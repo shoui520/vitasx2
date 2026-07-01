@@ -37,7 +37,7 @@
 #include <smmintrin.h>
 #include <immintrin.h>
 
-#elif defined(ARCH_ARM64)
+#elif defined(ARCH_ARM64) || defined(ARCH_ARM32)
 #include <arm_neon.h>
 #endif
 

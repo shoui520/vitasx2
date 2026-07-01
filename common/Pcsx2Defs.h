@@ -25,6 +25,8 @@ static constexpr bool IsDebugBuild = false;
 
 #if defined(_M_ARM64) || defined(__aarch64__)
 	#define ARCH_ARM64
+#elif defined(_M_ARM32) || defined(__arm__)
+	#define ARCH_ARM32
 #elif defined(_M_X86) || defined(__x86_64__) || defined(__i386__)
 	#define ARCH_X86
 #else
@@ -51,6 +53,9 @@ static constexpr bool IsDebugBuild = false;
 	static constexpr unsigned int __cachelinesize = OVERRIDE_HOST_CACHE_LINE_SIZE;
 #elif defined(ARCH_ARM64)
 	static constexpr unsigned int __cachelinesize = 128;
+#elif defined(ARCH_ARM32)
+	// Cortex-A9: 32-byte L1/L2 cache lines.
+	static constexpr unsigned int __cachelinesize = 32;
 #else
 	static constexpr unsigned int __cachelinesize = 64;
 #endif

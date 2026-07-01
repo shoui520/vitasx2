@@ -49,4 +49,6 @@ add_compile_definitions(
 
 add_link_options(-Wl,--gc-sections)
 
+add_subdirectory(3rdparty)
+add_subdirectory(common)
 add_subdirectory(vita)

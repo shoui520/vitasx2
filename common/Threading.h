@@ -7,6 +7,10 @@
 
 #if defined(__APPLE__)
 #include <mach/semaphore.h>
+#elif defined(__vita__)
+// pte's semaphore.h uses mode_t without pulling in its definition.
+#include <sys/types.h>
+#include <semaphore.h>
 #elif !defined(_WIN32)
 #include <semaphore.h>
 #endif
@@ -79,7 +83,8 @@ namespace Threading
 		void* m_native_handle = nullptr;
 
 		// We need the thread ID for affinity adjustments on Linux.
-#if defined(__linux__)
+		// On the Vita this is the SceUID of the thread, for affinity and priority.
+#if defined(__linux__) || defined(__vita__)
 		unsigned int m_native_id = 0;
 #endif
 	};

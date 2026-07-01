@@ -7,12 +7,7 @@ add_executable(vitasx2-probe
 	probe/ProbeMain.cpp
 )
 target_link_libraries(vitasx2-probe
-	pthread
-	SceLibKernel_stub
-	SceKernelThreadMgr_stub
-	SceProcessmgr_stub
-	SceIofilemgr_stub
-	SceSysmem_stub
+	common
 )
 
 vita_create_self(vitasx2-probe.self vitasx2-probe UNSAFE)

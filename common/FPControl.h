@@ -189,6 +189,96 @@ struct FPControlRegister
 
 	__fi constexpr bool operator==(const FPControlRegister& rhs) const { return bitmask == rhs.bitmask; }
 	__fi constexpr bool operator!=(const FPControlRegister& rhs) const { return bitmask != rhs.bitmask; }
+
+#elif defined(ARCH_ARM32)
+	// AArch32 FPSCR. FZ and RMode share the A64 FPCR layout; trap enables are
+	// IOE/DZE/OFE/UFE/IXE (bits 8-12) and IDE (bit 15). NEON on Cortex-A9 always
+	// runs flush-to-zero regardless of FZ; FZ governs the VFP pipeline.
+	u32 bitmask;
+
+	static constexpr u32 FZ_BIT = (0x1u << 24);
+	static constexpr u32 RMODE_SHIFT = 22;
+	static constexpr u32 RMODE_MASK = 0x3u;
+	static constexpr u32 RMODE_BITS = (RMODE_MASK << RMODE_SHIFT);
+	static constexpr u32 EXCEPTION_MASK = ((0x1Fu << 8) | (0x1u << 15));
+
+	__fi static FPControlRegister GetCurrent()
+	{
+		u32 value;
+		asm volatile("\tvmrs %0, FPSCR\n"
+					 : "=r"(value));
+		return FPControlRegister{value};
+	}
+
+	__fi static void SetCurrent(FPControlRegister value)
+	{
+		asm volatile("\tvmsr FPSCR, %0\n" ::"r"(value.bitmask));
+	}
+
+	__fi static constexpr FPControlRegister GetDefault()
+	{
+		// 0x0 - all exceptions masked, nearest rounding
+		return FPControlRegister{0x0};
+	}
+
+	__fi constexpr FPControlRegister& EnableExceptions()
+	{
+		bitmask |= EXCEPTION_MASK;
+		return *this;
+	}
+
+	__fi constexpr FPControlRegister& DisableExceptions()
+	{
+		bitmask &= ~EXCEPTION_MASK;
+		return *this;
+	}
+
+	__fi constexpr FPRoundMode GetRoundMode() const
+	{
+		// Same RMode encoding as A64: negative/positive infinity are flipped vs x86.
+		const u32 RMode = (bitmask >> RMODE_SHIFT) & RMODE_MASK;
+		return static_cast<FPRoundMode>((RMode == 0b00 || RMode == 0b11) ? RMode : (RMode ^ 0b11));
+	}
+
+	__fi constexpr FPControlRegister& SetRoundMode(FPRoundMode mode)
+	{
+		const u32 RMode = ((mode == FPRoundMode::Nearest || mode == FPRoundMode::ChopZero) ? static_cast<u32>(mode) : (static_cast<u32>(mode) ^ 0b11));
+		bitmask = (bitmask & ~RMODE_BITS) | ((RMode & RMODE_MASK) << RMODE_SHIFT);
+		return *this;
+	}
+
+	__fi constexpr bool GetDenormalsAreZero() const
+	{
+		// No separate DaZ/FtZ on AArch32 either; FZ flushes both inputs and outputs.
+		return ((bitmask & FZ_BIT) != 0);
+	}
+
+	__fi constexpr FPControlRegister SetDenormalsAreZero(bool daz)
+	{
+		if (daz)
+			bitmask |= FZ_BIT;
+		else
+			bitmask &= ~FZ_BIT;
+		return *this;
+	}
+
+	__fi constexpr bool GetFlushToZero() const
+	{
+		// See note in GetDenormalsAreZero().
+		return ((bitmask & FZ_BIT) != 0);
+	}
+
+	__fi constexpr FPControlRegister SetFlushToZero(bool ftz)
+	{
+		if (ftz)
+			bitmask |= FZ_BIT;
+		else
+			bitmask &= ~FZ_BIT;
+		return *this;
+	}
+
+	__fi constexpr bool operator==(const FPControlRegister& rhs) const { return bitmask == rhs.bitmask; }
+	__fi constexpr bool operator!=(const FPControlRegister& rhs) const { return bitmask != rhs.bitmask; }
 #else
 #error Unknown architecture.
 #endif

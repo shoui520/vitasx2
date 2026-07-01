@@ -87,6 +87,40 @@ asm(
 	br x30
 )");
 
+#elif defined(ARCH_ARM32)
+
+// AArch32/A32. Callee-saved state per AAPCS: r4-r11, sp, lr, d8-d15.
+// Emitted as ARM (not Thumb) so the encoding is mode-independent of the
+// surrounding translation unit; interworking is handled by bx/veneers.
+asm(
+	"\t.global " PREFIX "fastjmp_set\n"
+	"\t.global " PREFIX "fastjmp_jmp\n"
+	"\t.text\n"
+	"\t.syntax unified\n"
+	"\t.arm\n"
+	"\t.align 4\n"
+	"\t.type " PREFIX "fastjmp_set, %function\n"
+	"\t" PREFIX "fastjmp_set:" R"(
+	stmia r0, {r4-r11}
+	add r2, r0, #32
+	mov r3, sp
+	stmia r2!, {r3, lr}
+	vstmia r2, {d8-d15}
+	mov r0, #0
+	bx lr
+)"
+	"\t.align 4\n"
+	"\t.type " PREFIX "fastjmp_jmp, %function\n"
+	"\t" PREFIX "fastjmp_jmp:" R"(
+	ldmia r0, {r4-r11}
+	add r2, r0, #32
+	ldmia r2!, {r3, lr}
+	mov sp, r3
+	vldmia r2, {d8-d15}
+	mov r0, r1
+	bx lr
+)");
+
 #endif
 
 #endif // __WIN32

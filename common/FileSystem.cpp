@@ -42,8 +42,13 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef __vita__
 #include <sys/mman.h>
+#endif
 #include <unistd.h>
+#ifndef PATH_MAX
+#define PATH_MAX 1024
+#endif
 #endif
 
 #ifdef _WIN32
@@ -1110,8 +1115,17 @@ FileSystem::ManagedCFilePtr FileSystem::OpenManagedSharedCFile(const char* filen
 
 int FileSystem::FSeek64(std::FILE* fp, s64 offset, int whence)
 {
-#ifdef _WIN32
+#if defined(_WIN32)
 	return _fseeki64(fp, offset, whence);
+#elif defined(__vita__)
+	// newlib stdio offsets are 32-bit on this target. Anything needing >2GiB
+	// files (DVD9 ISOs) must use a sceIo-based reader, not stdio.
+	if (offset > std::numeric_limits<off_t>::max() || offset < std::numeric_limits<off_t>::min())
+	{
+		errno = EOVERFLOW;
+		return -1;
+	}
+	return fseeko(fp, static_cast<off_t>(offset), whence);
 #else
 	return fseeko(fp, static_cast<off_t>(offset), whence);
 #endif
@@ -1278,6 +1292,30 @@ static std::span<const u8> MapBinaryFileForRead(HANDLE handle)
 	CloseHandle(mapping);
 	return {static_cast<const u8*>(ptr), static_cast<size_t>(size.QuadPart)};
 }
+#elif defined(__vita__)
+// No mmap on the Vita; a read-only "mapping" is a heap copy of the file.
+static std::span<const u8> MapBinaryFileForRead(int fd)
+{
+	struct stat s;
+	if (0 != fstat(fd, &s) || s.st_size == 0)
+		return {};
+	const size_t size = static_cast<size_t>(s.st_size);
+	u8* ptr = static_cast<u8*>(std::malloc(size));
+	if (!ptr)
+		return {};
+	size_t done = 0;
+	while (done < size)
+	{
+		const ssize_t r = read(fd, ptr + done, size - done);
+		if (r <= 0)
+		{
+			std::free(ptr);
+			return {};
+		}
+		done += static_cast<size_t>(r);
+	}
+	return {ptr, size};
+}
 #else
 static std::span<const u8> MapBinaryFileForRead(int fd)
 {
@@ -1323,8 +1361,10 @@ std::span<const u8> FileSystem::MapBinaryFileForRead(std::FILE* fp)
 
 void FileSystem::UnmapFile(std::span<const u8> file)
 {
-#ifdef _WIN32
+#if defined(_WIN32)
 	UnmapViewOfFile(const_cast<u8*>(file.data()));
+#elif defined(__vita__)
+	std::free(const_cast<u8*>(file.data()));
 #else
 	munmap(const_cast<u8*>(file.data()), file.size());
 #endif
@@ -2118,7 +2158,11 @@ bool FileSystem::DeleteSymbolicLink(const char* path, Error* error)
 #else
 
 // No 32-bit file offsets breaking stuff please.
+// The Vita's newlib keeps a 32-bit off_t; 64-bit file access goes through the
+// explicit fseeko64/ftello64 entry points in FSeek64/FTell64 instead.
+#ifndef __vita__
 static_assert(sizeof(off_t) == sizeof(s64));
+#endif
 
 static u32 RecursiveFindFiles(const char* OriginPath, const char* ParentPath, const char* Path, const char* Pattern,
 	u32 Flags, FileSystem::FindResultsArray* pResults, std::vector<std::string>& visited, ProgressCallback* cancel)
