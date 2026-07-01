@@ -3,7 +3,9 @@
 
 #include "SIO/Memcard/MemoryCardFile.h"
 
+#if !defined(VITASX2_VITA)
 #include "SIO/Memcard/MemoryCardFolder.h"
+#endif
 #include "SIO/Sio.h"
 #include <SIO/SioTypes.h>
 
@@ -569,7 +571,9 @@ u64 FileMemoryCard::GetCRC(uint slot)
 namespace Mcd
 {
 	FileMemoryCard impl; // class-based implementations we refer to when API is invoked
+#if !defined(VITASX2_VITA)
 	FolderMemoryCardAggregator implFolder;
+#endif
 }; // namespace Mcd
 
 uint FileMcd_ConvertToSlot(uint port, uint slot)
@@ -594,9 +598,11 @@ void FileMcd_SetType()
 		{
 			MemoryCardType type = MemoryCardType::File; // default to file if we can't find anything at the path so it gets auto-generated
 
+#if !defined(VITASX2_VITA)
 			const std::string path(EmuConfig.FullpathToMcd(slot));
 			if (FileSystem::DirectoryExists(path.c_str()))
 				type = MemoryCardType::Folder;
+#endif
 
 			EmuConfig.Mcd[slot].Type = type;
 		}
@@ -611,8 +617,10 @@ void FileMcd_EmuOpen()
 
 
 	Mcd::impl.Open();
+#if !defined(VITASX2_VITA)
 	Mcd::implFolder.SetFiltering(true);
 	Mcd::implFolder.Open();
+#endif
 }
 
 void FileMcd_EmuClose()
@@ -620,7 +628,9 @@ void FileMcd_EmuClose()
 	if (!FileMcd_Open)
 		return;
 	FileMcd_Open = false;
+#if !defined(VITASX2_VITA)
 	Mcd::implFolder.Close();
+#endif
 	Mcd::impl.Close();
 }
 
@@ -704,8 +714,10 @@ s32 FileMcd_IsPresent(uint port, uint slot)
 	{
 		case MemoryCardType::File:
 			return Mcd::impl.IsPresent(combinedSlot);
+#if !defined(VITASX2_VITA)
 		case MemoryCardType::Folder:
 			return Mcd::implFolder.IsPresent(combinedSlot);
+#endif
 		default:
 			return false;
 	}
@@ -719,9 +731,11 @@ void FileMcd_GetSizeInfo(uint port, uint slot, McdSizeInfo* outways)
 		case MemoryCardType::File:
 			Mcd::impl.GetSizeInfo(combinedSlot, *outways);
 			break;
+#if !defined(VITASX2_VITA)
 		case MemoryCardType::Folder:
 			Mcd::implFolder.GetSizeInfo(combinedSlot, *outways);
 			break;
+#endif
 		default:
 			return;
 	}
@@ -734,8 +748,10 @@ bool FileMcd_IsPSX(uint port, uint slot)
 	{
 		case MemoryCardType::File:
 			return Mcd::impl.IsPSX(combinedSlot);
+#if !defined(VITASX2_VITA)
 		case MemoryCardType::Folder:
 			return Mcd::implFolder.IsPSX(combinedSlot);
+#endif
 		default:
 			return false;
 	}
@@ -748,8 +764,10 @@ s32 FileMcd_Read(uint port, uint slot, u8* dest, u32 adr, int size)
 	{
 		case MemoryCardType::File:
 			return Mcd::impl.Read(combinedSlot, dest, adr, size);
+#if !defined(VITASX2_VITA)
 		case MemoryCardType::Folder:
 			return Mcd::implFolder.Read(combinedSlot, dest, adr, size);
+#endif
 		default:
 			return 0;
 	}
@@ -762,8 +780,10 @@ s32 FileMcd_Save(uint port, uint slot, const u8* src, u32 adr, int size)
 	{
 		case MemoryCardType::File:
 			return Mcd::impl.Save(combinedSlot, src, adr, size);
+#if !defined(VITASX2_VITA)
 		case MemoryCardType::Folder:
 			return Mcd::implFolder.Save(combinedSlot, src, adr, size);
+#endif
 		default:
 			return 0;
 	}
@@ -776,8 +796,10 @@ s32 FileMcd_EraseBlock(uint port, uint slot, u32 adr)
 	{
 		case MemoryCardType::File:
 			return Mcd::impl.EraseBlock(combinedSlot, adr);
+#if !defined(VITASX2_VITA)
 		case MemoryCardType::Folder:
 			return Mcd::implFolder.EraseBlock(combinedSlot, adr);
+#endif
 		default:
 			return 0;
 	}
@@ -790,8 +812,10 @@ u64 FileMcd_GetCRC(uint port, uint slot)
 	{
 		case MemoryCardType::File:
 			return Mcd::impl.GetCRC(combinedSlot);
+#if !defined(VITASX2_VITA)
 		case MemoryCardType::Folder:
 			return Mcd::implFolder.GetCRC(combinedSlot);
+#endif
 		default:
 			return 0;
 	}
@@ -805,9 +829,11 @@ void FileMcd_NextFrame(uint port, uint slot)
 		//case MemoryCardType::MemoryCard_File:
 		//	Mcd::impl.NextFrame( combinedSlot );
 		//	break;
+#if !defined(VITASX2_VITA)
 		case MemoryCardType::Folder:
 			Mcd::implFolder.NextFrame(combinedSlot);
 			break;
+#endif
 		default:
 			return;
 	}
@@ -822,10 +848,12 @@ int FileMcd_ReIndex(uint port, uint slot, const std::string& filter)
 		//case MemoryCardType::File:
 		//	return Mcd::impl.ReIndex( combinedSlot, filter );
 		//	break;
+#if !defined(VITASX2_VITA)
 		case MemoryCardType::Folder:
 			if (!Mcd::implFolder.ReIndex(combinedSlot, true, filter))
 				return -1;
 			break;
+#endif
 		default:
 			return -1;
 			break;
@@ -857,8 +885,12 @@ static MemoryCardFileType GetMemoryCardFileTypeFromSize(s64 size)
 
 static bool FileMcd_IsFolder(const std::string& path)
 {
+#if defined(VITASX2_VITA)
+	return false;
+#else
 	const std::string superblock_path(Path::Combine(path, s_folder_mem_card_id_file));
 	return FileSystem::FileExists(superblock_path.c_str());
+#endif
 }
 
 bool FileMcd_IsMemoryCardFormatted(const std::string& path)
@@ -923,6 +955,9 @@ std::vector<AvailableMcdInfo> FileMcd_GetAvailableCards(bool include_in_use_card
 
 		if (fd.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY)
 		{
+#if defined(VITASX2_VITA)
+			continue;
+#else
 			if (!FileMcd_IsFolder(fd.FileName))
 				continue;
 
@@ -935,6 +970,7 @@ std::vector<AvailableMcdInfo> FileMcd_GetAvailableCards(bool include_in_use_card
 			mcds.push_back({std::move(basename), std::move(fd.FileName), fd.ModificationTime,
 				MemoryCardType::Folder, MemoryCardFileType::Unknown, 0u, sourceFolderMemoryCard.IsFormatted()});
 			sourceFolderMemoryCard.Close(false);
+#endif
 		}
 		else
 		{
@@ -965,11 +1001,13 @@ std::optional<AvailableMcdInfo> FileMcd_GetCardInfo(const std::string_view name)
 
 	if (sd.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY)
 	{
+#if !defined(VITASX2_VITA)
 		if (FileMcd_IsFolder(path))
 		{
 			ret = {std::move(basename), std::move(path), sd.ModificationTime,
 				MemoryCardType::Folder, MemoryCardFileType::Unknown, 0u, true};
 		}
+#endif
 	}
 	else
 	{
@@ -991,6 +1029,9 @@ bool FileMcd_CreateNewCard(const std::string_view name, MemoryCardType type, Mem
 
 	if (type == MemoryCardType::Folder)
 	{
+#if defined(VITASX2_VITA)
+		return false;
+#else
 		Console.WriteLn("(FileMcd) Creating new PS2 folder memory card: '%.*s'", static_cast<int>(name.size()), name.data());
 
 		Error error;
@@ -1010,6 +1051,7 @@ bool FileMcd_CreateNewCard(const std::string_view name, MemoryCardType type, Mem
 		}
 
 		return true;
+#endif
 	}
 
 	if (type == MemoryCardType::File)
@@ -1120,12 +1162,16 @@ bool FileMcd_DeleteCard(const std::string_view name)
 
 	if (sd.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY)
 	{
+#if defined(VITASX2_VITA)
+		return false;
+#else
 		// must be a folder memcard, so do a recursive delete (scary)
 		if (!FileSystem::RecursiveDeleteDirectory(name_path.c_str()))
 		{
 			Console.Error("(FileMcd) Failed to recursively delete '%s'", name_path.c_str());
 			return false;
 		}
+#endif
 	}
 	else
 	{

@@ -10,6 +10,9 @@ project(libzip
   LANGUAGES C)
 
 set(ENABLE_FDOPEN ON)
+if(VITA)
+  set(ENABLE_FDOPEN OFF)
+endif()
 set(HAVE_LIBZSTD TRUE)
 set(ZIP_STATIC TRUE)
 
@@ -50,6 +53,10 @@ set(HAVE_FCHMOD ${UNIX})
 set(HAVE_FILENO TRUE)
 set(HAVE_FSEEKO ${UNIX})
 set(HAVE_FTELLO ${UNIX})
+if(VITA)
+  set(HAVE_FSEEKO TRUE)
+  set(HAVE_FTELLO TRUE)
+endif()
 set(HAVE_GETPROGNAME ${APPLE})
 set(HAVE_LOCALTIME_R ${UNIX})
 set(HAVE_LOCALTIME_S ${MSVC})
@@ -263,6 +270,10 @@ if(WIN32)
     lib/zip_source_file_win32_utf8.c
     lib/zip_source_file_win32_ansi.c
     lib/zip_random_win32.c
+    )
+elseif(VITA)
+  target_sources(zip PRIVATE
+    lib/zip_random_unix.c
     )
 else(WIN32)
   target_sources(zip PRIVATE

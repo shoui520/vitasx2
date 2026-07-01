@@ -57,6 +57,9 @@ namespace SysMemory
 	static u8* s_data_memory;
 	static void* s_data_memory_file_handle;
 	static u8* s_code_memory;
+#if defined(ARCH_ARM32)
+	static void* s_code_memory_file_handle;
+#endif
 	static std::unique_ptr<SharedMemoryMappingArea> s_memory_mapping_area;
 } // namespace SysMemory
 
@@ -95,6 +98,17 @@ bool SysMemory::AllocateMemoryMap()
 		return false;
 	}
 
+#if defined(ARCH_ARM32)
+	s_data_memory = static_cast<u8*>(s_data_memory_file_handle);
+	s_code_memory_file_handle = HostSys::CreateSharedMemory(HostSys::GetFileMappingName("pcsx2-code").c_str(), HostMemoryMap::CodeSize);
+	if (!s_code_memory_file_handle)
+	{
+		Host::ReportErrorAsync("Error", "Failed to allocate code memory.");
+		ReleaseMemoryMap();
+		return false;
+	}
+	s_code_memory = static_cast<u8*>(s_code_memory_file_handle);
+#else
 	if (!(s_memory_mapping_area = SharedMemoryMappingArea::Create(HostMemoryMap::MainSize + HostMemoryMap::CodeSize, true)))
 	{
 		Host::ReportErrorAsync("Error", "Failed to map main memory.");
@@ -115,6 +129,7 @@ bool SysMemory::AllocateMemoryMap()
 		ReleaseMemoryMap();
 		return false;
 	}
+#endif
 
 	HostMemoryMap::EEmem = (uptr)(s_data_memory + HostMemoryMap::EEmemOffset);
 	HostMemoryMap::IOPmem = (uptr)(s_data_memory + HostMemoryMap::IOPmemOffset);
@@ -151,6 +166,21 @@ void SysMemory::DumpMemoryMap()
 
 void SysMemory::ReleaseMemoryMap()
 {
+#if defined(ARCH_ARM32)
+	if (s_code_memory_file_handle)
+	{
+		HostSys::DestroySharedMemory(s_code_memory_file_handle);
+		s_code_memory_file_handle = nullptr;
+		s_code_memory = nullptr;
+	}
+
+	if (s_data_memory_file_handle)
+	{
+		HostSys::DestroySharedMemory(s_data_memory_file_handle);
+		s_data_memory_file_handle = nullptr;
+		s_data_memory = nullptr;
+	}
+#else
 	if (s_code_memory)
 	{
 		s_memory_mapping_area->Unmap(s_code_memory, HostMemoryMap::CodeSize, false);
@@ -170,6 +200,7 @@ void SysMemory::ReleaseMemoryMap()
 		HostSys::DestroySharedMemory(s_data_memory_file_handle);
 		s_data_memory_file_handle = nullptr;
 	}
+#endif
 }
 
 bool SysMemory::Allocate()

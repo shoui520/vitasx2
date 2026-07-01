@@ -39,6 +39,31 @@ u32 PSXCLK = 36864000;
 
 static constexpr s32 GMT9_OFFSET_SECONDS = 9 * 60 * 60; // 32400
 
+static constexpr s64 DaysFromCivil(int year, unsigned month, unsigned day)
+{
+	year -= month <= 2;
+	const int era = (year >= 0 ? year : year - 399) / 400;
+	const unsigned year_of_era = static_cast<unsigned>(year - era * 400);
+	const unsigned day_of_year = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+	const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+	return era * 146097 + static_cast<int>(day_of_era) - 719468;
+}
+
+static std::time_t CDVDTimeGM(const std::tm& tm)
+{
+#if defined(_WIN32)
+	std::tm copy = tm;
+	return _mkgmtime(&copy);
+#elif !defined(VITASX2_VITA)
+	std::tm copy = tm;
+	return timegm(&copy);
+#else
+	return static_cast<std::time_t>(
+		(DaysFromCivil(tm.tm_year + 1900, static_cast<unsigned>(tm.tm_mon + 1), static_cast<unsigned>(tm.tm_mday)) * 86400) +
+		(tm.tm_hour * 3600) + (tm.tm_min * 60) + tm.tm_sec);
+#endif
+}
+
 static constexpr u8 monthmap[13] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
 
 static constexpr u8 cdvdParamLength[16] = { 0, 0, 0, 0, 0, 4, 11, 11, 11, 1, 255, 255, 7, 2, 11, 1 };
@@ -971,11 +996,10 @@ void cdvdReset()
 		resulting_tm.tm_isdst = 0;
 
 		// Work backwards to input time by accounting for BIOS settings and GMT+9 defaultism.
+		const std::time_t input_time = CDVDTimeGM(resulting_tm) + GMT9_OFFSET_SECONDS - bios_settings_offset_seconds;
 #if defined(_WIN32)
-		const std::time_t input_time = _mkgmtime(&resulting_tm) + GMT9_OFFSET_SECONDS - bios_settings_offset_seconds;
 		gmtime_s(&input_tm, &input_time);
 #else
-		const std::time_t input_time = timegm(&resulting_tm) + GMT9_OFFSET_SECONDS - bios_settings_offset_seconds;
 		gmtime_r(&input_time, &input_tm);
 #endif
 	}
@@ -992,11 +1016,10 @@ void cdvdReset()
 		input_tm.tm_year = 120;
 		input_tm.tm_isdst = 0;
 
+		const std::time_t resulting_time = CDVDTimeGM(input_tm) - GMT9_OFFSET_SECONDS + bios_settings_offset_seconds;
 #if defined(_WIN32)
-		const std::time_t resulting_time = _mkgmtime(&input_tm) - GMT9_OFFSET_SECONDS + bios_settings_offset_seconds;
 		gmtime_s(&resulting_tm, &resulting_time);
 #else
-		const std::time_t resulting_time = timegm(&input_tm) - GMT9_OFFSET_SECONDS + bios_settings_offset_seconds;
 		gmtime_r(&resulting_time, &resulting_tm);
 #endif
 	}

@@ -1,0 +1,13 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#pragma once
+
+#define GIT_TAG "@VITASX2_GIT_TAG@"
+#define GIT_TAGGED_COMMIT false
+#define GIT_TAG_HI 0
+#define GIT_TAG_MID 0
+#define GIT_TAG_LO 0
+#define GIT_REV "@VITASX2_GIT_REV@"
+#define GIT_HASH "@VITASX2_GIT_HASH@"
+#define GIT_DATE "@VITASX2_GIT_DATE@"

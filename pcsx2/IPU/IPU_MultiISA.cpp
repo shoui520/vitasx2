@@ -1404,6 +1404,9 @@ __fi static bool mpeg2_slice()
 					s += 32;
 					d += 32;
 				}
+#elif defined(ARCH_ARM32)
+				for (uint i = 0; i < (256 + 64 + 64); i++)
+					d[i] = s[i];
 #else
 #error Unsupported arch
 #endif

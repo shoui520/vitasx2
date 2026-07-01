@@ -39,6 +39,9 @@ static const char* nameFromType(int type)
 
 static std::unique_ptr<ThreadedFileReader> GetFileReader(const std::string& path)
 {
+#if defined(VITASX2_VITA)
+	return std::make_unique<FlatFileReader>();
+#else
 	const std::string_view extension = Path::GetExtension(path);
 
 	if (StringUtil::compareNoCase(extension, "chd"))
@@ -54,6 +57,7 @@ static std::unique_ptr<ThreadedFileReader> GetFileReader(const std::string& path
 		return std::make_unique<BlockdumpFileReader>();
 
 	return std::make_unique<FlatFileReader>();
+#endif
 }
 
 int InputIsoFile::ReadSync(u8* dst, uint lsn)

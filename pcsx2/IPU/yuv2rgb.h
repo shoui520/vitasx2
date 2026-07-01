@@ -17,4 +17,8 @@ MULTI_ISA_DEF(extern void yuv2rgb_sse2();)
 #define yuv2rgb yuv2rgb_neon
 MULTI_ISA_DEF(extern void yuv2rgb_neon();)
 
+#else
+
+#define yuv2rgb yuv2rgb_reference
+
 #endif

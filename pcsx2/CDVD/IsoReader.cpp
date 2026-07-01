@@ -12,6 +12,7 @@
 #include "fmt/format.h"
 
 #include <cctype>
+#include <limits>
 
 IsoReader::IsoReader() = default;
 
@@ -293,9 +294,15 @@ bool IsoReader::ReadFile(const ISODirectoryEntry& de, std::vector<u8>* data, Err
 		return true;
 	}
 
-	static_assert(sizeof(size_t) == sizeof(u64));
 	const u32 num_sectors = (de.length_le + (SECTOR_SIZE - 1)) / SECTOR_SIZE;
-	data->resize(num_sectors * static_cast<u64>(SECTOR_SIZE));
+	const u64 read_size = num_sectors * static_cast<u64>(SECTOR_SIZE);
+	if (read_size > std::numeric_limits<size_t>::max())
+	{
+		Error::SetString(error, "ISO file entry is too large for the host address space.");
+		return false;
+	}
+
+	data->resize(static_cast<size_t>(read_size));
 	for (u32 i = 0, lsn = de.location_le; i < num_sectors; i++, lsn++)
 	{
 		if (!ReadSector(data->data() + (i * SECTOR_SIZE), lsn, error))

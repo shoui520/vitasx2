@@ -922,6 +922,9 @@ static bool vtlb_GetMainMemoryOffset(u32 paddr, u32* mainmem_offset, u32* mainme
 
 static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageProtectionMode& mode)
 {
+	if (!vtlbdata.fastmem_base || s_fastmem_virtual_mapping.empty())
+		return;
+
 	FASTMEM_LOG("Create fastmem mapping @ vaddr %08X mainmem %08X", vaddr, mainmem_offset);
 
 	const u32 page = vaddr / VTLB_PAGE_SIZE;
@@ -971,6 +974,9 @@ static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageP
 
 static void vtlb_RemoveFastmemMapping(u32 vaddr)
 {
+	if (!vtlbdata.fastmem_base || s_fastmem_virtual_mapping.empty())
+		return;
+
 	const u32 page = vaddr / VTLB_PAGE_SIZE;
 	if (s_fastmem_virtual_mapping[page] == NO_FASTMEM_MAPPING)
 		return;
@@ -1030,6 +1036,9 @@ static void vtlb_RemoveFastmemMappings()
 
 bool vtlb_ResolveFastmemMapping(uptr* addr)
 {
+	if (!vtlbdata.fastmem_base || s_fastmem_virtual_mapping.empty())
+		return false;
+
 	uptr uaddr = *addr;
 	uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
 	uptr fastmem_end = fastmem_start + 0xFFFFFFFFu;
@@ -1054,6 +1063,9 @@ bool vtlb_ResolveFastmemMapping(uptr* addr)
 
 bool vtlb_GetGuestAddress(uptr host_addr, u32* guest_addr)
 {
+	if (!vtlbdata.fastmem_base)
+		return false;
+
 	uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
 	uptr fastmem_end = fastmem_start + 0xFFFFFFFFu;
 	if (host_addr < fastmem_start || host_addr > fastmem_end)
@@ -1065,6 +1077,9 @@ bool vtlb_GetGuestAddress(uptr host_addr, u32* guest_addr)
 
 void vtlb_UpdateFastmemProtection(u32 paddr, u32 size, PageProtectionMode prot)
 {
+	if (!vtlbdata.fastmem_base || s_fastmem_virtual_mapping.empty())
+		return;
+
 	if (!CHECK_FASTMEM)
 		return;
 
@@ -1290,6 +1305,9 @@ void vtlb_Shutdown()
 
 void vtlb_ResetFastmem()
 {
+	if (!vtlbdata.fastmem_base)
+		return;
+
 	DevCon.WriteLn("Resetting fastmem mappings...");
 
 	vtlb_RemoveFastmemMappings();
@@ -1331,6 +1349,13 @@ bool vtlb_Core_Alloc()
 
 	vtlbdata.vmap = reinterpret_cast<VTLBVirtual*>(SysMemory::GetVTLBVirtualMap());
 
+#if defined(ARCH_ARM32)
+	// Vita has no user-mode page protection or fault handler substrate. Keep the
+	// PCSX2 VTLB tables, but force explicit interpreter/JIT checks instead of
+	// allocating the desktop 4 GiB fastmem view owned by this function.
+	vtlbdata.fastmem_base = 0;
+	return true;
+#else
 	pxAssert(!s_fastmem_area);
 	s_fastmem_area = SharedMemoryMappingArea::Create(FASTMEM_AREA_SIZE);
 	if (!s_fastmem_area)
@@ -1352,6 +1377,7 @@ bool vtlb_Core_Alloc()
 	}
 
 	return true;
+#endif
 }
 
 // The LUT is only used for 1 game so we allocate it only when the gamefix is enabled (save 4MB)

@@ -102,7 +102,7 @@ using r128 = __m128i;
 	_mm_store_ps((float*)&dest, _mm_setzero_ps());
 }
 
-#elif defined(ARCH_ARM64)
+#elif defined(ARCH_ARM64) || defined(ARCH_ARM32)
 
 using r128 = uint32x4_t;
 

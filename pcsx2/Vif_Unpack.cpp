@@ -484,9 +484,8 @@ __ri void _nVifUnpackLoop(const u8* data)
 	{
 		u8* dest = getVUptr(idx, vif.tag.addr);
 
-		if (doMode)
+		if (doMode || !newVifDynaRec)
 		{
-			//if (1) {
 			ft(dest, data);
 		}
 		else

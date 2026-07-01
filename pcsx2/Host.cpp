@@ -3,7 +3,6 @@
 
 #include "BuildVersion.h"
 #include "GS.h"
-#include "GS/Renderers/HW/GSTextureReplacements.h"
 #include "Host.h"
 #include "LayeredSettingsInterface.h"
 #include "VMManager.h"

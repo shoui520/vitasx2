@@ -3,6 +3,36 @@
 
 #pragma once
 
+#if defined(VITASX2_VITA)
+
+#include "common/Pcsx2Defs.h"
+
+class Pcsx2Config;
+struct NetPacket;
+
+void rx_process(NetPacket* pk);
+bool rx_fifo_can_rx();
+
+s32 DEV9init();
+void DEV9close();
+s32 DEV9open();
+void DEV9shutdown();
+void _DEV9irq(int cause, int cycles);
+int DEV9irqHandler(void);
+void DEV9async(u32 cycles);
+void DEV9runFIFO();
+void DEV9writeDMA8Mem(u32* pMem, int size);
+void DEV9readDMA8Mem(u32* pMem, int size);
+u8 DEV9read8(u32 addr);
+u16 DEV9read16(u32 addr);
+u32 DEV9read32(u32 addr);
+void DEV9write8(u32 addr, u8 value);
+void DEV9write16(u32 addr, u16 value);
+void DEV9write32(u32 addr, u32 value);
+void DEV9CheckChanges(const Pcsx2Config& old_config);
+
+#else
+
 #include <stdio.h>
 #include <string>
 
@@ -692,4 +722,6 @@ void DEV9CheckChanges(const Pcsx2Config& old_config);
 
 #ifdef _WIN32
 #pragma warning(error : 4013)
+#endif
+
 #endif

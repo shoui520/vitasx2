@@ -54,40 +54,72 @@ namespace HostMemoryMap
 	// Code
 	//////////////////////////////////////////////////////////////////////////
 
-	// EE recompiler code cache area (64mb)
+	// EE recompiler code cache area (64mb desktop, smaller on Vita).
 	static constexpr u32 EErecOffset = 0x00000000;
+#if defined(ARCH_ARM32)
+	static constexpr u32 EErecSize = 0x800000;
+#else
 	static constexpr u32 EErecSize = 0x4000000;
+#endif
 
-	// IOP recompiler code cache area (32mb)
+	// IOP recompiler code cache area (32mb desktop, smaller on Vita).
 	static constexpr u32 IOPrecOffset = EErecOffset + EErecSize;
+#if defined(ARCH_ARM32)
+	static constexpr u32 IOPrecSize = 0x100000;
+#else
 	static constexpr u32 IOPrecSize = 0x2000000;
+#endif
 
-	// newVif0 recompiler code cache area (8mb)
+	// newVif0 recompiler code cache area (8mb desktop, smaller on Vita).
 	static constexpr u32 VIF0recOffset = IOPrecOffset + IOPrecSize;
+#if defined(ARCH_ARM32)
+	static constexpr u32 VIF0recSize = 0x80000;
+#else
 	static constexpr u32 VIF0recSize = 0x800000;
+#endif
 
-	// newVif1 recompiler code cache area (8mb)
+	// newVif1 recompiler code cache area (8mb desktop, smaller on Vita).
 	static constexpr u32 VIF1recOffset = VIF0recOffset + VIF0recSize;
+#if defined(ARCH_ARM32)
+	static constexpr u32 VIF1recSize = 0x80000;
+#else
 	static constexpr u32 VIF1recSize = 0x800000;
+#endif
 
-	// microVU1 recompiler code cache area (64mb)
+	// microVU1 recompiler code cache area (64mb desktop, smaller on Vita).
 	static constexpr u32 mVU0recOffset = VIF1recOffset + VIF1recSize;
+#if defined(ARCH_ARM32)
+	static constexpr u32 mVU0recSize = 0x100000;
+#else
 	static constexpr u32 mVU0recSize = 0x4000000;
+#endif
 
-	// microVU0 recompiler code cache area (64mb)
+	// microVU0 recompiler code cache area (64mb desktop, smaller on Vita).
 	static constexpr u32 mVU1recOffset = mVU0recOffset + mVU0recSize;
+#if defined(ARCH_ARM32)
+	static constexpr u32 mVU1recSize = 0x200000;
+#else
 	static constexpr u32 mVU1recSize = 0x4000000;
+#endif
 
-	// SSE-optimized VIF unpack functions (1mb)
+	// Optimized VIF unpack functions (1mb desktop, smaller on Vita).
 	static constexpr u32 VIFUnpackRecOffset = mVU1recOffset + mVU1recSize;
+#if defined(ARCH_ARM32)
+	static constexpr u32 VIFUnpackRecSize = 0x80000;
+#else
 	static constexpr u32 VIFUnpackRecSize = 0x100000;
+#endif
 
-	// Software Renderer JIT buffer (64mb)
+	// Software Renderer JIT buffer (64mb desktop, omitted on interpreter-only Vita).
 	static constexpr u32 SWrecOffset = VIFUnpackRecOffset + VIFUnpackRecSize;
+#if defined(ARCH_ARM32)
+	static constexpr u32 SWrecSize = 0;
+#else
 	static constexpr u32 SWrecSize = 0x04000000;
+#endif
 
 	// Overall size.
-	static constexpr u32 CodeSize = SWrecOffset + SWrecSize; // 305 mb
+	static constexpr u32 CodeSize = SWrecOffset + SWrecSize;
 } // namespace HostMemoryMap
 
 

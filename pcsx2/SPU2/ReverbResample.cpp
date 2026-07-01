@@ -79,6 +79,7 @@ s32 __forceinline ReverbDownsample_reference(V_Core& core, bool right)
 	return clamp_mix(out);
 }
 
+#if !defined(ARCH_ARM32)
 #if _M_SSE >= 0x501
 s32 __forceinline ReverbDownsample_avx(V_Core& core, bool right)
 {
@@ -136,10 +137,13 @@ s32 __forceinline ReverbDownsample_sse(V_Core& core, bool right)
 
 	return acc.I16[0];
 }
+#endif
 
 s32 ReverbDownsample(V_Core& core, bool right)
 {
-#if _M_SSE >= 0x501
+#if defined(ARCH_ARM32)
+	return ReverbDownsample_reference(core, right);
+#elif _M_SSE >= 0x501
 	return ReverbDownsample_avx(core, right);
 #else
 	return ReverbDownsample_sse(core, right);
@@ -163,6 +167,7 @@ StereoOut32 __forceinline ReverbUpsample_reference(V_Core& core)
 	return {clamp_mix(l), clamp_mix(r)};
 }
 
+#if !defined(ARCH_ARM32)
 #if _M_SSE >= 0x501
 StereoOut32 __forceinline ReverbUpsample_avx(V_Core& core)
 {
@@ -247,10 +252,13 @@ StereoOut32 __forceinline ReverbUpsample_sse(V_Core& core)
 
 	return {lacc.I16[0], racc.I16[0]};
 }
+#endif
 
 StereoOut32 ReverbUpsample(V_Core& core)
 {
-#if _M_SSE >= 0x501
+#if defined(ARCH_ARM32)
+	return ReverbUpsample_reference(core);
+#elif _M_SSE >= 0x501
 	return ReverbUpsample_avx(core);
 #else
 	return ReverbUpsample_sse(core);
