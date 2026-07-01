@@ -12,6 +12,19 @@
 #include "common/Assertions.h"
 #include "common/Console.h"
 
+static VitaEePreInstructionTraceCallback s_ee_pre_instruction_trace_callback = nullptr;
+
+void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback)
+{
+	s_ee_pre_instruction_trace_callback = callback;
+}
+
+bool VitaRecordEePreInstruction(u32 pc, u32 opcode)
+{
+	const VitaEePreInstructionTraceCallback callback = s_ee_pre_instruction_trace_callback;
+	return callback ? callback(pc, opcode) : false;
+}
+
 static void recReserve()
 {
 }

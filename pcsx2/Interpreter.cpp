@@ -10,6 +10,9 @@
 #include "DebugTools/Breakpoints.h"
 
 #include "common/FastJmp.h"
+#ifdef VITASX2_VITA
+#include "vita/VitaCore.h"
+#endif
 
 #include <float.h>
 
@@ -175,6 +178,14 @@ static void execI()
 
 	// interprete instruction
 	cpuRegs.code = memRead32( pc );
+
+#ifdef VITASX2_VITA
+	if (VitaRecordEePreInstruction(pc, cpuRegs.code))
+	{
+		Cpu->ExitExecution();
+		return;
+	}
+#endif
 
 	const OPCODE& opcode = GetCurrentInstruction();
 #if 0
