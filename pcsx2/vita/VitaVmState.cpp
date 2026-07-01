@@ -9,6 +9,7 @@
 #include "VMManager.h"
 #include "VUmicro.h"
 #include "vita/VitaCore.h"
+#include "vtlb.h"
 
 #include "common/Error.h"
 #include "common/FileSystem.h"
@@ -219,6 +220,7 @@ namespace VMManager
 				return;
 
 			s_elf_executed = true;
+			mmap_ResetBlockTracking();
 			ClearCPUExecutionCaches();
 			memBindConditionalHandlers();
 			ClearCPUExecutionCaches();
