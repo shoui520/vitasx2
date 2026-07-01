@@ -27,6 +27,7 @@
 #include "common/Threading.h"
 
 #include <cctype>
+#include <cstring>
 #include <ctime>
 #ifndef _WIN32
 #include <time.h>

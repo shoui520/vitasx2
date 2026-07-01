@@ -6,6 +6,7 @@
 #include "R5900.h"
 #include "SaveState.h"
 #include "VUmicro.h"
+#include "vita/VitaCore.h"
 #include "vtlb.h"
 
 #include "common/Assertions.h"
@@ -191,4 +192,12 @@ bool SaveStateBase::vuJITFreeze()
 	Freeze(empty_data);
 	Freeze(empty_data);
 	return true;
+}
+
+void VitaSelectInterpreterCpuProviders()
+{
+	Cpu = &intCpu;
+	psxCpu = &psxInt;
+	CpuVU0 = &CpuIntVU0;
+	CpuVU1 = &CpuIntVU1;
 }

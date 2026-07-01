@@ -2,6 +2,7 @@
 
 set(VITASX2_TITLEID "VSX200001")
 set(VITASX2_CORE_SMOKE_TITLEID "VSX200002")
+set(VITASX2_BIOS_SMOKE_TITLEID "VSX200003")
 
 # --- toolchain/runtime probe -------------------------------------------------
 add_executable(vitasx2-probe
@@ -29,4 +30,18 @@ vita_create_self(vitasx2-core-smoke.self vitasx2-core-smoke UNSAFE)
 vita_create_vpk(vitasx2-core-smoke.vpk ${VITASX2_CORE_SMOKE_TITLEID} vitasx2-core-smoke.self
 	VERSION "00.01"
 	NAME "VitaSX2 Core Smoke"
+)
+
+# --- BIOS/reset smoke -------------------------------------------------------
+add_executable(vitasx2-bios-smoke
+	core/BiosSmokeMain.cpp
+)
+target_link_libraries(vitasx2-bios-smoke
+	pcsx2core
+)
+
+vita_create_self(vitasx2-bios-smoke.self vitasx2-bios-smoke UNSAFE)
+vita_create_vpk(vitasx2-bios-smoke.vpk ${VITASX2_BIOS_SMOKE_TITLEID} vitasx2-bios-smoke.self
+	VERSION "00.01"
+	NAME "VitaSX2 BIOS Smoke"
 )

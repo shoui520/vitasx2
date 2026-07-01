@@ -285,6 +285,12 @@ bool Path::IsAbsolute(const std::string_view path)
 	return (path.length() >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
 			   path[1] == ':' && (path[2] == '/' || path[2] == '\\')) ||
 		   (path.length() >= 3 && path[0] == '\\' && path[1] == '\\');
+#elif defined(__vita__)
+	const size_t colon_pos = path.find(':');
+	const size_t slash_pos = path.find('/');
+	return (path.length() >= 1 && path[0] == '/') ||
+		   (colon_pos != std::string_view::npos && colon_pos > 0 &&
+			   (slash_pos == std::string_view::npos || colon_pos < slash_pos));
 #else
 	return (path.length() >= 1 && path[0] == '/');
 #endif
@@ -389,6 +395,16 @@ std::string Path::RealPath(const std::string_view path)
 		realpath.erase(0, 7);
 		realpath.insert(realpath.begin(), '\\');
 	}
+
+#elif defined(__vita__)
+	for (const std::string_view& comp : components)
+	{
+		if (!realpath.empty())
+			realpath.push_back(FS_OSPATH_SEPARATOR_CHARACTER);
+		realpath.append(comp);
+	}
+
+	realpath = Path::Canonicalize(realpath);
 
 #else
 	// Why this monstrosity instead of calling realpath()? realpath() only works on files that exist.
