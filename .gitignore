@@ -1,0 +1,10 @@
+build/
+build-*/
+*.o
+*.a
+*.elf
+*.velf
+*.self
+*.vpk
+compile_commands.json
+.cache/
