@@ -4,6 +4,7 @@ set(VITASX2_TITLEID "VSX200001")
 set(VITASX2_CORE_SMOKE_TITLEID "VSX200002")
 set(VITASX2_BIOS_SMOKE_TITLEID "VSX200003")
 set(VITASX2_BIOS_EE_TRACE_TITLEID "VSX200004")
+set(VITASX2_BIOS_IOP_TRACE_TITLEID "VSX200005")
 
 # --- toolchain/runtime probe -------------------------------------------------
 add_executable(vitasx2-probe
@@ -59,4 +60,18 @@ vita_create_self(vitasx2-bios-ee-trace.self vitasx2-bios-ee-trace UNSAFE)
 vita_create_vpk(vitasx2-bios-ee-trace.vpk ${VITASX2_BIOS_EE_TRACE_TITLEID} vitasx2-bios-ee-trace.self
 	VERSION "00.01"
 	NAME "VitaSX2 BIOS EE Trace"
+)
+
+# --- BIOS IOP trace smoke ---------------------------------------------------
+add_executable(vitasx2-bios-iop-trace
+	core/BiosIopTraceMain.cpp
+)
+target_link_libraries(vitasx2-bios-iop-trace
+	pcsx2core
+)
+
+vita_create_self(vitasx2-bios-iop-trace.self vitasx2-bios-iop-trace UNSAFE)
+vita_create_vpk(vitasx2-bios-iop-trace.vpk ${VITASX2_BIOS_IOP_TRACE_TITLEID} vitasx2-bios-iop-trace.self
+	VERSION "00.01"
+	NAME "VitaSX2 BIOS IOP Trace"
 )

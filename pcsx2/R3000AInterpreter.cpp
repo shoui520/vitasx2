@@ -10,6 +10,9 @@
 #include "DebugTools/Breakpoints.h"
 #include "IopBios.h"
 #include "IopHw.h"
+#ifdef VITASX2_VITA
+#include "vita/VitaCore.h"
+#endif
 
 using namespace R3000A;
 
@@ -224,6 +227,15 @@ static __fi void execI()
 	}
 
 	psxRegs.code = iopMemRead32(psxRegs.pc);
+#ifdef VITASX2_VITA
+	if (VitaRecordIopPreInstruction(psxRegs.pc, psxRegs.code))
+	{
+		psxRegs.iopCycleEE = 0;
+		branch2 = 1;
+		Cpu->ExitExecution();
+		return;
+	}
+#endif
 
 		PSXCPU_LOG("%s", disR3000AF(psxRegs.code, psxRegs.pc));
 

@@ -13,6 +13,7 @@
 #include "common/Console.h"
 
 static VitaEePreInstructionTraceCallback s_ee_pre_instruction_trace_callback = nullptr;
+static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback = nullptr;
 
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback)
 {
@@ -22,6 +23,17 @@ void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback call
 bool VitaRecordEePreInstruction(u32 pc, u32 opcode)
 {
 	const VitaEePreInstructionTraceCallback callback = s_ee_pre_instruction_trace_callback;
+	return callback ? callback(pc, opcode) : false;
+}
+
+void VitaSetIopPreInstructionTraceCallback(VitaIopPreInstructionTraceCallback callback)
+{
+	s_iop_pre_instruction_trace_callback = callback;
+}
+
+bool VitaRecordIopPreInstruction(u32 pc, u32 opcode)
+{
+	const VitaIopPreInstructionTraceCallback callback = s_iop_pre_instruction_trace_callback;
 	return callback ? callback(pc, opcode) : false;
 }
 

@@ -16,3 +16,9 @@ void VitaSelectInterpreterCpuProviders();
 using VitaEePreInstructionTraceCallback = bool (*)(u32 pc, u32 opcode);
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback);
 bool VitaRecordEePreInstruction(u32 pc, u32 opcode);
+
+// Mirrors the PCSX2 DebugTools/IopTrace.cpp::RecordIopPreInstruction hook point
+// in R3000AInterpreter.cpp::execI() for Vita bring-up trace executables.
+using VitaIopPreInstructionTraceCallback = bool (*)(u32 pc, u32 opcode);
+void VitaSetIopPreInstructionTraceCallback(VitaIopPreInstructionTraceCallback callback);
+bool VitaRecordIopPreInstruction(u32 pc, u32 opcode);
