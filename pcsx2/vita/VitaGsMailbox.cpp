@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include "Gif_Unit.h"
 #include "MTGS.h"
 
 namespace MTGS
@@ -112,3 +113,22 @@ namespace MTGS
 	{
 	}
 } // namespace MTGS
+
+void Gif_AddGSPacketMTVU(GS_Packet& gsPack, GIF_PATH path)
+{
+	gifUnit.gifPath[path].readAmount.fetch_add(gsPack.size);
+}
+
+void Gif_AddCompletedGSPacket(GS_Packet& gsPack, GIF_PATH path)
+{
+	gifUnit.gifPath[path].readAmount.fetch_add(gsPack.size);
+}
+
+void Gif_AddBlankGSPacket(u32 size, GIF_PATH path)
+{
+	gifUnit.gifPath[path].readAmount.fetch_add(size);
+}
+
+void Gif_MTGS_Wait(bool isMTVU)
+{
+}

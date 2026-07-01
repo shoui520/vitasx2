@@ -170,7 +170,9 @@ private:
 	std::atomic<u32> m_rpos{0};
 	std::atomic<u32> m_wpos{0};
 
+#if !defined(ARCH_ARM32)
 	std::unique_ptr<soundtouch::SoundTouch> m_soundtouch;
+#endif
 
 	u32 m_target_buffer_size = 0;
 	u32 m_stretch_reset = STRETCH_RESET_THRESHOLD;
@@ -188,7 +190,9 @@ private:
 	// temporary staging buffer, used for timestretching
 	std::unique_ptr<SampleType[]> m_staging_buffer;
 
+#if !defined(ARCH_ARM32)
 	std::unique_ptr<FreeSurroundDecoder> m_expander;
+#endif
 
 	// block buffer for expansion
 	std::unique_ptr<float[]> m_expand_buffer;

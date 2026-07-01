@@ -10,12 +10,23 @@
 #include "common/Assertions.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 
 void* _aligned_malloc(size_t size, size_t align)
 {
 	pxAssert(align < 0x10000);
-#if defined(__USE_ISOC11) && !defined(ASAN_WORKAROUND) // not supported yet on gcc 4.9
+#if defined(__vita__)
+	const size_t effective_align = std::max<size_t>(align, sizeof(void*));
+	const size_t total_size = size + effective_align - 1 + sizeof(void*);
+	void* raw = malloc(total_size);
+	if (!raw)
+		return nullptr;
+
+	const uintptr_t aligned = (reinterpret_cast<uintptr_t>(raw) + sizeof(void*) + effective_align - 1) & ~(effective_align - 1);
+	reinterpret_cast<void**>(aligned)[-1] = raw;
+	return reinterpret_cast<void*>(aligned);
+#elif defined(__USE_ISOC11) && !defined(ASAN_WORKAROUND) // not supported yet on gcc 4.9
 	return aligned_alloc(align, size);
 #else
 #ifdef __APPLE__
@@ -45,6 +56,12 @@ void* pcsx2_aligned_realloc(void* handle, size_t new_size, size_t align, size_t 
 
 __fi void _aligned_free(void* pmem)
 {
+#if defined(__vita__)
+	if (!pmem)
+		return;
+	free(reinterpret_cast<void**>(pmem)[-1]);
+#else
 	free(pmem);
+#endif
 }
 #endif

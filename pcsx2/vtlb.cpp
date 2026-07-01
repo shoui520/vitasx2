@@ -87,8 +87,16 @@ static std::unordered_set<u32> s_fastmem_faulting_pcs;
 
 vtlb_private::VTLBPhysical vtlb_private::VTLBPhysical::fromPointer(sptr ptr)
 {
+#if defined(ARCH_ARM32)
+	pxAssertMsg(vtlbdata.host_memory_base != 0, "Vita VTLB host memory base was not initialized");
+	pxAssertMsg(ptr >= static_cast<sptr>(vtlbdata.host_memory_base), "Pointer before Vita VTLB host memory base");
+	const uptr offset = static_cast<uptr>(ptr) - vtlbdata.host_memory_base;
+	pxAssertMsg(offset < HostMemoryMap::MainSize, "Pointer outside Vita VTLB host memory arena");
+	return VTLBPhysical(static_cast<sptr>(offset));
+#else
 	pxAssertMsg(ptr >= 0, "Address too high");
 	return VTLBPhysical(ptr);
+#endif
 }
 
 vtlb_private::VTLBPhysical vtlb_private::VTLBPhysical::fromHandler(vtlbHandler handler)
@@ -917,7 +925,7 @@ static bool vtlb_GetMainMemoryOffset(u32 paddr, u32* mainmem_offset, u32* mainme
 	if (vm.isHandler())
 		return false;
 
-	return vtlb_GetMainMemoryOffsetFromPtr(vm.raw(), mainmem_offset, mainmem_size, prot);
+	return vtlb_GetMainMemoryOffsetFromPtr(vm.assumePtr(), mainmem_offset, mainmem_size, prot);
 }
 
 static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageProtectionMode& mode)
@@ -1348,6 +1356,9 @@ bool vtlb_Core_Alloc()
 	pxAssert(!vtlbdata.vmap && !vtlbdata.fastmem_base && !s_fastmem_area);
 
 	vtlbdata.vmap = reinterpret_cast<VTLBVirtual*>(SysMemory::GetVTLBVirtualMap());
+#if defined(ARCH_ARM32)
+	vtlbdata.host_memory_base = reinterpret_cast<uptr>(SysMemory::GetDataPtr(0));
+#endif
 
 #if defined(ARCH_ARM32)
 	// Vita has no user-mode page protection or fault handler substrate. Keep the
@@ -1406,6 +1417,9 @@ void vtlb_Core_Free()
 	vtlb_ClearLoadStoreInfo();
 
 	vtlbdata.fastmem_base = 0;
+#if defined(ARCH_ARM32)
+	vtlbdata.host_memory_base = 0;
+#endif
 	decltype(s_fastmem_physical_mapping)().swap(s_fastmem_physical_mapping);
 	decltype(s_fastmem_virtual_mapping)().swap(s_fastmem_virtual_mapping);
 	s_fastmem_area.reset();

@@ -39,9 +39,19 @@ namespace VMManager
 		return 1.0f;
 	}
 
+	bool IsTargetSpeedAdjustedToHost()
+	{
+		return false;
+	}
+
 	float GetFrameRate()
 	{
 		return 0.0f;
+	}
+
+	std::string GetDiscSerial()
+	{
+		return {};
 	}
 
 	void UpdateTargetSpeed()

@@ -35,7 +35,13 @@ typedef u128 mem128_t;
 // Needs to fit within EEmemSize of Memory.h
 struct EEVM_MemoryAllocMess
 {
+#if defined(ARCH_ARM32)
+	// Vita targets retail PS2 memory. Memory.cpp::memMapPhy() exposes
+	// Ps2MemSize::ExposedRam, which the Vita port keeps at MainRam.
+	u8 Main[Ps2MemSize::MainRam];
+#else
 	u8 Main[Ps2MemSize::TotalRam];   // Main memory
+#endif
 	u8 Scratch[Ps2MemSize::Scratch]; // Scratchpad!
 	u8 ROM[Ps2MemSize::Rom];         // Boot rom (4MB)
 	u8 ROM1[Ps2MemSize::Rom1];       // DVD player (4MB)
@@ -53,7 +59,13 @@ struct EEVM_MemoryAllocMess
 // Needs to fit within IOPmemSize of Memory.h
 struct IopVM_MemoryAllocMess
 {
+#if defined(ARCH_ARM32)
+	// Vita keeps only the IOP-visible RAM range. IopMem.cpp::iopMemReset()
+	// maps this through Ps2MemSize::ExposedIopRam (2 MiB retail, 8 MiB max).
+	u8 Main[Ps2MemSize::TotalIopRam];
+#else
 	u8 Main[Ps2MemSize::TotalRam]; // Main memory
+#endif
 	u8 P[_64kb];                   // I really have no idea what this is... --air
 	u8 Sif[0x100];                 // a few special SIF/SBUS registers (likely not needed)
 };

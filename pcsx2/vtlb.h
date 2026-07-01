@@ -148,7 +148,7 @@ namespace vtlb_private
 		/// Returns whether or not this entry is a handler
 		bool isHandler() const { return value < 0; }
 		/// Assumes the entry is a pointer, giving back its value
-		uptr assumePtr() const { return value; }
+		uptr assumePtr() const;
 		/// Assumes the entry is a handler, and gets the raw handler ID
 		u8 assumeHandler() const { return value; }
 	};
@@ -170,7 +170,7 @@ namespace vtlb_private
 		/// Returns whether or not this entry is a handler
 		bool isHandler(u32 vaddr) const { return (sptr)(value + vaddr) < 0; }
 		/// Assumes the entry is a pointer, giving back its value
-		uptr assumePtr(u32 vaddr) const { return value + vaddr; }
+		uptr assumePtr(u32 vaddr) const;
 		/// Assumes the entry is a handler, and gets the raw handler ID
 		u8 assumeHandlerGetID() const { return value; }
 		/// Assumes the entry is a handler, and gets the physical address
@@ -196,16 +196,40 @@ namespace vtlb_private
 		u32* ppmap;               //4MB (allocated by vtlb_init) // PS2 virtual to PS2 physical
 
 		uptr fastmem_base;
+#if defined(ARCH_ARM32)
+		uptr host_memory_base;
+#endif
 
 		MapData()
 		{
 			vmap = NULL;
 			ppmap = NULL;
 			fastmem_base = 0;
+#if defined(ARCH_ARM32)
+			host_memory_base = 0;
+#endif
 		}
 	};
 
 	alignas(64) extern MapData vtlbdata;
+
+	inline uptr VTLBPhysical::assumePtr() const
+	{
+#if defined(ARCH_ARM32)
+		return vtlbdata.host_memory_base + value;
+#else
+		return value;
+#endif
+	}
+
+	inline uptr VTLBVirtual::assumePtr(u32 vaddr) const
+	{
+#if defined(ARCH_ARM32)
+		return vtlbdata.host_memory_base + value + vaddr;
+#else
+		return value + vaddr;
+#endif
+	}
 
 	inline void *VTLBVirtual::assumeHandlerGetRaw(int index, bool write) const
 	{

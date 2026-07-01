@@ -71,6 +71,8 @@ add_library(pcsx2core STATIC
 	R5900.cpp
 	R5900OpcodeImpl.cpp
 	R5900OpcodeTables.cpp
+	SIO/Pad/PadBase.cpp
+	SIO/Pad/PadNotConnected.cpp
 	SIO/Memcard/MemoryCardFile.cpp
 	SIO/Memcard/MemoryCardProtocol.cpp
 	SIO/Multitap/MultitapProtocol.cpp
@@ -118,9 +120,14 @@ add_library(pcsx2core STATIC
 	ps2/Iop/PsxBios.cpp
 	ps2/pgif.cpp
 	sif2.cpp
+	vita/VitaAudioStream.cpp
+	vita/VitaCaptureDisabled.cpp
+	vita/VitaCdvdDevice.cpp
 	vita/VitaCpuProviders.cpp
 	vita/VitaDisabledDevices.cpp
 	vita/VitaGsMailbox.cpp
+	vita/VitaHostSurface.cpp
+	vita/VitaPad.cpp
 	vita/VitaVifInterpreter.cpp
 	vita/VitaVmState.cpp
 	vtlb.cpp

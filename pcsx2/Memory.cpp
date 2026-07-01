@@ -269,6 +269,10 @@ bool memGetExtraMemMode()
 
 void memSetExtraMemMode(bool mode)
 {
+#if defined(ARCH_ARM32)
+	// Vita has no memory budget for PCSX2's optional 128 MiB devkit RAM mode.
+	mode = false;
+#endif
 	s_extra_memory = mode;
 
 	// update the amount of RAM exposed to the VM
