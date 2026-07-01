@@ -5,6 +5,7 @@ set(VITASX2_CORE_SMOKE_TITLEID "VSX200002")
 set(VITASX2_BIOS_SMOKE_TITLEID "VSX200003")
 set(VITASX2_BIOS_EE_TRACE_TITLEID "VSX200004")
 set(VITASX2_BIOS_IOP_TRACE_TITLEID "VSX200005")
+set(VITASX2_CUBE_EE_TRACE_TITLEID "VSX200006")
 
 # --- toolchain/runtime probe -------------------------------------------------
 add_executable(vitasx2-probe
@@ -74,4 +75,18 @@ vita_create_self(vitasx2-bios-iop-trace.self vitasx2-bios-iop-trace UNSAFE)
 vita_create_vpk(vitasx2-bios-iop-trace.vpk ${VITASX2_BIOS_IOP_TRACE_TITLEID} vitasx2-bios-iop-trace.self
 	VERSION "00.01"
 	NAME "VitaSX2 BIOS IOP Trace"
+)
+
+# --- Homebrew ELF EE trace smoke -------------------------------------------
+add_executable(vitasx2-cube-ee-trace
+	core/ElfEeTraceMain.cpp
+)
+target_link_libraries(vitasx2-cube-ee-trace
+	pcsx2core
+)
+
+vita_create_self(vitasx2-cube-ee-trace.self vitasx2-cube-ee-trace UNSAFE)
+vita_create_vpk(vitasx2-cube-ee-trace.vpk ${VITASX2_CUBE_EE_TRACE_TITLEID} vitasx2-cube-ee-trace.self
+	VERSION "00.01"
+	NAME "VitaSX2 Cube EE Trace"
 )

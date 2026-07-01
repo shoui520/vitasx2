@@ -9,6 +9,11 @@
 // executables before the full Vita VM lifecycle exists.
 void VitaSelectInterpreterCpuProviders();
 
+// Mirrors the fast-boot ELF state that VMManager.cpp::Initialize() seeds for
+// R5900.cpp::eeloadHook() in Vita bring-up executables.
+void VitaClearVmBootState();
+void VitaSetFastBootElfOverride(const char* elf_path);
+
 // Mirrors the PCSX2 DebugTools/EeTrace.cpp::RecordEePreInstruction hook point
 // in Interpreter.cpp::execI() for Vita bring-up trace executables.
 // Return true only from Cpu->Execute() flows; Cpu->Step() users should stop
