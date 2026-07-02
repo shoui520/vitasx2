@@ -8,6 +8,14 @@ set(VITASX2_BIOS_IOP_TRACE_TITLEID "VSX200005")
 set(VITASX2_CUBE_EE_TRACE_TITLEID "VSX200006")
 set(VITASX2_SIMPLE2000_EE_TRACE_TITLEID "VSX200007")
 
+set(VITASX2_CUBE_EE_TRACE_RECORDS "4096" CACHE STRING "Cube EE trace records to write.")
+set(VITASX2_CUBE_EE_TRACE_SKIP_RECORDS "0" CACHE STRING "Cube EE trace records to skip before writing.")
+option(VITASX2_CUBE_EE_TRACE_FROM_BOOT "Start the cube EE trace at BIOS boot instead of ELF entry." OFF)
+
+set(VITASX2_SIMPLE2000_EE_TRACE_RECORDS "4096" CACHE STRING "Simple 2000 EE trace records to write.")
+set(VITASX2_SIMPLE2000_EE_TRACE_SKIP_RECORDS "0" CACHE STRING "Simple 2000 EE trace records to skip before writing.")
+option(VITASX2_SIMPLE2000_EE_TRACE_FROM_BOOT "Start the Simple 2000 EE trace at BIOS boot instead of ELF entry." OFF)
+
 # --- toolchain/runtime probe -------------------------------------------------
 add_executable(vitasx2-probe
 	probe/ProbeMain.cpp
@@ -82,6 +90,11 @@ vita_create_vpk(vitasx2-bios-iop-trace.vpk ${VITASX2_BIOS_IOP_TRACE_TITLEID} vit
 add_executable(vitasx2-cube-ee-trace
 	core/ElfEeTraceMain.cpp
 )
+target_compile_definitions(vitasx2-cube-ee-trace PRIVATE
+	VITASX2_EE_TRACE_RECORDS=${VITASX2_CUBE_EE_TRACE_RECORDS}
+	VITASX2_EE_TRACE_SKIP_RECORDS=${VITASX2_CUBE_EE_TRACE_SKIP_RECORDS}
+	VITASX2_EE_TRACE_FROM_BOOT=$<BOOL:${VITASX2_CUBE_EE_TRACE_FROM_BOOT}>
+)
 target_link_libraries(vitasx2-cube-ee-trace
 	pcsx2core
 )
@@ -95,6 +108,11 @@ vita_create_vpk(vitasx2-cube-ee-trace.vpk ${VITASX2_CUBE_EE_TRACE_TITLEID} vitas
 # --- Real-game disc EE trace smoke -----------------------------------------
 add_executable(vitasx2-simple2000-ee-trace
 	core/DiscEeTraceMain.cpp
+)
+target_compile_definitions(vitasx2-simple2000-ee-trace PRIVATE
+	VITASX2_EE_TRACE_RECORDS=${VITASX2_SIMPLE2000_EE_TRACE_RECORDS}
+	VITASX2_EE_TRACE_SKIP_RECORDS=${VITASX2_SIMPLE2000_EE_TRACE_SKIP_RECORDS}
+	VITASX2_EE_TRACE_FROM_BOOT=$<BOOL:${VITASX2_SIMPLE2000_EE_TRACE_FROM_BOOT}>
 )
 target_link_libraries(vitasx2-simple2000-ee-trace
 	pcsx2core
