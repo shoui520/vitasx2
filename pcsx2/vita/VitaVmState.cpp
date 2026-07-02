@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "CDVD/CDVD.h"
+#include "Config.h"
 #include "Elfheader.h"
 #include "Memory.h"
 #include "R3000A.h"
@@ -220,6 +221,9 @@ namespace VMManager
 				return;
 
 			s_elf_executed = true;
+			// Mirrors VMManager.cpp::EntryPointCompilingOnCPUThread() -> HandleELFChange(true):
+			// the BIOS/EELOAD-only InstantDMAHack from ApplyGameFixes() is cleared once the game ELF owns execution.
+			EmuConfig.Gamefixes.InstantDMAHack = false;
 			mmap_ResetBlockTracking();
 			ClearCPUExecutionCaches();
 			memBindConditionalHandlers();
