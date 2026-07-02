@@ -28,6 +28,14 @@ namespace VitaA32
 		AL = 0xe,
 	};
 
+	enum class ShiftType : u8
+	{
+		LSL = 0,
+		LSR = 1,
+		ASR = 2,
+		ROR = 3,
+	};
+
 	// Vita ARM-state code buffer for the future EE recompiler.
 	// PCSX2's current x86 owners for the first real consumer are
 	// x86/ix86-32/iR5900.cpp::iBranchTest() and x86/BaseblockEx.cpp::BaseBlocks::Link().
@@ -57,7 +65,10 @@ namespace VitaA32
 		bool EmitMovImm8(unsigned rd, u8 value);
 		bool EmitMovImm32(unsigned rd, u32 value);
 		bool EmitAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+		bool EmitSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+		bool EmitOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitAdcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+		bool EmitMovRegShiftImm(unsigned rd, unsigned rm, ShiftType shift, u8 amount, bool set_flags = false);
 		bool EmitSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitLdrImm12(unsigned rd, unsigned rn, u16 offset);
@@ -83,7 +94,10 @@ namespace VitaA32
 	u32 EncodeMovw(unsigned rd, u16 value);
 	u32 EncodeMovt(unsigned rd, u16 value);
 	u32 EncodeAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+	u32 EncodeSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+	u32 EncodeOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 	u32 EncodeAdcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+	u32 EncodeMovRegShiftImm(unsigned rd, unsigned rm, ShiftType shift, u8 amount, bool set_flags = false);
 	u32 EncodeSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset);
