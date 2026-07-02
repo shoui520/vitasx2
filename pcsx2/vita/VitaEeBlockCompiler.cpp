@@ -125,6 +125,20 @@ namespace VitaEE
 			}
 		}
 
+		bool CanCompileREGIMM(u32 op)
+		{
+			switch (RT(op))
+			{
+				case 0x00: // BLTZ, owned by Interpreter.cpp::BLTZ().
+				case 0x01: // BGEZ, owned by Interpreter.cpp::BGEZ().
+				case 0x10: // BLTZAL, owned by Interpreter.cpp::BLTZAL().
+				case 0x11: // BGEZAL, owned by Interpreter.cpp::BGEZAL().
+					return true;
+				default:
+					return false;
+			}
+		}
+
 		u32 ScaleBlockCycles(u32 raw_cycles)
 		{
 			// Ported from PCSX2 x86/ix86-32/iR5900.cpp::scaleblockcycles_calculation()
@@ -164,11 +178,15 @@ namespace VitaEE
 		{
 			case 0x00:
 				return CanCompileSPECIAL(op);
+			case 0x01:
+				return CanCompileREGIMM(op);
 			case 0x02: // J, owned by Interpreter.cpp::J().
 			case 0x03: // JAL, owned by Interpreter.cpp::JAL().
 				return !EmuConfig.Gamefixes.GoemonTlbHack;
 			case 0x04: // BEQ, owned by Interpreter.cpp::BEQ().
 			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
+			case 0x06: // BLEZ, owned by Interpreter.cpp::BLEZ().
+			case 0x07: // BGTZ, owned by Interpreter.cpp::BGTZ().
 				return true;
 			case 0x09: // ADDIU, owned by R5900OpcodeImpl.cpp::ADDIU().
 			case 0x0a: // SLTI, owned by R5900OpcodeImpl.cpp::SLTI().
@@ -197,11 +215,15 @@ namespace VitaEE
 					default:
 						return false;
 				}
+			case 0x01:
+				return CanCompileREGIMM(op);
 			case 0x02: // J, owned by Interpreter.cpp::J().
 			case 0x03: // JAL, owned by Interpreter.cpp::JAL().
 				return !EmuConfig.Gamefixes.GoemonTlbHack;
 			case 0x04: // BEQ, owned by Interpreter.cpp::BEQ().
 			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
+			case 0x06: // BLEZ, owned by Interpreter.cpp::BLEZ().
+			case 0x07: // BGTZ, owned by Interpreter.cpp::BGTZ().
 				return true;
 			default:
 				return false;
@@ -285,6 +307,11 @@ namespace VitaEE
 								return false;
 						}
 						break;
+					case 0x01:
+						branch_target_pc = BranchTarget(pc, op);
+						if (!EmitREGIMM(op, pc))
+							return false;
+						break;
 					case 0x02:
 						branch_target_pc = JumpTarget(pc, op);
 						if (!EmitJ(op, pc))
@@ -303,6 +330,16 @@ namespace VitaEE
 					case 0x05:
 						branch_target_pc = BranchTarget(pc, op);
 						if (!EmitBNE(op))
+							return false;
+						break;
+					case 0x06:
+						branch_target_pc = BranchTarget(pc, op);
+						if (!EmitBLEZ(op))
+							return false;
+						break;
+					case 0x07:
+						branch_target_pc = BranchTarget(pc, op);
+						if (!EmitBGTZ(op))
 							return false;
 						break;
 					default:
@@ -720,6 +757,31 @@ namespace VitaEE
 		return EmitConditionalMove(op, false);
 	}
 
+	bool BlockCompiler::EmitREGIMM(u32 op, u32 pc)
+	{
+		const unsigned rt = RT(op);
+		const bool link = (rt == 0x10 || rt == 0x11);
+		if (link)
+		{
+			// PCSX2 owners: Interpreter.cpp::BLTZAL()/BGEZAL() apply
+			// R5900.h::_SetLink(31) before testing the branch condition.
+			if (!EmitLink(31, pc))
+				return false;
+		}
+
+		switch (rt)
+		{
+			case 0x00: // BLTZ, owned by Interpreter.cpp::BLTZ().
+			case 0x10: // BLTZAL, owned by Interpreter.cpp::BLTZAL().
+				return EmitBranchSigned(op, SignedBranchCondition::LessThanZero);
+			case 0x01: // BGEZ, owned by Interpreter.cpp::BGEZ().
+			case 0x11: // BGEZAL, owned by Interpreter.cpp::BGEZAL().
+				return EmitBranchSigned(op, SignedBranchCondition::GreaterEqualZero);
+			default:
+				return false;
+		}
+	}
+
 	bool BlockCompiler::EmitJ(u32, u32 pc)
 	{
 		return EmitJump(pc, false);
@@ -748,6 +810,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitBNE(u32 op)
 	{
 		return EmitBranchEqual(op, false);
+	}
+
+	bool BlockCompiler::EmitBLEZ(u32 op)
+	{
+		return EmitBranchSigned(op, SignedBranchCondition::LessEqualZero);
+	}
+
+	bool BlockCompiler::EmitBGTZ(u32 op)
+	{
+		return EmitBranchSigned(op, SignedBranchCondition::GreaterThanZero);
 	}
 
 	bool BlockCompiler::EmitDSLLV(u32 op)
@@ -1237,9 +1309,7 @@ namespace VitaEE
 
 		// PCSX2 owner: Interpreter.cpp::JAL() applies _SetLink(31) before
 		// doBranch() executes the delay slot, so a delay-slot write to ra wins.
-		return m_code.EmitMovImm32(HOST_TMP0, pc + 8) &&
-			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-			   EmitStoreGpr64(31, HOST_TMP0, HOST_TMP1);
+		return EmitLink(31, pc);
 	}
 
 	bool BlockCompiler::EmitRegisterJump(u32 op, u32 pc, bool link)
@@ -1256,9 +1326,14 @@ namespace VitaEE
 		if (!link || rd == 0)
 			return true;
 
+		return EmitLink(rd, pc);
+	}
+
+	bool BlockCompiler::EmitLink(unsigned guest_reg, u32 pc)
+	{
 		return m_code.EmitMovImm32(HOST_TMP0, pc + 8) &&
 			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitBranchEqual(u32 op, bool branch_on_equal)
@@ -1273,6 +1348,55 @@ namespace VitaEE
 			   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1, true) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, branch_on_equal ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
+	}
+
+	bool BlockCompiler::EmitBranchSigned(u32 op, SignedBranchCondition condition)
+	{
+		const unsigned rs = RS(op);
+
+		if (condition == SignedBranchCondition::LessThanZero ||
+			condition == SignedBranchCondition::GreaterEqualZero)
+		{
+			return EmitLoadGprHigh(rs, HOST_TMP1) &&
+				   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+				   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2) &&
+				   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
+				   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
+					   condition == SignedBranchCondition::LessThanZero ? VitaA32::Condition::LT : VitaA32::Condition::GE);
+		}
+
+		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2) ||
+			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0))
+		{
+			return false;
+		}
+
+		if (condition == SignedBranchCondition::LessEqualZero)
+		{
+			if (!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::LT))
+				return false;
+		}
+		else
+		{
+			if (!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::GT))
+				return false;
+		}
+
+		const size_t high_nonzero = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (high_nonzero == static_cast<size_t>(-1))
+			return false;
+
+		const VitaA32::Condition low_condition =
+			(condition == SignedBranchCondition::LessEqualZero) ? VitaA32::Condition::EQ : VitaA32::Condition::NE;
+		if (!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2) ||
+			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, low_condition))
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(high_nonzero, m_code.Size(), VitaA32::Condition::NE);
 	}
 
 	bool BlockCompiler::EmitSetLessThan64(unsigned guest_reg, bool signed_compare)
@@ -1317,6 +1441,14 @@ namespace VitaEE
 			return m_code.EmitMovImm8(host_reg, 0);
 
 		return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg)));
+	}
+
+	bool BlockCompiler::EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg)
+	{
+		if (guest_reg == 0)
+			return m_code.EmitMovImm8(host_reg, 0);
+
+		return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg) + sizeof(u32)));
 	}
 
 	bool BlockCompiler::EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high)
