@@ -22,8 +22,12 @@ namespace VitaEE
 		bool EndBlockReturn(u8 value);
 
 	private:
+		bool EmitSPECIAL(u32 op);
 		bool EmitADDIU(u32 op);
 		bool EmitORI(u32 op);
+		bool EmitLUI(u32 op);
+		bool EmitSLL(u32 op);
+		bool EmitADDU(u32 op);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 		bool EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);

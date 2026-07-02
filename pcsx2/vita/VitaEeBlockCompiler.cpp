@@ -33,6 +33,16 @@ namespace VitaEE
 			return (op >> 16) & 0x1f;
 		}
 
+		constexpr unsigned RD(u32 op)
+		{
+			return (op >> 11) & 0x1f;
+		}
+
+		constexpr unsigned SA(u32 op)
+		{
+			return (op >> 6) & 0x1f;
+		}
+
 		constexpr u16 IMM_U(u32 op)
 		{
 			return static_cast<u16>(op);
@@ -66,10 +76,14 @@ namespace VitaEE
 	{
 		switch (op >> 26)
 		{
+			case 0x00:
+				return EmitSPECIAL(op);
 			case 0x09: // ADDIU, owned by R5900OpcodeImpl.cpp::ADDIU().
 				return EmitADDIU(op);
 			case 0x0d: // ORI, owned by R5900OpcodeImpl.cpp::ORI().
 				return EmitORI(op);
+			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
+				return EmitLUI(op);
 			default:
 				return false;
 		}
@@ -79,6 +93,19 @@ namespace VitaEE
 	{
 		return m_code.EmitMovImm8(0, value) &&
 			   m_code.EmitPop(REG_R4 | REG_PC);
+	}
+
+	bool BlockCompiler::EmitSPECIAL(u32 op)
+	{
+		switch (op & 0x3f)
+		{
+			case 0x00: // SLL, owned by R5900OpcodeImpl.cpp::SLL().
+				return EmitSLL(op);
+			case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
+				return EmitADDU(op);
+			default:
+				return false;
+		}
 	}
 
 	bool BlockCompiler::EmitADDIU(u32 op)
@@ -143,6 +170,49 @@ namespace VitaEE
 		}
 
 		return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitLUI(u32 op)
+	{
+		const unsigned rt = RT(op);
+		if (rt == 0)
+			return true;
+
+		const u32 value = op << 16;
+		return m_code.EmitMovImm32(HOST_TMP0, value) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitSLL(u32 op)
+	{
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+		const unsigned sa = SA(op);
+
+		if (rd == 0)
+			return true;
+
+		return EmitLoadGprLow(rt, HOST_TMP0) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, static_cast<u8>(sa)) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitADDU(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		return EmitLoadGprLow(rs, HOST_TMP0) &&
+			   EmitLoadGprLow(rt, HOST_TMP1) &&
+			   m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitLoadGprLow(unsigned guest_reg, unsigned host_reg)
