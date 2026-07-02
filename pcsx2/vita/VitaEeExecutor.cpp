@@ -120,6 +120,120 @@ namespace VitaEE
 		m_lookup_pages = nullptr;
 	}
 
+	s32 BlockExecutor::LastBlockRecordIndex(u32 pc) const
+	{
+		if (m_block_record_count == 0)
+			return -1;
+
+		s32 min = 0;
+		s32 max = static_cast<s32>(m_block_record_count - 1);
+		while (min != max)
+		{
+			const s32 mid = (min + max + 1) >> 1;
+			if (m_block_records[mid].start_pc > pc)
+				max = mid - 1;
+			else
+				min = mid;
+		}
+
+		return min;
+	}
+
+	bool BlockExecutor::RegisterBlockRecord(CachedBlock& block)
+	{
+		if (!block.valid)
+			return false;
+
+		UnregisterBlockRecord(block);
+		if (m_block_record_count >= m_block_records.size())
+			return false;
+
+		// PCSX2 owner: x86/BaseblockEx.h::BaseBlockArray::insert().
+		// Keep translated blocks sorted by guest start PC so invalidation and
+		// target lookup do not depend on a linear walk of the cache storage.
+		u32 insert_index = 0;
+		while (insert_index < m_block_record_count &&
+			   m_block_records[insert_index].start_pc <= block.start_pc)
+		{
+			insert_index++;
+		}
+
+		for (u32 i = m_block_record_count; i > insert_index; i--)
+			m_block_records[i] = m_block_records[i - 1];
+
+		m_block_records[insert_index] = {
+			&block,
+			block.code.EntryPoint(),
+			block.start_pc,
+			block.instruction_count,
+			block.code.Size(),
+		};
+		m_block_record_count++;
+		return true;
+	}
+
+	void BlockExecutor::UnregisterBlockRecord(CachedBlock& block)
+	{
+		u32 write_index = 0;
+		for (u32 read_index = 0; read_index < m_block_record_count; read_index++)
+		{
+			if (m_block_records[read_index].block == &block)
+				continue;
+
+			if (write_index != read_index)
+				m_block_records[write_index] = m_block_records[read_index];
+			write_index++;
+		}
+
+		for (u32 i = write_index; i < m_block_record_count; i++)
+			m_block_records[i] = {};
+
+		m_block_record_count = write_index;
+	}
+
+	void BlockExecutor::ClearBlockRecords()
+	{
+		for (u32 i = 0; i < m_block_record_count; i++)
+			m_block_records[i] = {};
+
+		m_block_record_count = 0;
+	}
+
+	BlockExecutor::CachedBlock* BlockExecutor::FindRecordedBlockByStartPc(
+		u32 start_pc, u32 instruction_count, bool match_instruction_count)
+	{
+		s32 index = LastBlockRecordIndex(start_pc);
+		while (index >= 0 && m_block_records[index].start_pc == start_pc)
+		{
+			CachedBlock* block = m_block_records[index].block;
+			if (block && block->valid &&
+				(!match_instruction_count || block->instruction_count == instruction_count))
+			{
+				if (ValidateCachedBlock(*block))
+					return block;
+
+				break;
+			}
+
+			index--;
+		}
+
+		return nullptr;
+	}
+
+	void BlockExecutor::InvalidateCachedBlock(CachedBlock& block)
+	{
+		if (!block.valid)
+			return;
+
+		UnlinkIncomingLinks(block.start_pc);
+		UnregisterIncomingLinks(block);
+		UnregisterBlockLookup(block);
+		UnregisterBlockRecord(block);
+		block.valid = false;
+		block.direct_links = {};
+	}
+
 	DirectLinkSlot* BlockExecutor::GetRecordedDirectLink(IncomingLinkRecord& record)
 	{
 		if (!record.source || !record.source->valid || record.slot_index >= DIRECT_LINK_SLOT_COUNT)
@@ -189,6 +303,7 @@ namespace VitaEE
 			block.direct_links = {};
 		}
 
+		ClearBlockRecords();
 		ClearIncomingLinks();
 		ReleaseLookupPages();
 		m_next_victim = 0;
@@ -203,21 +318,30 @@ namespace VitaEE
 		const u32 end_pc = start_pc + instruction_count * 4;
 		u32 invalidated = 0;
 
-		for (CachedBlock& block : m_cache)
+		for (u32 i = 0; i < m_block_record_count;)
 		{
-			if (!block.valid)
-				continue;
-
-			const u32 block_end = block.start_pc + block.instruction_count * 4;
-			if (block.start_pc < end_pc && start_pc < block_end)
+			CachedBlock* block = m_block_records[i].block;
+			if (!block || !block->valid)
 			{
-				UnlinkIncomingLinks(block.start_pc);
-				UnregisterIncomingLinks(block);
-				UnregisterBlockLookup(block);
-				block.valid = false;
-				block.direct_links = {};
-				invalidated++;
+				if (block)
+					UnregisterBlockRecord(*block);
+				else
+					i++;
+				continue;
 			}
+
+			if (block->start_pc >= end_pc)
+				break;
+
+			const u32 block_end = block->start_pc + block->instruction_count * 4;
+			if (start_pc < block_end)
+			{
+				InvalidateCachedBlock(*block);
+				invalidated++;
+				continue;
+			}
+
+			i++;
 		}
 
 		return invalidated;
@@ -342,11 +466,7 @@ namespace VitaEE
 		// PCSX2's x86 path combines recRAMCopy with protected-page faults.
 		// Vita has no user-mode fault repair, so validate cached opcodes before
 		// any direct-linked dispatch can reach the block.
-		UnlinkIncomingLinks(block.start_pc);
-		UnregisterIncomingLinks(block);
-		UnregisterBlockLookup(block);
-		block.valid = false;
-		block.direct_links = {};
+		InvalidateCachedBlock(block);
 		return false;
 	}
 
@@ -389,16 +509,10 @@ namespace VitaEE
 			}
 		}
 
-		for (CachedBlock& entry : m_cache)
+		if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, instruction_count, true))
 		{
-			if (!entry.valid || entry.start_pc != start_pc || entry.instruction_count != instruction_count)
-				continue;
-
-			if (ValidateCachedBlock(entry))
-			{
-				*block = &entry;
-				return true;
-			}
+			*block = entry;
+			return true;
 		}
 
 		return false;
@@ -412,13 +526,7 @@ namespace VitaEE
 				return entry;
 		}
 
-		for (CachedBlock& entry : m_cache)
-		{
-			if (entry.valid && entry.start_pc == start_pc && ValidateCachedBlock(entry))
-				return &entry;
-		}
-
-		return nullptr;
+		return FindRecordedBlockByStartPc(start_pc, 0, false);
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::AllocateCacheEntry()
@@ -431,14 +539,7 @@ namespace VitaEE
 
 		CachedBlock& victim = m_cache[m_next_victim];
 		m_next_victim = (m_next_victim + 1) % m_cache.size();
-		if (victim.valid)
-		{
-			UnlinkIncomingLinks(victim.start_pc);
-			UnregisterIncomingLinks(victim);
-			UnregisterBlockLookup(victim);
-		}
-		victim.valid = false;
-		victim.direct_links = {};
+		InvalidateCachedBlock(victim);
 		return &victim;
 	}
 
@@ -451,8 +552,7 @@ namespace VitaEE
 			return false;
 		}
 
-		UnregisterIncomingLinks(block);
-		block.valid = false;
+		InvalidateCachedBlock(block);
 
 		for (u32 i = 0; i < instruction_count; i++)
 		{
@@ -490,6 +590,12 @@ namespace VitaEE
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
 		block.direct_links = direct_links;
 		block.valid = true;
+		if (!RegisterBlockRecord(block))
+		{
+			block.valid = false;
+			block.direct_links = {};
+			return false;
+		}
 		RegisterBlockLookup(block);
 		RegisterIncomingLinks(block);
 
@@ -594,6 +700,7 @@ namespace VitaEE
 		result->instruction_count = block.instruction_count;
 		result->scaled_cycles = block.scaled_cycles;
 		result->code_size = block.code.Size();
+		result->block_records = m_block_record_count;
 		result->link_records = m_incoming_link_count;
 		return true;
 	}

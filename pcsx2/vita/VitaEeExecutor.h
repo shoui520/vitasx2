@@ -51,6 +51,7 @@ namespace VitaEE
 		u32 instruction_count = 0;
 		u32 scaled_cycles = 0;
 		size_t code_size = 0;
+		u32 block_records = 0;
 		u32 link_records = 0;
 		bool cache_hit = false;
 		bool lookup_hit = false;
@@ -105,6 +106,15 @@ namespace VitaEE
 			u8 slot_index = 0;
 		};
 
+		struct BlockRecord
+		{
+			CachedBlock* block = nullptr;
+			const void* entry_point = nullptr;
+			u32 start_pc = 0;
+			u32 instruction_count = 0;
+			size_t code_size = 0;
+		};
+
 		static u32 LookupPageIndex(u32 start_pc);
 		static u32 LookupEntryIndex(u32 start_pc);
 		bool EnsureLookupDirectory();
@@ -112,6 +122,12 @@ namespace VitaEE
 		void RegisterBlockLookup(CachedBlock& block);
 		void UnregisterBlockLookup(CachedBlock& block);
 		void ReleaseLookupPages();
+		s32 LastBlockRecordIndex(u32 pc) const;
+		bool RegisterBlockRecord(CachedBlock& block);
+		void UnregisterBlockRecord(CachedBlock& block);
+		void ClearBlockRecords();
+		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc, u32 instruction_count, bool match_instruction_count);
+		void InvalidateCachedBlock(CachedBlock& block);
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
 		void ClearIncomingLinks();
 		void RegisterIncomingLinks(CachedBlock& block);
@@ -130,8 +146,10 @@ namespace VitaEE
 		void RelinkDirectLinks();
 
 		std::array<CachedBlock, CACHE_CAPACITY> m_cache{};
+		std::array<BlockRecord, CACHE_CAPACITY> m_block_records{};
 		std::array<IncomingLinkRecord, MAX_INCOMING_LINKS> m_incoming_links{};
 		LookupPage** m_lookup_pages = nullptr;
+		u32 m_block_record_count = 0;
 		u32 m_incoming_link_count = 0;
 		size_t m_next_victim = 0;
 		bool m_direct_linking_enabled = true;
