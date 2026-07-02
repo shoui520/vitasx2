@@ -13,6 +13,7 @@ void VitaSelectInterpreterCpuProviders();
 // R5900.cpp::eeloadHook() in Vita bring-up executables.
 void VitaClearVmBootState();
 void VitaSetFastBootElfOverride(const char* elf_path);
+void VitaSetFastBootDisc();
 
 // Mirrors the PCSX2 DebugTools/EeTrace.cpp::RecordEePreInstruction hook point
 // in Interpreter.cpp::execI() for Vita bring-up trace executables.

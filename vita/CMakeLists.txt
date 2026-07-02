@@ -6,6 +6,7 @@ set(VITASX2_BIOS_SMOKE_TITLEID "VSX200003")
 set(VITASX2_BIOS_EE_TRACE_TITLEID "VSX200004")
 set(VITASX2_BIOS_IOP_TRACE_TITLEID "VSX200005")
 set(VITASX2_CUBE_EE_TRACE_TITLEID "VSX200006")
+set(VITASX2_SIMPLE2000_EE_TRACE_TITLEID "VSX200007")
 
 # --- toolchain/runtime probe -------------------------------------------------
 add_executable(vitasx2-probe
@@ -89,4 +90,18 @@ vita_create_self(vitasx2-cube-ee-trace.self vitasx2-cube-ee-trace UNSAFE)
 vita_create_vpk(vitasx2-cube-ee-trace.vpk ${VITASX2_CUBE_EE_TRACE_TITLEID} vitasx2-cube-ee-trace.self
 	VERSION "00.01"
 	NAME "VitaSX2 Cube EE Trace"
+)
+
+# --- Real-game disc EE trace smoke -----------------------------------------
+add_executable(vitasx2-simple2000-ee-trace
+	core/DiscEeTraceMain.cpp
+)
+target_link_libraries(vitasx2-simple2000-ee-trace
+	pcsx2core
+)
+
+vita_create_self(vitasx2-simple2000-ee-trace.self vitasx2-simple2000-ee-trace UNSAFE)
+vita_create_vpk(vitasx2-simple2000-ee-trace.vpk ${VITASX2_SIMPLE2000_EE_TRACE_TITLEID} vitasx2-simple2000-ee-trace.self
+	VERSION "00.01"
+	NAME "VitaSX2 Simple2000 EE Trace"
 )

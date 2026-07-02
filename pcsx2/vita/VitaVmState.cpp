@@ -251,3 +251,10 @@ void VitaSetFastBootElfOverride(const char* elf_path)
 	VMManager::s_elf_override = elf_path ? std::string(elf_path) : std::string();
 	VMManager::s_fast_boot_requested = !VMManager::s_elf_override.empty();
 }
+
+void VitaSetFastBootDisc()
+{
+	VMManager::ClearELFInfo();
+	VMManager::s_elf_override = {};
+	VMManager::s_fast_boot_requested = true;
+}

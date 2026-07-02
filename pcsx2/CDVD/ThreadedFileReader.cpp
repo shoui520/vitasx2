@@ -19,15 +19,22 @@ static constexpr u32 MINIMUM_SIZE = 128 * 1024;
 
 ThreadedFileReader::ThreadedFileReader()
 {
+#if !defined(VITASX2_VITA)
 	m_readThread = std::thread([](ThreadedFileReader* r){ r->Loop(); }, this);
+#else
+	// Vita runs CDVD flat-file reads synchronously while preserving InputIsoFile's
+	// sector handling and cache semantics.
+#endif
 }
 
 ThreadedFileReader::~ThreadedFileReader()
 {
+#if !defined(VITASX2_VITA)
 	m_quit = true;
 	(void)std::lock_guard<std::mutex>{m_mtx};
 	m_condition.notify_one();
 	m_readThread.join();
+#endif
 	for (auto& buffer : m_buffer)
 		if (buffer.ptr)
 			free(buffer.ptr);
@@ -294,6 +301,11 @@ int ThreadedFileReader::ReadSync(void* pBuffer, u32 sector, u32 count)
 	u32 blocksize = InternalBlockSize();
 	u64 offset = (u64)sector * (u64)blocksize + m_dataoffset;
 	u32 size = count * blocksize;
+#if defined(VITASX2_VITA)
+	m_amtRead = 0;
+	m_requestCancelled.store(false, std::memory_order_relaxed);
+	return Decompress(pBuffer, offset, size) ? m_amtRead : -1;
+#else
 	{
 		std::lock_guard<std::mutex> l(m_mtx);
 		if (TryCachedRead(pBuffer, offset, size, l))
@@ -328,10 +340,14 @@ int ThreadedFileReader::ReadSync(void* pBuffer, u32 sector, u32 count)
 	if (size == 0)
 		return m_amtRead;
 	return FinishRead();
+#endif
 }
 
 void ThreadedFileReader::CancelAndWaitUntilStopped(void)
 {
+#if defined(VITASX2_VITA)
+	m_requestCancelled.store(true, std::memory_order_relaxed);
+#else
 	m_requestCancelled.store(true, std::memory_order_relaxed);
 	std::unique_lock<std::mutex> lock(m_mtx);
 
@@ -341,10 +357,14 @@ void ThreadedFileReader::CancelAndWaitUntilStopped(void)
 
 	while (m_running)
 		m_condition.wait(lock);
+#endif
 }
 
 void ThreadedFileReader::BeginRead(void* pBuffer, u32 sector, u32 count)
 {
+#if defined(VITASX2_VITA)
+	m_amtRead = ReadSync(pBuffer, sector, count);
+#else
 	s32 blocksize = InternalBlockSize();
 	u64 offset = (u64)sector * (u64)blocksize + m_dataoffset;
 	u32 size = count * blocksize;
@@ -368,26 +388,35 @@ void ThreadedFileReader::BeginRead(void* pBuffer, u32 sector, u32 count)
 		m_requestCancelled.store(false, std::memory_order_relaxed);
 	}
 	m_condition.notify_one();
+#endif
 }
 
 int ThreadedFileReader::FinishRead(void)
 {
+#if defined(VITASX2_VITA)
+	return m_amtRead;
+#else
 	if (m_requestPtr.load(std::memory_order_acquire) == nullptr)
 		return m_amtRead;
 	std::unique_lock<std::mutex> lock(m_mtx);
 	while (m_requestPtr.load(std::memory_order_acquire))
 		m_condition.wait(lock);
 	return m_amtRead;
+#endif
 }
 
 void ThreadedFileReader::CancelRead(void)
 {
+#if defined(VITASX2_VITA)
+	m_requestCancelled.store(true, std::memory_order_release);
+#else
 	if (m_requestPtr.load(std::memory_order_acquire) == nullptr)
 		return;
 	m_requestCancelled.store(true, std::memory_order_release);
 	std::unique_lock<std::mutex> lock(m_mtx);
 	while (m_requestPtr.load(std::memory_order_relaxed))
 		m_condition.wait(lock);
+#endif
 }
 
 void ThreadedFileReader::Close(void)
