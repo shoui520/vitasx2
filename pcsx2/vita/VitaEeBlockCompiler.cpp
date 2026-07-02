@@ -152,7 +152,9 @@ namespace VitaEE
 				case 0x19: // MULTU, owned by R5900OpcodeImpl.cpp::MULTU().
 				case 0x1a: // DIV, owned by R5900OpcodeImpl.cpp::DIV().
 				case 0x1b: // DIVU, owned by R5900OpcodeImpl.cpp::DIVU().
+				case 0x20: // ADD, owned by R5900OpcodeImpl.cpp::ADD().
 				case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
+				case 0x22: // SUB, owned by R5900OpcodeImpl.cpp::SUB().
 				case 0x23: // SUBU, owned by R5900OpcodeImpl.cpp::SUBU().
 				case 0x24: // AND, owned by R5900OpcodeImpl.cpp::AND().
 				case 0x25: // OR, owned by R5900OpcodeImpl.cpp::OR().
@@ -160,7 +162,9 @@ namespace VitaEE
 				case 0x27: // NOR, owned by R5900OpcodeImpl.cpp::NOR().
 				case 0x2a: // SLT, owned by R5900OpcodeImpl.cpp::SLT().
 				case 0x2b: // SLTU, owned by R5900OpcodeImpl.cpp::SLTU().
+				case 0x2c: // DADD, owned by R5900OpcodeImpl.cpp::DADD().
 				case 0x2d: // DADDU, owned by R5900OpcodeImpl.cpp::DADDU().
+				case 0x2e: // DSUB, owned by R5900OpcodeImpl.cpp::DSUB().
 				case 0x2f: // DSUBU, owned by R5900OpcodeImpl.cpp::DSUBU().
 				case 0x38: // DSLL, owned by R5900OpcodeImpl.cpp::DSLL().
 				case 0x3a: // DSRL, owned by R5900OpcodeImpl.cpp::DSRL().
@@ -530,6 +534,7 @@ namespace VitaEE
 			case 0x16: // BLEZL, owned by Interpreter.cpp::BLEZL().
 			case 0x17: // BGTZL, owned by Interpreter.cpp::BGTZL().
 				return true;
+			case 0x08: // ADDI, owned by R5900OpcodeImpl.cpp::ADDI().
 			case 0x09: // ADDIU, owned by R5900OpcodeImpl.cpp::ADDIU().
 			case 0x0a: // SLTI, owned by R5900OpcodeImpl.cpp::SLTI().
 			case 0x0b: // SLTIU, owned by R5900OpcodeImpl.cpp::SLTIU().
@@ -537,6 +542,7 @@ namespace VitaEE
 			case 0x0d: // ORI, owned by R5900OpcodeImpl.cpp::ORI().
 			case 0x0e: // XORI, owned by R5900OpcodeImpl.cpp::XORI().
 			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
+			case 0x18: // DADDI, owned by R5900OpcodeImpl.cpp::DADDI().
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
 			case 0x1a: // LDL, owned by R5900OpcodeImpl.cpp::LDL().
 			case 0x1b: // LDR, owned by R5900OpcodeImpl.cpp::LDR().
@@ -927,6 +933,10 @@ namespace VitaEE
 		{
 			case 0x00:
 				return EmitSPECIAL(op);
+			case 0x08: // ADDI, owned by R5900OpcodeImpl.cpp::ADDI(). The PCSX2
+				// recompiler owner x86/ix86-32/iR5900AritImm.cpp::recADDI_() drops
+				// the integer-overflow exception, so ADDI compiles exactly like ADDIU.
+				return EmitADDIU(op);
 			case 0x09: // ADDIU, owned by R5900OpcodeImpl.cpp::ADDIU().
 				return EmitADDIU(op);
 			case 0x0a: // SLTI, owned by R5900OpcodeImpl.cpp::SLTI().
@@ -941,6 +951,9 @@ namespace VitaEE
 				return EmitXORI(op);
 			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
 				return EmitLUI(op);
+			case 0x18: // DADDI, owned by R5900OpcodeImpl.cpp::DADDI(); overflow trap
+				// dropped by x86/ix86-32/iR5900AritImm.cpp::recDADDI(), compiled as DADDIU.
+				return EmitDADDIU(op);
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
 				return EmitDADDIU(op);
 			case 0x1a: // LDL, owned by R5900OpcodeImpl.cpp::LDL().
@@ -1285,8 +1298,15 @@ namespace VitaEE
 				return EmitDIV(op);
 			case 0x1b: // DIVU, owned by R5900OpcodeImpl.cpp::DIVU().
 				return EmitDIVU(op);
+			case 0x20: // ADD, owned by R5900OpcodeImpl.cpp::ADD(). The PCSX2
+				// recompiler owner x86/ix86-32/iR5900Arit.cpp::recADD_() drops the
+				// integer-overflow exception, so ADD compiles exactly like ADDU.
+				return EmitADDU(op);
 			case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
 				return EmitADDU(op);
+			case 0x22: // SUB, owned by R5900OpcodeImpl.cpp::SUB(); overflow trap
+				// dropped by x86/ix86-32/iR5900Arit.cpp::recSUB_(), compiled as SUBU.
+				return EmitSUBU(op);
 			case 0x23: // SUBU, owned by R5900OpcodeImpl.cpp::SUBU().
 				return EmitSUBU(op);
 			case 0x24: // AND, owned by R5900OpcodeImpl.cpp::AND().
@@ -1301,8 +1321,14 @@ namespace VitaEE
 				return EmitSLT(op);
 			case 0x2b: // SLTU, owned by R5900OpcodeImpl.cpp::SLTU().
 				return EmitSLTU(op);
+			case 0x2c: // DADD, owned by R5900OpcodeImpl.cpp::DADD(); overflow trap
+				// dropped by x86/ix86-32/iR5900Arit.cpp::recDADD_(), compiled as DADDU.
+				return EmitDADDU(op);
 			case 0x2d: // DADDU, owned by R5900OpcodeImpl.cpp::DADDU().
 				return EmitDADDU(op);
+			case 0x2e: // DSUB, owned by R5900OpcodeImpl.cpp::DSUB(); overflow trap
+				// dropped by x86/ix86-32/iR5900Arit.cpp::recDSUB_(), compiled as DSUBU.
+				return EmitDSUBU(op);
 			case 0x2f: // DSUBU, owned by R5900OpcodeImpl.cpp::DSUBU().
 				return EmitDSUBU(op);
 			case 0x38: // DSLL, owned by R5900OpcodeImpl.cpp::DSLL().
