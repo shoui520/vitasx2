@@ -76,6 +76,8 @@ namespace VitaEE
 				case 0x04: // SLLV, owned by R5900OpcodeImpl.cpp::SLLV().
 				case 0x06: // SRLV, owned by R5900OpcodeImpl.cpp::SRLV().
 				case 0x07: // SRAV, owned by R5900OpcodeImpl.cpp::SRAV().
+				case 0x0a: // MOVZ, owned by R5900OpcodeImpl.cpp::MOVZ().
+				case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
 				case 0x14: // DSLLV, owned by R5900OpcodeImpl.cpp::DSLLV().
 				case 0x16: // DSRLV, owned by R5900OpcodeImpl.cpp::DSRLV().
 				case 0x17: // DSRAV, owned by R5900OpcodeImpl.cpp::DSRAV().
@@ -303,6 +305,10 @@ namespace VitaEE
 				return EmitSRLV(op);
 			case 0x07: // SRAV, owned by R5900OpcodeImpl.cpp::SRAV().
 				return EmitSRAV(op);
+			case 0x0a: // MOVZ, owned by R5900OpcodeImpl.cpp::MOVZ().
+				return EmitMOVZ(op);
+			case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
+				return EmitMOVN(op);
 			case 0x14: // DSLLV, owned by R5900OpcodeImpl.cpp::DSLLV().
 				return EmitDSLLV(op);
 			case 0x16: // DSRLV, owned by R5900OpcodeImpl.cpp::DSRLV().
@@ -556,6 +562,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitSRAV(u32 op)
 	{
 		return EmitShift32Variable(op, VitaA32::ShiftType::ASR);
+	}
+
+	bool BlockCompiler::EmitMOVZ(u32 op)
+	{
+		return EmitConditionalMove(op, true);
+	}
+
+	bool BlockCompiler::EmitMOVN(u32 op)
+	{
+		return EmitConditionalMove(op, false);
 	}
 
 	bool BlockCompiler::EmitDSLLV(u32 op)
@@ -1004,6 +1020,35 @@ namespace VitaEE
 			   m_code.PatchBranch(zero_branch, store_target, VitaA32::Condition::EQ) &&
 			   m_code.PatchBranch(done_branch, store_target) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitConditionalMove(u32 op, bool move_on_zero)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		if (!EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) ||
+			!m_code.EmitOrrReg(HOST_TMP4, HOST_TMP2, HOST_TMP3, true))
+		{
+			return false;
+		}
+
+		const VitaA32::Condition skip_condition = move_on_zero ? VitaA32::Condition::NE : VitaA32::Condition::EQ;
+		const size_t skip_store = m_code.EmitBranchPlaceholder(skip_condition);
+		if (skip_store == static_cast<size_t>(-1))
+			return false;
+
+		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) ||
+			!EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1))
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(skip_store, m_code.Size(), skip_condition);
 	}
 
 	bool BlockCompiler::EmitSetLessThan64(unsigned guest_reg, bool signed_compare)
