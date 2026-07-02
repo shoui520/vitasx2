@@ -124,9 +124,9 @@ namespace VitaEE
 			if (BlockCompiler::IsSupportedBranchOpcode(op))
 			{
 				// Ported from PCSX2 x86/ix86-32/iR5900.cpp::recRecompile():
-				// branches and jumps end the block after the delay slot. Branches
-				// or jumps in the delay slot stay on the interpreter path until the
-				// full special delay-slot rule from iR5900.cpp is ported.
+				// branches and jumps end the block after the delay slot. If the
+				// delay slot is itself a supported branch, the compiler applies
+				// recompileNextInstruction()'s branch-in-delay-slot skip rule.
 				if (i + 1 >= max_instruction_count)
 				{
 					result->stop = BlockScanStop::MaxInstructions;

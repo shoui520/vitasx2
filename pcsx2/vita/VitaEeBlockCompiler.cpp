@@ -275,9 +275,10 @@ namespace VitaEE
 	bool BlockCompiler::CanCompileDelaySlotOpcode(u32 op)
 	{
 		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() detects branches in
-		// delay slots and leaves a special path. Keep those on the interpreter
-		// side until that rule is ported completely.
-		return CanCompileOpcode(op) && !IsSupportedBranchOpcode(op);
+		// delay slots through recompileNextInstruction(true, ...): the delay
+		// branch is skipped as generated work and the outer branch still owns
+		// the block exit.
+		return CanCompileOpcode(op);
 	}
 
 	bool BlockCompiler::BeginBlock()
@@ -324,6 +325,21 @@ namespace VitaEE
 
 			if (IsSupportedBranchOpcode(op))
 			{
+				if (has_branch && i == branch_instruction_index + 1)
+				{
+					// PCSX2 owner: x86/ix86-32/iR5900.cpp::recompileNextInstruction()
+					// detects a branch while compiling the outer branch delay slot,
+					// advances PC past it, and emits no side effects or cycles for
+					// the delay-slot branch itself.
+					if (branch_is_likely &&
+						!m_code.PatchBranch(branch_likely_skip_delay, m_code.Size(), VitaA32::Condition::EQ))
+					{
+						return false;
+					}
+
+					continue;
+				}
+
 				if (has_branch || i + 1 >= instruction_count)
 					return false;
 
