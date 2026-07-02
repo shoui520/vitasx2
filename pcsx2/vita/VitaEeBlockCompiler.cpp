@@ -47,6 +47,31 @@ namespace VitaEE
 
 		alignas(16) GPR_reg s_lq_zero_sink;
 
+		constexpr u32 LWL_MASK[4] = {0x00ffffff, 0x0000ffff, 0x000000ff, 0x00000000};
+		constexpr u32 LWR_MASK[4] = {0x00000000, 0xff000000, 0xffff0000, 0xffffff00};
+		constexpr u8 LWL_SHIFT[4] = {24, 16, 8, 0};
+		constexpr u8 LWR_SHIFT[4] = {0, 8, 16, 24};
+		constexpr u64 LDL_MASK[8] = {
+			0x00ffffffffffffffULL, 0x0000ffffffffffffULL, 0x000000ffffffffffULL, 0x00000000ffffffffULL,
+			0x0000000000ffffffULL, 0x000000000000ffffULL, 0x00000000000000ffULL, 0x0000000000000000ULL};
+		constexpr u64 LDR_MASK[8] = {
+			0x0000000000000000ULL, 0xff00000000000000ULL, 0xffff000000000000ULL, 0xffffff0000000000ULL,
+			0xffffffff00000000ULL, 0xffffffffff000000ULL, 0xffffffffffff0000ULL, 0xffffffffffffff00ULL};
+		constexpr u8 LDL_SHIFT[8] = {56, 48, 40, 32, 24, 16, 8, 0};
+		constexpr u8 LDR_SHIFT[8] = {0, 8, 16, 24, 32, 40, 48, 56};
+		constexpr u32 SWL_MASK[4] = {0xffffff00, 0xffff0000, 0xff000000, 0x00000000};
+		constexpr u32 SWR_MASK[4] = {0x00000000, 0x000000ff, 0x0000ffff, 0x00ffffff};
+		constexpr u8 SWL_SHIFT[4] = {24, 16, 8, 0};
+		constexpr u8 SWR_SHIFT[4] = {0, 8, 16, 24};
+		constexpr u64 SDL_MASK[8] = {
+			0xffffffffffffff00ULL, 0xffffffffffff0000ULL, 0xffffffffff000000ULL, 0xffffffff00000000ULL,
+			0xffffff0000000000ULL, 0xffff000000000000ULL, 0xff00000000000000ULL, 0x0000000000000000ULL};
+		constexpr u64 SDR_MASK[8] = {
+			0x0000000000000000ULL, 0x00000000000000ffULL, 0x000000000000ffffULL, 0x0000000000ffffffULL,
+			0x00000000ffffffffULL, 0x000000ffffffffffULL, 0x0000ffffffffffffULL, 0x00ffffffffffffffULL};
+		constexpr u8 SDL_SHIFT[8] = {56, 48, 40, 32, 24, 16, 8, 0};
+		constexpr u8 SDR_SHIFT[8] = {0, 8, 16, 24, 32, 40, 48, 56};
+
 		constexpr unsigned RS(u32 op)
 		{
 			return (op >> 21) & 0x1f;
@@ -243,6 +268,58 @@ namespace VitaEE
 			return memRead64(addr);
 		}
 
+		__noinline void VitaEeMemReadWordLeft(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::LWL().
+			const u32 shift = addr & 3;
+			const u32 mem = memRead32(addr & ~3u);
+			if (guest_reg == 0)
+				return;
+
+			cpuRegs.GPR.r[guest_reg].SD[0] = static_cast<s32>((cpuRegs.GPR.r[guest_reg].UL[0] & LWL_MASK[shift]) |
+															  (mem << LWL_SHIFT[shift]));
+		}
+
+		__noinline void VitaEeMemReadWordRight(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::LWR().
+			const u32 shift = addr & 3;
+			const u32 aligned_mem = memRead32(addr & ~3u);
+			if (guest_reg == 0)
+				return;
+
+			const u32 mem = (cpuRegs.GPR.r[guest_reg].UL[0] & LWR_MASK[shift]) |
+							(aligned_mem >> LWR_SHIFT[shift]);
+			if (shift == 0)
+				cpuRegs.GPR.r[guest_reg].SD[0] = static_cast<s32>(mem);
+			else
+				cpuRegs.GPR.r[guest_reg].UL[0] = mem;
+		}
+
+		__noinline void VitaEeMemReadDwordLeft(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::LDL().
+			const u32 shift = addr & 7;
+			const u64 mem = memRead64(addr & ~7u);
+			if (guest_reg == 0)
+				return;
+
+			cpuRegs.GPR.r[guest_reg].UD[0] = (cpuRegs.GPR.r[guest_reg].UD[0] & LDL_MASK[shift]) |
+											 (mem << LDL_SHIFT[shift]);
+		}
+
+		__noinline void VitaEeMemReadDwordRight(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::LDR().
+			const u32 shift = addr & 7;
+			const u64 mem = memRead64(addr & ~7u);
+			if (guest_reg == 0)
+				return;
+
+			cpuRegs.GPR.r[guest_reg].UD[0] = (cpuRegs.GPR.r[guest_reg].UD[0] & LDR_MASK[shift]) |
+											 (mem >> LDR_SHIFT[shift]);
+		}
+
 		__noinline void VitaEeMemRead128Aligned(u32 addr, u32 guest_reg)
 		{
 			// PCSX2 owner: R5900OpcodeImpl.cpp::LQ().
@@ -274,6 +351,24 @@ namespace VitaEE
 			memWrite32(addr, value);
 		}
 
+		__noinline void VitaEeMemWriteWordLeft(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::SWL().
+			const u32 shift = addr & 3;
+			const u32 aligned = addr & ~3u;
+			const u32 mem = memRead32(aligned);
+			memWrite32(aligned, (cpuRegs.GPR.r[guest_reg].UL[0] >> SWL_SHIFT[shift]) | (mem & SWL_MASK[shift]));
+		}
+
+		__noinline void VitaEeMemWriteWordRight(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::SWR().
+			const u32 shift = addr & 3;
+			const u32 aligned = addr & ~3u;
+			const u32 mem = memRead32(aligned);
+			memWrite32(aligned, (cpuRegs.GPR.r[guest_reg].UL[0] << SWR_SHIFT[shift]) | (mem & SWR_MASK[shift]));
+		}
+
 		__noinline void VitaEeMemWrite64Checked(u32 addr, u32 low, u32 high)
 		{
 			// PCSX2 owner: R5900OpcodeImpl.cpp::SD().
@@ -281,6 +376,26 @@ namespace VitaEE
 				VitaEeRaiseAddressError(addr, true);
 
 			memWrite64(addr, (static_cast<u64>(high) << 32) | low);
+		}
+
+		__noinline void VitaEeMemWriteDwordLeft(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::SDL().
+			const u32 shift = addr & 7;
+			const u32 aligned = addr & ~7u;
+			const u64 mem = (cpuRegs.GPR.r[guest_reg].UD[0] >> SDL_SHIFT[shift]) |
+							(memRead64(aligned) & SDL_MASK[shift]);
+			memWrite64(aligned, mem);
+		}
+
+		__noinline void VitaEeMemWriteDwordRight(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::SDR().
+			const u32 shift = addr & 7;
+			const u32 aligned = addr & ~7u;
+			const u64 mem = (cpuRegs.GPR.r[guest_reg].UD[0] << SDR_SHIFT[shift]) |
+							(memRead64(aligned) & SDR_MASK[shift]);
+			memWrite64(aligned, mem);
 		}
 
 		__noinline void VitaEeMemWrite128Aligned(u32 addr, u32 guest_reg)
@@ -328,17 +443,25 @@ namespace VitaEE
 			case 0x0e: // XORI, owned by R5900OpcodeImpl.cpp::XORI().
 			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
+			case 0x1a: // LDL, owned by R5900OpcodeImpl.cpp::LDL().
+			case 0x1b: // LDR, owned by R5900OpcodeImpl.cpp::LDR().
 			case 0x1e: // LQ, owned by R5900OpcodeImpl.cpp::LQ().
 			case 0x1f: // SQ, owned by R5900OpcodeImpl.cpp::SQ().
 			case 0x20: // LB, owned by R5900OpcodeImpl.cpp::LB().
 			case 0x21: // LH, owned by R5900OpcodeImpl.cpp::LH().
+			case 0x22: // LWL, owned by R5900OpcodeImpl.cpp::LWL().
 			case 0x23: // LW, owned by R5900OpcodeImpl.cpp::LW().
 			case 0x24: // LBU, owned by R5900OpcodeImpl.cpp::LBU().
 			case 0x25: // LHU, owned by R5900OpcodeImpl.cpp::LHU().
+			case 0x26: // LWR, owned by R5900OpcodeImpl.cpp::LWR().
 			case 0x27: // LWU, owned by R5900OpcodeImpl.cpp::LWU().
 			case 0x28: // SB, owned by R5900OpcodeImpl.cpp::SB().
 			case 0x29: // SH, owned by R5900OpcodeImpl.cpp::SH().
+			case 0x2a: // SWL, owned by R5900OpcodeImpl.cpp::SWL().
 			case 0x2b: // SW, owned by R5900OpcodeImpl.cpp::SW().
+			case 0x2c: // SDL, owned by R5900OpcodeImpl.cpp::SDL().
+			case 0x2d: // SDR, owned by R5900OpcodeImpl.cpp::SDR().
+			case 0x2e: // SWR, owned by R5900OpcodeImpl.cpp::SWR().
 			case 0x37: // LD, owned by R5900OpcodeImpl.cpp::LD().
 			case 0x3f: // SD, owned by R5900OpcodeImpl.cpp::SD().
 				return true;
@@ -721,6 +844,10 @@ namespace VitaEE
 				return EmitLUI(op);
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
 				return EmitDADDIU(op);
+			case 0x1a: // LDL, owned by R5900OpcodeImpl.cpp::LDL().
+				return EmitLDL(op);
+			case 0x1b: // LDR, owned by R5900OpcodeImpl.cpp::LDR().
+				return EmitLDR(op);
 			case 0x1e: // LQ, owned by R5900OpcodeImpl.cpp::LQ().
 				return EmitLQ(op);
 			case 0x1f: // SQ, owned by R5900OpcodeImpl.cpp::SQ().
@@ -729,20 +856,32 @@ namespace VitaEE
 				return EmitLB(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x21: // LH, owned by R5900OpcodeImpl.cpp::LH().
 				return EmitLH(op, pc, raw_cycles_through_instruction, event_exit);
+			case 0x22: // LWL, owned by R5900OpcodeImpl.cpp::LWL().
+				return EmitLWL(op);
 			case 0x23: // LW, owned by R5900OpcodeImpl.cpp::LW().
 				return EmitLW(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x24: // LBU, owned by R5900OpcodeImpl.cpp::LBU().
 				return EmitLBU(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x25: // LHU, owned by R5900OpcodeImpl.cpp::LHU().
 				return EmitLHU(op, pc, raw_cycles_through_instruction, event_exit);
+			case 0x26: // LWR, owned by R5900OpcodeImpl.cpp::LWR().
+				return EmitLWR(op);
 			case 0x27: // LWU, owned by R5900OpcodeImpl.cpp::LWU().
 				return EmitLWU(op);
 			case 0x28: // SB, owned by R5900OpcodeImpl.cpp::SB().
 				return EmitSB(op);
 			case 0x29: // SH, owned by R5900OpcodeImpl.cpp::SH().
 				return EmitSH(op);
+			case 0x2a: // SWL, owned by R5900OpcodeImpl.cpp::SWL().
+				return EmitSWL(op);
 			case 0x2b: // SW, owned by R5900OpcodeImpl.cpp::SW().
 				return EmitSW(op);
+			case 0x2c: // SDL, owned by R5900OpcodeImpl.cpp::SDL().
+				return EmitSDL(op);
+			case 0x2d: // SDR, owned by R5900OpcodeImpl.cpp::SDR().
+				return EmitSDR(op);
+			case 0x2e: // SWR, owned by R5900OpcodeImpl.cpp::SWR().
+				return EmitSWR(op);
 			case 0x37: // LD, owned by R5900OpcodeImpl.cpp::LD().
 				return EmitLD(op);
 			case 0x3f: // SD, owned by R5900OpcodeImpl.cpp::SD().
@@ -1437,6 +1576,24 @@ namespace VitaEE
 			   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 	}
 
+	bool BlockCompiler::EmitLWL(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemReadWordLeft));
+	}
+
+	bool BlockCompiler::EmitLWR(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemReadWordRight));
+	}
+
 	bool BlockCompiler::EmitLD(u32 op)
 	{
 		const unsigned rt = RT(op);
@@ -1448,6 +1605,24 @@ namespace VitaEE
 		}
 
 		return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitLDL(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemReadDwordLeft));
+	}
+
+	bool BlockCompiler::EmitLDR(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemReadDwordRight));
 	}
 
 	bool BlockCompiler::EmitLQ(u32 op)
@@ -1486,6 +1661,24 @@ namespace VitaEE
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite32Checked));
 	}
 
+	bool BlockCompiler::EmitSWL(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWriteWordLeft));
+	}
+
+	bool BlockCompiler::EmitSWR(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWriteWordRight));
+	}
+
 	bool BlockCompiler::EmitSD(u32 op)
 	{
 		const unsigned rt = RT(op);
@@ -1493,6 +1686,24 @@ namespace VitaEE
 		return EmitEffectiveAddress(op, HOST_TMP0) &&
 			   EmitLoadGpr64(rt, HOST_TMP1, HOST_TMP2) &&
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite64Checked));
+	}
+
+	bool BlockCompiler::EmitSDL(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWriteDwordLeft));
+	}
+
+	bool BlockCompiler::EmitSDR(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWriteDwordRight));
 	}
 
 	bool BlockCompiler::EmitSQ(u32 op)
