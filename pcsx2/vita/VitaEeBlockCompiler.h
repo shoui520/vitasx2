@@ -49,6 +49,8 @@ namespace VitaEE
 		bool EmitMOVN(u32 op);
 		bool EmitJ(u32 op, u32 pc);
 		bool EmitJAL(u32 op, u32 pc);
+		bool EmitJR(u32 op, u32 pc);
+		bool EmitJALR(u32 op, u32 pc);
 		bool EmitBEQ(u32 op);
 		bool EmitBNE(u32 op);
 		bool EmitDSLLV(u32 op);
@@ -78,10 +80,12 @@ namespace VitaEE
 		bool EmitShift64RightVariable(u32 op, bool arithmetic);
 		bool EmitConditionalMove(u32 op, bool move_on_zero);
 		bool EmitJump(u32 pc, bool link);
+		bool EmitRegisterJump(u32 op, u32 pc, bool link);
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
+		bool EmitStorePcFromHostReg(unsigned host_reg);
 		bool EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc);
 		bool EmitStorePc(u32 pc);
 		bool EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);

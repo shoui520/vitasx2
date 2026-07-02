@@ -21,7 +21,9 @@ namespace VitaEE
 		constexpr u16 REG_PC = 1u << 15;
 
 		constexpr unsigned HOST_CPU_REGS = 4;
-		constexpr unsigned HOST_BRANCH_FLAG = 5;
+		constexpr unsigned HOST_BRANCH_STATE = 5;
+		constexpr unsigned HOST_BRANCH_FLAG = HOST_BRANCH_STATE;
+		constexpr unsigned HOST_BRANCH_TARGET = HOST_BRANCH_STATE;
 		constexpr unsigned HOST_TMP0 = 0;
 		constexpr unsigned HOST_TMP1 = 1;
 		constexpr unsigned HOST_TMP2 = 2;
@@ -93,6 +95,9 @@ namespace VitaEE
 				case 0x04: // SLLV, owned by R5900OpcodeImpl.cpp::SLLV().
 				case 0x06: // SRLV, owned by R5900OpcodeImpl.cpp::SRLV().
 				case 0x07: // SRAV, owned by R5900OpcodeImpl.cpp::SRAV().
+				case 0x08: // JR, owned by Interpreter.cpp::JR().
+				case 0x09: // JALR, owned by Interpreter.cpp::JALR().
+					return !EmuConfig.Gamefixes.GoemonTlbHack;
 				case 0x0a: // MOVZ, owned by R5900OpcodeImpl.cpp::MOVZ().
 				case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
 				case 0x14: // DSLLV, owned by R5900OpcodeImpl.cpp::DSLLV().
@@ -183,6 +188,15 @@ namespace VitaEE
 	{
 		switch (op >> 26)
 		{
+			case 0x00:
+				switch (op & 0x3f)
+				{
+					case 0x08: // JR, owned by Interpreter.cpp::JR().
+					case 0x09: // JALR, owned by Interpreter.cpp::JALR().
+						return !EmuConfig.Gamefixes.GoemonTlbHack;
+					default:
+						return false;
+				}
 			case 0x02: // J, owned by Interpreter.cpp::J().
 			case 0x03: // JAL, owned by Interpreter.cpp::JAL().
 				return !EmuConfig.Gamefixes.GoemonTlbHack;
@@ -219,6 +233,7 @@ namespace VitaEE
 
 		u32 raw_cycles = 0;
 		bool has_branch = false;
+		bool has_register_branch_target = false;
 		u32 branch_instruction_index = 0;
 		u32 branch_target_pc = 0;
 		const auto add_raw_cycles = [&raw_cycles](u32 op) {
@@ -253,6 +268,23 @@ namespace VitaEE
 
 				switch (op >> 26)
 				{
+					case 0x00:
+						switch (op & 0x3f)
+						{
+							case 0x08:
+								has_register_branch_target = true;
+								if (!EmitJR(op, pc))
+									return false;
+								break;
+							case 0x09:
+								has_register_branch_target = true;
+								if (!EmitJALR(op, pc))
+									return false;
+								break;
+							default:
+								return false;
+						}
+						break;
 					case 0x02:
 						branch_target_pc = JumpTarget(pc, op);
 						if (!EmitJ(op, pc))
@@ -295,8 +327,24 @@ namespace VitaEE
 
 		// Matches the fall-through/branch writeback in x86/ix86-32/iR5900.cpp,
 		// after compiling either a non-branching block or a branch plus delay slot.
-		return (has_branch ? EmitStoreBranchPc(branch_target_pc, next_pc) : EmitStorePc(next_pc)) &&
-			   EndBlockWithCycleTest(block_cycles, direct_exit, event_exit);
+		if (has_branch)
+		{
+			if (has_register_branch_target)
+			{
+				if (!EmitStorePcFromHostReg(HOST_BRANCH_TARGET))
+					return false;
+			}
+			else if (!EmitStoreBranchPc(branch_target_pc, next_pc))
+			{
+				return false;
+			}
+		}
+		else if (!EmitStorePc(next_pc))
+		{
+			return false;
+		}
+
+		return EndBlockWithCycleTest(block_cycles, direct_exit, event_exit);
 	}
 
 	bool BlockCompiler::EmitOpcode(u32 op)
@@ -680,6 +728,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitJAL(u32, u32 pc)
 	{
 		return EmitJump(pc, true);
+	}
+
+	bool BlockCompiler::EmitJR(u32 op, u32 pc)
+	{
+		return EmitRegisterJump(op, pc, false);
+	}
+
+	bool BlockCompiler::EmitJALR(u32 op, u32 pc)
+	{
+		return EmitRegisterJump(op, pc, true);
 	}
 
 	bool BlockCompiler::EmitBEQ(u32 op)
@@ -1184,6 +1242,25 @@ namespace VitaEE
 			   EmitStoreGpr64(31, HOST_TMP0, HOST_TMP1);
 	}
 
+	bool BlockCompiler::EmitRegisterJump(u32 op, u32 pc, bool link)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rd = RD(op);
+
+		// PCSX2 owners: Interpreter.cpp::JR()/JALR() and
+		// x86/ix86-32/iR5900Jump.cpp::recJR()/recJALR(). The target is snapped
+		// before the delay slot, and JALR links before the delay slot.
+		if (!EmitLoadGprLow(rs, HOST_BRANCH_TARGET))
+			return false;
+
+		if (!link || rd == 0)
+			return true;
+
+		return m_code.EmitMovImm32(HOST_TMP0, pc + 8) &&
+			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
 	bool BlockCompiler::EmitBranchEqual(u32 op, bool branch_on_equal)
 	{
 		const unsigned rs = RS(op);
@@ -1257,6 +1334,11 @@ namespace VitaEE
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, pc) &&
 			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(PC_OFFSET));
+	}
+
+	bool BlockCompiler::EmitStorePcFromHostReg(unsigned host_reg)
+	{
+		return m_code.EmitStrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(PC_OFFSET));
 	}
 
 	bool BlockCompiler::EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc)
