@@ -15,6 +15,8 @@ namespace VitaA32
 	namespace
 	{
 		constexpr u32 DATA_PROCESSING_IMM = 0x02000000u;
+		constexpr u32 OPCODE_AND = 0x00000000u;
+		constexpr u32 OPCODE_EOR = 0x00200000u;
 		constexpr u32 OPCODE_ADD = 0x00800000u;
 		constexpr u32 OPCODE_ADC = 0x00a00000u;
 		constexpr u32 OPCODE_MOV = 0x01a00000u;
@@ -143,6 +145,20 @@ namespace VitaA32
 		return EmitU32(EncodeSubImm8(rd, rn, value, set_flags));
 	}
 
+	bool CodeBuffer::EmitAndImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn))
+			return false;
+		return EmitU32(EncodeAndImm8(rd, rn, value, set_flags));
+	}
+
+	bool CodeBuffer::EmitEorImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn))
+			return false;
+		return EmitU32(EncodeEorImm8(rd, rn, value, set_flags));
+	}
+
 	bool CodeBuffer::EmitOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
@@ -169,6 +185,20 @@ namespace VitaA32
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
 			return false;
 		return EmitU32(EncodeAddReg(rd, rn, rm, set_flags));
+	}
+
+	bool CodeBuffer::EmitAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
+			return false;
+		return EmitU32(EncodeAndReg(rd, rn, rm, set_flags));
+	}
+
+	bool CodeBuffer::EmitEorReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
+			return false;
+		return EmitU32(EncodeEorReg(rd, rn, rm, set_flags));
 	}
 
 	bool CodeBuffer::EmitOrrReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
@@ -315,6 +345,22 @@ namespace VitaA32
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | value;
 	}
 
+	u32 EncodeAndImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	{
+		pxAssert(IsRegister(rd));
+		pxAssert(IsRegister(rn));
+		return CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_AND | (set_flags ? SET_FLAGS : 0) |
+			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | value;
+	}
+
+	u32 EncodeEorImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	{
+		pxAssert(IsRegister(rd));
+		pxAssert(IsRegister(rn));
+		return CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_EOR | (set_flags ? SET_FLAGS : 0) |
+			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | value;
+	}
+
 	u32 EncodeOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
 	{
 		pxAssert(IsRegister(rd));
@@ -347,6 +393,24 @@ namespace VitaA32
 		pxAssert(IsRegister(rn));
 		pxAssert(IsRegister(rm));
 		return CondBits(Condition::AL) | OPCODE_ADD | (set_flags ? SET_FLAGS : 0) |
+			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
+	u32 EncodeAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
+	{
+		pxAssert(IsRegister(rd));
+		pxAssert(IsRegister(rn));
+		pxAssert(IsRegister(rm));
+		return CondBits(Condition::AL) | OPCODE_AND | (set_flags ? SET_FLAGS : 0) |
+			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
+	u32 EncodeEorReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
+	{
+		pxAssert(IsRegister(rd));
+		pxAssert(IsRegister(rn));
+		pxAssert(IsRegister(rm));
+		return CondBits(Condition::AL) | OPCODE_EOR | (set_flags ? SET_FLAGS : 0) |
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
 	}
 
