@@ -48,7 +48,56 @@ namespace VitaEE
 		m_code.Release();
 	}
 
-	bool BlockExecutor::ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
+	bool BlockExecutor::ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result)
+	{
+		if (!result || max_instruction_count == 0)
+			return false;
+
+		*result = {};
+		result->start_pc = start_pc;
+		result->stop_pc = start_pc;
+		result->stop = BlockScanStop::MaxInstructions;
+
+		for (u32 i = 0; i < max_instruction_count; i++)
+		{
+			if (i > ((UINT32_MAX - start_pc) / 4))
+			{
+				result->stop = BlockScanStop::AddressWrap;
+				return true;
+			}
+
+			const u32 pc = start_pc + i * 4;
+
+			// Ported from PCSX2 x86/ix86-32/iR5900.cpp::recRecompile():
+			// do not fold a required debugger boundary into a regular block.
+			if (isBreakpointNeeded(pc) != 0 || isMemcheckNeeded(pc) != 0)
+			{
+				result->stop = BlockScanStop::DebugBoundary;
+				return true;
+			}
+
+			// Ported from PCSX2 x86/ix86-32/iR5900.cpp::recRecompile():
+			// split before crossing a 4 KiB guest page.
+			if (i != 0 && (pc & 0xffcu) == 0)
+			{
+				result->stop = BlockScanStop::PageBoundary;
+				return true;
+			}
+
+			if (!BlockCompiler::CanCompileOpcode(memRead32(pc)))
+			{
+				result->stop = BlockScanStop::UnsupportedOpcode;
+				return true;
+			}
+
+			result->instruction_count++;
+			result->stop_pc = pc + 4;
+		}
+
+		return true;
+	}
+
+	bool BlockExecutor::ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
 		bool run_event_test_on_event_exit, BlockExecutionResult* result)
 	{
 		if (!result || instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
@@ -60,15 +109,7 @@ namespace VitaEE
 		{
 			const u32 op = memRead32(start_pc + i * 4);
 			if (!BlockCompiler::CanCompileOpcode(op))
-			{
-				cpuRegs.pc = start_pc;
-				intCpu.Step(); // PCSX2 interpreter owner: Interpreter.cpp::execI().
-
-				result->path = BlockExecutionPath::InterpreterStep;
-				result->exit = BlockExitKind::InterpreterStep;
-				result->exit_value = static_cast<u32>(BlockExitKind::InterpreterStep);
-				return true;
-			}
+				return false;
 		}
 
 		if (!m_code.Data())
@@ -107,8 +148,35 @@ namespace VitaEE
 		result->path = BlockExecutionPath::Compiled;
 		result->exit = exit;
 		result->exit_value = exit_value;
+		result->instruction_count = instruction_count;
 		result->scaled_cycles = scaled_cycles;
 		result->code_size = m_code.Size();
 		return true;
+	}
+
+	bool BlockExecutor::ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
+		bool run_event_test_on_event_exit, BlockExecutionResult* result)
+	{
+		if (!result || instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
+			return false;
+
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * 4);
+			if (!BlockCompiler::CanCompileOpcode(op))
+			{
+				cpuRegs.pc = start_pc;
+				intCpu.Step(); // PCSX2 interpreter owner: Interpreter.cpp::execI().
+
+				*result = {};
+				result->path = BlockExecutionPath::InterpreterStep;
+				result->exit = BlockExitKind::InterpreterStep;
+				result->exit_value = static_cast<u32>(BlockExitKind::InterpreterStep);
+				result->instruction_count = 1;
+				return true;
+			}
+		}
+
+		return ExecuteCompiledBlock(start_pc, instruction_count, run_event_test_on_event_exit, result);
 	}
 } // namespace VitaEE

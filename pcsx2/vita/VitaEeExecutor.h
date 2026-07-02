@@ -23,11 +23,29 @@ namespace VitaEE
 		InterpreterStep = 0x1e,
 	};
 
+	enum class BlockScanStop : u8
+	{
+		UnsupportedOpcode,
+		PageBoundary,
+		DebugBoundary,
+		MaxInstructions,
+		AddressWrap,
+	};
+
+	struct BlockScanResult
+	{
+		u32 start_pc = 0;
+		u32 instruction_count = 0;
+		u32 stop_pc = 0;
+		BlockScanStop stop = BlockScanStop::UnsupportedOpcode;
+	};
+
 	struct BlockExecutionResult
 	{
 		BlockExecutionPath path = BlockExecutionPath::Compiled;
 		BlockExitKind exit = BlockExitKind::Direct;
 		u32 exit_value = 0;
+		u32 instruction_count = 0;
 		u32 scaled_cycles = 0;
 		size_t code_size = 0;
 	};
@@ -36,6 +54,9 @@ namespace VitaEE
 	{
 	public:
 		void Reset();
+		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
+		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
+			bool run_event_test_on_event_exit, BlockExecutionResult* result);
 		bool ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
 

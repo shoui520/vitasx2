@@ -13,6 +13,7 @@ void VitaSelectA32EeCpuProviders();
 struct VitaA32EeProviderStats
 {
 	u32 compiled_blocks = 0;
+	u32 compiled_instructions = 0;
 	u32 interpreter_steps = 0;
 	u32 direct_exits = 0;
 	u32 event_exits = 0;

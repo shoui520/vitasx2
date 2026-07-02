@@ -8,7 +8,6 @@
 #include "SaveState.h"
 #include "VUmicro.h"
 #include "vita/VitaCore.h"
-#include "vita/VitaEeBlockCompiler.h"
 #include "vita/VitaEeExecutor.h"
 #include "vtlb.h"
 
@@ -20,6 +19,11 @@ static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback =
 static VitaEE::BlockExecutor s_ee_a32_executor;
 static VitaA32EeProviderStats s_ee_a32_stats;
 static bool s_ee_a32_exit_execution = false;
+
+namespace
+{
+	constexpr u32 EE_A32_MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 64;
+}
 
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback)
 {
@@ -51,6 +55,33 @@ static void recInterpreterStepWithoutProviderTrace()
 	s_ee_pre_instruction_trace_callback = callback;
 }
 
+static bool recRecordEeWindow(u32 start_pc, u32 instruction_count, u32* executable_instruction_count)
+{
+	if (!executable_instruction_count)
+		return false;
+
+	*executable_instruction_count = 0;
+	for (u32 i = 0; i < instruction_count; i++)
+	{
+		const u32 pc = start_pc + i * 4;
+		if (VitaRecordEePreInstruction(pc, memRead32(pc)))
+			return false;
+
+		(*executable_instruction_count)++;
+	}
+
+	return true;
+}
+
+static void recRunInterpreterStepsWithoutProviderTrace(u32 instruction_count)
+{
+	for (u32 i = 0; i < instruction_count && !s_ee_a32_exit_execution; i++)
+	{
+		recInterpreterStepWithoutProviderTrace();
+		s_ee_a32_stats.interpreter_steps++;
+	}
+}
+
 static void recReserve()
 {
 }
@@ -80,35 +111,54 @@ static void recExecute()
 	while (!s_ee_a32_exit_execution)
 	{
 		const u32 pc = cpuRegs.pc;
-		const u32 op = memRead32(pc);
-		if (VitaRecordEePreInstruction(pc, op))
-			break;
 
-		if (!VitaEE::BlockCompiler::CanCompileOpcode(op))
+		VitaEE::BlockScanResult scan;
+		if (!VitaEE::BlockExecutor::ScanStraightLineBlock(pc, EE_A32_MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
+			scan.instruction_count == 0)
 		{
+			const u32 op = memRead32(pc);
+			if (VitaRecordEePreInstruction(pc, op))
+				break;
+
 			recInterpreterStepWithoutProviderTrace();
 			s_ee_a32_stats.interpreter_steps++;
 			continue;
 		}
 
+		u32 executable_instruction_count = 0;
+		const bool full_window_recorded =
+			recRecordEeWindow(pc, scan.instruction_count, &executable_instruction_count);
+		if (executable_instruction_count == 0)
+			break;
+
 		VitaEE::BlockExecutionResult result;
-		if (!s_ee_a32_executor.ExecuteStraightLineBlockOrInterpreterStep(pc, 1, true, &result))
+		if (!s_ee_a32_executor.ExecuteCompiledBlock(pc, executable_instruction_count, true, &result))
 		{
 			s_ee_a32_stats.failed_blocks++;
-			recInterpreterStepWithoutProviderTrace();
-			s_ee_a32_stats.interpreter_steps++;
+			recRunInterpreterStepsWithoutProviderTrace(executable_instruction_count);
+			if (!full_window_recorded)
+				break;
+
 			continue;
 		}
 
 		if (result.path == VitaEE::BlockExecutionPath::Compiled)
+		{
 			s_ee_a32_stats.compiled_blocks++;
+			s_ee_a32_stats.compiled_instructions += result.instruction_count;
+		}
 		else
+		{
 			s_ee_a32_stats.interpreter_steps++;
+		}
 
 		if (result.exit == VitaEE::BlockExitKind::Direct)
 			s_ee_a32_stats.direct_exits++;
 		else if (result.exit == VitaEE::BlockExitKind::Event)
 			s_ee_a32_stats.event_exits++;
+
+		if (!full_window_recorded)
+			break;
 	}
 }
 
