@@ -95,9 +95,11 @@ namespace VitaEE
 		bool EmitShift64LeftVariable(u32 op);
 		bool EmitShift64RightVariable(u32 op, bool arithmetic);
 		bool EmitConditionalMove(u32 op, bool move_on_zero);
+		bool EmitGoemonBlockStartHook(u32 start_pc);
 		bool EmitLink(unsigned guest_reg, u32 pc);
 		bool EmitJump(u32 pc, bool link);
 		bool EmitRegisterJump(u32 op, u32 pc, bool link);
+		bool EmitGoemonTranslateHostReg(unsigned host_reg);
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitBranchSigned(u32 op, SignedBranchCondition condition);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);

@@ -44,15 +44,20 @@ namespace
 
 namespace VitaEE
 {
-	void BlockExecutor::Reset()
+	u32 BlockExecutor::Reset()
 	{
+		u32 invalidated = 0;
 		for (CachedBlock& block : m_cache)
 		{
+			if (block.valid)
+				invalidated++;
+
 			block.code.Release();
 			block.valid = false;
 		}
 
 		m_next_victim = 0;
+		return invalidated;
 	}
 
 	u32 BlockExecutor::InvalidateRange(u32 start_pc, u32 instruction_count)

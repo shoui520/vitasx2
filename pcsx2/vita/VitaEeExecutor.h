@@ -58,7 +58,7 @@ namespace VitaEE
 	public:
 		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 64;
 
-		void Reset();
+		u32 Reset();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,

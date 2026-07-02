@@ -19,10 +19,16 @@ static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback =
 static VitaEE::BlockExecutor s_ee_a32_executor;
 static VitaA32EeProviderStats s_ee_a32_stats;
 static bool s_ee_a32_exit_execution = false;
+static bool s_ee_a32_cache_reset_requested = false;
 
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback)
 {
 	s_ee_pre_instruction_trace_callback = callback;
+}
+
+void VitaRequestA32EeCacheReset()
+{
+	s_ee_a32_cache_reset_requested = true;
 }
 
 bool VitaRecordEePreInstruction(u32 pc, u32 opcode)
@@ -84,6 +90,7 @@ static void recReserve()
 static void recShutdown()
 {
 	s_ee_a32_executor.Reset();
+	s_ee_a32_cache_reset_requested = false;
 }
 
 static void recReset()
@@ -92,6 +99,7 @@ static void recReset()
 	s_ee_a32_executor.Reset();
 	VitaResetA32EeProviderStats();
 	s_ee_a32_exit_execution = false;
+	s_ee_a32_cache_reset_requested = false;
 }
 
 static void recStep()
@@ -105,6 +113,12 @@ static void recExecute()
 
 	while (!s_ee_a32_exit_execution)
 	{
+		if (s_ee_a32_cache_reset_requested)
+		{
+			s_ee_a32_stats.invalidated_blocks += s_ee_a32_executor.Reset();
+			s_ee_a32_cache_reset_requested = false;
+		}
+
 		const u32 pc = cpuRegs.pc;
 
 		VitaEE::BlockScanResult scan;
@@ -157,6 +171,12 @@ static void recExecute()
 			s_ee_a32_stats.cache_hits++;
 		else
 			s_ee_a32_stats.cache_misses++;
+
+		if (s_ee_a32_cache_reset_requested)
+		{
+			s_ee_a32_stats.invalidated_blocks += s_ee_a32_executor.Reset();
+			s_ee_a32_cache_reset_requested = false;
+		}
 
 		if (!full_window_recorded)
 			break;

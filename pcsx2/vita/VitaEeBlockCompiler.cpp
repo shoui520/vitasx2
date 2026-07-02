@@ -8,6 +8,8 @@
 #include "pcsx2/R5900.h"
 #include "pcsx2/R5900OpcodeTables.h"
 #include "pcsx2/vita/A32Emitter.h"
+#include "pcsx2/vita/VitaCore.h"
+#include "pcsx2/vtlb.h"
 
 #include <cstddef>
 
@@ -34,6 +36,10 @@ namespace VitaEE
 		constexpr size_t PC_OFFSET = offsetof(cpuRegisters, pc);
 		constexpr size_t CYCLE_OFFSET = offsetof(cpuRegisters, cycle);
 		constexpr size_t NEXT_EVENT_OFFSET = offsetof(cpuRegisters, nextEventCycle);
+
+		constexpr u32 GOEMON_PRELOAD_RETURN_PC_0 = 0x0033ad48;
+		constexpr u32 GOEMON_PRELOAD_RETURN_PC_1 = 0x0035060c;
+		constexpr u32 GOEMON_UNLOAD_ENTRY_PC = 0x003563b8;
 
 		constexpr unsigned RS(u32 op)
 		{
@@ -97,7 +103,6 @@ namespace VitaEE
 				case 0x07: // SRAV, owned by R5900OpcodeImpl.cpp::SRAV().
 				case 0x08: // JR, owned by Interpreter.cpp::JR().
 				case 0x09: // JALR, owned by Interpreter.cpp::JALR().
-					return !EmuConfig.Gamefixes.GoemonTlbHack;
 				case 0x0a: // MOVZ, owned by R5900OpcodeImpl.cpp::MOVZ().
 				case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
 				case 0x14: // DSLLV, owned by R5900OpcodeImpl.cpp::DSLLV().
@@ -211,7 +216,7 @@ namespace VitaEE
 				return CanCompileREGIMM(op);
 			case 0x02: // J, owned by Interpreter.cpp::J().
 			case 0x03: // JAL, owned by Interpreter.cpp::JAL().
-				return !EmuConfig.Gamefixes.GoemonTlbHack;
+				return true;
 			case 0x04: // BEQ, owned by Interpreter.cpp::BEQ().
 			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
 			case 0x06: // BLEZ, owned by Interpreter.cpp::BLEZ().
@@ -244,7 +249,7 @@ namespace VitaEE
 				{
 					case 0x08: // JR, owned by Interpreter.cpp::JR().
 					case 0x09: // JALR, owned by Interpreter.cpp::JALR().
-						return !EmuConfig.Gamefixes.GoemonTlbHack;
+						return true;
 					default:
 						return false;
 				}
@@ -252,7 +257,7 @@ namespace VitaEE
 				return CanCompileREGIMM(op);
 			case 0x02: // J, owned by Interpreter.cpp::J().
 			case 0x03: // JAL, owned by Interpreter.cpp::JAL().
-				return !EmuConfig.Gamefixes.GoemonTlbHack;
+				return true;
 			case 0x04: // BEQ, owned by Interpreter.cpp::BEQ().
 			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
 			case 0x06: // BLEZ, owned by Interpreter.cpp::BLEZ().
@@ -288,6 +293,8 @@ namespace VitaEE
 			return false;
 
 		if (!BeginBlock())
+			return false;
+		if (!EmitGoemonBlockStartHook(start_pc))
 			return false;
 
 		u32 raw_cycles = 0;
@@ -357,11 +364,15 @@ namespace VitaEE
 						break;
 					case 0x02:
 						branch_target_pc = JumpTarget(pc, op);
+						if (EmuConfig.Gamefixes.GoemonTlbHack)
+							branch_target_pc = vtlb_V2P(branch_target_pc);
 						if (!EmitJ(op, pc))
 							return false;
 						break;
 					case 0x03:
 						branch_target_pc = JumpTarget(pc, op);
+						if (EmuConfig.Gamefixes.GoemonTlbHack)
+							branch_target_pc = vtlb_V2P(branch_target_pc);
 						if (!EmitJAL(op, pc))
 							return false;
 						break;
@@ -1516,11 +1527,52 @@ namespace VitaEE
 		// before the delay slot, and JALR links before the delay slot.
 		if (!EmitLoadGprLow(rs, HOST_BRANCH_TARGET))
 			return false;
+		if (EmuConfig.Gamefixes.GoemonTlbHack && !EmitGoemonTranslateHostReg(HOST_BRANCH_TARGET))
+			return false;
 
 		if (!link || rd == 0)
 			return true;
 
 		return EmitLink(rd, pc);
+	}
+
+	bool BlockCompiler::EmitGoemonBlockStartHook(u32 start_pc)
+	{
+		if (!EmuConfig.Gamefixes.GoemonTlbHack)
+			return true;
+
+		if (start_pc == GOEMON_PRELOAD_RETURN_PC_0 || start_pc == GOEMON_PRELOAD_RETURN_PC_1)
+		{
+			// PCSX2 owners: Interpreter.cpp::JR() and
+			// x86/ix86-32/iR5900.cpp::recRecompile() preload Goemon's TLB cache
+			// when execution reaches either return PC of the TLB-populating
+			// function at 0x356250.
+			return m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&GoemonPreloadTlb));
+		}
+
+		if (start_pc == GOEMON_UNLOAD_ENTRY_PC)
+		{
+			// PCSX2 owners: Interpreter.cpp::JAL() and
+			// x86/ix86-32/iR5900.cpp::recRecompile() unload a Goemon TLB cache
+			// entry at function 0x3563b8. The x86 path also marks the rec cache
+			// for reset; Vita requests the same reset and performs it after this
+			// generated block returns to the provider loop.
+			return m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaRequestA32EeCacheReset)) &&
+				   EmitLoadGprLow(4, HOST_TMP0) &&
+				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&GoemonUnloadTlb));
+		}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitGoemonTranslateHostReg(unsigned host_reg)
+	{
+		// PCSX2 owner: x86/ix86-32/iR5900Jump.cpp::recJR()/recJALR() snapshot
+		// the register target, translate it with vtlb_DynV2P(), and only then
+		// compile the delay slot.
+		return m_code.EmitMovRegShiftImm(HOST_TMP0, host_reg, VitaA32::ShiftType::LSL, 0) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_V2P)) &&
+			   m_code.EmitMovRegShiftImm(host_reg, HOST_TMP0, VitaA32::ShiftType::LSL, 0);
 	}
 
 	bool BlockCompiler::EmitLink(unsigned guest_reg, u32 pc)

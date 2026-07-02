@@ -25,6 +25,7 @@ struct VitaA32EeProviderStats
 
 void VitaResetA32EeProviderStats();
 VitaA32EeProviderStats VitaGetA32EeProviderStats();
+void VitaRequestA32EeCacheReset();
 
 // Mirrors the fast-boot ELF state that VMManager.cpp::Initialize() seeds for
 // R5900.cpp::eeloadHook() in Vita bring-up executables.
