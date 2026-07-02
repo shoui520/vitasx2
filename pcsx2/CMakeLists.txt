@@ -121,6 +121,7 @@ add_library(pcsx2core STATIC
 	ps2/pgif.cpp
 	sif2.cpp
 	vita/VitaAudioStream.cpp
+	vita/A32Emitter.cpp
 	vita/VitaCaptureDisabled.cpp
 	vita/VitaCdvdDevice.cpp
 	vita/VitaCpuProviders.cpp

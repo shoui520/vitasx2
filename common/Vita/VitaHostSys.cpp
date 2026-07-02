@@ -17,6 +17,7 @@
 #include "common/Assertions.h"
 #include "common/Console.h"
 #include "common/Error.h"
+#include "common/Vita/VitaJitMemory.h"
 
 #include <cstring>
 #include <map>

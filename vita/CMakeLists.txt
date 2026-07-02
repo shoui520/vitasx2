@@ -7,6 +7,7 @@ set(VITASX2_BIOS_EE_TRACE_TITLEID "VSX200004")
 set(VITASX2_BIOS_IOP_TRACE_TITLEID "VSX200005")
 set(VITASX2_CUBE_EE_TRACE_TITLEID "VSX200006")
 set(VITASX2_SIMPLE2000_EE_TRACE_TITLEID "VSX200007")
+set(VITASX2_A32_EMITTER_SMOKE_TITLEID "VSX200008")
 
 set(VITASX2_CUBE_EE_TRACE_RECORDS "4096" CACHE STRING "Cube EE trace records to write.")
 set(VITASX2_CUBE_EE_TRACE_SKIP_RECORDS "0" CACHE STRING "Cube EE trace records to skip before writing.")
@@ -28,6 +29,20 @@ vita_create_self(vitasx2-probe.self vitasx2-probe UNSAFE)
 vita_create_vpk(vitasx2-probe.vpk ${VITASX2_TITLEID} vitasx2-probe.self
 	VERSION "00.01"
 	NAME "VitaSX2 Probe"
+)
+
+# --- A32 generated-code smoke ----------------------------------------------
+add_executable(vitasx2-a32-emitter-smoke
+	core/A32EmitterSmokeMain.cpp
+)
+target_link_libraries(vitasx2-a32-emitter-smoke
+	pcsx2core
+)
+
+vita_create_self(vitasx2-a32-emitter-smoke.self vitasx2-a32-emitter-smoke UNSAFE)
+vita_create_vpk(vitasx2-a32-emitter-smoke.vpk ${VITASX2_A32_EMITTER_SMOKE_TITLEID} vitasx2-a32-emitter-smoke.self
+	VERSION "00.01"
+	NAME "VitaSX2 A32 Code"
 )
 
 # --- interpreter-core memory/vtlb smoke ------------------------------------
