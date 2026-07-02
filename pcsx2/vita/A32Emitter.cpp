@@ -19,6 +19,7 @@ namespace VitaA32
 		constexpr u32 OPCODE_EOR = 0x00200000u;
 		constexpr u32 OPCODE_ADD = 0x00800000u;
 		constexpr u32 OPCODE_ADC = 0x00a00000u;
+		constexpr u32 OPCODE_CMP = 0x01400000u;
 		constexpr u32 OPCODE_MOV = 0x01a00000u;
 		constexpr u32 OPCODE_ORR = 0x01800000u;
 		constexpr u32 OPCODE_SUB = 0x00400000u;
@@ -116,11 +117,11 @@ namespace VitaA32
 		return true;
 	}
 
-	bool CodeBuffer::EmitMovImm8(unsigned rd, u8 value)
+	bool CodeBuffer::EmitMovImm8(unsigned rd, u8 value, Condition condition)
 	{
 		if (!IsRegister(rd))
 			return false;
-		return EmitU32(EncodeMovImm8(rd, value));
+		return EmitU32(EncodeMovImm8(rd, value, condition));
 	}
 
 	bool CodeBuffer::EmitMovImm32(unsigned rd, u32 value)
@@ -187,6 +188,13 @@ namespace VitaA32
 		return EmitU32(EncodeAddReg(rd, rn, rm, set_flags));
 	}
 
+	bool CodeBuffer::EmitAdcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
+			return false;
+		return EmitU32(EncodeAdcReg(rd, rn, rm, set_flags));
+	}
+
 	bool CodeBuffer::EmitAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
@@ -220,6 +228,13 @@ namespace VitaA32
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
 			return false;
 		return EmitU32(EncodeSbcReg(rd, rn, rm, set_flags));
+	}
+
+	bool CodeBuffer::EmitCmpReg(unsigned rn, unsigned rm, Condition condition)
+	{
+		if (!IsRegister(rn) || !IsRegister(rm))
+			return false;
+		return EmitU32(EncodeCmpReg(rn, rm, condition));
 	}
 
 	bool CodeBuffer::EmitLdrImm12(unsigned rd, unsigned rn, u16 offset)
@@ -309,10 +324,10 @@ namespace VitaA32
 		return m_base && bytes <= (m_capacity - m_offset);
 	}
 
-	u32 EncodeMovImm8(unsigned rd, u8 value)
+	u32 EncodeMovImm8(unsigned rd, u8 value, Condition condition)
 	{
 		pxAssert(IsRegister(rd));
-		return CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_MOV | ((rd & 0xfu) << 12) | value;
+		return CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_MOV | ((rd & 0xfu) << 12) | value;
 	}
 
 	u32 EncodeMovw(unsigned rd, u16 value)
@@ -396,6 +411,15 @@ namespace VitaA32
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
 	}
 
+	u32 EncodeAdcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
+	{
+		pxAssert(IsRegister(rd));
+		pxAssert(IsRegister(rn));
+		pxAssert(IsRegister(rm));
+		return CondBits(Condition::AL) | OPCODE_ADC | (set_flags ? SET_FLAGS : 0) |
+			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
 	u32 EncodeAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
 	{
 		pxAssert(IsRegister(rd));
@@ -439,6 +463,13 @@ namespace VitaA32
 		pxAssert(IsRegister(rm));
 		return CondBits(Condition::AL) | OPCODE_SBC | (set_flags ? SET_FLAGS : 0) |
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
+	u32 EncodeCmpReg(unsigned rn, unsigned rm, Condition condition)
+	{
+		pxAssert(IsRegister(rn));
+		pxAssert(IsRegister(rm));
+		return CondBits(condition) | OPCODE_CMP | SET_FLAGS | ((rn & 0xfu) << 16) | (rm & 0xfu);
 	}
 
 	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset)

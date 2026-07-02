@@ -24,6 +24,7 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP1 = 1;
 		constexpr unsigned HOST_TMP2 = 2;
 		constexpr unsigned HOST_TMP3 = 3;
+		constexpr unsigned HOST_TMP4 = 12;
 
 		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
 		constexpr size_t PC_OFFSET = offsetof(cpuRegisters, pc);
@@ -75,6 +76,10 @@ namespace VitaEE
 				case 0x24: // AND, owned by R5900OpcodeImpl.cpp::AND().
 				case 0x25: // OR, owned by R5900OpcodeImpl.cpp::OR().
 				case 0x26: // XOR, owned by R5900OpcodeImpl.cpp::XOR().
+				case 0x2a: // SLT, owned by R5900OpcodeImpl.cpp::SLT().
+				case 0x2b: // SLTU, owned by R5900OpcodeImpl.cpp::SLTU().
+				case 0x2d: // DADDU, owned by R5900OpcodeImpl.cpp::DADDU().
+				case 0x2f: // DSUBU, owned by R5900OpcodeImpl.cpp::DSUBU().
 					return true;
 				default:
 					return false;
@@ -121,10 +126,13 @@ namespace VitaEE
 			case 0x00:
 				return CanCompileSPECIAL(op);
 			case 0x09: // ADDIU, owned by R5900OpcodeImpl.cpp::ADDIU().
+			case 0x0a: // SLTI, owned by R5900OpcodeImpl.cpp::SLTI().
+			case 0x0b: // SLTIU, owned by R5900OpcodeImpl.cpp::SLTIU().
 			case 0x0c: // ANDI, owned by R5900OpcodeImpl.cpp::ANDI().
 			case 0x0d: // ORI, owned by R5900OpcodeImpl.cpp::ORI().
 			case 0x0e: // XORI, owned by R5900OpcodeImpl.cpp::XORI().
 			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
+			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
 				return true;
 			default:
 				return false;
@@ -184,6 +192,10 @@ namespace VitaEE
 				return EmitSPECIAL(op);
 			case 0x09: // ADDIU, owned by R5900OpcodeImpl.cpp::ADDIU().
 				return EmitADDIU(op);
+			case 0x0a: // SLTI, owned by R5900OpcodeImpl.cpp::SLTI().
+				return EmitSLTI(op);
+			case 0x0b: // SLTIU, owned by R5900OpcodeImpl.cpp::SLTIU().
+				return EmitSLTIU(op);
 			case 0x0c: // ANDI, owned by R5900OpcodeImpl.cpp::ANDI().
 				return EmitANDI(op);
 			case 0x0d: // ORI, owned by R5900OpcodeImpl.cpp::ORI().
@@ -192,6 +204,8 @@ namespace VitaEE
 				return EmitXORI(op);
 			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
 				return EmitLUI(op);
+			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
+				return EmitDADDIU(op);
 			default:
 				return false;
 		}
@@ -274,6 +288,14 @@ namespace VitaEE
 				return EmitOR(op);
 			case 0x26: // XOR, owned by R5900OpcodeImpl.cpp::XOR().
 				return EmitXOR(op);
+			case 0x2a: // SLT, owned by R5900OpcodeImpl.cpp::SLT().
+				return EmitSLT(op);
+			case 0x2b: // SLTU, owned by R5900OpcodeImpl.cpp::SLTU().
+				return EmitSLTU(op);
+			case 0x2d: // DADDU, owned by R5900OpcodeImpl.cpp::DADDU().
+				return EmitDADDU(op);
+			case 0x2f: // DSUBU, owned by R5900OpcodeImpl.cpp::DSUBU().
+				return EmitDSUBU(op);
 			default:
 				return false;
 		}
@@ -312,6 +334,53 @@ namespace VitaEE
 
 		return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
 			   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitDADDIU(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const s32 imm = static_cast<s32>(IMM_S(op));
+
+		if (rt == 0)
+			return true;
+
+		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
+			   m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true) &&
+			   m_code.EmitMovImm32(HOST_TMP2, (imm < 0) ? 0xffffffffu : 0) &&
+			   m_code.EmitAdcReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
+			   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitSLTI(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const s32 imm = static_cast<s32>(IMM_S(op));
+
+		if (rt == 0)
+			return true;
+
+		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
+			   m_code.EmitMovImm32(HOST_TMP3, (imm < 0) ? 0xffffffffu : 0) &&
+			   EmitSetLessThan64(rt, true);
+	}
+
+	bool BlockCompiler::EmitSLTIU(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const s32 imm = static_cast<s32>(IMM_S(op));
+
+		if (rt == 0)
+			return true;
+
+		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
+			   m_code.EmitMovImm32(HOST_TMP3, (imm < 0) ? 0xffffffffu : 0) &&
+			   EmitSetLessThan64(rt, false);
 	}
 
 	bool BlockCompiler::EmitANDI(u32 op)
@@ -461,6 +530,38 @@ namespace VitaEE
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
+	bool BlockCompiler::EmitDADDU(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
+			   m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true) &&
+			   m_code.EmitAdcReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitDSUBU(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
+			   m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true) &&
+			   m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
 	bool BlockCompiler::EmitAND(u32 op)
 	{
 		const unsigned rs = RS(op);
@@ -507,6 +608,70 @@ namespace VitaEE
 			   m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
 			   m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitSLT(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
+			   EmitSetLessThan64(rd, true);
+	}
+
+	bool BlockCompiler::EmitSLTU(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
+			   EmitSetLessThan64(rd, false);
+	}
+
+	bool BlockCompiler::EmitSetLessThan64(unsigned guest_reg, bool signed_compare)
+	{
+		if (guest_reg == 0)
+			return true;
+
+		if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3))
+		{
+			return false;
+		}
+
+		const size_t high_equal = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (high_equal == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovImm8(HOST_TMP4, 1, signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC))
+			return false;
+
+		const size_t done = m_code.EmitBranchPlaceholder();
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t low_compare = m_code.Size();
+		if (!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2) ||
+			!m_code.EmitMovImm8(HOST_TMP4, 1, VitaA32::Condition::CC))
+		{
+			return false;
+		}
+
+		const size_t done_target = m_code.Size();
+		return m_code.PatchBranch(high_equal, low_compare, VitaA32::Condition::EQ) &&
+			   m_code.PatchBranch(done, done_target) &&
+			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   EmitStoreGpr64(guest_reg, HOST_TMP4, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitLoadGprLow(unsigned guest_reg, unsigned host_reg)

@@ -29,6 +29,9 @@ namespace VitaEE
 	private:
 		bool EmitSPECIAL(u32 op);
 		bool EmitADDIU(u32 op);
+		bool EmitDADDIU(u32 op);
+		bool EmitSLTI(u32 op);
+		bool EmitSLTIU(u32 op);
 		bool EmitANDI(u32 op);
 		bool EmitORI(u32 op);
 		bool EmitXORI(u32 op);
@@ -36,9 +39,14 @@ namespace VitaEE
 		bool EmitSLL(u32 op);
 		bool EmitADDU(u32 op);
 		bool EmitSUBU(u32 op);
+		bool EmitDADDU(u32 op);
+		bool EmitDSUBU(u32 op);
 		bool EmitAND(u32 op);
 		bool EmitOR(u32 op);
 		bool EmitXOR(u32 op);
+		bool EmitSLT(u32 op);
+		bool EmitSLTU(u32 op);
+		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 		bool EmitStorePc(u32 pc);
