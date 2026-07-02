@@ -126,6 +126,7 @@ add_library(pcsx2core STATIC
 	vita/VitaCdvdDevice.cpp
 	vita/VitaCpuProviders.cpp
 	vita/VitaDisabledDevices.cpp
+	vita/VitaEeBlockCompiler.cpp
 	vita/VitaGsMailbox.cpp
 	vita/VitaHostSurface.cpp
 	vita/VitaPad.cpp

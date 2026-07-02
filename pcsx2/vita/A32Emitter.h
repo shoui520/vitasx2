@@ -69,6 +69,8 @@ namespace VitaA32
 		bool EmitOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitAdcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitMovRegShiftImm(unsigned rd, unsigned rm, ShiftType shift, u8 amount, bool set_flags = false);
+		bool EmitAddReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+		bool EmitOrrReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitLdrImm12(unsigned rd, unsigned rn, u16 offset);
@@ -98,6 +100,8 @@ namespace VitaA32
 	u32 EncodeOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 	u32 EncodeAdcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 	u32 EncodeMovRegShiftImm(unsigned rd, unsigned rm, ShiftType shift, u8 amount, bool set_flags = false);
+	u32 EncodeAddReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+	u32 EncodeOrrReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset);
