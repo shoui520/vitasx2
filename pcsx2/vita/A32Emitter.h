@@ -53,6 +53,7 @@ namespace VitaA32
 		CodeBuffer& operator=(CodeBuffer&& other) noexcept;
 
 		bool Allocate(size_t capacity);
+		bool Attach(u8* data, size_t capacity);
 		void Reset();
 		void Release();
 
@@ -99,6 +100,7 @@ namespace VitaA32
 		u8* m_base = nullptr;
 		size_t m_capacity = 0;
 		size_t m_offset = 0;
+		bool m_owns_memory = false;
 	};
 
 	u32 EncodeMovImm8(unsigned rd, u8 value, Condition condition = Condition::AL);

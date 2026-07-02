@@ -66,6 +66,7 @@ namespace VitaA32
 		: m_base(std::exchange(other.m_base, nullptr))
 		, m_capacity(std::exchange(other.m_capacity, 0))
 		, m_offset(std::exchange(other.m_offset, 0))
+		, m_owns_memory(std::exchange(other.m_owns_memory, false))
 	{
 	}
 
@@ -77,6 +78,7 @@ namespace VitaA32
 			m_base = std::exchange(other.m_base, nullptr);
 			m_capacity = std::exchange(other.m_capacity, 0);
 			m_offset = std::exchange(other.m_offset, 0);
+			m_owns_memory = std::exchange(other.m_owns_memory, false);
 		}
 
 		return *this;
@@ -88,7 +90,21 @@ namespace VitaA32
 		m_base = static_cast<u8*>(VitaVM::AllocJitMemory(capacity));
 		m_capacity = m_base ? capacity : 0;
 		m_offset = 0;
+		m_owns_memory = (m_base != nullptr);
 		return (m_base != nullptr);
+	}
+
+	bool CodeBuffer::Attach(u8* data, size_t capacity)
+	{
+		Release();
+		if (!data || capacity == 0)
+			return false;
+
+		m_base = data;
+		m_capacity = capacity;
+		m_offset = 0;
+		m_owns_memory = false;
+		return true;
 	}
 
 	void CodeBuffer::Reset()
@@ -100,12 +116,14 @@ namespace VitaA32
 	{
 		if (m_base)
 		{
-			VitaVM::FreeJitMemory(m_base);
+			if (m_owns_memory)
+				VitaVM::FreeJitMemory(m_base);
 			m_base = nullptr;
 		}
 
 		m_capacity = 0;
 		m_offset = 0;
+		m_owns_memory = false;
 	}
 
 	bool CodeBuffer::EmitU32(u32 instruction)

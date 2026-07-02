@@ -3,6 +3,7 @@
 
 #include "pcsx2/vita/VitaEeExecutor.h"
 
+#include "common/Vita/VitaJitMemory.h"
 #include "pcsx2/Config.h"
 #include "pcsx2/Memory.h"
 #include "pcsx2/R5900.h"
@@ -13,8 +14,6 @@
 namespace
 {
 	using GeneratedBlock = u32 (*)();
-
-	constexpr size_t STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 4096;
 
 	extern "C" __attribute__((noinline)) u32 VitaEeA32DirectExit()
 	{
@@ -42,14 +41,27 @@ namespace
 
 		return false;
 	}
+
+	size_t AlignUp(size_t value, size_t alignment)
+	{
+		return (value + alignment - 1) & ~(alignment - 1);
+	}
 } // namespace
 
 namespace VitaEE
 {
+	BlockExecutor::BlockExecutor()
+	{
+		m_cache.reserve(INITIAL_CACHE_CAPACITY);
+		m_block_records.reserve(INITIAL_CACHE_CAPACITY);
+		m_incoming_links.reserve(INITIAL_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT);
+	}
+
 	BlockExecutor::~BlockExecutor()
 	{
 		Reset();
 		ReleaseLookupPages();
+		ReleaseCodeCache();
 	}
 
 	u32 BlockExecutor::LookupPageIndex(u32 start_pc)
@@ -122,11 +134,11 @@ namespace VitaEE
 
 	s32 BlockExecutor::LastBlockRecordIndex(u32 pc) const
 	{
-		if (m_block_record_count == 0)
+		if (m_block_records.empty())
 			return -1;
 
 		s32 min = 0;
-		s32 max = static_cast<s32>(m_block_record_count - 1);
+		s32 max = static_cast<s32>(m_block_records.size() - 1);
 		while (min != max)
 		{
 			const s32 mid = (min + max + 1) >> 1;
@@ -145,37 +157,33 @@ namespace VitaEE
 			return false;
 
 		UnregisterBlockRecord(block);
-		if (m_block_record_count >= m_block_records.size())
+		if (m_block_records.size() >= MAX_CACHE_CAPACITY)
 			return false;
 
 		// PCSX2 owner: x86/BaseblockEx.h::BaseBlockArray::insert().
 		// Keep translated blocks sorted by guest start PC so invalidation and
 		// target lookup do not depend on a linear walk of the cache storage.
 		u32 insert_index = 0;
-		while (insert_index < m_block_record_count &&
+		while (insert_index < m_block_records.size() &&
 			   m_block_records[insert_index].start_pc <= block.start_pc)
 		{
 			insert_index++;
 		}
 
-		for (u32 i = m_block_record_count; i > insert_index; i--)
-			m_block_records[i] = m_block_records[i - 1];
-
-		m_block_records[insert_index] = {
+		m_block_records.insert(m_block_records.begin() + insert_index, {
 			&block,
 			block.code.EntryPoint(),
 			block.start_pc,
 			block.instruction_count,
 			block.code.Size(),
-		};
-		m_block_record_count++;
+		});
 		return true;
 	}
 
 	void BlockExecutor::UnregisterBlockRecord(CachedBlock& block)
 	{
 		u32 write_index = 0;
-		for (u32 read_index = 0; read_index < m_block_record_count; read_index++)
+		for (u32 read_index = 0; read_index < m_block_records.size(); read_index++)
 		{
 			if (m_block_records[read_index].block == &block)
 				continue;
@@ -185,18 +193,12 @@ namespace VitaEE
 			write_index++;
 		}
 
-		for (u32 i = write_index; i < m_block_record_count; i++)
-			m_block_records[i] = {};
-
-		m_block_record_count = write_index;
+		m_block_records.resize(write_index);
 	}
 
 	void BlockExecutor::ClearBlockRecords()
 	{
-		for (u32 i = 0; i < m_block_record_count; i++)
-			m_block_records[i] = {};
-
-		m_block_record_count = 0;
+		m_block_records.clear();
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::FindRecordedBlockByStartPc(
@@ -232,6 +234,7 @@ namespace VitaEE
 		UnregisterBlockRecord(block);
 		block.valid = false;
 		block.direct_links = {};
+		block.code.Release();
 	}
 
 	DirectLinkSlot* BlockExecutor::GetRecordedDirectLink(IncomingLinkRecord& record)
@@ -248,10 +251,7 @@ namespace VitaEE
 
 	void BlockExecutor::ClearIncomingLinks()
 	{
-		for (u32 i = 0; i < m_incoming_link_count; i++)
-			m_incoming_links[i] = {};
-
-		m_incoming_link_count = 0;
+		m_incoming_links.clear();
 	}
 
 	void BlockExecutor::RegisterIncomingLinks(CachedBlock& block)
@@ -264,17 +264,17 @@ namespace VitaEE
 		for (u8 i = 0; i < DIRECT_LINK_SLOT_COUNT; i++)
 		{
 			const DirectLinkSlot& link = block.direct_links.slots[i];
-			if (!link.valid || m_incoming_link_count >= m_incoming_links.size())
+			if (!link.valid || m_incoming_links.size() >= MAX_INCOMING_LINKS)
 				continue;
 
-			m_incoming_links[m_incoming_link_count++] = {&block, link.target_pc, i};
+			m_incoming_links.push_back({&block, link.target_pc, i});
 		}
 	}
 
 	void BlockExecutor::UnregisterIncomingLinks(CachedBlock& block)
 	{
 		u32 write_index = 0;
-		for (u32 read_index = 0; read_index < m_incoming_link_count; read_index++)
+		for (u32 read_index = 0; read_index < m_incoming_links.size(); read_index++)
 		{
 			if (m_incoming_links[read_index].source == &block)
 				continue;
@@ -284,17 +284,15 @@ namespace VitaEE
 			write_index++;
 		}
 
-		for (u32 i = write_index; i < m_incoming_link_count; i++)
-			m_incoming_links[i] = {};
-
-		m_incoming_link_count = write_index;
+		m_incoming_links.resize(write_index);
 	}
 
 	u32 BlockExecutor::Reset()
 	{
 		u32 invalidated = 0;
-		for (CachedBlock& block : m_cache)
+		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
 		{
+			CachedBlock& block = *entry;
 			if (block.valid)
 				invalidated++;
 
@@ -307,6 +305,8 @@ namespace VitaEE
 		ClearIncomingLinks();
 		ReleaseLookupPages();
 		m_next_victim = 0;
+		m_code_cache_resets = 0;
+		ReleaseCodeCache();
 		return invalidated;
 	}
 
@@ -318,7 +318,7 @@ namespace VitaEE
 		const u32 end_pc = start_pc + instruction_count * 4;
 		u32 invalidated = 0;
 
-		for (u32 i = 0; i < m_block_record_count;)
+		for (u32 i = 0; i < m_block_records.size();)
 		{
 			CachedBlock* block = m_block_records[i].block;
 			if (!block || !block->valid)
@@ -472,8 +472,8 @@ namespace VitaEE
 
 	void BlockExecutor::ValidateCachedBlocks()
 	{
-		for (CachedBlock& block : m_cache)
-			ValidateCachedBlock(block);
+		for (const std::unique_ptr<CachedBlock>& block : m_cache)
+			ValidateCachedBlock(*block);
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::FindLookupBlockByStartPc(u32 start_pc)
@@ -531,16 +531,83 @@ namespace VitaEE
 
 	BlockExecutor::CachedBlock* BlockExecutor::AllocateCacheEntry()
 	{
-		for (CachedBlock& entry : m_cache)
+		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
 		{
-			if (!entry.valid)
-				return &entry;
+			if (!entry->valid)
+				return entry.get();
 		}
 
-		CachedBlock& victim = m_cache[m_next_victim];
+		if (m_cache.size() < MAX_CACHE_CAPACITY)
+		{
+			std::unique_ptr<CachedBlock> entry(new (std::nothrow) CachedBlock());
+			if (!entry)
+				return nullptr;
+
+			CachedBlock* block = entry.get();
+			m_cache.push_back(std::move(entry));
+			return block;
+		}
+
+		CachedBlock& victim = *m_cache[m_next_victim];
 		m_next_victim = (m_next_victim + 1) % m_cache.size();
 		InvalidateCachedBlock(victim);
 		return &victim;
+	}
+
+	bool BlockExecutor::EnsureCodeCache()
+	{
+		if (m_code_cache)
+			return true;
+
+		// Vita VM-domain allocations are rounded to 1 MiB by VitaVM::AllocJitMemory().
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp owns one EE code cache and
+		// BaseblockEx tracks block entries inside that cache; do the same here
+		// instead of allocating a VM block per translated guest block.
+		m_code_cache = static_cast<u8*>(VitaVM::AllocJitMemory(EE_CODE_CACHE_CAPACITY));
+		m_code_cache_capacity = m_code_cache ? EE_CODE_CACHE_CAPACITY : 0;
+		m_code_cache_used = 0;
+		return (m_code_cache != nullptr);
+	}
+
+	void BlockExecutor::ReleaseCodeCache()
+	{
+		if (!m_code_cache)
+			return;
+
+		VitaVM::FreeJitMemory(m_code_cache);
+		m_code_cache = nullptr;
+		m_code_cache_capacity = 0;
+		m_code_cache_used = 0;
+	}
+
+	u8* BlockExecutor::AllocateCodeSlice(size_t capacity, size_t* slice_offset)
+	{
+		if (!EnsureCodeCache())
+			return nullptr;
+
+		const size_t aligned_offset = AlignUp(m_code_cache_used, CODE_CACHE_ALIGNMENT);
+		if (capacity > m_code_cache_capacity || aligned_offset > (m_code_cache_capacity - capacity))
+			return nullptr;
+
+		if (slice_offset)
+			*slice_offset = aligned_offset;
+
+		m_code_cache_used = aligned_offset + capacity;
+		return m_code_cache + aligned_offset;
+	}
+
+	void BlockExecutor::RewindCodeCache(size_t slice_offset)
+	{
+		if (slice_offset <= m_code_cache_used)
+			m_code_cache_used = slice_offset;
+	}
+
+	u32 BlockExecutor::ResetForCodeCacheFull()
+	{
+		const u32 previous_resets = m_code_cache_resets;
+		const u32 invalidated = Reset();
+		m_code_cache_resets = previous_resets + 1;
+		return invalidated;
 	}
 
 	bool BlockExecutor::CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles)
@@ -554,22 +621,32 @@ namespace VitaEE
 
 		InvalidateCachedBlock(block);
 
+		size_t code_slice_offset = 0;
+		u8* code_slice = AllocateCodeSlice(STRAIGHT_LINE_BLOCK_CODE_CAPACITY, &code_slice_offset);
+		if (!code_slice)
+		{
+			ResetForCodeCacheFull();
+			code_slice = AllocateCodeSlice(STRAIGHT_LINE_BLOCK_CODE_CAPACITY, &code_slice_offset);
+			if (!code_slice)
+				return false;
+		}
+
+		if (!block.code.Attach(code_slice, STRAIGHT_LINE_BLOCK_CODE_CAPACITY))
+		{
+			RewindCodeCache(code_slice_offset);
+			return false;
+		}
+
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 op = memRead32(start_pc + i * 4);
 			if (!BlockCompiler::CanCompileOpcode(op))
+			{
+				block.code.Release();
+				RewindCodeCache(code_slice_offset);
 				return false;
+			}
 			block.opcodes[i] = op;
-		}
-
-		if (!block.code.Data())
-		{
-			if (!block.code.Allocate(STRAIGHT_LINE_BLOCK_CODE_CAPACITY))
-				return false;
-		}
-		else
-		{
-			block.code.Reset();
 		}
 
 		BlockCompiler compiler(block.code);
@@ -580,6 +657,8 @@ namespace VitaEE
 				reinterpret_cast<const void*>(&VitaEeA32EventExit), &compiled_scaled_cycles, &direct_links) ||
 			!block.code.Flush())
 		{
+			block.code.Release();
+			RewindCodeCache(code_slice_offset);
 			return false;
 		}
 
@@ -594,6 +673,8 @@ namespace VitaEE
 		{
 			block.valid = false;
 			block.direct_links = {};
+			block.code.Release();
+			RewindCodeCache(code_slice_offset);
 			return false;
 		}
 		RegisterBlockLookup(block);
@@ -633,7 +714,7 @@ namespace VitaEE
 		if (!m_direct_linking_enabled || !target)
 			return;
 
-		for (u32 i = 0; i < m_incoming_link_count; i++)
+		for (u32 i = 0; i < m_incoming_links.size(); i++)
 		{
 			IncomingLinkRecord& record = m_incoming_links[i];
 			if (record.target_pc != target_pc)
@@ -646,7 +727,7 @@ namespace VitaEE
 
 	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc)
 	{
-		for (u32 i = 0; i < m_incoming_link_count; i++)
+		for (u32 i = 0; i < m_incoming_links.size(); i++)
 		{
 			IncomingLinkRecord& record = m_incoming_links[i];
 			if (target_pc != UINT32_MAX && record.target_pc != target_pc)
@@ -659,7 +740,7 @@ namespace VitaEE
 
 	void BlockExecutor::RelinkDirectLinks()
 	{
-		for (u32 i = 0; i < m_incoming_link_count; i++)
+		for (u32 i = 0; i < m_incoming_links.size(); i++)
 		{
 			IncomingLinkRecord& record = m_incoming_links[i];
 			DirectLinkSlot* link = GetRecordedDirectLink(record);
@@ -700,8 +781,12 @@ namespace VitaEE
 		result->instruction_count = block.instruction_count;
 		result->scaled_cycles = block.scaled_cycles;
 		result->code_size = block.code.Size();
-		result->block_records = m_block_record_count;
-		result->link_records = m_incoming_link_count;
+		result->block_records = static_cast<u32>(m_block_records.size());
+		result->link_records = static_cast<u32>(m_incoming_links.size());
+		result->cache_slots = static_cast<u32>(m_cache.size());
+		result->code_cache_resets = m_code_cache_resets;
+		result->code_cache_used = m_code_cache_used;
+		result->code_cache_capacity = m_code_cache_capacity;
 		return true;
 	}
 

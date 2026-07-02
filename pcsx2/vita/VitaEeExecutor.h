@@ -9,6 +9,8 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
+#include <vector>
 
 namespace VitaEE
 {
@@ -53,6 +55,10 @@ namespace VitaEE
 		size_t code_size = 0;
 		u32 block_records = 0;
 		u32 link_records = 0;
+		u32 cache_slots = 0;
+		u32 code_cache_resets = 0;
+		size_t code_cache_used = 0;
+		size_t code_cache_capacity = 0;
 		bool cache_hit = false;
 		bool lookup_hit = false;
 	};
@@ -62,7 +68,7 @@ namespace VitaEE
 	public:
 		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 64;
 
-		BlockExecutor() = default;
+		BlockExecutor();
 		~BlockExecutor();
 
 		u32 Reset();
@@ -75,9 +81,13 @@ namespace VitaEE
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
 
 	private:
-		static constexpr size_t CACHE_CAPACITY = 32;
+		static constexpr size_t INITIAL_CACHE_CAPACITY = 32;
+		static constexpr size_t MAX_CACHE_CAPACITY = 256;
+		static constexpr size_t STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 4096;
+		static constexpr size_t EE_CODE_CACHE_CAPACITY = 1024 * 1024;
+		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
-		static constexpr size_t MAX_INCOMING_LINKS = CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
+		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
 
@@ -138,6 +148,11 @@ namespace VitaEE
 		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit);
 		CachedBlock* FindCachedBlockByStartPc(u32 start_pc);
 		CachedBlock* AllocateCacheEntry();
+		bool EnsureCodeCache();
+		void ReleaseCodeCache();
+		u8* AllocateCodeSlice(size_t capacity, size_t* slice_offset);
+		void RewindCodeCache(size_t slice_offset);
+		u32 ResetForCodeCacheFull();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles);
 		bool RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result);
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
@@ -145,12 +160,14 @@ namespace VitaEE
 		void UnlinkIncomingLinks(u32 target_pc);
 		void RelinkDirectLinks();
 
-		std::array<CachedBlock, CACHE_CAPACITY> m_cache{};
-		std::array<BlockRecord, CACHE_CAPACITY> m_block_records{};
-		std::array<IncomingLinkRecord, MAX_INCOMING_LINKS> m_incoming_links{};
+		std::vector<std::unique_ptr<CachedBlock>> m_cache;
+		std::vector<BlockRecord> m_block_records;
+		std::vector<IncomingLinkRecord> m_incoming_links;
 		LookupPage** m_lookup_pages = nullptr;
-		u32 m_block_record_count = 0;
-		u32 m_incoming_link_count = 0;
+		u8* m_code_cache = nullptr;
+		size_t m_code_cache_capacity = 0;
+		size_t m_code_cache_used = 0;
+		u32 m_code_cache_resets = 0;
 		size_t m_next_victim = 0;
 		bool m_direct_linking_enabled = true;
 	};
