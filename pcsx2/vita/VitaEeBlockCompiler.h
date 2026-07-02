@@ -97,6 +97,8 @@ namespace VitaEE
 		bool EmitLDL(u32 op);
 		bool EmitLDR(u32 op);
 		bool EmitLQ(u32 op);
+		bool EmitLWC1(u32 op);
+		bool EmitLQC2(u32 op);
 		bool EmitSB(u32 op);
 		bool EmitSH(u32 op);
 		bool EmitSW(u32 op);
@@ -106,6 +108,8 @@ namespace VitaEE
 		bool EmitSDL(u32 op);
 		bool EmitSDR(u32 op);
 		bool EmitSQ(u32 op);
+		bool EmitSWC1(u32 op);
+		bool EmitSQC2(u32 op);
 		bool EmitDSLLV(u32 op);
 		bool EmitDSRLV(u32 op);
 		bool EmitDSRAV(u32 op);

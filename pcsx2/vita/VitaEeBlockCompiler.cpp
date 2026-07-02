@@ -7,6 +7,7 @@
 #include "pcsx2/Memory.h"
 #include "pcsx2/R5900.h"
 #include "pcsx2/R5900OpcodeTables.h"
+#include "pcsx2/VUmicro.h"
 #include "pcsx2/vita/A32Emitter.h"
 #include "pcsx2/vita/VitaCore.h"
 #include "pcsx2/vtlb.h"
@@ -16,6 +17,8 @@
 
 #include <cstddef>
 #include <string>
+
+extern void vu0Sync();
 
 namespace VitaEE
 {
@@ -327,6 +330,31 @@ namespace VitaEE
 			memRead128(addr & ~0x0fu, dest->UQ);
 		}
 
+		__noinline void VitaEeMemReadCop1Word(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: FPU.cpp::LWC1().
+			if (addr & 3)
+			{
+				Console.Error("FPU (LWC1 Opcode): Invalid Unaligned Memory Address");
+				return;
+			}
+
+			fpuRegs.fpr[guest_reg].UL = memRead32(addr);
+		}
+
+		__noinline void VitaEeMemReadVu0Quad(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: VU0.cpp::LQC2().
+			vu0Sync();
+			if (guest_reg != 0)
+				memRead128(addr, VU0.VF[guest_reg].UQ);
+			else
+			{
+				mem128_t sink;
+				memRead128(addr, sink);
+			}
+		}
+
 		__noinline void VitaEeMemWrite8(u32 addr, u32 value)
 		{
 			// PCSX2 owner: R5900OpcodeImpl.cpp::SB().
@@ -403,6 +431,25 @@ namespace VitaEE
 			// PCSX2 owner: R5900OpcodeImpl.cpp::SQ().
 			memWrite128(addr & ~0x0fu, cpuRegs.GPR.r[guest_reg].UQ);
 		}
+
+		__noinline void VitaEeMemWriteCop1Word(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: FPU.cpp::SWC1().
+			if (addr & 3)
+			{
+				Console.Error("FPU (SWC1 Opcode): Invalid Unaligned Memory Address");
+				return;
+			}
+
+			memWrite32(addr, fpuRegs.fpr[guest_reg].UL);
+		}
+
+		__noinline void VitaEeMemWriteVu0Quad(u32 addr, u32 guest_reg)
+		{
+			// PCSX2 owner: VU0.cpp::SQC2().
+			vu0Sync();
+			memWrite128(addr, VU0.VF[guest_reg].UQ);
+		}
 	} // namespace
 
 	static_assert(GprOffset(31) + sizeof(GPR_reg) <= 0x0fff);
@@ -462,7 +509,11 @@ namespace VitaEE
 			case 0x2c: // SDL, owned by R5900OpcodeImpl.cpp::SDL().
 			case 0x2d: // SDR, owned by R5900OpcodeImpl.cpp::SDR().
 			case 0x2e: // SWR, owned by R5900OpcodeImpl.cpp::SWR().
+			case 0x31: // LWC1, owned by FPU.cpp::LWC1().
+			case 0x36: // LQC2, owned by VU0.cpp::LQC2().
 			case 0x37: // LD, owned by R5900OpcodeImpl.cpp::LD().
+			case 0x39: // SWC1, owned by FPU.cpp::SWC1().
+			case 0x3e: // SQC2, owned by VU0.cpp::SQC2().
 			case 0x3f: // SD, owned by R5900OpcodeImpl.cpp::SD().
 				return true;
 			default:
@@ -882,8 +933,16 @@ namespace VitaEE
 				return EmitSDR(op);
 			case 0x2e: // SWR, owned by R5900OpcodeImpl.cpp::SWR().
 				return EmitSWR(op);
+			case 0x31: // LWC1, owned by FPU.cpp::LWC1().
+				return EmitLWC1(op);
+			case 0x36: // LQC2, owned by VU0.cpp::LQC2().
+				return EmitLQC2(op);
 			case 0x37: // LD, owned by R5900OpcodeImpl.cpp::LD().
 				return EmitLD(op);
+			case 0x39: // SWC1, owned by FPU.cpp::SWC1().
+				return EmitSWC1(op);
+			case 0x3e: // SQC2, owned by VU0.cpp::SQC2().
+				return EmitSQC2(op);
 			case 0x3f: // SD, owned by R5900OpcodeImpl.cpp::SD().
 				return EmitSD(op);
 			default:
@@ -1634,6 +1693,24 @@ namespace VitaEE
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead128Aligned));
 	}
 
+	bool BlockCompiler::EmitLWC1(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemReadCop1Word));
+	}
+
+	bool BlockCompiler::EmitLQC2(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemReadVu0Quad));
+	}
+
 	bool BlockCompiler::EmitSB(u32 op)
 	{
 		const unsigned rt = RT(op);
@@ -1713,6 +1790,24 @@ namespace VitaEE
 		return EmitEffectiveAddress(op, HOST_TMP0) &&
 			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite128Aligned));
+	}
+
+	bool BlockCompiler::EmitSWC1(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWriteCop1Word));
+	}
+
+	bool BlockCompiler::EmitSQC2(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWriteVu0Quad));
 	}
 
 	bool BlockCompiler::EmitDSLLV(u32 op)
