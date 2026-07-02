@@ -54,7 +54,7 @@ namespace VitaEE
 
 			block.code.Release();
 			block.valid = false;
-			block.direct_link = {};
+			block.direct_links = {};
 		}
 
 		m_next_victim = 0;
@@ -79,7 +79,7 @@ namespace VitaEE
 			{
 				UnlinkIncomingLinks(block.start_pc);
 				block.valid = false;
-				block.direct_link = {};
+				block.direct_links = {};
 				invalidated++;
 			}
 		}
@@ -208,7 +208,7 @@ namespace VitaEE
 		// any direct-linked dispatch can reach the block.
 		UnlinkIncomingLinks(block.start_pc);
 		block.valid = false;
-		block.direct_link = {};
+		block.direct_links = {};
 		return false;
 	}
 
@@ -268,7 +268,7 @@ namespace VitaEE
 		if (victim.valid)
 			UnlinkIncomingLinks(victim.start_pc);
 		victim.valid = false;
-		victim.direct_link = {};
+		victim.direct_links = {};
 		return &victim;
 	}
 
@@ -303,10 +303,10 @@ namespace VitaEE
 
 		BlockCompiler compiler(block.code);
 		u32 compiled_scaled_cycles = 0;
-		DirectLinkSlot direct_link;
+		DirectLinkSlots direct_links;
 		if (!compiler.CompileStraightLineBlock(start_pc, instruction_count,
 				reinterpret_cast<const void*>(&VitaEeA32DirectExit),
-				reinterpret_cast<const void*>(&VitaEeA32EventExit), &compiled_scaled_cycles, &direct_link) ||
+				reinterpret_cast<const void*>(&VitaEeA32EventExit), &compiled_scaled_cycles, &direct_links) ||
 			!block.code.Flush())
 		{
 			return false;
@@ -317,16 +317,19 @@ namespace VitaEE
 		block.scaled_cycles = compiled_scaled_cycles;
 		block.ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
-		block.direct_link = direct_link;
+		block.direct_links = direct_links;
 		block.valid = true;
 
 		if (m_direct_linking_enabled)
 		{
 			PatchIncomingLinks(block.start_pc, block.code.EntryPoint());
-			if (block.direct_link.valid)
+			for (DirectLinkSlot& link : block.direct_links.slots)
 			{
-				if (CachedBlock* target = FindCachedBlockByStartPc(block.direct_link.target_pc))
-					PatchDirectLink(block, target->code.EntryPoint());
+				if (link.valid)
+				{
+					if (CachedBlock* target = FindCachedBlockByStartPc(link.target_pc))
+						PatchDirectLink(block, link, target->code.EntryPoint());
+				}
 			}
 		}
 
@@ -336,12 +339,12 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockExecutor::PatchDirectLink(CachedBlock& block, const void* target)
+	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target)
 	{
-		if (!target || !block.valid || !block.direct_link.valid)
+		if (!target || !block.valid || !link.valid)
 			return false;
 
-		return block.code.PatchMovImm32(block.direct_link.target_offset, 12,
+		return block.code.PatchMovImm32(link.target_offset, 12,
 				   static_cast<u32>(reinterpret_cast<uptr>(target))) &&
 			   block.code.Flush();
 	}
@@ -353,8 +356,14 @@ namespace VitaEE
 
 		for (CachedBlock& block : m_cache)
 		{
-			if (block.valid && block.direct_link.valid && block.direct_link.target_pc == target_pc)
-				PatchDirectLink(block, target);
+			if (!block.valid)
+				continue;
+
+			for (DirectLinkSlot& link : block.direct_links.slots)
+			{
+				if (link.valid && link.target_pc == target_pc)
+					PatchDirectLink(block, link, target);
+			}
 		}
 	}
 
@@ -362,10 +371,13 @@ namespace VitaEE
 	{
 		for (CachedBlock& block : m_cache)
 		{
-			if (block.valid && block.direct_link.valid &&
-				(target_pc == UINT32_MAX || block.direct_link.target_pc == target_pc))
+			if (!block.valid)
+				continue;
+
+			for (DirectLinkSlot& link : block.direct_links.slots)
 			{
-				PatchDirectLink(block, reinterpret_cast<const void*>(&VitaEeA32DirectExit));
+				if (link.valid && (target_pc == UINT32_MAX || link.target_pc == target_pc))
+					PatchDirectLink(block, link, reinterpret_cast<const void*>(&VitaEeA32DirectExit));
 			}
 		}
 	}
@@ -374,12 +386,18 @@ namespace VitaEE
 	{
 		for (CachedBlock& block : m_cache)
 		{
-			if (!block.valid || !block.direct_link.valid)
+			if (!block.valid)
 				continue;
 
-			const CachedBlock* target = FindCachedBlockByStartPc(block.direct_link.target_pc);
-			PatchDirectLink(block, target ? target->code.EntryPoint() :
-											 reinterpret_cast<const void*>(&VitaEeA32DirectExit));
+			for (DirectLinkSlot& link : block.direct_links.slots)
+			{
+				if (!link.valid)
+					continue;
+
+				const CachedBlock* target = FindCachedBlockByStartPc(link.target_pc);
+				PatchDirectLink(block, link, target ? target->code.EntryPoint() :
+													  reinterpret_cast<const void*>(&VitaEeA32DirectExit));
+			}
 		}
 	}
 

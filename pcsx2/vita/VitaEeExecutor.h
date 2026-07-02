@@ -80,7 +80,7 @@ namespace VitaEE
 			u32 scaled_cycles = 0;
 			s8 ee_cycle_rate = 0;
 			u8 cp0_config_cycle_shift = 0;
-			DirectLinkSlot direct_link{};
+			DirectLinkSlots direct_links{};
 			bool valid = false;
 		};
 
@@ -91,7 +91,7 @@ namespace VitaEE
 		CachedBlock* AllocateCacheEntry();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles);
 		bool RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result);
-		bool PatchDirectLink(CachedBlock& block, const void* target);
+		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
 		void PatchIncomingLinks(u32 target_pc, const void* target);
 		void UnlinkIncomingLinks(u32 target_pc);
 		void RelinkDirectLinks();
