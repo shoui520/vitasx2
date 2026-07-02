@@ -8,6 +8,8 @@
 #include "pcsx2/R5900.h"
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
 
+#include <new>
+
 namespace
 {
 	using GeneratedBlock = u32 (*)();
@@ -44,6 +46,80 @@ namespace
 
 namespace VitaEE
 {
+	BlockExecutor::~BlockExecutor()
+	{
+		Reset();
+		ReleaseLookupPages();
+	}
+
+	u32 BlockExecutor::LookupPageIndex(u32 start_pc)
+	{
+		return start_pc >> 16;
+	}
+
+	u32 BlockExecutor::LookupEntryIndex(u32 start_pc)
+	{
+		return (start_pc & 0xffffu) >> 2;
+	}
+
+	bool BlockExecutor::EnsureLookupDirectory()
+	{
+		if (m_lookup_pages)
+			return true;
+
+		m_lookup_pages = new (std::nothrow) LookupPage*[LOOKUP_DIRECTORY_ENTRY_COUNT] {};
+		return (m_lookup_pages != nullptr);
+	}
+
+	BlockExecutor::LookupPage* BlockExecutor::GetLookupPage(u32 start_pc, bool allocate)
+	{
+		if (!m_lookup_pages && (!allocate || !EnsureLookupDirectory()))
+			return nullptr;
+
+		const u32 page = LookupPageIndex(start_pc);
+		if (!m_lookup_pages[page] && allocate)
+			m_lookup_pages[page] = new (std::nothrow) LookupPage();
+
+		return m_lookup_pages[page];
+	}
+
+	void BlockExecutor::RegisterBlockLookup(CachedBlock& block)
+	{
+		if (!block.valid || (block.start_pc & 0x3u) != 0)
+			return;
+
+		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_()/recLUT_SetPage().
+		// Vita keeps the same 64 KiB guest-page lookup granularity, but allocates
+		// pages lazily instead of reserving a BASEBLOCK for every possible EE word.
+		if (LookupPage* page = GetLookupPage(block.start_pc, true))
+			page->blocks[LookupEntryIndex(block.start_pc)] = &block;
+	}
+
+	void BlockExecutor::UnregisterBlockLookup(CachedBlock& block)
+	{
+		if ((block.start_pc & 0x3u) != 0)
+			return;
+
+		if (LookupPage* page = GetLookupPage(block.start_pc, false))
+		{
+			CachedBlock*& entry = page->blocks[LookupEntryIndex(block.start_pc)];
+			if (entry == &block)
+				entry = nullptr;
+		}
+	}
+
+	void BlockExecutor::ReleaseLookupPages()
+	{
+		if (!m_lookup_pages)
+			return;
+
+		for (u32 i = 0; i < LOOKUP_DIRECTORY_ENTRY_COUNT; i++)
+			delete m_lookup_pages[i];
+
+		delete[] m_lookup_pages;
+		m_lookup_pages = nullptr;
+	}
+
 	u32 BlockExecutor::Reset()
 	{
 		u32 invalidated = 0;
@@ -57,6 +133,7 @@ namespace VitaEE
 			block.direct_links = {};
 		}
 
+		ReleaseLookupPages();
 		m_next_victim = 0;
 		return invalidated;
 	}
@@ -78,6 +155,7 @@ namespace VitaEE
 			if (block.start_pc < end_pc && start_pc < block_end)
 			{
 				UnlinkIncomingLinks(block.start_pc);
+				UnregisterBlockLookup(block);
 				block.valid = false;
 				block.direct_links = {};
 				invalidated++;
@@ -207,6 +285,7 @@ namespace VitaEE
 		// Vita has no user-mode fault repair, so validate cached opcodes before
 		// any direct-linked dispatch can reach the block.
 		UnlinkIncomingLinks(block.start_pc);
+		UnregisterBlockLookup(block);
 		block.valid = false;
 		block.direct_links = {};
 		return false;
@@ -218,7 +297,16 @@ namespace VitaEE
 			ValidateCachedBlock(block);
 	}
 
-	bool BlockExecutor::FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block)
+	BlockExecutor::CachedBlock* BlockExecutor::FindLookupBlockByStartPc(u32 start_pc)
+	{
+		if ((start_pc & 0x3u) != 0)
+			return nullptr;
+
+		LookupPage* page = GetLookupPage(start_pc, false);
+		return page ? page->blocks[LookupEntryIndex(start_pc)] : nullptr;
+	}
+
+	bool BlockExecutor::FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit)
 	{
 		if (!block || instruction_count == 0 ||
 			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -228,6 +316,19 @@ namespace VitaEE
 		}
 
 		*block = nullptr;
+		if (lookup_hit)
+			*lookup_hit = false;
+
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		{
+			if (entry->valid && entry->instruction_count == instruction_count && ValidateCachedBlock(*entry))
+			{
+				*block = entry;
+				if (lookup_hit)
+					*lookup_hit = true;
+				return true;
+			}
+		}
 
 		for (CachedBlock& entry : m_cache)
 		{
@@ -246,6 +347,12 @@ namespace VitaEE
 
 	BlockExecutor::CachedBlock* BlockExecutor::FindCachedBlockByStartPc(u32 start_pc)
 	{
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		{
+			if (entry->valid && ValidateCachedBlock(*entry))
+				return entry;
+		}
+
 		for (CachedBlock& entry : m_cache)
 		{
 			if (entry.valid && entry.start_pc == start_pc && ValidateCachedBlock(entry))
@@ -266,7 +373,10 @@ namespace VitaEE
 		CachedBlock& victim = m_cache[m_next_victim];
 		m_next_victim = (m_next_victim + 1) % m_cache.size();
 		if (victim.valid)
+		{
 			UnlinkIncomingLinks(victim.start_pc);
+			UnregisterBlockLookup(victim);
+		}
 		victim.valid = false;
 		victim.direct_links = {};
 		return &victim;
@@ -319,6 +429,7 @@ namespace VitaEE
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
 		block.direct_links = direct_links;
 		block.valid = true;
+		RegisterBlockLookup(block);
 
 		if (m_direct_linking_enabled)
 		{
@@ -445,9 +556,11 @@ namespace VitaEE
 		*result = {};
 
 		CachedBlock* block = nullptr;
-		if (FindCachedBlock(start_pc, instruction_count, &block))
+		bool lookup_hit = false;
+		if (FindCachedBlock(start_pc, instruction_count, &block, &lookup_hit))
 		{
 			result->cache_hit = true;
+			result->lookup_hit = lookup_hit;
 			return RunCachedBlock(*block, run_event_test_on_event_exit, result);
 		}
 
@@ -456,6 +569,7 @@ namespace VitaEE
 			return false;
 
 		result->cache_hit = false;
+		result->lookup_hit = false;
 		return RunCachedBlock(*block, run_event_test_on_event_exit, result);
 	}
 

@@ -173,6 +173,9 @@ static void recExecute()
 		else
 			s_ee_a32_stats.cache_misses++;
 
+		if (result.lookup_hit)
+			s_ee_a32_stats.lookup_hits++;
+
 		if (s_ee_a32_cache_reset_requested)
 		{
 			s_ee_a32_stats.invalidated_blocks += s_ee_a32_executor.Reset();

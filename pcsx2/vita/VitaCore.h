@@ -20,6 +20,7 @@ struct VitaA32EeProviderStats
 	u32 failed_blocks = 0;
 	u32 cache_hits = 0;
 	u32 cache_misses = 0;
+	u32 lookup_hits = 0;
 	u32 invalidated_blocks = 0;
 };
 
