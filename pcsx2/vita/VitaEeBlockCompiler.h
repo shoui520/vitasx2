@@ -43,6 +43,12 @@ namespace VitaEE
 		bool EmitSLLV(u32 op);
 		bool EmitSRLV(u32 op);
 		bool EmitSRAV(u32 op);
+		bool EmitDSLL(u32 op);
+		bool EmitDSRL(u32 op);
+		bool EmitDSRA(u32 op);
+		bool EmitDSLL32(u32 op);
+		bool EmitDSRL32(u32 op);
+		bool EmitDSRA32(u32 op);
 		bool EmitADDU(u32 op);
 		bool EmitSUBU(u32 op);
 		bool EmitDADDU(u32 op);
@@ -54,6 +60,8 @@ namespace VitaEE
 		bool EmitSLTU(u32 op);
 		bool EmitShift32Immediate(u32 op, VitaA32::ShiftType shift);
 		bool EmitShift32Variable(u32 op, VitaA32::ShiftType shift);
+		bool EmitShift64LeftImmediate(u32 op, unsigned amount);
+		bool EmitShift64RightImmediate(u32 op, unsigned amount, bool arithmetic);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);

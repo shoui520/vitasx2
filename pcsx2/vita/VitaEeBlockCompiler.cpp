@@ -85,6 +85,12 @@ namespace VitaEE
 				case 0x2b: // SLTU, owned by R5900OpcodeImpl.cpp::SLTU().
 				case 0x2d: // DADDU, owned by R5900OpcodeImpl.cpp::DADDU().
 				case 0x2f: // DSUBU, owned by R5900OpcodeImpl.cpp::DSUBU().
+				case 0x38: // DSLL, owned by R5900OpcodeImpl.cpp::DSLL().
+				case 0x3a: // DSRL, owned by R5900OpcodeImpl.cpp::DSRL().
+				case 0x3b: // DSRA, owned by R5900OpcodeImpl.cpp::DSRA().
+				case 0x3c: // DSLL32, owned by R5900OpcodeImpl.cpp::DSLL32().
+				case 0x3e: // DSRL32, owned by R5900OpcodeImpl.cpp::DSRL32().
+				case 0x3f: // DSRA32, owned by R5900OpcodeImpl.cpp::DSRA32().
 					return true;
 				default:
 					return false;
@@ -311,6 +317,18 @@ namespace VitaEE
 				return EmitDADDU(op);
 			case 0x2f: // DSUBU, owned by R5900OpcodeImpl.cpp::DSUBU().
 				return EmitDSUBU(op);
+			case 0x38: // DSLL, owned by R5900OpcodeImpl.cpp::DSLL().
+				return EmitDSLL(op);
+			case 0x3a: // DSRL, owned by R5900OpcodeImpl.cpp::DSRL().
+				return EmitDSRL(op);
+			case 0x3b: // DSRA, owned by R5900OpcodeImpl.cpp::DSRA().
+				return EmitDSRA(op);
+			case 0x3c: // DSLL32, owned by R5900OpcodeImpl.cpp::DSLL32().
+				return EmitDSLL32(op);
+			case 0x3e: // DSRL32, owned by R5900OpcodeImpl.cpp::DSRL32().
+				return EmitDSRL32(op);
+			case 0x3f: // DSRA32, owned by R5900OpcodeImpl.cpp::DSRA32().
+				return EmitDSRA32(op);
 			default:
 				return false;
 		}
@@ -528,6 +546,36 @@ namespace VitaEE
 		return EmitShift32Variable(op, VitaA32::ShiftType::ASR);
 	}
 
+	bool BlockCompiler::EmitDSLL(u32 op)
+	{
+		return EmitShift64LeftImmediate(op, SA(op));
+	}
+
+	bool BlockCompiler::EmitDSRL(u32 op)
+	{
+		return EmitShift64RightImmediate(op, SA(op), false);
+	}
+
+	bool BlockCompiler::EmitDSRA(u32 op)
+	{
+		return EmitShift64RightImmediate(op, SA(op), true);
+	}
+
+	bool BlockCompiler::EmitDSLL32(u32 op)
+	{
+		return EmitShift64LeftImmediate(op, SA(op) + 32);
+	}
+
+	bool BlockCompiler::EmitDSRL32(u32 op)
+	{
+		return EmitShift64RightImmediate(op, SA(op) + 32, false);
+	}
+
+	bool BlockCompiler::EmitDSRA32(u32 op)
+	{
+		return EmitShift64RightImmediate(op, SA(op) + 32, true);
+	}
+
 	bool BlockCompiler::EmitADDU(u32 op)
 	{
 		const unsigned rs = RS(op);
@@ -710,6 +758,81 @@ namespace VitaEE
 			   m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x1f) &&
 			   m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP0, shift, HOST_TMP2) &&
 			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitShift64LeftImmediate(u32 op, unsigned amount)
+	{
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1))
+			return false;
+
+		if (amount == 0)
+		{
+			return EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+		else if (amount < 32)
+		{
+			return m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR, static_cast<u8>(32 - amount)) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
+				   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+		else if (amount == 32)
+		{
+			return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::LSL, 0) &&
+				   m_code.EmitMovImm8(HOST_TMP0, 0) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+
+		return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::LSL, static_cast<u8>(amount - 32)) &&
+			   m_code.EmitMovImm8(HOST_TMP0, 0) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitShift64RightImmediate(u32 op, unsigned amount, bool arithmetic)
+	{
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1))
+			return false;
+
+		const VitaA32::ShiftType high_shift = arithmetic ? VitaA32::ShiftType::ASR : VitaA32::ShiftType::LSR;
+		if (amount == 0)
+		{
+			return EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+		else if (amount < 32)
+		{
+			return m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::LSL, static_cast<u8>(32 - amount)) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, static_cast<u8>(amount)) &&
+				   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, high_shift, static_cast<u8>(amount)) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+		else if (amount == 32)
+		{
+			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP1, VitaA32::ShiftType::LSL, 0) &&
+				   (arithmetic ?
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::ASR, 31) :
+					   m_code.EmitMovImm8(HOST_TMP1, 0)) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+
+		return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP1, high_shift, static_cast<u8>(amount - 32)) &&
+			   (arithmetic ?
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::ASR, 31) :
+				   m_code.EmitMovImm8(HOST_TMP1, 0)) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
