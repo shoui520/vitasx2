@@ -131,8 +131,37 @@ namespace VitaEE
 			{
 				case 0x00: // BLTZ, owned by Interpreter.cpp::BLTZ().
 				case 0x01: // BGEZ, owned by Interpreter.cpp::BGEZ().
+				case 0x02: // BLTZL, owned by Interpreter.cpp::BLTZL().
+				case 0x03: // BGEZL, owned by Interpreter.cpp::BGEZL().
 				case 0x10: // BLTZAL, owned by Interpreter.cpp::BLTZAL().
 				case 0x11: // BGEZAL, owned by Interpreter.cpp::BGEZAL().
+				case 0x12: // BLTZALL, owned by Interpreter.cpp::BLTZALL().
+				case 0x13: // BGEZALL, owned by Interpreter.cpp::BGEZALL().
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool IsBranchLikelyOpcode(u32 op)
+		{
+			switch (op >> 26)
+			{
+				case 0x01:
+					switch (RT(op))
+					{
+						case 0x02: // BLTZL, owned by Interpreter.cpp::BLTZL().
+						case 0x03: // BGEZL, owned by Interpreter.cpp::BGEZL().
+						case 0x12: // BLTZALL, owned by Interpreter.cpp::BLTZALL().
+						case 0x13: // BGEZALL, owned by Interpreter.cpp::BGEZALL().
+							return true;
+						default:
+							return false;
+					}
+				case 0x14: // BEQL, owned by Interpreter.cpp::BEQL().
+				case 0x15: // BNEL, owned by Interpreter.cpp::BNEL().
+				case 0x16: // BLEZL, owned by Interpreter.cpp::BLEZL().
+				case 0x17: // BGTZL, owned by Interpreter.cpp::BGTZL().
 					return true;
 				default:
 					return false;
@@ -187,6 +216,10 @@ namespace VitaEE
 			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
 			case 0x06: // BLEZ, owned by Interpreter.cpp::BLEZ().
 			case 0x07: // BGTZ, owned by Interpreter.cpp::BGTZ().
+			case 0x14: // BEQL, owned by Interpreter.cpp::BEQL().
+			case 0x15: // BNEL, owned by Interpreter.cpp::BNEL().
+			case 0x16: // BLEZL, owned by Interpreter.cpp::BLEZL().
+			case 0x17: // BGTZL, owned by Interpreter.cpp::BGTZL().
 				return true;
 			case 0x09: // ADDIU, owned by R5900OpcodeImpl.cpp::ADDIU().
 			case 0x0a: // SLTI, owned by R5900OpcodeImpl.cpp::SLTI().
@@ -224,6 +257,10 @@ namespace VitaEE
 			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
 			case 0x06: // BLEZ, owned by Interpreter.cpp::BLEZ().
 			case 0x07: // BGTZ, owned by Interpreter.cpp::BGTZ().
+			case 0x14: // BEQL, owned by Interpreter.cpp::BEQL().
+			case 0x15: // BNEL, owned by Interpreter.cpp::BNEL().
+			case 0x16: // BLEZL, owned by Interpreter.cpp::BLEZL().
+			case 0x17: // BGTZL, owned by Interpreter.cpp::BGTZL().
 				return true;
 			default:
 				return false;
@@ -256,8 +293,11 @@ namespace VitaEE
 		u32 raw_cycles = 0;
 		bool has_branch = false;
 		bool has_register_branch_target = false;
+		bool branch_is_likely = false;
 		u32 branch_instruction_index = 0;
 		u32 branch_target_pc = 0;
+		u32 branch_likely_not_taken_raw_cycles = 0;
+		size_t branch_likely_skip_delay = static_cast<size_t>(-1);
 		const auto add_raw_cycles = [&raw_cycles](u32 op) {
 			// PCSX2's x86 recRecompile() gives NOP a fixed 9-cycle raw cost before
 			// scaling; all other op costs come from the R5900 opcode table.
@@ -287,6 +327,9 @@ namespace VitaEE
 				add_raw_cycles(op);
 				branch_instruction_index = i;
 				has_branch = true;
+				branch_is_likely = IsBranchLikelyOpcode(op);
+				if (branch_is_likely)
+					branch_likely_not_taken_raw_cycles = raw_cycles;
 
 				switch (op >> 26)
 				{
@@ -342,7 +385,44 @@ namespace VitaEE
 						if (!EmitBGTZ(op))
 							return false;
 						break;
+					case 0x14:
+						branch_target_pc = BranchTarget(pc, op);
+						if (!EmitBEQL(op))
+							return false;
+						break;
+					case 0x15:
+						branch_target_pc = BranchTarget(pc, op);
+						if (!EmitBNEL(op))
+							return false;
+						break;
+					case 0x16:
+						branch_target_pc = BranchTarget(pc, op);
+						if (!EmitBLEZL(op))
+							return false;
+						break;
+					case 0x17:
+						branch_target_pc = BranchTarget(pc, op);
+						if (!EmitBGTZL(op))
+							return false;
+						break;
 					default:
+						return false;
+				}
+
+				if (branch_is_likely)
+				{
+					// PCSX2 owners: Interpreter.cpp::BEQL()/BNEL()/BLEZL()/BGTZL()
+					// and REGIMM likely forms cancel the delay slot when the
+					// condition is false; x86/ix86-32/iR5900Branch.cpp emits a
+					// separate not-taken path without recompileNextInstruction().
+					if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
+						!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP0))
+					{
+						return false;
+					}
+
+					branch_likely_skip_delay = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+					if (branch_likely_skip_delay == static_cast<size_t>(-1))
 						return false;
 				}
 
@@ -355,10 +435,17 @@ namespace VitaEE
 			add_raw_cycles(op);
 			if (!EmitOpcode(op))
 				return false;
+
+			if (has_branch && branch_is_likely && i == branch_instruction_index + 1)
+			{
+				if (!m_code.PatchBranch(branch_likely_skip_delay, m_code.Size(), VitaA32::Condition::EQ))
+					return false;
+			}
 		}
 
 		const u32 next_pc = start_pc + instruction_count * 4;
 		const u32 block_cycles = ScaleBlockCycles(raw_cycles);
+		const u32 branch_likely_not_taken_cycles = ScaleBlockCycles(branch_likely_not_taken_raw_cycles);
 		if (scaled_cycles)
 			*scaled_cycles = block_cycles;
 
@@ -380,6 +467,9 @@ namespace VitaEE
 		{
 			return false;
 		}
+
+		if (has_branch && branch_is_likely)
+			return EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit);
 
 		return EndBlockWithCycleTest(block_cycles, direct_exit, event_exit);
 	}
@@ -449,6 +539,86 @@ namespace VitaEE
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
 			!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
 			!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET + sizeof(u32))) ||
+			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true) ||
+			!m_code.EmitSbcReg(HOST_TMP3, HOST_TMP1, HOST_TMP3, true))
+		{
+			return false;
+		}
+
+		const size_t direct_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
+		if (direct_branch == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitCallAbsolute(event_exit) ||
+			!m_code.EmitPop(REG_R4 | REG_R5 | REG_PC))
+		{
+			return false;
+		}
+
+		const size_t direct_target = m_code.Size();
+		return m_code.EmitCallAbsolute(direct_exit) &&
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_PC) &&
+			   m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI);
+	}
+
+	bool BlockCompiler::EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles,
+		const void* direct_exit, const void* event_exit)
+	{
+		if (!direct_exit || !event_exit)
+			return false;
+
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
+			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+			!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP2))
+		{
+			return false;
+		}
+
+		const size_t taken_path = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (taken_path == static_cast<size_t>(-1))
+			return false;
+
+		const auto add_cycles = [this](u32 cycles) {
+			if (cycles <= 255)
+			{
+				if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(cycles), true))
+					return false;
+			}
+			else
+			{
+				if (!m_code.EmitMovImm32(HOST_TMP2, cycles) ||
+					!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true))
+				{
+					return false;
+				}
+			}
+
+			return m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) &&
+				   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32)));
+		};
+
+		if (!add_cycles(not_taken_cycles))
+			return false;
+
+		const size_t cycles_done = m_code.EmitBranchPlaceholder();
+		if (cycles_done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t taken_target = m_code.Size();
+		if (!m_code.PatchBranch(taken_path, taken_target, VitaA32::Condition::NE) ||
+			!add_cycles(taken_cycles))
+		{
+			return false;
+		}
+
+		const size_t cycles_done_target = m_code.Size();
+		if (!m_code.PatchBranch(cycles_done, cycles_done_target))
+			return false;
+
+		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
 			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET + sizeof(u32))) ||
 			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true) ||
 			!m_code.EmitSbcReg(HOST_TMP3, HOST_TMP1, HOST_TMP3, true))
@@ -760,10 +930,10 @@ namespace VitaEE
 	bool BlockCompiler::EmitREGIMM(u32 op, u32 pc)
 	{
 		const unsigned rt = RT(op);
-		const bool link = (rt == 0x10 || rt == 0x11);
+		const bool link = (rt == 0x10 || rt == 0x11 || rt == 0x12 || rt == 0x13);
 		if (link)
 		{
-			// PCSX2 owners: Interpreter.cpp::BLTZAL()/BGEZAL() apply
+			// PCSX2 owners: Interpreter.cpp::BLTZAL()/BGEZAL()/BLTZALL()/BGEZALL() apply
 			// R5900.h::_SetLink(31) before testing the branch condition.
 			if (!EmitLink(31, pc))
 				return false;
@@ -772,10 +942,14 @@ namespace VitaEE
 		switch (rt)
 		{
 			case 0x00: // BLTZ, owned by Interpreter.cpp::BLTZ().
+			case 0x02: // BLTZL, owned by Interpreter.cpp::BLTZL().
 			case 0x10: // BLTZAL, owned by Interpreter.cpp::BLTZAL().
+			case 0x12: // BLTZALL, owned by Interpreter.cpp::BLTZALL().
 				return EmitBranchSigned(op, SignedBranchCondition::LessThanZero);
 			case 0x01: // BGEZ, owned by Interpreter.cpp::BGEZ().
+			case 0x03: // BGEZL, owned by Interpreter.cpp::BGEZL().
 			case 0x11: // BGEZAL, owned by Interpreter.cpp::BGEZAL().
+			case 0x13: // BGEZALL, owned by Interpreter.cpp::BGEZALL().
 				return EmitBranchSigned(op, SignedBranchCondition::GreaterEqualZero);
 			default:
 				return false;
@@ -818,6 +992,26 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitBGTZ(u32 op)
+	{
+		return EmitBranchSigned(op, SignedBranchCondition::GreaterThanZero);
+	}
+
+	bool BlockCompiler::EmitBEQL(u32 op)
+	{
+		return EmitBranchEqual(op, true);
+	}
+
+	bool BlockCompiler::EmitBNEL(u32 op)
+	{
+		return EmitBranchEqual(op, false);
+	}
+
+	bool BlockCompiler::EmitBLEZL(u32 op)
+	{
+		return EmitBranchSigned(op, SignedBranchCondition::LessEqualZero);
+	}
+
+	bool BlockCompiler::EmitBGTZL(u32 op)
 	{
 		return EmitBranchSigned(op, SignedBranchCondition::GreaterThanZero);
 	}

@@ -36,6 +36,7 @@ namespace VitaEE
 		bool EmitOpcode(u32 op);
 		bool EndBlockReturn(u8 value);
 		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit);
+		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit, const void* event_exit);
 
 	private:
 		bool EmitSPECIAL(u32 op);
@@ -64,6 +65,10 @@ namespace VitaEE
 		bool EmitBNE(u32 op);
 		bool EmitBLEZ(u32 op);
 		bool EmitBGTZ(u32 op);
+		bool EmitBEQL(u32 op);
+		bool EmitBNEL(u32 op);
+		bool EmitBLEZL(u32 op);
+		bool EmitBGTZL(u32 op);
 		bool EmitDSLLV(u32 op);
 		bool EmitDSRLV(u32 op);
 		bool EmitDSRAV(u32 op);
