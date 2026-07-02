@@ -29,6 +29,7 @@ namespace VitaEE
 		UnsupportedOpcode,
 		PageBoundary,
 		DebugBoundary,
+		Branch,
 		MaxInstructions,
 		AddressWrap,
 	};

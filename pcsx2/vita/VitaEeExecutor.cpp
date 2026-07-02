@@ -115,7 +115,46 @@ namespace VitaEE
 				return true;
 			}
 
-			if (!BlockCompiler::CanCompileOpcode(memRead32(pc)))
+			const u32 op = memRead32(pc);
+			if (BlockCompiler::IsSupportedBranchOpcode(op))
+			{
+				// Ported from PCSX2 x86/ix86-32/iR5900.cpp::recRecompile():
+				// branches end the block after the delay slot. Branches in the
+				// delay slot stay on the interpreter path until the full special
+				// delay-slot rule from iR5900.cpp is ported.
+				if (i + 1 >= max_instruction_count)
+				{
+					result->stop = BlockScanStop::MaxInstructions;
+					return true;
+				}
+
+				if (pc > UINT32_MAX - 4)
+				{
+					result->stop = BlockScanStop::AddressWrap;
+					return true;
+				}
+
+				const u32 delay_pc = pc + 4;
+				if ((delay_pc & 0xffcu) == 0)
+				{
+					result->stop = BlockScanStop::PageBoundary;
+					return true;
+				}
+
+				const u32 delay_op = memRead32(delay_pc);
+				if (!BlockCompiler::CanCompileDelaySlotOpcode(delay_op))
+				{
+					result->stop = BlockScanStop::UnsupportedOpcode;
+					return true;
+				}
+
+				result->instruction_count += 2;
+				result->stop_pc = delay_pc + 4;
+				result->stop = BlockScanStop::Branch;
+				return true;
+			}
+
+			if (!BlockCompiler::CanCompileOpcode(op))
 			{
 				result->stop = BlockScanStop::UnsupportedOpcode;
 				return true;

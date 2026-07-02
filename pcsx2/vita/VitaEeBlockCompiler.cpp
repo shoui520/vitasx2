@@ -16,10 +16,12 @@ namespace VitaEE
 	namespace
 	{
 		constexpr u16 REG_R4 = 1u << 4;
+		constexpr u16 REG_R5 = 1u << 5;
 		constexpr u16 REG_LR = 1u << 14;
 		constexpr u16 REG_PC = 1u << 15;
 
 		constexpr unsigned HOST_CPU_REGS = 4;
+		constexpr unsigned HOST_BRANCH_FLAG = 5;
 		constexpr unsigned HOST_TMP0 = 0;
 		constexpr unsigned HOST_TMP1 = 1;
 		constexpr unsigned HOST_TMP2 = 2;
@@ -59,6 +61,11 @@ namespace VitaEE
 		constexpr s16 IMM_S(u32 op)
 		{
 			return static_cast<s16>(op);
+		}
+
+		constexpr u32 BranchTarget(u32 pc, u32 op)
+		{
+			return pc + 4 + static_cast<s32>(IMM_S(op)) * 4;
 		}
 
 		constexpr size_t GprOffset(unsigned guest_reg)
@@ -142,6 +149,9 @@ namespace VitaEE
 		{
 			case 0x00:
 				return CanCompileSPECIAL(op);
+			case 0x04: // BEQ, owned by Interpreter.cpp::BEQ().
+			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
+				return true;
 			case 0x09: // ADDIU, owned by R5900OpcodeImpl.cpp::ADDIU().
 			case 0x0a: // SLTI, owned by R5900OpcodeImpl.cpp::SLTI().
 			case 0x0b: // SLTIU, owned by R5900OpcodeImpl.cpp::SLTIU().
@@ -156,9 +166,29 @@ namespace VitaEE
 		}
 	}
 
+	bool BlockCompiler::IsSupportedBranchOpcode(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x04: // BEQ, owned by Interpreter.cpp::BEQ().
+			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::CanCompileDelaySlotOpcode(u32 op)
+	{
+		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() detects branches in
+		// delay slots and leaves a special path. Keep those on the interpreter
+		// side until that rule is ported completely.
+		return CanCompileOpcode(op) && !IsSupportedBranchOpcode(op);
+	}
+
 	bool BlockCompiler::BeginBlock()
 	{
-		return m_code.EmitPush(REG_R4 | REG_LR) &&
+		return m_code.EmitPush(REG_R4 | REG_R5 | REG_LR) &&
 			   m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs)));
 	}
 
@@ -172,20 +202,61 @@ namespace VitaEE
 			return false;
 
 		u32 raw_cycles = 0;
-		for (u32 i = 0; i < instruction_count; i++)
-		{
-			const u32 pc = start_pc + i * 4;
-			const u32 op = memRead32(pc);
-			if (!CanCompileOpcode(op))
-				return false;
-
+		bool has_branch = false;
+		u32 branch_instruction_index = 0;
+		u32 branch_target_pc = 0;
+		const auto add_raw_cycles = [&raw_cycles](u32 op) {
 			// PCSX2's x86 recRecompile() gives NOP a fixed 9-cycle raw cost before
 			// scaling; all other op costs come from the R5900 opcode table.
 			if (op == 0)
 				raw_cycles += 9 * (2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1));
 			else
 				raw_cycles += R5900::GetInstruction(op).cycles * (2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1));
+		};
 
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 pc = start_pc + i * 4;
+			const u32 op = memRead32(pc);
+
+			if (has_branch && i > branch_instruction_index + 1)
+				return false;
+
+			if (IsSupportedBranchOpcode(op))
+			{
+				if (has_branch || i + 1 >= instruction_count)
+					return false;
+
+				const u32 delay_op = memRead32(pc + 4);
+				if (!CanCompileDelaySlotOpcode(delay_op))
+					return false;
+
+				add_raw_cycles(op);
+				branch_instruction_index = i;
+				branch_target_pc = BranchTarget(pc, op);
+				has_branch = true;
+
+				switch (op >> 26)
+				{
+					case 0x04:
+						if (!EmitBEQ(op))
+							return false;
+						break;
+					case 0x05:
+						if (!EmitBNE(op))
+							return false;
+						break;
+					default:
+						return false;
+				}
+
+				continue;
+			}
+
+			if ((has_branch && i != branch_instruction_index + 1) || !CanCompileOpcode(op))
+				return false;
+
+			add_raw_cycles(op);
 			if (!EmitOpcode(op))
 				return false;
 		}
@@ -195,9 +266,9 @@ namespace VitaEE
 		if (scaled_cycles)
 			*scaled_cycles = block_cycles;
 
-		// Matches the fall-through writeback in x86/ix86-32/iR5900.cpp::recRecompile()
-		// after compiling a non-branching block.
-		return EmitStorePc(next_pc) &&
+		// Matches the fall-through/branch writeback in x86/ix86-32/iR5900.cpp,
+		// after compiling either a non-branching block or a branch plus delay slot.
+		return (has_branch ? EmitStoreBranchPc(branch_target_pc, next_pc) : EmitStorePc(next_pc)) &&
 			   EndBlockWithCycleTest(block_cycles, direct_exit, event_exit);
 	}
 
@@ -231,7 +302,7 @@ namespace VitaEE
 	bool BlockCompiler::EndBlockReturn(u8 value)
 	{
 		return m_code.EmitMovImm8(0, value) &&
-			   m_code.EmitPop(REG_R4 | REG_PC);
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_PC);
 	}
 
 	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit)
@@ -278,14 +349,14 @@ namespace VitaEE
 			return false;
 
 		if (!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(REG_R4 | REG_PC))
+			!m_code.EmitPop(REG_R4 | REG_R5 | REG_PC))
 		{
 			return false;
 		}
 
 		const size_t direct_target = m_code.Size();
 		return m_code.EmitCallAbsolute(direct_exit) &&
-			   m_code.EmitPop(REG_R4 | REG_PC) &&
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_PC) &&
 			   m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI);
 	}
 
@@ -572,6 +643,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitMOVN(u32 op)
 	{
 		return EmitConditionalMove(op, false);
+	}
+
+	bool BlockCompiler::EmitBEQ(u32 op)
+	{
+		return EmitBranchEqual(op, true);
+	}
+
+	bool BlockCompiler::EmitBNE(u32 op)
+	{
+		return EmitBranchEqual(op, false);
 	}
 
 	bool BlockCompiler::EmitDSLLV(u32 op)
@@ -1051,6 +1132,20 @@ namespace VitaEE
 		return m_code.PatchBranch(skip_store, m_code.Size(), skip_condition);
 	}
 
+	bool BlockCompiler::EmitBranchEqual(u32 op, bool branch_on_equal)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+
+		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
+			   m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
+			   m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1, true) &&
+			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
+			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, branch_on_equal ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
+	}
+
 	bool BlockCompiler::EmitSetLessThan64(unsigned guest_reg, bool signed_compare)
 	{
 		if (guest_reg == 0)
@@ -1110,6 +1205,25 @@ namespace VitaEE
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, pc) &&
 			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(PC_OFFSET));
+	}
+
+	bool BlockCompiler::EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc)
+	{
+		if (!EmitStorePc(fallthrough_pc) ||
+			!m_code.EmitMovImm8(HOST_TMP1, 0) ||
+			!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP1))
+		{
+			return false;
+		}
+
+		const size_t not_taken = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (not_taken == static_cast<size_t>(-1))
+			return false;
+
+		if (!EmitStorePc(target_pc))
+			return false;
+
+		return m_code.PatchBranch(not_taken, m_code.Size(), VitaA32::Condition::EQ);
 	}
 
 	bool BlockCompiler::EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high)

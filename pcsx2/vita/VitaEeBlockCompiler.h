@@ -19,6 +19,8 @@ namespace VitaEE
 		explicit BlockCompiler(VitaA32::CodeBuffer& code);
 
 		static bool CanCompileOpcode(u32 op);
+		static bool IsSupportedBranchOpcode(u32 op);
+		static bool CanCompileDelaySlotOpcode(u32 op);
 
 		bool BeginBlock();
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
@@ -45,6 +47,8 @@ namespace VitaEE
 		bool EmitSRAV(u32 op);
 		bool EmitMOVZ(u32 op);
 		bool EmitMOVN(u32 op);
+		bool EmitBEQ(u32 op);
+		bool EmitBNE(u32 op);
 		bool EmitDSLLV(u32 op);
 		bool EmitDSRLV(u32 op);
 		bool EmitDSRAV(u32 op);
@@ -71,9 +75,11 @@ namespace VitaEE
 		bool EmitShift64LeftVariable(u32 op);
 		bool EmitShift64RightVariable(u32 op, bool arithmetic);
 		bool EmitConditionalMove(u32 op, bool move_on_zero);
+		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
+		bool EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc);
 		bool EmitStorePc(u32 pc);
 		bool EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 
