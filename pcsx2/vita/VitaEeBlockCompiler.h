@@ -18,6 +18,8 @@ namespace VitaEE
 		explicit BlockCompiler(VitaA32::CodeBuffer& code);
 
 		bool BeginBlock();
+		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
+			u32* scaled_cycles = nullptr);
 		bool EmitOpcode(u32 op);
 		bool EndBlockReturn(u8 value);
 		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit);
@@ -31,6 +33,7 @@ namespace VitaEE
 		bool EmitADDU(u32 op);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
+		bool EmitStorePc(u32 pc);
 		bool EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 
 		VitaA32::CodeBuffer& m_code;

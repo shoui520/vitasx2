@@ -3,7 +3,10 @@
 
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
 
+#include "pcsx2/Config.h"
+#include "pcsx2/Memory.h"
 #include "pcsx2/R5900.h"
+#include "pcsx2/R5900OpcodeTables.h"
 #include "pcsx2/vita/A32Emitter.h"
 
 #include <cstddef>
@@ -23,6 +26,7 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP3 = 3;
 
 		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
+		constexpr size_t PC_OFFSET = offsetof(cpuRegisters, pc);
 		constexpr size_t CYCLE_OFFSET = offsetof(cpuRegisters, cycle);
 		constexpr size_t NEXT_EVENT_OFFSET = offsetof(cpuRegisters, nextEventCycle);
 
@@ -60,9 +64,32 @@ namespace VitaEE
 		{
 			return GPR_OFFSET + sizeof(GPR_reg) * guest_reg;
 		}
+
+		u32 ScaleBlockCycles(u32 raw_cycles)
+		{
+			// Ported from PCSX2 x86/ix86-32/iR5900.cpp::scaleblockcycles_calculation()
+			// and matched with Interpreter.cpp::intUpdateCPUCycles().
+			const bool lowcycles = (raw_cycles <= 40);
+			const s8 cyclerate = EmuConfig.Speedhacks.EECycleRate;
+			u32 scale_cycles = 0;
+
+			if (cyclerate == 0 || lowcycles || cyclerate < -99 || cyclerate > 3)
+				scale_cycles = raw_cycles >> 3;
+			else if (cyclerate > 1)
+				scale_cycles = raw_cycles >> (2 + cyclerate);
+			else if (cyclerate == 1)
+				scale_cycles = (raw_cycles >> 3) / 1.3f;
+			else if (cyclerate == -1)
+				scale_cycles = (raw_cycles <= 80 || raw_cycles > 168 ? 5 : 7) * raw_cycles / 32;
+			else
+				scale_cycles = ((5 + (-2 * (cyclerate + 1))) * raw_cycles) >> 5;
+
+			return (scale_cycles < 1) ? 1 : scale_cycles;
+		}
 	} // namespace
 
 	static_assert(GprOffset(31) + sizeof(u64) <= 0x0fff);
+	static_assert(PC_OFFSET + sizeof(u32) <= 0x0fff);
 	static_assert(CYCLE_OFFSET + sizeof(u64) <= 0x0fff);
 	static_assert(NEXT_EVENT_OFFSET + sizeof(u64) <= 0x0fff);
 
@@ -75,6 +102,43 @@ namespace VitaEE
 	{
 		return m_code.EmitPush(REG_R4 | REG_LR) &&
 			   m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs)));
+	}
+
+	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit,
+		const void* event_exit, u32* scaled_cycles)
+	{
+		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
+			return false;
+
+		if (!BeginBlock())
+			return false;
+
+		u32 raw_cycles = 0;
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 pc = start_pc + i * 4;
+			const u32 op = memRead32(pc);
+
+			// PCSX2's x86 recRecompile() gives NOP a fixed 9-cycle raw cost before
+			// scaling; all other op costs come from the R5900 opcode table.
+			if (op == 0)
+				raw_cycles += 9 * (2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1));
+			else
+				raw_cycles += R5900::GetInstruction(op).cycles * (2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1));
+
+			if (!EmitOpcode(op))
+				return false;
+		}
+
+		const u32 next_pc = start_pc + instruction_count * 4;
+		const u32 block_cycles = ScaleBlockCycles(raw_cycles);
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		// Matches the fall-through writeback in x86/ix86-32/iR5900.cpp::recRecompile()
+		// after compiling a non-branching block.
+		return EmitStorePc(next_pc) &&
+			   EndBlockWithCycleTest(block_cycles, direct_exit, event_exit);
 	}
 
 	bool BlockCompiler::EmitOpcode(u32 op)
@@ -292,6 +356,12 @@ namespace VitaEE
 		const size_t offset = GprOffset(guest_reg);
 		return m_code.EmitLdrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset)) &&
 			   m_code.EmitLdrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+	}
+
+	bool BlockCompiler::EmitStorePc(u32 pc)
+	{
+		return m_code.EmitMovImm32(HOST_TMP0, pc) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(PC_OFFSET));
 	}
 
 	bool BlockCompiler::EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high)
