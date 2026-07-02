@@ -85,8 +85,14 @@ namespace VitaEE
 		bool EmitBNEL(u32 op);
 		bool EmitBLEZL(u32 op);
 		bool EmitBGTZL(u32 op);
+		bool EmitLB(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitLH(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitLW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitLBU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitLHU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitLWU(u32 op);
+		bool EmitSB(u32 op);
+		bool EmitSH(u32 op);
 		bool EmitSW(u32 op);
 		bool EmitDSLLV(u32 op);
 		bool EmitDSRLV(u32 op);
@@ -122,6 +128,8 @@ namespace VitaEE
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitBranchSigned(u32 op, SignedBranchCondition condition);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
+		bool EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift);
 		bool EmitCounterReadFlagFromAddress(unsigned host_reg);
 		bool EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitAddScaledCyclesToCpu(u32 cycles);

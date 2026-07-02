@@ -208,6 +208,21 @@ namespace VitaEE
 			Cpu->CancelInstruction();
 		}
 
+		__noinline u32 VitaEeMemRead8(u32 addr)
+		{
+			// PCSX2 owners: R5900OpcodeImpl.cpp::LB() and LBU().
+			return memRead8(addr);
+		}
+
+		__noinline u32 VitaEeMemRead16Checked(u32 addr)
+		{
+			// PCSX2 owners: R5900OpcodeImpl.cpp::LH() and LHU().
+			if (addr & 1)
+				VitaEeRaiseAddressError(addr, false);
+
+			return memRead16(addr);
+		}
+
 		__noinline u32 VitaEeMemRead32Checked(u32 addr)
 		{
 			// PCSX2 owners: R5900OpcodeImpl.cpp::LW() and LWU().
@@ -215,6 +230,21 @@ namespace VitaEE
 				VitaEeRaiseAddressError(addr, false);
 
 			return memRead32(addr);
+		}
+
+		__noinline void VitaEeMemWrite8(u32 addr, u32 value)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::SB().
+			memWrite8(addr, static_cast<u8>(value));
+		}
+
+		__noinline void VitaEeMemWrite16Checked(u32 addr, u32 value)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::SH().
+			if (addr & 1)
+				VitaEeRaiseAddressError(addr, true);
+
+			memWrite16(addr, static_cast<u16>(value));
 		}
 
 		__noinline void VitaEeMemWrite32Checked(u32 addr, u32 value)
@@ -265,8 +295,14 @@ namespace VitaEE
 			case 0x0e: // XORI, owned by R5900OpcodeImpl.cpp::XORI().
 			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
+			case 0x20: // LB, owned by R5900OpcodeImpl.cpp::LB().
+			case 0x21: // LH, owned by R5900OpcodeImpl.cpp::LH().
 			case 0x23: // LW, owned by R5900OpcodeImpl.cpp::LW().
+			case 0x24: // LBU, owned by R5900OpcodeImpl.cpp::LBU().
+			case 0x25: // LHU, owned by R5900OpcodeImpl.cpp::LHU().
 			case 0x27: // LWU, owned by R5900OpcodeImpl.cpp::LWU().
+			case 0x28: // SB, owned by R5900OpcodeImpl.cpp::SB().
+			case 0x29: // SH, owned by R5900OpcodeImpl.cpp::SH().
 			case 0x2b: // SW, owned by R5900OpcodeImpl.cpp::SW().
 				return true;
 			default:
@@ -317,10 +353,21 @@ namespace VitaEE
 
 	bool BlockCompiler::RequiresBlockEndAfterOpcode(u32 op)
 	{
-		// PCSX2 owner: R5900OpcodeImpl.cpp::LW() forces intUpdateCPUCycles() and
-		// intEventTest() for EE counter reads. Ending the Vita block after LW
-		// keeps trace-window recording aligned with executed instructions.
-		return (op >> 26) == 0x23;
+		// PCSX2 owners: R5900OpcodeImpl.cpp::LB()/LBU()/LH()/LHU()/LW()
+		// force intUpdateCPUCycles() and intEventTest() for EE counter reads.
+		// Ending the Vita block after these loads keeps trace-window recording
+		// aligned with executed instructions.
+		switch (op >> 26)
+		{
+			case 0x20:
+			case 0x21:
+			case 0x23:
+			case 0x24:
+			case 0x25:
+				return true;
+			default:
+				return false;
+		}
 	}
 
 	bool BlockCompiler::BeginBlock()
@@ -637,10 +684,22 @@ namespace VitaEE
 				return EmitLUI(op);
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
 				return EmitDADDIU(op);
+			case 0x20: // LB, owned by R5900OpcodeImpl.cpp::LB().
+				return EmitLB(op, pc, raw_cycles_through_instruction, event_exit);
+			case 0x21: // LH, owned by R5900OpcodeImpl.cpp::LH().
+				return EmitLH(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x23: // LW, owned by R5900OpcodeImpl.cpp::LW().
 				return EmitLW(op, pc, raw_cycles_through_instruction, event_exit);
+			case 0x24: // LBU, owned by R5900OpcodeImpl.cpp::LBU().
+				return EmitLBU(op, pc, raw_cycles_through_instruction, event_exit);
+			case 0x25: // LHU, owned by R5900OpcodeImpl.cpp::LHU().
+				return EmitLHU(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x27: // LWU, owned by R5900OpcodeImpl.cpp::LWU().
 				return EmitLWU(op);
+			case 0x28: // SB, owned by R5900OpcodeImpl.cpp::SB().
+				return EmitSB(op);
+			case 0x29: // SH, owned by R5900OpcodeImpl.cpp::SH().
+				return EmitSH(op);
 			case 0x2b: // SW, owned by R5900OpcodeImpl.cpp::SW().
 				return EmitSW(op);
 			default:
@@ -1267,6 +1326,18 @@ namespace VitaEE
 		return EmitBranchSigned(op, SignedBranchCondition::GreaterThanZero);
 	}
 
+	bool BlockCompiler::EmitLB(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
+			reinterpret_cast<const void*>(&VitaEeMemRead8), true, 24);
+	}
+
+	bool BlockCompiler::EmitLH(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
+			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), true, 16);
+	}
+
 	bool BlockCompiler::EmitLW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		const unsigned rt = RT(op);
@@ -1285,9 +1356,23 @@ namespace VitaEE
 			{
 				return false;
 			}
+
+			return EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit);
 		}
 
-		return EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit);
+		return true;
+	}
+
+	bool BlockCompiler::EmitLBU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
+			reinterpret_cast<const void*>(&VitaEeMemRead8), false, 0);
+	}
+
+	bool BlockCompiler::EmitLHU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
+			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), false, 0);
 	}
 
 	bool BlockCompiler::EmitLWU(u32 op)
@@ -1305,6 +1390,24 @@ namespace VitaEE
 
 		return m_code.EmitMovImm8(HOST_TMP1, 0) &&
 			   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitSB(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   EmitLoadGprLow(rt, HOST_TMP1) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite8));
+	}
+
+	bool BlockCompiler::EmitSH(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   EmitLoadGprLow(rt, HOST_TMP1) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite16Checked));
 	}
 
 	bool BlockCompiler::EmitSW(u32 op)
@@ -1970,11 +2073,46 @@ namespace VitaEE
 			   EmitStoreGpr64(guest_reg, HOST_TMP4, HOST_TMP1);
 	}
 
+	bool BlockCompiler::EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift)
+	{
+		const unsigned rt = RT(op);
+
+		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
+			!EmitCounterReadFlagFromAddress(HOST_TMP0) ||
+			!m_code.EmitCallAbsolute(read_helper))
+		{
+			return false;
+		}
+
+		if (rt == 0)
+			return true;
+
+		if (sign_extend)
+		{
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
+					static_cast<u8>(sign_shift)) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
+					static_cast<u8>(sign_shift)) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31))
+			{
+				return false;
+			}
+		}
+		else if (!m_code.EmitMovImm8(HOST_TMP1, 0))
+		{
+			return false;
+		}
+
+		return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1) &&
+			   EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit);
+	}
+
 	bool BlockCompiler::EmitCounterReadFlagFromAddress(unsigned host_reg)
 	{
-		// PCSX2 owner: R5900OpcodeImpl.cpp::LW() checks
-		// (addr & 0xffffe000) == 0x10000000 after the load to force an EE
-		// counter-read event test.
+		// PCSX2 owners: R5900OpcodeImpl.cpp::LB()/LBU()/LH()/LHU()/LW()
+		// check (addr & 0xffffe000) == 0x10000000 after the load to force
+		// an EE counter-read event test.
 		return m_code.EmitMovImm32(HOST_TMP2, 0xffffe000u) &&
 			   m_code.EmitAndReg(HOST_TMP2, host_reg, HOST_TMP2) &&
 			   m_code.EmitMovImm32(HOST_TMP3, 0x10000000u) &&
