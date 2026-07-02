@@ -441,6 +441,11 @@ namespace VitaEE
 
 			result->instruction_count++;
 			result->stop_pc = pc + 4;
+			if (BlockCompiler::RequiresBlockEndAfterOpcode(op))
+			{
+				result->stop = BlockScanStop::OpcodeBoundary;
+				return true;
+			}
 		}
 
 		return true;

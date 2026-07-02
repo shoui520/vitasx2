@@ -45,13 +45,14 @@ namespace VitaEE
 		bool BeginBlock();
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr);
-		bool EmitOpcode(u32 op);
+		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0, const void* event_exit = nullptr);
 		bool EndBlockReturn(u8 value);
 		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
 			size_t* direct_link_target_offset = nullptr, size_t* taken_link_target_offset = nullptr);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
 			const void* event_exit, size_t* not_taken_link_target_offset = nullptr,
 			size_t* taken_link_target_offset = nullptr);
+		static bool RequiresBlockEndAfterOpcode(u32 op);
 
 	private:
 		bool EmitSPECIAL(u32 op);
@@ -84,6 +85,7 @@ namespace VitaEE
 		bool EmitBNEL(u32 op);
 		bool EmitBLEZL(u32 op);
 		bool EmitBGTZL(u32 op);
+		bool EmitLW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitLWU(u32 op);
 		bool EmitSW(u32 op);
 		bool EmitDSLLV(u32 op);
@@ -120,6 +122,9 @@ namespace VitaEE
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitBranchSigned(u32 op, SignedBranchCondition condition);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
+		bool EmitCounterReadFlagFromAddress(unsigned host_reg);
+		bool EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitAddScaledCyclesToCpu(u32 cycles);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg);
