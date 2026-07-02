@@ -325,6 +325,21 @@ namespace VitaA32
 			   EmitBlx(scratch_reg);
 	}
 
+	bool CodeBuffer::PatchMovImm32(size_t instruction_offset, unsigned rd, u32 value)
+	{
+		if (!m_base || !IsRegister(rd) || instruction_offset + sizeof(u32) * 2 > m_offset ||
+			(instruction_offset & 3) != 0)
+		{
+			return false;
+		}
+
+		const u32 movw = EncodeMovw(rd, static_cast<u16>(value));
+		const u32 movt = EncodeMovt(rd, static_cast<u16>(value >> 16));
+		std::memcpy(m_base + instruction_offset, &movw, sizeof(movw));
+		std::memcpy(m_base + instruction_offset + sizeof(movw), &movt, sizeof(movt));
+		return true;
+	}
+
 	bool CodeBuffer::Flush()
 	{
 		if (!m_base || m_offset == 0)

@@ -13,6 +13,13 @@ namespace VitaA32
 
 namespace VitaEE
 {
+	struct DirectLinkSlot
+	{
+		u32 target_pc = 0;
+		size_t target_offset = 0;
+		bool valid = false;
+	};
+
 	enum class SignedBranchCondition : u8
 	{
 		LessThanZero,
@@ -32,10 +39,11 @@ namespace VitaEE
 
 		bool BeginBlock();
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
-			u32* scaled_cycles = nullptr);
+			u32* scaled_cycles = nullptr, DirectLinkSlot* direct_link = nullptr);
 		bool EmitOpcode(u32 op);
 		bool EndBlockReturn(u8 value);
-		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit);
+		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
+			size_t* direct_link_target_offset = nullptr);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit, const void* event_exit);
 
 	private:

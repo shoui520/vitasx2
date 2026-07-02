@@ -54,6 +54,7 @@ namespace VitaEE
 
 			block.code.Release();
 			block.valid = false;
+			block.direct_link = {};
 		}
 
 		m_next_victim = 0;
@@ -76,12 +77,26 @@ namespace VitaEE
 			const u32 block_end = block.start_pc + block.instruction_count * 4;
 			if (block.start_pc < end_pc && start_pc < block_end)
 			{
+				UnlinkIncomingLinks(block.start_pc);
 				block.valid = false;
+				block.direct_link = {};
 				invalidated++;
 			}
 		}
 
 		return invalidated;
+	}
+
+	void BlockExecutor::SetDirectLinkingEnabled(bool enabled)
+	{
+		if (m_direct_linking_enabled == enabled)
+			return;
+
+		m_direct_linking_enabled = enabled;
+		if (enabled)
+			RelinkDirectLinks();
+		else
+			UnlinkIncomingLinks(UINT32_MAX);
 	}
 
 	bool BlockExecutor::ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result)
@@ -172,6 +187,37 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockExecutor::ValidateCachedBlock(CachedBlock& block)
+	{
+		if (!block.valid)
+			return false;
+
+		const s8 ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
+		const u8 cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		bool matches = (block.ee_cycle_rate == ee_cycle_rate &&
+						block.cp0_config_cycle_shift == cp0_config_cycle_shift);
+
+		for (u32 i = 0; matches && i < block.instruction_count; i++)
+			matches = (block.opcodes[i] == memRead32(block.start_pc + i * 4));
+
+		if (matches)
+			return true;
+
+		// PCSX2's x86 path combines recRAMCopy with protected-page faults.
+		// Vita has no user-mode fault repair, so validate cached opcodes before
+		// any direct-linked dispatch can reach the block.
+		UnlinkIncomingLinks(block.start_pc);
+		block.valid = false;
+		block.direct_link = {};
+		return false;
+	}
+
+	void BlockExecutor::ValidateCachedBlocks()
+	{
+		for (CachedBlock& block : m_cache)
+			ValidateCachedBlock(block);
+	}
+
 	bool BlockExecutor::FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block)
 	{
 		if (!block || instruction_count == 0 ||
@@ -183,31 +229,30 @@ namespace VitaEE
 
 		*block = nullptr;
 
-		const s8 ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
-		const u8 cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
-
 		for (CachedBlock& entry : m_cache)
 		{
 			if (!entry.valid || entry.start_pc != start_pc || entry.instruction_count != instruction_count)
 				continue;
 
-			bool matches = (entry.ee_cycle_rate == ee_cycle_rate &&
-							entry.cp0_config_cycle_shift == cp0_config_cycle_shift);
-			for (u32 i = 0; matches && i < instruction_count; i++)
-				matches = (entry.opcodes[i] == memRead32(start_pc + i * 4));
-
-			if (matches)
+			if (ValidateCachedBlock(entry))
 			{
 				*block = &entry;
 				return true;
 			}
-
-			// Vita has no user-mode page protection fault path, so SMC safety is
-			// an explicit opcode/config validation check before dispatch.
-			entry.valid = false;
 		}
 
 		return false;
+	}
+
+	BlockExecutor::CachedBlock* BlockExecutor::FindCachedBlockByStartPc(u32 start_pc)
+	{
+		for (CachedBlock& entry : m_cache)
+		{
+			if (entry.valid && entry.start_pc == start_pc && ValidateCachedBlock(entry))
+				return &entry;
+		}
+
+		return nullptr;
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::AllocateCacheEntry()
@@ -220,7 +265,10 @@ namespace VitaEE
 
 		CachedBlock& victim = m_cache[m_next_victim];
 		m_next_victim = (m_next_victim + 1) % m_cache.size();
+		if (victim.valid)
+			UnlinkIncomingLinks(victim.start_pc);
 		victim.valid = false;
+		victim.direct_link = {};
 		return &victim;
 	}
 
@@ -255,9 +303,10 @@ namespace VitaEE
 
 		BlockCompiler compiler(block.code);
 		u32 compiled_scaled_cycles = 0;
+		DirectLinkSlot direct_link;
 		if (!compiler.CompileStraightLineBlock(start_pc, instruction_count,
 				reinterpret_cast<const void*>(&VitaEeA32DirectExit),
-				reinterpret_cast<const void*>(&VitaEeA32EventExit), &compiled_scaled_cycles) ||
+				reinterpret_cast<const void*>(&VitaEeA32EventExit), &compiled_scaled_cycles, &direct_link) ||
 			!block.code.Flush())
 		{
 			return false;
@@ -268,7 +317,18 @@ namespace VitaEE
 		block.scaled_cycles = compiled_scaled_cycles;
 		block.ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		block.direct_link = direct_link;
 		block.valid = true;
+
+		if (m_direct_linking_enabled)
+		{
+			PatchIncomingLinks(block.start_pc, block.code.EntryPoint());
+			if (block.direct_link.valid)
+			{
+				if (CachedBlock* target = FindCachedBlockByStartPc(block.direct_link.target_pc))
+					PatchDirectLink(block, target->code.EntryPoint());
+			}
+		}
 
 		if (scaled_cycles)
 			*scaled_cycles = compiled_scaled_cycles;
@@ -276,9 +336,60 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockExecutor::PatchDirectLink(CachedBlock& block, const void* target)
+	{
+		if (!target || !block.valid || !block.direct_link.valid)
+			return false;
+
+		return block.code.PatchMovImm32(block.direct_link.target_offset, 12,
+				   static_cast<u32>(reinterpret_cast<uptr>(target))) &&
+			   block.code.Flush();
+	}
+
+	void BlockExecutor::PatchIncomingLinks(u32 target_pc, const void* target)
+	{
+		if (!m_direct_linking_enabled || !target)
+			return;
+
+		for (CachedBlock& block : m_cache)
+		{
+			if (block.valid && block.direct_link.valid && block.direct_link.target_pc == target_pc)
+				PatchDirectLink(block, target);
+		}
+	}
+
+	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc)
+	{
+		for (CachedBlock& block : m_cache)
+		{
+			if (block.valid && block.direct_link.valid &&
+				(target_pc == UINT32_MAX || block.direct_link.target_pc == target_pc))
+			{
+				PatchDirectLink(block, reinterpret_cast<const void*>(&VitaEeA32DirectExit));
+			}
+		}
+	}
+
+	void BlockExecutor::RelinkDirectLinks()
+	{
+		for (CachedBlock& block : m_cache)
+		{
+			if (!block.valid || !block.direct_link.valid)
+				continue;
+
+			const CachedBlock* target = FindCachedBlockByStartPc(block.direct_link.target_pc);
+			PatchDirectLink(block, target ? target->code.EntryPoint() :
+											 reinterpret_cast<const void*>(&VitaEeA32DirectExit));
+		}
+	}
+
 	bool BlockExecutor::RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result)
 	{
 		if (!result || !block.valid)
+			return false;
+
+		ValidateCachedBlocks();
+		if (!block.valid)
 			return false;
 
 		cpuRegs.pc = block.start_pc;

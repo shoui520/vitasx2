@@ -288,10 +288,13 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit,
-		const void* event_exit, u32* scaled_cycles)
+		const void* event_exit, u32* scaled_cycles, DirectLinkSlot* direct_link)
 	{
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return false;
+
+		if (direct_link)
+			*direct_link = {};
 
 		if (!BeginBlock())
 			return false;
@@ -498,7 +501,21 @@ namespace VitaEE
 		if (has_branch && branch_is_likely)
 			return EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit);
 
-		return EndBlockWithCycleTest(block_cycles, direct_exit, event_exit);
+		size_t direct_link_target_offset = 0;
+		if (!EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
+				direct_link && !has_branch ? &direct_link_target_offset : nullptr))
+		{
+			return false;
+		}
+
+		if (direct_link && !has_branch)
+		{
+			direct_link->target_pc = next_pc;
+			direct_link->target_offset = direct_link_target_offset;
+			direct_link->valid = true;
+		}
+
+		return true;
 	}
 
 	bool BlockCompiler::EmitOpcode(u32 op)
@@ -534,7 +551,8 @@ namespace VitaEE
 			   m_code.EmitPop(REG_R4 | REG_R5 | REG_PC);
 	}
 
-	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit)
+	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
+		size_t* direct_link_target_offset)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
@@ -584,9 +602,21 @@ namespace VitaEE
 		}
 
 		const size_t direct_target = m_code.Size();
-		return m_code.EmitCallAbsolute(direct_exit) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_PC) &&
-			   m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI);
+		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+			return false;
+
+		const size_t target_offset = m_code.Size();
+		if (!m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+			!m_code.EmitBx(HOST_TMP4) ||
+			!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
+		{
+			return false;
+		}
+
+		if (direct_link_target_offset)
+			*direct_link_target_offset = target_offset;
+
+		return true;
 	}
 
 	bool BlockCompiler::EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles,

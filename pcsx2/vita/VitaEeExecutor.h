@@ -5,6 +5,7 @@
 
 #include "common/Pcsx2Defs.h"
 #include "pcsx2/vita/A32Emitter.h"
+#include "pcsx2/vita/VitaEeBlockCompiler.h"
 
 #include <array>
 #include <cstddef>
@@ -60,6 +61,7 @@ namespace VitaEE
 
 		u32 Reset();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
+		void SetDirectLinkingEnabled(bool enabled);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
@@ -78,15 +80,24 @@ namespace VitaEE
 			u32 scaled_cycles = 0;
 			s8 ee_cycle_rate = 0;
 			u8 cp0_config_cycle_shift = 0;
+			DirectLinkSlot direct_link{};
 			bool valid = false;
 		};
 
+		bool ValidateCachedBlock(CachedBlock& block);
+		void ValidateCachedBlocks();
 		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block);
+		CachedBlock* FindCachedBlockByStartPc(u32 start_pc);
 		CachedBlock* AllocateCacheEntry();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles);
 		bool RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result);
+		bool PatchDirectLink(CachedBlock& block, const void* target);
+		void PatchIncomingLinks(u32 target_pc, const void* target);
+		void UnlinkIncomingLinks(u32 target_pc);
+		void RelinkDirectLinks();
 
 		std::array<CachedBlock, CACHE_CAPACITY> m_cache{};
 		size_t m_next_victim = 0;
+		bool m_direct_linking_enabled = true;
 	};
 } // namespace VitaEE

@@ -110,6 +110,7 @@ static void recStep()
 static void recExecute()
 {
 	s_ee_a32_exit_execution = false;
+	s_ee_a32_executor.SetDirectLinkingEnabled(s_ee_pre_instruction_trace_callback == nullptr);
 
 	while (!s_ee_a32_exit_execution)
 	{

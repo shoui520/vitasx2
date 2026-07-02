@@ -90,6 +90,7 @@ namespace VitaA32
 		bool EmitBx(unsigned rm);
 		bool EmitBlx(unsigned rm);
 		bool EmitCallAbsolute(const void* function, unsigned scratch_reg = 12);
+		bool PatchMovImm32(size_t instruction_offset, unsigned rd, u32 value);
 		bool Flush();
 
 	private:
