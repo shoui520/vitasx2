@@ -6,6 +6,7 @@
 #include "common/Pcsx2Defs.h"
 #include "pcsx2/vita/A32Emitter.h"
 
+#include <array>
 #include <cstddef>
 
 namespace VitaEE
@@ -48,12 +49,16 @@ namespace VitaEE
 		u32 instruction_count = 0;
 		u32 scaled_cycles = 0;
 		size_t code_size = 0;
+		bool cache_hit = false;
 	};
 
 	class BlockExecutor
 	{
 	public:
+		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 64;
+
 		void Reset();
+		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
@@ -61,6 +66,26 @@ namespace VitaEE
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
 
 	private:
-		VitaA32::CodeBuffer m_code;
+		static constexpr size_t CACHE_CAPACITY = 32;
+
+		struct CachedBlock
+		{
+			VitaA32::CodeBuffer code;
+			std::array<u32, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS> opcodes{};
+			u32 start_pc = 0;
+			u32 instruction_count = 0;
+			u32 scaled_cycles = 0;
+			s8 ee_cycle_rate = 0;
+			u8 cp0_config_cycle_shift = 0;
+			bool valid = false;
+		};
+
+		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block);
+		CachedBlock* AllocateCacheEntry();
+		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles);
+		bool RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result);
+
+		std::array<CachedBlock, CACHE_CAPACITY> m_cache{};
+		size_t m_next_victim = 0;
 	};
 } // namespace VitaEE

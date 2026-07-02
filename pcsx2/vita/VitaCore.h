@@ -18,6 +18,9 @@ struct VitaA32EeProviderStats
 	u32 direct_exits = 0;
 	u32 event_exits = 0;
 	u32 failed_blocks = 0;
+	u32 cache_hits = 0;
+	u32 cache_misses = 0;
+	u32 invalidated_blocks = 0;
 };
 
 void VitaResetA32EeProviderStats();

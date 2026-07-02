@@ -20,11 +20,6 @@ static VitaEE::BlockExecutor s_ee_a32_executor;
 static VitaA32EeProviderStats s_ee_a32_stats;
 static bool s_ee_a32_exit_execution = false;
 
-namespace
-{
-	constexpr u32 EE_A32_MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 64;
-}
-
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback)
 {
 	s_ee_pre_instruction_trace_callback = callback;
@@ -113,7 +108,8 @@ static void recExecute()
 		const u32 pc = cpuRegs.pc;
 
 		VitaEE::BlockScanResult scan;
-		if (!VitaEE::BlockExecutor::ScanStraightLineBlock(pc, EE_A32_MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
+		if (!VitaEE::BlockExecutor::ScanStraightLineBlock(pc,
+				VitaEE::BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
 			scan.instruction_count == 0)
 		{
 			const u32 op = memRead32(pc);
@@ -157,6 +153,11 @@ static void recExecute()
 		else if (result.exit == VitaEE::BlockExitKind::Event)
 			s_ee_a32_stats.event_exits++;
 
+		if (result.cache_hit)
+			s_ee_a32_stats.cache_hits++;
+		else
+			s_ee_a32_stats.cache_misses++;
+
 		if (!full_window_recorded)
 			break;
 	}
@@ -174,7 +175,9 @@ static void recCancelInstruction()
 
 static void recClear(u32 addr, u32 size)
 {
-	s_ee_a32_executor.Reset();
+	// PCSX2 owner: x86/ix86-32/iR5900.cpp::recClear(addr, size), where size is
+	// measured in 32-bit guest words.
+	s_ee_a32_stats.invalidated_blocks += s_ee_a32_executor.InvalidateRange(addr, size);
 }
 
 R5900cpu recCpu = {
