@@ -71,6 +71,11 @@ namespace VitaEE
 			switch (op & 0x3f)
 			{
 				case 0x00: // SLL, owned by R5900OpcodeImpl.cpp::SLL().
+				case 0x02: // SRL, owned by R5900OpcodeImpl.cpp::SRL().
+				case 0x03: // SRA, owned by R5900OpcodeImpl.cpp::SRA().
+				case 0x04: // SLLV, owned by R5900OpcodeImpl.cpp::SLLV().
+				case 0x06: // SRLV, owned by R5900OpcodeImpl.cpp::SRLV().
+				case 0x07: // SRAV, owned by R5900OpcodeImpl.cpp::SRAV().
 				case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
 				case 0x23: // SUBU, owned by R5900OpcodeImpl.cpp::SUBU().
 				case 0x24: // AND, owned by R5900OpcodeImpl.cpp::AND().
@@ -278,6 +283,16 @@ namespace VitaEE
 		{
 			case 0x00: // SLL, owned by R5900OpcodeImpl.cpp::SLL().
 				return EmitSLL(op);
+			case 0x02: // SRL, owned by R5900OpcodeImpl.cpp::SRL().
+				return EmitSRL(op);
+			case 0x03: // SRA, owned by R5900OpcodeImpl.cpp::SRA().
+				return EmitSRA(op);
+			case 0x04: // SLLV, owned by R5900OpcodeImpl.cpp::SLLV().
+				return EmitSLLV(op);
+			case 0x06: // SRLV, owned by R5900OpcodeImpl.cpp::SRLV().
+				return EmitSRLV(op);
+			case 0x07: // SRAV, owned by R5900OpcodeImpl.cpp::SRAV().
+				return EmitSRAV(op);
 			case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
 				return EmitADDU(op);
 			case 0x23: // SUBU, owned by R5900OpcodeImpl.cpp::SUBU().
@@ -485,17 +500,32 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitSLL(u32 op)
 	{
-		const unsigned rt = RT(op);
-		const unsigned rd = RD(op);
-		const unsigned sa = SA(op);
+		return EmitShift32Immediate(op, VitaA32::ShiftType::LSL);
+	}
 
-		if (rd == 0)
-			return true;
+	bool BlockCompiler::EmitSRL(u32 op)
+	{
+		return EmitShift32Immediate(op, VitaA32::ShiftType::LSR);
+	}
 
-		return EmitLoadGprLow(rt, HOST_TMP0) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, static_cast<u8>(sa)) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	bool BlockCompiler::EmitSRA(u32 op)
+	{
+		return EmitShift32Immediate(op, VitaA32::ShiftType::ASR);
+	}
+
+	bool BlockCompiler::EmitSLLV(u32 op)
+	{
+		return EmitShift32Variable(op, VitaA32::ShiftType::LSL);
+	}
+
+	bool BlockCompiler::EmitSRLV(u32 op)
+	{
+		return EmitShift32Variable(op, VitaA32::ShiftType::LSR);
+	}
+
+	bool BlockCompiler::EmitSRAV(u32 op)
+	{
+		return EmitShift32Variable(op, VitaA32::ShiftType::ASR);
 	}
 
 	bool BlockCompiler::EmitADDU(u32 op)
@@ -636,6 +666,51 @@ namespace VitaEE
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
 			   EmitSetLessThan64(rd, false);
+	}
+
+	bool BlockCompiler::EmitShift32Immediate(u32 op, VitaA32::ShiftType shift)
+	{
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+		const unsigned sa = SA(op);
+
+		if (rd == 0)
+			return true;
+
+		if (!EmitLoadGprLow(rt, HOST_TMP0))
+			return false;
+
+		// ARM immediate LSR/ASR with amount 0 encodes a shift of 32, while
+		// R5900 SRL/SRA with sa=0 is a no-op on the low word.
+		if (sa == 0)
+		{
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 0))
+				return false;
+		}
+		else if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, shift, static_cast<u8>(sa)))
+		{
+			return false;
+		}
+
+		return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitShift32Variable(u32 op, VitaA32::ShiftType shift)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		return EmitLoadGprLow(rt, HOST_TMP0) &&
+			   EmitLoadGprLow(rs, HOST_TMP2) &&
+			   m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x1f) &&
+			   m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP0, shift, HOST_TMP2) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitSetLessThan64(unsigned guest_reg, bool signed_compare)

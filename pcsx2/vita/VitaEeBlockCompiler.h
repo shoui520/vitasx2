@@ -8,6 +8,7 @@
 namespace VitaA32
 {
 	class CodeBuffer;
+	enum class ShiftType : u8;
 }
 
 namespace VitaEE
@@ -37,6 +38,11 @@ namespace VitaEE
 		bool EmitXORI(u32 op);
 		bool EmitLUI(u32 op);
 		bool EmitSLL(u32 op);
+		bool EmitSRL(u32 op);
+		bool EmitSRA(u32 op);
+		bool EmitSLLV(u32 op);
+		bool EmitSRLV(u32 op);
+		bool EmitSRAV(u32 op);
 		bool EmitADDU(u32 op);
 		bool EmitSUBU(u32 op);
 		bool EmitDADDU(u32 op);
@@ -46,6 +52,8 @@ namespace VitaEE
 		bool EmitXOR(u32 op);
 		bool EmitSLT(u32 op);
 		bool EmitSLTU(u32 op);
+		bool EmitShift32Immediate(u32 op, VitaA32::ShiftType shift);
+		bool EmitShift32Variable(u32 op, VitaA32::ShiftType shift);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
