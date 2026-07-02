@@ -152,7 +152,7 @@ namespace VitaEE
 		void ReleaseCodeCache();
 		u8* AllocateCodeSlice(size_t capacity, size_t* slice_offset);
 		void RewindCodeCache(size_t slice_offset);
-		u32 ResetForCodeCacheFull();
+		u32 ResetForCachePressure();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles);
 		bool RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result);
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
@@ -168,7 +168,6 @@ namespace VitaEE
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
-		size_t m_next_victim = 0;
 		bool m_direct_linking_enabled = true;
 	};
 } // namespace VitaEE

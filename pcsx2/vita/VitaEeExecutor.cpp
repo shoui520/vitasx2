@@ -304,7 +304,6 @@ namespace VitaEE
 		ClearBlockRecords();
 		ClearIncomingLinks();
 		ReleaseLookupPages();
-		m_next_victim = 0;
 		m_code_cache_resets = 0;
 		ReleaseCodeCache();
 		return invalidated;
@@ -548,10 +547,17 @@ namespace VitaEE
 			return block;
 		}
 
-		CachedBlock& victim = *m_cache[m_next_victim];
-		m_next_victim = (m_next_victim + 1) % m_cache.size();
-		InvalidateCachedBlock(victim);
-		return &victim;
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile() requests
+		// recResetRaw() when recPtr reaches recPtrEnd; keep the same whole-cache
+		// pressure behavior instead of replacing one arbitrary translated block.
+		ResetForCachePressure();
+		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
+		{
+			if (!entry->valid)
+				return entry.get();
+		}
+
+		return nullptr;
 	}
 
 	bool BlockExecutor::EnsureCodeCache()
@@ -602,7 +608,7 @@ namespace VitaEE
 			m_code_cache_used = slice_offset;
 	}
 
-	u32 BlockExecutor::ResetForCodeCacheFull()
+	u32 BlockExecutor::ResetForCachePressure()
 	{
 		const u32 previous_resets = m_code_cache_resets;
 		const u32 invalidated = Reset();
@@ -625,7 +631,7 @@ namespace VitaEE
 		u8* code_slice = AllocateCodeSlice(STRAIGHT_LINE_BLOCK_CODE_CAPACITY, &code_slice_offset);
 		if (!code_slice)
 		{
-			ResetForCodeCacheFull();
+			ResetForCachePressure();
 			code_slice = AllocateCodeSlice(STRAIGHT_LINE_BLOCK_CODE_CAPACITY, &code_slice_offset);
 			if (!code_slice)
 				return false;
