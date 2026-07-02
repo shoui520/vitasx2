@@ -35,6 +35,7 @@ namespace VitaEE
 	class BlockExecutor
 	{
 	public:
+		void Reset();
 		bool ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
 

@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "MTVU.h"
+#include "Memory.h"
 #include "R3000A.h"
 #include "R5900.h"
 #include "SaveState.h"
 #include "VUmicro.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaEeBlockCompiler.h"
+#include "vita/VitaEeExecutor.h"
 #include "vtlb.h"
 
 #include "common/Assertions.h"
@@ -14,6 +17,9 @@
 
 static VitaEePreInstructionTraceCallback s_ee_pre_instruction_trace_callback = nullptr;
 static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback = nullptr;
+static VitaEE::BlockExecutor s_ee_a32_executor;
+static VitaA32EeProviderStats s_ee_a32_stats;
+static bool s_ee_a32_exit_execution = false;
 
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback)
 {
@@ -37,17 +43,29 @@ bool VitaRecordIopPreInstruction(u32 pc, u32 opcode)
 	return callback ? callback(pc, opcode) : false;
 }
 
+static void recInterpreterStepWithoutProviderTrace()
+{
+	const VitaEePreInstructionTraceCallback callback = s_ee_pre_instruction_trace_callback;
+	s_ee_pre_instruction_trace_callback = nullptr;
+	intCpu.Step();
+	s_ee_pre_instruction_trace_callback = callback;
+}
+
 static void recReserve()
 {
 }
 
 static void recShutdown()
 {
+	s_ee_a32_executor.Reset();
 }
 
 static void recReset()
 {
 	intCpu.Reset();
+	s_ee_a32_executor.Reset();
+	VitaResetA32EeProviderStats();
+	s_ee_a32_exit_execution = false;
 }
 
 static void recStep()
@@ -57,21 +75,56 @@ static void recStep()
 
 static void recExecute()
 {
-	intCpu.Execute();
+	s_ee_a32_exit_execution = false;
+
+	while (!s_ee_a32_exit_execution)
+	{
+		const u32 pc = cpuRegs.pc;
+		const u32 op = memRead32(pc);
+		if (VitaRecordEePreInstruction(pc, op))
+			break;
+
+		if (!VitaEE::BlockCompiler::CanCompileOpcode(op))
+		{
+			recInterpreterStepWithoutProviderTrace();
+			s_ee_a32_stats.interpreter_steps++;
+			continue;
+		}
+
+		VitaEE::BlockExecutionResult result;
+		if (!s_ee_a32_executor.ExecuteStraightLineBlockOrInterpreterStep(pc, 1, true, &result))
+		{
+			s_ee_a32_stats.failed_blocks++;
+			recInterpreterStepWithoutProviderTrace();
+			s_ee_a32_stats.interpreter_steps++;
+			continue;
+		}
+
+		if (result.path == VitaEE::BlockExecutionPath::Compiled)
+			s_ee_a32_stats.compiled_blocks++;
+		else
+			s_ee_a32_stats.interpreter_steps++;
+
+		if (result.exit == VitaEE::BlockExitKind::Direct)
+			s_ee_a32_stats.direct_exits++;
+		else if (result.exit == VitaEE::BlockExitKind::Event)
+			s_ee_a32_stats.event_exits++;
+	}
 }
 
 static void recExitExecution()
 {
-	intCpu.ExitExecution();
+	s_ee_a32_exit_execution = true;
 }
 
 static void recCancelInstruction()
 {
-	intCpu.CancelInstruction();
+	s_ee_a32_exit_execution = true;
 }
 
 static void recClear(u32 addr, u32 size)
 {
+	s_ee_a32_executor.Reset();
 }
 
 R5900cpu recCpu = {
@@ -225,4 +278,22 @@ void VitaSelectInterpreterCpuProviders()
 	psxCpu = &psxInt;
 	CpuVU0 = &CpuIntVU0;
 	CpuVU1 = &CpuIntVU1;
+}
+
+void VitaSelectA32EeCpuProviders()
+{
+	Cpu = &recCpu;
+	psxCpu = &psxInt;
+	CpuVU0 = &CpuIntVU0;
+	CpuVU1 = &CpuIntVU1;
+}
+
+void VitaResetA32EeProviderStats()
+{
+	s_ee_a32_stats = {};
+}
+
+VitaA32EeProviderStats VitaGetA32EeProviderStats()
+{
+	return s_ee_a32_stats;
 }

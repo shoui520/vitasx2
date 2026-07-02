@@ -8,6 +8,19 @@
 // Mirrors VMManager.cpp::UpdateCPUImplementations() for the Vita bring-up
 // executables before the full Vita VM lifecycle exists.
 void VitaSelectInterpreterCpuProviders();
+void VitaSelectA32EeCpuProviders();
+
+struct VitaA32EeProviderStats
+{
+	u32 compiled_blocks = 0;
+	u32 interpreter_steps = 0;
+	u32 direct_exits = 0;
+	u32 event_exits = 0;
+	u32 failed_blocks = 0;
+};
+
+void VitaResetA32EeProviderStats();
+VitaA32EeProviderStats VitaGetA32EeProviderStats();
 
 // Mirrors the fast-boot ELF state that VMManager.cpp::Initialize() seeds for
 // R5900.cpp::eeloadHook() in Vita bring-up executables.

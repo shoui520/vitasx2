@@ -43,6 +43,11 @@ namespace
 
 namespace VitaEE
 {
+	void BlockExecutor::Reset()
+	{
+		m_code.Release();
+	}
+
 	bool BlockExecutor::ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
 		bool run_event_test_on_event_exit, BlockExecutionResult* result)
 	{
