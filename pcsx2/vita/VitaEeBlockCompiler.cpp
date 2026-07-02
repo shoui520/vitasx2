@@ -65,6 +65,18 @@ namespace VitaEE
 			return GPR_OFFSET + sizeof(GPR_reg) * guest_reg;
 		}
 
+		bool CanCompileSPECIAL(u32 op)
+		{
+			switch (op & 0x3f)
+			{
+				case 0x00: // SLL, owned by R5900OpcodeImpl.cpp::SLL().
+				case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
+					return true;
+				default:
+					return false;
+			}
+		}
+
 		u32 ScaleBlockCycles(u32 raw_cycles)
 		{
 			// Ported from PCSX2 x86/ix86-32/iR5900.cpp::scaleblockcycles_calculation()
@@ -98,6 +110,21 @@ namespace VitaEE
 	{
 	}
 
+	bool BlockCompiler::CanCompileOpcode(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x00:
+				return CanCompileSPECIAL(op);
+			case 0x09: // ADDIU, owned by R5900OpcodeImpl.cpp::ADDIU().
+			case 0x0d: // ORI, owned by R5900OpcodeImpl.cpp::ORI().
+			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	bool BlockCompiler::BeginBlock()
 	{
 		return m_code.EmitPush(REG_R4 | REG_LR) &&
@@ -118,6 +145,8 @@ namespace VitaEE
 		{
 			const u32 pc = start_pc + i * 4;
 			const u32 op = memRead32(pc);
+			if (!CanCompileOpcode(op))
+				return false;
 
 			// PCSX2's x86 recRecompile() gives NOP a fixed 9-cycle raw cost before
 			// scaling; all other op costs come from the R5900 opcode table.

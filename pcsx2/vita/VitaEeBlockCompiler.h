@@ -17,6 +17,8 @@ namespace VitaEE
 	public:
 		explicit BlockCompiler(VitaA32::CodeBuffer& code);
 
+		static bool CanCompileOpcode(u32 op);
+
 		bool BeginBlock();
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr);
