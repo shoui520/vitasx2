@@ -81,6 +81,7 @@ namespace VitaEE
 				case 0x24: // AND, owned by R5900OpcodeImpl.cpp::AND().
 				case 0x25: // OR, owned by R5900OpcodeImpl.cpp::OR().
 				case 0x26: // XOR, owned by R5900OpcodeImpl.cpp::XOR().
+				case 0x27: // NOR, owned by R5900OpcodeImpl.cpp::NOR().
 				case 0x2a: // SLT, owned by R5900OpcodeImpl.cpp::SLT().
 				case 0x2b: // SLTU, owned by R5900OpcodeImpl.cpp::SLTU().
 				case 0x2d: // DADDU, owned by R5900OpcodeImpl.cpp::DADDU().
@@ -309,6 +310,8 @@ namespace VitaEE
 				return EmitOR(op);
 			case 0x26: // XOR, owned by R5900OpcodeImpl.cpp::XOR().
 				return EmitXOR(op);
+			case 0x27: // NOR, owned by R5900OpcodeImpl.cpp::NOR().
+				return EmitNOR(op);
 			case 0x2a: // SLT, owned by R5900OpcodeImpl.cpp::SLT().
 				return EmitSLT(op);
 			case 0x2b: // SLTU, owned by R5900OpcodeImpl.cpp::SLTU().
@@ -685,6 +688,24 @@ namespace VitaEE
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
 			   m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
 			   m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitNOR(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
+			   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
+			   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   m_code.EmitMvnReg(HOST_TMP0, HOST_TMP0) &&
+			   m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 

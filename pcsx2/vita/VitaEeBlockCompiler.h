@@ -56,6 +56,7 @@ namespace VitaEE
 		bool EmitAND(u32 op);
 		bool EmitOR(u32 op);
 		bool EmitXOR(u32 op);
+		bool EmitNOR(u32 op);
 		bool EmitSLT(u32 op);
 		bool EmitSLTU(u32 op);
 		bool EmitShift32Immediate(u32 op, VitaA32::ShiftType shift);

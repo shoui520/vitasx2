@@ -21,6 +21,7 @@ namespace VitaA32
 		constexpr u32 OPCODE_ADC = 0x00a00000u;
 		constexpr u32 OPCODE_CMP = 0x01400000u;
 		constexpr u32 OPCODE_MOV = 0x01a00000u;
+		constexpr u32 OPCODE_MVN = 0x01e00000u;
 		constexpr u32 OPCODE_ORR = 0x01800000u;
 		constexpr u32 OPCODE_SUB = 0x00400000u;
 		constexpr u32 OPCODE_SBC = 0x00c00000u;
@@ -221,6 +222,13 @@ namespace VitaA32
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
 			return false;
 		return EmitU32(EncodeOrrReg(rd, rn, rm, set_flags));
+	}
+
+	bool CodeBuffer::EmitMvnReg(unsigned rd, unsigned rm, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rm))
+			return false;
+		return EmitU32(EncodeMvnReg(rd, rm, set_flags));
 	}
 
 	bool CodeBuffer::EmitSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
@@ -462,6 +470,14 @@ namespace VitaA32
 		pxAssert(IsRegister(rm));
 		return CondBits(Condition::AL) | OPCODE_ORR | (set_flags ? SET_FLAGS : 0) |
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
+	u32 EncodeMvnReg(unsigned rd, unsigned rm, bool set_flags)
+	{
+		pxAssert(IsRegister(rd));
+		pxAssert(IsRegister(rm));
+		return CondBits(Condition::AL) | OPCODE_MVN | (set_flags ? SET_FLAGS : 0) |
+			   ((rd & 0xfu) << 12) | (rm & 0xfu);
 	}
 
 	u32 EncodeSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)

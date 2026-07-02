@@ -77,6 +77,7 @@ namespace VitaA32
 		bool EmitAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitEorReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitOrrReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+		bool EmitMvnReg(unsigned rd, unsigned rm, bool set_flags = false);
 		bool EmitSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitCmpReg(unsigned rn, unsigned rm, Condition condition = Condition::AL);
@@ -115,6 +116,7 @@ namespace VitaA32
 	u32 EncodeAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeEorReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeOrrReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+	u32 EncodeMvnReg(unsigned rd, unsigned rm, bool set_flags = false);
 	u32 EncodeSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeCmpReg(unsigned rn, unsigned rm, Condition condition = Condition::AL);
