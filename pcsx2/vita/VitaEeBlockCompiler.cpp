@@ -76,6 +76,9 @@ namespace VitaEE
 				case 0x04: // SLLV, owned by R5900OpcodeImpl.cpp::SLLV().
 				case 0x06: // SRLV, owned by R5900OpcodeImpl.cpp::SRLV().
 				case 0x07: // SRAV, owned by R5900OpcodeImpl.cpp::SRAV().
+				case 0x14: // DSLLV, owned by R5900OpcodeImpl.cpp::DSLLV().
+				case 0x16: // DSRLV, owned by R5900OpcodeImpl.cpp::DSRLV().
+				case 0x17: // DSRAV, owned by R5900OpcodeImpl.cpp::DSRAV().
 				case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
 				case 0x23: // SUBU, owned by R5900OpcodeImpl.cpp::SUBU().
 				case 0x24: // AND, owned by R5900OpcodeImpl.cpp::AND().
@@ -300,6 +303,12 @@ namespace VitaEE
 				return EmitSRLV(op);
 			case 0x07: // SRAV, owned by R5900OpcodeImpl.cpp::SRAV().
 				return EmitSRAV(op);
+			case 0x14: // DSLLV, owned by R5900OpcodeImpl.cpp::DSLLV().
+				return EmitDSLLV(op);
+			case 0x16: // DSRLV, owned by R5900OpcodeImpl.cpp::DSRLV().
+				return EmitDSRLV(op);
+			case 0x17: // DSRAV, owned by R5900OpcodeImpl.cpp::DSRAV().
+				return EmitDSRAV(op);
 			case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
 				return EmitADDU(op);
 			case 0x23: // SUBU, owned by R5900OpcodeImpl.cpp::SUBU().
@@ -547,6 +556,21 @@ namespace VitaEE
 	bool BlockCompiler::EmitSRAV(u32 op)
 	{
 		return EmitShift32Variable(op, VitaA32::ShiftType::ASR);
+	}
+
+	bool BlockCompiler::EmitDSLLV(u32 op)
+	{
+		return EmitShift64LeftVariable(op);
+	}
+
+	bool BlockCompiler::EmitDSRLV(u32 op)
+	{
+		return EmitShift64RightVariable(op, false);
+	}
+
+	bool BlockCompiler::EmitDSRAV(u32 op)
+	{
+		return EmitShift64RightVariable(op, true);
 	}
 
 	bool BlockCompiler::EmitDSLL(u32 op)
@@ -854,6 +878,131 @@ namespace VitaEE
 			   (arithmetic ?
 				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::ASR, 31) :
 				   m_code.EmitMovImm8(HOST_TMP1, 0)) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitShift64LeftVariable(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1) ||
+			!EmitLoadGprLow(rs, HOST_TMP2) ||
+			!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x3f) ||
+			!m_code.EmitMovImm8(HOST_TMP3, 32) ||
+			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+		{
+			return false;
+		}
+
+		const size_t ge32_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+		if (ge32_branch == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+		{
+			return false;
+		}
+
+		const size_t zero_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (zero_branch == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovImm8(HOST_TMP3, 32) ||
+			!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_TMP2) ||
+			!m_code.EmitMovRegShiftReg(HOST_TMP4, HOST_TMP0, VitaA32::ShiftType::LSR, HOST_TMP3) ||
+			!m_code.EmitMovRegShiftReg(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, HOST_TMP2) ||
+			!m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+			!m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, HOST_TMP2))
+		{
+			return false;
+		}
+
+		const size_t done_branch = m_code.EmitBranchPlaceholder();
+		if (done_branch == static_cast<size_t>(-1))
+			return false;
+
+		const size_t ge32_target = m_code.Size();
+		if (!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x1f) ||
+			!m_code.EmitMovRegShiftReg(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::LSL, HOST_TMP2) ||
+			!m_code.EmitMovImm8(HOST_TMP0, 0))
+		{
+			return false;
+		}
+
+		const size_t store_target = m_code.Size();
+		return m_code.PatchBranch(ge32_branch, ge32_target, VitaA32::Condition::CS) &&
+			   m_code.PatchBranch(zero_branch, store_target, VitaA32::Condition::EQ) &&
+			   m_code.PatchBranch(done_branch, store_target) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitShift64RightVariable(u32 op, bool arithmetic)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (rd == 0)
+			return true;
+
+		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1) ||
+			!EmitLoadGprLow(rs, HOST_TMP2) ||
+			!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x3f) ||
+			!m_code.EmitMovImm8(HOST_TMP3, 32) ||
+			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+		{
+			return false;
+		}
+
+		const size_t ge32_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+		if (ge32_branch == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+		{
+			return false;
+		}
+
+		const size_t zero_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (zero_branch == static_cast<size_t>(-1))
+			return false;
+
+		const VitaA32::ShiftType high_shift = arithmetic ? VitaA32::ShiftType::ASR : VitaA32::ShiftType::LSR;
+		if (!m_code.EmitMovImm8(HOST_TMP3, 32) ||
+			!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_TMP2) ||
+			!m_code.EmitMovRegShiftReg(HOST_TMP4, HOST_TMP1, VitaA32::ShiftType::LSL, HOST_TMP3) ||
+			!m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, HOST_TMP2) ||
+			!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP4) ||
+			!m_code.EmitMovRegShiftReg(HOST_TMP1, HOST_TMP1, high_shift, HOST_TMP2))
+		{
+			return false;
+		}
+
+		const size_t done_branch = m_code.EmitBranchPlaceholder();
+		if (done_branch == static_cast<size_t>(-1))
+			return false;
+
+		const size_t ge32_target = m_code.Size();
+		if (!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x1f) ||
+			!m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP1, high_shift, HOST_TMP2) ||
+			!(arithmetic ?
+				 m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::ASR, 31) :
+				 m_code.EmitMovImm8(HOST_TMP1, 0)))
+		{
+			return false;
+		}
+
+		const size_t store_target = m_code.Size();
+		return m_code.PatchBranch(ge32_branch, ge32_target, VitaA32::Condition::CS) &&
+			   m_code.PatchBranch(zero_branch, store_target, VitaA32::Condition::EQ) &&
+			   m_code.PatchBranch(done_branch, store_target) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
