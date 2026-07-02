@@ -92,10 +92,12 @@ namespace VitaEE
 		bool EmitLHU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitLWU(u32 op);
 		bool EmitLD(u32 op);
+		bool EmitLQ(u32 op);
 		bool EmitSB(u32 op);
 		bool EmitSH(u32 op);
 		bool EmitSW(u32 op);
 		bool EmitSD(u32 op);
+		bool EmitSQ(u32 op);
 		bool EmitDSLLV(u32 op);
 		bool EmitDSRLV(u32 op);
 		bool EmitDSRAV(u32 op);
