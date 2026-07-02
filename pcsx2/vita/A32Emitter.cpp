@@ -18,8 +18,13 @@ namespace VitaA32
 		constexpr u32 DATA_PROCESSING_IMM = 0x02000000u;
 		constexpr u32 OPCODE_ADD = 0x00800000u;
 		constexpr u32 OPCODE_MOV = 0x01a00000u;
+		constexpr u32 MOVW = 0x03000000u;
+		constexpr u32 MOVT = 0x03400000u;
 		constexpr u32 BRANCH = 0x0a000000u;
+		constexpr u32 PUSH = 0x092d0000u;
+		constexpr u32 POP = 0x08bd0000u;
 		constexpr u32 BX = 0x012fff10u;
+		constexpr u32 BLX = 0x012fff30u;
 
 		bool IsRegister(unsigned reg)
 		{
@@ -100,6 +105,14 @@ namespace VitaA32
 		return EmitU32(EncodeMovImm8(rd, value));
 	}
 
+	bool CodeBuffer::EmitMovImm32(unsigned rd, u32 value)
+	{
+		if (!IsRegister(rd))
+			return false;
+		return EmitU32(EncodeMovw(rd, static_cast<u16>(value))) &&
+			   EmitU32(EncodeMovt(rd, static_cast<u16>(value >> 16)));
+	}
+
 	bool CodeBuffer::EmitAddImm8(unsigned rd, unsigned rn, u8 value)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
@@ -129,11 +142,41 @@ namespace VitaA32
 		return true;
 	}
 
+	bool CodeBuffer::EmitPush(u16 register_list)
+	{
+		if (register_list == 0)
+			return false;
+		return EmitU32(EncodePush(register_list));
+	}
+
+	bool CodeBuffer::EmitPop(u16 register_list)
+	{
+		if (register_list == 0)
+			return false;
+		return EmitU32(EncodePop(register_list));
+	}
+
 	bool CodeBuffer::EmitBx(unsigned rm)
 	{
 		if (!IsRegister(rm))
 			return false;
 		return EmitU32(EncodeBx(rm));
+	}
+
+	bool CodeBuffer::EmitBlx(unsigned rm)
+	{
+		if (!IsRegister(rm))
+			return false;
+		return EmitU32(EncodeBlx(rm));
+	}
+
+	bool CodeBuffer::EmitCallAbsolute(const void* function, unsigned scratch_reg)
+	{
+		if (!function || !IsRegister(scratch_reg) || scratch_reg == 13 || scratch_reg == 14 || scratch_reg == 15)
+			return false;
+
+		return EmitMovImm32(scratch_reg, static_cast<u32>(reinterpret_cast<uptr>(function))) &&
+			   EmitBlx(scratch_reg);
 	}
 
 	bool CodeBuffer::Flush()
@@ -156,6 +199,20 @@ namespace VitaA32
 		return COND_AL | DATA_PROCESSING_IMM | OPCODE_MOV | ((rd & 0xfu) << 12) | value;
 	}
 
+	u32 EncodeMovw(unsigned rd, u16 value)
+	{
+		pxAssert(IsRegister(rd));
+		return COND_AL | MOVW | ((static_cast<u32>(value) & 0xf000u) << 4) | ((rd & 0xfu) << 12) |
+			   (static_cast<u32>(value) & 0x0fffu);
+	}
+
+	u32 EncodeMovt(unsigned rd, u16 value)
+	{
+		pxAssert(IsRegister(rd));
+		return COND_AL | MOVT | ((static_cast<u32>(value) & 0xf000u) << 4) | ((rd & 0xfu) << 12) |
+			   (static_cast<u32>(value) & 0x0fffu);
+	}
+
 	u32 EncodeAddImm8(unsigned rd, unsigned rn, u8 value)
 	{
 		pxAssert(IsRegister(rd));
@@ -163,10 +220,28 @@ namespace VitaA32
 		return COND_AL | DATA_PROCESSING_IMM | OPCODE_ADD | ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | value;
 	}
 
+	u32 EncodePush(u16 register_list)
+	{
+		pxAssert(register_list != 0);
+		return COND_AL | PUSH | register_list;
+	}
+
+	u32 EncodePop(u16 register_list)
+	{
+		pxAssert(register_list != 0);
+		return COND_AL | POP | register_list;
+	}
+
 	u32 EncodeBx(unsigned rm)
 	{
 		pxAssert(IsRegister(rm));
 		return COND_AL | BX | (rm & 0xfu);
+	}
+
+	u32 EncodeBlx(unsigned rm)
+	{
+		pxAssert(IsRegister(rm));
+		return COND_AL | BLX | (rm & 0xfu);
 	}
 
 	bool EncodeBranch(u8* instruction, u8* target, u32* out_instruction)

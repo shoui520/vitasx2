@@ -36,10 +36,15 @@ namespace VitaA32
 
 		bool EmitU32(u32 instruction);
 		bool EmitMovImm8(unsigned rd, u8 value);
+		bool EmitMovImm32(unsigned rd, u32 value);
 		bool EmitAddImm8(unsigned rd, unsigned rn, u8 value);
 		size_t EmitBranchPlaceholder();
 		bool PatchBranch(size_t instruction_offset, size_t target_offset);
+		bool EmitPush(u16 register_list);
+		bool EmitPop(u16 register_list);
 		bool EmitBx(unsigned rm);
+		bool EmitBlx(unsigned rm);
+		bool EmitCallAbsolute(const void* function, unsigned scratch_reg = 12);
 		bool Flush();
 
 	private:
@@ -51,7 +56,12 @@ namespace VitaA32
 	};
 
 	u32 EncodeMovImm8(unsigned rd, u8 value);
+	u32 EncodeMovw(unsigned rd, u16 value);
+	u32 EncodeMovt(unsigned rd, u16 value);
 	u32 EncodeAddImm8(unsigned rd, unsigned rn, u8 value);
+	u32 EncodePush(u16 register_list);
+	u32 EncodePop(u16 register_list);
 	u32 EncodeBx(unsigned rm);
+	u32 EncodeBlx(unsigned rm);
 	bool EncodeBranch(u8* instruction, u8* target, u32* out_instruction);
 } // namespace VitaA32
