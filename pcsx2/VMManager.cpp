@@ -43,6 +43,10 @@
 #include "VMManager.h"
 #include "ps2/BiosTools.h"
 
+#ifdef VITASX2_VITA
+#include "vita/VitaCore.h"
+#endif
+
 #include "common/Console.h"
 #include "common/Error.h"
 #include "common/FileSystem.h"
@@ -2666,6 +2670,13 @@ void VMManager::InitializeCPUProviders()
 
 	CpuMicroVU0.Reserve();
 	CpuMicroVU1.Reserve();
+#elif defined(VITASX2_VITA)
+	// PCSX2 owner: x86/ix86-32/iR5900.cpp::recReserve() reserves the EE
+	// provider before VM execution. Vita keeps the MTVU thread alive like the
+	// upstream non-x86 path, because shared ring-buffer state can otherwise
+	// deadlock subsystems which still expect the thread to exist.
+	recCpu.Reserve();
+	vu1Thread.Open();
 #else
 	// Despite not having any VU recompilers on ARM64, therefore no MTVU,
 	// we still need the thread alive. Otherwise the read and write positions
@@ -2690,6 +2701,13 @@ void VMManager::ShutdownCPUProviders()
 
 	psxRec.Shutdown();
 	recCpu.Shutdown();
+#elif defined(VITASX2_VITA)
+	recCpu.Shutdown();
+
+	// See the comment in InitializeCPUProviders for why the MTVU thread is
+	// still managed on the Vita path.
+	if (vu1Thread.IsOpen())
+		vu1Thread.WaitVU();
 #else
 	// See the comment in the InitializeCPUProviders for an explaination why we
 	// still need to manage the MTVU thread.
@@ -2715,6 +2733,8 @@ void VMManager::UpdateCPUImplementations()
 
 	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU0) : static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
 	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
+#elif defined(VITASX2_VITA)
+	VitaSelectConfiguredCpuProviders();
 #else
 	Cpu = &intCpu;
 	psxCpu = &psxInt;

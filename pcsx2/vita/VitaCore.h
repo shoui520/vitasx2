@@ -5,10 +5,12 @@
 
 #include "common/Pcsx2Types.h"
 
-// Mirrors VMManager.cpp::UpdateCPUImplementations() for the Vita bring-up
-// executables before the full Vita VM lifecycle exists.
+// Vita CPU provider selection. Bring-up executables can force interpreter or
+// A32 EE mode directly; VMManager.cpp::UpdateCPUImplementations() uses the
+// configured selector.
 void VitaSelectInterpreterCpuProviders();
 void VitaSelectA32EeCpuProviders();
+void VitaSelectConfiguredCpuProviders();
 
 struct VitaA32EeProviderStats
 {

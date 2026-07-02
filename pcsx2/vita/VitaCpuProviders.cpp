@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "MTVU.h"
+#include "Config.h"
 #include "Memory.h"
 #include "R3000A.h"
 #include "R5900.h"
@@ -363,6 +364,17 @@ void VitaSelectA32EeCpuProviders()
 	psxCpu = &psxInt;
 	CpuVU0 = &CpuIntVU0;
 	CpuVU1 = &CpuIntVU1;
+}
+
+void VitaSelectConfiguredCpuProviders()
+{
+	// PCSX2 owner: VMManager.cpp::UpdateCPUImplementations(). The Vita fork
+	// maps the EE recompiler flag to the A32 EE provider while IOP/VU remain
+	// on their PCSX2 interpreters until their Vita providers are ported.
+	if (EmuConfig.Cpu.Recompiler.EnableEE)
+		VitaSelectA32EeCpuProviders();
+	else
+		VitaSelectInterpreterCpuProviders();
 }
 
 void VitaResetA32EeProviderStats()
