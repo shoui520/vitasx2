@@ -20,6 +20,7 @@ namespace VitaEE
 		bool BeginBlock();
 		bool EmitOpcode(u32 op);
 		bool EndBlockReturn(u8 value);
+		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit);
 
 	private:
 		bool EmitSPECIAL(u32 op);

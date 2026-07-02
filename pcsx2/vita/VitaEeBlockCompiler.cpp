@@ -20,8 +20,11 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP0 = 0;
 		constexpr unsigned HOST_TMP1 = 1;
 		constexpr unsigned HOST_TMP2 = 2;
+		constexpr unsigned HOST_TMP3 = 3;
 
 		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
+		constexpr size_t CYCLE_OFFSET = offsetof(cpuRegisters, cycle);
+		constexpr size_t NEXT_EVENT_OFFSET = offsetof(cpuRegisters, nextEventCycle);
 
 		constexpr unsigned RS(u32 op)
 		{
@@ -60,6 +63,8 @@ namespace VitaEE
 	} // namespace
 
 	static_assert(GprOffset(31) + sizeof(u64) <= 0x0fff);
+	static_assert(CYCLE_OFFSET + sizeof(u64) <= 0x0fff);
+	static_assert(NEXT_EVENT_OFFSET + sizeof(u64) <= 0x0fff);
 
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code)
 		: m_code(code)
@@ -93,6 +98,61 @@ namespace VitaEE
 	{
 		return m_code.EmitMovImm8(0, value) &&
 			   m_code.EmitPop(REG_R4 | REG_PC);
+	}
+
+	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit)
+	{
+		if (!direct_exit || !event_exit)
+			return false;
+
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))))
+		{
+			return false;
+		}
+
+		if (block_cycles <= 255)
+		{
+			if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(block_cycles), true))
+				return false;
+		}
+		else
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
+				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true))
+			{
+				return false;
+			}
+		}
+
+		// Mirrors PCSX2's normal x86/ix86-32/iR5900.cpp::iBranchTest() path.
+		// The signed-negative branch is the direct continuation/link path owned by
+		// x86/BaseblockEx.cpp::BaseBlocks::Link() once Vita block linking exists.
+		if (!m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
+			!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET + sizeof(u32))) ||
+			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true) ||
+			!m_code.EmitSbcReg(HOST_TMP3, HOST_TMP1, HOST_TMP3, true))
+		{
+			return false;
+		}
+
+		const size_t direct_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
+		if (direct_branch == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitCallAbsolute(event_exit) ||
+			!m_code.EmitPop(REG_R4 | REG_PC))
+		{
+			return false;
+		}
+
+		const size_t direct_target = m_code.Size();
+		return m_code.EmitCallAbsolute(direct_exit) &&
+			   m_code.EmitPop(REG_R4 | REG_PC) &&
+			   m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI);
 	}
 
 	bool BlockCompiler::EmitSPECIAL(u32 op)
