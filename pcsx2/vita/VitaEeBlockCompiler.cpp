@@ -232,6 +232,15 @@ namespace VitaEE
 			return memRead32(addr);
 		}
 
+		__noinline u64 VitaEeMemRead64Checked(u32 addr)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::LD().
+			if (addr & 7)
+				VitaEeRaiseAddressError(addr, false);
+
+			return memRead64(addr);
+		}
+
 		__noinline void VitaEeMemWrite8(u32 addr, u32 value)
 		{
 			// PCSX2 owner: R5900OpcodeImpl.cpp::SB().
@@ -254,6 +263,15 @@ namespace VitaEE
 				VitaEeRaiseAddressError(addr, true);
 
 			memWrite32(addr, value);
+		}
+
+		__noinline void VitaEeMemWrite64Checked(u32 addr, u32 low, u32 high)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::SD().
+			if (addr & 7)
+				VitaEeRaiseAddressError(addr, true);
+
+			memWrite64(addr, (static_cast<u64>(high) << 32) | low);
 		}
 	} // namespace
 
@@ -304,6 +322,8 @@ namespace VitaEE
 			case 0x28: // SB, owned by R5900OpcodeImpl.cpp::SB().
 			case 0x29: // SH, owned by R5900OpcodeImpl.cpp::SH().
 			case 0x2b: // SW, owned by R5900OpcodeImpl.cpp::SW().
+			case 0x37: // LD, owned by R5900OpcodeImpl.cpp::LD().
+			case 0x3f: // SD, owned by R5900OpcodeImpl.cpp::SD().
 				return true;
 			default:
 				return false;
@@ -702,6 +722,10 @@ namespace VitaEE
 				return EmitSH(op);
 			case 0x2b: // SW, owned by R5900OpcodeImpl.cpp::SW().
 				return EmitSW(op);
+			case 0x37: // LD, owned by R5900OpcodeImpl.cpp::LD().
+				return EmitLD(op);
+			case 0x3f: // SD, owned by R5900OpcodeImpl.cpp::SD().
+				return EmitSD(op);
 			default:
 				return false;
 		}
@@ -1392,6 +1416,19 @@ namespace VitaEE
 			   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 	}
 
+	bool BlockCompiler::EmitLD(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead64Checked)))
+		{
+			return false;
+		}
+
+		return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+	}
+
 	bool BlockCompiler::EmitSB(u32 op)
 	{
 		const unsigned rt = RT(op);
@@ -1417,6 +1454,15 @@ namespace VitaEE
 		return EmitEffectiveAddress(op, HOST_TMP0) &&
 			   EmitLoadGprLow(rt, HOST_TMP1) &&
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite32Checked));
+	}
+
+	bool BlockCompiler::EmitSD(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   EmitLoadGpr64(rt, HOST_TMP1, HOST_TMP2) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite64Checked));
 	}
 
 	bool BlockCompiler::EmitDSLLV(u32 op)
