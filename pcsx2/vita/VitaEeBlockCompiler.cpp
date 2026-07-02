@@ -607,6 +607,13 @@ namespace VitaEE
 		}
 	}
 
+	bool BlockCompiler::IsBranchLikely(u32 op)
+	{
+		// PCSX2 owners: Interpreter.cpp::BEQL()/BNEL()/BLEZL()/BGTZL() and the
+		// REGIMM likely forms cancel the delay slot on the not-taken path.
+		return IsBranchLikelyOpcode(op);
+	}
+
 	bool BlockCompiler::CanCompileDelaySlotOpcode(u32 op)
 	{
 		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() detects branches in

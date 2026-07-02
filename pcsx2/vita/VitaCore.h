@@ -44,6 +44,15 @@ using VitaEePreInstructionTraceCallback = bool (*)(u32 pc, u32 opcode);
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback);
 bool VitaRecordEePreInstruction(u32 pc, u32 opcode);
 
+// Exact-stream trace mode for the A32 EE provider: recorded windows must
+// match the executed instruction stream exactly, so branch-likely pairs are
+// stepped through Interpreter.cpp::execI() (which records the delay slot only
+// when it executes) instead of compiling natively. Requires initialized
+// EE hardware because interpreter branches run intEventTest(). Oracle trace
+// recorders enable this; synthetic provider validation keeps it off to prove
+// native likely-branch blocks.
+void VitaSetEeExactTraceStreams(bool enabled);
+
 // Mirrors the PCSX2 DebugTools/IopTrace.cpp::RecordIopPreInstruction hook point
 // in R3000AInterpreter.cpp::execI() for Vita bring-up trace executables.
 using VitaIopPreInstructionTraceCallback = bool (*)(u32 pc, u32 opcode);

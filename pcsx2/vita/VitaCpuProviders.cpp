@@ -9,6 +9,7 @@
 #include "SaveState.h"
 #include "VUmicro.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaEeBlockCompiler.h"
 #include "vita/VitaEeExecutor.h"
 #include "vtlb.h"
 
@@ -36,6 +37,13 @@ bool VitaRecordEePreInstruction(u32 pc, u32 opcode)
 {
 	const VitaEePreInstructionTraceCallback callback = s_ee_pre_instruction_trace_callback;
 	return callback ? callback(pc, opcode) : false;
+}
+
+static bool s_ee_exact_trace_streams = false;
+
+void VitaSetEeExactTraceStreams(bool enabled)
+{
+	s_ee_exact_trace_streams = enabled;
 }
 
 void VitaSetIopPreInstructionTraceCallback(VitaIopPreInstructionTraceCallback callback)
@@ -128,18 +136,40 @@ static void recExecute()
 				VitaEE::BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
 			scan.instruction_count == 0)
 		{
-			const u32 op = memRead32(pc);
-			if (VitaRecordEePreInstruction(pc, op))
-				break;
-
-			recInterpreterStepWithoutProviderTrace();
+			// Step through Interpreter.cpp::execI() with the pre-instruction
+			// hook active: execI records this instruction itself and, for
+			// branches, records and executes the delay slot inside
+			// intDoBranch() — the same record stream the interpreter provider
+			// produces. A stop request exits through Cpu->ExitExecution().
+			intCpu.Step();
 			s_ee_a32_stats.interpreter_steps++;
 			continue;
 		}
 
+		u32 window_instruction_count = scan.instruction_count;
+		if (s_ee_exact_trace_streams && s_ee_pre_instruction_trace_callback &&
+			scan.stop == VitaEE::BlockScanStop::Branch &&
+			window_instruction_count >= 2 &&
+			VitaEE::BlockCompiler::IsBranchLikely(memRead32(pc + (window_instruction_count - 2) * 4)))
+		{
+			// Branch-likely cancels its delay slot on the not-taken path
+			// (Interpreter.cpp::BEQL() and friends), so a pre-recorded window
+			// would log a delay slot that never executes. In trace mode, drop
+			// the branch pair from the window and let execI() step it with
+			// exact delay-slot recording; non-trace runs keep the native
+			// likely-branch blocks.
+			window_instruction_count -= 2;
+			if (window_instruction_count == 0)
+			{
+				intCpu.Step();
+				s_ee_a32_stats.interpreter_steps++;
+				continue;
+			}
+		}
+
 		u32 executable_instruction_count = 0;
 		const bool full_window_recorded =
-			recRecordEeWindow(pc, scan.instruction_count, &executable_instruction_count);
+			recRecordEeWindow(pc, window_instruction_count, &executable_instruction_count);
 		if (executable_instruction_count == 0)
 			break;
 

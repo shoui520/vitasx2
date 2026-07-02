@@ -40,6 +40,7 @@ namespace VitaEE
 
 		static bool CanCompileOpcode(u32 op);
 		static bool IsSupportedBranchOpcode(u32 op);
+		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
 
 		bool BeginBlock();

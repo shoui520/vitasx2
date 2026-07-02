@@ -9,6 +9,7 @@ set(VITASX2_CUBE_EE_TRACE_TITLEID "VSX200006")
 set(VITASX2_SIMPLE2000_EE_TRACE_TITLEID "VSX200007")
 set(VITASX2_A32_EMITTER_VALIDATION_TITLEID "VSX200008")
 set(VITASX2_A32_PROVIDER_VALIDATION_TITLEID "VSX200009")
+set(VITASX2_BIOS_EE_A32_TRACE_TITLEID "VSX200010")
 
 set(VITASX2_CUBE_EE_TRACE_RECORDS "4096" CACHE STRING "Cube EE trace records to write.")
 set(VITASX2_CUBE_EE_TRACE_SKIP_RECORDS "0" CACHE STRING "Cube EE trace records to skip before writing.")
@@ -100,6 +101,23 @@ vita_create_self(vitasx2-bios-ee-trace.self vitasx2-bios-ee-trace UNSAFE)
 vita_create_vpk(vitasx2-bios-ee-trace.vpk ${VITASX2_BIOS_EE_TRACE_TITLEID} vitasx2-bios-ee-trace.self
 	VERSION "00.01"
 	NAME "VitaSX2 BIOS EE Trace"
+)
+
+# --- BIOS EE A32-provider trace validation -----------------------------------
+add_executable(vitasx2-bios-ee-a32-trace
+	core/BiosEeTraceMain.cpp
+)
+target_compile_definitions(vitasx2-bios-ee-a32-trace PRIVATE
+	VITASX2_BIOS_EE_TRACE_A32=1
+)
+target_link_libraries(vitasx2-bios-ee-a32-trace
+	pcsx2core
+)
+
+vita_create_self(vitasx2-bios-ee-a32-trace.self vitasx2-bios-ee-a32-trace UNSAFE)
+vita_create_vpk(vitasx2-bios-ee-a32-trace.vpk ${VITASX2_BIOS_EE_A32_TRACE_TITLEID} vitasx2-bios-ee-a32-trace.self
+	VERSION "00.01"
+	NAME "VitaSX2 BIOS EE A32 Trace"
 )
 
 # --- BIOS IOP trace validation ----------------------------------------------

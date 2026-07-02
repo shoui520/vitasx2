@@ -8,3 +8,4 @@ build-*/
 *.vpk
 compile_commands.json
 .cache/
+__pycache__/
