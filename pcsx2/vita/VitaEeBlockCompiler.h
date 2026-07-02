@@ -84,6 +84,8 @@ namespace VitaEE
 		bool EmitBNEL(u32 op);
 		bool EmitBLEZL(u32 op);
 		bool EmitBGTZL(u32 op);
+		bool EmitLWU(u32 op);
+		bool EmitSW(u32 op);
 		bool EmitDSLLV(u32 op);
 		bool EmitDSRLV(u32 op);
 		bool EmitDSRAV(u32 op);
@@ -118,6 +120,7 @@ namespace VitaEE
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitBranchSigned(u32 op, SignedBranchCondition condition);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
+		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);

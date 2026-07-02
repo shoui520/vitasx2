@@ -11,7 +11,11 @@
 #include "pcsx2/vita/VitaCore.h"
 #include "pcsx2/vtlb.h"
 
+#include "common/Console.h"
+#include "fmt/format.h"
+
 #include <cstddef>
+#include <string>
 
 namespace VitaEE
 {
@@ -194,6 +198,33 @@ namespace VitaEE
 
 			return (scale_cycles < 1) ? 1 : scale_cycles;
 		}
+
+		__noinline void VitaEeRaiseAddressError(u32 addr, bool store)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::RaiseAddressError().
+			const std::string message(
+				fmt::format("Address Error, addr=0x{:x} [{}]", addr, store ? "store" : "load"));
+			Console.Error(message);
+			Cpu->CancelInstruction();
+		}
+
+		__noinline u32 VitaEeMemRead32Checked(u32 addr)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::LWU().
+			if (addr & 3)
+				VitaEeRaiseAddressError(addr, false);
+
+			return memRead32(addr);
+		}
+
+		__noinline void VitaEeMemWrite32Checked(u32 addr, u32 value)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::SW().
+			if (addr & 3)
+				VitaEeRaiseAddressError(addr, true);
+
+			memWrite32(addr, value);
+		}
 	} // namespace
 
 	static_assert(GprOffset(31) + sizeof(u64) <= 0x0fff);
@@ -234,6 +265,8 @@ namespace VitaEE
 			case 0x0e: // XORI, owned by R5900OpcodeImpl.cpp::XORI().
 			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
+			case 0x27: // LWU, owned by R5900OpcodeImpl.cpp::LWU().
+			case 0x2b: // SW, owned by R5900OpcodeImpl.cpp::SW().
 				return true;
 			default:
 				return false;
@@ -593,6 +626,10 @@ namespace VitaEE
 				return EmitLUI(op);
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
 				return EmitDADDIU(op);
+			case 0x27: // LWU, owned by R5900OpcodeImpl.cpp::LWU().
+				return EmitLWU(op);
+			case 0x2b: // SW, owned by R5900OpcodeImpl.cpp::SW().
+				return EmitSW(op);
 			default:
 				return false;
 		}
@@ -1215,6 +1252,32 @@ namespace VitaEE
 	bool BlockCompiler::EmitBGTZL(u32 op)
 	{
 		return EmitBranchSigned(op, SignedBranchCondition::GreaterThanZero);
+	}
+
+	bool BlockCompiler::EmitLWU(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead32Checked)))
+		{
+			return false;
+		}
+
+		if (rt == 0)
+			return true;
+
+		return m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitSW(u32 op)
+	{
+		const unsigned rt = RT(op);
+
+		return EmitEffectiveAddress(op, HOST_TMP0) &&
+			   EmitLoadGprLow(rt, HOST_TMP1) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite32Checked));
 	}
 
 	bool BlockCompiler::EmitDSLLV(u32 op)
@@ -1869,6 +1932,27 @@ namespace VitaEE
 			   m_code.PatchBranch(done, done_target) &&
 			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
 			   EmitStoreGpr64(guest_reg, HOST_TMP4, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitEffectiveAddress(u32 op, unsigned host_reg)
+	{
+		const unsigned rs = RS(op);
+		const s32 imm = static_cast<s32>(IMM_S(op));
+
+		if (!EmitLoadGprLow(rs, host_reg))
+			return false;
+
+		if (imm == 0)
+			return true;
+
+		if (imm > 0 && imm <= 255)
+			return m_code.EmitAddImm8(host_reg, host_reg, static_cast<u8>(imm));
+
+		if (imm < 0 && imm >= -255)
+			return m_code.EmitSubImm8(host_reg, host_reg, static_cast<u8>(-imm));
+
+		return m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
+			   m_code.EmitAddReg(host_reg, host_reg, HOST_TMP2);
 	}
 
 	bool BlockCompiler::EmitLoadGprLow(unsigned guest_reg, unsigned host_reg)
