@@ -304,9 +304,11 @@ namespace VitaEE
 		u32 raw_cycles = 0;
 		bool has_branch = false;
 		bool has_register_branch_target = false;
+		bool has_static_direct_link_target = false;
 		bool branch_is_likely = false;
 		u32 branch_instruction_index = 0;
 		u32 branch_target_pc = 0;
+		u32 static_direct_link_target_pc = 0;
 		u32 branch_likely_not_taken_raw_cycles = 0;
 		size_t branch_likely_skip_delay = static_cast<size_t>(-1);
 		const auto add_raw_cycles = [&raw_cycles](u32 op) {
@@ -385,6 +387,8 @@ namespace VitaEE
 						branch_target_pc = JumpTarget(pc, op);
 						if (EmuConfig.Gamefixes.GoemonTlbHack)
 							branch_target_pc = vtlb_V2P(branch_target_pc);
+						has_static_direct_link_target = true;
+						static_direct_link_target_pc = branch_target_pc;
 						if (!EmitJ(op, pc))
 							return false;
 						break;
@@ -392,6 +396,8 @@ namespace VitaEE
 						branch_target_pc = JumpTarget(pc, op);
 						if (EmuConfig.Gamefixes.GoemonTlbHack)
 							branch_target_pc = vtlb_V2P(branch_target_pc);
+						has_static_direct_link_target = true;
+						static_direct_link_target_pc = branch_target_pc;
 						if (!EmitJAL(op, pc))
 							return false;
 						break;
@@ -502,15 +508,16 @@ namespace VitaEE
 			return EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit);
 
 		size_t direct_link_target_offset = 0;
+		const bool can_direct_link = !has_branch || has_static_direct_link_target;
 		if (!EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
-				direct_link && !has_branch ? &direct_link_target_offset : nullptr))
+				direct_link && can_direct_link ? &direct_link_target_offset : nullptr))
 		{
 			return false;
 		}
 
-		if (direct_link && !has_branch)
+		if (direct_link && can_direct_link)
 		{
-			direct_link->target_pc = next_pc;
+			direct_link->target_pc = has_static_direct_link_target ? static_direct_link_target_pc : next_pc;
 			direct_link->target_offset = direct_link_target_offset;
 			direct_link->valid = true;
 		}
