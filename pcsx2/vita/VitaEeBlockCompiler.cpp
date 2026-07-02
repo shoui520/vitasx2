@@ -40,6 +40,8 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP4 = 12;
 
 		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
+		constexpr size_t HI_OFFSET = offsetof(cpuRegisters, HI);
+		constexpr size_t LO_OFFSET = offsetof(cpuRegisters, LO);
 		constexpr size_t PC_OFFSET = offsetof(cpuRegisters, pc);
 		constexpr size_t CYCLE_OFFSET = offsetof(cpuRegisters, cycle);
 		constexpr size_t NEXT_EVENT_OFFSET = offsetof(cpuRegisters, nextEventCycle);
@@ -139,9 +141,17 @@ namespace VitaEE
 				case 0x09: // JALR, owned by Interpreter.cpp::JALR().
 				case 0x0a: // MOVZ, owned by R5900OpcodeImpl.cpp::MOVZ().
 				case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
+				case 0x10: // MFHI, owned by R5900OpcodeImpl.cpp::MFHI().
+				case 0x11: // MTHI, owned by R5900OpcodeImpl.cpp::MTHI().
+				case 0x12: // MFLO, owned by R5900OpcodeImpl.cpp::MFLO().
+				case 0x13: // MTLO, owned by R5900OpcodeImpl.cpp::MTLO().
 				case 0x14: // DSLLV, owned by R5900OpcodeImpl.cpp::DSLLV().
 				case 0x16: // DSRLV, owned by R5900OpcodeImpl.cpp::DSRLV().
 				case 0x17: // DSRAV, owned by R5900OpcodeImpl.cpp::DSRAV().
+				case 0x18: // MULT, owned by R5900OpcodeImpl.cpp::MULT().
+				case 0x19: // MULTU, owned by R5900OpcodeImpl.cpp::MULTU().
+				case 0x1a: // DIV, owned by R5900OpcodeImpl.cpp::DIV().
+				case 0x1b: // DIVU, owned by R5900OpcodeImpl.cpp::DIVU().
 				case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
 				case 0x23: // SUBU, owned by R5900OpcodeImpl.cpp::SUBU().
 				case 0x24: // AND, owned by R5900OpcodeImpl.cpp::AND().
@@ -450,9 +460,47 @@ namespace VitaEE
 			vu0Sync();
 			memWrite128(addr, VU0.VF[guest_reg].UQ);
 		}
+
+		__noinline void VitaEeDivSigned(u32 rs, u32 rt)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::DIV(). Cortex-A9 has no integer
+			// divide instruction, so the generated code calls this helper.
+			if (rs == 0x80000000u && rt == 0xffffffffu)
+			{
+				cpuRegs.LO.SD[0] = static_cast<s32>(0x80000000);
+				cpuRegs.HI.SD[0] = 0;
+			}
+			else if (static_cast<s32>(rt) != 0)
+			{
+				cpuRegs.LO.SD[0] = static_cast<s32>(rs) / static_cast<s32>(rt);
+				cpuRegs.HI.SD[0] = static_cast<s32>(rs) % static_cast<s32>(rt);
+			}
+			else
+			{
+				cpuRegs.LO.SD[0] = (static_cast<s32>(rs) < 0) ? 1 : -1;
+				cpuRegs.HI.SD[0] = static_cast<s32>(rs);
+			}
+		}
+
+		__noinline void VitaEeDivUnsigned(u32 rs, u32 rt)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::DIVU().
+			if (rt != 0)
+			{
+				cpuRegs.LO.SD[0] = static_cast<s32>(rs / rt);
+				cpuRegs.HI.SD[0] = static_cast<s32>(rs % rt);
+			}
+			else
+			{
+				cpuRegs.LO.SD[0] = -1;
+				cpuRegs.HI.SD[0] = static_cast<s32>(rs);
+			}
+		}
 	} // namespace
 
 	static_assert(GprOffset(31) + sizeof(GPR_reg) <= 0x0fff);
+	static_assert(HI_OFFSET + sizeof(u64) <= 0x0fff);
+	static_assert(LO_OFFSET + sizeof(u64) <= 0x0fff);
 	static_assert(PC_OFFSET + sizeof(u32) <= 0x0fff);
 	static_assert(CYCLE_OFFSET + sizeof(u64) <= 0x0fff);
 	static_assert(NEXT_EVENT_OFFSET + sizeof(u64) <= 0x0fff);
@@ -1215,12 +1263,28 @@ namespace VitaEE
 				return EmitMOVZ(op);
 			case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
 				return EmitMOVN(op);
+			case 0x10: // MFHI, owned by R5900OpcodeImpl.cpp::MFHI().
+				return EmitMFHI(op);
+			case 0x11: // MTHI, owned by R5900OpcodeImpl.cpp::MTHI().
+				return EmitMTHI(op);
+			case 0x12: // MFLO, owned by R5900OpcodeImpl.cpp::MFLO().
+				return EmitMFLO(op);
+			case 0x13: // MTLO, owned by R5900OpcodeImpl.cpp::MTLO().
+				return EmitMTLO(op);
 			case 0x14: // DSLLV, owned by R5900OpcodeImpl.cpp::DSLLV().
 				return EmitDSLLV(op);
 			case 0x16: // DSRLV, owned by R5900OpcodeImpl.cpp::DSRLV().
 				return EmitDSRLV(op);
 			case 0x17: // DSRAV, owned by R5900OpcodeImpl.cpp::DSRAV().
 				return EmitDSRAV(op);
+			case 0x18: // MULT, owned by R5900OpcodeImpl.cpp::MULT().
+				return EmitMULT(op);
+			case 0x19: // MULTU, owned by R5900OpcodeImpl.cpp::MULTU().
+				return EmitMULTU(op);
+			case 0x1a: // DIV, owned by R5900OpcodeImpl.cpp::DIV().
+				return EmitDIV(op);
+			case 0x1b: // DIVU, owned by R5900OpcodeImpl.cpp::DIVU().
+				return EmitDIVU(op);
 			case 0x21: // ADDU, owned by R5900OpcodeImpl.cpp::ADDU().
 				return EmitADDU(op);
 			case 0x23: // SUBU, owned by R5900OpcodeImpl.cpp::SUBU().
@@ -1478,6 +1542,118 @@ namespace VitaEE
 	bool BlockCompiler::EmitMOVN(u32 op)
 	{
 		return EmitConditionalMove(op, false);
+	}
+
+	bool BlockCompiler::EmitMULT(u32 op)
+	{
+		return EmitMultiply(op, true);
+	}
+
+	bool BlockCompiler::EmitMULTU(u32 op)
+	{
+		return EmitMultiply(op, false);
+	}
+
+	bool BlockCompiler::EmitMultiply(u32 op, bool signed_multiply)
+	{
+		// PCSX2 owners: R5900OpcodeImpl.cpp::MULT()/MULTU() and
+		// x86/ix86-32/iR5900MultDiv.cpp::recMULT()/recMULTU(). Both forms
+		// sign-extend the 32-bit LO/HI halves into 64 bits, and the EE
+		// three-operand form writes LO into rd as well.
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+
+		if (!EmitLoadGprLow(rs, HOST_TMP0) ||
+			!EmitLoadGprLow(rt, HOST_TMP1))
+		{
+			return false;
+		}
+
+		if (signed_multiply)
+		{
+			if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+				return false;
+		}
+		else
+		{
+			if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+				return false;
+		}
+
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP2, VitaA32::ShiftType::ASR, 31) ||
+			!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(LO_OFFSET)) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(LO_OFFSET + sizeof(u32))))
+		{
+			return false;
+		}
+
+		if (rd != 0 && !EmitStoreGpr64(rd, HOST_TMP2, HOST_TMP0))
+			return false;
+
+		return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3, VitaA32::ShiftType::ASR, 31) &&
+			   m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(HI_OFFSET)) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(HI_OFFSET + sizeof(u32)));
+	}
+
+	bool BlockCompiler::EmitDIV(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::DIV(). The Cortex-A9 has no
+		// integer divide instruction, so the quotient/remainder and the
+		// divide-by-zero/overflow special cases run in the helper.
+		return EmitLoadGprLow(RS(op), HOST_TMP0) &&
+			   EmitLoadGprLow(RT(op), HOST_TMP1) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeDivSigned));
+	}
+
+	bool BlockCompiler::EmitDIVU(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::DIVU().
+		return EmitLoadGprLow(RS(op), HOST_TMP0) &&
+			   EmitLoadGprLow(RT(op), HOST_TMP1) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeDivUnsigned));
+	}
+
+	bool BlockCompiler::EmitMFHI(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::MFHI().
+		return EmitMoveFromHiLo(op, HI_OFFSET);
+	}
+
+	bool BlockCompiler::EmitMFLO(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::MFLO().
+		return EmitMoveFromHiLo(op, LO_OFFSET);
+	}
+
+	bool BlockCompiler::EmitMTHI(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::MTHI().
+		return EmitMoveToHiLo(op, HI_OFFSET);
+	}
+
+	bool BlockCompiler::EmitMTLO(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::MTLO().
+		return EmitMoveToHiLo(op, LO_OFFSET);
+	}
+
+	bool BlockCompiler::EmitMoveFromHiLo(u32 op, size_t hilo_offset)
+	{
+		const unsigned rd = RD(op);
+		if (rd == 0)
+			return true;
+
+		return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hilo_offset)) &&
+			   m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(hilo_offset + sizeof(u32))) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitMoveToHiLo(u32 op, size_t hilo_offset)
+	{
+		return EmitLoadGpr64(RS(op), HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hilo_offset)) &&
+			   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(hilo_offset + sizeof(u32)));
 	}
 
 	bool BlockCompiler::EmitREGIMM(u32 op, u32 pc)

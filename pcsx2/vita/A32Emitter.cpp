@@ -30,6 +30,8 @@ namespace VitaA32
 		constexpr u32 MOVT = 0x03400000u;
 		constexpr u32 LDR_IMM = 0x05900000u;
 		constexpr u32 STR_IMM = 0x05800000u;
+		constexpr u32 UMULL = 0x00800090u;
+		constexpr u32 SMULL = 0x00c00090u;
 		constexpr u32 BRANCH = 0x0a000000u;
 		constexpr u32 PUSH = 0x092d0000u;
 		constexpr u32 POP = 0x08bd0000u;
@@ -261,6 +263,26 @@ namespace VitaA32
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
 			return false;
 		return EmitU32(EncodeSbcReg(rd, rn, rm, set_flags));
+	}
+
+	bool CodeBuffer::EmitUmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags)
+	{
+		if (!IsLowRegister(rdlo) || !IsLowRegister(rdhi) || !IsLowRegister(rn) || !IsLowRegister(rm) ||
+			rdlo == rdhi)
+		{
+			return false;
+		}
+		return EmitU32(EncodeUmull(rdlo, rdhi, rn, rm, set_flags));
+	}
+
+	bool CodeBuffer::EmitSmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags)
+	{
+		if (!IsLowRegister(rdlo) || !IsLowRegister(rdhi) || !IsLowRegister(rn) || !IsLowRegister(rm) ||
+			rdlo == rdhi)
+		{
+			return false;
+		}
+		return EmitU32(EncodeSmull(rdlo, rdhi, rn, rm, set_flags));
 	}
 
 	bool CodeBuffer::EmitCmpReg(unsigned rn, unsigned rm, Condition condition)
@@ -529,6 +551,28 @@ namespace VitaA32
 		pxAssert(IsRegister(rm));
 		return CondBits(Condition::AL) | OPCODE_SBC | (set_flags ? SET_FLAGS : 0) |
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
+	u32 EncodeUmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags)
+	{
+		pxAssert(IsLowRegister(rdlo));
+		pxAssert(IsLowRegister(rdhi));
+		pxAssert(IsLowRegister(rn));
+		pxAssert(IsLowRegister(rm));
+		pxAssert(rdlo != rdhi);
+		return CondBits(Condition::AL) | UMULL | (set_flags ? SET_FLAGS : 0) |
+			   ((rdhi & 0xfu) << 16) | ((rdlo & 0xfu) << 12) | ((rm & 0xfu) << 8) | (rn & 0xfu);
+	}
+
+	u32 EncodeSmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags)
+	{
+		pxAssert(IsLowRegister(rdlo));
+		pxAssert(IsLowRegister(rdhi));
+		pxAssert(IsLowRegister(rn));
+		pxAssert(IsLowRegister(rm));
+		pxAssert(rdlo != rdhi);
+		return CondBits(Condition::AL) | SMULL | (set_flags ? SET_FLAGS : 0) |
+			   ((rdhi & 0xfu) << 16) | ((rdlo & 0xfu) << 12) | ((rm & 0xfu) << 8) | (rn & 0xfu);
 	}
 
 	u32 EncodeCmpReg(unsigned rn, unsigned rm, Condition condition)

@@ -81,6 +81,8 @@ namespace VitaA32
 		bool EmitMvnReg(unsigned rd, unsigned rm, bool set_flags = false);
 		bool EmitSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+		bool EmitUmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
+		bool EmitSmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitCmpReg(unsigned rn, unsigned rm, Condition condition = Condition::AL);
 		bool EmitLdrImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitStrImm12(unsigned rd, unsigned rn, u16 offset);
@@ -122,6 +124,8 @@ namespace VitaA32
 	u32 EncodeMvnReg(unsigned rd, unsigned rm, bool set_flags = false);
 	u32 EncodeSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+	u32 EncodeUmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
+	u32 EncodeSmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeCmpReg(unsigned rn, unsigned rm, Condition condition = Condition::AL);
 	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeStrImm12(unsigned rd, unsigned rn, u16 offset);
