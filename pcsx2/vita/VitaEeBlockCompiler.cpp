@@ -63,9 +63,19 @@ namespace VitaEE
 			return static_cast<s16>(op);
 		}
 
+		constexpr u32 INSTRUC_TARGET(u32 op)
+		{
+			return op & 0x03ffffffu;
+		}
+
 		constexpr u32 BranchTarget(u32 pc, u32 op)
 		{
 			return pc + 4 + static_cast<s32>(IMM_S(op)) * 4;
+		}
+
+		constexpr u32 JumpTarget(u32 pc, u32 op)
+		{
+			return (INSTRUC_TARGET(op) << 2) | ((pc + 4) & 0xf0000000u);
 		}
 
 		constexpr size_t GprOffset(unsigned guest_reg)
@@ -149,6 +159,9 @@ namespace VitaEE
 		{
 			case 0x00:
 				return CanCompileSPECIAL(op);
+			case 0x02: // J, owned by Interpreter.cpp::J().
+			case 0x03: // JAL, owned by Interpreter.cpp::JAL().
+				return !EmuConfig.Gamefixes.GoemonTlbHack;
 			case 0x04: // BEQ, owned by Interpreter.cpp::BEQ().
 			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
 				return true;
@@ -170,6 +183,9 @@ namespace VitaEE
 	{
 		switch (op >> 26)
 		{
+			case 0x02: // J, owned by Interpreter.cpp::J().
+			case 0x03: // JAL, owned by Interpreter.cpp::JAL().
+				return !EmuConfig.Gamefixes.GoemonTlbHack;
 			case 0x04: // BEQ, owned by Interpreter.cpp::BEQ().
 			case 0x05: // BNE, owned by Interpreter.cpp::BNE().
 				return true;
@@ -233,16 +249,27 @@ namespace VitaEE
 
 				add_raw_cycles(op);
 				branch_instruction_index = i;
-				branch_target_pc = BranchTarget(pc, op);
 				has_branch = true;
 
 				switch (op >> 26)
 				{
+					case 0x02:
+						branch_target_pc = JumpTarget(pc, op);
+						if (!EmitJ(op, pc))
+							return false;
+						break;
+					case 0x03:
+						branch_target_pc = JumpTarget(pc, op);
+						if (!EmitJAL(op, pc))
+							return false;
+						break;
 					case 0x04:
+						branch_target_pc = BranchTarget(pc, op);
 						if (!EmitBEQ(op))
 							return false;
 						break;
 					case 0x05:
+						branch_target_pc = BranchTarget(pc, op);
 						if (!EmitBNE(op))
 							return false;
 						break;
@@ -643,6 +670,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitMOVN(u32 op)
 	{
 		return EmitConditionalMove(op, false);
+	}
+
+	bool BlockCompiler::EmitJ(u32, u32 pc)
+	{
+		return EmitJump(pc, false);
+	}
+
+	bool BlockCompiler::EmitJAL(u32, u32 pc)
+	{
+		return EmitJump(pc, true);
 	}
 
 	bool BlockCompiler::EmitBEQ(u32 op)
@@ -1130,6 +1167,21 @@ namespace VitaEE
 		}
 
 		return m_code.PatchBranch(skip_store, m_code.Size(), skip_condition);
+	}
+
+	bool BlockCompiler::EmitJump(u32 pc, bool link)
+	{
+		if (!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1))
+			return false;
+
+		if (!link)
+			return true;
+
+		// PCSX2 owner: Interpreter.cpp::JAL() applies _SetLink(31) before
+		// doBranch() executes the delay slot, so a delay-slot write to ra wins.
+		return m_code.EmitMovImm32(HOST_TMP0, pc + 8) &&
+			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   EmitStoreGpr64(31, HOST_TMP0, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitBranchEqual(u32 op, bool branch_on_equal)

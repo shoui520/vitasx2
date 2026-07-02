@@ -47,6 +47,8 @@ namespace VitaEE
 		bool EmitSRAV(u32 op);
 		bool EmitMOVZ(u32 op);
 		bool EmitMOVN(u32 op);
+		bool EmitJ(u32 op, u32 pc);
+		bool EmitJAL(u32 op, u32 pc);
 		bool EmitBEQ(u32 op);
 		bool EmitBNE(u32 op);
 		bool EmitDSLLV(u32 op);
@@ -75,6 +77,7 @@ namespace VitaEE
 		bool EmitShift64LeftVariable(u32 op);
 		bool EmitShift64RightVariable(u32 op, bool arithmetic);
 		bool EmitConditionalMove(u32 op, bool move_on_zero);
+		bool EmitJump(u32 pc, bool link);
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
