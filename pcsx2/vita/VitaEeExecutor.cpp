@@ -120,6 +120,62 @@ namespace VitaEE
 		m_lookup_pages = nullptr;
 	}
 
+	DirectLinkSlot* BlockExecutor::GetRecordedDirectLink(IncomingLinkRecord& record)
+	{
+		if (!record.source || !record.source->valid || record.slot_index >= DIRECT_LINK_SLOT_COUNT)
+			return nullptr;
+
+		DirectLinkSlot& link = record.source->direct_links.slots[record.slot_index];
+		if (!link.valid || link.target_pc != record.target_pc)
+			return nullptr;
+
+		return &link;
+	}
+
+	void BlockExecutor::ClearIncomingLinks()
+	{
+		for (u32 i = 0; i < m_incoming_link_count; i++)
+			m_incoming_links[i] = {};
+
+		m_incoming_link_count = 0;
+	}
+
+	void BlockExecutor::RegisterIncomingLinks(CachedBlock& block)
+	{
+		UnregisterIncomingLinks(block);
+
+		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Link(). The x86
+		// provider stores target-PC -> patch-site records so New()/Remove() only
+		// touch incoming edges for the affected block.
+		for (u8 i = 0; i < DIRECT_LINK_SLOT_COUNT; i++)
+		{
+			const DirectLinkSlot& link = block.direct_links.slots[i];
+			if (!link.valid || m_incoming_link_count >= m_incoming_links.size())
+				continue;
+
+			m_incoming_links[m_incoming_link_count++] = {&block, link.target_pc, i};
+		}
+	}
+
+	void BlockExecutor::UnregisterIncomingLinks(CachedBlock& block)
+	{
+		u32 write_index = 0;
+		for (u32 read_index = 0; read_index < m_incoming_link_count; read_index++)
+		{
+			if (m_incoming_links[read_index].source == &block)
+				continue;
+
+			if (write_index != read_index)
+				m_incoming_links[write_index] = m_incoming_links[read_index];
+			write_index++;
+		}
+
+		for (u32 i = write_index; i < m_incoming_link_count; i++)
+			m_incoming_links[i] = {};
+
+		m_incoming_link_count = write_index;
+	}
+
 	u32 BlockExecutor::Reset()
 	{
 		u32 invalidated = 0;
@@ -133,6 +189,7 @@ namespace VitaEE
 			block.direct_links = {};
 		}
 
+		ClearIncomingLinks();
 		ReleaseLookupPages();
 		m_next_victim = 0;
 		return invalidated;
@@ -155,6 +212,7 @@ namespace VitaEE
 			if (block.start_pc < end_pc && start_pc < block_end)
 			{
 				UnlinkIncomingLinks(block.start_pc);
+				UnregisterIncomingLinks(block);
 				UnregisterBlockLookup(block);
 				block.valid = false;
 				block.direct_links = {};
@@ -285,6 +343,7 @@ namespace VitaEE
 		// Vita has no user-mode fault repair, so validate cached opcodes before
 		// any direct-linked dispatch can reach the block.
 		UnlinkIncomingLinks(block.start_pc);
+		UnregisterIncomingLinks(block);
 		UnregisterBlockLookup(block);
 		block.valid = false;
 		block.direct_links = {};
@@ -375,6 +434,7 @@ namespace VitaEE
 		if (victim.valid)
 		{
 			UnlinkIncomingLinks(victim.start_pc);
+			UnregisterIncomingLinks(victim);
 			UnregisterBlockLookup(victim);
 		}
 		victim.valid = false;
@@ -391,6 +451,7 @@ namespace VitaEE
 			return false;
 		}
 
+		UnregisterIncomingLinks(block);
 		block.valid = false;
 
 		for (u32 i = 0; i < instruction_count; i++)
@@ -430,6 +491,7 @@ namespace VitaEE
 		block.direct_links = direct_links;
 		block.valid = true;
 		RegisterBlockLookup(block);
+		RegisterIncomingLinks(block);
 
 		if (m_direct_linking_enabled)
 		{
@@ -465,50 +527,42 @@ namespace VitaEE
 		if (!m_direct_linking_enabled || !target)
 			return;
 
-		for (CachedBlock& block : m_cache)
+		for (u32 i = 0; i < m_incoming_link_count; i++)
 		{
-			if (!block.valid)
+			IncomingLinkRecord& record = m_incoming_links[i];
+			if (record.target_pc != target_pc)
 				continue;
 
-			for (DirectLinkSlot& link : block.direct_links.slots)
-			{
-				if (link.valid && link.target_pc == target_pc)
-					PatchDirectLink(block, link, target);
-			}
+			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
+				PatchDirectLink(*record.source, *link, target);
 		}
 	}
 
 	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc)
 	{
-		for (CachedBlock& block : m_cache)
+		for (u32 i = 0; i < m_incoming_link_count; i++)
 		{
-			if (!block.valid)
+			IncomingLinkRecord& record = m_incoming_links[i];
+			if (target_pc != UINT32_MAX && record.target_pc != target_pc)
 				continue;
 
-			for (DirectLinkSlot& link : block.direct_links.slots)
-			{
-				if (link.valid && (target_pc == UINT32_MAX || link.target_pc == target_pc))
-					PatchDirectLink(block, link, reinterpret_cast<const void*>(&VitaEeA32DirectExit));
-			}
+			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
+				PatchDirectLink(*record.source, *link, reinterpret_cast<const void*>(&VitaEeA32DirectExit));
 		}
 	}
 
 	void BlockExecutor::RelinkDirectLinks()
 	{
-		for (CachedBlock& block : m_cache)
+		for (u32 i = 0; i < m_incoming_link_count; i++)
 		{
-			if (!block.valid)
+			IncomingLinkRecord& record = m_incoming_links[i];
+			DirectLinkSlot* link = GetRecordedDirectLink(record);
+			if (!link)
 				continue;
 
-			for (DirectLinkSlot& link : block.direct_links.slots)
-			{
-				if (!link.valid)
-					continue;
-
-				const CachedBlock* target = FindCachedBlockByStartPc(link.target_pc);
-				PatchDirectLink(block, link, target ? target->code.EntryPoint() :
-													  reinterpret_cast<const void*>(&VitaEeA32DirectExit));
-			}
+			const CachedBlock* target = FindCachedBlockByStartPc(record.target_pc);
+			PatchDirectLink(*record.source, *link, target ? target->code.EntryPoint() :
+															reinterpret_cast<const void*>(&VitaEeA32DirectExit));
 		}
 	}
 
@@ -540,6 +594,7 @@ namespace VitaEE
 		result->instruction_count = block.instruction_count;
 		result->scaled_cycles = block.scaled_cycles;
 		result->code_size = block.code.Size();
+		result->link_records = m_incoming_link_count;
 		return true;
 	}
 
