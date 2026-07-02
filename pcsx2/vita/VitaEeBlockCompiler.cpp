@@ -306,6 +306,7 @@ namespace VitaEE
 		bool has_register_branch_target = false;
 		bool has_static_direct_link_target = false;
 		bool has_static_conditional_direct_links = false;
+		bool has_static_likely_direct_links = false;
 		bool branch_is_likely = false;
 		u32 branch_instruction_index = 0;
 		u32 branch_target_pc = 0;
@@ -381,7 +382,10 @@ namespace VitaEE
 						break;
 					case 0x01:
 						branch_target_pc = BranchTarget(pc, op);
-						has_static_conditional_direct_links = !branch_is_likely;
+						if (branch_is_likely)
+							has_static_likely_direct_links = true;
+						else
+							has_static_conditional_direct_links = true;
 						if (!EmitREGIMM(op, pc))
 							return false;
 						break;
@@ -429,21 +433,25 @@ namespace VitaEE
 						break;
 					case 0x14:
 						branch_target_pc = BranchTarget(pc, op);
+						has_static_likely_direct_links = true;
 						if (!EmitBEQL(op))
 							return false;
 						break;
 					case 0x15:
 						branch_target_pc = BranchTarget(pc, op);
+						has_static_likely_direct_links = true;
 						if (!EmitBNEL(op))
 							return false;
 						break;
 					case 0x16:
 						branch_target_pc = BranchTarget(pc, op);
+						has_static_likely_direct_links = true;
 						if (!EmitBLEZL(op))
 							return false;
 						break;
 					case 0x17:
 						branch_target_pc = BranchTarget(pc, op);
+						has_static_likely_direct_links = true;
 						if (!EmitBGTZL(op))
 							return false;
 						break;
@@ -511,7 +519,29 @@ namespace VitaEE
 		}
 
 		if (has_branch && branch_is_likely)
-			return EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit);
+		{
+			size_t not_taken_link_target_offset = 0;
+			size_t taken_link_target_offset = 0;
+			if (!EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit,
+					direct_links && has_static_likely_direct_links ? &not_taken_link_target_offset : nullptr,
+					direct_links && has_static_likely_direct_links ? &taken_link_target_offset : nullptr))
+			{
+				return false;
+			}
+
+			if (direct_links && has_static_likely_direct_links)
+			{
+				direct_links->slots[0].target_pc = next_pc;
+				direct_links->slots[0].target_offset = not_taken_link_target_offset;
+				direct_links->slots[0].valid = true;
+
+				direct_links->slots[1].target_pc = branch_target_pc;
+				direct_links->slots[1].target_offset = taken_link_target_offset;
+				direct_links->slots[1].valid = true;
+			}
+
+			return true;
+		}
 
 		size_t direct_link_target_offset = 0;
 		size_t taken_link_target_offset = 0;
@@ -686,7 +716,8 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles,
-		const void* direct_exit, const void* event_exit)
+		const void* direct_exit, const void* event_exit, size_t* not_taken_link_target_offset,
+		size_t* taken_link_target_offset)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
@@ -760,8 +791,55 @@ namespace VitaEE
 		}
 
 		const size_t direct_target = m_code.Size();
-		return m_code.EmitCallAbsolute(direct_exit) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_PC) &&
+		if (not_taken_link_target_offset || taken_link_target_offset)
+		{
+			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
+				!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP0))
+			{
+				return false;
+			}
+
+			const size_t taken_tail = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (taken_tail == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+				return false;
+
+			const size_t not_taken_target_offset = m_code.Size();
+			if (!m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+				!m_code.EmitBx(HOST_TMP4))
+			{
+				return false;
+			}
+
+			const size_t taken_tail_target = m_code.Size();
+			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) ||
+				!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+			{
+				return false;
+			}
+
+			const size_t taken_target_offset = m_code.Size();
+			if (!m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+				!m_code.EmitBx(HOST_TMP4) ||
+				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
+			{
+				return false;
+			}
+
+			if (not_taken_link_target_offset)
+				*not_taken_link_target_offset = not_taken_target_offset;
+			if (taken_link_target_offset)
+				*taken_link_target_offset = taken_target_offset;
+			return true;
+		}
+
+		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+			return false;
+
+		return m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) &&
+			   m_code.EmitBx(HOST_TMP4) &&
 			   m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI);
 	}
 

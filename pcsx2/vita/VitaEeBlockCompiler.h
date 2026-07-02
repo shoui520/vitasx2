@@ -49,7 +49,9 @@ namespace VitaEE
 		bool EndBlockReturn(u8 value);
 		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
 			size_t* direct_link_target_offset = nullptr, size_t* taken_link_target_offset = nullptr);
-		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit, const void* event_exit);
+		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
+			const void* event_exit, size_t* not_taken_link_target_offset = nullptr,
+			size_t* taken_link_target_offset = nullptr);
 
 	private:
 		bool EmitSPECIAL(u32 op);
