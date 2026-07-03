@@ -818,8 +818,7 @@ namespace VitaEE
 		bool CanCompileCOP2(u32 op)
 		{
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-			(void)op;
-			return false;
+			return IsCOP2BranchOpcode(op);
 #else
 			// PCSX2 owners: COP2.cpp, VU0.cpp, VUops.cpp, and
 			// R5900OpcodeTables.cpp::Int_COP2*PrintTable. The first A32 full-core
@@ -1633,7 +1632,7 @@ namespace VitaEE
 			case 0x11:
 				return CanCompileCOP1(op) && !IsFastCOP1InBlock(op);
 			case 0x12:
-				return CanCompileCOP2(op) && !IsCOP2BranchOpcode(op);
+				return CanCompileCOP2(op);
 			case 0x2f:
 				return IsHelperCACHE(op);
 			case 0x20:
@@ -9380,10 +9379,6 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCop2Branch(u32 op)
 	{
-#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-		(void)op;
-		return false;
-#else
 		// PCSX2 owners: COP2.cpp::BC2F()/BC2T()/BC2FL()/BC2TL() branch on
 		// ((VU0.VI[REG_VPU_STAT].US[0] >> 8) & 1). x86/microVU_Macro.inl
 		// tests the same bit through VU0.VI[REG_VPU_STAT].UL & 0x100.
@@ -9398,7 +9393,6 @@ namespace VitaEE
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
 				   branch_on_true ? VitaA32::Condition::NE : VitaA32::Condition::EQ);
-#endif
 	}
 
 	bool BlockCompiler::EmitCop0Branch(u32 op)
