@@ -75,7 +75,7 @@ struct LoadstoreBackpatchInfo
 	bool is_fpr;
 };
 
-static constexpr size_t FASTMEM_AREA_SIZE = 0x100000000ULL;
+static constexpr u64 FASTMEM_AREA_SIZE = 0x100000000ULL;
 static constexpr u32 FASTMEM_PAGE_COUNT = FASTMEM_AREA_SIZE / VTLB_PAGE_SIZE;
 static constexpr u32 NO_FASTMEM_MAPPING = 0xFFFFFFFFu;
 

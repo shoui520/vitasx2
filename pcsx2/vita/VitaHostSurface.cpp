@@ -7,15 +7,32 @@
 #include "common/WindowInfo.h"
 #include "common/ProgressCallback.h"
 
+#include <cstdarg>
 #include <cstring>
 
+#if defined(VITASX2_QEMU_VALIDATION)
+#include <cstdio>
+#else
 #include <psp2/kernel/clib.h>
+#endif
 
 namespace
 {
+	void HostPrint(const char* format, ...)
+	{
+		std::va_list args;
+		va_start(args, format);
+#if defined(VITASX2_QEMU_VALIDATION)
+		std::vprintf(format, args);
+#else
+		sceClibVprintf(format, args);
+#endif
+		va_end(args);
+	}
+
 	void PrintHostMessage(const char* kind, const std::string_view title, const std::string_view message)
 	{
-		sceClibPrintf("Host %s: %.*s: %.*s\n", kind,
+		HostPrint("Host %s: %.*s: %.*s\n", kind,
 			static_cast<int>(title.size()), title.data(),
 			static_cast<int>(message.size()), message.data());
 	}
@@ -28,17 +45,17 @@ std::string Host::TranslatePluralToString(const char* context, const char* msg, 
 
 void Host::AddOSDMessage(std::string message, float duration)
 {
-	sceClibPrintf("Host OSD: %s\n", message.c_str());
+	HostPrint("Host OSD: %s\n", message.c_str());
 }
 
 void Host::AddKeyedOSDMessage(std::string key, std::string message, float duration)
 {
-	sceClibPrintf("Host OSD[%s]: %s\n", key.c_str(), message.c_str());
+	HostPrint("Host OSD[%s]: %s\n", key.c_str(), message.c_str());
 }
 
 void Host::AddIconOSDMessage(std::string key, const char* icon, const std::string_view message, float duration)
 {
-	sceClibPrintf("Host OSD[%s]: %.*s\n", key.c_str(), static_cast<int>(message.size()), message.data());
+	HostPrint("Host OSD[%s]: %.*s\n", key.c_str(), static_cast<int>(message.size()), message.data());
 }
 
 void Host::RemoveKeyedOSDMessage(std::string key)

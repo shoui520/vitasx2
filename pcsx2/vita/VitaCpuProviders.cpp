@@ -7,6 +7,7 @@
 #include "R3000A.h"
 #include "R5900.h"
 #include "SaveState.h"
+#include "VMManager.h"
 #include "VUmicro.h"
 #include "vita/VitaCore.h"
 #include "vita/VitaEeBlockCompiler.h"
@@ -22,6 +23,29 @@ static VitaEE::BlockExecutor s_ee_a32_executor;
 static VitaA32EeProviderStats s_ee_a32_stats;
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
+static bool s_ee_a32_running_compiled_block = false;
+static VitaA32EeTraceMode s_ee_a32_trace_mode = VitaA32EeTraceMode::InstructionWindow;
+
+const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason)
+{
+	switch (reason)
+	{
+		case VitaA32EeFallbackReason::None:
+			return "none";
+		case VitaA32EeFallbackReason::ScanUnsupportedOpcode:
+			return "scan_unsupported";
+		case VitaA32EeFallbackReason::ScanBoundary:
+			return "scan_boundary";
+		case VitaA32EeFallbackReason::ExactTraceBranchLikely:
+			return "exact_trace_branch_likely";
+		case VitaA32EeFallbackReason::ExecuteFailed:
+			return "execute_failed";
+		case VitaA32EeFallbackReason::InterpreterPath:
+			return "interpreter_path";
+		default:
+			return "unknown";
+	}
+}
 
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback)
 {
@@ -37,6 +61,11 @@ bool VitaRecordEePreInstruction(u32 pc, u32 opcode)
 {
 	const VitaEePreInstructionTraceCallback callback = s_ee_pre_instruction_trace_callback;
 	return callback ? callback(pc, opcode) : false;
+}
+
+void VitaSetA32EeTraceMode(VitaA32EeTraceMode mode)
+{
+	s_ee_a32_trace_mode = mode;
 }
 
 static bool s_ee_exact_trace_streams = false;
@@ -55,6 +84,49 @@ bool VitaRecordIopPreInstruction(u32 pc, u32 opcode)
 {
 	const VitaIopPreInstructionTraceCallback callback = s_iop_pre_instruction_trace_callback;
 	return callback ? callback(pc, opcode) : false;
+}
+
+static void recRecordInterpreterFallback(u32 pc, u32 opcode, VitaA32EeFallbackReason reason)
+{
+	if (s_ee_a32_stats.interpreter_steps == 0)
+	{
+		s_ee_a32_stats.first_interpreter_pc = pc;
+		s_ee_a32_stats.first_interpreter_opcode = opcode;
+		s_ee_a32_stats.first_interpreter_reason = static_cast<u32>(reason);
+	}
+
+	s_ee_a32_stats.last_interpreter_pc = pc;
+	s_ee_a32_stats.last_interpreter_opcode = opcode;
+	s_ee_a32_stats.last_interpreter_reason = static_cast<u32>(reason);
+	s_ee_a32_stats.interpreter_steps++;
+
+	switch (reason)
+	{
+		case VitaA32EeFallbackReason::ScanUnsupportedOpcode:
+			s_ee_a32_stats.scan_unsupported_fallbacks++;
+			break;
+		case VitaA32EeFallbackReason::ScanBoundary:
+			s_ee_a32_stats.scan_boundary_fallbacks++;
+			break;
+		case VitaA32EeFallbackReason::ExactTraceBranchLikely:
+			s_ee_a32_stats.exact_trace_branch_likely_fallbacks++;
+			break;
+		case VitaA32EeFallbackReason::ExecuteFailed:
+			s_ee_a32_stats.execute_failed_fallbacks++;
+			break;
+		case VitaA32EeFallbackReason::InterpreterPath:
+			s_ee_a32_stats.interpreter_path_fallbacks++;
+			break;
+		case VitaA32EeFallbackReason::None:
+			break;
+	}
+}
+
+static VitaA32EeFallbackReason recFallbackReasonForScanStop(VitaEE::BlockScanStop stop)
+{
+	return stop == VitaEE::BlockScanStop::UnsupportedOpcode ?
+		VitaA32EeFallbackReason::ScanUnsupportedOpcode :
+		VitaA32EeFallbackReason::ScanBoundary;
 }
 
 static void recInterpreterStepWithoutProviderTrace()
@@ -87,8 +159,10 @@ static void recRunInterpreterStepsWithoutProviderTrace(u32 instruction_count)
 {
 	for (u32 i = 0; i < instruction_count && !s_ee_a32_exit_execution; i++)
 	{
+		const u32 pc = cpuRegs.pc;
+		const u32 opcode = memRead32(pc);
 		recInterpreterStepWithoutProviderTrace();
-		s_ee_a32_stats.interpreter_steps++;
+		recRecordInterpreterFallback(pc, opcode, VitaA32EeFallbackReason::ExecuteFailed);
 	}
 }
 
@@ -119,10 +193,18 @@ static void recStep()
 static void recExecute()
 {
 	s_ee_a32_exit_execution = false;
-	s_ee_a32_executor.SetDirectLinkingEnabled(s_ee_pre_instruction_trace_callback == nullptr);
 
 	while (!s_ee_a32_exit_execution)
 	{
+		// Direct-linked chains bypass this dispatcher, so linking stays off
+		// while tracing and until the ELF boots: pre-boot, every arrival at
+		// the EELOAD/entry hook pcs below must pass through here, matching
+		// Interpreter.cpp::intExecute() and the compile-time hooks in
+		// x86/ix86-32/iR5900.cpp::recRecompile().
+		const bool elf_booted = VMManager::Internal::HasBootedELF();
+		s_ee_a32_executor.SetDirectLinkingEnabled(
+			s_ee_pre_instruction_trace_callback == nullptr && elf_booted);
+
 		if (s_ee_a32_cache_reset_requested)
 		{
 			s_ee_a32_stats.invalidated_blocks += s_ee_a32_executor.Reset();
@@ -130,6 +212,43 @@ static void recExecute()
 		}
 
 		const u32 pc = cpuRegs.pc;
+
+		if (!elf_booted)
+		{
+			if (pc == EELOAD_START)
+			{
+				// The EELOAD _start function is the same across all BIOS versions.
+				const u32 mainjump = memRead32(EELOAD_START + 0x9c);
+				if (mainjump >> 26 == 3) // JAL
+					g_eeloadMain = ((EELOAD_START + 0xa0) & 0xf0000000U) | (mainjump << 2 & 0x0fffffffU);
+			}
+			else if (g_eeloadMain && pc == g_eeloadMain)
+			{
+				eeloadHook();
+				if (VMManager::Internal::IsFastBootInProgress())
+				{
+					// See comments on this code in iR5900.cpp's recRecompile().
+					const u32 typeAexecjump = memRead32(EELOAD_START + 0x470);
+					const u32 typeBexecjump = memRead32(EELOAD_START + 0x5B0);
+					const u32 typeCexecjump = memRead32(EELOAD_START + 0x618);
+					const u32 typeDexecjump = memRead32(EELOAD_START + 0x600);
+					if ((typeBexecjump >> 26 == 3) || (typeCexecjump >> 26 == 3) || (typeDexecjump >> 26 == 3))
+						g_eeloadExec = EELOAD_START + 0x2B8;
+					else if (typeAexecjump >> 26 == 3)
+						g_eeloadExec = EELOAD_START + 0x170;
+					else
+						Console.WriteLn("recExecute: Could not enable launch arguments for fast boot mode; unidentified BIOS version!");
+				}
+			}
+			else if (g_eeloadExec && pc == g_eeloadExec)
+			{
+				eeloadHook2();
+			}
+			else if (pc == VMManager::Internal::GetCurrentELFEntryPoint())
+			{
+				VMManager::Internal::EntryPointCompilingOnCPUThread();
+			}
+		}
 
 		VitaEE::BlockScanResult scan;
 		if (!VitaEE::BlockExecutor::ScanStraightLineBlock(pc,
@@ -141,8 +260,9 @@ static void recExecute()
 			// branches, records and executes the delay slot inside
 			// intDoBranch() — the same record stream the interpreter provider
 			// produces. A stop request exits through Cpu->ExitExecution().
+			const u32 opcode = memRead32(pc);
 			intCpu.Step();
-			s_ee_a32_stats.interpreter_steps++;
+			recRecordInterpreterFallback(pc, opcode, recFallbackReasonForScanStop(scan.stop));
 			continue;
 		}
 
@@ -161,20 +281,35 @@ static void recExecute()
 			window_instruction_count -= 2;
 			if (window_instruction_count == 0)
 			{
+				const u32 opcode = memRead32(pc);
 				intCpu.Step();
-				s_ee_a32_stats.interpreter_steps++;
+				recRecordInterpreterFallback(pc, opcode, VitaA32EeFallbackReason::ExactTraceBranchLikely);
 				continue;
 			}
 		}
 
 		u32 executable_instruction_count = 0;
-		const bool full_window_recorded =
-			recRecordEeWindow(pc, window_instruction_count, &executable_instruction_count);
+		bool full_window_recorded = false;
+		if (s_ee_pre_instruction_trace_callback &&
+			s_ee_a32_trace_mode == VitaA32EeTraceMode::BlockBoundaryState)
+		{
+			full_window_recorded = !VitaRecordEePreInstruction(pc, memRead32(pc));
+			if (full_window_recorded)
+				executable_instruction_count = window_instruction_count;
+		}
+		else
+		{
+			full_window_recorded =
+				recRecordEeWindow(pc, window_instruction_count, &executable_instruction_count);
+		}
 		if (executable_instruction_count == 0)
 			break;
 
 		VitaEE::BlockExecutionResult result;
-		if (!s_ee_a32_executor.ExecuteCompiledBlock(pc, executable_instruction_count, true, &result))
+		s_ee_a32_running_compiled_block = true;
+		const bool executed = s_ee_a32_executor.ExecuteCompiledBlock(pc, executable_instruction_count, true, &result);
+		s_ee_a32_running_compiled_block = false;
+		if (!executed)
 		{
 			s_ee_a32_stats.failed_blocks++;
 			recRunInterpreterStepsWithoutProviderTrace(executable_instruction_count);
@@ -191,7 +326,7 @@ static void recExecute()
 		}
 		else
 		{
-			s_ee_a32_stats.interpreter_steps++;
+			recRecordInterpreterFallback(pc, memRead32(pc), VitaA32EeFallbackReason::InterpreterPath);
 		}
 
 		if (result.exit == VitaEE::BlockExitKind::Direct)
@@ -232,6 +367,12 @@ static void recClear(u32 addr, u32 size)
 {
 	// PCSX2 owner: x86/ix86-32/iR5900.cpp::recClear(addr, size), where size is
 	// measured in 32-bit guest words.
+	if (s_ee_a32_running_compiled_block)
+	{
+		s_ee_a32_cache_reset_requested = true;
+		return;
+	}
+
 	s_ee_a32_stats.invalidated_blocks += s_ee_a32_executor.InvalidateRange(addr, size);
 }
 

@@ -31,6 +31,7 @@ BIOS
 #include "SPU2/spu2.h"
 #include "SaveState.h"
 #include "VUmicro.h"
+#include "MemoryMap.h"
 
 #include "ps2/HwInternal.h"
 #include "ps2/BiosTools.h"
@@ -440,16 +441,7 @@ void memMapVUmicro()
 
 void memMapPhy()
 {
-	// Main memory
-	vtlb_MapBlock(eeMem->Main,	0x00000000,Ps2MemSize::ExposedRam);//mirrored on first 256 mb ?
-
-	// High memory, uninstalled on the configuration we emulate
-	vtlb_MapHandler(null_handler, Ps2MemSize::ExposedRam, 0x10000000 - Ps2MemSize::ExposedRam);
-
-	// Various ROMs (all read-only)
-	vtlb_MapBlock(eeMem->ROM,	0x1fc00000, Ps2MemSize::Rom);
-	vtlb_MapBlock(eeMem->ROM1,	0x1e000000, Ps2MemSize::Rom1);
-	vtlb_MapBlock(eeMem->ROM2,	0x1e400000, Ps2MemSize::Rom2);
+	Ps2MemoryMap::MapEERamHighMemoryAndRoms(null_handler);
 
 	// IOP memory
 	// (used by the EE Bios Kernel during initial hardware initialization, Apps/Games
@@ -487,12 +479,7 @@ void memMapPhy()
 //Why is this required ?
 void memMapKernelMem()
 {
-	//lower 512 mb: direct map
-	//vtlb_VMap(0x00000000,0x00000000,0x20000000);
-	//0x8* mirror
-	vtlb_VMap(0x80000000, 0x00000000, _1mb*512);
-	//0xa* mirror
-	vtlb_VMap(0xA0000000, 0x00000000, _1mb*512);
+	Ps2MemoryMap::MapKernelVirtualMirrors();
 }
 
 //what do do with these ?
@@ -502,47 +489,6 @@ void memMapSupervisorMem()
 
 void memMapUserMem()
 {
-}
-
-static mem8_t nullRead8(u32 mem) {
-	MEM_LOG("Read uninstalled memory at address %08x", mem);
-	return 0;
-}
-static mem16_t nullRead16(u32 mem) {
-	MEM_LOG("Read uninstalled memory at address %08x", mem);
-	return 0;
-}
-static mem32_t nullRead32(u32 mem) {
-	MEM_LOG("Read uninstalled memory at address %08x", mem);
-	return 0;
-}
-static mem64_t nullRead64(u32 mem) {
-	MEM_LOG("Read uninstalled memory at address %08x", mem);
-	return 0;
-}
-static RETURNS_R128 nullRead128(u32 mem) {
-	MEM_LOG("Read uninstalled memory at address %08x", mem);
-	return r128_zero();
-}
-static void nullWrite8(u32 mem, mem8_t value)
-{
-	MEM_LOG("Write uninstalled memory at address %08x", mem);
-}
-static void nullWrite16(u32 mem, mem16_t value)
-{
-	MEM_LOG("Write uninstalled memory at address %08x", mem);
-}
-static void nullWrite32(u32 mem, mem32_t value)
-{
-	MEM_LOG("Write uninstalled memory at address %08x", mem);
-}
-static void nullWrite64(u32 mem, mem64_t value)
-{
-	MEM_LOG("Write uninstalled memory at address %08x", mem);
-}
-static void TAKES_R128 nullWrite128(u32 mem, r128 value)
-{
-	MEM_LOG("Write uninstalled memory at address %08x", mem);
 }
 
 template<int p>
@@ -1075,8 +1021,7 @@ void memReset()
 
 	vtlb_Init();
 
-	null_handler = vtlb_RegisterHandler(nullRead8, nullRead16, nullRead32, nullRead64, nullRead128,
-		nullWrite8, nullWrite16, nullWrite32, nullWrite64, nullWrite128);
+	null_handler = Ps2MemoryMap::RegisterNullMemoryHandler();
 
 	tlb_fallback_0 = vtlb_RegisterHandlerTempl1(_ext_mem,0);
 	tlb_fallback_3 = vtlb_RegisterHandlerTempl1(_ext_mem,3);
@@ -1175,8 +1120,7 @@ void memReset()
 	memMapUserMem();
 	memSetKernelMode();
 
-	vtlb_VMap(0x00000000,0x00000000,0x20000000);
-	vtlb_VMapUnmap(0x20000000,0x60000000);
+	Ps2MemoryMap::MapDirectVirtualMemoryWindow();
 
 	std::memset(s_ba, 0, sizeof(s_ba));
 

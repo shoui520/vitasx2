@@ -5,7 +5,11 @@
 
 #include <cstddef>
 
+#if defined(VITASX2_QEMU_VALIDATION)
+using SceUID = int;
+#else
 #include <psp2common/types.h>
+#endif
 
 namespace VitaVM
 {

@@ -24,8 +24,30 @@ struct VitaA32EeProviderStats
 	u32 cache_misses = 0;
 	u32 lookup_hits = 0;
 	u32 invalidated_blocks = 0;
+	u32 first_interpreter_pc = 0;
+	u32 first_interpreter_opcode = 0;
+	u32 first_interpreter_reason = 0;
+	u32 last_interpreter_pc = 0;
+	u32 last_interpreter_opcode = 0;
+	u32 last_interpreter_reason = 0;
+	u32 scan_unsupported_fallbacks = 0;
+	u32 scan_boundary_fallbacks = 0;
+	u32 exact_trace_branch_likely_fallbacks = 0;
+	u32 execute_failed_fallbacks = 0;
+	u32 interpreter_path_fallbacks = 0;
 };
 
+enum class VitaA32EeFallbackReason : u32
+{
+	None = 0,
+	ScanUnsupportedOpcode = 1,
+	ScanBoundary = 2,
+	ExactTraceBranchLikely = 3,
+	ExecuteFailed = 4,
+	InterpreterPath = 5,
+};
+
+const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason);
 void VitaResetA32EeProviderStats();
 VitaA32EeProviderStats VitaGetA32EeProviderStats();
 void VitaRequestA32EeCacheReset();
@@ -43,6 +65,18 @@ void VitaSetFastBootDisc();
 using VitaEePreInstructionTraceCallback = bool (*)(u32 pc, u32 opcode);
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback);
 bool VitaRecordEePreInstruction(u32 pc, u32 opcode);
+
+enum class VitaA32EeTraceMode
+{
+	InstructionWindow,
+	BlockBoundaryState,
+};
+
+// InstructionWindow records the executed pc/opcode stream by pre-recording
+// straight-line block windows before native execution. BlockBoundaryState
+// records only block starts, where the complete EE state is current and can be
+// compared against PCSX2 full-state traces.
+void VitaSetA32EeTraceMode(VitaA32EeTraceMode mode);
 
 // Exact-stream trace mode for the A32 EE provider: recorded windows must
 // match the executed instruction stream exactly, so branch-likely pairs are

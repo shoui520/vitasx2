@@ -3,22 +3,47 @@
 
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
 
+#if defined(VITASX2_QEMU_VALIDATION) && !defined(VITASX2_QEMU_FULL_CORE)
+#define VITASX2_QEMU_PROVIDER_FIXTURE 1
+#endif
+
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+#include "vita/qemu/VitaEeQemuStubs.h"
+#else
 #include "pcsx2/Config.h"
 #include "pcsx2/Memory.h"
 #include "pcsx2/R5900.h"
 #include "pcsx2/R5900OpcodeTables.h"
 #include "pcsx2/VUmicro.h"
+#endif
 #include "pcsx2/vita/A32Emitter.h"
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 #include "pcsx2/vita/VitaCore.h"
 #include "pcsx2/vtlb.h"
 
 #include "common/Console.h"
 #include "fmt/format.h"
+#endif
 
 #include <cstddef>
+#if defined(VITASX2_QEMU_VALIDATION)
+#include <cstdio>
+#endif
 #include <string>
 
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 extern void vu0Sync();
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuDivSignedHelperCalls = 0;
+u32 g_qemuDivUnsignedHelperCalls = 0;
+u32 g_qemuDivSigned1HelperCalls = 0;
+u32 g_qemuDivUnsigned1HelperCalls = 0;
+u32 g_qemuPackedDivSignedWordHelperCalls = 0;
+u32 g_qemuPackedDivUnsignedWordHelperCalls = 0;
+u32 g_qemuPackedDivWordByHalfwordHelperCalls = 0;
+#endif
 
 namespace VitaEE
 {
@@ -26,6 +51,7 @@ namespace VitaEE
 	{
 		constexpr u16 REG_R4 = 1u << 4;
 		constexpr u16 REG_R5 = 1u << 5;
+		constexpr u16 REG_R6 = 1u << 6;
 		constexpr u16 REG_LR = 1u << 14;
 		constexpr u16 REG_PC = 1u << 15;
 
@@ -38,17 +64,22 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP2 = 2;
 		constexpr unsigned HOST_TMP3 = 3;
 		constexpr unsigned HOST_TMP4 = 12;
+		constexpr unsigned HOST_TMP5 = 6;
 
 		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
 		constexpr size_t HI_OFFSET = offsetof(cpuRegisters, HI);
 		constexpr size_t LO_OFFSET = offsetof(cpuRegisters, LO);
+		constexpr size_t SA_OFFSET = offsetof(cpuRegisters, sa);
 		constexpr size_t PC_OFFSET = offsetof(cpuRegisters, pc);
+		constexpr size_t CODE_OFFSET = offsetof(cpuRegisters, code);
 		constexpr size_t CYCLE_OFFSET = offsetof(cpuRegisters, cycle);
+		constexpr size_t BRANCH_OFFSET = offsetof(cpuRegisters, branch);
 		constexpr size_t NEXT_EVENT_OFFSET = offsetof(cpuRegisters, nextEventCycle);
 
 		constexpr u32 GOEMON_PRELOAD_RETURN_PC_0 = 0x0033ad48;
 		constexpr u32 GOEMON_PRELOAD_RETURN_PC_1 = 0x0035060c;
 		constexpr u32 GOEMON_UNLOAD_ENTRY_PC = 0x003563b8;
+		constexpr u32 FPU_FCR31_CONDITION_FLAG = 0x00800000;
 
 		alignas(16) GPR_reg s_lq_zero_sink;
 
@@ -127,6 +158,18 @@ namespace VitaEE
 			return GPR_OFFSET + sizeof(GPR_reg) * guest_reg;
 		}
 
+		constexpr size_t HiloLaneOffset(size_t hilo_offset, bool upper_pipeline)
+		{
+			return hilo_offset + (upper_pipeline ? sizeof(u64) : 0);
+		}
+
+		constexpr size_t PackedHalfwordAccumulatorOffset(unsigned lane)
+		{
+			const size_t base_offset = ((lane & 2u) != 0) ? HI_OFFSET : LO_OFFSET;
+			const unsigned word = (lane & 1u) + (((lane & 4u) != 0) ? 2u : 0u);
+			return base_offset + word * sizeof(u32);
+		}
+
 		bool CanCompileSPECIAL(u32 op)
 		{
 			switch (op & 0x3f)
@@ -141,6 +184,8 @@ namespace VitaEE
 				case 0x09: // JALR, owned by Interpreter.cpp::JALR().
 				case 0x0a: // MOVZ, owned by R5900OpcodeImpl.cpp::MOVZ().
 				case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
+				case 0x0d: // BREAK, owned by R5900OpcodeImpl.cpp::BREAK().
+				case 0x0f: // SYNC, owned by R5900OpcodeImpl.cpp::SYNC().
 				case 0x10: // MFHI, owned by R5900OpcodeImpl.cpp::MFHI().
 				case 0x11: // MTHI, owned by R5900OpcodeImpl.cpp::MTHI().
 				case 0x12: // MFLO, owned by R5900OpcodeImpl.cpp::MFLO().
@@ -178,6 +223,308 @@ namespace VitaEE
 			}
 		}
 
+		bool IsBREAK(u32 op)
+		{
+			return (op >> 26) == 0x00 && (op & 0x3f) == 0x0d;
+		}
+
+		bool IsCounterReadLoad(u32 op)
+		{
+			switch (op >> 26)
+			{
+				case 0x20: // LB, owned by R5900OpcodeImpl.cpp::LB().
+				case 0x21: // LH, owned by R5900OpcodeImpl.cpp::LH().
+				case 0x23: // LW, owned by R5900OpcodeImpl.cpp::LW().
+				case 0x24: // LBU, owned by R5900OpcodeImpl.cpp::LBU().
+				case 0x25: // LHU, owned by R5900OpcodeImpl.cpp::LHU().
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool CanCompileMMI0(u32 op);
+		bool CanCompileMMI1(u32 op);
+		bool CanCompileMMI2(u32 op);
+		bool CanCompileMMI3(u32 op);
+		bool CanCompileCOP0(u32 op);
+		bool CanCompileCOP1(u32 op);
+
+		bool CanCompileMMI(u32 op)
+		{
+			switch (op & 0x3f)
+			{
+				case 0x00: // MADD, owned by MMI.cpp::MADD() and x86/ix86-32/iR5900MultDiv.cpp::recMADD().
+				case 0x01: // MADDU, owned by MMI.cpp::MADDU() and x86/ix86-32/iR5900MultDiv.cpp::recMADDU().
+				case 0x04: // PLZCW, owned by MMI.cpp::PLZCW().
+				case 0x10: // MFHI1, owned by MMI.cpp::MFHI1().
+				case 0x11: // MTHI1, owned by MMI.cpp::MTHI1().
+				case 0x12: // MFLO1, owned by MMI.cpp::MFLO1().
+				case 0x13: // MTLO1, owned by MMI.cpp::MTLO1().
+				case 0x18: // MULT1, owned by MMI.cpp::MULT1() and x86/ix86-32/iR5900MultDiv.cpp::recMULT1().
+				case 0x19: // MULTU1, owned by MMI.cpp::MULTU1() and x86/ix86-32/iR5900MultDiv.cpp::recMULTU1().
+				case 0x1a: // DIV1, owned by MMI.cpp::DIV1() and x86/ix86-32/iR5900MultDiv.cpp::recDIV1().
+				case 0x1b: // DIVU1, owned by MMI.cpp::DIVU1() and x86/ix86-32/iR5900MultDiv.cpp::recDIVU1().
+				case 0x20: // MADD1, owned by MMI.cpp::MADD1() and x86/ix86-32/iR5900MultDiv.cpp::recMADD1().
+				case 0x21: // MADDU1, owned by MMI.cpp::MADDU1() and x86/ix86-32/iR5900MultDiv.cpp::recMADDU1().
+				case 0x30: // PMFHL, owned by MMI.cpp::PMFHL().
+				case 0x31: // PMTHL, owned by MMI.cpp::PMTHL().
+				case 0x34: // PSLLH, owned by MMI.cpp::PSLLH().
+				case 0x36: // PSRLH, owned by MMI.cpp::PSRLH().
+				case 0x37: // PSRAH, owned by MMI.cpp::PSRAH().
+				case 0x3c: // PSLLW, owned by MMI.cpp::PSLLW().
+				case 0x3e: // PSRLW, owned by MMI.cpp::PSRLW().
+				case 0x3f: // PSRAW, owned by MMI.cpp::PSRAW().
+					return true;
+				case 0x08: // MMI0 class, owned by R5900OpcodeTables.cpp::Class_MMI0().
+					return CanCompileMMI0(op);
+				case 0x09: // MMI2 class, owned by R5900OpcodeTables.cpp::Class_MMI2().
+					return CanCompileMMI2(op);
+				case 0x28: // MMI1 class, owned by R5900OpcodeTables.cpp::Class_MMI1().
+					return CanCompileMMI1(op);
+				case 0x29: // MMI3 class, owned by R5900OpcodeTables.cpp::Class_MMI3().
+					return CanCompileMMI3(op);
+				default:
+					return false;
+			}
+		}
+
+		bool CanCompileMMI0(u32 op)
+		{
+			switch ((op >> 6) & 0x1f)
+			{
+				case 0x00: // PADDW, owned by MMI.cpp::PADDW().
+				case 0x01: // PSUBW, owned by MMI.cpp::PSUBW().
+				case 0x02: // PCGTW, owned by MMI.cpp::PCGTW().
+				case 0x03: // PMAXW, owned by MMI.cpp::PMAXW().
+				case 0x04: // PADDH, owned by MMI.cpp::PADDH().
+				case 0x05: // PSUBH, owned by MMI.cpp::PSUBH().
+				case 0x06: // PCGTH, owned by MMI.cpp::PCGTH().
+				case 0x07: // PMAXH, owned by MMI.cpp::PMAXH().
+				case 0x08: // PADDB, owned by MMI.cpp::PADDB().
+				case 0x09: // PSUBB, owned by MMI.cpp::PSUBB().
+				case 0x0a: // PCGTB, owned by MMI.cpp::PCGTB().
+				case 0x10: // PADDSW, owned by MMI.cpp::PADDSW().
+				case 0x11: // PSUBSW, owned by MMI.cpp::PSUBSW().
+				case 0x12: // PEXTLW, owned by MMI.cpp::PEXTLW().
+				case 0x13: // PPACW, owned by MMI.cpp::PPACW().
+				case 0x14: // PADDSH, owned by MMI.cpp::PADDSH().
+				case 0x15: // PSUBSH, owned by MMI.cpp::PSUBSH().
+				case 0x16: // PEXTLH, owned by MMI.cpp::PEXTLH().
+				case 0x17: // PPACH, owned by MMI.cpp::PPACH().
+				case 0x18: // PADDSB, owned by MMI.cpp::PADDSB().
+				case 0x19: // PSUBSB, owned by MMI.cpp::PSUBSB().
+				case 0x1a: // PEXTLB, owned by MMI.cpp::PEXTLB().
+				case 0x1b: // PPACB, owned by MMI.cpp::PPACB().
+				case 0x1e: // PEXT5, owned by MMI.cpp::PEXT5().
+				case 0x1f: // PPAC5, owned by MMI.cpp::PPAC5().
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool CanCompileMMI1(u32 op)
+		{
+			switch ((op >> 6) & 0x1f)
+			{
+				case 0x01: // PABSW, owned by MMI.cpp::PABSW().
+				case 0x02: // PCEQW, owned by MMI.cpp::PCEQW().
+				case 0x03: // PMINW, owned by MMI.cpp::PMINW().
+				case 0x04: // PADSBH, owned by MMI.cpp::PADSBH().
+				case 0x05: // PABSH, owned by MMI.cpp::PABSH().
+				case 0x06: // PCEQH, owned by MMI.cpp::PCEQH().
+				case 0x07: // PMINH, owned by MMI.cpp::PMINH().
+				case 0x0a: // PCEQB, owned by MMI.cpp::PCEQB().
+				case 0x10: // PADDUW, owned by MMI.cpp::PADDUW().
+				case 0x11: // PSUBUW, owned by MMI.cpp::PSUBUW().
+				case 0x12: // PEXTUW, owned by MMI.cpp::PEXTUW().
+				case 0x14: // PADDUH, owned by MMI.cpp::PADDUH().
+				case 0x15: // PSUBUH, owned by MMI.cpp::PSUBUH().
+				case 0x16: // PEXTUH, owned by MMI.cpp::PEXTUH().
+				case 0x18: // PADDUB, owned by MMI.cpp::PADDUB().
+				case 0x19: // PSUBUB, owned by MMI.cpp::PSUBUB().
+				case 0x1a: // PEXTUB, owned by MMI.cpp::PEXTUB().
+				case 0x1b: // QFSRV, owned by MMI.cpp::QFSRV().
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool CanCompileMMI2(u32 op)
+		{
+			switch ((op >> 6) & 0x1f)
+			{
+				case 0x00: // PMADDW, owned by MMI.cpp::PMADDW().
+				case 0x02: // PSLLVW, owned by MMI.cpp::PSLLVW().
+				case 0x03: // PSRLVW, owned by MMI.cpp::PSRLVW().
+				case 0x04: // PMSUBW, owned by MMI.cpp::PMSUBW().
+				case 0x08: // PMFHI, owned by MMI.cpp::PMFHI().
+				case 0x09: // PMFLO, owned by MMI.cpp::PMFLO().
+				case 0x0a: // PINTH, owned by MMI.cpp::PINTH().
+				case 0x0c: // PMULTW, owned by MMI.cpp::PMULTW().
+				case 0x0d: // PDIVW, owned by MMI.cpp::PDIVW().
+				case 0x0e: // PCPYLD, owned by MMI.cpp::PCPYLD().
+				case 0x10: // PMADDH, owned by MMI.cpp::PMADDH().
+				case 0x11: // PHMADH, owned by MMI.cpp::PHMADH().
+				case 0x12: // PAND, owned by MMI.cpp::PAND().
+				case 0x13: // PXOR, owned by MMI.cpp::PXOR().
+				case 0x14: // PMSUBH, owned by MMI.cpp::PMSUBH().
+				case 0x15: // PHMSBH, owned by MMI.cpp::PHMSBH().
+				case 0x1a: // PEXEH, owned by MMI.cpp::PEXEH().
+				case 0x1b: // PREVH, owned by MMI.cpp::PREVH().
+				case 0x1c: // PMULTH, owned by MMI.cpp::PMULTH().
+				case 0x1d: // PDIVBW, owned by MMI.cpp::PDIVBW().
+				case 0x1e: // PEXEW, owned by MMI.cpp::PEXEW().
+				case 0x1f: // PROT3W, owned by MMI.cpp::PROT3W().
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool CanCompileMMI3(u32 op)
+		{
+			switch ((op >> 6) & 0x1f)
+			{
+				case 0x00: // PMADDUW, owned by MMI.cpp::PMADDUW().
+				case 0x03: // PSRAVW, owned by MMI.cpp::PSRAVW().
+				case 0x08: // PMTHI, owned by MMI.cpp::PMTHI().
+				case 0x09: // PMTLO, owned by MMI.cpp::PMTLO().
+				case 0x0a: // PINTEH, owned by MMI.cpp::PINTEH().
+				case 0x0c: // PMULTUW, owned by MMI.cpp::PMULTUW().
+				case 0x0d: // PDIVUW, owned by MMI.cpp::PDIVUW().
+				case 0x0e: // PCPYUD, owned by MMI.cpp::PCPYUD().
+				case 0x12: // POR, owned by MMI.cpp::POR().
+				case 0x13: // PNOR, owned by MMI.cpp::PNOR().
+				case 0x1a: // PEXCH, owned by MMI.cpp::PEXCH().
+				case 0x1b: // PCPYH, owned by MMI.cpp::PCPYH().
+				case 0x1e: // PEXCW, owned by MMI.cpp::PEXCW().
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool CanCompileCOP0(u32 op)
+		{
+			switch ((op >> 21) & 0x1f)
+			{
+				case 0x00: // MFC0, owned by COP0.cpp::MFC0().
+				case 0x04: // MTC0, owned by COP0.cpp::MTC0().
+					return true;
+				case 0x10: // COP0_C0 class, owned by R5900OpcodeTables.cpp::tbl_COP0_C0.
+					switch (op & 0x3f)
+					{
+						case 0x01: // TLBR, owned by COP0.cpp::TLBR().
+						case 0x02: // TLBWI, owned by COP0.cpp::TLBWI().
+						case 0x06: // TLBWR, owned by COP0.cpp::TLBWR().
+						case 0x08: // TLBP, owned by COP0.cpp::TLBP().
+						case 0x18: // ERET, owned by COP0.cpp::ERET().
+						case 0x38: // EI, owned by COP0.cpp::EI().
+							return true;
+						default:
+							return false;
+					}
+				default:
+					return false;
+			}
+		}
+
+		bool CanCompileCOP1(u32 op)
+		{
+			switch ((op >> 21) & 0x1f)
+			{
+				case 0x00: // MFC1, owned by FPU.cpp::MFC1().
+				case 0x02: // CFC1, owned by FPU.cpp::CFC1().
+				case 0x04: // MTC1, owned by FPU.cpp::MTC1().
+				case 0x06: // CTC1, owned by FPU.cpp::CTC1().
+					return true;
+				case 0x08: // COP1_BC1 class, owned by R5900OpcodeTables.cpp::tbl_COP1_BC1.
+					switch (RT(op))
+					{
+						case 0x00: // BC1F, owned by FPU.cpp::BC1F().
+						case 0x01: // BC1T, owned by FPU.cpp::BC1T().
+						case 0x02: // BC1FL, owned by FPU.cpp::BC1FL().
+						case 0x03: // BC1TL, owned by FPU.cpp::BC1TL().
+							return true;
+						default:
+							return false;
+					}
+				case 0x10: // COP1_S class, owned by R5900OpcodeTables.cpp::tbl_COP1_S.
+					switch (op & 0x3f)
+					{
+						case 0x00: // ADD_S, owned by FPU.cpp::ADD_S().
+						case 0x01: // SUB_S, owned by FPU.cpp::SUB_S().
+						case 0x02: // MUL_S, owned by FPU.cpp::MUL_S().
+						case 0x03: // DIV_S, owned by FPU.cpp::DIV_S().
+						case 0x04: // SQRT_S, owned by FPU.cpp::SQRT_S().
+						case 0x05: // ABS_S, owned by FPU.cpp::ABS_S().
+						case 0x06: // MOV_S, owned by FPU.cpp::MOV_S().
+						case 0x07: // NEG_S, owned by FPU.cpp::NEG_S().
+						case 0x16: // RSQRT_S, owned by FPU.cpp::RSQRT_S().
+						case 0x18: // ADDA_S, owned by FPU.cpp::ADDA_S().
+						case 0x19: // SUBA_S, owned by FPU.cpp::SUBA_S().
+						case 0x1a: // MULA_S, owned by FPU.cpp::MULA_S().
+						case 0x1c: // MADD_S, owned by FPU.cpp::MADD_S().
+						case 0x1d: // MSUB_S, owned by FPU.cpp::MSUB_S().
+						case 0x1e: // MADDA_S, owned by FPU.cpp::MADDA_S().
+						case 0x1f: // MSUBA_S, owned by FPU.cpp::MSUBA_S().
+						case 0x24: // CVT_W, owned by FPU.cpp::CVT_W().
+						case 0x28: // MAX_S, owned by FPU.cpp::MAX_S().
+						case 0x29: // MIN_S, owned by FPU.cpp::MIN_S().
+						case 0x30: // C_F, owned by FPU.cpp::C_F().
+						case 0x32: // C_EQ, owned by FPU.cpp::C_EQ().
+						case 0x34: // C_LT, owned by FPU.cpp::C_LT().
+						case 0x36: // C_LE, owned by FPU.cpp::C_LE().
+							return true;
+						default:
+							return false;
+					}
+				case 0x14: // COP1_W class, owned by R5900OpcodeTables.cpp::tbl_COP1_W.
+					return (op & 0x3f) == 0x20; // CVT_S, owned by FPU.cpp::CVT_S().
+				default:
+					return false;
+			}
+		}
+
+		bool IsNoOpCACHE(u32 op)
+		{
+			switch (RT(op))
+			{
+				case 0x07: // IXIN, owned by Cache.cpp::CACHE(); PCSX2 no-ops instruction-cache invalidation.
+				case 0x0c: // BFH, owned by Cache.cpp::CACHE(); PCSX2 no-ops BTAC flush.
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool IsHelperCACHE(u32 op)
+		{
+			switch (RT(op))
+			{
+				case 0x10: // DXLTG, owned by Cache.cpp::CACHE().
+				case 0x11: // DXLDT, owned by Cache.cpp::CACHE().
+				case 0x12: // DXSTG, owned by Cache.cpp::CACHE().
+				case 0x13: // DXSDT, owned by Cache.cpp::CACHE().
+				case 0x14: // DXWBIN, owned by Cache.cpp::CACHE().
+				case 0x16: // DXIN, owned by Cache.cpp::CACHE().
+				case 0x18: // DHWBIN, owned by Cache.cpp::CACHE().
+				case 0x1a: // DHIN, owned by Cache.cpp::CACHE().
+				case 0x1c: // DHWOIN, owned by Cache.cpp::CACHE().
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool CanCompileCACHE(u32 op)
+		{
+			return IsNoOpCACHE(op) || IsHelperCACHE(op);
+		}
+
 		bool CanCompileREGIMM(u32 op)
 		{
 			switch (RT(op))
@@ -190,6 +537,8 @@ namespace VitaEE
 				case 0x11: // BGEZAL, owned by Interpreter.cpp::BGEZAL().
 				case 0x12: // BLTZALL, owned by Interpreter.cpp::BLTZALL().
 				case 0x13: // BGEZALL, owned by Interpreter.cpp::BGEZALL().
+				case 0x18: // MTSAB, owned by R5900OpcodeImpl.cpp::MTSAB().
+				case 0x19: // MTSAH, owned by R5900OpcodeImpl.cpp::MTSAH().
 					return true;
 				default:
 					return false;
@@ -216,6 +565,8 @@ namespace VitaEE
 				case 0x16: // BLEZL, owned by Interpreter.cpp::BLEZL().
 				case 0x17: // BGTZL, owned by Interpreter.cpp::BGTZL().
 					return true;
+				case 0x11:
+					return ((op >> 21) & 0x1f) == 0x08 && (RT(op) == 0x02 || RT(op) == 0x03);
 				default:
 					return false;
 			}
@@ -468,7 +819,10 @@ namespace VitaEE
 		__noinline void VitaEeDivSigned(u32 rs, u32 rt)
 		{
 			// PCSX2 owner: R5900OpcodeImpl.cpp::DIV(). Cortex-A9 has no integer
-			// divide instruction, so the generated code calls this helper.
+			// divide instruction, so arbitrary division falls back here.
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuDivSignedHelperCalls;
+#endif
 			if (rs == 0x80000000u && rt == 0xffffffffu)
 			{
 				cpuRegs.LO.SD[0] = static_cast<s32>(0x80000000);
@@ -489,6 +843,9 @@ namespace VitaEE
 		__noinline void VitaEeDivUnsigned(u32 rs, u32 rt)
 		{
 			// PCSX2 owner: R5900OpcodeImpl.cpp::DIVU().
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuDivUnsignedHelperCalls;
+#endif
 			if (rt != 0)
 			{
 				cpuRegs.LO.SD[0] = static_cast<s32>(rs / rt);
@@ -500,13 +857,142 @@ namespace VitaEE
 				cpuRegs.HI.SD[0] = static_cast<s32>(rs);
 			}
 		}
+
+		__noinline void VitaEeDivSigned1(u32 rs, u32 rt)
+		{
+			// PCSX2 owners: MMI.cpp::DIV1() and
+			// x86/ix86-32/iR5900MultDiv.cpp::recDIV1().
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuDivSigned1HelperCalls;
+#endif
+			if (rs == 0x80000000u && rt == 0xffffffffu)
+			{
+				cpuRegs.LO.SD[1] = static_cast<s32>(0x80000000);
+				cpuRegs.HI.SD[1] = 0;
+			}
+			else if (static_cast<s32>(rt) != 0)
+			{
+				cpuRegs.LO.SD[1] = static_cast<s32>(rs) / static_cast<s32>(rt);
+				cpuRegs.HI.SD[1] = static_cast<s32>(rs) % static_cast<s32>(rt);
+			}
+			else
+			{
+				cpuRegs.LO.SD[1] = (static_cast<s32>(rs) < 0) ? 1 : -1;
+				cpuRegs.HI.SD[1] = static_cast<s32>(rs);
+			}
+		}
+
+		__noinline void VitaEeDivUnsigned1(u32 rs, u32 rt)
+		{
+			// PCSX2 owners: MMI.cpp::DIVU1() and
+			// x86/ix86-32/iR5900MultDiv.cpp::recDIVU1().
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuDivUnsigned1HelperCalls;
+#endif
+			if (rt != 0)
+			{
+				cpuRegs.LO.SD[1] = static_cast<s32>(rs / rt);
+				cpuRegs.HI.SD[1] = static_cast<s32>(rs % rt);
+			}
+			else
+			{
+				cpuRegs.LO.SD[1] = -1;
+				cpuRegs.HI.SD[1] = static_cast<s32>(rs);
+			}
+		}
+
+		__noinline void VitaEePackedDivSignedWords(u32 rs0, u32 rt0, u32 rs2, u32 rt2)
+		{
+			// PCSX2 owners: MMI.cpp::PDIVW() and x86/iMMI.cpp::recPDIVW().
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuPackedDivSignedWordHelperCalls;
+#endif
+			const auto divide_lane = [](unsigned lane, u32 rs, u32 rt) {
+				if (rs == 0x80000000u && rt == 0xffffffffu)
+				{
+					cpuRegs.LO.SD[lane] = static_cast<s32>(0x80000000);
+					cpuRegs.HI.SD[lane] = 0;
+				}
+				else if (static_cast<s32>(rt) != 0)
+				{
+					cpuRegs.LO.SD[lane] = static_cast<s32>(rs) / static_cast<s32>(rt);
+					cpuRegs.HI.SD[lane] = static_cast<s32>(rs) % static_cast<s32>(rt);
+				}
+				else
+				{
+					cpuRegs.LO.SD[lane] = (static_cast<s32>(rs) < 0) ? 1 : -1;
+					cpuRegs.HI.SD[lane] = static_cast<s32>(rs);
+				}
+			};
+
+			divide_lane(0, rs0, rt0);
+			divide_lane(1, rs2, rt2);
+		}
+
+		__noinline void VitaEePackedDivUnsignedWords(u32 rs0, u32 rt0, u32 rs2, u32 rt2)
+		{
+			// PCSX2 owners: MMI.cpp::PDIVUW() and x86/iMMI.cpp::recPDIVUW().
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuPackedDivUnsignedWordHelperCalls;
+#endif
+			const auto divide_lane = [](unsigned lane, u32 rs, u32 rt) {
+				if (rt != 0)
+				{
+					cpuRegs.LO.SD[lane] = static_cast<s32>(rs / rt);
+					cpuRegs.HI.SD[lane] = static_cast<s32>(rs % rt);
+				}
+				else
+				{
+					cpuRegs.LO.SD[lane] = -1;
+					cpuRegs.HI.SD[lane] = static_cast<s32>(rs);
+				}
+			};
+
+			divide_lane(0, rs0, rt0);
+			divide_lane(1, rs2, rt2);
+		}
+
+		__noinline void VitaEePackedDivSignedWordsByHalfword(u32 op)
+		{
+			// PCSX2 owner: MMI.cpp::PDIVBW().
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuPackedDivWordByHalfwordHelperCalls;
+#endif
+			const unsigned rs = RS(op);
+			const unsigned rt = RT(op);
+			const u16 raw_divisor = cpuRegs.GPR.r[rt].US[0];
+			const s16 divisor = static_cast<s16>(raw_divisor);
+			for (unsigned lane = 0; lane < 4; lane++)
+			{
+				const s32 dividend = cpuRegs.GPR.r[rs].SL[lane];
+				if (static_cast<u32>(dividend) == 0x80000000u && raw_divisor == 0xffffu)
+				{
+					cpuRegs.LO.SL[lane] = static_cast<s32>(0x80000000);
+					cpuRegs.HI.SL[lane] = 0;
+				}
+				else if (raw_divisor != 0)
+				{
+					cpuRegs.LO.SL[lane] = dividend / divisor;
+					cpuRegs.HI.SL[lane] = dividend % divisor;
+				}
+				else
+				{
+					cpuRegs.LO.SL[lane] = (dividend < 0) ? 1 : -1;
+					cpuRegs.HI.SL[lane] = dividend;
+				}
+			}
+		}
+
 	} // namespace
 
 	static_assert(GprOffset(31) + sizeof(GPR_reg) <= 0x0fff);
-	static_assert(HI_OFFSET + sizeof(u64) <= 0x0fff);
-	static_assert(LO_OFFSET + sizeof(u64) <= 0x0fff);
+	static_assert(HI_OFFSET + sizeof(GPR_reg) <= 0x0fff);
+	static_assert(LO_OFFSET + sizeof(GPR_reg) <= 0x0fff);
+	static_assert(SA_OFFSET + sizeof(u32) <= 0x0fff);
 	static_assert(PC_OFFSET + sizeof(u32) <= 0x0fff);
+	static_assert(CODE_OFFSET + sizeof(u32) <= 0x0fff);
 	static_assert(CYCLE_OFFSET + sizeof(u64) <= 0x0fff);
+	static_assert(BRANCH_OFFSET + sizeof(int) <= 0x0fff);
 	static_assert(NEXT_EVENT_OFFSET + sizeof(u64) <= 0x0fff);
 
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code)
@@ -542,6 +1028,11 @@ namespace VitaEE
 			case 0x0d: // ORI, owned by R5900OpcodeImpl.cpp::ORI().
 			case 0x0e: // XORI, owned by R5900OpcodeImpl.cpp::XORI().
 			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
+				return true;
+			case 0x10: // COP0 helper-backed system ops, owned by COP0.cpp and x86/iCOP0.cpp.
+				return CanCompileCOP0(op);
+			case 0x11: // COP1 helper-backed scalar/control ops, owned by FPU.cpp and x86/iFPU.cpp.
+				return CanCompileCOP1(op);
 			case 0x18: // DADDI, owned by R5900OpcodeImpl.cpp::DADDI().
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
 			case 0x1a: // LDL, owned by R5900OpcodeImpl.cpp::LDL().
@@ -563,13 +1054,19 @@ namespace VitaEE
 			case 0x2c: // SDL, owned by R5900OpcodeImpl.cpp::SDL().
 			case 0x2d: // SDR, owned by R5900OpcodeImpl.cpp::SDR().
 			case 0x2e: // SWR, owned by R5900OpcodeImpl.cpp::SWR().
+				return true;
+			case 0x2f: // CACHE known modes, owned by Cache.cpp::CACHE().
+				return CanCompileCACHE(op);
 			case 0x31: // LWC1, owned by FPU.cpp::LWC1().
+			case 0x33: // PREF, owned by R5900OpcodeImpl.cpp::PREF().
 			case 0x36: // LQC2, owned by VU0.cpp::LQC2().
 			case 0x37: // LD, owned by R5900OpcodeImpl.cpp::LD().
 			case 0x39: // SWC1, owned by FPU.cpp::SWC1().
 			case 0x3e: // SQC2, owned by VU0.cpp::SQC2().
 			case 0x3f: // SD, owned by R5900OpcodeImpl.cpp::SD().
 				return true;
+			case 0x1c: // MMI scalar mult/div extensions, owned by MMI.cpp and iR5900MultDiv.cpp.
+				return CanCompileMMI(op);
 			default:
 				return false;
 		}
@@ -589,7 +1086,20 @@ namespace VitaEE
 						return false;
 				}
 			case 0x01:
-				return CanCompileREGIMM(op);
+				switch (RT(op))
+				{
+					case 0x00: // BLTZ, owned by Interpreter.cpp::BLTZ().
+					case 0x01: // BGEZ, owned by Interpreter.cpp::BGEZ().
+					case 0x02: // BLTZL, owned by Interpreter.cpp::BLTZL().
+					case 0x03: // BGEZL, owned by Interpreter.cpp::BGEZL().
+					case 0x10: // BLTZAL, owned by Interpreter.cpp::BLTZAL().
+					case 0x11: // BGEZAL, owned by Interpreter.cpp::BGEZAL().
+					case 0x12: // BLTZALL, owned by Interpreter.cpp::BLTZALL().
+					case 0x13: // BGEZALL, owned by Interpreter.cpp::BGEZALL().
+						return true;
+					default:
+						return false;
+				}
 			case 0x02: // J, owned by Interpreter.cpp::J().
 			case 0x03: // JAL, owned by Interpreter.cpp::JAL().
 				return true;
@@ -602,6 +1112,19 @@ namespace VitaEE
 			case 0x16: // BLEZL, owned by Interpreter.cpp::BLEZL().
 			case 0x17: // BGTZL, owned by Interpreter.cpp::BGTZL().
 				return true;
+			case 0x11: // COP1_BC1 branch forms, owned by FPU.cpp::BC1F()/BC1T()/BC1FL()/BC1TL().
+				if (((op >> 21) & 0x1f) != 0x08)
+					return false;
+				switch (RT(op))
+				{
+					case 0x00:
+					case 0x01:
+					case 0x02:
+					case 0x03:
+						return true;
+					default:
+						return false;
+				}
 			default:
 				return false;
 		}
@@ -620,17 +1143,29 @@ namespace VitaEE
 		// delay slots through recompileNextInstruction(true, ...): the delay
 		// branch is skipped as generated work and the outer branch still owns
 		// the block exit.
-		return CanCompileOpcode(op) && !RequiresBlockEndAfterOpcode(op);
+		// BREAK is different: R5900OpcodeImpl.cpp::BREAK() is a helper-backed
+		// exception path, and Interpreter.cpp::_doBranch_shared() marks
+		// cpuRegs.branch before executing it as a delay slot.
+		return CanCompileOpcode(op) &&
+			   (!RequiresBlockEndAfterOpcode(op) || IsBREAK(op) || IsCounterReadLoad(op));
 	}
 
 	bool BlockCompiler::RequiresBlockEndAfterOpcode(u32 op)
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp::LB()/LBU()/LH()/LHU()/LW()
 		// force intUpdateCPUCycles() and intEventTest() for EE counter reads.
-		// Ending the Vita block after these loads keeps trace-window recording
-		// aligned with executed instructions.
+		// R5900OpcodeImpl.cpp::SYNC() is a no-op, but local EE docs still forbid
+		// compiling it inside a branch delay slot, so make it a one-op tail.
 		switch (op >> 26)
 		{
+			case 0x00:
+				return (op & 0x3f) == 0x0d || (op & 0x3f) == 0x0f;
+			case 0x10:
+				return CanCompileCOP0(op);
+			case 0x11:
+				return CanCompileCOP1(op);
+			case 0x2f:
+				return IsHelperCACHE(op);
 			case 0x20:
 			case 0x21:
 			case 0x23:
@@ -644,7 +1179,7 @@ namespace VitaEE
 
 	bool BlockCompiler::BeginBlock()
 	{
-		return m_code.EmitPush(REG_R4 | REG_R5 | REG_LR) &&
+		return m_code.EmitPush(REG_R4 | REG_R5 | REG_R6 | REG_LR) &&
 			   m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs)));
 	}
 
@@ -792,6 +1327,15 @@ namespace VitaEE
 						if (!EmitBGTZ(op))
 							return false;
 						break;
+					case 0x11:
+						branch_target_pc = BranchTarget(pc, op);
+						if (branch_is_likely)
+							has_static_likely_direct_links = true;
+						else
+							has_static_conditional_direct_links = true;
+						if (!EmitCop1Branch(op))
+							return false;
+						break;
 					case 0x14:
 						branch_target_pc = BranchTarget(pc, op);
 						has_static_likely_direct_links = true;
@@ -846,8 +1390,43 @@ namespace VitaEE
 				return false;
 
 			add_raw_cycles(op);
-			if (!EmitOpcode(op, pc, raw_cycles, event_exit))
+			const bool branch_delay_slot = has_branch && i == branch_instruction_index + 1;
+			if (!EmitOpcode(op, pc, raw_cycles, event_exit, branch_delay_slot))
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				std::printf("a32-block-compile-failed index=%u pc=%08x op=%08x code=%zu\n",
+					i, pc, op, m_code.Size());
+#endif
 				return false;
+			}
+
+			if (IsBREAK(op) && !branch_delay_slot)
+			{
+				if (scaled_cycles)
+					*scaled_cycles = ScaleBlockCycles(raw_cycles);
+				return true;
+			}
+
+			if ((op >> 26) == 0x10 && CanCompileCOP0(op))
+			{
+				if (scaled_cycles)
+					*scaled_cycles = ScaleBlockCycles(raw_cycles);
+				return true;
+			}
+
+			if ((op >> 26) == 0x11 && CanCompileCOP1(op))
+			{
+				if (scaled_cycles)
+					*scaled_cycles = ScaleBlockCycles(raw_cycles);
+				return true;
+			}
+
+			if ((op >> 26) == 0x2f && IsHelperCACHE(op))
+			{
+				if (scaled_cycles)
+					*scaled_cycles = ScaleBlockCycles(raw_cycles);
+				return true;
+			}
 
 			if (has_branch && branch_is_likely && i == branch_instruction_index + 1)
 			{
@@ -934,12 +1513,15 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::EmitOpcode(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	bool BlockCompiler::EmitOpcode(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
 	{
 		switch (op >> 26)
 		{
 			case 0x00:
-				return EmitSPECIAL(op);
+				return EmitSPECIAL(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
+			case 0x01: // REGIMM, including MTSAB/MTSAH from R5900OpcodeImpl.cpp.
+				return EmitREGIMM(op, pc);
 			case 0x08: // ADDI, owned by R5900OpcodeImpl.cpp::ADDI(). The PCSX2
 				// recompiler owner x86/ix86-32/iR5900AritImm.cpp::recADDI_() drops
 				// the integer-overflow exception, so ADDI compiles exactly like ADDIU.
@@ -958,6 +1540,10 @@ namespace VitaEE
 				return EmitXORI(op);
 			case 0x0f: // LUI, owned by R5900OpcodeImpl.cpp::LUI().
 				return EmitLUI(op);
+			case 0x10: // COP0 helper-backed system ops, owned by COP0.cpp and x86/iCOP0.cpp.
+				return EmitCOP0(op, pc, raw_cycles_through_instruction, event_exit);
+			case 0x11: // COP1 helper-backed scalar/control ops, owned by FPU.cpp and x86/iFPU.cpp.
+				return EmitCOP1(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x18: // DADDI, owned by R5900OpcodeImpl.cpp::DADDI(); overflow trap
 				// dropped by x86/ix86-32/iR5900AritImm.cpp::recDADDI(), compiled as DADDIU.
 				return EmitDADDIU(op);
@@ -967,22 +1553,24 @@ namespace VitaEE
 				return EmitLDL(op);
 			case 0x1b: // LDR, owned by R5900OpcodeImpl.cpp::LDR().
 				return EmitLDR(op);
+			case 0x1c: // MMI scalar mult/div extensions, owned by MMI.cpp and iR5900MultDiv.cpp.
+				return EmitMMI(op);
 			case 0x1e: // LQ, owned by R5900OpcodeImpl.cpp::LQ().
 				return EmitLQ(op);
 			case 0x1f: // SQ, owned by R5900OpcodeImpl.cpp::SQ().
 				return EmitSQ(op);
 			case 0x20: // LB, owned by R5900OpcodeImpl.cpp::LB().
-				return EmitLB(op, pc, raw_cycles_through_instruction, event_exit);
+				return EmitLB(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
 			case 0x21: // LH, owned by R5900OpcodeImpl.cpp::LH().
-				return EmitLH(op, pc, raw_cycles_through_instruction, event_exit);
+				return EmitLH(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
 			case 0x22: // LWL, owned by R5900OpcodeImpl.cpp::LWL().
 				return EmitLWL(op);
 			case 0x23: // LW, owned by R5900OpcodeImpl.cpp::LW().
-				return EmitLW(op, pc, raw_cycles_through_instruction, event_exit);
+				return EmitLW(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
 			case 0x24: // LBU, owned by R5900OpcodeImpl.cpp::LBU().
-				return EmitLBU(op, pc, raw_cycles_through_instruction, event_exit);
+				return EmitLBU(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
 			case 0x25: // LHU, owned by R5900OpcodeImpl.cpp::LHU().
-				return EmitLHU(op, pc, raw_cycles_through_instruction, event_exit);
+				return EmitLHU(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
 			case 0x26: // LWR, owned by R5900OpcodeImpl.cpp::LWR().
 				return EmitLWR(op);
 			case 0x27: // LWU, owned by R5900OpcodeImpl.cpp::LWU().
@@ -1001,8 +1589,12 @@ namespace VitaEE
 				return EmitSDR(op);
 			case 0x2e: // SWR, owned by R5900OpcodeImpl.cpp::SWR().
 				return EmitSWR(op);
+			case 0x2f: // CACHE, owned by Cache.cpp::CACHE().
+				return EmitCACHE(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x31: // LWC1, owned by FPU.cpp::LWC1().
 				return EmitLWC1(op);
+			case 0x33: // PREF, owned by R5900OpcodeImpl.cpp::PREF(); PCSX2 no-ops it.
+				return true;
 			case 0x36: // LQC2, owned by VU0.cpp::LQC2().
 				return EmitLQC2(op);
 			case 0x37: // LD, owned by R5900OpcodeImpl.cpp::LD().
@@ -1021,7 +1613,7 @@ namespace VitaEE
 	bool BlockCompiler::EndBlockReturn(u8 value)
 	{
 		return m_code.EmitMovImm8(0, value) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_PC);
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
 	}
 
 	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
@@ -1069,7 +1661,7 @@ namespace VitaEE
 			return false;
 
 		if (!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(REG_R4 | REG_R5 | REG_PC))
+			!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC))
 		{
 			return false;
 		}
@@ -1087,7 +1679,7 @@ namespace VitaEE
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+			if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
 				return false;
 
 			const size_t fallthrough_target_offset = m_code.Size();
@@ -1099,7 +1691,7 @@ namespace VitaEE
 
 			const size_t taken_tail_target = m_code.Size();
 			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) ||
-				!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+				!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
 			{
 				return false;
 			}
@@ -1118,7 +1710,7 @@ namespace VitaEE
 			return true;
 		}
 
-		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
 			return false;
 
 		const size_t target_offset = m_code.Size();
@@ -1205,7 +1797,7 @@ namespace VitaEE
 			return false;
 
 		if (!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(REG_R4 | REG_R5 | REG_PC))
+			!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC))
 		{
 			return false;
 		}
@@ -1223,7 +1815,7 @@ namespace VitaEE
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+			if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
 				return false;
 
 			const size_t not_taken_target_offset = m_code.Size();
@@ -1235,7 +1827,7 @@ namespace VitaEE
 
 			const size_t taken_tail_target = m_code.Size();
 			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) ||
-				!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+				!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
 			{
 				return false;
 			}
@@ -1255,7 +1847,7 @@ namespace VitaEE
 			return true;
 		}
 
-		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_LR))
+		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
 			return false;
 
 		return m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) &&
@@ -1263,7 +1855,8 @@ namespace VitaEE
 			   m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI);
 	}
 
-	bool BlockCompiler::EmitSPECIAL(u32 op)
+	bool BlockCompiler::EmitSPECIAL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
 	{
 		switch (op & 0x3f)
 		{
@@ -1283,6 +1876,10 @@ namespace VitaEE
 				return EmitMOVZ(op);
 			case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
 				return EmitMOVN(op);
+			case 0x0d: // BREAK, owned by R5900OpcodeImpl.cpp::BREAK().
+				return EmitBREAK(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
+			case 0x0f: // SYNC, owned by R5900OpcodeImpl.cpp::SYNC(); PCSX2 no-ops it.
+				return true;
 			case 0x10: // MFHI, owned by R5900OpcodeImpl.cpp::MFHI().
 				return EmitMFHI(op);
 			case 0x11: // MTHI, owned by R5900OpcodeImpl.cpp::MTHI().
@@ -1353,6 +1950,148 @@ namespace VitaEE
 			default:
 				return false;
 		}
+	}
+
+	bool BlockCompiler::EmitCOP0(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+		// PCSX2 owner: x86/iCOP0.cpp helper-calls COP0.cpp for these operations.
+		// MFC0/MTC0 use REC_SYS(), while ERET/EI use branch/event tails.
+		using namespace R5900::Interpreter::OpcodeImpl::COP0;
+		switch ((op >> 21) & 0x1f)
+		{
+			case 0x00: // MFC0, owned by COP0.cpp::MFC0().
+				return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+					reinterpret_cast<const void*>(&MFC0), event_exit);
+			case 0x04: // MTC0, owned by COP0.cpp::MTC0().
+				return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+					reinterpret_cast<const void*>(&MTC0), event_exit);
+			case 0x10: // COP0_C0 class, owned by R5900OpcodeTables.cpp::tbl_COP0_C0.
+				switch (op & 0x3f)
+				{
+					case 0x01: // TLBR, owned by COP0.cpp::TLBR().
+						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+							reinterpret_cast<const void*>(&TLBR), event_exit);
+					case 0x02: // TLBWI, owned by COP0.cpp::TLBWI().
+						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+							reinterpret_cast<const void*>(&TLBWI), event_exit, true);
+					case 0x06: // TLBWR, owned by COP0.cpp::TLBWR().
+						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+							reinterpret_cast<const void*>(&TLBWR), event_exit, true);
+					case 0x08: // TLBP, owned by COP0.cpp::TLBP().
+						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+							reinterpret_cast<const void*>(&TLBP), event_exit);
+					case 0x18: // ERET, owned by COP0.cpp::ERET().
+						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+							reinterpret_cast<const void*>(&ERET), event_exit);
+					case 0x38: // EI, owned by COP0.cpp::EI().
+						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+							reinterpret_cast<const void*>(&EI), event_exit);
+					default:
+						return false;
+				}
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitCOP1(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+		// PCSX2 owner: x86/iFPU.cpp helper-calls FPU.cpp for COP1 fallbacks; the
+		// Vita native FPU fast path will replace this one-op event tail later.
+		using namespace R5900::Interpreter::OpcodeImpl::COP1;
+		const void* helper = nullptr;
+
+		switch ((op >> 21) & 0x1f)
+		{
+			case 0x00: // MFC1, owned by FPU.cpp::MFC1().
+				helper = reinterpret_cast<const void*>(&MFC1);
+				break;
+			case 0x02: // CFC1, owned by FPU.cpp::CFC1().
+				helper = reinterpret_cast<const void*>(&CFC1);
+				break;
+			case 0x04: // MTC1, owned by FPU.cpp::MTC1().
+				helper = reinterpret_cast<const void*>(&MTC1);
+				break;
+			case 0x06: // CTC1, owned by FPU.cpp::CTC1().
+				helper = reinterpret_cast<const void*>(&CTC1);
+				break;
+			case 0x10: // COP1_S class, owned by R5900OpcodeTables.cpp::tbl_COP1_S.
+				switch (op & 0x3f)
+				{
+					case 0x00: helper = reinterpret_cast<const void*>(&ADD_S); break;
+					case 0x01: helper = reinterpret_cast<const void*>(&SUB_S); break;
+					case 0x02: helper = reinterpret_cast<const void*>(&MUL_S); break;
+					case 0x03: helper = reinterpret_cast<const void*>(&DIV_S); break;
+					case 0x04: helper = reinterpret_cast<const void*>(&SQRT_S); break;
+					case 0x05: helper = reinterpret_cast<const void*>(&ABS_S); break;
+					case 0x06: helper = reinterpret_cast<const void*>(&MOV_S); break;
+					case 0x07: helper = reinterpret_cast<const void*>(&NEG_S); break;
+					case 0x16: helper = reinterpret_cast<const void*>(&RSQRT_S); break;
+					case 0x18: helper = reinterpret_cast<const void*>(&ADDA_S); break;
+					case 0x19: helper = reinterpret_cast<const void*>(&SUBA_S); break;
+					case 0x1a: helper = reinterpret_cast<const void*>(&MULA_S); break;
+					case 0x1c: helper = reinterpret_cast<const void*>(&MADD_S); break;
+					case 0x1d: helper = reinterpret_cast<const void*>(&MSUB_S); break;
+					case 0x1e: helper = reinterpret_cast<const void*>(&MADDA_S); break;
+					case 0x1f: helper = reinterpret_cast<const void*>(&MSUBA_S); break;
+					case 0x24: helper = reinterpret_cast<const void*>(&CVT_W); break;
+					case 0x28: helper = reinterpret_cast<const void*>(&MAX_S); break;
+					case 0x29: helper = reinterpret_cast<const void*>(&MIN_S); break;
+					case 0x30: helper = reinterpret_cast<const void*>(&C_F); break;
+					case 0x32: helper = reinterpret_cast<const void*>(&C_EQ); break;
+					case 0x34: helper = reinterpret_cast<const void*>(&C_LT); break;
+					case 0x36: helper = reinterpret_cast<const void*>(&C_LE); break;
+					default:
+						return false;
+				}
+				break;
+			case 0x14: // COP1_W class, owned by R5900OpcodeTables.cpp::tbl_COP1_W.
+				if ((op & 0x3f) == 0x20)
+					helper = reinterpret_cast<const void*>(&CVT_S);
+				else
+					return false;
+				break;
+			default:
+				return false;
+		}
+
+		return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction, helper, event_exit);
+	}
+
+	bool BlockCompiler::EmitCACHE(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+		if (IsNoOpCACHE(op))
+			return true;
+
+		if (!IsHelperCACHE(op))
+			return false;
+
+		using namespace R5900::Interpreter::OpcodeImpl;
+		return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+			reinterpret_cast<const void*>(&CACHE), event_exit);
+	}
+
+	bool BlockCompiler::EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
+	{
+		if (!event_exit || raw_cycles_through_instruction == 0)
+			return false;
+
+		using namespace R5900::Interpreter::OpcodeImpl;
+		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
+		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
+			!EmitStorePc(pc + 4) ||
+			!m_code.EmitMovImm8(HOST_TMP0, branch_delay_slot ? 1 : 0) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(BRANCH_OFFSET)) ||
+			!EmitAddScaledCyclesToCpu(cycles) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&BREAK)))
+		{
+			return false;
+		}
+
+		return m_code.EmitCallAbsolute(event_exit) &&
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
 	}
 
 	bool BlockCompiler::EmitADDIU(u32 op)
@@ -1579,23 +2318,79 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitMULT(u32 op)
 	{
-		return EmitMultiply(op, true);
+		return EmitMultiply(op, true, false);
 	}
 
 	bool BlockCompiler::EmitMULTU(u32 op)
 	{
-		return EmitMultiply(op, false);
+		return EmitMultiply(op, false, false);
 	}
 
-	bool BlockCompiler::EmitMultiply(u32 op, bool signed_multiply)
+	bool BlockCompiler::EmitMADD(u32 op)
 	{
-		// PCSX2 owners: R5900OpcodeImpl.cpp::MULT()/MULTU() and
-		// x86/ix86-32/iR5900MultDiv.cpp::recMULT()/recMULTU(). Both forms
-		// sign-extend the 32-bit LO/HI halves into 64 bits, and the EE
-		// three-operand form writes LO into rd as well.
+		return EmitMultiplyAdd(op, true, false);
+	}
+
+	bool BlockCompiler::EmitMADDU(u32 op)
+	{
+		return EmitMultiplyAdd(op, false, false);
+	}
+
+	bool BlockCompiler::EmitMADD1(u32 op)
+	{
+		return EmitMultiplyAdd(op, true, true);
+	}
+
+	bool BlockCompiler::EmitMADDU1(u32 op)
+	{
+		return EmitMultiplyAdd(op, false, true);
+	}
+
+	bool BlockCompiler::EmitMFHI1(u32 op)
+	{
+		// PCSX2 owner: MMI.cpp::MFHI1().
+		return EmitMoveFromHiLo(op, HiloLaneOffset(HI_OFFSET, true));
+	}
+
+	bool BlockCompiler::EmitMFLO1(u32 op)
+	{
+		// PCSX2 owner: MMI.cpp::MFLO1().
+		return EmitMoveFromHiLo(op, HiloLaneOffset(LO_OFFSET, true));
+	}
+
+	bool BlockCompiler::EmitMTHI1(u32 op)
+	{
+		// PCSX2 owner: MMI.cpp::MTHI1().
+		return EmitMoveToHiLo(op, HiloLaneOffset(HI_OFFSET, true));
+	}
+
+	bool BlockCompiler::EmitMTLO1(u32 op)
+	{
+		// PCSX2 owner: MMI.cpp::MTLO1().
+		return EmitMoveToHiLo(op, HiloLaneOffset(LO_OFFSET, true));
+	}
+
+	bool BlockCompiler::EmitMULT1(u32 op)
+	{
+		return EmitMultiply(op, true, true);
+	}
+
+	bool BlockCompiler::EmitMULTU1(u32 op)
+	{
+		return EmitMultiply(op, false, true);
+	}
+
+	bool BlockCompiler::EmitMultiply(u32 op, bool signed_multiply, bool upper_pipeline)
+	{
+		// PCSX2 owners: R5900OpcodeImpl.cpp::MULT()/MULTU(), MMI.cpp::MULT1()/MULTU1(),
+		// and x86/ix86-32/iR5900MultDiv.cpp::recMULT*(). All forms sign-extend
+		// the 32-bit LO/HI halves into their 64-bit lanes, and the EE
+		// three-operand form writes the selected LO lane into rd as well.
 		const unsigned rs = RS(op);
 		const unsigned rt = RT(op);
 		const unsigned rd = RD(op);
+		const size_t lo_offset = HiloLaneOffset(LO_OFFSET, upper_pipeline);
+		const size_t hi_offset = HiloLaneOffset(HI_OFFSET, upper_pipeline);
 
 		if (!EmitLoadGprLow(rs, HOST_TMP0) ||
 			!EmitLoadGprLow(rt, HOST_TMP1))
@@ -1615,8 +2410,8 @@ namespace VitaEE
 		}
 
 		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP2, VitaA32::ShiftType::ASR, 31) ||
-			!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(LO_OFFSET)) ||
-			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(LO_OFFSET + sizeof(u32))))
+			!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_offset + sizeof(u32))))
 		{
 			return false;
 		}
@@ -1625,26 +2420,483 @@ namespace VitaEE
 			return false;
 
 		return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3, VitaA32::ShiftType::ASR, 31) &&
-			   m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(HI_OFFSET)) &&
-			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(HI_OFFSET + sizeof(u32)));
+			   m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(hi_offset)) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hi_offset + sizeof(u32)));
+	}
+
+	bool BlockCompiler::EmitMultiplyAdd(u32 op, bool signed_multiply, bool upper_pipeline)
+	{
+		// PCSX2 owners: MMI.cpp::MADD()/MADDU()/MADD1()/MADDU1() and
+		// x86/ix86-32/iR5900MultDiv.cpp::recMADD*(). The accumulator is the
+		// raw 64-bit value formed from LO.UL[lane*2] and HI.UL[lane*2]; the
+		// writeback stores each 32-bit result half as a sign-extended 64-bit lane.
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+		const size_t lo_offset = HiloLaneOffset(LO_OFFSET, upper_pipeline);
+		const size_t hi_offset = HiloLaneOffset(HI_OFFSET, upper_pipeline);
+
+		if (!EmitLoadGprLow(rs, HOST_TMP0) ||
+			!EmitLoadGprLow(rt, HOST_TMP1))
+		{
+			return false;
+		}
+
+		if (signed_multiply)
+		{
+			if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+				return false;
+		}
+		else
+		{
+			if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+				return false;
+		}
+
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(hi_offset)) ||
+			!m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP0, true) ||
+			!m_code.EmitAdcReg(HOST_TMP3, HOST_TMP3, HOST_TMP1))
+		{
+			return false;
+		}
+
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP2, VitaA32::ShiftType::ASR, 31) ||
+			!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_offset + sizeof(u32))))
+		{
+			return false;
+		}
+
+		if (rd != 0 && !EmitStoreGpr64(rd, HOST_TMP2, HOST_TMP0))
+			return false;
+
+		return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3, VitaA32::ShiftType::ASR, 31) &&
+			   m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(hi_offset)) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hi_offset + sizeof(u32)));
 	}
 
 	bool BlockCompiler::EmitDIV(u32 op)
 	{
-		// PCSX2 owner: R5900OpcodeImpl.cpp::DIV(). The Cortex-A9 has no
-		// integer divide instruction, so the quotient/remainder and the
-		// divide-by-zero/overflow special cases run in the helper.
-		return EmitLoadGprLow(RS(op), HOST_TMP0) &&
-			   EmitLoadGprLow(RT(op), HOST_TMP1) &&
-			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeDivSigned));
+		// PCSX2 owner: R5900OpcodeImpl.cpp::DIV(). Cortex-A9 has no integer
+		// divide, so no-divide and positive power-of-two cases are direct and
+		// arbitrary division keeps the exact PCSX2 helper semantics.
+		return EmitScalarDivide(op, true, false);
 	}
 
 	bool BlockCompiler::EmitDIVU(u32 op)
 	{
 		// PCSX2 owner: R5900OpcodeImpl.cpp::DIVU().
-		return EmitLoadGprLow(RS(op), HOST_TMP0) &&
-			   EmitLoadGprLow(RT(op), HOST_TMP1) &&
-			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeDivUnsigned));
+		return EmitScalarDivide(op, false, false);
+	}
+
+	bool BlockCompiler::EmitDIV1(u32 op)
+	{
+		// PCSX2 owners: MMI.cpp::DIV1() and x86/ix86-32/iR5900MultDiv.cpp::recDIV1().
+		return EmitScalarDivide(op, true, true);
+	}
+
+	bool BlockCompiler::EmitDIVU1(u32 op)
+	{
+		// PCSX2 owners: MMI.cpp::DIVU1() and x86/ix86-32/iR5900MultDiv.cpp::recDIVU1().
+		return EmitScalarDivide(op, false, true);
+	}
+
+	bool BlockCompiler::EmitScalarDivide(u32 op, bool signed_divide, bool upper_pipeline)
+	{
+		struct BranchPatch
+		{
+			size_t offset = static_cast<size_t>(-1);
+			VitaA32::Condition condition = VitaA32::Condition::AL;
+		};
+
+		const auto emit_branch = [this](BranchPatch& patch, VitaA32::Condition condition) {
+			patch.offset = m_code.EmitBranchPlaceholder(condition);
+			patch.condition = condition;
+			return patch.offset != static_cast<size_t>(-1);
+		};
+
+		const auto patch_branch = [this](const BranchPatch& patch, size_t target) {
+			return m_code.PatchBranch(patch.offset, target, patch.condition);
+		};
+
+		const auto patch_branches = [patch_branch](const BranchPatch* branches, unsigned count, size_t target) {
+			for (unsigned i = 0; i < count; i++)
+			{
+				if (!patch_branch(branches[i], target))
+					return false;
+			}
+			return true;
+		};
+
+		const auto store_signed_word_as_doubleword = [this](unsigned value_reg, size_t offset) {
+			return m_code.EmitMovRegShiftImm(HOST_TMP4, value_reg, VitaA32::ShiftType::ASR, 31) &&
+				   m_code.EmitStrImm12(value_reg, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+				   m_code.EmitStrImm12(HOST_TMP4, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+		};
+
+		const size_t lo_offset = HiloLaneOffset(LO_OFFSET, upper_pipeline);
+		const size_t hi_offset = HiloLaneOffset(HI_OFFSET, upper_pipeline);
+		const void* helper = nullptr;
+		if (signed_divide)
+		{
+			helper = upper_pipeline ?
+						 reinterpret_cast<const void*>(&VitaEeDivSigned1) :
+						 reinterpret_cast<const void*>(&VitaEeDivSigned);
+		}
+		else
+		{
+			helper = upper_pipeline ?
+						 reinterpret_cast<const void*>(&VitaEeDivUnsigned1) :
+						 reinterpret_cast<const void*>(&VitaEeDivUnsigned);
+		}
+
+		if (!EmitLoadGprLow(RS(op), HOST_TMP0) ||
+			!EmitLoadGprLow(RT(op), HOST_TMP1))
+		{
+			return false;
+		}
+
+		BranchPatch divzero_branch{};
+		BranchPatch zero_branch{};
+		BranchPatch divone_branch{};
+		BranchPatch negone_or_below_branch{};
+		BranchPatch equal_branch{};
+		BranchPatch power_of_two_branch{};
+		BranchPatch fallback_branch{};
+		BranchPatch done_branches[6]{};
+		unsigned done_branch_count = 0;
+
+		if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+			!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
+			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+			!emit_branch(zero_branch, VitaA32::Condition::EQ) ||
+			!m_code.EmitMovImm8(HOST_TMP3, 1) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+			!emit_branch(divone_branch, VitaA32::Condition::EQ))
+		{
+			return false;
+		}
+
+		if (signed_divide)
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP3, 0xffffffffu) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!emit_branch(negone_or_below_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) ||
+				!emit_branch(equal_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitEorReg(HOST_TMP2, HOST_TMP1, HOST_TMP3) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP3) ||
+				!m_code.EmitSubImm8(HOST_TMP3, HOST_TMP2, 1) ||
+				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP2, HOST_TMP3, true) ||
+				!emit_branch(power_of_two_branch, VitaA32::Condition::EQ))
+			{
+				return false;
+			}
+		}
+		else if (!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) ||
+				 !emit_branch(negone_or_below_branch, VitaA32::Condition::CC) ||
+				 !emit_branch(equal_branch, VitaA32::Condition::EQ) ||
+				 !m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
+				 !m_code.EmitAndReg(HOST_TMP2, HOST_TMP1, HOST_TMP2, true) ||
+				 !emit_branch(power_of_two_branch, VitaA32::Condition::EQ))
+		{
+			return false;
+		}
+
+		if (!emit_branch(fallback_branch, VitaA32::Condition::AL))
+			return false;
+
+		if (!patch_branch(divzero_branch, m_code.Size()) ||
+			!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu))
+		{
+			return false;
+		}
+
+		if (signed_divide &&
+			(!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT)))
+		{
+			return false;
+		}
+
+		if (!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+			!store_signed_word_as_doubleword(HOST_TMP0, hi_offset) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (!patch_branch(zero_branch, m_code.Size()) ||
+			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+			!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+			!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (!patch_branch(divone_branch, m_code.Size()) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+			!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+			!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (signed_divide)
+		{
+			if (!patch_branch(negone_or_below_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP3, HOST_TMP0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
+				!patch_branch(equal_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 1) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
+				!patch_branch(power_of_two_branch, m_code.Size()) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP0, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitEorReg(HOST_TMP4, HOST_TMP1, HOST_TMP2) ||
+				!m_code.EmitSubReg(HOST_TMP4, HOST_TMP4, HOST_TMP2) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP4, 1) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP3, HOST_TMP2) ||
+				!m_code.EmitAddReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitClz(HOST_TMP4, HOST_TMP4) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 31) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP4, HOST_TMP3, VitaA32::ShiftType::ASR, HOST_TMP2) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_TMP4, VitaA32::ShiftType::LSL, HOST_TMP2) ||
+				!m_code.EmitSubReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitEorReg(HOST_TMP4, HOST_TMP4, HOST_TMP2) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP4, HOST_TMP2) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP3, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			if (!patch_branch(negone_or_below_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP0, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
+				!patch_branch(equal_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 1) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
+				!patch_branch(power_of_two_branch, m_code.Size()) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
+				!m_code.EmitClz(HOST_TMP2, HOST_TMP1) ||
+				!m_code.EmitMovImm8(HOST_TMP4, 31) ||
+				!m_code.EmitSubReg(HOST_TMP4, HOST_TMP4, HOST_TMP2) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR, HOST_TMP4) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP3, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+		}
+
+		if (!patch_branch(fallback_branch, m_code.Size()) ||
+			!m_code.EmitCallAbsolute(helper))
+		{
+			return false;
+		}
+
+		return patch_branches(done_branches, done_branch_count, m_code.Size());
+	}
+
+	bool BlockCompiler::EmitPLZCW(u32 op)
+	{
+		// PCSX2 owner: MMI.cpp::PLZCW(), which writes only RD.UL[0]/[1] with
+		// the leading sign-bit count of RS.SL[0]/[1], excluding the sign bit.
+		const unsigned rd = RD(op);
+		if (rd == 0)
+			return true;
+
+		const size_t rd_offset = GprOffset(rd);
+		const auto emit_lane = [this, rd_offset](unsigned word, unsigned value_reg) {
+			return m_code.EmitMovRegShiftImm(HOST_TMP2, value_reg, VitaA32::ShiftType::ASR, 31) &&
+				   m_code.EmitEorReg(value_reg, value_reg, HOST_TMP2) &&
+				   m_code.EmitClz(value_reg, value_reg) &&
+				   m_code.EmitSubImm8(value_reg, value_reg, 1) &&
+				   m_code.EmitStrImm12(value_reg, HOST_CPU_REGS,
+					   static_cast<u16>(rd_offset + word * sizeof(u32)));
+		};
+
+		return EmitLoadGpr64(RS(op), HOST_TMP0, HOST_TMP1) &&
+			   emit_lane(0, HOST_TMP0) &&
+			   emit_lane(1, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitPMFHL(u32 op)
+	{
+		// PCSX2 owner: MMI.cpp::PMFHL(). Mode 2 saturates the signed 64-bit
+		// LO/HI pair into a sign-extended signed 32-bit doubleword.
+		const unsigned rd = RD(op);
+		if (rd == 0)
+			return true;
+
+		const size_t rd_offset = GprOffset(rd);
+		const auto emit_word_move = [this, rd_offset](size_t source_offset, unsigned dst_word) {
+			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(source_offset)) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS,
+					   static_cast<u16>(rd_offset + dst_word * sizeof(u32)));
+		};
+		const auto emit_halfword_pack = [this, rd_offset](size_t first_offset, size_t second_offset,
+										  unsigned dst_word, bool saturate) {
+			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(first_offset)) ||
+				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(second_offset)))
+			{
+				return false;
+			}
+
+			if (saturate &&
+				(!m_code.EmitSsat(HOST_TMP0, 16, HOST_TMP0) ||
+				 !m_code.EmitSsat(HOST_TMP1, 16, HOST_TMP1)))
+			{
+				return false;
+			}
+
+			return m_code.EmitPkhbt(HOST_TMP0, HOST_TMP0, HOST_TMP1, 16) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS,
+					   static_cast<u16>(rd_offset + dst_word * sizeof(u32)));
+		};
+		const auto emit_saturating_word = [this, rd_offset](size_t lo_offset, size_t hi_offset,
+											unsigned dst_doubleword) {
+			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
+				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(hi_offset)) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2))
+			{
+				return false;
+			}
+
+			const size_t no_overflow = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (no_overflow == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3))
+			{
+				return false;
+			}
+
+			const size_t negative_overflow = m_code.EmitBranchPlaceholder(VitaA32::Condition::LT);
+			if (negative_overflow == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitMovImm32(HOST_TMP0, 0x7fffffffu) ||
+				!m_code.EmitMovImm8(HOST_TMP1, 0))
+			{
+				return false;
+			}
+
+			const size_t positive_done = m_code.EmitBranchPlaceholder();
+			if (positive_done == static_cast<size_t>(-1) ||
+				!m_code.PatchBranch(negative_overflow, m_code.Size(), VitaA32::Condition::LT))
+			{
+				return false;
+			}
+
+			if (!m_code.EmitMovImm32(HOST_TMP0, 0x80000000u) ||
+				!m_code.EmitMovImm32(HOST_TMP1, 0xffffffffu))
+			{
+				return false;
+			}
+
+			const size_t negative_done = m_code.EmitBranchPlaceholder();
+			if (negative_done == static_cast<size_t>(-1) ||
+				!m_code.PatchBranch(no_overflow, m_code.Size(), VitaA32::Condition::EQ))
+			{
+				return false;
+			}
+
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP2, VitaA32::ShiftType::LSL, 0) ||
+				!m_code.PatchBranch(positive_done, m_code.Size()) ||
+				!m_code.PatchBranch(negative_done, m_code.Size()))
+			{
+				return false;
+			}
+
+			return m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS,
+					   static_cast<u16>(rd_offset + dst_doubleword * sizeof(u64))) &&
+				   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS,
+					   static_cast<u16>(rd_offset + dst_doubleword * sizeof(u64) + sizeof(u32)));
+		};
+
+		switch (SA(op))
+		{
+			case 0x00: // LW
+				return emit_word_move(LO_OFFSET, 0) &&
+					   emit_word_move(HI_OFFSET, 1) &&
+					   emit_word_move(LO_OFFSET + 2 * sizeof(u32), 2) &&
+					   emit_word_move(HI_OFFSET + 2 * sizeof(u32), 3);
+			case 0x01: // UW
+				return emit_word_move(LO_OFFSET + sizeof(u32), 0) &&
+					   emit_word_move(HI_OFFSET + sizeof(u32), 1) &&
+					   emit_word_move(LO_OFFSET + 3 * sizeof(u32), 2) &&
+					   emit_word_move(HI_OFFSET + 3 * sizeof(u32), 3);
+			case 0x02: // SLW
+				return emit_saturating_word(LO_OFFSET, HI_OFFSET, 0) &&
+					   emit_saturating_word(LO_OFFSET + 2 * sizeof(u32), HI_OFFSET + 2 * sizeof(u32), 1);
+			case 0x03: // LH
+				return emit_halfword_pack(LO_OFFSET, LO_OFFSET + sizeof(u32), 0, false) &&
+					   emit_halfword_pack(HI_OFFSET, HI_OFFSET + sizeof(u32), 1, false) &&
+					   emit_halfword_pack(LO_OFFSET + 2 * sizeof(u32), LO_OFFSET + 3 * sizeof(u32), 2, false) &&
+					   emit_halfword_pack(HI_OFFSET + 2 * sizeof(u32), HI_OFFSET + 3 * sizeof(u32), 3, false);
+			case 0x04: // SH
+				return emit_halfword_pack(LO_OFFSET, LO_OFFSET + sizeof(u32), 0, true) &&
+					   emit_halfword_pack(HI_OFFSET, HI_OFFSET + sizeof(u32), 1, true) &&
+					   emit_halfword_pack(LO_OFFSET + 2 * sizeof(u32), LO_OFFSET + 3 * sizeof(u32), 2, true) &&
+					   emit_halfword_pack(HI_OFFSET + 2 * sizeof(u32), HI_OFFSET + 3 * sizeof(u32), 3, true);
+			default:
+				return true;
+		}
+	}
+
+	bool BlockCompiler::EmitPMTHL(u32 op)
+	{
+		// PCSX2 owner: MMI.cpp::PMTHL(), which only changes LO/HI for SA == 0.
+		if (SA(op) != 0)
+			return true;
+
+		const unsigned rs = RS(op);
+		const auto emit_load_source_word = [this, rs](unsigned dst_reg, unsigned source_word) {
+			if (rs == 0)
+				return m_code.EmitMovImm8(dst_reg, 0);
+
+			return m_code.EmitLdrImm12(dst_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(rs) + source_word * sizeof(u32)));
+		};
+		const auto emit_move_word = [this, &emit_load_source_word](unsigned source_word, size_t dst_offset) {
+			return emit_load_source_word(HOST_TMP0, source_word) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(dst_offset));
+		};
+
+		return emit_move_word(0, LO_OFFSET) &&
+			   emit_move_word(1, HI_OFFSET) &&
+			   emit_move_word(2, LO_OFFSET + 2 * sizeof(u32)) &&
+			   emit_move_word(3, HI_OFFSET + 2 * sizeof(u32));
 	}
 
 	bool BlockCompiler::EmitMFHI(u32 op)
@@ -1689,6 +2941,2791 @@ namespace VitaEE
 			   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(hilo_offset + sizeof(u32)));
 	}
 
+	bool BlockCompiler::EmitMoveFullFromHiLo(u32 op, size_t hilo_offset)
+	{
+		const unsigned rd = RD(op);
+		if (rd == 0)
+			return true;
+
+		constexpr unsigned NEON_VALUE = 0;
+		const auto emit_cpu_regs_address = [this](unsigned host_reg, size_t offset) {
+			if (offset <= 255)
+				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
+				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+		};
+
+		return emit_cpu_regs_address(HOST_TMP0, hilo_offset) &&
+			   m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) &&
+			   emit_cpu_regs_address(HOST_TMP1, GprOffset(rd)) &&
+			   m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitMoveFullToHiLo(u32 op, size_t hilo_offset)
+	{
+		const unsigned rs = RS(op);
+
+		constexpr unsigned NEON_VALUE = 0;
+		const auto emit_cpu_regs_address = [this](unsigned host_reg, size_t offset) {
+			if (offset <= 255)
+				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
+				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+		};
+
+		if (rs == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_VALUE, NEON_VALUE, NEON_VALUE))
+				return false;
+		}
+		else if (!emit_cpu_regs_address(HOST_TMP0, GprOffset(rs)) ||
+				 !m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0))
+		{
+			return false;
+		}
+
+		return emit_cpu_regs_address(HOST_TMP1, hilo_offset) &&
+			   m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitMMI(u32 op)
+	{
+		switch (op & 0x3f)
+		{
+			case 0x00: // MADD, owned by MMI.cpp::MADD().
+				return EmitMADD(op);
+			case 0x01: // MADDU, owned by MMI.cpp::MADDU().
+				return EmitMADDU(op);
+			case 0x04: // PLZCW, owned by MMI.cpp::PLZCW().
+				return EmitPLZCW(op);
+			case 0x08: // MMI0 class, owned by R5900OpcodeTables.cpp::Class_MMI0().
+				return EmitMMI0(op);
+			case 0x09: // MMI2 class, owned by R5900OpcodeTables.cpp::Class_MMI2().
+				return EmitMMI2(op);
+			case 0x28: // MMI1 class, owned by R5900OpcodeTables.cpp::Class_MMI1().
+				return EmitMMI1(op);
+			case 0x29: // MMI3 class, owned by R5900OpcodeTables.cpp::Class_MMI3().
+				return EmitMMI3(op);
+			case 0x10: // MFHI1, owned by MMI.cpp::MFHI1().
+				return EmitMFHI1(op);
+			case 0x11: // MTHI1, owned by MMI.cpp::MTHI1().
+				return EmitMTHI1(op);
+			case 0x12: // MFLO1, owned by MMI.cpp::MFLO1().
+				return EmitMFLO1(op);
+			case 0x13: // MTLO1, owned by MMI.cpp::MTLO1().
+				return EmitMTLO1(op);
+			case 0x18: // MULT1, owned by MMI.cpp::MULT1().
+				return EmitMULT1(op);
+			case 0x19: // MULTU1, owned by MMI.cpp::MULTU1().
+				return EmitMULTU1(op);
+			case 0x1a: // DIV1, owned by MMI.cpp::DIV1().
+				return EmitDIV1(op);
+			case 0x1b: // DIVU1, owned by MMI.cpp::DIVU1().
+				return EmitDIVU1(op);
+			case 0x20: // MADD1, owned by MMI.cpp::MADD1().
+				return EmitMADD1(op);
+			case 0x21: // MADDU1, owned by MMI.cpp::MADDU1().
+				return EmitMADDU1(op);
+			case 0x30: // PMFHL, owned by MMI.cpp::PMFHL().
+				return EmitPMFHL(op);
+			case 0x31: // PMTHL, owned by MMI.cpp::PMTHL().
+				return EmitPMTHL(op);
+			case 0x34: // PSLLH, owned by MMI.cpp::PSLLH().
+				return EmitPSLLH(op);
+			case 0x36: // PSRLH, owned by MMI.cpp::PSRLH().
+				return EmitPSRLH(op);
+			case 0x37: // PSRAH, owned by MMI.cpp::PSRAH().
+				return EmitPSRAH(op);
+			case 0x3c: // PSLLW, owned by MMI.cpp::PSLLW().
+				return EmitPSLLW(op);
+			case 0x3e: // PSRLW, owned by MMI.cpp::PSRLW().
+				return EmitPSRLW(op);
+			case 0x3f: // PSRAW, owned by MMI.cpp::PSRAW().
+				return EmitPSRAW(op);
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitMMI0(u32 op)
+	{
+		switch ((op >> 6) & 0x1f)
+		{
+			case 0x00: // PADDW, owned by MMI.cpp::PADDW().
+				return EmitPADDW(op);
+			case 0x01: // PSUBW, owned by MMI.cpp::PSUBW().
+				return EmitPSUBW(op);
+			case 0x02: // PCGTW, owned by MMI.cpp::PCGTW().
+				return EmitPCGTW(op);
+			case 0x03: // PMAXW, owned by MMI.cpp::PMAXW().
+				return EmitPMAXW(op);
+			case 0x04: // PADDH, owned by MMI.cpp::PADDH().
+				return EmitPADDH(op);
+			case 0x05: // PSUBH, owned by MMI.cpp::PSUBH().
+				return EmitPSUBH(op);
+			case 0x06: // PCGTH, owned by MMI.cpp::PCGTH().
+				return EmitPCGTH(op);
+			case 0x07: // PMAXH, owned by MMI.cpp::PMAXH().
+				return EmitPMAXH(op);
+			case 0x08: // PADDB, owned by MMI.cpp::PADDB().
+				return EmitPADDB(op);
+			case 0x09: // PSUBB, owned by MMI.cpp::PSUBB().
+				return EmitPSUBB(op);
+			case 0x0a: // PCGTB, owned by MMI.cpp::PCGTB().
+				return EmitPCGTB(op);
+			case 0x10: // PADDSW, owned by MMI.cpp::PADDSW().
+				return EmitPADDSW(op);
+			case 0x11: // PSUBSW, owned by MMI.cpp::PSUBSW().
+				return EmitPSUBSW(op);
+			case 0x12: // PEXTLW, owned by MMI.cpp::PEXTLW().
+				return EmitPEXTLW(op);
+			case 0x13: // PPACW, owned by MMI.cpp::PPACW().
+				return EmitPPACW(op);
+			case 0x14: // PADDSH, owned by MMI.cpp::PADDSH().
+				return EmitPADDSH(op);
+			case 0x15: // PSUBSH, owned by MMI.cpp::PSUBSH().
+				return EmitPSUBSH(op);
+			case 0x16: // PEXTLH, owned by MMI.cpp::PEXTLH().
+				return EmitPEXTLH(op);
+			case 0x17: // PPACH, owned by MMI.cpp::PPACH().
+				return EmitPPACH(op);
+			case 0x18: // PADDSB, owned by MMI.cpp::PADDSB().
+				return EmitPADDSB(op);
+			case 0x19: // PSUBSB, owned by MMI.cpp::PSUBSB().
+				return EmitPSUBSB(op);
+			case 0x1a: // PEXTLB, owned by MMI.cpp::PEXTLB().
+				return EmitPEXTLB(op);
+			case 0x1b: // PPACB, owned by MMI.cpp::PPACB().
+				return EmitPPACB(op);
+			case 0x1e: // PEXT5, owned by MMI.cpp::PEXT5().
+				return EmitPEXT5(op);
+			case 0x1f: // PPAC5, owned by MMI.cpp::PPAC5().
+				return EmitPPAC5(op);
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitMMI1(u32 op)
+	{
+		switch ((op >> 6) & 0x1f)
+		{
+			case 0x01: // PABSW, owned by MMI.cpp::PABSW().
+				return EmitPABSW(op);
+			case 0x02: // PCEQW, owned by MMI.cpp::PCEQW().
+				return EmitPCEQW(op);
+			case 0x03: // PMINW, owned by MMI.cpp::PMINW().
+				return EmitPMINW(op);
+			case 0x04: // PADSBH, owned by MMI.cpp::PADSBH().
+				return EmitPADSBH(op);
+			case 0x05: // PABSH, owned by MMI.cpp::PABSH().
+				return EmitPABSH(op);
+			case 0x06: // PCEQH, owned by MMI.cpp::PCEQH().
+				return EmitPCEQH(op);
+			case 0x07: // PMINH, owned by MMI.cpp::PMINH().
+				return EmitPMINH(op);
+			case 0x0a: // PCEQB, owned by MMI.cpp::PCEQB().
+				return EmitPCEQB(op);
+			case 0x10: // PADDUW, owned by MMI.cpp::PADDUW().
+				return EmitPADDUW(op);
+			case 0x11: // PSUBUW, owned by MMI.cpp::PSUBUW().
+				return EmitPSUBUW(op);
+			case 0x12: // PEXTUW, owned by MMI.cpp::PEXTUW().
+				return EmitPEXTUW(op);
+			case 0x14: // PADDUH, owned by MMI.cpp::PADDUH().
+				return EmitPADDUH(op);
+			case 0x15: // PSUBUH, owned by MMI.cpp::PSUBUH().
+				return EmitPSUBUH(op);
+			case 0x16: // PEXTUH, owned by MMI.cpp::PEXTUH().
+				return EmitPEXTUH(op);
+			case 0x18: // PADDUB, owned by MMI.cpp::PADDUB().
+				return EmitPADDUB(op);
+			case 0x19: // PSUBUB, owned by MMI.cpp::PSUBUB().
+				return EmitPSUBUB(op);
+			case 0x1a: // PEXTUB, owned by MMI.cpp::PEXTUB().
+				return EmitPEXTUB(op);
+			case 0x1b: // QFSRV, owned by MMI.cpp::QFSRV().
+				return EmitQFSRV(op);
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitMMI2(u32 op)
+	{
+		switch ((op >> 6) & 0x1f)
+		{
+			case 0x00: // PMADDW, owned by MMI.cpp::PMADDW().
+				return EmitPMADDW(op);
+			case 0x02: // PSLLVW, owned by MMI.cpp::PSLLVW().
+				return EmitPSLLVW(op);
+			case 0x03: // PSRLVW, owned by MMI.cpp::PSRLVW().
+				return EmitPSRLVW(op);
+			case 0x04: // PMSUBW, owned by MMI.cpp::PMSUBW().
+				return EmitPMSUBW(op);
+			case 0x08: // PMFHI, owned by MMI.cpp::PMFHI().
+				return EmitPMFHI(op);
+			case 0x09: // PMFLO, owned by MMI.cpp::PMFLO().
+				return EmitPMFLO(op);
+			case 0x0a: // PINTH, owned by MMI.cpp::PINTH().
+				return EmitPINTH(op);
+			case 0x0c: // PMULTW, owned by MMI.cpp::PMULTW().
+				return EmitPMULTW(op);
+			case 0x0d: // PDIVW, owned by MMI.cpp::PDIVW().
+				return EmitPDIVW(op);
+			case 0x0e: // PCPYLD, owned by MMI.cpp::PCPYLD().
+				return EmitPCPYLD(op);
+			case 0x10: // PMADDH, owned by MMI.cpp::PMADDH().
+				return EmitPMADDH(op);
+			case 0x11: // PHMADH, owned by MMI.cpp::PHMADH().
+				return EmitPHMADH(op);
+			case 0x12: // PAND, owned by MMI.cpp::PAND().
+				return EmitPAND(op);
+			case 0x13: // PXOR, owned by MMI.cpp::PXOR().
+				return EmitPXOR(op);
+			case 0x14: // PMSUBH, owned by MMI.cpp::PMSUBH().
+				return EmitPMSUBH(op);
+			case 0x15: // PHMSBH, owned by MMI.cpp::PHMSBH().
+				return EmitPHMSBH(op);
+			case 0x1a: // PEXEH, owned by MMI.cpp::PEXEH().
+				return EmitPEXEH(op);
+			case 0x1b: // PREVH, owned by MMI.cpp::PREVH().
+				return EmitPREVH(op);
+			case 0x1c: // PMULTH, owned by MMI.cpp::PMULTH().
+				return EmitPMULTH(op);
+			case 0x1d: // PDIVBW, owned by MMI.cpp::PDIVBW().
+				return EmitPDIVBW(op);
+			case 0x1e: // PEXEW, owned by MMI.cpp::PEXEW().
+				return EmitPEXEW(op);
+			case 0x1f: // PROT3W, owned by MMI.cpp::PROT3W().
+				return EmitPROT3W(op);
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitMMI3(u32 op)
+	{
+		switch ((op >> 6) & 0x1f)
+		{
+			case 0x00: // PMADDUW, owned by MMI.cpp::PMADDUW().
+				return EmitPMADDUW(op);
+			case 0x03: // PSRAVW, owned by MMI.cpp::PSRAVW().
+				return EmitPSRAVW(op);
+			case 0x08: // PMTHI, owned by MMI.cpp::PMTHI().
+				return EmitPMTHI(op);
+			case 0x09: // PMTLO, owned by MMI.cpp::PMTLO().
+				return EmitPMTLO(op);
+			case 0x0a: // PINTEH, owned by MMI.cpp::PINTEH().
+				return EmitPINTEH(op);
+			case 0x0c: // PMULTUW, owned by MMI.cpp::PMULTUW().
+				return EmitPMULTUW(op);
+			case 0x0d: // PDIVUW, owned by MMI.cpp::PDIVUW().
+				return EmitPDIVUW(op);
+			case 0x0e: // PCPYUD, owned by MMI.cpp::PCPYUD().
+				return EmitPCPYUD(op);
+			case 0x12: // POR, owned by MMI.cpp::POR().
+				return EmitPOR(op);
+			case 0x13: // PNOR, owned by MMI.cpp::PNOR().
+				return EmitPNOR(op);
+			case 0x1a: // PEXCH, owned by MMI.cpp::PEXCH().
+				return EmitPEXCH(op);
+			case 0x1b: // PCPYH, owned by MMI.cpp::PCPYH().
+				return EmitPCPYH(op);
+			case 0x1e: // PEXCW, owned by MMI.cpp::PEXCW().
+				return EmitPEXCW(op);
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitPMADDW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PMADDW(); the lower lane has the PS2 high-word
+		// adjustment documented in the interpreter.
+		return EmitPackedSignedWordMultiplyAccumulate(op, false);
+	}
+
+	bool BlockCompiler::EmitPMSUBW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PMSUBW(); x86/iMMI.cpp::recPMSUBW() uses the same
+		// signed product and LO/HI accumulator lanes.
+		return EmitPackedSignedWordMultiplyAccumulate(op, true);
+	}
+
+	bool BlockCompiler::EmitPMADDH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PMADDH(), which adds eight signed 16x16 products
+		// into the packed LO/HI word accumulators.
+		return EmitPackedHalfwordMultiplyAccumulate(op, false);
+	}
+
+	bool BlockCompiler::EmitPMSUBH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PMSUBH(), which subtracts eight signed 16x16
+		// products from the packed LO/HI word accumulators.
+		return EmitPackedHalfwordMultiplyAccumulate(op, true);
+	}
+
+	bool BlockCompiler::EmitPHMADH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PHMADH(), which writes pairwise signed 16x16
+		// sums into even LO/HI words and the second pair product into odd words.
+		return EmitPackedHalfwordPairMultiply(op, false);
+	}
+
+	bool BlockCompiler::EmitPHMSBH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PHMSBH(), which writes pairwise signed 16x16
+		// differences and the undocumented bitwise-not second product lanes.
+		return EmitPackedHalfwordPairMultiply(op, true);
+	}
+
+	bool BlockCompiler::EmitPMULTW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PMULTW(), which multiplies RS.SL[0]/[2] by
+		// RT.SL[0]/[2], writes the raw 64-bit products to RD, and writes the
+		// sign-extended low/high 32-bit halves into LO/HI.
+		return EmitPackedWordMultiply(op, true);
+	}
+
+	bool BlockCompiler::EmitPMULTUW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PMULTUW(), which multiplies RS.UL[0]/[2] by
+		// RT.UL[0]/[2], writes unsigned 64-bit products to RD, and still
+		// sign-extends the low/high 32-bit halves into LO/HI.
+		return EmitPackedWordMultiply(op, false);
+	}
+
+	bool BlockCompiler::EmitPMULTH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PMULTH(), which multiplies all eight signed
+		// halfword lanes into LO/HI words and exposes lanes 0/2/4/6 through RD.
+		return EmitPackedHalfwordMultiply(op);
+	}
+
+	bool BlockCompiler::EmitPMADDUW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PMADDUW(), which adds each unsigned 32x32
+		// product to the raw 64-bit LO.UL[0/2] + HI.UL[0/2] accumulator.
+		return EmitPackedUnsignedWordMultiplyAdd(op);
+	}
+
+	bool BlockCompiler::EmitPDIVW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PDIVW(). Cortex-A9 has no integer divide, so the
+		// no-divide edge cases are emitted directly and true division keeps the
+		// exact PCSX2 helper semantics.
+		return EmitPackedWordDivide(op, true);
+	}
+
+	bool BlockCompiler::EmitPDIVUW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PDIVUW(). Cortex-A9 has no integer divide, so the
+		// no-divide edge cases are emitted directly and true division keeps the
+		// exact PCSX2 helper semantics.
+		return EmitPackedWordDivide(op, false);
+	}
+
+	bool BlockCompiler::EmitPDIVBW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PDIVBW(), which divides all four signed RS words
+		// by RT.SS[0] and writes all four 32-bit LO/HI words directly. Divisor
+		// 0, 1, and -1 are emitted directly; other divisors call the PCSX2-shaped
+		// helper because Cortex-A9 has no integer divide.
+		return EmitPackedWordByHalfwordDivide(op);
+	}
+
+	bool BlockCompiler::EmitPackedWordMultiply(u32 op, bool signed_multiply)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+
+		const auto load_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
+		};
+
+		const auto emit_lane = [this, rd, rs, rt, signed_multiply, load_word](unsigned source_word, unsigned dest_lane) {
+			const size_t rd_offset = GprOffset(rd) + dest_lane * sizeof(u64);
+			const size_t lo_offset = LO_OFFSET + dest_lane * sizeof(u64);
+			const size_t hi_offset = HI_OFFSET + dest_lane * sizeof(u64);
+
+			if (!load_word(rs, source_word, HOST_TMP0) ||
+				!load_word(rt, source_word, HOST_TMP1))
+			{
+				return false;
+			}
+
+			if (signed_multiply)
+			{
+				if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+					return false;
+			}
+			else
+			{
+				if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+					return false;
+			}
+
+			if (rd != 0 &&
+				(!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(rd_offset)) ||
+					!m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(rd_offset + sizeof(u32)))))
+			{
+				return false;
+			}
+
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP2, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_offset + sizeof(u32))) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(hi_offset)) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hi_offset + sizeof(u32))))
+			{
+				return false;
+			}
+
+			return true;
+		};
+
+		return emit_lane(0, 0) && emit_lane(2, 1);
+	}
+
+	bool BlockCompiler::EmitPackedWordDivide(u32 op, bool signed_divide)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		struct BranchPatch
+		{
+			size_t offset = static_cast<size_t>(-1);
+			VitaA32::Condition condition = VitaA32::Condition::AL;
+		};
+
+		const auto load_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
+		};
+
+		const auto emit_branch = [this](BranchPatch& patch, VitaA32::Condition condition) {
+			patch.offset = m_code.EmitBranchPlaceholder(condition);
+			patch.condition = condition;
+			return patch.offset != static_cast<size_t>(-1);
+		};
+
+		const auto patch_branch = [this](const BranchPatch& patch, size_t target) {
+			return m_code.PatchBranch(patch.offset, target, patch.condition);
+		};
+
+		const auto patch_branches = [patch_branch](const BranchPatch* branches, unsigned count, size_t target) {
+			for (unsigned i = 0; i < count; i++)
+			{
+				if (!patch_branch(branches[i], target))
+					return false;
+			}
+			return true;
+		};
+
+		const auto store_signed_word_as_doubleword = [this](unsigned value_reg, size_t offset) {
+			return m_code.EmitMovRegShiftImm(HOST_TMP4, value_reg, VitaA32::ShiftType::ASR, 31) &&
+				   m_code.EmitStrImm12(value_reg, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+				   m_code.EmitStrImm12(HOST_TMP4, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+		};
+
+		BranchPatch fallback_branches[2]{};
+		unsigned fallback_branch_count = 0;
+		const auto emit_fallback = [&]() {
+			if (fallback_branch_count >= 2)
+				return false;
+			return emit_branch(fallback_branches[fallback_branch_count++], VitaA32::Condition::AL);
+		};
+
+		const auto emit_signed_fast_guard = [&](unsigned dividend_reg, unsigned divisor_reg) {
+			BranchPatch ok_branches[6]{};
+			unsigned ok_branch_count = 0;
+			if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
+				!m_code.EmitCmpReg(divisor_reg, HOST_TMP4) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(dividend_reg, HOST_TMP4) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!m_code.EmitMovImm8(HOST_TMP4, 1) ||
+				!m_code.EmitCmpReg(divisor_reg, HOST_TMP4) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!m_code.EmitMovImm32(HOST_TMP4, 0xffffffffu) ||
+				!m_code.EmitCmpReg(divisor_reg, HOST_TMP4) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(dividend_reg, divisor_reg) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP4, divisor_reg, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitEorReg(HOST_TMP5, divisor_reg, HOST_TMP4) ||
+				!m_code.EmitSubReg(HOST_TMP5, HOST_TMP5, HOST_TMP4) ||
+				!m_code.EmitSubImm8(HOST_TMP4, HOST_TMP5, 1) ||
+				!m_code.EmitAndReg(HOST_TMP4, HOST_TMP5, HOST_TMP4, true) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!emit_fallback())
+			{
+				return false;
+			}
+
+			return patch_branches(ok_branches, ok_branch_count, m_code.Size());
+		};
+
+		const auto emit_unsigned_fast_guard = [&](unsigned dividend_reg, unsigned divisor_reg) {
+			BranchPatch ok_branches[5]{};
+			unsigned ok_branch_count = 0;
+			if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
+				!m_code.EmitCmpReg(divisor_reg, HOST_TMP4) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(dividend_reg, HOST_TMP4) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!m_code.EmitMovImm8(HOST_TMP4, 1) ||
+				!m_code.EmitCmpReg(divisor_reg, HOST_TMP4) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(dividend_reg, divisor_reg) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::LS) ||
+				!m_code.EmitSubImm8(HOST_TMP4, divisor_reg, 1) ||
+				!m_code.EmitAndReg(HOST_TMP4, divisor_reg, HOST_TMP4, true) ||
+				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
+				!emit_fallback())
+			{
+				return false;
+			}
+
+			return patch_branches(ok_branches, ok_branch_count, m_code.Size());
+		};
+
+		const auto emit_signed_direct_lane = [&](unsigned source_word, unsigned dest_lane) {
+			const size_t lo_offset = LO_OFFSET + dest_lane * sizeof(u64);
+			const size_t hi_offset = HI_OFFSET + dest_lane * sizeof(u64);
+			BranchPatch divzero_branch{};
+			BranchPatch zero_branch{};
+			BranchPatch divone_branch{};
+			BranchPatch negone_branch{};
+			BranchPatch equal_branch{};
+			BranchPatch done_branches[6]{};
+			unsigned done_branch_count = 0;
+
+			if (!load_word(rs, source_word, HOST_TMP0) ||
+				!load_word(rt, source_word, HOST_TMP1) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+				!emit_branch(zero_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 1) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!emit_branch(divone_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitMovImm32(HOST_TMP3, 0xffffffffu) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!emit_branch(negone_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) ||
+				!emit_branch(equal_branch, VitaA32::Condition::EQ))
+			{
+				return false;
+			}
+
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP0, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitEorReg(HOST_TMP4, HOST_TMP1, HOST_TMP2) ||
+				!m_code.EmitSubReg(HOST_TMP4, HOST_TMP4, HOST_TMP2) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP4, 1) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP3, HOST_TMP2) ||
+				!m_code.EmitAddReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitClz(HOST_TMP4, HOST_TMP4) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 31) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP4, HOST_TMP3, VitaA32::ShiftType::ASR, HOST_TMP2) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_TMP4, VitaA32::ShiftType::LSL, HOST_TMP2) ||
+				!m_code.EmitSubReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitEorReg(HOST_TMP4, HOST_TMP4, HOST_TMP2) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP4, HOST_TMP2) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP3, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(negone_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP3, HOST_TMP0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(equal_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 1) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(divone_branch, m_code.Size()) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(zero_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(divzero_branch, m_code.Size()) ||
+				!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP0, hi_offset))
+			{
+				return false;
+			}
+
+			return patch_branches(done_branches, done_branch_count, m_code.Size());
+		};
+
+		const auto emit_unsigned_direct_lane = [&](unsigned source_word, unsigned dest_lane) {
+			const size_t lo_offset = LO_OFFSET + dest_lane * sizeof(u64);
+			const size_t hi_offset = HI_OFFSET + dest_lane * sizeof(u64);
+			BranchPatch divzero_branch{};
+			BranchPatch zero_branch{};
+			BranchPatch divone_branch{};
+			BranchPatch below_branch{};
+			BranchPatch equal_branch{};
+			BranchPatch done_branches[6]{};
+			unsigned done_branch_count = 0;
+
+			if (!load_word(rs, source_word, HOST_TMP0) ||
+				!load_word(rt, source_word, HOST_TMP1) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+				!emit_branch(zero_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 1) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!emit_branch(divone_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) ||
+				!emit_branch(below_branch, VitaA32::Condition::CC) ||
+				!emit_branch(equal_branch, VitaA32::Condition::EQ))
+			{
+				return false;
+			}
+
+			if (!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
+				!m_code.EmitClz(HOST_TMP2, HOST_TMP1) ||
+				!m_code.EmitMovImm8(HOST_TMP4, 31) ||
+				!m_code.EmitSubReg(HOST_TMP4, HOST_TMP4, HOST_TMP2) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR, HOST_TMP4) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP3, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(equal_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 1) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(below_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP0, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(divone_branch, m_code.Size()) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(zero_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+
+			if (!patch_branch(divzero_branch, m_code.Size()) ||
+				!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP0, hi_offset))
+			{
+				return false;
+			}
+
+			return patch_branches(done_branches, done_branch_count, m_code.Size());
+		};
+
+		if (!load_word(rs, 0, HOST_TMP0) ||
+			!load_word(rt, 0, HOST_TMP1) ||
+			!load_word(rs, 2, HOST_TMP2) ||
+			!load_word(rt, 2, HOST_TMP3))
+		{
+			return false;
+		}
+
+		if (signed_divide)
+		{
+			if (!emit_signed_fast_guard(HOST_TMP0, HOST_TMP1) ||
+				!emit_signed_fast_guard(HOST_TMP2, HOST_TMP3))
+			{
+				return false;
+			}
+		}
+		else if (!emit_unsigned_fast_guard(HOST_TMP0, HOST_TMP1) ||
+				 !emit_unsigned_fast_guard(HOST_TMP2, HOST_TMP3))
+		{
+			return false;
+		}
+
+		if (signed_divide)
+		{
+			if (!emit_signed_direct_lane(0, 0) ||
+				!emit_signed_direct_lane(2, 1))
+			{
+				return false;
+			}
+		}
+		else if (!emit_unsigned_direct_lane(0, 0) ||
+				 !emit_unsigned_direct_lane(2, 1))
+		{
+			return false;
+		}
+
+		BranchPatch done_branch{};
+		if (!emit_branch(done_branch, VitaA32::Condition::AL))
+			return false;
+
+		if (!patch_branches(fallback_branches, fallback_branch_count, m_code.Size()) ||
+			!m_code.EmitCallAbsolute(signed_divide ?
+					reinterpret_cast<const void*>(&VitaEePackedDivSignedWords) :
+					reinterpret_cast<const void*>(&VitaEePackedDivUnsignedWords)))
+		{
+			return false;
+		}
+
+		return patch_branch(done_branch, m_code.Size());
+	}
+
+	bool BlockCompiler::EmitPackedWordByHalfwordDivide(u32 op)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		struct BranchPatch
+		{
+			size_t offset = static_cast<size_t>(-1);
+			VitaA32::Condition condition = VitaA32::Condition::AL;
+		};
+
+		const auto emit_branch = [this](BranchPatch& patch, VitaA32::Condition condition) {
+			patch.offset = m_code.EmitBranchPlaceholder(condition);
+			patch.condition = condition;
+			return patch.offset != static_cast<size_t>(-1);
+		};
+
+		const auto patch_branch = [this](const BranchPatch& patch, size_t target) {
+			return m_code.PatchBranch(patch.offset, target, patch.condition);
+		};
+
+		const auto patch_branches = [patch_branch](const BranchPatch* branches, unsigned count, size_t target) {
+			for (unsigned i = 0; i < count; i++)
+			{
+				if (!patch_branch(branches[i], target))
+					return false;
+			}
+			return true;
+		};
+
+		const auto load_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
+		};
+
+		const auto load_divisor = [&]() {
+			if (rt == 0)
+				return m_code.EmitMovImm8(HOST_TMP1, 0);
+
+			return m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 16) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, 16);
+		};
+
+		const auto emit_divzero_lane = [&](unsigned lane) {
+			return load_word(rs, lane, HOST_TMP0) &&
+				   m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) &&
+				   m_code.EmitMovImm8(HOST_TMP3, 0) &&
+				   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) &&
+				   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS,
+					   static_cast<u16>(LO_OFFSET + lane * sizeof(u32))) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS,
+					   static_cast<u16>(HI_OFFSET + lane * sizeof(u32)));
+		};
+
+		const auto emit_divone_lane = [&](unsigned lane) {
+			return load_word(rs, lane, HOST_TMP0) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS,
+					   static_cast<u16>(LO_OFFSET + lane * sizeof(u32))) &&
+				   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS,
+					   static_cast<u16>(HI_OFFSET + lane * sizeof(u32)));
+		};
+
+		const auto emit_negone_lane = [&](unsigned lane) {
+			return load_word(rs, lane, HOST_TMP0) &&
+				   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+				   m_code.EmitSubReg(HOST_TMP3, HOST_TMP2, HOST_TMP0) &&
+				   m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS,
+					   static_cast<u16>(LO_OFFSET + lane * sizeof(u32))) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS,
+					   static_cast<u16>(HI_OFFSET + lane * sizeof(u32)));
+		};
+
+		BranchPatch divzero_branch{};
+		BranchPatch divone_branch{};
+		BranchPatch negone_branch{};
+		BranchPatch fallback_branch{};
+		BranchPatch done_branches[3]{};
+		unsigned done_branch_count = 0;
+
+		if (!load_divisor() ||
+			!m_code.EmitMovImm8(HOST_TMP4, 0) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP4) ||
+			!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
+			!m_code.EmitMovImm8(HOST_TMP4, 1) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP4) ||
+			!emit_branch(divone_branch, VitaA32::Condition::EQ) ||
+			!m_code.EmitMovImm32(HOST_TMP4, 0xffffu) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP4) ||
+			!emit_branch(negone_branch, VitaA32::Condition::EQ) ||
+			!emit_branch(fallback_branch, VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (!patch_branch(divzero_branch, m_code.Size()) ||
+			!emit_divzero_lane(0) ||
+			!emit_divzero_lane(1) ||
+			!emit_divzero_lane(2) ||
+			!emit_divzero_lane(3) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (!patch_branch(divone_branch, m_code.Size()) ||
+			!emit_divone_lane(0) ||
+			!emit_divone_lane(1) ||
+			!emit_divone_lane(2) ||
+			!emit_divone_lane(3) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (!patch_branch(negone_branch, m_code.Size()) ||
+			!emit_negone_lane(0) ||
+			!emit_negone_lane(1) ||
+			!emit_negone_lane(2) ||
+			!emit_negone_lane(3) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (!patch_branch(fallback_branch, m_code.Size()) ||
+			!m_code.EmitMovImm32(HOST_TMP0, op) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEePackedDivSignedWordsByHalfword)))
+		{
+			return false;
+		}
+
+		return patch_branches(done_branches, done_branch_count, m_code.Size());
+	}
+
+	bool BlockCompiler::EmitPackedSignedWordMultiplyAccumulate(u32 op, bool subtract)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+
+		const auto load_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
+		};
+
+		const auto store_signed_word_as_doubleword = [this](unsigned value_reg, size_t offset) {
+			return m_code.EmitMovRegShiftImm(HOST_TMP0, value_reg, VitaA32::ShiftType::ASR, 31) &&
+				   m_code.EmitStrImm12(value_reg, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+		};
+
+		const auto emit_divide_signed_64_by_u32_max = [this]() {
+			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
+				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP0))
+			{
+				return false;
+			}
+
+			const size_t negative_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::LT);
+			if (negative_branch == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitMvnReg(HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitCmpReg(HOST_TMP4, HOST_TMP0))
+			{
+				return false;
+			}
+
+			const size_t positive_no_increment = m_code.EmitBranchPlaceholder(VitaA32::Condition::CC);
+			if (positive_no_increment == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitAddImm8(HOST_TMP3, HOST_TMP3, 1))
+				return false;
+
+			const size_t positive_done = m_code.EmitBranchPlaceholder();
+			if (positive_done == static_cast<size_t>(-1))
+				return false;
+
+			const size_t negative_target = m_code.Size();
+			if (!m_code.PatchBranch(negative_branch, negative_target, VitaA32::Condition::LT) ||
+				!m_code.PatchBranch(positive_no_increment, positive_done, VitaA32::Condition::CC))
+			{
+				return false;
+			}
+
+			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
+				!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitCmpReg(HOST_TMP4, HOST_TMP0))
+			{
+				return false;
+			}
+
+			const size_t negative_no_increment = m_code.EmitBranchPlaceholder(VitaA32::Condition::LS);
+			if (negative_no_increment == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitAddImm8(HOST_TMP3, HOST_TMP3, 1))
+				return false;
+
+			const size_t done_target = m_code.Size();
+			return m_code.PatchBranch(positive_done, done_target) &&
+				   m_code.PatchBranch(negative_no_increment, done_target, VitaA32::Condition::LS);
+		};
+
+		const auto emit_pmaddw_lower_quirk = [this, rs, load_word]() {
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::LSL, 1) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, 1) ||
+				!m_code.EmitMovImm8(HOST_TMP0, 0) ||
+				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP0))
+			{
+				return false;
+			}
+
+			const size_t compare_registers_from_zero = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (compare_registers_from_zero == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitMovImm32(HOST_TMP0, 0x7fffffffu) ||
+				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP0))
+			{
+				return false;
+			}
+
+			const size_t no_quirk_from_mask = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (no_quirk_from_mask == static_cast<size_t>(-1))
+				return false;
+
+			const size_t compare_registers_target = m_code.Size();
+			if (!m_code.PatchBranch(compare_registers_from_zero, compare_registers_target, VitaA32::Condition::EQ) ||
+				!load_word(rs, 0, HOST_TMP0) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
+			{
+				return false;
+			}
+
+			const size_t no_quirk_from_equal_operands = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (no_quirk_from_equal_operands == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitMovImm32(HOST_TMP0, 0x70000000u) ||
+				!m_code.EmitAddReg(HOST_TMP4, HOST_TMP4, HOST_TMP0, true) ||
+				!m_code.EmitAdcImm8(HOST_TMP3, HOST_TMP3, 0))
+			{
+				return false;
+			}
+
+			const size_t done_target = m_code.Size();
+			return m_code.PatchBranch(no_quirk_from_mask, done_target, VitaA32::Condition::NE) &&
+				   m_code.PatchBranch(no_quirk_from_equal_operands, done_target, VitaA32::Condition::EQ);
+		};
+
+		const auto emit_lane = [this, rs, rt, subtract, load_word, store_signed_word_as_doubleword,
+							   emit_divide_signed_64_by_u32_max, emit_pmaddw_lower_quirk]
+			(unsigned source_word, unsigned dest_lane) {
+			const size_t lo_source_offset = LO_OFFSET + source_word * sizeof(u32);
+			const size_t hi_source_offset = HI_OFFSET + source_word * sizeof(u32);
+			const size_t lo_dest_offset = LO_OFFSET + dest_lane * sizeof(u64);
+			const size_t hi_dest_offset = HI_OFFSET + dest_lane * sizeof(u64);
+
+			if (!load_word(rs, source_word, HOST_TMP0) ||
+				!load_word(rt, source_word, HOST_TMP1) ||
+				!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL, 0) ||
+				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_source_offset)) ||
+				!(subtract ? m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP4) :
+							  m_code.EmitAddReg(HOST_TMP2, HOST_TMP0, HOST_TMP4)) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_dest_offset))
+			{
+				return false;
+			}
+
+			if (subtract)
+			{
+				if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
+					!m_code.EmitSubReg(HOST_TMP4, HOST_TMP0, HOST_TMP4, true) ||
+					!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hi_source_offset)) ||
+					!m_code.EmitSbcReg(HOST_TMP3, HOST_TMP0, HOST_TMP3))
+				{
+					return false;
+				}
+			}
+			else if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hi_source_offset)) ||
+					 !m_code.EmitAddReg(HOST_TMP3, HOST_TMP3, HOST_TMP0) ||
+					 (source_word == 0 && !emit_pmaddw_lower_quirk()))
+			{
+				return false;
+			}
+
+			return emit_divide_signed_64_by_u32_max() &&
+				   store_signed_word_as_doubleword(HOST_TMP3, hi_dest_offset);
+		};
+
+		const auto copy_accumulator_to_rd = [this, rd](unsigned rd_word, size_t accumulator_offset) {
+			const size_t rd_offset = GprOffset(rd) + rd_word * sizeof(u32);
+			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(accumulator_offset)) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(rd_offset));
+		};
+
+		if (!emit_lane(0, 0) || !emit_lane(2, 1))
+			return false;
+
+		if (rd == 0)
+			return true;
+
+		return copy_accumulator_to_rd(0, LO_OFFSET) &&
+			   copy_accumulator_to_rd(1, HI_OFFSET) &&
+			   copy_accumulator_to_rd(2, LO_OFFSET + sizeof(u64)) &&
+			   copy_accumulator_to_rd(3, HI_OFFSET + sizeof(u64));
+	}
+
+	bool BlockCompiler::EmitPackedHalfwordMultiplyAccumulate(u32 op, bool subtract)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+
+		const auto load_halfword = [this](unsigned guest_reg, unsigned lane, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			const size_t source_offset = GprOffset(guest_reg) + (lane / 2) * sizeof(u32);
+			if (!m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(source_offset)))
+				return false;
+
+			if ((lane & 1u) != 0)
+				return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
+
+			return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::LSL, 16) &&
+				   m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
+		};
+
+		const auto emit_lane = [this, rs, rt, subtract, load_halfword](unsigned lane) {
+			const size_t accumulator_offset = PackedHalfwordAccumulatorOffset(lane);
+			if (!load_halfword(rs, lane, HOST_TMP0) ||
+				!load_halfword(rt, lane, HOST_TMP1) ||
+				!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1) ||
+				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(accumulator_offset)) ||
+				!(subtract ? m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2) :
+							  m_code.EmitAddReg(HOST_TMP2, HOST_TMP0, HOST_TMP2)) ||
+				!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(accumulator_offset)))
+			{
+				return false;
+			}
+
+			return true;
+		};
+
+		const auto copy_accumulator_to_rd = [this, rd](unsigned rd_word, size_t accumulator_offset) {
+			const size_t rd_offset = GprOffset(rd) + rd_word * sizeof(u32);
+			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(accumulator_offset)) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(rd_offset));
+		};
+
+		if (!emit_lane(0) || !emit_lane(1) || !emit_lane(2) || !emit_lane(3) ||
+			!emit_lane(4) || !emit_lane(5) || !emit_lane(6) || !emit_lane(7))
+		{
+			return false;
+		}
+
+		if (rd == 0)
+			return true;
+
+		return copy_accumulator_to_rd(0, PackedHalfwordAccumulatorOffset(0)) &&
+			   copy_accumulator_to_rd(1, PackedHalfwordAccumulatorOffset(2)) &&
+			   copy_accumulator_to_rd(2, PackedHalfwordAccumulatorOffset(4)) &&
+			   copy_accumulator_to_rd(3, PackedHalfwordAccumulatorOffset(6));
+	}
+
+	bool BlockCompiler::EmitPackedHalfwordPairMultiply(u32 op, bool subtract)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+
+		const auto load_halfword = [this](unsigned guest_reg, unsigned lane, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			const size_t source_offset = GprOffset(guest_reg) + (lane / 2) * sizeof(u32);
+			if (!m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(source_offset)))
+				return false;
+
+			if ((lane & 1u) != 0)
+				return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
+
+			return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::LSL, 16) &&
+				   m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
+		};
+
+		const auto emit_product = [this, rs, rt, load_halfword](unsigned lane) {
+			return load_halfword(rs, lane, HOST_TMP0) &&
+				   load_halfword(rt, lane, HOST_TMP1) &&
+				   m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1);
+		};
+
+		const auto emit_pair = [this, subtract, emit_product](unsigned first_lane) {
+			const unsigned second_lane = first_lane + 1;
+			if (!emit_product(first_lane) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL, 0) ||
+				!emit_product(second_lane))
+			{
+				return false;
+			}
+
+			if (subtract)
+			{
+				if (!m_code.EmitMvnReg(HOST_TMP3, HOST_TMP2) ||
+					!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4))
+				{
+					return false;
+				}
+			}
+			else if (!m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP2, VitaA32::ShiftType::LSL, 0) ||
+					 !m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP4))
+			{
+				return false;
+			}
+
+			return m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS,
+					   static_cast<u16>(PackedHalfwordAccumulatorOffset(first_lane))) &&
+				   m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS,
+					   static_cast<u16>(PackedHalfwordAccumulatorOffset(second_lane)));
+		};
+
+		const auto copy_accumulator_to_rd = [this, rd](unsigned rd_word, size_t accumulator_offset) {
+			const size_t rd_offset = GprOffset(rd) + rd_word * sizeof(u32);
+			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(accumulator_offset)) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(rd_offset));
+		};
+
+		if (!emit_pair(0) || !emit_pair(2) || !emit_pair(4) || !emit_pair(6))
+			return false;
+
+		if (rd == 0)
+			return true;
+
+		return copy_accumulator_to_rd(0, PackedHalfwordAccumulatorOffset(0)) &&
+			   copy_accumulator_to_rd(1, PackedHalfwordAccumulatorOffset(2)) &&
+			   copy_accumulator_to_rd(2, PackedHalfwordAccumulatorOffset(4)) &&
+			   copy_accumulator_to_rd(3, PackedHalfwordAccumulatorOffset(6));
+	}
+
+	bool BlockCompiler::EmitPackedHalfwordMultiply(u32 op)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+
+		const auto load_halfword = [this](unsigned guest_reg, unsigned lane, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			const size_t source_offset = GprOffset(guest_reg) + (lane / 2) * sizeof(u32);
+			if (!m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(source_offset)))
+				return false;
+
+			if ((lane & 1u) != 0)
+				return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
+
+			return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::LSL, 16) &&
+				   m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
+		};
+
+		const auto emit_lane = [this, rs, rt, load_halfword](unsigned lane) {
+			if (!load_halfword(rs, lane, HOST_TMP0) ||
+				!load_halfword(rt, lane, HOST_TMP1) ||
+				!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1) ||
+				!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS,
+					static_cast<u16>(PackedHalfwordAccumulatorOffset(lane))))
+			{
+				return false;
+			}
+
+			return true;
+		};
+
+		const auto copy_accumulator_to_rd = [this, rd](unsigned rd_word, size_t accumulator_offset) {
+			const size_t rd_offset = GprOffset(rd) + rd_word * sizeof(u32);
+			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(accumulator_offset)) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(rd_offset));
+		};
+
+		if (!emit_lane(0) || !emit_lane(1) || !emit_lane(2) || !emit_lane(3) ||
+			!emit_lane(4) || !emit_lane(5) || !emit_lane(6) || !emit_lane(7))
+		{
+			return false;
+		}
+
+		if (rd == 0)
+			return true;
+
+		return copy_accumulator_to_rd(0, PackedHalfwordAccumulatorOffset(0)) &&
+			   copy_accumulator_to_rd(1, PackedHalfwordAccumulatorOffset(2)) &&
+			   copy_accumulator_to_rd(2, PackedHalfwordAccumulatorOffset(4)) &&
+			   copy_accumulator_to_rd(3, PackedHalfwordAccumulatorOffset(6));
+	}
+
+	bool BlockCompiler::EmitPackedUnsignedWordMultiplyAdd(u32 op)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+
+		const auto load_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
+		};
+
+		const auto emit_lane = [this, rd, rs, rt, load_word](unsigned source_word, unsigned dest_lane) {
+			const size_t rd_offset = GprOffset(rd) + dest_lane * sizeof(u64);
+			const size_t lo_offset = LO_OFFSET + dest_lane * sizeof(u64);
+			const size_t hi_offset = HI_OFFSET + dest_lane * sizeof(u64);
+
+			if (!load_word(rs, source_word, HOST_TMP0) ||
+				!load_word(rt, source_word, HOST_TMP1) ||
+				!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1) ||
+				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
+				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(hi_offset)) ||
+				!m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP0, true) ||
+				!m_code.EmitAdcReg(HOST_TMP3, HOST_TMP3, HOST_TMP1))
+			{
+				return false;
+			}
+
+			if (rd != 0 &&
+				(!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(rd_offset)) ||
+					!m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(rd_offset + sizeof(u32)))))
+			{
+				return false;
+			}
+
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP2, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_offset + sizeof(u32))) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(hi_offset)) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hi_offset + sizeof(u32))))
+			{
+				return false;
+			}
+
+			return true;
+		};
+
+		return emit_lane(0, 0) && emit_lane(2, 1);
+	}
+
+	bool BlockCompiler::EmitMmiVectorOp(u32 op, MmiVectorOp operation)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		constexpr unsigned NEON_RS = 0;
+		constexpr unsigned NEON_RT = 1;
+		constexpr unsigned NEON_RD = 2;
+
+		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
+			const size_t offset = GprOffset(guest_reg);
+			if (offset <= 255)
+				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
+				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+		};
+
+		if (rs == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RS, NEON_RS, NEON_RS))
+				return false;
+		}
+		else if (!emit_gpr_address(rs, HOST_TMP0) ||
+				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+		{
+			return false;
+		}
+
+		if (rt == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RT, NEON_RT, NEON_RT))
+				return false;
+		}
+		else if (!emit_gpr_address(rt, HOST_TMP1) ||
+				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+		{
+			return false;
+		}
+
+		bool vector_op_ok = false;
+		switch (operation)
+		{
+			case MmiVectorOp::AddWord:
+				vector_op_ok = m_code.EmitVaddI32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SubtractWord:
+				vector_op_ok = m_code.EmitVsubI32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::CompareGreaterSignedWord:
+				vector_op_ok = m_code.EmitVcgtS32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::MaxSignedWord:
+				vector_op_ok = m_code.EmitVmaxS32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::AddHalfword:
+				vector_op_ok = m_code.EmitVaddI16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SubtractHalfword:
+				vector_op_ok = m_code.EmitVsubI16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::CompareGreaterSignedHalfword:
+				vector_op_ok = m_code.EmitVcgtS16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::MaxSignedHalfword:
+				vector_op_ok = m_code.EmitVmaxS16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::AddByte:
+				vector_op_ok = m_code.EmitVaddI8Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SubtractByte:
+				vector_op_ok = m_code.EmitVsubI8Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::CompareGreaterSignedByte:
+				vector_op_ok = m_code.EmitVcgtS8Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::CompareEqualWord:
+				vector_op_ok = m_code.EmitVceqI32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::MinSignedWord:
+				vector_op_ok = m_code.EmitVminS32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::CompareEqualHalfword:
+				vector_op_ok = m_code.EmitVceqI16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::MinSignedHalfword:
+				vector_op_ok = m_code.EmitVminS16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::CompareEqualByte:
+				vector_op_ok = m_code.EmitVceqI8Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingAddSignedWord:
+				vector_op_ok = m_code.EmitVqaddS32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingSubtractSignedWord:
+				vector_op_ok = m_code.EmitVqsubS32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingAddSignedHalfword:
+				vector_op_ok = m_code.EmitVqaddS16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingSubtractSignedHalfword:
+				vector_op_ok = m_code.EmitVqsubS16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingAddSignedByte:
+				vector_op_ok = m_code.EmitVqaddS8Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingSubtractSignedByte:
+				vector_op_ok = m_code.EmitVqsubS8Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingAddUnsignedWord:
+				vector_op_ok = m_code.EmitVqaddU32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingSubtractUnsignedWord:
+				vector_op_ok = m_code.EmitVqsubU32Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingAddUnsignedHalfword:
+				vector_op_ok = m_code.EmitVqaddU16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingSubtractUnsignedHalfword:
+				vector_op_ok = m_code.EmitVqsubU16Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingAddUnsignedByte:
+				vector_op_ok = m_code.EmitVqaddU8Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::SaturatingSubtractUnsignedByte:
+				vector_op_ok = m_code.EmitVqsubU8Q(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::BitwiseAnd:
+				vector_op_ok = m_code.EmitVandQ(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::BitwiseXor:
+				vector_op_ok = m_code.EmitVeorQ(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::BitwiseOr:
+				vector_op_ok = m_code.EmitVorrQ(NEON_RD, NEON_RS, NEON_RT);
+				break;
+			case MmiVectorOp::BitwiseNor:
+				vector_op_ok = m_code.EmitVorrQ(NEON_RD, NEON_RS, NEON_RT) &&
+							   m_code.EmitVmvnQ(NEON_RD, NEON_RD);
+				break;
+		}
+
+		if (!vector_op_ok ||
+			!emit_gpr_address(rd, HOST_TMP2) ||
+			!m_code.EmitVst1Q32(NEON_RD, HOST_TMP2))
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitMmiUnaryRtVectorOp(u32 op, MmiUnaryVectorOp operation)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		constexpr unsigned NEON_RT = 0;
+
+		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
+			const size_t offset = GprOffset(guest_reg);
+			if (offset <= 255)
+				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
+				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+		};
+
+		if (rt == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RT, NEON_RT, NEON_RT))
+				return false;
+		}
+		else if (!emit_gpr_address(rt, HOST_TMP0) ||
+				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP0))
+		{
+			return false;
+		}
+
+		bool vector_op_ok = false;
+		switch (operation)
+		{
+			case MmiUnaryVectorOp::AbsoluteSignedWord:
+				vector_op_ok = m_code.EmitVqabsS32Q(NEON_RT, NEON_RT);
+				break;
+			case MmiUnaryVectorOp::AbsoluteSignedHalfword:
+				vector_op_ok = m_code.EmitVqabsS16Q(NEON_RT, NEON_RT);
+				break;
+		}
+
+		if (!vector_op_ok ||
+			!emit_gpr_address(rd, HOST_TMP2) ||
+			!m_code.EmitVst1Q32(NEON_RT, HOST_TMP2))
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitMmiImmediateShiftOp(u32 op, MmiImmediateShiftOp operation)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		constexpr unsigned NEON_RT = 0;
+
+		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
+			const size_t offset = GprOffset(guest_reg);
+			if (offset <= 255)
+				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
+				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+		};
+
+		if (rt == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RT, NEON_RT, NEON_RT))
+				return false;
+		}
+		else if (!emit_gpr_address(rt, HOST_TMP0) ||
+				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP0))
+		{
+			return false;
+		}
+
+		const u8 amount = static_cast<u8>((operation == MmiImmediateShiftOp::ShiftLeftHalfword ||
+			operation == MmiImmediateShiftOp::ShiftRightLogicalHalfword ||
+			operation == MmiImmediateShiftOp::ShiftRightArithmeticHalfword) ?
+			(SA(op) & 0x0f) : SA(op));
+
+		bool vector_op_ok = true;
+		if (amount != 0)
+		{
+			switch (operation)
+			{
+				case MmiImmediateShiftOp::ShiftLeftHalfword:
+					vector_op_ok = m_code.EmitVshlI16Q(NEON_RT, NEON_RT, amount);
+					break;
+				case MmiImmediateShiftOp::ShiftRightLogicalHalfword:
+					vector_op_ok = m_code.EmitVshrU16Q(NEON_RT, NEON_RT, amount);
+					break;
+				case MmiImmediateShiftOp::ShiftRightArithmeticHalfword:
+					vector_op_ok = m_code.EmitVshrS16Q(NEON_RT, NEON_RT, amount);
+					break;
+				case MmiImmediateShiftOp::ShiftLeftWord:
+					vector_op_ok = m_code.EmitVshlI32Q(NEON_RT, NEON_RT, amount);
+					break;
+				case MmiImmediateShiftOp::ShiftRightLogicalWord:
+					vector_op_ok = m_code.EmitVshrU32Q(NEON_RT, NEON_RT, amount);
+					break;
+				case MmiImmediateShiftOp::ShiftRightArithmeticWord:
+					vector_op_ok = m_code.EmitVshrS32Q(NEON_RT, NEON_RT, amount);
+					break;
+			}
+		}
+
+		if (!vector_op_ok ||
+			!emit_gpr_address(rd, HOST_TMP2) ||
+			!m_code.EmitVst1Q32(NEON_RT, HOST_TMP2))
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitMmiVariableWordShiftOp(u32 op, MmiVariableWordShiftOp operation)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		const auto emit_load_gpr_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
+		};
+
+		const auto emit_store_rd_word = [this, rd](unsigned word, unsigned host_reg) {
+			return m_code.EmitStrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(rd) + word * sizeof(u32)));
+		};
+
+		const auto emit_lane = [&](unsigned source_word, unsigned result_word, unsigned value_reg,
+			unsigned amount_reg, unsigned sign_reg) {
+			VitaA32::ShiftType shift = VitaA32::ShiftType::LSL;
+			switch (operation)
+			{
+				case MmiVariableWordShiftOp::ShiftLeftLogical:
+					shift = VitaA32::ShiftType::LSL;
+					break;
+				case MmiVariableWordShiftOp::ShiftRightLogical:
+					shift = VitaA32::ShiftType::LSR;
+					break;
+				case MmiVariableWordShiftOp::ShiftRightArithmetic:
+					shift = VitaA32::ShiftType::ASR;
+					break;
+			}
+
+			return emit_load_gpr_word(rt, source_word, value_reg) &&
+				   emit_load_gpr_word(rs, source_word, amount_reg) &&
+				   m_code.EmitAndImm8(amount_reg, amount_reg, 0x1f) &&
+				   m_code.EmitMovRegShiftReg(value_reg, value_reg, shift, amount_reg) &&
+				   m_code.EmitMovRegShiftImm(sign_reg, value_reg, VitaA32::ShiftType::ASR, 31) &&
+				   emit_store_rd_word(result_word, value_reg) &&
+				   emit_store_rd_word(result_word + 1, sign_reg);
+		};
+
+		return emit_lane(0, 0, HOST_TMP0, HOST_TMP2, HOST_TMP1) &&
+			   emit_lane(2, 2, HOST_TMP3, HOST_TMP2, HOST_TMP4);
+	}
+
+	bool BlockCompiler::EmitMmiWordShuffleOp(u32 op, MmiWordShuffleOp operation)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		const auto emit_load_gpr_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
+		};
+
+		const auto emit_store_rd_word = [this, rd](unsigned word, unsigned host_reg) {
+			return m_code.EmitStrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(rd) + word * sizeof(u32)));
+		};
+
+		switch (operation)
+		{
+			case MmiWordShuffleOp::Pcpyld:
+				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 1, HOST_TMP1) &&
+					   emit_load_gpr_word(rs, 0, HOST_TMP2) &&
+					   emit_load_gpr_word(rs, 1, HOST_TMP3) &&
+					   emit_store_rd_word(0, HOST_TMP0) &&
+					   emit_store_rd_word(1, HOST_TMP1) &&
+					   emit_store_rd_word(2, HOST_TMP2) &&
+					   emit_store_rd_word(3, HOST_TMP3);
+			case MmiWordShuffleOp::Pcpyud:
+				return emit_load_gpr_word(rs, 2, HOST_TMP0) &&
+					   emit_load_gpr_word(rs, 3, HOST_TMP1) &&
+					   emit_load_gpr_word(rt, 2, HOST_TMP2) &&
+					   emit_load_gpr_word(rt, 3, HOST_TMP3) &&
+					   emit_store_rd_word(0, HOST_TMP0) &&
+					   emit_store_rd_word(1, HOST_TMP1) &&
+					   emit_store_rd_word(2, HOST_TMP2) &&
+					   emit_store_rd_word(3, HOST_TMP3);
+			case MmiWordShuffleOp::Pexew:
+				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 1, HOST_TMP1) &&
+					   emit_load_gpr_word(rt, 2, HOST_TMP2) &&
+					   emit_load_gpr_word(rt, 3, HOST_TMP3) &&
+					   emit_store_rd_word(0, HOST_TMP2) &&
+					   emit_store_rd_word(1, HOST_TMP1) &&
+					   emit_store_rd_word(2, HOST_TMP0) &&
+					   emit_store_rd_word(3, HOST_TMP3);
+			case MmiWordShuffleOp::Prot3w:
+				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 1, HOST_TMP1) &&
+					   emit_load_gpr_word(rt, 2, HOST_TMP2) &&
+					   emit_load_gpr_word(rt, 3, HOST_TMP3) &&
+					   emit_store_rd_word(0, HOST_TMP1) &&
+					   emit_store_rd_word(1, HOST_TMP2) &&
+					   emit_store_rd_word(2, HOST_TMP0) &&
+					   emit_store_rd_word(3, HOST_TMP3);
+			case MmiWordShuffleOp::Pexcw:
+				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 1, HOST_TMP1) &&
+					   emit_load_gpr_word(rt, 2, HOST_TMP2) &&
+					   emit_load_gpr_word(rt, 3, HOST_TMP3) &&
+					   emit_store_rd_word(0, HOST_TMP0) &&
+					   emit_store_rd_word(1, HOST_TMP2) &&
+					   emit_store_rd_word(2, HOST_TMP1) &&
+					   emit_store_rd_word(3, HOST_TMP3);
+		}
+
+		return false;
+	}
+
+	bool BlockCompiler::EmitMmiFiveBitOp(u32 op, MmiFiveBitOp operation)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		const auto emit_load_gpr_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
+		};
+
+		const auto emit_store_rd_word = [this, rd](unsigned word, unsigned host_reg) {
+			return m_code.EmitStrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(rd) + word * sizeof(u32)));
+		};
+
+		const auto emit_expand_lane = [&](unsigned word, unsigned value_reg, unsigned result_reg,
+			unsigned tmp_reg) {
+			return emit_load_gpr_word(rt, word, value_reg) &&
+				   m_code.EmitAndImm8(result_reg, value_reg, 0x1f) &&
+				   m_code.EmitMovRegShiftImm(result_reg, result_reg, VitaA32::ShiftType::LSL, 3) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, value_reg, VitaA32::ShiftType::LSR, 5) &&
+				   m_code.EmitAndImm8(tmp_reg, tmp_reg, 0x1f) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, tmp_reg, VitaA32::ShiftType::LSL, 11) &&
+				   m_code.EmitOrrReg(result_reg, result_reg, tmp_reg) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, value_reg, VitaA32::ShiftType::LSR, 10) &&
+				   m_code.EmitAndImm8(tmp_reg, tmp_reg, 0x1f) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, tmp_reg, VitaA32::ShiftType::LSL, 19) &&
+				   m_code.EmitOrrReg(result_reg, result_reg, tmp_reg) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, value_reg, VitaA32::ShiftType::LSR, 15) &&
+				   m_code.EmitAndImm8(tmp_reg, tmp_reg, 0x01) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, tmp_reg, VitaA32::ShiftType::LSL, 31) &&
+				   m_code.EmitOrrReg(result_reg, result_reg, tmp_reg) &&
+				   emit_store_rd_word(word, result_reg);
+		};
+
+		const auto emit_pack_lane = [&](unsigned word, unsigned value_reg, unsigned result_reg,
+			unsigned tmp_reg) {
+			return emit_load_gpr_word(rt, word, value_reg) &&
+				   m_code.EmitMovRegShiftImm(result_reg, value_reg, VitaA32::ShiftType::LSR, 3) &&
+				   m_code.EmitAndImm8(result_reg, result_reg, 0x1f) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, value_reg, VitaA32::ShiftType::LSR, 11) &&
+				   m_code.EmitAndImm8(tmp_reg, tmp_reg, 0x1f) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, tmp_reg, VitaA32::ShiftType::LSL, 5) &&
+				   m_code.EmitOrrReg(result_reg, result_reg, tmp_reg) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, value_reg, VitaA32::ShiftType::LSR, 19) &&
+				   m_code.EmitAndImm8(tmp_reg, tmp_reg, 0x1f) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, tmp_reg, VitaA32::ShiftType::LSL, 10) &&
+				   m_code.EmitOrrReg(result_reg, result_reg, tmp_reg) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, value_reg, VitaA32::ShiftType::LSR, 31) &&
+				   m_code.EmitMovRegShiftImm(tmp_reg, tmp_reg, VitaA32::ShiftType::LSL, 15) &&
+				   m_code.EmitOrrReg(result_reg, result_reg, tmp_reg) &&
+				   emit_store_rd_word(word, result_reg);
+		};
+
+		for (unsigned word = 0; word < 4; word++)
+		{
+			if (operation == MmiFiveBitOp::Expand)
+			{
+				if (!emit_expand_lane(word, HOST_TMP0, HOST_TMP1, HOST_TMP2))
+					return false;
+			}
+			else if (!emit_pack_lane(word, HOST_TMP0, HOST_TMP1, HOST_TMP2))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitMmiHalfwordShuffleOp(u32 op, MmiHalfwordShuffleOp operation)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		const auto emit_load_gpr_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+
+			return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
+		};
+
+		const auto emit_store_rd_word = [this, rd](unsigned word, unsigned host_reg) {
+			return m_code.EmitStrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(rd) + word * sizeof(u32)));
+		};
+
+		const auto emit_pack = [this](unsigned low_reg, bool low_high_half, unsigned high_reg,
+			bool high_high_half, unsigned out_reg) {
+			if (low_high_half &&
+				!m_code.EmitMovRegShiftImm(out_reg, low_reg, VitaA32::ShiftType::LSR, 16))
+			{
+				return false;
+			}
+
+			const unsigned rn = low_high_half ? out_reg : low_reg;
+			const u8 high_shift = high_high_half ? 0 : 16;
+			return m_code.EmitPkhbt(out_reg, rn, high_reg, high_shift);
+		};
+
+		const auto emit_pin_word = [&](unsigned out_word, unsigned rt_word, unsigned rs_word) {
+			return emit_load_gpr_word(rt, rt_word, HOST_TMP0) &&
+				   emit_load_gpr_word(rs, rs_word, HOST_TMP1) &&
+				   emit_pack(HOST_TMP0, false, HOST_TMP1, false, HOST_TMP4) &&
+				   emit_store_rd_word(out_word, HOST_TMP4);
+		};
+
+		switch (operation)
+		{
+			case MmiHalfwordShuffleOp::Pinth:
+				if (!emit_load_gpr_word(rt, 0, HOST_TMP0) ||
+					!emit_load_gpr_word(rs, 2, HOST_TMP1) ||
+					!emit_load_gpr_word(rt, 1, HOST_TMP2) ||
+					!emit_load_gpr_word(rs, 3, HOST_TMP3))
+				{
+					return false;
+				}
+				return emit_pack(HOST_TMP0, false, HOST_TMP1, false, HOST_TMP4) &&
+					   emit_store_rd_word(0, HOST_TMP4) &&
+					   emit_pack(HOST_TMP0, true, HOST_TMP1, true, HOST_TMP4) &&
+					   emit_store_rd_word(1, HOST_TMP4) &&
+					   emit_pack(HOST_TMP2, false, HOST_TMP3, false, HOST_TMP4) &&
+					   emit_store_rd_word(2, HOST_TMP4) &&
+					   emit_pack(HOST_TMP2, true, HOST_TMP3, true, HOST_TMP4) &&
+					   emit_store_rd_word(3, HOST_TMP4);
+			case MmiHalfwordShuffleOp::Pinteh:
+				return emit_pin_word(0, 0, 0) &&
+					   emit_pin_word(1, 1, 1) &&
+					   emit_pin_word(2, 2, 2) &&
+					   emit_pin_word(3, 3, 3);
+			case MmiHalfwordShuffleOp::Pexeh:
+				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 1, HOST_TMP1) &&
+					   emit_pack(HOST_TMP1, false, HOST_TMP0, true, HOST_TMP4) &&
+					   emit_store_rd_word(0, HOST_TMP4) &&
+					   emit_pack(HOST_TMP0, false, HOST_TMP1, true, HOST_TMP4) &&
+					   emit_store_rd_word(1, HOST_TMP4) &&
+					   emit_load_gpr_word(rt, 2, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 3, HOST_TMP1) &&
+					   emit_pack(HOST_TMP1, false, HOST_TMP0, true, HOST_TMP4) &&
+					   emit_store_rd_word(2, HOST_TMP4) &&
+					   emit_pack(HOST_TMP0, false, HOST_TMP1, true, HOST_TMP4) &&
+					   emit_store_rd_word(3, HOST_TMP4);
+			case MmiHalfwordShuffleOp::Prevh:
+				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 1, HOST_TMP1) &&
+					   emit_pack(HOST_TMP1, true, HOST_TMP1, false, HOST_TMP4) &&
+					   emit_store_rd_word(0, HOST_TMP4) &&
+					   emit_pack(HOST_TMP0, true, HOST_TMP0, false, HOST_TMP4) &&
+					   emit_store_rd_word(1, HOST_TMP4) &&
+					   emit_load_gpr_word(rt, 2, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 3, HOST_TMP1) &&
+					   emit_pack(HOST_TMP1, true, HOST_TMP1, false, HOST_TMP4) &&
+					   emit_store_rd_word(2, HOST_TMP4) &&
+					   emit_pack(HOST_TMP0, true, HOST_TMP0, false, HOST_TMP4) &&
+					   emit_store_rd_word(3, HOST_TMP4);
+			case MmiHalfwordShuffleOp::Pexch:
+				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 1, HOST_TMP1) &&
+					   emit_pack(HOST_TMP0, false, HOST_TMP1, false, HOST_TMP4) &&
+					   emit_store_rd_word(0, HOST_TMP4) &&
+					   emit_pack(HOST_TMP0, true, HOST_TMP1, true, HOST_TMP4) &&
+					   emit_store_rd_word(1, HOST_TMP4) &&
+					   emit_load_gpr_word(rt, 2, HOST_TMP0) &&
+					   emit_load_gpr_word(rt, 3, HOST_TMP1) &&
+					   emit_pack(HOST_TMP0, false, HOST_TMP1, false, HOST_TMP4) &&
+					   emit_store_rd_word(2, HOST_TMP4) &&
+					   emit_pack(HOST_TMP0, true, HOST_TMP1, true, HOST_TMP4) &&
+					   emit_store_rd_word(3, HOST_TMP4);
+			case MmiHalfwordShuffleOp::Pcpyh:
+				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
+					   emit_pack(HOST_TMP0, false, HOST_TMP0, false, HOST_TMP4) &&
+					   emit_store_rd_word(0, HOST_TMP4) &&
+					   emit_store_rd_word(1, HOST_TMP4) &&
+					   emit_load_gpr_word(rt, 2, HOST_TMP0) &&
+					   emit_pack(HOST_TMP0, false, HOST_TMP0, false, HOST_TMP4) &&
+					   emit_store_rd_word(2, HOST_TMP4) &&
+					   emit_store_rd_word(3, HOST_TMP4);
+		}
+
+		return false;
+	}
+
+	bool BlockCompiler::EmitMmiInterleaveOp(u32 op, MmiUpperInterleaveOp operation, bool upper_half)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		constexpr unsigned NEON_RS = 0;
+		constexpr unsigned NEON_RT = 1;
+
+		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
+			const size_t offset = GprOffset(guest_reg);
+			if (offset <= 255)
+				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
+				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+		};
+
+		if (rs == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RS, NEON_RS, NEON_RS))
+				return false;
+		}
+		else if (!emit_gpr_address(rs, HOST_TMP0) ||
+				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+		{
+			return false;
+		}
+
+		if (rt == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RT, NEON_RT, NEON_RT))
+				return false;
+		}
+		else if (!emit_gpr_address(rt, HOST_TMP1) ||
+				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+		{
+			return false;
+		}
+
+		bool vector_op_ok = false;
+		switch (operation)
+		{
+			case MmiUpperInterleaveOp::Word:
+				vector_op_ok = m_code.EmitVzipI32Q(NEON_RT, NEON_RS);
+				break;
+			case MmiUpperInterleaveOp::Halfword:
+				vector_op_ok = m_code.EmitVzipI16Q(NEON_RT, NEON_RS);
+				break;
+			case MmiUpperInterleaveOp::Byte:
+				vector_op_ok = m_code.EmitVzipI8Q(NEON_RT, NEON_RS);
+				break;
+		}
+
+		// vzip RT, RS leaves the lower interleave in RT and the upper
+		// interleave in RS. PCSX2's PEXTL* and PEXTU* forms use those halves
+		// directly.
+		const unsigned result = upper_half ? NEON_RS : NEON_RT;
+		if (!vector_op_ok ||
+			!emit_gpr_address(rd, HOST_TMP2) ||
+			!m_code.EmitVst1Q32(result, HOST_TMP2))
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitMmiUpperInterleaveOp(u32 op, MmiUpperInterleaveOp operation)
+	{
+		return EmitMmiInterleaveOp(op, operation, true);
+	}
+
+	bool BlockCompiler::EmitMmiPackEvenOp(u32 op, MmiUpperInterleaveOp operation)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		constexpr unsigned NEON_RS = 0;
+		constexpr unsigned NEON_RT = 1;
+
+		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
+			const size_t offset = GprOffset(guest_reg);
+			if (offset <= 255)
+				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
+				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+		};
+
+		if (rs == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RS, NEON_RS, NEON_RS))
+				return false;
+		}
+		else if (!emit_gpr_address(rs, HOST_TMP0) ||
+				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+		{
+			return false;
+		}
+
+		if (rt == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RT, NEON_RT, NEON_RT))
+				return false;
+		}
+		else if (!emit_gpr_address(rt, HOST_TMP1) ||
+				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+		{
+			return false;
+		}
+
+		bool vector_op_ok = false;
+		switch (operation)
+		{
+			case MmiUpperInterleaveOp::Word:
+				vector_op_ok = m_code.EmitVuzpI32Q(NEON_RT, NEON_RS);
+				break;
+			case MmiUpperInterleaveOp::Halfword:
+				vector_op_ok = m_code.EmitVuzpI16Q(NEON_RT, NEON_RS);
+				break;
+			case MmiUpperInterleaveOp::Byte:
+				vector_op_ok = m_code.EmitVuzpI8Q(NEON_RT, NEON_RS);
+				break;
+		}
+
+		// vuzp RT, RS leaves the even RT lanes followed by the even RS lanes in
+		// RT, matching PCSX2's PPACW/PPACH/PPACB definitions.
+		if (!vector_op_ok ||
+			!emit_gpr_address(rd, HOST_TMP2) ||
+			!m_code.EmitVst1Q32(NEON_RT, HOST_TMP2))
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitPABSW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PABSW(), which computes saturating absolute
+		// values for four signed 32-bit lanes from RT and ignores RS.
+		return EmitMmiUnaryRtVectorOp(op, MmiUnaryVectorOp::AbsoluteSignedWord);
+	}
+
+	bool BlockCompiler::EmitPSLLH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::tbl_MMI dispatches this opcode
+		// to MMI.cpp::PSLLH(), which left-shifts eight 16-bit lanes by SA & 0xf.
+		return EmitMmiImmediateShiftOp(op, MmiImmediateShiftOp::ShiftLeftHalfword);
+	}
+
+	bool BlockCompiler::EmitPSRLH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::tbl_MMI dispatches this opcode
+		// to MMI.cpp::PSRLH(), which logical-right-shifts eight 16-bit lanes by SA & 0xf.
+		return EmitMmiImmediateShiftOp(op, MmiImmediateShiftOp::ShiftRightLogicalHalfword);
+	}
+
+	bool BlockCompiler::EmitPSRAH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::tbl_MMI dispatches this opcode
+		// to MMI.cpp::PSRAH(), which arithmetic-right-shifts eight signed 16-bit lanes by SA & 0xf.
+		return EmitMmiImmediateShiftOp(op, MmiImmediateShiftOp::ShiftRightArithmeticHalfword);
+	}
+
+	bool BlockCompiler::EmitPSLLW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::tbl_MMI dispatches this opcode
+		// to MMI.cpp::PSLLW(), which left-shifts four 32-bit lanes by SA.
+		return EmitMmiImmediateShiftOp(op, MmiImmediateShiftOp::ShiftLeftWord);
+	}
+
+	bool BlockCompiler::EmitPSRLW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::tbl_MMI dispatches this opcode
+		// to MMI.cpp::PSRLW(), which logical-right-shifts four 32-bit lanes by SA.
+		return EmitMmiImmediateShiftOp(op, MmiImmediateShiftOp::ShiftRightLogicalWord);
+	}
+
+	bool BlockCompiler::EmitPSRAW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::tbl_MMI dispatches this opcode
+		// to MMI.cpp::PSRAW(), which arithmetic-right-shifts four signed 32-bit lanes by SA.
+		return EmitMmiImmediateShiftOp(op, MmiImmediateShiftOp::ShiftRightArithmeticWord);
+	}
+
+	bool BlockCompiler::EmitPADDW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PADDW(), which wraps four independent 32-bit lanes.
+		// The Cortex-A9 path uses call-clobbered NEON q0-q2 as block-local
+		// temporaries; this matches the full128 MMI promotion rule in the Vita
+		// ARM optimization plan.
+		return EmitMmiVectorOp(op, MmiVectorOp::AddWord);
+	}
+
+	bool BlockCompiler::EmitPSUBW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PSUBW(), which wraps four independent 32-bit lanes.
+		return EmitMmiVectorOp(op, MmiVectorOp::SubtractWord);
+	}
+
+	bool BlockCompiler::EmitPCGTW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PCGTW(), signed-compares four independent 32-bit
+		// lanes, and writes each result as 0xffffffff or 0x00000000.
+		return EmitMmiVectorOp(op, MmiVectorOp::CompareGreaterSignedWord);
+	}
+
+	bool BlockCompiler::EmitPMAXW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PMAXW(), which writes the signed max of each
+		// independent 32-bit lane.
+		return EmitMmiVectorOp(op, MmiVectorOp::MaxSignedWord);
+	}
+
+	bool BlockCompiler::EmitPADDH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PADDH(), which wraps eight independent 16-bit lanes.
+		return EmitMmiVectorOp(op, MmiVectorOp::AddHalfword);
+	}
+
+	bool BlockCompiler::EmitPSUBH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PSUBH(), which wraps eight independent 16-bit lanes.
+		return EmitMmiVectorOp(op, MmiVectorOp::SubtractHalfword);
+	}
+
+	bool BlockCompiler::EmitPCGTH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PCGTH(), signed-compares eight independent 16-bit
+		// lanes, and writes each result as 0xffff or 0x0000.
+		return EmitMmiVectorOp(op, MmiVectorOp::CompareGreaterSignedHalfword);
+	}
+
+	bool BlockCompiler::EmitPMAXH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PMAXH(), which writes the signed max of each
+		// independent 16-bit lane.
+		return EmitMmiVectorOp(op, MmiVectorOp::MaxSignedHalfword);
+	}
+
+	bool BlockCompiler::EmitPADDB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PADDB(), which wraps sixteen independent 8-bit lanes.
+		return EmitMmiVectorOp(op, MmiVectorOp::AddByte);
+	}
+
+	bool BlockCompiler::EmitPSUBB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PSUBB(), which wraps sixteen independent 8-bit lanes.
+		return EmitMmiVectorOp(op, MmiVectorOp::SubtractByte);
+	}
+
+	bool BlockCompiler::EmitPCGTB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PCGTB(), signed-compares sixteen independent 8-bit
+		// lanes, and writes each result as 0xff or 0x00.
+		return EmitMmiVectorOp(op, MmiVectorOp::CompareGreaterSignedByte);
+	}
+
+	bool BlockCompiler::EmitPADDSW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PADDSW(), which signed-saturates four 32-bit sums.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingAddSignedWord);
+	}
+
+	bool BlockCompiler::EmitPSUBSW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PSUBSW(), which signed-saturates four 32-bit differences.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingSubtractSignedWord);
+	}
+
+	bool BlockCompiler::EmitPEXTLW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PEXTLW(), which interleaves the lower 32-bit lanes
+		// of RT and RS as RT0, RS0, RT1, RS1.
+		return EmitMmiInterleaveOp(op, MmiUpperInterleaveOp::Word, false);
+	}
+
+	bool BlockCompiler::EmitPPACW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PPACW(), which packs even 32-bit lanes as
+		// RT0, RT2, RS0, RS2.
+		return EmitMmiPackEvenOp(op, MmiUpperInterleaveOp::Word);
+	}
+
+	bool BlockCompiler::EmitPADDSH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PADDSH(), which signed-saturates eight 16-bit sums.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingAddSignedHalfword);
+	}
+
+	bool BlockCompiler::EmitPSUBSH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PSUBSH(), which signed-saturates eight 16-bit differences.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingSubtractSignedHalfword);
+	}
+
+	bool BlockCompiler::EmitPEXTLH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PEXTLH(), which interleaves the lower 16-bit lanes
+		// of RT and RS as RT0, RS0, ... RT3, RS3.
+		return EmitMmiInterleaveOp(op, MmiUpperInterleaveOp::Halfword, false);
+	}
+
+	bool BlockCompiler::EmitPPACH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PPACH(), which packs even 16-bit lanes as
+		// RT0, RT2, RT4, RT6, RS0, RS2, RS4, RS6.
+		return EmitMmiPackEvenOp(op, MmiUpperInterleaveOp::Halfword);
+	}
+
+	bool BlockCompiler::EmitPADDSB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PADDSB(), which signed-saturates sixteen 8-bit sums.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingAddSignedByte);
+	}
+
+	bool BlockCompiler::EmitPSUBSB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PSUBSB(), which signed-saturates sixteen 8-bit differences.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingSubtractSignedByte);
+	}
+
+	bool BlockCompiler::EmitPEXTLB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PEXTLB(), which interleaves the lower 8-bit lanes
+		// of RT and RS as RT0, RS0, ... RT7, RS7.
+		return EmitMmiInterleaveOp(op, MmiUpperInterleaveOp::Byte, false);
+	}
+
+	bool BlockCompiler::EmitPPACB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PPACB(), which packs even 8-bit lanes as
+		// RT0, RT2, ... RT14, RS0, RS2, ... RS14.
+		return EmitMmiPackEvenOp(op, MmiUpperInterleaveOp::Byte);
+	}
+
+	bool BlockCompiler::EmitPEXT5(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PEXT5(), which expands each RT 5:5:5:1 word into
+		// byte-aligned 8:8:8:8 fields.
+		return EmitMmiFiveBitOp(op, MmiFiveBitOp::Expand);
+	}
+
+	bool BlockCompiler::EmitPPAC5(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI0() dispatches this
+		// opcode to MMI.cpp::PPAC5(), which packs each RT 8:8:8:8 word back
+		// into a 5:5:5:1 field layout.
+		return EmitMmiFiveBitOp(op, MmiFiveBitOp::Pack);
+	}
+
+	bool BlockCompiler::EmitPCEQW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PCEQW(), which writes 0xffffffff for equal 32-bit lanes.
+		return EmitMmiVectorOp(op, MmiVectorOp::CompareEqualWord);
+	}
+
+	bool BlockCompiler::EmitPMINW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PMINW(), which writes the signed min of each 32-bit lane.
+		return EmitMmiVectorOp(op, MmiVectorOp::MinSignedWord);
+	}
+
+	bool BlockCompiler::EmitPADSBH(u32 op)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		constexpr unsigned NEON_RS = 0;
+		constexpr unsigned NEON_RT = 1;
+		constexpr unsigned NEON_SUB = 2;
+		constexpr unsigned NEON_ADD = 3;
+		constexpr unsigned NEON_SUB_LOW_D = NEON_SUB * 2;
+		constexpr unsigned NEON_ADD_HIGH_D = NEON_ADD * 2 + 1;
+
+		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
+			const size_t offset = GprOffset(guest_reg);
+			if (offset <= 255)
+				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
+				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+		};
+
+		if (rs == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RS, NEON_RS, NEON_RS))
+				return false;
+		}
+		else if (!emit_gpr_address(rs, HOST_TMP0) ||
+				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+		{
+			return false;
+		}
+
+		if (rt == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RT, NEON_RT, NEON_RT))
+				return false;
+		}
+		else if (!emit_gpr_address(rt, HOST_TMP1) ||
+				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+		{
+			return false;
+		}
+
+		// PCSX2 owner: MMI.cpp::PADSBH() subtracts lanes 0..3 with PSUBH
+		// semantics and adds lanes 4..7 with PADDH semantics.
+		return m_code.EmitVsubI16Q(NEON_SUB, NEON_RS, NEON_RT) &&
+			   m_code.EmitVaddI16Q(NEON_ADD, NEON_RS, NEON_RT) &&
+			   emit_gpr_address(rd, HOST_TMP2) &&
+			   m_code.EmitVst1D32(NEON_SUB_LOW_D, HOST_TMP2) &&
+			   m_code.EmitAddImm8(HOST_TMP2, HOST_TMP2, 8) &&
+			   m_code.EmitVst1D32(NEON_ADD_HIGH_D, HOST_TMP2);
+	}
+
+	bool BlockCompiler::EmitPABSH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PABSH(), which computes saturating absolute
+		// values for eight signed 16-bit lanes from RT and ignores RS.
+		return EmitMmiUnaryRtVectorOp(op, MmiUnaryVectorOp::AbsoluteSignedHalfword);
+	}
+
+	bool BlockCompiler::EmitPCEQH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PCEQH(), which writes 0xffff for equal 16-bit lanes.
+		return EmitMmiVectorOp(op, MmiVectorOp::CompareEqualHalfword);
+	}
+
+	bool BlockCompiler::EmitPMINH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PMINH(), which writes the signed min of each 16-bit lane.
+		return EmitMmiVectorOp(op, MmiVectorOp::MinSignedHalfword);
+	}
+
+	bool BlockCompiler::EmitPCEQB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PCEQB(), which writes 0xff for equal 8-bit lanes.
+		return EmitMmiVectorOp(op, MmiVectorOp::CompareEqualByte);
+	}
+
+	bool BlockCompiler::EmitPADDUW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PADDUW(), which unsigned-saturates four 32-bit sums.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingAddUnsignedWord);
+	}
+
+	bool BlockCompiler::EmitPSUBUW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PSUBUW(), which unsigned-saturates four 32-bit differences.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingSubtractUnsignedWord);
+	}
+
+	bool BlockCompiler::EmitPEXTUW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PEXTUW(), which interleaves the upper 32-bit lanes
+		// of RT and RS as RT2, RS2, RT3, RS3.
+		return EmitMmiUpperInterleaveOp(op, MmiUpperInterleaveOp::Word);
+	}
+
+	bool BlockCompiler::EmitPADDUH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PADDUH(), which unsigned-saturates eight 16-bit sums.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingAddUnsignedHalfword);
+	}
+
+	bool BlockCompiler::EmitPSUBUH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PSUBUH(), which unsigned-saturates eight 16-bit differences.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingSubtractUnsignedHalfword);
+	}
+
+	bool BlockCompiler::EmitPEXTUH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PEXTUH(), which interleaves the upper 16-bit lanes
+		// of RT and RS as RT4, RS4, ... RT7, RS7.
+		return EmitMmiUpperInterleaveOp(op, MmiUpperInterleaveOp::Halfword);
+	}
+
+	bool BlockCompiler::EmitPADDUB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PADDUB(), which unsigned-saturates sixteen 8-bit sums.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingAddUnsignedByte);
+	}
+
+	bool BlockCompiler::EmitPSUBUB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PSUBUB(), which unsigned-saturates sixteen 8-bit differences.
+		return EmitMmiVectorOp(op, MmiVectorOp::SaturatingSubtractUnsignedByte);
+	}
+
+	bool BlockCompiler::EmitPEXTUB(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::PEXTUB(), which interleaves the upper 8-bit lanes
+		// of RT and RS as RT8, RS8, ... RT15, RS15.
+		return EmitMmiUpperInterleaveOp(op, MmiUpperInterleaveOp::Byte);
+	}
+
+	bool BlockCompiler::EmitQFSRV(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI1() dispatches this
+		// opcode to MMI.cpp::QFSRV(); x86/iMMI.cpp::recQFSRV() implements it as
+		// a 16-byte unaligned extract from RT||RS at byte offset cpuRegs.sa.
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		constexpr unsigned NEON_RS = 0;
+		constexpr unsigned NEON_RT = 1;
+		constexpr unsigned NEON_RD = 2;
+
+		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
+			const size_t offset = GprOffset(guest_reg);
+			if (offset <= 255)
+				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
+				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+		};
+
+		if (rs == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RS, NEON_RS, NEON_RS))
+				return false;
+		}
+		else if (!emit_gpr_address(rs, HOST_TMP0) ||
+				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+		{
+			return false;
+		}
+
+		if (rt == 0)
+		{
+			if (!m_code.EmitVeorQ(NEON_RT, NEON_RT, NEON_RT))
+				return false;
+		}
+		else if (!emit_gpr_address(rt, HOST_TMP1) ||
+				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+		{
+			return false;
+		}
+
+		if (!emit_gpr_address(rd, HOST_TMP2) ||
+			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET)) ||
+			!m_code.EmitAndImm8(HOST_TMP3, HOST_TMP3, 0x0f))
+		{
+			return false;
+		}
+
+		size_t done_branches[15]{};
+		unsigned done_count = 0;
+		for (u8 offset = 0; offset < 15; offset++)
+		{
+			if (!m_code.EmitMovImm8(HOST_TMP4, offset) ||
+				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+			{
+				return false;
+			}
+
+			const size_t next_case = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (next_case == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitVextI8Q(NEON_RD, NEON_RT, NEON_RS, offset))
+				return false;
+
+			const size_t done = m_code.EmitBranchPlaceholder();
+			if (done == static_cast<size_t>(-1))
+				return false;
+			done_branches[done_count++] = done;
+
+			if (!m_code.PatchBranch(next_case, m_code.Size(), VitaA32::Condition::NE))
+				return false;
+		}
+
+		if (!m_code.EmitVextI8Q(NEON_RD, NEON_RT, NEON_RS, 15))
+			return false;
+
+		const size_t store_target = m_code.Size();
+		for (unsigned i = 0; i < done_count; i++)
+		{
+			if (!m_code.PatchBranch(done_branches[i], store_target))
+				return false;
+		}
+
+		return m_code.EmitVst1Q32(NEON_RD, HOST_TMP2);
+	}
+
+	bool BlockCompiler::EmitPSLLVW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PSLLVW(), which shifts RT.UL[0]/[2] by
+		// RS.UL[0]/[2] & 0x1f and sign-extends each 32-bit result to 64 bits.
+		return EmitMmiVariableWordShiftOp(op, MmiVariableWordShiftOp::ShiftLeftLogical);
+	}
+
+	bool BlockCompiler::EmitPSRLVW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PSRLVW(), which logically shifts RT.UL[0]/[2] by
+		// RS.UL[0]/[2] & 0x1f and sign-extends each 32-bit result to 64 bits.
+		return EmitMmiVariableWordShiftOp(op, MmiVariableWordShiftOp::ShiftRightLogical);
+	}
+
+	bool BlockCompiler::EmitPSRAVW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PSRAVW(), which arithmetically shifts RT.SL[0]/[2]
+		// by RS.UL[0]/[2] & 0x1f and sign-extends each result to 64 bits.
+		return EmitMmiVariableWordShiftOp(op, MmiVariableWordShiftOp::ShiftRightArithmetic);
+	}
+
+	bool BlockCompiler::EmitPINTH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PINTH(), which interleaves RT low halfwords with
+		// RS upper halfwords.
+		return EmitMmiHalfwordShuffleOp(op, MmiHalfwordShuffleOp::Pinth);
+	}
+
+	bool BlockCompiler::EmitPCPYLD(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PCPYLD(), which copies RT.UD[0] into RD.UD[0]
+		// and RS.UD[0] into RD.UD[1].
+		return EmitMmiWordShuffleOp(op, MmiWordShuffleOp::Pcpyld);
+	}
+
+	bool BlockCompiler::EmitPEXEH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PEXEH(), which swaps halfwords 0/2 inside each
+		// 64-bit half while leaving halfwords 1/3 in place.
+		return EmitMmiHalfwordShuffleOp(op, MmiHalfwordShuffleOp::Pexeh);
+	}
+
+	bool BlockCompiler::EmitPREVH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PREVH(), which reverses the four halfwords inside
+		// each 64-bit half.
+		return EmitMmiHalfwordShuffleOp(op, MmiHalfwordShuffleOp::Prevh);
+	}
+
+	bool BlockCompiler::EmitPEXEW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PEXEW(), which writes RT words as 2,1,0,3.
+		return EmitMmiWordShuffleOp(op, MmiWordShuffleOp::Pexew);
+	}
+
+	bool BlockCompiler::EmitPROT3W(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PROT3W(), which writes RT words as 1,2,0,3.
+		return EmitMmiWordShuffleOp(op, MmiWordShuffleOp::Prot3w);
+	}
+
+	bool BlockCompiler::EmitPINTEH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PINTEH(), which interleaves even RT and RS
+		// halfwords.
+		return EmitMmiHalfwordShuffleOp(op, MmiHalfwordShuffleOp::Pinteh);
+	}
+
+	bool BlockCompiler::EmitPCPYUD(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PCPYUD(), which copies RS.UD[1] into RD.UD[0]
+		// and RT.UD[1] into RD.UD[1].
+		return EmitMmiWordShuffleOp(op, MmiWordShuffleOp::Pcpyud);
+	}
+
+	bool BlockCompiler::EmitPMFHI(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PMFHI(), which copies the full 128-bit HI value
+		// into RD unless RD is zero.
+		return EmitMoveFullFromHiLo(op, HI_OFFSET);
+	}
+
+	bool BlockCompiler::EmitPMFLO(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PMFLO(), which copies the full 128-bit LO value
+		// into RD unless RD is zero.
+		return EmitMoveFullFromHiLo(op, LO_OFFSET);
+	}
+
+	bool BlockCompiler::EmitPMTHI(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PMTHI(), which copies the full 128-bit RS value
+		// into HI.
+		return EmitMoveFullToHiLo(op, HI_OFFSET);
+	}
+
+	bool BlockCompiler::EmitPMTLO(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PMTLO(), which copies the full 128-bit RS value
+		// into LO.
+		return EmitMoveFullToHiLo(op, LO_OFFSET);
+	}
+
+	bool BlockCompiler::EmitPEXCH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PEXCH(), which swaps halfwords 1/2 inside each
+		// 64-bit half.
+		return EmitMmiHalfwordShuffleOp(op, MmiHalfwordShuffleOp::Pexch);
+	}
+
+	bool BlockCompiler::EmitPCPYH(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PCPYH(), which broadcasts RT.US[0] into the lower
+		// 64-bit half and RT.US[4] into the upper 64-bit half.
+		return EmitMmiHalfwordShuffleOp(op, MmiHalfwordShuffleOp::Pcpyh);
+	}
+
+	bool BlockCompiler::EmitPEXCW(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PEXCW(), which writes RT words as 0,2,1,3.
+		return EmitMmiWordShuffleOp(op, MmiWordShuffleOp::Pexcw);
+	}
+
+	bool BlockCompiler::EmitPAND(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PAND(), which bitwise-ANDs both 64-bit halves of
+		// the full 128-bit GPR value.
+		return EmitMmiVectorOp(op, MmiVectorOp::BitwiseAnd);
+	}
+
+	bool BlockCompiler::EmitPXOR(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
+		// opcode to MMI.cpp::PXOR(), which bitwise-XORs both 64-bit halves of
+		// the full 128-bit GPR value.
+		return EmitMmiVectorOp(op, MmiVectorOp::BitwiseXor);
+	}
+
+	bool BlockCompiler::EmitPOR(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::POR(), which bitwise-ORs both 64-bit halves of
+		// the full 128-bit GPR value.
+		return EmitMmiVectorOp(op, MmiVectorOp::BitwiseOr);
+	}
+
+	bool BlockCompiler::EmitPNOR(u32 op)
+	{
+		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI3() dispatches this
+		// opcode to MMI.cpp::PNOR(), which writes the full 128-bit bitwise-NOR
+		// of RS and RT.
+		return EmitMmiVectorOp(op, MmiVectorOp::BitwiseNor);
+	}
+
 	bool BlockCompiler::EmitREGIMM(u32 op, u32 pc)
 	{
 		const unsigned rt = RT(op);
@@ -1713,9 +5750,46 @@ namespace VitaEE
 			case 0x11: // BGEZAL, owned by Interpreter.cpp::BGEZAL().
 			case 0x13: // BGEZALL, owned by Interpreter.cpp::BGEZALL().
 				return EmitBranchSigned(op, SignedBranchCondition::GreaterEqualZero);
+			case 0x18: // MTSAB, owned by R5900OpcodeImpl.cpp::MTSAB().
+				return EmitMTSAB(op);
+			case 0x19: // MTSAH, owned by R5900OpcodeImpl.cpp::MTSAH().
+				return EmitMTSAH(op);
 			default:
 				return false;
 		}
+	}
+
+	bool BlockCompiler::EmitMTSAB(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::MTSAB().
+		const u8 imm = static_cast<u8>(IMM_U(op) & 0x0f);
+		if (!EmitLoadGprLow(RS(op), HOST_TMP0) ||
+			!m_code.EmitAndImm8(HOST_TMP0, HOST_TMP0, 0x0f))
+		{
+			return false;
+		}
+
+		if (imm != 0 && !m_code.EmitEorImm8(HOST_TMP0, HOST_TMP0, imm))
+			return false;
+
+		return m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET));
+	}
+
+	bool BlockCompiler::EmitMTSAH(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::MTSAH().
+		const u8 imm = static_cast<u8>(IMM_U(op) & 0x07);
+		if (!EmitLoadGprLow(RS(op), HOST_TMP0) ||
+			!m_code.EmitAndImm8(HOST_TMP0, HOST_TMP0, 0x07))
+		{
+			return false;
+		}
+
+		if (imm != 0 && !m_code.EmitEorImm8(HOST_TMP0, HOST_TMP0, imm))
+			return false;
+
+		return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 1) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET));
 	}
 
 	bool BlockCompiler::EmitJ(u32, u32 pc)
@@ -1778,23 +5852,28 @@ namespace VitaEE
 		return EmitBranchSigned(op, SignedBranchCondition::GreaterThanZero);
 	}
 
-	bool BlockCompiler::EmitLB(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	bool BlockCompiler::EmitLB(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead8), true, 24);
+			reinterpret_cast<const void*>(&VitaEeMemRead8), true, 24, branch_delay_slot);
 	}
 
-	bool BlockCompiler::EmitLH(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	bool BlockCompiler::EmitLH(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), true, 16);
+			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), true, 16, branch_delay_slot);
 	}
 
-	bool BlockCompiler::EmitLW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	bool BlockCompiler::EmitLW(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
 	{
 		const unsigned rt = RT(op);
 
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
+			(branch_delay_slot &&
+			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
 			!EmitCounterReadFlagFromAddress(HOST_TMP0) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead32Checked)))
 		{
@@ -1809,22 +5888,27 @@ namespace VitaEE
 				return false;
 			}
 
-			return EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit);
+			return EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit) &&
+				   (!branch_delay_slot ||
+					   m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0));
 		}
 
-		return true;
+		return !branch_delay_slot ||
+			   m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0);
 	}
 
-	bool BlockCompiler::EmitLBU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	bool BlockCompiler::EmitLBU(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead8), false, 0);
+			reinterpret_cast<const void*>(&VitaEeMemRead8), false, 0, branch_delay_slot);
 	}
 
-	bool BlockCompiler::EmitLHU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	bool BlockCompiler::EmitLHU(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), false, 0);
+			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), false, 0, branch_delay_slot);
 	}
 
 	bool BlockCompiler::EmitLWU(u32 op)
@@ -1870,6 +5954,15 @@ namespace VitaEE
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead64Checked)))
 		{
 			return false;
+		}
+
+		if (rt == 0)
+		{
+			// PCSX2 owner: R5900OpcodeImpl.cpp::LD() writes cpuRegs.GPR.r[_Rt_]
+			// directly. This is intentionally different from LQ's gpr_GetWritePtr().
+			const size_t offset = GprOffset(0);
+			return m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+				   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
 		}
 
 		return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
@@ -2637,6 +6730,25 @@ namespace VitaEE
 		return m_code.PatchBranch(high_nonzero, m_code.Size(), VitaA32::Condition::NE);
 	}
 
+	bool BlockCompiler::EmitCop1Branch(u32 op)
+	{
+		// PCSX2 owner: FPU.cpp::BC1F()/BC1T()/BC1FL()/BC1TL() branch on
+		// FCR31.C; x86/iFPU.cpp::REC_FPUBRANCH() flushes FPU state before
+		// entering the shared branch path. Vita helper-backed scalar COP1 ops
+		// already commit through fpuRegs before a BC1 block observes FCR31.
+		const unsigned rt = RT(op);
+		const bool branch_on_true = rt == 0x01 || rt == 0x03;
+		const u32 fcr31_addr = static_cast<u32>(reinterpret_cast<uptr>(&fpuRegs.fprc[31]));
+
+		return m_code.EmitMovImm32(HOST_TMP0, fcr31_addr) &&
+			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
+			   m_code.EmitMovImm32(HOST_TMP2, FPU_FCR31_CONDITION_FLAG) &&
+			   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2, true) &&
+			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
+			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
+				   branch_on_true ? VitaA32::Condition::NE : VitaA32::Condition::EQ);
+	}
+
 	bool BlockCompiler::EmitSetLessThan64(unsigned guest_reg, bool signed_compare)
 	{
 		if (guest_reg == 0)
@@ -2674,11 +6786,14 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
-		const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift)
+		const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,
+		bool branch_delay_slot)
 	{
 		const unsigned rt = RT(op);
 
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
+			(branch_delay_slot &&
+			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
 			!EmitCounterReadFlagFromAddress(HOST_TMP0) ||
 			!m_code.EmitCallAbsolute(read_helper))
 		{
@@ -2686,7 +6801,10 @@ namespace VitaEE
 		}
 
 		if (rt == 0)
-			return true;
+		{
+			return !branch_delay_slot ||
+				   m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0);
+		}
 
 		if (sign_extend)
 		{
@@ -2705,7 +6823,9 @@ namespace VitaEE
 		}
 
 		return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1) &&
-			   EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit);
+			   EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit) &&
+			   (!branch_delay_slot ||
+				   m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0));
 	}
 
 	bool BlockCompiler::EmitCounterReadFlagFromAddress(unsigned host_reg)
@@ -2740,12 +6860,38 @@ namespace VitaEE
 		if (!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
 			!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(REG_R4 | REG_R5 | REG_PC))
+			!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC))
 		{
 			return false;
 		}
 
 		return m_code.PatchBranch(not_counter_read, m_code.Size(), VitaA32::Condition::EQ);
+	}
+
+	bool BlockCompiler::EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
+		const void* helper, const void* event_exit, bool request_cache_reset)
+	{
+		if (!helper || !event_exit || raw_cycles_through_instruction == 0)
+			return false;
+
+		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
+		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
+			!EmitStorePc(next_pc) ||
+			!EmitAddScaledCyclesToCpu(cycles) ||
+			!m_code.EmitCallAbsolute(helper))
+		{
+			return false;
+		}
+
+		if (request_cache_reset &&
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaRequestA32EeCacheReset)))
+		{
+			return false;
+		}
+
+		return m_code.EmitCallAbsolute(event_exit) &&
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
 	}
 
 	bool BlockCompiler::EmitAddScaledCyclesToCpu(u32 cycles)

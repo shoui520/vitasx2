@@ -24,6 +24,7 @@ add_library(pcsx2core STATIC
 	DebugTools/DisVU0Micro.cpp
 	DebugTools/DisVU1Micro.cpp
 	DebugTools/DisassemblyManager.cpp
+	DebugTools/MemTrace.cpp
 	DebugTools/ExpressionParser.cpp
 	DebugTools/MIPSAnalyst.cpp
 	DebugTools/MipsAssembler.cpp
@@ -63,6 +64,7 @@ add_library(pcsx2core STATIC
 	MTVU.cpp
 	Mdec.cpp
 	Memory.cpp
+	MemoryMap.cpp
 	Pcsx2Config.cpp
 	PerformanceMetrics.cpp
 	R3000A.cpp

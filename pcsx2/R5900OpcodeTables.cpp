@@ -25,7 +25,56 @@ namespace R5900
 	{
 		// Generates an entry for the given opcode name.
 		// Assumes the default function naming schemes for interpreter and recompiler  functions.
-#ifdef _M_X86 // TODO(Stenzek): Remove me once EE/VU/IOP recs are added.
+#if defined(VITASX2_QEMU_OPCODE_TABLE_METADATA_ONLY)
+		// QEMU provider validation only needs PCSX2-owned decode/cycle metadata here.
+		// Full interpreter/disasm table payloads are tracked in TODO.md for BIOS/game tracing.
+	#	define MakeOpcode( name, cycles, flags ) \
+		static const OPCODE name = { \
+			#name, \
+			cycles, \
+			flags, \
+			NULL, \
+			nullptr, \
+			nullptr, \
+			nullptr \
+		}
+
+#	define MakeOpcodeM( name, cycles, flags ) \
+		static const OPCODE name = { \
+			#name, \
+			cycles, \
+			flags, \
+			NULL, \
+			nullptr, \
+			nullptr, \
+			nullptr \
+		}
+
+#	define MakeOpcode0( name, cycles, flags ) \
+		static const OPCODE name = { \
+			#name, \
+			cycles, \
+			flags, \
+			NULL, \
+			nullptr, \
+			nullptr, \
+			nullptr \
+		}
+
+	// COP1 validation still needs the PCSX2-owned interpreter leaf selected by
+	// the real opcode table. Keep recompiler/disasm stripped from this QEMU
+	// fixture mode, but leave COP1 helper dispatch intact.
+	#	define MakeOpcode1( name, cycles, flags ) \
+		static const OPCODE name = { \
+			#name, \
+			cycles, \
+			flags, \
+			NULL, \
+			::R5900::Interpreter::OpcodeImpl::COP1::name, \
+			nullptr, \
+			nullptr \
+		}
+#elif defined(_M_X86) // TODO(Stenzek): Remove me once EE/VU/IOP recs are added.
 	#	define MakeOpcode( name, cycles, flags ) \
 		static const OPCODE name = { \
 			#name, \

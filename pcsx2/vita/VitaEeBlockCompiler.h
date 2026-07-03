@@ -35,6 +35,97 @@ namespace VitaEE
 
 	class BlockCompiler
 	{
+		enum class MmiVectorOp : u8
+		{
+			AddWord,
+			SubtractWord,
+			CompareGreaterSignedWord,
+			MaxSignedWord,
+			AddHalfword,
+			SubtractHalfword,
+			CompareGreaterSignedHalfword,
+			MaxSignedHalfword,
+			AddByte,
+			SubtractByte,
+			CompareGreaterSignedByte,
+			CompareEqualWord,
+			MinSignedWord,
+			CompareEqualHalfword,
+			MinSignedHalfword,
+			CompareEqualByte,
+			SaturatingAddSignedWord,
+			SaturatingSubtractSignedWord,
+			SaturatingAddSignedHalfword,
+			SaturatingSubtractSignedHalfword,
+			SaturatingAddSignedByte,
+			SaturatingSubtractSignedByte,
+			SaturatingAddUnsignedWord,
+			SaturatingSubtractUnsignedWord,
+			SaturatingAddUnsignedHalfword,
+			SaturatingSubtractUnsignedHalfword,
+			SaturatingAddUnsignedByte,
+			SaturatingSubtractUnsignedByte,
+			BitwiseAnd,
+			BitwiseXor,
+			BitwiseOr,
+			BitwiseNor,
+		};
+
+		enum class MmiUnaryVectorOp : u8
+		{
+			AbsoluteSignedWord,
+			AbsoluteSignedHalfword,
+		};
+
+		enum class MmiImmediateShiftOp : u8
+		{
+			ShiftLeftHalfword,
+			ShiftRightLogicalHalfword,
+			ShiftRightArithmeticHalfword,
+			ShiftLeftWord,
+			ShiftRightLogicalWord,
+			ShiftRightArithmeticWord,
+		};
+
+		enum class MmiVariableWordShiftOp : u8
+		{
+			ShiftLeftLogical,
+			ShiftRightLogical,
+			ShiftRightArithmetic,
+		};
+
+		enum class MmiHalfwordShuffleOp : u8
+		{
+			Pinth,
+			Pinteh,
+			Pexeh,
+			Prevh,
+			Pexch,
+			Pcpyh,
+		};
+
+		enum class MmiWordShuffleOp : u8
+		{
+			Pcpyld,
+			Pcpyud,
+			Pexew,
+			Prot3w,
+			Pexcw,
+		};
+
+		enum class MmiFiveBitOp : u8
+		{
+			Expand,
+			Pack,
+		};
+
+		enum class MmiUpperInterleaveOp : u8
+		{
+			Word,
+			Halfword,
+			Byte,
+		};
+
 	public:
 		explicit BlockCompiler(VitaA32::CodeBuffer& code);
 
@@ -46,7 +137,8 @@ namespace VitaEE
 		bool BeginBlock();
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr);
-		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0, const void* event_exit = nullptr);
+		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
+			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
 		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
 			size_t* direct_link_target_offset = nullptr, size_t* taken_link_target_offset = nullptr);
@@ -56,7 +148,13 @@ namespace VitaEE
 		static bool RequiresBlockEndAfterOpcode(u32 op);
 
 	private:
-		bool EmitSPECIAL(u32 op);
+		bool EmitSPECIAL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool branch_delay_slot);
+		bool EmitCOP0(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitCOP1(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitCACHE(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit,
+			bool branch_delay_slot);
 		bool EmitADDIU(u32 op);
 		bool EmitDADDIU(u32 op);
 		bool EmitSLTI(u32 op);
@@ -75,13 +173,129 @@ namespace VitaEE
 		bool EmitMOVN(u32 op);
 		bool EmitMULT(u32 op);
 		bool EmitMULTU(u32 op);
+		bool EmitMADD(u32 op);
+		bool EmitMADDU(u32 op);
+		bool EmitMADD1(u32 op);
+		bool EmitMADDU1(u32 op);
+		bool EmitMFHI1(u32 op);
+		bool EmitMFLO1(u32 op);
+		bool EmitMTHI1(u32 op);
+		bool EmitMTLO1(u32 op);
+		bool EmitMULT1(u32 op);
+		bool EmitMULTU1(u32 op);
 		bool EmitDIV(u32 op);
 		bool EmitDIVU(u32 op);
+		bool EmitDIV1(u32 op);
+		bool EmitDIVU1(u32 op);
+		bool EmitPLZCW(u32 op);
+		bool EmitPMFHL(u32 op);
+		bool EmitPMTHL(u32 op);
 		bool EmitMFHI(u32 op);
 		bool EmitMFLO(u32 op);
 		bool EmitMTHI(u32 op);
 		bool EmitMTLO(u32 op);
+		bool EmitPSLLH(u32 op);
+		bool EmitPSRLH(u32 op);
+		bool EmitPSRAH(u32 op);
+		bool EmitPSLLW(u32 op);
+		bool EmitPSRLW(u32 op);
+		bool EmitPSRAW(u32 op);
+		bool EmitMMI(u32 op);
+		bool EmitMMI0(u32 op);
+		bool EmitMMI1(u32 op);
+		bool EmitMMI2(u32 op);
+		bool EmitMMI3(u32 op);
+		bool EmitPMADDW(u32 op);
+		bool EmitPMSUBW(u32 op);
+		bool EmitPMADDH(u32 op);
+		bool EmitPHMADH(u32 op);
+		bool EmitPMSUBH(u32 op);
+		bool EmitPHMSBH(u32 op);
+		bool EmitPDIVW(u32 op);
+		bool EmitPDIVUW(u32 op);
+		bool EmitPDIVBW(u32 op);
+		bool EmitPMADDUW(u32 op);
+		bool EmitPMULTW(u32 op);
+		bool EmitPMULTUW(u32 op);
+		bool EmitPMULTH(u32 op);
+		bool EmitPMFHI(u32 op);
+		bool EmitPMFLO(u32 op);
+		bool EmitPMTHI(u32 op);
+		bool EmitPMTLO(u32 op);
+		bool EmitMmiVectorOp(u32 op, MmiVectorOp operation);
+		bool EmitMmiUnaryRtVectorOp(u32 op, MmiUnaryVectorOp operation);
+		bool EmitMmiImmediateShiftOp(u32 op, MmiImmediateShiftOp operation);
+		bool EmitMmiVariableWordShiftOp(u32 op, MmiVariableWordShiftOp operation);
+		bool EmitMmiHalfwordShuffleOp(u32 op, MmiHalfwordShuffleOp operation);
+		bool EmitMmiWordShuffleOp(u32 op, MmiWordShuffleOp operation);
+		bool EmitMmiFiveBitOp(u32 op, MmiFiveBitOp operation);
+		bool EmitMmiInterleaveOp(u32 op, MmiUpperInterleaveOp operation, bool upper_half);
+		bool EmitMmiUpperInterleaveOp(u32 op, MmiUpperInterleaveOp operation);
+		bool EmitMmiPackEvenOp(u32 op, MmiUpperInterleaveOp operation);
+		bool EmitPADDW(u32 op);
+		bool EmitPSUBW(u32 op);
+		bool EmitPCGTW(u32 op);
+		bool EmitPMAXW(u32 op);
+		bool EmitPADDH(u32 op);
+		bool EmitPSUBH(u32 op);
+		bool EmitPCGTH(u32 op);
+		bool EmitPMAXH(u32 op);
+		bool EmitPADDB(u32 op);
+		bool EmitPSUBB(u32 op);
+		bool EmitPCGTB(u32 op);
+		bool EmitPADDSW(u32 op);
+		bool EmitPSUBSW(u32 op);
+		bool EmitPEXTLW(u32 op);
+		bool EmitPPACW(u32 op);
+		bool EmitPADDSH(u32 op);
+		bool EmitPSUBSH(u32 op);
+		bool EmitPEXTLH(u32 op);
+		bool EmitPPACH(u32 op);
+		bool EmitPADDSB(u32 op);
+		bool EmitPSUBSB(u32 op);
+		bool EmitPEXTLB(u32 op);
+		bool EmitPPACB(u32 op);
+		bool EmitPEXT5(u32 op);
+		bool EmitPPAC5(u32 op);
+		bool EmitPABSW(u32 op);
+		bool EmitPCEQW(u32 op);
+		bool EmitPMINW(u32 op);
+		bool EmitPADSBH(u32 op);
+		bool EmitPABSH(u32 op);
+		bool EmitPCEQH(u32 op);
+		bool EmitPMINH(u32 op);
+		bool EmitPCEQB(u32 op);
+		bool EmitPADDUW(u32 op);
+		bool EmitPSUBUW(u32 op);
+		bool EmitPEXTUW(u32 op);
+		bool EmitPADDUH(u32 op);
+		bool EmitPSUBUH(u32 op);
+		bool EmitPEXTUH(u32 op);
+		bool EmitPADDUB(u32 op);
+		bool EmitPSUBUB(u32 op);
+		bool EmitPEXTUB(u32 op);
+		bool EmitQFSRV(u32 op);
+		bool EmitPSLLVW(u32 op);
+		bool EmitPSRLVW(u32 op);
+		bool EmitPSRAVW(u32 op);
+		bool EmitPINTH(u32 op);
+		bool EmitPCPYLD(u32 op);
+		bool EmitPEXEH(u32 op);
+		bool EmitPREVH(u32 op);
+		bool EmitPEXEW(u32 op);
+		bool EmitPROT3W(u32 op);
+		bool EmitPINTEH(u32 op);
+		bool EmitPCPYUD(u32 op);
+		bool EmitPEXCH(u32 op);
+		bool EmitPCPYH(u32 op);
+		bool EmitPEXCW(u32 op);
+		bool EmitPAND(u32 op);
+		bool EmitPXOR(u32 op);
+		bool EmitPOR(u32 op);
+		bool EmitPNOR(u32 op);
 		bool EmitREGIMM(u32 op, u32 pc);
+		bool EmitMTSAB(u32 op);
+		bool EmitMTSAH(u32 op);
 		bool EmitJ(u32 op, u32 pc);
 		bool EmitJAL(u32 op, u32 pc);
 		bool EmitJR(u32 op, u32 pc);
@@ -94,11 +308,16 @@ namespace VitaEE
 		bool EmitBNEL(u32 op);
 		bool EmitBLEZL(u32 op);
 		bool EmitBGTZL(u32 op);
-		bool EmitLB(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
-		bool EmitLH(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
-		bool EmitLW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
-		bool EmitLBU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
-		bool EmitLHU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitLB(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool branch_delay_slot);
+		bool EmitLH(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool branch_delay_slot);
+		bool EmitLW(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool branch_delay_slot);
+		bool EmitLBU(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool branch_delay_slot);
+		bool EmitLHU(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool branch_delay_slot);
 		bool EmitLWU(u32 op);
 		bool EmitLWL(u32 op);
 		bool EmitLWR(u32 op);
@@ -145,9 +364,21 @@ namespace VitaEE
 		bool EmitShift64LeftVariable(u32 op);
 		bool EmitShift64RightVariable(u32 op, bool arithmetic);
 		bool EmitConditionalMove(u32 op, bool move_on_zero);
-		bool EmitMultiply(u32 op, bool signed_multiply);
+		bool EmitMultiply(u32 op, bool signed_multiply, bool upper_pipeline = false);
+		bool EmitMultiplyAdd(u32 op, bool signed_multiply, bool upper_pipeline);
+		bool EmitPackedWordMultiply(u32 op, bool signed_multiply);
+		bool EmitPackedSignedWordMultiplyAccumulate(u32 op, bool subtract);
+		bool EmitPackedHalfwordMultiplyAccumulate(u32 op, bool subtract);
+		bool EmitPackedHalfwordPairMultiply(u32 op, bool subtract);
+		bool EmitPackedHalfwordMultiply(u32 op);
+		bool EmitPackedUnsignedWordMultiplyAdd(u32 op);
+		bool EmitScalarDivide(u32 op, bool signed_divide, bool upper_pipeline);
+		bool EmitPackedWordDivide(u32 op, bool signed_divide);
+		bool EmitPackedWordByHalfwordDivide(u32 op);
 		bool EmitMoveFromHiLo(u32 op, size_t hilo_offset);
 		bool EmitMoveToHiLo(u32 op, size_t hilo_offset);
+		bool EmitMoveFullFromHiLo(u32 op, size_t hilo_offset);
+		bool EmitMoveFullToHiLo(u32 op, size_t hilo_offset);
 		bool EmitGoemonBlockStartHook(u32 start_pc);
 		bool EmitLink(unsigned guest_reg, u32 pc);
 		bool EmitJump(u32 pc, bool link);
@@ -155,11 +386,15 @@ namespace VitaEE
 		bool EmitGoemonTranslateHostReg(unsigned host_reg);
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitBranchSigned(u32 op, SignedBranchCondition condition);
+		bool EmitCop1Branch(u32 op);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
-			const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift);
+			const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,
+			bool branch_delay_slot);
 		bool EmitCounterReadFlagFromAddress(unsigned host_reg);
 		bool EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
+			const void* helper, const void* event_exit, bool request_cache_reset = false);
 		bool EmitAddScaledCyclesToCpu(u32 cycles);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);

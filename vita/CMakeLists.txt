@@ -10,6 +10,7 @@ set(VITASX2_SIMPLE2000_EE_TRACE_TITLEID "VSX200007")
 set(VITASX2_A32_EMITTER_VALIDATION_TITLEID "VSX200008")
 set(VITASX2_A32_PROVIDER_VALIDATION_TITLEID "VSX200009")
 set(VITASX2_BIOS_EE_A32_TRACE_TITLEID "VSX200010")
+set(VITASX2_CUBE_EE_A32_TRACE_TITLEID "VSX200011")
 
 set(VITASX2_CUBE_EE_TRACE_RECORDS "4096" CACHE STRING "Cube EE trace records to write.")
 set(VITASX2_CUBE_EE_TRACE_SKIP_RECORDS "0" CACHE STRING "Cube EE trace records to skip before writing.")
@@ -19,30 +20,30 @@ set(VITASX2_SIMPLE2000_EE_TRACE_RECORDS "4096" CACHE STRING "Simple 2000 EE trac
 set(VITASX2_SIMPLE2000_EE_TRACE_SKIP_RECORDS "0" CACHE STRING "Simple 2000 EE trace records to skip before writing.")
 option(VITASX2_SIMPLE2000_EE_TRACE_FROM_BOOT "Start the Simple 2000 EE trace at BIOS boot instead of ELF entry." OFF)
 
-# --- toolchain/runtime diagnostics ------------------------------------------
-add_executable(vitasx2-probe
-	probe/ProbeMain.cpp
+# --- startup/runtime validation ---------------------------------------------
+add_executable(vitasx2-startup-validation
+	runtime/StartupValidationMain.cpp
 )
-target_link_libraries(vitasx2-probe
+target_link_libraries(vitasx2-startup-validation
 	common
 )
 
-vita_create_self(vitasx2-probe.self vitasx2-probe UNSAFE)
-vita_create_vpk(vitasx2-probe.vpk ${VITASX2_TITLEID} vitasx2-probe.self
+vita_create_self(vitasx2-startup-validation.self vitasx2-startup-validation UNSAFE)
+vita_create_vpk(vitasx2-startup-validation.vpk ${VITASX2_TITLEID} vitasx2-startup-validation.self
 	VERSION "00.01"
-	NAME "VitaSX2 Runtime"
+	NAME "VitaSX2 Startup"
 )
 
 # --- A32 generated-code validation ------------------------------------------
-add_executable(vitasx2-a32-emitter-smoke
-	core/A32EmitterSmokeMain.cpp
+add_executable(vitasx2-a32-emitter-validation
+	core/A32EmitterValidationMain.cpp
 )
-target_link_libraries(vitasx2-a32-emitter-smoke
+target_link_libraries(vitasx2-a32-emitter-validation
 	pcsx2core
 )
 
-vita_create_self(vitasx2-a32-emitter-smoke.self vitasx2-a32-emitter-smoke UNSAFE)
-vita_create_vpk(vitasx2-a32-emitter-smoke.vpk ${VITASX2_A32_EMITTER_VALIDATION_TITLEID} vitasx2-a32-emitter-smoke.self
+vita_create_self(vitasx2-a32-emitter-validation.self vitasx2-a32-emitter-validation UNSAFE)
+vita_create_vpk(vitasx2-a32-emitter-validation.vpk ${VITASX2_A32_EMITTER_VALIDATION_TITLEID} vitasx2-a32-emitter-validation.self
 	VERSION "00.01"
 	NAME "VitaSX2 A32 Code"
 )
@@ -62,29 +63,29 @@ vita_create_vpk(vitasx2-a32-provider-validation.vpk ${VITASX2_A32_PROVIDER_VALID
 )
 
 # --- interpreter-core memory/vtlb validation --------------------------------
-add_executable(vitasx2-core-smoke
-	core/CoreSmokeMain.cpp
+add_executable(vitasx2-core-validation
+	core/CoreValidationMain.cpp
 )
-target_link_libraries(vitasx2-core-smoke
+target_link_libraries(vitasx2-core-validation
 	pcsx2core
 )
 
-vita_create_self(vitasx2-core-smoke.self vitasx2-core-smoke UNSAFE)
-vita_create_vpk(vitasx2-core-smoke.vpk ${VITASX2_CORE_VALIDATION_TITLEID} vitasx2-core-smoke.self
+vita_create_self(vitasx2-core-validation.self vitasx2-core-validation UNSAFE)
+vita_create_vpk(vitasx2-core-validation.vpk ${VITASX2_CORE_VALIDATION_TITLEID} vitasx2-core-validation.self
 	VERSION "00.01"
 	NAME "VitaSX2 Core"
 )
 
 # --- BIOS/reset validation --------------------------------------------------
-add_executable(vitasx2-bios-smoke
-	core/BiosSmokeMain.cpp
+add_executable(vitasx2-bios-validation
+	core/BiosValidationMain.cpp
 )
-target_link_libraries(vitasx2-bios-smoke
+target_link_libraries(vitasx2-bios-validation
 	pcsx2core
 )
 
-vita_create_self(vitasx2-bios-smoke.self vitasx2-bios-smoke UNSAFE)
-vita_create_vpk(vitasx2-bios-smoke.vpk ${VITASX2_BIOS_VALIDATION_TITLEID} vitasx2-bios-smoke.self
+vita_create_self(vitasx2-bios-validation.self vitasx2-bios-validation UNSAFE)
+vita_create_vpk(vitasx2-bios-validation.vpk ${VITASX2_BIOS_VALIDATION_TITLEID} vitasx2-bios-validation.self
 	VERSION "00.01"
 	NAME "VitaSX2 BIOS"
 )
@@ -151,6 +152,26 @@ vita_create_self(vitasx2-cube-ee-trace.self vitasx2-cube-ee-trace UNSAFE)
 vita_create_vpk(vitasx2-cube-ee-trace.vpk ${VITASX2_CUBE_EE_TRACE_TITLEID} vitasx2-cube-ee-trace.self
 	VERSION "00.01"
 	NAME "VitaSX2 Cube EE Trace"
+)
+
+# --- Homebrew ELF EE A32-provider trace validation ----------------------------
+add_executable(vitasx2-cube-ee-a32-trace
+	core/ElfEeTraceMain.cpp
+)
+target_compile_definitions(vitasx2-cube-ee-a32-trace PRIVATE
+	VITASX2_EE_TRACE_RECORDS=${VITASX2_CUBE_EE_TRACE_RECORDS}
+	VITASX2_EE_TRACE_SKIP_RECORDS=${VITASX2_CUBE_EE_TRACE_SKIP_RECORDS}
+	VITASX2_EE_TRACE_FROM_BOOT=$<BOOL:${VITASX2_CUBE_EE_TRACE_FROM_BOOT}>
+	VITASX2_EE_TRACE_A32=1
+)
+target_link_libraries(vitasx2-cube-ee-a32-trace
+	pcsx2core
+)
+
+vita_create_self(vitasx2-cube-ee-a32-trace.self vitasx2-cube-ee-a32-trace UNSAFE)
+vita_create_vpk(vitasx2-cube-ee-a32-trace.vpk ${VITASX2_CUBE_EE_A32_TRACE_TITLEID} vitasx2-cube-ee-a32-trace.self
+	VERSION "00.01"
+	NAME "VitaSX2 Cube EE A32 Trace"
 )
 
 # --- Real-game disc EE trace validation -------------------------------------
