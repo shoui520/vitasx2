@@ -175,6 +175,7 @@ namespace VitaEE
 		bool EmitCOP1CompareFast(u32 op);
 		bool EmitCOP1ConvertWordFast(u32 op);
 		bool EmitCOP1ConvertSingleFast(u32 op);
+		bool EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitCACHE(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit,
 			bool branch_delay_slot);
@@ -411,6 +412,7 @@ namespace VitaEE
 		bool EmitBranchSigned(u32 op, SignedBranchCondition condition);
 		bool EmitCop0Branch(u32 op);
 		bool EmitCop1Branch(u32 op);
+		bool EmitCop2Branch(u32 op);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,

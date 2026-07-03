@@ -333,6 +333,7 @@ namespace VitaEE
 		bool CanCompileMMI3(u32 op);
 		bool CanCompileCOP0(u32 op);
 		bool CanCompileCOP1(u32 op);
+		bool CanCompileCOP2(u32 op);
 
 		bool IsFastMFC0(u32 op)
 		{
@@ -516,6 +517,51 @@ namespace VitaEE
 				   IsFastCOP1ScalarWordOp(op) ||
 				   IsFastCOP1CompareOp(op) || IsFastCOP1ConvertWordOp(op) ||
 				   IsFastCOP1ConvertSingleOp(op);
+		}
+
+		bool IsCOP2Special2Supported(u32 index)
+		{
+			// PCSX2 owner: R5900OpcodeTables.cpp::Int_COP2SPECIAL2PrintTable.
+			// Keep unknown slots out of the A32 provider so they remain visible
+			// as scan fallbacks instead of helper-calling COP2_Unknown().
+			return (index <= 42) || (index >= 44 && index <= 49) ||
+				   (index >= 52 && index <= 67);
+		}
+
+		bool IsCOP2Special1Supported(u32 op)
+		{
+			// PCSX2 owner: R5900OpcodeTables.cpp::Int_COP2SPECIAL1PrintTable.
+			const u32 function = op & 0x3f;
+			if (function <= 50 || function == 52 || function == 53 ||
+				function == 56 || function == 57)
+			{
+				return true;
+			}
+
+			if (function >= 60)
+			{
+				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+				return IsCOP2Special2Supported(special2_index);
+			}
+
+			return false;
+		}
+
+		bool IsCOP2BranchOpcode(u32 op)
+		{
+			if ((op >> 26) != 0x12 || ((op >> 21) & 0x1f) != 0x08)
+				return false;
+
+			switch (RT(op))
+			{
+				case 0x00: // BC2F, owned by COP2.cpp::BC2F().
+				case 0x01: // BC2T, owned by COP2.cpp::BC2T().
+				case 0x02: // BC2FL, owned by COP2.cpp::BC2FL().
+				case 0x03: // BC2TL, owned by COP2.cpp::BC2TL().
+					return true;
+				default:
+					return false;
+			}
 		}
 
 		bool CanCompileMMI(u32 op)
@@ -769,6 +815,33 @@ namespace VitaEE
 			}
 		}
 
+		bool CanCompileCOP2(u32 op)
+		{
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+			(void)op;
+			return false;
+#else
+			// PCSX2 owners: COP2.cpp, VU0.cpp, VUops.cpp, and
+			// R5900OpcodeTables.cpp::Int_COP2*PrintTable. The first A32 full-core
+			// path helper-calls the same interpreter owner for valid transfer and
+			// VU0 macro forms, while BC2 branches use a native branch test below.
+			switch ((op >> 21) & 0x1f)
+			{
+				case 0x01: // QMFC2, owned by VU0.cpp::QMFC2().
+				case 0x02: // CFC2, owned by VU0.cpp::CFC2().
+				case 0x05: // QMTC2, owned by VU0.cpp::QMTC2().
+				case 0x06: // CTC2, owned by VU0.cpp::CTC2().
+					return true;
+				case 0x08: // COP2_BC2 branch forms, owned by COP2.cpp::BC2*().
+					return IsCOP2BranchOpcode(op);
+				default:
+					if (((op >> 21) & 0x10) == 0)
+						return false;
+					return IsCOP2Special1Supported(op);
+			}
+#endif
+		}
+
 		bool IsNoOpCACHE(u32 op)
 		{
 			switch (RT(op))
@@ -846,6 +919,8 @@ namespace VitaEE
 				case 0x17: // BGTZL, owned by Interpreter.cpp::BGTZL().
 					return true;
 				case 0x11:
+					return ((op >> 21) & 0x1f) == 0x08 && (RT(op) == 0x02 || RT(op) == 0x03);
+				case 0x12:
 					return ((op >> 21) & 0x1f) == 0x08 && (RT(op) == 0x02 || RT(op) == 0x03);
 				case 0x10:
 					return ((op >> 21) & 0x1f) == 0x08 && (RT(op) == 0x02 || RT(op) == 0x03);
@@ -1409,6 +1484,8 @@ namespace VitaEE
 				return CanCompileCOP0(op);
 			case 0x11: // COP1 helper-backed scalar/control ops, owned by FPU.cpp and x86/iFPU.cpp.
 				return CanCompileCOP1(op);
+			case 0x12: // COP2/VU0 macro interface, owned by COP2.cpp and VU0.cpp.
+				return CanCompileCOP2(op);
 			case 0x18: // DADDI, owned by R5900OpcodeImpl.cpp::DADDI().
 			case 0x19: // DADDIU, owned by R5900OpcodeImpl.cpp::DADDIU().
 			case 0x1a: // LDL, owned by R5900OpcodeImpl.cpp::LDL().
@@ -1501,6 +1578,8 @@ namespace VitaEE
 					default:
 						return false;
 				}
+			case 0x12: // COP2_BC2 branch forms, owned by COP2.cpp::BC2F()/BC2T()/BC2FL()/BC2TL().
+				return IsCOP2BranchOpcode(op);
 			case 0x10: // COP0_BC0 branch forms, owned by COP0.cpp::BC0F()/BC0T()/BC0FL()/BC0TL().
 				if (((op >> 21) & 0x1f) != 0x08)
 					return false;
@@ -1553,6 +1632,8 @@ namespace VitaEE
 				return CanCompileCOP0(op) && !IsDI(op) && !IsFastMFC0(op) && !IsFastMTC0(op);
 			case 0x11:
 				return CanCompileCOP1(op) && !IsFastCOP1InBlock(op);
+			case 0x12:
+				return CanCompileCOP2(op) && !IsCOP2BranchOpcode(op);
 			case 0x2f:
 				return IsHelperCACHE(op);
 			case 0x20:
@@ -1741,6 +1822,15 @@ namespace VitaEE
 						if (!EmitCop1Branch(op))
 							return false;
 						break;
+					case 0x12:
+						branch_target_pc = BranchTarget(pc, op);
+						if (branch_is_likely)
+							has_static_likely_direct_links = true;
+						else
+							has_static_conditional_direct_links = true;
+						if (!EmitCop2Branch(op))
+							return false;
+						break;
 					case 0x14:
 						branch_target_pc = BranchTarget(pc, op);
 						has_static_likely_direct_links = true;
@@ -1855,6 +1945,13 @@ namespace VitaEE
 			}
 
 			if ((op >> 26) == 0x11 && CanCompileCOP1(op) && !IsFastCOP1InBlock(op))
+			{
+				if (scaled_cycles)
+					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
+				return true;
+			}
+
+			if ((op >> 26) == 0x12 && CanCompileCOP2(op) && !IsCOP2BranchOpcode(op))
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
@@ -1987,6 +2084,8 @@ namespace VitaEE
 				return EmitCOP0(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x11: // COP1 helper-backed scalar/control ops, owned by FPU.cpp and x86/iFPU.cpp.
 				return EmitCOP1(op, pc, raw_cycles_through_instruction, event_exit);
+			case 0x12: // COP2/VU0 macro interface, owned by COP2.cpp, VU0.cpp, and x86/microVU_Macro.inl.
+				return EmitCOP2(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x18: // DADDI, owned by R5900OpcodeImpl.cpp::DADDI(); overflow trap
 				// dropped by x86/ix86-32/iR5900AritImm.cpp::recDADDI(), compiled as DADDIU.
 				return EmitDADDIU(op);
@@ -3041,6 +3140,24 @@ namespace VitaEE
 		}
 
 		return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction, helper, event_exit);
+	}
+
+	bool BlockCompiler::EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		(void)op;
+		(void)pc;
+		(void)raw_cycles_through_instruction;
+		(void)event_exit;
+		return false;
+#else
+		// PCSX2 owners: R5900OpcodeImpl.cpp::COP2(), COP2.cpp, VU0.cpp, and
+		// VUops.cpp. Non-branch COP2 forms exit through the same interpreter
+		// dispatcher so VU0 sync, VCALLMS, flags, and transfer side effects stay
+		// PCSX2-owned while the full machine is brought up.
+		return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
+			reinterpret_cast<const void*>(&R5900::Interpreter::OpcodeImpl::COP2), event_exit);
+#endif
 	}
 
 	bool BlockCompiler::EmitCOP1MoveControlFast(u32 op)
@@ -9259,6 +9376,29 @@ namespace VitaEE
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
 				   branch_on_true ? VitaA32::Condition::NE : VitaA32::Condition::EQ);
+	}
+
+	bool BlockCompiler::EmitCop2Branch(u32 op)
+	{
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		(void)op;
+		return false;
+#else
+		// PCSX2 owners: COP2.cpp::BC2F()/BC2T()/BC2FL()/BC2TL() branch on
+		// ((VU0.VI[REG_VPU_STAT].US[0] >> 8) & 1). x86/microVU_Macro.inl
+		// tests the same bit through VU0.VI[REG_VPU_STAT].UL & 0x100.
+		const unsigned rt = RT(op);
+		const bool branch_on_true = rt == 0x01 || rt == 0x03;
+		const u32 vpu_stat_addr = static_cast<u32>(reinterpret_cast<uptr>(&VU0.VI[REG_VPU_STAT].UL));
+
+		return m_code.EmitMovImm32(HOST_TMP0, vpu_stat_addr) &&
+			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
+			   m_code.EmitMovImm32(HOST_TMP2, 0x100u) &&
+			   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2, true) &&
+			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
+			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
+				   branch_on_true ? VitaA32::Condition::NE : VitaA32::Condition::EQ);
+#endif
 	}
 
 	bool BlockCompiler::EmitCop0Branch(u32 op)
