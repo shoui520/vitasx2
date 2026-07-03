@@ -17,7 +17,8 @@ namespace Pcsx2Trace
 	namespace
 	{
 		static constexpr std::array<char, 8> TRACE_MAGIC = {'P', 'C', 'S', 'X', '2', 'I', 'O', 'T'};
-		static constexpr u32 TRACE_VERSION = 1;
+		static constexpr u32 TRACE_VERSION = 2;
+		static constexpr u32 TRACE_FLAG_WAITED_FOR_ELF_ENTRY = 1u << 0;
 
 		struct IopTraceFileHeader
 		{
@@ -56,7 +57,10 @@ namespace Pcsx2Trace
 		IopTraceConfig s_config;
 		u64 s_records_seen = 0;
 		u64 s_records_written = 0;
+		bool s_started = false;
 		bool s_hit_limit = false;
+		bool s_last_instruction_recorded = false;
+		u32 s_entry_pc = 0xbfc00000;
 		std::string s_error;
 
 		IopTraceFileHeader MakeHeader()
@@ -66,9 +70,10 @@ namespace Pcsx2Trace
 			header.version = TRACE_VERSION;
 			header.header_size = sizeof(IopTraceFileHeader);
 			header.record_size = sizeof(IopTraceRecord);
+			header.flags = s_config.wait_for_elf_entry ? TRACE_FLAG_WAITED_FOR_ELF_ENTRY : 0;
 			header.max_records = s_config.max_records;
 			header.records_written = s_records_written;
-			header.entry_pc = 0xbfc00000;
+			header.entry_pc = s_entry_pc;
 			return header;
 		}
 
@@ -109,7 +114,10 @@ namespace Pcsx2Trace
 		s_config = config;
 		s_records_seen = 0;
 		s_records_written = 0;
+		s_started = !s_config.wait_for_elf_entry;
 		s_hit_limit = false;
+		s_last_instruction_recorded = false;
+		s_entry_pc = s_config.wait_for_elf_entry ? 0 : 0xbfc00000;
 		s_error.clear();
 
 		if (!WriteHeader())
@@ -132,15 +140,17 @@ namespace Pcsx2Trace
 
 		std::fclose(s_trace_file);
 		s_trace_file = nullptr;
+		s_started = false;
 	}
 
 	bool IsIopTraceEnabled()
 	{
-		return s_trace_file != nullptr;
+		return s_trace_file != nullptr && s_started;
 	}
 
 	bool RecordIopPreInstruction(u32 pc, u32 opcode)
 	{
+		s_last_instruction_recorded = false;
 		if (!IsIopTraceEnabled())
 			return false;
 
@@ -183,6 +193,7 @@ namespace Pcsx2Trace
 		}
 
 		s_records_written++;
+		s_last_instruction_recorded = true;
 		s_records_seen++;
 		if (s_config.max_records != 0 && s_records_written >= s_config.max_records)
 		{
@@ -191,6 +202,20 @@ namespace Pcsx2Trace
 		}
 
 		return false;
+	}
+
+	void NotifyIopElfEntry(u32 pc)
+	{
+		if (!s_trace_file || s_started)
+			return;
+
+		s_entry_pc = pc;
+		s_started = true;
+	}
+
+	bool DidIopTraceRecordLastInstruction()
+	{
+		return s_last_instruction_recorded;
 	}
 
 	u64 GetIopTraceRecordsWritten()

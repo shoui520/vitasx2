@@ -16,6 +16,7 @@ namespace Pcsx2Trace
 		std::string output_path;
 		u64 max_records = 0;
 		u64 skip_records = 0;
+		bool wait_for_elf_entry = false;
 	};
 
 	bool StartIopTrace(const IopTraceConfig& config, Error* error = nullptr);
@@ -23,6 +24,8 @@ namespace Pcsx2Trace
 
 	bool IsIopTraceEnabled();
 	bool RecordIopPreInstruction(u32 pc, u32 opcode);
+	void NotifyIopElfEntry(u32 pc);
+	bool DidIopTraceRecordLastInstruction();
 
 	u64 GetIopTraceRecordsWritten();
 	bool DidIopTraceHitLimit();
