@@ -178,6 +178,8 @@ namespace VitaEE
 		bool EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitCOP2VectorTransferEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
+		bool EmitCOP2ControlReadEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
+			const void* event_exit);
 		bool EmitCACHE(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit,
 			bool branch_delay_slot);
@@ -432,6 +434,7 @@ namespace VitaEE
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitCpuRegsAddress(unsigned host_reg, size_t offset);
 		bool EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg);
+		bool EmitVu0ViAddress(unsigned host_reg, unsigned vi_reg);
 		bool EmitAlignQwordAddress(unsigned host_reg, unsigned scratch_reg);
 		bool EmitVtlbNonHandlerHostAddress(unsigned host_reg, unsigned vmap_reg, unsigned scratch_reg,
 			size_t* handler_fallback_branch);
