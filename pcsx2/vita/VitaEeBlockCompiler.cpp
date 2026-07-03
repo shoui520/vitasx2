@@ -564,6 +564,21 @@ namespace VitaEE
 			}
 		}
 
+		bool IsFastCOP2VectorTransfer(u32 op)
+		{
+			if ((op >> 26) != 0x12 || (op & 1u) != 0)
+				return false;
+
+			switch ((op >> 21) & 0x1f)
+			{
+				case 0x01: // QMFC2, owned by VU0.cpp::QMFC2().
+				case 0x05: // QMTC2, owned by VU0.cpp::QMTC2().
+					return true;
+				default:
+					return false;
+			}
+		}
+
 		bool CanCompileMMI(u32 op)
 		{
 			switch (op & 0x3f)
@@ -818,7 +833,7 @@ namespace VitaEE
 		bool CanCompileCOP2(u32 op)
 		{
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-			return IsCOP2BranchOpcode(op);
+			return IsCOP2BranchOpcode(op) || IsFastCOP2VectorTransfer(op);
 #else
 			// PCSX2 owners: COP2.cpp, VU0.cpp, VUops.cpp, and
 			// R5900OpcodeTables.cpp::Int_COP2*PrintTable. The first A32 full-core
@@ -3143,11 +3158,10 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
+		if (IsFastCOP2VectorTransfer(op))
+			return EmitCOP2VectorTransferEventExit(op, pc + 4, raw_cycles_through_instruction, event_exit);
+
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-		(void)op;
-		(void)pc;
-		(void)raw_cycles_through_instruction;
-		(void)event_exit;
 		return false;
 #else
 		// PCSX2 owners: R5900OpcodeImpl.cpp::COP2(), COP2.cpp, VU0.cpp, and
@@ -3157,6 +3171,59 @@ namespace VitaEE
 		return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
 			reinterpret_cast<const void*>(&R5900::Interpreter::OpcodeImpl::COP2), event_exit);
 #endif
+	}
+
+	bool BlockCompiler::EmitCOP2VectorTransferEventExit(u32 op, u32 next_pc,
+		u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+		// PCSX2 owners: VU0.cpp::QMFC2() / QMTC2(). These forms still end the
+		// block so vu0Sync() observes the same committed EE cycle as the
+		// interpreter helper path.
+		if (!event_exit || raw_cycles_through_instruction == 0)
+			return false;
+
+		const unsigned rt = RT(op);
+		const unsigned fs = RD(op);
+		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
+		constexpr unsigned NEON_VALUE = 0;
+
+		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
+			!EmitStorePc(next_pc) ||
+			!EmitAddScaledCyclesToCpu(cycles) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)))
+		{
+			return false;
+		}
+
+		switch ((op >> 21) & 0x1f)
+		{
+			case 0x01: // QMFC2
+				if (rt != 0 &&
+					(!EmitVu0VfAddress(HOST_TMP0, fs) ||
+					 !m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) ||
+					 !EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
+					 !m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1)))
+				{
+					return false;
+				}
+				break;
+			case 0x05: // QMTC2
+				if (fs != 0 &&
+					(!EmitCpuRegsAddress(HOST_TMP0, GprOffset(rt)) ||
+					 !m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) ||
+					 !EmitVu0VfAddress(HOST_TMP1, fs) ||
+					 !m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1)))
+				{
+					return false;
+				}
+				break;
+			default:
+				return false;
+		}
+
+		return m_code.EmitCallAbsolute(event_exit) &&
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
 	}
 
 	bool BlockCompiler::EmitCOP1MoveControlFast(u32 op)

@@ -176,6 +176,8 @@ namespace VitaEE
 		bool EmitCOP1ConvertWordFast(u32 op);
 		bool EmitCOP1ConvertSingleFast(u32 op);
 		bool EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitCOP2VectorTransferEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
+			const void* event_exit);
 		bool EmitCACHE(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit,
 			bool branch_delay_slot);
