@@ -5,17 +5,20 @@
 
 #include "common/Pcsx2Defs.h"
 
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+class SettingsInterface;
 struct HotkeyInfo;
 enum class GenericInputBinding : u8;
 
 enum class InputSourceType : u32
 {
-	Unknown,
+	Vita,
+	Count,
 };
 
 struct InputBindingKey
@@ -29,33 +32,37 @@ namespace InputManager
 {
 	using GenericInputBindingMapping = std::vector<std::pair<GenericInputBinding, std::string>>;
 
-	static inline const char* InputSourceToString(InputSourceType type)
+	enum VitaPadButton : u32
 	{
-		return "Vita";
-	}
+		VitaPadButton_Select = 1u << 0,
+		VitaPadButton_Start = 1u << 1,
+		VitaPadButton_Up = 1u << 2,
+		VitaPadButton_Right = 1u << 3,
+		VitaPadButton_Down = 1u << 4,
+		VitaPadButton_Left = 1u << 5,
+		VitaPadButton_L1 = 1u << 6,
+		VitaPadButton_R1 = 1u << 7,
+		VitaPadButton_Triangle = 1u << 8,
+		VitaPadButton_Circle = 1u << 9,
+		VitaPadButton_Cross = 1u << 10,
+		VitaPadButton_Square = 1u << 11,
+	};
 
-	static inline bool GetInputSourceDefaultEnabled(InputSourceType type)
-	{
-		return false;
-	}
+	const char* InputSourceToString(InputSourceType type);
+	bool GetInputSourceDefaultEnabled(InputSourceType type);
+	GenericInputBindingMapping GetGenericBindingMapping(const std::string_view name);
+	std::vector<std::string_view> SplitChord(const std::string_view chord);
+	const std::vector<const HotkeyInfo*>& GetHotkeyList();
 
-	static inline GenericInputBindingMapping GetGenericBindingMapping(const std::string_view name)
-	{
-		return {};
-	}
+	void ReloadSources(const SettingsInterface& si, std::unique_lock<std::mutex>& settings_lock);
+	void ReloadBindings(const SettingsInterface& si, const SettingsInterface& binding_si,
+		const SettingsInterface& hotkey_binding_si, bool force, bool clear_existing);
+	void CloseSources();
+	void PollSources();
+	void PauseVibration();
+	void SetPadVibrationIntensity(u32 pad, float large_or_single_motor, float small_motor);
 
-	static inline std::vector<std::string_view> SplitChord(const std::string_view chord)
-	{
-		return {};
-	}
-
-	static inline const std::vector<const HotkeyInfo*>& GetHotkeyList()
-	{
-		static const std::vector<const HotkeyInfo*> empty;
-		return empty;
-	}
-
-	static inline void SetPadVibrationIntensity(u32 pad, float large_or_single_motor, float small_motor)
-	{
-	}
+#if defined(VITASX2_QEMU_VALIDATION)
+	void SetVitaPadSnapshotForTesting(u32 buttons, u8 lx, u8 ly, u8 rx, u8 ry);
+#endif
 } // namespace InputManager

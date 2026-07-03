@@ -210,7 +210,7 @@ void Pad::SetDefaultControllerConfig(SettingsInterface& si)
 
 	// PCSX2 Controller Settings - Controller 1 / Controller 2 / ...
 	// Use the automapper to set this up.
-	MapController(si, 0, InputManager::GetGenericBindingMapping("Keyboard"));
+	MapController(si, 0, InputManager::GetGenericBindingMapping("Vita"));
 }
 
 void Pad::SetDefaultHotkeyConfig(SettingsInterface& si)

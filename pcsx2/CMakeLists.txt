@@ -154,6 +154,7 @@ add_library(pcsx2core STATIC
 	vita/VitaGsDiagnosticsDisabled.cpp
 	vita/VitaGsMemory.cpp
 	vita/VitaHostSurface.cpp
+	vita/VitaInputManager.cpp
 	vita/VitaPad.cpp
 	vita/VitaVifInterpreter.cpp
 	vita/VitaVmState.cpp
@@ -195,4 +196,5 @@ target_link_libraries(pcsx2core PUBLIC
 	xxhash
 	ccc
 	demanglegnu
+	SceCtrl_stub
 )
