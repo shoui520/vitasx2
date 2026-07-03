@@ -126,6 +126,12 @@ namespace VitaEE
 			Byte,
 		};
 
+		enum class ScalarLoadWidth : u8
+		{
+			Byte,
+			Halfword,
+		};
+
 	public:
 		explicit BlockCompiler(VitaA32::CodeBuffer& code);
 
@@ -151,7 +157,24 @@ namespace VitaEE
 		bool EmitSPECIAL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, bool branch_delay_slot);
 		bool EmitCOP0(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitMFC0Fast(u32 op, u32 raw_cycles_through_instruction);
+		bool EmitMFC0CountFast(u32 op, u32 scaled_cycles_through_instruction);
+		bool EmitMTC0Fast(u32 op, u32 raw_cycles_through_instruction);
+		bool EmitSetNextEventDelta4FromCurrentCycle();
+		bool EmitEIEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitERETEventExit(u32 op, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitTLBREventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitTLBPEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitDIDelayedStatusClear();
 		bool EmitCOP1(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitCOP1MoveControlFast(u32 op);
+		bool EmitCOP1ArithmeticFast(u32 op);
+		bool EmitCOP1DivSqrtFast(u32 op);
+		bool EmitCOP1AccumulatorFast(u32 op);
+		bool EmitCOP1ScalarWordFast(u32 op);
+		bool EmitCOP1CompareFast(u32 op);
+		bool EmitCOP1ConvertWordFast(u32 op);
+		bool EmitCOP1ConvertSingleFast(u32 op);
 		bool EmitCACHE(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit,
 			bool branch_delay_slot);
@@ -386,17 +409,30 @@ namespace VitaEE
 		bool EmitGoemonTranslateHostReg(unsigned host_reg);
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitBranchSigned(u32 op, SignedBranchCondition condition);
+		bool EmitCop0Branch(u32 op);
 		bool EmitCop1Branch(u32 op);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,
-			bool branch_delay_slot);
+			bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask);
+		bool EmitPartialWordLoad(u32 op, bool left);
+		bool EmitPartialWordStore(u32 op, bool left);
+		bool EmitPartialDwordLoad(u32 op, bool left);
+		bool EmitPartialDwordStore(u32 op, bool left);
 		bool EmitCounterReadFlagFromAddress(unsigned host_reg);
 		bool EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
+		bool EmitGsTracePreInstruction(u32 pc);
 		bool EmitAddScaledCyclesToCpu(u32 cycles);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
+		bool EmitCpuRegsAddress(unsigned host_reg, size_t offset);
+		bool EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg);
+		bool EmitAlignQwordAddress(unsigned host_reg, unsigned scratch_reg);
+		bool EmitVtlbNonHandlerHostAddress(unsigned host_reg, unsigned vmap_reg, unsigned scratch_reg,
+			size_t* handler_fallback_branch);
+		bool EmitVtlbNonHandlerHostAddress128(unsigned host_reg, unsigned vmap_reg, unsigned scratch_reg,
+			size_t* handler_fallback_branch);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
