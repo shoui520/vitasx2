@@ -25,7 +25,10 @@ add_library(pcsx2core STATIC
 	DebugTools/DisVU1Micro.cpp
 	DebugTools/DisassemblyManager.cpp
 	DebugTools/GsTrace.cpp
+	DebugTools/IpuTrace.cpp
 	DebugTools/MemTrace.cpp
+	DebugTools/Spu2Trace.cpp
+	DebugTools/VuTrace.cpp
 	DebugTools/ExpressionParser.cpp
 	DebugTools/MIPSAnalyst.cpp
 	DebugTools/MipsAssembler.cpp

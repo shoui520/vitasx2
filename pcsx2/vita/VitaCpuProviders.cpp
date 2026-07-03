@@ -4,6 +4,9 @@
 #include "MTVU.h"
 #include "Config.h"
 #include "DebugTools/GsTrace.h"
+#include "DebugTools/IpuTrace.h"
+#include "DebugTools/Spu2Trace.h"
+#include "DebugTools/VuTrace.h"
 #include "Memory.h"
 #include "R3000A.h"
 #include "R5900.h"
@@ -71,6 +74,13 @@ bool VitaRecordEePreInstruction(u32 pc, u32 opcode)
 		return true;
 	if (s_ee_a32_prerecording_window || s_ee_a32_trace_mode == VitaA32EeTraceMode::BlockBoundaryState)
 		return false;
+
+	if (Pcsx2Trace::DidIpuTraceHitLimit())
+		return true;
+	if (Pcsx2Trace::RecordVuPreEeInstruction(pc))
+		return true;
+	if (Pcsx2Trace::DidSpu2TraceHitLimit())
+		return true;
 
 	return Pcsx2Trace::RecordGsPreEeInstruction(pc);
 }

@@ -13,6 +13,7 @@
 #include "IPU/IPUdma.h"
 #include "IPU/yuv2rgb.h"
 #include "IPU/IPU_MultiISA.h"
+#include "DebugTools/IpuTrace.h"
 
 // the IPU is fixed to 16 byte strides (128-bit / QWC resolution):
 static const uint decoder_stride = 16;
@@ -2005,6 +2006,7 @@ __noinline void IPUWorker()
 	IPU_LOG("IPU Command finished");
 	ipuRegs.ctrl.BUSY = 0;
 	//ipu_cmd.current = 0xffffffff;
+	Pcsx2Trace::RecordIpuCommandComplete(ipu_cmd.current);
 	hwIntcIrq(INTC_IPU);
 }
 

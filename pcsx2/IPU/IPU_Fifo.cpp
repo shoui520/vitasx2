@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
+#include "DebugTools/IpuTrace.h"
 #include "IPU/IPU.h"
 #include "IPU/IPUdma.h"
 #include "IPU/IPU_MultiISA.h"
@@ -113,6 +114,9 @@ int IPU_Fifo_Output::write(const u32 *value, uint size)
 
 	const int transfer_size = std::min(size, 8 - (uint)ipuRegs.ctrl.OFC);
 	if(!transfer_size) return 0;
+
+	Pcsx2Trace::RecordIpuOutputWrite(ipu_cmd.current, value,
+		static_cast<u32>(transfer_size << 4));
 
 	const int first_words = std::min((32 - writepos), transfer_size << 2);
 	const int second_words = (transfer_size << 2) - first_words;

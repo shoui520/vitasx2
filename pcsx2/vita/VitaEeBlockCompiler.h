@@ -423,7 +423,7 @@ namespace VitaEE
 		bool EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
-		bool EmitGsTracePreInstruction(u32 pc);
+		bool EmitDeviceTracePreInstruction(u32 pc);
 		bool EmitAddScaledCyclesToCpu(u32 cycles);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitCpuRegsAddress(unsigned host_reg, size_t offset);

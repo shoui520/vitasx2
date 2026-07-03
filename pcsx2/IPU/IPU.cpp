@@ -3,6 +3,7 @@
 
 #include "Common.h"
 
+#include "DebugTools/IpuTrace.h"
 #include "IPU.h"
 #include "IPU_MultiISA.h"
 #include "IPUdma.h"
@@ -476,12 +477,14 @@ __fi void IPUCMD_WRITE(u32 val)
 			ipuBCLR(val);
 			hwIntcIrq(INTC_IPU); //DMAC_TO_IPU
 			ipuRegs.ctrl.BUSY = 0;
+			Pcsx2Trace::RecordIpuCommandComplete(val);
 			return;
 
 		case SCE_IPU_SETTH:
 			ipuSETTH(val);
 			hwIntcIrq(INTC_IPU);
 			ipuRegs.ctrl.BUSY = 0;
+			Pcsx2Trace::RecordIpuCommandComplete(val);
 			return;
 
 		case SCE_IPU_IDEC:

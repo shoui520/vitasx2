@@ -4,6 +4,9 @@
 #include "CDVD/CDVD.h"
 #include "Config.h"
 #include "DebugTools/GsTrace.h"
+#include "DebugTools/IpuTrace.h"
+#include "DebugTools/Spu2Trace.h"
+#include "DebugTools/VuTrace.h"
 #include "Elfheader.h"
 #include "Memory.h"
 #include "R3000A.h"
@@ -222,6 +225,9 @@ namespace VMManager
 				return;
 
 			Pcsx2Trace::NotifyGsElfEntry(s_elf_entry_point);
+			Pcsx2Trace::NotifyIpuElfEntry(s_elf_entry_point);
+			Pcsx2Trace::NotifySpu2ElfEntry(s_elf_entry_point);
+			Pcsx2Trace::NotifyVuElfEntry(s_elf_entry_point);
 			s_elf_executed = true;
 			// Mirrors VMManager.cpp::EntryPointCompilingOnCPUThread() -> HandleELFChange(true):
 			// the BIOS/EELOAD-only InstantDMAHack from ApplyGameFixes() is cleared once the game ELF owns execution.

@@ -4,6 +4,7 @@
 #include "Common.h"
 
 #include "VUmicro.h"
+#include "DebugTools/VuTrace.h"
 #include "GS.h"
 #include "Gif_Unit.h"
 #include "MTVU.h"
@@ -211,8 +212,13 @@ static void _vu1Exec(VURegs* VU)
 
 void vu1Exec(VURegs* VU)
 {
+	const u16 trace_pc = static_cast<u16>(VU1.VI[REG_TPC].UL);
+	const u32* trace_ops = reinterpret_cast<const u32*>(&VU->Micro[trace_pc]);
+	const u32 trace_lower = trace_ops[0];
+	const u32 trace_upper = trace_ops[1];
 	VU->cycle++;
 	_vu1Exec(VU);
+	Pcsx2Trace::RecordVuMicroStep(1, trace_pc, trace_upper, trace_lower, *VU);
 
 	if (VU->VI[0].UL != 0)
 		DbgCon.Error("VI[0] != 0!!!!\n");

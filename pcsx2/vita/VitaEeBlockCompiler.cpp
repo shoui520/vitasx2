@@ -14,6 +14,8 @@
 #include "vita/qemu/VitaEeQemuStubs.h"
 #else
 #include "pcsx2/Config.h"
+#include "pcsx2/DebugTools/GsTrace.h"
+#include "pcsx2/DebugTools/VuTrace.h"
 #include "pcsx2/Memory.h"
 #include "pcsx2/R5900.h"
 #include "pcsx2/R5900OpcodeTables.h"
@@ -1643,7 +1645,7 @@ namespace VitaEE
 					return false;
 
 				add_raw_cycles(op);
-				if (!EmitGsTracePreInstruction(pc))
+				if (!EmitDeviceTracePreInstruction(pc))
 					return false;
 				branch_instruction_index = i;
 				has_branch = true;
@@ -1794,7 +1796,7 @@ namespace VitaEE
 
 			add_raw_cycles(op);
 			const bool branch_delay_slot = has_branch && i == branch_instruction_index + 1;
-			if (!EmitGsTracePreInstruction(pc))
+			if (!EmitDeviceTracePreInstruction(pc))
 				return false;
 			if (IsDI(op))
 			{
@@ -9836,18 +9838,37 @@ namespace VitaEE
 			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
 	}
 
-	bool BlockCompiler::EmitGsTracePreInstruction(u32 pc)
+	bool BlockCompiler::EmitDeviceTracePreInstruction(u32 pc)
 	{
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		return true;
 #else
-		if (!Pcsx2Trace::IsGsTraceEnabled())
+		if (!Pcsx2Trace::IsGsTraceEnabled() && !Pcsx2Trace::IsVuTraceEnabled())
 			return true;
 
-		return m_code.EmitMovImm32(HOST_TMP0, pc) &&
-			   m_code.EmitCallAbsolute(
-				   reinterpret_cast<const void*>(
-					   static_cast<bool (*)(u32)>(&Pcsx2Trace::RecordGsPreEeInstruction)));
+		if (Pcsx2Trace::IsGsTraceEnabled())
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP0, pc) ||
+				!m_code.EmitCallAbsolute(
+					reinterpret_cast<const void*>(
+						static_cast<bool (*)(u32)>(&Pcsx2Trace::RecordGsPreEeInstruction))))
+			{
+				return false;
+			}
+		}
+
+		if (Pcsx2Trace::IsVuTraceEnabled())
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP0, pc) ||
+				!m_code.EmitCallAbsolute(
+					reinterpret_cast<const void*>(
+						static_cast<bool (*)(u32)>(&Pcsx2Trace::RecordVuPreEeInstruction))))
+			{
+				return false;
+			}
+		}
+
+		return true;
 #endif
 	}
 
