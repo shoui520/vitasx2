@@ -61,7 +61,6 @@ static __fi bool _add32_Overflow( s32 x, s32 y, s64 &ret )
 }
 
 
-#if !defined(VITASX2_QEMU_LOCAL_OPCODE_CYCLES)
 const R5900::OPCODE& R5900::GetCurrentInstruction()
 {
 	const OPCODE* opcode = &R5900::OpcodeTables::tbl_Standard[_Opcode_];
@@ -81,7 +80,6 @@ const R5900::OPCODE& R5900::GetInstruction(u32 op)
 
 	return *opcode;
 }
-#endif
 
 const char * const R5900::bios[256]=
 {
