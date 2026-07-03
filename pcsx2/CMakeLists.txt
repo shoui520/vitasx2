@@ -93,6 +93,7 @@ add_library(pcsx2core STATIC
 	R5900OpcodeImpl.cpp
 	R5900OpcodeTables.cpp
 	SIO/Pad/PadBase.cpp
+	SIO/Pad/PadDualshock2.cpp
 	SIO/Pad/PadNotConnected.cpp
 	SIO/Memcard/MemoryCardFile.cpp
 	SIO/Memcard/MemoryCardProtocol.cpp

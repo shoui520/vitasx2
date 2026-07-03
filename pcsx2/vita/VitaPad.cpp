@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "SIO/Pad/Pad.h"
+#include "SIO/Pad/PadDualshock2.h"
 #include "SIO/Pad/PadNotConnected.h"
 #include "SIO/Sio.h"
 
@@ -16,13 +17,30 @@ namespace Pad
 {
 	static std::array<std::unique_ptr<PadBase>, NUM_CONTROLLER_PORTS> s_controllers;
 
+	static ControllerType GetDefaultControllerType(u32 unified_slot)
+	{
+		return (unified_slot == 0) ? ControllerType::DualShock2 : ControllerType::NotConnected;
+	}
+
+	static std::unique_ptr<PadBase> CreatePad(ControllerType type, u8 unified_slot, size_t eject_ticks = 0)
+	{
+		switch (type)
+		{
+			case ControllerType::DualShock2:
+				return std::make_unique<PadDualshock2>(unified_slot, eject_ticks);
+			case ControllerType::NotConnected:
+			default:
+				return std::make_unique<PadNotConnected>(unified_slot, eject_ticks);
+		}
+	}
+
 	static PadBase* EnsurePad(u8 unified_slot)
 	{
 		if (unified_slot >= NUM_CONTROLLER_PORTS)
 			unified_slot = 0;
 
 		if (!s_controllers[unified_slot])
-			s_controllers[unified_slot] = std::make_unique<PadNotConnected>(unified_slot);
+			s_controllers[unified_slot] = CreatePad(GetDefaultControllerType(unified_slot), unified_slot);
 
 		return s_controllers[unified_slot].get();
 	}
@@ -43,16 +61,27 @@ void Pad::Shutdown()
 
 Pad::ControllerType Pad::GetDefaultPadType(u32 pad)
 {
-	return ControllerType::NotConnected;
+	return GetDefaultControllerType(pad);
 }
 
 void Pad::LoadConfig(const SettingsInterface& si)
 {
-	Initialize();
+	for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
+	{
+		const std::string section = GetConfigSection(i);
+		const ControllerInfo* ci = GetConfigControllerType(si, section.c_str(), i);
+		s_controllers[i] = CreatePad(ci ? ci->type : GetDefaultControllerType(i), i);
+	}
 }
 
 void Pad::SetDefaultControllerConfig(SettingsInterface& si)
 {
+	for (u32 i = 0; i < NUM_CONTROLLER_PORTS; i++)
+	{
+		const std::string section = GetConfigSection(i);
+		const ControllerInfo* ci = GetControllerInfo(GetDefaultPadType(i));
+		si.SetStringValue(section.c_str(), "Type", ci->name);
+	}
 }
 
 void Pad::SetDefaultHotkeyConfig(SettingsInterface& si)
@@ -70,22 +99,40 @@ void Pad::CopyConfiguration(SettingsInterface* dest_si, const SettingsInterface&
 
 const std::vector<std::pair<const char*, const char*>> Pad::GetControllerTypeNames()
 {
-	return {{"None", "Not Connected"}};
+	return {
+		{PadNotConnected::ControllerInfo.name, PadNotConnected::ControllerInfo.display_name},
+		{PadDualshock2::ControllerInfo.name, PadDualshock2::ControllerInfo.display_name},
+	};
 }
 
 const Pad::ControllerInfo* Pad::GetControllerInfo(ControllerType type)
 {
-	return &PadNotConnected::ControllerInfo;
+	switch (type)
+	{
+		case ControllerType::DualShock2:
+			return &PadDualshock2::ControllerInfo;
+		case ControllerType::NotConnected:
+		default:
+			return &PadNotConnected::ControllerInfo;
+	}
 }
 
 const Pad::ControllerInfo* Pad::GetControllerInfoByName(const std::string_view name)
 {
-	return &PadNotConnected::ControllerInfo;
+	if (name == PadDualshock2::ControllerInfo.name)
+		return &PadDualshock2::ControllerInfo;
+	if (name == PadNotConnected::ControllerInfo.name)
+		return &PadNotConnected::ControllerInfo;
+
+	return nullptr;
 }
 
 const Pad::ControllerInfo* Pad::GetConfigControllerType(const SettingsInterface& si, const char* section, u32 port)
 {
-	return &PadNotConnected::ControllerInfo;
+	const ControllerInfo* default_info = GetControllerInfo(GetDefaultPadType(port));
+	const std::string type = si.GetStringValue(section, "Type", default_info->name);
+	const ControllerInfo* info = GetControllerInfoByName(type);
+	return info ? info : default_info;
 }
 
 bool Pad::MapController(SettingsInterface& si, u32 controller, const std::vector<std::pair<GenericInputBinding, std::string>>& mapping)
@@ -105,7 +152,10 @@ std::string Pad::GetConfigSection(u32 pad_index)
 
 bool Pad::HasConnectedPad(u8 unifiedSlot)
 {
-	return false;
+	if (unifiedSlot >= NUM_CONTROLLER_PORTS)
+		return false;
+
+	return EnsurePad(unifiedSlot)->GetType() != ControllerType::NotConnected;
 }
 
 PadBase* Pad::GetPad(u8 port, u8 slot)
@@ -120,11 +170,29 @@ PadBase* Pad::GetPad(const u8 unifiedSlot)
 
 void Pad::SetControllerState(u32 controller, u32 bind, float value)
 {
+	if (controller >= NUM_CONTROLLER_PORTS)
+		return;
+
+	EnsurePad(static_cast<u8>(controller))->Set(bind, value);
 }
 
 bool Pad::Freeze(StateWrapper& sw)
 {
-	return true;
+	if (!sw.DoMarker("PAD"))
+		return false;
+
+	for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
+	{
+		ControllerType type = EnsurePad(i)->GetType();
+		sw.Do(&type);
+		if (sw.IsReading())
+			s_controllers[i] = CreatePad(type, i);
+
+		if (!EnsurePad(i)->Freeze(sw))
+			return false;
+	}
+
+	return !sw.HasError();
 }
 
 void Pad::SetMacroButtonState(InputBindingKey& key, u32 pad, u32 index, bool state)
@@ -142,5 +210,11 @@ const char* Pad::ControllerInfo::GetLocalizedName() const
 
 std::optional<u32> Pad::ControllerInfo::GetBindIndex(const std::string_view name) const
 {
+	for (u32 i = 0; i < static_cast<u32>(bindings.size()); i++)
+	{
+		if (name == bindings[i].name)
+			return i;
+	}
+
 	return std::nullopt;
 }
