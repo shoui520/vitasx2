@@ -73,14 +73,10 @@ static inline uint32_t vaddvq_u32(uint32x4_t v)
 
 static inline int8x16_t vqtbl1q_s8(int8x16_t table, uint8x16_t indices)
 {
-	s8 table_values[16];
-	u8 index_values[16];
-	s8 result_values[16];
-	vst1q_s8(table_values, table);
-	vst1q_u8(index_values, indices);
-	for (size_t i = 0; i < 16; i++)
-		result_values[i] = index_values[i] < 16 ? table_values[index_values[i]] : 0;
-	return vld1q_s8(result_values);
+	const int8x8x2_t table_halves = {vget_low_s8(table), vget_high_s8(table)};
+	return vcombine_s8(
+		vtbl2_s8(table_halves, vreinterpret_s8_u8(vget_low_u8(indices))),
+		vtbl2_s8(table_halves, vreinterpret_s8_u8(vget_high_u8(indices))));
 }
 
 static inline int32x4_t vzip1q_s32(int32x4_t a, int32x4_t b) { return vzipq_s32(a, b).val[0]; }
