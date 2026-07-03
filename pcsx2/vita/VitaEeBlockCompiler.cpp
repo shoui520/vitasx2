@@ -149,7 +149,13 @@ namespace VitaEE
 		constexpr u16 DMAC_STAT_DMAC_OFFSET = 0x10;
 		constexpr u16 DMAC_PCR_DMAC_OFFSET = 0x20;
 		constexpr u32 DMAC_CPCOND_MASK = 0x3ff;
+		constexpr unsigned VU0_REG_MAC_FLAG = 17;
+		constexpr unsigned VU0_REG_CLIP_FLAG = 18;
 		constexpr unsigned VU0_REG_R = 20;
+		constexpr unsigned VU0_REG_TPC = 26;
+		constexpr unsigned VU0_REG_FBRST = 28;
+		constexpr unsigned VU0_REG_VPU_STAT = 29;
+		constexpr unsigned VU0_REG_CMSAR1 = 31;
 
 		alignas(16) GPR_reg s_lq_zero_sink;
 
@@ -586,6 +592,18 @@ namespace VitaEE
 				   (op & 1u) == 0; // CFC2, owned by VU0.cpp::CFC2().
 		}
 
+		bool IsFastCOP2ControlWrite(u32 op)
+		{
+			if ((op >> 26) != 0x12 || ((op >> 21) & 0x1f) != 0x06 ||
+				(op & 1u) != 0)
+			{
+				return false;
+			}
+
+			const unsigned fs = RD(op);
+			return fs != VU0_REG_FBRST && fs != VU0_REG_CMSAR1;
+		}
+
 		bool CanCompileMMI(u32 op)
 		{
 			switch (op & 0x3f)
@@ -840,7 +858,8 @@ namespace VitaEE
 		bool CanCompileCOP2(u32 op)
 		{
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-			return IsCOP2BranchOpcode(op) || IsFastCOP2VectorTransfer(op) || IsFastCOP2ControlRead(op);
+			return IsCOP2BranchOpcode(op) || IsFastCOP2VectorTransfer(op) ||
+				   IsFastCOP2ControlRead(op) || IsFastCOP2ControlWrite(op);
 #else
 			// PCSX2 owners: COP2.cpp, VU0.cpp, VUops.cpp, and
 			// R5900OpcodeTables.cpp::Int_COP2*PrintTable. The first A32 full-core
@@ -3169,6 +3188,8 @@ namespace VitaEE
 			return EmitCOP2VectorTransferEventExit(op, pc + 4, raw_cycles_through_instruction, event_exit);
 		if (IsFastCOP2ControlRead(op))
 			return EmitCOP2ControlReadEventExit(op, pc + 4, raw_cycles_through_instruction, event_exit);
+		if (IsFastCOP2ControlWrite(op))
+			return EmitCOP2ControlWriteEventExit(op, pc + 4, raw_cycles_through_instruction, event_exit);
 
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		return false;
@@ -3278,6 +3299,74 @@ namespace VitaEE
 			{
 				return false;
 			}
+		}
+
+		return m_code.EmitCallAbsolute(event_exit) &&
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+	}
+
+	bool BlockCompiler::EmitCOP2ControlWriteEventExit(u32 op, u32 next_pc,
+		u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+		// PCSX2 owner: VU0.cpp::CTC2(). Keep FBRST and CMSAR1 helper-backed
+		// because they reset/start VUs; the rest are no-op, masked, or raw VI
+		// low-word writes after vu0Sync().
+		if (!event_exit || raw_cycles_through_instruction == 0)
+			return false;
+
+		const unsigned rt = RT(op);
+		const unsigned fs = RD(op);
+		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
+
+		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
+			!EmitStorePc(next_pc) ||
+			!EmitAddScaledCyclesToCpu(cycles) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)))
+		{
+			return false;
+		}
+
+		switch (fs)
+		{
+			case 0:
+			case VU0_REG_MAC_FLAG:
+			case VU0_REG_TPC:
+			case VU0_REG_VPU_STAT:
+				break;
+
+			case VU0_REG_R:
+				if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) ||
+					!m_code.EmitMovImm32(HOST_TMP2, 0x007fffffu) ||
+					!m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
+					!m_code.EmitMovImm32(HOST_TMP2, 0x3f800000u) ||
+					!m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
+					!EmitVu0ViAddress(HOST_TMP0, fs) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+				{
+					return false;
+				}
+				break;
+
+			case VU0_REG_CLIP_FLAG:
+				if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) ||
+					!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(reinterpret_cast<uptr>(&VU0.clipflag))) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+					!EmitVu0ViAddress(HOST_TMP0, fs) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+				{
+					return false;
+				}
+				break;
+
+			default:
+				if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) ||
+					!EmitVu0ViAddress(HOST_TMP0, fs) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+				{
+					return false;
+				}
+				break;
 		}
 
 		return m_code.EmitCallAbsolute(event_exit) &&
