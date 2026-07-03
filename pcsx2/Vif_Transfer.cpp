@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
+#include "DebugTools/VifTrace.h"
 #include "Vif_Dma.h"
 #include "Vif_Dynarec.h"
 
@@ -35,6 +36,13 @@ _vifT void vifTransferLoop(u32* &data) {
 			vifXRegs.code = data[0];
 			vifX.cmd	  = data[0] >> 24;
 
+			const DMACh& vifChannel = idx ? vif1ch : vif0ch;
+			const u32 trace_cycle = static_cast<u32>(vifXRegs.cycle.cl) |
+				(static_cast<u32>(vifXRegs.cycle.wl) << 8);
+			Pcsx2Trace::RecordVifCommand(static_cast<u8>(idx), vifXRegs.code,
+				vifXRegs.stat._u32, trace_cycle,
+				vifXRegs.mode, vifXRegs.num, vifXRegs.mask, vifX.tag.addr,
+				vifX.tag.size, vifX.vifpacketsize, vifChannel.madr, vifChannel.qwc);
 
 			VIF_LOG("New VifCMD %x tagsize %x irq %d", vifX.cmd, vifX.tag.size, vifX.irq);
 			if (IsDevBuild && TraceLogging.EE.VIFcode.IsActive()) {

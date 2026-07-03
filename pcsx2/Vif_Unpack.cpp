@@ -3,8 +3,10 @@
 
 #include "Common.h"
 #include "Vif.h"
+#include "DebugTools/VifTrace.h"
 #include "Vif_Dma.h"
 #include "Vif_Dynarec.h"
+#include "VUmicro.h"
 #include "MTVU.h"
 
 enum UnpackOffset {
@@ -353,6 +355,18 @@ _vifT int nVifUnpack(const u8* data)
 				vifRegs.num = 256;
 		}
 
+		const u32 trace_code = vifRegs.code;
+		const u32 trace_stat = vifRegs.stat._u32;
+		const u32 trace_cycle = static_cast<u32>(vifRegs.cycle.cl) |
+			(static_cast<u32>(vifRegs.cycle.wl) << 8);
+		const u32 trace_mode = vifRegs.mode;
+		const u32 trace_num = vifRegs.num;
+		const u32 trace_mask = vifRegs.mask;
+		const u32 trace_tag_addr = vif.tag.addr;
+		const u32 trace_tag_size = vif.tag.size;
+		const u32 trace_packet_size = vif.vifpacketsize;
+		const u32 trace_cl = vifRegs.cycle.cl;
+		const u32 trace_wl = vifRegs.cycle.wl;
 		if (!idx || !THREAD_VU1)
 		{
 			if (newVifDynaRec)
@@ -362,6 +376,10 @@ _vifT int nVifUnpack(const u8* data)
 		}
 		else
 			vu1Thread.VifUnpack(vif, vifRegs, (u8*)data, (size + 4) & ~0x3);
+		Pcsx2Trace::RecordVifUnpack(static_cast<u8>(idx), trace_code, trace_stat,
+			trace_cycle, trace_mode, trace_num, trace_mask, trace_tag_addr,
+			trace_tag_size, trace_packet_size, trace_cl, trace_wl, data,
+			static_cast<u32>(size), vuRegs[idx].Mem, idx ? VU1_MEMSIZE : VU0_MEMSIZE);
 
 		vif.pass     = 0;
 		vif.tag.size = 0;
