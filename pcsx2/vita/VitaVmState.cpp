@@ -3,6 +3,7 @@
 
 #include "CDVD/CDVD.h"
 #include "Config.h"
+#include "DebugTools/GsTrace.h"
 #include "Elfheader.h"
 #include "Memory.h"
 #include "R3000A.h"
@@ -220,6 +221,7 @@ namespace VMManager
 			if (s_elf_executed)
 				return;
 
+			Pcsx2Trace::NotifyGsElfEntry(s_elf_entry_point);
 			s_elf_executed = true;
 			// Mirrors VMManager.cpp::EntryPointCompilingOnCPUThread() -> HandleELFChange(true):
 			// the BIOS/EELOAD-only InstantDMAHack from ApplyGameFixes() is cleared once the game ELF owns execution.

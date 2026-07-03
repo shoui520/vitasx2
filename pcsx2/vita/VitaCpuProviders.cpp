@@ -3,6 +3,7 @@
 
 #include "MTVU.h"
 #include "Config.h"
+#include "DebugTools/GsTrace.h"
 #include "Memory.h"
 #include "R3000A.h"
 #include "R5900.h"
@@ -25,6 +26,8 @@ static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
 static bool s_ee_a32_running_compiled_block = false;
 static VitaA32EeTraceMode s_ee_a32_trace_mode = VitaA32EeTraceMode::InstructionWindow;
+static bool s_ee_provider_trace_suppressed = false;
+static bool s_ee_a32_prerecording_window = false;
 
 const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason)
 {
@@ -59,8 +62,17 @@ void VitaRequestA32EeCacheReset()
 
 bool VitaRecordEePreInstruction(u32 pc, u32 opcode)
 {
+	if (s_ee_provider_trace_suppressed)
+		return false;
+
 	const VitaEePreInstructionTraceCallback callback = s_ee_pre_instruction_trace_callback;
-	return callback ? callback(pc, opcode) : false;
+	const bool stop_for_ee_trace = callback ? callback(pc, opcode) : false;
+	if (stop_for_ee_trace)
+		return true;
+	if (s_ee_a32_prerecording_window || s_ee_a32_trace_mode == VitaA32EeTraceMode::BlockBoundaryState)
+		return false;
+
+	return Pcsx2Trace::RecordGsPreEeInstruction(pc);
 }
 
 void VitaSetA32EeTraceMode(VitaA32EeTraceMode mode)
@@ -133,7 +145,9 @@ static void recInterpreterStepWithoutProviderTrace()
 {
 	const VitaEePreInstructionTraceCallback callback = s_ee_pre_instruction_trace_callback;
 	s_ee_pre_instruction_trace_callback = nullptr;
+	s_ee_provider_trace_suppressed = true;
 	intCpu.Step();
+	s_ee_provider_trace_suppressed = false;
 	s_ee_pre_instruction_trace_callback = callback;
 }
 
@@ -143,15 +157,20 @@ static bool recRecordEeWindow(u32 start_pc, u32 instruction_count, u32* executab
 		return false;
 
 	*executable_instruction_count = 0;
+	s_ee_a32_prerecording_window = true;
 	for (u32 i = 0; i < instruction_count; i++)
 	{
 		const u32 pc = start_pc + i * 4;
 		if (VitaRecordEePreInstruction(pc, memRead32(pc)))
+		{
+			s_ee_a32_prerecording_window = false;
 			return false;
+		}
 
 		(*executable_instruction_count)++;
 	}
 
+	s_ee_a32_prerecording_window = false;
 	return true;
 }
 

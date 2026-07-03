@@ -24,6 +24,7 @@ add_library(pcsx2core STATIC
 	DebugTools/DisVU0Micro.cpp
 	DebugTools/DisVU1Micro.cpp
 	DebugTools/DisassemblyManager.cpp
+	DebugTools/GsTrace.cpp
 	DebugTools/MemTrace.cpp
 	DebugTools/ExpressionParser.cpp
 	DebugTools/MIPSAnalyst.cpp
@@ -37,6 +38,20 @@ add_library(pcsx2core STATIC
 	FPU.cpp
 	FiFo.cpp
 	GS.cpp
+	GS/GSBlock.cpp
+	GS/GSClut.cpp
+	GS/GSDrawingContext.cpp
+	GS/GSDrawingEnvironment.cpp
+	GS/GSLocalMemory.cpp
+	GS/GSLocalMemoryMultiISA.cpp
+	GS/GSPerfMon.cpp
+	GS/GSState.cpp
+	GS/GSTables.cpp
+	GS/GSUtil.cpp
+	GS/GSVector.cpp
+	GS/GSXXH.cpp
+	GS/Renderers/Common/GSVertexTrace.cpp
+	GS/Renderers/Common/GSVertexTraceFMM.cpp
 	Gif.cpp
 	Gif_Logger.cpp
 	Gif_Unit.cpp
@@ -131,6 +146,8 @@ add_library(pcsx2core STATIC
 	vita/VitaEeBlockCompiler.cpp
 	vita/VitaEeExecutor.cpp
 	vita/VitaGsMailbox.cpp
+	vita/VitaGsDiagnosticsDisabled.cpp
+	vita/VitaGsMemory.cpp
 	vita/VitaHostSurface.cpp
 	vita/VitaPad.cpp
 	vita/VitaVifInterpreter.cpp

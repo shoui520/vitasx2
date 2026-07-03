@@ -28,6 +28,8 @@ struct alignas(32) GSVertex
 		__m128i m[2];
 #elif defined(ARCH_ARM64)
 		int32x4_t m[2];
+#elif defined(ARCH_ARM32)
+		int32x4_t m[2];
 #endif
 	};
 };

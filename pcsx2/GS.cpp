@@ -7,6 +7,7 @@
 #include "Gif_Unit.h"
 #include "MTGS.h"
 #include "VMManager.h"
+#include "DebugTools/GsTrace.h"
 
 #include <list>
 
@@ -154,6 +155,7 @@ __fi void gsWrite32(u32 mem, u32 value)
 {
 	pxAssume( (mem & 3) == 0 );
 	GIF_LOG("GS write 32 at %8.8lx with data %8.8lx", mem, value);
+	Pcsx2Trace::RecordGsPrivilegedWrite(mem, value, 0, false);
 
 	switch (mem)
 	{
@@ -175,6 +177,8 @@ __fi void gsWrite32(u32 mem, u32 value)
 void gsWrite64_generic( u32 mem, u64 value )
 {
 	GIF_LOG("GS Write64 at %8.8lx with data %8.8x_%8.8x", mem, (u32)(value >> 32), (u32)value);
+	Pcsx2Trace::RecordGsPrivilegedWrite(mem, static_cast<u32>(value), 0, false);
+	Pcsx2Trace::RecordGsPrivilegedWrite(mem + 4, static_cast<u32>(value >> 32), 0, false);
 
 	std::memcpy(PS2GS_BASE(mem), &value, sizeof(value));
 }
@@ -217,10 +221,14 @@ void gsWrite64_page_01( u32 mem, u64 value )
 		return;
 
 		case GS_CSR:
+			Pcsx2Trace::RecordGsPrivilegedWrite(mem, static_cast<u32>(value), 0, false);
+			Pcsx2Trace::RecordGsPrivilegedWrite(mem + 4, static_cast<u32>(value >> 32), 0, false);
 			gsCSRwrite(tGS_CSR(value));
 		return;
 
 		case GS_IMR:
+			Pcsx2Trace::RecordGsPrivilegedWrite(mem, static_cast<u32>(value), 0, false);
+			Pcsx2Trace::RecordGsPrivilegedWrite(mem + 4, static_cast<u32>(value >> 32), 0, false);
 			IMRwrite(static_cast<u32>(value));
 		return;
 	}
@@ -340,4 +348,3 @@ bool SaveStateBase::gsFreeze()
 	Freeze(gsVideoMode);
 	return IsOkay();
 }
-

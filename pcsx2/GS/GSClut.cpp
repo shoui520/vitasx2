@@ -410,6 +410,7 @@ void GSClut::Read32(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA)
 			}
 		}
 
+#if !defined(VITASX2_VITA)
 		if (GSConfig.UserHacks_GPUTargetCLUTMode != GSGPUTargetCLUTMode::Disabled)
 		{
 			const bool is_4bit = (TEX0.PSM == PSMT4 || TEX0.PSM == PSMT4HL || TEX0.PSM == PSMT4HH);
@@ -469,6 +470,7 @@ void GSClut::Read32(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA)
 				return;
 			}
 		}
+#endif
 		m_current_gpu_clut = nullptr;
 	}
 }

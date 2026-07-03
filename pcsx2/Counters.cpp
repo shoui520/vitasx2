@@ -14,6 +14,7 @@
 #include "MTGS.h"
 #include "PerformanceMetrics.h"
 #include "Patch.h"
+#include "DebugTools/GsTrace.h"
 #include "ps2/HwInternal.h"
 #include "SIO/Sio.h"
 #include "SPU2/spu2.h"
@@ -486,6 +487,8 @@ static __fi void DoFMVSwitch()
 
 static __fi void VSyncStart(u64 sCycle)
 {
+	Pcsx2Trace::RecordGsVSync(Pcsx2Trace::GsTraceVSyncStart, sCycle);
+
 	// End-of-frame tasks.
 	DoFMVSwitch();
 	VMManager::Internal::VSyncOnCPUThread();
@@ -542,8 +545,10 @@ static __fi void VSyncStart(u64 sCycle)
 		Cpu->ExitExecution();
 }
 
-static __fi void GSVSync()
+static __fi void GSVSync(u64 sCycle)
 {
+	Pcsx2Trace::RecordGsVSync(Pcsx2Trace::GsTraceVSyncGsBlank, sCycle);
+
 	// CSR is swapped and GS vBlank IRQ is triggered roughly 3.5 hblanks after VSync Start
 	if (GSSMODE1reg.SINT)
 		return;
@@ -563,6 +568,8 @@ static __fi void GSVSync()
 
 static __fi void VSyncEnd(u64 sCycle)
 {
+	Pcsx2Trace::RecordGsVSync(Pcsx2Trace::GsTraceVSyncEnd, sCycle);
+
 	EECNT_LOG("    ================  EE COUNTER VSYNC END (frame: %d)  ================", g_FrameCount);
 
 	g_FrameCount++;
@@ -600,7 +607,7 @@ __fi void rcntUpdate_vSync()
 	}
 	else if (vsyncCounter.Mode == MODE_GSBLANK) // GS CSR Swap and interrupt
 	{
-		GSVSync();
+		GSVSync(vsyncCounter.startCycle + vsyncCounter.deltaCycles);
 
 		vsyncCounter.Mode = MODE_VBLANK;
 		// Don't set the start cycle, makes it easier to calculate the correct Vsync End time
