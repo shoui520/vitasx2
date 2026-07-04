@@ -8580,10 +8580,11 @@ namespace VitaEE
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
+		const bool needs_counter_event = rt != 0;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			(branch_delay_slot &&
+			(branch_delay_slot && needs_counter_event &&
 			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
-			!EmitCounterReadFlagFromAddress(HOST_TMP0) ||
+			(needs_counter_event && !m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0)) ||
 			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
 		{
 			return false;
@@ -8604,16 +8605,16 @@ namespace VitaEE
 			return false;
 
 		const size_t fallback_target = m_code.Size();
-		if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead32Checked)))
+		if ((needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead32Checked)))
+		{
 			return false;
+		}
 
 		const size_t value_ready_target = m_code.Size();
 		auto emit_result_tail = [&]() -> bool {
 			if (rt == 0)
-			{
-				return !branch_delay_slot ||
-					   m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0);
-			}
+				return true;
 
 			return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1) &&
@@ -10330,7 +10331,7 @@ namespace VitaEE
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			(branch_delay_slot && needs_counter_event &&
 			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
-			(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)))
+			(needs_counter_event && !m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0)))
 		{
 			return false;
 		}
@@ -10368,8 +10369,11 @@ namespace VitaEE
 			return false;
 
 		const size_t fallback_target = m_code.Size();
-		if (!m_code.EmitCallAbsolute(read_helper))
+		if ((needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
+			!m_code.EmitCallAbsolute(read_helper))
+		{
 			return false;
+		}
 
 		const auto emit_sign_extend_low = [&]() -> bool {
 			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
