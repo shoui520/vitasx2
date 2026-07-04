@@ -2237,7 +2237,7 @@ namespace VitaIOP
 	{
 		const u32 next_pc = pc + 4;
 		if (!EmitStoreCode(op) ||
-			!EmitTraceCheck(pc, op, direct_exit_branches) ||
+			(m_emit_trace_checks && !EmitTraceCheck(pc, op, direct_exit_branches)) ||
 			!EmitStorePc(next_pc) ||
 			!EmitIncrementCycle())
 		{
@@ -2274,6 +2274,7 @@ namespace VitaIOP
 		direct_exit_branches.reserve(instruction_count * 2);
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
+		m_emit_trace_checks = VitaIsIopPreInstructionTraceEnabled();
 		bool can_direct_link_fallthrough = true;
 		bool has_native_static_branch = false;
 		bool has_native_static_jump = false;

@@ -125,4 +125,5 @@ void VitaSetEeExactTraceStreams(bool enabled);
 // in R3000AInterpreter.cpp::execI() for Vita bring-up trace executables.
 using VitaIopPreInstructionTraceCallback = bool (*)(u32 pc, u32 opcode);
 void VitaSetIopPreInstructionTraceCallback(VitaIopPreInstructionTraceCallback callback);
+bool VitaIsIopPreInstructionTraceEnabled();
 bool VitaRecordIopPreInstruction(u32 pc, u32 opcode);

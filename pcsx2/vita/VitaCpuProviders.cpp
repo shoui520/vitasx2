@@ -112,7 +112,16 @@ void VitaSetEeExactTraceStreams(bool enabled)
 
 void VitaSetIopPreInstructionTraceCallback(VitaIopPreInstructionTraceCallback callback)
 {
+	const bool old_enabled = (s_iop_pre_instruction_trace_callback != nullptr);
+	const bool new_enabled = (callback != nullptr);
 	s_iop_pre_instruction_trace_callback = callback;
+	if (old_enabled != new_enabled)
+		s_iop_a32_executor.Reset();
+}
+
+bool VitaIsIopPreInstructionTraceEnabled()
+{
+	return s_iop_pre_instruction_trace_callback != nullptr;
 }
 
 bool VitaRecordIopPreInstruction(u32 pc, u32 opcode)

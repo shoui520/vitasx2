@@ -117,6 +117,7 @@ namespace VitaIOP
 		VitaA32::CodeBuffer& m_code;
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
+		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_jump = false;
 		bool m_emit_native_register_jump = false;
