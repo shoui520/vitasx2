@@ -66,6 +66,7 @@ struct VitaA32IopProviderStats
 	u32 interpreter_blocks = 0;
 	u32 cache_hits = 0;
 	u32 cache_misses = 0;
+	u32 lookup_hits = 0;
 	u32 invalidated_blocks = 0;
 	u32 code_cache_resets = 0;
 	u32 first_interpreter_pc = 0;

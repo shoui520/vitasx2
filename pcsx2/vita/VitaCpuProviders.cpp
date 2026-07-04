@@ -685,6 +685,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.native_instructions += result.native_instruction_count;
 			s_iop_a32_stats.helper_instructions += result.helper_instruction_count;
 		}
+		if (result.lookup_hit)
+			s_iop_a32_stats.lookup_hits++;
 		s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
 
 		psxRecChargeEeBudget(last_iop_cycle);
