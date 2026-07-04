@@ -2181,7 +2181,7 @@ namespace VitaEE
 			case 0x36: // LQC2, owned by VU0.cpp::LQC2().
 				return EmitLQC2(op);
 			case 0x37: // LD, owned by R5900OpcodeImpl.cpp::LD().
-				return EmitLD(op);
+				return EmitLD(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x39: // SWC1, owned by FPU.cpp::SWC1().
 				return EmitSWC1(op);
 			case 0x3e: // SQC2, owned by VU0.cpp::SQC2().
@@ -8518,7 +8518,7 @@ namespace VitaEE
 		return EmitPartialWordLoad(op, false);
 	}
 
-	bool BlockCompiler::EmitLD(u32 op)
+	bool BlockCompiler::EmitLD(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		const unsigned rt = RT(op);
 
@@ -8566,9 +8566,18 @@ namespace VitaEE
 			return false;
 		}
 
-		return m_code.PatchBranch(unaligned_fallback, fallback_target, VitaA32::Condition::NE) &&
+		const size_t after_address_error = m_code.EmitBranchPlaceholder();
+		if (after_address_error == static_cast<size_t>(-1))
+			return false;
+
+		const size_t address_error_target = m_code.Size();
+		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, false))
+			return false;
+
+		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
 			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(value_ready, value_ready_target);
+			   m_code.PatchBranch(value_ready, value_ready_target) &&
+			   m_code.PatchBranch(after_address_error, m_code.Size());
 	}
 
 	bool BlockCompiler::EmitLDL(u32 op)
