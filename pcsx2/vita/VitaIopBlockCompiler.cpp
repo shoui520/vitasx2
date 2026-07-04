@@ -1358,8 +1358,7 @@ namespace VitaIOP
 		if (!EmitEffectiveAddress(op) ||
 			!m_code.EmitAndImm8(HOST_SAVED0, HOST_TMP0, 3) ||
 			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_SAVED0, VitaA32::ShiftType::LSL, 3) ||
-			!m_code.EmitMovImm32(HOST_TMP1, 0xfffffffcu) ||
-			!m_code.EmitAndReg(HOST_SAVED1, HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitBicImm32(HOST_SAVED1, HOST_TMP0, 3) ||
 			!m_code.EmitTstImm32(HOST_SAVED1, 0x10000000u))
 		{
 			return false;
@@ -1826,10 +1825,8 @@ namespace VitaIOP
 	bool BlockCompiler::EmitCop0RfeOp()
 	{
 		return m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) &&
-			   m_code.EmitMovImm32(HOST_TMP1, 0xfffffff0u) &&
-			   m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
-			   m_code.EmitMovImm32(HOST_TMP1, 0x3cu) &&
-			   m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitBicImm32(HOST_TMP2, HOST_TMP0, 0x0f) &&
+			   m_code.EmitAndImm32(HOST_TMP0, HOST_TMP0, 0x3cu) &&
 			   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, 2) &&
 			   m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP0) &&
 			   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) &&
