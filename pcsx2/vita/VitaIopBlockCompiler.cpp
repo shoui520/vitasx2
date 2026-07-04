@@ -71,6 +71,11 @@ namespace
 		return pc + 4 + static_cast<u32>(static_cast<s32>(IMM_S(op)) * 4);
 	}
 
+	constexpr u32 JumpTarget(u32 pc, u32 op)
+	{
+		return ((pc + 4) & 0xf0000000u) | ((op & 0x03ffffffu) << 2);
+	}
+
 	constexpr size_t GprOffset(unsigned guest_reg)
 	{
 		return GPR_OFFSET + guest_reg * sizeof(u32);
@@ -106,6 +111,8 @@ namespace
 			case 0x04: // SLLV
 			case 0x06: // SRLV
 			case 0x07: // SRAV
+			case 0x08: // JR
+			case 0x09: // JALR
 			case 0x10: // MFHI
 			case 0x11: // MTHI
 			case 0x12: // MFLO
@@ -132,6 +139,8 @@ namespace
 		{
 			case 0x00: // SPECIAL
 				return IsNativeSpecialOpcode(op);
+			case 0x02: // J
+			case 0x03: // JAL
 			case 0x04: // BEQ
 			case 0x05: // BNE
 			case 0x08: // ADDI
@@ -596,6 +605,46 @@ namespace VitaIOP
 			   m_code.PatchBranch(not_taken, m_code.Size(), skip_taken);
 	}
 
+	bool BlockCompiler::EmitJumpOp(u32 op, u32 pc)
+	{
+		if ((op >> 26) == 0x03) // JAL
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP0, pc + 8) ||
+				!EmitStoreGpr(31, HOST_TMP0) ||
+				!m_code.EmitMovImm32(HOST_TMP0, JumpTarget(pc, op)) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP0, JumpTarget(pc, op)) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoJump), HOST_CALL_SCRATCH))
+			{
+				return false;
+			}
+		}
+
+		return EndBlockReturn(BlockExitKind::Direct);
+	}
+
+	bool BlockCompiler::EmitRegisterJumpOp(u32 op, u32 pc)
+	{
+		if ((op & 0x3f) == 0x09 && RD(op) != 0) // JALR
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP0, pc + 8) ||
+				!EmitStoreGpr(RD(op), HOST_TMP0))
+			{
+				return false;
+			}
+		}
+
+		return EmitLoadGpr(RS(op), HOST_TMP0) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
+			   EndBlockReturn(BlockExitKind::Direct);
+	}
+
 	bool BlockCompiler::EmitCop0TransferOp(u32 op, bool to_cop0)
 	{
 		if (to_cop0)
@@ -623,7 +672,7 @@ namespace VitaIOP
 			   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET));
 	}
 
-	bool BlockCompiler::EmitNativeSPECIAL(u32 op)
+	bool BlockCompiler::EmitNativeSPECIAL(u32 op, u32 pc)
 	{
 		switch (op & 0x3f)
 		{
@@ -635,6 +684,9 @@ namespace VitaIOP
 			case 0x06: // SRLV
 			case 0x07: // SRAV
 				return EmitShiftRegOp(op);
+			case 0x08: // JR
+			case 0x09: // JALR
+				return EmitRegisterJumpOp(op, pc);
 			case 0x10: // MFHI
 				return EmitMoveGpr(RD(op), 32);
 			case 0x11: // MTHI
@@ -685,7 +737,10 @@ namespace VitaIOP
 		switch (op >> 26)
 		{
 			case 0x00: // SPECIAL
-				return EmitNativeSPECIAL(op);
+				return EmitNativeSPECIAL(op, pc);
+			case 0x02: // J
+			case 0x03: // JAL
+				return EmitJumpOp(op, pc);
 			case 0x04: // BEQ
 			case 0x05: // BNE
 				return EmitConditionalBranchOp(op, pc);

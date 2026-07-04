@@ -87,12 +87,7 @@ void psxBNE()   // Branch if Rs != Rt
 *********************************************************/
 void psxJ()
 {
-	// check for iop module import table magic
-	u32 delayslot = iopMemRead32(psxRegs.pc);
-	if (delayslot >> 16 == 0x2400 && irxImportExec(irxImportTableAddr(psxRegs.pc), delayslot & 0xffff))
-		return;
-
-	doBranch(_JumpTarget_);
+	psxDoJump(_JumpTarget_);
 }
 
 void psxJAL()
@@ -271,6 +266,15 @@ void psxDoBranch(u32 tar) {
 	psxRegs.pc = branchPC;
 
 	iopEventTest();
+}
+
+void psxDoJump(u32 tar) {
+	// check for iop module import table magic
+	u32 delayslot = iopMemRead32(psxRegs.pc);
+	if (delayslot >> 16 == 0x2400 && irxImportExec(irxImportTableAddr(psxRegs.pc), delayslot & 0xffff))
+		return;
+
+	psxDoBranch(tar);
 }
 
 static void doBranch(s32 tar) {
