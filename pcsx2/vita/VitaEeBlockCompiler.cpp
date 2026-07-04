@@ -2161,11 +2161,11 @@ namespace VitaEE
 			case 0x28: // SB, owned by R5900OpcodeImpl.cpp::SB().
 				return EmitSB(op);
 			case 0x29: // SH, owned by R5900OpcodeImpl.cpp::SH().
-				return EmitSH(op);
+				return EmitSH(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x2a: // SWL, owned by R5900OpcodeImpl.cpp::SWL().
 				return EmitSWL(op);
 			case 0x2b: // SW, owned by R5900OpcodeImpl.cpp::SW().
-				return EmitSW(op);
+				return EmitSW(op, pc, raw_cycles_through_instruction, event_exit);
 			case 0x2c: // SDL, owned by R5900OpcodeImpl.cpp::SDL().
 				return EmitSDL(op);
 			case 0x2d: // SDR, owned by R5900OpcodeImpl.cpp::SDR().
@@ -2187,7 +2187,7 @@ namespace VitaEE
 			case 0x3e: // SQC2, owned by VU0.cpp::SQC2().
 				return EmitSQC2(op);
 			case 0x3f: // SD, owned by R5900OpcodeImpl.cpp::SD().
-				return EmitSD(op);
+				return EmitSD(op, pc, raw_cycles_through_instruction, event_exit);
 			default:
 				return false;
 		}
@@ -8727,7 +8727,7 @@ namespace VitaEE
 			   m_code.PatchBranch(done, m_code.Size());
 	}
 
-	bool BlockCompiler::EmitSH(u32 op)
+	bool BlockCompiler::EmitSH(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		const unsigned rt = RT(op);
 
@@ -8761,12 +8761,21 @@ namespace VitaEE
 			return false;
 		}
 
-		return m_code.PatchBranch(unaligned_fallback, fallback_target, VitaA32::Condition::NE) &&
+		const size_t after_address_error = m_code.EmitBranchPlaceholder();
+		if (after_address_error == static_cast<size_t>(-1))
+			return false;
+
+		const size_t address_error_target = m_code.Size();
+		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, true))
+			return false;
+
+		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
 			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size());
+			   m_code.PatchBranch(done, m_code.Size()) &&
+			   m_code.PatchBranch(after_address_error, m_code.Size());
 	}
 
-	bool BlockCompiler::EmitSW(u32 op)
+	bool BlockCompiler::EmitSW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		const unsigned rt = RT(op);
 
@@ -8800,9 +8809,18 @@ namespace VitaEE
 			return false;
 		}
 
-		return m_code.PatchBranch(unaligned_fallback, fallback_target, VitaA32::Condition::NE) &&
+		const size_t after_address_error = m_code.EmitBranchPlaceholder();
+		if (after_address_error == static_cast<size_t>(-1))
+			return false;
+
+		const size_t address_error_target = m_code.Size();
+		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, true))
+			return false;
+
+		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
 			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size());
+			   m_code.PatchBranch(done, m_code.Size()) &&
+			   m_code.PatchBranch(after_address_error, m_code.Size());
 	}
 
 	bool BlockCompiler::EmitSWL(u32 op)
@@ -8815,7 +8833,7 @@ namespace VitaEE
 		return EmitPartialWordStore(op, false);
 	}
 
-	bool BlockCompiler::EmitSD(u32 op)
+	bool BlockCompiler::EmitSD(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		const unsigned rt = RT(op);
 
@@ -8850,9 +8868,18 @@ namespace VitaEE
 			return false;
 		}
 
-		return m_code.PatchBranch(unaligned_fallback, fallback_target, VitaA32::Condition::NE) &&
+		const size_t after_address_error = m_code.EmitBranchPlaceholder();
+		if (after_address_error == static_cast<size_t>(-1))
+			return false;
+
+		const size_t address_error_target = m_code.Size();
+		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, true))
+			return false;
+
+		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
 			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size());
+			   m_code.PatchBranch(done, m_code.Size()) &&
+			   m_code.PatchBranch(after_address_error, m_code.Size());
 	}
 
 	bool BlockCompiler::EmitSDL(u32 op)

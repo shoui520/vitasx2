@@ -358,11 +358,11 @@ namespace VitaEE
 		bool EmitLWC1(u32 op);
 		bool EmitLQC2(u32 op);
 		bool EmitSB(u32 op);
-		bool EmitSH(u32 op);
-		bool EmitSW(u32 op);
+		bool EmitSH(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitSW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitSWL(u32 op);
 		bool EmitSWR(u32 op);
-		bool EmitSD(u32 op);
+		bool EmitSD(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitSDL(u32 op);
 		bool EmitSDR(u32 op);
 		bool EmitSQ(u32 op);
