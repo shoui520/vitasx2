@@ -66,6 +66,9 @@ namespace
 #if VITASX2_VIF_HAS_ARM_NEON
 		const uint32x4_t value = vld1q_u32(reinterpret_cast<const u32*>(src));
 		vst1q_u32(reinterpret_cast<u32*>(dest), value);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
 #else
 		std::memcpy(dest, src, 16);
 #endif
@@ -105,6 +108,91 @@ namespace
 	}
 
 #if VITASX2_VIF_HAS_ARM_NEON
+	void VitaVifStoreS_16WordsNeon(u8* dest, const u8* src, bool usn)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_S().
+		if (usn)
+		{
+			const uint16x4_t packed = vdup_n_u16(VitaVifLoadU16(src));
+			const uint32x4_t widened = vmovl_u16(packed);
+			vst1q_u32(reinterpret_cast<u32*>(dest), widened);
+		}
+		else
+		{
+			const int16x4_t packed = vdup_n_s16(VitaVifLoadS16(src));
+			const int32x4_t widened = vmovl_s16(packed);
+			vst1q_s32(reinterpret_cast<s32*>(dest), widened);
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
+
+	void VitaVifStoreS_8WordsNeon(u8* dest, const u8* src, bool usn)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_S().
+		if (usn)
+		{
+			const uint8x8_t packed = vdup_n_u8(VitaVifLoadU8(src));
+			const uint16x8_t halves = vmovl_u8(packed);
+			const uint32x4_t widened = vmovl_u16(vget_low_u16(halves));
+			vst1q_u32(reinterpret_cast<u32*>(dest), widened);
+		}
+		else
+		{
+			const int8x8_t packed = vdup_n_s8(VitaVifLoadS8(src));
+			const int16x8_t halves = vmovl_s8(packed);
+			const int32x4_t widened = vmovl_s16(vget_low_s16(halves));
+			vst1q_s32(reinterpret_cast<s32*>(dest), widened);
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
+
+	void VitaVifStoreV2_16WordsNeon(u8* dest, const u8* src, bool usn)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V2(); output is v1v0v1v0.
+		const uint32x2_t packed_pair = vdup_n_u32(VitaVifLoadU32(src));
+		if (usn)
+		{
+			const uint32x4_t widened = vmovl_u16(vreinterpret_u16_u32(packed_pair));
+			vst1q_u32(reinterpret_cast<u32*>(dest), widened);
+		}
+		else
+		{
+			const int32x4_t widened = vmovl_s16(vreinterpret_s16_u32(packed_pair));
+			vst1q_s32(reinterpret_cast<s32*>(dest), widened);
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
+
+	void VitaVifStoreV2_8WordsNeon(u8* dest, const u8* src, bool usn)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V2(); output is v1v0v1v0.
+		const u32 xy = VitaVifLoadU16(src);
+		const u32 packed = (xy & 0xffu) | (xy & 0xff00u) |
+						   ((xy & 0xffu) << 16) | ((xy & 0xff00u) << 16);
+		const uint32x2_t packed_pair = vdup_n_u32(packed);
+		if (usn)
+		{
+			const uint16x8_t halves = vmovl_u8(vreinterpret_u8_u32(packed_pair));
+			const uint32x4_t widened = vmovl_u16(vget_low_u16(halves));
+			vst1q_u32(reinterpret_cast<u32*>(dest), widened);
+		}
+		else
+		{
+			const int16x8_t halves = vmovl_s8(vreinterpret_s8_u32(packed_pair));
+			const int32x4_t widened = vmovl_s16(vget_low_s16(halves));
+			vst1q_s32(reinterpret_cast<s32*>(dest), widened);
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
+
 	void VitaVifStoreV4_16WordsNeon(u8* dest, const u8* src, bool usn)
 	{
 		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4(). This mirrors
@@ -235,17 +323,43 @@ namespace
 
 			case 0x01: // S-16
 			{
-				const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, x, x, x);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreS_16WordsNeon(dest, src, usn);
+#else
+					const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
+					VitaVifStoreWords(dest, x, x, x, x);
+#endif
+				}
+				else
+				{
+					const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, x, x, x);
+				}
 				return true;
 			}
 
 			case 0x02: // S-8
 			{
-				const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, x, x, x);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreS_8WordsNeon(dest, src, usn);
+#else
+					const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
+					VitaVifStoreWords(dest, x, x, x, x);
+#endif
+				}
+				else
+				{
+					const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, x, x, x);
+				}
 				return true;
 			}
 
@@ -259,59 +373,110 @@ namespace
 
 			case 0x05: // V2-16
 			{
-				const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
-				const u32 y = usn ? static_cast<u32>(VitaVifLoadU16(src + sizeof(u16))) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + sizeof(u16))));
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, x, y);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreV2_16WordsNeon(dest, src, usn);
+#else
+					const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
+					const u32 y = usn ? static_cast<u32>(VitaVifLoadU16(src + sizeof(u16))) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + sizeof(u16))));
+					VitaVifStoreWords(dest, x, y, x, y);
+#endif
+				}
+				else
+				{
+					const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
+					const u32 y = usn ? static_cast<u32>(VitaVifLoadU16(src + sizeof(u16))) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + sizeof(u16))));
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, x, y);
+				}
 				return true;
 			}
 
 			case 0x06: // V2-8
 			{
-				const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
-				const u32 y = usn ? static_cast<u32>(VitaVifLoadU8(src + sizeof(u8))) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + sizeof(u8))));
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, x, y);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreV2_8WordsNeon(dest, src, usn);
+#else
+					const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
+					const u32 y = usn ? static_cast<u32>(VitaVifLoadU8(src + sizeof(u8))) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + sizeof(u8))));
+					VitaVifStoreWords(dest, x, y, x, y);
+#endif
+				}
+				else
+				{
+					const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
+					const u32 y = usn ? static_cast<u32>(VitaVifLoadU8(src + sizeof(u8))) :
+										static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + sizeof(u8))));
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, x, y);
+				}
 				return true;
 			}
 
 			case 0x08: // V3-32, owned by Vif_Unpack.cpp::UNPACK_V4().
 			{
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask,
-					VitaVifLoadU32(src),
-					VitaVifLoadU32(src + 4),
-					VitaVifLoadU32(src + 8),
-					VitaVifLoadU32(src + 12));
+				if (mode == 0 && !doMask)
+				{
+					VitaVifCopyQword(dest, src);
+				}
+				else
+				{
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask,
+						VitaVifLoadU32(src),
+						VitaVifLoadU32(src + 4),
+						VitaVifLoadU32(src + 8),
+						VitaVifLoadU32(src + 12));
+				}
 				return true;
 			}
 
 			case 0x09: // V3-16, owned by Vif_Unpack.cpp::UNPACK_V4().
 			{
-				const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
-				const u32 y = usn ? static_cast<u32>(VitaVifLoadU16(src + 2)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 2)));
-				const u32 z = usn ? static_cast<u32>(VitaVifLoadU16(src + 4)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 4)));
-				const u32 w = usn ? static_cast<u32>(VitaVifLoadU16(src + 6)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 6)));
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreV4_16WordsNeon(dest, src, usn);
+#else
+					u32 x, y, z, w;
+					VitaVifLoadV4_16Words(src, usn, x, y, z, w);
+					VitaVifStoreWords(dest, x, y, z, w);
+#endif
+				}
+				else
+				{
+					u32 x, y, z, w;
+					VitaVifLoadV4_16Words(src, usn, x, y, z, w);
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
+				}
 				return true;
 			}
 
 			case 0x0a: // V3-8, owned by Vif_Unpack.cpp::UNPACK_V4().
 			{
-				const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
-				const u32 y = usn ? static_cast<u32>(VitaVifLoadU8(src + 1)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 1)));
-				const u32 z = usn ? static_cast<u32>(VitaVifLoadU8(src + 2)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 2)));
-				const u32 w = usn ? static_cast<u32>(VitaVifLoadU8(src + 3)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 3)));
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreV4_8WordsNeon(dest, src, usn);
+#else
+					u32 x, y, z, w;
+					VitaVifLoadV4_8Words(src, usn, x, y, z, w);
+					VitaVifStoreWords(dest, x, y, z, w);
+#endif
+				}
+				else
+				{
+					u32 x, y, z, w;
+					VitaVifLoadV4_8Words(src, usn, x, y, z, w);
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
+				}
 				return true;
 			}
 
