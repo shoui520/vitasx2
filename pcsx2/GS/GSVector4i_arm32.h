@@ -5,70 +5,65 @@
 
 #include "common/Assertions.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstring>
 
 static inline uint32_t vminv_u32(uint32x2_t v)
 {
-	u32 values[2];
-	vst1_u32(values, v);
-	return std::min(values[0], values[1]);
+	return vget_lane_u32(vpmin_u32(v, v), 0);
 }
 
 static inline int32_t vminvq_s32(int32x4_t v)
 {
-	s32 values[4];
-	vst1q_s32(values, v);
-	return std::min(std::min(values[0], values[1]), std::min(values[2], values[3]));
+	int32x2_t pair = vpmin_s32(vget_low_s32(v), vget_high_s32(v));
+	pair = vpmin_s32(pair, pair);
+	return vget_lane_s32(pair, 0);
 }
 
 static inline uint32_t vminvq_u32(uint32x4_t v)
 {
-	u32 values[4];
-	vst1q_u32(values, v);
-	return std::min(std::min(values[0], values[1]), std::min(values[2], values[3]));
+	uint32x2_t pair = vpmin_u32(vget_low_u32(v), vget_high_u32(v));
+	pair = vpmin_u32(pair, pair);
+	return vget_lane_u32(pair, 0);
 }
 
 static inline int32_t vmaxvq_s32(int32x4_t v)
 {
-	s32 values[4];
-	vst1q_s32(values, v);
-	return std::max(std::max(values[0], values[1]), std::max(values[2], values[3]));
+	int32x2_t pair = vpmax_s32(vget_low_s32(v), vget_high_s32(v));
+	pair = vpmax_s32(pair, pair);
+	return vget_lane_s32(pair, 0);
 }
 
 static inline uint32_t vmaxvq_u32(uint32x4_t v)
 {
-	u32 values[4];
-	vst1q_u32(values, v);
-	return std::max(std::max(values[0], values[1]), std::max(values[2], values[3]));
+	uint32x2_t pair = vpmax_u32(vget_low_u32(v), vget_high_u32(v));
+	pair = vpmax_u32(pair, pair);
+	return vget_lane_u32(pair, 0);
 }
 
 static inline uint8_t vminvq_u8(uint8x16_t v)
 {
-	u8 values[16];
-	vst1q_u8(values, v);
-	u8 result = values[0];
-	for (size_t i = 1; i < 16; i++)
-		result = std::min(result, values[i]);
-	return result;
+	uint8x8_t pair = vpmin_u8(vget_low_u8(v), vget_high_u8(v));
+	pair = vpmin_u8(pair, pair);
+	pair = vpmin_u8(pair, pair);
+	pair = vpmin_u8(pair, pair);
+	return vget_lane_u8(pair, 0);
 }
 
 static inline uint8_t vmaxvq_u8(uint8x16_t v)
 {
-	u8 values[16];
-	vst1q_u8(values, v);
-	u8 result = values[0];
-	for (size_t i = 1; i < 16; i++)
-		result = std::max(result, values[i]);
-	return result;
+	uint8x8_t pair = vpmax_u8(vget_low_u8(v), vget_high_u8(v));
+	pair = vpmax_u8(pair, pair);
+	pair = vpmax_u8(pair, pair);
+	pair = vpmax_u8(pair, pair);
+	return vget_lane_u8(pair, 0);
 }
 
 static inline uint32_t vaddvq_u32(uint32x4_t v)
 {
-	u32 values[4];
-	vst1q_u32(values, v);
-	return values[0] + values[1] + values[2] + values[3];
+	uint32x2_t pair = vadd_u32(vget_low_u32(v), vget_high_u32(v));
+	pair = vpadd_u32(pair, pair);
+	return vget_lane_u32(pair, 0);
 }
 
 static inline int8x16_t vqtbl1q_s8(int8x16_t table, uint8x16_t indices)
@@ -113,14 +108,8 @@ static inline float32x4_t vpaddq_f32(float32x4_t a, float32x4_t b)
 
 static inline uint64x2_t vceqq_s64(int64x2_t a, int64x2_t b)
 {
-	s64 av[2];
-	s64 bv[2];
-	u64 rv[2];
-	vst1q_s64(av, a);
-	vst1q_s64(bv, b);
-	rv[0] = av[0] == bv[0] ? UINT64_MAX : 0;
-	rv[1] = av[1] == bv[1] ? UINT64_MAX : 0;
-	return vld1q_u64(rv);
+	const uint32x4_t eq32 = vceqq_u32(vreinterpretq_u32_s64(a), vreinterpretq_u32_s64(b));
+	return vreinterpretq_u64_u32(vandq_u32(eq32, vrev64q_u32(eq32)));
 }
 
 class alignas(16) GSVector4i
