@@ -56,6 +56,7 @@ namespace VitaIOP
 		bool EmitInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op);
+		bool EmitNativeCOP0(u32 op);
 		bool EmitHelperInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitStoreCode(u32 op);
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
@@ -74,6 +75,8 @@ namespace VitaIOP
 		bool EmitLoadOp(u32 op);
 		bool EmitStoreOp(u32 op);
 		bool EmitConditionalBranchOp(u32 op, u32 pc);
+		bool EmitCop0TransferOp(u32 op, bool to_cop0);
+		bool EmitCop0RfeOp();
 
 		VitaA32::CodeBuffer& m_code;
 		u32 m_native_instruction_count = 0;

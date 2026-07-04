@@ -29,6 +29,8 @@ namespace
 	constexpr size_t GPR_OFFSET = offsetof(psxRegisters, GPR);
 	constexpr size_t HI_OFFSET = GPR_OFFSET + offsetof(GPRRegs, n.hi);
 	constexpr size_t LO_OFFSET = GPR_OFFSET + offsetof(GPRRegs, n.lo);
+	constexpr size_t CP0_OFFSET = offsetof(psxRegisters, CP0);
+	constexpr size_t CP0_STATUS_OFFSET = CP0_OFFSET + offsetof(CP0Regs, n.Status);
 	constexpr size_t PC_OFFSET = offsetof(psxRegisters, pc);
 	constexpr size_t CODE_OFFSET = offsetof(psxRegisters, code);
 	constexpr size_t CYCLE_OFFSET = offsetof(psxRegisters, cycle);
@@ -72,6 +74,26 @@ namespace
 	constexpr size_t GprOffset(unsigned guest_reg)
 	{
 		return GPR_OFFSET + guest_reg * sizeof(u32);
+	}
+
+	constexpr size_t Cp0Offset(unsigned cop0_reg)
+	{
+		return CP0_OFFSET + cop0_reg * sizeof(u32);
+	}
+
+	constexpr bool IsNativeCop0Opcode(u32 op)
+	{
+		switch (RS(op))
+		{
+			case 0x00: // MFC0
+			case 0x02: // CFC0
+			case 0x04: // MTC0
+			case 0x06: // CTC0
+			case 0x10: // RFE
+				return true;
+			default:
+				return false;
+		}
 	}
 
 	constexpr bool IsNativeSpecialOpcode(u32 op)
@@ -120,6 +142,9 @@ namespace
 			case 0x0d: // ORI
 			case 0x0e: // XORI
 			case 0x0f: // LUI
+				return true;
+			case 0x10: // COP0
+				return IsNativeCop0Opcode(op);
 			case 0x20: // LB
 			case 0x21: // LH
 			case 0x23: // LW
@@ -141,6 +166,8 @@ namespace
 	static_assert(GprOffset(33) + sizeof(u32) <= 4095);
 	static_assert(HI_OFFSET + sizeof(u32) <= 4095);
 	static_assert(LO_OFFSET + sizeof(u32) <= 4095);
+	static_assert(Cp0Offset(31) + sizeof(u32) <= 4095);
+	static_assert(CP0_STATUS_OFFSET + sizeof(u32) <= 4095);
 
 	extern "C" __attribute__((noinline)) bool VitaIopA32TraceInstruction(u32 pc, u32 opcode)
 	{
@@ -569,6 +596,33 @@ namespace VitaIOP
 			   m_code.PatchBranch(not_taken, m_code.Size(), skip_taken);
 	}
 
+	bool BlockCompiler::EmitCop0TransferOp(u32 op, bool to_cop0)
+	{
+		if (to_cop0)
+		{
+			return EmitLoadGpr(RT(op), HOST_TMP0) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp0Offset(RD(op))));
+		}
+
+		if (RT(op) == 0)
+			return true;
+
+		return m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp0Offset(RD(op)))) &&
+			   EmitStoreGpr(RT(op), HOST_TMP0);
+	}
+
+	bool BlockCompiler::EmitCop0RfeOp()
+	{
+		return m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) &&
+			   m_code.EmitMovImm32(HOST_TMP1, 0xfffffff0u) &&
+			   m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitMovImm32(HOST_TMP1, 0x3cu) &&
+			   m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, 2) &&
+			   m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP0) &&
+			   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET));
+	}
+
 	bool BlockCompiler::EmitNativeSPECIAL(u32 op)
 	{
 		switch (op & 0x3f)
@@ -609,6 +663,23 @@ namespace VitaIOP
 		}
 	}
 
+	bool BlockCompiler::EmitNativeCOP0(u32 op)
+	{
+		switch (RS(op))
+		{
+			case 0x00: // MFC0
+			case 0x02: // CFC0
+				return EmitCop0TransferOp(op, false);
+			case 0x04: // MTC0
+			case 0x06: // CTC0
+				return EmitCop0TransferOp(op, true);
+			case 0x10: // RFE
+				return EmitCop0RfeOp();
+			default:
+				return false;
+		}
+	}
+
 	bool BlockCompiler::EmitNativeInstruction(u32 op, u32 pc)
 	{
 		switch (op >> 26)
@@ -627,6 +698,8 @@ namespace VitaIOP
 			case 0x0e: // XORI
 			case 0x0f: // LUI
 				return EmitImmediateOp(op);
+			case 0x10: // COP0
+				return EmitNativeCOP0(op);
 			case 0x20: // LB
 			case 0x21: // LH
 			case 0x23: // LW
