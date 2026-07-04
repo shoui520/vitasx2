@@ -102,7 +102,9 @@ namespace VitaA32
 		bool EmitLdrsbImm8(unsigned rd, unsigned rn, u8 offset);
 		bool EmitLdrshImm8(unsigned rd, unsigned rn, u8 offset);
 		bool EmitVld1Q32(unsigned qd, unsigned rn);
+		bool EmitVld1Q32Aligned(unsigned qd, unsigned rn);
 		bool EmitVst1Q32(unsigned qd, unsigned rn);
+		bool EmitVst1Q32Aligned(unsigned qd, unsigned rn);
 		bool EmitVst1D32(unsigned dd, unsigned rn);
 		bool EmitVmovCoreToS(unsigned sd, unsigned rt);
 		bool EmitVmovSToCore(unsigned rt, unsigned sd);
@@ -216,7 +218,9 @@ namespace VitaA32
 	u32 EncodeLdrsbImm8(unsigned rd, unsigned rn, u8 offset);
 	u32 EncodeLdrshImm8(unsigned rd, unsigned rn, u8 offset);
 	u32 EncodeVld1Q32(unsigned qd, unsigned rn);
+	u32 EncodeVld1Q32Aligned(unsigned qd, unsigned rn);
 	u32 EncodeVst1Q32(unsigned qd, unsigned rn);
+	u32 EncodeVst1Q32Aligned(unsigned qd, unsigned rn);
 	u32 EncodeVst1D32(unsigned dd, unsigned rn);
 	u32 EncodeVmovCoreToS(unsigned sd, unsigned rt);
 	u32 EncodeVmovSToCore(unsigned rt, unsigned sd);

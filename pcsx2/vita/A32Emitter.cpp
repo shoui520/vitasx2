@@ -50,7 +50,9 @@ namespace VitaA32
 		constexpr u32 UMULL = 0x00800090u;
 		constexpr u32 SMULL = 0x00c00090u;
 		constexpr u32 VLD1_32_Q = 0xf4200a8fu;
+		constexpr u32 VLD1_32_Q_ALIGNED = 0xf4200aafu;
 		constexpr u32 VST1_32_Q = 0xf4000a8fu;
+		constexpr u32 VST1_32_Q_ALIGNED = 0xf4000aafu;
 		constexpr u32 VST1_32_D = 0xf400078fu;
 		constexpr u32 VMOV_CORE_TO_S = 0xee000a10u;
 		constexpr u32 VMOV_S_TO_CORE = 0xee100a10u;
@@ -611,11 +613,25 @@ namespace VitaA32
 		return EmitU32(EncodeVld1Q32(qd, rn));
 	}
 
+	bool CodeBuffer::EmitVld1Q32Aligned(unsigned qd, unsigned rn)
+	{
+		if (!IsQRegister(qd) || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeVld1Q32Aligned(qd, rn));
+	}
+
 	bool CodeBuffer::EmitVst1Q32(unsigned qd, unsigned rn)
 	{
 		if (!IsQRegister(qd) || !IsLowRegister(rn))
 			return false;
 		return EmitU32(EncodeVst1Q32(qd, rn));
+	}
+
+	bool CodeBuffer::EmitVst1Q32Aligned(unsigned qd, unsigned rn)
+	{
+		if (!IsQRegister(qd) || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeVst1Q32Aligned(qd, rn));
 	}
 
 	bool CodeBuffer::EmitVst1D32(unsigned dd, unsigned rn)
@@ -1415,11 +1431,25 @@ namespace VitaA32
 		return VLD1_32_Q | ((rn & 0xfu) << 16) | NeonQd(qd);
 	}
 
+	u32 EncodeVld1Q32Aligned(unsigned qd, unsigned rn)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsLowRegister(rn));
+		return VLD1_32_Q_ALIGNED | ((rn & 0xfu) << 16) | NeonQd(qd);
+	}
+
 	u32 EncodeVst1Q32(unsigned qd, unsigned rn)
 	{
 		pxAssert(IsQRegister(qd));
 		pxAssert(IsLowRegister(rn));
 		return VST1_32_Q | ((rn & 0xfu) << 16) | NeonQd(qd);
+	}
+
+	u32 EncodeVst1Q32Aligned(unsigned qd, unsigned rn)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsLowRegister(rn));
+		return VST1_32_Q_ALIGNED | ((rn & 0xfu) << 16) | NeonQd(qd);
 	}
 
 	u32 EncodeVst1D32(unsigned dd, unsigned rn)

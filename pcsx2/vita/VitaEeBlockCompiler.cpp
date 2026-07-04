@@ -3466,7 +3466,7 @@ namespace VitaEE
 					(!EmitVu0VfAddress(HOST_TMP0, fs) ||
 					 !m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) ||
 					 !EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
-					 !m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1)))
+					 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1)))
 				{
 					return false;
 				}
@@ -3474,7 +3474,7 @@ namespace VitaEE
 			case 0x05: // QMTC2
 				if (fs != 0 &&
 					(!EmitCpuRegsAddress(HOST_TMP0, GprOffset(rt)) ||
-					 !m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) ||
+					 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
 					 !EmitVu0VfAddress(HOST_TMP1, fs) ||
 					 !m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1)))
 				{
@@ -5739,9 +5739,9 @@ namespace VitaEE
 		};
 
 		return emit_cpu_regs_address(HOST_TMP0, hilo_offset) &&
-			   m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) &&
+			   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
 			   emit_cpu_regs_address(HOST_TMP1, GprOffset(rd)) &&
-			   m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1);
+			   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitMoveFullToHiLo(u32 op, size_t hilo_offset)
@@ -5763,13 +5763,13 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_cpu_regs_address(HOST_TMP0, GprOffset(rs)) ||
-				 !m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0))
+				 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0))
 		{
 			return false;
 		}
 
 		return emit_cpu_regs_address(HOST_TMP1, hilo_offset) &&
-			   m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1);
+			   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitMMI(u32 op)
@@ -7131,7 +7131,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rs, HOST_TMP0) ||
-				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+				 !m_code.EmitVld1Q32Aligned(NEON_RS, HOST_TMP0))
 		{
 			return false;
 		}
@@ -7142,7 +7142,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rt, HOST_TMP1) ||
-				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+				 !m_code.EmitVld1Q32Aligned(NEON_RT, HOST_TMP1))
 		{
 			return false;
 		}
@@ -7251,7 +7251,7 @@ namespace VitaEE
 
 		if (!vector_op_ok ||
 			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32(NEON_RD, HOST_TMP2))
+			!m_code.EmitVst1Q32Aligned(NEON_RD, HOST_TMP2))
 		{
 			return false;
 		}
@@ -7283,7 +7283,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rt, HOST_TMP0) ||
-				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP0))
+				 !m_code.EmitVld1Q32Aligned(NEON_RT, HOST_TMP0))
 		{
 			return false;
 		}
@@ -7301,7 +7301,7 @@ namespace VitaEE
 
 		if (!vector_op_ok ||
 			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32(NEON_RT, HOST_TMP2))
+			!m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2))
 		{
 			return false;
 		}
@@ -7333,7 +7333,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rt, HOST_TMP0) ||
-				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP0))
+				 !m_code.EmitVld1Q32Aligned(NEON_RT, HOST_TMP0))
 		{
 			return false;
 		}
@@ -7371,7 +7371,7 @@ namespace VitaEE
 
 		if (!vector_op_ok ||
 			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32(NEON_RT, HOST_TMP2))
+			!m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2))
 		{
 			return false;
 		}
@@ -7720,7 +7720,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rs, HOST_TMP0) ||
-				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+				 !m_code.EmitVld1Q32Aligned(NEON_RS, HOST_TMP0))
 		{
 			return false;
 		}
@@ -7731,7 +7731,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rt, HOST_TMP1) ||
-				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+				 !m_code.EmitVld1Q32Aligned(NEON_RT, HOST_TMP1))
 		{
 			return false;
 		}
@@ -7756,7 +7756,7 @@ namespace VitaEE
 		const unsigned result = upper_half ? NEON_RS : NEON_RT;
 		if (!vector_op_ok ||
 			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32(result, HOST_TMP2))
+			!m_code.EmitVst1Q32Aligned(result, HOST_TMP2))
 		{
 			return false;
 		}
@@ -7795,7 +7795,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rs, HOST_TMP0) ||
-				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+				 !m_code.EmitVld1Q32Aligned(NEON_RS, HOST_TMP0))
 		{
 			return false;
 		}
@@ -7806,7 +7806,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rt, HOST_TMP1) ||
-				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+				 !m_code.EmitVld1Q32Aligned(NEON_RT, HOST_TMP1))
 		{
 			return false;
 		}
@@ -7829,7 +7829,7 @@ namespace VitaEE
 		// RT, matching PCSX2's PPACW/PPACH/PPACB definitions.
 		if (!vector_op_ok ||
 			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32(NEON_RT, HOST_TMP2))
+			!m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2))
 		{
 			return false;
 		}
@@ -8122,7 +8122,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rs, HOST_TMP0) ||
-				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+				 !m_code.EmitVld1Q32Aligned(NEON_RS, HOST_TMP0))
 		{
 			return false;
 		}
@@ -8133,7 +8133,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rt, HOST_TMP1) ||
-				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+				 !m_code.EmitVld1Q32Aligned(NEON_RT, HOST_TMP1))
 		{
 			return false;
 		}
@@ -8273,7 +8273,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rs, HOST_TMP0) ||
-				 !m_code.EmitVld1Q32(NEON_RS, HOST_TMP0))
+				 !m_code.EmitVld1Q32Aligned(NEON_RS, HOST_TMP0))
 		{
 			return false;
 		}
@@ -8284,7 +8284,7 @@ namespace VitaEE
 				return false;
 		}
 		else if (!emit_gpr_address(rt, HOST_TMP1) ||
-				 !m_code.EmitVld1Q32(NEON_RT, HOST_TMP1))
+				 !m_code.EmitVld1Q32Aligned(NEON_RT, HOST_TMP1))
 		{
 			return false;
 		}
@@ -8332,7 +8332,7 @@ namespace VitaEE
 				return false;
 		}
 
-		return m_code.EmitVst1Q32(NEON_RD, HOST_TMP2);
+		return m_code.EmitVst1Q32Aligned(NEON_RD, HOST_TMP2);
 	}
 
 	bool BlockCompiler::EmitPSLLVW(u32 op)
@@ -8885,7 +8885,7 @@ namespace VitaEE
 		if (rt != 0 &&
 			(!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) ||
 			 !EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
-			 !m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1)))
+			 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1)))
 		{
 			return false;
 		}
@@ -9218,7 +9218,7 @@ namespace VitaEE
 			const size_t raw_fallback_target = m_code.Size();
 			if (!m_code.PatchBranch(raw_fallback, raw_fallback_target, VitaA32::Condition::EQ) ||
 				!EmitCpuRegsAddress(HOST_TMP1, GprOffset(0)) ||
-				!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP1) ||
+				!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) ||
 				!m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0) ||
 				!m_code.PatchBranch(zero_done, m_code.Size()))
 			{
@@ -9226,7 +9226,7 @@ namespace VitaEE
 			}
 		}
 		else if (!EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
-				 !m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP1) ||
+				 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) ||
 				 !m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0))
 		{
 			return false;
