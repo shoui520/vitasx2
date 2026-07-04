@@ -90,6 +90,7 @@ namespace VitaA32
 		bool EmitSmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitCmpReg(unsigned rn, unsigned rm, Condition condition = Condition::AL);
 		bool EmitCmpImm32(unsigned rn, u32 value, Condition condition = Condition::AL);
+		bool EmitTstImm32(unsigned rn, u32 value, Condition condition = Condition::AL);
 		bool EmitLdrImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 		bool EmitStrImm12(unsigned rd, unsigned rn, u16 offset);

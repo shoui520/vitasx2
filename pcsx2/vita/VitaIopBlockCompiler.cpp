@@ -1063,8 +1063,7 @@ namespace VitaIOP
 
 		if (!EmitEffectiveAddress(op) ||
 			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
-			!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+			!m_code.EmitTstImm32(HOST_TMP0, 0x10000000u))
 		{
 			return false;
 		}
@@ -1202,8 +1201,7 @@ namespace VitaIOP
 
 		if (!EmitEffectiveAddress(op) ||
 			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
-			!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+			!m_code.EmitTstImm32(HOST_TMP0, 0x10000000u))
 		{
 			return false;
 		}
@@ -1227,8 +1225,7 @@ namespace VitaIOP
 		}
 
 		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
-			!m_code.EmitMovImm32(HOST_TMP3, 0x10000u) ||
-			!m_code.EmitAndReg(HOST_TMP2, HOST_TMP2, HOST_TMP3, true))
+			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
 		{
 			return false;
 		}
@@ -1273,8 +1270,7 @@ namespace VitaIOP
 			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_SAVED0, VitaA32::ShiftType::LSL, 3) ||
 			!m_code.EmitMovImm32(HOST_TMP1, 0xfffffffcu) ||
 			!m_code.EmitAndReg(HOST_SAVED1, HOST_TMP0, HOST_TMP1) ||
-			!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
-			!m_code.EmitAndReg(HOST_TMP2, HOST_SAVED1, HOST_TMP2, true))
+			!m_code.EmitTstImm32(HOST_SAVED1, 0x10000000u))
 		{
 			return false;
 		}
@@ -1352,8 +1348,7 @@ namespace VitaIOP
 			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_SAVED0, VitaA32::ShiftType::LSL, 3) ||
 			!m_code.EmitMovImm32(HOST_TMP1, 0xfffffffcu) ||
 			!m_code.EmitAndReg(HOST_SAVED1, HOST_TMP0, HOST_TMP1) ||
-			!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
-			!m_code.EmitAndReg(HOST_TMP2, HOST_SAVED1, HOST_TMP2, true))
+			!m_code.EmitTstImm32(HOST_SAVED1, 0x10000000u))
 		{
 			return false;
 		}
@@ -1411,8 +1406,7 @@ namespace VitaIOP
 
 		if (!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) ||
 			!m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP0) ||
-			!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
-			!m_code.EmitAndReg(HOST_TMP2, HOST_SAVED1, HOST_TMP2, true))
+			!m_code.EmitTstImm32(HOST_SAVED1, 0x10000000u))
 		{
 			return false;
 		}
@@ -1420,8 +1414,7 @@ namespace VitaIOP
 		const size_t write_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (write_fallback_branch == static_cast<size_t>(-1) ||
 			!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
-			!m_code.EmitMovImm32(HOST_TMP3, 0x10000u) ||
-			!m_code.EmitAndReg(HOST_TMP2, HOST_TMP2, HOST_TMP3, true))
+			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
 		{
 			return false;
 		}
@@ -1993,8 +1986,7 @@ namespace VitaIOP
 		{
 			if (!EmitEffectiveAddress(op) ||
 				!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-				!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
-				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+				!m_code.EmitTstImm32(HOST_TMP0, 0x10000000u))
 			{
 				return false;
 			}
@@ -2053,8 +2045,7 @@ namespace VitaIOP
 			if (!EmitReadCop2DataReg(RT(op), HOST_SAVED0) ||
 				!EmitEffectiveAddress(op) ||
 				!m_code.EmitMovRegShiftImm(HOST_SAVED1, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-				!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
-				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+				!m_code.EmitTstImm32(HOST_TMP0, 0x10000000u))
 			{
 				return false;
 			}
@@ -2072,8 +2063,7 @@ namespace VitaIOP
 			const size_t alignment_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 			if (alignment_fallback_branch == static_cast<size_t>(-1) ||
 				!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
-				!m_code.EmitMovImm32(HOST_TMP3, 0x10000u) ||
-				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP2, HOST_TMP3, true))
+				!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
 			{
 				return false;
 			}
