@@ -85,6 +85,7 @@ namespace VitaEE
 		static constexpr size_t INITIAL_CACHE_CAPACITY = 32;
 		static constexpr size_t MAX_CACHE_CAPACITY = 256;
 		static constexpr size_t STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 4096;
+		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 16 * 1024;
 		static constexpr size_t EE_CODE_CACHE_CAPACITY = 1024 * 1024;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;

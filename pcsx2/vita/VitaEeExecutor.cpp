@@ -632,45 +632,72 @@ namespace VitaEE
 
 		InvalidateCachedBlock(block);
 
-		size_t code_slice_offset = 0;
-		u8* code_slice = AllocateCodeSlice(STRAIGHT_LINE_BLOCK_CODE_CAPACITY, &code_slice_offset);
-		if (!code_slice)
-		{
-			ResetForCachePressure();
-			code_slice = AllocateCodeSlice(STRAIGHT_LINE_BLOCK_CODE_CAPACITY, &code_slice_offset);
-			if (!code_slice)
-				return false;
-		}
-
-		if (!block.code.Attach(code_slice, STRAIGHT_LINE_BLOCK_CODE_CAPACITY))
-		{
-			RewindCodeCache(code_slice_offset);
-			return false;
-		}
-
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 op = memRead32(start_pc + i * 4);
 			if (!BlockCompiler::CanCompileOpcode(op))
 			{
-				block.code.Release();
-				RewindCodeCache(code_slice_offset);
 				return false;
 			}
 			block.opcodes[i] = op;
 		}
 
-		BlockCompiler compiler(block.code);
+		size_t block_code_capacity = STRAIGHT_LINE_BLOCK_CODE_CAPACITY;
+		size_t block_code_slice_offset = 0;
 		u32 compiled_scaled_cycles = 0;
 		DirectLinkSlots direct_links;
-		if (!compiler.CompileStraightLineBlock(start_pc, instruction_count,
-				reinterpret_cast<const void*>(&VitaEeA32DirectExit),
-				reinterpret_cast<const void*>(&VitaEeA32EventExit), &compiled_scaled_cycles, &direct_links) ||
-			!block.code.Flush())
+#if defined(VITASX2_QEMU_VALIDATION)
+		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
+			std::printf("a32-block-compile-failed pc=%08x instructions=%u code=%zu capacity=%zu\n",
+				start_pc, instruction_count, code_size, code_capacity);
+		};
+#endif
+		for (;;)
 		{
+			size_t code_slice_offset = 0;
+			u8* code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
+			if (!code_slice)
+			{
+				ResetForCachePressure();
+				code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
+				if (!code_slice)
+					return false;
+			}
+
+			if (!block.code.Attach(code_slice, block_code_capacity))
+			{
+				RewindCodeCache(code_slice_offset);
+				return false;
+			}
+
+			BlockCompiler compiler(block.code);
+			u32 attempt_scaled_cycles = 0;
+			DirectLinkSlots attempt_direct_links;
+			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
+				reinterpret_cast<const void*>(&VitaEeA32DirectExit),
+				reinterpret_cast<const void*>(&VitaEeA32EventExit), &attempt_scaled_cycles, &attempt_direct_links);
+			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
+			const size_t failure_code_size = block.code.Size();
+			const size_t failure_code_capacity = block.code.Capacity();
+			if (compiled && block.code.Flush())
+			{
+				block_code_slice_offset = code_slice_offset;
+				compiled_scaled_cycles = attempt_scaled_cycles;
+				direct_links = attempt_direct_links;
+				break;
+			}
+
 			block.code.Release();
 			RewindCodeCache(code_slice_offset);
-			return false;
+			if (!out_of_block_space || block_code_capacity >= MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				report_compile_failure(failure_code_size, failure_code_capacity);
+#endif
+				return false;
+			}
+
+			block_code_capacity *= 2;
 		}
 
 		block.start_pc = start_pc;
@@ -685,7 +712,7 @@ namespace VitaEE
 			block.valid = false;
 			block.direct_links = {};
 			block.code.Release();
-			RewindCodeCache(code_slice_offset);
+			RewindCodeCache(block_code_slice_offset);
 			return false;
 		}
 		RegisterBlockLookup(block);

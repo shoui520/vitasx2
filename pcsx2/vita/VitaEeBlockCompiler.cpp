@@ -1951,13 +1951,7 @@ namespace VitaEE
 				continue;
 			}
 			if (!EmitOpcode(op, pc, raw_cycles, event_exit, branch_delay_slot))
-			{
-#if defined(VITASX2_QEMU_VALIDATION)
-				std::printf("a32-block-compile-failed index=%u pc=%08x op=%08x code=%zu\n",
-					i, pc, op, m_code.Size());
-#endif
 				return false;
-			}
 
 			if (pending_di_clear)
 			{
