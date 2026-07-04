@@ -10351,12 +10351,14 @@ namespace VitaEE
 		switch (width)
 		{
 			case ScalarLoadWidth::Byte:
-				if (!m_code.EmitLdrbImm12(HOST_TMP0, HOST_TMP0, 0))
+				if (!(sign_extend ? m_code.EmitLdrsbImm8(HOST_TMP0, HOST_TMP0, 0) :
+									 m_code.EmitLdrbImm12(HOST_TMP0, HOST_TMP0, 0)))
 					return false;
 				break;
 
 			case ScalarLoadWidth::Halfword:
-				if (!m_code.EmitLdrhImm8(HOST_TMP0, HOST_TMP0, 0))
+				if (!(sign_extend ? m_code.EmitLdrshImm8(HOST_TMP0, HOST_TMP0, 0) :
+									 m_code.EmitLdrhImm8(HOST_TMP0, HOST_TMP0, 0)))
 					return false;
 				break;
 		}
@@ -10367,6 +10369,15 @@ namespace VitaEE
 
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.EmitCallAbsolute(read_helper))
+			return false;
+
+		const auto emit_sign_extend_low = [&]() -> bool {
+			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
+					   static_cast<u8>(sign_shift)) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
+					   static_cast<u8>(sign_shift));
+		};
+		if (rt != 0 && sign_extend && !emit_sign_extend_low())
 			return false;
 
 		const size_t value_ready_target = m_code.Size();
@@ -10401,11 +10412,7 @@ namespace VitaEE
 
 		if (sign_extend)
 		{
-			if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
-					static_cast<u8>(sign_shift)) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
-					static_cast<u8>(sign_shift)) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31))
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31))
 			{
 				return false;
 			}

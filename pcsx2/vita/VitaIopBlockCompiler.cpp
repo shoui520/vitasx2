@@ -1043,7 +1043,7 @@ namespace VitaIOP
 				return false;
 		}
 
-		const auto emit_sign_extend = [&]() -> bool {
+		const auto emit_sign_extend_helper_result = [&]() -> bool {
 			switch (opcode)
 			{
 				case 0x20: // LB
@@ -1057,8 +1057,8 @@ namespace VitaIOP
 			}
 		};
 
-		const auto emit_store_result = [&]() -> bool {
-			return emit_sign_extend() && EmitStoreGpr(rt, HOST_TMP0);
+		const auto emit_store_helper_result = [&]() -> bool {
+			return emit_sign_extend_helper_result() && EmitStoreGpr(rt, HOST_TMP0);
 		};
 
 		if (!EmitEffectiveAddress(op) ||
@@ -1098,12 +1098,18 @@ namespace VitaIOP
 
 			switch (opcode)
 			{
-				case 0x20: // LB
 				case 0x24: // LBU
 					if (!m_code.EmitLdrbImm12(HOST_TMP0, HOST_TMP0, 0))
 						return false;
 					break;
+				case 0x20: // LB
+					if (!m_code.EmitLdrsbImm8(HOST_TMP0, HOST_TMP0, 0))
+						return false;
+					break;
 				case 0x21: // LH
+					if (!m_code.EmitLdrshImm8(HOST_TMP0, HOST_TMP0, 0))
+						return false;
+					break;
 				case 0x25: // LHU
 					if (!m_code.EmitLdrhImm8(HOST_TMP0, HOST_TMP0, 0))
 						return false;
@@ -1116,7 +1122,7 @@ namespace VitaIOP
 					return false;
 			}
 
-			if (!emit_store_result())
+			if (!EmitStoreGpr(rt, HOST_TMP0))
 				return false;
 		}
 
@@ -1139,7 +1145,7 @@ namespace VitaIOP
 			return false;
 		}
 
-		if (rt != 0 && !emit_store_result())
+		if (rt != 0 && !emit_store_helper_result())
 			return false;
 
 		return m_code.PatchBranch(done_branch, m_code.Size());

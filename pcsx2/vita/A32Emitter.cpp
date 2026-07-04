@@ -39,6 +39,8 @@ namespace VitaA32
 		constexpr u32 STRB_IMM = 0x05c00000u;
 		constexpr u32 LDRH_IMM = 0x01d000b0u;
 		constexpr u32 STRH_IMM = 0x01c000b0u;
+		constexpr u32 LDRSB_IMM = 0x01d000d0u;
+		constexpr u32 LDRSH_IMM = 0x01d000f0u;
 		constexpr u32 PKHBT = 0x06800010u;
 		constexpr u32 CLZ = 0x016f0f10u;
 		constexpr u32 SSAT = 0x06a00010u;
@@ -557,6 +559,20 @@ namespace VitaA32
 		if (!IsLowRegister(rd) || !IsLowRegister(rn))
 			return false;
 		return EmitU32(EncodeStrhImm8(rd, rn, offset));
+	}
+
+	bool CodeBuffer::EmitLdrsbImm8(unsigned rd, unsigned rn, u8 offset)
+	{
+		if (!IsLowRegister(rd) || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeLdrsbImm8(rd, rn, offset));
+	}
+
+	bool CodeBuffer::EmitLdrshImm8(unsigned rd, unsigned rn, u8 offset)
+	{
+		if (!IsLowRegister(rd) || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeLdrshImm8(rd, rn, offset));
 	}
 
 	bool CodeBuffer::EmitVld1Q32(unsigned qd, unsigned rn)
@@ -1317,6 +1333,22 @@ namespace VitaA32
 		pxAssert(IsLowRegister(rd));
 		pxAssert(IsLowRegister(rn));
 		return CondBits(Condition::AL) | STRH_IMM | ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) |
+			   ((static_cast<u32>(offset) & 0xf0u) << 4) | (offset & 0x0fu);
+	}
+
+	u32 EncodeLdrsbImm8(unsigned rd, unsigned rn, u8 offset)
+	{
+		pxAssert(IsLowRegister(rd));
+		pxAssert(IsLowRegister(rn));
+		return CondBits(Condition::AL) | LDRSB_IMM | ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) |
+			   ((static_cast<u32>(offset) & 0xf0u) << 4) | (offset & 0x0fu);
+	}
+
+	u32 EncodeLdrshImm8(unsigned rd, unsigned rn, u8 offset)
+	{
+		pxAssert(IsLowRegister(rd));
+		pxAssert(IsLowRegister(rn));
+		return CondBits(Condition::AL) | LDRSH_IMM | ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) |
 			   ((static_cast<u32>(offset) & 0xf0u) << 4) | (offset & 0x0fu);
 	}
 
