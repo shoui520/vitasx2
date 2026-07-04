@@ -106,6 +106,7 @@ namespace VitaIOP
 		bool EmitStaticJumpOp(u32 op, u32 pc);
 		bool EmitRegisterJumpOp(u32 op, u32 pc);
 		bool EmitRegisterJumpCaptureOp(u32 op, u32 pc);
+		bool EmitIopEventTestFastPath();
 		bool EmitCop0TransferOp(u32 op, bool to_cop0);
 		bool EmitCop0RfeOp();
 		bool EmitCop2CommandOp(u32 op);
