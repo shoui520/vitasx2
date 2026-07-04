@@ -255,6 +255,11 @@ namespace VitaEE
 			return FPRC_OFFSET + sizeof(u32) * guest_reg;
 		}
 
+		constexpr bool CanUseA32DualTransferPair(unsigned low_reg, unsigned high_reg)
+		{
+			return low_reg < 14 && high_reg == low_reg + 1 && ((low_reg & 1u) == 0);
+		}
+
 		constexpr size_t HiloLaneOffset(size_t hilo_offset, bool upper_pipeline)
 		{
 			return hilo_offset + (upper_pipeline ? sizeof(u64) : 0);
@@ -1586,6 +1591,7 @@ namespace VitaEE
 	} // namespace
 
 	static_assert(GprOffset(31) + sizeof(GPR_reg) <= 0x0fff);
+	static_assert((GprOffset(0) % alignof(u64)) == 0);
 	static_assert(HI_OFFSET + sizeof(GPR_reg) <= 0x0fff);
 	static_assert(LO_OFFSET + sizeof(GPR_reg) <= 0x0fff);
 	static_assert(Cp0Offset(31) + sizeof(u32) <= 0x0fff);
@@ -10794,6 +10800,9 @@ namespace VitaEE
 				   m_code.EmitMovImm8(host_high, 0);
 
 		const size_t offset = GprOffset(guest_reg);
+		if (offset <= 0xff && CanUseA32DualTransferPair(host_low, host_high))
+			return m_code.EmitLdrdImm8(host_low, host_high, HOST_CPU_REGS, static_cast<u8>(offset));
+
 		return m_code.EmitLdrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset)) &&
 			   m_code.EmitLdrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
 	}
@@ -10833,6 +10842,9 @@ namespace VitaEE
 			return true;
 
 		const size_t offset = GprOffset(guest_reg);
+		if (offset <= 0xff && CanUseA32DualTransferPair(host_low, host_high))
+			return m_code.EmitStrdImm8(host_low, host_high, HOST_CPU_REGS, static_cast<u8>(offset));
+
 		return m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset)) &&
 			   m_code.EmitStrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
 	}

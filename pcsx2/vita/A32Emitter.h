@@ -93,6 +93,8 @@ namespace VitaA32
 		bool EmitLdrImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 		bool EmitStrImm12(unsigned rd, unsigned rn, u16 offset);
+		bool EmitLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
+		bool EmitStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
 		bool EmitLdrbImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitStrbImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitLdrhImm8(unsigned rd, unsigned rn, u8 offset);
@@ -205,6 +207,8 @@ namespace VitaA32
 	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 	u32 EncodeStrImm12(unsigned rd, unsigned rn, u16 offset);
+	u32 EncodeLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
+	u32 EncodeStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
 	u32 EncodeLdrbImm12(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeStrbImm12(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeLdrhImm8(unsigned rd, unsigned rn, u8 offset);

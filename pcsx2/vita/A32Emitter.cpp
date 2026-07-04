@@ -36,6 +36,8 @@ namespace VitaA32
 		constexpr u32 LDR_IMM = 0x05900000u;
 		constexpr u32 LDR_REG = 0x07900000u;
 		constexpr u32 STR_IMM = 0x05800000u;
+		constexpr u32 LDRD_IMM = 0x01c000d0u;
+		constexpr u32 STRD_IMM = 0x01c000f0u;
 		constexpr u32 LDRB_IMM = 0x05d00000u;
 		constexpr u32 STRB_IMM = 0x05c00000u;
 		constexpr u32 LDRH_IMM = 0x01d000b0u;
@@ -132,6 +134,11 @@ namespace VitaA32
 		bool IsSRegister(unsigned reg)
 		{
 			return reg < 32;
+		}
+
+		bool IsLowEvenRegisterPair(unsigned rdlo, unsigned rdhi)
+		{
+			return rdlo < 14 && rdhi == rdlo + 1 && ((rdlo & 1u) == 0);
 		}
 
 		u32 CondBits(Condition condition)
@@ -539,6 +546,20 @@ namespace VitaA32
 		if (!IsLowRegister(rd) || !IsLowRegister(rn) || offset > 0x0fff)
 			return false;
 		return EmitU32(EncodeStrImm12(rd, rn, offset));
+	}
+
+	bool CodeBuffer::EmitLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset)
+	{
+		if (!IsLowEvenRegisterPair(rdlo, rdhi) || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeLdrdImm8(rdlo, rdhi, rn, offset));
+	}
+
+	bool CodeBuffer::EmitStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset)
+	{
+		if (!IsLowEvenRegisterPair(rdlo, rdhi) || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeStrdImm8(rdlo, rdhi, rn, offset));
 	}
 
 	bool CodeBuffer::EmitLdrbImm12(unsigned rd, unsigned rn, u16 offset)
@@ -1321,6 +1342,22 @@ namespace VitaA32
 		pxAssert(IsLowRegister(rn));
 		pxAssert(offset <= 0x0fff);
 		return CondBits(Condition::AL) | STR_IMM | ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | offset;
+	}
+
+	u32 EncodeLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset)
+	{
+		pxAssert(IsLowEvenRegisterPair(rdlo, rdhi));
+		pxAssert(IsLowRegister(rn));
+		return CondBits(Condition::AL) | LDRD_IMM | ((rn & 0xfu) << 16) | ((rdlo & 0xfu) << 12) |
+			   ((static_cast<u32>(offset) & 0xf0u) << 4) | (offset & 0x0fu);
+	}
+
+	u32 EncodeStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset)
+	{
+		pxAssert(IsLowEvenRegisterPair(rdlo, rdhi));
+		pxAssert(IsLowRegister(rn));
+		return CondBits(Condition::AL) | STRD_IMM | ((rn & 0xfu) << 16) | ((rdlo & 0xfu) << 12) |
+			   ((static_cast<u32>(offset) & 0xf0u) << 4) | (offset & 0x0fu);
 	}
 
 	u32 EncodeLdrbImm12(unsigned rd, unsigned rn, u16 offset)
