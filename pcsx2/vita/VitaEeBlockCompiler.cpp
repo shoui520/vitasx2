@@ -482,6 +482,21 @@ namespace VitaEE
 			return (op >> 26) == 0x10 && ((op >> 21) & 0x1f) == 0x10 && (op & 0x3f) == 0x39;
 		}
 
+		bool IsInBlockTLBReadProbe(u32 op)
+		{
+			if ((op >> 26) != 0x10 || ((op >> 21) & 0x1f) != 0x10)
+				return false;
+
+			switch (op & 0x3f)
+			{
+				case 0x01: // TLBR, owned by COP0.cpp::TLBR().
+				case 0x08: // TLBP, owned by COP0.cpp::TLBP().
+					return true;
+				default:
+					return false;
+			}
+		}
+
 		bool IsCycleCommittingFastCOP0(u32 op)
 		{
 			if ((op >> 26) != 0x10)
@@ -1765,7 +1780,7 @@ namespace VitaEE
 		// are helper-backed exception paths, and Interpreter.cpp::_doBranch_shared()
 		// marks cpuRegs.branch before executing them as delay slots.
 		// Trap ops use the same exception-shaped helper/event tail.
-		return CanCompileOpcode(op) && !IsDI(op) &&
+		return CanCompileOpcode(op) && !IsDI(op) && !IsInBlockTLBReadProbe(op) &&
 			   (!RequiresBlockEndAfterOpcode(op) || IsSYSCALL(op) || IsBREAK(op) ||
 				   IsTrapOpcode(op) || IsCounterReadLoad(op));
 	}
@@ -1784,7 +1799,8 @@ namespace VitaEE
 			case 0x01:
 				return IsRegImmTrap(op);
 			case 0x10:
-				return CanCompileCOP0(op) && !IsDI(op) && !IsFastMFC0(op) && !IsFastMTC0(op);
+				return CanCompileCOP0(op) && !IsDI(op) && !IsFastMFC0(op) && !IsFastMTC0(op) &&
+					   !IsInBlockTLBReadProbe(op);
 			case 0x11:
 				return CanCompileCOP1(op) && !IsFastCOP1InBlock(op);
 			case 0x12:
@@ -2087,7 +2103,8 @@ namespace VitaEE
 				return true;
 			}
 
-			if ((op >> 26) == 0x10 && CanCompileCOP0(op) && !IsFastMFC0(op) && !IsFastMTC0(op))
+			if ((op >> 26) == 0x10 && CanCompileCOP0(op) && !IsFastMFC0(op) && !IsFastMTC0(op) &&
+				!IsInBlockTLBReadProbe(op))
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
@@ -2685,7 +2702,7 @@ namespace VitaEE
 				switch (op & 0x3f)
 				{
 					case 0x01: // TLBR, owned by COP0.cpp::TLBR().
-						return EmitTLBREventExit(op, pc + 4, raw_cycles_through_instruction, event_exit);
+						return EmitTLBRInBlock();
 					case 0x02: // TLBWI, owned by COP0.cpp::TLBWI().
 						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
 							reinterpret_cast<const void*>(&TLBWI), event_exit, true);
@@ -2693,7 +2710,7 @@ namespace VitaEE
 						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
 							reinterpret_cast<const void*>(&TLBWR), event_exit, true);
 					case 0x08: // TLBP, owned by COP0.cpp::TLBP().
-						return EmitTLBPEventExit(op, pc + 4, raw_cycles_through_instruction, event_exit);
+						return EmitTLBPInBlock();
 					case 0x18: // ERET, owned by COP0.cpp::ERET().
 						return EmitERETEventExit(op, raw_cycles_through_instruction, event_exit);
 					case 0x38: // EI, owned by COP0.cpp::EI().
@@ -2990,21 +3007,12 @@ namespace VitaEE
 				   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
 		}
 
-		bool BlockCompiler::EmitTLBREventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
-			const void* event_exit)
+		bool BlockCompiler::EmitTLBRInBlock()
 		{
 			// PCSX2 owners: COP0.cpp::TLBR(), x86/iCOP0.cpp::recTLBR().
 			// TLBR reads the architectural TLB table only, so it can be emitted
-			// directly while keeping the current event-test tail.
-			if (!event_exit || raw_cycles_through_instruction == 0)
-				return false;
-
-			const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
-			if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
-				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
-				!EmitStorePc(next_pc) ||
-				!EmitAddScaledCyclesToCpu(cycles) ||
-				!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(0))) ||
+			// directly; the normal block tail owns PC, cycle, and event testing.
+			if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(0))) ||
 				!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x3f) ||
 				!m_code.EmitMovImm8(HOST_TMP3, static_cast<u8>(TLB_ENTRY_COUNT)) ||
 				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
@@ -3048,25 +3056,17 @@ namespace VitaEE
 			if (!m_code.PatchBranch(invalid_index, m_code.Size(), VitaA32::Condition::CS))
 				return false;
 
-			return m_code.EmitCallAbsolute(event_exit) &&
-				   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+			return true;
 		}
 
-		bool BlockCompiler::EmitTLBPEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
-			const void* event_exit)
+		bool BlockCompiler::EmitTLBPInBlock()
 		{
 			// PCSX2 owners: COP0.cpp::TLBP(), x86/iCOP0.cpp::recTLBP().
 			// Keep COP0.cpp's EntryHi32 bitfield view exactly: VPN2 is the
 			// low 19 bits of EntryHi, while ASID is bits 24..31.
-			if (!event_exit || raw_cycles_through_instruction == 0)
-				return false;
-
-			const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
-			if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
-				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
-				!EmitStorePc(next_pc) ||
-				!EmitAddScaledCyclesToCpu(cycles) ||
-				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(10))) ||
+			// The operation has no cycle-dependent side effects, so the normal
+			// block tail owns PC, cycle, and event testing.
+			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(10))) ||
 				!m_code.EmitMovImm32(HOST_TMP1, TLB_ENTRY_HI32_VPN2_MASK) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP1) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR, 24) ||
@@ -3153,8 +3153,7 @@ namespace VitaEE
 				return false;
 			}
 
-			return m_code.EmitCallAbsolute(event_exit) &&
-				   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+			return true;
 		}
 
 		bool BlockCompiler::EmitERETEventExit(u32 op, u32 raw_cycles_through_instruction,

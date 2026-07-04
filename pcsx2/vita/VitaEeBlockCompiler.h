@@ -166,8 +166,8 @@ namespace VitaEE
 		bool EmitSetNextEventDelta4FromCurrentCycle();
 		bool EmitEIEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitERETEventExit(u32 op, u32 raw_cycles_through_instruction, const void* event_exit);
-		bool EmitTLBREventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
-		bool EmitTLBPEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitTLBRInBlock();
+		bool EmitTLBPInBlock();
 		bool EmitDIDelayedStatusClear();
 		bool EmitCOP1(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitCOP1MoveControlFast(u32 op);
