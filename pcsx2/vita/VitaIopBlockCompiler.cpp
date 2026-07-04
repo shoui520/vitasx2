@@ -945,6 +945,7 @@ namespace VitaIOP
 	{
 		const unsigned opcode = op >> 26;
 		const void* helper = nullptr;
+		u8 alignment_mask = 0;
 
 		switch (opcode)
 		{
@@ -953,17 +954,105 @@ namespace VitaIOP
 				break;
 			case 0x29: // SH
 				helper = reinterpret_cast<const void*>(&iopMemWrite16);
+				alignment_mask = 1;
 				break;
 			case 0x2b: // SW
 				helper = reinterpret_cast<const void*>(&iopMemWrite32);
+				alignment_mask = 3;
 				break;
 			default:
 				return false;
 		}
 
-		return EmitEffectiveAddress(op) &&
-			   EmitLoadGpr(RT(op), HOST_TMP1) &&
-			   m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH);
+		const auto emit_store_value = [&]() -> bool {
+			switch (opcode)
+			{
+				case 0x28: // SB
+					return m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, 0);
+				case 0x29: // SH
+					return m_code.EmitStrhImm8(HOST_TMP1, HOST_TMP0, 0);
+				case 0x2b: // SW
+					return m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0);
+				default:
+					return false;
+			}
+		};
+
+		const auto emit_clear_stored_word = [&]() -> bool {
+			return m_code.EmitMovImm32(HOST_TMP2, ~3u) &&
+				   m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_TMP2) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 1) &&
+				   m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+					   static_cast<u32>(reinterpret_cast<uptr>(&psxCpu))) &&
+				   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 0) &&
+				   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
+					   static_cast<u16>(offsetof(R3000Acpu, Clear))) &&
+				   m_code.EmitBlx(HOST_CALL_SCRATCH);
+		};
+
+		if (!EmitEffectiveAddress(op) ||
+			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
+			!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+		{
+			return false;
+		}
+
+		// PCSX2 owner: IopMem.cpp::iopMemWrite8/16/32 writes directly through
+		// psxMemWLUT only for writable RAM and when CP0 isolate-cache is clear,
+		// then invalidates the written word through psxCpu->Clear(mem & ~3, 1).
+		const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branch == static_cast<size_t>(-1))
+			return false;
+
+		size_t alignment_fallback_branch = static_cast<size_t>(-1);
+		if (alignment_mask != 0)
+		{
+			if (!m_code.EmitAndImm8(HOST_TMP2, HOST_SAVED0, alignment_mask, true))
+				return false;
+
+			alignment_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (alignment_fallback_branch == static_cast<size_t>(-1))
+				return false;
+		}
+
+		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
+			!m_code.EmitMovImm32(HOST_TMP3, 0x10000u) ||
+			!m_code.EmitAndReg(HOST_TMP2, HOST_TMP2, HOST_TMP3, true))
+		{
+			return false;
+		}
+
+		const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (isolated_fallback_branch == static_cast<size_t>(-1) ||
+			!EmitLoadGpr(RT(op), HOST_TMP1) ||
+			!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
+			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_TMP2) ||
+			!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP3, HOST_TMP0) ||
+			!emit_store_value() ||
+			!emit_clear_stored_word())
+		{
+			return false;
+		}
+
+		const size_t done_branch = m_code.EmitBranchPlaceholder();
+		if (done_branch == static_cast<size_t>(-1))
+			return false;
+
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			(alignment_fallback_branch != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(alignment_fallback_branch, fallback_target, VitaA32::Condition::NE)) ||
+			!m_code.PatchBranch(isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
+			!EmitLoadGpr(RT(op), HOST_TMP1) ||
+			!m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH))
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(done_branch, m_code.Size());
 	}
 
 	bool BlockCompiler::EmitUnalignedLoadOp(u32 op)
