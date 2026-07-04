@@ -33,7 +33,12 @@ namespace
 	constexpr unsigned HOST_SAVED0 = 5;
 	constexpr unsigned HOST_SAVED1 = 6;
 	constexpr unsigned HOST_BRANCH_FLAG = 7;
+	constexpr unsigned HOST_REGISTER_JUMP_TARGET = 8;
 	constexpr unsigned HOST_CALL_SCRATCH = 12;
+
+	constexpr u32 IOP_BRANCH_TARGET_ZERO = 0x00000000u;
+	constexpr u32 IOP_BRANCH_TARGET_SYSMEM = 0x00000890u;
+	constexpr u32 IOP_BRANCH_TARGET_IOPBOOT = 0xbfc4a000u;
 
 	constexpr size_t GPR_OFFSET = offsetof(psxRegisters, GPR);
 	constexpr size_t HI_OFFSET = GPR_OFFSET + offsetof(GPRRegs, n.hi);
@@ -326,6 +331,11 @@ namespace
 		return (op >> 26) == 0x02 || (op >> 26) == 0x03; // J/JAL
 	}
 
+	constexpr bool IsIopRegisterJumpOpcode(u32 op)
+	{
+		return (op >> 26) == 0x00 && ((op & 0x3f) == 0x08 || (op & 0x3f) == 0x09); // JR/JALR
+	}
+
 	static_assert(PC_OFFSET <= 4095);
 	static_assert(CODE_OFFSET <= 4095);
 	static_assert(CYCLE_OFFSET + sizeof(u32) <= 4095);
@@ -500,6 +510,11 @@ namespace VitaIOP
 			   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, PC_OFFSET);
 	}
 
+	bool BlockCompiler::EmitStorePcReg(unsigned host_reg)
+	{
+		return m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, PC_OFFSET);
+	}
+
 	bool BlockCompiler::EmitIncrementCycle()
 	{
 		return m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) &&
@@ -515,6 +530,18 @@ namespace VitaIOP
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, PC_OFFSET) ||
 			!m_code.EmitMovImm32(HOST_TMP1, expected_pc) ||
 			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
+		{
+			return false;
+		}
+
+		direct_exit_branches.push_back(m_code.EmitBranchPlaceholder(VitaA32::Condition::NE));
+		return true;
+	}
+
+	bool BlockCompiler::EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches)
+	{
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, PC_OFFSET) ||
+			!m_code.EmitCmpReg(HOST_TMP0, expected_host_reg))
 		{
 			return false;
 		}
@@ -1128,6 +1155,9 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitRegisterJumpOp(u32 op, u32 pc)
 	{
+		if (m_emit_native_register_jump)
+			return EmitRegisterJumpCaptureOp(op, pc);
+
 		if ((op & 0x3f) == 0x09 && RD(op) != 0) // JALR
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP0, pc + 8) ||
@@ -1140,6 +1170,59 @@ namespace VitaIOP
 		return EmitLoadGpr(RS(op), HOST_TMP0) &&
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
 			   EndBlockReturn(BlockExitKind::Direct);
+	}
+
+	bool BlockCompiler::EmitRegisterJumpCaptureOp(u32 op, u32 pc)
+	{
+		if ((op & 0x3f) == 0x09 && RD(op) != 0) // JALR
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP0, pc + 8) ||
+				!EmitStoreGpr(RD(op), HOST_TMP0))
+			{
+				return false;
+			}
+		}
+
+		if (!EmitLoadGpr(RS(op), HOST_REGISTER_JUMP_TARGET))
+			return false;
+
+		// psxDoBranch() owns these diagnostic/module/IOPBOOT side effects.
+		const auto emit_special_target_check = [this](u32 target) -> size_t {
+			if (!m_code.EmitMovImm32(HOST_TMP0, target) ||
+				!m_code.EmitCmpReg(HOST_REGISTER_JUMP_TARGET, HOST_TMP0))
+			{
+				return static_cast<size_t>(-1);
+			}
+
+			return m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		};
+
+		const size_t zero_target = emit_special_target_check(IOP_BRANCH_TARGET_ZERO);
+		const size_t sysmem_target = emit_special_target_check(IOP_BRANCH_TARGET_SYSMEM);
+		const size_t iopboot_target = emit_special_target_check(IOP_BRANCH_TARGET_IOPBOOT);
+		if (zero_target == static_cast<size_t>(-1) ||
+			sysmem_target == static_cast<size_t>(-1) ||
+			iopboot_target == static_cast<size_t>(-1))
+		{
+			return false;
+		}
+
+		const size_t skip_helper = m_code.EmitBranchPlaceholder();
+		if (skip_helper == static_cast<size_t>(-1))
+			return false;
+
+		const size_t helper_path = m_code.Size();
+		if (!m_code.PatchBranch(zero_target, helper_path, VitaA32::Condition::EQ) ||
+			!m_code.PatchBranch(sysmem_target, helper_path, VitaA32::Condition::EQ) ||
+			!m_code.PatchBranch(iopboot_target, helper_path, VitaA32::Condition::EQ) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_REGISTER_JUMP_TARGET, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) ||
+			!EndBlockReturn(BlockExitKind::Direct))
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(skip_helper, m_code.Size());
 	}
 
 	bool BlockCompiler::EmitCop0TransferOp(u32 op, bool to_cop0)
@@ -1515,6 +1598,7 @@ namespace VitaIOP
 		bool can_direct_link_fallthrough = true;
 		bool has_native_static_branch = false;
 		bool has_native_static_jump = false;
+		bool has_native_register_jump = false;
 		u32 static_branch_target_pc = 0;
 		u32 static_branch_fallthrough_pc = 0;
 		u32 static_jump_target_pc = 0;
@@ -1534,8 +1618,14 @@ namespace VitaIOP
 				!IsIopBranchOrJumpOpcode(delay_op) &&
 				!IsIopExceptionOpcode(delay_op) &&
 				((op >> 26) != 0x02 || (delay_op >> 16) != 0x2400);
+			const bool can_native_register_jump =
+				IsIopRegisterJumpOpcode(op) &&
+				i + 2 == instruction_count &&
+				!IsIopBranchOrJumpOpcode(delay_op) &&
+				!IsIopExceptionOpcode(delay_op);
 			m_emit_native_static_branch = can_native_static_branch;
 			m_emit_native_static_jump = can_native_static_jump;
+			m_emit_native_register_jump = can_native_register_jump;
 			if (can_native_static_branch)
 			{
 				has_native_static_branch = true;
@@ -1547,11 +1637,14 @@ namespace VitaIOP
 				has_native_static_jump = true;
 				static_jump_target_pc = JumpTarget(pc, op);
 			}
+			if (can_native_register_jump)
+				has_native_register_jump = true;
 			if (IsIopBranchOrJumpOpcode(op) || IsIopExceptionOpcode(op))
 				can_direct_link_fallthrough = false;
 			const bool emitted = CanCompileOpcode(op) && EmitInstruction(op, pc, direct_exit_branches);
 			m_emit_native_static_branch = false;
 			m_emit_native_static_jump = false;
+			m_emit_native_register_jump = false;
 			if (!emitted)
 				return false;
 		}
@@ -1628,6 +1721,20 @@ namespace VitaIOP
 				direct_links->slots[0].valid = true;
 			}
 			else if (!EndBlockReturn(BlockExitKind::Direct))
+			{
+				return false;
+			}
+
+			direct_exit_offset = m_code.Size();
+			if (!EndBlockReturn(BlockExitKind::Direct))
+				return false;
+		}
+		else if (has_native_register_jump)
+		{
+			if (!EmitStorePcReg(HOST_REGISTER_JUMP_TARGET) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopEventTest), HOST_CALL_SCRATCH) ||
+				!EmitPcChangedExitCheckReg(HOST_REGISTER_JUMP_TARGET, direct_exit_branches) ||
+				!EndBlockReturn(BlockExitKind::Direct))
 			{
 				return false;
 			}

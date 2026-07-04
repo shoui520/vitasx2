@@ -78,8 +78,10 @@ namespace VitaIOP
 		bool EmitStoreCode(u32 op);
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
 		bool EmitStorePc(u32 pc);
+		bool EmitStorePcReg(unsigned host_reg);
 		bool EmitIncrementCycle();
 		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
+		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches);
 		bool EmitLoadGpr(unsigned guest_reg, unsigned host_reg);
 		bool EmitStoreGpr(unsigned guest_reg, unsigned host_reg);
 		bool EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg);
@@ -103,6 +105,7 @@ namespace VitaIOP
 		bool EmitJumpOp(u32 op, u32 pc);
 		bool EmitStaticJumpOp(u32 op, u32 pc);
 		bool EmitRegisterJumpOp(u32 op, u32 pc);
+		bool EmitRegisterJumpCaptureOp(u32 op, u32 pc);
 		bool EmitCop0TransferOp(u32 op, bool to_cop0);
 		bool EmitCop0RfeOp();
 		bool EmitCop2CommandOp(u32 op);
@@ -115,6 +118,7 @@ namespace VitaIOP
 		u32 m_helper_instruction_count = 0;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_jump = false;
+		bool m_emit_native_register_jump = false;
 	};
 
 	class BlockExecutor
