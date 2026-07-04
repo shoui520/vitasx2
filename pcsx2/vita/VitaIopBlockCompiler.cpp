@@ -36,6 +36,8 @@ namespace
 	constexpr size_t LO_OFFSET = GPR_OFFSET + offsetof(GPRRegs, n.lo);
 	constexpr size_t CP0_OFFSET = offsetof(psxRegisters, CP0);
 	constexpr size_t CP0_STATUS_OFFSET = CP0_OFFSET + offsetof(CP0Regs, n.Status);
+	constexpr size_t CP2D_OFFSET = offsetof(psxRegisters, CP2D);
+	constexpr size_t CP2C_OFFSET = offsetof(psxRegisters, CP2C);
 	constexpr size_t PC_OFFSET = offsetof(psxRegisters, pc);
 	constexpr size_t CODE_OFFSET = offsetof(psxRegisters, code);
 	constexpr size_t CYCLE_OFFSET = offsetof(psxRegisters, cycle);
@@ -91,6 +93,16 @@ namespace
 		return CP0_OFFSET + cop0_reg * sizeof(u32);
 	}
 
+	constexpr size_t Cp2dOffset(unsigned cop2_reg)
+	{
+		return CP2D_OFFSET + cop2_reg * sizeof(u32);
+	}
+
+	constexpr size_t Cp2cOffset(unsigned cop2_reg)
+	{
+		return CP2C_OFFSET + cop2_reg * sizeof(u32);
+	}
+
 	constexpr bool IsNativeCop0Opcode(u32 op)
 	{
 		switch (RS(op))
@@ -100,6 +112,23 @@ namespace
 			case 0x04: // MTC0
 			case 0x06: // CTC0
 			case 0x10: // RFE
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	constexpr bool IsNativeCop2Opcode(u32 op)
+	{
+		if ((op & 0x3f) != 0)
+			return false;
+
+		switch (RS(op))
+		{
+			case 0x00: // MFC2
+			case 0x02: // CFC2
+			case 0x04: // MTC2
+			case 0x06: // CTC2
 				return true;
 			default:
 				return false;
@@ -179,6 +208,8 @@ namespace
 				return true;
 			case 0x10: // COP0
 				return IsNativeCop0Opcode(op);
+			case 0x12: // COP2
+				return IsNativeCop2Opcode(op);
 			case 0x20: // LB
 			case 0x21: // LH
 			case 0x22: // LWL
@@ -191,6 +222,8 @@ namespace
 			case 0x2a: // SWL
 			case 0x2b: // SW
 			case 0x2e: // SWR
+			case 0x32: // LWC2
+			case 0x3a: // SWC2
 				return true;
 			default:
 				return false;
@@ -206,6 +239,8 @@ namespace
 	static_assert(LO_OFFSET + sizeof(u32) <= 4095);
 	static_assert(Cp0Offset(31) + sizeof(u32) <= 4095);
 	static_assert(CP0_STATUS_OFFSET + sizeof(u32) <= 4095);
+	static_assert(Cp2dOffset(31) + sizeof(u32) <= 4095);
+	static_assert(Cp2cOffset(31) + sizeof(u32) <= 4095);
 
 	extern "C" __attribute__((noinline)) bool VitaIopA32TraceInstruction(u32 pc, u32 opcode)
 	{
@@ -867,6 +902,145 @@ namespace VitaIOP
 			   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET));
 	}
 
+	bool BlockCompiler::EmitReadCop2DataReg(unsigned cop2_reg, unsigned host_reg)
+	{
+		// PCSX2 owner: IopGte.cpp::MFC2(). Register 29 synthesizes ORGB from
+		// IR1/IR2/IR3 and stores the synthesized value back into CP2D[29].
+		if (cop2_reg != 29)
+			return m_code.EmitLdrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(cop2_reg)));
+
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(9))) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, 7) ||
+			!m_code.EmitAndImm8(HOST_TMP0, HOST_TMP0, 0x1f) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(10))) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, 7) ||
+			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 0x1f) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 5) ||
+			!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(11))) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, 7) ||
+			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 0x1f) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 10) ||
+			!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(29))))
+		{
+			return false;
+		}
+
+		if (host_reg == HOST_TMP0)
+			return true;
+
+		return m_code.EmitMovRegShiftImm(host_reg, HOST_TMP0, VitaA32::ShiftType::LSL, 0);
+	}
+
+	bool BlockCompiler::EmitWriteCop2DataReg(unsigned cop2_reg, unsigned host_reg)
+	{
+		// PCSX2 owner: IopGte.cpp::MTC2(). These are GTE data-register side
+		// effects, not generic coprocessor transfers.
+		switch (cop2_reg)
+		{
+			case 8:
+			case 9:
+			case 10:
+			case 11:
+				return m_code.EmitMovRegShiftImm(HOST_TMP1, host_reg, VitaA32::ShiftType::LSL, 16) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::ASR, 16) &&
+					   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(cop2_reg)));
+
+			case 15:
+				return m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(13))) &&
+					   m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(14))) &&
+					   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(12))) &&
+					   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(13))) &&
+					   m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(14))) &&
+					   m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(15)));
+
+			case 16:
+			case 17:
+			case 18:
+			case 19:
+				return m_code.EmitMovImm32(HOST_TMP1, 0xffffu) &&
+					   m_code.EmitAndReg(HOST_TMP1, host_reg, HOST_TMP1) &&
+					   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(cop2_reg)));
+
+			case 28:
+				return m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(28))) &&
+					   m_code.EmitAndImm8(HOST_TMP1, host_reg, 0x1f) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 7) &&
+					   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(9))) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, host_reg, VitaA32::ShiftType::LSR, 5) &&
+					   m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 0x1f) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 7) &&
+					   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(10))) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, host_reg, VitaA32::ShiftType::LSR, 10) &&
+					   m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 0x1f) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 7) &&
+					   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(11)));
+
+			case 30:
+				return m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(30))) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, host_reg, VitaA32::ShiftType::ASR, 31) &&
+					   m_code.EmitEorReg(HOST_TMP1, host_reg, HOST_TMP1) &&
+					   m_code.EmitClz(HOST_TMP1, HOST_TMP1) &&
+					   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(31)));
+
+			default:
+				return m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(cop2_reg)));
+		}
+	}
+
+	bool BlockCompiler::EmitNativeCOP2(u32 op)
+	{
+		if ((op & 0x3f) != 0)
+			return false;
+
+		switch (RS(op))
+		{
+			case 0x00: // MFC2
+				if (RT(op) == 0)
+					return true;
+				return EmitReadCop2DataReg(RD(op), HOST_TMP0) &&
+					   EmitStoreGpr(RT(op), HOST_TMP0);
+
+			case 0x02: // CFC2
+				if (RT(op) == 0)
+					return true;
+				return m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp2cOffset(RD(op)))) &&
+					   EmitStoreGpr(RT(op), HOST_TMP0);
+
+			case 0x04: // MTC2
+				return EmitLoadGpr(RT(op), HOST_TMP0) &&
+					   EmitWriteCop2DataReg(RD(op), HOST_TMP0);
+
+			case 0x06: // CTC2
+				return EmitLoadGpr(RT(op), HOST_TMP0) &&
+					   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp2cOffset(RD(op))));
+
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitCop2LoadStoreOp(u32 op)
+	{
+		if ((op >> 26) == 0x32) // LWC2
+		{
+			return EmitEffectiveAddress(op) &&
+				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) &&
+				   EmitWriteCop2DataReg(RT(op), HOST_TMP0);
+		}
+
+		if ((op >> 26) == 0x3a) // SWC2
+		{
+			return EmitReadCop2DataReg(RT(op), HOST_SAVED0) &&
+				   EmitEffectiveAddress(op) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) &&
+				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH);
+		}
+
+		return false;
+	}
+
 	bool BlockCompiler::EmitNativeSPECIAL(u32 op, u32 pc)
 	{
 		switch (op & 0x3f)
@@ -959,6 +1133,8 @@ namespace VitaIOP
 				return EmitImmediateOp(op);
 			case 0x10: // COP0
 				return EmitNativeCOP0(op);
+			case 0x12: // COP2
+				return EmitNativeCOP2(op);
 			case 0x20: // LB
 			case 0x21: // LH
 			case 0x23: // LW
@@ -975,6 +1151,9 @@ namespace VitaIOP
 			case 0x2a: // SWL
 			case 0x2e: // SWR
 				return EmitUnalignedStoreOp(op);
+			case 0x32: // LWC2
+			case 0x3a: // SWC2
+				return EmitCop2LoadStoreOp(op);
 			default:
 				return false;
 		}
