@@ -105,7 +105,15 @@ namespace
 		}
 	}
 
-	bool VitaVifIsFastMode0NoMaskFormat(u32 format)
+	void VitaVifStoreMode0Words(vifStruct& vif, const VIFregisters& regs, u8* dest, bool doMask, u32 x, u32 y, u32 z, u32 w)
+	{
+		if (doMask)
+			VitaVifStoreMode0MaskedWords(vif, regs, dest, x, y, z, w);
+		else
+			VitaVifStoreWords(dest, x, y, z, w);
+	}
+
+	bool VitaVifIsFastMode0Format(u32 format)
 	{
 		switch (format)
 		{
@@ -124,16 +132,16 @@ namespace
 		}
 	}
 
-	bool VitaVifUnpackMode0NoMaskVector(u8* dest, const u8* src, u32 format, bool usn)
+	bool VitaVifUnpackMode0Vector(vifStruct& vif, const VIFregisters& regs, u8* dest, const u8* src, u32 format, bool usn, bool doMask)
 	{
 		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_S(), UNPACK_V2(), and
-		// UNPACK_V4() when mode == 0 and masking is disabled.
+		// UNPACK_V4() when mode == 0.
 		switch (format)
 		{
 			case 0x00: // S-32
 			{
 				const u32 x = VitaVifLoadU32(src);
-				VitaVifStoreWords(dest, x, x, x, x);
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, x, x, x);
 				return true;
 			}
 
@@ -141,7 +149,7 @@ namespace
 			{
 				const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
-				VitaVifStoreWords(dest, x, x, x, x);
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, x, x, x);
 				return true;
 			}
 
@@ -149,7 +157,7 @@ namespace
 			{
 				const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
-				VitaVifStoreWords(dest, x, x, x, x);
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, x, x, x);
 				return true;
 			}
 
@@ -157,7 +165,7 @@ namespace
 			{
 				const u32 x = VitaVifLoadU32(src);
 				const u32 y = VitaVifLoadU32(src + sizeof(u32));
-				VitaVifStoreWords(dest, x, y, x, y);
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, y, x, y);
 				return true;
 			}
 
@@ -167,7 +175,7 @@ namespace
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
 				const u32 y = usn ? static_cast<u32>(VitaVifLoadU16(src + sizeof(u16))) :
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + sizeof(u16))));
-				VitaVifStoreWords(dest, x, y, x, y);
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, y, x, y);
 				return true;
 			}
 
@@ -177,12 +185,23 @@ namespace
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
 				const u32 y = usn ? static_cast<u32>(VitaVifLoadU8(src + sizeof(u8))) :
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + sizeof(u8))));
-				VitaVifStoreWords(dest, x, y, x, y);
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, y, x, y);
 				return true;
 			}
 
 			case 0x0c: // V4-32
-				VitaVifCopyQword(dest, src);
+				if (doMask)
+				{
+					VitaVifStoreMode0MaskedWords(vif, regs, dest,
+						VitaVifLoadU32(src),
+						VitaVifLoadU32(src + 4),
+						VitaVifLoadU32(src + 8),
+						VitaVifLoadU32(src + 12));
+				}
+				else
+				{
+					VitaVifCopyQword(dest, src);
+				}
 				return true;
 
 			case 0x0d: // V4-16
@@ -195,7 +214,7 @@ namespace
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 4)));
 				const u32 w = usn ? static_cast<u32>(VitaVifLoadU16(src + 6)) :
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 6)));
-				VitaVifStoreWords(dest, x, y, z, w);
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, y, z, w);
 				return true;
 			}
 
@@ -209,7 +228,7 @@ namespace
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 2)));
 				const u32 w = usn ? static_cast<u32>(VitaVifLoadU8(src + 3)) :
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 3)));
-				VitaVifStoreWords(dest, x, y, z, w);
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, y, z, w);
 				return true;
 			}
 
@@ -276,21 +295,22 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastMode0NoMask(const u8* data, bool isFill)
+	bool VitaVifTryFastMode0(const u8* data, bool isFill)
 	{
 		vifStruct& vif = GetVifX;
 		VIFregisters& regs = vifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 format = upk_num & 0x0f;
-		if ((upk_num & 0x10) != 0 || regs.mode != 0 || !VitaVifIsFastMode0NoMaskFormat(format))
+		if (regs.mode != 0 || !VitaVifIsFastMode0Format(format))
 			return false;
 
+		const bool doMask = (upk_num & 0x10) != 0;
 		const int vsize = nVifT[format];
 		const int skip_size = (regs.cycle.cl - regs.cycle.wl) * 16;
 		do
 		{
-			VitaVifUnpackMode0NoMaskVector(
-				VitaVifVuMemPtr<idx>(vif.tag.addr), data, format, vif.usn != 0);
+			VitaVifUnpackMode0Vector(
+				vif, regs, VitaVifVuMemPtr<idx>(vif.tag.addr), data, format, vif.usn != 0, doMask);
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuVifFastVectors;
 #endif
@@ -378,7 +398,7 @@ void dVifUnpack(const u8* data, bool isFill)
 	if (VitaVifTryFastV4_5<idx>(data, isFill))
 		return;
 
-	if (VitaVifTryFastMode0NoMask<idx>(data, isFill))
+	if (VitaVifTryFastMode0<idx>(data, isFill))
 		return;
 
 	VitaVifGenericUnpackLoop<idx>(data, isFill);
