@@ -1485,9 +1485,49 @@ namespace VitaIOP
 	{
 		if ((op >> 26) == 0x32) // LWC2
 		{
-			return EmitEffectiveAddress(op) &&
-				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) &&
-				   EmitWriteCop2DataReg(RT(op), HOST_TMP0);
+			if (!EmitEffectiveAddress(op) ||
+				!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+				!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
+				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+			{
+				return false;
+			}
+
+			// PCSX2 owner: IopGte.cpp::gteLWC2() reads with iopMemRead32() before
+			// MTC2 side effects. Mirror rpsxLoad's ordinary-RAM fast split here.
+			const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (fallback_branch == static_cast<size_t>(-1) ||
+				!m_code.EmitAndImm8(HOST_TMP2, HOST_SAVED0, 3, true))
+			{
+				return false;
+			}
+
+			const size_t alignment_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (alignment_fallback_branch == static_cast<size_t>(-1) ||
+				!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
+				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_TMP2) ||
+				!m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
+				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP1, HOST_TMP0) ||
+				!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+			{
+				return false;
+			}
+
+			const size_t done_branch = m_code.EmitBranchPlaceholder();
+			if (done_branch == static_cast<size_t>(-1))
+				return false;
+
+			const size_t fallback_target = m_code.Size();
+			if (!m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+				!m_code.PatchBranch(alignment_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) ||
+				!m_code.PatchBranch(done_branch, m_code.Size()))
+			{
+				return false;
+			}
+
+			return EmitWriteCop2DataReg(RT(op), HOST_TMP0);
 		}
 
 		if ((op >> 26) == 0x3a) // SWC2
