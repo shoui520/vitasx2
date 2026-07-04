@@ -191,6 +191,8 @@ namespace VitaEE
 			bool branch_delay_slot);
 		bool EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit,
 			bool branch_delay_slot);
+		bool EmitTrapEventExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool branch_delay_slot);
 		bool EmitADDIU(u32 op);
 		bool EmitDADDIU(u32 op);
 		bool EmitSLTI(u32 op);

@@ -307,6 +307,12 @@ namespace VitaEE
 				case 0x2d: // DADDU, owned by R5900OpcodeImpl.cpp::DADDU().
 				case 0x2e: // DSUB, owned by R5900OpcodeImpl.cpp::DSUB().
 				case 0x2f: // DSUBU, owned by R5900OpcodeImpl.cpp::DSUBU().
+				case 0x30: // TGE, owned by R5900OpcodeImpl.cpp::TGE().
+				case 0x31: // TGEU, owned by R5900OpcodeImpl.cpp::TGEU().
+				case 0x32: // TLT, owned by R5900OpcodeImpl.cpp::TLT().
+				case 0x33: // TLTU, owned by R5900OpcodeImpl.cpp::TLTU().
+				case 0x34: // TEQ, owned by R5900OpcodeImpl.cpp::TEQ().
+				case 0x36: // TNE, owned by R5900OpcodeImpl.cpp::TNE().
 				case 0x38: // DSLL, owned by R5900OpcodeImpl.cpp::DSLL().
 				case 0x3a: // DSRL, owned by R5900OpcodeImpl.cpp::DSRL().
 				case 0x3b: // DSRA, owned by R5900OpcodeImpl.cpp::DSRA().
@@ -332,6 +338,84 @@ namespace VitaEE
 		bool IsSYNC(u32 op)
 		{
 			return (op >> 26) == 0x00 && (op & 0x3f) == 0x0f;
+		}
+
+		bool IsSpecialTrap(u32 op)
+		{
+			if ((op >> 26) != 0x00)
+				return false;
+
+			switch (op & 0x3f)
+			{
+				case 0x30: // TGE
+				case 0x31: // TGEU
+				case 0x32: // TLT
+				case 0x33: // TLTU
+				case 0x34: // TEQ
+				case 0x36: // TNE
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool IsRegImmTrap(u32 op)
+		{
+			if ((op >> 26) != 0x01)
+				return false;
+
+			switch (RT(op))
+			{
+				case 0x08: // TGEI
+				case 0x09: // TGEIU
+				case 0x0a: // TLTI
+				case 0x0b: // TLTIU
+				case 0x0c: // TEQI
+				case 0x0e: // TNEI
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool IsTrapOpcode(u32 op)
+		{
+			return IsSpecialTrap(op) || IsRegImmTrap(op);
+		}
+
+		const void* TrapHelperForOpcode(u32 op)
+		{
+			using namespace R5900::Interpreter::OpcodeImpl;
+
+			if ((op >> 26) == 0x00)
+			{
+				switch (op & 0x3f)
+				{
+					case 0x30: return reinterpret_cast<const void*>(&TGE);
+					case 0x31: return reinterpret_cast<const void*>(&TGEU);
+					case 0x32: return reinterpret_cast<const void*>(&TLT);
+					case 0x33: return reinterpret_cast<const void*>(&TLTU);
+					case 0x34: return reinterpret_cast<const void*>(&TEQ);
+					case 0x36: return reinterpret_cast<const void*>(&TNE);
+					default: return nullptr;
+				}
+			}
+
+			if ((op >> 26) == 0x01)
+			{
+				switch (RT(op))
+				{
+					case 0x08: return reinterpret_cast<const void*>(&TGEI);
+					case 0x09: return reinterpret_cast<const void*>(&TGEIU);
+					case 0x0a: return reinterpret_cast<const void*>(&TLTI);
+					case 0x0b: return reinterpret_cast<const void*>(&TLTIU);
+					case 0x0c: return reinterpret_cast<const void*>(&TEQI);
+					case 0x0e: return reinterpret_cast<const void*>(&TNEI);
+					default: return nullptr;
+				}
+			}
+
+			return nullptr;
 		}
 
 		bool IsCounterReadLoad(u32 op)
@@ -941,6 +1025,12 @@ namespace VitaEE
 				case 0x01: // BGEZ, owned by Interpreter.cpp::BGEZ().
 				case 0x02: // BLTZL, owned by Interpreter.cpp::BLTZL().
 				case 0x03: // BGEZL, owned by Interpreter.cpp::BGEZL().
+				case 0x08: // TGEI, owned by R5900OpcodeImpl.cpp::TGEI().
+				case 0x09: // TGEIU, owned by R5900OpcodeImpl.cpp::TGEIU().
+				case 0x0a: // TLTI, owned by R5900OpcodeImpl.cpp::TLTI().
+				case 0x0b: // TLTIU, owned by R5900OpcodeImpl.cpp::TLTIU().
+				case 0x0c: // TEQI, owned by R5900OpcodeImpl.cpp::TEQI().
+				case 0x0e: // TNEI, owned by R5900OpcodeImpl.cpp::TNEI().
 				case 0x10: // BLTZAL, owned by Interpreter.cpp::BLTZAL().
 				case 0x11: // BGEZAL, owned by Interpreter.cpp::BGEZAL().
 				case 0x12: // BLTZALL, owned by Interpreter.cpp::BLTZALL().
@@ -1674,8 +1764,10 @@ namespace VitaEE
 		// SYSCALL/BREAK are different: R5900OpcodeImpl.cpp::SYSCALL()/BREAK()
 		// are helper-backed exception paths, and Interpreter.cpp::_doBranch_shared()
 		// marks cpuRegs.branch before executing them as delay slots.
+		// Trap ops use the same exception-shaped helper/event tail.
 		return CanCompileOpcode(op) && !IsDI(op) &&
-			   (!RequiresBlockEndAfterOpcode(op) || IsSYSCALL(op) || IsBREAK(op) || IsCounterReadLoad(op));
+			   (!RequiresBlockEndAfterOpcode(op) || IsSYSCALL(op) || IsBREAK(op) ||
+				   IsTrapOpcode(op) || IsCounterReadLoad(op));
 	}
 
 	bool BlockCompiler::RequiresBlockEndAfterOpcode(u32 op)
@@ -1687,7 +1779,10 @@ namespace VitaEE
 		switch (op >> 26)
 		{
 			case 0x00:
-				return (op & 0x3f) == 0x0c || (op & 0x3f) == 0x0d || (op & 0x3f) == 0x0f;
+				return (op & 0x3f) == 0x0c || (op & 0x3f) == 0x0d ||
+					   (op & 0x3f) == 0x0f || IsSpecialTrap(op);
+			case 0x01:
+				return IsRegImmTrap(op);
 			case 0x10:
 				return CanCompileCOP0(op) && !IsDI(op) && !IsFastMFC0(op) && !IsFastMTC0(op);
 			case 0x11:
@@ -1985,7 +2080,7 @@ namespace VitaEE
 				raw_cycles = RawCycleRemainderAfterClear(raw_cycles);
 			}
 
-			if ((IsSYSCALL(op) || IsBREAK(op)) && !branch_delay_slot)
+			if ((IsSYSCALL(op) || IsBREAK(op) || IsTrapOpcode(op)) && !branch_delay_slot)
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
@@ -2115,7 +2210,9 @@ namespace VitaEE
 		{
 			case 0x00:
 				return EmitSPECIAL(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
-			case 0x01: // REGIMM, including MTSAB/MTSAH from R5900OpcodeImpl.cpp.
+			case 0x01: // REGIMM, including traps and MTSAB/MTSAH from R5900OpcodeImpl.cpp.
+				if (IsRegImmTrap(op))
+					return EmitTrapEventExit(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
 				return EmitREGIMM(op, pc);
 			case 0x08: // ADDI, owned by R5900OpcodeImpl.cpp::ADDI(). The PCSX2
 				// recompiler owner x86/ix86-32/iR5900AritImm.cpp::recADDI_() drops
@@ -2538,6 +2635,13 @@ namespace VitaEE
 				return EmitDSUBU(op);
 			case 0x2f: // DSUBU, owned by R5900OpcodeImpl.cpp::DSUBU().
 				return EmitDSUBU(op);
+			case 0x30: // TGE, owned by R5900OpcodeImpl.cpp::TGE().
+			case 0x31: // TGEU, owned by R5900OpcodeImpl.cpp::TGEU().
+			case 0x32: // TLT, owned by R5900OpcodeImpl.cpp::TLT().
+			case 0x33: // TLTU, owned by R5900OpcodeImpl.cpp::TLTU().
+			case 0x34: // TEQ, owned by R5900OpcodeImpl.cpp::TEQ().
+			case 0x36: // TNE, owned by R5900OpcodeImpl.cpp::TNE().
+				return EmitTrapEventExit(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
 			case 0x38: // DSLL, owned by R5900OpcodeImpl.cpp::DSLL().
 				return EmitDSLL(op);
 			case 0x3a: // DSRL, owned by R5900OpcodeImpl.cpp::DSRL().
@@ -4633,6 +4737,16 @@ namespace VitaEE
 		using namespace R5900::Interpreter::OpcodeImpl;
 		return EmitSpecialExceptionEventExit(op, pc, raw_cycles_through_instruction,
 			event_exit, branch_delay_slot, reinterpret_cast<const void*>(&BREAK));
+	}
+
+	bool BlockCompiler::EmitTrapEventExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
+	{
+		// PCSX2 owners: R5900OpcodeImpl.cpp::TGE/TGEU/TLT/TLTU/TEQ/TNE and
+		// TGEI/TGEIU/TLTI/TLTIU/TEQI/TNEI. The x86 recompiler keeps these as
+		// recBranchCall() helper tails, so the first A32 port does the same.
+		return EmitSpecialExceptionEventExit(op, pc, raw_cycles_through_instruction,
+			event_exit, branch_delay_slot, TrapHelperForOpcode(op));
 	}
 
 	bool BlockCompiler::EmitADDIU(u32 op)
