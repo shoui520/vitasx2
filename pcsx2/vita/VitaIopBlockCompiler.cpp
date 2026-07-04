@@ -318,8 +318,7 @@ namespace
 	{
 		// PCSX2 owner: R3000AInterpreter.cpp::execI() stores psxRegs.code,
 		// records DebugTools/IopTrace.cpp::RecordIopPreInstruction, and only
-		// then advances pc/cycle. Keep the generated helper-tail path at that
-		// same hook point.
+		// then advances pc/cycle. Keep generated A32 blocks at that hook point.
 		if (!VitaRecordIopPreInstruction(pc, opcode))
 			return false;
 
@@ -1385,12 +1384,6 @@ namespace VitaIOP
 		direct_exit_branches.reserve(instruction_count * 2);
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
-		m_helper_opcode_class_count = 0;
-		m_helper_opcode_class_overflow = 0;
-		m_helper_opcode_classes.fill(0);
-		m_helper_opcode_class_hits.fill(0);
-		m_helper_opcode_class_first_pc.fill(0);
-		m_helper_opcode_class_first_opcode.fill(0);
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 pc = start_pc + i * 4;
@@ -1598,7 +1591,7 @@ namespace VitaIOP
 
 		// PCSX2 owner: x86/iR3000A.cpp::recReserve()/recResetIOP() use one IOP
 		// recompiler arena and BASEBLOCK records inside it. Vita mirrors that
-		// with one ARM code arena for cached R3000A helper-tail blocks.
+		// with one ARM code arena for cached R3000A blocks.
 		m_code_cache = static_cast<u8*>(VitaVM::AllocJitMemory(IOP_CODE_CACHE_CAPACITY));
 		m_code_cache_capacity = m_code_cache ? IOP_CODE_CACHE_CAPACITY : 0;
 		m_code_cache_used = 0;
@@ -1687,12 +1680,6 @@ namespace VitaIOP
 				block.instruction_count = instruction_count;
 				block.native_instruction_count = compiler.NativeInstructionCount();
 				block.helper_instruction_count = compiler.HelperInstructionCount();
-				block.helper_opcode_class_count = compiler.HelperOpcodeClassCount();
-				block.helper_opcode_class_overflow = compiler.HelperOpcodeClassOverflow();
-				block.helper_opcode_classes = compiler.HelperOpcodeClasses();
-				block.helper_opcode_class_hits = compiler.HelperOpcodeClassHits();
-				block.helper_opcode_class_first_pc = compiler.HelperOpcodeClassFirstPc();
-				block.helper_opcode_class_first_opcode = compiler.HelperOpcodeClassFirstOpcode();
 				block.valid = true;
 				return true;
 			}
@@ -1722,12 +1709,6 @@ namespace VitaIOP
 		result->instruction_count = block.instruction_count;
 		result->native_instruction_count = block.native_instruction_count;
 		result->helper_instruction_count = block.helper_instruction_count;
-		result->helper_opcode_class_count = block.helper_opcode_class_count;
-		result->helper_opcode_class_overflow = block.helper_opcode_class_overflow;
-		result->helper_opcode_classes = block.helper_opcode_classes;
-		result->helper_opcode_class_hits = block.helper_opcode_class_hits;
-		result->helper_opcode_class_first_pc = block.helper_opcode_class_first_pc;
-		result->helper_opcode_class_first_opcode = block.helper_opcode_class_first_opcode;
 		result->code_size = block.code.Size();
 		result->cache_slots = static_cast<u32>(m_cache.size());
 		result->code_cache_resets = m_code_cache_resets;

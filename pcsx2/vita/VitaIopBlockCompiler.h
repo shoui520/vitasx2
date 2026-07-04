@@ -27,18 +27,10 @@ namespace VitaIOP
 
 	struct BlockExecutionResult
 	{
-		static constexpr u32 HELPER_OPCODE_CLASS_SLOTS = 16;
-
 		BlockExitKind exit = BlockExitKind::Direct;
 		u32 instruction_count = 0;
 		u32 native_instruction_count = 0;
 		u32 helper_instruction_count = 0;
-		u32 helper_opcode_class_count = 0;
-		u32 helper_opcode_class_overflow = 0;
-		std::array<u32, HELPER_OPCODE_CLASS_SLOTS> helper_opcode_classes{};
-		std::array<u32, HELPER_OPCODE_CLASS_SLOTS> helper_opcode_class_hits{};
-		std::array<u32, HELPER_OPCODE_CLASS_SLOTS> helper_opcode_class_first_pc{};
-		std::array<u32, HELPER_OPCODE_CLASS_SLOTS> helper_opcode_class_first_opcode{};
 		size_t code_size = 0;
 		u32 cache_slots = 0;
 		u32 code_cache_resets = 0;
@@ -57,12 +49,6 @@ namespace VitaIOP
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
-		u32 HelperOpcodeClassCount() const { return m_helper_opcode_class_count; }
-		u32 HelperOpcodeClassOverflow() const { return m_helper_opcode_class_overflow; }
-		const std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS>& HelperOpcodeClasses() const { return m_helper_opcode_classes; }
-		const std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS>& HelperOpcodeClassHits() const { return m_helper_opcode_class_hits; }
-		const std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS>& HelperOpcodeClassFirstPc() const { return m_helper_opcode_class_first_pc; }
-		const std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS>& HelperOpcodeClassFirstOpcode() const { return m_helper_opcode_class_first_opcode; }
 
 	private:
 		bool BeginBlock();
@@ -107,12 +93,6 @@ namespace VitaIOP
 		VitaA32::CodeBuffer& m_code;
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
-		u32 m_helper_opcode_class_count = 0;
-		u32 m_helper_opcode_class_overflow = 0;
-		std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS> m_helper_opcode_classes{};
-		std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS> m_helper_opcode_class_hits{};
-		std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS> m_helper_opcode_class_first_pc{};
-		std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS> m_helper_opcode_class_first_opcode{};
 	};
 
 	class BlockExecutor
@@ -144,12 +124,6 @@ namespace VitaIOP
 			u32 instruction_count = 0;
 			u32 native_instruction_count = 0;
 			u32 helper_instruction_count = 0;
-			u32 helper_opcode_class_count = 0;
-			u32 helper_opcode_class_overflow = 0;
-			std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS> helper_opcode_classes{};
-			std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS> helper_opcode_class_hits{};
-			std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS> helper_opcode_class_first_pc{};
-			std::array<u32, BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS> helper_opcode_class_first_opcode{};
 			bool valid = false;
 		};
 

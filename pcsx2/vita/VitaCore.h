@@ -56,8 +56,6 @@ void VitaRequestA32EeCacheReset();
 
 struct VitaA32IopProviderStats
 {
-	static constexpr u32 HELPER_OPCODE_CLASS_SLOTS = 16;
-
 	u32 compiled_blocks = 0;
 	u32 compiled_instructions = 0;
 	u32 native_instructions = 0;
@@ -74,12 +72,6 @@ struct VitaA32IopProviderStats
 	u32 first_interpreter_opcode = 0;
 	u32 last_interpreter_pc = 0;
 	u32 last_interpreter_opcode = 0;
-	u32 helper_opcode_class_count = 0;
-	u32 helper_opcode_class_overflow = 0;
-	u32 helper_opcode_classes[HELPER_OPCODE_CLASS_SLOTS] = {};
-	u32 helper_opcode_class_hits[HELPER_OPCODE_CLASS_SLOTS] = {};
-	u32 helper_opcode_class_first_pc[HELPER_OPCODE_CLASS_SLOTS] = {};
-	u32 helper_opcode_class_first_opcode[HELPER_OPCODE_CLASS_SLOTS] = {};
 };
 
 void VitaResetA32IopProviderStats();
