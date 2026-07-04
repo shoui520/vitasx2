@@ -471,9 +471,7 @@ namespace VitaEE
 				case 0x0c: // Status, owned by x86/iCOP0.cpp::recMTC0().
 					return true;
 				case 0x19: // Perf counters.
-					if ((op & 1u) == 0)
-						return (op & 0x3eu) != 0; // MTPS/PCCR sel 0 calls COP0_UpdatePCCR(); other even sels no-op.
-					return true; // MTPC0/MTPC1, selected by sel bit 1.
+					return true;
 				default:
 					return true;
 			}
@@ -494,7 +492,8 @@ namespace VitaEE
 				case 0x00:
 					return RD(op) == 9 || (RD(op) == 25 && RT(op) != 0 && (op & 1u) != 0);
 				case 0x04:
-					return RD(op) == 9 || RD(op) == 12 || (RD(op) == 25 && (op & 1u) != 0);
+					return RD(op) == 9 || RD(op) == 12 ||
+						   (RD(op) == 25 && ((op & 1u) != 0 || (op & 0x3fu) == 0));
 				default:
 					return false;
 			}
@@ -2812,10 +2811,10 @@ namespace VitaEE
 			// PCSX2 owner: x86/iCOP0.cpp::recMTC0() under CP0_RECOMPILE.
 			// Status calls PCSX2's WriteCP0Status() in-block after committing
 			// cycles, matching the x86 helper-call shape while avoiding an
-			// artificial event-tail split. MTPS/PCCR still uses the helper/event
-			// tail because it calls COP0_UpdatePCCR() and COP0_DiagnosticPCCR().
-			// Count and MTPC0/MTPC1 commit cycles here using the same
-			// scaleblockcycles_clear() cadence.
+			// artificial event-tail split. Count and the perf counter writes
+			// commit cycles here using the same scaleblockcycles_clear() cadence;
+			// MTPS/PCCR calls COP0_UpdatePCCR() before storing the new PCCR and
+			// then runs COP0_DiagnosticPCCR(), as PCSX2's x86 path does.
 			const unsigned rt = RT(op);
 			const unsigned rd = RD(op);
 			const auto load_rt_low = [this, rt](unsigned host_reg) {
@@ -2864,7 +2863,20 @@ namespace VitaEE
 					return true;
 				case 0x19: // Perf counters
 					if ((op & 1u) == 0)
-						return true; // Non-zero even sels are no-op; sel 0 is helper-backed MTPS/PCCR.
+					{
+						if ((op & 0x3eu) != 0)
+							return true; // Non-zero even selectors are no-op.
+
+						const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
+						if (cycles == 0 || !EmitAddScaledCyclesToCpu(cycles))
+							return false;
+
+						return m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&COP0_UpdatePCCR)) &&
+							   load_rt_low(HOST_TMP0) &&
+							   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS,
+								   static_cast<u16>(PERF_PCCR_OFFSET)) &&
+							   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&COP0_DiagnosticPCCR));
+					}
 
 					{
 						const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
