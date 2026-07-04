@@ -51,7 +51,7 @@ namespace VitaIOP
 
 	struct DirectLinkSlots
 	{
-		DirectLinkSlot slots[1]{};
+		DirectLinkSlot slots[2]{};
 	};
 
 	class BlockCompiler
@@ -98,6 +98,8 @@ namespace VitaIOP
 		bool EmitUnalignedStoreOp(u32 op);
 		bool EmitConditionalBranchOp(u32 op, u32 pc);
 		bool EmitSignedBranchOp(u32 op, u32 pc);
+		bool EmitConditionalBranchFlag(u32 op);
+		bool EmitSignedBranchFlag(u32 op);
 		bool EmitJumpOp(u32 op, u32 pc);
 		bool EmitRegisterJumpOp(u32 op, u32 pc);
 		bool EmitCop0TransferOp(u32 op, bool to_cop0);
@@ -110,6 +112,7 @@ namespace VitaIOP
 		VitaA32::CodeBuffer& m_code;
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
+		bool m_emit_native_static_branch = false;
 	};
 
 	class BlockExecutor
@@ -133,7 +136,7 @@ namespace VitaIOP
 		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 16 * 1024;
 		static constexpr size_t IOP_CODE_CACHE_CAPACITY = 512 * 1024;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
-		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 1;
+		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;

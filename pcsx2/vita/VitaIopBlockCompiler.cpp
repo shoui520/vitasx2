@@ -20,6 +20,8 @@ namespace
 	constexpr u16 REG_R4 = 1u << 4;
 	constexpr u16 REG_R5 = 1u << 5;
 	constexpr u16 REG_R6 = 1u << 6;
+	constexpr u16 REG_R7 = 1u << 7;
+	constexpr u16 REG_R8 = 1u << 8;
 	constexpr u16 REG_LR = 1u << 14;
 	constexpr u16 REG_PC = 1u << 15;
 
@@ -30,6 +32,7 @@ namespace
 	constexpr unsigned HOST_PSX_REGS = 4;
 	constexpr unsigned HOST_SAVED0 = 5;
 	constexpr unsigned HOST_SAVED1 = 6;
+	constexpr unsigned HOST_BRANCH_FLAG = 7;
 	constexpr unsigned HOST_CALL_SCRATCH = 12;
 
 	constexpr size_t GPR_OFFSET = offsetof(psxRegisters, GPR);
@@ -302,6 +305,22 @@ namespace
 		return function == 0x0c || function == 0x0d; // SYSCALL/BREAK
 	}
 
+	constexpr bool IsIopStaticConditionalBranchOpcode(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x01: // REGIMM
+				return IsNativeRegimmOpcode(op);
+			case 0x04: // BEQ
+			case 0x05: // BNE
+			case 0x06: // BLEZ
+			case 0x07: // BGTZ
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	static_assert(PC_OFFSET <= 4095);
 	static_assert(CODE_OFFSET <= 4095);
 	static_assert(CYCLE_OFFSET + sizeof(u32) <= 4095);
@@ -419,14 +438,14 @@ namespace VitaIOP
 
 	bool BlockCompiler::BeginBlock()
 	{
-		return m_code.EmitPush(REG_R4 | REG_R5 | REG_R6 | REG_LR) &&
+		return m_code.EmitPush(REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_LR) &&
 			   m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs)));
 	}
 
 	bool BlockCompiler::EndBlockReturn(BlockExitKind exit)
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_PC);
 	}
 
 	bool BlockCompiler::EndBlockDirectTail(const void* direct_exit, size_t* direct_link_target_offset)
@@ -434,7 +453,7 @@ namespace VitaIOP
 		if (!direct_exit)
 			return false;
 
-		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
+		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_LR))
 			return false;
 
 		const size_t target_offset = m_code.Size();
@@ -929,6 +948,9 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitConditionalBranchOp(u32 op, u32 pc)
 	{
+		if (m_emit_native_static_branch)
+			return EmitConditionalBranchFlag(op);
+
 		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
 			!EmitLoadGpr(RT(op), HOST_TMP1) ||
 			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
@@ -945,6 +967,20 @@ namespace VitaIOP
 			   m_code.PatchBranch(not_taken, m_code.Size(), skip_taken);
 	}
 
+	bool BlockCompiler::EmitConditionalBranchFlag(u32 op)
+	{
+		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
+			!EmitLoadGpr(RT(op), HOST_TMP1) ||
+			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0))
+		{
+			return false;
+		}
+
+		return m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
+			((op >> 26) == 0x04) ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
+	}
+
 	bool BlockCompiler::EmitSignedBranchOp(u32 op, u32 pc)
 	{
 		const unsigned opcode = op >> 26;
@@ -958,6 +994,9 @@ namespace VitaIOP
 				return false;
 			}
 		}
+
+		if (m_emit_native_static_branch)
+			return EmitSignedBranchFlag(op);
 
 		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
 			!m_code.EmitMovImm8(HOST_TMP1, 0) ||
@@ -1001,6 +1040,47 @@ namespace VitaIOP
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
 			   EndBlockReturn(BlockExitKind::Direct) &&
 			   m_code.PatchBranch(not_taken, m_code.Size(), skip_taken);
+	}
+
+	bool BlockCompiler::EmitSignedBranchFlag(u32 op)
+	{
+		const unsigned opcode = op >> 26;
+		const unsigned rt = RT(op);
+		VitaA32::Condition taken = VitaA32::Condition::AL;
+		if (opcode == 0x01)
+		{
+			switch (rt)
+			{
+				case 0x00: // BLTZ
+				case 0x10: // BLTZAL
+					taken = VitaA32::Condition::LT;
+					break;
+				case 0x01: // BGEZ
+				case 0x11: // BGEZAL
+					taken = VitaA32::Condition::GE;
+					break;
+				default:
+					return false;
+			}
+		}
+		else if (opcode == 0x06) // BLEZ
+		{
+			taken = VitaA32::Condition::LE;
+		}
+		else if (opcode == 0x07) // BGTZ
+		{
+			taken = VitaA32::Condition::GT;
+		}
+		else
+		{
+			return false;
+		}
+
+		return EmitLoadGpr(RS(op), HOST_TMP0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
+			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, taken);
 	}
 
 	bool BlockCompiler::EmitJumpOp(u32 op, u32 pc)
@@ -1414,20 +1494,86 @@ namespace VitaIOP
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
 		bool can_direct_link_fallthrough = true;
+		bool has_native_static_branch = false;
+		u32 static_branch_target_pc = 0;
+		u32 static_branch_fallthrough_pc = 0;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 pc = start_pc + i * 4;
 			const u32 op = iopMemRead32(pc);
+			const bool can_native_static_branch =
+				IsIopStaticConditionalBranchOpcode(op) &&
+				i + 2 == instruction_count &&
+				!IsIopBranchOrJumpOpcode(iopMemRead32(pc + 4)) &&
+				!IsIopExceptionOpcode(iopMemRead32(pc + 4));
+			m_emit_native_static_branch = can_native_static_branch;
+			if (can_native_static_branch)
+			{
+				has_native_static_branch = true;
+				static_branch_target_pc = BranchTarget(pc, op);
+				static_branch_fallthrough_pc = pc + 8;
+			}
 			if (IsIopBranchOrJumpOpcode(op) || IsIopExceptionOpcode(op))
 				can_direct_link_fallthrough = false;
-			if (!CanCompileOpcode(op) || !EmitInstruction(op, pc, direct_exit_branches))
+			const bool emitted = CanCompileOpcode(op) && EmitInstruction(op, pc, direct_exit_branches);
+			m_emit_native_static_branch = false;
+			if (!emitted)
 				return false;
 		}
 
 		const u32 next_pc = start_pc + instruction_count * 4;
 		size_t direct_exit_offset = 0;
 		const bool emit_link_tail = direct_exit && direct_links && can_direct_link_fallthrough;
-		if (emit_link_tail)
+		const bool emit_branch_link_tails = direct_exit && direct_links && has_native_static_branch;
+		const auto emit_direct_or_return_tail = [&](u32 target_pc, u8 slot_index) -> bool {
+			if (emit_branch_link_tails)
+			{
+				size_t target_offset = 0;
+				if (!EndBlockDirectTail(direct_exit, &target_offset))
+					return false;
+
+				direct_links->slots[slot_index].target_pc = target_pc;
+				direct_links->slots[slot_index].target_offset = target_offset;
+				direct_links->slots[slot_index].valid = true;
+				return true;
+			}
+
+			return EndBlockReturn(BlockExitKind::Direct);
+		};
+
+		if (has_native_static_branch)
+		{
+			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
+				!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP0))
+			{
+				return false;
+			}
+
+			const size_t taken_path = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (taken_path == static_cast<size_t>(-1))
+				return false;
+
+			if (!EmitStorePc(static_branch_fallthrough_pc) ||
+				!emit_direct_or_return_tail(static_branch_fallthrough_pc, 0))
+			{
+				return false;
+			}
+
+			const size_t taken_path_target = m_code.Size();
+			if (!m_code.PatchBranch(taken_path, taken_path_target, VitaA32::Condition::NE) ||
+				!EmitStorePc(static_branch_target_pc) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopEventTest), HOST_CALL_SCRATCH) ||
+				!EmitPcChangedExitCheck(static_branch_target_pc, direct_exit_branches) ||
+				!emit_direct_or_return_tail(static_branch_target_pc, 1))
+			{
+				return false;
+			}
+
+			direct_exit_offset = m_code.Size();
+			if (!EndBlockReturn(BlockExitKind::Direct))
+				return false;
+		}
+		else if (emit_link_tail)
 		{
 			size_t target_offset = 0;
 			if (!EndBlockDirectTail(direct_exit, &target_offset))
