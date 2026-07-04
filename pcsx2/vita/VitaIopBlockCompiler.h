@@ -32,11 +32,26 @@ namespace VitaIOP
 		u32 native_instruction_count = 0;
 		u32 helper_instruction_count = 0;
 		size_t code_size = 0;
+		u32 block_records = 0;
+		u32 link_records = 0;
 		u32 cache_slots = 0;
 		u32 code_cache_resets = 0;
 		size_t code_cache_used = 0;
 		size_t code_cache_capacity = 0;
 		bool cache_hit = false;
+		bool lookup_hit = false;
+	};
+
+	struct DirectLinkSlot
+	{
+		u32 target_pc = 0;
+		size_t target_offset = 0;
+		bool valid = false;
+	};
+
+	struct DirectLinkSlots
+	{
+		DirectLinkSlot slots[1]{};
 	};
 
 	class BlockCompiler
@@ -46,13 +61,15 @@ namespace VitaIOP
 
 		static bool CanCompileOpcode(u32 op);
 
-		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count);
+		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count,
+			const void* direct_exit = nullptr, DirectLinkSlots* direct_links = nullptr);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 
 	private:
 		bool BeginBlock();
 		bool EndBlockReturn(BlockExitKind exit);
+		bool EndBlockDirectTail(const void* direct_exit, size_t* direct_link_target_offset);
 		bool EmitInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op, u32 pc);
@@ -105,6 +122,7 @@ namespace VitaIOP
 
 		u32 Reset();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
+		void SetDirectLinkingEnabled(bool enabled);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result);
 
@@ -115,6 +133,10 @@ namespace VitaIOP
 		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 16 * 1024;
 		static constexpr size_t IOP_CODE_CACHE_CAPACITY = 512 * 1024;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
+		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 1;
+		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
+		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
+		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
 
 		struct CachedBlock
 		{
@@ -124,10 +146,51 @@ namespace VitaIOP
 			u32 instruction_count = 0;
 			u32 native_instruction_count = 0;
 			u32 helper_instruction_count = 0;
+			DirectLinkSlots direct_links{};
 			bool valid = false;
 		};
 
-		CachedBlock* FindCachedBlock(u32 start_pc, u32 instruction_count);
+		struct LookupPage
+		{
+			std::array<CachedBlock*, LOOKUP_PAGE_ENTRY_COUNT> blocks{};
+		};
+
+		struct IncomingLinkRecord
+		{
+			CachedBlock* source = nullptr;
+			u32 target_pc = 0;
+			u8 slot_index = 0;
+		};
+
+		struct BlockRecord
+		{
+			CachedBlock* block = nullptr;
+			const void* entry_point = nullptr;
+			u32 start_pc = 0;
+			u32 instruction_count = 0;
+			size_t code_size = 0;
+		};
+
+		static u32 LookupPageIndex(u32 start_pc);
+		static u32 LookupEntryIndex(u32 start_pc);
+		bool EnsureLookupDirectory();
+		LookupPage* GetLookupPage(u32 start_pc, bool allocate);
+		void RegisterBlockLookup(CachedBlock& block);
+		void UnregisterBlockLookup(CachedBlock& block);
+		void ReleaseLookupPages();
+		s32 LastBlockRecordIndex(u32 pc) const;
+		bool RegisterBlockRecord(CachedBlock& block);
+		void UnregisterBlockRecord(CachedBlock& block);
+		void ClearBlockRecords();
+		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc, u32 instruction_count, bool match_instruction_count);
+		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
+		void ClearIncomingLinks();
+		void RegisterIncomingLinks(CachedBlock& block);
+		void UnregisterIncomingLinks(CachedBlock& block);
+		void ValidateCachedBlocks();
+		CachedBlock* FindLookupBlockByStartPc(u32 start_pc);
+		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit);
+		CachedBlock* FindCachedBlockByStartPc(u32 start_pc);
 		CachedBlock* AllocateCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
 		bool ValidateCachedBlock(CachedBlock& block);
@@ -138,11 +201,19 @@ namespace VitaIOP
 		u32 ResetForCachePressure();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count);
 		bool RunCachedBlock(CachedBlock& block, BlockExecutionResult* result);
+		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
+		void PatchIncomingLinks(u32 target_pc, const void* target);
+		void UnlinkIncomingLinks(u32 target_pc);
+		void RelinkDirectLinks();
 
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
+		std::vector<BlockRecord> m_block_records;
+		std::vector<IncomingLinkRecord> m_incoming_links;
+		LookupPage** m_lookup_pages = nullptr;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
+		bool m_direct_linking_enabled = true;
 	};
 } // namespace VitaIOP

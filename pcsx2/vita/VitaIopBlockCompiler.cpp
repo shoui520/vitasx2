@@ -314,6 +314,11 @@ namespace
 	static_assert(Cp2dOffset(31) + sizeof(u32) <= 4095);
 	static_assert(Cp2cOffset(31) + sizeof(u32) <= 4095);
 
+	extern "C" __attribute__((noinline)) u32 VitaIopA32DirectExit()
+	{
+		return static_cast<u32>(VitaIOP::BlockExitKind::Direct);
+	}
+
 	extern "C" __attribute__((noinline)) bool VitaIopA32TraceInstruction(u32 pc, u32 opcode)
 	{
 		// PCSX2 owner: R3000AInterpreter.cpp::execI() stores psxRegs.code,
@@ -422,6 +427,26 @@ namespace VitaIOP
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
 			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+	}
+
+	bool BlockCompiler::EndBlockDirectTail(const void* direct_exit, size_t* direct_link_target_offset)
+	{
+		if (!direct_exit)
+			return false;
+
+		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
+			return false;
+
+		const size_t target_offset = m_code.Size();
+		if (!m_code.EmitMovImm32(HOST_CALL_SCRATCH, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+			!m_code.EmitBx(HOST_CALL_SCRATCH))
+		{
+			return false;
+		}
+
+		if (direct_link_target_offset)
+			*direct_link_target_offset = target_offset;
+		return true;
 	}
 
 	bool BlockCompiler::EmitStoreCode(u32 op)
@@ -1368,7 +1393,8 @@ namespace VitaIOP
 		return true;
 	}
 
-	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count)
+	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count,
+		const void* direct_exit, DirectLinkSlots* direct_links)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -1377,6 +1403,9 @@ namespace VitaIOP
 			return false;
 		}
 
+		if (direct_links)
+			*direct_links = {};
+
 		if (!BeginBlock())
 			return false;
 
@@ -1384,17 +1413,40 @@ namespace VitaIOP
 		direct_exit_branches.reserve(instruction_count * 2);
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
+		bool can_direct_link_fallthrough = true;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 pc = start_pc + i * 4;
 			const u32 op = iopMemRead32(pc);
+			if (IsIopBranchOrJumpOpcode(op) || IsIopExceptionOpcode(op))
+				can_direct_link_fallthrough = false;
 			if (!CanCompileOpcode(op) || !EmitInstruction(op, pc, direct_exit_branches))
 				return false;
 		}
 
-		const size_t direct_exit_offset = m_code.Size();
-		if (!EndBlockReturn(BlockExitKind::Direct))
-			return false;
+		const u32 next_pc = start_pc + instruction_count * 4;
+		size_t direct_exit_offset = 0;
+		const bool emit_link_tail = direct_exit && direct_links && can_direct_link_fallthrough;
+		if (emit_link_tail)
+		{
+			size_t target_offset = 0;
+			if (!EndBlockDirectTail(direct_exit, &target_offset))
+				return false;
+
+			direct_links->slots[0].target_pc = next_pc;
+			direct_links->slots[0].target_offset = target_offset;
+			direct_links->slots[0].valid = true;
+
+			direct_exit_offset = m_code.Size();
+			if (!EndBlockReturn(BlockExitKind::Direct))
+				return false;
+		}
+		else
+		{
+			direct_exit_offset = m_code.Size();
+			if (!EndBlockReturn(BlockExitKind::Direct))
+				return false;
+		}
 
 		for (const size_t branch_offset : direct_exit_branches)
 		{
@@ -1408,12 +1460,224 @@ namespace VitaIOP
 	BlockExecutor::BlockExecutor()
 	{
 		m_cache.reserve(INITIAL_CACHE_CAPACITY);
+		m_block_records.reserve(INITIAL_CACHE_CAPACITY);
+		m_incoming_links.reserve(INITIAL_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT);
 	}
 
 	BlockExecutor::~BlockExecutor()
 	{
 		Reset();
+		ReleaseLookupPages();
 		ReleaseCodeCache();
+	}
+
+	u32 BlockExecutor::LookupPageIndex(u32 start_pc)
+	{
+		return start_pc >> 16;
+	}
+
+	u32 BlockExecutor::LookupEntryIndex(u32 start_pc)
+	{
+		return (start_pc & 0xffffu) >> 2;
+	}
+
+	bool BlockExecutor::EnsureLookupDirectory()
+	{
+		if (m_lookup_pages)
+			return true;
+
+		m_lookup_pages = new (std::nothrow) LookupPage*[LOOKUP_DIRECTORY_ENTRY_COUNT] {};
+		return (m_lookup_pages != nullptr);
+	}
+
+	BlockExecutor::LookupPage* BlockExecutor::GetLookupPage(u32 start_pc, bool allocate)
+	{
+		if (!m_lookup_pages && (!allocate || !EnsureLookupDirectory()))
+			return nullptr;
+
+		const u32 page = LookupPageIndex(start_pc);
+		if (!m_lookup_pages[page] && allocate)
+			m_lookup_pages[page] = new (std::nothrow) LookupPage();
+
+		return m_lookup_pages[page];
+	}
+
+	void BlockExecutor::RegisterBlockLookup(CachedBlock& block)
+	{
+		if (!block.valid || (block.start_pc & 0x3u) != 0)
+			return;
+
+		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_()/recLUT_SetPage().
+		// Vita keeps the same 64 KiB guest-page lookup granularity, allocated
+		// lazily for the R3000A address space.
+		if (LookupPage* page = GetLookupPage(block.start_pc, true))
+			page->blocks[LookupEntryIndex(block.start_pc)] = &block;
+	}
+
+	void BlockExecutor::UnregisterBlockLookup(CachedBlock& block)
+	{
+		if ((block.start_pc & 0x3u) != 0)
+			return;
+
+		if (LookupPage* page = GetLookupPage(block.start_pc, false))
+		{
+			CachedBlock*& entry = page->blocks[LookupEntryIndex(block.start_pc)];
+			if (entry == &block)
+				entry = nullptr;
+		}
+	}
+
+	void BlockExecutor::ReleaseLookupPages()
+	{
+		if (!m_lookup_pages)
+			return;
+
+		for (u32 i = 0; i < LOOKUP_DIRECTORY_ENTRY_COUNT; i++)
+			delete m_lookup_pages[i];
+
+		delete[] m_lookup_pages;
+		m_lookup_pages = nullptr;
+	}
+
+	s32 BlockExecutor::LastBlockRecordIndex(u32 pc) const
+	{
+		if (m_block_records.empty())
+			return -1;
+
+		s32 min = 0;
+		s32 max = static_cast<s32>(m_block_records.size() - 1);
+		while (min != max)
+		{
+			const s32 mid = (min + max + 1) >> 1;
+			if (m_block_records[mid].start_pc > pc)
+				max = mid - 1;
+			else
+				min = mid;
+		}
+
+		return min;
+	}
+
+	bool BlockExecutor::RegisterBlockRecord(CachedBlock& block)
+	{
+		if (!block.valid)
+			return false;
+
+		UnregisterBlockRecord(block);
+		if (m_block_records.size() >= MAX_CACHE_CAPACITY)
+			return false;
+
+		// PCSX2 owner: x86/BaseblockEx.h::BaseBlockArray::insert().
+		// Sorted records let invalidation find overlapped R3000A blocks without
+		// depending on cache-vector storage order.
+		u32 insert_index = 0;
+		while (insert_index < m_block_records.size() &&
+			   m_block_records[insert_index].start_pc <= block.start_pc)
+		{
+			insert_index++;
+		}
+
+		m_block_records.insert(m_block_records.begin() + insert_index, {
+			&block,
+			block.code.EntryPoint(),
+			block.start_pc,
+			block.instruction_count,
+			block.code.Size(),
+		});
+		return true;
+	}
+
+	void BlockExecutor::UnregisterBlockRecord(CachedBlock& block)
+	{
+		u32 write_index = 0;
+		for (u32 read_index = 0; read_index < m_block_records.size(); read_index++)
+		{
+			if (m_block_records[read_index].block == &block)
+				continue;
+
+			if (write_index != read_index)
+				m_block_records[write_index] = m_block_records[read_index];
+			write_index++;
+		}
+
+		m_block_records.resize(write_index);
+	}
+
+	void BlockExecutor::ClearBlockRecords()
+	{
+		m_block_records.clear();
+	}
+
+	BlockExecutor::CachedBlock* BlockExecutor::FindRecordedBlockByStartPc(
+		u32 start_pc, u32 instruction_count, bool match_instruction_count)
+	{
+		s32 index = LastBlockRecordIndex(start_pc);
+		while (index >= 0 && m_block_records[index].start_pc == start_pc)
+		{
+			CachedBlock* block = m_block_records[index].block;
+			if (block && block->valid &&
+				(!match_instruction_count || block->instruction_count == instruction_count))
+			{
+				if (ValidateCachedBlock(*block))
+					return block;
+
+				break;
+			}
+
+			index--;
+		}
+
+		return nullptr;
+	}
+
+	DirectLinkSlot* BlockExecutor::GetRecordedDirectLink(IncomingLinkRecord& record)
+	{
+		if (!record.source || !record.source->valid || record.slot_index >= DIRECT_LINK_SLOT_COUNT)
+			return nullptr;
+
+		DirectLinkSlot& link = record.source->direct_links.slots[record.slot_index];
+		if (!link.valid || link.target_pc != record.target_pc)
+			return nullptr;
+
+		return &link;
+	}
+
+	void BlockExecutor::ClearIncomingLinks()
+	{
+		m_incoming_links.clear();
+	}
+
+	void BlockExecutor::RegisterIncomingLinks(CachedBlock& block)
+	{
+		UnregisterIncomingLinks(block);
+
+		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Link(). Keep target-PC
+		// -> source patch-site records so invalidating a block only repairs its
+		// incoming edges.
+		for (u8 i = 0; i < DIRECT_LINK_SLOT_COUNT; i++)
+		{
+			const DirectLinkSlot& link = block.direct_links.slots[i];
+			if (!link.valid || m_incoming_links.size() >= MAX_INCOMING_LINKS)
+				continue;
+
+			m_incoming_links.push_back({&block, link.target_pc, i});
+		}
+	}
+
+	void BlockExecutor::UnregisterIncomingLinks(CachedBlock& block)
+	{
+		u32 write_index = 0;
+		for (u32 read_index = 0; read_index < m_incoming_links.size(); read_index++)
+		{
+			if (m_incoming_links[read_index].source == &block)
+				continue;
+
+			if (write_index != read_index)
+				m_incoming_links[write_index] = m_incoming_links[read_index];
+			write_index++;
+		}
+
+		m_incoming_links.resize(write_index);
 	}
 
 	u32 BlockExecutor::Reset()
@@ -1425,9 +1689,13 @@ namespace VitaIOP
 				invalidated++;
 
 			entry->valid = false;
+			entry->direct_links = {};
 			entry->code.Release();
 		}
 
+		ClearBlockRecords();
+		ClearIncomingLinks();
+		ReleaseLookupPages();
 		const u32 previous_resets = m_code_cache_resets;
 		ReleaseCodeCache();
 		m_code_cache_resets = previous_resets;
@@ -1439,7 +1707,12 @@ namespace VitaIOP
 		if (!block.valid)
 			return;
 
+		UnlinkIncomingLinks(block.start_pc);
+		UnregisterIncomingLinks(block);
+		UnregisterBlockLookup(block);
+		UnregisterBlockRecord(block);
 		block.valid = false;
+		block.direct_links = {};
 		block.code.Release();
 	}
 
@@ -1450,21 +1723,45 @@ namespace VitaIOP
 
 		const u32 end_pc = start_pc + instruction_count * 4;
 		u32 invalidated = 0;
-		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
+		for (u32 i = 0; i < m_block_records.size();)
 		{
-			CachedBlock& block = *entry;
-			if (!block.valid)
-				continue;
-
-			const u32 block_end = block.start_pc + block.instruction_count * 4;
-			if (start_pc < block_end && block.start_pc < end_pc)
+			CachedBlock* block = m_block_records[i].block;
+			if (!block || !block->valid)
 			{
-				InvalidateCachedBlock(block);
-				invalidated++;
+				if (block)
+					UnregisterBlockRecord(*block);
+				else
+					i++;
+				continue;
 			}
+
+			if (block->start_pc >= end_pc)
+				break;
+
+			const u32 block_end = block->start_pc + block->instruction_count * 4;
+			if (start_pc < block_end)
+			{
+				InvalidateCachedBlock(*block);
+				invalidated++;
+				continue;
+			}
+
+			i++;
 		}
 
 		return invalidated;
+	}
+
+	void BlockExecutor::SetDirectLinkingEnabled(bool enabled)
+	{
+		if (m_direct_linking_enabled == enabled)
+			return;
+
+		m_direct_linking_enabled = enabled;
+		if (enabled)
+			RelinkDirectLinks();
+		else
+			UnlinkIncomingLinks(UINT32_MAX);
 	}
 
 	bool BlockExecutor::ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result)
@@ -1540,19 +1837,63 @@ namespace VitaIOP
 		return false;
 	}
 
-	BlockExecutor::CachedBlock* BlockExecutor::FindCachedBlock(u32 start_pc, u32 instruction_count)
+	void BlockExecutor::ValidateCachedBlocks()
 	{
-		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
+		for (const std::unique_ptr<CachedBlock>& block : m_cache)
+			ValidateCachedBlock(*block);
+	}
+
+	BlockExecutor::CachedBlock* BlockExecutor::FindLookupBlockByStartPc(u32 start_pc)
+	{
+		if ((start_pc & 0x3u) != 0)
+			return nullptr;
+
+		LookupPage* page = GetLookupPage(start_pc, false);
+		return page ? page->blocks[LookupEntryIndex(start_pc)] : nullptr;
+	}
+
+	bool BlockExecutor::FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit)
+	{
+		if (!block || instruction_count == 0 ||
+			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
+			instruction_count > ((UINT32_MAX - start_pc) / 4))
 		{
-			CachedBlock& block = *entry;
-			if (block.valid && block.start_pc == start_pc && block.instruction_count == instruction_count &&
-				ValidateCachedBlock(block))
+			return false;
+		}
+
+		*block = nullptr;
+		if (lookup_hit)
+			*lookup_hit = false;
+
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		{
+			if (entry->valid && entry->instruction_count == instruction_count && ValidateCachedBlock(*entry))
 			{
-				return &block;
+				*block = entry;
+				if (lookup_hit)
+					*lookup_hit = true;
+				return true;
 			}
 		}
 
-		return nullptr;
+		if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, instruction_count, true))
+		{
+			*block = entry;
+			return true;
+		}
+
+		return false;
+	}
+
+	BlockExecutor::CachedBlock* BlockExecutor::FindCachedBlockByStartPc(u32 start_pc)
+	{
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		{
+			if (entry->valid && ValidateCachedBlock(*entry))
+				return entry;
+		}
+
+		return FindRecordedBlockByStartPc(start_pc, 0, false);
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::AllocateCacheEntry()
@@ -1650,9 +1991,19 @@ namespace VitaIOP
 
 		InvalidateCachedBlock(block);
 		for (u32 i = 0; i < instruction_count; i++)
-			block.opcodes[i] = iopMemRead32(start_pc + i * 4);
+		{
+			const u32 op = iopMemRead32(start_pc + i * 4);
+			if (!BlockCompiler::CanCompileOpcode(op))
+				return false;
+
+			block.opcodes[i] = op;
+		}
 
 		size_t block_code_capacity = STRAIGHT_LINE_BLOCK_CODE_CAPACITY;
+		size_t block_code_slice_offset = 0;
+		u32 native_instruction_count = 0;
+		u32 helper_instruction_count = 0;
+		DirectLinkSlots direct_links;
 		for (;;)
 		{
 			size_t code_slice_offset = 0;
@@ -1672,16 +2023,17 @@ namespace VitaIOP
 			}
 
 			BlockCompiler compiler(block.code);
-			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count);
+			DirectLinkSlots attempt_direct_links;
+			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
+				reinterpret_cast<const void*>(&VitaIopA32DirectExit), &attempt_direct_links);
 			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
 			if (compiled && block.code.Flush())
 			{
-				block.start_pc = start_pc;
-				block.instruction_count = instruction_count;
-				block.native_instruction_count = compiler.NativeInstructionCount();
-				block.helper_instruction_count = compiler.HelperInstructionCount();
-				block.valid = true;
-				return true;
+				block_code_slice_offset = code_slice_offset;
+				native_instruction_count = compiler.NativeInstructionCount();
+				helper_instruction_count = compiler.HelperInstructionCount();
+				direct_links = attempt_direct_links;
+				break;
 			}
 
 			block.code.Release();
@@ -1691,11 +2043,101 @@ namespace VitaIOP
 
 			block_code_capacity *= 2;
 		}
+
+		block.start_pc = start_pc;
+		block.instruction_count = instruction_count;
+		block.native_instruction_count = native_instruction_count;
+		block.helper_instruction_count = helper_instruction_count;
+		block.direct_links = direct_links;
+		block.valid = true;
+		if (!RegisterBlockRecord(block))
+		{
+			block.valid = false;
+			block.direct_links = {};
+			block.code.Release();
+			RewindCodeCache(block_code_slice_offset);
+			return false;
+		}
+		RegisterBlockLookup(block);
+		RegisterIncomingLinks(block);
+
+		if (m_direct_linking_enabled)
+		{
+			PatchIncomingLinks(block.start_pc, block.code.EntryPoint());
+			for (DirectLinkSlot& link : block.direct_links.slots)
+			{
+				if (link.valid)
+				{
+					if (CachedBlock* target = FindCachedBlockByStartPc(link.target_pc))
+						PatchDirectLink(block, link, target->code.EntryPoint());
+				}
+			}
+		}
+
+		return true;
+	}
+
+	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target)
+	{
+		if (!target || !block.valid || !link.valid)
+			return false;
+
+		return block.code.PatchMovImm32(link.target_offset, HOST_CALL_SCRATCH,
+				   static_cast<u32>(reinterpret_cast<uptr>(target))) &&
+			   block.code.Flush();
+	}
+
+	void BlockExecutor::PatchIncomingLinks(u32 target_pc, const void* target)
+	{
+		if (!m_direct_linking_enabled || !target)
+			return;
+
+		for (u32 i = 0; i < m_incoming_links.size(); i++)
+		{
+			IncomingLinkRecord& record = m_incoming_links[i];
+			if (record.target_pc != target_pc)
+				continue;
+
+			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
+				PatchDirectLink(*record.source, *link, target);
+		}
+	}
+
+	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc)
+	{
+		for (u32 i = 0; i < m_incoming_links.size(); i++)
+		{
+			IncomingLinkRecord& record = m_incoming_links[i];
+			if (target_pc != UINT32_MAX && record.target_pc != target_pc)
+				continue;
+
+			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
+				PatchDirectLink(*record.source, *link, reinterpret_cast<const void*>(&VitaIopA32DirectExit));
+		}
+	}
+
+	void BlockExecutor::RelinkDirectLinks()
+	{
+		for (u32 i = 0; i < m_incoming_links.size(); i++)
+		{
+			IncomingLinkRecord& record = m_incoming_links[i];
+			DirectLinkSlot* link = GetRecordedDirectLink(record);
+			if (!link)
+				continue;
+
+			const CachedBlock* target = FindCachedBlockByStartPc(record.target_pc);
+			PatchDirectLink(*record.source, *link, target ? target->code.EntryPoint() :
+															reinterpret_cast<const void*>(&VitaIopA32DirectExit));
+		}
 	}
 
 	bool BlockExecutor::RunCachedBlock(CachedBlock& block, BlockExecutionResult* result)
 	{
-		if (!result || !ValidateCachedBlock(block))
+		if (!result || !block.valid)
+			return false;
+
+		ValidateCachedBlocks();
+		if (!block.valid)
 			return false;
 
 		psxRegs.pc = block.start_pc;
@@ -1710,6 +2152,8 @@ namespace VitaIOP
 		result->native_instruction_count = block.native_instruction_count;
 		result->helper_instruction_count = block.helper_instruction_count;
 		result->code_size = block.code.Size();
+		result->block_records = static_cast<u32>(m_block_records.size());
+		result->link_records = static_cast<u32>(m_incoming_links.size());
 		result->cache_slots = static_cast<u32>(m_cache.size());
 		result->code_cache_resets = m_code_cache_resets;
 		result->code_cache_used = m_code_cache_used;
@@ -1727,17 +2171,21 @@ namespace VitaIOP
 		}
 
 		*result = {};
-		if (CachedBlock* block = FindCachedBlock(start_pc, instruction_count))
+		CachedBlock* block = nullptr;
+		bool lookup_hit = false;
+		if (FindCachedBlock(start_pc, instruction_count, &block, &lookup_hit))
 		{
 			result->cache_hit = true;
+			result->lookup_hit = lookup_hit;
 			return RunCachedBlock(*block, result);
 		}
 
-		CachedBlock* block = AllocateCacheEntry();
+		block = AllocateCacheEntry();
 		if (!block || !CompileIntoCacheEntry(*block, start_pc, instruction_count))
 			return false;
 
 		result->cache_hit = false;
+		result->lookup_hit = false;
 		return RunCachedBlock(*block, result);
 	}
 } // namespace VitaIOP
