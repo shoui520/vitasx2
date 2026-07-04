@@ -381,6 +381,9 @@ _vifT int nVifUnpack(const u8* data)
 			trace_tag_size, trace_packet_size, trace_cl, trace_wl, data,
 			static_cast<u32>(size), vuRegs[idx].Mem, idx ? VU1_MEMSIZE : VU0_MEMSIZE);
 
+		// PCSX2's generated unpack path leaves completed-UNPACK tag state clear;
+		// keep Vita's scalar path diagnostic state aligned with that oracle.
+		vif.tag.addr = 0;
 		vif.pass     = 0;
 		vif.tag.size = 0;
 		vif.cmd      = 0;
