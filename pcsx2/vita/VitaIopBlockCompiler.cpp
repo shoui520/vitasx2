@@ -14,6 +14,11 @@
 #include <algorithm>
 #include <new>
 
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuIopDivSignedHelperCalls = 0;
+u32 g_qemuIopDivUnsignedHelperCalls = 0;
+#endif
+
 namespace
 {
 	using GeneratedBlock = u32 (*)();
@@ -382,6 +387,9 @@ namespace
 	extern "C" __attribute__((noinline)) u64 VitaIopA32DivResult(u32 rs_value, u32 rt_value)
 	{
 		// PCSX2 owner: R3000AOpcodeTables.cpp::psxDIV().
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIopDivSignedHelperCalls;
+#endif
 		u32 lo = 0;
 		u32 hi = 0;
 		if (rt_value == 0)
@@ -406,6 +414,9 @@ namespace
 	extern "C" __attribute__((noinline)) u64 VitaIopA32DivuResult(u32 rs_value, u32 rt_value)
 	{
 		// PCSX2 owner: R3000AOpcodeTables.cpp::psxDIVU().
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIopDivUnsignedHelperCalls;
+#endif
 		u32 lo = 0;
 		u32 hi = 0;
 		if (rt_value == 0)
@@ -738,15 +749,204 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitDivideOp(u32 op, bool is_signed)
 	{
+		struct BranchPatch
+		{
+			size_t offset = static_cast<size_t>(-1);
+			VitaA32::Condition condition = VitaA32::Condition::AL;
+		};
+
+		const auto emit_branch = [this](BranchPatch& patch, VitaA32::Condition condition) {
+			patch.offset = m_code.EmitBranchPlaceholder(condition);
+			patch.condition = condition;
+			return patch.offset != static_cast<size_t>(-1);
+		};
+
+		const auto patch_branch = [this](const BranchPatch& patch, size_t target) {
+			return m_code.PatchBranch(patch.offset, target, patch.condition);
+		};
+
+		const auto patch_branches = [patch_branch](const BranchPatch* branches, unsigned count, size_t target) {
+			for (unsigned i = 0; i < count; i++)
+			{
+				if (!patch_branch(branches[i], target))
+					return false;
+			}
+			return true;
+		};
+
+		const auto store_hilo = [this](unsigned lo_reg, unsigned hi_reg) {
+			return m_code.EmitStrImm12(lo_reg, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
+				   m_code.EmitStrImm12(hi_reg, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+		};
+
 		const void* helper = is_signed ?
 			reinterpret_cast<const void*>(&VitaIopA32DivResult) :
 			reinterpret_cast<const void*>(&VitaIopA32DivuResult);
 
-		return EmitLoadGpr(RS(op), HOST_TMP0) &&
-			   EmitLoadGpr(RT(op), HOST_TMP1) &&
-			   m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH) &&
-			   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
-			   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
+			!EmitLoadGpr(RT(op), HOST_TMP1))
+		{
+			return false;
+		}
+
+		BranchPatch divzero_branch{};
+		BranchPatch zero_branch{};
+		BranchPatch divone_branch{};
+		BranchPatch negone_branch{};
+		BranchPatch equal_branch{};
+		BranchPatch unsigned_less_branch{};
+		BranchPatch non_positive_fallback_branch{};
+		BranchPatch power_of_two_branch{};
+		BranchPatch fallback_branch{};
+		BranchPatch done_branches[7]{};
+		unsigned done_branch_count = 0;
+
+		if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+			!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
+			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+			!emit_branch(zero_branch, VitaA32::Condition::EQ) ||
+			!m_code.EmitMovImm8(HOST_TMP3, 1) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+			!emit_branch(divone_branch, VitaA32::Condition::EQ))
+		{
+			return false;
+		}
+
+		if (is_signed)
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP3, 0xffffffffu) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!emit_branch(negone_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) ||
+				!emit_branch(equal_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!emit_branch(non_positive_fallback_branch, VitaA32::Condition::LE) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
+				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP1, HOST_TMP2, true) ||
+				!emit_branch(power_of_two_branch, VitaA32::Condition::EQ))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			if (!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) ||
+				!emit_branch(unsigned_less_branch, VitaA32::Condition::CC) ||
+				!emit_branch(equal_branch, VitaA32::Condition::EQ) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
+				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP1, HOST_TMP2, true) ||
+				!emit_branch(power_of_two_branch, VitaA32::Condition::EQ))
+			{
+				return false;
+			}
+		}
+
+		if (!emit_branch(fallback_branch, VitaA32::Condition::AL))
+			return false;
+
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxDIV()/psxDIVU().
+		if (!patch_branch(divzero_branch, m_code.Size()) ||
+			!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu))
+		{
+			return false;
+		}
+
+		if (is_signed &&
+			(!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT)))
+		{
+			return false;
+		}
+
+		if (!store_hilo(HOST_TMP2, HOST_TMP0) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (!patch_branch(zero_branch, m_code.Size()) ||
+			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+			!store_hilo(HOST_TMP2, HOST_TMP2) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (!patch_branch(divone_branch, m_code.Size()) ||
+			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+			!store_hilo(HOST_TMP0, HOST_TMP2) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (is_signed)
+		{
+			if (!patch_branch(negone_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP3, HOST_TMP0) ||
+				!store_hilo(HOST_TMP2, HOST_TMP3) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
+				!patch_branch(equal_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 1) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!store_hilo(HOST_TMP2, HOST_TMP3) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
+				!patch_branch(power_of_two_branch, m_code.Size()) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP0, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP3, HOST_TMP2) ||
+				!m_code.EmitAddReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitClz(HOST_SAVED0, HOST_TMP1) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 31) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_SAVED0) ||
+				!m_code.EmitMovRegShiftReg(HOST_SAVED0, HOST_TMP3, VitaA32::ShiftType::ASR, HOST_TMP2) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_SAVED0, VitaA32::ShiftType::LSL, HOST_TMP2) ||
+				!m_code.EmitSubReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) ||
+				!store_hilo(HOST_SAVED0, HOST_TMP3) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			if (!patch_branch(unsigned_less_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!store_hilo(HOST_TMP2, HOST_TMP0) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
+				!patch_branch(equal_branch, m_code.Size()) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 1) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!store_hilo(HOST_TMP2, HOST_TMP3) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
+				!patch_branch(power_of_two_branch, m_code.Size()) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
+				!m_code.EmitClz(HOST_TMP2, HOST_TMP1) ||
+				!m_code.EmitMovImm8(HOST_SAVED0, 31) ||
+				!m_code.EmitSubReg(HOST_SAVED0, HOST_SAVED0, HOST_TMP2) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR, HOST_SAVED0) ||
+				!store_hilo(HOST_TMP2, HOST_TMP3) ||
+				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+			{
+				return false;
+			}
+		}
+
+		const size_t fallback_target = m_code.Size();
+		if (!patch_branch(fallback_branch, fallback_target) ||
+			(is_signed && !patch_branch(non_positive_fallback_branch, fallback_target)) ||
+			!m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH) ||
+			!store_hilo(HOST_TMP0, HOST_TMP1))
+		{
+			return false;
+		}
+
+		return patch_branches(done_branches, done_branch_count, m_code.Size());
 	}
 
 	bool BlockCompiler::EmitExceptionOp(u32 pc, u32 code)
