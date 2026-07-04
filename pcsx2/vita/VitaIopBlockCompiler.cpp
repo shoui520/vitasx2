@@ -1674,10 +1674,70 @@ namespace VitaIOP
 
 		if ((op >> 26) == 0x3a) // SWC2
 		{
-			return EmitReadCop2DataReg(RT(op), HOST_SAVED0) &&
-				   EmitEffectiveAddress(op) &&
+			const auto emit_clear_stored_word = [&]() -> bool {
+				return m_code.EmitMovImm32(HOST_TMP2, ~3u) &&
+					   m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_TMP2) &&
+					   m_code.EmitMovImm8(HOST_TMP1, 1) &&
+					   m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+						   static_cast<u32>(reinterpret_cast<uptr>(&psxCpu))) &&
+					   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 0) &&
+					   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
+						   static_cast<u16>(offsetof(R3000Acpu, Clear))) &&
+					   m_code.EmitBlx(HOST_CALL_SCRATCH);
+			};
+
+			if (!EmitReadCop2DataReg(RT(op), HOST_SAVED0) ||
+				!EmitEffectiveAddress(op) ||
+				!m_code.EmitMovRegShiftImm(HOST_SAVED1, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+				!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
+				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+			{
+				return false;
+			}
+
+			// PCSX2 owner: IopGte.cpp::gteSWC2() writes MFC2(_Rt_) through
+			// iopMemWrite32(). Ordinary writable RAM can store directly, but
+			// must retain iopMemWrite32()'s isolate-cache and invalidation rules.
+			const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (fallback_branch == static_cast<size_t>(-1) ||
+				!m_code.EmitAndImm8(HOST_TMP2, HOST_SAVED1, 3, true))
+			{
+				return false;
+			}
+
+			const size_t alignment_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (alignment_fallback_branch == static_cast<size_t>(-1) ||
+				!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
+				!m_code.EmitMovImm32(HOST_TMP3, 0x10000u) ||
+				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP2, HOST_TMP3, true))
+			{
+				return false;
+			}
+
+			const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (isolated_fallback_branch == static_cast<size_t>(-1) ||
+				!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
+				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_TMP2) ||
+				!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
+				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP3, HOST_TMP0) ||
+				!m_code.EmitStrImm12(HOST_SAVED0, HOST_TMP0, 0) ||
+				!emit_clear_stored_word())
+			{
+				return false;
+			}
+
+			const size_t done_branch = m_code.EmitBranchPlaceholder();
+			if (done_branch == static_cast<size_t>(-1))
+				return false;
+
+			const size_t fallback_target = m_code.Size();
+			return m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE) &&
+				   m_code.PatchBranch(alignment_fallback_branch, fallback_target, VitaA32::Condition::NE) &&
+				   m_code.PatchBranch(isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) &&
-				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH);
+				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH) &&
+				   m_code.PatchBranch(done_branch, m_code.Size());
 		}
 
 		return false;
