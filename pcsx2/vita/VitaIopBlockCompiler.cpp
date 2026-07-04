@@ -4,6 +4,7 @@
 #include "pcsx2/vita/VitaIopBlockCompiler.h"
 
 #include "common/Vita/VitaJitMemory.h"
+#include "pcsx2/IopDma.h"
 #include "pcsx2/IopGte.h"
 #include "pcsx2/IopHw.h"
 #include "pcsx2/IopMem.h"
@@ -1825,7 +1826,8 @@ namespace VitaIOP
 			   m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
 			   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, 2) &&
 			   m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP0) &&
-			   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET));
+			   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopTestIntc), HOST_CALL_SCRATCH);
 	}
 
 	bool BlockCompiler::EmitCop2CommandOp(u32 op)
