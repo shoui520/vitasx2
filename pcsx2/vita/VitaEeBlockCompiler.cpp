@@ -2394,7 +2394,7 @@ namespace VitaEE
 				return false;
 
 			const size_t fallthrough_target_offset = m_code.Size();
-			if (!m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+			if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
 				!m_code.EmitBx(HOST_TMP4))
 			{
 				return false;
@@ -2408,7 +2408,7 @@ namespace VitaEE
 			}
 
 			const size_t taken_target_offset = m_code.Size();
-			if (!m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+			if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
 				!m_code.EmitBx(HOST_TMP4) ||
 				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
 			{
@@ -2425,7 +2425,7 @@ namespace VitaEE
 			return false;
 
 		const size_t target_offset = m_code.Size();
-		if (!m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+		if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
 			!m_code.EmitBx(HOST_TMP4) ||
 			!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
 		{
@@ -2530,7 +2530,7 @@ namespace VitaEE
 				return false;
 
 			const size_t not_taken_target_offset = m_code.Size();
-			if (!m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+			if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
 				!m_code.EmitBx(HOST_TMP4))
 			{
 				return false;
@@ -2544,7 +2544,7 @@ namespace VitaEE
 			}
 
 			const size_t taken_target_offset = m_code.Size();
-			if (!m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+			if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
 				!m_code.EmitBx(HOST_TMP4) ||
 				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
 			{

@@ -136,6 +136,34 @@ namespace VitaA32
 			return static_cast<u32>(condition) << 28;
 		}
 
+		u32 RotateRight(u32 value, unsigned amount)
+		{
+			amount &= 31u;
+			return amount == 0 ? value : ((value >> amount) | (value << (32u - amount)));
+		}
+
+		u32 RotateLeft(u32 value, unsigned amount)
+		{
+			amount &= 31u;
+			return amount == 0 ? value : ((value << amount) | (value >> (32u - amount)));
+		}
+
+		bool EncodeModifiedImmediate(u32 value, u32* encoded)
+		{
+			for (unsigned rotate = 0; rotate < 16; rotate++)
+			{
+				const unsigned amount = rotate * 2;
+				const u32 imm8 = RotateLeft(value, amount);
+				if ((imm8 & ~0xffu) == 0 && RotateRight(imm8, amount) == value)
+				{
+					*encoded = (rotate << 8) | imm8;
+					return true;
+				}
+			}
+
+			return false;
+		}
+
 		u32 NeonQd(unsigned qreg)
 		{
 			const unsigned dreg = qreg * 2;
@@ -288,6 +316,26 @@ namespace VitaA32
 	}
 
 	bool CodeBuffer::EmitMovImm32(unsigned rd, u32 value)
+	{
+		if (!IsRegister(rd))
+			return false;
+
+		u32 encoded = 0;
+		if (EncodeModifiedImmediate(value, &encoded))
+			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_MOV |
+						   ((rd & 0xfu) << 12) | encoded);
+
+		if (EncodeModifiedImmediate(~value, &encoded))
+			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_MVN |
+						   ((rd & 0xfu) << 12) | encoded);
+
+		if ((value >> 16) == 0)
+			return EmitU32(EncodeMovw(rd, static_cast<u16>(value)));
+
+		return EmitMovImm32Patchable(rd, value);
+	}
+
+	bool CodeBuffer::EmitMovImm32Patchable(unsigned rd, u32 value)
 	{
 		if (!IsRegister(rd))
 			return false;

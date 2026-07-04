@@ -488,7 +488,7 @@ namespace VitaIOP
 			return false;
 
 		const size_t target_offset = m_code.Size();
-		if (!m_code.EmitMovImm32(HOST_CALL_SCRATCH, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+		if (!m_code.EmitMovImm32Patchable(HOST_CALL_SCRATCH, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
 			!m_code.EmitBx(HOST_CALL_SCRATCH))
 		{
 			return false;
