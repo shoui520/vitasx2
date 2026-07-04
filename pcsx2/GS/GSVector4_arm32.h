@@ -352,12 +352,11 @@ public:
 
 	__forceinline GSVector4 sat(const GSVector4& a) const
 	{
-		GSVector4 minv;
-		GSVector4 maxv;
-		minv.U64[0] = a.U64[0];
-		minv.U64[1] = a.U64[0];
-		maxv.U64[0] = a.U64[1];
-		maxv.U64[1] = a.U64[1];
+		const uint64x2_t limits = vreinterpretq_u64_f32(a.v4s);
+		const uint64x1_t min_lane = vget_low_u64(limits);
+		const uint64x1_t max_lane = vget_high_u64(limits);
+		const GSVector4 minv(vreinterpretq_f32_u64(vcombine_u64(min_lane, min_lane)));
+		const GSVector4 maxv(vreinterpretq_f32_u64(vcombine_u64(max_lane, max_lane)));
 		return sat(minv, maxv);
 	}
 
@@ -406,18 +405,12 @@ public:
 
 	__forceinline GSVector4 upld(const GSVector4& a) const
 	{
-		GSVector4 ret;
-		ret.U64[0] = U64[0];
-		ret.U64[1] = a.U64[0];
-		return ret;
+		return GSVector4(vcombine_f32(vget_low_f32(v4s), vget_low_f32(a.v4s)));
 	}
 
 	__forceinline GSVector4 uphd(const GSVector4& a) const
 	{
-		GSVector4 ret;
-		ret.U64[0] = U64[1];
-		ret.U64[1] = a.U64[1];
-		return ret;
+		return GSVector4(vcombine_f32(vget_high_f32(v4s), vget_high_f32(a.v4s)));
 	}
 
 	__forceinline GSVector4 l2h(const GSVector4& a) const
@@ -460,9 +453,7 @@ public:
 	template <int src, int dst>
 	__forceinline GSVector4 insert32(const GSVector4& v) const
 	{
-		GSVector4 ret(*this);
-		ret.F32[dst] = v.F32[src];
-		return ret;
+		return GSVector4(vsetq_lane_f32(vgetq_lane_f32(v.v4s, src), v4s, dst));
 	}
 
 	template <int i>
@@ -521,12 +512,12 @@ public:
 
 	__forceinline static void storel(void* p, const GSVector4& v)
 	{
-		std::memcpy(p, &v.U64[0], sizeof(v.U64[0]));
+		vst1_u64(static_cast<u64*>(p), vget_low_u64(vreinterpretq_u64_f32(v.v4s)));
 	}
 
 	__forceinline static void storeh(void* p, const GSVector4& v)
 	{
-		std::memcpy(p, &v.U64[1], sizeof(v.U64[1]));
+		vst1_u64(static_cast<u64*>(p), vget_high_u64(vreinterpretq_u64_f32(v.v4s)));
 	}
 
 	template <bool aligned>
@@ -782,12 +773,12 @@ public:
 
 	__forceinline GSVector4 broadcast32() const
 	{
-		return GSVector4(vdupq_n_f32(F32[0]));
+		return GSVector4(vdupq_n_f32(vgetq_lane_f32(v4s, 0)));
 	}
 
 	__forceinline static GSVector4 broadcast32(const GSVector4& v)
 	{
-		return GSVector4(vdupq_n_f32(v.F32[0]));
+		return GSVector4(vdupq_n_f32(vgetq_lane_f32(v.v4s, 0)));
 	}
 
 	__forceinline static GSVector4 broadcast32(const void* f)
