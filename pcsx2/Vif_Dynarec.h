@@ -43,7 +43,7 @@ alignas(16) extern nVifStruct nVif[2];
 alignas(16) extern nVifCall nVifUpk[(2 * 2 * 16) * 4]; // ([USN][Masking][Unpack Type]) [curCycle]
 alignas(16) extern u32      nVifMask[3][4][4];         // [MaskNumber][CycleNumber][Vector]
 
-#if defined(ARCH_ARM32)
+#if defined(ARCH_ARM32) || defined(VITASX2_VITA)
 static constexpr bool newVifDynaRec = false;
 #else
 static constexpr bool newVifDynaRec = true; // Use code in Vif_Dynarec.inl
