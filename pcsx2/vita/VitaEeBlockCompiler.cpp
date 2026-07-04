@@ -297,6 +297,8 @@ namespace VitaEE
 				case 0x25: // OR, owned by R5900OpcodeImpl.cpp::OR().
 				case 0x26: // XOR, owned by R5900OpcodeImpl.cpp::XOR().
 				case 0x27: // NOR, owned by R5900OpcodeImpl.cpp::NOR().
+				case 0x28: // MFSA, owned by R5900OpcodeImpl.cpp::MFSA().
+				case 0x29: // MTSA, owned by R5900OpcodeImpl.cpp::MTSA().
 				case 0x2a: // SLT, owned by R5900OpcodeImpl.cpp::SLT().
 				case 0x2b: // SLTU, owned by R5900OpcodeImpl.cpp::SLTU().
 				case 0x2c: // DADD, owned by R5900OpcodeImpl.cpp::DADD().
@@ -2504,6 +2506,10 @@ namespace VitaEE
 				return EmitXOR(op);
 			case 0x27: // NOR, owned by R5900OpcodeImpl.cpp::NOR().
 				return EmitNOR(op);
+			case 0x28: // MFSA, owned by R5900OpcodeImpl.cpp::MFSA().
+				return EmitMFSA(op);
+			case 0x29: // MTSA, owned by R5900OpcodeImpl.cpp::MTSA().
+				return EmitMTSA(op);
 			case 0x2a: // SLT, owned by R5900OpcodeImpl.cpp::SLT().
 				return EmitSLT(op);
 			case 0x2b: // SLTU, owned by R5900OpcodeImpl.cpp::SLTU().
@@ -5427,6 +5433,25 @@ namespace VitaEE
 	{
 		// PCSX2 owner: R5900OpcodeImpl.cpp::MTLO().
 		return EmitMoveToHiLo(op, LO_OFFSET);
+	}
+
+	bool BlockCompiler::EmitMFSA(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::MFSA().
+		const unsigned rd = RD(op);
+		if (rd == 0)
+			return true;
+
+		return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET)) &&
+			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitMTSA(u32 op)
+	{
+		// PCSX2 owner: R5900OpcodeImpl.cpp::MTSA().
+		return EmitLoadGprLow(RS(op), HOST_TMP0) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET));
 	}
 
 	bool BlockCompiler::EmitMoveFromHiLo(u32 op, size_t hilo_offset)

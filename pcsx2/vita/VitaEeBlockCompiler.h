@@ -224,6 +224,8 @@ namespace VitaEE
 		bool EmitMFLO(u32 op);
 		bool EmitMTHI(u32 op);
 		bool EmitMTLO(u32 op);
+		bool EmitMFSA(u32 op);
+		bool EmitMTSA(u32 op);
 		bool EmitPSLLH(u32 op);
 		bool EmitPSRLH(u32 op);
 		bool EmitPSRAH(u32 op);
