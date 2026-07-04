@@ -4952,12 +4952,7 @@ namespace VitaEE
 		if (!EmitLoadGprLow(rs, HOST_TMP0))
 			return false;
 
-		if (imm <= 255)
-		{
-			if (!m_code.EmitAndImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(imm)))
-				return false;
-		}
-		else
+		if (!m_code.EmitAndImm32(HOST_TMP0, HOST_TMP0, imm))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
 				!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
@@ -4982,12 +4977,7 @@ namespace VitaEE
 		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1))
 			return false;
 
-		if (imm <= 255)
-		{
-			if (!m_code.EmitOrrImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(imm)))
-				return false;
-		}
-		else
+		if (!m_code.EmitOrrImm32(HOST_TMP0, HOST_TMP0, imm))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
 				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
@@ -5011,12 +5001,7 @@ namespace VitaEE
 		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1))
 			return false;
 
-		if (imm <= 255)
-		{
-			if (!m_code.EmitEorImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(imm)))
-				return false;
-		}
-		else
+		if (!m_code.EmitEorImm32(HOST_TMP0, HOST_TMP0, imm))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
 				!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))

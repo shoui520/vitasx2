@@ -994,16 +994,19 @@ namespace VitaIOP
 					   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::CC) &&
 					   EmitStoreGpr(rt, HOST_TMP2);
 			case 0x0c: // ANDI
-				return m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&
-					   m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
+				return (m_code.EmitAndImm32(HOST_TMP2, HOST_TMP0, IMM_U(op)) ||
+						  (m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&
+						   m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP1))) &&
 					   EmitStoreGpr(rt, HOST_TMP2);
 			case 0x0d: // ORI
-				return m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&
-					   m_code.EmitOrrReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
+				return (m_code.EmitOrrImm32(HOST_TMP2, HOST_TMP0, IMM_U(op)) ||
+						  (m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&
+						   m_code.EmitOrrReg(HOST_TMP2, HOST_TMP0, HOST_TMP1))) &&
 					   EmitStoreGpr(rt, HOST_TMP2);
 			case 0x0e: // XORI
-				return m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&
-					   m_code.EmitEorReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
+				return (m_code.EmitEorImm32(HOST_TMP2, HOST_TMP0, IMM_U(op)) ||
+						  (m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&
+						   m_code.EmitEorReg(HOST_TMP2, HOST_TMP0, HOST_TMP1))) &&
 					   EmitStoreGpr(rt, HOST_TMP2);
 			default:
 				return false;
