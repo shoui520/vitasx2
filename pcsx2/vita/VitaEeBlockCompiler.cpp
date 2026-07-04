@@ -10061,9 +10061,7 @@ namespace VitaEE
 			return false;
 		}
 
-		if (!m_code.EmitMovImm8(HOST_TMP4, 3) ||
-			!m_code.EmitMvnReg(HOST_TMP4, HOST_TMP4) ||
-			!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP4) ||
+		if (!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 3) ||
 			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
 			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
 		{
@@ -10151,9 +10149,7 @@ namespace VitaEE
 			return false;
 		}
 
-		if (!m_code.EmitMovImm8(HOST_TMP4, 3) ||
-			!m_code.EmitMvnReg(HOST_TMP4, HOST_TMP4) ||
-			!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP4) ||
+		if (!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 3) ||
 			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP5, 0) ||
@@ -10200,9 +10196,7 @@ namespace VitaEE
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitAndImm8(HOST_TMP3, HOST_TMP0, 7) ||
-			!m_code.EmitMovImm8(HOST_TMP4, 7) ||
-			!m_code.EmitMvnReg(HOST_TMP4, HOST_TMP4) ||
-			!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP4) ||
+			!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 7) ||
 			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
 		{
 			return false;
@@ -10307,9 +10301,7 @@ namespace VitaEE
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitAndImm8(HOST_TMP3, HOST_TMP0, 7) ||
-			!m_code.EmitMovImm8(HOST_TMP4, 7) ||
-			!m_code.EmitMvnReg(HOST_TMP4, HOST_TMP4) ||
-			!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP4) ||
+			!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 7) ||
 			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
 		{
 			return false;
