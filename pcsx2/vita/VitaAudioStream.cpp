@@ -12,6 +12,18 @@
 #include <limits>
 #include <utility>
 
+#if defined(VITASX2_NATIVE_VALIDATION) && !defined(ARCH_ARM32)
+class FreeSurroundDecoder
+{
+};
+namespace soundtouch
+{
+	class SoundTouch
+	{
+	};
+} // namespace soundtouch
+#endif
+
 namespace
 {
 	static constexpr const char* s_backend_names[] = {
