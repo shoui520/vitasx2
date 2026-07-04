@@ -16,6 +16,7 @@
 class Error;
 
 class FreeSurroundDecoder;
+struct VitaAudioState;
 namespace soundtouch
 {
 	class SoundTouch;
@@ -172,6 +173,10 @@ private:
 
 #if !defined(ARCH_ARM32)
 	std::unique_ptr<soundtouch::SoundTouch> m_soundtouch;
+#endif
+
+#if defined(VITASX2_VITA)
+	std::unique_ptr<VitaAudioState> m_vita_audio_state;
 #endif
 
 	u32 m_target_buffer_size = 0;
