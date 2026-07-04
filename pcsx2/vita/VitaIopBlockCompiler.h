@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/Pcsx2Defs.h"
+#include "pcsx2/HostMemoryMap.h"
 #include "pcsx2/vita/A32Emitter.h"
 
 #include <array>
@@ -138,11 +139,14 @@ namespace VitaIOP
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result);
 
 	private:
-		static constexpr size_t INITIAL_CACHE_CAPACITY = 32;
-		static constexpr size_t MAX_CACHE_CAPACITY = 256;
+		// PCSX2 owner: x86/BaseblockEx.h::BaseBlocks() starts at 0x4000
+		// BASEBLOCKEX records and grows from there. Vita keeps the same
+		// game-scale order while bounding metadata for the smaller memory budget.
+		static constexpr size_t INITIAL_CACHE_CAPACITY = 512;
+		static constexpr size_t MAX_CACHE_CAPACITY = 0x4000;
 		static constexpr size_t STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 4096;
 		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 16 * 1024;
-		static constexpr size_t IOP_CODE_CACHE_CAPACITY = 512 * 1024;
+		static constexpr size_t IOP_CODE_CACHE_CAPACITY = HostMemoryMap::IOPrecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
@@ -195,10 +199,11 @@ namespace VitaIOP
 		void ClearBlockRecords();
 		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc, u32 instruction_count, bool match_instruction_count);
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
+		s32 LastIncomingLinkIndex(u32 target_pc) const;
 		void ClearIncomingLinks();
+		void RegisterIncomingLink(CachedBlock& block, u8 slot_index, const DirectLinkSlot& link);
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
-		void ValidateCachedBlocks();
 		CachedBlock* FindLookupBlockByStartPc(u32 start_pc);
 		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit);
 		CachedBlock* FindCachedBlockByStartPc(u32 start_pc);
@@ -226,5 +231,6 @@ namespace VitaIOP
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
 		bool m_direct_linking_enabled = true;
+		bool m_reuse_invalid_cache_entries = false;
 	};
 } // namespace VitaIOP
