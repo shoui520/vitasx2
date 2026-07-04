@@ -329,6 +329,11 @@ namespace VitaEE
 			return (op >> 26) == 0x00 && (op & 0x3f) == 0x0c;
 		}
 
+		bool IsSYNC(u32 op)
+		{
+			return (op >> 26) == 0x00 && (op & 0x3f) == 0x0f;
+		}
+
 		bool IsCounterReadLoad(u32 op)
 		{
 			switch (op >> 26)
@@ -1953,7 +1958,8 @@ namespace VitaEE
 					return false;
 
 				const u32 next_op = memRead32(pc + 4);
-				if (IsSupportedBranchOpcode(next_op) || RequiresBlockEndAfterOpcode(next_op) ||
+				if (IsSupportedBranchOpcode(next_op) ||
+					(RequiresBlockEndAfterOpcode(next_op) && !IsSYNC(next_op)) ||
 					IsCycleCommittingFastCOP0(next_op))
 				{
 					return false;
