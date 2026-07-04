@@ -108,6 +108,43 @@ namespace
 				  static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 3)));
 	}
 
+	void VitaVifLoadV3_32Words(const u8* src, u32 generated_iteration, u32 generated_alignment, u32& x, u32& y, u32& z, u32& w)
+	{
+		// PCSX2 owners: x86/Vif_Dynarec.cpp::ModUnpack() and
+		// x86/Vif_UnpackSSE.cpp::xUPK_V3_32(). Generated V3 unpacks use
+		// the V4 data shape, but zero W when the generated iteration does
+		// not match the packet alignment slot.
+		x = VitaVifLoadU32(src);
+		y = VitaVifLoadU32(src + 4);
+		z = VitaVifLoadU32(src + 8);
+		w = (generated_iteration == generated_alignment) ? VitaVifLoadU32(src + 12) : 0;
+	}
+
+	void VitaVifLoadV3_16Words(const u8* src, bool usn, u32 generated_iteration, u32 generated_alignment, u32& x, u32& y, u32& z, u32& w)
+	{
+		// PCSX2 owner: x86/Vif_UnpackSSE.cpp::xUPK_V3_16().
+		VitaVifLoadV4_16Words(src, usn, x, y, z, w);
+		const u32 result = (((generated_iteration / 4) + 1 + (4 - generated_alignment)) & 0x3);
+		if ((generated_iteration & 0x1) == 0 && result == 0)
+			w = 0;
+	}
+
+	void VitaVifLoadV3_8Words(const u8* src, bool usn, u32 generated_iteration, u32 generated_alignment, u32& x, u32& y, u32& z, u32& w)
+	{
+		// PCSX2 owners: x86/Vif_Dynarec.cpp::ModUnpack() and
+		// x86/Vif_UnpackSSE.cpp::xUPK_V3_8().
+		x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
+		y = usn ? static_cast<u32>(VitaVifLoadU8(src + 1)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 1)));
+		z = usn ? static_cast<u32>(VitaVifLoadU8(src + 2)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 2)));
+		w = (generated_iteration == generated_alignment) ?
+				(usn ? static_cast<u32>(VitaVifLoadU8(src + 3)) :
+					   static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 3)))) :
+				0;
+	}
+
 #if VITASX2_VIF_HAS_ARM_NEON
 	void VitaVifStoreS_16WordsNeon(u8* dest, const u8* src, bool usn)
 	{
@@ -309,7 +346,21 @@ namespace
 		}
 	}
 
-	bool VitaVifUnpackVector(vifStruct& vif, const VIFregisters& regs, u8* dest, const u8* src, u32 format, u32 mode, bool usn, bool doMask)
+	bool VitaVifIsV3Format(u32 format)
+	{
+		return format == 0x08 || format == 0x09 || format == 0x0a;
+	}
+
+	u32 VitaVifGeneratedAlignment(const vifStruct& vif, u32 format)
+	{
+		// PCSX2 owner: x86/Vif_Dynarec.cpp::dVifUnpack(). The generated
+		// block key keeps full packet alignment for V3-16 and only bit 0
+		// for the other V3 formats.
+		return (format == 0x09) ? static_cast<u32>(vif.start_aligned) :
+								  (static_cast<u32>(vif.start_aligned) & 0x1u);
+	}
+
+	bool VitaVifUnpackVector(vifStruct& vif, const VIFregisters& regs, u8* dest, const u8* src, u32 format, u32 mode, bool usn, bool doMask, u32 generated_iteration, u32 generated_alignment)
 	{
 		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_S(), UNPACK_V2(),
 		// UNPACK_V4(), and writeXYZW().
@@ -424,60 +475,25 @@ namespace
 
 			case 0x08: // V3-32, owned by Vif_Unpack.cpp::UNPACK_V4().
 			{
-				if (mode == 0 && !doMask)
-				{
-					VitaVifCopyQword(dest, src);
-				}
-				else
-				{
-					VitaVifStoreModeWords(vif, regs, dest, mode, doMask,
-						VitaVifLoadU32(src),
-						VitaVifLoadU32(src + 4),
-						VitaVifLoadU32(src + 8),
-						VitaVifLoadU32(src + 12));
-				}
+				u32 x, y, z, w;
+				VitaVifLoadV3_32Words(src, generated_iteration, generated_alignment, x, y, z, w);
+				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
 				return true;
 			}
 
 			case 0x09: // V3-16, owned by Vif_Unpack.cpp::UNPACK_V4().
 			{
-				if (mode == 0 && !doMask)
-				{
-#if VITASX2_VIF_HAS_ARM_NEON
-					VitaVifStoreV4_16WordsNeon(dest, src, usn);
-#else
-					u32 x, y, z, w;
-					VitaVifLoadV4_16Words(src, usn, x, y, z, w);
-					VitaVifStoreWords(dest, x, y, z, w);
-#endif
-				}
-				else
-				{
-					u32 x, y, z, w;
-					VitaVifLoadV4_16Words(src, usn, x, y, z, w);
-					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
-				}
+				u32 x, y, z, w;
+				VitaVifLoadV3_16Words(src, usn, generated_iteration, generated_alignment, x, y, z, w);
+				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
 				return true;
 			}
 
 			case 0x0a: // V3-8, owned by Vif_Unpack.cpp::UNPACK_V4().
 			{
-				if (mode == 0 && !doMask)
-				{
-#if VITASX2_VIF_HAS_ARM_NEON
-					VitaVifStoreV4_8WordsNeon(dest, src, usn);
-#else
-					u32 x, y, z, w;
-					VitaVifLoadV4_8Words(src, usn, x, y, z, w);
-					VitaVifStoreWords(dest, x, y, z, w);
-#endif
-				}
-				else
-				{
-					u32 x, y, z, w;
-					VitaVifLoadV4_8Words(src, usn, x, y, z, w);
-					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
-				}
+				u32 x, y, z, w;
+				VitaVifLoadV3_8Words(src, usn, generated_iteration, generated_alignment, x, y, z, w);
+				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
 				return true;
 			}
 
@@ -689,6 +705,8 @@ namespace
 			return false;
 		if (nVifT[format] == 0)
 			return false;
+		if (VitaVifIsV3Format(format))
+			return false;
 
 		const int vsize = nVifT[format];
 		const int skip_size = (regs.cycle.cl - regs.cycle.wl) * 16;
@@ -781,10 +799,17 @@ namespace
 		const u32 mode = regs.mode & 0x3;
 		const int vsize = nVifT[format];
 		const int skip_size = (regs.cycle.cl - regs.cycle.wl) * 16;
+		u32 generated_iteration = 0;
+		const u32 generated_alignment = VitaVifGeneratedAlignment(vif, format);
 		do
 		{
+			u32 vector_iteration = generated_iteration;
+			if (format == 0x09 || format == 0x0a)
+				vector_iteration = ++generated_iteration;
+
 			VitaVifUnpackVector(
-				vif, regs, VitaVifVuMemPtr<idx>(vif.tag.addr), data, format, mode, vif.usn != 0, doMask);
+				vif, regs, VitaVifVuMemPtr<idx>(vif.tag.addr), data, format, mode, vif.usn != 0, doMask,
+				vector_iteration, generated_alignment);
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuVifFastVectors;
 #endif
@@ -808,6 +833,9 @@ namespace
 					vif.cl = 0;
 				}
 			}
+
+			if (format == 0x08)
+				generated_iteration = (generated_iteration + 1) & 0x1u;
 		} while (regs.num);
 
 		return true;
