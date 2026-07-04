@@ -556,6 +556,173 @@ namespace
 			VitaVifStoreWords(dest, x, y, z, w);
 	}
 
+	bool VitaVifStorePlainUnmaskedVector(u8* dest, const u8* src, u32 format, bool usn)
+	{
+		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_S(), UNPACK_V2(),
+		// UNPACK_V4(), and UNPACK_V4_5(). V3 uses the same V4 data shape.
+		switch (format)
+		{
+			case 0x00: // S-32
+			{
+				const u32 x = VitaVifLoadU32(src);
+				VitaVifStoreWords(dest, x, x, x, x);
+				return true;
+			}
+
+			case 0x01: // S-16
+			{
+#if VITASX2_VIF_HAS_ARM_NEON
+				VitaVifStoreS_16WordsNeon(dest, src, usn);
+#else
+				const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
+				VitaVifStoreWords(dest, x, x, x, x);
+#endif
+				return true;
+			}
+
+			case 0x02: // S-8
+			{
+#if VITASX2_VIF_HAS_ARM_NEON
+				VitaVifStoreS_8WordsNeon(dest, src, usn);
+#else
+				const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
+				VitaVifStoreWords(dest, x, x, x, x);
+#endif
+				return true;
+			}
+
+			case 0x04: // V2-32
+			{
+				const u32 x = VitaVifLoadU32(src);
+				const u32 y = VitaVifLoadU32(src + sizeof(u32));
+				VitaVifStoreWords(dest, x, y, x, y);
+				return true;
+			}
+
+			case 0x05: // V2-16
+			{
+#if VITASX2_VIF_HAS_ARM_NEON
+				VitaVifStoreV2_16WordsNeon(dest, src, usn);
+#else
+				const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
+				const u32 y = usn ? static_cast<u32>(VitaVifLoadU16(src + sizeof(u16))) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + sizeof(u16))));
+				VitaVifStoreWords(dest, x, y, x, y);
+#endif
+				return true;
+			}
+
+			case 0x06: // V2-8
+			{
+#if VITASX2_VIF_HAS_ARM_NEON
+				VitaVifStoreV2_8WordsNeon(dest, src, usn);
+#else
+				const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
+				const u32 y = usn ? static_cast<u32>(VitaVifLoadU8(src + sizeof(u8))) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + sizeof(u8))));
+				VitaVifStoreWords(dest, x, y, x, y);
+#endif
+				return true;
+			}
+
+			case 0x08: // V3-32, owned by Vif_Unpack.cpp::UNPACK_V4().
+			case 0x0c: // V4-32
+				VitaVifCopyQword(dest, src);
+				return true;
+
+			case 0x09: // V3-16, owned by Vif_Unpack.cpp::UNPACK_V4().
+			case 0x0d: // V4-16
+			{
+#if VITASX2_VIF_HAS_ARM_NEON
+				VitaVifStoreV4_16WordsNeon(dest, src, usn);
+#else
+				u32 x, y, z, w;
+				VitaVifLoadV4_16Words(src, usn, x, y, z, w);
+				VitaVifStoreWords(dest, x, y, z, w);
+#endif
+				return true;
+			}
+
+			case 0x0a: // V3-8, owned by Vif_Unpack.cpp::UNPACK_V4().
+			case 0x0e: // V4-8
+			{
+#if VITASX2_VIF_HAS_ARM_NEON
+				VitaVifStoreV4_8WordsNeon(dest, src, usn);
+#else
+				u32 x, y, z, w;
+				VitaVifLoadV4_8Words(src, usn, x, y, z, w);
+				VitaVifStoreWords(dest, x, y, z, w);
+#endif
+				return true;
+			}
+
+			case 0x0f: // V4-5
+			{
+				const u32 data = VitaVifLoadU16(src);
+				const u32 x = (data & 0x001fu) << 3;
+				const u32 y = (data & 0x03e0u) >> 2;
+				const u32 z = (data & 0x7c00u) >> 7;
+				const u32 w = (data & 0x8000u) >> 8;
+				VitaVifStoreWords(dest, x, y, z, w);
+				return true;
+			}
+
+			default:
+				return false;
+		}
+	}
+
+	template <int idx>
+	bool VitaVifTryFastPlainUnmasked(const u8* data, bool isFill)
+	{
+		vifStruct& vif = GetVifX;
+		VIFregisters& regs = vifXRegs;
+		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
+		const u32 format = upk_num & 0x0f;
+		const bool doMask = (upk_num & 0x10) != 0;
+		if (doMask || ((regs.mode & 0x3) != 0 && format != 0x0f))
+			return false;
+		if (nVifT[format] == 0)
+			return false;
+
+		const int vsize = nVifT[format];
+		const int skip_size = (regs.cycle.cl - regs.cycle.wl) * 16;
+		do
+		{
+			if (!VitaVifStorePlainUnmaskedVector(VitaVifVuMemPtr<idx>(vif.tag.addr), data, format, vif.usn != 0))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+#endif
+			vif.tag.addr += 16;
+			--regs.num;
+			++vif.cl;
+
+			if (isFill)
+			{
+				if (vif.cl <= regs.cycle.cl)
+					data += vsize;
+				else if (vif.cl == regs.cycle.wl)
+					vif.cl = 0;
+			}
+			else
+			{
+				data += vsize;
+				if (vif.cl >= regs.cycle.wl)
+				{
+					vif.tag.addr += skip_size;
+					vif.cl = 0;
+				}
+			}
+		} while (regs.num);
+
+		return true;
+	}
+
 	template <int idx>
 	bool VitaVifTryFastV4_5(const u8* data, bool isFill)
 	{
@@ -701,6 +868,9 @@ void dVifRelease(int idx)
 template <int idx>
 void dVifUnpack(const u8* data, bool isFill)
 {
+	if (VitaVifTryFastPlainUnmasked<idx>(data, isFill))
+		return;
+
 	if (VitaVifTryFastV4_5<idx>(data, isFill))
 		return;
 
