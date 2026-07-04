@@ -10131,13 +10131,14 @@ namespace VitaEE
 		bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask)
 	{
 		const unsigned rt = RT(op);
+		const bool needs_counter_event = rt != 0;
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			(branch_delay_slot &&
+			(branch_delay_slot && needs_counter_event &&
 			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
-			!EmitCounterReadFlagFromAddress(HOST_TMP0))
+			(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)))
 		{
 			return false;
 		}
@@ -10201,12 +10202,8 @@ namespace VitaEE
 
 		if (rt == 0)
 		{
-			if (branch_delay_slot &&
-				!m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0))
-			{
-				return false;
-			}
-
+			// PCSX2's scalar loads still access memory for r0, then return before
+			// the counter-read event test, so HOST_BRANCH_FLAG was not overwritten.
 			return emit_address_error_path() && patch_exits();
 		}
 
