@@ -1042,8 +1042,34 @@ namespace VitaIOP
 			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_SAVED0, VitaA32::ShiftType::LSL, 3) ||
 			!m_code.EmitMovImm32(HOST_TMP1, 0xfffffffcu) ||
 			!m_code.EmitAndReg(HOST_SAVED1, HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
+			!m_code.EmitAndReg(HOST_TMP2, HOST_SAVED1, HOST_TMP2, true))
+		{
+			return false;
+		}
+
+		// PCSX2 owner: R3000AInterpreter.cpp::psxSWL/psxSWR read the aligned
+		// word with iopMemRead32() before writing through iopMemWrite32().
+		const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
+			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_TMP2) ||
+			!m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP1, HOST_TMP0) ||
+			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+		{
+			return false;
+		}
+
+		const size_t done_branch = m_code.EmitBranchPlaceholder();
+		if (done_branch == static_cast<size_t>(-1))
+			return false;
+
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) ||
+			!m_code.PatchBranch(done_branch, m_code.Size()) ||
 			!EmitLoadGpr(RT(op), HOST_TMP1))
 		{
 			return false;
