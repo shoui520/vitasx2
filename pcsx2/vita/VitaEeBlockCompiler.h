@@ -450,6 +450,7 @@ namespace VitaEE
 		bool EmitCpuRegsAddress(unsigned host_reg, size_t offset);
 		bool EmitLoadRawGpr0KnownZeroFlag(unsigned host_reg);
 		bool EmitRefreshRawGpr0KnownZeroFromLow64(unsigned low_reg, unsigned high_reg);
+		bool EmitVu0SyncIfRunning();
 		bool EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg);
 		bool EmitVu0ViAddress(unsigned host_reg, unsigned vi_reg);
 		bool EmitAlignQwordAddress(unsigned host_reg, unsigned scratch_reg);

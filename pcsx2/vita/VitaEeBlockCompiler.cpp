@@ -58,6 +58,7 @@ u32 g_qemuCop1MemoryHelperCalls = 0;
 u32 g_qemuQwordGprMemoryHelperCalls = 0;
 u32 g_qemuQwordCop2MemoryHelperCalls = 0;
 u32 g_qemuCpuCancelInstructionCalls = 0;
+u32 g_qemuVu0SyncCalls = 0;
 #endif
 
 namespace VitaEE
@@ -8957,7 +8958,7 @@ namespace VitaEE
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			!EmitVu0SyncIfRunning() ||
 			!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP5))
 		{
 			return false;
@@ -9299,7 +9300,7 @@ namespace VitaEE
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			!EmitVu0SyncIfRunning() ||
 			!EmitVu0VfAddress(HOST_TMP0, rt) ||
 			!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) ||
 			!m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP5))
@@ -10701,6 +10702,30 @@ namespace VitaEE
 			   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::EQ) &&
 			   m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(&s_raw_gpr0_known_zero))) &&
 			   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP3, 0);
+	}
+
+	bool BlockCompiler::EmitVu0SyncIfRunning()
+	{
+		// PCSX2 owners: VU0.cpp::vu0Sync() / _vu0run() and
+		// x86/microVU_Macro.inl::mVUSyncVU0(). _vu0run() returns before any
+		// side effect when VU0.VI[REG_VPU_STAT].UL bit 0 is clear, so keep the
+		// idle-VU0 case in the A32 block and call the PCSX2 helper only for the
+		// running case.
+		if (!EmitVu0ViAddress(HOST_TMP0, VU0_REG_VPU_STAT) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 1, true))
+		{
+			return false;
+		}
+
+		const size_t vu0_idle = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (vu0_idle == static_cast<size_t>(-1) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)))
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ);
 	}
 
 	bool BlockCompiler::EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg)
