@@ -169,6 +169,8 @@ namespace
 			case 0x13: // MTLO
 			case 0x18: // MULT
 			case 0x19: // MULTU
+			case 0x1a: // DIV
+			case 0x1b: // DIVU
 			case 0x20: // ADD
 			case 0x21: // ADDU
 			case 0x22: // SUB
@@ -322,6 +324,49 @@ namespace
 		// subtract the pre-incremented pc before entering R3000A.cpp::psxException().
 		psxRegs.pc = pc;
 		psxException(code, iopIsDelaySlot);
+	}
+
+	extern "C" __attribute__((noinline)) u64 VitaIopA32DivResult(u32 rs_value, u32 rt_value)
+	{
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxDIV().
+		u32 lo = 0;
+		u32 hi = 0;
+		if (rt_value == 0)
+		{
+			lo = (static_cast<s32>(rs_value) < 0) ? 1 : 0xffffffffu;
+			hi = rs_value;
+		}
+		else if (rs_value == 0x80000000u && rt_value == 0xffffffffu)
+		{
+			lo = 0x80000000u;
+			hi = 0;
+		}
+		else
+		{
+			lo = static_cast<u32>(static_cast<s32>(rs_value) / static_cast<s32>(rt_value));
+			hi = static_cast<u32>(static_cast<s32>(rs_value) % static_cast<s32>(rt_value));
+		}
+
+		return (static_cast<u64>(hi) << 32) | lo;
+	}
+
+	extern "C" __attribute__((noinline)) u64 VitaIopA32DivuResult(u32 rs_value, u32 rt_value)
+	{
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxDIVU().
+		u32 lo = 0;
+		u32 hi = 0;
+		if (rt_value == 0)
+		{
+			lo = 0xffffffffu;
+			hi = rs_value;
+		}
+		else
+		{
+			lo = rs_value / rt_value;
+			hi = rs_value % rt_value;
+		}
+
+		return (static_cast<u64>(hi) << 32) | lo;
 	}
 
 	bool DecodeExitKind(u32 value, VitaIOP::BlockExitKind* exit)
@@ -624,6 +669,19 @@ namespace VitaIOP
 
 		return m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
 			   m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+	}
+
+	bool BlockCompiler::EmitDivideOp(u32 op, bool is_signed)
+	{
+		const void* helper = is_signed ?
+			reinterpret_cast<const void*>(&VitaIopA32DivResult) :
+			reinterpret_cast<const void*>(&VitaIopA32DivuResult);
+
+		return EmitLoadGpr(RS(op), HOST_TMP0) &&
+			   EmitLoadGpr(RT(op), HOST_TMP1) &&
+			   m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
+			   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
 	}
 
 	bool BlockCompiler::EmitExceptionOp(u32 pc, u32 code)
@@ -1174,6 +1232,10 @@ namespace VitaIOP
 				return EmitMultiplyOp(op, true);
 			case 0x19: // MULTU
 				return EmitMultiplyOp(op, false);
+			case 0x1a: // DIV
+				return EmitDivideOp(op, true);
+			case 0x1b: // DIVU
+				return EmitDivideOp(op, false);
 			case 0x20: // ADD
 			case 0x21: // ADDU
 			case 0x22: // SUB
