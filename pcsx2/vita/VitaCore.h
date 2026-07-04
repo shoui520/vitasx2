@@ -10,6 +10,8 @@
 // configured selector.
 void VitaSelectInterpreterCpuProviders();
 void VitaSelectA32EeCpuProviders();
+void VitaSelectA32IopCpuProviders();
+void VitaSelectA32EeIopCpuProviders();
 void VitaSelectConfiguredCpuProviders();
 
 struct VitaA32EeProviderStats
@@ -51,6 +53,27 @@ const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason);
 void VitaResetA32EeProviderStats();
 VitaA32EeProviderStats VitaGetA32EeProviderStats();
 void VitaRequestA32EeCacheReset();
+
+struct VitaA32IopProviderStats
+{
+	u32 compiled_blocks = 0;
+	u32 compiled_instructions = 0;
+	u32 executed_blocks = 0;
+	u32 direct_exits = 0;
+	u32 failed_blocks = 0;
+	u32 interpreter_blocks = 0;
+	u32 cache_hits = 0;
+	u32 cache_misses = 0;
+	u32 invalidated_blocks = 0;
+	u32 code_cache_resets = 0;
+	u32 first_interpreter_pc = 0;
+	u32 first_interpreter_opcode = 0;
+	u32 last_interpreter_pc = 0;
+	u32 last_interpreter_opcode = 0;
+};
+
+void VitaResetA32IopProviderStats();
+VitaA32IopProviderStats VitaGetA32IopProviderStats();
 
 // Mirrors the fast-boot ELF state that VMManager.cpp::Initialize() seeds for
 // R5900.cpp::eeloadHook() in Vita bring-up executables.

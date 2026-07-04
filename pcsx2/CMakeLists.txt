@@ -151,6 +151,7 @@ add_library(pcsx2core STATIC
 	vita/VitaDisabledDevices.cpp
 	vita/VitaEeBlockCompiler.cpp
 	vita/VitaEeExecutor.cpp
+	vita/VitaIopBlockCompiler.cpp
 	vita/VitaGsMailbox.cpp
 	vita/VitaGsDiagnosticsDisabled.cpp
 	vita/VitaGsMemory.cpp

@@ -8,6 +8,9 @@
 #include "DebugTools/Spu2Trace.h"
 #include "DebugTools/VuTrace.h"
 #include "Hw.h"
+#include "IopBios.h"
+#include "IopHw.h"
+#include "IopMem.h"
 #include "Memory.h"
 #include "R3000A.h"
 #include "R5900.h"
@@ -17,6 +20,7 @@
 #include "vita/VitaCore.h"
 #include "vita/VitaEeBlockCompiler.h"
 #include "vita/VitaEeExecutor.h"
+#include "vita/VitaIopBlockCompiler.h"
 #include "vtlb.h"
 
 #include "common/Assertions.h"
@@ -26,7 +30,9 @@ static VitaEePreInstructionTraceCallback s_ee_pre_instruction_trace_callback = n
 static VitaEePreInstructionTraceWindowSkipCallback s_ee_pre_instruction_trace_window_skip_callback = nullptr;
 static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback = nullptr;
 static VitaEE::BlockExecutor s_ee_a32_executor;
+static VitaIOP::BlockExecutor s_iop_a32_executor;
 static VitaA32EeProviderStats s_ee_a32_stats;
+static VitaA32IopProviderStats s_iop_a32_stats;
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
 static bool s_ee_a32_running_compiled_block = false;
@@ -589,19 +595,112 @@ static void psxRecReserve()
 static void psxRecReset()
 {
 	psxInt.Reset();
+	s_iop_a32_stats.invalidated_blocks += s_iop_a32_executor.Reset();
+}
+
+static void psxRecChargeEeBudget(u64 last_iop_cycle)
+{
+	if ((psxHu32(HW_ICFG) & (1 << 3)))
+	{
+		// PCSX2 owner: R3000AInterpreter.cpp::intExecuteBlock() converts PS1
+		// mode IOP cycles to EE-domain cycles with PS2CLK/PSXCLK = 1280/147.
+		const u32 cnum = 1280;
+		const u32 cdenom = 147;
+		const u32 delta = static_cast<u32>(psxRegs.cycle - last_iop_cycle);
+		const u32 t = cnum * delta + psxRegs.iopCycleEECarry;
+		psxRegs.iopCycleEE -= t / cdenom;
+		psxRegs.iopCycleEECarry = t % cdenom;
+	}
+	else
+	{
+		// PCSX2 owner: R3000AInterpreter.cpp::intExecuteBlock(), PS2 mode.
+		psxRegs.iopCycleEE -= static_cast<s32>((psxRegs.cycle - last_iop_cycle) * 8);
+	}
 }
 
 static s32 psxRecExecuteBlock(s32 eeCycles)
 {
-	return psxInt.ExecuteBlock(eeCycles);
+	psxRegs.iopBreak = 0;
+	psxRegs.iopCycleEE = eeCycles;
+
+	while (psxRegs.iopCycleEE > 0)
+	{
+		const u64 last_iop_cycle = psxRegs.cycle;
+		if ((psxHu32(HW_ICFG) & 8) &&
+			((psxRegs.pc & 0x1fffffffU) == 0xa0 ||
+			 (psxRegs.pc & 0x1fffffffU) == 0xb0 ||
+			 (psxRegs.pc & 0x1fffffffU) == 0xc0))
+		{
+			psxBiosCall();
+		}
+
+		VitaIOP::BlockScanResult scan;
+		if (!VitaIOP::BlockExecutor::ScanStraightLineBlock(
+				psxRegs.pc, VitaIOP::BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
+			scan.instruction_count == 0)
+		{
+			const u32 pc = psxRegs.pc;
+			const u32 opcode = iopMemRead32(pc);
+			if (s_iop_a32_stats.interpreter_blocks == 0)
+			{
+				s_iop_a32_stats.first_interpreter_pc = pc;
+				s_iop_a32_stats.first_interpreter_opcode = opcode;
+			}
+			s_iop_a32_stats.last_interpreter_pc = pc;
+			s_iop_a32_stats.last_interpreter_opcode = opcode;
+			s_iop_a32_stats.interpreter_blocks++;
+			const s32 result = psxInt.ExecuteBlock(psxRegs.iopCycleEE);
+			return result;
+		}
+
+		VitaIOP::BlockExecutionResult result;
+		if (!s_iop_a32_executor.ExecuteCompiledBlock(psxRegs.pc, scan.instruction_count, &result))
+		{
+			const u32 pc = psxRegs.pc;
+			const u32 opcode = iopMemRead32(pc);
+			s_iop_a32_stats.failed_blocks++;
+			if (s_iop_a32_stats.interpreter_blocks == 0)
+			{
+				s_iop_a32_stats.first_interpreter_pc = pc;
+				s_iop_a32_stats.first_interpreter_opcode = opcode;
+			}
+			s_iop_a32_stats.last_interpreter_pc = pc;
+			s_iop_a32_stats.last_interpreter_opcode = opcode;
+			s_iop_a32_stats.interpreter_blocks++;
+			const s32 fallback_result = psxInt.ExecuteBlock(psxRegs.iopCycleEE);
+			return fallback_result;
+		}
+
+		s_iop_a32_stats.executed_blocks++;
+		s_iop_a32_stats.direct_exits++;
+		if (result.cache_hit)
+		{
+			s_iop_a32_stats.cache_hits++;
+		}
+		else
+		{
+			s_iop_a32_stats.cache_misses++;
+			s_iop_a32_stats.compiled_blocks++;
+			s_iop_a32_stats.compiled_instructions += result.instruction_count;
+		}
+		s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
+
+		psxRecChargeEeBudget(last_iop_cycle);
+	}
+
+	return psxRegs.iopBreak + psxRegs.iopCycleEE;
 }
 
 static void psxRecClear(u32 addr, u32 size)
 {
+	// PCSX2 owner: x86/iR3000A.cpp::recClearIOP(addr, size), where size is
+	// measured in 32-bit guest words.
+	s_iop_a32_stats.invalidated_blocks += s_iop_a32_executor.InvalidateRange(addr, size);
 }
 
 static void psxRecShutdown()
 {
+	s_iop_a32_executor.Reset();
 }
 
 R3000Acpu psxRec = {
@@ -732,13 +831,33 @@ void VitaSelectA32EeCpuProviders()
 	CpuVU1 = &CpuIntVU1;
 }
 
+void VitaSelectA32IopCpuProviders()
+{
+	Cpu = &intCpu;
+	psxCpu = &psxRec;
+	CpuVU0 = &CpuIntVU0;
+	CpuVU1 = &CpuIntVU1;
+}
+
+void VitaSelectA32EeIopCpuProviders()
+{
+	Cpu = &recCpu;
+	psxCpu = &psxRec;
+	CpuVU0 = &CpuIntVU0;
+	CpuVU1 = &CpuIntVU1;
+}
+
 void VitaSelectConfiguredCpuProviders()
 {
 	// PCSX2 owner: VMManager.cpp::UpdateCPUImplementations(). The Vita fork
-	// maps the EE recompiler flag to the A32 EE provider while IOP/VU remain
-	// on their PCSX2 interpreters until their Vita providers are ported.
-	if (EmuConfig.Cpu.Recompiler.EnableEE)
+	// maps the EE and IOP recompiler flags to Vita A32 providers while VU
+	// remains on the PCSX2 interpreter until the Vita VU provider is ported.
+	if (EmuConfig.Cpu.Recompiler.EnableEE && EmuConfig.Cpu.Recompiler.EnableIOP)
+		VitaSelectA32EeIopCpuProviders();
+	else if (EmuConfig.Cpu.Recompiler.EnableEE)
 		VitaSelectA32EeCpuProviders();
+	else if (EmuConfig.Cpu.Recompiler.EnableIOP)
+		VitaSelectA32IopCpuProviders();
 	else
 		VitaSelectInterpreterCpuProviders();
 }
@@ -751,4 +870,14 @@ void VitaResetA32EeProviderStats()
 VitaA32EeProviderStats VitaGetA32EeProviderStats()
 {
 	return s_ee_a32_stats;
+}
+
+void VitaResetA32IopProviderStats()
+{
+	s_iop_a32_stats = {};
+}
+
+VitaA32IopProviderStats VitaGetA32IopProviderStats()
+{
+	return s_iop_a32_stats;
 }
