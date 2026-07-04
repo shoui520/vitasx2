@@ -7,6 +7,7 @@
 #include "DebugTools/IpuTrace.h"
 #include "DebugTools/Spu2Trace.h"
 #include "DebugTools/VuTrace.h"
+#include "Hw.h"
 #include "Memory.h"
 #include "R3000A.h"
 #include "R5900.h"
@@ -185,6 +186,115 @@ static bool recRecordEeWindow(u32 start_pc, u32 instruction_count, u32* executab
 	return true;
 }
 
+static constexpr unsigned recRS(u32 op)
+{
+	return (op >> 21) & 0x1f;
+}
+
+static constexpr unsigned recRT(u32 op)
+{
+	return (op >> 16) & 0x1f;
+}
+
+static bool recEvaluateLikelyBranchTaken(u32 op, bool* taken)
+{
+	if (!taken)
+		return false;
+
+	switch (op >> 26)
+	{
+		case 0x01:
+			switch (recRT(op))
+			{
+				case 0x02: // BLTZL, owned by Interpreter.cpp::BLTZL().
+				case 0x12: // BLTZALL, owned by Interpreter.cpp::BLTZALL().
+					*taken = cpuRegs.GPR.r[recRS(op)].SD[0] < 0;
+					return true;
+				case 0x03: // BGEZL, owned by Interpreter.cpp::BGEZL().
+				case 0x13: // BGEZALL, owned by Interpreter.cpp::BGEZALL().
+					*taken = cpuRegs.GPR.r[recRS(op)].SD[0] >= 0;
+					return true;
+				default:
+					return false;
+			}
+
+		case 0x10: // BC0FL/BC0TL, owned by COP0.cpp::BC0FL()/BC0TL().
+		{
+			if (recRS(op) != 0x08 || (recRT(op) != 0x02 && recRT(op) != 0x03))
+				return false;
+
+			const bool cpc_cond = (((psHu32(DMAC_STAT) | ~psHu32(DMAC_PCR)) & 0x3ff) == 0x3ff);
+			*taken = (recRT(op) == 0x03) ? cpc_cond : !cpc_cond;
+			return true;
+		}
+
+		case 0x11: // BC1FL/BC1TL, owned by FPU.cpp::BC1FL()/BC1TL().
+		{
+			if (recRS(op) != 0x08 || (recRT(op) != 0x02 && recRT(op) != 0x03))
+				return false;
+
+			const bool fpu_cond = (fpuRegs.fprc[31] & 0x00800000u) != 0;
+			*taken = (recRT(op) == 0x03) ? fpu_cond : !fpu_cond;
+			return true;
+		}
+
+		case 0x12: // BC2FL/BC2TL, owned by COP2.cpp::BC2FL()/BC2TL().
+		{
+			if (recRS(op) != 0x08 || (recRT(op) != 0x02 && recRT(op) != 0x03))
+				return false;
+
+			const bool vu_cond = ((VU0.VI[29].US[0] >> 8) & 1) != 0;
+			*taken = (recRT(op) == 0x03) ? vu_cond : !vu_cond;
+			return true;
+		}
+
+		case 0x14: // BEQL, owned by Interpreter.cpp::BEQL().
+			*taken = cpuRegs.GPR.r[recRS(op)].SD[0] == cpuRegs.GPR.r[recRT(op)].SD[0];
+			return true;
+		case 0x15: // BNEL, owned by Interpreter.cpp::BNEL().
+			*taken = cpuRegs.GPR.r[recRS(op)].SD[0] != cpuRegs.GPR.r[recRT(op)].SD[0];
+			return true;
+		case 0x16: // BLEZL, owned by Interpreter.cpp::BLEZL().
+			*taken = cpuRegs.GPR.r[recRS(op)].SD[0] <= 0;
+			return true;
+		case 0x17: // BGTZL, owned by Interpreter.cpp::BGTZL().
+			*taken = cpuRegs.GPR.r[recRS(op)].SD[0] > 0;
+			return true;
+
+		default:
+			return false;
+	}
+}
+
+static bool recRecordEeLikelyBranchPair(u32 branch_pc, u32 branch_op, u32* executable_instruction_count)
+{
+	if (!executable_instruction_count)
+		return false;
+
+	*executable_instruction_count = 0;
+
+	bool taken = false;
+	if (!recEvaluateLikelyBranchTaken(branch_op, &taken))
+		return false;
+
+	s_ee_a32_prerecording_window = true;
+	if (VitaRecordEePreInstruction(branch_pc, branch_op))
+	{
+		s_ee_a32_prerecording_window = false;
+		return false;
+	}
+
+	*executable_instruction_count = 2;
+	if (taken && VitaRecordEePreInstruction(branch_pc + 4, memRead32(branch_pc + 4)))
+	{
+		s_ee_a32_prerecording_window = false;
+		return false;
+	}
+
+	s_ee_a32_prerecording_window = false;
+	return true;
+}
+
 static void recRunInterpreterStepsWithoutProviderTrace(u32 instruction_count)
 {
 	for (u32 i = 0; i < instruction_count && !s_ee_a32_exit_execution; i++)
@@ -300,6 +410,9 @@ static void recExecute()
 		}
 
 		u32 window_instruction_count = scan.instruction_count;
+		bool likely_pair_trace_recorded = false;
+		bool likely_pair_full_window_recorded = false;
+		u32 likely_pair_executable_instruction_count = 0;
 		if (s_ee_exact_trace_streams && s_ee_pre_instruction_trace_callback &&
 			scan.stop == VitaEE::BlockScanStop::Branch &&
 			window_instruction_count >= 2 &&
@@ -315,16 +428,21 @@ static void recExecute()
 			if (window_instruction_count == 0)
 			{
 				const u32 opcode = memRead32(pc);
-				intCpu.Step();
-				VitaEE::RefreshRawGpr0KnownZero();
-				recRecordInterpreterFallback(pc, opcode, VitaA32EeFallbackReason::ExactTraceBranchLikely);
-				continue;
+				likely_pair_trace_recorded = true;
+				likely_pair_full_window_recorded =
+					recRecordEeLikelyBranchPair(pc, opcode, &likely_pair_executable_instruction_count);
+				window_instruction_count = likely_pair_executable_instruction_count;
 			}
 		}
 
 		u32 executable_instruction_count = 0;
 		bool full_window_recorded = false;
-		if (s_ee_pre_instruction_trace_callback &&
+		if (likely_pair_trace_recorded)
+		{
+			executable_instruction_count = likely_pair_executable_instruction_count;
+			full_window_recorded = likely_pair_full_window_recorded;
+		}
+		else if (s_ee_pre_instruction_trace_callback &&
 			s_ee_a32_trace_mode == VitaA32EeTraceMode::BlockBoundaryState)
 		{
 			full_window_recorded = !VitaRecordEePreInstruction(pc, memRead32(pc));
