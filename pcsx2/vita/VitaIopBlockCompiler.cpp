@@ -113,6 +113,14 @@ namespace
 			case 0x0d: // ORI
 			case 0x0e: // XORI
 			case 0x0f: // LUI
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+			case 0x28: // SB
+			case 0x29: // SH
+			case 0x2b: // SW
 				return true;
 			default:
 				return false;
@@ -449,6 +457,93 @@ namespace VitaIOP
 		}
 	}
 
+	bool BlockCompiler::EmitEffectiveAddress(u32 op)
+	{
+		return EmitLoadGpr(RS(op), HOST_TMP0) &&
+			   m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(static_cast<s32>(IMM_S(op)))) &&
+			   m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitLoadOp(u32 op)
+	{
+		const unsigned opcode = op >> 26;
+		const unsigned rt = RT(op);
+		const void* helper = nullptr;
+
+		switch (opcode)
+		{
+			case 0x20: // LB
+			case 0x24: // LBU
+				helper = reinterpret_cast<const void*>(&iopMemRead8);
+				break;
+			case 0x21: // LH
+			case 0x25: // LHU
+				helper = reinterpret_cast<const void*>(&iopMemRead16);
+				break;
+			case 0x23: // LW
+				helper = reinterpret_cast<const void*>(&iopMemRead32);
+				break;
+			default:
+				return false;
+		}
+
+		if (!EmitEffectiveAddress(op) ||
+			!m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH))
+		{
+			return false;
+		}
+
+		if (rt == 0)
+			return true;
+
+		switch (opcode)
+		{
+			case 0x20: // LB
+				if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 24) ||
+					!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 24))
+				{
+					return false;
+				}
+				break;
+			case 0x21: // LH
+				if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 16) ||
+					!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 16))
+				{
+					return false;
+				}
+				break;
+			default:
+				break;
+		}
+
+		return EmitStoreGpr(rt, HOST_TMP0);
+	}
+
+	bool BlockCompiler::EmitStoreOp(u32 op)
+	{
+		const unsigned opcode = op >> 26;
+		const void* helper = nullptr;
+
+		switch (opcode)
+		{
+			case 0x28: // SB
+				helper = reinterpret_cast<const void*>(&iopMemWrite8);
+				break;
+			case 0x29: // SH
+				helper = reinterpret_cast<const void*>(&iopMemWrite16);
+				break;
+			case 0x2b: // SW
+				helper = reinterpret_cast<const void*>(&iopMemWrite32);
+				break;
+			default:
+				return false;
+		}
+
+		return EmitEffectiveAddress(op) &&
+			   EmitLoadGpr(RT(op), HOST_TMP1) &&
+			   m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH);
+	}
+
 	bool BlockCompiler::EmitNativeSPECIAL(u32 op)
 	{
 		switch (op & 0x3f)
@@ -504,6 +599,16 @@ namespace VitaIOP
 			case 0x0e: // XORI
 			case 0x0f: // LUI
 				return EmitImmediateOp(op);
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+				return EmitLoadOp(op);
+			case 0x28: // SB
+			case 0x29: // SH
+			case 0x2b: // SW
+				return EmitStoreOp(op);
 			default:
 				return false;
 		}

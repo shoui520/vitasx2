@@ -70,6 +70,9 @@ namespace VitaIOP
 		bool EmitShiftRegOp(u32 op);
 		bool EmitSetLessThanRegOp(u32 op, bool is_signed);
 		bool EmitImmediateOp(u32 op);
+		bool EmitEffectiveAddress(u32 op);
+		bool EmitLoadOp(u32 op);
+		bool EmitStoreOp(u32 op);
 
 		VitaA32::CodeBuffer& m_code;
 		u32 m_native_instruction_count = 0;
