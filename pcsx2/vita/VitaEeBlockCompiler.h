@@ -348,7 +348,7 @@ namespace VitaEE
 			const void* event_exit, bool branch_delay_slot);
 		bool EmitLHU(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, bool branch_delay_slot);
-		bool EmitLWU(u32 op);
+		bool EmitLWU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitLWL(u32 op);
 		bool EmitLWR(u32 op);
 		bool EmitLD(u32 op);
@@ -429,6 +429,8 @@ namespace VitaEE
 		bool EmitPartialDwordStore(u32 op, bool left);
 		bool EmitCounterReadFlagFromAddress(unsigned host_reg);
 		bool EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitAddressErrorEventExit(u32 next_pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool store);
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
 		bool EmitDeviceTracePreInstruction(u32 pc);
