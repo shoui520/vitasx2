@@ -121,6 +121,43 @@ bool VitaRecordIopPreInstruction(u32 pc, u32 opcode)
 	return callback ? callback(pc, opcode) : false;
 }
 
+static void AccumulateIopA32HelperClass(u32 opcode_class, u32 hits, u32 first_pc, u32 first_opcode)
+{
+	for (u32 i = 0; i < s_iop_a32_stats.helper_opcode_class_count; i++)
+	{
+		if (s_iop_a32_stats.helper_opcode_classes[i] == opcode_class)
+		{
+			s_iop_a32_stats.helper_opcode_class_hits[i] += hits;
+			return;
+		}
+	}
+
+	if (s_iop_a32_stats.helper_opcode_class_count >= VitaA32IopProviderStats::HELPER_OPCODE_CLASS_SLOTS)
+	{
+		s_iop_a32_stats.helper_opcode_class_overflow += hits;
+		return;
+	}
+
+	const u32 slot = s_iop_a32_stats.helper_opcode_class_count++;
+	s_iop_a32_stats.helper_opcode_classes[slot] = opcode_class;
+	s_iop_a32_stats.helper_opcode_class_hits[slot] = hits;
+	s_iop_a32_stats.helper_opcode_class_first_pc[slot] = first_pc;
+	s_iop_a32_stats.helper_opcode_class_first_opcode[slot] = first_opcode;
+}
+
+static void AccumulateIopA32HelperClasses(const VitaIOP::BlockExecutionResult& result)
+{
+	s_iop_a32_stats.helper_opcode_class_overflow += result.helper_opcode_class_overflow;
+	for (u32 i = 0; i < result.helper_opcode_class_count; i++)
+	{
+		AccumulateIopA32HelperClass(
+			result.helper_opcode_classes[i],
+			result.helper_opcode_class_hits[i],
+			result.helper_opcode_class_first_pc[i],
+			result.helper_opcode_class_first_opcode[i]);
+	}
+}
+
 static void recRecordInterpreterFallback(u32 pc, u32 opcode, VitaA32EeFallbackReason reason)
 {
 	if (s_ee_a32_stats.interpreter_steps == 0)
@@ -684,6 +721,7 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.compiled_instructions += result.instruction_count;
 			s_iop_a32_stats.native_instructions += result.native_instruction_count;
 			s_iop_a32_stats.helper_instructions += result.helper_instruction_count;
+			AccumulateIopA32HelperClasses(result);
 		}
 		s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
 

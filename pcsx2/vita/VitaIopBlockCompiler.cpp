@@ -232,6 +232,63 @@ namespace
 		}
 	}
 
+	constexpr u32 IopOpcodeClass(u32 op)
+	{
+		const u32 opcode = op >> 26;
+		switch (opcode)
+		{
+			case 0x00: // SPECIAL
+				return (opcode << 24) | (op & 0x3f);
+			case 0x01: // REGIMM
+				return (opcode << 24) | RT(op);
+			case 0x10: // COP0
+			case 0x12: // COP2/GTE
+				if (RS(op) >= 0x10)
+					return (opcode << 24) | (RS(op) << 8) | (op & 0x3f);
+				return (opcode << 24) | (RS(op) << 8);
+			default:
+				return opcode << 24;
+		}
+	}
+
+	constexpr bool IsIopBranchOrJumpOpcode(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x00: // SPECIAL
+				return (op & 0x3f) == 0x08 || (op & 0x3f) == 0x09; // JR/JALR
+			case 0x01: // REGIMM
+				switch (RT(op))
+				{
+					case 0x00: // BLTZ
+					case 0x01: // BGEZ
+					case 0x10: // BLTZAL
+					case 0x11: // BGEZAL
+						return true;
+					default:
+						return false;
+				}
+			case 0x02: // J
+			case 0x03: // JAL
+			case 0x04: // BEQ
+			case 0x05: // BNE
+			case 0x06: // BLEZ
+			case 0x07: // BGTZ
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	constexpr bool IsIopExceptionOpcode(u32 op)
+	{
+		if ((op >> 26) != 0x00)
+			return false;
+
+		const u32 function = op & 0x3f;
+		return function == 0x0c || function == 0x0d; // SYSCALL/BREAK
+	}
+
 	static_assert(PC_OFFSET <= 4095);
 	static_assert(CODE_OFFSET <= 4095);
 	static_assert(CYCLE_OFFSET + sizeof(u32) <= 4095);
@@ -337,6 +394,31 @@ namespace VitaIOP
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, pc) &&
 			   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, PC_OFFSET);
+	}
+
+	void BlockCompiler::RecordHelperOpcode(u32 op, u32 pc)
+	{
+		const u32 opcode_class = IopOpcodeClass(op);
+		for (u32 i = 0; i < m_helper_opcode_class_count; i++)
+		{
+			if (m_helper_opcode_classes[i] == opcode_class)
+			{
+				m_helper_opcode_class_hits[i]++;
+				return;
+			}
+		}
+
+		if (m_helper_opcode_class_count >= BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS)
+		{
+			m_helper_opcode_class_overflow++;
+			return;
+		}
+
+		const u32 slot = m_helper_opcode_class_count++;
+		m_helper_opcode_classes[slot] = opcode_class;
+		m_helper_opcode_class_hits[slot] = 1;
+		m_helper_opcode_class_first_pc[slot] = pc;
+		m_helper_opcode_class_first_opcode[slot] = op;
 	}
 
 	bool BlockCompiler::EmitIncrementCycle()
@@ -1207,6 +1289,7 @@ namespace VitaIOP
 		}
 
 		void (*helper)() = psxBSC[op >> 26];
+		RecordHelperOpcode(op, pc);
 		if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(helper), HOST_CALL_SCRATCH) ||
 			!EmitPcChangedExitCheck(next_pc, direct_exit_branches))
 		{
@@ -1246,6 +1329,12 @@ namespace VitaIOP
 		direct_exit_branches.reserve(instruction_count * 2);
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
+		m_helper_opcode_class_count = 0;
+		m_helper_opcode_class_overflow = 0;
+		m_helper_opcode_classes.fill(0);
+		m_helper_opcode_class_hits.fill(0);
+		m_helper_opcode_class_first_pc.fill(0);
+		m_helper_opcode_class_first_opcode.fill(0);
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 pc = start_pc + i * 4;
@@ -1338,6 +1427,11 @@ namespace VitaIOP
 		result->start_pc = start_pc;
 		result->stop_pc = start_pc;
 
+		const auto add_instruction = [&](u32 pc) {
+			result->instruction_count++;
+			result->stop_pc = pc + 4;
+		};
+
 		for (u32 i = 0; i < max_instruction_count; i++)
 		{
 			if (i > ((UINT32_MAX - start_pc) / 4))
@@ -1351,8 +1445,28 @@ namespace VitaIOP
 			if (!BlockCompiler::CanCompileOpcode(op))
 				return true;
 
-			result->instruction_count++;
-			result->stop_pc = pc + 4;
+			if (IsIopBranchOrJumpOpcode(op))
+			{
+				if (i + 1 >= max_instruction_count ||
+					i >= ((UINT32_MAX - start_pc) / 4) ||
+					((pc + 4) & 0xffcu) == 0)
+				{
+					return result->instruction_count != 0;
+				}
+
+				const u32 delay_pc = pc + 4;
+				const u32 delay_op = iopMemRead32(delay_pc);
+				if (!BlockCompiler::CanCompileOpcode(delay_op))
+					return result->instruction_count != 0;
+
+				add_instruction(pc);
+				add_instruction(delay_pc);
+				return true;
+			}
+
+			add_instruction(pc);
+			if (IsIopExceptionOpcode(op))
+				return true;
 		}
 
 		return true;
@@ -1517,6 +1631,12 @@ namespace VitaIOP
 				block.instruction_count = instruction_count;
 				block.native_instruction_count = compiler.NativeInstructionCount();
 				block.helper_instruction_count = compiler.HelperInstructionCount();
+				block.helper_opcode_class_count = compiler.HelperOpcodeClassCount();
+				block.helper_opcode_class_overflow = compiler.HelperOpcodeClassOverflow();
+				block.helper_opcode_classes = compiler.HelperOpcodeClasses();
+				block.helper_opcode_class_hits = compiler.HelperOpcodeClassHits();
+				block.helper_opcode_class_first_pc = compiler.HelperOpcodeClassFirstPc();
+				block.helper_opcode_class_first_opcode = compiler.HelperOpcodeClassFirstOpcode();
 				block.valid = true;
 				return true;
 			}
@@ -1546,6 +1666,12 @@ namespace VitaIOP
 		result->instruction_count = block.instruction_count;
 		result->native_instruction_count = block.native_instruction_count;
 		result->helper_instruction_count = block.helper_instruction_count;
+		result->helper_opcode_class_count = block.helper_opcode_class_count;
+		result->helper_opcode_class_overflow = block.helper_opcode_class_overflow;
+		result->helper_opcode_classes = block.helper_opcode_classes;
+		result->helper_opcode_class_hits = block.helper_opcode_class_hits;
+		result->helper_opcode_class_first_pc = block.helper_opcode_class_first_pc;
+		result->helper_opcode_class_first_opcode = block.helper_opcode_class_first_opcode;
 		result->code_size = block.code.Size();
 		result->cache_slots = static_cast<u32>(m_cache.size());
 		result->code_cache_resets = m_code_cache_resets;
