@@ -818,6 +818,7 @@ namespace VitaIOP
 		const unsigned opcode = op >> 26;
 		const unsigned rt = RT(op);
 		const void* helper = nullptr;
+		u8 alignment_mask = 0;
 
 		switch (opcode)
 		{
@@ -828,44 +829,116 @@ namespace VitaIOP
 			case 0x21: // LH
 			case 0x25: // LHU
 				helper = reinterpret_cast<const void*>(&iopMemRead16);
+				alignment_mask = 1;
 				break;
 			case 0x23: // LW
 				helper = reinterpret_cast<const void*>(&iopMemRead32);
+				alignment_mask = 3;
 				break;
 			default:
 				return false;
 		}
 
+		const auto emit_sign_extend = [&]() -> bool {
+			switch (opcode)
+			{
+				case 0x20: // LB
+					return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 24) &&
+						   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 24);
+				case 0x21: // LH
+					return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 16) &&
+						   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 16);
+				default:
+					return true;
+			}
+		};
+
+		const auto emit_store_result = [&]() -> bool {
+			return emit_sign_extend() && EmitStoreGpr(rt, HOST_TMP0);
+		};
+
 		if (!EmitEffectiveAddress(op) ||
+			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitMovImm32(HOST_TMP2, 0x10000000u) ||
+			!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+		{
+			return false;
+		}
+
+		// PCSX2 owner: x86/iR3000Atables.cpp::rpsxLoad() uses direct iopMem->Main
+		// reads for ordinary IOP RAM aliases and iopMemRead* helpers for MMIO/ROM.
+		const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branch == static_cast<size_t>(-1))
+			return false;
+
+		size_t alignment_fallback_branch = static_cast<size_t>(-1);
+		if (rt != 0 && alignment_mask != 0)
+		{
+			if (!m_code.EmitAndImm8(HOST_TMP2, HOST_SAVED0, alignment_mask, true))
+				return false;
+
+			alignment_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (alignment_fallback_branch == static_cast<size_t>(-1))
+				return false;
+		}
+
+		if (rt != 0)
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
+				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_TMP2) ||
+				!m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
+				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP1, HOST_TMP0))
+			{
+				return false;
+			}
+
+			switch (opcode)
+			{
+				case 0x20: // LB
+				case 0x24: // LBU
+					if (!m_code.EmitLdrbImm12(HOST_TMP0, HOST_TMP0, 0))
+						return false;
+					break;
+				case 0x21: // LH
+				case 0x25: // LHU
+					if (!m_code.EmitLdrhImm8(HOST_TMP0, HOST_TMP0, 0))
+						return false;
+					break;
+				case 0x23: // LW
+					if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+						return false;
+					break;
+				default:
+					return false;
+			}
+
+			if (!emit_store_result())
+				return false;
+		}
+
+		const size_t done_branch = m_code.EmitBranchPlaceholder();
+		if (done_branch == static_cast<size_t>(-1))
+			return false;
+
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE))
+			return false;
+		if (alignment_fallback_branch != static_cast<size_t>(-1) &&
+			!m_code.PatchBranch(alignment_fallback_branch, fallback_target, VitaA32::Condition::NE))
+		{
+			return false;
+		}
+
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH))
 		{
 			return false;
 		}
 
-		if (rt == 0)
-			return true;
+		if (rt != 0 && !emit_store_result())
+			return false;
 
-		switch (opcode)
-		{
-			case 0x20: // LB
-				if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 24) ||
-					!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 24))
-				{
-					return false;
-				}
-				break;
-			case 0x21: // LH
-				if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 16) ||
-					!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 16))
-				{
-					return false;
-				}
-				break;
-			default:
-				break;
-		}
-
-		return EmitStoreGpr(rt, HOST_TMP0);
+		return m_code.PatchBranch(done_branch, m_code.Size());
 	}
 
 	bool BlockCompiler::EmitStoreOp(u32 op)
