@@ -101,6 +101,20 @@ namespace
 		}
 	}
 
+	constexpr bool IsNativeRegimmOpcode(u32 op)
+	{
+		switch (RT(op))
+		{
+			case 0x00: // BLTZ
+			case 0x01: // BGEZ
+			case 0x10: // BLTZAL
+			case 0x11: // BGEZAL
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	constexpr bool IsNativeSpecialOpcode(u32 op)
 	{
 		switch (op & 0x3f)
@@ -139,10 +153,14 @@ namespace
 		{
 			case 0x00: // SPECIAL
 				return IsNativeSpecialOpcode(op);
+			case 0x01: // REGIMM
+				return IsNativeRegimmOpcode(op);
 			case 0x02: // J
 			case 0x03: // JAL
 			case 0x04: // BEQ
 			case 0x05: // BNE
+			case 0x06: // BLEZ
+			case 0x07: // BGTZ
 			case 0x08: // ADDI
 			case 0x09: // ADDIU
 			case 0x0a: // SLTI
@@ -605,6 +623,64 @@ namespace VitaIOP
 			   m_code.PatchBranch(not_taken, m_code.Size(), skip_taken);
 	}
 
+	bool BlockCompiler::EmitSignedBranchOp(u32 op, u32 pc)
+	{
+		const unsigned opcode = op >> 26;
+		const unsigned rt = RT(op);
+		const bool link = (opcode == 0x01 && (rt == 0x10 || rt == 0x11));
+		if (link)
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP0, pc + 8) ||
+				!EmitStoreGpr(31, HOST_TMP0))
+			{
+				return false;
+			}
+		}
+
+		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
+			!m_code.EmitMovImm8(HOST_TMP1, 0) ||
+			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
+		{
+			return false;
+		}
+
+		VitaA32::Condition skip_taken = VitaA32::Condition::AL;
+		if (opcode == 0x01)
+		{
+			switch (rt)
+			{
+				case 0x00: // BLTZ
+				case 0x10: // BLTZAL
+					skip_taken = VitaA32::Condition::GE;
+					break;
+				case 0x01: // BGEZ
+				case 0x11: // BGEZAL
+					skip_taken = VitaA32::Condition::LT;
+					break;
+				default:
+					return false;
+			}
+		}
+		else if (opcode == 0x06) // BLEZ
+		{
+			skip_taken = VitaA32::Condition::GT;
+		}
+		else if (opcode == 0x07) // BGTZ
+		{
+			skip_taken = VitaA32::Condition::LE;
+		}
+		else
+		{
+			return false;
+		}
+
+		const size_t not_taken = m_code.EmitBranchPlaceholder(skip_taken);
+		return m_code.EmitMovImm32(HOST_TMP0, BranchTarget(pc, op)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
+			   EndBlockReturn(BlockExitKind::Direct) &&
+			   m_code.PatchBranch(not_taken, m_code.Size(), skip_taken);
+	}
+
 	bool BlockCompiler::EmitJumpOp(u32 op, u32 pc)
 	{
 		if ((op >> 26) == 0x03) // JAL
@@ -738,12 +814,17 @@ namespace VitaIOP
 		{
 			case 0x00: // SPECIAL
 				return EmitNativeSPECIAL(op, pc);
+			case 0x01: // REGIMM
+				return EmitSignedBranchOp(op, pc);
 			case 0x02: // J
 			case 0x03: // JAL
 				return EmitJumpOp(op, pc);
 			case 0x04: // BEQ
 			case 0x05: // BNE
 				return EmitConditionalBranchOp(op, pc);
+			case 0x06: // BLEZ
+			case 0x07: // BGTZ
+				return EmitSignedBranchOp(op, pc);
 			case 0x08: // ADDI
 			case 0x09: // ADDIU
 			case 0x0a: // SLTI

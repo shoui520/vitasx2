@@ -75,6 +75,7 @@ namespace VitaIOP
 		bool EmitLoadOp(u32 op);
 		bool EmitStoreOp(u32 op);
 		bool EmitConditionalBranchOp(u32 op, u32 pc);
+		bool EmitSignedBranchOp(u32 op, u32 pc);
 		bool EmitJumpOp(u32 op, u32 pc);
 		bool EmitRegisterJumpOp(u32 op, u32 pc);
 		bool EmitCop0TransferOp(u32 op, bool to_cop0);
