@@ -5,6 +5,7 @@
 
 #include "R3000A.h"
 #include "Common.h"
+#include "DebugTools/SifTrace.h"
 #include "Sif.h"
 #include "IopHw.h"
 
@@ -38,7 +39,12 @@ static __fi bool WriteEEtoFifo()
 		return false;
 	}
 
+	const u32 ee_madr = sif1ch.madr;
+	const u32 fifo_before = sif1.fifo.size;
 	sif1.fifo.write((u32*)ptag, writeSize << 2);
+	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 1, Pcsx2Trace::SifTraceDirectionEeToFifo,
+		ptag, static_cast<u32>(writeSize << 2), ee_madr, hw_dma10.madr, sif1ch.qwc, sif1.iop.counter,
+		fifo_before, sif1.fifo.size, sif1ch.chcr._u32, sif1data, sif1ch.tadr);
 
 	sif1ch.madr += writeSize << 4;
 	hwDmacSrcTadrInc(sif1ch);
@@ -58,7 +64,13 @@ static __fi bool WriteFifoToIOP()
 
 	SIF_LOG("Sif 1 IOP doing transfer %04X to %08X", readSize, HW_DMA10_MADR);
 
-	sif1.fifo.read((u32*)iopPhysMem(hw_dma10.madr), readSize);
+	const u32 iop_madr = hw_dma10.madr;
+	const u32 fifo_before = sif1.fifo.size;
+	void* destination = iopPhysMem(iop_madr);
+	sif1.fifo.read((u32*)destination, readSize);
+	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 1, Pcsx2Trace::SifTraceDirectionFifoToIop,
+		destination, static_cast<u32>(readSize), sif1ch.madr, iop_madr, sif1ch.qwc, sif1.iop.counter,
+		fifo_before, sif1.fifo.size, HW_DMA10_CHCR, sif1data, sif1ch.tadr);
 	psxCpu->Clear(hw_dma10.madr, readSize);
 	hw_dma10.madr += readSize << 2;
 	sif1.iop.cycles += readSize >> 2;		// fixme: should be >> 4
@@ -85,7 +97,12 @@ static __fi bool ProcessEETag()
 	if (sif1ch.chcr.TTE)
 	{
 		Console.WriteLn("SIF1 TTE");
-		sif1.fifo.write((u32*)ptag + 2, 2);
+		const u32 fifo_before = sif1.fifo.size;
+		const void* tag_source = (u32*)ptag + 2;
+		sif1.fifo.write((u32*)tag_source, 2);
+		Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoTag, 1, Pcsx2Trace::SifTraceDirectionEeToFifo,
+			tag_source, 2, sif1ch.tadr, hw_dma10.madr, sif1ch.qwc, sif1.iop.counter,
+			fifo_before, sif1.fifo.size, sif1ch.chcr._u32, ptag->_u32, sif1ch.tadr);
 	}
 
 	SIF_LOG("%s", ptag->tag_to_str().c_str());
@@ -106,7 +123,11 @@ static __fi bool ProcessEETag()
 static __fi bool SIFIOPReadTag()
 {
 	// Read a tag.
+	const u32 fifo_before = sif1.fifo.size;
 	sif1.fifo.read((u32*)&sif1.iop.data, 4);
+	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoTag, 1, Pcsx2Trace::SifTraceDirectionFifoToIop,
+		&sif1.iop.data, 4, sif1ch.madr, hw_dma10.madr, sif1ch.qwc, sif1.iop.counter,
+		fifo_before, sif1.fifo.size, HW_DMA10_CHCR, sif1data, sif1ch.tadr);
 	//sif1words = (sif1words + 3) & 0xfffffffc; // Round up to nearest 4.
 	SIF_LOG("SIF 1 IOP: dest chain tag madr:%08X wc:%04X id:%X irq:%d",
 		sif1data & 0xffffff, sif1words, sif1tag.ID, sif1tag.IRQ);

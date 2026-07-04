@@ -27,6 +27,7 @@ add_library(pcsx2core STATIC
 	DebugTools/GsTrace.cpp
 	DebugTools/IpuTrace.cpp
 	DebugTools/MemTrace.cpp
+	DebugTools/SifTrace.cpp
 	DebugTools/Spu2Trace.cpp
 	DebugTools/VifTrace.cpp
 	DebugTools/VuTrace.cpp

@@ -5,6 +5,7 @@
 
 #include "R3000A.h"
 #include "Common.h"
+#include "DebugTools/SifTrace.h"
 #include "Sif.h"
 #include "IopHw.h"
 
@@ -37,7 +38,12 @@ static __fi bool WriteFifoToEE()
 		return false;
 	}
 
+	const u32 ee_madr = sif0ch.madr;
+	const u32 fifo_before = sif0.fifo.size;
 	sif0.fifo.read((u32*)ptag, readSize << 2);
+	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 0, Pcsx2Trace::SifTraceDirectionFifoToEe,
+		ptag, static_cast<u32>(readSize << 2), ee_madr, hw_dma9.madr, sif0ch.qwc, sif0.iop.counter,
+		fifo_before, sif0.fifo.size, sif0ch.chcr._u32, sif0data, hw_dma9.tadr);
 
 	// Clearing handled by vtlb memory protection and manual blocks.
 	//Cpu->Clear(sif0ch.madr, readSize*4);
@@ -64,7 +70,13 @@ static __fi bool WriteIOPtoFifo()
 
 	SIF_LOG("Write IOP to Fifo: +++++++++++ %lX of %lX", writeSize, sif0.iop.counter);
 
-	sif0.fifo.write((u32*)iopPhysMem(hw_dma9.madr), writeSize);
+	const u32 iop_madr = hw_dma9.madr;
+	const u32 fifo_before = sif0.fifo.size;
+	const void* source = iopPhysMem(iop_madr);
+	sif0.fifo.write((u32*)source, writeSize);
+	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 0, Pcsx2Trace::SifTraceDirectionIopToFifo,
+		source, static_cast<u32>(writeSize), sif0ch.madr, iop_madr, sif0ch.qwc, sif0.iop.counter,
+		fifo_before, sif0.fifo.size, HW_DMA9_CHCR, sif0data, hw_dma9.tadr);
 	hw_dma9.madr += writeSize << 2;
 
 	// iop is 1/8th the clock rate of the EE and psxcycles is in words (not quadwords).
@@ -81,7 +93,11 @@ static __fi bool ProcessEETag()
 	alignas(16) static u32 tag[4];
 	tDMA_TAG& ptag(*(tDMA_TAG*)tag);
 
+	const u32 fifo_before = sif0.fifo.size;
 	sif0.fifo.read((u32*)&tag[0], 4); // Tag
+	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoTag, 0, Pcsx2Trace::SifTraceDirectionFifoToEe,
+		tag, 4, sif0ch.madr, hw_dma9.madr, sif0ch.qwc, sif0.iop.counter,
+		fifo_before, sif0.fifo.size, sif0ch.chcr._u32, tag[0], hw_dma9.tadr);
 	SIF_LOG("SIF0 EE read tag: %x %x %x %x", tag[0], tag[1], tag[2], tag[3]);
 
 	sif0ch.unsafeTransfer(&ptag);
@@ -121,7 +137,12 @@ static __fi bool ProcessIOPTag()
 
 	// send the EE's side of the DMAtag.  The tag is only 64 bits, with the upper 64 bits being the next IOP tag
 	// ignored by the EE, however required for alignment and used as junk data in small packets.
-	sif0.fifo.write((u32*)iopPhysMem(hw_dma9.tadr + 8), 4);
+	const u32 fifo_before = sif0.fifo.size;
+	const void* ee_tag_source = iopPhysMem(hw_dma9.tadr + 8);
+	sif0.fifo.write((u32*)ee_tag_source, 4);
+	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoTag, 0, Pcsx2Trace::SifTraceDirectionIopToFifo,
+		ee_tag_source, 4, sif0ch.madr, hw_dma9.madr, sif0ch.qwc, sif0.iop.counter,
+		fifo_before, sif0.fifo.size, HW_DMA9_CHCR, sif0data, hw_dma9.tadr);
 
 	// I know we just sent 1QW, because of the size of the EE read, but only 64bits was valid
 	// so we advance by 64bits after the EE tag to get the next IOP tag.
