@@ -66,6 +66,14 @@ using VitaEePreInstructionTraceCallback = bool (*)(u32 pc, u32 opcode);
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback);
 bool VitaRecordEePreInstruction(u32 pc, u32 opcode);
 
+// Optional trace-harness fast path for A32 exact-stream recording. The callback
+// returns how many leading pre-instruction records in a straight-line native
+// window were consumed by an outer skip gate without writing trace state.
+using VitaEePreInstructionTraceWindowSkipCallback =
+	u32 (*)(u32 start_pc, u32 first_opcode, u32 instruction_count);
+void VitaSetEePreInstructionTraceWindowSkipCallback(
+	VitaEePreInstructionTraceWindowSkipCallback callback);
+
 enum class VitaA32EeTraceMode
 {
 	InstructionWindow,

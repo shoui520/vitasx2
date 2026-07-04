@@ -23,6 +23,7 @@
 #include "common/Console.h"
 
 static VitaEePreInstructionTraceCallback s_ee_pre_instruction_trace_callback = nullptr;
+static VitaEePreInstructionTraceWindowSkipCallback s_ee_pre_instruction_trace_window_skip_callback = nullptr;
 static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback = nullptr;
 static VitaEE::BlockExecutor s_ee_a32_executor;
 static VitaA32EeProviderStats s_ee_a32_stats;
@@ -57,6 +58,11 @@ const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason)
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback)
 {
 	s_ee_pre_instruction_trace_callback = callback;
+}
+
+void VitaSetEePreInstructionTraceWindowSkipCallback(VitaEePreInstructionTraceWindowSkipCallback callback)
+{
+	s_ee_pre_instruction_trace_window_skip_callback = callback;
 }
 
 void VitaRequestA32EeCacheReset()
@@ -195,7 +201,18 @@ static bool recRecordEeWindow(u32 start_pc, u32 instruction_count, u32* executab
 
 	*executable_instruction_count = 0;
 	s_ee_a32_prerecording_window = true;
-	for (u32 i = 0; i < instruction_count; i++)
+	u32 first_recorded_instruction = 0;
+	if (instruction_count != 0 &&
+		s_ee_pre_instruction_trace_callback && s_ee_pre_instruction_trace_window_skip_callback)
+	{
+		const u32 requested_skip = s_ee_pre_instruction_trace_window_skip_callback(
+			start_pc, memRead32(start_pc), instruction_count);
+		first_recorded_instruction =
+			requested_skip < instruction_count ? requested_skip : instruction_count;
+		*executable_instruction_count = first_recorded_instruction;
+	}
+
+	for (u32 i = first_recorded_instruction; i < instruction_count; i++)
 	{
 		const u32 pc = start_pc + i * 4;
 		if (VitaRecordEePreInstruction(pc, memRead32(pc)))
