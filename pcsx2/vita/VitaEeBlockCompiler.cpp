@@ -8660,9 +8660,6 @@ namespace VitaEE
 		size_t handler_fallback = static_cast<size_t>(-1);
 		const bool needs_counter_event = rt != 0;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			(branch_delay_slot && needs_counter_event &&
-			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
-			(needs_counter_event && !m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0)) ||
 			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
 		{
 			return false;
@@ -8678,44 +8675,52 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t value_ready = m_code.EmitBranchPlaceholder();
-		if (value_ready == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if ((needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead32Checked)))
-		{
-			return false;
-		}
-
-		const size_t value_ready_target = m_code.Size();
 		auto emit_result_tail = [&]() -> bool {
 			if (rt == 0)
 				return true;
 
 			return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1) &&
-				   EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit) &&
-				   (!branch_delay_slot ||
-					   m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0));
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		};
 
 		if (!emit_result_tail())
 			return false;
 
-		const size_t after_address_error = m_code.EmitBranchPlaceholder();
-		if (after_address_error == static_cast<size_t>(-1))
+		const size_t done = m_code.EmitBranchPlaceholder();
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t fallback_target = m_code.Size();
+		if ((branch_delay_slot && needs_counter_event &&
+			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
+			(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead32Checked)) ||
+			!emit_result_tail())
+		{
+			return false;
+		}
+
+		if (needs_counter_event &&
+			(!EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit) ||
+			 (branch_delay_slot &&
+				 !m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0))))
+		{
+			return false;
+		}
+
+		const size_t fallback_done = m_code.EmitBranchPlaceholder();
+		if (fallback_done == static_cast<size_t>(-1))
 			return false;
 
 		const size_t address_error_target = m_code.Size();
 		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, false))
 			return false;
 
+		const size_t done_target = m_code.Size();
 		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
 			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(value_ready, value_ready_target) &&
-			   m_code.PatchBranch(after_address_error, m_code.Size());
+			   m_code.PatchBranch(done, done_target) &&
+			   m_code.PatchBranch(fallback_done, done_target);
 	}
 
 	bool BlockCompiler::EmitLBU(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -10406,13 +10411,8 @@ namespace VitaEE
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
-		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			(branch_delay_slot && needs_counter_event &&
-			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
-			(needs_counter_event && !m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0)))
-		{
+		if (!EmitEffectiveAddress(op, HOST_TMP0))
 			return false;
-		}
 
 		if (alignment_mask != 0)
 		{
@@ -10442,74 +10442,74 @@ namespace VitaEE
 				break;
 		}
 
-		const size_t value_ready = m_code.EmitBranchPlaceholder();
-		if (value_ready == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if ((needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
-			!m_code.EmitCallAbsolute(read_helper))
-		{
-			return false;
-		}
-
 		const auto emit_sign_extend_low = [&]() -> bool {
 			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
 					   static_cast<u8>(sign_shift)) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
 					   static_cast<u8>(sign_shift));
 		};
-		if (rt != 0 && sign_extend && !emit_sign_extend_low())
-			return false;
 
-		const size_t value_ready_target = m_code.Size();
-		size_t after_address_error = static_cast<size_t>(-1);
-		size_t address_error_target = static_cast<size_t>(-1);
-		auto emit_address_error_path = [&]() -> bool {
-			if (unaligned_fallback == static_cast<size_t>(-1))
+		const auto emit_store_result = [&]() -> bool {
+			if (rt == 0)
 				return true;
 
-			after_address_error = m_code.EmitBranchPlaceholder();
-			if (after_address_error == static_cast<size_t>(-1))
-				return false;
-
-			address_error_target = m_code.Size();
-			return EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, false);
-		};
-		auto patch_exits = [&]() -> bool {
-			return (unaligned_fallback == static_cast<size_t>(-1) ||
-					   m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE)) &&
-				   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-				   m_code.PatchBranch(value_ready, value_ready_target) &&
-				   (after_address_error == static_cast<size_t>(-1) ||
-					   m_code.PatchBranch(after_address_error, m_code.Size()));
-		};
-
-		if (rt == 0)
-		{
-			// PCSX2's scalar loads still access memory for r0, then return before
-			// the counter-read event test, so HOST_BRANCH_FLAG was not overwritten.
-			return emit_address_error_path() && patch_exits();
-		}
-
-		if (sign_extend)
-		{
-			if (!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31))
+			if (sign_extend)
+			{
+				if (!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31))
+					return false;
+			}
+			else if (!m_code.EmitMovImm8(HOST_TMP1, 0))
 			{
 				return false;
 			}
-		}
-		else if (!m_code.EmitMovImm8(HOST_TMP1, 0))
+
+			return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		};
+
+		if (!emit_store_result())
+			return false;
+
+		const size_t done = m_code.EmitBranchPlaceholder();
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t fallback_target = m_code.Size();
+		if ((branch_delay_slot && needs_counter_event &&
+			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
+			(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
+			!m_code.EmitCallAbsolute(read_helper) ||
+			(rt != 0 && sign_extend && !emit_sign_extend_low()) ||
+			!emit_store_result())
 		{
 			return false;
 		}
 
-		return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1) &&
-			   EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit) &&
-			   (!branch_delay_slot ||
-				   m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0)) &&
-			   emit_address_error_path() &&
-			   patch_exits();
+		if (needs_counter_event &&
+			(!EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit) ||
+			 (branch_delay_slot &&
+				 !m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0))))
+		{
+			return false;
+		}
+
+		const size_t fallback_done = m_code.EmitBranchPlaceholder();
+		if (fallback_done == static_cast<size_t>(-1))
+			return false;
+
+		size_t address_error_target = static_cast<size_t>(-1);
+		if (unaligned_fallback != static_cast<size_t>(-1))
+		{
+			address_error_target = m_code.Size();
+			if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, false))
+				return false;
+		}
+
+		const size_t done_target = m_code.Size();
+		return (unaligned_fallback == static_cast<size_t>(-1) ||
+				   m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE)) &&
+			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
+			   m_code.PatchBranch(done, done_target) &&
+			   m_code.PatchBranch(fallback_done, done_target);
 	}
 
 	bool BlockCompiler::EmitCounterReadFlagFromAddress(unsigned host_reg)
