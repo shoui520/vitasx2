@@ -1202,8 +1202,7 @@ namespace VitaIOP
 		};
 
 		const auto emit_clear_stored_word = [&]() -> bool {
-			return m_code.EmitMovImm32(HOST_TMP2, ~3u) &&
-				   m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_TMP2) &&
+			return m_code.EmitBicImm32(HOST_TMP0, HOST_SAVED0, 3) &&
 				   m_code.EmitMovImm8(HOST_TMP1, 1) &&
 				   m_code.EmitMovImm32(HOST_CALL_SCRATCH,
 					   static_cast<u32>(reinterpret_cast<uptr>(&psxCpu))) &&
@@ -1282,8 +1281,7 @@ namespace VitaIOP
 		if (!EmitEffectiveAddress(op) ||
 			!m_code.EmitAndImm8(HOST_SAVED0, HOST_TMP0, 3) ||
 			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_SAVED0, VitaA32::ShiftType::LSL, 3) ||
-			!m_code.EmitMovImm32(HOST_TMP1, 0xfffffffcu) ||
-			!m_code.EmitAndReg(HOST_SAVED1, HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitBicImm32(HOST_SAVED1, HOST_TMP0, 3) ||
 			!m_code.EmitTstImm32(HOST_SAVED1, 0x10000000u))
 		{
 			return false;
@@ -2045,8 +2043,7 @@ namespace VitaIOP
 		if ((op >> 26) == 0x3a) // SWC2
 		{
 			const auto emit_clear_stored_word = [&]() -> bool {
-				return m_code.EmitMovImm32(HOST_TMP2, ~3u) &&
-					   m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_TMP2) &&
+				return m_code.EmitBicImm32(HOST_TMP0, HOST_SAVED1, 3) &&
 					   m_code.EmitMovImm8(HOST_TMP1, 1) &&
 					   m_code.EmitMovImm32(HOST_CALL_SCRATCH,
 						   static_cast<u32>(reinterpret_cast<uptr>(&psxCpu))) &&
