@@ -72,6 +72,7 @@ namespace VitaIOP
 		bool EmitShiftRegOp(u32 op);
 		bool EmitSetLessThanRegOp(u32 op, bool is_signed);
 		bool EmitMultiplyOp(u32 op, bool is_signed);
+		bool EmitExceptionOp(u32 pc, u32 code);
 		bool EmitImmediateOp(u32 op);
 		bool EmitEffectiveAddress(u32 op);
 		bool EmitLoadOp(u32 op);

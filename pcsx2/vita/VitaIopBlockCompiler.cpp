@@ -161,6 +161,8 @@ namespace
 			case 0x07: // SRAV
 			case 0x08: // JR
 			case 0x09: // JALR
+			case 0x0c: // SYSCALL
+			case 0x0d: // BREAK
 			case 0x10: // MFHI
 			case 0x11: // MTHI
 			case 0x12: // MFLO
@@ -255,6 +257,14 @@ namespace
 		if (Cpu)
 			Cpu->ExitExecution();
 		return true;
+	}
+
+	extern "C" __attribute__((noinline)) void VitaIopA32RaiseException(u32 pc, u32 code)
+	{
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSYSCALL()/psxBREAK()
+		// subtract the pre-incremented pc before entering R3000A.cpp::psxException().
+		psxRegs.pc = pc;
+		psxException(code, iopIsDelaySlot);
 	}
 
 	bool DecodeExitKind(u32 value, VitaIOP::BlockExitKind* exit)
@@ -532,6 +542,14 @@ namespace VitaIOP
 
 		return m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
 			   m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+	}
+
+	bool BlockCompiler::EmitExceptionOp(u32 pc, u32 code)
+	{
+		return m_code.EmitMovImm32(HOST_TMP0, pc) &&
+			   m_code.EmitMovImm32(HOST_TMP1, code) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaIopA32RaiseException), HOST_CALL_SCRATCH) &&
+			   EndBlockReturn(BlockExitKind::Direct);
 	}
 
 	bool BlockCompiler::EmitImmediateOp(u32 op)
@@ -1056,6 +1074,10 @@ namespace VitaIOP
 			case 0x08: // JR
 			case 0x09: // JALR
 				return EmitRegisterJumpOp(op, pc);
+			case 0x0c: // SYSCALL
+				return EmitExceptionOp(pc, 0x20);
+			case 0x0d: // BREAK
+				return EmitExceptionOp(pc, 0x24);
 			case 0x10: // MFHI
 				return EmitMoveGpr(RD(op), 32);
 			case 0x11: // MTHI
