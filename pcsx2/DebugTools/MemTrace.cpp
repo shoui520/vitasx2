@@ -3,14 +3,12 @@
 
 #include "DebugTools/MemTrace.h"
 
+#include "GS/GS.h"
 #include "IopMem.h"
 #include "Memory.h"
 #include "R5900.h"
 #include "SPU2/defs.h"
 #include "VUmicro.h"
-#if defined(VITASX2_VITA)
-#include "vita/VitaGsMailbox.h"
-#endif
 
 #include "common/Error.h"
 #include "common/FileSystem.h"
@@ -200,15 +198,17 @@ namespace Pcsx2Trace
 			}
 			if ((s_config.region_mask & MemTraceRegionMaskGsLocal) != 0)
 			{
-#if defined(VITASX2_VITA)
 				size_t gs_local_size = 0;
-				const u8* gs_local = VitaGS::GetLocalMemoryForTrace(&gs_local_size);
-				if (!WriteRecord(ee_cycle, MemTraceRegionGsLocal, gs_local, gs_local_size))
+				const u8* gs_local = GSTraceLocalMemoryData(&gs_local_size);
+				if (gs_local)
+				{
+					if (!WriteRecord(ee_cycle, MemTraceRegionGsLocal, gs_local, gs_local_size))
+						return false;
+				}
+				else if (!WriteUnavailableRecord(ee_cycle, MemTraceRegionGsLocal))
+				{
 					return false;
-#else
-				if (!WriteUnavailableRecord(ee_cycle, MemTraceRegionGsLocal))
-					return false;
-#endif
+				}
 			}
 			return true;
 		}
