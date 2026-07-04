@@ -58,6 +58,8 @@ struct VitaA32IopProviderStats
 {
 	u32 compiled_blocks = 0;
 	u32 compiled_instructions = 0;
+	u32 native_instructions = 0;
+	u32 helper_instructions = 0;
 	u32 executed_blocks = 0;
 	u32 direct_exits = 0;
 	u32 failed_blocks = 0;

@@ -29,6 +29,8 @@ namespace VitaIOP
 	{
 		BlockExitKind exit = BlockExitKind::Direct;
 		u32 instruction_count = 0;
+		u32 native_instruction_count = 0;
+		u32 helper_instruction_count = 0;
 		size_t code_size = 0;
 		u32 cache_slots = 0;
 		u32 code_cache_resets = 0;
@@ -45,18 +47,33 @@ namespace VitaIOP
 		static bool CanCompileOpcode(u32 op);
 
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count);
+		u32 NativeInstructionCount() const { return m_native_instruction_count; }
+		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 
 	private:
 		bool BeginBlock();
 		bool EndBlockReturn(BlockExitKind exit);
+		bool EmitInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
+		bool EmitNativeInstruction(u32 op);
+		bool EmitNativeSPECIAL(u32 op);
 		bool EmitHelperInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitStoreCode(u32 op);
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
 		bool EmitStorePc(u32 pc);
 		bool EmitIncrementCycle();
 		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
+		bool EmitLoadGpr(unsigned guest_reg, unsigned host_reg);
+		bool EmitStoreGpr(unsigned guest_reg, unsigned host_reg);
+		bool EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg);
+		bool EmitBinaryRegOp(u32 op);
+		bool EmitShiftImmOp(u32 op);
+		bool EmitShiftRegOp(u32 op);
+		bool EmitSetLessThanRegOp(u32 op, bool is_signed);
+		bool EmitImmediateOp(u32 op);
 
 		VitaA32::CodeBuffer& m_code;
+		u32 m_native_instruction_count = 0;
+		u32 m_helper_instruction_count = 0;
 	};
 
 	class BlockExecutor
@@ -86,6 +103,8 @@ namespace VitaIOP
 			std::array<u32, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS> opcodes{};
 			u32 start_pc = 0;
 			u32 instruction_count = 0;
+			u32 native_instruction_count = 0;
+			u32 helper_instruction_count = 0;
 			bool valid = false;
 		};
 

@@ -22,18 +22,110 @@ namespace
 
 	constexpr unsigned HOST_TMP0 = 0;
 	constexpr unsigned HOST_TMP1 = 1;
+	constexpr unsigned HOST_TMP2 = 2;
 	constexpr unsigned HOST_PSX_REGS = 4;
 	constexpr unsigned HOST_CALL_SCRATCH = 12;
 
+	constexpr size_t GPR_OFFSET = offsetof(psxRegisters, GPR);
+	constexpr size_t HI_OFFSET = GPR_OFFSET + offsetof(GPRRegs, n.hi);
+	constexpr size_t LO_OFFSET = GPR_OFFSET + offsetof(GPRRegs, n.lo);
 	constexpr size_t PC_OFFSET = offsetof(psxRegisters, pc);
 	constexpr size_t CODE_OFFSET = offsetof(psxRegisters, code);
 	constexpr size_t CYCLE_OFFSET = offsetof(psxRegisters, cycle);
 	constexpr size_t IOP_CYCLE_EE_OFFSET = offsetof(psxRegisters, iopCycleEE);
 
+	constexpr unsigned RS(u32 op)
+	{
+		return (op >> 21) & 0x1f;
+	}
+
+	constexpr unsigned RT(u32 op)
+	{
+		return (op >> 16) & 0x1f;
+	}
+
+	constexpr unsigned RD(u32 op)
+	{
+		return (op >> 11) & 0x1f;
+	}
+
+	constexpr unsigned SA(u32 op)
+	{
+		return (op >> 6) & 0x1f;
+	}
+
+	constexpr s16 IMM_S(u32 op)
+	{
+		return static_cast<s16>(op);
+	}
+
+	constexpr u16 IMM_U(u32 op)
+	{
+		return static_cast<u16>(op);
+	}
+
+	constexpr size_t GprOffset(unsigned guest_reg)
+	{
+		return GPR_OFFSET + guest_reg * sizeof(u32);
+	}
+
+	constexpr bool IsNativeSpecialOpcode(u32 op)
+	{
+		switch (op & 0x3f)
+		{
+			case 0x00: // SLL
+			case 0x02: // SRL
+			case 0x03: // SRA
+			case 0x04: // SLLV
+			case 0x06: // SRLV
+			case 0x07: // SRAV
+			case 0x10: // MFHI
+			case 0x11: // MTHI
+			case 0x12: // MFLO
+			case 0x13: // MTLO
+			case 0x20: // ADD
+			case 0x21: // ADDU
+			case 0x22: // SUB
+			case 0x23: // SUBU
+			case 0x24: // AND
+			case 0x25: // OR
+			case 0x26: // XOR
+			case 0x27: // NOR
+			case 0x2a: // SLT
+			case 0x2b: // SLTU
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	constexpr bool IsNativeOpcode(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x00: // SPECIAL
+				return IsNativeSpecialOpcode(op);
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+			case 0x0a: // SLTI
+			case 0x0b: // SLTIU
+			case 0x0c: // ANDI
+			case 0x0d: // ORI
+			case 0x0e: // XORI
+			case 0x0f: // LUI
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	static_assert(PC_OFFSET <= 4095);
 	static_assert(CODE_OFFSET <= 4095);
 	static_assert(CYCLE_OFFSET + sizeof(u32) <= 4095);
 	static_assert(IOP_CYCLE_EE_OFFSET <= 4095);
+	static_assert(GprOffset(33) + sizeof(u32) <= 4095);
+	static_assert(HI_OFFSET + sizeof(u32) <= 4095);
+	static_assert(LO_OFFSET + sizeof(u32) <= 4095);
 
 	extern "C" __attribute__((noinline)) bool VitaIopA32TraceInstruction(u32 pc, u32 opcode)
 	{
@@ -145,6 +237,314 @@ namespace VitaIOP
 		return true;
 	}
 
+	bool BlockCompiler::EmitLoadGpr(unsigned guest_reg, unsigned host_reg)
+	{
+		if (guest_reg == 0)
+			return m_code.EmitMovImm8(host_reg, 0);
+
+		return m_code.EmitLdrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(GprOffset(guest_reg)));
+	}
+
+	bool BlockCompiler::EmitStoreGpr(unsigned guest_reg, unsigned host_reg)
+	{
+		if (guest_reg == 0)
+			return true;
+
+		return m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(GprOffset(guest_reg)));
+	}
+
+	bool BlockCompiler::EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg)
+	{
+		return EmitLoadGpr(src_guest_reg, HOST_TMP0) &&
+			   EmitStoreGpr(dst_guest_reg, HOST_TMP0);
+	}
+
+	bool BlockCompiler::EmitBinaryRegOp(u32 op)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const u32 funct = op & 0x3f;
+
+		if (rd == 0)
+			return true;
+
+		if (!EmitLoadGpr(rs, HOST_TMP0) || !EmitLoadGpr(rt, HOST_TMP1))
+			return false;
+
+		switch (funct)
+		{
+			case 0x20: // ADD
+			case 0x21: // ADDU
+				if (!m_code.EmitAddReg(HOST_TMP2, HOST_TMP0, HOST_TMP1))
+					return false;
+				break;
+			case 0x22: // SUB
+			case 0x23: // SUBU
+				if (!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP1))
+					return false;
+				break;
+			case 0x24: // AND
+				if (!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP1))
+					return false;
+				break;
+			case 0x25: // OR
+				if (!m_code.EmitOrrReg(HOST_TMP2, HOST_TMP0, HOST_TMP1))
+					return false;
+				break;
+			case 0x26: // XOR
+				if (!m_code.EmitEorReg(HOST_TMP2, HOST_TMP0, HOST_TMP1))
+					return false;
+				break;
+			case 0x27: // NOR
+				if (!m_code.EmitOrrReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) ||
+					!m_code.EmitMvnReg(HOST_TMP2, HOST_TMP2))
+				{
+					return false;
+				}
+				break;
+			default:
+				return false;
+		}
+
+		return EmitStoreGpr(rd, HOST_TMP2);
+	}
+
+	bool BlockCompiler::EmitShiftImmOp(u32 op)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rt = RT(op);
+		const unsigned sa = SA(op);
+		const u32 funct = op & 0x3f;
+		if (rd == 0)
+			return true;
+
+		if (!EmitLoadGpr(rt, HOST_TMP0))
+			return false;
+		if (sa == 0)
+			return EmitStoreGpr(rd, HOST_TMP0);
+
+		VitaA32::ShiftType shift = VitaA32::ShiftType::LSL;
+		switch (funct)
+		{
+			case 0x00: // SLL
+				shift = VitaA32::ShiftType::LSL;
+				break;
+			case 0x02: // SRL
+				shift = VitaA32::ShiftType::LSR;
+				break;
+			case 0x03: // SRA
+				shift = VitaA32::ShiftType::ASR;
+				break;
+			default:
+				return false;
+		}
+
+		return m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, shift, static_cast<u8>(sa)) &&
+			   EmitStoreGpr(rd, HOST_TMP2);
+	}
+
+	bool BlockCompiler::EmitShiftRegOp(u32 op)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const u32 funct = op & 0x3f;
+		if (rd == 0)
+			return true;
+
+		if (!EmitLoadGpr(rt, HOST_TMP0) ||
+			!EmitLoadGpr(rs, HOST_TMP1) ||
+			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 0x1f))
+		{
+			return false;
+		}
+
+		VitaA32::ShiftType shift = VitaA32::ShiftType::LSL;
+		switch (funct)
+		{
+			case 0x04: // SLLV
+				shift = VitaA32::ShiftType::LSL;
+				break;
+			case 0x06: // SRLV
+				shift = VitaA32::ShiftType::LSR;
+				break;
+			case 0x07: // SRAV
+				shift = VitaA32::ShiftType::ASR;
+				break;
+			default:
+				return false;
+		}
+
+		return m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP0, shift, HOST_TMP1) &&
+			   EmitStoreGpr(rd, HOST_TMP2);
+	}
+
+	bool BlockCompiler::EmitSetLessThanRegOp(u32 op, bool is_signed)
+	{
+		const unsigned rd = RD(op);
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rd == 0)
+			return true;
+
+		return EmitLoadGpr(rs, HOST_TMP0) &&
+			   EmitLoadGpr(rt, HOST_TMP1) &&
+			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+			   m_code.EmitMovImm8(HOST_TMP2, 1, is_signed ? VitaA32::Condition::LT : VitaA32::Condition::CC) &&
+			   EmitStoreGpr(rd, HOST_TMP2);
+	}
+
+	bool BlockCompiler::EmitImmediateOp(u32 op)
+	{
+		const unsigned opcode = op >> 26;
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		if (rt == 0)
+			return true;
+
+		if (opcode == 0x0f) // LUI
+		{
+			return m_code.EmitMovImm32(HOST_TMP0, op << 16) &&
+				   EmitStoreGpr(rt, HOST_TMP0);
+		}
+
+		if (!EmitLoadGpr(rs, HOST_TMP0))
+			return false;
+
+		switch (opcode)
+		{
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+				return m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(static_cast<s32>(IMM_S(op)))) &&
+					   m_code.EmitAddReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
+					   EmitStoreGpr(rt, HOST_TMP2);
+			case 0x0a: // SLTI
+				return m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(static_cast<s32>(IMM_S(op)))) &&
+					   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT) &&
+					   EmitStoreGpr(rt, HOST_TMP2);
+			case 0x0b: // SLTIU
+				return m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(static_cast<s32>(IMM_S(op)))) &&
+					   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::CC) &&
+					   EmitStoreGpr(rt, HOST_TMP2);
+			case 0x0c: // ANDI
+				return m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&
+					   m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
+					   EmitStoreGpr(rt, HOST_TMP2);
+			case 0x0d: // ORI
+				return m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&
+					   m_code.EmitOrrReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
+					   EmitStoreGpr(rt, HOST_TMP2);
+			case 0x0e: // XORI
+				return m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&
+					   m_code.EmitEorReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
+					   EmitStoreGpr(rt, HOST_TMP2);
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitNativeSPECIAL(u32 op)
+	{
+		switch (op & 0x3f)
+		{
+			case 0x00: // SLL
+			case 0x02: // SRL
+			case 0x03: // SRA
+				return EmitShiftImmOp(op);
+			case 0x04: // SLLV
+			case 0x06: // SRLV
+			case 0x07: // SRAV
+				return EmitShiftRegOp(op);
+			case 0x10: // MFHI
+				return EmitMoveGpr(RD(op), 32);
+			case 0x11: // MTHI
+				return EmitLoadGpr(RS(op), HOST_TMP0) &&
+					   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+			case 0x12: // MFLO
+				return EmitMoveGpr(RD(op), 33);
+			case 0x13: // MTLO
+				return EmitLoadGpr(RS(op), HOST_TMP0) &&
+					   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET));
+			case 0x20: // ADD
+			case 0x21: // ADDU
+			case 0x22: // SUB
+			case 0x23: // SUBU
+			case 0x24: // AND
+			case 0x25: // OR
+			case 0x26: // XOR
+			case 0x27: // NOR
+				return EmitBinaryRegOp(op);
+			case 0x2a: // SLT
+				return EmitSetLessThanRegOp(op, true);
+			case 0x2b: // SLTU
+				return EmitSetLessThanRegOp(op, false);
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitNativeInstruction(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x00: // SPECIAL
+				return EmitNativeSPECIAL(op);
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+			case 0x0a: // SLTI
+			case 0x0b: // SLTIU
+			case 0x0c: // ANDI
+			case 0x0d: // ORI
+			case 0x0e: // XORI
+			case 0x0f: // LUI
+				return EmitImmediateOp(op);
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::EmitInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches)
+	{
+		const u32 next_pc = pc + 4;
+		if (!EmitStoreCode(op) ||
+			!EmitTraceCheck(pc, op, direct_exit_branches) ||
+			!EmitStorePc(next_pc) ||
+			!EmitIncrementCycle())
+		{
+			return false;
+		}
+
+		// PCSX2 owner: R3000AOpcodeTables.cpp implements these pure R3000A
+		// integer operations directly; x86/iR3000Atables.cpp lowers the same
+		// batch to native host ALU/shifter instructions. Keep every other opcode
+		// on the PCSX2 helper-tail path until its owner is ported in a verified
+		// batch.
+		if (IsNativeOpcode(op))
+		{
+			if (!EmitNativeInstruction(op))
+				return false;
+
+			m_native_instruction_count++;
+			return true;
+		}
+
+		void (*helper)() = psxBSC[op >> 26];
+		if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(helper), HOST_CALL_SCRATCH) ||
+			!EmitPcChangedExitCheck(next_pc, direct_exit_branches))
+		{
+			return false;
+		}
+
+		m_helper_instruction_count++;
+		return true;
+	}
+
 	bool BlockCompiler::EmitHelperInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches)
 	{
 		const u32 next_pc = pc + 4;
@@ -172,11 +572,13 @@ namespace VitaIOP
 
 		std::vector<size_t> direct_exit_branches;
 		direct_exit_branches.reserve(instruction_count * 2);
+		m_native_instruction_count = 0;
+		m_helper_instruction_count = 0;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 pc = start_pc + i * 4;
 			const u32 op = iopMemRead32(pc);
-			if (!CanCompileOpcode(op) || !EmitHelperInstruction(op, pc, direct_exit_branches))
+			if (!CanCompileOpcode(op) || !EmitInstruction(op, pc, direct_exit_branches))
 				return false;
 		}
 
@@ -441,6 +843,8 @@ namespace VitaIOP
 			{
 				block.start_pc = start_pc;
 				block.instruction_count = instruction_count;
+				block.native_instruction_count = compiler.NativeInstructionCount();
+				block.helper_instruction_count = compiler.HelperInstructionCount();
 				block.valid = true;
 				return true;
 			}
@@ -468,6 +872,8 @@ namespace VitaIOP
 
 		result->exit = exit;
 		result->instruction_count = block.instruction_count;
+		result->native_instruction_count = block.native_instruction_count;
+		result->helper_instruction_count = block.helper_instruction_count;
 		result->code_size = block.code.Size();
 		result->cache_slots = static_cast<u32>(m_cache.size());
 		result->code_cache_resets = m_code_cache_resets;

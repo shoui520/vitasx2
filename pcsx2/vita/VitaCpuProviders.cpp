@@ -682,6 +682,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.cache_misses++;
 			s_iop_a32_stats.compiled_blocks++;
 			s_iop_a32_stats.compiled_instructions += result.instruction_count;
+			s_iop_a32_stats.native_instructions += result.native_instruction_count;
+			s_iop_a32_stats.helper_instructions += result.helper_instruction_count;
 		}
 		s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
 
