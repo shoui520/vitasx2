@@ -197,4 +197,5 @@ target_link_libraries(pcsx2core PUBLIC
 	ccc
 	demanglegnu
 	SceCtrl_stub
+	SceAudio_stub
 )
