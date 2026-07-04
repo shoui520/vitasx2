@@ -75,6 +75,7 @@ namespace Pcsx2Trace
 		u64 s_instruction_records_seen = 0;
 		u64 s_records_seen = 0;
 		u64 s_records_written = 0;
+		u64 s_micro_step_records_written = 0;
 		bool s_started = false;
 		bool s_hit_limit = false;
 		u32 s_entry_pc = 0;
@@ -140,6 +141,8 @@ namespace Pcsx2Trace
 			}
 
 			s_records_written++;
+			if (record.kind == VuTraceKindMicroStep)
+				s_micro_step_records_written++;
 			s_records_seen++;
 			if (s_config.max_records != 0 && s_records_written >= s_config.max_records)
 				s_hit_limit = true;
@@ -182,6 +185,7 @@ namespace Pcsx2Trace
 		s_instruction_records_seen = 0;
 		s_records_seen = 0;
 		s_records_written = 0;
+		s_micro_step_records_written = 0;
 		s_started = !s_config.wait_for_elf_entry;
 		s_hit_limit = false;
 		s_entry_pc = s_started ? 0xbfc00000 : 0;
@@ -287,6 +291,11 @@ namespace Pcsx2Trace
 	u64 GetVuTraceRecordsWritten()
 	{
 		return s_records_written;
+	}
+
+	u64 GetVuTraceMicroStepRecordsWritten()
+	{
+		return s_micro_step_records_written;
 	}
 
 	bool DidVuTraceHitLimit()

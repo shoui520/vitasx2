@@ -48,6 +48,7 @@ namespace Pcsx2Trace
 		const VURegs& vu);
 
 	u64 GetVuTraceRecordsWritten();
+	u64 GetVuTraceMicroStepRecordsWritten();
 	bool DidVuTraceHitLimit();
 	const std::string& GetVuTraceError();
 } // namespace Pcsx2Trace
