@@ -37,6 +37,17 @@ namespace MTGS
 
 	static std::unique_ptr<VitaHeadlessGsState> s_gs;
 
+	static u8 GsTraceSourceForGifPath(GIF_PATH path)
+	{
+		switch (path)
+		{
+			case GIF_PATH_1: return Pcsx2Trace::GsTraceSourcePath1;
+			case GIF_PATH_2: return Pcsx2Trace::GsTraceSourcePath2;
+			case GIF_PATH_3: return Pcsx2Trace::GsTraceSourcePath3;
+			default: return Pcsx2Trace::GsTraceSourcePath3;
+		}
+	}
+
 	static bool EnsureGsOpen()
 	{
 		if (s_gs)
@@ -59,7 +70,10 @@ namespace MTGS
 		gif_path.readAmount.fetch_add(gsPack.size, std::memory_order_acq_rel);
 
 		if (EnsureGsOpen())
+		{
+			const Pcsx2Trace::ScopedGsTraceSourceOverride trace_source(GsTraceSourceForGifPath(path));
 			s_gs->Transfer<3>(&gif_path.buffer[gsPack.offset], gsPack.size / 16);
+		}
 
 		gif_path.readAmount.fetch_sub(gsPack.size, std::memory_order_acq_rel);
 	}
@@ -73,7 +87,10 @@ namespace MTGS
 		GS_Packet gsPack = path.GetGSPacketMTVU();
 
 		if (EnsureGsOpen() && gsPack.size)
+		{
+			const Pcsx2Trace::ScopedGsTraceSourceOverride trace_source(Pcsx2Trace::GsTraceSourcePath1);
 			s_gs->Transfer<3>(&path.buffer[gsPack.offset], gsPack.size / 16);
+		}
 
 		path.readAmount.fetch_sub(gsPack.size + gsPack.readAmount, std::memory_order_acq_rel);
 		path.PopGSPacketMTVU();

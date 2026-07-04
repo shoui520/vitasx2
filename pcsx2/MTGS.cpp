@@ -8,6 +8,7 @@
 #include "Host.h"
 #include "IconsFontAwesome.h"
 #include "VMManager.h"
+#include "DebugTools/GsTrace.h"
 
 #include "common/FPControl.h"
 #include "common/ScopedGuard.h"
@@ -32,6 +33,17 @@
 
 namespace MTGS
 {
+	static u8 GsTraceSourceForGifPath(GIF_PATH path)
+	{
+		switch (path)
+		{
+			case GIF_PATH_1: return Pcsx2Trace::GsTraceSourcePath1;
+			case GIF_PATH_2: return Pcsx2Trace::GsTraceSourcePath2;
+			case GIF_PATH_3: return Pcsx2Trace::GsTraceSourcePath3;
+			default: return Pcsx2Trace::GsTraceSourcePath3;
+		}
+	}
+
 	struct BufferedData
 	{
 		u128 m_Ring[RingBufferSize];
@@ -448,11 +460,15 @@ void MTGS::MainLoop()
 #endif
 				case Command::GSPacket:
 				{
-					Gif_Path& path = gifUnit.gifPath[tag.data[2]];
+					const GIF_PATH path_index = static_cast<GIF_PATH>(tag.data[2]);
+					Gif_Path& path = gifUnit.gifPath[path_index];
 					u32 offset = tag.data[0];
 					u32 size = tag.data[1];
 					if (offset != ~0u)
+					{
+						const Pcsx2Trace::ScopedGsTraceSourceOverride trace_source(GsTraceSourceForGifPath(path_index));
 						GSgifTransfer((u8*)&path.buffer[offset], size / 16);
+					}
 					path.readAmount.fetch_sub(size, std::memory_order_acq_rel);
 					break;
 				}
@@ -470,7 +486,10 @@ void MTGS::MainLoop()
 					Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
 					GS_Packet gsPack = path.GetGSPacketMTVU(); // Get vu1 program's xgkick packet(s)
 					if (gsPack.size)
+					{
+						const Pcsx2Trace::ScopedGsTraceSourceOverride trace_source(Pcsx2Trace::GsTraceSourcePath1);
 						GSgifTransfer((u8*)&path.buffer[gsPack.offset], gsPack.size / 16);
+					}
 					path.readAmount.fetch_sub(gsPack.size + gsPack.readAmount, std::memory_order_acq_rel);
 					path.PopGSPacketMTVU(); // Should be done last, for proper Gif_MTGS_Wait()
 					break;

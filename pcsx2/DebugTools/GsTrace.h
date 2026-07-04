@@ -75,10 +75,24 @@ namespace Pcsx2Trace
 		bool state_full_dumps = false;
 	};
 
+	class ScopedGsTraceSourceOverride final
+	{
+	public:
+		explicit ScopedGsTraceSourceOverride(u8 source);
+		~ScopedGsTraceSourceOverride();
+
+		ScopedGsTraceSourceOverride(const ScopedGsTraceSourceOverride&) = delete;
+		ScopedGsTraceSourceOverride& operator=(const ScopedGsTraceSourceOverride&) = delete;
+
+	private:
+		u8 m_previous_source;
+	};
+
 	bool StartGsTrace(const GsTraceConfig& config, Error* error = nullptr);
 	void StopGsTrace();
 
 	bool IsGsTraceEnabled();
+	u8 ResolveGsTraceSource(u8 fallback_source);
 	bool RecordGsPreEeInstruction(u32 pc);
 	void NotifyGsElfEntry(u32 pc);
 

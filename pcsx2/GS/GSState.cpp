@@ -3678,7 +3678,7 @@ template <int index>
 void GSState::Transfer(const u8* mem, u32 size)
 {
 	const u8* start = mem;
-	const u8 trace_source = GsTraceSourceForPathIndex(index);
+	const u8 trace_source = Pcsx2Trace::ResolveGsTraceSource(GsTraceSourceForPathIndex(index));
 	Pcsx2Trace::RecordGsRawTransfer(trace_source, mem, static_cast<size_t>(size) * 16u);
 
 	GIFPath& path = m_path[index];

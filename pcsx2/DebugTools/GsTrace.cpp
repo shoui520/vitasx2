@@ -25,6 +25,7 @@ namespace Pcsx2Trace
 		static constexpr u32 TRACE_FLAG_STATE_FULL_DUMPS = 1u << 2;
 		static constexpr std::array<char, 8> STATE_DUMP_MAGIC = {'P', 'C', 'S', 'X', '2', 'G', 'S', 'F'};
 		static constexpr u32 STATE_DUMP_VERSION = 1;
+		static constexpr u8 GS_TRACE_SOURCE_NONE = 0xff;
 		static constexpr u64 FNV1A64_OFFSET = 14695981039346656037ull;
 		static constexpr u64 FNV1A64_PRIME = 1099511628211ull;
 
@@ -107,6 +108,7 @@ namespace Pcsx2Trace
 		bool s_hit_limit = false;
 		u32 s_entry_pc = 0;
 		std::string s_error;
+		thread_local u8 s_source_override = GS_TRACE_SOURCE_NONE;
 
 		void SetError(std::string error)
 		{
@@ -257,6 +259,17 @@ namespace Pcsx2Trace
 		}
 	} // namespace
 
+	ScopedGsTraceSourceOverride::ScopedGsTraceSourceOverride(u8 source)
+		: m_previous_source(s_source_override)
+	{
+		s_source_override = source;
+	}
+
+	ScopedGsTraceSourceOverride::~ScopedGsTraceSourceOverride()
+	{
+		s_source_override = m_previous_source;
+	}
+
 	bool StartGsTrace(const GsTraceConfig& config, Error* error)
 	{
 		StopGsTrace();
@@ -349,6 +362,11 @@ namespace Pcsx2Trace
 	bool IsGsTraceEnabled()
 	{
 		return s_trace_file && s_started;
+	}
+
+	u8 ResolveGsTraceSource(u8 fallback_source)
+	{
+		return s_source_override == GS_TRACE_SOURCE_NONE ? fallback_source : s_source_override;
 	}
 
 	bool RecordGsPreEeInstruction(u32 pc)
