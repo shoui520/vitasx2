@@ -448,12 +448,13 @@ namespace VitaEE
 
 			const unsigned rd = RD(op);
 			// PCSX2 x86/iCOP0.cpp::recMFC0() keeps Count in-block by committing
-			// cycles through scaleblockcycles_clear(). MFPS/PCCR also stays in-block,
-			// but PCR0/PCR1 reads call COP0_UpdatePCCR() and keep the event path.
+			// cycles through scaleblockcycles_clear(). MFPS/PCCR stays in-block,
+			// and PCR0/PCR1 reads call COP0_UpdatePCCR() before reading the
+			// selected counter without forcing an event-tail split.
 			if (rd != 25)
 				return true;
 
-			return RT(op) == 0 || (op & 1u) == 0;
+			return true;
 		}
 
 		bool IsFastMTC0(u32 op)
@@ -491,7 +492,7 @@ namespace VitaEE
 			switch ((op >> 21) & 0x1f)
 			{
 				case 0x00:
-					return RD(op) == 9;
+					return RD(op) == 9 || (RD(op) == 25 && RT(op) != 0 && (op & 1u) != 0);
 				case 0x04:
 					return RD(op) == 9 || RD(op) == 12 || (RD(op) == 25 && (op & 1u) != 0);
 				default:
@@ -2722,6 +2723,9 @@ namespace VitaEE
 
 		if (rd == 25)
 		{
+			if ((op & 1u) != 0)
+				return EmitMFC0PerfCounterFast(op, ScaleBlockCycles(raw_cycles_through_instruction));
+
 			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(PERF_OFFSET)) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
@@ -2781,6 +2785,26 @@ namespace VitaEE
 
 			return m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP3, VitaA32::ShiftType::ASR, 31) &&
 				   EmitStoreGpr64(rt, HOST_TMP3, HOST_TMP2);
+		}
+
+		bool BlockCompiler::EmitMFC0PerfCounterFast(u32 op, u32 scaled_cycles_through_instruction)
+		{
+			// PCSX2 owner: x86/iCOP0.cpp::recMFC0() rd 25 odd selectors. MFPC0
+			// and MFPC1 commit cycles, call COP0_UpdatePCCR(), then sign-extend
+			// the selected PCR into the target GPR.
+			const unsigned rt = RT(op);
+			if (rt == 0)
+				return true;
+			if (scaled_cycles_through_instruction == 0)
+				return false;
+
+			const bool pcr1 = (op & 2u) != 0;
+			const size_t pcr_offset = pcr1 ? PERF_PCR1_OFFSET : PERF_PCR0_OFFSET;
+			return EmitAddScaledCyclesToCpu(scaled_cycles_through_instruction) &&
+				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&COP0_UpdatePCCR)) &&
+				   m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(pcr_offset)) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		}
 
 		bool BlockCompiler::EmitMTC0Fast(u32 op, u32 raw_cycles_through_instruction)

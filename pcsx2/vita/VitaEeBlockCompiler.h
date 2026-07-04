@@ -161,6 +161,7 @@ namespace VitaEE
 		bool EmitCOP0(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitMFC0Fast(u32 op, u32 raw_cycles_through_instruction);
 		bool EmitMFC0CountFast(u32 op, u32 scaled_cycles_through_instruction);
+		bool EmitMFC0PerfCounterFast(u32 op, u32 scaled_cycles_through_instruction);
 		bool EmitMTC0Fast(u32 op, u32 raw_cycles_through_instruction);
 		bool EmitSetNextEventDelta4FromCurrentCycle();
 		bool EmitEIEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
