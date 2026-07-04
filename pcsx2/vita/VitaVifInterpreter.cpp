@@ -21,7 +21,11 @@ void dVifRelease(int idx)
 template <int idx>
 void dVifUnpack(const u8* data, bool isFill)
 {
-	pxFailRel("Vita ARM32 build must use the generic VIF unpack path.");
+	// PCSX2 owner: Vif_Unpack.cpp::_nVifUnpack(). The Vita ARM32 target keeps
+	// the dynarec entry point valid while the A32/NEON unpack generator is
+	// brought up, so any accidental dVifUnpack() route still executes the
+	// interpreter-owned unpack semantics instead of aborting.
+	_nVifUnpack(idx, data, vifXRegs.mode, isFill);
 }
 
 template void dVifUnpack<0>(const u8* data, bool isFill);
