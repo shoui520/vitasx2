@@ -91,6 +91,7 @@ namespace VitaA32
 		bool EmitCmpReg(unsigned rn, unsigned rm, Condition condition = Condition::AL);
 		bool EmitCmpImm32(unsigned rn, u32 value, Condition condition = Condition::AL);
 		bool EmitLdrImm12(unsigned rd, unsigned rn, u16 offset);
+		bool EmitLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 		bool EmitStrImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitLdrbImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitStrbImm12(unsigned rd, unsigned rn, u16 offset);
@@ -202,6 +203,7 @@ namespace VitaA32
 	u32 EncodeSmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeCmpReg(unsigned rn, unsigned rm, Condition condition = Condition::AL);
 	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset);
+	u32 EncodeLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 	u32 EncodeStrImm12(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeLdrbImm12(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeStrbImm12(unsigned rd, unsigned rn, u16 offset);

@@ -10659,10 +10659,8 @@ namespace VitaEE
 			!m_code.EmitLdrImm12(vmap_reg, vmap_reg, 0) ||
 			!m_code.EmitMovRegShiftImm(scratch_reg, host_reg, VitaA32::ShiftType::LSR,
 				vtlb_private::VTLB_PAGE_BITS) ||
-			!m_code.EmitMovRegShiftImm(scratch_reg, scratch_reg, VitaA32::ShiftType::LSL,
+			!m_code.EmitLdrRegShift(vmap_reg, vmap_reg, scratch_reg, VitaA32::ShiftType::LSL,
 				VTLB_VIRTUAL_ENTRY_SHIFT) ||
-			!m_code.EmitAddReg(vmap_reg, vmap_reg, scratch_reg) ||
-			!m_code.EmitLdrImm12(vmap_reg, vmap_reg, 0) ||
 			!m_code.EmitAddReg(vmap_reg, vmap_reg, host_reg, true))
 		{
 			return false;
