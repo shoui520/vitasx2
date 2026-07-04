@@ -163,6 +163,31 @@ static void recInterpreterStepWithoutProviderTrace()
 	VitaEE::RefreshRawGpr0KnownZero();
 }
 
+static void recTrimIncompleteBranchTail(u32 start_pc, u32* instruction_count)
+{
+	if (!instruction_count || *instruction_count == 0)
+		return;
+
+	const u32 tail_index = *instruction_count - 1;
+	const u32 tail_pc = start_pc + tail_index * 4;
+	const u32 tail_op = memRead32(tail_pc);
+	if (!VitaEE::BlockCompiler::IsSupportedBranchOpcode(tail_op))
+		return;
+
+	// PCSX2 owners: Interpreter.cpp::_doBranch_shared() and
+	// x86/ix86-32/iR5900.cpp::recRecompile() treat a branch and its delay slot
+	// as one compiled execution unit. When the trace limit stops after recording
+	// a delay slot, the executable prefix contains the branch but not the delay
+	// slot. Trim that branch so the A32 compiler never sees an unpaired tail.
+	if (tail_index != 0 &&
+		VitaEE::BlockCompiler::IsSupportedBranchOpcode(memRead32(tail_pc - 4)))
+	{
+		return;
+	}
+
+	(*instruction_count)--;
+}
+
 static bool recRecordEeWindow(u32 start_pc, u32 instruction_count, u32* executable_instruction_count)
 {
 	if (!executable_instruction_count)
@@ -175,6 +200,7 @@ static bool recRecordEeWindow(u32 start_pc, u32 instruction_count, u32* executab
 		const u32 pc = start_pc + i * 4;
 		if (VitaRecordEePreInstruction(pc, memRead32(pc)))
 		{
+			recTrimIncompleteBranchTail(start_pc, executable_instruction_count);
 			s_ee_a32_prerecording_window = false;
 			return false;
 		}

@@ -403,6 +403,10 @@ namespace VitaEE
 				// recompileNextInstruction()'s branch-in-delay-slot skip rule.
 				if (i + 1 >= max_instruction_count)
 				{
+					// The A32 compiler's block contract matches PCSX2's branch
+					// path: a branch is only compiled together with its delay
+					// slot. Stop before this branch and let the next scan own
+					// the pair instead of returning an uncompileable tail.
 					result->stop = BlockScanStop::MaxInstructions;
 					return true;
 				}
