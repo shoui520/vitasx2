@@ -502,7 +502,14 @@ __ri void _nVifUnpackLoop(const u8* data)
 	{
 		u8* dest = getVUptr(idx, vif.tag.addr);
 
-		if (doMode || !newVifDynaRec)
+		constexpr bool useGeneratedUnpackTable =
+#if defined(VITASX2_VITA)
+			false;
+#else
+			newVifDynaRec;
+#endif
+
+		if (doMode || !useGeneratedUnpackTable)
 		{
 			ft(dest, data);
 		}
