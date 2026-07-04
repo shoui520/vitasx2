@@ -10740,11 +10740,9 @@ namespace VitaEE
 			static_cast<u32>(reinterpret_cast<uptr>(&VU0.VI[vi_reg])));
 	}
 
-	bool BlockCompiler::EmitAlignQwordAddress(unsigned host_reg, unsigned scratch_reg)
+	bool BlockCompiler::EmitAlignQwordAddress(unsigned host_reg, unsigned)
 	{
-		return m_code.EmitMovImm8(scratch_reg, 0x0f) &&
-			   m_code.EmitMvnReg(scratch_reg, scratch_reg) &&
-			   m_code.EmitAndReg(host_reg, host_reg, scratch_reg);
+		return m_code.EmitBicImm32(host_reg, host_reg, 0x0f);
 	}
 
 	bool BlockCompiler::EmitVtlbNonHandlerHostAddress(unsigned host_reg, unsigned vmap_reg,

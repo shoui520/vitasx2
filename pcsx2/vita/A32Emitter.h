@@ -71,6 +71,7 @@ namespace VitaA32
 		bool EmitSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitSubImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitAndImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+		bool EmitBicImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitEorImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitAdcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
@@ -189,6 +190,7 @@ namespace VitaA32
 	u32 EncodeAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 	u32 EncodeSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 	u32 EncodeAndImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+	u32 EncodeBicImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 	u32 EncodeEorImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 	u32 EncodeOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 	u32 EncodeAdcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
