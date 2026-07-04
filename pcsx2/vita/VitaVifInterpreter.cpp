@@ -123,6 +123,9 @@ namespace
 			case 0x04:
 			case 0x05:
 			case 0x06:
+			case 0x08:
+			case 0x09:
+			case 0x0a:
 			case 0x0c:
 			case 0x0d:
 			case 0x0e:
@@ -186,6 +189,44 @@ namespace
 				const u32 y = usn ? static_cast<u32>(VitaVifLoadU8(src + sizeof(u8))) :
 									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + sizeof(u8))));
 				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, y, x, y);
+				return true;
+			}
+
+			case 0x08: // V3-32, owned by Vif_Unpack.cpp::UNPACK_V4().
+			{
+				VitaVifStoreMode0Words(vif, regs, dest, doMask,
+					VitaVifLoadU32(src),
+					VitaVifLoadU32(src + 4),
+					VitaVifLoadU32(src + 8),
+					VitaVifLoadU32(src + 12));
+				return true;
+			}
+
+			case 0x09: // V3-16, owned by Vif_Unpack.cpp::UNPACK_V4().
+			{
+				const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
+				const u32 y = usn ? static_cast<u32>(VitaVifLoadU16(src + 2)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 2)));
+				const u32 z = usn ? static_cast<u32>(VitaVifLoadU16(src + 4)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 4)));
+				const u32 w = usn ? static_cast<u32>(VitaVifLoadU16(src + 6)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 6)));
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, y, z, w);
+				return true;
+			}
+
+			case 0x0a: // V3-8, owned by Vif_Unpack.cpp::UNPACK_V4().
+			{
+				const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
+				const u32 y = usn ? static_cast<u32>(VitaVifLoadU8(src + 1)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 1)));
+				const u32 z = usn ? static_cast<u32>(VitaVifLoadU8(src + 2)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 2)));
+				const u32 w = usn ? static_cast<u32>(VitaVifLoadU8(src + 3)) :
+									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 3)));
+				VitaVifStoreMode0Words(vif, regs, dest, doMask, x, y, z, w);
 				return true;
 			}
 
