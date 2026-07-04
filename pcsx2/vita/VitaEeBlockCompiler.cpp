@@ -67,6 +67,8 @@ namespace VitaEE
 		constexpr u16 REG_R4 = 1u << 4;
 		constexpr u16 REG_R5 = 1u << 5;
 		constexpr u16 REG_R6 = 1u << 6;
+		constexpr u16 REG_R7 = 1u << 7;
+		constexpr u16 REG_R8 = 1u << 8;
 		constexpr u16 REG_LR = 1u << 14;
 		constexpr u16 REG_PC = 1u << 15;
 
@@ -80,6 +82,8 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP3 = 3;
 		constexpr unsigned HOST_TMP4 = 12;
 		constexpr unsigned HOST_TMP5 = 6;
+		constexpr unsigned HOST_VTLB_VMAP = 7;
+		constexpr unsigned HOST_VTLB_HOST_MEMORY_BASE = 8;
 
 		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
 		constexpr size_t HI_OFFSET = offsetof(cpuRegisters, HI);
@@ -1818,10 +1822,77 @@ namespace VitaEE
 		}
 	}
 
-	bool BlockCompiler::BeginBlock()
+	bool OpcodeMayUseVtlbFastPath(u32 op)
 	{
-		return m_code.EmitPush(REG_R4 | REG_R5 | REG_R6 | REG_LR) &&
-			   m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs)));
+		switch (op >> 26)
+		{
+			case 0x1a: // LDL
+			case 0x1b: // LDR
+			case 0x1e: // LQ
+			case 0x1f: // SQ
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x22: // LWL
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+			case 0x26: // LWR
+			case 0x27: // LWU
+			case 0x28: // SB
+			case 0x29: // SH
+			case 0x2a: // SWL
+			case 0x2b: // SW
+			case 0x2c: // SDL
+			case 0x2d: // SDR
+			case 0x2e: // SWR
+			case 0x31: // LWC1
+			case 0x36: // LQC2
+			case 0x37: // LD
+			case 0x39: // SWC1
+			case 0x3e: // SQC2
+			case 0x3f: // SD
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	bool BlockMayUseVtlbFastPath(u32 start_pc, u32 instruction_count)
+	{
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			if (OpcodeMayUseVtlbFastPath(memRead32(start_pc + i * 4)))
+				return true;
+		}
+
+		return false;
+	}
+
+	bool BlockCompiler::BeginBlock(bool use_vtlb_registers)
+	{
+		m_vtlb_registers_available = use_vtlb_registers;
+		m_saved_registers = REG_R4 | REG_R5 | REG_R6;
+		if (use_vtlb_registers)
+			m_saved_registers |= REG_R7 | REG_R8;
+
+		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
+			!m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))))
+		{
+			return false;
+		}
+
+		if (!use_vtlb_registers)
+			return true;
+
+		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() read
+		// these stable pointers from vtlbdata for every access. Keep them
+		// resident for EE A32 blocks that actually emit VTLB fast paths.
+		return m_code.EmitMovImm32(HOST_VTLB_VMAP,
+				   static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.vmap))) &&
+			   m_code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_VTLB_VMAP, 0) &&
+			   m_code.EmitMovImm32(HOST_VTLB_HOST_MEMORY_BASE,
+				   static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.host_memory_base))) &&
+			   m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0);
 	}
 
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit,
@@ -1833,7 +1904,7 @@ namespace VitaEE
 		if (direct_links)
 			*direct_links = {};
 
-		if (!BeginBlock())
+		if (!BeginBlock(BlockMayUseVtlbFastPath(start_pc, instruction_count)))
 			return false;
 		if (!EmitGoemonBlockStartHook(start_pc))
 			return false;
@@ -2320,11 +2391,11 @@ namespace VitaEE
 		}
 	}
 
-	bool BlockCompiler::EndBlockReturn(u8 value)
-	{
-		return m_code.EmitMovImm8(0, value) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
-	}
+		bool BlockCompiler::EndBlockReturn(u8 value)
+		{
+			return m_code.EmitMovImm8(0, value) &&
+				   m_code.EmitPop(m_saved_registers | REG_PC);
+		}
 
 	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
 		size_t* direct_link_target_offset, size_t* taken_link_target_offset)
@@ -2371,7 +2442,7 @@ namespace VitaEE
 			return false;
 
 		if (!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC))
+			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
 			return false;
 		}
@@ -2388,7 +2459,7 @@ namespace VitaEE
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
+			if (!m_code.EmitPop(m_saved_registers | REG_LR))
 				return false;
 
 			const size_t fallthrough_target_offset = m_code.Size();
@@ -2400,7 +2471,7 @@ namespace VitaEE
 
 			const size_t taken_tail_target = m_code.Size();
 			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) ||
-				!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
+				!m_code.EmitPop(m_saved_registers | REG_LR))
 			{
 				return false;
 			}
@@ -2419,7 +2490,7 @@ namespace VitaEE
 			return true;
 		}
 
-		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
+		if (!m_code.EmitPop(m_saved_registers | REG_LR))
 			return false;
 
 		const size_t target_offset = m_code.Size();
@@ -2505,7 +2576,7 @@ namespace VitaEE
 			return false;
 
 		if (!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC))
+			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
 			return false;
 		}
@@ -2522,7 +2593,7 @@ namespace VitaEE
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
+			if (!m_code.EmitPop(m_saved_registers | REG_LR))
 				return false;
 
 			const size_t not_taken_target_offset = m_code.Size();
@@ -2534,7 +2605,7 @@ namespace VitaEE
 
 			const size_t taken_tail_target = m_code.Size();
 			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) ||
-				!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
+				!m_code.EmitPop(m_saved_registers | REG_LR))
 			{
 				return false;
 			}
@@ -2554,7 +2625,7 @@ namespace VitaEE
 			return true;
 		}
 
-		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_LR))
+		if (!m_code.EmitPop(m_saved_registers | REG_LR))
 			return false;
 
 		return m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) &&
@@ -3000,7 +3071,7 @@ namespace VitaEE
 				return false;
 
 			return m_code.EmitCallAbsolute(event_exit) &&
-				   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+				   m_code.EmitPop(m_saved_registers | REG_PC);
 		}
 
 		bool BlockCompiler::EmitTLBRInBlock()
@@ -3211,7 +3282,7 @@ namespace VitaEE
 			}
 
 			return m_code.EmitCallAbsolute(event_exit) &&
-				   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+				   m_code.EmitPop(m_saved_registers | REG_PC);
 		}
 
 		bool BlockCompiler::EmitDIDelayedStatusClear()
@@ -3409,7 +3480,7 @@ namespace VitaEE
 		}
 
 		return m_code.EmitCallAbsolute(event_exit) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
 	bool BlockCompiler::EmitCOP2ControlReadEventExit(u32 op, u32 next_pc,
@@ -3458,7 +3529,7 @@ namespace VitaEE
 		}
 
 		return m_code.EmitCallAbsolute(event_exit) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
 	bool BlockCompiler::EmitCOP2ControlWriteEventExit(u32 op, u32 next_pc,
@@ -3526,7 +3597,7 @@ namespace VitaEE
 		}
 
 		return m_code.EmitCallAbsolute(event_exit) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
 	bool BlockCompiler::EmitCOP1MoveControlFast(u32 op)
@@ -4751,7 +4822,7 @@ namespace VitaEE
 		}
 
 		return m_code.EmitCallAbsolute(event_exit) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
 	bool BlockCompiler::EmitSYSCALL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -10464,7 +10535,7 @@ namespace VitaEE
 		if (!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
 			!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC))
+			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
 			return false;
 		}
@@ -10486,7 +10557,7 @@ namespace VitaEE
 			   m_code.EmitMovImm8(HOST_TMP1, store ? 1 : 0) &&
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeRaiseAddressError)) &&
 			   m_code.EmitCallAbsolute(event_exit) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
 	bool BlockCompiler::EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
@@ -10512,7 +10583,7 @@ namespace VitaEE
 		}
 
 		return m_code.EmitCallAbsolute(event_exit) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
 	bool BlockCompiler::EmitDeviceTracePreInstruction(u32 pc)
@@ -10653,6 +10724,24 @@ namespace VitaEE
 		// cache/MMIO/unmapped pages branch to the existing PCSX2 helper path.
 		constexpr u8 VTLB_VIRTUAL_ENTRY_SHIFT = 2;
 		static_assert((sizeof(vtlb_private::VTLBVirtual) >> VTLB_VIRTUAL_ENTRY_SHIFT) == 1);
+
+		if (m_vtlb_registers_available)
+		{
+			if (!m_code.EmitMovRegShiftImm(scratch_reg, host_reg, VitaA32::ShiftType::LSR,
+					vtlb_private::VTLB_PAGE_BITS) ||
+				!m_code.EmitLdrRegShift(vmap_reg, HOST_VTLB_VMAP, scratch_reg, VitaA32::ShiftType::LSL,
+					VTLB_VIRTUAL_ENTRY_SHIFT) ||
+				!m_code.EmitAddReg(vmap_reg, vmap_reg, host_reg, true))
+			{
+				return false;
+			}
+
+			*handler_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
+			if (*handler_fallback_branch == static_cast<size_t>(-1))
+				return false;
+
+			return m_code.EmitAddReg(host_reg, vmap_reg, HOST_VTLB_HOST_MEMORY_BASE);
+		}
 
 		if (!m_code.EmitMovImm32(vmap_reg,
 				static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.vmap))) ||

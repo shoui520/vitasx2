@@ -142,7 +142,7 @@ namespace VitaEE
 		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
 
-		bool BeginBlock();
+		bool BeginBlock(bool use_vtlb_registers);
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
@@ -466,5 +466,7 @@ namespace VitaEE
 		bool EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 
 		VitaA32::CodeBuffer& m_code;
-	};
-} // namespace VitaEE
+		u16 m_saved_registers = 0;
+		bool m_vtlb_registers_available = false;
+		};
+	} // namespace VitaEE
