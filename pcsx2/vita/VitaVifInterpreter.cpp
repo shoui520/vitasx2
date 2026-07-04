@@ -19,6 +19,7 @@
 
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuVifFastVectors = 0;
+u32 g_qemuVifNeonVectors = 0;
 #endif
 
 namespace
@@ -78,6 +79,75 @@ namespace
 		out[2] = z;
 		out[3] = w;
 	}
+
+	void VitaVifLoadV4_16Words(const u8* src, bool usn, u32& x, u32& y, u32& z, u32& w)
+	{
+		x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
+		y = usn ? static_cast<u32>(VitaVifLoadU16(src + 2)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 2)));
+		z = usn ? static_cast<u32>(VitaVifLoadU16(src + 4)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 4)));
+		w = usn ? static_cast<u32>(VitaVifLoadU16(src + 6)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 6)));
+	}
+
+	void VitaVifLoadV4_8Words(const u8* src, bool usn, u32& x, u32& y, u32& z, u32& w)
+	{
+		x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
+		y = usn ? static_cast<u32>(VitaVifLoadU8(src + 1)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 1)));
+		z = usn ? static_cast<u32>(VitaVifLoadU8(src + 2)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 2)));
+		w = usn ? static_cast<u32>(VitaVifLoadU8(src + 3)) :
+				  static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 3)));
+	}
+
+#if VITASX2_VIF_HAS_ARM_NEON
+	void VitaVifStoreV4_16WordsNeon(u8* dest, const u8* src, bool usn)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4(). This mirrors
+		// arm64/Vif_UnpackNEON.cpp::xUPK_V4_16() for the ARMv7 runtime.
+		if (usn)
+		{
+			const uint16x4_t packed = vld1_u16(reinterpret_cast<const u16*>(src));
+			const uint32x4_t widened = vmovl_u16(packed);
+			vst1q_u32(reinterpret_cast<u32*>(dest), widened);
+		}
+		else
+		{
+			const int16x4_t packed = vld1_s16(reinterpret_cast<const s16*>(src));
+			const int32x4_t widened = vmovl_s16(packed);
+			vst1q_s32(reinterpret_cast<s32*>(dest), widened);
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
+
+	void VitaVifStoreV4_8WordsNeon(u8* dest, const u8* src, bool usn)
+	{
+		// Load exactly one V4-8 packet word, then widen in NEON lanes. The
+		// scalar load avoids reading past the current VIF packet item.
+		const uint32x2_t packed_word = vdup_n_u32(VitaVifLoadU32(src));
+		if (usn)
+		{
+			const uint16x8_t halves = vmovl_u8(vreinterpret_u8_u32(packed_word));
+			const uint32x4_t widened = vmovl_u16(vget_low_u16(halves));
+			vst1q_u32(reinterpret_cast<u32*>(dest), widened);
+		}
+		else
+		{
+			const int16x8_t halves = vmovl_s8(vreinterpret_s8_u32(packed_word));
+			const int32x4_t widened = vmovl_s16(vget_low_s16(halves));
+			vst1q_s32(reinterpret_cast<s32*>(dest), widened);
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
+#endif
 
 	u32 VitaVifApplyMode(vifStruct& vif, u32 lane, u32 mode, u32 data)
 	{
@@ -262,29 +332,43 @@ namespace
 
 			case 0x0d: // V4-16
 			{
-				const u32 x = usn ? static_cast<u32>(VitaVifLoadU16(src)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src)));
-				const u32 y = usn ? static_cast<u32>(VitaVifLoadU16(src + 2)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 2)));
-				const u32 z = usn ? static_cast<u32>(VitaVifLoadU16(src + 4)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 4)));
-				const u32 w = usn ? static_cast<u32>(VitaVifLoadU16(src + 6)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS16(src + 6)));
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreV4_16WordsNeon(dest, src, usn);
+#else
+					u32 x, y, z, w;
+					VitaVifLoadV4_16Words(src, usn, x, y, z, w);
+					VitaVifStoreWords(dest, x, y, z, w);
+#endif
+				}
+				else
+				{
+					u32 x, y, z, w;
+					VitaVifLoadV4_16Words(src, usn, x, y, z, w);
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
+				}
 				return true;
 			}
 
 			case 0x0e: // V4-8
 			{
-				const u32 x = usn ? static_cast<u32>(VitaVifLoadU8(src)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src)));
-				const u32 y = usn ? static_cast<u32>(VitaVifLoadU8(src + 1)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 1)));
-				const u32 z = usn ? static_cast<u32>(VitaVifLoadU8(src + 2)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 2)));
-				const u32 w = usn ? static_cast<u32>(VitaVifLoadU8(src + 3)) :
-									static_cast<u32>(static_cast<s32>(VitaVifLoadS8(src + 3)));
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreV4_8WordsNeon(dest, src, usn);
+#else
+					u32 x, y, z, w;
+					VitaVifLoadV4_8Words(src, usn, x, y, z, w);
+					VitaVifStoreWords(dest, x, y, z, w);
+#endif
+				}
+				else
+				{
+					u32 x, y, z, w;
+					VitaVifLoadV4_8Words(src, usn, x, y, z, w);
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, z, w);
+				}
 				return true;
 			}
 
