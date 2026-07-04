@@ -75,6 +75,8 @@ namespace VitaIOP
 		bool EmitEffectiveAddress(u32 op);
 		bool EmitLoadOp(u32 op);
 		bool EmitStoreOp(u32 op);
+		bool EmitUnalignedLoadOp(u32 op);
+		bool EmitUnalignedStoreOp(u32 op);
 		bool EmitConditionalBranchOp(u32 op, u32 pc);
 		bool EmitSignedBranchOp(u32 op, u32 pc);
 		bool EmitJumpOp(u32 op, u32 pc);

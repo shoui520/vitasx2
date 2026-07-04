@@ -17,6 +17,8 @@ namespace
 	using GeneratedBlock = u32 (*)();
 
 	constexpr u16 REG_R4 = 1u << 4;
+	constexpr u16 REG_R5 = 1u << 5;
+	constexpr u16 REG_R6 = 1u << 6;
 	constexpr u16 REG_LR = 1u << 14;
 	constexpr u16 REG_PC = 1u << 15;
 
@@ -25,6 +27,8 @@ namespace
 	constexpr unsigned HOST_TMP2 = 2;
 	constexpr unsigned HOST_TMP3 = 3;
 	constexpr unsigned HOST_PSX_REGS = 4;
+	constexpr unsigned HOST_SAVED0 = 5;
+	constexpr unsigned HOST_SAVED1 = 6;
 	constexpr unsigned HOST_CALL_SCRATCH = 12;
 
 	constexpr size_t GPR_OFFSET = offsetof(psxRegisters, GPR);
@@ -177,12 +181,16 @@ namespace
 				return IsNativeCop0Opcode(op);
 			case 0x20: // LB
 			case 0x21: // LH
+			case 0x22: // LWL
 			case 0x23: // LW
 			case 0x24: // LBU
 			case 0x25: // LHU
+			case 0x26: // LWR
 			case 0x28: // SB
 			case 0x29: // SH
+			case 0x2a: // SWL
 			case 0x2b: // SW
+			case 0x2e: // SWR
 				return true;
 			default:
 				return false;
@@ -249,14 +257,14 @@ namespace VitaIOP
 
 	bool BlockCompiler::BeginBlock()
 	{
-		return m_code.EmitPush(REG_R4 | REG_LR) &&
+		return m_code.EmitPush(REG_R4 | REG_R5 | REG_R6 | REG_LR) &&
 			   m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs)));
 	}
 
 	bool BlockCompiler::EndBlockReturn(BlockExitKind exit)
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
-			   m_code.EmitPop(REG_R4 | REG_PC);
+			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
 	}
 
 	bool BlockCompiler::EmitStoreCode(u32 op)
@@ -631,6 +639,91 @@ namespace VitaIOP
 			   m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH);
 	}
 
+	bool BlockCompiler::EmitUnalignedLoadOp(u32 op)
+	{
+		const bool left = ((op >> 26) == 0x22);
+		if (!EmitEffectiveAddress(op) ||
+			!m_code.EmitAndImm8(HOST_SAVED0, HOST_TMP0, 3) ||
+			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_SAVED0, VitaA32::ShiftType::LSL, 3) ||
+			!m_code.EmitMovImm32(HOST_TMP1, 0xfffffffcu) ||
+			!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH))
+		{
+			return false;
+		}
+
+		if (RT(op) == 0)
+			return true;
+
+		if (!EmitLoadGpr(RT(op), HOST_TMP1))
+			return false;
+
+		if (left)
+		{
+			return m_code.EmitMovImm32(HOST_TMP2, 0x00ffffffu) &&
+				   m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, HOST_SAVED0) &&
+				   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
+				   m_code.EmitMovImm8(HOST_TMP3, 24) &&
+				   m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_SAVED0) &&
+				   m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, HOST_TMP3) &&
+				   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
+				   EmitStoreGpr(RT(op), HOST_TMP0);
+		}
+
+		return m_code.EmitMovImm32(HOST_TMP2, 0xffffff00u) &&
+			   m_code.EmitMovImm8(HOST_TMP3, 24) &&
+			   m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_SAVED0) &&
+			   m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSL, HOST_TMP3) &&
+			   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
+			   m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, HOST_SAVED0) &&
+			   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
+			   EmitStoreGpr(RT(op), HOST_TMP0);
+	}
+
+	bool BlockCompiler::EmitUnalignedStoreOp(u32 op)
+	{
+		const bool left = ((op >> 26) == 0x2a);
+		if (!EmitEffectiveAddress(op) ||
+			!m_code.EmitAndImm8(HOST_SAVED0, HOST_TMP0, 3) ||
+			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_SAVED0, VitaA32::ShiftType::LSL, 3) ||
+			!m_code.EmitMovImm32(HOST_TMP1, 0xfffffffcu) ||
+			!m_code.EmitAndReg(HOST_SAVED1, HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) ||
+			!EmitLoadGpr(RT(op), HOST_TMP1))
+		{
+			return false;
+		}
+
+		if (left)
+		{
+			if (!m_code.EmitMovImm8(HOST_TMP3, 24) ||
+				!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_SAVED0) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, HOST_TMP3) ||
+				!m_code.EmitMovImm32(HOST_TMP2, 0xffffff00u) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSL, HOST_SAVED0))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			if (!m_code.EmitMovRegShiftReg(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, HOST_SAVED0) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 24) ||
+				!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_SAVED0) ||
+				!m_code.EmitMovImm32(HOST_TMP2, 0x00ffffffu) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, HOST_TMP3))
+			{
+				return false;
+			}
+		}
+
+		return m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
+			   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP0) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH);
+	}
+
 	bool BlockCompiler::EmitConditionalBranchOp(u32 op, u32 pc)
 	{
 		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
@@ -872,10 +965,16 @@ namespace VitaIOP
 			case 0x24: // LBU
 			case 0x25: // LHU
 				return EmitLoadOp(op);
+			case 0x22: // LWL
+			case 0x26: // LWR
+				return EmitUnalignedLoadOp(op);
 			case 0x28: // SB
 			case 0x29: // SH
 			case 0x2b: // SW
 				return EmitStoreOp(op);
+			case 0x2a: // SWL
+			case 0x2e: // SWR
+				return EmitUnalignedStoreOp(op);
 			default:
 				return false;
 		}
