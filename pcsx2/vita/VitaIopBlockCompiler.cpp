@@ -1012,8 +1012,19 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitEffectiveAddress(u32 op)
 	{
-		return EmitLoadGpr(RS(op), HOST_TMP0) &&
-			   m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(static_cast<s32>(IMM_S(op)))) &&
+		const s32 imm = static_cast<s32>(IMM_S(op));
+		if (!EmitLoadGpr(RS(op), HOST_TMP0))
+			return false;
+
+		if (imm == 0)
+			return true;
+
+		if (imm > 0 && m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(imm)))
+			return true;
+		if (imm < 0 && m_code.EmitSubImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(-imm)))
+			return true;
+
+		return m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(imm)) &&
 			   m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP1);
 	}
 

@@ -363,11 +363,39 @@ namespace VitaA32
 		return EmitU32(EncodeAddImm8(rd, rn, value, set_flags));
 	}
 
+	bool CodeBuffer::EmitAddImm32(unsigned rd, unsigned rn, u32 value, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn))
+			return false;
+
+		u32 encoded = 0;
+		if (!EncodeModifiedImmediate(value, &encoded))
+			return false;
+
+		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_ADD |
+					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
+					   ((rd & 0xfu) << 12) | encoded);
+	}
+
 	bool CodeBuffer::EmitSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
 		return EmitU32(EncodeSubImm8(rd, rn, value, set_flags));
+	}
+
+	bool CodeBuffer::EmitSubImm32(unsigned rd, unsigned rn, u32 value, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn))
+			return false;
+
+		u32 encoded = 0;
+		if (!EncodeModifiedImmediate(value, &encoded))
+			return false;
+
+		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_SUB |
+					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
+					   ((rd & 0xfu) << 12) | encoded);
 	}
 
 	bool CodeBuffer::EmitAndImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)

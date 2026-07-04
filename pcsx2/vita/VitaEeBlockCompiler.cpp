@@ -10665,11 +10665,11 @@ namespace VitaEE
 		if (imm == 0)
 			return true;
 
-		if (imm > 0 && imm <= 255)
-			return m_code.EmitAddImm8(host_reg, host_reg, static_cast<u8>(imm));
+		if (imm > 0 && m_code.EmitAddImm32(host_reg, host_reg, static_cast<u32>(imm)))
+			return true;
 
-		if (imm < 0 && imm >= -255)
-			return m_code.EmitSubImm8(host_reg, host_reg, static_cast<u8>(-imm));
+		if (imm < 0 && m_code.EmitSubImm32(host_reg, host_reg, static_cast<u32>(-imm)))
+			return true;
 
 		return m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
 			   m_code.EmitAddReg(host_reg, host_reg, HOST_TMP2);
@@ -10677,8 +10677,8 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCpuRegsAddress(unsigned host_reg, size_t offset)
 	{
-		if (offset <= 255)
-			return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
+		if (offset <= 0xffffffffu && m_code.EmitAddImm32(host_reg, HOST_CPU_REGS, static_cast<u32>(offset)))
+			return true;
 
 		return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
 			   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
