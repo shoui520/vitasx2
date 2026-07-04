@@ -192,6 +192,58 @@ namespace
 		}
 	}
 
+	void VitaVifUnpackV4_5NoMaskVector(u8* dest, const u8* src)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4_5(). V4-5 ignores MODE.
+		const u32 data = VitaVifLoadU16(src);
+		VitaVifStoreWords(dest,
+			(data & 0x001fu) << 3,
+			(data & 0x03e0u) >> 2,
+			(data & 0x7c00u) >> 7,
+			(data & 0x8000u) >> 8);
+	}
+
+	template <int idx>
+	bool VitaVifTryFastV4_5NoMask(const u8* data, bool isFill)
+	{
+		vifStruct& vif = GetVifX;
+		VIFregisters& regs = vifXRegs;
+		if ((vif.cmd & 0x1f) != 0x0f)
+			return false;
+
+		constexpr int vsize = 2;
+		const int skip_size = (regs.cycle.cl - regs.cycle.wl) * 16;
+		do
+		{
+			VitaVifUnpackV4_5NoMaskVector(VitaVifVuMemPtr<idx>(vif.tag.addr), data);
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+#endif
+			vif.tag.addr += 16;
+			--regs.num;
+			++vif.cl;
+
+			if (isFill)
+			{
+				if (vif.cl <= regs.cycle.cl)
+					data += vsize;
+				else if (vif.cl == regs.cycle.wl)
+					vif.cl = 0;
+			}
+			else
+			{
+				data += vsize;
+				if (vif.cl >= regs.cycle.wl)
+				{
+					vif.tag.addr += skip_size;
+					vif.cl = 0;
+				}
+			}
+		} while (regs.num);
+
+		return true;
+	}
+
 	template <int idx>
 	bool VitaVifTryFastMode0NoMask(const u8* data, bool isFill)
 	{
@@ -292,6 +344,9 @@ void dVifRelease(int idx)
 template <int idx>
 void dVifUnpack(const u8* data, bool isFill)
 {
+	if (VitaVifTryFastV4_5NoMask<idx>(data, isFill))
+		return;
+
 	if (VitaVifTryFastMode0NoMask<idx>(data, isFill))
 		return;
 
