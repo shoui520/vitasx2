@@ -800,8 +800,10 @@ namespace VitaEE
 		if (!block.valid)
 			return false;
 
+		RefreshRawGpr0KnownZero();
 		cpuRegs.pc = block.start_pc;
 		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
+		RefreshRawGpr0KnownZero();
 
 		BlockExitKind exit = BlockExitKind::Direct;
 		if (!DecodeExitKind(exit_value, &exit))
@@ -812,6 +814,7 @@ namespace VitaEE
 		// until the full VM scheduler/device state is initialized.
 		if (exit == BlockExitKind::Event && run_event_test_on_event_exit)
 			_cpuEventTest_Shared();
+		RefreshRawGpr0KnownZero();
 
 		result->path = BlockExecutionPath::Compiled;
 		result->exit = exit;
@@ -875,6 +878,7 @@ namespace VitaEE
 			{
 				cpuRegs.pc = start_pc;
 				intCpu.Step(); // PCSX2 interpreter owner: Interpreter.cpp::execI().
+				RefreshRawGpr0KnownZero();
 
 				*result = {};
 				result->path = BlockExecutionPath::InterpreterStep;

@@ -159,6 +159,7 @@ static void recInterpreterStepWithoutProviderTrace()
 	intCpu.Step();
 	s_ee_provider_trace_suppressed = false;
 	s_ee_pre_instruction_trace_callback = callback;
+	VitaEE::RefreshRawGpr0KnownZero();
 }
 
 static bool recRecordEeWindow(u32 start_pc, u32 instruction_count, u32* executable_instruction_count)
@@ -208,6 +209,7 @@ static void recShutdown()
 static void recReset()
 {
 	intCpu.Reset();
+	VitaEE::RefreshRawGpr0KnownZero();
 	s_ee_a32_executor.Reset();
 	VitaResetA32EeProviderStats();
 	s_ee_a32_exit_execution = false;
@@ -217,6 +219,7 @@ static void recReset()
 static void recStep()
 {
 	intCpu.Step();
+	VitaEE::RefreshRawGpr0KnownZero();
 }
 
 static void recExecute()
@@ -291,6 +294,7 @@ static void recExecute()
 			// produces. A stop request exits through Cpu->ExitExecution().
 			const u32 opcode = memRead32(pc);
 			intCpu.Step();
+			VitaEE::RefreshRawGpr0KnownZero();
 			recRecordInterpreterFallback(pc, opcode, recFallbackReasonForScanStop(scan.stop));
 			continue;
 		}
@@ -312,6 +316,7 @@ static void recExecute()
 			{
 				const u32 opcode = memRead32(pc);
 				intCpu.Step();
+				VitaEE::RefreshRawGpr0KnownZero();
 				recRecordInterpreterFallback(pc, opcode, VitaA32EeFallbackReason::ExactTraceBranchLikely);
 				continue;
 			}

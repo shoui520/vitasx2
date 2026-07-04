@@ -159,6 +159,7 @@ namespace VitaEE
 		constexpr unsigned VU0_REG_CMSAR1 = 31;
 
 		alignas(16) GPR_reg s_lq_zero_sink;
+		alignas(4) u32 s_raw_gpr0_known_zero = 1;
 
 		constexpr u32 LWL_MASK[4] = {0x00ffffff, 0x0000ffff, 0x000000ff, 0x00000000};
 		constexpr u32 LWR_MASK[4] = {0x00000000, 0xff000000, 0xffff0000, 0xffffff00};
@@ -1494,6 +1495,11 @@ namespace VitaEE
 	static_assert(TLB_ENTRY_HI_OFFSET == 4);
 	static_assert(TLB_ENTRY_LO0_OFFSET == 8);
 	static_assert(TLB_ENTRY_LO1_OFFSET == 12);
+
+	void RefreshRawGpr0KnownZero()
+	{
+		s_raw_gpr0_known_zero = (cpuRegs.GPR.r[0].UD[0] == 0 && cpuRegs.GPR.r[0].UD[1] == 0) ? 1u : 0u;
+	}
 
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code)
 		: m_code(code)
@@ -8598,7 +8604,8 @@ namespace VitaEE
 			// directly. This is intentionally different from LQ's gpr_GetWritePtr().
 			const size_t offset = GprOffset(0);
 			if (!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(offset)) ||
-				!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32))))
+				!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32))) ||
+				!EmitRefreshRawGpr0KnownZeroFromLow64(HOST_TMP0, HOST_TMP1))
 			{
 				return false;
 			}
@@ -8952,10 +8959,46 @@ namespace VitaEE
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitAlignQwordAddress(HOST_TMP0, HOST_TMP1) ||
-			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
-			!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP1) ||
-			!m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0))
+			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
+		{
+			return false;
+		}
+
+		if (rt == 0)
+		{
+			if (!EmitLoadRawGpr0KnownZeroFlag(HOST_TMP1) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 0, true))
+			{
+				return false;
+			}
+
+			const size_t raw_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (raw_fallback == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitVeorQ(NEON_VALUE, NEON_VALUE, NEON_VALUE) ||
+				!m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0))
+			{
+				return false;
+			}
+
+			const size_t zero_done = m_code.EmitBranchPlaceholder();
+			if (zero_done == static_cast<size_t>(-1))
+				return false;
+
+			const size_t raw_fallback_target = m_code.Size();
+			if (!m_code.PatchBranch(raw_fallback, raw_fallback_target, VitaA32::Condition::EQ) ||
+				!EmitCpuRegsAddress(HOST_TMP1, GprOffset(0)) ||
+				!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP1) ||
+				!m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0) ||
+				!m_code.PatchBranch(zero_done, m_code.Size()))
+			{
+				return false;
+			}
+		}
+		else if (!EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
+				 !m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP1) ||
+				 !m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0))
 		{
 			return false;
 		}
@@ -10403,6 +10446,26 @@ namespace VitaEE
 
 		return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
 			   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+	}
+
+	bool BlockCompiler::EmitLoadRawGpr0KnownZeroFlag(unsigned host_reg)
+	{
+		return m_code.EmitMovImm32(host_reg, static_cast<u32>(reinterpret_cast<uptr>(&s_raw_gpr0_known_zero))) &&
+			   m_code.EmitLdrImm12(host_reg, host_reg, 0);
+	}
+
+	bool BlockCompiler::EmitRefreshRawGpr0KnownZeroFromLow64(unsigned low_reg, unsigned high_reg)
+	{
+		const size_t high64_offset = GprOffset(0) + 2 * sizeof(u32);
+		return m_code.EmitOrrReg(HOST_TMP2, low_reg, high_reg) &&
+			   m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(high64_offset)) &&
+			   m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP3) &&
+			   m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(high64_offset + sizeof(u32))) &&
+			   m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP3, true) &&
+			   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+			   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::EQ) &&
+			   m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(&s_raw_gpr0_known_zero))) &&
+			   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP3, 0);
 	}
 
 	bool BlockCompiler::EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg)
