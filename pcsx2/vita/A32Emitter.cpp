@@ -504,6 +504,19 @@ namespace VitaA32
 		return EmitU32(EncodeCmpReg(rn, rm, condition));
 	}
 
+	bool CodeBuffer::EmitCmpImm32(unsigned rn, u32 value, Condition condition)
+	{
+		if (!IsRegister(rn))
+			return false;
+
+		u32 encoded = 0;
+		if (!EncodeModifiedImmediate(value, &encoded))
+			return false;
+
+		return EmitU32(CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_CMP | SET_FLAGS |
+					   ((rn & 0xfu) << 16) | encoded);
+	}
+
 	bool CodeBuffer::EmitLdrImm12(unsigned rd, unsigned rn, u16 offset)
 	{
 		if (!IsLowRegister(rd) || !IsLowRegister(rn) || offset > 0x0fff)

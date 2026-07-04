@@ -2036,8 +2036,7 @@ namespace VitaEE
 					// and REGIMM likely forms cancel the delay slot when the
 					// condition is false; x86/ix86-32/iR5900Branch.cpp emits a
 					// separate not-taken path without recompileNextInstruction().
-					if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
-						!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP0))
+					if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 					{
 						return false;
 					}
@@ -2380,8 +2379,7 @@ namespace VitaEE
 		const size_t direct_target = m_code.Size();
 		if (taken_link_target_offset)
 		{
-			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
-				!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP0))
+			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 			{
 				return false;
 			}
@@ -2447,8 +2445,7 @@ namespace VitaEE
 
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
-			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
-			!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP2))
+			!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 		{
 			return false;
 		}
@@ -2516,8 +2513,7 @@ namespace VitaEE
 		const size_t direct_target = m_code.Size();
 		if (not_taken_link_target_offset || taken_link_target_offset)
 		{
-			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
-				!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP0))
+			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 			{
 				return false;
 			}
@@ -9826,16 +9822,14 @@ namespace VitaEE
 			condition == SignedBranchCondition::GreaterEqualZero)
 		{
 			return EmitLoadGprHigh(rs, HOST_TMP1) &&
-				   m_code.EmitMovImm8(HOST_TMP2, 0) &&
-				   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2) &&
+				   m_code.EmitCmpImm32(HOST_TMP1, 0) &&
 				   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 				   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
 					   condition == SignedBranchCondition::LessThanZero ? VitaA32::Condition::LT : VitaA32::Condition::GE);
 		}
 
 		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) ||
-			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2) ||
+			!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
 			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0))
 		{
 			return false;
@@ -9858,7 +9852,7 @@ namespace VitaEE
 
 		const VitaA32::Condition low_condition =
 			(condition == SignedBranchCondition::LessEqualZero) ? VitaA32::Condition::EQ : VitaA32::Condition::NE;
-		if (!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2) ||
+		if (!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
 			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, low_condition))
 		{
 			return false;
@@ -10436,8 +10430,7 @@ namespace VitaEE
 		// an EE counter-read event test.
 		return m_code.EmitMovImm32(HOST_TMP2, 0xffffe000u) &&
 			   m_code.EmitAndReg(HOST_TMP2, host_reg, HOST_TMP2) &&
-			   m_code.EmitMovImm32(HOST_TMP3, 0x10000000u) &&
-			   m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3) &&
+			   m_code.EmitCmpImm32(HOST_TMP2, 0x10000000u) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::EQ);
 	}
@@ -10447,8 +10440,7 @@ namespace VitaEE
 		if (!event_exit || raw_cycles_through_instruction == 0)
 			return false;
 
-		if (!m_code.EmitMovImm8(HOST_TMP2, 0) ||
-			!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP2))
+		if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 		{
 			return false;
 		}
@@ -10722,8 +10714,7 @@ namespace VitaEE
 	bool BlockCompiler::EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc)
 	{
 		if (!EmitStorePc(fallthrough_pc) ||
-			!m_code.EmitMovImm8(HOST_TMP1, 0) ||
-			!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP1))
+			!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 		{
 			return false;
 		}

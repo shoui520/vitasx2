@@ -510,8 +510,7 @@ namespace VitaIOP
 		if (!m_code.EmitMovImm32(HOST_TMP0, pc) ||
 			!m_code.EmitMovImm32(HOST_TMP1, op) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaIopA32TraceInstruction)) ||
-			!m_code.EmitMovImm8(HOST_TMP1, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
 		{
 			return false;
 		}
@@ -1502,8 +1501,7 @@ namespace VitaIOP
 			return EmitSignedBranchFlag(op);
 
 		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
-			!m_code.EmitMovImm8(HOST_TMP1, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
 		{
 			return false;
 		}
@@ -1580,8 +1578,7 @@ namespace VitaIOP
 		}
 
 		return EmitLoadGpr(RS(op), HOST_TMP0) &&
-			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) &&
+			   m_code.EmitCmpImm32(HOST_TMP0, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, taken);
 	}
@@ -1747,8 +1744,7 @@ namespace VitaIOP
 			VitaA32::Condition::LT});
 
 		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(INTERRUPT_OFFSET)) ||
-			!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+			!m_code.EmitCmpImm32(HOST_TMP2, 0))
 		{
 			return false;
 		}
@@ -1758,8 +1754,7 @@ namespace VitaIOP
 		if (!m_code.EmitMovImm32(HOST_TMP3,
 				static_cast<u32>(reinterpret_cast<uptr>(&iopHw[HW_ICTRL & 0xffff]))) ||
 			!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP3, 0) ||
-			!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+			!m_code.EmitCmpImm32(HOST_TMP2, 0))
 		{
 			return false;
 		}
@@ -2349,8 +2344,7 @@ namespace VitaIOP
 
 		if (has_native_static_branch)
 		{
-			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
-				!m_code.EmitCmpReg(HOST_BRANCH_FLAG, HOST_TMP0))
+			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 			{
 				return false;
 			}
