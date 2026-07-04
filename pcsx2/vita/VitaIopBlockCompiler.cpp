@@ -264,25 +264,6 @@ namespace
 		}
 	}
 
-	constexpr u32 IopOpcodeClass(u32 op)
-	{
-		const u32 opcode = op >> 26;
-		switch (opcode)
-		{
-			case 0x00: // SPECIAL
-				return (opcode << 24) | (op & 0x3f);
-			case 0x01: // REGIMM
-				return (opcode << 24) | RT(op);
-			case 0x10: // COP0
-			case 0x12: // COP2/GTE
-				if (RS(op) >= 0x10)
-					return (opcode << 24) | (RS(op) << 8) | (op & 0x3f);
-				return (opcode << 24) | (RS(op) << 8);
-			default:
-				return opcode << 24;
-		}
-	}
-
 	constexpr bool IsIopBranchOrJumpOpcode(u32 op)
 	{
 		switch (op >> 26)
@@ -423,13 +404,13 @@ namespace VitaIOP
 	{
 	}
 
-	bool BlockCompiler::CanCompileOpcode(u32)
+	bool BlockCompiler::CanCompileOpcode(u32 op)
 	{
-		// PCSX2 owner: R3000AInterpreter.cpp::execI() dispatches every fetched
-		// word through R3000AOpcodeTables.cpp::psxBSC, where invalid slots route
-		// to psxNULL(). The first IOP A32 provider preserves that table as the
-		// semantic oracle instead of maintaining a second validity table.
-		return true;
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxBSC plus the SPECIAL/REGIMM/
+		// COP0/COP2 subtables. Every non-psxNULL R3000A slot has a native A32
+		// path below; psxNULL slots are rejected at scan time and executed by the
+		// interpreter fallback instead of a generated helper tail.
+		return IsNativeOpcode(op);
 	}
 
 	bool BlockCompiler::BeginBlock()
@@ -469,31 +450,6 @@ namespace VitaIOP
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, pc) &&
 			   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, PC_OFFSET);
-	}
-
-	void BlockCompiler::RecordHelperOpcode(u32 op, u32 pc)
-	{
-		const u32 opcode_class = IopOpcodeClass(op);
-		for (u32 i = 0; i < m_helper_opcode_class_count; i++)
-		{
-			if (m_helper_opcode_classes[i] == opcode_class)
-			{
-				m_helper_opcode_class_hits[i]++;
-				return;
-			}
-		}
-
-		if (m_helper_opcode_class_count >= BlockExecutionResult::HELPER_OPCODE_CLASS_SLOTS)
-		{
-			m_helper_opcode_class_overflow++;
-			return;
-		}
-
-		const u32 slot = m_helper_opcode_class_count++;
-		m_helper_opcode_classes[slot] = opcode_class;
-		m_helper_opcode_class_hits[slot] = 1;
-		m_helper_opcode_class_first_pc[slot] = pc;
-		m_helper_opcode_class_first_opcode[slot] = op;
 	}
 
 	bool BlockCompiler::EmitIncrementCycle()
@@ -1403,43 +1359,14 @@ namespace VitaIOP
 			return false;
 		}
 
-		// PCSX2 owner: R3000AOpcodeTables.cpp implements these pure R3000A
-		// integer operations directly; x86/iR3000Atables.cpp lowers the same
-		// batch to native host ALU/shifter instructions. Keep every other opcode
-		// on the PCSX2 helper-tail path until its owner is ported in a verified
-		// batch.
-		if (IsNativeOpcode(op))
-		{
-			if (!EmitNativeInstruction(op, pc))
-				return false;
-
-			m_native_instruction_count++;
-			return true;
-		}
-
-		void (*helper)() = psxBSC[op >> 26];
-		RecordHelperOpcode(op, pc);
-		if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(helper), HOST_CALL_SCRATCH) ||
-			!EmitPcChangedExitCheck(next_pc, direct_exit_branches))
-		{
+		// PCSX2 owner: R3000AOpcodeTables.cpp implements the full valid IOP
+		// table; x86/iR3000Atables.cpp lowers the same table to native host
+		// operations. CanCompileOpcode() has already rejected psxNULL slots.
+		if (!IsNativeOpcode(op) || !EmitNativeInstruction(op, pc))
 			return false;
-		}
 
-		m_helper_instruction_count++;
+		m_native_instruction_count++;
 		return true;
-	}
-
-	bool BlockCompiler::EmitHelperInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches)
-	{
-		const u32 next_pc = pc + 4;
-		void (*helper)() = psxBSC[op >> 26];
-
-		return EmitStoreCode(op) &&
-			   EmitTraceCheck(pc, op, direct_exit_branches) &&
-			   EmitStorePc(next_pc) &&
-			   EmitIncrementCycle() &&
-			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(helper), HOST_CALL_SCRATCH) &&
-			   EmitPcChangedExitCheck(next_pc, direct_exit_branches);
 	}
 
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count)

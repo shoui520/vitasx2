@@ -68,12 +68,10 @@ namespace VitaIOP
 		bool BeginBlock();
 		bool EndBlockReturn(BlockExitKind exit);
 		bool EmitInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
-		void RecordHelperOpcode(u32 op, u32 pc);
 		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op, u32 pc);
 		bool EmitNativeCOP0(u32 op);
 		bool EmitNativeCOP2(u32 op);
-		bool EmitHelperInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitStoreCode(u32 op);
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
 		bool EmitStorePc(u32 pc);
