@@ -101,6 +101,7 @@ namespace VitaIOP
 		bool EmitConditionalBranchFlag(u32 op);
 		bool EmitSignedBranchFlag(u32 op);
 		bool EmitJumpOp(u32 op, u32 pc);
+		bool EmitStaticJumpOp(u32 op, u32 pc);
 		bool EmitRegisterJumpOp(u32 op, u32 pc);
 		bool EmitCop0TransferOp(u32 op, bool to_cop0);
 		bool EmitCop0RfeOp();
@@ -113,6 +114,7 @@ namespace VitaIOP
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
 		bool m_emit_native_static_branch = false;
+		bool m_emit_native_static_jump = false;
 	};
 
 	class BlockExecutor

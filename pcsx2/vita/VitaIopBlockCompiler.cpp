@@ -321,6 +321,11 @@ namespace
 		}
 	}
 
+	constexpr bool IsIopStaticJumpOpcode(u32 op)
+	{
+		return (op >> 26) == 0x02 || (op >> 26) == 0x03; // J/JAL
+	}
+
 	static_assert(PC_OFFSET <= 4095);
 	static_assert(CODE_OFFSET <= 4095);
 	static_assert(CYCLE_OFFSET + sizeof(u32) <= 4095);
@@ -1085,6 +1090,9 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitJumpOp(u32 op, u32 pc)
 	{
+		if (m_emit_native_static_jump)
+			return EmitStaticJumpOp(op, pc);
+
 		if ((op >> 26) == 0x03) // JAL
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP0, pc + 8) ||
@@ -1105,6 +1113,17 @@ namespace VitaIOP
 		}
 
 		return EndBlockReturn(BlockExitKind::Direct);
+	}
+
+	bool BlockCompiler::EmitStaticJumpOp(u32 op, u32 pc)
+	{
+		if ((op >> 26) == 0x03) // JAL
+		{
+			return m_code.EmitMovImm32(HOST_TMP0, pc + 8) &&
+				   EmitStoreGpr(31, HOST_TMP0);
+		}
+
+		return (op >> 26) == 0x02; // J
 	}
 
 	bool BlockCompiler::EmitRegisterJumpOp(u32 op, u32 pc)
@@ -1495,28 +1514,44 @@ namespace VitaIOP
 		m_helper_instruction_count = 0;
 		bool can_direct_link_fallthrough = true;
 		bool has_native_static_branch = false;
+		bool has_native_static_jump = false;
 		u32 static_branch_target_pc = 0;
 		u32 static_branch_fallthrough_pc = 0;
+		u32 static_jump_target_pc = 0;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 pc = start_pc + i * 4;
 			const u32 op = iopMemRead32(pc);
+			const u32 delay_op = (i + 1 < instruction_count) ? iopMemRead32(pc + 4) : 0;
 			const bool can_native_static_branch =
 				IsIopStaticConditionalBranchOpcode(op) &&
 				i + 2 == instruction_count &&
-				!IsIopBranchOrJumpOpcode(iopMemRead32(pc + 4)) &&
-				!IsIopExceptionOpcode(iopMemRead32(pc + 4));
+				!IsIopBranchOrJumpOpcode(delay_op) &&
+				!IsIopExceptionOpcode(delay_op);
+			const bool can_native_static_jump =
+				IsIopStaticJumpOpcode(op) &&
+				i + 2 == instruction_count &&
+				!IsIopBranchOrJumpOpcode(delay_op) &&
+				!IsIopExceptionOpcode(delay_op) &&
+				((op >> 26) != 0x02 || (delay_op >> 16) != 0x2400);
 			m_emit_native_static_branch = can_native_static_branch;
+			m_emit_native_static_jump = can_native_static_jump;
 			if (can_native_static_branch)
 			{
 				has_native_static_branch = true;
 				static_branch_target_pc = BranchTarget(pc, op);
 				static_branch_fallthrough_pc = pc + 8;
 			}
+			if (can_native_static_jump)
+			{
+				has_native_static_jump = true;
+				static_jump_target_pc = JumpTarget(pc, op);
+			}
 			if (IsIopBranchOrJumpOpcode(op) || IsIopExceptionOpcode(op))
 				can_direct_link_fallthrough = false;
 			const bool emitted = CanCompileOpcode(op) && EmitInstruction(op, pc, direct_exit_branches);
 			m_emit_native_static_branch = false;
+			m_emit_native_static_jump = false;
 			if (!emitted)
 				return false;
 		}
@@ -1565,6 +1600,34 @@ namespace VitaIOP
 				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopEventTest), HOST_CALL_SCRATCH) ||
 				!EmitPcChangedExitCheck(static_branch_target_pc, direct_exit_branches) ||
 				!emit_direct_or_return_tail(static_branch_target_pc, 1))
+			{
+				return false;
+			}
+
+			direct_exit_offset = m_code.Size();
+			if (!EndBlockReturn(BlockExitKind::Direct))
+				return false;
+		}
+		else if (has_native_static_jump)
+		{
+			if (!EmitStorePc(static_jump_target_pc) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopEventTest), HOST_CALL_SCRATCH) ||
+				!EmitPcChangedExitCheck(static_jump_target_pc, direct_exit_branches))
+			{
+				return false;
+			}
+
+			if (direct_exit && direct_links)
+			{
+				size_t target_offset = 0;
+				if (!EndBlockDirectTail(direct_exit, &target_offset))
+					return false;
+
+				direct_links->slots[0].target_pc = static_jump_target_pc;
+				direct_links->slots[0].target_offset = target_offset;
+				direct_links->slots[0].valid = true;
+			}
+			else if (!EndBlockReturn(BlockExitKind::Direct))
 			{
 				return false;
 			}
