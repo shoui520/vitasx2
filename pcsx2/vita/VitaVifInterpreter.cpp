@@ -20,6 +20,7 @@
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuVifFastVectors = 0;
 u32 g_qemuVifNeonVectors = 0;
+u32 g_qemuVifGenericVectors = 0;
 #endif
 
 namespace
@@ -829,6 +830,9 @@ namespace
 		do
 		{
 			unpack(VitaVifVuMemPtr<idx>(vif.tag.addr), data);
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifGenericVectors;
+#endif
 			vif.tag.addr += 16;
 			--regs.num;
 			++vif.cl;
