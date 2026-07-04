@@ -276,6 +276,7 @@ namespace VitaEE
 				case 0x09: // JALR, owned by Interpreter.cpp::JALR().
 				case 0x0a: // MOVZ, owned by R5900OpcodeImpl.cpp::MOVZ().
 				case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
+				case 0x0c: // SYSCALL, owned by R5900OpcodeImpl.cpp::SYSCALL().
 				case 0x0d: // BREAK, owned by R5900OpcodeImpl.cpp::BREAK().
 				case 0x0f: // SYNC, owned by R5900OpcodeImpl.cpp::SYNC().
 				case 0x10: // MFHI, owned by R5900OpcodeImpl.cpp::MFHI().
@@ -320,6 +321,11 @@ namespace VitaEE
 		bool IsBREAK(u32 op)
 		{
 			return (op >> 26) == 0x00 && (op & 0x3f) == 0x0d;
+		}
+
+		bool IsSYSCALL(u32 op)
+		{
+			return (op >> 26) == 0x00 && (op & 0x3f) == 0x0c;
 		}
 
 		bool IsCounterReadLoad(u32 op)
@@ -1654,11 +1660,11 @@ namespace VitaEE
 		// delay slots through recompileNextInstruction(true, ...): the delay
 		// branch is skipped as generated work and the outer branch still owns
 		// the block exit.
-		// BREAK is different: R5900OpcodeImpl.cpp::BREAK() is a helper-backed
-		// exception path, and Interpreter.cpp::_doBranch_shared() marks
-		// cpuRegs.branch before executing it as a delay slot.
+		// SYSCALL/BREAK are different: R5900OpcodeImpl.cpp::SYSCALL()/BREAK()
+		// are helper-backed exception paths, and Interpreter.cpp::_doBranch_shared()
+		// marks cpuRegs.branch before executing them as delay slots.
 		return CanCompileOpcode(op) && !IsDI(op) &&
-			   (!RequiresBlockEndAfterOpcode(op) || IsBREAK(op) || IsCounterReadLoad(op));
+			   (!RequiresBlockEndAfterOpcode(op) || IsSYSCALL(op) || IsBREAK(op) || IsCounterReadLoad(op));
 	}
 
 	bool BlockCompiler::RequiresBlockEndAfterOpcode(u32 op)
@@ -1670,7 +1676,7 @@ namespace VitaEE
 		switch (op >> 26)
 		{
 			case 0x00:
-				return (op & 0x3f) == 0x0d || (op & 0x3f) == 0x0f;
+				return (op & 0x3f) == 0x0c || (op & 0x3f) == 0x0d || (op & 0x3f) == 0x0f;
 			case 0x10:
 				return CanCompileCOP0(op) && !IsDI(op) && !IsFastMFC0(op) && !IsFastMTC0(op);
 			case 0x11:
@@ -1967,7 +1973,7 @@ namespace VitaEE
 				raw_cycles = RawCycleRemainderAfterClear(raw_cycles);
 			}
 
-			if (IsBREAK(op) && !branch_delay_slot)
+			if ((IsSYSCALL(op) || IsBREAK(op)) && !branch_delay_slot)
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
@@ -2455,6 +2461,8 @@ namespace VitaEE
 				return EmitMOVZ(op);
 			case 0x0b: // MOVN, owned by R5900OpcodeImpl.cpp::MOVN().
 				return EmitMOVN(op);
+			case 0x0c: // SYSCALL, owned by R5900OpcodeImpl.cpp::SYSCALL().
+				return EmitSYSCALL(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
 			case 0x0d: // BREAK, owned by R5900OpcodeImpl.cpp::BREAK().
 				return EmitBREAK(op, pc, raw_cycles_through_instruction, event_exit, branch_delay_slot);
 			case 0x0f: // SYNC, owned by R5900OpcodeImpl.cpp::SYNC(); PCSX2 no-ops it.
@@ -4577,13 +4585,12 @@ namespace VitaEE
 			reinterpret_cast<const void*>(&CACHE), event_exit);
 	}
 
-	bool BlockCompiler::EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction,
-		const void* event_exit, bool branch_delay_slot)
+	bool BlockCompiler::EmitSpecialExceptionEventExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot, const void* helper)
 	{
-		if (!event_exit || raw_cycles_through_instruction == 0)
+		if (!event_exit || !helper || raw_cycles_through_instruction == 0)
 			return false;
 
-		using namespace R5900::Interpreter::OpcodeImpl;
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
@@ -4591,13 +4598,29 @@ namespace VitaEE
 			!m_code.EmitMovImm8(HOST_TMP0, branch_delay_slot ? 1 : 0) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(BRANCH_OFFSET)) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&BREAK)))
+			!m_code.EmitCallAbsolute(helper))
 		{
 			return false;
 		}
 
 		return m_code.EmitCallAbsolute(event_exit) &&
 			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_PC);
+	}
+
+	bool BlockCompiler::EmitSYSCALL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
+	{
+		using namespace R5900::Interpreter::OpcodeImpl;
+		return EmitSpecialExceptionEventExit(op, pc, raw_cycles_through_instruction,
+			event_exit, branch_delay_slot, reinterpret_cast<const void*>(&SYSCALL));
+	}
+
+	bool BlockCompiler::EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot)
+	{
+		using namespace R5900::Interpreter::OpcodeImpl;
+		return EmitSpecialExceptionEventExit(op, pc, raw_cycles_through_instruction,
+			event_exit, branch_delay_slot, reinterpret_cast<const void*>(&BREAK));
 	}
 
 	bool BlockCompiler::EmitADDIU(u32 op)
