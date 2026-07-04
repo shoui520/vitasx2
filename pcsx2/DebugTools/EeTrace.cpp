@@ -172,7 +172,7 @@ namespace Pcsx2Trace
 		}
 
 		EeTraceRecord record = {};
-		record.index = s_records_seen;
+		record.index = s_config.index_offset + s_records_seen;
 		record.cycle = cpuRegs.cycle;
 		record.pc = pc;
 		record.opcode = opcode;

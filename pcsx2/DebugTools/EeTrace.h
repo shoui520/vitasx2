@@ -16,6 +16,7 @@ namespace Pcsx2Trace
 		std::string output_path;
 		u64 max_records = 0;
 		u64 skip_records = 0;
+		u64 index_offset = 0;
 		bool wait_for_elf_entry = true;
 	};
 
