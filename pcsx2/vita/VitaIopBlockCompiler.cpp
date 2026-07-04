@@ -64,6 +64,11 @@ namespace
 		return static_cast<u16>(op);
 	}
 
+	constexpr u32 BranchTarget(u32 pc, u32 op)
+	{
+		return pc + 4 + static_cast<u32>(static_cast<s32>(IMM_S(op)) * 4);
+	}
+
 	constexpr size_t GprOffset(unsigned guest_reg)
 	{
 		return GPR_OFFSET + guest_reg * sizeof(u32);
@@ -105,6 +110,8 @@ namespace
 		{
 			case 0x00: // SPECIAL
 				return IsNativeSpecialOpcode(op);
+			case 0x04: // BEQ
+			case 0x05: // BNE
 			case 0x08: // ADDI
 			case 0x09: // ADDIU
 			case 0x0a: // SLTI
@@ -544,6 +551,24 @@ namespace VitaIOP
 			   m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH);
 	}
 
+	bool BlockCompiler::EmitConditionalBranchOp(u32 op, u32 pc)
+	{
+		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
+			!EmitLoadGpr(RT(op), HOST_TMP1) ||
+			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
+		{
+			return false;
+		}
+
+		const VitaA32::Condition skip_taken =
+			((op >> 26) == 0x04) ? VitaA32::Condition::NE : VitaA32::Condition::EQ;
+		const size_t not_taken = m_code.EmitBranchPlaceholder(skip_taken);
+		return m_code.EmitMovImm32(HOST_TMP0, BranchTarget(pc, op)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
+			   EndBlockReturn(BlockExitKind::Direct) &&
+			   m_code.PatchBranch(not_taken, m_code.Size(), skip_taken);
+	}
+
 	bool BlockCompiler::EmitNativeSPECIAL(u32 op)
 	{
 		switch (op & 0x3f)
@@ -584,12 +609,15 @@ namespace VitaIOP
 		}
 	}
 
-	bool BlockCompiler::EmitNativeInstruction(u32 op)
+	bool BlockCompiler::EmitNativeInstruction(u32 op, u32 pc)
 	{
 		switch (op >> 26)
 		{
 			case 0x00: // SPECIAL
 				return EmitNativeSPECIAL(op);
+			case 0x04: // BEQ
+			case 0x05: // BNE
+				return EmitConditionalBranchOp(op, pc);
 			case 0x08: // ADDI
 			case 0x09: // ADDIU
 			case 0x0a: // SLTI
@@ -632,7 +660,7 @@ namespace VitaIOP
 		// batch.
 		if (IsNativeOpcode(op))
 		{
-			if (!EmitNativeInstruction(op))
+			if (!EmitNativeInstruction(op, pc))
 				return false;
 
 			m_native_instruction_count++;

@@ -54,7 +54,7 @@ namespace VitaIOP
 		bool BeginBlock();
 		bool EndBlockReturn(BlockExitKind exit);
 		bool EmitInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
-		bool EmitNativeInstruction(u32 op);
+		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op);
 		bool EmitHelperInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitStoreCode(u32 op);
@@ -73,6 +73,7 @@ namespace VitaIOP
 		bool EmitEffectiveAddress(u32 op);
 		bool EmitLoadOp(u32 op);
 		bool EmitStoreOp(u32 op);
+		bool EmitConditionalBranchOp(u32 op, u32 pc);
 
 		VitaA32::CodeBuffer& m_code;
 		u32 m_native_instruction_count = 0;

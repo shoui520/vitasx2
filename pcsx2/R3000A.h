@@ -192,6 +192,7 @@ extern R3000Acpu psxRec;
 
 extern void psxReset();
 extern void psxException(u32 code, u32 step);
+extern void psxDoBranch(u32 target);
 extern void iopEventTest();
 
 int psxIsBreakpointNeeded(u32 addr);

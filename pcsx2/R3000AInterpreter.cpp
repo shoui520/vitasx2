@@ -245,7 +245,7 @@ static __fi void execI()
 	psxBSC[psxRegs.code >> 26]();
 }
 
-static void doBranch(s32 tar) {
+void psxDoBranch(u32 tar) {
 	if (tar == 0x0)
 		DevCon.Warning("[R3000 Interpreter] Warning: Branch to 0x0!");
 
@@ -271,6 +271,10 @@ static void doBranch(s32 tar) {
 	psxRegs.pc = branchPC;
 
 	iopEventTest();
+}
+
+static void doBranch(s32 tar) {
+	psxDoBranch(static_cast<u32>(tar));
 }
 
 static void intReserve() {
