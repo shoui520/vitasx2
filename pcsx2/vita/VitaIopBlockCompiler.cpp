@@ -23,6 +23,7 @@ namespace
 	constexpr unsigned HOST_TMP0 = 0;
 	constexpr unsigned HOST_TMP1 = 1;
 	constexpr unsigned HOST_TMP2 = 2;
+	constexpr unsigned HOST_TMP3 = 3;
 	constexpr unsigned HOST_PSX_REGS = 4;
 	constexpr unsigned HOST_CALL_SCRATCH = 12;
 
@@ -131,6 +132,8 @@ namespace
 			case 0x11: // MTHI
 			case 0x12: // MFLO
 			case 0x13: // MTLO
+			case 0x18: // MULT
+			case 0x19: // MULTU
 			case 0x20: // ADD
 			case 0x21: // ADDU
 			case 0x22: // SUB
@@ -465,6 +468,29 @@ namespace VitaIOP
 			   EmitStoreGpr(rd, HOST_TMP2);
 	}
 
+	bool BlockCompiler::EmitMultiplyOp(u32 op, bool is_signed)
+	{
+		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
+			!EmitLoadGpr(RT(op), HOST_TMP1))
+		{
+			return false;
+		}
+
+		if (is_signed)
+		{
+			if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+				return false;
+		}
+		else
+		{
+			if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+				return false;
+		}
+
+		return m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
+			   m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+	}
+
 	bool BlockCompiler::EmitImmediateOp(u32 op)
 	{
 		const unsigned opcode = op >> 26;
@@ -773,6 +799,10 @@ namespace VitaIOP
 			case 0x13: // MTLO
 				return EmitLoadGpr(RS(op), HOST_TMP0) &&
 					   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET));
+			case 0x18: // MULT
+				return EmitMultiplyOp(op, true);
+			case 0x19: // MULTU
+				return EmitMultiplyOp(op, false);
 			case 0x20: // ADD
 			case 0x21: // ADDU
 			case 0x22: // SUB
