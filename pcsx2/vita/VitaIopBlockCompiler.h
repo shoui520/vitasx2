@@ -101,6 +101,7 @@ namespace VitaIOP
 		bool EmitRegisterJumpOp(u32 op, u32 pc);
 		bool EmitCop0TransferOp(u32 op, bool to_cop0);
 		bool EmitCop0RfeOp();
+		bool EmitCop2CommandOp(u32 op);
 		bool EmitReadCop2DataReg(unsigned cop2_reg, unsigned host_reg);
 		bool EmitWriteCop2DataReg(unsigned cop2_reg, unsigned host_reg);
 		bool EmitCop2LoadStoreOp(u32 op);

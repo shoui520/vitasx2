@@ -4,6 +4,7 @@
 #include "pcsx2/vita/VitaIopBlockCompiler.h"
 
 #include "common/Vita/VitaJitMemory.h"
+#include "pcsx2/IopGte.h"
 #include "pcsx2/IopMem.h"
 #include "pcsx2/R3000A.h"
 #include "pcsx2/R5900.h"
@@ -120,15 +121,44 @@ namespace
 
 	constexpr bool IsNativeCop2Opcode(u32 op)
 	{
-		if ((op & 0x3f) != 0)
-			return false;
-
-		switch (RS(op))
+		if ((op & 0x3f) == 0)
 		{
-			case 0x00: // MFC2
-			case 0x02: // CFC2
-			case 0x04: // MTC2
-			case 0x06: // CTC2
+			switch (RS(op))
+			{
+				case 0x00: // MFC2
+				case 0x02: // CFC2
+				case 0x04: // MTC2
+				case 0x06: // CTC2
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		switch (op & 0x3f)
+		{
+			case 0x01: // RTPS
+			case 0x06: // NCLIP
+			case 0x0c: // OP
+			case 0x10: // DPCS
+			case 0x11: // INTPL
+			case 0x12: // MVMVA
+			case 0x13: // NCDS
+			case 0x14: // CDP
+			case 0x16: // NCDT
+			case 0x1b: // NCCS
+			case 0x1c: // CC
+			case 0x1e: // NCS
+			case 0x20: // NCT
+			case 0x28: // SQR
+			case 0x29: // DCPL
+			case 0x2a: // DPCT
+			case 0x2d: // AVSZ3
+			case 0x2e: // AVSZ4
+			case 0x30: // RTPT
+			case 0x3d: // GPF
+			case 0x3e: // GPL
+			case 0x3f: // NCCT
 				return true;
 			default:
 				return false;
@@ -1060,6 +1090,43 @@ namespace VitaIOP
 			   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET));
 	}
 
+	bool BlockCompiler::EmitCop2CommandOp(u32 op)
+	{
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxCP2 dispatches by function
+		// to IopGte.cpp. Direct calls remove the generic COP2 table tail while
+		// preserving PCSX2's GTE command implementation.
+		const void* helper = nullptr;
+		switch (op & 0x3f)
+		{
+			case 0x01: helper = reinterpret_cast<const void*>(&gteRTPS); break;
+			case 0x06: helper = reinterpret_cast<const void*>(&gteNCLIP); break;
+			case 0x0c: helper = reinterpret_cast<const void*>(&gteOP); break;
+			case 0x10: helper = reinterpret_cast<const void*>(&gteDPCS); break;
+			case 0x11: helper = reinterpret_cast<const void*>(&gteINTPL); break;
+			case 0x12: helper = reinterpret_cast<const void*>(&gteMVMVA); break;
+			case 0x13: helper = reinterpret_cast<const void*>(&gteNCDS); break;
+			case 0x14: helper = reinterpret_cast<const void*>(&gteCDP); break;
+			case 0x16: helper = reinterpret_cast<const void*>(&gteNCDT); break;
+			case 0x1b: helper = reinterpret_cast<const void*>(&gteNCCS); break;
+			case 0x1c: helper = reinterpret_cast<const void*>(&gteCC); break;
+			case 0x1e: helper = reinterpret_cast<const void*>(&gteNCS); break;
+			case 0x20: helper = reinterpret_cast<const void*>(&gteNCT); break;
+			case 0x28: helper = reinterpret_cast<const void*>(&gteSQR); break;
+			case 0x29: helper = reinterpret_cast<const void*>(&gteDCPL); break;
+			case 0x2a: helper = reinterpret_cast<const void*>(&gteDPCT); break;
+			case 0x2d: helper = reinterpret_cast<const void*>(&gteAVSZ3); break;
+			case 0x2e: helper = reinterpret_cast<const void*>(&gteAVSZ4); break;
+			case 0x30: helper = reinterpret_cast<const void*>(&gteRTPT); break;
+			case 0x3d: helper = reinterpret_cast<const void*>(&gteGPF); break;
+			case 0x3e: helper = reinterpret_cast<const void*>(&gteGPL); break;
+			case 0x3f: helper = reinterpret_cast<const void*>(&gteNCCT); break;
+			default:
+				return false;
+		}
+
+		return m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH);
+	}
+
 	bool BlockCompiler::EmitReadCop2DataReg(unsigned cop2_reg, unsigned host_reg)
 	{
 		// PCSX2 owner: IopGte.cpp::MFC2(). Register 29 synthesizes ORGB from
@@ -1150,7 +1217,7 @@ namespace VitaIOP
 	bool BlockCompiler::EmitNativeCOP2(u32 op)
 	{
 		if ((op & 0x3f) != 0)
-			return false;
+			return EmitCop2CommandOp(op);
 
 		switch (RS(op))
 		{
