@@ -11240,9 +11240,17 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return true;
 
+		const size_t offset = GprOffset(guest_reg);
+		if (offset <= 0xff && CanUseA32DualTransferPair(HOST_TMP0, HOST_TMP1))
+		{
+			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+				   m_code.EmitStrdImm8(HOST_TMP0, HOST_TMP1, HOST_CPU_REGS, static_cast<u8>(offset));
+		}
+
 		return m_code.EmitMovImm8(HOST_TMP0, 0) &&
-			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
 	}
 
 	bool BlockCompiler::EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high)
