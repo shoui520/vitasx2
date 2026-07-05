@@ -2029,6 +2029,7 @@ namespace VitaEE
 		m_qword_store_cold_tails.clear();
 		m_cop1_word_memory_cold_tails.clear();
 		m_cop2_qword_memory_cold_tails.clear();
+		m_vu0_sync_cold_tails.clear();
 		m_partial_memory_cold_tails.clear();
 		m_vtlb_registers_available = use_vtlb_registers;
 		m_cop1_exponent_mask_available = use_cop1_exponent_mask_register;
@@ -8810,9 +8811,8 @@ namespace VitaEE
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-			!EmitVu0SyncIfRunning() ||
-			!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP5))
+			!EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5) ||
+			!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0))
 		{
 			return false;
 		}
@@ -9097,11 +9097,10 @@ namespace VitaEE
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-			!EmitVu0SyncIfRunning() ||
-			!EmitVu0VfAddress(HOST_TMP0, rt) ||
-			!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
-			!m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP5))
+			!EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5) ||
+			!EmitVu0VfAddress(HOST_TMP1, rt) ||
+			!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) ||
+			!m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0))
 		{
 			return false;
 		}
@@ -10469,6 +10468,12 @@ namespace VitaEE
 				return false;
 		}
 
+		for (const Vu0SyncColdTail& tail : m_vu0_sync_cold_tails)
+		{
+			if (!EmitVu0SyncColdTail(tail))
+				return false;
+		}
+
 		for (const PartialMemoryColdTail& tail : m_partial_memory_cold_tails)
 		{
 			if (!EmitPartialMemoryColdTail(tail))
@@ -10481,6 +10486,7 @@ namespace VitaEE
 		m_qword_store_cold_tails.clear();
 		m_cop1_word_memory_cold_tails.clear();
 		m_cop2_qword_memory_cold_tails.clear();
+		m_vu0_sync_cold_tails.clear();
 		m_partial_memory_cold_tails.clear();
 		return true;
 	}
@@ -10700,6 +10706,30 @@ namespace VitaEE
 			   m_code.PatchBranch(tail_done, tail.join_offset);
 	}
 
+	bool BlockCompiler::EmitVu0SyncColdTail(const Vu0SyncColdTail& tail)
+	{
+		// PCSX2 owners: VU0.cpp::vu0Sync() / _vu0run(). Blocks branch here
+		// only when VU0.VI[REG_VPU_STAT].UL bit 0 says macro VU0 is running;
+		// idle VU0 stays on the fallthrough path.
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.running_branch, fallback_target, VitaA32::Condition::NE))
+			return false;
+
+		const bool preserve = tail.preserve_reg < 16;
+		if ((preserve &&
+			 (!m_code.EmitMovRegShiftImm(tail.save_reg, tail.preserve_reg, VitaA32::ShiftType::LSL, 0))) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			(preserve &&
+			 !m_code.EmitMovRegShiftImm(tail.preserve_reg, tail.save_reg, VitaA32::ShiftType::LSL, 0)))
+		{
+			return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
+	}
+
 	bool BlockCompiler::EmitPartialMemoryColdTail(const PartialMemoryColdTail& tail)
 	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() plus
@@ -10910,28 +10940,31 @@ namespace VitaEE
 			   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP3, 0);
 	}
 
-	bool BlockCompiler::EmitVu0SyncIfRunning()
+	bool BlockCompiler::EmitVu0SyncIfRunning(unsigned preserve_reg, unsigned save_reg)
 	{
 		// PCSX2 owners: VU0.cpp::vu0Sync() / _vu0run() and
 		// x86/microVU_Macro.inl::mVUSyncVU0(). _vu0run() returns before any
-		// side effect when VU0.VI[REG_VPU_STAT].UL bit 0 is clear, so keep the
-		// idle-VU0 case in the A32 block and call the PCSX2 helper only for the
-		// running case.
-		if (!EmitVu0ViAddress(HOST_TMP0, VU0_REG_VPU_STAT) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
-			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 1, true))
+		// side effect when VU0.VI[REG_VPU_STAT].UL bit 0 is clear. Keep that
+		// idle case as fallthrough and branch only the running case to a cold
+		// helper tail.
+		if (!EmitVu0ViAddress(HOST_TMP1, VU0_REG_VPU_STAT) ||
+			!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, 0) ||
+			!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 1, true))
 		{
 			return false;
 		}
 
-		const size_t vu0_idle = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (vu0_idle == static_cast<size_t>(-1) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)))
-		{
+		const size_t vu0_running = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (vu0_running == static_cast<size_t>(-1))
 			return false;
-		}
 
-		return m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ);
+		m_vu0_sync_cold_tails.push_back({
+			vu0_running,
+			m_code.Size(),
+			preserve_reg,
+			save_reg,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitVu0RegisterAddress(unsigned host_reg, size_t offset)

@@ -477,7 +477,7 @@ namespace VitaEE
 		bool EmitCpuRegsAddress(unsigned host_reg, size_t offset);
 		bool EmitLoadRawGpr0KnownZeroFlag(unsigned host_reg);
 		bool EmitRefreshRawGpr0KnownZeroFromLow64(unsigned low_reg, unsigned high_reg);
-		bool EmitVu0SyncIfRunning();
+		bool EmitVu0SyncIfRunning(unsigned preserve_reg = 16, unsigned save_reg = 16);
 		bool EmitVu0RegisterAddress(unsigned host_reg, size_t offset);
 		bool EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg);
 		bool EmitVu0ViAddress(unsigned host_reg, unsigned vi_reg);
@@ -566,6 +566,15 @@ namespace VitaEE
 		};
 		bool EmitCop2QwordMemoryColdTail(const Cop2QwordMemoryColdTail& tail);
 
+		struct Vu0SyncColdTail
+		{
+			size_t running_branch = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+			unsigned preserve_reg = 16;
+			unsigned save_reg = 16;
+		};
+		bool EmitVu0SyncColdTail(const Vu0SyncColdTail& tail);
+
 		struct PartialMemoryColdTail
 		{
 			size_t handler_fallback = static_cast<size_t>(-1);
@@ -582,6 +591,7 @@ namespace VitaEE
 		std::vector<QwordStoreColdTail> m_qword_store_cold_tails;
 		std::vector<Cop1WordMemoryColdTail> m_cop1_word_memory_cold_tails;
 		std::vector<Cop2QwordMemoryColdTail> m_cop2_qword_memory_cold_tails;
+		std::vector<Vu0SyncColdTail> m_vu0_sync_cold_tails;
 		std::vector<PartialMemoryColdTail> m_partial_memory_cold_tails;
 		u16 m_saved_registers = 0;
 		bool m_vtlb_registers_available = false;
