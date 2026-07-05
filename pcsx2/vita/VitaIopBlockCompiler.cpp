@@ -1047,6 +1047,9 @@ namespace VitaIOP
 		// The shift amount is irrelevant when the source register is zero.
 		if (rt == 0)
 			return EmitStoreGprZero(rd);
+		// Register zero supplies a shift amount of 0.
+		if (rs == 0)
+			return EmitMoveGpr(rd, rt);
 
 		if (!EmitLoadGpr(rt, HOST_TMP0) ||
 			!EmitLoadGpr(rs, HOST_TMP1) ||

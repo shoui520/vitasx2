@@ -9478,11 +9478,20 @@ namespace VitaEE
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
 
-		return EmitLoadGprLow(rt, HOST_TMP0) &&
-			   EmitLoadGprLow(rs, HOST_TMP2) &&
-			   m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x1f) &&
-			   m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP0, shift, HOST_TMP2) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+		// Register zero supplies a shift amount of 0; the 32-bit result still
+		// needs the owner's sign-extension into the low 64-bit lane.
+		if (!EmitLoadGprLow(rt, HOST_TMP0))
+			return false;
+
+		if (rs != 0 &&
+			(!EmitLoadGprLow(rs, HOST_TMP2) ||
+			 !m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x1f) ||
+			 !m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP0, shift, HOST_TMP2)))
+		{
+			return false;
+		}
+
+		return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
@@ -9584,6 +9593,15 @@ namespace VitaEE
 		// irrelevant when the source register is zero.
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
+		// Register zero supplies a shift amount of 0.
+		if (rs == 0)
+		{
+			if (rd == rt)
+				return true;
+
+			return EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
 
 		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1) ||
 			!EmitLoadGprLow(rs, HOST_TMP2) ||
@@ -9647,6 +9665,15 @@ namespace VitaEE
 		// is irrelevant when the source register is zero.
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
+		// Register zero supplies a shift amount of 0.
+		if (rs == 0)
+		{
+			if (rd == rt)
+				return true;
+
+			return EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
 
 		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1) ||
 			!EmitLoadGprLow(rs, HOST_TMP2) ||
