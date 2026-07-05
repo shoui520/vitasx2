@@ -9415,6 +9415,18 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
+		// PCSX2 owner: R5900OpcodeImpl.cpp::SLT() compares signed UD[0] and
+		// writes the 0/1 result back to UD[0].
+		if (rs == rt)
+			return EmitStoreGprZero64(rd);
+		if (rt == 0)
+		{
+			return EmitLoadGprHigh(rs, HOST_TMP0) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, 31) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
 			   EmitSetLessThan64(rd, true);
@@ -9428,6 +9440,10 @@ namespace VitaEE
 
 		if (rd == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::SLTU() compares unsigned UD[0].
+		if (rs == rt || rt == 0)
+			return EmitStoreGprZero64(rd);
 
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&

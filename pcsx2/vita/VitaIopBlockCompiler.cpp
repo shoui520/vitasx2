@@ -1104,10 +1104,10 @@ namespace VitaIOP
 
 			if (rt == 0)
 			{
+				// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLT(). Comparing a
+				// signed 32-bit value with $zero is just its sign bit.
 				return EmitLoadGpr(rs, HOST_TMP0) &&
-					   m_code.EmitCmpImm32(HOST_TMP0, 0) &&
-					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
-					   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR, 31) &&
 					   EmitStoreGpr(rd, HOST_TMP2);
 			}
 		}
