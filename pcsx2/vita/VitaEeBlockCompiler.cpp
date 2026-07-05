@@ -3711,8 +3711,7 @@ namespace VitaEE
 
 			const size_t finite_or_zero_target = m_code.Size();
 			if (!m_code.PatchBranch(not_infinity_or_nan, finite_or_zero_target, VitaA32::Condition::NE) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -3760,8 +3759,7 @@ namespace VitaEE
 			if (!m_code.PatchBranch(no_overflow, no_overflow_target, VitaA32::Condition::NE) ||
 				!EmitBicImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FCR31_OVERFLOW_FLAG, HOST_TMP2) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP5) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -3772,8 +3770,7 @@ namespace VitaEE
 
 			if (!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_FRACTION_MASK) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -3880,8 +3877,7 @@ namespace VitaEE
 
 			const size_t finite_or_zero_target = m_code.Size();
 			if (!m_code.PatchBranch(not_infinity_or_nan, finite_or_zero_target, VitaA32::Condition::NE) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -3939,8 +3935,7 @@ namespace VitaEE
 			const size_t no_overflow_target = m_code.Size();
 			if (!m_code.PatchBranch(no_overflow, no_overflow_target, VitaA32::Condition::NE) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, exponent_mask_reg) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -3951,8 +3946,7 @@ namespace VitaEE
 
 			if (!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_FRACTION_MASK) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -3987,8 +3981,7 @@ namespace VitaEE
 			if (!m_code.EmitLdrImm12(HOST_TMP5, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
 				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4027,8 +4020,7 @@ namespace VitaEE
 				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) ||
 				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP1, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4067,8 +4059,7 @@ namespace VitaEE
 				!clear_invalid_divide_causes() ||
 				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP1, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4089,8 +4080,7 @@ namespace VitaEE
 			const size_t operand_nonzero_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_nonzero, operand_nonzero_target, VitaA32::Condition::NE) ||
 				!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4134,8 +4124,7 @@ namespace VitaEE
 				!clear_invalid_divide_causes() ||
 				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP1, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4161,8 +4150,7 @@ namespace VitaEE
 			const size_t operand_nonzero_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_nonzero, operand_nonzero_target, VitaA32::Condition::NE) ||
 				!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4262,8 +4250,7 @@ namespace VitaEE
 
 			const size_t finite_or_zero_target = m_code.Size();
 			if (!m_code.PatchBranch(not_infinity_or_nan, finite_or_zero_target, VitaA32::Condition::NE) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4311,8 +4298,7 @@ namespace VitaEE
 			if (!m_code.PatchBranch(no_overflow, no_overflow_target, VitaA32::Condition::NE) ||
 				!EmitBicImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FCR31_OVERFLOW_FLAG, HOST_TMP2) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP5) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4323,8 +4309,7 @@ namespace VitaEE
 
 			if (!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_FRACTION_MASK) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4566,8 +4551,7 @@ namespace VitaEE
 
 			const size_t finite_or_zero_target = m_code.Size();
 			if (!m_code.PatchBranch(not_infinity_or_nan, finite_or_zero_target, VitaA32::Condition::NE) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -4596,8 +4580,7 @@ namespace VitaEE
 				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
 				!m_code.EmitMovImm32(HOST_TMP1, FPU_FCR31_CONDITION_FLAG) ||
 				!EmitBicImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FCR31_CONDITION_FLAG, HOST_TMP2) ||
-				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP4, HOST_TMP2))
+				!m_code.EmitCmpImm32(HOST_TMP4, 0))
 			{
 				return false;
 			}
