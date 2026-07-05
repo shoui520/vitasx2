@@ -5676,17 +5676,9 @@ namespace VitaEE
 			return true;
 
 		constexpr unsigned NEON_VALUE = 0;
-		const auto emit_cpu_regs_address = [this](unsigned host_reg, size_t offset) {
-			if (offset <= 255)
-				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
-
-			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
-				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
-		};
-
-		return emit_cpu_regs_address(HOST_TMP0, hilo_offset) &&
+		return EmitCpuRegsAddress(HOST_TMP0, hilo_offset) &&
 			   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
-			   emit_cpu_regs_address(HOST_TMP1, GprOffset(rd)) &&
+			   EmitCpuRegsAddress(HOST_TMP1, GprOffset(rd)) &&
 			   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
 	}
 
@@ -5695,26 +5687,18 @@ namespace VitaEE
 		const unsigned rs = RS(op);
 
 		constexpr unsigned NEON_VALUE = 0;
-		const auto emit_cpu_regs_address = [this](unsigned host_reg, size_t offset) {
-			if (offset <= 255)
-				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
-
-			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
-				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
-		};
-
 		if (rs == 0)
 		{
 			if (!m_code.EmitVeorQ(NEON_VALUE, NEON_VALUE, NEON_VALUE))
 				return false;
 		}
-		else if (!emit_cpu_regs_address(HOST_TMP0, GprOffset(rs)) ||
+		else if (!EmitCpuRegsAddress(HOST_TMP0, GprOffset(rs)) ||
 				 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0))
 		{
 			return false;
 		}
 
-		return emit_cpu_regs_address(HOST_TMP1, hilo_offset) &&
+		return EmitCpuRegsAddress(HOST_TMP1, hilo_offset) &&
 			   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
 	}
 
@@ -7059,12 +7043,7 @@ namespace VitaEE
 		constexpr unsigned NEON_RD = 2;
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
-			const size_t offset = GprOffset(guest_reg);
-			if (offset <= 255)
-				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
-
-			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
-				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
 
 		if (rs == 0)
@@ -7211,12 +7190,7 @@ namespace VitaEE
 		constexpr unsigned NEON_RT = 0;
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
-			const size_t offset = GprOffset(guest_reg);
-			if (offset <= 255)
-				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
-
-			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
-				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
 
 		if (rt == 0)
@@ -7261,12 +7235,7 @@ namespace VitaEE
 		constexpr unsigned NEON_RT = 0;
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
-			const size_t offset = GprOffset(guest_reg);
-			if (offset <= 255)
-				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
-
-			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
-				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
 
 		if (rt == 0)
@@ -7648,12 +7617,7 @@ namespace VitaEE
 		constexpr unsigned NEON_RT = 1;
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
-			const size_t offset = GprOffset(guest_reg);
-			if (offset <= 255)
-				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
-
-			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
-				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
 
 		if (rs == 0)
@@ -7723,12 +7687,7 @@ namespace VitaEE
 		constexpr unsigned NEON_RT = 1;
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
-			const size_t offset = GprOffset(guest_reg);
-			if (offset <= 255)
-				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
-
-			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
-				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
 
 		if (rs == 0)
@@ -8050,12 +8009,7 @@ namespace VitaEE
 		constexpr unsigned NEON_ADD_HIGH_D = NEON_ADD * 2 + 1;
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
-			const size_t offset = GprOffset(guest_reg);
-			if (offset <= 255)
-				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
-
-			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
-				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
 
 		if (rs == 0)
@@ -8201,12 +8155,7 @@ namespace VitaEE
 		constexpr unsigned NEON_RD = 2;
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
-			const size_t offset = GprOffset(guest_reg);
-			if (offset <= 255)
-				return m_code.EmitAddImm8(host_reg, HOST_CPU_REGS, static_cast<u8>(offset));
-
-			return m_code.EmitMovImm32(host_reg, static_cast<u32>(offset)) &&
-				   m_code.EmitAddReg(host_reg, HOST_CPU_REGS, host_reg);
+			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
 
 		if (rs == 0)
@@ -10656,6 +10605,9 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCpuRegsAddress(unsigned host_reg, size_t offset)
 	{
+		// PCSX2 owner: R5900.h::cpuRegisters keeps GPR/HI/LO as contiguous
+		// 16-byte slots, so these guest-state addresses can use A32's
+		// modified-immediate ADD whenever the struct offset encodes directly.
 		if (offset <= 0xffffffffu && m_code.EmitAddImm32(host_reg, HOST_CPU_REGS, static_cast<u32>(offset)))
 			return true;
 
