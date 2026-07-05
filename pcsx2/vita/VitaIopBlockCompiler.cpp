@@ -836,12 +836,18 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitStoreGprZero(unsigned guest_reg)
 	{
+		if (guest_reg == 0)
+			return true;
+
 		return m_code.EmitMovImm8(HOST_TMP0, 0) &&
 			   EmitStoreGpr(guest_reg, HOST_TMP0);
 	}
 
 	bool BlockCompiler::EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg)
 	{
+		if (dst_guest_reg == 0)
+			return true;
+
 		if (dst_guest_reg == src_guest_reg)
 			return true;
 

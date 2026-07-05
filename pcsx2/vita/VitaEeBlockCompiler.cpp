@@ -11120,6 +11120,9 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitStoreGprZero64(unsigned guest_reg)
 	{
+		if (guest_reg == 0)
+			return true;
+
 		return m_code.EmitMovImm8(HOST_TMP0, 0) &&
 			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
 			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
