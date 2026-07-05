@@ -4545,17 +4545,33 @@ namespace VitaEE
 				   m_code.EmitEorReg(reg, reg, HOST_TMP2);
 		};
 
+		const auto inverse_condition = [](VitaA32::Condition condition, VitaA32::Condition* inverse) {
+			switch (condition)
+			{
+				case VitaA32::Condition::EQ:
+					*inverse = VitaA32::Condition::NE;
+					return true;
+				case VitaA32::Condition::CC:
+					*inverse = VitaA32::Condition::CS;
+					return true;
+				case VitaA32::Condition::LS:
+					*inverse = VitaA32::Condition::HI;
+					return true;
+				default:
+					return false;
+			}
+		};
+
 		const auto apply_condition_flag = [&](VitaA32::Condition condition) {
-			if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 1, condition) ||
+			VitaA32::Condition clear_only_condition = VitaA32::Condition::AL;
+			if (!inverse_condition(condition, &clear_only_condition) ||
 				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
-				!EmitBicImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FCR31_CONDITION_FLAG, HOST_TMP2) ||
-				!m_code.EmitCmpImm32(HOST_TMP4, 0))
+				!EmitBicImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FCR31_CONDITION_FLAG, HOST_TMP2))
 			{
 				return false;
 			}
 
-			const size_t clear_only = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			const size_t clear_only = m_code.EmitBranchPlaceholder(clear_only_condition);
 			if (clear_only == static_cast<size_t>(-1))
 				return false;
 
@@ -4563,7 +4579,7 @@ namespace VitaEE
 				return false;
 
 			const size_t store_target = m_code.Size();
-			return m_code.PatchBranch(clear_only, store_target, VitaA32::Condition::EQ) &&
+			return m_code.PatchBranch(clear_only, store_target, clear_only_condition) &&
 				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31)));
 		};
 
