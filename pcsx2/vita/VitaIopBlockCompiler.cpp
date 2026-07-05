@@ -1071,6 +1071,46 @@ namespace VitaIOP
 		if (rd == 0)
 			return true;
 
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLT()/psxSLTU(). Fold
+		// architectural-zero compare identities before loading both operands.
+		if (rs == rt)
+			return EmitStoreGprZero(rd);
+
+		if (is_signed)
+		{
+			if (rs == 0)
+			{
+				return EmitLoadGpr(rt, HOST_TMP0) &&
+					   m_code.EmitCmpImm32(HOST_TMP0, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::GT) &&
+					   EmitStoreGpr(rd, HOST_TMP2);
+			}
+
+			if (rt == 0)
+			{
+				return EmitLoadGpr(rs, HOST_TMP0) &&
+					   m_code.EmitCmpImm32(HOST_TMP0, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT) &&
+					   EmitStoreGpr(rd, HOST_TMP2);
+			}
+		}
+		else
+		{
+			if (rt == 0)
+				return EmitStoreGprZero(rd);
+
+			if (rs == 0)
+			{
+				return EmitLoadGpr(rt, HOST_TMP0) &&
+					   m_code.EmitCmpImm32(HOST_TMP0, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::NE) &&
+					   EmitStoreGpr(rd, HOST_TMP2);
+			}
+		}
+
 		return EmitLoadGpr(rs, HOST_TMP0) &&
 			   EmitLoadGpr(rt, HOST_TMP1) &&
 			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) &&
