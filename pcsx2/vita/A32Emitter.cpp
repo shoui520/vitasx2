@@ -189,6 +189,31 @@ namespace VitaA32
 			return false;
 		}
 
+		u32 EncodeDataProcessingRegShiftImm(
+			u32 opcode, unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount, bool set_flags)
+		{
+			pxAssert(IsRegister(rd));
+			pxAssert(IsRegister(rn));
+			pxAssert(IsRegister(rm));
+			pxAssert(amount <= 31);
+			return CondBits(Condition::AL) | opcode | (set_flags ? SET_FLAGS : 0) |
+				   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) |
+				   ((static_cast<u32>(amount) & 0x1fu) << 7) |
+				   ((static_cast<u32>(shift) & 0x3u) << 5) | (rm & 0xfu);
+		}
+
+		u32 EncodeDataProcessingRegShiftReg(
+			u32 opcode, unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs, bool set_flags)
+		{
+			pxAssert(IsRegister(rd));
+			pxAssert(IsRegister(rn));
+			pxAssert(IsRegister(rm));
+			pxAssert(IsRegister(rs));
+			return CondBits(Condition::AL) | opcode | (set_flags ? SET_FLAGS : 0) |
+				   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | ((rs & 0xfu) << 8) |
+				   ((static_cast<u32>(shift) & 0x3u) << 5) | 0x10u | (rm & 0xfu);
+		}
+
 		u32 NeonQd(unsigned qreg)
 		{
 			const unsigned dreg = qreg * 2;
@@ -516,6 +541,22 @@ namespace VitaA32
 		return EmitU32(EncodeAddReg(rd, rn, rm, set_flags));
 	}
 
+	bool CodeBuffer::EmitAddRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
+			return false;
+		return EmitU32(EncodeAddRegShiftImm(rd, rn, rm, shift, amount, set_flags));
+	}
+
+	bool CodeBuffer::EmitAddRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || !IsRegister(rs))
+			return false;
+		return EmitU32(EncodeAddRegShiftReg(rd, rn, rm, shift, rs, set_flags));
+	}
+
 	bool CodeBuffer::EmitAdcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
@@ -530,6 +571,38 @@ namespace VitaA32
 		return EmitU32(EncodeAndReg(rd, rn, rm, set_flags));
 	}
 
+	bool CodeBuffer::EmitAndRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
+			return false;
+		return EmitU32(EncodeAndRegShiftImm(rd, rn, rm, shift, amount, set_flags));
+	}
+
+	bool CodeBuffer::EmitAndRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || !IsRegister(rs))
+			return false;
+		return EmitU32(EncodeAndRegShiftReg(rd, rn, rm, shift, rs, set_flags));
+	}
+
+	bool CodeBuffer::EmitBicRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
+			return false;
+		return EmitU32(EncodeBicRegShiftImm(rd, rn, rm, shift, amount, set_flags));
+	}
+
+	bool CodeBuffer::EmitBicRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || !IsRegister(rs))
+			return false;
+		return EmitU32(EncodeBicRegShiftReg(rd, rn, rm, shift, rs, set_flags));
+	}
+
 	bool CodeBuffer::EmitEorReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
@@ -537,11 +610,43 @@ namespace VitaA32
 		return EmitU32(EncodeEorReg(rd, rn, rm, set_flags));
 	}
 
+	bool CodeBuffer::EmitEorRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
+			return false;
+		return EmitU32(EncodeEorRegShiftImm(rd, rn, rm, shift, amount, set_flags));
+	}
+
+	bool CodeBuffer::EmitEorRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || !IsRegister(rs))
+			return false;
+		return EmitU32(EncodeEorRegShiftReg(rd, rn, rm, shift, rs, set_flags));
+	}
+
 	bool CodeBuffer::EmitOrrReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
 			return false;
 		return EmitU32(EncodeOrrReg(rd, rn, rm, set_flags));
+	}
+
+	bool CodeBuffer::EmitOrrRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
+			return false;
+		return EmitU32(EncodeOrrRegShiftImm(rd, rn, rm, shift, amount, set_flags));
+	}
+
+	bool CodeBuffer::EmitOrrRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || !IsRegister(rs))
+			return false;
+		return EmitU32(EncodeOrrRegShiftReg(rd, rn, rm, shift, rs, set_flags));
 	}
 
 	bool CodeBuffer::EmitMvnReg(unsigned rd, unsigned rm, bool set_flags)
@@ -591,6 +696,22 @@ namespace VitaA32
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
 			return false;
 		return EmitU32(EncodeSubReg(rd, rn, rm, set_flags));
+	}
+
+	bool CodeBuffer::EmitSubRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
+			return false;
+		return EmitU32(EncodeSubRegShiftImm(rd, rn, rm, shift, amount, set_flags));
+	}
+
+	bool CodeBuffer::EmitSubRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || !IsRegister(rs))
+			return false;
+		return EmitU32(EncodeSubRegShiftReg(rd, rn, rm, shift, rs, set_flags));
 	}
 
 	bool CodeBuffer::EmitSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
@@ -1442,6 +1563,18 @@ namespace VitaA32
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
 	}
 
+	u32 EncodeAddRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftImm(OPCODE_ADD, rd, rn, rm, shift, amount, set_flags);
+	}
+
+	u32 EncodeAddRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftReg(OPCODE_ADD, rd, rn, rm, shift, rs, set_flags);
+	}
+
 	u32 EncodeAdcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
 	{
 		pxAssert(IsRegister(rd));
@@ -1460,6 +1593,30 @@ namespace VitaA32
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
 	}
 
+	u32 EncodeAndRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftImm(OPCODE_AND, rd, rn, rm, shift, amount, set_flags);
+	}
+
+	u32 EncodeAndRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftReg(OPCODE_AND, rd, rn, rm, shift, rs, set_flags);
+	}
+
+	u32 EncodeBicRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftImm(OPCODE_BIC, rd, rn, rm, shift, amount, set_flags);
+	}
+
+	u32 EncodeBicRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftReg(OPCODE_BIC, rd, rn, rm, shift, rs, set_flags);
+	}
+
 	u32 EncodeEorReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
 	{
 		pxAssert(IsRegister(rd));
@@ -1469,6 +1626,18 @@ namespace VitaA32
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
 	}
 
+	u32 EncodeEorRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftImm(OPCODE_EOR, rd, rn, rm, shift, amount, set_flags);
+	}
+
+	u32 EncodeEorRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftReg(OPCODE_EOR, rd, rn, rm, shift, rs, set_flags);
+	}
+
 	u32 EncodeOrrReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
 	{
 		pxAssert(IsRegister(rd));
@@ -1476,6 +1645,18 @@ namespace VitaA32
 		pxAssert(IsRegister(rm));
 		return CondBits(Condition::AL) | OPCODE_ORR | (set_flags ? SET_FLAGS : 0) |
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
+	u32 EncodeOrrRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftImm(OPCODE_ORR, rd, rn, rm, shift, amount, set_flags);
+	}
+
+	u32 EncodeOrrRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftReg(OPCODE_ORR, rd, rn, rm, shift, rs, set_flags);
 	}
 
 	u32 EncodeMvnReg(unsigned rd, unsigned rm, bool set_flags)
@@ -1530,6 +1711,18 @@ namespace VitaA32
 		pxAssert(IsRegister(rm));
 		return CondBits(Condition::AL) | OPCODE_SUB | (set_flags ? SET_FLAGS : 0) |
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
+	u32 EncodeSubRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftImm(OPCODE_SUB, rd, rn, rm, shift, amount, set_flags);
+	}
+
+	u32 EncodeSubRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags)
+	{
+		return EncodeDataProcessingRegShiftReg(OPCODE_SUB, rd, rn, rm, shift, rs, set_flags);
 	}
 
 	u32 EncodeSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)

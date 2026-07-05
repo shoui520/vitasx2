@@ -82,10 +82,30 @@ namespace VitaA32
 			Condition condition = Condition::AL);
 		bool EmitMovRegShiftReg(unsigned rd, unsigned rm, ShiftType shift, unsigned rs, bool set_flags = false);
 		bool EmitAddReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+		bool EmitAddRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+			bool set_flags = false);
+		bool EmitAddRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+			bool set_flags = false);
 		bool EmitAdcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+		bool EmitAndRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+			bool set_flags = false);
+		bool EmitAndRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+			bool set_flags = false);
+		bool EmitBicRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+			bool set_flags = false);
+		bool EmitBicRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+			bool set_flags = false);
 		bool EmitEorReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+		bool EmitEorRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+			bool set_flags = false);
+		bool EmitEorRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+			bool set_flags = false);
 		bool EmitOrrReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+		bool EmitOrrRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+			bool set_flags = false);
+		bool EmitOrrRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+			bool set_flags = false);
 		bool EmitMvnReg(unsigned rd, unsigned rm, bool set_flags = false);
 		bool EmitClz(unsigned rd, unsigned rm);
 		bool EmitSsat(unsigned rd, u8 bits, unsigned rm);
@@ -93,6 +113,10 @@ namespace VitaA32
 		bool EmitSxth(unsigned rd, unsigned rm);
 		bool EmitUxth(unsigned rd, unsigned rm);
 		bool EmitSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+		bool EmitSubRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+			bool set_flags = false);
+		bool EmitSubRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+			bool set_flags = false);
 		bool EmitSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitPkhbt(unsigned rd, unsigned rn, unsigned rm, u8 lsl_amount = 0);
 		bool EmitUmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
@@ -214,10 +238,30 @@ namespace VitaA32
 		Condition condition = Condition::AL);
 	u32 EncodeMovRegShiftReg(unsigned rd, unsigned rm, ShiftType shift, unsigned rs, bool set_flags = false);
 	u32 EncodeAddReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+	u32 EncodeAddRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags = false);
+	u32 EncodeAddRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags = false);
 	u32 EncodeAdcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+	u32 EncodeAndRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags = false);
+	u32 EncodeAndRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags = false);
+	u32 EncodeBicRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags = false);
+	u32 EncodeBicRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags = false);
 	u32 EncodeEorReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+	u32 EncodeEorRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags = false);
+	u32 EncodeEorRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags = false);
 	u32 EncodeOrrReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+	u32 EncodeOrrRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags = false);
+	u32 EncodeOrrRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags = false);
 	u32 EncodeMvnReg(unsigned rd, unsigned rm, bool set_flags = false);
 	u32 EncodeClz(unsigned rd, unsigned rm);
 	u32 EncodeSsat(unsigned rd, u8 bits, unsigned rm);
@@ -225,6 +269,10 @@ namespace VitaA32
 	u32 EncodeSxth(unsigned rd, unsigned rm);
 	u32 EncodeUxth(unsigned rd, unsigned rm);
 	u32 EncodeSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
+	u32 EncodeSubRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+		bool set_flags = false);
+	u32 EncodeSubRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
+		bool set_flags = false);
 	u32 EncodeSbcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodePkhbt(unsigned rd, unsigned rn, unsigned rm, u8 lsl_amount = 0);
 	u32 EncodeUmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
