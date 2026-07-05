@@ -9622,6 +9622,16 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return true;
 
+		if (!signed_compare)
+		{
+			return m_code.EmitMovImm8(HOST_TMP4, 0) &&
+				   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) &&
+				   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2, VitaA32::Condition::EQ) &&
+				   m_code.EmitMovImm8(HOST_TMP4, 1, VitaA32::Condition::CC) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+				   EmitStoreGpr64(guest_reg, HOST_TMP4, HOST_TMP1);
+		}
+
 		if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
 			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3))
 		{
@@ -9662,6 +9672,22 @@ namespace VitaEE
 		// sign-extended to 64 bits, then compared as signed or unsigned.
 		const u32 imm_low = static_cast<u32>(imm);
 		const u32 imm_high = (imm < 0) ? 0xffffffffu : 0u;
+		if (!signed_compare)
+		{
+			if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
+				!m_code.EmitCmpImm32(HOST_TMP1, imm_high) ||
+				!(m_code.EmitCmpImm32(HOST_TMP0, imm_low, VitaA32::Condition::EQ) ||
+					(m_code.EmitMovImm32(HOST_TMP2, imm_low) &&
+						m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2, VitaA32::Condition::EQ))) ||
+				!m_code.EmitMovImm8(HOST_TMP4, 1, VitaA32::Condition::CC) ||
+				!m_code.EmitMovImm8(HOST_TMP1, 0))
+			{
+				return false;
+			}
+
+			return EmitStoreGpr64(guest_reg, HOST_TMP4, HOST_TMP1);
+		}
+
 		if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
 			!m_code.EmitCmpImm32(HOST_TMP1, imm_high))
 		{
