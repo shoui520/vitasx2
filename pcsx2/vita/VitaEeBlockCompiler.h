@@ -472,6 +472,7 @@ namespace VitaEE
 		bool EmitStoreCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch);
 		bool EmitCop1ExponentMask(unsigned host_reg);
 		bool EmitAndCop1ExponentMask(unsigned rd, unsigned rn, unsigned scratch);
+		bool EmitAndCop1FractionMask(unsigned rd, unsigned rn);
 		bool EmitAddScaledCyclesToCpu(u32 cycles);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitCpuRegsAddress(unsigned host_reg, size_t offset);

@@ -156,7 +156,6 @@ namespace VitaEE
 		constexpr u32 FPU_FCR31_CLEAR_OVERFLOW_UNDERFLOW_MASK = ~FPU_FCR31_OVERFLOW_UNDERFLOW_FLAGS;
 		constexpr u32 FPU_FLOAT_SIGN_MASK = 0x80000000;
 		constexpr u32 FPU_FLOAT_EXPONENT_MASK = 0x7f800000;
-		constexpr u32 FPU_FLOAT_FRACTION_MASK = 0x007fffff;
 		constexpr u32 FPU_FLOAT_IMPLICIT_MANTISSA = 0x00800000;
 		constexpr u32 FPU_CVT_W_MAX_EXPONENT_MASK = 0x4e800000;
 		constexpr u32 FPU_FLOAT_EXPONENT_BIAS = 127;
@@ -3880,7 +3879,7 @@ namespace VitaEE
 			if (no_underflow_from_exponent == static_cast<size_t>(-1))
 				return false;
 
-			if (!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP0, FPU_FLOAT_FRACTION_MASK, HOST_TMP2) ||
+			if (!EmitAndCop1FractionMask(HOST_TMP3, HOST_TMP0) ||
 				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
@@ -4049,7 +4048,7 @@ namespace VitaEE
 			if (no_underflow_from_exponent == static_cast<size_t>(-1))
 				return false;
 
-			if (!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP0, FPU_FLOAT_FRACTION_MASK, HOST_TMP2) ||
+			if (!EmitAndCop1FractionMask(HOST_TMP3, HOST_TMP0) ||
 				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
@@ -4401,7 +4400,7 @@ namespace VitaEE
 			if (no_underflow_from_exponent == static_cast<size_t>(-1))
 				return false;
 
-			if (!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP0, FPU_FLOAT_FRACTION_MASK, HOST_TMP2) ||
+			if (!EmitAndCop1FractionMask(HOST_TMP3, HOST_TMP0) ||
 				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
@@ -4787,7 +4786,7 @@ namespace VitaEE
 
 		const size_t nonzero_target = m_code.Size();
 		if (!m_code.PatchBranch(nonzero_path, nonzero_target, VitaA32::Condition::CS) ||
-			!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP0, FPU_FLOAT_FRACTION_MASK, HOST_TMP4) ||
+			!EmitAndCop1FractionMask(HOST_TMP3, HOST_TMP0) ||
 			!EmitOrrImm32OrReg(HOST_TMP3, HOST_TMP3, FPU_FLOAT_IMPLICIT_MANTISSA, HOST_TMP4) ||
 			!m_code.EmitMovImm8(HOST_TMP4, FPU_FLOAT_EXPONENT_BIAS) ||
 			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
@@ -11021,6 +11020,13 @@ namespace VitaEE
 			return m_code.EmitAndReg(rd, rn, HOST_COP1_EXPONENT_MASK);
 
 		return EmitAndImm32OrReg(rd, rn, FPU_FLOAT_EXPONENT_MASK, scratch);
+	}
+
+	bool BlockCompiler::EmitAndCop1FractionMask(unsigned rd, unsigned rn)
+	{
+		// PCSX2 owner: FPU.cpp fast paths inspect IEEE-754 fraction bits as
+		// word & 0x007fffff; A32 UBFX extracts the same bit range in one insn.
+		return m_code.EmitUbfx(rd, rn, 0, 23);
 	}
 
 	bool BlockCompiler::EmitAddScaledCyclesToCpu(u32 cycles)
