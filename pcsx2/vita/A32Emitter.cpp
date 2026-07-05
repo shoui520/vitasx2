@@ -68,6 +68,8 @@ namespace VitaA32
 		constexpr u32 VST1_32_Q = 0xf4000a8fu;
 		constexpr u32 VST1_32_Q_ALIGNED = 0xf4000aafu;
 		constexpr u32 VST1_32_D = 0xf400078fu;
+		constexpr u32 VLDR_D_IMM = 0x0d900b00u;
+		constexpr u32 VSTR_D_IMM = 0x0d800b00u;
 		constexpr u32 VMOV_CORE_TO_S = 0xee000a10u;
 		constexpr u32 VMOV_S_TO_CORE = 0xee100a10u;
 		constexpr u32 VCVT_F32_S32 = 0xeeb80ac0u;
@@ -222,6 +224,11 @@ namespace VitaA32
 		}
 
 		u32 NeonDd(unsigned dreg)
+		{
+			return ((dreg & 0xfu) << 12) | ((dreg & 0x10u) << 18);
+		}
+
+		u32 VfpDd(unsigned dreg)
 		{
 			return ((dreg & 0xfu) << 12) | ((dreg & 0x10u) << 18);
 		}
@@ -1000,6 +1007,20 @@ namespace VitaA32
 		if (!IsDRegister(dd) || !IsLowRegister(rn))
 			return false;
 		return EmitU32(EncodeVst1D32(dd, rn));
+	}
+
+	bool CodeBuffer::EmitVldrDImm(unsigned dd, unsigned rn, u16 offset)
+	{
+		if (!IsDRegister(dd) || !IsLowRegister(rn) || offset > 0x3fc || (offset & 0x3u) != 0)
+			return false;
+		return EmitU32(EncodeVldrDImm(dd, rn, offset));
+	}
+
+	bool CodeBuffer::EmitVstrDImm(unsigned dd, unsigned rn, u16 offset)
+	{
+		if (!IsDRegister(dd) || !IsLowRegister(rn) || offset > 0x3fc || (offset & 0x3u) != 0)
+			return false;
+		return EmitU32(EncodeVstrDImm(dd, rn, offset));
 	}
 
 	bool CodeBuffer::EmitVmovCoreToS(unsigned sd, unsigned rt)
@@ -1887,6 +1908,24 @@ namespace VitaA32
 		pxAssert(IsLowRegister(rn));
 		return CondBits(Condition::AL) | STRD_IMM | ((rn & 0xfu) << 16) | ((rdlo & 0xfu) << 12) |
 			   ((static_cast<u32>(offset) & 0xf0u) << 4) | (offset & 0x0fu);
+	}
+
+	u32 EncodeVldrDImm(unsigned dd, unsigned rn, u16 offset)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsLowRegister(rn));
+		pxAssert(offset <= 0x3fc && (offset & 0x3u) == 0);
+		return CondBits(Condition::AL) | VLDR_D_IMM | ((rn & 0xfu) << 16) | VfpDd(dd) |
+			   ((offset >> 2) & 0xffu);
+	}
+
+	u32 EncodeVstrDImm(unsigned dd, unsigned rn, u16 offset)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsLowRegister(rn));
+		pxAssert(offset <= 0x3fc && (offset & 0x3u) == 0);
+		return CondBits(Condition::AL) | VSTR_D_IMM | ((rn & 0xfu) << 16) | VfpDd(dd) |
+			   ((offset >> 2) & 0xffu);
 	}
 
 	u32 EncodeLdrbImm12(unsigned rd, unsigned rn, u16 offset)

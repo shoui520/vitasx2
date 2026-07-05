@@ -1592,6 +1592,7 @@ namespace VitaEE
 
 	static_assert(GprOffset(31) + sizeof(GPR_reg) <= 0x0fff);
 	static_assert((GprOffset(0) % alignof(u64)) == 0);
+	static_assert(GprOffset(31) + sizeof(u64) <= 0x3fc);
 	static_assert(HI_OFFSET + sizeof(GPR_reg) <= 0x0fff);
 	static_assert(LO_OFFSET + sizeof(GPR_reg) <= 0x0fff);
 	static_assert((HI_OFFSET % alignof(u64)) == 0);
@@ -8058,10 +8059,8 @@ namespace VitaEE
 		// semantics and adds lanes 4..7 with PADDH semantics.
 		return m_code.EmitVsubI16Q(NEON_SUB, NEON_RS, NEON_RT) &&
 			   m_code.EmitVaddI16Q(NEON_ADD, NEON_RS, NEON_RT) &&
-			   emit_gpr_address(rd, HOST_TMP2) &&
-			   m_code.EmitVst1D32(NEON_SUB_LOW_D, HOST_TMP2) &&
-			   m_code.EmitAddImm8(HOST_TMP2, HOST_TMP2, 8) &&
-			   m_code.EmitVst1D32(NEON_ADD_HIGH_D, HOST_TMP2);
+			   m_code.EmitVstrDImm(NEON_SUB_LOW_D, HOST_CPU_REGS, static_cast<u16>(GprOffset(rd))) &&
+			   m_code.EmitVstrDImm(NEON_ADD_HIGH_D, HOST_CPU_REGS, static_cast<u16>(GprOffset(rd) + sizeof(u64)));
 	}
 
 	bool BlockCompiler::EmitPABSH(u32 op)
