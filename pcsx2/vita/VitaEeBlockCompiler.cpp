@@ -4064,7 +4064,7 @@ namespace VitaEE
 
 			const size_t operand_nonzero_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_nonzero, operand_nonzero_target, VitaA32::Condition::NE) ||
-				!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP2) ||
+				!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP4) ||
 				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
@@ -4074,9 +4074,9 @@ namespace VitaEE
 			if (operand_positive == static_cast<size_t>(-1))
 				return false;
 
-			if (!EmitOrrImm32OrReg(HOST_TMP5, HOST_TMP5, FPU_FCR31_INVALID_FLAGS, HOST_TMP2) ||
-				!normalize_arithmetic_word(HOST_TMP1) ||
-				!EmitBicImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP2))
+			if (!EmitOrrImm32OrReg(HOST_TMP5, HOST_TMP5, FPU_FCR31_INVALID_FLAGS, HOST_TMP4) ||
+				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2) ||
+				!EmitBicImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP4))
 			{
 				return false;
 			}
@@ -4087,7 +4087,7 @@ namespace VitaEE
 
 			const size_t operand_positive_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_positive, operand_positive_target, VitaA32::Condition::EQ) ||
-				!normalize_arithmetic_word(HOST_TMP1))
+				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2))
 			{
 				return false;
 			}
@@ -4132,7 +4132,7 @@ namespace VitaEE
 
 			const size_t operand_nonzero_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_nonzero, operand_nonzero_target, VitaA32::Condition::NE) ||
-				!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP2) ||
+				!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP4) ||
 				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
@@ -4142,9 +4142,9 @@ namespace VitaEE
 			if (operand_positive == static_cast<size_t>(-1))
 				return false;
 
-			if (!EmitOrrImm32OrReg(HOST_TMP5, HOST_TMP5, FPU_FCR31_INVALID_FLAGS, HOST_TMP2) ||
-				!normalize_arithmetic_word(HOST_TMP1) ||
-				!EmitBicImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP2))
+			if (!EmitOrrImm32OrReg(HOST_TMP5, HOST_TMP5, FPU_FCR31_INVALID_FLAGS, HOST_TMP4) ||
+				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2) ||
+				!EmitBicImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP4))
 			{
 				return false;
 			}
@@ -4155,14 +4155,14 @@ namespace VitaEE
 
 			const size_t operand_positive_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_positive, operand_positive_target, VitaA32::Condition::EQ) ||
-				!normalize_arithmetic_word(HOST_TMP1))
+				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2))
 			{
 				return false;
 			}
 
 			const size_t operand_ready_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_ready, operand_ready_target) ||
-				!normalize_arithmetic_word(HOST_TMP0) ||
+				!normalize_arithmetic_word_with_mask(HOST_TMP0, HOST_TMP2) ||
 				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
 				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1) ||
 				!m_code.EmitVsqrtF32(VFP_FT_S1, VFP_FT_S1) ||
