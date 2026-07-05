@@ -1901,6 +1901,7 @@ namespace VitaEE
 
 	bool BlockCompiler::BeginBlock(bool use_vtlb_registers)
 	{
+		m_scalar_load_cold_tails.clear();
 		m_vtlb_registers_available = use_vtlb_registers;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6;
 		if (use_vtlb_registers)
@@ -2201,7 +2202,7 @@ namespace VitaEE
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
-				return true;
+				return FlushColdTails();
 			}
 
 			if ((op >> 26) == 0x10 && CanCompileCOP0(op) && !IsFastMFC0(op) && !IsFastMTC0(op) &&
@@ -2209,28 +2210,28 @@ namespace VitaEE
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
-				return true;
+				return FlushColdTails();
 			}
 
 			if ((op >> 26) == 0x11 && CanCompileCOP1(op) && !IsFastCOP1InBlock(op))
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
-				return true;
+				return FlushColdTails();
 			}
 
 			if ((op >> 26) == 0x12 && CanCompileCOP2(op) && !IsCOP2BranchOpcode(op))
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
-				return true;
+				return FlushColdTails();
 			}
 
 			if ((op >> 26) == 0x2f && IsHelperCACHE(op))
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
-				return true;
+				return FlushColdTails();
 			}
 
 			if (has_branch && branch_is_likely && i == branch_instruction_index + 1)
@@ -2279,6 +2280,9 @@ namespace VitaEE
 				return false;
 			}
 
+			if (!FlushColdTails())
+				return false;
+
 			if (direct_links && has_static_likely_direct_links)
 			{
 				direct_links->slots[0].target_pc = next_pc;
@@ -2303,6 +2307,9 @@ namespace VitaEE
 		{
 			return false;
 		}
+
+		if (!FlushColdTails())
+			return false;
 
 		if (direct_links && can_direct_link)
 		{
@@ -10407,13 +10414,6 @@ namespace VitaEE
 				break;
 		}
 
-		const auto emit_sign_extend_low = [&]() -> bool {
-			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
-					   static_cast<u8>(sign_shift)) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
-					   static_cast<u8>(sign_shift));
-		};
-
 		const auto emit_store_result = [&]() -> bool {
 			if (rt == 0)
 				return true;
@@ -10434,47 +10434,20 @@ namespace VitaEE
 		if (!emit_store_result())
 			return false;
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if ((branch_delay_slot && needs_counter_event &&
-			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
-			(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
-			!m_code.EmitCallAbsolute(read_helper) ||
-			(rt != 0 && sign_extend && !emit_sign_extend_low()) ||
-			!emit_store_result())
-		{
-			return false;
-		}
-
-		if (needs_counter_event &&
-			(!EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit) ||
-			 (branch_delay_slot &&
-				 !m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0))))
-		{
-			return false;
-		}
-
-		const size_t fallback_done = m_code.EmitBranchPlaceholder();
-		if (fallback_done == static_cast<size_t>(-1))
-			return false;
-
-		size_t address_error_target = static_cast<size_t>(-1);
-		if (unaligned_fallback != static_cast<size_t>(-1))
-		{
-			address_error_target = m_code.Size();
-			if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, false))
-				return false;
-		}
-
-		const size_t done_target = m_code.Size();
-		return (unaligned_fallback == static_cast<size_t>(-1) ||
-				   m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE)) &&
-			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, done_target) &&
-			   m_code.PatchBranch(fallback_done, done_target);
+		m_scalar_load_cold_tails.push_back({
+			unaligned_fallback,
+			handler_fallback,
+			m_code.Size(),
+			pc,
+			raw_cycles_through_instruction,
+			event_exit,
+			read_helper,
+			rt,
+			sign_shift,
+			sign_extend,
+			branch_delay_slot,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitCounterReadFlagFromAddress(unsigned host_reg)
@@ -10556,6 +10529,84 @@ namespace VitaEE
 
 		return m_code.EmitCallAbsolute(event_exit) &&
 			   m_code.EmitPop(m_saved_registers | REG_PC);
+	}
+
+	bool BlockCompiler::FlushColdTails()
+	{
+		for (const ScalarLoadColdTail& tail : m_scalar_load_cold_tails)
+		{
+			if (!EmitScalarLoadColdTail(tail))
+				return false;
+		}
+
+		m_scalar_load_cold_tails.clear();
+		return true;
+	}
+
+	bool BlockCompiler::EmitScalarLoadColdTail(const ScalarLoadColdTail& tail)
+	{
+		// PCSX2 owner: vtlb.cpp::vtlb_memRead*() / R5900OpcodeImpl.cpp::LB/LBU/LH/LHU().
+		// Handler and unaligned pages stay on the helper/event path, but the hot
+		// non-handler VTLB path falls through to the next guest instruction.
+		if (tail.unaligned_fallback != static_cast<size_t>(-1))
+		{
+			const size_t address_error_target = m_code.Size();
+			if (!m_code.PatchBranch(tail.unaligned_fallback, address_error_target, VitaA32::Condition::NE) ||
+				!EmitAddressErrorEventExit(tail.pc + 4, tail.raw_cycles_through_instruction, tail.event_exit, false))
+			{
+				return false;
+			}
+		}
+
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
+			return false;
+
+		const bool needs_counter_event = tail.rt != 0;
+		const auto emit_sign_extend_low = [&]() -> bool {
+			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
+					   static_cast<u8>(tail.sign_shift)) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
+					   static_cast<u8>(tail.sign_shift));
+		};
+		const auto emit_store_result = [&]() -> bool {
+			if (tail.rt == 0)
+				return true;
+
+			if (tail.sign_extend)
+			{
+				if (!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31))
+					return false;
+			}
+			else if (!m_code.EmitMovImm8(HOST_TMP1, 0))
+			{
+				return false;
+			}
+
+			return EmitStoreGpr64(tail.rt, HOST_TMP0, HOST_TMP1);
+		};
+
+		if ((tail.branch_delay_slot && needs_counter_event &&
+			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
+			(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
+			!m_code.EmitCallAbsolute(tail.read_helper) ||
+			(tail.rt != 0 && tail.sign_extend && !emit_sign_extend_low()) ||
+			!emit_store_result())
+		{
+			return false;
+		}
+
+		if (needs_counter_event &&
+			(!EmitCounterReadEventExit(tail.pc + 4, tail.raw_cycles_through_instruction, tail.event_exit) ||
+			 (tail.branch_delay_slot &&
+				 !m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0))))
+		{
+			return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
 	}
 
 	bool BlockCompiler::EmitDeviceTracePreInstruction(u32 pc)

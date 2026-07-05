@@ -5,6 +5,8 @@
 
 #include "common/Pcsx2Defs.h"
 
+#include <vector>
+
 namespace VitaA32
 {
 	class CodeBuffer;
@@ -448,6 +450,7 @@ namespace VitaEE
 			const void* event_exit, bool store);
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
+		bool FlushColdTails();
 		bool EmitDeviceTracePreInstruction(u32 pc);
 		bool EmitAddScaledCyclesToCpu(u32 cycles);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
@@ -470,7 +473,25 @@ namespace VitaEE
 		bool EmitStorePc(u32 pc);
 		bool EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 
+		struct ScalarLoadColdTail
+		{
+			size_t unaligned_fallback = static_cast<size_t>(-1);
+			size_t handler_fallback = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+			u32 pc = 0;
+			u32 raw_cycles_through_instruction = 0;
+			const void* event_exit = nullptr;
+			const void* read_helper = nullptr;
+			unsigned rt = 0;
+			unsigned sign_shift = 0;
+			bool sign_extend = false;
+			bool branch_delay_slot = false;
+		};
+
+		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);
+
 		VitaA32::CodeBuffer& m_code;
+		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
 		u16 m_saved_registers = 0;
 		bool m_vtlb_registers_available = false;
 		};
