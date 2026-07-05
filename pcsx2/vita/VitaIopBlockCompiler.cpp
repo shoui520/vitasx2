@@ -2116,8 +2116,7 @@ namespace VitaIOP
 			case 9:
 			case 10:
 			case 11:
-				return m_code.EmitMovRegShiftImm(HOST_TMP1, host_reg, VitaA32::ShiftType::LSL, 16) &&
-					   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::ASR, 16) &&
+				return m_code.EmitSxth(HOST_TMP1, host_reg) &&
 					   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(cop2_reg)));
 
 			case 15:
@@ -2132,8 +2131,7 @@ namespace VitaIOP
 			case 17:
 			case 18:
 			case 19:
-				return m_code.EmitMovImm32(HOST_TMP1, 0xffffu) &&
-					   m_code.EmitAndReg(HOST_TMP1, host_reg, HOST_TMP1) &&
+				return m_code.EmitUxth(HOST_TMP1, host_reg) &&
 					   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(Cp2dOffset(cop2_reg)));
 
 			case 28:

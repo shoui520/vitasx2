@@ -50,6 +50,8 @@ namespace VitaA32
 		constexpr u32 PKHBT = 0x06800010u;
 		constexpr u32 CLZ = 0x016f0f10u;
 		constexpr u32 SSAT = 0x06a00010u;
+		constexpr u32 SXTH = 0x06bf0070u;
+		constexpr u32 UXTH = 0x06ff0070u;
 		constexpr u32 UMULL = 0x00800090u;
 		constexpr u32 SMULL = 0x00c00090u;
 		constexpr u32 VLD1_32_Q = 0xf4200a8fu;
@@ -553,6 +555,20 @@ namespace VitaA32
 		if (!IsLowRegister(rd) || !IsLowRegister(rm) || bits == 0 || bits > 32)
 			return false;
 		return EmitU32(EncodeSsat(rd, bits, rm));
+	}
+
+	bool CodeBuffer::EmitSxth(unsigned rd, unsigned rm)
+	{
+		if (!IsLowRegister(rd) || !IsLowRegister(rm))
+			return false;
+		return EmitU32(EncodeSxth(rd, rm));
+	}
+
+	bool CodeBuffer::EmitUxth(unsigned rd, unsigned rm)
+	{
+		if (!IsLowRegister(rd) || !IsLowRegister(rm))
+			return false;
+		return EmitU32(EncodeUxth(rd, rm));
 	}
 
 	bool CodeBuffer::EmitSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
@@ -1420,6 +1436,20 @@ namespace VitaA32
 		pxAssert(bits > 0 && bits <= 32);
 		return CondBits(Condition::AL) | SSAT | ((static_cast<u32>(bits - 1) & 0x1fu) << 16) |
 			   ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
+	u32 EncodeSxth(unsigned rd, unsigned rm)
+	{
+		pxAssert(IsLowRegister(rd));
+		pxAssert(IsLowRegister(rm));
+		return CondBits(Condition::AL) | SXTH | ((rd & 0xfu) << 12) | (rm & 0xfu);
+	}
+
+	u32 EncodeUxth(unsigned rd, unsigned rm)
+	{
+		pxAssert(IsLowRegister(rd));
+		pxAssert(IsLowRegister(rm));
+		return CondBits(Condition::AL) | UXTH | ((rd & 0xfu) << 12) | (rm & 0xfu);
 	}
 
 	u32 EncodeSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags)
