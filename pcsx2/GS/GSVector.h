@@ -122,8 +122,15 @@ __forceinline_odr GSVector4i::GSVector4i(const GSVector4& v, bool truncate)
 	// GS thread uses default (nearest) rounding.
 	v4s = truncate ? vcvtq_s32_f32(v.v4s) : vreinterpretq_s32_u32(vcvtnq_u32_f32(v.v4s));
 #elif defined(ARCH_ARM32)
-	for (size_t i = 0; i < 4; i++)
-		I32[i] = truncate ? static_cast<s32>(v.F32[i]) : static_cast<s32>(std::nearbyint(v.F32[i]));
+	if (truncate)
+	{
+		v4s = vcvtq_s32_f32(v.v4s);
+	}
+	else
+	{
+		for (size_t i = 0; i < 4; i++)
+			I32[i] = static_cast<s32>(std::nearbyint(v.F32[i]));
+	}
 #endif
 }
 
@@ -134,8 +141,7 @@ __forceinline_odr GSVector4::GSVector4(const GSVector4i& v)
 #elif defined(ARCH_ARM64)
 	v4s = vcvtq_f32_s32(v.v4s);
 #elif defined(ARCH_ARM32)
-	for (size_t i = 0; i < 4; i++)
-		F32[i] = static_cast<float>(v.I32[i]);
+	v4s = vcvtq_f32_s32(v.v4s);
 #endif
 }
 
