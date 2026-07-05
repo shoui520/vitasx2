@@ -442,6 +442,7 @@ namespace VitaEE
 		bool EmitJump(u32 pc, bool link);
 		bool EmitRegisterJump(u32 op, u32 pc, bool link);
 		bool EmitGoemonTranslateHostReg(unsigned host_reg);
+		bool EmitCompareGpr64ForBranch(unsigned lhs_guest_reg, unsigned rhs_guest_reg);
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitBranchSigned(u32 op, SignedBranchCondition condition);
 		bool EmitCop0Branch(u32 op);

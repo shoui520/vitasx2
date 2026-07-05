@@ -9504,15 +9504,33 @@ namespace VitaEE
 			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
 	}
 
+	bool BlockCompiler::EmitCompareGpr64ForBranch(unsigned lhs_guest_reg, unsigned rhs_guest_reg)
+	{
+		// PCSX2 owners: Interpreter.cpp::BEQ()/BNE()/BEQL()/BNEL(). Branch
+		// equality observes the low 64-bit SD[0] value; folding $zero only
+		// changes how the A32 flags are produced.
+		if (lhs_guest_reg == rhs_guest_reg)
+			return m_code.EmitCmpReg(HOST_TMP0, HOST_TMP0);
+
+		if (lhs_guest_reg == 0 || rhs_guest_reg == 0)
+		{
+			const unsigned nonzero_guest_reg = (lhs_guest_reg == 0) ? rhs_guest_reg : lhs_guest_reg;
+			return EmitLoadGpr64(nonzero_guest_reg, HOST_TMP0, HOST_TMP1) &&
+				   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1, true);
+		}
+
+		return EmitLoadGpr64(lhs_guest_reg, HOST_TMP0, HOST_TMP1) &&
+			   EmitLoadGpr64(rhs_guest_reg, HOST_TMP2, HOST_TMP3) &&
+			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2) &&
+			   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3, VitaA32::Condition::EQ);
+	}
+
 	bool BlockCompiler::EmitBranchEqual(u32 op, bool branch_on_equal)
 	{
 		const unsigned rs = RS(op);
 		const unsigned rt = RT(op);
 
-		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
-			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
-			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2) &&
-			   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3, VitaA32::Condition::EQ) &&
+		return EmitCompareGpr64ForBranch(rs, rt) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, branch_on_equal ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
 	}
@@ -9520,6 +9538,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitBranchSigned(u32 op, SignedBranchCondition condition)
 	{
 		const unsigned rs = RS(op);
+
+		// PCSX2 owners: Interpreter.cpp::BLTZ/BGEZ/BLEZ/BGTZ and likely/link
+		// variants compare the low 64-bit SD[0] value. $zero makes those
+		// predicates compile-time constants.
+		if (rs == 0)
+		{
+			const bool taken = condition == SignedBranchCondition::GreaterEqualZero ||
+							   condition == SignedBranchCondition::LessEqualZero;
+			return m_code.EmitMovImm8(HOST_BRANCH_FLAG, taken ? 1 : 0);
+		}
 
 		if (condition == SignedBranchCondition::LessThanZero ||
 			condition == SignedBranchCondition::GreaterEqualZero)
@@ -10595,6 +10623,11 @@ namespace VitaEE
 		const unsigned rs = RS(op);
 		const s32 imm = static_cast<s32>(IMM_S(op));
 
+		// PCSX2 owner: R5900OpcodeImpl.cpp memory ops form
+		// cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_ before vtlb_memRead/Write.
+		if (rs == 0)
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(imm));
+
 		if (!EmitLoadGprLow(rs, host_reg))
 			return false;
 
@@ -10607,8 +10640,9 @@ namespace VitaEE
 		if (imm < 0 && m_code.EmitSubImm32(host_reg, host_reg, static_cast<u32>(-imm)))
 			return true;
 
-		return m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
-			   m_code.EmitAddReg(host_reg, host_reg, HOST_TMP2);
+		const unsigned scratch_reg = (host_reg == HOST_TMP2) ? HOST_TMP0 : HOST_TMP2;
+		return m_code.EmitMovImm32(scratch_reg, static_cast<u32>(imm)) &&
+			   m_code.EmitAddReg(host_reg, host_reg, scratch_reg);
 	}
 
 	bool BlockCompiler::EmitCpuRegsAddress(unsigned host_reg, size_t offset)
