@@ -843,6 +843,25 @@ namespace VitaIOP
 			   EmitStoreGpr(dst_guest_reg, HOST_TMP0);
 	}
 
+	bool BlockCompiler::EmitCompareGprs(unsigned lhs_guest_reg, unsigned rhs_guest_reg)
+	{
+		// PCSX2 owner: x86/iR3000Atables.cpp::rpsxBEQ()/rpsxBNE(). This only
+		// changes the Vita compare sequence; the branch decision remains the
+		// same architectural register equality test.
+		if (lhs_guest_reg == 0 && rhs_guest_reg == 0)
+			return m_code.EmitCmpReg(HOST_TMP0, HOST_TMP0);
+		if (lhs_guest_reg == 0)
+			return EmitLoadGpr(rhs_guest_reg, HOST_TMP0) &&
+				   m_code.EmitCmpImm32(HOST_TMP0, 0);
+		if (rhs_guest_reg == 0)
+			return EmitLoadGpr(lhs_guest_reg, HOST_TMP0) &&
+				   m_code.EmitCmpImm32(HOST_TMP0, 0);
+
+		return EmitLoadGpr(lhs_guest_reg, HOST_TMP0) &&
+			   EmitLoadGpr(rhs_guest_reg, HOST_TMP1) &&
+			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1);
+	}
+
 	bool BlockCompiler::EmitBinaryRegOp(u32 op)
 	{
 		const unsigned rd = RD(op);
@@ -1958,9 +1977,7 @@ namespace VitaIOP
 		if (m_emit_native_static_branch)
 			return EmitConditionalBranchFlag(op);
 
-		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
-			!EmitLoadGpr(RT(op), HOST_TMP1) ||
-			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
+		if (!EmitCompareGprs(RS(op), RT(op)))
 		{
 			return false;
 		}
@@ -1976,9 +1993,7 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitConditionalBranchFlag(u32 op)
 	{
-		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
-			!EmitLoadGpr(RT(op), HOST_TMP1) ||
-			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) ||
+		if (!EmitCompareGprs(RS(op), RT(op)) ||
 			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0))
 		{
 			return false;
@@ -2081,6 +2096,10 @@ namespace VitaIOP
 		{
 			return false;
 		}
+
+		if (RS(op) == 0)
+			return m_code.EmitMovImm8(HOST_BRANCH_FLAG,
+				(taken == VitaA32::Condition::GE || taken == VitaA32::Condition::LE) ? 1 : 0);
 
 		return EmitLoadGpr(RS(op), HOST_TMP0) &&
 			   m_code.EmitCmpImm32(HOST_TMP0, 0) &&

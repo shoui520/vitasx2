@@ -87,6 +87,7 @@ namespace VitaIOP
 		bool EmitLoadGpr(unsigned guest_reg, unsigned host_reg);
 		bool EmitStoreGpr(unsigned guest_reg, unsigned host_reg);
 		bool EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg);
+		bool EmitCompareGprs(unsigned lhs_guest_reg, unsigned rhs_guest_reg);
 		bool EmitBinaryRegOp(u32 op);
 		bool EmitShiftImmOp(u32 op);
 		bool EmitShiftRegOp(u32 op);
