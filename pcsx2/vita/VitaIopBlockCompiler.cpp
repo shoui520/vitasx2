@@ -2788,18 +2788,24 @@ namespace VitaIOP
 
 	void BlockExecutor::UnregisterBlockRecord(CachedBlock& block)
 	{
-		u32 write_index = 0;
-		for (u32 read_index = 0; read_index < m_block_records.size(); read_index++)
+		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::LastIndex() plus
+		// BaseBlocks::Remove(). Records are sorted by start PC, so only the
+		// same-PC run can contain this block.
+		s32 index = LastBlockRecordIndex(block.start_pc);
+		while (index >= 0 && m_block_records[index].start_pc == block.start_pc)
+			index--;
+		index++;
+
+		for (; index >= 0 && static_cast<u32>(index) < m_block_records.size() &&
+			   m_block_records[index].start_pc == block.start_pc;
+			 index++)
 		{
-			if (m_block_records[read_index].block == &block)
-				continue;
-
-			if (write_index != read_index)
-				m_block_records[write_index] = m_block_records[read_index];
-			write_index++;
+			if (m_block_records[index].block == &block)
+			{
+				m_block_records.erase(m_block_records.begin() + index);
+				return;
+			}
 		}
-
-		m_block_records.resize(write_index);
 	}
 
 	void BlockExecutor::ClearBlockRecords()
@@ -2959,7 +2965,23 @@ namespace VitaIOP
 
 		const u32 end_pc = start_pc + instruction_count * 4;
 		u32 invalidated = 0;
-		for (u32 i = 0; i < m_block_records.size();)
+		constexpr u32 max_block_bytes = MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS * 4;
+		const u32 first_candidate_pc = (start_pc > max_block_bytes) ? (start_pc - max_block_bytes) : 0;
+		// PCSX2 keeps BaseBlocks sorted by guest start PC. Since Vita blocks are
+		// bounded, entries before this lower bound cannot overlap the cleared
+		// word range.
+		u32 i = 0;
+		u32 limit = static_cast<u32>(m_block_records.size());
+		while (i < limit)
+		{
+			const u32 mid = (i + limit) >> 1;
+			if (m_block_records[mid].start_pc < first_candidate_pc)
+				i = mid + 1;
+			else
+				limit = mid;
+		}
+
+		for (; i < m_block_records.size();)
 		{
 			CachedBlock* block = m_block_records[i].block;
 			if (!block || !block->valid)
