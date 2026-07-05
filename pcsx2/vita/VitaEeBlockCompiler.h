@@ -467,6 +467,8 @@ namespace VitaEE
 		bool EmitDeviceTracePreInstruction(u32 pc);
 		bool EmitLoadCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
 		bool EmitStoreCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
+		bool EmitLoadCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch);
+		bool EmitStoreCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch);
 		bool EmitAddScaledCyclesToCpu(u32 cycles);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitCpuRegsAddress(unsigned host_reg, size_t offset);

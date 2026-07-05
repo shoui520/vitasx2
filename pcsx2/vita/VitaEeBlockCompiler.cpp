@@ -3467,16 +3467,14 @@ namespace VitaEE
 				if (rt != 0 &&
 					(!EmitVu0VfAddress(HOST_TMP0, fs) ||
 					 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
-					 !EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
-					 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1)))
+					 !EmitStoreCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP1)))
 				{
 					return false;
 				}
 				break;
 			case 0x05: // QMTC2
 				if (fs != 0 &&
-					(!EmitCpuRegsAddress(HOST_TMP0, GprOffset(rt)) ||
-					 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
+					(!EmitLoadCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP0) ||
 					 !EmitVu0VfAddress(HOST_TMP1, fs) ||
 					 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1)))
 				{
@@ -5716,10 +5714,8 @@ namespace VitaEE
 			return true;
 
 		constexpr unsigned NEON_VALUE = 0;
-		return EmitCpuRegsAddress(HOST_TMP0, hilo_offset) &&
-			   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
-			   EmitCpuRegsAddress(HOST_TMP1, GprOffset(rd)) &&
-			   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
+		return EmitLoadCpuRegsQ128(hilo_offset, NEON_VALUE, HOST_TMP0) &&
+			   EmitStoreCpuRegsQ128(GprOffset(rd), NEON_VALUE, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitMoveFullToHiLo(u32 op, size_t hilo_offset)
@@ -5732,14 +5728,12 @@ namespace VitaEE
 			if (!m_code.EmitVeorQ(NEON_VALUE, NEON_VALUE, NEON_VALUE))
 				return false;
 		}
-		else if (!EmitCpuRegsAddress(HOST_TMP0, GprOffset(rs)) ||
-				 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0))
+		else if (!EmitLoadCpuRegsQ128(GprOffset(rs), NEON_VALUE, HOST_TMP0))
 		{
 			return false;
 		}
 
-		return EmitCpuRegsAddress(HOST_TMP1, hilo_offset) &&
-			   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
+		return EmitStoreCpuRegsQ128(hilo_offset, NEON_VALUE, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitMMI(u32 op)
@@ -8632,8 +8626,7 @@ namespace VitaEE
 
 		if (rt != 0 &&
 			(!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
-			 !EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
-			 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1)))
+			 !EmitStoreCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP1)))
 		{
 			return false;
 		}
@@ -8912,16 +8905,14 @@ namespace VitaEE
 
 			const size_t raw_fallback_target = m_code.Size();
 			if (!m_code.PatchBranch(raw_fallback, raw_fallback_target, VitaA32::Condition::EQ) ||
-				!EmitCpuRegsAddress(HOST_TMP1, GprOffset(0)) ||
-				!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) ||
+				!EmitLoadCpuRegsQ128(GprOffset(0), NEON_VALUE, HOST_TMP1) ||
 				!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
 				!m_code.PatchBranch(zero_done, m_code.Size()))
 			{
 				return false;
 			}
 		}
-		else if (!EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
-				 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) ||
+		else if (!EmitLoadCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP1) ||
 				 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0))
 		{
 			return false;
@@ -10665,6 +10656,34 @@ namespace VitaEE
 
 		return m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset)) &&
 			   m_code.EmitStrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+	}
+
+	bool BlockCompiler::EmitLoadCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch)
+	{
+		const unsigned low_d = qreg * 2;
+		const unsigned high_d = low_d + 1;
+		if (offset + sizeof(u64) <= 0x3fc && (offset & 0x3u) == 0)
+		{
+			return m_code.EmitVldrDImm(low_d, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+				   m_code.EmitVldrDImm(high_d, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u64)));
+		}
+
+		return EmitCpuRegsAddress(address_scratch, offset) &&
+			   m_code.EmitVld1Q32Aligned(qreg, address_scratch);
+	}
+
+	bool BlockCompiler::EmitStoreCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch)
+	{
+		const unsigned low_d = qreg * 2;
+		const unsigned high_d = low_d + 1;
+		if (offset + sizeof(u64) <= 0x3fc && (offset & 0x3u) == 0)
+		{
+			return m_code.EmitVstrDImm(low_d, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+				   m_code.EmitVstrDImm(high_d, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u64)));
+		}
+
+		return EmitCpuRegsAddress(address_scratch, offset) &&
+			   m_code.EmitVst1Q32Aligned(qreg, address_scratch);
 	}
 
 	bool BlockCompiler::EmitAddScaledCyclesToCpu(u32 cycles)
