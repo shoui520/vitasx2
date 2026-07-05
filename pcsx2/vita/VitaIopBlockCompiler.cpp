@@ -377,7 +377,8 @@ namespace
 
 	static_assert(PC_OFFSET <= 4095);
 	static_assert(CODE_OFFSET <= 4095);
-	static_assert(CYCLE_OFFSET + sizeof(u32) <= 4095);
+	static_assert(CYCLE_OFFSET + sizeof(u64) <= 4095);
+	static_assert((CYCLE_OFFSET % alignof(u64)) == 0);
 	static_assert(IOP_CYCLE_EE_OFFSET <= 4095);
 	static_assert(GprOffset(33) + sizeof(u32) <= 4095);
 	static_assert(HI_OFFSET + sizeof(u32) <= 4095);
@@ -574,6 +575,19 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitIncrementCycle()
 	{
+		const auto emit_increment_from_address = [this](unsigned address_reg) {
+			return m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, address_reg, 0) &&
+				   m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1, true) &&
+				   m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
+				   m_code.EmitStrdImm8(HOST_TMP0, HOST_TMP1, address_reg, 0);
+		};
+
+		if (CYCLE_OFFSET <= 0xff)
+			return emit_increment_from_address(HOST_PSX_REGS);
+
+		if (m_code.EmitAddImm32(HOST_TMP2, HOST_PSX_REGS, static_cast<u32>(CYCLE_OFFSET)))
+			return emit_increment_from_address(HOST_TMP2);
+
 		return m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) &&
 			   m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, CYCLE_OFFSET + sizeof(u32)) &&
 			   m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1, true) &&
