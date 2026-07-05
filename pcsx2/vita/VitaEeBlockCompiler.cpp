@@ -4891,6 +4891,14 @@ namespace VitaEE
 		if (rt == 0)
 			return true;
 
+		// PCSX2 owner: R5900OpcodeImpl.cpp::ANDI(); result is zero-extended into the low 64 bits.
+		if (rs == 0 || imm == 0)
+		{
+			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
+
 		if (!EmitLoadGprLow(rs, HOST_TMP0))
 			return false;
 
@@ -4916,6 +4924,17 @@ namespace VitaEE
 		if (rt == 0)
 			return true;
 
+		// PCSX2 owner: R5900OpcodeImpl.cpp::ORI(); result is zero-extended into the low 64 bits.
+		if (imm == 0 && rt == rs)
+			return true;
+
+		if (rs == 0)
+		{
+			return m_code.EmitMovImm32(HOST_TMP0, imm) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
+
 		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1))
 			return false;
 
@@ -4939,6 +4958,17 @@ namespace VitaEE
 
 		if (rt == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::XORI(); result is zero-extended into the low 64 bits.
+		if (imm == 0 && rt == rs)
+			return true;
+
+		if (rs == 0)
+		{
+			return m_code.EmitMovImm32(HOST_TMP0, imm) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
 
 		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1))
 			return false;
