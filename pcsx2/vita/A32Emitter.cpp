@@ -460,11 +460,18 @@ namespace VitaA32
 			return false;
 
 		u32 encoded = 0;
-		if (!EncodeModifiedImmediate(value, &encoded))
+		if (EncodeModifiedImmediate(value, &encoded))
+		{
+			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_AND |
+						   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
+						   ((rd & 0xfu) << 12) | encoded);
+		}
+
+		if (set_flags || !EncodeModifiedImmediate(~value, &encoded))
 			return false;
 
-		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_AND |
-					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
+		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_BIC |
+					   ((rn & 0xfu) << 16) |
 					   ((rd & 0xfu) << 12) | encoded);
 	}
 
@@ -474,11 +481,18 @@ namespace VitaA32
 			return false;
 
 		u32 encoded = 0;
-		if (!EncodeModifiedImmediate(value, &encoded))
+		if (EncodeModifiedImmediate(value, &encoded))
+		{
+			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_BIC |
+						   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
+						   ((rd & 0xfu) << 12) | encoded);
+		}
+
+		if (set_flags || !EncodeModifiedImmediate(~value, &encoded))
 			return false;
 
-		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_BIC |
-					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
+		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_AND |
+					   ((rn & 0xfu) << 16) |
 					   ((rd & 0xfu) << 12) | encoded);
 	}
 
