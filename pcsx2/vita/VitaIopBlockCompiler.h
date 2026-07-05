@@ -114,8 +114,33 @@ namespace VitaIOP
 		bool EmitReadCop2DataReg(unsigned cop2_reg, unsigned host_reg);
 		bool EmitWriteCop2DataReg(unsigned cop2_reg, unsigned host_reg);
 		bool EmitCop2LoadStoreOp(u32 op);
+		bool FlushColdTails();
+
+		struct ScalarLoadColdTail
+		{
+			size_t fallback_branch = static_cast<size_t>(-1);
+			size_t alignment_fallback_branch = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+			const void* helper = nullptr;
+			unsigned rt = 0;
+			unsigned opcode = 0;
+		};
+		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);
+
+		struct ScalarStoreColdTail
+		{
+			size_t fallback_branch = static_cast<size_t>(-1);
+			size_t alignment_fallback_branch = static_cast<size_t>(-1);
+			size_t isolated_fallback_branch = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+			const void* helper = nullptr;
+			unsigned rt = 0;
+		};
+		bool EmitScalarStoreColdTail(const ScalarStoreColdTail& tail);
 
 		VitaA32::CodeBuffer& m_code;
+		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
+		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
 		bool m_emit_trace_checks = false;

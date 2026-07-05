@@ -469,6 +469,8 @@ namespace VitaIOP
 
 	bool BlockCompiler::BeginBlock()
 	{
+		m_scalar_load_cold_tails.clear();
+		m_scalar_store_cold_tails.clear();
 		return m_code.EmitPush(REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_LR) &&
 			   m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs)));
 	}
@@ -1079,24 +1081,6 @@ namespace VitaIOP
 				return false;
 		}
 
-		const auto emit_sign_extend_helper_result = [&]() -> bool {
-			switch (opcode)
-			{
-				case 0x20: // LB
-					return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 24) &&
-						   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 24);
-				case 0x21: // LH
-					return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 16) &&
-						   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 16);
-				default:
-					return true;
-			}
-		};
-
-		const auto emit_store_helper_result = [&]() -> bool {
-			return emit_sign_extend_helper_result() && EmitStoreGpr(rt, HOST_TMP0);
-		};
-
 		if (!EmitEffectiveAddress(op) ||
 			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitTstImm32(HOST_TMP0, 0x10000000u))
@@ -1161,29 +1145,67 @@ namespace VitaIOP
 				return false;
 		}
 
-		const size_t done_branch = m_code.EmitBranchPlaceholder();
-		if (done_branch == static_cast<size_t>(-1))
-			return false;
+		m_scalar_load_cold_tails.push_back({
+			fallback_branch,
+			alignment_fallback_branch,
+			m_code.Size(),
+			helper,
+			rt,
+			opcode,
+		});
+		return true;
+	}
 
+	bool BlockCompiler::EmitScalarLoadColdTail(const ScalarLoadColdTail& tail)
+	{
+		// PCSX2 owners: x86/iR3000Atables.cpp::rpsxLoad() and
+		// IopMem.cpp::iopMemRead8/16/32. Non-RAM aliases and aligned-helper
+		// cases keep the existing helper semantics; ordinary IOP RAM falls
+		// through after the direct load.
 		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE))
+		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target, VitaA32::Condition::NE))
 			return false;
-		if (alignment_fallback_branch != static_cast<size_t>(-1) &&
-			!m_code.PatchBranch(alignment_fallback_branch, fallback_target, VitaA32::Condition::NE))
+		if (tail.alignment_fallback_branch != static_cast<size_t>(-1) &&
+			!m_code.PatchBranch(tail.alignment_fallback_branch, fallback_target, VitaA32::Condition::NE))
 		{
 			return false;
 		}
 
 		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH))
+			!m_code.EmitCallAbsolute(tail.helper, HOST_CALL_SCRATCH))
 		{
 			return false;
 		}
 
-		if (rt != 0 && !emit_store_helper_result())
-			return false;
+		if (tail.rt != 0)
+		{
+			switch (tail.opcode)
+			{
+				case 0x20: // LB
+					if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 24) ||
+						!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 24))
+					{
+						return false;
+					}
+					break;
+				case 0x21: // LH
+					if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 16) ||
+						!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 16))
+					{
+						return false;
+					}
+					break;
+				default:
+					break;
+			}
 
-		return m_code.PatchBranch(done_branch, m_code.Size());
+			if (!EmitStoreGpr(tail.rt, HOST_TMP0))
+				return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
 	}
 
 	bool BlockCompiler::EmitStoreOp(u32 op)
@@ -1278,23 +1300,61 @@ namespace VitaIOP
 			return false;
 		}
 
-		const size_t done_branch = m_code.EmitBranchPlaceholder();
-		if (done_branch == static_cast<size_t>(-1))
-			return false;
+		m_scalar_store_cold_tails.push_back({
+			fallback_branch,
+			alignment_fallback_branch,
+			isolated_fallback_branch,
+			m_code.Size(),
+			helper,
+			RT(op),
+		});
+		return true;
+	}
 
+	bool BlockCompiler::EmitScalarStoreColdTail(const ScalarStoreColdTail& tail)
+	{
+		// PCSX2 owners: IopMem.cpp::iopMemWrite8/16/32 and
+		// x86/iR3000Atables.cpp::rpsxStore(). MMIO/ROM, alignment, and
+		// isolate-cache paths call the existing helper; writable RAM falls
+		// through after the direct store and psxCpu->Clear() invalidation.
 		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE) ||
-			(alignment_fallback_branch != static_cast<size_t>(-1) &&
-				!m_code.PatchBranch(alignment_fallback_branch, fallback_target, VitaA32::Condition::NE)) ||
-			!m_code.PatchBranch(isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target, VitaA32::Condition::NE))
+			return false;
+		if (tail.alignment_fallback_branch != static_cast<size_t>(-1) &&
+			!m_code.PatchBranch(tail.alignment_fallback_branch, fallback_target, VitaA32::Condition::NE))
+		{
+			return false;
+		}
+		if (!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
-			!EmitLoadGpr(RT(op), HOST_TMP1) ||
-			!m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH))
+			!EmitLoadGpr(tail.rt, HOST_TMP1) ||
+			!m_code.EmitCallAbsolute(tail.helper, HOST_CALL_SCRATCH))
 		{
 			return false;
 		}
 
-		return m_code.PatchBranch(done_branch, m_code.Size());
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
+	}
+
+	bool BlockCompiler::FlushColdTails()
+	{
+		for (const ScalarLoadColdTail& tail : m_scalar_load_cold_tails)
+		{
+			if (!EmitScalarLoadColdTail(tail))
+				return false;
+		}
+
+		for (const ScalarStoreColdTail& tail : m_scalar_store_cold_tails)
+		{
+			if (!EmitScalarStoreColdTail(tail))
+				return false;
+		}
+
+		m_scalar_load_cold_tails.clear();
+		m_scalar_store_cold_tails.clear();
+		return true;
 	}
 
 	bool BlockCompiler::EmitUnalignedLoadOp(u32 op)
@@ -2462,6 +2522,9 @@ namespace VitaIOP
 			if (!EndBlockReturn(BlockExitKind::Direct))
 				return false;
 		}
+
+		if (!FlushColdTails())
+			return false;
 
 		for (const size_t branch_offset : direct_exit_branches)
 		{
