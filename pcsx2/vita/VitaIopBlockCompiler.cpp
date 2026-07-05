@@ -849,6 +849,70 @@ namespace VitaIOP
 		if (rd == 0)
 			return true;
 
+		const auto store_zero = [this, rd]() {
+			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
+				   EmitStoreGpr(rd, HOST_TMP0);
+		};
+		const auto store_not = [this, rd](unsigned guest_reg) {
+			return EmitLoadGpr(guest_reg, HOST_TMP0) &&
+				   m_code.EmitMvnReg(HOST_TMP2, HOST_TMP0) &&
+				   EmitStoreGpr(rd, HOST_TMP2);
+		};
+
+		// PCSX2 owners: x86/iR3000Atables.cpp::rpsxADDU_(),
+		// rpsxSUBU_(), and rpsxLogicalOp(). Fold the same $zero/no-op
+		// identities before paying for both operand loads.
+		switch (funct)
+		{
+			case 0x20: // ADD
+			case 0x21: // ADDU
+				if (rs == 0)
+					return EmitMoveGpr(rd, rt);
+				if (rt == 0)
+					return EmitMoveGpr(rd, rs);
+				break;
+			case 0x22: // SUB
+			case 0x23: // SUBU
+				if (rs == rt)
+					return store_zero();
+				if (rt == 0)
+					return EmitMoveGpr(rd, rs);
+				break;
+			case 0x24: // AND
+				if (rs == 0 || rt == 0)
+					return store_zero();
+				if (rs == rt)
+					return EmitMoveGpr(rd, rs);
+				break;
+			case 0x25: // OR
+				if (rs == 0)
+					return EmitMoveGpr(rd, rt);
+				if (rt == 0 || rs == rt)
+					return EmitMoveGpr(rd, rs);
+				break;
+			case 0x26: // XOR
+				if (rs == rt)
+					return store_zero();
+				if (rs == 0)
+					return EmitMoveGpr(rd, rt);
+				if (rt == 0)
+					return EmitMoveGpr(rd, rs);
+				break;
+			case 0x27: // NOR
+				if (rs == 0 && rt == 0)
+				{
+					return m_code.EmitMovImm32(HOST_TMP0, 0xffffffffu) &&
+						   EmitStoreGpr(rd, HOST_TMP0);
+				}
+				if (rs == 0)
+					return store_not(rt);
+				if (rt == 0 || rs == rt)
+					return store_not(rs);
+				break;
+			default:
+				break;
+		}
+
 		if (!EmitLoadGpr(rs, HOST_TMP0) || !EmitLoadGpr(rt, HOST_TMP1))
 			return false;
 
@@ -899,10 +963,11 @@ namespace VitaIOP
 		if (rd == 0)
 			return true;
 
+		if (sa == 0)
+			return EmitMoveGpr(rd, rt);
+
 		if (!EmitLoadGpr(rt, HOST_TMP0))
 			return false;
-		if (sa == 0)
-			return EmitStoreGpr(rd, HOST_TMP0);
 
 		VitaA32::ShiftType shift = VitaA32::ShiftType::LSL;
 		switch (funct)
