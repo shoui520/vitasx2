@@ -512,15 +512,16 @@ public:
 	template <int mask>
 	__forceinline GSVector4i blend16(const GSVector4i& a) const
 	{
-		const uint16_t _mask[8] = {((mask) & (1 << 0)) ? (uint16_t)-1 : 0x0,
-			((mask) & (1 << 1)) ? (uint16_t)-1 : 0x0,
-			((mask) & (1 << 2)) ? (uint16_t)-1 : 0x0,
-			((mask) & (1 << 3)) ? (uint16_t)-1 : 0x0,
-			((mask) & (1 << 4)) ? (uint16_t)-1 : 0x0,
-			((mask) & (1 << 5)) ? (uint16_t)-1 : 0x0,
-			((mask) & (1 << 6)) ? (uint16_t)-1 : 0x0,
-			((mask) & (1 << 7)) ? (uint16_t)-1 : 0x0};
-		return GSVector4i(vreinterpretq_s32_u16(vbslq_u16(vld1q_u16(_mask), vreinterpretq_u16_s32(a.v4s), vreinterpretq_u16_s32(v4s))));
+		return GSVector4i(vreinterpretq_s32_s16(__builtin_shufflevector(
+			vreinterpretq_s16_s32(v4s), vreinterpretq_s16_s32(a.v4s),
+			(mask & (1 << 0)) ? 8 : 0,
+			(mask & (1 << 1)) ? 9 : 1,
+			(mask & (1 << 2)) ? 10 : 2,
+			(mask & (1 << 3)) ? 11 : 3,
+			(mask & (1 << 4)) ? 12 : 4,
+			(mask & (1 << 5)) ? 13 : 5,
+			(mask & (1 << 6)) ? 14 : 6,
+			(mask & (1 << 7)) ? 15 : 7)));
 	}
 
 	template <int mask>
