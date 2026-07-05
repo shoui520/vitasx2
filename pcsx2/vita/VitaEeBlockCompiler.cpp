@@ -1905,6 +1905,7 @@ namespace VitaEE
 		m_scalar_store_cold_tails.clear();
 		m_qword_load_cold_tails.clear();
 		m_qword_store_cold_tails.clear();
+		m_cop1_word_memory_cold_tails.clear();
 		m_vtlb_registers_available = use_vtlb_registers;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6;
 		if (use_vtlb_registers)
@@ -8747,21 +8748,14 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemReadCop1Word)))
-		{
-			return false;
-		}
-
-		return m_code.PatchBranch(unaligned_fallback, fallback_target, VitaA32::Condition::NE) &&
-			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size());
+		m_cop1_word_memory_cold_tails.push_back({
+			unaligned_fallback,
+			handler_fallback,
+			m_code.Size(),
+			reinterpret_cast<const void*>(&VitaEeMemReadCop1Word),
+			rt,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitLQC2(u32 op)
@@ -9048,21 +9042,14 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWriteCop1Word)))
-		{
-			return false;
-		}
-
-		return m_code.PatchBranch(unaligned_fallback, fallback_target, VitaA32::Condition::NE) &&
-			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size());
+		m_cop1_word_memory_cold_tails.push_back({
+			unaligned_fallback,
+			handler_fallback,
+			m_code.Size(),
+			reinterpret_cast<const void*>(&VitaEeMemWriteCop1Word),
+			rt,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitSQC2(u32 op)
@@ -10377,10 +10364,17 @@ namespace VitaEE
 				return false;
 		}
 
+		for (const Cop1WordMemoryColdTail& tail : m_cop1_word_memory_cold_tails)
+		{
+			if (!EmitCop1WordMemoryColdTail(tail))
+				return false;
+		}
+
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
 		m_qword_load_cold_tails.clear();
 		m_qword_store_cold_tails.clear();
+		m_cop1_word_memory_cold_tails.clear();
 		return true;
 	}
 
@@ -10539,6 +10533,26 @@ namespace VitaEE
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
 			!m_code.EmitCallAbsolute(tail.write_helper))
+		{
+			return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
+	}
+
+	bool BlockCompiler::EmitCop1WordMemoryColdTail(const Cop1WordMemoryColdTail& tail)
+	{
+		// PCSX2 owner: vtlb.cpp::vtlb_memRead32()/vtlb_memWrite32() plus
+		// FPU.cpp::LWC1()/SWC1(). The helper keeps the existing FPU
+		// unaligned-address behavior; the non-handler VTLB path falls through.
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.unaligned_fallback, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
+			!m_code.EmitCallAbsolute(tail.helper))
 		{
 			return false;
 		}
