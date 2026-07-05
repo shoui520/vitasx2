@@ -9532,36 +9532,19 @@ namespace VitaEE
 		}
 
 		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) ||
+			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) ||
 			!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
-			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0))
+			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::LT) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0, VitaA32::Condition::EQ) ||
+			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::EQ))
 		{
 			return false;
 		}
 
 		if (condition == SignedBranchCondition::LessEqualZero)
-		{
-			if (!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::LT))
-				return false;
-		}
-		else
-		{
-			if (!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::GT))
-				return false;
-		}
+			return true;
 
-		const size_t high_nonzero = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (high_nonzero == static_cast<size_t>(-1))
-			return false;
-
-		const VitaA32::Condition low_condition =
-			(condition == SignedBranchCondition::LessEqualZero) ? VitaA32::Condition::EQ : VitaA32::Condition::NE;
-		if (!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
-			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, low_condition))
-		{
-			return false;
-		}
-
-		return m_code.PatchBranch(high_nonzero, m_code.Size(), VitaA32::Condition::NE);
+		return m_code.EmitEorImm8(HOST_BRANCH_FLAG, HOST_BRANCH_FLAG, 1);
 	}
 
 	bool BlockCompiler::EmitCop1Branch(u32 op)
