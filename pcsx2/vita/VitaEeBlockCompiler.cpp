@@ -9609,12 +9609,10 @@ namespace VitaEE
 
 		return m_code.EmitMovImm32(HOST_TMP0, dmac_regs_addr) &&
 			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, DMAC_PCR_DMAC_OFFSET) &&
-			   m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1) &&
 			   m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, DMAC_STAT_DMAC_OFFSET) &&
-			   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
+			   m_code.EmitBicRegShiftImm(HOST_TMP1, HOST_TMP1, HOST_TMP2, VitaA32::ShiftType::LSL, 0) &&
 			   m_code.EmitMovImm32(HOST_TMP2, DMAC_CPCOND_MASK) &&
-			   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
-			   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2) &&
+			   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2, true) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
 				   branch_on_true ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
