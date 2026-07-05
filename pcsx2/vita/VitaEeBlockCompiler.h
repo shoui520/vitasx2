@@ -135,6 +135,7 @@ namespace VitaEE
 			Byte,
 			Halfword,
 			Word,
+			Dword,
 		};
 
 		enum class ScalarStoreWidth : u8
@@ -491,6 +492,7 @@ namespace VitaEE
 			u32 raw_cycles_through_instruction = 0;
 			const void* event_exit = nullptr;
 			const void* read_helper = nullptr;
+			ScalarLoadWidth width = ScalarLoadWidth::Byte;
 			unsigned rt = 0;
 			unsigned sign_shift = 0;
 			bool sign_extend = false;
