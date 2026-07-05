@@ -4654,8 +4654,7 @@ namespace VitaEE
 			!EmitOrrImm32OrReg(HOST_TMP3, HOST_TMP3, FPU_FLOAT_IMPLICIT_MANTISSA, HOST_TMP4) ||
 			!m_code.EmitMovImm8(HOST_TMP4, FPU_FLOAT_EXPONENT_BIAS) ||
 			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
-			!m_code.EmitMovImm8(HOST_TMP4, FPU_FLOAT_MANTISSA_BITS) ||
-			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP4))
+			!m_code.EmitCmpImm32(HOST_TMP2, FPU_FLOAT_MANTISSA_BITS))
 		{
 			return false;
 		}
@@ -4664,7 +4663,7 @@ namespace VitaEE
 		if (left_shift_path == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitSubReg(HOST_TMP4, HOST_TMP4, HOST_TMP2) ||
+		if (!m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP2, FPU_FLOAT_MANTISSA_BITS) ||
 			!m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_TMP3, VitaA32::ShiftType::LSR, HOST_TMP4))
 		{
 			return false;
@@ -4676,8 +4675,7 @@ namespace VitaEE
 
 		const size_t left_shift_target = m_code.Size();
 		if (!m_code.PatchBranch(left_shift_path, left_shift_target, VitaA32::Condition::CS) ||
-			!m_code.EmitMovImm8(HOST_TMP4, FPU_FLOAT_MANTISSA_BITS) ||
-			!m_code.EmitSubReg(HOST_TMP4, HOST_TMP2, HOST_TMP4) ||
+			!m_code.EmitSubImm32(HOST_TMP4, HOST_TMP2, FPU_FLOAT_MANTISSA_BITS) ||
 			!m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_TMP3, VitaA32::ShiftType::LSL, HOST_TMP4))
 		{
 			return false;

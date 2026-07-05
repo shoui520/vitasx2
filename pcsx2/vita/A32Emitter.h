@@ -70,6 +70,7 @@ namespace VitaA32
 		bool EmitAddImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitSubImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
+		bool EmitRsbImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitAndImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitAndImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitBicImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
