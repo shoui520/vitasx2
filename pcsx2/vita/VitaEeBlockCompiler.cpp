@@ -3649,8 +3649,7 @@ namespace VitaEE
 
 			if (fs == VU0_REG_R)
 			{
-				if (!m_code.EmitMovImm32(HOST_TMP2, 0x007fffffu) ||
-					!m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
+				if (!m_code.EmitUbfx(HOST_TMP1, HOST_TMP1, 0, 23) ||
 					!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))))
 				{
 					return false;
@@ -3699,8 +3698,7 @@ namespace VitaEE
 
 			case VU0_REG_R:
 				if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) ||
-					!m_code.EmitMovImm32(HOST_TMP2, 0x007fffffu) ||
-					!m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
+					!m_code.EmitUbfx(HOST_TMP1, HOST_TMP1, 0, 23) ||
 					!EmitOrrImm32OrReg(HOST_TMP1, HOST_TMP1, 0x3f800000u, HOST_TMP2) ||
 					!EmitVu0ViAddress(HOST_TMP0, fs) ||
 					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
