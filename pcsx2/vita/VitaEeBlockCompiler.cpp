@@ -9580,8 +9580,7 @@ namespace VitaEE
 
 		return m_code.EmitMovImm32(HOST_TMP0, fcr31_addr) &&
 			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
-			   m_code.EmitMovImm32(HOST_TMP2, FPU_FCR31_CONDITION_FLAG) &&
-			   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2, true) &&
+			   m_code.EmitTstImm32(HOST_TMP1, FPU_FCR31_CONDITION_FLAG) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
 				   branch_on_true ? VitaA32::Condition::NE : VitaA32::Condition::EQ);
@@ -9598,8 +9597,7 @@ namespace VitaEE
 
 		return m_code.EmitMovImm32(HOST_TMP0, vpu_stat_addr) &&
 			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
-			   m_code.EmitMovImm32(HOST_TMP2, 0x100u) &&
-			   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2, true) &&
+			   m_code.EmitTstImm32(HOST_TMP1, 0x100u) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
 				   branch_on_true ? VitaA32::Condition::NE : VitaA32::Condition::EQ);
