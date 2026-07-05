@@ -139,6 +139,16 @@ namespace VitaA32
 			return reg < 15;
 		}
 
+		bool IsGeneralRegister(unsigned reg)
+		{
+			return reg < 15;
+		}
+
+		bool CanElideSameRegisterWrite(unsigned rd, unsigned rn)
+		{
+			return rd == rn && IsGeneralRegister(rd);
+		}
+
 		bool IsQRegister(unsigned reg)
 		{
 			return reg < 16;
@@ -411,6 +421,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+			return true;
 		return EmitU32(EncodeAddImm8(rd, rn, value, set_flags));
 	}
 
@@ -418,6 +430,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+			return true;
 
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
@@ -438,6 +452,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+			return true;
 		return EmitU32(EncodeSubImm8(rd, rn, value, set_flags));
 	}
 
@@ -445,6 +461,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+			return true;
 
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
@@ -486,6 +504,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0xffffffffu && CanElideSameRegisterWrite(rd, rn))
+			return true;
 
 		u32 encoded = 0;
 		if (EncodeModifiedImmediate(value, &encoded))
@@ -507,6 +527,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+			return true;
 
 		u32 encoded = 0;
 		if (EncodeModifiedImmediate(value, &encoded))
@@ -528,6 +550,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+			return true;
 		return EmitU32(EncodeEorImm8(rd, rn, value, set_flags));
 	}
 
@@ -535,6 +559,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+			return true;
 
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
@@ -549,6 +575,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+			return true;
 		return EmitU32(EncodeOrrImm8(rd, rn, value, set_flags));
 	}
 
@@ -556,6 +584,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
+		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+			return true;
 
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
@@ -585,7 +615,7 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rm) || amount > 31)
 			return false;
-		if (!set_flags && rd == rm && shift == ShiftType::LSL && amount == 0)
+		if (!set_flags && shift == ShiftType::LSL && amount == 0 && CanElideSameRegisterWrite(rd, rm))
 			return true;
 		return EmitU32(EncodeMovRegShiftImm(rd, rm, shift, amount, set_flags, condition));
 	}
@@ -631,6 +661,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
 			return false;
+		if (!set_flags && rd == rn && rn == rm && IsGeneralRegister(rd))
+			return true;
 		return EmitU32(EncodeAndReg(rd, rn, rm, set_flags));
 	}
 
@@ -639,6 +671,11 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
 			return false;
+		if (!set_flags && rd == rn && rn == rm && shift == ShiftType::LSL && amount == 0 &&
+			IsGeneralRegister(rd))
+		{
+			return true;
+		}
 		return EmitU32(EncodeAndRegShiftImm(rd, rn, rm, shift, amount, set_flags));
 	}
 
@@ -693,6 +730,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm))
 			return false;
+		if (!set_flags && rd == rn && rn == rm && IsGeneralRegister(rd))
+			return true;
 		return EmitU32(EncodeOrrReg(rd, rn, rm, set_flags));
 	}
 
@@ -701,6 +740,11 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
 			return false;
+		if (!set_flags && rd == rn && rn == rm && shift == ShiftType::LSL && amount == 0 &&
+			IsGeneralRegister(rd))
+		{
+			return true;
+		}
 		return EmitU32(EncodeOrrRegShiftImm(rd, rn, rm, shift, amount, set_flags));
 	}
 
