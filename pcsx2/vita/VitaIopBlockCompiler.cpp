@@ -471,6 +471,8 @@ namespace VitaIOP
 	{
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
+		m_unaligned_read_cold_tails.clear();
+		m_unaligned_write_cold_tails.clear();
 		return m_code.EmitPush(REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_LR) &&
 			   m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs)));
 	}
@@ -1352,9 +1354,60 @@ namespace VitaIOP
 				return false;
 		}
 
+		for (const UnalignedReadColdTail& tail : m_unaligned_read_cold_tails)
+		{
+			if (!EmitUnalignedReadColdTail(tail))
+				return false;
+		}
+
+		for (const UnalignedWriteColdTail& tail : m_unaligned_write_cold_tails)
+		{
+			if (!EmitUnalignedWriteColdTail(tail))
+				return false;
+		}
+
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
+		m_unaligned_read_cold_tails.clear();
+		m_unaligned_write_cold_tails.clear();
 		return true;
+	}
+
+	bool BlockCompiler::EmitUnalignedReadColdTail(const UnalignedReadColdTail& tail)
+	{
+		// PCSX2 owners: R3000AInterpreter.cpp::psxLWL/psxLWR/psxSWL/psxSWR
+		// merge an aligned iopMemRead32() word. Handler-backed addresses call
+		// the helper; ordinary IOP RAM falls through with HOST_TMP0 loaded.
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH))
+		{
+			return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
+	}
+
+	bool BlockCompiler::EmitUnalignedWriteColdTail(const UnalignedWriteColdTail& tail)
+	{
+		// PCSX2 owner: IopMem.cpp::iopMemWrite32(). The merged word is already
+		// in HOST_TMP1 when the fallback branch fires; writable RAM falls
+		// through after the direct write and invalidation.
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.write_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH))
+		{
+			return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
 	}
 
 	bool BlockCompiler::EmitUnalignedLoadOp(u32 op)
@@ -1382,18 +1435,10 @@ namespace VitaIOP
 			return false;
 		}
 
-		const size_t done_branch = m_code.EmitBranchPlaceholder();
-		if (done_branch == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) ||
-			!m_code.PatchBranch(done_branch, m_code.Size()))
-		{
-			return false;
-		}
+		m_unaligned_read_cold_tails.push_back({
+			fallback_branch,
+			m_code.Size(),
+		});
 
 		if (RT(op) == 0)
 			return true;
@@ -1460,19 +1505,13 @@ namespace VitaIOP
 			return false;
 		}
 
-		const size_t done_branch = m_code.EmitBranchPlaceholder();
-		if (done_branch == static_cast<size_t>(-1))
-			return false;
+		m_unaligned_read_cold_tails.push_back({
+			fallback_branch,
+			m_code.Size(),
+		});
 
-		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) ||
-			!m_code.PatchBranch(done_branch, m_code.Size()) ||
-			!EmitLoadGpr(RT(op), HOST_TMP1))
-		{
+		if (!EmitLoadGpr(RT(op), HOST_TMP1))
 			return false;
-		}
 
 		if (left)
 		{
@@ -1524,20 +1563,12 @@ namespace VitaIOP
 			return false;
 		}
 
-		const size_t write_done_branch = m_code.EmitBranchPlaceholder();
-		if (write_done_branch == static_cast<size_t>(-1))
-			return false;
-
-		const size_t write_fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(write_fallback_branch, write_fallback_target, VitaA32::Condition::NE) ||
-			!m_code.PatchBranch(isolated_fallback_branch, write_fallback_target, VitaA32::Condition::NE) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH))
-		{
-			return false;
-		}
-
-		return m_code.PatchBranch(write_done_branch, m_code.Size());
+		m_unaligned_write_cold_tails.push_back({
+			write_fallback_branch,
+			isolated_fallback_branch,
+			m_code.Size(),
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitConditionalBranchOp(u32 op, u32 pc)
