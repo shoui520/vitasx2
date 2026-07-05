@@ -329,6 +329,32 @@ namespace
 		++g_qemuVifNeonVectors;
 #endif
 	}
+
+	void VitaVifStoreUnmaskedModeWordsNeon(vifStruct& vif, u8* dest, u32 mode, u32 x, u32 y, u32 z, u32 w)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::writeXYZW(). With no write mask, every
+		// lane takes the data path, so modes 1-3 map directly to vector row
+		// add/replace behavior.
+		uint32x4_t data = vdupq_n_u32(x);
+		data = vsetq_lane_u32(y, data, 1);
+		data = vsetq_lane_u32(z, data, 2);
+		data = vsetq_lane_u32(w, data, 3);
+		uint32x4_t result = data;
+
+		if (mode == 1 || mode == 2)
+		{
+			const uint32x4_t row = vld1q_u32(vif.MaskRow._u32);
+			result = vaddq_u32(data, row);
+		}
+
+		if (mode == 2 || mode == 3)
+			vst1q_u32(vif.MaskRow._u32, result);
+
+		vst1q_u32(reinterpret_cast<u32*>(dest), result);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
 #endif
 
 	u32 VitaVifApplyMode(vifStruct& vif, u32 lane, u32 mode, u32 data)
@@ -358,6 +384,12 @@ namespace
 		}
 
 #if VITASX2_VIF_HAS_ARM_NEON
+		if (!doMask)
+		{
+			VitaVifStoreUnmaskedModeWordsNeon(vif, dest, mode, x, y, z, w);
+			return;
+		}
+
 		if (mode == 0)
 		{
 			VitaVifStoreMaskedMode0WordsNeon(vif, regs, dest, x, y, z, w);
