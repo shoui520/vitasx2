@@ -9583,10 +9583,8 @@ namespace VitaEE
 		// already commit through fpuRegs before a BC1 block observes FCR31.
 		const unsigned rt = RT(op);
 		const bool branch_on_true = rt == 0x01 || rt == 0x03;
-		const u32 fcr31_addr = static_cast<u32>(reinterpret_cast<uptr>(&fpuRegs.fprc[31]));
 
-		return m_code.EmitMovImm32(HOST_TMP0, fcr31_addr) &&
-			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
+		return m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) &&
 			   m_code.EmitTstImm32(HOST_TMP1, FPU_FCR31_CONDITION_FLAG) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
