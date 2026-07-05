@@ -9511,9 +9511,8 @@ namespace VitaEE
 
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
-			   m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
-			   m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
-			   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1, true) &&
+			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2) &&
+			   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3, VitaA32::Condition::EQ) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, branch_on_equal ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
 	}
