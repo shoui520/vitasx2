@@ -81,6 +81,7 @@ namespace VitaEE
 		constexpr unsigned HOST_BRANCH_STATE = 5;
 		constexpr unsigned HOST_BRANCH_FLAG = HOST_BRANCH_STATE;
 		constexpr unsigned HOST_BRANCH_TARGET = HOST_BRANCH_STATE;
+		constexpr unsigned HOST_SP = 13;
 		constexpr unsigned HOST_TMP0 = 0;
 		constexpr unsigned HOST_TMP1 = 1;
 		constexpr unsigned HOST_TMP2 = 2;
@@ -6697,11 +6698,34 @@ namespace VitaEE
 					   static_cast<u16>(HI_OFFSET + lane * sizeof(u32)));
 		};
 
+		// PCSX2 owner: MMI.cpp::_PDIVBW() does signed word / signed halfword,
+		// with C truncation toward zero and HI = dividend - quotient * divisor.
+		const auto emit_power_of_two_lane = [&](unsigned lane) {
+			return load_word(rs, lane, HOST_TMP0) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+				   m_code.EmitAndReg(HOST_TMP2, HOST_TMP2, HOST_TMP3) &&
+				   m_code.EmitAddReg(HOST_TMP2, HOST_TMP0, HOST_TMP2) &&
+				   m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::ASR, HOST_TMP5) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1, VitaA32::ShiftType::ASR, 31) &&
+				   m_code.EmitEorReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) &&
+				   m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS,
+					   static_cast<u16>(LO_OFFSET + lane * sizeof(u32))) &&
+				   m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP2, VitaA32::ShiftType::LSL, HOST_TMP5) &&
+				   m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP4) &&
+				   m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP4) &&
+				   load_word(rs, lane, HOST_TMP4) &&
+				   m_code.EmitSubReg(HOST_TMP4, HOST_TMP4, HOST_TMP0) &&
+				   m_code.EmitStrImm12(HOST_TMP4, HOST_CPU_REGS,
+					   static_cast<u16>(HI_OFFSET + lane * sizeof(u32)));
+		};
+
 		BranchPatch divzero_branch{};
 		BranchPatch divone_branch{};
 		BranchPatch negone_branch{};
+		BranchPatch power_of_two_branch{};
 		BranchPatch fallback_branch{};
-		BranchPatch done_branches[3]{};
+		BranchPatch done_branches[4]{};
 		unsigned done_branch_count = 0;
 
 		if (!load_divisor() ||
@@ -6711,6 +6735,13 @@ namespace VitaEE
 			!emit_branch(divone_branch, VitaA32::Condition::EQ) ||
 			!EmitCmpImm32OrReg(HOST_TMP1, 0xffffu, HOST_TMP4) ||
 			!emit_branch(negone_branch, VitaA32::Condition::EQ) ||
+			!m_code.EmitSxth(HOST_TMP1, HOST_TMP1) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
+			!m_code.EmitEorReg(HOST_TMP3, HOST_TMP1, HOST_TMP2) ||
+			!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_TMP2) ||
+			!m_code.EmitSubImm8(HOST_TMP4, HOST_TMP3, 1) ||
+			!m_code.EmitAndReg(HOST_TMP4, HOST_TMP3, HOST_TMP4, true) ||
+			!emit_branch(power_of_two_branch, VitaA32::Condition::EQ) ||
 			!emit_branch(fallback_branch, VitaA32::Condition::AL))
 		{
 			return false;
@@ -6741,6 +6772,19 @@ namespace VitaEE
 			!emit_negone_lane(1) ||
 			!emit_negone_lane(2) ||
 			!emit_negone_lane(3) ||
+			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+		{
+			return false;
+		}
+
+		if (!patch_branch(power_of_two_branch, m_code.Size()) ||
+			!m_code.EmitClz(HOST_TMP5, HOST_TMP3) ||
+			!m_code.EmitRsbImm32(HOST_TMP5, HOST_TMP5, 31) ||
+			!m_code.EmitSubImm8(HOST_TMP3, HOST_TMP3, 1) ||
+			!emit_power_of_two_lane(0) ||
+			!emit_power_of_two_lane(1) ||
+			!emit_power_of_two_lane(2) ||
+			!emit_power_of_two_lane(3) ||
 			!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
 		{
 			return false;
@@ -7181,8 +7225,144 @@ namespace VitaEE
 		constexpr unsigned NEON_RT = 1;
 		constexpr unsigned NEON_RD = 2;
 
+		const auto emit_store_result = [this, rd](unsigned qreg) {
+			return EmitStoreCpuRegsQ128(GprOffset(rd), qreg, HOST_TMP2);
+		};
+
+		const auto emit_zero_result = [&]() {
+			return m_code.EmitVeorQ(NEON_RD, NEON_RD, NEON_RD) &&
+				   emit_store_result(NEON_RD);
+		};
+
+		const auto emit_copy_result = [&](unsigned guest_reg) {
+			if (guest_reg == 0)
+				return emit_zero_result();
+
+			if (guest_reg == rd)
+				return true;
+
+			return EmitLoadCpuRegsQ128(GprOffset(guest_reg), NEON_RD, HOST_TMP0) &&
+				   emit_store_result(NEON_RD);
+		};
+
+		const auto emit_inverted_result = [&](unsigned guest_reg) {
+			if (guest_reg == 0)
+			{
+				if (!m_code.EmitVeorQ(NEON_RD, NEON_RD, NEON_RD))
+					return false;
+			}
+			else if (!EmitLoadCpuRegsQ128(GprOffset(guest_reg), NEON_RD, HOST_TMP0))
+			{
+				return false;
+			}
+
+			return m_code.EmitVmvnQ(NEON_RD, NEON_RD) &&
+				   emit_store_result(NEON_RD);
+		};
+
+		// PCSX2 owners: MMI.cpp packed add/sub/compare/min/max/logical helpers.
+		// Fold exact zero/idempotent cases before the generic two-source NEON path.
+		switch (operation)
+		{
+			case MmiVectorOp::AddWord:
+			case MmiVectorOp::AddHalfword:
+			case MmiVectorOp::AddByte:
+			case MmiVectorOp::SaturatingAddSignedWord:
+			case MmiVectorOp::SaturatingAddSignedHalfword:
+			case MmiVectorOp::SaturatingAddSignedByte:
+			case MmiVectorOp::SaturatingAddUnsignedWord:
+			case MmiVectorOp::SaturatingAddUnsignedHalfword:
+			case MmiVectorOp::SaturatingAddUnsignedByte:
+				if (rs == 0)
+					return emit_copy_result(rt);
+				if (rt == 0)
+					return emit_copy_result(rs);
+				break;
+			case MmiVectorOp::SubtractWord:
+			case MmiVectorOp::SubtractHalfword:
+			case MmiVectorOp::SubtractByte:
+			case MmiVectorOp::SaturatingSubtractSignedWord:
+			case MmiVectorOp::SaturatingSubtractSignedHalfword:
+			case MmiVectorOp::SaturatingSubtractSignedByte:
+				if (rs == rt)
+					return emit_zero_result();
+				if (rt == 0)
+					return emit_copy_result(rs);
+				break;
+			case MmiVectorOp::SaturatingSubtractUnsignedWord:
+			case MmiVectorOp::SaturatingSubtractUnsignedHalfword:
+			case MmiVectorOp::SaturatingSubtractUnsignedByte:
+				if (rs == 0 || rs == rt)
+					return emit_zero_result();
+				if (rt == 0)
+					return emit_copy_result(rs);
+				break;
+			case MmiVectorOp::CompareGreaterSignedWord:
+			case MmiVectorOp::CompareGreaterSignedHalfword:
+			case MmiVectorOp::CompareGreaterSignedByte:
+				if (rs == rt)
+					return emit_zero_result();
+				break;
+			case MmiVectorOp::CompareEqualWord:
+			case MmiVectorOp::CompareEqualHalfword:
+			case MmiVectorOp::CompareEqualByte:
+				if (rs == rt)
+					return emit_inverted_result(0);
+				break;
+			case MmiVectorOp::MaxSignedWord:
+			case MmiVectorOp::MaxSignedHalfword:
+			case MmiVectorOp::MinSignedWord:
+			case MmiVectorOp::MinSignedHalfword:
+				if (rs == rt)
+					return emit_copy_result(rs);
+				break;
+			case MmiVectorOp::BitwiseAnd:
+				if (rs == 0 || rt == 0)
+					return emit_zero_result();
+				if (rs == rt)
+					return emit_copy_result(rs);
+				break;
+			case MmiVectorOp::BitwiseXor:
+				if (rs == rt)
+					return emit_zero_result();
+				if (rs == 0)
+					return emit_copy_result(rt);
+				if (rt == 0)
+					return emit_copy_result(rs);
+				break;
+			case MmiVectorOp::BitwiseOr:
+				if (rs == rt)
+					return emit_copy_result(rs);
+				if (rs == 0)
+					return emit_copy_result(rt);
+				if (rt == 0)
+					return emit_copy_result(rs);
+				break;
+			case MmiVectorOp::BitwiseNor:
+				if (rs == rt)
+					return emit_inverted_result(rs);
+				if (rs == 0)
+					return emit_inverted_result(rt);
+				if (rt == 0)
+					return emit_inverted_result(rs);
+				break;
+			default:
+				break;
+		}
+
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
 			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
+		};
+
+		const auto emit_store_rd = [&](unsigned qreg) {
+			if (rd == rs && rs != 0)
+				return m_code.EmitVst1Q32Aligned(qreg, HOST_TMP0);
+
+			if (rd == rt && rt != 0)
+				return m_code.EmitVst1Q32Aligned(qreg, HOST_TMP1);
+
+			return emit_gpr_address(rd, HOST_TMP2) &&
+				   m_code.EmitVst1Q32Aligned(qreg, HOST_TMP2);
 		};
 
 		if (rs == 0)
@@ -7310,8 +7490,7 @@ namespace VitaEE
 		}
 
 		if (!vector_op_ok ||
-			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32Aligned(NEON_RD, HOST_TMP2))
+			!emit_store_rd(NEON_RD))
 		{
 			return false;
 		}
@@ -7330,6 +7509,14 @@ namespace VitaEE
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
 			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
+		};
+
+		const auto emit_store_rd = [&]() {
+			if (rd == rt && rt != 0)
+				return m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP0);
+
+			return emit_gpr_address(rd, HOST_TMP2) &&
+				   m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2);
 		};
 
 		if (rt == 0)
@@ -7355,8 +7542,7 @@ namespace VitaEE
 		}
 
 		if (!vector_op_ok ||
-			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2))
+			!emit_store_rd())
 		{
 			return false;
 		}
@@ -7373,8 +7559,23 @@ namespace VitaEE
 
 		constexpr unsigned NEON_RT = 0;
 
+		const u8 amount = static_cast<u8>((operation == MmiImmediateShiftOp::ShiftLeftHalfword ||
+			operation == MmiImmediateShiftOp::ShiftRightLogicalHalfword ||
+			operation == MmiImmediateShiftOp::ShiftRightArithmeticHalfword) ?
+			(SA(op) & 0x0f) : SA(op));
+		if (amount == 0 && rd == rt && rt != 0)
+			return true;
+
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
 			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
+		};
+
+		const auto emit_store_rd = [&]() {
+			if (rd == rt && rt != 0)
+				return m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP0);
+
+			return emit_gpr_address(rd, HOST_TMP2) &&
+				   m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2);
 		};
 
 		if (rt == 0)
@@ -7387,11 +7588,6 @@ namespace VitaEE
 		{
 			return false;
 		}
-
-		const u8 amount = static_cast<u8>((operation == MmiImmediateShiftOp::ShiftLeftHalfword ||
-			operation == MmiImmediateShiftOp::ShiftRightLogicalHalfword ||
-			operation == MmiImmediateShiftOp::ShiftRightArithmeticHalfword) ?
-			(SA(op) & 0x0f) : SA(op));
 
 		bool vector_op_ok = true;
 		if (amount != 0)
@@ -7420,8 +7616,7 @@ namespace VitaEE
 		}
 
 		if (!vector_op_ok ||
-			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2))
+			!emit_store_rd())
 		{
 			return false;
 		}
@@ -7449,6 +7644,31 @@ namespace VitaEE
 			return m_code.EmitStrImm12(host_reg, HOST_CPU_REGS,
 				static_cast<u16>(GprOffset(rd) + word * sizeof(u32)));
 		};
+
+		const auto emit_zero_result = [&]() {
+			constexpr unsigned NEON_ZERO = 0;
+			return m_code.EmitVeorQ(NEON_ZERO, NEON_ZERO, NEON_ZERO) &&
+				   EmitStoreCpuRegsQ128(GprOffset(rd), NEON_ZERO, HOST_TMP0);
+		};
+
+		const auto emit_unshifted_lane = [&](unsigned source_word, unsigned result_word,
+			unsigned value_reg, unsigned sign_reg) {
+			return emit_load_gpr_word(rt, source_word, value_reg) &&
+				   m_code.EmitMovRegShiftImm(sign_reg, value_reg, VitaA32::ShiftType::ASR, 31) &&
+				   emit_store_rd_word(result_word, value_reg) &&
+				   emit_store_rd_word(result_word + 1, sign_reg);
+		};
+
+		if (rt == 0)
+			return emit_zero_result();
+
+		// PCSX2 owners: MMI.cpp::PSLLVW()/PSRLVW()/PSRAVW(). GPR zero makes
+		// the variable shift amount 0 for both active word lanes.
+		if (rs == 0)
+		{
+			return emit_unshifted_lane(0, 0, HOST_TMP0, HOST_TMP1) &&
+				   emit_unshifted_lane(2, 2, HOST_TMP3, HOST_TMP4);
+		}
 
 		const auto emit_lane = [&](unsigned source_word, unsigned result_word, unsigned value_reg,
 			unsigned amount_reg, unsigned sign_reg) {
@@ -7487,6 +7707,10 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
+		constexpr unsigned NEON_DWORD_PAIR = 0;
+		constexpr unsigned NEON_LOW_D = NEON_DWORD_PAIR * 2;
+		constexpr unsigned NEON_HIGH_D = NEON_DWORD_PAIR * 2 + 1;
+
 		const auto emit_load_gpr_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
 			if (guest_reg == 0)
 				return m_code.EmitMovImm8(host_reg, 0);
@@ -7500,26 +7724,41 @@ namespace VitaEE
 				static_cast<u16>(GprOffset(rd) + word * sizeof(u32)));
 		};
 
+		const auto emit_copy_dword_pair = [&](unsigned low_guest_reg, unsigned low_dword,
+			unsigned high_guest_reg, unsigned high_dword) {
+			if ((low_guest_reg == 0 || high_guest_reg == 0) &&
+				!m_code.EmitVeorQ(NEON_DWORD_PAIR, NEON_DWORD_PAIR, NEON_DWORD_PAIR))
+			{
+				return false;
+			}
+
+			if (low_guest_reg != 0 &&
+				!m_code.EmitVldrDImm(NEON_LOW_D, HOST_CPU_REGS,
+					static_cast<u16>(GprOffset(low_guest_reg) + low_dword * sizeof(u64))))
+			{
+				return false;
+			}
+
+			if (high_guest_reg != 0 &&
+				!m_code.EmitVldrDImm(NEON_HIGH_D, HOST_CPU_REGS,
+					static_cast<u16>(GprOffset(high_guest_reg) + high_dword * sizeof(u64))))
+			{
+				return false;
+			}
+
+			return m_code.EmitVstrDImm(NEON_LOW_D, HOST_CPU_REGS, static_cast<u16>(GprOffset(rd))) &&
+				   m_code.EmitVstrDImm(NEON_HIGH_D, HOST_CPU_REGS, static_cast<u16>(GprOffset(rd) + sizeof(u64)));
+		};
+
 		switch (operation)
 		{
 			case MmiWordShuffleOp::Pcpyld:
-				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
-					   emit_load_gpr_word(rt, 1, HOST_TMP1) &&
-					   emit_load_gpr_word(rs, 0, HOST_TMP2) &&
-					   emit_load_gpr_word(rs, 1, HOST_TMP3) &&
-					   emit_store_rd_word(0, HOST_TMP0) &&
-					   emit_store_rd_word(1, HOST_TMP1) &&
-					   emit_store_rd_word(2, HOST_TMP2) &&
-					   emit_store_rd_word(3, HOST_TMP3);
+				// PCSX2 owners: MMI.cpp::PCPYLD() and x86/iMMI.cpp::recPCPYLD().
+				// Load both halves before storing so rd==rs/rt stays alias-safe.
+				return emit_copy_dword_pair(rt, 0, rs, 0);
 			case MmiWordShuffleOp::Pcpyud:
-				return emit_load_gpr_word(rs, 2, HOST_TMP0) &&
-					   emit_load_gpr_word(rs, 3, HOST_TMP1) &&
-					   emit_load_gpr_word(rt, 2, HOST_TMP2) &&
-					   emit_load_gpr_word(rt, 3, HOST_TMP3) &&
-					   emit_store_rd_word(0, HOST_TMP0) &&
-					   emit_store_rd_word(1, HOST_TMP1) &&
-					   emit_store_rd_word(2, HOST_TMP2) &&
-					   emit_store_rd_word(3, HOST_TMP3);
+				// PCSX2 owners: MMI.cpp::PCPYUD() and x86/iMMI.cpp::recPCPYUD().
+				return emit_copy_dword_pair(rs, 1, rt, 1);
 			case MmiWordShuffleOp::Pexew:
 				return emit_load_gpr_word(rt, 0, HOST_TMP0) &&
 					   emit_load_gpr_word(rt, 1, HOST_TMP1) &&
@@ -7634,6 +7873,95 @@ namespace VitaEE
 		const unsigned rt = RT(op);
 		if (rd == 0)
 			return true;
+
+		constexpr unsigned NEON_RT = 0;
+		constexpr unsigned NEON_RS = 1;
+
+		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
+			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
+		};
+
+		const auto emit_load_q = [&](unsigned guest_reg, unsigned qreg, unsigned address_reg) {
+			if (guest_reg == 0)
+				return m_code.EmitVeorQ(qreg, qreg, qreg);
+
+			return emit_gpr_address(guest_reg, address_reg) &&
+				   m_code.EmitVld1Q32Aligned(qreg, address_reg);
+		};
+
+		const auto emit_store_rd_q = [&]() {
+			if (rd == rt && rt != 0)
+				return m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP0);
+
+			if (rd == rs && rs != 0)
+				return m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP1);
+
+			return emit_gpr_address(rd, HOST_TMP2) &&
+				   m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2);
+		};
+
+		const auto emit_store_rd_rt_q = [&]() {
+			if (rd == rt && rt != 0)
+				return m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP0);
+
+			return emit_gpr_address(rd, HOST_TMP2) &&
+				   m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2);
+		};
+
+		if (operation == MmiHalfwordShuffleOp::Pinth)
+		{
+			// PCSX2 owners: MMI.cpp::PINTH() and x86/iMMI.cpp::recPINTH().
+			// RT low halfwords are interleaved with RS upper halfwords.
+			return emit_load_q(rt, NEON_RT, HOST_TMP0) &&
+				   emit_load_q(rs, NEON_RS, HOST_TMP1) &&
+				   m_code.EmitVextI8Q(NEON_RS, NEON_RS, NEON_RS, 8) &&
+				   m_code.EmitVzipI16Q(NEON_RT, NEON_RS) &&
+				   emit_store_rd_q();
+		}
+
+		if (operation == MmiHalfwordShuffleOp::Pinteh)
+		{
+			// PCSX2 owners: MMI.cpp::PINTEH() and x86/iMMI.cpp::recPINTEH().
+			// Keep even halfwords from each source, then interleave RT/RS.
+			return emit_load_q(rt, NEON_RT, HOST_TMP0) &&
+				   emit_load_q(rs, NEON_RS, HOST_TMP1) &&
+				   m_code.EmitVuzpI16Q(NEON_RT, NEON_RS) &&
+				   m_code.EmitVextI8Q(NEON_RS, NEON_RT, NEON_RT, 8) &&
+				   m_code.EmitVzipI16Q(NEON_RT, NEON_RS) &&
+				   emit_store_rd_q();
+		}
+
+		if (operation == MmiHalfwordShuffleOp::Pexch)
+		{
+			// PCSX2 owners: MMI.cpp::PEXCH() and x86/iMMI.cpp::recPEXCH().
+			// Duplicate RT, split even/odd halfwords, then zip 32-bit pairs.
+			return emit_load_q(rt, NEON_RT, HOST_TMP0) &&
+				   m_code.EmitVorrQ(NEON_RS, NEON_RT, NEON_RT) &&
+				   m_code.EmitVuzpI16Q(NEON_RT, NEON_RS) &&
+				   m_code.EmitVzipI32Q(NEON_RT, NEON_RS) &&
+				   emit_store_rd_rt_q();
+		}
+
+		if (operation == MmiHalfwordShuffleOp::Prevh)
+		{
+			// PCSX2 owners: MMI.cpp::PREVH() and x86/iMMI.cpp::recPREVH().
+			// PREVH reverses halfwords independently inside each 64-bit half.
+			return emit_load_q(rt, NEON_RT, HOST_TMP0) &&
+				   m_code.EmitVrev64I16Q(NEON_RT, NEON_RT) &&
+				   emit_store_rd_rt_q();
+		}
+
+		if (operation == MmiHalfwordShuffleOp::Pcpyh)
+		{
+			// PCSX2 owners: MMI.cpp::PCPYH() and x86/iMMI.cpp::recPCPYH().
+			// Broadcast the first halfword independently within each 64-bit half.
+			constexpr unsigned NEON_RT_LOW_D = NEON_RT * 2;
+			constexpr unsigned NEON_RT_HIGH_D = NEON_RT * 2 + 1;
+			return emit_load_q(rt, NEON_RT, HOST_TMP0) &&
+				   m_code.EmitVdupI16D(NEON_RT_LOW_D, NEON_RT_LOW_D, 0) &&
+				   m_code.EmitVdupI16D(NEON_RT_HIGH_D, NEON_RT_HIGH_D, 0) &&
+				   emit_store_rd_rt_q();
+		}
 
 		const auto emit_load_gpr_word = [this](unsigned guest_reg, unsigned word, unsigned host_reg) {
 			if (guest_reg == 0)
@@ -7759,6 +8087,17 @@ namespace VitaEE
 			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
 
+		const auto emit_store_rd = [&](unsigned qreg) {
+			if (rd == rs && rs != 0)
+				return m_code.EmitVst1Q32Aligned(qreg, HOST_TMP0);
+
+			if (rd == rt && rt != 0)
+				return m_code.EmitVst1Q32Aligned(qreg, HOST_TMP1);
+
+			return emit_gpr_address(rd, HOST_TMP2) &&
+				   m_code.EmitVst1Q32Aligned(qreg, HOST_TMP2);
+		};
+
 		if (rs == 0)
 		{
 			if (!m_code.EmitVeorQ(NEON_RS, NEON_RS, NEON_RS))
@@ -7800,8 +8139,7 @@ namespace VitaEE
 		// directly.
 		const unsigned result = upper_half ? NEON_RS : NEON_RT;
 		if (!vector_op_ok ||
-			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32Aligned(result, HOST_TMP2))
+			!emit_store_rd(result))
 		{
 			return false;
 		}
@@ -7827,6 +8165,17 @@ namespace VitaEE
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
 			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
+		};
+
+		const auto emit_store_rd = [&]() {
+			if (rd == rs && rs != 0)
+				return m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP0);
+
+			if (rd == rt && rt != 0)
+				return m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP1);
+
+			return emit_gpr_address(rd, HOST_TMP2) &&
+				   m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2);
 		};
 
 		if (rs == 0)
@@ -7868,8 +8217,7 @@ namespace VitaEE
 		// vuzp RT, RS leaves the even RT lanes followed by the even RS lanes in
 		// RT, matching PCSX2's PPACW/PPACH/PPACB definitions.
 		if (!vector_op_ok ||
-			!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitVst1Q32Aligned(NEON_RT, HOST_TMP2))
+			!emit_store_rd())
 		{
 			return false;
 		}
@@ -8146,10 +8494,47 @@ namespace VitaEE
 		constexpr unsigned NEON_ADD = 3;
 		constexpr unsigned NEON_SUB_LOW_D = NEON_SUB * 2;
 		constexpr unsigned NEON_ADD_HIGH_D = NEON_ADD * 2 + 1;
+		constexpr unsigned NEON_RS_HIGH_D = NEON_RS * 2 + 1;
+		constexpr unsigned NEON_ZERO_LOW_D = NEON_RT * 2;
 
 		const auto emit_gpr_address = [this](unsigned guest_reg, unsigned host_reg) {
 			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
+
+		const auto emit_zero_qword = [&]() {
+			return m_code.EmitVeorQ(NEON_RS, NEON_RS, NEON_RS) &&
+				   m_code.EmitVstrDImm(NEON_RS * 2, HOST_CPU_REGS, static_cast<u16>(GprOffset(rd))) &&
+				   m_code.EmitVstrDImm(NEON_RS * 2 + 1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rd) + sizeof(u64)));
+		};
+
+		const auto emit_copy_qword = [&]() {
+			if (rs == 0)
+				return emit_zero_qword();
+
+			if (rd == rs)
+				return true;
+
+			return EmitLoadCpuRegsQ128(GprOffset(rs), NEON_RS, HOST_TMP0) &&
+				   EmitStoreCpuRegsQ128(GprOffset(rd), NEON_RS, HOST_TMP2);
+		};
+
+		if (rt == 0)
+			return emit_copy_qword();
+
+		if (rs == rt)
+		{
+			// PCSX2 owners: MMI.cpp::PADSBH() and x86/iMMI.cpp::recPADSBH().
+			// Same-source PADSBH is lower-half zero and upper-half PADDH(rs, rs).
+			if (rs == 0)
+				return emit_zero_qword();
+
+			return emit_gpr_address(rs, HOST_TMP0) &&
+				   m_code.EmitVld1Q32Aligned(NEON_RS, HOST_TMP0) &&
+				   m_code.EmitVaddI16Q(NEON_RS, NEON_RS, NEON_RS) &&
+				   m_code.EmitVeorQ(NEON_RT, NEON_RT, NEON_RT) &&
+				   m_code.EmitVstrDImm(NEON_ZERO_LOW_D, HOST_CPU_REGS, static_cast<u16>(GprOffset(rd))) &&
+				   m_code.EmitVstrDImm(NEON_RS_HIGH_D, HOST_CPU_REGS, static_cast<u16>(GprOffset(rd) + sizeof(u64)));
+		}
 
 		if (rs == 0)
 		{
@@ -8295,6 +8680,24 @@ namespace VitaEE
 			return EmitCpuRegsAddress(host_reg, GprOffset(guest_reg));
 		};
 
+		if (rt != 0 && rs == rt + 1)
+		{
+			// PCSX2 x86 owner: x86/iMMI.cpp::recQFSRV() directly loads from
+			// contiguous RT||RS storage when RS physically follows RT.
+			if (!emit_gpr_address(rt, HOST_TMP0) ||
+				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET)) ||
+				!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 0x0f) ||
+				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) ||
+				!m_code.EmitVld1Q32(NEON_RD, HOST_TMP0) ||
+				!emit_gpr_address(rd, HOST_TMP2) ||
+				!m_code.EmitVst1Q32Aligned(NEON_RD, HOST_TMP2))
+			{
+				return false;
+			}
+
+			return true;
+		}
+
 		if (rs == 0)
 		{
 			if (!m_code.EmitVeorQ(NEON_RS, NEON_RS, NEON_RS))
@@ -8317,49 +8720,19 @@ namespace VitaEE
 			return false;
 		}
 
-		if (!emit_gpr_address(rd, HOST_TMP2) ||
-			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET)) ||
-			!m_code.EmitAndImm8(HOST_TMP3, HOST_TMP3, 0x0f))
-		{
-			return false;
-		}
-
-		size_t done_branches[15]{};
-		unsigned done_count = 0;
-		for (u8 offset = 0; offset < 15; offset++)
-		{
-			if (!EmitCmpImm32OrReg(HOST_TMP3, offset, HOST_TMP4))
-			{
-				return false;
-			}
-
-			const size_t next_case = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-			if (next_case == static_cast<size_t>(-1))
-				return false;
-
-			if (!m_code.EmitVextI8Q(NEON_RD, NEON_RT, NEON_RS, offset))
-				return false;
-
-			const size_t done = m_code.EmitBranchPlaceholder();
-			if (done == static_cast<size_t>(-1))
-				return false;
-			done_branches[done_count++] = done;
-
-			if (!m_code.PatchBranch(next_case, m_code.Size(), VitaA32::Condition::NE))
-				return false;
-		}
-
-		if (!m_code.EmitVextI8Q(NEON_RD, NEON_RT, NEON_RS, 15))
-			return false;
-
-		const size_t store_target = m_code.Size();
-		for (unsigned i = 0; i < done_count; i++)
-		{
-			if (!m_code.PatchBranch(done_branches[i], store_target))
-				return false;
-		}
-
-		return m_code.EmitVst1Q32Aligned(NEON_RD, HOST_TMP2);
+		// PCSX2 x86 owner: x86/iMMI.cpp::recQFSRV() spills RT||RS to tempqw
+		// for non-contiguous registers, then performs one unaligned 16-byte load.
+		return m_code.EmitSubImm8(HOST_SP, HOST_SP, 32) &&
+			   m_code.EmitVst1Q32(NEON_RT, HOST_SP) &&
+			   m_code.EmitAddImm8(HOST_TMP0, HOST_SP, 16) &&
+			   m_code.EmitVst1Q32(NEON_RS, HOST_TMP0) &&
+			   m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET)) &&
+			   m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 0x0f) &&
+			   m_code.EmitAddReg(HOST_TMP0, HOST_SP, HOST_TMP1) &&
+			   m_code.EmitVld1Q32(NEON_RD, HOST_TMP0) &&
+			   m_code.EmitAddImm8(HOST_SP, HOST_SP, 32) &&
+			   emit_gpr_address(rd, HOST_TMP2) &&
+			   m_code.EmitVst1Q32Aligned(NEON_RD, HOST_TMP2);
 	}
 
 	bool BlockCompiler::EmitPSLLVW(u32 op)

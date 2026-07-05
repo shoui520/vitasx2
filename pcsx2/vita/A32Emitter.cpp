@@ -71,6 +71,7 @@ namespace VitaA32
 		constexpr u32 VST1_32_D = 0xf400078fu;
 		constexpr u32 VLDR_D_IMM = 0x0d900b00u;
 		constexpr u32 VSTR_D_IMM = 0x0d800b00u;
+		constexpr u32 VDUP_I16_D = 0xf3b20c00u;
 		constexpr u32 VMOV_CORE_TO_S = 0xee000a10u;
 		constexpr u32 VMOV_S_TO_CORE = 0xee100a10u;
 		constexpr u32 VCVT_F32_S32 = 0xeeb80ac0u;
@@ -113,6 +114,7 @@ namespace VitaA32
 		constexpr u32 VQSUB_U32_Q = 0xf3200250u;
 		constexpr u32 VQABS_S16_Q = 0xf3b40740u;
 		constexpr u32 VQABS_S32_Q = 0xf3b80740u;
+		constexpr u32 VREV64_I16_Q = 0xf3b40040u;
 		constexpr u32 VZIP_I8_Q = 0xf3b201c0u;
 		constexpr u32 VZIP_I16_Q = 0xf3b601c0u;
 		constexpr u32 VZIP_I32_Q = 0xf3ba01c0u;
@@ -237,6 +239,11 @@ namespace VitaA32
 		u32 NeonDd(unsigned dreg)
 		{
 			return ((dreg & 0xfu) << 12) | ((dreg & 0x10u) << 18);
+		}
+
+		u32 NeonDm(unsigned dreg)
+		{
+			return (dreg & 0xfu) | ((dreg & 0x10u) << 1);
 		}
 
 		u32 VfpDd(unsigned dreg)
@@ -1077,6 +1084,13 @@ namespace VitaA32
 		return EmitU32(EncodeVstrDImm(dd, rn, offset));
 	}
 
+	bool CodeBuffer::EmitVdupI16D(unsigned dd, unsigned dm, u8 lane)
+	{
+		if (!IsDRegister(dd) || !IsDRegister(dm) || lane >= 4)
+			return false;
+		return EmitU32(EncodeVdupI16D(dd, dm, lane));
+	}
+
 	bool CodeBuffer::EmitVmovCoreToS(unsigned sd, unsigned rt)
 	{
 		if (!IsSRegister(sd) || !IsRegister(rt))
@@ -1383,6 +1397,13 @@ namespace VitaA32
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
 		return EmitU32(EncodeVqabsS32Q(qd, qm));
+	}
+
+	bool CodeBuffer::EmitVrev64I16Q(unsigned qd, unsigned qm)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qm))
+			return false;
+		return EmitU32(EncodeVrev64I16Q(qd, qm));
 	}
 
 	bool CodeBuffer::EmitVzipI8Q(unsigned qd, unsigned qm)
@@ -1992,6 +2013,14 @@ namespace VitaA32
 			   ((offset >> 2) & 0xffu);
 	}
 
+	u32 EncodeVdupI16D(unsigned dd, unsigned dm, u8 lane)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsDRegister(dm));
+		pxAssert(lane < 4);
+		return VDUP_I16_D | NeonDd(dd) | NeonDm(dm) | ((static_cast<u32>(lane) & 0x3u) << 18);
+	}
+
 	u32 EncodeLdrbImm12(unsigned rd, unsigned rn, u16 offset)
 	{
 		pxAssert(IsLowRegister(rd));
@@ -2487,6 +2516,13 @@ namespace VitaA32
 		pxAssert(IsQRegister(qd));
 		pxAssert(IsQRegister(qm));
 		return VQABS_S32_Q | NeonQd(qd) | NeonQm(qm);
+	}
+
+	u32 EncodeVrev64I16Q(unsigned qd, unsigned qm)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qm));
+		return VREV64_I16_Q | NeonQd(qd) | NeonQm(qm);
 	}
 
 	u32 EncodeVzipI8Q(unsigned qd, unsigned qm)
