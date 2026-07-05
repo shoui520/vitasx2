@@ -3745,8 +3745,7 @@ namespace VitaEE
 
 		const auto apply_overflow_underflow_flags = [&]() {
 			if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 1) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, 1) ||
+				!m_code.EmitBicImm32(HOST_TMP2, HOST_TMP0, FPU_FLOAT_SIGN_MASK) ||
 				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP5))
 			{
 				return false;
@@ -3926,8 +3925,7 @@ namespace VitaEE
 		};
 
 		const auto clamp_result_no_flags = [&](bool store_fcr31) {
-			if (!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 1) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, 1) ||
+			if (!m_code.EmitBicImm32(HOST_TMP2, HOST_TMP0, FPU_FLOAT_SIGN_MASK) ||
 				!m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_EXPONENT_MASK) ||
 				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
 			{
@@ -4293,8 +4291,7 @@ namespace VitaEE
 
 		const auto apply_overflow_underflow_flags = [&](size_t dest_offset) {
 			if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 1) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, 1) ||
+				!m_code.EmitBicImm32(HOST_TMP2, HOST_TMP0, FPU_FLOAT_SIGN_MASK) ||
 				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP5))
 			{
 				return false;
@@ -4473,8 +4470,7 @@ namespace VitaEE
 		switch (function)
 		{
 			case 0x05: // ABS_S
-				if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 1) ||
-					!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, 1))
+				if (!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK))
 				{
 					return false;
 				}
