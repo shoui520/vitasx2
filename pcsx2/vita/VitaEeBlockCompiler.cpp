@@ -4618,11 +4618,9 @@ namespace VitaEE
 		if (convert_path == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_SIGN_MASK) ||
-			!m_code.EmitTstImm32(HOST_TMP0, FPU_FLOAT_SIGN_MASK) ||
+		if (!m_code.EmitTstImm32(HOST_TMP0, FPU_FLOAT_SIGN_MASK) ||
 			!m_code.EmitMovImm32(HOST_TMP0, 0x7fffffffu) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3, VitaA32::ShiftType::LSL, 0,
-				false, VitaA32::Condition::NE))
+			!m_code.EmitMovImm32(HOST_TMP0, FPU_FLOAT_SIGN_MASK, VitaA32::Condition::NE))
 		{
 			return false;
 		}

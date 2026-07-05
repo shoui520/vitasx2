@@ -365,22 +365,28 @@ namespace VitaA32
 		return EmitU32(EncodeMovImm8(rd, value, condition));
 	}
 
-	bool CodeBuffer::EmitMovImm32(unsigned rd, u32 value)
+	bool CodeBuffer::EmitMovImm32(unsigned rd, u32 value, Condition condition)
 	{
 		if (!IsRegister(rd))
 			return false;
 
 		u32 encoded = 0;
 		if (EncodeModifiedImmediate(value, &encoded))
-			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_MOV |
+			return EmitU32(CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_MOV |
 						   ((rd & 0xfu) << 12) | encoded);
 
 		if (EncodeModifiedImmediate(~value, &encoded))
-			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_MVN |
+			return EmitU32(CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_MVN |
 						   ((rd & 0xfu) << 12) | encoded);
 
 		if ((value >> 16) == 0)
-			return EmitU32(EncodeMovw(rd, static_cast<u16>(value)));
+			return EmitU32(EncodeMovw(rd, static_cast<u16>(value), condition));
+
+		if (condition != Condition::AL)
+		{
+			return EmitU32(EncodeMovw(rd, static_cast<u16>(value), condition)) &&
+				   EmitU32(EncodeMovt(rd, static_cast<u16>(value >> 16), condition));
+		}
 
 		return EmitMovImm32Patchable(rd, value);
 	}
@@ -1464,17 +1470,17 @@ namespace VitaA32
 		return CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_MOV | ((rd & 0xfu) << 12) | value;
 	}
 
-	u32 EncodeMovw(unsigned rd, u16 value)
+	u32 EncodeMovw(unsigned rd, u16 value, Condition condition)
 	{
 		pxAssert(IsRegister(rd));
-		return CondBits(Condition::AL) | MOVW | ((static_cast<u32>(value) & 0xf000u) << 4) | ((rd & 0xfu) << 12) |
+		return CondBits(condition) | MOVW | ((static_cast<u32>(value) & 0xf000u) << 4) | ((rd & 0xfu) << 12) |
 			   (static_cast<u32>(value) & 0x0fffu);
 	}
 
-	u32 EncodeMovt(unsigned rd, u16 value)
+	u32 EncodeMovt(unsigned rd, u16 value, Condition condition)
 	{
 		pxAssert(IsRegister(rd));
-		return CondBits(Condition::AL) | MOVT | ((static_cast<u32>(value) & 0xf000u) << 4) | ((rd & 0xfu) << 12) |
+		return CondBits(condition) | MOVT | ((static_cast<u32>(value) & 0xf000u) << 4) | ((rd & 0xfu) << 12) |
 			   (static_cast<u32>(value) & 0x0fffu);
 	}
 

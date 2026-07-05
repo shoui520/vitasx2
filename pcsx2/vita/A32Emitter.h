@@ -64,7 +64,7 @@ namespace VitaA32
 
 		bool EmitU32(u32 instruction);
 		bool EmitMovImm8(unsigned rd, u8 value, Condition condition = Condition::AL);
-		bool EmitMovImm32(unsigned rd, u32 value);
+		bool EmitMovImm32(unsigned rd, u32 value, Condition condition = Condition::AL);
 		bool EmitMovImm32Patchable(unsigned rd, u32 value);
 		bool EmitAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitAddImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
@@ -223,8 +223,8 @@ namespace VitaA32
 	};
 
 	u32 EncodeMovImm8(unsigned rd, u8 value, Condition condition = Condition::AL);
-	u32 EncodeMovw(unsigned rd, u16 value);
-	u32 EncodeMovt(unsigned rd, u16 value);
+	u32 EncodeMovw(unsigned rd, u16 value, Condition condition = Condition::AL);
+	u32 EncodeMovt(unsigned rd, u16 value, Condition condition = Condition::AL);
 	u32 EncodeAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 	u32 EncodeSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 	u32 EncodeAndImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
