@@ -231,6 +231,7 @@ namespace VitaIOP
 			u32 helper_instruction_count = 0;
 			DirectLinkSlots direct_links{};
 			bool valid = false;
+			bool queued_free = false;
 		};
 
 		struct LookupPage
@@ -266,6 +267,8 @@ namespace VitaIOP
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
 		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc, u32 instruction_count, bool match_instruction_count);
+		void RememberFreeCacheEntry(CachedBlock& block);
+		CachedBlock* TakeFreeCacheEntry();
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
 		s32 LastIncomingLinkIndex(u32 target_pc) const;
 		void ClearIncomingLinks();
@@ -292,6 +295,7 @@ namespace VitaIOP
 		void RelinkDirectLinks();
 
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
+		std::vector<CachedBlock*> m_free_cache_entries;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		LookupPage** m_lookup_pages = nullptr;
@@ -300,6 +304,5 @@ namespace VitaIOP
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
 		bool m_direct_linking_enabled = true;
-		bool m_reuse_invalid_cache_entries = false;
 	};
 } // namespace VitaIOP

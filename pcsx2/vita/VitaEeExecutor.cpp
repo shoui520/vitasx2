@@ -53,6 +53,7 @@ namespace VitaEE
 	BlockExecutor::BlockExecutor()
 	{
 		m_cache.reserve(INITIAL_CACHE_CAPACITY);
+		m_free_cache_entries.reserve(INITIAL_CACHE_CAPACITY);
 		m_block_records.reserve(INITIAL_CACHE_CAPACITY);
 		m_incoming_links.reserve(INITIAL_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT);
 	}
@@ -233,6 +234,33 @@ namespace VitaEE
 		return nullptr;
 	}
 
+	void BlockExecutor::RememberFreeCacheEntry(CachedBlock& block)
+	{
+		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Remove()/New().
+		// Removed BaseBlock records become reusable metadata; keep Vita's
+		// CachedBlock object reuse O(1) instead of scanning m_cache.
+		if (block.queued_free)
+			return;
+
+		block.queued_free = true;
+		m_free_cache_entries.push_back(&block);
+	}
+
+	BlockExecutor::CachedBlock* BlockExecutor::TakeFreeCacheEntry()
+	{
+		while (!m_free_cache_entries.empty())
+		{
+			CachedBlock* block = m_free_cache_entries.back();
+			m_free_cache_entries.pop_back();
+			if (block)
+				block->queued_free = false;
+			if (block && !block->valid)
+				return block;
+		}
+
+		return nullptr;
+	}
+
 	void BlockExecutor::InvalidateCachedBlock(CachedBlock& block)
 	{
 		if (!block.valid)
@@ -245,7 +273,7 @@ namespace VitaEE
 		block.valid = false;
 		block.direct_links = {};
 		block.code.Release();
-		m_reuse_invalid_cache_entries = true;
+		RememberFreeCacheEntry(block);
 	}
 
 	DirectLinkSlot* BlockExecutor::GetRecordedDirectLink(IncomingLinkRecord& record)
@@ -336,6 +364,7 @@ namespace VitaEE
 	u32 BlockExecutor::Reset()
 	{
 		u32 invalidated = 0;
+		m_free_cache_entries.clear();
 		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
 		{
 			CachedBlock& block = *entry;
@@ -344,7 +373,9 @@ namespace VitaEE
 
 			block.code.Release();
 			block.valid = false;
+			block.queued_free = false;
 			block.direct_links = {};
+			RememberFreeCacheEntry(block);
 		}
 
 		ClearBlockRecords();
@@ -352,7 +383,6 @@ namespace VitaEE
 		ReleaseLookupPages();
 		m_code_cache_resets = 0;
 		ReleaseCodeCache();
-		m_reuse_invalid_cache_entries = !m_cache.empty();
 		return invalidated;
 	}
 
@@ -609,18 +639,8 @@ namespace VitaEE
 			return block;
 		};
 
-		if (!m_reuse_invalid_cache_entries)
-		{
-			if (CachedBlock* block = append_entry())
-				return block;
-		}
-
-		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
-		{
-			if (!entry->valid)
-				return entry.get();
-		}
-		m_reuse_invalid_cache_entries = false;
+		if (CachedBlock* block = TakeFreeCacheEntry())
+			return block;
 
 		if (CachedBlock* block = append_entry())
 			return block;
@@ -629,13 +649,7 @@ namespace VitaEE
 		// recResetRaw() when recPtr reaches recPtrEnd; keep the same whole-cache
 		// pressure behavior instead of replacing one arbitrary translated block.
 		ResetForCachePressure();
-		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
-		{
-			if (!entry->valid)
-				return entry.get();
-		}
-
-		return nullptr;
+		return TakeFreeCacheEntry();
 	}
 
 	bool BlockExecutor::EnsureCodeCache()

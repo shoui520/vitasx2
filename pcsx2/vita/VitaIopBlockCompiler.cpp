@@ -2853,6 +2853,7 @@ namespace VitaIOP
 	BlockExecutor::BlockExecutor()
 	{
 		m_cache.reserve(INITIAL_CACHE_CAPACITY);
+		m_free_cache_entries.reserve(INITIAL_CACHE_CAPACITY);
 		m_block_records.reserve(INITIAL_CACHE_CAPACITY);
 		m_incoming_links.reserve(INITIAL_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT);
 	}
@@ -3033,6 +3034,33 @@ namespace VitaIOP
 		return nullptr;
 	}
 
+	void BlockExecutor::RememberFreeCacheEntry(CachedBlock& block)
+	{
+		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Remove()/New().
+		// Removed BaseBlock records become reusable metadata; keep Vita's
+		// CachedBlock object reuse O(1) instead of scanning m_cache.
+		if (block.queued_free)
+			return;
+
+		block.queued_free = true;
+		m_free_cache_entries.push_back(&block);
+	}
+
+	BlockExecutor::CachedBlock* BlockExecutor::TakeFreeCacheEntry()
+	{
+		while (!m_free_cache_entries.empty())
+		{
+			CachedBlock* block = m_free_cache_entries.back();
+			m_free_cache_entries.pop_back();
+			if (block)
+				block->queued_free = false;
+			if (block && !block->valid)
+				return block;
+		}
+
+		return nullptr;
+	}
+
 	DirectLinkSlot* BlockExecutor::GetRecordedDirectLink(IncomingLinkRecord& record)
 	{
 		if (!record.source || !record.source->valid || record.slot_index >= DIRECT_LINK_SLOT_COUNT)
@@ -3121,14 +3149,17 @@ namespace VitaIOP
 	u32 BlockExecutor::Reset()
 	{
 		u32 invalidated = 0;
+		m_free_cache_entries.clear();
 		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
 		{
 			if (entry->valid)
 				invalidated++;
 
 			entry->valid = false;
+			entry->queued_free = false;
 			entry->direct_links = {};
 			entry->code.Release();
+			RememberFreeCacheEntry(*entry);
 		}
 
 		ClearBlockRecords();
@@ -3137,7 +3168,6 @@ namespace VitaIOP
 		const u32 previous_resets = m_code_cache_resets;
 		ReleaseCodeCache();
 		m_code_cache_resets = previous_resets;
-		m_reuse_invalid_cache_entries = !m_cache.empty();
 		return invalidated;
 	}
 
@@ -3153,7 +3183,7 @@ namespace VitaIOP
 		block.valid = false;
 		block.direct_links = {};
 		block.code.Release();
-		m_reuse_invalid_cache_entries = true;
+		RememberFreeCacheEntry(block);
 	}
 
 	u32 BlockExecutor::InvalidateRange(u32 start_pc, u32 instruction_count)
@@ -3364,30 +3394,14 @@ namespace VitaIOP
 			return block;
 		};
 
-		if (!m_reuse_invalid_cache_entries)
-		{
-			if (CachedBlock* block = append_entry())
-				return block;
-		}
-
-		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
-		{
-			if (!entry->valid)
-				return entry.get();
-		}
-		m_reuse_invalid_cache_entries = false;
+		if (CachedBlock* block = TakeFreeCacheEntry())
+			return block;
 
 		if (CachedBlock* block = append_entry())
 			return block;
 
 		ResetForCachePressure();
-		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
-		{
-			if (!entry->valid)
-				return entry.get();
-		}
-
-		return nullptr;
+		return TakeFreeCacheEntry();
 	}
 
 	bool BlockExecutor::EnsureCodeCache()

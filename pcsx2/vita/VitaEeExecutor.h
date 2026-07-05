@@ -108,6 +108,7 @@ namespace VitaEE
 			u8 cp0_config_cycle_shift = 0;
 			DirectLinkSlots direct_links{};
 			bool valid = false;
+			bool queued_free = false;
 		};
 
 		struct LookupPage
@@ -143,6 +144,8 @@ namespace VitaEE
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
 		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc, u32 instruction_count, bool match_instruction_count);
+		void RememberFreeCacheEntry(CachedBlock& block);
+		CachedBlock* TakeFreeCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
 		s32 LastIncomingLinkIndex(u32 target_pc) const;
@@ -169,6 +172,7 @@ namespace VitaEE
 		void RelinkDirectLinks();
 
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
+		std::vector<CachedBlock*> m_free_cache_entries;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		LookupPage** m_lookup_pages = nullptr;
@@ -177,6 +181,5 @@ namespace VitaEE
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
 		bool m_direct_linking_enabled = true;
-		bool m_reuse_invalid_cache_entries = false;
 	};
 } // namespace VitaEE
