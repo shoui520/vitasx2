@@ -5531,8 +5531,7 @@ namespace VitaEE
 		if (signed_divide)
 		{
 			if (!patch_branch(negone_or_below_branch, m_code.Size()) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP3, HOST_TMP0) ||
+				!m_code.EmitRsbImm32(HOST_TMP2, HOST_TMP0, 0) ||
 				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
 				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
 				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
@@ -6433,8 +6432,7 @@ namespace VitaEE
 			}
 
 			if (!patch_branch(negone_branch, m_code.Size()) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP3, HOST_TMP0) ||
+				!m_code.EmitRsbImm32(HOST_TMP2, HOST_TMP0, 0) ||
 				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
 				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
 				!store_signed_word_as_doubleword(HOST_TMP2, hi_offset) ||
@@ -6811,8 +6809,7 @@ namespace VitaEE
 				return false;
 			}
 
-			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
-				!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP3) ||
+			if (!m_code.EmitRsbImm32(HOST_TMP0, HOST_TMP3, 0) ||
 				!m_code.EmitCmpReg(HOST_TMP4, HOST_TMP0))
 			{
 				return false;
@@ -6898,8 +6895,7 @@ namespace VitaEE
 
 			if (subtract)
 			{
-				if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
-					!m_code.EmitSubReg(HOST_TMP4, HOST_TMP0, HOST_TMP4, true) ||
+				if (!m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP4, 0, true) ||
 					!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hi_source_offset)) ||
 					!m_code.EmitSbcReg(HOST_TMP3, HOST_TMP0, HOST_TMP3))
 				{
