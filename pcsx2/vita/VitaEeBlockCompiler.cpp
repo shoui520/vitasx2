@@ -1670,6 +1670,7 @@ namespace VitaEE
 	} // namespace
 
 	static_assert(GprOffset(31) + sizeof(GPR_reg) <= 0x0fff);
+	static_assert((GprOffset(0) % 16) == 0);
 	static_assert((GprOffset(0) % alignof(u64)) == 0);
 	static_assert(GprOffset(31) + sizeof(u64) <= 0x3fc);
 	static_assert(HI_OFFSET + sizeof(GPR_reg) <= 0x0fff);
@@ -10968,6 +10969,13 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitLoadCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch)
 	{
+		if (offset == 0)
+		{
+			// PCSX2 owner: R5900.h::cpuRegistersPack keeps cpuRegs alignas(16)
+			// with GPR first, so GPR[0] can use the aligned 128-bit NEON form.
+			return m_code.EmitVld1Q32Aligned(qreg, HOST_CPU_REGS);
+		}
+
 		const unsigned low_d = qreg * 2;
 		const unsigned high_d = low_d + 1;
 		if (offset + sizeof(u64) <= 0x3fc && (offset & 0x3u) == 0)
@@ -10982,6 +10990,13 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitStoreCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch)
 	{
+		if (offset == 0)
+		{
+			// PCSX2 owner: R5900.h::cpuRegistersPack keeps cpuRegs alignas(16)
+			// with GPR first, so GPR[0] can use the aligned 128-bit NEON form.
+			return m_code.EmitVst1Q32Aligned(qreg, HOST_CPU_REGS);
+		}
+
 		const unsigned low_d = qreg * 2;
 		const unsigned high_d = low_d + 1;
 		if (offset + sizeof(u64) <= 0x3fc && (offset & 0x3u) == 0)
