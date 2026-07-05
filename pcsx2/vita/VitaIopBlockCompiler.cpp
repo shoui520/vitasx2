@@ -3258,8 +3258,7 @@ namespace VitaIOP
 			if (IsIopBranchOrJumpOpcode(op))
 			{
 				if (i + 1 >= max_instruction_count ||
-					i >= ((UINT32_MAX - start_pc) / 4) ||
-					((pc + 4) & 0xffcu) == 0)
+					i >= ((UINT32_MAX - start_pc) / 4))
 				{
 					return result->instruction_count != 0;
 				}
@@ -3269,6 +3268,10 @@ namespace VitaIOP
 				if (!BlockCompiler::CanCompileOpcode(delay_op))
 					return result->instruction_count != 0;
 
+				// PCSX2 owner: R3000AInterpreter.cpp::psxBNE()/psxJAL()
+				// dispatch through doBranch(), whose delay slot belongs to the
+				// branch. Keep the pair together even when the delay slot is the
+				// first word of the next guest page.
 				add_instruction(pc);
 				add_instruction(delay_pc);
 				return true;
