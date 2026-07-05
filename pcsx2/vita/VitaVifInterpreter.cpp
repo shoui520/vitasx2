@@ -146,6 +146,16 @@ namespace
 	}
 
 #if VITASX2_VIF_HAS_ARM_NEON
+	void VitaVifStoreS_32WordsNeon(u8* dest, const u8* src)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_S().
+		const uint32x4_t value = vdupq_n_u32(VitaVifLoadU32(src));
+		vst1q_u32(reinterpret_cast<u32*>(dest), value);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
+
 	void VitaVifStoreS_16WordsNeon(u8* dest, const u8* src, bool usn)
 	{
 		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_S().
@@ -183,6 +193,20 @@ namespace
 			const int32x4_t widened = vmovl_s16(vget_low_s16(halves));
 			vst1q_s32(reinterpret_cast<s32*>(dest), widened);
 		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
+
+	void VitaVifStoreV2_32WordsNeon(u8* dest, const u8* src)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V2(); output is v1v0v1v0.
+		const u32 x = VitaVifLoadU32(src);
+		const u32 y = VitaVifLoadU32(src + sizeof(u32));
+		uint32x2_t pair = vdup_n_u32(x);
+		pair = vset_lane_u32(y, pair, 1);
+		const uint32x4_t value = vcombine_u32(pair, pair);
+		vst1q_u32(reinterpret_cast<u32*>(dest), value);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuVifNeonVectors;
 #endif
@@ -368,8 +392,20 @@ namespace
 		{
 			case 0x00: // S-32
 			{
-				const u32 x = VitaVifLoadU32(src);
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, x, x, x);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreS_32WordsNeon(dest, src);
+#else
+					const u32 x = VitaVifLoadU32(src);
+					VitaVifStoreWords(dest, x, x, x, x);
+#endif
+				}
+				else
+				{
+					const u32 x = VitaVifLoadU32(src);
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, x, x, x);
+				}
 				return true;
 			}
 
@@ -417,9 +453,22 @@ namespace
 
 			case 0x04: // V2-32
 			{
-				const u32 x = VitaVifLoadU32(src);
-				const u32 y = VitaVifLoadU32(src + sizeof(u32));
-				VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, x, y);
+				if (mode == 0 && !doMask)
+				{
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreV2_32WordsNeon(dest, src);
+#else
+					const u32 x = VitaVifLoadU32(src);
+					const u32 y = VitaVifLoadU32(src + sizeof(u32));
+					VitaVifStoreWords(dest, x, y, x, y);
+#endif
+				}
+				else
+				{
+					const u32 x = VitaVifLoadU32(src);
+					const u32 y = VitaVifLoadU32(src + sizeof(u32));
+					VitaVifStoreModeWords(vif, regs, dest, mode, doMask, x, y, x, y);
+				}
 				return true;
 			}
 
@@ -581,8 +630,12 @@ namespace
 		{
 			case 0x00: // S-32
 			{
+#if VITASX2_VIF_HAS_ARM_NEON
+				VitaVifStoreS_32WordsNeon(dest, src);
+#else
 				const u32 x = VitaVifLoadU32(src);
 				VitaVifStoreWords(dest, x, x, x, x);
+#endif
 				return true;
 			}
 
@@ -612,9 +665,13 @@ namespace
 
 			case 0x04: // V2-32
 			{
+#if VITASX2_VIF_HAS_ARM_NEON
+				VitaVifStoreV2_32WordsNeon(dest, src);
+#else
 				const u32 x = VitaVifLoadU32(src);
 				const u32 y = VitaVifLoadU32(src + sizeof(u32));
 				VitaVifStoreWords(dest, x, y, x, y);
+#endif
 				return true;
 			}
 
