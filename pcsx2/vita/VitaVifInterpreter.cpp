@@ -355,6 +355,46 @@ namespace
 		++g_qemuVifNeonVectors;
 #endif
 	}
+
+	void VitaVifStoreMaskedModeWordsNeon(vifStruct& vif, const VIFregisters& regs, u8* dest, u32 mode, u32 x, u32 y, u32 z, u32 w)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::writeXYZW(). Masked modes still update
+		// MaskRow only for selector-zero data lanes; row/col/protect lanes do
+		// not participate in the mode side effect.
+		const u32 cl = vif.cl < 3 ? vif.cl : 3;
+		const u32 cycle_mask = (regs.mask >> (cl * 8)) & 0xffu;
+
+		uint32x4_t data = vdupq_n_u32(x);
+		data = vsetq_lane_u32(y, data, 1);
+		data = vsetq_lane_u32(z, data, 2);
+		data = vsetq_lane_u32(w, data, 3);
+
+		const int16x4_t shifts = {0, -2, -4, -6};
+		const uint16x4_t selectors16 = vand_u16(
+			vshl_u16(vdup_n_u16(static_cast<u16>(cycle_mask)), shifts),
+			vdup_n_u16(3));
+		const uint32x4_t selectors = vmovl_u16(selectors16);
+		const uint32x4_t row = vld1q_u32(vif.MaskRow._u32);
+		uint32x4_t mode_data = data;
+
+		if (mode == 1 || mode == 2)
+			mode_data = vaddq_u32(data, row);
+
+		const uint32x4_t data_mask = vceqq_u32(selectors, vdupq_n_u32(0));
+		if (mode == 2 || mode == 3)
+			vst1q_u32(vif.MaskRow._u32, vbslq_u32(data_mask, mode_data, row));
+
+		const uint32x4_t col = vdupq_n_u32(vif.MaskCol._u32[cl]);
+		const uint32x4_t old = vld1q_u32(reinterpret_cast<const u32*>(dest));
+		uint32x4_t result = mode_data;
+		result = vbslq_u32(vceqq_u32(selectors, vdupq_n_u32(1)), row, result);
+		result = vbslq_u32(vceqq_u32(selectors, vdupq_n_u32(2)), col, result);
+		result = vbslq_u32(vceqq_u32(selectors, vdupq_n_u32(3)), old, result);
+		vst1q_u32(reinterpret_cast<u32*>(dest), result);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
 #endif
 
 	u32 VitaVifApplyMode(vifStruct& vif, u32 lane, u32 mode, u32 data)
@@ -395,6 +435,9 @@ namespace
 			VitaVifStoreMaskedMode0WordsNeon(vif, regs, dest, x, y, z, w);
 			return;
 		}
+
+		VitaVifStoreMaskedModeWordsNeon(vif, regs, dest, mode, x, y, z, w);
+		return;
 #endif
 
 		u32* out = reinterpret_cast<u32*>(dest);
