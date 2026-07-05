@@ -297,6 +297,38 @@ namespace
 		++g_qemuVifNeonVectors;
 #endif
 	}
+
+	void VitaVifStoreMaskedMode0WordsNeon(const vifStruct& vif, const VIFregisters& regs, u8* dest, u32 x, u32 y, u32 z, u32 w)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::writeXYZW(). MODE 0 masked lanes select
+		// data, MaskRow, MaskCol, or write-protect without mutating MaskRow.
+		const u32 cl = vif.cl < 3 ? vif.cl : 3;
+		const u32 cycle_mask = (regs.mask >> (cl * 8)) & 0xffu;
+
+		uint32x4_t data = vdupq_n_u32(x);
+		data = vsetq_lane_u32(y, data, 1);
+		data = vsetq_lane_u32(z, data, 2);
+		data = vsetq_lane_u32(w, data, 3);
+
+		const int16x4_t shifts = {0, -2, -4, -6};
+		const uint16x4_t selectors16 = vand_u16(
+			vshl_u16(vdup_n_u16(static_cast<u16>(cycle_mask)), shifts),
+			vdup_n_u16(3));
+		const uint32x4_t selectors = vmovl_u16(selectors16);
+		uint32x4_t result = data;
+
+		const uint32x4_t row = vld1q_u32(vif.MaskRow._u32);
+		const uint32x4_t col = vdupq_n_u32(vif.MaskCol._u32[cl]);
+		const uint32x4_t old = vld1q_u32(reinterpret_cast<const u32*>(dest));
+
+		result = vbslq_u32(vceqq_u32(selectors, vdupq_n_u32(1)), row, result);
+		result = vbslq_u32(vceqq_u32(selectors, vdupq_n_u32(2)), col, result);
+		result = vbslq_u32(vceqq_u32(selectors, vdupq_n_u32(3)), old, result);
+		vst1q_u32(reinterpret_cast<u32*>(dest), result);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVifNeonVectors;
+#endif
+	}
 #endif
 
 	u32 VitaVifApplyMode(vifStruct& vif, u32 lane, u32 mode, u32 data)
@@ -324,6 +356,14 @@ namespace
 			VitaVifStoreWords(dest, x, y, z, w);
 			return;
 		}
+
+#if VITASX2_VIF_HAS_ARM_NEON
+		if (mode == 0)
+		{
+			VitaVifStoreMaskedMode0WordsNeon(vif, regs, dest, x, y, z, w);
+			return;
+		}
+#endif
 
 		u32* out = reinterpret_cast<u32*>(dest);
 		const u32 values[4] = {x, y, z, w};
