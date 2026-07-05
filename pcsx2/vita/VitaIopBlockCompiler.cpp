@@ -43,6 +43,9 @@ namespace
 	constexpr unsigned HOST_SAVED1 = 6;
 	constexpr unsigned HOST_BRANCH_FLAG = 7;
 	constexpr unsigned HOST_REGISTER_JUMP_TARGET = 8;
+	// r10 is also HOST_IOP_RAM_MASK; the cycle base is only allocated in
+	// non-trace blocks that do not reserve the direct IOP RAM fast-path pair.
+	constexpr unsigned HOST_CYCLE_BASE = 10;
 	constexpr unsigned HOST_IOP_RAM_MASK = 10;
 	constexpr unsigned HOST_IOP_RAM_BASE = 11;
 	constexpr unsigned HOST_CALL_SCRATCH = 12;
@@ -519,15 +522,27 @@ namespace VitaIOP
 		m_unaligned_write_cold_tails.clear();
 		m_cop2_load_cold_tails.clear();
 		m_cop2_store_cold_tails.clear();
+		// Trace blocks call out before every cycle increment; keep that validation
+		// path on the local address-add sequence and reserve r10 only for production blocks.
+		m_iop_cycle_base_register_available = !m_iop_ram_registers_available && !m_emit_trace_checks;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8;
 		if (m_iop_ram_registers_available)
 			m_saved_registers |= REG_R10 | REG_R11;
+		else if (m_iop_cycle_base_register_available)
+			m_saved_registers |= REG_R10;
 
-		return m_code.EmitPush(m_saved_registers | REG_LR) &&
-			   m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))) &&
-			   (!m_iop_ram_registers_available ||
-				   (m_code.EmitMovImm32(HOST_IOP_RAM_MASK, Ps2MemSize::ExposedIopRam - 1) &&
-					   m_code.EmitMovImm32(HOST_IOP_RAM_BASE, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main)))));
+		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
+			!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
+		{
+			return false;
+		}
+
+		if (m_iop_cycle_base_register_available)
+			return m_code.EmitAddImm32(HOST_CYCLE_BASE, HOST_PSX_REGS, static_cast<u32>(CYCLE_OFFSET));
+
+		return !m_iop_ram_registers_available ||
+			   (m_code.EmitMovImm32(HOST_IOP_RAM_MASK, Ps2MemSize::ExposedIopRam - 1) &&
+				   m_code.EmitMovImm32(HOST_IOP_RAM_BASE, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))));
 	}
 
 	bool BlockCompiler::EndBlockReturn(BlockExitKind exit)
@@ -595,6 +610,9 @@ namespace VitaIOP
 				   m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
 				   m_code.EmitStrdImm8(HOST_TMP0, HOST_TMP1, address_reg, 0);
 		};
+
+		if (m_iop_cycle_base_register_available)
+			return emit_increment_from_address(HOST_CYCLE_BASE);
 
 		if (CYCLE_OFFSET <= 0xff)
 			return emit_increment_from_address(HOST_PSX_REGS);
@@ -2473,6 +2491,7 @@ namespace VitaIOP
 				break;
 			}
 		}
+		m_emit_trace_checks = VitaIsIopPreInstructionTraceEnabled();
 
 		if (!BeginBlock())
 			return false;
@@ -2481,7 +2500,6 @@ namespace VitaIOP
 		direct_exit_branches.reserve(instruction_count * 2);
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
-		m_emit_trace_checks = VitaIsIopPreInstructionTraceEnabled();
 		bool can_direct_link_fallthrough = true;
 		bool has_native_static_branch = false;
 		bool has_native_static_jump = false;

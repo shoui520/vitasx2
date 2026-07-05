@@ -182,6 +182,7 @@ namespace VitaIOP
 		u32 m_helper_instruction_count = 0;
 		u16 m_saved_registers = 0;
 		bool m_iop_ram_registers_available = false;
+		bool m_iop_cycle_base_register_available = false;
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_jump = false;
