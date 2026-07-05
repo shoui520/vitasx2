@@ -9211,11 +9211,7 @@ namespace VitaEE
 		// PCSX2 owner: R5900OpcodeImpl.cpp::SLL()/SRL()/SRA(). Shifting
 		// register zero still writes signed-extended zero.
 		if (rt == 0)
-		{
-			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
-				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
-		}
+			return EmitStoreGprZero64(rd);
 
 		if (!EmitLoadGprLow(rt, HOST_TMP0))
 			return false;
@@ -9245,11 +9241,7 @@ namespace VitaEE
 		// PCSX2 owner: R5900OpcodeImpl.cpp::SLLV()/SRLV()/SRAV(). The shift
 		// amount is irrelevant when the source register is zero.
 		if (rt == 0)
-		{
-			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
-				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
-		}
+			return EmitStoreGprZero64(rd);
 
 		return EmitLoadGprLow(rt, HOST_TMP0) &&
 			   EmitLoadGprLow(rs, HOST_TMP2) &&
@@ -9266,6 +9258,11 @@ namespace VitaEE
 
 		if (rd == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::DSLL()/DSLL32(). Shifting
+		// register zero writes zero for every immediate amount.
+		if (rt == 0)
+			return EmitStoreGprZero64(rd);
 
 		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1))
 			return false;
@@ -9301,6 +9298,11 @@ namespace VitaEE
 
 		if (rd == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::DSRL()/DSRL32()/DSRA()/DSRA32().
+		// Shifting register zero writes zero for every immediate amount.
+		if (rt == 0)
+			return EmitStoreGprZero64(rd);
 
 		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1))
 			return false;
@@ -9342,6 +9344,11 @@ namespace VitaEE
 
 		if (rd == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::DSLLV(). The shift amount is
+		// irrelevant when the source register is zero.
+		if (rt == 0)
+			return EmitStoreGprZero64(rd);
 
 		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1) ||
 			!EmitLoadGprLow(rs, HOST_TMP2) ||
@@ -9400,6 +9407,11 @@ namespace VitaEE
 
 		if (rd == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::DSRLV()/DSRAV(). The shift amount
+		// is irrelevant when the source register is zero.
+		if (rt == 0)
+			return EmitStoreGprZero64(rd);
 
 		if (!EmitLoadGpr64(rt, HOST_TMP0, HOST_TMP1) ||
 			!EmitLoadGprLow(rs, HOST_TMP2) ||
@@ -10886,6 +10898,13 @@ namespace VitaEE
 			return false;
 
 		return m_code.PatchBranch(not_taken, m_code.Size(), VitaA32::Condition::EQ);
+	}
+
+	bool BlockCompiler::EmitStoreGprZero64(unsigned guest_reg)
+	{
+		return m_code.EmitMovImm8(HOST_TMP0, 0) &&
+			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high)

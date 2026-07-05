@@ -486,6 +486,7 @@ namespace VitaEE
 		bool EmitStorePcFromHostReg(unsigned host_reg);
 		bool EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc);
 		bool EmitStorePc(u32 pc);
+		bool EmitStoreGprZero64(unsigned guest_reg);
 		bool EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 
 		struct ScalarLoadColdTail
