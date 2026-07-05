@@ -525,10 +525,20 @@ namespace VitaEE
 		};
 		bool EmitQwordLoadColdTail(const QwordLoadColdTail& tail);
 
+		struct QwordStoreColdTail
+		{
+			size_t handler_fallback = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+			const void* write_helper = nullptr;
+			unsigned rt = 0;
+		};
+		bool EmitQwordStoreColdTail(const QwordStoreColdTail& tail);
+
 		VitaA32::CodeBuffer& m_code;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
 		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
 		std::vector<QwordLoadColdTail> m_qword_load_cold_tails;
+		std::vector<QwordStoreColdTail> m_qword_store_cold_tails;
 		u16 m_saved_registers = 0;
 		bool m_vtlb_registers_available = false;
 		};
