@@ -35,6 +35,7 @@
 #include <cstdio>
 #endif
 #include <string>
+#include <type_traits>
 
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 extern void vu0Sync();
@@ -70,7 +71,9 @@ namespace VitaEE
 		constexpr u16 REG_R6 = 1u << 6;
 		constexpr u16 REG_R7 = 1u << 7;
 		constexpr u16 REG_R8 = 1u << 8;
+		constexpr u16 REG_R9 = 1u << 9;
 		constexpr u16 REG_R10 = 1u << 10;
+		constexpr u16 REG_R11 = 1u << 11;
 		constexpr u16 REG_LR = 1u << 14;
 		constexpr u16 REG_PC = 1u << 15;
 
@@ -87,6 +90,7 @@ namespace VitaEE
 		constexpr unsigned HOST_VTLB_VMAP = 7;
 		constexpr unsigned HOST_VTLB_HOST_MEMORY_BASE = 8;
 		constexpr unsigned HOST_COP1_EXPONENT_MASK = 10;
+		constexpr unsigned HOST_VU0_BASE = 11;
 
 		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
 		constexpr size_t HI_OFFSET = offsetof(cpuRegisters, HI);
@@ -115,6 +119,11 @@ namespace VitaEE
 		constexpr size_t TLB_ENTRY_LO0_OFFSET = offsetof(tlbs, EntryLo0);
 		constexpr size_t TLB_ENTRY_LO1_OFFSET = offsetof(tlbs, EntryLo1);
 		constexpr size_t TLB_ENTRY_SIZE = sizeof(tlbs);
+		using Vu0State = std::remove_reference_t<decltype(VU0)>;
+		constexpr size_t VU0_VF_OFFSET = offsetof(Vu0State, VF);
+		constexpr size_t VU0_VI_OFFSET = offsetof(Vu0State, VI);
+		constexpr size_t VU0_VF_STRIDE = sizeof(VU0.VF[0]);
+		constexpr size_t VU0_VI_STRIDE = sizeof(VU0.VI[0]);
 		constexpr u32 TLB_PAGE_MASK_REGISTER_MASK = 0x01ffe000u;
 		constexpr u32 TLB_TLBR_ENTRY_LO0_MASK = 0x03fffffeu;
 		constexpr u32 TLB_TLBR_ENTRY_LO1_MASK = 0x83fffffeu;
@@ -738,6 +747,64 @@ namespace VitaEE
 
 			const unsigned fs = RD(op);
 			return fs != VU0_REG_FBRST && fs != VU0_REG_CMSAR1;
+		}
+
+		unsigned FastVu0AddressUses(u32 op)
+		{
+			if (IsCOP2BranchOpcode(op))
+				return 1;
+
+			if (IsFastCOP2VectorTransfer(op))
+			{
+				switch ((op >> 21) & 0x1f)
+				{
+					case 0x01: // QMFC2 reads VF when rt is writable.
+						return RT(op) != 0 ? 1 : 0;
+					case 0x05: // QMTC2 writes VF when fs is writable.
+						return RD(op) != 0 ? 1 : 0;
+					default:
+						return 0;
+				}
+			}
+
+			if (IsFastCOP2ControlRead(op))
+				return RT(op) != 0 ? 1 : 0;
+
+			if (IsFastCOP2ControlWrite(op))
+			{
+				switch (RD(op))
+				{
+					case 0:
+					case VU0_REG_MAC_FLAG:
+					case VU0_REG_TPC:
+					case VU0_REG_VPU_STAT:
+						return 0;
+					default:
+						return 1;
+				}
+			}
+
+			switch (op >> 26)
+			{
+				case 0x36: // LQC2 checks VU0 run state and may write VF.
+					return RT(op) != 0 ? 2 : 1;
+				case 0x3e: // SQC2 checks VU0 run state and reads VF.
+					return 2;
+				default:
+					return 0;
+			}
+		}
+
+		unsigned RegisterCount(u16 registers)
+		{
+			unsigned count = 0;
+			while (registers != 0)
+			{
+				count += registers & 1u;
+				registers >>= 1;
+			}
+
+			return count;
 		}
 
 		bool CanCompileMMI(u32 op)
@@ -1635,6 +1702,8 @@ namespace VitaEE
 	static_assert(TLB_ENTRY_HI_OFFSET == 4);
 	static_assert(TLB_ENTRY_LO0_OFFSET == 8);
 	static_assert(TLB_ENTRY_LO1_OFFSET == 12);
+	static_assert(VU0_VF_OFFSET == 0);
+	static_assert(VU0_VI_OFFSET + VU0_VI_STRIDE * 32 <= 0x0fff);
 
 	void RefreshRawGpr0KnownZero()
 	{
@@ -1938,7 +2007,21 @@ namespace VitaEE
 		return false;
 	}
 
-	bool BlockCompiler::BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register)
+	bool BlockShouldUseVu0BaseRegister(u32 start_pc, u32 instruction_count)
+	{
+		unsigned address_users = 0;
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			address_users += FastVu0AddressUses(memRead32(start_pc + i * 4));
+			if (address_users >= 3)
+				return true;
+		}
+
+		return false;
+	}
+
+	bool BlockCompiler::BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register,
+		bool use_vu0_base_register)
 	{
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
@@ -1949,11 +2032,17 @@ namespace VitaEE
 		m_partial_memory_cold_tails.clear();
 		m_vtlb_registers_available = use_vtlb_registers;
 		m_cop1_exponent_mask_available = use_cop1_exponent_mask_register;
+		m_vu0_base_available = use_vu0_base_register;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6;
 		if (use_vtlb_registers)
 			m_saved_registers |= REG_R7 | REG_R8;
 		if (use_cop1_exponent_mask_register)
 			m_saved_registers |= REG_R10;
+		if (use_vu0_base_register)
+			m_saved_registers |= REG_R11;
+		// Keep SP 8-byte aligned for AAPCS helper calls after any resident-register choice.
+		if ((RegisterCount(m_saved_registers | REG_LR) & 1u) != 0)
+			m_saved_registers |= REG_R9;
 
 		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
 			!m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))))
@@ -1963,6 +2052,12 @@ namespace VitaEE
 
 		if (use_cop1_exponent_mask_register &&
 			!m_code.EmitMovImm32(HOST_COP1_EXPONENT_MASK, FPU_FLOAT_EXPONENT_MASK))
+		{
+			return false;
+		}
+
+		if (use_vu0_base_register &&
+			!m_code.EmitMovImm32(HOST_VU0_BASE, static_cast<u32>(reinterpret_cast<uptr>(&VU0))))
 		{
 			return false;
 		}
@@ -1989,7 +2084,8 @@ namespace VitaEE
 			*direct_links = {};
 
 		if (!BeginBlock(BlockMayUseVtlbFastPath(start_pc, instruction_count),
-				BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count)))
+				BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count),
+				BlockShouldUseVu0BaseRegister(start_pc, instruction_count)))
 			return false;
 		if (!EmitGoemonBlockStartHook(start_pc))
 			return false;
@@ -9689,9 +9785,8 @@ namespace VitaEE
 		// tests the same bit through VU0.VI[REG_VPU_STAT].UL & 0x100.
 		const unsigned rt = RT(op);
 		const bool branch_on_true = rt == 0x01 || rt == 0x03;
-		const u32 vpu_stat_addr = static_cast<u32>(reinterpret_cast<uptr>(&VU0.VI[REG_VPU_STAT].UL));
 
-		return m_code.EmitMovImm32(HOST_TMP0, vpu_stat_addr) &&
+		return EmitVu0ViAddress(HOST_TMP0, VU0_REG_VPU_STAT) &&
 			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
 			   m_code.EmitTstImm32(HOST_TMP1, 0x100u) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
@@ -10839,16 +10934,36 @@ namespace VitaEE
 		return m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ);
 	}
 
+	bool BlockCompiler::EmitVu0RegisterAddress(unsigned host_reg, size_t offset)
+	{
+		// PCSX2 owners: VU0.cpp and VU.h keep VU0 VF/VI state in one singleton.
+		// Repeated COP2/VU0 memory blocks can address it from a resident base.
+		if (m_vu0_base_available)
+		{
+			if (offset == 0)
+			{
+				if (host_reg == HOST_VU0_BASE)
+					return true;
+
+				return m_code.EmitMovRegShiftImm(host_reg, HOST_VU0_BASE, VitaA32::ShiftType::LSL, 0);
+			}
+
+			if (m_code.EmitAddImm32(host_reg, HOST_VU0_BASE, static_cast<u32>(offset)))
+				return true;
+		}
+
+		return m_code.EmitMovImm32(host_reg,
+			static_cast<u32>(reinterpret_cast<uptr>(&VU0)) + static_cast<u32>(offset));
+	}
+
 	bool BlockCompiler::EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg)
 	{
-		return m_code.EmitMovImm32(host_reg,
-			static_cast<u32>(reinterpret_cast<uptr>(&VU0.VF[vf_reg])));
+		return EmitVu0RegisterAddress(host_reg, VU0_VF_OFFSET + vf_reg * VU0_VF_STRIDE);
 	}
 
 	bool BlockCompiler::EmitVu0ViAddress(unsigned host_reg, unsigned vi_reg)
 	{
-		return m_code.EmitMovImm32(host_reg,
-			static_cast<u32>(reinterpret_cast<uptr>(&VU0.VI[vi_reg])));
+		return EmitVu0RegisterAddress(host_reg, VU0_VI_OFFSET + vi_reg * VU0_VI_STRIDE);
 	}
 
 	bool BlockCompiler::EmitAlignQwordAddress(unsigned host_reg, unsigned)

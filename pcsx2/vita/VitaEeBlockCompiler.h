@@ -154,7 +154,8 @@ namespace VitaEE
 		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
 
-		bool BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register);
+		bool BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register,
+			bool use_vu0_base_register);
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
@@ -477,6 +478,7 @@ namespace VitaEE
 		bool EmitLoadRawGpr0KnownZeroFlag(unsigned host_reg);
 		bool EmitRefreshRawGpr0KnownZeroFromLow64(unsigned low_reg, unsigned high_reg);
 		bool EmitVu0SyncIfRunning();
+		bool EmitVu0RegisterAddress(unsigned host_reg, size_t offset);
 		bool EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg);
 		bool EmitVu0ViAddress(unsigned host_reg, unsigned vi_reg);
 		bool EmitAlignQwordAddress(unsigned host_reg, unsigned scratch_reg);
@@ -584,5 +586,6 @@ namespace VitaEE
 		u16 m_saved_registers = 0;
 		bool m_vtlb_registers_available = false;
 		bool m_cop1_exponent_mask_available = false;
+		bool m_vu0_base_available = false;
 		};
 	} // namespace VitaEE
