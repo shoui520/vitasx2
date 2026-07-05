@@ -10110,9 +10110,10 @@ namespace VitaEE
 		// PCSX2 owners: R5900OpcodeImpl.cpp::LB()/LBU()/LH()/LHU()/LW()
 		// check (addr & 0xffffe000) == 0x10000000 after the load to force
 		// an EE counter-read event test.
-		return m_code.EmitMovImm32(HOST_TMP2, 0xffffe000u) &&
-			   m_code.EmitAndReg(HOST_TMP2, host_reg, HOST_TMP2) &&
-			   m_code.EmitCmpImm32(HOST_TMP2, 0x10000000u) &&
+		constexpr u32 EE_COUNTER_PAGE_SHIFT = 13;
+		constexpr u32 EE_COUNTER_PAGE_TAG = 0x10000000u >> EE_COUNTER_PAGE_SHIFT;
+		return m_code.EmitMovRegShiftImm(HOST_TMP2, host_reg, VitaA32::ShiftType::LSR, EE_COUNTER_PAGE_SHIFT) &&
+			   m_code.EmitCmpImm32(HOST_TMP2, EE_COUNTER_PAGE_TAG) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::EQ);
 	}
