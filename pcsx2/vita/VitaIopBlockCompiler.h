@@ -213,6 +213,7 @@ namespace VitaIOP
 		bool EnsureCodeCache();
 		void ReleaseCodeCache();
 		u8* AllocateCodeSlice(size_t capacity, size_t* slice_offset);
+		void CommitCodeSlice(size_t slice_offset, size_t code_size);
 		void RewindCodeCache(size_t slice_offset);
 		u32 ResetForCachePressure();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count);

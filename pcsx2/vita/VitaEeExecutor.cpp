@@ -665,6 +665,18 @@ namespace VitaEE
 			m_code_cache_used = slice_offset;
 	}
 
+	void BlockExecutor::CommitCodeSlice(size_t slice_offset, size_t code_size)
+	{
+		if (slice_offset > m_code_cache_used || code_size > m_code_cache_used - slice_offset)
+			return;
+
+		const size_t committed_size = AlignUp(code_size, CODE_CACHE_ALIGNMENT);
+		if (committed_size > m_code_cache_used - slice_offset)
+			return;
+
+		m_code_cache_used = slice_offset + committed_size;
+	}
+
 	u32 BlockExecutor::ResetForCachePressure()
 	{
 		const u32 previous_resets = m_code_cache_resets;
@@ -734,6 +746,7 @@ namespace VitaEE
 			if (compiled && block.code.Flush())
 			{
 				block_code_slice_offset = code_slice_offset;
+				CommitCodeSlice(code_slice_offset, block.code.Size());
 				compiled_scaled_cycles = attempt_scaled_cycles;
 				direct_links = attempt_direct_links;
 				break;
