@@ -462,6 +462,8 @@ namespace VitaEE
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
 		bool FlushColdTails();
 		bool EmitDeviceTracePreInstruction(u32 pc);
+		bool EmitLoadCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
+		bool EmitStoreCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
 		bool EmitAddScaledCyclesToCpu(u32 cycles);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitCpuRegsAddress(unsigned host_reg, size_t offset);

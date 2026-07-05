@@ -1606,6 +1606,7 @@ namespace VitaEE
 	static_assert(PERF_OFFSET + sizeof(PERFregs) <= 0x0fff);
 	static_assert(LAST_PERF_CYCLE_OFFSET + 2 * sizeof(u64) <= 0x0fff);
 	static_assert(CYCLE_OFFSET + sizeof(u64) <= 0x0fff);
+	static_assert((CYCLE_OFFSET % alignof(u64)) == 0);
 	static_assert(BRANCH_OFFSET + sizeof(int) <= 0x0fff);
 	static_assert(NEXT_EVENT_OFFSET + sizeof(u64) <= 0x0fff);
 	static_assert(LAST_COP0_CYCLE_OFFSET + sizeof(u64) <= 0x0fff);
@@ -2447,8 +2448,7 @@ namespace VitaEE
 		if (!direct_exit || !event_exit)
 			return false;
 
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))))
+		if (!EmitLoadCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2))
 		{
 			return false;
 		}
@@ -2471,8 +2471,7 @@ namespace VitaEE
 		// The signed-negative branch is the direct continuation/link path owned by
 		// x86/BaseblockEx.cpp::BaseBlocks::Link() once Vita block linking exists.
 		if (!m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) ||
-			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
-			!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
+			!EmitStoreCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2) ||
 			!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
 			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET + sizeof(u32))) ||
 			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true) ||
@@ -2558,8 +2557,7 @@ namespace VitaEE
 		if (!direct_exit || !event_exit)
 			return false;
 
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
+		if (!EmitLoadCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2) ||
 			!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 		{
 			return false;
@@ -2585,8 +2583,7 @@ namespace VitaEE
 			}
 
 			return m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
-				   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) &&
-				   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32)));
+				   EmitStoreCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2);
 		};
 
 		if (!add_cycles(not_taken_cycles))
@@ -2873,8 +2870,7 @@ namespace VitaEE
 		if (scaled_cycles_through_instruction == 0)
 			return false;
 
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))))
+		if (!EmitLoadCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2))
 		{
 			return false;
 		}
@@ -2894,8 +2890,7 @@ namespace VitaEE
 		}
 
 		if (!m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) ||
-			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
-			!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
+			!EmitStoreCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2) ||
 			!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(LAST_COP0_CYCLE_OFFSET)) ||
 			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2) ||
 			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(9))) ||
@@ -10610,13 +10605,42 @@ namespace VitaEE
 #endif
 	}
 
+	bool BlockCompiler::EmitLoadCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high,
+		unsigned address_scratch)
+	{
+		if (CanUseA32DualTransferPair(host_low, host_high))
+		{
+			if (offset <= 0xff)
+				return m_code.EmitLdrdImm8(host_low, host_high, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			if (EmitCpuRegsAddress(address_scratch, offset))
+				return m_code.EmitLdrdImm8(host_low, host_high, address_scratch, 0);
+		}
+
+		return m_code.EmitLdrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+			   m_code.EmitLdrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+	}
+
+	bool BlockCompiler::EmitStoreCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high,
+		unsigned address_scratch)
+	{
+		if (CanUseA32DualTransferPair(host_low, host_high))
+		{
+			if (offset <= 0xff)
+				return m_code.EmitStrdImm8(host_low, host_high, HOST_CPU_REGS, static_cast<u8>(offset));
+
+			if (EmitCpuRegsAddress(address_scratch, offset))
+				return m_code.EmitStrdImm8(host_low, host_high, address_scratch, 0);
+		}
+
+		return m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+			   m_code.EmitStrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+	}
+
 	bool BlockCompiler::EmitAddScaledCyclesToCpu(u32 cycles)
 	{
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))))
-		{
+		if (!EmitLoadCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2))
 			return false;
-		}
 
 		if (cycles <= 255)
 		{
@@ -10633,8 +10657,7 @@ namespace VitaEE
 		}
 
 		return m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
-			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) &&
-			   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32)));
+			   EmitStoreCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2);
 	}
 
 	bool BlockCompiler::EmitEffectiveAddress(u32 op, unsigned host_reg)
