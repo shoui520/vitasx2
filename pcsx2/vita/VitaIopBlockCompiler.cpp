@@ -978,21 +978,43 @@ namespace VitaIOP
 		{
 			case 0x08: // ADDI
 			case 0x09: // ADDIU
-				return m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(static_cast<s32>(IMM_S(op)))) &&
+			{
+				// PCSX2 owner: x86/iR3000Atables.cpp::rpsxADDI() reuses rpsxADDIU().
+				const s32 imm = static_cast<s32>(IMM_S(op));
+				if (imm == 0)
+					return EmitStoreGpr(rt, HOST_TMP0);
+				if (imm > 0 && m_code.EmitAddImm32(HOST_TMP2, HOST_TMP0, static_cast<u32>(imm)))
+					return EmitStoreGpr(rt, HOST_TMP2);
+				if (imm < 0 && m_code.EmitSubImm32(HOST_TMP2, HOST_TMP0, static_cast<u32>(-imm)))
+					return EmitStoreGpr(rt, HOST_TMP2);
+				return m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(imm)) &&
 					   m_code.EmitAddReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) &&
 					   EmitStoreGpr(rt, HOST_TMP2);
+			}
 			case 0x0a: // SLTI
-				return m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(static_cast<s32>(IMM_S(op)))) &&
-					   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) &&
-					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+			{
+				const u32 imm = static_cast<u32>(static_cast<s32>(IMM_S(op)));
+				if (!(m_code.EmitCmpImm32(HOST_TMP0, imm) ||
+					  (m_code.EmitMovImm32(HOST_TMP1, imm) && m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))))
+				{
+					return false;
+				}
+				return m_code.EmitMovImm8(HOST_TMP2, 0) &&
 					   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT) &&
 					   EmitStoreGpr(rt, HOST_TMP2);
+			}
 			case 0x0b: // SLTIU
-				return m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(static_cast<s32>(IMM_S(op)))) &&
-					   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) &&
-					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+			{
+				const u32 imm = static_cast<u32>(static_cast<s32>(IMM_S(op)));
+				if (!(m_code.EmitCmpImm32(HOST_TMP0, imm) ||
+					  (m_code.EmitMovImm32(HOST_TMP1, imm) && m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))))
+				{
+					return false;
+				}
+				return m_code.EmitMovImm8(HOST_TMP2, 0) &&
 					   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::CC) &&
 					   EmitStoreGpr(rt, HOST_TMP2);
+			}
 			case 0x0c: // ANDI
 				return (m_code.EmitAndImm32(HOST_TMP2, HOST_TMP0, IMM_U(op)) ||
 						  (m_code.EmitMovImm32(HOST_TMP1, IMM_U(op)) &&

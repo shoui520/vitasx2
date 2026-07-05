@@ -4866,17 +4866,9 @@ namespace VitaEE
 		if (!EmitLoadGprLow(rs, HOST_TMP0))
 			return false;
 
-		if (imm >= 0 && imm <= 255)
-		{
-			if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(imm)))
-				return false;
-		}
-		else if (imm < 0 && imm >= -255)
-		{
-			if (!m_code.EmitSubImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(-imm)))
-				return false;
-		}
-		else
+		const bool encoded_imm = (imm >= 0 && m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(imm))) ||
+								 (imm < 0 && m_code.EmitSubImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(-imm)));
+		if (!encoded_imm)
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) ||
 				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
