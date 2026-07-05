@@ -1605,11 +1605,14 @@ namespace VitaEE
 	static_assert(CODE_OFFSET + sizeof(u32) <= 0x0fff);
 	static_assert(PERF_OFFSET + sizeof(PERFregs) <= 0x0fff);
 	static_assert(LAST_PERF_CYCLE_OFFSET + 2 * sizeof(u64) <= 0x0fff);
+	static_assert((LAST_PERF_CYCLE_OFFSET % alignof(u64)) == 0);
 	static_assert(CYCLE_OFFSET + sizeof(u64) <= 0x0fff);
 	static_assert((CYCLE_OFFSET % alignof(u64)) == 0);
 	static_assert(BRANCH_OFFSET + sizeof(int) <= 0x0fff);
 	static_assert(NEXT_EVENT_OFFSET + sizeof(u64) <= 0x0fff);
+	static_assert((NEXT_EVENT_OFFSET % alignof(u64)) == 0);
 	static_assert(LAST_COP0_CYCLE_OFFSET + sizeof(u64) <= 0x0fff);
+	static_assert((LAST_COP0_CYCLE_OFFSET % alignof(u64)) == 0);
 	static_assert(TLB_ENTRY_COUNT == 48);
 	static_assert(sizeof(vtlb_private::VTLBVirtual) == sizeof(u32));
 	static_assert(TLB_ENTRY_SIZE == 16);
@@ -2472,8 +2475,7 @@ namespace VitaEE
 		// x86/BaseblockEx.cpp::BaseBlocks::Link() once Vita block linking exists.
 		if (!m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) ||
 			!EmitStoreCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2) ||
-			!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
-			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET + sizeof(u32))) ||
+			!EmitLoadCpuRegsU64(NEXT_EVENT_OFFSET, HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
 			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true) ||
 			!m_code.EmitSbcReg(HOST_TMP3, HOST_TMP1, HOST_TMP3, true))
 		{
@@ -2604,8 +2606,7 @@ namespace VitaEE
 		if (!m_code.PatchBranch(cycles_done, cycles_done_target))
 			return false;
 
-		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
-			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET + sizeof(u32))) ||
+		if (!EmitLoadCpuRegsU64(NEXT_EVENT_OFFSET, HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
 			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true) ||
 			!m_code.EmitSbcReg(HOST_TMP3, HOST_TMP1, HOST_TMP3, true))
 		{
@@ -2896,8 +2897,7 @@ namespace VitaEE
 			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(9))) ||
 			!m_code.EmitAddReg(HOST_TMP3, HOST_TMP3, HOST_TMP2) ||
 			!m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(9))) ||
-			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(LAST_COP0_CYCLE_OFFSET)) ||
-			!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(LAST_COP0_CYCLE_OFFSET + sizeof(u32))))
+			!EmitStoreCpuRegsU64(LAST_COP0_CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP4))
 		{
 			return false;
 		}
@@ -2959,9 +2959,7 @@ namespace VitaEE
 					}
 
 					return m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(9))) &&
-						   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(LAST_COP0_CYCLE_OFFSET)) &&
-						   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS,
-							   static_cast<u16>(LAST_COP0_CYCLE_OFFSET + sizeof(u32)));
+						   EmitStoreCpuRegsU64(LAST_COP0_CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP4);
 				}
 				case 0x0c: // Status
 				{
@@ -3014,9 +3012,7 @@ namespace VitaEE
 						}
 
 						return m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(pcr_offset)) &&
-							   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(last_perf_offset)) &&
-							   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS,
-								   static_cast<u16>(last_perf_offset + sizeof(u32)));
+							   EmitStoreCpuRegsU64(last_perf_offset, HOST_TMP0, HOST_TMP1, HOST_TMP4);
 					}
 				default:
 					return load_rt_low(HOST_TMP0) &&
@@ -3043,8 +3039,7 @@ namespace VitaEE
 			if (keep_event == static_cast<size_t>(-1))
 				return false;
 
-			if (!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
-				!m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET + sizeof(u32))))
+			if (!EmitStoreCpuRegsU64(NEXT_EVENT_OFFSET, HOST_TMP2, HOST_TMP3, HOST_TMP4))
 			{
 				return false;
 			}
