@@ -3700,9 +3700,8 @@ namespace VitaEE
 		constexpr unsigned VFP_FD_S2 = 2;
 
 		const auto normalize_arithmetic_word = [&](unsigned reg) {
-			if (!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP3, reg, HOST_TMP2) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP2))
+			if (!m_code.EmitAndReg(HOST_TMP3, reg, HOST_TMP5) ||
+				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP5))
 			{
 				return false;
 			}
@@ -3748,8 +3747,7 @@ namespace VitaEE
 			if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 1) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, 1) ||
-				!m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP5))
 			{
 				return false;
 			}
@@ -3775,8 +3773,7 @@ namespace VitaEE
 			if (!m_code.PatchBranch(no_overflow, no_overflow_target, VitaA32::Condition::NE) ||
 				!m_code.EmitMovImm32(HOST_TMP2, ~FPU_FCR31_OVERFLOW_FLAG) ||
 				!m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP5) ||
 				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
 				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
 			{
@@ -3828,6 +3825,7 @@ namespace VitaEE
 
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) ||
+			!m_code.EmitMovImm32(HOST_TMP5, FPU_FLOAT_EXPONENT_MASK) ||
 			!normalize_arithmetic_word(HOST_TMP0) ||
 			!normalize_arithmetic_word(HOST_TMP1) ||
 			!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
@@ -4250,9 +4248,8 @@ namespace VitaEE
 		};
 
 		const auto normalize_arithmetic_word = [&](unsigned reg) {
-			if (!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP3, reg, HOST_TMP2) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP2))
+			if (!m_code.EmitAndReg(HOST_TMP3, reg, HOST_TMP5) ||
+				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP5))
 			{
 				return false;
 			}
@@ -4298,8 +4295,7 @@ namespace VitaEE
 			if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 1) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, 1) ||
-				!m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP5))
 			{
 				return false;
 			}
@@ -4325,8 +4321,7 @@ namespace VitaEE
 			if (!m_code.PatchBranch(no_overflow, no_overflow_target, VitaA32::Condition::NE) ||
 				!m_code.EmitMovImm32(HOST_TMP2, ~FPU_FCR31_OVERFLOW_FLAG) ||
 				!m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP5) ||
 				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
 				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
 			{
@@ -4379,6 +4374,7 @@ namespace VitaEE
 		const auto load_normalized_operands = [&]() {
 			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) &&
 				   m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) &&
+				   m_code.EmitMovImm32(HOST_TMP5, FPU_FLOAT_EXPONENT_MASK) &&
 				   normalize_arithmetic_word(HOST_TMP0) &&
 				   normalize_arithmetic_word(HOST_TMP1) &&
 				   m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) &&
@@ -4560,9 +4556,8 @@ namespace VitaEE
 		};
 
 		const auto normalize_compare_word = [&](unsigned reg) {
-			if (!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP3, reg, HOST_TMP2) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP2))
+			if (!m_code.EmitAndReg(HOST_TMP3, reg, HOST_TMP5) ||
+				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP5))
 			{
 				return false;
 			}
@@ -4637,6 +4632,7 @@ namespace VitaEE
 
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) ||
+			!m_code.EmitMovImm32(HOST_TMP5, FPU_FLOAT_EXPONENT_MASK) ||
 			!normalize_compare_word(HOST_TMP0) ||
 			!normalize_compare_word(HOST_TMP1))
 		{
