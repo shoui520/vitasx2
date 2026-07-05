@@ -147,7 +147,6 @@ namespace VitaEE
 		constexpr u32 FPU_FLOAT_EXPONENT_MASK = 0x7f800000;
 		constexpr u32 FPU_FLOAT_FRACTION_MASK = 0x007fffff;
 		constexpr u32 FPU_FLOAT_IMPLICIT_MANTISSA = 0x00800000;
-		constexpr u32 FPU_FLOAT_MAX_FINITE = 0x7f7fffff;
 		constexpr u32 FPU_CVT_W_MAX_EXPONENT_MASK = 0x4e800000;
 		constexpr u32 FPU_FLOAT_EXPONENT_BIAS = 127;
 		constexpr u32 FPU_FLOAT_MANTISSA_BITS = 23;
@@ -3700,7 +3699,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitAndImm32OrReg(reg, reg, FPU_FLOAT_SIGN_MASK, HOST_TMP4) ||
-				!m_code.EmitMovImm32(HOST_TMP4, FPU_FLOAT_MAX_FINITE) ||
+				!m_code.EmitSubImm8(HOST_TMP4, HOST_TMP5, 1) ||
 				!m_code.EmitOrrReg(reg, reg, HOST_TMP4))
 			{
 				return false;
@@ -3745,7 +3744,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP2) ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_MAX_FINITE) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP5, 1) ||
 				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) ||
 				!m_code.EmitMovImm32(HOST_TMP2, FPU_FCR31_ARITHMETIC_OVERFLOW_FLAGS) ||
 				!m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP2))
@@ -3870,7 +3869,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitAndImm32OrReg(reg, reg, FPU_FLOAT_SIGN_MASK, HOST_TMP4) ||
-				!m_code.EmitMovImm32(HOST_TMP4, FPU_FLOAT_MAX_FINITE) ||
+				!m_code.EmitSubImm8(HOST_TMP4, HOST_TMP2, 1) ||
 				!m_code.EmitOrrReg(reg, reg, HOST_TMP4))
 			{
 				return false;
@@ -3924,7 +3923,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP2) ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_MAX_FINITE) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP3, 1) ||
 				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
 			{
 				return false;
@@ -4008,10 +4007,10 @@ namespace VitaEE
 			const size_t flags_ready_target = m_code.Size();
 			return m_code.PatchBranch(flags_ready, flags_ready_target) &&
 				   m_code.EmitOrrReg(HOST_TMP5, HOST_TMP5, HOST_TMP4) &&
+				   m_code.EmitSubImm8(HOST_TMP3, HOST_TMP2, 1) &&
 				   m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
 				   EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP2) &&
-				   m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_MAX_FINITE) &&
-				   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
+				   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP3) &&
 				   store_result(true);
 		};
 
@@ -4137,11 +4136,11 @@ namespace VitaEE
 			if (operand_nonzero == static_cast<size_t>(-1))
 				return false;
 
-			if (!m_code.EmitMovImm32(HOST_TMP2, FPU_FCR31_DIVIDE_BY_ZERO_FLAGS) ||
-				!m_code.EmitOrrReg(HOST_TMP5, HOST_TMP5, HOST_TMP2) ||
+			if (!m_code.EmitMovImm32(HOST_TMP4, FPU_FCR31_DIVIDE_BY_ZERO_FLAGS) ||
+				!m_code.EmitOrrReg(HOST_TMP5, HOST_TMP5, HOST_TMP4) ||
+				!m_code.EmitSubImm8(HOST_TMP4, HOST_TMP2, 1) ||
 				!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP2) ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_MAX_FINITE) ||
-				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) ||
+				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP4) ||
 				!store_result(true))
 			{
 				return false;
@@ -4243,7 +4242,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitAndImm32OrReg(reg, reg, FPU_FLOAT_SIGN_MASK, HOST_TMP4) ||
-				!m_code.EmitMovImm32(HOST_TMP4, FPU_FLOAT_MAX_FINITE) ||
+				!m_code.EmitSubImm8(HOST_TMP4, HOST_TMP5, 1) ||
 				!m_code.EmitOrrReg(reg, reg, HOST_TMP4))
 			{
 				return false;
@@ -4288,7 +4287,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP2) ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_MAX_FINITE) ||
+				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP5, 1) ||
 				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) ||
 				!m_code.EmitMovImm32(HOST_TMP2, FPU_FCR31_ARITHMETIC_OVERFLOW_FLAGS) ||
 				!m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP2))
@@ -4547,7 +4546,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitAndImm32OrReg(reg, reg, FPU_FLOAT_SIGN_MASK, HOST_TMP4) ||
-				!m_code.EmitMovImm32(HOST_TMP4, FPU_FLOAT_MAX_FINITE) ||
+				!m_code.EmitSubImm8(HOST_TMP4, HOST_TMP5, 1) ||
 				!m_code.EmitOrrReg(reg, reg, HOST_TMP4))
 			{
 				return false;
