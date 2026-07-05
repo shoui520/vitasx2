@@ -5495,8 +5495,7 @@ namespace VitaEE
 			if (no_overflow == static_cast<size_t>(-1))
 				return false;
 
-			if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3))
+			if (!m_code.EmitCmpImm32(HOST_TMP1, 0))
 			{
 				return false;
 			}
@@ -6167,10 +6166,9 @@ namespace VitaEE
 		const auto emit_signed_fast_guard = [&](unsigned dividend_reg, unsigned divisor_reg) {
 			BranchPatch ok_branches[6]{};
 			unsigned ok_branch_count = 0;
-			if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(divisor_reg, HOST_TMP4) ||
+			if (!m_code.EmitCmpImm32(divisor_reg, 0) ||
 				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
-				!m_code.EmitCmpReg(dividend_reg, HOST_TMP4) ||
+				!m_code.EmitCmpImm32(dividend_reg, 0) ||
 				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
 				!m_code.EmitMovImm8(HOST_TMP4, 1) ||
 				!m_code.EmitCmpReg(divisor_reg, HOST_TMP4) ||
@@ -6197,10 +6195,9 @@ namespace VitaEE
 		const auto emit_unsigned_fast_guard = [&](unsigned dividend_reg, unsigned divisor_reg) {
 			BranchPatch ok_branches[5]{};
 			unsigned ok_branch_count = 0;
-			if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-				!m_code.EmitCmpReg(divisor_reg, HOST_TMP4) ||
+			if (!m_code.EmitCmpImm32(divisor_reg, 0) ||
 				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
-				!m_code.EmitCmpReg(dividend_reg, HOST_TMP4) ||
+				!m_code.EmitCmpImm32(dividend_reg, 0) ||
 				!emit_branch(ok_branches[ok_branch_count++], VitaA32::Condition::EQ) ||
 				!m_code.EmitMovImm8(HOST_TMP4, 1) ||
 				!m_code.EmitCmpReg(divisor_reg, HOST_TMP4) ||
@@ -6231,10 +6228,9 @@ namespace VitaEE
 
 			if (!load_word(rs, source_word, HOST_TMP0) ||
 				!load_word(rt, source_word, HOST_TMP1) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
 				!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
-				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
 				!emit_branch(zero_branch, VitaA32::Condition::EQ) ||
 				!m_code.EmitMovImm8(HOST_TMP3, 1) ||
 				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
@@ -6313,8 +6309,7 @@ namespace VitaEE
 
 			if (!patch_branch(divzero_branch, m_code.Size()) ||
 				!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
 				!m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT) ||
 				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
 				!store_signed_word_as_doubleword(HOST_TMP0, hi_offset))
@@ -6338,10 +6333,9 @@ namespace VitaEE
 
 			if (!load_word(rs, source_word, HOST_TMP0) ||
 				!load_word(rt, source_word, HOST_TMP1) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
 				!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
-				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+				!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
 				!emit_branch(zero_branch, VitaA32::Condition::EQ) ||
 				!m_code.EmitMovImm8(HOST_TMP3, 1) ||
 				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
@@ -6514,8 +6508,7 @@ namespace VitaEE
 		const auto emit_divzero_lane = [&](unsigned lane) {
 			return load_word(rs, lane, HOST_TMP0) &&
 				   m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) &&
-				   m_code.EmitMovImm8(HOST_TMP3, 0) &&
-				   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) &&
+				   m_code.EmitCmpImm32(HOST_TMP0, 0) &&
 				   m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT) &&
 				   m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS,
 					   static_cast<u16>(LO_OFFSET + lane * sizeof(u32))) &&
@@ -6550,8 +6543,7 @@ namespace VitaEE
 		unsigned done_branch_count = 0;
 
 		if (!load_divisor() ||
-			!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP4) ||
+			!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
 			!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
 			!m_code.EmitMovImm8(HOST_TMP4, 1) ||
 			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP4) ||
@@ -6625,8 +6617,7 @@ namespace VitaEE
 		};
 
 		const auto emit_divide_signed_64_by_u32_max = [this]() {
-			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP0))
+			if (!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
 			}
@@ -6681,8 +6672,7 @@ namespace VitaEE
 		const auto emit_pmaddw_lower_quirk = [this, rs, load_word]() {
 			if (!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::LSL, 1) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, 1) ||
-				!m_code.EmitMovImm8(HOST_TMP0, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP0))
+				!m_code.EmitCmpImm32(HOST_TMP2, 0))
 			{
 				return false;
 			}
@@ -9314,8 +9304,7 @@ namespace VitaEE
 		if (ge32_branch == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+		if (!m_code.EmitCmpImm32(HOST_TMP2, 0))
 		{
 			return false;
 		}
@@ -9375,8 +9364,7 @@ namespace VitaEE
 		if (ge32_branch == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+		if (!m_code.EmitCmpImm32(HOST_TMP2, 0))
 		{
 			return false;
 		}
@@ -9739,8 +9727,7 @@ namespace VitaEE
 						VitaA32::ShiftType::LSL, HOST_TMP4) ||
 					!m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP1, HOST_TMP0,
 						VitaA32::ShiftType::LSR, HOST_TMP3) ||
-					!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-					!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4) ||
+					!m_code.EmitCmpImm32(HOST_TMP3, 0) ||
 					!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::ASR, 31, false,
 						VitaA32::Condition::EQ) ||
 					!EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP2))
