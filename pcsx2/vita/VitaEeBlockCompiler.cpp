@@ -10104,8 +10104,7 @@ namespace VitaEE
 			{
 				if (!EmitLoadGprLow(rt, HOST_TMP1) ||
 					!m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP3, 32) ||
-					!m_code.EmitMovImm8(HOST_TMP2, 0) ||
-					!m_code.EmitMvnReg(HOST_TMP2, HOST_TMP2) ||
+					!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) ||
 					!m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP2,
 						VitaA32::ShiftType::LSR, HOST_TMP4) ||
 					!m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP1, HOST_TMP0,
@@ -10121,8 +10120,7 @@ namespace VitaEE
 				if (!EmitLoadGprLow(rt, HOST_TMP1) ||
 					!EmitLoadGprHigh(rt, HOST_TMP2) ||
 					!m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP3, 32) ||
-					!m_code.EmitMovImm8(HOST_TMP5, 0) ||
-					!m_code.EmitMvnReg(HOST_TMP5, HOST_TMP5) ||
+					!m_code.EmitMovImm32(HOST_TMP5, 0xffffffffu) ||
 					!m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP5,
 						VitaA32::ShiftType::LSL, HOST_TMP4) ||
 					!m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP1, HOST_TMP0,
@@ -10173,8 +10171,7 @@ namespace VitaEE
 			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP5, 0) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) ||
 			!m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP3, 32) ||
-			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
-			!m_code.EmitMvnReg(HOST_TMP2, HOST_TMP2) ||
+			!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) ||
 			!(left ? m_code.EmitAndRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP2,
 						   VitaA32::ShiftType::LSL, HOST_TMP4) :
 						 m_code.EmitAndRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP2,
