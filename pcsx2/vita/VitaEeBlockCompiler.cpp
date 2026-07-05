@@ -3856,10 +3856,9 @@ namespace VitaEE
 		constexpr unsigned VFP_FT_S1 = 1;
 		constexpr unsigned VFP_FD_S2 = 2;
 
-		const auto normalize_arithmetic_word = [&](unsigned reg) {
-			if (!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP3, reg, HOST_TMP2) ||
-				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP2))
+		const auto normalize_arithmetic_word_with_mask = [&](unsigned reg, unsigned exponent_mask_reg) {
+			if (!m_code.EmitAndReg(HOST_TMP3, reg, exponent_mask_reg) ||
+				!m_code.EmitCmpReg(HOST_TMP3, exponent_mask_reg))
 			{
 				return false;
 			}
@@ -3869,7 +3868,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitAndImm32OrReg(reg, reg, FPU_FLOAT_SIGN_MASK, HOST_TMP4) ||
-				!m_code.EmitSubImm8(HOST_TMP4, HOST_TMP2, 1) ||
+				!m_code.EmitSubImm8(HOST_TMP4, exponent_mask_reg, 1) ||
 				!m_code.EmitOrrReg(reg, reg, HOST_TMP4))
 			{
 				return false;
@@ -3901,6 +3900,11 @@ namespace VitaEE
 				   m_code.PatchBranch(done_from_finite, done_target, VitaA32::Condition::NE);
 		};
 
+		const auto normalize_arithmetic_word = [&](unsigned reg) {
+			return m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) &&
+				   normalize_arithmetic_word_with_mask(reg, HOST_TMP2);
+		};
+
 		const auto store_result = [&](bool store_fcr31) {
 			if (store_fcr31 &&
 				!m_code.EmitStrImm12(HOST_TMP5, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))))
@@ -3910,10 +3914,9 @@ namespace VitaEE
 			return m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fd)));
 		};
 
-		const auto clamp_result_no_flags = [&](bool store_fcr31) {
+		const auto clamp_result_no_flags_with_mask = [&](bool store_fcr31, unsigned exponent_mask_reg) {
 			if (!m_code.EmitBicImm32(HOST_TMP2, HOST_TMP0, FPU_FLOAT_SIGN_MASK) ||
-				!m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3))
+				!m_code.EmitCmpReg(HOST_TMP2, exponent_mask_reg))
 			{
 				return false;
 			}
@@ -3923,7 +3926,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP2) ||
-				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP3, 1) ||
+				!m_code.EmitSubImm8(HOST_TMP2, exponent_mask_reg, 1) ||
 				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
 			{
 				return false;
@@ -3935,8 +3938,7 @@ namespace VitaEE
 
 			const size_t no_overflow_target = m_code.Size();
 			if (!m_code.PatchBranch(no_overflow, no_overflow_target, VitaA32::Condition::NE) ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, exponent_mask_reg) ||
 				!m_code.EmitMovImm8(HOST_TMP4, 0) ||
 				!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP4))
 			{
@@ -3969,6 +3971,11 @@ namespace VitaEE
 				   m_code.PatchBranch(no_underflow_from_exponent, store_target, VitaA32::Condition::NE) &&
 				   m_code.PatchBranch(no_underflow_from_fraction, store_target, VitaA32::Condition::EQ) &&
 				   store_result(store_fcr31);
+		};
+
+		const auto clamp_result_no_flags = [&](bool store_fcr31) {
+			return m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_EXPONENT_MASK) &&
+				   clamp_result_no_flags_with_mask(store_fcr31, HOST_TMP3);
 		};
 
 		const auto clear_invalid_divide_causes = [&]() {
@@ -4039,13 +4046,14 @@ namespace VitaEE
 
 			const size_t divisor_nonzero_target = m_code.Size();
 			if (!m_code.PatchBranch(divisor_nonzero, divisor_nonzero_target, VitaA32::Condition::NE) ||
-				!normalize_arithmetic_word(HOST_TMP0) ||
-				!normalize_arithmetic_word(HOST_TMP1) ||
+				!m_code.EmitMovImm32(HOST_TMP5, FPU_FLOAT_EXPONENT_MASK) ||
+				!normalize_arithmetic_word_with_mask(HOST_TMP0, HOST_TMP5) ||
+				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP5) ||
 				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
 				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1) ||
 				!m_code.EmitVdivF32(VFP_FD_S2, VFP_FS_S0, VFP_FT_S1) ||
 				!m_code.EmitVmovSToCore(HOST_TMP0, VFP_FD_S2) ||
-				!clamp_result_no_flags(false))
+				!clamp_result_no_flags_with_mask(false, HOST_TMP5))
 			{
 				return false;
 			}
