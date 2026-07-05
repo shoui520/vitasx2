@@ -832,6 +832,9 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg)
 	{
+		if (dst_guest_reg == src_guest_reg)
+			return true;
+
 		return EmitLoadGpr(src_guest_reg, HOST_TMP0) &&
 			   EmitStoreGpr(dst_guest_reg, HOST_TMP0);
 	}
@@ -1212,6 +1215,25 @@ namespace VitaIOP
 		if (opcode == 0x0f) // LUI
 		{
 			return m_code.EmitMovImm32(HOST_TMP0, op << 16) &&
+				   EmitStoreGpr(rt, HOST_TMP0);
+		}
+
+		if ((opcode == 0x08 || opcode == 0x09) && IMM_S(op) == 0)
+			return EmitMoveGpr(rt, rs);
+
+		// PCSX2 owner: x86/iR3000Atables.cpp::rpsxLogicalOpI(). Preserve the
+		// same zero/no-op folds before loading rs into a host register.
+		const u16 logical_imm = IMM_U(op);
+		if (opcode == 0x0c && (logical_imm == 0 || rs == 0)) // ANDI
+		{
+			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
+				   EmitStoreGpr(rt, HOST_TMP0);
+		}
+		if ((opcode == 0x0d || opcode == 0x0e) && logical_imm == 0) // ORI/XORI
+			return EmitMoveGpr(rt, rs);
+		if ((opcode == 0x0d || opcode == 0x0e) && rs == 0) // ORI/XORI
+		{
+			return m_code.EmitMovImm32(HOST_TMP0, logical_imm) &&
 				   EmitStoreGpr(rt, HOST_TMP0);
 		}
 
