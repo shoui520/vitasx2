@@ -438,8 +438,12 @@ public:
 
 	__forceinline int mask() const
 	{
-		static const int32_t shifts[] = {0, 1, 2, 3};
-		return static_cast<int>(vaddvq_u32(vshlq_u32(vshrq_n_u32(vreinterpretq_u32_f32(v4s), 31), vld1q_s32(shifts))));
+		const uint32x4_t sign_bits = vshrq_n_u32(vreinterpretq_u32_f32(v4s), 31);
+		return static_cast<int>(
+			vgetq_lane_u32(sign_bits, 0) |
+			(vgetq_lane_u32(sign_bits, 1) << 1) |
+			(vgetq_lane_u32(sign_bits, 2) << 2) |
+			(vgetq_lane_u32(sign_bits, 3) << 3));
 	}
 
 	__forceinline bool alltrue() const
