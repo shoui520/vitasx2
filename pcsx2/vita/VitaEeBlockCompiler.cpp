@@ -10042,16 +10042,18 @@ namespace VitaEE
 		bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask, bool counter_read_event)
 	{
 		const unsigned rt = RT(op);
-		const bool needs_counter_event = counter_read_event && rt != 0;
+		const unsigned address_reg = (width == ScalarLoadWidth::Dword) ? HOST_TMP2 : HOST_TMP0;
+		const unsigned vmap_reg = HOST_TMP1;
+		const unsigned scratch_reg = (width == ScalarLoadWidth::Dword) ? HOST_TMP0 : HOST_TMP2;
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
-		if (!EmitEffectiveAddress(op, HOST_TMP0))
+		if (!EmitEffectiveAddress(op, address_reg))
 			return false;
 
 		if (alignment_mask != 0)
 		{
-			if (!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, alignment_mask, true))
+			if (!m_code.EmitAndImm8(vmap_reg, address_reg, alignment_mask, true))
 				return false;
 
 			unaligned_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
@@ -10059,7 +10061,7 @@ namespace VitaEE
 				return false;
 		}
 
-		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
+		if (!EmitVtlbNonHandlerHostAddress(address_reg, vmap_reg, scratch_reg, &handler_fallback))
 			return false;
 
 		switch (width)
@@ -10082,8 +10084,10 @@ namespace VitaEE
 				break;
 
 			case ScalarLoadWidth::Dword:
-				if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, sizeof(u32)) ||
-					!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+				// PCSX2 owner: R5900OpcodeImpl.cpp::LD() via vtlb_memRead64().
+				// Keep the translated address out of r0/r1 so Cortex-A9 can use
+				// one LDRD instead of two dependent scalar loads.
+				if (!m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, address_reg, 0))
 				{
 					return false;
 				}
@@ -10139,6 +10143,7 @@ namespace VitaEE
 			sign_extend,
 			branch_delay_slot,
 			counter_read_event,
+			address_reg,
 		});
 		return true;
 	}
@@ -10281,13 +10286,16 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitScalarLoadColdTail(const ScalarLoadColdTail& tail)
 	{
-		// PCSX2 owner: vtlb.cpp::vtlb_memRead*() / R5900OpcodeImpl.cpp::LB/LBU/LH/LHU/LW/LWU().
+		// PCSX2 owner: vtlb.cpp::vtlb_memRead*() /
+		// R5900OpcodeImpl.cpp::LB/LBU/LH/LHU/LW/LWU/LD().
 		// Handler and unaligned pages stay on the helper/event path, but the hot
 		// non-handler VTLB path falls through to the next guest instruction.
 		if (tail.unaligned_fallback != static_cast<size_t>(-1))
 		{
 			const size_t address_error_target = m_code.Size();
 			if (!m_code.PatchBranch(tail.unaligned_fallback, address_error_target, VitaA32::Condition::NE) ||
+				(tail.address_reg != HOST_TMP0 &&
+					!m_code.EmitMovRegShiftImm(HOST_TMP0, tail.address_reg, VitaA32::ShiftType::LSL, 0)) ||
 				!EmitAddressErrorEventExit(tail.pc + 4, tail.raw_cycles_through_instruction, tail.event_exit, false))
 			{
 				return false;
@@ -10297,6 +10305,11 @@ namespace VitaEE
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
 			return false;
+		if (tail.address_reg != HOST_TMP0 &&
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, tail.address_reg, VitaA32::ShiftType::LSL, 0))
+		{
+			return false;
+		}
 
 		const bool needs_counter_event = tail.counter_read_event && tail.rt != 0;
 		const auto emit_sign_extend_low = [&]() -> bool {

@@ -502,6 +502,7 @@ namespace VitaEE
 			bool sign_extend = false;
 			bool branch_delay_slot = false;
 			bool counter_read_event = false;
+			unsigned address_reg = 0;
 		};
 
 		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);
