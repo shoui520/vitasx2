@@ -349,6 +349,20 @@ namespace
 		return function == 0x0c || function == 0x0d; // SYSCALL/BREAK
 	}
 
+	constexpr bool IsIopCop2CommandOpcode(u32 op)
+	{
+		return (op >> 26) == 0x12 && (op & 0x3f) != 0;
+	}
+
+	constexpr bool IopInstructionRequiresCodeState(u32 op)
+	{
+		// PCSX2 owner: x86/iR3000A.cpp only writes psxRegs.code for paths that
+		// enter opcode-driven helpers, notably rpsxSYSCALL()/rpsxBREAK() and
+		// COP2 GTE command calls. Native A32 templates decode other fields from
+		// the compile-time opcode and do not need the architectural code slot.
+		return IsIopExceptionOpcode(op) || IsIopCop2CommandOpcode(op);
+	}
+
 	constexpr bool IsIopStaticConditionalBranchOpcode(u32 op)
 	{
 		switch (op >> 26)
@@ -2419,7 +2433,7 @@ namespace VitaIOP
 	bool BlockCompiler::EmitInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches)
 	{
 		const u32 next_pc = pc + 4;
-		if (!EmitStoreCode(op) ||
+		if (((m_emit_trace_checks || IopInstructionRequiresCodeState(op)) && !EmitStoreCode(op)) ||
 			(m_emit_trace_checks && !EmitTraceCheck(pc, op, direct_exit_branches)) ||
 			!EmitStorePc(next_pc) ||
 			!EmitIncrementCycle())
