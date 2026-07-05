@@ -366,6 +366,47 @@ namespace
 		return IsIopExceptionOpcode(op) || IsIopCop2CommandOpcode(op);
 	}
 
+	constexpr bool IopInstructionRequiresPcState(u32 op)
+	{
+		// PCSX2 owner: x86/iR3000A.cpp keeps psxpc as compile-time state and
+		// stores psxRegs.pc around helper/exit paths. Vita keeps the same rule
+		// conservatively for branches, exceptions, event tests, and memory
+		// operations that can reach helper-backed cold tails.
+		switch (op >> 26)
+		{
+			case 0x00: // SPECIAL
+				return (op & 0x3f) == 0x08 || (op & 0x3f) == 0x09 || // JR/JALR
+					   (op & 0x3f) == 0x0c || (op & 0x3f) == 0x0d; // SYSCALL/BREAK
+			case 0x01: // REGIMM
+			case 0x02: // J
+			case 0x03: // JAL
+			case 0x04: // BEQ
+			case 0x05: // BNE
+			case 0x06: // BLEZ
+			case 0x07: // BGTZ
+				return true;
+			case 0x10: // COP0
+				return RS(op) == 0x10; // RFE calls iopTestIntc().
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x22: // LWL
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+			case 0x26: // LWR
+			case 0x28: // SB
+			case 0x29: // SH
+			case 0x2a: // SWL
+			case 0x2b: // SW
+			case 0x2e: // SWR
+			case 0x32: // LWC2
+			case 0x3a: // SWC2
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	constexpr bool IsIopStaticConditionalBranchOpcode(u32 op)
 	{
 		switch (op >> 26)
@@ -2448,12 +2489,12 @@ namespace VitaIOP
 		}
 	}
 
-	bool BlockCompiler::EmitInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches)
+	bool BlockCompiler::EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& direct_exit_branches)
 	{
 		const u32 next_pc = pc + 4;
 		if (((m_emit_trace_checks || IopInstructionRequiresCodeState(op)) && !EmitStoreCode(op)) ||
 			(m_emit_trace_checks && !EmitTraceCheck(pc, op, direct_exit_branches)) ||
-			!EmitStorePc(next_pc) ||
+			(store_pc && !EmitStorePc(next_pc)) ||
 			!EmitIncrementCycle())
 		{
 			return false;
@@ -2546,7 +2587,9 @@ namespace VitaIOP
 				has_native_register_jump = true;
 			if (IsIopBranchOrJumpOpcode(op) || IsIopExceptionOpcode(op))
 				can_direct_link_fallthrough = false;
-			const bool emitted = CanCompileOpcode(op) && EmitInstruction(op, pc, direct_exit_branches);
+			const bool store_pc =
+				m_emit_trace_checks || (i + 1 == instruction_count) || IopInstructionRequiresPcState(op);
+			const bool emitted = CanCompileOpcode(op) && EmitInstruction(op, pc, store_pc, direct_exit_branches);
 			m_emit_native_static_branch = false;
 			m_emit_native_static_jump = false;
 			m_emit_native_register_jump = false;

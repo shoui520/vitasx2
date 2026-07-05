@@ -71,7 +71,7 @@ namespace VitaIOP
 		bool BeginBlock();
 		bool EndBlockReturn(BlockExitKind exit);
 		bool EndBlockDirectTail(const void* direct_exit, size_t* direct_link_target_offset);
-		bool EmitInstruction(u32 op, u32 pc, std::vector<size_t>& direct_exit_branches);
+		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op, u32 pc);
 		bool EmitNativeCOP0(u32 op);
