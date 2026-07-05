@@ -807,13 +807,11 @@ namespace VitaIOP
 		BranchPatch done_branches[7]{};
 		unsigned done_branch_count = 0;
 
-		if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+		if (!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
 			!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
-			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
 			!emit_branch(zero_branch, VitaA32::Condition::EQ) ||
-			!m_code.EmitMovImm8(HOST_TMP3, 1) ||
-			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+			!m_code.EmitCmpImm32(HOST_TMP1, 1) ||
 			!emit_branch(divone_branch, VitaA32::Condition::EQ))
 		{
 			return false;
@@ -821,13 +819,11 @@ namespace VitaIOP
 
 		if (is_signed)
 		{
-			if (!m_code.EmitMovImm32(HOST_TMP3, 0xffffffffu) ||
-				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+			if (!m_code.EmitCmpImm32(HOST_TMP1, 0xffffffffu) ||
 				!emit_branch(negone_branch, VitaA32::Condition::EQ) ||
 				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) ||
 				!emit_branch(equal_branch, VitaA32::Condition::EQ) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3) ||
+				!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
 				!emit_branch(non_positive_fallback_branch, VitaA32::Condition::LE) ||
 				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
 				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP1, HOST_TMP2, true) ||
@@ -860,8 +856,7 @@ namespace VitaIOP
 		}
 
 		if (is_signed &&
-			(!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP3) ||
+			(!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
 				!m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT)))
 		{
 			return false;
