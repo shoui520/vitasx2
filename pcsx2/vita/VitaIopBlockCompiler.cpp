@@ -1346,6 +1346,22 @@ namespace VitaIOP
 			return m_code.EmitMovImm32(HOST_TMP0, logical_imm) &&
 				   EmitStoreGpr(rt, HOST_TMP0);
 		}
+		if (opcode == 0x0a && rs == 0) // SLTI
+		{
+			// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLTI(). With the
+			// architectural zero register, the signed predicate is constant.
+			const u8 result = (IMM_S(op) > 0) ? 1 : 0;
+			return m_code.EmitMovImm8(HOST_TMP0, result) &&
+				   EmitStoreGpr(rt, HOST_TMP0);
+		}
+		if (opcode == 0x0b && rs == 0) // SLTIU
+		{
+			// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLTIU(). The immediate is
+			// sign-extended before the unsigned compare, so 0 < imm iff imm != 0.
+			const u8 result = (IMM_S(op) != 0) ? 1 : 0;
+			return m_code.EmitMovImm8(HOST_TMP0, result) &&
+				   EmitStoreGpr(rt, HOST_TMP0);
+		}
 
 		if (!EmitLoadGpr(rs, HOST_TMP0))
 			return false;
