@@ -89,6 +89,7 @@ namespace VitaA32
 		bool EmitMvnReg(unsigned rd, unsigned rm, bool set_flags = false);
 		bool EmitClz(unsigned rd, unsigned rm);
 		bool EmitSsat(unsigned rd, u8 bits, unsigned rm);
+		bool EmitSxtb(unsigned rd, unsigned rm);
 		bool EmitSxth(unsigned rd, unsigned rm);
 		bool EmitUxth(unsigned rd, unsigned rm);
 		bool EmitSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
@@ -213,6 +214,7 @@ namespace VitaA32
 	u32 EncodeMvnReg(unsigned rd, unsigned rm, bool set_flags = false);
 	u32 EncodeClz(unsigned rd, unsigned rm);
 	u32 EncodeSsat(unsigned rd, u8 bits, unsigned rm);
+	u32 EncodeSxtb(unsigned rd, unsigned rm);
 	u32 EncodeSxth(unsigned rd, unsigned rm);
 	u32 EncodeUxth(unsigned rd, unsigned rm);
 	u32 EncodeSubReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);

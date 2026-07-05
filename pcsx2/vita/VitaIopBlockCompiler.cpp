@@ -1229,18 +1229,12 @@ namespace VitaIOP
 			switch (tail.opcode)
 			{
 				case 0x20: // LB
-					if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 24) ||
-						!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 24))
-					{
+					if (!m_code.EmitSxtb(HOST_TMP0, HOST_TMP0))
 						return false;
-					}
 					break;
 				case 0x21: // LH
-					if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 16) ||
-						!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR, 16))
-					{
+					if (!m_code.EmitSxth(HOST_TMP0, HOST_TMP0))
 						return false;
-					}
 					break;
 				default:
 					break;

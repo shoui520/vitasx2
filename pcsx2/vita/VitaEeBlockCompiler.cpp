@@ -6533,8 +6533,7 @@ namespace VitaEE
 				return m_code.EmitMovImm8(HOST_TMP1, 0);
 
 			return m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 16) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, 16);
+				   m_code.EmitUxth(HOST_TMP1, HOST_TMP1);
 		};
 
 		const auto emit_divzero_lane = [&](unsigned lane) {
@@ -6827,8 +6826,7 @@ namespace VitaEE
 			if ((lane & 1u) != 0)
 				return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
 
-			return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::LSL, 16) &&
-				   m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
+			return m_code.EmitSxth(host_reg, host_reg);
 		};
 
 		const auto emit_lane = [this, rs, rt, subtract, load_halfword](unsigned lane) {
@@ -6885,8 +6883,7 @@ namespace VitaEE
 			if ((lane & 1u) != 0)
 				return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
 
-			return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::LSL, 16) &&
-				   m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
+			return m_code.EmitSxth(host_reg, host_reg);
 		};
 
 		const auto emit_product = [this, rs, rt, load_halfword](unsigned lane) {
@@ -6959,8 +6956,7 @@ namespace VitaEE
 			if ((lane & 1u) != 0)
 				return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
 
-			return m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::LSL, 16) &&
-				   m_code.EmitMovRegShiftImm(host_reg, host_reg, VitaA32::ShiftType::ASR, 16);
+			return m_code.EmitSxth(host_reg, host_reg);
 		};
 
 		const auto emit_lane = [this, rs, rt, load_halfword](unsigned lane) {
@@ -10336,13 +10332,20 @@ namespace VitaEE
 
 		const bool needs_counter_event = tail.counter_read_event && tail.rt != 0;
 		const auto emit_sign_extend_low = [&]() -> bool {
-			if (tail.sign_shift == 0)
-				return true;
-
-			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
-					   static_cast<u8>(tail.sign_shift)) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
-					   static_cast<u8>(tail.sign_shift));
+			switch (tail.sign_shift)
+			{
+				case 0:
+					return true;
+				case 16:
+					return m_code.EmitSxth(HOST_TMP0, HOST_TMP0);
+				case 24:
+					return m_code.EmitSxtb(HOST_TMP0, HOST_TMP0);
+				default:
+					return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
+							   static_cast<u8>(tail.sign_shift)) &&
+						   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
+							   static_cast<u8>(tail.sign_shift));
+			}
 		};
 		const auto emit_store_result = [&]() -> bool {
 			if (tail.width == ScalarLoadWidth::Dword)
