@@ -134,6 +134,7 @@ namespace VitaEE
 		{
 			Byte,
 			Halfword,
+			Word,
 		};
 
 	public:
@@ -439,7 +440,7 @@ namespace VitaEE
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
 		bool EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,
-			bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask);
+			bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask, bool counter_read_event);
 		bool EmitPartialWordLoad(u32 op, bool left);
 		bool EmitPartialWordStore(u32 op, bool left);
 		bool EmitPartialDwordLoad(u32 op, bool left);
@@ -486,6 +487,7 @@ namespace VitaEE
 			unsigned sign_shift = 0;
 			bool sign_extend = false;
 			bool branch_delay_slot = false;
+			bool counter_read_event = false;
 		};
 
 		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);

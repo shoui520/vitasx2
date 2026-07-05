@@ -8620,7 +8620,7 @@ namespace VitaEE
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
 			reinterpret_cast<const void*>(&VitaEeMemRead8), true, 24, branch_delay_slot,
-			ScalarLoadWidth::Byte, 0);
+			ScalarLoadWidth::Byte, 0, true);
 	}
 
 	bool BlockCompiler::EmitLH(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -8628,79 +8628,15 @@ namespace VitaEE
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
 			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), true, 16, branch_delay_slot,
-			ScalarLoadWidth::Halfword, 1);
+			ScalarLoadWidth::Halfword, 1, true);
 	}
 
 	bool BlockCompiler::EmitLW(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 		const void* event_exit, bool branch_delay_slot)
 	{
-		const unsigned rt = RT(op);
-
-		size_t unaligned_fallback = static_cast<size_t>(-1);
-		size_t handler_fallback = static_cast<size_t>(-1);
-		const bool needs_counter_event = rt != 0;
-		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
-		{
-			return false;
-		}
-
-		unaligned_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (unaligned_fallback == static_cast<size_t>(-1))
-			return false;
-
-		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
-		{
-			return false;
-		}
-
-		auto emit_result_tail = [&]() -> bool {
-			if (rt == 0)
-				return true;
-
-			return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
-		};
-
-		if (!emit_result_tail())
-			return false;
-
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if ((branch_delay_slot && needs_counter_event &&
-			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
-			(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead32Checked)) ||
-			!emit_result_tail())
-		{
-			return false;
-		}
-
-		if (needs_counter_event &&
-			(!EmitCounterReadEventExit(pc + 4, raw_cycles_through_instruction, event_exit) ||
-			 (branch_delay_slot &&
-				 !m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0))))
-		{
-			return false;
-		}
-
-		const size_t fallback_done = m_code.EmitBranchPlaceholder();
-		if (fallback_done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t address_error_target = m_code.Size();
-		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, false))
-			return false;
-
-		const size_t done_target = m_code.Size();
-		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
-			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, done_target) &&
-			   m_code.PatchBranch(fallback_done, done_target);
+		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
+			reinterpret_cast<const void*>(&VitaEeMemRead32Checked), true, 0, branch_delay_slot,
+			ScalarLoadWidth::Word, 3, true);
 	}
 
 	bool BlockCompiler::EmitLBU(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -8708,7 +8644,7 @@ namespace VitaEE
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
 			reinterpret_cast<const void*>(&VitaEeMemRead8), false, 0, branch_delay_slot,
-			ScalarLoadWidth::Byte, 0);
+			ScalarLoadWidth::Byte, 0, true);
 	}
 
 	bool BlockCompiler::EmitLHU(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -8716,59 +8652,14 @@ namespace VitaEE
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
 			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), false, 0, branch_delay_slot,
-			ScalarLoadWidth::Halfword, 1);
+			ScalarLoadWidth::Halfword, 1, true);
 	}
 
 	bool BlockCompiler::EmitLWU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
-		const unsigned rt = RT(op);
-
-		size_t unaligned_fallback = static_cast<size_t>(-1);
-		size_t handler_fallback = static_cast<size_t>(-1);
-		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
-		{
-			return false;
-		}
-
-		unaligned_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (unaligned_fallback == static_cast<size_t>(-1))
-			return false;
-
-		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
-		{
-			return false;
-		}
-
-		const size_t value_ready = m_code.EmitBranchPlaceholder();
-		if (value_ready == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead32Checked)))
-			return false;
-
-		const size_t value_ready_target = m_code.Size();
-		if (rt != 0 &&
-			(!m_code.EmitMovImm8(HOST_TMP1, 0) ||
-			 !EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1)))
-		{
-			return false;
-		}
-
-		const size_t after_address_error = m_code.EmitBranchPlaceholder();
-		if (after_address_error == static_cast<size_t>(-1))
-			return false;
-
-		const size_t address_error_target = m_code.Size();
-		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, false))
-			return false;
-
-		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
-			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(value_ready, value_ready_target) &&
-			   m_code.PatchBranch(after_address_error, m_code.Size());
+		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
+			reinterpret_cast<const void*>(&VitaEeMemRead32Checked), false, 0, false,
+			ScalarLoadWidth::Word, 3, false);
 	}
 
 	bool BlockCompiler::EmitLWL(u32 op)
@@ -10376,10 +10267,10 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 		const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,
-		bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask)
+		bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask, bool counter_read_event)
 	{
 		const unsigned rt = RT(op);
-		const bool needs_counter_event = rt != 0;
+		const bool needs_counter_event = counter_read_event && rt != 0;
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -10410,6 +10301,11 @@ namespace VitaEE
 			case ScalarLoadWidth::Halfword:
 				if (!(sign_extend ? m_code.EmitLdrshImm8(HOST_TMP0, HOST_TMP0, 0) :
 									 m_code.EmitLdrhImm8(HOST_TMP0, HOST_TMP0, 0)))
+					return false;
+				break;
+
+			case ScalarLoadWidth::Word:
+				if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
 					return false;
 				break;
 		}
@@ -10446,6 +10342,7 @@ namespace VitaEE
 			sign_shift,
 			sign_extend,
 			branch_delay_slot,
+			counter_read_event,
 		});
 		return true;
 	}
@@ -10545,7 +10442,7 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitScalarLoadColdTail(const ScalarLoadColdTail& tail)
 	{
-		// PCSX2 owner: vtlb.cpp::vtlb_memRead*() / R5900OpcodeImpl.cpp::LB/LBU/LH/LHU().
+		// PCSX2 owner: vtlb.cpp::vtlb_memRead*() / R5900OpcodeImpl.cpp::LB/LBU/LH/LHU/LW/LWU().
 		// Handler and unaligned pages stay on the helper/event path, but the hot
 		// non-handler VTLB path falls through to the next guest instruction.
 		if (tail.unaligned_fallback != static_cast<size_t>(-1))
@@ -10562,8 +10459,11 @@ namespace VitaEE
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
 			return false;
 
-		const bool needs_counter_event = tail.rt != 0;
+		const bool needs_counter_event = tail.counter_read_event && tail.rt != 0;
 		const auto emit_sign_extend_low = [&]() -> bool {
+			if (tail.sign_shift == 0)
+				return true;
+
 			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
 					   static_cast<u8>(tail.sign_shift)) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
