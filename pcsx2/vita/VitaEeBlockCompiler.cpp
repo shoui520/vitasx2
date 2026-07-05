@@ -4709,8 +4709,7 @@ namespace VitaEE
 		if (positive_done == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitMovImm8(HOST_TMP1, 0) ||
-			!m_code.EmitSubReg(HOST_TMP0, HOST_TMP1, HOST_TMP3))
+		if (!m_code.EmitRsbImm32(HOST_TMP0, HOST_TMP3, 0))
 		{
 			return false;
 		}
