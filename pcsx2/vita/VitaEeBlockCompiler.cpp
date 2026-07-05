@@ -9168,6 +9168,17 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
+		if (rs == 0 || rt == 0)
+		{
+			const unsigned src = (rs == 0) ? rt : rs;
+			if (src == 0)
+				return EmitStoreGprZero64(rd);
+
+			return EmitLoadGprLow(src, HOST_TMP0) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+
 		return EmitLoadGprLow(rs, HOST_TMP0) &&
 			   EmitLoadGprLow(rt, HOST_TMP1) &&
 			   m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
@@ -9207,6 +9218,18 @@ namespace VitaEE
 
 		if (rd == 0)
 			return true;
+
+		if (rs == 0 || rt == 0)
+		{
+			const unsigned src = (rs == 0) ? rt : rs;
+			if (src == 0)
+				return EmitStoreGprZero64(rd);
+			if (rd == src)
+				return true;
+
+			return EmitLoadGpr64(src, HOST_TMP0, HOST_TMP1) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
 
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
