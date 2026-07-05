@@ -1156,32 +1156,31 @@ namespace VitaIOP
 
 		if (rt != 0)
 		{
-			if (!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
-				!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0))
-			{
+			if (!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK))
 				return false;
-			}
 
 			switch (opcode)
 			{
 				case 0x24: // LBU
-					if (!m_code.EmitLdrbImm12(HOST_TMP0, HOST_TMP0, 0))
+					if (!m_code.EmitLdrbRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+							VitaA32::ShiftType::LSL, 0))
 						return false;
 					break;
 				case 0x20: // LB
-					if (!m_code.EmitLdrsbImm8(HOST_TMP0, HOST_TMP0, 0))
+					if (!m_code.EmitLdrsbReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0))
 						return false;
 					break;
 				case 0x21: // LH
-					if (!m_code.EmitLdrshImm8(HOST_TMP0, HOST_TMP0, 0))
+					if (!m_code.EmitLdrshReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0))
 						return false;
 					break;
 				case 0x25: // LHU
-					if (!m_code.EmitLdrhImm8(HOST_TMP0, HOST_TMP0, 0))
+					if (!m_code.EmitLdrhReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0))
 						return false;
 					break;
 				case 0x23: // LW
-					if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+					if (!m_code.EmitLdrRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+							VitaA32::ShiftType::LSL, 0))
 						return false;
 					break;
 				default:
@@ -1276,11 +1275,13 @@ namespace VitaIOP
 			switch (opcode)
 			{
 				case 0x28: // SB
-					return m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, 0);
+					return m_code.EmitStrbRegShift(HOST_TMP1, HOST_IOP_RAM_BASE, HOST_TMP0,
+						VitaA32::ShiftType::LSL, 0);
 				case 0x29: // SH
-					return m_code.EmitStrhImm8(HOST_TMP1, HOST_TMP0, 0);
+					return m_code.EmitStrhReg(HOST_TMP1, HOST_IOP_RAM_BASE, HOST_TMP0);
 				case 0x2b: // SW
-					return m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0);
+					return m_code.EmitStrRegShift(HOST_TMP1, HOST_IOP_RAM_BASE, HOST_TMP0,
+						VitaA32::ShiftType::LSL, 0);
 				default:
 					return false;
 			}
@@ -1332,7 +1333,6 @@ namespace VitaIOP
 		if (isolated_fallback_branch == static_cast<size_t>(-1) ||
 			!EmitLoadGpr(RT(op), HOST_TMP1) ||
 			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
-			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
 			!emit_store_value() ||
 			!emit_clear_stored_word())
 		{
@@ -1519,8 +1519,8 @@ namespace VitaIOP
 		const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (fallback_branch == static_cast<size_t>(-1) ||
 			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
-			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
-			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+			!m_code.EmitLdrRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+				VitaA32::ShiftType::LSL, 0))
 		{
 			return false;
 		}
@@ -1587,8 +1587,8 @@ namespace VitaIOP
 		const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (fallback_branch == static_cast<size_t>(-1) ||
 			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
-			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
-			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+			!m_code.EmitLdrRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+				VitaA32::ShiftType::LSL, 0))
 		{
 			return false;
 		}
@@ -1642,8 +1642,8 @@ namespace VitaIOP
 		const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (isolated_fallback_branch == static_cast<size_t>(-1) ||
 			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
-			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
-			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!m_code.EmitStrRegShift(HOST_TMP1, HOST_IOP_RAM_BASE, HOST_TMP0,
+				VitaA32::ShiftType::LSL, 0) ||
 			!emit_clear_stored_word())
 		{
 			return false;
@@ -2209,8 +2209,8 @@ namespace VitaIOP
 			const size_t alignment_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 			if (alignment_fallback_branch == static_cast<size_t>(-1) ||
 				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
-				!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
-				!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+				!m_code.EmitLdrRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+					VitaA32::ShiftType::LSL, 0))
 			{
 				return false;
 			}
@@ -2269,8 +2269,8 @@ namespace VitaIOP
 			const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 			if (isolated_fallback_branch == static_cast<size_t>(-1) ||
 				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
-				!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
-				!m_code.EmitStrImm12(HOST_SAVED0, HOST_TMP0, 0) ||
+				!m_code.EmitStrRegShift(HOST_SAVED0, HOST_IOP_RAM_BASE, HOST_TMP0,
+					VitaA32::ShiftType::LSL, 0) ||
 				!emit_clear_stored_word())
 			{
 				return false;
