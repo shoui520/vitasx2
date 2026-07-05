@@ -89,8 +89,12 @@ public:
 
 	__forceinline GSVector4(float x, float y, float z, float w)
 	{
-		const float arr[4] = { x, y, z, w };
-		v4s = vld1q_f32(arr);
+		v4s = vsetq_lane_f32(w,
+			vsetq_lane_f32(z,
+				vsetq_lane_f32(y,
+					vsetq_lane_f32(x, vdupq_n_f32(0.0f), 0), 1),
+				2),
+			3);
 	}
 
 	__forceinline GSVector4(float x, float y)
@@ -100,8 +104,13 @@ public:
 
 	__forceinline GSVector4(int x, int y, int z, int w)
 	{
-		const int arr[4] = { x, y, z, w };
-		v4s = vcvtq_f32_s32(vld1q_s32(arr));
+		const int32x4_t lanes = vsetq_lane_s32(w,
+			vsetq_lane_s32(z,
+				vsetq_lane_s32(y,
+					vsetq_lane_s32(x, vdupq_n_s32(0), 0), 1),
+				2),
+			3);
+		v4s = vcvtq_f32_s32(lanes);
 	}
 
 	__forceinline GSVector4(int x, int y)
