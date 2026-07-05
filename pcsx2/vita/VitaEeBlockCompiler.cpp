@@ -8810,9 +8810,14 @@ namespace VitaEE
 			return false;
 
 		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!EmitLoadGpr64(rt, HOST_TMP1, HOST_TMP2) ||
-			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
-			!m_code.EmitStrImm12(HOST_TMP2, HOST_TMP0, sizeof(u32)))
+			!EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3))
+		{
+			return false;
+		}
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::SD() via vtlb_memWrite64().
+		// Keep the store value in r2/r3 so Cortex-A9 can issue one STRD.
+		if (!m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_TMP0, 0))
 		{
 			return false;
 		}
