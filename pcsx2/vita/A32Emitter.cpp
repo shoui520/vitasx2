@@ -26,6 +26,7 @@ namespace VitaA32
 		constexpr u32 OPCODE_ADC = 0x00a00000u;
 		constexpr u32 OPCODE_TST = 0x01000000u;
 		constexpr u32 OPCODE_CMP = 0x01400000u;
+		constexpr u32 OPCODE_CMN = 0x01600000u;
 		constexpr u32 OPCODE_MOV = 0x01a00000u;
 		constexpr u32 OPCODE_MVN = 0x01e00000u;
 		constexpr u32 OPCODE_ORR = 0x01800000u;
@@ -608,10 +609,16 @@ namespace VitaA32
 			return false;
 
 		u32 encoded = 0;
-		if (!EncodeModifiedImmediate(value, &encoded))
+		if (EncodeModifiedImmediate(value, &encoded))
+		{
+			return EmitU32(CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_CMP | SET_FLAGS |
+						   ((rn & 0xfu) << 16) | encoded);
+		}
+
+		if (!EncodeModifiedImmediate(0u - value, &encoded))
 			return false;
 
-		return EmitU32(CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_CMP | SET_FLAGS |
+		return EmitU32(CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_CMN | SET_FLAGS |
 					   ((rn & 0xfu) << 16) | encoded);
 	}
 
