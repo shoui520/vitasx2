@@ -1281,20 +1281,26 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitEffectiveAddress(u32 op)
 	{
+		return EmitEffectiveAddress(op, HOST_TMP0);
+	}
+
+	bool BlockCompiler::EmitEffectiveAddress(u32 op, unsigned host_reg)
+	{
 		const s32 imm = static_cast<s32>(IMM_S(op));
-		if (!EmitLoadGpr(RS(op), HOST_TMP0))
+		const unsigned scratch_reg = (host_reg == HOST_TMP1) ? HOST_TMP2 : HOST_TMP1;
+		if (!EmitLoadGpr(RS(op), host_reg))
 			return false;
 
 		if (imm == 0)
 			return true;
 
-		if (imm > 0 && m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(imm)))
+		if (imm > 0 && m_code.EmitAddImm32(host_reg, host_reg, static_cast<u32>(imm)))
 			return true;
-		if (imm < 0 && m_code.EmitSubImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(-imm)))
+		if (imm < 0 && m_code.EmitSubImm32(host_reg, host_reg, static_cast<u32>(-imm)))
 			return true;
 
-		return m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(imm)) &&
-			   m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP1);
+		return m_code.EmitMovImm32(scratch_reg, static_cast<u32>(imm)) &&
+			   m_code.EmitAddReg(host_reg, host_reg, scratch_reg);
 	}
 
 	bool BlockCompiler::EmitLoadOp(u32 op)
@@ -1323,9 +1329,8 @@ namespace VitaIOP
 				return false;
 		}
 
-		if (!EmitEffectiveAddress(op) ||
-			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitTstImm32(HOST_TMP0, 0x10000000u))
+		if (!EmitEffectiveAddress(op, HOST_SAVED0) ||
+			!m_code.EmitTstImm32(HOST_SAVED0, 0x10000000u))
 		{
 			return false;
 		}
@@ -1491,9 +1496,8 @@ namespace VitaIOP
 				   m_code.EmitBlx(HOST_CALL_SCRATCH);
 		};
 
-		if (!EmitEffectiveAddress(op) ||
-			!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitTstImm32(HOST_TMP0, 0x10000000u))
+		if (!EmitEffectiveAddress(op, HOST_SAVED0) ||
+			!m_code.EmitTstImm32(HOST_SAVED0, 0x10000000u))
 		{
 			return false;
 		}

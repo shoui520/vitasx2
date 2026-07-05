@@ -96,6 +96,7 @@ namespace VitaIOP
 		bool EmitExceptionOp(u32 pc, u32 code);
 		bool EmitImmediateOp(u32 op);
 		bool EmitEffectiveAddress(u32 op);
+		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitLoadOp(u32 op);
 		bool EmitStoreOp(u32 op);
 		bool EmitUnalignedLoadOp(u32 op);
