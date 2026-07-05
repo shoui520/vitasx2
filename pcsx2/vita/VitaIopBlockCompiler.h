@@ -153,11 +153,31 @@ namespace VitaIOP
 		};
 		bool EmitUnalignedWriteColdTail(const UnalignedWriteColdTail& tail);
 
+		struct Cop2LoadColdTail
+		{
+			size_t fallback_branch = static_cast<size_t>(-1);
+			size_t alignment_fallback_branch = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+			unsigned cop2_reg = 0;
+		};
+		bool EmitCop2LoadColdTail(const Cop2LoadColdTail& tail);
+
+		struct Cop2StoreColdTail
+		{
+			size_t fallback_branch = static_cast<size_t>(-1);
+			size_t alignment_fallback_branch = static_cast<size_t>(-1);
+			size_t isolated_fallback_branch = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+		};
+		bool EmitCop2StoreColdTail(const Cop2StoreColdTail& tail);
+
 		VitaA32::CodeBuffer& m_code;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
 		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
 		std::vector<UnalignedReadColdTail> m_unaligned_read_cold_tails;
 		std::vector<UnalignedWriteColdTail> m_unaligned_write_cold_tails;
+		std::vector<Cop2LoadColdTail> m_cop2_load_cold_tails;
+		std::vector<Cop2StoreColdTail> m_cop2_store_cold_tails;
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
 		bool m_emit_trace_checks = false;

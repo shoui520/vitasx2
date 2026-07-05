@@ -473,6 +473,8 @@ namespace VitaIOP
 		m_scalar_store_cold_tails.clear();
 		m_unaligned_read_cold_tails.clear();
 		m_unaligned_write_cold_tails.clear();
+		m_cop2_load_cold_tails.clear();
+		m_cop2_store_cold_tails.clear();
 		return m_code.EmitPush(REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_LR) &&
 			   m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs)));
 	}
@@ -1366,10 +1368,24 @@ namespace VitaIOP
 				return false;
 		}
 
+		for (const Cop2LoadColdTail& tail : m_cop2_load_cold_tails)
+		{
+			if (!EmitCop2LoadColdTail(tail))
+				return false;
+		}
+
+		for (const Cop2StoreColdTail& tail : m_cop2_store_cold_tails)
+		{
+			if (!EmitCop2StoreColdTail(tail))
+				return false;
+		}
+
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
 		m_unaligned_read_cold_tails.clear();
 		m_unaligned_write_cold_tails.clear();
+		m_cop2_load_cold_tails.clear();
+		m_cop2_store_cold_tails.clear();
 		return true;
 	}
 
@@ -1400,6 +1416,47 @@ namespace VitaIOP
 		if (!m_code.PatchBranch(tail.write_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH))
+		{
+			return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
+	}
+
+	bool BlockCompiler::EmitCop2LoadColdTail(const Cop2LoadColdTail& tail)
+	{
+		// PCSX2 owners: IopGte.cpp::gteLWC2()/MTC2() and
+		// IopMem.cpp::iopMemRead32(). Helper-backed reads still feed the same
+		// GTE data-register side effects as the direct RAM path.
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(tail.alignment_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) ||
+			!EmitWriteCop2DataReg(tail.cop2_reg, HOST_TMP0))
+		{
+			return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
+	}
+
+	bool BlockCompiler::EmitCop2StoreColdTail(const Cop2StoreColdTail& tail)
+	{
+		// PCSX2 owners: IopGte.cpp::gteSWC2()/MFC2() and
+		// IopMem.cpp::iopMemWrite32(). EmitReadCop2DataReg() has already
+		// produced the MFC2 value in HOST_SAVED0 before these branches fire.
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(tail.alignment_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH))
 		{
 			return false;
@@ -2133,21 +2190,16 @@ namespace VitaIOP
 				return false;
 			}
 
-			const size_t done_branch = m_code.EmitBranchPlaceholder();
-			if (done_branch == static_cast<size_t>(-1))
+			if (!EmitWriteCop2DataReg(RT(op), HOST_TMP0))
 				return false;
 
-			const size_t fallback_target = m_code.Size();
-			if (!m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE) ||
-				!m_code.PatchBranch(alignment_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
-				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) ||
-				!m_code.PatchBranch(done_branch, m_code.Size()))
-			{
-				return false;
-			}
-
-			return EmitWriteCop2DataReg(RT(op), HOST_TMP0);
+			m_cop2_load_cold_tails.push_back({
+				fallback_branch,
+				alignment_fallback_branch,
+				m_code.Size(),
+				RT(op),
+			});
+			return true;
 		}
 
 		if ((op >> 26) == 0x3a) // SWC2
@@ -2201,18 +2253,13 @@ namespace VitaIOP
 				return false;
 			}
 
-			const size_t done_branch = m_code.EmitBranchPlaceholder();
-			if (done_branch == static_cast<size_t>(-1))
-				return false;
-
-			const size_t fallback_target = m_code.Size();
-			return m_code.PatchBranch(fallback_branch, fallback_target, VitaA32::Condition::NE) &&
-				   m_code.PatchBranch(alignment_fallback_branch, fallback_target, VitaA32::Condition::NE) &&
-				   m_code.PatchBranch(isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) &&
-				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH) &&
-				   m_code.PatchBranch(done_branch, m_code.Size());
+			m_cop2_store_cold_tails.push_back({
+				fallback_branch,
+				alignment_fallback_branch,
+				isolated_fallback_branch,
+				m_code.Size(),
+			});
+			return true;
 		}
 
 		return false;
