@@ -410,8 +410,9 @@ namespace
 	constexpr bool IopInstructionCanDeferCycleState(u32 op)
 	{
 		// PCSX2 owner: x86/iR3000A.cpp batches s_psxBlockCycles and commits them
-		// in iPsxBranchTest(). Keep that shape only for opcodes whose Vita A32
-		// templates cannot call helpers, touch memory handlers, or read timing.
+		// in iPsxBranchTest(). Keep this per-instruction predicate to opcodes
+		// whose Vita A32 templates cannot call helpers, touch memory handlers,
+		// redirect control flow, or read timing.
 		switch (op >> 26)
 		{
 			case 0x00: // SPECIAL
@@ -483,6 +484,38 @@ namespace
 	constexpr bool IsIopRegisterJumpOpcode(u32 op)
 	{
 		return (op >> 26) == 0x00 && ((op & 0x3f) == 0x08 || (op & 0x3f) == 0x09); // JR/JALR
+	}
+
+	bool IopBlockCanDeferCycleUpdates(u32 start_pc, u32 instruction_count)
+	{
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 pc = start_pc + i * 4;
+			const u32 op = iopMemRead32(pc);
+			if (!IsNativeOpcode(op))
+				return false;
+
+			if (IopInstructionCanDeferCycleState(op))
+				continue;
+
+			const u32 delay_op = (i + 1 < instruction_count) ? iopMemRead32(pc + 4) : 0;
+			const bool final_branch_pair = (i + 2 == instruction_count) &&
+										   IopInstructionCanDeferCycleState(delay_op) &&
+										   !IsIopBranchOrJumpOpcode(delay_op) &&
+										   !IsIopExceptionOpcode(delay_op);
+			if (IsIopStaticConditionalBranchOpcode(op) && final_branch_pair)
+				continue;
+
+			if (IsIopStaticJumpOpcode(op) && final_branch_pair &&
+				((op >> 26) != 0x02 || (delay_op >> 16) != 0x2400))
+			{
+				continue;
+			}
+
+			return false;
+		}
+
+		return true;
 	}
 
 	static_assert(PC_OFFSET <= 4095);
@@ -2631,13 +2664,7 @@ namespace VitaIOP
 			}
 		}
 		m_emit_trace_checks = VitaIsIopPreInstructionTraceEnabled();
-		m_defer_cycle_updates = !m_emit_trace_checks;
-		for (u32 i = 0; i < instruction_count && m_defer_cycle_updates; i++)
-		{
-			const u32 op = iopMemRead32(start_pc + i * 4);
-			if (!CanCompileOpcode(op) || !IopInstructionCanDeferCycleState(op))
-				m_defer_cycle_updates = false;
-		}
+		m_defer_cycle_updates = !m_emit_trace_checks && IopBlockCanDeferCycleUpdates(start_pc, instruction_count);
 
 		if (!BeginBlock())
 			return false;
