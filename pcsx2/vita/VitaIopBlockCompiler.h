@@ -86,6 +86,7 @@ namespace VitaIOP
 		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches);
 		bool EmitLoadGpr(unsigned guest_reg, unsigned host_reg);
 		bool EmitStoreGpr(unsigned guest_reg, unsigned host_reg);
+		bool EmitStoreGprZero(unsigned guest_reg);
 		bool EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg);
 		bool EmitCompareGprs(unsigned lhs_guest_reg, unsigned rhs_guest_reg);
 		bool EmitBinaryRegOp(u32 op);

@@ -834,6 +834,12 @@ namespace VitaIOP
 		return m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(GprOffset(guest_reg)));
 	}
 
+	bool BlockCompiler::EmitStoreGprZero(unsigned guest_reg)
+	{
+		return m_code.EmitMovImm8(HOST_TMP0, 0) &&
+			   EmitStoreGpr(guest_reg, HOST_TMP0);
+	}
+
 	bool BlockCompiler::EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg)
 	{
 		if (dst_guest_reg == src_guest_reg)
@@ -873,8 +879,7 @@ namespace VitaIOP
 			return true;
 
 		const auto store_zero = [this, rd]() {
-			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
-				   EmitStoreGpr(rd, HOST_TMP0);
+			return EmitStoreGprZero(rd);
 		};
 		const auto store_not = [this, rd](unsigned guest_reg) {
 			return EmitLoadGpr(guest_reg, HOST_TMP0) &&
@@ -986,6 +991,11 @@ namespace VitaIOP
 		if (rd == 0)
 			return true;
 
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLL()/psxSRL()/psxSRA().
+		// Shifting register zero writes zero for every immediate amount.
+		if (rt == 0)
+			return EmitStoreGprZero(rd);
+
 		if (sa == 0)
 			return EmitMoveGpr(rd, rt);
 
@@ -1020,6 +1030,11 @@ namespace VitaIOP
 		const u32 funct = op & 0x3f;
 		if (rd == 0)
 			return true;
+
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLLV()/psxSRLV()/psxSRAV().
+		// The shift amount is irrelevant when the source register is zero.
+		if (rt == 0)
+			return EmitStoreGprZero(rd);
 
 		if (!EmitLoadGpr(rt, HOST_TMP0) ||
 			!EmitLoadGpr(rs, HOST_TMP1) ||
