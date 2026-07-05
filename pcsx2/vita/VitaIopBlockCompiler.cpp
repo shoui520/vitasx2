@@ -766,9 +766,11 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches)
 	{
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, PC_OFFSET) ||
-			!m_code.EmitMovImm32(HOST_TMP1, expected_pc) ||
-			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, PC_OFFSET))
+			return false;
+
+		if (!(m_code.EmitCmpImm32(HOST_TMP0, expected_pc) ||
+			  (m_code.EmitMovImm32(HOST_TMP1, expected_pc) && m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))))
 		{
 			return false;
 		}
@@ -2035,8 +2037,9 @@ namespace VitaIOP
 
 		// psxDoBranch() owns these diagnostic/module/IOPBOOT side effects.
 		const auto emit_special_target_check = [this](u32 target) -> size_t {
-			if (!m_code.EmitMovImm32(HOST_TMP0, target) ||
-				!m_code.EmitCmpReg(HOST_REGISTER_JUMP_TARGET, HOST_TMP0))
+			if (!(m_code.EmitCmpImm32(HOST_REGISTER_JUMP_TARGET, target) ||
+				  (m_code.EmitMovImm32(HOST_TMP0, target) &&
+				   m_code.EmitCmpReg(HOST_REGISTER_JUMP_TARGET, HOST_TMP0))))
 			{
 				return static_cast<size_t>(-1);
 			}
