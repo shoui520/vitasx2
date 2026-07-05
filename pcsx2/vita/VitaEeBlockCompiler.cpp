@@ -1594,6 +1594,8 @@ namespace VitaEE
 	static_assert((GprOffset(0) % alignof(u64)) == 0);
 	static_assert(HI_OFFSET + sizeof(GPR_reg) <= 0x0fff);
 	static_assert(LO_OFFSET + sizeof(GPR_reg) <= 0x0fff);
+	static_assert((HI_OFFSET % alignof(u64)) == 0);
+	static_assert((LO_OFFSET % alignof(u64)) == 0);
 	static_assert(Cp0Offset(31) + sizeof(u32) <= 0x0fff);
 	static_assert(FprOffset(31) + sizeof(FPRreg) <= 0x0fff);
 	static_assert(FprcOffset(31) + sizeof(u32) <= 0x0fff);
@@ -5696,16 +5698,14 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
-		return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hilo_offset)) &&
-			   m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(hilo_offset + sizeof(u32))) &&
+		return EmitLoadCpuRegsU64(hilo_offset, HOST_TMP0, HOST_TMP1, HOST_TMP2) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitMoveToHiLo(u32 op, size_t hilo_offset)
 	{
 		return EmitLoadGpr64(RS(op), HOST_TMP0, HOST_TMP1) &&
-			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(hilo_offset)) &&
-			   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(hilo_offset + sizeof(u32)));
+			   EmitStoreCpuRegsU64(hilo_offset, HOST_TMP0, HOST_TMP1, HOST_TMP2);
 	}
 
 	bool BlockCompiler::EmitMoveFullFromHiLo(u32 op, size_t hilo_offset)
