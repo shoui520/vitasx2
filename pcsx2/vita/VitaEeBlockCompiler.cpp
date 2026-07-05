@@ -4797,6 +4797,16 @@ namespace VitaEE
 		if (rt == 0)
 			return true;
 
+		// PCSX2 owner: R5900OpcodeImpl.cpp::ADDIU() sign-extends the 32-bit
+		// result of RS.low + sign_extend_16(imm). With RS=$zero that is just
+		// the sign-extended immediate.
+		if (rs == 0)
+		{
+			return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(imm)) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
+
 		if (!EmitLoadGprLow(rs, HOST_TMP0))
 			return false;
 
@@ -4823,6 +4833,16 @@ namespace VitaEE
 
 		if (rt == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::DADDIU() sign-extends the 16-bit
+		// immediate and adds it to the low 64-bit GPR value. With RS=$zero the
+		// result is exactly that sign-extended immediate.
+		if (rs == 0)
+		{
+			return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(imm)) &&
+				   m_code.EmitMovImm32(HOST_TMP1, (imm < 0) ? 0xffffffffu : 0) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
 		if (imm == 0 && rt == rs)
 			return true;
 
