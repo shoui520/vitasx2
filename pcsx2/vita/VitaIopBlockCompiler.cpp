@@ -66,6 +66,7 @@ namespace
 	constexpr size_t CYCLE_OFFSET = offsetof(psxRegisters, cycle);
 	constexpr size_t INTERRUPT_OFFSET = offsetof(psxRegisters, interrupt);
 	constexpr size_t IOP_NEXT_EVENT_CYCLE_OFFSET = offsetof(psxRegisters, iopNextEventCycle);
+	constexpr size_t IOP_NEXT_EVENT_CYCLE_FROM_CYCLE_OFFSET = IOP_NEXT_EVENT_CYCLE_OFFSET - CYCLE_OFFSET;
 	constexpr size_t IOP_CYCLE_EE_OFFSET = offsetof(psxRegisters, iopCycleEE);
 	constexpr u32 IOP_WAIT_CYCLES = 384;
 
@@ -522,6 +523,9 @@ namespace
 	static_assert(CODE_OFFSET <= 4095);
 	static_assert(CYCLE_OFFSET + sizeof(u64) <= 4095);
 	static_assert((CYCLE_OFFSET % alignof(u64)) == 0);
+	static_assert(IOP_NEXT_EVENT_CYCLE_OFFSET > CYCLE_OFFSET);
+	static_assert(IOP_NEXT_EVENT_CYCLE_FROM_CYCLE_OFFSET <= 0xff);
+	static_assert((IOP_NEXT_EVENT_CYCLE_FROM_CYCLE_OFFSET % alignof(u64)) == 0);
 	static_assert(IOP_CYCLE_EE_OFFSET <= 4095);
 	static_assert(GprOffset(33) + sizeof(u32) <= 4095);
 	static_assert(HI_OFFSET + sizeof(u32) <= 4095);
@@ -2199,14 +2203,32 @@ namespace VitaIOP
 		std::vector<HelperBranch> helper_branches;
 		helper_branches.reserve(5);
 
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
-			!m_code.EmitMovImm32(HOST_TMP2, IOP_WAIT_CYCLES) ||
-			!m_code.EmitAddReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true) ||
-			!m_code.EmitAdcImm8(HOST_TMP3, HOST_TMP1, 0) ||
-			!m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(IOP_NEXT_EVENT_CYCLE_OFFSET)) ||
-			!m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS,
-				static_cast<u16>(IOP_NEXT_EVENT_CYCLE_OFFSET + sizeof(u32))))
+		const auto emit_add_wait_cycles = [this]() {
+			if (m_code.EmitAddImm32(HOST_TMP2, HOST_TMP0, IOP_WAIT_CYCLES, true))
+				return true;
+
+			return m_code.EmitMovImm32(HOST_TMP2, IOP_WAIT_CYCLES) &&
+				   m_code.EmitAddReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true);
+		};
+		const auto emit_schedule_next_event_from_cycle_base = [this, &emit_add_wait_cycles](unsigned cycle_base_reg) {
+			return m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, cycle_base_reg, 0) &&
+				   emit_add_wait_cycles() &&
+				   m_code.EmitAdcImm8(HOST_TMP3, HOST_TMP1, 0) &&
+				   m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, cycle_base_reg,
+					   static_cast<u8>(IOP_NEXT_EVENT_CYCLE_FROM_CYCLE_OFFSET));
+		};
+
+		// PCSX2 owner: R3000A.cpp::iopEventTest() writes
+		// psxRegs.iopNextEventCycle = psxRegs.cycle + iopWaitCycles. Keep the
+		// 64-bit fields paired so Cortex-A9 can issue one load/store each.
+		const bool emitted_schedule =
+			m_iop_cycle_base_register_available ?
+				emit_schedule_next_event_from_cycle_base(HOST_CYCLE_BASE) :
+				((m_code.EmitAddImm32(HOST_CALL_SCRATCH, HOST_PSX_REGS, static_cast<u32>(CYCLE_OFFSET)) ||
+					 (m_code.EmitMovImm32(HOST_CALL_SCRATCH, static_cast<u32>(CYCLE_OFFSET)) &&
+						 m_code.EmitAddReg(HOST_CALL_SCRATCH, HOST_PSX_REGS, HOST_CALL_SCRATCH))) &&
+					emit_schedule_next_event_from_cycle_base(HOST_CALL_SCRATCH));
+		if (!emitted_schedule)
 		{
 			return false;
 		}
