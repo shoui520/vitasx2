@@ -2135,25 +2135,21 @@ namespace VitaIOP
 		// pending IOP INTC all branch to the owner function.
 		if (!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(&psxNextStartCounter))) ||
 			!m_code.EmitLdrImm12(HOST_SAVED0, HOST_TMP3, 0) ||
-			!m_code.EmitSubReg(HOST_SAVED0, HOST_TMP0, HOST_SAVED0) ||
 			!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(&psxNextDeltaCounter))) ||
-			!m_code.EmitLdrImm12(HOST_TMP3, HOST_TMP3, 0) ||
-			!m_code.EmitCmpReg(HOST_SAVED0, HOST_TMP3))
+			!m_code.EmitLdrImm12(HOST_SAVED1, HOST_TMP3, 0) ||
+			!m_code.EmitSubReg(HOST_TMP3, HOST_TMP0, HOST_SAVED0) ||
+			!m_code.EmitCmpReg(HOST_TMP3, HOST_SAVED1))
 		{
 			return false;
 		}
 		helper_branches.push_back({m_code.EmitBranchPlaceholder(VitaA32::Condition::GE),
 			VitaA32::Condition::GE});
 
-		// HOST_TMP2 still holds iopNextEventCycle.low from the wait-cycle store
-		// above, so the second no-work test does not need to read it back from
-		// psxRegs.
-		if (!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(&psxNextStartCounter))) ||
-			!m_code.EmitLdrImm12(HOST_TMP3, HOST_TMP3, 0) ||
-			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP3) ||
-			!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(&psxNextDeltaCounter))) ||
-			!m_code.EmitLdrImm12(HOST_TMP3, HOST_TMP3, 0) ||
-			!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP2))
+		// HOST_TMP2 still holds iopNextEventCycle.low, while HOST_SAVED0/1 keep
+		// psxNextStartCounter.low and psxNextDeltaCounter for the second
+		// no-work test.
+		if (!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_SAVED0) ||
+			!m_code.EmitCmpReg(HOST_SAVED1, HOST_TMP2))
 		{
 			return false;
 		}
