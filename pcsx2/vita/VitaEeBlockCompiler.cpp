@@ -3482,7 +3482,7 @@ namespace VitaEE
 			case 0x01: // QMFC2
 				if (rt != 0 &&
 					(!EmitVu0VfAddress(HOST_TMP0, fs) ||
-					 !m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) ||
+					 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
 					 !EmitCpuRegsAddress(HOST_TMP1, GprOffset(rt)) ||
 					 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1)))
 				{
@@ -3494,7 +3494,7 @@ namespace VitaEE
 					(!EmitCpuRegsAddress(HOST_TMP0, GprOffset(rt)) ||
 					 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
 					 !EmitVu0VfAddress(HOST_TMP1, fs) ||
-					 !m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP1)))
+					 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1)))
 				{
 					return false;
 				}
@@ -8738,7 +8738,7 @@ namespace VitaEE
 
 		if (rt != 0 &&
 			(!EmitVu0VfAddress(HOST_TMP0, rt) ||
-			 !m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0)))
+			 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0)))
 		{
 			return false;
 		}
@@ -9019,7 +9019,7 @@ namespace VitaEE
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitVu0SyncIfRunning() ||
 			!EmitVu0VfAddress(HOST_TMP0, rt) ||
-			!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) ||
+			!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
 			!m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP5))
 		{
 			return false;
