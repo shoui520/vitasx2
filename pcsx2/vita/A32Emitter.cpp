@@ -585,6 +585,8 @@ namespace VitaA32
 	{
 		if (!IsRegister(rd) || !IsRegister(rm) || amount > 31)
 			return false;
+		if (!set_flags && rd == rm && shift == ShiftType::LSL && amount == 0)
+			return true;
 		return EmitU32(EncodeMovRegShiftImm(rd, rm, shift, amount, set_flags, condition));
 	}
 
