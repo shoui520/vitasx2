@@ -4878,6 +4878,16 @@ namespace VitaEE
 		if (rt == 0)
 			return true;
 
+		// PCSX2 owner: R5900OpcodeImpl.cpp::SLTI(). With RS=$zero, the
+		// signed comparison is the constant predicate 0 < sign_extend_16(imm).
+		if (rs == 0)
+		{
+			const u32 result = (imm > 0) ? 1u : 0u;
+			return m_code.EmitMovImm8(HOST_TMP0, static_cast<u8>(result)) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
+
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitSetLessThan64Imm(rt, imm, true);
 	}
@@ -4890,6 +4900,17 @@ namespace VitaEE
 
 		if (rt == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::SLTIU(). The immediate is
+		// sign-extended before the unsigned 64-bit compare, so 0 is less than
+		// every nonzero immediate.
+		if (rs == 0)
+		{
+			const u32 result = (imm != 0) ? 1u : 0u;
+			return m_code.EmitMovImm8(HOST_TMP0, static_cast<u8>(result)) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
 
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitSetLessThan64Imm(rt, imm, false);
