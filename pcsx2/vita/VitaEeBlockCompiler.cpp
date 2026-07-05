@@ -9211,14 +9211,11 @@ namespace VitaEE
 		if (!EmitLoadGprLow(rt, HOST_TMP0))
 			return false;
 
-		// ARM immediate LSR/ASR with amount 0 encodes a shift of 32, while
-		// R5900 SRL/SRA with sa=0 is a no-op on the low word.
-		if (sa == 0)
-		{
-			if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 0))
-				return false;
-		}
-		else if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, shift, static_cast<u8>(sa)))
+		// PCSX2 owner: R5900OpcodeImpl.cpp::SLL()/SRL()/SRA(). ARM immediate
+		// LSR/ASR with amount 0 encodes a shift of 32; the R5900 sa=0 case
+		// leaves the low word unchanged, so only the final sign extension is
+		// needed.
+		if (sa != 0 && !m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, shift, static_cast<u8>(sa)))
 		{
 			return false;
 		}
