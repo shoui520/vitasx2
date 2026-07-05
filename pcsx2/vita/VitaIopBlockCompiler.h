@@ -80,6 +80,7 @@ namespace VitaIOP
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
 		bool EmitStorePc(u32 pc);
 		bool EmitStorePcReg(unsigned host_reg);
+		bool EmitAddCycles(u32 cycles);
 		bool EmitIncrementCycle();
 		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches);
@@ -183,6 +184,7 @@ namespace VitaIOP
 		u16 m_saved_registers = 0;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_cycle_base_register_available = false;
+		bool m_defer_cycle_updates = false;
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_jump = false;

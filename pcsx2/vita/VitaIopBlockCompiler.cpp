@@ -407,6 +407,58 @@ namespace
 		}
 	}
 
+	constexpr bool IopInstructionCanDeferCycleState(u32 op)
+	{
+		// PCSX2 owner: x86/iR3000A.cpp batches s_psxBlockCycles and commits them
+		// in iPsxBranchTest(). Keep that shape only for opcodes whose Vita A32
+		// templates cannot call helpers, touch memory handlers, or read timing.
+		switch (op >> 26)
+		{
+			case 0x00: // SPECIAL
+				switch (op & 0x3f)
+				{
+					case 0x00: // SLL
+					case 0x02: // SRL
+					case 0x03: // SRA
+					case 0x04: // SLLV
+					case 0x06: // SRLV
+					case 0x07: // SRAV
+					case 0x10: // MFHI
+					case 0x11: // MTHI
+					case 0x12: // MFLO
+					case 0x13: // MTLO
+					case 0x18: // MULT
+					case 0x19: // MULTU
+					case 0x20: // ADD
+					case 0x21: // ADDU
+					case 0x22: // SUB
+					case 0x23: // SUBU
+					case 0x24: // AND
+					case 0x25: // OR
+					case 0x26: // XOR
+					case 0x27: // NOR
+					case 0x2a: // SLT
+					case 0x2b: // SLTU
+						return true;
+					default:
+						return false;
+				}
+
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+			case 0x0a: // SLTI
+			case 0x0b: // SLTIU
+			case 0x0c: // ANDI
+			case 0x0d: // ORI
+			case 0x0e: // XORI
+			case 0x0f: // LUI
+				return true;
+
+			default:
+				return false;
+		}
+	}
+
 	constexpr bool IsIopStaticConditionalBranchOpcode(u32 op)
 	{
 		switch (op >> 26)
@@ -563,9 +615,11 @@ namespace VitaIOP
 		m_unaligned_write_cold_tails.clear();
 		m_cop2_load_cold_tails.clear();
 		m_cop2_store_cold_tails.clear();
-		// Trace blocks call out before every cycle increment; keep that validation
-		// path on the local address-add sequence and reserve r10 only for production blocks.
-		m_iop_cycle_base_register_available = !m_iop_ram_registers_available && !m_emit_trace_checks;
+		// Trace blocks call out before every cycle increment. Pure production
+		// blocks batch cycles once at the tail, so r10 is only useful for the
+		// remaining per-instruction cycle path.
+		m_iop_cycle_base_register_available =
+			!m_iop_ram_registers_available && !m_emit_trace_checks && !m_defer_cycle_updates;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8;
 		if (m_iop_ram_registers_available)
 			m_saved_registers |= REG_R10 | REG_R11;
@@ -643,30 +697,71 @@ namespace VitaIOP
 		return m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, PC_OFFSET);
 	}
 
-	bool BlockCompiler::EmitIncrementCycle()
+	bool BlockCompiler::EmitAddCycles(u32 cycles)
 	{
-		const auto emit_increment_from_address = [this](unsigned address_reg) {
-			return m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, address_reg, 0) &&
-				   m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1, true) &&
-				   m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
-				   m_code.EmitStrdImm8(HOST_TMP0, HOST_TMP1, address_reg, 0);
+		if (cycles == 0)
+			return true;
+
+		const auto emit_add_to_loaded_cycle = [this, cycles](unsigned address_reg, u8 offset) {
+			const unsigned cycle_scratch = (address_reg == HOST_TMP2) ? HOST_TMP3 : HOST_TMP2;
+			if (!m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, address_reg, offset))
+				return false;
+
+			if (cycles <= 0xff)
+			{
+				if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(cycles), true))
+					return false;
+			}
+			else
+			{
+				if (!m_code.EmitMovImm32(cycle_scratch, cycles) ||
+					!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, cycle_scratch, true))
+				{
+					return false;
+				}
+			}
+
+			return m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
+				   m_code.EmitStrdImm8(HOST_TMP0, HOST_TMP1, address_reg, offset);
 		};
 
 		if (m_iop_cycle_base_register_available)
-			return emit_increment_from_address(HOST_CYCLE_BASE);
+			return emit_add_to_loaded_cycle(HOST_CYCLE_BASE, 0);
 
 		if (CYCLE_OFFSET <= 0xff)
-			return emit_increment_from_address(HOST_PSX_REGS);
+			return emit_add_to_loaded_cycle(HOST_PSX_REGS, static_cast<u8>(CYCLE_OFFSET));
 
 		if (m_code.EmitAddImm32(HOST_TMP2, HOST_PSX_REGS, static_cast<u32>(CYCLE_OFFSET)))
-			return emit_increment_from_address(HOST_TMP2);
+			return emit_add_to_loaded_cycle(HOST_TMP2, 0);
 
-		return m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) &&
-			   m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, CYCLE_OFFSET + sizeof(u32)) &&
-			   m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1, true) &&
-			   m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, CYCLE_OFFSET + sizeof(u32)))
+		{
+			return false;
+		}
+
+		if (cycles <= 0xff)
+		{
+			if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(cycles), true))
+				return false;
+		}
+		else
+		{
+			if (!m_code.EmitMovImm32(HOST_TMP2, cycles) ||
+				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true))
+			{
+				return false;
+			}
+		}
+
+		return m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
 			   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) &&
 			   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, CYCLE_OFFSET + sizeof(u32));
+	}
+
+	bool BlockCompiler::EmitIncrementCycle()
+	{
+		return EmitAddCycles(1);
 	}
 
 	bool BlockCompiler::EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches)
@@ -2495,7 +2590,7 @@ namespace VitaIOP
 		if (((m_emit_trace_checks || IopInstructionRequiresCodeState(op)) && !EmitStoreCode(op)) ||
 			(m_emit_trace_checks && !EmitTraceCheck(pc, op, direct_exit_branches)) ||
 			(store_pc && !EmitStorePc(next_pc)) ||
-			!EmitIncrementCycle())
+			(!m_defer_cycle_updates && !EmitIncrementCycle()))
 		{
 			return false;
 		}
@@ -2533,6 +2628,13 @@ namespace VitaIOP
 			}
 		}
 		m_emit_trace_checks = VitaIsIopPreInstructionTraceEnabled();
+		m_defer_cycle_updates = !m_emit_trace_checks;
+		for (u32 i = 0; i < instruction_count && m_defer_cycle_updates; i++)
+		{
+			const u32 op = iopMemRead32(start_pc + i * 4);
+			if (!CanCompileOpcode(op) || !IopInstructionCanDeferCycleState(op))
+				m_defer_cycle_updates = false;
+		}
 
 		if (!BeginBlock())
 			return false;
@@ -2598,6 +2700,9 @@ namespace VitaIOP
 		}
 
 		const u32 next_pc = start_pc + instruction_count * 4;
+		if (m_defer_cycle_updates && !EmitAddCycles(instruction_count))
+			return false;
+
 		size_t direct_exit_offset = 0;
 		const bool emit_link_tail = direct_exit && direct_links && can_direct_link_fallthrough;
 		const bool emit_branch_link_tails = direct_exit && direct_links && has_native_static_branch;
