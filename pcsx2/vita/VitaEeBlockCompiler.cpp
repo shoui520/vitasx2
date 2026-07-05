@@ -3875,11 +3875,6 @@ namespace VitaEE
 				   m_code.PatchBranch(done_from_finite, done_target, VitaA32::Condition::NE);
 		};
 
-		const auto normalize_arithmetic_word = [&](unsigned reg) {
-			return m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) &&
-				   normalize_arithmetic_word_with_mask(reg, HOST_TMP2);
-		};
-
 		const auto store_result = [&](bool store_fcr31) {
 			if (store_fcr31 &&
 				!m_code.EmitStrImm12(HOST_TMP5, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))))
@@ -3945,20 +3940,14 @@ namespace VitaEE
 				   store_result(store_fcr31);
 		};
 
-		const auto clamp_result_no_flags = [&](bool store_fcr31) {
-			return m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_EXPONENT_MASK) &&
-				   clamp_result_no_flags_with_mask(store_fcr31, HOST_TMP3);
-		};
-
 		const auto clear_invalid_divide_causes = [&]() {
 			return m_code.EmitLdrImm12(HOST_TMP5, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) &&
 				   EmitBicImm32OrReg(HOST_TMP5, HOST_TMP5, FPU_FCR31_INVALID_DIVIDE_CAUSE_FLAGS, HOST_TMP2);
 		};
 
-		const auto emit_divide_by_zero_result = [&]() {
+		const auto emit_divide_by_zero_result = [&](unsigned exponent_mask_reg) {
 			if (!m_code.EmitLdrImm12(HOST_TMP5, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
+				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, exponent_mask_reg) ||
 				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
 				return false;
@@ -3984,7 +3973,7 @@ namespace VitaEE
 
 			const size_t flags_ready_target = m_code.Size();
 			return m_code.PatchBranch(flags_ready, flags_ready_target) &&
-				   m_code.EmitSubImm8(HOST_TMP3, HOST_TMP2, 1) &&
+				   m_code.EmitSubImm8(HOST_TMP3, exponent_mask_reg, 1) &&
 				   m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
 				   EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP2) &&
 				   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP3) &&
@@ -4006,7 +3995,7 @@ namespace VitaEE
 			if (divisor_nonzero == static_cast<size_t>(-1))
 				return false;
 
-			if (!emit_divide_by_zero_result())
+			if (!emit_divide_by_zero_result(HOST_TMP2))
 				return false;
 
 			const size_t done_from_zero = m_code.EmitBranchPlaceholder();
@@ -4015,7 +4004,7 @@ namespace VitaEE
 
 			const size_t divisor_nonzero_target = m_code.Size();
 			if (!m_code.PatchBranch(divisor_nonzero, divisor_nonzero_target, VitaA32::Condition::NE) ||
-				!m_code.EmitMovImm32(HOST_TMP5, FPU_FLOAT_EXPONENT_MASK) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP2, VitaA32::ShiftType::LSL, 0) ||
 				!normalize_arithmetic_word_with_mask(HOST_TMP0, HOST_TMP5) ||
 				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP5) ||
 				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
@@ -4160,7 +4149,8 @@ namespace VitaEE
 				!m_code.EmitVsqrtF32(VFP_FT_S1, VFP_FT_S1) ||
 				!m_code.EmitVdivF32(VFP_FD_S2, VFP_FS_S0, VFP_FT_S1) ||
 				!m_code.EmitVmovSToCore(HOST_TMP0, VFP_FD_S2) ||
-				!clamp_result_no_flags(true))
+				!m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP2, VitaA32::ShiftType::LSL, 0) ||
+				!clamp_result_no_flags_with_mask(true, HOST_TMP3))
 			{
 				return false;
 			}
