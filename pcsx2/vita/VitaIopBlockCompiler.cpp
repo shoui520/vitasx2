@@ -1287,6 +1287,15 @@ namespace VitaIOP
 
 		if ((opcode == 0x08 || opcode == 0x09) && IMM_S(op) == 0)
 			return EmitMoveGpr(rt, rs);
+		if ((opcode == 0x08 || opcode == 0x09) && rs == 0)
+		{
+			// PCSX2 owner: x86/iR3000Atables.cpp::rpsxADDI() reuses rpsxADDIU().
+			// The architectural zero register lets the Vita template skip the
+			// otherwise-dead load/add pair and materialize the sign-extended
+			// immediate directly.
+			return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(static_cast<s32>(IMM_S(op)))) &&
+				   EmitStoreGpr(rt, HOST_TMP0);
+		}
 
 		// PCSX2 owner: x86/iR3000Atables.cpp::rpsxLogicalOpI(). Preserve the
 		// same zero/no-op folds before loading rs into a host register.
@@ -1377,6 +1386,9 @@ namespace VitaIOP
 	{
 		const s32 imm = static_cast<s32>(IMM_S(op));
 		const unsigned scratch_reg = (host_reg == HOST_TMP1) ? HOST_TMP2 : HOST_TMP1;
+		if (RS(op) == 0)
+			return m_code.EmitMovImm32(host_reg, static_cast<u32>(imm));
+
 		if (!EmitLoadGpr(RS(op), host_reg))
 			return false;
 
