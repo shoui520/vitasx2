@@ -544,12 +544,22 @@ namespace VitaEE
 		};
 		bool EmitCop1WordMemoryColdTail(const Cop1WordMemoryColdTail& tail);
 
+		struct Cop2QwordMemoryColdTail
+		{
+			size_t handler_fallback = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+			const void* helper = nullptr;
+			unsigned rt = 0;
+		};
+		bool EmitCop2QwordMemoryColdTail(const Cop2QwordMemoryColdTail& tail);
+
 		VitaA32::CodeBuffer& m_code;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
 		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
 		std::vector<QwordLoadColdTail> m_qword_load_cold_tails;
 		std::vector<QwordStoreColdTail> m_qword_store_cold_tails;
 		std::vector<Cop1WordMemoryColdTail> m_cop1_word_memory_cold_tails;
+		std::vector<Cop2QwordMemoryColdTail> m_cop2_qword_memory_cold_tails;
 		u16 m_saved_registers = 0;
 		bool m_vtlb_registers_available = false;
 		};
