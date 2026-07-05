@@ -448,6 +448,7 @@ namespace VitaEE
 		bool EmitCop1Branch(u32 op);
 		bool EmitCop2Branch(u32 op);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
+		bool EmitSetLessThan64Imm(unsigned guest_reg, s32 imm, bool signed_compare);
 		bool EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,
 			bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask, bool counter_read_event);

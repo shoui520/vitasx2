@@ -4866,9 +4866,7 @@ namespace VitaEE
 			return true;
 
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
-			   m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
-			   m_code.EmitMovImm32(HOST_TMP3, (imm < 0) ? 0xffffffffu : 0) &&
-			   EmitSetLessThan64(rt, true);
+			   EmitSetLessThan64Imm(rt, imm, true);
 	}
 
 	bool BlockCompiler::EmitSLTIU(u32 op)
@@ -4881,9 +4879,7 @@ namespace VitaEE
 			return true;
 
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
-			   m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
-			   m_code.EmitMovImm32(HOST_TMP3, (imm < 0) ? 0xffffffffu : 0) &&
-			   EmitSetLessThan64(rt, false);
+			   EmitSetLessThan64Imm(rt, imm, false);
 	}
 
 	bool BlockCompiler::EmitANDI(u32 op)
@@ -9630,6 +9626,46 @@ namespace VitaEE
 
 		const size_t low_compare = m_code.Size();
 		if (!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2) ||
+			!m_code.EmitMovImm8(HOST_TMP4, 1, VitaA32::Condition::CC))
+		{
+			return false;
+		}
+
+		const size_t done_target = m_code.Size();
+		return m_code.PatchBranch(high_equal, low_compare, VitaA32::Condition::EQ) &&
+			   m_code.PatchBranch(done, done_target) &&
+			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   EmitStoreGpr64(guest_reg, HOST_TMP4, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitSetLessThan64Imm(unsigned guest_reg, s32 imm, bool signed_compare)
+	{
+		if (guest_reg == 0)
+			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::SLTI()/SLTIU(). The immediate is
+		// sign-extended to 64 bits, then compared as signed or unsigned.
+		const u32 imm_low = static_cast<u32>(imm);
+		const u32 imm_high = (imm < 0) ? 0xffffffffu : 0u;
+		if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
+			!m_code.EmitCmpImm32(HOST_TMP1, imm_high))
+		{
+			return false;
+		}
+
+		const size_t high_equal = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (high_equal == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovImm8(HOST_TMP4, 1, signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC))
+			return false;
+
+		const size_t done = m_code.EmitBranchPlaceholder();
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t low_compare = m_code.Size();
+		if (!EmitCmpImm32OrReg(HOST_TMP0, imm_low, HOST_TMP2) ||
 			!m_code.EmitMovImm8(HOST_TMP4, 1, VitaA32::Condition::CC))
 		{
 			return false;
