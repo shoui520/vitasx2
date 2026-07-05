@@ -407,7 +407,13 @@ namespace VitaA32
 
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
-			return false;
+		{
+			if (set_flags || !EncodeModifiedImmediate(0u - value, &encoded))
+				return false;
+
+			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_SUB |
+						   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | encoded);
+		}
 
 		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_ADD |
 					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
@@ -428,7 +434,13 @@ namespace VitaA32
 
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
-			return false;
+		{
+			if (set_flags || !EncodeModifiedImmediate(0u - value, &encoded))
+				return false;
+
+			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_ADD |
+						   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | encoded);
+		}
 
 		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_SUB |
 					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
