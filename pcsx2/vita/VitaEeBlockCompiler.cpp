@@ -3060,8 +3060,7 @@ namespace VitaEE
 			}
 
 			if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(12))) ||
-				!m_code.EmitMovImm32(HOST_TMP3, EI_ALLOWED_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP4, HOST_TMP2, HOST_TMP3, true))
+				!EmitAndImm32OrReg(HOST_TMP4, HOST_TMP2, EI_ALLOWED_MASK, HOST_TMP3, true))
 			{
 				return false;
 			}
@@ -3115,12 +3114,10 @@ namespace VitaEE
 				!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL, 4) ||
 				!m_code.EmitAddReg(HOST_TMP3, HOST_TMP3, HOST_TMP4) ||
 				!m_code.EmitLdrImm12(HOST_TMP4, HOST_TMP3, static_cast<u16>(TLB_PAGE_MASK_OFFSET)) ||
-				!m_code.EmitMovImm32(HOST_TMP5, TLB_PAGE_MASK_REGISTER_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP4, HOST_TMP4, HOST_TMP5) ||
+				!EmitAndImm32OrReg(HOST_TMP4, HOST_TMP4, TLB_PAGE_MASK_REGISTER_MASK, HOST_TMP5) ||
 				!m_code.EmitStrImm12(HOST_TMP4, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(5))) ||
 				!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP3, static_cast<u16>(TLB_ENTRY_HI_OFFSET)) ||
-				!m_code.EmitMovImm32(HOST_TMP5, 0x1f00u) ||
-				!m_code.EmitOrrReg(HOST_TMP5, HOST_TMP5, HOST_TMP4) ||
+				!EmitOrrImm32OrReg(HOST_TMP5, HOST_TMP4, 0x1f00u, HOST_TMP5) ||
 				!m_code.EmitMvnReg(HOST_TMP5, HOST_TMP5) ||
 				!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
 				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(10))) ||
@@ -3128,12 +3125,10 @@ namespace VitaEE
 				!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP3, static_cast<u16>(TLB_ENTRY_LO1_OFFSET)) ||
 				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP1) ||
 				!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 1) ||
-				!m_code.EmitMovImm32(HOST_TMP5, TLB_TLBR_ENTRY_LO0_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
+				!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, TLB_TLBR_ENTRY_LO0_MASK, HOST_TMP5) ||
 				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) ||
 				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(2))) ||
-				!m_code.EmitMovImm32(HOST_TMP5, TLB_TLBR_ENTRY_LO1_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP5) ||
+				!EmitAndImm32OrReg(HOST_TMP1, HOST_TMP1, TLB_TLBR_ENTRY_LO1_MASK, HOST_TMP5) ||
 				!m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
 				!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(3))))
 			{
@@ -3154,8 +3149,7 @@ namespace VitaEE
 			// The operation has no cycle-dependent side effects, so the normal
 			// block tail owns PC, cycle, and event testing.
 			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(10))) ||
-				!m_code.EmitMovImm32(HOST_TMP1, TLB_ENTRY_HI32_VPN2_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP1) ||
+				!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP0, TLB_ENTRY_HI32_VPN2_MASK, HOST_TMP1) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR, 24) ||
 				!m_code.EmitMovImm32(HOST_TMP5, static_cast<u32>(reinterpret_cast<uptr>(&tlb[0]))) ||
 				!m_code.EmitMovImm8(HOST_TMP4, 0))
@@ -3166,8 +3160,7 @@ namespace VitaEE
 			const size_t loop_start = m_code.Size();
 			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP5, static_cast<u16>(TLB_PAGE_MASK_OFFSET)) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, 13) ||
-				!m_code.EmitMovImm32(HOST_TMP1, TLB_MASK_FIELD_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) ||
+				!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, TLB_MASK_FIELD_MASK, HOST_TMP1) ||
 				!m_code.EmitMvnReg(HOST_TMP0, HOST_TMP0) ||
 				!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP5, static_cast<u16>(TLB_ENTRY_HI_OFFSET)) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, 13) ||
@@ -3310,8 +3303,7 @@ namespace VitaEE
 			constexpr u32 STATUS_EIE_MASK = 0x00010000u;
 
 			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(Cp0Offset(12))) ||
-				!m_code.EmitMovImm32(HOST_TMP1, DI_ALLOWED_MASK) ||
-				!m_code.EmitAndReg(HOST_TMP2, HOST_TMP0, HOST_TMP1, true))
+				!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP0, DI_ALLOWED_MASK, HOST_TMP1, true))
 			{
 				return false;
 			}
