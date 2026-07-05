@@ -9294,6 +9294,19 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
+		// PCSX2 owner: R5900OpcodeImpl.cpp::AND() assigns only UD[0].
+		// Fold $zero/self identities before loading both low-64 operands.
+		if (rs == 0 || rt == 0)
+			return EmitStoreGprZero64(rd);
+		if (rs == rt)
+		{
+			if (rd == rs)
+				return true;
+
+			return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
 			   m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
@@ -9309,6 +9322,19 @@ namespace VitaEE
 
 		if (rd == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::OR() assigns only UD[0].
+		if (rs == 0 || rt == 0 || rs == rt)
+		{
+			const unsigned src = (rs == 0) ? rt : rs;
+			if (src == 0)
+				return EmitStoreGprZero64(rd);
+			if (rd == src)
+				return true;
+
+			return EmitLoadGpr64(src, HOST_TMP0, HOST_TMP1) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
 
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
@@ -9326,6 +9352,19 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
+		// PCSX2 owner: R5900OpcodeImpl.cpp::XOR() assigns only UD[0].
+		if (rs == rt)
+			return EmitStoreGprZero64(rd);
+		if (rs == 0 || rt == 0)
+		{
+			const unsigned src = (rs == 0) ? rt : rs;
+			if (rd == src)
+				return true;
+
+			return EmitLoadGpr64(src, HOST_TMP0, HOST_TMP1) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
 			   m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
@@ -9341,6 +9380,22 @@ namespace VitaEE
 
 		if (rd == 0)
 			return true;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::NOR() assigns only UD[0].
+		if (rs == 0 && rt == 0)
+		{
+			return m_code.EmitMovImm32(HOST_TMP0, 0xffffffffu) &&
+				   m_code.EmitMovImm32(HOST_TMP1, 0xffffffffu) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+		if (rs == 0 || rt == 0 || rs == rt)
+		{
+			const unsigned src = (rs == 0) ? rt : rs;
+			return EmitLoadGpr64(src, HOST_TMP0, HOST_TMP1) &&
+				   m_code.EmitMvnReg(HOST_TMP0, HOST_TMP0) &&
+				   m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
 
 		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
 			   EmitLoadGpr64(rt, HOST_TMP2, HOST_TMP3) &&
