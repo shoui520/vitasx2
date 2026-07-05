@@ -4830,9 +4830,26 @@ namespace VitaEE
 
 		if (rt == 0)
 			return true;
+		if (imm == 0 && rt == rs)
+			return true;
 
-		return EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1) &&
-			   m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
+		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1))
+			return false;
+
+		// PCSX2 owner: R5900OpcodeImpl.cpp::DADDIU() sign-extends the 16-bit
+		// immediate and performs the 64-bit add without overflow trapping.
+		if (imm == 0)
+			return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+
+		if (imm > 0 && m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(imm), true))
+			return m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+
+		if (imm < 0 && m_code.EmitSubImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(-imm), true))
+			return m_code.EmitSbcImm8(HOST_TMP1, HOST_TMP1, 0) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+
+		return m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
 			   m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true) &&
 			   m_code.EmitMovImm32(HOST_TMP2, (imm < 0) ? 0xffffffffu : 0) &&
 			   m_code.EmitAdcReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&

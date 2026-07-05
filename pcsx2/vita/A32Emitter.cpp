@@ -545,6 +545,13 @@ namespace VitaA32
 		return EmitU32(EncodeAdcImm8(rd, rn, value, set_flags));
 	}
 
+	bool CodeBuffer::EmitSbcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn))
+			return false;
+		return EmitU32(EncodeSbcImm8(rd, rn, value, set_flags));
+	}
+
 	bool CodeBuffer::EmitMovRegShiftImm(unsigned rd, unsigned rm, ShiftType shift, u8 amount, bool set_flags,
 		Condition condition)
 	{
@@ -1556,6 +1563,14 @@ namespace VitaA32
 		pxAssert(IsRegister(rd));
 		pxAssert(IsRegister(rn));
 		return CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_ADC | (set_flags ? SET_FLAGS : 0) |
+			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | value;
+	}
+
+	u32 EncodeSbcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	{
+		pxAssert(IsRegister(rd));
+		pxAssert(IsRegister(rn));
+		return CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_SBC | (set_flags ? SET_FLAGS : 0) |
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | value;
 	}
 
