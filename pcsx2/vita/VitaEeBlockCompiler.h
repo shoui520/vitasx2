@@ -137,6 +137,14 @@ namespace VitaEE
 			Word,
 		};
 
+		enum class ScalarStoreWidth : u8
+		{
+			Byte,
+			Halfword,
+			Word,
+			Dword,
+		};
+
 	public:
 		explicit BlockCompiler(VitaA32::CodeBuffer& code);
 
@@ -492,8 +500,23 @@ namespace VitaEE
 
 		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);
 
+		struct ScalarStoreColdTail
+		{
+			size_t unaligned_fallback = static_cast<size_t>(-1);
+			size_t handler_fallback = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+			u32 pc = 0;
+			u32 raw_cycles_through_instruction = 0;
+			const void* event_exit = nullptr;
+			const void* write_helper = nullptr;
+			unsigned rt = 0;
+			ScalarStoreWidth width = ScalarStoreWidth::Byte;
+		};
+		bool EmitScalarStoreColdTail(const ScalarStoreColdTail& tail);
+
 		VitaA32::CodeBuffer& m_code;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
+		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
 		u16 m_saved_registers = 0;
 		bool m_vtlb_registers_available = false;
 		};

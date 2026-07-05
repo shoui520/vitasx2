@@ -1902,6 +1902,7 @@ namespace VitaEE
 	bool BlockCompiler::BeginBlock(bool use_vtlb_registers)
 	{
 		m_scalar_load_cold_tails.clear();
+		m_scalar_store_cold_tails.clear();
 		m_vtlb_registers_available = use_vtlb_registers;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6;
 		if (use_vtlb_registers)
@@ -8876,19 +8877,18 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if (!EmitLoadGprLow(rt, HOST_TMP1) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite8)))
-		{
-			return false;
-		}
-
-		return m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size());
+		m_scalar_store_cold_tails.push_back({
+			static_cast<size_t>(-1),
+			handler_fallback,
+			m_code.Size(),
+			0,
+			0,
+			nullptr,
+			reinterpret_cast<const void*>(&VitaEeMemWrite8),
+			rt,
+			ScalarStoreWidth::Byte,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitSH(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
@@ -8914,29 +8914,18 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if (!EmitLoadGprLow(rt, HOST_TMP1) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite16Checked)))
-		{
-			return false;
-		}
-
-		const size_t after_address_error = m_code.EmitBranchPlaceholder();
-		if (after_address_error == static_cast<size_t>(-1))
-			return false;
-
-		const size_t address_error_target = m_code.Size();
-		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, true))
-			return false;
-
-		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
-			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size()) &&
-			   m_code.PatchBranch(after_address_error, m_code.Size());
+		m_scalar_store_cold_tails.push_back({
+			unaligned_fallback,
+			handler_fallback,
+			m_code.Size(),
+			pc,
+			raw_cycles_through_instruction,
+			event_exit,
+			reinterpret_cast<const void*>(&VitaEeMemWrite16Checked),
+			rt,
+			ScalarStoreWidth::Halfword,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitSW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
@@ -8962,29 +8951,18 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if (!EmitLoadGprLow(rt, HOST_TMP1) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite32Checked)))
-		{
-			return false;
-		}
-
-		const size_t after_address_error = m_code.EmitBranchPlaceholder();
-		if (after_address_error == static_cast<size_t>(-1))
-			return false;
-
-		const size_t address_error_target = m_code.Size();
-		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, true))
-			return false;
-
-		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
-			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size()) &&
-			   m_code.PatchBranch(after_address_error, m_code.Size());
+		m_scalar_store_cold_tails.push_back({
+			unaligned_fallback,
+			handler_fallback,
+			m_code.Size(),
+			pc,
+			raw_cycles_through_instruction,
+			event_exit,
+			reinterpret_cast<const void*>(&VitaEeMemWrite32Checked),
+			rt,
+			ScalarStoreWidth::Word,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitSWL(u32 op)
@@ -9021,29 +8999,18 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if (!EmitLoadGpr64(rt, HOST_TMP1, HOST_TMP2) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemWrite64Checked)))
-		{
-			return false;
-		}
-
-		const size_t after_address_error = m_code.EmitBranchPlaceholder();
-		if (after_address_error == static_cast<size_t>(-1))
-			return false;
-
-		const size_t address_error_target = m_code.Size();
-		if (!EmitAddressErrorEventExit(pc + 4, raw_cycles_through_instruction, event_exit, true))
-			return false;
-
-		return m_code.PatchBranch(unaligned_fallback, address_error_target, VitaA32::Condition::NE) &&
-			   m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size()) &&
-			   m_code.PatchBranch(after_address_error, m_code.Size());
+		m_scalar_store_cold_tails.push_back({
+			unaligned_fallback,
+			handler_fallback,
+			m_code.Size(),
+			pc,
+			raw_cycles_through_instruction,
+			event_exit,
+			reinterpret_cast<const void*>(&VitaEeMemWrite64Checked),
+			rt,
+			ScalarStoreWidth::Dword,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitSDL(u32 op)
@@ -10436,7 +10403,14 @@ namespace VitaEE
 				return false;
 		}
 
+		for (const ScalarStoreColdTail& tail : m_scalar_store_cold_tails)
+		{
+			if (!EmitScalarStoreColdTail(tail))
+				return false;
+		}
+
 		m_scalar_load_cold_tails.clear();
+		m_scalar_store_cold_tails.clear();
 		return true;
 	}
 
@@ -10503,6 +10477,48 @@ namespace VitaEE
 		{
 			return false;
 		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
+	}
+
+	bool BlockCompiler::EmitScalarStoreColdTail(const ScalarStoreColdTail& tail)
+	{
+		// PCSX2 owner: vtlb.cpp::vtlb_memWrite*() / R5900OpcodeImpl.cpp::SB/SH/SW/SD().
+		// Handler and unaligned writes keep the existing helper/event behavior;
+		// the non-handler VTLB path falls through after the native store.
+		if (tail.unaligned_fallback != static_cast<size_t>(-1))
+		{
+			const size_t address_error_target = m_code.Size();
+			if (!m_code.PatchBranch(tail.unaligned_fallback, address_error_target, VitaA32::Condition::NE) ||
+				!EmitAddressErrorEventExit(tail.pc + 4, tail.raw_cycles_through_instruction, tail.event_exit, true))
+			{
+				return false;
+			}
+		}
+
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
+			return false;
+
+		switch (tail.width)
+		{
+			case ScalarStoreWidth::Byte:
+			case ScalarStoreWidth::Halfword:
+			case ScalarStoreWidth::Word:
+				if (!EmitLoadGprLow(tail.rt, HOST_TMP1))
+					return false;
+				break;
+
+			case ScalarStoreWidth::Dword:
+				if (!EmitLoadGpr64(tail.rt, HOST_TMP1, HOST_TMP2))
+					return false;
+				break;
+		}
+
+		if (!m_code.EmitCallAbsolute(tail.write_helper))
+			return false;
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();
 		return tail_done != static_cast<size_t>(-1) &&
