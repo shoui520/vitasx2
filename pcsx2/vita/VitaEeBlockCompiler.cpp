@@ -1903,6 +1903,7 @@ namespace VitaEE
 	{
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
+		m_qword_load_cold_tails.clear();
 		m_vtlb_registers_available = use_vtlb_registers;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6;
 		if (use_vtlb_registers)
@@ -8712,20 +8713,13 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeMemRead128Aligned)))
-		{
-			return false;
-		}
-
-		return m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size());
+		m_qword_load_cold_tails.push_back({
+			handler_fallback,
+			m_code.Size(),
+			reinterpret_cast<const void*>(&VitaEeMemRead128Aligned),
+			rt,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitLWC1(u32 op)
@@ -10377,8 +10371,15 @@ namespace VitaEE
 				return false;
 		}
 
+		for (const QwordLoadColdTail& tail : m_qword_load_cold_tails)
+		{
+			if (!EmitQwordLoadColdTail(tail))
+				return false;
+		}
+
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
+		m_qword_load_cold_tails.clear();
 		return true;
 	}
 
@@ -10502,6 +10503,25 @@ namespace VitaEE
 
 		if (!m_code.EmitCallAbsolute(tail.write_helper))
 			return false;
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
+	}
+
+	bool BlockCompiler::EmitQwordLoadColdTail(const QwordLoadColdTail& tail)
+	{
+		// PCSX2 owner: vtlb.cpp::vtlb_memRead128() / R5900OpcodeImpl.cpp::LQ().
+		// Handler-backed pages call the existing helper; non-handler pages fall
+		// through after the native NEON load/store.
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
+			!m_code.EmitCallAbsolute(tail.read_helper))
+		{
+			return false;
+		}
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();
 		return tail_done != static_cast<size_t>(-1) &&
