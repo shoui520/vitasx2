@@ -747,9 +747,10 @@ public:
 
 	__forceinline GSVector4i f64toi32(bool truncate = true) const
 	{
-		const s32 x = static_cast<s32>(truncate ? std::trunc(F64[0]) : std::nearbyint(F64[0]));
-		const s32 y = static_cast<s32>(truncate ? std::trunc(F64[1]) : std::nearbyint(F64[1]));
-		return GSVector4i(x, y, 0, 0);
+		const s32 x = static_cast<s32>(truncate ? F64[0] : std::nearbyint(F64[0]));
+		const s32 y = static_cast<s32>(truncate ? F64[1] : std::nearbyint(F64[1]));
+		const u64 xy = static_cast<u32>(x) | (static_cast<u64>(static_cast<u32>(y)) << 32);
+		return GSVector4i(vcombine_s32(vcreate_s32(xy), vdup_n_s32(0)));
 	}
 
 	// clang-format off
