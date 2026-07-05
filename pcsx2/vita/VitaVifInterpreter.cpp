@@ -263,6 +263,19 @@ namespace
 		return vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(halves)));
 	}
 
+	uint32x4_t VitaVifLoadV4_5VectorNeon(const u8* src)
+	{
+		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_V4_5() and
+		// arm64/Vif_UnpackNEON.cpp::xUPK_V4_5(). V4-5 ignores USN/MODE and
+		// expands packed 5:5:5:1 color into byte-scaled XYZW lanes.
+		const u32 data = VitaVifLoadU16(src);
+		return VitaVifVectorFromWordsNeon(
+			(data & 0x001fu) << 3,
+			(data & 0x03e0u) >> 2,
+			(data & 0x7c00u) >> 7,
+			(data & 0x8000u) >> 8);
+	}
+
 	bool VitaVifLoadUnpackVectorNeon(
 		const u8* src,
 		u32 format,
@@ -790,6 +803,14 @@ namespace
 	void VitaVifUnpackV4_5Vector(vifStruct& vif, const VIFregisters& regs, u8* dest, const u8* src, bool doMask)
 	{
 		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4_5(). V4-5 ignores MODE.
+#if VITASX2_VIF_HAS_ARM_NEON
+		const uint32x4_t unpacked = VitaVifLoadV4_5VectorNeon(src);
+		if (doMask)
+			VitaVifStoreModeVectorNeon(vif, regs, dest, 0, true, unpacked);
+		else
+			VitaVifStoreVectorNeon(dest, unpacked);
+		return;
+#endif
 		const u32 data = VitaVifLoadU16(src);
 		const u32 x = (data & 0x001fu) << 3;
 		const u32 y = (data & 0x03e0u) >> 2;
@@ -915,12 +936,16 @@ namespace
 
 			case 0x0f: // V4-5
 			{
+#if VITASX2_VIF_HAS_ARM_NEON
+				VitaVifStoreVectorNeon(dest, VitaVifLoadV4_5VectorNeon(src));
+#else
 				const u32 data = VitaVifLoadU16(src);
 				const u32 x = (data & 0x001fu) << 3;
 				const u32 y = (data & 0x03e0u) >> 2;
 				const u32 z = (data & 0x7c00u) >> 7;
 				const u32 w = (data & 0x8000u) >> 8;
 				VitaVifStoreWords(dest, x, y, z, w);
+#endif
 				return true;
 			}
 
