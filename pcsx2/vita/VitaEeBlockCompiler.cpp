@@ -2463,12 +2463,7 @@ namespace VitaEE
 			return false;
 		}
 
-		if (block_cycles <= 255)
-		{
-			if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(block_cycles), true))
-				return false;
-		}
-		else
+		if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, block_cycles, true))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
 				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true))
@@ -2577,12 +2572,7 @@ namespace VitaEE
 			return false;
 
 		const auto add_cycles = [this](u32 cycles) {
-			if (cycles <= 255)
-			{
-				if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(cycles), true))
-					return false;
-			}
-			else
+			if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, cycles, true))
 			{
 				if (!m_code.EmitMovImm32(HOST_TMP2, cycles) ||
 					!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true))
@@ -2883,12 +2873,7 @@ namespace VitaEE
 			return false;
 		}
 
-		if (scaled_cycles_through_instruction <= 255)
-		{
-			if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(scaled_cycles_through_instruction), true))
-				return false;
-		}
-		else
+		if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, scaled_cycles_through_instruction, true))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, scaled_cycles_through_instruction) ||
 				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true))
@@ -10509,12 +10494,7 @@ namespace VitaEE
 		if (!EmitLoadCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2))
 			return false;
 
-		if (cycles <= 255)
-		{
-			if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(cycles), true))
-				return false;
-		}
-		else
+		if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, cycles, true))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, cycles) ||
 				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true))

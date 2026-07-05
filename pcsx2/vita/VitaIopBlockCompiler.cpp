@@ -740,12 +740,7 @@ namespace VitaIOP
 			if (!m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, address_reg, offset))
 				return false;
 
-			if (cycles <= 0xff)
-			{
-				if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(cycles), true))
-					return false;
-			}
-			else
+			if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, cycles, true))
 			{
 				if (!m_code.EmitMovImm32(cycle_scratch, cycles) ||
 					!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, cycle_scratch, true))
@@ -773,12 +768,7 @@ namespace VitaIOP
 			return false;
 		}
 
-		if (cycles <= 0xff)
-		{
-			if (!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(cycles), true))
-				return false;
-		}
-		else
+		if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, cycles, true))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, cycles) ||
 				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true))
