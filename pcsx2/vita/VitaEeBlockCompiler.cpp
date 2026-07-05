@@ -1633,6 +1633,7 @@ namespace VitaEE
 	bool BlockCompiler::EmitAndImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags)
 	{
 		return m_code.EmitAndImm32(rd, rn, value, set_flags) ||
+			   (!set_flags && m_code.EmitBicImm32(rd, rn, ~value)) ||
 			   (m_code.EmitMovImm32(scratch, value) && m_code.EmitAndReg(rd, rn, scratch, set_flags));
 	}
 
@@ -1651,6 +1652,7 @@ namespace VitaEE
 	bool BlockCompiler::EmitBicImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags)
 	{
 		return m_code.EmitBicImm32(rd, rn, value, set_flags) ||
+			   (!set_flags && m_code.EmitAndImm32(rd, rn, ~value)) ||
 			   (m_code.EmitMovImm32(scratch, ~value) && m_code.EmitAndReg(rd, rn, scratch, set_flags));
 	}
 
