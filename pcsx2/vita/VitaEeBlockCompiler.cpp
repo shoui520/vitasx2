@@ -1907,6 +1907,7 @@ namespace VitaEE
 		m_qword_store_cold_tails.clear();
 		m_cop1_word_memory_cold_tails.clear();
 		m_cop2_qword_memory_cold_tails.clear();
+		m_partial_memory_cold_tails.clear();
 		m_vtlb_registers_available = use_vtlb_registers;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6;
 		if (use_vtlb_registers)
@@ -9854,22 +9855,15 @@ namespace VitaEE
 			}
 		}
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
 		const void* fallback_helper = left ? reinterpret_cast<const void*>(&VitaEeMemReadWordLeft) :
 											 reinterpret_cast<const void*>(&VitaEeMemReadWordRight);
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) ||
-			!m_code.EmitCallAbsolute(fallback_helper))
-		{
-			return false;
-		}
-
-		return m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size());
+		m_partial_memory_cold_tails.push_back({
+			handler_fallback,
+			m_code.Size(),
+			fallback_helper,
+			rt,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitPartialWordStore(u32 op, bool left)
@@ -9913,22 +9907,15 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t fallback_target = m_code.Size();
 		const void* fallback_helper = left ? reinterpret_cast<const void*>(&VitaEeMemWriteWordLeft) :
 											 reinterpret_cast<const void*>(&VitaEeMemWriteWordRight);
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) ||
-			!m_code.EmitCallAbsolute(fallback_helper))
-		{
-			return false;
-		}
-
-		return m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI) &&
-			   m_code.PatchBranch(done, m_code.Size());
+		m_partial_memory_cold_tails.push_back({
+			handler_fallback,
+			m_code.Size(),
+			fallback_helper,
+			rt,
+		});
+		return true;
 	}
 
 	bool BlockCompiler::EmitPartialDwordLoad(u32 op, bool left)
@@ -10013,26 +10000,21 @@ namespace VitaEE
 				return false;
 		}
 
-		const size_t fallback_target = m_code.Size();
 		const void* fallback_helper = left ? reinterpret_cast<const void*>(&VitaEeMemReadDwordLeft) :
 											 reinterpret_cast<const void*>(&VitaEeMemReadDwordRight);
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) ||
-			!m_code.EmitCallAbsolute(fallback_helper))
-		{
-			return false;
-		}
-
 		const size_t done_target = m_code.Size();
-		if (!m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI))
-			return false;
-
 		for (size_t branch : done_branches)
 		{
 			if (!m_code.PatchBranch(branch, done_target))
 				return false;
 		}
 
+		m_partial_memory_cold_tails.push_back({
+			handler_fallback,
+			done_target,
+			fallback_helper,
+			rt,
+		});
 		return true;
 	}
 
@@ -10115,26 +10097,21 @@ namespace VitaEE
 				return false;
 		}
 
-		const size_t fallback_target = m_code.Size();
 		const void* fallback_helper = left ? reinterpret_cast<const void*>(&VitaEeMemWriteDwordLeft) :
 											 reinterpret_cast<const void*>(&VitaEeMemWriteDwordRight);
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(rt)) ||
-			!m_code.EmitCallAbsolute(fallback_helper))
-		{
-			return false;
-		}
-
 		const size_t done_target = m_code.Size();
-		if (!m_code.PatchBranch(handler_fallback, fallback_target, VitaA32::Condition::MI))
-			return false;
-
 		for (size_t branch : done_branches)
 		{
 			if (!m_code.PatchBranch(branch, done_target))
 				return false;
 		}
 
+		m_partial_memory_cold_tails.push_back({
+			handler_fallback,
+			done_target,
+			fallback_helper,
+			rt,
+		});
 		return true;
 	}
 
@@ -10363,12 +10340,19 @@ namespace VitaEE
 				return false;
 		}
 
+		for (const PartialMemoryColdTail& tail : m_partial_memory_cold_tails)
+		{
+			if (!EmitPartialMemoryColdTail(tail))
+				return false;
+		}
+
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
 		m_qword_load_cold_tails.clear();
 		m_qword_store_cold_tails.clear();
 		m_cop1_word_memory_cold_tails.clear();
 		m_cop2_qword_memory_cold_tails.clear();
+		m_partial_memory_cold_tails.clear();
 		return true;
 	}
 
@@ -10562,6 +10546,26 @@ namespace VitaEE
 		// plus VU0.cpp::LQC2()/SQC2(). The handler branch is emitted before
 		// LQC2/SQC2 replace HOST_TMP5 with the translated host pointer, so the
 		// helper still receives the original guest address from HOST_TMP5.
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
+			!m_code.EmitCallAbsolute(tail.helper))
+		{
+			return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(tail_done, tail.join_offset);
+	}
+
+	bool BlockCompiler::EmitPartialMemoryColdTail(const PartialMemoryColdTail& tail)
+	{
+		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() plus
+		// R5900OpcodeImpl.cpp::LWL/LWR/LDL/LDR/SWL/SWR/SDL/SDR().
+		// Partial accesses do not raise address errors; handler-backed pages
+		// call the existing helper, while non-handler pages fall through.
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
