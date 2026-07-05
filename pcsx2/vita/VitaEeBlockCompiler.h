@@ -154,7 +154,7 @@ namespace VitaEE
 		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
 
-		bool BeginBlock(bool use_vtlb_registers);
+		bool BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register);
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
@@ -469,6 +469,8 @@ namespace VitaEE
 		bool EmitStoreCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
 		bool EmitLoadCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch);
 		bool EmitStoreCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch);
+		bool EmitCop1ExponentMask(unsigned host_reg);
+		bool EmitAndCop1ExponentMask(unsigned rd, unsigned rn, unsigned scratch);
 		bool EmitAddScaledCyclesToCpu(u32 cycles);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitCpuRegsAddress(unsigned host_reg, size_t offset);
@@ -581,5 +583,6 @@ namespace VitaEE
 		std::vector<PartialMemoryColdTail> m_partial_memory_cold_tails;
 		u16 m_saved_registers = 0;
 		bool m_vtlb_registers_available = false;
+		bool m_cop1_exponent_mask_available = false;
 		};
 	} // namespace VitaEE

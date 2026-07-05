@@ -70,6 +70,7 @@ namespace VitaEE
 		constexpr u16 REG_R6 = 1u << 6;
 		constexpr u16 REG_R7 = 1u << 7;
 		constexpr u16 REG_R8 = 1u << 8;
+		constexpr u16 REG_R10 = 1u << 10;
 		constexpr u16 REG_LR = 1u << 14;
 		constexpr u16 REG_PC = 1u << 15;
 
@@ -85,6 +86,7 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP5 = 6;
 		constexpr unsigned HOST_VTLB_VMAP = 7;
 		constexpr unsigned HOST_VTLB_HOST_MEMORY_BASE = 8;
+		constexpr unsigned HOST_COP1_EXPONENT_MASK = 10;
 
 		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
 		constexpr size_t HI_OFFSET = offsetof(cpuRegisters, HI);
@@ -647,6 +649,17 @@ namespace VitaEE
 				   IsFastCOP1ScalarWordOp(op) ||
 				   IsFastCOP1CompareOp(op) || IsFastCOP1ConvertWordOp(op) ||
 				   IsFastCOP1ConvertSingleOp(op);
+		}
+
+		bool FastCOP1UsesExponentMask(u32 op)
+		{
+			if (IsFastCOP1ArithmeticOp(op) || IsFastCOP1DivSqrtOp(op) ||
+				IsFastCOP1AccumulatorOp(op) || IsFastCOP1ConvertWordOp(op))
+			{
+				return true;
+			}
+
+			return IsFastCOP1CompareOp(op) && (op & 0x3f) != 0x30; // C_F only clears FCR31.C.
 		}
 
 		bool IsCOP2Special2Supported(u32 index)
@@ -1913,7 +1926,19 @@ namespace VitaEE
 		return false;
 	}
 
-	bool BlockCompiler::BeginBlock(bool use_vtlb_registers)
+	bool BlockShouldUseCop1ExponentMaskRegister(u32 start_pc, u32 instruction_count)
+	{
+		unsigned mask_users = 0;
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			if (FastCOP1UsesExponentMask(memRead32(start_pc + i * 4)) && ++mask_users >= 2)
+				return true;
+		}
+
+		return false;
+	}
+
+	bool BlockCompiler::BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register)
 	{
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
@@ -1923,9 +1948,12 @@ namespace VitaEE
 		m_cop2_qword_memory_cold_tails.clear();
 		m_partial_memory_cold_tails.clear();
 		m_vtlb_registers_available = use_vtlb_registers;
+		m_cop1_exponent_mask_available = use_cop1_exponent_mask_register;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6;
 		if (use_vtlb_registers)
 			m_saved_registers |= REG_R7 | REG_R8;
+		if (use_cop1_exponent_mask_register)
+			m_saved_registers |= REG_R10;
 
 		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
 			!m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))))
@@ -1933,18 +1961,22 @@ namespace VitaEE
 			return false;
 		}
 
-		if (!use_vtlb_registers)
-			return true;
+		if (use_cop1_exponent_mask_register &&
+			!m_code.EmitMovImm32(HOST_COP1_EXPONENT_MASK, FPU_FLOAT_EXPONENT_MASK))
+		{
+			return false;
+		}
 
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() read
 		// these stable pointers from vtlbdata for every access. Keep them
 		// resident for EE A32 blocks that actually emit VTLB fast paths.
-		return m_code.EmitMovImm32(HOST_VTLB_VMAP,
+		return !use_vtlb_registers ||
+			   (m_code.EmitMovImm32(HOST_VTLB_VMAP,
 				   static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.vmap))) &&
 			   m_code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_VTLB_VMAP, 0) &&
 			   m_code.EmitMovImm32(HOST_VTLB_HOST_MEMORY_BASE,
 				   static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.host_memory_base))) &&
-			   m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0);
+			   m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0));
 	}
 
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit,
@@ -1956,7 +1988,8 @@ namespace VitaEE
 		if (direct_links)
 			*direct_links = {};
 
-		if (!BeginBlock(BlockMayUseVtlbFastPath(start_pc, instruction_count)))
+		if (!BeginBlock(BlockMayUseVtlbFastPath(start_pc, instruction_count),
+				BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count)))
 			return false;
 		if (!EmitGoemonBlockStartHook(start_pc))
 			return false;
@@ -3787,7 +3820,7 @@ namespace VitaEE
 
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) ||
-			!m_code.EmitMovImm32(HOST_TMP5, FPU_FLOAT_EXPONENT_MASK) ||
+			!EmitCop1ExponentMask(HOST_TMP5) ||
 			!normalize_arithmetic_word(HOST_TMP0) ||
 			!normalize_arithmetic_word(HOST_TMP1) ||
 			!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
@@ -3985,7 +4018,7 @@ namespace VitaEE
 		{
 			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) ||
 				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
+				!EmitCop1ExponentMask(HOST_TMP2) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP1, HOST_TMP2) ||
 				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
@@ -4024,7 +4057,7 @@ namespace VitaEE
 		{
 			if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) ||
 				!clear_invalid_divide_causes() ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
+				!EmitCop1ExponentMask(HOST_TMP2) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP1, HOST_TMP2) ||
 				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
@@ -4088,7 +4121,7 @@ namespace VitaEE
 			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) ||
 				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) ||
 				!clear_invalid_divide_causes() ||
-				!m_code.EmitMovImm32(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK) ||
+				!EmitCop1ExponentMask(HOST_TMP2) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP1, HOST_TMP2) ||
 				!m_code.EmitCmpImm32(HOST_TMP3, 0))
 			{
@@ -4309,7 +4342,7 @@ namespace VitaEE
 		const auto load_normalized_operands = [&]() {
 			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) &&
 				   m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) &&
-				   m_code.EmitMovImm32(HOST_TMP5, FPU_FLOAT_EXPONENT_MASK) &&
+				   EmitCop1ExponentMask(HOST_TMP5) &&
 				   normalize_arithmetic_word(HOST_TMP0) &&
 				   normalize_arithmetic_word(HOST_TMP1) &&
 				   m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) &&
@@ -4579,7 +4612,7 @@ namespace VitaEE
 
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) ||
-			!m_code.EmitMovImm32(HOST_TMP5, FPU_FLOAT_EXPONENT_MASK) ||
+			!EmitCop1ExponentMask(HOST_TMP5) ||
 			!normalize_compare_word(HOST_TMP0) ||
 			!normalize_compare_word(HOST_TMP1))
 		{
@@ -4615,7 +4648,7 @@ namespace VitaEE
 		const unsigned fd = (op >> 6) & 0x1f;
 
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) ||
-			!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP0, FPU_FLOAT_EXPONENT_MASK, HOST_TMP1) ||
+			!EmitAndCop1ExponentMask(HOST_TMP2, HOST_TMP0, HOST_TMP1) ||
 			!EmitCmpImm32OrReg(HOST_TMP2, FPU_CVT_W_MAX_EXPONENT_MASK, HOST_TMP3))
 		{
 			return false;
@@ -10684,6 +10717,25 @@ namespace VitaEE
 
 		return EmitCpuRegsAddress(address_scratch, offset) &&
 			   m_code.EmitVst1Q32Aligned(qreg, address_scratch);
+	}
+
+	bool BlockCompiler::EmitCop1ExponentMask(unsigned host_reg)
+	{
+		if (!m_cop1_exponent_mask_available)
+			return m_code.EmitMovImm32(host_reg, FPU_FLOAT_EXPONENT_MASK);
+
+		if (host_reg == HOST_COP1_EXPONENT_MASK)
+			return true;
+
+		return m_code.EmitMovRegShiftImm(host_reg, HOST_COP1_EXPONENT_MASK, VitaA32::ShiftType::LSL, 0);
+	}
+
+	bool BlockCompiler::EmitAndCop1ExponentMask(unsigned rd, unsigned rn, unsigned scratch)
+	{
+		if (m_cop1_exponent_mask_available)
+			return m_code.EmitAndReg(rd, rn, HOST_COP1_EXPONENT_MASK);
+
+		return EmitAndImm32OrReg(rd, rn, FPU_FLOAT_EXPONENT_MASK, scratch);
 	}
 
 	bool BlockCompiler::EmitAddScaledCyclesToCpu(u32 cycles)
