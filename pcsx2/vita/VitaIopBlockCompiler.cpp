@@ -530,6 +530,8 @@ namespace
 	static_assert(GprOffset(33) + sizeof(u32) <= 4095);
 	static_assert(HI_OFFSET + sizeof(u32) <= 4095);
 	static_assert(LO_OFFSET + sizeof(u32) <= 4095);
+	static_assert(LO_OFFSET == HI_OFFSET + sizeof(u32));
+	static_assert(HI_OFFSET <= 0xff);
 	static_assert(Cp0Offset(31) + sizeof(u32) <= 4095);
 	static_assert(CP0_STATUS_OFFSET + sizeof(u32) <= 4095);
 	static_assert(Cp2dOffset(31) + sizeof(u32) <= 4095);
@@ -1188,6 +1190,11 @@ namespace VitaIOP
 			return m_code.EmitStrImm12(lo_reg, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
 				   m_code.EmitStrImm12(hi_reg, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
 		};
+		const auto store_hilo_from_hi_lo_pair = [this]() {
+			// PCSX2 owner: R3000A.h::GPRRegs lays out HI then LO; A32 STRD can
+			// write the adjacent pair when HOST_TMP2=HI and HOST_TMP3=LO.
+			return m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_PSX_REGS, static_cast<u8>(HI_OFFSET));
+		};
 
 		const void* helper = is_signed ?
 			reinterpret_cast<const void*>(&VitaIopA32DivResult) :
@@ -1291,14 +1298,14 @@ namespace VitaIOP
 		if (is_signed)
 		{
 			if (!patch_branch(negone_branch, m_code.Size()) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP3, HOST_TMP0) ||
-				!store_hilo(HOST_TMP2, HOST_TMP3) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!m_code.EmitRsbImm32(HOST_TMP3, HOST_TMP0, 0) ||
+				!store_hilo_from_hi_lo_pair() ||
 				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
 				!patch_branch(equal_branch, m_code.Size()) ||
-				!m_code.EmitMovImm8(HOST_TMP2, 1) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!store_hilo(HOST_TMP2, HOST_TMP3) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 1) ||
+				!store_hilo_from_hi_lo_pair() ||
 				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
 				!patch_branch(power_of_two_branch, m_code.Size()) ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP0, VitaA32::ShiftType::ASR, 31) ||
@@ -1323,9 +1330,9 @@ namespace VitaIOP
 				!store_hilo(HOST_TMP2, HOST_TMP0) ||
 				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
 				!patch_branch(equal_branch, m_code.Size()) ||
-				!m_code.EmitMovImm8(HOST_TMP2, 1) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!store_hilo(HOST_TMP2, HOST_TMP3) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 1) ||
+				!store_hilo_from_hi_lo_pair() ||
 				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
 				!patch_branch(power_of_two_branch, m_code.Size()) ||
 				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
