@@ -911,6 +911,12 @@ namespace VitaIOP
 					return store_zero();
 				if (rt == 0)
 					return EmitMoveGpr(rd, rs);
+				if (rs == 0)
+				{
+					return EmitLoadGpr(rt, HOST_TMP0) &&
+						   m_code.EmitRsbImm32(HOST_TMP2, HOST_TMP0, 0) &&
+						   EmitStoreGpr(rd, HOST_TMP2);
+				}
 				break;
 			case 0x24: // AND
 				if (rs == 0 || rt == 0)
