@@ -8589,7 +8589,6 @@ namespace VitaEE
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitAlignQwordAddress(HOST_TMP0, HOST_TMP1) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
 		{
@@ -8620,7 +8619,6 @@ namespace VitaEE
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
 		{
 			return false;
@@ -8654,7 +8652,6 @@ namespace VitaEE
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitVu0SyncIfRunning() ||
@@ -8845,7 +8842,6 @@ namespace VitaEE
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitAlignQwordAddress(HOST_TMP0, HOST_TMP1) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
 		{
@@ -8907,7 +8903,6 @@ namespace VitaEE
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
 		{
 			return false;
@@ -8941,7 +8936,6 @@ namespace VitaEE
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitVu0SyncIfRunning() ||
