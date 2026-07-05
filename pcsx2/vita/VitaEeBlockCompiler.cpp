@@ -9242,6 +9242,15 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
+		// PCSX2 owner: R5900OpcodeImpl.cpp::SLLV()/SRLV()/SRAV(). The shift
+		// amount is irrelevant when the source register is zero.
+		if (rt == 0)
+		{
+			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+
 		return EmitLoadGprLow(rt, HOST_TMP0) &&
 			   EmitLoadGprLow(rs, HOST_TMP2) &&
 			   m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x1f) &&
