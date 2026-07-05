@@ -147,10 +147,9 @@ public:
 
 	__forceinline static GSVector4 f64(double x, double y)
 	{
-		GSVector4 ret;
-		ret.F64[0] = x;
-		ret.F64[1] = y;
-		return ret;
+		return GSVector4(vreinterpretq_f32_u64(vcombine_u64(
+			vcreate_u64(std::bit_cast<u64>(x)),
+			vcreate_u64(std::bit_cast<u64>(y)))));
 	}
 
 	__forceinline void operator=(float f)
@@ -788,9 +787,7 @@ public:
 
 	__forceinline static GSVector4 broadcast64(const void* f)
 	{
-		GSVector4 ret;
-		std::memcpy(&ret.U64[0], f, sizeof(ret.U64[0]));
-		ret.U64[1] = ret.U64[0];
-		return ret;
+		const uint64x1_t lane = vld1_u64(static_cast<const u64*>(f));
+		return GSVector4(vreinterpretq_f32_u64(vcombine_u64(lane, lane)));
 	}
 };
