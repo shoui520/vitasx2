@@ -29,6 +29,8 @@ namespace
 	constexpr u16 REG_R6 = 1u << 6;
 	constexpr u16 REG_R7 = 1u << 7;
 	constexpr u16 REG_R8 = 1u << 8;
+	constexpr u16 REG_R10 = 1u << 10;
+	constexpr u16 REG_R11 = 1u << 11;
 	constexpr u16 REG_LR = 1u << 14;
 	constexpr u16 REG_PC = 1u << 15;
 
@@ -41,6 +43,8 @@ namespace
 	constexpr unsigned HOST_SAVED1 = 6;
 	constexpr unsigned HOST_BRANCH_FLAG = 7;
 	constexpr unsigned HOST_REGISTER_JUMP_TARGET = 8;
+	constexpr unsigned HOST_IOP_RAM_MASK = 10;
+	constexpr unsigned HOST_IOP_RAM_BASE = 11;
 	constexpr unsigned HOST_CALL_SCRATCH = 12;
 
 	constexpr u32 IOP_BRANCH_TARGET_ZERO = 0x00000000u;
@@ -282,6 +286,31 @@ namespace
 		}
 	}
 
+	constexpr bool UsesDirectIopRamFastPath(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+				return RT(op) != 0;
+			case 0x22: // LWL
+			case 0x26: // LWR
+			case 0x28: // SB
+			case 0x29: // SH
+			case 0x2a: // SWL
+			case 0x2b: // SW
+			case 0x2e: // SWR
+			case 0x32: // LWC2
+			case 0x3a: // SWC2
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	constexpr bool IsIopBranchOrJumpOpcode(u32 op)
 	{
 		switch (op >> 26)
@@ -475,14 +504,21 @@ namespace VitaIOP
 		m_unaligned_write_cold_tails.clear();
 		m_cop2_load_cold_tails.clear();
 		m_cop2_store_cold_tails.clear();
-		return m_code.EmitPush(REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_LR) &&
-			   m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs)));
+		m_saved_registers = REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8;
+		if (m_iop_ram_registers_available)
+			m_saved_registers |= REG_R10 | REG_R11;
+
+		return m_code.EmitPush(m_saved_registers | REG_LR) &&
+			   m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))) &&
+			   (!m_iop_ram_registers_available ||
+				   (m_code.EmitMovImm32(HOST_IOP_RAM_MASK, Ps2MemSize::ExposedIopRam - 1) &&
+					   m_code.EmitMovImm32(HOST_IOP_RAM_BASE, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main)))));
 	}
 
 	bool BlockCompiler::EndBlockReturn(BlockExitKind exit)
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
-			   m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_PC);
+			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
 	bool BlockCompiler::EndBlockDirectTail(const void* direct_exit, size_t* direct_link_target_offset)
@@ -490,7 +526,7 @@ namespace VitaIOP
 		if (!direct_exit)
 			return false;
 
-		if (!m_code.EmitPop(REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_LR))
+		if (!m_code.EmitPop(m_saved_registers | REG_LR))
 			return false;
 
 		const size_t target_offset = m_code.Size();
@@ -1106,10 +1142,8 @@ namespace VitaIOP
 
 		if (rt != 0)
 		{
-			if (!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
-				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_TMP2) ||
-				!m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
-				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP1, HOST_TMP0))
+			if (!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
+				!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0))
 			{
 				return false;
 			}
@@ -1289,10 +1323,8 @@ namespace VitaIOP
 		const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (isolated_fallback_branch == static_cast<size_t>(-1) ||
 			!EmitLoadGpr(RT(op), HOST_TMP1) ||
-			!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
-			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_TMP2) ||
-			!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
-			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP3, HOST_TMP0) ||
+			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
 			!emit_store_value() ||
 			!emit_clear_stored_word())
 		{
@@ -1478,10 +1510,8 @@ namespace VitaIOP
 		// on the aligned address. Ordinary IOP RAM can read iopMem->Main directly.
 		const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (fallback_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
-			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_TMP2) ||
-			!m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
-			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP1, HOST_TMP0) ||
+			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
 			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
 		{
 			return false;
@@ -1548,10 +1578,8 @@ namespace VitaIOP
 		// isolate-cache suppression, and psxCpu->Clear() invalidation.
 		const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (fallback_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
-			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_TMP2) ||
-			!m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
-			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP1, HOST_TMP0) ||
+			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
 			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
 		{
 			return false;
@@ -1605,10 +1633,8 @@ namespace VitaIOP
 
 		const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (isolated_fallback_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
-			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_TMP2) ||
-			!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
-			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP3, HOST_TMP0) ||
+			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
 			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
 			!emit_clear_stored_word())
 		{
@@ -2176,10 +2202,8 @@ namespace VitaIOP
 
 			const size_t alignment_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 			if (alignment_fallback_branch == static_cast<size_t>(-1) ||
-				!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
-				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_TMP2) ||
-				!m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
-				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP1, HOST_TMP0) ||
+				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
+				!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
 				!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
 			{
 				return false;
@@ -2238,10 +2262,8 @@ namespace VitaIOP
 
 			const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 			if (isolated_fallback_branch == static_cast<size_t>(-1) ||
-				!m_code.EmitMovImm32(HOST_TMP2, Ps2MemSize::ExposedIopRam - 1) ||
-				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_TMP2) ||
-				!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))) ||
-				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP3, HOST_TMP0) ||
+				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
+				!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
 				!m_code.EmitStrImm12(HOST_SAVED0, HOST_TMP0, 0) ||
 				!emit_clear_stored_word())
 			{
@@ -2419,6 +2441,16 @@ namespace VitaIOP
 
 		if (direct_links)
 			*direct_links = {};
+
+		m_iop_ram_registers_available = false;
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			if (UsesDirectIopRamFastPath(iopMemRead32(start_pc + i * 4)))
+			{
+				m_iop_ram_registers_available = true;
+				break;
+			}
+		}
 
 		if (!BeginBlock())
 			return false;

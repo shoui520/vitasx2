@@ -180,6 +180,8 @@ namespace VitaIOP
 		std::vector<Cop2StoreColdTail> m_cop2_store_cold_tails;
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
+		u16 m_saved_registers = 0;
+		bool m_iop_ram_registers_available = false;
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_jump = false;
