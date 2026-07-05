@@ -10381,7 +10381,6 @@ namespace VitaEE
 		// through after the native NEON load/store.
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
 			!m_code.EmitCallAbsolute(tail.read_helper))
 		{
@@ -10400,7 +10399,6 @@ namespace VitaEE
 		// through after the native NEON store.
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
 			!m_code.EmitCallAbsolute(tail.write_helper))
 		{
@@ -10420,7 +10418,6 @@ namespace VitaEE
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.unaligned_fallback, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
 			!m_code.EmitCallAbsolute(tail.helper))
 		{
@@ -10436,11 +10433,10 @@ namespace VitaEE
 	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead128()/vtlb_memWrite128()
 		// plus VU0.cpp::LQC2()/SQC2(). The handler branch is emitted before
-		// LQC2/SQC2 replace HOST_TMP5 with the translated host pointer, so the
-		// helper still receives the original guest address from HOST_TMP5.
+		// the translated host pointer replaces the guest address, so HOST_TMP0
+		// still carries the PCSX2 helper address argument on the cold edge.
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
 			!m_code.EmitCallAbsolute(tail.helper))
 		{
