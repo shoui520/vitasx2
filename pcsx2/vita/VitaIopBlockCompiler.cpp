@@ -1217,8 +1217,7 @@ namespace VitaIOP
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP3, HOST_TMP2) ||
 				!m_code.EmitAddReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) ||
 				!m_code.EmitClz(HOST_SAVED0, HOST_TMP1) ||
-				!m_code.EmitMovImm8(HOST_TMP2, 31) ||
-				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_SAVED0) ||
+				!m_code.EmitRsbImm32(HOST_TMP2, HOST_SAVED0, 31) ||
 				!m_code.EmitMovRegShiftReg(HOST_SAVED0, HOST_TMP3, VitaA32::ShiftType::ASR, HOST_TMP2) ||
 				!m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_SAVED0, VitaA32::ShiftType::LSL, HOST_TMP2) ||
 				!m_code.EmitSubReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) ||
@@ -1243,8 +1242,7 @@ namespace VitaIOP
 				!m_code.EmitSubImm8(HOST_TMP2, HOST_TMP1, 1) ||
 				!m_code.EmitAndReg(HOST_TMP3, HOST_TMP0, HOST_TMP2) ||
 				!m_code.EmitClz(HOST_TMP2, HOST_TMP1) ||
-				!m_code.EmitMovImm8(HOST_SAVED0, 31) ||
-				!m_code.EmitSubReg(HOST_SAVED0, HOST_SAVED0, HOST_TMP2) ||
+				!m_code.EmitRsbImm32(HOST_SAVED0, HOST_TMP2, 31) ||
 				!m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR, HOST_SAVED0) ||
 				!store_hilo(HOST_TMP2, HOST_TMP3) ||
 				!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
@@ -1829,16 +1827,14 @@ namespace VitaIOP
 			return m_code.EmitMovImm32(HOST_TMP2, 0x00ffffffu) &&
 				   m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP2,
 					   VitaA32::ShiftType::LSR, HOST_SAVED0) &&
-				   m_code.EmitMovImm8(HOST_TMP3, 24) &&
-				   m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_SAVED0) &&
+				   m_code.EmitRsbImm32(HOST_TMP3, HOST_SAVED0, 24) &&
 				   m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP1, HOST_TMP0,
 					   VitaA32::ShiftType::LSL, HOST_TMP3) &&
 				   EmitStoreGpr(RT(op), HOST_TMP0);
 		}
 
 		return m_code.EmitMovImm32(HOST_TMP2, 0xffffff00u) &&
-			   m_code.EmitMovImm8(HOST_TMP3, 24) &&
-			   m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_SAVED0) &&
+			   m_code.EmitRsbImm32(HOST_TMP3, HOST_SAVED0, 24) &&
 			   m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP2,
 				   VitaA32::ShiftType::LSL, HOST_TMP3) &&
 			   m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP1, HOST_TMP0,
@@ -1891,8 +1887,7 @@ namespace VitaIOP
 
 		if (left)
 		{
-			if (!m_code.EmitMovImm8(HOST_TMP3, 24) ||
-				!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_SAVED0) ||
+			if (!m_code.EmitRsbImm32(HOST_TMP3, HOST_SAVED0, 24) ||
 				!m_code.EmitMovImm32(HOST_TMP2, 0xffffff00u))
 			{
 				return false;
@@ -1900,8 +1895,7 @@ namespace VitaIOP
 		}
 		else
 		{
-			if (!m_code.EmitMovImm8(HOST_TMP3, 24) ||
-				!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_SAVED0) ||
+			if (!m_code.EmitRsbImm32(HOST_TMP3, HOST_SAVED0, 24) ||
 				!m_code.EmitMovImm32(HOST_TMP2, 0x00ffffffu))
 			{
 				return false;
