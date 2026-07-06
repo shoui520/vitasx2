@@ -480,6 +480,15 @@ namespace VitaEE
 #endif
 		}
 
+		constexpr bool IsCop2MacroClip(u32 op)
+		{
+			if ((op & 0x3c) != 0x3c)
+				return false;
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			return special2_index == 0x1f;
+		}
+
 		constexpr size_t GprOffset(unsigned guest_reg)
 		{
 			return GPR_OFFSET + sizeof(GPR_reg) * guest_reg;
@@ -986,12 +995,13 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
+			// VABS/VCLIP/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
 			// VLQI/VSQI/VLQD/VSQD, and x86/microVU_Macro.inl
 			// recVMAX/recVMINI/recVABS/recVNOP/recVMOVE/recVMR32/recVI*/
-			// recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops have no
-			// MAC/status/clip synchronization side effects, so idle VU0 can
-			// execute them inline while running VU0 stays on the helper tail.
+			// recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops either have
+			// no MAC/status/clip synchronization side effects or synchronize
+			// their flags directly, so idle VU0 can execute them inline while
+			// running VU0 stays on the helper tail.
 			if ((op >> 26) != 0x12 || (((op >> 21) & 0x10) == 0) ||
 				!IsCOP2Special1Supported(op))
 			{
@@ -1011,6 +1021,8 @@ namespace VitaEE
 			if (DecodeCop2MacroIndexedViMemory(op).valid)
 				return true;
 			if (DecodeCop2MacroIndexedVectorMemory(op).valid)
+				return true;
+			if (IsCop2MacroClip(op))
 				return true;
 
 			if ((op & 0x3c) != 0x3c)
@@ -1081,6 +1093,8 @@ namespace VitaEE
 					return 4; // code + address VI + data VI + VU memory/register window.
 				if (DecodeCop2MacroIndexedVectorMemory(op).valid)
 					return 5; // code + VI backup/update + VF + VU memory/register window.
+				if (IsCop2MacroClip(op))
+					return 4; // code + Fs/Ft VF + clipflag VI mirror.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
@@ -4812,6 +4826,8 @@ namespace VitaEE
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroIndexedViMemoryBody(op);
 		if (DecodeCop2MacroIndexedVectorMemory(op).valid)
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroIndexedVectorMemoryBody(op);
+		if (IsCop2MacroClip(op))
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroClipBody(op);
 
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
@@ -5394,6 +5410,81 @@ namespace VitaEE
 		}
 
 		return decrement || emit_post_increment();
+	}
+
+	bool BlockCompiler::EmitCOP2MacroClipBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::_vuCLIP() and VCLIPw(). The macro shifts
+		// the 24-bit clip history, emits six signed raw-bit comparisons for
+		// Fs.xyz against abs(Ft.w), mirrors clipflag into VI[REG_CLIP_FLAG],
+		// and has no MAC/status/FDIV side effects.
+		if (!IsCop2MacroClip(op))
+			return false;
+
+		const unsigned ft = RT(op);
+		const unsigned fs = RD(op);
+
+		if (!EmitVu0VfAddress(HOST_TMP0, ft) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(3 * sizeof(u32))) ||
+			!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP1, FPU_FLOAT_EXPONENT_MASK, HOST_TMP3, true))
+		{
+			return false;
+		}
+
+		const size_t denormal_limit = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (denormal_limit == static_cast<size_t>(-1))
+			return false;
+
+		if (!EmitBicImm32OrReg(HOST_TMP2, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP3))
+			return false;
+
+		const size_t limit_done = m_code.EmitBranchPlaceholder();
+		if (limit_done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t denormal_target = m_code.Size();
+		if (!m_code.PatchBranch(denormal_limit, denormal_target, VitaA32::Condition::EQ) ||
+			!m_code.EmitMovImm32(HOST_TMP2, 0x007fffffu) ||
+			!m_code.PatchBranch(limit_done, m_code.Size()))
+		{
+			return false;
+		}
+
+		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+			!m_code.EmitMovImm8(HOST_TMP4, 0))
+		{
+			return false;
+		}
+
+		const auto emit_compare_flag = [&](unsigned lane, u8 positive_flag, u8 negative_flag) {
+			const u16 offset = static_cast<u16>(lane * sizeof(u32));
+			return m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, offset) &&
+				   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2) &&
+				   m_code.EmitMovImm8(HOST_TMP3, 0) &&
+				   m_code.EmitMovImm8(HOST_TMP3, positive_flag, VitaA32::Condition::GT) &&
+				   m_code.EmitOrrReg(HOST_TMP4, HOST_TMP4, HOST_TMP3) &&
+				   EmitEorImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP3) &&
+				   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2) &&
+				   m_code.EmitMovImm8(HOST_TMP3, 0) &&
+				   m_code.EmitMovImm8(HOST_TMP3, negative_flag, VitaA32::Condition::GT) &&
+				   m_code.EmitOrrReg(HOST_TMP4, HOST_TMP4, HOST_TMP3);
+		};
+
+		if (!emit_compare_flag(0, 0x01, 0x02) ||
+			!emit_compare_flag(1, 0x04, 0x08) ||
+			!emit_compare_flag(2, 0x10, 0x20))
+		{
+			return false;
+		}
+
+		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(reinterpret_cast<uptr>(&VU0.clipflag))) &&
+			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 6) &&
+			   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) &&
+			   EmitAndImm32OrReg(HOST_TMP1, HOST_TMP1, 0x00ffffffu, HOST_TMP2) &&
+			   m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) &&
+			   EmitVu0ViAddress(HOST_TMP0, VU0_REG_CLIP_FLAG) &&
+			   m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroMoveBody(u32 op)
