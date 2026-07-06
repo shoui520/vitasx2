@@ -1467,12 +1467,9 @@ namespace VUInterpFast
 	}
 
 #if defined(ARCH_ARM32)
-	static inline void StoreViHalfwordToMemoryQword(u16 value, u16* ptr)
+	static inline void StoreViHalfwordToMemoryQwordMasked(u16 value, unsigned mask, u16* ptr)
 	{
-		vst1q_u16(ptr, vreinterpretq_u16_u32(vdupq_n_u32(value)));
-#if defined(VITASX2_QEMU_VALIDATION)
-		++::g_qemuVuLowerNeonQwordOps;
-#endif
+		StoreLowerVfResultMaskedNeon(reinterpret_cast<u32*>(ptr), mask, vdupq_n_u32(value));
 	}
 
 	static inline void StoreMr32Masked(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
@@ -2283,9 +2280,9 @@ namespace VUInterpFast
 				const u16 addr = static_cast<u16>((Imm11(code) + VU->VI[Is(code)].SS[0]) * 16);
 				u16* ptr = reinterpret_cast<u16*>(VuMemQword(VU, addr));
 #if defined(ARCH_ARM32)
-				if (XYZW(code) == 0x0f)
+				if (XYZW(code) != 0)
 				{
-					StoreViHalfwordToMemoryQword(VU->VI[It(code)].US[0], ptr);
+					StoreViHalfwordToMemoryQwordMasked(VU->VI[It(code)].US[0], XYZW(code), ptr);
 					return;
 				}
 #endif
@@ -2428,9 +2425,9 @@ namespace VUInterpFast
 			{
 				u16* ptr = reinterpret_cast<u16*>(VuMemQword(VU, VU->VI[Is(code)].US[0] * 16));
 #if defined(ARCH_ARM32)
-				if (XYZW(code) == 0x0f)
+				if (XYZW(code) != 0)
 				{
-					StoreViHalfwordToMemoryQword(VU->VI[It(code)].US[0], ptr);
+					StoreViHalfwordToMemoryQwordMasked(VU->VI[It(code)].US[0], XYZW(code), ptr);
 					return;
 				}
 #endif
