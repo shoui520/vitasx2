@@ -269,6 +269,21 @@ namespace VitaEE
 			bool vi_to_vf = false;
 		};
 
+		enum class Cop2MacroRandomKind : u8
+		{
+			WaitQ,
+			RNext,
+			RGet,
+			RInit,
+			RXor,
+		};
+
+		struct Cop2MacroRandomOp
+		{
+			bool valid = false;
+			Cop2MacroRandomKind kind = Cop2MacroRandomKind::WaitQ;
+		};
+
 		constexpr unsigned RS(u32 op)
 		{
 			return (op >> 21) & 0x1f;
@@ -375,6 +390,29 @@ namespace VitaEE
 			if (special2_index == 0x3d)
 				return {true, true};
 			return {};
+		}
+
+		constexpr Cop2MacroRandomOp DecodeCop2MacroRandom(u32 op)
+		{
+			if ((op & 0x3c) != 0x3c)
+				return {};
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			switch (special2_index)
+			{
+				case 0x3b:
+					return {true, Cop2MacroRandomKind::WaitQ};
+				case 0x40:
+					return {true, Cop2MacroRandomKind::RNext};
+				case 0x41:
+					return {true, Cop2MacroRandomKind::RGet};
+				case 0x42:
+					return {true, Cop2MacroRandomKind::RInit};
+				case 0x43:
+					return {true, Cop2MacroRandomKind::RXor};
+				default:
+					return {};
+			}
 		}
 
 		constexpr size_t GprOffset(unsigned guest_reg)
@@ -883,11 +921,12 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR, and x86/microVU_Macro.inl
+			// VABS/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*, and
+			// x86/microVU_Macro.inl
 			// recVMAX/recVMINI/recVABS/recVNOP/recVMOVE/recVMR32/recVI*/
-			// recVMFIR/recVMTIR. These macro ops have no MAC/status/clip
-			// synchronization side effects, so idle VU0 can execute them inline
-			// while running VU0 stays on the helper tail.
+			// recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops have no
+			// MAC/status/clip synchronization side effects, so idle VU0 can
+			// execute them inline while running VU0 stays on the helper tail.
 			if ((op >> 26) != 0x12 || (((op >> 21) & 0x10) == 0) ||
 				!IsCOP2Special1Supported(op))
 			{
@@ -901,6 +940,8 @@ namespace VitaEE
 			if (DecodeCop2MacroVi(op).valid)
 				return true;
 			if (DecodeCop2MacroViTransfer(op).valid)
+				return true;
+			if (DecodeCop2MacroRandom(op).valid)
 				return true;
 
 			if ((op & 0x3c) != 0x3c)
@@ -962,6 +1003,11 @@ namespace VitaEE
 					return 4; // code + source VI + operand/imm + destination VI.
 				if (DecodeCop2MacroViTransfer(op).valid)
 					return 3; // code + source VF/VI + destination VF/VI.
+				if (DecodeCop2MacroRandom(op).valid)
+				{
+					const Cop2MacroRandomOp random = DecodeCop2MacroRandom(op);
+					return random.kind == Cop2MacroRandomKind::WaitQ ? 1 : 3;
+				}
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
@@ -4684,6 +4730,8 @@ namespace VitaEE
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroViBody(op);
 		if (DecodeCop2MacroViTransfer(op).valid)
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroViTransferBody(op);
+		if (DecodeCop2MacroRandom(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroRandomBody(op);
 
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
@@ -4937,6 +4985,107 @@ namespace VitaEE
 			   m_code.EmitLdrhImm8(HOST_TMP2, HOST_TMP0, source_offset) &&
 			   EmitVu0ViAddress(HOST_TMP1, it) &&
 			   m_code.EmitStrhImm8(HOST_TMP2, HOST_TMP1, 0);
+	}
+
+	bool BlockCompiler::EmitVu0RandomAdvance()
+	{
+		// PCSX2 owner: VUops.cpp::AdvanceLFSR(). Keep the low-bit tap order and
+		// final exponent/mantissa policy exact for REG_R.
+		return EmitVu0ViAddress(HOST_TMP0, VU0_REG_R) &&
+			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::LSR, 4) &&
+			   m_code.EmitEorRegShiftImm(HOST_TMP2, HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::LSR, 22) &&
+			   EmitAndImm32OrReg(HOST_TMP2, HOST_TMP2, 1u, HOST_TMP3) &&
+			   m_code.EmitOrrRegShiftImm(HOST_TMP1, HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::LSL, 1) &&
+			   EmitAndImm32OrReg(HOST_TMP1, HOST_TMP1, 0x007fffffu, HOST_TMP3) &&
+			   EmitOrrImm32OrReg(HOST_TMP1, HOST_TMP1, 0x3f800000u, HOST_TMP3) &&
+			   m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0);
+	}
+
+	bool BlockCompiler::EmitCOP2MacroRandomBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::_vuWAITQ() / _vuRINIT() / _vuRGET() /
+		// _vuRNEXT() / _vuRXOR(). RNEXT returns before AdvanceLFSR when Ft is
+		// zero, but otherwise advances REG_R even when the XYZW mask writes no
+		// VF lanes.
+		const Cop2MacroRandomOp random = DecodeCop2MacroRandom(op);
+		if (!random.valid)
+			return false;
+
+		if (random.kind == Cop2MacroRandomKind::WaitQ)
+			return true;
+
+		if (random.kind == Cop2MacroRandomKind::RInit ||
+			random.kind == Cop2MacroRandomKind::RXor)
+		{
+			const unsigned fs = RD(op);
+			const unsigned lane = (op >> 21) & 0x03;
+			const u8 source_offset = static_cast<u8>(lane * sizeof(u32));
+			if (!EmitVu0ViAddress(HOST_TMP0, VU0_REG_R) ||
+				!EmitVu0VfAddress(HOST_TMP1, fs) ||
+				!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, source_offset))
+			{
+				return false;
+			}
+
+			if (random.kind == Cop2MacroRandomKind::RXor &&
+				(!m_code.EmitLdrImm12(HOST_TMP3, HOST_TMP0, 0) ||
+				 !m_code.EmitEorReg(HOST_TMP2, HOST_TMP2, HOST_TMP3)))
+			{
+				return false;
+			}
+
+			return EmitAndImm32OrReg(HOST_TMP2, HOST_TMP2, 0x007fffffu, HOST_TMP3) &&
+				   EmitOrrImm32OrReg(HOST_TMP2, HOST_TMP2, 0x3f800000u, HOST_TMP3) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP0, 0);
+		}
+
+		const unsigned ft = RT(op);
+		if (ft == 0)
+			return true;
+
+		if (random.kind == Cop2MacroRandomKind::RNext &&
+			!EmitVu0RandomAdvance())
+		{
+			return false;
+		}
+
+		const unsigned mask = (op >> 21) & 0x0f;
+		if (mask == 0)
+			return true;
+
+		if (!EmitVu0ViAddress(HOST_TMP0, VU0_REG_R) ||
+			!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, 0))
+		{
+			return false;
+		}
+
+		if (mask == 0x0f)
+		{
+			constexpr unsigned NEON_VALUE = 0;
+			return m_code.EmitVdupI32QFromCore(NEON_VALUE, HOST_TMP2) &&
+				   EmitVu0VfAddress(HOST_TMP1, ft) &&
+				   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
+		}
+
+		if (!EmitVu0VfAddress(HOST_TMP1, ft))
+			return false;
+
+		const auto emit_lane = [this](unsigned lane) {
+			const u16 offset = static_cast<u16>(lane * sizeof(u32));
+			return m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
+		};
+
+		if ((mask & 0x8) && !emit_lane(0))
+			return false;
+		if ((mask & 0x4) && !emit_lane(1))
+			return false;
+		if ((mask & 0x2) && !emit_lane(2))
+			return false;
+		if ((mask & 0x1) && !emit_lane(3))
+			return false;
+
+		return true;
 	}
 
 	bool BlockCompiler::EmitCOP2MacroMoveBody(u32 op)
