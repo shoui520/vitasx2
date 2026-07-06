@@ -14,6 +14,7 @@ u32 g_qemuSifFifoWrappedWrites = 0;
 u32 g_qemuSifFifoWrappedReads = 0;
 u32 g_qemuSifFifoJunkWrites = 0;
 u32 g_qemuSifFifoNeonQwords = 0;
+u32 g_qemuSifFifoNeon64ByteGroups = 0;
 #endif
 
 void sifReset()
