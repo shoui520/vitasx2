@@ -318,13 +318,22 @@ static __forceinline s32 GetVoiceValues_neon(V_Core& thiscore, uint voiceidx)
 {
 	V_Voice& vc(thiscore.Voices[voiceidx]);
 	const u32 sample_idx = vc.DecPosRead & 31u;
-	if (sample_idx > 28u)
-		return GetVoiceValues_reference(thiscore, voiceidx);
 
 	const int phase = (vc.SP & 0x0ff0) >> 4;
 	const int16x4_t coeff16 = vld1_s16(interpTable[phase].data());
 	const int32x4_t coeff = vmovl_s16(coeff16);
-	const int32x4_t samples = vld1q_s32(&vc.DecodeFifo[sample_idx]);
+	int32x4_t samples;
+	if (sample_idx <= 28u)
+	{
+		samples = vld1q_s32(&vc.DecodeFifo[sample_idx]);
+	}
+	else
+	{
+		samples = vsetq_lane_s32(vc.DecodeFifo[(sample_idx + 0u) & 31u], vdupq_n_s32(0), 0);
+		samples = vsetq_lane_s32(vc.DecodeFifo[(sample_idx + 1u) & 31u], samples, 1);
+		samples = vsetq_lane_s32(vc.DecodeFifo[(sample_idx + 2u) & 31u], samples, 2);
+		samples = vsetq_lane_s32(vc.DecodeFifo[(sample_idx + 3u) & 31u], samples, 3);
+	}
 	const int32x4_t terms = vshrq_n_s32(vmulq_s32(coeff, samples), 15);
 	int32x2_t sum = vadd_s32(vget_low_s32(terms), vget_high_s32(terms));
 	sum = vpadd_s32(sum, sum);
