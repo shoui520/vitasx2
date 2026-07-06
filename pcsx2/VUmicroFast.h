@@ -1488,6 +1488,25 @@ namespace VUInterpFast
 	}
 
 #if defined(ARCH_ARM32)
+	alignas(16) static constexpr u32 XYZW_LANE_WRITE_MASKS_NEON[16][4] = {
+		{0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
+		{0x00000000u, 0x00000000u, 0x00000000u, 0xffffffffu},
+		{0x00000000u, 0x00000000u, 0xffffffffu, 0x00000000u},
+		{0x00000000u, 0x00000000u, 0xffffffffu, 0xffffffffu},
+		{0x00000000u, 0xffffffffu, 0x00000000u, 0x00000000u},
+		{0x00000000u, 0xffffffffu, 0x00000000u, 0xffffffffu},
+		{0x00000000u, 0xffffffffu, 0xffffffffu, 0x00000000u},
+		{0x00000000u, 0xffffffffu, 0xffffffffu, 0xffffffffu},
+		{0xffffffffu, 0x00000000u, 0x00000000u, 0x00000000u},
+		{0xffffffffu, 0x00000000u, 0x00000000u, 0xffffffffu},
+		{0xffffffffu, 0x00000000u, 0xffffffffu, 0x00000000u},
+		{0xffffffffu, 0x00000000u, 0xffffffffu, 0xffffffffu},
+		{0xffffffffu, 0xffffffffu, 0x00000000u, 0x00000000u},
+		{0xffffffffu, 0xffffffffu, 0x00000000u, 0xffffffffu},
+		{0xffffffffu, 0xffffffffu, 0xffffffffu, 0x00000000u},
+		{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu},
+	};
+
 	static inline uint32x4_t MinMaxBitsNeon(uint32x4_t fs_bits, uint32x4_t ft_bits, bool take_max)
 	{
 		const int32x4_t fs_signed = vreinterpretq_s32_u32(fs_bits);
@@ -1500,19 +1519,31 @@ namespace VUInterpFast
 			vbslq_u32(both_negative, signed_min, signed_max) :
 			vbslq_u32(both_negative, signed_max, signed_min);
 	}
+
+	static inline void StoreMinMaxResultMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, uint32x4_t result)
+	{
+		if (mask != 0x0f)
+		{
+			const uint32x4_t old_bits = vld1q_u32(VU->VF[fd].UL);
+			const uint32x4_t write_mask = vld1q_u32(XYZW_LANE_WRITE_MASKS_NEON[mask]);
+			result = vbslq_u32(write_mask, result, old_bits);
+		}
+
+		vst1q_u32(VU->VF[fd].UL, result);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuUpperNeonQwordOps;
+#endif
+	}
 #endif
 
 	static inline bool StoreMinMaxUpperMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, unsigned ft, bool take_max)
 	{
 #if defined(ARCH_ARM32)
-		if (fd != 0 && mask == 0x0f)
+		if (fd != 0 && mask != 0)
 		{
 			const uint32x4_t fs_bits = vld1q_u32(VU->VF[fs].UL);
 			const uint32x4_t ft_bits = vld1q_u32(VU->VF[ft].UL);
-			vst1q_u32(VU->VF[fd].UL, MinMaxBitsNeon(fs_bits, ft_bits, take_max));
-#if defined(VITASX2_QEMU_VALIDATION)
-			++::g_qemuVuUpperNeonQwordOps;
-#endif
+			StoreMinMaxResultMaskedNeon(VU, fd, mask, MinMaxBitsNeon(fs_bits, ft_bits, take_max));
 			return true;
 		}
 #endif
@@ -1522,13 +1553,10 @@ namespace VUInterpFast
 	static inline bool StoreMinMaxUpperBroadcastMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, u32 ft_bits, bool take_max)
 	{
 #if defined(ARCH_ARM32)
-		if (fd != 0 && mask == 0x0f)
+		if (fd != 0 && mask != 0)
 		{
 			const uint32x4_t fs_bits = vld1q_u32(VU->VF[fs].UL);
-			vst1q_u32(VU->VF[fd].UL, MinMaxBitsNeon(fs_bits, vdupq_n_u32(ft_bits), take_max));
-#if defined(VITASX2_QEMU_VALIDATION)
-			++::g_qemuVuUpperNeonQwordOps;
-#endif
+			StoreMinMaxResultMaskedNeon(VU, fd, mask, MinMaxBitsNeon(fs_bits, vdupq_n_u32(ft_bits), take_max));
 			return true;
 		}
 #endif
