@@ -1487,6 +1487,21 @@ namespace VUInterpFast
 		return false;
 	}
 
+#if defined(ARCH_ARM32)
+	static inline uint32x4_t MinMaxBitsNeon(uint32x4_t fs_bits, uint32x4_t ft_bits, bool take_max)
+	{
+		const int32x4_t fs_signed = vreinterpretq_s32_u32(fs_bits);
+		const int32x4_t ft_signed = vreinterpretq_s32_u32(ft_bits);
+		const uint32x4_t signed_min = vreinterpretq_u32_s32(vminq_s32(fs_signed, ft_signed));
+		const uint32x4_t signed_max = vreinterpretq_u32_s32(vmaxq_s32(fs_signed, ft_signed));
+		const uint32x4_t both_negative =
+			vtstq_u32(vandq_u32(fs_bits, ft_bits), vdupq_n_u32(0x80000000u));
+		return take_max ?
+			vbslq_u32(both_negative, signed_min, signed_max) :
+			vbslq_u32(both_negative, signed_max, signed_min);
+	}
+#endif
+
 	static inline bool StoreMinMaxUpperMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, unsigned ft, bool take_max)
 	{
 #if defined(ARCH_ARM32)
@@ -1494,16 +1509,23 @@ namespace VUInterpFast
 		{
 			const uint32x4_t fs_bits = vld1q_u32(VU->VF[fs].UL);
 			const uint32x4_t ft_bits = vld1q_u32(VU->VF[ft].UL);
-			const int32x4_t fs_signed = vreinterpretq_s32_u32(fs_bits);
-			const int32x4_t ft_signed = vreinterpretq_s32_u32(ft_bits);
-			const uint32x4_t signed_min = vreinterpretq_u32_s32(vminq_s32(fs_signed, ft_signed));
-			const uint32x4_t signed_max = vreinterpretq_u32_s32(vmaxq_s32(fs_signed, ft_signed));
-			const uint32x4_t both_negative =
-				vtstq_u32(vandq_u32(fs_bits, ft_bits), vdupq_n_u32(0x80000000u));
-			const uint32x4_t result = take_max ?
-				vbslq_u32(both_negative, signed_min, signed_max) :
-				vbslq_u32(both_negative, signed_max, signed_min);
-			vst1q_u32(VU->VF[fd].UL, result);
+			vst1q_u32(VU->VF[fd].UL, MinMaxBitsNeon(fs_bits, ft_bits, take_max));
+#if defined(VITASX2_QEMU_VALIDATION)
+			++::g_qemuVuUpperNeonQwordOps;
+#endif
+			return true;
+		}
+#endif
+		return false;
+	}
+
+	static inline bool StoreMinMaxUpperBroadcastMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, u32 ft_bits, bool take_max)
+	{
+#if defined(ARCH_ARM32)
+		if (fd != 0 && mask == 0x0f)
+		{
+			const uint32x4_t fs_bits = vld1q_u32(VU->VF[fs].UL);
+			vst1q_u32(VU->VF[fd].UL, MinMaxBitsNeon(fs_bits, vdupq_n_u32(ft_bits), take_max));
 #if defined(VITASX2_QEMU_VALIDATION)
 			++::g_qemuVuUpperNeonQwordOps;
 #endif
@@ -1906,18 +1928,28 @@ namespace VUInterpFast
 				StoreBinaryUpperMasked(VU, Fd(code), XYZW(code), Fs(code), Ft(code), FpMaxBits);
 				return;
 			case UpperFastKind::MAXi:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VI[REG_I].UL, true))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VI[REG_I].UL, FpMaxBits);
 				return;
 			case UpperFastKind::MAXx:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[0], true))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[0], FpMaxBits);
 				return;
 			case UpperFastKind::MAXy:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[1], true))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[1], FpMaxBits);
 				return;
 			case UpperFastKind::MAXz:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[2], true))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[2], FpMaxBits);
 				return;
 			case UpperFastKind::MAXw:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[3], true))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[3], FpMaxBits);
 				return;
 			case UpperFastKind::MINI:
@@ -1926,18 +1958,28 @@ namespace VUInterpFast
 				StoreBinaryUpperMasked(VU, Fd(code), XYZW(code), Fs(code), Ft(code), FpMinBits);
 				return;
 			case UpperFastKind::MINIi:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VI[REG_I].UL, false))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VI[REG_I].UL, FpMinBits);
 				return;
 			case UpperFastKind::MINIx:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[0], false))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[0], FpMinBits);
 				return;
 			case UpperFastKind::MINIy:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[1], false))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[1], FpMinBits);
 				return;
 			case UpperFastKind::MINIz:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[2], false))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[2], FpMinBits);
 				return;
 			case UpperFastKind::MINIw:
+				if (StoreMinMaxUpperBroadcastMaskedNeon(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[3], false))
+					return;
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[3], FpMinBits);
 				return;
 			case UpperFastKind::CLIP:
