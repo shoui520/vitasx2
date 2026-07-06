@@ -311,6 +311,12 @@ namespace VitaEE
 			unsigned offset = 0;
 		};
 
+		struct Cop2MacroFtoiOp
+		{
+			bool valid = false;
+			unsigned offset = 0;
+		};
+
 		constexpr unsigned RS(u32 op)
 		{
 			return (op >> 21) & 0x1f;
@@ -510,6 +516,27 @@ namespace VitaEE
 				case 0x12:
 					return {true, 12};
 				case 0x13:
+					return {true, 15};
+				default:
+					return {};
+			}
+		}
+
+		constexpr Cop2MacroFtoiOp DecodeCop2MacroFtoi(u32 op)
+		{
+			if ((op & 0x3c) != 0x3c)
+				return {};
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			switch (special2_index)
+			{
+				case 0x14:
+					return {true, 0};
+				case 0x15:
+					return {true, 4};
+				case 0x16:
+					return {true, 12};
+				case 0x17:
 					return {true, 15};
 				default:
 					return {};
@@ -1022,7 +1049,7 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VCLIP/VITOF/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
+			// VABS/VCLIP/VFTOI/VITOF/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
 			// VLQI/VSQI/VLQD/VSQD, and x86/microVU_Macro.inl
 			// recVMAX/recVMINI/recVABS/recVNOP/recVMOVE/recVMR32/recVI*/
 			// recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops either have
@@ -1052,6 +1079,8 @@ namespace VitaEE
 			if (IsCop2MacroClip(op))
 				return true;
 			if (DecodeCop2MacroItof(op).valid)
+				return true;
+			if (DecodeCop2MacroFtoi(op).valid)
 				return true;
 
 			if ((op & 0x3c) != 0x3c)
@@ -1125,6 +1154,8 @@ namespace VitaEE
 				if (IsCop2MacroClip(op))
 					return 4; // code + Fs/Ft VF + clipflag VI mirror.
 				if (DecodeCop2MacroItof(op).valid)
+					return 3; // code + source VF + destination VF.
+				if (DecodeCop2MacroFtoi(op).valid)
 					return 3; // code + source VF + destination VF.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
@@ -4861,6 +4892,8 @@ namespace VitaEE
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroClipBody(op);
 		if (DecodeCop2MacroItof(op).valid)
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroItofBody(op);
+		if (DecodeCop2MacroFtoi(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroFtoiBody(op);
 
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
@@ -5562,6 +5595,90 @@ namespace VitaEE
 			{
 				return false;
 			}
+		}
+
+		if (!EmitVu0VfAddress(HOST_TMP1, ft))
+			return false;
+
+		if (mask == 0x0f)
+			return m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
+
+		const auto emit_lane = [&](unsigned lane) {
+			const u16 offset = static_cast<u16>(lane * sizeof(u32));
+			return m_code.EmitVmovSToCore(HOST_TMP2, NEON_VALUE * 4 + lane) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
+		};
+
+		if ((mask & 0x8) && !emit_lane(0))
+			return false;
+		if ((mask & 0x4) && !emit_lane(1))
+			return false;
+		if ((mask & 0x2) && !emit_lane(2))
+			return false;
+		if ((mask & 0x1) && !emit_lane(3))
+			return false;
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitCOP2MacroFtoiBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::floatToInt<>() and _vuFTOI*(). VFTOI
+		// scales source floats by 2^offset, truncates toward zero, and
+		// saturates any exponent at or above signed 32-bit range.
+		const Cop2MacroFtoiOp ftoi = DecodeCop2MacroFtoi(op);
+		if (!ftoi.valid)
+			return false;
+
+		const unsigned ft = RT(op);
+		const unsigned mask = (op >> 21) & 0x0f;
+		if (ft == 0 || mask == 0)
+			return true;
+
+		constexpr unsigned NEON_VALUE = 0;
+		constexpr unsigned NEON_BITS = 1;
+		constexpr unsigned NEON_MASK = 2;
+		constexpr unsigned NEON_SATURATED = 3;
+		const unsigned fs = RD(op);
+		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+			!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0))
+		{
+			return false;
+		}
+
+		if (ftoi.offset != 0)
+		{
+			const u32 scale_bits = 0x3f800000u + (ftoi.offset << 23);
+			if (!m_code.EmitMovImm32(HOST_TMP2, scale_bits) ||
+				!m_code.EmitVdupI32QFromCore(NEON_BITS, HOST_TMP2) ||
+				!m_code.EmitVmulF32Q(NEON_VALUE, NEON_VALUE, NEON_BITS))
+			{
+				return false;
+			}
+		}
+
+		if (!m_code.EmitVorrQ(NEON_BITS, NEON_VALUE, NEON_VALUE) ||
+			!m_code.EmitVcvtS32F32Q(NEON_VALUE, NEON_VALUE))
+		{
+			return false;
+		}
+
+		if (!m_code.EmitMovImm32(HOST_TMP2, 0x7f800000u) ||
+			!m_code.EmitVdupI32QFromCore(NEON_MASK, HOST_TMP2) ||
+			!m_code.EmitVandQ(NEON_MASK, NEON_BITS, NEON_MASK) ||
+			!m_code.EmitMovImm32(HOST_TMP2, 0x4effffffu) ||
+			!m_code.EmitVdupI32QFromCore(NEON_SATURATED, HOST_TMP2) ||
+			!m_code.EmitVcgtS32Q(NEON_MASK, NEON_MASK, NEON_SATURATED) ||
+			!m_code.EmitVshrS32Q(NEON_SATURATED, NEON_BITS, 31) ||
+			!m_code.EmitMovImm32(HOST_TMP2, 0x7fffffffu) ||
+			!m_code.EmitVdupI32QFromCore(NEON_BITS, HOST_TMP2) ||
+			!m_code.EmitVeorQ(NEON_SATURATED, NEON_SATURATED, NEON_BITS) ||
+			!m_code.EmitVandQ(NEON_SATURATED, NEON_SATURATED, NEON_MASK) ||
+			!m_code.EmitVmvnQ(NEON_MASK, NEON_MASK) ||
+			!m_code.EmitVandQ(NEON_VALUE, NEON_VALUE, NEON_MASK) ||
+			!m_code.EmitVorrQ(NEON_VALUE, NEON_VALUE, NEON_SATURATED))
+		{
+			return false;
 		}
 
 		if (!EmitVu0VfAddress(HOST_TMP1, ft))
