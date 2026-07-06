@@ -1471,22 +1471,6 @@ namespace VUInterpFast
 		if (mask & 0x1) VU->VF[ft].UL[3] = fn(VU->VF[fs].UL[3]);
 	}
 
-	static inline bool StoreAbsUpperMaskedNeon(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
-	{
-#if defined(ARCH_ARM32)
-		if (ft != 0 && mask == 0x0f)
-		{
-			const uint32x4_t signless = vandq_u32(vld1q_u32(VU->VF[fs].UL), vdupq_n_u32(0x7fffffffu));
-			vst1q_u32(VU->VF[ft].UL, signless);
-#if defined(VITASX2_QEMU_VALIDATION)
-			++::g_qemuVuUpperNeonQwordOps;
-#endif
-			return true;
-		}
-#endif
-		return false;
-	}
-
 #if defined(ARCH_ARM32)
 	alignas(16) static constexpr u32 XYZW_LANE_WRITE_MASKS_NEON[16][4] = {
 		{0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
@@ -1507,20 +1491,7 @@ namespace VUInterpFast
 		{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu},
 	};
 
-	static inline uint32x4_t MinMaxBitsNeon(uint32x4_t fs_bits, uint32x4_t ft_bits, bool take_max)
-	{
-		const int32x4_t fs_signed = vreinterpretq_s32_u32(fs_bits);
-		const int32x4_t ft_signed = vreinterpretq_s32_u32(ft_bits);
-		const uint32x4_t signed_min = vreinterpretq_u32_s32(vminq_s32(fs_signed, ft_signed));
-		const uint32x4_t signed_max = vreinterpretq_u32_s32(vmaxq_s32(fs_signed, ft_signed));
-		const uint32x4_t both_negative =
-			vtstq_u32(vandq_u32(fs_bits, ft_bits), vdupq_n_u32(0x80000000u));
-		return take_max ?
-			vbslq_u32(both_negative, signed_min, signed_max) :
-			vbslq_u32(both_negative, signed_max, signed_min);
-	}
-
-	static inline void StoreMinMaxResultMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, uint32x4_t result)
+	static inline void StoreUpperResultMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, uint32x4_t result)
 	{
 		if (mask != 0x0f)
 		{
@@ -1536,6 +1507,34 @@ namespace VUInterpFast
 	}
 #endif
 
+	static inline bool StoreAbsUpperMaskedNeon(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
+	{
+#if defined(ARCH_ARM32)
+		if (ft != 0 && mask != 0)
+		{
+			const uint32x4_t signless = vandq_u32(vld1q_u32(VU->VF[fs].UL), vdupq_n_u32(0x7fffffffu));
+			StoreUpperResultMaskedNeon(VU, ft, mask, signless);
+			return true;
+		}
+#endif
+		return false;
+	}
+
+#if defined(ARCH_ARM32)
+	static inline uint32x4_t MinMaxBitsNeon(uint32x4_t fs_bits, uint32x4_t ft_bits, bool take_max)
+	{
+		const int32x4_t fs_signed = vreinterpretq_s32_u32(fs_bits);
+		const int32x4_t ft_signed = vreinterpretq_s32_u32(ft_bits);
+		const uint32x4_t signed_min = vreinterpretq_u32_s32(vminq_s32(fs_signed, ft_signed));
+		const uint32x4_t signed_max = vreinterpretq_u32_s32(vmaxq_s32(fs_signed, ft_signed));
+		const uint32x4_t both_negative =
+			vtstq_u32(vandq_u32(fs_bits, ft_bits), vdupq_n_u32(0x80000000u));
+		return take_max ?
+			vbslq_u32(both_negative, signed_min, signed_max) :
+			vbslq_u32(both_negative, signed_max, signed_min);
+	}
+#endif
+
 	static inline bool StoreMinMaxUpperMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, unsigned ft, bool take_max)
 	{
 #if defined(ARCH_ARM32)
@@ -1543,7 +1542,7 @@ namespace VUInterpFast
 		{
 			const uint32x4_t fs_bits = vld1q_u32(VU->VF[fs].UL);
 			const uint32x4_t ft_bits = vld1q_u32(VU->VF[ft].UL);
-			StoreMinMaxResultMaskedNeon(VU, fd, mask, MinMaxBitsNeon(fs_bits, ft_bits, take_max));
+			StoreUpperResultMaskedNeon(VU, fd, mask, MinMaxBitsNeon(fs_bits, ft_bits, take_max));
 			return true;
 		}
 #endif
@@ -1556,7 +1555,7 @@ namespace VUInterpFast
 		if (fd != 0 && mask != 0)
 		{
 			const uint32x4_t fs_bits = vld1q_u32(VU->VF[fs].UL);
-			StoreMinMaxResultMaskedNeon(VU, fd, mask, MinMaxBitsNeon(fs_bits, vdupq_n_u32(ft_bits), take_max));
+			StoreUpperResultMaskedNeon(VU, fd, mask, MinMaxBitsNeon(fs_bits, vdupq_n_u32(ft_bits), take_max));
 			return true;
 		}
 #endif
