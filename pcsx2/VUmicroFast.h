@@ -1801,6 +1801,16 @@ namespace VUInterpFast
 			vgetq_lane_f32(squared, 2);
 	}
 
+	static inline float VuSumXYZWNeon(VURegs* VU, unsigned reg)
+	{
+		const float32x4_t value = VuFloatQNeon(vld1q_u32(VU->VF[reg].UL));
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuLowerNeonQwordOps;
+#endif
+		return ((vgetq_lane_f32(value, 0) + vgetq_lane_f32(value, 1)) +
+			vgetq_lane_f32(value, 2)) + vgetq_lane_f32(value, 3);
+	}
+
 	static inline void FinishMacVectorNeon(VURegs* VU, bool acc, unsigned fd, unsigned mask, float32x4_t result)
 	{
 		if (mask & 0x8)
@@ -2653,6 +2663,16 @@ namespace VUInterpFast
 #endif
 	}
 
+	static inline float VuSumXYZW(VURegs* VU, unsigned reg)
+	{
+#if defined(ARCH_ARM32)
+		return VuSumXYZWNeon(VU, reg);
+#else
+		return ((VuLane(VU, reg, 0) + VuLane(VU, reg, 1)) +
+			VuLane(VU, reg, 2)) + VuLane(VU, reg, 3);
+#endif
+	}
+
 	static inline float VuCalculateEatan(float input)
 	{
 		static constexpr float eatanconst[9] = {
@@ -3139,8 +3159,7 @@ namespace VUInterpFast
 				return;
 			}
 			case LowerFastKind::ESUM:
-				VU->p.F = VuLane(VU, Fs(code), 0) + VuLane(VU, Fs(code), 1) +
-					VuLane(VU, Fs(code), 2) + VuLane(VU, Fs(code), 3);
+				VU->p.F = VuSumXYZW(VU, Fs(code));
 				return;
 			case LowerFastKind::ERCPR:
 			{
