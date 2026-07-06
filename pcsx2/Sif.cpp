@@ -12,6 +12,7 @@ u32 g_qemuSifFifoContiguousWrites = 0;
 u32 g_qemuSifFifoContiguousReads = 0;
 u32 g_qemuSifFifoWrappedWrites = 0;
 u32 g_qemuSifFifoWrappedReads = 0;
+u32 g_qemuSifFifoNeonQwords = 0;
 #endif
 
 void sifReset()

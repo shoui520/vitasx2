@@ -5,12 +5,39 @@
 
 static const int FIFO_SIF_W = 128;
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
 #if defined(VITASX2_QEMU_VALIDATION)
 extern u32 g_qemuSifFifoContiguousWrites;
 extern u32 g_qemuSifFifoContiguousReads;
 extern u32 g_qemuSifFifoWrappedWrites;
 extern u32 g_qemuSifFifoWrappedReads;
+extern u32 g_qemuSifFifoNeonQwords;
 #endif
+
+static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
+{
+#if defined(ARCH_ARM32)
+	if ((words & 3) == 0)
+	{
+		const int qwords = words >> 2;
+		for (int i = 0; i < qwords; i++)
+		{
+			const uint32x4_t qword = vld1q_u32(from);
+			vst1q_u32(to, qword);
+			from += 4;
+			to += 4;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSifFifoNeonQwords += qwords;
+#endif
+		return;
+	}
+#endif
+	memcpy(to, from, words << 2);
+}
 
 // Despite its name, this is actually the IOP's DMAtag, which itself also contains
 // the EE's DMAtag in its upper 64 bits.  Note that only the lower 24 bits of 'data' is
@@ -48,7 +75,7 @@ struct sifFifo
 			const int contiguous = FIFO_SIF_W - writePos;
 			if (words <= contiguous)
 			{
-				memcpy(&data[writePos], from, words << 2);
+				SifFifoCopyWords(&data[writePos], from, words);
 #if defined(VITASX2_QEMU_VALIDATION)
 				++g_qemuSifFifoContiguousWrites;
 #endif
@@ -58,8 +85,8 @@ struct sifFifo
 				const int wP0 = contiguous;
 				const int wP1 = words - wP0;
 
-				memcpy(&data[writePos], from, wP0 << 2);
-				memcpy(&data[0], &from[wP0], wP1 << 2);
+				SifFifoCopyWords(&data[writePos], from, wP0);
+				SifFifoCopyWords(&data[0], &from[wP0], wP1);
 #if defined(VITASX2_QEMU_VALIDATION)
 				++g_qemuSifFifoWrappedWrites;
 #endif
@@ -140,7 +167,7 @@ struct sifFifo
 			const int contiguous = FIFO_SIF_W - readPos;
 			if (words <= contiguous)
 			{
-				memcpy(to, &data[readPos], words << 2);
+				SifFifoCopyWords(to, &data[readPos], words);
 #if defined(VITASX2_QEMU_VALIDATION)
 				++g_qemuSifFifoContiguousReads;
 #endif
@@ -150,8 +177,8 @@ struct sifFifo
 				const int wP0 = contiguous;
 				const int wP1 = words - wP0;
 
-				memcpy(to, &data[readPos], wP0 << 2);
-				memcpy(&to[wP0], &data[0], wP1 << 2);
+				SifFifoCopyWords(to, &data[readPos], wP0);
+				SifFifoCopyWords(&to[wP0], &data[0], wP1);
 #if defined(VITASX2_QEMU_VALIDATION)
 				++g_qemuSifFifoWrappedReads;
 #endif
