@@ -342,6 +342,10 @@ namespace VitaEE
 			Add,
 			Sub,
 			Mul,
+			MAdd,
+			MSub,
+			OpMula,
+			OpMSub,
 		};
 
 		enum class Cop2MacroArithmeticOperand
@@ -625,6 +629,18 @@ namespace VitaEE
 					case 0x07:
 						return {true, Cop2MacroArithmeticKind::Sub,
 							Cop2MacroArithmeticOperand::BroadcastLane, false, function & 0x3};
+					case 0x08:
+					case 0x09:
+					case 0x0a:
+					case 0x0b:
+						return {true, Cop2MacroArithmeticKind::MAdd,
+							Cop2MacroArithmeticOperand::BroadcastLane, false, function & 0x3};
+					case 0x0c:
+					case 0x0d:
+					case 0x0e:
+					case 0x0f:
+						return {true, Cop2MacroArithmeticKind::MSub,
+							Cop2MacroArithmeticOperand::BroadcastLane, false, function & 0x3};
 					case 0x18:
 					case 0x19:
 					case 0x1a:
@@ -640,20 +656,41 @@ namespace VitaEE
 					case 0x20:
 						return {true, Cop2MacroArithmeticKind::Add,
 							Cop2MacroArithmeticOperand::ImmediateQ, false, 0};
+					case 0x21:
+						return {true, Cop2MacroArithmeticKind::MAdd,
+							Cop2MacroArithmeticOperand::ImmediateQ, false, 0};
+					case 0x23:
+						return {true, Cop2MacroArithmeticKind::MAdd,
+							Cop2MacroArithmeticOperand::ImmediateI, false, 0};
 					case 0x24:
 						return {true, Cop2MacroArithmeticKind::Sub,
+							Cop2MacroArithmeticOperand::ImmediateQ, false, 0};
+					case 0x25:
+						return {true, Cop2MacroArithmeticKind::MSub,
 							Cop2MacroArithmeticOperand::ImmediateQ, false, 0};
 					case 0x26:
 						return {true, Cop2MacroArithmeticKind::Sub,
 							Cop2MacroArithmeticOperand::ImmediateI, false, 0};
+					case 0x27:
+						return {true, Cop2MacroArithmeticKind::MSub,
+							Cop2MacroArithmeticOperand::ImmediateI, false, 0};
 					case 0x28:
 						return {true, Cop2MacroArithmeticKind::Add,
+							Cop2MacroArithmeticOperand::Vector, false, 0};
+					case 0x29:
+						return {true, Cop2MacroArithmeticKind::MAdd,
 							Cop2MacroArithmeticOperand::Vector, false, 0};
 					case 0x2a:
 						return {true, Cop2MacroArithmeticKind::Mul,
 							Cop2MacroArithmeticOperand::Vector, false, 0};
 					case 0x2c:
 						return {true, Cop2MacroArithmeticKind::Sub,
+							Cop2MacroArithmeticOperand::Vector, false, 0};
+					case 0x2d:
+						return {true, Cop2MacroArithmeticKind::MSub,
+							Cop2MacroArithmeticOperand::Vector, false, 0};
+					case 0x2e:
+						return {true, Cop2MacroArithmeticKind::OpMSub,
 							Cop2MacroArithmeticOperand::Vector, false, 0};
 					default:
 						return {};
@@ -675,6 +712,18 @@ namespace VitaEE
 				case 0x07:
 					return {true, Cop2MacroArithmeticKind::Sub,
 						Cop2MacroArithmeticOperand::BroadcastLane, true, special2_index & 0x3};
+				case 0x08:
+				case 0x09:
+				case 0x0a:
+				case 0x0b:
+					return {true, Cop2MacroArithmeticKind::MAdd,
+						Cop2MacroArithmeticOperand::BroadcastLane, true, special2_index & 0x3};
+				case 0x0c:
+				case 0x0d:
+				case 0x0e:
+				case 0x0f:
+					return {true, Cop2MacroArithmeticKind::MSub,
+						Cop2MacroArithmeticOperand::BroadcastLane, true, special2_index & 0x3};
 				case 0x18:
 				case 0x19:
 				case 0x1a:
@@ -690,23 +739,44 @@ namespace VitaEE
 				case 0x20:
 					return {true, Cop2MacroArithmeticKind::Add,
 						Cop2MacroArithmeticOperand::ImmediateQ, true, 0};
+				case 0x21:
+					return {true, Cop2MacroArithmeticKind::MAdd,
+						Cop2MacroArithmeticOperand::ImmediateQ, true, 0};
 				case 0x22:
 					return {true, Cop2MacroArithmeticKind::Add,
+						Cop2MacroArithmeticOperand::ImmediateI, true, 0};
+				case 0x23:
+					return {true, Cop2MacroArithmeticKind::MAdd,
 						Cop2MacroArithmeticOperand::ImmediateI, true, 0};
 				case 0x24:
 					return {true, Cop2MacroArithmeticKind::Sub,
 						Cop2MacroArithmeticOperand::ImmediateQ, true, 0};
+				case 0x25:
+					return {true, Cop2MacroArithmeticKind::MSub,
+						Cop2MacroArithmeticOperand::ImmediateQ, true, 0};
 				case 0x26:
 					return {true, Cop2MacroArithmeticKind::Sub,
 						Cop2MacroArithmeticOperand::ImmediateI, true, 0};
+				case 0x27:
+					return {true, Cop2MacroArithmeticKind::MSub,
+						Cop2MacroArithmeticOperand::ImmediateI, true, 0};
 				case 0x28:
 					return {true, Cop2MacroArithmeticKind::Add,
+						Cop2MacroArithmeticOperand::Vector, true, 0};
+				case 0x29:
+					return {true, Cop2MacroArithmeticKind::MAdd,
 						Cop2MacroArithmeticOperand::Vector, true, 0};
 				case 0x2a:
 					return {true, Cop2MacroArithmeticKind::Mul,
 						Cop2MacroArithmeticOperand::Vector, true, 0};
 				case 0x2c:
 					return {true, Cop2MacroArithmeticKind::Sub,
+						Cop2MacroArithmeticOperand::Vector, true, 0};
+				case 0x2d:
+					return {true, Cop2MacroArithmeticKind::MSub,
+						Cop2MacroArithmeticOperand::Vector, true, 0};
+				case 0x2e:
+					return {true, Cop2MacroArithmeticKind::OpMula,
 						Cop2MacroArithmeticOperand::Vector, true, 0};
 				default:
 					return {};
@@ -1219,9 +1289,9 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VADD/VSUB/
-			// VMUL/VMAX/VMINI/VABS/VCLIP/VDIV/VFTOI/VITOF/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
+			// VMUL/VMADD/VMSUB/VOPMULA/VOPMSUB/VMAX/VMINI/VABS/VCLIP/VDIV/VFTOI/VITOF/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
 			// VLQI/VSQI/VLQD/VSQD, and x86/microVU_Macro.inl
-			// recVADD/recVSUB/recVMUL/recVMAX/recVMINI/recVABS/recVNOP/
+			// recVADD/recVSUB/recVMUL/recVMADD/recVMSUB/recVOPMULA/recVOPMSUB/recVMAX/recVMINI/recVABS/recVNOP/
 			// recVMOVE/recVMR32/recVI*/recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops either have
 			// no MAC/status/clip synchronization side effects or synchronize
 			// their flags directly, so idle VU0 can execute them inline while
@@ -5136,10 +5206,11 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCOP2MacroArithmeticBody(u32 op)
 	{
-		// PCSX2 owners: VUops.cpp::_vuADD/_vuSUB/_vuMUL plus their
-		// broadcast/ACC variants, VUflags.cpp::VU_MAC*_UPDATE(), and
-		// VUops.cpp::SYNCMSFLAGS(). FD VADDi stays helper-backed because
-		// VUops.cpp conditionally uses the TriAce CHECK_VUADDSUBHACK path.
+		// PCSX2 owners: VUops.cpp::_vuADD/_vuSUB/_vuMUL/_vuMADD/_vuMSUB/
+		// _vuOPMULA/_vuOPMSUB plus their broadcast/ACC variants,
+		// VUflags.cpp::VU_MAC*_UPDATE(), and VUops.cpp::SYNCMSFLAGS().
+		// FD VADDi stays helper-backed because VUops.cpp conditionally uses
+		// the TriAce CHECK_VUADDSUBHACK path.
 		const Cop2MacroArithmeticOp arithmetic = DecodeCop2MacroArithmetic(op);
 		if (!arithmetic.valid)
 			return false;
@@ -5157,6 +5228,12 @@ namespace VitaEE
 		constexpr unsigned VFP_FT_S1 = 1;
 		constexpr unsigned VFP_RESULT_S2 = 2;
 		constexpr unsigned VFP_BROADCAST_S3 = 3;
+		constexpr unsigned VFP_ACC_S4 = 4;
+		const bool is_outer_product = arithmetic.kind == Cop2MacroArithmeticKind::OpMula ||
+									  arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
+		const bool uses_acc_source = arithmetic.kind == Cop2MacroArithmeticKind::MAdd ||
+									 arithmetic.kind == Cop2MacroArithmeticKind::MSub ||
+									 arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
 
 		const auto emit_normalize_vu_float_word = [&](unsigned reg) {
 			if (!EmitAndImm32OrReg(HOST_TMP3, reg, FPU_FLOAT_EXPONENT_MASK, HOST_TMP5) ||
@@ -5399,18 +5476,30 @@ namespace VitaEE
 		for (unsigned lane = 0; lane < 4; lane++)
 		{
 			const unsigned lane_mask = 1u << (3 - lane);
-			if ((mask & lane_mask) == 0)
+			const bool active_lane = is_outer_product ? (lane < 3) : ((mask & lane_mask) != 0);
+			if (!active_lane)
 			{
-				if (!emit_clear_mac_lane(lane))
+				if (!is_outer_product && !emit_clear_mac_lane(lane))
 					return false;
 				continue;
 			}
 
-			if (!emit_load_vf_lane(HOST_TMP0, fs, lane) ||
+			const unsigned source_lane = is_outer_product ? ((lane + 1) % 3) : lane;
+			const unsigned operand_lane = is_outer_product ? ((lane + 2) % 3) : lane;
+			if (!emit_load_vf_lane(HOST_TMP0, fs, source_lane) ||
 				!emit_normalize_vu_float_word(HOST_TMP0) ||
-				!emit_load_operand_lane(lane) ||
+				!emit_load_operand_lane(operand_lane) ||
 				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
 				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1))
+			{
+				return false;
+			}
+
+			if (uses_acc_source &&
+				(!EmitVu0RegisterAddress(HOST_TMP2, VU0_ACC_OFFSET) ||
+					!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP2, static_cast<u16>(lane * sizeof(u32))) ||
+					!emit_normalize_vu_float_word(HOST_TMP2) ||
+					!m_code.EmitVmovCoreToS(VFP_ACC_S4, HOST_TMP2)))
 			{
 				return false;
 			}
@@ -5428,6 +5517,31 @@ namespace VitaEE
 				case Cop2MacroArithmeticKind::Mul:
 					if (!m_code.EmitVmulF32(VFP_RESULT_S2, VFP_FS_S0, VFP_FT_S1))
 						return false;
+					break;
+				case Cop2MacroArithmeticKind::OpMula:
+					if (!m_code.EmitVmulF32(VFP_RESULT_S2, VFP_FS_S0, VFP_FT_S1))
+						return false;
+					break;
+				case Cop2MacroArithmeticKind::MAdd:
+					if (!m_code.EmitVmulF32(VFP_RESULT_S2, VFP_FS_S0, VFP_FT_S1) ||
+						!m_code.EmitVaddF32(VFP_RESULT_S2, VFP_ACC_S4, VFP_RESULT_S2))
+					{
+						return false;
+					}
+					break;
+				case Cop2MacroArithmeticKind::MSub:
+					if (!m_code.EmitVmulF32(VFP_RESULT_S2, VFP_FS_S0, VFP_FT_S1) ||
+						!m_code.EmitVsubF32(VFP_RESULT_S2, VFP_ACC_S4, VFP_RESULT_S2))
+					{
+						return false;
+					}
+					break;
+				case Cop2MacroArithmeticKind::OpMSub:
+					if (!m_code.EmitVmulF32(VFP_RESULT_S2, VFP_FS_S0, VFP_FT_S1) ||
+						!m_code.EmitVsubF32(VFP_RESULT_S2, VFP_ACC_S4, VFP_RESULT_S2))
+					{
+						return false;
+					}
 					break;
 			}
 
