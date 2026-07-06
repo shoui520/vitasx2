@@ -14,6 +14,7 @@ extern u32 g_qemuSifFifoContiguousWrites;
 extern u32 g_qemuSifFifoContiguousReads;
 extern u32 g_qemuSifFifoWrappedWrites;
 extern u32 g_qemuSifFifoWrappedReads;
+extern u32 g_qemuSifFifoJunkWrites;
 extern u32 g_qemuSifFifoNeonQwords;
 #endif
 
@@ -156,17 +157,20 @@ struct sifFifo
 			// Read the old data in to our junk array in case of wrapping.
 			const int rP0 = std::min((FIFO_SIF_W - prevQWPos), 4);
 			const int rP1 = 4 - rP0;
-			memcpy(&junk[0], &data[prevQWPos], rP0 << 2);
-			memcpy(&junk[rP0], &data[0], rP1 << 2);
+			SifFifoCopyWords(&junk[0], &data[prevQWPos], rP0);
+			SifFifoCopyWords(&junk[rP0], &data[0], rP1);
 
 			// Fill the missing words to fill the QW.
 			const int wP0 = std::min((FIFO_SIF_W - writePos), words);
 			const int wP1 = words - wP0;
-			memcpy(&data[writePos], &junk[4- wP0], wP0 << 2);
-			memcpy(&data[0], &junk[wP0], wP1 << 2);
+			SifFifoCopyWords(&data[writePos], &junk[4- wP0], wP0);
+			SifFifoCopyWords(&data[0], &junk[wP0], wP1);
 
 			writePos = (writePos + words) & (FIFO_SIF_W - 1);
 			size += words;
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuSifFifoJunkWrites;
+#endif
 
 			SIF_LOG("  SIF + %d = %d Junk (pos=%d)", words, size, writePos);
 		}
