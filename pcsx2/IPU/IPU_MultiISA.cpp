@@ -21,6 +21,7 @@
 
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuIpuCscPostNeonBlocks = 0;
+u32 g_qemuIpuVqNeonGroups = 0;
 #endif
 
 // the IPU is fixed to 16 byte strides (128-bit / QWC resolution):
@@ -75,6 +76,7 @@ MULTI_ISA_UNSHARED_START
 
 static void ipu_csc(macroblock_8& mb8, macroblock_rgb32& rgb32, int sgn);
 static void ipu_csc_postprocess(macroblock_rgb32& rgb32, int sgn);
+static void ipu_vq_reference(macroblock_rgb16& rgb16, u8* indx4);
 static void ipu_vq(macroblock_rgb16& rgb16, u8* indx4);
 
 // --------------------------------------------------------------------------------------
@@ -2012,7 +2014,7 @@ void IpuCscPostprocessSelectedForValidation(macroblock_rgb32& rgb32, int sgn)
 }
 #endif
 
-__fi static void ipu_vq(macroblock_rgb16& rgb16, u8* indx4)
+static void ipu_vq_reference(macroblock_rgb16& rgb16, u8* indx4)
 {
 	const auto closest_index = [&](int i, int j) {
 		u8 index = 0;
@@ -2039,6 +2041,75 @@ __fi static void ipu_vq(macroblock_rgb16& rgb16, u8* indx4)
 		for (int j = 0; j < 8; ++j)
 			indx4[i * 8 + j] = closest_index(i, 2 * j + 1) << 4 | closest_index(i, 2 * j);
 }
+
+#if defined(ARCH_ARM32)
+
+static __forceinline void ipu_vq_neon_group(const u16* src, u8* dst)
+{
+	const uint16x8_t raw = vld1q_u16(src);
+	const int16x8_t r = vreinterpretq_s16_u16(vandq_u16(raw, vdupq_n_u16(0x001f)));
+	const int16x8_t g = vreinterpretq_s16_u16(vandq_u16(vshrq_n_u16(raw, 5), vdupq_n_u16(0x001f)));
+	const int16x8_t b = vreinterpretq_s16_u16(vandq_u16(vshrq_n_u16(raw, 10), vdupq_n_u16(0x001f)));
+	uint16x8_t min_distance = vdupq_n_u16(0xffff);
+	uint16x8_t best_index = vdupq_n_u16(0);
+
+	for (u8 k = 0; k < 16; k++)
+	{
+		const int16x8_t dr = vsubq_s16(r, vdupq_n_s16(g_ipu_vqclut[k].r));
+		const int16x8_t dg = vsubq_s16(g, vdupq_n_s16(g_ipu_vqclut[k].g));
+		const int16x8_t db = vsubq_s16(b, vdupq_n_s16(g_ipu_vqclut[k].b));
+		uint16x8_t distance = vreinterpretq_u16_s16(vmulq_s16(dr, dr));
+		distance = vaddq_u16(distance, vreinterpretq_u16_s16(vmulq_s16(dg, dg)));
+		distance = vaddq_u16(distance, vreinterpretq_u16_s16(vmulq_s16(db, db)));
+
+		const uint16x8_t closer = vcgtq_u16(min_distance, distance);
+		min_distance = vbslq_u16(closer, distance, min_distance);
+		best_index = vbslq_u16(closer, vdupq_n_u16(k), best_index);
+	}
+
+	alignas(16) u16 index[8];
+	vst1q_u16(index, best_index);
+	dst[0] = static_cast<u8>((index[1] << 4) | index[0]);
+	dst[1] = static_cast<u8>((index[3] << 4) | index[2]);
+	dst[2] = static_cast<u8>((index[5] << 4) | index[4]);
+	dst[3] = static_cast<u8>((index[7] << 4) | index[6]);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuIpuVqNeonGroups;
+#endif
+}
+
+static void ipu_vq_neon(macroblock_rgb16& rgb16, u8* indx4)
+{
+	for (int i = 0; i < 16; ++i)
+	{
+		ipu_vq_neon_group(reinterpret_cast<const u16*>(&rgb16.c[i][0]), &indx4[i * 8]);
+		ipu_vq_neon_group(reinterpret_cast<const u16*>(&rgb16.c[i][8]), &indx4[i * 8 + 4]);
+	}
+}
+
+#endif
+
+__fi static void ipu_vq(macroblock_rgb16& rgb16, u8* indx4)
+{
+#if defined(ARCH_ARM32)
+	ipu_vq_neon(rgb16, indx4);
+#else
+	ipu_vq_reference(rgb16, indx4);
+#endif
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void IpuVqReferenceForValidation(macroblock_rgb16& rgb16, u8* indx4)
+{
+	ipu_vq_reference(rgb16, indx4);
+}
+
+void IpuVqSelectedForValidation(macroblock_rgb16& rgb16, u8* indx4)
+{
+	ipu_vq(rgb16, indx4);
+}
+#endif
 
 __noinline void IPUWorker()
 {
