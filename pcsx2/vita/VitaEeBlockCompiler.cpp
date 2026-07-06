@@ -239,6 +239,12 @@ namespace VitaEE
 			unsigned broadcast_lane = 0;
 		};
 
+		struct Cop2MacroMoveOp
+		{
+			bool valid = false;
+			bool rotate32 = false;
+		};
+
 		constexpr unsigned RS(u32 op)
 		{
 			return (op >> 21) & 0x1f;
@@ -299,6 +305,19 @@ namespace VitaEE
 				return {true, true, true, false, 0};
 			if (function == 0x2f)
 				return {true, false, true, false, 0};
+			return {};
+		}
+
+		constexpr Cop2MacroMoveOp DecodeCop2MacroMove(u32 op)
+		{
+			if ((op & 0x3c) != 0x3c)
+				return {};
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			if (special2_index == 0x30)
+				return {true, false};
+			if (special2_index == 0x31)
+				return {true, true};
 			return {};
 		}
 
@@ -808,10 +827,10 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VNOP, and x86/microVU_Macro.inl recVMAX/recVMINI/
-			// recVABS/recVNOP. These macro ops have no MAC/status/clip
-			// synchronization side effects, so idle VU0 can execute them inline
-			// while running VU0 stays on the helper tail.
+			// VABS/VNOP/VMOVE/VMR32, and x86/microVU_Macro.inl recVMAX/
+			// recVMINI/recVABS/recVNOP/recVMOVE/recVMR32. These macro ops
+			// have no MAC/status/clip synchronization side effects, so idle VU0
+			// can execute them inline while running VU0 stays on the helper tail.
 			if ((op >> 26) != 0x12 || (((op >> 21) & 0x10) == 0) ||
 				!IsCOP2Special1Supported(op))
 			{
@@ -819,6 +838,8 @@ namespace VitaEE
 			}
 
 			if (DecodeCop2MacroMinMax(op).valid)
+				return true;
+			if (DecodeCop2MacroMove(op).valid)
 				return true;
 
 			if ((op & 0x3c) != 0x3c)
@@ -874,6 +895,8 @@ namespace VitaEE
 			{
 				if (DecodeCop2MacroMinMax(op).valid)
 					return 4; // code + source VF + operand VF/VI + destination VF.
+				if (DecodeCop2MacroMove(op).valid)
+					return 3; // code + source VF + destination VF.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
@@ -4584,12 +4607,14 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCOP2MacroBody(u32 op)
 	{
-		// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp::VABS()/VNOP(),
-		// and x86/microVU_Macro.inl::recVABS()/recVNOP(). This body is emitted
-		// only on the idle-VU0 path; running VU0 exits through the COP2 helper
-		// so _vu0FinishMicro() still owns the interlock and cycle side effects.
+		// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp macro helpers, and
+		// x86/microVU_Macro.inl rec* macro lowerings. This body is emitted only
+		// on the idle-VU0 path; running VU0 exits through the COP2 helper so
+		// _vu0FinishMicro() still owns the interlock and cycle side effects.
 		if (DecodeCop2MacroMinMax(op).valid)
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroMinMaxBody(op);
+		if (DecodeCop2MacroMove(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroMoveBody(op);
 
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
@@ -4643,6 +4668,78 @@ namespace VitaEE
 		if ((mask & 0x2) && !emit_lane(2))
 			return false;
 		if ((mask & 0x1) && !emit_lane(3))
+			return false;
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitCOP2MacroMoveBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::_vuMOVE() / _vuMR32(). These are raw
+		// bit-copy lane operations; keep self-overlap behavior by reading the
+		// original X lane before any stores for VMR32.
+		const Cop2MacroMoveOp move = DecodeCop2MacroMove(op);
+		if (!move.valid)
+			return false;
+
+		const unsigned ft = RT(op);
+		const unsigned mask = (op >> 21) & 0x0f;
+		if (ft == 0 || mask == 0)
+			return true;
+
+		const unsigned fs = RD(op);
+		if (mask == 0x0f)
+		{
+			constexpr unsigned NEON_VALUE = 0;
+			return EmitVu0VfAddress(HOST_TMP0, fs) &&
+				   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
+				   (!move.rotate32 || m_code.EmitVextI8Q(NEON_VALUE, NEON_VALUE, NEON_VALUE, 4)) &&
+				   EmitVu0VfAddress(HOST_TMP1, ft) &&
+				   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
+		}
+
+		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+			!EmitVu0VfAddress(HOST_TMP1, ft))
+		{
+			return false;
+		}
+
+		if (move.rotate32 &&
+			!m_code.EmitLdrImm12(HOST_TMP4, HOST_TMP0, 0))
+		{
+			return false;
+		}
+
+		const auto emit_lane_copy = [&](unsigned dest_lane, unsigned source_lane) {
+			const u16 dest_offset = static_cast<u16>(dest_lane * sizeof(u32));
+			const u16 source_offset = static_cast<u16>(source_lane * sizeof(u32));
+			return m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, source_offset) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, dest_offset);
+		};
+
+		if (move.rotate32)
+		{
+			if ((mask & 0x8) && !emit_lane_copy(0, 1))
+				return false;
+			if ((mask & 0x4) && !emit_lane_copy(1, 2))
+				return false;
+			if ((mask & 0x2) && !emit_lane_copy(2, 3))
+				return false;
+			if ((mask & 0x1) &&
+				!m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, static_cast<u16>(3 * sizeof(u32))))
+			{
+				return false;
+			}
+			return true;
+		}
+
+		if ((mask & 0x8) && !emit_lane_copy(0, 0))
+			return false;
+		if ((mask & 0x4) && !emit_lane_copy(1, 1))
+			return false;
+		if ((mask & 0x2) && !emit_lane_copy(2, 2))
+			return false;
+		if ((mask & 0x1) && !emit_lane_copy(3, 3))
 			return false;
 
 		return true;
