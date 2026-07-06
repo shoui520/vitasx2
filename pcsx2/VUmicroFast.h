@@ -186,6 +186,8 @@ namespace VUInterpFast
 		MSUBAy,
 		MSUBAz,
 		MSUBAw,
+		OPMULA,
+		OPMSUB,
 	};
 
 	static constexpr unsigned Ft(u32 code) { return (code >> 16) & 0x1f; }
@@ -498,6 +500,8 @@ namespace VUInterpFast
 				return UpperFastKind::SUB;
 			case 0x2d:
 				return UpperFastKind::MSUB;
+			case 0x2e:
+				return UpperFastKind::OPMSUB;
 			case 0x2f:
 				return UpperFastKind::MINI;
 			case 0x3c:
@@ -585,6 +589,8 @@ namespace VUInterpFast
 						return UpperFastKind::SUBAi;
 					case 0x0a:
 						return UpperFastKind::MULA;
+					case 0x0b:
+						return UpperFastKind::OPMULA;
 					default:
 						return UpperFastKind::None;
 				}
@@ -768,6 +774,30 @@ namespace VUInterpFast
 		regs->VIread = Vf0Flag(Fs(code)) | Vf0Flag(Ft(code)) | (1u << REG_CLIP_FLAG);
 	}
 
+	static inline void AnalyzeUpperOpmula(u32 code, _VURegsNum* regs)
+	{
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFwxyzw = 0xe;
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = 0xe;
+		regs->VFread1 = Ft(code);
+		regs->VFr1xyzw = 0xe;
+		regs->VIwrite = 1u << REG_ACC_FLAG;
+		regs->VIread = Vf0Flag(Fs(code)) | Vf0Flag(Ft(code)) | (1u << REG_ACC_FLAG);
+	}
+
+	static inline void AnalyzeUpperOpmsub(u32 code, _VURegsNum* regs)
+	{
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFwrite = Fd(code);
+		regs->VFwxyzw = 0xe;
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = 0xe;
+		regs->VFread1 = Ft(code);
+		regs->VFr1xyzw = 0xe;
+		regs->VIread = Vf0Flag(Fs(code)) | Vf0Flag(Ft(code)) | (1u << REG_ACC_FLAG);
+	}
+
 	static inline bool AnalyzeUpperNoLower(u32 code, _VURegsNum* regs)
 	{
 		const UpperFastKind kind = DecodeUpper(code);
@@ -875,6 +905,12 @@ namespace VUInterpFast
 				return true;
 			case UpperFastKind::CLIP:
 				AnalyzeUpperClip(code, regs);
+				return true;
+			case UpperFastKind::OPMULA:
+				AnalyzeUpperOpmula(code, regs);
+				return true;
+			case UpperFastKind::OPMSUB:
+				AnalyzeUpperOpmsub(code, regs);
 				return true;
 			case UpperFastKind::ADDA:
 			case UpperFastKind::SUBA:
@@ -1571,6 +1607,43 @@ namespace VUInterpFast
 		VU_STAT_UPDATE(VU);
 	}
 
+	static inline void ExecuteOpmula(VURegs* VU, u32 code)
+	{
+		const unsigned fs = Fs(code);
+		const unsigned ft = Ft(code);
+
+		const float ftx = VuDouble(VU->VF[ft].UL[0]);
+		const float fty = VuDouble(VU->VF[ft].UL[1]);
+		const float ftz = VuDouble(VU->VF[ft].UL[2]);
+		const float fsx = VuDouble(VU->VF[fs].UL[0]);
+		const float fsy = VuDouble(VU->VF[fs].UL[1]);
+		const float fsz = VuDouble(VU->VF[fs].UL[2]);
+
+		VU->ACC.UL[0] = UpdateMacLane(VU, 0, fsy * ftz);
+		VU->ACC.UL[1] = UpdateMacLane(VU, 1, fsz * ftx);
+		VU->ACC.UL[2] = UpdateMacLane(VU, 2, fsx * fty);
+		VU_STAT_UPDATE(VU);
+	}
+
+	static inline void ExecuteOpmsub(VURegs* VU, u32 code)
+	{
+		const unsigned fd = Fd(code);
+		const unsigned fs = Fs(code);
+		const unsigned ft = Ft(code);
+
+		const float ftx = VuDouble(VU->VF[ft].UL[0]);
+		const float fty = VuDouble(VU->VF[ft].UL[1]);
+		const float ftz = VuDouble(VU->VF[ft].UL[2]);
+		const float fsx = VuDouble(VU->VF[fs].UL[0]);
+		const float fsy = VuDouble(VU->VF[fs].UL[1]);
+		const float fsz = VuDouble(VU->VF[fs].UL[2]);
+
+		WriteMacResult(VU, false, fd, 0, UpdateMacLane(VU, 0, VuDouble(VU->ACC.UL[0]) - fsy * ftz));
+		WriteMacResult(VU, false, fd, 1, UpdateMacLane(VU, 1, VuDouble(VU->ACC.UL[1]) - fsz * ftx));
+		WriteMacResult(VU, false, fd, 2, UpdateMacLane(VU, 2, VuDouble(VU->ACC.UL[2]) - fsx * fty));
+		VU_STAT_UPDATE(VU);
+	}
+
 	template <u32 Offset>
 	static inline u32 FloatToIntBits(u32 bits)
 	{
@@ -1746,6 +1819,12 @@ namespace VUInterpFast
 				return;
 			case UpperFastKind::CLIP:
 				ExecuteClip(VU, code);
+				return;
+			case UpperFastKind::OPMULA:
+				ExecuteOpmula(VU, code);
+				return;
+			case UpperFastKind::OPMSUB:
+				ExecuteOpmsub(VU, code);
 				return;
 			case UpperFastKind::MUL:
 				ExecuteMulMasked(VU, code, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
