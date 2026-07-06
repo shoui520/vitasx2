@@ -9,7 +9,59 @@
 #include "IopHw.h"
 #include "Config.h"
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
 static constexpr int CYCLES_PER_WORD = 24;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuSpu2DmaCopyNeonQwords = 0;
+#endif
+
+static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes)
+{
+#if defined(ARCH_ARM32)
+	u8* dst = static_cast<u8*>(to);
+	const u8* src = static_cast<const u8*>(from);
+	const u32 qwords = bytes >> 4;
+	for (u32 i = 0; i < qwords; i++)
+	{
+		const uint8x16_t qword = vld1q_u8(src);
+		vst1q_u8(dst, qword);
+		src += 16;
+		dst += 16;
+	}
+
+	if (bytes & 8)
+	{
+		const uint8x8_t half = vld1_u8(src);
+		vst1_u8(dst, half);
+		src += 8;
+		dst += 8;
+	}
+	for (u32 i = 0; i < (bytes & 7); i++)
+		dst[i] = src[i];
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2DmaCopyNeonQwords += qwords;
+#endif
+	return;
+#endif
+	memcpy(to, from, bytes);
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void Spu2DmaCopyBytesReferenceForValidation(void* to, const void* from, u32 bytes)
+{
+	memcpy(to, from, bytes);
+}
+
+void Spu2DmaCopyBytesSelectedForValidation(void* to, const void* from, u32 bytes)
+{
+	Spu2DmaCopyBytes(to, from, bytes);
+}
+#endif
 
 #ifdef PCSX2_DEVBUILD
 
@@ -120,7 +172,7 @@ void V_Core::AutoDMAReadBuffer(int mode) //mode: 0= split stereo; 1 = do not spl
 	if (mode)
 	{
 		if (DMAPtr != nullptr)
-			memcpy(GetMemPtr(0x2000 + (Index << 10) + spos), DMAPtr + InputDataProgress, size);
+			Spu2DmaCopyBytes(GetMemPtr(0x2000 + (Index << 10) + spos), DMAPtr + InputDataProgress, size);
 		MADR += size;
 		InputDataLeft -= 0x200;
 		InputDataProgress += 0x200;
@@ -135,7 +187,7 @@ void V_Core::AutoDMAReadBuffer(int mode) //mode: 0= split stereo; 1 = do not spl
 				spos &= ~0x200;
 
 			if (DMAPtr != nullptr)
-				memcpy(GetMemPtr(0x2000 + (Index << 10) + spos), DMAPtr + InputDataProgress, 0x200);
+				Spu2DmaCopyBytes(GetMemPtr(0x2000 + (Index << 10) + spos), DMAPtr + InputDataProgress, 0x200);
 			InputDataTransferred += 0x200;
 			InputDataLeft -= 0x100;
 			InputDataProgress += 0x100;
@@ -277,7 +329,7 @@ void V_Core::FinishDMAwrite()
 	// It starts at TSA and goes to buff1end.
 
 	const u32 buff1size = (buff1end - ActiveTSA);
-	memcpy(GetMemPtr(ActiveTSA), DMAPtr, buff1size * 2);
+	Spu2DmaCopyBytes(GetMemPtr(ActiveTSA), DMAPtr, buff1size * 2);
 
 	u32 TDA;
 
@@ -298,7 +350,7 @@ void V_Core::FinishDMAwrite()
 		ActiveTSA = 0;
 		// Emulation Grayarea: Should addresses wrap around to zero, or wrap around to
 		// 0x2800?  Hard to know for sure (almost no games depend on this)
-		memcpy(GetMemPtr(0), DMAPtr, buff2end * 2);
+		Spu2DmaCopyBytes(GetMemPtr(0), DMAPtr, buff2end * 2);
 		TDA = (buff2end) & 0xfffff;
 
 		// Flag interrupt?  If IRQA occurs between start and dest, flag it.
@@ -371,7 +423,7 @@ void V_Core::FinishDMAread()
 	}
 
 	const u32 buff1size = (buff1end - ActiveTSA);
-	memcpy(DMARPtr, GetMemPtr(ActiveTSA), buff1size * 2);
+	Spu2DmaCopyBytes(DMARPtr, GetMemPtr(ActiveTSA), buff1size * 2);
 	// Note on TSA's position after our copy finishes:
 	// IRQA should be measured by the end of the writepos+0x20.  But the TDA
 	// should be written back at the precise endpoint of the xfer.
@@ -388,7 +440,7 @@ void V_Core::FinishDMAread()
 
 		// second branch needs cleared:
 		// It starts at the beginning of memory and moves forward to buff2end
-		memcpy(DMARPtr, GetMemPtr(0), buff2end * 2);
+		Spu2DmaCopyBytes(DMARPtr, GetMemPtr(0), buff2end * 2);
 
 		TDA = (buff2end) & 0xfffff;
 

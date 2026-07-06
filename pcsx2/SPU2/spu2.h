@@ -91,4 +91,5 @@ extern u32 g_qemuSpu2MasterVolumeSlideUpdated;
 extern u32 g_qemuSpu2MasterVolumeSlideSkipped;
 extern u32 g_qemuSpu2ZeroVoiceGateSkipped;
 extern u32 g_qemuSpu2NonzeroVoiceGateMixed;
+extern u32 g_qemuSpu2DmaCopyNeonQwords;
 #endif
