@@ -149,6 +149,9 @@ namespace VitaEE
 		constexpr size_t VU0_VI_OFFSET = offsetof(Vu0State, VI);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		constexpr size_t VU0_CODE_OFFSET = offsetof(Vu0State, code);
+		constexpr size_t VU0_VI_BACKUP_CYCLES_OFFSET = offsetof(Vu0State, VIBackupCycles);
+		constexpr size_t VU0_VI_OLD_VALUE_OFFSET = offsetof(Vu0State, VIOldValue);
+		constexpr size_t VU0_VI_REG_NUMBER_OFFSET = offsetof(Vu0State, VIRegNumber);
 #endif
 		constexpr size_t VU0_VF_STRIDE = sizeof(VU0.VF[0]);
 		constexpr size_t VU0_VI_STRIDE = sizeof(VU0.VI[0]);
@@ -245,6 +248,21 @@ namespace VitaEE
 			bool rotate32 = false;
 		};
 
+		enum class Cop2MacroViKind : u8
+		{
+			Add,
+			Sub,
+			AddImmediate,
+			And,
+			Or,
+		};
+
+		struct Cop2MacroViOp
+		{
+			bool valid = false;
+			Cop2MacroViKind kind = Cop2MacroViKind::Add;
+		};
+
 		constexpr unsigned RS(u32 op)
 		{
 			return (op >> 21) & 0x1f;
@@ -319,6 +337,25 @@ namespace VitaEE
 			if (special2_index == 0x31)
 				return {true, true};
 			return {};
+		}
+
+		constexpr Cop2MacroViOp DecodeCop2MacroVi(u32 op)
+		{
+			switch (op & 0x3f)
+			{
+				case 0x30:
+					return {true, Cop2MacroViKind::Add};
+				case 0x31:
+					return {true, Cop2MacroViKind::Sub};
+				case 0x32:
+					return {true, Cop2MacroViKind::AddImmediate};
+				case 0x34:
+					return {true, Cop2MacroViKind::And};
+				case 0x35:
+					return {true, Cop2MacroViKind::Or};
+				default:
+					return {};
+			}
 		}
 
 		constexpr size_t GprOffset(unsigned guest_reg)
@@ -827,10 +864,11 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VNOP/VMOVE/VMR32, and x86/microVU_Macro.inl recVMAX/
-			// recVMINI/recVABS/recVNOP/recVMOVE/recVMR32. These macro ops
-			// have no MAC/status/clip synchronization side effects, so idle VU0
-			// can execute them inline while running VU0 stays on the helper tail.
+			// VABS/VNOP/VMOVE/VMR32/VI*, and x86/microVU_Macro.inl recVMAX/
+			// recVMINI/recVABS/recVNOP/recVMOVE/recVMR32/recVI*. These macro
+			// ops have no MAC/status/clip synchronization side effects, so idle
+			// VU0 can execute them inline while running VU0 stays on the helper
+			// tail.
 			if ((op >> 26) != 0x12 || (((op >> 21) & 0x10) == 0) ||
 				!IsCOP2Special1Supported(op))
 			{
@@ -840,6 +878,8 @@ namespace VitaEE
 			if (DecodeCop2MacroMinMax(op).valid)
 				return true;
 			if (DecodeCop2MacroMove(op).valid)
+				return true;
+			if (DecodeCop2MacroVi(op).valid)
 				return true;
 
 			if ((op & 0x3c) != 0x3c)
@@ -897,6 +937,8 @@ namespace VitaEE
 					return 4; // code + source VF + operand VF/VI + destination VF.
 				if (DecodeCop2MacroMove(op).valid)
 					return 3; // code + source VF + destination VF.
+				if (DecodeCop2MacroVi(op).valid)
+					return 4; // code + source VI + operand/imm + destination VI.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
@@ -4615,6 +4657,8 @@ namespace VitaEE
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroMinMaxBody(op);
 		if (DecodeCop2MacroMove(op).valid)
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroMoveBody(op);
+		if (DecodeCop2MacroVi(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroViBody(op);
 
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
@@ -4671,6 +4715,139 @@ namespace VitaEE
 			return false;
 
 		return true;
+	}
+
+	bool BlockCompiler::EmitVu0ViBackup(unsigned vi_reg)
+	{
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		return false;
+#else
+		// PCSX2 owner: VUops.cpp::_vuBackupVI(). Repeated writes to the same VI
+		// register must keep the old value from before the write chain.
+		if (!EmitVu0RegisterAddress(HOST_TMP0, VU0_VI_BACKUP_CYCLES_OFFSET) ||
+			!EmitVu0RegisterAddress(HOST_TMP2, VU0_VI_REG_NUMBER_OFFSET) ||
+			!m_code.EmitLdrbImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!m_code.EmitCmpImm32(HOST_TMP1, 0))
+		{
+			return false;
+		}
+
+		const size_t set_new_from_zero = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (set_new_from_zero == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitLdrImm12(HOST_TMP3, HOST_TMP2, 0) ||
+			!m_code.EmitCmpImm32(HOST_TMP3, vi_reg))
+		{
+			return false;
+		}
+
+		const size_t set_new_from_different = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (set_new_from_different == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovImm8(HOST_TMP1, 2) ||
+			!m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, 0))
+		{
+			return false;
+		}
+
+		const size_t done = m_code.EmitBranchPlaceholder();
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t set_new_target = m_code.Size();
+		if (!m_code.PatchBranch(set_new_from_zero, set_new_target, VitaA32::Condition::EQ) ||
+			!m_code.PatchBranch(set_new_from_different, set_new_target, VitaA32::Condition::NE) ||
+			!m_code.EmitMovImm8(HOST_TMP1, 2) ||
+			!m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!m_code.EmitMovImm8(HOST_TMP3, static_cast<u8>(vi_reg)) ||
+			!m_code.EmitStrImm12(HOST_TMP3, HOST_TMP2, 0) ||
+			!EmitVu0ViAddress(HOST_TMP4, vi_reg) ||
+			!m_code.EmitLdrhImm8(HOST_TMP3, HOST_TMP4, 0) ||
+			!EmitVu0RegisterAddress(HOST_TMP4, VU0_VI_OLD_VALUE_OFFSET) ||
+			!m_code.EmitStrImm12(HOST_TMP3, HOST_TMP4, 0))
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(done, m_code.Size());
+#endif
+	}
+
+	bool BlockCompiler::EmitCOP2MacroViBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::_vuIADD()/IADDI/IAND/IOR/ISUB. These write
+		// only VI.US[0]/SS[0] and update _vuBackupVI() before the halfword store.
+		const Cop2MacroViOp vi = DecodeCop2MacroVi(op);
+		if (!vi.valid)
+			return false;
+
+		const unsigned it = RT(op) & 0x0f;
+		const unsigned is = RD(op) & 0x0f;
+		const unsigned id = SA(op) & 0x0f;
+		const bool immediate = vi.kind == Cop2MacroViKind::AddImmediate;
+		const bool logical = vi.kind == Cop2MacroViKind::And || vi.kind == Cop2MacroViKind::Or;
+		const unsigned dest = immediate ? it : id;
+		if (dest == 0)
+			return true;
+
+		if (!EmitVu0ViBackup(dest) ||
+			!EmitVu0ViAddress(HOST_TMP0, is) ||
+			!(logical ? m_code.EmitLdrhImm8(HOST_TMP2, HOST_TMP0, 0) :
+						m_code.EmitLdrshImm8(HOST_TMP2, HOST_TMP0, 0)))
+		{
+			return false;
+		}
+
+		if (immediate)
+		{
+			const unsigned imm5 = SA(op) & 0x1f;
+			const int imm = (imm5 & 0x10) ? static_cast<int>(imm5) - 0x20 : static_cast<int>(imm5);
+			if (imm > 0)
+			{
+				if (!m_code.EmitAddImm8(HOST_TMP2, HOST_TMP2, static_cast<u8>(imm)))
+					return false;
+			}
+			else if (imm < 0 && !m_code.EmitSubImm8(HOST_TMP2, HOST_TMP2, static_cast<u8>(-imm)))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			if (!EmitVu0ViAddress(HOST_TMP1, it) ||
+				!(logical ? m_code.EmitLdrhImm8(HOST_TMP3, HOST_TMP1, 0) :
+							m_code.EmitLdrshImm8(HOST_TMP3, HOST_TMP1, 0)))
+			{
+				return false;
+			}
+
+			switch (vi.kind)
+			{
+				case Cop2MacroViKind::Add:
+					if (!m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP3))
+						return false;
+					break;
+				case Cop2MacroViKind::Sub:
+					if (!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP3))
+						return false;
+					break;
+				case Cop2MacroViKind::And:
+					if (!m_code.EmitAndReg(HOST_TMP2, HOST_TMP2, HOST_TMP3))
+						return false;
+					break;
+				case Cop2MacroViKind::Or:
+					if (!m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP3))
+						return false;
+					break;
+				case Cop2MacroViKind::AddImmediate:
+					return false;
+			}
+		}
+
+		return EmitVu0ViAddress(HOST_TMP0, dest) &&
+			   m_code.EmitStrhImm8(HOST_TMP2, HOST_TMP0, 0);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroMoveBody(u32 op)
