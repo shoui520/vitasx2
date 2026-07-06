@@ -20,21 +20,33 @@ extern u32 g_qemuSifFifoNeonQwords;
 static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 {
 #if defined(ARCH_ARM32)
-	if ((words & 3) == 0)
+	const int qwords = words >> 2;
+	for (int i = 0; i < qwords; i++)
 	{
-		const int qwords = words >> 2;
-		for (int i = 0; i < qwords; i++)
-		{
-			const uint32x4_t qword = vld1q_u32(from);
-			vst1q_u32(to, qword);
-			from += 4;
-			to += 4;
-		}
-#if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuSifFifoNeonQwords += qwords;
-#endif
-		return;
+		const uint32x4_t qword = vld1q_u32(from);
+		vst1q_u32(to, qword);
+		from += 4;
+		to += 4;
 	}
+
+	switch (words & 3)
+	{
+		case 3:
+			to[2] = from[2];
+			[[fallthrough]];
+		case 2:
+			to[1] = from[1];
+			[[fallthrough]];
+		case 1:
+			to[0] = from[0];
+			break;
+		default:
+			break;
+	}
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSifFifoNeonQwords += qwords;
+#endif
+	return;
 #endif
 	memcpy(to, from, words << 2);
 }
