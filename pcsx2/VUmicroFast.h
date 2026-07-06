@@ -8,12 +8,20 @@
 #include "VUflags.h"
 #include "VUmicro.h"
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
 #include <cmath>
 #include <cstring>
 
 extern void _vuBackupVI(VURegs* VU, u32 reg);
 extern void _vuXGKICKTransfer(s32 cycles, bool flush);
 extern u32* GET_VU_MEM(VURegs* VU, u32 addr);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+extern u32 g_qemuVuLowerNeonQwordOps;
+#endif
 
 namespace VUInterpFast
 {
@@ -1342,6 +1350,16 @@ namespace VUInterpFast
 	{
 		if (ft == 0)
 			return;
+#if defined(ARCH_ARM32)
+		if (mask == 0x0f)
+		{
+			vst1q_u32(VU->VF[ft].UL, vld1q_u32(ptr));
+#if defined(VITASX2_QEMU_VALIDATION)
+			++::g_qemuVuLowerNeonQwordOps;
+#endif
+			return;
+		}
+#endif
 		if (mask & 0x8) VU->VF[ft].UL[0] = ptr[0];
 		if (mask & 0x4) VU->VF[ft].UL[1] = ptr[1];
 		if (mask & 0x2) VU->VF[ft].UL[2] = ptr[2];
@@ -1350,6 +1368,16 @@ namespace VUInterpFast
 
 	static inline void StoreVfMasked(VURegs* VU, unsigned fs, unsigned mask, u32* ptr)
 	{
+#if defined(ARCH_ARM32)
+		if (mask == 0x0f)
+		{
+			vst1q_u32(ptr, vld1q_u32(VU->VF[fs].UL));
+#if defined(VITASX2_QEMU_VALIDATION)
+			++::g_qemuVuLowerNeonQwordOps;
+#endif
+			return;
+		}
+#endif
 		if (mask & 0x8) ptr[0] = VU->VF[fs].UL[0];
 		if (mask & 0x4) ptr[1] = VU->VF[fs].UL[1];
 		if (mask & 0x2) ptr[2] = VU->VF[fs].UL[2];
@@ -1360,6 +1388,16 @@ namespace VUInterpFast
 	{
 		if (ft == 0)
 			return;
+#if defined(ARCH_ARM32)
+		if (mask == 0x0f)
+		{
+			vst1q_u32(VU->VF[ft].UL, vdupq_n_u32(value));
+#if defined(VITASX2_QEMU_VALIDATION)
+			++::g_qemuVuLowerNeonQwordOps;
+#endif
+			return;
+		}
+#endif
 		if (mask & 0x8) VU->VF[ft].UL[0] = value;
 		if (mask & 0x4) VU->VF[ft].UL[1] = value;
 		if (mask & 0x2) VU->VF[ft].UL[2] = value;
@@ -1370,11 +1408,40 @@ namespace VUInterpFast
 	{
 		if (ft == 0)
 			return;
+#if defined(ARCH_ARM32)
+		if (mask == 0x0f)
+		{
+			vst1q_s32(VU->VF[ft].SL, vdupq_n_s32(value));
+#if defined(VITASX2_QEMU_VALIDATION)
+			++::g_qemuVuLowerNeonQwordOps;
+#endif
+			return;
+		}
+#endif
 		if (mask & 0x8) VU->VF[ft].SL[0] = value;
 		if (mask & 0x4) VU->VF[ft].SL[1] = value;
 		if (mask & 0x2) VU->VF[ft].SL[2] = value;
 		if (mask & 0x1) VU->VF[ft].SL[3] = value;
 	}
+
+#if defined(ARCH_ARM32)
+	static inline void StoreViHalfwordToMemoryQword(u16 value, u16* ptr)
+	{
+		vst1q_u16(ptr, vreinterpretq_u16_u32(vdupq_n_u32(value)));
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuLowerNeonQwordOps;
+#endif
+	}
+
+	static inline void StoreMr32Full(VURegs* VU, unsigned ft, unsigned fs)
+	{
+		const uint32x4_t source = vld1q_u32(VU->VF[fs].UL);
+		vst1q_u32(VU->VF[ft].UL, vextq_u32(source, source, 1));
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuLowerNeonQwordOps;
+#endif
+	}
+#endif
 
 	static inline float FloatFromBits(u32 bits)
 	{
@@ -2095,6 +2162,13 @@ namespace VUInterpFast
 			{
 				const u16 addr = static_cast<u16>((Imm11(code) + VU->VI[Is(code)].SS[0]) * 16);
 				u16* ptr = reinterpret_cast<u16*>(VuMemQword(VU, addr));
+#if defined(ARCH_ARM32)
+				if (XYZW(code) == 0x0f)
+				{
+					StoreViHalfwordToMemoryQword(VU->VI[It(code)].US[0], ptr);
+					return;
+				}
+#endif
 				if (XYZW(code) & 0x8) { ptr[0] = VU->VI[It(code)].US[0]; ptr[1] = 0; }
 				if (XYZW(code) & 0x4) { ptr[2] = VU->VI[It(code)].US[0]; ptr[3] = 0; }
 				if (XYZW(code) & 0x2) { ptr[4] = VU->VI[It(code)].US[0]; ptr[5] = 0; }
@@ -2233,6 +2307,13 @@ namespace VUInterpFast
 			case LowerFastKind::ISWR:
 			{
 				u16* ptr = reinterpret_cast<u16*>(VuMemQword(VU, VU->VI[Is(code)].US[0] * 16));
+#if defined(ARCH_ARM32)
+				if (XYZW(code) == 0x0f)
+				{
+					StoreViHalfwordToMemoryQword(VU->VI[It(code)].US[0], ptr);
+					return;
+				}
+#endif
 				if (XYZW(code) & 0x8) { ptr[0] = VU->VI[It(code)].US[0]; ptr[1] = 0; }
 				if (XYZW(code) & 0x4) { ptr[2] = VU->VI[It(code)].US[0]; ptr[3] = 0; }
 				if (XYZW(code) & 0x2) { ptr[4] = VU->VI[It(code)].US[0]; ptr[5] = 0; }
@@ -2246,6 +2327,13 @@ namespace VUInterpFast
 			case LowerFastKind::MR32:
 				if (Ft(code) != 0)
 				{
+#if defined(ARCH_ARM32)
+					if (XYZW(code) == 0x0f)
+					{
+						StoreMr32Full(VU, Ft(code), Fs(code));
+						return;
+					}
+#endif
 					const u32 tx = VU->VF[Fs(code)].i.x;
 					if (XYZW(code) & 0x8) VU->VF[Ft(code)].i.x = VU->VF[Fs(code)].i.y;
 					if (XYZW(code) & 0x4) VU->VF[Ft(code)].i.y = VU->VF[Fs(code)].i.z;
