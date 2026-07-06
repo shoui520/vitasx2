@@ -21,6 +21,7 @@ extern u32* GET_VU_MEM(VURegs* VU, u32 addr);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 extern u32 g_qemuVuLowerNeonQwordOps;
+extern u32 g_qemuVuUpperNeonQwordOps;
 #endif
 
 namespace VUInterpFast
@@ -1470,6 +1471,22 @@ namespace VUInterpFast
 		if (mask & 0x1) VU->VF[ft].UL[3] = fn(VU->VF[fs].UL[3]);
 	}
 
+	static inline bool StoreAbsUpperMaskedNeon(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
+	{
+#if defined(ARCH_ARM32)
+		if (ft != 0 && mask == 0x0f)
+		{
+			const uint32x4_t signless = vandq_u32(vld1q_u32(VU->VF[fs].UL), vdupq_n_u32(0x7fffffffu));
+			vst1q_u32(VU->VF[ft].UL, signless);
+#if defined(VITASX2_QEMU_VALIDATION)
+			++::g_qemuVuUpperNeonQwordOps;
+#endif
+			return true;
+		}
+#endif
+		return false;
+	}
+
 	template <typename Binary>
 	static inline void StoreBinaryUpperMasked(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, unsigned ft, Binary fn)
 	{
@@ -1745,6 +1762,8 @@ namespace VUInterpFast
 			case UpperFastKind::NOP:
 				return;
 			case UpperFastKind::ABS:
+				if (StoreAbsUpperMaskedNeon(VU, Ft(code), XYZW(code), Fs(code)))
+					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), [](u32 bits) { return bits & 0x7fffffffu; });
 				return;
 			case UpperFastKind::FTOI0:
