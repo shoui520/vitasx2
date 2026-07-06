@@ -491,6 +491,9 @@ namespace VitaEE
 		bool EmitVtlbNonHandlerHostAddress128(unsigned host_reg, unsigned vmap_reg, unsigned scratch_reg,
 			size_t* handler_fallback_branch);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
+		bool EmitGprLowOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host);
+		bool EmitGpr64OperandLow(unsigned guest_reg, unsigned fallback_low, unsigned host_high,
+			unsigned* low_operand_host);
 		bool EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 		bool EmitStorePcFromHostReg(unsigned host_reg);

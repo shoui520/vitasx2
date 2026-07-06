@@ -5286,15 +5286,16 @@ namespace VitaEE
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		}
 
-		if (!EmitLoadGprLow(rs, HOST_TMP0))
+		unsigned rs_host;
+		if (!EmitGprLowOperand(rs, HOST_TMP0, &rs_host))
 			return false;
 
-		const bool encoded_imm = (imm >= 0 && m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(imm))) ||
-								 (imm < 0 && m_code.EmitSubImm32(HOST_TMP0, HOST_TMP0, static_cast<u32>(-imm)));
+		const bool encoded_imm = (imm >= 0 && m_code.EmitAddImm32(HOST_TMP0, rs_host, static_cast<u32>(imm))) ||
+								 (imm < 0 && m_code.EmitSubImm32(HOST_TMP0, rs_host, static_cast<u32>(-imm)));
 		if (!encoded_imm)
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) ||
-				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
+				!m_code.EmitAddReg(HOST_TMP0, rs_host, HOST_TMP2))
 			{
 				return false;
 			}
@@ -5412,13 +5413,14 @@ namespace VitaEE
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		}
 
-		if (!EmitLoadGprLow(rs, HOST_TMP0))
+		unsigned rs_host;
+		if (!EmitGprLowOperand(rs, HOST_TMP0, &rs_host))
 			return false;
 
-		if (!m_code.EmitAndImm32(HOST_TMP0, HOST_TMP0, imm))
+		if (!m_code.EmitAndImm32(HOST_TMP0, rs_host, imm))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
-				!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
+				!m_code.EmitAndReg(HOST_TMP0, rs_host, HOST_TMP2))
 			{
 				return false;
 			}
@@ -5448,13 +5450,14 @@ namespace VitaEE
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		}
 
-		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1))
+		unsigned rs_low;
+		if (!EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low))
 			return false;
 
-		if (!m_code.EmitOrrImm32(HOST_TMP0, HOST_TMP0, imm))
+		if (!m_code.EmitOrrImm32(HOST_TMP0, rs_low, imm))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
-				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
+				!m_code.EmitOrrReg(HOST_TMP0, rs_low, HOST_TMP2))
 			{
 				return false;
 			}
@@ -5483,13 +5486,14 @@ namespace VitaEE
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		}
 
-		if (!EmitLoadGpr64(rs, HOST_TMP0, HOST_TMP1))
+		unsigned rs_low;
+		if (!EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low))
 			return false;
 
-		if (!m_code.EmitEorImm32(HOST_TMP0, HOST_TMP0, imm))
+		if (!m_code.EmitEorImm32(HOST_TMP0, rs_low, imm))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
-				!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
+				!m_code.EmitEorReg(HOST_TMP0, rs_low, HOST_TMP2))
 			{
 				return false;
 			}
@@ -5626,20 +5630,22 @@ namespace VitaEE
 		const size_t lo_offset = HiloLaneOffset(LO_OFFSET, upper_pipeline);
 		const size_t hi_offset = HiloLaneOffset(HI_OFFSET, upper_pipeline);
 
-		if (!EmitLoadGprLow(rs, HOST_TMP0) ||
-			!EmitLoadGprLow(rt, HOST_TMP1))
+		unsigned rs_host;
+		unsigned rt_host;
+		if (!EmitGprLowOperand(rs, HOST_TMP0, &rs_host) ||
+			!EmitGprLowOperand(rt, HOST_TMP1, &rt_host))
 		{
 			return false;
 		}
 
 		if (signed_multiply)
 		{
-			if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+			if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, rs_host, rt_host))
 				return false;
 		}
 		else
 		{
-			if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+			if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, rs_host, rt_host))
 				return false;
 		}
 
@@ -5670,20 +5676,22 @@ namespace VitaEE
 		const size_t lo_offset = HiloLaneOffset(LO_OFFSET, upper_pipeline);
 		const size_t hi_offset = HiloLaneOffset(HI_OFFSET, upper_pipeline);
 
-		if (!EmitLoadGprLow(rs, HOST_TMP0) ||
-			!EmitLoadGprLow(rt, HOST_TMP1))
+		unsigned rs_host;
+		unsigned rt_host;
+		if (!EmitGprLowOperand(rs, HOST_TMP0, &rs_host) ||
+			!EmitGprLowOperand(rt, HOST_TMP1, &rt_host))
 		{
 			return false;
 		}
 
 		if (signed_multiply)
 		{
-			if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+			if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, rs_host, rt_host))
 				return false;
 		}
 		else
 		{
-			if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+			if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, rs_host, rt_host))
 				return false;
 		}
 
@@ -6164,8 +6172,9 @@ namespace VitaEE
 	bool BlockCompiler::EmitMTSA(u32 op)
 	{
 		// PCSX2 owner: R5900OpcodeImpl.cpp::MTSA().
-		return EmitLoadGprLow(RS(op), HOST_TMP0) &&
-			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET));
+		unsigned rs_host;
+		return EmitGprLowOperand(RS(op), HOST_TMP0, &rs_host) &&
+			   m_code.EmitStrImm12(rs_host, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET));
 	}
 
 	bool BlockCompiler::EmitMoveFromHiLo(u32 op, size_t hilo_offset)
@@ -9554,10 +9563,11 @@ namespace VitaEE
 		const unsigned rt = RT(op);
 
 		size_t handler_fallback = static_cast<size_t>(-1);
+		unsigned rt_host;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!EmitLoadGprLow(rt, HOST_TMP1) ||
-			!m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, 0))
+			!EmitGprLowOperand(rt, HOST_TMP1, &rt_host) ||
+			!m_code.EmitStrbImm12(rt_host, HOST_TMP0, 0))
 		{
 			return false;
 		}
@@ -9592,9 +9602,10 @@ namespace VitaEE
 		if (unaligned_fallback == static_cast<size_t>(-1))
 			return false;
 
+		unsigned rt_host;
 		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!EmitLoadGprLow(rt, HOST_TMP1) ||
-			!m_code.EmitStrhImm8(HOST_TMP1, HOST_TMP0, 0))
+			!EmitGprLowOperand(rt, HOST_TMP1, &rt_host) ||
+			!m_code.EmitStrhImm8(rt_host, HOST_TMP0, 0))
 		{
 			return false;
 		}
@@ -9629,9 +9640,10 @@ namespace VitaEE
 		if (unaligned_fallback == static_cast<size_t>(-1))
 			return false;
 
+		unsigned rt_host;
 		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!EmitLoadGprLow(rt, HOST_TMP1) ||
-			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+			!EmitGprLowOperand(rt, HOST_TMP1, &rt_host) ||
+			!m_code.EmitStrImm12(rt_host, HOST_TMP0, 0))
 		{
 			return false;
 		}
@@ -9890,14 +9902,17 @@ namespace VitaEE
 			if (src == 0)
 				return EmitStoreGprZero64(rd);
 
-			return EmitLoadGprLow(src, HOST_TMP0) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+			unsigned src_host;
+			return EmitGprLowOperand(src, HOST_TMP0, &src_host) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, src_host, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rd, src_host, HOST_TMP1);
 		}
 
-		return EmitLoadGprLow(rs, HOST_TMP0) &&
-			   EmitLoadGprLow(rt, HOST_TMP1) &&
-			   m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
+		unsigned rs_host;
+		unsigned rt_host;
+		return EmitGprLowOperand(rs, HOST_TMP0, &rs_host) &&
+			   EmitGprLowOperand(rt, HOST_TMP1, &rt_host) &&
+			   m_code.EmitAddReg(HOST_TMP0, rs_host, rt_host) &&
 			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
@@ -9916,22 +9931,26 @@ namespace VitaEE
 
 		if (rt == 0)
 		{
-			return EmitLoadGprLow(rs, HOST_TMP0) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+			unsigned rs_host;
+			return EmitGprLowOperand(rs, HOST_TMP0, &rs_host) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, rs_host, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rd, rs_host, HOST_TMP1);
 		}
 
 		if (rs == 0)
 		{
-			return EmitLoadGprLow(rt, HOST_TMP0) &&
-				   m_code.EmitRsbImm32(HOST_TMP0, HOST_TMP0, 0) &&
+			unsigned rt_host;
+			return EmitGprLowOperand(rt, HOST_TMP0, &rt_host) &&
+				   m_code.EmitRsbImm32(HOST_TMP0, rt_host, 0) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
 				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 		}
 
-		return EmitLoadGprLow(rs, HOST_TMP0) &&
-			   EmitLoadGprLow(rt, HOST_TMP1) &&
-			   m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) &&
+		unsigned rs_host;
+		unsigned rt_host;
+		return EmitGprLowOperand(rs, HOST_TMP0, &rs_host) &&
+			   EmitGprLowOperand(rt, HOST_TMP1, &rt_host) &&
+			   m_code.EmitSubReg(HOST_TMP0, rs_host, rt_host) &&
 			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
@@ -10180,20 +10199,24 @@ namespace VitaEE
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
 
-		if (!EmitLoadGprLow(rt, HOST_TMP0))
+		unsigned rt_host;
+		if (!EmitGprLowOperand(rt, HOST_TMP0, &rt_host))
 			return false;
 
 		// PCSX2 owner: R5900OpcodeImpl.cpp::SLL()/SRL()/SRA(). ARM immediate
 		// LSR/ASR with amount 0 encodes a shift of 32; the R5900 sa=0 case
 		// leaves the low word unchanged, so only the final sign extension is
 		// needed.
-		if (sa != 0 && !m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, shift, static_cast<u8>(sa)))
+		if (sa != 0)
 		{
-			return false;
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP0, rt_host, shift, static_cast<u8>(sa)))
+				return false;
+
+			rt_host = HOST_TMP0;
 		}
 
-		return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		return m_code.EmitMovRegShiftImm(HOST_TMP1, rt_host, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(rd, rt_host, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitShift32Variable(u32 op, VitaA32::ShiftType shift)
@@ -10212,19 +10235,25 @@ namespace VitaEE
 
 		// Register zero supplies a shift amount of 0; the 32-bit result still
 		// needs the owner's sign-extension into the low 64-bit lane.
-		if (!EmitLoadGprLow(rt, HOST_TMP0))
+		unsigned rt_host;
+		if (!EmitGprLowOperand(rt, HOST_TMP0, &rt_host))
 			return false;
 
-		if (rs != 0 &&
-			(!EmitLoadGprLow(rs, HOST_TMP2) ||
-			 !m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 0x1f) ||
-			 !m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP0, shift, HOST_TMP2)))
+		if (rs != 0)
 		{
-			return false;
+			unsigned rs_host;
+			if (!EmitGprLowOperand(rs, HOST_TMP2, &rs_host) ||
+				!m_code.EmitAndImm8(HOST_TMP2, rs_host, 0x1f) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP0, rt_host, shift, HOST_TMP2))
+			{
+				return false;
+			}
+
+			rt_host = HOST_TMP0;
 		}
 
-		return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		return m_code.EmitMovRegShiftImm(HOST_TMP1, rt_host, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(rd, rt_host, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitShift64LeftImmediate(u32 op, unsigned amount)
@@ -10577,13 +10606,16 @@ namespace VitaEE
 		if (lhs_guest_reg == 0 || rhs_guest_reg == 0)
 		{
 			const unsigned nonzero_guest_reg = (lhs_guest_reg == 0) ? rhs_guest_reg : lhs_guest_reg;
-			return EmitLoadGpr64(nonzero_guest_reg, HOST_TMP0, HOST_TMP1) &&
-				   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1, true);
+			unsigned low_host;
+			return EmitGpr64OperandLow(nonzero_guest_reg, HOST_TMP0, HOST_TMP1, &low_host) &&
+				   m_code.EmitOrrReg(HOST_TMP0, low_host, HOST_TMP1, true);
 		}
 
-		return EmitLoadGpr64(lhs_guest_reg, HOST_TMP0, HOST_TMP1) &&
-			   EmitLoadGpr64(rhs_guest_reg, HOST_TMP2, HOST_TMP3) &&
-			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP2) &&
+		unsigned lhs_low;
+		unsigned rhs_low;
+		return EmitGpr64OperandLow(lhs_guest_reg, HOST_TMP0, HOST_TMP1, &lhs_low) &&
+			   EmitGpr64OperandLow(rhs_guest_reg, HOST_TMP2, HOST_TMP3, &rhs_low) &&
+			   m_code.EmitCmpReg(lhs_low, rhs_low) &&
 			   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3, VitaA32::Condition::EQ);
 	}
 
@@ -11785,21 +11817,27 @@ namespace VitaEE
 		if (rs == 0)
 			return m_code.EmitMovImm32(host_reg, static_cast<u32>(imm));
 
-		if (!EmitLoadGprLow(rs, host_reg))
+		// Callers mutate the address register, so fold a pinned base into the
+		// displacement add instead of returning the pin itself.
+		unsigned base_reg;
+		if (!EmitGprLowOperand(rs, host_reg, &base_reg))
 			return false;
 
 		if (imm == 0)
+		{
+			return base_reg == host_reg ||
+				   m_code.EmitMovRegShiftImm(host_reg, base_reg, VitaA32::ShiftType::LSL, 0);
+		}
+
+		if (imm > 0 && m_code.EmitAddImm32(host_reg, base_reg, static_cast<u32>(imm)))
 			return true;
 
-		if (imm > 0 && m_code.EmitAddImm32(host_reg, host_reg, static_cast<u32>(imm)))
-			return true;
-
-		if (imm < 0 && m_code.EmitSubImm32(host_reg, host_reg, static_cast<u32>(-imm)))
+		if (imm < 0 && m_code.EmitSubImm32(host_reg, base_reg, static_cast<u32>(-imm)))
 			return true;
 
 		const unsigned scratch_reg = (host_reg == HOST_TMP2) ? HOST_TMP0 : HOST_TMP2;
 		return m_code.EmitMovImm32(scratch_reg, static_cast<u32>(imm)) &&
-			   m_code.EmitAddReg(host_reg, host_reg, scratch_reg);
+			   m_code.EmitAddReg(host_reg, base_reg, scratch_reg);
 	}
 
 	bool BlockCompiler::EmitCpuRegsAddress(unsigned host_reg, size_t offset)
@@ -11951,6 +11989,39 @@ namespace VitaEE
 		unsigned scratch_reg, size_t* handler_fallback_branch)
 	{
 		return EmitVtlbNonHandlerHostAddress(host_reg, vmap_reg, scratch_reg, handler_fallback_branch);
+	}
+
+	bool BlockCompiler::EmitGprLowOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host)
+	{
+		// Pinned guest registers are handed out directly as read-only A32 source
+		// operands; the caller must consume the operand before any code that can
+		// write that guest register and must never modify the returned register.
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0)
+		{
+			*operand_host = static_cast<unsigned>(pin_host);
+			return true;
+		}
+
+		*operand_host = fallback_host;
+		return EmitLoadGprLow(guest_reg, fallback_host);
+	}
+
+	bool BlockCompiler::EmitGpr64OperandLow(unsigned guest_reg, unsigned fallback_low, unsigned host_high,
+		unsigned* low_operand_host)
+	{
+		// 64-bit reads keep the LDRD pairing when the register is unpinned; a
+		// pinned register supplies the low word directly and only the high word
+		// is loaded. The low operand is read-only for the caller.
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0)
+		{
+			*low_operand_host = static_cast<unsigned>(pin_host);
+			return EmitLoadGprHigh(guest_reg, host_high);
+		}
+
+		*low_operand_host = fallback_low;
+		return EmitLoadGpr64(guest_reg, fallback_low, host_high);
 	}
 
 	bool BlockCompiler::EmitLoadGprLow(unsigned guest_reg, unsigned host_reg)
