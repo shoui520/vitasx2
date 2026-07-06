@@ -60,12 +60,15 @@ u32 g_qemuQwordGprMemoryHelperCalls = 0;
 u32 g_qemuQwordCop2MemoryHelperCalls = 0;
 u32 g_qemuCpuCancelInstructionCalls = 0;
 u32 g_qemuVu0SyncCalls = 0;
+u32 g_qemuGprPinnedBlocks = 0;
+u32 g_qemuGprPinnedRegisters = 0;
 #endif
 
 namespace VitaEE
 {
 	namespace
 	{
+		constexpr u16 REG_R3 = 1u << 3;
 		constexpr u16 REG_R4 = 1u << 4;
 		constexpr u16 REG_R5 = 1u << 5;
 		constexpr u16 REG_R6 = 1u << 6;
@@ -90,6 +93,7 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP5 = 6;
 		constexpr unsigned HOST_VTLB_VMAP = 7;
 		constexpr unsigned HOST_VTLB_HOST_MEMORY_BASE = 8;
+		constexpr unsigned HOST_GPR_PIN0 = 9;
 		constexpr unsigned HOST_COP1_EXPONENT_MASK = 10;
 		constexpr unsigned HOST_VU0_BASE = 11;
 
@@ -1996,6 +2000,229 @@ namespace VitaEE
 		return false;
 	}
 
+	namespace
+	{
+		struct GprPinOpInfo
+		{
+			u32 unsafe_write_mask = 0;
+			u8 seam_reads[4]{};
+			unsigned seam_read_count = 0;
+		};
+	} // namespace
+
+	// Classifies one accepted EE opcode for the write-through GPR pin cache.
+	// Returns true when every GPR-file write the op can perform goes through
+	// EmitStoreGpr64()/EmitStoreGprZero64(), or when the bypassing writes are
+	// exactly the registers reported in unsafe_write_mask (NEON/helper stores
+	// from the MMI family, LQ, and the LWL/LWR/LDL/LDR cold-tail helpers).
+	// Returns false for op classes whose write paths are not certified
+	// (COP0/COP1/COP2 and anything unrecognized); those blocks compile without
+	// pins. seam_reads lists low-word/pair reads that reach EmitLoadGprLow()/
+	// EmitLoadGpr64() and is only used to score pin candidates.
+	static bool ClassifyOpcodeForGprPinning(u32 op, GprPinOpInfo* info)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+		const auto add_read = [info](unsigned guest_reg) {
+			if (guest_reg != 0 && info->seam_read_count < 4)
+				info->seam_reads[info->seam_read_count++] = static_cast<u8>(guest_reg);
+		};
+
+		switch (op >> 26)
+		{
+			case 0x00:
+				switch (op & 0x3f)
+				{
+					case 0x00: // SLL
+					case 0x02: // SRL
+					case 0x03: // SRA
+					case 0x38: // DSLL
+					case 0x3a: // DSRL
+					case 0x3b: // DSRA
+					case 0x3c: // DSLL32
+					case 0x3e: // DSRL32
+					case 0x3f: // DSRA32
+						add_read(rt);
+						return true;
+					case 0x04: // SLLV
+					case 0x06: // SRLV
+					case 0x07: // SRAV
+					case 0x14: // DSLLV
+					case 0x16: // DSRLV
+					case 0x17: // DSRAV
+						add_read(rt);
+						add_read(rs);
+						return true;
+					case 0x08: // JR
+					case 0x09: // JALR links through the seam
+						add_read(rs);
+						return true;
+					case 0x0a: // MOVZ
+					case 0x0b: // MOVN
+					case 0x18: // MULT
+					case 0x19: // MULTU
+					case 0x1a: // DIV
+					case 0x1b: // DIVU
+					case 0x20: // ADD
+					case 0x21: // ADDU
+					case 0x22: // SUB
+					case 0x23: // SUBU
+					case 0x24: // AND
+					case 0x25: // OR
+					case 0x26: // XOR
+					case 0x27: // NOR
+					case 0x2a: // SLT
+					case 0x2b: // SLTU
+					case 0x2c: // DADD
+					case 0x2d: // DADDU
+					case 0x2e: // DSUB
+					case 0x2f: // DSUBU
+					case 0x30: // TGE
+					case 0x31: // TGEU
+					case 0x32: // TLT
+					case 0x33: // TLTU
+					case 0x34: // TEQ
+					case 0x36: // TNE
+						add_read(rs);
+						add_read(rt);
+						return true;
+					case 0x0c: // SYSCALL exits the block through the event helper
+					case 0x0d: // BREAK exits the block through the event helper
+					case 0x0f: // SYNC
+					case 0x10: // MFHI writes rd through the seam
+					case 0x12: // MFLO writes rd through the seam
+					case 0x28: // MFSA writes rd through the seam
+						return true;
+					case 0x11: // MTHI
+					case 0x13: // MTLO
+					case 0x29: // MTSA
+						add_read(rs);
+						return true;
+					default:
+						return false;
+				}
+			case 0x01:
+				switch (rt)
+				{
+					case 0x00: // BLTZ
+					case 0x01: // BGEZ
+					case 0x02: // BLTZL
+					case 0x03: // BGEZL
+					case 0x08: // TGEI
+					case 0x09: // TGEIU
+					case 0x0a: // TLTI
+					case 0x0b: // TLTIU
+					case 0x0c: // TEQI
+					case 0x0e: // TNEI
+					case 0x10: // BLTZAL links through the seam
+					case 0x11: // BGEZAL links through the seam
+					case 0x12: // BLTZALL links through the seam
+					case 0x13: // BGEZALL links through the seam
+					case 0x18: // MTSAB
+					case 0x19: // MTSAH
+						add_read(rs);
+						return true;
+					default:
+						return false;
+				}
+			case 0x02: // J
+			case 0x03: // JAL links through the seam
+			case 0x0f: // LUI
+			case 0x2f: // CACHE writes no GPR
+			case 0x33: // PREF
+				return true;
+			case 0x04: // BEQ
+			case 0x05: // BNE
+			case 0x14: // BEQL
+			case 0x15: // BNEL
+				add_read(rs);
+				add_read(rt);
+				return true;
+			case 0x06: // BLEZ
+			case 0x07: // BGTZ
+			case 0x16: // BLEZL
+			case 0x17: // BGTZL
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+			case 0x0a: // SLTI
+			case 0x0b: // SLTIU
+			case 0x0c: // ANDI
+			case 0x0d: // ORI
+			case 0x0e: // XORI
+			case 0x18: // DADDI
+			case 0x19: // DADDIU
+				add_read(rs);
+				return true;
+			case 0x1a: // LDL cold tail writes rt through VitaEeMemReadDwordLeft()
+			case 0x1b: // LDR cold tail writes rt through VitaEeMemReadDwordRight()
+			case 0x1e: // LQ writes rt with a NEON store
+				add_read(rs);
+				info->unsafe_write_mask |= 1u << rt;
+				return true;
+			case 0x22: // LWL merges rt and its cold tail writes rt directly
+			case 0x26: // LWR merges rt and its cold tail writes rt directly
+				add_read(rs);
+				add_read(rt);
+				info->unsafe_write_mask |= 1u << rt;
+				return true;
+			case 0x1c:
+				switch (op & 0x3f)
+				{
+					case 0x00: // MADD
+					case 0x01: // MADDU
+					case 0x18: // MULT1
+					case 0x19: // MULTU1
+					case 0x1a: // DIV1
+					case 0x1b: // DIVU1
+					case 0x20: // MADD1
+					case 0x21: // MADDU1
+						add_read(rs);
+						add_read(rt);
+						return true;
+					case 0x10: // MFHI1 writes rd through the seam
+					case 0x12: // MFLO1 writes rd through the seam
+						return true;
+					case 0x11: // MTHI1
+					case 0x13: // MTLO1
+						add_read(rs);
+						return true;
+					default:
+						// PLZCW, PMFHL, the MMI0-3 vector classes, and the packed
+						// shifts write rd with NEON or direct word stores.
+						info->unsafe_write_mask |= 1u << rd;
+						return true;
+				}
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+			case 0x27: // LWU
+			case 0x37: // LD writes rt through the seam in hot and cold paths
+			case 0x31: // LWC1 writes an FPR only
+			case 0x39: // SWC1
+			case 0x36: // LQC2 writes a VU0 register only
+			case 0x3e: // SQC2
+				add_read(rs);
+				return true;
+			case 0x28: // SB
+			case 0x29: // SH
+			case 0x2b: // SW
+			case 0x3f: // SD
+			case 0x2a: // SWL writes guest RAM only
+			case 0x2c: // SDL writes guest RAM only
+			case 0x2d: // SDR writes guest RAM only
+			case 0x2e: // SWR writes guest RAM only
+			case 0x1f: // SQ writes guest RAM only
+				add_read(rs);
+				add_read(rt);
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	bool BlockShouldUseCop1ExponentMaskRegister(u32 start_pc, u32 instruction_count)
 	{
 		unsigned mask_users = 0;
@@ -2021,6 +2248,82 @@ namespace VitaEE
 		return false;
 	}
 
+	void BlockCompiler::StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r10, bool allow_r11)
+	{
+		m_staged_pin_count = 0;
+
+		u32 unsafe_write_mask = 1u; // $zero is handled by constant folding, never pinned
+		u16 read_counts[32]{};
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			GprPinOpInfo info;
+			if (!ClassifyOpcodeForGprPinning(memRead32(start_pc + i * 4), &info))
+				return;
+
+			unsafe_write_mask |= info.unsafe_write_mask;
+			for (unsigned read = 0; read < info.seam_read_count; read++)
+				read_counts[info.seam_reads[read]]++;
+		}
+
+		u8 hosts[3];
+		unsigned host_count = 0;
+		hosts[host_count++] = HOST_GPR_PIN0;
+		if (allow_r10)
+			hosts[host_count++] = HOST_COP1_EXPONENT_MASK;
+		if (allow_r11)
+			hosts[host_count++] = HOST_VU0_BASE;
+
+		for (unsigned slot = 0; slot < host_count; slot++)
+		{
+			unsigned best_reg = 0;
+			u16 best_count = 1; // a single read would only trade the entry load for the read
+			for (unsigned reg = 1; reg < 32; reg++)
+			{
+				if ((unsafe_write_mask & (1u << reg)) != 0)
+					continue;
+
+				if (read_counts[reg] > best_count)
+				{
+					best_count = read_counts[reg];
+					best_reg = reg;
+				}
+			}
+
+			if (best_reg == 0)
+				break;
+
+			read_counts[best_reg] = 0;
+			m_staged_pin_guest[m_staged_pin_count] = static_cast<u8>(best_reg);
+			m_staged_pin_host[m_staged_pin_count] = hosts[slot];
+			m_staged_pin_count++;
+		}
+	}
+
+	int BlockCompiler::FindGprPinHost(unsigned guest_reg) const
+	{
+		for (unsigned i = 0; i < m_pin_count; i++)
+		{
+			if (m_pin_guest[i] == guest_reg)
+				return static_cast<int>(m_pin_host[i]);
+		}
+
+		return -1;
+	}
+
+	bool BlockCompiler::EmitGprPinLoads()
+	{
+		for (unsigned i = 0; i < m_pin_count; i++)
+		{
+			if (!m_code.EmitLdrImm12(m_pin_host[i], HOST_CPU_REGS,
+					static_cast<u16>(GprOffset(m_pin_guest[i]))))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
 	bool BlockCompiler::BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register,
 		bool use_vu0_base_register)
 	{
@@ -2042,9 +2345,46 @@ namespace VitaEE
 			m_saved_registers |= REG_R10;
 		if (use_vu0_base_register)
 			m_saved_registers |= REG_R11;
+
+		// Adopt the staged GPR pins, dropping any whose host register a block
+		// feature claimed after staging.
+		m_pin_count = 0;
+		for (unsigned i = 0; i < m_staged_pin_count; i++)
+		{
+			const unsigned host = m_staged_pin_host[i];
+			if ((host == HOST_COP1_EXPONENT_MASK && use_cop1_exponent_mask_register) ||
+				(host == HOST_VU0_BASE && use_vu0_base_register))
+			{
+				continue;
+			}
+
+			m_pin_guest[m_pin_count] = m_staged_pin_guest[i];
+			m_pin_host[m_pin_count] = static_cast<u8>(host);
+			m_pin_count++;
+			m_saved_registers |= static_cast<u16>(1u << host);
+		}
+		m_staged_pin_count = 0;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (m_pin_count != 0)
+		{
+			g_qemuGprPinnedBlocks++;
+			g_qemuGprPinnedRegisters += m_pin_count;
+		}
+#endif
+
 		// Keep SP 8-byte aligned for AAPCS helper calls after any resident-register choice.
 		if ((RegisterCount(m_saved_registers | REG_LR) & 1u) != 0)
-			m_saved_registers |= REG_R9;
+		{
+			if (!(m_saved_registers & REG_R9))
+				m_saved_registers |= REG_R9;
+			else if (!(m_saved_registers & REG_R10))
+				m_saved_registers |= REG_R10;
+			else if (!(m_saved_registers & REG_R11))
+				m_saved_registers |= REG_R11;
+			else
+				m_saved_registers |= REG_R3;
+		}
 
 		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
 			!m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))))
@@ -2085,9 +2425,18 @@ namespace VitaEE
 		if (direct_links)
 			*direct_links = {};
 
-		if (!BeginBlock(BlockMayUseVtlbFastPath(start_pc, instruction_count),
-				BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count),
-				BlockShouldUseVu0BaseRegister(start_pc, instruction_count)))
+		const bool use_vtlb_registers = BlockMayUseVtlbFastPath(start_pc, instruction_count);
+		const bool use_cop1_exponent_mask_register =
+			BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count);
+		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
+		StageGprPinsForBlock(start_pc, instruction_count, !use_cop1_exponent_mask_register,
+			!use_vu0_base_register);
+		if (!BeginBlock(use_vtlb_registers, use_cop1_exponent_mask_register, use_vu0_base_register))
+			return false;
+		// Pins must be live before any emitted GPR read, including the Goemon
+		// hook's GPR4 argument load; the hook's helpers are AAPCS calls that
+		// preserve r9-r11 and never write the GPR file.
+		if (!EmitGprPinLoads())
 			return false;
 		if (!EmitGoemonBlockStartHook(start_pc))
 			return false;
@@ -11609,6 +11958,15 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return m_code.EmitMovImm8(host_reg, 0);
 
+		// Pinned registers are write-through, so the host copy always matches
+		// memory and a 1-cycle move replaces the Cortex-A9 load-use stall.
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0)
+		{
+			return m_code.EmitMovRegShiftImm(host_reg, static_cast<unsigned>(pin_host),
+				VitaA32::ShiftType::LSL, 0);
+		}
+
 		return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg)));
 	}
 
@@ -11627,6 +11985,14 @@ namespace VitaEE
 				   m_code.EmitMovImm8(host_high, 0);
 
 		const size_t offset = GprOffset(guest_reg);
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0)
+		{
+			return m_code.EmitMovRegShiftImm(host_low, static_cast<unsigned>(pin_host),
+					   VitaA32::ShiftType::LSL, 0) &&
+				   m_code.EmitLdrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+		}
+
 		if (offset <= 0xff && CanUseA32DualTransferPair(host_low, host_high))
 			return m_code.EmitLdrdImm8(host_low, host_high, HOST_CPU_REGS, static_cast<u8>(offset));
 
@@ -11668,6 +12034,10 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return true;
 
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0 && !m_code.EmitMovImm8(static_cast<unsigned>(pin_host), 0))
+			return false;
+
 		const size_t offset = GprOffset(guest_reg);
 		if (offset <= 0xff && CanUseA32DualTransferPair(HOST_TMP0, HOST_TMP1))
 		{
@@ -11685,6 +12055,16 @@ namespace VitaEE
 	{
 		if (guest_reg == 0)
 			return true;
+
+		// Write-through: memory stays authoritative and the pinned host copy is
+		// refreshed with the same value on every path that reaches this store.
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0 &&
+			!m_code.EmitMovRegShiftImm(static_cast<unsigned>(pin_host), host_low,
+				VitaA32::ShiftType::LSL, 0))
+		{
+			return false;
+		}
 
 		const size_t offset = GprOffset(guest_reg);
 		if (offset <= 0xff && CanUseA32DualTransferPair(host_low, host_high))

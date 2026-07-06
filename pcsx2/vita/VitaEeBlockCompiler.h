@@ -465,6 +465,9 @@ namespace VitaEE
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
 		bool FlushColdTails();
+		void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r10, bool allow_r11);
+		bool EmitGprPinLoads();
+		int FindGprPinHost(unsigned guest_reg) const;
 		bool EmitDeviceTracePreInstruction(u32 pc);
 		bool EmitLoadCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
 		bool EmitStoreCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
@@ -598,5 +601,14 @@ namespace VitaEE
 		bool m_vtlb_registers_available = false;
 		bool m_cop1_exponent_mask_available = false;
 		bool m_vu0_base_available = false;
+		// Write-through read pins: guest GPR low words held in callee-saved host
+		// registers for the whole block. Memory stays authoritative, so pins only
+		// exist for guest registers whose writes all go through the GPR store seam.
+		u8 m_staged_pin_guest[3]{};
+		u8 m_staged_pin_host[3]{};
+		u8 m_staged_pin_count = 0;
+		u8 m_pin_guest[3]{};
+		u8 m_pin_host[3]{};
+		u8 m_pin_count = 0;
 		};
 	} // namespace VitaEE
