@@ -10,6 +10,10 @@
 
 #include "common/Assertions.h"
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
 // LOOP/END sets the ENDX bit and sets NAX to LSA, and the voice is muted if LOOP is not set
 // LOOP seems to only have any effect on the block with LOOP/END set, where it prevents muting the voice
 // (the documented requirement that every block in a loop has the LOOP bit set is nonsense according to tests)
@@ -37,6 +41,7 @@ u32 g_qemuSpu2MasterVolumeSlideUpdated = 0;
 u32 g_qemuSpu2MasterVolumeSlideSkipped = 0;
 u32 g_qemuSpu2ZeroVoiceGateSkipped = 0;
 u32 g_qemuSpu2NonzeroVoiceGateMixed = 0;
+u32 g_qemuSpu2VoiceInterpNeon = 0;
 #endif
 
 MULTI_ISA_UNSHARED_START
@@ -294,7 +299,7 @@ static __forceinline void ConsumeSamples(V_Core& thiscore, uint voiceidx)
 	vc.DecPosRead += consumed;
 }
 
-static __forceinline s32 GetVoiceValues(V_Core& thiscore, uint voiceidx)
+static __forceinline s32 GetVoiceValues_reference(V_Core& thiscore, uint voiceidx)
 {
 	V_Voice& vc(thiscore.Voices[voiceidx]);
 
@@ -307,6 +312,50 @@ static __forceinline s32 GetVoiceValues(V_Core& thiscore, uint voiceidx)
 
 	return out;
 }
+
+#if defined(ARCH_ARM32)
+static __forceinline s32 GetVoiceValues_neon(V_Core& thiscore, uint voiceidx)
+{
+	V_Voice& vc(thiscore.Voices[voiceidx]);
+	const u32 sample_idx = vc.DecPosRead & 31u;
+	if (sample_idx > 28u)
+		return GetVoiceValues_reference(thiscore, voiceidx);
+
+	const int phase = (vc.SP & 0x0ff0) >> 4;
+	const int16x4_t coeff16 = vld1_s16(interpTable[phase].data());
+	const int32x4_t coeff = vmovl_s16(coeff16);
+	const int32x4_t samples = vld1q_s32(&vc.DecodeFifo[sample_idx]);
+	const int32x4_t terms = vshrq_n_s32(vmulq_s32(coeff, samples), 15);
+	int32x2_t sum = vadd_s32(vget_low_s32(terms), vget_high_s32(terms));
+	sum = vpadd_s32(sum, sum);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuSpu2VoiceInterpNeon;
+#endif
+	return vget_lane_s32(sum, 0);
+}
+#endif
+
+static __forceinline s32 GetVoiceValues(V_Core& thiscore, uint voiceidx)
+{
+#if defined(ARCH_ARM32)
+	return GetVoiceValues_neon(thiscore, voiceidx);
+#else
+	return GetVoiceValues_reference(thiscore, voiceidx);
+#endif
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+s32 Spu2GetVoiceValuesScalarForValidation(V_Core& core, uint voiceidx)
+{
+	return GetVoiceValues_reference(core, voiceidx);
+}
+
+s32 Spu2GetVoiceValuesSelectedForValidation(V_Core& core, uint voiceidx)
+{
+	return GetVoiceValues(core, voiceidx);
+}
+#endif
 
 // This is Dr. Hell's noise algorithm as implemented in pcsxr
 // Supposedly this is 100% accurate
