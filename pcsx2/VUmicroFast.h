@@ -130,6 +130,20 @@ namespace VUInterpFast
 		MULAy,
 		MULAz,
 		MULAw,
+		MADD,
+		MADDi,
+		MADDq,
+		MADDx,
+		MADDy,
+		MADDz,
+		MADDw,
+		MADDA,
+		MADDAi,
+		MADDAq,
+		MADDAx,
+		MADDAy,
+		MADDAz,
+		MADDAw,
 	};
 
 	static constexpr unsigned Ft(u32 code) { return (code >> 16) & 0x1f; }
@@ -350,6 +364,14 @@ namespace VUInterpFast
 	{
 		switch (code & 0x3f)
 		{
+			case 0x08:
+				return UpperFastKind::MADDx;
+			case 0x09:
+				return UpperFastKind::MADDy;
+			case 0x0a:
+				return UpperFastKind::MADDz;
+			case 0x0b:
+				return UpperFastKind::MADDw;
 			case 0x10:
 				return UpperFastKind::MAXx;
 			case 0x11:
@@ -382,6 +404,12 @@ namespace VUInterpFast
 				return UpperFastKind::MULi;
 			case 0x1f:
 				return UpperFastKind::MINIi;
+			case 0x21:
+				return UpperFastKind::MADDq;
+			case 0x23:
+				return UpperFastKind::MADDi;
+			case 0x29:
+				return UpperFastKind::MADD;
 			case 0x2a:
 				return UpperFastKind::MUL;
 			case 0x2b:
@@ -391,6 +419,8 @@ namespace VUInterpFast
 			case 0x3c:
 				switch ((code >> 6) & 0x1f)
 				{
+					case 0x02:
+						return UpperFastKind::MADDAx;
 					case 0x04:
 						return UpperFastKind::ITOF0;
 					case 0x05:
@@ -405,6 +435,8 @@ namespace VUInterpFast
 			case 0x3d:
 				switch ((code >> 6) & 0x1f)
 				{
+					case 0x02:
+						return UpperFastKind::MADDAy;
 					case 0x04:
 						return UpperFastKind::ITOF4;
 					case 0x05:
@@ -413,12 +445,18 @@ namespace VUInterpFast
 						return UpperFastKind::MULAy;
 					case 0x07:
 						return UpperFastKind::ABS;
+					case 0x08:
+						return UpperFastKind::MADDAq;
+					case 0x0a:
+						return UpperFastKind::MADDA;
 					default:
 						return UpperFastKind::None;
 				}
 			case 0x3e:
 				switch ((code >> 6) & 0x1f)
 				{
+					case 0x02:
+						return UpperFastKind::MADDAz;
 					case 0x04:
 						return UpperFastKind::ITOF12;
 					case 0x05:
@@ -435,6 +473,8 @@ namespace VUInterpFast
 			case 0x3f:
 				switch ((code >> 6) & 0x1f)
 				{
+					case 0x02:
+						return UpperFastKind::MADDAw;
 					case 0x04:
 						return UpperFastKind::ITOF15;
 					case 0x05:
@@ -443,6 +483,8 @@ namespace VUInterpFast
 						return UpperFastKind::MULAw;
 					case 0x07:
 						return UpperFastKind::CLIP;
+					case 0x08:
+						return UpperFastKind::MADDAi;
 					default:
 						return UpperFastKind::None;
 				}
@@ -483,7 +525,51 @@ namespace VUInterpFast
 		regs->VIread = (1u << REG_Q) | Vf0Flag(Fs(code));
 	}
 
-	static inline void AnalyzeUpperAccFsFt(u32 code, _VURegsNum* regs)
+	static inline void AnalyzeUpperFdfsftReadAcc(u32 code, u32 ft_xyzw, _VURegsNum* regs)
+	{
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFwrite = Fd(code);
+		regs->VFwxyzw = XYZW(code);
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = XYZW(code);
+		regs->VFread1 = Ft(code);
+		regs->VFr1xyzw = ft_xyzw;
+		regs->VIread = (1u << REG_ACC_FLAG) | Vf0Flag(Fs(code)) | Vf0Flag(Ft(code));
+	}
+
+	static inline void AnalyzeUpperFdfsiReadAcc(u32 code, _VURegsNum* regs)
+	{
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFwrite = Fd(code);
+		regs->VFwxyzw = XYZW(code);
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = XYZW(code);
+		regs->VIread = (1u << REG_I) | (1u << REG_ACC_FLAG) | Vf0Flag(Fs(code));
+	}
+
+	static inline void AnalyzeUpperFdfsqReadAcc(u32 code, _VURegsNum* regs)
+	{
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFwrite = Fd(code);
+		regs->VFwxyzw = XYZW(code);
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = XYZW(code);
+		regs->VIread = (1u << REG_Q) | (1u << REG_ACC_FLAG) | Vf0Flag(Fs(code));
+	}
+
+	static inline void AnalyzeUpperMaddBroadcast(u32 code, u32 ft_xyzw, bool read_fs_vf0, _VURegsNum* regs)
+	{
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFwrite = Fd(code);
+		regs->VFwxyzw = XYZW(code);
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = XYZW(code);
+		regs->VFread1 = Ft(code);
+		regs->VFr1xyzw = ft_xyzw;
+		regs->VIread = (1u << REG_ACC_FLAG) | (read_fs_vf0 ? Vf0Flag(Fs(code)) : 0);
+	}
+
+	static inline void AnalyzeUpperAccFsFt(u32 code, bool read_acc, _VURegsNum* regs)
 	{
 		regs->pipe = VUPIPE_FMAC;
 		regs->VFwxyzw = XYZW(code);
@@ -493,10 +579,10 @@ namespace VUInterpFast
 		regs->VFr1xyzw = XYZW(code);
 		regs->VIwrite = 1u << REG_ACC_FLAG;
 		regs->VIread = Vf0Flag(Fs(code)) | Vf0Flag(Ft(code)) |
-			(XYZW(code) != 0x0f ? (1u << REG_ACC_FLAG) : 0);
+			(read_acc || XYZW(code) != 0x0f ? (1u << REG_ACC_FLAG) : 0);
 	}
 
-	static inline void AnalyzeUpperAccFsI(u32 code, _VURegsNum* regs)
+	static inline void AnalyzeUpperAccFsI(u32 code, bool read_acc, _VURegsNum* regs)
 	{
 		regs->pipe = VUPIPE_FMAC;
 		regs->VFwxyzw = XYZW(code);
@@ -504,10 +590,10 @@ namespace VUInterpFast
 		regs->VFr0xyzw = XYZW(code);
 		regs->VIwrite = 1u << REG_ACC_FLAG;
 		regs->VIread = (1u << REG_I) | Vf0Flag(Fs(code)) |
-			(XYZW(code) != 0x0f ? (1u << REG_ACC_FLAG) : 0);
+			(read_acc || XYZW(code) != 0x0f ? (1u << REG_ACC_FLAG) : 0);
 	}
 
-	static inline void AnalyzeUpperAccFsQ(u32 code, _VURegsNum* regs)
+	static inline void AnalyzeUpperAccFsQ(u32 code, bool read_acc, _VURegsNum* regs)
 	{
 		regs->pipe = VUPIPE_FMAC;
 		regs->VFwxyzw = XYZW(code);
@@ -515,7 +601,7 @@ namespace VUInterpFast
 		regs->VFr0xyzw = XYZW(code);
 		regs->VIwrite = 1u << REG_ACC_FLAG;
 		regs->VIread = (1u << REG_Q) | Vf0Flag(Fs(code)) |
-			(XYZW(code) != 0x0f ? (1u << REG_ACC_FLAG) : 0);
+			(read_acc || XYZW(code) != 0x0f ? (1u << REG_ACC_FLAG) : 0);
 	}
 
 	static inline void AnalyzeUpperMulBroadcast(u32 code, u32 ft_xyzw, bool acc, _VURegsNum* regs)
@@ -560,6 +646,9 @@ namespace VUInterpFast
 			case UpperFastKind::MUL:
 				AnalyzeUpperFdfsft(code, XYZW(code), regs);
 				return true;
+			case UpperFastKind::MADD:
+				AnalyzeUpperFdfsftReadAcc(code, XYZW(code), regs);
+				return true;
 			case UpperFastKind::MAXi:
 			case UpperFastKind::MINIi:
 				AnalyzeUpperFdfsi(code, regs);
@@ -567,8 +656,14 @@ namespace VUInterpFast
 			case UpperFastKind::MULi:
 				AnalyzeUpperFdfsi(code, regs);
 				return true;
+			case UpperFastKind::MADDi:
+				AnalyzeUpperFdfsiReadAcc(code, regs);
+				return true;
 			case UpperFastKind::MULq:
 				AnalyzeUpperFdfsq(code, regs);
+				return true;
+			case UpperFastKind::MADDq:
+				AnalyzeUpperFdfsqReadAcc(code, regs);
 				return true;
 			case UpperFastKind::MAXx:
 			case UpperFastKind::MINIx:
@@ -577,12 +672,18 @@ namespace VUInterpFast
 			case UpperFastKind::MULx:
 				AnalyzeUpperMulBroadcast(code, 0x8, false, regs);
 				return true;
+			case UpperFastKind::MADDx:
+				AnalyzeUpperMaddBroadcast(code, 0x8, Ft(code) != 0, regs);
+				return true;
 			case UpperFastKind::MAXy:
 			case UpperFastKind::MINIy:
 				AnalyzeUpperFdfsft(code, 0x4, regs);
 				return true;
 			case UpperFastKind::MULy:
 				AnalyzeUpperMulBroadcast(code, 0x4, false, regs);
+				return true;
+			case UpperFastKind::MADDy:
+				AnalyzeUpperMaddBroadcast(code, 0x4, Ft(code) != 0, regs);
 				return true;
 			case UpperFastKind::MAXz:
 			case UpperFastKind::MINIz:
@@ -591,6 +692,9 @@ namespace VUInterpFast
 			case UpperFastKind::MULz:
 				AnalyzeUpperMulBroadcast(code, 0x2, false, regs);
 				return true;
+			case UpperFastKind::MADDz:
+				AnalyzeUpperMaddBroadcast(code, 0x2, Ft(code) != 0, regs);
+				return true;
 			case UpperFastKind::MAXw:
 			case UpperFastKind::MINIw:
 				AnalyzeUpperFdfsft(code, 0x1, regs);
@@ -598,17 +702,20 @@ namespace VUInterpFast
 			case UpperFastKind::MULw:
 				AnalyzeUpperMulBroadcast(code, 0x1, false, regs);
 				return true;
+			case UpperFastKind::MADDw:
+				AnalyzeUpperMaddBroadcast(code, 0x1, true, regs);
+				return true;
 			case UpperFastKind::CLIP:
 				AnalyzeUpperClip(code, regs);
 				return true;
 			case UpperFastKind::MULA:
-				AnalyzeUpperAccFsFt(code, regs);
+				AnalyzeUpperAccFsFt(code, false, regs);
 				return true;
 			case UpperFastKind::MULAi:
-				AnalyzeUpperAccFsI(code, regs);
+				AnalyzeUpperAccFsI(code, false, regs);
 				return true;
 			case UpperFastKind::MULAq:
-				AnalyzeUpperAccFsQ(code, regs);
+				AnalyzeUpperAccFsQ(code, false, regs);
 				return true;
 			case UpperFastKind::MULAx:
 				AnalyzeUpperMulBroadcast(code, 0x8, true, regs);
@@ -621,6 +728,35 @@ namespace VUInterpFast
 				return true;
 			case UpperFastKind::MULAw:
 				AnalyzeUpperMulBroadcast(code, 0x1, true, regs);
+				return true;
+			case UpperFastKind::MADDA:
+				AnalyzeUpperAccFsFt(code, true, regs);
+				return true;
+			case UpperFastKind::MADDAi:
+				AnalyzeUpperAccFsI(code, true, regs);
+				return true;
+			case UpperFastKind::MADDAq:
+				AnalyzeUpperAccFsQ(code, true, regs);
+				return true;
+			case UpperFastKind::MADDAx:
+				AnalyzeUpperFdfsftReadAcc(code, 0x8, regs);
+				regs->VFwrite = 0;
+				regs->VIwrite = 1u << REG_ACC_FLAG;
+				return true;
+			case UpperFastKind::MADDAy:
+				AnalyzeUpperFdfsftReadAcc(code, 0x4, regs);
+				regs->VFwrite = 0;
+				regs->VIwrite = 1u << REG_ACC_FLAG;
+				return true;
+			case UpperFastKind::MADDAz:
+				AnalyzeUpperFdfsftReadAcc(code, 0x2, regs);
+				regs->VFwrite = 0;
+				regs->VIwrite = 1u << REG_ACC_FLAG;
+				return true;
+			case UpperFastKind::MADDAw:
+				AnalyzeUpperFdfsftReadAcc(code, 0x1, regs);
+				regs->VFwrite = 0;
+				regs->VIwrite = 1u << REG_ACC_FLAG;
 				return true;
 			default:
 				break;
@@ -1145,6 +1281,30 @@ namespace VUInterpFast
 		VU_STAT_UPDATE(VU);
 	}
 
+	template <typename Operand>
+	static inline void ExecuteMaddMasked(VURegs* VU, u32 code, bool acc, Operand operand)
+	{
+		const unsigned fd = Fd(code);
+		const unsigned fs = Fs(code);
+		const unsigned mask = XYZW(code);
+
+		for (unsigned lane = 0; lane < 4; lane++)
+		{
+			const unsigned lane_mask = 1u << (3 - lane);
+			if ((mask & lane_mask) == 0)
+			{
+				ClearMacLane(VU, lane);
+				continue;
+			}
+
+			const float result = VuDouble(VU->ACC.UL[lane]) +
+				VuDouble(VU->VF[fs].UL[lane]) * VuDouble(operand(lane));
+			WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, result));
+		}
+
+		VU_STAT_UPDATE(VU);
+	}
+
 	template <u32 Offset>
 	static inline u32 FloatToIntBits(u32 bits)
 	{
@@ -1278,6 +1438,48 @@ namespace VUInterpFast
 				return;
 			case UpperFastKind::MULAw:
 				ExecuteMulMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
+				return;
+			case UpperFastKind::MADD:
+				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
+				return;
+			case UpperFastKind::MADDi:
+				ExecuteMaddMasked(VU, code, false, [VU](unsigned) { return VU->VI[REG_I].UL; });
+				return;
+			case UpperFastKind::MADDq:
+				ExecuteMaddMasked(VU, code, false, [VU](unsigned) { return VU->VI[REG_Q].UL; });
+				return;
+			case UpperFastKind::MADDx:
+				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
+				return;
+			case UpperFastKind::MADDy:
+				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
+				return;
+			case UpperFastKind::MADDz:
+				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
+				return;
+			case UpperFastKind::MADDw:
+				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
+				return;
+			case UpperFastKind::MADDA:
+				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
+				return;
+			case UpperFastKind::MADDAi:
+				ExecuteMaddMasked(VU, code, true, [VU](unsigned) { return VU->VI[REG_I].UL; });
+				return;
+			case UpperFastKind::MADDAq:
+				ExecuteMaddMasked(VU, code, true, [VU](unsigned) { return VU->VI[REG_Q].UL; });
+				return;
+			case UpperFastKind::MADDAx:
+				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
+				return;
+			case UpperFastKind::MADDAy:
+				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
+				return;
+			case UpperFastKind::MADDAz:
+				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
+				return;
+			case UpperFastKind::MADDAw:
+				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::None:
 				return;
