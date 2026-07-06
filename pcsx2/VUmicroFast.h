@@ -94,6 +94,7 @@ namespace VUInterpFast
 	enum class UpperFastKind : u8
 	{
 		None,
+		NOP,
 		ABS,
 		FTOI0,
 		FTOI4,
@@ -617,6 +618,8 @@ namespace VUInterpFast
 						return UpperFastKind::MADDAi;
 					case 0x09:
 						return UpperFastKind::MSUBAi;
+					case 0x0b:
+						return UpperFastKind::NOP;
 					default:
 						return UpperFastKind::None;
 				}
@@ -808,6 +811,8 @@ namespace VUInterpFast
 
 		switch (kind)
 		{
+			case UpperFastKind::NOP:
+				return true;
 			case UpperFastKind::ADD:
 			case UpperFastKind::SUB:
 			case UpperFastKind::MAX:
@@ -1670,6 +1675,8 @@ namespace VUInterpFast
 	{
 		switch (DecodeUpper(code))
 		{
+			case UpperFastKind::NOP:
+				return;
 			case UpperFastKind::ABS:
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), [](u32 bits) { return bits & 0x7fffffffu; });
 				return;

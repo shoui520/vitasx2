@@ -16,6 +16,7 @@ u32 g_qemuVuLowerNopFastSteps = 0;
 u32 g_qemuVuNopPairBurstSteps = 0;
 u32 g_qemuVuLowerDirectFastSteps = 0;
 u32 g_qemuVuUpperDirectFastSteps = 0;
+u32 g_qemuVuIbitFastSteps = 0;
 bool g_qemuVuLowerDirectFastEnabled = true;
 bool g_qemuVuUpperDirectFastEnabled = true;
 #endif

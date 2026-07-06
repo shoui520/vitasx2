@@ -17,6 +17,7 @@ extern u32 g_qemuVuLowerNopFastSteps;
 extern u32 g_qemuVuNopPairBurstSteps;
 extern u32 g_qemuVuLowerDirectFastSteps;
 extern u32 g_qemuVuUpperDirectFastSteps;
+extern u32 g_qemuVuIbitFastSteps;
 extern bool g_qemuVuLowerDirectFastEnabled;
 extern bool g_qemuVuUpperDirectFastEnabled;
 #endif
@@ -251,6 +252,11 @@ static void _vu0Exec(VURegs* VU)
 			VU->VIBackupCycles -= std::min((u8)(VU0.cycle - cyclesBeforeOp), VU->VIBackupCycles);
 
 		_vu0ExecUpperMaybeFast(VU, ptr, upper_fast);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (upper_fast)
+			++g_qemuVuIbitFastSteps;
+#endif
 
 		VU->VI[REG_I].UL = ptr[0];
 		memset(&lregs, 0, sizeof(lregs));
