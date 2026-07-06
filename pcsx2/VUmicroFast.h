@@ -1534,6 +1534,23 @@ namespace VUInterpFast
 		return false;
 	}
 
+	template <u32 Offset>
+	static inline bool StoreItofUpperMaskedNeon(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
+	{
+#if defined(ARCH_ARM32)
+		if (ft == 0 || mask == 0)
+			return false;
+
+		float32x4_t result = vcvtq_f32_s32(vreinterpretq_s32_u32(vld1q_u32(VU->VF[fs].UL)));
+		if (Offset != 0)
+			result = vmulq_f32(result, vdupq_n_f32(FloatFromBits(0x3f800000u - (Offset << 23))));
+
+		StoreUpperResultMaskedNeon(VU, ft, mask, vreinterpretq_u32_f32(result));
+		return true;
+#endif
+		return false;
+	}
+
 #if defined(ARCH_ARM32)
 	static inline uint32x4_t MinMaxBitsNeon(uint32x4_t fs_bits, uint32x4_t ft_bits, bool take_max)
 	{
@@ -1868,15 +1885,23 @@ namespace VUInterpFast
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), FloatToIntBits<15>);
 				return;
 			case UpperFastKind::ITOF0:
+				if (StoreItofUpperMaskedNeon<0>(VU, Ft(code), XYZW(code), Fs(code)))
+					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<0>);
 				return;
 			case UpperFastKind::ITOF4:
+				if (StoreItofUpperMaskedNeon<4>(VU, Ft(code), XYZW(code), Fs(code)))
+					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<4>);
 				return;
 			case UpperFastKind::ITOF12:
+				if (StoreItofUpperMaskedNeon<12>(VU, Ft(code), XYZW(code), Fs(code)))
+					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<12>);
 				return;
 			case UpperFastKind::ITOF15:
+				if (StoreItofUpperMaskedNeon<15>(VU, Ft(code), XYZW(code), Fs(code)))
+					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<15>);
 				return;
 			case UpperFastKind::ADD:
