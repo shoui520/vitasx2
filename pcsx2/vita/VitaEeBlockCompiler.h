@@ -205,6 +205,7 @@ namespace VitaEE
 		bool EmitCOP2MacroBody(u32 op);
 		bool EmitVu0ViBackup(unsigned vi_reg);
 		bool EmitCOP2MacroViBody(u32 op);
+		bool EmitCOP2MacroViTransferBody(u32 op);
 		bool EmitCOP2MacroMoveBody(u32 op);
 		bool EmitCOP2MacroMinMaxSelect(bool take_max);
 		bool EmitCOP2MacroMinMaxBody(u32 op);
