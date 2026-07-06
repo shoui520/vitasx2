@@ -3180,13 +3180,6 @@ namespace VitaEE
 				return FlushColdTails();
 			}
 
-			if ((op >> 26) == 0x2f && IsHelperCACHE(op))
-			{
-				if (scaled_cycles)
-					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
-				return FlushColdTails();
-			}
-
 			if (has_branch && branch_is_likely && i == branch_instruction_index + 1)
 			{
 				if (!m_code.PatchBranch(branch_likely_skip_delay, m_code.Size(), VitaA32::Condition::EQ))
@@ -5821,6 +5814,10 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCACHE(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
+		(void)pc;
+		(void)raw_cycles_through_instruction;
+		(void)event_exit;
+
 		if (IsNoOpCACHE(op))
 			return true;
 
@@ -5828,8 +5825,12 @@ namespace VitaEE
 			return false;
 
 		using namespace R5900::Interpreter::OpcodeImpl;
-		return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
-			reinterpret_cast<const void*>(&CACHE), event_exit);
+		// PCSX2 owner: Cache.cpp::CACHE(). Keep data-cache/TagLo modes inside
+		// the generated A32 tail so the normal cycle test can direct-exit instead
+		// of forcing an interpreter event split after every CACHE instruction.
+		return m_code.EmitMovImm32(HOST_TMP0, op) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&CACHE));
 	}
 
 	bool BlockCompiler::EmitSpecialExceptionEventExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
