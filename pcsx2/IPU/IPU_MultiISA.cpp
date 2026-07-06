@@ -15,6 +15,14 @@
 #include "IPU/IPU_MultiISA.h"
 #include "DebugTools/IpuTrace.h"
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuIpuCscPostNeonBlocks = 0;
+#endif
+
 // the IPU is fixed to 16 byte strides (128-bit / QWC resolution):
 static const uint decoder_stride = 16;
 
@@ -66,6 +74,7 @@ alignas(16) const mpeg2_scan_pack mpeg2_scan = make_scan_pack();
 MULTI_ISA_UNSHARED_START
 
 static void ipu_csc(macroblock_8& mb8, macroblock_rgb32& rgb32, int sgn);
+static void ipu_csc_postprocess(macroblock_rgb32& rgb32, int sgn);
 static void ipu_vq(macroblock_rgb16& rgb16, u8* indx4);
 
 // --------------------------------------------------------------------------------------
@@ -1881,10 +1890,14 @@ __ri static bool ipuPACK(tIPU_CMD_CSC csc)
 
 __fi static void ipu_csc(macroblock_8& mb8, macroblock_rgb32& rgb32, int sgn)
 {
-	int i;
-	u8* p = (u8*)&rgb32;
-
 	yuv2rgb();
+	ipu_csc_postprocess(rgb32, sgn);
+}
+
+static void ipu_csc_postprocess_reference(macroblock_rgb32& rgb32, int sgn)
+{
+	int i;
+	u8* p = reinterpret_cast<u8*>(&rgb32);
 
 	if (g_ipu_thresh[0] > 0)
 	{
@@ -1912,6 +1925,92 @@ __fi static void ipu_csc(macroblock_8& mb8, macroblock_rgb32& rgb32, int sgn)
 		}
 	}
 }
+
+#if defined(ARCH_ARM32)
+
+static __forceinline uint8x16_t IpuCscRgbAllLt(uint8x16_t r, uint8x16_t g, uint8x16_t b, u16 threshold)
+{
+	if (threshold > 255)
+		return vdupq_n_u8(0xff);
+
+	const uint8x16_t threshold_vec = vdupq_n_u8(static_cast<u8>(threshold));
+	return vandq_u8(vandq_u8(vcgtq_u8(threshold_vec, r), vcgtq_u8(threshold_vec, g)), vcgtq_u8(threshold_vec, b));
+}
+
+static void ipu_csc_postprocess_neon(macroblock_rgb32& rgb32, int sgn)
+{
+	u8* p = reinterpret_cast<u8*>(&rgb32);
+	const u16 threshold0 = g_ipu_thresh[0];
+	const u16 threshold1 = g_ipu_thresh[1];
+	const bool apply_threshold0 = threshold0 > 0;
+	const bool apply_threshold1 = threshold1 > 0;
+	const bool apply_sgn = sgn != 0;
+	const uint8x16_t zero = vdupq_n_u8(0);
+	const uint8x16_t alpha40 = vdupq_n_u8(0x40);
+	const uint8x16_t sign_flip = vdupq_n_u8(0x80);
+
+	if (!apply_threshold0 && !apply_threshold1 && !apply_sgn)
+		return;
+
+	for (u32 i = 0; i < 16; i++, p += 16 * 4)
+	{
+		uint8x16x4_t rgba = vld4q_u8(p);
+
+		if (apply_threshold0)
+		{
+			const uint8x16_t zero_mask = IpuCscRgbAllLt(rgba.val[0], rgba.val[1], rgba.val[2], threshold0);
+			const uint8x16_t alpha40_mask = IpuCscRgbAllLt(rgba.val[0], rgba.val[1], rgba.val[2], threshold1);
+			rgba.val[0] = vbslq_u8(zero_mask, zero, rgba.val[0]);
+			rgba.val[1] = vbslq_u8(zero_mask, zero, rgba.val[1]);
+			rgba.val[2] = vbslq_u8(zero_mask, zero, rgba.val[2]);
+			rgba.val[3] = vbslq_u8(zero_mask, zero, vbslq_u8(alpha40_mask, alpha40, rgba.val[3]));
+		}
+		else if (apply_threshold1)
+		{
+			const uint8x16_t alpha40_mask = IpuCscRgbAllLt(rgba.val[0], rgba.val[1], rgba.val[2], threshold1);
+			rgba.val[3] = vbslq_u8(alpha40_mask, alpha40, rgba.val[3]);
+		}
+		else
+		{
+			rgba.val[0] = veorq_u8(rgba.val[0], sign_flip);
+			rgba.val[1] = veorq_u8(rgba.val[1], sign_flip);
+			rgba.val[2] = veorq_u8(rgba.val[2], sign_flip);
+		}
+
+		vst4q_u8(p, rgba);
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuIpuCscPostNeonBlocks;
+#endif
+}
+
+#endif
+
+static void ipu_csc_postprocess(macroblock_rgb32& rgb32, int sgn)
+{
+#if defined(ARCH_ARM32)
+	const bool thresholded = g_ipu_thresh[0] > 0 || g_ipu_thresh[1] > 0;
+	if (!(sgn && thresholded))
+	{
+		ipu_csc_postprocess_neon(rgb32, sgn);
+		return;
+	}
+#endif
+	ipu_csc_postprocess_reference(rgb32, sgn);
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void IpuCscPostprocessReferenceForValidation(macroblock_rgb32& rgb32, int sgn)
+{
+	ipu_csc_postprocess_reference(rgb32, sgn);
+}
+
+void IpuCscPostprocessSelectedForValidation(macroblock_rgb32& rgb32, int sgn)
+{
+	ipu_csc_postprocess(rgb32, sgn);
+}
+#endif
 
 __fi static void ipu_vq(macroblock_rgb16& rgb16, u8* indx4)
 {
