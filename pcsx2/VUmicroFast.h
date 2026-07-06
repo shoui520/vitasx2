@@ -114,6 +114,7 @@ namespace VUInterpFast
 		MINIy,
 		MINIz,
 		MINIw,
+		CLIP,
 	};
 
 	static constexpr unsigned Ft(u32 code) { return (code >> 16) & 0x1f; }
@@ -397,6 +398,8 @@ namespace VUInterpFast
 						return UpperFastKind::ITOF15;
 					case 0x05:
 						return UpperFastKind::FTOI15;
+					case 0x07:
+						return UpperFastKind::CLIP;
 					default:
 						return UpperFastKind::None;
 				}
@@ -425,6 +428,17 @@ namespace VUInterpFast
 		regs->VFread0 = Fs(code);
 		regs->VFr0xyzw = XYZW(code);
 		regs->VIread = (1u << REG_I) | Vf0Flag(Fs(code));
+	}
+
+	static inline void AnalyzeUpperClip(u32 code, _VURegsNum* regs)
+	{
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = 0xe;
+		regs->VFread1 = Ft(code);
+		regs->VFr1xyzw = 0x1;
+		regs->VIwrite = 1u << REG_CLIP_FLAG;
+		regs->VIread = Vf0Flag(Fs(code)) | Vf0Flag(Ft(code)) | (1u << REG_CLIP_FLAG);
 	}
 
 	static inline bool AnalyzeUpperNoLower(u32 code, _VURegsNum* regs)
@@ -460,6 +474,9 @@ namespace VUInterpFast
 			case UpperFastKind::MAXw:
 			case UpperFastKind::MINIw:
 				AnalyzeUpperFdfsft(code, 0x1, regs);
+				return true;
+			case UpperFastKind::CLIP:
+				AnalyzeUpperClip(code, regs);
 				return true;
 			default:
 				break;
@@ -898,6 +915,25 @@ namespace VUInterpFast
 		return static_cast<u32>(sa < sb ? sa : sb);
 	}
 
+	static inline void ExecuteClip(VURegs* VU, u32 code)
+	{
+		const s32 value = (VU->VF[Ft(code)].UL[3] & 0x7f800000u) ?
+			static_cast<s32>(VU->VF[Ft(code)].UL[3] & 0x7fffffffu) :
+			static_cast<s32>(0x007fffffu);
+		const u32 pos = 0x00000000u;
+		const u32 neg = 0x80000000u;
+		const unsigned fs = Fs(code);
+
+		VU->clipflag <<= 6;
+		if (static_cast<s32>(VU->VF[fs].UL[0] ^ pos) > value) VU->clipflag |= 0x01;
+		if (static_cast<s32>(VU->VF[fs].UL[0] ^ neg) > value) VU->clipflag |= 0x02;
+		if (static_cast<s32>(VU->VF[fs].UL[1] ^ pos) > value) VU->clipflag |= 0x04;
+		if (static_cast<s32>(VU->VF[fs].UL[1] ^ neg) > value) VU->clipflag |= 0x08;
+		if (static_cast<s32>(VU->VF[fs].UL[2] ^ pos) > value) VU->clipflag |= 0x10;
+		if (static_cast<s32>(VU->VF[fs].UL[2] ^ neg) > value) VU->clipflag |= 0x20;
+		VU->clipflag &= 0x00ffffffu;
+	}
+
 	template <u32 Offset>
 	static inline u32 FloatToIntBits(u32 bits)
 	{
@@ -986,6 +1022,9 @@ namespace VUInterpFast
 				return;
 			case UpperFastKind::MINIw:
 				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[3], FpMinBits);
+				return;
+			case UpperFastKind::CLIP:
+				ExecuteClip(VU, code);
 				return;
 			case UpperFastKind::None:
 				return;
