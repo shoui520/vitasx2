@@ -27,6 +27,7 @@ u32 g_qemuVifBurstWidenVectors = 0;
 u32 g_qemuVifBurstColorVectors = 0;
 u32 g_qemuVifBurstSAndV2Vectors = 0;
 u32 g_qemuVifBurstV3Vectors = 0;
+u32 g_qemuVifBurstCopyVectors = 0;
 u32 g_qemuVifBurstModeMaskVectors = 0;
 u32 g_qemuVifCycleBurstVectors = 0;
 #endif
@@ -80,6 +81,29 @@ namespace
 #endif
 #else
 		std::memcpy(dest, src, 16);
+#endif
+	}
+
+	void VitaVifCopyQwordBurst(u8* dest, const u8* src, u32 count)
+	{
+#if VITASX2_VIF_HAS_ARM_NEON
+		for (u32 i = 0; i < count; i++)
+		{
+			const uint32x4_t value = vld1q_u32(reinterpret_cast<const u32*>(src));
+			vst1q_u32(reinterpret_cast<u32*>(dest), value);
+			src += 16;
+			dest += 16;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuVifNeonVectors += count;
+#endif
+#else
+		std::memcpy(dest, src, count * 16);
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuVifFastVectors += count;
+		g_qemuVifBurstVectors += count;
+		g_qemuVifBurstCopyVectors += count;
 #endif
 	}
 
@@ -1095,13 +1119,19 @@ namespace
 			return false;
 
 		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
+		if (format == 0x0c)
+		{
+			VitaVifCopyQwordBurst(dest, data, count);
+			vif.tag.addr += bytes;
+			vif.cl = static_cast<u8>(count % wl);
+			regs.num = 0;
+			return true;
+		}
+
 		for (u32 i = 0; i < count; i++)
 		{
 			switch (format)
 			{
-				case 0x0c:
-					VitaVifCopyQword(dest + i * 16, data + i * 16);
-					break;
 				case 0x0d:
 #if VITASX2_VIF_HAS_ARM_NEON
 					VitaVifStoreV4_16WordsNeon(dest + i * 16, data + i * 8, vif.usn != 0);
