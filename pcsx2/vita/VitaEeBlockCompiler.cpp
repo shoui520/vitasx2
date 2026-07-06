@@ -147,7 +147,9 @@ namespace VitaEE
 		using Vu0State = std::remove_reference_t<decltype(VU0)>;
 		constexpr size_t VU0_VF_OFFSET = offsetof(Vu0State, VF);
 		constexpr size_t VU0_VI_OFFSET = offsetof(Vu0State, VI);
+		constexpr size_t VU0_ACC_OFFSET = offsetof(Vu0State, ACC);
 		constexpr size_t VU0_Q_OFFSET = offsetof(Vu0State, q);
+		constexpr size_t VU0_MACFLAG_OFFSET = offsetof(Vu0State, macflag);
 		constexpr size_t VU0_STATUSFLAG_OFFSET = offsetof(Vu0State, statusflag);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		constexpr size_t VU0_MEM_OFFSET = offsetof(Vu0State, Mem);
@@ -333,6 +335,30 @@ namespace VitaEE
 		{
 			bool valid = false;
 			Cop2MacroFdivKind kind = Cop2MacroFdivKind::Div;
+		};
+
+		enum class Cop2MacroArithmeticKind
+		{
+			Add,
+			Sub,
+			Mul,
+		};
+
+		enum class Cop2MacroArithmeticOperand
+		{
+			Vector,
+			BroadcastLane,
+			ImmediateI,
+			ImmediateQ,
+		};
+
+		struct Cop2MacroArithmeticOp
+		{
+			bool valid = false;
+			Cop2MacroArithmeticKind kind = Cop2MacroArithmeticKind::Add;
+			Cop2MacroArithmeticOperand operand = Cop2MacroArithmeticOperand::Vector;
+			bool acc_destination = false;
+			unsigned broadcast_lane = 0;
 		};
 
 		constexpr unsigned RS(u32 op)
@@ -575,6 +601,113 @@ namespace VitaEE
 					return {true, Cop2MacroFdivKind::Sqrt};
 				case 0x3a:
 					return {true, Cop2MacroFdivKind::Rsqrt};
+				default:
+					return {};
+			}
+		}
+
+		constexpr Cop2MacroArithmeticOp DecodeCop2MacroArithmetic(u32 op)
+		{
+			const u32 function = op & 0x3f;
+			if (function < 0x3c)
+			{
+				switch (function)
+				{
+					case 0x00:
+					case 0x01:
+					case 0x02:
+					case 0x03:
+						return {true, Cop2MacroArithmeticKind::Add,
+							Cop2MacroArithmeticOperand::BroadcastLane, false, function & 0x3};
+					case 0x04:
+					case 0x05:
+					case 0x06:
+					case 0x07:
+						return {true, Cop2MacroArithmeticKind::Sub,
+							Cop2MacroArithmeticOperand::BroadcastLane, false, function & 0x3};
+					case 0x18:
+					case 0x19:
+					case 0x1a:
+					case 0x1b:
+						return {true, Cop2MacroArithmeticKind::Mul,
+							Cop2MacroArithmeticOperand::BroadcastLane, false, function & 0x3};
+					case 0x1c:
+						return {true, Cop2MacroArithmeticKind::Mul,
+							Cop2MacroArithmeticOperand::ImmediateQ, false, 0};
+					case 0x1e:
+						return {true, Cop2MacroArithmeticKind::Mul,
+							Cop2MacroArithmeticOperand::ImmediateI, false, 0};
+					case 0x20:
+						return {true, Cop2MacroArithmeticKind::Add,
+							Cop2MacroArithmeticOperand::ImmediateQ, false, 0};
+					case 0x24:
+						return {true, Cop2MacroArithmeticKind::Sub,
+							Cop2MacroArithmeticOperand::ImmediateQ, false, 0};
+					case 0x26:
+						return {true, Cop2MacroArithmeticKind::Sub,
+							Cop2MacroArithmeticOperand::ImmediateI, false, 0};
+					case 0x28:
+						return {true, Cop2MacroArithmeticKind::Add,
+							Cop2MacroArithmeticOperand::Vector, false, 0};
+					case 0x2a:
+						return {true, Cop2MacroArithmeticKind::Mul,
+							Cop2MacroArithmeticOperand::Vector, false, 0};
+					case 0x2c:
+						return {true, Cop2MacroArithmeticKind::Sub,
+							Cop2MacroArithmeticOperand::Vector, false, 0};
+					default:
+						return {};
+				}
+			}
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			switch (special2_index)
+			{
+				case 0x00:
+				case 0x01:
+				case 0x02:
+				case 0x03:
+					return {true, Cop2MacroArithmeticKind::Add,
+						Cop2MacroArithmeticOperand::BroadcastLane, true, special2_index & 0x3};
+				case 0x04:
+				case 0x05:
+				case 0x06:
+				case 0x07:
+					return {true, Cop2MacroArithmeticKind::Sub,
+						Cop2MacroArithmeticOperand::BroadcastLane, true, special2_index & 0x3};
+				case 0x18:
+				case 0x19:
+				case 0x1a:
+				case 0x1b:
+					return {true, Cop2MacroArithmeticKind::Mul,
+						Cop2MacroArithmeticOperand::BroadcastLane, true, special2_index & 0x3};
+				case 0x1c:
+					return {true, Cop2MacroArithmeticKind::Mul,
+						Cop2MacroArithmeticOperand::ImmediateQ, true, 0};
+				case 0x1e:
+					return {true, Cop2MacroArithmeticKind::Mul,
+						Cop2MacroArithmeticOperand::ImmediateI, true, 0};
+				case 0x20:
+					return {true, Cop2MacroArithmeticKind::Add,
+						Cop2MacroArithmeticOperand::ImmediateQ, true, 0};
+				case 0x22:
+					return {true, Cop2MacroArithmeticKind::Add,
+						Cop2MacroArithmeticOperand::ImmediateI, true, 0};
+				case 0x24:
+					return {true, Cop2MacroArithmeticKind::Sub,
+						Cop2MacroArithmeticOperand::ImmediateQ, true, 0};
+				case 0x26:
+					return {true, Cop2MacroArithmeticKind::Sub,
+						Cop2MacroArithmeticOperand::ImmediateI, true, 0};
+				case 0x28:
+					return {true, Cop2MacroArithmeticKind::Add,
+						Cop2MacroArithmeticOperand::Vector, true, 0};
+				case 0x2a:
+					return {true, Cop2MacroArithmeticKind::Mul,
+						Cop2MacroArithmeticOperand::Vector, true, 0};
+				case 0x2c:
+					return {true, Cop2MacroArithmeticKind::Sub,
+						Cop2MacroArithmeticOperand::Vector, true, 0};
 				default:
 					return {};
 			}
@@ -1085,11 +1218,11 @@ namespace VitaEE
 
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
-			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VCLIP/VDIV/VFTOI/VITOF/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
+			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VADD/VSUB/
+			// VMUL/VMAX/VMINI/VABS/VCLIP/VDIV/VFTOI/VITOF/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
 			// VLQI/VSQI/VLQD/VSQD, and x86/microVU_Macro.inl
-			// recVMAX/recVMINI/recVABS/recVNOP/recVMOVE/recVMR32/recVI*/
-			// recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops either have
+			// recVADD/recVSUB/recVMUL/recVMAX/recVMINI/recVABS/recVNOP/
+			// recVMOVE/recVMR32/recVI*/recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops either have
 			// no MAC/status/clip synchronization side effects or synchronize
 			// their flags directly, so idle VU0 can execute them inline while
 			// running VU0 stays on the helper tail.
@@ -1099,6 +1232,8 @@ namespace VitaEE
 				return false;
 			}
 
+			if (DecodeCop2MacroArithmetic(op).valid)
+				return true;
 			if (DecodeCop2MacroMinMax(op).valid)
 				return true;
 			if (DecodeCop2MacroMove(op).valid)
@@ -1173,6 +1308,8 @@ namespace VitaEE
 
 			if (IsFastCOP2MacroInBlock(op))
 			{
+				if (DecodeCop2MacroArithmetic(op).valid)
+					return 5; // code + source/operand/destination + MAC/status mirrors.
 				if (DecodeCop2MacroMinMax(op).valid)
 					return 4; // code + source VF + operand VF/VI + destination VF.
 				if (DecodeCop2MacroMove(op).valid)
@@ -4915,6 +5052,8 @@ namespace VitaEE
 		// x86/microVU_Macro.inl rec* macro lowerings. This body is emitted only
 		// on the idle-VU0 path; running VU0 exits through the COP2 helper so
 		// _vu0FinishMicro() still owns the interlock and cycle side effects.
+		if (DecodeCop2MacroArithmetic(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroArithmeticBody(op);
 		if (DecodeCop2MacroMinMax(op).valid)
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroMinMaxBody(op);
 		if (DecodeCop2MacroMove(op).valid)
@@ -4993,6 +5132,314 @@ namespace VitaEE
 			return false;
 
 		return true;
+	}
+
+	bool BlockCompiler::EmitCOP2MacroArithmeticBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::_vuADD/_vuSUB/_vuMUL plus their
+		// broadcast/ACC variants, VUflags.cpp::VU_MAC*_UPDATE(), and
+		// VUops.cpp::SYNCMSFLAGS(). FD VADDi stays helper-backed because
+		// VUops.cpp conditionally uses the TriAce CHECK_VUADDSUBHACK path.
+		const Cop2MacroArithmeticOp arithmetic = DecodeCop2MacroArithmetic(op);
+		if (!arithmetic.valid)
+			return false;
+
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		const bool vu0_overflow_clamp = true;
+#else
+		const bool vu0_overflow_clamp = CHECK_VU_OVERFLOW(0);
+#endif
+		const unsigned fs = RD(op);
+		const unsigned ft = RT(op);
+		const unsigned fd = SA(op);
+		const unsigned mask = (op >> 21) & 0x0f;
+		constexpr unsigned VFP_FS_S0 = 0;
+		constexpr unsigned VFP_FT_S1 = 1;
+		constexpr unsigned VFP_RESULT_S2 = 2;
+		constexpr unsigned VFP_BROADCAST_S3 = 3;
+
+		const auto emit_normalize_vu_float_word = [&](unsigned reg) {
+			if (!EmitAndImm32OrReg(HOST_TMP3, reg, FPU_FLOAT_EXPONENT_MASK, HOST_TMP5) ||
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
+			{
+				return false;
+			}
+
+			const size_t exponent_nonzero = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (exponent_nonzero == static_cast<size_t>(-1))
+				return false;
+
+			if (!EmitAndImm32OrReg(reg, reg, FPU_FLOAT_SIGN_MASK, HOST_TMP5))
+				return false;
+
+			const size_t done_from_zero = m_code.EmitBranchPlaceholder();
+			if (done_from_zero == static_cast<size_t>(-1))
+				return false;
+
+			const size_t exponent_nonzero_target = m_code.Size();
+			if (!m_code.PatchBranch(exponent_nonzero, exponent_nonzero_target, VitaA32::Condition::NE))
+				return false;
+
+			size_t done_from_finite = static_cast<size_t>(-1);
+			if (vu0_overflow_clamp)
+			{
+				if (!EmitCmpImm32OrReg(HOST_TMP3, FPU_FLOAT_EXPONENT_MASK, HOST_TMP5))
+					return false;
+
+				done_from_finite = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+				if (done_from_finite == static_cast<size_t>(-1))
+					return false;
+
+				if (!EmitAndImm32OrReg(reg, reg, FPU_FLOAT_SIGN_MASK, HOST_TMP5) ||
+					!EmitOrrImm32OrReg(reg, reg, FPU_FLOAT_MAX_FINITE, HOST_TMP5))
+				{
+					return false;
+				}
+			}
+
+			const size_t done_target = m_code.Size();
+			return m_code.PatchBranch(done_from_zero, done_target) &&
+				   (done_from_finite == static_cast<size_t>(-1) ||
+					   m_code.PatchBranch(done_from_finite, done_target, VitaA32::Condition::NE));
+		};
+
+		const auto emit_load_vf_lane = [&](unsigned host_reg, unsigned vf_reg, unsigned lane) {
+			return EmitVu0VfAddress(host_reg, vf_reg) &&
+				   m_code.EmitLdrImm12(host_reg, host_reg, static_cast<u16>(lane * sizeof(u32)));
+		};
+
+		const auto emit_prepare_broadcast_operand = [&]() {
+			switch (arithmetic.operand)
+			{
+				case Cop2MacroArithmeticOperand::Vector:
+					return true;
+				case Cop2MacroArithmeticOperand::BroadcastLane:
+					return emit_load_vf_lane(HOST_TMP1, ft, arithmetic.broadcast_lane) &&
+						   m_code.EmitVmovCoreToS(VFP_BROADCAST_S3, HOST_TMP1);
+				case Cop2MacroArithmeticOperand::ImmediateI:
+					return EmitVu0ViAddress(HOST_TMP1, VU0_REG_I) &&
+						   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP1, 0) &&
+						   m_code.EmitVmovCoreToS(VFP_BROADCAST_S3, HOST_TMP1);
+				case Cop2MacroArithmeticOperand::ImmediateQ:
+					return EmitVu0ViAddress(HOST_TMP1, VU0_REG_Q) &&
+						   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP1, 0) &&
+						   m_code.EmitVmovCoreToS(VFP_BROADCAST_S3, HOST_TMP1);
+			}
+			return false;
+		};
+
+		const auto emit_load_operand_lane = [&](unsigned lane) {
+			if (arithmetic.operand == Cop2MacroArithmeticOperand::Vector)
+			{
+				return emit_load_vf_lane(HOST_TMP1, ft, lane) &&
+					   emit_normalize_vu_float_word(HOST_TMP1);
+			}
+
+			return m_code.EmitVmovSToCore(HOST_TMP1, VFP_BROADCAST_S3) &&
+				   emit_normalize_vu_float_word(HOST_TMP1);
+		};
+
+		const auto emit_clear_mac_lane = [&](unsigned lane) {
+			const unsigned shift = 3 - lane;
+			return EmitBicImm32OrReg(HOST_TMP4, HOST_TMP4, 0x1111u << shift, HOST_TMP5);
+		};
+
+		const auto emit_update_mac_lane = [&](unsigned lane) {
+			const unsigned shift = 3 - lane;
+			const u32 sign_flag = 0x0010u << shift;
+			const u32 zero_clear = 0x1100u << shift;
+			const u32 zero_set = 0x0001u << shift;
+			const u32 denormal_clear = 0x1000u << shift;
+			const u32 denormal_set = 0x0101u << shift;
+			const u32 overflow_clear = 0x0101u << shift;
+			const u32 overflow_set = 0x1000u << shift;
+			const u32 finite_clear = 0x1101u << shift;
+
+			if (!EmitBicImm32OrReg(HOST_TMP4, HOST_TMP4, sign_flag, HOST_TMP5) ||
+				!m_code.EmitTstImm32(HOST_TMP0, FPU_FLOAT_SIGN_MASK) ||
+				!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+				!m_code.EmitMovImm8(HOST_TMP2, static_cast<u8>(sign_flag), VitaA32::Condition::NE) ||
+				!m_code.EmitOrrReg(HOST_TMP4, HOST_TMP4, HOST_TMP2) ||
+				!EmitBicImm32OrReg(HOST_TMP2, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP5) ||
+				!m_code.EmitCmpImm32(HOST_TMP2, 0))
+			{
+				return false;
+			}
+
+			const size_t nonzero = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (nonzero == static_cast<size_t>(-1))
+				return false;
+
+			if (!EmitBicImm32OrReg(HOST_TMP4, HOST_TMP4, zero_clear, HOST_TMP5) ||
+				!EmitOrrImm32OrReg(HOST_TMP4, HOST_TMP4, zero_set, HOST_TMP5))
+			{
+				return false;
+			}
+
+			const size_t done_from_zero = m_code.EmitBranchPlaceholder();
+			if (done_from_zero == static_cast<size_t>(-1))
+				return false;
+
+			const size_t nonzero_target = m_code.Size();
+			if (!m_code.PatchBranch(nonzero, nonzero_target, VitaA32::Condition::NE) ||
+				!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP0, FPU_FLOAT_EXPONENT_MASK, HOST_TMP5) ||
+				!m_code.EmitCmpImm32(HOST_TMP2, 0))
+			{
+				return false;
+			}
+
+			const size_t exponent_nonzero = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (exponent_nonzero == static_cast<size_t>(-1))
+				return false;
+
+			if (!EmitBicImm32OrReg(HOST_TMP4, HOST_TMP4, denormal_clear, HOST_TMP5) ||
+				!EmitOrrImm32OrReg(HOST_TMP4, HOST_TMP4, denormal_set, HOST_TMP5) ||
+				!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP5))
+			{
+				return false;
+			}
+
+			const size_t done_from_denormal = m_code.EmitBranchPlaceholder();
+			if (done_from_denormal == static_cast<size_t>(-1))
+				return false;
+
+			const size_t exponent_nonzero_target = m_code.Size();
+			if (!m_code.PatchBranch(exponent_nonzero, exponent_nonzero_target, VitaA32::Condition::NE) ||
+				!EmitCmpImm32OrReg(HOST_TMP2, FPU_FLOAT_EXPONENT_MASK, HOST_TMP5))
+			{
+				return false;
+			}
+
+			const size_t finite = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (finite == static_cast<size_t>(-1))
+				return false;
+
+			if (!EmitBicImm32OrReg(HOST_TMP4, HOST_TMP4, overflow_clear, HOST_TMP5) ||
+				!EmitOrrImm32OrReg(HOST_TMP4, HOST_TMP4, overflow_set, HOST_TMP5))
+			{
+				return false;
+			}
+
+			if (vu0_overflow_clamp &&
+				(!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP5) ||
+				 !EmitOrrImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_MAX_FINITE, HOST_TMP5)))
+			{
+				return false;
+			}
+
+			const size_t done_from_overflow = m_code.EmitBranchPlaceholder();
+			if (done_from_overflow == static_cast<size_t>(-1))
+				return false;
+
+			const size_t finite_target = m_code.Size();
+			if (!m_code.PatchBranch(finite, finite_target, VitaA32::Condition::NE) ||
+				!EmitBicImm32OrReg(HOST_TMP4, HOST_TMP4, finite_clear, HOST_TMP5))
+			{
+				return false;
+			}
+
+			const size_t done_target = m_code.Size();
+			return m_code.PatchBranch(done_from_zero, done_target) &&
+				   m_code.PatchBranch(done_from_denormal, done_target) &&
+				   m_code.PatchBranch(done_from_overflow, done_target);
+		};
+
+		const auto emit_store_result = [&](unsigned lane) {
+			if (arithmetic.acc_destination)
+			{
+				return EmitVu0RegisterAddress(HOST_TMP2, VU0_ACC_OFFSET) &&
+					   m_code.EmitStrImm12(HOST_TMP0, HOST_TMP2, static_cast<u16>(lane * sizeof(u32)));
+			}
+
+			if (fd == 0)
+				return true;
+
+			return EmitVu0VfAddress(HOST_TMP2, fd) &&
+				   m_code.EmitStrImm12(HOST_TMP0, HOST_TMP2, static_cast<u16>(lane * sizeof(u32)));
+		};
+
+		const auto emit_sync_msflags = [&]() {
+			const auto emit_status_bit = [&](u32 mac_mask, u8 status_bit) {
+				return m_code.EmitTstImm32(HOST_TMP4, mac_mask) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, status_bit, VitaA32::Condition::NE) &&
+					   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2);
+			};
+
+			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
+				!emit_status_bit(0x000fu, 0x1) ||
+				!emit_status_bit(0x00f0u, 0x2) ||
+				!emit_status_bit(0x0f00u, 0x4) ||
+				!emit_status_bit(0xf000u, 0x8) ||
+				!EmitVu0RegisterAddress(HOST_TMP1, VU0_MACFLAG_OFFSET) ||
+				!m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, 0) ||
+				!EmitVu0ViAddress(HOST_TMP1, VU0_REG_MAC_FLAG) ||
+				!m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, 0) ||
+				!EmitVu0RegisterAddress(HOST_TMP1, VU0_STATUSFLAG_OFFSET) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_TMP1, 0) ||
+				!EmitVu0ViAddress(HOST_TMP1, VU0_REG_STATUS_FLAG) ||
+				!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, 0) ||
+				!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP2, 0x0fc0u, HOST_TMP5) ||
+				!m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP0) ||
+				!m_code.EmitOrrRegShiftImm(HOST_TMP2, HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 6) ||
+				!m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, 0))
+			{
+				return false;
+			}
+			return true;
+		};
+
+		if (!EmitVu0RegisterAddress(HOST_TMP2, VU0_MACFLAG_OFFSET) ||
+			!m_code.EmitLdrImm12(HOST_TMP4, HOST_TMP2, 0) ||
+			!emit_prepare_broadcast_operand())
+		{
+			return false;
+		}
+
+		for (unsigned lane = 0; lane < 4; lane++)
+		{
+			const unsigned lane_mask = 1u << (3 - lane);
+			if ((mask & lane_mask) == 0)
+			{
+				if (!emit_clear_mac_lane(lane))
+					return false;
+				continue;
+			}
+
+			if (!emit_load_vf_lane(HOST_TMP0, fs, lane) ||
+				!emit_normalize_vu_float_word(HOST_TMP0) ||
+				!emit_load_operand_lane(lane) ||
+				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
+				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1))
+			{
+				return false;
+			}
+
+			switch (arithmetic.kind)
+			{
+				case Cop2MacroArithmeticKind::Add:
+					if (!m_code.EmitVaddF32(VFP_RESULT_S2, VFP_FS_S0, VFP_FT_S1))
+						return false;
+					break;
+				case Cop2MacroArithmeticKind::Sub:
+					if (!m_code.EmitVsubF32(VFP_RESULT_S2, VFP_FS_S0, VFP_FT_S1))
+						return false;
+					break;
+				case Cop2MacroArithmeticKind::Mul:
+					if (!m_code.EmitVmulF32(VFP_RESULT_S2, VFP_FS_S0, VFP_FT_S1))
+						return false;
+					break;
+			}
+
+			if (!m_code.EmitVmovSToCore(HOST_TMP0, VFP_RESULT_S2) ||
+				!emit_update_mac_lane(lane) ||
+				!emit_store_result(lane))
+			{
+				return false;
+			}
+		}
+
+		return emit_sync_msflags();
 	}
 
 	bool BlockCompiler::EmitVu0ViBackup(unsigned vi_reg)

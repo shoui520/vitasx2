@@ -203,6 +203,7 @@ namespace VitaEE
 		bool EmitCOP2ControlWriteBody(u32 op);
 		bool EmitCOP2MacroCodeWrite(u32 op);
 		bool EmitCOP2MacroBody(u32 op);
+		bool EmitCOP2MacroArithmeticBody(u32 op);
 		bool EmitVu0ViBackup(unsigned vi_reg);
 		bool EmitCOP2MacroViBody(u32 op);
 		bool EmitCOP2MacroViTransferBody(u32 op);
