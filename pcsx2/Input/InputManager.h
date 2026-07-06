@@ -68,5 +68,7 @@ namespace InputManager
 	void ResetVitaPadFastPathCountersForTesting();
 	u32 GetVitaPadAppliedSnapshotsForTesting();
 	u32 GetVitaPadSkippedSnapshotsForTesting();
+	u32 GetVitaPadAnalogWritesForTesting();
+	u32 GetVitaPadButtonWritesForTesting();
 #endif
 } // namespace InputManager

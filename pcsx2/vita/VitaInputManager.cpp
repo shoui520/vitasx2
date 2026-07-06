@@ -36,9 +36,25 @@ namespace
 	VitaPadSnapshot s_qemu_snapshot;
 	u32 s_qemu_applied_snapshots = 0;
 	u32 s_qemu_skipped_snapshots = 0;
+	u32 s_qemu_analog_writes = 0;
+	u32 s_qemu_button_writes = 0;
 #else
 	bool s_ctrl_initialized = false;
 #endif
+
+	constexpr u32 VITA_PAD_BUTTON_MASK =
+		InputManager::VitaPadButton_Select |
+		InputManager::VitaPadButton_Start |
+		InputManager::VitaPadButton_Up |
+		InputManager::VitaPadButton_Right |
+		InputManager::VitaPadButton_Down |
+		InputManager::VitaPadButton_Left |
+		InputManager::VitaPadButton_L1 |
+		InputManager::VitaPadButton_R1 |
+		InputManager::VitaPadButton_Triangle |
+		InputManager::VitaPadButton_Circle |
+		InputManager::VitaPadButton_Cross |
+		InputManager::VitaPadButton_Square;
 
 	u8 DigitalPressure(bool pressed)
 	{
@@ -48,6 +64,18 @@ namespace
 	void SetPressureButton(PadBase* pad, u32 index, bool pressed, u8 pressure)
 	{
 		pad->SetRawPressureButton(index, {pressed, pressed ? pressure : 0x00});
+	}
+
+	void SetPressureButtonIfChanged(PadBase* pad, u32 changed_buttons, u32 buttons, u32 mask, u32 index)
+	{
+		if ((changed_buttons & mask) == 0)
+			return;
+
+		const bool pressed = (buttons & mask) != 0;
+		SetPressureButton(pad, index, pressed, DigitalPressure(pressed));
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemu_button_writes++;
+#endif
 	}
 
 	void ApplyVitaPadState(u32 buttons, u8 lx, u8 ly, u8 rx, u8 ry)
@@ -60,13 +88,31 @@ namespace
 		}
 
 		const VitaPadSnapshot snapshot = {buttons, lx, ly, rx, ry};
-		if (s_last_applied_snapshot_valid && s_last_applied_pad == pad && s_last_applied_snapshot == snapshot)
+		const bool can_diff_from_previous = s_last_applied_snapshot_valid && s_last_applied_pad == pad;
+		const VitaPadSnapshot previous_snapshot = s_last_applied_snapshot;
+		if (can_diff_from_previous && previous_snapshot == snapshot)
 		{
 #if defined(VITASX2_QEMU_VALIDATION)
 			s_qemu_skipped_snapshots++;
 #endif
 			return;
 		}
+
+		if (!can_diff_from_previous ||
+			previous_snapshot.lx != lx ||
+			previous_snapshot.ly != ly ||
+			previous_snapshot.rx != rx ||
+			previous_snapshot.ry != ry)
+		{
+			pad->SetRawAnalogs({lx, ly}, {rx, ry});
+#if defined(VITASX2_QEMU_VALIDATION)
+			s_qemu_analog_writes++;
+#endif
+		}
+
+		const u32 changed_buttons = can_diff_from_previous ?
+			((previous_snapshot.buttons ^ buttons) & VITA_PAD_BUTTON_MASK) :
+			VITA_PAD_BUTTON_MASK;
 
 		s_last_applied_snapshot = snapshot;
 		s_last_applied_pad = pad;
@@ -75,32 +121,30 @@ namespace
 		s_qemu_applied_snapshots++;
 #endif
 
-		pad->SetRawAnalogs({lx, ly}, {rx, ry});
-
-		SetPressureButton(pad, PadDualshock2::PAD_SELECT, (buttons & InputManager::VitaPadButton_Select) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Select) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_START, (buttons & InputManager::VitaPadButton_Start) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Start) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_UP, (buttons & InputManager::VitaPadButton_Up) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Up) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_RIGHT, (buttons & InputManager::VitaPadButton_Right) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Right) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_DOWN, (buttons & InputManager::VitaPadButton_Down) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Down) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_LEFT, (buttons & InputManager::VitaPadButton_Left) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Left) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_L1, (buttons & InputManager::VitaPadButton_L1) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_L1) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_R1, (buttons & InputManager::VitaPadButton_R1) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_R1) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_TRIANGLE, (buttons & InputManager::VitaPadButton_Triangle) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Triangle) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_CIRCLE, (buttons & InputManager::VitaPadButton_Circle) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Circle) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_CROSS, (buttons & InputManager::VitaPadButton_Cross) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Cross) != 0));
-		SetPressureButton(pad, PadDualshock2::PAD_SQUARE, (buttons & InputManager::VitaPadButton_Square) != 0,
-			DigitalPressure((buttons & InputManager::VitaPadButton_Square) != 0));
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Select,
+			PadDualshock2::PAD_SELECT);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Start,
+			PadDualshock2::PAD_START);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Up,
+			PadDualshock2::PAD_UP);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Right,
+			PadDualshock2::PAD_RIGHT);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Down,
+			PadDualshock2::PAD_DOWN);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Left,
+			PadDualshock2::PAD_LEFT);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_L1,
+			PadDualshock2::PAD_L1);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_R1,
+			PadDualshock2::PAD_R1);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Triangle,
+			PadDualshock2::PAD_TRIANGLE);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Circle,
+			PadDualshock2::PAD_CIRCLE);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Cross,
+			PadDualshock2::PAD_CROSS);
+		SetPressureButtonIfChanged(pad, changed_buttons, buttons, InputManager::VitaPadButton_Square,
+			PadDualshock2::PAD_SQUARE);
 	}
 
 #if !defined(VITASX2_QEMU_VALIDATION)
@@ -286,6 +330,8 @@ void InputManager::ResetVitaPadFastPathCountersForTesting()
 {
 	s_qemu_applied_snapshots = 0;
 	s_qemu_skipped_snapshots = 0;
+	s_qemu_analog_writes = 0;
+	s_qemu_button_writes = 0;
 }
 
 u32 InputManager::GetVitaPadAppliedSnapshotsForTesting()
@@ -296,5 +342,15 @@ u32 InputManager::GetVitaPadAppliedSnapshotsForTesting()
 u32 InputManager::GetVitaPadSkippedSnapshotsForTesting()
 {
 	return s_qemu_skipped_snapshots;
+}
+
+u32 InputManager::GetVitaPadAnalogWritesForTesting()
+{
+	return s_qemu_analog_writes;
+}
+
+u32 InputManager::GetVitaPadButtonWritesForTesting()
+{
+	return s_qemu_button_writes;
 }
 #endif
