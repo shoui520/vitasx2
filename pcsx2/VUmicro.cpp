@@ -10,6 +10,14 @@
 BaseVUmicroCPU* CpuVU0 = nullptr;
 BaseVUmicroCPU* CpuVU1 = nullptr;
 
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuVuUpperNopFastSteps = 0;
+u32 g_qemuVuLowerNopFastSteps = 0;
+u32 g_qemuVuNopPairBurstSteps = 0;
+u32 g_qemuVuLowerDirectFastSteps = 0;
+bool g_qemuVuLowerDirectFastEnabled = true;
+#endif
+
 __inline u32 CalculateMinRunCycles(u32 cycles, bool requiresAccurateCycles)
 {
 	// If we're running an interlocked COP2 operation
