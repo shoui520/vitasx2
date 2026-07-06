@@ -11,11 +11,103 @@
 #include "common/SmallString.h"
 #include "common/Threading.h"
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
 #include <cstring>
 
 // Make sure buffer size is bigger than the cutoff where PCSX2 emulates a seek
 // If buffers are smaller than that, we can't keep up with linear reads
 static constexpr u32 MINIMUM_SIZE = 128 * 1024;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuCdvdBlockCopyNeonQwords = 0;
+#endif
+
+static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
+{
+#if defined(ARCH_ARM32)
+	u8* cdst = static_cast<u8*>(dst);
+	const u8* csrc = static_cast<const u8*>(src);
+	const size_t qwords = size >> 4;
+	for (size_t i = 0; i < qwords; i++)
+	{
+		const uint8x16_t qword = vld1q_u8(csrc);
+		vst1q_u8(cdst, qword);
+		csrc += 16;
+		cdst += 16;
+	}
+
+	if (size & 8)
+	{
+		const uint8x8_t half = vld1_u8(csrc);
+		vst1_u8(cdst, half);
+		csrc += 8;
+		cdst += 8;
+	}
+	for (size_t i = 0; i < (size & 7); i++)
+		cdst[i] = csrc[i];
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuCdvdBlockCopyNeonQwords += static_cast<u32>(qwords);
+#endif
+	return;
+#endif
+	memcpy(dst, src, size);
+}
+
+static size_t CdvdCopyBlocks(void* dst, const void* src, size_t size, u32 blocksize, int internalBlockSize)
+{
+	char* cdst = static_cast<char*>(dst);
+	const char* csrc = static_cast<const char*>(src);
+	const char* cend = csrc + size;
+	if (internalBlockSize)
+	{
+		for (; csrc < cend; csrc += internalBlockSize, cdst += blocksize)
+			CdvdCopyBytes(cdst, csrc, blocksize);
+
+		return cdst - static_cast<char*>(dst);
+	}
+	else
+	{
+		CdvdCopyBytes(dst, src, size);
+		return size;
+	}
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+static size_t CdvdCopyBlocksReference(void* dst, const void* src, size_t size, u32 blocksize, int internalBlockSize)
+{
+	char* cdst = static_cast<char*>(dst);
+	const char* csrc = static_cast<const char*>(src);
+	const char* cend = csrc + size;
+	if (internalBlockSize)
+	{
+		for (; csrc < cend; csrc += internalBlockSize, cdst += blocksize)
+			memcpy(cdst, csrc, blocksize);
+
+		return cdst - static_cast<char*>(dst);
+	}
+	else
+	{
+		memcpy(dst, src, size);
+		return size;
+	}
+}
+
+size_t CdvdCopyBlocksReferenceForValidation(
+	void* dst, const void* src, size_t size, u32 blocksize, int internalBlockSize)
+{
+	return CdvdCopyBlocksReference(dst, src, size, blocksize, internalBlockSize);
+}
+
+size_t CdvdCopyBlocksSelectedForValidation(
+	void* dst, const void* src, size_t size, u32 blocksize, int internalBlockSize)
+{
+	return CdvdCopyBlocks(dst, src, size, blocksize, internalBlockSize);
+}
+#endif
 
 ThreadedFileReader::ThreadedFileReader()
 {
@@ -42,22 +134,7 @@ ThreadedFileReader::~ThreadedFileReader()
 
 size_t ThreadedFileReader::CopyBlocks(void* dst, const void* src, size_t size) const
 {
-	char* cdst = static_cast<char*>(dst);
-	const char* csrc = static_cast<const char*>(src);
-	const char* cend = csrc + size;
-	if (m_internalBlockSize)
-	{
-		for (; csrc < cend; csrc += m_internalBlockSize, cdst += m_blocksize)
-		{
-			memcpy(cdst, csrc, m_blocksize);
-		}
-		return cdst - static_cast<char*>(dst);
-	}
-	else
-	{
-		memcpy(dst, src, size);
-		return size;
-	}
+	return CdvdCopyBlocks(dst, src, size, m_blocksize, m_internalBlockSize);
 }
 
 void ThreadedFileReader::Loop()
