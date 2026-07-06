@@ -267,8 +267,16 @@ static void _vu1Exec(VURegs* VU)
 			int discard = 0;
 
 			VU->code = ptr[0];
-			lregs.cycles = 0;
-			VU1regs_LOWER_OPCODE[VU->code >> 25](&lregs);
+			const bool lower_fast =
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuVuLowerDirectFastEnabled &&
+#endif
+				VUInterpFast::AnalyzeLowerNoUpper(ptr[0], &lregs);
+			if (!lower_fast)
+			{
+				lregs.cycles = 0;
+				VU1regs_LOWER_OPCODE[VU->code >> 25](&lregs);
+			}
 
 			_vuTestLowerStalls(VU, &lregs);
 			_vuTestPipes(VU);
@@ -321,7 +329,13 @@ static void _vu1Exec(VURegs* VU)
 					VU->VI[vireg] = _VI;
 				}
 
-				_vu1ExecLower(VU, ptr);
+				if (lower_fast)
+				{
+					IdebugLOWER(VU1);
+					VUInterpFast::ExecuteLowerNoUpper(VU, ptr[0]);
+				}
+				else
+					_vu1ExecLower(VU, ptr);
 
 				if (vfreg)
 				{
@@ -332,6 +346,11 @@ static void _vu1Exec(VURegs* VU)
 					VU->VI[vireg] = _VIc;
 				}
 			}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (lower_fast)
+				++g_qemuVuLowerDirectFastSteps;
+#endif
 		}
 	}
 	// Clear an FMAC read for use
