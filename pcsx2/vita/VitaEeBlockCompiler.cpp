@@ -147,6 +147,8 @@ namespace VitaEE
 		using Vu0State = std::remove_reference_t<decltype(VU0)>;
 		constexpr size_t VU0_VF_OFFSET = offsetof(Vu0State, VF);
 		constexpr size_t VU0_VI_OFFSET = offsetof(Vu0State, VI);
+		constexpr size_t VU0_Q_OFFSET = offsetof(Vu0State, q);
+		constexpr size_t VU0_STATUSFLAG_OFFSET = offsetof(Vu0State, statusflag);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		constexpr size_t VU0_MEM_OFFSET = offsetof(Vu0State, Mem);
 		constexpr size_t VU0_CODE_OFFSET = offsetof(Vu0State, code);
@@ -190,6 +192,7 @@ namespace VitaEE
 		constexpr u32 FPU_FLOAT_EXPONENT_MASK = 0x7f800000;
 		constexpr u32 FPU_FLOAT_IMPLICIT_MANTISSA = 0x00800000;
 		constexpr u32 FPU_FLOAT_ONE = 0x3f800000;
+		constexpr u32 FPU_FLOAT_MAX_FINITE = 0x7f7fffff;
 		constexpr u32 FPU_CVT_W_MAX_EXPONENT_MASK = 0x4e800000;
 		constexpr u32 FPU_FLOAT_EXPONENT_BIAS = 127;
 		constexpr u32 FPU_FLOAT_MANTISSA_BITS = 23;
@@ -197,10 +200,12 @@ namespace VitaEE
 		constexpr u16 DMAC_STAT_DMAC_OFFSET = 0x10;
 		constexpr u16 DMAC_PCR_DMAC_OFFSET = 0x20;
 		constexpr u32 DMAC_CPCOND_MASK = 0x3ff;
+		constexpr unsigned VU0_REG_STATUS_FLAG = 16;
 		constexpr unsigned VU0_REG_MAC_FLAG = 17;
 		constexpr unsigned VU0_REG_CLIP_FLAG = 18;
 		constexpr unsigned VU0_REG_R = 20;
 		constexpr unsigned VU0_REG_I = 21;
+		constexpr unsigned VU0_REG_Q = 22;
 		constexpr unsigned VU0_REG_TPC = 26;
 		constexpr unsigned VU0_REG_FBRST = 28;
 		constexpr unsigned VU0_REG_VPU_STAT = 29;
@@ -315,6 +320,19 @@ namespace VitaEE
 		{
 			bool valid = false;
 			unsigned offset = 0;
+		};
+
+		enum class Cop2MacroFdivKind
+		{
+			Div,
+			Sqrt,
+			Rsqrt,
+		};
+
+		struct Cop2MacroFdivOp
+		{
+			bool valid = false;
+			Cop2MacroFdivKind kind = Cop2MacroFdivKind::Div;
 		};
 
 		constexpr unsigned RS(u32 op)
@@ -538,6 +556,25 @@ namespace VitaEE
 					return {true, 12};
 				case 0x17:
 					return {true, 15};
+				default:
+					return {};
+			}
+		}
+
+		constexpr Cop2MacroFdivOp DecodeCop2MacroFdiv(u32 op)
+		{
+			if ((op & 0x3c) != 0x3c)
+				return {};
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			switch (special2_index)
+			{
+				case 0x38:
+					return {true, Cop2MacroFdivKind::Div};
+				case 0x39:
+					return {true, Cop2MacroFdivKind::Sqrt};
+				case 0x3a:
+					return {true, Cop2MacroFdivKind::Rsqrt};
 				default:
 					return {};
 			}
@@ -1049,7 +1086,7 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VCLIP/VFTOI/VITOF/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
+			// VABS/VCLIP/VDIV/VFTOI/VITOF/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
 			// VLQI/VSQI/VLQD/VSQD, and x86/microVU_Macro.inl
 			// recVMAX/recVMINI/recVABS/recVNOP/recVMOVE/recVMR32/recVI*/
 			// recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops either have
@@ -1081,6 +1118,8 @@ namespace VitaEE
 			if (DecodeCop2MacroItof(op).valid)
 				return true;
 			if (DecodeCop2MacroFtoi(op).valid)
+				return true;
+			if (DecodeCop2MacroFdiv(op).valid)
 				return true;
 
 			if ((op & 0x3c) != 0x3c)
@@ -1157,6 +1196,8 @@ namespace VitaEE
 					return 3; // code + source VF + destination VF.
 				if (DecodeCop2MacroFtoi(op).valid)
 					return 3; // code + source VF + destination VF.
+				if (DecodeCop2MacroFdiv(op).valid)
+					return 5; // code + source VF(s) + Q/status mirrors.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
@@ -4894,6 +4935,8 @@ namespace VitaEE
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroItofBody(op);
 		if (DecodeCop2MacroFtoi(op).valid)
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroFtoiBody(op);
+		if (DecodeCop2MacroFdiv(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroFdivBody(op);
 
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
@@ -5703,6 +5746,278 @@ namespace VitaEE
 			return false;
 
 		return true;
+	}
+
+	bool BlockCompiler::EmitCOP2MacroFdivBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::_vuDIV() / _vuSQRT() / _vuRSQRT() and
+		// SYNCFDIV(). Macro COP2 updates VU0.q/statusflag immediately and
+		// mirrors Q plus D/I status bits into VI[REG_Q]/VI[REG_STATUS_FLAG].
+		const Cop2MacroFdivOp fdiv = DecodeCop2MacroFdiv(op);
+		if (!fdiv.valid)
+			return false;
+
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		const bool vu0_overflow_clamp = true;
+#else
+		const bool vu0_overflow_clamp = CHECK_VU_OVERFLOW(0);
+#endif
+		const unsigned fs = RD(op);
+		const unsigned ft = RT(op);
+		const unsigned fsf = (op >> 21) & 0x03;
+		const unsigned ftf = (op >> 23) & 0x03;
+		constexpr unsigned VFP_FS_S0 = 0;
+		constexpr unsigned VFP_FT_S1 = 1;
+		constexpr unsigned VFP_Q_S2 = 2;
+
+		const auto emit_load_vf_lane = [&](unsigned host_reg, unsigned vf_reg, unsigned lane) {
+			return EmitVu0VfAddress(host_reg, vf_reg) &&
+				   m_code.EmitLdrImm12(host_reg, host_reg, static_cast<u16>(lane * sizeof(u32)));
+		};
+
+		const auto emit_normalize_vu_float_word = [&](unsigned reg) {
+			if (!EmitAndImm32OrReg(HOST_TMP3, reg, FPU_FLOAT_EXPONENT_MASK, HOST_TMP5) ||
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
+			{
+				return false;
+			}
+
+			const size_t exponent_nonzero = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (exponent_nonzero == static_cast<size_t>(-1))
+				return false;
+
+			if (!EmitAndImm32OrReg(reg, reg, FPU_FLOAT_SIGN_MASK, HOST_TMP5))
+				return false;
+
+			const size_t done_from_zero = m_code.EmitBranchPlaceholder();
+			if (done_from_zero == static_cast<size_t>(-1))
+				return false;
+
+			const size_t exponent_nonzero_target = m_code.Size();
+			if (!m_code.PatchBranch(exponent_nonzero, exponent_nonzero_target, VitaA32::Condition::NE))
+				return false;
+
+			size_t done_from_finite = static_cast<size_t>(-1);
+			if (vu0_overflow_clamp)
+			{
+				if (!EmitCmpImm32OrReg(HOST_TMP3, FPU_FLOAT_EXPONENT_MASK, HOST_TMP5))
+					return false;
+
+				done_from_finite = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+				if (done_from_finite == static_cast<size_t>(-1))
+					return false;
+
+				if (!EmitAndImm32OrReg(reg, reg, FPU_FLOAT_SIGN_MASK, HOST_TMP5) ||
+					!EmitOrrImm32OrReg(reg, reg, FPU_FLOAT_MAX_FINITE, HOST_TMP5))
+				{
+					return false;
+				}
+			}
+
+			const size_t done_target = m_code.Size();
+			return m_code.PatchBranch(done_from_zero, done_target) &&
+				   (done_from_finite == static_cast<size_t>(-1) ||
+					   m_code.PatchBranch(done_from_finite, done_target, VitaA32::Condition::NE));
+		};
+
+		const auto emit_abs_word = [&](unsigned rd, unsigned rn) {
+			return EmitBicImm32OrReg(rd, rn, FPU_FLOAT_SIGN_MASK, HOST_TMP5);
+		};
+
+		const auto emit_set_invalid_if_negative_nonzero = [&](unsigned reg) {
+			if (!emit_abs_word(HOST_TMP3, reg) ||
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
+			{
+				return false;
+			}
+
+			const size_t zero = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (zero == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitTstImm32(reg, FPU_FLOAT_SIGN_MASK))
+				return false;
+
+			const size_t positive = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (positive == static_cast<size_t>(-1))
+				return false;
+
+			if (!m_code.EmitMovImm8(HOST_TMP4, 0x10))
+				return false;
+
+			const size_t done_target = m_code.Size();
+			return m_code.PatchBranch(zero, done_target, VitaA32::Condition::EQ) &&
+				   m_code.PatchBranch(positive, done_target, VitaA32::Condition::EQ);
+		};
+
+		const auto emit_compute_div = [&]() {
+			return m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) &&
+				   m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1) &&
+				   m_code.EmitVdivF32(VFP_Q_S2, VFP_FS_S0, VFP_FT_S1) &&
+				   m_code.EmitVmovSToCore(HOST_TMP0, VFP_Q_S2) &&
+				   emit_normalize_vu_float_word(HOST_TMP0);
+		};
+
+		const auto emit_compute_sqrt_abs_ft = [&]() {
+			return emit_abs_word(HOST_TMP1, HOST_TMP1) &&
+				   m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1) &&
+				   m_code.EmitVsqrtF32(VFP_Q_S2, VFP_FT_S1) &&
+				   m_code.EmitVmovSToCore(HOST_TMP0, VFP_Q_S2) &&
+				   emit_normalize_vu_float_word(HOST_TMP0);
+		};
+
+		const auto emit_store_q_and_status = [&]() {
+			if (!EmitVu0RegisterAddress(HOST_TMP1, VU0_Q_OFFSET) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_TMP1, 0) ||
+				!EmitVu0ViAddress(HOST_TMP1, VU0_REG_Q) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_TMP1, 0) ||
+				!EmitVu0RegisterAddress(HOST_TMP1, VU0_STATUSFLAG_OFFSET) ||
+				!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, 0) ||
+				!EmitBicImm32OrReg(HOST_TMP2, HOST_TMP2, 0x30u, HOST_TMP5) ||
+				!m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+				!m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, 0) ||
+				!EmitVu0ViAddress(HOST_TMP1, VU0_REG_STATUS_FLAG) ||
+				!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, 0) ||
+				!EmitBicImm32OrReg(HOST_TMP2, HOST_TMP2, 0x0c30u, HOST_TMP5) ||
+				!m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+				!m_code.EmitOrrRegShiftImm(HOST_TMP2, HOST_TMP2, HOST_TMP4, VitaA32::ShiftType::LSL, 6) ||
+				!m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, 0))
+			{
+				return false;
+			}
+			return true;
+		};
+
+		if (!m_code.EmitMovImm8(HOST_TMP4, 0))
+			return false;
+
+		switch (fdiv.kind)
+		{
+			case Cop2MacroFdivKind::Div:
+			{
+				if (!emit_load_vf_lane(HOST_TMP0, fs, fsf) ||
+					!emit_normalize_vu_float_word(HOST_TMP0) ||
+					!emit_load_vf_lane(HOST_TMP1, ft, ftf) ||
+					!emit_normalize_vu_float_word(HOST_TMP1) ||
+					!emit_abs_word(HOST_TMP3, HOST_TMP1) ||
+					!m_code.EmitCmpImm32(HOST_TMP3, 0))
+				{
+					return false;
+				}
+
+				const size_t divisor_nonzero = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+				if (divisor_nonzero == static_cast<size_t>(-1))
+					return false;
+
+				if (!emit_abs_word(HOST_TMP3, HOST_TMP0) ||
+					!m_code.EmitMovImm8(HOST_TMP4, 0x20) ||
+					!m_code.EmitCmpImm32(HOST_TMP3, 0) ||
+					!m_code.EmitMovImm8(HOST_TMP4, 0x10, VitaA32::Condition::EQ) ||
+					!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) ||
+					!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP5) ||
+					!EmitOrrImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_MAX_FINITE, HOST_TMP5))
+				{
+					return false;
+				}
+
+				const size_t done_from_zero = m_code.EmitBranchPlaceholder();
+				if (done_from_zero == static_cast<size_t>(-1))
+					return false;
+
+				const size_t divisor_nonzero_target = m_code.Size();
+				if (!m_code.PatchBranch(divisor_nonzero, divisor_nonzero_target, VitaA32::Condition::NE) ||
+					!emit_compute_div())
+				{
+					return false;
+				}
+
+				return m_code.PatchBranch(done_from_zero, m_code.Size()) &&
+					   emit_store_q_and_status();
+			}
+
+			case Cop2MacroFdivKind::Sqrt:
+				if (!emit_load_vf_lane(HOST_TMP1, ft, ftf) ||
+					!emit_normalize_vu_float_word(HOST_TMP1) ||
+					!emit_set_invalid_if_negative_nonzero(HOST_TMP1) ||
+					!emit_compute_sqrt_abs_ft())
+				{
+					return false;
+				}
+				return emit_store_q_and_status();
+
+			case Cop2MacroFdivKind::Rsqrt:
+			{
+				if (!emit_load_vf_lane(HOST_TMP0, fs, fsf) ||
+					!emit_normalize_vu_float_word(HOST_TMP0) ||
+					!emit_load_vf_lane(HOST_TMP1, ft, ftf) ||
+					!emit_normalize_vu_float_word(HOST_TMP1) ||
+					!emit_abs_word(HOST_TMP3, HOST_TMP1) ||
+					!m_code.EmitCmpImm32(HOST_TMP3, 0))
+				{
+					return false;
+				}
+
+				const size_t ft_nonzero = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+				if (ft_nonzero == static_cast<size_t>(-1))
+					return false;
+
+				if (!emit_abs_word(HOST_TMP3, HOST_TMP0) ||
+					!m_code.EmitMovImm8(HOST_TMP4, 0x20) ||
+					!m_code.EmitCmpImm32(HOST_TMP3, 0))
+				{
+					return false;
+				}
+
+				const size_t fs_nonzero = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+				if (fs_nonzero == static_cast<size_t>(-1))
+					return false;
+
+				if (!m_code.EmitMovImm8(HOST_TMP4, 0x30) ||
+					!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) ||
+					!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP5))
+				{
+					return false;
+				}
+
+				const size_t done_from_zero_zero = m_code.EmitBranchPlaceholder();
+				if (done_from_zero_zero == static_cast<size_t>(-1))
+					return false;
+
+				const size_t fs_nonzero_target = m_code.Size();
+				if (!m_code.PatchBranch(fs_nonzero, fs_nonzero_target, VitaA32::Condition::NE) ||
+					!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) ||
+					!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP5) ||
+					!EmitOrrImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_MAX_FINITE, HOST_TMP5))
+				{
+					return false;
+				}
+
+				const size_t done_from_zero = m_code.EmitBranchPlaceholder();
+				if (done_from_zero == static_cast<size_t>(-1))
+					return false;
+
+				const size_t ft_nonzero_target = m_code.Size();
+				if (!m_code.PatchBranch(ft_nonzero, ft_nonzero_target, VitaA32::Condition::NE) ||
+					!emit_set_invalid_if_negative_nonzero(HOST_TMP1) ||
+					!emit_abs_word(HOST_TMP1, HOST_TMP1) ||
+					!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
+					!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1) ||
+					!m_code.EmitVsqrtF32(VFP_FT_S1, VFP_FT_S1) ||
+					!m_code.EmitVdivF32(VFP_Q_S2, VFP_FS_S0, VFP_FT_S1) ||
+					!m_code.EmitVmovSToCore(HOST_TMP0, VFP_Q_S2) ||
+					!emit_normalize_vu_float_word(HOST_TMP0))
+				{
+					return false;
+				}
+
+				const size_t done_target = m_code.Size();
+				return m_code.PatchBranch(done_from_zero_zero, done_target) &&
+					   m_code.PatchBranch(done_from_zero, done_target) &&
+					   emit_store_q_and_status();
+			}
+		}
+
+		return false;
 	}
 
 	bool BlockCompiler::EmitCOP2MacroMoveBody(u32 op)
