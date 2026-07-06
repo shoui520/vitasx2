@@ -5,6 +5,13 @@
 
 static const int FIFO_SIF_W = 128;
 
+#if defined(VITASX2_QEMU_VALIDATION)
+extern u32 g_qemuSifFifoContiguousWrites;
+extern u32 g_qemuSifFifoContiguousReads;
+extern u32 g_qemuSifFifoWrappedWrites;
+extern u32 g_qemuSifFifoWrappedReads;
+#endif
+
 // Despite its name, this is actually the IOP's DMAtag, which itself also contains
 // the EE's DMAtag in its upper 64 bits.  Note that only the lower 24 bits of 'data' is
 // the IOP's chain transfer address (loaded into MADR).  Bits 30 and 31 are transfer stop
@@ -38,11 +45,25 @@ struct sifFifo
 			if ((FIFO_SIF_W - size) < words)
 				DevCon.Warning("Not enough space in SIF0 FIFO!\n");
 
-			const int wP0 = std::min((FIFO_SIF_W - writePos), words);
-			const int wP1 = words - wP0;
+			const int contiguous = FIFO_SIF_W - writePos;
+			if (words <= contiguous)
+			{
+				memcpy(&data[writePos], from, words << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuSifFifoContiguousWrites;
+#endif
+			}
+			else
+			{
+				const int wP0 = contiguous;
+				const int wP1 = words - wP0;
 
-			memcpy(&data[writePos], from, wP0 << 2);
-			memcpy(&data[0], &from[wP0], wP1 << 2);
+				memcpy(&data[writePos], from, wP0 << 2);
+				memcpy(&data[0], &from[wP0], wP1 << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuSifFifoWrappedWrites;
+#endif
+			}
 
 			writePos = (writePos + words) & (FIFO_SIF_W - 1);
 			size += words;
@@ -116,11 +137,25 @@ struct sifFifo
 	{
 		if (words > 0)
 		{
-			const int wP0 = std::min((FIFO_SIF_W - readPos), words);
-			const int wP1 = words - wP0;
+			const int contiguous = FIFO_SIF_W - readPos;
+			if (words <= contiguous)
+			{
+				memcpy(to, &data[readPos], words << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuSifFifoContiguousReads;
+#endif
+			}
+			else
+			{
+				const int wP0 = contiguous;
+				const int wP1 = words - wP0;
 
-			memcpy(to, &data[readPos], wP0 << 2);
-			memcpy(&to[wP0], &data[0], wP1 << 2);
+				memcpy(to, &data[readPos], wP0 << 2);
+				memcpy(&to[wP0], &data[0], wP1 << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuSifFifoWrappedReads;
+#endif
+			}
 
 			readPos = (readPos + words) & (FIFO_SIF_W - 1);
 			size -= words;

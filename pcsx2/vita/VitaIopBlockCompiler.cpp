@@ -33,6 +33,7 @@ namespace
 	constexpr u16 REG_R11 = 1u << 11;
 	constexpr u16 REG_LR = 1u << 14;
 	constexpr u16 REG_PC = 1u << 15;
+	constexpr unsigned HOST_SP = 13;
 
 	constexpr unsigned HOST_TMP0 = 0;
 	constexpr unsigned HOST_TMP1 = 1;
@@ -68,6 +69,7 @@ namespace
 	constexpr size_t IOP_NEXT_EVENT_CYCLE_OFFSET = offsetof(psxRegisters, iopNextEventCycle);
 	constexpr size_t IOP_NEXT_EVENT_CYCLE_FROM_CYCLE_OFFSET = IOP_NEXT_EVENT_CYCLE_OFFSET - CYCLE_OFFSET;
 	constexpr size_t IOP_CYCLE_EE_OFFSET = offsetof(psxRegisters, iopCycleEE);
+	constexpr size_t IOP_CYCLE_EE_CARRY_OFFSET = offsetof(psxRegisters, iopCycleEECarry);
 	constexpr u32 IOP_WAIT_CYCLES = 384;
 
 	constexpr unsigned RS(u32 op)
@@ -527,6 +529,7 @@ namespace
 	static_assert(IOP_NEXT_EVENT_CYCLE_FROM_CYCLE_OFFSET <= 0xff);
 	static_assert((IOP_NEXT_EVENT_CYCLE_FROM_CYCLE_OFFSET % alignof(u64)) == 0);
 	static_assert(IOP_CYCLE_EE_OFFSET <= 4095);
+	static_assert(IOP_CYCLE_EE_CARRY_OFFSET <= 4095);
 	static_assert(GprOffset(33) + sizeof(u32) <= 4095);
 	static_assert(HI_OFFSET + sizeof(u32) <= 4095);
 	static_assert(LO_OFFSET + sizeof(u32) <= 4095);
@@ -665,8 +668,14 @@ namespace VitaIOP
 		else if (m_iop_cycle_base_register_available)
 			m_saved_registers |= REG_R10;
 
+		const u16 pushed_registers = m_saved_registers | REG_LR;
+		const u32 pushed_count = static_cast<u32>(__builtin_popcount(static_cast<unsigned>(pushed_registers)));
+		m_stack_frame_size = (pushed_count & 1u) ? 4 : 8;
 		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
-			!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
+			!m_code.EmitSubImm8(HOST_SP, HOST_SP, m_stack_frame_size) ||
+			!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))) ||
+			!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_SP, 0))
 		{
 			return false;
 		}
@@ -679,9 +688,13 @@ namespace VitaIOP
 				   m_code.EmitMovImm32(HOST_IOP_RAM_BASE, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))));
 	}
 
-	bool BlockCompiler::EndBlockReturn(BlockExitKind exit)
+	bool BlockCompiler::EndBlockReturn(BlockExitKind exit, bool charge_budget)
 	{
+		if (charge_budget && !EmitChargeEeBudget())
+			return false;
+
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
+			   m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size) &&
 			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
@@ -690,8 +703,12 @@ namespace VitaIOP
 		if (!direct_exit)
 			return false;
 
-		if (!m_code.EmitPop(m_saved_registers | REG_LR))
+		if (!EmitChargeEeBudget() ||
+			!m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size) ||
+			!m_code.EmitPop(m_saved_registers | REG_LR))
+		{
 			return false;
+		}
 
 		const size_t target_offset = m_code.Size();
 		if (!m_code.EmitMovImm32Patchable(HOST_CALL_SCRATCH, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
@@ -791,6 +808,91 @@ namespace VitaIOP
 	bool BlockCompiler::EmitIncrementCycle()
 	{
 		return EmitAddCycles(1);
+	}
+
+	bool BlockCompiler::EmitChargeEeBudgetPs1()
+	{
+		// PCSX2 owner: x86/iR3000A.cpp::iPsxAddEECycles(), PS1 clock mode.
+		// Blocks are bounded to 64 IOP instructions, so t = delta * 1280 + carry
+		// is <= 82066.  floor(t / 147) is exact as high32(t * 0x01bdd2b9)
+		// for that range, and the remainder is reconstructed as t - q * 147.
+		return
+			m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::LSL, 10) &&
+			m_code.EmitAddRegShiftImm(HOST_TMP1, HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::LSL, 8) &&
+			m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_CARRY_OFFSET)) &&
+			m_code.EmitAddReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
+			m_code.EmitMovImm32(HOST_TMP2, 0x01bdd2b9u) &&
+			m_code.EmitUmull(HOST_TMP0, HOST_TMP3, HOST_TMP1, HOST_TMP2) &&
+			m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP3, VitaA32::ShiftType::LSL, 7) &&
+			m_code.EmitAddRegShiftImm(HOST_TMP2, HOST_TMP2, HOST_TMP3, VitaA32::ShiftType::LSL, 4) &&
+			m_code.EmitAddRegShiftImm(HOST_TMP2, HOST_TMP2, HOST_TMP3, VitaA32::ShiftType::LSL, 1) &&
+			m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP3) &&
+			m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
+			m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_CARRY_OFFSET)) &&
+			m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET)) &&
+			m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP3, true) &&
+			m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET));
+	}
+
+	bool BlockCompiler::EmitChargeEeBudget()
+	{
+		if (!m_direct_exit_branches)
+			return false;
+
+		const auto emit_budget_exit_from_signed_flags = [this]() {
+			if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+				!m_code.EmitMovImm8(HOST_TMP3, 1, VitaA32::Condition::LE) ||
+				!m_code.EmitCmpImm32(HOST_TMP3, 0))
+			{
+				return false;
+			}
+
+			m_direct_exit_branches->push_back(m_code.EmitBranchPlaceholder(VitaA32::Condition::NE));
+			return true;
+		};
+
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_SP, 0) ||
+			!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP1))
+		{
+			return false;
+		}
+
+		if (!m_code.EmitMovImm32(HOST_TMP2,
+				static_cast<u32>(reinterpret_cast<uptr>(&iopHw[HW_ICFG & 0xffff]))) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP2, 0) ||
+			!m_code.EmitTstImm32(HOST_TMP1, 1u << 3))
+		{
+			return false;
+		}
+
+		const size_t ps1_clock_mode = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (ps1_clock_mode == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 3) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP2, true) ||
+			!m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET)) ||
+			!emit_budget_exit_from_signed_flags())
+		{
+			return false;
+		}
+
+		const size_t done = m_code.EmitBranchPlaceholder();
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t ps1_clock_mode_target = m_code.Size();
+		if (!m_code.PatchBranch(ps1_clock_mode, ps1_clock_mode_target, VitaA32::Condition::NE) ||
+			!EmitChargeEeBudgetPs1() ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
+			!emit_budget_exit_from_signed_flags())
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(done, m_code.Size());
 	}
 
 	bool BlockCompiler::EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches)
@@ -2889,6 +2991,7 @@ namespace VitaIOP
 			return false;
 
 		std::vector<size_t> direct_exit_branches;
+		m_direct_exit_branches = &direct_exit_branches;
 		direct_exit_branches.reserve(instruction_count * 2);
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
@@ -2999,7 +3102,7 @@ namespace VitaIOP
 			}
 
 			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct))
+			if (!EndBlockReturn(BlockExitKind::Direct, false))
 				return false;
 		}
 		else if (has_native_static_jump)
@@ -3027,7 +3130,7 @@ namespace VitaIOP
 			}
 
 			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct))
+			if (!EndBlockReturn(BlockExitKind::Direct, false))
 				return false;
 		}
 		else if (has_native_register_jump)
@@ -3041,7 +3144,7 @@ namespace VitaIOP
 			}
 
 			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct))
+			if (!EndBlockReturn(BlockExitKind::Direct, false))
 				return false;
 		}
 		else if (emit_link_tail)
@@ -3055,13 +3158,13 @@ namespace VitaIOP
 			direct_links->slots[0].valid = true;
 
 			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct))
+			if (!EndBlockReturn(BlockExitKind::Direct, false))
 				return false;
 		}
 		else
 		{
 			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct))
+			if (!EndBlockReturn(BlockExitKind::Direct, false))
 				return false;
 		}
 
@@ -3074,6 +3177,7 @@ namespace VitaIOP
 				return false;
 		}
 
+		m_direct_exit_branches = nullptr;
 		return true;
 	}
 
@@ -3523,6 +3627,19 @@ namespace VitaIOP
 				// first word of the next guest page.
 				add_instruction(pc);
 				add_instruction(delay_pc);
+				if (IsIopStaticConditionalBranchOpcode(op) &&
+					!IsIopBranchOrJumpOpcode(delay_op) &&
+					!IsIopExceptionOpcode(delay_op) &&
+					(delay_pc & 0xffcu) != 0)
+				{
+					// PCSX2 owner: R3000AInterpreter.cpp::intExecuteBlock()
+					// keeps running after not-taken conditional branches because
+					// branch2 is only set by doBranch(). Let the native fallthrough
+					// path continue too; taken paths still leave through
+					// psxDoBranch(), which executes the delay slot and iopEventTest().
+					i++;
+					continue;
+				}
 				return true;
 			}
 
@@ -3912,5 +4029,44 @@ namespace VitaIOP
 		result->cache_hit = false;
 		result->lookup_hit = false;
 		return RunCachedBlock(*block, result);
+	}
+
+	bool BlockExecutor::ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result)
+	{
+		if (!result || (start_pc & 0x3u) != 0)
+			return false;
+
+		*result = {};
+
+		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_() looks up the
+		// translated BaseBlock by guest PC before doing any decode work. Keep
+		// the Vita IOP hot path on the same shape: validate the cached opcode
+		// bytes, run the block immediately, and only scan on misses or SMC.
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		{
+			if (entry->valid && ValidateCachedBlock(*entry))
+			{
+				result->cache_hit = true;
+				result->lookup_hit = true;
+				result->fast_dispatch_hit = true;
+				return RunCachedBlock(*entry, result);
+			}
+		}
+
+		if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, 0, false))
+		{
+			result->cache_hit = true;
+			result->fast_dispatch_hit = true;
+			return RunCachedBlock(*entry, result);
+		}
+
+		BlockScanResult scan;
+		if (!ScanStraightLineBlock(start_pc, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
+			scan.instruction_count == 0)
+		{
+			return false;
+		}
+
+		return ExecuteCompiledBlock(start_pc, scan.instruction_count, result);
 	}
 } // namespace VitaIOP

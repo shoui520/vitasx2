@@ -197,11 +197,15 @@ namespace VitaEE
 		bool EmitCOP1ConvertWordFast(u32 op);
 		bool EmitCOP1ConvertSingleFast(u32 op);
 		bool EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
-		bool EmitCOP2VectorTransferEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
+		bool EmitCOP2IdleBranch(size_t* vu0_idle);
+		bool EmitCOP2VectorTransferBody(u32 op);
+		bool EmitCOP2ControlReadBody(u32 op);
+		bool EmitCOP2ControlWriteBody(u32 op);
+		bool EmitCOP2VectorTransferFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
-		bool EmitCOP2ControlReadEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
+		bool EmitCOP2ControlReadFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
-		bool EmitCOP2ControlWriteEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
+		bool EmitCOP2ControlWriteFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
 		bool EmitCACHE(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitSpecialExceptionEventExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -449,8 +453,10 @@ namespace VitaEE
 		bool EmitCop0Branch(u32 op);
 		bool EmitCop1Branch(u32 op);
 		bool EmitCop2Branch(u32 op);
-		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare);
-		bool EmitSetLessThan64Imm(unsigned guest_reg, s32 imm, bool signed_compare);
+		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare, unsigned lhs_low,
+			unsigned lhs_high, unsigned rhs_low, unsigned rhs_high);
+		bool EmitSetLessThan64Imm(unsigned guest_reg, s32 imm, bool signed_compare,
+			unsigned lhs_low, unsigned lhs_high);
 		bool EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,
 			bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask, bool counter_read_event);
@@ -465,9 +471,16 @@ namespace VitaEE
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
 		bool FlushColdTails();
-		void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r10, bool allow_r11);
+		void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
+			bool allow_r10, bool allow_r11);
 		bool EmitGprPinLoads();
 		int FindGprPinHost(unsigned guest_reg) const;
+		int FindGprPinHighHost(unsigned guest_reg) const;
+		void ClearGprQCache();
+		void InvalidateGprQCacheForGuest(unsigned guest_reg);
+		void InvalidateGprQCacheForQreg(unsigned qreg);
+		void MarkGprQCache(unsigned guest_reg, unsigned qreg);
+		int FindGprQCache(unsigned guest_reg) const;
 		bool EmitDeviceTracePreInstruction(u32 pc);
 		bool EmitLoadCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
 		bool EmitStoreCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
@@ -491,14 +504,27 @@ namespace VitaEE
 		bool EmitVtlbNonHandlerHostAddress128(unsigned host_reg, unsigned vmap_reg, unsigned scratch_reg,
 			size_t* handler_fallback_branch);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
+		bool EmitLoadGprLowRawZero(unsigned guest_reg, unsigned host_reg);
 		bool EmitGprLowOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host);
+		bool EmitRefreshGprPinFromBacking(unsigned guest_reg);
+		bool TryEmitLoadGprWordFromQCache(unsigned guest_reg, unsigned word, unsigned host_reg,
+			bool* emitted);
+		bool EmitLoadGprWord(unsigned guest_reg, unsigned word, unsigned host_reg);
+		bool EmitGprWordOperand(unsigned guest_reg, unsigned word, unsigned fallback_host,
+			unsigned* operand_host);
 		bool EmitGpr64OperandLow(unsigned guest_reg, unsigned fallback_low, unsigned host_high,
 			unsigned* low_operand_host);
 		bool EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
+		bool EmitLoadGprQ128(unsigned guest_reg, unsigned qreg, unsigned address_scratch);
 		bool EmitStorePcFromHostReg(unsigned host_reg);
 		bool EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc);
 		bool EmitStorePc(u32 pc);
+		bool EmitStoreGprQ128(unsigned guest_reg, unsigned qreg, unsigned address_scratch);
+		bool EmitStoreGprQ128ToAddress(unsigned guest_reg, unsigned qreg, unsigned address_reg);
+		bool EmitStoreGprDwordPair(unsigned guest_reg, unsigned low_d, unsigned high_d);
+		bool EmitStoreGprWord(unsigned guest_reg, unsigned word, unsigned host_reg);
+		bool EmitStoreGprLowPreserveHigh(unsigned guest_reg, unsigned host_low);
 		bool EmitStoreGprZero64(unsigned guest_reg);
 		bool EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 
@@ -559,8 +585,8 @@ namespace VitaEE
 			size_t unaligned_fallback = static_cast<size_t>(-1);
 			size_t handler_fallback = static_cast<size_t>(-1);
 			size_t join_offset = 0;
-			const void* helper = nullptr;
 			unsigned rt = 0;
+			bool store = false;
 		};
 		bool EmitCop1WordMemoryColdTail(const Cop1WordMemoryColdTail& tail);
 
@@ -604,14 +630,22 @@ namespace VitaEE
 		bool m_vtlb_registers_available = false;
 		bool m_cop1_exponent_mask_available = false;
 		bool m_vu0_base_available = false;
+		static constexpr unsigned MAX_GPR_PINS = 5;
 		// Write-through read pins: guest GPR low words held in callee-saved host
-		// registers for the whole block. Memory stays authoritative, so pins only
+		// registers for the whole block, optionally with a companion high word
+		// for hot low64 scalar state. Memory stays authoritative, so pins only
 		// exist for guest registers whose writes all go through the GPR store seam.
-		u8 m_staged_pin_guest[3]{};
-		u8 m_staged_pin_host[3]{};
+		u8 m_staged_pin_guest[MAX_GPR_PINS]{};
+		u8 m_staged_pin_host[MAX_GPR_PINS]{};
+		u8 m_staged_pin_high_host[MAX_GPR_PINS]{};
 		u8 m_staged_pin_count = 0;
-		u8 m_pin_guest[3]{};
-		u8 m_pin_host[3]{};
+		u8 m_pin_guest[MAX_GPR_PINS]{};
+		u8 m_pin_host[MAX_GPR_PINS]{};
+		u8 m_pin_high_host[MAX_GPR_PINS]{};
 		u8 m_pin_count = 0;
+		bool m_gpr_q_cache_enabled = false;
+		u8 m_gpr_q_cache_guest[4]{};
+		u8 m_gpr_q_cache_qreg[4]{};
+		u8 m_gpr_q_cache_count = 0;
 		};
 	} // namespace VitaEE

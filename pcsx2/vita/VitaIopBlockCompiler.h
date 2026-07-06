@@ -41,6 +41,7 @@ namespace VitaIOP
 		size_t code_cache_capacity = 0;
 		bool cache_hit = false;
 		bool lookup_hit = false;
+		bool fast_dispatch_hit = false;
 	};
 
 	struct DirectLinkSlot
@@ -69,7 +70,7 @@ namespace VitaIOP
 
 	private:
 		bool BeginBlock();
-		bool EndBlockReturn(BlockExitKind exit);
+		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true);
 		bool EndBlockDirectTail(const void* direct_exit, size_t* direct_link_target_offset);
 		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
@@ -82,6 +83,8 @@ namespace VitaIOP
 		bool EmitStorePcReg(unsigned host_reg);
 		bool EmitAddCycles(u32 cycles);
 		bool EmitIncrementCycle();
+		bool EmitChargeEeBudget();
+		bool EmitChargeEeBudgetPs1();
 		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches);
 		bool EmitLoadGpr(unsigned guest_reg, unsigned host_reg);
@@ -185,6 +188,8 @@ namespace VitaIOP
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
 		u16 m_saved_registers = 0;
+		u8 m_stack_frame_size = 0;
+		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_cycle_base_register_available = false;
 		bool m_defer_cycle_updates = false;
@@ -207,6 +212,7 @@ namespace VitaIOP
 		void SetDirectLinkingEnabled(bool enabled);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result);
+		bool ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result);
 
 	private:
 		// PCSX2 owner: x86/BaseblockEx.h::BaseBlocks() starts at 0x4000

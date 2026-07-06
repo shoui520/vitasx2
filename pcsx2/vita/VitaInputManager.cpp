@@ -17,7 +17,6 @@
 
 namespace
 {
-#if defined(VITASX2_QEMU_VALIDATION)
 	struct VitaPadSnapshot
 	{
 		u32 buttons = 0;
@@ -25,9 +24,18 @@ namespace
 		u8 ly = Pad::ANALOG_NEUTRAL_POSITION;
 		u8 rx = Pad::ANALOG_NEUTRAL_POSITION;
 		u8 ry = Pad::ANALOG_NEUTRAL_POSITION;
+
+		bool operator==(const VitaPadSnapshot&) const = default;
 	};
 
+	VitaPadSnapshot s_last_applied_snapshot;
+	PadBase* s_last_applied_pad = nullptr;
+	bool s_last_applied_snapshot_valid = false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
 	VitaPadSnapshot s_qemu_snapshot;
+	u32 s_qemu_applied_snapshots = 0;
+	u32 s_qemu_skipped_snapshots = 0;
 #else
 	bool s_ctrl_initialized = false;
 #endif
@@ -46,7 +54,26 @@ namespace
 	{
 		PadBase* pad = Pad::GetPad(0);
 		if (!pad || pad->GetType() != Pad::ControllerType::DualShock2)
+		{
+			InputManager::InvalidateVitaPadStateCache();
 			return;
+		}
+
+		const VitaPadSnapshot snapshot = {buttons, lx, ly, rx, ry};
+		if (s_last_applied_snapshot_valid && s_last_applied_pad == pad && s_last_applied_snapshot == snapshot)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			s_qemu_skipped_snapshots++;
+#endif
+			return;
+		}
+
+		s_last_applied_snapshot = snapshot;
+		s_last_applied_pad = pad;
+		s_last_applied_snapshot_valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemu_applied_snapshots++;
+#endif
 
 		pad->SetRawAnalogs({lx, ly}, {rx, ry});
 
@@ -179,6 +206,7 @@ void InputManager::ReloadSources(const SettingsInterface& si, std::unique_lock<s
 {
 	(void)si;
 	(void)settings_lock;
+	InvalidateVitaPadStateCache();
 #if !defined(VITASX2_QEMU_VALIDATION)
 	s_ctrl_initialized = false;
 	EnsureCtrlInitialized();
@@ -197,7 +225,15 @@ void InputManager::ReloadBindings(const SettingsInterface& si, const SettingsInt
 
 void InputManager::CloseSources()
 {
+	InvalidateVitaPadStateCache();
 	PauseVibration();
+}
+
+void InputManager::InvalidateVitaPadStateCache()
+{
+	s_last_applied_snapshot = {};
+	s_last_applied_pad = nullptr;
+	s_last_applied_snapshot_valid = false;
 }
 
 void InputManager::PollSources()
@@ -244,5 +280,21 @@ void InputManager::SetPadVibrationIntensity(u32 pad, float large_or_single_motor
 void InputManager::SetVitaPadSnapshotForTesting(u32 buttons, u8 lx, u8 ly, u8 rx, u8 ry)
 {
 	s_qemu_snapshot = {buttons, lx, ly, rx, ry};
+}
+
+void InputManager::ResetVitaPadFastPathCountersForTesting()
+{
+	s_qemu_applied_snapshots = 0;
+	s_qemu_skipped_snapshots = 0;
+}
+
+u32 InputManager::GetVitaPadAppliedSnapshotsForTesting()
+{
+	return s_qemu_applied_snapshots;
+}
+
+u32 InputManager::GetVitaPadSkippedSnapshotsForTesting()
+{
+	return s_qemu_skipped_snapshots;
 }
 #endif

@@ -3,8 +3,12 @@
 
 #include "CDVD/CDVD.h"
 #include "Config.h"
+#include "DebugTools/EeTrace.h"
 #include "DebugTools/GsTrace.h"
+#include "DebugTools/IopTrace.h"
 #include "DebugTools/IpuTrace.h"
+#include "DebugTools/MemTrace.h"
+#include "DebugTools/SifTrace.h"
 #include "DebugTools/Spu2Trace.h"
 #include "DebugTools/VifTrace.h"
 #include "DebugTools/VuTrace.h"
@@ -225,8 +229,15 @@ namespace VMManager
 			if (s_elf_executed)
 				return;
 
+			// PCSX2 owner: Interpreter.cpp::intExecute() notifies every
+			// trace domain immediately before EntryPointCompilingOnCPUThread().
+			// Vita's VM shim owns that edge for both interpreter and A32 EE/IOP.
+			Pcsx2Trace::NotifyEeElfEntry(s_elf_entry_point);
+			Pcsx2Trace::NotifyMemElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyGsElfEntry(s_elf_entry_point);
+			Pcsx2Trace::NotifyIopElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyIpuElfEntry(s_elf_entry_point);
+			Pcsx2Trace::NotifySifElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifySpu2ElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyVifElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyVuElfEntry(s_elf_entry_point);

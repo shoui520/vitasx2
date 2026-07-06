@@ -59,10 +59,14 @@ namespace InputManager
 		const SettingsInterface& hotkey_binding_si, bool force, bool clear_existing);
 	void CloseSources();
 	void PollSources();
+	void InvalidateVitaPadStateCache();
 	void PauseVibration();
 	void SetPadVibrationIntensity(u32 pad, float large_or_single_motor, float small_motor);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	void SetVitaPadSnapshotForTesting(u32 buttons, u8 lx, u8 ly, u8 rx, u8 ry);
+	void ResetVitaPadFastPathCountersForTesting();
+	u32 GetVitaPadAppliedSnapshotsForTesting();
+	u32 GetVitaPadSkippedSnapshotsForTesting();
 #endif
 } // namespace InputManager

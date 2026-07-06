@@ -7,6 +7,7 @@
 #include "Vif_Dynarec.h"
 #include "Vif_Dma.h"
 #include "Vif_Unpack.h"
+#include "VUmicro.h"
 
 #include <cstring>
 
@@ -21,6 +22,13 @@
 u32 g_qemuVifFastVectors = 0;
 u32 g_qemuVifNeonVectors = 0;
 u32 g_qemuVifGenericVectors = 0;
+u32 g_qemuVifBurstVectors = 0;
+u32 g_qemuVifBurstWidenVectors = 0;
+u32 g_qemuVifBurstColorVectors = 0;
+u32 g_qemuVifBurstSAndV2Vectors = 0;
+u32 g_qemuVifBurstV3Vectors = 0;
+u32 g_qemuVifBurstModeMaskVectors = 0;
+u32 g_qemuVifCycleBurstVectors = 0;
 #endif
 
 namespace
@@ -559,6 +567,11 @@ namespace
 		return format == 0x08 || format == 0x09 || format == 0x0a;
 	}
 
+	bool VitaVifIsSOrV2Format(u32 format)
+	{
+		return format <= 0x02 || (format >= 0x04 && format <= 0x06);
+	}
+
 	u32 VitaVifGeneratedAlignment(const vifStruct& vif, u32 format)
 	{
 		// PCSX2 owner: x86/Vif_Dynarec.cpp::dVifUnpack(). The generated
@@ -955,6 +968,386 @@ namespace
 	}
 
 	template <int idx>
+	bool VitaVifTryFastSAndV2Burst(const u8* data, bool isFill)
+	{
+		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_S() and UNPACK_V2(). This path
+		// keeps only the contiguous no-mode/no-mask case; MODE, row/col masks,
+		// fill, skip, and VU-memory wrap stay on the per-vector path.
+		vifStruct& vif = GetVifX;
+		VIFregisters& regs = vifXRegs;
+		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
+		const u32 format = upk_num & 0x0f;
+		const u32 wl = regs.cycle.wl;
+		if (isFill || (upk_num & 0x10) != 0 || !VitaVifIsSOrV2Format(format) ||
+			(regs.mode & 0x3) != 0 || regs.cycle.cl != wl || wl == 0 ||
+			vif.cl != 0 || regs.num == 0)
+		{
+			return false;
+		}
+
+		const u32 count = regs.num;
+		const u32 bytes = count * 16;
+		const u32 vu_mem_size = idx ? VU1_MEMSIZE : VU0_MEMSIZE;
+		const u32 vu_mem_offset = vif.tag.addr & (idx ? 0x3ff0u : 0xff0u);
+		if (vu_mem_offset + bytes > vu_mem_size)
+			return false;
+
+		const u32 vsize = nVifT[format];
+		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
+		for (u32 i = 0; i < count; i++)
+		{
+			if (!VitaVifStorePlainUnmaskedVector(dest + i * 16, data + i * vsize, format, vif.usn != 0))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+			++g_qemuVifBurstVectors;
+			++g_qemuVifBurstSAndV2Vectors;
+#endif
+		}
+
+		vif.tag.addr += bytes;
+		vif.cl = static_cast<u8>(count % wl);
+		regs.num = 0;
+		return true;
+	}
+
+	template <int idx>
+	bool VitaVifTryFastV3Burst(const u8* data, bool isFill)
+	{
+		// PCSX2 owners: x86/Vif_Dynarec.cpp::ModUnpack() and
+		// x86/Vif_UnpackSSE.cpp::xUPK_V3_*(). Generated V3 has alignment-based
+		// W-lane zeroing, so only the contiguous no-mode/no-mask case is hoisted.
+		vifStruct& vif = GetVifX;
+		VIFregisters& regs = vifXRegs;
+		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
+		const u32 format = upk_num & 0x0f;
+		const u32 wl = regs.cycle.wl;
+		if (isFill || (upk_num & 0x10) != 0 || !VitaVifIsV3Format(format) ||
+			(regs.mode & 0x3) != 0 || regs.cycle.cl != wl || wl == 0 ||
+			vif.cl != 0 || regs.num == 0)
+		{
+			return false;
+		}
+
+		const u32 count = regs.num;
+		const u32 bytes = count * 16;
+		const u32 vu_mem_size = idx ? VU1_MEMSIZE : VU0_MEMSIZE;
+		const u32 vu_mem_offset = vif.tag.addr & (idx ? 0x3ff0u : 0xff0u);
+		if (vu_mem_offset + bytes > vu_mem_size)
+			return false;
+
+		const u32 vsize = nVifT[format];
+		const u32 generated_alignment = VitaVifGeneratedAlignment(vif, format);
+		u32 generated_iteration = 0;
+		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
+		for (u32 i = 0; i < count; i++)
+		{
+			u32 vector_iteration = generated_iteration;
+			if (format == 0x09 || format == 0x0a)
+				vector_iteration = ++generated_iteration;
+
+			if (!VitaVifUnpackVector(
+					vif, regs, dest + i * 16, data + i * vsize, format, 0, vif.usn != 0, false,
+					vector_iteration, generated_alignment))
+			{
+				return false;
+			}
+
+			if (format == 0x08)
+				generated_iteration = (generated_iteration + 1) & 0x1u;
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+			++g_qemuVifBurstVectors;
+			++g_qemuVifBurstV3Vectors;
+#endif
+		}
+
+		vif.tag.addr += bytes;
+		vif.cl = static_cast<u8>(count % wl);
+		regs.num = 0;
+		return true;
+	}
+
+	template <int idx>
+	bool VitaVifTryFastV4Burst(const u8* data, bool isFill)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4(). This is the contiguous
+		// no-mask/no-mode V4 case; row/col, fill, skip, and VU-memory wrap
+		// cases stay on the generic fast vector path below.
+		vifStruct& vif = GetVifX;
+		VIFregisters& regs = vifXRegs;
+		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
+		const u32 format = upk_num & 0x0f;
+		const u32 wl = regs.cycle.wl;
+		if (isFill || (upk_num & 0x10) != 0 ||
+			(format != 0x0c && format != 0x0d && format != 0x0e) ||
+			(regs.mode & 0x3) != 0 || regs.cycle.cl != wl || wl == 0 ||
+			vif.cl != 0 || regs.num == 0)
+		{
+			return false;
+		}
+
+		const u32 count = regs.num;
+		const u32 bytes = count * 16;
+		const u32 vu_mem_size = idx ? VU1_MEMSIZE : VU0_MEMSIZE;
+		const u32 vu_mem_offset = vif.tag.addr & (idx ? 0x3ff0u : 0xff0u);
+		if (vu_mem_offset + bytes > vu_mem_size)
+			return false;
+
+		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
+		for (u32 i = 0; i < count; i++)
+		{
+			switch (format)
+			{
+				case 0x0c:
+					VitaVifCopyQword(dest + i * 16, data + i * 16);
+					break;
+				case 0x0d:
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreV4_16WordsNeon(dest + i * 16, data + i * 8, vif.usn != 0);
+#else
+				{
+					u32 x, y, z, w;
+					VitaVifLoadV4_16Words(data + i * 8, vif.usn != 0, x, y, z, w);
+					VitaVifStoreWords(dest + i * 16, x, y, z, w);
+				}
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+					++g_qemuVifBurstWidenVectors;
+#endif
+					break;
+				default:
+#if VITASX2_VIF_HAS_ARM_NEON
+					VitaVifStoreV4_8WordsNeon(dest + i * 16, data + i * 4, vif.usn != 0);
+#else
+				{
+					u32 x, y, z, w;
+					VitaVifLoadV4_8Words(data + i * 4, vif.usn != 0, x, y, z, w);
+					VitaVifStoreWords(dest + i * 16, x, y, z, w);
+				}
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+					++g_qemuVifBurstWidenVectors;
+#endif
+					break;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+			++g_qemuVifBurstVectors;
+#endif
+		}
+
+		vif.tag.addr += bytes;
+		vif.cl = static_cast<u8>(count % wl);
+		regs.num = 0;
+		return true;
+	}
+
+	template <int idx>
+	bool VitaVifTryFastV4_5Burst(const u8* data, bool isFill)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4_5(). V4-5 ignores USN/MODE,
+		// but row/col mask, fill, skip, and VU-memory wrap still need the
+		// per-vector path below.
+		vifStruct& vif = GetVifX;
+		VIFregisters& regs = vifXRegs;
+		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
+		const u32 wl = regs.cycle.wl;
+		if (isFill || (upk_num & 0x10) != 0 || (upk_num & 0x0f) != 0x0f ||
+			regs.cycle.cl != wl || wl == 0 || vif.cl != 0 || regs.num == 0)
+		{
+			return false;
+		}
+
+		const u32 count = regs.num;
+		const u32 bytes = count * 16;
+		const u32 vu_mem_size = idx ? VU1_MEMSIZE : VU0_MEMSIZE;
+		const u32 vu_mem_offset = vif.tag.addr & (idx ? 0x3ff0u : 0xff0u);
+		if (vu_mem_offset + bytes > vu_mem_size)
+			return false;
+
+		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
+		for (u32 i = 0; i < count; i++)
+		{
+			VitaVifUnpackV4_5Vector(vif, regs, dest + i * 16, data + i * 2, false);
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+			++g_qemuVifBurstVectors;
+			++g_qemuVifBurstColorVectors;
+#endif
+		}
+
+		vif.tag.addr += bytes;
+		vif.cl = static_cast<u8>(count % wl);
+		regs.num = 0;
+		return true;
+	}
+
+	template <int idx>
+	bool VitaVifTryFastModeMaskBurst(const u8* data, bool isFill)
+	{
+		// PCSX2 owners: Vif_Unpack.cpp::writeXYZW(), UNPACK_S(),
+		// UNPACK_V2(), UNPACK_V4(), UNPACK_V4_5(), and generated V3 from
+		// x86/Vif_Dynarec.cpp::ModUnpack(). This keeps row/col/protect and
+		// MODE side effects per-vector while hoisting contiguous loop control.
+		vifStruct& vif = GetVifX;
+		VIFregisters& regs = vifXRegs;
+		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
+		const u32 format = upk_num & 0x0f;
+		const bool doMask = (upk_num & 0x10) != 0;
+		const u32 mode = regs.mode & 0x3;
+		const u32 wl = regs.cycle.wl;
+		if (isFill || (!doMask && mode == 0) || regs.cycle.cl != wl ||
+			wl == 0 || vif.cl != 0 || regs.num == 0)
+		{
+			return false;
+		}
+		if (nVifT[format] == 0 || (!VitaVifIsFastVectorFormat(format) && format != 0x0f))
+			return false;
+
+		const u32 count = regs.num;
+		const u32 bytes = count * 16;
+		const u32 vu_mem_size = idx ? VU1_MEMSIZE : VU0_MEMSIZE;
+		const u32 vu_mem_offset = vif.tag.addr & (idx ? 0x3ff0u : 0xff0u);
+		if (vu_mem_offset + bytes > vu_mem_size)
+			return false;
+
+		const u32 vsize = nVifT[format];
+		const u32 generated_alignment = VitaVifGeneratedAlignment(vif, format);
+		u32 generated_iteration = 0;
+		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
+		for (u32 i = 0; i < count; i++)
+		{
+			vif.cl = static_cast<u8>(i % wl);
+			if (format == 0x0f)
+			{
+				VitaVifUnpackV4_5Vector(vif, regs, dest + i * 16, data + i * vsize, doMask);
+			}
+			else
+			{
+				u32 vector_iteration = generated_iteration;
+				if (format == 0x09 || format == 0x0a)
+					vector_iteration = ++generated_iteration;
+
+				if (!VitaVifUnpackVector(
+						vif, regs, dest + i * 16, data + i * vsize, format, mode, vif.usn != 0, doMask,
+						vector_iteration, generated_alignment))
+				{
+					return false;
+				}
+
+				if (format == 0x08)
+					generated_iteration = (generated_iteration + 1) & 0x1u;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+			++g_qemuVifBurstVectors;
+			++g_qemuVifBurstModeMaskVectors;
+#endif
+		}
+
+		vif.tag.addr += bytes;
+		vif.cl = static_cast<u8>(count % wl);
+		regs.num = 0;
+		return true;
+	}
+
+	template <int idx>
+	bool VitaVifTryFastCycleBurst(const u8* data, bool isFill)
+	{
+		// PCSX2 owners: Vif_Unpack.cpp::_nVifUnpackLoop(), writeXYZW(),
+		// UNPACK_S(), UNPACK_V2(), UNPACK_V4(), UNPACK_V4_5(), and generated
+		// V3 from x86/Vif_Dynarec.cpp::ModUnpack(). This path keeps the exact
+		// per-vector unpack/write semantics, but hoists fill/skip cycle control
+		// when the destination VU memory span does not wrap.
+		vifStruct& vif = GetVifX;
+		VIFregisters& regs = vifXRegs;
+		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
+		const u32 format = upk_num & 0x0f;
+		const u32 mode = regs.mode & 0x3;
+		const bool doMask = (upk_num & 0x10) != 0;
+		const u32 wl = regs.cycle.wl ? static_cast<u32>(regs.cycle.wl) : 256u;
+		if (vif.cl != 0 || regs.num == 0 || nVifT[format] == 0 ||
+			(!VitaVifIsFastVectorFormat(format) && format != 0x0f))
+		{
+			return false;
+		}
+		if (!isFill && regs.cycle.cl == wl)
+			return false;
+
+		const u32 count = regs.num;
+		const u32 vu_mem_size = idx ? VU1_MEMSIZE : VU0_MEMSIZE;
+		const u32 vu_mem_offset = vif.tag.addr & (idx ? 0x3ff0u : 0xff0u);
+		u32 max_write_end = count * 16u;
+		if (!isFill)
+		{
+			const u32 skip_size = (static_cast<u32>(regs.cycle.cl) - wl) * 16u;
+			max_write_end += ((count - 1u) / wl) * skip_size;
+		}
+		if (vu_mem_offset + max_write_end > vu_mem_size)
+			return false;
+
+		const u32 vsize = nVifT[format];
+		const u32 generated_alignment = VitaVifGeneratedAlignment(vif, format);
+		const u32 skip_size = isFill ? 0u : (static_cast<u32>(regs.cycle.cl) - wl) * 16u;
+		u32 generated_iteration = 0;
+		u32 cycle = 0;
+		u32 dest_offset = 0;
+		u8* dest_base = vuRegs[idx].Mem + vu_mem_offset;
+		for (u32 i = 0; i < count; i++)
+		{
+			vif.cl = static_cast<u8>(cycle);
+			u32 vector_iteration = generated_iteration;
+			if (format == 0x09 || format == 0x0a)
+				vector_iteration = ++generated_iteration;
+
+			if (format == 0x0f)
+			{
+				VitaVifUnpackV4_5Vector(vif, regs, dest_base + dest_offset, data, doMask);
+			}
+			else if (!VitaVifUnpackVector(
+						 vif, regs, dest_base + dest_offset, data, format, mode, vif.usn != 0, doMask,
+						 vector_iteration, generated_alignment))
+			{
+				return false;
+			}
+
+			if (format == 0x08)
+				generated_iteration = (generated_iteration + 1) & 0x1u;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+			++g_qemuVifBurstVectors;
+			++g_qemuVifCycleBurstVectors;
+#endif
+			dest_offset += 16u;
+			--regs.num;
+			++cycle;
+
+			if (isFill)
+			{
+				if (cycle <= regs.cycle.cl)
+					data += vsize;
+				else if (cycle == wl)
+					cycle = 0;
+			}
+			else
+			{
+				data += vsize;
+				if (cycle >= wl)
+				{
+					dest_offset += skip_size;
+					cycle = 0;
+				}
+			}
+		}
+
+		vif.tag.addr += dest_offset;
+		vif.cl = static_cast<u8>(cycle);
+		return true;
+	}
+
+	template <int idx>
 	bool VitaVifTryFastPlainUnmasked(const u8* data, bool isFill)
 	{
 		vifStruct& vif = GetVifX;
@@ -1161,6 +1554,24 @@ void dVifRelease(int idx)
 template <int idx>
 void dVifUnpack(const u8* data, bool isFill)
 {
+	if (VitaVifTryFastV4Burst<idx>(data, isFill))
+		return;
+
+	if (VitaVifTryFastV4_5Burst<idx>(data, isFill))
+		return;
+
+	if (VitaVifTryFastSAndV2Burst<idx>(data, isFill))
+		return;
+
+	if (VitaVifTryFastV3Burst<idx>(data, isFill))
+		return;
+
+	if (VitaVifTryFastModeMaskBurst<idx>(data, isFill))
+		return;
+
+	if (VitaVifTryFastCycleBurst<idx>(data, isFill))
+		return;
+
 	if (VitaVifTryFastPlainUnmasked<idx>(data, isFill))
 		return;
 

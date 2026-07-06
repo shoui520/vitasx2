@@ -48,6 +48,7 @@ namespace Pad
 
 bool Pad::Initialize()
 {
+	InputManager::InvalidateVitaPadStateCache();
 	for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
 		EnsurePad(i);
 	return true;
@@ -55,6 +56,7 @@ bool Pad::Initialize()
 
 void Pad::Shutdown()
 {
+	InputManager::InvalidateVitaPadStateCache();
 	for (auto& controller : s_controllers)
 		controller.reset();
 }
@@ -66,6 +68,7 @@ Pad::ControllerType Pad::GetDefaultPadType(u32 pad)
 
 void Pad::LoadConfig(const SettingsInterface& si)
 {
+	InputManager::InvalidateVitaPadStateCache();
 	for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
 	{
 		const std::string section = GetConfigSection(i);
@@ -173,6 +176,7 @@ void Pad::SetControllerState(u32 controller, u32 bind, float value)
 	if (controller >= NUM_CONTROLLER_PORTS)
 		return;
 
+	InputManager::InvalidateVitaPadStateCache();
 	EnsurePad(static_cast<u8>(controller))->Set(bind, value);
 }
 
@@ -180,6 +184,10 @@ bool Pad::Freeze(StateWrapper& sw)
 {
 	if (!sw.DoMarker("PAD"))
 		return false;
+
+	const bool reading = sw.IsReading();
+	if (reading)
+		InputManager::InvalidateVitaPadStateCache();
 
 	for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
 	{

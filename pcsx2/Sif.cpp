@@ -7,6 +7,13 @@
 #include "Common.h"
 #include "Sif.h"
 
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuSifFifoContiguousWrites = 0;
+u32 g_qemuSifFifoContiguousReads = 0;
+u32 g_qemuSifFifoWrappedWrites = 0;
+u32 g_qemuSifFifoWrappedReads = 0;
+#endif
+
 void sifReset()
 {
 	std::memset(&sif0, 0, sizeof(sif0));

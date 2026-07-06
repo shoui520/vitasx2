@@ -84,3 +84,11 @@ extern void CounterUpdate(u32 DMAICounter);
 extern void TimeUpdate(u32 cClocks);
 extern void SPU2_FastWrite(u32 rmem, u16 value);
 
+#if defined(VITASX2_QEMU_VALIDATION)
+extern u32 g_qemuSpu2VoiceVolumeSlideUpdated;
+extern u32 g_qemuSpu2VoiceVolumeSlideSkipped;
+extern u32 g_qemuSpu2MasterVolumeSlideUpdated;
+extern u32 g_qemuSpu2MasterVolumeSlideSkipped;
+extern u32 g_qemuSpu2ZeroVoiceGateSkipped;
+extern u32 g_qemuSpu2NonzeroVoiceGateMixed;
+#endif

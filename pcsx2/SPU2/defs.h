@@ -136,6 +136,10 @@ public:
 
 	void Update();
 	void RegSet(u16 src); // used to set the volume from a register source
+	bool IsSlideActive() const
+	{
+		return Enable != 0;
+	}
 
 #ifdef PCSX2_DEVBUILD
 	void DebugDump(FILE* dump, const char* title, const char* nameLR);
@@ -161,6 +165,11 @@ public:
 	{
 		Left.Update();
 		Right.Update();
+	}
+
+	bool HasActiveSlide() const
+	{
+		return Left.IsSlideActive() || Right.IsSlideActive();
 	}
 
 #ifdef PCSX2_DEVBUILD

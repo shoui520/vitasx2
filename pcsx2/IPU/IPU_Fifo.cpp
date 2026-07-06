@@ -9,6 +9,16 @@
 
 alignas(16) IPU_Fifo ipu_fifo;
 
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuIpuFifoInputContiguousWrites = 0;
+u32 g_qemuIpuFifoInputWrappedWrites = 0;
+u32 g_qemuIpuFifoInputReads = 0;
+u32 g_qemuIpuFifoOutputContiguousWrites = 0;
+u32 g_qemuIpuFifoOutputWrappedWrites = 0;
+u32 g_qemuIpuFifoOutputContiguousReads = 0;
+u32 g_qemuIpuFifoOutputWrappedReads = 0;
+#endif
+
 void IPU_Fifo::init()
 {
 	out.readpos = 0;
@@ -65,16 +75,29 @@ int IPU_Fifo_Input::write(const u32* pMem, int size)
 	const int transfer_size = std::min(size, 8 - (int)g_BP.IFC);
 	if (!transfer_size) return 0;
 
-	const int first_words = std::min((32 - writepos), transfer_size << 2);
-	const int second_words = (transfer_size << 2) - first_words;
+	const int words = transfer_size << 2;
+	const int contiguous_words = 32 - writepos;
+	if (words <= contiguous_words)
+	{
+		memcpy(&data[writepos], pMem, words << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuFifoInputContiguousWrites;
+#endif
+	}
+	else
+	{
+		const int first_words = contiguous_words;
+		const int second_words = words - first_words;
 
-	memcpy(&data[writepos], pMem, first_words << 2);
-	pMem += first_words;
-
-	if(second_words)
+		memcpy(&data[writepos], pMem, first_words << 2);
+		pMem += first_words;
 		memcpy(&data[0], pMem, second_words << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuFifoInputWrappedWrites;
+#endif
+	}
 
-	writepos = (writepos + (transfer_size << 2)) & 31;
+	writepos = (writepos + words) & 31;
 
 	g_BP.IFC += transfer_size;
 
@@ -103,6 +126,10 @@ int IPU_Fifo_Input::read(void *value)
 
 	CopyQWC(value, &data[readpos]);
 
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuIpuFifoInputReads;
+#endif
+
 	readpos = (readpos + 4) & 31;
 	g_BP.IFC--;
 	return 1;
@@ -118,15 +145,29 @@ int IPU_Fifo_Output::write(const u32 *value, uint size)
 	Pcsx2Trace::RecordIpuOutputWrite(ipu_cmd.current, value,
 		static_cast<u32>(transfer_size << 4));
 
-	const int first_words = std::min((32 - writepos), transfer_size << 2);
-	const int second_words = (transfer_size << 2) - first_words;
+	const int words = transfer_size << 2;
+	const int contiguous_words = 32 - writepos;
+	if (words <= contiguous_words)
+	{
+		memcpy(&data[writepos], value, words << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuFifoOutputContiguousWrites;
+#endif
+	}
+	else
+	{
+		const int first_words = contiguous_words;
+		const int second_words = words - first_words;
 
-	memcpy(&data[writepos], value, first_words << 2);
-	value += first_words;
-	if (second_words)
+		memcpy(&data[writepos], value, first_words << 2);
+		value += first_words;
 		memcpy(&data[0], value, second_words << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuFifoOutputWrappedWrites;
+#endif
+	}
 
-	writepos = (writepos + (transfer_size << 2)) & 31;
+	writepos = (writepos + words) & 31;
 
 	ipuRegs.ctrl.OFC += transfer_size;
 
@@ -144,16 +185,29 @@ void IPU_Fifo_Output::read(void *value, uint size)
 	// Zeroing the read data is not needed, since the ringbuffer design will never read back
 	// the zero'd data anyway. --air
 
-	const int first_words = std::min((32 - readpos), static_cast<int>(size << 2));
-	const int second_words = static_cast<int>(size << 2) - first_words;
+	const int words = static_cast<int>(size << 2);
+	const int contiguous_words = 32 - readpos;
+	if (words <= contiguous_words)
+	{
+		memcpy(value, &data[readpos], words << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuFifoOutputContiguousReads;
+#endif
+	}
+	else
+	{
+		const int first_words = contiguous_words;
+		const int second_words = words - first_words;
 
-	memcpy(value, &data[readpos], first_words << 2);
-	value = static_cast<u32*>(value) + first_words;
-
-	if (second_words)
+		memcpy(value, &data[readpos], first_words << 2);
+		value = static_cast<u32*>(value) + first_words;
 		memcpy(value, &data[0], second_words << 2);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuFifoOutputWrappedReads;
+#endif
+	}
 
-	readpos = (readpos + static_cast<int>(size << 2)) & 31;
+	readpos = (readpos + words) & 31;
 }
 
 void ReadFIFO_IPUout(mem128_t* out)

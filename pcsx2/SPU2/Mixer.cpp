@@ -30,6 +30,15 @@ int g_counter_cache_misses = 0;
 int g_counter_cache_ignores = 0;
 #endif
 
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuSpu2VoiceVolumeSlideUpdated = 0;
+u32 g_qemuSpu2VoiceVolumeSlideSkipped = 0;
+u32 g_qemuSpu2MasterVolumeSlideUpdated = 0;
+u32 g_qemuSpu2MasterVolumeSlideSkipped = 0;
+u32 g_qemuSpu2ZeroVoiceGateSkipped = 0;
+u32 g_qemuSpu2NonzeroVoiceGateMixed = 0;
+#endif
+
 MULTI_ISA_UNSHARED_START
 
 static const s32 tbl_XA_Factor[16][2] =
@@ -378,7 +387,22 @@ static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx)
 	// methods when needed by checking the flag outside the method here...
 	// (Note: Ys 6 : Ark of Nephistm uses these effects)
 
-	vc.Volume.Update();
+	// PCSX2 owner: ADSR.cpp::V_VolumeSlide::Update() is a no-op unless the
+	// slide Enable bit is set; keep enabled slide timing exact and skip only
+	// the disabled-volume-slide call overhead in the 48-voice mixer loop.
+	if (vc.Volume.HasActiveSlide())
+	{
+		vc.Volume.Update();
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSpu2VoiceVolumeSlideUpdated++;
+#endif
+	}
+#if defined(VITASX2_QEMU_VALIDATION)
+	else
+	{
+		g_qemuSpu2VoiceVolumeSlideSkipped++;
+	}
+#endif
 
 	DecodeSamples(coreidx, voiceidx);
 
@@ -430,6 +454,20 @@ static __forceinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
 		StereoOut32 VVal(MixVoice(coreidx, voiceidx));
 
 		// Note: Results from MixVoice are ranged at 16 bits.
+		if ((VVal.Left | VVal.Right) == 0)
+		{
+			// PCSX2 owner: Mixer.cpp::MixVoice() / MixCoreVoices(). Silent
+			// voices still execute MixVoice for NextA, IRQ, ADSR, pitch, and
+			// voice writeback side effects, but zero cannot contribute through
+			// any dry/wet AND gate.
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSpu2ZeroVoiceGateSkipped++;
+#endif
+			continue;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSpu2NonzeroVoiceGateMixed++;
+#endif
 
 		dest.Dry.Left += VVal.Left & thiscore.VoiceGates[voiceidx].DryL;
 		dest.Dry.Right += VVal.Right & thiscore.VoiceGates[voiceidx].DryR;
@@ -442,7 +480,20 @@ static __forceinline StereoOut32 MixCore(const uint coreidx, const VoiceMixSet& 
 {
 	V_Core& thiscore(Cores[coreidx]);
 
-	thiscore.MasterVol.Update();
+	// Same disabled-slide fast path for core master volume.
+	if (thiscore.MasterVol.HasActiveSlide())
+	{
+		thiscore.MasterVol.Update();
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSpu2MasterVolumeSlideUpdated++;
+#endif
+	}
+#if defined(VITASX2_QEMU_VALIDATION)
+	else
+	{
+		g_qemuSpu2MasterVolumeSlideSkipped++;
+	}
+#endif
 	UpdateNoise(thiscore);
 
 	// Saturate final result to standard 16 bit range.

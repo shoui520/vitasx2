@@ -116,7 +116,13 @@ void VitaSetIopPreInstructionTraceCallback(VitaIopPreInstructionTraceCallback ca
 	const bool new_enabled = (callback != nullptr);
 	s_iop_pre_instruction_trace_callback = callback;
 	if (old_enabled != new_enabled)
+	{
+		// PCSX2 owner: x86/iR3000A.cpp::iPsxBranchTest(). Vita's A32 IOP block
+		// tail now charges iopCycleEE before direct links, so trace/oracle mode
+		// can keep the same linked-chain shape while still honoring timeslices.
+		s_iop_a32_executor.SetDirectLinkingEnabled(true);
 		s_iop_a32_executor.Reset();
+	}
 }
 
 bool VitaIsIopPreInstructionTraceEnabled()
@@ -607,26 +613,6 @@ static void psxRecReset()
 	s_iop_a32_stats.invalidated_blocks += s_iop_a32_executor.Reset();
 }
 
-static void psxRecChargeEeBudget(u64 last_iop_cycle)
-{
-	if ((psxHu32(HW_ICFG) & (1 << 3)))
-	{
-		// PCSX2 owner: R3000AInterpreter.cpp::intExecuteBlock() converts PS1
-		// mode IOP cycles to EE-domain cycles with PS2CLK/PSXCLK = 1280/147.
-		const u32 cnum = 1280;
-		const u32 cdenom = 147;
-		const u32 delta = static_cast<u32>(psxRegs.cycle - last_iop_cycle);
-		const u32 t = cnum * delta + psxRegs.iopCycleEECarry;
-		psxRegs.iopCycleEE -= t / cdenom;
-		psxRegs.iopCycleEECarry = t % cdenom;
-	}
-	else
-	{
-		// PCSX2 owner: R3000AInterpreter.cpp::intExecuteBlock(), PS2 mode.
-		psxRegs.iopCycleEE -= static_cast<s32>((psxRegs.cycle - last_iop_cycle) * 8);
-	}
-}
-
 static s32 psxRecExecuteBlock(s32 eeCycles)
 {
 	psxRegs.iopBreak = 0;
@@ -634,7 +620,6 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 
 	while (psxRegs.iopCycleEE > 0)
 	{
-		const u64 last_iop_cycle = psxRegs.cycle;
 		if ((psxHu32(HW_ICFG) & 8) &&
 			((psxRegs.pc & 0x1fffffffU) == 0xa0 ||
 			 (psxRegs.pc & 0x1fffffffU) == 0xb0 ||
@@ -643,31 +628,18 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			psxBiosCall();
 		}
 
-		VitaIOP::BlockScanResult scan;
-		if (!VitaIOP::BlockExecutor::ScanStraightLineBlock(
-				psxRegs.pc, VitaIOP::BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
-			scan.instruction_count == 0)
-		{
-			const u32 pc = psxRegs.pc;
-			const u32 opcode = iopMemRead32(pc);
-			if (s_iop_a32_stats.interpreter_blocks == 0)
-			{
-				s_iop_a32_stats.first_interpreter_pc = pc;
-				s_iop_a32_stats.first_interpreter_opcode = opcode;
-			}
-			s_iop_a32_stats.last_interpreter_pc = pc;
-			s_iop_a32_stats.last_interpreter_opcode = opcode;
-			s_iop_a32_stats.interpreter_blocks++;
-			const s32 result = psxInt.ExecuteBlock(psxRegs.iopCycleEE);
-			return result;
-		}
-
 		VitaIOP::BlockExecutionResult result;
-		if (!s_iop_a32_executor.ExecuteCompiledBlock(psxRegs.pc, scan.instruction_count, &result))
+		const u32 pc = psxRegs.pc;
+		if (!s_iop_a32_executor.ExecuteCompiledBlockAtPc(pc, &result))
 		{
-			const u32 pc = psxRegs.pc;
 			const u32 opcode = iopMemRead32(pc);
-			s_iop_a32_stats.failed_blocks++;
+			VitaIOP::BlockScanResult scan;
+			if (VitaIOP::BlockExecutor::ScanStraightLineBlock(
+					pc, VitaIOP::BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) &&
+				scan.instruction_count != 0)
+			{
+				s_iop_a32_stats.failed_blocks++;
+			}
 			if (s_iop_a32_stats.interpreter_blocks == 0)
 			{
 				s_iop_a32_stats.first_interpreter_pc = pc;
@@ -696,9 +668,9 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		}
 		if (result.lookup_hit)
 			s_iop_a32_stats.lookup_hits++;
+		if (result.fast_dispatch_hit)
+			s_iop_a32_stats.fast_dispatch_hits++;
 		s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
-
-		psxRecChargeEeBudget(last_iop_cycle);
 	}
 
 	return psxRegs.iopBreak + psxRegs.iopCycleEE;
