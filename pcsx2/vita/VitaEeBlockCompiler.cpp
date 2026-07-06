@@ -5415,9 +5415,9 @@ namespace VitaEE
 	bool BlockCompiler::EmitCOP2MacroClipBody(u32 op)
 	{
 		// PCSX2 owners: VUops.cpp::_vuCLIP() and VCLIPw(). The macro shifts
-		// the 24-bit clip history, emits six signed raw-bit comparisons for
-		// Fs.xyz against abs(Ft.w), mirrors clipflag into VI[REG_CLIP_FLAG],
-		// and has no MAC/status/FDIV side effects.
+		// the 24-bit clip history, emits signed raw-bit comparisons for Fs.xyz
+		// against abs(Ft.w), mirrors clipflag into VI[REG_CLIP_FLAG], and has
+		// no MAC/status/FDIV side effects.
 		if (!IsCop2MacroClip(op))
 			return false;
 
@@ -5450,29 +5450,38 @@ namespace VitaEE
 			return false;
 		}
 
+		constexpr unsigned NEON_FS_POS = 0;
+		constexpr unsigned NEON_FS_NEG = 1;
+		constexpr unsigned NEON_LIMIT = 2;
+		constexpr unsigned NEON_SIGN = 3;
 		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+			!m_code.EmitVld1Q32Aligned(NEON_FS_POS, HOST_TMP0) ||
+			!m_code.EmitVdupI32QFromCore(NEON_LIMIT, HOST_TMP2) ||
+			!m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_SIGN_MASK) ||
+			!m_code.EmitVdupI32QFromCore(NEON_SIGN, HOST_TMP3) ||
+			!m_code.EmitVeorQ(NEON_FS_NEG, NEON_FS_POS, NEON_SIGN) ||
+			!m_code.EmitVcgtS32Q(NEON_FS_POS, NEON_FS_POS, NEON_LIMIT) ||
+			!m_code.EmitVcgtS32Q(NEON_FS_NEG, NEON_FS_NEG, NEON_LIMIT) ||
 			!m_code.EmitMovImm8(HOST_TMP4, 0))
 		{
 			return false;
 		}
 
-		const auto emit_compare_flag = [&](unsigned lane, u8 positive_flag, u8 negative_flag) {
-			const u16 offset = static_cast<u16>(lane * sizeof(u32));
-			return m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, offset) &&
-				   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2) &&
-				   m_code.EmitMovImm8(HOST_TMP3, 0) &&
-				   m_code.EmitMovImm8(HOST_TMP3, positive_flag, VitaA32::Condition::GT) &&
-				   m_code.EmitOrrReg(HOST_TMP4, HOST_TMP4, HOST_TMP3) &&
-				   EmitEorImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP3) &&
-				   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2) &&
-				   m_code.EmitMovImm8(HOST_TMP3, 0) &&
-				   m_code.EmitMovImm8(HOST_TMP3, negative_flag, VitaA32::Condition::GT) &&
-				   m_code.EmitOrrReg(HOST_TMP4, HOST_TMP4, HOST_TMP3);
+		const auto emit_extract_flag = [&](unsigned qreg, unsigned lane, unsigned shift) {
+			return m_code.EmitVmovSToCore(HOST_TMP1, qreg * 4 + lane) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, 31) &&
+				   (shift == 0 ?
+						   m_code.EmitOrrReg(HOST_TMP4, HOST_TMP4, HOST_TMP1) :
+						   m_code.EmitOrrRegShiftImm(HOST_TMP4, HOST_TMP4, HOST_TMP1,
+							   VitaA32::ShiftType::LSL, static_cast<u8>(shift)));
 		};
 
-		if (!emit_compare_flag(0, 0x01, 0x02) ||
-			!emit_compare_flag(1, 0x04, 0x08) ||
-			!emit_compare_flag(2, 0x10, 0x20))
+		if (!emit_extract_flag(NEON_FS_POS, 0, 0) ||
+			!emit_extract_flag(NEON_FS_NEG, 0, 1) ||
+			!emit_extract_flag(NEON_FS_POS, 1, 2) ||
+			!emit_extract_flag(NEON_FS_NEG, 1, 3) ||
+			!emit_extract_flag(NEON_FS_POS, 2, 4) ||
+			!emit_extract_flag(NEON_FS_NEG, 2, 5))
 		{
 			return false;
 		}
