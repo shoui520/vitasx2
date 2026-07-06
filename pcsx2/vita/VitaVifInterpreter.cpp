@@ -28,6 +28,7 @@ u32 g_qemuVifBurstColorVectors = 0;
 u32 g_qemuVifBurstSAndV2Vectors = 0;
 u32 g_qemuVifBurstV3Vectors = 0;
 u32 g_qemuVifBurstCopyVectors = 0;
+u32 g_qemuVifBurstCopy64ByteGroups = 0;
 u32 g_qemuVifBurstModeMaskVectors = 0;
 u32 g_qemuVifCycleBurstVectors = 0;
 #endif
@@ -86,8 +87,27 @@ namespace
 
 	void VitaVifCopyQwordBurst(u8* dest, const u8* src, u32 count)
 	{
+		const u32 groups64 = count >> 2;
 #if VITASX2_VIF_HAS_ARM_NEON
-		for (u32 i = 0; i < count; i++)
+		for (u32 i = 0; i < groups64; i++)
+		{
+			if ((i + 1) < groups64)
+				__builtin_prefetch(src + 64, 0, 1);
+
+			const uint32x4_t qword0 = vld1q_u32(reinterpret_cast<const u32*>(src));
+			const uint32x4_t qword1 = vld1q_u32(reinterpret_cast<const u32*>(src + 16));
+			const uint32x4_t qword2 = vld1q_u32(reinterpret_cast<const u32*>(src + 32));
+			const uint32x4_t qword3 = vld1q_u32(reinterpret_cast<const u32*>(src + 48));
+			vst1q_u32(reinterpret_cast<u32*>(dest), qword0);
+			vst1q_u32(reinterpret_cast<u32*>(dest + 16), qword1);
+			vst1q_u32(reinterpret_cast<u32*>(dest + 32), qword2);
+			vst1q_u32(reinterpret_cast<u32*>(dest + 48), qword3);
+			src += 64;
+			dest += 64;
+		}
+
+		const u32 tail_qwords = count & 3;
+		for (u32 i = 0; i < tail_qwords; i++)
 		{
 			const uint32x4_t value = vld1q_u32(reinterpret_cast<const u32*>(src));
 			vst1q_u32(reinterpret_cast<u32*>(dest), value);
@@ -104,6 +124,7 @@ namespace
 		g_qemuVifFastVectors += count;
 		g_qemuVifBurstVectors += count;
 		g_qemuVifBurstCopyVectors += count;
+		g_qemuVifBurstCopy64ByteGroups += groups64;
 #endif
 	}
 
