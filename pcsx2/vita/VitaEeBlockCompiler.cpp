@@ -196,6 +196,7 @@ namespace VitaEE
 		constexpr unsigned VU0_REG_MAC_FLAG = 17;
 		constexpr unsigned VU0_REG_CLIP_FLAG = 18;
 		constexpr unsigned VU0_REG_R = 20;
+		constexpr unsigned VU0_REG_I = 21;
 		constexpr unsigned VU0_REG_TPC = 26;
 		constexpr unsigned VU0_REG_FBRST = 28;
 		constexpr unsigned VU0_REG_VPU_STAT = 29;
@@ -228,6 +229,15 @@ namespace VitaEE
 			0x00000000ffffffffULL, 0x000000ffffffffffULL, 0x0000ffffffffffffULL, 0x00ffffffffffffffULL};
 		constexpr u8 SDL_SHIFT[8] = {56, 48, 40, 32, 24, 16, 8, 0};
 		constexpr u8 SDR_SHIFT[8] = {0, 8, 16, 24, 32, 40, 48, 56};
+
+		struct Cop2MacroMinMaxOp
+		{
+			bool valid = false;
+			bool take_max = false;
+			bool vector_operand = false;
+			bool immediate_operand = false;
+			unsigned broadcast_lane = 0;
+		};
 
 		constexpr unsigned RS(u32 op)
 		{
@@ -272,6 +282,24 @@ namespace VitaEE
 		constexpr u32 JumpTarget(u32 pc, u32 op)
 		{
 			return (INSTRUC_TARGET(op) << 2) | ((pc + 4) & 0xf0000000u);
+		}
+
+		constexpr Cop2MacroMinMaxOp DecodeCop2MacroMinMax(u32 op)
+		{
+			const unsigned function = op & 0x3f;
+			if (function >= 0x10 && function <= 0x13)
+				return {true, true, false, false, function - 0x10};
+			if (function >= 0x14 && function <= 0x17)
+				return {true, false, false, false, function - 0x14};
+			if (function == 0x1d)
+				return {true, true, false, true, 0};
+			if (function == 0x1f)
+				return {true, false, false, true, 0};
+			if (function == 0x2b)
+				return {true, true, true, false, 0};
+			if (function == 0x2f)
+				return {true, false, true, false, 0};
+			return {};
 		}
 
 		constexpr size_t GprOffset(unsigned guest_reg)
@@ -779,15 +807,22 @@ namespace VitaEE
 
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
-			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp::VABS()/VNOP(),
-			// and x86/microVU_Macro.inl::recVABS()/recVNOP(). These macro ops
-			// have no MAC/status/clip synchronization side effects, so idle VU0
-			// can execute them inline while running VU0 stays on the helper tail.
+			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
+			// VABS/VNOP, and x86/microVU_Macro.inl recVMAX/recVMINI/
+			// recVABS/recVNOP. These macro ops have no MAC/status/clip
+			// synchronization side effects, so idle VU0 can execute them inline
+			// while running VU0 stays on the helper tail.
 			if ((op >> 26) != 0x12 || (((op >> 21) & 0x10) == 0) ||
-				!IsCOP2Special1Supported(op) || (op & 0x3c) != 0x3c)
+				!IsCOP2Special1Supported(op))
 			{
 				return false;
 			}
+
+			if (DecodeCop2MacroMinMax(op).valid)
+				return true;
+
+			if ((op & 0x3c) != 0x3c)
+				return false;
 
 			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 			return special2_index == 0x1d || // VABS
@@ -837,6 +872,9 @@ namespace VitaEE
 
 			if (IsFastCOP2MacroInBlock(op))
 			{
+				if (DecodeCop2MacroMinMax(op).valid)
+					return 4; // code + source VF + operand VF/VI + destination VF.
+
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
 			}
@@ -4550,6 +4588,9 @@ namespace VitaEE
 		// and x86/microVU_Macro.inl::recVABS()/recVNOP(). This body is emitted
 		// only on the idle-VU0 path; running VU0 exits through the COP2 helper
 		// so _vu0FinishMicro() still owns the interlock and cycle side effects.
+		if (DecodeCop2MacroMinMax(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroMinMaxBody(op);
+
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
 			return false;
@@ -4593,6 +4634,94 @@ namespace VitaEE
 			return m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, offset) &&
 				   EmitBicImm32OrReg(HOST_TMP2, HOST_TMP2, 0x80000000u, HOST_TMP3) &&
 				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
+		};
+
+		if ((mask & 0x8) && !emit_lane(0))
+			return false;
+		if ((mask & 0x4) && !emit_lane(1))
+			return false;
+		if ((mask & 0x2) && !emit_lane(2))
+			return false;
+		if ((mask & 0x1) && !emit_lane(3))
+			return false;
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitCOP2MacroMinMaxSelect(bool take_max)
+	{
+		const auto emit_signed_select = [&](bool select_max) {
+			return m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL, 0) &&
+				   m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP3, VitaA32::ShiftType::LSL, 0,
+					   false, select_max ? VitaA32::Condition::LT : VitaA32::Condition::GE);
+		};
+
+		if (!m_code.EmitAndReg(HOST_TMP4, HOST_TMP2, HOST_TMP3, true))
+			return false;
+
+		const size_t both_negative = m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
+		if (both_negative == static_cast<size_t>(-1))
+			return false;
+
+		if (!emit_signed_select(take_max))
+			return false;
+
+		const size_t done = m_code.EmitBranchPlaceholder();
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t both_negative_target = m_code.Size();
+		if (!m_code.PatchBranch(both_negative, both_negative_target, VitaA32::Condition::MI) ||
+			!emit_signed_select(!take_max))
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(done, m_code.Size());
+	}
+
+	bool BlockCompiler::EmitCOP2MacroMinMaxBody(u32 op)
+	{
+		// PCSX2 owner: VUops.cpp::fp_max()/fp_min(). Those helpers compare
+		// raw float bits as signed words, but swap min/max selection when both
+		// inputs are negative. Keep that bit policy exactly; no host FP here.
+		const Cop2MacroMinMaxOp minmax = DecodeCop2MacroMinMax(op);
+		if (!minmax.valid)
+			return false;
+
+		const unsigned fd = SA(op);
+		const unsigned mask = (op >> 21) & 0x0f;
+		if (fd == 0 || mask == 0)
+			return true;
+
+		if (!EmitVu0VfAddress(HOST_TMP0, RD(op)) ||
+			!EmitVu0VfAddress(HOST_TMP1, fd))
+		{
+			return false;
+		}
+
+		if (minmax.immediate_operand)
+		{
+			if (!EmitVu0ViAddress(HOST_TMP5, VU0_REG_I))
+				return false;
+		}
+		else if (!EmitVu0VfAddress(HOST_TMP5, RT(op)))
+		{
+			return false;
+		}
+
+		const auto emit_lane = [&](unsigned lane) {
+			const u16 dest_offset = static_cast<u16>(lane * sizeof(u32));
+			const u16 operand_offset = static_cast<u16>(
+				minmax.vector_operand ? dest_offset :
+				minmax.immediate_operand ? 0 :
+				minmax.broadcast_lane * sizeof(u32));
+
+			return m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, dest_offset) &&
+				   m_code.EmitLdrImm12(HOST_TMP3, HOST_TMP5, operand_offset) &&
+				   EmitCOP2MacroMinMaxSelect(minmax.take_max) &&
+				   m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, dest_offset);
 		};
 
 		if ((mask & 0x8) && !emit_lane(0))
