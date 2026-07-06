@@ -17,6 +17,7 @@ static constexpr int CYCLES_PER_WORD = 24;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSpu2DmaCopyNeonQwords = 0;
+u32 g_qemuSpu2DmaCopyNeon64ByteGroups = 0;
 #endif
 
 static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes)
@@ -24,11 +25,28 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 #if defined(ARCH_ARM32)
 	u8* dst = static_cast<u8*>(to);
 	const u8* src = static_cast<const u8*>(from);
-	const u32 qwords = bytes >> 4;
-	for (u32 i = 0; i < qwords; i++)
+	const u32 groups64 = bytes >> 6;
+	for (u32 i = 0; i < groups64; i++)
 	{
-		const uint8x16_t qword = vld1q_u8(src);
-		vst1q_u8(dst, qword);
+		if ((i + 1) < groups64)
+			__builtin_prefetch(src + 64, 0, 1);
+		const uint8x16_t q0 = vld1q_u8(src);
+		const uint8x16_t q1 = vld1q_u8(src + 16);
+		const uint8x16_t q2 = vld1q_u8(src + 32);
+		const uint8x16_t q3 = vld1q_u8(src + 48);
+		vst1q_u8(dst, q0);
+		vst1q_u8(dst + 16, q1);
+		vst1q_u8(dst + 32, q2);
+		vst1q_u8(dst + 48, q3);
+		src += 64;
+		dst += 64;
+	}
+
+	const u32 tail_qwords = (bytes & 63u) >> 4;
+	for (u32 i = 0; i < tail_qwords; i++)
+	{
+		const uint8x16_t q = vld1q_u8(src);
+		vst1q_u8(dst, q);
 		src += 16;
 		dst += 16;
 	}
@@ -44,7 +62,8 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 		dst[i] = src[i];
 
 #if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuSpu2DmaCopyNeonQwords += qwords;
+	g_qemuSpu2DmaCopyNeonQwords += (groups64 << 2) + tail_qwords;
+	g_qemuSpu2DmaCopyNeon64ByteGroups += groups64;
 #endif
 	return;
 #endif
