@@ -1347,17 +1347,67 @@ namespace VUInterpFast
 		return GET_VU_MEM(VU, address);
 	}
 
+#if defined(ARCH_ARM32)
+	alignas(16) static constexpr u32 XYZW_LANE_WRITE_MASKS_NEON[16][4] = {
+		{0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
+		{0x00000000u, 0x00000000u, 0x00000000u, 0xffffffffu},
+		{0x00000000u, 0x00000000u, 0xffffffffu, 0x00000000u},
+		{0x00000000u, 0x00000000u, 0xffffffffu, 0xffffffffu},
+		{0x00000000u, 0xffffffffu, 0x00000000u, 0x00000000u},
+		{0x00000000u, 0xffffffffu, 0x00000000u, 0xffffffffu},
+		{0x00000000u, 0xffffffffu, 0xffffffffu, 0x00000000u},
+		{0x00000000u, 0xffffffffu, 0xffffffffu, 0xffffffffu},
+		{0xffffffffu, 0x00000000u, 0x00000000u, 0x00000000u},
+		{0xffffffffu, 0x00000000u, 0x00000000u, 0xffffffffu},
+		{0xffffffffu, 0x00000000u, 0xffffffffu, 0x00000000u},
+		{0xffffffffu, 0x00000000u, 0xffffffffu, 0xffffffffu},
+		{0xffffffffu, 0xffffffffu, 0x00000000u, 0x00000000u},
+		{0xffffffffu, 0xffffffffu, 0x00000000u, 0xffffffffu},
+		{0xffffffffu, 0xffffffffu, 0xffffffffu, 0x00000000u},
+		{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu},
+	};
+
+	static inline uint32x4_t BlendQwordMaskedNeon(const u32* old_bits, unsigned mask, uint32x4_t result)
+	{
+		if (mask == 0x0f)
+			return result;
+
+		const uint32x4_t old_value = vld1q_u32(old_bits);
+		const uint32x4_t write_mask = vld1q_u32(XYZW_LANE_WRITE_MASKS_NEON[mask]);
+		return vbslq_u32(write_mask, result, old_value);
+	}
+
+	static inline void StoreLowerVfResultMaskedNeon(u32* dest, unsigned mask, uint32x4_t result)
+	{
+		if (mask == 0)
+			return;
+
+		vst1q_u32(dest, BlendQwordMaskedNeon(dest, mask, result));
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuLowerNeonQwordOps;
+#endif
+	}
+
+	static inline void StoreUpperResultMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, uint32x4_t result)
+	{
+		if (mask == 0)
+			return;
+
+		vst1q_u32(VU->VF[fd].UL, BlendQwordMaskedNeon(VU->VF[fd].UL, mask, result));
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuUpperNeonQwordOps;
+#endif
+	}
+#endif
+
 	static inline void LoadVfMasked(VURegs* VU, unsigned ft, unsigned mask, const u32* ptr)
 	{
 		if (ft == 0)
 			return;
 #if defined(ARCH_ARM32)
-		if (mask == 0x0f)
+		if (mask != 0)
 		{
-			vst1q_u32(VU->VF[ft].UL, vld1q_u32(ptr));
-#if defined(VITASX2_QEMU_VALIDATION)
-			++::g_qemuVuLowerNeonQwordOps;
-#endif
+			StoreLowerVfResultMaskedNeon(VU->VF[ft].UL, mask, vld1q_u32(ptr));
 			return;
 		}
 #endif
@@ -1370,12 +1420,9 @@ namespace VUInterpFast
 	static inline void StoreVfMasked(VURegs* VU, unsigned fs, unsigned mask, u32* ptr)
 	{
 #if defined(ARCH_ARM32)
-		if (mask == 0x0f)
+		if (mask != 0)
 		{
-			vst1q_u32(ptr, vld1q_u32(VU->VF[fs].UL));
-#if defined(VITASX2_QEMU_VALIDATION)
-			++::g_qemuVuLowerNeonQwordOps;
-#endif
+			StoreLowerVfResultMaskedNeon(ptr, mask, vld1q_u32(VU->VF[fs].UL));
 			return;
 		}
 #endif
@@ -1390,12 +1437,9 @@ namespace VUInterpFast
 		if (ft == 0)
 			return;
 #if defined(ARCH_ARM32)
-		if (mask == 0x0f)
+		if (mask != 0)
 		{
-			vst1q_u32(VU->VF[ft].UL, vdupq_n_u32(value));
-#if defined(VITASX2_QEMU_VALIDATION)
-			++::g_qemuVuLowerNeonQwordOps;
-#endif
+			StoreLowerVfResultMaskedNeon(VU->VF[ft].UL, mask, vdupq_n_u32(value));
 			return;
 		}
 #endif
@@ -1410,12 +1454,9 @@ namespace VUInterpFast
 		if (ft == 0)
 			return;
 #if defined(ARCH_ARM32)
-		if (mask == 0x0f)
+		if (mask != 0)
 		{
-			vst1q_s32(VU->VF[ft].SL, vdupq_n_s32(value));
-#if defined(VITASX2_QEMU_VALIDATION)
-			++::g_qemuVuLowerNeonQwordOps;
-#endif
+			StoreLowerVfResultMaskedNeon(VU->VF[ft].UL, mask, vreinterpretq_u32_s32(vdupq_n_s32(value)));
 			return;
 		}
 #endif
@@ -1434,13 +1475,10 @@ namespace VUInterpFast
 #endif
 	}
 
-	static inline void StoreMr32Full(VURegs* VU, unsigned ft, unsigned fs)
+	static inline void StoreMr32Masked(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
 	{
 		const uint32x4_t source = vld1q_u32(VU->VF[fs].UL);
-		vst1q_u32(VU->VF[ft].UL, vextq_u32(source, source, 1));
-#if defined(VITASX2_QEMU_VALIDATION)
-		++::g_qemuVuLowerNeonQwordOps;
-#endif
+		StoreLowerVfResultMaskedNeon(VU->VF[ft].UL, mask, vextq_u32(source, source, 1));
 	}
 #endif
 
@@ -1470,42 +1508,6 @@ namespace VUInterpFast
 		if (mask & 0x2) VU->VF[ft].UL[2] = fn(VU->VF[fs].UL[2]);
 		if (mask & 0x1) VU->VF[ft].UL[3] = fn(VU->VF[fs].UL[3]);
 	}
-
-#if defined(ARCH_ARM32)
-	alignas(16) static constexpr u32 XYZW_LANE_WRITE_MASKS_NEON[16][4] = {
-		{0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
-		{0x00000000u, 0x00000000u, 0x00000000u, 0xffffffffu},
-		{0x00000000u, 0x00000000u, 0xffffffffu, 0x00000000u},
-		{0x00000000u, 0x00000000u, 0xffffffffu, 0xffffffffu},
-		{0x00000000u, 0xffffffffu, 0x00000000u, 0x00000000u},
-		{0x00000000u, 0xffffffffu, 0x00000000u, 0xffffffffu},
-		{0x00000000u, 0xffffffffu, 0xffffffffu, 0x00000000u},
-		{0x00000000u, 0xffffffffu, 0xffffffffu, 0xffffffffu},
-		{0xffffffffu, 0x00000000u, 0x00000000u, 0x00000000u},
-		{0xffffffffu, 0x00000000u, 0x00000000u, 0xffffffffu},
-		{0xffffffffu, 0x00000000u, 0xffffffffu, 0x00000000u},
-		{0xffffffffu, 0x00000000u, 0xffffffffu, 0xffffffffu},
-		{0xffffffffu, 0xffffffffu, 0x00000000u, 0x00000000u},
-		{0xffffffffu, 0xffffffffu, 0x00000000u, 0xffffffffu},
-		{0xffffffffu, 0xffffffffu, 0xffffffffu, 0x00000000u},
-		{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu},
-	};
-
-	static inline void StoreUpperResultMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, uint32x4_t result)
-	{
-		if (mask != 0x0f)
-		{
-			const uint32x4_t old_bits = vld1q_u32(VU->VF[fd].UL);
-			const uint32x4_t write_mask = vld1q_u32(XYZW_LANE_WRITE_MASKS_NEON[mask]);
-			result = vbslq_u32(write_mask, result, old_bits);
-		}
-
-		vst1q_u32(VU->VF[fd].UL, result);
-#if defined(VITASX2_QEMU_VALIDATION)
-		++::g_qemuVuUpperNeonQwordOps;
-#endif
-	}
-#endif
 
 	static inline bool StoreAbsUpperMaskedNeon(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
 	{
@@ -2446,9 +2448,9 @@ namespace VUInterpFast
 				if (Ft(code) != 0)
 				{
 #if defined(ARCH_ARM32)
-					if (XYZW(code) == 0x0f)
+					if (XYZW(code) != 0)
 					{
-						StoreMr32Full(VU, Ft(code), Fs(code));
+						StoreMr32Masked(VU, Ft(code), XYZW(code), Fs(code));
 						return;
 					}
 #endif
