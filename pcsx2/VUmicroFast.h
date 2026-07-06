@@ -1660,8 +1660,39 @@ namespace VUInterpFast
 		return static_cast<u32>(sa < sb ? sa : sb);
 	}
 
+	static inline bool ExecuteClipNeon(VURegs* VU, u32 code)
+	{
+#if defined(ARCH_ARM32)
+		const unsigned fs = Fs(code);
+		const u32 ft_w = VU->VF[Ft(code)].UL[3];
+		const s32 value = (ft_w & 0x7f800000u) ?
+			static_cast<s32>(ft_w & 0x7fffffffu) :
+			static_cast<s32>(0x007fffffu);
+
+		const uint32x4_t fs_bits = vld1q_u32(VU->VF[fs].UL);
+		const int32x4_t limit = vdupq_n_s32(value);
+		const uint32x4_t pos = vcgtq_s32(vreinterpretq_s32_u32(fs_bits), limit);
+		const uint32x4_t neg_bits = veorq_u32(fs_bits, vdupq_n_u32(0x80000000u));
+		const uint32x4_t neg = vcgtq_s32(vreinterpretq_s32_u32(neg_bits), limit);
+		const u32 flags =
+			((vgetq_lane_u32(pos, 0) >> 31) << 0) |
+			((vgetq_lane_u32(neg, 0) >> 31) << 1) |
+			((vgetq_lane_u32(pos, 1) >> 31) << 2) |
+			((vgetq_lane_u32(neg, 1) >> 31) << 3) |
+			((vgetq_lane_u32(pos, 2) >> 31) << 4) |
+			((vgetq_lane_u32(neg, 2) >> 31) << 5);
+
+		VU->clipflag = ((VU->clipflag << 6) | flags) & 0x00ffffffu;
+		return true;
+#endif
+		return false;
+	}
+
 	static inline void ExecuteClip(VURegs* VU, u32 code)
 	{
+		if (ExecuteClipNeon(VU, code))
+			return;
+
 		const s32 value = (VU->VF[Ft(code)].UL[3] & 0x7f800000u) ?
 			static_cast<s32>(VU->VF[Ft(code)].UL[3] & 0x7fffffffu) :
 			static_cast<s32>(0x007fffffu);
