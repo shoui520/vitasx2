@@ -8,6 +8,14 @@
 #include "IPU/yuv2rgb.h"
 #include "IPU/IPU_MultiISA.h"
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuIpuDitherNeonGroups = 0;
+#endif
+
 MULTI_ISA_UNSHARED_START
 
 void ipu_dither_reference(const macroblock_rgb32 &rgb32, macroblock_rgb16 &rgb16, int dte);
@@ -15,11 +23,16 @@ void ipu_dither_reference(const macroblock_rgb32 &rgb32, macroblock_rgb16 &rgb16
 #if defined(_M_X86)
 void ipu_dither_sse2(const macroblock_rgb32 &rgb32, macroblock_rgb16 &rgb16, int dte);
 #endif
+#if defined(ARCH_ARM32)
+void ipu_dither_neon(const macroblock_rgb32 &rgb32, macroblock_rgb16 &rgb16, int dte);
+#endif
 
 __ri void ipu_dither(const macroblock_rgb32 &rgb32, macroblock_rgb16 &rgb16, int dte)
 {
 #if defined(_M_X86)
     ipu_dither_sse2(rgb32, rgb16, dte);
+#elif defined(ARCH_ARM32)
+    ipu_dither_neon(rgb32, rgb16, dte);
 #else
     ipu_dither_reference(rgb32, rgb16, dte);
 #endif
@@ -119,6 +132,69 @@ __ri void ipu_dither_sse2(const macroblock_rgb32 &rgb32, macroblock_rgb16 &rgb16
     }
 }
 
+#endif
+
+#if defined(ARCH_ARM32)
+
+__ri void ipu_dither_neon(const macroblock_rgb32 &rgb32, macroblock_rgb16 &rgb16, int dte)
+{
+    static constexpr u8 dither_add_matrix[4][8] = {
+        {0, 0, 0, 1, 0, 0, 0, 1},
+        {2, 0, 3, 0, 2, 0, 3, 0},
+        {0, 1, 0, 0, 0, 1, 0, 0},
+        {3, 0, 2, 0, 3, 0, 2, 0},
+    };
+    static constexpr u8 dither_sub_matrix[4][8] = {
+        {4, 0, 3, 0, 4, 0, 3, 0},
+        {0, 2, 0, 1, 0, 2, 0, 1},
+        {3, 0, 4, 0, 3, 0, 4, 0},
+        {0, 1, 0, 2, 0, 1, 0, 2},
+    };
+
+    const uint16x8_t alpha_test = vdupq_n_u16(0x40);
+
+    for (int i = 0; i < 16; ++i)
+    {
+        const uint8x8_t dither_add = vld1_u8(dither_add_matrix[i & 3]);
+        const uint8x8_t dither_sub = vld1_u8(dither_sub_matrix[i & 3]);
+        for (int n = 0; n < 2; ++n)
+        {
+            uint8x8x4_t rgba = vld4_u8(reinterpret_cast<const u8*>(&rgb32.c[i][n * 8]));
+
+            if (dte)
+            {
+                rgba.val[0] = vqsub_u8(vqadd_u8(rgba.val[0], dither_add), dither_sub);
+                rgba.val[1] = vqsub_u8(vqadd_u8(rgba.val[1], dither_add), dither_sub);
+                rgba.val[2] = vqsub_u8(vqadd_u8(rgba.val[2], dither_add), dither_sub);
+            }
+
+            uint16x8_t r = vshrq_n_u16(vmovl_u8(rgba.val[0]), 3);
+            uint16x8_t g = vshlq_n_u16(vshrq_n_u16(vmovl_u8(rgba.val[1]), 3), 5);
+            uint16x8_t b = vshlq_n_u16(vshrq_n_u16(vmovl_u8(rgba.val[2]), 3), 10);
+            uint16x8_t a = vshlq_n_u16(vceqq_u16(vmovl_u8(rgba.val[3]), alpha_test), 15);
+
+            const uint16x8_t rgb16_lanes = vorrq_u16(vorrq_u16(r, g), vorrq_u16(b, a));
+            vst1q_u16(reinterpret_cast<u16*>(&rgb16.c[i][n * 8]), rgb16_lanes);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+            ++::g_qemuIpuDitherNeonGroups;
+#endif
+        }
+    }
+}
+
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void IpuDitherReferenceForValidation(const macroblock_rgb32& rgb32, macroblock_rgb16& rgb16, int dte)
+{
+    ipu_dither_reference(rgb32, rgb16, dte);
+}
+
+void IpuDitherSelectedForValidation(const macroblock_rgb32& rgb32, macroblock_rgb16& rgb16, int dte)
+{
+    ipu_dither(rgb32, rgb16, dte);
+}
 #endif
 
 MULTI_ISA_UNSHARED_END
