@@ -305,6 +305,12 @@ namespace VitaEE
 			Cop2MacroIndexedVectorMemoryKind kind = Cop2MacroIndexedVectorMemoryKind::LoadIncrement;
 		};
 
+		struct Cop2MacroItofOp
+		{
+			bool valid = false;
+			unsigned offset = 0;
+		};
+
 		constexpr unsigned RS(u32 op)
 		{
 			return (op >> 21) & 0x1f;
@@ -487,6 +493,27 @@ namespace VitaEE
 
 			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 			return special2_index == 0x1f;
+		}
+
+		constexpr Cop2MacroItofOp DecodeCop2MacroItof(u32 op)
+		{
+			if ((op & 0x3c) != 0x3c)
+				return {};
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			switch (special2_index)
+			{
+				case 0x10:
+					return {true, 0};
+				case 0x11:
+					return {true, 4};
+				case 0x12:
+					return {true, 12};
+				case 0x13:
+					return {true, 15};
+				default:
+					return {};
+			}
 		}
 
 		constexpr size_t GprOffset(unsigned guest_reg)
@@ -995,7 +1022,7 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VCLIP/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
+			// VABS/VCLIP/VITOF/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
 			// VLQI/VSQI/VLQD/VSQD, and x86/microVU_Macro.inl
 			// recVMAX/recVMINI/recVABS/recVNOP/recVMOVE/recVMR32/recVI*/
 			// recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops either have
@@ -1023,6 +1050,8 @@ namespace VitaEE
 			if (DecodeCop2MacroIndexedVectorMemory(op).valid)
 				return true;
 			if (IsCop2MacroClip(op))
+				return true;
+			if (DecodeCop2MacroItof(op).valid)
 				return true;
 
 			if ((op & 0x3c) != 0x3c)
@@ -1095,6 +1124,8 @@ namespace VitaEE
 					return 5; // code + VI backup/update + VF + VU memory/register window.
 				if (IsCop2MacroClip(op))
 					return 4; // code + Fs/Ft VF + clipflag VI mirror.
+				if (DecodeCop2MacroItof(op).valid)
+					return 3; // code + source VF + destination VF.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
@@ -4828,6 +4859,8 @@ namespace VitaEE
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroIndexedVectorMemoryBody(op);
 		if (IsCop2MacroClip(op))
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroClipBody(op);
+		if (DecodeCop2MacroItof(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroItofBody(op);
 
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
@@ -5494,6 +5527,65 @@ namespace VitaEE
 			   m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) &&
 			   EmitVu0ViAddress(HOST_TMP0, VU0_REG_CLIP_FLAG) &&
 			   m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0);
+	}
+
+	bool BlockCompiler::EmitCOP2MacroItofBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::intToFloat<>() and _vuITOF*(). VITOF
+		// treats source lanes as signed 32-bit integers, converts to float,
+		// scales by 2^-offset, and writes only selected destination lanes.
+		const Cop2MacroItofOp itof = DecodeCop2MacroItof(op);
+		if (!itof.valid)
+			return false;
+
+		const unsigned ft = RT(op);
+		const unsigned mask = (op >> 21) & 0x0f;
+		if (ft == 0 || mask == 0)
+			return true;
+
+		constexpr unsigned NEON_VALUE = 0;
+		constexpr unsigned NEON_SCALE = 1;
+		const unsigned fs = RD(op);
+		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+			!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
+			!m_code.EmitVcvtF32S32Q(NEON_VALUE, NEON_VALUE))
+		{
+			return false;
+		}
+
+		if (itof.offset != 0)
+		{
+			const u32 scale_bits = 0x3f800000u - (itof.offset << 23);
+			if (!m_code.EmitMovImm32(HOST_TMP2, scale_bits) ||
+				!m_code.EmitVdupI32QFromCore(NEON_SCALE, HOST_TMP2) ||
+				!m_code.EmitVmulF32Q(NEON_VALUE, NEON_VALUE, NEON_SCALE))
+			{
+				return false;
+			}
+		}
+
+		if (!EmitVu0VfAddress(HOST_TMP1, ft))
+			return false;
+
+		if (mask == 0x0f)
+			return m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
+
+		const auto emit_lane = [&](unsigned lane) {
+			const u16 offset = static_cast<u16>(lane * sizeof(u32));
+			return m_code.EmitVmovSToCore(HOST_TMP2, NEON_VALUE * 4 + lane) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
+		};
+
+		if ((mask & 0x8) && !emit_lane(0))
+			return false;
+		if ((mask & 0x4) && !emit_lane(1))
+			return false;
+		if ((mask & 0x2) && !emit_lane(2))
+			return false;
+		if ((mask & 0x1) && !emit_lane(3))
+			return false;
+
+		return true;
 	}
 
 	bool BlockCompiler::EmitCOP2MacroMoveBody(u32 op)

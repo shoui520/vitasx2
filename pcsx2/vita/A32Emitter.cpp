@@ -79,9 +79,12 @@ namespace VitaA32
 		constexpr u32 VMOV_CORE_TO_S = 0xee000a10u;
 		constexpr u32 VMOV_S_TO_CORE = 0xee100a10u;
 		constexpr u32 VCVT_F32_S32 = 0xeeb80ac0u;
+		constexpr u32 VCVT_F32_S32_Q = 0xf3bb0640u;
+		constexpr u32 VCVT_S32_F32_Q = 0xf3bb0740u;
 		constexpr u32 VADD_F32 = 0xee300a00u;
 		constexpr u32 VSUB_F32 = 0xee300a40u;
 		constexpr u32 VMUL_F32 = 0xee200a00u;
+		constexpr u32 VMUL_F32_Q = 0xf3000d50u;
 		constexpr u32 VDIV_F32 = 0xee800a00u;
 		constexpr u32 VSQRT_F32 = 0xeeb10ac0u;
 		constexpr u32 VADD_I8_Q = 0xf2000840u;
@@ -1167,6 +1170,20 @@ namespace VitaA32
 		return EmitU32(EncodeVcvtF32S32(sd, sm));
 	}
 
+	bool CodeBuffer::EmitVcvtF32S32Q(unsigned qd, unsigned qm)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qm))
+			return false;
+		return EmitU32(EncodeVcvtF32S32Q(qd, qm));
+	}
+
+	bool CodeBuffer::EmitVcvtS32F32Q(unsigned qd, unsigned qm)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qm))
+			return false;
+		return EmitU32(EncodeVcvtS32F32Q(qd, qm));
+	}
+
 	bool CodeBuffer::EmitVaddF32(unsigned sd, unsigned sn, unsigned sm)
 	{
 		if (!IsSRegister(sd) || !IsSRegister(sn) || !IsSRegister(sm))
@@ -1186,6 +1203,13 @@ namespace VitaA32
 		if (!IsSRegister(sd) || !IsSRegister(sn) || !IsSRegister(sm))
 			return false;
 		return EmitU32(EncodeVmulF32(sd, sn, sm));
+	}
+
+	bool CodeBuffer::EmitVmulF32Q(unsigned qd, unsigned qn, unsigned qm)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
+			return false;
+		return EmitU32(EncodeVmulF32Q(qd, qn, qm));
 	}
 
 	bool CodeBuffer::EmitVdivF32(unsigned sd, unsigned sn, unsigned sm)
@@ -2398,6 +2422,20 @@ namespace VitaA32
 		return VCVT_F32_S32 | VfpSd(sd) | VfpSm(sm);
 	}
 
+	u32 EncodeVcvtF32S32Q(unsigned qd, unsigned qm)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qm));
+		return VCVT_F32_S32_Q | NeonQd(qd) | NeonQm(qm);
+	}
+
+	u32 EncodeVcvtS32F32Q(unsigned qd, unsigned qm)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qm));
+		return VCVT_S32_F32_Q | NeonQd(qd) | NeonQm(qm);
+	}
+
 	u32 EncodeVaddF32(unsigned sd, unsigned sn, unsigned sm)
 	{
 		pxAssert(IsSRegister(sd));
@@ -2420,6 +2458,14 @@ namespace VitaA32
 		pxAssert(IsSRegister(sn));
 		pxAssert(IsSRegister(sm));
 		return VMUL_F32 | VfpSd(sd) | VfpSn(sn) | VfpSm(sm);
+	}
+
+	u32 EncodeVmulF32Q(unsigned qd, unsigned qn, unsigned qm)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qn));
+		pxAssert(IsQRegister(qm));
+		return VMUL_F32_Q | NeonQd(qd) | NeonQn(qn) | NeonQm(qm);
 	}
 
 	u32 EncodeVdivF32(unsigned sd, unsigned sn, unsigned sm)

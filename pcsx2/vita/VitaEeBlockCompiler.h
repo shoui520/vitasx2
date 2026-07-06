@@ -213,6 +213,7 @@ namespace VitaEE
 		bool EmitVu0ViLowHalfwordAdjust(unsigned vi_reg, bool decrement);
 		bool EmitCOP2MacroIndexedVectorMemoryBody(u32 op);
 		bool EmitCOP2MacroClipBody(u32 op);
+		bool EmitCOP2MacroItofBody(u32 op);
 		bool EmitCOP2MacroMoveBody(u32 op);
 		bool EmitCOP2MacroMinMaxSelect(bool take_max);
 		bool EmitCOP2MacroMinMaxBody(u32 op);

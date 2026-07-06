@@ -160,9 +160,12 @@ namespace VitaA32
 		bool EmitVmovCoreToS(unsigned sd, unsigned rt);
 		bool EmitVmovSToCore(unsigned rt, unsigned sd);
 		bool EmitVcvtF32S32(unsigned sd, unsigned sm);
+		bool EmitVcvtF32S32Q(unsigned qd, unsigned qm);
+		bool EmitVcvtS32F32Q(unsigned qd, unsigned qm);
 		bool EmitVaddF32(unsigned sd, unsigned sn, unsigned sm);
 		bool EmitVsubF32(unsigned sd, unsigned sn, unsigned sm);
 		bool EmitVmulF32(unsigned sd, unsigned sn, unsigned sm);
+		bool EmitVmulF32Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVdivF32(unsigned sd, unsigned sn, unsigned sm);
 		bool EmitVsqrtF32(unsigned sd, unsigned sm);
 		bool EmitVaddI8Q(unsigned qd, unsigned qn, unsigned qm);
@@ -342,9 +345,12 @@ namespace VitaA32
 	u32 EncodeVmovCoreToS(unsigned sd, unsigned rt);
 	u32 EncodeVmovSToCore(unsigned rt, unsigned sd);
 	u32 EncodeVcvtF32S32(unsigned sd, unsigned sm);
+	u32 EncodeVcvtF32S32Q(unsigned qd, unsigned qm);
+	u32 EncodeVcvtS32F32Q(unsigned qd, unsigned qm);
 	u32 EncodeVaddF32(unsigned sd, unsigned sn, unsigned sm);
 	u32 EncodeVsubF32(unsigned sd, unsigned sn, unsigned sm);
 	u32 EncodeVmulF32(unsigned sd, unsigned sn, unsigned sm);
+	u32 EncodeVmulF32Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVdivF32(unsigned sd, unsigned sn, unsigned sm);
 	u32 EncodeVsqrtF32(unsigned sd, unsigned sm);
 	u32 EncodeVaddI8Q(unsigned qd, unsigned qn, unsigned qm);
