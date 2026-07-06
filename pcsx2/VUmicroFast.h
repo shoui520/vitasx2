@@ -1790,6 +1790,17 @@ namespace VUInterpFast
 		return vreinterpretq_f32_u32(VuDoubleBitsNeon(bits));
 	}
 
+	static inline float VuSumXYZSquaresNeon(VURegs* VU, unsigned reg)
+	{
+		const float32x4_t value = VuFloatQNeon(vld1q_u32(VU->VF[reg].UL));
+		const float32x4_t squared = vmulq_f32(value, value);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuLowerNeonQwordOps;
+#endif
+		return (vgetq_lane_f32(squared, 0) + vgetq_lane_f32(squared, 1)) +
+			vgetq_lane_f32(squared, 2);
+	}
+
 	static inline void FinishMacVectorNeon(VURegs* VU, bool acc, unsigned fd, unsigned mask, float32x4_t result)
 	{
 		if (mask & 0x8)
@@ -2632,10 +2643,14 @@ namespace VUInterpFast
 
 	static inline float VuSumXYZSquares(VURegs* VU, unsigned reg)
 	{
+#if defined(ARCH_ARM32)
+		return VuSumXYZSquaresNeon(VU, reg);
+#else
 		const float x = VuLane(VU, reg, 0);
 		const float y = VuLane(VU, reg, 1);
 		const float z = VuLane(VU, reg, 2);
 		return x * x + y * y + z * z;
+#endif
 	}
 
 	static inline float VuCalculateEatan(float input)
