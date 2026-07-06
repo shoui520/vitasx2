@@ -7,6 +7,10 @@
 #include "IPU/IPUdma.h"
 #include "IPU/IPU_MultiISA.h"
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
 alignas(16) IPU_Fifo ipu_fifo;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -17,7 +21,30 @@ u32 g_qemuIpuFifoOutputContiguousWrites = 0;
 u32 g_qemuIpuFifoOutputWrappedWrites = 0;
 u32 g_qemuIpuFifoOutputContiguousReads = 0;
 u32 g_qemuIpuFifoOutputWrappedReads = 0;
+u32 g_qemuIpuFifoNeonQwords = 0;
 #endif
+
+static __forceinline void IpuFifoCopyWords(u32* to, const u32* from, int words)
+{
+#if defined(ARCH_ARM32)
+	if ((words & 3) == 0)
+	{
+		const int qwords = words >> 2;
+		for (int i = 0; i < qwords; i++)
+		{
+			const uint32x4_t qword = vld1q_u32(from);
+			vst1q_u32(to, qword);
+			from += 4;
+			to += 4;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuIpuFifoNeonQwords += qwords;
+#endif
+		return;
+	}
+#endif
+	memcpy(to, from, words << 2);
+}
 
 void IPU_Fifo::init()
 {
@@ -79,7 +106,7 @@ int IPU_Fifo_Input::write(const u32* pMem, int size)
 	const int contiguous_words = 32 - writepos;
 	if (words <= contiguous_words)
 	{
-		memcpy(&data[writepos], pMem, words << 2);
+		IpuFifoCopyWords(&data[writepos], pMem, words);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIpuFifoInputContiguousWrites;
 #endif
@@ -89,9 +116,9 @@ int IPU_Fifo_Input::write(const u32* pMem, int size)
 		const int first_words = contiguous_words;
 		const int second_words = words - first_words;
 
-		memcpy(&data[writepos], pMem, first_words << 2);
+		IpuFifoCopyWords(&data[writepos], pMem, first_words);
 		pMem += first_words;
-		memcpy(&data[0], pMem, second_words << 2);
+		IpuFifoCopyWords(&data[0], pMem, second_words);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIpuFifoInputWrappedWrites;
 #endif
@@ -124,7 +151,7 @@ int IPU_Fifo_Input::read(void *value)
 		pxAssert(g_BP.IFC > 0);
 	}
 
-	CopyQWC(value, &data[readpos]);
+	IpuFifoCopyWords(static_cast<u32*>(value), &data[readpos], 4);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	++g_qemuIpuFifoInputReads;
@@ -149,7 +176,7 @@ int IPU_Fifo_Output::write(const u32 *value, uint size)
 	const int contiguous_words = 32 - writepos;
 	if (words <= contiguous_words)
 	{
-		memcpy(&data[writepos], value, words << 2);
+		IpuFifoCopyWords(&data[writepos], value, words);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIpuFifoOutputContiguousWrites;
 #endif
@@ -159,9 +186,9 @@ int IPU_Fifo_Output::write(const u32 *value, uint size)
 		const int first_words = contiguous_words;
 		const int second_words = words - first_words;
 
-		memcpy(&data[writepos], value, first_words << 2);
+		IpuFifoCopyWords(&data[writepos], value, first_words);
 		value += first_words;
-		memcpy(&data[0], value, second_words << 2);
+		IpuFifoCopyWords(&data[0], value, second_words);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIpuFifoOutputWrappedWrites;
 #endif
@@ -189,7 +216,7 @@ void IPU_Fifo_Output::read(void *value, uint size)
 	const int contiguous_words = 32 - readpos;
 	if (words <= contiguous_words)
 	{
-		memcpy(value, &data[readpos], words << 2);
+		IpuFifoCopyWords(static_cast<u32*>(value), &data[readpos], words);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIpuFifoOutputContiguousReads;
 #endif
@@ -199,9 +226,9 @@ void IPU_Fifo_Output::read(void *value, uint size)
 		const int first_words = contiguous_words;
 		const int second_words = words - first_words;
 
-		memcpy(value, &data[readpos], first_words << 2);
+		IpuFifoCopyWords(static_cast<u32*>(value), &data[readpos], first_words);
 		value = static_cast<u32*>(value) + first_words;
-		memcpy(value, &data[0], second_words << 2);
+		IpuFifoCopyWords(static_cast<u32*>(value), &data[0], second_words);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIpuFifoOutputWrappedReads;
 #endif
