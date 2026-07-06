@@ -1763,6 +1763,152 @@ namespace VUInterpFast
 		return VuDouble(a) + VuDouble(b);
 	}
 
+#if defined(ARCH_ARM32)
+	static inline uint32x4_t VuDoubleBitsNeon(uint32x4_t bits)
+	{
+		// PCSX2 owner: VUops.cpp::vuDouble(). Normalize inputs before the
+		// NEON arithmetic body, then keep MAC/status writes on VUflags.cpp.
+		const uint32x4_t exponent_mask = vdupq_n_u32(0x7f800000u);
+		const uint32x4_t sign_mask = vdupq_n_u32(0x80000000u);
+		const uint32x4_t exponent = vandq_u32(bits, exponent_mask);
+		const uint32x4_t sign = vandq_u32(bits, sign_mask);
+		const uint32x4_t denormal = vceqq_u32(exponent, vdupq_n_u32(0));
+		bits = vbslq_u32(denormal, sign, bits);
+
+#ifndef INT_VUDOUBLEHACK
+		if (CHECK_VU_OVERFLOW(0))
+		{
+			const uint32x4_t infinite = vceqq_u32(exponent, exponent_mask);
+			bits = vbslq_u32(infinite, vorrq_u32(sign, vdupq_n_u32(0x7f7fffffu)), bits);
+		}
+#endif
+		return bits;
+	}
+
+	static inline float32x4_t VuFloatQNeon(uint32x4_t bits)
+	{
+		return vreinterpretq_f32_u32(VuDoubleBitsNeon(bits));
+	}
+
+	static inline void FinishMacVectorNeon(VURegs* VU, bool acc, unsigned fd, unsigned mask, float32x4_t result)
+	{
+		if (mask & 0x8)
+			WriteMacResult(VU, acc, fd, 0, UpdateMacLane(VU, 0, vgetq_lane_f32(result, 0)));
+		else
+			ClearMacLane(VU, 0);
+		if (mask & 0x4)
+			WriteMacResult(VU, acc, fd, 1, UpdateMacLane(VU, 1, vgetq_lane_f32(result, 1)));
+		else
+			ClearMacLane(VU, 1);
+		if (mask & 0x2)
+			WriteMacResult(VU, acc, fd, 2, UpdateMacLane(VU, 2, vgetq_lane_f32(result, 2)));
+		else
+			ClearMacLane(VU, 2);
+		if (mask & 0x1)
+			WriteMacResult(VU, acc, fd, 3, UpdateMacLane(VU, 3, vgetq_lane_f32(result, 3)));
+		else
+			ClearMacLane(VU, 3);
+
+		VU_STAT_UPDATE(VU);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuUpperNeonQwordOps;
+#endif
+	}
+
+	static inline bool ExecuteAddSubMaskedNeon(VURegs* VU, u32 code, bool acc, bool subtract, uint32x4_t operand_bits)
+	{
+		const unsigned mask = XYZW(code);
+		if (mask == 0)
+			return false;
+
+		const float32x4_t fs = VuFloatQNeon(vld1q_u32(VU->VF[Fs(code)].UL));
+		const float32x4_t operand = VuFloatQNeon(operand_bits);
+		FinishMacVectorNeon(VU, acc, Fd(code), mask, subtract ? vsubq_f32(fs, operand) : vaddq_f32(fs, operand));
+		return true;
+	}
+
+	static inline bool ExecuteMulMaskedNeon(VURegs* VU, u32 code, bool acc, uint32x4_t operand_bits)
+	{
+		const unsigned mask = XYZW(code);
+		if (mask == 0)
+			return false;
+
+		const float32x4_t fs = VuFloatQNeon(vld1q_u32(VU->VF[Fs(code)].UL));
+		const float32x4_t operand = VuFloatQNeon(operand_bits);
+		FinishMacVectorNeon(VU, acc, Fd(code), mask, vmulq_f32(fs, operand));
+		return true;
+	}
+
+	static inline bool ExecuteMaddMsubMaskedNeon(VURegs* VU, u32 code, bool acc, bool subtract, uint32x4_t operand_bits)
+	{
+		const unsigned mask = XYZW(code);
+		if (mask == 0)
+			return false;
+
+		const float32x4_t acc_value = VuFloatQNeon(vld1q_u32(VU->ACC.UL));
+		const float32x4_t fs = VuFloatQNeon(vld1q_u32(VU->VF[Fs(code)].UL));
+		const float32x4_t operand = VuFloatQNeon(operand_bits);
+		const float32x4_t product = vmulq_f32(fs, operand);
+		FinishMacVectorNeon(VU, acc, Fd(code), mask,
+			subtract ? vsubq_f32(acc_value, product) : vaddq_f32(acc_value, product));
+		return true;
+	}
+#endif
+
+	static inline bool TryExecuteAddSubVectorNeon(VURegs* VU, u32 code, bool acc, bool subtract)
+	{
+#if defined(ARCH_ARM32)
+		return ExecuteAddSubMaskedNeon(VU, code, acc, subtract, vld1q_u32(VU->VF[Ft(code)].UL));
+#else
+		return false;
+#endif
+	}
+
+	static inline bool TryExecuteAddSubBroadcastNeon(VURegs* VU, u32 code, bool acc, bool subtract, u32 operand_bits)
+	{
+#if defined(ARCH_ARM32)
+		return ExecuteAddSubMaskedNeon(VU, code, acc, subtract, vdupq_n_u32(operand_bits));
+#else
+		return false;
+#endif
+	}
+
+	static inline bool TryExecuteMulVectorNeon(VURegs* VU, u32 code, bool acc)
+	{
+#if defined(ARCH_ARM32)
+		return ExecuteMulMaskedNeon(VU, code, acc, vld1q_u32(VU->VF[Ft(code)].UL));
+#else
+		return false;
+#endif
+	}
+
+	static inline bool TryExecuteMulBroadcastNeon(VURegs* VU, u32 code, bool acc, u32 operand_bits)
+	{
+#if defined(ARCH_ARM32)
+		return ExecuteMulMaskedNeon(VU, code, acc, vdupq_n_u32(operand_bits));
+#else
+		return false;
+#endif
+	}
+
+	static inline bool TryExecuteMaddMsubVectorNeon(VURegs* VU, u32 code, bool acc, bool subtract)
+	{
+#if defined(ARCH_ARM32)
+		return ExecuteMaddMsubMaskedNeon(VU, code, acc, subtract, vld1q_u32(VU->VF[Ft(code)].UL));
+#else
+		return false;
+#endif
+	}
+
+	static inline bool TryExecuteMaddMsubBroadcastNeon(VURegs* VU, u32 code, bool acc, bool subtract, u32 operand_bits)
+	{
+#if defined(ARCH_ARM32)
+		return ExecuteMaddMsubMaskedNeon(VU, code, acc, subtract, vdupq_n_u32(operand_bits));
+#else
+		return false;
+#endif
+	}
+
 	template <typename Operand>
 	static inline void ExecuteAddSubMasked(VURegs* VU, u32 code, bool acc, bool subtract, bool triace_add, Operand operand)
 	{
@@ -1971,87 +2117,143 @@ namespace VUInterpFast
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<15>);
 				return;
 			case UpperFastKind::ADD:
+				if (TryExecuteAddSubVectorNeon(VU, code, false, false))
+					return;
 				ExecuteAddSubMasked(VU, code, false, false, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::ADDi:
+				if (!CHECK_VUADDSUBHACK && TryExecuteAddSubBroadcastNeon(VU, code, false, false, VU->VI[REG_I].UL))
+					return;
 				ExecuteAddSubMasked(VU, code, false, false, CHECK_VUADDSUBHACK, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::ADDq:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, false, VU->VI[REG_Q].UL))
+					return;
 				ExecuteAddSubMasked(VU, code, false, false, false, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::ADDx:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteAddSubMasked(VU, code, false, false, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::ADDy:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteAddSubMasked(VU, code, false, false, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::ADDz:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteAddSubMasked(VU, code, false, false, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::ADDw:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteAddSubMasked(VU, code, false, false, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::ADDA:
+				if (TryExecuteAddSubVectorNeon(VU, code, true, false))
+					return;
 				ExecuteAddSubMasked(VU, code, true, false, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::ADDAi:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, false, VU->VI[REG_I].UL))
+					return;
 				ExecuteAddSubMasked(VU, code, true, false, false, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::ADDAq:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, false, VU->VI[REG_Q].UL))
+					return;
 				ExecuteAddSubMasked(VU, code, true, false, false, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::ADDAx:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, false, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteAddSubMasked(VU, code, true, false, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::ADDAy:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, false, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteAddSubMasked(VU, code, true, false, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::ADDAz:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, false, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteAddSubMasked(VU, code, true, false, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::ADDAw:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, false, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteAddSubMasked(VU, code, true, false, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::SUB:
+				if (TryExecuteAddSubVectorNeon(VU, code, false, true))
+					return;
 				ExecuteAddSubMasked(VU, code, false, true, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::SUBi:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, true, VU->VI[REG_I].UL))
+					return;
 				ExecuteAddSubMasked(VU, code, false, true, false, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::SUBq:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, true, VU->VI[REG_Q].UL))
+					return;
 				ExecuteAddSubMasked(VU, code, false, true, false, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::SUBx:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteAddSubMasked(VU, code, false, true, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::SUBy:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteAddSubMasked(VU, code, false, true, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::SUBz:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteAddSubMasked(VU, code, false, true, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::SUBw:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteAddSubMasked(VU, code, false, true, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::SUBA:
+				if (TryExecuteAddSubVectorNeon(VU, code, true, true))
+					return;
 				ExecuteAddSubMasked(VU, code, true, true, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::SUBAi:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, true, VU->VI[REG_I].UL))
+					return;
 				ExecuteAddSubMasked(VU, code, true, true, false, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::SUBAq:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, true, VU->VI[REG_Q].UL))
+					return;
 				ExecuteAddSubMasked(VU, code, true, true, false, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::SUBAx:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, true, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteAddSubMasked(VU, code, true, true, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::SUBAy:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, true, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteAddSubMasked(VU, code, true, true, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::SUBAz:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, true, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteAddSubMasked(VU, code, true, true, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::SUBAw:
+				if (TryExecuteAddSubBroadcastNeon(VU, code, true, true, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteAddSubMasked(VU, code, true, true, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::MAX:
@@ -2124,129 +2326,213 @@ namespace VUInterpFast
 				ExecuteOpmsub(VU, code);
 				return;
 			case UpperFastKind::MUL:
+				if (TryExecuteMulVectorNeon(VU, code, false))
+					return;
 				ExecuteMulMasked(VU, code, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::MULi:
+				if (TryExecuteMulBroadcastNeon(VU, code, false, VU->VI[REG_I].UL))
+					return;
 				ExecuteMulMasked(VU, code, false, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::MULq:
+				if (TryExecuteMulBroadcastNeon(VU, code, false, VU->VI[REG_Q].UL))
+					return;
 				ExecuteMulMasked(VU, code, false, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::MULx:
+				if (TryExecuteMulBroadcastNeon(VU, code, false, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteMulMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::MULy:
+				if (TryExecuteMulBroadcastNeon(VU, code, false, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteMulMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::MULz:
+				if (TryExecuteMulBroadcastNeon(VU, code, false, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteMulMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::MULw:
+				if (TryExecuteMulBroadcastNeon(VU, code, false, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteMulMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::MULA:
+				if (TryExecuteMulVectorNeon(VU, code, true))
+					return;
 				ExecuteMulMasked(VU, code, true, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::MULAi:
+				if (TryExecuteMulBroadcastNeon(VU, code, true, VU->VI[REG_I].UL))
+					return;
 				ExecuteMulMasked(VU, code, true, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::MULAq:
+				if (TryExecuteMulBroadcastNeon(VU, code, true, VU->VI[REG_Q].UL))
+					return;
 				ExecuteMulMasked(VU, code, true, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::MULAx:
+				if (TryExecuteMulBroadcastNeon(VU, code, true, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteMulMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::MULAy:
+				if (TryExecuteMulBroadcastNeon(VU, code, true, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteMulMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::MULAz:
+				if (TryExecuteMulBroadcastNeon(VU, code, true, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteMulMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::MULAw:
+				if (TryExecuteMulBroadcastNeon(VU, code, true, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteMulMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::MADD:
+				if (TryExecuteMaddMsubVectorNeon(VU, code, false, false))
+					return;
 				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::MADDi:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VI[REG_I].UL))
+					return;
 				ExecuteMaddMasked(VU, code, false, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::MADDq:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VI[REG_Q].UL))
+					return;
 				ExecuteMaddMasked(VU, code, false, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::MADDx:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::MADDy:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::MADDz:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::MADDw:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::MADDA:
+				if (TryExecuteMaddMsubVectorNeon(VU, code, true, false))
+					return;
 				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::MADDAi:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, false, VU->VI[REG_I].UL))
+					return;
 				ExecuteMaddMasked(VU, code, true, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::MADDAq:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, false, VU->VI[REG_Q].UL))
+					return;
 				ExecuteMaddMasked(VU, code, true, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::MADDAx:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, false, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::MADDAy:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, false, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::MADDAz:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, false, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::MADDAw:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, false, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteMaddMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::MSUB:
+				if (TryExecuteMaddMsubVectorNeon(VU, code, false, true))
+					return;
 				ExecuteMsubMasked(VU, code, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::MSUBi:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VI[REG_I].UL))
+					return;
 				ExecuteMsubMasked(VU, code, false, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::MSUBq:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VI[REG_Q].UL))
+					return;
 				ExecuteMsubMasked(VU, code, false, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::MSUBx:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteMsubMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::MSUBy:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteMsubMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::MSUBz:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteMsubMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::MSUBw:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteMsubMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::MSUBA:
+				if (TryExecuteMaddMsubVectorNeon(VU, code, true, true))
+					return;
 				ExecuteMsubMasked(VU, code, true, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::MSUBAi:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, true, VU->VI[REG_I].UL))
+					return;
 				ExecuteMsubMasked(VU, code, true, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
 			case UpperFastKind::MSUBAq:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, true, VU->VI[REG_Q].UL))
+					return;
 				ExecuteMsubMasked(VU, code, true, [VU](unsigned) { return VU->VI[REG_Q].UL; });
 				return;
 			case UpperFastKind::MSUBAx:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, true, VU->VF[Ft(code)].UL[0]))
+					return;
 				ExecuteMsubMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
 				return;
 			case UpperFastKind::MSUBAy:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, true, VU->VF[Ft(code)].UL[1]))
+					return;
 				ExecuteMsubMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
 				return;
 			case UpperFastKind::MSUBAz:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, true, VU->VF[Ft(code)].UL[2]))
+					return;
 				ExecuteMsubMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
 				return;
 			case UpperFastKind::MSUBAw:
+				if (TryExecuteMaddMsubBroadcastNeon(VU, code, true, true, VU->VF[Ft(code)].UL[3]))
+					return;
 				ExecuteMsubMasked(VU, code, true, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
 				return;
 			case UpperFastKind::None:
