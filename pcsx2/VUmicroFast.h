@@ -90,6 +90,20 @@ namespace VUInterpFast
 		EEXP,
 	};
 
+	enum class UpperFastKind : u8
+	{
+		None,
+		ABS,
+		FTOI0,
+		FTOI4,
+		FTOI12,
+		FTOI15,
+		ITOF0,
+		ITOF4,
+		ITOF12,
+		ITOF15,
+	};
+
 	static constexpr unsigned Ft(u32 code) { return (code >> 16) & 0x1f; }
 	static constexpr unsigned Fs(u32 code) { return (code >> 11) & 0x1f; }
 	static constexpr unsigned Fd(u32 code) { return (code >> 6) & 0x1f; }
@@ -302,6 +316,73 @@ namespace VUInterpFast
 			default:
 				return LowerFastKind::None;
 		}
+	}
+
+	static constexpr UpperFastKind DecodeUpper(u32 code)
+	{
+		switch (code & 0x3f)
+		{
+			case 0x3c:
+				switch ((code >> 6) & 0x1f)
+				{
+					case 0x04:
+						return UpperFastKind::ITOF0;
+					case 0x05:
+						return UpperFastKind::FTOI0;
+					default:
+						return UpperFastKind::None;
+				}
+			case 0x3d:
+				switch ((code >> 6) & 0x1f)
+				{
+					case 0x04:
+						return UpperFastKind::ITOF4;
+					case 0x05:
+						return UpperFastKind::FTOI4;
+					case 0x07:
+						return UpperFastKind::ABS;
+					default:
+						return UpperFastKind::None;
+				}
+			case 0x3e:
+				switch ((code >> 6) & 0x1f)
+				{
+					case 0x04:
+						return UpperFastKind::ITOF12;
+					case 0x05:
+						return UpperFastKind::FTOI12;
+					default:
+						return UpperFastKind::None;
+				}
+			case 0x3f:
+				switch ((code >> 6) & 0x1f)
+				{
+					case 0x04:
+						return UpperFastKind::ITOF15;
+					case 0x05:
+						return UpperFastKind::FTOI15;
+					default:
+						return UpperFastKind::None;
+				}
+			default:
+				return UpperFastKind::None;
+		}
+	}
+
+	static inline bool AnalyzeUpperNoLower(u32 code, _VURegsNum* regs)
+	{
+		if (DecodeUpper(code) == UpperFastKind::None)
+			return false;
+
+		*regs = {};
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFwrite = Ft(code);
+		regs->VFwxyzw = XYZW(code);
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = XYZW(code);
+		regs->VFr1xyzw = 0xff;
+		regs->VIread = Ft(code) != 0 ? Vf0Flag(Fs(code)) : 0;
+		return true;
 	}
 
 	static inline void AnalyzeIaluItIs(u32 code, _VURegsNum* regs)
@@ -674,6 +755,75 @@ namespace VUInterpFast
 		u32 bits;
 		std::memcpy(&bits, &value, sizeof(bits));
 		return bits;
+	}
+
+	template <typename Unary>
+	static inline void StoreUnaryUpperMasked(VURegs* VU, unsigned ft, unsigned mask, unsigned fs, Unary fn)
+	{
+		if (ft == 0)
+			return;
+		if (mask & 0x8) VU->VF[ft].UL[0] = fn(VU->VF[fs].UL[0]);
+		if (mask & 0x4) VU->VF[ft].UL[1] = fn(VU->VF[fs].UL[1]);
+		if (mask & 0x2) VU->VF[ft].UL[2] = fn(VU->VF[fs].UL[2]);
+		if (mask & 0x1) VU->VF[ft].UL[3] = fn(VU->VF[fs].UL[3]);
+	}
+
+	template <u32 Offset>
+	static inline u32 FloatToIntBits(u32 bits)
+	{
+		float value = FloatFromBits(bits);
+		if (Offset != 0)
+			value *= FloatFromBits(0x3f800000u + (Offset << 23));
+		bits = FloatToBits(value);
+
+		if ((bits & 0x7f800000u) >= 0x4f000000u)
+			return (bits & 0x80000000u) ? 0x80000000u : 0x7fffffffu;
+		return static_cast<u32>(static_cast<s32>(value));
+	}
+
+	template <u32 Offset>
+	static inline u32 IntToFloatBits(u32 bits)
+	{
+		float value = static_cast<float>(static_cast<s32>(bits));
+		if (Offset != 0)
+			value *= FloatFromBits(0x3f800000u - (Offset << 23));
+		return FloatToBits(value);
+	}
+
+	static inline void ExecuteUpperNoLower(VURegs* VU, u32 code)
+	{
+		switch (DecodeUpper(code))
+		{
+			case UpperFastKind::ABS:
+				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), [](u32 bits) { return bits & 0x7fffffffu; });
+				return;
+			case UpperFastKind::FTOI0:
+				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), FloatToIntBits<0>);
+				return;
+			case UpperFastKind::FTOI4:
+				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), FloatToIntBits<4>);
+				return;
+			case UpperFastKind::FTOI12:
+				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), FloatToIntBits<12>);
+				return;
+			case UpperFastKind::FTOI15:
+				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), FloatToIntBits<15>);
+				return;
+			case UpperFastKind::ITOF0:
+				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<0>);
+				return;
+			case UpperFastKind::ITOF4:
+				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<4>);
+				return;
+			case UpperFastKind::ITOF12:
+				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<12>);
+				return;
+			case UpperFastKind::ITOF15:
+				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<15>);
+				return;
+			case UpperFastKind::None:
+				return;
+		}
 	}
 
 	static inline float VuDouble(u32 bits)

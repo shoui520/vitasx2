@@ -20,7 +20,9 @@ extern u32 g_qemuVuUpperNopFastSteps;
 extern u32 g_qemuVuLowerNopFastSteps;
 extern u32 g_qemuVuNopPairBurstSteps;
 extern u32 g_qemuVuLowerDirectFastSteps;
+extern u32 g_qemuVuUpperDirectFastSteps;
 extern bool g_qemuVuLowerDirectFastEnabled;
+extern bool g_qemuVuUpperDirectFastEnabled;
 #endif
 
 void _vu1ExecUpper(VURegs* VU, u32* ptr)
@@ -35,6 +37,22 @@ void _vu1ExecLower(VURegs* VU, u32* ptr)
 	VU->code = ptr[0];
 	IdebugLOWER(VU1);
 	VU1_LOWER_OPCODE[VU->code >> 25]();
+}
+
+static void _vu1ExecUpperMaybeFast(VURegs* VU, u32* ptr, bool upper_fast)
+{
+	if (upper_fast)
+	{
+		VU->code = ptr[1];
+		IdebugUPPER(VU1);
+		VUInterpFast::ExecuteUpperNoLower(VU, ptr[1]);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVuUpperDirectFastSteps;
+#endif
+		return;
+	}
+
+	_vu1ExecUpper(VU, ptr);
 }
 
 int vu1branch = 0;
@@ -215,7 +233,13 @@ static void _vu1Exec(VURegs* VU)
 	}
 
 	VU->code = ptr[1];
-	VU1regs_UPPER_OPCODE[VU->code & 0x3f](&uregs);
+	const bool upper_fast =
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuVuUpperDirectFastEnabled &&
+#endif
+		VUInterpFast::AnalyzeUpperNoLower(ptr[1], &uregs);
+	if (!upper_fast)
+		VU1regs_UPPER_OPCODE[VU->code & 0x3f](&uregs);
 
 	u32 cyclesBeforeOp = VU1.cycle-1;
 
@@ -229,7 +253,7 @@ static void _vu1Exec(VURegs* VU)
 		if (VU->VIBackupCycles > 0)
 			VU->VIBackupCycles -= std::min((u8)(VU1.cycle - cyclesBeforeOp), VU->VIBackupCycles);
 
-		_vu1ExecUpper(VU, ptr);
+		_vu1ExecUpperMaybeFast(VU, ptr, upper_fast);
 
 		VU->VI[REG_I].UL = ptr[0];
 		//Lower not used, set to 0 to fill in the FMAC stall gap
@@ -249,7 +273,7 @@ static void _vu1Exec(VURegs* VU)
 			if (VU->VIBackupCycles > 0)
 				VU->VIBackupCycles-= std::min((u8)(VU1.cycle- cyclesBeforeOp), VU->VIBackupCycles);
 
-			_vu1ExecUpper(VU, ptr);
+			_vu1ExecUpperMaybeFast(VU, ptr, upper_fast);
 			VU->code = ptr[0];
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -314,7 +338,7 @@ static void _vu1Exec(VURegs* VU)
 				}
 			}
 
-			_vu1ExecUpper(VU, ptr);
+			_vu1ExecUpperMaybeFast(VU, ptr, upper_fast);
 
 			if (discard == 0)
 			{

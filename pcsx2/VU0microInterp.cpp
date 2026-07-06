@@ -16,7 +16,9 @@ extern u32 g_qemuVuUpperNopFastSteps;
 extern u32 g_qemuVuLowerNopFastSteps;
 extern u32 g_qemuVuNopPairBurstSteps;
 extern u32 g_qemuVuLowerDirectFastSteps;
+extern u32 g_qemuVuUpperDirectFastSteps;
 extern bool g_qemuVuLowerDirectFastEnabled;
+extern bool g_qemuVuUpperDirectFastEnabled;
 #endif
 
 static void _vu0ExecUpper(VURegs* VU, u32* ptr)
@@ -31,6 +33,22 @@ static void _vu0ExecLower(VURegs* VU, u32* ptr)
 	VU->code = ptr[0];
 	IdebugLOWER(VU0);
 	VU0_LOWER_OPCODE[VU->code >> 25]();
+}
+
+static void _vu0ExecUpperMaybeFast(VURegs* VU, u32* ptr, bool upper_fast)
+{
+	if (upper_fast)
+	{
+		VU->code = ptr[1];
+		IdebugUPPER(VU0);
+		VUInterpFast::ExecuteUpperNoLower(VU, ptr[1]);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVuUpperDirectFastSteps;
+#endif
+		return;
+	}
+
+	_vu0ExecUpper(VU, ptr);
 }
 
 int vu0branch = 0;
@@ -212,7 +230,13 @@ static void _vu0Exec(VURegs* VU)
 	}
 
 	VU->code = ptr[1];
-	VU0regs_UPPER_OPCODE[VU->code & 0x3f](&uregs);
+	const bool upper_fast =
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuVuUpperDirectFastEnabled &&
+#endif
+		VUInterpFast::AnalyzeUpperNoLower(ptr[1], &uregs);
+	if (!upper_fast)
+		VU0regs_UPPER_OPCODE[VU->code & 0x3f](&uregs);
 
 	u64 cyclesBeforeOp = VU0.cycle - 1;
 
@@ -226,7 +250,7 @@ static void _vu0Exec(VURegs* VU)
 		if (VU->VIBackupCycles > 0)
 			VU->VIBackupCycles -= std::min((u8)(VU0.cycle - cyclesBeforeOp), VU->VIBackupCycles);
 
-		_vu0ExecUpper(VU, ptr);
+		_vu0ExecUpperMaybeFast(VU, ptr, upper_fast);
 
 		VU->VI[REG_I].UL = ptr[0];
 		memset(&lregs, 0, sizeof(lregs));
@@ -245,7 +269,7 @@ static void _vu0Exec(VURegs* VU)
 				VU->VIBackupCycles -= std::min((u8)(VU0.cycle - cyclesBeforeOp), VU->VIBackupCycles);
 			vu0branch = false;
 
-			_vu0ExecUpper(VU, ptr);
+			_vu0ExecUpperMaybeFast(VU, ptr, upper_fast);
 			VU->code = ptr[0];
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -309,7 +333,7 @@ static void _vu0Exec(VURegs* VU)
 				}
 			}
 
-			_vu0ExecUpper(VU, ptr);
+			_vu0ExecUpperMaybeFast(VU, ptr, upper_fast);
 
 			if (discard == 0)
 			{
