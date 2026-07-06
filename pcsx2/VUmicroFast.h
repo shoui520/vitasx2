@@ -1853,6 +1853,47 @@ namespace VUInterpFast
 			subtract ? vsubq_f32(acc_value, product) : vaddq_f32(acc_value, product));
 		return true;
 	}
+
+	static inline float32x4_t OuterProductNeon(VURegs* VU, u32 code)
+	{
+		// PCSX2 owner: VUops.cpp::_vuOPMULA()/_vuOPMSUB() use
+		// {Fs.y * Ft.z, Fs.z * Ft.x, Fs.x * Ft.y}; W is ignored.
+		const float32x4_t fs = VuFloatQNeon(vld1q_u32(VU->VF[Fs(code)].UL));
+		const float32x4_t ft = VuFloatQNeon(vld1q_u32(VU->VF[Ft(code)].UL));
+		float32x4_t fs_yzx = vextq_f32(fs, fs, 1);
+		float32x4_t ft_zxy = vextq_f32(ft, ft, 2);
+		fs_yzx = vsetq_lane_f32(vgetq_lane_f32(fs, 0), fs_yzx, 2);
+		ft_zxy = vsetq_lane_f32(vgetq_lane_f32(ft, 0), ft_zxy, 1);
+		ft_zxy = vsetq_lane_f32(vgetq_lane_f32(ft, 1), ft_zxy, 2);
+		return vmulq_f32(fs_yzx, ft_zxy);
+	}
+
+	static inline bool ExecuteOpmulaNeon(VURegs* VU, u32 code)
+	{
+		const float32x4_t product = OuterProductNeon(VU, code);
+		VU->ACC.UL[0] = UpdateMacLane(VU, 0, vgetq_lane_f32(product, 0));
+		VU->ACC.UL[1] = UpdateMacLane(VU, 1, vgetq_lane_f32(product, 1));
+		VU->ACC.UL[2] = UpdateMacLane(VU, 2, vgetq_lane_f32(product, 2));
+		VU_STAT_UPDATE(VU);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuUpperNeonQwordOps;
+#endif
+		return true;
+	}
+
+	static inline bool ExecuteOpmsubNeon(VURegs* VU, u32 code)
+	{
+		const float32x4_t result = vsubq_f32(VuFloatQNeon(vld1q_u32(VU->ACC.UL)), OuterProductNeon(VU, code));
+		const unsigned fd = Fd(code);
+		WriteMacResult(VU, false, fd, 0, UpdateMacLane(VU, 0, vgetq_lane_f32(result, 0)));
+		WriteMacResult(VU, false, fd, 1, UpdateMacLane(VU, 1, vgetq_lane_f32(result, 1)));
+		WriteMacResult(VU, false, fd, 2, UpdateMacLane(VU, 2, vgetq_lane_f32(result, 2)));
+		VU_STAT_UPDATE(VU);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuUpperNeonQwordOps;
+#endif
+		return true;
+	}
 #endif
 
 	static inline bool TryExecuteAddSubVectorNeon(VURegs* VU, u32 code, bool acc, bool subtract)
@@ -1904,6 +1945,24 @@ namespace VUInterpFast
 	{
 #if defined(ARCH_ARM32)
 		return ExecuteMaddMsubMaskedNeon(VU, code, acc, subtract, vdupq_n_u32(operand_bits));
+#else
+		return false;
+#endif
+	}
+
+	static inline bool TryExecuteOpmulaNeon(VURegs* VU, u32 code)
+	{
+#if defined(ARCH_ARM32)
+		return ExecuteOpmulaNeon(VU, code);
+#else
+		return false;
+#endif
+	}
+
+	static inline bool TryExecuteOpmsubNeon(VURegs* VU, u32 code)
+	{
+#if defined(ARCH_ARM32)
+		return ExecuteOpmsubNeon(VU, code);
 #else
 		return false;
 #endif
@@ -2320,9 +2379,13 @@ namespace VUInterpFast
 				ExecuteClip(VU, code);
 				return;
 			case UpperFastKind::OPMULA:
+				if (TryExecuteOpmulaNeon(VU, code))
+					return;
 				ExecuteOpmula(VU, code);
 				return;
 			case UpperFastKind::OPMSUB:
+				if (TryExecuteOpmsubNeon(VU, code))
+					return;
 				ExecuteOpmsub(VU, code);
 				return;
 			case UpperFastKind::MUL:
