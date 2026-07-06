@@ -148,6 +148,7 @@ namespace VitaEE
 		constexpr size_t VU0_VF_OFFSET = offsetof(Vu0State, VF);
 		constexpr size_t VU0_VI_OFFSET = offsetof(Vu0State, VI);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		constexpr size_t VU0_MEM_OFFSET = offsetof(Vu0State, Mem);
 		constexpr size_t VU0_CODE_OFFSET = offsetof(Vu0State, code);
 		constexpr size_t VU0_VI_BACKUP_CYCLES_OFFSET = offsetof(Vu0State, VIBackupCycles);
 		constexpr size_t VU0_VI_OLD_VALUE_OFFSET = offsetof(Vu0State, VIOldValue);
@@ -284,6 +285,12 @@ namespace VitaEE
 			Cop2MacroRandomKind kind = Cop2MacroRandomKind::WaitQ;
 		};
 
+		struct Cop2MacroIndexedViMemoryOp
+		{
+			bool valid = false;
+			bool load = false;
+		};
+
 		constexpr unsigned RS(u32 op)
 		{
 			return (op >> 21) & 0x1f;
@@ -413,6 +420,24 @@ namespace VitaEE
 				default:
 					return {};
 			}
+		}
+
+		constexpr Cop2MacroIndexedViMemoryOp DecodeCop2MacroIndexedViMemory(u32 op)
+		{
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+			(void)op;
+			return {};
+#else
+			if ((op & 0x3c) != 0x3c)
+				return {};
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			if (special2_index == 0x3e)
+				return {true, true};
+			if (special2_index == 0x3f)
+				return {true, false};
+			return {};
+#endif
 		}
 
 		constexpr size_t GprOffset(unsigned guest_reg)
@@ -921,8 +946,8 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*, and
-			// x86/microVU_Macro.inl
+			// VABS/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR,
+			// and x86/microVU_Macro.inl
 			// recVMAX/recVMINI/recVABS/recVNOP/recVMOVE/recVMR32/recVI*/
 			// recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops have no
 			// MAC/status/clip synchronization side effects, so idle VU0 can
@@ -942,6 +967,8 @@ namespace VitaEE
 			if (DecodeCop2MacroViTransfer(op).valid)
 				return true;
 			if (DecodeCop2MacroRandom(op).valid)
+				return true;
+			if (DecodeCop2MacroIndexedViMemory(op).valid)
 				return true;
 
 			if ((op & 0x3c) != 0x3c)
@@ -1008,6 +1035,8 @@ namespace VitaEE
 					const Cop2MacroRandomOp random = DecodeCop2MacroRandom(op);
 					return random.kind == Cop2MacroRandomKind::WaitQ ? 1 : 3;
 				}
+				if (DecodeCop2MacroIndexedViMemory(op).valid)
+					return 4; // code + address VI + data VI + VU memory/register window.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
@@ -1934,6 +1963,9 @@ namespace VitaEE
 	static_assert(TLB_ENTRY_LO1_OFFSET == 12);
 	static_assert(VU0_VF_OFFSET == 0);
 	static_assert(VU0_VI_OFFSET + VU0_VI_STRIDE * 32 <= 0x0fff);
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+	static_assert(VU0_MEM_OFFSET <= 0x0fff);
+#endif
 
 	void RefreshRawGpr0KnownZero()
 	{
@@ -4732,6 +4764,8 @@ namespace VitaEE
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroViTransferBody(op);
 		if (DecodeCop2MacroRandom(op).valid)
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroRandomBody(op);
+		if (DecodeCop2MacroIndexedViMemory(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroIndexedViMemoryBody(op);
 
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
@@ -5074,6 +5108,112 @@ namespace VitaEE
 		const auto emit_lane = [this](unsigned lane) {
 			const u16 offset = static_cast<u16>(lane * sizeof(u32));
 			return m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
+		};
+
+		if ((mask & 0x8) && !emit_lane(0))
+			return false;
+		if ((mask & 0x4) && !emit_lane(1))
+			return false;
+		if ((mask & 0x2) && !emit_lane(2))
+			return false;
+		if ((mask & 0x1) && !emit_lane(3))
+			return false;
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitVu0IndexedMemoryAddress(unsigned vi_reg)
+	{
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		(void)vi_reg;
+		return false;
+#else
+		// PCSX2 owner: VUops.cpp::GET_VU_MEM(). For VU0, addresses below
+		// 0x4000 wrap in VU0 data memory; 0x4000 maps into VU1 VF/VI storage.
+		if (!EmitVu0ViAddress(HOST_TMP0, vi_reg) ||
+			!m_code.EmitLdrhImm8(HOST_TMP2, HOST_TMP0, 0) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSL, 4) ||
+			!m_code.EmitTstImm32(HOST_TMP2, 0x4000u))
+		{
+			return false;
+		}
+
+		const size_t vu0_memory = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (vu0_memory == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovImm32(HOST_TMP0,
+				static_cast<u32>(reinterpret_cast<uptr>(&VU1.VF[0]))) ||
+			!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP2, 0x03ffu, HOST_TMP3) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
+		{
+			return false;
+		}
+
+		const size_t done = m_code.EmitBranchPlaceholder();
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t vu0_memory_target = m_code.Size();
+		if (!m_code.PatchBranch(vu0_memory, vu0_memory_target, VitaA32::Condition::EQ) ||
+			!EmitVu0RegisterAddress(HOST_TMP0, VU0_MEM_OFFSET) ||
+			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0) ||
+			!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP2, 0x0fffu, HOST_TMP3) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(done, m_code.Size());
+#endif
+	}
+
+	bool BlockCompiler::EmitCOP2MacroIndexedViMemoryBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::_vuILWR() / _vuISWR(). These use VI.US[0]
+		// as an indexed VU memory qword address and do not update _vuBackupVI().
+		const Cop2MacroIndexedViMemoryOp memory = DecodeCop2MacroIndexedViMemory(op);
+		if (!memory.valid)
+			return false;
+
+		const unsigned mask = (op >> 21) & 0x0f;
+		if (mask == 0)
+			return true;
+
+		const unsigned it = RT(op) & 0x0f;
+		const unsigned is = RD(op) & 0x0f;
+		if (memory.load)
+		{
+			if (it == 0)
+				return true;
+
+			unsigned lane = 0;
+			if (mask & 0x1)
+				lane = 3;
+			else if (mask & 0x2)
+				lane = 2;
+			else if (mask & 0x4)
+				lane = 1;
+
+			const u8 memory_offset = static_cast<u8>(lane * sizeof(u32));
+			return EmitVu0IndexedMemoryAddress(is) &&
+				   m_code.EmitLdrhImm8(HOST_TMP2, HOST_TMP0, memory_offset) &&
+				   EmitVu0ViAddress(HOST_TMP1, it) &&
+				   m_code.EmitStrhImm8(HOST_TMP2, HOST_TMP1, 0);
+		}
+
+		if (!EmitVu0IndexedMemoryAddress(is) ||
+			!EmitVu0ViAddress(HOST_TMP1, it) ||
+			!m_code.EmitLdrhImm8(HOST_TMP2, HOST_TMP1, 0) ||
+			!m_code.EmitMovImm8(HOST_TMP3, 0))
+		{
+			return false;
+		}
+
+		const auto emit_lane = [this](unsigned lane) {
+			const u8 offset = static_cast<u8>(lane * sizeof(u32));
+			return m_code.EmitStrhImm8(HOST_TMP2, HOST_TMP0, offset) &&
+				   m_code.EmitStrhImm8(HOST_TMP3, HOST_TMP0, static_cast<u8>(offset + sizeof(u16)));
 		};
 
 		if ((mask & 0x8) && !emit_lane(0))
