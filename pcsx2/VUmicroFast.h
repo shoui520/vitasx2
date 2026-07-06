@@ -1347,6 +1347,21 @@ namespace VUInterpFast
 		return GET_VU_MEM(VU, address);
 	}
 
+	static constexpr u8 XYZW_LAST_HALFWORD_INDEX[16] = {
+		0, 6, 4, 6,
+		2, 6, 4, 6,
+		0, 6, 4, 6,
+		2, 6, 4, 6,
+	};
+
+	static inline void LoadViHalfwordFromMemoryMasked(VURegs* VU, unsigned it, unsigned mask, const u16* ptr)
+	{
+		if (it == 0 || mask == 0)
+			return;
+
+		VU->VI[it].US[0] = ptr[XYZW_LAST_HALFWORD_INDEX[mask]];
+	}
+
 #if defined(ARCH_ARM32)
 	alignas(16) static constexpr u32 XYZW_LANE_WRITE_MASKS_NEON[16][4] = {
 		{0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
@@ -2268,11 +2283,8 @@ namespace VUInterpFast
 				if (It(code) == 0)
 					return;
 				const u16 addr = static_cast<u16>((Imm11(code) + VU->VI[Is(code)].SS[0]) * 16);
-				const u16* ptr = reinterpret_cast<const u16*>(VuMemQword(VU, addr));
-				if (XYZW(code) & 0x8) VU->VI[It(code)].US[0] = ptr[0];
-				if (XYZW(code) & 0x4) VU->VI[It(code)].US[0] = ptr[2];
-				if (XYZW(code) & 0x2) VU->VI[It(code)].US[0] = ptr[4];
-				if (XYZW(code) & 0x1) VU->VI[It(code)].US[0] = ptr[6];
+				LoadViHalfwordFromMemoryMasked(VU, It(code), XYZW(code),
+					reinterpret_cast<const u16*>(VuMemQword(VU, addr)));
 				return;
 			}
 			case LowerFastKind::ISW:
@@ -2414,11 +2426,8 @@ namespace VUInterpFast
 			{
 				if (It(code) == 0)
 					return;
-				const u16* ptr = reinterpret_cast<const u16*>(VuMemQword(VU, VU->VI[Is(code)].US[0] * 16));
-				if (XYZW(code) & 0x8) VU->VI[It(code)].US[0] = ptr[0];
-				if (XYZW(code) & 0x4) VU->VI[It(code)].US[0] = ptr[2];
-				if (XYZW(code) & 0x2) VU->VI[It(code)].US[0] = ptr[4];
-				if (XYZW(code) & 0x1) VU->VI[It(code)].US[0] = ptr[6];
+				LoadViHalfwordFromMemoryMasked(VU, It(code), XYZW(code),
+					reinterpret_cast<const u16*>(VuMemQword(VU, VU->VI[Is(code)].US[0] * 16)));
 				return;
 			}
 			case LowerFastKind::ISWR:
