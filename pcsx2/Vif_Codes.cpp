@@ -9,6 +9,12 @@
 #include "Vif_Dma.h"
 #include "Vif_Dynarec.h"
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
+#include <cstring>
+
 #define vifOp(vifCodeName) _vifT int vifCodeName(int pass, const u32* data)
 #define pass1 if (pass == 0)
 #define pass2 if (pass == 1)
@@ -20,6 +26,42 @@
 			return vifCode_Null<idx>(pass, (u32*)data); \
 	}
 vifOp(vifCode_Null);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuVifMpgNeonQwords = 0;
+#endif
+
+static __forceinline void VifMpgCopyBytes(void* dst, const void* src, size_t size)
+{
+#if defined(ARCH_ARM32)
+	u8* cdst = static_cast<u8*>(dst);
+	const u8* csrc = static_cast<const u8*>(src);
+	const size_t qwords = size >> 4;
+	for (size_t i = 0; i < qwords; i++)
+	{
+		const uint8x16_t qword = vld1q_u8(csrc);
+		vst1q_u8(cdst, qword);
+		csrc += 16;
+		cdst += 16;
+	}
+
+	if (size & 8)
+	{
+		const uint8x8_t half = vld1_u8(csrc);
+		vst1_u8(cdst, half);
+		csrc += 8;
+		cdst += 8;
+	}
+	for (size_t i = 0; i < (size & 7); i++)
+		cdst[i] = csrc[i];
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuVifMpgNeonQwords += static_cast<u32>(qwords);
+#endif
+	return;
+#endif
+	memcpy(dst, src, size);
+}
 
 //------------------------------------------------------------------
 // Vif0/Vif1 Misc Functions
@@ -343,10 +385,10 @@ static __fi void _vifCode_MPG(int idx, u32 addr, const u32* data, int size)
 		else
 			CpuVU1->Clear(addr, vuMemSize - addr);
 
-		memcpy(VUx.Micro + addr, data, vuMemSize - addr);
+		VifMpgCopyBytes(VUx.Micro + addr, data, vuMemSize - addr);
 		size -= (vuMemSize - addr) / 4;
 		data += (vuMemSize - addr) / 4;
-		memcpy(VUx.Micro, data, size * 4);
+		VifMpgCopyBytes(VUx.Micro, data, size * 4);
 
 		vifX.tag.addr = size * 4;
 	}
@@ -360,7 +402,7 @@ static __fi void _vifCode_MPG(int idx, u32 addr, const u32* data, int size)
 			CpuVU0->Clear(addr, size * 4);
 		else
 			CpuVU1->Clear(addr, size * 4);
-		memcpy(VUx.Micro + addr, data, size * 4); //from tests, memcpy is 1fps faster on Grandia 3 than memcpy
+		VifMpgCopyBytes(VUx.Micro + addr, data, size * 4);
 
 		vifX.tag.addr += size * 4;
 	}
