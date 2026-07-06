@@ -147,6 +147,9 @@ namespace VitaEE
 		using Vu0State = std::remove_reference_t<decltype(VU0)>;
 		constexpr size_t VU0_VF_OFFSET = offsetof(Vu0State, VF);
 		constexpr size_t VU0_VI_OFFSET = offsetof(Vu0State, VI);
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		constexpr size_t VU0_CODE_OFFSET = offsetof(Vu0State, code);
+#endif
 		constexpr size_t VU0_VF_STRIDE = sizeof(VU0.VF[0]);
 		constexpr size_t VU0_VI_STRIDE = sizeof(VU0.VI[0]);
 		constexpr u32 TLB_PAGE_MASK_REGISTER_MASK = 0x01ffe000u;
@@ -774,10 +777,27 @@ namespace VitaEE
 			return fs != VU0_REG_FBRST && fs != VU0_REG_CMSAR1;
 		}
 
+		bool IsFastCOP2MacroInBlock(u32 op)
+		{
+			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp::VABS()/VNOP(),
+			// and x86/microVU_Macro.inl::recVABS()/recVNOP(). These macro ops
+			// have no MAC/status/clip synchronization side effects, so idle VU0
+			// can execute them inline while running VU0 stays on the helper tail.
+			if ((op >> 26) != 0x12 || (((op >> 21) & 0x10) == 0) ||
+				!IsCOP2Special1Supported(op) || (op & 0x3c) != 0x3c)
+			{
+				return false;
+			}
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			return special2_index == 0x1d || // VABS
+				   special2_index == 0x2f;   // VNOP
+		}
+
 		bool IsFastCOP2InBlock(u32 op)
 		{
 			return IsFastCOP2VectorTransfer(op) || IsFastCOP2ControlRead(op) ||
-				   IsFastCOP2ControlWrite(op);
+				   IsFastCOP2ControlWrite(op) || IsFastCOP2MacroInBlock(op);
 		}
 
 		unsigned FastVu0AddressUses(u32 op)
@@ -813,6 +833,12 @@ namespace VitaEE
 					default:
 						return 1;
 				}
+			}
+
+			if (IsFastCOP2MacroInBlock(op))
+			{
+				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
 			}
 
 			switch (op >> 26)
@@ -4349,6 +4375,8 @@ namespace VitaEE
 			return EmitCOP2ControlReadFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
 		if (IsFastCOP2ControlWrite(op))
 			return EmitCOP2ControlWriteFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
+		if (IsFastCOP2MacroInBlock(op))
+			return EmitCOP2MacroFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
 
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		return false;
@@ -4498,6 +4526,107 @@ namespace VitaEE
 		}
 
 		return true;
+	}
+
+	bool BlockCompiler::EmitCOP2MacroCodeWrite(u32 op)
+	{
+		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)))
+		{
+			return false;
+		}
+
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		return true;
+#else
+		return EmitVu0RegisterAddress(HOST_TMP1, VU0_CODE_OFFSET) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_TMP1, 0);
+#endif
+	}
+
+	bool BlockCompiler::EmitCOP2MacroBody(u32 op)
+	{
+		// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp::VABS()/VNOP(),
+		// and x86/microVU_Macro.inl::recVABS()/recVNOP(). This body is emitted
+		// only on the idle-VU0 path; running VU0 exits through the COP2 helper
+		// so _vu0FinishMicro() still owns the interlock and cycle side effects.
+		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+		if (!EmitCOP2MacroCodeWrite(op))
+			return false;
+
+		if (special2_index == 0x2f) // VNOP
+			return true;
+
+		if (special2_index != 0x1d) // VABS
+			return false;
+
+		const unsigned ft = RT(op);
+		if (ft == 0)
+			return true;
+
+		const unsigned fs = RD(op);
+		const unsigned mask = (op >> 21) & 0x0f;
+		if (mask == 0)
+			return true;
+
+		if (mask == 0x0f)
+		{
+			constexpr unsigned NEON_VALUE = 0;
+			constexpr unsigned NEON_MASK = 1;
+			return EmitVu0VfAddress(HOST_TMP0, fs) &&
+				   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
+				   m_code.EmitMovImm32(HOST_TMP2, 0x7fffffffu) &&
+				   m_code.EmitVdupI32QFromCore(NEON_MASK, HOST_TMP2) &&
+				   m_code.EmitVandQ(NEON_VALUE, NEON_VALUE, NEON_MASK) &&
+				   EmitVu0VfAddress(HOST_TMP1, ft) &&
+				   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
+		}
+
+		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+			!EmitVu0VfAddress(HOST_TMP1, ft))
+		{
+			return false;
+		}
+
+		const auto emit_lane = [this](unsigned lane) {
+			const u16 offset = static_cast<u16>(lane * sizeof(u32));
+			return m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, offset) &&
+				   EmitBicImm32OrReg(HOST_TMP2, HOST_TMP2, 0x80000000u, HOST_TMP3) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
+		};
+
+		if ((mask & 0x8) && !emit_lane(0))
+			return false;
+		if ((mask & 0x4) && !emit_lane(1))
+			return false;
+		if ((mask & 0x2) && !emit_lane(2))
+			return false;
+		if ((mask & 0x1) && !emit_lane(3))
+			return false;
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitCOP2MacroFast(u32 op, u32 next_pc,
+		u32 raw_cycles_through_instruction, const void* event_exit)
+	{
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		return false;
+#else
+		if (!event_exit || raw_cycles_through_instruction == 0)
+			return false;
+
+		size_t vu0_idle = static_cast<size_t>(-1);
+		if (!EmitCOP2IdleBranch(&vu0_idle) ||
+			!EmitSystemHelperEventExit(op, next_pc, raw_cycles_through_instruction,
+				reinterpret_cast<const void*>(&R5900::Interpreter::OpcodeImpl::COP2), event_exit) ||
+			!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+		{
+			return false;
+		}
+
+		return EmitCOP2MacroBody(op);
+#endif
 	}
 
 	bool BlockCompiler::EmitCOP2VectorTransferFast(u32 op, u32 next_pc,
