@@ -102,6 +102,18 @@ namespace VUInterpFast
 		ITOF4,
 		ITOF12,
 		ITOF15,
+		MAX,
+		MAXi,
+		MAXx,
+		MAXy,
+		MAXz,
+		MAXw,
+		MINI,
+		MINIi,
+		MINIx,
+		MINIy,
+		MINIz,
+		MINIw,
 	};
 
 	static constexpr unsigned Ft(u32 code) { return (code >> 16) & 0x1f; }
@@ -322,6 +334,30 @@ namespace VUInterpFast
 	{
 		switch (code & 0x3f)
 		{
+			case 0x10:
+				return UpperFastKind::MAXx;
+			case 0x11:
+				return UpperFastKind::MAXy;
+			case 0x12:
+				return UpperFastKind::MAXz;
+			case 0x13:
+				return UpperFastKind::MAXw;
+			case 0x14:
+				return UpperFastKind::MINIx;
+			case 0x15:
+				return UpperFastKind::MINIy;
+			case 0x16:
+				return UpperFastKind::MINIz;
+			case 0x17:
+				return UpperFastKind::MINIw;
+			case 0x1d:
+				return UpperFastKind::MAXi;
+			case 0x1f:
+				return UpperFastKind::MINIi;
+			case 0x2b:
+				return UpperFastKind::MAX;
+			case 0x2f:
+				return UpperFastKind::MINI;
 			case 0x3c:
 				switch ((code >> 6) & 0x1f)
 				{
@@ -369,12 +405,66 @@ namespace VUInterpFast
 		}
 	}
 
+	static inline void AnalyzeUpperFdfsft(u32 code, u32 ft_xyzw, _VURegsNum* regs)
+	{
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFwrite = Fd(code);
+		regs->VFwxyzw = XYZW(code);
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = XYZW(code);
+		regs->VFread1 = Ft(code);
+		regs->VFr1xyzw = ft_xyzw;
+		regs->VIread = Vf0Flag(Fs(code)) | Vf0Flag(Ft(code));
+	}
+
+	static inline void AnalyzeUpperFdfsi(u32 code, _VURegsNum* regs)
+	{
+		regs->pipe = VUPIPE_FMAC;
+		regs->VFwrite = Fd(code);
+		regs->VFwxyzw = XYZW(code);
+		regs->VFread0 = Fs(code);
+		regs->VFr0xyzw = XYZW(code);
+		regs->VIread = (1u << REG_I) | Vf0Flag(Fs(code));
+	}
+
 	static inline bool AnalyzeUpperNoLower(u32 code, _VURegsNum* regs)
 	{
-		if (DecodeUpper(code) == UpperFastKind::None)
+		const UpperFastKind kind = DecodeUpper(code);
+		if (kind == UpperFastKind::None)
 			return false;
 
 		*regs = {};
+
+		switch (kind)
+		{
+			case UpperFastKind::MAX:
+			case UpperFastKind::MINI:
+				AnalyzeUpperFdfsft(code, XYZW(code), regs);
+				return true;
+			case UpperFastKind::MAXi:
+			case UpperFastKind::MINIi:
+				AnalyzeUpperFdfsi(code, regs);
+				return true;
+			case UpperFastKind::MAXx:
+			case UpperFastKind::MINIx:
+				AnalyzeUpperFdfsft(code, 0x8, regs);
+				return true;
+			case UpperFastKind::MAXy:
+			case UpperFastKind::MINIy:
+				AnalyzeUpperFdfsft(code, 0x4, regs);
+				return true;
+			case UpperFastKind::MAXz:
+			case UpperFastKind::MINIz:
+				AnalyzeUpperFdfsft(code, 0x2, regs);
+				return true;
+			case UpperFastKind::MAXw:
+			case UpperFastKind::MINIw:
+				AnalyzeUpperFdfsft(code, 0x1, regs);
+				return true;
+			default:
+				break;
+		}
+
 		regs->pipe = VUPIPE_FMAC;
 		regs->VFwrite = Ft(code);
 		regs->VFwxyzw = XYZW(code);
@@ -768,6 +858,46 @@ namespace VUInterpFast
 		if (mask & 0x1) VU->VF[ft].UL[3] = fn(VU->VF[fs].UL[3]);
 	}
 
+	template <typename Binary>
+	static inline void StoreBinaryUpperMasked(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, unsigned ft, Binary fn)
+	{
+		if (fd == 0)
+			return;
+		if (mask & 0x8) VU->VF[fd].UL[0] = fn(VU->VF[fs].UL[0], VU->VF[ft].UL[0]);
+		if (mask & 0x4) VU->VF[fd].UL[1] = fn(VU->VF[fs].UL[1], VU->VF[ft].UL[1]);
+		if (mask & 0x2) VU->VF[fd].UL[2] = fn(VU->VF[fs].UL[2], VU->VF[ft].UL[2]);
+		if (mask & 0x1) VU->VF[fd].UL[3] = fn(VU->VF[fs].UL[3], VU->VF[ft].UL[3]);
+	}
+
+	template <typename Binary>
+	static inline void StoreBinaryUpperBroadcastMasked(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, u32 ft, Binary fn)
+	{
+		if (fd == 0)
+			return;
+		if (mask & 0x8) VU->VF[fd].UL[0] = fn(VU->VF[fs].UL[0], ft);
+		if (mask & 0x4) VU->VF[fd].UL[1] = fn(VU->VF[fs].UL[1], ft);
+		if (mask & 0x2) VU->VF[fd].UL[2] = fn(VU->VF[fs].UL[2], ft);
+		if (mask & 0x1) VU->VF[fd].UL[3] = fn(VU->VF[fs].UL[3], ft);
+	}
+
+	static inline u32 FpMaxBits(u32 a, u32 b)
+	{
+		const s32 sa = static_cast<s32>(a);
+		const s32 sb = static_cast<s32>(b);
+		if (sa < 0 && sb < 0)
+			return static_cast<u32>(sa < sb ? sa : sb);
+		return static_cast<u32>(sa < sb ? sb : sa);
+	}
+
+	static inline u32 FpMinBits(u32 a, u32 b)
+	{
+		const s32 sa = static_cast<s32>(a);
+		const s32 sb = static_cast<s32>(b);
+		if (sa < 0 && sb < 0)
+			return static_cast<u32>(sa < sb ? sb : sa);
+		return static_cast<u32>(sa < sb ? sa : sb);
+	}
+
 	template <u32 Offset>
 	static inline u32 FloatToIntBits(u32 bits)
 	{
@@ -820,6 +950,42 @@ namespace VUInterpFast
 				return;
 			case UpperFastKind::ITOF15:
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<15>);
+				return;
+			case UpperFastKind::MAX:
+				StoreBinaryUpperMasked(VU, Fd(code), XYZW(code), Fs(code), Ft(code), FpMaxBits);
+				return;
+			case UpperFastKind::MAXi:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VI[REG_I].UL, FpMaxBits);
+				return;
+			case UpperFastKind::MAXx:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[0], FpMaxBits);
+				return;
+			case UpperFastKind::MAXy:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[1], FpMaxBits);
+				return;
+			case UpperFastKind::MAXz:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[2], FpMaxBits);
+				return;
+			case UpperFastKind::MAXw:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[3], FpMaxBits);
+				return;
+			case UpperFastKind::MINI:
+				StoreBinaryUpperMasked(VU, Fd(code), XYZW(code), Fs(code), Ft(code), FpMinBits);
+				return;
+			case UpperFastKind::MINIi:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VI[REG_I].UL, FpMinBits);
+				return;
+			case UpperFastKind::MINIx:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[0], FpMinBits);
+				return;
+			case UpperFastKind::MINIy:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[1], FpMinBits);
+				return;
+			case UpperFastKind::MINIz:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[2], FpMinBits);
+				return;
+			case UpperFastKind::MINIw:
+				StoreBinaryUpperBroadcastMasked(VU, Fd(code), XYZW(code), Fs(code), VU->VF[Ft(code)].UL[3], FpMinBits);
 				return;
 			case UpperFastKind::None:
 				return;
