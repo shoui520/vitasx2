@@ -291,6 +291,20 @@ namespace VitaEE
 			bool load = false;
 		};
 
+		enum class Cop2MacroIndexedVectorMemoryKind : u8
+		{
+			LoadIncrement,
+			StoreIncrement,
+			LoadDecrement,
+			StoreDecrement,
+		};
+
+		struct Cop2MacroIndexedVectorMemoryOp
+		{
+			bool valid = false;
+			Cop2MacroIndexedVectorMemoryKind kind = Cop2MacroIndexedVectorMemoryKind::LoadIncrement;
+		};
+
 		constexpr unsigned RS(u32 op)
 		{
 			return (op >> 21) & 0x1f;
@@ -437,6 +451,32 @@ namespace VitaEE
 			if (special2_index == 0x3f)
 				return {true, false};
 			return {};
+#endif
+		}
+
+		constexpr Cop2MacroIndexedVectorMemoryOp DecodeCop2MacroIndexedVectorMemory(u32 op)
+		{
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+			(void)op;
+			return {};
+#else
+			if ((op & 0x3c) != 0x3c)
+				return {};
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			switch (special2_index)
+			{
+				case 0x34:
+					return {true, Cop2MacroIndexedVectorMemoryKind::LoadIncrement};
+				case 0x35:
+					return {true, Cop2MacroIndexedVectorMemoryKind::StoreIncrement};
+				case 0x36:
+					return {true, Cop2MacroIndexedVectorMemoryKind::LoadDecrement};
+				case 0x37:
+					return {true, Cop2MacroIndexedVectorMemoryKind::StoreDecrement};
+				default:
+					return {};
+			}
 #endif
 		}
 
@@ -946,8 +986,8 @@ namespace VitaEE
 		bool IsFastCOP2MacroInBlock(u32 op)
 		{
 			// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp VMAX/VMINI/
-			// VABS/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR,
-			// and x86/microVU_Macro.inl
+			// VABS/VNOP/VMOVE/VMR32/VI*/VMFIR/VMTIR/VWAITQ/VR*/VILWR/VISWR/
+			// VLQI/VSQI/VLQD/VSQD, and x86/microVU_Macro.inl
 			// recVMAX/recVMINI/recVABS/recVNOP/recVMOVE/recVMR32/recVI*/
 			// recVMFIR/recVMTIR/recVWAITQ/recVR*. These macro ops have no
 			// MAC/status/clip synchronization side effects, so idle VU0 can
@@ -969,6 +1009,8 @@ namespace VitaEE
 			if (DecodeCop2MacroRandom(op).valid)
 				return true;
 			if (DecodeCop2MacroIndexedViMemory(op).valid)
+				return true;
+			if (DecodeCop2MacroIndexedVectorMemory(op).valid)
 				return true;
 
 			if ((op & 0x3c) != 0x3c)
@@ -1037,6 +1079,8 @@ namespace VitaEE
 				}
 				if (DecodeCop2MacroIndexedViMemory(op).valid)
 					return 4; // code + address VI + data VI + VU memory/register window.
+				if (DecodeCop2MacroIndexedVectorMemory(op).valid)
+					return 5; // code + VI backup/update + VF + VU memory/register window.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
@@ -4766,6 +4810,8 @@ namespace VitaEE
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroRandomBody(op);
 		if (DecodeCop2MacroIndexedViMemory(op).valid)
 			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroIndexedViMemoryBody(op);
+		if (DecodeCop2MacroIndexedVectorMemory(op).valid)
+			return EmitCOP2MacroCodeWrite(op) && EmitCOP2MacroIndexedVectorMemoryBody(op);
 
 		const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
 		if (!EmitCOP2MacroCodeWrite(op))
@@ -5226,6 +5272,128 @@ namespace VitaEE
 			return false;
 
 		return true;
+	}
+
+	bool BlockCompiler::EmitVu0ViLowHalfwordAdjust(unsigned vi_reg, bool decrement)
+	{
+		return EmitVu0ViAddress(HOST_TMP1, vi_reg) &&
+			   m_code.EmitLdrhImm8(HOST_TMP2, HOST_TMP1, 0) &&
+			   (decrement ? m_code.EmitSubImm8(HOST_TMP2, HOST_TMP2, 1) :
+							m_code.EmitAddImm8(HOST_TMP2, HOST_TMP2, 1)) &&
+			   m_code.EmitStrhImm8(HOST_TMP2, HOST_TMP1, 0);
+	}
+
+	bool BlockCompiler::EmitCOP2MacroIndexedVectorMemoryBody(u32 op)
+	{
+		// PCSX2 owners: VUops.cpp::_vuLQI() / _vuLQD() / _vuSQI() / _vuSQD().
+		// Preserve the exact VI backup and pre/post update order around the VU
+		// memory access; running VU0 still exits through the helper interlock.
+		const Cop2MacroIndexedVectorMemoryOp memory = DecodeCop2MacroIndexedVectorMemory(op);
+		if (!memory.valid)
+			return false;
+
+		const bool load = memory.kind == Cop2MacroIndexedVectorMemoryKind::LoadIncrement ||
+						  memory.kind == Cop2MacroIndexedVectorMemoryKind::LoadDecrement;
+		const bool decrement = memory.kind == Cop2MacroIndexedVectorMemoryKind::LoadDecrement ||
+							   memory.kind == Cop2MacroIndexedVectorMemoryKind::StoreDecrement;
+		const unsigned ft = RT(op);
+		const unsigned fs = RD(op);
+		const unsigned vi = load ? (fs & 0x0f) : (ft & 0x0f);
+		const unsigned mask = (op >> 21) & 0x0f;
+
+		if (!EmitVu0ViBackup(vi))
+			return false;
+
+		if (decrement && (load ? vi != 0 : ft != 0) &&
+			!EmitVu0ViLowHalfwordAdjust(vi, true))
+		{
+			return false;
+		}
+
+		const auto emit_post_increment = [&]() {
+			const bool do_increment = load ? fs != 0 : ft != 0;
+			return !do_increment || EmitVu0ViLowHalfwordAdjust(vi, false);
+		};
+
+		if (load)
+		{
+			if (ft != 0 && mask != 0)
+			{
+				if (!EmitVu0IndexedMemoryAddress(vi))
+					return false;
+
+				if (mask == 0x0f)
+				{
+					constexpr unsigned NEON_VALUE = 0;
+					if (!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
+						!EmitVu0VfAddress(HOST_TMP1, ft) ||
+						!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1))
+					{
+						return false;
+					}
+				}
+				else
+				{
+					if (!EmitVu0VfAddress(HOST_TMP1, ft))
+						return false;
+
+					const auto emit_lane = [this](unsigned lane) {
+						const u16 offset = static_cast<u16>(lane * sizeof(u32));
+						return m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, offset) &&
+							   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
+					};
+
+					if ((mask & 0x8) && !emit_lane(0))
+						return false;
+					if ((mask & 0x4) && !emit_lane(1))
+						return false;
+					if ((mask & 0x2) && !emit_lane(2))
+						return false;
+					if ((mask & 0x1) && !emit_lane(3))
+						return false;
+				}
+			}
+
+			return decrement || emit_post_increment();
+		}
+
+		if (mask != 0)
+		{
+			if (!EmitVu0IndexedMemoryAddress(vi) ||
+				!EmitVu0VfAddress(HOST_TMP1, fs))
+			{
+				return false;
+			}
+
+			if (mask == 0x0f)
+			{
+				constexpr unsigned NEON_VALUE = 0;
+				if (!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) ||
+					!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0))
+				{
+					return false;
+				}
+			}
+			else
+			{
+				const auto emit_lane = [this](unsigned lane) {
+					const u16 offset = static_cast<u16>(lane * sizeof(u32));
+					return m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, offset) &&
+						   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP0, offset);
+				};
+
+				if ((mask & 0x8) && !emit_lane(0))
+					return false;
+				if ((mask & 0x4) && !emit_lane(1))
+					return false;
+				if ((mask & 0x2) && !emit_lane(2))
+					return false;
+				if ((mask & 0x1) && !emit_lane(3))
+					return false;
+			}
+		}
+
+		return decrement || emit_post_increment();
 	}
 
 	bool BlockCompiler::EmitCOP2MacroMoveBody(u32 op)
