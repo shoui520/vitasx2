@@ -21,6 +21,10 @@
 #include <psp2/audioout.h>
 #endif
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
 #if defined(VITASX2_NATIVE_VALIDATION) && !defined(ARCH_ARM32)
 class FreeSurroundDecoder
 {
@@ -65,6 +69,53 @@ namespace
 		sample = std::clamp(sample * volume_scale, -1.0f, 1.0f);
 		const float scaled = (sample < 0.0f) ? (sample * 32768.0f) : (sample * 32767.0f);
 		return static_cast<s16>(scaled);
+	}
+
+	static void VitaAudioCopySamples(AudioStream::SampleType* dest, const AudioStream::SampleType* src, u32 samples)
+	{
+#if defined(ARCH_ARM32)
+		u8* d = reinterpret_cast<u8*>(dest);
+		const u8* s = reinterpret_cast<const u8*>(src);
+		const u32 bytes = samples * sizeof(AudioStream::SampleType);
+		const u32 groups64 = bytes >> 6;
+		for (u32 i = 0; i < groups64; i++)
+		{
+			if ((i + 1) < groups64)
+				__builtin_prefetch(s + 64, 0, 1);
+
+			const uint8x16_t q0 = vld1q_u8(s);
+			const uint8x16_t q1 = vld1q_u8(s + 16);
+			const uint8x16_t q2 = vld1q_u8(s + 32);
+			const uint8x16_t q3 = vld1q_u8(s + 48);
+			vst1q_u8(d, q0);
+			vst1q_u8(d + 16, q1);
+			vst1q_u8(d + 32, q2);
+			vst1q_u8(d + 48, q3);
+			s += 64;
+			d += 64;
+		}
+
+		const u32 tail_qwords = (bytes & 63u) >> 4;
+		for (u32 i = 0; i < tail_qwords; i++)
+		{
+			const uint8x16_t q = vld1q_u8(s);
+			vst1q_u8(d, q);
+			s += 16;
+			d += 16;
+		}
+
+		if (bytes & 8u)
+		{
+			const uint8x8_t half = vld1_u8(s);
+			vst1_u8(d, half);
+			s += 8;
+			d += 8;
+		}
+		for (u32 i = 0; i < (bytes & 7u); i++)
+			d[i] = s[i];
+		return;
+#endif
+		std::memcpy(dest, src, samples * sizeof(AudioStream::SampleType));
 	}
 } // namespace
 
@@ -114,15 +165,15 @@ struct VitaAudioState
 			const u32 end = buffer_size - wpos;
 			const u32 start = num_frames - end;
 
-			std::memcpy(&samples[wpos * VITA_AUDIO_CHANNELS], data, end * VITA_AUDIO_CHANNELS * sizeof(AudioStream::SampleType));
+			VitaAudioCopySamples(&samples[wpos * VITA_AUDIO_CHANNELS], data, end * VITA_AUDIO_CHANNELS);
 			if (start > 0)
-				std::memcpy(samples.get(), data + end * VITA_AUDIO_CHANNELS, start * VITA_AUDIO_CHANNELS * sizeof(AudioStream::SampleType));
+				VitaAudioCopySamples(samples.get(), data + end * VITA_AUDIO_CHANNELS, start * VITA_AUDIO_CHANNELS);
 
 			wpos = start;
 		}
 		else
 		{
-			std::memcpy(&samples[wpos * VITA_AUDIO_CHANNELS], data, num_frames * VITA_AUDIO_CHANNELS * sizeof(AudioStream::SampleType));
+			VitaAudioCopySamples(&samples[wpos * VITA_AUDIO_CHANNELS], data, num_frames * VITA_AUDIO_CHANNELS);
 			wpos += num_frames;
 		}
 
@@ -142,7 +193,7 @@ struct VitaAudioState
 		const u32 end = std::min(buffer_size - rpos, frames_to_read);
 		if (end > 0)
 		{
-			std::memcpy(output, &samples[rpos * VITA_AUDIO_CHANNELS], end * VITA_AUDIO_CHANNELS * sizeof(AudioStream::SampleType));
+			VitaAudioCopySamples(output, &samples[rpos * VITA_AUDIO_CHANNELS], end * VITA_AUDIO_CHANNELS);
 			rpos += end;
 			rpos = (rpos == buffer_size) ? 0 : rpos;
 		}
@@ -150,7 +201,7 @@ struct VitaAudioState
 		const u32 start = frames_to_read - end;
 		if (start > 0)
 		{
-			std::memcpy(output + end * VITA_AUDIO_CHANNELS, samples.get(), start * VITA_AUDIO_CHANNELS * sizeof(AudioStream::SampleType));
+			VitaAudioCopySamples(output + end * VITA_AUDIO_CHANNELS, samples.get(), start * VITA_AUDIO_CHANNELS);
 			rpos = start;
 		}
 
@@ -532,7 +583,7 @@ void AudioStream::ReadFrames(SampleType* samples, u32 num_frames)
 
 void AudioStream::StereoSampleReaderImpl(SampleType* dest, const SampleType* src, u32 num_frames)
 {
-	std::memcpy(dest, src, sizeof(SampleType) * num_frames * NUM_INPUT_CHANNELS);
+	VitaAudioCopySamples(dest, src, num_frames * NUM_INPUT_CHANNELS);
 }
 
 void AudioStream::InternalWriteFrames(const SampleType* data, u32 num_frames)
