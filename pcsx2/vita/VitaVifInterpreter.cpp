@@ -32,6 +32,7 @@ u32 g_qemuVifBurstCopy64ByteGroups = 0;
 u32 g_qemuVifBurstCopy256ByteGroups = 0;
 u32 g_qemuVifBurstCopy1024ByteGroups = 0;
 u32 g_qemuVifBurstModeMaskVectors = 0;
+u32 g_qemuVifBurstV4_32ModeVectors = 0;
 u32 g_qemuVifCycleBurstVectors = 0;
 #endif
 
@@ -1288,6 +1289,73 @@ namespace
 	}
 
 	template <int idx>
+	bool VitaVifTryFastV4_32ModeBurst(const u8* data, bool isFill)
+	{
+		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_V4() and writeXYZW().
+		// Contiguous unmasked V4-32 MODE traffic has no lane selectors, so keep
+		// the same MaskRow side effects in one NEON loop instead of the generic
+		// per-vector mode/mask dispatcher.
+		vifStruct& vif = GetVifX;
+		VIFregisters& regs = vifXRegs;
+		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
+		const u32 mode = regs.mode & 0x3;
+		const u32 wl = regs.cycle.wl;
+		if (isFill || upk_num != 0x0c || mode == 0 || regs.cycle.cl != wl ||
+			wl == 0 || vif.cl != 0 || regs.num == 0)
+		{
+			return false;
+		}
+
+		const u32 count = regs.num;
+		const u32 bytes = count * 16u;
+		const u32 vu_mem_size = idx ? VU1_MEMSIZE : VU0_MEMSIZE;
+		const u32 vu_mem_offset = vif.tag.addr & (idx ? 0x3ff0u : 0xff0u);
+		if (vu_mem_offset + bytes > vu_mem_size)
+			return false;
+
+		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
+#if VITASX2_VIF_HAS_ARM_NEON
+		uint32x4_t row = vld1q_u32(vif.MaskRow._u32);
+		for (u32 i = 0; i < count; i++)
+		{
+			const uint32x4_t unpacked = vld1q_u32(reinterpret_cast<const u32*>(data + i * 16u));
+			uint32x4_t result = unpacked;
+			if (mode == 1 || mode == 2)
+				result = vaddq_u32(unpacked, row);
+			if (mode == 2 || mode == 3)
+				row = result;
+			VitaVifStoreVectorNeon(dest + i * 16u, result);
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+			++g_qemuVifBurstVectors;
+			++g_qemuVifBurstV4_32ModeVectors;
+#endif
+		}
+		if (mode == 2 || mode == 3)
+			vst1q_u32(vif.MaskRow._u32, row);
+#else
+		for (u32 i = 0; i < count; i++)
+		{
+			VitaVifStoreModeWords(vif, regs, dest + i * 16u, mode, false,
+				VitaVifLoadU32(data + i * 16u),
+				VitaVifLoadU32(data + i * 16u + 4u),
+				VitaVifLoadU32(data + i * 16u + 8u),
+				VitaVifLoadU32(data + i * 16u + 12u));
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuVifFastVectors;
+			++g_qemuVifBurstVectors;
+			++g_qemuVifBurstV4_32ModeVectors;
+#endif
+		}
+#endif
+
+		vif.tag.addr += bytes;
+		vif.cl = static_cast<u8>(count % wl);
+		regs.num = 0;
+		return true;
+	}
+
+	template <int idx>
 	bool VitaVifTryFastModeMaskBurst(const u8* data, bool isFill)
 	{
 		// PCSX2 owners: Vif_Unpack.cpp::writeXYZW(), UNPACK_S(),
@@ -1668,6 +1736,9 @@ void dVifUnpack(const u8* data, bool isFill)
 		return;
 
 	if (VitaVifTryFastV3Burst<idx>(data, isFill))
+		return;
+
+	if (VitaVifTryFastV4_32ModeBurst<idx>(data, isFill))
 		return;
 
 	if (VitaVifTryFastModeMaskBurst<idx>(data, isFill))
