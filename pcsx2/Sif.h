@@ -18,6 +18,7 @@ extern u32 g_qemuSifFifoJunkWrites;
 extern u32 g_qemuSifFifoJunkScalarWords;
 extern u32 g_qemuSifFifoNeonQwords;
 extern u32 g_qemuSifFifoNeon64ByteGroups;
+extern u32 g_qemuSifFifoNeon128ByteGroups;
 extern u32 g_qemuSifFifoNeon256ByteGroups;
 extern u32 g_qemuSifFifoNeon512ByteGroups;
 #endif
@@ -41,6 +42,12 @@ static __forceinline void SifFifoCopy64Words(u32* to, const u32* from)
 	SifFifoCopy16Words(to + 16, from + 16);
 	SifFifoCopy16Words(to + 32, from + 32);
 	SifFifoCopy16Words(to + 48, from + 48);
+}
+
+static __forceinline void SifFifoCopy32Words(u32* to, const u32* from)
+{
+	SifFifoCopy16Words(to, from);
+	SifFifoCopy16Words(to + 16, from + 16);
 }
 
 static __forceinline void SifFifoCopy128Words(u32* to, const u32* from)
@@ -77,7 +84,19 @@ static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 	}
 
 	const int remaining_after_256 = remaining_after_512 & 63;
-	const int groups64 = remaining_after_256 >> 4;
+	const int groups128 = remaining_after_256 >> 5;
+	for (int i = 0; i < groups128; i++)
+	{
+		if ((i + 1) < groups128)
+			__builtin_prefetch(from + 32, 0, 1);
+
+		SifFifoCopy32Words(to, from);
+		from += 32;
+		to += 32;
+	}
+
+	const int remaining_after_128 = remaining_after_256 & 31;
+	const int groups64 = remaining_after_128 >> 4;
 	for (int i = 0; i < groups64; i++)
 	{
 		if ((i + 1) < groups64)
@@ -88,7 +107,7 @@ static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 		to += 16;
 	}
 
-	const int tail_words = remaining_after_256 & 15;
+	const int tail_words = remaining_after_128 & 15;
 	const int qwords = tail_words >> 2;
 	for (int i = 0; i < qwords; i++)
 	{
@@ -113,8 +132,9 @@ static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 			break;
 	}
 #if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuSifFifoNeonQwords += (groups512 << 5) + (groups256 << 4) + (groups64 << 2) + qwords;
-	g_qemuSifFifoNeon64ByteGroups += (groups512 << 3) + (groups256 << 2) + groups64;
+	g_qemuSifFifoNeonQwords += (groups512 << 5) + (groups256 << 4) + (groups128 << 3) + (groups64 << 2) + qwords;
+	g_qemuSifFifoNeon64ByteGroups += (groups512 << 3) + (groups256 << 2) + (groups128 << 1) + groups64;
+	g_qemuSifFifoNeon128ByteGroups += groups128;
 	g_qemuSifFifoNeon256ByteGroups += (groups512 << 1) + groups256;
 	g_qemuSifFifoNeon512ByteGroups += groups512;
 #endif
