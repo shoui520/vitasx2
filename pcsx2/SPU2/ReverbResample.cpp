@@ -11,12 +11,12 @@
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSpu2ReverbDownsampleNeon = 0;
 u32 g_qemuSpu2ReverbUpsampleNeon = 0;
+u32 g_qemuSpu2ReverbSparseTapAccumulates = 0;
 #endif
 
 MULTI_ISA_UNSHARED_START
 
 static constexpr u32 NUM_TAPS = 39;
-// 39 tap filter, the 0's could be optimized out
 static constexpr std::array<s16, 48> filter_down_coefs alignas(32) = {
 	-1,
 	0,
@@ -73,6 +73,21 @@ static constexpr std::array<s16, 48> make_up_coefs()
 
 static constexpr std::array<s16, 48> filter_up_coefs alignas(32) = make_up_coefs();
 
+static constexpr std::array<s16, 20> make_sparse_even_coefs(const std::array<s16, 48>& source)
+{
+	std::array<s16, 20> ret = {};
+
+	for (u32 i = 0; i < ret.size(); i++)
+		ret[i] = source[i * 2];
+
+	return ret;
+}
+
+static constexpr std::array<s16, 20> filter_down_sparse_even_coefs alignas(16) =
+	make_sparse_even_coefs(filter_down_coefs);
+static constexpr std::array<s16, 20> filter_up_sparse_even_coefs alignas(16) =
+	make_sparse_even_coefs(filter_up_coefs);
+
 s32 __forceinline ReverbDownsample_reference(V_Core& core, bool right)
 {
 	int index = (core.RevbSampleBufPos - NUM_TAPS) & 63;
@@ -89,12 +104,36 @@ s32 __forceinline ReverbDownsample_reference(V_Core& core, bool right)
 }
 
 #if defined(ARCH_ARM32)
-static __forceinline int32x4_t ReverbAccumulate8(int32x4_t acc, const s16* samples, const s16* coefs)
+static __forceinline int32x4_t ReverbAccumulateEven8(int32x4_t acc, const s16* samples, const s16* coefs)
 {
-	const int16x8_t sample_vec = vld1q_s16(samples);
+	const int16x8x2_t sample_pairs = vld2q_s16(samples);
 	const int16x8_t coef_vec = vld1q_s16(coefs);
-	acc = vmlal_s16(acc, vget_low_s16(sample_vec), vget_low_s16(coef_vec));
-	acc = vmlal_s16(acc, vget_high_s16(sample_vec), vget_high_s16(coef_vec));
+	acc = vmlal_s16(acc, vget_low_s16(sample_pairs.val[0]), vget_low_s16(coef_vec));
+	acc = vmlal_s16(acc, vget_high_s16(sample_pairs.val[0]), vget_high_s16(coef_vec));
+	return acc;
+}
+
+static __forceinline int32x4_t ReverbAccumulateEven4(int32x4_t acc, const s16* samples, const s16* coefs)
+{
+	const int16x4x2_t sample_pairs = vld2_s16(samples);
+	return vmlal_s16(acc, sample_pairs.val[0], vld1_s16(coefs));
+}
+
+static __forceinline int32x4_t ReverbAccumulateSparseTaps(
+	int32x4_t acc, const s16* samples, const s16* even_coefs, s16 center_coef)
+{
+	// PCSX2 owner: ReverbDownsample_reference()/ReverbUpsample_reference().
+	// The 39-tap filters have zero odd taps except the center tap at index 19;
+	// skip those zero multiplies on Cortex-A9 and keep the same 32-bit sum.
+	acc = ReverbAccumulateEven8(acc, &samples[0], &even_coefs[0]);
+	acc = ReverbAccumulateEven8(acc, &samples[16], &even_coefs[8]);
+	acc = ReverbAccumulateEven4(acc, &samples[32], &even_coefs[16]);
+
+	const s32 center_product = static_cast<s32>(samples[19]) * static_cast<s32>(center_coef);
+	acc = vaddq_s32(acc, vsetq_lane_s32(center_product, vdupq_n_s32(0), 0));
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuSpu2ReverbSparseTapAccumulates;
+#endif
 	return acc;
 }
 
@@ -111,11 +150,8 @@ s32 __forceinline ReverbDownsample_neon(V_Core& core, bool right)
 	const s16* samples = &core.RevbDownBuf[right][index];
 	int32x4_t acc = vdupq_n_s32(0);
 
-	acc = ReverbAccumulate8(acc, &samples[0], &filter_down_coefs[0]);
-	acc = ReverbAccumulate8(acc, &samples[8], &filter_down_coefs[8]);
-	acc = ReverbAccumulate8(acc, &samples[16], &filter_down_coefs[16]);
-	acc = ReverbAccumulate8(acc, &samples[24], &filter_down_coefs[24]);
-	acc = ReverbAccumulate8(acc, &samples[32], &filter_down_coefs[32]);
+	acc = ReverbAccumulateSparseTaps(
+		acc, samples, filter_down_sparse_even_coefs.data(), filter_down_coefs[19]);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	++::g_qemuSpu2ReverbDownsampleNeon;
@@ -221,16 +257,10 @@ StereoOut32 __forceinline ReverbUpsample_neon(V_Core& core)
 	int32x4_t left_acc = vdupq_n_s32(0);
 	int32x4_t right_acc = vdupq_n_s32(0);
 
-	left_acc = ReverbAccumulate8(left_acc, &left[0], &filter_up_coefs[0]);
-	right_acc = ReverbAccumulate8(right_acc, &right[0], &filter_up_coefs[0]);
-	left_acc = ReverbAccumulate8(left_acc, &left[8], &filter_up_coefs[8]);
-	right_acc = ReverbAccumulate8(right_acc, &right[8], &filter_up_coefs[8]);
-	left_acc = ReverbAccumulate8(left_acc, &left[16], &filter_up_coefs[16]);
-	right_acc = ReverbAccumulate8(right_acc, &right[16], &filter_up_coefs[16]);
-	left_acc = ReverbAccumulate8(left_acc, &left[24], &filter_up_coefs[24]);
-	right_acc = ReverbAccumulate8(right_acc, &right[24], &filter_up_coefs[24]);
-	left_acc = ReverbAccumulate8(left_acc, &left[32], &filter_up_coefs[32]);
-	right_acc = ReverbAccumulate8(right_acc, &right[32], &filter_up_coefs[32]);
+	left_acc = ReverbAccumulateSparseTaps(
+		left_acc, left, filter_up_sparse_even_coefs.data(), filter_up_coefs[19]);
+	right_acc = ReverbAccumulateSparseTaps(
+		right_acc, right, filter_up_sparse_even_coefs.data(), filter_up_coefs[19]);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	++::g_qemuSpu2ReverbUpsampleNeon;
