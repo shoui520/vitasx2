@@ -33,6 +33,7 @@ u32 g_qemuSio2Dma12FastBlocks = 0;
 u32 g_qemuSio2Dma12FastBytes = 0;
 u32 g_qemuSio2Dma12DirectBlocks = 0;
 u32 g_qemuSio2Dma12DirectBytes = 0;
+u32 g_qemuSio2Dma12DirectStoreBytes = 0;
 u32 g_qemuSio2Dma12FallbackBytes = 0;
 #endif
 
@@ -127,17 +128,17 @@ static void Sio2Dma12TransferBlock(u32& madr, u32 bytes)
 {
 	if (bytes != 0 && bytes <= 256 && IopDmaCanAccessExposedIopRam(madr, bytes))
 	{
-		std::array<u8, 256> buffer;
+		u8* const destination = iopPhysMem(madr);
 		for (u32 i = 0; i < bytes; i++)
-			buffer[i] = g_Sio2.Read();
+			destination[i] = g_Sio2.Read();
 
-		std::memcpy(iopPhysMem(madr), buffer.data(), bytes);
 		madr += bytes;
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuSio2Dma12FastBlocks;
 		g_qemuSio2Dma12FastBytes += bytes;
 		++g_qemuSio2Dma12DirectBlocks;
 		g_qemuSio2Dma12DirectBytes += bytes;
+		g_qemuSio2Dma12DirectStoreBytes += bytes;
 #endif
 		return;
 	}
