@@ -103,5 +103,6 @@ extern u32 g_qemuSpu2DmaCopyNeon1024ByteGroups;
 extern u32 g_qemuSpu2DmaCopyExactSpanCopies;
 extern u32 g_qemuSpu2DmaCopyExact512ByteCopies;
 extern u32 g_qemuSpu2DmaCopyExact1024ByteCopies;
+extern u32 g_qemuSpu2DmaCopyExact1536ByteCopies;
 extern u32 g_qemuSpu2DmaCopyExact2048ByteCopies;
 #endif

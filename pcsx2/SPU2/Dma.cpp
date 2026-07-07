@@ -24,6 +24,7 @@ u32 g_qemuSpu2DmaCopyNeon1024ByteGroups = 0;
 u32 g_qemuSpu2DmaCopyExactSpanCopies = 0;
 u32 g_qemuSpu2DmaCopyExact512ByteCopies = 0;
 u32 g_qemuSpu2DmaCopyExact1024ByteCopies = 0;
+u32 g_qemuSpu2DmaCopyExact1536ByteCopies = 0;
 u32 g_qemuSpu2DmaCopyExact2048ByteCopies = 0;
 #endif
 
@@ -72,6 +73,12 @@ static __forceinline void Spu2DmaCopy512Bytes(u8* dst, const u8* src)
 	Spu2DmaCopy256Bytes(dst + 256, src + 256);
 }
 
+static __forceinline void Spu2DmaCopy1536Bytes(u8* dst, const u8* src)
+{
+	Spu2DmaCopy1024Bytes(dst, src);
+	Spu2DmaCopy512Bytes(dst + 1024, src + 1024);
+}
+
 static __forceinline void Spu2DmaCountNeonCopy(
 	u32 qwords,
 	u32 groups64,
@@ -94,6 +101,8 @@ static __forceinline void Spu2DmaCountNeonCopy(
 			++g_qemuSpu2DmaCopyExact512ByteCopies;
 		else if (exact_bytes == 1024)
 			++g_qemuSpu2DmaCopyExact1024ByteCopies;
+		else if (exact_bytes == 1536)
+			++g_qemuSpu2DmaCopyExact1536ByteCopies;
 		else if (exact_bytes == 2048)
 			++g_qemuSpu2DmaCopyExact2048ByteCopies;
 	}
@@ -123,6 +132,10 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 		case 2048:
 			Spu2DmaCopy2048Bytes(dst, src);
 			Spu2DmaCountNeonCopy(128, 32, 16, 8, 2, true, 2048);
+			return;
+		case 1536:
+			Spu2DmaCopy1536Bytes(dst, src);
+			Spu2DmaCountNeonCopy(96, 24, 12, 6, 1, true, 1536);
 			return;
 		case 1024:
 			Spu2DmaCopy1024Bytes(dst, src);
