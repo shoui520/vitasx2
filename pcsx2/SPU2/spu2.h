@@ -93,4 +93,5 @@ extern u32 g_qemuSpu2ZeroVoiceGateSkipped;
 extern u32 g_qemuSpu2NonzeroVoiceGateMixed;
 extern u32 g_qemuSpu2DmaCopyNeonQwords;
 extern u32 g_qemuSpu2DmaCopyNeon64ByteGroups;
+extern u32 g_qemuSpu2DmaCopyNeon256ByteGroups;
 #endif

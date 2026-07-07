@@ -18,6 +18,38 @@ static constexpr int CYCLES_PER_WORD = 24;
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSpu2DmaCopyNeonQwords = 0;
 u32 g_qemuSpu2DmaCopyNeon64ByteGroups = 0;
+u32 g_qemuSpu2DmaCopyNeon256ByteGroups = 0;
+#endif
+
+#if defined(ARCH_ARM32)
+static __forceinline void Spu2DmaCopy64Bytes(u8* dst, const u8* src)
+{
+	const uint8x16_t q0 = vld1q_u8(src);
+	const uint8x16_t q1 = vld1q_u8(src + 16);
+	const uint8x16_t q2 = vld1q_u8(src + 32);
+	const uint8x16_t q3 = vld1q_u8(src + 48);
+	vst1q_u8(dst, q0);
+	vst1q_u8(dst + 16, q1);
+	vst1q_u8(dst + 32, q2);
+	vst1q_u8(dst + 48, q3);
+}
+
+static __forceinline void Spu2DmaCopy256Bytes(u8* dst, const u8* src)
+{
+	Spu2DmaCopy64Bytes(dst, src);
+	Spu2DmaCopy64Bytes(dst + 64, src + 64);
+	Spu2DmaCopy64Bytes(dst + 128, src + 128);
+	Spu2DmaCopy64Bytes(dst + 192, src + 192);
+}
+
+static __forceinline void Spu2DmaCountNeonCopy(u32 qwords, u32 groups64, u32 groups256)
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2DmaCopyNeonQwords += qwords;
+	g_qemuSpu2DmaCopyNeon64ByteGroups += groups64;
+	g_qemuSpu2DmaCopyNeon256ByteGroups += groups256;
+#endif
+}
 #endif
 
 static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes)
@@ -25,24 +57,29 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 #if defined(ARCH_ARM32)
 	u8* dst = static_cast<u8*>(to);
 	const u8* src = static_cast<const u8*>(from);
-	const u32 groups64 = bytes >> 6;
+	const u32 groups256 = bytes >> 8;
+	for (u32 i = 0; i < groups256; i++)
+	{
+		if ((i + 1) < groups256)
+			__builtin_prefetch(src + 256, 0, 1);
+		Spu2DmaCopy256Bytes(dst, src);
+		src += 256;
+		dst += 256;
+	}
+
+	const u32 remaining_after_256 = bytes & 255u;
+	const u32 groups64 = remaining_after_256 >> 6;
 	for (u32 i = 0; i < groups64; i++)
 	{
 		if ((i + 1) < groups64)
 			__builtin_prefetch(src + 64, 0, 1);
-		const uint8x16_t q0 = vld1q_u8(src);
-		const uint8x16_t q1 = vld1q_u8(src + 16);
-		const uint8x16_t q2 = vld1q_u8(src + 32);
-		const uint8x16_t q3 = vld1q_u8(src + 48);
-		vst1q_u8(dst, q0);
-		vst1q_u8(dst + 16, q1);
-		vst1q_u8(dst + 32, q2);
-		vst1q_u8(dst + 48, q3);
+		Spu2DmaCopy64Bytes(dst, src);
 		src += 64;
 		dst += 64;
 	}
 
-	const u32 tail_qwords = (bytes & 63u) >> 4;
+	const u32 tail_bytes = remaining_after_256 & 63u;
+	const u32 tail_qwords = tail_bytes >> 4;
 	for (u32 i = 0; i < tail_qwords; i++)
 	{
 		const uint8x16_t q = vld1q_u8(src);
@@ -51,20 +88,19 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 		dst += 16;
 	}
 
-	if (bytes & 8)
+	if (tail_bytes & 8)
 	{
 		const uint8x8_t half = vld1_u8(src);
 		vst1_u8(dst, half);
 		src += 8;
 		dst += 8;
 	}
-	for (u32 i = 0; i < (bytes & 7); i++)
+	for (u32 i = 0; i < (tail_bytes & 7); i++)
 		dst[i] = src[i];
 
-#if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuSpu2DmaCopyNeonQwords += (groups64 << 2) + tail_qwords;
-	g_qemuSpu2DmaCopyNeon64ByteGroups += groups64;
-#endif
+	Spu2DmaCountNeonCopy((groups256 << 4) + (groups64 << 2) + tail_qwords,
+		(groups256 << 2) + groups64,
+		groups256);
 	return;
 #endif
 	memcpy(to, from, bytes);
