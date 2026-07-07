@@ -29,6 +29,7 @@ u32 g_qemuVifBurstSAndV2Vectors = 0;
 u32 g_qemuVifBurstV3Vectors = 0;
 u32 g_qemuVifBurstCopyVectors = 0;
 u32 g_qemuVifBurstCopy64ByteGroups = 0;
+u32 g_qemuVifBurstCopy256ByteGroups = 0;
 u32 g_qemuVifBurstModeMaskVectors = 0;
 u32 g_qemuVifCycleBurstVectors = 0;
 #endif
@@ -85,28 +86,55 @@ namespace
 #endif
 	}
 
+#if VITASX2_VIF_HAS_ARM_NEON
+	void VitaVifCopy64Bytes(u8* dest, const u8* src)
+	{
+		const uint32x4_t qword0 = vld1q_u32(reinterpret_cast<const u32*>(src));
+		const uint32x4_t qword1 = vld1q_u32(reinterpret_cast<const u32*>(src + 16));
+		const uint32x4_t qword2 = vld1q_u32(reinterpret_cast<const u32*>(src + 32));
+		const uint32x4_t qword3 = vld1q_u32(reinterpret_cast<const u32*>(src + 48));
+		vst1q_u32(reinterpret_cast<u32*>(dest), qword0);
+		vst1q_u32(reinterpret_cast<u32*>(dest + 16), qword1);
+		vst1q_u32(reinterpret_cast<u32*>(dest + 32), qword2);
+		vst1q_u32(reinterpret_cast<u32*>(dest + 48), qword3);
+	}
+
+	void VitaVifCopy256Bytes(u8* dest, const u8* src)
+	{
+		VitaVifCopy64Bytes(dest, src);
+		VitaVifCopy64Bytes(dest + 64, src + 64);
+		VitaVifCopy64Bytes(dest + 128, src + 128);
+		VitaVifCopy64Bytes(dest + 192, src + 192);
+	}
+#endif
+
 	void VitaVifCopyQwordBurst(u8* dest, const u8* src, u32 count)
 	{
-		const u32 groups64 = count >> 2;
+		const u32 groups256 = count >> 4;
 #if VITASX2_VIF_HAS_ARM_NEON
+		for (u32 i = 0; i < groups256; i++)
+		{
+			if ((i + 1) < groups256)
+				__builtin_prefetch(src + 256, 0, 1);
+
+			VitaVifCopy256Bytes(dest, src);
+			src += 256;
+			dest += 256;
+		}
+
+		const u32 remaining_after_256 = count & 15u;
+		const u32 groups64 = remaining_after_256 >> 2;
 		for (u32 i = 0; i < groups64; i++)
 		{
 			if ((i + 1) < groups64)
 				__builtin_prefetch(src + 64, 0, 1);
 
-			const uint32x4_t qword0 = vld1q_u32(reinterpret_cast<const u32*>(src));
-			const uint32x4_t qword1 = vld1q_u32(reinterpret_cast<const u32*>(src + 16));
-			const uint32x4_t qword2 = vld1q_u32(reinterpret_cast<const u32*>(src + 32));
-			const uint32x4_t qword3 = vld1q_u32(reinterpret_cast<const u32*>(src + 48));
-			vst1q_u32(reinterpret_cast<u32*>(dest), qword0);
-			vst1q_u32(reinterpret_cast<u32*>(dest + 16), qword1);
-			vst1q_u32(reinterpret_cast<u32*>(dest + 32), qword2);
-			vst1q_u32(reinterpret_cast<u32*>(dest + 48), qword3);
+			VitaVifCopy64Bytes(dest, src);
 			src += 64;
 			dest += 64;
 		}
 
-		const u32 tail_qwords = count & 3;
+		const u32 tail_qwords = remaining_after_256 & 3u;
 		for (u32 i = 0; i < tail_qwords; i++)
 		{
 			const uint32x4_t value = vld1q_u32(reinterpret_cast<const u32*>(src));
@@ -124,7 +152,8 @@ namespace
 		g_qemuVifFastVectors += count;
 		g_qemuVifBurstVectors += count;
 		g_qemuVifBurstCopyVectors += count;
-		g_qemuVifBurstCopy64ByteGroups += groups64;
+		g_qemuVifBurstCopy64ByteGroups += (groups256 << 2) + (count & 15u) / 4u;
+		g_qemuVifBurstCopy256ByteGroups += groups256;
 #endif
 	}
 
