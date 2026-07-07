@@ -7,6 +7,88 @@
 
 static constexpr s32 ADSR_MAX_VOL = 0x7fff;
 
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuSpu2AdsrSaturateClamps = 0;
+u32 g_qemuSpu2VolumeSlideSaturateClamps = 0;
+#endif
+
+static __forceinline s32 ClampAdsrValue_reference(s32 value)
+{
+	return std::clamp<s32>(value, 0, INT16_MAX);
+}
+
+static __forceinline s32 ClampS16_reference(s32 value)
+{
+	return std::clamp<s32>(value, INT16_MIN, INT16_MAX);
+}
+
+static __forceinline s32 ClampNonPositiveS16_reference(s32 value)
+{
+	return std::clamp<s32>(value, INT16_MIN, 0);
+}
+
+static __forceinline s32 ClampAdsrValue_selected(s32 value)
+{
+#if defined(ARCH_ARM32)
+	s32 result;
+	__asm__("usat %0, #15, %1" : "=r"(result) : "r"(value));
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuSpu2AdsrSaturateClamps;
+#endif
+	return result;
+#else
+	return ClampAdsrValue_reference(value);
+#endif
+}
+
+static __forceinline s32 ClampVolumeS16_selected(s32 value)
+{
+#if defined(ARCH_ARM32)
+	s32 result;
+	__asm__("ssat %0, #16, %1" : "=r"(result) : "r"(value));
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuSpu2VolumeSlideSaturateClamps;
+#endif
+	return result;
+#else
+	return ClampS16_reference(value);
+#endif
+}
+
+static __forceinline s32 ClampVolumePositive_selected(s32 value)
+{
+#if defined(ARCH_ARM32)
+	s32 result;
+	__asm__("usat %0, #15, %1" : "=r"(result) : "r"(value));
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuSpu2VolumeSlideSaturateClamps;
+#endif
+	return result;
+#else
+	return ClampAdsrValue_reference(value);
+#endif
+}
+
+static __forceinline s32 ClampVolumeNonPositive_selected(s32 value)
+{
+#if defined(ARCH_ARM32)
+	s32 result;
+	__asm__(
+		"ssat %0, #16, %1\n\t"
+		"cmp %0, #0\n\t"
+		"movgt %0, #0"
+		: "=&r"(result)
+		: "r"(value)
+		: "cc");
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuSpu2VolumeSlideSaturateClamps;
+#endif
+	return result;
+#else
+	return ClampNonPositiveS16_reference(value);
+#endif
+}
+
 void V_ADSR::UpdateCache()
 {
 	CachedPhases[PHASE_ATTACK].Decr = false;
@@ -38,11 +120,13 @@ void V_ADSR::UpdateCache()
 	CachedPhases[PHASE_RELEASE].Target = 0;
 }
 
-bool V_ADSR::Calculate(int voiceidx)
+template <typename ClampValue>
+static __forceinline bool CalculateAdsrImpl(V_ADSR& adsr, int voiceidx, ClampValue clamp_value)
 {
-	pxAssume(Phase != PHASE_STOPPED);
+	(void)voiceidx;
+	pxAssume(adsr.Phase != V_ADSR::PHASE_STOPPED);
 
-	auto& p = CachedPhases.at(Phase);
+	auto& p = adsr.CachedPhases.at(adsr.Phase);
 
 	// maybe not correct for the "infinite" settings
 	u32 counter_inc = 0x8000 >> std::max(0, p.Shift - 11);
@@ -50,45 +134,50 @@ bool V_ADSR::Calculate(int voiceidx)
 
 	if (p.Exp)
 	{
-		if (!p.Decr && Value > 0x6000)
+		if (!p.Decr && adsr.Value > 0x6000)
 		{
 			counter_inc >>= 2;
 		}
 
 		if (p.Decr)
 		{
-			level_inc = (s16)((level_inc * Value) >> 15);
+			level_inc = (s16)((level_inc * adsr.Value) >> 15);
 		}
 	}
 
 	counter_inc = std::max<u32>(1, counter_inc);
-	Counter += counter_inc;
+	adsr.Counter += counter_inc;
 
-	if (Counter >= 0x8000)
+	if (adsr.Counter >= 0x8000)
 	{
-		Counter = 0;
-		Value = std::clamp<s32>(Value + level_inc, 0, INT16_MAX);
+		adsr.Counter = 0;
+		adsr.Value = clamp_value(adsr.Value + level_inc);
 	}
 
 	// Stay in sustain until key off or silence
-	if (Phase == PHASE_SUSTAIN)
+	if (adsr.Phase == V_ADSR::PHASE_SUSTAIN)
 	{
-		return Value != 0;
+		return adsr.Value != 0;
 	}
 
 	// Check if target is reached to advance phase
-	if ((!p.Decr && Value >= p.Target) || (p.Decr && Value <= p.Target))
+	if ((!p.Decr && adsr.Value >= p.Target) || (p.Decr && adsr.Value <= p.Target))
 	{
-		Phase++;
+		adsr.Phase++;
 	}
 
 	// All phases done, stop the voice
-	if (Phase > PHASE_RELEASE)
+	if (adsr.Phase > V_ADSR::PHASE_RELEASE)
 	{
 		return false;
 	}
 
 	return true;
+}
+
+bool V_ADSR::Calculate(int voiceidx)
+{
+	return CalculateAdsrImpl(*this, voiceidx, ClampAdsrValue_selected);
 }
 
 void V_ADSR::Attack()
@@ -116,67 +205,101 @@ void V_VolumeSlide::RegSet(u16 src)
 	}
 }
 
-void V_VolumeSlide::Update()
+template <typename ClampS16, typename ClampPositive, typename ClampNonPositive>
+static __forceinline void UpdateVolumeSlideImpl(
+	V_VolumeSlide& slide, ClampS16 clamp_s16, ClampPositive clamp_positive, ClampNonPositive clamp_non_positive)
 {
-	if (!Enable)
+	if (!slide.Enable)
 		return;
 
-	s32 step_size = 7 - Step;
+	s32 step_size = 7 - slide.Step;
 
-	if (Decr)
+	if (slide.Decr)
 	{
 		step_size = ~step_size;
 	}
 
-	u32 counter_inc = 0x8000 >> std::max(0, Shift - 11);
-	s32 level_inc = step_size << std::max(0, 11 - Shift);
+	u32 counter_inc = 0x8000 >> std::max(0, slide.Shift - 11);
+	s32 level_inc = step_size << std::max(0, 11 - slide.Shift);
 
-	if (Exp)
+	if (slide.Exp)
 	{
-		if (!Decr && Value > 0x6000)
+		if (!slide.Decr && slide.Value > 0x6000)
 		{
 			counter_inc >>= 2;
 		}
 
-		if (Decr)
+		if (slide.Decr)
 		{
-			level_inc = (s16)((level_inc * Value) >> 15);
+			level_inc = (s16)((level_inc * slide.Value) >> 15);
 		}
 	}
 
 	// Allow counter_inc to be zero only in when all bits
 	// of the rate field are set
-	if (Step != 3 && Shift != 0x1f)
+	if (slide.Step != 3 && slide.Shift != 0x1f)
 	{
 		counter_inc = std::max<u32>(1, counter_inc);
 	}
-	Counter += counter_inc;
+	slide.Counter += counter_inc;
 
 	// If negative phase "increase" to -0x8000 or "decrease" towards 0
 	// Unless in Exp + Decr modes
-	if (!(Exp && Decr))
+	if (!(slide.Exp && slide.Decr))
 	{
-		level_inc = Phase ? -level_inc : level_inc;
+		level_inc = slide.Phase ? -level_inc : level_inc;
 	}
 
-	if (Counter >= 0x8000)
+	if (slide.Counter >= 0x8000)
 	{
-		Counter = 0;
+		slide.Counter = 0;
 
-		if (!Decr)
+		if (!slide.Decr)
 		{
-			Value = std::clamp<s32>(Value + level_inc, INT16_MIN, INT16_MAX);
+			slide.Value = clamp_s16(slide.Value + level_inc);
+		}
+		else if (slide.Exp || !slide.Phase)
+		{
+			slide.Value = clamp_positive(slide.Value + level_inc);
 		}
 		else
 		{
-			s32 low = Phase ? INT16_MIN : 0;
-			s32 high = Phase ? 0 : INT16_MAX;
-			if (Exp)
-			{
-				low = 0;
-				high = INT16_MAX;
-			}
-			Value = std::clamp<s32>(Value + level_inc, low, high);
+			slide.Value = clamp_non_positive(slide.Value + level_inc);
 		}
 	}
 }
+
+void V_VolumeSlide::Update()
+{
+	UpdateVolumeSlideImpl(
+		*this,
+		ClampVolumeS16_selected,
+		ClampVolumePositive_selected,
+		ClampVolumeNonPositive_selected);
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+bool Spu2AdsrCalculateReferenceForValidation(V_ADSR* adsr, int voiceidx)
+{
+	return CalculateAdsrImpl(*adsr, voiceidx, ClampAdsrValue_reference);
+}
+
+bool Spu2AdsrCalculateSelectedForValidation(V_ADSR* adsr, int voiceidx)
+{
+	return adsr->Calculate(voiceidx);
+}
+
+void Spu2VolumeSlideUpdateReferenceForValidation(V_VolumeSlide* slide)
+{
+	UpdateVolumeSlideImpl(
+		*slide,
+		ClampS16_reference,
+		ClampAdsrValue_reference,
+		ClampNonPositiveS16_reference);
+}
+
+void Spu2VolumeSlideUpdateSelectedForValidation(V_VolumeSlide* slide)
+{
+	slide->Update();
+}
+#endif
