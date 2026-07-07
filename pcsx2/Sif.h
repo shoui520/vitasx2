@@ -18,30 +18,58 @@ extern u32 g_qemuSifFifoJunkWrites;
 extern u32 g_qemuSifFifoJunkScalarWords;
 extern u32 g_qemuSifFifoNeonQwords;
 extern u32 g_qemuSifFifoNeon64ByteGroups;
+extern u32 g_qemuSifFifoNeon256ByteGroups;
+#endif
+
+#if defined(ARCH_ARM32)
+static __forceinline void SifFifoCopy16Words(u32* to, const u32* from)
+{
+	const uint32x4_t qword0 = vld1q_u32(from);
+	const uint32x4_t qword1 = vld1q_u32(from + 4);
+	const uint32x4_t qword2 = vld1q_u32(from + 8);
+	const uint32x4_t qword3 = vld1q_u32(from + 12);
+	vst1q_u32(to, qword0);
+	vst1q_u32(to + 4, qword1);
+	vst1q_u32(to + 8, qword2);
+	vst1q_u32(to + 12, qword3);
+}
+
+static __forceinline void SifFifoCopy64Words(u32* to, const u32* from)
+{
+	SifFifoCopy16Words(to, from);
+	SifFifoCopy16Words(to + 16, from + 16);
+	SifFifoCopy16Words(to + 32, from + 32);
+	SifFifoCopy16Words(to + 48, from + 48);
+}
 #endif
 
 static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 {
 #if defined(ARCH_ARM32)
-	const int groups64 = words >> 4;
+	const int groups256 = words >> 6;
+	for (int i = 0; i < groups256; i++)
+	{
+		if ((i + 1) < groups256)
+			__builtin_prefetch(from + 64, 0, 1);
+
+		SifFifoCopy64Words(to, from);
+		from += 64;
+		to += 64;
+	}
+
+	const int remaining_after_256 = words & 63;
+	const int groups64 = remaining_after_256 >> 4;
 	for (int i = 0; i < groups64; i++)
 	{
 		if ((i + 1) < groups64)
 			__builtin_prefetch(from + 16, 0, 1);
 
-		const uint32x4_t qword0 = vld1q_u32(from);
-		const uint32x4_t qword1 = vld1q_u32(from + 4);
-		const uint32x4_t qword2 = vld1q_u32(from + 8);
-		const uint32x4_t qword3 = vld1q_u32(from + 12);
-		vst1q_u32(to, qword0);
-		vst1q_u32(to + 4, qword1);
-		vst1q_u32(to + 8, qword2);
-		vst1q_u32(to + 12, qword3);
+		SifFifoCopy16Words(to, from);
 		from += 16;
 		to += 16;
 	}
 
-	const int tail_words = words & 15;
+	const int tail_words = remaining_after_256 & 15;
 	const int qwords = tail_words >> 2;
 	for (int i = 0; i < qwords; i++)
 	{
@@ -66,8 +94,9 @@ static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 			break;
 	}
 #if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuSifFifoNeonQwords += (groups64 << 2) + qwords;
-	g_qemuSifFifoNeon64ByteGroups += groups64;
+	g_qemuSifFifoNeonQwords += (groups256 << 4) + (groups64 << 2) + qwords;
+	g_qemuSifFifoNeon64ByteGroups += (groups256 << 2) + groups64;
+	g_qemuSifFifoNeon256ByteGroups += groups256;
 #endif
 	return;
 #endif
