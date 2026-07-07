@@ -76,9 +76,22 @@ static __forceinline s16 SignExtend16(u16 v)
 	return (s16)v;
 }
 
+#if defined(VITASX2_QEMU_VALIDATION)
+inline u32 g_qemuSpu2ClampMixSsat = 0;
+#endif
+
 static __forceinline s32 clamp_mix(s32 x)
 {
+#if defined(ARCH_ARM32)
+	s32 result;
+	__asm__("ssat %0, #16, %1" : "=r"(result) : "r"(x));
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuSpu2ClampMixSsat;
+#endif
+	return result;
+#else
 	return std::clamp(x, -0x8000, 0x7fff);
+#endif
 }
 
 static __forceinline StereoOut32 clamp_mix(StereoOut32 sample)
