@@ -25,6 +25,7 @@ extern u32 g_qemuVuUpperNeonQwordOps;
 extern u32 g_qemuVuUpperScalarFullMaskOps;
 extern u32 g_qemuVuUpperScalarPartialMaskOps;
 extern u32 g_qemuVuLowerVfpSqrtOps;
+extern u32 g_qemuVuLowerVfpDivOps;
 extern u32 g_qemuVuUpperVfpMaddScalarOps;
 #endif
 
@@ -1543,6 +1544,23 @@ namespace VUInterpFast
 		return result;
 #else
 		return std::sqrt(value);
+#endif
+	}
+
+	static inline float VuDiv(float numerator, float denominator)
+	{
+#if defined(ARCH_ARM32)
+		// PCSX2 owner: VUops.cpp::_vuDIV()/_vuRSQRT() and lower EFU
+		// reciprocal ops. Use exact scalar VFP division on Cortex-A9 rather
+		// than a compiler helper or NEON reciprocal-estimate sequence.
+		float result;
+		__asm__("vdiv.f32 %0, %1, %2" : "=t"(result) : "t"(numerator), "t"(denominator));
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuLowerVfpDivOps;
+#endif
+		return result;
+#else
+		return numerator / denominator;
 #endif
 	}
 
@@ -3201,7 +3219,7 @@ namespace VUInterpFast
 				}
 				else
 				{
-					WriteVuQ(VU, fs / ft);
+					WriteVuQ(VU, VuDiv(fs, ft));
 				}
 				return;
 			}
@@ -3242,7 +3260,7 @@ namespace VUInterpFast
 				{
 					if (ft < 0.0f)
 						VU->statusflag |= 0x10u;
-					WriteVuQ(VU, fs / VuSqrt(std::fabs(ft)));
+					WriteVuQ(VU, VuDiv(fs, VuSqrt(std::fabs(ft))));
 				}
 				return;
 			}
@@ -3272,7 +3290,7 @@ namespace VUInterpFast
 			{
 				float p = VuSumXYZSquares(VU, Fs(code));
 				if (p != 0.0f)
-					p = 1.0f / p;
+					p = VuDiv(1.0f, p);
 				VU->p.F = p;
 				return;
 			}
@@ -3291,7 +3309,7 @@ namespace VUInterpFast
 				{
 					p = VuSqrt(p);
 					if (p != 0.0f)
-						p = 1.0f / p;
+						p = VuDiv(1.0f, p);
 				}
 				VU->p.F = p;
 				return;
@@ -3301,7 +3319,7 @@ namespace VUInterpFast
 				float p = 0.0f;
 				const float x = VuLane(VU, Fs(code), 0);
 				if (x != 0.0f)
-					p = VuCalculateEatan(VuLane(VU, Fs(code), 1) / x);
+					p = VuCalculateEatan(VuDiv(VuLane(VU, Fs(code), 1), x));
 				VU->p.F = p;
 				return;
 			}
@@ -3310,7 +3328,7 @@ namespace VUInterpFast
 				float p = 0.0f;
 				const float x = VuLane(VU, Fs(code), 0);
 				if (x != 0.0f)
-					p = VuCalculateEatan(VuLane(VU, Fs(code), 2) / x);
+					p = VuCalculateEatan(VuDiv(VuLane(VU, Fs(code), 2), x));
 				VU->p.F = p;
 				return;
 			}
@@ -3340,7 +3358,7 @@ namespace VUInterpFast
 				{
 					p = VuSqrt(p);
 					if (p != 0.0f)
-						p = 1.0f / p;
+						p = VuDiv(1.0f, p);
 				}
 				VU->p.F = p;
 				return;
@@ -3383,7 +3401,7 @@ namespace VUInterpFast
 				const double p2 = static_cast<double>(p) * p;
 				p = static_cast<float>(p2 * p2);
 				p = VuDouble(FloatToBits(p));
-				p = 1.0f / p;
+				p = VuDiv(1.0f, p);
 				VU->p.F = p;
 				return;
 			}
