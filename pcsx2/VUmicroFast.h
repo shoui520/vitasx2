@@ -3156,49 +3156,108 @@ namespace VUInterpFast
 				if (It(code) != 0)
 				{
 					_vuBackupVI(VU, It(code));
-					VU->VI[It(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] + Imm15(code));
+					const s32 imm = Imm15(code);
+					if (imm != 0 || It(code) != Is(code))
+						VU->VI[It(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] + imm);
 				}
 				return;
 			case LowerFastKind::ISUBIU:
 				if (It(code) != 0)
 				{
 					_vuBackupVI(VU, It(code));
-					VU->VI[It(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] - Imm15(code));
+					const s32 imm = Imm15(code);
+					if (imm != 0 || It(code) != Is(code))
+						VU->VI[It(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] - imm);
 				}
 				return;
 			case LowerFastKind::IADD:
 				if (Id(code) != 0)
 				{
 					_vuBackupVI(VU, Id(code));
-					VU->VI[Id(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] + VU->VI[It(code)].SS[0]);
+					if (Is(code) == 0)
+					{
+						if (Id(code) != It(code))
+							VU->VI[Id(code)].SS[0] = VU->VI[It(code)].SS[0];
+					}
+					else if (It(code) == 0)
+					{
+						if (Id(code) != Is(code))
+							VU->VI[Id(code)].SS[0] = VU->VI[Is(code)].SS[0];
+					}
+					else
+					{
+						VU->VI[Id(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] + VU->VI[It(code)].SS[0]);
+					}
 				}
 				return;
 			case LowerFastKind::ISUB:
 				if (Id(code) != 0)
 				{
 					_vuBackupVI(VU, Id(code));
-					VU->VI[Id(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] - VU->VI[It(code)].SS[0]);
+					if (Is(code) == It(code))
+						VU->VI[Id(code)].SS[0] = 0;
+					else if (It(code) == 0)
+					{
+						if (Id(code) != Is(code))
+							VU->VI[Id(code)].SS[0] = VU->VI[Is(code)].SS[0];
+					}
+					else
+					{
+						VU->VI[Id(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] - VU->VI[It(code)].SS[0]);
+					}
 				}
 				return;
 			case LowerFastKind::IADDI:
 				if (It(code) != 0)
 				{
 					_vuBackupVI(VU, It(code));
-					VU->VI[It(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] + Imm5(code));
+					const s16 imm = Imm5(code);
+					if (imm != 0 || It(code) != Is(code))
+						VU->VI[It(code)].SS[0] = static_cast<s16>(VU->VI[Is(code)].SS[0] + imm);
 				}
 				return;
 			case LowerFastKind::IAND:
 				if (Id(code) != 0)
 				{
 					_vuBackupVI(VU, Id(code));
-					VU->VI[Id(code)].US[0] = VU->VI[Is(code)].US[0] & VU->VI[It(code)].US[0];
+					if (Is(code) == It(code))
+					{
+						if (Id(code) != Is(code))
+							VU->VI[Id(code)].US[0] = VU->VI[Is(code)].US[0];
+					}
+					else if (Is(code) == 0 || It(code) == 0)
+					{
+						VU->VI[Id(code)].US[0] = 0;
+					}
+					else
+					{
+						VU->VI[Id(code)].US[0] = VU->VI[Is(code)].US[0] & VU->VI[It(code)].US[0];
+					}
 				}
 				return;
 			case LowerFastKind::IOR:
 				if (Id(code) != 0)
 				{
 					_vuBackupVI(VU, Id(code));
-					VU->VI[Id(code)].US[0] = VU->VI[Is(code)].US[0] | VU->VI[It(code)].US[0];
+					if (Is(code) == It(code))
+					{
+						if (Id(code) != Is(code))
+							VU->VI[Id(code)].US[0] = VU->VI[Is(code)].US[0];
+					}
+					else if (Is(code) == 0)
+					{
+						if (Id(code) != It(code))
+							VU->VI[Id(code)].US[0] = VU->VI[It(code)].US[0];
+					}
+					else if (It(code) == 0)
+					{
+						if (Id(code) != Is(code))
+							VU->VI[Id(code)].US[0] = VU->VI[Is(code)].US[0];
+					}
+					else
+					{
+						VU->VI[Id(code)].US[0] = VU->VI[Is(code)].US[0] | VU->VI[It(code)].US[0];
+					}
 				}
 				return;
 			case LowerFastKind::FCAND:
