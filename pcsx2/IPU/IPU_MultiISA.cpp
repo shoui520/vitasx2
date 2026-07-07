@@ -24,6 +24,7 @@ u32 g_qemuIpuCscPostNeonBlocks = 0;
 u32 g_qemuIpuVqNeonGroups = 0;
 u32 g_qemuIpuIdctCopyNeonRows = 0;
 u32 g_qemuIpuDctLowLookupHits = 0;
+u32 g_qemuIpuDctHighLookupHits = 0;
 u32 g_qemuIpuBitreader64NeonReads = 0;
 u32 g_qemuIpuBitreader32NeonReads = 0;
 u32 g_qemuIpuBitreader8ArmReads = 0;
@@ -94,9 +95,44 @@ static constexpr std::array<DCTtab, 512> make_dct_low_lookup()
 	return lut;
 }
 
+static constexpr std::array<DCTtab, 1024> make_dct_high_table0_lookup(bool first_coefficient)
+{
+	std::array<DCTtab, 1024> lut = {};
+
+	for (u32 bucket = 8; bucket < 1024; bucket++)
+	{
+		if (bucket >= 256)
+			lut[bucket] = first_coefficient ? DCT.first[(bucket >> 6) - 4] : DCT.next[(bucket >> 6) - 4];
+		else if (bucket >= 16)
+			lut[bucket] = DCT.tab0[(bucket >> 2) - 4];
+		else
+			lut[bucket] = DCT.tab1[bucket - 8];
+	}
+
+	return lut;
+}
+
+static constexpr std::array<DCTtab, 1024> make_dct_high_table1_lookup()
+{
+	std::array<DCTtab, 1024> lut = {};
+
+	for (u32 bucket = 8; bucket < 1024; bucket++)
+	{
+		if (bucket >= 16)
+			lut[bucket] = DCT.tab0a[(bucket >> 2) - 4];
+		else
+			lut[bucket] = DCT.tab1a[bucket - 8];
+	}
+
+	return lut;
+}
+
 alignas(16) const std::array<u8, 1024> g_idct_clip_lut = make_clip_lut();
 alignas(16) const mpeg2_scan_pack mpeg2_scan = make_scan_pack();
 alignas(16) const std::array<DCTtab, 512> g_dct_low_lookup = make_dct_low_lookup();
+alignas(16) const std::array<DCTtab, 1024> g_dct_high_table0_next_lookup = make_dct_high_table0_lookup(false);
+alignas(16) const std::array<DCTtab, 1024> g_dct_high_table0_first_lookup = make_dct_high_table0_lookup(true);
+alignas(16) const std::array<DCTtab, 1024> g_dct_high_table1_lookup = make_dct_high_table1_lookup();
 
 #endif
 
@@ -667,12 +703,16 @@ static __forceinline const DCTtab* LookupDctTabReference(u16 code, bool table_on
 
 static __forceinline const DCTtab* LookupDctTabSelected(u16 code, bool table_one, bool first_coefficient)
 {
-	if (code >= 16384 && !table_one)
-		return first_coefficient ? &DCT.first[(code >> 12) - 4] : &DCT.next[(code >> 12) - 4];
-	if (code >= 1024)
-		return table_one ? &DCT.tab0a[(code >> 8) - 4] : &DCT.tab0[(code >> 8) - 4];
 	if (code >= 512)
-		return table_one ? &DCT.tab1a[(code >> 6) - 8] : &DCT.tab1[(code >> 6) - 8];
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuDctHighLookupHits;
+#endif
+		const u32 bucket = code >> 6;
+		if (table_one)
+			return &g_dct_high_table1_lookup[bucket];
+		return first_coefficient ? &g_dct_high_table0_first_lookup[bucket] : &g_dct_high_table0_next_lookup[bucket];
+	}
 	if (code >= 16)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
