@@ -630,11 +630,23 @@ namespace VitaEE
 		};
 		bool EmitVu0SyncColdTail(const Vu0SyncColdTail& tail);
 
+		enum class PartialMemoryOp : u8
+		{
+			WordLoadLeft,
+			WordLoadRight,
+			WordStoreLeft,
+			WordStoreRight,
+			DwordLoadLeft,
+			DwordLoadRight,
+			DwordStoreLeft,
+			DwordStoreRight,
+		};
+
 		struct PartialMemoryColdTail
 		{
 			size_t handler_fallback = static_cast<size_t>(-1);
 			size_t join_offset = 0;
-			const void* helper = nullptr;
+			PartialMemoryOp op = PartialMemoryOp::WordLoadLeft;
 			unsigned rt = 0;
 		};
 		bool EmitPartialMemoryColdTail(const PartialMemoryColdTail& tail);

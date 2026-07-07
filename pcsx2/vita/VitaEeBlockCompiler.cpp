@@ -216,31 +216,6 @@ namespace VitaEE
 
 		alignas(4) u32 s_raw_gpr0_known_zero = 1;
 
-		constexpr u32 LWL_MASK[4] = {0x00ffffff, 0x0000ffff, 0x000000ff, 0x00000000};
-		constexpr u32 LWR_MASK[4] = {0x00000000, 0xff000000, 0xffff0000, 0xffffff00};
-		constexpr u8 LWL_SHIFT[4] = {24, 16, 8, 0};
-		constexpr u8 LWR_SHIFT[4] = {0, 8, 16, 24};
-		constexpr u64 LDL_MASK[8] = {
-			0x00ffffffffffffffULL, 0x0000ffffffffffffULL, 0x000000ffffffffffULL, 0x00000000ffffffffULL,
-			0x0000000000ffffffULL, 0x000000000000ffffULL, 0x00000000000000ffULL, 0x0000000000000000ULL};
-		constexpr u64 LDR_MASK[8] = {
-			0x0000000000000000ULL, 0xff00000000000000ULL, 0xffff000000000000ULL, 0xffffff0000000000ULL,
-			0xffffffff00000000ULL, 0xffffffffff000000ULL, 0xffffffffffff0000ULL, 0xffffffffffffff00ULL};
-		constexpr u8 LDL_SHIFT[8] = {56, 48, 40, 32, 24, 16, 8, 0};
-		constexpr u8 LDR_SHIFT[8] = {0, 8, 16, 24, 32, 40, 48, 56};
-		constexpr u32 SWL_MASK[4] = {0xffffff00, 0xffff0000, 0xff000000, 0x00000000};
-		constexpr u32 SWR_MASK[4] = {0x00000000, 0x000000ff, 0x0000ffff, 0x00ffffff};
-		constexpr u8 SWL_SHIFT[4] = {24, 16, 8, 0};
-		constexpr u8 SWR_SHIFT[4] = {0, 8, 16, 24};
-		constexpr u64 SDL_MASK[8] = {
-			0xffffffffffffff00ULL, 0xffffffffffff0000ULL, 0xffffffffff000000ULL, 0xffffffff00000000ULL,
-			0xffffff0000000000ULL, 0xffff000000000000ULL, 0xff00000000000000ULL, 0x0000000000000000ULL};
-		constexpr u64 SDR_MASK[8] = {
-			0x0000000000000000ULL, 0x00000000000000ffULL, 0x000000000000ffffULL, 0x0000000000ffffffULL,
-			0x00000000ffffffffULL, 0x000000ffffffffffULL, 0x0000ffffffffffffULL, 0x00ffffffffffffffULL};
-		constexpr u8 SDL_SHIFT[8] = {56, 48, 40, 32, 24, 16, 8, 0};
-		constexpr u8 SDR_SHIFT[8] = {0, 8, 16, 24, 32, 40, 48, 56};
-
 		struct Cop2MacroMinMaxOp
 		{
 			bool valid = false;
@@ -1852,70 +1827,6 @@ namespace VitaEE
 			Cpu->CancelInstruction();
 		}
 
-		__noinline void VitaEeMemReadWordLeft(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::LWL().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuPartialWordMemoryHelperCalls;
-#endif
-			const u32 shift = addr & 3;
-			const u32 mem = memRead32(addr & ~3u);
-			if (guest_reg == 0)
-				return;
-
-			cpuRegs.GPR.r[guest_reg].SD[0] = static_cast<s32>((cpuRegs.GPR.r[guest_reg].UL[0] & LWL_MASK[shift]) |
-															  (mem << LWL_SHIFT[shift]));
-		}
-
-		__noinline void VitaEeMemReadWordRight(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::LWR().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuPartialWordMemoryHelperCalls;
-#endif
-			const u32 shift = addr & 3;
-			const u32 aligned_mem = memRead32(addr & ~3u);
-			if (guest_reg == 0)
-				return;
-
-			const u32 mem = (cpuRegs.GPR.r[guest_reg].UL[0] & LWR_MASK[shift]) |
-							(aligned_mem >> LWR_SHIFT[shift]);
-			if (shift == 0)
-				cpuRegs.GPR.r[guest_reg].SD[0] = static_cast<s32>(mem);
-			else
-				cpuRegs.GPR.r[guest_reg].UL[0] = mem;
-		}
-
-		__noinline void VitaEeMemReadDwordLeft(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::LDL().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuPartialDwordMemoryHelperCalls;
-#endif
-			const u32 shift = addr & 7;
-			const u64 mem = memRead64(addr & ~7u);
-			if (guest_reg == 0)
-				return;
-
-			cpuRegs.GPR.r[guest_reg].UD[0] = (cpuRegs.GPR.r[guest_reg].UD[0] & LDL_MASK[shift]) |
-											 (mem << LDL_SHIFT[shift]);
-		}
-
-		__noinline void VitaEeMemReadDwordRight(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::LDR().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuPartialDwordMemoryHelperCalls;
-#endif
-			const u32 shift = addr & 7;
-			const u64 mem = memRead64(addr & ~7u);
-			if (guest_reg == 0)
-				return;
-
-			cpuRegs.GPR.r[guest_reg].UD[0] = (cpuRegs.GPR.r[guest_reg].UD[0] & LDR_MASK[shift]) |
-											 (mem >> LDR_SHIFT[shift]);
-		}
-
 		__noinline void VitaEeMemReadCop1Word(u32 addr, u32 guest_reg)
 		{
 			// PCSX2 owner: FPU.cpp::LWC1().
@@ -1929,56 +1840,6 @@ namespace VitaEE
 			}
 
 			fpuRegs.fpr[guest_reg].UL = memRead32(addr);
-		}
-
-		__noinline void VitaEeMemWriteWordLeft(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::SWL().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuPartialWordMemoryHelperCalls;
-#endif
-			const u32 shift = addr & 3;
-			const u32 aligned = addr & ~3u;
-			const u32 mem = memRead32(aligned);
-			memWrite32(aligned, (cpuRegs.GPR.r[guest_reg].UL[0] >> SWL_SHIFT[shift]) | (mem & SWL_MASK[shift]));
-		}
-
-		__noinline void VitaEeMemWriteWordRight(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::SWR().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuPartialWordMemoryHelperCalls;
-#endif
-			const u32 shift = addr & 3;
-			const u32 aligned = addr & ~3u;
-			const u32 mem = memRead32(aligned);
-			memWrite32(aligned, (cpuRegs.GPR.r[guest_reg].UL[0] << SWR_SHIFT[shift]) | (mem & SWR_MASK[shift]));
-		}
-
-		__noinline void VitaEeMemWriteDwordLeft(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::SDL().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuPartialDwordMemoryHelperCalls;
-#endif
-			const u32 shift = addr & 7;
-			const u32 aligned = addr & ~7u;
-			const u64 mem = (cpuRegs.GPR.r[guest_reg].UD[0] >> SDL_SHIFT[shift]) |
-							(memRead64(aligned) & SDL_MASK[shift]);
-			memWrite64(aligned, mem);
-		}
-
-		__noinline void VitaEeMemWriteDwordRight(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::SDR().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuPartialDwordMemoryHelperCalls;
-#endif
-			const u32 shift = addr & 7;
-			const u32 aligned = addr & ~7u;
-			const u64 mem = (cpuRegs.GPR.r[guest_reg].UD[0] << SDR_SHIFT[shift]) |
-							(memRead64(aligned) & SDR_MASK[shift]);
-			memWrite64(aligned, mem);
 		}
 
 		__noinline void VitaEeMemWriteCop1Word(u32 addr, u32 guest_reg)
@@ -14289,12 +14150,10 @@ namespace VitaEE
 			}
 		}
 
-		const void* fallback_helper = left ? reinterpret_cast<const void*>(&VitaEeMemReadWordLeft) :
-											 reinterpret_cast<const void*>(&VitaEeMemReadWordRight);
 		m_partial_memory_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
-			fallback_helper,
+			left ? PartialMemoryOp::WordLoadLeft : PartialMemoryOp::WordLoadRight,
 			rt,
 		});
 		return true;
@@ -14339,12 +14198,10 @@ namespace VitaEE
 			return false;
 		}
 
-		const void* fallback_helper = left ? reinterpret_cast<const void*>(&VitaEeMemWriteWordLeft) :
-											 reinterpret_cast<const void*>(&VitaEeMemWriteWordRight);
 		m_partial_memory_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
-			fallback_helper,
+			left ? PartialMemoryOp::WordStoreLeft : PartialMemoryOp::WordStoreRight,
 			rt,
 		});
 		return true;
@@ -14431,8 +14288,6 @@ namespace VitaEE
 				return false;
 		}
 
-		const void* fallback_helper = left ? reinterpret_cast<const void*>(&VitaEeMemReadDwordLeft) :
-											 reinterpret_cast<const void*>(&VitaEeMemReadDwordRight);
 		const size_t done_target = m_code.Size();
 		for (size_t branch : done_branches)
 		{
@@ -14447,7 +14302,7 @@ namespace VitaEE
 		m_partial_memory_cold_tails.push_back({
 			handler_fallback,
 			join_offset,
-			fallback_helper,
+			left ? PartialMemoryOp::DwordLoadLeft : PartialMemoryOp::DwordLoadRight,
 			rt,
 		});
 		return true;
@@ -14531,8 +14386,6 @@ namespace VitaEE
 				return false;
 		}
 
-		const void* fallback_helper = left ? reinterpret_cast<const void*>(&VitaEeMemWriteDwordLeft) :
-											 reinterpret_cast<const void*>(&VitaEeMemWriteDwordRight);
 		const size_t done_target = m_code.Size();
 		for (size_t branch : done_branches)
 		{
@@ -14543,7 +14396,7 @@ namespace VitaEE
 		m_partial_memory_cold_tails.push_back({
 			handler_fallback,
 			done_target,
-			fallback_helper,
+			left ? PartialMemoryOp::DwordStoreLeft : PartialMemoryOp::DwordStoreRight,
 			rt,
 		});
 		return true;
@@ -15105,16 +14958,197 @@ namespace VitaEE
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() plus
 		// R5900OpcodeImpl.cpp::LWL/LWR/LDL/LDR/SWL/SWR/SDL/SDR().
 		// Partial accesses do not raise address errors; handler-backed pages
-		// call the existing helper, while non-handler pages fall through.
+		// dispatch through PCSX2's vTLB and do the merge in generated A32,
+		// while non-handler pages fall through after the native fast path.
 		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
-			!m_code.EmitCallAbsolute(tail.helper) ||
-			!EmitRefreshGprPinFromBacking(tail.rt))
+		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
 		{
 			return false;
 		}
+
+		const auto emit_original_aligned_address = [this](u32 mask) -> bool {
+			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) &&
+				   m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, mask);
+		};
+
+		const auto emit_word_shift_bits = [this](bool left) -> bool {
+			if (!m_code.EmitAndImm8(HOST_TMP3, HOST_TMP5, 3) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP3, VitaA32::ShiftType::LSL, 3))
+			{
+				return false;
+			}
+
+			return !left || m_code.EmitRsbImm32(HOST_TMP3, HOST_TMP3, 24);
+		};
+
+		const auto emit_word_load = [&](bool left) -> bool {
+			if (!emit_original_aligned_address(3) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&memRead32)))
+			{
+				return false;
+			}
+
+			if (tail.rt == 0)
+				return true;
+
+			if (!emit_word_shift_bits(left))
+				return false;
+
+			if (left)
+			{
+				return EmitLoadGprLow(tail.rt, HOST_TMP1) &&
+					   m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP3, 32) &&
+					   m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) &&
+					   m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP2,
+						   VitaA32::ShiftType::LSR, HOST_TMP4) &&
+					   m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP1, HOST_TMP0,
+						   VitaA32::ShiftType::LSL, HOST_TMP3) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+					   EmitStoreGpr64(tail.rt, HOST_TMP0, HOST_TMP1);
+			}
+
+			return EmitLoadGprLow(tail.rt, HOST_TMP1) &&
+				   EmitLoadGprHigh(tail.rt, HOST_TMP2) &&
+				   m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP3, 32) &&
+				   m_code.EmitMovImm32(HOST_TMP5, 0xffffffffu) &&
+				   m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP5,
+					   VitaA32::ShiftType::LSL, HOST_TMP4) &&
+				   m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP1, HOST_TMP0,
+					   VitaA32::ShiftType::LSR, HOST_TMP3) &&
+				   m_code.EmitCmpImm32(HOST_TMP3, 0) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::ASR, 31, false,
+					   VitaA32::Condition::EQ) &&
+				   EmitStoreGpr64(tail.rt, HOST_TMP0, HOST_TMP2);
+		};
+
+		const auto emit_word_store = [&](bool left) -> bool {
+			if (!emit_original_aligned_address(3) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&memRead32)) ||
+				!emit_word_shift_bits(left) ||
+				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(tail.rt))) ||
+				!m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP3, 32) ||
+				!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu))
+			{
+				return false;
+			}
+
+			if (!(left ? m_code.EmitAndRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP2,
+							   VitaA32::ShiftType::LSL, HOST_TMP4) :
+						 m_code.EmitAndRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP2,
+							   VitaA32::ShiftType::LSR, HOST_TMP4)) ||
+				!(left ? m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP1,
+							   VitaA32::ShiftType::LSR, HOST_TMP3) :
+						 m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP1,
+							   VitaA32::ShiftType::LSL, HOST_TMP3)) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+				!emit_original_aligned_address(3) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&memWrite32)))
+			{
+				return false;
+			}
+
+			return true;
+		};
+
+		const auto emit_dword_loop_indices = [this](bool left) -> bool {
+			if (!m_code.EmitAndImm8(HOST_TMP0, HOST_TMP5, 7))
+				return false;
+
+			if (left)
+			{
+				return m_code.EmitRsbImm32(HOST_TMP2, HOST_TMP0, 7) &&
+					   m_code.EmitAddImm8(HOST_TMP3, HOST_TMP0, 1) &&
+					   m_code.EmitMovImm8(HOST_TMP0, 0);
+			}
+
+			return m_code.EmitMovImm8(HOST_TMP2, 0) &&
+				   m_code.EmitRsbImm32(HOST_TMP3, HOST_TMP0, 8);
+		};
+
+		const auto emit_dword_byte_loop = [&](bool store) -> bool {
+			const size_t loop_target = m_code.Size();
+			if (!(store ? (m_code.EmitLdrbRegShift(HOST_TMP1, HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL, 0) &&
+							  m_code.EmitStrbRegShift(HOST_TMP1, HOST_SP, HOST_TMP0, VitaA32::ShiftType::LSL, 0)) :
+						  (m_code.EmitLdrbRegShift(HOST_TMP1, HOST_SP, HOST_TMP0, VitaA32::ShiftType::LSL, 0) &&
+							  m_code.EmitStrbRegShift(HOST_TMP1, HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL, 0))) ||
+				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1) ||
+				!m_code.EmitAddImm8(HOST_TMP2, HOST_TMP2, 1) ||
+				!m_code.EmitSubImm8(HOST_TMP3, HOST_TMP3, 1, true))
+			{
+				return false;
+			}
+
+			const size_t loop_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			return loop_branch != static_cast<size_t>(-1) &&
+				   m_code.PatchBranch(loop_branch, loop_target, VitaA32::Condition::NE);
+		};
+
+		const auto emit_dword_load = [&](bool left) -> bool {
+			if (!emit_original_aligned_address(7) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&memRead64)))
+			{
+				return false;
+			}
+
+			if (tail.rt == 0)
+				return true;
+
+			return m_code.EmitSubImm8(HOST_SP, HOST_SP, 8) &&
+				   m_code.EmitStrdImm8(HOST_TMP0, HOST_TMP1, HOST_SP, 0) &&
+				   m_code.EmitAddImm32(HOST_TMP4, HOST_CPU_REGS, static_cast<u32>(GprOffset(tail.rt))) &&
+				   emit_dword_loop_indices(left) &&
+				   emit_dword_byte_loop(false) &&
+				   m_code.EmitAddImm8(HOST_SP, HOST_SP, 8) &&
+				   EmitRefreshGprPinFromBacking(tail.rt);
+		};
+
+		const auto emit_dword_store = [&](bool left) -> bool {
+			return emit_original_aligned_address(7) &&
+				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&memRead64)) &&
+				   m_code.EmitSubImm8(HOST_SP, HOST_SP, 8) &&
+				   m_code.EmitStrdImm8(HOST_TMP0, HOST_TMP1, HOST_SP, 0) &&
+				   m_code.EmitAddImm32(HOST_TMP4, HOST_CPU_REGS, static_cast<u32>(GprOffset(tail.rt))) &&
+				   emit_dword_loop_indices(left) &&
+				   emit_dword_byte_loop(true) &&
+				   m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, HOST_SP, 0) &&
+				   m_code.EmitAddImm8(HOST_SP, HOST_SP, 8) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 0) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP1, VitaA32::ShiftType::LSL, 0) &&
+				   emit_original_aligned_address(7) &&
+				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&memWrite64));
+		};
+
+		bool emitted = false;
+		switch (tail.op)
+		{
+			case PartialMemoryOp::WordLoadLeft:
+				emitted = emit_word_load(true);
+				break;
+			case PartialMemoryOp::WordLoadRight:
+				emitted = emit_word_load(false);
+				break;
+			case PartialMemoryOp::WordStoreLeft:
+				emitted = emit_word_store(true);
+				break;
+			case PartialMemoryOp::WordStoreRight:
+				emitted = emit_word_store(false);
+				break;
+			case PartialMemoryOp::DwordLoadLeft:
+				emitted = emit_dword_load(true);
+				break;
+			case PartialMemoryOp::DwordLoadRight:
+				emitted = emit_dword_load(false);
+				break;
+			case PartialMemoryOp::DwordStoreLeft:
+				emitted = emit_dword_store(true);
+				break;
+			case PartialMemoryOp::DwordStoreRight:
+				emitted = emit_dword_store(false);
+				break;
+		}
+
+		if (!emitted)
+			return false;
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();
 		return tail_done != static_cast<size_t>(-1) &&
