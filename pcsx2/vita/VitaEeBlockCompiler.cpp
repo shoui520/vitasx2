@@ -1852,51 +1852,6 @@ namespace VitaEE
 			Cpu->CancelInstruction();
 		}
 
-		__noinline u32 VitaEeMemRead8(u32 addr)
-		{
-			// PCSX2 owners: R5900OpcodeImpl.cpp::LB() and LBU().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuByteMemoryHelperCalls;
-#endif
-			return memRead8(addr);
-		}
-
-		__noinline u32 VitaEeMemRead16Checked(u32 addr)
-		{
-			// PCSX2 owners: R5900OpcodeImpl.cpp::LH() and LHU().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuHalfwordMemoryHelperCalls;
-#endif
-			if (addr & 1)
-				VitaEeRaiseAddressError(addr, false);
-
-			return memRead16(addr);
-		}
-
-		__noinline u32 VitaEeMemRead32Checked(u32 addr)
-		{
-			// PCSX2 owners: R5900OpcodeImpl.cpp::LW() and LWU().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuWordMemoryHelperCalls;
-#endif
-			if (addr & 3)
-				VitaEeRaiseAddressError(addr, false);
-
-			return memRead32(addr);
-		}
-
-		__noinline u64 VitaEeMemRead64Checked(u32 addr)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::LD().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuDwordMemoryHelperCalls;
-#endif
-			if (addr & 7)
-				VitaEeRaiseAddressError(addr, false);
-
-			return memRead64(addr);
-		}
-
 		__noinline void VitaEeMemReadWordLeft(u32 addr, u32 guest_reg)
 		{
 			// PCSX2 owner: R5900OpcodeImpl.cpp::LWL().
@@ -1976,39 +1931,6 @@ namespace VitaEE
 			fpuRegs.fpr[guest_reg].UL = memRead32(addr);
 		}
 
-		__noinline void VitaEeMemWrite8(u32 addr, u32 value)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::SB().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuByteMemoryHelperCalls;
-#endif
-			memWrite8(addr, static_cast<u8>(value));
-		}
-
-		__noinline void VitaEeMemWrite16Checked(u32 addr, u32 value)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::SH().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuHalfwordMemoryHelperCalls;
-#endif
-			if (addr & 1)
-				VitaEeRaiseAddressError(addr, true);
-
-			memWrite16(addr, static_cast<u16>(value));
-		}
-
-		__noinline void VitaEeMemWrite32Checked(u32 addr, u32 value)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::SW().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuWordMemoryHelperCalls;
-#endif
-			if (addr & 3)
-				VitaEeRaiseAddressError(addr, true);
-
-			memWrite32(addr, value);
-		}
-
 		__noinline void VitaEeMemWriteWordLeft(u32 addr, u32 guest_reg)
 		{
 			// PCSX2 owner: R5900OpcodeImpl.cpp::SWL().
@@ -2031,18 +1953,6 @@ namespace VitaEE
 			const u32 aligned = addr & ~3u;
 			const u32 mem = memRead32(aligned);
 			memWrite32(aligned, (cpuRegs.GPR.r[guest_reg].UL[0] << SWR_SHIFT[shift]) | (mem & SWR_MASK[shift]));
-		}
-
-		__noinline void VitaEeMemWrite64Checked(u32 addr, u32 low, u32 high)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::SD().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuDwordMemoryHelperCalls;
-#endif
-			if (addr & 7)
-				VitaEeRaiseAddressError(addr, true);
-
-			memWrite64(addr, (static_cast<u64>(high) << 32) | low);
 		}
 
 		__noinline void VitaEeMemWriteDwordLeft(u32 addr, u32 guest_reg)
@@ -12849,7 +12759,7 @@ namespace VitaEE
 		const void* event_exit, bool branch_delay_slot)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead8), true, 24, branch_delay_slot,
+			reinterpret_cast<const void*>(&memRead8), true, branch_delay_slot,
 			ScalarLoadWidth::Byte, 0, true);
 	}
 
@@ -12857,7 +12767,7 @@ namespace VitaEE
 		const void* event_exit, bool branch_delay_slot)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), true, 16, branch_delay_slot,
+			reinterpret_cast<const void*>(&memRead16), true, branch_delay_slot,
 			ScalarLoadWidth::Halfword, 1, true);
 	}
 
@@ -12865,7 +12775,7 @@ namespace VitaEE
 		const void* event_exit, bool branch_delay_slot)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead32Checked), true, 0, branch_delay_slot,
+			reinterpret_cast<const void*>(&memRead32), true, branch_delay_slot,
 			ScalarLoadWidth::Word, 3, true);
 	}
 
@@ -12873,7 +12783,7 @@ namespace VitaEE
 		const void* event_exit, bool branch_delay_slot)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead8), false, 0, branch_delay_slot,
+			reinterpret_cast<const void*>(&memRead8), false, branch_delay_slot,
 			ScalarLoadWidth::Byte, 0, true);
 	}
 
@@ -12881,14 +12791,14 @@ namespace VitaEE
 		const void* event_exit, bool branch_delay_slot)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead16Checked), false, 0, branch_delay_slot,
+			reinterpret_cast<const void*>(&memRead16), false, branch_delay_slot,
 			ScalarLoadWidth::Halfword, 1, true);
 	}
 
 	bool BlockCompiler::EmitLWU(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead32Checked), false, 0, false,
+			reinterpret_cast<const void*>(&memRead32), false, false,
 			ScalarLoadWidth::Word, 3, false);
 	}
 
@@ -12905,7 +12815,7 @@ namespace VitaEE
 	bool BlockCompiler::EmitLD(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		return EmitLoadWithCounterReadEvent(op, pc, raw_cycles_through_instruction, event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemRead64Checked), false, 0, false,
+			reinterpret_cast<const void*>(&memRead64), false, false,
 			ScalarLoadWidth::Dword, 7, false);
 	}
 
@@ -13031,7 +12941,7 @@ namespace VitaEE
 			0,
 			0,
 			nullptr,
-			reinterpret_cast<const void*>(&VitaEeMemWrite8),
+			reinterpret_cast<const void*>(&memWrite8),
 			rt,
 			ScalarStoreWidth::Byte,
 		});
@@ -13069,7 +12979,7 @@ namespace VitaEE
 			pc,
 			raw_cycles_through_instruction,
 			event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemWrite16Checked),
+			reinterpret_cast<const void*>(&memWrite16),
 			rt,
 			ScalarStoreWidth::Halfword,
 		});
@@ -13107,7 +13017,7 @@ namespace VitaEE
 			pc,
 			raw_cycles_through_instruction,
 			event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemWrite32Checked),
+			reinterpret_cast<const void*>(&memWrite32),
 			rt,
 			ScalarStoreWidth::Word,
 		});
@@ -13168,7 +13078,7 @@ namespace VitaEE
 			pc,
 			raw_cycles_through_instruction,
 			event_exit,
-			reinterpret_cast<const void*>(&VitaEeMemWrite64Checked),
+			reinterpret_cast<const void*>(&memWrite64),
 			rt,
 			ScalarStoreWidth::Dword,
 		});
@@ -14640,7 +14550,7 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
-		const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,
+		const void* event_exit, const void* read_helper, bool sign_extend,
 		bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask, bool counter_read_event)
 	{
 		const unsigned rt = RT(op);
@@ -14741,7 +14651,6 @@ namespace VitaEE
 			read_helper,
 			width,
 			rt,
-			sign_shift,
 			sign_extend,
 			branch_delay_slot,
 			counter_read_event,
@@ -14897,8 +14806,9 @@ namespace VitaEE
 	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead*() /
 		// R5900OpcodeImpl.cpp::LB/LBU/LH/LHU/LW/LWU/LD().
-		// Handler and unaligned pages stay on the helper/event path, but the hot
-		// non-handler VTLB path falls through to the next guest instruction.
+		// Handler pages dispatch through PCSX2's vTLB directly; unaligned pages
+		// use the generated address-error event path before any memory dispatch.
+		// The hot non-handler VTLB path falls through to the next guest instruction.
 		if (tail.unaligned_fallback != static_cast<size_t>(-1))
 		{
 			const size_t address_error_target = m_code.Size();
@@ -14921,21 +14831,21 @@ namespace VitaEE
 		}
 
 		const bool needs_counter_event = tail.counter_read_event && tail.rt != 0;
-		const auto emit_sign_extend_low = [&]() -> bool {
-			switch (tail.sign_shift)
+		const auto emit_normalize_narrow_low = [&]() -> bool {
+			switch (tail.width)
 			{
-				case 0:
+				case ScalarLoadWidth::Byte:
+					return tail.sign_extend ? m_code.EmitSxtb(HOST_TMP0, HOST_TMP0) :
+											  m_code.EmitUbfx(HOST_TMP0, HOST_TMP0, 0, 8);
+				case ScalarLoadWidth::Halfword:
+					return tail.sign_extend ? m_code.EmitSxth(HOST_TMP0, HOST_TMP0) :
+											  m_code.EmitUxth(HOST_TMP0, HOST_TMP0);
+				case ScalarLoadWidth::Word:
+				case ScalarLoadWidth::Dword:
 					return true;
-				case 16:
-					return m_code.EmitSxth(HOST_TMP0, HOST_TMP0);
-				case 24:
-					return m_code.EmitSxtb(HOST_TMP0, HOST_TMP0);
-				default:
-					return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL,
-							   static_cast<u8>(tail.sign_shift)) &&
-						   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::ASR,
-							   static_cast<u8>(tail.sign_shift));
 			}
+
+			return false;
 		};
 		const auto emit_store_result = [&]() -> bool {
 			if (tail.width == ScalarLoadWidth::Dword)
@@ -14973,7 +14883,7 @@ namespace VitaEE
 			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
 			(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
 			!m_code.EmitCallAbsolute(tail.read_helper) ||
-			(tail.width != ScalarLoadWidth::Dword && tail.rt != 0 && tail.sign_extend && !emit_sign_extend_low()) ||
+			(tail.width != ScalarLoadWidth::Dword && tail.rt != 0 && !emit_normalize_narrow_low()) ||
 			!emit_store_result())
 		{
 			return false;
@@ -14995,8 +14905,9 @@ namespace VitaEE
 	bool BlockCompiler::EmitScalarStoreColdTail(const ScalarStoreColdTail& tail)
 	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memWrite*() / R5900OpcodeImpl.cpp::SB/SH/SW/SD().
-		// Handler and unaligned writes keep the existing helper/event behavior;
-		// the non-handler VTLB path falls through after the native store.
+		// Handler pages dispatch through PCSX2's vTLB directly; unaligned pages
+		// use the generated address-error event path before any memory dispatch.
+		// The non-handler VTLB path falls through after the native store.
 		if (tail.unaligned_fallback != static_cast<size_t>(-1))
 		{
 			const size_t address_error_target = m_code.Size();
@@ -15021,7 +14932,9 @@ namespace VitaEE
 				break;
 
 			case ScalarStoreWidth::Dword:
-				if (!EmitLoadGpr64(tail.rt, HOST_TMP1, HOST_TMP2))
+				// PCSX2 owner: vtlb.cpp::vtlb_memWrite<mem64_t>() takes
+				// (u32 addr, u64 value). AAPCS places the 64-bit value in r2/r3.
+				if (!EmitLoadGpr64(tail.rt, HOST_TMP2, HOST_TMP3))
 					return false;
 				break;
 		}

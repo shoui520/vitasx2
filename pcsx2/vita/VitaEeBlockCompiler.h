@@ -483,7 +483,7 @@ namespace VitaEE
 		bool EmitSetLessThan64Imm(unsigned guest_reg, s32 imm, bool signed_compare,
 			unsigned lhs_low, unsigned lhs_high);
 		bool EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
-			const void* event_exit, const void* read_helper, bool sign_extend, unsigned sign_shift,
+			const void* event_exit, const void* read_helper, bool sign_extend,
 			bool branch_delay_slot, ScalarLoadWidth width, u8 alignment_mask, bool counter_read_event);
 		bool EmitPartialWordLoad(u32 op, bool left);
 		bool EmitPartialWordStore(u32 op, bool left);
@@ -564,7 +564,6 @@ namespace VitaEE
 			const void* read_helper = nullptr;
 			ScalarLoadWidth width = ScalarLoadWidth::Byte;
 			unsigned rt = 0;
-			unsigned sign_shift = 0;
 			bool sign_extend = false;
 			bool branch_delay_slot = false;
 			bool counter_read_event = false;
