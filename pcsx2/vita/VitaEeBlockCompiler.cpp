@@ -15616,6 +15616,12 @@ namespace VitaEE
 				VitaA32::ShiftType::LSL, 0);
 		}
 
+		bool qcache_loaded = false;
+		if (!TryEmitLoadGprWordFromQCache(guest_reg, 0, host_reg, &qcache_loaded))
+			return false;
+		if (qcache_loaded)
+			return true;
+
 		return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg)));
 	}
 
@@ -15683,6 +15689,12 @@ namespace VitaEE
 				VitaA32::ShiftType::LSL, 0);
 		}
 
+		bool qcache_loaded = false;
+		if (!TryEmitLoadGprWordFromQCache(guest_reg, 1, host_reg, &qcache_loaded))
+			return false;
+		if (qcache_loaded)
+			return true;
+
 		return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg) + sizeof(u32)));
 	}
 
@@ -15699,6 +15711,16 @@ namespace VitaEE
 			return m_code.EmitMovRegShiftImm(host_low, static_cast<unsigned>(pin_host),
 					   VitaA32::ShiftType::LSL, 0) &&
 				   EmitLoadGprHigh(guest_reg, host_high);
+		}
+
+		bool qcache_loaded = false;
+		if (!TryEmitLoadGprWordFromQCache(guest_reg, 0, host_low, &qcache_loaded))
+			return false;
+		if (qcache_loaded)
+		{
+			bool high_qcache_loaded = false;
+			return TryEmitLoadGprWordFromQCache(guest_reg, 1, host_high, &high_qcache_loaded) &&
+				   high_qcache_loaded;
 		}
 
 		if (offset <= 0xff && CanUseA32DualTransferPair(host_low, host_high))
