@@ -35,6 +35,7 @@ u32 g_qemuSio2FifoBulkWriteBytes = 0;
 u32 g_qemuSio2FifoNeonQwords = 0;
 u32 g_qemuSio2FifoNeon64ByteGroups = 0;
 u32 g_qemuSio2FifoNeon256ByteGroups = 0;
+u32 g_qemuSio2FifoCompactBytes = 0;
 #endif
 
 namespace
@@ -231,7 +232,19 @@ void Sio2ByteFifo::CompactConsumed()
 
 	const size_t remaining = size();
 	if (remaining != 0)
+	{
+#if defined(ARCH_ARM32)
+		// Consumed-prefix compaction is always a left move. The source stays
+		// ahead of the destination, so the ARM32 FIFO copy loop preserves the
+		// same byte stream as memmove while avoiding libc dispatch on Cortex-A9.
+		Sio2CopyBytes(m_data.data(), m_data.data() + m_head, remaining);
+#else
 		std::memmove(m_data.data(), m_data.data() + m_head, remaining);
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSio2FifoCompactBytes += static_cast<u32>(remaining);
+#endif
+	}
 
 	m_data.resize(remaining);
 	m_head = 0;
