@@ -18,6 +18,7 @@ static constexpr size_t SPR_SCRATCH_BYTES = 16 * 1024;
 #if defined(VITASX2_QEMU_VALIDATION)
 extern u32 g_qemuSprCopyNeonQwords;
 extern u32 g_qemuSprCopyNeon64ByteGroups;
+extern u32 g_qemuSprCopyNeon128ByteGroups;
 extern u32 g_qemuSprCopyNeon256ByteGroups;
 extern u32 g_qemuSprCopyNeon1024ByteGroups;
 extern u32 g_qemuSprCopyToScratchCalls;
@@ -47,12 +48,16 @@ static __forceinline void SprCopy64Bytes(u8* dst, const u8* src)
 	vst1q_u8(dst + 48, qword3);
 }
 
-static __forceinline void SprCopy256Bytes(u8* dst, const u8* src)
+static __forceinline void SprCopy128Bytes(u8* dst, const u8* src)
 {
 	SprCopy64Bytes(dst, src);
 	SprCopy64Bytes(dst + 64, src + 64);
-	SprCopy64Bytes(dst + 128, src + 128);
-	SprCopy64Bytes(dst + 192, src + 192);
+}
+
+static __forceinline void SprCopy256Bytes(u8* dst, const u8* src)
+{
+	SprCopy128Bytes(dst, src);
+	SprCopy128Bytes(dst + 128, src + 128);
 }
 
 static __forceinline void SprCopy1024Bytes(u8* dst, const u8* src)
@@ -63,11 +68,12 @@ static __forceinline void SprCopy1024Bytes(u8* dst, const u8* src)
 	SprCopy256Bytes(dst + 768, src + 768);
 }
 
-static __forceinline void SprCountNeonCopy(size_t qwords, size_t groups64, size_t groups256, size_t groups1024)
+static __forceinline void SprCountNeonCopy(size_t qwords, size_t groups64, size_t groups128, size_t groups256, size_t groups1024)
 {
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuSprCopyNeonQwords += static_cast<u32>(qwords);
 	g_qemuSprCopyNeon64ByteGroups += static_cast<u32>(groups64);
+	g_qemuSprCopyNeon128ByteGroups += static_cast<u32>(groups128);
 	g_qemuSprCopyNeon256ByteGroups += static_cast<u32>(groups256);
 	g_qemuSprCopyNeon1024ByteGroups += static_cast<u32>(groups1024);
 #endif
@@ -115,7 +121,19 @@ static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
 	}
 
 	const size_t remaining_after_256 = remaining_after_1024 & 255;
-	const size_t groups64 = remaining_after_256 >> 6;
+	const size_t groups128 = remaining_after_256 >> 7;
+	for (size_t i = 0; i < groups128; i++)
+	{
+		if ((i + 1) < groups128)
+			__builtin_prefetch(csrc + 128, 0, 1);
+
+		SprCopy128Bytes(cdst, csrc);
+		csrc += 128;
+		cdst += 128;
+	}
+
+	const size_t remaining_after_128 = remaining_after_256 & 127;
+	const size_t groups64 = remaining_after_128 >> 6;
 	for (size_t i = 0; i < groups64; i++)
 	{
 		if ((i + 1) < groups64)
@@ -126,7 +144,7 @@ static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
 		cdst += 64;
 	}
 
-	const size_t tail_bytes = remaining_after_256 & 63;
+	const size_t tail_bytes = remaining_after_128 & 63;
 	const size_t tail_qwords = tail_bytes >> 4;
 	for (size_t i = 0; i < tail_qwords; i++)
 	{
@@ -147,8 +165,9 @@ static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
 	for (size_t i = 0; i < (tail_bytes & 7); i++)
 		cdst[i] = csrc[i];
 
-	SprCountNeonCopy((groups1024 << 6) + (groups256 << 4) + (groups64 << 2) + tail_qwords,
-		(groups1024 << 4) + (groups256 << 2) + groups64,
+	SprCountNeonCopy((groups1024 << 6) + (groups256 << 4) + (groups128 << 3) + (groups64 << 2) + tail_qwords,
+		(groups1024 << 4) + (groups256 << 2) + (groups128 << 1) + groups64,
+		(groups1024 << 3) + (groups256 << 1) + groups128,
 		(groups1024 << 2) + groups256,
 		groups1024);
 	return;
