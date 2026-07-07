@@ -1363,44 +1363,24 @@ namespace VUInterpFast
 	}
 
 #if defined(ARCH_ARM32)
-	alignas(16) static constexpr u32 XYZW_LANE_WRITE_MASKS_NEON[16][4] = {
-		{0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
-		{0x00000000u, 0x00000000u, 0x00000000u, 0xffffffffu},
-		{0x00000000u, 0x00000000u, 0xffffffffu, 0x00000000u},
-		{0x00000000u, 0x00000000u, 0xffffffffu, 0xffffffffu},
-		{0x00000000u, 0xffffffffu, 0x00000000u, 0x00000000u},
-		{0x00000000u, 0xffffffffu, 0x00000000u, 0xffffffffu},
-		{0x00000000u, 0xffffffffu, 0xffffffffu, 0x00000000u},
-		{0x00000000u, 0xffffffffu, 0xffffffffu, 0xffffffffu},
-		{0xffffffffu, 0x00000000u, 0x00000000u, 0x00000000u},
-		{0xffffffffu, 0x00000000u, 0x00000000u, 0xffffffffu},
-		{0xffffffffu, 0x00000000u, 0xffffffffu, 0x00000000u},
-		{0xffffffffu, 0x00000000u, 0xffffffffu, 0xffffffffu},
-		{0xffffffffu, 0xffffffffu, 0x00000000u, 0x00000000u},
-		{0xffffffffu, 0xffffffffu, 0x00000000u, 0xffffffffu},
-		{0xffffffffu, 0xffffffffu, 0xffffffffu, 0x00000000u},
-		{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu},
-	};
-
-	static inline uint32x4_t BlendQwordMaskedNeon(const u32* old_bits, unsigned mask, uint32x4_t result)
-	{
-		if (mask == 0x0f)
-			return result;
-
-		const uint32x4_t old_value = vld1q_u32(old_bits);
-		const uint32x4_t write_mask = vld1q_u32(XYZW_LANE_WRITE_MASKS_NEON[mask]);
-		return vbslq_u32(write_mask, result, old_value);
-	}
-
 	static inline void StoreLowerVfResultMaskedNeon(u32* dest, unsigned mask, uint32x4_t result)
 	{
 		if (mask == 0)
 			return;
 
-		vst1q_u32(dest, BlendQwordMaskedNeon(dest, mask, result));
+		if (mask == 0x0f)
+		{
+			vst1q_u32(dest, result);
 #if defined(VITASX2_QEMU_VALIDATION)
-		++::g_qemuVuLowerNeonQwordOps;
+			++::g_qemuVuLowerNeonQwordOps;
 #endif
+			return;
+		}
+
+		if (mask & 0x8) vst1q_lane_u32(&dest[0], result, 0);
+		if (mask & 0x4) vst1q_lane_u32(&dest[1], result, 1);
+		if (mask & 0x2) vst1q_lane_u32(&dest[2], result, 2);
+		if (mask & 0x1) vst1q_lane_u32(&dest[3], result, 3);
 	}
 
 	static inline void StoreUpperResultMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, uint32x4_t result)
