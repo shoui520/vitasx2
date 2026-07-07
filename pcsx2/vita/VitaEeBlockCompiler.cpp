@@ -9218,8 +9218,8 @@ namespace VitaEE
 		// PCSX2 owners: R5900OpcodeTables.cpp::Class_MMI2() dispatches this
 		// opcode to MMI.cpp::PDIVBW(), which divides all four signed RS words
 		// by RT.SS[0] and writes all four 32-bit LO/HI words directly. Divisor
-		// 0, 1, and -1 are emitted directly; other divisors call the PCSX2-shaped
-		// helper because Cortex-A9 has no integer divide.
+		// 0, 1, -1, power-of-two, and arbitrary divisors are all emitted as
+		// A32/NEON because Cortex-A9 has no integer divide instruction.
 		return EmitPackedWordByHalfwordDivide(op);
 	}
 
@@ -9356,6 +9356,164 @@ namespace VitaEE
 			       EmitStoreCpuRegsU64(offset, value_reg, sign_reg,
 					   address_scratch);
 		};
+
+		const auto emit_unsigned_shift_subtract_divide =
+			[&](unsigned dividend_reg, unsigned divisor_reg,
+				unsigned quotient_reg, unsigned remainder_reg, unsigned scratch_reg) {
+				BranchPatch below_branch{};
+				BranchPatch equal_branch{};
+				BranchPatch done_branches[2]{};
+				unsigned done_branch_count = 0;
+
+				if (!m_code.EmitMovImm8(quotient_reg, 0) ||
+					!m_code.EmitMovRegShiftImm(remainder_reg, dividend_reg,
+						VitaA32::ShiftType::LSL, 0) ||
+					!m_code.EmitCmpReg(dividend_reg, divisor_reg) ||
+					!emit_branch(below_branch, VitaA32::Condition::CC) ||
+					!emit_branch(equal_branch, VitaA32::Condition::EQ))
+				{
+					return false;
+				}
+
+				if (!m_code.EmitClz(scratch_reg, divisor_reg) ||
+					!m_code.EmitClz(quotient_reg, dividend_reg) ||
+					!m_code.EmitSubReg(scratch_reg, scratch_reg, quotient_reg) ||
+					!m_code.EmitMovRegShiftReg(dividend_reg, divisor_reg,
+						VitaA32::ShiftType::LSL, scratch_reg) ||
+					!m_code.EmitMovImm8(divisor_reg, 1) ||
+					!m_code.EmitMovRegShiftReg(divisor_reg, divisor_reg,
+						VitaA32::ShiftType::LSL, scratch_reg) ||
+					!m_code.EmitMovImm8(quotient_reg, 0))
+				{
+					return false;
+				}
+
+				const size_t loop_start = m_code.Size();
+				BranchPatch skip_subtract_branch{};
+				BranchPatch loop_branch{};
+				if (!m_code.EmitCmpReg(remainder_reg, dividend_reg) ||
+					!emit_branch(skip_subtract_branch, VitaA32::Condition::CC) ||
+					!m_code.EmitSubReg(remainder_reg, remainder_reg, dividend_reg) ||
+					!m_code.EmitOrrReg(quotient_reg, quotient_reg, divisor_reg) ||
+					!patch_branch(skip_subtract_branch, m_code.Size()) ||
+					!m_code.EmitMovRegShiftImm(divisor_reg, divisor_reg,
+						VitaA32::ShiftType::LSR, 1, true) ||
+					!m_code.EmitMovRegShiftImm(dividend_reg, dividend_reg,
+						VitaA32::ShiftType::LSR, 1) ||
+					!emit_branch(loop_branch, VitaA32::Condition::NE) ||
+					!patch_branch(loop_branch, loop_start) ||
+					!emit_branch(done_branches[done_branch_count++],
+						VitaA32::Condition::AL))
+				{
+					return false;
+				}
+
+				if (!patch_branch(equal_branch, m_code.Size()) ||
+					!m_code.EmitMovImm8(quotient_reg, 1) ||
+					!m_code.EmitMovImm8(remainder_reg, 0) ||
+					!emit_branch(done_branches[done_branch_count++],
+						VitaA32::Condition::AL) ||
+					!patch_branch(below_branch, m_code.Size()))
+				{
+					return false;
+				}
+
+				return patch_branches(done_branches, done_branch_count,
+					m_code.Size());
+			};
+
+		const auto emit_unsigned_general_lane =
+			[&](unsigned source_word, unsigned dest_lane) {
+				const size_t lo_offset = LO_OFFSET + dest_lane * sizeof(u64);
+				const size_t hi_offset = HI_OFFSET + dest_lane * sizeof(u64);
+				BranchPatch divzero_branch{};
+				BranchPatch done_branch{};
+
+				if (!load_word(rs, source_word, HOST_TMP0) ||
+					!load_word(rt, source_word, HOST_TMP1) ||
+					!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
+					!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
+					!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1,
+						HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
+					!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+					!store_signed_word_as_doubleword(HOST_TMP3, hi_offset) ||
+					!emit_branch(done_branch, VitaA32::Condition::AL))
+				{
+					return false;
+				}
+
+				if (!patch_branch(divzero_branch, m_code.Size()) ||
+					!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) ||
+					!store_signed_word_as_doubleword(HOST_TMP2, lo_offset,
+						HOST_TMP3) ||
+					!store_signed_word_as_doubleword(HOST_TMP0, hi_offset,
+						HOST_TMP1))
+				{
+					return false;
+				}
+
+				return patch_branch(done_branch, m_code.Size());
+			};
+
+		const auto emit_signed_general_lane =
+			[&](unsigned source_word, unsigned dest_lane) {
+				const size_t lo_offset = LO_OFFSET + dest_lane * sizeof(u64);
+				const size_t hi_offset = HI_OFFSET + dest_lane * sizeof(u64);
+				BranchPatch divzero_branch{};
+				BranchPatch done_branch{};
+
+				if (!load_word(rs, source_word, HOST_TMP0) ||
+					!load_word(rt, source_word, HOST_TMP1) ||
+					!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
+					!emit_branch(divzero_branch, VitaA32::Condition::EQ))
+				{
+					return false;
+				}
+
+				// PCSX2 MMI.cpp::_PDIVW() truncates toward zero. Cortex-A9
+				// has no SDIV, so divide absolute magnitudes and restore the
+				// quotient/remainder signs in generated A32.
+				if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0,
+						VitaA32::ShiftType::ASR, 31) ||
+					!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1,
+						VitaA32::ShiftType::ASR, 31) ||
+					!m_code.EmitEorReg(HOST_TMP4, HOST_TMP4, HOST_TMP5) ||
+					!m_code.EmitPush(static_cast<u16>(1u << HOST_TMP4)) ||
+					!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
+					!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
+					!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1,
+						VitaA32::ShiftType::ASR, 31) ||
+					!m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+					!m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+					!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1,
+						HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
+					!m_code.EmitPop(static_cast<u16>(1u << HOST_TMP4)) ||
+					!m_code.EmitEorReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+					!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+					!m_code.EmitEorReg(HOST_TMP3, HOST_TMP3, HOST_TMP5) ||
+					!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_TMP5) ||
+					!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+					!store_signed_word_as_doubleword(HOST_TMP3, hi_offset) ||
+					!emit_branch(done_branch, VitaA32::Condition::AL))
+				{
+					return false;
+				}
+
+				if (!patch_branch(divzero_branch, m_code.Size()) ||
+					!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) ||
+					!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
+					!m_code.EmitMovImm8(HOST_TMP2, 1,
+						VitaA32::Condition::LT) ||
+					!store_signed_word_as_doubleword(HOST_TMP2, lo_offset,
+						HOST_TMP3) ||
+					!store_signed_word_as_doubleword(HOST_TMP0, hi_offset,
+						HOST_TMP1))
+				{
+					return false;
+				}
+
+				return patch_branch(done_branch, m_code.Size());
+			};
 
 		BranchPatch fallback_branches[2]{};
 		unsigned fallback_branch_count = 0;
@@ -9908,11 +10066,10 @@ namespace VitaEE
 
 		if (!patch_branches(fallback_branches, fallback_branch_count,
 				m_code.Size()) ||
-			!m_code.EmitCallAbsolute(
-				signed_divide ? reinterpret_cast<const void*>(
-									&VitaEePackedDivSignedWords) :
-								reinterpret_cast<const void*>(
-									&VitaEePackedDivUnsignedWords)))
+			!(signed_divide ? emit_signed_general_lane(0, 0) :
+							  emit_unsigned_general_lane(0, 0)) ||
+			!(signed_divide ? emit_signed_general_lane(2, 1) :
+							  emit_unsigned_general_lane(2, 1)))
 		{
 			return false;
 		}
@@ -9956,6 +10113,72 @@ namespace VitaEE
                 return true;
               };
 
+          const auto emit_unsigned_shift_subtract_divide =
+              [&](unsigned dividend_reg, unsigned divisor_reg,
+                  unsigned quotient_reg, unsigned remainder_reg,
+                  unsigned scratch_reg) {
+                BranchPatch below_branch{};
+                BranchPatch equal_branch{};
+                BranchPatch done_branches[2]{};
+                unsigned done_branch_count = 0;
+
+                if (!m_code.EmitMovImm8(quotient_reg, 0) ||
+                    !m_code.EmitMovRegShiftImm(remainder_reg, dividend_reg,
+                        VitaA32::ShiftType::LSL, 0) ||
+                    !m_code.EmitCmpReg(dividend_reg, divisor_reg) ||
+                    !emit_branch(below_branch, VitaA32::Condition::CC) ||
+                    !emit_branch(equal_branch, VitaA32::Condition::EQ)) {
+                  return false;
+                }
+
+                if (!m_code.EmitClz(scratch_reg, divisor_reg) ||
+                    !m_code.EmitClz(quotient_reg, dividend_reg) ||
+                    !m_code.EmitSubReg(scratch_reg, scratch_reg,
+                        quotient_reg) ||
+                    !m_code.EmitMovRegShiftReg(dividend_reg, divisor_reg,
+                        VitaA32::ShiftType::LSL, scratch_reg) ||
+                    !m_code.EmitMovImm8(divisor_reg, 1) ||
+                    !m_code.EmitMovRegShiftReg(divisor_reg, divisor_reg,
+                        VitaA32::ShiftType::LSL, scratch_reg) ||
+                    !m_code.EmitMovImm8(quotient_reg, 0)) {
+                  return false;
+                }
+
+                const size_t loop_start = m_code.Size();
+                BranchPatch skip_subtract_branch{};
+                BranchPatch loop_branch{};
+                if (!m_code.EmitCmpReg(remainder_reg, dividend_reg) ||
+                    !emit_branch(skip_subtract_branch,
+                        VitaA32::Condition::CC) ||
+                    !m_code.EmitSubReg(remainder_reg, remainder_reg,
+                        dividend_reg) ||
+                    !m_code.EmitOrrReg(quotient_reg, quotient_reg,
+                        divisor_reg) ||
+                    !patch_branch(skip_subtract_branch, m_code.Size()) ||
+                    !m_code.EmitMovRegShiftImm(divisor_reg, divisor_reg,
+                        VitaA32::ShiftType::LSR, 1, true) ||
+                    !m_code.EmitMovRegShiftImm(dividend_reg, dividend_reg,
+                        VitaA32::ShiftType::LSR, 1) ||
+                    !emit_branch(loop_branch, VitaA32::Condition::NE) ||
+                    !patch_branch(loop_branch, loop_start) ||
+                    !emit_branch(done_branches[done_branch_count++],
+                        VitaA32::Condition::AL)) {
+                  return false;
+                }
+
+                if (!patch_branch(equal_branch, m_code.Size()) ||
+                    !m_code.EmitMovImm8(quotient_reg, 1) ||
+                    !m_code.EmitMovImm8(remainder_reg, 0) ||
+                    !emit_branch(done_branches[done_branch_count++],
+                        VitaA32::Condition::AL) ||
+                    !patch_branch(below_branch, m_code.Size())) {
+                  return false;
+                }
+
+                return patch_branches(done_branches, done_branch_count,
+                    m_code.Size());
+              };
+
           const auto load_divisor = [&]() {
             if (rt == 0)
               return m_code.EmitMovImm8(HOST_TMP1, 0);
@@ -9963,6 +10186,48 @@ namespace VitaEE
             unsigned rt_low;
             return EmitGprWordOperand(rt, 0, HOST_TMP1, &rt_low) &&
                    m_code.EmitUxth(HOST_TMP1, rt_low);
+          };
+
+          const auto emit_arbitrary_divisor_lane = [&](unsigned lane) {
+            const size_t lo_offset = LO_OFFSET + lane * sizeof(u32);
+            const size_t hi_offset = HI_OFFSET + lane * sizeof(u32);
+
+            if (!EmitLoadGprWord(rs, lane, HOST_TMP0) ||
+                !load_divisor() ||
+                !m_code.EmitSxth(HOST_TMP1, HOST_TMP1)) {
+              return false;
+            }
+
+            // PCSX2 owner: MMI.cpp::_PDIVBW(). The arbitrary signed
+            // word/signed-halfword path uses C truncation toward zero, with
+            // HI receiving the signed remainder as a 32-bit lane.
+            if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0,
+                    VitaA32::ShiftType::ASR, 31) ||
+                !m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1,
+                    VitaA32::ShiftType::ASR, 31) ||
+                !m_code.EmitEorReg(HOST_TMP4, HOST_TMP4, HOST_TMP5) ||
+                !m_code.EmitPush(static_cast<u16>(1u << HOST_TMP4)) ||
+                !m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
+                !m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
+                !m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1,
+                    VitaA32::ShiftType::ASR, 31) ||
+                !m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+                !m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+                !emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1,
+                    HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
+                !m_code.EmitPop(static_cast<u16>(1u << HOST_TMP4)) ||
+                !m_code.EmitEorReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+                !m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+                !m_code.EmitEorReg(HOST_TMP3, HOST_TMP3, HOST_TMP5) ||
+                !m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_TMP5) ||
+                !m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS,
+                    static_cast<u16>(lo_offset)) ||
+                !m_code.EmitStrImm12(HOST_TMP3, HOST_CPU_REGS,
+                    static_cast<u16>(hi_offset))) {
+              return false;
+            }
+
+            return true;
           };
 
           const auto emit_divzero_vector = [&]() {
@@ -10127,9 +10392,10 @@ namespace VitaEE
           }
 
           if (!patch_branch(fallback_branch, m_code.Size()) ||
-              !m_code.EmitMovImm32(HOST_TMP0, op) ||
-              !m_code.EmitCallAbsolute(reinterpret_cast<const void *>(
-                  &VitaEePackedDivSignedWordsByHalfword))) {
+              !emit_arbitrary_divisor_lane(0) ||
+              !emit_arbitrary_divisor_lane(1) ||
+              !emit_arbitrary_divisor_lane(2) ||
+              !emit_arbitrary_divisor_lane(3)) {
             return false;
           }
 
