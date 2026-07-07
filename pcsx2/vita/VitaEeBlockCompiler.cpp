@@ -5120,33 +5120,32 @@ namespace VitaEE
 #endif
 	}
 
-	bool BlockCompiler::EmitCOP2MacroStoreVfMaskedQword(unsigned vf_reg, unsigned mask, unsigned value_qreg,
-		unsigned old_qreg, unsigned mask_qreg, unsigned address_reg, unsigned scratch_reg)
+	bool BlockCompiler::EmitCOP2MacroStoreVfSelectedLanes(unsigned vf_reg, unsigned mask, unsigned value_qreg,
+		unsigned address_reg)
 	{
 		mask &= 0x0f;
 		if (vf_reg == 0 || mask == 0)
 			return true;
-		if (mask_qreg >= 8 || !EmitVu0VfAddress(address_reg, vf_reg))
+		if (!EmitVu0VfAddress(address_reg, vf_reg))
 			return false;
 		if (mask == 0x0f)
 			return m_code.EmitVst1Q32Aligned(value_qreg, address_reg);
 
-		const auto emit_mask_lane = [&](unsigned lane, unsigned bit) {
-			const u32 lane_mask = (mask & bit) ? 0xffffffffu : 0u;
-			return m_code.EmitMovImm32(scratch_reg, lane_mask) &&
-				   m_code.EmitVmovCoreToS(mask_qreg * 4 + lane, scratch_reg);
+		const auto emit_lane = [&](unsigned lane) {
+			return m_code.EmitVstrSImm(value_qreg * 4 + lane, address_reg,
+				static_cast<u16>(lane * sizeof(u32)));
 		};
 
-		return emit_mask_lane(0, 0x8) &&
-			   emit_mask_lane(1, 0x4) &&
-			   emit_mask_lane(2, 0x2) &&
-			   emit_mask_lane(3, 0x1) &&
-			   m_code.EmitVld1Q32Aligned(old_qreg, address_reg) &&
-			   m_code.EmitVandQ(value_qreg, value_qreg, mask_qreg) &&
-			   m_code.EmitVmvnQ(mask_qreg, mask_qreg) &&
-			   m_code.EmitVandQ(old_qreg, old_qreg, mask_qreg) &&
-			   m_code.EmitVorrQ(value_qreg, value_qreg, old_qreg) &&
-			   m_code.EmitVst1Q32Aligned(value_qreg, address_reg);
+		if ((mask & 0x8) && !emit_lane(0))
+			return false;
+		if ((mask & 0x4) && !emit_lane(1))
+			return false;
+		if ((mask & 0x2) && !emit_lane(2))
+			return false;
+		if ((mask & 0x1) && !emit_lane(3))
+			return false;
+
+		return true;
 	}
 
 	bool BlockCompiler::EmitCOP2MacroBody(u32 op)
@@ -5201,14 +5200,12 @@ namespace VitaEE
 
 		constexpr unsigned NEON_VALUE = 0;
 		constexpr unsigned NEON_SIGN_MASK = 1;
-		constexpr unsigned NEON_OLD = 2;
 		return EmitVu0VfAddress(HOST_TMP0, fs) &&
 			   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
 			   m_code.EmitMovImm32(HOST_TMP2, 0x7fffffffu) &&
 			   m_code.EmitVdupI32QFromCore(NEON_SIGN_MASK, HOST_TMP2) &&
 			   m_code.EmitVandQ(NEON_VALUE, NEON_VALUE, NEON_SIGN_MASK) &&
-			   EmitCOP2MacroStoreVfMaskedQword(ft, mask, NEON_VALUE, NEON_OLD, NEON_SIGN_MASK,
-				   HOST_TMP1, HOST_TMP2);
+			   EmitCOP2MacroStoreVfSelectedLanes(ft, mask, NEON_VALUE, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroArithmeticBody(u32 op)
@@ -6244,10 +6241,7 @@ namespace VitaEE
 			}
 		}
 
-		constexpr unsigned NEON_WRITE_MASK = 2;
-		constexpr unsigned NEON_OLD = 3;
-		return EmitCOP2MacroStoreVfMaskedQword(ft, mask, NEON_VALUE, NEON_OLD, NEON_WRITE_MASK,
-			HOST_TMP1, HOST_TMP2);
+		return EmitCOP2MacroStoreVfSelectedLanes(ft, mask, NEON_VALUE, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroFtoiBody(u32 op)
@@ -6310,8 +6304,7 @@ namespace VitaEE
 			return false;
 		}
 
-		return EmitCOP2MacroStoreVfMaskedQword(ft, mask, NEON_VALUE, NEON_SATURATED, NEON_MASK,
-			HOST_TMP1, HOST_TMP2);
+		return EmitCOP2MacroStoreVfSelectedLanes(ft, mask, NEON_VALUE, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroFdivBody(u32 op)
@@ -6590,7 +6583,7 @@ namespace VitaEE
 	{
 		// PCSX2 owners: VUops.cpp::_vuMOVE() / _vuMR32(). These are raw
 		// bit-copy lane operations; keep self-overlap behavior by reading the
-		// original X lane before any stores for VMR32.
+		// original source qword before selected destination lane stores.
 		const Cop2MacroMoveOp move = DecodeCop2MacroMove(op);
 		if (!move.valid)
 			return false;
@@ -6601,61 +6594,11 @@ namespace VitaEE
 			return true;
 
 		const unsigned fs = RD(op);
-		if (mask == 0x0f)
-		{
-			constexpr unsigned NEON_VALUE = 0;
-			return EmitVu0VfAddress(HOST_TMP0, fs) &&
-				   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
-				   (!move.rotate32 || m_code.EmitVextI8Q(NEON_VALUE, NEON_VALUE, NEON_VALUE, 4)) &&
-				   EmitVu0VfAddress(HOST_TMP1, ft) &&
-				   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
-		}
-
-		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
-			!EmitVu0VfAddress(HOST_TMP1, ft))
-		{
-			return false;
-		}
-
-		if (move.rotate32 &&
-			!m_code.EmitLdrImm12(HOST_TMP4, HOST_TMP0, 0))
-		{
-			return false;
-		}
-
-		const auto emit_lane_copy = [&](unsigned dest_lane, unsigned source_lane) {
-			const u16 dest_offset = static_cast<u16>(dest_lane * sizeof(u32));
-			const u16 source_offset = static_cast<u16>(source_lane * sizeof(u32));
-			return m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, source_offset) &&
-				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, dest_offset);
-		};
-
-		if (move.rotate32)
-		{
-			if ((mask & 0x8) && !emit_lane_copy(0, 1))
-				return false;
-			if ((mask & 0x4) && !emit_lane_copy(1, 2))
-				return false;
-			if ((mask & 0x2) && !emit_lane_copy(2, 3))
-				return false;
-			if ((mask & 0x1) &&
-				!m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, static_cast<u16>(3 * sizeof(u32))))
-			{
-				return false;
-			}
-			return true;
-		}
-
-		if ((mask & 0x8) && !emit_lane_copy(0, 0))
-			return false;
-		if ((mask & 0x4) && !emit_lane_copy(1, 1))
-			return false;
-		if ((mask & 0x2) && !emit_lane_copy(2, 2))
-			return false;
-		if ((mask & 0x1) && !emit_lane_copy(3, 3))
-			return false;
-
-		return true;
+		constexpr unsigned NEON_VALUE = 0;
+		return EmitVu0VfAddress(HOST_TMP0, fs) &&
+			   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
+			   (!move.rotate32 || m_code.EmitVextI8Q(NEON_VALUE, NEON_VALUE, NEON_VALUE, 4)) &&
+			   EmitCOP2MacroStoreVfSelectedLanes(ft, mask, NEON_VALUE, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroMinMaxSelect(bool take_max)
