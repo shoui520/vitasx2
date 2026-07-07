@@ -27,6 +27,8 @@ extern u32 g_qemuVuIbitBurstSteps;
 extern u32 g_qemuVuLowerDirectBurstSteps;
 extern u32 g_qemuVuUpperDirectBurstSteps;
 extern u32 g_qemuVuPairedDirectBurstSteps;
+extern u32 g_qemuVuDecodedUpperStepKindExecutes;
+extern u32 g_qemuVuDecodedLowerStepKindExecutes;
 extern u32 g_qemuVuDecodedUpperBurstKindExecutes;
 extern u32 g_qemuVuDecodedLowerBurstKindExecutes;
 extern bool g_qemuVuLowerDirectFastEnabled;
@@ -34,6 +36,22 @@ extern bool g_qemuVuUpperDirectFastEnabled;
 extern bool g_qemuVuLowerDirectBurstEnabled;
 extern bool g_qemuVuUpperDirectBurstEnabled;
 #endif
+
+static __fi void _vu1ExecuteUpperStepKnownKind(VURegs* VU, u32 code, u8 kind)
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuVuDecodedUpperStepKindExecutes;
+#endif
+	VUInterpFast::ExecuteUpperNoLowerKnownKind(VU, code, static_cast<VUInterpFast::UpperFastKind>(kind));
+}
+
+static __fi void _vu1ExecuteLowerStepKnownKind(VURegs* VU, u32 code, u8 kind)
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuVuDecodedLowerStepKindExecutes;
+#endif
+	VUInterpFast::ExecuteLowerNoUpperKnownKind(VU, code, static_cast<VUInterpFast::LowerFastKind>(kind));
+}
 
 static __fi void _vu1ExecuteUpperBurstKnownKind(VURegs* VU, u32 code, u8 kind)
 {
@@ -65,13 +83,13 @@ void _vu1ExecLower(VURegs* VU, u32* ptr)
 	VU1_LOWER_OPCODE[VU->code >> 25]();
 }
 
-static void _vu1ExecUpperMaybeFast(VURegs* VU, u32 pc, u32* ptr, bool upper_fast)
+static void _vu1ExecUpperMaybeFast(VURegs* VU, u32* ptr, bool upper_fast, u8 upper_kind)
 {
 	if (upper_fast)
 	{
 		VU->code = ptr[1];
 		IdebugUPPER(VU1);
-		VuMicroExecuteUpperNoLowerCached(1, pc, VU, ptr[1]);
+		_vu1ExecuteUpperStepKnownKind(VU, ptr[1], upper_kind);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuVuUpperDirectFastSteps;
 #endif
@@ -583,11 +601,12 @@ static void _vu1Exec(VURegs* VU)
 		// dispatch while keeping the lower opcode on the normal interpreter path.
 		VU->code = ptr[0];
 		const bool lower_nop = _vu1IsLowerNop(ptr[0]);
+		u8 lower_kind = 0;
 		const bool lower_fast = !lower_nop
 #if defined(VITASX2_QEMU_VALIDATION)
 			&& g_qemuVuLowerDirectFastEnabled
 #endif
-			&& VuMicroAnalyzeLowerNoUpperCached(1, pc, ptr[0], &lregs);
+			&& VuMicroAnalyzeLowerNoUpperCached(1, pc, ptr[0], &lregs, &lower_kind);
 		if (lower_nop)
 		{
 			// PCSX2 owners: VUops.cpp::_vuMOVE() returns immediately for
@@ -610,7 +629,7 @@ static void _vu1Exec(VURegs* VU)
 		if (lower_fast)
 		{
 			IdebugLOWER(VU1);
-			VuMicroExecuteLowerNoUpperCached(1, pc, VU, ptr[0]);
+			_vu1ExecuteLowerStepKnownKind(VU, ptr[0], lower_kind);
 		}
 		else if (!lower_nop)
 			_vu1ExecLower(VU, ptr);
@@ -667,11 +686,12 @@ static void _vu1Exec(VURegs* VU)
 	}
 
 	VU->code = ptr[1];
+	u8 upper_kind = 0;
 	const bool upper_fast =
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuVuUpperDirectFastEnabled &&
 #endif
-		VuMicroAnalyzeUpperNoLowerCached(1, pc, ptr[1], &uregs);
+		VuMicroAnalyzeUpperNoLowerCached(1, pc, ptr[1], &uregs, &upper_kind);
 	if (!upper_fast)
 		VU1regs_UPPER_OPCODE[VU->code & 0x3f](&uregs);
 
@@ -687,7 +707,7 @@ static void _vu1Exec(VURegs* VU)
 		if (VU->VIBackupCycles > 0)
 			VU->VIBackupCycles -= std::min((u8)(VU1.cycle - cyclesBeforeOp), VU->VIBackupCycles);
 
-		_vu1ExecUpperMaybeFast(VU, pc, ptr, upper_fast);
+		_vu1ExecUpperMaybeFast(VU, ptr, upper_fast, upper_kind);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (upper_fast)
@@ -712,7 +732,7 @@ static void _vu1Exec(VURegs* VU)
 			if (VU->VIBackupCycles > 0)
 				VU->VIBackupCycles-= std::min((u8)(VU1.cycle- cyclesBeforeOp), VU->VIBackupCycles);
 
-			_vu1ExecUpperMaybeFast(VU, pc, ptr, upper_fast);
+			_vu1ExecUpperMaybeFast(VU, ptr, upper_fast, upper_kind);
 			VU->code = ptr[0];
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -730,11 +750,12 @@ static void _vu1Exec(VURegs* VU)
 			int discard = 0;
 
 			VU->code = ptr[0];
+			u8 lower_kind = 0;
 			const bool lower_fast =
 #if defined(VITASX2_QEMU_VALIDATION)
 				g_qemuVuLowerDirectFastEnabled &&
 #endif
-				VuMicroAnalyzeLowerNoUpperCached(1, pc, ptr[0], &lregs);
+				VuMicroAnalyzeLowerNoUpperCached(1, pc, ptr[0], &lregs, &lower_kind);
 			if (!lower_fast)
 			{
 				lregs.cycles = 0;
@@ -777,7 +798,7 @@ static void _vu1Exec(VURegs* VU)
 				}
 			}
 
-			_vu1ExecUpperMaybeFast(VU, pc, ptr, upper_fast);
+			_vu1ExecUpperMaybeFast(VU, ptr, upper_fast, upper_kind);
 
 			if (discard == 0)
 			{
@@ -795,7 +816,7 @@ static void _vu1Exec(VURegs* VU)
 				if (lower_fast)
 				{
 					IdebugLOWER(VU1);
-					VuMicroExecuteLowerNoUpperCached(1, pc, VU, ptr[0]);
+					_vu1ExecuteLowerStepKnownKind(VU, ptr[0], lower_kind);
 				}
 				else
 					_vu1ExecLower(VU, ptr);
