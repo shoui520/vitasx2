@@ -24,6 +24,7 @@ u32 g_qemuIpuCscPostNeonBlocks = 0;
 u32 g_qemuIpuVqNeonGroups = 0;
 u32 g_qemuIpuIdctCopyNeonRows = 0;
 u32 g_qemuIpuBitreader64NeonReads = 0;
+u32 g_qemuIpuBitreader32NeonReads = 0;
 #endif
 
 // the IPU is fixed to 16 byte strides (128-bit / QWC resolution):
@@ -136,9 +137,9 @@ __fi static u32 GETBITS(uint num)
 #if defined(ARCH_ARM32)
 static __forceinline uint8x8_t ipuGetShifted64BitsNeon(const u8* readpos, uint shift)
 {
-	// PCSX2 owner: getBits64() below. For misaligned bit positions, each
-	// output byte takes high bits from the current byte and low bits from the
-	// following byte; use NEON byte shifts instead of unaligned u64 masks.
+	// PCSX2 owner: getBits64()/getBits32() below. For misaligned bit positions,
+	// each output byte takes high bits from the current byte and low bits from
+	// the following byte; use NEON byte shifts instead of unaligned word masks.
 	const uint8x8_t current = vld1_u8(readpos);
 	if (shift == 0)
 		return current;
@@ -204,6 +205,13 @@ __ri static u8 getBits32(u8 *address, bool advance)
 
 	const u8* readpos = &g_BP.internal_qwc->_u8[g_BP.BP/8];
 
+#if defined(ARCH_ARM32)
+	const uint8x8_t shifted = ipuGetShifted64BitsNeon(readpos, g_BP.BP & 7);
+	vst1_lane_u32(reinterpret_cast<u32*>(address), vreinterpret_u32_u8(shifted), 0);
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuIpuBitreader32NeonReads;
+#endif
+#else
 	if(uint shift = (g_BP.BP & 7))
 	{
 		u32 mask = (0xff >> shift);
@@ -216,6 +224,7 @@ __ri static u8 getBits32(u8 *address, bool advance)
 		// Bit position-aligned -- no masking/shifting necessary
 		*(u32*)address = *(u32*)readpos;
 	}
+#endif
 
 	if (advance) g_BP.Advance(32);
 
@@ -242,6 +251,30 @@ __ri static u8 getBits8(u8 *address, bool advance)
 
 	return 1;
 }
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void IpuGetBits32ReferenceForValidation(const u8* readpos, u32 shift, u8* address)
+{
+	shift &= 7u;
+	for (u32 i = 0; i < 4; i++)
+	{
+		address[i] = (shift != 0) ?
+			static_cast<u8>((readpos[i] << shift) | (readpos[i + 1] >> (8u - shift))) :
+			readpos[i];
+	}
+}
+
+void IpuGetBits32SelectedForValidation(const u8* readpos, u32 shift, u8* address)
+{
+#if defined(ARCH_ARM32)
+	const uint8x8_t shifted = ipuGetShifted64BitsNeon(readpos, shift & 7u);
+	vst1_lane_u32(reinterpret_cast<u32*>(address), vreinterpret_u32_u8(shifted), 0);
+	++g_qemuIpuBitreader32NeonReads;
+#else
+	IpuGetBits32ReferenceForValidation(readpos, shift, address);
+#endif
+}
+#endif
 
 
 #define W1 2841 /* 2048*sqrt (2)*cos (1*pi/16) */
