@@ -34,8 +34,11 @@ u32 g_qemuVifBurstCopy256ByteGroups = 0;
 u32 g_qemuVifBurstCopy1024ByteGroups = 0;
 u32 g_qemuVifBurstModeMaskVectors = 0;
 u32 g_qemuVifBurstV4_32ModeVectors = 0;
+u32 g_qemuVifBurstV4WidenModeVectors = 0;
 u32 g_qemuVifBurstV4_16PairGroups = 0;
 u32 g_qemuVifBurstV4_8QuadGroups = 0;
+u32 g_qemuVifBurstV4_16ModePairGroups = 0;
+u32 g_qemuVifBurstV4_8ModeQuadGroups = 0;
 u32 g_qemuVifCycleBurstVectors = 0;
 #endif
 
@@ -581,6 +584,164 @@ namespace
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuVifBurstV4_8QuadGroups += quads;
 #endif
+	}
+
+	void VitaVifStoreV4_16ModeBurstNeon(vifStruct& vif, u8* dest, const u8* src, u32 count, bool usn, u32 mode)
+	{
+		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_V4() and writeXYZW().
+		// MODE 1/3 can group widened V4-16 source pairs because MaskRow is
+		// read-only or replaced by the final vector. MODE 2 is sequential.
+		uint32x4_t row = vld1q_u32(vif.MaskRow._u32);
+		if (mode != 2)
+		{
+			const u32 pairs = count >> 1;
+			uint32x4_t final_row = row;
+			for (u32 i = 0; i < pairs; i++)
+			{
+				const uint16x8_t packed = vld1q_u16(reinterpret_cast<const u16*>(src));
+				uint32x4_t lo;
+				uint32x4_t hi;
+				if (usn)
+				{
+					lo = vmovl_u16(vget_low_u16(packed));
+					hi = vmovl_u16(vget_high_u16(packed));
+				}
+				else
+				{
+					const int16x8_t signed_packed = vreinterpretq_s16_u16(packed);
+					lo = vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(signed_packed)));
+					hi = vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(signed_packed)));
+				}
+
+				if (mode == 1)
+				{
+					lo = vaddq_u32(lo, row);
+					hi = vaddq_u32(hi, row);
+				}
+				else
+				{
+					final_row = hi;
+				}
+
+				VitaVifStoreVectorNeon(dest, lo);
+				VitaVifStoreVectorNeon(dest + 16, hi);
+				src += 16;
+				dest += 32;
+			}
+
+			if ((count & 1u) != 0)
+			{
+				uint32x4_t value = VitaVifLoadV4_16VectorNeon(src, usn);
+				if (mode == 1)
+					value = vaddq_u32(value, row);
+				else
+					final_row = value;
+				VitaVifStoreVectorNeon(dest, value);
+			}
+
+			if (mode == 3)
+				vst1q_u32(vif.MaskRow._u32, final_row);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuVifBurstV4_16ModePairGroups += pairs;
+#endif
+			return;
+		}
+
+		for (u32 i = 0; i < count; i++)
+		{
+			const uint32x4_t data = VitaVifLoadV4_16VectorNeon(src + i * 8u, usn);
+			const uint32x4_t result = vaddq_u32(data, row);
+			row = result;
+			VitaVifStoreVectorNeon(dest + i * 16u, result);
+		}
+		vst1q_u32(vif.MaskRow._u32, row);
+	}
+
+	void VitaVifStoreV4_8ModeBurstNeon(vifStruct& vif, u8* dest, const u8* src, u32 count, bool usn, u32 mode)
+	{
+		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_V4() and writeXYZW().
+		// Four V4-8 source vectors fit in one NEON qword for MODE 1/3; MODE 2
+		// keeps sequential MaskRow accumulation exact.
+		uint32x4_t row = vld1q_u32(vif.MaskRow._u32);
+		if (mode != 2)
+		{
+			const u32 quads = count >> 2;
+			uint32x4_t final_row = row;
+			for (u32 i = 0; i < quads; i++)
+			{
+				const uint8x16_t packed = vld1q_u8(src);
+				uint32x4_t v0;
+				uint32x4_t v1;
+				uint32x4_t v2;
+				uint32x4_t v3;
+				if (usn)
+				{
+					const uint16x8_t low16 = vmovl_u8(vget_low_u8(packed));
+					const uint16x8_t high16 = vmovl_u8(vget_high_u8(packed));
+					v0 = vmovl_u16(vget_low_u16(low16));
+					v1 = vmovl_u16(vget_high_u16(low16));
+					v2 = vmovl_u16(vget_low_u16(high16));
+					v3 = vmovl_u16(vget_high_u16(high16));
+				}
+				else
+				{
+					const int8x16_t signed_packed = vreinterpretq_s8_u8(packed);
+					const int16x8_t low16 = vmovl_s8(vget_low_s8(signed_packed));
+					const int16x8_t high16 = vmovl_s8(vget_high_s8(signed_packed));
+					v0 = vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(low16)));
+					v1 = vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(low16)));
+					v2 = vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(high16)));
+					v3 = vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(high16)));
+				}
+
+				if (mode == 1)
+				{
+					v0 = vaddq_u32(v0, row);
+					v1 = vaddq_u32(v1, row);
+					v2 = vaddq_u32(v2, row);
+					v3 = vaddq_u32(v3, row);
+				}
+				else
+				{
+					final_row = v3;
+				}
+
+				VitaVifStoreVectorNeon(dest, v0);
+				VitaVifStoreVectorNeon(dest + 16, v1);
+				VitaVifStoreVectorNeon(dest + 32, v2);
+				VitaVifStoreVectorNeon(dest + 48, v3);
+				src += 16;
+				dest += 64;
+			}
+
+			for (u32 i = quads << 2; i < count; i++)
+			{
+				uint32x4_t value = VitaVifLoadV4_8VectorNeon(src, usn);
+				if (mode == 1)
+					value = vaddq_u32(value, row);
+				else
+					final_row = value;
+				VitaVifStoreVectorNeon(dest, value);
+				src += 4;
+				dest += 16;
+			}
+
+			if (mode == 3)
+				vst1q_u32(vif.MaskRow._u32, final_row);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuVifBurstV4_8ModeQuadGroups += quads;
+#endif
+			return;
+		}
+
+		for (u32 i = 0; i < count; i++)
+		{
+			const uint32x4_t data = VitaVifLoadV4_8VectorNeon(src + i * 4u, usn);
+			const uint32x4_t result = vaddq_u32(data, row);
+			row = result;
+			VitaVifStoreVectorNeon(dest + i * 16u, result);
+		}
+		vst1q_u32(vif.MaskRow._u32, row);
 	}
 
 	void VitaVifStoreMaskedMode0VectorNeon(const vifStruct& vif, const VIFregisters& regs, u8* dest, uint32x4_t data)
@@ -1417,19 +1578,22 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastV4_32ModeBurst(const u8* data, bool isFill)
+	bool VitaVifTryFastV4ModeBurst(const u8* data, bool isFill)
 	{
 		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_V4() and writeXYZW().
-		// Contiguous unmasked V4-32 MODE traffic has no lane selectors, so keep
-		// the same MaskRow side effects in one NEON loop instead of the generic
+		// Contiguous unmasked V4 MODE traffic has no lane selectors, so keep the
+		// same MaskRow side effects in direct NEON loops instead of the generic
 		// per-vector mode/mask dispatcher.
 		vifStruct& vif = GetVifX;
 		VIFregisters& regs = vifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
+		const u32 format = upk_num & 0x0f;
 		const u32 mode = regs.mode & 0x3;
 		const u32 wl = regs.cycle.wl;
-		if (isFill || upk_num != 0x0c || mode == 0 || regs.cycle.cl != wl ||
-			wl == 0 || vif.cl != 0 || regs.num == 0)
+		if (isFill || (upk_num & 0x10) != 0 ||
+			(format != 0x0c && format != 0x0d && format != 0x0e) ||
+			mode == 0 || regs.cycle.cl != wl || wl == 0 || vif.cl != 0 ||
+			regs.num == 0)
 		{
 			return false;
 		}
@@ -1443,36 +1607,75 @@ namespace
 
 		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
 #if VITASX2_VIF_HAS_ARM_NEON
-		uint32x4_t row = vld1q_u32(vif.MaskRow._u32);
-		for (u32 i = 0; i < count; i++)
+		if (format == 0x0c)
 		{
-			const uint32x4_t unpacked = vld1q_u32(reinterpret_cast<const u32*>(data + i * 16u));
-			uint32x4_t result = unpacked;
-			if (mode == 1 || mode == 2)
-				result = vaddq_u32(unpacked, row);
-			if (mode == 2 || mode == 3)
-				row = result;
-			VitaVifStoreVectorNeon(dest + i * 16u, result);
+			uint32x4_t row = vld1q_u32(vif.MaskRow._u32);
+			for (u32 i = 0; i < count; i++)
+			{
+				const uint32x4_t unpacked = vld1q_u32(reinterpret_cast<const u32*>(data + i * 16u));
+				uint32x4_t result = unpacked;
+				if (mode == 1 || mode == 2)
+					result = vaddq_u32(unpacked, row);
+				if (mode == 2 || mode == 3)
+					row = result;
+				VitaVifStoreVectorNeon(dest + i * 16u, result);
 #if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuVifFastVectors;
-			++g_qemuVifBurstVectors;
-			++g_qemuVifBurstV4_32ModeVectors;
+				++g_qemuVifFastVectors;
+				++g_qemuVifBurstVectors;
+				++g_qemuVifBurstV4_32ModeVectors;
+#endif
+			}
+			if (mode == 2 || mode == 3)
+				vst1q_u32(vif.MaskRow._u32, row);
+		}
+		else
+		{
+			if (format == 0x0d)
+				VitaVifStoreV4_16ModeBurstNeon(vif, dest, data, count, vif.usn != 0, mode);
+			else
+				VitaVifStoreV4_8ModeBurstNeon(vif, dest, data, count, vif.usn != 0, mode);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuVifFastVectors += count;
+			g_qemuVifBurstVectors += count;
+			g_qemuVifBurstWidenVectors += count;
+			g_qemuVifBurstV4WidenModeVectors += count;
 #endif
 		}
-		if (mode == 2 || mode == 3)
-			vst1q_u32(vif.MaskRow._u32, row);
 #else
 		for (u32 i = 0; i < count; i++)
 		{
-			VitaVifStoreModeWords(vif, regs, dest + i * 16u, mode, false,
-				VitaVifLoadU32(data + i * 16u),
-				VitaVifLoadU32(data + i * 16u + 4u),
-				VitaVifLoadU32(data + i * 16u + 8u),
-				VitaVifLoadU32(data + i * 16u + 12u));
+			u32 x;
+			u32 y;
+			u32 z;
+			u32 w;
+			if (format == 0x0c)
+			{
+				x = VitaVifLoadU32(data + i * 16u);
+				y = VitaVifLoadU32(data + i * 16u + 4u);
+				z = VitaVifLoadU32(data + i * 16u + 8u);
+				w = VitaVifLoadU32(data + i * 16u + 12u);
+			}
+			else if (format == 0x0d)
+			{
+				VitaVifLoadV4_16Words(data + i * 8u, vif.usn != 0, x, y, z, w);
+			}
+			else
+			{
+				VitaVifLoadV4_8Words(data + i * 4u, vif.usn != 0, x, y, z, w);
+			}
+			VitaVifStoreModeWords(vif, regs, dest + i * 16u, mode, false, x, y, z, w);
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuVifFastVectors;
 			++g_qemuVifBurstVectors;
-			++g_qemuVifBurstV4_32ModeVectors;
+			if (format == 0x0c)
+			{
+				++g_qemuVifBurstV4_32ModeVectors;
+			}
+			else
+			{
+				++g_qemuVifBurstWidenVectors;
+				++g_qemuVifBurstV4WidenModeVectors;
+			}
 #endif
 		}
 #endif
@@ -1866,7 +2069,7 @@ void dVifUnpack(const u8* data, bool isFill)
 	if (VitaVifTryFastV3Burst<idx>(data, isFill))
 		return;
 
-	if (VitaVifTryFastV4_32ModeBurst<idx>(data, isFill))
+	if (VitaVifTryFastV4ModeBurst<idx>(data, isFill))
 		return;
 
 	if (VitaVifTryFastModeMaskBurst<idx>(data, isFill))
