@@ -18,6 +18,8 @@
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuIopDivSignedHelperCalls = 0;
 u32 g_qemuIopDivUnsignedHelperCalls = 0;
+u32 g_qemuIopKnownRamScalarLoadFastPaths = 0;
+u32 g_qemuIopKnownRamScalarStoreFastPaths = 0;
 #endif
 
 namespace
@@ -631,6 +633,49 @@ namespace
 	{
 		return (value + alignment - 1) & ~(alignment - 1);
 	}
+
+	bool TryKnownDirectIopRamAddress(u32 op, u8 alignment_mask, u32* address)
+	{
+		if (RS(op) != 0 || !address)
+			return false;
+
+		const s32 imm = static_cast<s32>(IMM_S(op));
+		if (imm < 0)
+			return false;
+
+		const u32 addr = static_cast<u32>(imm);
+		if (addr >= Ps2MemSize::ExposedIopRam || (addr & alignment_mask) != 0)
+			return false;
+
+		*address = addr;
+		return true;
+	}
+
+	bool IsKnownDirectIopRamScalarFastPath(u32 op)
+	{
+		u8 alignment_mask = 0;
+		switch (op >> 26)
+		{
+			case 0x20: // LB
+			case 0x24: // LBU
+			case 0x28: // SB
+				break;
+			case 0x21: // LH
+			case 0x25: // LHU
+			case 0x29: // SH
+				alignment_mask = 1;
+				break;
+			case 0x23: // LW
+			case 0x2b: // SW
+				alignment_mask = 3;
+				break;
+			default:
+				return false;
+		}
+
+		u32 address = 0;
+		return TryKnownDirectIopRamAddress(op, alignment_mask, &address);
+	}
 } // namespace
 
 namespace VitaIOP
@@ -658,15 +703,15 @@ namespace VitaIOP
 		m_cop2_load_cold_tails.clear();
 		m_cop2_store_cold_tails.clear();
 		// Trace blocks call out before every cycle increment. Pure production
-		// blocks batch cycles once at the tail, so r10 is only useful for the
-		// remaining per-instruction cycle path.
+		// blocks batch cycles once at the tail. Runtime IOP RAM masking also
+		// uses r10, but known direct-RAM blocks only need the r11 base pointer.
 		m_iop_cycle_base_register_available =
-			!m_iop_ram_registers_available && !m_emit_trace_checks && !m_defer_cycle_updates;
+			!m_iop_ram_mask_register_available && !m_emit_trace_checks && !m_defer_cycle_updates;
 		m_saved_registers = REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8;
-		if (m_iop_ram_registers_available)
-			m_saved_registers |= REG_R10 | REG_R11;
-		else if (m_iop_cycle_base_register_available)
+		if (m_iop_cycle_base_register_available || m_iop_ram_mask_register_available)
 			m_saved_registers |= REG_R10;
+		if (m_iop_ram_registers_available)
+			m_saved_registers |= REG_R11;
 
 		const u16 pushed_registers = m_saved_registers | REG_LR;
 		const u32 pushed_count = static_cast<u32>(__builtin_popcount(static_cast<unsigned>(pushed_registers)));
@@ -680,12 +725,20 @@ namespace VitaIOP
 			return false;
 		}
 
-		if (m_iop_cycle_base_register_available)
-			return m_code.EmitAddImm32(HOST_CYCLE_BASE, HOST_PSX_REGS, static_cast<u32>(CYCLE_OFFSET));
+		if (m_iop_cycle_base_register_available &&
+			!m_code.EmitAddImm32(HOST_CYCLE_BASE, HOST_PSX_REGS, static_cast<u32>(CYCLE_OFFSET)))
+		{
+			return false;
+		}
+
+		if (m_iop_ram_mask_register_available &&
+			!m_code.EmitMovImm32(HOST_IOP_RAM_MASK, Ps2MemSize::ExposedIopRam - 1))
+		{
+			return false;
+		}
 
 		return !m_iop_ram_registers_available ||
-			   (m_code.EmitMovImm32(HOST_IOP_RAM_MASK, Ps2MemSize::ExposedIopRam - 1) &&
-				   m_code.EmitMovImm32(HOST_IOP_RAM_BASE, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))));
+			   m_code.EmitMovImm32(HOST_IOP_RAM_BASE, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main)));
 	}
 
 	bool BlockCompiler::EndBlockReturn(BlockExitKind exit, bool charge_budget)
@@ -1618,6 +1671,58 @@ namespace VitaIOP
 			   m_code.EmitAddReg(host_reg, host_reg, scratch_reg);
 	}
 
+	bool BlockCompiler::EmitKnownDirectRamLoadOp(u32 op, u32 address)
+	{
+		const unsigned opcode = op >> 26;
+		const unsigned rt = RT(op);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIopKnownRamScalarLoadFastPaths;
+#endif
+
+		if (rt == 0)
+			return true;
+
+		// PCSX2 owner: x86/iR3000Atables.cpp::rpsxLoad() reads ordinary IOP
+		// RAM directly through iopMem->Main. When rs == $zero and the aligned
+		// immediate lands in main RAM, the MMIO/ROM helper split is impossible.
+		const auto emit_load_value = [&]() -> bool {
+			switch (opcode)
+			{
+				case 0x24: // LBU
+					if (address <= 0x0fffu)
+						return m_code.EmitLdrbImm12(HOST_TMP0, HOST_IOP_RAM_BASE, static_cast<u16>(address));
+					return m_code.EmitMovImm32(HOST_TMP0, address) &&
+						   m_code.EmitLdrbRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+							   VitaA32::ShiftType::LSL, 0);
+				case 0x20: // LB
+					if (address <= 0xffu)
+						return m_code.EmitLdrsbImm8(HOST_TMP0, HOST_IOP_RAM_BASE, static_cast<u8>(address));
+					return m_code.EmitMovImm32(HOST_TMP0, address) &&
+						   m_code.EmitLdrsbReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0);
+				case 0x21: // LH
+					if (address <= 0xffu)
+						return m_code.EmitLdrshImm8(HOST_TMP0, HOST_IOP_RAM_BASE, static_cast<u8>(address));
+					return m_code.EmitMovImm32(HOST_TMP0, address) &&
+						   m_code.EmitLdrshReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0);
+				case 0x25: // LHU
+					if (address <= 0xffu)
+						return m_code.EmitLdrhImm8(HOST_TMP0, HOST_IOP_RAM_BASE, static_cast<u8>(address));
+					return m_code.EmitMovImm32(HOST_TMP0, address) &&
+						   m_code.EmitLdrhReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0);
+				case 0x23: // LW
+					if (address <= 0x0fffu)
+						return m_code.EmitLdrImm12(HOST_TMP0, HOST_IOP_RAM_BASE, static_cast<u16>(address));
+					return m_code.EmitMovImm32(HOST_TMP0, address) &&
+						   m_code.EmitLdrRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+							   VitaA32::ShiftType::LSL, 0);
+				default:
+					return false;
+			}
+		};
+
+		return emit_load_value() && EmitStoreGpr(rt, HOST_TMP0);
+	}
+
 	bool BlockCompiler::EmitLoadOp(u32 op)
 	{
 		const unsigned opcode = op >> 26;
@@ -1643,6 +1748,10 @@ namespace VitaIOP
 			default:
 				return false;
 		}
+
+		u32 known_ram_address = 0;
+		if (TryKnownDirectIopRamAddress(op, alignment_mask, &known_ram_address))
+			return EmitKnownDirectRamLoadOp(op, known_ram_address);
 
 		if (!EmitEffectiveAddress(op, HOST_SAVED0) ||
 			!m_code.EmitTstImm32(HOST_SAVED0, 0x10000000u))
@@ -1761,6 +1870,70 @@ namespace VitaIOP
 			   m_code.PatchBranch(tail_done, tail.join_offset);
 	}
 
+	bool BlockCompiler::EmitKnownDirectRamStoreOp(u32 op, u32 address)
+	{
+		const unsigned opcode = op >> 26;
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIopKnownRamScalarStoreFastPaths;
+#endif
+
+		const auto emit_store_value = [&]() -> bool {
+			switch (opcode)
+			{
+				case 0x28: // SB
+					if (address <= 0x0fffu)
+						return m_code.EmitStrbImm12(HOST_TMP1, HOST_IOP_RAM_BASE, static_cast<u16>(address));
+					return m_code.EmitMovImm32(HOST_TMP0, address) &&
+						   m_code.EmitStrbRegShift(HOST_TMP1, HOST_IOP_RAM_BASE, HOST_TMP0,
+							   VitaA32::ShiftType::LSL, 0);
+				case 0x29: // SH
+					if (address <= 0xffu)
+						return m_code.EmitStrhImm8(HOST_TMP1, HOST_IOP_RAM_BASE, static_cast<u8>(address));
+					return m_code.EmitMovImm32(HOST_TMP0, address) &&
+						   m_code.EmitStrhReg(HOST_TMP1, HOST_IOP_RAM_BASE, HOST_TMP0);
+				case 0x2b: // SW
+					if (address <= 0x0fffu)
+						return m_code.EmitStrImm12(HOST_TMP1, HOST_IOP_RAM_BASE, static_cast<u16>(address));
+					return m_code.EmitMovImm32(HOST_TMP0, address) &&
+						   m_code.EmitStrRegShift(HOST_TMP1, HOST_IOP_RAM_BASE, HOST_TMP0,
+							   VitaA32::ShiftType::LSL, 0);
+				default:
+					return false;
+			}
+		};
+
+		const auto emit_clear_stored_word = [&]() -> bool {
+			return m_code.EmitMovImm32(HOST_TMP0, address & ~3u) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 1) &&
+				   m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+					   static_cast<u32>(reinterpret_cast<uptr>(&psxCpu))) &&
+				   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 0) &&
+				   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
+					   static_cast<u16>(offsetof(R3000Acpu, Clear))) &&
+				   m_code.EmitBlx(HOST_CALL_SCRATCH);
+		};
+
+		// PCSX2 owner: IopMem.cpp::iopMemWrite8/16/32 writes ordinary RAM
+		// directly when isolate-cache is clear and invalidates the written word.
+		// A known $zero+imm main-RAM address cannot hit the MMIO/ROM helper arm.
+		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
+			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
+		{
+			return false;
+		}
+
+		const size_t isolated_skip = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (isolated_skip == static_cast<size_t>(-1) ||
+			!EmitLoadGpr(RT(op), HOST_TMP1) ||
+			!emit_store_value() ||
+			!emit_clear_stored_word())
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE);
+	}
+
 	bool BlockCompiler::EmitStoreOp(u32 op)
 	{
 		const unsigned opcode = op >> 26;
@@ -1783,6 +1956,10 @@ namespace VitaIOP
 			default:
 				return false;
 		}
+
+		u32 known_ram_address = 0;
+		if (TryKnownDirectIopRamAddress(op, alignment_mask, &known_ram_address))
+			return EmitKnownDirectRamStoreOp(op, known_ram_address);
 
 		const auto emit_store_value = [&]() -> bool {
 			switch (opcode)
@@ -2976,12 +3153,15 @@ namespace VitaIOP
 			*direct_links = {};
 
 		m_iop_ram_registers_available = false;
+		m_iop_ram_mask_register_available = false;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
-			if (UsesDirectIopRamFastPath(iopMemRead32(start_pc + i * 4)))
+			const u32 op = iopMemRead32(start_pc + i * 4);
+			if (UsesDirectIopRamFastPath(op))
 			{
 				m_iop_ram_registers_available = true;
-				break;
+				if (!IsKnownDirectIopRamScalarFastPath(op))
+					m_iop_ram_mask_register_available = true;
 			}
 		}
 		m_emit_trace_checks = VitaIsIopPreInstructionTraceEnabled();

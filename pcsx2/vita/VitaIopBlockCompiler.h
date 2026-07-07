@@ -103,7 +103,9 @@ namespace VitaIOP
 		bool EmitEffectiveAddress(u32 op);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitLoadOp(u32 op);
+		bool EmitKnownDirectRamLoadOp(u32 op, u32 address);
 		bool EmitStoreOp(u32 op);
+		bool EmitKnownDirectRamStoreOp(u32 op, u32 address);
 		bool EmitUnalignedLoadOp(u32 op);
 		bool EmitUnalignedStoreOp(u32 op);
 		bool EmitConditionalBranchOp(u32 op, u32 pc);
@@ -191,6 +193,7 @@ namespace VitaIOP
 		u8 m_stack_frame_size = 0;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		bool m_iop_ram_registers_available = false;
+		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
 		bool m_defer_cycle_updates = false;
 		bool m_emit_trace_checks = false;
