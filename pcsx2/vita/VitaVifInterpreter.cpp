@@ -30,6 +30,7 @@ u32 g_qemuVifBurstV3Vectors = 0;
 u32 g_qemuVifBurstCopyVectors = 0;
 u32 g_qemuVifBurstCopy64ByteGroups = 0;
 u32 g_qemuVifBurstCopy256ByteGroups = 0;
+u32 g_qemuVifBurstCopy1024ByteGroups = 0;
 u32 g_qemuVifBurstModeMaskVectors = 0;
 u32 g_qemuVifCycleBurstVectors = 0;
 #endif
@@ -106,12 +107,32 @@ namespace
 		VitaVifCopy64Bytes(dest + 128, src + 128);
 		VitaVifCopy64Bytes(dest + 192, src + 192);
 	}
+
+	void VitaVifCopy1024Bytes(u8* dest, const u8* src)
+	{
+		VitaVifCopy256Bytes(dest, src);
+		VitaVifCopy256Bytes(dest + 256, src + 256);
+		VitaVifCopy256Bytes(dest + 512, src + 512);
+		VitaVifCopy256Bytes(dest + 768, src + 768);
+	}
 #endif
 
 	void VitaVifCopyQwordBurst(u8* dest, const u8* src, u32 count)
 	{
-		const u32 groups256 = count >> 4;
+		const u32 groups1024 = count >> 6;
 #if VITASX2_VIF_HAS_ARM_NEON
+		for (u32 i = 0; i < groups1024; i++)
+		{
+			if ((i + 1) < groups1024)
+				__builtin_prefetch(src + 1024, 0, 1);
+
+			VitaVifCopy1024Bytes(dest, src);
+			src += 1024;
+			dest += 1024;
+		}
+
+		const u32 remaining_after_1024 = count & 63u;
+		const u32 groups256 = remaining_after_1024 >> 4;
 		for (u32 i = 0; i < groups256; i++)
 		{
 			if ((i + 1) < groups256)
@@ -122,7 +143,7 @@ namespace
 			dest += 256;
 		}
 
-		const u32 remaining_after_256 = count & 15u;
+		const u32 remaining_after_256 = remaining_after_1024 & 15u;
 		const u32 groups64 = remaining_after_256 >> 2;
 		for (u32 i = 0; i < groups64; i++)
 		{
@@ -149,11 +170,14 @@ namespace
 		std::memcpy(dest, src, count * 16);
 #endif
 #if defined(VITASX2_QEMU_VALIDATION)
+		const u32 validation_remaining_after_1024 = count & 63u;
+		const u32 validation_groups256 = validation_remaining_after_1024 >> 4;
 		g_qemuVifFastVectors += count;
 		g_qemuVifBurstVectors += count;
 		g_qemuVifBurstCopyVectors += count;
-		g_qemuVifBurstCopy64ByteGroups += (groups256 << 2) + (count & 15u) / 4u;
-		g_qemuVifBurstCopy256ByteGroups += groups256;
+		g_qemuVifBurstCopy64ByteGroups += (groups1024 << 4) + (validation_groups256 << 2) + ((validation_remaining_after_1024 & 15u) / 4u);
+		g_qemuVifBurstCopy256ByteGroups += (groups1024 << 2) + validation_groups256;
+		g_qemuVifBurstCopy1024ByteGroups += groups1024;
 #endif
 	}
 
