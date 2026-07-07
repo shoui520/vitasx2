@@ -17,6 +17,7 @@ extern u32 g_qemuCdvdBlockCopyNeonQwords;
 extern u32 g_qemuCdvdBlockCopyNeon64ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon256ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon1024ByteGroups;
+extern u32 g_qemuCdvdBlockCopyNeon2048ByteGroups;
 #endif
 
 #if defined(ARCH_ARM32)
@@ -48,13 +49,21 @@ static __forceinline void CdvdCopy1024Bytes(u8* dst, const u8* src)
 	CdvdCopy256Bytes(dst + 768, src + 768);
 }
 
-static __forceinline void CdvdCountNeonCopy(size_t qwords, size_t groups64, size_t groups256, size_t groups1024)
+static __forceinline void CdvdCopy2048Bytes(u8* dst, const u8* src)
+{
+	CdvdCopy1024Bytes(dst, src);
+	CdvdCopy1024Bytes(dst + 1024, src + 1024);
+}
+
+static __forceinline void CdvdCountNeonCopy(
+	size_t qwords, size_t groups64, size_t groups256, size_t groups1024, size_t groups2048)
 {
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuCdvdBlockCopyNeonQwords += static_cast<u32>(qwords);
 	g_qemuCdvdBlockCopyNeon64ByteGroups += static_cast<u32>(groups64);
 	g_qemuCdvdBlockCopyNeon256ByteGroups += static_cast<u32>(groups256);
 	g_qemuCdvdBlockCopyNeon1024ByteGroups += static_cast<u32>(groups1024);
+	g_qemuCdvdBlockCopyNeon2048ByteGroups += static_cast<u32>(groups2048);
 #endif
 }
 #endif
@@ -64,7 +73,19 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 #if defined(ARCH_ARM32)
 	u8* cdst = static_cast<u8*>(dst);
 	const u8* csrc = static_cast<const u8*>(src);
-	const size_t groups1024 = size >> 10;
+	const size_t groups2048 = size >> 11;
+	for (size_t i = 0; i < groups2048; i++)
+	{
+		if ((i + 1) < groups2048)
+			__builtin_prefetch(csrc + 2048, 0, 1);
+
+		CdvdCopy2048Bytes(cdst, csrc);
+		csrc += 2048;
+		cdst += 2048;
+	}
+
+	const size_t remaining_after_2048 = size & 2047;
+	const size_t groups1024 = remaining_after_2048 >> 10;
 	for (size_t i = 0; i < groups1024; i++)
 	{
 		if ((i + 1) < groups1024)
@@ -75,7 +96,7 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 		cdst += 1024;
 	}
 
-	const size_t remaining_after_1024 = size & 1023;
+	const size_t remaining_after_1024 = remaining_after_2048 & 1023;
 	const size_t groups256 = remaining_after_1024 >> 8;
 	for (size_t i = 0; i < groups256; i++)
 	{
@@ -119,10 +140,11 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 	for (size_t i = 0; i < (tail_bytes & 7); i++)
 		cdst[i] = csrc[i];
 
-	CdvdCountNeonCopy((groups1024 << 6) + (groups256 << 4) + (groups64 << 2) + tail_qwords,
-		(groups1024 << 4) + (groups256 << 2) + groups64,
-		(groups1024 << 2) + groups256,
-		groups1024);
+	CdvdCountNeonCopy((groups2048 << 7) + (groups1024 << 6) + (groups256 << 4) + (groups64 << 2) + tail_qwords,
+		(groups2048 << 5) + (groups1024 << 4) + (groups256 << 2) + groups64,
+		(groups2048 << 3) + (groups1024 << 2) + groups256,
+		(groups2048 << 1) + groups1024,
+		groups2048);
 	return;
 #endif
 	std::memcpy(dst, src, size);
