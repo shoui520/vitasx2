@@ -35,6 +35,7 @@ u32 g_qemuVifBurstCopy1024ByteGroups = 0;
 u32 g_qemuVifBurstModeMaskVectors = 0;
 u32 g_qemuVifBurstV4_32ModeVectors = 0;
 u32 g_qemuVifBurstV4_16PairGroups = 0;
+u32 g_qemuVifBurstV4_8QuadGroups = 0;
 u32 g_qemuVifCycleBurstVectors = 0;
 #endif
 
@@ -536,6 +537,50 @@ namespace
 	void VitaVifStoreV4_8WordsNeon(u8* dest, const u8* src, bool usn)
 	{
 		VitaVifStoreVectorNeon(dest, VitaVifLoadV4_8VectorNeon(src, usn));
+	}
+
+	void VitaVifStoreV4_8QuadBurstNeon(u8* dest, const u8* src, u32 count, bool usn)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4(). Plain V4-8 bursts write
+		// one widened qword per vector; four source vectors fit in one NEON qword.
+		const u32 quads = count >> 2;
+		for (u32 i = 0; i < quads; i++)
+		{
+			const uint8x16_t packed = vld1q_u8(src);
+			if (usn)
+			{
+				const uint16x8_t low16 = vmovl_u8(vget_low_u8(packed));
+				const uint16x8_t high16 = vmovl_u8(vget_high_u8(packed));
+				VitaVifStoreVectorNeon(dest, vmovl_u16(vget_low_u16(low16)));
+				VitaVifStoreVectorNeon(dest + 16, vmovl_u16(vget_high_u16(low16)));
+				VitaVifStoreVectorNeon(dest + 32, vmovl_u16(vget_low_u16(high16)));
+				VitaVifStoreVectorNeon(dest + 48, vmovl_u16(vget_high_u16(high16)));
+			}
+			else
+			{
+				const int8x16_t signed_packed = vreinterpretq_s8_u8(packed);
+				const int16x8_t low16 = vmovl_s8(vget_low_s8(signed_packed));
+				const int16x8_t high16 = vmovl_s8(vget_high_s8(signed_packed));
+				VitaVifStoreVectorNeon(dest, vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(low16))));
+				VitaVifStoreVectorNeon(dest + 16, vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(low16))));
+				VitaVifStoreVectorNeon(dest + 32, vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(high16))));
+				VitaVifStoreVectorNeon(dest + 48, vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(high16))));
+			}
+
+			src += 16;
+			dest += 64;
+		}
+
+		for (u32 i = quads << 2; i < count; i++)
+		{
+			VitaVifStoreV4_8WordsNeon(dest, src, usn);
+			src += 4;
+			dest += 16;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuVifBurstV4_8QuadGroups += quads;
+#endif
 	}
 
 	void VitaVifStoreMaskedMode0VectorNeon(const vifStruct& vif, const VIFregisters& regs, u8* dest, uint32x4_t data)
@@ -1260,6 +1305,20 @@ namespace
 		if (format == 0x0d)
 		{
 			VitaVifStoreV4_16PairBurstNeon(dest, data, count, vif.usn != 0);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuVifFastVectors += count;
+			g_qemuVifBurstVectors += count;
+			g_qemuVifBurstWidenVectors += count;
+#endif
+			vif.tag.addr += bytes;
+			vif.cl = static_cast<u8>(count % wl);
+			regs.num = 0;
+			return true;
+		}
+
+		if (format == 0x0e)
+		{
+			VitaVifStoreV4_8QuadBurstNeon(dest, data, count, vif.usn != 0);
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuVifFastVectors += count;
 			g_qemuVifBurstVectors += count;
