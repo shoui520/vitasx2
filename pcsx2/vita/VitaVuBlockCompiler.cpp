@@ -373,8 +373,9 @@ namespace VitaVU
 		constexpr unsigned HOST_CLIP_NEW = 9;
 		constexpr unsigned SP = 13;
 
-		constexpr u16 SAVED_REGISTER_MASK = 0x43f0; // r4-r9, sl, lr
-		constexpr u32 STACK_FRAME_SIZE = 32;        // VF hazard backup slots
+		constexpr u16 SAVED_REGISTER_MASK = 0x47f0; // r4-r10, lr; keeps helper-call SP aligned
+		constexpr u16 RETURN_REGISTER_MASK = 0x87f0; // r4-r10, pc
+		constexpr u32 STACK_FRAME_SIZE = 32;         // VF hazard backup slots
 
 		u16 VuOffset(size_t offset)
 		{
@@ -458,7 +459,7 @@ namespace VitaVU
 			bool EmitEpilogue()
 			{
 				return m_code.EmitAddImm8(SP, SP, STACK_FRAME_SIZE) &&
-					m_code.EmitPop(0x83f0); // r4-r9, sl, pc
+					m_code.EmitPop(RETURN_REGISTER_MASK);
 			}
 
 			bool EmitMovReg(unsigned rd, unsigned rm, Condition condition = Condition::AL)
