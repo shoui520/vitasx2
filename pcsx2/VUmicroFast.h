@@ -26,6 +26,7 @@ extern u32 g_qemuVuUpperScalarFullMaskOps;
 extern u32 g_qemuVuUpperScalarPartialMaskOps;
 extern u32 g_qemuVuLowerVfpSqrtOps;
 extern u32 g_qemuVuLowerVfpDivOps;
+extern u32 g_qemuVuLowerVfpDoubleDivOps;
 extern u32 g_qemuVuUpperVfpMaddScalarOps;
 #endif
 
@@ -1557,6 +1558,23 @@ namespace VUInterpFast
 		__asm__("vdiv.f32 %0, %1, %2" : "=t"(result) : "t"(numerator), "t"(denominator));
 #if defined(VITASX2_QEMU_VALIDATION)
 		++::g_qemuVuLowerVfpDivOps;
+#endif
+		return result;
+#else
+		return numerator / denominator;
+#endif
+	}
+
+	static inline double VuDoubleDiv(double numerator, double denominator)
+	{
+#if defined(ARCH_ARM32)
+		// PCSX2 owner: VUops.cpp::_vuERCPR() deliberately uses a double
+		// literal reciprocal before truncating to VU P. Keep that precision
+		// while forcing native Cortex-A9 VFP instead of generic C++ lowering.
+		double result;
+		__asm__("vdiv.f64 %P0, %P1, %P2" : "=w"(result) : "w"(numerator), "w"(denominator));
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuLowerVfpDoubleDivOps;
 #endif
 		return result;
 #else
@@ -3339,7 +3357,7 @@ namespace VUInterpFast
 			{
 				float p = VuLane(VU, Fs(code), Fsf(code));
 				if (p != 0.0f)
-					p = static_cast<float>(1.0 / p);
+					p = static_cast<float>(VuDoubleDiv(1.0, static_cast<double>(p)));
 				VU->p.F = p;
 				return;
 			}
