@@ -14,6 +14,10 @@
 #include "SIO/SioTypes.h"
 #include "StateWrapper.h"
 
+#if defined(ARCH_ARM32)
+#include <arm_neon.h>
+#endif
+
 #include <algorithm>
 #include <cstring>
 
@@ -28,11 +32,80 @@ Sio2 g_Sio2;
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSio2FifoBulkReadBytes = 0;
 u32 g_qemuSio2FifoBulkWriteBytes = 0;
+u32 g_qemuSio2FifoNeonQwords = 0;
+u32 g_qemuSio2FifoNeon64ByteGroups = 0;
 #endif
 
 namespace
 {
 	constexpr size_t SIO2_FIFO_COMPACT_THRESHOLD = 256;
+
+#if defined(ARCH_ARM32)
+	static __forceinline void Sio2Copy64Bytes(u8* dst, const u8* src)
+	{
+		const uint8x16_t qword0 = vld1q_u8(src);
+		const uint8x16_t qword1 = vld1q_u8(src + 16);
+		const uint8x16_t qword2 = vld1q_u8(src + 32);
+		const uint8x16_t qword3 = vld1q_u8(src + 48);
+		vst1q_u8(dst, qword0);
+		vst1q_u8(dst + 16, qword1);
+		vst1q_u8(dst + 32, qword2);
+		vst1q_u8(dst + 48, qword3);
+	}
+
+	static __forceinline void Sio2CountNeonCopy(size_t qwords, size_t groups64)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSio2FifoNeonQwords += static_cast<u32>(qwords);
+		g_qemuSio2FifoNeon64ByteGroups += static_cast<u32>(groups64);
+#endif
+	}
+
+	static __forceinline void Sio2CopyBytes(u8* dst, const u8* src, size_t bytes)
+	{
+		u8* cdst = dst;
+		const u8* csrc = src;
+
+		const size_t groups64 = bytes >> 6;
+		for (size_t i = 0; i < groups64; i++)
+		{
+			if ((i + 1) < groups64)
+				__builtin_prefetch(csrc + 64, 0, 1);
+
+			Sio2Copy64Bytes(cdst, csrc);
+			csrc += 64;
+			cdst += 64;
+		}
+
+		const size_t tail_bytes = bytes & 63;
+		const size_t tail_qwords = tail_bytes >> 4;
+		for (size_t i = 0; i < tail_qwords; i++)
+		{
+			const uint8x16_t qword = vld1q_u8(csrc);
+			vst1q_u8(cdst, qword);
+			csrc += 16;
+			cdst += 16;
+		}
+
+		if (tail_bytes & 8)
+		{
+			const uint8x8_t half = vld1_u8(csrc);
+			vst1_u8(cdst, half);
+			csrc += 8;
+			cdst += 8;
+		}
+
+		for (size_t i = 0; i < (tail_bytes & 7); i++)
+			cdst[i] = csrc[i];
+
+		Sio2CountNeonCopy((groups64 << 2) + tail_qwords, groups64);
+	}
+#else
+	static __forceinline void Sio2CopyBytes(u8* dst, const u8* src, size_t bytes)
+	{
+		std::memcpy(dst, src, bytes);
+	}
+#endif
 }
 
 bool Sio2ByteFifo::empty() const
@@ -66,7 +139,7 @@ void Sio2ByteFifo::push_back(const u8* source, size_t bytes)
 	CompactConsumed();
 	const size_t offset = m_data.size();
 	m_data.resize(offset + bytes);
-	std::memcpy(m_data.data() + offset, source, bytes);
+	Sio2CopyBytes(m_data.data() + offset, source, bytes);
 }
 
 void Sio2ByteFifo::pop_front()
@@ -81,7 +154,7 @@ size_t Sio2ByteFifo::pop_front(u8* destination, size_t bytes)
 	if (copied == 0)
 		return 0;
 
-	std::memcpy(destination, m_data.data() + m_head, copied);
+	Sio2CopyBytes(destination, m_data.data() + m_head, copied);
 	m_head += copied;
 	NormalizeConsumed();
 	return copied;
