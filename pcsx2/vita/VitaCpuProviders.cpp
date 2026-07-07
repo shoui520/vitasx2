@@ -735,6 +735,10 @@ void recMicroVU0::Execute(u32 cycles)
 
 void recMicroVU0::Clear(u32 addr, u32 size)
 {
+	// PCSX2 owner: x86/microVU uses Clear() to discard compiled blocks after
+	// VU micro writes. Vita invalidates the decoded-op cache until the A32
+	// microVU emitter replaces this interpreter-backed provider.
+	VuMicroInvalidateDecodedCache(0, addr, size);
 }
 
 recMicroVU1::recMicroVU1()
@@ -773,6 +777,7 @@ void recMicroVU1::Execute(u32 cycles)
 
 void recMicroVU1::Clear(u32 addr, u32 size)
 {
+	VuMicroInvalidateDecodedCache(1, addr, size);
 }
 
 void recMicroVU1::ResumeXGkick()

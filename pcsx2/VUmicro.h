@@ -95,7 +95,7 @@ public:
 	void Step() override;
 	void SetStartPC(u32 startPC) override;
 	void Execute(u32 cycles) override;
-	void Clear(u32 addr, u32 size) override {}
+	void Clear(u32 addr, u32 size) override;
 };
 
 class InterpVU1 final : public BaseVUmicroCPU
@@ -113,7 +113,7 @@ public:
 	void SetStartPC(u32 startPC) override;
 	void Step() override;
 	void Execute(u32 cycles) override;
-	void Clear(u32 addr, u32 size) override {}
+	void Clear(u32 addr, u32 size) override;
 	void ResumeXGkick() override {}
 };
 
@@ -167,6 +167,9 @@ extern recMicroVU1 CpuMicroVU1;
 extern BaseVUmicroCPU* CpuVU0;
 extern BaseVUmicroCPU* CpuVU1;
 
+extern bool VuMicroAnalyzeUpperNoLowerCached(int idx, u32 pc, u32 code, _VURegsNum* regs);
+extern bool VuMicroAnalyzeLowerNoUpperCached(int idx, u32 pc, u32 code, _VURegsNum* regs);
+extern void VuMicroInvalidateDecodedCache(int idx, u32 addr, u32 size);
 
 // VU0
 extern void vu0ResetRegs();

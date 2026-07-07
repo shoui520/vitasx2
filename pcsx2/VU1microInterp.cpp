@@ -215,7 +215,7 @@ static u32 _vu1ExecUpperNopLowerDirectBurst(VURegs* VU, u32 max_cycles)
 			break;
 
 		_VURegsNum lregs = {};
-		if (!VUInterpFast::AnalyzeLowerNoUpper(lower, &lregs) || !_vu1CanBurstUpperNopLowerDirect(lregs))
+		if (!VuMicroAnalyzeLowerNoUpperCached(1, pc, lower, &lregs) || !_vu1CanBurstUpperNopLowerDirect(lregs))
 			break;
 
 		// PCSX2 owners: VU1microInterp.cpp::vu1Exec() upper-NOP path,
@@ -281,7 +281,7 @@ static u32 _vu1ExecUpperDirectLowerNopBurst(VURegs* VU, u32 max_cycles)
 			break;
 
 		_VURegsNum uregs = {};
-		if (!VUInterpFast::AnalyzeUpperNoLower(upper, &uregs) || !_vu1CanBurstUpperDirect(uregs))
+		if (!VuMicroAnalyzeUpperNoLowerCached(1, pc, upper, &uregs) || !_vu1CanBurstUpperDirect(uregs))
 			break;
 
 		// PCSX2 owners: VU1microInterp.cpp::vu1Exec() lower-NOP path,
@@ -351,8 +351,8 @@ static u32 _vu1ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 
 		_VURegsNum uregs = {};
 		_VURegsNum lregs = {};
-		if (!VUInterpFast::AnalyzeUpperNoLower(upper, &uregs) || !_vu1CanBurstUpperDirect(uregs) ||
-			!VUInterpFast::AnalyzeLowerNoUpper(lower, &lregs) || !_vu1CanBurstLowerDirect(lregs))
+		if (!VuMicroAnalyzeUpperNoLowerCached(1, pc, upper, &uregs) || !_vu1CanBurstUpperDirect(uregs) ||
+			!VuMicroAnalyzeLowerNoUpperCached(1, pc, lower, &lregs) || !_vu1CanBurstLowerDirect(lregs))
 		{
 			break;
 		}
@@ -475,7 +475,7 @@ static u32 _vu1ExecIbitDirectBurst(VURegs* VU, u32 max_cycles)
 			break;
 
 		_VURegsNum uregs = {};
-		if (!VUInterpFast::AnalyzeUpperNoLower(upper, &uregs) ||
+		if (!VuMicroAnalyzeUpperNoLowerCached(1, pc, upper, &uregs) ||
 			(uregs.pipe != VUPIPE_NONE && uregs.pipe != VUPIPE_FMAC))
 		{
 			break;
@@ -524,7 +524,8 @@ static void _vu1Exec(VURegs* VU)
 	_VURegsNum uregs;
 	u32* ptr;
 
-	ptr = (u32*)&VU->Micro[VU->VI[REG_TPC].UL];
+	const u32 pc = VU->VI[REG_TPC].UL;
+	ptr = (u32*)&VU->Micro[pc];
 	VU->VI[REG_TPC].UL += 8;
 
 	if (ptr[1] & 0x40000000) // E flag
@@ -563,7 +564,7 @@ static void _vu1Exec(VURegs* VU)
 #if defined(VITASX2_QEMU_VALIDATION)
 			&& g_qemuVuLowerDirectFastEnabled
 #endif
-			&& VUInterpFast::AnalyzeLowerNoUpper(ptr[0], &lregs);
+			&& VuMicroAnalyzeLowerNoUpperCached(1, pc, ptr[0], &lregs);
 		if (lower_nop)
 		{
 			// PCSX2 owners: VUops.cpp::_vuMOVE() returns immediately for
@@ -647,7 +648,7 @@ static void _vu1Exec(VURegs* VU)
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuVuUpperDirectFastEnabled &&
 #endif
-		VUInterpFast::AnalyzeUpperNoLower(ptr[1], &uregs);
+		VuMicroAnalyzeUpperNoLowerCached(1, pc, ptr[1], &uregs);
 	if (!upper_fast)
 		VU1regs_UPPER_OPCODE[VU->code & 0x3f](&uregs);
 
@@ -710,7 +711,7 @@ static void _vu1Exec(VURegs* VU)
 #if defined(VITASX2_QEMU_VALIDATION)
 				g_qemuVuLowerDirectFastEnabled &&
 #endif
-				VUInterpFast::AnalyzeLowerNoUpper(ptr[0], &lregs);
+				VuMicroAnalyzeLowerNoUpperCached(1, pc, ptr[0], &lregs);
 			if (!lower_fast)
 			{
 				lregs.cycles = 0;
@@ -878,6 +879,11 @@ void InterpVU1::Reset()
 	VU1.ialuwritepos = 0;
 	VU1.ialureadpos = 0;
 	VU1.ialucount = 0;
+}
+
+void InterpVU1::Clear(u32 addr, u32 size)
+{
+	VuMicroInvalidateDecodedCache(1, addr, size);
 }
 
 void InterpVU1::SetStartPC(u32 startPC)
