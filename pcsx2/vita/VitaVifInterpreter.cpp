@@ -34,6 +34,7 @@ u32 g_qemuVifBurstCopy256ByteGroups = 0;
 u32 g_qemuVifBurstCopy1024ByteGroups = 0;
 u32 g_qemuVifBurstModeMaskVectors = 0;
 u32 g_qemuVifBurstV4_32ModeVectors = 0;
+u32 g_qemuVifBurstV4_16PairGroups = 0;
 u32 g_qemuVifCycleBurstVectors = 0;
 #endif
 
@@ -498,6 +499,38 @@ namespace
 	void VitaVifStoreV4_16WordsNeon(u8* dest, const u8* src, bool usn)
 	{
 		VitaVifStoreVectorNeon(dest, VitaVifLoadV4_16VectorNeon(src, usn));
+	}
+
+	void VitaVifStoreV4_16PairBurstNeon(u8* dest, const u8* src, u32 count, bool usn)
+	{
+		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4(). Plain V4-16 bursts write
+		// one widened qword per vector; two source vectors fit in one NEON qword.
+		const u32 pairs = count >> 1;
+		for (u32 i = 0; i < pairs; i++)
+		{
+			const uint16x8_t packed = vld1q_u16(reinterpret_cast<const u16*>(src));
+			if (usn)
+			{
+				VitaVifStoreVectorNeon(dest, vmovl_u16(vget_low_u16(packed)));
+				VitaVifStoreVectorNeon(dest + 16, vmovl_u16(vget_high_u16(packed)));
+			}
+			else
+			{
+				const int16x8_t signed_packed = vreinterpretq_s16_u16(packed);
+				VitaVifStoreVectorNeon(dest, vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(signed_packed))));
+				VitaVifStoreVectorNeon(dest + 16, vreinterpretq_u32_s32(vmovl_s16(vget_high_s16(signed_packed))));
+			}
+
+			src += 16;
+			dest += 32;
+		}
+
+		if ((count & 1u) != 0)
+			VitaVifStoreV4_16WordsNeon(dest, src, usn);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuVifBurstV4_16PairGroups += pairs;
+#endif
 	}
 
 	void VitaVifStoreV4_8WordsNeon(u8* dest, const u8* src, bool usn)
@@ -1222,6 +1255,22 @@ namespace
 			regs.num = 0;
 			return true;
 		}
+
+#if VITASX2_VIF_HAS_ARM_NEON
+		if (format == 0x0d)
+		{
+			VitaVifStoreV4_16PairBurstNeon(dest, data, count, vif.usn != 0);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuVifFastVectors += count;
+			g_qemuVifBurstVectors += count;
+			g_qemuVifBurstWidenVectors += count;
+#endif
+			vif.tag.addr += bytes;
+			vif.cl = static_cast<u8>(count % wl);
+			regs.num = 0;
+			return true;
+		}
+#endif
 
 		for (u32 i = 0; i < count; i++)
 		{
