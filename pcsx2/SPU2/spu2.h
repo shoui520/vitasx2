@@ -94,6 +94,7 @@ extern u32 g_qemuSpu2NonzeroVoiceGateMixed;
 extern u32 g_qemuSpu2DecodeFifoNeonStores;
 extern u32 g_qemuSpu2DecodeFifoWrappedStores;
 extern u32 g_qemuSpu2MixerIrqDisabledChecksSkipped;
+extern u32 g_qemuSpu2PitchClampUsat;
 extern u32 g_qemuSpu2DmaCopyNeonQwords;
 extern u32 g_qemuSpu2DmaCopyNeon64ByteGroups;
 extern u32 g_qemuSpu2DmaCopyNeon128ByteGroups;

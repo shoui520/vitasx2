@@ -46,6 +46,7 @@ u32 g_qemuSpu2DecodeFifoNeonStores = 0;
 u32 g_qemuSpu2DecodeFifoWrappedStores = 0;
 u32 g_qemuSpu2AdpcmSsatClamps = 0;
 u32 g_qemuSpu2MixerIrqDisabledChecksSkipped = 0;
+u32 g_qemuSpu2PitchClampUsat = 0;
 #endif
 
 MULTI_ISA_UNSHARED_START
@@ -309,6 +310,25 @@ static __forceinline s32 ApplyVolume(s32 data, s32 volume)
 	return (volume * data) >> 15;
 }
 
+static __forceinline s32 ClampPitch_reference(s32 value)
+{
+	return std::clamp(value, 0, 0x3fff);
+}
+
+static __forceinline s32 ClampPitch_selected(s32 value)
+{
+#if defined(ARCH_ARM32)
+	u32 result;
+	__asm__("usat %0, #14, %1" : "=r"(result) : "r"(value));
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuSpu2PitchClampUsat;
+#endif
+	return static_cast<s32>(result);
+#else
+	return ClampPitch_reference(value);
+#endif
+}
+
 static __forceinline StereoOut32 ApplyVolume(const StereoOut32& data, const V_VolumeLR& volume)
 {
 	return StereoOut32(
@@ -426,13 +446,33 @@ static void __forceinline UpdatePitch(uint coreidx, uint voiceidx)
 	//   most of the time.  Now it'll just check Modulated and short-circuit past the voice
 	//   check (not that it amounts to much, but eh every little bit helps).
 	if ((vc.Modulated == 0) || (voiceidx == 0))
-		pitch = vc.Pitch;
+		pitch = ClampPitch_selected(vc.Pitch);
 	else
-		pitch = std::clamp((vc.Pitch * (32768 + Cores[coreidx].Voices[voiceidx - 1].OutX)) >> 15, 0, 0x3fff);
+		pitch = ClampPitch_selected((vc.Pitch * (32768 + Cores[coreidx].Voices[voiceidx - 1].OutX)) >> 15);
 
-	pitch = std::min(pitch, 0x3FFF);
 	vc.SP += pitch;
 }
+
+#if defined(VITASX2_QEMU_VALIDATION)
+static void UpdatePitch_reference(uint coreidx, uint voiceidx)
+{
+	V_Voice& vc(Cores[coreidx].Voices[voiceidx]);
+	const s32 pitch = ((vc.Modulated == 0) || (voiceidx == 0)) ?
+		ClampPitch_reference(vc.Pitch) :
+		ClampPitch_reference((vc.Pitch * (32768 + Cores[coreidx].Voices[voiceidx - 1].OutX)) >> 15);
+	vc.SP += pitch;
+}
+
+void Spu2UpdatePitchReferenceForValidation(uint coreidx, uint voiceidx)
+{
+	UpdatePitch_reference(coreidx, voiceidx);
+}
+
+void Spu2UpdatePitchSelectedForValidation(uint coreidx, uint voiceidx)
+{
+	UpdatePitch(coreidx, voiceidx);
+}
+#endif
 
 static __forceinline void CalculateADSR(V_Core& thiscore, uint voiceidx)
 {
