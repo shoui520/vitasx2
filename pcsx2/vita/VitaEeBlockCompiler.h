@@ -202,6 +202,8 @@ namespace VitaEE
 		bool EmitCOP2ControlReadBody(u32 op);
 		bool EmitCOP2ControlWriteBody(u32 op);
 		bool EmitCOP2MacroCodeWrite(u32 op);
+		bool EmitCOP2MacroStoreVfMaskedQword(unsigned vf_reg, unsigned mask, unsigned value_qreg,
+			unsigned old_qreg, unsigned mask_qreg, unsigned address_reg, unsigned scratch_reg);
 		bool EmitCOP2MacroBody(u32 op);
 		bool EmitCOP2MacroArithmeticBody(u32 op);
 		bool EmitVu0ViBackup(unsigned vi_reg);

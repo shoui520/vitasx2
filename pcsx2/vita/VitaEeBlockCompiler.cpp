@@ -5120,6 +5120,35 @@ namespace VitaEE
 #endif
 	}
 
+	bool BlockCompiler::EmitCOP2MacroStoreVfMaskedQword(unsigned vf_reg, unsigned mask, unsigned value_qreg,
+		unsigned old_qreg, unsigned mask_qreg, unsigned address_reg, unsigned scratch_reg)
+	{
+		mask &= 0x0f;
+		if (vf_reg == 0 || mask == 0)
+			return true;
+		if (mask_qreg >= 8 || !EmitVu0VfAddress(address_reg, vf_reg))
+			return false;
+		if (mask == 0x0f)
+			return m_code.EmitVst1Q32Aligned(value_qreg, address_reg);
+
+		const auto emit_mask_lane = [&](unsigned lane, unsigned bit) {
+			const u32 lane_mask = (mask & bit) ? 0xffffffffu : 0u;
+			return m_code.EmitMovImm32(scratch_reg, lane_mask) &&
+				   m_code.EmitVmovCoreToS(mask_qreg * 4 + lane, scratch_reg);
+		};
+
+		return emit_mask_lane(0, 0x8) &&
+			   emit_mask_lane(1, 0x4) &&
+			   emit_mask_lane(2, 0x2) &&
+			   emit_mask_lane(3, 0x1) &&
+			   m_code.EmitVld1Q32Aligned(old_qreg, address_reg) &&
+			   m_code.EmitVandQ(value_qreg, value_qreg, mask_qreg) &&
+			   m_code.EmitVmvnQ(mask_qreg, mask_qreg) &&
+			   m_code.EmitVandQ(old_qreg, old_qreg, mask_qreg) &&
+			   m_code.EmitVorrQ(value_qreg, value_qreg, old_qreg) &&
+			   m_code.EmitVst1Q32Aligned(value_qreg, address_reg);
+	}
+
 	bool BlockCompiler::EmitCOP2MacroBody(u32 op)
 	{
 		// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp macro helpers, and
@@ -5170,42 +5199,16 @@ namespace VitaEE
 		if (mask == 0)
 			return true;
 
-		if (mask == 0x0f)
-		{
-			constexpr unsigned NEON_VALUE = 0;
-			constexpr unsigned NEON_MASK = 1;
-			return EmitVu0VfAddress(HOST_TMP0, fs) &&
-				   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
-				   m_code.EmitMovImm32(HOST_TMP2, 0x7fffffffu) &&
-				   m_code.EmitVdupI32QFromCore(NEON_MASK, HOST_TMP2) &&
-				   m_code.EmitVandQ(NEON_VALUE, NEON_VALUE, NEON_MASK) &&
-				   EmitVu0VfAddress(HOST_TMP1, ft) &&
-				   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
-		}
-
-		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
-			!EmitVu0VfAddress(HOST_TMP1, ft))
-		{
-			return false;
-		}
-
-		const auto emit_lane = [this](unsigned lane) {
-			const u16 offset = static_cast<u16>(lane * sizeof(u32));
-			return m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, offset) &&
-				   EmitBicImm32OrReg(HOST_TMP2, HOST_TMP2, 0x80000000u, HOST_TMP3) &&
-				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
-		};
-
-		if ((mask & 0x8) && !emit_lane(0))
-			return false;
-		if ((mask & 0x4) && !emit_lane(1))
-			return false;
-		if ((mask & 0x2) && !emit_lane(2))
-			return false;
-		if ((mask & 0x1) && !emit_lane(3))
-			return false;
-
-		return true;
+		constexpr unsigned NEON_VALUE = 0;
+		constexpr unsigned NEON_SIGN_MASK = 1;
+		constexpr unsigned NEON_OLD = 2;
+		return EmitVu0VfAddress(HOST_TMP0, fs) &&
+			   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
+			   m_code.EmitMovImm32(HOST_TMP2, 0x7fffffffu) &&
+			   m_code.EmitVdupI32QFromCore(NEON_SIGN_MASK, HOST_TMP2) &&
+			   m_code.EmitVandQ(NEON_VALUE, NEON_VALUE, NEON_SIGN_MASK) &&
+			   EmitCOP2MacroStoreVfMaskedQword(ft, mask, NEON_VALUE, NEON_OLD, NEON_SIGN_MASK,
+				   HOST_TMP1, HOST_TMP2);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroArithmeticBody(u32 op)
@@ -6241,28 +6244,10 @@ namespace VitaEE
 			}
 		}
 
-		if (!EmitVu0VfAddress(HOST_TMP1, ft))
-			return false;
-
-		if (mask == 0x0f)
-			return m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
-
-		const auto emit_lane = [&](unsigned lane) {
-			const u16 offset = static_cast<u16>(lane * sizeof(u32));
-			return m_code.EmitVmovSToCore(HOST_TMP2, NEON_VALUE * 4 + lane) &&
-				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
-		};
-
-		if ((mask & 0x8) && !emit_lane(0))
-			return false;
-		if ((mask & 0x4) && !emit_lane(1))
-			return false;
-		if ((mask & 0x2) && !emit_lane(2))
-			return false;
-		if ((mask & 0x1) && !emit_lane(3))
-			return false;
-
-		return true;
+		constexpr unsigned NEON_WRITE_MASK = 2;
+		constexpr unsigned NEON_OLD = 3;
+		return EmitCOP2MacroStoreVfMaskedQword(ft, mask, NEON_VALUE, NEON_OLD, NEON_WRITE_MASK,
+			HOST_TMP1, HOST_TMP2);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroFtoiBody(u32 op)
@@ -6325,28 +6310,8 @@ namespace VitaEE
 			return false;
 		}
 
-		if (!EmitVu0VfAddress(HOST_TMP1, ft))
-			return false;
-
-		if (mask == 0x0f)
-			return m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1);
-
-		const auto emit_lane = [&](unsigned lane) {
-			const u16 offset = static_cast<u16>(lane * sizeof(u32));
-			return m_code.EmitVmovSToCore(HOST_TMP2, NEON_VALUE * 4 + lane) &&
-				   m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, offset);
-		};
-
-		if ((mask & 0x8) && !emit_lane(0))
-			return false;
-		if ((mask & 0x4) && !emit_lane(1))
-			return false;
-		if ((mask & 0x2) && !emit_lane(2))
-			return false;
-		if ((mask & 0x1) && !emit_lane(3))
-			return false;
-
-		return true;
+		return EmitCOP2MacroStoreVfMaskedQword(ft, mask, NEON_VALUE, NEON_SATURATED, NEON_MASK,
+			HOST_TMP1, HOST_TMP2);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroFdivBody(u32 op)
