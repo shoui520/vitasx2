@@ -23,25 +23,87 @@ u32 g_qemuIpuFifoOutputContiguousReads = 0;
 u32 g_qemuIpuFifoOutputWrappedReads = 0;
 u32 g_qemuIpuFifoNeonQwords = 0;
 u32 g_qemuIpuFifoNeon64ByteGroups = 0;
+u32 g_qemuIpuFifoFixedQwordCopies = 0;
+#endif
+
+#if defined(ARCH_ARM32)
+static __forceinline void IpuFifoCopyQword(u32* to, const u32* from)
+{
+	const uint32x4_t qword = vld1q_u32(from);
+	vst1q_u32(to, qword);
+}
+
+static __forceinline void IpuFifoCopyFourQwords(u32* to, const u32* from)
+{
+	const uint32x4_t qword0 = vld1q_u32(from);
+	const uint32x4_t qword1 = vld1q_u32(from + 4);
+	const uint32x4_t qword2 = vld1q_u32(from + 8);
+	const uint32x4_t qword3 = vld1q_u32(from + 12);
+	vst1q_u32(to, qword0);
+	vst1q_u32(to + 4, qword1);
+	vst1q_u32(to + 8, qword2);
+	vst1q_u32(to + 12, qword3);
+}
+
+static __forceinline void IpuFifoCountNeonCopy(int qwords, int groups64)
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuIpuFifoNeonQwords += static_cast<u32>(qwords);
+	g_qemuIpuFifoNeon64ByteGroups += static_cast<u32>(groups64);
+#endif
+}
 #endif
 
 static __forceinline void IpuFifoCopyWords(u32* to, const u32* from, int words)
 {
 #if defined(ARCH_ARM32)
+	const int fixed_qwords = words >> 2;
+	if ((words & 3) == 0 && fixed_qwords > 0 && fixed_qwords <= 8)
+	{
+		u32* fixed_to = to;
+		const u32* fixed_from = from;
+
+		if (fixed_qwords >= 4)
+		{
+			if (fixed_qwords == 8)
+				__builtin_prefetch(fixed_from + 16, 0, 1);
+
+			IpuFifoCopyFourQwords(fixed_to, fixed_from);
+			fixed_to += 16;
+			fixed_from += 16;
+			if (fixed_qwords == 8)
+				IpuFifoCopyFourQwords(fixed_to, fixed_from);
+		}
+
+		switch (fixed_qwords & 3)
+		{
+			case 3:
+				IpuFifoCopyQword(fixed_to + 8, fixed_from + 8);
+				[[fallthrough]];
+			case 2:
+				IpuFifoCopyQword(fixed_to + 4, fixed_from + 4);
+				[[fallthrough]];
+			case 1:
+				IpuFifoCopyQword(fixed_to, fixed_from);
+				break;
+			default:
+				break;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuFifoFixedQwordCopies;
+#endif
+		IpuFifoCountNeonCopy(fixed_qwords, fixed_qwords >> 2);
+		return;
+	}
+
 	const int groups64 = words >> 4;
 	for (int i = 0; i < groups64; i++)
 	{
 		if ((i + 1) < groups64)
 			__builtin_prefetch(from + 16, 0, 1);
 
-		const uint32x4_t qword0 = vld1q_u32(from);
-		const uint32x4_t qword1 = vld1q_u32(from + 4);
-		const uint32x4_t qword2 = vld1q_u32(from + 8);
-		const uint32x4_t qword3 = vld1q_u32(from + 12);
-		vst1q_u32(to, qword0);
-		vst1q_u32(to + 4, qword1);
-		vst1q_u32(to + 8, qword2);
-		vst1q_u32(to + 12, qword3);
+		IpuFifoCopyFourQwords(to, from);
 		from += 16;
 		to += 16;
 	}
@@ -50,8 +112,7 @@ static __forceinline void IpuFifoCopyWords(u32* to, const u32* from, int words)
 	const int tail_qwords = tail_words >> 2;
 	for (int i = 0; i < tail_qwords; i++)
 	{
-		const uint32x4_t qword = vld1q_u32(from);
-		vst1q_u32(to, qword);
+		IpuFifoCopyQword(to, from);
 		from += 4;
 		to += 4;
 	}
@@ -70,10 +131,7 @@ static __forceinline void IpuFifoCopyWords(u32* to, const u32* from, int words)
 		default:
 			break;
 	}
-#if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuIpuFifoNeonQwords += (groups64 << 2) + tail_qwords;
-	g_qemuIpuFifoNeon64ByteGroups += groups64;
-#endif
+	IpuFifoCountNeonCopy((groups64 << 2) + tail_qwords, groups64);
 	return;
 #endif
 	memcpy(to, from, words << 2);
