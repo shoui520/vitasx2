@@ -22,8 +22,10 @@ extern u32 g_qemuVuNopPairBurstSteps;
 extern u32 g_qemuVuLowerDirectFastSteps;
 extern u32 g_qemuVuUpperDirectFastSteps;
 extern u32 g_qemuVuIbitFastSteps;
+extern u32 g_qemuVuLowerDirectBurstSteps;
 extern bool g_qemuVuLowerDirectFastEnabled;
 extern bool g_qemuVuUpperDirectFastEnabled;
+extern bool g_qemuVuLowerDirectBurstEnabled;
 #endif
 
 void _vu1ExecUpper(VURegs* VU, u32* ptr)
@@ -105,6 +107,76 @@ static u32 _vu1ExecNopPairBurst(VURegs* VU, u32 max_steps)
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuVuNopPairBurstSteps += steps;
+#endif
+	return steps;
+}
+
+static __fi bool _vu1CanBurstLowerDirect(const _VURegsNum& lregs)
+{
+	return lregs.pipe == VUPIPE_FMAC || lregs.pipe == VUPIPE_IALU;
+}
+
+static u32 _vu1ExecUpperNopLowerDirectBurst(VURegs* VU, u32 max_cycles)
+{
+	if (max_cycles == 0 || Pcsx2Trace::IsVuTraceEnabled() ||
+		VU->branch != 0 || VU->ebit != 0 || VU->takedelaybranch)
+	{
+		return 0;
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (!g_qemuVuLowerDirectFastEnabled || !g_qemuVuLowerDirectBurstEnabled)
+		return 0;
+#endif
+
+	u32 steps = 0;
+	const u64 start_cycle = VU->cycle;
+	while ((VU->cycle - start_cycle) < max_cycles && (VU0.VI[REG_VPU_STAT].UL & 0x100))
+	{
+		VU->VI[REG_TPC].UL &= VU1_PROGMASK;
+		const u32 pc = VU->VI[REG_TPC].UL;
+		const u32* ptr = reinterpret_cast<const u32*>(&VU->Micro[pc]);
+		const u32 lower = ptr[0];
+		const u32 upper = ptr[1];
+		if (upper != 0x000002ffu || _vu1IsLowerNop(lower))
+			break;
+
+		_VURegsNum lregs = {};
+		if (!VUInterpFast::AnalyzeLowerNoUpper(lower, &lregs) || !_vu1CanBurstLowerDirect(lregs))
+			break;
+
+		// PCSX2 owners: VU1microInterp.cpp::vu1Exec() upper-NOP path,
+		// VUops.cpp lower-slot implementations, and VUops.cpp pipe/stall
+		// helpers. The burst keeps the same per-op dependency/pipe sequence.
+		VU->cycle++;
+		VU->VI[REG_TPC].UL = pc + 8;
+		VU->code = lower;
+
+		const u64 cyclesBeforeOp = VU->cycle - 1;
+		_vuTestLowerStalls(VU, &lregs);
+		_vuTestPipes(VU);
+
+		if (VU->VIBackupCycles > 0)
+			VU->VIBackupCycles -= std::min((u8)(VU->cycle - cyclesBeforeOp), VU->VIBackupCycles);
+
+		IdebugLOWER(VU1);
+		VUInterpFast::ExecuteLowerNoUpper(VU, lower);
+
+		if (lregs.pipe == VUPIPE_FMAC)
+			_vuClearFMAC(VU);
+
+		_vuAddLowerStalls(VU, &lregs);
+
+		if (lregs.pipe == VUPIPE_FMAC)
+			VU->fmacwritepos = (VU->fmacwritepos + 1) & 3;
+
+		steps++;
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuVuLowerDirectFastSteps += steps;
+	g_qemuVuUpperNopFastSteps += steps;
+	g_qemuVuLowerDirectBurstSteps += steps;
 #endif
 	return steps;
 }
@@ -502,6 +574,8 @@ void InterpVU1::Execute(u32 cycles)
 		}
 		const u32 remaining_cycles = static_cast<u32>(cycles - (VU1.cycle - startcycles));
 		if (_vu1ExecNopPairBurst(&VU1, remaining_cycles) != 0)
+			continue;
+		if (_vu1ExecUpperNopLowerDirectBurst(&VU1, remaining_cycles) != 0)
 			continue;
 		Step();
 	}
