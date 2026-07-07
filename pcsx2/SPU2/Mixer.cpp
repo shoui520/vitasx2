@@ -42,6 +42,8 @@ u32 g_qemuSpu2MasterVolumeSlideSkipped = 0;
 u32 g_qemuSpu2ZeroVoiceGateSkipped = 0;
 u32 g_qemuSpu2NonzeroVoiceGateMixed = 0;
 u32 g_qemuSpu2VoiceInterpNeon = 0;
+u32 g_qemuSpu2DecodeFifoNeonStores = 0;
+u32 g_qemuSpu2DecodeFifoWrappedStores = 0;
 u32 g_qemuSpu2AdpcmSsatClamps = 0;
 #endif
 
@@ -151,6 +153,62 @@ static void __forceinline IncrementNextA(V_Core& thiscore, uint voiceidx)
 	vc.NextA &= 0xFFFFF;
 }
 
+static __forceinline void PushDecodeFifoSamples_reference(V_Voice& vc, int sampleIdx)
+{
+	// PCSX2 owner: GetNextDataBuffered() stages four decoded ADPCM samples
+	// into the 32-entry circular voice FIFO before interpolation consumes them.
+	for (int i = 0; i < 4; i++)
+	{
+		vc.DecodeFifo[(vc.DecPosWrite + i) % 32] = vc.SBuffer[sampleIdx + i];
+	}
+}
+
+#if defined(ARCH_ARM32)
+static __forceinline void PushDecodeFifoSamples_neon(V_Voice& vc, int sampleIdx)
+{
+	const int32x4_t samples = vmovl_s16(vld1_s16(&vc.SBuffer[sampleIdx]));
+	const u32 write = vc.DecPosWrite & 31u;
+	if (write <= 28u)
+	{
+		vst1q_s32(&vc.DecodeFifo[write], samples);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuSpu2DecodeFifoNeonStores;
+#endif
+		return;
+	}
+
+	vc.DecodeFifo[write] = vgetq_lane_s32(samples, 0);
+	vc.DecodeFifo[(write + 1u) & 31u] = vgetq_lane_s32(samples, 1);
+	vc.DecodeFifo[(write + 2u) & 31u] = vgetq_lane_s32(samples, 2);
+	vc.DecodeFifo[(write + 3u) & 31u] = vgetq_lane_s32(samples, 3);
+#if defined(VITASX2_QEMU_VALIDATION)
+	++::g_qemuSpu2DecodeFifoNeonStores;
+	++::g_qemuSpu2DecodeFifoWrappedStores;
+#endif
+}
+#endif
+
+static __forceinline void PushDecodeFifoSamples(V_Voice& vc, int sampleIdx)
+{
+#if defined(ARCH_ARM32)
+	PushDecodeFifoSamples_neon(vc, sampleIdx);
+#else
+	PushDecodeFifoSamples_reference(vc, sampleIdx);
+#endif
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void Spu2PushDecodeFifoSamplesReferenceForValidation(V_Core& core, uint voiceidx, int sampleIdx)
+{
+	PushDecodeFifoSamples_reference(core.Voices[voiceidx], sampleIdx);
+}
+
+void Spu2PushDecodeFifoSamplesSelectedForValidation(V_Core& core, uint voiceidx, int sampleIdx)
+{
+	PushDecodeFifoSamples(core.Voices[voiceidx], sampleIdx);
+}
+#endif
+
 static __forceinline void GetNextDataBuffered(V_Core& thiscore, uint voiceidx)
 {
 	V_Voice& vc(thiscore.Voices[voiceidx]);
@@ -198,12 +256,8 @@ static __forceinline void GetNextDataBuffered(V_Core& thiscore, uint voiceidx)
 		}
 	}
 
-	// Get the sample index for NextA, we have to subtract 1 to ignore the loop header
-	int sampleIdx = ((vc.NextA % pcm_WordsPerBlock) - 1) * 4;
-	for (int i = 0; i < 4; i++)
-	{
-		vc.DecodeFifo[(vc.DecPosWrite + i) % 32] = vc.SBuffer[sampleIdx + i];
-	}
+	const int sampleIdx = ((vc.NextA % pcm_WordsPerBlock) - 1) * 4;
+	PushDecodeFifoSamples(vc, sampleIdx);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////
