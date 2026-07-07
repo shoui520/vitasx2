@@ -24,6 +24,7 @@ extern u32 g_qemuVuLowerNeonQwordOps;
 extern u32 g_qemuVuUpperNeonQwordOps;
 extern u32 g_qemuVuUpperScalarFullMaskOps;
 extern u32 g_qemuVuUpperScalarPartialMaskOps;
+extern u32 g_qemuVuLowerVfpSqrtOps;
 #endif
 
 namespace VUInterpFast
@@ -1526,6 +1527,23 @@ namespace VUInterpFast
 	}
 
 	static inline float VuDouble(u32 bits);
+
+	static inline float VuSqrt(float value)
+	{
+#if defined(ARCH_ARM32)
+		// PCSX2 owner: VUops.cpp::_vuSQRT()/_vuRSQRT() and EFU sqrt ops.
+		// Use Cortex-A9 VFP directly instead of routing the direct VU path
+		// through libm while preserving the same non-negative input contract.
+		float result;
+		__asm__("vsqrt.f32 %0, %1" : "=t"(result) : "t"(value));
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuLowerVfpSqrtOps;
+#endif
+		return result;
+#else
+		return std::sqrt(value);
+#endif
+	}
 
 	template <typename Unary>
 	static inline void StoreUnaryUpperMasked(VURegs* VU, unsigned ft, unsigned mask, unsigned fs, Unary fn)
@@ -3159,7 +3177,7 @@ namespace VUInterpFast
 				VU->statusflag &= ~0x30u;
 				if (ft < 0.0f)
 					VU->statusflag |= 0x10u;
-				WriteVuQ(VU, std::sqrt(std::fabs(ft)));
+				WriteVuQ(VU, VuSqrt(std::fabs(ft)));
 				return;
 			}
 			case LowerFastKind::RSQRT:
@@ -3188,7 +3206,7 @@ namespace VUInterpFast
 				{
 					if (ft < 0.0f)
 						VU->statusflag |= 0x10u;
-					WriteVuQ(VU, fs / std::sqrt(std::fabs(ft)));
+					WriteVuQ(VU, fs / VuSqrt(std::fabs(ft)));
 				}
 				return;
 			}
@@ -3226,7 +3244,7 @@ namespace VUInterpFast
 			{
 				float p = VuSumXYZSquares(VU, Fs(code));
 				if (p >= 0.0f)
-					p = std::sqrt(p);
+					p = VuSqrt(p);
 				VU->p.F = p;
 				return;
 			}
@@ -3235,7 +3253,7 @@ namespace VUInterpFast
 				float p = VuSumXYZSquares(VU, Fs(code));
 				if (p >= 0.0f)
 				{
-					p = std::sqrt(p);
+					p = VuSqrt(p);
 					if (p != 0.0f)
 						p = 1.0f / p;
 				}
@@ -3275,7 +3293,7 @@ namespace VUInterpFast
 			{
 				float p = VuLane(VU, Fs(code), Fsf(code));
 				if (p >= 0.0f)
-					p = std::sqrt(p);
+					p = VuSqrt(p);
 				VU->p.F = p;
 				return;
 			}
@@ -3284,7 +3302,7 @@ namespace VUInterpFast
 				float p = VuLane(VU, Fs(code), Fsf(code));
 				if (p >= 0.0f)
 				{
-					p = std::sqrt(p);
+					p = VuSqrt(p);
 					if (p != 0.0f)
 						p = 1.0f / p;
 				}
