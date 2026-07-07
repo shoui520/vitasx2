@@ -18,6 +18,9 @@ extern u32 g_qemuCdvdBlockCopyNeon64ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon256ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon1024ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon2048ByteGroups;
+extern u32 g_qemuCdvdBlockCopyNeon2328ByteGroups;
+extern u32 g_qemuCdvdBlockCopyNeon2340ByteGroups;
+extern u32 g_qemuCdvdBlockCopyNeon2352ByteGroups;
 #endif
 
 #if defined(ARCH_ARM32)
@@ -55,8 +58,54 @@ static __forceinline void CdvdCopy2048Bytes(u8* dst, const u8* src)
 	CdvdCopy1024Bytes(dst + 1024, src + 1024);
 }
 
+static __forceinline void CdvdCopy2328Bytes(u8* dst, const u8* src)
+{
+	CdvdCopy2048Bytes(dst, src);
+	CdvdCopy256Bytes(dst + 2048, src + 2048);
+
+	const uint8x16_t tail16 = vld1q_u8(src + 2304);
+	const uint8x8_t tail8 = vld1_u8(src + 2320);
+	vst1q_u8(dst + 2304, tail16);
+	vst1_u8(dst + 2320, tail8);
+}
+
+static __forceinline void CdvdCopy2340Bytes(u8* dst, const u8* src)
+{
+	CdvdCopy2048Bytes(dst, src);
+	CdvdCopy256Bytes(dst + 2048, src + 2048);
+
+	const uint8x16_t tail0 = vld1q_u8(src + 2304);
+	const uint8x16_t tail1 = vld1q_u8(src + 2320);
+	vst1q_u8(dst + 2304, tail0);
+	vst1q_u8(dst + 2320, tail1);
+	dst[2336] = src[2336];
+	dst[2337] = src[2337];
+	dst[2338] = src[2338];
+	dst[2339] = src[2339];
+}
+
+static __forceinline void CdvdCopy2352Bytes(u8* dst, const u8* src)
+{
+	CdvdCopy2048Bytes(dst, src);
+	CdvdCopy256Bytes(dst + 2048, src + 2048);
+
+	const uint8x16_t tail0 = vld1q_u8(src + 2304);
+	const uint8x16_t tail1 = vld1q_u8(src + 2320);
+	const uint8x16_t tail2 = vld1q_u8(src + 2336);
+	vst1q_u8(dst + 2304, tail0);
+	vst1q_u8(dst + 2320, tail1);
+	vst1q_u8(dst + 2336, tail2);
+}
+
 static __forceinline void CdvdCountNeonCopy(
-	size_t qwords, size_t groups64, size_t groups256, size_t groups1024, size_t groups2048)
+	size_t qwords,
+	size_t groups64,
+	size_t groups256,
+	size_t groups1024,
+	size_t groups2048,
+	size_t groups2328 = 0,
+	size_t groups2340 = 0,
+	size_t groups2352 = 0)
 {
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuCdvdBlockCopyNeonQwords += static_cast<u32>(qwords);
@@ -64,6 +113,9 @@ static __forceinline void CdvdCountNeonCopy(
 	g_qemuCdvdBlockCopyNeon256ByteGroups += static_cast<u32>(groups256);
 	g_qemuCdvdBlockCopyNeon1024ByteGroups += static_cast<u32>(groups1024);
 	g_qemuCdvdBlockCopyNeon2048ByteGroups += static_cast<u32>(groups2048);
+	g_qemuCdvdBlockCopyNeon2328ByteGroups += static_cast<u32>(groups2328);
+	g_qemuCdvdBlockCopyNeon2340ByteGroups += static_cast<u32>(groups2340);
+	g_qemuCdvdBlockCopyNeon2352ByteGroups += static_cast<u32>(groups2352);
 #endif
 }
 #endif
@@ -73,6 +125,36 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 #if defined(ARCH_ARM32)
 	u8* cdst = static_cast<u8*>(dst);
 	const u8* csrc = static_cast<const u8*>(src);
+
+	if (size == 2328)
+	{
+		CdvdCopy2328Bytes(cdst, csrc);
+		CdvdCountNeonCopy(145, 36, 9, 2, 1, 1);
+		return;
+	}
+	if (size == 2340)
+	{
+		CdvdCopy2340Bytes(cdst, csrc);
+		CdvdCountNeonCopy(146, 36, 9, 2, 1, 0, 1);
+		return;
+	}
+	if (size != 0 && (size % 2352) == 0)
+	{
+		const size_t groups2352 = size / 2352;
+		for (size_t i = 0; i < groups2352; i++)
+		{
+			if ((i + 1) < groups2352)
+				__builtin_prefetch(csrc + 2352, 0, 1);
+
+			CdvdCopy2352Bytes(cdst, csrc);
+			csrc += 2352;
+			cdst += 2352;
+		}
+
+		CdvdCountNeonCopy(groups2352 * 147, groups2352 * 36, groups2352 * 9, groups2352 * 2, groups2352, 0, 0, groups2352);
+		return;
+	}
+
 	const size_t groups2048 = size >> 11;
 	for (size_t i = 0; i < groups2048; i++)
 	{
