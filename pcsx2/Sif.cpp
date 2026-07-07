@@ -17,6 +17,7 @@ u32 g_qemuSifFifoJunkScalarWords = 0;
 u32 g_qemuSifFifoNeonQwords = 0;
 u32 g_qemuSifFifoNeon64ByteGroups = 0;
 u32 g_qemuSifFifoNeon256ByteGroups = 0;
+u32 g_qemuSifFifoNeon512ByteGroups = 0;
 #endif
 
 void sifReset()

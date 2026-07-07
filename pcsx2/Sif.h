@@ -19,6 +19,7 @@ extern u32 g_qemuSifFifoJunkScalarWords;
 extern u32 g_qemuSifFifoNeonQwords;
 extern u32 g_qemuSifFifoNeon64ByteGroups;
 extern u32 g_qemuSifFifoNeon256ByteGroups;
+extern u32 g_qemuSifFifoNeon512ByteGroups;
 #endif
 
 #if defined(ARCH_ARM32)
@@ -41,12 +42,30 @@ static __forceinline void SifFifoCopy64Words(u32* to, const u32* from)
 	SifFifoCopy16Words(to + 32, from + 32);
 	SifFifoCopy16Words(to + 48, from + 48);
 }
+
+static __forceinline void SifFifoCopy128Words(u32* to, const u32* from)
+{
+	SifFifoCopy64Words(to, from);
+	SifFifoCopy64Words(to + 64, from + 64);
+}
 #endif
 
 static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 {
 #if defined(ARCH_ARM32)
-	const int groups256 = words >> 6;
+	const int groups512 = words >> 7;
+	for (int i = 0; i < groups512; i++)
+	{
+		if ((i + 1) < groups512)
+			__builtin_prefetch(from + 128, 0, 1);
+
+		SifFifoCopy128Words(to, from);
+		from += 128;
+		to += 128;
+	}
+
+	const int remaining_after_512 = words & 127;
+	const int groups256 = remaining_after_512 >> 6;
 	for (int i = 0; i < groups256; i++)
 	{
 		if ((i + 1) < groups256)
@@ -57,7 +76,7 @@ static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 		to += 64;
 	}
 
-	const int remaining_after_256 = words & 63;
+	const int remaining_after_256 = remaining_after_512 & 63;
 	const int groups64 = remaining_after_256 >> 4;
 	for (int i = 0; i < groups64; i++)
 	{
@@ -94,9 +113,10 @@ static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 			break;
 	}
 #if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuSifFifoNeonQwords += (groups256 << 4) + (groups64 << 2) + qwords;
-	g_qemuSifFifoNeon64ByteGroups += (groups256 << 2) + groups64;
-	g_qemuSifFifoNeon256ByteGroups += groups256;
+	g_qemuSifFifoNeonQwords += (groups512 << 5) + (groups256 << 4) + (groups64 << 2) + qwords;
+	g_qemuSifFifoNeon64ByteGroups += (groups512 << 3) + (groups256 << 2) + groups64;
+	g_qemuSifFifoNeon256ByteGroups += (groups512 << 1) + groups256;
+	g_qemuSifFifoNeon512ByteGroups += groups512;
 #endif
 	return;
 #endif
