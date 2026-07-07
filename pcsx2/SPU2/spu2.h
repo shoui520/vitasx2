@@ -96,4 +96,5 @@ extern u32 g_qemuSpu2DecodeFifoWrappedStores;
 extern u32 g_qemuSpu2DmaCopyNeonQwords;
 extern u32 g_qemuSpu2DmaCopyNeon64ByteGroups;
 extern u32 g_qemuSpu2DmaCopyNeon256ByteGroups;
+extern u32 g_qemuSpu2DmaCopyNeon1024ByteGroups;
 #endif

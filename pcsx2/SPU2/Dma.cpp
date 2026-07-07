@@ -19,6 +19,7 @@ static constexpr int CYCLES_PER_WORD = 24;
 u32 g_qemuSpu2DmaCopyNeonQwords = 0;
 u32 g_qemuSpu2DmaCopyNeon64ByteGroups = 0;
 u32 g_qemuSpu2DmaCopyNeon256ByteGroups = 0;
+u32 g_qemuSpu2DmaCopyNeon1024ByteGroups = 0;
 #endif
 
 #if defined(ARCH_ARM32)
@@ -42,12 +43,21 @@ static __forceinline void Spu2DmaCopy256Bytes(u8* dst, const u8* src)
 	Spu2DmaCopy64Bytes(dst + 192, src + 192);
 }
 
-static __forceinline void Spu2DmaCountNeonCopy(u32 qwords, u32 groups64, u32 groups256)
+static __forceinline void Spu2DmaCopy1024Bytes(u8* dst, const u8* src)
+{
+	Spu2DmaCopy256Bytes(dst, src);
+	Spu2DmaCopy256Bytes(dst + 256, src + 256);
+	Spu2DmaCopy256Bytes(dst + 512, src + 512);
+	Spu2DmaCopy256Bytes(dst + 768, src + 768);
+}
+
+static __forceinline void Spu2DmaCountNeonCopy(u32 qwords, u32 groups64, u32 groups256, u32 groups1024)
 {
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuSpu2DmaCopyNeonQwords += qwords;
 	g_qemuSpu2DmaCopyNeon64ByteGroups += groups64;
 	g_qemuSpu2DmaCopyNeon256ByteGroups += groups256;
+	g_qemuSpu2DmaCopyNeon1024ByteGroups += groups1024;
 #endif
 }
 #endif
@@ -57,7 +67,18 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 #if defined(ARCH_ARM32)
 	u8* dst = static_cast<u8*>(to);
 	const u8* src = static_cast<const u8*>(from);
-	const u32 groups256 = bytes >> 8;
+	const u32 groups1024 = bytes >> 10;
+	for (u32 i = 0; i < groups1024; i++)
+	{
+		if ((i + 1) < groups1024)
+			__builtin_prefetch(src + 1024, 0, 1);
+		Spu2DmaCopy1024Bytes(dst, src);
+		src += 1024;
+		dst += 1024;
+	}
+
+	const u32 remaining_after_1024 = bytes & 1023u;
+	const u32 groups256 = remaining_after_1024 >> 8;
 	for (u32 i = 0; i < groups256; i++)
 	{
 		if ((i + 1) < groups256)
@@ -67,7 +88,7 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 		dst += 256;
 	}
 
-	const u32 remaining_after_256 = bytes & 255u;
+	const u32 remaining_after_256 = remaining_after_1024 & 255u;
 	const u32 groups64 = remaining_after_256 >> 6;
 	for (u32 i = 0; i < groups64; i++)
 	{
@@ -98,9 +119,10 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 	for (u32 i = 0; i < (tail_bytes & 7); i++)
 		dst[i] = src[i];
 
-	Spu2DmaCountNeonCopy((groups256 << 4) + (groups64 << 2) + tail_qwords,
-		(groups256 << 2) + groups64,
-		groups256);
+	Spu2DmaCountNeonCopy((groups1024 << 6) + (groups256 << 4) + (groups64 << 2) + tail_qwords,
+		(groups1024 << 4) + (groups256 << 2) + groups64,
+		(groups1024 << 2) + groups256,
+		groups1024);
 	return;
 #endif
 	memcpy(to, from, bytes);
