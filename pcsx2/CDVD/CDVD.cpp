@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "CDVD/CDVD.h"
+#include "CDVD/CdvdCopy.h"
 #include "CDVD/Ps1CD.h"
 #include "CDVD/CDVD_internal.h"
 #include "CDVD/IsoReader.h"
@@ -1197,7 +1198,7 @@ int cdvdReadSector()
 		mdest[11] = 0;
 
 		// normal 2048 bytes of sector data
-		memcpy(&mdest[12], &cdr.Transfer[0], 2048);
+		CdvdCopyBytes(&mdest[12], &cdr.Transfer[0], 2048);
 
 		// 4 bytes of edc (not calculated at present)
 		mdest[2060] = 0;
@@ -1207,7 +1208,7 @@ int cdvdReadSector()
 	}
 	else
 	{
-		memcpy(mdest, &cdr.Transfer[0], cdvd.BlockSize);
+		CdvdCopyBytes(mdest, &cdr.Transfer[0], cdvd.BlockSize);
 	}
 
 	// decrypt sector's bytes

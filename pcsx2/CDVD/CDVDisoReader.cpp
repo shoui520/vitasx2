@@ -3,6 +3,7 @@
 
 #include "IsoFileFormats.h"
 #include "CDVD/CDVD.h"
+#include "CDVD/CdvdCopy.h"
 
 #include "common/Assertions.h"
 #include "common/Console.h"
@@ -358,7 +359,7 @@ static s32 ISOreadSector(u8* tempbuffer, u32 lsn, int mode)
 			jNO_DEFAULT
 	}
 
-	memcpy(tempbuffer, pbuffer, psize);
+	CdvdCopyBytes(tempbuffer, pbuffer, psize);
 
 	return 0;
 }

@@ -6,6 +6,7 @@
 
 #include "Ps1CD.h"
 #include "CDVD.h"
+#include "CDVD/CdvdCopy.h"
 #include "IopHw.h"
 #include "IopDma.h"
 
@@ -1070,7 +1071,7 @@ void psxDma3(u32 madr, u32 bcr, u32 chcr)
 			}
 
 			cdsize = (bcr & 0xffff) * 4;
-			memcpy(iopPhysMem(madr), cdr.pTransfer, cdsize);
+			CdvdCopyBytes(iopPhysMem(madr), cdr.pTransfer, cdsize);
 			psxCpu->Clear(madr, cdsize / 4);
 			cdr.pTransfer += cdsize;
 

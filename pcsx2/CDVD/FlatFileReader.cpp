@@ -3,6 +3,8 @@
 
 #include "FlatFileReader.h"
 
+#include "CDVD/CdvdCopy.h"
+
 #include "common/Assertions.h"
 #include "common/Console.h"
 #include "common/FileSystem.h"
@@ -86,7 +88,7 @@ int FlatFileReader::ReadChunk(void* dst, s64 blockID)
 			return -1;
 
 		const u64 read_size = std::min<u64>(m_file_size - file_offset, CHUNK_SIZE);
-		std::memcpy(dst, &m_file_cache[file_offset], read_size);
+		CdvdCopyBytes(dst, &m_file_cache[file_offset], read_size);
 		return static_cast<int>(read_size);
 	}
 

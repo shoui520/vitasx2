@@ -3,6 +3,7 @@
 
 #include "CDVD/BlockdumpFileReader.h"
 #include "CDVD/ChdFileReader.h"
+#include "CDVD/CdvdCopy.h"
 #include "CDVD/CsoFileReader.h"
 #include "CDVD/FlatFileReader.h"
 #include "CDVD/GzippedFileReader.h"
@@ -156,7 +157,7 @@ int InputIsoFile::FinishRead3(u8* dst, uint mode)
 
 	length = end - _offset;
 
-	std::memcpy(dst + diff, m_readbuffer + ndiff, length);
+	CdvdCopyBytes(dst + diff, m_readbuffer + ndiff, length);
 
 	if (m_type == ISOTYPE_CD && diff >= 12)
 	{
