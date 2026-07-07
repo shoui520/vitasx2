@@ -14,6 +14,7 @@ BaseVUmicroCPU* CpuVU1 = nullptr;
 u32 g_qemuVuUpperNopFastSteps = 0;
 u32 g_qemuVuLowerNopFastSteps = 0;
 u32 g_qemuVuNopPairBurstSteps = 0;
+u32 g_qemuVuNopPairFastForwardSteps = 0;
 u32 g_qemuVuLowerDirectFastSteps = 0;
 u32 g_qemuVuUpperDirectFastSteps = 0;
 u32 g_qemuVuIbitFastSteps = 0;

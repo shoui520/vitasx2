@@ -19,6 +19,7 @@ extern void _vuXGKICKFlush(VURegs* VU);
 extern u32 g_qemuVuUpperNopFastSteps;
 extern u32 g_qemuVuLowerNopFastSteps;
 extern u32 g_qemuVuNopPairBurstSteps;
+extern u32 g_qemuVuNopPairFastForwardSteps;
 extern u32 g_qemuVuLowerDirectFastSteps;
 extern u32 g_qemuVuUpperDirectFastSteps;
 extern u32 g_qemuVuIbitFastSteps;
@@ -79,12 +80,67 @@ static __fi bool _vu1IsPlainNopPair(u32 upper, u32 lower)
 	return upper == 0x000002ffu && _vu1IsLowerNop(lower);
 }
 
+static __fi bool _vu1CanFastForwardPlainNopPairs(const VURegs* VU)
+{
+	return VU->fmaccount == 0 &&
+		VU->ialucount == 0 &&
+		VU->fdiv.enable == 0 &&
+		VU->efu.enable == 0 &&
+		VU->xgkickenable == 0;
+}
+
+static u32 _vu1FastForwardPlainNopPairs(VURegs* VU, u32 max_steps)
+{
+	// PCSX2 owners: VUops.cpp::_vuNOP(), _vuMOVE(Ft==0), and _vuTestPipes().
+	// Fast-forward only when _vuTestPipes() cannot publish pending pipe state.
+	if (!_vu1CanFastForwardPlainNopPairs(VU))
+		return 0;
+
+	const u32 start_pc = VU->VI[REG_TPC].UL & VU1_PROGMASK;
+	u32 pc = start_pc;
+	u32 steps = 0;
+	while (steps < max_steps && (VU0.VI[REG_VPU_STAT].UL & 0x100))
+	{
+		const u32* ptr = reinterpret_cast<const u32*>(&VU->Micro[pc]);
+		if (!_vu1IsPlainNopPair(ptr[1], ptr[0]))
+			break;
+
+		steps++;
+		pc = (pc + 8) & VU1_PROGMASK;
+	}
+
+	if (steps == 0)
+		return 0;
+
+	VU->cycle += steps;
+	const u32 last_pc = (start_pc + ((steps - 1) * 8)) & VU1_PROGMASK;
+	VU->VI[REG_TPC].UL = last_pc + 8;
+	if (VU->VIBackupCycles > 0)
+	{
+		const u32 elapsed = std::min<u32>(steps, VU->VIBackupCycles);
+		VU->VIBackupCycles -= static_cast<u8>(elapsed);
+	}
+	VU->code = 0x8000033cu;
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuVuNopPairFastForwardSteps += steps;
+#endif
+	return steps;
+}
+
 static u32 _vu1ExecNopPairBurst(VURegs* VU, u32 max_steps)
 {
 	if (max_steps == 0 || Pcsx2Trace::IsVuTraceEnabled() ||
 		VU->branch != 0 || VU->ebit != 0 || VU->takedelaybranch)
 	{
 		return 0;
+	}
+
+	if (const u32 fast_forward_steps = _vu1FastForwardPlainNopPairs(VU, max_steps); fast_forward_steps != 0)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuVuNopPairBurstSteps += fast_forward_steps;
+#endif
+		return fast_forward_steps;
 	}
 
 	u32 steps = 0;
