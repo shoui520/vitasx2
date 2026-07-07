@@ -21,6 +21,8 @@ extern u32 g_qemuSifFifoNeon64ByteGroups;
 extern u32 g_qemuSifFifoNeon128ByteGroups;
 extern u32 g_qemuSifFifoNeon256ByteGroups;
 extern u32 g_qemuSifFifoNeon512ByteGroups;
+extern u32 g_qemuSifFifoExactSpanCopies;
+extern u32 g_qemuSifFifoExact512ByteCopies;
 #endif
 
 #if defined(ARCH_ARM32)
@@ -55,11 +57,95 @@ static __forceinline void SifFifoCopy128Words(u32* to, const u32* from)
 	SifFifoCopy64Words(to, from);
 	SifFifoCopy64Words(to + 64, from + 64);
 }
+
+static __forceinline void SifFifoCopy12Words(u32* to, const u32* from)
+{
+	const uint32x4_t qword0 = vld1q_u32(from);
+	const uint32x4_t qword1 = vld1q_u32(from + 4);
+	const uint32x4_t qword2 = vld1q_u32(from + 8);
+	vst1q_u32(to, qword0);
+	vst1q_u32(to + 4, qword1);
+	vst1q_u32(to + 8, qword2);
+}
+
+static __forceinline void SifFifoCopy8Words(u32* to, const u32* from)
+{
+	const uint32x4_t qword0 = vld1q_u32(from);
+	const uint32x4_t qword1 = vld1q_u32(from + 4);
+	vst1q_u32(to, qword0);
+	vst1q_u32(to + 4, qword1);
+}
+
+static __forceinline void SifFifoCopy4Words(u32* to, const u32* from)
+{
+	const uint32x4_t qword = vld1q_u32(from);
+	vst1q_u32(to, qword);
+}
+
+static __forceinline void SifFifoCountNeonCopy(u32 qwords, u32 groups64, u32 groups128, u32 groups256, u32 groups512, bool exact_span)
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSifFifoNeonQwords += qwords;
+	g_qemuSifFifoNeon64ByteGroups += groups64;
+	g_qemuSifFifoNeon128ByteGroups += groups128;
+	g_qemuSifFifoNeon256ByteGroups += groups256;
+	g_qemuSifFifoNeon512ByteGroups += groups512;
+	if (exact_span)
+	{
+		++g_qemuSifFifoExactSpanCopies;
+		if (groups512 != 0)
+			++g_qemuSifFifoExact512ByteCopies;
+	}
+#else
+	(void)qwords;
+	(void)groups64;
+	(void)groups128;
+	(void)groups256;
+	(void)groups512;
+	(void)exact_span;
+#endif
+}
 #endif
 
 static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 {
 #if defined(ARCH_ARM32)
+	// PCSX2 owner: Sif.h::sifFifo::write/read circular spans. SIF traffic is
+	// qword-shaped, so keep common fixed spans branch-free on Cortex-A9.
+	switch (words)
+	{
+		case 128:
+			SifFifoCopy128Words(to, from);
+			SifFifoCountNeonCopy(32, 8, 0, 2, 1, true);
+			return;
+		case 64:
+			SifFifoCopy64Words(to, from);
+			SifFifoCountNeonCopy(16, 4, 0, 1, 0, true);
+			return;
+		case 32:
+			SifFifoCopy32Words(to, from);
+			SifFifoCountNeonCopy(8, 2, 1, 0, 0, true);
+			return;
+		case 16:
+			SifFifoCopy16Words(to, from);
+			SifFifoCountNeonCopy(4, 1, 0, 0, 0, true);
+			return;
+		case 12:
+			SifFifoCopy12Words(to, from);
+			SifFifoCountNeonCopy(3, 0, 0, 0, 0, true);
+			return;
+		case 8:
+			SifFifoCopy8Words(to, from);
+			SifFifoCountNeonCopy(2, 0, 0, 0, 0, true);
+			return;
+		case 4:
+			SifFifoCopy4Words(to, from);
+			SifFifoCountNeonCopy(1, 0, 0, 0, 0, true);
+			return;
+		default:
+			break;
+	}
+
 	const int groups512 = words >> 7;
 	for (int i = 0; i < groups512; i++)
 	{
@@ -132,11 +218,13 @@ static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 			break;
 	}
 #if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuSifFifoNeonQwords += (groups512 << 5) + (groups256 << 4) + (groups128 << 3) + (groups64 << 2) + qwords;
-	g_qemuSifFifoNeon64ByteGroups += (groups512 << 3) + (groups256 << 2) + (groups128 << 1) + groups64;
-	g_qemuSifFifoNeon128ByteGroups += groups128;
-	g_qemuSifFifoNeon256ByteGroups += (groups512 << 1) + groups256;
-	g_qemuSifFifoNeon512ByteGroups += groups512;
+	SifFifoCountNeonCopy(
+		(groups512 << 5) + (groups256 << 4) + (groups128 << 3) + (groups64 << 2) + qwords,
+		(groups512 << 3) + (groups256 << 2) + (groups128 << 1) + groups64,
+		groups128,
+		(groups512 << 1) + groups256,
+		groups512,
+		false);
 #endif
 	return;
 #endif

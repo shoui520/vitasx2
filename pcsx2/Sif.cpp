@@ -19,6 +19,8 @@ u32 g_qemuSifFifoNeon64ByteGroups = 0;
 u32 g_qemuSifFifoNeon128ByteGroups = 0;
 u32 g_qemuSifFifoNeon256ByteGroups = 0;
 u32 g_qemuSifFifoNeon512ByteGroups = 0;
+u32 g_qemuSifFifoExactSpanCopies = 0;
+u32 g_qemuSifFifoExact512ByteCopies = 0;
 #endif
 
 void sifReset()
