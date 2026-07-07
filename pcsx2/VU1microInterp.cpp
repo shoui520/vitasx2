@@ -120,6 +120,13 @@ static __fi bool _vu1CanBurstLowerDirect(const _VURegsNum& lregs)
 	return lregs.pipe == VUPIPE_FMAC || lregs.pipe == VUPIPE_IALU;
 }
 
+static __fi bool _vu1CanBurstUpperNopLowerDirect(const _VURegsNum& lregs)
+{
+	return _vu1CanBurstLowerDirect(lregs) ||
+		lregs.pipe == VUPIPE_FDIV ||
+		lregs.pipe == VUPIPE_EFU;
+}
+
 static __fi bool _vu1CanBurstUpperDirect(const _VURegsNum& uregs)
 {
 	return uregs.pipe == VUPIPE_FMAC;
@@ -151,12 +158,13 @@ static u32 _vu1ExecUpperNopLowerDirectBurst(VURegs* VU, u32 max_cycles)
 			break;
 
 		_VURegsNum lregs = {};
-		if (!VUInterpFast::AnalyzeLowerNoUpper(lower, &lregs) || !_vu1CanBurstLowerDirect(lregs))
+		if (!VUInterpFast::AnalyzeLowerNoUpper(lower, &lregs) || !_vu1CanBurstUpperNopLowerDirect(lregs))
 			break;
 
 		// PCSX2 owners: VU1microInterp.cpp::vu1Exec() upper-NOP path,
 		// VUops.cpp lower-slot implementations, and VUops.cpp pipe/stall
-		// helpers. The burst keeps the same per-op dependency/pipe sequence.
+		// helpers for FMAC/IALU/FDIV/EFU lower pipes. The burst keeps the same
+		// per-op dependency/pipe sequence.
 		VU->cycle++;
 		VU->VI[REG_TPC].UL = pc + 8;
 		VU->code = lower;
