@@ -27,6 +27,7 @@ Sio2 g_Sio2;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSio2FifoBulkReadBytes = 0;
+u32 g_qemuSio2FifoBulkWriteBytes = 0;
 #endif
 
 namespace
@@ -55,6 +56,17 @@ void Sio2ByteFifo::push_back(u8 value)
 		CompactConsumed();
 
 	m_data.push_back(value);
+}
+
+void Sio2ByteFifo::push_back(const u8* source, size_t bytes)
+{
+	if (bytes == 0)
+		return;
+
+	CompactConsumed();
+	const size_t offset = m_data.size();
+	m_data.resize(offset + bytes);
+	std::memcpy(m_data.data() + offset, source, bytes);
 }
 
 void Sio2ByteFifo::pop_front()
@@ -491,11 +503,6 @@ void Sio2::Memcard()
 	}
 }
 
-void Sio2::ReserveWriteBytes(size_t bytes)
-{
-	g_Sio2FifoIn.reserve(g_Sio2FifoIn.size() + bytes);
-}
-
 void Sio2::Write(u8 data)
 {
 	Sio2Log.WriteLn("%s(%02X) SIO2 DATA Write", __FUNCTION__, data);
@@ -539,51 +546,57 @@ void Sio2::Write(u8 data)
 	// ... These were from SIO2 DMA (DMA block size is non-zero when SIO2 DMA occurs)
 	if ((g_Sio2FifoIn.size() == g_Sio2.commandLength && g_Sio2.dmaBlockSize == 0) || g_Sio2FifoIn.size() == g_Sio2.dmaBlockSize)
 	{
-		// Go ahead and prep so the next write triggers a load of the new cmd value.
-		g_Sio2.queueRead = false;
-		g_Sio2.queuePosition++;
-
-		// Check the SIO mode
-		const u8 sioMode = g_Sio2FifoIn.front();
-		g_Sio2FifoIn.pop_front();
-
-		switch (sioMode)
-		{
-			case SioMode::PAD:
-				this->Pad();
-				break;
-			case SioMode::MULTITAP:
-				this->Multitap();
-				break;
-			case SioMode::INFRARED:
-				this->Infrared();
-				break;
-			case SioMode::MEMCARD:
-				this->Memcard();
-				break;
-			default:
-				Console.Error("%s(%02X) Unhandled SIO mode %02X", __FUNCTION__, data, sioMode);
-				g_Sio2FifoOut.push_back(0xff);
-				SetCmdStat(CmdStat::DISCONNECTED);
-				break;
-		}
-
-		// If command was sent over SIO2 DMA, align g_Sio2FifoOut to the block size
-		if (g_Sio2.dmaBlockSize > 0)
-		{
-			const size_t dmaDiff = g_Sio2FifoOut.size() % g_Sio2.dmaBlockSize;
-
-			if (dmaDiff > 0)
-			{
-				const size_t padding = g_Sio2.dmaBlockSize - dmaDiff;
-
-				for (size_t i = 0; i < padding; i++)
-				{
-					g_Sio2FifoOut.push_back(0x00);
-				}
-			}
-		}
+		ProcessQueuedCommand(data);
 	}
+}
+
+void Sio2::WriteBytes(const u8* source, size_t bytes)
+{
+#if SIO2LOG_ENABLE
+	for (size_t i = 0; i < bytes; i++)
+		Write(source[i]);
+#else
+	if (bytes == 0)
+		return;
+
+	if (queueRead || queueComplete || dmaBlockSize == 0 || bytes != dmaBlockSize)
+	{
+		g_Sio2FifoIn.reserve(g_Sio2FifoIn.size() + bytes);
+		for (size_t i = 0; i < bytes; i++)
+			Write(source[i]);
+		return;
+	}
+
+	// No more queue positions to access, but the game is still sending us SIO2 writes. Lets ignore them.
+	if (queuePosition > CmdQueue.size())
+	{
+		Console.Warning("%s(%02X) Received data after exhausting all queue entries!", __FUNCTION__, source[0]);
+		return;
+	}
+
+	const u32 currentCmd = CmdQueue[queuePosition];
+	port = currentCmd & Sio2Cmd::PORT;
+	commandLength = (currentCmd >> 8) & Sio2Cmd::COMMAND_LENGTH_MASK;
+	queueRead = true;
+
+	// The freshly read cmd position had a length of 0, so we are done handling SIO2 commands until
+	// the next cmd writes.
+	if (commandLength == 0)
+	{
+		queueComplete = true;
+		g_Sio2FifoIn.clear();
+		return;
+	}
+
+	// If the prior command did not need to fully pop g_Sio2FifoIn, do so now,
+	// so that the next command isn't trying to read the last command's leftovers.
+	g_Sio2FifoIn.clear();
+	g_Sio2FifoIn.push_back(source, bytes);
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSio2FifoBulkWriteBytes += static_cast<u32>(bytes);
+#endif
+	ProcessQueuedCommand(source[bytes - 1]);
+#endif
 }
 
 u8 Sio2::Read()
@@ -618,6 +631,54 @@ void Sio2::ReadBytes(u8* destination, size_t bytes)
 	for (size_t i = copied; i < bytes; i++)
 		destination[i] = Read();
 #endif
+}
+
+void Sio2::ProcessQueuedCommand(u8 log_data)
+{
+	// Go ahead and prep so the next write triggers a load of the new cmd value.
+	g_Sio2.queueRead = false;
+	g_Sio2.queuePosition++;
+
+	// Check the SIO mode
+	const u8 sioMode = g_Sio2FifoIn.front();
+	g_Sio2FifoIn.pop_front();
+
+	switch (sioMode)
+	{
+		case SioMode::PAD:
+			this->Pad();
+			break;
+		case SioMode::MULTITAP:
+			this->Multitap();
+			break;
+		case SioMode::INFRARED:
+			this->Infrared();
+			break;
+		case SioMode::MEMCARD:
+			this->Memcard();
+			break;
+		default:
+			Console.Error("%s(%02X) Unhandled SIO mode %02X", __FUNCTION__, log_data, sioMode);
+			g_Sio2FifoOut.push_back(0xff);
+			SetCmdStat(CmdStat::DISCONNECTED);
+			break;
+	}
+
+	// If command was sent over SIO2 DMA, align g_Sio2FifoOut to the block size
+	if (g_Sio2.dmaBlockSize > 0)
+	{
+		const size_t dmaDiff = g_Sio2FifoOut.size() % g_Sio2.dmaBlockSize;
+
+		if (dmaDiff > 0)
+		{
+			const size_t padding = g_Sio2.dmaBlockSize - dmaDiff;
+
+			for (size_t i = 0; i < padding; i++)
+			{
+				g_Sio2FifoOut.push_back(0x00);
+			}
+		}
+	}
 }
 
 bool Sio2::DoState(StateWrapper& sw)

@@ -18,6 +18,7 @@ public:
 	u8 front() const;
 
 	void push_back(u8 value);
+	void push_back(const u8* source, size_t bytes);
 	void pop_front();
 	size_t pop_front(u8* destination, size_t bytes);
 	void clear();
@@ -83,10 +84,13 @@ public:
 	void Infrared();
 	void Memcard();
 
-	void ReserveWriteBytes(size_t bytes);
 	void Write(u8 data);
+	void WriteBytes(const u8* source, size_t bytes);
 	u8 Read();
 	void ReadBytes(u8* destination, size_t bytes);
+
+private:
+	void ProcessQueuedCommand(u8 log_data);
 };
 
 extern Sio2ByteFifo g_Sio2FifoIn;
