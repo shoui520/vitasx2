@@ -17,6 +17,7 @@ u32 g_qemuVuNopPairBurstSteps = 0;
 u32 g_qemuVuLowerDirectFastSteps = 0;
 u32 g_qemuVuUpperDirectFastSteps = 0;
 u32 g_qemuVuIbitFastSteps = 0;
+u32 g_qemuVuIbitBurstSteps = 0;
 u32 g_qemuVuLowerDirectBurstSteps = 0;
 u32 g_qemuVuUpperDirectBurstSteps = 0;
 u32 g_qemuVuPairedDirectBurstSteps = 0;
