@@ -2194,6 +2194,35 @@ namespace VUInterpFast
 		WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, result));
 	}
 
+	template <bool subtract, bool lane0, bool lane1, bool lane2, bool lane3, typename Operand>
+	static inline void ExecuteMaddMsubMaskPatternScalar(VURegs* VU, bool acc, unsigned fd, unsigned fs, Operand& operand)
+	{
+		if constexpr (lane0)
+			ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
+		else
+			ClearMacLane(VU, 0);
+		if constexpr (lane1)
+			ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
+		else
+			ClearMacLane(VU, 1);
+		if constexpr (lane2)
+			ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
+		else
+			ClearMacLane(VU, 2);
+		if constexpr (lane3)
+			ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
+		else
+			ClearMacLane(VU, 3);
+
+		VU_STAT_UPDATE(VU);
+#if defined(VITASX2_QEMU_VALIDATION)
+		if constexpr (lane0 && lane1 && lane2 && lane3)
+			++::g_qemuVuUpperScalarFullMaskOps;
+		else
+			++::g_qemuVuUpperScalarPartialMaskOps;
+#endif
+	}
+
 	template <bool subtract, typename Operand>
 	static inline void ExecuteMaddMsubMaskedScalar(VURegs* VU, u32 code, bool acc, Operand operand)
 	{
@@ -2204,63 +2233,54 @@ namespace VUInterpFast
 		switch (mask)
 		{
 			case 0x0f:
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
-				VU_STAT_UPDATE(VU);
-	#if defined(VITASX2_QEMU_VALIDATION)
-				++::g_qemuVuUpperScalarFullMaskOps;
-	#endif
+				ExecuteMaddMsubMaskPatternScalar<subtract, true, true, true, true>(VU, acc, fd, fs, operand);
 				return;
 			case 0x0e:
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
-				ClearMacLane(VU, 3);
-				break;
+				ExecuteMaddMsubMaskPatternScalar<subtract, true, true, true, false>(VU, acc, fd, fs, operand);
+				return;
 			case 0x0d:
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
-				ClearMacLane(VU, 2);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
-				break;
+				ExecuteMaddMsubMaskPatternScalar<subtract, true, true, false, true>(VU, acc, fd, fs, operand);
+				return;
+			case 0x0c:
+				ExecuteMaddMsubMaskPatternScalar<subtract, true, true, false, false>(VU, acc, fd, fs, operand);
+				return;
 			case 0x0b:
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
-				ClearMacLane(VU, 1);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
-				break;
+				ExecuteMaddMsubMaskPatternScalar<subtract, true, false, true, true>(VU, acc, fd, fs, operand);
+				return;
+			case 0x0a:
+				ExecuteMaddMsubMaskPatternScalar<subtract, true, false, true, false>(VU, acc, fd, fs, operand);
+				return;
+			case 0x09:
+				ExecuteMaddMsubMaskPatternScalar<subtract, true, false, false, true>(VU, acc, fd, fs, operand);
+				return;
+			case 0x08:
+				ExecuteMaddMsubMaskPatternScalar<subtract, true, false, false, false>(VU, acc, fd, fs, operand);
+				return;
 			case 0x07:
-				ClearMacLane(VU, 0);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
-				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
-				break;
-			default:
-				if (mask & 0x08)
-					ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
-				else
-					ClearMacLane(VU, 0);
-				if (mask & 0x04)
-					ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
-				else
-					ClearMacLane(VU, 1);
-				if (mask & 0x02)
-					ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
-				else
-					ClearMacLane(VU, 2);
-				if (mask & 0x01)
-					ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
-				else
-					ClearMacLane(VU, 3);
-				break;
+				ExecuteMaddMsubMaskPatternScalar<subtract, false, true, true, true>(VU, acc, fd, fs, operand);
+				return;
+			case 0x06:
+				ExecuteMaddMsubMaskPatternScalar<subtract, false, true, true, false>(VU, acc, fd, fs, operand);
+				return;
+			case 0x05:
+				ExecuteMaddMsubMaskPatternScalar<subtract, false, true, false, true>(VU, acc, fd, fs, operand);
+				return;
+			case 0x04:
+				ExecuteMaddMsubMaskPatternScalar<subtract, false, true, false, false>(VU, acc, fd, fs, operand);
+				return;
+			case 0x03:
+				ExecuteMaddMsubMaskPatternScalar<subtract, false, false, true, true>(VU, acc, fd, fs, operand);
+				return;
+			case 0x02:
+				ExecuteMaddMsubMaskPatternScalar<subtract, false, false, true, false>(VU, acc, fd, fs, operand);
+				return;
+			case 0x01:
+				ExecuteMaddMsubMaskPatternScalar<subtract, false, false, false, true>(VU, acc, fd, fs, operand);
+				return;
+			case 0x00:
+				ExecuteMaddMsubMaskPatternScalar<subtract, false, false, false, false>(VU, acc, fd, fs, operand);
+				return;
 		}
-
-		VU_STAT_UPDATE(VU);
-#if defined(VITASX2_QEMU_VALIDATION)
-		++::g_qemuVuUpperScalarPartialMaskOps;
-#endif
 	}
 
 	template <typename Operand>
