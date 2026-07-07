@@ -18,6 +18,7 @@ static constexpr size_t SPR_SCRATCH_BYTES = 16 * 1024;
 #if defined(VITASX2_QEMU_VALIDATION)
 extern u32 g_qemuSprCopyNeonQwords;
 extern u32 g_qemuSprCopyNeon64ByteGroups;
+extern u32 g_qemuSprCopyNeon256ByteGroups;
 extern u32 g_qemuSprCopyToScratchCalls;
 extern u32 g_qemuSprCopyFromScratchCalls;
 extern u32 g_qemuSprCopyWrappedToScratch;
@@ -31,6 +32,28 @@ static __forceinline bool SprCopyRangesOverlap(const void* dst, const void* src,
 	const std::uintptr_t s = reinterpret_cast<std::uintptr_t>(src);
 	return size != 0 && d < (s + size) && s < (d + size);
 }
+
+#if defined(ARCH_ARM32)
+static __forceinline void SprCopy64Bytes(u8* dst, const u8* src)
+{
+	const uint8x16_t qword0 = vld1q_u8(src);
+	const uint8x16_t qword1 = vld1q_u8(src + 16);
+	const uint8x16_t qword2 = vld1q_u8(src + 32);
+	const uint8x16_t qword3 = vld1q_u8(src + 48);
+	vst1q_u8(dst, qword0);
+	vst1q_u8(dst + 16, qword1);
+	vst1q_u8(dst + 32, qword2);
+	vst1q_u8(dst + 48, qword3);
+}
+
+static __forceinline void SprCopy256Bytes(u8* dst, const u8* src)
+{
+	SprCopy64Bytes(dst, src);
+	SprCopy64Bytes(dst + 64, src + 64);
+	SprCopy64Bytes(dst + 128, src + 128);
+	SprCopy64Bytes(dst + 192, src + 192);
+}
+#endif
 
 static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
 {
@@ -49,25 +72,30 @@ static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
 
 	u8* cdst = static_cast<u8*>(dst);
 	const u8* csrc = static_cast<const u8*>(src);
-	const size_t groups64 = size >> 6;
+	const size_t groups256 = size >> 8;
+	for (size_t i = 0; i < groups256; i++)
+	{
+		if ((i + 1) < groups256)
+			__builtin_prefetch(csrc + 256, 0, 1);
+
+		SprCopy256Bytes(cdst, csrc);
+		csrc += 256;
+		cdst += 256;
+	}
+
+	const size_t remaining_after_256 = size & 255;
+	const size_t groups64 = remaining_after_256 >> 6;
 	for (size_t i = 0; i < groups64; i++)
 	{
 		if ((i + 1) < groups64)
 			__builtin_prefetch(csrc + 64, 0, 1);
 
-		const uint8x16_t qword0 = vld1q_u8(csrc);
-		const uint8x16_t qword1 = vld1q_u8(csrc + 16);
-		const uint8x16_t qword2 = vld1q_u8(csrc + 32);
-		const uint8x16_t qword3 = vld1q_u8(csrc + 48);
-		vst1q_u8(cdst, qword0);
-		vst1q_u8(cdst + 16, qword1);
-		vst1q_u8(cdst + 32, qword2);
-		vst1q_u8(cdst + 48, qword3);
+		SprCopy64Bytes(cdst, csrc);
 		csrc += 64;
 		cdst += 64;
 	}
 
-	const size_t tail_bytes = size & 63;
+	const size_t tail_bytes = remaining_after_256 & 63;
 	const size_t tail_qwords = tail_bytes >> 4;
 	for (size_t i = 0; i < tail_qwords; i++)
 	{
@@ -89,8 +117,9 @@ static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
 		cdst[i] = csrc[i];
 
 #if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuSprCopyNeonQwords += static_cast<u32>((groups64 << 2) + tail_qwords);
-	g_qemuSprCopyNeon64ByteGroups += static_cast<u32>(groups64);
+	g_qemuSprCopyNeonQwords += static_cast<u32>((groups256 << 4) + (groups64 << 2) + tail_qwords);
+	g_qemuSprCopyNeon64ByteGroups += static_cast<u32>((groups256 << 2) + groups64);
+	g_qemuSprCopyNeon256ByteGroups += static_cast<u32>(groups256);
 #endif
 	return;
 #endif
