@@ -20,6 +20,7 @@ extern u32 g_qemuVuUpperDirectFastSteps;
 extern u32 g_qemuVuIbitFastSteps;
 extern u32 g_qemuVuLowerDirectBurstSteps;
 extern u32 g_qemuVuUpperDirectBurstSteps;
+extern u32 g_qemuVuPairedDirectBurstSteps;
 extern bool g_qemuVuLowerDirectFastEnabled;
 extern bool g_qemuVuUpperDirectFastEnabled;
 extern bool g_qemuVuLowerDirectBurstEnabled;
@@ -257,6 +258,138 @@ static u32 _vu0ExecUpperDirectLowerNopBurst(VURegs* VU, u32 max_cycles)
 	g_qemuVuUpperDirectFastSteps += steps;
 	g_qemuVuLowerNopFastSteps += steps;
 	g_qemuVuUpperDirectBurstSteps += steps;
+#endif
+	return steps;
+}
+
+static u32 _vu0ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
+{
+	if (max_cycles == 0 || Pcsx2Trace::IsVuTraceEnabled() ||
+		VU->branch != 0 || VU->ebit != 0 || VU->takedelaybranch ||
+		(VU->flags & VUFLAG_MFLAGSET))
+	{
+		return 0;
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (!g_qemuVuLowerDirectFastEnabled || !g_qemuVuUpperDirectFastEnabled ||
+		!g_qemuVuLowerDirectBurstEnabled || !g_qemuVuUpperDirectBurstEnabled)
+	{
+		return 0;
+	}
+#endif
+
+	u32 steps = 0;
+	const u64 start_cycle = VU->cycle;
+	while ((VU->cycle - start_cycle) < max_cycles &&
+		   (VU0.VI[REG_VPU_STAT].UL & 0x1) &&
+		   !(VU->flags & VUFLAG_MFLAGSET))
+	{
+		VU->VI[REG_TPC].UL &= VU0_PROGMASK;
+		const u32 pc = VU->VI[REG_TPC].UL;
+		const u32* ptr = reinterpret_cast<const u32*>(&VU->Micro[pc]);
+		const u32 lower = ptr[0];
+		const u32 upper = ptr[1];
+		if ((upper & 0xf8000000u) != 0 || _vu0IsUpperNop(upper) || _vu0IsLowerNop(lower))
+			break;
+
+		_VURegsNum uregs = {};
+		_VURegsNum lregs = {};
+		if (!VUInterpFast::AnalyzeUpperNoLower(upper, &uregs) || !_vu0CanBurstUpperDirect(uregs) ||
+			!VUInterpFast::AnalyzeLowerNoUpper(lower, &lregs) || !_vu0CanBurstLowerDirect(lregs))
+		{
+			break;
+		}
+
+		VECTOR _VF;
+		VECTOR _VFc;
+		REG_VI _VI;
+		REG_VI _VIc;
+		int vfreg = 0;
+		int vireg = 0;
+		int discard = 0;
+
+		// PCSX2 owners: VU0microInterp.cpp::_vu0Exec() paired upper/lower
+		// path and VUops.cpp pipe helpers. Keep the same upper-first issue,
+		// lower stale-read save/restore, same-register discard, and stall order.
+		VU->cycle++;
+		VU->VI[REG_TPC].UL = pc + 8;
+		VU->code = upper;
+
+		const u64 cyclesBeforeOp = VU->cycle - 1;
+		_vuTestUpperStalls(VU, &uregs);
+
+		VU->code = lower;
+		_vuTestLowerStalls(VU, &lregs);
+		_vuTestPipes(VU);
+
+		if (VU->VIBackupCycles > 0)
+			VU->VIBackupCycles -= std::min((u8)(VU->cycle - cyclesBeforeOp), VU->VIBackupCycles);
+		vu0branch = false;
+
+		if (uregs.VFwrite)
+		{
+			if (lregs.VFwrite == uregs.VFwrite)
+				discard = 1;
+			if (lregs.VFread0 == uregs.VFwrite || lregs.VFread1 == uregs.VFwrite)
+			{
+				_VF = VU->VF[uregs.VFwrite];
+				vfreg = uregs.VFwrite;
+			}
+		}
+		if (uregs.VIread & (1 << REG_CLIP_FLAG))
+		{
+			if (lregs.VIwrite & (1 << REG_CLIP_FLAG))
+				discard = 1;
+			if (lregs.VIread & (1 << REG_CLIP_FLAG))
+			{
+				_VI = VU0.VI[REG_CLIP_FLAG];
+				vireg = REG_CLIP_FLAG;
+			}
+		}
+
+		VU->code = upper;
+		IdebugUPPER(VU0);
+		VUInterpFast::ExecuteUpperNoLower(VU, upper);
+
+		if (discard == 0)
+		{
+			if (vfreg)
+			{
+				_VFc = VU->VF[vfreg];
+				VU->VF[vfreg] = _VF;
+			}
+			if (vireg)
+			{
+				_VIc = VU->VI[vireg];
+				VU->VI[vireg] = _VI;
+			}
+
+			IdebugLOWER(VU0);
+			VUInterpFast::ExecuteLowerNoUpper(VU, lower);
+
+			if (vfreg)
+				VU->VF[vfreg] = _VFc;
+			if (vireg)
+				VU->VI[vireg] = _VIc;
+		}
+
+		if (uregs.pipe == VUPIPE_FMAC || lregs.pipe == VUPIPE_FMAC)
+			_vuClearFMAC(VU);
+
+		_vuAddUpperStalls(VU, &uregs);
+		_vuAddLowerStalls(VU, &lregs);
+
+		if (uregs.pipe == VUPIPE_FMAC || lregs.pipe == VUPIPE_FMAC)
+			VU->fmacwritepos = (VU->fmacwritepos + 1) & 3;
+
+		steps++;
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuVuUpperDirectFastSteps += steps;
+	g_qemuVuLowerDirectFastSteps += steps;
+	g_qemuVuPairedDirectBurstSteps += steps;
 #endif
 	return steps;
 }
@@ -653,6 +786,8 @@ void InterpVU0::Execute(u32 cycles)
 		if (_vu0ExecUpperNopLowerDirectBurst(&VU0, remaining_cycles) != 0)
 			continue;
 		if (_vu0ExecUpperDirectLowerNopBurst(&VU0, remaining_cycles) != 0)
+			continue;
+		if (_vu0ExecUpperLowerDirectBurst(&VU0, remaining_cycles) != 0)
 			continue;
 
 		vu0Exec(&VU0);

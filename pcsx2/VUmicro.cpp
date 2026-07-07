@@ -19,6 +19,7 @@ u32 g_qemuVuUpperDirectFastSteps = 0;
 u32 g_qemuVuIbitFastSteps = 0;
 u32 g_qemuVuLowerDirectBurstSteps = 0;
 u32 g_qemuVuUpperDirectBurstSteps = 0;
+u32 g_qemuVuPairedDirectBurstSteps = 0;
 u32 g_qemuVuLowerNeonQwordOps = 0;
 u32 g_qemuVuUpperNeonQwordOps = 0;
 bool g_qemuVuLowerDirectFastEnabled = true;
