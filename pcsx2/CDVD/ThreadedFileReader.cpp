@@ -22,6 +22,7 @@ static constexpr u32 MINIMUM_SIZE = 128 * 1024;
 u32 g_qemuCdvdBlockCopyNeonQwords = 0;
 u32 g_qemuCdvdBlockCopyNeon64ByteGroups = 0;
 u32 g_qemuCdvdBlockCopyNeon256ByteGroups = 0;
+u32 g_qemuCdvdBlockCopyNeon1024ByteGroups = 0;
 #endif
 
 #if defined(VITASX2_QEMU_VALIDATION)
