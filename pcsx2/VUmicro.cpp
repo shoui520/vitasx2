@@ -37,6 +37,8 @@ u32 g_qemuVuDecodedLowerCacheHits = 0;
 u32 g_qemuVuDecodedLowerCacheMisses = 0;
 u32 g_qemuVuDecodedUpperExecuteHits = 0;
 u32 g_qemuVuDecodedLowerExecuteHits = 0;
+u32 g_qemuVuDecodedUpperBurstKindExecutes = 0;
+u32 g_qemuVuDecodedLowerBurstKindExecutes = 0;
 bool g_qemuVuLowerDirectFastEnabled = true;
 bool g_qemuVuUpperDirectFastEnabled = true;
 bool g_qemuVuLowerDirectBurstEnabled = true;
@@ -88,7 +90,7 @@ namespace
 	}
 } // namespace
 
-bool VuMicroAnalyzeUpperNoLowerCached(int idx, u32 pc, u32 code, _VURegsNum* regs)
+bool VuMicroAnalyzeUpperNoLowerCached(int idx, u32 pc, u32 code, _VURegsNum* regs, u8* kind)
 {
 	VuMicroDecodedEntry& entry = VuMicroDecodedEntryForPc(idx, pc);
 	if ((entry.flags & VU_DECODED_UPPER_VALID) != 0 && entry.upper == code)
@@ -100,6 +102,8 @@ bool VuMicroAnalyzeUpperNoLowerCached(int idx, u32 pc, u32 code, _VURegsNum* reg
 			return false;
 
 		*regs = entry.upper_regs;
+		if (kind)
+			*kind = static_cast<u8>(entry.upper_kind);
 		return true;
 	}
 
@@ -114,12 +118,14 @@ bool VuMicroAnalyzeUpperNoLowerCached(int idx, u32 pc, u32 code, _VURegsNum* reg
 	{
 		entry.flags |= VU_DECODED_UPPER_FAST;
 		*regs = entry.upper_regs;
+		if (kind)
+			*kind = static_cast<u8>(entry.upper_kind);
 	}
 	entry.flags |= VU_DECODED_UPPER_VALID;
 	return fast;
 }
 
-bool VuMicroAnalyzeLowerNoUpperCached(int idx, u32 pc, u32 code, _VURegsNum* regs)
+bool VuMicroAnalyzeLowerNoUpperCached(int idx, u32 pc, u32 code, _VURegsNum* regs, u8* kind)
 {
 	VuMicroDecodedEntry& entry = VuMicroDecodedEntryForPc(idx, pc);
 	if ((entry.flags & VU_DECODED_LOWER_VALID) != 0 && entry.lower == code)
@@ -131,6 +137,8 @@ bool VuMicroAnalyzeLowerNoUpperCached(int idx, u32 pc, u32 code, _VURegsNum* reg
 			return false;
 
 		*regs = entry.lower_regs;
+		if (kind)
+			*kind = static_cast<u8>(entry.lower_kind);
 		return true;
 	}
 
@@ -145,6 +153,8 @@ bool VuMicroAnalyzeLowerNoUpperCached(int idx, u32 pc, u32 code, _VURegsNum* reg
 	{
 		entry.flags |= VU_DECODED_LOWER_FAST;
 		*regs = entry.lower_regs;
+		if (kind)
+			*kind = static_cast<u8>(entry.lower_kind);
 	}
 	entry.flags |= VU_DECODED_LOWER_VALID;
 	return fast;

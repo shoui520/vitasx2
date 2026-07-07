@@ -167,8 +167,8 @@ extern recMicroVU1 CpuMicroVU1;
 extern BaseVUmicroCPU* CpuVU0;
 extern BaseVUmicroCPU* CpuVU1;
 
-extern bool VuMicroAnalyzeUpperNoLowerCached(int idx, u32 pc, u32 code, _VURegsNum* regs);
-extern bool VuMicroAnalyzeLowerNoUpperCached(int idx, u32 pc, u32 code, _VURegsNum* regs);
+extern bool VuMicroAnalyzeUpperNoLowerCached(int idx, u32 pc, u32 code, _VURegsNum* regs, u8* kind = nullptr);
+extern bool VuMicroAnalyzeLowerNoUpperCached(int idx, u32 pc, u32 code, _VURegsNum* regs, u8* kind = nullptr);
 extern void VuMicroExecuteUpperNoLowerCached(int idx, u32 pc, VURegs* VU, u32 code);
 extern void VuMicroExecuteLowerNoUpperCached(int idx, u32 pc, VURegs* VU, u32 code);
 extern void VuMicroInvalidateDecodedCache(int idx, u32 addr, u32 size);

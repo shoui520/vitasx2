@@ -27,11 +27,29 @@ extern u32 g_qemuVuIbitBurstSteps;
 extern u32 g_qemuVuLowerDirectBurstSteps;
 extern u32 g_qemuVuUpperDirectBurstSteps;
 extern u32 g_qemuVuPairedDirectBurstSteps;
+extern u32 g_qemuVuDecodedUpperBurstKindExecutes;
+extern u32 g_qemuVuDecodedLowerBurstKindExecutes;
 extern bool g_qemuVuLowerDirectFastEnabled;
 extern bool g_qemuVuUpperDirectFastEnabled;
 extern bool g_qemuVuLowerDirectBurstEnabled;
 extern bool g_qemuVuUpperDirectBurstEnabled;
 #endif
+
+static __fi void _vu1ExecuteUpperBurstKnownKind(VURegs* VU, u32 code, u8 kind)
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuVuDecodedUpperBurstKindExecutes;
+#endif
+	VUInterpFast::ExecuteUpperNoLowerKnownKind(VU, code, static_cast<VUInterpFast::UpperFastKind>(kind));
+}
+
+static __fi void _vu1ExecuteLowerBurstKnownKind(VURegs* VU, u32 code, u8 kind)
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuVuDecodedLowerBurstKindExecutes;
+#endif
+	VUInterpFast::ExecuteLowerNoUpperKnownKind(VU, code, static_cast<VUInterpFast::LowerFastKind>(kind));
+}
 
 void _vu1ExecUpper(VURegs* VU, u32* ptr)
 {
@@ -215,7 +233,8 @@ static u32 _vu1ExecUpperNopLowerDirectBurst(VURegs* VU, u32 max_cycles)
 			break;
 
 		_VURegsNum lregs = {};
-		if (!VuMicroAnalyzeLowerNoUpperCached(1, pc, lower, &lregs) || !_vu1CanBurstUpperNopLowerDirect(lregs))
+		u8 lower_kind = 0;
+		if (!VuMicroAnalyzeLowerNoUpperCached(1, pc, lower, &lregs, &lower_kind) || !_vu1CanBurstUpperNopLowerDirect(lregs))
 			break;
 
 		// PCSX2 owners: VU1microInterp.cpp::vu1Exec() upper-NOP path,
@@ -234,7 +253,7 @@ static u32 _vu1ExecUpperNopLowerDirectBurst(VURegs* VU, u32 max_cycles)
 			VU->VIBackupCycles -= std::min((u8)(VU->cycle - cyclesBeforeOp), VU->VIBackupCycles);
 
 		IdebugLOWER(VU1);
-		VuMicroExecuteLowerNoUpperCached(1, pc, VU, lower);
+		_vu1ExecuteLowerBurstKnownKind(VU, lower, lower_kind);
 
 		if (lregs.pipe == VUPIPE_FMAC)
 			_vuClearFMAC(VU);
@@ -281,7 +300,8 @@ static u32 _vu1ExecUpperDirectLowerNopBurst(VURegs* VU, u32 max_cycles)
 			break;
 
 		_VURegsNum uregs = {};
-		if (!VuMicroAnalyzeUpperNoLowerCached(1, pc, upper, &uregs) || !_vu1CanBurstUpperDirect(uregs))
+		u8 upper_kind = 0;
+		if (!VuMicroAnalyzeUpperNoLowerCached(1, pc, upper, &uregs, &upper_kind) || !_vu1CanBurstUpperDirect(uregs))
 			break;
 
 		// PCSX2 owners: VU1microInterp.cpp::vu1Exec() lower-NOP path,
@@ -299,7 +319,7 @@ static u32 _vu1ExecUpperDirectLowerNopBurst(VURegs* VU, u32 max_cycles)
 			VU->VIBackupCycles -= std::min((u8)(VU->cycle - cyclesBeforeOp), VU->VIBackupCycles);
 
 		IdebugUPPER(VU1);
-		VuMicroExecuteUpperNoLowerCached(1, pc, VU, upper);
+		_vu1ExecuteUpperBurstKnownKind(VU, upper, upper_kind);
 		VU->code = lower;
 
 		if (uregs.pipe == VUPIPE_FMAC)
@@ -351,8 +371,10 @@ static u32 _vu1ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 
 		_VURegsNum uregs = {};
 		_VURegsNum lregs = {};
-		if (!VuMicroAnalyzeUpperNoLowerCached(1, pc, upper, &uregs) || !_vu1CanBurstUpperDirect(uregs) ||
-			!VuMicroAnalyzeLowerNoUpperCached(1, pc, lower, &lregs) || !_vu1CanBurstLowerDirect(lregs))
+		u8 upper_kind = 0;
+		u8 lower_kind = 0;
+		if (!VuMicroAnalyzeUpperNoLowerCached(1, pc, upper, &uregs, &upper_kind) || !_vu1CanBurstUpperDirect(uregs) ||
+			!VuMicroAnalyzeLowerNoUpperCached(1, pc, lower, &lregs, &lower_kind) || !_vu1CanBurstLowerDirect(lregs))
 		{
 			break;
 		}
@@ -406,7 +428,7 @@ static u32 _vu1ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 
 		VU->code = upper;
 		IdebugUPPER(VU1);
-		VuMicroExecuteUpperNoLowerCached(1, pc, VU, upper);
+		_vu1ExecuteUpperBurstKnownKind(VU, upper, upper_kind);
 
 		if (discard == 0)
 		{
@@ -422,7 +444,7 @@ static u32 _vu1ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 			}
 
 			IdebugLOWER(VU1);
-			VuMicroExecuteLowerNoUpperCached(1, pc, VU, lower);
+			_vu1ExecuteLowerBurstKnownKind(VU, lower, lower_kind);
 
 			if (vfreg)
 				VU->VF[vfreg] = _VFc;
@@ -475,7 +497,8 @@ static u32 _vu1ExecIbitDirectBurst(VURegs* VU, u32 max_cycles)
 			break;
 
 		_VURegsNum uregs = {};
-		if (!VuMicroAnalyzeUpperNoLowerCached(1, pc, upper, &uregs) ||
+		u8 upper_kind = 0;
+		if (!VuMicroAnalyzeUpperNoLowerCached(1, pc, upper, &uregs, &upper_kind) ||
 			(uregs.pipe != VUPIPE_NONE && uregs.pipe != VUPIPE_FMAC))
 		{
 			break;
@@ -496,7 +519,7 @@ static u32 _vu1ExecIbitDirectBurst(VURegs* VU, u32 max_cycles)
 			VU->VIBackupCycles -= std::min((u8)(VU->cycle - cyclesBeforeOp), VU->VIBackupCycles);
 
 		IdebugUPPER(VU1);
-		VuMicroExecuteUpperNoLowerCached(1, pc, VU, upper);
+		_vu1ExecuteUpperBurstKnownKind(VU, upper, upper_kind);
 		VU->VI[REG_I].UL = ptr[0];
 
 		if (uregs.pipe == VUPIPE_FMAC)
