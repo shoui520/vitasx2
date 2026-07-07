@@ -2728,10 +2728,21 @@ namespace VUInterpFast
 			0.096420042216778f, -0.055909886956215f, 0.021861229091883f, -0.004054057877511f,
 			0.785398185253143f};
 
-		float result = (eatanconst[0] * input) + (eatanconst[1] * std::pow(input, 3)) +
-			(eatanconst[2] * std::pow(input, 5)) + (eatanconst[3] * std::pow(input, 7)) +
-			(eatanconst[4] * std::pow(input, 9)) + (eatanconst[5] * std::pow(input, 11)) +
-			(eatanconst[6] * std::pow(input, 13)) + (eatanconst[7] * std::pow(input, 15));
+		// PCSX2 owner: VUops.cpp::_vuCalculateEATAN(). The exponents are
+		// fixed small integers; avoid libm pow() in the VU lower fast path.
+		const double x = input;
+		const double x2 = x * x;
+		const double x3 = x * x2;
+		const double x5 = x3 * x2;
+		const double x7 = x5 * x2;
+		const double x9 = x7 * x2;
+		const double x11 = x9 * x2;
+		const double x13 = x11 * x2;
+		const double x15 = x13 * x2;
+		float result = static_cast<float>(static_cast<double>(eatanconst[0] * input) + (eatanconst[1] * x3) +
+			(eatanconst[2] * x5) + (eatanconst[3] * x7) +
+			(eatanconst[4] * x9) + (eatanconst[5] * x11) +
+			(eatanconst[6] * x13) + (eatanconst[7] * x15));
 		result += eatanconst[8];
 		return VuDouble(FloatToBits(result));
 	}
@@ -3242,9 +3253,15 @@ namespace VUInterpFast
 				static constexpr float sinconsts[5] = {
 					1.0f, -0.166666567325592f, 0.008333025500178f, -0.000198074136279f, 0.000002601886990f};
 				float p = VuLane(VU, Fs(code), Fsf(code));
-				p = (sinconsts[0] * p) + (sinconsts[1] * std::pow(p, 3)) +
-					(sinconsts[2] * std::pow(p, 5)) + (sinconsts[3] * std::pow(p, 7)) +
-					(sinconsts[4] * std::pow(p, 9));
+				const double x = p;
+				const double x2 = x * x;
+				const double x3 = x * x2;
+				const double x5 = x3 * x2;
+				const double x7 = x5 * x2;
+				const double x9 = x7 * x2;
+				p = static_cast<float>(static_cast<double>(sinconsts[0] * p) + (sinconsts[1] * x3) +
+					(sinconsts[2] * x5) + (sinconsts[3] * x7) +
+					(sinconsts[4] * x9));
 				VU->p.F = VuDouble(FloatToBits(p));
 				return;
 			}
@@ -3257,10 +3274,17 @@ namespace VUInterpFast
 					0.249998688697815f, 0.031257584691048f, 0.002591371303424f,
 					0.000171562001924f, 0.000005430199963f, 0.000000690600018f};
 				float p = VuLane(VU, Fs(code), Fsf(code));
-				p = 1.0f + (consts[0] * p) + (consts[1] * std::pow(p, 2)) +
-					(consts[2] * std::pow(p, 3)) + (consts[3] * std::pow(p, 4)) +
-					(consts[4] * std::pow(p, 5)) + (consts[5] * std::pow(p, 6));
-				p = std::pow(p, 4);
+				const double x = p;
+				const double x2 = x * x;
+				const double x3 = x2 * x;
+				const double x4 = x2 * x2;
+				const double x5 = x4 * x;
+				const double x6 = x3 * x3;
+				p = static_cast<float>(static_cast<double>(1.0f + (consts[0] * p)) + (consts[1] * x2) +
+					(consts[2] * x3) + (consts[3] * x4) +
+					(consts[4] * x5) + (consts[5] * x6));
+				const double p2 = static_cast<double>(p) * p;
+				p = static_cast<float>(p2 * p2);
 				p = VuDouble(FloatToBits(p));
 				p = 1.0f / p;
 				VU->p.F = p;
