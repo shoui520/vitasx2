@@ -21,6 +21,10 @@ u32 g_qemuSpu2DmaCopyNeon64ByteGroups = 0;
 u32 g_qemuSpu2DmaCopyNeon128ByteGroups = 0;
 u32 g_qemuSpu2DmaCopyNeon256ByteGroups = 0;
 u32 g_qemuSpu2DmaCopyNeon1024ByteGroups = 0;
+u32 g_qemuSpu2DmaCopyExactSpanCopies = 0;
+u32 g_qemuSpu2DmaCopyExact512ByteCopies = 0;
+u32 g_qemuSpu2DmaCopyExact1024ByteCopies = 0;
+u32 g_qemuSpu2DmaCopyExact2048ByteCopies = 0;
 #endif
 
 #if defined(ARCH_ARM32)
@@ -56,7 +60,26 @@ static __forceinline void Spu2DmaCopy1024Bytes(u8* dst, const u8* src)
 	Spu2DmaCopy256Bytes(dst + 768, src + 768);
 }
 
-static __forceinline void Spu2DmaCountNeonCopy(u32 qwords, u32 groups64, u32 groups128, u32 groups256, u32 groups1024)
+static __forceinline void Spu2DmaCopy2048Bytes(u8* dst, const u8* src)
+{
+	Spu2DmaCopy1024Bytes(dst, src);
+	Spu2DmaCopy1024Bytes(dst + 1024, src + 1024);
+}
+
+static __forceinline void Spu2DmaCopy512Bytes(u8* dst, const u8* src)
+{
+	Spu2DmaCopy256Bytes(dst, src);
+	Spu2DmaCopy256Bytes(dst + 256, src + 256);
+}
+
+static __forceinline void Spu2DmaCountNeonCopy(
+	u32 qwords,
+	u32 groups64,
+	u32 groups128,
+	u32 groups256,
+	u32 groups1024,
+	bool exact_span = false,
+	u32 exact_bytes = 0)
 {
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuSpu2DmaCopyNeonQwords += qwords;
@@ -64,6 +87,24 @@ static __forceinline void Spu2DmaCountNeonCopy(u32 qwords, u32 groups64, u32 gro
 	g_qemuSpu2DmaCopyNeon128ByteGroups += groups128;
 	g_qemuSpu2DmaCopyNeon256ByteGroups += groups256;
 	g_qemuSpu2DmaCopyNeon1024ByteGroups += groups1024;
+	if (exact_span)
+	{
+		++g_qemuSpu2DmaCopyExactSpanCopies;
+		if (exact_bytes == 512)
+			++g_qemuSpu2DmaCopyExact512ByteCopies;
+		else if (exact_bytes == 1024)
+			++g_qemuSpu2DmaCopyExact1024ByteCopies;
+		else if (exact_bytes == 2048)
+			++g_qemuSpu2DmaCopyExact2048ByteCopies;
+	}
+#else
+	(void)qwords;
+	(void)groups64;
+	(void)groups128;
+	(void)groups256;
+	(void)groups1024;
+	(void)exact_span;
+	(void)exact_bytes;
 #endif
 }
 #endif
@@ -73,6 +114,40 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 #if defined(ARCH_ARM32)
 	u8* dst = static_cast<u8*>(to);
 	const u8* src = static_cast<const u8*>(from);
+
+	// PCSX2 owner: SPU2/Dma.cpp::AutoDMAReadBuffer()/FinishDMAwrite()/
+	// FinishDMAread(). Common SPU2 DMA spans are fixed-size byte jobs, so keep
+	// them out of the grouped remainder loop on Cortex-A9.
+	switch (bytes)
+	{
+		case 2048:
+			Spu2DmaCopy2048Bytes(dst, src);
+			Spu2DmaCountNeonCopy(128, 32, 16, 8, 2, true, 2048);
+			return;
+		case 1024:
+			Spu2DmaCopy1024Bytes(dst, src);
+			Spu2DmaCountNeonCopy(64, 16, 8, 4, 1, true, 1024);
+			return;
+		case 512:
+			Spu2DmaCopy512Bytes(dst, src);
+			Spu2DmaCountNeonCopy(32, 8, 4, 2, 0, true, 512);
+			return;
+		case 256:
+			Spu2DmaCopy256Bytes(dst, src);
+			Spu2DmaCountNeonCopy(16, 4, 2, 1, 0, true, 256);
+			return;
+		case 128:
+			Spu2DmaCopy128Bytes(dst, src);
+			Spu2DmaCountNeonCopy(8, 2, 1, 0, 0, true, 128);
+			return;
+		case 64:
+			Spu2DmaCopy64Bytes(dst, src);
+			Spu2DmaCountNeonCopy(4, 1, 0, 0, 0, true, 64);
+			return;
+		default:
+			break;
+	}
+
 	const u32 groups1024 = bytes >> 10;
 	for (u32 i = 0; i < groups1024; i++)
 	{
