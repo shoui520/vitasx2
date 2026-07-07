@@ -6601,39 +6601,6 @@ namespace VitaEE
 			   EmitCOP2MacroStoreVfSelectedLanes(ft, mask, NEON_VALUE, HOST_TMP1);
 	}
 
-	bool BlockCompiler::EmitCOP2MacroMinMaxSelect(bool take_max)
-	{
-		const auto emit_signed_select = [&](bool select_max) {
-			return m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL, 0) &&
-				   m_code.EmitCmpReg(HOST_TMP2, HOST_TMP3) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP3, VitaA32::ShiftType::LSL, 0,
-					   false, select_max ? VitaA32::Condition::LT : VitaA32::Condition::GE);
-		};
-
-		if (!m_code.EmitAndReg(HOST_TMP4, HOST_TMP2, HOST_TMP3, true))
-			return false;
-
-		const size_t both_negative = m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
-		if (both_negative == static_cast<size_t>(-1))
-			return false;
-
-		if (!emit_signed_select(take_max))
-			return false;
-
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t both_negative_target = m_code.Size();
-		if (!m_code.PatchBranch(both_negative, both_negative_target, VitaA32::Condition::MI) ||
-			!emit_signed_select(!take_max))
-		{
-			return false;
-		}
-
-		return m_code.PatchBranch(done, m_code.Size());
-	}
-
 	bool BlockCompiler::EmitCOP2MacroMinMaxBody(u32 op)
 	{
 		// PCSX2 owner: VUops.cpp::fp_max()/fp_min(). Those helpers compare
@@ -6648,45 +6615,56 @@ namespace VitaEE
 		if (fd == 0 || mask == 0)
 			return true;
 
+		constexpr unsigned NEON_FS = 0;
+		constexpr unsigned NEON_OPERAND = 1;
+		constexpr unsigned NEON_SIGNED_MIN = 2;
+		constexpr unsigned NEON_SIGNED_MAX = 3;
+		constexpr unsigned NEON_BOTH_NEGATIVE = 4;
 		if (!EmitVu0VfAddress(HOST_TMP0, RD(op)) ||
-			!EmitVu0VfAddress(HOST_TMP1, fd))
+			!m_code.EmitVld1Q32Aligned(NEON_FS, HOST_TMP0))
 		{
 			return false;
 		}
 
 		if (minmax.immediate_operand)
 		{
-			if (!EmitVu0ViAddress(HOST_TMP5, VU0_REG_I))
+			if (!EmitVu0ViAddress(HOST_TMP5, VU0_REG_I) ||
+				!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP5, 0) ||
+				!m_code.EmitVdupI32QFromCore(NEON_OPERAND, HOST_TMP2))
+			{
 				return false;
+			}
 		}
-		else if (!EmitVu0VfAddress(HOST_TMP5, RT(op)))
+		else if (minmax.vector_operand)
 		{
-			return false;
+			if (!EmitVu0VfAddress(HOST_TMP5, RT(op)) ||
+				!m_code.EmitVld1Q32Aligned(NEON_OPERAND, HOST_TMP5))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			if (!EmitVu0VfAddress(HOST_TMP5, RT(op)) ||
+				!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP5,
+					static_cast<u16>(minmax.broadcast_lane * sizeof(u32))) ||
+				!m_code.EmitVdupI32QFromCore(NEON_OPERAND, HOST_TMP2))
+			{
+				return false;
+			}
 		}
 
-		const auto emit_lane = [&](unsigned lane) {
-			const u16 dest_offset = static_cast<u16>(lane * sizeof(u32));
-			const u16 operand_offset = static_cast<u16>(
-				minmax.vector_operand ? dest_offset :
-				minmax.immediate_operand ? 0 :
-				minmax.broadcast_lane * sizeof(u32));
-
-			return m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, dest_offset) &&
-				   m_code.EmitLdrImm12(HOST_TMP3, HOST_TMP5, operand_offset) &&
-				   EmitCOP2MacroMinMaxSelect(minmax.take_max) &&
-				   m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, dest_offset);
-		};
-
-		if ((mask & 0x8) && !emit_lane(0))
-			return false;
-		if ((mask & 0x4) && !emit_lane(1))
-			return false;
-		if ((mask & 0x2) && !emit_lane(2))
-			return false;
-		if ((mask & 0x1) && !emit_lane(3))
-			return false;
-
-		return true;
+		const unsigned negative_result = minmax.take_max ? NEON_SIGNED_MIN : NEON_SIGNED_MAX;
+		const unsigned default_result = minmax.take_max ? NEON_SIGNED_MAX : NEON_SIGNED_MIN;
+		return m_code.EmitVminS32Q(NEON_SIGNED_MIN, NEON_FS, NEON_OPERAND) &&
+			   m_code.EmitVmaxS32Q(NEON_SIGNED_MAX, NEON_FS, NEON_OPERAND) &&
+			   m_code.EmitVandQ(NEON_BOTH_NEGATIVE, NEON_FS, NEON_OPERAND) &&
+			   m_code.EmitVshrS32Q(NEON_BOTH_NEGATIVE, NEON_BOTH_NEGATIVE, 31) &&
+			   m_code.EmitVandQ(NEON_FS, negative_result, NEON_BOTH_NEGATIVE) &&
+			   m_code.EmitVmvnQ(NEON_BOTH_NEGATIVE, NEON_BOTH_NEGATIVE) &&
+			   m_code.EmitVandQ(NEON_OPERAND, default_result, NEON_BOTH_NEGATIVE) &&
+			   m_code.EmitVorrQ(NEON_FS, NEON_FS, NEON_OPERAND) &&
+			   EmitCOP2MacroStoreVfSelectedLanes(fd, mask, NEON_FS, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitCOP2MacroFast(u32 op, u32 next_pc,

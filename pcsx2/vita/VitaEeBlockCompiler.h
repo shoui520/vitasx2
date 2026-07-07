@@ -220,7 +220,6 @@ namespace VitaEE
 		bool EmitCOP2MacroFtoiBody(u32 op);
 		bool EmitCOP2MacroFdivBody(u32 op);
 		bool EmitCOP2MacroMoveBody(u32 op);
-		bool EmitCOP2MacroMinMaxSelect(bool take_max);
 		bool EmitCOP2MacroMinMaxBody(u32 op);
 		bool EmitCOP2MacroFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
