@@ -12,12 +12,134 @@
 #include "Sif.h"
 #include "DEV9/DEV9.h"
 
+#include <algorithm>
+#include <array>
+
 using namespace R3000A;
 
 // Dma0/1   in Mdec.c
 // Dma3     in CdRom.c
 // Dma8     in PsxSpd.c
 // Dma11/12 in PsxSio2.c
+
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuSio2Dma11FastBlocks = 0;
+u32 g_qemuSio2Dma11FastBytes = 0;
+u32 g_qemuSio2Dma11FallbackBytes = 0;
+u32 g_qemuSio2Dma12FastBlocks = 0;
+u32 g_qemuSio2Dma12FastBytes = 0;
+u32 g_qemuSio2Dma12FallbackBytes = 0;
+#endif
+
+static bool IopDmaCanAccessDirectIopRam(u32 mem, u32 size)
+{
+	const u32 phys = mem & 0x1fffffffu;
+	return phys <= Ps2MemSize::TotalIopRam && size <= (Ps2MemSize::TotalIopRam - phys);
+}
+
+static void Sio2Dma11TransferBytewise(u32& madr, u32 bytes)
+{
+	while (bytes > 0)
+	{
+		const u8 data = iopMemRead8(madr);
+		g_Sio2.Write(data);
+		madr++;
+		bytes--;
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuSio2Dma11FallbackBytes;
+#endif
+	}
+}
+
+static void Sio2Dma11TransferBlock(u32& madr, u32 bytes)
+{
+	std::array<u8, 256> buffer;
+	u32 remaining = bytes;
+	bool used_fast_path = false;
+
+	while (remaining > 0)
+	{
+		const u32 chunk = std::min<u32>(static_cast<u32>(buffer.size()), remaining);
+		if (!IopDmaCanAccessDirectIopRam(madr, chunk) ||
+			!iopMemSafeReadBytes(madr & 0x1fffffffu, buffer.data(), chunk))
+		{
+			Sio2Dma11TransferBytewise(madr, remaining);
+			return;
+		}
+
+		for (u32 i = 0; i < chunk; i++)
+			g_Sio2.Write(buffer[i]);
+
+		madr += chunk;
+		remaining -= chunk;
+		used_fast_path = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSio2Dma11FastBytes += chunk;
+#endif
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (used_fast_path)
+		++g_qemuSio2Dma11FastBlocks;
+#endif
+}
+
+static void Sio2DmaWriteBufferBytewise(u32& madr, const u8* data, u32 bytes)
+{
+	for (u32 i = 0; i < bytes; i++)
+	{
+		iopMemWrite8(madr, data[i]);
+		madr++;
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuSio2Dma12FallbackBytes;
+#endif
+	}
+}
+
+static void Sio2Dma12TransferBlock(u32& madr, u32 bytes)
+{
+	std::array<u8, 256> buffer;
+	u32 remaining = bytes;
+	bool used_fast_path = false;
+
+	while (remaining > 0)
+	{
+		const u32 chunk = std::min<u32>(static_cast<u32>(buffer.size()), remaining);
+		if (!IopDmaCanAccessDirectIopRam(madr, chunk))
+		{
+			const u8 data = g_Sio2.Read();
+			iopMemWrite8(madr, data);
+			madr++;
+			remaining--;
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuSio2Dma12FallbackBytes;
+#endif
+			continue;
+		}
+
+		for (u32 i = 0; i < chunk; i++)
+			buffer[i] = g_Sio2.Read();
+
+		if (!iopMemSafeWriteBytes(madr & 0x1fffffffu, buffer.data(), chunk))
+		{
+			Sio2DmaWriteBufferBytewise(madr, buffer.data(), chunk);
+			remaining -= chunk;
+			continue;
+		}
+
+		madr += chunk;
+		remaining -= chunk;
+		used_fast_path = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSio2Dma12FastBytes += chunk;
+#endif
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (used_fast_path)
+		++g_qemuSio2Dma12FastBlocks;
+#endif
+}
 
 static void psxDmaGeneric(u32 madr, u32 bcr, u32 chcr, u32 spuCore)
 {
@@ -202,7 +324,6 @@ void psxDma10(u32 madr, u32 bcr, u32 chcr)
 
 void psxDma11(u32 madr, u32 bcr, u32 chcr)
 {
-	unsigned int i, j;
 	int size = (bcr >> 16) * (bcr & 0xffff);
 	PSXDMA_LOG("*** DMA 11 - SIO2 in *** %lx addr = %lx size = %lx", chcr, madr, bcr);
 	// Set dmaBlockSize, so SIO2 knows to count based on the DMA block rather than SEND3 length.
@@ -214,15 +335,9 @@ void psxDma11(u32 madr, u32 bcr, u32 chcr)
 		return;
 	}
 
-	for (i = 0; i < (bcr >> 16); i++)
-	{
-		for (j = 0; j < ((bcr & 0xFFFF) * 4); j++)
-		{
-			const u8 data = iopMemRead8(madr);
-			g_Sio2.Write(data);
-			madr++;
-		}
-	}
+	const u32 block_bytes = (bcr & 0xffff) * 4;
+	for (u32 i = 0; i < (bcr >> 16); i++)
+		Sio2Dma11TransferBlock(madr, block_bytes);
 
 	HW_DMA11_MADR = madr;
 	PSX_INT(IopEvt_Dma11, (size >> 2));
@@ -247,15 +362,7 @@ void psxDma12(u32 madr, u32 bcr, u32 chcr)
 		return;
 	}
 
-	bcr = size;
-
-	while (bcr > 0)
-	{
-		const u8 data = g_Sio2.Read();
-		iopMemWrite8(madr, data);
-		bcr--;
-		madr++;
-	}
+	Sio2Dma12TransferBlock(madr, static_cast<u32>(size));
 
 	HW_DMA12_MADR = madr;
 	PSX_INT(IopEvt_Dma12, (size >> 2));
