@@ -30,6 +30,7 @@ vifOp(vifCode_Null);
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuVifMpgNeonQwords = 0;
 u32 g_qemuVifMpgNeon64ByteGroups = 0;
+u32 g_qemuVifMpgNeon128ByteGroups = 0;
 u32 g_qemuVifMpgNeon256ByteGroups = 0;
 u32 g_qemuVifMpgNeon1024ByteGroups = 0;
 #endif
@@ -47,12 +48,16 @@ static __forceinline void VifMpgCopy64Bytes(u8* dst, const u8* src)
 	vst1q_u8(dst + 48, qword3);
 }
 
-static __forceinline void VifMpgCopy256Bytes(u8* dst, const u8* src)
+static __forceinline void VifMpgCopy128Bytes(u8* dst, const u8* src)
 {
 	VifMpgCopy64Bytes(dst, src);
 	VifMpgCopy64Bytes(dst + 64, src + 64);
-	VifMpgCopy64Bytes(dst + 128, src + 128);
-	VifMpgCopy64Bytes(dst + 192, src + 192);
+}
+
+static __forceinline void VifMpgCopy256Bytes(u8* dst, const u8* src)
+{
+	VifMpgCopy128Bytes(dst, src);
+	VifMpgCopy128Bytes(dst + 128, src + 128);
 }
 
 static __forceinline void VifMpgCopy1024Bytes(u8* dst, const u8* src)
@@ -63,11 +68,12 @@ static __forceinline void VifMpgCopy1024Bytes(u8* dst, const u8* src)
 	VifMpgCopy256Bytes(dst + 768, src + 768);
 }
 
-static __forceinline void VifMpgCountNeonCopy(size_t qwords, size_t groups64, size_t groups256, size_t groups1024)
+static __forceinline void VifMpgCountNeonCopy(size_t qwords, size_t groups64, size_t groups128, size_t groups256, size_t groups1024)
 {
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuVifMpgNeonQwords += static_cast<u32>(qwords);
 	g_qemuVifMpgNeon64ByteGroups += static_cast<u32>(groups64);
+	g_qemuVifMpgNeon128ByteGroups += static_cast<u32>(groups128);
 	g_qemuVifMpgNeon256ByteGroups += static_cast<u32>(groups256);
 	g_qemuVifMpgNeon1024ByteGroups += static_cast<u32>(groups1024);
 #endif
@@ -103,7 +109,19 @@ static __forceinline void VifMpgCopyBytes(void* dst, const void* src, size_t siz
 	}
 
 	const size_t tail_after_256 = tail_after_1024 & 255;
-	const size_t tail_groups64 = tail_after_256 >> 6;
+	const size_t groups128 = tail_after_256 >> 7;
+	for (size_t i = 0; i < groups128; i++)
+	{
+		if ((i + 1) < groups128)
+			__builtin_prefetch(csrc + 128, 0, 1);
+
+		VifMpgCopy128Bytes(cdst, csrc);
+		csrc += 128;
+		cdst += 128;
+	}
+
+	const size_t tail_after_128 = tail_after_256 & 127;
+	const size_t tail_groups64 = tail_after_128 >> 6;
 	for (size_t i = 0; i < tail_groups64; i++)
 	{
 		VifMpgCopy64Bytes(cdst, csrc);
@@ -111,7 +129,7 @@ static __forceinline void VifMpgCopyBytes(void* dst, const void* src, size_t siz
 		cdst += 64;
 	}
 
-	const size_t tail_bytes = tail_after_256 & 63;
+	const size_t tail_bytes = tail_after_128 & 63;
 	const size_t tail_qwords = tail_bytes >> 4;
 	for (size_t i = 0; i < tail_qwords; i++)
 	{
@@ -131,8 +149,9 @@ static __forceinline void VifMpgCopyBytes(void* dst, const void* src, size_t siz
 	for (size_t i = 0; i < (tail_bytes & 7); i++)
 		cdst[i] = csrc[i];
 
-	VifMpgCountNeonCopy((groups1024 << 6) + (groups256 << 4) + (tail_groups64 << 2) + tail_qwords,
-		(groups1024 << 4) + (groups256 << 2) + tail_groups64,
+	VifMpgCountNeonCopy((groups1024 << 6) + (groups256 << 4) + (groups128 << 3) + (tail_groups64 << 2) + tail_qwords,
+		(groups1024 << 4) + (groups256 << 2) + (groups128 << 1) + tail_groups64,
+		(groups1024 << 3) + (groups256 << 1) + groups128,
 		(groups1024 << 2) + groups256,
 		groups1024);
 	return;
