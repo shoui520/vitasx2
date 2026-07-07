@@ -1790,6 +1790,21 @@ namespace VUInterpFast
 		return vreinterpretq_f32_u32(VuDoubleBitsNeon(bits));
 	}
 
+	static inline void ApplyTriAceAddHackNeon(uint32x4_t& fs_bits, uint32x4_t& operand_bits)
+	{
+		// PCSX2 owner: VUops.cpp::vuADD_TriAceHack(). Preserve sign-only
+		// tiny operands before vuDouble() normalization and NEON addition.
+		const uint32x4_t exponent_mask = vdupq_n_u32(0x7f800000u);
+		const uint32x4_t sign_mask = vdupq_n_u32(0x80000000u);
+		const int32x4_t fs_exp = vreinterpretq_s32_u32(vshrq_n_u32(vandq_u32(fs_bits, exponent_mask), 23));
+		const int32x4_t operand_exp = vreinterpretq_s32_u32(vshrq_n_u32(vandq_u32(operand_bits, exponent_mask), 23));
+		const int32x4_t diff = vsubq_s32(fs_exp, operand_exp);
+		const uint32x4_t tiny_operand = vcgeq_s32(diff, vdupq_n_s32(25));
+		const uint32x4_t tiny_fs = vcgeq_s32(vdupq_n_s32(-25), diff);
+		fs_bits = vbslq_u32(tiny_fs, vandq_u32(fs_bits, sign_mask), fs_bits);
+		operand_bits = vbslq_u32(tiny_operand, vandq_u32(operand_bits, sign_mask), operand_bits);
+	}
+
 	static inline float VuSumXYZSquaresNeon(VURegs* VU, unsigned reg)
 	{
 		const float32x4_t value = VuFloatQNeon(vld1q_u32(VU->VF[reg].UL));
@@ -1836,13 +1851,17 @@ namespace VUInterpFast
 #endif
 	}
 
-	static inline bool ExecuteAddSubMaskedNeon(VURegs* VU, u32 code, bool acc, bool subtract, uint32x4_t operand_bits)
+	static inline bool ExecuteAddSubMaskedNeon(VURegs* VU, u32 code, bool acc, bool subtract, uint32x4_t operand_bits, bool triace_add = false)
 	{
 		const unsigned mask = XYZW(code);
 		if (mask == 0)
 			return false;
 
-		const float32x4_t fs = VuFloatQNeon(vld1q_u32(VU->VF[Fs(code)].UL));
+		uint32x4_t fs_bits = vld1q_u32(VU->VF[Fs(code)].UL);
+		if (triace_add && !subtract)
+			ApplyTriAceAddHackNeon(fs_bits, operand_bits);
+
+		const float32x4_t fs = VuFloatQNeon(fs_bits);
 		const float32x4_t operand = VuFloatQNeon(operand_bits);
 		FinishMacVectorNeon(VU, acc, Fd(code), mask, subtract ? vsubq_f32(fs, operand) : vaddq_f32(fs, operand));
 		return true;
@@ -1926,10 +1945,10 @@ namespace VUInterpFast
 #endif
 	}
 
-	static inline bool TryExecuteAddSubBroadcastNeon(VURegs* VU, u32 code, bool acc, bool subtract, u32 operand_bits)
+	static inline bool TryExecuteAddSubBroadcastNeon(VURegs* VU, u32 code, bool acc, bool subtract, u32 operand_bits, bool triace_add = false)
 	{
 #if defined(ARCH_ARM32)
-		return ExecuteAddSubMaskedNeon(VU, code, acc, subtract, vdupq_n_u32(operand_bits));
+		return ExecuteAddSubMaskedNeon(VU, code, acc, subtract, vdupq_n_u32(operand_bits), triace_add);
 #else
 		return false;
 #endif
@@ -2202,7 +2221,7 @@ namespace VUInterpFast
 				ExecuteAddSubMasked(VU, code, false, false, false, [VU, code](unsigned lane) { return VU->VF[Ft(code)].UL[lane]; });
 				return;
 			case UpperFastKind::ADDi:
-				if (!CHECK_VUADDSUBHACK && TryExecuteAddSubBroadcastNeon(VU, code, false, false, VU->VI[REG_I].UL))
+				if (TryExecuteAddSubBroadcastNeon(VU, code, false, false, VU->VI[REG_I].UL, CHECK_VUADDSUBHACK))
 					return;
 				ExecuteAddSubMasked(VU, code, false, false, CHECK_VUADDSUBHACK, [VU](unsigned) { return VU->VI[REG_I].UL; });
 				return;
