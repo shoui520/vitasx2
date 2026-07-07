@@ -15,6 +15,7 @@ extern u32 g_qemuSifFifoContiguousReads;
 extern u32 g_qemuSifFifoWrappedWrites;
 extern u32 g_qemuSifFifoWrappedReads;
 extern u32 g_qemuSifFifoJunkWrites;
+extern u32 g_qemuSifFifoJunkScalarWords;
 extern u32 g_qemuSifFifoNeonQwords;
 extern u32 g_qemuSifFifoNeon64ByteGroups;
 #endif
@@ -175,22 +176,24 @@ struct sifFifo
 			const int transferredWords = 4 - words;
 			const int prevQWPos = (writePos - (4 + transferredWords)) & (FIFO_SIF_W - 1);
 
-			// Read the old data in to our junk array in case of wrapping.
-			const int rP0 = std::min((FIFO_SIF_W - prevQWPos), 4);
-			const int rP1 = 4 - rP0;
-			SifFifoCopyWords(&junk[0], &data[prevQWPos], rP0);
-			SifFifoCopyWords(&junk[rP0], &data[0], rP1);
+			// PCSX2 owner: Sif.h::writeJunk(). Missing SIF0 packet words are
+			// always 1-3 scalar words, so avoid the NEON copy setup while
+			// preserving the original circular FIFO/junk offsets exactly.
+			for (int i = 0; i < 4; i++)
+				junk[i] = data[(prevQWPos + i) & (FIFO_SIF_W - 1)];
 
-			// Fill the missing words to fill the QW.
 			const int wP0 = std::min((FIFO_SIF_W - writePos), words);
 			const int wP1 = words - wP0;
-			SifFifoCopyWords(&data[writePos], &junk[4- wP0], wP0);
-			SifFifoCopyWords(&data[0], &junk[wP0], wP1);
+			for (int i = 0; i < wP0; i++)
+				data[writePos + i] = junk[4 - wP0 + i];
+			for (int i = 0; i < wP1; i++)
+				data[i] = junk[wP0 + i];
 
 			writePos = (writePos + words) & (FIFO_SIF_W - 1);
 			size += words;
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuSifFifoJunkWrites;
+			g_qemuSifFifoJunkScalarWords += 4 + words;
 #endif
 
 			SIF_LOG("  SIF + %d = %d Junk (pos=%d)", words, size, writePos);
