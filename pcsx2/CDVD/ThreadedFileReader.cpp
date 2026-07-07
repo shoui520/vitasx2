@@ -29,6 +29,7 @@ u32 g_qemuCdvdBlockCopyNeon4096ByteGroups = 0;
 u32 g_qemuCdvdBlockCopyNeon2328ByteGroups = 0;
 u32 g_qemuCdvdBlockCopyNeon2340ByteGroups = 0;
 u32 g_qemuCdvdBlockCopyNeon2352ByteGroups = 0;
+u32 g_qemuCdvdBlockCopyNeon2448ByteGroups = 0;
 #endif
 
 #if defined(VITASX2_QEMU_VALIDATION)

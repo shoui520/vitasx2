@@ -23,6 +23,7 @@ extern u32 g_qemuCdvdBlockCopyNeon4096ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon2328ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon2340ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon2352ByteGroups;
+extern u32 g_qemuCdvdBlockCopyNeon2448ByteGroups;
 #endif
 
 #if defined(ARCH_ARM32)
@@ -109,6 +110,16 @@ static __forceinline void CdvdCopy2352Bytes(u8* dst, const u8* src)
 	vst1q_u8(dst + 2336, tail2);
 }
 
+static __forceinline void CdvdCopy2448Bytes(u8* dst, const u8* src)
+{
+	CdvdCopy2048Bytes(dst, src);
+	CdvdCopy256Bytes(dst + 2048, src + 2048);
+	CdvdCopy128Bytes(dst + 2304, src + 2304);
+
+	const uint8x16_t tail = vld1q_u8(src + 2432);
+	vst1q_u8(dst + 2432, tail);
+}
+
 static __forceinline void CdvdCountNeonCopy(
 	size_t qwords,
 	size_t groups64,
@@ -119,7 +130,8 @@ static __forceinline void CdvdCountNeonCopy(
 	size_t groups4096 = 0,
 	size_t groups2328 = 0,
 	size_t groups2340 = 0,
-	size_t groups2352 = 0)
+	size_t groups2352 = 0,
+	size_t groups2448 = 0)
 {
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuCdvdBlockCopyNeonQwords += static_cast<u32>(qwords);
@@ -132,6 +144,7 @@ static __forceinline void CdvdCountNeonCopy(
 	g_qemuCdvdBlockCopyNeon2328ByteGroups += static_cast<u32>(groups2328);
 	g_qemuCdvdBlockCopyNeon2340ByteGroups += static_cast<u32>(groups2340);
 	g_qemuCdvdBlockCopyNeon2352ByteGroups += static_cast<u32>(groups2352);
+	g_qemuCdvdBlockCopyNeon2448ByteGroups += static_cast<u32>(groups2448);
 #endif
 }
 #endif
@@ -168,6 +181,22 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 		}
 
 		CdvdCountNeonCopy(groups2352 * 147, groups2352 * 36, groups2352 * 18, groups2352 * 9, groups2352 * 2, groups2352, 0, 0, 0, groups2352);
+		return;
+	}
+	if (size != 0 && (size % 2448) == 0)
+	{
+		const size_t groups2448 = size / 2448;
+		for (size_t i = 0; i < groups2448; i++)
+		{
+			if ((i + 1) < groups2448)
+				__builtin_prefetch(csrc + 2448, 0, 1);
+
+			CdvdCopy2448Bytes(cdst, csrc);
+			csrc += 2448;
+			cdst += 2448;
+		}
+
+		CdvdCountNeonCopy(groups2448 * 153, groups2448 * 38, groups2448 * 19, groups2448 * 9, groups2448 * 2, groups2448, 0, 0, 0, 0, groups2448);
 		return;
 	}
 
