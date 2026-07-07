@@ -22,6 +22,7 @@
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuIpuCscPostNeonBlocks = 0;
 u32 g_qemuIpuVqNeonGroups = 0;
+u32 g_qemuIpuIdctCopyNeonRows = 0;
 #endif
 
 // the IPU is fixed to 16 byte strides (128-bit / QWC resolution):
@@ -334,10 +335,8 @@ __ri static void IDCT_Block(s16* block)
 	}
 }
 
-__ri static void IDCT_Copy(s16* block, u8* dest, const int stride)
+static __forceinline void IDCT_CopyRowsReference(s16* block, u8* dest, const int stride)
 {
-	IDCT_Block(block);
-
 	for (int i = 0; i < 8; i++)
 	{
 		dest[0] = (g_idct_clip_lut.data() + 384)[block[0]];
@@ -356,6 +355,44 @@ __ri static void IDCT_Copy(s16* block, u8* dest, const int stride)
 	}
 }
 
+static __forceinline void IDCT_CopyRowsSelected(s16* block, u8* dest, const int stride)
+{
+#if defined(ARCH_ARM32)
+	const int16x8_t zero = vdupq_n_s16(0);
+	for (int i = 0; i < 8; i++)
+	{
+		const int16x8_t row = vld1q_s16(block);
+		const uint8x8_t clipped = vqmovun_s16(row);
+		vst1_u8(dest, clipped);
+		vst1q_s16(block, zero);
+		dest += stride;
+		block += 8;
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuIdctCopyNeonRows;
+#endif
+	}
+#else
+	IDCT_CopyRowsReference(block, dest, stride);
+#endif
+}
+
+__ri static void IDCT_Copy(s16* block, u8* dest, const int stride)
+{
+	IDCT_Block(block);
+	IDCT_CopyRowsSelected(block, dest, stride);
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void IpuIdctCopyRowsReferenceForValidation(s16* block, u8* dest, int stride)
+{
+	IDCT_CopyRowsReference(block, dest, stride);
+}
+
+void IpuIdctCopyRowsSelectedForValidation(s16* block, u8* dest, int stride)
+{
+	IDCT_CopyRowsSelected(block, dest, stride);
+}
+#endif
 
 // stride = increment for dest in 16-bit units (typically either 8 [128 bits] or 16 [256 bits]).
 __ri static void IDCT_Add(const int last, s16* block, s16* dest, const int stride)
