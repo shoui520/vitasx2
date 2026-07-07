@@ -20,6 +20,8 @@ u32 g_qemuIopDivSignedHelperCalls = 0;
 u32 g_qemuIopDivUnsignedHelperCalls = 0;
 u32 g_qemuIopKnownRamScalarLoadFastPaths = 0;
 u32 g_qemuIopKnownRamScalarStoreFastPaths = 0;
+u32 g_qemuIopKnownRamUnalignedLoadFastPaths = 0;
+u32 g_qemuIopKnownRamUnalignedStoreFastPaths = 0;
 #endif
 
 namespace
@@ -675,6 +677,29 @@ namespace
 
 		u32 address = 0;
 		return TryKnownDirectIopRamAddress(op, alignment_mask, &address);
+	}
+
+	bool IsKnownDirectIopRamUnalignedFastPath(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x22: // LWL
+			case 0x26: // LWR
+			case 0x2a: // SWL
+			case 0x2e: // SWR
+				break;
+			default:
+				return false;
+		}
+
+		u32 address = 0;
+		return TryKnownDirectIopRamAddress(op, 0, &address);
+	}
+
+	bool IsKnownDirectIopRamFastPath(u32 op)
+	{
+		return IsKnownDirectIopRamScalarFastPath(op) ||
+			   IsKnownDirectIopRamUnalignedFastPath(op);
 	}
 } // namespace
 
@@ -2115,7 +2140,7 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitUnalignedReadColdTail(const UnalignedReadColdTail& tail)
 	{
-		// PCSX2 owners: R3000AInterpreter.cpp::psxLWL/psxLWR/psxSWL/psxSWR
+		// PCSX2 owners: R3000AOpcodeTables.cpp::psxLWL/psxLWR/psxSWL/psxSWR
 		// merge an aligned iopMemRead32() word. Handler-backed addresses call
 		// the helper; ordinary IOP RAM falls through with HOST_TMP0 loaded.
 		const size_t fallback_target = m_code.Size();
@@ -2191,8 +2216,76 @@ namespace VitaIOP
 			   m_code.PatchBranch(tail_done, tail.join_offset);
 	}
 
+	bool BlockCompiler::EmitKnownDirectRamUnalignedLoadOp(u32 op, u32 address)
+	{
+		const bool left = ((op >> 26) == 0x22);
+		const unsigned rt = RT(op);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIopKnownRamUnalignedLoadFastPaths;
+#endif
+
+		if (rt == 0)
+			return true;
+
+		const u32 aligned_address = address & ~3u;
+		const u32 shift = (address & 3u) << 3;
+		const auto emit_load_aligned_word = [&]() -> bool {
+			if (aligned_address <= 0x0fffu)
+				return m_code.EmitLdrImm12(HOST_TMP0, HOST_IOP_RAM_BASE,
+					static_cast<u16>(aligned_address));
+
+			return m_code.EmitMovImm32(HOST_TMP0, aligned_address) &&
+				   m_code.EmitLdrRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+					   VitaA32::ShiftType::LSL, 0);
+		};
+
+		if (!emit_load_aligned_word())
+			return false;
+
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxLWL()/psxLWR() merge an
+		// aligned iopMemRead32() word. A known $zero+imm main-RAM address cannot
+		// hit the MMIO/ROM helper arm, so emit the fixed merge directly.
+		if ((left && shift == 24) || (!left && shift == 0))
+			return EmitStoreGpr(rt, HOST_TMP0);
+
+		const auto emit_and_mask = [&](unsigned host_reg, u32 mask) -> bool {
+			if (mask == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+			if (mask == 0xffffffffu)
+				return true;
+			if (m_code.EmitAndImm32(host_reg, host_reg, mask))
+				return true;
+			return m_code.EmitMovImm32(HOST_TMP2, mask) &&
+				   m_code.EmitAndReg(host_reg, host_reg, HOST_TMP2);
+		};
+
+		if (!EmitLoadGpr(rt, HOST_TMP1))
+			return false;
+
+		if (left)
+		{
+			const u32 old_mask = 0x00ffffffu >> shift;
+			const u8 mem_shift = static_cast<u8>(24 - shift);
+			return emit_and_mask(HOST_TMP1, old_mask) &&
+				   m_code.EmitOrrRegShiftImm(HOST_TMP0, HOST_TMP1, HOST_TMP0,
+					   VitaA32::ShiftType::LSL, mem_shift) &&
+				   EmitStoreGpr(rt, HOST_TMP0);
+		}
+
+		const u32 old_mask = 0xffffff00u << (24 - shift);
+		const u8 mem_shift = static_cast<u8>(shift);
+		return emit_and_mask(HOST_TMP1, old_mask) &&
+			   m_code.EmitOrrRegShiftImm(HOST_TMP0, HOST_TMP1, HOST_TMP0,
+				   VitaA32::ShiftType::LSR, mem_shift) &&
+			   EmitStoreGpr(rt, HOST_TMP0);
+	}
+
 	bool BlockCompiler::EmitUnalignedLoadOp(u32 op)
 	{
+		u32 known_ram_address = 0;
+		if (TryKnownDirectIopRamAddress(op, 0, &known_ram_address))
+			return EmitKnownDirectRamUnalignedLoadOp(op, known_ram_address);
+
 		const bool left = ((op >> 26) == 0x22);
 		if (!EmitEffectiveAddress(op) ||
 			!m_code.EmitAndImm8(HOST_SAVED0, HOST_TMP0, 3) ||
@@ -2203,7 +2296,7 @@ namespace VitaIOP
 			return false;
 		}
 
-		// PCSX2 owner: R3000AInterpreter.cpp::psxLWL/psxLWR use iopMemRead32()
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxLWL/psxLWR use iopMemRead32()
 		// on the aligned address. Ordinary IOP RAM can read iopMem->Main directly.
 		const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (fallback_branch == static_cast<size_t>(-1) ||
@@ -2245,8 +2338,112 @@ namespace VitaIOP
 			   EmitStoreGpr(RT(op), HOST_TMP0);
 	}
 
+	bool BlockCompiler::EmitKnownDirectRamUnalignedStoreOp(u32 op, u32 address)
+	{
+		const bool left = ((op >> 26) == 0x2a);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIopKnownRamUnalignedStoreFastPaths;
+#endif
+
+		const u32 aligned_address = address & ~3u;
+		const u32 shift = (address & 3u) << 3;
+		const auto emit_load_aligned_word = [&]() -> bool {
+			if (aligned_address <= 0x0fffu)
+				return m_code.EmitLdrImm12(HOST_TMP0, HOST_IOP_RAM_BASE,
+					static_cast<u16>(aligned_address));
+
+			return m_code.EmitMovImm32(HOST_TMP0, aligned_address) &&
+				   m_code.EmitLdrRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+					   VitaA32::ShiftType::LSL, 0);
+		};
+		const auto emit_store_merged_word = [&]() -> bool {
+			if (aligned_address <= 0x0fffu)
+				return m_code.EmitStrImm12(HOST_TMP1, HOST_IOP_RAM_BASE,
+					static_cast<u16>(aligned_address));
+
+			return m_code.EmitMovImm32(HOST_TMP0, aligned_address) &&
+				   m_code.EmitStrRegShift(HOST_TMP1, HOST_IOP_RAM_BASE, HOST_TMP0,
+					   VitaA32::ShiftType::LSL, 0);
+		};
+		const auto emit_clear_stored_word = [&]() -> bool {
+			return m_code.EmitMovImm32(HOST_TMP0, aligned_address) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 1) &&
+				   m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+					   static_cast<u32>(reinterpret_cast<uptr>(&psxCpu))) &&
+				   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 0) &&
+				   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
+					   static_cast<u16>(offsetof(R3000Acpu, Clear))) &&
+				   m_code.EmitBlx(HOST_CALL_SCRATCH);
+		};
+		const auto emit_and_mask = [&](unsigned host_reg, u32 mask) -> bool {
+			if (mask == 0)
+				return m_code.EmitMovImm8(host_reg, 0);
+			if (mask == 0xffffffffu)
+				return true;
+			if (m_code.EmitAndImm32(host_reg, host_reg, mask))
+				return true;
+			return m_code.EmitMovImm32(HOST_TMP2, mask) &&
+				   m_code.EmitAndReg(host_reg, host_reg, HOST_TMP2);
+		};
+		const auto emit_orr_shift = [&](unsigned rd, unsigned rn, unsigned rm,
+										VitaA32::ShiftType shift_type, u8 amount) -> bool {
+			if (amount == 0)
+				return m_code.EmitOrrRegShiftImm(rd, rn, rm, VitaA32::ShiftType::LSL, 0);
+			return m_code.EmitOrrRegShiftImm(rd, rn, rm, shift_type, amount);
+		};
+
+		// PCSX2 owners: R3000AOpcodeTables.cpp::psxSWL()/psxSWR() merge an
+		// aligned iopMemRead32() word, then IopMem.cpp::iopMemWrite32() applies
+		// isolate-cache suppression and psxCpu->Clear() invalidation.
+		if (!emit_load_aligned_word() || !EmitLoadGpr(RT(op), HOST_TMP1))
+			return false;
+
+		if (left)
+		{
+			const u32 old_mask = 0xffffff00u << shift;
+			const u8 rt_shift = static_cast<u8>(24 - shift);
+			if (!emit_and_mask(HOST_TMP0, old_mask) ||
+				!emit_orr_shift(HOST_TMP1, HOST_TMP0, HOST_TMP1,
+					VitaA32::ShiftType::LSR, rt_shift))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			const u8 mem_shift = static_cast<u8>(24 - shift);
+			const u32 old_mask = 0x00ffffffu >> mem_shift;
+			if (!emit_and_mask(HOST_TMP0, old_mask) ||
+				!m_code.EmitOrrRegShiftImm(HOST_TMP1, HOST_TMP0, HOST_TMP1,
+					VitaA32::ShiftType::LSL, static_cast<u8>(shift)))
+			{
+				return false;
+			}
+		}
+
+		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
+			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
+		{
+			return false;
+		}
+
+		const size_t isolated_skip = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (isolated_skip == static_cast<size_t>(-1) ||
+			!emit_store_merged_word() ||
+			!emit_clear_stored_word())
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE);
+	}
+
 	bool BlockCompiler::EmitUnalignedStoreOp(u32 op)
 	{
+		u32 known_ram_address = 0;
+		if (TryKnownDirectIopRamAddress(op, 0, &known_ram_address))
+			return EmitKnownDirectRamUnalignedStoreOp(op, known_ram_address);
+
 		const bool left = ((op >> 26) == 0x2a);
 		const auto emit_clear_stored_word = [&]() -> bool {
 			return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) &&
@@ -2268,7 +2465,7 @@ namespace VitaIOP
 			return false;
 		}
 
-		// PCSX2 owners: R3000AInterpreter.cpp::psxSWL/psxSWR merge the aligned
+		// PCSX2 owners: R3000AOpcodeTables.cpp::psxSWL/psxSWR merge the aligned
 		// word, while IopMem.cpp::iopMemWrite32() owns writable-RAM filtering,
 		// isolate-cache suppression, and psxCpu->Clear() invalidation.
 		const size_t fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
@@ -3160,7 +3357,7 @@ namespace VitaIOP
 			if (UsesDirectIopRamFastPath(op))
 			{
 				m_iop_ram_registers_available = true;
-				if (!IsKnownDirectIopRamScalarFastPath(op))
+				if (!IsKnownDirectIopRamFastPath(op))
 					m_iop_ram_mask_register_available = true;
 			}
 		}

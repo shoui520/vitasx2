@@ -107,7 +107,9 @@ namespace VitaIOP
 		bool EmitStoreOp(u32 op);
 		bool EmitKnownDirectRamStoreOp(u32 op, u32 address);
 		bool EmitUnalignedLoadOp(u32 op);
+		bool EmitKnownDirectRamUnalignedLoadOp(u32 op, u32 address);
 		bool EmitUnalignedStoreOp(u32 op);
+		bool EmitKnownDirectRamUnalignedStoreOp(u32 op, u32 address);
 		bool EmitConditionalBranchOp(u32 op, u32 pc);
 		bool EmitSignedBranchOp(u32 op, u32 pc);
 		bool EmitConditionalBranchFlag(u32 op);
