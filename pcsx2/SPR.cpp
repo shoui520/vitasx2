@@ -3,9 +3,20 @@
 
 #include "Common.h"
 
+#include "SPRCopy.h"
 #include "SPR.h"
 #include "VUmicro.h"
 #include "MTVU.h"
+
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuSprCopyNeonQwords = 0;
+u32 g_qemuSprCopyNeon64ByteGroups = 0;
+u32 g_qemuSprCopyToScratchCalls = 0;
+u32 g_qemuSprCopyFromScratchCalls = 0;
+u32 g_qemuSprCopyWrappedToScratch = 0;
+u32 g_qemuSprCopyWrappedFromScratch = 0;
+u32 g_qemuSprCopyOverlapFallbacks = 0;
+#endif
 
 static bool spr0finished = false;
 static bool spr1finished = false;
@@ -69,34 +80,14 @@ static void TestClearVUs(u32 madr, u32 qwc, bool isWrite)
 	}
 }
 
-static void memcpy_to_spr(u32 dst, u8* src, size_t size)
+static void memcpy_to_spr(u32 dst, const u8* src, size_t size)
 {
-	dst &= _16kb - 1;
-
-	if (dst + size >= _16kb) {
-		size_t end = _16kb - dst;
-		memcpy(&psSu128(dst), src, end);
-
-		src += end;
-		memcpy(&psSu128(0)  , src, size - end);
-	} else {
-		memcpy(&psSu128(dst), src, size);
-	}
+	SprCopyToScratch(eeMem->Scratch, dst, src, size);
 }
 
 static void memcpy_from_spr(u8* dst, u32 src, size_t size)
 {
-	src &= _16kb - 1;
-
-	if (src + size >= _16kb) {
-		size_t end = _16kb - src;
-		memcpy(dst, &psSu128(src), end);
-
-		dst += end;
-		memcpy(dst, &psSu128(0)  , size - end);
-	} else {
-		memcpy(dst, &psSu128(src), size);
-	}
+	SprCopyFromScratch(dst, eeMem->Scratch, src, size);
 }
 
 int  _SPR0chain()
@@ -352,7 +343,7 @@ __fi static void SPR1transfer(const void* data, int qwc)
 		TestClearVUs(spr1ch.madr, spr1ch.qwc, false);
 	}
 
-	memcpy_to_spr(spr1ch.sadr, (u8*)data, qwc*16);
+	memcpy_to_spr(spr1ch.sadr, static_cast<const u8*>(data), qwc*16);
 	spr1ch.sadr += qwc * 16;
 	spr1ch.sadr &= 0x3FFF; // Limited to 16K
 }
