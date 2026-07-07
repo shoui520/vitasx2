@@ -222,9 +222,11 @@ static __fi bool _vu0CanBurstUpperNopLowerDirect(const _VURegsNum& lregs)
 	return _vu0CanBurstLowerDirect(lregs);
 }
 
-static __fi bool _vu0CanBurstUpperDirect(const _VURegsNum& uregs)
+static __fi bool _vu0CanBurstUpperDirect(const _VURegsNum& uregs, u8 upper_kind)
 {
-	return uregs.pipe == VUPIPE_FMAC;
+	return uregs.pipe == VUPIPE_FMAC ||
+		(uregs.pipe == VUPIPE_NONE &&
+			static_cast<VUInterpFast::UpperFastKind>(upper_kind) == VUInterpFast::UpperFastKind::NOP);
 }
 
 static u32 _vu0ExecUpperNopLowerDirectBurst(VURegs* VU, u32 max_cycles)
@@ -323,17 +325,19 @@ static u32 _vu0ExecUpperDirectLowerNopBurst(VURegs* VU, u32 max_cycles)
 		const u32* ptr = reinterpret_cast<const u32*>(&VU->Micro[pc]);
 		const u32 lower = ptr[0];
 		const u32 upper = ptr[1];
-		if ((upper & 0xf8000000u) != 0 || !_vu0IsLowerNop(lower))
+		if ((upper & 0xf8000000u) != 0 || _vu0IsUpperNop(upper) || !_vu0IsLowerNop(lower))
 			break;
 
 		_VURegsNum uregs = {};
 		u8 upper_kind = 0;
-		if (!VuMicroAnalyzeUpperNoLowerCached(0, pc, upper, &uregs, &upper_kind) || !_vu0CanBurstUpperDirect(uregs))
+		if (!VuMicroAnalyzeUpperNoLowerCached(0, pc, upper, &uregs, &upper_kind) || !_vu0CanBurstUpperDirect(uregs, upper_kind))
 			break;
 
 		// PCSX2 owners: VU0microInterp.cpp::vu0Exec() lower-NOP path,
-		// VUops.cpp upper-slot implementations, and VUops.cpp pipe/stall
-		// helpers. The burst keeps the same per-op dependency/pipe sequence.
+		// VUops.cpp upper-slot implementations including _vuNOP(), and
+		// VUops.cpp pipe/stall helpers. The burst keeps the same per-op
+		// dependency/pipe sequence while canonical NOP pairs stay on the
+		// dedicated fast-forward path.
 		VU->cycle++;
 		VU->VI[REG_TPC].UL = pc + 8;
 		VU->code = upper;
@@ -404,7 +408,7 @@ static u32 _vu0ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 		_VURegsNum lregs = {};
 		u8 upper_kind = 0;
 		u8 lower_kind = 0;
-		if (!VuMicroAnalyzeUpperNoLowerCached(0, pc, upper, &uregs, &upper_kind) || !_vu0CanBurstUpperDirect(uregs) ||
+		if (!VuMicroAnalyzeUpperNoLowerCached(0, pc, upper, &uregs, &upper_kind) || !_vu0CanBurstUpperDirect(uregs, upper_kind) ||
 			!VuMicroAnalyzeLowerNoUpperCached(0, pc, lower, &lregs, &lower_kind) || !_vu0CanBurstLowerDirect(lregs))
 		{
 			break;
@@ -419,9 +423,9 @@ static u32 _vu0ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 		int discard = 0;
 
 		// PCSX2 owners: VU0microInterp.cpp::_vu0Exec() paired upper/lower
-		// path and VUops.cpp pipe helpers for FMAC/IALU/FDIV/EFU lower pipes.
-		// Keep the same upper-first issue, lower stale-read save/restore,
-		// same-register discard, and stall order.
+		// path, VUops.cpp::_vuNOP(), and VUops.cpp pipe helpers for
+		// FMAC/IALU/FDIV/EFU lower pipes. Keep the same upper-first issue,
+		// lower stale-read save/restore, same-register discard, and stall order.
 		VU->cycle++;
 		VU->VI[REG_TPC].UL = pc + 8;
 		VU->code = upper;
