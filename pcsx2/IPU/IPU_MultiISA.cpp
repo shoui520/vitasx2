@@ -1939,6 +1939,13 @@ static __forceinline uint8x16_t IpuCscRgbAllLt(uint8x16_t r, uint8x16_t g, uint8
 	return vandq_u8(vandq_u8(vcgtq_u8(threshold_vec, r), vcgtq_u8(threshold_vec, g)), vcgtq_u8(threshold_vec, b));
 }
 
+static __forceinline void IpuCscSignFlipPixelsNeon(u8* p)
+{
+	const uint8x16_t sign_flip = vreinterpretq_u8_u32(vdupq_n_u32(0x00808080u));
+	for (u32 i = 0; i < (16 * 16 * 4) / 16; i++, p += 16)
+		vst1q_u8(p, veorq_u8(vld1q_u8(p), sign_flip));
+}
+
 static void ipu_csc_postprocess_neon(macroblock_rgb32& rgb32, int sgn)
 {
 	u8* p = reinterpret_cast<u8*>(&rgb32);
@@ -1949,10 +1956,18 @@ static void ipu_csc_postprocess_neon(macroblock_rgb32& rgb32, int sgn)
 	const bool apply_sgn = sgn != 0;
 	const uint8x16_t zero = vdupq_n_u8(0);
 	const uint8x16_t alpha40 = vdupq_n_u8(0x40);
-	const uint8x16_t sign_flip = vdupq_n_u8(0x80);
 
 	if (!apply_threshold0 && !apply_threshold1 && !apply_sgn)
 		return;
+
+	if (!apply_threshold0 && !apply_threshold1)
+	{
+		IpuCscSignFlipPixelsNeon(p);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuIpuCscPostNeonBlocks;
+#endif
+		return;
+	}
 
 	for (u32 i = 0; i < 16; i++, p += 16 * 4)
 	{
@@ -1972,14 +1987,15 @@ static void ipu_csc_postprocess_neon(macroblock_rgb32& rgb32, int sgn)
 			const uint8x16_t alpha40_mask = IpuCscRgbAllLt(rgba.val[0], rgba.val[1], rgba.val[2], threshold1);
 			rgba.val[3] = vbslq_u8(alpha40_mask, alpha40, rgba.val[3]);
 		}
-		else
-		{
-			rgba.val[0] = veorq_u8(rgba.val[0], sign_flip);
-			rgba.val[1] = veorq_u8(rgba.val[1], sign_flip);
-			rgba.val[2] = veorq_u8(rgba.val[2], sign_flip);
-		}
 
 		vst4q_u8(p, rgba);
+	}
+
+	if (apply_sgn)
+	{
+		// PCSX2 owner: ipu_csc_postprocess_reference() advances p through the
+		// threshold pass before the SGN XOR loop. Preserve that ordering exactly.
+		IpuCscSignFlipPixelsNeon(p);
 	}
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -1992,12 +2008,8 @@ static void ipu_csc_postprocess_neon(macroblock_rgb32& rgb32, int sgn)
 static void ipu_csc_postprocess(macroblock_rgb32& rgb32, int sgn)
 {
 #if defined(ARCH_ARM32)
-	const bool thresholded = g_ipu_thresh[0] > 0 || g_ipu_thresh[1] > 0;
-	if (!(sgn && thresholded))
-	{
-		ipu_csc_postprocess_neon(rgb32, sgn);
-		return;
-	}
+	ipu_csc_postprocess_neon(rgb32, sgn);
+	return;
 #endif
 	ipu_csc_postprocess_reference(rgb32, sgn);
 }
