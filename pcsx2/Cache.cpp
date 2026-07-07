@@ -355,7 +355,7 @@ RETURNS_R128 readCache128(u32 mem, bool validPFN)
 }
 
 template <typename Op>
-void doCacheHitOp(u32 addr, const char* name, Op op)
+void doCacheHitOp(u32 addr, const char* name, u32 instr, Op op)
 {
 	const int index = cache.setIdxFor(addr);
 	CacheSet& set = cache.sets[index];
@@ -369,9 +369,132 @@ void doCacheHitOp(u32 addr, const char* name, Op op)
 		return;
 	}
 
-	CACHE_LOG("CACHE %s addr %x, index %d, way %d, flags %x OP %x", name, addr, index, way, set.tags[way].flags(), cpuRegs.code);
+	CACHE_LOG("CACHE %s addr %x, index %d, way %d, flags %x OP %x", name, addr, index, way, set.tags[way].flags(), instr);
 
 	op(cache.lineAt(index, way));
+}
+
+void executeCacheOp(u32 instr, u32 addr)
+{
+	const u32 mode = (instr >> 16) & 0x1f;
+
+	switch (mode)
+	{
+		case 0x1a: //DHIN (Data Cache Hit Invalidate)
+			doCacheHitOp(addr, "DHIN", instr, [](CacheLine line) {
+				line.clear();
+			});
+			break;
+
+		case 0x18: //DHWBIN (Data Cache Hit WriteBack with Invalidate)
+			doCacheHitOp(addr, "DHWBIN", instr, [](CacheLine line) {
+				line.writeBackIfNeeded();
+				line.clear();
+			});
+			break;
+
+		case 0x1c: //DHWOIN (Data Cache Hit WriteBack Without Invalidate)
+			doCacheHitOp(addr, "DHWOIN", instr, [](CacheLine line) {
+				line.writeBackIfNeeded();
+			});
+			break;
+
+		case 0x16: //DXIN (Data Cache Index Invalidate)
+		{
+			const int index = cache.setIdxFor(addr);
+			const int way = addr & 0x1;
+			CacheLine line = cache.lineAt(index, way);
+
+			CACHE_LOG("CACHE DXIN addr %x, index %d, way %d, flag %x", addr, index, way, line.tag.flags());
+
+			line.clear();
+			break;
+		}
+
+		case 0x11: //DXLDT (Data Cache Load Data into TagLo)
+		{
+			const int index = cache.setIdxFor(addr);
+			const int way = addr & 0x1;
+			CacheLine line = cache.lineAt(index, way);
+
+			cpuRegs.CP0.n.TagLo = *reinterpret_cast<u32*>(&line.data.bytes[addr & 0x3C]);
+
+			CACHE_LOG("CACHE DXLDT addr %x, index %d, way %d, DATA %x OP %x", addr, index, way, cpuRegs.CP0.n.TagLo, instr);
+			break;
+		}
+
+		case 0x10: //DXLTG (Data Cache Load Tag into TagLo)
+		{
+			const int index = (addr >> 6) & 0x3F;
+			const int way = addr & 0x1;
+			CacheLine line = cache.lineAt(index, way);
+
+			// DXLTG demands that SYNC.L is called before this command, which forces the cache to write back, so presumably games are checking the cache has updated the memory
+			// For speed, we will do it here.
+			line.writeBackIfNeeded();
+
+			// Our tags don't contain PS2 paddrs (instead they contain x86 addrs)
+			cpuRegs.CP0.n.TagLo = line.tag.flags();
+
+			CACHE_LOG("CACHE DXLTG addr %x, index %d, way %d, DATA %x OP %x ", addr, index, way, cpuRegs.CP0.n.TagLo, instr);
+			CACHE_LOG("WARNING: DXLTG emulation supports flags only, things could break");
+			break;
+		}
+
+		case 0x13: //DXSDT (Data Cache Store 32bits from TagLo)
+		{
+			const int index = (addr >> 6) & 0x3F;
+			const int way = addr & 0x1;
+			CacheLine line = cache.lineAt(index, way);
+
+			*reinterpret_cast<u32*>(&line.data.bytes[addr & 0x3C]) = cpuRegs.CP0.n.TagLo;
+
+			CACHE_LOG("CACHE DXSDT addr %x, index %d, way %d, DATA %x OP %x", addr, index, way, cpuRegs.CP0.n.TagLo, instr);
+			break;
+		}
+
+		case 0x12: //DXSTG (Data Cache Store Tag from TagLo)
+		{
+			const int index = (addr >> 6) & 0x3F;
+			const int way = addr & 0x1;
+			CacheLine line = cache.lineAt(index, way);
+
+			line.tag.setAddr(cpuRegs.CP0.n.TagLo);
+			line.tag.rawValue &= ~CacheTag::ALL_FLAGS;
+			line.tag.rawValue |= (cpuRegs.CP0.n.TagLo & CacheTag::ALL_FLAGS);
+
+			CACHE_LOG("CACHE DXSTG addr %x, index %d, way %d, DATA %x OP %x", addr, index, way, cpuRegs.CP0.n.TagLo, instr);
+			break;
+		}
+
+		case 0x14: //DXWBIN (Data Cache Index WriteBack Invalidate)
+		{
+			const int index = (addr >> 6) & 0x3F;
+			const int way = addr & 0x1;
+			CacheLine line = cache.lineAt(index, way);
+
+			CACHE_LOG("CACHE DXWBIN addr %x, index %d, way %d, flags %x paddr %zx", addr, index, way, line.tag.flags(), line.addr());
+			line.writeBackIfNeeded();
+			line.clear();
+			break;
+		}
+
+		case 0x7: //IXIN (Instruction Cache Index Invalidate)
+		{
+			//Not Implemented as we do not have instruction cache
+			break;
+		}
+
+		case 0xC: //BFH (BTAC Flush)
+		{
+			//Not Implemented as we do not cache Branch Target Addresses.
+			break;
+		}
+
+		default:
+			DevCon.Warning("Cache mode %x not implemented", mode);
+			break;
+	}
 }
 
 namespace R5900
@@ -386,124 +509,7 @@ namespace R5900
 			{
 				u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 				// CACHE_LOG("cpuRegs.GPR.r[_Rs_].UL[0] = %x, IMM = %x RT = %x", cpuRegs.GPR.r[_Rs_].UL[0], _Imm_, _Rt_);
-
-				switch (_Rt_)
-				{
-					case 0x1a: //DHIN (Data Cache Hit Invalidate)
-						doCacheHitOp(addr, "DHIN", [](CacheLine line) {
-							line.clear();
-						});
-						break;
-
-					case 0x18: //DHWBIN (Data Cache Hit WriteBack with Invalidate)
-						doCacheHitOp(addr, "DHWBIN", [](CacheLine line) {
-							line.writeBackIfNeeded();
-							line.clear();
-						});
-						break;
-
-					case 0x1c: //DHWOIN (Data Cache Hit WriteBack Without Invalidate)
-						doCacheHitOp(addr, "DHWOIN", [](CacheLine line) {
-							line.writeBackIfNeeded();
-						});
-						break;
-
-					case 0x16: //DXIN (Data Cache Index Invalidate)
-					{
-						const int index = cache.setIdxFor(addr);
-						const int way = addr & 0x1;
-						CacheLine line = cache.lineAt(index, way);
-
-						CACHE_LOG("CACHE DXIN addr %x, index %d, way %d, flag %x", addr, index, way, line.tag.flags());
-
-						line.clear();
-						break;
-					}
-
-					case 0x11: //DXLDT (Data Cache Load Data into TagLo)
-					{
-						const int index = cache.setIdxFor(addr);
-						const int way = addr & 0x1;
-						CacheLine line = cache.lineAt(index, way);
-
-						cpuRegs.CP0.n.TagLo = *reinterpret_cast<u32*>(&line.data.bytes[addr & 0x3C]);
-
-						CACHE_LOG("CACHE DXLDT addr %x, index %d, way %d, DATA %x OP %x", addr, index, way, cpuRegs.CP0.n.TagLo, cpuRegs.code);
-						break;
-					}
-
-					case 0x10: //DXLTG (Data Cache Load Tag into TagLo)
-					{
-						const int index = (addr >> 6) & 0x3F;
-						const int way = addr & 0x1;
-						CacheLine line = cache.lineAt(index, way);
-
-						// DXLTG demands that SYNC.L is called before this command, which forces the cache to write back, so presumably games are checking the cache has updated the memory
-						// For speed, we will do it here.
-						line.writeBackIfNeeded();
-
-						// Our tags don't contain PS2 paddrs (instead they contain x86 addrs)
-						cpuRegs.CP0.n.TagLo = line.tag.flags();
-
-						CACHE_LOG("CACHE DXLTG addr %x, index %d, way %d, DATA %x OP %x ", addr, index, way, cpuRegs.CP0.n.TagLo, cpuRegs.code);
-						CACHE_LOG("WARNING: DXLTG emulation supports flags only, things could break");
-						break;
-					}
-
-					case 0x13: //DXSDT (Data Cache Store 32bits from TagLo)
-					{
-						const int index = (addr >> 6) & 0x3F;
-						const int way = addr & 0x1;
-						CacheLine line = cache.lineAt(index, way);
-
-						*reinterpret_cast<u32*>(&line.data.bytes[addr & 0x3C]) = cpuRegs.CP0.n.TagLo;
-
-						CACHE_LOG("CACHE DXSDT addr %x, index %d, way %d, DATA %x OP %x", addr, index, way, cpuRegs.CP0.n.TagLo, cpuRegs.code);
-						break;
-					}
-
-					case 0x12: //DXSTG (Data Cache Store Tag from TagLo)
-					{
-						const int index = (addr >> 6) & 0x3F;
-						const int way = addr & 0x1;
-						CacheLine line = cache.lineAt(index, way);
-
-						line.tag.setAddr(cpuRegs.CP0.n.TagLo);
-						line.tag.rawValue &= ~CacheTag::ALL_FLAGS;
-						line.tag.rawValue |= (cpuRegs.CP0.n.TagLo & CacheTag::ALL_FLAGS);
-
-						CACHE_LOG("CACHE DXSTG addr %x, index %d, way %d, DATA %x OP %x", addr, index, way, cpuRegs.CP0.n.TagLo, cpuRegs.code);
-						break;
-					}
-
-					case 0x14: //DXWBIN (Data Cache Index WriteBack Invalidate)
-					{
-						const int index = (addr >> 6) & 0x3F;
-						const int way = addr & 0x1;
-						CacheLine line = cache.lineAt(index, way);
-
-						CACHE_LOG("CACHE DXWBIN addr %x, index %d, way %d, flags %x paddr %zx", addr, index, way, line.tag.flags(), line.addr());
-						line.writeBackIfNeeded();
-						line.clear();
-						break;
-					}
-
-					case 0x7: //IXIN (Instruction Cache Index Invalidate)
-					{
-						//Not Implemented as we do not have instruction cache
-						break;
-					}
-
-					case 0xC: //BFH (BTAC Flush)
-					{
-						//Not Implemented as we do not cache Branch Target Addresses.
-						break;
-					}
-
-					default:
-						DevCon.Warning("Cache mode %x not implemented", _Rt_);
-						break;
-				}
+				executeCacheOp(cpuRegs.code, addr);
 			}
 		} // end namespace OpcodeImpl
 

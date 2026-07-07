@@ -40,6 +40,7 @@
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 extern void vu0Sync();
 #endif
+void executeCacheOp(u32 op, u32 addr);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuDivSignedHelperCalls = 0;
@@ -7967,13 +7968,31 @@ namespace VitaEE
 		if (!IsHelperCACHE(op))
 			return false;
 
-		using namespace R5900::Interpreter::OpcodeImpl;
-		// PCSX2 owner: Cache.cpp::CACHE(). Keep data-cache/TagLo modes inside
-		// the generated A32 tail so the normal cycle test can direct-exit instead
-		// of forcing an interpreter event split after every CACHE instruction.
-		return m_code.EmitMovImm32(HOST_TMP0, op) &&
-			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) &&
-			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&CACHE));
+		const s16 imm = IMM_S(op);
+		const auto emit_addr_adjust = [&]() {
+			if (imm == 0)
+				return true;
+			if (imm > 0)
+			{
+				const u32 delta = static_cast<u32>(imm);
+				return m_code.EmitAddImm32(HOST_TMP1, HOST_TMP1, delta) ||
+					   (m_code.EmitMovImm32(HOST_TMP2, delta) &&
+					    m_code.EmitAddReg(HOST_TMP1, HOST_TMP1, HOST_TMP2));
+			}
+
+			const u32 delta = static_cast<u32>(-static_cast<s32>(imm));
+			return m_code.EmitSubImm32(HOST_TMP1, HOST_TMP1, delta) ||
+				   (m_code.EmitMovImm32(HOST_TMP2, delta) &&
+				    m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP2));
+		};
+
+		// PCSX2 owner: Cache.cpp::CACHE()/executeCacheOp(). Compute the CACHE
+		// address in A32 and jump straight to the owner operation, avoiding the
+		// interpreter's cpuRegs.code store/decode while preserving TagLo/cache lines.
+		return EmitLoadGprLow(RS(op), HOST_TMP1) &&
+			   emit_addr_adjust() &&
+			   m_code.EmitMovImm32(HOST_TMP0, op) &&
+			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&executeCacheOp));
 	}
 
 	bool BlockCompiler::EmitSpecialExceptionEventExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
