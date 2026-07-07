@@ -34,6 +34,7 @@ u32 g_qemuSio2FifoBulkReadBytes = 0;
 u32 g_qemuSio2FifoBulkWriteBytes = 0;
 u32 g_qemuSio2FifoNeonQwords = 0;
 u32 g_qemuSio2FifoNeon64ByteGroups = 0;
+u32 g_qemuSio2FifoNeon256ByteGroups = 0;
 #endif
 
 namespace
@@ -53,11 +54,20 @@ namespace
 		vst1q_u8(dst + 48, qword3);
 	}
 
-	static __forceinline void Sio2CountNeonCopy(size_t qwords, size_t groups64)
+	static __forceinline void Sio2Copy256Bytes(u8* dst, const u8* src)
+	{
+		Sio2Copy64Bytes(dst, src);
+		Sio2Copy64Bytes(dst + 64, src + 64);
+		Sio2Copy64Bytes(dst + 128, src + 128);
+		Sio2Copy64Bytes(dst + 192, src + 192);
+	}
+
+	static __forceinline void Sio2CountNeonCopy(size_t qwords, size_t groups64, size_t groups256)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuSio2FifoNeonQwords += static_cast<u32>(qwords);
 		g_qemuSio2FifoNeon64ByteGroups += static_cast<u32>(groups64);
+		g_qemuSio2FifoNeon256ByteGroups += static_cast<u32>(groups256);
 #endif
 	}
 
@@ -66,7 +76,19 @@ namespace
 		u8* cdst = dst;
 		const u8* csrc = src;
 
-		const size_t groups64 = bytes >> 6;
+		const size_t groups256 = bytes >> 8;
+		for (size_t i = 0; i < groups256; i++)
+		{
+			if ((i + 1) < groups256)
+				__builtin_prefetch(csrc + 256, 0, 1);
+
+			Sio2Copy256Bytes(cdst, csrc);
+			csrc += 256;
+			cdst += 256;
+		}
+
+		const size_t remaining_bytes = bytes & 255;
+		const size_t groups64 = remaining_bytes >> 6;
 		for (size_t i = 0; i < groups64; i++)
 		{
 			if ((i + 1) < groups64)
@@ -98,7 +120,7 @@ namespace
 		for (size_t i = 0; i < (tail_bytes & 7); i++)
 			cdst[i] = csrc[i];
 
-		Sio2CountNeonCopy((groups64 << 2) + tail_qwords, groups64);
+		Sio2CountNeonCopy((groups256 << 4) + (groups64 << 2) + tail_qwords, (groups256 << 2) + groups64, groups256);
 	}
 #else
 	static __forceinline void Sio2CopyBytes(u8* dst, const u8* src, size_t bytes)
