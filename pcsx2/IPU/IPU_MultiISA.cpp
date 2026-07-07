@@ -23,6 +23,7 @@
 u32 g_qemuIpuCscPostNeonBlocks = 0;
 u32 g_qemuIpuVqNeonGroups = 0;
 u32 g_qemuIpuIdctCopyNeonRows = 0;
+u32 g_qemuIpuBitreader64NeonReads = 0;
 #endif
 
 // the IPU is fixed to 16 byte strides (128-bit / QWC resolution):
@@ -132,6 +133,37 @@ __fi static u32 GETBITS(uint num)
 	return retVal;
 }
 
+#if defined(ARCH_ARM32)
+static __forceinline uint8x8_t ipuGetShifted64BitsNeon(const u8* readpos, uint shift)
+{
+	// PCSX2 owner: getBits64() below. For misaligned bit positions, each
+	// output byte takes high bits from the current byte and low bits from the
+	// following byte; use NEON byte shifts instead of unaligned u64 masks.
+	const uint8x8_t current = vld1_u8(readpos);
+	if (shift == 0)
+		return current;
+
+	const uint8x8_t next = vld1_u8(readpos + 1);
+	switch (shift)
+	{
+		case 1:
+			return vorr_u8(vshl_n_u8(current, 1), vshr_n_u8(next, 7));
+		case 2:
+			return vorr_u8(vshl_n_u8(current, 2), vshr_n_u8(next, 6));
+		case 3:
+			return vorr_u8(vshl_n_u8(current, 3), vshr_n_u8(next, 5));
+		case 4:
+			return vorr_u8(vshl_n_u8(current, 4), vshr_n_u8(next, 4));
+		case 5:
+			return vorr_u8(vshl_n_u8(current, 5), vshr_n_u8(next, 3));
+		case 6:
+			return vorr_u8(vshl_n_u8(current, 6), vshr_n_u8(next, 2));
+		default:
+			return vorr_u8(vshl_n_u8(current, 7), vshr_n_u8(next, 1));
+	}
+}
+#endif
+
 // whenever reading fractions of bytes. The low bits always come from the next byte
 // while the high bits come from the current byte
 __ri static u8 getBits64(u8 *address, bool advance)
@@ -140,6 +172,12 @@ __ri static u8 getBits64(u8 *address, bool advance)
 
 	const u8* readpos = &g_BP.internal_qwc[0]._u8[g_BP.BP/8];
 
+#if defined(ARCH_ARM32)
+	vst1_u8(address, ipuGetShifted64BitsNeon(readpos, g_BP.BP & 7));
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuIpuBitreader64NeonReads;
+#endif
+#else
 	if (uint shift = (g_BP.BP & 7))
 	{
 		u64 mask = (0xff >> shift);
@@ -151,6 +189,7 @@ __ri static u8 getBits64(u8 *address, bool advance)
 	{
 		*(u64*)address = *(u64*)readpos;
 	}
+#endif
 
 	if (advance) g_BP.Advance(64);
 
