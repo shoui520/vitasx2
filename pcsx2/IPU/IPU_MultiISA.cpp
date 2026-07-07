@@ -23,6 +23,7 @@
 u32 g_qemuIpuCscPostNeonBlocks = 0;
 u32 g_qemuIpuVqNeonGroups = 0;
 u32 g_qemuIpuIdctCopyNeonRows = 0;
+u32 g_qemuIpuDctLowLookupHits = 0;
 u32 g_qemuIpuBitreader64NeonReads = 0;
 u32 g_qemuIpuBitreader32NeonReads = 0;
 u32 g_qemuIpuBitreader8ArmReads = 0;
@@ -72,8 +73,30 @@ static constexpr mpeg2_scan_pack make_scan_pack()
 	return pack;
 }
 
+static constexpr std::array<DCTtab, 512> make_dct_low_lookup()
+{
+	std::array<DCTtab, 512> lut = {};
+
+	for (u32 code = 16; code < 512; code++)
+	{
+		if (code >= 256)
+			lut[code] = DCT.tab2[(code >> 4) - 16];
+		else if (code >= 128)
+			lut[code] = DCT.tab3[(code >> 3) - 16];
+		else if (code >= 64)
+			lut[code] = DCT.tab4[(code >> 2) - 16];
+		else if (code >= 32)
+			lut[code] = DCT.tab5[(code >> 1) - 16];
+		else
+			lut[code] = DCT.tab6[code - 16];
+	}
+
+	return lut;
+}
+
 alignas(16) const std::array<u8, 1024> g_idct_clip_lut = make_clip_lut();
 alignas(16) const mpeg2_scan_pack mpeg2_scan = make_scan_pack();
+alignas(16) const std::array<DCTtab, 512> g_dct_low_lookup = make_dct_low_lookup();
 
 #endif
 
@@ -620,6 +643,69 @@ __ri static void IDCT_Add(const int last, s16* block, s16* dest, const int strid
 static const DCTtab * tab;
 static int mbaCount = 0;
 
+static __forceinline const DCTtab* LookupDctTabReference(u16 code, bool table_one, bool first_coefficient)
+{
+	if (code >= 16384 && !table_one)
+		return first_coefficient ? &DCT.first[(code >> 12) - 4] : &DCT.next[(code >> 12) - 4];
+	if (code >= 1024)
+		return table_one ? &DCT.tab0a[(code >> 8) - 4] : &DCT.tab0[(code >> 8) - 4];
+	if (code >= 512)
+		return table_one ? &DCT.tab1a[(code >> 6) - 8] : &DCT.tab1[(code >> 6) - 8];
+	if (code >= 256)
+		return &DCT.tab2[(code >> 4) - 16];
+	if (code >= 128)
+		return &DCT.tab3[(code >> 3) - 16];
+	if (code >= 64)
+		return &DCT.tab4[(code >> 2) - 16];
+	if (code >= 32)
+		return &DCT.tab5[(code >> 1) - 16];
+	if (code >= 16)
+		return &DCT.tab6[code - 16];
+
+	return nullptr;
+}
+
+static __forceinline const DCTtab* LookupDctTabSelected(u16 code, bool table_one, bool first_coefficient)
+{
+	if (code >= 16384 && !table_one)
+		return first_coefficient ? &DCT.first[(code >> 12) - 4] : &DCT.next[(code >> 12) - 4];
+	if (code >= 1024)
+		return table_one ? &DCT.tab0a[(code >> 8) - 4] : &DCT.tab0[(code >> 8) - 4];
+	if (code >= 512)
+		return table_one ? &DCT.tab1a[(code >> 6) - 8] : &DCT.tab1[(code >> 6) - 8];
+	if (code >= 16)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuDctLowLookupHits;
+#endif
+		return &g_dct_low_lookup[code];
+	}
+
+	return nullptr;
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+bool IpuDctLookupReferenceForValidation(u16 code, bool table_one, bool first_coefficient, DCTtab* out)
+{
+	const DCTtab* result = LookupDctTabReference(code, table_one, first_coefficient);
+	if (result == nullptr)
+		return false;
+
+	*out = *result;
+	return true;
+}
+
+bool IpuDctLookupSelectedForValidation(u16 code, bool table_one, bool first_coefficient, DCTtab* out)
+{
+	const DCTtab* result = LookupDctTabSelected(code, table_one, first_coefficient);
+	if (result == nullptr)
+		return false;
+
+	*out = *result;
+	return true;
+}
+#endif
+
 __ri static int BitstreamInit ()
 {
 	return g_BP.FillBuffer(32);
@@ -853,6 +939,7 @@ __ri static bool get_intra_block()
 	int quantizer_scale = decoder.quantizer_scale;
 	s16 * dest = decoder.DCTblock;
 	u16 code;
+	const bool table_one = decoder.intra_vlc_format && !decoder.mpeg1;
 
 	/* decode AC coefficients */
   for (int i=1 + ipu_cmd.pos[4]; ; i++)
@@ -868,59 +955,10 @@ __ri static bool get_intra_block()
 
 		code = UBITS(16);
 
-		if (code >= 16384 && (!decoder.intra_vlc_format || decoder.mpeg1))
-		{
-		  tab = &DCT.next[(code >> 12) - 4];
-		}
-		else if (code >= 1024)
-		{
-			if (decoder.intra_vlc_format && !decoder.mpeg1)
-			{
-				tab = &DCT.tab0a[(code >> 8) - 4];
-			}
-			else
-			{
-				tab = &DCT.tab0[(code >> 8) - 4];
-			}
-		}
-		else if (code >= 512)
-		{
-			if (decoder.intra_vlc_format && !decoder.mpeg1)
-			{
-				tab = &DCT.tab1a[(code >> 6) - 8];
-			}
-			else
-			{
-				tab = &DCT.tab1[(code >> 6) - 8];
-			}
-		}
-
-		// [TODO] Optimization: Following codes can all be done by a single "expedited" lookup
-		// that should use a single unrolled DCT table instead of five separate tables used
-		// here.  Multiple conditional statements are very slow, while modern CPU data caches
-		// have lots of room to spare.
-
-		else if (code >= 256)
-		{
-			tab = &DCT.tab2[(code >> 4) - 16];
-		}
-		else if (code >= 128)
-		{
-			tab = &DCT.tab3[(code >> 3) - 16];
-		}
-		else if (code >= 64)
-		{
-			tab = &DCT.tab4[(code >> 2) - 16];
-		}
-		else if (code >= 32)
-		{
-			tab = &DCT.tab5[(code >> 1) - 16];
-		}
-		else if (code >= 16)
-		{
-			tab = &DCT.tab6[code - 16];
-		}
-		else
+		// PCSX2 owner: get_intra_block()'s DCT table chain. Low VLC codes now
+		// use a compact predecoded table to avoid five unpredictable branches.
+		tab = LookupDctTabSelected(code, table_one, false);
+		if (tab == nullptr)
 		{
 		  ipu_cmd.pos[4] = 0;
 		  return true;
@@ -1026,52 +1064,9 @@ __ri static bool get_non_intra_block(int * last)
 
 			code = UBITS(16);
 
-			if (code >= 16384)
-			{
-				if (i==0)
-				{
-					tab = &DCT.first[(code >> 12) - 4];
-				}
-				else
-				{
-					tab = &DCT.next[(code >> 12)- 4];
-				}
-			}
-			else if (code >= 1024)
-			{
-				tab = &DCT.tab0[(code >> 8) - 4];
-			}
-			else if (code >= 512)
-			{
-				tab = &DCT.tab1[(code >> 6) - 8];
-			}
-
-			// [TODO] Optimization: Following codes can all be done by a single "expedited" lookup
-			// that should use a single unrolled DCT table instead of five separate tables used
-			// here.  Multiple conditional statements are very slow, while modern CPU data caches
-			// have lots of room to spare.
-
-			else if (code >= 256)
-			{
-				tab = &DCT.tab2[(code >> 4) - 16];
-			}
-			else if (code >= 128)
-			{
-				tab = &DCT.tab3[(code >> 3) - 16];
-			}
-			else if (code >= 64)
-			{
-				tab = &DCT.tab4[(code >> 2) - 16];
-			}
-			else if (code >= 32)
-			{
-				tab = &DCT.tab5[(code >> 1) - 16];
-			}
-			else if (code >= 16)
-			{
-				tab = &DCT.tab6[code - 16];
-			}
-			else
+			// PCSX2 owner: get_non_intra_block()'s DCT table chain.
+			tab = LookupDctTabSelected(code, false, i == 0);
+			if (tab == nullptr)
 			{
 				ipu_cmd.pos[4] = 0;
 				return true;

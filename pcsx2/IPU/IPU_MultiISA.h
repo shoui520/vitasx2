@@ -163,3 +163,4 @@ struct mpeg2_scan_pack
 
 alignas(16) extern const std::array<u8, 1024> g_idct_clip_lut;
 alignas(16) extern const mpeg2_scan_pack mpeg2_scan;
+alignas(16) extern const std::array<DCTtab, 512> g_dct_low_lookup;
