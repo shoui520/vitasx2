@@ -1420,7 +1420,7 @@ namespace VUInterpFast
 		if (ft == 0)
 			return;
 #if defined(ARCH_ARM32)
-		if (mask != 0)
+		if (mask == 0x0f)
 		{
 			StoreLowerVfResultMaskedNeon(VU->VF[ft].UL, mask, vld1q_u32(ptr));
 			return;
@@ -1435,7 +1435,7 @@ namespace VUInterpFast
 	static inline void StoreVfMasked(VURegs* VU, unsigned fs, unsigned mask, u32* ptr)
 	{
 #if defined(ARCH_ARM32)
-		if (mask != 0)
+		if (mask == 0x0f)
 		{
 			StoreLowerVfResultMaskedNeon(ptr, mask, vld1q_u32(VU->VF[fs].UL));
 			return;
@@ -1452,7 +1452,7 @@ namespace VUInterpFast
 		if (ft == 0)
 			return;
 #if defined(ARCH_ARM32)
-		if (mask != 0)
+		if (mask == 0x0f)
 		{
 			StoreLowerVfResultMaskedNeon(VU->VF[ft].UL, mask, vdupq_n_u32(value));
 			return;
@@ -1469,7 +1469,7 @@ namespace VUInterpFast
 		if (ft == 0)
 			return;
 #if defined(ARCH_ARM32)
-		if (mask != 0)
+		if (mask == 0x0f)
 		{
 			StoreLowerVfResultMaskedNeon(VU->VF[ft].UL, mask, vreinterpretq_u32_s32(vdupq_n_s32(value)));
 			return;
@@ -1484,13 +1484,39 @@ namespace VUInterpFast
 #if defined(ARCH_ARM32)
 	static inline void StoreViHalfwordToMemoryQwordMasked(u16 value, unsigned mask, u16* ptr)
 	{
-		StoreLowerVfResultMaskedNeon(reinterpret_cast<u32*>(ptr), mask, vdupq_n_u32(value));
+		if (mask == 0)
+			return;
+		if (mask == 0x0f)
+		{
+			StoreLowerVfResultMaskedNeon(reinterpret_cast<u32*>(ptr), mask, vdupq_n_u32(value));
+			return;
+		}
+
+		u32* words = reinterpret_cast<u32*>(ptr);
+		const u32 word = value;
+		if (mask & 0x8) words[0] = word;
+		if (mask & 0x4) words[1] = word;
+		if (mask & 0x2) words[2] = word;
+		if (mask & 0x1) words[3] = word;
 	}
 
 	static inline void StoreMr32Masked(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
 	{
+		if (mask == 0)
+			return;
+
 		const uint32x4_t source = vld1q_u32(VU->VF[fs].UL);
-		StoreLowerVfResultMaskedNeon(VU->VF[ft].UL, mask, vextq_u32(source, source, 1));
+		const uint32x4_t rotated = vextq_u32(source, source, 1);
+		if (mask == 0x0f)
+		{
+			StoreLowerVfResultMaskedNeon(VU->VF[ft].UL, mask, rotated);
+			return;
+		}
+
+		if (mask & 0x8) vst1q_lane_u32(&VU->VF[ft].UL[0], rotated, 0);
+		if (mask & 0x4) vst1q_lane_u32(&VU->VF[ft].UL[1], rotated, 1);
+		if (mask & 0x2) vst1q_lane_u32(&VU->VF[ft].UL[2], rotated, 2);
+		if (mask & 0x1) vst1q_lane_u32(&VU->VF[ft].UL[3], rotated, 3);
 	}
 #endif
 
