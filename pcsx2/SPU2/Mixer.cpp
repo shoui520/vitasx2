@@ -45,6 +45,7 @@ u32 g_qemuSpu2VoiceInterpNeon = 0;
 u32 g_qemuSpu2DecodeFifoNeonStores = 0;
 u32 g_qemuSpu2DecodeFifoWrappedStores = 0;
 u32 g_qemuSpu2AdpcmSsatClamps = 0;
+u32 g_qemuSpu2MixerIrqDisabledChecksSkipped = 0;
 #endif
 
 MULTI_ISA_UNSHARED_START
@@ -131,6 +132,17 @@ void Spu2XaDecodeBlockSelectedForValidation(s16* buffer, const s16* block, s32* 
 }
 #endif
 
+static __forceinline bool HasEnabledMixerIrqCore()
+{
+	if (Cores[0].IRQEnable || Cores[1].IRQEnable)
+		return true;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	::g_qemuSpu2MixerIrqDisabledChecksSkipped += 2;
+#endif
+	return false;
+}
+
 static void __forceinline IncrementNextA(V_Core& thiscore, uint voiceidx)
 {
 	V_Voice& vc(thiscore.Voices[voiceidx]);
@@ -138,20 +150,48 @@ static void __forceinline IncrementNextA(V_Core& thiscore, uint voiceidx)
 	// Important!  Both cores signal IRQ when an address is read, regardless of
 	// which core actually reads the address.
 
-	for (int i = 0; i < 2; i++)
+	if (HasEnabledMixerIrqCore())
 	{
-		if (Cores[i].IRQEnable && (vc.NextA == Cores[i].IRQA))
+		for (int i = 0; i < 2; i++)
 		{
-			//if( IsDevBuild )
-			//	ConLog(" * SPU2 Core %d: IRQ Requested (IRQA (%05X) passed; voice %d).\n", i, Cores[i].IRQA, thiscore.Index * 24 + voiceidx);
+			if (Cores[i].IRQEnable && (vc.NextA == Cores[i].IRQA))
+			{
+				//if( IsDevBuild )
+				//	ConLog(" * SPU2 Core %d: IRQ Requested (IRQA (%05X) passed; voice %d).\n", i, Cores[i].IRQA, thiscore.Index * 24 + voiceidx);
 
-			SetIrqCall(i);
+				SetIrqCall(i);
+			}
 		}
 	}
 
 	vc.NextA++;
 	vc.NextA &= 0xFFFFF;
 }
+
+#if defined(VITASX2_QEMU_VALIDATION)
+static void IncrementNextA_reference(V_Core& thiscore, uint voiceidx)
+{
+	V_Voice& vc(thiscore.Voices[voiceidx]);
+	for (int i = 0; i < 2; i++)
+	{
+		if (Cores[i].IRQEnable && (vc.NextA == Cores[i].IRQA))
+			SetIrqCall(i);
+	}
+
+	vc.NextA++;
+	vc.NextA &= 0xFFFFF;
+}
+
+void Spu2IncrementNextAReferenceForValidation(uint coreidx, uint voiceidx)
+{
+	IncrementNextA_reference(Cores[coreidx], voiceidx);
+}
+
+void Spu2IncrementNextASelectedForValidation(uint coreidx, uint voiceidx)
+{
+	IncrementNextA(Cores[coreidx], voiceidx);
+}
+#endif
 
 static __forceinline void PushDecodeFifoSamples_reference(V_Voice& vc, int sampleIdx)
 {
@@ -287,9 +327,12 @@ static __forceinline void UpdateBlockHeader(V_Core& thiscore, uint voiceidx)
 {
 	V_Voice& vc(thiscore.Voices[voiceidx]);
 
-	for (int i = 0; i < 2; i++)
-		if (Cores[i].IRQEnable && Cores[i].IRQA == (vc.NextA & 0xFFFF8))
-			SetIrqCall(i);
+	if (HasEnabledMixerIrqCore())
+	{
+		for (int i = 0; i < 2; i++)
+			if (Cores[i].IRQEnable && Cores[i].IRQA == (vc.NextA & 0xFFFF8))
+				SetIrqCall(i);
+	}
 
 	s16* memptr = GetMemPtr(vc.NextA & 0xFFFF8);
 	vc.LoopFlags = *memptr >> 8; // grab loop flags from the upper byte.
@@ -299,6 +342,33 @@ static __forceinline void UpdateBlockHeader(V_Core& thiscore, uint voiceidx)
 		vc.LoopStartA = vc.NextA & 0xFFFF8;
 	}
 }
+
+#if defined(VITASX2_QEMU_VALIDATION)
+static void UpdateBlockHeader_reference(V_Core& thiscore, uint voiceidx)
+{
+	V_Voice& vc(thiscore.Voices[voiceidx]);
+
+	for (int i = 0; i < 2; i++)
+		if (Cores[i].IRQEnable && Cores[i].IRQA == (vc.NextA & 0xFFFF8))
+			SetIrqCall(i);
+
+	s16* memptr = GetMemPtr(vc.NextA & 0xFFFF8);
+	vc.LoopFlags = *memptr >> 8;
+
+	if ((vc.LoopFlags & XAFLAG_LOOP_START) && !vc.LoopMode)
+		vc.LoopStartA = vc.NextA & 0xFFFF8;
+}
+
+void Spu2UpdateBlockHeaderReferenceForValidation(uint coreidx, uint voiceidx)
+{
+	UpdateBlockHeader_reference(Cores[coreidx], voiceidx);
+}
+
+void Spu2UpdateBlockHeaderSelectedForValidation(uint coreidx, uint voiceidx)
+{
+	UpdateBlockHeader(Cores[coreidx], voiceidx);
+}
+#endif
 
 static __forceinline void DecodeSamples(uint coreidx, uint voiceidx)
 {
@@ -517,12 +587,15 @@ static __forceinline s32 GetNoiseValues(V_Core& thiscore)
 static __forceinline void spu2M_WriteFast(u32 addr, s16 value)
 {
 	// Fixes some of the oldest hangs in pcsx2's history! :p
-	for (int i = 0; i < 2; i++)
+	if (HasEnabledMixerIrqCore())
 	{
-		if (Cores[i].IRQEnable && Cores[i].IRQA == addr)
+		for (int i = 0; i < 2; i++)
 		{
-			//printf("Core %d special write IRQ Called (IRQ passed). IRQA = %x\n",i,addr);
-			SetIrqCall(i);
+			if (Cores[i].IRQEnable && Cores[i].IRQA == addr)
+			{
+				//printf("Core %d special write IRQ Called (IRQ passed). IRQA = %x\n",i,addr);
+				SetIrqCall(i);
+			}
 		}
 	}
 // throw an assertion if the memory range is invalid:
@@ -531,6 +604,32 @@ static __forceinline void spu2M_WriteFast(u32 addr, s16 value)
 #endif
 	*GetMemPtr(addr) = value;
 }
+
+#if defined(VITASX2_QEMU_VALIDATION)
+static void spu2M_WriteFast_reference(u32 addr, s16 value)
+{
+	for (int i = 0; i < 2; i++)
+	{
+		if (Cores[i].IRQEnable && Cores[i].IRQA == addr)
+			SetIrqCall(i);
+	}
+
+#ifndef DEBUG_FAST
+	pxAssume(addr < SPU2_DYN_MEMLINE);
+#endif
+	*GetMemPtr(addr) = value;
+}
+
+void Spu2WriteFastReferenceForValidation(u32 addr, s16 value)
+{
+	spu2M_WriteFast_reference(addr, value);
+}
+
+void Spu2WriteFastSelectedForValidation(u32 addr, s16 value)
+{
+	spu2M_WriteFast(addr, value);
+}
+#endif
 
 
 static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx)
