@@ -35,6 +35,8 @@ u32 g_qemuVuDecodedUpperCacheHits = 0;
 u32 g_qemuVuDecodedUpperCacheMisses = 0;
 u32 g_qemuVuDecodedLowerCacheHits = 0;
 u32 g_qemuVuDecodedLowerCacheMisses = 0;
+u32 g_qemuVuDecodedUpperExecuteHits = 0;
+u32 g_qemuVuDecodedLowerExecuteHits = 0;
 bool g_qemuVuLowerDirectFastEnabled = true;
 bool g_qemuVuUpperDirectFastEnabled = true;
 bool g_qemuVuLowerDirectBurstEnabled = true;
@@ -55,6 +57,8 @@ namespace
 	{
 		u32 upper = 0;
 		u32 lower = 0;
+		VUInterpFast::UpperFastKind upper_kind = VUInterpFast::UpperFastKind::None;
+		VUInterpFast::LowerFastKind lower_kind = VUInterpFast::LowerFastKind::None;
 		_VURegsNum upper_regs = {};
 		_VURegsNum lower_regs = {};
 		u8 flags = 0;
@@ -104,7 +108,8 @@ bool VuMicroAnalyzeUpperNoLowerCached(int idx, u32 pc, u32 code, _VURegsNum* reg
 #endif
 	entry.upper = code;
 	entry.flags = static_cast<u8>(entry.flags & ~VU_DECODED_UPPER_FAST);
-	const bool fast = VUInterpFast::AnalyzeUpperNoLower(code, &entry.upper_regs);
+	entry.upper_kind = VUInterpFast::DecodeUpper(code);
+	const bool fast = VUInterpFast::AnalyzeUpperNoLowerKnownKind(code, entry.upper_kind, &entry.upper_regs);
 	if (fast)
 	{
 		entry.flags |= VU_DECODED_UPPER_FAST;
@@ -134,7 +139,8 @@ bool VuMicroAnalyzeLowerNoUpperCached(int idx, u32 pc, u32 code, _VURegsNum* reg
 #endif
 	entry.lower = code;
 	entry.flags = static_cast<u8>(entry.flags & ~VU_DECODED_LOWER_FAST);
-	const bool fast = VUInterpFast::AnalyzeLowerNoUpper(code, &entry.lower_regs);
+	entry.lower_kind = VUInterpFast::DecodeLower(code);
+	const bool fast = VUInterpFast::AnalyzeLowerNoUpperKnownKind(code, entry.lower_kind, &entry.lower_regs);
 	if (fast)
 	{
 		entry.flags |= VU_DECODED_LOWER_FAST;
@@ -142,6 +148,40 @@ bool VuMicroAnalyzeLowerNoUpperCached(int idx, u32 pc, u32 code, _VURegsNum* reg
 	}
 	entry.flags |= VU_DECODED_LOWER_VALID;
 	return fast;
+}
+
+void VuMicroExecuteUpperNoLowerCached(int idx, u32 pc, VURegs* VU, u32 code)
+{
+	const VuMicroDecodedEntry& entry = VuMicroDecodedEntryForPc(idx, pc);
+	if ((entry.flags & (VU_DECODED_UPPER_VALID | VU_DECODED_UPPER_FAST)) ==
+			(VU_DECODED_UPPER_VALID | VU_DECODED_UPPER_FAST) &&
+		entry.upper == code)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVuDecodedUpperExecuteHits;
+#endif
+		VUInterpFast::ExecuteUpperNoLowerKnownKind(VU, code, entry.upper_kind);
+		return;
+	}
+
+	VUInterpFast::ExecuteUpperNoLower(VU, code);
+}
+
+void VuMicroExecuteLowerNoUpperCached(int idx, u32 pc, VURegs* VU, u32 code)
+{
+	const VuMicroDecodedEntry& entry = VuMicroDecodedEntryForPc(idx, pc);
+	if ((entry.flags & (VU_DECODED_LOWER_VALID | VU_DECODED_LOWER_FAST)) ==
+			(VU_DECODED_LOWER_VALID | VU_DECODED_LOWER_FAST) &&
+		entry.lower == code)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuVuDecodedLowerExecuteHits;
+#endif
+		VUInterpFast::ExecuteLowerNoUpperKnownKind(VU, code, entry.lower_kind);
+		return;
+	}
+
+	VUInterpFast::ExecuteLowerNoUpper(VU, code);
 }
 
 void VuMicroInvalidateDecodedCache(int idx, u32 addr, u32 size)

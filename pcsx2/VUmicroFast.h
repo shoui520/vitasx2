@@ -816,9 +816,8 @@ namespace VUInterpFast
 		regs->VIread = Vf0Flag(Fs(code)) | Vf0Flag(Ft(code)) | (1u << REG_ACC_FLAG);
 	}
 
-	static inline bool AnalyzeUpperNoLower(u32 code, _VURegsNum* regs)
+	static inline bool AnalyzeUpperNoLowerKnownKind(u32 code, UpperFastKind kind, _VURegsNum* regs)
 	{
-		const UpperFastKind kind = DecodeUpper(code);
 		if (kind == UpperFastKind::None)
 			return false;
 
@@ -1033,6 +1032,11 @@ namespace VUInterpFast
 		return true;
 	}
 
+	static inline bool AnalyzeUpperNoLower(u32 code, _VURegsNum* regs)
+	{
+		return AnalyzeUpperNoLowerKnownKind(code, DecodeUpper(code), regs);
+	}
+
 	static inline void AnalyzeIaluItIs(u32 code, _VURegsNum* regs)
 	{
 		regs->pipe = VUPIPE_IALU;
@@ -1074,9 +1078,8 @@ namespace VUInterpFast
 		regs->cycles = cycles;
 	}
 
-	static inline bool AnalyzeLowerNoUpper(u32 code, _VURegsNum* regs)
+	static inline bool AnalyzeLowerNoUpperKnownKind(u32 code, LowerFastKind kind, _VURegsNum* regs)
 	{
-		const LowerFastKind kind = DecodeLower(code);
 		if (kind == LowerFastKind::None)
 			return false;
 
@@ -1346,6 +1349,11 @@ namespace VUInterpFast
 		}
 
 		return false;
+	}
+
+	static inline bool AnalyzeLowerNoUpper(u32 code, _VURegsNum* regs)
+	{
+		return AnalyzeLowerNoUpperKnownKind(code, DecodeLower(code), regs);
 	}
 
 	static inline u32* VuMemQword(VURegs* VU, u32 address)
@@ -2326,9 +2334,9 @@ namespace VUInterpFast
 		return FloatToBits(value);
 	}
 
-	static inline void ExecuteUpperNoLower(VURegs* VU, u32 code)
+	static inline void ExecuteUpperNoLowerKnownKind(VURegs* VU, u32 code, UpperFastKind kind)
 	{
-		switch (DecodeUpper(code))
+		switch (kind)
 		{
 			case UpperFastKind::NOP:
 				return;
@@ -2805,6 +2813,11 @@ namespace VUInterpFast
 		}
 	}
 
+	static inline void ExecuteUpperNoLower(VURegs* VU, u32 code)
+	{
+		ExecuteUpperNoLowerKnownKind(VU, code, DecodeUpper(code));
+	}
+
 	static inline float VuDouble(u32 bits)
 	{
 #ifndef INT_VUDOUBLEHACK
@@ -2929,9 +2942,9 @@ namespace VUInterpFast
 			VU->VI[reg].US[0] = static_cast<u16>((VU->VI[REG_TPC].UL + 8) / 8);
 	}
 
-	static inline void ExecuteLowerNoUpper(VURegs* VU, u32 code)
+	static inline void ExecuteLowerNoUpperKnownKind(VURegs* VU, u32 code, LowerFastKind kind)
 	{
-		switch (DecodeLower(code))
+		switch (kind)
 		{
 			case LowerFastKind::LQ:
 			{
@@ -3426,5 +3439,10 @@ namespace VUInterpFast
 			case LowerFastKind::None:
 				return;
 		}
+	}
+
+	static inline void ExecuteLowerNoUpper(VURegs* VU, u32 code)
+	{
+		ExecuteLowerNoUpperKnownKind(VU, code, DecodeLower(code));
 	}
 } // namespace VUInterpFast

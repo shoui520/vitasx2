@@ -43,13 +43,13 @@ static void _vu0ExecLower(VURegs* VU, u32* ptr)
 	VU0_LOWER_OPCODE[VU->code >> 25]();
 }
 
-static void _vu0ExecUpperMaybeFast(VURegs* VU, u32* ptr, bool upper_fast)
+static void _vu0ExecUpperMaybeFast(VURegs* VU, u32 pc, u32* ptr, bool upper_fast)
 {
 	if (upper_fast)
 	{
 		VU->code = ptr[1];
 		IdebugUPPER(VU0);
-		VUInterpFast::ExecuteUpperNoLower(VU, ptr[1]);
+		VuMicroExecuteUpperNoLowerCached(0, pc, VU, ptr[1]);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuVuUpperDirectFastSteps;
 #endif
@@ -240,7 +240,7 @@ static u32 _vu0ExecUpperNopLowerDirectBurst(VURegs* VU, u32 max_cycles)
 		vu0branch = false;
 
 		IdebugLOWER(VU0);
-		VUInterpFast::ExecuteLowerNoUpper(VU, lower);
+		VuMicroExecuteLowerNoUpperCached(0, pc, VU, lower);
 
 		if (lregs.pipe == VUPIPE_FMAC)
 			_vuClearFMAC(VU);
@@ -309,7 +309,7 @@ static u32 _vu0ExecUpperDirectLowerNopBurst(VURegs* VU, u32 max_cycles)
 		vu0branch = false;
 
 		IdebugUPPER(VU0);
-		VUInterpFast::ExecuteUpperNoLower(VU, upper);
+		VuMicroExecuteUpperNoLowerCached(0, pc, VU, upper);
 		VU->code = lower;
 
 		if (uregs.pipe == VUPIPE_FMAC)
@@ -420,7 +420,7 @@ static u32 _vu0ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 
 		VU->code = upper;
 		IdebugUPPER(VU0);
-		VUInterpFast::ExecuteUpperNoLower(VU, upper);
+		VuMicroExecuteUpperNoLowerCached(0, pc, VU, upper);
 
 		if (discard == 0)
 		{
@@ -436,7 +436,7 @@ static u32 _vu0ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 			}
 
 			IdebugLOWER(VU0);
-			VUInterpFast::ExecuteLowerNoUpper(VU, lower);
+			VuMicroExecuteLowerNoUpperCached(0, pc, VU, lower);
 
 			if (vfreg)
 				VU->VF[vfreg] = _VFc;
@@ -513,7 +513,7 @@ static u32 _vu0ExecIbitDirectBurst(VURegs* VU, u32 max_cycles)
 			VU->VIBackupCycles -= std::min((u8)(VU->cycle - cyclesBeforeOp), VU->VIBackupCycles);
 
 		IdebugUPPER(VU0);
-		VUInterpFast::ExecuteUpperNoLower(VU, upper);
+		VuMicroExecuteUpperNoLowerCached(0, pc, VU, upper);
 		VU->VI[REG_I].UL = ptr[0];
 
 		if (uregs.pipe == VUPIPE_FMAC)
@@ -607,7 +607,7 @@ static void _vu0Exec(VURegs* VU)
 		if (lower_fast)
 		{
 			IdebugLOWER(VU0);
-			VUInterpFast::ExecuteLowerNoUpper(VU, ptr[0]);
+			VuMicroExecuteLowerNoUpperCached(0, pc, VU, ptr[0]);
 		}
 		else if (!lower_nop)
 			_vu0ExecLower(VU, ptr);
@@ -679,7 +679,7 @@ static void _vu0Exec(VURegs* VU)
 		if (VU->VIBackupCycles > 0)
 			VU->VIBackupCycles -= std::min((u8)(VU0.cycle - cyclesBeforeOp), VU->VIBackupCycles);
 
-		_vu0ExecUpperMaybeFast(VU, ptr, upper_fast);
+		_vu0ExecUpperMaybeFast(VU, pc, ptr, upper_fast);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (upper_fast)
@@ -703,7 +703,7 @@ static void _vu0Exec(VURegs* VU)
 				VU->VIBackupCycles -= std::min((u8)(VU0.cycle - cyclesBeforeOp), VU->VIBackupCycles);
 			vu0branch = false;
 
-			_vu0ExecUpperMaybeFast(VU, ptr, upper_fast);
+			_vu0ExecUpperMaybeFast(VU, pc, ptr, upper_fast);
 			VU->code = ptr[0];
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -767,7 +767,7 @@ static void _vu0Exec(VURegs* VU)
 				}
 			}
 
-			_vu0ExecUpperMaybeFast(VU, ptr, upper_fast);
+			_vu0ExecUpperMaybeFast(VU, pc, ptr, upper_fast);
 
 			if (discard == 0)
 			{
@@ -785,7 +785,7 @@ static void _vu0Exec(VURegs* VU)
 				if (lower_fast)
 				{
 					IdebugLOWER(VU0);
-					VUInterpFast::ExecuteLowerNoUpper(VU, ptr[0]);
+					VuMicroExecuteLowerNoUpperCached(0, pc, VU, ptr[0]);
 				}
 				else
 					_vu0ExecLower(VU, ptr);
