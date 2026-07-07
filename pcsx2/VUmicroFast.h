@@ -25,6 +25,7 @@ extern u32 g_qemuVuUpperNeonQwordOps;
 extern u32 g_qemuVuUpperScalarFullMaskOps;
 extern u32 g_qemuVuUpperScalarPartialMaskOps;
 extern u32 g_qemuVuLowerVfpSqrtOps;
+extern u32 g_qemuVuUpperVfpMaddScalarOps;
 #endif
 
 namespace VUInterpFast
@@ -1545,6 +1546,39 @@ namespace VUInterpFast
 #endif
 	}
 
+	template <bool subtract>
+	static inline float VuMaddMsubScalar(float acc, float fs, float operand)
+	{
+#if defined(ARCH_ARM32)
+		// PCSX2 owner: VUops.cpp::_vuOpMADD()/_vuOpMSUB(). Keep the exact
+		// separate multiply then add/subtract ordering while forcing native
+		// Cortex-A9 VFP scalar instructions instead of a C helper sequence.
+		float result;
+		if (subtract)
+		{
+			__asm__(
+				"vmul.f32 %0, %1, %2\n\t"
+				"vsub.f32 %0, %3, %0"
+				: "=&t"(result)
+				: "t"(fs), "t"(operand), "t"(acc));
+		}
+		else
+		{
+			__asm__(
+				"vmul.f32 %0, %1, %2\n\t"
+				"vadd.f32 %0, %3, %0"
+				: "=&t"(result)
+				: "t"(fs), "t"(operand), "t"(acc));
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuUpperVfpMaddScalarOps;
+#endif
+		return result;
+#else
+		return subtract ? (acc - (fs * operand)) : (acc + (fs * operand));
+#endif
+	}
+
 	template <typename Unary>
 	static inline void StoreUnaryUpperMasked(VURegs* VU, unsigned ft, unsigned mask, unsigned fs, Unary fn)
 	{
@@ -2109,8 +2143,10 @@ namespace VUInterpFast
 	template <bool subtract, typename Operand>
 	static inline void ExecuteMaddMsubLaneScalar(VURegs* VU, bool acc, unsigned fd, unsigned fs, unsigned lane, Operand& operand)
 	{
-		const float product = VuDouble(VU->VF[fs].UL[lane]) * VuDouble(operand(lane));
-		const float result = subtract ? (VuDouble(VU->ACC.UL[lane]) - product) : (VuDouble(VU->ACC.UL[lane]) + product);
+		const float result = VuMaddMsubScalar<subtract>(
+			VuDouble(VU->ACC.UL[lane]),
+			VuDouble(VU->VF[fs].UL[lane]),
+			VuDouble(operand(lane)));
 		WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, result));
 	}
 

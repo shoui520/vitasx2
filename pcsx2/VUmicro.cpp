@@ -28,6 +28,7 @@ u32 g_qemuVuUpperNeonQwordOps = 0;
 u32 g_qemuVuUpperScalarFullMaskOps = 0;
 u32 g_qemuVuUpperScalarPartialMaskOps = 0;
 u32 g_qemuVuLowerVfpSqrtOps = 0;
+u32 g_qemuVuUpperVfpMaddScalarOps = 0;
 u32 g_qemuVuDecodedUpperCacheHits = 0;
 u32 g_qemuVuDecodedUpperCacheMisses = 0;
 u32 g_qemuVuDecodedLowerCacheHits = 0;
