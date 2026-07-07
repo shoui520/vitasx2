@@ -1408,10 +1408,19 @@ namespace VUInterpFast
 		if (mask == 0)
 			return;
 
-		vst1q_u32(VU->VF[fd].UL, BlendQwordMaskedNeon(VU->VF[fd].UL, mask, result));
+		if (mask == 0x0f)
+		{
+			vst1q_u32(VU->VF[fd].UL, result);
 #if defined(VITASX2_QEMU_VALIDATION)
-		++::g_qemuVuUpperNeonQwordOps;
+			++::g_qemuVuUpperNeonQwordOps;
 #endif
+			return;
+		}
+
+		if (mask & 0x8) vst1q_lane_u32(&VU->VF[fd].UL[0], result, 0);
+		if (mask & 0x4) vst1q_lane_u32(&VU->VF[fd].UL[1], result, 1);
+		if (mask & 0x2) vst1q_lane_u32(&VU->VF[fd].UL[2], result, 2);
+		if (mask & 0x1) vst1q_lane_u32(&VU->VF[fd].UL[3], result, 3);
 	}
 #endif
 
