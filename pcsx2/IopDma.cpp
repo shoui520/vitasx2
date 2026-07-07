@@ -65,7 +65,7 @@ static void Sio2Dma11TransferBytewise(u32& madr, u32 bytes)
 
 static void Sio2Dma11TransferBlock(u32& madr, u32 bytes)
 {
-	if (bytes != 0 && bytes <= 256 && IopDmaCanAccessExposedIopRam(madr, bytes))
+	if (bytes != 0 && IopDmaCanAccessExposedIopRam(madr, bytes))
 	{
 		const u8* data = iopPhysMem(madr);
 		g_Sio2.WriteBytes(data, bytes);
@@ -124,7 +124,7 @@ static void Sio2DmaWriteBufferBytewise(u32& madr, const u8* data, u32 bytes)
 
 static void Sio2Dma12TransferBlock(u32& madr, u32 bytes)
 {
-	if (bytes != 0 && bytes <= 256 && IopDmaCanAccessExposedIopRam(madr, bytes))
+	if (bytes != 0 && IopDmaCanAccessExposedIopRam(madr, bytes))
 	{
 		u8* const destination = iopPhysMem(madr);
 		g_Sio2.ReadBytes(destination, bytes);
