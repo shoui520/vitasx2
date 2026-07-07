@@ -1990,7 +1990,14 @@ namespace VUInterpFast
 	static inline bool TryExecuteMaddMsubVectorNeon(VURegs* VU, u32 code, bool acc, bool subtract)
 	{
 #if defined(ARCH_ARM32)
-		return ExecuteMaddMsubMaskedNeon(VU, code, acc, subtract, vld1q_u32(VU->VF[Ft(code)].UL));
+		// PCSX2 owner: VUops.cpp::_vuOpMADD()/_vuOpMSUB(). ARM32/QEMU
+		// exposes 1-ULP drift in dependent ACC chains through NEON here, so
+		// keep these on the scalar direct path until the qword path is exact.
+		(void)VU;
+		(void)code;
+		(void)acc;
+		(void)subtract;
+		return false;
 #else
 		return false;
 #endif
@@ -1999,7 +2006,14 @@ namespace VUInterpFast
 	static inline bool TryExecuteMaddMsubBroadcastNeon(VURegs* VU, u32 code, bool acc, bool subtract, u32 operand_bits)
 	{
 #if defined(ARCH_ARM32)
-		return ExecuteMaddMsubMaskedNeon(VU, code, acc, subtract, vdupq_n_u32(operand_bits));
+		// PCSX2 owner: VUops.cpp::_vuOpMADD()/_vuOpMSUB(). See the vector
+		// form above; the scalar direct path preserves dependent ACC results.
+		(void)VU;
+		(void)code;
+		(void)acc;
+		(void)subtract;
+		(void)operand_bits;
+		return false;
 #else
 		return false;
 #endif

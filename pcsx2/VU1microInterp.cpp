@@ -120,8 +120,7 @@ static __fi bool _vu1CanBurstLowerDirect(const _VURegsNum& lregs)
 
 static __fi bool _vu1CanBurstUpperDirect(const _VURegsNum& uregs)
 {
-	constexpr u32 acc_flag = 1u << REG_ACC_FLAG;
-	return uregs.pipe == VUPIPE_FMAC && (uregs.VIread & acc_flag) == 0 && (uregs.VIwrite & acc_flag) == 0;
+	return uregs.pipe == VUPIPE_FMAC;
 }
 
 static u32 _vu1ExecUpperNopLowerDirectBurst(VURegs* VU, u32 max_cycles)
