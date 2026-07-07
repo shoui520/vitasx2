@@ -15,6 +15,7 @@
 #if defined(VITASX2_QEMU_VALIDATION)
 extern u32 g_qemuCdvdBlockCopyNeonQwords;
 extern u32 g_qemuCdvdBlockCopyNeon64ByteGroups;
+extern u32 g_qemuCdvdBlockCopyNeon128ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon256ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon1024ByteGroups;
 extern u32 g_qemuCdvdBlockCopyNeon2048ByteGroups;
@@ -36,12 +37,16 @@ static __forceinline void CdvdCopy64Bytes(u8* dst, const u8* src)
 	vst1q_u8(dst + 48, qword3);
 }
 
-static __forceinline void CdvdCopy256Bytes(u8* dst, const u8* src)
+static __forceinline void CdvdCopy128Bytes(u8* dst, const u8* src)
 {
 	CdvdCopy64Bytes(dst, src);
 	CdvdCopy64Bytes(dst + 64, src + 64);
-	CdvdCopy64Bytes(dst + 128, src + 128);
-	CdvdCopy64Bytes(dst + 192, src + 192);
+}
+
+static __forceinline void CdvdCopy256Bytes(u8* dst, const u8* src)
+{
+	CdvdCopy128Bytes(dst, src);
+	CdvdCopy128Bytes(dst + 128, src + 128);
 }
 
 static __forceinline void CdvdCopy1024Bytes(u8* dst, const u8* src)
@@ -100,6 +105,7 @@ static __forceinline void CdvdCopy2352Bytes(u8* dst, const u8* src)
 static __forceinline void CdvdCountNeonCopy(
 	size_t qwords,
 	size_t groups64,
+	size_t groups128,
 	size_t groups256,
 	size_t groups1024,
 	size_t groups2048,
@@ -110,6 +116,7 @@ static __forceinline void CdvdCountNeonCopy(
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuCdvdBlockCopyNeonQwords += static_cast<u32>(qwords);
 	g_qemuCdvdBlockCopyNeon64ByteGroups += static_cast<u32>(groups64);
+	g_qemuCdvdBlockCopyNeon128ByteGroups += static_cast<u32>(groups128);
 	g_qemuCdvdBlockCopyNeon256ByteGroups += static_cast<u32>(groups256);
 	g_qemuCdvdBlockCopyNeon1024ByteGroups += static_cast<u32>(groups1024);
 	g_qemuCdvdBlockCopyNeon2048ByteGroups += static_cast<u32>(groups2048);
@@ -129,13 +136,13 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 	if (size == 2328)
 	{
 		CdvdCopy2328Bytes(cdst, csrc);
-		CdvdCountNeonCopy(145, 36, 9, 2, 1, 1);
+		CdvdCountNeonCopy(145, 36, 18, 9, 2, 1, 1);
 		return;
 	}
 	if (size == 2340)
 	{
 		CdvdCopy2340Bytes(cdst, csrc);
-		CdvdCountNeonCopy(146, 36, 9, 2, 1, 0, 1);
+		CdvdCountNeonCopy(146, 36, 18, 9, 2, 1, 0, 1);
 		return;
 	}
 	if (size != 0 && (size % 2352) == 0)
@@ -151,7 +158,7 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 			cdst += 2352;
 		}
 
-		CdvdCountNeonCopy(groups2352 * 147, groups2352 * 36, groups2352 * 9, groups2352 * 2, groups2352, 0, 0, groups2352);
+		CdvdCountNeonCopy(groups2352 * 147, groups2352 * 36, groups2352 * 18, groups2352 * 9, groups2352 * 2, groups2352, 0, 0, groups2352);
 		return;
 	}
 
@@ -191,7 +198,19 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 	}
 
 	const size_t remaining_after_256 = remaining_after_1024 & 255;
-	const size_t groups64 = remaining_after_256 >> 6;
+	const size_t groups128 = remaining_after_256 >> 7;
+	for (size_t i = 0; i < groups128; i++)
+	{
+		if ((i + 1) < groups128)
+			__builtin_prefetch(csrc + 128, 0, 1);
+
+		CdvdCopy128Bytes(cdst, csrc);
+		csrc += 128;
+		cdst += 128;
+	}
+
+	const size_t remaining_after_128 = remaining_after_256 & 127;
+	const size_t groups64 = remaining_after_128 >> 6;
 	for (size_t i = 0; i < groups64; i++)
 	{
 		if ((i + 1) < groups64)
@@ -202,7 +221,7 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 		cdst += 64;
 	}
 
-	const size_t tail_bytes = remaining_after_256 & 63;
+	const size_t tail_bytes = remaining_after_128 & 63;
 	const size_t tail_qwords = tail_bytes >> 4;
 	for (size_t i = 0; i < tail_qwords; i++)
 	{
@@ -222,8 +241,9 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 	for (size_t i = 0; i < (tail_bytes & 7); i++)
 		cdst[i] = csrc[i];
 
-	CdvdCountNeonCopy((groups2048 << 7) + (groups1024 << 6) + (groups256 << 4) + (groups64 << 2) + tail_qwords,
-		(groups2048 << 5) + (groups1024 << 4) + (groups256 << 2) + groups64,
+	CdvdCountNeonCopy((groups2048 << 7) + (groups1024 << 6) + (groups256 << 4) + (groups128 << 3) + (groups64 << 2) + tail_qwords,
+		(groups2048 << 5) + (groups1024 << 4) + (groups256 << 2) + (groups128 << 1) + groups64,
+		(groups2048 << 4) + (groups1024 << 3) + (groups256 << 1) + groups128,
 		(groups2048 << 3) + (groups1024 << 2) + groups256,
 		(groups2048 << 1) + groups1024,
 		groups2048);
