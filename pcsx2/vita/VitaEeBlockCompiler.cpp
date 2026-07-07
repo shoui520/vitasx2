@@ -363,6 +363,7 @@ namespace VitaEE
 			Cop2MacroArithmeticOperand operand = Cop2MacroArithmeticOperand::Vector;
 			bool acc_destination = false;
 			unsigned broadcast_lane = 0;
+			bool addi_triace_hack = false;
 		};
 
 		constexpr unsigned RS(u32 op)
@@ -659,6 +660,9 @@ namespace VitaEE
 					case 0x21:
 						return {true, Cop2MacroArithmeticKind::MAdd,
 							Cop2MacroArithmeticOperand::ImmediateQ, false, 0};
+					case 0x22:
+						return {true, Cop2MacroArithmeticKind::Add,
+							Cop2MacroArithmeticOperand::ImmediateI, false, 0, true};
 					case 0x23:
 						return {true, Cop2MacroArithmeticKind::MAdd,
 							Cop2MacroArithmeticOperand::ImmediateI, false, 0};
@@ -5206,11 +5210,10 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCOP2MacroArithmeticBody(u32 op)
 	{
-		// PCSX2 owners: VUops.cpp::_vuADD/_vuSUB/_vuMUL/_vuMADD/_vuMSUB/
-		// _vuOPMULA/_vuOPMSUB plus their broadcast/ACC variants,
-		// VUflags.cpp::VU_MAC*_UPDATE(), and VUops.cpp::SYNCMSFLAGS().
-		// FD VADDi stays helper-backed because VUops.cpp conditionally uses
-		// the TriAce CHECK_VUADDSUBHACK path.
+		// PCSX2 owners: VUops.cpp::_vuADD/_vuADDi/_vuSUB/_vuMUL/_vuMADD/
+		// _vuMSUB/_vuOPMULA/_vuOPMSUB plus their broadcast/ACC variants,
+		// VUops.cpp::vuADD_TriAceHack(), VUflags.cpp::VU_MAC*_UPDATE(), and
+		// VUops.cpp::SYNCMSFLAGS().
 		const Cop2MacroArithmeticOp arithmetic = DecodeCop2MacroArithmetic(op);
 		if (!arithmetic.valid)
 			return false;
@@ -5234,6 +5237,7 @@ namespace VitaEE
 		const bool uses_acc_source = arithmetic.kind == Cop2MacroArithmeticKind::MAdd ||
 									 arithmetic.kind == Cop2MacroArithmeticKind::MSub ||
 									 arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
+		const bool use_addi_triace_hack = arithmetic.addi_triace_hack && CHECK_VUADDSUBHACK;
 
 		const auto emit_normalize_vu_float_word = [&](unsigned reg) {
 			if (!EmitAndImm32OrReg(HOST_TMP3, reg, FPU_FLOAT_EXPONENT_MASK, HOST_TMP5) ||
@@ -5305,15 +5309,49 @@ namespace VitaEE
 			return false;
 		};
 
-		const auto emit_load_operand_lane = [&](unsigned lane) {
+		const auto emit_load_operand_lane_raw = [&](unsigned lane) {
 			if (arithmetic.operand == Cop2MacroArithmeticOperand::Vector)
 			{
-				return emit_load_vf_lane(HOST_TMP1, ft, lane) &&
-					   emit_normalize_vu_float_word(HOST_TMP1);
+				return emit_load_vf_lane(HOST_TMP1, ft, lane);
 			}
 
-			return m_code.EmitVmovSToCore(HOST_TMP1, VFP_BROADCAST_S3) &&
-				   emit_normalize_vu_float_word(HOST_TMP1);
+			return m_code.EmitVmovSToCore(HOST_TMP1, VFP_BROADCAST_S3);
+		};
+
+		const auto emit_apply_triace_add_hack = [&]() {
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR, 23) ||
+				!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP2, 0xffu, HOST_TMP5) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP1, VitaA32::ShiftType::LSR, 23) ||
+				!EmitAndImm32OrReg(HOST_TMP3, HOST_TMP3, 0xffu, HOST_TMP5) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP3))
+			{
+				return false;
+			}
+
+			if (!m_code.EmitCmpImm32(HOST_TMP2, 25))
+				return false;
+
+			const size_t keep_b = m_code.EmitBranchPlaceholder(VitaA32::Condition::LT);
+			if (keep_b == static_cast<size_t>(-1))
+				return false;
+
+			if (!EmitAndImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP5))
+				return false;
+
+			if (!m_code.PatchBranch(keep_b, m_code.Size(), VitaA32::Condition::LT) ||
+				!EmitCmpImm32OrReg(HOST_TMP2, static_cast<u32>(-25), HOST_TMP5))
+			{
+				return false;
+			}
+
+			const size_t keep_a = m_code.EmitBranchPlaceholder(VitaA32::Condition::GT);
+			if (keep_a == static_cast<size_t>(-1))
+				return false;
+
+			if (!EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, FPU_FLOAT_SIGN_MASK, HOST_TMP5))
+				return false;
+
+			return m_code.PatchBranch(keep_a, m_code.Size(), VitaA32::Condition::GT);
 		};
 
 		const auto emit_clear_mac_lane = [&](unsigned lane) {
@@ -5487,8 +5525,10 @@ namespace VitaEE
 			const unsigned source_lane = is_outer_product ? ((lane + 1) % 3) : lane;
 			const unsigned operand_lane = is_outer_product ? ((lane + 2) % 3) : lane;
 			if (!emit_load_vf_lane(HOST_TMP0, fs, source_lane) ||
+				!emit_load_operand_lane_raw(operand_lane) ||
+				(use_addi_triace_hack && !emit_apply_triace_add_hack()) ||
 				!emit_normalize_vu_float_word(HOST_TMP0) ||
-				!emit_load_operand_lane(operand_lane) ||
+				!emit_normalize_vu_float_word(HOST_TMP1) ||
 				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
 				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1))
 			{
