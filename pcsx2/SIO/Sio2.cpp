@@ -36,6 +36,10 @@ u32 g_qemuSio2FifoNeonQwords = 0;
 u32 g_qemuSio2FifoNeon64ByteGroups = 0;
 u32 g_qemuSio2FifoNeon256ByteGroups = 0;
 u32 g_qemuSio2FifoCompactBytes = 0;
+u32 g_qemuSio2FifoExactSpanCopies = 0;
+u32 g_qemuSio2FifoExact16ByteCopies = 0;
+u32 g_qemuSio2FifoExact320ByteCopies = 0;
+u32 g_qemuSio2FifoExact640ByteCopies = 0;
 #endif
 
 namespace
@@ -63,12 +67,46 @@ namespace
 		Sio2Copy64Bytes(dst + 192, src + 192);
 	}
 
-	static __forceinline void Sio2CountNeonCopy(size_t qwords, size_t groups64, size_t groups256)
+	static __forceinline void Sio2Copy320Bytes(u8* dst, const u8* src)
+	{
+		Sio2Copy256Bytes(dst, src);
+		Sio2Copy64Bytes(dst + 256, src + 256);
+	}
+
+	static __forceinline void Sio2Copy640Bytes(u8* dst, const u8* src)
+	{
+		Sio2Copy320Bytes(dst, src);
+		Sio2Copy320Bytes(dst + 320, src + 320);
+	}
+
+	static __forceinline void Sio2Copy16Bytes(u8* dst, const u8* src)
+	{
+		const uint8x16_t qword = vld1q_u8(src);
+		vst1q_u8(dst, qword);
+	}
+
+	static __forceinline void Sio2CountNeonCopy(size_t qwords, size_t groups64, size_t groups256, bool exact_span = false, size_t exact_bytes = 0)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuSio2FifoNeonQwords += static_cast<u32>(qwords);
 		g_qemuSio2FifoNeon64ByteGroups += static_cast<u32>(groups64);
 		g_qemuSio2FifoNeon256ByteGroups += static_cast<u32>(groups256);
+		if (exact_span)
+		{
+			g_qemuSio2FifoExactSpanCopies++;
+			if (exact_bytes == 16)
+				g_qemuSio2FifoExact16ByteCopies++;
+			else if (exact_bytes == 320)
+				g_qemuSio2FifoExact320ByteCopies++;
+			else if (exact_bytes == 640)
+				g_qemuSio2FifoExact640ByteCopies++;
+		}
+#else
+		(void)qwords;
+		(void)groups64;
+		(void)groups256;
+		(void)exact_span;
+		(void)exact_bytes;
 #endif
 	}
 
@@ -76,6 +114,35 @@ namespace
 	{
 		u8* cdst = dst;
 		const u8* csrc = src;
+
+		// PCSX2 owner: SIO/Sio2.cpp::Sio2ByteFifo packet copies. The Vita PAD
+		// path uses small poll packets and larger direct-DMA packets, so keep
+		// those exact byte spans out of the grouped remainder loop.
+		switch (bytes)
+		{
+			case 640:
+				Sio2Copy640Bytes(cdst, csrc);
+				Sio2CountNeonCopy(40, 10, 2, true, 640);
+				return;
+			case 320:
+				Sio2Copy320Bytes(cdst, csrc);
+				Sio2CountNeonCopy(20, 5, 1, true, 320);
+				return;
+			case 256:
+				Sio2Copy256Bytes(cdst, csrc);
+				Sio2CountNeonCopy(16, 4, 1, true, 256);
+				return;
+			case 64:
+				Sio2Copy64Bytes(cdst, csrc);
+				Sio2CountNeonCopy(4, 1, 0, true, 64);
+				return;
+			case 16:
+				Sio2Copy16Bytes(cdst, csrc);
+				Sio2CountNeonCopy(1, 0, 0, true, 16);
+				return;
+			default:
+				break;
+		}
 
 		const size_t groups256 = bytes >> 8;
 		for (size_t i = 0; i < groups256; i++)
