@@ -215,6 +215,110 @@ namespace VUInterpFast
 	static constexpr unsigned XYZW(u32 code) { return (code >> 21) & 0x0f; }
 	static constexpr unsigned Fsf(u32 code) { return (code >> 21) & 0x03; }
 
+	template <bool lane0, bool lane1, bool lane2, bool lane3, typename LaneOp>
+	static inline void ForEachXyzwLaneStatePattern(LaneOp& op)
+	{
+		op.template operator()<0, lane0>();
+		op.template operator()<1, lane1>();
+		op.template operator()<2, lane2>();
+		op.template operator()<3, lane3>();
+	}
+
+	template <typename LaneOp>
+	static inline void ForEachXyzwLaneState(unsigned mask, LaneOp& op)
+	{
+		switch (mask & 0x0f)
+		{
+			case 0x0f:
+				ForEachXyzwLaneStatePattern<true, true, true, true>(op);
+				return;
+			case 0x0e:
+				ForEachXyzwLaneStatePattern<true, true, true, false>(op);
+				return;
+			case 0x0d:
+				ForEachXyzwLaneStatePattern<true, true, false, true>(op);
+				return;
+			case 0x0c:
+				ForEachXyzwLaneStatePattern<true, true, false, false>(op);
+				return;
+			case 0x0b:
+				ForEachXyzwLaneStatePattern<true, false, true, true>(op);
+				return;
+			case 0x0a:
+				ForEachXyzwLaneStatePattern<true, false, true, false>(op);
+				return;
+			case 0x09:
+				ForEachXyzwLaneStatePattern<true, false, false, true>(op);
+				return;
+			case 0x08:
+				ForEachXyzwLaneStatePattern<true, false, false, false>(op);
+				return;
+			case 0x07:
+				ForEachXyzwLaneStatePattern<false, true, true, true>(op);
+				return;
+			case 0x06:
+				ForEachXyzwLaneStatePattern<false, true, true, false>(op);
+				return;
+			case 0x05:
+				ForEachXyzwLaneStatePattern<false, true, false, true>(op);
+				return;
+			case 0x04:
+				ForEachXyzwLaneStatePattern<false, true, false, false>(op);
+				return;
+			case 0x03:
+				ForEachXyzwLaneStatePattern<false, false, true, true>(op);
+				return;
+			case 0x02:
+				ForEachXyzwLaneStatePattern<false, false, true, false>(op);
+				return;
+			case 0x01:
+				ForEachXyzwLaneStatePattern<false, false, false, true>(op);
+				return;
+			case 0x00:
+				ForEachXyzwLaneStatePattern<false, false, false, false>(op);
+				return;
+		}
+	}
+
+	struct CopyWordLaneOp
+	{
+		u32* dest;
+		const u32* source;
+
+		template <unsigned lane, bool active>
+		void operator()() const
+		{
+			if constexpr (active)
+				dest[lane] = source[lane];
+		}
+	};
+
+	struct StoreWordLaneOp
+	{
+		u32* dest;
+		u32 value;
+
+		template <unsigned lane, bool active>
+		void operator()() const
+		{
+			if constexpr (active)
+				dest[lane] = value;
+		}
+	};
+
+	struct StoreSignedWordLaneOp
+	{
+		s32* dest;
+		s32 value;
+
+		template <unsigned lane, bool active>
+		void operator()() const
+		{
+			if constexpr (active)
+				dest[lane] = value;
+		}
+	};
+
 	static constexpr u32 Vf0Flag(unsigned reg)
 	{
 		return reg == 0 ? (1u << REG_VF0_FLAG) : 0;
@@ -1377,6 +1481,19 @@ namespace VUInterpFast
 	}
 
 #if defined(ARCH_ARM32)
+	struct StoreNeonLaneOp
+	{
+		u32* dest;
+		uint32x4_t result;
+
+		template <unsigned lane, bool active>
+		void operator()() const
+		{
+			if constexpr (active)
+				vst1q_lane_u32(&dest[lane], result, lane);
+		}
+	};
+
 	static inline void StoreLowerVfResultMaskedNeon(u32* dest, unsigned mask, uint32x4_t result)
 	{
 		if (mask == 0)
@@ -1391,10 +1508,8 @@ namespace VUInterpFast
 			return;
 		}
 
-		if (mask & 0x8) vst1q_lane_u32(&dest[0], result, 0);
-		if (mask & 0x4) vst1q_lane_u32(&dest[1], result, 1);
-		if (mask & 0x2) vst1q_lane_u32(&dest[2], result, 2);
-		if (mask & 0x1) vst1q_lane_u32(&dest[3], result, 3);
+		StoreNeonLaneOp op{dest, result};
+		ForEachXyzwLaneState(mask, op);
 	}
 
 	static inline void StoreUpperResultMaskedNeon(VURegs* VU, unsigned fd, unsigned mask, uint32x4_t result)
@@ -1411,10 +1526,8 @@ namespace VUInterpFast
 			return;
 		}
 
-		if (mask & 0x8) vst1q_lane_u32(&VU->VF[fd].UL[0], result, 0);
-		if (mask & 0x4) vst1q_lane_u32(&VU->VF[fd].UL[1], result, 1);
-		if (mask & 0x2) vst1q_lane_u32(&VU->VF[fd].UL[2], result, 2);
-		if (mask & 0x1) vst1q_lane_u32(&VU->VF[fd].UL[3], result, 3);
+		StoreNeonLaneOp op{VU->VF[fd].UL, result};
+		ForEachXyzwLaneState(mask, op);
 	}
 #endif
 
@@ -1429,10 +1542,8 @@ namespace VUInterpFast
 			return;
 		}
 #endif
-		if (mask & 0x8) VU->VF[ft].UL[0] = ptr[0];
-		if (mask & 0x4) VU->VF[ft].UL[1] = ptr[1];
-		if (mask & 0x2) VU->VF[ft].UL[2] = ptr[2];
-		if (mask & 0x1) VU->VF[ft].UL[3] = ptr[3];
+		CopyWordLaneOp op{VU->VF[ft].UL, ptr};
+		ForEachXyzwLaneState(mask, op);
 	}
 
 	static inline void StoreVfMasked(VURegs* VU, unsigned fs, unsigned mask, u32* ptr)
@@ -1444,10 +1555,8 @@ namespace VUInterpFast
 			return;
 		}
 #endif
-		if (mask & 0x8) ptr[0] = VU->VF[fs].UL[0];
-		if (mask & 0x4) ptr[1] = VU->VF[fs].UL[1];
-		if (mask & 0x2) ptr[2] = VU->VF[fs].UL[2];
-		if (mask & 0x1) ptr[3] = VU->VF[fs].UL[3];
+		CopyWordLaneOp op{ptr, VU->VF[fs].UL};
+		ForEachXyzwLaneState(mask, op);
 	}
 
 	static inline void FillVfMasked(VURegs* VU, unsigned ft, unsigned mask, u32 value)
@@ -1461,10 +1570,8 @@ namespace VUInterpFast
 			return;
 		}
 #endif
-		if (mask & 0x8) VU->VF[ft].UL[0] = value;
-		if (mask & 0x4) VU->VF[ft].UL[1] = value;
-		if (mask & 0x2) VU->VF[ft].UL[2] = value;
-		if (mask & 0x1) VU->VF[ft].UL[3] = value;
+		StoreWordLaneOp op{VU->VF[ft].UL, value};
+		ForEachXyzwLaneState(mask, op);
 	}
 
 	static inline void StoreViToVectorMasked(VURegs* VU, unsigned ft, unsigned mask, s32 value)
@@ -1478,10 +1585,8 @@ namespace VUInterpFast
 			return;
 		}
 #endif
-		if (mask & 0x8) VU->VF[ft].SL[0] = value;
-		if (mask & 0x4) VU->VF[ft].SL[1] = value;
-		if (mask & 0x2) VU->VF[ft].SL[2] = value;
-		if (mask & 0x1) VU->VF[ft].SL[3] = value;
+		StoreSignedWordLaneOp op{VU->VF[ft].SL, value};
+		ForEachXyzwLaneState(mask, op);
 	}
 
 #if defined(ARCH_ARM32)
@@ -1497,10 +1602,8 @@ namespace VUInterpFast
 
 		u32* words = reinterpret_cast<u32*>(ptr);
 		const u32 word = value;
-		if (mask & 0x8) words[0] = word;
-		if (mask & 0x4) words[1] = word;
-		if (mask & 0x2) words[2] = word;
-		if (mask & 0x1) words[3] = word;
+		StoreWordLaneOp op{words, word};
+		ForEachXyzwLaneState(mask, op);
 	}
 
 	static inline void StoreMr32Masked(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
@@ -1516,10 +1619,8 @@ namespace VUInterpFast
 			return;
 		}
 
-		if (mask & 0x8) vst1q_lane_u32(&VU->VF[ft].UL[0], rotated, 0);
-		if (mask & 0x4) vst1q_lane_u32(&VU->VF[ft].UL[1], rotated, 1);
-		if (mask & 0x2) vst1q_lane_u32(&VU->VF[ft].UL[2], rotated, 2);
-		if (mask & 0x1) vst1q_lane_u32(&VU->VF[ft].UL[3], rotated, 3);
+		StoreNeonLaneOp op{VU->VF[ft].UL, rotated};
+		ForEachXyzwLaneState(mask, op);
 	}
 #endif
 
@@ -1624,14 +1725,28 @@ namespace VUInterpFast
 	}
 
 	template <typename Unary>
+	struct StoreUnaryUpperLaneOp
+	{
+		VURegs* VU;
+		unsigned ft;
+		unsigned fs;
+		Unary fn;
+
+		template <unsigned lane, bool active>
+		void operator()() const
+		{
+			if constexpr (active)
+				VU->VF[ft].UL[lane] = fn(VU->VF[fs].UL[lane]);
+		}
+	};
+
+	template <typename Unary>
 	static inline void StoreUnaryUpperMasked(VURegs* VU, unsigned ft, unsigned mask, unsigned fs, Unary fn)
 	{
 		if (ft == 0)
 			return;
-		if (mask & 0x8) VU->VF[ft].UL[0] = fn(VU->VF[fs].UL[0]);
-		if (mask & 0x4) VU->VF[ft].UL[1] = fn(VU->VF[fs].UL[1]);
-		if (mask & 0x2) VU->VF[ft].UL[2] = fn(VU->VF[fs].UL[2]);
-		if (mask & 0x1) VU->VF[ft].UL[3] = fn(VU->VF[fs].UL[3]);
+		StoreUnaryUpperLaneOp<Unary> op{VU, ft, fs, fn};
+		ForEachXyzwLaneState(mask, op);
 	}
 
 	static inline bool StoreAbsUpperMaskedNeon(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
@@ -1734,25 +1849,55 @@ namespace VUInterpFast
 	}
 
 	template <typename Binary>
+	struct StoreBinaryUpperLaneOp
+	{
+		VURegs* VU;
+		unsigned fd;
+		unsigned fs;
+		unsigned ft;
+		Binary fn;
+
+		template <unsigned lane, bool active>
+		void operator()() const
+		{
+			if constexpr (active)
+				VU->VF[fd].UL[lane] = fn(VU->VF[fs].UL[lane], VU->VF[ft].UL[lane]);
+		}
+	};
+
+	template <typename Binary>
 	static inline void StoreBinaryUpperMasked(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, unsigned ft, Binary fn)
 	{
 		if (fd == 0)
 			return;
-		if (mask & 0x8) VU->VF[fd].UL[0] = fn(VU->VF[fs].UL[0], VU->VF[ft].UL[0]);
-		if (mask & 0x4) VU->VF[fd].UL[1] = fn(VU->VF[fs].UL[1], VU->VF[ft].UL[1]);
-		if (mask & 0x2) VU->VF[fd].UL[2] = fn(VU->VF[fs].UL[2], VU->VF[ft].UL[2]);
-		if (mask & 0x1) VU->VF[fd].UL[3] = fn(VU->VF[fs].UL[3], VU->VF[ft].UL[3]);
+		StoreBinaryUpperLaneOp<Binary> op{VU, fd, fs, ft, fn};
+		ForEachXyzwLaneState(mask, op);
 	}
+
+	template <typename Binary>
+	struct StoreBinaryUpperBroadcastLaneOp
+	{
+		VURegs* VU;
+		unsigned fd;
+		unsigned fs;
+		u32 ft;
+		Binary fn;
+
+		template <unsigned lane, bool active>
+		void operator()() const
+		{
+			if constexpr (active)
+				VU->VF[fd].UL[lane] = fn(VU->VF[fs].UL[lane], ft);
+		}
+	};
 
 	template <typename Binary>
 	static inline void StoreBinaryUpperBroadcastMasked(VURegs* VU, unsigned fd, unsigned mask, unsigned fs, u32 ft, Binary fn)
 	{
 		if (fd == 0)
 			return;
-		if (mask & 0x8) VU->VF[fd].UL[0] = fn(VU->VF[fs].UL[0], ft);
-		if (mask & 0x4) VU->VF[fd].UL[1] = fn(VU->VF[fs].UL[1], ft);
-		if (mask & 0x2) VU->VF[fd].UL[2] = fn(VU->VF[fs].UL[2], ft);
-		if (mask & 0x1) VU->VF[fd].UL[3] = fn(VU->VF[fs].UL[3], ft);
+		StoreBinaryUpperBroadcastLaneOp<Binary> op{VU, fd, fs, ft, fn};
+		ForEachXyzwLaneState(mask, op);
 	}
 
 	static inline u32 FpMaxBits(u32 a, u32 b)
@@ -1939,24 +2084,27 @@ namespace VUInterpFast
 			vgetq_lane_f32(value, 2)) + vgetq_lane_f32(value, 3);
 	}
 
+	struct FinishMacVectorLaneOp
+	{
+		VURegs* VU;
+		bool acc;
+		unsigned fd;
+		float32x4_t result;
+
+		template <unsigned lane, bool active>
+		void operator()() const
+		{
+			if constexpr (active)
+				WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, vgetq_lane_f32(result, lane)));
+			else
+				ClearMacLane(VU, lane);
+		}
+	};
+
 	static inline void FinishMacVectorNeon(VURegs* VU, bool acc, unsigned fd, unsigned mask, float32x4_t result)
 	{
-		if (mask & 0x8)
-			WriteMacResult(VU, acc, fd, 0, UpdateMacLane(VU, 0, vgetq_lane_f32(result, 0)));
-		else
-			ClearMacLane(VU, 0);
-		if (mask & 0x4)
-			WriteMacResult(VU, acc, fd, 1, UpdateMacLane(VU, 1, vgetq_lane_f32(result, 1)));
-		else
-			ClearMacLane(VU, 1);
-		if (mask & 0x2)
-			WriteMacResult(VU, acc, fd, 2, UpdateMacLane(VU, 2, vgetq_lane_f32(result, 2)));
-		else
-			ClearMacLane(VU, 2);
-		if (mask & 0x1)
-			WriteMacResult(VU, acc, fd, 3, UpdateMacLane(VU, 3, vgetq_lane_f32(result, 3)));
-		else
-			ClearMacLane(VU, 3);
+		FinishMacVectorLaneOp op{VU, acc, fd, result};
+		ForEachXyzwLaneState(mask, op);
 
 		VU_STAT_UPDATE(VU);
 #if defined(VITASX2_QEMU_VALIDATION)
