@@ -8329,19 +8329,6 @@ namespace VitaEE
 
 		const size_t lo_offset = HiloLaneOffset(LO_OFFSET, upper_pipeline);
 		const size_t hi_offset = HiloLaneOffset(HI_OFFSET, upper_pipeline);
-		const void* helper = nullptr;
-		if (signed_divide)
-		{
-			helper = upper_pipeline ?
-						 reinterpret_cast<const void*>(&VitaEeDivSigned1) :
-						 reinterpret_cast<const void*>(&VitaEeDivSigned);
-		}
-		else
-		{
-			helper = upper_pipeline ?
-						 reinterpret_cast<const void*>(&VitaEeDivUnsigned1) :
-						 reinterpret_cast<const void*>(&VitaEeDivUnsigned);
-		}
 
 		unsigned dividend_low;
 		unsigned divisor_low;
@@ -8351,10 +8338,20 @@ namespace VitaEE
 			return false;
 		}
 
-		const auto emit_helper_args = [this, dividend_low, divisor_low]() {
-			// The divide helper follows AAPCS (r0=rs low, r1=rt low). Pinned
-			// operands can bypass r0/r1 in the fast guards, but the fallback
-			// helper still needs the arguments materialized there.
+		const auto materialize_divide_operands = [this, dividend_low, divisor_low]() {
+			if (dividend_low == HOST_TMP1 && divisor_low == HOST_TMP0)
+			{
+				return m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 0) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP1, VitaA32::ShiftType::LSL, 0) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP2, VitaA32::ShiftType::LSL, 0);
+			}
+
+			if (divisor_low == HOST_TMP0 && dividend_low != HOST_TMP0)
+			{
+				if (!m_code.EmitMovRegShiftImm(HOST_TMP1, divisor_low, VitaA32::ShiftType::LSL, 0))
+					return false;
+			}
+
 			if (dividend_low != HOST_TMP0 &&
 				!m_code.EmitMovRegShiftImm(HOST_TMP0, dividend_low, VitaA32::ShiftType::LSL, 0))
 			{
@@ -8369,6 +8366,65 @@ namespace VitaEE
 
 			return true;
 		};
+
+		const auto emit_unsigned_shift_subtract_divide =
+			[this, emit_branch, patch_branch, patch_branches](unsigned dividend_reg, unsigned divisor_reg,
+				unsigned quotient_reg, unsigned remainder_reg, unsigned scratch_reg) {
+				BranchPatch below_branch{};
+				BranchPatch equal_branch{};
+				BranchPatch done_branches[2]{};
+				unsigned done_branch_count = 0;
+
+				if (!m_code.EmitMovImm8(quotient_reg, 0) ||
+					!m_code.EmitMovRegShiftImm(remainder_reg, dividend_reg, VitaA32::ShiftType::LSL, 0) ||
+					!m_code.EmitCmpReg(dividend_reg, divisor_reg) ||
+					!emit_branch(below_branch, VitaA32::Condition::CC) ||
+					!emit_branch(equal_branch, VitaA32::Condition::EQ))
+				{
+					return false;
+				}
+
+				if (!m_code.EmitClz(scratch_reg, divisor_reg) ||
+					!m_code.EmitClz(quotient_reg, dividend_reg) ||
+					!m_code.EmitSubReg(scratch_reg, scratch_reg, quotient_reg) ||
+					!m_code.EmitMovRegShiftReg(dividend_reg, divisor_reg,
+						VitaA32::ShiftType::LSL, scratch_reg) ||
+					!m_code.EmitMovImm8(divisor_reg, 1) ||
+					!m_code.EmitMovRegShiftReg(divisor_reg, divisor_reg,
+						VitaA32::ShiftType::LSL, scratch_reg) ||
+					!m_code.EmitMovImm8(quotient_reg, 0))
+				{
+					return false;
+				}
+
+				const size_t loop_start = m_code.Size();
+				BranchPatch skip_subtract_branch{};
+				BranchPatch loop_branch{};
+				if (!m_code.EmitCmpReg(remainder_reg, dividend_reg) ||
+					!emit_branch(skip_subtract_branch, VitaA32::Condition::CC) ||
+					!m_code.EmitSubReg(remainder_reg, remainder_reg, dividend_reg) ||
+					!m_code.EmitOrrReg(quotient_reg, quotient_reg, divisor_reg) ||
+					!patch_branch(skip_subtract_branch, m_code.Size()) ||
+					!m_code.EmitMovRegShiftImm(divisor_reg, divisor_reg, VitaA32::ShiftType::LSR, 1, true) ||
+					!m_code.EmitMovRegShiftImm(dividend_reg, dividend_reg, VitaA32::ShiftType::LSR, 1) ||
+					!emit_branch(loop_branch, VitaA32::Condition::NE) ||
+					!patch_branch(loop_branch, loop_start) ||
+					!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL))
+				{
+					return false;
+				}
+
+				if (!patch_branch(equal_branch, m_code.Size()) ||
+					!m_code.EmitMovImm8(quotient_reg, 1) ||
+					!m_code.EmitMovImm8(remainder_reg, 0) ||
+					!emit_branch(done_branches[done_branch_count++], VitaA32::Condition::AL) ||
+					!patch_branch(below_branch, m_code.Size()))
+				{
+					return false;
+				}
+
+				return patch_branches(done_branches, done_branch_count, m_code.Size());
+			};
 
 		BranchPatch divzero_branch{};
 		BranchPatch zero_branch{};
@@ -8523,8 +8579,40 @@ namespace VitaEE
 		}
 
 		if (!patch_branch(fallback_branch, m_code.Size()) ||
-			!emit_helper_args() ||
-			!m_code.EmitCallAbsolute(helper))
+			!materialize_divide_operands())
+		{
+			return false;
+		}
+
+		if (signed_divide)
+		{
+			// Cortex-A9 has no integer divide. Generate the same signed
+			// trunc-toward-zero result as PCSX2's R5900OpcodeImpl.cpp/MMI.cpp
+			// helpers by dividing absolute values and restoring the signs.
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitEorReg(HOST_TMP4, HOST_TMP4, HOST_TMP5) ||
+				!m_code.EmitPush(static_cast<u16>(1u << HOST_TMP4)) ||
+				!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
+				!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+				!m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+				!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1, HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
+				!m_code.EmitPop(static_cast<u16>(1u << HOST_TMP4)) ||
+				!m_code.EmitEorReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
+				!m_code.EmitEorReg(HOST_TMP3, HOST_TMP3, HOST_TMP5) ||
+				!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_TMP5) ||
+				!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				!store_signed_word_as_doubleword(HOST_TMP3, hi_offset))
+			{
+				return false;
+			}
+		}
+		else if (!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1, HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
+				 !store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
+				 !store_signed_word_as_doubleword(HOST_TMP3, hi_offset))
 		{
 			return false;
 		}
