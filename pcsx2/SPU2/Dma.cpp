@@ -18,6 +18,7 @@ static constexpr int CYCLES_PER_WORD = 24;
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSpu2DmaCopyNeonQwords = 0;
 u32 g_qemuSpu2DmaCopyNeon64ByteGroups = 0;
+u32 g_qemuSpu2DmaCopyNeon128ByteGroups = 0;
 u32 g_qemuSpu2DmaCopyNeon256ByteGroups = 0;
 u32 g_qemuSpu2DmaCopyNeon1024ByteGroups = 0;
 #endif
@@ -35,12 +36,16 @@ static __forceinline void Spu2DmaCopy64Bytes(u8* dst, const u8* src)
 	vst1q_u8(dst + 48, q3);
 }
 
-static __forceinline void Spu2DmaCopy256Bytes(u8* dst, const u8* src)
+static __forceinline void Spu2DmaCopy128Bytes(u8* dst, const u8* src)
 {
 	Spu2DmaCopy64Bytes(dst, src);
 	Spu2DmaCopy64Bytes(dst + 64, src + 64);
-	Spu2DmaCopy64Bytes(dst + 128, src + 128);
-	Spu2DmaCopy64Bytes(dst + 192, src + 192);
+}
+
+static __forceinline void Spu2DmaCopy256Bytes(u8* dst, const u8* src)
+{
+	Spu2DmaCopy128Bytes(dst, src);
+	Spu2DmaCopy128Bytes(dst + 128, src + 128);
 }
 
 static __forceinline void Spu2DmaCopy1024Bytes(u8* dst, const u8* src)
@@ -51,11 +56,12 @@ static __forceinline void Spu2DmaCopy1024Bytes(u8* dst, const u8* src)
 	Spu2DmaCopy256Bytes(dst + 768, src + 768);
 }
 
-static __forceinline void Spu2DmaCountNeonCopy(u32 qwords, u32 groups64, u32 groups256, u32 groups1024)
+static __forceinline void Spu2DmaCountNeonCopy(u32 qwords, u32 groups64, u32 groups128, u32 groups256, u32 groups1024)
 {
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuSpu2DmaCopyNeonQwords += qwords;
 	g_qemuSpu2DmaCopyNeon64ByteGroups += groups64;
+	g_qemuSpu2DmaCopyNeon128ByteGroups += groups128;
 	g_qemuSpu2DmaCopyNeon256ByteGroups += groups256;
 	g_qemuSpu2DmaCopyNeon1024ByteGroups += groups1024;
 #endif
@@ -89,7 +95,18 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 	}
 
 	const u32 remaining_after_256 = remaining_after_1024 & 255u;
-	const u32 groups64 = remaining_after_256 >> 6;
+	const u32 groups128 = remaining_after_256 >> 7;
+	for (u32 i = 0; i < groups128; i++)
+	{
+		if ((i + 1) < groups128)
+			__builtin_prefetch(src + 128, 0, 1);
+		Spu2DmaCopy128Bytes(dst, src);
+		src += 128;
+		dst += 128;
+	}
+
+	const u32 remaining_after_128 = remaining_after_256 & 127u;
+	const u32 groups64 = remaining_after_128 >> 6;
 	for (u32 i = 0; i < groups64; i++)
 	{
 		if ((i + 1) < groups64)
@@ -99,7 +116,7 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 		dst += 64;
 	}
 
-	const u32 tail_bytes = remaining_after_256 & 63u;
+	const u32 tail_bytes = remaining_after_128 & 63u;
 	const u32 tail_qwords = tail_bytes >> 4;
 	for (u32 i = 0; i < tail_qwords; i++)
 	{
@@ -119,8 +136,9 @@ static __forceinline void Spu2DmaCopyBytes(void* to, const void* from, u32 bytes
 	for (u32 i = 0; i < (tail_bytes & 7); i++)
 		dst[i] = src[i];
 
-	Spu2DmaCountNeonCopy((groups1024 << 6) + (groups256 << 4) + (groups64 << 2) + tail_qwords,
-		(groups1024 << 4) + (groups256 << 2) + groups64,
+	Spu2DmaCountNeonCopy((groups1024 << 6) + (groups256 << 4) + (groups128 << 3) + (groups64 << 2) + tail_qwords,
+		(groups1024 << 4) + (groups256 << 2) + (groups128 << 1) + groups64,
+		(groups1024 << 3) + (groups256 << 1) + groups128,
 		(groups1024 << 2) + groups256,
 		groups1024);
 	return;
