@@ -23,6 +23,7 @@ extern u32* GET_VU_MEM(VURegs* VU, u32 addr);
 extern u32 g_qemuVuLowerNeonQwordOps;
 extern u32 g_qemuVuUpperNeonQwordOps;
 extern u32 g_qemuVuUpperScalarFullMaskOps;
+extern u32 g_qemuVuUpperScalarPartialMaskOps;
 #endif
 
 namespace VUInterpFast
@@ -2087,84 +2088,93 @@ namespace VUInterpFast
 		VU_STAT_UPDATE(VU);
 	}
 
-	template <typename Operand>
-	static inline void ExecuteMaddMasked(VURegs* VU, u32 code, bool acc, Operand operand)
+	template <bool subtract, typename Operand>
+	static inline void ExecuteMaddMsubLaneScalar(VURegs* VU, bool acc, unsigned fd, unsigned fs, unsigned lane, Operand& operand)
+	{
+		const float product = VuDouble(VU->VF[fs].UL[lane]) * VuDouble(operand(lane));
+		const float result = subtract ? (VuDouble(VU->ACC.UL[lane]) - product) : (VuDouble(VU->ACC.UL[lane]) + product);
+		WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, result));
+	}
+
+	template <bool subtract, typename Operand>
+	static inline void ExecuteMaddMsubMaskedScalar(VURegs* VU, u32 code, bool acc, Operand operand)
 	{
 		const unsigned fd = Fd(code);
 		const unsigned fs = Fs(code);
 		const unsigned mask = XYZW(code);
-		if (mask == 0x0f)
+
+		switch (mask)
 		{
-			WriteMacResult(VU, acc, fd, 0, UpdateMacLane(VU, 0,
-				VuDouble(VU->ACC.UL[0]) + VuDouble(VU->VF[fs].UL[0]) * VuDouble(operand(0))));
-			WriteMacResult(VU, acc, fd, 1, UpdateMacLane(VU, 1,
-				VuDouble(VU->ACC.UL[1]) + VuDouble(VU->VF[fs].UL[1]) * VuDouble(operand(1))));
-			WriteMacResult(VU, acc, fd, 2, UpdateMacLane(VU, 2,
-				VuDouble(VU->ACC.UL[2]) + VuDouble(VU->VF[fs].UL[2]) * VuDouble(operand(2))));
-			WriteMacResult(VU, acc, fd, 3, UpdateMacLane(VU, 3,
-				VuDouble(VU->ACC.UL[3]) + VuDouble(VU->VF[fs].UL[3]) * VuDouble(operand(3))));
-			VU_STAT_UPDATE(VU);
+			case 0x0f:
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
+				VU_STAT_UPDATE(VU);
 	#if defined(VITASX2_QEMU_VALIDATION)
-			++::g_qemuVuUpperScalarFullMaskOps;
+				++::g_qemuVuUpperScalarFullMaskOps;
 	#endif
-			return;
-		}
-
-		for (unsigned lane = 0; lane < 4; lane++)
-		{
-			const unsigned lane_mask = 1u << (3 - lane);
-			if ((mask & lane_mask) == 0)
-			{
-				ClearMacLane(VU, lane);
-				continue;
-			}
-
-			const float result = VuDouble(VU->ACC.UL[lane]) +
-				VuDouble(VU->VF[fs].UL[lane]) * VuDouble(operand(lane));
-			WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, result));
+				return;
+			case 0x0e:
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
+				ClearMacLane(VU, 3);
+				break;
+			case 0x0d:
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
+				ClearMacLane(VU, 2);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
+				break;
+			case 0x0b:
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
+				ClearMacLane(VU, 1);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
+				break;
+			case 0x07:
+				ClearMacLane(VU, 0);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
+				ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
+				break;
+			default:
+				if (mask & 0x08)
+					ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 0, operand);
+				else
+					ClearMacLane(VU, 0);
+				if (mask & 0x04)
+					ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 1, operand);
+				else
+					ClearMacLane(VU, 1);
+				if (mask & 0x02)
+					ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 2, operand);
+				else
+					ClearMacLane(VU, 2);
+				if (mask & 0x01)
+					ExecuteMaddMsubLaneScalar<subtract>(VU, acc, fd, fs, 3, operand);
+				else
+					ClearMacLane(VU, 3);
+				break;
 		}
 
 		VU_STAT_UPDATE(VU);
+#if defined(VITASX2_QEMU_VALIDATION)
+		++::g_qemuVuUpperScalarPartialMaskOps;
+#endif
+	}
+
+	template <typename Operand>
+	static inline void ExecuteMaddMasked(VURegs* VU, u32 code, bool acc, Operand operand)
+	{
+		ExecuteMaddMsubMaskedScalar<false>(VU, code, acc, operand);
 	}
 
 	template <typename Operand>
 	static inline void ExecuteMsubMasked(VURegs* VU, u32 code, bool acc, Operand operand)
 	{
-		const unsigned fd = Fd(code);
-		const unsigned fs = Fs(code);
-		const unsigned mask = XYZW(code);
-		if (mask == 0x0f)
-		{
-			WriteMacResult(VU, acc, fd, 0, UpdateMacLane(VU, 0,
-				VuDouble(VU->ACC.UL[0]) - VuDouble(VU->VF[fs].UL[0]) * VuDouble(operand(0))));
-			WriteMacResult(VU, acc, fd, 1, UpdateMacLane(VU, 1,
-				VuDouble(VU->ACC.UL[1]) - VuDouble(VU->VF[fs].UL[1]) * VuDouble(operand(1))));
-			WriteMacResult(VU, acc, fd, 2, UpdateMacLane(VU, 2,
-				VuDouble(VU->ACC.UL[2]) - VuDouble(VU->VF[fs].UL[2]) * VuDouble(operand(2))));
-			WriteMacResult(VU, acc, fd, 3, UpdateMacLane(VU, 3,
-				VuDouble(VU->ACC.UL[3]) - VuDouble(VU->VF[fs].UL[3]) * VuDouble(operand(3))));
-			VU_STAT_UPDATE(VU);
-	#if defined(VITASX2_QEMU_VALIDATION)
-			++::g_qemuVuUpperScalarFullMaskOps;
-	#endif
-			return;
-		}
-
-		for (unsigned lane = 0; lane < 4; lane++)
-		{
-			const unsigned lane_mask = 1u << (3 - lane);
-			if ((mask & lane_mask) == 0)
-			{
-				ClearMacLane(VU, lane);
-				continue;
-			}
-
-			const float result = VuDouble(VU->ACC.UL[lane]) -
-				VuDouble(VU->VF[fs].UL[lane]) * VuDouble(operand(lane));
-			WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, result));
-		}
-
-		VU_STAT_UPDATE(VU);
+		ExecuteMaddMsubMaskedScalar<true>(VU, code, acc, operand);
 	}
 
 	static inline void ExecuteOpmula(VURegs* VU, u32 code)
