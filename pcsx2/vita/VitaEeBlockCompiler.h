@@ -202,6 +202,9 @@ namespace VitaEE
 		bool EmitCOP2ControlReadBody(u32 op);
 		bool EmitCOP2ControlWriteBody(u32 op);
 		bool EmitCOP2MacroCodeWrite(u32 op);
+		bool EmitCOP2MacroCopySelectedLanes(unsigned mask, unsigned source_address_reg,
+			unsigned dest_address_reg, unsigned temp_qreg);
+		bool EmitCOP2MacroStoreSelectedLanes(unsigned mask, unsigned value_qreg, unsigned address_reg);
 		bool EmitCOP2MacroStoreVfSelectedLanes(unsigned vf_reg, unsigned mask, unsigned value_qreg,
 			unsigned address_reg);
 		bool EmitCOP2MacroBody(u32 op);
