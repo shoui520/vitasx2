@@ -65,6 +65,12 @@ static __forceinline void CdvdCopy2048Bytes(u8* dst, const u8* src)
 	CdvdCopy1024Bytes(dst + 1024, src + 1024);
 }
 
+static __forceinline void CdvdCopy512Bytes(u8* dst, const u8* src)
+{
+	CdvdCopy256Bytes(dst, src);
+	CdvdCopy256Bytes(dst + 256, src + 256);
+}
+
 static __forceinline void CdvdCopy4096Bytes(u8* dst, const u8* src)
 {
 	CdvdCopy2048Bytes(dst, src);
@@ -198,6 +204,43 @@ static __forceinline void CdvdCopyBytes(void* dst, const void* src, size_t size)
 
 		CdvdCountNeonCopy(groups2448 * 153, groups2448 * 38, groups2448 * 19, groups2448 * 9, groups2448 * 2, groups2448, 0, 0, 0, 0, groups2448);
 		return;
+	}
+
+	// PCSX2 owners: CDVDdiscThread.cpp sector extraction, InputIsoFile sector
+	// staging, and CDVD.cpp DMA3 payload copies. These cooked-sector and cache
+	// spans are common enough to bypass the generic grouped remainder loop.
+	switch (size)
+	{
+		case 4096:
+			CdvdCopy4096Bytes(cdst, csrc);
+			CdvdCountNeonCopy(256, 64, 32, 16, 4, 2, 1);
+			return;
+		case 2048:
+			CdvdCopy2048Bytes(cdst, csrc);
+			CdvdCountNeonCopy(128, 32, 16, 8, 2, 1);
+			return;
+		case 1024:
+			CdvdCopy1024Bytes(cdst, csrc);
+			CdvdCountNeonCopy(64, 16, 8, 4, 1, 0);
+			return;
+		case 512:
+			CdvdCopy512Bytes(cdst, csrc);
+			CdvdCountNeonCopy(32, 8, 4, 2, 0, 0);
+			return;
+		case 256:
+			CdvdCopy256Bytes(cdst, csrc);
+			CdvdCountNeonCopy(16, 4, 2, 1, 0, 0);
+			return;
+		case 128:
+			CdvdCopy128Bytes(cdst, csrc);
+			CdvdCountNeonCopy(8, 2, 1, 0, 0, 0);
+			return;
+		case 64:
+			CdvdCopy64Bytes(cdst, csrc);
+			CdvdCountNeonCopy(4, 1, 0, 0, 0, 0);
+			return;
+		default:
+			break;
 	}
 
 	const size_t groups4096 = size >> 12;
