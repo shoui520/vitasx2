@@ -30,6 +30,21 @@ vifOp(vifCode_Null);
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuVifMpgNeonQwords = 0;
 u32 g_qemuVifMpgNeon64ByteGroups = 0;
+u32 g_qemuVifMpgNeon256ByteGroups = 0;
+#endif
+
+#if defined(ARCH_ARM32)
+static __forceinline void VifMpgCopy64Bytes(u8* dst, const u8* src)
+{
+	const uint8x16_t qword0 = vld1q_u8(src);
+	const uint8x16_t qword1 = vld1q_u8(src + 16);
+	const uint8x16_t qword2 = vld1q_u8(src + 32);
+	const uint8x16_t qword3 = vld1q_u8(src + 48);
+	vst1q_u8(dst, qword0);
+	vst1q_u8(dst + 16, qword1);
+	vst1q_u8(dst + 32, qword2);
+	vst1q_u8(dst + 48, qword3);
+}
 #endif
 
 static __forceinline void VifMpgCopyBytes(void* dst, const void* src, size_t size)
@@ -37,25 +52,30 @@ static __forceinline void VifMpgCopyBytes(void* dst, const void* src, size_t siz
 #if defined(ARCH_ARM32)
 	u8* cdst = static_cast<u8*>(dst);
 	const u8* csrc = static_cast<const u8*>(src);
-	const size_t groups64 = size >> 6;
-	for (size_t i = 0; i < groups64; i++)
+	const size_t groups256 = size >> 8;
+	for (size_t i = 0; i < groups256; i++)
 	{
-		if ((i + 1) < groups64)
-			__builtin_prefetch(csrc + 64, 0, 1);
+		if ((i + 1) < groups256)
+			__builtin_prefetch(csrc + 256, 0, 1);
 
-		const uint8x16_t qword0 = vld1q_u8(csrc);
-		const uint8x16_t qword1 = vld1q_u8(csrc + 16);
-		const uint8x16_t qword2 = vld1q_u8(csrc + 32);
-		const uint8x16_t qword3 = vld1q_u8(csrc + 48);
-		vst1q_u8(cdst, qword0);
-		vst1q_u8(cdst + 16, qword1);
-		vst1q_u8(cdst + 32, qword2);
-		vst1q_u8(cdst + 48, qword3);
+		VifMpgCopy64Bytes(cdst, csrc);
+		VifMpgCopy64Bytes(cdst + 64, csrc + 64);
+		VifMpgCopy64Bytes(cdst + 128, csrc + 128);
+		VifMpgCopy64Bytes(cdst + 192, csrc + 192);
+		csrc += 256;
+		cdst += 256;
+	}
+
+	const size_t tail_after_256 = size & 255;
+	const size_t tail_groups64 = tail_after_256 >> 6;
+	for (size_t i = 0; i < tail_groups64; i++)
+	{
+		VifMpgCopy64Bytes(cdst, csrc);
 		csrc += 64;
 		cdst += 64;
 	}
 
-	const size_t tail_bytes = size & 63;
+	const size_t tail_bytes = tail_after_256 & 63;
 	const size_t tail_qwords = tail_bytes >> 4;
 	for (size_t i = 0; i < tail_qwords; i++)
 	{
@@ -76,8 +96,9 @@ static __forceinline void VifMpgCopyBytes(void* dst, const void* src, size_t siz
 		cdst[i] = csrc[i];
 
 #if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuVifMpgNeonQwords += static_cast<u32>((groups64 << 2) + tail_qwords);
-	g_qemuVifMpgNeon64ByteGroups += static_cast<u32>(groups64);
+	g_qemuVifMpgNeonQwords += static_cast<u32>((groups256 << 4) + (tail_groups64 << 2) + tail_qwords);
+	g_qemuVifMpgNeon64ByteGroups += static_cast<u32>((groups256 << 2) + tail_groups64);
+	g_qemuVifMpgNeon256ByteGroups += static_cast<u32>(groups256);
 #endif
 	return;
 #endif
