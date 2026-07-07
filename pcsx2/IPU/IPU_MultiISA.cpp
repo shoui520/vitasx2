@@ -25,6 +25,7 @@ u32 g_qemuIpuVqNeonGroups = 0;
 u32 g_qemuIpuIdctCopyNeonRows = 0;
 u32 g_qemuIpuBitreader64NeonReads = 0;
 u32 g_qemuIpuBitreader32NeonReads = 0;
+u32 g_qemuIpuBitreader8ArmReads = 0;
 u32 g_qemuIpuMb8To16NeonGroups = 0;
 #endif
 
@@ -164,6 +165,18 @@ static __forceinline uint8x8_t ipuGetShifted64BitsNeon(const u8* readpos, uint s
 			return vorr_u8(vshl_n_u8(current, 7), vshr_n_u8(next, 1));
 	}
 }
+
+static __forceinline u8 ipuGetShifted8BitsArm32(const u8* readpos, uint shift)
+{
+	// PCSX2 owner: getBits8() below. Keep the byte-combine ordering used by
+	// getBits32()/getBits64(), but avoid the scalar mask construction for the
+	// single-byte MPEG readers on Cortex-A9.
+	shift &= 7u;
+	if (shift == 0)
+		return readpos[0];
+
+	return static_cast<u8>((readpos[0] << shift) | (readpos[1] >> (8u - shift)));
+}
 #endif
 
 // whenever reading fractions of bytes. The low bits always come from the next byte
@@ -238,6 +251,12 @@ __ri static u8 getBits8(u8 *address, bool advance)
 
 	const u8* readpos = &g_BP.internal_qwc[0]._u8[g_BP.BP/8];
 
+#if defined(ARCH_ARM32)
+	*address = ipuGetShifted8BitsArm32(readpos, g_BP.BP & 7);
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuIpuBitreader8ArmReads;
+#endif
+#else
 	if (uint shift = (g_BP.BP & 7))
 	{
 		uint mask = (0xff >> shift);
@@ -247,6 +266,7 @@ __ri static u8 getBits8(u8 *address, bool advance)
 	{
 		*(u8*)address = *(u8*)readpos;
 	}
+#endif
 
 	if (advance) g_BP.Advance(8);
 
@@ -273,6 +293,24 @@ void IpuGetBits32SelectedForValidation(const u8* readpos, u32 shift, u8* address
 	++g_qemuIpuBitreader32NeonReads;
 #else
 	IpuGetBits32ReferenceForValidation(readpos, shift, address);
+#endif
+}
+
+void IpuGetBits8ReferenceForValidation(const u8* readpos, u32 shift, u8* address)
+{
+	shift &= 7u;
+	*address = (shift != 0) ?
+		static_cast<u8>((readpos[0] << shift) | (readpos[1] >> (8u - shift))) :
+		readpos[0];
+}
+
+void IpuGetBits8SelectedForValidation(const u8* readpos, u32 shift, u8* address)
+{
+#if defined(ARCH_ARM32)
+	*address = ipuGetShifted8BitsArm32(readpos, shift);
+	++g_qemuIpuBitreader8ArmReads;
+#else
+	IpuGetBits8ReferenceForValidation(readpos, shift, address);
 #endif
 }
 #endif
