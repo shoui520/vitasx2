@@ -20,6 +20,7 @@ u32 g_qemuSifFifoNeon128ByteGroups = 0;
 u32 g_qemuSifFifoNeon256ByteGroups = 0;
 u32 g_qemuSifFifoNeon512ByteGroups = 0;
 u32 g_qemuSifFifoExactSpanCopies = 0;
+u32 g_qemuSifFifoExact384ByteCopies = 0;
 u32 g_qemuSifFifoExact512ByteCopies = 0;
 #endif
 

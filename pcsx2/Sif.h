@@ -22,6 +22,7 @@ extern u32 g_qemuSifFifoNeon128ByteGroups;
 extern u32 g_qemuSifFifoNeon256ByteGroups;
 extern u32 g_qemuSifFifoNeon512ByteGroups;
 extern u32 g_qemuSifFifoExactSpanCopies;
+extern u32 g_qemuSifFifoExact384ByteCopies;
 extern u32 g_qemuSifFifoExact512ByteCopies;
 #endif
 
@@ -50,6 +51,12 @@ static __forceinline void SifFifoCopy32Words(u32* to, const u32* from)
 {
 	SifFifoCopy16Words(to, from);
 	SifFifoCopy16Words(to + 16, from + 16);
+}
+
+static __forceinline void SifFifoCopy96Words(u32* to, const u32* from)
+{
+	SifFifoCopy64Words(to, from);
+	SifFifoCopy32Words(to + 64, from + 64);
 }
 
 static __forceinline void SifFifoCopy128Words(u32* to, const u32* from)
@@ -105,6 +112,13 @@ static __forceinline void SifFifoCountNeonCopy(u32 qwords, u32 groups64, u32 gro
 	(void)exact_span;
 #endif
 }
+
+static __forceinline void SifFifoCountExact384ByteCopy()
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuSifFifoExact384ByteCopies;
+#endif
+}
 #endif
 
 static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
@@ -117,6 +131,11 @@ static __forceinline void SifFifoCopyWords(u32* to, const u32* from, int words)
 		case 128:
 			SifFifoCopy128Words(to, from);
 			SifFifoCountNeonCopy(32, 8, 0, 2, 1, true);
+			return;
+		case 96:
+			SifFifoCopy96Words(to, from);
+			SifFifoCountNeonCopy(24, 6, 1, 1, 0, true);
+			SifFifoCountExact384ByteCopy();
 			return;
 		case 64:
 			SifFifoCopy64Words(to, from);
