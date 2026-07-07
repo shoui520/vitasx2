@@ -117,14 +117,15 @@ static u32 _vu1ExecNopPairBurst(VURegs* VU, u32 max_steps)
 
 static __fi bool _vu1CanBurstLowerDirect(const _VURegsNum& lregs)
 {
-	return lregs.pipe == VUPIPE_FMAC || lregs.pipe == VUPIPE_IALU;
+	return lregs.pipe == VUPIPE_FMAC ||
+		lregs.pipe == VUPIPE_IALU ||
+		lregs.pipe == VUPIPE_FDIV ||
+		lregs.pipe == VUPIPE_EFU;
 }
 
 static __fi bool _vu1CanBurstUpperNopLowerDirect(const _VURegsNum& lregs)
 {
-	return _vu1CanBurstLowerDirect(lregs) ||
-		lregs.pipe == VUPIPE_FDIV ||
-		lregs.pipe == VUPIPE_EFU;
+	return _vu1CanBurstLowerDirect(lregs);
 }
 
 static __fi bool _vu1CanBurstUpperDirect(const _VURegsNum& uregs)
@@ -309,8 +310,9 @@ static u32 _vu1ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 		int discard = 0;
 
 		// PCSX2 owners: VU1microInterp.cpp::_vu1Exec() paired upper/lower
-		// path and VUops.cpp pipe helpers. Keep the same upper-first issue,
-		// lower stale-read save/restore, same-register discard, and stall order.
+		// path and VUops.cpp pipe helpers for FMAC/IALU/FDIV/EFU lower pipes.
+		// Keep the same upper-first issue, lower stale-read save/restore,
+		// same-register discard, and stall order.
 		VU->cycle++;
 		VU->VI[REG_TPC].UL = pc + 8;
 		VU->code = upper;
