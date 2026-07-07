@@ -68,6 +68,7 @@ static void Sio2Dma11TransferBlock(u32& madr, u32 bytes)
 	if (bytes != 0 && bytes <= 256 && IopDmaCanAccessExposedIopRam(madr, bytes))
 	{
 		const u8* data = iopPhysMem(madr);
+		g_Sio2.ReserveWriteBytes(bytes);
 		for (u32 i = 0; i < bytes; i++)
 			g_Sio2.Write(data[i]);
 
@@ -95,6 +96,7 @@ static void Sio2Dma11TransferBlock(u32& madr, u32 bytes)
 			return;
 		}
 
+		g_Sio2.ReserveWriteBytes(chunk);
 		for (u32 i = 0; i < chunk; i++)
 			g_Sio2.Write(buffer[i]);
 
@@ -129,8 +131,7 @@ static void Sio2Dma12TransferBlock(u32& madr, u32 bytes)
 	if (bytes != 0 && bytes <= 256 && IopDmaCanAccessExposedIopRam(madr, bytes))
 	{
 		u8* const destination = iopPhysMem(madr);
-		for (u32 i = 0; i < bytes; i++)
-			destination[i] = g_Sio2.Read();
+		g_Sio2.ReadBytes(destination, bytes);
 
 		madr += bytes;
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -162,8 +163,7 @@ static void Sio2Dma12TransferBlock(u32& madr, u32 bytes)
 			continue;
 		}
 
-		for (u32 i = 0; i < chunk; i++)
-			buffer[i] = g_Sio2.Read();
+		g_Sio2.ReadBytes(buffer.data(), chunk);
 
 		if (!iopMemSafeWriteBytes(madr & 0x1fffffffu, buffer.data(), chunk))
 		{

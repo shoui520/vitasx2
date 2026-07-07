@@ -14,13 +14,133 @@
 #include "SIO/SioTypes.h"
 #include "StateWrapper.h"
 
+#include <algorithm>
+#include <cstring>
+
 #define SIO2LOG_ENABLE 0
 #define Sio2Log if (SIO2LOG_ENABLE) DevCon
 
-std::deque<u8> g_Sio2FifoIn;
-std::deque<u8> g_Sio2FifoOut;
+Sio2ByteFifo g_Sio2FifoIn;
+Sio2ByteFifo g_Sio2FifoOut;
 
 Sio2 g_Sio2;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuSio2FifoBulkReadBytes = 0;
+#endif
+
+namespace
+{
+	constexpr size_t SIO2_FIFO_COMPACT_THRESHOLD = 256;
+}
+
+bool Sio2ByteFifo::empty() const
+{
+	return m_head == m_data.size();
+}
+
+size_t Sio2ByteFifo::size() const
+{
+	return m_data.size() - m_head;
+}
+
+u8 Sio2ByteFifo::front() const
+{
+	return m_data[m_head];
+}
+
+void Sio2ByteFifo::push_back(u8 value)
+{
+	if (m_head != 0 && m_data.size() == m_data.capacity())
+		CompactConsumed();
+
+	m_data.push_back(value);
+}
+
+void Sio2ByteFifo::pop_front()
+{
+	m_head++;
+	NormalizeConsumed();
+}
+
+size_t Sio2ByteFifo::pop_front(u8* destination, size_t bytes)
+{
+	const size_t copied = std::min(bytes, size());
+	if (copied == 0)
+		return 0;
+
+	std::memcpy(destination, m_data.data() + m_head, copied);
+	m_head += copied;
+	NormalizeConsumed();
+	return copied;
+}
+
+void Sio2ByteFifo::clear()
+{
+	m_data.clear();
+	m_head = 0;
+}
+
+void Sio2ByteFifo::reserve(size_t capacity)
+{
+	if (capacity <= (m_data.capacity() - m_head))
+		return;
+
+	CompactConsumed();
+	m_data.reserve(capacity);
+}
+
+void Sio2ByteFifo::DoState(StateWrapper& sw)
+{
+	u32 length = static_cast<u32>(size());
+	sw.Do(&length);
+
+	if (sw.IsReading())
+	{
+		clear();
+		reserve(length);
+
+		for (u32 i = 0; i < length; i++)
+		{
+			u8 value = 0;
+			sw.Do(&value);
+			push_back(value);
+		}
+	}
+	else
+	{
+		for (u32 i = 0; i < length; i++)
+		{
+			u8 value = m_data[m_head + i];
+			sw.Do(&value);
+		}
+	}
+}
+
+void Sio2ByteFifo::CompactConsumed()
+{
+	if (m_head == 0)
+		return;
+
+	const size_t remaining = size();
+	if (remaining != 0)
+		std::memmove(m_data.data(), m_data.data() + m_head, remaining);
+
+	m_data.resize(remaining);
+	m_head = 0;
+}
+
+void Sio2ByteFifo::NormalizeConsumed()
+{
+	if (m_head == m_data.size())
+	{
+		clear();
+		return;
+	}
+
+	if (m_head >= SIO2_FIFO_COMPACT_THRESHOLD && (m_head * 2) >= m_data.size())
+		CompactConsumed();
+}
 
 Sio2::Sio2() = default;
 Sio2::~Sio2() = default;
@@ -52,10 +172,7 @@ bool Sio2::Initialize()
 
 	port = 0;
 
-	while (!g_Sio2FifoOut.empty())
-	{
-		g_Sio2FifoOut.pop_front();
-	}
+	g_Sio2FifoOut.clear();
 
 	for (int i = 0; i < 2; i++)
 	{
@@ -89,10 +206,7 @@ void Sio2::SoftReset()
 	queueComplete = false;
 
 	// Anything in g_Sio2FifoIn which was not necessary to consume should be cleared out prior to the next SIO2 cycle.
-	while (!g_Sio2FifoIn.empty())
-	{
-		g_Sio2FifoIn.pop_front();
-	}
+	g_Sio2FifoIn.clear();
 
 	// cmd_stat should always be reassembled based on the devices being probed by the packet.
 	CmdStat = 0;
@@ -377,6 +491,11 @@ void Sio2::Memcard()
 	}
 }
 
+void Sio2::ReserveWriteBytes(size_t bytes)
+{
+	g_Sio2FifoIn.reserve(g_Sio2FifoIn.size() + bytes);
+}
+
 void Sio2::Write(u8 data)
 {
 	Sio2Log.WriteLn("%s(%02X) SIO2 DATA Write", __FUNCTION__, data);
@@ -404,10 +523,7 @@ void Sio2::Write(u8 data)
 
 		// If the prior command did not need to fully pop g_Sio2FifoIn, do so now,
 		// so that the next command isn't trying to read the last command's leftovers.
-		while (!g_Sio2FifoIn.empty())
-		{
-			g_Sio2FifoIn.pop_front();
-		}
+		g_Sio2FifoIn.clear();
 	}
 
 	if (queueComplete)
@@ -488,6 +604,22 @@ u8 Sio2::Read()
 	return ret;
 }
 
+void Sio2::ReadBytes(u8* destination, size_t bytes)
+{
+#if SIO2LOG_ENABLE
+	for (size_t i = 0; i < bytes; i++)
+		destination[i] = Read();
+#else
+	const size_t copied = g_Sio2FifoOut.pop_front(destination, bytes);
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSio2FifoBulkReadBytes += static_cast<u32>(copied);
+#endif
+
+	for (size_t i = copied; i < bytes; i++)
+		destination[i] = Read();
+#endif
+}
+
 bool Sio2::DoState(StateWrapper& sw)
 {
 	if (!sw.DoMarker("Sio2"))
@@ -513,8 +645,8 @@ bool Sio2::DoState(StateWrapper& sw)
 	sw.Do(&dmaBlockSize);
 	sw.Do(&queueComplete);
 
-	sw.Do(&g_Sio2FifoIn);
-	sw.Do(&g_Sio2FifoOut);
+	g_Sio2FifoIn.DoState(sw);
+	g_Sio2FifoOut.DoState(sw);
 
 	// CRCs for memory cards.
 	// If the memory card hasn't changed when loading state, we can safely skip ejecting it.

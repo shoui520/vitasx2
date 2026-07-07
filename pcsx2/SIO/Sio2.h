@@ -6,9 +6,31 @@
 #include "common/Pcsx2Types.h"
 
 #include <array>
-#include <deque>
+#include <vector>
 
 class StateWrapper;
+
+class Sio2ByteFifo
+{
+public:
+	bool empty() const;
+	size_t size() const;
+	u8 front() const;
+
+	void push_back(u8 value);
+	void pop_front();
+	size_t pop_front(u8* destination, size_t bytes);
+	void clear();
+	void reserve(size_t capacity);
+	void DoState(StateWrapper& sw);
+
+private:
+	void CompactConsumed();
+	void NormalizeConsumed();
+
+	std::vector<u8> m_data;
+	size_t m_head = 0;
+};
 
 class Sio2
 {
@@ -61,10 +83,12 @@ public:
 	void Infrared();
 	void Memcard();
 
+	void ReserveWriteBytes(size_t bytes);
 	void Write(u8 data);
 	u8 Read();
+	void ReadBytes(u8* destination, size_t bytes);
 };
 
-extern std::deque<u8> g_Sio2FifoIn;
-extern std::deque<u8> g_Sio2FifoOut;
+extern Sio2ByteFifo g_Sio2FifoIn;
+extern Sio2ByteFifo g_Sio2FifoOut;
 extern Sio2 g_Sio2;
