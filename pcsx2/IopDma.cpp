@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 
 using namespace R3000A;
 
@@ -25,9 +26,13 @@ using namespace R3000A;
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSio2Dma11FastBlocks = 0;
 u32 g_qemuSio2Dma11FastBytes = 0;
+u32 g_qemuSio2Dma11DirectBlocks = 0;
+u32 g_qemuSio2Dma11DirectBytes = 0;
 u32 g_qemuSio2Dma11FallbackBytes = 0;
 u32 g_qemuSio2Dma12FastBlocks = 0;
 u32 g_qemuSio2Dma12FastBytes = 0;
+u32 g_qemuSio2Dma12DirectBlocks = 0;
+u32 g_qemuSio2Dma12DirectBytes = 0;
 u32 g_qemuSio2Dma12FallbackBytes = 0;
 #endif
 
@@ -35,6 +40,12 @@ static bool IopDmaCanAccessDirectIopRam(u32 mem, u32 size)
 {
 	const u32 phys = mem & 0x1fffffffu;
 	return phys <= Ps2MemSize::TotalIopRam && size <= (Ps2MemSize::TotalIopRam - phys);
+}
+
+static bool IopDmaCanAccessExposedIopRam(u32 mem, u32 size)
+{
+	const u32 phys = mem & 0x1fffffffu;
+	return phys <= Ps2MemSize::ExposedIopRam && size <= (Ps2MemSize::ExposedIopRam - phys);
 }
 
 static void Sio2Dma11TransferBytewise(u32& madr, u32 bytes)
@@ -53,6 +64,22 @@ static void Sio2Dma11TransferBytewise(u32& madr, u32 bytes)
 
 static void Sio2Dma11TransferBlock(u32& madr, u32 bytes)
 {
+	if (bytes != 0 && bytes <= 256 && IopDmaCanAccessExposedIopRam(madr, bytes))
+	{
+		const u8* data = iopPhysMem(madr);
+		for (u32 i = 0; i < bytes; i++)
+			g_Sio2.Write(data[i]);
+
+		madr += bytes;
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuSio2Dma11FastBlocks;
+		g_qemuSio2Dma11FastBytes += bytes;
+		++g_qemuSio2Dma11DirectBlocks;
+		g_qemuSio2Dma11DirectBytes += bytes;
+#endif
+		return;
+	}
+
 	std::array<u8, 256> buffer;
 	u32 remaining = bytes;
 	bool used_fast_path = false;
@@ -98,6 +125,23 @@ static void Sio2DmaWriteBufferBytewise(u32& madr, const u8* data, u32 bytes)
 
 static void Sio2Dma12TransferBlock(u32& madr, u32 bytes)
 {
+	if (bytes != 0 && bytes <= 256 && IopDmaCanAccessExposedIopRam(madr, bytes))
+	{
+		std::array<u8, 256> buffer;
+		for (u32 i = 0; i < bytes; i++)
+			buffer[i] = g_Sio2.Read();
+
+		std::memcpy(iopPhysMem(madr), buffer.data(), bytes);
+		madr += bytes;
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuSio2Dma12FastBlocks;
+		g_qemuSio2Dma12FastBytes += bytes;
+		++g_qemuSio2Dma12DirectBlocks;
+		g_qemuSio2Dma12DirectBytes += bytes;
+#endif
+		return;
+	}
+
 	std::array<u8, 256> buffer;
 	u32 remaining = bytes;
 	bool used_fast_path = false;
