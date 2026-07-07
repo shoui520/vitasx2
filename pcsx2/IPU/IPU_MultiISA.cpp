@@ -25,6 +25,7 @@ u32 g_qemuIpuVqNeonGroups = 0;
 u32 g_qemuIpuIdctCopyNeonRows = 0;
 u32 g_qemuIpuBitreader64NeonReads = 0;
 u32 g_qemuIpuBitreader32NeonReads = 0;
+u32 g_qemuIpuMb8To16NeonGroups = 0;
 #endif
 
 // the IPU is fixed to 16 byte strides (128-bit / QWC resolution):
@@ -273,6 +274,82 @@ void IpuGetBits32SelectedForValidation(const u8* readpos, u32 shift, u8* address
 #else
 	IpuGetBits32ReferenceForValidation(readpos, shift, address);
 #endif
+}
+#endif
+
+static __forceinline void IpuCopyMacroblock8To16Reference(const macroblock_8& mb8, macroblock_16& mb16)
+{
+	const u8* s = reinterpret_cast<const u8*>(&mb8);
+	u16* d = reinterpret_cast<u16*>(&mb16);
+	for (uint i = 0; i < (256 + 64 + 64); i++)
+		d[i] = s[i];
+}
+
+static __forceinline void IpuCopyMacroblock8To16Selected(const macroblock_8& mb8, macroblock_16& mb16)
+{
+	const u8* s = reinterpret_cast<const u8*>(&mb8);
+	u16* d = reinterpret_cast<u16*>(&mb16);
+
+#if defined(ARCH_X86)
+	__m128i zeroreg = _mm_setzero_si128();
+
+	for (uint i = 0; i < (256 + 64 + 64) / 32; ++i)
+	{
+		__m128i woot1 = _mm_load_si128(reinterpret_cast<const __m128i*>(s));
+		__m128i woot2 = _mm_load_si128(reinterpret_cast<const __m128i*>(s) + 1);
+		_mm_store_si128(reinterpret_cast<__m128i*>(d), _mm_unpacklo_epi8(woot1, zeroreg));
+		_mm_store_si128(reinterpret_cast<__m128i*>(d) + 1, _mm_unpackhi_epi8(woot1, zeroreg));
+		_mm_store_si128(reinterpret_cast<__m128i*>(d) + 2, _mm_unpacklo_epi8(woot2, zeroreg));
+		_mm_store_si128(reinterpret_cast<__m128i*>(d) + 3, _mm_unpackhi_epi8(woot2, zeroreg));
+		s += 32;
+		d += 32;
+	}
+#elif defined(ARCH_ARM64)
+	uint8x16_t zeroreg = vmovq_n_u8(0);
+
+	for (uint i = 0; i < (256 + 64 + 64) / 32; ++i)
+	{
+		uint8x16_t woot1 = vld1q_u8(reinterpret_cast<const uint8_t*>(s));
+		uint8x16_t woot2 = vld1q_u8(reinterpret_cast<const uint8_t*>(s) + 16);
+		vst1q_u8(reinterpret_cast<uint8_t*>(d), vzip1q_u8(woot1, zeroreg));
+		vst1q_u8(reinterpret_cast<uint8_t*>(d) + 16, vzip2q_u8(woot1, zeroreg));
+		vst1q_u8(reinterpret_cast<uint8_t*>(d) + 32, vzip1q_u8(woot2, zeroreg));
+		vst1q_u8(reinterpret_cast<uint8_t*>(d) + 48, vzip2q_u8(woot2, zeroreg));
+		s += 32;
+		d += 32;
+	}
+#elif defined(ARCH_ARM32)
+	for (uint i = 0; i < (256 + 64 + 64) / 32; ++i)
+	{
+		// PCSX2 owner: the scalar macroblock8-to-macroblock16 copy in
+		// mpeg2_slice(). ARMv7 widens the same 8-bit luma/chroma bytes to
+		// zero-extended 16-bit samples before yuv2rgb/PACK processing.
+		const uint8x16_t woot1 = vld1q_u8(s);
+		const uint8x16_t woot2 = vld1q_u8(s + 16);
+		vst1q_u16(d, vmovl_u8(vget_low_u8(woot1)));
+		vst1q_u16(d + 8, vmovl_u8(vget_high_u8(woot1)));
+		vst1q_u16(d + 16, vmovl_u8(vget_low_u8(woot2)));
+		vst1q_u16(d + 24, vmovl_u8(vget_high_u8(woot2)));
+		s += 32;
+		d += 32;
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIpuMb8To16NeonGroups;
+#endif
+	}
+#else
+	IpuCopyMacroblock8To16Reference(mb8, mb16);
+#endif
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void IpuCopyMacroblock8To16ReferenceForValidation(const macroblock_8& mb8, macroblock_16& mb16)
+{
+	IpuCopyMacroblock8To16Reference(mb8, mb16);
+}
+
+void IpuCopyMacroblock8To16SelectedForValidation(const macroblock_8& mb8, macroblock_16& mb16)
+{
+	IpuCopyMacroblock8To16Selected(mb8, mb16);
 }
 #endif
 
@@ -1486,52 +1563,7 @@ __fi static bool mpeg2_slice()
 			}
 
 			// Copy macroblock8 to macroblock16 - without sign extension.
-			// Manually inlined due to MSVC refusing to inline the SSE-optimized version.
-			{
-				const u8	*s = (const u8*)&mb8;
-				u16			*d = (u16*)&mb16;
-
-				//Y  bias	- 16 * 16
-				//Cr bias	- 8 * 8
-				//Cb bias	- 8 * 8
-
-#if defined(ARCH_X86)
-				__m128i zeroreg = _mm_setzero_si128();
-
-				for (uint i = 0; i < (256+64+64) / 32; ++i)
-				{
-					//*d++ = *s++;
-					__m128i woot1 = _mm_load_si128((__m128i*)s);
-					__m128i woot2 = _mm_load_si128((__m128i*)s+1);
-					_mm_store_si128((__m128i*)d,	_mm_unpacklo_epi8(woot1, zeroreg));
-					_mm_store_si128((__m128i*)d+1,	_mm_unpackhi_epi8(woot1, zeroreg));
-					_mm_store_si128((__m128i*)d+2,	_mm_unpacklo_epi8(woot2, zeroreg));
-					_mm_store_si128((__m128i*)d+3,	_mm_unpackhi_epi8(woot2, zeroreg));
-					s += 32;
-					d += 32;
-				}
-#elif defined(ARCH_ARM64)
-				uint8x16_t zeroreg = vmovq_n_u8(0);
-
-				for (uint i = 0; i < (256 + 64 + 64) / 32; ++i)
-				{
-					//*d++ = *s++;
-					uint8x16_t woot1 = vld1q_u8((uint8_t*)s);
-					uint8x16_t woot2 = vld1q_u8((uint8_t*)s + 16);
-					vst1q_u8((uint8_t*)d, vzip1q_u8(woot1, zeroreg));
-					vst1q_u8((uint8_t*)d + 16, vzip2q_u8(woot1, zeroreg));
-					vst1q_u8((uint8_t*)d + 32, vzip1q_u8(woot2, zeroreg));
-					vst1q_u8((uint8_t*)d + 48, vzip2q_u8(woot2, zeroreg));
-					s += 32;
-					d += 32;
-				}
-#elif defined(ARCH_ARM32)
-				for (uint i = 0; i < (256 + 64 + 64); i++)
-					d[i] = s[i];
-#else
-#error Unsupported arch
-#endif
-			}
+			IpuCopyMacroblock8To16Selected(mb8, mb16);
 		}
 		else
 		{
