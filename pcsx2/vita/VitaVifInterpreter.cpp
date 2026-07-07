@@ -29,6 +29,7 @@ u32 g_qemuVifBurstSAndV2Vectors = 0;
 u32 g_qemuVifBurstV3Vectors = 0;
 u32 g_qemuVifBurstCopyVectors = 0;
 u32 g_qemuVifBurstCopy64ByteGroups = 0;
+u32 g_qemuVifBurstCopy128ByteGroups = 0;
 u32 g_qemuVifBurstCopy256ByteGroups = 0;
 u32 g_qemuVifBurstCopy1024ByteGroups = 0;
 u32 g_qemuVifBurstModeMaskVectors = 0;
@@ -101,12 +102,16 @@ namespace
 		vst1q_u32(reinterpret_cast<u32*>(dest + 48), qword3);
 	}
 
-	void VitaVifCopy256Bytes(u8* dest, const u8* src)
+	void VitaVifCopy128Bytes(u8* dest, const u8* src)
 	{
 		VitaVifCopy64Bytes(dest, src);
 		VitaVifCopy64Bytes(dest + 64, src + 64);
-		VitaVifCopy64Bytes(dest + 128, src + 128);
-		VitaVifCopy64Bytes(dest + 192, src + 192);
+	}
+
+	void VitaVifCopy256Bytes(u8* dest, const u8* src)
+	{
+		VitaVifCopy128Bytes(dest, src);
+		VitaVifCopy128Bytes(dest + 128, src + 128);
 	}
 
 	void VitaVifCopy1024Bytes(u8* dest, const u8* src)
@@ -145,7 +150,19 @@ namespace
 		}
 
 		const u32 remaining_after_256 = remaining_after_1024 & 15u;
-		const u32 groups64 = remaining_after_256 >> 2;
+		const u32 groups128 = remaining_after_256 >> 3;
+		for (u32 i = 0; i < groups128; i++)
+		{
+			if ((i + 1) < groups128)
+				__builtin_prefetch(src + 128, 0, 1);
+
+			VitaVifCopy128Bytes(dest, src);
+			src += 128;
+			dest += 128;
+		}
+
+		const u32 remaining_after_128 = remaining_after_256 & 7u;
+		const u32 groups64 = remaining_after_128 >> 2;
 		for (u32 i = 0; i < groups64; i++)
 		{
 			if ((i + 1) < groups64)
@@ -156,7 +173,7 @@ namespace
 			dest += 64;
 		}
 
-		const u32 tail_qwords = remaining_after_256 & 3u;
+		const u32 tail_qwords = remaining_after_128 & 3u;
 		for (u32 i = 0; i < tail_qwords; i++)
 		{
 			const uint32x4_t value = vld1q_u32(reinterpret_cast<const u32*>(src));
@@ -173,10 +190,13 @@ namespace
 #if defined(VITASX2_QEMU_VALIDATION)
 		const u32 validation_remaining_after_1024 = count & 63u;
 		const u32 validation_groups256 = validation_remaining_after_1024 >> 4;
+		const u32 validation_remaining_after_256 = validation_remaining_after_1024 & 15u;
+		const u32 validation_groups128 = validation_remaining_after_256 >> 3;
 		g_qemuVifFastVectors += count;
 		g_qemuVifBurstVectors += count;
 		g_qemuVifBurstCopyVectors += count;
-		g_qemuVifBurstCopy64ByteGroups += (groups1024 << 4) + (validation_groups256 << 2) + ((validation_remaining_after_1024 & 15u) / 4u);
+		g_qemuVifBurstCopy64ByteGroups += (groups1024 << 4) + (validation_groups256 << 2) + (validation_groups128 << 1) + ((validation_remaining_after_256 & 7u) / 4u);
+		g_qemuVifBurstCopy128ByteGroups += (groups1024 << 3) + (validation_groups256 << 1) + validation_groups128;
 		g_qemuVifBurstCopy256ByteGroups += (groups1024 << 2) + validation_groups256;
 		g_qemuVifBurstCopy1024ByteGroups += groups1024;
 #endif
