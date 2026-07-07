@@ -19,6 +19,7 @@ static constexpr size_t SPR_SCRATCH_BYTES = 16 * 1024;
 extern u32 g_qemuSprCopyNeonQwords;
 extern u32 g_qemuSprCopyNeon64ByteGroups;
 extern u32 g_qemuSprCopyNeon256ByteGroups;
+extern u32 g_qemuSprCopyNeon1024ByteGroups;
 extern u32 g_qemuSprCopyToScratchCalls;
 extern u32 g_qemuSprCopyFromScratchCalls;
 extern u32 g_qemuSprCopyWrappedToScratch;
@@ -53,6 +54,24 @@ static __forceinline void SprCopy256Bytes(u8* dst, const u8* src)
 	SprCopy64Bytes(dst + 128, src + 128);
 	SprCopy64Bytes(dst + 192, src + 192);
 }
+
+static __forceinline void SprCopy1024Bytes(u8* dst, const u8* src)
+{
+	SprCopy256Bytes(dst, src);
+	SprCopy256Bytes(dst + 256, src + 256);
+	SprCopy256Bytes(dst + 512, src + 512);
+	SprCopy256Bytes(dst + 768, src + 768);
+}
+
+static __forceinline void SprCountNeonCopy(size_t qwords, size_t groups64, size_t groups256, size_t groups1024)
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSprCopyNeonQwords += static_cast<u32>(qwords);
+	g_qemuSprCopyNeon64ByteGroups += static_cast<u32>(groups64);
+	g_qemuSprCopyNeon256ByteGroups += static_cast<u32>(groups256);
+	g_qemuSprCopyNeon1024ByteGroups += static_cast<u32>(groups1024);
+#endif
+}
 #endif
 
 static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
@@ -72,7 +91,19 @@ static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
 
 	u8* cdst = static_cast<u8*>(dst);
 	const u8* csrc = static_cast<const u8*>(src);
-	const size_t groups256 = size >> 8;
+	const size_t groups1024 = size >> 10;
+	for (size_t i = 0; i < groups1024; i++)
+	{
+		if ((i + 1) < groups1024)
+			__builtin_prefetch(csrc + 1024, 0, 1);
+
+		SprCopy1024Bytes(cdst, csrc);
+		csrc += 1024;
+		cdst += 1024;
+	}
+
+	const size_t remaining_after_1024 = size & 1023;
+	const size_t groups256 = remaining_after_1024 >> 8;
 	for (size_t i = 0; i < groups256; i++)
 	{
 		if ((i + 1) < groups256)
@@ -83,7 +114,7 @@ static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
 		cdst += 256;
 	}
 
-	const size_t remaining_after_256 = size & 255;
+	const size_t remaining_after_256 = remaining_after_1024 & 255;
 	const size_t groups64 = remaining_after_256 >> 6;
 	for (size_t i = 0; i < groups64; i++)
 	{
@@ -116,11 +147,10 @@ static __forceinline void SprCopyBytes(void* dst, const void* src, size_t size)
 	for (size_t i = 0; i < (tail_bytes & 7); i++)
 		cdst[i] = csrc[i];
 
-#if defined(VITASX2_QEMU_VALIDATION)
-	g_qemuSprCopyNeonQwords += static_cast<u32>((groups256 << 4) + (groups64 << 2) + tail_qwords);
-	g_qemuSprCopyNeon64ByteGroups += static_cast<u32>((groups256 << 2) + groups64);
-	g_qemuSprCopyNeon256ByteGroups += static_cast<u32>(groups256);
-#endif
+	SprCountNeonCopy((groups1024 << 6) + (groups256 << 4) + (groups64 << 2) + tail_qwords,
+		(groups1024 << 4) + (groups256 << 2) + groups64,
+		(groups1024 << 2) + groups256,
+		groups1024);
 	return;
 #endif
 

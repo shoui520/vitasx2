@@ -12,6 +12,7 @@
 u32 g_qemuSprCopyNeonQwords = 0;
 u32 g_qemuSprCopyNeon64ByteGroups = 0;
 u32 g_qemuSprCopyNeon256ByteGroups = 0;
+u32 g_qemuSprCopyNeon1024ByteGroups = 0;
 u32 g_qemuSprCopyToScratchCalls = 0;
 u32 g_qemuSprCopyFromScratchCalls = 0;
 u32 g_qemuSprCopyWrappedToScratch = 0;
