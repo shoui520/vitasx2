@@ -3,6 +3,7 @@
 
 #include "CDVDdiscReader.h"
 #include "CDVD/CDVD.h"
+#include "CDVD/CdvdCopy.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -63,7 +64,7 @@ static void cdvdCacheUpdate(u32 lsn, u8* data)
 	std::lock_guard<std::mutex> guard(s_cache_lock);
 	u32 entry = cdvdSectorHash(lsn);
 
-	memcpy(Cache[entry].data, data, 2352 * sectors_per_read);
+	CdvdCopyBytes(Cache[entry].data, data, 2352 * sectors_per_read);
 	Cache[entry].lsn = lsn;
 }
 
@@ -82,7 +83,7 @@ static bool cdvdCacheFetch(u32 lsn, u8* data)
 
 	if (Cache[entry].lsn == lsn)
 	{
-		memcpy(data, Cache[entry].data, 2352 * sectors_per_read);
+		CdvdCopyBytes(data, Cache[entry].data, 2352 * sectors_per_read);
 		return true;
 	}
 	//printf("NOT IN CACHE\n");
@@ -342,7 +343,7 @@ s32 cdvdDirectReadSector(u32 sector, s32 mode, u8* buffer)
 	if (src->GetMediaType() >= 0)
 	{
 		u32 offset = 2048 * (sector - sector_block);
-		memcpy(buffer, data + offset, 2048);
+		CdvdCopyBytes(buffer, data + offset, 2048);
 		return 0;
 	}
 
@@ -353,16 +354,16 @@ s32 cdvdDirectReadSector(u32 sector, s32 mode, u8* buffer)
 	{
 		case CDVD_MODE_2048:
 			// Data location depends on CD mode
-			std::memcpy(buffer, (bfr[15] & 3) == 2 ? bfr + 24 : bfr + 16, 2048);
+			CdvdCopyBytes(buffer, (bfr[15] & 3) == 2 ? bfr + 24 : bfr + 16, 2048);
 			return 0;
 		case CDVD_MODE_2328:
-			memcpy(buffer, bfr + 24, 2328);
+			CdvdCopyBytes(buffer, bfr + 24, 2328);
 			return 0;
 		case CDVD_MODE_2340:
-			memcpy(buffer, bfr + 12, 2340);
+			CdvdCopyBytes(buffer, bfr + 12, 2340);
 			return 0;
 		default:
-			memcpy(buffer, bfr, 2352);
+			CdvdCopyBytes(buffer, bfr, 2352);
 			return 0;
 	}
 }

@@ -3,6 +3,7 @@
 
 #include "CDVDdiscReader.h"
 #include "CDVD/CDVD.h"
+#include "CDVD/CdvdCopy.h"
 #include "Host.h"
 #include "common/Console.h"
 
@@ -255,11 +256,11 @@ static s32 DISCgetBuffer(u8* dest)
 	{
 		lastReadInNewDiskCB = 0;
 
-		memcpy(dest, directReadSectorBuffer, csize);
+		CdvdCopyBytes(dest, directReadSectorBuffer, csize);
 		return 0;
 	}
 
-	memcpy(dest, cdvdGetSector(csector, cmode), csize);
+	CdvdCopyBytes(dest, cdvdGetSector(csector, cmode), csize);
 
 	return 0;
 }
