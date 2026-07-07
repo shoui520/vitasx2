@@ -22,6 +22,7 @@ extern u32* GET_VU_MEM(VURegs* VU, u32 addr);
 #if defined(VITASX2_QEMU_VALIDATION)
 extern u32 g_qemuVuLowerNeonQwordOps;
 extern u32 g_qemuVuUpperNeonQwordOps;
+extern u32 g_qemuVuUpperScalarFullMaskOps;
 #endif
 
 namespace VUInterpFast
@@ -2092,6 +2093,22 @@ namespace VUInterpFast
 		const unsigned fd = Fd(code);
 		const unsigned fs = Fs(code);
 		const unsigned mask = XYZW(code);
+		if (mask == 0x0f)
+		{
+			WriteMacResult(VU, acc, fd, 0, UpdateMacLane(VU, 0,
+				VuDouble(VU->ACC.UL[0]) + VuDouble(VU->VF[fs].UL[0]) * VuDouble(operand(0))));
+			WriteMacResult(VU, acc, fd, 1, UpdateMacLane(VU, 1,
+				VuDouble(VU->ACC.UL[1]) + VuDouble(VU->VF[fs].UL[1]) * VuDouble(operand(1))));
+			WriteMacResult(VU, acc, fd, 2, UpdateMacLane(VU, 2,
+				VuDouble(VU->ACC.UL[2]) + VuDouble(VU->VF[fs].UL[2]) * VuDouble(operand(2))));
+			WriteMacResult(VU, acc, fd, 3, UpdateMacLane(VU, 3,
+				VuDouble(VU->ACC.UL[3]) + VuDouble(VU->VF[fs].UL[3]) * VuDouble(operand(3))));
+			VU_STAT_UPDATE(VU);
+	#if defined(VITASX2_QEMU_VALIDATION)
+			++::g_qemuVuUpperScalarFullMaskOps;
+	#endif
+			return;
+		}
 
 		for (unsigned lane = 0; lane < 4; lane++)
 		{
@@ -2116,6 +2133,22 @@ namespace VUInterpFast
 		const unsigned fd = Fd(code);
 		const unsigned fs = Fs(code);
 		const unsigned mask = XYZW(code);
+		if (mask == 0x0f)
+		{
+			WriteMacResult(VU, acc, fd, 0, UpdateMacLane(VU, 0,
+				VuDouble(VU->ACC.UL[0]) - VuDouble(VU->VF[fs].UL[0]) * VuDouble(operand(0))));
+			WriteMacResult(VU, acc, fd, 1, UpdateMacLane(VU, 1,
+				VuDouble(VU->ACC.UL[1]) - VuDouble(VU->VF[fs].UL[1]) * VuDouble(operand(1))));
+			WriteMacResult(VU, acc, fd, 2, UpdateMacLane(VU, 2,
+				VuDouble(VU->ACC.UL[2]) - VuDouble(VU->VF[fs].UL[2]) * VuDouble(operand(2))));
+			WriteMacResult(VU, acc, fd, 3, UpdateMacLane(VU, 3,
+				VuDouble(VU->ACC.UL[3]) - VuDouble(VU->VF[fs].UL[3]) * VuDouble(operand(3))));
+			VU_STAT_UPDATE(VU);
+	#if defined(VITASX2_QEMU_VALIDATION)
+			++::g_qemuVuUpperScalarFullMaskOps;
+	#endif
+			return;
+		}
 
 		for (unsigned lane = 0; lane < 4; lane++)
 		{

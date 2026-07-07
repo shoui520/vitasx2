@@ -24,6 +24,7 @@ u32 g_qemuVuUpperDirectBurstSteps = 0;
 u32 g_qemuVuPairedDirectBurstSteps = 0;
 u32 g_qemuVuLowerNeonQwordOps = 0;
 u32 g_qemuVuUpperNeonQwordOps = 0;
+u32 g_qemuVuUpperScalarFullMaskOps = 0;
 bool g_qemuVuLowerDirectFastEnabled = true;
 bool g_qemuVuUpperDirectFastEnabled = true;
 bool g_qemuVuLowerDirectBurstEnabled = true;
