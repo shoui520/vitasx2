@@ -213,7 +213,6 @@ namespace VitaEE
 		constexpr unsigned VU0_REG_VPU_STAT = 29;
 		constexpr unsigned VU0_REG_CMSAR1 = 31;
 
-		alignas(16) GPR_reg s_lq_zero_sink;
 		alignas(4) u32 s_raw_gpr0_known_zero = 1;
 
 		constexpr u32 LWL_MASK[4] = {0x00ffffff, 0x0000ffff, 0x000000ff, 0x00000000};
@@ -1961,16 +1960,6 @@ namespace VitaEE
 											 (mem >> LDR_SHIFT[shift]);
 		}
 
-		__noinline void VitaEeMemRead128Aligned(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::LQ().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuQwordGprMemoryHelperCalls;
-#endif
-			GPR_reg* dest = (guest_reg == 0) ? &s_lq_zero_sink : &cpuRegs.GPR.r[guest_reg];
-			memRead128(addr & ~0x0fu, dest->UQ);
-		}
-
 		__noinline void VitaEeMemReadCop1Word(u32 addr, u32 guest_reg)
 		{
 			// PCSX2 owner: FPU.cpp::LWC1().
@@ -1984,22 +1973,6 @@ namespace VitaEE
 			}
 
 			fpuRegs.fpr[guest_reg].UL = memRead32(addr);
-		}
-
-		__noinline void VitaEeMemReadVu0Quad(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: VU0.cpp::LQC2().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuQwordCop2MemoryHelperCalls;
-#endif
-			vu0Sync();
-			if (guest_reg != 0)
-				memRead128(addr, VU0.VF[guest_reg].UQ);
-			else
-			{
-				mem128_t sink;
-				memRead128(addr, sink);
-			}
 		}
 
 		__noinline void VitaEeMemWrite8(u32 addr, u32 value)
@@ -2097,15 +2070,6 @@ namespace VitaEE
 			memWrite64(aligned, mem);
 		}
 
-		__noinline void VitaEeMemWrite128Aligned(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: R5900OpcodeImpl.cpp::SQ().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuQwordGprMemoryHelperCalls;
-#endif
-			memWrite128(addr & ~0x0fu, cpuRegs.GPR.r[guest_reg].UQ);
-		}
-
 		__noinline void VitaEeMemWriteCop1Word(u32 addr, u32 guest_reg)
 		{
 			// PCSX2 owner: FPU.cpp::SWC1().
@@ -2119,16 +2083,6 @@ namespace VitaEE
 			}
 
 			memWrite32(addr, fpuRegs.fpr[guest_reg].UL);
-		}
-
-		__noinline void VitaEeMemWriteVu0Quad(u32 addr, u32 guest_reg)
-		{
-			// PCSX2 owner: VU0.cpp::SQC2().
-#if defined(VITASX2_QEMU_VALIDATION)
-			++g_qemuQwordCop2MemoryHelperCalls;
-#endif
-			vu0Sync();
-			memWrite128(addr, VU0.VF[guest_reg].UQ);
 		}
 
 		__noinline void VitaEeDivSigned(u32 rs, u32 rt)
@@ -12969,7 +12923,6 @@ namespace VitaEE
 		m_qword_load_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
-			reinterpret_cast<const void*>(&VitaEeMemRead128Aligned),
 			rt,
 		});
 		return true;
@@ -13032,8 +12985,8 @@ namespace VitaEE
 		m_cop2_qword_memory_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
-			reinterpret_cast<const void*>(&VitaEeMemReadVu0Quad),
 			rt,
+			false,
 		});
 		return true;
 	}
@@ -13266,7 +13219,6 @@ namespace VitaEE
 		m_qword_store_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
-			reinterpret_cast<const void*>(&VitaEeMemWrite128Aligned),
 			rt,
 		});
 		return true;
@@ -13324,8 +13276,8 @@ namespace VitaEE
 		m_cop2_qword_memory_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
-			reinterpret_cast<const void*>(&VitaEeMemWriteVu0Quad),
 			rt,
+			true,
 		});
 		return true;
 	}
@@ -15066,13 +15018,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitQwordLoadColdTail(const QwordLoadColdTail& tail)
 	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead128() / R5900OpcodeImpl.cpp::LQ().
-		// Handler-backed pages call the existing helper; non-handler pages fall
-		// through after the native NEON load/store.
+		// Handler-backed pages dispatch through vTLB directly and keep the
+		// 128-bit payload in q0; non-handler pages fall through after the native
+		// NEON load/store. LQ r0 still performs the handler read for side effects
+		// but discards the returned qword like R5900OpcodeImpl.cpp::LQ().
+		constexpr unsigned NEON_VALUE = 0;
+		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
-			!m_code.EmitCallAbsolute(tail.read_helper) ||
-			!EmitRefreshGprPinFromBacking(tail.rt))
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memRead128)) ||
+			!EmitStoreGprQ128(tail.rt, NEON_VALUE, HOST_TMP1))
 		{
 			return false;
 		}
@@ -15085,12 +15040,14 @@ namespace VitaEE
 	bool BlockCompiler::EmitQwordStoreColdTail(const QwordStoreColdTail& tail)
 	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memWrite128() / R5900OpcodeImpl.cpp::SQ().
-		// Handler-backed pages call the existing helper; non-handler pages fall
-		// through after the native NEON store.
+		// Handler-backed pages dispatch through vTLB directly. SQ reads the raw
+		// GPR backing slot, including r0, matching R5900OpcodeImpl.cpp::SQ().
+		constexpr unsigned NEON_VALUE = 0;
+		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
-			!m_code.EmitCallAbsolute(tail.write_helper))
+			!EmitLoadCpuRegsQ128(GprOffset(tail.rt), NEON_VALUE, HOST_TMP1) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memWrite128)))
 		{
 			return false;
 		}
@@ -15136,13 +15093,50 @@ namespace VitaEE
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead128()/vtlb_memWrite128()
 		// plus VU0.cpp::LQC2()/SQC2(). The handler branch is emitted before
 		// the translated host pointer replaces the guest address, so HOST_TMP0
-		// still carries the PCSX2 helper address argument on the cold edge.
+		// still carries the PCSX2 memory address argument on the cold edge.
+		constexpr unsigned NEON_VALUE = 0;
+		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!m_code.EmitMovImm8(HOST_TMP1, static_cast<u8>(tail.rt)) ||
-			!m_code.EmitCallAbsolute(tail.helper))
+			!EmitVu0ViAddress(HOST_TMP1, VU0_REG_VPU_STAT) ||
+			!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, 0) ||
+			!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 1, true))
 		{
 			return false;
+		}
+
+		const size_t vu0_idle = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (vu0_idle == static_cast<size_t>(-1) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
+			!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+		{
+			return false;
+		}
+
+		if (tail.store)
+		{
+			if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+				!EmitVu0VfAddress(HOST_TMP1, tail.rt) ||
+				!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memWrite128)))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memRead128)))
+				return false;
+
+			if (tail.rt != 0 &&
+				(!EmitVu0VfAddress(HOST_TMP0, tail.rt) ||
+				 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0)))
+			{
+				return false;
+			}
 		}
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();

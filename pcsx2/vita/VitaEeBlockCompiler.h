@@ -591,7 +591,6 @@ namespace VitaEE
 		{
 			size_t handler_fallback = static_cast<size_t>(-1);
 			size_t join_offset = 0;
-			const void* read_helper = nullptr;
 			unsigned rt = 0;
 		};
 		bool EmitQwordLoadColdTail(const QwordLoadColdTail& tail);
@@ -600,7 +599,6 @@ namespace VitaEE
 		{
 			size_t handler_fallback = static_cast<size_t>(-1);
 			size_t join_offset = 0;
-			const void* write_helper = nullptr;
 			unsigned rt = 0;
 		};
 		bool EmitQwordStoreColdTail(const QwordStoreColdTail& tail);
@@ -619,8 +617,8 @@ namespace VitaEE
 		{
 			size_t handler_fallback = static_cast<size_t>(-1);
 			size_t join_offset = 0;
-			const void* helper = nullptr;
 			unsigned rt = 0;
+			bool store = false;
 		};
 		bool EmitCop2QwordMemoryColdTail(const Cop2QwordMemoryColdTail& tail);
 
