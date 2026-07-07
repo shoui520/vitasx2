@@ -106,6 +106,9 @@ namespace VUInterpFast
 		EEXP,
 	};
 
+	// One past the last decodable lower kind, for kind-indexed dispatch tables.
+	inline constexpr size_t LowerFastKindCount = static_cast<size_t>(LowerFastKind::EEXP) + 1;
+
 	enum class UpperFastKind : u8
 	{
 		None,
@@ -205,6 +208,9 @@ namespace VUInterpFast
 		OPMULA,
 		OPMSUB,
 	};
+
+	// One past the last decodable upper kind, for kind-indexed dispatch tables.
+	inline constexpr size_t UpperFastKindCount = static_cast<size_t>(UpperFastKind::OPMSUB) + 1;
 
 	static constexpr unsigned Ft(u32 code) { return (code >> 16) & 0x1f; }
 	static constexpr unsigned Fs(u32 code) { return (code >> 11) & 0x1f; }

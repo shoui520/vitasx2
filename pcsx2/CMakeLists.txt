@@ -162,6 +162,7 @@ add_library(pcsx2core STATIC
 	vita/VitaPad.cpp
 	vita/VitaVifInterpreter.cpp
 	vita/VitaVmState.cpp
+	vita/VitaVuBlockCompiler.cpp
 	vtlb.cpp
 )
 

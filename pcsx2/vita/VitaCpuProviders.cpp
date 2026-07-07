@@ -21,6 +21,7 @@
 #include "vita/VitaEeBlockCompiler.h"
 #include "vita/VitaEeExecutor.h"
 #include "vita/VitaIopBlockCompiler.h"
+#include "vita/VitaVuBlockCompiler.h"
 #include "vtlb.h"
 
 #include "common/Assertions.h"
@@ -753,11 +754,13 @@ void recMicroVU1::Reserve()
 
 void recMicroVU1::Shutdown()
 {
+	VitaVU::ShutdownVu1Blocks();
 }
 
 void recMicroVU1::Reset()
 {
 	CpuIntVU1.Reset();
+	VitaVU::ResetVu1Blocks();
 }
 
 void recMicroVU1::Step()
@@ -772,12 +775,15 @@ void recMicroVU1::SetStartPC(u32 startPC)
 
 void recMicroVU1::Execute(u32 cycles)
 {
-	CpuIntVU1.Execute(cycles);
+	// PCSX2 owner: InterpVU1::Execute()'s loop, with eligible windows routed
+	// through the A32 block provider in pcsx2/vita/VitaVuBlockCompiler.cpp.
+	VitaVU::ExecuteVu1Blocks(cycles);
 }
 
 void recMicroVU1::Clear(u32 addr, u32 size)
 {
 	VuMicroInvalidateDecodedCache(1, addr, size);
+	VitaVU::InvalidateVu1Blocks(addr, size);
 }
 
 void recMicroVU1::ResumeXGkick()
@@ -840,8 +846,9 @@ void VitaSelectA32EeIopCpuProviders()
 void VitaSelectConfiguredCpuProviders()
 {
 	// PCSX2 owner: VMManager.cpp::UpdateCPUImplementations(). The Vita fork
-	// maps the EE and IOP recompiler flags to Vita A32 providers while VU
-	// remains on the PCSX2 interpreter until the Vita VU provider is ported.
+	// maps the EE and IOP recompiler flags to Vita A32 providers, and the VU1
+	// recompiler flag to the A32 VU1 block provider. VU0 remains on the PCSX2
+	// interpreter until the Vita VU0 provider is ported.
 	if (EmuConfig.Cpu.Recompiler.EnableEE && EmuConfig.Cpu.Recompiler.EnableIOP)
 		VitaSelectA32EeIopCpuProviders();
 	else if (EmuConfig.Cpu.Recompiler.EnableEE)
@@ -850,6 +857,9 @@ void VitaSelectConfiguredCpuProviders()
 		VitaSelectA32IopCpuProviders();
 	else
 		VitaSelectInterpreterCpuProviders();
+
+	if (EmuConfig.Cpu.Recompiler.EnableVU1)
+		CpuVU1 = &CpuMicroVU1;
 }
 
 void VitaResetA32EeProviderStats()
