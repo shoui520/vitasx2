@@ -23,6 +23,7 @@
 u32 g_qemuIpuCscPostNeonBlocks = 0;
 u32 g_qemuIpuVqNeonGroups = 0;
 u32 g_qemuIpuIdctCopyNeonRows = 0;
+u32 g_qemuIpuIdctCopyDcOnlyBlocks = 0;
 u32 g_qemuIpuDctLowLookupHits = 0;
 u32 g_qemuIpuDctHighLookupHits = 0;
 u32 g_qemuIpuBitreader64NeonReads = 0;
@@ -622,8 +623,47 @@ static __forceinline void IDCT_CopyRowsSelected(s16* block, u8* dest, const int 
 #endif
 }
 
-__ri static void IDCT_Copy(s16* block, u8* dest, const int stride)
+static __forceinline void IDCT_CopyDcOnlySelected(s16* block, u8* dest, const int stride)
 {
+	// PCSX2 owner: IPU_MultiISA.cpp::IDCT_Add() already uses the same DC-only
+	// shortcut for non-intra blocks. Intra blocks can use it after
+	// get_intra_block() proves that no AC coefficient was written.
+	const s16 sample = static_cast<s16>((static_cast<s32>(block[0]) + 4) >> 3);
+	const u8 pixel = (g_idct_clip_lut.data() + 384)[sample];
+
+#if defined(ARCH_ARM32)
+	const uint8x8_t pixels = vdup_n_u8(pixel);
+	const int16x8_t zero = vdupq_n_s16(0);
+	for (int i = 0; i < 8; i++)
+	{
+		vst1_u8(dest, pixels);
+		vst1q_s16(block, zero);
+		dest += stride;
+		block += 8;
+	}
+#else
+	for (int i = 0; i < 8; i++)
+	{
+		std::memset(dest, pixel, 8);
+		std::memset(block, 0, 16);
+		dest += stride;
+		block += 8;
+	}
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	++g_qemuIpuIdctCopyDcOnlyBlocks;
+#endif
+}
+
+__ri static void IDCT_Copy(s16* block, u8* dest, const int stride, bool dc_only)
+{
+	if (dc_only && ((block[0] & 7) != 4))
+	{
+		IDCT_CopyDcOnlySelected(block, dest, stride);
+		return;
+	}
+
 	IDCT_Block(block);
 	IDCT_CopyRowsSelected(block, dest, stride);
 }
@@ -637,6 +677,17 @@ void IpuIdctCopyRowsReferenceForValidation(s16* block, u8* dest, int stride)
 void IpuIdctCopyRowsSelectedForValidation(s16* block, u8* dest, int stride)
 {
 	IDCT_CopyRowsSelected(block, dest, stride);
+}
+
+void IpuIdctCopyReferenceForValidation(s16* block, u8* dest, int stride)
+{
+	IDCT_Block(block);
+	IDCT_CopyRowsReference(block, dest, stride);
+}
+
+void IpuIdctCopySelectedForValidation(s16* block, u8* dest, int stride, bool dc_only)
+{
+	IDCT_Copy(block, dest, stride, dc_only);
 }
 #endif
 
@@ -972,7 +1023,7 @@ __fi static void SATURATE(int& val)
 		val = (val >> 31) ^ 2047;
 }
 
-__ri static bool get_intra_block()
+__ri static bool get_intra_block(bool* dc_only)
 {
 	const u8 * scan = decoder.scantype ? mpeg2_scan.alt : mpeg2_scan.norm;
 	const u8 (&quant_matrix)[64] = decoder.iq;
@@ -980,6 +1031,9 @@ __ri static bool get_intra_block()
 	s16 * dest = decoder.DCTblock;
 	u16 code;
 	const bool table_one = decoder.intra_vlc_format && !decoder.mpeg1;
+	bool wrote_ac = ipu_cmd.pos[4] != 0 || ipu_cmd.pos[5] != 0;
+	if (dc_only)
+		*dc_only = false;
 
 	/* decode AC coefficients */
   for (int i=1 + ipu_cmd.pos[4]; ; i++)
@@ -1000,6 +1054,8 @@ __ri static bool get_intra_block()
 		tab = LookupDctTabSelected(code, table_one, false);
 		if (tab == nullptr)
 		{
+		  if (dc_only)
+			  *dc_only = !wrote_ac;
 		  ipu_cmd.pos[4] = 0;
 		  return true;
 		}
@@ -1008,6 +1064,8 @@ __ri static bool get_intra_block()
 
 		if (tab->run==64) /* end_of_block */
 		{
+			if (dc_only)
+				*dc_only = !wrote_ac;
 			ipu_cmd.pos[4] = 0;
 			return true;
 		}
@@ -1015,6 +1073,8 @@ __ri static bool get_intra_block()
 		i += (tab->run == 65) ? GETBITS(6) : tab->run;
 		if (i >= 64)
 		{
+			if (dc_only)
+				*dc_only = !wrote_ac;
 			ipu_cmd.pos[4] = 0;
 			return true;
 		}
@@ -1070,6 +1130,7 @@ __ri static bool get_intra_block()
 
 			SATURATE(val);
 			dest[j] = val;
+			wrote_ac = true;
 			ipu_cmd.pos[5] = 0;
 		}
 	 }
@@ -1199,12 +1260,13 @@ __ri static bool slice_intra_DCT(const int cc, u8 * const dest, const int stride
 		decoder.DCTblock[0] = decoder.dc_dct_pred[cc] << (3 - decoder.intra_dc_precision);
 	}
 
-	if (!get_intra_block())
+	bool dc_only = false;
+	if (!get_intra_block(&dc_only))
 	{
 		return false;
 	}
 
-	IDCT_Copy(decoder.DCTblock, dest, stride);
+	IDCT_Copy(decoder.DCTblock, dest, stride, dc_only);
 
 	return true;
 }
