@@ -19,6 +19,7 @@ public:
 
 	void push_back(u8 value);
 	void push_back(const u8* source, size_t bytes);
+	void push_fill(u8 value, size_t bytes);
 	void pop_front();
 	size_t pop_front(u8* destination, size_t bytes);
 	void clear();

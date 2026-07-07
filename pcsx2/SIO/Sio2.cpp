@@ -40,6 +40,10 @@ u32 g_qemuSio2FifoExactSpanCopies = 0;
 u32 g_qemuSio2FifoExact16ByteCopies = 0;
 u32 g_qemuSio2FifoExact320ByteCopies = 0;
 u32 g_qemuSio2FifoExact640ByteCopies = 0;
+u32 g_qemuSio2FifoBulkFillBytes = 0;
+u32 g_qemuSio2FifoNeonFillQwords = 0;
+u32 g_qemuSio2FifoNeonFill64ByteGroups = 0;
+u32 g_qemuSio2FifoNeonFill256ByteGroups = 0;
 #endif
 
 namespace
@@ -85,6 +89,34 @@ namespace
 		vst1q_u8(dst, qword);
 	}
 
+	static __forceinline void Sio2Fill64Bytes(u8* dst, uint8x16_t value)
+	{
+		vst1q_u8(dst, value);
+		vst1q_u8(dst + 16, value);
+		vst1q_u8(dst + 32, value);
+		vst1q_u8(dst + 48, value);
+	}
+
+	static __forceinline void Sio2Fill256Bytes(u8* dst, uint8x16_t value)
+	{
+		Sio2Fill64Bytes(dst, value);
+		Sio2Fill64Bytes(dst + 64, value);
+		Sio2Fill64Bytes(dst + 128, value);
+		Sio2Fill64Bytes(dst + 192, value);
+	}
+
+	static __forceinline void Sio2Fill320Bytes(u8* dst, uint8x16_t value)
+	{
+		Sio2Fill256Bytes(dst, value);
+		Sio2Fill64Bytes(dst + 256, value);
+	}
+
+	static __forceinline void Sio2Fill640Bytes(u8* dst, uint8x16_t value)
+	{
+		Sio2Fill320Bytes(dst, value);
+		Sio2Fill320Bytes(dst + 320, value);
+	}
+
 	static __forceinline void Sio2CountNeonCopy(size_t qwords, size_t groups64, size_t groups256, bool exact_span = false, size_t exact_bytes = 0)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -107,6 +139,19 @@ namespace
 		(void)groups256;
 		(void)exact_span;
 		(void)exact_bytes;
+#endif
+	}
+
+	static __forceinline void Sio2CountNeonFill(size_t qwords, size_t groups64, size_t groups256)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSio2FifoNeonFillQwords += static_cast<u32>(qwords);
+		g_qemuSio2FifoNeonFill64ByteGroups += static_cast<u32>(groups64);
+		g_qemuSio2FifoNeonFill256ByteGroups += static_cast<u32>(groups256);
+#else
+		(void)qwords;
+		(void)groups64;
+		(void)groups256;
 #endif
 	}
 
@@ -190,10 +235,82 @@ namespace
 
 		Sio2CountNeonCopy((groups256 << 4) + (groups64 << 2) + tail_qwords, (groups256 << 2) + groups64, groups256);
 	}
+
+	static __forceinline void Sio2FillBytes(u8* dst, u8 value, size_t bytes)
+	{
+		u8* cdst = dst;
+		const uint8x16_t qword = vdupq_n_u8(value);
+
+		switch (bytes)
+		{
+			case 640:
+				Sio2Fill640Bytes(cdst, qword);
+				Sio2CountNeonFill(40, 10, 2);
+				return;
+			case 320:
+				Sio2Fill320Bytes(cdst, qword);
+				Sio2CountNeonFill(20, 5, 1);
+				return;
+			case 256:
+				Sio2Fill256Bytes(cdst, qword);
+				Sio2CountNeonFill(16, 4, 1);
+				return;
+			case 64:
+				Sio2Fill64Bytes(cdst, qword);
+				Sio2CountNeonFill(4, 1, 0);
+				return;
+			case 16:
+				vst1q_u8(cdst, qword);
+				Sio2CountNeonFill(1, 0, 0);
+				return;
+			default:
+				break;
+		}
+
+		const size_t groups256 = bytes >> 8;
+		for (size_t i = 0; i < groups256; i++)
+		{
+			Sio2Fill256Bytes(cdst, qword);
+			cdst += 256;
+		}
+
+		const size_t remaining_bytes = bytes & 255;
+		const size_t groups64 = remaining_bytes >> 6;
+		for (size_t i = 0; i < groups64; i++)
+		{
+			Sio2Fill64Bytes(cdst, qword);
+			cdst += 64;
+		}
+
+		const size_t tail_bytes = bytes & 63;
+		const size_t tail_qwords = tail_bytes >> 4;
+		for (size_t i = 0; i < tail_qwords; i++)
+		{
+			vst1q_u8(cdst, qword);
+			cdst += 16;
+		}
+
+		if (tail_bytes & 8)
+		{
+			const uint8x8_t half = vdup_n_u8(value);
+			vst1_u8(cdst, half);
+			cdst += 8;
+		}
+
+		for (size_t i = 0; i < (tail_bytes & 7); i++)
+			cdst[i] = value;
+
+		Sio2CountNeonFill((groups256 << 4) + (groups64 << 2) + tail_qwords, (groups256 << 2) + groups64, groups256);
+	}
 #else
 	static __forceinline void Sio2CopyBytes(u8* dst, const u8* src, size_t bytes)
 	{
 		std::memcpy(dst, src, bytes);
+	}
+
+	static __forceinline void Sio2FillBytes(u8* dst, u8 value, size_t bytes)
+	{
+		std::memset(dst, value, bytes);
 	}
 #endif
 }
@@ -230,6 +347,20 @@ void Sio2ByteFifo::push_back(const u8* source, size_t bytes)
 	const size_t offset = m_data.size();
 	m_data.resize(offset + bytes);
 	Sio2CopyBytes(m_data.data() + offset, source, bytes);
+}
+
+void Sio2ByteFifo::push_fill(u8 value, size_t bytes)
+{
+	if (bytes == 0)
+		return;
+
+	CompactConsumed();
+	const size_t offset = m_data.size();
+	m_data.resize(offset + bytes);
+	Sio2FillBytes(m_data.data() + offset, value, bytes);
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSio2FifoBulkFillBytes += static_cast<u32>(bytes);
+#endif
 }
 
 void Sio2ByteFifo::pop_front()
@@ -469,17 +600,16 @@ void Sio2::Pad()
 	g_Sio2FifoOut.push_back(0xff);
 	pad->SoftReset();
 
-	// Then for every byte in g_Sio2FifoIn, pass to PAD and see what it kicks back to us.
-	while (!g_Sio2FifoIn.empty())
+	if (pad->ejectTicks)
 	{
-		// If the pad is "ejected", respond with nothing
-		if (pad->ejectTicks)
-		{
-			g_Sio2FifoIn.pop_front();
-			g_Sio2FifoOut.push_back(0xff);
-		}
-		// Else, actually forward to the pad.
-		else
+		const size_t bytes = g_Sio2FifoIn.size();
+		g_Sio2FifoIn.clear();
+		g_Sio2FifoOut.push_fill(0xff, bytes);
+	}
+	// Then for every byte in g_Sio2FifoIn, pass to PAD and see what it kicks back to us.
+	else
+	{
+		while (!g_Sio2FifoIn.empty())
 		{
 			const u8 commandByte = g_Sio2FifoIn.front();
 			g_Sio2FifoIn.pop_front();
@@ -538,12 +668,9 @@ void Sio2::Infrared()
 	SetCmdStat(CmdStat::DISCONNECTED);
 
 	g_Sio2FifoIn.pop_front();
-	const u8 responseByte = 0xff;
 
-	while (g_Sio2FifoOut.size() < commandLength)
-	{
-		g_Sio2FifoOut.push_back(responseByte);
-	}
+	if (g_Sio2FifoOut.size() < commandLength)
+		g_Sio2FifoOut.push_fill(0xff, commandLength - g_Sio2FifoOut.size());
 }
 
 void Sio2::Memcard()
@@ -559,11 +686,9 @@ void Sio2::Memcard()
 		SetCmdStat(CmdStat::DISCONNECTED);
 		g_Sio2FifoOut.push_back(0xff); // Because Sio2::Write pops the first g_Sio2FifoIn member
 
-		while (!g_Sio2FifoIn.empty())
-		{
-			g_Sio2FifoIn.pop_front();
-			g_Sio2FifoOut.push_back(0xff);
-		}
+		const size_t bytes = g_Sio2FifoIn.size();
+		g_Sio2FifoIn.clear();
+		g_Sio2FifoOut.push_fill(0xff, bytes);
 
 		return;
 	}
@@ -847,11 +972,7 @@ void Sio2::ProcessQueuedCommand(u8 log_data)
 		if (dmaDiff > 0)
 		{
 			const size_t padding = g_Sio2.dmaBlockSize - dmaDiff;
-
-			for (size_t i = 0; i < padding; i++)
-			{
-				g_Sio2FifoOut.push_back(0x00);
-			}
+			g_Sio2FifoOut.push_fill(0x00, padding);
 		}
 	}
 }
