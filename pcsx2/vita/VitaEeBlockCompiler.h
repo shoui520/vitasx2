@@ -569,6 +569,7 @@ namespace VitaEE
 		bool EmitRefreshRawGpr0KnownZeroFromLow64(unsigned low_reg, unsigned high_reg);
 		bool EmitVu0SyncIfRunning(unsigned preserve_reg = 16, unsigned save_reg = 16);
 		bool EmitVu0RegisterAddress(unsigned host_reg, size_t offset);
+		bool EmitVu0Vf0ConstantQ(unsigned qreg, unsigned host_scratch);
 		bool EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg);
 		bool EmitVu0ViAddress(unsigned host_reg, unsigned vi_reg);
 		bool EmitAlignQwordAddress(unsigned host_reg, unsigned scratch_reg);
@@ -582,6 +583,11 @@ namespace VitaEE
 		bool EmitLoadGprLowKnownValue(unsigned guest_reg, unsigned host_reg, bool value_known, u32 value);
 		bool EmitLoadGprLowValue(unsigned guest_reg, unsigned host_reg);
 		bool EmitGprLowValueOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host);
+		bool EmitLoadPartialStoreLowValue(unsigned guest_reg, unsigned host_reg);
+		bool EmitLoadPartialStoreLowKnownValue(unsigned guest_reg, unsigned host_reg,
+			bool value_known, u32 value);
+		bool EmitLoadPartialDwordStoreByteValue(unsigned guest_reg, unsigned source_byte,
+			unsigned host_reg, bool value_known, u32 low, u32 high);
 		bool EmitRefreshGprPinFromBacking(unsigned guest_reg);
 		bool TryEmitLoadGprWordFromQCache(unsigned guest_reg, unsigned word, unsigned host_reg,
 			bool* emitted);
@@ -709,7 +715,12 @@ namespace VitaEE
 			size_t join_offset = 0;
 			PartialMemoryOp op = PartialMemoryOp::WordLoadLeft;
 			unsigned rt = 0;
+			bool rt_low_known = false;
+			u32 rt_low = 0;
+			bool rt_high_known = false;
+			u32 rt_high = 0;
 		};
+		void CapturePartialStoreValue(PartialMemoryColdTail* tail);
 		bool EmitPartialMemoryColdTail(const PartialMemoryColdTail& tail);
 
 		VitaA32::CodeBuffer& m_code;

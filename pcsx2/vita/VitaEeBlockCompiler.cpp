@@ -81,6 +81,18 @@ u32 g_qemuGprDirtyPinFlushStores = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
+u32 g_qemuScalarZeroLoadSkips = 0;
+u32 g_qemuPartialZeroLoadSkips = 0;
+u32 g_qemuCop2QwordZeroLoadSkips = 0;
+u32 g_qemuCop2QwordZeroStoreFastPaths = 0;
+u32 g_qemuCop2Vf0ConstantTransferFastPaths = 0;
+u32 g_qemuCop2ControlKnownSourceFastPaths = 0;
+u32 g_qemuGprPartialStoreValueFastPaths = 0;
+u32 g_qemuPartialWordFullLoadFastPaths = 0;
+u32 g_qemuPartialWordFullStoreFastPaths = 0;
+u32 g_qemuGprPartialDwordStoreValueFastPaths = 0;
+u32 g_qemuPartialDwordFullLoadFastPaths = 0;
+u32 g_qemuPartialDwordFullStoreFastPaths = 0;
 u32 g_qemuKnownVtlbScalarFastPaths = 0;
 u32 g_qemuKnownVtlbQwordFastPaths = 0;
 u32 g_qemuKnownVtlbCop1FastPaths = 0;
@@ -6149,10 +6161,25 @@ namespace VitaEE
 		switch ((op >> 21) & 0x1f)
 		{
 			case 0x01: // QMFC2
-				if (rt != 0 &&
-					(!EmitVu0VfAddress(HOST_TMP0, fs) ||
-					 !m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
-					 !EmitStoreGprQ128(rt, NEON_VALUE, HOST_TMP1)))
+				if (rt == 0)
+					break;
+
+				if (fs == 0)
+				{
+					if (!EmitVu0Vf0ConstantQ(NEON_VALUE, HOST_TMP1) ||
+						!EmitStoreGprQ128(rt, NEON_VALUE, HOST_TMP1))
+					{
+						return false;
+					}
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuCop2Vf0ConstantTransferFastPaths++;
+#endif
+					break;
+				}
+
+				if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+					!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
+					!EmitStoreGprQ128(rt, NEON_VALUE, HOST_TMP1))
 				{
 					return false;
 				}
@@ -15007,6 +15034,12 @@ namespace VitaEE
 	{
 		const unsigned rt = RT(op);
 		constexpr unsigned NEON_VALUE = 0;
+		const auto emit_zero_load_skip_counter = []() -> bool {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCop2QwordZeroLoadSkips++;
+#endif
+			return true;
+		};
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -15016,7 +15049,7 @@ namespace VitaEE
 			if (!EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5))
 				return false;
 			if (rt == 0)
-				return true;
+				return emit_zero_load_skip_counter();
 
 			return m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) &&
 				   EmitVu0VfAddress(HOST_TMP0, rt) &&
@@ -15026,11 +15059,27 @@ namespace VitaEE
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5) ||
-			!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0))
+			!EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5))
 		{
 			return false;
 		}
+
+		if (rt == 0)
+		{
+			if (!emit_zero_load_skip_counter())
+				return false;
+
+			m_cop2_qword_memory_cold_tails.push_back({
+				handler_fallback,
+				m_code.Size(),
+				rt,
+				false,
+			});
+			return true;
+		}
+
+		if (!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0))
+			return false;
 
 		if (rt != 0 &&
 			(!EmitVu0VfAddress(HOST_TMP0, rt) ||
@@ -15390,6 +15439,22 @@ namespace VitaEE
 	{
 		const unsigned rt = RT(op);
 		constexpr unsigned NEON_VALUE = 0;
+		const auto emit_store_to_host = [&]() -> bool {
+			if (rt == 0)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuCop2QwordZeroStoreFastPaths++;
+#endif
+				// Keep SQC2's memory side effect, but avoid a VU0 state load
+				// for VF0's architectural constant.
+				return EmitVu0Vf0ConstantQ(NEON_VALUE, HOST_TMP1) &&
+					   m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0);
+			}
+
+			return EmitVu0VfAddress(HOST_TMP1, rt) &&
+				   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) &&
+				   m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0);
+		};
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -15397,18 +15462,14 @@ namespace VitaEE
 				KnownVtlbFastPathKind::Cop2))
 		{
 			return EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5) &&
-				   EmitVu0VfAddress(HOST_TMP1, rt) &&
-				   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) &&
-				   m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0);
+				   emit_store_to_host();
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
 			!EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5) ||
-			!EmitVu0VfAddress(HOST_TMP1, rt) ||
-			!m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) ||
-			!m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0))
+			!emit_store_to_host())
 		{
 			return false;
 		}
@@ -17411,6 +17472,20 @@ namespace VitaEE
 		constexpr u32 LWR_MASK[4] = {0x00000000u, 0xff000000u, 0xffff0000u, 0xffffff00u};
 		constexpr u8 LWL_SHIFT[4] = {24, 16, 8, 0};
 		constexpr u8 LWR_SHIFT[4] = {0, 8, 16, 24};
+		const auto emit_full_load = [this, rt]() {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPartialWordFullLoadFastPaths++;
+#endif
+			return m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		};
+		const auto emit_zero_load_skip_counter = []() -> bool {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPartialZeroLoadSkips++;
+#endif
+			return true;
+		};
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -17420,6 +17495,12 @@ namespace VitaEE
 			const unsigned lane = known_address & 3u;
 			const u8 shift = left ? LWL_SHIFT[lane] : LWR_SHIFT[lane];
 			const u32 mask = left ? LWL_MASK[lane] : LWR_MASK[lane];
+			if (rt == 0)
+				return emit_zero_load_skip_counter();
+
+			if (rt != 0 && ((left && lane == 3) || (!left && lane == 0)))
+				return emit_full_load();
+
 			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
 				return false;
 
@@ -17468,11 +17549,37 @@ namespace VitaEE
 		}
 
 		if (!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 3) ||
-			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
 		{
 			return false;
 		}
+
+		if (rt == 0)
+		{
+			if (!emit_zero_load_skip_counter())
+				return false;
+
+			m_partial_memory_cold_tails.push_back({
+				handler_fallback,
+				m_code.Size(),
+				left ? PartialMemoryOp::WordLoadLeft : PartialMemoryOp::WordLoadRight,
+				rt,
+			});
+			return true;
+		}
+
+		size_t full_lane_branch = static_cast<size_t>(-1);
+		if (rt != 0)
+		{
+			if (!m_code.EmitCmpImm32(HOST_TMP3, 0))
+				return false;
+			full_lane_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (full_lane_branch == static_cast<size_t>(-1))
+				return false;
+		}
+
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+			return false;
 
 		if (rt != 0)
 		{
@@ -17511,6 +17618,26 @@ namespace VitaEE
 			}
 		}
 
+		if (full_lane_branch != static_cast<size_t>(-1))
+		{
+			const size_t general_done = m_code.EmitBranchPlaceholder();
+			if (general_done == static_cast<size_t>(-1))
+				return false;
+
+			const size_t full_lane_target = m_code.Size();
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPartialWordFullLoadFastPaths++;
+#endif
+			if (!m_code.PatchBranch(full_lane_branch, full_lane_target, VitaA32::Condition::EQ) ||
+				!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) ||
+				!EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1) ||
+				!m_code.PatchBranch(general_done, m_code.Size()))
+			{
+				return false;
+			}
+		}
+
 		m_partial_memory_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
@@ -17528,6 +17655,13 @@ namespace VitaEE
 		constexpr u32 SWR_MASK[4] = {0x00000000u, 0x000000ffu, 0x0000ffffu, 0x00ffffffu};
 		constexpr u8 SWL_SHIFT[4] = {24, 16, 8, 0};
 		constexpr u8 SWR_SHIFT[4] = {0, 8, 16, 24};
+		const auto emit_full_store = [this, rt]() {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPartialWordFullStoreFastPaths++;
+#endif
+			return EmitLoadPartialStoreLowValue(rt, HOST_TMP1) &&
+				   m_code.EmitStrImm12(HOST_TMP1, HOST_TMP5, 0);
+		};
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -17537,10 +17671,13 @@ namespace VitaEE
 			const unsigned lane = known_address & 3u;
 			const u8 shift = left ? SWL_SHIFT[lane] : SWR_SHIFT[lane];
 			const u32 mask = left ? SWL_MASK[lane] : SWR_MASK[lane];
+			if ((left && lane == 3) || (!left && lane == 0))
+				return emit_full_store();
+
 			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP5, 0) ||
 				!(mask == 0 ? m_code.EmitMovImm8(HOST_TMP0, 0) :
 							   EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, mask, HOST_TMP2)) ||
-				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) ||
+				!EmitLoadPartialStoreLowValue(rt, HOST_TMP1) ||
 				!(shift == 0 ? true :
 					(left ? m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, shift) :
 							m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, shift))) ||
@@ -17568,10 +17705,20 @@ namespace VitaEE
 		}
 
 		if (!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 3) ||
-			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
+		{
+			return false;
+		}
+
+		if (!m_code.EmitCmpImm32(HOST_TMP3, 0))
+			return false;
+		const size_t full_lane_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (full_lane_branch == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP5, 0) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) ||
+			!EmitLoadPartialStoreLowValue(rt, HOST_TMP1) ||
 			!m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP3, 32) ||
 			!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) ||
 			!(left ? m_code.EmitAndRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP2,
@@ -17587,12 +17734,30 @@ namespace VitaEE
 			return false;
 		}
 
-		m_partial_memory_cold_tails.push_back({
+		const size_t general_done = m_code.EmitBranchPlaceholder();
+		if (general_done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t full_lane_target = m_code.Size();
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuPartialWordFullStoreFastPaths++;
+#endif
+		if (!m_code.PatchBranch(full_lane_branch, full_lane_target, VitaA32::Condition::EQ) ||
+			!EmitLoadPartialStoreLowValue(rt, HOST_TMP1) ||
+			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!m_code.PatchBranch(general_done, m_code.Size()))
+		{
+			return false;
+		}
+
+		PartialMemoryColdTail tail{
 			handler_fallback,
 			m_code.Size(),
 			left ? PartialMemoryOp::WordStoreLeft : PartialMemoryOp::WordStoreRight,
 			rt,
-		});
+		};
+		CapturePartialStoreValue(&tail);
+		m_partial_memory_cold_tails.push_back(tail);
 		return true;
 	}
 
@@ -17600,6 +17765,19 @@ namespace VitaEE
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp::LDL() / LDR().
 		const unsigned rt = RT(op);
+		const auto emit_full_load = [this, rt]() {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPartialDwordFullLoadFastPaths++;
+#endif
+			return m_code.EmitLdrdImm8(HOST_TMP2, HOST_TMP3, HOST_TMP0, 0) &&
+				   EmitStoreGpr64(rt, HOST_TMP2, HOST_TMP3);
+		};
+		const auto emit_zero_load_skip_counter = []() -> bool {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPartialZeroLoadSkips++;
+#endif
+			return true;
+		};
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -17607,8 +17785,14 @@ namespace VitaEE
 				KnownVtlbFastPathKind::Partial))
 		{
 			const unsigned shift = known_address & 7u;
+			if (rt == 0)
+				return emit_zero_load_skip_counter();
+
 			if (rt != 0)
 			{
+				if ((left && shift == 7) || (!left && shift == 0))
+					return emit_full_load();
+
 				const auto emit_byte = [this, rt](unsigned memory_byte, unsigned dest_byte) {
 					return m_code.EmitLdrbImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(memory_byte)) &&
 						   m_code.EmitStrbImm12(HOST_TMP1, HOST_CPU_REGS,
@@ -17648,6 +17832,20 @@ namespace VitaEE
 			return false;
 		}
 
+		if (rt == 0)
+		{
+			if (!emit_zero_load_skip_counter())
+				return false;
+
+			m_partial_memory_cold_tails.push_back({
+				handler_fallback,
+				m_code.Size(),
+				left ? PartialMemoryOp::DwordLoadLeft : PartialMemoryOp::DwordLoadRight,
+				rt,
+			});
+			return true;
+		}
+
 		const auto emit_byte = [this, rt](unsigned memory_byte, unsigned dest_byte) {
 			return m_code.EmitLdrbImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(memory_byte)) &&
 				   m_code.EmitStrbImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt) + dest_byte));
@@ -17656,6 +17854,9 @@ namespace VitaEE
 		const auto emit_case_body = [&](unsigned shift) {
 			if (rt == 0)
 				return true;
+
+			if ((left && shift == 7) || (!left && shift == 0))
+				return emit_full_load();
 
 			if (left)
 			{
@@ -17738,6 +17939,27 @@ namespace VitaEE
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp::SDL() / SDR().
 		const unsigned rt = RT(op);
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		const bool rt64_known =
+			rt != 0 && FindGprPinHost(rt) < 0 && TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value);
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (rt64_known)
+			g_qemuGprPartialDwordStoreValueFastPaths++;
+#endif
+		const auto emit_byte = [this, rt, rt64_known, rt_low_value, rt_high_value]
+			(unsigned source_byte, unsigned memory_byte) {
+				return EmitLoadPartialDwordStoreByteValue(rt, source_byte, HOST_TMP1,
+						   rt64_known, rt_low_value, rt_high_value) &&
+					   m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(memory_byte));
+			};
+		const auto emit_full_store = [this, rt]() {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPartialDwordFullStoreFastPaths++;
+#endif
+			return EmitLoadGpr64Value(rt, HOST_TMP2, HOST_TMP3) &&
+				   m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_TMP0, 0);
+		};
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -17745,11 +17967,8 @@ namespace VitaEE
 				KnownVtlbFastPathKind::Partial))
 		{
 			const unsigned shift = known_address & 7u;
-			const auto emit_byte = [this, rt](unsigned source_byte, unsigned memory_byte) {
-				return m_code.EmitLdrbImm12(HOST_TMP1, HOST_CPU_REGS,
-						   static_cast<u16>(GprOffset(rt) + source_byte)) &&
-					   m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(memory_byte));
-			};
+			if (rt != 0 && ((left && shift == 7) || (!left && shift == 0)))
+				return emit_full_store();
 
 			if (left)
 			{
@@ -17783,12 +18002,10 @@ namespace VitaEE
 			return false;
 		}
 
-		const auto emit_byte = [this, rt](unsigned source_byte, unsigned memory_byte) {
-			return m_code.EmitLdrbImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt) + source_byte)) &&
-				   m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(memory_byte));
-		};
-
 		const auto emit_case_body = [&](unsigned shift) {
+			if (rt != 0 && ((left && shift == 7) || (!left && shift == 0)))
+				return emit_full_store();
+
 			if (left)
 			{
 				for (unsigned memory_byte = 0; memory_byte <= shift; memory_byte++)
@@ -17853,12 +18070,14 @@ namespace VitaEE
 				return false;
 		}
 
-		m_partial_memory_cold_tails.push_back({
+		PartialMemoryColdTail tail{
 			handler_fallback,
 			done_target,
 			left ? PartialMemoryOp::DwordStoreLeft : PartialMemoryOp::DwordStoreRight,
 			rt,
-		});
+		};
+		CapturePartialStoreValue(&tail);
+		m_partial_memory_cold_tails.push_back(tail);
 		return true;
 	}
 
@@ -17924,6 +18143,13 @@ namespace VitaEE
 
 			return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		};
+		const bool skip_zero_load_result = rt == 0 && width != ScalarLoadWidth::Dword;
+		const auto emit_zero_load_skip_counter = []() -> bool {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuScalarZeroLoadSkips++;
+#endif
+			return true;
+		};
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -17931,6 +18157,9 @@ namespace VitaEE
 			(!counter_read_event || ((known_address & 0xffffe000u) != 0x10000000u)) &&
 			TryEmitKnownVtlbNonHandlerHostAddress(known_address, address_reg))
 		{
+			if (skip_zero_load_result)
+				return emit_zero_load_skip_counter();
+
 			return emit_load_from_host() && emit_store_result();
 		}
 
@@ -17949,6 +18178,29 @@ namespace VitaEE
 
 		if (!EmitVtlbNonHandlerHostAddress(address_reg, vmap_reg, scratch_reg, &handler_fallback))
 			return false;
+
+		if (skip_zero_load_result)
+		{
+			if (!emit_zero_load_skip_counter())
+				return false;
+
+			m_scalar_load_cold_tails.push_back({
+				unaligned_fallback,
+				handler_fallback,
+				m_code.Size(),
+				pc,
+				raw_cycles_through_instruction,
+				event_exit,
+				read_helper,
+				width,
+				rt,
+				sign_extend,
+				branch_delay_slot,
+				counter_read_event,
+				address_reg,
+			});
+			return true;
+		}
 
 		if (!emit_load_from_host() || !emit_store_result())
 			return false;
@@ -18444,6 +18696,30 @@ namespace VitaEE
 			   m_code.PatchBranch(tail_done, tail.join_offset);
 	}
 
+	void BlockCompiler::CapturePartialStoreValue(PartialMemoryColdTail* tail)
+	{
+		if (!tail || FindGprPinHost(tail->rt) >= 0)
+			return;
+
+		switch (tail->op)
+		{
+			case PartialMemoryOp::WordStoreLeft:
+			case PartialMemoryOp::WordStoreRight:
+				tail->rt_low_known = TryGetKnownGprLow(tail->rt, &tail->rt_low);
+				break;
+			case PartialMemoryOp::DwordStoreLeft:
+			case PartialMemoryOp::DwordStoreRight:
+				if (tail->rt != 0 && TryGetKnownGpr64(tail->rt, &tail->rt_low, &tail->rt_high))
+				{
+					tail->rt_low_known = true;
+					tail->rt_high_known = true;
+				}
+				break;
+			default:
+				break;
+		}
+	}
+
 	bool BlockCompiler::EmitPartialMemoryColdTail(const PartialMemoryColdTail& tail)
 	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() plus
@@ -18516,7 +18792,7 @@ namespace VitaEE
 			if (!emit_original_aligned_address(3) ||
 				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&memRead32)) ||
 				!emit_word_shift_bits(left) ||
-				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(tail.rt))) ||
+				!EmitLoadPartialStoreLowKnownValue(tail.rt, HOST_TMP1, tail.rt_low_known, tail.rt_low) ||
 				!m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP3, 32) ||
 				!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu))
 			{
@@ -18594,15 +18870,35 @@ namespace VitaEE
 		};
 
 		const auto emit_dword_store = [&](bool left) -> bool {
-			return emit_original_aligned_address(7) &&
-				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&memRead64)) &&
-				   m_code.EmitSubImm8(HOST_SP, HOST_SP, 8) &&
-				   m_code.EmitStrdImm8(HOST_TMP0, HOST_TMP1, HOST_SP, 0) &&
-				   m_code.EmitAddImm32(HOST_TMP4, HOST_CPU_REGS, static_cast<u32>(GprOffset(tail.rt))) &&
-				   emit_dword_loop_indices(left) &&
+			const bool known_source = tail.rt != 0 && tail.rt_low_known && tail.rt_high_known;
+			const u8 stack_bytes = known_source ? 16 : 8;
+			if (!emit_original_aligned_address(7) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&memRead64)) ||
+				!m_code.EmitSubImm8(HOST_SP, HOST_SP, stack_bytes) ||
+				!m_code.EmitStrdImm8(HOST_TMP0, HOST_TMP1, HOST_SP, 0))
+			{
+				return false;
+			}
+
+			if (known_source)
+			{
+				if (!m_code.EmitMovImm32(HOST_TMP2, tail.rt_low) ||
+					!m_code.EmitMovImm32(HOST_TMP3, tail.rt_high) ||
+					!m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_SP, 8) ||
+					!m_code.EmitAddImm8(HOST_TMP4, HOST_SP, 8))
+				{
+					return false;
+				}
+			}
+			else if (!m_code.EmitAddImm32(HOST_TMP4, HOST_CPU_REGS, static_cast<u32>(GprOffset(tail.rt))))
+			{
+				return false;
+			}
+
+			return emit_dword_loop_indices(left) &&
 				   emit_dword_byte_loop(true) &&
 				   m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, HOST_SP, 0) &&
-				   m_code.EmitAddImm8(HOST_SP, HOST_SP, 8) &&
+				   m_code.EmitAddImm8(HOST_SP, HOST_SP, stack_bytes) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 0) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP1, VitaA32::ShiftType::LSL, 0) &&
 				   emit_original_aligned_address(7) &&
@@ -18967,6 +19263,18 @@ namespace VitaEE
 			static_cast<u32>(reinterpret_cast<uptr>(&VU0)) + static_cast<u32>(offset));
 	}
 
+	bool BlockCompiler::EmitVu0Vf0ConstantQ(unsigned qreg, unsigned host_scratch)
+	{
+		if (qreg >= 8)
+			return false;
+
+		// PCSX2 owners: VUmicroMem.cpp initializes VF0 to 0,0,0,1 and
+		// VU0.cpp::QMTC2() rejects writes to VF0, so readers can synthesize it.
+		return m_code.EmitVeorQ(qreg, qreg, qreg) &&
+			   m_code.EmitMovImm32(host_scratch, 0x3f800000u) &&
+			   m_code.EmitVmovCoreToS(qreg * 4 + 3, host_scratch);
+	}
+
 	bool BlockCompiler::EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg)
 	{
 		return EmitVu0RegisterAddress(host_reg, VU0_VF_OFFSET + vf_reg * VU0_VF_STRIDE);
@@ -19092,6 +19400,39 @@ namespace VitaEE
 		return EmitLoadGprLowValue(guest_reg, fallback_host);
 	}
 
+	bool BlockCompiler::EmitLoadPartialStoreLowValue(unsigned guest_reg, unsigned host_reg)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (FindGprPinHost(guest_reg) >= 0 || (guest_reg != 0 && TryGetKnownGprLow(guest_reg, nullptr)))
+			g_qemuGprPartialStoreValueFastPaths++;
+#endif
+		return EmitLoadGprLowValue(guest_reg, host_reg);
+	}
+
+	bool BlockCompiler::EmitLoadPartialStoreLowKnownValue(unsigned guest_reg, unsigned host_reg,
+		bool value_known, u32 value)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (FindGprPinHost(guest_reg) >= 0 || (guest_reg != 0 && value_known))
+			g_qemuGprPartialStoreValueFastPaths++;
+#endif
+		return EmitLoadGprLowKnownValue(guest_reg, host_reg, value_known, value);
+	}
+
+	bool BlockCompiler::EmitLoadPartialDwordStoreByteValue(unsigned guest_reg, unsigned source_byte,
+		unsigned host_reg, bool value_known, u32 low, u32 high)
+	{
+		if (guest_reg != 0 && value_known)
+		{
+			const u32 word = (source_byte < 4) ? low : high;
+			const u32 byte = (word >> ((source_byte & 3u) * 8u)) & 0xffu;
+			return m_code.EmitMovImm8(host_reg, static_cast<u8>(byte));
+		}
+
+		return m_code.EmitLdrbImm12(host_reg, HOST_CPU_REGS,
+			static_cast<u16>(GprOffset(guest_reg) + source_byte));
+	}
+
 	bool BlockCompiler::EmitLoadGprWord(unsigned guest_reg, unsigned word, unsigned host_reg)
 	{
 		if (word == 0)
@@ -19210,7 +19551,15 @@ namespace VitaEE
 	bool BlockCompiler::EmitLoadGprLowRawZero(unsigned guest_reg, unsigned host_reg)
 	{
 		if (guest_reg != 0)
-			return EmitLoadGprLow(guest_reg, host_reg);
+		{
+			u32 value = 0;
+			const bool value_known = TryGetKnownGprLow(guest_reg, &value);
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (FindGprPinHost(guest_reg) < 0 && value_known)
+				g_qemuCop2ControlKnownSourceFastPaths++;
+#endif
+			return EmitLoadGprLowKnownValue(guest_reg, host_reg, value_known, value);
+		}
 
 		// PCSX2 VU0.cpp::CTC2() reads cpuRegs.GPR.r[_Rt_].UL[0] directly, so
 		// rt=$zero observes the raw backing slot instead of architectural zero.
