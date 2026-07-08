@@ -87,6 +87,7 @@ u32 g_qemuCop2QwordZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroStoreFastPaths = 0;
 u32 g_qemuCop2Vf0ConstantTransferFastPaths = 0;
 u32 g_qemuCop2RawGpr0Qmtc2ZeroFastPaths = 0;
+u32 g_qemuCop2Qmtc2QCacheFastPaths = 0;
 u32 g_qemuCop2ControlKnownSourceFastPaths = 0;
 u32 g_qemuVu0BaseRegisterBlocks = 0;
 u32 g_qemuGprPartialStoreValueFastPaths = 0;
@@ -3024,6 +3025,14 @@ namespace VitaEE
 
 	bool MmiOpcodeKeepsGprQCacheLocal(u32 op)
 	{
+		if (IsFastCOP2VectorTransfer(op))
+		{
+			// PCSX2 owner: VU0.cpp::QMFC2()/QMTC2(). These native paths either
+			// read qcached GPR data into VU0 or write GPRs through the qcache-aware
+			// store seam, so they do not force a block-local qcache spill.
+			return true;
+		}
+
 		if ((op >> 26) != 0x1c)
 			return false;
 
@@ -6192,6 +6201,7 @@ namespace VitaEE
 				}
 				break;
 			case 0x05: // QMTC2
+			{
 				if (fs == 0)
 					break;
 
@@ -6241,12 +6251,18 @@ namespace VitaEE
 					break;
 				}
 
-				if (!EmitLoadCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP0) ||
+				const bool qcache_hit = FindGprQCache(rt) >= 0;
+				if (!EmitLoadGprQ128(rt, NEON_VALUE, HOST_TMP0) ||
 					!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1))
 				{
 					return false;
 				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (qcache_hit)
+					g_qemuCop2Qmtc2QCacheFastPaths++;
+#endif
 				break;
+			}
 			default:
 				return false;
 		}
