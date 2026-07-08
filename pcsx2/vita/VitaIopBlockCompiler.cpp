@@ -22,6 +22,30 @@ u32 g_qemuIopKnownRamScalarLoadFastPaths = 0;
 u32 g_qemuIopKnownRamScalarStoreFastPaths = 0;
 u32 g_qemuIopKnownRamUnalignedLoadFastPaths = 0;
 u32 g_qemuIopKnownRamUnalignedStoreFastPaths = 0;
+u32 g_qemuIopConstRamScalarLoadFastPaths = 0;
+u32 g_qemuIopConstRamScalarStoreFastPaths = 0;
+u32 g_qemuIopConstRamUnalignedLoadFastPaths = 0;
+u32 g_qemuIopConstRamUnalignedStoreFastPaths = 0;
+u32 g_qemuIopConstRamCop2LoadFastPaths = 0;
+u32 g_qemuIopConstRamCop2StoreFastPaths = 0;
+u32 g_qemuIopConstBranchCompareFastPaths = 0;
+u32 g_qemuIopConstSignedBranchFastPaths = 0;
+u32 g_qemuIopConstStoreValueFastPaths = 0;
+u32 g_qemuIopConstStaticBranchTailFastPaths = 0;
+u32 g_qemuIopConstImmediateFastPaths = 0;
+u32 g_qemuIopConstRegisterOpFastPaths = 0;
+u32 g_qemuIopConstShiftFastPaths = 0;
+u32 g_qemuIopConstShiftAmountFastPaths = 0;
+u32 g_qemuIopConstMultiplyFastPaths = 0;
+u32 g_qemuIopConstDivideFastPaths = 0;
+u32 g_qemuIopConstHiLoReadFastPaths = 0;
+u32 g_qemuIopConstHiLoWriteFastPaths = 0;
+u32 g_qemuIopConstRegisterOperandFastPaths = 0;
+u32 g_qemuIopConstMultiplyOperandFastPaths = 0;
+u32 g_qemuIopConstDivideOperandFastPaths = 0;
+u32 g_qemuIopConstRegisterJumpFastPaths = 0;
+u32 g_qemuIopConstCop0WriteFastPaths = 0;
+u32 g_qemuIopConstCop2WriteFastPaths = 0;
 #endif
 
 namespace
@@ -119,6 +143,77 @@ namespace
 	constexpr size_t GprOffset(unsigned guest_reg)
 	{
 		return GPR_OFFSET + guest_reg * sizeof(u32);
+	}
+
+	void ComputeIopMultiplyResult(u32 lhs, u32 rhs, bool is_signed, u32* lo, u32* hi)
+	{
+		// PCSX2 owners: R3000AOpcodeTables.cpp::psxMULT()/psxMULTU().
+		const u64 result = is_signed ?
+			static_cast<u64>(static_cast<s64>(static_cast<s32>(lhs)) *
+							 static_cast<s64>(static_cast<s32>(rhs))) :
+			(static_cast<u64>(lhs) * static_cast<u64>(rhs));
+		*lo = static_cast<u32>(result);
+		*hi = static_cast<u32>(result >> 32);
+	}
+
+	void ComputeIopDivideResult(u32 lhs, u32 rhs, bool is_signed, u32* lo, u32* hi)
+	{
+		// PCSX2 owners: R3000AOpcodeTables.cpp::psxDIV()/psxDIVU().
+		if (is_signed)
+		{
+			const s32 numerator = static_cast<s32>(lhs);
+			const s32 denominator = static_cast<s32>(rhs);
+			if (denominator == 0)
+			{
+				*lo = (numerator < 0) ? 1u : 0xffffffffu;
+				*hi = lhs;
+			}
+			else if (lhs == 0x80000000u && rhs == 0xffffffffu)
+			{
+				*lo = 0x80000000u;
+				*hi = 0;
+			}
+			else
+			{
+				*lo = static_cast<u32>(numerator / denominator);
+				*hi = static_cast<u32>(numerator % denominator);
+			}
+			return;
+		}
+
+		if (rhs == 0)
+		{
+			*lo = 0xffffffffu;
+			*hi = lhs;
+		}
+		else
+		{
+			*lo = lhs / rhs;
+			*hi = lhs % rhs;
+		}
+	}
+
+	bool IsPowerOfTwo(u32 value)
+	{
+		return value != 0 && (value & (value - 1)) == 0;
+	}
+
+	bool IsIopSpecialBranchTarget(u32 target)
+	{
+		return target == IOP_BRANCH_TARGET_ZERO ||
+			   target == IOP_BRANCH_TARGET_SYSMEM ||
+			   target == IOP_BRANCH_TARGET_IOPBOOT;
+	}
+
+	unsigned PowerOfTwoShift(u32 value)
+	{
+		unsigned shift = 0;
+		while ((value & 1) == 0)
+		{
+			value >>= 1;
+			shift++;
+		}
+		return shift;
 	}
 
 	constexpr size_t Cp0Offset(unsigned cop0_reg)
@@ -525,6 +620,69 @@ namespace
 		return true;
 	}
 
+	u8 DirectIopRamAlignmentMask(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x20: // LB
+			case 0x22: // LWL
+			case 0x24: // LBU
+			case 0x26: // LWR
+			case 0x28: // SB
+			case 0x2a: // SWL
+			case 0x2e: // SWR
+				return 0;
+			case 0x21: // LH
+			case 0x25: // LHU
+			case 0x29: // SH
+				return 1;
+			case 0x23: // LW
+			case 0x2b: // SW
+			case 0x32: // LWC2
+			case 0x3a: // SWC2
+				return 3;
+			default:
+				return 0xff;
+		}
+	}
+
+	bool CanEmitKnownDirectIopRamFastPath(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x22: // LWL
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+			case 0x26: // LWR
+			case 0x28: // SB
+			case 0x29: // SH
+			case 0x2a: // SWL
+			case 0x2b: // SW
+			case 0x2e: // SWR
+			case 0x32: // LWC2
+			case 0x3a: // SWC2
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	bool TryDirectIopRamEffectiveAddress(u32 effective_address, u8 alignment_mask, u32* address)
+	{
+		if (alignment_mask == 0xff || (effective_address & alignment_mask) != 0 ||
+			(effective_address & 0x10000000u) != 0)
+		{
+			return false;
+		}
+
+		if (address)
+			*address = effective_address & (Ps2MemSize::ExposedIopRam - 1);
+		return true;
+	}
+
 	static_assert(PC_OFFSET <= 4095);
 	static_assert(CODE_OFFSET <= 4095);
 	static_assert(CYCLE_OFFSET + sizeof(u64) <= 4095);
@@ -636,71 +794,6 @@ namespace
 		return (value + alignment - 1) & ~(alignment - 1);
 	}
 
-	bool TryKnownDirectIopRamAddress(u32 op, u8 alignment_mask, u32* address)
-	{
-		if (RS(op) != 0 || !address)
-			return false;
-
-		const s32 imm = static_cast<s32>(IMM_S(op));
-		if (imm < 0)
-			return false;
-
-		const u32 addr = static_cast<u32>(imm);
-		if (addr >= Ps2MemSize::ExposedIopRam || (addr & alignment_mask) != 0)
-			return false;
-
-		*address = addr;
-		return true;
-	}
-
-	bool IsKnownDirectIopRamScalarFastPath(u32 op)
-	{
-		u8 alignment_mask = 0;
-		switch (op >> 26)
-		{
-			case 0x20: // LB
-			case 0x24: // LBU
-			case 0x28: // SB
-				break;
-			case 0x21: // LH
-			case 0x25: // LHU
-			case 0x29: // SH
-				alignment_mask = 1;
-				break;
-			case 0x23: // LW
-			case 0x2b: // SW
-				alignment_mask = 3;
-				break;
-			default:
-				return false;
-		}
-
-		u32 address = 0;
-		return TryKnownDirectIopRamAddress(op, alignment_mask, &address);
-	}
-
-	bool IsKnownDirectIopRamUnalignedFastPath(u32 op)
-	{
-		switch (op >> 26)
-		{
-			case 0x22: // LWL
-			case 0x26: // LWR
-			case 0x2a: // SWL
-			case 0x2e: // SWR
-				break;
-			default:
-				return false;
-		}
-
-		u32 address = 0;
-		return TryKnownDirectIopRamAddress(op, 0, &address);
-	}
-
-	bool IsKnownDirectIopRamFastPath(u32 op)
-	{
-		return IsKnownDirectIopRamScalarFastPath(op) ||
-			   IsKnownDirectIopRamUnalignedFastPath(op);
-	}
 } // namespace
 
 namespace VitaIOP
@@ -827,6 +920,356 @@ namespace VitaIOP
 
 		direct_exit_branches.push_back(m_code.EmitBranchPlaceholder(VitaA32::Condition::NE));
 		return true;
+	}
+
+	void BlockCompiler::ResetGprConstState()
+	{
+		m_gpr_const_values.fill(0);
+		m_gpr_const_known_mask = 1u;
+		m_hilo_const_values.fill(0);
+		m_hilo_const_known_mask = 0;
+	}
+
+	bool BlockCompiler::TryGetKnownGpr(unsigned guest_reg, u32* value) const
+	{
+		if (guest_reg >= m_gpr_const_values.size())
+			return false;
+
+		if ((m_gpr_const_known_mask & (1u << guest_reg)) == 0)
+			return false;
+
+		if (value)
+			*value = (guest_reg == 0) ? 0 : m_gpr_const_values[guest_reg];
+		return true;
+	}
+
+	void BlockCompiler::SetKnownGpr(unsigned guest_reg, u32 value)
+	{
+		if (guest_reg == 0 || guest_reg >= m_gpr_const_values.size())
+			return;
+
+		m_gpr_const_values[guest_reg] = value;
+		m_gpr_const_known_mask |= (1u << guest_reg);
+	}
+
+	void BlockCompiler::ClearKnownGpr(unsigned guest_reg)
+	{
+		if (guest_reg == 0 || guest_reg >= m_gpr_const_values.size())
+			return;
+
+		m_gpr_const_known_mask &= ~(1u << guest_reg);
+	}
+
+	bool BlockCompiler::TryGetKnownHiLo(bool lo, u32* value) const
+	{
+		const u8 bit = lo ? 0x2u : 0x1u;
+		if ((m_hilo_const_known_mask & bit) == 0)
+			return false;
+
+		if (value)
+			*value = m_hilo_const_values[lo ? 1 : 0];
+		return true;
+	}
+
+	void BlockCompiler::SetKnownHiLo(bool lo, u32 value)
+	{
+		const u8 bit = lo ? 0x2u : 0x1u;
+		m_hilo_const_values[lo ? 1 : 0] = value;
+		m_hilo_const_known_mask |= bit;
+	}
+
+	void BlockCompiler::ClearKnownHiLo(bool lo)
+	{
+		const u8 bit = lo ? 0x2u : 0x1u;
+		m_hilo_const_known_mask &= static_cast<u8>(~bit);
+	}
+
+	void BlockCompiler::ClearKnownHiLo()
+	{
+		m_hilo_const_known_mask = 0;
+	}
+
+	bool BlockCompiler::TryKnownDirectIopRamAddress(u32 op, u8 alignment_mask, u32* address) const
+	{
+		u32 base = 0;
+		if (!TryGetKnownGpr(RS(op), &base))
+			return false;
+
+		const u32 effective_address = base + static_cast<u32>(static_cast<s32>(IMM_S(op)));
+		return TryDirectIopRamEffectiveAddress(effective_address, alignment_mask, address);
+	}
+
+	void BlockCompiler::UpdateGprConstStateAfterOpcode(u32 op, u32 pc)
+	{
+		const unsigned opcode = op >> 26;
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+		u32 lhs = 0;
+		u32 rhs = 0;
+		u32 lo = 0;
+		u32 hi = 0;
+
+		const auto set_binary_reg = [&](u32 (*func)(u32, u32)) {
+			if (TryGetKnownGpr(rs, &lhs) && TryGetKnownGpr(rt, &rhs))
+				SetKnownGpr(rd, func(lhs, rhs));
+			else
+				ClearKnownGpr(rd);
+		};
+		const auto set_shift_imm = [&](VitaA32::ShiftType shift, unsigned amount) {
+			if (!TryGetKnownGpr(rt, &rhs))
+			{
+				ClearKnownGpr(rd);
+				return;
+			}
+
+			switch (shift)
+			{
+				case VitaA32::ShiftType::LSL:
+					SetKnownGpr(rd, rhs << amount);
+					break;
+				case VitaA32::ShiftType::LSR:
+					SetKnownGpr(rd, rhs >> amount);
+					break;
+				case VitaA32::ShiftType::ASR:
+					SetKnownGpr(rd, static_cast<u32>(static_cast<s32>(rhs) >> amount));
+					break;
+				default:
+					ClearKnownGpr(rd);
+					break;
+			}
+		};
+		const auto set_shift_reg = [&](VitaA32::ShiftType shift) {
+			if (!TryGetKnownGpr(rt, &rhs) || !TryGetKnownGpr(rs, &lhs))
+			{
+				ClearKnownGpr(rd);
+				return;
+			}
+
+			const unsigned amount = lhs & 0x1f;
+			switch (shift)
+			{
+				case VitaA32::ShiftType::LSL:
+					SetKnownGpr(rd, rhs << amount);
+					break;
+				case VitaA32::ShiftType::LSR:
+					SetKnownGpr(rd, rhs >> amount);
+					break;
+				case VitaA32::ShiftType::ASR:
+					SetKnownGpr(rd, static_cast<u32>(static_cast<s32>(rhs) >> amount));
+					break;
+				default:
+					ClearKnownGpr(rd);
+					break;
+			}
+		};
+
+		switch (opcode)
+		{
+			case 0x00: // SPECIAL
+				switch (op & 0x3f)
+				{
+					case 0x00: // SLL
+						set_shift_imm(VitaA32::ShiftType::LSL, SA(op));
+						break;
+					case 0x02: // SRL
+						set_shift_imm(VitaA32::ShiftType::LSR, SA(op));
+						break;
+					case 0x03: // SRA
+						set_shift_imm(VitaA32::ShiftType::ASR, SA(op));
+						break;
+					case 0x04: // SLLV
+						set_shift_reg(VitaA32::ShiftType::LSL);
+						break;
+					case 0x06: // SRLV
+						set_shift_reg(VitaA32::ShiftType::LSR);
+						break;
+					case 0x07: // SRAV
+						set_shift_reg(VitaA32::ShiftType::ASR);
+						break;
+					case 0x09: // JALR
+						SetKnownGpr(rd, pc + 8);
+						break;
+					case 0x10: // MFHI
+						if (TryGetKnownHiLo(false, &lhs))
+							SetKnownGpr(rd, lhs);
+						else
+							ClearKnownGpr(rd);
+						break;
+					case 0x12: // MFLO
+						if (TryGetKnownHiLo(true, &lhs))
+							SetKnownGpr(rd, lhs);
+						else
+							ClearKnownGpr(rd);
+						break;
+					case 0x11: // MTHI
+						if (TryGetKnownGpr(rs, &lhs))
+							SetKnownHiLo(false, lhs);
+						else
+							ClearKnownHiLo(false);
+						break;
+					case 0x13: // MTLO
+						if (TryGetKnownGpr(rs, &lhs))
+							SetKnownHiLo(true, lhs);
+						else
+							ClearKnownHiLo(true);
+						break;
+					case 0x18: // MULT
+					case 0x19: // MULTU
+						if (TryGetKnownGpr(rs, &lhs) && TryGetKnownGpr(rt, &rhs))
+						{
+							ComputeIopMultiplyResult(lhs, rhs, (op & 0x3f) == 0x18, &lo, &hi);
+							SetKnownHiLo(true, lo);
+							SetKnownHiLo(false, hi);
+						}
+						else
+						{
+							ClearKnownHiLo();
+						}
+						break;
+					case 0x1a: // DIV
+					case 0x1b: // DIVU
+					{
+						const bool signed_div = (op & 0x3f) == 0x1a;
+						const bool lhs_known = TryGetKnownGpr(rs, &lhs);
+						const bool rhs_known = TryGetKnownGpr(rt, &rhs);
+						if (lhs_known && rhs_known)
+						{
+							ComputeIopDivideResult(lhs, rhs, signed_div, &lo, &hi);
+							SetKnownHiLo(true, lo);
+							SetKnownHiLo(false, hi);
+						}
+						else if (rhs_known && (rhs == 1 || (signed_div && rhs == 0xffffffffu)))
+						{
+							ClearKnownHiLo(true);
+							SetKnownHiLo(false, 0);
+						}
+						else if (!signed_div && rhs_known && rhs == 0)
+						{
+							SetKnownHiLo(true, 0xffffffffu);
+							ClearKnownHiLo(false);
+						}
+						else if (lhs_known && lhs == 0)
+						{
+							ClearKnownHiLo(true);
+							SetKnownHiLo(false, 0);
+						}
+						else
+						{
+							ClearKnownHiLo();
+						}
+						break;
+					}
+					case 0x20: // ADD
+					case 0x21: // ADDU
+						set_binary_reg([](u32 a, u32 b) { return a + b; });
+						break;
+					case 0x22: // SUB
+					case 0x23: // SUBU
+						set_binary_reg([](u32 a, u32 b) { return a - b; });
+						break;
+					case 0x24: // AND
+						set_binary_reg([](u32 a, u32 b) { return a & b; });
+						break;
+					case 0x25: // OR
+						set_binary_reg([](u32 a, u32 b) { return a | b; });
+						break;
+					case 0x26: // XOR
+						set_binary_reg([](u32 a, u32 b) { return a ^ b; });
+						break;
+					case 0x27: // NOR
+						set_binary_reg([](u32 a, u32 b) { return ~(a | b); });
+						break;
+					case 0x2a: // SLT
+						set_binary_reg([](u32 a, u32 b) {
+							return static_cast<s32>(a) < static_cast<s32>(b) ? 1u : 0u;
+						});
+						break;
+					case 0x2b: // SLTU
+						set_binary_reg([](u32 a, u32 b) { return a < b ? 1u : 0u; });
+						break;
+					default:
+						break;
+				}
+				break;
+
+			case 0x01: // REGIMM
+				if (rt == 0x10 || rt == 0x11) // BLTZAL/BGEZAL
+					SetKnownGpr(31, pc + 8);
+				break;
+
+			case 0x03: // JAL
+				SetKnownGpr(31, pc + 8);
+				break;
+
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+				if (TryGetKnownGpr(rs, &lhs))
+					SetKnownGpr(rt, lhs + static_cast<u32>(static_cast<s32>(IMM_S(op))));
+				else
+					ClearKnownGpr(rt);
+				break;
+			case 0x0a: // SLTI
+				if (TryGetKnownGpr(rs, &lhs))
+				{
+					SetKnownGpr(rt,
+						(static_cast<s32>(lhs) < static_cast<s32>(IMM_S(op))) ? 1u : 0u);
+				}
+				else
+				{
+					ClearKnownGpr(rt);
+				}
+				break;
+			case 0x0b: // SLTIU
+				if (TryGetKnownGpr(rs, &lhs))
+					SetKnownGpr(rt, lhs < static_cast<u32>(static_cast<s32>(IMM_S(op))) ? 1u : 0u);
+				else
+					ClearKnownGpr(rt);
+				break;
+			case 0x0c: // ANDI
+				if (TryGetKnownGpr(rs, &lhs))
+					SetKnownGpr(rt, lhs & IMM_U(op));
+				else
+					ClearKnownGpr(rt);
+				break;
+			case 0x0d: // ORI
+				if (TryGetKnownGpr(rs, &lhs))
+					SetKnownGpr(rt, lhs | IMM_U(op));
+				else
+					ClearKnownGpr(rt);
+				break;
+			case 0x0e: // XORI
+				if (TryGetKnownGpr(rs, &lhs))
+					SetKnownGpr(rt, lhs ^ IMM_U(op));
+				else
+					ClearKnownGpr(rt);
+				break;
+			case 0x0f: // LUI
+				SetKnownGpr(rt, static_cast<u32>(IMM_U(op)) << 16);
+				break;
+
+			case 0x10: // COP0
+				if ((rs == 0x00 || rs == 0x02) && rt != 0) // MFC0/CFC0
+					ClearKnownGpr(rt);
+				break;
+			case 0x12: // COP2
+				if ((op & 0x3f) == 0 && (rs == 0x00 || rs == 0x02) && rt != 0) // MFC2/CFC2
+					ClearKnownGpr(rt);
+				break;
+
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x22: // LWL
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+			case 0x26: // LWR
+				ClearKnownGpr(rt);
+				break;
+
+			default:
+				break;
+		}
 	}
 
 	bool BlockCompiler::EmitStorePc(u32 pc)
@@ -1017,6 +1460,24 @@ namespace VitaIOP
 		return m_code.EmitLdrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(GprOffset(guest_reg)));
 	}
 
+	bool BlockCompiler::EmitLoadGprValue(unsigned guest_reg, unsigned host_reg, bool* used_known_value)
+	{
+		// PCSX2 owners read guest GPR operands from psxRegs.GPR. When this block
+		// already proves that value, keep Cortex-A9 off the load path and
+		// materialize it directly.
+		u32 known_value = 0;
+		if (TryGetKnownGpr(guest_reg, &known_value))
+		{
+			if (used_known_value)
+				*used_known_value = guest_reg != 0;
+			return m_code.EmitMovImm32(host_reg, known_value);
+		}
+
+		if (used_known_value)
+			*used_known_value = false;
+		return EmitLoadGpr(guest_reg, host_reg);
+	}
+
 	bool BlockCompiler::EmitStoreGpr(unsigned guest_reg, unsigned host_reg)
 	{
 		if (guest_reg == 0)
@@ -1049,8 +1510,56 @@ namespace VitaIOP
 	bool BlockCompiler::EmitCompareGprs(unsigned lhs_guest_reg, unsigned rhs_guest_reg)
 	{
 		// PCSX2 owner: x86/iR3000Atables.cpp::rpsxBEQ()/rpsxBNE(). This only
-		// changes the Vita compare sequence; the branch decision remains the
-		// same architectural register equality test.
+		// changes the Vita compare sequence; DuckStation's ARM32 R3000A
+		// recompiler proves this codegen shape for constants, but not PS2 IOP
+		// semantics.
+		u32 lhs_value = 0;
+		u32 rhs_value = 0;
+		const bool lhs_known = TryGetKnownGpr(lhs_guest_reg, &lhs_value);
+		const bool rhs_known = TryGetKnownGpr(rhs_guest_reg, &rhs_value);
+		const bool has_tracked_operand =
+			(lhs_guest_reg != 0 && lhs_known) || (rhs_guest_reg != 0 && rhs_known);
+		const auto emit_false_compare = [this]() {
+			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
+				   m_code.EmitCmpImm32(HOST_TMP0, 1);
+		};
+		const auto emit_cmp_reg_imm = [this](unsigned host_reg, u32 value) {
+			return m_code.EmitCmpImm32(host_reg, value) ||
+				   (m_code.EmitMovImm32(HOST_TMP1, value) &&
+					   m_code.EmitCmpReg(host_reg, HOST_TMP1));
+		};
+
+		if (lhs_known && rhs_known)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (has_tracked_operand)
+				++g_qemuIopConstBranchCompareFastPaths;
+#endif
+			return (lhs_value == rhs_value) ?
+					   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP0) :
+					   emit_false_compare();
+		}
+
+		if (lhs_known)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (has_tracked_operand)
+				++g_qemuIopConstBranchCompareFastPaths;
+#endif
+			return EmitLoadGpr(rhs_guest_reg, HOST_TMP0) &&
+				   emit_cmp_reg_imm(HOST_TMP0, lhs_value);
+		}
+
+		if (rhs_known)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (has_tracked_operand)
+				++g_qemuIopConstBranchCompareFastPaths;
+#endif
+			return EmitLoadGpr(lhs_guest_reg, HOST_TMP0) &&
+				   emit_cmp_reg_imm(HOST_TMP0, rhs_value);
+		}
+
 		if (lhs_guest_reg == 0 && rhs_guest_reg == 0)
 			return m_code.EmitCmpReg(HOST_TMP0, HOST_TMP0);
 		if (lhs_guest_reg == 0)
@@ -1074,6 +1583,63 @@ namespace VitaIOP
 
 		if (rd == 0)
 			return true;
+
+		u32 known_rs = 0;
+		u32 known_rt = 0;
+		if (TryGetKnownGpr(rs, &known_rs) && TryGetKnownGpr(rt, &known_rt))
+		{
+			u32 result = 0;
+			bool can_fold = true;
+			switch (funct)
+			{
+				case 0x20: // ADD
+				case 0x21: // ADDU
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxADD() /
+					// psxADDU() and x86/iR3000Atables.cpp::rpsxADDU_const().
+					// The IOP ADD path in this tree wraps just like ADDU.
+					result = known_rs + known_rt;
+					break;
+				case 0x22: // SUB
+				case 0x23: // SUBU
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxSUB() /
+					// psxSUBU() and x86/iR3000Atables.cpp::rpsxSUBU_const().
+					result = known_rs - known_rt;
+					break;
+				case 0x24: // AND
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxAND() and
+					// x86/iR3000Atables.cpp::rpsxAND_const().
+					result = known_rs & known_rt;
+					break;
+				case 0x25: // OR
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxOR() and
+					// x86/iR3000Atables.cpp::rpsxOR_const().
+					result = known_rs | known_rt;
+					break;
+				case 0x26: // XOR
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxXOR() and
+					// x86/iR3000Atables.cpp::rpsxXOR_const().
+					result = known_rs ^ known_rt;
+					break;
+				case 0x27: // NOR
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxNOR() and
+					// x86/iR3000Atables.cpp::rpsxNOR_const().
+					result = ~(known_rs | known_rt);
+					break;
+				default:
+					can_fold = false;
+					break;
+			}
+
+			if (can_fold)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuIopConstRegisterOpFastPaths;
+#endif
+				return ((result <= 0xffu) ? m_code.EmitMovImm8(HOST_TMP0, static_cast<u8>(result)) :
+											m_code.EmitMovImm32(HOST_TMP0, result)) &&
+					   EmitStoreGpr(rd, HOST_TMP0);
+			}
+		}
 
 		const auto store_zero = [this, rd]() {
 			return EmitStoreGprZero(rd);
@@ -1144,6 +1710,164 @@ namespace VitaIOP
 				break;
 		}
 
+		const bool rs_tracked = rs != 0 && TryGetKnownGpr(rs, &known_rs);
+		const bool rt_tracked = rt != 0 && TryGetKnownGpr(rt, &known_rt);
+		const auto emit_reg_imm_or_reg = [this](u32 known_value,
+												bool (*emit_imm)(VitaA32::CodeBuffer&, unsigned, unsigned, u32),
+												bool (*emit_reg)(VitaA32::CodeBuffer&, unsigned, unsigned, unsigned)) {
+			return emit_imm(m_code, HOST_TMP2, HOST_TMP0, known_value) ||
+				   (m_code.EmitMovImm32(HOST_TMP1, known_value) &&
+					   emit_reg(m_code, HOST_TMP2, HOST_TMP0, HOST_TMP1));
+		};
+		const auto emit_add_imm = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, u32 value) {
+			return code.EmitAddImm32(rd, rn, value);
+		};
+		const auto emit_sub_imm = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, u32 value) {
+			return code.EmitSubImm32(rd, rn, value);
+		};
+		const auto emit_and_imm = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, u32 value) {
+			return code.EmitAndImm32(rd, rn, value);
+		};
+		const auto emit_orr_imm = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, u32 value) {
+			return code.EmitOrrImm32(rd, rn, value);
+		};
+		const auto emit_eor_imm = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, u32 value) {
+			return code.EmitEorImm32(rd, rn, value);
+		};
+		const auto emit_add_reg = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, unsigned rm) {
+			return code.EmitAddReg(rd, rn, rm);
+		};
+		const auto emit_sub_reg = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, unsigned rm) {
+			return code.EmitSubReg(rd, rn, rm);
+		};
+		const auto emit_and_reg = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, unsigned rm) {
+			return code.EmitAndReg(rd, rn, rm);
+		};
+		const auto emit_orr_reg = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, unsigned rm) {
+			return code.EmitOrrReg(rd, rn, rm);
+		};
+		const auto emit_eor_reg = [](VitaA32::CodeBuffer& code, unsigned rd, unsigned rn, unsigned rm) {
+			return code.EmitEorReg(rd, rn, rm);
+		};
+		const auto emit_counted_store = [this, rd]() {
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+			return EmitStoreGpr(rd, HOST_TMP2);
+		};
+		const auto emit_known_operand = [&](bool known_lhs, u32 known_value) -> bool {
+			const unsigned dynamic_reg = known_lhs ? rt : rs;
+			switch (funct)
+			{
+				case 0x20: // ADD
+				case 0x21: // ADDU
+					if (known_value == 0)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+						return EmitMoveGpr(rd, dynamic_reg);
+					}
+					return EmitLoadGpr(dynamic_reg, HOST_TMP0) &&
+						   emit_reg_imm_or_reg(known_value, emit_add_imm, emit_add_reg) &&
+						   emit_counted_store();
+				case 0x22: // SUB
+				case 0x23: // SUBU
+					if (known_lhs)
+					{
+						return EmitLoadGpr(dynamic_reg, HOST_TMP0) &&
+							   (m_code.EmitRsbImm32(HOST_TMP2, HOST_TMP0, known_value) ||
+								   (m_code.EmitMovImm32(HOST_TMP1, known_value) &&
+									   m_code.EmitSubReg(HOST_TMP2, HOST_TMP1, HOST_TMP0))) &&
+							   emit_counted_store();
+					}
+					if (known_value == 0)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+						return EmitMoveGpr(rd, dynamic_reg);
+					}
+					return EmitLoadGpr(dynamic_reg, HOST_TMP0) &&
+						   emit_reg_imm_or_reg(known_value, emit_sub_imm, emit_sub_reg) &&
+						   emit_counted_store();
+				case 0x24: // AND
+					if (known_value == 0)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+						return store_zero();
+					}
+					if (known_value == 0xffffffffu)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+						return EmitMoveGpr(rd, dynamic_reg);
+					}
+					return EmitLoadGpr(dynamic_reg, HOST_TMP0) &&
+						   emit_reg_imm_or_reg(known_value, emit_and_imm, emit_and_reg) &&
+						   emit_counted_store();
+				case 0x25: // OR
+					if (known_value == 0)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+						return EmitMoveGpr(rd, dynamic_reg);
+					}
+					if (known_value == 0xffffffffu)
+					{
+						return m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) &&
+							   emit_counted_store();
+					}
+					return EmitLoadGpr(dynamic_reg, HOST_TMP0) &&
+						   emit_reg_imm_or_reg(known_value, emit_orr_imm, emit_orr_reg) &&
+						   emit_counted_store();
+				case 0x26: // XOR
+					if (known_value == 0)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+						return EmitMoveGpr(rd, dynamic_reg);
+					}
+					return EmitLoadGpr(dynamic_reg, HOST_TMP0) &&
+						   emit_reg_imm_or_reg(known_value, emit_eor_imm, emit_eor_reg) &&
+						   emit_counted_store();
+				case 0x27: // NOR
+					if (known_value == 0xffffffffu)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+						return store_zero();
+					}
+					if (known_value == 0)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+						return store_not(dynamic_reg);
+					}
+					return EmitLoadGpr(dynamic_reg, HOST_TMP0) &&
+						   emit_reg_imm_or_reg(known_value, emit_orr_imm, emit_orr_reg) &&
+						   m_code.EmitMvnReg(HOST_TMP2, HOST_TMP2) &&
+						   emit_counted_store();
+				default:
+					return false;
+			}
+		};
+
+		// PCSX2 owners: x86/iR3000Atables.cpp::rpsxADDU_consts(),
+		// rpsxSUBU_const{t,s}(), rpsxLogicalOp_constv(). Fold one known
+		// operand so Cortex-A9 avoids the second psxRegs.GPR load.
+		if (rs_tracked)
+			return emit_known_operand(true, known_rs);
+		if (rt_tracked)
+			return emit_known_operand(false, known_rt);
+
 		if (!EmitLoadGpr(rs, HOST_TMP0) || !EmitLoadGpr(rt, HOST_TMP1))
 			return false;
 
@@ -1194,17 +1918,6 @@ namespace VitaIOP
 		if (rd == 0)
 			return true;
 
-		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLL()/psxSRL()/psxSRA().
-		// Shifting register zero writes zero for every immediate amount.
-		if (rt == 0)
-			return EmitStoreGprZero(rd);
-
-		if (sa == 0)
-			return EmitMoveGpr(rd, rt);
-
-		if (!EmitLoadGpr(rt, HOST_TMP0))
-			return false;
-
 		VitaA32::ShiftType shift = VitaA32::ShiftType::LSL;
 		switch (funct)
 		{
@@ -1221,6 +1934,44 @@ namespace VitaIOP
 				return false;
 		}
 
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLL()/psxSRL()/psxSRA().
+		// Shifting register zero writes zero for every immediate amount.
+		if (rt == 0)
+			return EmitStoreGprZero(rd);
+
+		u32 known_rt = 0;
+		if (TryGetKnownGpr(rt, &known_rt))
+		{
+			u32 result = 0;
+			switch (shift)
+			{
+				case VitaA32::ShiftType::LSL:
+					result = known_rt << sa;
+					break;
+				case VitaA32::ShiftType::LSR:
+					result = known_rt >> sa;
+					break;
+				case VitaA32::ShiftType::ASR:
+					result = static_cast<u32>(static_cast<s32>(known_rt) >> sa);
+					break;
+				default:
+					return false;
+			}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstShiftFastPaths;
+#endif
+			return ((result <= 0xffu) ? m_code.EmitMovImm8(HOST_TMP0, static_cast<u8>(result)) :
+										m_code.EmitMovImm32(HOST_TMP0, result)) &&
+				   EmitStoreGpr(rd, HOST_TMP0);
+		}
+
+		if (sa == 0)
+			return EmitMoveGpr(rd, rt);
+
+		if (!EmitLoadGpr(rt, HOST_TMP0))
+			return false;
+
 		return m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, shift, static_cast<u8>(sa)) &&
 			   EmitStoreGpr(rd, HOST_TMP2);
 	}
@@ -1233,21 +1984,6 @@ namespace VitaIOP
 		const u32 funct = op & 0x3f;
 		if (rd == 0)
 			return true;
-
-		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLLV()/psxSRLV()/psxSRAV().
-		// The shift amount is irrelevant when the source register is zero.
-		if (rt == 0)
-			return EmitStoreGprZero(rd);
-		// Register zero supplies a shift amount of 0.
-		if (rs == 0)
-			return EmitMoveGpr(rd, rt);
-
-		if (!EmitLoadGpr(rt, HOST_TMP0) ||
-			!EmitLoadGpr(rs, HOST_TMP1) ||
-			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 0x1f))
-		{
-			return false;
-		}
 
 		VitaA32::ShiftType shift = VitaA32::ShiftType::LSL;
 		switch (funct)
@@ -1265,6 +2001,64 @@ namespace VitaIOP
 				return false;
 		}
 
+		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLLV()/psxSRLV()/psxSRAV().
+		// The shift amount is irrelevant when the source register is zero.
+		if (rt == 0)
+			return EmitStoreGprZero(rd);
+
+		u32 known_rs = 0;
+		u32 known_rt = 0;
+		if (TryGetKnownGpr(rt, &known_rt) && TryGetKnownGpr(rs, &known_rs))
+		{
+			const unsigned amount = known_rs & 0x1f;
+			u32 result = 0;
+			switch (shift)
+			{
+				case VitaA32::ShiftType::LSL:
+					result = known_rt << amount;
+					break;
+				case VitaA32::ShiftType::LSR:
+					result = known_rt >> amount;
+					break;
+				case VitaA32::ShiftType::ASR:
+					result = static_cast<u32>(static_cast<s32>(known_rt) >> amount);
+					break;
+				default:
+					return false;
+			}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstShiftFastPaths;
+#endif
+			return ((result <= 0xffu) ? m_code.EmitMovImm8(HOST_TMP0, static_cast<u8>(result)) :
+										m_code.EmitMovImm32(HOST_TMP0, result)) &&
+				   EmitStoreGpr(rd, HOST_TMP0);
+		}
+
+		// Register zero supplies a shift amount of 0.
+		if (rs == 0)
+			return EmitMoveGpr(rd, rt);
+
+		if (TryGetKnownGpr(rs, &known_rs))
+		{
+			const unsigned amount = known_rs & 0x1f;
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstShiftAmountFastPaths;
+#endif
+			if (amount == 0)
+				return EmitMoveGpr(rd, rt);
+			return EmitLoadGpr(rt, HOST_TMP0) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, shift, static_cast<u8>(amount)) &&
+				   EmitStoreGpr(rd, HOST_TMP2);
+		}
+
+		if (!EmitLoadGpr(rt, HOST_TMP0) ||
+			!EmitLoadGpr(rs, HOST_TMP1) ||
+			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP1, 0x1f))
+		{
+			return false;
+		}
+
 		return m_code.EmitMovRegShiftReg(HOST_TMP2, HOST_TMP0, shift, HOST_TMP1) &&
 			   EmitStoreGpr(rd, HOST_TMP2);
 	}
@@ -1276,6 +2070,22 @@ namespace VitaIOP
 		const unsigned rt = RT(op);
 		if (rd == 0)
 			return true;
+
+		u32 known_rs = 0;
+		u32 known_rt = 0;
+		if (TryGetKnownGpr(rs, &known_rs) && TryGetKnownGpr(rt, &known_rt))
+		{
+			// PCSX2 owners: R3000AOpcodeTables.cpp::psxSLT()/psxSLTU() and
+			// x86/iR3000Atables.cpp::rpsxSLT_const()/rpsxSLTU_const().
+			const u32 result = is_signed ?
+				((static_cast<s32>(known_rs) < static_cast<s32>(known_rt)) ? 1u : 0u) :
+				((known_rs < known_rt) ? 1u : 0u);
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstRegisterOpFastPaths;
+#endif
+			return m_code.EmitMovImm8(HOST_TMP0, static_cast<u8>(result)) &&
+				   EmitStoreGpr(rd, HOST_TMP0);
+		}
 
 		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLT()/psxSLTU(). Fold
 		// architectural-zero compare identities before loading both operands.
@@ -1317,6 +2127,33 @@ namespace VitaIOP
 			}
 		}
 
+		const bool rs_tracked = rs != 0 && TryGetKnownGpr(rs, &known_rs);
+		const bool rt_tracked = rt != 0 && TryGetKnownGpr(rt, &known_rt);
+		const auto emit_cmp_reg_imm = [this](unsigned host_reg, u32 value) {
+			return m_code.EmitCmpImm32(host_reg, value) ||
+				   (m_code.EmitMovImm32(HOST_TMP1, value) &&
+					   m_code.EmitCmpReg(host_reg, HOST_TMP1));
+		};
+		if (rs_tracked || rt_tracked)
+		{
+			// PCSX2 owners: x86/iR3000Atables.cpp::rpsxSLT_consts() /
+			// rpsxSLT_constt() and rpsxSLTU_consts()/rpsxSLTU_constt().
+			const bool known_lhs = rs_tracked;
+			const u32 known_value = known_lhs ? known_rs : known_rt;
+			const unsigned dynamic_reg = known_lhs ? rt : rs;
+			const VitaA32::Condition set_condition = known_lhs ?
+				(is_signed ? VitaA32::Condition::GT : VitaA32::Condition::HI) :
+				(is_signed ? VitaA32::Condition::LT : VitaA32::Condition::CC);
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstRegisterOperandFastPaths;
+#endif
+			return EmitLoadGpr(dynamic_reg, HOST_TMP0) &&
+				   emit_cmp_reg_imm(HOST_TMP0, known_value) &&
+				   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+				   m_code.EmitMovImm8(HOST_TMP2, 1, set_condition) &&
+				   EmitStoreGpr(rd, HOST_TMP2);
+		}
+
 		return EmitLoadGpr(rs, HOST_TMP0) &&
 			   EmitLoadGpr(rt, HOST_TMP1) &&
 			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1) &&
@@ -1327,6 +2164,63 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitMultiplyOp(u32 op, bool is_signed)
 	{
+		u32 known_rs = 0;
+		u32 known_rt = 0;
+		if (TryGetKnownGpr(RS(op), &known_rs) && TryGetKnownGpr(RT(op), &known_rt))
+		{
+			// PCSX2 owners: R3000AOpcodeTables.cpp::psxMULT()/psxMULTU()
+			// and x86/iR3000Atables.cpp::rpsxMULT_const()/rpsxMULTU_const().
+			u32 lo = 0;
+			u32 hi = 0;
+			ComputeIopMultiplyResult(known_rs, known_rt, is_signed, &lo, &hi);
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstMultiplyFastPaths;
+#endif
+			return m_code.EmitMovImm32(HOST_TMP2, lo) &&
+				   m_code.EmitMovImm32(HOST_TMP3, hi) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
+				   m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+		}
+
+		const bool rs_known = TryGetKnownGpr(RS(op), &known_rs);
+		const bool rt_known = TryGetKnownGpr(RT(op), &known_rt);
+		if (rs_known || rt_known)
+		{
+			// PCSX2 owners: x86/iR3000Atables.cpp::rpsxMULT_consts() /
+			// rpsxMULT_constt() and rpsxMULTU_consts()/rpsxMULTU_constt().
+			const u32 known_value = rs_known ? known_rs : known_rt;
+			const unsigned dynamic_reg = rs_known ? RT(op) : RS(op);
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstMultiplyOperandFastPaths;
+#endif
+			if (known_value == 0)
+			{
+				return m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
+					   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+			}
+
+			if (!EmitLoadGpr(dynamic_reg, HOST_TMP0) ||
+				!m_code.EmitMovImm32(HOST_TMP1, known_value))
+			{
+				return false;
+			}
+
+			if (is_signed)
+			{
+				if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+					return false;
+			}
+			else
+			{
+				if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+					return false;
+			}
+
+			return m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
+				   m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+		}
+
 		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
 			!EmitLoadGpr(RT(op), HOST_TMP1))
 		{
@@ -1384,13 +2278,141 @@ namespace VitaIOP
 			// write the adjacent pair when HOST_TMP2=HI and HOST_TMP3=LO.
 			return m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_PSX_REGS, static_cast<u8>(HI_OFFSET));
 		};
+		const auto emit_and_mask = [this](unsigned rd, unsigned rn, u32 mask) {
+			if (m_code.EmitAndImm32(rd, rn, mask))
+				return true;
+			return m_code.EmitMovImm32(HOST_TMP1, mask) &&
+				   m_code.EmitAndReg(rd, rn, HOST_TMP1);
+		};
 
 		const void* helper = is_signed ?
 			reinterpret_cast<const void*>(&VitaIopA32DivResult) :
 			reinterpret_cast<const void*>(&VitaIopA32DivuResult);
 
-		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
-			!EmitLoadGpr(RT(op), HOST_TMP1))
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		u32 known_rs = 0;
+		u32 known_rt = 0;
+		const bool rs_known = TryGetKnownGpr(rs, &known_rs);
+		const bool rt_known = TryGetKnownGpr(rt, &known_rt);
+		if (rs_known && rt_known)
+		{
+			// PCSX2 owners: R3000AOpcodeTables.cpp::psxDIV()/psxDIVU() and
+			// x86/iR3000Atables.cpp::rpsxDIV_const()/rpsxDIVU_const().
+			u32 lo = 0;
+			u32 hi = 0;
+			ComputeIopDivideResult(known_rs, known_rt, is_signed, &lo, &hi);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstDivideFastPaths;
+#endif
+			return m_code.EmitMovImm32(HOST_TMP2, lo) &&
+				   m_code.EmitMovImm32(HOST_TMP3, hi) &&
+				   m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)) &&
+				   m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+		}
+
+		// PCSX2 owners: x86/iR3000Atables.cpp::rpsxDIV_consts() /
+		// rpsxDIV_constt() / rpsxDIVU_consts() / rpsxDIVU_constt(). Keep the
+		// Cortex-A9 off the full divide branch/helper tree for one-known
+		// operands whose quotient/remainder needs only the dynamic register.
+		if (rt_known)
+		{
+			if (known_rt == 0)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuIopConstDivideOperandFastPaths;
+#endif
+				if (!EmitLoadGpr(rs, HOST_TMP0) ||
+					!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu))
+				{
+					return false;
+				}
+
+				if (is_signed &&
+					(!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
+						!m_code.EmitMovImm8(HOST_TMP2, 1, VitaA32::Condition::LT)))
+				{
+					return false;
+				}
+
+				return store_hilo(HOST_TMP2, HOST_TMP0);
+			}
+
+			if (known_rt == 1)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuIopConstDivideOperandFastPaths;
+#endif
+				return EmitLoadGpr(rs, HOST_TMP0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   store_hilo(HOST_TMP0, HOST_TMP2);
+			}
+
+			if (is_signed && known_rt == 0xffffffffu)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuIopConstDivideOperandFastPaths;
+#endif
+				return EmitLoadGpr(rs, HOST_TMP0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   m_code.EmitRsbImm32(HOST_TMP3, HOST_TMP0, 0) &&
+					   store_hilo_from_hi_lo_pair();
+			}
+
+			const bool signed_negative_power_of_two =
+				is_signed && static_cast<s32>(known_rt) < 0 && known_rt != 0x80000000u &&
+				IsPowerOfTwo(0u - known_rt);
+			if ((!is_signed && IsPowerOfTwo(known_rt)) ||
+				(is_signed && static_cast<s32>(known_rt) > 0 && IsPowerOfTwo(known_rt)) ||
+				signed_negative_power_of_two)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuIopConstDivideOperandFastPaths;
+#endif
+				const u32 positive_divisor = signed_negative_power_of_two ? (0u - known_rt) : known_rt;
+				const unsigned shift = PowerOfTwoShift(positive_divisor);
+				const u32 mask = positive_divisor - 1;
+				if (!EmitLoadGpr(rs, HOST_TMP0))
+					return false;
+
+				if (!is_signed)
+				{
+					return m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSR,
+							   static_cast<u8>(shift)) &&
+						   emit_and_mask(HOST_TMP3, HOST_TMP0, mask) &&
+						   store_hilo(HOST_TMP2, HOST_TMP3);
+				}
+
+				return m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+					   emit_and_mask(HOST_TMP3, HOST_TMP3, mask) &&
+					   m_code.EmitAddReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP3, VitaA32::ShiftType::ASR,
+						   static_cast<u8>(shift)) &&
+					   m_code.EmitMovRegShiftImm(HOST_TMP3, HOST_TMP2, VitaA32::ShiftType::LSL,
+						   static_cast<u8>(shift)) &&
+					   m_code.EmitSubReg(HOST_TMP3, HOST_TMP0, HOST_TMP3) &&
+					   (!signed_negative_power_of_two ||
+						   m_code.EmitRsbImm32(HOST_TMP2, HOST_TMP2, 0)) &&
+					   store_hilo(HOST_TMP2, HOST_TMP3);
+			}
+		}
+
+		if (rs_known && known_rs == 0)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstDivideOperandFastPaths;
+#endif
+			return EmitLoadGpr(rt, HOST_TMP1) &&
+				   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+				   m_code.EmitMovImm8(HOST_TMP3, 0) &&
+				   m_code.EmitCmpImm32(HOST_TMP1, 0) &&
+				   m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu, VitaA32::Condition::EQ) &&
+				   store_hilo(HOST_TMP2, HOST_TMP3);
+		}
+
+		if (!EmitLoadGpr(rs, HOST_TMP0) ||
+			!EmitLoadGpr(rt, HOST_TMP1))
 		{
 			return false;
 		}
@@ -1570,6 +2592,60 @@ namespace VitaIOP
 				   EmitStoreGpr(rt, HOST_TMP0);
 		}
 
+		u32 known_rs = 0;
+		if (rs != 0 && TryGetKnownGpr(rs, &known_rs))
+		{
+			u32 result = 0;
+			bool can_fold = true;
+			switch (opcode)
+			{
+				case 0x08: // ADDI
+				case 0x09: // ADDIU
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxADDI() /
+					// psxADDIU() and x86/iR3000Atables.cpp::rpsxADDIU_const().
+					// This tree's IOP ADDI is wrapping, so a known source can be
+					// folded without emitting a Cortex-A9 load/add pair.
+					result = known_rs + static_cast<u32>(static_cast<s32>(IMM_S(op)));
+					break;
+				case 0x0a: // SLTI
+					// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLTI().
+					result = (static_cast<s32>(known_rs) < static_cast<s32>(IMM_S(op))) ? 1u : 0u;
+					break;
+				case 0x0b: // SLTIU
+					// PCSX2 owner: R3000AOpcodeTables.cpp::psxSLTIU().
+					result = (known_rs < static_cast<u32>(static_cast<s32>(IMM_S(op)))) ? 1u : 0u;
+					break;
+				case 0x0c: // ANDI
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxANDI() and
+					// x86/iR3000Atables.cpp::rpsxANDI_const().
+					result = known_rs & IMM_U(op);
+					break;
+				case 0x0d: // ORI
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxORI() and
+					// x86/iR3000Atables.cpp::rpsxORI_const().
+					result = known_rs | IMM_U(op);
+					break;
+				case 0x0e: // XORI
+					// PCSX2 owners: R3000AOpcodeTables.cpp::psxXORI() and
+					// x86/iR3000Atables.cpp::rpsxXORI_const().
+					result = known_rs ^ IMM_U(op);
+					break;
+				default:
+					can_fold = false;
+					break;
+			}
+
+			if (can_fold)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuIopConstImmediateFastPaths;
+#endif
+				return ((result <= 0xffu) ? m_code.EmitMovImm8(HOST_TMP0, static_cast<u8>(result)) :
+											m_code.EmitMovImm32(HOST_TMP0, result)) &&
+					   EmitStoreGpr(rt, HOST_TMP0);
+			}
+		}
+
 		if ((opcode == 0x08 || opcode == 0x09) && IMM_S(op) == 0)
 			return EmitMoveGpr(rt, rs);
 		if ((opcode == 0x08 || opcode == 0x09) && rs == 0)
@@ -1687,8 +2763,11 @@ namespace VitaIOP
 	{
 		const s32 imm = static_cast<s32>(IMM_S(op));
 		const unsigned scratch_reg = (host_reg == HOST_TMP1) ? HOST_TMP2 : HOST_TMP1;
+		u32 known_base = 0;
 		if (RS(op) == 0)
 			return m_code.EmitMovImm32(host_reg, static_cast<u32>(imm));
+		if (TryGetKnownGpr(RS(op), &known_base))
+			return m_code.EmitMovImm32(host_reg, known_base + static_cast<u32>(imm));
 
 		if (!EmitLoadGpr(RS(op), host_reg))
 			return false;
@@ -1711,14 +2790,17 @@ namespace VitaIOP
 		const unsigned rt = RT(op);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIopKnownRamScalarLoadFastPaths;
+		if (RS(op) != 0)
+			++g_qemuIopConstRamScalarLoadFastPaths;
 #endif
 
 		if (rt == 0)
 			return true;
 
 		// PCSX2 owner: x86/iR3000Atables.cpp::rpsxLoad() reads ordinary IOP
-		// RAM directly through iopMem->Main. When rs == $zero and the aligned
-		// immediate lands in main RAM, the MMIO/ROM helper split is impossible.
+		// RAM directly through iopMem->Main. When the block-local address
+		// tracker proves an aligned main-RAM address, the MMIO/ROM helper split
+		// is impossible.
 		const auto emit_load_value = [&]() -> bool {
 			switch (opcode)
 			{
@@ -1909,6 +2991,8 @@ namespace VitaIOP
 		const unsigned opcode = op >> 26;
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIopKnownRamScalarStoreFastPaths;
+		if (RS(op) != 0)
+			++g_qemuIopConstRamScalarStoreFastPaths;
 #endif
 
 		const auto emit_store_value = [&]() -> bool {
@@ -1949,23 +3033,31 @@ namespace VitaIOP
 
 		// PCSX2 owner: IopMem.cpp::iopMemWrite8/16/32 writes ordinary RAM
 		// directly when isolate-cache is clear and invalidates the written word.
-		// A known $zero+imm main-RAM address cannot hit the MMIO/ROM helper arm.
+		// A compile-time-known main-RAM address cannot hit the MMIO/ROM helper
+		// arm.
 		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
 			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
 		{
 			return false;
 		}
 
+		bool used_known_store_value = false;
 		const size_t isolated_skip = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (isolated_skip == static_cast<size_t>(-1) ||
-			!EmitLoadGpr(RT(op), HOST_TMP1) ||
+			!EmitLoadGprValue(RT(op), HOST_TMP1, &used_known_store_value) ||
 			!emit_store_value() ||
 			!emit_clear_stored_word())
 		{
 			return false;
 		}
 
-		return m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE);
+		if (!m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE))
+			return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (used_known_store_value)
+			++g_qemuIopConstStoreValueFastPaths;
+#endif
+		return true;
 	}
 
 	bool BlockCompiler::EmitStoreOp(u32 op)
@@ -2052,9 +3144,10 @@ namespace VitaIOP
 			return false;
 		}
 
+		bool used_known_store_value = false;
 		const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (isolated_fallback_branch == static_cast<size_t>(-1) ||
-			!EmitLoadGpr(RT(op), HOST_TMP1) ||
+			!EmitLoadGprValue(RT(op), HOST_TMP1, &used_known_store_value) ||
 			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
 			!emit_store_value() ||
 			!emit_clear_stored_word())
@@ -2070,6 +3163,10 @@ namespace VitaIOP
 			helper,
 			RT(op),
 		});
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (used_known_store_value)
+			++g_qemuIopConstStoreValueFastPaths;
+#endif
 		return true;
 	}
 
@@ -2231,6 +3328,8 @@ namespace VitaIOP
 		const unsigned rt = RT(op);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIopKnownRamUnalignedLoadFastPaths;
+		if (RS(op) != 0)
+			++g_qemuIopConstRamUnalignedLoadFastPaths;
 #endif
 
 		if (rt == 0)
@@ -2252,8 +3351,8 @@ namespace VitaIOP
 			return false;
 
 		// PCSX2 owner: R3000AOpcodeTables.cpp::psxLWL()/psxLWR() merge an
-		// aligned iopMemRead32() word. A known $zero+imm main-RAM address cannot
-		// hit the MMIO/ROM helper arm, so emit the fixed merge directly.
+		// aligned iopMemRead32() word. A compile-time-known main-RAM address
+		// cannot hit the MMIO/ROM helper arm, so emit the fixed merge directly.
 		if ((left && shift == 24) || (!left && shift == 0))
 			return EmitStoreGpr(rt, HOST_TMP0);
 
@@ -2352,6 +3451,8 @@ namespace VitaIOP
 		const bool left = ((op >> 26) == 0x2a);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++g_qemuIopKnownRamUnalignedStoreFastPaths;
+		if (RS(op) != 0)
+			++g_qemuIopConstRamUnalignedStoreFastPaths;
 #endif
 
 		const u32 aligned_address = address & ~3u;
@@ -2404,7 +3505,8 @@ namespace VitaIOP
 		// PCSX2 owners: R3000AOpcodeTables.cpp::psxSWL()/psxSWR() merge an
 		// aligned iopMemRead32() word, then IopMem.cpp::iopMemWrite32() applies
 		// isolate-cache suppression and psxCpu->Clear() invalidation.
-		if (!emit_load_aligned_word() || !EmitLoadGpr(RT(op), HOST_TMP1))
+		bool used_known_store_value = false;
+		if (!emit_load_aligned_word() || !EmitLoadGprValue(RT(op), HOST_TMP1, &used_known_store_value))
 			return false;
 
 		if (left)
@@ -2444,7 +3546,13 @@ namespace VitaIOP
 			return false;
 		}
 
-		return m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE);
+		if (!m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE))
+			return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (used_known_store_value)
+			++g_qemuIopConstStoreValueFastPaths;
+#endif
+		return true;
 	}
 
 	bool BlockCompiler::EmitUnalignedStoreOp(u32 op)
@@ -2491,7 +3599,8 @@ namespace VitaIOP
 			m_code.Size(),
 		});
 
-		if (!EmitLoadGpr(RT(op), HOST_TMP1))
+		bool used_known_store_value = false;
+		if (!EmitLoadGprValue(RT(op), HOST_TMP1, &used_known_store_value))
 			return false;
 
 		if (left)
@@ -2547,6 +3656,10 @@ namespace VitaIOP
 			isolated_fallback_branch,
 			m_code.Size(),
 		});
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (used_known_store_value)
+			++g_qemuIopConstStoreValueFastPaths;
+#endif
 		return true;
 	}
 
@@ -2571,6 +3684,23 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitConditionalBranchFlag(u32 op)
 	{
+		u32 lhs_value = 0;
+		u32 rhs_value = 0;
+		const bool lhs_known = TryGetKnownGpr(RS(op), &lhs_value);
+		const bool rhs_known = TryGetKnownGpr(RT(op), &rhs_value);
+		const bool branch_on_equal = (op >> 26) == 0x04;
+		if (RS(op) == RT(op) || (lhs_known && rhs_known))
+		{
+			const bool equal = RS(op) == RT(op) || lhs_value == rhs_value;
+			m_static_branch_outcome_known = true;
+			m_static_branch_taken = (equal == branch_on_equal);
+#if defined(VITASX2_QEMU_VALIDATION)
+			if ((RS(op) != 0 && lhs_known) || (RT(op) != 0 && rhs_known))
+				++g_qemuIopConstBranchCompareFastPaths;
+#endif
+			return true;
+		}
+
 		if (!EmitCompareGprs(RS(op), RT(op)) ||
 			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0))
 		{
@@ -2597,6 +3727,47 @@ namespace VitaIOP
 
 		if (m_emit_native_static_branch)
 			return EmitSignedBranchFlag(op);
+
+		u32 known_value = 0;
+		if (TryGetKnownGpr(RS(op), &known_value))
+		{
+			const s32 signed_value = static_cast<s32>(known_value);
+			bool taken = false;
+			if (opcode == 0x01)
+			{
+				switch (rt)
+				{
+					case 0x00: // BLTZ
+					case 0x10: // BLTZAL
+						taken = signed_value < 0;
+						break;
+					case 0x01: // BGEZ
+					case 0x11: // BGEZAL
+						taken = signed_value >= 0;
+						break;
+					default:
+						return false;
+				}
+			}
+			else if (opcode == 0x06) // BLEZ
+			{
+				taken = signed_value <= 0;
+			}
+			else if (opcode == 0x07) // BGTZ
+			{
+				taken = signed_value > 0;
+			}
+			else
+			{
+				return false;
+			}
+
+			if (!taken)
+				return true;
+			return m_code.EmitMovImm32(HOST_TMP0, BranchTarget(pc, op)) &&
+				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
+				   EndBlockReturn(BlockExitKind::Direct);
+		}
 
 		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
 			!m_code.EmitCmpImm32(HOST_TMP0, 0))
@@ -2643,6 +3814,9 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitSignedBranchFlag(u32 op)
 	{
+		// PCSX2 owner: x86/iR3000Atables.cpp signed REGIMM/BLEZ/BGTZ lowering.
+		// Keep the same signed-zero predicate; known static branches also collapse
+		// the tail to one PC store/direct-link path, matching the EE A32 branch fold.
 		const unsigned opcode = op >> 26;
 		const unsigned rt = RT(op);
 		VitaA32::Condition taken = VitaA32::Condition::AL;
@@ -2676,8 +3850,41 @@ namespace VitaIOP
 		}
 
 		if (RS(op) == 0)
-			return m_code.EmitMovImm8(HOST_BRANCH_FLAG,
-				(taken == VitaA32::Condition::GE || taken == VitaA32::Condition::LE) ? 1 : 0);
+		{
+			m_static_branch_outcome_known = true;
+			m_static_branch_taken = taken == VitaA32::Condition::GE || taken == VitaA32::Condition::LE;
+			return true;
+		}
+
+		u32 known_value = 0;
+		if (TryGetKnownGpr(RS(op), &known_value))
+		{
+			const s32 signed_value = static_cast<s32>(known_value);
+			bool is_taken = false;
+			switch (taken)
+			{
+				case VitaA32::Condition::LT:
+					is_taken = signed_value < 0;
+					break;
+				case VitaA32::Condition::GE:
+					is_taken = signed_value >= 0;
+					break;
+				case VitaA32::Condition::LE:
+					is_taken = signed_value <= 0;
+					break;
+				case VitaA32::Condition::GT:
+					is_taken = signed_value > 0;
+					break;
+				default:
+					return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuIopConstSignedBranchFastPaths;
+#endif
+			m_static_branch_outcome_known = true;
+			m_static_branch_taken = is_taken;
+			return true;
+		}
 
 		return EmitLoadGpr(RS(op), HOST_TMP0) &&
 			   m_code.EmitCmpImm32(HOST_TMP0, 0) &&
@@ -2751,6 +3958,28 @@ namespace VitaIOP
 			{
 				return false;
 			}
+		}
+
+		u32 known_target = 0;
+		const bool known_jalr_self_link =
+			(op & 0x3f) == 0x09 && RD(op) != 0 && RD(op) == RS(op);
+		const bool known_target_available =
+			known_jalr_self_link || TryGetKnownGpr(RS(op), &known_target);
+		if (known_jalr_self_link)
+			known_target = pc + 8;
+
+		if (known_target_available && !IsIopSpecialBranchTarget(known_target))
+		{
+			// PCSX2 owners: R3000AInterpreter.cpp::psxJR()/psxJALR() and
+			// x86/iR3000Atables.cpp::rpsxJR()/rpsxJALR(). Constant JR/JALR
+			// targets can use the static direct-link tail after the delay slot,
+			// but special psxDoBranch() targets must keep their helper side effects.
+			m_register_jump_target_known = true;
+			m_register_jump_target = known_target;
+#if defined(VITASX2_QEMU_VALIDATION)
+			++g_qemuIopConstRegisterJumpFastPaths;
+#endif
+			return true;
 		}
 
 		if (!EmitLoadGpr(RS(op), HOST_REGISTER_JUMP_TARGET))
@@ -2920,8 +4149,17 @@ namespace VitaIOP
 	{
 		if (to_cop0)
 		{
-			return EmitLoadGpr(RT(op), HOST_TMP0) &&
-				   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp0Offset(RD(op))));
+			bool used_known_value = false;
+			if (!EmitLoadGprValue(RT(op), HOST_TMP0, &used_known_value) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp0Offset(RD(op)))))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (used_known_value)
+				++g_qemuIopConstCop0WriteFastPaths;
+#endif
+			return true;
 		}
 
 		if (RT(op) == 0)
@@ -3084,20 +4322,119 @@ namespace VitaIOP
 					   EmitStoreGpr(RT(op), HOST_TMP0);
 
 			case 0x04: // MTC2
-				return EmitLoadGpr(RT(op), HOST_TMP0) &&
-					   EmitWriteCop2DataReg(RD(op), HOST_TMP0);
+			{
+				bool used_known_value = false;
+				if (!EmitLoadGprValue(RT(op), HOST_TMP0, &used_known_value) ||
+					!EmitWriteCop2DataReg(RD(op), HOST_TMP0))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (used_known_value)
+					++g_qemuIopConstCop2WriteFastPaths;
+#endif
+				return true;
+			}
 
 			case 0x06: // CTC2
-				return EmitLoadGpr(RT(op), HOST_TMP0) &&
-					   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp2cOffset(RD(op))));
+			{
+				bool used_known_value = false;
+				if (!EmitLoadGprValue(RT(op), HOST_TMP0, &used_known_value) ||
+					!m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp2cOffset(RD(op)))))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (used_known_value)
+					++g_qemuIopConstCop2WriteFastPaths;
+#endif
+				return true;
+			}
 
 			default:
 				return false;
 		}
 	}
 
+	bool BlockCompiler::EmitKnownDirectRamCop2LoadOp(u32 op, u32 address)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIopConstRamCop2LoadFastPaths;
+#endif
+
+		const auto emit_load_word = [&]() -> bool {
+			if (address <= 0x0fffu)
+				return m_code.EmitLdrImm12(HOST_TMP0, HOST_IOP_RAM_BASE, static_cast<u16>(address));
+
+			return m_code.EmitMovImm32(HOST_TMP0, address) &&
+				   m_code.EmitLdrRegShift(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0,
+					   VitaA32::ShiftType::LSL, 0);
+		};
+
+		// PCSX2 owners: IopGte.cpp::gteLWC2()/MTC2() and
+		// IopMem.cpp::iopMemRead32(). A proven aligned main-RAM address can
+		// skip the runtime alias/MMIO split before applying MTC2 side effects.
+		return emit_load_word() && EmitWriteCop2DataReg(RT(op), HOST_TMP0);
+	}
+
+	bool BlockCompiler::EmitKnownDirectRamCop2StoreOp(u32 op, u32 address)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		++g_qemuIopConstRamCop2StoreFastPaths;
+#endif
+
+		const auto emit_store_word = [&]() -> bool {
+			if (address <= 0x0fffu)
+				return m_code.EmitStrImm12(HOST_SAVED0, HOST_IOP_RAM_BASE, static_cast<u16>(address));
+
+			return m_code.EmitMovImm32(HOST_TMP0, address) &&
+				   m_code.EmitStrRegShift(HOST_SAVED0, HOST_IOP_RAM_BASE, HOST_TMP0,
+					   VitaA32::ShiftType::LSL, 0);
+		};
+		const auto emit_clear_stored_word = [&]() -> bool {
+			return m_code.EmitMovImm32(HOST_TMP0, address & ~3u) &&
+				   m_code.EmitMovImm8(HOST_TMP1, 1) &&
+				   m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+					   static_cast<u32>(reinterpret_cast<uptr>(&psxCpu))) &&
+				   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 0) &&
+				   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
+					   static_cast<u16>(offsetof(R3000Acpu, Clear))) &&
+				   m_code.EmitBlx(HOST_CALL_SCRATCH);
+		};
+
+		// PCSX2 owners: IopGte.cpp::gteSWC2()/MFC2() and
+		// IopMem.cpp::iopMemWrite32(). Keep MFC2 synthesis, isolate-cache
+		// suppression, and code invalidation while skipping the runtime RAM
+		// address/mask path.
+		if (!EmitReadCop2DataReg(RT(op), HOST_SAVED0) ||
+			!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
+			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
+		{
+			return false;
+		}
+
+		const size_t isolated_skip = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (isolated_skip == static_cast<size_t>(-1) ||
+			!emit_store_word() ||
+			!emit_clear_stored_word())
+		{
+			return false;
+		}
+
+		return m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE);
+	}
+
 	bool BlockCompiler::EmitCop2LoadStoreOp(u32 op)
 	{
+		u32 known_ram_address = 0;
+		if (TryKnownDirectIopRamAddress(op, 3, &known_ram_address))
+		{
+			if ((op >> 26) == 0x32) // LWC2
+				return EmitKnownDirectRamCop2LoadOp(op, known_ram_address);
+			if ((op >> 26) == 0x3a) // SWC2
+				return EmitKnownDirectRamCop2StoreOp(op, known_ram_address);
+		}
+
 		if ((op >> 26) == 0x32) // LWC2
 		{
 			if (!EmitEffectiveAddress(op) ||
@@ -3218,15 +4555,59 @@ namespace VitaIOP
 			case 0x0d: // BREAK
 				return EmitExceptionOp(pc, 0x24);
 			case 0x10: // MFHI
+			{
+				u32 known_hi = 0;
+				if (RD(op) != 0 && TryGetKnownHiLo(false, &known_hi))
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					++g_qemuIopConstHiLoReadFastPaths;
+#endif
+					return m_code.EmitMovImm32(HOST_TMP0, known_hi) &&
+						   EmitStoreGpr(RD(op), HOST_TMP0);
+				}
 				return EmitMoveGpr(RD(op), 32);
+			}
 			case 0x11: // MTHI
-				return EmitLoadGpr(RS(op), HOST_TMP0) &&
-					   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET));
+			{
+				bool used_known_value = false;
+				if (!EmitLoadGprValue(RS(op), HOST_TMP0, &used_known_value) ||
+					!m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(HI_OFFSET)))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (used_known_value)
+					++g_qemuIopConstHiLoWriteFastPaths;
+#endif
+				return true;
+			}
 			case 0x12: // MFLO
+			{
+				u32 known_lo = 0;
+				if (RD(op) != 0 && TryGetKnownHiLo(true, &known_lo))
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					++g_qemuIopConstHiLoReadFastPaths;
+#endif
+					return m_code.EmitMovImm32(HOST_TMP0, known_lo) &&
+						   EmitStoreGpr(RD(op), HOST_TMP0);
+				}
 				return EmitMoveGpr(RD(op), 33);
+			}
 			case 0x13: // MTLO
-				return EmitLoadGpr(RS(op), HOST_TMP0) &&
-					   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET));
+			{
+				bool used_known_value = false;
+				if (!EmitLoadGprValue(RS(op), HOST_TMP0, &used_known_value) ||
+					!m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(LO_OFFSET)))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (used_known_value)
+					++g_qemuIopConstHiLoWriteFastPaths;
+#endif
+				return true;
+			}
 			case 0x18: // MULT
 				return EmitMultiplyOp(op, true);
 			case 0x19: // MULTU
@@ -3341,6 +4722,7 @@ namespace VitaIOP
 		if (!IsNativeOpcode(op) || !EmitNativeInstruction(op, pc))
 			return false;
 
+		UpdateGprConstStateAfterOpcode(op, pc);
 		m_native_instruction_count++;
 		return true;
 	}
@@ -3360,16 +4742,29 @@ namespace VitaIOP
 
 		m_iop_ram_registers_available = false;
 		m_iop_ram_mask_register_available = false;
+		m_static_branch_outcome_known = false;
+		m_static_branch_taken = false;
+		m_register_jump_target_known = false;
+		m_register_jump_target = 0;
+		ResetGprConstState();
 		for (u32 i = 0; i < instruction_count; i++)
 		{
-			const u32 op = iopMemRead32(start_pc + i * 4);
+			const u32 pc = start_pc + i * 4;
+			const u32 op = iopMemRead32(pc);
 			if (UsesDirectIopRamFastPath(op))
 			{
 				m_iop_ram_registers_available = true;
-				if (!IsKnownDirectIopRamFastPath(op))
+				const u8 alignment_mask = DirectIopRamAlignmentMask(op);
+				u32 known_address = 0;
+				const bool known_direct =
+					CanEmitKnownDirectIopRamFastPath(op) &&
+					TryKnownDirectIopRamAddress(op, alignment_mask, &known_address);
+				if (!known_direct)
 					m_iop_ram_mask_register_available = true;
 			}
+			UpdateGprConstStateAfterOpcode(op, pc);
 		}
+		ResetGprConstState();
 		m_emit_trace_checks = VitaIsIopPreInstructionTraceEnabled();
 		m_defer_cycle_updates = !m_emit_trace_checks && IopBlockCanDeferCycleUpdates(start_pc, instruction_count);
 
@@ -3461,34 +4856,61 @@ namespace VitaIOP
 
 		if (has_native_static_branch)
 		{
-			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+			if (m_static_branch_outcome_known)
 			{
-				return false;
+				const u32 target_pc = m_static_branch_taken ? static_branch_target_pc : static_branch_fallthrough_pc;
+				const u8 link_slot = m_static_branch_taken ? 1 : 0;
+#if defined(VITASX2_QEMU_VALIDATION)
+				++g_qemuIopConstStaticBranchTailFastPaths;
+#endif
+				if (!EmitStorePc(target_pc))
+					return false;
+
+				if (m_static_branch_taken &&
+					(!EmitIopEventTestFastPath() ||
+						!EmitPcChangedExitCheck(target_pc, direct_exit_branches)))
+				{
+					return false;
+				}
+
+				if (!emit_direct_or_return_tail(target_pc, link_slot))
+					return false;
+
+				direct_exit_offset = m_code.Size();
+				if (!EndBlockReturn(BlockExitKind::Direct, false))
+					return false;
 			}
-
-			const size_t taken_path = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-			if (taken_path == static_cast<size_t>(-1))
-				return false;
-
-			if (!EmitStorePc(static_branch_fallthrough_pc) ||
-				!emit_direct_or_return_tail(static_branch_fallthrough_pc, 0))
+			else
 			{
-				return false;
-			}
+				if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+				{
+					return false;
+				}
 
-			const size_t taken_path_target = m_code.Size();
-			if (!m_code.PatchBranch(taken_path, taken_path_target, VitaA32::Condition::NE) ||
-				!EmitStorePc(static_branch_target_pc) ||
-				!EmitIopEventTestFastPath() ||
-				!EmitPcChangedExitCheck(static_branch_target_pc, direct_exit_branches) ||
-				!emit_direct_or_return_tail(static_branch_target_pc, 1))
-			{
-				return false;
-			}
+				const size_t taken_path = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+				if (taken_path == static_cast<size_t>(-1))
+					return false;
 
-			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct, false))
-				return false;
+				if (!EmitStorePc(static_branch_fallthrough_pc) ||
+					!emit_direct_or_return_tail(static_branch_fallthrough_pc, 0))
+				{
+					return false;
+				}
+
+				const size_t taken_path_target = m_code.Size();
+				if (!m_code.PatchBranch(taken_path, taken_path_target, VitaA32::Condition::NE) ||
+					!EmitStorePc(static_branch_target_pc) ||
+					!EmitIopEventTestFastPath() ||
+					!EmitPcChangedExitCheck(static_branch_target_pc, direct_exit_branches) ||
+					!emit_direct_or_return_tail(static_branch_target_pc, 1))
+				{
+					return false;
+				}
+
+				direct_exit_offset = m_code.Size();
+				if (!EndBlockReturn(BlockExitKind::Direct, false))
+					return false;
+			}
 		}
 		else if (has_native_static_jump)
 		{
@@ -3519,12 +4941,38 @@ namespace VitaIOP
 		}
 		else if (has_native_register_jump)
 		{
-			if (!EmitStorePcReg(HOST_REGISTER_JUMP_TARGET) ||
-				!EmitIopEventTestFastPath() ||
-				!EmitPcChangedExitCheckReg(HOST_REGISTER_JUMP_TARGET, direct_exit_branches) ||
-				!EndBlockReturn(BlockExitKind::Direct))
+			if (m_register_jump_target_known)
 			{
-				return false;
+				if (!EmitStorePc(m_register_jump_target) ||
+					!EmitIopEventTestFastPath() ||
+					!EmitPcChangedExitCheck(m_register_jump_target, direct_exit_branches))
+				{
+					return false;
+				}
+
+				if (direct_exit && direct_links)
+				{
+					DirectLinkSlot& link = direct_links->slots[0];
+					if (!EndBlockDirectTail(direct_exit, &link))
+						return false;
+
+					link.target_pc = m_register_jump_target;
+					link.valid = true;
+				}
+				else if (!EndBlockReturn(BlockExitKind::Direct))
+				{
+					return false;
+				}
+			}
+			else
+			{
+				if (!EmitStorePcReg(HOST_REGISTER_JUMP_TARGET) ||
+					!EmitIopEventTestFastPath() ||
+					!EmitPcChangedExitCheckReg(HOST_REGISTER_JUMP_TARGET, direct_exit_branches) ||
+					!EndBlockReturn(BlockExitKind::Direct))
+				{
+					return false;
+				}
 			}
 
 			direct_exit_offset = m_code.Size();

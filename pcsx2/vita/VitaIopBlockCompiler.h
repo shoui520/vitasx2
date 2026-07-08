@@ -80,6 +80,16 @@ namespace VitaIOP
 		bool EmitNativeCOP2(u32 op);
 		bool EmitStoreCode(u32 op);
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
+		void ResetGprConstState();
+		bool TryGetKnownGpr(unsigned guest_reg, u32* value) const;
+		void SetKnownGpr(unsigned guest_reg, u32 value);
+		void ClearKnownGpr(unsigned guest_reg);
+		bool TryGetKnownHiLo(bool lo, u32* value) const;
+		void SetKnownHiLo(bool lo, u32 value);
+		void ClearKnownHiLo(bool lo);
+		void ClearKnownHiLo();
+		void UpdateGprConstStateAfterOpcode(u32 op, u32 pc);
+		bool TryKnownDirectIopRamAddress(u32 op, u8 alignment_mask, u32* address) const;
 		bool EmitStorePc(u32 pc);
 		bool EmitStorePcReg(unsigned host_reg);
 		bool EmitAddCycles(u32 cycles);
@@ -89,6 +99,7 @@ namespace VitaIOP
 		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches);
 		bool EmitLoadGpr(unsigned guest_reg, unsigned host_reg);
+		bool EmitLoadGprValue(unsigned guest_reg, unsigned host_reg, bool* used_known_value);
 		bool EmitStoreGpr(unsigned guest_reg, unsigned host_reg);
 		bool EmitStoreGprZero(unsigned guest_reg);
 		bool EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg);
@@ -126,6 +137,8 @@ namespace VitaIOP
 		bool EmitReadCop2DataReg(unsigned cop2_reg, unsigned host_reg);
 		bool EmitWriteCop2DataReg(unsigned cop2_reg, unsigned host_reg);
 		bool EmitCop2LoadStoreOp(u32 op);
+		bool EmitKnownDirectRamCop2LoadOp(u32 op, u32 address);
+		bool EmitKnownDirectRamCop2StoreOp(u32 op, u32 address);
 		bool FlushColdTails();
 
 		struct ScalarLoadColdTail
@@ -203,6 +216,14 @@ namespace VitaIOP
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_jump = false;
 		bool m_emit_native_register_jump = false;
+		bool m_static_branch_outcome_known = false;
+		bool m_static_branch_taken = false;
+		bool m_register_jump_target_known = false;
+		u32 m_register_jump_target = 0;
+		std::array<u32, 32> m_gpr_const_values{};
+		u32 m_gpr_const_known_mask = 1;
+		std::array<u32, 2> m_hilo_const_values{};
+		u8 m_hilo_const_known_mask = 0;
 	};
 
 	class BlockExecutor

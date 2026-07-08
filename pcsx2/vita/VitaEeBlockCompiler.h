@@ -579,6 +579,9 @@ namespace VitaEE
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGprLowRawZero(unsigned guest_reg, unsigned host_reg);
 		bool EmitGprLowOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host);
+		bool EmitLoadGprLowKnownValue(unsigned guest_reg, unsigned host_reg, bool value_known, u32 value);
+		bool EmitLoadGprLowValue(unsigned guest_reg, unsigned host_reg);
+		bool EmitGprLowValueOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host);
 		bool EmitRefreshGprPinFromBacking(unsigned guest_reg);
 		bool TryEmitLoadGprWordFromQCache(unsigned guest_reg, unsigned word, unsigned host_reg,
 			bool* emitted);
@@ -586,6 +589,11 @@ namespace VitaEE
 		bool EmitGprWordOperand(unsigned guest_reg, unsigned word, unsigned fallback_host,
 			unsigned* operand_host);
 		bool EmitGpr64OperandLow(unsigned guest_reg, unsigned fallback_low, unsigned host_high,
+			unsigned* low_operand_host);
+		bool EmitLoadGpr64KnownValue(unsigned guest_reg, unsigned host_low, unsigned host_high,
+			bool value_known, u32 low, u32 high);
+		bool EmitLoadGpr64Value(unsigned guest_reg, unsigned host_low, unsigned host_high);
+		bool EmitGpr64ValueOperandLow(unsigned guest_reg, unsigned fallback_low, unsigned host_high,
 			unsigned* low_operand_host);
 		bool EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
@@ -631,7 +639,12 @@ namespace VitaEE
 			const void* write_helper = nullptr;
 			unsigned rt = 0;
 			ScalarStoreWidth width = ScalarStoreWidth::Byte;
+			bool rt_low_known = false;
+			bool rt_high_known = false;
+			u32 rt_low = 0;
+			u32 rt_high = 0;
 		};
+		void CaptureScalarStoreValue(ScalarStoreColdTail* tail);
 		bool EmitScalarStoreColdTail(const ScalarStoreColdTail& tail);
 
 		struct QwordLoadColdTail
