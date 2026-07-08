@@ -87,6 +87,7 @@ u32 g_qemuCop2QwordZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroStoreFastPaths = 0;
 u32 g_qemuCop2Vf0ConstantTransferFastPaths = 0;
 u32 g_qemuCop2ControlKnownSourceFastPaths = 0;
+u32 g_qemuVu0BaseRegisterBlocks = 0;
 u32 g_qemuGprPartialStoreValueFastPaths = 0;
 u32 g_qemuPartialWordFullLoadFastPaths = 0;
 u32 g_qemuPartialWordFullStoreFastPaths = 0;
@@ -1422,7 +1423,7 @@ namespace VitaEE
 			{
 				switch ((op >> 21) & 0x1f)
 				{
-					case 0x01: // QMFC2 reads VF when rt is writable.
+					case 0x01: // QMFC2 checks VU0 run state and reads VF when rt is writable.
 						return RT(op) != 0 ? 1 : 0;
 					case 0x05: // QMTC2 writes VF when fs is writable.
 						return RD(op) != 0 ? 1 : 0;
@@ -1486,8 +1487,8 @@ namespace VitaEE
 			{
 				case 0x36: // LQC2 checks VU0 run state and may write VF.
 					return RT(op) != 0 ? 2 : 1;
-				case 0x3e: // SQC2 checks VU0 run state and reads VF.
-					return 2;
+				case 0x3e: // SQC2 checks VU0 run state and reads VF unless storing constant VF0.
+					return RT(op) != 0 ? 2 : 1;
 				default:
 					return 0;
 			}
@@ -4413,10 +4414,15 @@ namespace VitaEE
 			return false;
 		}
 
-		if (use_vu0_base_register &&
-			!m_code.EmitMovImm32(HOST_VU0_BASE, static_cast<u32>(reinterpret_cast<uptr>(&VU0))))
+		if (use_vu0_base_register)
 		{
-			return false;
+			// PCSX2 owner: VU0.cpp's singleton VU0 state. This is only worth a
+			// callee-saved register when the block really addresses VU0 state.
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuVu0BaseRegisterBlocks++;
+#endif
+			if (!m_code.EmitMovImm32(HOST_VU0_BASE, static_cast<u32>(reinterpret_cast<uptr>(&VU0))))
+				return false;
 		}
 
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() read
