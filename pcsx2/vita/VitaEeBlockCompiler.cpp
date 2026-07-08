@@ -4319,6 +4319,7 @@ namespace VitaEE
 		ClearGprQCache();
 		ClearGprConstState();
 		ClearCop1NormalizedState();
+		m_cop2_norm_consts_ready = false;
 		for (unsigned i = 0; i < MAX_GPR_PINS; i++)
 		{
 			m_pin_dirty_low[i] = false;
@@ -6791,6 +6792,21 @@ namespace VitaEE
 				   m_code.EmitVdupI32QFromCore(NQ_MAXF, HOST_TMP1);
 		};
 
+		// Materializes the constants once per block. Q8-Q15 are exclusive to this
+		// normalize scratch, so once the constants are in Q8-Q11 a later COP2
+		// arithmetic/outer op in the same straight-line block reuses them instead
+		// of re-emitting the 5-7 constant instructions. m_cop2_norm_consts_ready
+		// is reset in BeginBlock(), so the first COP2 op in every block always
+		// materializes.
+		const auto emit_ensure_norm_consts = [&]() {
+			if (m_cop2_norm_consts_ready)
+				return true;
+			if (!emit_materialize_norm_consts())
+				return false;
+			m_cop2_norm_consts_ready = true;
+			return true;
+		};
+
 		// NEON-quad vuDouble() over all four lanes of vq. Bit-identical to the
 		// scalar emit_normalize_vu_float_word() but branchless and NEON-only:
 		// denormals (exp 0) flush to signed zero; with the overflow clamp,
@@ -6834,7 +6850,7 @@ namespace VitaEE
 				(uses_acc_source &&
 					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
 						!m_code.EmitVld1Q32Aligned(QUAD_ACC, HOST_TMP0))) ||
-				!emit_materialize_norm_consts() ||
+				!emit_ensure_norm_consts() ||
 				!emit_normalize_quad(QUAD_FS) ||
 				!emit_normalize_quad(QUAD_FT) ||
 				(uses_acc_source && !emit_normalize_quad(QUAD_ACC)))
@@ -6923,7 +6939,7 @@ namespace VitaEE
 				(opmsub &&
 					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
 						!m_code.EmitVld1Q32Aligned(QUAD_ACC_OUTER, HOST_TMP0))) ||
-				!emit_materialize_norm_consts() ||
+				!emit_ensure_norm_consts() ||
 				!emit_normalize_quad(QUAD_FS_OUTER) ||
 				!emit_normalize_quad(QUAD_FT_OUTER) ||
 				(opmsub && !emit_normalize_quad(QUAD_ACC_OUTER)))

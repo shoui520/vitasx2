@@ -735,6 +735,13 @@ namespace VitaEE
 		u32 m_gpr_const_high[32]{};
 		bool m_cop1_fpr_normalized[32]{};
 		bool m_cop1_acc_normalized = false;
+		// True once the vuDouble() bit-select constant quads (Q8-Q11) have been
+		// materialized in this block. Q8-Q15 are used exclusively by the COP2
+		// macro normalize scratch (the GPR-Q cache only claims Q0-Q3, and only on
+		// all-MMI blocks), so the constants survive across intervening ops and
+		// later COP2 arithmetic/outer ops in the same block can skip re-loading
+		// them. Reset per block in BeginBlock().
+		bool m_cop2_norm_consts_ready = false;
 		bool m_gpr_q_cache_enabled = false;
 		u8 m_gpr_q_cache_guest[4]{};
 		u8 m_gpr_q_cache_qreg[4]{};
