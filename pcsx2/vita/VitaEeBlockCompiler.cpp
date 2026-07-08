@@ -90,6 +90,7 @@ u32 g_qemuCop2RawGpr0Qmtc2ZeroFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheFastPaths = 0;
 u32 g_qemuCop2ControlKnownSourceFastPaths = 0;
 u32 g_qemuVu0BaseRegisterBlocks = 0;
+u32 g_qemuVu0ClipflagBaseAddressFastPaths = 0;
 u32 g_qemuGprPartialStoreValueFastPaths = 0;
 u32 g_qemuPartialWordFullLoadFastPaths = 0;
 u32 g_qemuPartialWordFullStoreFastPaths = 0;
@@ -194,6 +195,7 @@ namespace VitaEE
 		constexpr size_t VU0_Q_OFFSET = offsetof(Vu0State, q);
 		constexpr size_t VU0_MACFLAG_OFFSET = offsetof(Vu0State, macflag);
 		constexpr size_t VU0_STATUSFLAG_OFFSET = offsetof(Vu0State, statusflag);
+		constexpr size_t VU0_CLIPFLAG_OFFSET = offsetof(Vu0State, clipflag);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		constexpr size_t VU0_MEM_OFFSET = offsetof(Vu0State, Mem);
 		constexpr size_t VU0_CODE_OFFSET = offsetof(Vu0State, code);
@@ -2145,6 +2147,7 @@ namespace VitaEE
 	static_assert(TLB_ENTRY_LO1_OFFSET == 12);
 	static_assert(VU0_VF_OFFSET == 0);
 	static_assert(VU0_VI_OFFSET + VU0_VI_STRIDE * 32 <= 0x0fff);
+	static_assert(VU0_CLIPFLAG_OFFSET + sizeof(u32) <= 0x0fff);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 	static_assert(VU0_MEM_OFFSET <= 0x0fff);
 #endif
@@ -6369,7 +6372,7 @@ namespace VitaEE
 
 			case VU0_REG_CLIP_FLAG:
 				if (!EmitLoadGprLowRawZero(rt, HOST_TMP1) ||
-					!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(reinterpret_cast<uptr>(&VU0.clipflag))) ||
+					!EmitVu0ClipflagAddress(HOST_TMP0) ||
 					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
 					!EmitVu0ViAddress(HOST_TMP0, fs) ||
 					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
@@ -7721,7 +7724,7 @@ namespace VitaEE
 			return false;
 		}
 
-		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(reinterpret_cast<uptr>(&VU0.clipflag))) &&
+		return EmitVu0ClipflagAddress(HOST_TMP0) &&
 			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
 			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 6) &&
 			   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) &&
@@ -19330,6 +19333,24 @@ namespace VitaEE
 
 		return m_code.EmitMovImm32(host_reg,
 			static_cast<u32>(reinterpret_cast<uptr>(&VU0)) + static_cast<u32>(offset));
+	}
+
+	bool BlockCompiler::EmitVu0ClipflagAddress(unsigned host_reg)
+	{
+		// PCSX2 owner: VU.h::VURegs keeps clipflag in the VU0 singleton beside
+		// the VI mirror. Repeated VCLIP/CTC2 blocks should reuse the resident
+		// VU0 base instead of re-materializing this absolute side-field address.
+		if (m_vu0_base_available &&
+			m_code.EmitAddImm32(host_reg, HOST_VU0_BASE, static_cast<u32>(VU0_CLIPFLAG_OFFSET)))
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuVu0ClipflagBaseAddressFastPaths++;
+#endif
+			return true;
+		}
+
+		return m_code.EmitMovImm32(host_reg,
+			static_cast<u32>(reinterpret_cast<uptr>(&VU0)) + static_cast<u32>(VU0_CLIPFLAG_OFFSET));
 	}
 
 	bool BlockCompiler::EmitVu0Vf0ConstantQ(unsigned qreg, unsigned host_scratch)

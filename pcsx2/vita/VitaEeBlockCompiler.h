@@ -569,6 +569,7 @@ namespace VitaEE
 		bool EmitRefreshRawGpr0KnownZeroFromLow64(unsigned low_reg, unsigned high_reg);
 		bool EmitVu0SyncIfRunning(unsigned preserve_reg = 16, unsigned save_reg = 16);
 		bool EmitVu0RegisterAddress(unsigned host_reg, size_t offset);
+		bool EmitVu0ClipflagAddress(unsigned host_reg);
 		bool EmitVu0Vf0ConstantQ(unsigned qreg, unsigned host_scratch);
 		bool EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg);
 		bool EmitVu0ViAddress(unsigned host_reg, unsigned vi_reg);
