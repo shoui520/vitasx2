@@ -81,6 +81,7 @@ u32 g_qemuGprDirtyPinFlushStores = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
+u32 g_qemuGprConstHighWordLoadFastPaths = 0;
 u32 g_qemuScalarZeroLoadSkips = 0;
 u32 g_qemuPartialZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroLoadSkips = 0;
@@ -19741,6 +19742,15 @@ namespace VitaEE
 #endif
 			return m_code.EmitMovRegShiftImm(host_reg, static_cast<unsigned>(high_pin_host),
 				VitaA32::ShiftType::LSL, 0);
+		}
+
+		u32 high_value = 0;
+		if (TryGetKnownGpr64(guest_reg, nullptr, &high_value))
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprConstHighWordLoadFastPaths++;
+#endif
+			return m_code.EmitMovImm32(host_reg, high_value);
 		}
 
 		bool qcache_loaded = false;
