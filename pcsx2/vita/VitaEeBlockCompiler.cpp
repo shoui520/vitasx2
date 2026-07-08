@@ -86,6 +86,7 @@ u32 g_qemuPartialZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroStoreFastPaths = 0;
 u32 g_qemuCop2Vf0ConstantTransferFastPaths = 0;
+u32 g_qemuCop2RawGpr0Qmtc2ZeroFastPaths = 0;
 u32 g_qemuCop2ControlKnownSourceFastPaths = 0;
 u32 g_qemuVu0BaseRegisterBlocks = 0;
 u32 g_qemuGprPartialStoreValueFastPaths = 0;
@@ -6191,11 +6192,57 @@ namespace VitaEE
 				}
 				break;
 			case 0x05: // QMTC2
-				if (fs != 0 &&
-					(InvalidateGprQCacheForQreg(NEON_VALUE),
-					 !EmitLoadCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP0) ||
-					 !EmitVu0VfAddress(HOST_TMP1, fs) ||
-					 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1)))
+				if (fs == 0)
+					break;
+
+				InvalidateGprQCacheForQreg(NEON_VALUE);
+				if (!EmitVu0VfAddress(HOST_TMP1, fs))
+				{
+					return false;
+				}
+
+				if (rt == 0)
+				{
+					// PCSX2 owner: VU0.cpp::QMTC2() reads raw GPR[0], not the
+					// architectural zero register. The executor keeps this flag
+					// exact; use it to avoid a 128-bit cpuRegs load on the common
+					// raw-zero path and fall back to the raw backing slot otherwise.
+					if (!EmitLoadRawGpr0KnownZeroFlag(HOST_TMP0) ||
+						!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, 0, true))
+					{
+						return false;
+					}
+
+					const size_t raw_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+					if (raw_fallback == static_cast<size_t>(-1))
+						return false;
+
+					if (!m_code.EmitVeorQ(NEON_VALUE, NEON_VALUE, NEON_VALUE) ||
+						!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1))
+					{
+						return false;
+					}
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuCop2RawGpr0Qmtc2ZeroFastPaths++;
+#endif
+
+					const size_t zero_done = m_code.EmitBranchPlaceholder();
+					if (zero_done == static_cast<size_t>(-1))
+						return false;
+
+					const size_t raw_fallback_target = m_code.Size();
+					if (!m_code.PatchBranch(raw_fallback, raw_fallback_target, VitaA32::Condition::EQ) ||
+						!EmitLoadCpuRegsQ128(GprOffset(0), NEON_VALUE, HOST_TMP0) ||
+						!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1) ||
+						!m_code.PatchBranch(zero_done, m_code.Size()))
+					{
+						return false;
+					}
+					break;
+				}
+
+				if (!EmitLoadCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP0) ||
+					!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP1))
 				{
 					return false;
 				}
