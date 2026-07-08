@@ -168,10 +168,11 @@ namespace VitaEE
 		bool EndBlockReturn(u8 value);
 		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
 			DirectLinkSlot* direct_link = nullptr, DirectLinkSlot* taken_link = nullptr,
-			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr);
+			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
+			bool wait_loop_taken = false);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
 			const void* event_exit, DirectLinkSlot* not_taken_link = nullptr,
-			DirectLinkSlot* taken_link = nullptr);
+			DirectLinkSlot* taken_link = nullptr, bool wait_loop_taken = false);
 		static bool RequiresBlockEndAfterOpcode(u32 op);
 
 	private:
@@ -184,6 +185,9 @@ namespace VitaEE
 		bool EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link);
 		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag);
 		bool EmitEventExitReturn(const void* event_exit);
+		static bool IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc);
+		bool EmitWaitLoopFastForwardTail(const void* event_exit);
+		bool EndBlockWithWaitLoopFastForward(u32 block_cycles, const void* event_exit);
 		bool EmitSPECIAL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, bool branch_delay_slot);
 		bool EmitCOP0(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);

@@ -82,6 +82,7 @@ u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
 u32 g_qemuGprConstHighWordLoadFastPaths = 0;
+u32 g_qemuWaitLoopFastForwardBlocks = 0;
 u32 g_qemuScalarZeroLoadSkips = 0;
 u32 g_qemuPartialZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroLoadSkips = 0;
@@ -4912,6 +4913,23 @@ namespace VitaEE
 		if (scaled_cycles)
 			*scaled_cycles = committed_scaled_cycles + block_cycles;
 
+		// PCSX2 owners: x86/ix86-32/iR5900.cpp::recRecompile() StartRecomp
+		// s_nBlockFF analysis plus iBranchTest()'s WaitLoop fast-forward.
+		// A backwards loop branch whose guest body repeats identically until an
+		// event runs charges this block's cycles, jumps cpuRegs.cycle to
+		// nextEventCycle, and exits through the event tail instead of spinning
+		// natively. The loop head may sit in earlier A32 blocks (counter-read
+		// loads split blocks here, unlike PCSX2's x86 blocks), so the scan
+		// covers [taken target, block end). Goemon's physical direct-link
+		// targets are excluded so the virtual target compare stays exact.
+		const bool wait_loop_body = EmuConfig.Speedhacks.WaitLoop &&
+			!EmuConfig.Gamefixes.GoemonTlbHack &&
+			has_branch && !has_register_branch_target &&
+			branch_instruction_index + 2 == instruction_count &&
+			branch_target_pc <= start_pc &&
+			IsWaitLoopBody(branch_target_pc, next_pc,
+				start_pc + branch_instruction_index * 4);
+
 		// Matches the fall-through/branch writeback in x86/ix86-32/iR5900.cpp,
 		// after compiling either a non-branching block or a branch plus delay slot.
 		if (has_branch)
@@ -4936,14 +4954,27 @@ namespace VitaEE
 			return false;
 		}
 
+		// A statically-taken loop branch (J/JAL back to the loop head, or a
+		// collapsed constant branch whose taken target is the loop head)
+		// fast-forwards the whole exit; PCSX2's SetBranchImm(s_branchTo) tail
+		// does the same. A collapsed known-not-taken branch links to pc + 8
+		// instead of the taken target, so it never matches here.
+		if (has_branch && has_static_direct_link_target &&
+			static_direct_link_target_pc == branch_target_pc && wait_loop_body)
+		{
+			return EndBlockWithWaitLoopFastForward(block_cycles, event_exit) && FlushColdTails();
+		}
+
 		if (has_branch && branch_is_likely)
 		{
+			const bool wait_loop_taken = wait_loop_body && has_static_likely_direct_links;
 			DirectLinkSlot* const not_taken_link =
 				(direct_links && has_static_likely_direct_links) ? &direct_links->slots[0] : nullptr;
 			DirectLinkSlot* const taken_link =
-				(direct_links && has_static_likely_direct_links) ? &direct_links->slots[1] : nullptr;
+				(direct_links && has_static_likely_direct_links && !wait_loop_taken) ?
+					&direct_links->slots[1] : nullptr;
 			if (!EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit,
-					not_taken_link, taken_link))
+					not_taken_link, taken_link, wait_loop_taken))
 			{
 				return false;
 			}
@@ -4956,8 +4987,11 @@ namespace VitaEE
 				direct_links->slots[0].target_pc = next_pc;
 				direct_links->slots[0].valid = true;
 
-				direct_links->slots[1].target_pc = branch_target_pc;
-				direct_links->slots[1].valid = true;
+				if (!wait_loop_taken)
+				{
+					direct_links->slots[1].target_pc = branch_target_pc;
+					direct_links->slots[1].valid = true;
+				}
 			}
 
 			return true;
@@ -4965,14 +4999,17 @@ namespace VitaEE
 
 			const bool can_direct_link = !has_branch || has_static_direct_link_target ||
 									 has_static_conditional_direct_links;
+		const bool wait_loop_taken = wait_loop_body && has_static_conditional_direct_links;
 		DirectLinkSlot* const direct_link =
 			(direct_links && can_direct_link) ? &direct_links->slots[0] : nullptr;
 		DirectLinkSlot* const taken_link =
-			(direct_links && has_static_conditional_direct_links) ? &direct_links->slots[1] : nullptr;
+			(direct_links && has_static_conditional_direct_links && !wait_loop_taken) ?
+				&direct_links->slots[1] : nullptr;
 		if (!EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
 				direct_link, taken_link,
 				has_register_branch_target ? indirect_lookup_pages_slot : nullptr,
-				has_register_branch_target ? direct_linking_enabled_flag : nullptr))
+				has_register_branch_target ? direct_linking_enabled_flag : nullptr,
+				wait_loop_taken))
 		{
 			return false;
 		}
@@ -4985,7 +5022,7 @@ namespace VitaEE
 			direct_links->slots[0].target_pc = has_static_direct_link_target ? static_direct_link_target_pc : next_pc;
 			direct_links->slots[0].valid = true;
 
-			if (has_static_conditional_direct_links)
+			if (has_static_conditional_direct_links && !wait_loop_taken)
 			{
 				direct_links->slots[1].target_pc = branch_target_pc;
 				direct_links->slots[1].valid = true;
@@ -5201,15 +5238,169 @@ namespace VitaEE
 			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
+	bool BlockCompiler::IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc)
+	{
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile() StartRecomp scan
+		// for s_nBlockFF. A self-branching loop whose body never writes a
+		// register it already read (except registers refreshed from constants,
+		// memory loads, or COP moves each iteration) repeats identically until
+		// an event runs, so the taken exit may fast-forward to nextEventCycle.
+		// PCSX2 scans [startpc, s_nEndBlock); here the loop head may live in
+		// earlier blocks because counter-read loads split A32 blocks, so the
+		// scan walks the whole guest loop range and skips only the loop branch.
+		constexpr u32 MAX_WAIT_LOOP_BYTES = 128 * 4;
+		if (loop_start_pc >= loop_end_pc || (loop_start_pc & 3u) != 0 ||
+			loop_end_pc - loop_start_pc > MAX_WAIT_LOOP_BYTES)
+		{
+			return false;
+		}
+
+		u32 reads = 0;
+		u32 loads = 1;
+		for (u32 i = loop_start_pc; i < loop_end_pc; i += 4)
+		{
+			if (i == branch_pc)
+				continue;
+
+			const u32 code = memRead32(i);
+			const u32 opcode = code >> 26;
+			const u32 rs = (code >> 21) & 0x1f;
+			const u32 rt = (code >> 16) & 0x1f;
+			const u32 rd = (code >> 11) & 0x1f;
+			const u32 funct = code & 0x3f;
+
+			if (code == 0)
+				continue;
+
+			if (opcode == 0x2f || (opcode == 0 && funct == 0x0f))
+				continue; // CACHE, SYNC
+
+			if ((opcode & 0x38) == 0x08 || (opcode & 0x3e) == 0x18)
+			{
+				// ADDI..LUI immediates plus DADDI/DADDIU.
+				if (loads & (1u << rs))
+				{
+					loads |= 1u << rt;
+					continue;
+				}
+				reads |= 1u << rs;
+				if (reads & (1u << rt))
+					return false;
+			}
+			else if (opcode == 0 && (funct & 0x30) == 0x20 && (funct & 0x3e) != 0x28)
+			{
+				// ADD..NOR and SLT..DSUBU register arithmetic.
+				if ((loads & (1u << rs)) && (loads & (1u << rt)))
+				{
+					loads |= 1u << rd;
+					continue;
+				}
+				reads |= (1u << rs) | (1u << rt);
+				if (reads & (1u << rd))
+					return false;
+			}
+			else if ((opcode & 0x38) == 0x20 || (opcode & 0x3e) == 0x1a || opcode == 0x37)
+			{
+				// LB..LWU byte/word loads plus LDL/LDR and LD.
+				if (loads & (1u << rs))
+				{
+					loads |= 1u << rt;
+					continue;
+				}
+				reads |= 1u << rs;
+				if (reads & (1u << rt))
+					return false;
+			}
+			else if ((opcode & 0x3c) == 0x10 && rs < 4)
+			{
+				loads |= 1u << rt; // MFC*/DMFC*/CFC* refresh rt every iteration.
+			}
+			else
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitWaitLoopFastForwardTail(const void* event_exit)
+	{
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest() WaitLoop form:
+		// cycle = max(cycle + block cycles, nextEventCycle), then dispatch
+		// through the event path. Callers reach this tail with HOST_TMP0
+		// holding the freshly stored cycle low word and HOST_TMP2 holding the
+		// nextEventCycle low word after an MI (cycle < nextEventCycle)
+		// compare, so the max reduces to copying nextEventCycle into cycle.
+		// The u64 high word copy is exact under the bounded signed windows of
+		// R5900.cpp::cpuSetNextEvent() / cpuTestCycle().
+		constexpr u16 cycle_high_offset = static_cast<u16>(CYCLE_OFFSET + sizeof(u32));
+		constexpr u16 next_event_high_offset = static_cast<u16>(NEXT_EVENT_OFFSET + sizeof(u32));
+		if (!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, next_event_high_offset) ||
+			!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, cycle_high_offset))
+		{
+			return false;
+		}
+
+		return EmitEventExitReturn(event_exit);
+	}
+
+	bool BlockCompiler::EndBlockWithWaitLoopFastForward(u32 block_cycles, const void* event_exit)
+	{
+		if (!event_exit)
+			return false;
+
+		if (!EmitFlushDirtyGprPins())
+			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuWaitLoopFastForwardBlocks++;
+#endif
+
+		size_t carry_branch = static_cast<size_t>(-1);
+		if (!EmitAddScaledCyclesToCpuLowWord(block_cycles, HOST_TMP0, HOST_TMP2, &carry_branch))
+			return false;
+
+		const size_t cycle_compare_target = m_code.Size();
+		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP1, HOST_TMP0, HOST_TMP2, true))
+		{
+			return false;
+		}
+
+		const size_t no_skip = m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		if (no_skip == static_cast<size_t>(-1))
+			return false;
+
+		if (!EmitWaitLoopFastForwardTail(event_exit))
+			return false;
+
+		if (!m_code.PatchBranch(no_skip, m_code.Size(), VitaA32::Condition::PL) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		const size_t carry_branches[] = {carry_branch};
+		return EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1);
+	}
+
 	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
 		DirectLinkSlot* direct_link, DirectLinkSlot* taken_link,
-		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag)
+		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
+		bool wait_loop_taken)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
 
 		if (!EmitFlushDirtyGprPins())
 			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (wait_loop_taken)
+			g_qemuWaitLoopFastForwardBlocks++;
+#endif
 
 		size_t carry_branch = static_cast<size_t>(-1);
 		if (!EmitAddScaledCyclesToCpuLowWord(block_cycles, HOST_TMP0, HOST_TMP2, &carry_branch))
@@ -5219,9 +5410,11 @@ namespace VitaEE
 		// Scheduler deltas are bounded to signed 32-bit windows
 		// (`R5900.cpp::cpuSetNextEvent()` / `cpuTestCycle()`), so the hot path
 		// compares the low-word delta and only fixes the u64 high word on wrap.
+		// Wait-loop blocks keep the nextEventCycle low word live in HOST_TMP2
+		// for the fast-forward taken tail.
 		const size_t cycle_compare_target = m_code.Size();
 		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
-			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+			!m_code.EmitSubReg(wait_loop_taken ? HOST_TMP1 : HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
 		{
 			return false;
 		}
@@ -5234,7 +5427,7 @@ namespace VitaEE
 			return false;
 
 		const size_t direct_target = m_code.Size();
-		if (taken_link)
+		if (taken_link || wait_loop_taken)
 		{
 			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 				return false;
@@ -5250,8 +5443,15 @@ namespace VitaEE
 			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE))
 				return false;
 
+			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
+			// tail whose newpc is the loop head (s_branchTo), i.e. the taken
+			// side of the loop branch.
+			const bool taken_tail_ok = wait_loop_taken ?
+				EmitWaitLoopFastForwardTail(event_exit) :
+				EmitDirectLinkTail(direct_exit, taken_link);
+
 			const size_t carry_branches[] = {carry_branch};
-			if (!EmitDirectLinkTail(direct_exit, taken_link) ||
+			if (!taken_tail_ok ||
 				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI) ||
 				!EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1))
 			{
@@ -5290,13 +5490,18 @@ namespace VitaEE
 
 	bool BlockCompiler::EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles,
 		const void* direct_exit, const void* event_exit, DirectLinkSlot* not_taken_link,
-		DirectLinkSlot* taken_link)
+		DirectLinkSlot* taken_link, bool wait_loop_taken)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
 
 		if (!EmitFlushDirtyGprPins())
 			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (wait_loop_taken)
+			g_qemuWaitLoopFastForwardBlocks++;
+#endif
 
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
 			!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
@@ -5347,7 +5552,7 @@ namespace VitaEE
 
 		const size_t cycle_compare_target = m_code.Size();
 		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
-			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+			!m_code.EmitSubReg(wait_loop_taken ? HOST_TMP1 : HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
 		{
 			return false;
 		}
@@ -5360,7 +5565,7 @@ namespace VitaEE
 			return false;
 
 		const size_t direct_target = m_code.Size();
-		if (not_taken_link || taken_link)
+		if (not_taken_link || taken_link || wait_loop_taken)
 		{
 			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 				return false;
@@ -5376,8 +5581,14 @@ namespace VitaEE
 			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE))
 				return false;
 
+			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
+			// taken (loop head, s_branchTo) tail of likely loop branches.
+			const bool taken_tail_ok = wait_loop_taken ?
+				EmitWaitLoopFastForwardTail(event_exit) :
+				EmitDirectLinkTail(direct_exit, taken_link);
+
 			const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
-			if (!EmitDirectLinkTail(direct_exit, taken_link) ||
+			if (!taken_tail_ok ||
 				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI) ||
 				!EmitCycleCarryFixup(carry_branches, 2, cycle_compare_target, HOST_TMP1))
 			{
