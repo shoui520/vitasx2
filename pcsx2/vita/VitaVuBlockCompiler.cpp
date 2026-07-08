@@ -2574,6 +2574,51 @@ namespace VitaVU
 				}
 			}
 
+			// MADD/MSUB whose second operand is the full VF[ft] vector.
+			bool IsUpperMaddMsubVectorForm(VUInterpFast::UpperFastKind kind)
+			{
+				switch (kind)
+				{
+					case VUInterpFast::UpperFastKind::MADD:
+					case VUInterpFast::UpperFastKind::MADDA:
+					case VUInterpFast::UpperFastKind::MSUB:
+					case VUInterpFast::UpperFastKind::MSUBA:
+						return true;
+					default:
+						return false;
+				}
+			}
+
+			// MADD/MSUB whose second operand broadcasts one VF[ft] lane. When the
+			// destination aliases ft, the interpreter's per-lane store order lets a
+			// later lane observe the just-written value, so these keep the scalar
+			// per-lane path when fd == ft.
+			bool IsUpperMaddMsubVfBroadcastForm(VUInterpFast::UpperFastKind kind)
+			{
+				switch (kind)
+				{
+					case VUInterpFast::UpperFastKind::MADDx:
+					case VUInterpFast::UpperFastKind::MADDAx:
+					case VUInterpFast::UpperFastKind::MSUBx:
+					case VUInterpFast::UpperFastKind::MSUBAx:
+					case VUInterpFast::UpperFastKind::MADDy:
+					case VUInterpFast::UpperFastKind::MADDAy:
+					case VUInterpFast::UpperFastKind::MSUBy:
+					case VUInterpFast::UpperFastKind::MSUBAy:
+					case VUInterpFast::UpperFastKind::MADDz:
+					case VUInterpFast::UpperFastKind::MADDAz:
+					case VUInterpFast::UpperFastKind::MSUBz:
+					case VUInterpFast::UpperFastKind::MSUBAz:
+					case VUInterpFast::UpperFastKind::MADDw:
+					case VUInterpFast::UpperFastKind::MADDAw:
+					case VUInterpFast::UpperFastKind::MSUBw:
+					case VUInterpFast::UpperFastKind::MSUBAw:
+						return true;
+					default:
+						return false;
+				}
+			}
+
 			bool IsUpperMaddMsubAccKind(VUInterpFast::UpperFastKind kind)
 			{
 				switch (kind)
@@ -2771,6 +2816,20 @@ namespace VitaVU
 					default:
 						return false;
 				}
+			}
+
+			// Loads the MADD/MSUB second operand as a NEON quad: vector forms use
+			// one aligned load of VF[ft]; broadcast (VF-lane, I, or Q) forms load
+			// the single source word and VDUP it across all four lanes.
+			bool EmitLoadUpperMaddMsubOperandQuad(unsigned qd, u32 code,
+				VUInterpFast::UpperFastKind kind)
+			{
+				if (IsUpperMaddMsubVectorForm(kind))
+					return EmitAddVfAddress(3, VUInterpFast::Ft(code)) &&
+						m_code.EmitVld1Q32Aligned(qd, 3);
+
+				return EmitLoadUpperMaddMsubOperandWord(3, code, kind, 0) &&
+					m_code.EmitVdupI32QFromCore(qd, 3);
 			}
 
 			bool EmitClearMacLaneInReg(unsigned mac_reg, unsigned lane, unsigned scratch_reg)
@@ -3109,47 +3168,94 @@ namespace VitaVU
 			{
 				const unsigned fd = VUInterpFast::Fd(code);
 				const unsigned fs = VUInterpFast::Fs(code);
+				const unsigned ft = VUInterpFast::Ft(code);
 				const unsigned mask = VUInterpFast::XYZW(code);
 				const bool acc = IsUpperMaddMsubAccKind(kind);
 				const bool subtract = IsUpperMsubKind(kind);
 
 				// PCSX2 owners: VUops.cpp::_vuMADD* / _vuMSUB* /
-				// _vuMADDA* / _vuMSUBA* and VUmicroFast.h::VuMaddMsubScalar().
-				// The ARM32 direct path deliberately keeps separate scalar
-				// vmul.f32 then vadd/vsub.f32: qword NEON drifts by 1 ULP in
-				// dependent ACC chains. Keep VF broadcast operand loads inside
-				// each lane to match VUmicroFast.h::ExecuteMaddMsubMaskedScalar()
-				// when Fd aliases Ft.
+				// _vuMADDA* / _vuMSUBA* and VUmicroFast.h::VuMaddMsubScalar() /
+				// ExecuteMaddMsubMaskedScalar(). The multiply/add stays scalar VFP
+				// because qword NEON drifts by 1 ULP in dependent ACC chains, but
+				// vuDouble() input normalization is exact integer bit work: load
+				// ACC/fs/operand as NEON quads (Q0/Q1/Q2 -> S0-S11), normalize all
+				// three at once (matching VuDoubleBitsNeon()), then run each active
+				// lane's scalar vmul/vadd on the normalized lanes. A VF-lane
+				// broadcast whose result aliases Ft keeps the per-lane scalar path
+				// so a later lane still observes the just-written Ft, matching
+				// ExecuteMaddMsubMaskedScalar()'s store order.
+				const bool alias_hazard = IsUpperMaddMsubVfBroadcastForm(kind) && fd == ft;
+
 				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
 					return false;
 
-				for (unsigned lane = 0; lane < 4; lane++)
+				if (alias_hazard)
 				{
-					const unsigned lane_bit = 1u << (3 - lane);
-					if ((mask & lane_bit) == 0)
+					for (unsigned lane = 0; lane < 4; lane++)
 					{
-						if (!EmitClearMacLaneInReg(2, lane, HOST_CALL_SCRATCH))
+						const unsigned lane_bit = 1u << (3 - lane);
+						if ((mask & lane_bit) == 0)
+						{
+							if (!EmitClearMacLaneInReg(2, lane, HOST_CALL_SCRATCH))
+								return false;
+							continue;
+						}
+
+						if (!m_code.EmitLdrImm12(0, HOST_VU,
+								VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32))) ||
+							!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
+							!m_code.EmitVmovCoreToS(0, 0) ||
+							!EmitLoadVfWord(0, fs, lane) ||
+							!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
+							!m_code.EmitVmovCoreToS(1, 0) ||
+							!EmitLoadUpperMaddMsubOperandWord(0, code, kind, lane) ||
+							!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
+							!m_code.EmitVmovCoreToS(2, 0) ||
+							!m_code.EmitVmulF32(1, 1, 2) ||
+							(subtract ? !m_code.EmitVsubF32(0, 0, 1) : !m_code.EmitVaddF32(0, 0, 1)) ||
+							!m_code.EmitVmovSToCore(0, 0) ||
+							!EmitUpdateMacLaneFromResult(2, 0, lane, 1, HOST_CALL_SCRATCH) ||
+							!EmitStoreMacResultWord(0, acc, fd, lane))
+						{
 							return false;
-						continue;
+						}
+					}
+				}
+				else
+				{
+					if (mask != 0)
+					{
+						if (!m_code.EmitAddImm32(3, HOST_VU, VuOffset(offsetof(VURegs, ACC))) ||
+							!m_code.EmitVld1Q32Aligned(0, 3) ||
+							!EmitAddVfAddress(3, fs) ||
+							!m_code.EmitVld1Q32Aligned(1, 3) ||
+							!EmitLoadUpperMaddMsubOperandQuad(2, code, kind) ||
+							!EmitNormalizeVuFloatQuads3(0, 1, 2))
+						{
+							return false;
+						}
 					}
 
-					if (!m_code.EmitLdrImm12(0, HOST_VU,
-							VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32))) ||
-						!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
-						!m_code.EmitVmovCoreToS(0, 0) ||
-						!EmitLoadVfWord(0, fs, lane) ||
-						!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
-						!m_code.EmitVmovCoreToS(1, 0) ||
-						!EmitLoadUpperMaddMsubOperandWord(0, code, kind, lane) ||
-						!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
-						!m_code.EmitVmovCoreToS(2, 0) ||
-						!m_code.EmitVmulF32(1, 1, 2) ||
-						(subtract ? !m_code.EmitVsubF32(0, 0, 1) : !m_code.EmitVaddF32(0, 0, 1)) ||
-						!m_code.EmitVmovSToCore(0, 0) ||
-						!EmitUpdateMacLaneFromResult(2, 0, lane, 1, HOST_CALL_SCRATCH) ||
-						!EmitStoreMacResultWord(0, acc, fd, lane))
+					for (unsigned lane = 0; lane < 4; lane++)
 					{
-						return false;
+						const unsigned lane_bit = 1u << (3 - lane);
+						if ((mask & lane_bit) == 0)
+						{
+							if (!EmitClearMacLaneInReg(2, lane, HOST_CALL_SCRATCH))
+								return false;
+							continue;
+						}
+
+						// S12 = fs[lane] * operand[lane]; S12 = ACC[lane] -/+ S12.
+						if (!m_code.EmitVmulF32(12, 4 + lane, 8 + lane) ||
+							(subtract ? !m_code.EmitVsubF32(12, 0 + lane, 12)
+									  : !m_code.EmitVaddF32(12, 0 + lane, 12)) ||
+							!m_code.EmitVmovSToCore(0, 12) ||
+							!EmitUpdateMacLaneFromResult(2, 0, lane, 1, HOST_CALL_SCRATCH) ||
+							!EmitStoreMacResultWord(0, acc, fd, lane))
+						{
+							return false;
+						}
 					}
 				}
 
@@ -4441,6 +4547,23 @@ namespace VitaVU
 				return EmitMaterializeVuFloatNormalizeConstants(overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_a, overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_b, overflow_clamp);
+#endif
+			}
+
+			// Normalizes the three MADD/MSUB operand quads (ACC, fs, operand).
+			bool EmitNormalizeVuFloatQuads3(unsigned vq_a, unsigned vq_b, unsigned vq_c)
+			{
+#if defined(INT_VUDOUBLEHACK)
+				(void)vq_a;
+				(void)vq_b;
+				(void)vq_c;
+				return true;
+#else
+				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				return EmitMaterializeVuFloatNormalizeConstants(overflow_clamp) &&
+					EmitNormalizeVuFloatQuadInPlace(vq_a, overflow_clamp) &&
+					EmitNormalizeVuFloatQuadInPlace(vq_b, overflow_clamp) &&
+					EmitNormalizeVuFloatQuadInPlace(vq_c, overflow_clamp);
 #endif
 			}
 
