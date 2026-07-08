@@ -4566,6 +4566,19 @@ namespace VitaVU
 #endif
 			}
 
+			// Normalizes a single operand quad with vuDouble() semantics.
+			bool EmitNormalizeVuFloatQuad1(unsigned vq)
+			{
+#if defined(INT_VUDOUBLEHACK)
+				(void)vq;
+				return true;
+#else
+				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				return EmitMaterializeVuFloatNormalizeConstants(overflow_clamp) &&
+					EmitNormalizeVuFloatQuadInPlace(vq, overflow_clamp);
+#endif
+			}
+
 			// Normalizes the three MADD/MSUB operand quads (ACC, fs, operand).
 			bool EmitNormalizeVuFloatQuads3(unsigned vq_a, unsigned vq_b, unsigned vq_c)
 			{
@@ -5134,26 +5147,26 @@ namespace VitaVU
 				return m_code.PatchBranch(done, m_code.Size());
 			}
 
-			bool EmitEfuSumXyzSquaresToS0(unsigned vf, unsigned word_reg,
-				unsigned temp_reg, unsigned scratch_reg)
+			bool EmitEfuSumXyzSquaresToS0(unsigned vf)
 			{
-				return EmitLoadVuLaneToS(0, vf, 0, word_reg, temp_reg, scratch_reg) &&
-					EmitLoadVuLaneToS(1, vf, 1, word_reg, temp_reg, scratch_reg) &&
-					EmitLoadVuLaneToS(2, vf, 2, word_reg, temp_reg, scratch_reg) &&
-					m_code.EmitVmulF32(0, 0, 0) &&
-					m_code.EmitVmulF32(1, 1, 1) &&
-					m_code.EmitVmulF32(2, 2, 2) &&
+				// PCSX2 owner: VUmicroFast.h::VuSumXYZSquaresNeon(). Quad load and
+				// normalize, square every lane with one vmulq, then reduce
+				// (x*x + y*y) + z*z with the same scalar order as the reference.
+				return EmitAddVfAddress(3, vf) &&
+					m_code.EmitVld1Q32Aligned(0, 3) &&
+					EmitNormalizeVuFloatQuad1(0) &&
+					m_code.EmitVmulF32Q(0, 0, 0) &&
 					m_code.EmitVaddF32(0, 0, 1) &&
 					m_code.EmitVaddF32(0, 0, 2);
 			}
 
-			bool EmitEfuSumXyzwToS0(unsigned vf, unsigned word_reg,
-				unsigned temp_reg, unsigned scratch_reg)
+			bool EmitEfuSumXyzwToS0(unsigned vf)
 			{
-				return EmitLoadVuLaneToS(0, vf, 0, word_reg, temp_reg, scratch_reg) &&
-					EmitLoadVuLaneToS(1, vf, 1, word_reg, temp_reg, scratch_reg) &&
-					EmitLoadVuLaneToS(2, vf, 2, word_reg, temp_reg, scratch_reg) &&
-					EmitLoadVuLaneToS(3, vf, 3, word_reg, temp_reg, scratch_reg) &&
+				// PCSX2 owner: VUmicroFast.h::VuSumXYZWNeon(). Quad load and
+				// normalize, then reduce ((x + y) + z) + w.
+				return EmitAddVfAddress(3, vf) &&
+					m_code.EmitVld1Q32Aligned(0, 3) &&
+					EmitNormalizeVuFloatQuad1(0) &&
 					m_code.EmitVaddF32(0, 0, 1) &&
 					m_code.EmitVaddF32(0, 0, 2) &&
 					m_code.EmitVaddF32(0, 0, 3);
@@ -5348,34 +5361,34 @@ namespace VitaVU
 				{
 					case VUInterpFast::LowerFastKind::ESADD:
 						emitted_body =
-							EmitEfuSumXyzSquaresToS0(fs, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
+							EmitEfuSumXyzSquaresToS0(fs) &&
 							EmitStoreSToVuP(0, HOST_WORD);
 						break;
 
 					case VUInterpFast::LowerFastKind::ERSADD:
 						emitted_body =
-							EmitEfuSumXyzSquaresToS0(fs, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
+							EmitEfuSumXyzSquaresToS0(fs) &&
 							EmitReciprocalIfNonzero(0, 1, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
 							EmitStoreSToVuP(0, HOST_WORD);
 						break;
 
 					case VUInterpFast::LowerFastKind::ELENG:
 						emitted_body =
-							EmitEfuSumXyzSquaresToS0(fs, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
+							EmitEfuSumXyzSquaresToS0(fs) &&
 							EmitSqrtIfNonNegative(0, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
 							EmitStoreSToVuP(0, HOST_WORD);
 						break;
 
 					case VUInterpFast::LowerFastKind::ERLENG:
 						emitted_body =
-							EmitEfuSumXyzSquaresToS0(fs, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
+							EmitEfuSumXyzSquaresToS0(fs) &&
 							EmitSqrtAndReciprocalIfNonNegative(0, 1, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
 							EmitStoreSToVuP(0, HOST_WORD);
 						break;
 
 					case VUInterpFast::LowerFastKind::ESUM:
 						emitted_body =
-							EmitEfuSumXyzwToS0(fs, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
+							EmitEfuSumXyzwToS0(fs) &&
 							EmitStoreSToVuP(0, HOST_WORD);
 						break;
 
