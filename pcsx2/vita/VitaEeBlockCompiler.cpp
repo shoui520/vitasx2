@@ -6898,6 +6898,65 @@ namespace VitaEE
 			return emit_sync_msflags();
 		}
 
+		if (is_outer_product)
+		{
+			// VOPMULA/VOPMSUB. The reference _vuOPMULA/_vuOPMSUB snapshot fs/ft
+			// (and ACC for OPMSUB) into locals before writing the destination, so
+			// fd == fs / fd == ft aliases observe the original operands. Preload
+			// them as NEON quads before any store to keep that ordering (the old
+			// per-lane scalar loop read fs/ft interleaved with fd stores and so
+			// diverged for those aliases), normalize with the shared quad path,
+			// arrange the {fs.y*ft.z, fs.z*ft.x, fs.x*ft.y} cross product with
+			// cheap S-register moves (no ARM<->NEON transfers), and keep the qword
+			// multiply/subtract. W is ignored and its MAC bits stay untouched.
+			constexpr unsigned QUAD_FS_OUTER = 2;  // Q2 -> S8-S11
+			constexpr unsigned QUAD_FT_OUTER = 3;  // Q3 -> S12-S15
+			constexpr unsigned QUAD_ACC_OUTER = 4; // Q4 -> S16-S19
+			constexpr unsigned QUAD_FSYZX = 0;     // Q0 -> S0-S3 (shuffle, then product)
+			constexpr unsigned QUAD_FTZXY = 1;     // Q1 -> S4-S7
+			const bool opmsub = arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
+
+			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+				!m_code.EmitVld1Q32Aligned(QUAD_FS_OUTER, HOST_TMP0) ||
+				!EmitVu0VfAddress(HOST_TMP0, ft) ||
+				!m_code.EmitVld1Q32Aligned(QUAD_FT_OUTER, HOST_TMP0) ||
+				(opmsub &&
+					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
+						!m_code.EmitVld1Q32Aligned(QUAD_ACC_OUTER, HOST_TMP0))) ||
+				!emit_materialize_norm_consts() ||
+				!emit_normalize_quad(QUAD_FS_OUTER) ||
+				!emit_normalize_quad(QUAD_FT_OUTER) ||
+				(opmsub && !emit_normalize_quad(QUAD_ACC_OUTER)))
+			{
+				return false;
+			}
+
+			// Q0 = {fs.y, fs.z, fs.x, fs.x}, Q1 = {ft.z, ft.x, ft.y, ft.y}.
+			if (!m_code.EmitVmovS(0, 9) || !m_code.EmitVmovS(1, 10) ||
+				!m_code.EmitVmovS(2, 8) || !m_code.EmitVmovS(3, 8) ||
+				!m_code.EmitVmovS(4, 14) || !m_code.EmitVmovS(5, 12) ||
+				!m_code.EmitVmovS(6, 13) || !m_code.EmitVmovS(7, 13) ||
+				!m_code.EmitVmulF32Q(QUAD_FSYZX, QUAD_FSYZX, QUAD_FTZXY))
+			{
+				return false;
+			}
+
+			if (opmsub && !m_code.EmitVsubF32Q(QUAD_FSYZX, QUAD_ACC_OUTER, QUAD_FSYZX))
+				return false;
+
+			for (unsigned lane = 0; lane < 3; lane++)
+			{
+				if (!m_code.EmitVmovSToCore(HOST_TMP0, QUAD_FSYZX * 4 + lane) ||
+					!emit_update_mac_lane(lane) ||
+					!emit_store_result(lane))
+				{
+					return false;
+				}
+			}
+
+			return emit_sync_msflags();
+		}
+
 		if (!emit_prepare_broadcast_operand())
 			return false;
 
