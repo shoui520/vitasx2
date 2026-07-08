@@ -3272,15 +3272,6 @@ namespace VitaVU
 #endif
 			}
 
-			bool EmitLoadAccLaneToS(unsigned sreg, unsigned lane,
-				unsigned word_reg, unsigned temp_reg, unsigned scratch_reg)
-			{
-				return m_code.EmitLdrImm12(word_reg, HOST_VU,
-						VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32))) &&
-					EmitNormalizeVuFloatWord(word_reg, temp_reg, scratch_reg) &&
-					m_code.EmitVmovCoreToS(sreg, word_reg);
-			}
-
 			bool EmitFinishOuterLaneFromS(unsigned result_sreg, unsigned mac_reg,
 				bool acc, unsigned fd, unsigned lane)
 			{
@@ -3296,27 +3287,56 @@ namespace VitaVU
 				const unsigned ft = VUInterpFast::Ft(code);
 
 				// PCSX2 owners: VUops.cpp::_vuOPMULA()/_vuOPMSUB() and
-				// VUmicroFast.h::ExecuteOpmula()/ExecuteOpmsub(). W is ignored
-				// and its MAC bits are left untouched; OPMSUB sources are loaded
-				// before stores so Fd aliases keep the same source visibility as
-				// the direct path. Match VUmicroFast.h::OuterProductNeon()'s
-				// qword arithmetic shape; scalar VFP drifts by 1 ULP here.
+				// VUmicroFast.h::ExecuteOpmula()/ExecuteOpmsub()/OuterProductNeon().
+				// W is ignored and its MAC bits are left untouched. Load fs/ft (and
+				// ACC for OPMSUB) as NEON quads, normalize them with the shared
+				// vuDouble() quad path, then arrange the cross-product lanes with
+				// cheap S-register moves instead of per-lane scalar normalize plus
+				// ARM->NEON transfers. The multiply/subtract stays qword to match
+				// OuterProductNeon (scalar VFP drifts by 1 ULP here). fs/ft/ACC are
+				// all read before any store, so Fd aliases keep the same source
+				// visibility as the direct path.
+				const bool opmsub = kind != VUInterpFast::UpperFastKind::OPMULA;
+
 				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
 					return false;
-				if (!EmitLoadVuLaneToS(0, fs, 1, 0, 3, HOST_CALL_SCRATCH) ||
-					!EmitLoadVuLaneToS(1, fs, 2, 0, 3, HOST_CALL_SCRATCH) ||
-					!EmitLoadVuLaneToS(2, fs, 0, 0, 3, HOST_CALL_SCRATCH) ||
-					!m_code.EmitVmovS(3, 2) ||
-					!EmitLoadVuLaneToS(4, ft, 2, 0, 3, HOST_CALL_SCRATCH) ||
-					!EmitLoadVuLaneToS(5, ft, 0, 0, 3, HOST_CALL_SCRATCH) ||
-					!EmitLoadVuLaneToS(6, ft, 1, 0, 3, HOST_CALL_SCRATCH) ||
-					!m_code.EmitVmovS(7, 6) ||
+
+				// Q2 = fs, Q3 = ft, Q4 = ACC (OPMSUB only).
+				if (!EmitAddVfAddress(3, fs) ||
+					!m_code.EmitVld1Q32Aligned(2, 3) ||
+					!EmitAddVfAddress(3, ft) ||
+					!m_code.EmitVld1Q32Aligned(3, 3))
+				{
+					return false;
+				}
+
+				if (opmsub)
+				{
+					if (!m_code.EmitAddImm32(3, HOST_VU, VuOffset(offsetof(VURegs, ACC))) ||
+						!m_code.EmitVld1Q32Aligned(4, 3) ||
+						!EmitNormalizeVuFloatQuads3(2, 3, 4))
+					{
+						return false;
+					}
+				}
+				else if (!EmitNormalizeVuFloatQuads(2, 3))
+				{
+					return false;
+				}
+
+				// fs_yzx = {fs.y, fs.z, fs.x, fs.x} in Q0 (S0-S3);
+				// ft_zxy = {ft.z, ft.x, ft.y, ft.y} in Q1 (S4-S7).
+				// Q2 = S8-S11 (fs), Q3 = S12-S15 (ft).
+				if (!m_code.EmitVmovS(0, 9) || !m_code.EmitVmovS(1, 10) ||
+					!m_code.EmitVmovS(2, 8) || !m_code.EmitVmovS(3, 8) ||
+					!m_code.EmitVmovS(4, 14) || !m_code.EmitVmovS(5, 12) ||
+					!m_code.EmitVmovS(6, 13) || !m_code.EmitVmovS(7, 13) ||
 					!m_code.EmitVmulF32Q(0, 0, 1))
 				{
 					return false;
 				}
 
-				if (kind == VUInterpFast::UpperFastKind::OPMULA)
+				if (!opmsub)
 				{
 					if (!EmitFinishOuterLaneFromS(0, 2, true, 0, 0) ||
 						!EmitFinishOuterLaneFromS(1, 2, true, 0, 1) ||
@@ -3327,11 +3347,7 @@ namespace VitaVU
 				}
 				else
 				{
-					if (!EmitLoadAccLaneToS(4, 0, 0, 3, HOST_CALL_SCRATCH) ||
-						!EmitLoadAccLaneToS(5, 1, 0, 3, HOST_CALL_SCRATCH) ||
-						!EmitLoadAccLaneToS(6, 2, 0, 3, HOST_CALL_SCRATCH) ||
-						!EmitLoadAccLaneToS(7, 3, 0, 3, HOST_CALL_SCRATCH) ||
-						!m_code.EmitVsubF32Q(0, 1, 0) ||
+					if (!m_code.EmitVsubF32Q(0, 4, 0) ||
 						!EmitFinishOuterLaneFromS(0, 2, false, fd, 0) ||
 						!EmitFinishOuterLaneFromS(1, 2, false, fd, 1) ||
 						!EmitFinishOuterLaneFromS(2, 2, false, fd, 2))
