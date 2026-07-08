@@ -37,6 +37,8 @@ static VitaA32IopProviderStats s_iop_a32_stats;
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
 static bool s_ee_a32_running_compiled_block = false;
+static bool s_ee_a32_elf_booted = false;
+static bool s_ee_a32_direct_linking_enabled = false;
 static VitaA32EeTraceMode s_ee_a32_trace_mode = VitaA32EeTraceMode::InstructionWindow;
 static bool s_ee_provider_trace_suppressed = false;
 static bool s_ee_a32_prerecording_window = false;
@@ -222,6 +224,12 @@ static bool recRecordEeWindow(u32 start_pc, u32 instruction_count, u32* executab
 		return false;
 
 	*executable_instruction_count = 0;
+	if (!s_ee_pre_instruction_trace_callback)
+	{
+		*executable_instruction_count = instruction_count;
+		return true;
+	}
+
 	s_ee_a32_prerecording_window = true;
 	u32 first_recorded_instruction = 0;
 	if (instruction_count != 0 &&
@@ -371,6 +379,50 @@ static void recRunInterpreterStepsWithoutProviderTrace(u32 instruction_count)
 	}
 }
 
+static void recAccountEeBlockExecution(const VitaEE::BlockExecutionResult& result, u32 fallback_pc)
+{
+	if (result.path == VitaEE::BlockExecutionPath::Compiled)
+	{
+		s_ee_a32_stats.compiled_blocks++;
+		s_ee_a32_stats.compiled_instructions += result.instruction_count;
+	}
+	else
+	{
+		recRecordInterpreterFallback(fallback_pc, memRead32(fallback_pc),
+			VitaA32EeFallbackReason::InterpreterPath);
+	}
+
+	if (result.exit == VitaEE::BlockExitKind::Direct)
+		s_ee_a32_stats.direct_exits++;
+	else if (result.exit == VitaEE::BlockExitKind::Event)
+		s_ee_a32_stats.event_exits++;
+
+	if (result.cache_hit)
+		s_ee_a32_stats.cache_hits++;
+	else
+		s_ee_a32_stats.cache_misses++;
+
+	if (result.lookup_hit)
+		s_ee_a32_stats.lookup_hits++;
+	if (result.fast_dispatch_hit)
+		s_ee_a32_stats.fast_dispatch_hits++;
+}
+
+static void recSetEeDirectLinkingEnabled(bool enabled)
+{
+	if (s_ee_a32_direct_linking_enabled == enabled)
+		return;
+
+	s_ee_a32_executor.SetDirectLinkingEnabled(enabled);
+	s_ee_a32_direct_linking_enabled = enabled;
+}
+
+static void recResetEeDirectLinkingState()
+{
+	s_ee_a32_executor.SetDirectLinkingEnabled(false);
+	s_ee_a32_direct_linking_enabled = false;
+}
+
 static void recReserve()
 {
 }
@@ -378,7 +430,9 @@ static void recReserve()
 static void recShutdown()
 {
 	s_ee_a32_executor.Reset();
+	recResetEeDirectLinkingState();
 	s_ee_a32_cache_reset_requested = false;
+	s_ee_a32_elf_booted = false;
 }
 
 static void recReset()
@@ -386,9 +440,11 @@ static void recReset()
 	intCpu.Reset();
 	VitaEE::RefreshRawGpr0KnownZero();
 	s_ee_a32_executor.Reset();
+	recResetEeDirectLinkingState();
 	VitaResetA32EeProviderStats();
 	s_ee_a32_exit_execution = false;
 	s_ee_a32_cache_reset_requested = false;
+	s_ee_a32_elf_booted = false;
 }
 
 static void recStep()
@@ -408,9 +464,10 @@ static void recExecute()
 		// the EELOAD/entry hook pcs below must pass through here, matching
 		// Interpreter.cpp::intExecute() and the compile-time hooks in
 		// x86/ix86-32/iR5900.cpp::recRecompile().
-		const bool elf_booted = VMManager::Internal::HasBootedELF();
-		s_ee_a32_executor.SetDirectLinkingEnabled(
-			s_ee_pre_instruction_trace_callback == nullptr && elf_booted);
+		if (!s_ee_a32_elf_booted)
+			s_ee_a32_elf_booted = VMManager::Internal::HasBootedELF();
+		const bool elf_booted = s_ee_a32_elf_booted;
+		recSetEeDirectLinkingEnabled(s_ee_pre_instruction_trace_callback == nullptr && elf_booted);
 
 		if (s_ee_a32_cache_reset_requested)
 		{
@@ -454,6 +511,26 @@ static void recExecute()
 			else if (pc == VMManager::Internal::GetCurrentELFEntryPoint())
 			{
 				VMManager::Internal::EntryPointCompilingOnCPUThread();
+			}
+		}
+
+		if (!s_ee_pre_instruction_trace_callback)
+		{
+			VitaEE::BlockExecutionResult result;
+			s_ee_a32_running_compiled_block = true;
+			const bool executed = s_ee_a32_executor.ExecuteCompiledBlockAtPc(pc, true, &result);
+			s_ee_a32_running_compiled_block = false;
+			if (executed)
+			{
+				recAccountEeBlockExecution(result, pc);
+
+				if (s_ee_a32_cache_reset_requested)
+				{
+					s_ee_a32_stats.invalidated_blocks += s_ee_a32_executor.Reset();
+					s_ee_a32_cache_reset_requested = false;
+				}
+
+				continue;
 			}
 		}
 
@@ -536,28 +613,7 @@ static void recExecute()
 			continue;
 		}
 
-		if (result.path == VitaEE::BlockExecutionPath::Compiled)
-		{
-			s_ee_a32_stats.compiled_blocks++;
-			s_ee_a32_stats.compiled_instructions += result.instruction_count;
-		}
-		else
-		{
-			recRecordInterpreterFallback(pc, memRead32(pc), VitaA32EeFallbackReason::InterpreterPath);
-		}
-
-		if (result.exit == VitaEE::BlockExitKind::Direct)
-			s_ee_a32_stats.direct_exits++;
-		else if (result.exit == VitaEE::BlockExitKind::Event)
-			s_ee_a32_stats.event_exits++;
-
-		if (result.cache_hit)
-			s_ee_a32_stats.cache_hits++;
-		else
-			s_ee_a32_stats.cache_misses++;
-
-		if (result.lookup_hit)
-			s_ee_a32_stats.lookup_hits++;
+		recAccountEeBlockExecution(result, pc);
 
 		if (s_ee_a32_cache_reset_requested)
 		{
@@ -712,11 +768,13 @@ void recMicroVU0::Reserve()
 
 void recMicroVU0::Shutdown()
 {
+	VitaVU::ShutdownVu0Blocks();
 }
 
 void recMicroVU0::Reset()
 {
 	CpuIntVU0.Reset();
+	VitaVU::ResetVu0Blocks();
 }
 
 void recMicroVU0::Step()
@@ -731,15 +789,15 @@ void recMicroVU0::SetStartPC(u32 startPC)
 
 void recMicroVU0::Execute(u32 cycles)
 {
-	CpuIntVU0.Execute(cycles);
+	// PCSX2 owner: InterpVU0::Execute()'s loop, with scan-proven windows
+	// routed through the A32 block provider in pcsx2/vita/VitaVuBlockCompiler.cpp.
+	VitaVU::ExecuteVu0Blocks(cycles);
 }
 
 void recMicroVU0::Clear(u32 addr, u32 size)
 {
-	// PCSX2 owner: x86/microVU uses Clear() to discard compiled blocks after
-	// VU micro writes. Vita invalidates the decoded-op cache until the A32
-	// microVU emitter replaces this interpreter-backed provider.
 	VuMicroInvalidateDecodedCache(0, addr, size);
+	VitaVU::InvalidateVu0Blocks(addr, size);
 }
 
 recMicroVU1::recMicroVU1()
@@ -846,9 +904,8 @@ void VitaSelectA32EeIopCpuProviders()
 void VitaSelectConfiguredCpuProviders()
 {
 	// PCSX2 owner: VMManager.cpp::UpdateCPUImplementations(). The Vita fork
-	// maps the EE and IOP recompiler flags to Vita A32 providers, and the VU1
-	// recompiler flag to the A32 VU1 block provider. VU0 remains on the PCSX2
-	// interpreter until the Vita VU0 provider is ported.
+	// maps the EE and IOP recompiler flags to Vita A32 providers, and the VU
+	// recompiler flags to the A32 micro block providers.
 	if (EmuConfig.Cpu.Recompiler.EnableEE && EmuConfig.Cpu.Recompiler.EnableIOP)
 		VitaSelectA32EeIopCpuProviders();
 	else if (EmuConfig.Cpu.Recompiler.EnableEE)
@@ -858,6 +915,8 @@ void VitaSelectConfiguredCpuProviders()
 	else
 		VitaSelectInterpreterCpuProviders();
 
+	if (EmuConfig.Cpu.Recompiler.EnableVU0)
+		CpuVU0 = &CpuMicroVU0;
 	if (EmuConfig.Cpu.Recompiler.EnableVU1)
 		CpuVU1 = &CpuMicroVU1;
 }

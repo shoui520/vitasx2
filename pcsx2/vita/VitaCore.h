@@ -25,6 +25,7 @@ struct VitaA32EeProviderStats
 	u32 cache_hits = 0;
 	u32 cache_misses = 0;
 	u32 lookup_hits = 0;
+	u32 fast_dispatch_hits = 0;
 	u32 invalidated_blocks = 0;
 	u32 first_interpreter_pc = 0;
 	u32 first_interpreter_opcode = 0;

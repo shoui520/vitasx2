@@ -63,6 +63,7 @@ namespace VitaEE
 		size_t code_cache_capacity = 0;
 		bool cache_hit = false;
 		bool lookup_hit = false;
+		bool fast_dispatch_hit = false;
 	};
 
 	class BlockExecutor
@@ -79,6 +80,8 @@ namespace VitaEE
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
+		bool ExecuteCompiledBlockAtPc(u32 start_pc, bool run_event_test_on_event_exit,
+			BlockExecutionResult* result);
 		bool ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
 
@@ -106,6 +109,7 @@ namespace VitaEE
 			u32 scaled_cycles = 0;
 			s8 ee_cycle_rate = 0;
 			u8 cp0_config_cycle_shift = 0;
+			size_t linked_entry_offset = 0;
 			DirectLinkSlots direct_links{};
 			bool valid = false;
 			bool queued_free = false;
@@ -114,6 +118,11 @@ namespace VitaEE
 		struct LookupPage
 		{
 			std::array<CachedBlock*, LOOKUP_PAGE_ENTRY_COUNT> blocks{};
+		};
+
+		struct GeneratedLookupPage
+		{
+			std::array<const void*, LOOKUP_PAGE_ENTRY_COUNT> entry_points{};
 		};
 
 		struct IncomingLinkRecord
@@ -136,14 +145,18 @@ namespace VitaEE
 		static u32 LookupEntryIndex(u32 start_pc);
 		bool EnsureLookupDirectory();
 		LookupPage* GetLookupPage(u32 start_pc, bool allocate);
+		bool EnsureGeneratedLookupDirectory();
+		GeneratedLookupPage* GetGeneratedLookupPage(u32 start_pc, bool allocate);
 		void RegisterBlockLookup(CachedBlock& block);
 		void UnregisterBlockLookup(CachedBlock& block);
 		void ReleaseLookupPages();
+		void ReleaseGeneratedLookupPages();
 		s32 LastBlockRecordIndex(u32 pc) const;
 		bool RegisterBlockRecord(CachedBlock& block);
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
-		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc, u32 instruction_count, bool match_instruction_count);
+		CachedBlock* FindRecordedBlockByStartPc(
+			u32 start_pc, u32 instruction_count, bool match_instruction_count, bool validate_source_words = true);
 		void RememberFreeCacheEntry(CachedBlock& block);
 		CachedBlock* TakeFreeCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
@@ -153,10 +166,10 @@ namespace VitaEE
 		void RegisterIncomingLink(CachedBlock& block, u8 slot_index, const DirectLinkSlot& link);
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
-		bool ValidateCachedBlock(CachedBlock& block);
+		bool ValidateCachedBlock(CachedBlock& block, bool validate_source_words = true);
 		CachedBlock* FindLookupBlockByStartPc(u32 start_pc);
 		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit);
-		CachedBlock* FindCachedBlockByStartPc(u32 start_pc);
+		CachedBlock* FindCachedBlockByStartPc(u32 start_pc, bool validate_source_words = true);
 		CachedBlock* AllocateCacheEntry();
 		bool EnsureCodeCache();
 		void ReleaseCodeCache();
@@ -166,6 +179,7 @@ namespace VitaEE
 		u32 ResetForCachePressure();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles);
 		bool RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result);
+		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
 		void PatchIncomingLinks(u32 target_pc, const void* target);
 		void UnlinkIncomingLinks(u32 target_pc);
@@ -176,6 +190,8 @@ namespace VitaEE
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		LookupPage** m_lookup_pages = nullptr;
+		GeneratedLookupPage** m_generated_lookup_pages = nullptr;
+		GeneratedLookupPage** m_active_generated_lookup_pages = nullptr;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;

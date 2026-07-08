@@ -47,7 +47,8 @@ namespace VitaIOP
 	struct DirectLinkSlot
 	{
 		u32 target_pc = 0;
-		size_t target_offset = 0;
+		size_t target_offset = static_cast<size_t>(-1);
+		size_t fallback_offset = static_cast<size_t>(-1);
 		bool valid = false;
 	};
 
@@ -71,7 +72,7 @@ namespace VitaIOP
 	private:
 		bool BeginBlock();
 		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true);
-		bool EndBlockDirectTail(const void* direct_exit, size_t* direct_link_target_offset);
+		bool EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot);
 		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op, u32 pc);

@@ -39,6 +39,8 @@
 
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 extern void vu0Sync();
+extern void _vu0FinishMicro();
+extern void _vu0WaitMicro();
 #endif
 void executeCacheOp(u32 op, u32 addr);
 
@@ -61,11 +63,29 @@ u32 g_qemuQwordGprMemoryHelperCalls = 0;
 u32 g_qemuQwordCop2MemoryHelperCalls = 0;
 u32 g_qemuCpuCancelInstructionCalls = 0;
 u32 g_qemuVu0SyncCalls = 0;
+u32 g_qemuVu0FinishMicroCalls = 0;
+u32 g_qemuVu0WaitMicroCalls = 0;
+u32 g_qemuVu1FinishCalls = 0;
+u32 g_qemuVu1FinishAddCyclesCalls = 0;
+u32 g_qemuVu1ExecMicroCalls = 0;
+u32 g_qemuVu1ExecMicroLastAddr = 0;
 u32 g_qemuGprPinnedBlocks = 0;
 u32 g_qemuGprPinnedRegisters = 0;
 u32 g_qemuGprPinnedDwordRegisters = 0;
 u32 g_qemuGprPinnedVtlbFreeHostRegisters = 0;
 u32 g_qemuGprPinnedHighWordHits = 0;
+u32 g_qemuGprDirtyPinBlocks = 0;
+u32 g_qemuGprDirtyPinLowStoresElided = 0;
+u32 g_qemuGprDirtyPinHighStoresElided = 0;
+u32 g_qemuGprDirtyPinFlushStores = 0;
+u32 g_qemuGprConstBlocks = 0;
+u32 g_qemuGprConstResultStores = 0;
+u32 g_qemuKnownVtlbScalarFastPaths = 0;
+u32 g_qemuKnownVtlbQwordFastPaths = 0;
+u32 g_qemuKnownVtlbCop1FastPaths = 0;
+u32 g_qemuKnownVtlbCop2FastPaths = 0;
+u32 g_qemuKnownVtlbPartialFastPaths = 0;
+u32 g_qemuCop1NormalizedOperandSkips = 0;
 u32 g_qemuGprQCacheBlocks = 0;
 u32 g_qemuGprQCacheHits = 0;
 u32 g_qemuGprQCacheMisses = 0;
@@ -99,12 +119,18 @@ namespace VitaEE
 		constexpr u16 REG_R11 = 1u << 11;
 		constexpr u16 REG_LR = 1u << 14;
 		constexpr u16 REG_PC = 1u << 15;
+		constexpr u16 EE_LINK_FRAME_REGISTERS =
+			REG_R3 | REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_R9 | REG_R10 | REG_R11;
+		// Must match VitaEE::BlockExitKind without including the executor.
+		constexpr u8 EE_DIRECT_EXIT_TOKEN = 0xd1;
+		constexpr u8 EE_EVENT_EXIT_TOKEN = 0xe7;
 
 		constexpr unsigned HOST_CPU_REGS = 4;
 		constexpr unsigned HOST_BRANCH_STATE = 5;
 		constexpr unsigned HOST_BRANCH_FLAG = HOST_BRANCH_STATE;
 		constexpr unsigned HOST_BRANCH_TARGET = HOST_BRANCH_STATE;
 		constexpr unsigned HOST_SP = 13;
+		constexpr unsigned HOST_LR = 14;
 		constexpr unsigned HOST_TMP0 = 0;
 		constexpr unsigned HOST_TMP1 = 1;
 		constexpr unsigned HOST_TMP2 = 2;
@@ -594,15 +620,15 @@ namespace VitaEE
 				switch (function)
 				{
 					case 0x00:
-					case 0x01:
-					case 0x02:
-					case 0x03:
+						case 0x01:
+						case 0x02:
+						case 0x03:
 						return {true, Cop2MacroArithmeticKind::Add,
 							Cop2MacroArithmeticOperand::BroadcastLane, false, function & 0x3};
-					case 0x04:
-					case 0x05:
-					case 0x06:
-					case 0x07:
+						case 0x04:
+						case 0x05:
+						case 0x06:
+						case 0x07:
 						return {true, Cop2MacroArithmeticKind::Sub,
 							Cop2MacroArithmeticOperand::BroadcastLane, false, function & 0x3};
 					case 0x08:
@@ -785,6 +811,62 @@ namespace VitaEE
 		constexpr bool CanUseA32DualTransferPair(unsigned low_reg, unsigned high_reg)
 		{
 			return low_reg < 14 && high_reg == low_reg + 1 && ((low_reg & 1u) == 0);
+		}
+
+		u32 RotateRight32(u32 value, unsigned amount)
+		{
+			amount &= 31u;
+			return amount == 0 ? value : ((value >> amount) | (value << (32u - amount)));
+		}
+
+		u32 RotateLeft32(u32 value, unsigned amount)
+		{
+			amount &= 31u;
+			return amount == 0 ? value : ((value << amount) | (value >> (32u - amount)));
+		}
+
+		bool CanEncodeA32ModifiedImmediate(u32 value)
+		{
+			for (unsigned rotate = 0; rotate < 16; rotate++)
+			{
+				const unsigned amount = rotate * 2;
+				const u32 imm8 = RotateLeft32(value, amount);
+				if ((imm8 & ~0xffu) == 0 && RotateRight32(imm8, amount) == value)
+					return true;
+			}
+
+			return false;
+		}
+
+		bool IsCheapA32AndConstantWord(u32 value)
+		{
+			return value == 0 || value == 0xffffffffu ||
+				   CanEncodeA32ModifiedImmediate(value) || CanEncodeA32ModifiedImmediate(~value);
+		}
+
+		bool IsCheapA32LogicalConstantWord(u32 value)
+		{
+			return value == 0 || value == 0xffffffffu || CanEncodeA32ModifiedImmediate(value);
+		}
+
+		bool IsCheapA32AndConstant64(u32 low, u32 high)
+		{
+			return IsCheapA32AndConstantWord(low) && IsCheapA32AndConstantWord(high);
+		}
+
+		bool IsCheapA32LogicalConstant64(u32 low, u32 high)
+		{
+			return IsCheapA32LogicalConstantWord(low) && IsCheapA32LogicalConstantWord(high);
+		}
+
+		bool IsCheapA32CompareConstantWord(u32 value)
+		{
+			return CanEncodeA32ModifiedImmediate(value) || CanEncodeA32ModifiedImmediate(0u - value);
+		}
+
+		bool IsCheapA32CompareConstant64(u32 low, u32 high)
+		{
+			return IsCheapA32CompareConstantWord(low) && IsCheapA32CompareConstantWord(high);
 		}
 
 		constexpr size_t HiloLaneOffset(size_t hilo_offset, bool upper_pipeline)
@@ -1234,7 +1316,7 @@ namespace VitaEE
 
 		bool IsFastCOP2VectorTransfer(u32 op)
 		{
-			if ((op >> 26) != 0x12 || (op & 1u) != 0)
+			if ((op >> 26) != 0x12)
 				return false;
 
 			switch ((op >> 21) & 0x1f)
@@ -1249,20 +1331,17 @@ namespace VitaEE
 
 		bool IsFastCOP2ControlRead(u32 op)
 		{
-			return (op >> 26) == 0x12 && ((op >> 21) & 0x1f) == 0x02 &&
-				   (op & 1u) == 0; // CFC2, owned by VU0.cpp::CFC2().
+			return (op >> 26) == 0x12 && ((op >> 21) & 0x1f) == 0x02; // CFC2, owned by VU0.cpp::CFC2().
 		}
 
 		bool IsFastCOP2ControlWrite(u32 op)
 		{
-			if ((op >> 26) != 0x12 || ((op >> 21) & 0x1f) != 0x06 ||
-				(op & 1u) != 0)
+			if ((op >> 26) != 0x12 || ((op >> 21) & 0x1f) != 0x06)
 			{
 				return false;
 			}
 
-			const unsigned fs = RD(op);
-			return fs != VU0_REG_FBRST && fs != VU0_REG_CMSAR1;
+			return true;
 		}
 
 		bool IsFastCOP2MacroInBlock(u32 op)
@@ -1317,7 +1396,8 @@ namespace VitaEE
 		bool IsFastCOP2InBlock(u32 op)
 		{
 			return IsFastCOP2VectorTransfer(op) || IsFastCOP2ControlRead(op) ||
-				   IsFastCOP2ControlWrite(op) || IsFastCOP2MacroInBlock(op);
+				   (IsFastCOP2ControlWrite(op) && RD(op) != VU0_REG_CMSAR1) ||
+				   IsFastCOP2MacroInBlock(op);
 		}
 
 		unsigned FastVu0AddressUses(u32 op)
@@ -1398,18 +1478,6 @@ namespace VitaEE
 				default:
 					return 0;
 			}
-		}
-
-		unsigned RegisterCount(u16 registers)
-		{
-			unsigned count = 0;
-			while (registers != 0)
-			{
-				count += registers & 1u;
-				registers >>= 1;
-			}
-
-			return count;
 		}
 
 		bool CanCompileMMI(u32 op)
@@ -2103,8 +2171,15 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch)
 	{
-		return m_code.EmitCmpImm32(rn, value) ||
-			   (m_code.EmitMovImm32(scratch, value) && m_code.EmitCmpReg(rn, scratch));
+		return EmitCmpImm32OrReg(rn, value, scratch, VitaA32::Condition::AL);
+	}
+
+	bool BlockCompiler::EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch,
+		VitaA32::Condition condition)
+	{
+		return m_code.EmitCmpImm32(rn, value, condition) ||
+			   (m_code.EmitMovImm32(scratch, value, condition) &&
+			    m_code.EmitCmpReg(rn, scratch, condition));
 	}
 
 	bool BlockCompiler::CanCompileOpcode(u32 op)
@@ -2183,11 +2258,11 @@ namespace VitaEE
 
 	bool BlockCompiler::IsSupportedBranchOpcode(u32 op)
 	{
-		switch (op >> 26)
-		{
-			case 0x00:
-				switch (op & 0x3f)
-				{
+			switch (op >> 26)
+			{
+				case 0x00:
+					switch (op & 0x3f)
+					{
 					case 0x08: // JR, owned by Interpreter.cpp::JR().
 					case 0x09: // JALR, owned by Interpreter.cpp::JALR().
 						return true;
@@ -2363,6 +2438,12 @@ namespace VitaEE
 			unsigned low_read_count = 0;
 			u8 dword_reads[4]{};
 			unsigned dword_read_count = 0;
+		};
+
+		struct DirtyGprPinOpInfo
+		{
+			u8 writes[2]{};
+			unsigned write_count = 0;
 		};
 	} // namespace
 
@@ -2562,7 +2643,7 @@ namespace VitaEE
 					}
 				}
 
-				return CanCompileCOP2(op); // Helper-backed macro/interlocked forms are block-ending event tails.
+				return CanCompileCOP2(op); // Remaining helper-backed macro forms are block-ending event tails.
 			case 0x04: // BEQ
 			case 0x05: // BNE
 			case 0x14: // BEQL
@@ -2763,6 +2844,144 @@ namespace VitaEE
 		}
 	}
 
+	static bool ClassifyOpcodeForDirtyGprPins(u32 op, DirtyGprPinOpInfo* info)
+	{
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+		const auto add_write = [info](unsigned guest_reg) {
+			if (guest_reg != 0 && info->write_count < 2)
+				info->writes[info->write_count++] = static_cast<u8>(guest_reg);
+		};
+
+		switch (op >> 26)
+		{
+			case 0x00:
+				switch (op & 0x3f)
+				{
+					case 0x00: // SLL
+					case 0x02: // SRL
+					case 0x03: // SRA
+					case 0x04: // SLLV
+					case 0x06: // SRLV
+					case 0x07: // SRAV
+					case 0x0a: // MOVZ
+					case 0x0b: // MOVN
+					case 0x14: // DSLLV
+					case 0x16: // DSRLV
+					case 0x17: // DSRAV
+					case 0x20: // ADD
+					case 0x21: // ADDU
+					case 0x22: // SUB
+					case 0x23: // SUBU
+					case 0x24: // AND
+					case 0x25: // OR
+					case 0x26: // XOR
+					case 0x27: // NOR
+					case 0x2a: // SLT
+					case 0x2b: // SLTU
+					case 0x2c: // DADD
+					case 0x2d: // DADDU
+					case 0x2e: // DSUB
+					case 0x2f: // DSUBU
+					case 0x38: // DSLL
+					case 0x3a: // DSRL
+					case 0x3b: // DSRA
+					case 0x3c: // DSLL32
+					case 0x3e: // DSRL32
+					case 0x3f: // DSRA32
+						add_write(rd);
+						return true;
+					case 0x08: // JR
+					case 0x0f: // SYNC
+						return true;
+					case 0x09: // JALR
+						add_write(rd);
+						return true;
+					default:
+						return false;
+				}
+			case 0x01:
+				switch (rt)
+				{
+					case 0x00: // BLTZ
+					case 0x01: // BGEZ
+					case 0x02: // BLTZL
+					case 0x03: // BGEZL
+						return true;
+					case 0x10: // BLTZAL
+					case 0x11: // BGEZAL
+					case 0x12: // BLTZALL
+					case 0x13: // BGEZALL
+						add_write(31);
+						return true;
+					default:
+						return false;
+				}
+			case 0x02: // J
+				return true;
+			case 0x03: // JAL
+				add_write(31);
+				return true;
+			case 0x04: // BEQ
+			case 0x05: // BNE
+			case 0x06: // BLEZ
+			case 0x07: // BGTZ
+			case 0x14: // BEQL
+			case 0x15: // BNEL
+			case 0x16: // BLEZL
+			case 0x17: // BGTZL
+				return true;
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+			case 0x0a: // SLTI
+			case 0x0b: // SLTIU
+			case 0x0c: // ANDI
+			case 0x0d: // ORI
+			case 0x0e: // XORI
+			case 0x0f: // LUI
+			case 0x18: // DADDI
+			case 0x19: // DADDIU
+				add_write(rt);
+				return true;
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+			case 0x27: // LWU
+			case 0x37: // LD
+				add_write(rt);
+				return true;
+			case 0x28: // SB
+			case 0x29: // SH
+			case 0x2b: // SW
+			case 0x3f: // SD
+				return true;
+			default:
+				return false;
+			}
+		}
+
+	bool BlockCanUseDirtyGprPins(u32 start_pc, u32 instruction_count)
+	{
+		if (instruction_count == 0 || EmuConfig.Gamefixes.GoemonTlbHack)
+			return false;
+
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		if (Pcsx2Trace::IsGsTraceEnabled() || Pcsx2Trace::IsVuTraceEnabled())
+			return false;
+#endif
+
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			DirtyGprPinOpInfo info;
+			if (!ClassifyOpcodeForDirtyGprPins(memRead32(start_pc + i * 4), &info))
+				return false;
+		}
+
+		return true;
+	}
+
 	bool BlockShouldUseCop1ExponentMaskRegister(u32 start_pc, u32 instruction_count)
 	{
 		unsigned mask_users = 0;
@@ -2852,17 +3071,795 @@ namespace VitaEE
 		return true;
 	}
 
+	void BlockCompiler::ClearGprConstState()
+	{
+		for (unsigned i = 0; i < 32; i++)
+		{
+			m_gpr_const_known[i] = false;
+			m_gpr_const_low[i] = 0;
+			m_gpr_const_high_known[i] = false;
+			m_gpr_const_high[i] = 0;
+		}
+		m_gpr_const_known[0] = true;
+		m_gpr_const_high_known[0] = true;
+	}
+
+	void BlockCompiler::ClearCop1NormalizedState()
+	{
+		for (unsigned i = 0; i < 32; i++)
+			m_cop1_fpr_normalized[i] = false;
+		m_cop1_acc_normalized = false;
+	}
+
+	bool BlockCompiler::IsCop1FprNormalized(unsigned fpr) const
+	{
+		return fpr < 32 && m_cop1_fpr_normalized[fpr];
+	}
+
+	bool BlockCompiler::IsCop1AccNormalized() const
+	{
+		return m_cop1_acc_normalized;
+	}
+
+	bool BlockCompiler::TryGetKnownGprLow(unsigned guest_reg, u32* value) const
+	{
+		if (guest_reg >= 32 || !m_gpr_const_known[guest_reg])
+			return false;
+
+		if (value)
+			*value = m_gpr_const_low[guest_reg];
+		return true;
+	}
+
+	bool BlockCompiler::TryGetKnownGpr64(unsigned guest_reg, u32* low, u32* high) const
+	{
+		if (guest_reg >= 32 || !m_gpr_const_known[guest_reg] || !m_gpr_const_high_known[guest_reg])
+			return false;
+
+		if (low)
+			*low = m_gpr_const_low[guest_reg];
+		if (high)
+			*high = m_gpr_const_high[guest_reg];
+		return true;
+	}
+
+	bool BlockCompiler::EmitStoreKnownSignExtended32(unsigned guest_reg, u32 value)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGprConstResultStores++;
+#endif
+		if (value == 0)
+			return EmitStoreGprZero64(guest_reg);
+
+		return m_code.EmitMovImm32(HOST_TMP0, value) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitStoreKnownZeroExtended32(unsigned guest_reg, u32 value)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGprConstResultStores++;
+#endif
+		if (value == 0)
+			return EmitStoreGprZero64(guest_reg);
+
+		return m_code.EmitMovImm32(HOST_TMP0, value) &&
+			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitStoreKnown64(unsigned guest_reg, u32 low, u32 high)
+	{
+		if (high == 0)
+			return EmitStoreKnownZeroExtended32(guest_reg, low);
+		if (high == (static_cast<s32>(low) < 0 ? 0xffffffffu : 0))
+			return EmitStoreKnownSignExtended32(guest_reg, low);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGprConstResultStores++;
+#endif
+		return m_code.EmitMovImm32(HOST_TMP0, low) &&
+			   m_code.EmitMovImm32(HOST_TMP1, high) &&
+			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
+	}
+
+	bool BlockCompiler::TryGetKnownEffectiveAddress(u32 op, u32* address) const
+	{
+		const unsigned rs = RS(op);
+		const s32 imm = static_cast<s32>(IMM_S(op));
+		if (rs == 0)
+		{
+			*address = static_cast<u32>(imm);
+			return true;
+		}
+
+		if (!m_gpr_const_known[rs])
+			return false;
+
+		*address = m_gpr_const_low[rs] + static_cast<u32>(imm);
+		return true;
+	}
+
+	bool BlockCompiler::TryEmitKnownVtlbNonHandlerHostAddress(u32 guest_addr, unsigned host_reg,
+		KnownVtlbFastPathKind kind)
+	{
+		if (!vtlb_private::vtlbdata.vmap)
+			return false;
+
+		const vtlb_private::VTLBVirtual vmv =
+			vtlb_private::vtlbdata.vmap[guest_addr >> vtlb_private::VTLB_PAGE_BITS];
+		if (vmv.isHandler(guest_addr))
+			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		switch (kind)
+		{
+			case KnownVtlbFastPathKind::Scalar:
+				g_qemuKnownVtlbScalarFastPaths++;
+				break;
+			case KnownVtlbFastPathKind::Qword:
+				g_qemuKnownVtlbQwordFastPaths++;
+				break;
+			case KnownVtlbFastPathKind::Cop1:
+				g_qemuKnownVtlbCop1FastPaths++;
+				break;
+			case KnownVtlbFastPathKind::Cop2:
+				g_qemuKnownVtlbCop2FastPaths++;
+				break;
+			case KnownVtlbFastPathKind::Partial:
+				g_qemuKnownVtlbPartialFastPaths++;
+				break;
+		}
+#endif
+		return m_code.EmitMovImm32(host_reg, static_cast<u32>(vmv.assumePtr(guest_addr)));
+	}
+
+	void BlockCompiler::UpdateGprConstStateAfterOpcode(u32 op, u32 pc)
+	{
+		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
+		const unsigned rd = RD(op);
+		const auto clear = [this](unsigned guest_reg) {
+			if (guest_reg != 0)
+			{
+				m_gpr_const_known[guest_reg] = false;
+				m_gpr_const_high_known[guest_reg] = false;
+			}
+		};
+		const auto set = [this](unsigned guest_reg, u32 value) {
+			if (guest_reg != 0)
+			{
+				m_gpr_const_known[guest_reg] = true;
+				m_gpr_const_low[guest_reg] = value;
+				m_gpr_const_high_known[guest_reg] = false;
+			}
+		};
+		const auto set64 = [this](unsigned guest_reg, u32 low, u32 high) {
+			if (guest_reg != 0)
+			{
+				m_gpr_const_known[guest_reg] = true;
+				m_gpr_const_low[guest_reg] = low;
+				m_gpr_const_high_known[guest_reg] = true;
+				m_gpr_const_high[guest_reg] = high;
+			}
+		};
+		const auto set_sign32 = [&](unsigned guest_reg, u32 value) {
+			set64(guest_reg, value, (static_cast<s32>(value) < 0) ? 0xffffffffu : 0);
+		};
+		const auto set_zero32 = [&](unsigned guest_reg, u32 value) {
+			set64(guest_reg, value, 0);
+		};
+		const auto known = [this](unsigned guest_reg, u32* value) {
+			if (!m_gpr_const_known[guest_reg])
+				return false;
+			*value = m_gpr_const_low[guest_reg];
+			return true;
+		};
+		const auto known64 = [this](unsigned guest_reg, u32* low, u32* high) {
+			if (!m_gpr_const_known[guest_reg] || !m_gpr_const_high_known[guest_reg])
+				return false;
+			*low = m_gpr_const_low[guest_reg];
+			*high = m_gpr_const_high[guest_reg];
+			return true;
+		};
+		const auto set_add64 = [&](unsigned dst, unsigned lhs, u32 rhs_low, u32 rhs_high) {
+			u32 lhs_low = 0;
+			u32 lhs_high = 0;
+			if (!known64(lhs, &lhs_low, &lhs_high))
+				return false;
+
+			const u64 result = (static_cast<u64>(lhs_high) << 32) | lhs_low;
+			const u64 rhs_value = (static_cast<u64>(rhs_high) << 32) | rhs_low;
+			const u64 sum = result + rhs_value;
+			set64(dst, static_cast<u32>(sum), static_cast<u32>(sum >> 32));
+			return true;
+		};
+		const auto binary_sign32 = [&](unsigned dst, unsigned lhs, unsigned rhs, u32 (*op_fn)(u32, u32)) {
+			u32 lhs_value = 0;
+			u32 rhs_value = 0;
+			if (known(lhs, &lhs_value) && known(rhs, &rhs_value))
+				set_sign32(dst, op_fn(lhs_value, rhs_value));
+			else
+				clear(dst);
+		};
+		const auto binary_exact64 = [&](unsigned dst, unsigned lhs, unsigned rhs,
+			u64 (*op_fn)(u64, u64), u32 (*low_fn)(u32, u32)) {
+			u32 lhs_low = 0;
+			u32 rhs_low = 0;
+			u32 lhs_high = 0;
+			u32 rhs_high = 0;
+			if (known64(lhs, &lhs_low, &lhs_high) && known64(rhs, &rhs_low, &rhs_high))
+			{
+				const u64 lhs_value = (static_cast<u64>(lhs_high) << 32) | lhs_low;
+				const u64 rhs_value = (static_cast<u64>(rhs_high) << 32) | rhs_low;
+				const u64 result = op_fn(lhs_value, rhs_value);
+				set64(dst, static_cast<u32>(result), static_cast<u32>(result >> 32));
+			}
+			else if (known(lhs, &lhs_low) && known(rhs, &rhs_low))
+			{
+				set(dst, low_fn(lhs_low, rhs_low));
+			}
+			else
+			{
+				clear(dst);
+			}
+		};
+		const auto immediate_low = [&](unsigned dst, unsigned src, u32 imm, u32 (*op_fn)(u32, u32)) {
+			u32 src_value = 0;
+			if (known(src, &src_value))
+				set(dst, op_fn(src_value, imm));
+			else
+				clear(dst);
+		};
+		const auto immediate_sign32 = [&](unsigned dst, unsigned src, u32 imm, u32 (*op_fn)(u32, u32)) {
+			u32 src_value = 0;
+			if (known(src, &src_value))
+				set_sign32(dst, op_fn(src_value, imm));
+			else
+				clear(dst);
+		};
+
+		switch (op >> 26)
+		{
+			case 0x00:
+				switch (op & 0x3f)
+				{
+					case 0x00: // SLL
+					{
+						u32 value = 0;
+						if (known(rt, &value))
+							set_sign32(rd, value << SA(op));
+						else
+							clear(rd);
+						return;
+					}
+					case 0x02: // SRL
+					{
+						u32 value = 0;
+						if (known(rt, &value))
+							set_sign32(rd, value >> SA(op));
+						else
+							clear(rd);
+						return;
+					}
+					case 0x03: // SRA
+					{
+						u32 value = 0;
+						if (known(rt, &value))
+							set_sign32(rd, static_cast<u32>(static_cast<s32>(value) >> SA(op)));
+						else
+							clear(rd);
+						return;
+					}
+					case 0x04: // SLLV
+					{
+						u32 value = 0;
+						u32 amount = 0;
+						if (known(rt, &value) && known(rs, &amount))
+							set_sign32(rd, value << (amount & 0x1f));
+						else
+							clear(rd);
+						return;
+					}
+					case 0x06: // SRLV
+					{
+						u32 value = 0;
+						u32 amount = 0;
+						if (known(rt, &value) && known(rs, &amount))
+							set_sign32(rd, value >> (amount & 0x1f));
+						else
+							clear(rd);
+						return;
+					}
+					case 0x07: // SRAV
+					{
+						u32 value = 0;
+						u32 amount = 0;
+						if (known(rt, &value) && known(rs, &amount))
+							set_sign32(rd, static_cast<u32>(static_cast<s32>(value) >> (amount & 0x1f)));
+						else
+							clear(rd);
+						return;
+					}
+					case 0x20: // ADD
+					case 0x21: // ADDU
+						binary_sign32(rd, rs, rt, [](u32 lhs, u32 rhs) { return lhs + rhs; });
+						return;
+					case 0x22: // SUB
+					case 0x23: // SUBU
+						binary_sign32(rd, rs, rt, [](u32 lhs, u32 rhs) { return lhs - rhs; });
+						return;
+					case 0x2c: // DADD
+					case 0x2d: // DADDU
+						binary_exact64(rd, rs, rt,
+							[](u64 lhs, u64 rhs) { return lhs + rhs; },
+							[](u32 lhs, u32 rhs) { return lhs + rhs; });
+						return;
+					case 0x2e: // DSUB
+					case 0x2f: // DSUBU
+						binary_exact64(rd, rs, rt,
+							[](u64 lhs, u64 rhs) { return lhs - rhs; },
+							[](u32 lhs, u32 rhs) { return lhs - rhs; });
+						return;
+					case 0x24: // AND
+					{
+						u32 lhs_low = 0;
+						u32 lhs_high = 0;
+						u32 rhs_low = 0;
+						u32 rhs_high = 0;
+						const bool lhs64 = known64(rs, &lhs_low, &lhs_high);
+						const bool rhs64 = known64(rt, &rhs_low, &rhs_high);
+						if (lhs64 && rhs64)
+							set64(rd, lhs_low & rhs_low, lhs_high & rhs_high);
+						else if ((lhs64 && lhs_low == 0 && lhs_high == 0) ||
+								 (rhs64 && rhs_low == 0 && rhs_high == 0))
+							set64(rd, 0, 0);
+						else if ((known(rs, &lhs_low) && lhs_low == 0) ||
+								 (known(rt, &rhs_low) && rhs_low == 0))
+							set(rd, 0);
+						else if (known(rs, &lhs_low) && known(rt, &rhs_low))
+							set(rd, lhs_low & rhs_low);
+						else
+							clear(rd);
+						return;
+					}
+					case 0x25: // OR
+					{
+						u32 lhs_low = 0;
+						u32 lhs_high = 0;
+						u32 rhs_low = 0;
+						u32 rhs_high = 0;
+						const bool lhs64 = known64(rs, &lhs_low, &lhs_high);
+						const bool rhs64 = known64(rt, &rhs_low, &rhs_high);
+						if (lhs64 && rhs64)
+							set64(rd, lhs_low | rhs_low, lhs_high | rhs_high);
+						else if ((lhs64 && lhs_low == 0xffffffffu && lhs_high == 0xffffffffu) ||
+								 (rhs64 && rhs_low == 0xffffffffu && rhs_high == 0xffffffffu))
+							set64(rd, 0xffffffffu, 0xffffffffu);
+						else if ((known(rs, &lhs_low) && lhs_low == 0xffffffffu) ||
+								 (known(rt, &rhs_low) && rhs_low == 0xffffffffu))
+							set(rd, 0xffffffffu);
+						else if (known(rs, &lhs_low) && known(rt, &rhs_low))
+							set(rd, lhs_low | rhs_low);
+						else
+							clear(rd);
+						return;
+					}
+					case 0x26: // XOR
+						binary_exact64(rd, rs, rt,
+							[](u64 lhs, u64 rhs) { return lhs ^ rhs; },
+							[](u32 lhs, u32 rhs) { return lhs ^ rhs; });
+						return;
+					case 0x27: // NOR
+					{
+						u32 lhs_low = 0;
+						u32 lhs_high = 0;
+						u32 rhs_low = 0;
+						u32 rhs_high = 0;
+						const bool lhs64 = known64(rs, &lhs_low, &lhs_high);
+						const bool rhs64 = known64(rt, &rhs_low, &rhs_high);
+						if (lhs64 && rhs64)
+							set64(rd, ~(lhs_low | rhs_low), ~(lhs_high | rhs_high));
+						else if ((lhs64 && lhs_low == 0xffffffffu && lhs_high == 0xffffffffu) ||
+								 (rhs64 && rhs_low == 0xffffffffu && rhs_high == 0xffffffffu))
+							set64(rd, 0, 0);
+						else if ((known(rs, &lhs_low) && lhs_low == 0xffffffffu) ||
+								 (known(rt, &rhs_low) && rhs_low == 0xffffffffu))
+							set(rd, 0);
+						else if (known(rs, &lhs_low) && known(rt, &rhs_low))
+							set(rd, ~(lhs_low | rhs_low));
+						else
+							clear(rd);
+						return;
+					}
+					case 0x09: // JALR
+						set64(rd, pc + 8, 0);
+						return;
+					case 0x14: // DSLLV
+					{
+						u32 value_low = 0;
+						u32 value_high = 0;
+						u32 amount = 0;
+						if (known64(rt, &value_low, &value_high) && known(rs, &amount))
+						{
+							const u64 value = (static_cast<u64>(value_high) << 32) | value_low;
+							const u64 result = value << (amount & 0x3f);
+							set64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+						}
+						else
+						{
+							clear(rd);
+						}
+						return;
+					}
+					case 0x16: // DSRLV
+					{
+						u32 value_low = 0;
+						u32 value_high = 0;
+						u32 amount = 0;
+						if (known64(rt, &value_low, &value_high) && known(rs, &amount))
+						{
+							const u64 value = (static_cast<u64>(value_high) << 32) | value_low;
+							const u64 result = value >> (amount & 0x3f);
+							set64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+						}
+						else
+						{
+							clear(rd);
+						}
+						return;
+					}
+					case 0x17: // DSRAV
+					{
+						u32 value_low = 0;
+						u32 value_high = 0;
+						u32 amount = 0;
+						if (known64(rt, &value_low, &value_high) && known(rs, &amount))
+						{
+							const u64 value = (static_cast<u64>(value_high) << 32) | value_low;
+							const u64 result = static_cast<u64>(static_cast<s64>(value) >> (amount & 0x3f));
+							set64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+						}
+						else
+						{
+							clear(rd);
+						}
+						return;
+					}
+					case 0x38: // DSLL
+					case 0x3c: // DSLL32
+					{
+						u32 value_low = 0;
+						u32 value_high = 0;
+						if (known64(rt, &value_low, &value_high))
+						{
+							const unsigned amount = SA(op) + ((op & 0x3f) == 0x3c ? 32 : 0);
+							const u64 value = (static_cast<u64>(value_high) << 32) | value_low;
+							const u64 result = value << amount;
+							set64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+						}
+						else
+						{
+							clear(rd);
+						}
+						return;
+					}
+					case 0x3a: // DSRL
+					case 0x3e: // DSRL32
+					{
+						u32 value_low = 0;
+						u32 value_high = 0;
+						if (known64(rt, &value_low, &value_high))
+						{
+							const unsigned amount = SA(op) + ((op & 0x3f) == 0x3e ? 32 : 0);
+							const u64 value = (static_cast<u64>(value_high) << 32) | value_low;
+							const u64 result = value >> amount;
+							set64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+						}
+						else
+						{
+							clear(rd);
+						}
+						return;
+					}
+					case 0x3b: // DSRA
+					case 0x3f: // DSRA32
+					{
+						u32 value_low = 0;
+						u32 value_high = 0;
+						if (known64(rt, &value_low, &value_high))
+						{
+							const unsigned amount = SA(op) + ((op & 0x3f) == 0x3f ? 32 : 0);
+							const u64 value = (static_cast<u64>(value_high) << 32) | value_low;
+							const u64 result = static_cast<u64>(static_cast<s64>(value) >> amount);
+							set64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+						}
+						else
+						{
+							clear(rd);
+						}
+						return;
+					}
+					case 0x0a: // MOVZ
+					case 0x0b: // MOVN
+					{
+						if (rs == rd)
+							return;
+
+						u32 condition_low = 0;
+						u32 condition_high = 0;
+						if (known64(rt, &condition_low, &condition_high))
+						{
+							const bool condition_zero = condition_low == 0 && condition_high == 0;
+							const bool move = (op & 0x3f) == 0x0a ? condition_zero : !condition_zero;
+							if (!move)
+								return;
+
+							u32 source_low = 0;
+							u32 source_high = 0;
+							if (known64(rs, &source_low, &source_high))
+								set64(rd, source_low, source_high);
+							else if (known(rs, &source_low))
+								set(rd, source_low);
+							else
+								clear(rd);
+							return;
+						}
+
+						clear(rd);
+						return;
+					}
+					case 0x10: // MFHI
+					case 0x12: // MFLO
+					case 0x28: // MFSA
+						clear(rd);
+						return;
+					case 0x2a: // SLT
+					case 0x2b: // SLTU
+					{
+						u32 lhs_low = 0;
+						u32 lhs_high = 0;
+						u32 rhs_low = 0;
+						u32 rhs_high = 0;
+						if (known64(rs, &lhs_low, &lhs_high) && known64(rt, &rhs_low, &rhs_high))
+						{
+							const u64 lhs = (static_cast<u64>(lhs_high) << 32) | lhs_low;
+							const u64 rhs = (static_cast<u64>(rhs_high) << 32) | rhs_low;
+							const bool result = (op & 0x3f) == 0x2a ?
+								(static_cast<s64>(lhs) < static_cast<s64>(rhs)) :
+								(lhs < rhs);
+							set_zero32(rd, result ? 1 : 0);
+						}
+						else
+						{
+							clear(rd);
+						}
+						return;
+					}
+					default:
+						return;
+				}
+			case 0x01:
+				if (rt == 0x10 || rt == 0x11 || rt == 0x12 || rt == 0x13)
+					set64(31, pc + 8, 0);
+				return;
+			case 0x03: // JAL
+				set64(31, pc + 8, 0);
+				return;
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+				immediate_sign32(rt, rs, static_cast<u32>(static_cast<s32>(IMM_S(op))),
+					[](u32 lhs, u32 rhs) { return lhs + rhs; });
+				return;
+			case 0x18: // DADDI
+			case 0x19: // DADDIU
+			{
+				const u32 imm_low = static_cast<u32>(static_cast<s32>(IMM_S(op)));
+				const u32 imm_high = (IMM_S(op) < 0) ? 0xffffffffu : 0;
+				if (set_add64(rt, rs, imm_low, imm_high))
+					return;
+				immediate_low(rt, rs, imm_low, [](u32 lhs, u32 rhs) { return lhs + rhs; });
+				return;
+			}
+			case 0x0a: // SLTI
+			case 0x0b: // SLTIU
+			{
+				u32 lhs_low = 0;
+				u32 lhs_high = 0;
+				if (known64(rs, &lhs_low, &lhs_high))
+				{
+					const u64 lhs = (static_cast<u64>(lhs_high) << 32) | lhs_low;
+					const s32 imm = static_cast<s32>(IMM_S(op));
+					const u64 imm_value = (static_cast<u64>((imm < 0) ? 0xffffffffu : 0) << 32) |
+										  static_cast<u32>(imm);
+					const bool result = (op >> 26) == 0x0a ?
+						(static_cast<s64>(lhs) < static_cast<s64>(imm)) :
+						(lhs < imm_value);
+					set_zero32(rt, result ? 1 : 0);
+				}
+				else
+				{
+					clear(rt);
+				}
+				return;
+			}
+			case 0x0c: // ANDI
+			{
+				u32 src_value = 0;
+				if (known(rs, &src_value))
+					set_zero32(rt, src_value & IMM_U(op));
+				else
+					clear(rt);
+				return;
+			}
+			case 0x0d: // ORI
+			{
+				u32 src_low = 0;
+				u32 src_high = 0;
+				if (known64(rs, &src_low, &src_high))
+					set64(rt, src_low | IMM_U(op), src_high);
+				else
+					immediate_low(rt, rs, IMM_U(op), [](u32 lhs, u32 rhs) { return lhs | rhs; });
+				return;
+			}
+			case 0x0e: // XORI
+			{
+				u32 src_low = 0;
+				u32 src_high = 0;
+				if (known64(rs, &src_low, &src_high))
+					set64(rt, src_low ^ IMM_U(op), src_high);
+				else
+					immediate_low(rt, rs, IMM_U(op), [](u32 lhs, u32 rhs) { return lhs ^ rhs; });
+				return;
+			}
+			case 0x0f: // LUI
+				set_sign32(rt, op << 16);
+				return;
+			case 0x1a: // LDL
+			case 0x1b: // LDR
+			case 0x1e: // LQ
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x22: // LWL
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+			case 0x26: // LWR
+			case 0x27: // LWU
+			case 0x37: // LD
+				clear(rt);
+				return;
+			case 0x10: // COP0 MFC0 writes rt; other accepted forms write no GPR.
+				if (((op >> 21) & 0x1f) == 0x00)
+					clear(rt);
+				return;
+			case 0x11: // COP1 MFC1/CFC1 write rt.
+				if (((op >> 21) & 0x1f) == 0x00 || ((op >> 21) & 0x1f) == 0x02)
+					clear(rt);
+				return;
+			case 0x12: // COP2 QMFC2/CFC2 write rt.
+				if (((op >> 21) & 0x1f) == 0x01 || ((op >> 21) & 0x1f) == 0x02)
+					clear(rt);
+				return;
+			case 0x1c: // MMI writers target rd when they write a GPR.
+				clear(rd);
+				return;
+			default:
+				return;
+		}
+	}
+
+	void BlockCompiler::UpdateCop1NormalizedStateAfterOpcode(u32 op)
+	{
+		const bool acc_was_normalized = m_cop1_acc_normalized;
+		const bool fs_was_normalized = IsCop1FprNormalized(RD(op));
+		const bool ft_was_normalized = IsCop1FprNormalized(RT(op));
+		const auto clear_fpr = [this](unsigned fpr) {
+			if (fpr < 32)
+				m_cop1_fpr_normalized[fpr] = false;
+		};
+		const auto mark_fpr = [this](unsigned fpr) {
+			if (fpr < 32)
+				m_cop1_fpr_normalized[fpr] = true;
+		};
+		const auto set_fpr = [this](unsigned fpr, bool normalized) {
+			if (fpr < 32)
+				m_cop1_fpr_normalized[fpr] = normalized;
+		};
+
+		switch (op >> 26)
+		{
+			case 0x11: // COP1, owned by FPU.cpp and x86/iFPU.cpp.
+				switch ((op >> 21) & 0x1f)
+				{
+					case 0x00: // MFC1
+					case 0x02: // CFC1
+					case 0x06: // CTC1
+					case 0x08: // BC1*
+						return;
+					case 0x04: // MTC1 writes a raw word into an FPR.
+						clear_fpr(RD(op));
+						return;
+					case 0x10: // COP1_S
+						switch (op & 0x3f)
+						{
+							case 0x00: // ADD_S
+							case 0x01: // SUB_S
+							case 0x02: // MUL_S
+							case 0x03: // DIV_S
+							case 0x04: // SQRT_S
+							case 0x16: // RSQRT_S
+								mark_fpr(SA(op));
+								return;
+							case 0x18: // ADDA_S
+							case 0x19: // SUBA_S
+							case 0x1a: // MULA_S
+								m_cop1_acc_normalized = true;
+								return;
+							case 0x1e: // MADDA_S
+							case 0x1f: // MSUBA_S
+								m_cop1_acc_normalized = acc_was_normalized;
+								return;
+							case 0x1c: // MADD_S
+							case 0x1d: // MSUB_S
+								mark_fpr(SA(op));
+								return;
+							case 0x05: // ABS_S
+							case 0x06: // MOV_S
+							case 0x07: // NEG_S
+								set_fpr(SA(op), fs_was_normalized);
+								return;
+							case 0x28: // MAX_S
+							case 0x29: // MIN_S
+								set_fpr(SA(op), fs_was_normalized && ft_was_normalized);
+								return;
+							case 0x24: // CVT_W
+								clear_fpr(SA(op));
+								return;
+							case 0x30: // C_F
+							case 0x32: // C_EQ
+							case 0x34: // C_LT
+							case 0x36: // C_LE
+								return;
+							default:
+								ClearCop1NormalizedState();
+								return;
+						}
+					case 0x14: // COP1_W
+						if ((op & 0x3f) == 0x20) // CVT_S
+						{
+							mark_fpr(SA(op));
+							return;
+						}
+						ClearCop1NormalizedState();
+						return;
+					default:
+						ClearCop1NormalizedState();
+						return;
+				}
+			case 0x31: // LWC1 writes a raw memory word into an FPR.
+				clear_fpr(RT(op));
+				return;
+			default:
+				return;
+		}
+	}
+
 	void BlockCompiler::StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
-		bool allow_r10, bool allow_r11)
+		bool allow_r10, bool allow_r11, bool prefer_dirty_writes)
 	{
 		m_staged_pin_count = 0;
 
 		u16 read_counts[32]{};
 		u16 dword_read_counts[32]{};
+		u16 write_counts[32]{};
+		u16 dword_write_counts[32]{};
 		for (u32 i = 0; i < instruction_count; i++)
 		{
+			const u32 op = memRead32(start_pc + i * 4);
 			GprPinOpInfo info;
-			if (!ClassifyOpcodeForGprPinning(memRead32(start_pc + i * 4), &info))
+			if (!ClassifyOpcodeForGprPinning(op, &info))
 				return;
 
 			for (unsigned read = 0; read < info.low_read_count; read++)
@@ -2872,6 +3869,20 @@ namespace VitaEE
 				const unsigned guest_reg = info.dword_reads[read];
 				read_counts[guest_reg]++;
 				dword_read_counts[guest_reg]++;
+			}
+
+			if (prefer_dirty_writes)
+			{
+				DirtyGprPinOpInfo dirty_info;
+				if (!ClassifyOpcodeForDirtyGprPins(op, &dirty_info))
+					return;
+
+				for (unsigned write = 0; write < dirty_info.write_count; write++)
+				{
+					const unsigned guest_reg = dirty_info.writes[write];
+					write_counts[guest_reg]++;
+					dword_write_counts[guest_reg]++;
+				}
 			}
 		}
 
@@ -2889,6 +3900,14 @@ namespace VitaEE
 
 		bool host_used[MAX_GPR_PINS]{};
 		unsigned used_hosts = 0;
+		const auto find_free_host_slot = [&](unsigned host_reg) {
+			for (unsigned slot = 0; slot < host_count; slot++)
+			{
+				if (!host_used[slot] && hosts[slot] == host_reg)
+					return slot;
+			}
+			return host_count;
+		};
 		const auto next_free_host_slot = [&]() {
 			for (unsigned slot = 0; slot < host_count; slot++)
 			{
@@ -2897,6 +3916,37 @@ namespace VitaEE
 			}
 			return host_count;
 		};
+		const auto next_free_dual_host_slots = [&](unsigned* low_slot, unsigned* high_slot) {
+			if (!low_slot || !high_slot)
+				return false;
+
+			for (unsigned slot = 0; slot < host_count; slot++)
+			{
+				if (host_used[slot])
+					continue;
+
+				const unsigned low_host = hosts[slot];
+				const unsigned high_host = low_host + 1;
+				if (!CanUseA32DualTransferPair(low_host, high_host))
+					continue;
+
+				const unsigned candidate_high_slot = find_free_host_slot(high_host);
+				if (candidate_high_slot < host_count)
+				{
+					*low_slot = slot;
+					*high_slot = candidate_high_slot;
+					return true;
+				}
+			}
+
+			*low_slot = next_free_host_slot();
+			if (*low_slot >= host_count)
+				return false;
+			host_used[*low_slot] = true;
+			*high_slot = next_free_host_slot();
+			host_used[*low_slot] = false;
+			return *high_slot < host_count;
+		};
 
 		while (used_hosts + 1 < host_count)
 		{
@@ -2904,22 +3954,25 @@ namespace VitaEE
 			u16 best_count = 1; // one low64 read only trades the entry loads for moves
 			for (unsigned reg = 1; reg < 32; reg++)
 			{
-				if (dword_read_counts[reg] > best_count)
+				const u16 write_score = dword_write_counts[reg] >= 3 ? dword_write_counts[reg] : 0;
+				const u16 score = (dword_read_counts[reg] > write_score) ?
+									  dword_read_counts[reg] :
+									  write_score;
+				if (score > best_count)
 				{
-					best_count = dword_read_counts[reg];
+					best_count = score;
 					best_reg = reg;
 				}
 			}
 
 			if (best_reg != 0)
 			{
-				unsigned low_slot = next_free_host_slot();
-				if (low_slot >= host_count)
+				unsigned low_slot = host_count;
+				unsigned high_slot = host_count;
+				if (!next_free_dual_host_slots(&low_slot, &high_slot))
 					break;
+
 				host_used[low_slot] = true;
-				unsigned high_slot = next_free_host_slot();
-				if (high_slot >= host_count)
-					break;
 				m_staged_pin_guest[m_staged_pin_count] = static_cast<u8>(best_reg);
 				m_staged_pin_host[m_staged_pin_count] = hosts[low_slot];
 				m_staged_pin_high_host[m_staged_pin_count] = hosts[high_slot];
@@ -2928,6 +3981,8 @@ namespace VitaEE
 				used_hosts += 2;
 				read_counts[best_reg] = 0;
 				dword_read_counts[best_reg] = 0;
+				write_counts[best_reg] = 0;
+				dword_write_counts[best_reg] = 0;
 			}
 			else
 			{
@@ -2941,12 +3996,14 @@ namespace VitaEE
 				continue;
 
 			unsigned best_reg = 0;
-			u16 best_count = 1; // a single read would only trade the entry load for the read
+			u16 best_count = 1; // a single read only trades the entry load for the read
 			for (unsigned reg = 1; reg < 32; reg++)
 			{
-				if (read_counts[reg] > best_count)
+				const u16 write_score = write_counts[reg] >= 3 ? write_counts[reg] : 0;
+				const u16 score = (read_counts[reg] > write_score) ? read_counts[reg] : write_score;
+				if (score > best_count)
 				{
-					best_count = read_counts[reg];
+					best_count = score;
 					best_reg = reg;
 				}
 			}
@@ -2955,6 +4012,7 @@ namespace VitaEE
 				break;
 
 			read_counts[best_reg] = 0;
+			write_counts[best_reg] = 0;
 			m_staged_pin_guest[m_staged_pin_count] = static_cast<u8>(best_reg);
 			m_staged_pin_host[m_staged_pin_count] = hosts[slot];
 			m_staged_pin_high_host[m_staged_pin_count] = NO_GPR_PIN_HOST;
@@ -2962,6 +4020,35 @@ namespace VitaEE
 			host_used[slot] = true;
 			used_hosts++;
 		}
+	}
+
+	bool BlockCompiler::BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const
+	{
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			DirtyGprPinOpInfo info;
+			if (!ClassifyOpcodeForDirtyGprPins(memRead32(start_pc + i * 4), &info))
+				return false;
+
+			for (unsigned write = 0; write < info.write_count; write++)
+			{
+				if (FindGprPinIndex(info.writes[write]) >= 0)
+					return true;
+			}
+		}
+
+		return false;
+	}
+
+	int BlockCompiler::FindGprPinIndex(unsigned guest_reg) const
+	{
+		for (unsigned i = 0; i < m_pin_count; i++)
+		{
+			if (m_pin_guest[i] == guest_reg)
+				return static_cast<int>(i);
+		}
+
+		return -1;
 	}
 
 	int BlockCompiler::FindGprPinHost(unsigned guest_reg) const
@@ -2989,21 +4076,159 @@ namespace VitaEE
 	bool BlockCompiler::EmitGprPinLoads()
 	{
 		for (unsigned i = 0; i < m_pin_count; i++)
-		{
-			if (!m_code.EmitLdrImm12(m_pin_host[i], HOST_CPU_REGS,
-					static_cast<u16>(GprOffset(m_pin_guest[i]))))
 			{
-				return false;
+				const size_t offset = GprOffset(m_pin_guest[i]);
+				if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+					offset <= 0xff &&
+					CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))
+				{
+					if (!m_code.EmitLdrdImm8(m_pin_host[i], m_pin_high_host[i], HOST_CPU_REGS,
+						static_cast<u8>(offset)))
+					{
+						return false;
+					}
+					continue;
+				}
+
+				if (!m_code.EmitLdrImm12(m_pin_host[i], HOST_CPU_REGS, static_cast<u16>(offset)))
+					return false;
+
+				if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+					!m_code.EmitLdrImm12(m_pin_high_host[i], HOST_CPU_REGS,
+						static_cast<u16>(offset + sizeof(u32))))
+				{
+					return false;
+				}
 			}
 
-			if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
-				!m_code.EmitLdrImm12(m_pin_high_host[i], HOST_CPU_REGS,
-					static_cast<u16>(GprOffset(m_pin_guest[i]) + sizeof(u32))))
-			{
-				return false;
-			}
-		}
+		return true;
+	}
 
+	bool BlockCompiler::EmitFlushDirtyGprPins()
+	{
+		if (!m_dirty_pins_enabled)
+			return true;
+
+			for (unsigned i = 0; i < m_pin_count; i++)
+			{
+				const size_t offset = GprOffset(m_pin_guest[i]);
+				if (m_pin_dirty_low[i] && m_pin_dirty_high[i] &&
+					m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+					offset <= 0xff &&
+					CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))
+				{
+					if (!m_code.EmitStrdImm8(m_pin_host[i], m_pin_high_host[i], HOST_CPU_REGS,
+						static_cast<u8>(offset)))
+					{
+						return false;
+					}
+					m_pin_dirty_low[i] = false;
+					m_pin_dirty_high[i] = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuGprDirtyPinFlushStores += 2;
+#endif
+					continue;
+				}
+
+				if (m_pin_dirty_low[i])
+				{
+					if (!m_code.EmitStrImm12(m_pin_host[i], HOST_CPU_REGS, static_cast<u16>(offset)))
+					{
+						return false;
+					}
+					m_pin_dirty_low[i] = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuGprDirtyPinFlushStores++;
+#endif
+				}
+
+				if (m_pin_dirty_high[i])
+				{
+					if (m_pin_high_host[i] == NO_GPR_PIN_HOST ||
+						!m_code.EmitStrImm12(m_pin_high_host[i], HOST_CPU_REGS,
+							static_cast<u16>(offset + sizeof(u32))))
+					{
+						return false;
+					}
+					m_pin_dirty_high[i] = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuGprDirtyPinFlushStores++;
+#endif
+				}
+			}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitSyncGprPinsToBacking()
+	{
+		if (!m_dirty_pins_enabled)
+			return true;
+
+			for (unsigned i = 0; i < m_pin_count; i++)
+			{
+				const size_t offset = GprOffset(m_pin_guest[i]);
+				if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+					offset <= 0xff &&
+					CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))
+				{
+					if (!m_code.EmitStrdImm8(m_pin_host[i], m_pin_high_host[i], HOST_CPU_REGS,
+						static_cast<u8>(offset)))
+					{
+						return false;
+					}
+					m_pin_dirty_low[i] = false;
+					m_pin_dirty_high[i] = false;
+					continue;
+				}
+
+				if (!m_code.EmitStrImm12(m_pin_host[i], HOST_CPU_REGS, static_cast<u16>(offset)))
+					return false;
+
+				m_pin_dirty_low[i] = false;
+				if (m_pin_high_host[i] != NO_GPR_PIN_HOST)
+				{
+					if (!m_code.EmitStrImm12(m_pin_high_host[i], HOST_CPU_REGS,
+						static_cast<u16>(offset + sizeof(u32))))
+					{
+						return false;
+					}
+					m_pin_dirty_high[i] = false;
+				}
+			}
+
+		return true;
+	}
+
+	bool BlockCompiler::TryDeferGprPinLowStore(unsigned guest_reg)
+	{
+		if (!m_dirty_pins_enabled)
+			return false;
+
+		const int pin_index = FindGprPinIndex(guest_reg);
+		if (pin_index < 0)
+			return false;
+
+		m_pin_dirty_low[pin_index] = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGprDirtyPinLowStoresElided++;
+#endif
+		return true;
+	}
+
+	bool BlockCompiler::TryDeferGprPinHighStore(unsigned guest_reg)
+	{
+		if (!m_dirty_pins_enabled)
+			return false;
+
+		const int pin_index = FindGprPinIndex(guest_reg);
+		if (pin_index < 0 || m_pin_high_host[pin_index] == NO_GPR_PIN_HOST)
+			return false;
+
+		m_pin_dirty_high[pin_index] = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGprDirtyPinHighStoresElided++;
+#endif
 		return true;
 	}
 
@@ -3078,7 +4303,7 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register,
-		bool use_vu0_base_register)
+		bool use_vu0_base_register, size_t* linked_entry_offset)
 	{
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
@@ -3092,17 +4317,22 @@ namespace VitaEE
 		m_cop1_exponent_mask_available = use_cop1_exponent_mask_register;
 		m_vu0_base_available = use_vu0_base_register;
 		ClearGprQCache();
+		ClearGprConstState();
+		ClearCop1NormalizedState();
+		for (unsigned i = 0; i < MAX_GPR_PINS; i++)
+		{
+			m_pin_dirty_low[i] = false;
+			m_pin_dirty_high[i] = false;
+		}
 #if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGprConstBlocks++;
 		if (m_gpr_q_cache_enabled)
 			g_qemuGprQCacheBlocks++;
 #endif
-		m_saved_registers = REG_R4 | REG_R5 | REG_R6;
-		if (use_vtlb_registers)
-			m_saved_registers |= REG_R7 | REG_R8;
-		if (use_cop1_exponent_mask_register)
-			m_saved_registers |= REG_R10;
-		if (use_vu0_base_register)
-			m_saved_registers |= REG_R11;
+		// Native EE links can now jump body-to-body. Keep every block on the
+		// same generated frame so any linked target can eventually pop back to
+		// the original C++ caller, regardless of which resident registers it uses.
+		m_saved_registers = EE_LINK_FRAME_REGISTERS;
 
 		// Adopt the staged GPR pins, dropping any whose host register a block
 		// feature claimed after staging.
@@ -3127,9 +4357,6 @@ namespace VitaEE
 			m_pin_host[m_pin_count] = static_cast<u8>(host);
 			m_pin_high_host[m_pin_count] = static_cast<u8>(high_host);
 			m_pin_count++;
-			m_saved_registers |= static_cast<u16>(1u << host);
-			if (high_host != NO_GPR_PIN_HOST)
-				m_saved_registers |= static_cast<u16>(1u << high_host);
 		}
 		m_staged_pin_count = 0;
 
@@ -3152,24 +4379,19 @@ namespace VitaEE
 		}
 #endif
 
-		// Keep SP 8-byte aligned for AAPCS helper calls after any resident-register choice.
-		if ((RegisterCount(m_saved_registers | REG_LR) & 1u) != 0)
-		{
-			if (!(m_saved_registers & REG_R9))
-				m_saved_registers |= REG_R9;
-			else if (!(m_saved_registers & REG_R10))
-				m_saved_registers |= REG_R10;
-			else if (!(m_saved_registers & REG_R11))
-				m_saved_registers |= REG_R11;
-			else
-				m_saved_registers |= REG_R3;
-		}
-
-		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
-			!m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))))
+		if (!m_code.EmitPush(m_saved_registers | REG_LR))
 		{
 			return false;
 		}
+
+		if (!m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))))
+			return false;
+
+		// r4 is never used as a pin/scratch register and AAPCS helpers preserve
+		// it, so generated links can skip the callable-entry frame setup and the
+		// cpuRegs base materialization while still letting final exits pop once.
+		if (linked_entry_offset)
+			*linked_entry_offset = m_code.Size();
 
 		if (use_cop1_exponent_mask_register &&
 			!m_code.EmitMovImm32(HOST_COP1_EXPONENT_MASK, FPU_FLOAT_EXPONENT_MASK))
@@ -3196,7 +4418,9 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit,
-		const void* event_exit, u32* scaled_cycles, DirectLinkSlots* direct_links)
+		const void* event_exit, u32* scaled_cycles, DirectLinkSlots* direct_links,
+		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
+		size_t* linked_entry_offset)
 	{
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return false;
@@ -3208,11 +4432,24 @@ namespace VitaEE
 		const bool use_cop1_exponent_mask_register =
 			BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count);
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
+		const bool dirty_pins_candidate = BlockCanUseDirtyGprPins(start_pc, instruction_count);
+		m_dirty_pins_enabled = false;
 		m_gpr_q_cache_enabled = BlockShouldUseGprQCache(start_pc, instruction_count);
 		StageGprPinsForBlock(start_pc, instruction_count, !use_vtlb_registers, !use_vtlb_registers,
-			!use_cop1_exponent_mask_register, !use_vu0_base_register);
-		if (!BeginBlock(use_vtlb_registers, use_cop1_exponent_mask_register, use_vu0_base_register))
+			!use_cop1_exponent_mask_register, !use_vu0_base_register, dirty_pins_candidate);
+		if (linked_entry_offset)
+			*linked_entry_offset = 0;
+
+		if (!BeginBlock(use_vtlb_registers, use_cop1_exponent_mask_register, use_vu0_base_register,
+				linked_entry_offset))
+		{
 			return false;
+		}
+		m_dirty_pins_enabled = dirty_pins_candidate && BlockWritesPinnedGpr(start_pc, instruction_count);
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (m_dirty_pins_enabled)
+			g_qemuGprDirtyPinBlocks++;
+#endif
 		// Pins must be live before any emitted GPR read, including the Goemon
 		// hook's GPR4 argument load; the hook's helpers are AAPCS calls that
 		// preserve the callee-saved pin hosts and never write the GPR file.
@@ -3229,12 +4466,17 @@ namespace VitaEE
 		bool has_static_conditional_direct_links = false;
 		bool has_static_likely_direct_links = false;
 		bool branch_is_likely = false;
+		bool branch_likely_delay_slot_cancelled = false;
 		bool pending_di_clear = false;
 		u32 branch_instruction_index = 0;
 		u32 branch_target_pc = 0;
 		u32 static_direct_link_target_pc = 0;
 		u32 branch_likely_not_taken_raw_cycles = 0;
 		size_t branch_likely_skip_delay = static_cast<size_t>(-1);
+		const auto set_static_branch_link = [&](u32 target_pc) {
+			has_static_direct_link_target = true;
+			static_direct_link_target_pc = target_pc;
+		};
 		const auto add_raw_cycles = [&raw_cycles](u32 op) {
 			// PCSX2's x86 recRecompile() gives NOP a fixed 9-cycle raw cost before
 			// scaling; all other op costs come from the R5900 opcode table.
@@ -3251,6 +4493,9 @@ namespace VitaEE
 
 			if (has_branch && i > branch_instruction_index + 1)
 				return false;
+
+			if (branch_likely_delay_slot_cancelled && i == branch_instruction_index + 1)
+				continue;
 
 			if (IsSupportedBranchOpcode(op))
 			{
@@ -3309,10 +4554,43 @@ namespace VitaEE
 						break;
 					case 0x01:
 						branch_target_pc = BranchTarget(pc, op);
+						{
+							bool constant_branch_taken = false;
+							if (TryEvaluateConstantRegimmLinkBranch(op, &constant_branch_taken))
+							{
+								if (!EmitLink(31, pc))
+									return false;
+								set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+								if (branch_is_likely)
+								{
+									branch_likely_delay_slot_cancelled = !constant_branch_taken;
+									branch_is_likely = false;
+								}
+								break;
+							}
+						}
 						if (branch_is_likely)
+						{
+							bool constant_branch_taken = false;
+							if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+							{
+								set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+								branch_likely_delay_slot_cancelled = !constant_branch_taken;
+								branch_is_likely = false;
+								break;
+							}
 							has_static_likely_direct_links = true;
+						}
 						else
+						{
+							bool constant_branch_taken = false;
+							if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+							{
+								set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+								break;
+							}
 							has_static_conditional_direct_links = true;
+						}
 						if (!EmitREGIMM(op, pc))
 							return false;
 						break;
@@ -3320,8 +4598,7 @@ namespace VitaEE
 						branch_target_pc = JumpTarget(pc, op);
 						if (EmuConfig.Gamefixes.GoemonTlbHack)
 							branch_target_pc = vtlb_V2P(branch_target_pc);
-						has_static_direct_link_target = true;
-						static_direct_link_target_pc = branch_target_pc;
+						set_static_branch_link(branch_target_pc);
 						if (!EmitJ(op, pc))
 							return false;
 						break;
@@ -3329,35 +4606,66 @@ namespace VitaEE
 						branch_target_pc = JumpTarget(pc, op);
 						if (EmuConfig.Gamefixes.GoemonTlbHack)
 							branch_target_pc = vtlb_V2P(branch_target_pc);
-						has_static_direct_link_target = true;
-						static_direct_link_target_pc = branch_target_pc;
+						set_static_branch_link(branch_target_pc);
 						if (!EmitJAL(op, pc))
 							return false;
 						break;
 					case 0x04:
+					{
 						branch_target_pc = BranchTarget(pc, op);
+						bool constant_branch_taken = false;
+						if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+						{
+							set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+							break;
+						}
 						has_static_conditional_direct_links = true;
 						if (!EmitBEQ(op))
 							return false;
 						break;
+					}
 					case 0x05:
+					{
 						branch_target_pc = BranchTarget(pc, op);
+						bool constant_branch_taken = false;
+						if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+						{
+							set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+							break;
+						}
 						has_static_conditional_direct_links = true;
 						if (!EmitBNE(op))
 							return false;
 						break;
+					}
 					case 0x06:
+					{
 						branch_target_pc = BranchTarget(pc, op);
+						bool constant_branch_taken = false;
+						if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+						{
+							set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+							break;
+						}
 						has_static_conditional_direct_links = true;
 						if (!EmitBLEZ(op))
 							return false;
 						break;
+					}
 					case 0x07:
+					{
 						branch_target_pc = BranchTarget(pc, op);
+						bool constant_branch_taken = false;
+						if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+						{
+							set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+							break;
+						}
 						has_static_conditional_direct_links = true;
 						if (!EmitBGTZ(op))
 							return false;
 						break;
+					}
 					case 0x10:
 						branch_target_pc = BranchTarget(pc, op);
 						if (branch_is_likely)
@@ -3386,33 +4694,75 @@ namespace VitaEE
 							return false;
 						break;
 					case 0x14:
+					{
 						branch_target_pc = BranchTarget(pc, op);
+						bool constant_branch_taken = false;
+						if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+						{
+							set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+							branch_likely_delay_slot_cancelled = !constant_branch_taken;
+							branch_is_likely = false;
+							break;
+						}
 						has_static_likely_direct_links = true;
 						if (!EmitBEQL(op))
 							return false;
 						break;
+					}
 					case 0x15:
+					{
 						branch_target_pc = BranchTarget(pc, op);
+						bool constant_branch_taken = false;
+						if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+						{
+							set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+							branch_likely_delay_slot_cancelled = !constant_branch_taken;
+							branch_is_likely = false;
+							break;
+						}
 						has_static_likely_direct_links = true;
 						if (!EmitBNEL(op))
 							return false;
 						break;
+					}
 					case 0x16:
+					{
 						branch_target_pc = BranchTarget(pc, op);
+						bool constant_branch_taken = false;
+						if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+						{
+							set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+							branch_likely_delay_slot_cancelled = !constant_branch_taken;
+							branch_is_likely = false;
+							break;
+						}
 						has_static_likely_direct_links = true;
 						if (!EmitBLEZL(op))
 							return false;
 						break;
+					}
 					case 0x17:
+					{
 						branch_target_pc = BranchTarget(pc, op);
+						bool constant_branch_taken = false;
+						if (TryEvaluateConstantBranch(op, &constant_branch_taken))
+						{
+							set_static_branch_link(constant_branch_taken ? branch_target_pc : pc + 8);
+							branch_likely_delay_slot_cancelled = !constant_branch_taken;
+							branch_is_likely = false;
+							break;
+						}
 						has_static_likely_direct_links = true;
 						if (!EmitBGTZL(op))
 							return false;
 						break;
+					}
 					default:
 						return false;
 				}
 
+				UpdateGprConstStateAfterOpcode(op, pc);
+				UpdateCop1NormalizedStateAfterOpcode(op);
 				if (branch_is_likely)
 				{
 					// PCSX2 owners: Interpreter.cpp::BEQL()/BNEL()/BLEZL()/BGTZL()
@@ -3463,6 +4813,8 @@ namespace VitaEE
 			}
 			if (!EmitOpcode(op, pc, raw_cycles, event_exit, branch_delay_slot))
 				return false;
+			UpdateGprConstStateAfterOpcode(op, pc);
+			UpdateCop1NormalizedStateAfterOpcode(op);
 
 			if (pending_di_clear)
 			{
@@ -3533,6 +4885,11 @@ namespace VitaEE
 				if (!EmitStorePcFromHostReg(HOST_BRANCH_TARGET))
 					return false;
 			}
+			else if (has_static_direct_link_target)
+			{
+				if (!EmitStorePc(static_direct_link_target_pc))
+					return false;
+			}
 			else if (!EmitStoreBranchPc(branch_target_pc, next_pc))
 			{
 				return false;
@@ -3545,11 +4902,12 @@ namespace VitaEE
 
 		if (has_branch && branch_is_likely)
 		{
-			size_t not_taken_link_target_offset = 0;
-			size_t taken_link_target_offset = 0;
+			DirectLinkSlot* const not_taken_link =
+				(direct_links && has_static_likely_direct_links) ? &direct_links->slots[0] : nullptr;
+			DirectLinkSlot* const taken_link =
+				(direct_links && has_static_likely_direct_links) ? &direct_links->slots[1] : nullptr;
 			if (!EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit,
-					direct_links && has_static_likely_direct_links ? &not_taken_link_target_offset : nullptr,
-					direct_links && has_static_likely_direct_links ? &taken_link_target_offset : nullptr))
+					not_taken_link, taken_link))
 			{
 				return false;
 			}
@@ -3560,24 +4918,25 @@ namespace VitaEE
 			if (direct_links && has_static_likely_direct_links)
 			{
 				direct_links->slots[0].target_pc = next_pc;
-				direct_links->slots[0].target_offset = not_taken_link_target_offset;
 				direct_links->slots[0].valid = true;
 
 				direct_links->slots[1].target_pc = branch_target_pc;
-				direct_links->slots[1].target_offset = taken_link_target_offset;
 				direct_links->slots[1].valid = true;
 			}
 
 			return true;
 		}
 
-		size_t direct_link_target_offset = 0;
-		size_t taken_link_target_offset = 0;
-		const bool can_direct_link = !has_branch || has_static_direct_link_target ||
+			const bool can_direct_link = !has_branch || has_static_direct_link_target ||
 									 has_static_conditional_direct_links;
+		DirectLinkSlot* const direct_link =
+			(direct_links && can_direct_link) ? &direct_links->slots[0] : nullptr;
+		DirectLinkSlot* const taken_link =
+			(direct_links && has_static_conditional_direct_links) ? &direct_links->slots[1] : nullptr;
 		if (!EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
-				direct_links && can_direct_link ? &direct_link_target_offset : nullptr,
-				direct_links && has_static_conditional_direct_links ? &taken_link_target_offset : nullptr))
+				direct_link, taken_link,
+				has_register_branch_target ? indirect_lookup_pages_slot : nullptr,
+				has_register_branch_target ? direct_linking_enabled_flag : nullptr))
 		{
 			return false;
 		}
@@ -3588,13 +4947,11 @@ namespace VitaEE
 		if (direct_links && can_direct_link)
 		{
 			direct_links->slots[0].target_pc = has_static_direct_link_target ? static_direct_link_target_pc : next_pc;
-			direct_links->slots[0].target_offset = direct_link_target_offset;
 			direct_links->slots[0].valid = true;
 
 			if (has_static_conditional_direct_links)
 			{
 				direct_links->slots[1].target_pc = branch_target_pc;
-				direct_links->slots[1].target_offset = taken_link_target_offset;
 				direct_links->slots[1].valid = true;
 			}
 		}
@@ -3703,40 +5060,132 @@ namespace VitaEE
 		}
 	}
 
-		bool BlockCompiler::EndBlockReturn(u8 value)
+	bool BlockCompiler::EndBlockReturn(u8 value)
+	{
+		return m_code.EmitMovImm8(0, value) &&
+			   m_code.EmitPop(m_saved_registers | REG_PC);
+	}
+
+	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link)
+	{
+		if (!direct_exit)
+			return false;
+
+		const size_t target_offset = m_code.Size();
+		const size_t target_branch = m_code.EmitBranchPlaceholder();
+		if (target_branch == static_cast<size_t>(-1))
+			return false;
+
+		const size_t fallback_offset = m_code.Size();
+		if (!m_code.PatchBranch(target_branch, fallback_offset) ||
+			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
+			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
-			return m_code.EmitMovImm8(0, value) &&
-				   m_code.EmitPop(m_saved_registers | REG_PC);
+			return false;
 		}
 
+		if (direct_link)
+		{
+			direct_link->target_offset = target_offset;
+			direct_link->fallback_offset = fallback_offset;
+		}
+		return true;
+	}
+
+	bool BlockCompiler::EmitEventExitReturn(const void* event_exit)
+	{
+		if (!event_exit)
+			return false;
+
+		return m_code.EmitMovImm8(0, EE_EVENT_EXIT_TOKEN) &&
+			   m_code.EmitPop(m_saved_registers | REG_PC);
+	}
+
+	bool BlockCompiler::EmitIndirectDispatchTail(const void* lookup_pages_slot,
+		const void* direct_linking_enabled_flag)
+	{
+		if (!lookup_pages_slot || !direct_linking_enabled_flag)
+			return false;
+
+		if (!m_code.EmitTstImm32(HOST_BRANCH_TARGET, 0x3))
+			return false;
+
+		size_t fallback_unaligned = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_unaligned == static_cast<size_t>(-1))
+			return false;
+
+		// The slot points at BlockExecutor::m_active_generated_lookup_pages:
+		// null while generated linking is disabled, otherwise the populated
+		// PCSX2 BaseBlocks-style directory. That makes the disabled case share
+		// the same no-directory fallback instead of loading a separate flag.
+		if (!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(reinterpret_cast<uptr>(lookup_pages_slot))) ||
+			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return false;
+		}
+
+		size_t fallback_no_directory = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (fallback_no_directory == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_BRANCH_TARGET, VitaA32::ShiftType::LSR, 16) ||
+			!m_code.EmitLdrRegShift(HOST_TMP0, HOST_TMP0, HOST_TMP1, VitaA32::ShiftType::LSL, 2) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return false;
+		}
+
+		size_t fallback_no_page = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (fallback_no_page == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitUbfx(HOST_TMP1, HOST_BRANCH_TARGET, 2, 14) ||
+			!m_code.EmitLdrRegShift(HOST_TMP4, HOST_TMP0, HOST_TMP1, VitaA32::ShiftType::LSL, 2) ||
+			!m_code.EmitCmpImm32(HOST_TMP4, 0))
+		{
+			return false;
+		}
+
+		size_t fallback_no_entry = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (fallback_no_entry == static_cast<size_t>(-1))
+			return false;
+
+		if (!m_code.EmitBx(HOST_TMP4))
+		{
+			return false;
+		}
+
+		const size_t fallback_target = m_code.Size();
+		return m_code.PatchBranch(fallback_unaligned, fallback_target, VitaA32::Condition::NE) &&
+			   m_code.PatchBranch(fallback_no_directory, fallback_target, VitaA32::Condition::EQ) &&
+			   m_code.PatchBranch(fallback_no_page, fallback_target, VitaA32::Condition::EQ) &&
+			   m_code.PatchBranch(fallback_no_entry, fallback_target, VitaA32::Condition::EQ) &&
+			   m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) &&
+			   m_code.EmitPop(m_saved_registers | REG_PC);
+	}
+
 	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
-		size_t* direct_link_target_offset, size_t* taken_link_target_offset)
+		DirectLinkSlot* direct_link, DirectLinkSlot* taken_link,
+		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
 
-		if (!EmitLoadCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2))
-		{
+		if (!EmitFlushDirtyGprPins())
 			return false;
-		}
 
-		if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, block_cycles, true))
-		{
-			if (!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
-				!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true))
-			{
-				return false;
-			}
-		}
+		size_t carry_branch = static_cast<size_t>(-1);
+		if (!EmitAddScaledCyclesToCpuLowWord(block_cycles, HOST_TMP0, HOST_TMP2, &carry_branch))
+			return false;
 
 		// Mirrors PCSX2's normal x86/ix86-32/iR5900.cpp::iBranchTest() path.
-		// The signed-negative branch is the direct continuation/link path owned by
-		// x86/BaseblockEx.cpp::BaseBlocks::Link() once Vita block linking exists.
-		if (!m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) ||
-			!EmitStoreCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2) ||
-			!EmitLoadCpuRegsU64(NEXT_EVENT_OFFSET, HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
-			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true) ||
-			!m_code.EmitSbcReg(HOST_TMP3, HOST_TMP1, HOST_TMP3, true))
+		// Scheduler deltas are bounded to signed 32-bit windows
+		// (`R5900.cpp::cpuSetNextEvent()` / `cpuTestCycle()`), so the hot path
+		// compares the low-word delta and only fixes the u64 high word on wrap.
+		const size_t cycle_compare_target = m_code.Size();
+		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
 		{
 			return false;
 		}
@@ -3745,80 +5194,75 @@ namespace VitaEE
 		if (direct_branch == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(m_saved_registers | REG_PC))
-		{
+		if (!EmitEventExitReturn(event_exit))
 			return false;
-		}
 
 		const size_t direct_target = m_code.Size();
-		if (taken_link_target_offset)
+		if (taken_link)
 		{
 			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
-			{
 				return false;
-			}
 
 			const size_t taken_tail = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!m_code.EmitPop(m_saved_registers | REG_LR))
+			if (!EmitDirectLinkTail(direct_exit, direct_link))
 				return false;
-
-			const size_t fallthrough_target_offset = m_code.Size();
-			if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
-				!m_code.EmitBx(HOST_TMP4))
-			{
-				return false;
-			}
 
 			const size_t taken_tail_target = m_code.Size();
-			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) ||
-				!m_code.EmitPop(m_saved_registers | REG_LR))
+			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE))
+				return false;
+
+			const size_t carry_branches[] = {carry_branch};
+			if (!EmitDirectLinkTail(direct_exit, taken_link) ||
+				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI) ||
+				!EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1))
 			{
 				return false;
 			}
 
-			const size_t taken_target_offset = m_code.Size();
-			if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
-				!m_code.EmitBx(HOST_TMP4) ||
+			return true;
+		}
+
+		if (direct_link)
+		{
+			if (!EmitDirectLinkTail(direct_exit, direct_link) ||
 				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
 			{
 				return false;
 			}
-
-			if (direct_link_target_offset)
-				*direct_link_target_offset = fallthrough_target_offset;
-			*taken_link_target_offset = taken_target_offset;
-			return true;
 		}
-
-		if (!m_code.EmitPop(m_saved_registers | REG_LR))
-			return false;
-
-		const size_t target_offset = m_code.Size();
-		if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
-			!m_code.EmitBx(HOST_TMP4) ||
+		else if (indirect_lookup_pages_slot && direct_linking_enabled_flag)
+		{
+			if (!EmitIndirectDispatchTail(indirect_lookup_pages_slot, direct_linking_enabled_flag) ||
+				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
+			{
+				return false;
+			}
+		}
+		else if (!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
+			!m_code.EmitPop(m_saved_registers | REG_PC) ||
 			!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
 		{
 			return false;
 		}
 
-		if (direct_link_target_offset)
-			*direct_link_target_offset = target_offset;
-
-		return true;
+		const size_t carry_branches[] = {carry_branch};
+		return EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles,
-		const void* direct_exit, const void* event_exit, size_t* not_taken_link_target_offset,
-		size_t* taken_link_target_offset)
+		const void* direct_exit, const void* event_exit, DirectLinkSlot* not_taken_link,
+		DirectLinkSlot* taken_link)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
 
-		if (!EmitLoadCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2) ||
+		if (!EmitFlushDirtyGprPins())
+			return false;
+
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
 			!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 		{
 			return false;
@@ -3828,7 +5272,7 @@ namespace VitaEE
 		if (taken_path == static_cast<size_t>(-1))
 			return false;
 
-		const auto add_cycles = [this](u32 cycles) {
+		const auto add_cycles = [this](u32 cycles, size_t* carry_branch) {
 			if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, cycles, true))
 			{
 				if (!m_code.EmitMovImm32(HOST_TMP2, cycles) ||
@@ -3838,11 +5282,15 @@ namespace VitaEE
 				}
 			}
 
-			return m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
-				   EmitStoreCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2);
+			if (!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)))
+				return false;
+
+			*carry_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+			return *carry_branch != static_cast<size_t>(-1);
 		};
 
-		if (!add_cycles(not_taken_cycles))
+		size_t not_taken_carry_branch = static_cast<size_t>(-1);
+		if (!add_cycles(not_taken_cycles, &not_taken_carry_branch))
 			return false;
 
 		const size_t cycles_done = m_code.EmitBranchPlaceholder();
@@ -3850,8 +5298,9 @@ namespace VitaEE
 			return false;
 
 		const size_t taken_target = m_code.Size();
+		size_t taken_carry_branch = static_cast<size_t>(-1);
 		if (!m_code.PatchBranch(taken_path, taken_target, VitaA32::Condition::NE) ||
-			!add_cycles(taken_cycles))
+			!add_cycles(taken_cycles, &taken_carry_branch))
 		{
 			return false;
 		}
@@ -3860,9 +5309,9 @@ namespace VitaEE
 		if (!m_code.PatchBranch(cycles_done, cycles_done_target))
 			return false;
 
-		if (!EmitLoadCpuRegsU64(NEXT_EVENT_OFFSET, HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
-			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true) ||
-			!m_code.EmitSbcReg(HOST_TMP3, HOST_TMP1, HOST_TMP3, true))
+		const size_t cycle_compare_target = m_code.Size();
+		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
 		{
 			return false;
 		}
@@ -3871,62 +5320,42 @@ namespace VitaEE
 		if (direct_branch == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(m_saved_registers | REG_PC))
-		{
+		if (!EmitEventExitReturn(event_exit))
 			return false;
-		}
 
 		const size_t direct_target = m_code.Size();
-		if (not_taken_link_target_offset || taken_link_target_offset)
+		if (not_taken_link || taken_link)
 		{
 			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
-			{
 				return false;
-			}
 
 			const size_t taken_tail = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!m_code.EmitPop(m_saved_registers | REG_LR))
+			if (!EmitDirectLinkTail(direct_exit, not_taken_link))
 				return false;
-
-			const size_t not_taken_target_offset = m_code.Size();
-			if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
-				!m_code.EmitBx(HOST_TMP4))
-			{
-				return false;
-			}
 
 			const size_t taken_tail_target = m_code.Size();
-			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) ||
-				!m_code.EmitPop(m_saved_registers | REG_LR))
+			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE))
+				return false;
+
+			const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
+			if (!EmitDirectLinkTail(direct_exit, taken_link) ||
+				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI) ||
+				!EmitCycleCarryFixup(carry_branches, 2, cycle_compare_target, HOST_TMP1))
 			{
 				return false;
 			}
 
-			const size_t taken_target_offset = m_code.Size();
-			if (!m_code.EmitMovImm32Patchable(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
-				!m_code.EmitBx(HOST_TMP4) ||
-				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
-			{
-				return false;
-			}
-
-			if (not_taken_link_target_offset)
-				*not_taken_link_target_offset = not_taken_target_offset;
-			if (taken_link_target_offset)
-				*taken_link_target_offset = taken_target_offset;
 			return true;
 		}
 
-		if (!m_code.EmitPop(m_saved_registers | REG_LR))
-			return false;
-
-		return m_code.EmitMovImm32(HOST_TMP4, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) &&
-			   m_code.EmitBx(HOST_TMP4) &&
-			   m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI);
+		const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
+		return m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) &&
+			   m_code.EmitPop(m_saved_registers | REG_PC) &&
+			   m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI) &&
+			   EmitCycleCarryFixup(carry_branches, 2, cycle_compare_target, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitSPECIAL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -4345,8 +5774,7 @@ namespace VitaEE
 			if (!m_code.PatchBranch(skip_ei, m_code.Size(), VitaA32::Condition::NE))
 				return false;
 
-			return m_code.EmitCallAbsolute(event_exit) &&
-				   m_code.EmitPop(m_saved_registers | REG_PC);
+			return EmitEventExitReturn(event_exit);
 		}
 
 		bool BlockCompiler::EmitTLBRInBlock()
@@ -4544,8 +5972,7 @@ namespace VitaEE
 				return false;
 			}
 
-			return m_code.EmitCallAbsolute(event_exit) &&
-				   m_code.EmitPop(m_saved_registers | REG_PC);
+			return EmitEventExitReturn(event_exit);
 		}
 
 		bool BlockCompiler::EmitDIDelayedStatusClear()
@@ -4782,8 +6209,10 @@ namespace VitaEE
 	bool BlockCompiler::EmitCOP2ControlWriteBody(u32 op)
 	{
 		// PCSX2 owners: VU0.cpp::CTC2() and x86/microVU_Macro.inl::recCTC2().
-		// FBRST and CMSAR1 remain helper-backed because they reset/start VUs;
-		// the idle in-block subset is no-op, masked, or raw VI low-word writes.
+		// CMSAR1 is emitted as a separate cycle-committing event tail because
+		// it starts VU1 microcode; this fall-through body is no-op, masked, raw
+		// VI low-word writes, or FBRST's reset-bit calls followed by the masked
+		// mode-bit store.
 		const unsigned rt = RT(op);
 		const unsigned fs = RD(op);
 
@@ -4805,6 +6234,40 @@ namespace VitaEE
 					return false;
 				}
 				break;
+
+			case VU0_REG_FBRST:
+			{
+				if (!EmitLoadGprLowRawZero(rt, HOST_TMP5) ||
+					!m_code.EmitTstImm32(HOST_TMP5, 0x2u))
+				{
+					return false;
+				}
+
+				size_t skip_vu0_reset = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+				if (skip_vu0_reset == static_cast<size_t>(-1))
+					return false;
+
+				if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0ResetRegs)) ||
+					!m_code.PatchBranch(skip_vu0_reset, m_code.Size(), VitaA32::Condition::EQ) ||
+					!m_code.EmitTstImm32(HOST_TMP5, 0x200u))
+				{
+					return false;
+				}
+
+				size_t skip_vu1_reset = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+				if (skip_vu1_reset == static_cast<size_t>(-1))
+					return false;
+
+				if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu1ResetRegs)) ||
+					!m_code.PatchBranch(skip_vu1_reset, m_code.Size(), VitaA32::Condition::EQ) ||
+					!EmitAndImm32OrReg(HOST_TMP5, HOST_TMP5, 0x0c0cu, HOST_TMP1) ||
+					!EmitVu0ViAddress(HOST_TMP0, fs) ||
+					!m_code.EmitStrImm12(HOST_TMP5, HOST_TMP0, 0))
+				{
+					return false;
+				}
+				break;
+			}
 
 			case VU0_REG_CLIP_FLAG:
 				if (!EmitLoadGprLowRawZero(rt, HOST_TMP1) ||
@@ -6415,26 +7878,39 @@ namespace VitaEE
 #endif
 	}
 
+	bool BlockCompiler::EmitCOP2InterlockCall(u32 op, bool wait_for_mbit)
+	{
+		// PCSX2 owners: VU0.cpp interlocked QMFC2/QMTC2/CFC2/CTC2 plus
+		// x86/microVU_Macro.inl::COP2_Interlock(). The caller already selected
+		// the running-VU0 tail, so bit 0 performs the E-bit finish or M/E-bit wait.
+		if ((op & 1u) == 0)
+			return true;
+
+		void (*helper)() = wait_for_mbit ? &_vu0WaitMicro : &_vu0FinishMicro;
+		return m_code.EmitCallAbsolute(reinterpret_cast<const void*>(helper));
+	}
+
 	bool BlockCompiler::EmitCOP2VectorTransferFast(u32 op, u32 next_pc,
 		u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		// PCSX2 owners: VU0.cpp::QMFC2() / QMTC2() and
 		// x86/microVU_Macro.inl::recQMFC2()/recQMTC2(). Idle VU0 transfers stay
-		// in the A32 block; running VU0 takes the guarded sync/event exit.
+		// in the A32 block; running VU0 takes the guarded sync/interlock/event exit.
 		if (!event_exit || raw_cycles_through_instruction == 0)
 			return false;
 
 		size_t vu0_idle = static_cast<size_t>(-1);
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
+		const bool wait_for_mbit = ((op >> 21) & 0x1f) == 0x05;
 		if (!EmitCOP2IdleBranch(&vu0_idle) ||
 			!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
 			!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			!EmitCOP2InterlockCall(op, wait_for_mbit) ||
 			!EmitCOP2VectorTransferBody(op) ||
-			!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(m_saved_registers | REG_PC) ||
+			!EmitEventExitReturn(event_exit) ||
 			!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
 		{
 			return false;
@@ -6457,9 +7933,9 @@ namespace VitaEE
 			!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			!EmitCOP2InterlockCall(op, false) ||
 			!EmitCOP2ControlReadBody(op) ||
-			!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(m_saved_registers | REG_PC) ||
+			!EmitEventExitReturn(event_exit) ||
 			!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
 		{
 			return false;
@@ -6474,6 +7950,54 @@ namespace VitaEE
 		if (!event_exit || raw_cycles_through_instruction == 0)
 			return false;
 
+		if (RD(op) == VU0_REG_CMSAR1)
+		{
+			// PCSX2 owners: VU0.cpp::CTC2(REG_CMSAR1) and
+			// x86/microVU_Macro.inl::recCTC2(). CMSAR1 starts VU1 at the
+			// committed EE cycle, so emit a native event tail instead of a
+			// fall-through body under this compiler's deferred-cycle model.
+			const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
+			if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
+				!EmitStorePc(next_pc) ||
+				!EmitAddScaledCyclesToCpu(cycles) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)))
+			{
+				return false;
+			}
+
+			if ((op & 1u) != 0)
+			{
+				size_t vu0_idle = static_cast<size_t>(-1);
+				if (!EmitVu0ViAddress(HOST_TMP0, VU0_REG_VPU_STAT) ||
+					!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+					!m_code.EmitTstImm32(HOST_TMP1, 1))
+				{
+					return false;
+				}
+
+				vu0_idle = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+				if (vu0_idle == static_cast<size_t>(-1) ||
+					!EmitCOP2InterlockCall(op, true) ||
+					!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+				{
+					return false;
+				}
+			}
+
+			if (!m_code.EmitMovImm8(HOST_TMP0, 1) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu1Finish)) ||
+				!EmitLoadGprLowRawZero(RT(op), HOST_TMP0) ||
+				!m_code.EmitUbfx(HOST_TMP0, HOST_TMP0, 0, 16) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu1ExecMicro)) ||
+				!EmitEventExitReturn(event_exit))
+			{
+				return false;
+			}
+
+			return true;
+		}
+
 		size_t vu0_idle = static_cast<size_t>(-1);
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 		if (!EmitCOP2IdleBranch(&vu0_idle) ||
@@ -6482,9 +8006,9 @@ namespace VitaEE
 			!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			!EmitCOP2InterlockCall(op, true) ||
 			!EmitCOP2ControlWriteBody(op) ||
-			!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(m_saved_registers | REG_PC) ||
+			!EmitEventExitReturn(event_exit) ||
 			!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
 		{
 			return false;
@@ -6602,6 +8126,16 @@ namespace VitaEE
 			return m_code.PatchBranch(done_from_clamp, done_target) &&
 				   m_code.PatchBranch(done_from_finite, done_target, VitaA32::Condition::NE);
 		};
+		const auto normalize_tracked_arithmetic_word = [&](unsigned reg, bool already_normalized) {
+			if (already_normalized)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuCop1NormalizedOperandSkips++;
+#endif
+				return true;
+			}
+			return normalize_arithmetic_word(reg);
+		};
 
 		const auto apply_overflow_underflow_flags = [&]() {
 			if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
@@ -6692,7 +8226,7 @@ namespace VitaEE
 
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) ||
 			!EmitCop1ExponentMask(HOST_TMP5) ||
-			!normalize_arithmetic_word(HOST_TMP0) ||
+			!normalize_tracked_arithmetic_word(HOST_TMP0, IsCop1FprNormalized(fs)) ||
 			!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0))
 		{
 			return false;
@@ -6700,7 +8234,7 @@ namespace VitaEE
 
 		if (!same_source &&
 			(!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) ||
-				!normalize_arithmetic_word(HOST_TMP1) ||
+				!normalize_tracked_arithmetic_word(HOST_TMP1, IsCop1FprNormalized(ft)) ||
 				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1)))
 		{
 			return false;
@@ -6786,6 +8320,17 @@ namespace VitaEE
 			return m_code.PatchBranch(done_from_clamp, done_target) &&
 				   m_code.PatchBranch(done_from_finite, done_target, VitaA32::Condition::NE);
 		};
+		const auto normalize_tracked_arithmetic_word_with_mask =
+			[&](unsigned reg, unsigned exponent_mask_reg, bool already_normalized) {
+				if (already_normalized)
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuCop1NormalizedOperandSkips++;
+#endif
+					return true;
+				}
+				return normalize_arithmetic_word_with_mask(reg, exponent_mask_reg);
+			};
 
 		const auto store_result = [&](bool store_fcr31) {
 			if (store_fcr31 &&
@@ -6957,8 +8502,8 @@ namespace VitaEE
 			}
 
 			if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP2, VitaA32::ShiftType::LSL, 0) ||
-				!normalize_arithmetic_word_with_mask(HOST_TMP0, HOST_TMP5) ||
-				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP5) ||
+				!normalize_tracked_arithmetic_word_with_mask(HOST_TMP0, HOST_TMP5, IsCop1FprNormalized(fs)) ||
+				!normalize_tracked_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP5, IsCop1FprNormalized(ft)) ||
 				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
 				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1) ||
 				!m_code.EmitVdivF32(VFP_FD_S2, VFP_FS_S0, VFP_FT_S1) ||
@@ -7008,7 +8553,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitOrrImm32OrReg(HOST_TMP5, HOST_TMP5, FPU_FCR31_INVALID_FLAGS, HOST_TMP4) ||
-				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2) ||
+				!normalize_tracked_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2, IsCop1FprNormalized(ft)) ||
 				!EmitBicImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP4))
 			{
 				return false;
@@ -7020,7 +8565,7 @@ namespace VitaEE
 
 			const size_t operand_positive_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_positive, operand_positive_target, VitaA32::Condition::EQ) ||
-				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2))
+				!normalize_tracked_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2, IsCop1FprNormalized(ft)))
 			{
 				return false;
 			}
@@ -7076,7 +8621,7 @@ namespace VitaEE
 				return false;
 
 			if (!EmitOrrImm32OrReg(HOST_TMP5, HOST_TMP5, FPU_FCR31_INVALID_FLAGS, HOST_TMP4) ||
-				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2) ||
+				!normalize_tracked_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2, IsCop1FprNormalized(ft)) ||
 				!EmitBicImm32OrReg(HOST_TMP1, HOST_TMP1, FPU_FLOAT_SIGN_MASK, HOST_TMP4))
 			{
 				return false;
@@ -7088,14 +8633,14 @@ namespace VitaEE
 
 			const size_t operand_positive_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_positive, operand_positive_target, VitaA32::Condition::EQ) ||
-				!normalize_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2))
+				!normalize_tracked_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP2, IsCop1FprNormalized(ft)))
 			{
 				return false;
 			}
 
 			const size_t operand_ready_target = m_code.Size();
 			if (!m_code.PatchBranch(operand_ready, operand_ready_target) ||
-				!normalize_arithmetic_word_with_mask(HOST_TMP0, HOST_TMP2) ||
+				!normalize_tracked_arithmetic_word_with_mask(HOST_TMP0, HOST_TMP2, IsCop1FprNormalized(fs)) ||
 				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
 				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1) ||
 				!m_code.EmitVsqrtF32(VFP_FT_S1, VFP_FT_S1) ||
@@ -7186,6 +8731,16 @@ namespace VitaEE
 			return m_code.PatchBranch(done_from_clamp, done_target) &&
 				   m_code.PatchBranch(done_from_finite, done_target, VitaA32::Condition::NE);
 		};
+		const auto normalize_tracked_arithmetic_word = [&](unsigned reg, bool already_normalized) {
+			if (already_normalized)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuCop1NormalizedOperandSkips++;
+#endif
+				return true;
+			}
+			return normalize_arithmetic_word(reg);
+		};
 
 		const auto apply_overflow_underflow_flags = [&](size_t dest_offset) {
 			if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
@@ -7270,11 +8825,11 @@ namespace VitaEE
 		const auto load_normalized_operands = [&]() {
 			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) &&
 				   EmitCop1ExponentMask(HOST_TMP5) &&
-				   normalize_arithmetic_word(HOST_TMP0) &&
+				   normalize_tracked_arithmetic_word(HOST_TMP0, IsCop1FprNormalized(fs)) &&
 				   m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) &&
 				   (same_source ||
 					   (m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(ft))) &&
-						   normalize_arithmetic_word(HOST_TMP1) &&
+						   normalize_tracked_arithmetic_word(HOST_TMP1, IsCop1FprNormalized(ft)) &&
 						   m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1)));
 		};
 
@@ -7315,7 +8870,7 @@ namespace VitaEE
 			if (!m_code.EmitVmovSToCore(HOST_TMP0, VFP_FD_S2) ||
 				!normalize_arithmetic_word(HOST_TMP0) ||
 				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FPU_ACC_OFFSET)) ||
-				!normalize_arithmetic_word(HOST_TMP1) ||
+				!normalize_tracked_arithmetic_word(HOST_TMP1, IsCop1AccNormalized()) ||
 				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP1) ||
 				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP0))
 			{
@@ -7784,8 +9339,7 @@ namespace VitaEE
 			return false;
 		}
 
-		return m_code.EmitCallAbsolute(event_exit) &&
-			   m_code.EmitPop(m_saved_registers | REG_PC);
+		return EmitEventExitReturn(event_exit);
 	}
 
 	bool BlockCompiler::EmitSYSCALL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -7833,6 +9387,17 @@ namespace VitaEE
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		}
 
+		u32 rs_value = 0;
+		if (FindGprPinHost(rs) < 0 && TryGetKnownGprLow(rs, &rs_value))
+		{
+			// PCSX2 x86/ix86-32/iR5900AritImm.cpp::recADDI_const() folds this
+			// as a signed-extended 32-bit result; do the same before touching
+			// cpuRegs on Cortex-A9, but only when it replaces a real load. If
+			// the pin cache already has RS resident, register ADD/SUB is cheaper
+			// than rematerializing the full result.
+			return EmitStoreKnownSignExtended32(rt, rs_value + static_cast<u32>(imm));
+		}
+
 		unsigned rs_host;
 		if (!EmitGprLowOperand(rs, HOST_TMP0, &rs_host))
 			return false;
@@ -7872,6 +9437,17 @@ namespace VitaEE
 		}
 		if (imm == 0 && rt == rs)
 			return true;
+
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		if (FindGprPinHost(rs) < 0 && TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value))
+		{
+			// PCSX2 keeps full-width GPR constants in g_cpuConstRegs; fold the
+			// same DADDIU low-64 add when the exact high word is proven.
+			const u64 rs_value = (static_cast<u64>(rs_high_value) << 32) | rs_low_value;
+			const u64 result = rs_value + static_cast<u64>(static_cast<s64>(imm));
+			return EmitStoreKnown64(rt, static_cast<u32>(result), static_cast<u32>(result >> 32));
+		}
 
 		unsigned rs_low;
 		if (!EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low))
@@ -7916,6 +9492,17 @@ namespace VitaEE
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		}
 
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		if (TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value))
+		{
+			// PCSX2 x86/ix86-32/iR5900AritImm.cpp::recSLTI_const() folds the
+			// full SD[0] compare through GPR_IS_CONST1.
+			const u64 rs_value = (static_cast<u64>(rs_high_value) << 32) | rs_low_value;
+			const bool result = static_cast<s64>(rs_value) < static_cast<s64>(imm);
+			return EmitStoreKnownZeroExtended32(rt, result ? 1 : 0);
+		}
+
 		unsigned rs_low;
 		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
 			   EmitSetLessThan64Imm(rt, imm, true, rs_low, HOST_TMP1);
@@ -7941,6 +9528,18 @@ namespace VitaEE
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		}
 
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		if (TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value))
+		{
+			// PCSX2 x86/ix86-32/iR5900AritImm.cpp::recSLTIU_const() folds the
+			// full UD[0] compare through GPR_IS_CONST1.
+			const u64 rs_value = (static_cast<u64>(rs_high_value) << 32) | rs_low_value;
+			const u64 imm_value = (static_cast<u64>((imm < 0) ? 0xffffffffu : 0) << 32) |
+								  static_cast<u32>(imm);
+			return EmitStoreKnownZeroExtended32(rt, rs_value < imm_value ? 1 : 0);
+		}
+
 		unsigned rs_low;
 		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
 			   EmitSetLessThan64Imm(rt, imm, false, rs_low, HOST_TMP1);
@@ -7961,6 +9560,14 @@ namespace VitaEE
 			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
 				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
+
+		u32 rs_value = 0;
+		if (FindGprPinHost(rs) < 0 && TryGetKnownGprLow(rs, &rs_value))
+		{
+			// PCSX2 R5900OpcodeImpl.cpp::ANDI() zero-extends the 16-bit mask
+			// into the low 64-bit lane, so the block-local low32 fact is enough.
+			return EmitStoreKnownZeroExtended32(rt, rs_value & imm);
 		}
 
 		unsigned rs_host;
@@ -7989,7 +9596,8 @@ namespace VitaEE
 		if (rt == 0)
 			return true;
 
-		// PCSX2 owner: R5900OpcodeImpl.cpp::ORI(); result is zero-extended into the low 64 bits.
+		// PCSX2 owner: R5900OpcodeImpl.cpp::ORI(); the immediate is zero-extended,
+		// while the source high word of the low 64-bit lane is preserved.
 		if (imm == 0 && rt == rs)
 			return true;
 
@@ -7998,6 +9606,16 @@ namespace VitaEE
 			return m_code.EmitMovImm32(HOST_TMP0, imm) &&
 				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
+
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		if (FindGprPinHost(rs) < 0 && TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value))
+		{
+			// PCSX2 x86/ix86-32/iR5900AritImm.cpp::recORI_const() folds the
+			// full low-64 constant; require the exact high-word proof because
+			// ORI preserves source bits above the zero-extended immediate.
+			return EmitStoreKnown64(rt, rs_low_value | imm, rs_high_value);
 		}
 
 		unsigned rs_low;
@@ -8025,7 +9643,8 @@ namespace VitaEE
 		if (rt == 0)
 			return true;
 
-		// PCSX2 owner: R5900OpcodeImpl.cpp::XORI(); result is zero-extended into the low 64 bits.
+		// PCSX2 owner: R5900OpcodeImpl.cpp::XORI(); the immediate is zero-extended,
+		// while the source high word of the low 64-bit lane is preserved.
 		if (imm == 0 && rt == rs)
 			return true;
 
@@ -8034,6 +9653,16 @@ namespace VitaEE
 			return m_code.EmitMovImm32(HOST_TMP0, imm) &&
 				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		}
+
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		if (FindGprPinHost(rs) < 0 && TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value))
+		{
+			// PCSX2 x86/ix86-32/iR5900AritImm.cpp::recXORI_const() folds the
+			// full low-64 constant; require the exact high-word proof because
+			// XORI preserves source bits above the zero-extended immediate.
+			return EmitStoreKnown64(rt, rs_low_value ^ imm, rs_high_value);
 		}
 
 		unsigned rs_low;
@@ -13049,6 +14678,18 @@ namespace VitaEE
 		const unsigned rt = RT(op);
 		constexpr unsigned NEON_VALUE = 0;
 
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address & ~0x0fu, HOST_TMP0,
+				KnownVtlbFastPathKind::Qword))
+		{
+			if (rt == 0)
+				return true;
+
+			return m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
+				   EmitStoreGprQ128(rt, NEON_VALUE, HOST_TMP1);
+		}
+
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitAlignQwordAddress(HOST_TMP0, HOST_TMP1) ||
@@ -13075,6 +14716,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitLWC1(u32 op)
 	{
 		const unsigned rt = RT(op);
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			(known_address & 3u) == 0 &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0,
+				KnownVtlbFastPathKind::Cop1))
+		{
+			return m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
+				   m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(rt)));
+		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -13110,6 +14761,21 @@ namespace VitaEE
 		const unsigned rt = RT(op);
 		constexpr unsigned NEON_VALUE = 0;
 
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0,
+				KnownVtlbFastPathKind::Cop2))
+		{
+			if (!EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5))
+				return false;
+			if (rt == 0)
+				return true;
+
+			return m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0) &&
+				   EmitVu0VfAddress(HOST_TMP0, rt) &&
+				   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0);
+		}
+
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
@@ -13139,6 +14805,15 @@ namespace VitaEE
 	{
 		const unsigned rt = RT(op);
 
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
+		{
+			unsigned rt_host;
+			return EmitGprLowOperand(rt, HOST_TMP1, &rt_host) &&
+				   m_code.EmitStrbImm12(rt_host, HOST_TMP0, 0);
+		}
+
 		size_t handler_fallback = static_cast<size_t>(-1);
 		unsigned rt_host;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
@@ -13166,6 +14841,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitSH(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		const unsigned rt = RT(op);
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			(known_address & 1u) == 0 &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
+		{
+			unsigned rt_host;
+			return EmitGprLowOperand(rt, HOST_TMP1, &rt_host) &&
+				   m_code.EmitStrhImm8(rt_host, HOST_TMP0, 0);
+		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -13204,6 +14889,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitSW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		const unsigned rt = RT(op);
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			(known_address & 3u) == 0 &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
+		{
+			unsigned rt_host;
+			return EmitGprLowOperand(rt, HOST_TMP1, &rt_host) &&
+				   m_code.EmitStrImm12(rt_host, HOST_TMP0, 0);
+		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -13252,6 +14947,22 @@ namespace VitaEE
 	bool BlockCompiler::EmitSD(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
 	{
 		const unsigned rt = RT(op);
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			(known_address & 7u) == 0 &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
+		{
+			unsigned rt_low;
+			if (!EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low))
+				return false;
+
+			if (rt_low == HOST_TMP2)
+				return m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_TMP0, 0);
+
+			return m_code.EmitStrImm12(rt_low, HOST_TMP0, 0) &&
+				   m_code.EmitStrImm12(HOST_TMP3, HOST_TMP0, static_cast<u16>(sizeof(u32)));
+		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -13315,6 +15026,49 @@ namespace VitaEE
 		const unsigned rt = RT(op);
 		constexpr unsigned NEON_VALUE = 0;
 
+		const auto emit_store_to_host = [&]() -> bool
+		{
+			if (rt == 0)
+			{
+				if (!EmitLoadRawGpr0KnownZeroFlag(HOST_TMP1) ||
+					!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 0, true))
+				{
+					return false;
+				}
+
+				const size_t raw_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+				if (raw_fallback == static_cast<size_t>(-1))
+					return false;
+
+				if (!m_code.EmitVeorQ(NEON_VALUE, NEON_VALUE, NEON_VALUE) ||
+					!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0))
+				{
+					return false;
+				}
+
+				const size_t zero_done = m_code.EmitBranchPlaceholder();
+				if (zero_done == static_cast<size_t>(-1))
+					return false;
+
+				const size_t raw_fallback_target = m_code.Size();
+				return m_code.PatchBranch(raw_fallback, raw_fallback_target, VitaA32::Condition::EQ) &&
+					   EmitLoadCpuRegsQ128(GprOffset(0), NEON_VALUE, HOST_TMP1) &&
+					   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
+					   m_code.PatchBranch(zero_done, m_code.Size());
+			}
+
+			return EmitLoadCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP1) &&
+				   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0);
+		};
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address & ~0x0fu, HOST_TMP0,
+				KnownVtlbFastPathKind::Qword))
+		{
+			return emit_store_to_host();
+		}
+
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitAlignQwordAddress(HOST_TMP0, HOST_TMP1) ||
@@ -13323,42 +15077,8 @@ namespace VitaEE
 			return false;
 		}
 
-		if (rt == 0)
-		{
-			if (!EmitLoadRawGpr0KnownZeroFlag(HOST_TMP1) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 0, true))
-			{
-				return false;
-			}
-
-			const size_t raw_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-			if (raw_fallback == static_cast<size_t>(-1))
-				return false;
-
-			if (!m_code.EmitVeorQ(NEON_VALUE, NEON_VALUE, NEON_VALUE) ||
-				!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0))
-			{
-				return false;
-			}
-
-			const size_t zero_done = m_code.EmitBranchPlaceholder();
-			if (zero_done == static_cast<size_t>(-1))
-				return false;
-
-			const size_t raw_fallback_target = m_code.Size();
-			if (!m_code.PatchBranch(raw_fallback, raw_fallback_target, VitaA32::Condition::EQ) ||
-				!EmitLoadCpuRegsQ128(GprOffset(0), NEON_VALUE, HOST_TMP1) ||
-				!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0) ||
-				!m_code.PatchBranch(zero_done, m_code.Size()))
-			{
-				return false;
-			}
-		}
-		else if (!EmitLoadCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP1) ||
-				 !m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0))
-		{
+		if (!emit_store_to_host())
 			return false;
-		}
 
 		m_qword_store_cold_tails.push_back({
 			handler_fallback,
@@ -13371,6 +15091,16 @@ namespace VitaEE
 	bool BlockCompiler::EmitSWC1(u32 op)
 	{
 		const unsigned rt = RT(op);
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			(known_address & 3u) == 0 &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0,
+				KnownVtlbFastPathKind::Cop1))
+		{
+			return m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(rt))) &&
+				   m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0);
+		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -13405,6 +15135,17 @@ namespace VitaEE
 	{
 		const unsigned rt = RT(op);
 		constexpr unsigned NEON_VALUE = 0;
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0,
+				KnownVtlbFastPathKind::Cop2))
+		{
+			return EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5) &&
+				   EmitVu0VfAddress(HOST_TMP1, rt) &&
+				   m_code.EmitVld1Q32Aligned(NEON_VALUE, HOST_TMP1) &&
+				   m_code.EmitVst1Q32(NEON_VALUE, HOST_TMP0);
+		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
@@ -13480,16 +15221,73 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
+		const auto emit_store_sign32_dynamic = [&](unsigned guest_reg) {
+			unsigned guest_host;
+			return EmitGprLowOperand(guest_reg, HOST_TMP0, &guest_host) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, guest_host, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rd, guest_host, HOST_TMP1);
+		};
+
+		const auto emit_add_constant = [&](unsigned guest_reg, u32 constant) {
+			if (constant == 0)
+				return emit_store_sign32_dynamic(guest_reg);
+
+			unsigned guest_host;
+			if (!EmitGprLowOperand(guest_reg, HOST_TMP0, &guest_host))
+				return false;
+
+			if (!(m_code.EmitAddImm32(HOST_TMP0, guest_host, constant) ||
+				  (m_code.EmitMovImm32(HOST_TMP2, constant) &&
+				   m_code.EmitAddReg(HOST_TMP0, guest_host, HOST_TMP2))))
+			{
+				return false;
+			}
+
+			return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+
 		if (rs == 0 || rt == 0)
 		{
 			const unsigned src = (rs == 0) ? rt : rs;
 			if (src == 0)
 				return EmitStoreGprZero64(rd);
 
-			unsigned src_host;
-			return EmitGprLowOperand(src, HOST_TMP0, &src_host) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, src_host, VitaA32::ShiftType::ASR, 31) &&
-				   EmitStoreGpr64(rd, src_host, HOST_TMP1);
+			u32 src_value = 0;
+			if (FindGprPinHost(src) < 0 && TryGetKnownGprLow(src, &src_value))
+			{
+				// PCSX2 x86/ix86-32/iR5900Arit.cpp::recADD_const() keeps
+				// zero-plus-constant identities in the constant register file.
+				return EmitStoreKnownSignExtended32(rd, src_value);
+			}
+
+			return emit_store_sign32_dynamic(src);
+		}
+
+		u32 rs_value = 0;
+		u32 rt_value = 0;
+		const bool rs_known = TryGetKnownGprLow(rs, &rs_value);
+		const bool rt_known = TryGetKnownGprLow(rt, &rt_value);
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		if (!rs_pinned && !rt_pinned && rs_known && rt_known)
+		{
+			// PCSX2 x86/ix86-32/iR5900Arit.cpp::recADD_const() keeps this in
+			// the constant register file; materialize only the folded result
+			// when doing so removes guest-state loads.
+			return EmitStoreKnownSignExtended32(rd, rs_value + rt_value);
+		}
+		if (!rs_pinned && rs_known)
+		{
+			// PCSX2 iR5900Arit.cpp::recADD_consts() adds a constant RS low word
+			// to the runtime RT low word before sign-extending the 32-bit result.
+			return emit_add_constant(rt, rs_value);
+		}
+		if (!rt_pinned && rt_known)
+		{
+			// PCSX2 iR5900Arit.cpp::recADD_constt() adds a constant RT low word
+			// to the runtime RS low word before sign-extending the 32-bit result.
+			return emit_add_constant(rs, rt_value);
 		}
 
 		unsigned rs_host;
@@ -13513,21 +15311,85 @@ namespace VitaEE
 		if (rs == rt)
 			return EmitStoreGprZero64(rd);
 
+		const auto emit_store_sign32_dynamic = [&](unsigned guest_reg) {
+			unsigned guest_host;
+			return EmitGprLowOperand(guest_reg, HOST_TMP0, &guest_host) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP1, guest_host, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rd, guest_host, HOST_TMP1);
+		};
+
+		const auto emit_subtract_constant = [&](unsigned guest_reg, u32 constant) {
+			if (constant == 0)
+				return emit_store_sign32_dynamic(guest_reg);
+
+			unsigned guest_host;
+			if (!EmitGprLowOperand(guest_reg, HOST_TMP0, &guest_host))
+				return false;
+
+			if (!(m_code.EmitSubImm32(HOST_TMP0, guest_host, constant) ||
+				  (m_code.EmitMovImm32(HOST_TMP2, constant) &&
+				   m_code.EmitSubReg(HOST_TMP0, guest_host, HOST_TMP2))))
+			{
+				return false;
+			}
+
+			return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+
+		const auto emit_constant_minus_dynamic = [&](unsigned guest_reg, u32 constant) {
+			unsigned guest_host;
+			if (!EmitGprLowOperand(guest_reg, HOST_TMP2, &guest_host))
+				return false;
+
+			if (!(m_code.EmitRsbImm32(HOST_TMP0, guest_host, constant) ||
+				  (m_code.EmitMovImm32(HOST_TMP0, constant) &&
+				   m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, guest_host))))
+			{
+				return false;
+			}
+
+			return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
+				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+
 		if (rt == 0)
 		{
-			unsigned rs_host;
-			return EmitGprLowOperand(rs, HOST_TMP0, &rs_host) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, rs_host, VitaA32::ShiftType::ASR, 31) &&
-				   EmitStoreGpr64(rd, rs_host, HOST_TMP1);
+			u32 rs_value = 0;
+			if (FindGprPinHost(rs) < 0 && TryGetKnownGprLow(rs, &rs_value))
+				return EmitStoreKnownSignExtended32(rd, rs_value);
+
+			return emit_store_sign32_dynamic(rs);
 		}
 
 		if (rs == 0)
 		{
-			unsigned rt_host;
-			return EmitGprLowOperand(rt, HOST_TMP0, &rt_host) &&
-				   m_code.EmitRsbImm32(HOST_TMP0, rt_host, 0) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+			u32 rt_value = 0;
+			if (FindGprPinHost(rt) < 0 && TryGetKnownGprLow(rt, &rt_value))
+				return EmitStoreKnownSignExtended32(rd, 0 - rt_value);
+
+			return emit_constant_minus_dynamic(rt, 0);
+		}
+
+		u32 rs_value = 0;
+		u32 rt_value = 0;
+		const bool rs_known = TryGetKnownGprLow(rs, &rs_value);
+		const bool rt_known = TryGetKnownGprLow(rt, &rt_value);
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		if (!rs_pinned && !rt_pinned && rs_known && rt_known)
+			return EmitStoreKnownSignExtended32(rd, rs_value - rt_value);
+		if (!rt_pinned && rt_known)
+		{
+			// PCSX2 iR5900Arit.cpp::recSUB_constt() subtracts a constant RT low
+			// word from runtime RS, then sign-extends the 32-bit result.
+			return emit_subtract_constant(rs, rt_value);
+		}
+		if (!rs_pinned && rs_known)
+		{
+			// PCSX2 iR5900Arit.cpp::recSUB_consts() materializes constant RS
+			// before subtracting runtime RT, then sign-extends the 32-bit result.
+			return emit_constant_minus_dynamic(rt, rs_value);
 		}
 
 		unsigned rs_host;
@@ -13548,17 +15410,83 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
+		const auto emit_store_dynamic = [&](unsigned guest_reg) {
+			if (rd == guest_reg)
+				return true;
+
+			unsigned guest_low;
+			return EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low) &&
+				   EmitStoreGpr64(rd, guest_low, HOST_TMP1);
+		};
+
+		const auto emit_add_constant = [&](unsigned guest_reg, u32 constant_low, u32 constant_high) {
+			if (constant_low == 0 && constant_high == 0)
+				return emit_store_dynamic(guest_reg);
+
+			unsigned guest_low;
+			if (!EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low))
+				return false;
+
+			if (!(m_code.EmitAddImm32(HOST_TMP0, guest_low, constant_low, true) ||
+				  (m_code.EmitMovImm32(HOST_TMP2, constant_low) &&
+				   m_code.EmitAddReg(HOST_TMP0, guest_low, HOST_TMP2, true))))
+			{
+				return false;
+			}
+
+			const bool high_done = (constant_high <= 0xffu) ?
+				m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, static_cast<u8>(constant_high)) :
+				(m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
+				 m_code.EmitAdcReg(HOST_TMP1, HOST_TMP1, HOST_TMP2));
+			return high_done && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+
 		if (rs == 0 || rt == 0)
 		{
 			const unsigned src = (rs == 0) ? rt : rs;
 			if (src == 0)
 				return EmitStoreGprZero64(rd);
-			if (rd == src)
-				return true;
 
-			unsigned src_low;
-			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
-				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+			u32 src_low_value = 0;
+			u32 src_high_value = 0;
+			if (FindGprPinHost(src) < 0 && TryGetKnownGpr64(src, &src_low_value, &src_high_value))
+			{
+				// PCSX2 x86/ix86-32/iR5900Arit.cpp::recDADD_const() keeps
+				// zero-plus-constant identities as exact low64 constants.
+				return EmitStoreKnown64(rd, src_low_value, src_high_value);
+			}
+
+			return emit_store_dynamic(src);
+		}
+
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
+		const bool rt_known = TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value);
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		if (!rs_pinned && !rt_pinned && rs_known && rt_known)
+		{
+			// PCSX2 x86/ix86-32/iR5900Arit.cpp::recDADD_const() folds the
+			// full low64 sum in the constant register file.
+			const u64 lhs = (static_cast<u64>(rs_high_value) << 32) | rs_low_value;
+			const u64 rhs = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
+			const u64 result = lhs + rhs;
+			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+		}
+		if (!rs_pinned && rs_known)
+		{
+			// PCSX2 iR5900Arit.cpp::recDADD_consts() adds a full-width constant
+			// source to the runtime RT value.
+			return emit_add_constant(rt, rs_low_value, rs_high_value);
+		}
+		if (!rt_pinned && rt_known)
+		{
+			// PCSX2 iR5900Arit.cpp::recDADD_constt() adds a full-width constant
+			// target operand to the runtime RS value.
+			return emit_add_constant(rs, rt_low_value, rt_high_value);
 		}
 
 		unsigned rs_low;
@@ -13582,24 +15510,111 @@ namespace VitaEE
 		if (rs == rt)
 			return EmitStoreGprZero64(rd);
 
-		if (rt == 0)
-		{
-			if (rd == rs)
+		const auto emit_store_dynamic = [&](unsigned guest_reg) {
+			if (rd == guest_reg)
 				return true;
 
-			unsigned rs_low;
-			return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-				   EmitStoreGpr64(rd, rs_low, HOST_TMP1);
+			unsigned guest_low;
+			return EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low) &&
+				   EmitStoreGpr64(rd, guest_low, HOST_TMP1);
+		};
+
+		const auto emit_subtract_constant = [&](unsigned guest_reg, u32 constant_low, u32 constant_high) {
+			if (constant_low == 0 && constant_high == 0)
+				return emit_store_dynamic(guest_reg);
+
+			unsigned guest_low;
+			if (!EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low))
+				return false;
+
+			if (!(m_code.EmitSubImm32(HOST_TMP0, guest_low, constant_low, true) ||
+				  (m_code.EmitMovImm32(HOST_TMP2, constant_low) &&
+				   m_code.EmitSubReg(HOST_TMP0, guest_low, HOST_TMP2, true))))
+			{
+				return false;
+			}
+
+			const bool high_done = (constant_high <= 0xffu) ?
+				m_code.EmitSbcImm8(HOST_TMP1, HOST_TMP1, static_cast<u8>(constant_high)) :
+				(m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
+				 m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, HOST_TMP2));
+			return high_done && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+
+		const auto emit_constant_minus_dynamic = [&](unsigned guest_reg, u32 constant_low, u32 constant_high) {
+			unsigned guest_low;
+			if (!EmitGpr64OperandLow(guest_reg, HOST_TMP2, HOST_TMP3, &guest_low))
+				return false;
+
+			if (!(m_code.EmitRsbImm32(HOST_TMP0, guest_low, constant_low, true) ||
+				  (m_code.EmitMovImm32(HOST_TMP0, constant_low) &&
+				   m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, guest_low, true))) ||
+				!m_code.EmitMovImm32(HOST_TMP1, constant_high) ||
+				!m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, HOST_TMP3))
+			{
+				return false;
+			}
+
+			return EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+
+		if (rt == 0)
+		{
+			u32 rs_low_value = 0;
+			u32 rs_high_value = 0;
+			if (FindGprPinHost(rs) < 0 && TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value))
+				return EmitStoreKnown64(rd, rs_low_value, rs_high_value);
+
+			return emit_store_dynamic(rs);
 		}
 
 		if (rs == 0)
 		{
+			u32 rt_low_value = 0;
+			u32 rt_high_value = 0;
+			if (FindGprPinHost(rt) < 0 && TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value))
+			{
+				const u64 rhs = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
+				const u64 result = 0 - rhs;
+				return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+			}
+
 			unsigned rt_low;
 			return EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
 				   m_code.EmitRsbImm32(HOST_TMP0, rt_low, 0, true) &&
 				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
 				   m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
 				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
+		const bool rt_known = TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value);
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		if (!rs_pinned && !rt_pinned && rs_known && rt_known)
+		{
+			// PCSX2 x86/ix86-32/iR5900Arit.cpp::recDSUB_const() folds the
+			// full low64 difference in the constant register file.
+			const u64 lhs = (static_cast<u64>(rs_high_value) << 32) | rs_low_value;
+			const u64 rhs = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
+			const u64 result = lhs - rhs;
+			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+		}
+		if (!rt_pinned && rt_known)
+		{
+			// PCSX2 iR5900Arit.cpp::recDSUB_constt() subtracts a full-width
+			// constant RT from the runtime RS value.
+			return emit_subtract_constant(rs, rt_low_value, rt_high_value);
+		}
+		if (!rs_pinned && rs_known)
+		{
+			// PCSX2 iR5900Arit.cpp::recDSUB_consts() materializes the full-width
+			// constant RS before subtracting the runtime RT value.
+			return emit_constant_minus_dynamic(rt, rs_low_value, rs_high_value);
 		}
 
 		unsigned rs_low;
@@ -13634,6 +15649,68 @@ namespace VitaEE
 				   EmitStoreGpr64(rd, rs_low, HOST_TMP1);
 		}
 
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
+		const bool rt_known = TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value);
+		if (!rs_pinned && !rt_pinned && rs_known && rt_known)
+		{
+			// PCSX2 x86/ix86-32/iR5900Arit.cpp::recAND_const() folds the full
+			// low-64 register constants. Only use it when it replaces two real
+			// guest-state loads rather than pinned register ALU.
+			return EmitStoreKnown64(rd, rs_low_value & rt_low_value, rs_high_value & rt_high_value);
+		}
+		const auto emit_copy_source = [&](unsigned src) {
+			if (rd == src)
+				return true;
+
+			unsigned src_low;
+			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
+				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+		};
+		const auto emit_and_constant = [&](unsigned src, u32 constant_low, u32 constant_high) {
+			if (constant_low == 0 && constant_high == 0)
+				return EmitStoreGprZero64(rd);
+			if (constant_low == 0xffffffffu && constant_high == 0xffffffffu)
+				return emit_copy_source(src);
+
+			unsigned src_low;
+			if (!EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low))
+				return false;
+
+			const bool low_ok = constant_low == 0 ?
+				m_code.EmitMovImm8(HOST_TMP0, 0) :
+				(constant_low == 0xffffffffu ?
+					 (src_low == HOST_TMP0 ||
+						 m_code.EmitMovRegShiftImm(HOST_TMP0, src_low, VitaA32::ShiftType::LSL, 0)) :
+					 EmitAndImm32OrReg(HOST_TMP0, src_low, constant_low, HOST_TMP2));
+			if (!low_ok)
+				return false;
+
+			const bool high_ok = constant_high == 0 ?
+				m_code.EmitMovImm8(HOST_TMP1, 0) :
+				(constant_high == 0xffffffffu ?
+					 true :
+					 EmitAndImm32OrReg(HOST_TMP1, HOST_TMP1, constant_high, HOST_TMP2));
+			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+		if (!rs_pinned && rs_known && (!rt_pinned || IsCheapA32AndConstant64(rs_low_value, rs_high_value)))
+		{
+			// PCSX2 iR5900Arit.cpp::recAND_consts() applies a constant RS mask
+			// to the runtime RT value.
+			return emit_and_constant(rt, rs_low_value, rs_high_value);
+		}
+		if (!rt_pinned && rt_known && (!rs_pinned || IsCheapA32AndConstant64(rt_low_value, rt_high_value)))
+		{
+			// PCSX2 iR5900Arit.cpp::recAND_constt() applies a constant RT mask
+			// to the runtime RS value.
+			return emit_and_constant(rs, rt_low_value, rt_high_value);
+		}
+
 		unsigned rs_low;
 		unsigned rt_low;
 		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
@@ -13666,6 +15743,67 @@ namespace VitaEE
 				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
 		}
 
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
+		const bool rt_known = TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value);
+		if (!rs_pinned && !rt_pinned && rs_known && rt_known)
+		{
+			// PCSX2 x86/ix86-32/iR5900Arit.cpp::recOR_const() folds the full
+			// low-64 register constants.
+			return EmitStoreKnown64(rd, rs_low_value | rt_low_value, rs_high_value | rt_high_value);
+		}
+		const auto emit_copy_source = [&](unsigned src) {
+			if (rd == src)
+				return true;
+
+			unsigned src_low;
+			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
+				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+		};
+		const auto emit_or_constant = [&](unsigned src, u32 constant_low, u32 constant_high) {
+			if (constant_low == 0 && constant_high == 0)
+				return emit_copy_source(src);
+			if (constant_low == 0xffffffffu && constant_high == 0xffffffffu)
+				return EmitStoreKnown64(rd, 0xffffffffu, 0xffffffffu);
+
+			unsigned src_low;
+			if (!EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low))
+				return false;
+
+			const bool low_ok = constant_low == 0 ?
+				(src_low == HOST_TMP0 ||
+					m_code.EmitMovRegShiftImm(HOST_TMP0, src_low, VitaA32::ShiftType::LSL, 0)) :
+				(constant_low == 0xffffffffu ?
+					 m_code.EmitMovImm32(HOST_TMP0, 0xffffffffu) :
+					 EmitOrrImm32OrReg(HOST_TMP0, src_low, constant_low, HOST_TMP2));
+			if (!low_ok)
+				return false;
+
+			const bool high_ok = constant_high == 0 ?
+				true :
+				(constant_high == 0xffffffffu ?
+					 m_code.EmitMovImm32(HOST_TMP1, 0xffffffffu) :
+					 EmitOrrImm32OrReg(HOST_TMP1, HOST_TMP1, constant_high, HOST_TMP2));
+			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+		if (!rs_pinned && rs_known && (!rt_pinned || IsCheapA32LogicalConstant64(rs_low_value, rs_high_value)))
+		{
+			// PCSX2 iR5900Arit.cpp::recOR_consts() applies a constant RS mask
+			// to the runtime RT value.
+			return emit_or_constant(rt, rs_low_value, rs_high_value);
+		}
+		if (!rt_pinned && rt_known && (!rs_pinned || IsCheapA32LogicalConstant64(rt_low_value, rt_high_value)))
+		{
+			// PCSX2 iR5900Arit.cpp::recOR_constt() applies a constant RT mask
+			// to the runtime RS value.
+			return emit_or_constant(rs, rt_low_value, rt_high_value);
+		}
+
 		unsigned rs_low;
 		unsigned rt_low;
 		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
@@ -13696,6 +15834,61 @@ namespace VitaEE
 			unsigned src_low;
 			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
 				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+		}
+
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
+		const bool rt_known = TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value);
+		if (!rs_pinned && !rt_pinned && rs_known && rt_known)
+		{
+			// PCSX2 x86/ix86-32/iR5900Arit.cpp::recXOR_const() folds the full
+			// low-64 register constants.
+			return EmitStoreKnown64(rd, rs_low_value ^ rt_low_value, rs_high_value ^ rt_high_value);
+		}
+		const auto emit_copy_source = [&](unsigned src) {
+			if (rd == src)
+				return true;
+
+			unsigned src_low;
+			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
+				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+		};
+		const auto emit_xor_constant = [&](unsigned src, u32 constant_low, u32 constant_high) {
+			if (constant_low == 0 && constant_high == 0)
+				return emit_copy_source(src);
+
+			unsigned src_low;
+			if (!EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low))
+				return false;
+
+			const bool low_ok = constant_low == 0 ?
+				(src_low == HOST_TMP0 ||
+					m_code.EmitMovRegShiftImm(HOST_TMP0, src_low, VitaA32::ShiftType::LSL, 0)) :
+				EmitEorImm32OrReg(HOST_TMP0, src_low, constant_low, HOST_TMP2);
+			if (!low_ok)
+				return false;
+
+			const bool high_ok = constant_high == 0 ?
+				true :
+				EmitEorImm32OrReg(HOST_TMP1, HOST_TMP1, constant_high, HOST_TMP2);
+			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+		if (!rs_pinned && rs_known && (!rt_pinned || IsCheapA32LogicalConstant64(rs_low_value, rs_high_value)))
+		{
+			// PCSX2 iR5900Arit.cpp::recXOR_consts() applies a constant RS mask
+			// to the runtime RT value.
+			return emit_xor_constant(rt, rs_low_value, rs_high_value);
+		}
+		if (!rt_pinned && rt_known && (!rs_pinned || IsCheapA32LogicalConstant64(rt_low_value, rt_high_value)))
+		{
+			// PCSX2 iR5900Arit.cpp::recXOR_constt() applies a constant RT mask
+			// to the runtime RS value.
+			return emit_xor_constant(rs, rt_low_value, rt_high_value);
 		}
 
 		unsigned rs_low;
@@ -13733,6 +15926,58 @@ namespace VitaEE
 				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 		}
 
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
+		const bool rt_known = TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value);
+		if (!rs_pinned && !rt_pinned && rs_known && rt_known)
+		{
+			// PCSX2 x86/ix86-32/iR5900Arit.cpp::recNOR_const() folds the full
+			// low-64 register constants.
+			return EmitStoreKnown64(rd, ~(rs_low_value | rt_low_value), ~(rs_high_value | rt_high_value));
+		}
+		const auto emit_nor_constant = [&](unsigned src, u32 constant_low, u32 constant_high) {
+			if (constant_low == 0xffffffffu && constant_high == 0xffffffffu)
+				return EmitStoreGprZero64(rd);
+
+			unsigned src_low;
+			if (!EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low))
+				return false;
+
+			const bool low_ok = constant_low == 0 ?
+				m_code.EmitMvnReg(HOST_TMP0, src_low) :
+				(constant_low == 0xffffffffu ?
+					 m_code.EmitMovImm8(HOST_TMP0, 0) :
+					 (EmitOrrImm32OrReg(HOST_TMP0, src_low, constant_low, HOST_TMP2) &&
+						 m_code.EmitMvnReg(HOST_TMP0, HOST_TMP0)));
+			if (!low_ok)
+				return false;
+
+			const bool high_ok = constant_high == 0 ?
+				m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1) :
+				(constant_high == 0xffffffffu ?
+					 m_code.EmitMovImm8(HOST_TMP1, 0) :
+					 (EmitOrrImm32OrReg(HOST_TMP1, HOST_TMP1, constant_high, HOST_TMP2) &&
+						 m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1)));
+			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		};
+		if (!rs_pinned && rs_known && (!rt_pinned || IsCheapA32LogicalConstant64(rs_low_value, rs_high_value)))
+		{
+			// PCSX2 iR5900Arit.cpp::recNOR_consts() applies a constant RS mask
+			// before inverting the runtime RT result.
+			return emit_nor_constant(rt, rs_low_value, rs_high_value);
+		}
+		if (!rt_pinned && rt_known && (!rs_pinned || IsCheapA32LogicalConstant64(rt_low_value, rt_high_value)))
+		{
+			// PCSX2 iR5900Arit.cpp::recNOR_constt() applies a constant RT mask
+			// before inverting the runtime RS result.
+			return emit_nor_constant(rs, rt_low_value, rt_high_value);
+		}
+
 		unsigned rs_low;
 		unsigned rt_low;
 		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
@@ -13757,12 +16002,42 @@ namespace VitaEE
 		// writes the 0/1 result back to UD[0].
 		if (rs == rt)
 			return EmitStoreGprZero64(rd);
+
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
+		const bool rt_known = TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value);
+		if (rs_known && rt_known)
+		{
+			// PCSX2 x86/ix86-32/iR5900Arit.cpp::recSLT_const() folds the full
+			// signed low64 comparison when both operands are constant.
+			const u64 rs_value = (static_cast<u64>(rs_high_value) << 32) | rs_low_value;
+			const u64 rt_value = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
+			const bool result = static_cast<s64>(rs_value) < static_cast<s64>(rt_value);
+			return EmitStoreKnownZeroExtended32(rd, result ? 1 : 0);
+		}
 		if (rt == 0)
 		{
 			return EmitLoadGprHigh(rs, HOST_TMP0) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, 31) &&
 				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
 				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		}
+		if (!rs_pinned && rs_known && IsCheapA32CompareConstant64(rs_low_value, rs_high_value))
+		{
+			// PCSX2 iR5900Arit.cpp::recSLT_consts() compares a constant RS
+			// against the runtime RT value.
+			return EmitSetLessThan64Known(rd, true, rt, rs_low_value, rs_high_value, true);
+		}
+		if (!rt_pinned && rt_known && IsCheapA32CompareConstant64(rt_low_value, rt_high_value))
+		{
+			// PCSX2 iR5900Arit.cpp::recSLT_constt() compares the runtime RS
+			// value against a constant RT.
+			return EmitSetLessThan64Known(rd, true, rs, rt_low_value, rt_high_value, false);
 		}
 
 		unsigned rs_low;
@@ -13785,6 +16060,35 @@ namespace VitaEE
 		if (rs == rt || rt == 0)
 			return EmitStoreGprZero64(rd);
 
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		const bool rs_pinned = FindGprPinHost(rs) >= 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
+		const bool rt_known = TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value);
+		if (rs_known && rt_known)
+		{
+			// PCSX2 x86/ix86-32/iR5900Arit.cpp::recSLTU_const() folds the full
+			// unsigned low64 comparison when both operands are constant.
+			const u64 rs_value = (static_cast<u64>(rs_high_value) << 32) | rs_low_value;
+			const u64 rt_value = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
+			return EmitStoreKnownZeroExtended32(rd, rs_value < rt_value ? 1 : 0);
+		}
+		if (!rs_pinned && rs_known && IsCheapA32CompareConstant64(rs_low_value, rs_high_value))
+		{
+			// PCSX2 iR5900Arit.cpp::recSLTU_consts() compares a constant RS
+			// against the runtime RT value.
+			return EmitSetLessThan64Known(rd, false, rt, rs_low_value, rs_high_value, true);
+		}
+		if (!rt_pinned && rt_known && IsCheapA32CompareConstant64(rt_low_value, rt_high_value))
+		{
+			// PCSX2 iR5900Arit.cpp::recSLTU_constt() compares the runtime RS
+			// value against a constant RT.
+			return EmitSetLessThan64Known(rd, false, rs, rt_low_value, rt_high_value, false);
+		}
+
 		unsigned rs_low;
 		unsigned rt_low;
 		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
@@ -13805,6 +16109,31 @@ namespace VitaEE
 		// register zero still writes signed-extended zero.
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
+
+		u32 rt_value = 0;
+		if (FindGprPinHost(rt) < 0 && TryGetKnownGprLow(rt, &rt_value))
+		{
+			u32 result = rt_value;
+			if (sa != 0)
+			{
+				switch (shift)
+				{
+					case VitaA32::ShiftType::LSL:
+						result = rt_value << sa;
+						break;
+					case VitaA32::ShiftType::LSR:
+						result = rt_value >> sa;
+						break;
+					case VitaA32::ShiftType::ASR:
+						result = static_cast<u32>(static_cast<s32>(rt_value) >> sa);
+						break;
+					default:
+						break;
+				}
+			}
+
+			return EmitStoreKnownSignExtended32(rd, result);
+		}
 
 		unsigned rt_host;
 		if (!EmitGprLowOperand(rt, HOST_TMP0, &rt_host))
@@ -13839,6 +16168,36 @@ namespace VitaEE
 		// amount is irrelevant when the source register is zero.
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
+
+		u32 rt_value = 0;
+		u32 rs_value = 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		const bool rs_pinned = (rs == 0 || FindGprPinHost(rs) >= 0);
+		if (!(rt_pinned && rs_pinned) &&
+			TryGetKnownGprLow(rt, &rt_value) && TryGetKnownGprLow(rs, &rs_value))
+		{
+			const unsigned amount = rs_value & 0x1f;
+			u32 result = rt_value;
+			if (amount != 0)
+			{
+				switch (shift)
+				{
+					case VitaA32::ShiftType::LSL:
+						result = rt_value << amount;
+						break;
+					case VitaA32::ShiftType::LSR:
+						result = rt_value >> amount;
+						break;
+					case VitaA32::ShiftType::ASR:
+						result = static_cast<u32>(static_cast<s32>(rt_value) >> amount);
+						break;
+					default:
+						break;
+				}
+			}
+
+			return EmitStoreKnownSignExtended32(rd, result);
+		}
 
 		// Register zero supplies a shift amount of 0; the 32-bit result still
 		// needs the owner's sign-extension into the low 64-bit lane.
@@ -13875,6 +16234,17 @@ namespace VitaEE
 		// register zero writes zero for every immediate amount.
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
+
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		if (FindGprPinHost(rt) < 0 && TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value))
+		{
+			// PCSX2's x86 constant register file folds DSLL/DSLL32 as a full
+			// low-64 value; require the exact high word before replacing loads.
+			const u64 value = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
+			const u64 result = value << amount;
+			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+		}
 
 		unsigned rt_low;
 		if (!EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low))
@@ -13916,6 +16286,19 @@ namespace VitaEE
 		// Shifting register zero writes zero for every immediate amount.
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
+
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		if (FindGprPinHost(rt) < 0 && TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value))
+		{
+			// PCSX2's x86 constant register file folds DSRL/DSRL32/DSRA/DSRA32
+			// as full low-64 values; arithmetic shifts need the exact sign word.
+			const u64 value = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
+			const u64 result = arithmetic ?
+				static_cast<u64>(static_cast<s64>(value) >> amount) :
+				(value >> amount);
+			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+		}
 
 		unsigned rt_low;
 		if (!EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low))
@@ -13964,11 +16347,26 @@ namespace VitaEE
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
 		// Register zero supplies a shift amount of 0.
+		if (rs == 0 && rd == rt)
+			return true;
+
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		u32 rs_value = 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		const bool rs_pinned = (rs == 0 || FindGprPinHost(rs) >= 0);
+		if (!(rt_pinned && rs_pinned) &&
+			TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value) && TryGetKnownGprLow(rs, &rs_value))
+		{
+			// PCSX2 x86 const-propagates DSLLV through g_cpuConstRegs; the
+			// exact high-word proof makes the Cortex-A9 fold safe for low64.
+			const u64 value = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
+			const u64 result = value << (rs_value & 0x3f);
+			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+		}
+
 		if (rs == 0)
 		{
-			if (rd == rt)
-				return true;
-
 			unsigned rt_low;
 			return EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low) &&
 				   EmitStoreGpr64(rd, rt_low, HOST_TMP1);
@@ -14038,11 +16436,30 @@ namespace VitaEE
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
 		// Register zero supplies a shift amount of 0.
+		if (rs == 0 && rd == rt)
+			return true;
+
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		u32 rs_value = 0;
+		const bool rt_pinned = FindGprPinHost(rt) >= 0;
+		const bool rs_pinned = (rs == 0 || FindGprPinHost(rs) >= 0);
+		if (!(rt_pinned && rs_pinned) &&
+			TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value) && TryGetKnownGprLow(rs, &rs_value))
+		{
+			// PCSX2 x86 const-propagates DSRLV/DSRAV through g_cpuConstRegs;
+			// the exact high-word proof preserves logical versus arithmetic
+			// high-bit behavior.
+			const u64 value = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
+			const unsigned amount = rs_value & 0x3f;
+			const u64 result = arithmetic ?
+				static_cast<u64>(static_cast<s64>(value) >> amount) :
+				(value >> amount);
+			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+		}
+
 		if (rs == 0)
 		{
-			if (rd == rt)
-				return true;
-
 			unsigned rt_low;
 			return EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low) &&
 				   EmitStoreGpr64(rd, rt_low, HOST_TMP1);
@@ -14109,6 +16526,30 @@ namespace VitaEE
 
 		if (rd == 0)
 			return true;
+
+		// PCSX2 x86/ix86-32/iR5900Move.cpp::recMOVZ()/recMOVN() skip the
+		// self-copy and fold GPR_IS_CONST1 RT predicates before emitting a test.
+		if (rs == rd)
+			return true;
+
+		u32 rt_low_value = 0;
+		u32 rt_high_value = 0;
+		if (TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value))
+		{
+			const bool rt_zero = rt_low_value == 0 && rt_high_value == 0;
+			const bool move = move_on_zero ? rt_zero : !rt_zero;
+			if (!move)
+				return true;
+
+			u32 rs_low_value = 0;
+			u32 rs_high_value = 0;
+			if (FindGprPinHost(rs) < 0 && TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value))
+				return EmitStoreKnown64(rd, rs_low_value, rs_high_value);
+
+			unsigned rs_low;
+			return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
+				   EmitStoreGpr64(rd, rs_low, HOST_TMP1);
+		}
 
 		unsigned rt_low;
 		if (!EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) ||
@@ -14210,6 +16651,14 @@ namespace VitaEE
 			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
 	}
 
+	bool BlockCompiler::EmitCompareGpr64WithKnownForBranch(unsigned guest_reg, u32 low, u32 high)
+	{
+		unsigned guest_low;
+		return EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low) &&
+			   EmitCmpImm32OrReg(HOST_TMP1, high, HOST_TMP2) &&
+			   EmitCmpImm32OrReg(guest_low, low, HOST_TMP2, VitaA32::Condition::EQ);
+	}
+
 	bool BlockCompiler::EmitCompareGpr64ForBranch(unsigned lhs_guest_reg, unsigned rhs_guest_reg)
 	{
 		// PCSX2 owners: Interpreter.cpp::BEQ()/BNE()/BEQL()/BNEL(). Branch
@@ -14226,6 +16675,24 @@ namespace VitaEE
 				   m_code.EmitOrrReg(HOST_TMP0, low_host, HOST_TMP1, true);
 		}
 
+		u32 lhs_low_value = 0;
+		u32 lhs_high_value = 0;
+		u32 rhs_low_value = 0;
+		u32 rhs_high_value = 0;
+		const bool lhs_known = TryGetKnownGpr64(lhs_guest_reg, &lhs_low_value, &lhs_high_value);
+		const bool rhs_known = TryGetKnownGpr64(rhs_guest_reg, &rhs_low_value, &rhs_high_value);
+		if (lhs_known && FindGprPinHost(lhs_guest_reg) < 0)
+		{
+			// PCSX2 x86/ix86-32/iR5900Branch.cpp::recBEQ()/recBNE() can
+			// compare one runtime GPR against one GPR_IS_CONST value. Do the
+			// same only when the constant side is not already resident in a pin.
+			return EmitCompareGpr64WithKnownForBranch(rhs_guest_reg, lhs_low_value, lhs_high_value);
+		}
+		if (rhs_known && FindGprPinHost(rhs_guest_reg) < 0)
+		{
+			return EmitCompareGpr64WithKnownForBranch(lhs_guest_reg, rhs_low_value, rhs_high_value);
+		}
+
 		unsigned lhs_low;
 		unsigned rhs_low;
 		return EmitGpr64OperandLow(lhs_guest_reg, HOST_TMP0, HOST_TMP1, &lhs_low) &&
@@ -14234,10 +16701,176 @@ namespace VitaEE
 			   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3, VitaA32::Condition::EQ);
 	}
 
+	bool BlockCompiler::TryEvaluateConstantBranch(u32 op, bool* taken) const
+	{
+		if (!taken)
+			return false;
+
+		const auto evaluate_signed = [](s64 value, SignedBranchCondition condition) {
+			switch (condition)
+			{
+				case SignedBranchCondition::LessThanZero:
+					return value < 0;
+				case SignedBranchCondition::GreaterEqualZero:
+					return value >= 0;
+				case SignedBranchCondition::LessEqualZero:
+					return value <= 0;
+				case SignedBranchCondition::GreaterThanZero:
+					return value > 0;
+			}
+			return false;
+		};
+
+		const auto evaluate_known_signed = [&](unsigned guest_reg, SignedBranchCondition condition) {
+			if (guest_reg == 0)
+			{
+				*taken = evaluate_signed(0, condition);
+				return true;
+			}
+
+			u32 low = 0;
+			u32 high = 0;
+			if (!TryGetKnownGpr64(guest_reg, &low, &high))
+				return false;
+
+			const u64 value = (static_cast<u64>(high) << 32) | low;
+			*taken = evaluate_signed(static_cast<s64>(value), condition);
+			return true;
+		};
+
+		switch (op >> 26)
+		{
+			case 0x01:
+				// PCSX2 owner: x86/ix86-32/iR5900Branch.cpp folds non-link
+				// GPR_IS_CONST1 REGIMM predicates, including BLTZL and BGEZL.
+				switch (RT(op))
+				{
+					case 0x00: // BLTZ
+					case 0x02: // BLTZL
+						return evaluate_known_signed(RS(op), SignedBranchCondition::LessThanZero);
+					case 0x01: // BGEZ
+					case 0x03: // BGEZL
+						return evaluate_known_signed(RS(op), SignedBranchCondition::GreaterEqualZero);
+					default:
+						return false;
+				}
+
+			case 0x04: // BEQ
+			case 0x14: // BEQL
+			case 0x05: // BNE
+			case 0x15: // BNEL
+			{
+				const unsigned rs = RS(op);
+				const unsigned rt = RT(op);
+				const bool branch_on_equal = (op >> 26) == 0x04 || (op >> 26) == 0x14;
+				if (rs == rt)
+				{
+					*taken = branch_on_equal;
+					return true;
+				}
+
+				u32 rs_low = 0;
+				u32 rs_high = 0;
+				u32 rt_low = 0;
+				u32 rt_high = 0;
+				if (!TryGetKnownGpr64(rs, &rs_low, &rs_high) ||
+					!TryGetKnownGpr64(rt, &rt_low, &rt_high))
+				{
+					return false;
+				}
+
+				const bool equal = rs_low == rt_low && rs_high == rt_high;
+				*taken = (equal == branch_on_equal);
+				return true;
+			}
+
+			case 0x06: // BLEZ
+			case 0x16: // BLEZL
+				return evaluate_known_signed(RS(op), SignedBranchCondition::LessEqualZero);
+			case 0x07: // BGTZ
+			case 0x17: // BGTZL
+				return evaluate_known_signed(RS(op), SignedBranchCondition::GreaterThanZero);
+			default:
+				return false;
+		}
+	}
+
+	bool BlockCompiler::TryEvaluateConstantRegimmLinkBranch(u32 op, bool* taken) const
+	{
+		if (!taken || (op >> 26) != 0x01)
+			return false;
+
+		const bool branch_on_less = [&]() {
+			switch (RT(op))
+			{
+				case 0x10: // BLTZAL
+				case 0x12: // BLTZALL
+					return true;
+				case 0x11: // BGEZAL
+				case 0x13: // BGEZALL
+					return false;
+				default:
+					return false;
+			}
+		}();
+
+		switch (RT(op))
+		{
+			case 0x10:
+			case 0x11:
+			case 0x12:
+			case 0x13:
+				break;
+			default:
+				return false;
+		}
+
+		const unsigned rs = RS(op);
+		if (rs == 31)
+		{
+			// PCSX2 owners: Interpreter.cpp::BLTZAL()/BGEZAL()/BLTZALL()/
+			// BGEZALL() and x86/ix86-32/iR5900Branch.cpp::rec*AL() store ra
+			// before testing RS. EmitLink() writes a zero high word, so ra is
+			// non-negative for the signed low64 predicate.
+			*taken = !branch_on_less;
+			return true;
+		}
+
+		if (rs == 0)
+		{
+			*taken = !branch_on_less;
+			return true;
+		}
+
+		u32 low = 0;
+		u32 high = 0;
+		if (!TryGetKnownGpr64(rs, &low, &high))
+			return false;
+
+		const s64 value = static_cast<s64>((static_cast<u64>(high) << 32) | low);
+		*taken = branch_on_less ? value < 0 : value >= 0;
+		return true;
+	}
+
 	bool BlockCompiler::EmitBranchEqual(u32 op, bool branch_on_equal)
 	{
 		const unsigned rs = RS(op);
 		const unsigned rt = RT(op);
+
+		if (rs == rt)
+			return m_code.EmitMovImm8(HOST_BRANCH_FLAG, branch_on_equal ? 1 : 0);
+
+		u32 rs_low = 0;
+		u32 rs_high = 0;
+		u32 rt_low = 0;
+		u32 rt_high = 0;
+		if (TryGetKnownGpr64(rs, &rs_low, &rs_high) && TryGetKnownGpr64(rt, &rt_low, &rt_high))
+		{
+			// PCSX2 x86/ix86-32/iR5900Branch.cpp::recBEQ_const() /
+			// recBNE_const() resolve the branch predicate from GPR_IS_CONST2.
+			const bool equal = rs_low == rt_low && rs_high == rt_high;
+			return m_code.EmitMovImm8(HOST_BRANCH_FLAG, (equal == branch_on_equal) ? 1 : 0);
+		}
 
 		return EmitCompareGpr64ForBranch(rs, rt) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
@@ -14247,6 +16880,7 @@ namespace VitaEE
 	bool BlockCompiler::EmitBranchSigned(u32 op, SignedBranchCondition condition)
 	{
 		const unsigned rs = RS(op);
+		const unsigned rt = RT(op);
 
 		// PCSX2 owners: Interpreter.cpp::BLTZ/BGEZ/BLEZ/BGTZ and likely/link
 		// variants compare the low 64-bit SD[0] value. $zero makes those
@@ -14255,6 +16889,35 @@ namespace VitaEE
 		{
 			const bool taken = condition == SignedBranchCondition::GreaterEqualZero ||
 							   condition == SignedBranchCondition::LessEqualZero;
+			return m_code.EmitMovImm8(HOST_BRANCH_FLAG, taken ? 1 : 0);
+		}
+
+		const bool regimm_link_reads_ra = (op >> 26) == 0x01 && rs == 31 &&
+			(rt == 0x10 || rt == 0x11 || rt == 0x12 || rt == 0x13);
+		u32 rs_low_value = 0;
+		u32 rs_high_value = 0;
+		if (!regimm_link_reads_ra && TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value))
+		{
+			// PCSX2 x86/ix86-32/iR5900Branch.cpp folds GPR_IS_CONST1 signed
+			// branches. Require exact low64 state because these predicates read
+			// SD[0], not only the low word.
+			const s64 value = static_cast<s64>((static_cast<u64>(rs_high_value) << 32) | rs_low_value);
+			bool taken = false;
+			switch (condition)
+			{
+				case SignedBranchCondition::LessThanZero:
+					taken = value < 0;
+					break;
+				case SignedBranchCondition::GreaterEqualZero:
+					taken = value >= 0;
+					break;
+				case SignedBranchCondition::LessEqualZero:
+					taken = value <= 0;
+					break;
+				case SignedBranchCondition::GreaterThanZero:
+					taken = value > 0;
+					break;
+			}
 			return m_code.EmitMovImm8(HOST_BRANCH_FLAG, taken ? 1 : 0);
 		}
 
@@ -14384,6 +17047,50 @@ namespace VitaEE
 			   EmitStoreGpr64(guest_reg, HOST_TMP4, HOST_TMP1);
 	}
 
+	bool BlockCompiler::EmitSetLessThan64Known(unsigned guest_reg, bool signed_compare,
+		unsigned runtime_guest_reg, u32 known_low, u32 known_high, bool known_is_lhs)
+	{
+		if (guest_reg == 0)
+			return true;
+
+		unsigned runtime_low = HOST_TMP0;
+		if (!EmitGpr64OperandLow(runtime_guest_reg, HOST_TMP0, HOST_TMP1, &runtime_low) ||
+			!m_code.EmitMovImm8(HOST_TMP4, 0) ||
+			!EmitCmpImm32OrReg(HOST_TMP1, known_high, HOST_TMP2))
+		{
+			return false;
+		}
+
+		const size_t high_equal = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (high_equal == static_cast<size_t>(-1))
+			return false;
+
+		const VitaA32::Condition high_true =
+			known_is_lhs ? (signed_compare ? VitaA32::Condition::GT : VitaA32::Condition::HI) :
+						   (signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC);
+		if (!m_code.EmitMovImm8(HOST_TMP4, 1, high_true))
+			return false;
+
+		const size_t done = m_code.EmitBranchPlaceholder();
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t low_compare = m_code.Size();
+		const VitaA32::Condition low_true =
+			known_is_lhs ? VitaA32::Condition::HI : VitaA32::Condition::CC;
+		if (!EmitCmpImm32OrReg(runtime_low, known_low, HOST_TMP2) ||
+			!m_code.EmitMovImm8(HOST_TMP4, 1, low_true))
+		{
+			return false;
+		}
+
+		const size_t done_target = m_code.Size();
+		return m_code.PatchBranch(high_equal, low_compare, VitaA32::Condition::EQ) &&
+			   m_code.PatchBranch(done, done_target) &&
+			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
+			   EmitStoreGpr64(guest_reg, HOST_TMP4, HOST_TMP1);
+	}
+
 	bool BlockCompiler::EmitSetLessThan64Imm(unsigned guest_reg, s32 imm, bool signed_compare,
 		unsigned lhs_low, unsigned lhs_high)
 	{
@@ -14445,6 +17152,51 @@ namespace VitaEE
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp::LWL() / LWR().
 		const unsigned rt = RT(op);
+		constexpr u32 LWL_MASK[4] = {0x00ffffffu, 0x0000ffffu, 0x000000ffu, 0x00000000u};
+		constexpr u32 LWR_MASK[4] = {0x00000000u, 0xff000000u, 0xffff0000u, 0xffffff00u};
+		constexpr u8 LWL_SHIFT[4] = {24, 16, 8, 0};
+		constexpr u8 LWR_SHIFT[4] = {0, 8, 16, 24};
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address & ~3u, HOST_TMP0,
+				KnownVtlbFastPathKind::Partial))
+		{
+			const unsigned lane = known_address & 3u;
+			const u8 shift = left ? LWL_SHIFT[lane] : LWR_SHIFT[lane];
+			const u32 mask = left ? LWL_MASK[lane] : LWR_MASK[lane];
+			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
+				return false;
+
+			if (rt != 0)
+			{
+				if (!EmitLoadGprLow(rt, HOST_TMP1) ||
+					!(mask == 0 ? m_code.EmitMovImm8(HOST_TMP1, 0) :
+								   EmitAndImm32OrReg(HOST_TMP1, HOST_TMP1, mask, HOST_TMP2)) ||
+					!(shift == 0 ? true :
+						(left ? m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, shift) :
+								m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, shift))) ||
+					!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP1, HOST_TMP0))
+				{
+					return false;
+				}
+
+				if (left || lane == 0)
+				{
+					if (!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31))
+						return false;
+				}
+				else if (!EmitLoadGprHigh(rt, HOST_TMP1))
+				{
+					return false;
+				}
+
+				if (!EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1))
+					return false;
+			}
+
+			return true;
+		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
@@ -14517,6 +17269,34 @@ namespace VitaEE
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp::SWL() / SWR().
 		const unsigned rt = RT(op);
+		constexpr u32 SWL_MASK[4] = {0xffffff00u, 0xffff0000u, 0xff000000u, 0x00000000u};
+		constexpr u32 SWR_MASK[4] = {0x00000000u, 0x000000ffu, 0x0000ffffu, 0x00ffffffu};
+		constexpr u8 SWL_SHIFT[4] = {24, 16, 8, 0};
+		constexpr u8 SWR_SHIFT[4] = {0, 8, 16, 24};
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address & ~3u, HOST_TMP5,
+				KnownVtlbFastPathKind::Partial))
+		{
+			const unsigned lane = known_address & 3u;
+			const u8 shift = left ? SWL_SHIFT[lane] : SWR_SHIFT[lane];
+			const u32 mask = left ? SWL_MASK[lane] : SWR_MASK[lane];
+			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP5, 0) ||
+				!(mask == 0 ? m_code.EmitMovImm8(HOST_TMP0, 0) :
+							   EmitAndImm32OrReg(HOST_TMP0, HOST_TMP0, mask, HOST_TMP2)) ||
+				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(GprOffset(rt))) ||
+				!(shift == 0 ? true :
+					(left ? m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, shift) :
+							m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, shift))) ||
+				!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP1) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_TMP5, 0))
+			{
+				return false;
+			}
+
+			return true;
+		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
@@ -14565,6 +17345,43 @@ namespace VitaEE
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp::LDL() / LDR().
 		const unsigned rt = RT(op);
+
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address & ~7u, HOST_TMP0,
+				KnownVtlbFastPathKind::Partial))
+		{
+			const unsigned shift = known_address & 7u;
+			if (rt != 0)
+			{
+				const auto emit_byte = [this, rt](unsigned memory_byte, unsigned dest_byte) {
+					return m_code.EmitLdrbImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(memory_byte)) &&
+						   m_code.EmitStrbImm12(HOST_TMP1, HOST_CPU_REGS,
+							   static_cast<u16>(GprOffset(rt) + dest_byte));
+				};
+
+				if (left)
+				{
+					for (unsigned memory_byte = 0; memory_byte <= shift; memory_byte++)
+					{
+						const unsigned dest_byte = 7 - shift + memory_byte;
+						if (!emit_byte(memory_byte, dest_byte))
+							return false;
+					}
+				}
+				else
+				{
+					for (unsigned memory_byte = shift; memory_byte < 8; memory_byte++)
+					{
+						const unsigned dest_byte = memory_byte - shift;
+						if (!emit_byte(memory_byte, dest_byte))
+							return false;
+					}
+				}
+			}
+
+			return EmitRefreshGprPinFromBacking(rt);
+		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
@@ -14667,6 +17484,40 @@ namespace VitaEE
 		// PCSX2 owners: R5900OpcodeImpl.cpp::SDL() / SDR().
 		const unsigned rt = RT(op);
 
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address & ~7u, HOST_TMP0,
+				KnownVtlbFastPathKind::Partial))
+		{
+			const unsigned shift = known_address & 7u;
+			const auto emit_byte = [this, rt](unsigned source_byte, unsigned memory_byte) {
+				return m_code.EmitLdrbImm12(HOST_TMP1, HOST_CPU_REGS,
+						   static_cast<u16>(GprOffset(rt) + source_byte)) &&
+					   m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(memory_byte));
+			};
+
+			if (left)
+			{
+				for (unsigned memory_byte = 0; memory_byte <= shift; memory_byte++)
+				{
+					const unsigned source_byte = 7 - shift + memory_byte;
+					if (!emit_byte(source_byte, memory_byte))
+						return false;
+				}
+			}
+			else
+			{
+				for (unsigned memory_byte = shift; memory_byte < 8; memory_byte++)
+				{
+					const unsigned source_byte = memory_byte - shift;
+					if (!emit_byte(source_byte, memory_byte))
+						return false;
+				}
+			}
+
+			return true;
+		}
+
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
@@ -14767,52 +17618,26 @@ namespace VitaEE
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
-		if (!EmitEffectiveAddress(op, address_reg))
+		const auto emit_load_from_host = [&]() -> bool {
+			switch (width)
+			{
+				case ScalarLoadWidth::Byte:
+					return sign_extend ? m_code.EmitLdrsbImm8(HOST_TMP0, HOST_TMP0, 0) :
+										 m_code.EmitLdrbImm12(HOST_TMP0, HOST_TMP0, 0);
+				case ScalarLoadWidth::Halfword:
+					return sign_extend ? m_code.EmitLdrshImm8(HOST_TMP0, HOST_TMP0, 0) :
+										 m_code.EmitLdrhImm8(HOST_TMP0, HOST_TMP0, 0);
+				case ScalarLoadWidth::Word:
+					return m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0);
+				case ScalarLoadWidth::Dword:
+					// PCSX2 owner: R5900OpcodeImpl.cpp::LD() via vtlb_memRead64().
+					// Keep the translated address out of r0/r1 so Cortex-A9 can use
+					// one LDRD instead of two dependent scalar loads.
+					return m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, address_reg, 0);
+			}
+
 			return false;
-
-		if (alignment_mask != 0)
-		{
-			if (!m_code.EmitAndImm8(vmap_reg, address_reg, alignment_mask, true))
-				return false;
-
-			unaligned_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-			if (unaligned_fallback == static_cast<size_t>(-1))
-				return false;
-		}
-
-		if (!EmitVtlbNonHandlerHostAddress(address_reg, vmap_reg, scratch_reg, &handler_fallback))
-			return false;
-
-		switch (width)
-		{
-			case ScalarLoadWidth::Byte:
-				if (!(sign_extend ? m_code.EmitLdrsbImm8(HOST_TMP0, HOST_TMP0, 0) :
-									 m_code.EmitLdrbImm12(HOST_TMP0, HOST_TMP0, 0)))
-					return false;
-				break;
-
-			case ScalarLoadWidth::Halfword:
-				if (!(sign_extend ? m_code.EmitLdrshImm8(HOST_TMP0, HOST_TMP0, 0) :
-									 m_code.EmitLdrhImm8(HOST_TMP0, HOST_TMP0, 0)))
-					return false;
-				break;
-
-			case ScalarLoadWidth::Word:
-				if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0))
-					return false;
-				break;
-
-			case ScalarLoadWidth::Dword:
-				// PCSX2 owner: R5900OpcodeImpl.cpp::LD() via vtlb_memRead64().
-				// Keep the translated address out of r0/r1 so Cortex-A9 can use
-				// one LDRD instead of two dependent scalar loads.
-				if (!m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, address_reg, 0))
-				{
-					return false;
-				}
-				break;
-		}
-
+		};
 		const auto emit_store_result = [&]() -> bool {
 			if (width == ScalarLoadWidth::Dword)
 			{
@@ -14845,7 +17670,32 @@ namespace VitaEE
 			return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 		};
 
-		if (!emit_store_result())
+		u32 known_address = 0;
+		if (TryGetKnownEffectiveAddress(op, &known_address) &&
+			(alignment_mask == 0 || (known_address & alignment_mask) == 0) &&
+			(!counter_read_event || ((known_address & 0xffffe000u) != 0x10000000u)) &&
+			TryEmitKnownVtlbNonHandlerHostAddress(known_address, address_reg))
+		{
+			return emit_load_from_host() && emit_store_result();
+		}
+
+		if (!EmitEffectiveAddress(op, address_reg))
+			return false;
+
+		if (alignment_mask != 0)
+		{
+			if (!m_code.EmitAndImm8(vmap_reg, address_reg, alignment_mask, true))
+				return false;
+
+			unaligned_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (unaligned_fallback == static_cast<size_t>(-1))
+				return false;
+		}
+
+		if (!EmitVtlbNonHandlerHostAddress(address_reg, vmap_reg, scratch_reg, &handler_fallback))
+			return false;
+
+		if (!emit_load_from_host() || !emit_store_result())
 			return false;
 
 		m_scalar_load_cold_tails.push_back({
@@ -14896,8 +17746,7 @@ namespace VitaEE
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 		if (!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
-			!m_code.EmitCallAbsolute(event_exit) ||
-			!m_code.EmitPop(m_saved_registers | REG_PC))
+			!EmitEventExitReturn(event_exit))
 		{
 			return false;
 		}
@@ -14908,18 +17757,18 @@ namespace VitaEE
 	bool BlockCompiler::EmitAddressErrorEventExit(u32 next_pc, u32 raw_cycles_through_instruction,
 		const void* event_exit, bool store)
 	{
-		if (!event_exit || raw_cycles_through_instruction == 0)
-			return false;
+			if (!event_exit || raw_cycles_through_instruction == 0)
+				return false;
 
-		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
-		return m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP0, VitaA32::ShiftType::LSL, 0) &&
-			   EmitStorePc(next_pc) &&
-			   EmitAddScaledCyclesToCpu(cycles) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP4, VitaA32::ShiftType::LSL, 0) &&
+			const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
+			return EmitSyncGprPinsToBacking() &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP0, VitaA32::ShiftType::LSL, 0) &&
+				   EmitStorePc(next_pc) &&
+				   EmitAddScaledCyclesToCpu(cycles) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP4, VitaA32::ShiftType::LSL, 0) &&
 			   m_code.EmitMovImm8(HOST_TMP1, store ? 1 : 0) &&
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeRaiseAddressError)) &&
-			   m_code.EmitCallAbsolute(event_exit) &&
-			   m_code.EmitPop(m_saved_registers | REG_PC);
+			   EmitEventExitReturn(event_exit);
 	}
 
 	bool BlockCompiler::EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
@@ -14928,12 +17777,13 @@ namespace VitaEE
 		if (!helper || !event_exit || raw_cycles_through_instruction == 0)
 			return false;
 
-		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
-		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
-			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
-			!EmitStorePc(next_pc) ||
-			!EmitAddScaledCyclesToCpu(cycles) ||
-			!m_code.EmitCallAbsolute(helper))
+			const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
+			if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
+				!EmitSyncGprPinsToBacking() ||
+				!EmitStorePc(next_pc) ||
+				!EmitAddScaledCyclesToCpu(cycles) ||
+				!m_code.EmitCallAbsolute(helper))
 		{
 			return false;
 		}
@@ -14944,8 +17794,7 @@ namespace VitaEE
 			return false;
 		}
 
-		return m_code.EmitCallAbsolute(event_exit) &&
-			   m_code.EmitPop(m_saved_registers | REG_PC);
+		return EmitEventExitReturn(event_exit);
 	}
 
 	bool BlockCompiler::FlushColdTails()
@@ -15031,14 +17880,16 @@ namespace VitaEE
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
 			return false;
-		if (tail.address_reg != HOST_TMP0 &&
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, tail.address_reg, VitaA32::ShiftType::LSL, 0))
-		{
-			return false;
-		}
+			if (tail.address_reg != HOST_TMP0 &&
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, tail.address_reg, VitaA32::ShiftType::LSL, 0))
+			{
+				return false;
+			}
+			if (!EmitSyncGprPinsToBacking())
+				return false;
 
-		const bool needs_counter_event = tail.counter_read_event && tail.rt != 0;
-		const auto emit_normalize_narrow_low = [&]() -> bool {
+			const bool needs_counter_event = tail.counter_read_event && tail.rt != 0;
+			const auto emit_normalize_narrow_low = [&]() -> bool {
 			switch (tail.width)
 			{
 				case ScalarLoadWidth::Byte:
@@ -15088,13 +17939,14 @@ namespace VitaEE
 
 		if ((tail.branch_delay_slot && needs_counter_event &&
 			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
-			(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
-			!m_code.EmitCallAbsolute(tail.read_helper) ||
-			(tail.width != ScalarLoadWidth::Dword && tail.rt != 0 && !emit_normalize_narrow_low()) ||
-			!emit_store_result())
-		{
-			return false;
-		}
+				(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
+				!m_code.EmitCallAbsolute(tail.read_helper) ||
+				(tail.width != ScalarLoadWidth::Dword && tail.rt != 0 && !emit_normalize_narrow_low()) ||
+				!emit_store_result() ||
+				!EmitFlushDirtyGprPins())
+			{
+				return false;
+			}
 
 		if (needs_counter_event &&
 			(!EmitCounterReadEventExit(tail.pc + 4, tail.raw_cycles_through_instruction, tail.event_exit) ||
@@ -15125,11 +17977,13 @@ namespace VitaEE
 			}
 		}
 
-		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
-			return false;
+			const size_t fallback_target = m_code.Size();
+			if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
+				return false;
+			if (!EmitSyncGprPinsToBacking())
+				return false;
 
-		switch (tail.width)
+			switch (tail.width)
 		{
 			case ScalarStoreWidth::Byte:
 			case ScalarStoreWidth::Halfword:
@@ -15575,6 +18429,61 @@ namespace VitaEE
 			   m_code.EmitStrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
 	}
 
+	bool BlockCompiler::EmitAddScaledCyclesToCpuLowWord(u32 cycles, unsigned host_low, unsigned scratch,
+		size_t* carry_branch)
+	{
+		if (!carry_branch)
+			return false;
+
+		*carry_branch = static_cast<size_t>(-1);
+		if (!m_code.EmitLdrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)))
+			return false;
+
+		if (!m_code.EmitAddImm32(host_low, host_low, cycles, true))
+		{
+			if (!m_code.EmitMovImm32(scratch, cycles) ||
+				!m_code.EmitAddReg(host_low, host_low, scratch, true))
+			{
+				return false;
+			}
+		}
+
+		if (!m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)))
+			return false;
+
+		*carry_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+		return *carry_branch != static_cast<size_t>(-1);
+	}
+
+	bool BlockCompiler::EmitCycleCarryFixup(const size_t* carry_branches, size_t carry_branch_count,
+		size_t resume_offset, unsigned scratch)
+	{
+		if (!carry_branches || carry_branch_count == 0)
+			return true;
+
+		const size_t carry_target = m_code.Size();
+		for (size_t i = 0; i < carry_branch_count; i++)
+		{
+			if (carry_branches[i] != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(carry_branches[i], carry_target, VitaA32::Condition::CS))
+			{
+				return false;
+			}
+		}
+
+		constexpr u16 cycle_high_offset = static_cast<u16>(CYCLE_OFFSET + sizeof(u32));
+		if (!m_code.EmitLdrImm12(scratch, HOST_CPU_REGS, cycle_high_offset) ||
+			!m_code.EmitAddImm8(scratch, scratch, 1) ||
+			!m_code.EmitStrImm12(scratch, HOST_CPU_REGS, cycle_high_offset))
+		{
+			return false;
+		}
+
+		const size_t resume_branch = m_code.EmitBranchPlaceholder();
+		return resume_branch != static_cast<size_t>(-1) &&
+			   m_code.PatchBranch(resume_branch, resume_offset);
+	}
+
 	bool BlockCompiler::EmitLoadCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch)
 	{
 		if (offset == 0)
@@ -15921,8 +18830,8 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return m_code.EmitMovImm8(host_reg, 0);
 
-		// Pinned registers are write-through, so the host copy always matches
-		// memory and a 1-cycle move replaces the Cortex-A9 load-use stall.
+		// Pinned registers carry the current in-block value, so a 1-cycle move
+		// replaces the Cortex-A9 load-use stall.
 		const int pin_host = FindGprPinHost(guest_reg);
 		if (pin_host >= 0)
 		{
@@ -15958,16 +18867,24 @@ namespace VitaEE
 		if (pin_host < 0)
 			return true;
 
+		const size_t offset = GprOffset(guest_reg);
+		const int high_pin_host = FindGprPinHighHost(guest_reg);
+		if (high_pin_host >= 0 && offset <= 0xff &&
+			CanUseA32DualTransferPair(static_cast<unsigned>(pin_host), static_cast<unsigned>(high_pin_host)))
+		{
+			return m_code.EmitLdrdImm8(static_cast<unsigned>(pin_host), static_cast<unsigned>(high_pin_host),
+				HOST_CPU_REGS, static_cast<u8>(offset));
+		}
+
 		if (!m_code.EmitLdrImm12(static_cast<unsigned>(pin_host), HOST_CPU_REGS,
-			static_cast<u16>(GprOffset(guest_reg))))
+			static_cast<u16>(offset)))
 		{
 			return false;
 		}
 
-		const int high_pin_host = FindGprPinHighHost(guest_reg);
 		return high_pin_host < 0 ||
 			   m_code.EmitLdrImm12(static_cast<unsigned>(high_pin_host), HOST_CPU_REGS,
-				   static_cast<u16>(GprOffset(guest_reg) + sizeof(u32)));
+				   static_cast<u16>(offset + sizeof(u32)));
 	}
 
 	bool BlockCompiler::TryEmitLoadGprWordFromQCache(unsigned guest_reg, unsigned word,
@@ -16116,9 +19033,11 @@ namespace VitaEE
 		if (high_pin_host >= 0 && !m_code.EmitMovImm8(static_cast<unsigned>(high_pin_host), 0))
 			return false;
 
+		const bool defer_low = TryDeferGprPinLowStore(guest_reg);
+		const bool defer_high = TryDeferGprPinHighStore(guest_reg);
 		const size_t offset = GprOffset(guest_reg);
 		bool stored = false;
-		if (offset <= 0xff && CanUseA32DualTransferPair(HOST_TMP0, HOST_TMP1))
+		if (!defer_low && !defer_high && offset <= 0xff && CanUseA32DualTransferPair(HOST_TMP0, HOST_TMP1))
 		{
 			stored = m_code.EmitMovImm8(HOST_TMP0, 0) &&
 					 m_code.EmitMovImm8(HOST_TMP1, 0) &&
@@ -16126,9 +19045,11 @@ namespace VitaEE
 		}
 		else
 		{
-			stored = m_code.EmitMovImm8(HOST_TMP0, 0) &&
-					 m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(offset)) &&
-					 m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+			stored = (defer_low && defer_high) || m_code.EmitMovImm8(HOST_TMP0, 0);
+			if (stored && !defer_low)
+				stored = m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(offset));
+			if (stored && !defer_high)
+				stored = m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
 		}
 
 		if (!stored)
@@ -16241,6 +19162,7 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return true;
 
+		bool deferred = false;
 		if (word == 0)
 		{
 			const int pin_host = FindGprPinHost(guest_reg);
@@ -16250,6 +19172,8 @@ namespace VitaEE
 			{
 				return false;
 			}
+
+			deferred = TryDeferGprPinLowStore(guest_reg);
 		}
 		else if (word == 1)
 		{
@@ -16260,10 +19184,13 @@ namespace VitaEE
 			{
 				return false;
 			}
+
+			deferred = TryDeferGprPinHighStore(guest_reg);
 		}
 
-		if (!m_code.EmitStrImm12(host_reg, HOST_CPU_REGS,
-			static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32))))
+		if (!deferred &&
+			!m_code.EmitStrImm12(host_reg, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32))))
 		{
 			return false;
 		}
@@ -16278,7 +19205,7 @@ namespace VitaEE
 			return true;
 
 		// PCSX2 VU0.cpp::CFC2(REG_R) updates only GPR.UL[0]. Keep the
-		// write-through pin in sync while preserving the existing high word.
+		// low-word pin in sync while preserving the existing high word.
 		const int pin_host = FindGprPinHost(guest_reg);
 		if (pin_host >= 0 &&
 			!m_code.EmitMovRegShiftImm(static_cast<unsigned>(pin_host), host_low,
@@ -16287,8 +19214,12 @@ namespace VitaEE
 			return false;
 		}
 
-		if (!m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg))))
+		const bool deferred = TryDeferGprPinLowStore(guest_reg);
+		if (!deferred &&
+			!m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg))))
+		{
 			return false;
+		}
 
 		InvalidateGprQCacheForGuest(guest_reg);
 		return true;
@@ -16299,8 +19230,8 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return true;
 
-		// Write-through: memory stays authoritative and the pinned host copy is
-		// refreshed with the same value on every path that reaches this store.
+		// Most blocks keep memory authoritative immediately. The vetted scalar
+		// subset defers only pinned low/high words and flushes them at block exit.
 		const int pin_host = FindGprPinHost(guest_reg);
 		if (pin_host >= 0 &&
 			!m_code.EmitMovRegShiftImm(static_cast<unsigned>(pin_host), host_low,
@@ -16317,13 +19248,20 @@ namespace VitaEE
 			return false;
 		}
 
+		const bool defer_low = TryDeferGprPinLowStore(guest_reg);
+		const bool defer_high = TryDeferGprPinHighStore(guest_reg);
 		const size_t offset = GprOffset(guest_reg);
 		bool stored = false;
-		if (offset <= 0xff && CanUseA32DualTransferPair(host_low, host_high))
+		if (!defer_low && !defer_high && offset <= 0xff && CanUseA32DualTransferPair(host_low, host_high))
 			stored = m_code.EmitStrdImm8(host_low, host_high, HOST_CPU_REGS, static_cast<u8>(offset));
 		else
-			stored = m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset)) &&
-					 m_code.EmitStrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+		{
+			stored = true;
+			if (!defer_low)
+				stored = m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset));
+			if (stored && !defer_high)
+				stored = m_code.EmitStrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+		}
 
 		if (!stored)
 			return false;

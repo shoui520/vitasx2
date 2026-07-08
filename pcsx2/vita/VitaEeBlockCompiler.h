@@ -5,11 +5,13 @@
 
 #include "common/Pcsx2Defs.h"
 
+#include <cstddef>
 #include <vector>
 
 namespace VitaA32
 {
 	class CodeBuffer;
+	enum class Condition : u8;
 	enum class ShiftType : u8;
 }
 
@@ -18,7 +20,8 @@ namespace VitaEE
 	struct DirectLinkSlot
 	{
 		u32 target_pc = 0;
-		size_t target_offset = 0;
+		size_t target_offset = static_cast<size_t>(-1);
+		size_t fallback_offset = static_cast<size_t>(-1);
 		bool valid = false;
 	};
 
@@ -155,17 +158,20 @@ namespace VitaEE
 		static bool CanCompileDelaySlotOpcode(u32 op);
 
 		bool BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register,
-			bool use_vu0_base_register);
+			bool use_vu0_base_register, size_t* linked_entry_offset = nullptr);
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
-			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr);
+			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr,
+			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
+			size_t* linked_entry_offset = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
 		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
-			size_t* direct_link_target_offset = nullptr, size_t* taken_link_target_offset = nullptr);
+			DirectLinkSlot* direct_link = nullptr, DirectLinkSlot* taken_link = nullptr,
+			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
-			const void* event_exit, size_t* not_taken_link_target_offset = nullptr,
-			size_t* taken_link_target_offset = nullptr);
+			const void* event_exit, DirectLinkSlot* not_taken_link = nullptr,
+			DirectLinkSlot* taken_link = nullptr);
 		static bool RequiresBlockEndAfterOpcode(u32 op);
 
 	private:
@@ -174,6 +180,10 @@ namespace VitaEE
 		bool EmitEorImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
 		bool EmitBicImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
 		bool EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch);
+		bool EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch, VitaA32::Condition condition);
+		bool EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link);
+		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag);
+		bool EmitEventExitReturn(const void* event_exit);
 		bool EmitSPECIAL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, bool branch_delay_slot);
 		bool EmitCOP0(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
@@ -226,6 +236,7 @@ namespace VitaEE
 		bool EmitCOP2MacroMinMaxBody(u32 op);
 		bool EmitCOP2MacroFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
+		bool EmitCOP2InterlockCall(u32 op, bool wait_for_mbit);
 		bool EmitCOP2VectorTransferFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
 		bool EmitCOP2ControlReadFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
@@ -472,7 +483,10 @@ namespace VitaEE
 		bool EmitJump(u32 pc, bool link);
 		bool EmitRegisterJump(u32 op, u32 pc, bool link);
 		bool EmitGoemonTranslateHostReg(unsigned host_reg);
+		bool EmitCompareGpr64WithKnownForBranch(unsigned guest_reg, u32 low, u32 high);
 		bool EmitCompareGpr64ForBranch(unsigned lhs_guest_reg, unsigned rhs_guest_reg);
+		bool TryEvaluateConstantBranch(u32 op, bool* taken) const;
+		bool TryEvaluateConstantRegimmLinkBranch(u32 op, bool* taken) const;
 		bool EmitBranchEqual(u32 op, bool branch_on_equal);
 		bool EmitBranchSigned(u32 op, SignedBranchCondition condition);
 		bool EmitCop0Branch(u32 op);
@@ -480,6 +494,8 @@ namespace VitaEE
 		bool EmitCop2Branch(u32 op);
 		bool EmitSetLessThan64(unsigned guest_reg, bool signed_compare, unsigned lhs_low,
 			unsigned lhs_high, unsigned rhs_low, unsigned rhs_high);
+		bool EmitSetLessThan64Known(unsigned guest_reg, bool signed_compare,
+			unsigned runtime_guest_reg, u32 known_low, u32 known_high, bool known_is_lhs);
 		bool EmitSetLessThan64Imm(unsigned guest_reg, s32 imm, bool signed_compare,
 			unsigned lhs_low, unsigned lhs_high);
 		bool EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -496,11 +512,39 @@ namespace VitaEE
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
 		bool FlushColdTails();
-		void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
-			bool allow_r10, bool allow_r11);
-		bool EmitGprPinLoads();
+		void ClearGprConstState();
+		void ClearCop1NormalizedState();
+		bool IsCop1FprNormalized(unsigned fpr) const;
+		bool IsCop1AccNormalized() const;
+		bool TryGetKnownGprLow(unsigned guest_reg, u32* value) const;
+		bool TryGetKnownGpr64(unsigned guest_reg, u32* low, u32* high) const;
+		bool EmitStoreKnownSignExtended32(unsigned guest_reg, u32 value);
+		bool EmitStoreKnownZeroExtended32(unsigned guest_reg, u32 value);
+		bool EmitStoreKnown64(unsigned guest_reg, u32 low, u32 high);
+		void UpdateCop1NormalizedStateAfterOpcode(u32 op);
+		bool TryGetKnownEffectiveAddress(u32 op, u32* address) const;
+		enum class KnownVtlbFastPathKind : u8
+		{
+			Scalar,
+			Qword,
+			Cop1,
+			Cop2,
+			Partial,
+		};
+			bool TryEmitKnownVtlbNonHandlerHostAddress(u32 guest_addr, unsigned host_reg,
+				KnownVtlbFastPathKind kind = KnownVtlbFastPathKind::Scalar);
+			void UpdateGprConstStateAfterOpcode(u32 op, u32 pc);
+			void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
+				bool allow_r10, bool allow_r11, bool prefer_dirty_writes);
+			bool BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const;
+			bool EmitGprPinLoads();
+			bool EmitFlushDirtyGprPins();
+			bool EmitSyncGprPinsToBacking();
+			int FindGprPinIndex(unsigned guest_reg) const;
 		int FindGprPinHost(unsigned guest_reg) const;
 		int FindGprPinHighHost(unsigned guest_reg) const;
+		bool TryDeferGprPinLowStore(unsigned guest_reg);
+		bool TryDeferGprPinHighStore(unsigned guest_reg);
 		void ClearGprQCache();
 		void InvalidateGprQCacheForGuest(unsigned guest_reg);
 		void InvalidateGprQCacheForQreg(unsigned qreg);
@@ -509,6 +553,10 @@ namespace VitaEE
 		bool EmitDeviceTracePreInstruction(u32 pc);
 		bool EmitLoadCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
 		bool EmitStoreCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
+		bool EmitAddScaledCyclesToCpuLowWord(u32 cycles, unsigned host_low, unsigned scratch,
+			size_t* carry_branch);
+		bool EmitCycleCarryFixup(const size_t* carry_branches, size_t carry_branch_count,
+			size_t resume_offset, unsigned scratch);
 		bool EmitLoadCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch);
 		bool EmitStoreCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch);
 		bool EmitCop1ExponentMask(unsigned host_reg);
@@ -664,11 +712,12 @@ namespace VitaEE
 		bool m_vtlb_registers_available = false;
 		bool m_cop1_exponent_mask_available = false;
 		bool m_vu0_base_available = false;
-		static constexpr unsigned MAX_GPR_PINS = 5;
-		// Write-through read pins: guest GPR low words held in callee-saved host
-		// registers for the whole block, optionally with a companion high word
-		// for hot low64 scalar state. Memory stays authoritative, so pins only
-		// exist for guest registers whose writes all go through the GPR store seam.
+			static constexpr unsigned MAX_GPR_PINS = 5;
+			// Per-block read pins: guest GPR low words held in callee-saved host
+			// registers for the whole block, optionally with a companion high word
+			// for hot low64 scalar state. Most blocks remain write-through; a narrow
+			// scalar/control plus scalar-memory subset defers pinned stores and flushes
+			// at block exits or before helper/event cold seams.
 		u8 m_staged_pin_guest[MAX_GPR_PINS]{};
 		u8 m_staged_pin_host[MAX_GPR_PINS]{};
 		u8 m_staged_pin_high_host[MAX_GPR_PINS]{};
@@ -677,6 +726,15 @@ namespace VitaEE
 		u8 m_pin_host[MAX_GPR_PINS]{};
 		u8 m_pin_high_host[MAX_GPR_PINS]{};
 		u8 m_pin_count = 0;
+		bool m_dirty_pins_enabled = false;
+		bool m_pin_dirty_low[MAX_GPR_PINS]{};
+		bool m_pin_dirty_high[MAX_GPR_PINS]{};
+		bool m_gpr_const_known[32]{};
+		u32 m_gpr_const_low[32]{};
+		bool m_gpr_const_high_known[32]{};
+		u32 m_gpr_const_high[32]{};
+		bool m_cop1_fpr_normalized[32]{};
+		bool m_cop1_acc_normalized = false;
 		bool m_gpr_q_cache_enabled = false;
 		u8 m_gpr_q_cache_guest[4]{};
 		u8 m_gpr_q_cache_qreg[4]{};

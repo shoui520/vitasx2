@@ -776,7 +776,7 @@ namespace VitaIOP
 			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
-	bool BlockCompiler::EndBlockDirectTail(const void* direct_exit, size_t* direct_link_target_offset)
+	bool BlockCompiler::EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot)
 	{
 		if (!direct_exit)
 			return false;
@@ -789,14 +789,23 @@ namespace VitaIOP
 		}
 
 		const size_t target_offset = m_code.Size();
-		if (!m_code.EmitMovImm32Patchable(HOST_CALL_SCRATCH, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
+		const size_t target_branch = m_code.EmitBranchPlaceholder();
+		if (target_branch == static_cast<size_t>(-1))
+			return false;
+
+		const size_t fallback_offset = m_code.Size();
+		if (!m_code.PatchBranch(target_branch, fallback_offset) ||
+			!m_code.EmitMovImm32(HOST_CALL_SCRATCH, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
 			!m_code.EmitBx(HOST_CALL_SCRATCH))
 		{
 			return false;
 		}
 
-		if (direct_link_target_offset)
-			*direct_link_target_offset = target_offset;
+		if (direct_link_slot)
+		{
+			direct_link_slot->target_offset = target_offset;
+			direct_link_slot->fallback_offset = fallback_offset;
+		}
 		return true;
 	}
 
@@ -3438,13 +3447,12 @@ namespace VitaIOP
 		const auto emit_direct_or_return_tail = [&](u32 target_pc, u8 slot_index) -> bool {
 			if (emit_branch_link_tails)
 			{
-				size_t target_offset = 0;
-				if (!EndBlockDirectTail(direct_exit, &target_offset))
+				DirectLinkSlot& link = direct_links->slots[slot_index];
+				if (!EndBlockDirectTail(direct_exit, &link))
 					return false;
 
-				direct_links->slots[slot_index].target_pc = target_pc;
-				direct_links->slots[slot_index].target_offset = target_offset;
-				direct_links->slots[slot_index].valid = true;
+				link.target_pc = target_pc;
+				link.valid = true;
 				return true;
 			}
 
@@ -3493,13 +3501,12 @@ namespace VitaIOP
 
 			if (direct_exit && direct_links)
 			{
-				size_t target_offset = 0;
-				if (!EndBlockDirectTail(direct_exit, &target_offset))
+				DirectLinkSlot& link = direct_links->slots[0];
+				if (!EndBlockDirectTail(direct_exit, &link))
 					return false;
 
-				direct_links->slots[0].target_pc = static_jump_target_pc;
-				direct_links->slots[0].target_offset = target_offset;
-				direct_links->slots[0].valid = true;
+				link.target_pc = static_jump_target_pc;
+				link.valid = true;
 			}
 			else if (!EndBlockReturn(BlockExitKind::Direct))
 			{
@@ -3526,13 +3533,12 @@ namespace VitaIOP
 		}
 		else if (emit_link_tail)
 		{
-			size_t target_offset = 0;
-			if (!EndBlockDirectTail(direct_exit, &target_offset))
+			DirectLinkSlot& link = direct_links->slots[0];
+			if (!EndBlockDirectTail(direct_exit, &link))
 				return false;
 
-			direct_links->slots[0].target_pc = next_pc;
-			direct_links->slots[0].target_offset = target_offset;
-			direct_links->slots[0].valid = true;
+			link.target_pc = next_pc;
+			link.valid = true;
 
 			direct_exit_offset = m_code.Size();
 			if (!EndBlockReturn(BlockExitKind::Direct, false))
@@ -4292,12 +4298,19 @@ namespace VitaIOP
 
 	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target)
 	{
-		if (!target || !block.valid || !link.valid)
+		if (!target || !block.valid || !link.valid ||
+			link.target_offset == static_cast<size_t>(-1) ||
+			link.fallback_offset == static_cast<size_t>(-1))
+		{
 			return false;
+		}
 
-		return block.code.PatchMovImm32(link.target_offset, HOST_CALL_SCRATCH,
-				   static_cast<u32>(reinterpret_cast<uptr>(target))) &&
-			   block.code.Flush();
+		const bool target_is_direct_exit =
+			target == reinterpret_cast<const void*>(&VitaIopA32DirectExit);
+		const bool patched = target_is_direct_exit ?
+			block.code.PatchBranch(link.target_offset, link.fallback_offset) :
+			block.code.PatchBranchToAddress(link.target_offset, target);
+		return patched && block.code.Flush();
 	}
 
 	void BlockExecutor::PatchIncomingLinks(u32 target_pc, const void* target)

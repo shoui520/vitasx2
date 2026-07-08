@@ -9,6 +9,7 @@
 #include "pcsx2/R5900.h"
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
 
+#include <cstring>
 #include <new>
 
 namespace
@@ -62,6 +63,7 @@ namespace VitaEE
 	{
 		Reset();
 		ReleaseLookupPages();
+		ReleaseGeneratedLookupPages();
 		ReleaseCodeCache();
 	}
 
@@ -96,6 +98,29 @@ namespace VitaEE
 		return m_lookup_pages[page];
 	}
 
+	bool BlockExecutor::EnsureGeneratedLookupDirectory()
+	{
+		if (m_generated_lookup_pages)
+			return true;
+
+		m_generated_lookup_pages = new (std::nothrow) GeneratedLookupPage*[LOOKUP_DIRECTORY_ENTRY_COUNT] {};
+		if (m_generated_lookup_pages && m_direct_linking_enabled)
+			m_active_generated_lookup_pages = m_generated_lookup_pages;
+		return (m_generated_lookup_pages != nullptr);
+	}
+
+	BlockExecutor::GeneratedLookupPage* BlockExecutor::GetGeneratedLookupPage(u32 start_pc, bool allocate)
+	{
+		if (!m_generated_lookup_pages && (!allocate || !EnsureGeneratedLookupDirectory()))
+			return nullptr;
+
+		const u32 page = LookupPageIndex(start_pc);
+		if (!m_generated_lookup_pages[page] && allocate)
+			m_generated_lookup_pages[page] = new (std::nothrow) GeneratedLookupPage();
+
+		return m_generated_lookup_pages[page];
+	}
+
 	void BlockExecutor::RegisterBlockLookup(CachedBlock& block)
 	{
 		if (!block.valid || (block.start_pc & 0x3u) != 0)
@@ -104,8 +129,11 @@ namespace VitaEE
 		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_()/recLUT_SetPage().
 		// Vita keeps the same 64 KiB guest-page lookup granularity, but allocates
 		// pages lazily instead of reserving a BASEBLOCK for every possible EE word.
+		const u32 index = LookupEntryIndex(block.start_pc);
 		if (LookupPage* page = GetLookupPage(block.start_pc, true))
-			page->blocks[LookupEntryIndex(block.start_pc)] = &block;
+			page->blocks[index] = &block;
+		if (GeneratedLookupPage* page = GetGeneratedLookupPage(block.start_pc, true))
+			page->entry_points[index] = LinkedEntryPoint(block);
 	}
 
 	void BlockExecutor::UnregisterBlockLookup(CachedBlock& block)
@@ -113,10 +141,18 @@ namespace VitaEE
 		if ((block.start_pc & 0x3u) != 0)
 			return;
 
+		const u32 index = LookupEntryIndex(block.start_pc);
 		if (LookupPage* page = GetLookupPage(block.start_pc, false))
 		{
-			CachedBlock*& entry = page->blocks[LookupEntryIndex(block.start_pc)];
+			CachedBlock*& entry = page->blocks[index];
 			if (entry == &block)
+				entry = nullptr;
+		}
+
+		if (GeneratedLookupPage* page = GetGeneratedLookupPage(block.start_pc, false))
+		{
+			const void*& entry = page->entry_points[index];
+			if (entry == LinkedEntryPoint(block))
 				entry = nullptr;
 		}
 	}
@@ -131,6 +167,19 @@ namespace VitaEE
 
 		delete[] m_lookup_pages;
 		m_lookup_pages = nullptr;
+	}
+
+	void BlockExecutor::ReleaseGeneratedLookupPages()
+	{
+		if (!m_generated_lookup_pages)
+			return;
+
+		for (u32 i = 0; i < LOOKUP_DIRECTORY_ENTRY_COUNT; i++)
+			delete m_generated_lookup_pages[i];
+
+		delete[] m_generated_lookup_pages;
+		m_generated_lookup_pages = nullptr;
+		m_active_generated_lookup_pages = nullptr;
 	}
 
 	s32 BlockExecutor::LastBlockRecordIndex(u32 pc) const
@@ -213,7 +262,7 @@ namespace VitaEE
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::FindRecordedBlockByStartPc(
-		u32 start_pc, u32 instruction_count, bool match_instruction_count)
+		u32 start_pc, u32 instruction_count, bool match_instruction_count, bool validate_source_words)
 	{
 		s32 index = LastBlockRecordIndex(start_pc);
 		while (index >= 0 && m_block_records[index].start_pc == start_pc)
@@ -222,7 +271,7 @@ namespace VitaEE
 			if (block && block->valid &&
 				(!match_instruction_count || block->instruction_count == instruction_count))
 			{
-				if (ValidateCachedBlock(*block))
+				if (ValidateCachedBlock(*block, validate_source_words))
 					return block;
 
 				break;
@@ -271,6 +320,7 @@ namespace VitaEE
 		UnregisterBlockLookup(block);
 		UnregisterBlockRecord(block);
 		block.valid = false;
+		block.linked_entry_offset = 0;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -381,6 +431,7 @@ namespace VitaEE
 		ClearBlockRecords();
 		ClearIncomingLinks();
 		ReleaseLookupPages();
+		ReleaseGeneratedLookupPages();
 		m_code_cache_resets = 0;
 		ReleaseCodeCache();
 		return invalidated;
@@ -445,9 +496,15 @@ namespace VitaEE
 
 		m_direct_linking_enabled = enabled;
 		if (enabled)
+		{
+			m_active_generated_lookup_pages = m_generated_lookup_pages;
 			RelinkDirectLinks();
+		}
 		else
+		{
+			m_active_generated_lookup_pages = nullptr;
 			UnlinkIncomingLinks(UINT32_MAX);
+		}
 	}
 
 	bool BlockExecutor::ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result)
@@ -547,7 +604,7 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockExecutor::ValidateCachedBlock(CachedBlock& block)
+	bool BlockExecutor::ValidateCachedBlock(CachedBlock& block, bool validate_source_words)
 	{
 		if (!block.valid)
 			return false;
@@ -557,8 +614,36 @@ namespace VitaEE
 		bool matches = (block.ee_cycle_rate == ee_cycle_rate &&
 						block.cp0_config_cycle_shift == cp0_config_cycle_shift);
 
-		for (u32 i = 0; matches && i < block.instruction_count; i++)
-			matches = (block.opcodes[i] == memRead32(block.start_pc + i * 4));
+		if (matches && validate_source_words)
+		{
+			// PCSX2's x86 recompiler validates source words through recRAMCopy
+			// and protected-page invalidation. Vita blocks are page-bounded by
+			// ScanStraightLineBlock(), so a raw vmap pointer compare replaces
+			// the old per-opcode vtlb read loop on normal RAM/ROM/scratchpad
+			// dispatcher hits; handler-backed pages keep the exact memRead32()
+			// fallback.
+			const u32 opcode_bytes = block.instruction_count * static_cast<u32>(sizeof(u32));
+			const u32 page_remaining =
+				vtlb_private::VTLB_PAGE_SIZE - (block.start_pc & vtlb_private::VTLB_PAGE_MASK);
+			bool compared_raw_window = false;
+			if (vtlb_private::vtlbdata.vmap && opcode_bytes <= page_remaining)
+			{
+				const vtlb_private::VTLBVirtual vmv =
+					vtlb_private::vtlbdata.vmap[block.start_pc >> vtlb_private::VTLB_PAGE_BITS];
+				if (!vmv.isHandler(block.start_pc))
+				{
+					matches = (std::memcmp(block.opcodes.data(),
+								   reinterpret_cast<const void*>(vmv.assumePtr(block.start_pc)), opcode_bytes) == 0);
+					compared_raw_window = true;
+				}
+			}
+
+			if (!compared_raw_window)
+			{
+				for (u32 i = 0; matches && i < block.instruction_count; i++)
+					matches = (block.opcodes[i] == memRead32(block.start_pc + i * 4));
+			}
+		}
 
 		if (matches)
 			return true;
@@ -613,15 +698,15 @@ namespace VitaEE
 		return false;
 	}
 
-	BlockExecutor::CachedBlock* BlockExecutor::FindCachedBlockByStartPc(u32 start_pc)
+	BlockExecutor::CachedBlock* BlockExecutor::FindCachedBlockByStartPc(u32 start_pc, bool validate_source_words)
 	{
 		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
 		{
-			if (entry->valid && ValidateCachedBlock(*entry))
+			if (entry->valid && ValidateCachedBlock(*entry, validate_source_words))
 				return entry;
 		}
 
-		return FindRecordedBlockByStartPc(start_pc, 0, false);
+		return FindRecordedBlockByStartPc(start_pc, 0, false, validate_source_words);
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::AllocateCacheEntry()
@@ -744,6 +829,7 @@ namespace VitaEE
 		size_t block_code_capacity = STRAIGHT_LINE_BLOCK_CODE_CAPACITY;
 		size_t block_code_slice_offset = 0;
 		u32 compiled_scaled_cycles = 0;
+		size_t compiled_linked_entry_offset = 0;
 		DirectLinkSlots direct_links;
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
@@ -771,10 +857,12 @@ namespace VitaEE
 
 			BlockCompiler compiler(block.code);
 			u32 attempt_scaled_cycles = 0;
+			size_t attempt_linked_entry_offset = 0;
 			DirectLinkSlots attempt_direct_links;
 			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
 				reinterpret_cast<const void*>(&VitaEeA32DirectExit),
-				reinterpret_cast<const void*>(&VitaEeA32EventExit), &attempt_scaled_cycles, &attempt_direct_links);
+				reinterpret_cast<const void*>(&VitaEeA32EventExit), &attempt_scaled_cycles, &attempt_direct_links,
+				&m_active_generated_lookup_pages, &m_direct_linking_enabled, &attempt_linked_entry_offset);
 			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
 			const size_t failure_code_size = block.code.Size();
 			const size_t failure_code_capacity = block.code.Capacity();
@@ -783,6 +871,7 @@ namespace VitaEE
 				block_code_slice_offset = code_slice_offset;
 				CommitCodeSlice(code_slice_offset, block.code.Size());
 				compiled_scaled_cycles = attempt_scaled_cycles;
+				compiled_linked_entry_offset = attempt_linked_entry_offset;
 				direct_links = attempt_direct_links;
 				break;
 			}
@@ -805,6 +894,7 @@ namespace VitaEE
 		block.scaled_cycles = compiled_scaled_cycles;
 		block.ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		block.linked_entry_offset = compiled_linked_entry_offset;
 		block.direct_links = direct_links;
 		block.valid = true;
 		if (!RegisterBlockRecord(block))
@@ -820,13 +910,13 @@ namespace VitaEE
 
 		if (m_direct_linking_enabled)
 		{
-			PatchIncomingLinks(block.start_pc, block.code.EntryPoint());
+			PatchIncomingLinks(block.start_pc, LinkedEntryPoint(block));
 			for (DirectLinkSlot& link : block.direct_links.slots)
 			{
 				if (link.valid)
 				{
-					if (CachedBlock* target = FindCachedBlockByStartPc(link.target_pc))
-						PatchDirectLink(block, link, target->code.EntryPoint());
+					if (CachedBlock* target = FindCachedBlockByStartPc(link.target_pc, false))
+						PatchDirectLink(block, link, LinkedEntryPoint(*target));
 				}
 			}
 		}
@@ -837,14 +927,29 @@ namespace VitaEE
 		return true;
 	}
 
+	const void* BlockExecutor::LinkedEntryPoint(const CachedBlock& block) const
+	{
+		if (!block.code.EntryPoint() || block.linked_entry_offset >= block.code.Size())
+			return block.code.EntryPoint();
+
+		return static_cast<const u8*>(block.code.EntryPoint()) + block.linked_entry_offset;
+	}
+
 	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target)
 	{
-		if (!target || !block.valid || !link.valid)
+		if (!target || !block.valid || !link.valid ||
+			link.target_offset == static_cast<size_t>(-1) ||
+			link.fallback_offset == static_cast<size_t>(-1))
+		{
 			return false;
+		}
 
-		return block.code.PatchMovImm32(link.target_offset, 12,
-				   static_cast<u32>(reinterpret_cast<uptr>(target))) &&
-			   block.code.Flush();
+		const bool target_is_direct_exit =
+			target == reinterpret_cast<const void*>(&VitaEeA32DirectExit);
+		const bool patched = target_is_direct_exit ?
+			block.code.PatchBranch(link.target_offset, link.fallback_offset) :
+			block.code.PatchBranchToAddress(link.target_offset, target);
+		return patched && block.code.Flush();
 	}
 
 	void BlockExecutor::PatchIncomingLinks(u32 target_pc, const void* target)
@@ -892,8 +997,8 @@ namespace VitaEE
 			if (!link)
 				continue;
 
-			const CachedBlock* target = FindCachedBlockByStartPc(record.target_pc);
-			PatchDirectLink(*record.source, *link, target ? target->code.EntryPoint() :
+			const CachedBlock* target = FindCachedBlockByStartPc(record.target_pc, false);
+			PatchDirectLink(*record.source, *link, target ? LinkedEntryPoint(*target) :
 															reinterpret_cast<const void*>(&VitaEeA32DirectExit));
 		}
 	}
@@ -901,9 +1006,6 @@ namespace VitaEE
 	bool BlockExecutor::RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result)
 	{
 		if (!result || !block.valid)
-			return false;
-
-		if (!ValidateCachedBlock(block))
 			return false;
 
 		RefreshRawGpr0KnownZero();
@@ -965,6 +1067,51 @@ namespace VitaEE
 		result->cache_hit = false;
 		result->lookup_hit = false;
 		return RunCachedBlock(*block, run_event_test_on_event_exit, result);
+	}
+
+	bool BlockExecutor::ExecuteCompiledBlockAtPc(u32 start_pc, bool run_event_test_on_event_exit,
+		BlockExecutionResult* result)
+	{
+		if (!result || (start_pc & 0x3u) != 0)
+			return false;
+
+		*result = {};
+
+		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_() looks up the
+		// translated BaseBlock by guest PC before doing any decode work. Keep
+		// the Vita EE hot dispatcher on the same shape in non-trace execution:
+		// run it immediately, and only scan on misses or SMC invalidation. Once
+		// direct/generated-indirect linking is enabled, generated-to-generated
+		// transitions already trust recClear()/InvalidateRange(); keep the C++
+		// re-entry path on the same policy and avoid an opcode-window memcmp on
+		// every JR/JALR return. Pre-ELF/non-linked runs keep source validation.
+		const bool validate_source_words = !m_direct_linking_enabled;
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		{
+			if (entry->valid && ValidateCachedBlock(*entry, validate_source_words))
+			{
+				result->cache_hit = true;
+				result->lookup_hit = true;
+				result->fast_dispatch_hit = true;
+				return RunCachedBlock(*entry, run_event_test_on_event_exit, result);
+			}
+		}
+
+		if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, 0, false, validate_source_words))
+		{
+			result->cache_hit = true;
+			result->fast_dispatch_hit = true;
+			return RunCachedBlock(*entry, run_event_test_on_event_exit, result);
+		}
+
+		BlockScanResult scan;
+		if (!ScanStraightLineBlock(start_pc, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
+			scan.instruction_count == 0)
+		{
+			return false;
+		}
+
+		return ExecuteCompiledBlock(start_pc, scan.instruction_count, run_event_test_on_event_exit, result);
 	}
 
 	bool BlockExecutor::ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
