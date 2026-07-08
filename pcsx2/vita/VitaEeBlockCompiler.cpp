@@ -6461,6 +6461,23 @@ namespace VitaEE
 		constexpr unsigned VFP_RESULT_S2 = 2;
 		constexpr unsigned VFP_BROADCAST_S3 = 3;
 		constexpr unsigned VFP_ACC_S4 = 4;
+		// NEON-quad input-normalization path. The operand quads live in Q0-Q2
+		// (S0-S11) so the per-lane scalar arithmetic can read normalized lanes
+		// directly; the result uses S12 (Q3), clear of the quads. The vuDouble()
+		// bit-select scratch uses Q8-Q15 (D16-D31, no single-precision alias), so
+		// it never collides with the S0-S11 operands.
+		constexpr unsigned QUAD_ACC = 0;             // Q0 -> S0-S3
+		constexpr unsigned QUAD_FS = 1;              // Q1 -> S4-S7
+		constexpr unsigned QUAD_FT = 2;              // Q2 -> S8-S11
+		constexpr unsigned VFP_QUAD_RESULT_S12 = 12; // Q3 lane 0
+		constexpr unsigned NQ_EXP = 8;
+		constexpr unsigned NQ_SIGN = 9;
+		constexpr unsigned NQ_MAXF = 10;
+		constexpr unsigned NQ_ZERO = 11;
+		constexpr unsigned NQ_EXPV = 12;
+		constexpr unsigned NQ_SIGNV = 13;
+		constexpr unsigned NQ_TMP = 14;
+		constexpr unsigned NQ_MASK = 15;
 		const bool is_outer_product = arithmetic.kind == Cop2MacroArithmeticKind::OpMula ||
 									  arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
 		const bool uses_acc_source = arithmetic.kind == Cop2MacroArithmeticKind::MAdd ||
@@ -6733,12 +6750,156 @@ namespace VitaEE
 			return true;
 		};
 
+		// Preloads the operand quad (Q2 / S8-S11) for the NEON-quad path. Mirrors
+		// emit_prepare_broadcast_operand(): vector forms load all four lanes, the
+		// broadcast/immediate forms replicate a single word across the quad.
+		const auto emit_prepare_operand_quad = [&]() {
+			switch (arithmetic.operand)
+			{
+				case Cop2MacroArithmeticOperand::Vector:
+					return EmitVu0VfAddress(HOST_TMP0, ft) &&
+						   m_code.EmitVld1Q32Aligned(QUAD_FT, HOST_TMP0);
+				case Cop2MacroArithmeticOperand::BroadcastLane:
+					return emit_load_vf_lane(HOST_TMP1, ft, arithmetic.broadcast_lane) &&
+						   m_code.EmitVdupI32QFromCore(QUAD_FT, HOST_TMP1);
+				case Cop2MacroArithmeticOperand::ImmediateI:
+					return EmitVu0ViAddress(HOST_TMP1, VU0_REG_I) &&
+						   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP1, 0) &&
+						   m_code.EmitVdupI32QFromCore(QUAD_FT, HOST_TMP1);
+				case Cop2MacroArithmeticOperand::ImmediateQ:
+					return EmitVu0ViAddress(HOST_TMP1, VU0_REG_Q) &&
+						   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP1, 0) &&
+						   m_code.EmitVdupI32QFromCore(QUAD_FT, HOST_TMP1);
+			}
+			return false;
+		};
+
+		// Materializes the vuDouble() bit-select constants into Q8-Q11. Clobbers
+		// HOST_TMP1, which is free before the lane loop.
+		const auto emit_materialize_norm_consts = [&]() {
+			if (!m_code.EmitMovImm32(HOST_TMP1, FPU_FLOAT_EXPONENT_MASK) ||
+				!m_code.EmitVdupI32QFromCore(NQ_EXP, HOST_TMP1) ||
+				!m_code.EmitMovImm32(HOST_TMP1, FPU_FLOAT_SIGN_MASK) ||
+				!m_code.EmitVdupI32QFromCore(NQ_SIGN, HOST_TMP1) ||
+				!m_code.EmitVeorQ(NQ_ZERO, NQ_ZERO, NQ_ZERO))
+			{
+				return false;
+			}
+			if (!vu0_overflow_clamp)
+				return true;
+			return m_code.EmitMovImm32(HOST_TMP1, FPU_FLOAT_MAX_FINITE) &&
+				   m_code.EmitVdupI32QFromCore(NQ_MAXF, HOST_TMP1);
+		};
+
+		// NEON-quad vuDouble() over all four lanes of vq. Bit-identical to the
+		// scalar emit_normalize_vu_float_word() but branchless and NEON-only:
+		// denormals (exp 0) flush to signed zero; with the overflow clamp,
+		// inf/NaN (exp 0xff) become signed max finite. Requires the constants.
+		const auto emit_normalize_quad = [&](unsigned vq) {
+			if (!m_code.EmitVandQ(NQ_EXPV, vq, NQ_EXP) ||
+				!m_code.EmitVandQ(NQ_SIGNV, vq, NQ_SIGN) ||
+				!m_code.EmitVceqI32Q(NQ_MASK, NQ_EXPV, NQ_ZERO) ||
+				!m_code.EmitVeorQ(NQ_TMP, NQ_SIGNV, vq) ||
+				!m_code.EmitVandQ(NQ_TMP, NQ_TMP, NQ_MASK) ||
+				!m_code.EmitVeorQ(vq, vq, NQ_TMP))
+			{
+				return false;
+			}
+			if (!vu0_overflow_clamp)
+				return true;
+			return m_code.EmitVceqI32Q(NQ_MASK, NQ_EXPV, NQ_EXP) &&
+				   m_code.EmitVorrQ(NQ_TMP, NQ_SIGNV, NQ_MAXF) &&
+				   m_code.EmitVeorQ(NQ_TMP, NQ_TMP, vq) &&
+				   m_code.EmitVandQ(NQ_TMP, NQ_TMP, NQ_MASK) &&
+				   m_code.EmitVeorQ(vq, vq, NQ_TMP);
+		};
+
 		if (!EmitVu0RegisterAddress(HOST_TMP2, VU0_MACFLAG_OFFSET) ||
-			!m_code.EmitLdrImm12(HOST_TMP4, HOST_TMP2, 0) ||
-			!emit_prepare_broadcast_operand())
+			!m_code.EmitLdrImm12(HOST_TMP4, HOST_TMP2, 0))
 		{
 			return false;
 		}
+
+		// The TriAce add hack does a per-lane exponent compare that resists
+		// vectorization, and the outer product has cross-lane fd==fs/ft store
+		// hazards; both keep the scalar loop. Everything else preloads and
+		// NEON-normalizes fs/ft/ACC once, then runs scalar VFP arithmetic per
+		// active lane against the pre-normalized quad lanes.
+		const bool use_quad = !use_addi_triace_hack && !is_outer_product;
+		if (use_quad)
+		{
+			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+				!m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0) ||
+				!emit_prepare_operand_quad() ||
+				(uses_acc_source &&
+					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
+						!m_code.EmitVld1Q32Aligned(QUAD_ACC, HOST_TMP0))) ||
+				!emit_materialize_norm_consts() ||
+				!emit_normalize_quad(QUAD_FS) ||
+				!emit_normalize_quad(QUAD_FT) ||
+				(uses_acc_source && !emit_normalize_quad(QUAD_ACC)))
+			{
+				return false;
+			}
+
+			for (unsigned lane = 0; lane < 4; lane++)
+			{
+				const unsigned lane_mask = 1u << (3 - lane);
+				if ((mask & lane_mask) == 0)
+				{
+					if (!emit_clear_mac_lane(lane))
+						return false;
+					continue;
+				}
+
+				const unsigned fs_s = QUAD_FS * 4 + lane;
+				const unsigned ft_s = QUAD_FT * 4 + lane;
+				const unsigned acc_s = QUAD_ACC * 4 + lane;
+				switch (arithmetic.kind)
+				{
+					case Cop2MacroArithmeticKind::Add:
+						if (!m_code.EmitVaddF32(VFP_QUAD_RESULT_S12, fs_s, ft_s))
+							return false;
+						break;
+					case Cop2MacroArithmeticKind::Sub:
+						if (!m_code.EmitVsubF32(VFP_QUAD_RESULT_S12, fs_s, ft_s))
+							return false;
+						break;
+					case Cop2MacroArithmeticKind::Mul:
+					case Cop2MacroArithmeticKind::OpMula:
+						if (!m_code.EmitVmulF32(VFP_QUAD_RESULT_S12, fs_s, ft_s))
+							return false;
+						break;
+					case Cop2MacroArithmeticKind::MAdd:
+						if (!m_code.EmitVmulF32(VFP_QUAD_RESULT_S12, fs_s, ft_s) ||
+							!m_code.EmitVaddF32(VFP_QUAD_RESULT_S12, acc_s, VFP_QUAD_RESULT_S12))
+						{
+							return false;
+						}
+						break;
+					case Cop2MacroArithmeticKind::MSub:
+					case Cop2MacroArithmeticKind::OpMSub:
+						if (!m_code.EmitVmulF32(VFP_QUAD_RESULT_S12, fs_s, ft_s) ||
+							!m_code.EmitVsubF32(VFP_QUAD_RESULT_S12, acc_s, VFP_QUAD_RESULT_S12))
+						{
+							return false;
+						}
+						break;
+				}
+
+				if (!m_code.EmitVmovSToCore(HOST_TMP0, VFP_QUAD_RESULT_S12) ||
+					!emit_update_mac_lane(lane) ||
+					!emit_store_result(lane))
+				{
+					return false;
+				}
+			}
+
+			return emit_sync_msflags();
+		}
+
+		if (!emit_prepare_broadcast_operand())
+			return false;
 
 		for (unsigned lane = 0; lane < 4; lane++)
 		{
