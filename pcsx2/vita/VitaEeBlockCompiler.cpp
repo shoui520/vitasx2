@@ -89,6 +89,8 @@ u32 g_qemuCop2Vf0ConstantTransferFastPaths = 0;
 u32 g_qemuCop2RawGpr0Qmtc2ZeroFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheFastPaths = 0;
 u32 g_qemuCop2ControlKnownSourceFastPaths = 0;
+u32 g_qemuCop0KnownSourceFastPaths = 0;
+u32 g_qemuCop1KnownSourceFastPaths = 0;
 u32 g_qemuVu0BaseRegisterBlocks = 0;
 u32 g_qemuVu0ClipflagBaseAddressFastPaths = 0;
 u32 g_qemuGprPartialStoreValueFastPaths = 0;
@@ -5652,6 +5654,16 @@ namespace VitaEE
 			const unsigned rt = RT(op);
 			const unsigned rd = RD(op);
 			const auto load_rt_low = [this, rt](unsigned host_reg) {
+				u32 value = 0;
+				const bool value_known = TryGetKnownGprLow(rt, &value);
+				if (rt != 0 && FindGprPinHost(rt) < 0 && value_known)
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuCop0KnownSourceFastPaths++;
+#endif
+					return m_code.EmitMovImm32(host_reg, value);
+				}
+
 				return EmitLoadGprLow(rt, host_reg);
 			};
 
@@ -8371,6 +8383,19 @@ namespace VitaEE
 		// path, so CFC1 keeps that helper's raw fs=31 and fs=0 behavior here.
 		const unsigned rt = RT(op);
 		const unsigned fs = RD(op);
+		const auto load_rt_low = [this, rt](unsigned host_reg) {
+			u32 value = 0;
+			const bool value_known = TryGetKnownGprLow(rt, &value);
+			if (rt != 0 && FindGprPinHost(rt) < 0 && value_known)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuCop1KnownSourceFastPaths++;
+#endif
+				return m_code.EmitMovImm32(host_reg, value);
+			}
+
+			return EmitLoadGprLow(rt, host_reg);
+		};
 
 		switch ((op >> 21) & 0x1f)
 		{
@@ -8401,12 +8426,12 @@ namespace VitaEE
 				return m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
 					   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 			case 0x04: // MTC1
-				return EmitLoadGprLow(rt, HOST_TMP0) &&
+				return load_rt_low(HOST_TMP0) &&
 					   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs)));
 			case 0x06: // CTC1
 				if (fs != 31)
 					return true;
-				return EmitLoadGprLow(rt, HOST_TMP0) &&
+				return load_rt_low(HOST_TMP0) &&
 					   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31)));
 			default:
 				return false;
