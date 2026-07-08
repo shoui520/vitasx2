@@ -7540,6 +7540,14 @@ namespace VitaEE
 		return decrement || emit_post_increment();
 	}
 
+	// Per-lane bit weights for packing the six VCLIP comparison lanes into the
+	// clip flag with one horizontal reduce instead of six vmov lane extractions.
+	// Fs.xyz > +|Ft.w| -> bits 0/2/4, Fs.xyz < -|Ft.w| -> bits 1/3/5; lane 3 is
+	// unused. The weights are disjoint, so an OR-reduce across the lanes yields
+	// the packed value. 16-byte aligned for the aligned vld1.
+	alignas(16) static const u32 kClipPosWeights[4] = {1u << 0, 1u << 2, 1u << 4, 0u};
+	alignas(16) static const u32 kClipNegWeights[4] = {1u << 1, 1u << 3, 1u << 5, 0u};
+
 	bool BlockCompiler::EmitCOP2MacroClipBody(u32 op)
 	{
 		// PCSX2 owners: VUops.cpp::_vuCLIP() and VCLIPw(). The macro shifts
@@ -7589,27 +7597,29 @@ namespace VitaEE
 			!m_code.EmitVdupI32QFromCore(NEON_SIGN, HOST_TMP3) ||
 			!m_code.EmitVeorQ(NEON_FS_NEG, NEON_FS_POS, NEON_SIGN) ||
 			!m_code.EmitVcgtS32Q(NEON_FS_POS, NEON_FS_POS, NEON_LIMIT) ||
-			!m_code.EmitVcgtS32Q(NEON_FS_NEG, NEON_FS_NEG, NEON_LIMIT) ||
-			!m_code.EmitMovImm8(HOST_TMP4, 0))
+			!m_code.EmitVcgtS32Q(NEON_FS_NEG, NEON_FS_NEG, NEON_LIMIT))
 		{
 			return false;
 		}
 
-		const auto emit_extract_flag = [&](unsigned qreg, unsigned lane, unsigned shift) {
-			return m_code.EmitVmovSToCore(HOST_TMP1, qreg * 4 + lane) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSR, 31) &&
-				   (shift == 0 ?
-						   m_code.EmitOrrReg(HOST_TMP4, HOST_TMP4, HOST_TMP1) :
-						   m_code.EmitOrrRegShiftImm(HOST_TMP4, HOST_TMP4, HOST_TMP1,
-							   VitaA32::ShiftType::LSL, static_cast<u8>(shift)));
-		};
-
-		if (!emit_extract_flag(NEON_FS_POS, 0, 0) ||
-			!emit_extract_flag(NEON_FS_NEG, 0, 1) ||
-			!emit_extract_flag(NEON_FS_POS, 1, 2) ||
-			!emit_extract_flag(NEON_FS_NEG, 1, 3) ||
-			!emit_extract_flag(NEON_FS_POS, 2, 4) ||
-			!emit_extract_flag(NEON_FS_NEG, 2, 5))
+		// Pack the six comparison lanes with one horizontal OR-reduce instead of
+		// six vmov lane extractions + shifts. Each vcgt lane is 0 or all-ones;
+		// ANDing with the disjoint per-lane weights leaves each lane holding its
+		// clip bit (or 0), and OR-reducing the four lanes packs bits 0-5 into one
+		// word. NEON_LIMIT/NEON_SIGN are dead after the compares, so reuse them.
+		constexpr unsigned NEON_PACK_TMP = 4;
+		if (!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(reinterpret_cast<uptr>(kClipPosWeights))) ||
+			!m_code.EmitVld1Q32Aligned(NEON_LIMIT, HOST_TMP0) ||
+			!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(reinterpret_cast<uptr>(kClipNegWeights))) ||
+			!m_code.EmitVld1Q32Aligned(NEON_SIGN, HOST_TMP0) ||
+			!m_code.EmitVandQ(NEON_FS_POS, NEON_FS_POS, NEON_LIMIT) ||
+			!m_code.EmitVandQ(NEON_FS_NEG, NEON_FS_NEG, NEON_SIGN) ||
+			!m_code.EmitVorrQ(NEON_FS_POS, NEON_FS_POS, NEON_FS_NEG) ||
+			!m_code.EmitVextI8Q(NEON_PACK_TMP, NEON_FS_POS, NEON_FS_POS, 8) ||
+			!m_code.EmitVorrQ(NEON_FS_POS, NEON_FS_POS, NEON_PACK_TMP) ||
+			!m_code.EmitVextI8Q(NEON_PACK_TMP, NEON_FS_POS, NEON_FS_POS, 4) ||
+			!m_code.EmitVorrQ(NEON_FS_POS, NEON_FS_POS, NEON_PACK_TMP) ||
+			!m_code.EmitVmovSToCore(HOST_TMP4, NEON_FS_POS * 4))
 		{
 			return false;
 		}
