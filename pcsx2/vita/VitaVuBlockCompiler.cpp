@@ -4521,6 +4521,21 @@ namespace VitaVU
 					m_code.EmitVdupI32QFromCore(VU_NORM_MAXF_Q, 3);
 			}
 
+			// Materializes the constants once per block. Q8-Q11 are then reused by
+			// every later FMAC/EFU normalize in the same straight-line block (see
+			// m_norm_consts_ready). Blocks are entered only at their start_pc and
+			// each is compiled by a fresh BlockCompiler, so the first normalize in
+			// every block always materializes.
+			bool EmitEnsureVuFloatNormalizeConstants(bool overflow_clamp)
+			{
+				if (m_norm_consts_ready)
+					return true;
+				if (!EmitMaterializeVuFloatNormalizeConstants(overflow_clamp))
+					return false;
+				m_norm_consts_ready = true;
+				return true;
+			}
+
 			// NEON quad form of EmitNormalizeVuFloatWord() over all four lanes at
 			// once. Requires EmitMaterializeVuFloatNormalizeConstants() first.
 			// PCSX2 owner: VUops.cpp::vuDouble() / VUmicroFast.h::VuDouble().
@@ -4560,7 +4575,7 @@ namespace VitaVU
 				return true;
 #else
 				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
-				return EmitMaterializeVuFloatNormalizeConstants(overflow_clamp) &&
+				return EmitEnsureVuFloatNormalizeConstants(overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_a, overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_b, overflow_clamp);
 #endif
@@ -4574,7 +4589,7 @@ namespace VitaVU
 				return true;
 #else
 				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
-				return EmitMaterializeVuFloatNormalizeConstants(overflow_clamp) &&
+				return EmitEnsureVuFloatNormalizeConstants(overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq, overflow_clamp);
 #endif
 			}
@@ -4589,7 +4604,7 @@ namespace VitaVU
 				return true;
 #else
 				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
-				return EmitMaterializeVuFloatNormalizeConstants(overflow_clamp) &&
+				return EmitEnsureVuFloatNormalizeConstants(overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_a, overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_b, overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_c, overflow_clamp);
@@ -7008,6 +7023,13 @@ namespace VitaVU
 			u32 m_mem_mask = VU1_MEMMASK;
 			bool m_vu0_memory_map = false;
 			bool m_countdown_budget = false;
+			// True once the vuDouble() bit-select constant quads (Q8-Q11) have been
+			// materialized in this block. Q8-Q15 are exclusive to the normalize
+			// scratch (all other VU NEON ops use Q0-Q7), so once loaded the
+			// constants survive across pairs and later FMAC/EFU ops in the same
+			// straight-line block skip re-materializing them. Fresh per block via
+			// the per-block BlockCompiler construction.
+			bool m_norm_consts_ready = false;
 			std::vector<BudgetExit> m_budget_exits;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> m_direct_links{};
 		};
