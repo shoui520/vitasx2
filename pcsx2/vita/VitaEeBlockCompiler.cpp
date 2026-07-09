@@ -3098,6 +3098,29 @@ namespace VitaEE
 			case 0x37: // LD
 				add_write(rt);
 				return true;
+			case 0x10: // COP0, owned by COP0.cpp and x86/iCOP0.cpp.
+				switch ((op >> 21) & 0x1f)
+				{
+					case 0x00: // MFC0 fast forms write rt through the extended-store
+						// seam; helper fallbacks sync pins and end the block.
+						if (!IsFastMFC0(op))
+							return CanCompileCOP0(op);
+						add_write(rt);
+						return true;
+					case 0x04: // MTC0 fast forms read rt pin-aware and write CP0/perf
+						// state only; helper fallbacks sync pins and end the block.
+						if (!IsFastMTC0(op))
+							return CanCompileCOP0(op);
+						return true;
+					case 0x08: // COP0_BC0 branch forms read only CPCOND0.
+						return CanCompileCOP0(op);
+					case 0x10: // COP0_C0: in-block TLBR/TLBP/DI write CP0 only; EI and
+						// ERET flush dirty pins before their event exits, and the
+						// remaining helper tails sync pins and end the block.
+						return CanCompileCOP0(op);
+					default:
+						return false;
+				}
 			case 0x11: // COP1, owned by FPU.cpp and x86/iFPU.cpp.
 				if (((op >> 21) & 0x1f) == 0x08)
 					return CanCompileCOP1(op); // BC1 reads only FCR31.C.
@@ -6531,6 +6554,10 @@ namespace VitaEE
 			if (!event_exit || raw_cycles_through_instruction == 0)
 				return false;
 
+			// This event tail bypasses the normal block-exit flush.
+			if (!EmitFlushDirtyGprPins())
+				return false;
+
 			const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 			if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
@@ -6725,6 +6752,10 @@ namespace VitaEE
 			constexpr u32 STATUS_ERL_MASK = 0x00000004u;
 
 			if (!event_exit || raw_cycles_through_instruction == 0)
+				return false;
+
+			// This event tail bypasses the normal block-exit flush.
+			if (!EmitFlushDirtyGprPins())
 				return false;
 
 			const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
