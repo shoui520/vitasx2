@@ -75,6 +75,7 @@ u32 g_qemuGprPinnedDwordRegisters = 0;
 u32 g_qemuGprPinnedVtlbFreeHostRegisters = 0;
 u32 g_qemuGprPinnedHighWordHits = 0;
 u32 g_qemuGprPinSelfStoresElided = 0;
+u32 g_qemuGprPinHighReadOperands = 0;
 u32 g_qemuGprDirtyPinBlocks = 0;
 u32 g_qemuGprDirtyPinLowStoresElided = 0;
 u32 g_qemuGprDirtyPinHighStoresElided = 0;
@@ -10242,8 +10243,9 @@ namespace VitaEE
 		}
 
 		unsigned rs_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitSetLessThan64Imm(rt, imm, true, rs_low, HOST_TMP1);
+		unsigned rs_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitSetLessThan64Imm(rt, imm, true, rs_low, rs_high);
 	}
 
 	bool BlockCompiler::EmitSLTIU(u32 op)
@@ -10279,8 +10281,9 @@ namespace VitaEE
 		}
 
 		unsigned rs_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitSetLessThan64Imm(rt, imm, false, rs_low, HOST_TMP1);
+		unsigned rs_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitSetLessThan64Imm(rt, imm, false, rs_low, rs_high);
 	}
 
 	bool BlockCompiler::EmitANDI(u32 op)
@@ -16954,8 +16957,9 @@ namespace VitaEE
 		}
 		if (rt == 0)
 		{
-			return EmitLoadGprHigh(rs, HOST_TMP0) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, 31) &&
+			unsigned rs_high;
+			return EmitGprWordOperand(rs, 1, HOST_TMP0, &rs_high) &&
+				   m_code.EmitMovRegShiftImm(HOST_TMP0, rs_high, VitaA32::ShiftType::LSR, 31) &&
 				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
 				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 		}
@@ -16974,9 +16978,11 @@ namespace VitaEE
 
 		unsigned rs_low;
 		unsigned rt_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
-			   EmitSetLessThan64(rd, true, rs_low, HOST_TMP1, rt_low, HOST_TMP3);
+		unsigned rs_high;
+		unsigned rt_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
+			   EmitSetLessThan64(rd, true, rs_low, rs_high, rt_low, rt_high);
 	}
 
 	bool BlockCompiler::EmitSLTU(u32 op)
@@ -17023,9 +17029,11 @@ namespace VitaEE
 
 		unsigned rs_low;
 		unsigned rt_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
-			   EmitSetLessThan64(rd, false, rs_low, HOST_TMP1, rt_low, HOST_TMP3);
+		unsigned rs_high;
+		unsigned rt_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
+			   EmitSetLessThan64(rd, false, rs_low, rs_high, rt_low, rt_high);
 	}
 
 	bool BlockCompiler::EmitShift32Immediate(u32 op, VitaA32::ShiftType shift)
@@ -17585,8 +17593,9 @@ namespace VitaEE
 	bool BlockCompiler::EmitCompareGpr64WithKnownForBranch(unsigned guest_reg, u32 low, u32 high)
 	{
 		unsigned guest_low;
-		return EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low) &&
-			   EmitCmpImm32OrReg(HOST_TMP1, high, HOST_TMP2) &&
+		unsigned guest_high;
+		return EmitGpr64ReadOperands(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low, &guest_high) &&
+			   EmitCmpImm32OrReg(guest_high, high, HOST_TMP2) &&
 			   EmitCmpImm32OrReg(guest_low, low, HOST_TMP2, VitaA32::Condition::EQ);
 	}
 
@@ -17602,8 +17611,9 @@ namespace VitaEE
 		{
 			const unsigned nonzero_guest_reg = (lhs_guest_reg == 0) ? rhs_guest_reg : lhs_guest_reg;
 			unsigned low_host;
-			return EmitGpr64OperandLow(nonzero_guest_reg, HOST_TMP0, HOST_TMP1, &low_host) &&
-				   m_code.EmitOrrReg(HOST_TMP0, low_host, HOST_TMP1, true);
+			unsigned high_host;
+			return EmitGpr64ReadOperands(nonzero_guest_reg, HOST_TMP0, HOST_TMP1, &low_host, &high_host) &&
+				   m_code.EmitOrrReg(HOST_TMP0, low_host, high_host, true);
 		}
 
 		u32 lhs_low_value = 0;
@@ -17626,10 +17636,12 @@ namespace VitaEE
 
 		unsigned lhs_low;
 		unsigned rhs_low;
-		return EmitGpr64OperandLow(lhs_guest_reg, HOST_TMP0, HOST_TMP1, &lhs_low) &&
-			   EmitGpr64OperandLow(rhs_guest_reg, HOST_TMP2, HOST_TMP3, &rhs_low) &&
+		unsigned lhs_high;
+		unsigned rhs_high;
+		return EmitGpr64ReadOperands(lhs_guest_reg, HOST_TMP0, HOST_TMP1, &lhs_low, &lhs_high) &&
+			   EmitGpr64ReadOperands(rhs_guest_reg, HOST_TMP2, HOST_TMP3, &rhs_low, &rhs_high) &&
 			   m_code.EmitCmpReg(lhs_low, rhs_low) &&
-			   m_code.EmitCmpReg(HOST_TMP1, HOST_TMP3, VitaA32::Condition::EQ);
+			   m_code.EmitCmpReg(lhs_high, rhs_high, VitaA32::Condition::EQ);
 	}
 
 	bool BlockCompiler::TryEvaluateConstantBranch(u32 op, bool* taken) const
@@ -17855,17 +17867,19 @@ namespace VitaEE
 		if (condition == SignedBranchCondition::LessThanZero ||
 			condition == SignedBranchCondition::GreaterEqualZero)
 		{
-			return EmitLoadGprHigh(rs, HOST_TMP1) &&
-				   m_code.EmitCmpImm32(HOST_TMP1, 0) &&
+			unsigned rs_high;
+			return EmitGprWordOperand(rs, 1, HOST_TMP1, &rs_high) &&
+				   m_code.EmitCmpImm32(rs_high, 0) &&
 				   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 				   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
 					   condition == SignedBranchCondition::LessThanZero ? VitaA32::Condition::LT : VitaA32::Condition::GE);
 		}
 
 		unsigned rs_low;
-		if (!EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) ||
+		unsigned rs_high;
+		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) ||
 			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) ||
-			!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
+			!m_code.EmitCmpImm32(rs_high, 0) ||
 			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::LT) ||
 			!m_code.EmitCmpImm32(rs_low, 0, VitaA32::Condition::EQ) ||
 			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::EQ))
@@ -17985,9 +17999,10 @@ namespace VitaEE
 			return true;
 
 		unsigned runtime_low = HOST_TMP0;
-		if (!EmitGpr64OperandLow(runtime_guest_reg, HOST_TMP0, HOST_TMP1, &runtime_low) ||
+		unsigned runtime_high = HOST_TMP1;
+		if (!EmitGpr64ReadOperands(runtime_guest_reg, HOST_TMP0, HOST_TMP1, &runtime_low, &runtime_high) ||
 			!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-			!EmitCmpImm32OrReg(HOST_TMP1, known_high, HOST_TMP2))
+			!EmitCmpImm32OrReg(runtime_high, known_high, HOST_TMP2))
 		{
 			return false;
 		}
@@ -20147,6 +20162,32 @@ namespace VitaEE
 
 		*low_operand_host = fallback_low;
 		return EmitLoadGpr64(guest_reg, fallback_low, host_high);
+	}
+
+	bool BlockCompiler::EmitGpr64ReadOperands(unsigned guest_reg, unsigned fallback_low,
+		unsigned fallback_high, unsigned* low_operand_host, unsigned* high_operand_host)
+	{
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0)
+		{
+			*low_operand_host = static_cast<unsigned>(pin_host);
+			const int high_pin_host = FindGprPinHighHost(guest_reg);
+			if (high_pin_host >= 0)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuGprPinHighReadOperands++;
+#endif
+				*high_operand_host = static_cast<unsigned>(high_pin_host);
+				return true;
+			}
+
+			*high_operand_host = fallback_high;
+			return EmitLoadGprHigh(guest_reg, fallback_high);
+		}
+
+		*low_operand_host = fallback_low;
+		*high_operand_host = fallback_high;
+		return EmitLoadGpr64(guest_reg, fallback_low, fallback_high);
 	}
 
 	bool BlockCompiler::EmitLoadGpr64KnownValue(unsigned guest_reg, unsigned host_low, unsigned host_high,
