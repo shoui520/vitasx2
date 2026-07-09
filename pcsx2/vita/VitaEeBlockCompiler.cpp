@@ -10189,26 +10189,27 @@ namespace VitaEE
 		}
 
 		unsigned rs_low;
-		if (!EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low))
+		unsigned rs_high;
+		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high))
 			return false;
 
 		// PCSX2 owner: R5900OpcodeImpl.cpp::DADDIU() sign-extends the 16-bit
 		// immediate and performs the 64-bit add without overflow trapping.
 		if (imm == 0)
-			return EmitStoreGpr64(rt, rs_low, HOST_TMP1);
+			return EmitStoreGpr64(rt, rs_low, rs_high);
 
 		if (imm > 0 && m_code.EmitAddImm32(HOST_TMP0, rs_low, static_cast<u32>(imm), true))
-			return m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
+			return m_code.EmitAdcImm8(HOST_TMP1, rs_high, 0) &&
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 
 		if (imm < 0 && m_code.EmitSubImm32(HOST_TMP0, rs_low, static_cast<u32>(-imm), true))
-			return m_code.EmitSbcImm8(HOST_TMP1, HOST_TMP1, 0) &&
+			return m_code.EmitSbcImm8(HOST_TMP1, rs_high, 0) &&
 				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 
 		return m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) &&
 			   m_code.EmitAddReg(HOST_TMP0, rs_low, HOST_TMP2, true) &&
 			   m_code.EmitMovImm32(HOST_TMP2, (imm < 0) ? 0xffffffffu : 0) &&
-			   m_code.EmitAdcReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
+			   m_code.EmitAdcReg(HOST_TMP1, rs_high, HOST_TMP2) &&
 			   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
 	}
 
@@ -10360,7 +10361,8 @@ namespace VitaEE
 		}
 
 		unsigned rs_low;
-		if (!EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low))
+		unsigned rs_high;
+		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high))
 			return false;
 
 		if (!m_code.EmitOrrImm32(HOST_TMP0, rs_low, imm))
@@ -10372,7 +10374,7 @@ namespace VitaEE
 			}
 		}
 
-		return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		return EmitStoreGpr64(rt, HOST_TMP0, rs_high);
 	}
 
 	bool BlockCompiler::EmitXORI(u32 op)
@@ -10407,7 +10409,8 @@ namespace VitaEE
 		}
 
 		unsigned rs_low;
-		if (!EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low))
+		unsigned rs_high;
+		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high))
 			return false;
 
 		if (!m_code.EmitEorImm32(HOST_TMP0, rs_low, imm))
@@ -10419,7 +10422,7 @@ namespace VitaEE
 			}
 		}
 
-		return EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		return EmitStoreGpr64(rt, HOST_TMP0, rs_high);
 	}
 
 	bool BlockCompiler::EmitLUI(u32 op)
@@ -10996,7 +10999,8 @@ namespace VitaEE
 			return true;
 
 		unsigned rs_low;
-		if (!EmitGpr64OperandLow(RS(op), HOST_TMP0, HOST_TMP1, &rs_low))
+		unsigned rs_high;
+		if (!EmitGpr64ReadOperands(RS(op), HOST_TMP0, HOST_TMP1, &rs_low, &rs_high))
 			return false;
 
 		const auto emit_lane = [this, rd](unsigned word, unsigned source_reg, unsigned result_reg) {
@@ -11008,7 +11012,7 @@ namespace VitaEE
 		};
 
 		return emit_lane(0, rs_low, HOST_TMP0) &&
-			   emit_lane(1, HOST_TMP1, HOST_TMP1);
+			   emit_lane(1, rs_high, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitPMFHL(u32 op)
@@ -11203,8 +11207,9 @@ namespace VitaEE
 	bool BlockCompiler::EmitMoveToHiLo(u32 op, size_t hilo_offset)
 	{
 		unsigned rs_low;
-		return EmitGpr64OperandLow(RS(op), HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitStoreCpuRegsU64(hilo_offset, rs_low, HOST_TMP1, HOST_TMP2);
+		unsigned rs_high;
+		return EmitGpr64ReadOperands(RS(op), HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitStoreCpuRegsU64(hilo_offset, rs_low, rs_high, HOST_TMP2);
 	}
 
 	bool BlockCompiler::EmitMoveFullFromHiLo(u32 op, size_t hilo_offset)
@@ -16350,8 +16355,9 @@ namespace VitaEE
 				return true;
 
 			unsigned guest_low;
-			return EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low) &&
-				   EmitStoreGpr64(rd, guest_low, HOST_TMP1);
+			unsigned guest_high;
+			return EmitGpr64ReadOperands(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low, &guest_high) &&
+				   EmitStoreGpr64(rd, guest_low, guest_high);
 		};
 
 		const auto emit_add_constant = [&](unsigned guest_reg, u32 constant_low, u32 constant_high) {
@@ -16359,7 +16365,8 @@ namespace VitaEE
 				return emit_store_dynamic(guest_reg);
 
 			unsigned guest_low;
-			if (!EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low))
+			unsigned guest_high;
+			if (!EmitGpr64ReadOperands(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low, &guest_high))
 				return false;
 
 			if (!(m_code.EmitAddImm32(HOST_TMP0, guest_low, constant_low, true) ||
@@ -16370,9 +16377,9 @@ namespace VitaEE
 			}
 
 			const bool high_done = (constant_high <= 0xffu) ?
-				m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, static_cast<u8>(constant_high)) :
+				m_code.EmitAdcImm8(HOST_TMP1, guest_high, static_cast<u8>(constant_high)) :
 				(m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
-				 m_code.EmitAdcReg(HOST_TMP1, HOST_TMP1, HOST_TMP2));
+				 m_code.EmitAdcReg(HOST_TMP1, guest_high, HOST_TMP2));
 			return high_done && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 		};
 
@@ -16426,10 +16433,12 @@ namespace VitaEE
 
 		unsigned rs_low;
 		unsigned rt_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
+		unsigned rs_high;
+		unsigned rt_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
 			   m_code.EmitAddReg(HOST_TMP0, rs_low, rt_low, true) &&
-			   m_code.EmitAdcReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   m_code.EmitAdcReg(HOST_TMP1, rs_high, rt_high) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
@@ -16450,8 +16459,9 @@ namespace VitaEE
 				return true;
 
 			unsigned guest_low;
-			return EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low) &&
-				   EmitStoreGpr64(rd, guest_low, HOST_TMP1);
+			unsigned guest_high;
+			return EmitGpr64ReadOperands(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low, &guest_high) &&
+				   EmitStoreGpr64(rd, guest_low, guest_high);
 		};
 
 		const auto emit_subtract_constant = [&](unsigned guest_reg, u32 constant_low, u32 constant_high) {
@@ -16459,7 +16469,8 @@ namespace VitaEE
 				return emit_store_dynamic(guest_reg);
 
 			unsigned guest_low;
-			if (!EmitGpr64OperandLow(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low))
+			unsigned guest_high;
+			if (!EmitGpr64ReadOperands(guest_reg, HOST_TMP0, HOST_TMP1, &guest_low, &guest_high))
 				return false;
 
 			if (!(m_code.EmitSubImm32(HOST_TMP0, guest_low, constant_low, true) ||
@@ -16470,22 +16481,23 @@ namespace VitaEE
 			}
 
 			const bool high_done = (constant_high <= 0xffu) ?
-				m_code.EmitSbcImm8(HOST_TMP1, HOST_TMP1, static_cast<u8>(constant_high)) :
+				m_code.EmitSbcImm8(HOST_TMP1, guest_high, static_cast<u8>(constant_high)) :
 				(m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
-				 m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, HOST_TMP2));
+				 m_code.EmitSbcReg(HOST_TMP1, guest_high, HOST_TMP2));
 			return high_done && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 		};
 
 		const auto emit_constant_minus_dynamic = [&](unsigned guest_reg, u32 constant_low, u32 constant_high) {
 			unsigned guest_low;
-			if (!EmitGpr64OperandLow(guest_reg, HOST_TMP2, HOST_TMP3, &guest_low))
+			unsigned guest_high;
+			if (!EmitGpr64ReadOperands(guest_reg, HOST_TMP2, HOST_TMP3, &guest_low, &guest_high))
 				return false;
 
 			if (!(m_code.EmitRsbImm32(HOST_TMP0, guest_low, constant_low, true) ||
 				  (m_code.EmitMovImm32(HOST_TMP0, constant_low) &&
 				   m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, guest_low, true))) ||
 				!m_code.EmitMovImm32(HOST_TMP1, constant_high) ||
-				!m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, HOST_TMP3))
+				!m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, guest_high))
 			{
 				return false;
 			}
@@ -16515,10 +16527,11 @@ namespace VitaEE
 			}
 
 			unsigned rt_low;
-			return EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
+			unsigned rt_high;
+			return EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
 				   m_code.EmitRsbImm32(HOST_TMP0, rt_low, 0, true) &&
 				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-				   m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+				   m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, rt_high) &&
 				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 		}
 
@@ -16554,10 +16567,12 @@ namespace VitaEE
 
 		unsigned rs_low;
 		unsigned rt_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
+		unsigned rs_high;
+		unsigned rt_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
 			   m_code.EmitSubReg(HOST_TMP0, rs_low, rt_low, true) &&
-			   m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   m_code.EmitSbcReg(HOST_TMP1, rs_high, rt_high) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
@@ -16580,8 +16595,9 @@ namespace VitaEE
 				return true;
 
 			unsigned rs_low;
-			return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-				   EmitStoreGpr64(rd, rs_low, HOST_TMP1);
+			unsigned rs_high;
+			return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+				   EmitStoreGpr64(rd, rs_low, rs_high);
 		}
 
 		u32 rs_low_value = 0;
@@ -16604,8 +16620,9 @@ namespace VitaEE
 				return true;
 
 			unsigned src_low;
-			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
-				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+			unsigned src_high;
+			return EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high) &&
+				   EmitStoreGpr64(rd, src_low, src_high);
 		};
 		const auto emit_and_constant = [&](unsigned src, u32 constant_low, u32 constant_high) {
 			if (constant_low == 0 && constant_high == 0)
@@ -16614,7 +16631,8 @@ namespace VitaEE
 				return emit_copy_source(src);
 
 			unsigned src_low;
-			if (!EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low))
+			unsigned src_high;
+			if (!EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high))
 				return false;
 
 			const bool low_ok = constant_low == 0 ?
@@ -16626,12 +16644,13 @@ namespace VitaEE
 			if (!low_ok)
 				return false;
 
+			unsigned high_result = HOST_TMP1;
 			const bool high_ok = constant_high == 0 ?
 				m_code.EmitMovImm8(HOST_TMP1, 0) :
 				(constant_high == 0xffffffffu ?
-					 true :
-					 EmitAndImm32OrReg(HOST_TMP1, HOST_TMP1, constant_high, HOST_TMP2));
-			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+					 ((high_result = src_high), true) :
+					 EmitAndImm32OrReg(HOST_TMP1, src_high, constant_high, HOST_TMP2));
+			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, high_result);
 		};
 		if (!rs_pinned && rs_known && (!rt_pinned || IsCheapA32AndConstant64(rs_low_value, rs_high_value)))
 		{
@@ -16648,10 +16667,12 @@ namespace VitaEE
 
 		unsigned rs_low;
 		unsigned rt_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
+		unsigned rs_high;
+		unsigned rt_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
 			   m_code.EmitAndReg(HOST_TMP0, rs_low, rt_low) &&
-			   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   m_code.EmitAndReg(HOST_TMP1, rs_high, rt_high) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
@@ -16674,8 +16695,9 @@ namespace VitaEE
 				return true;
 
 			unsigned src_low;
-			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
-				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+			unsigned src_high;
+			return EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high) &&
+				   EmitStoreGpr64(rd, src_low, src_high);
 		}
 
 		u32 rs_low_value = 0;
@@ -16697,8 +16719,9 @@ namespace VitaEE
 				return true;
 
 			unsigned src_low;
-			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
-				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+			unsigned src_high;
+			return EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high) &&
+				   EmitStoreGpr64(rd, src_low, src_high);
 		};
 		const auto emit_or_constant = [&](unsigned src, u32 constant_low, u32 constant_high) {
 			if (constant_low == 0 && constant_high == 0)
@@ -16707,7 +16730,8 @@ namespace VitaEE
 				return EmitStoreKnown64(rd, 0xffffffffu, 0xffffffffu);
 
 			unsigned src_low;
-			if (!EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low))
+			unsigned src_high;
+			if (!EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high))
 				return false;
 
 			const bool low_ok = constant_low == 0 ?
@@ -16719,12 +16743,13 @@ namespace VitaEE
 			if (!low_ok)
 				return false;
 
+			unsigned high_result = HOST_TMP1;
 			const bool high_ok = constant_high == 0 ?
-				true :
+				((high_result = src_high), true) :
 				(constant_high == 0xffffffffu ?
 					 m_code.EmitMovImm32(HOST_TMP1, 0xffffffffu) :
-					 EmitOrrImm32OrReg(HOST_TMP1, HOST_TMP1, constant_high, HOST_TMP2));
-			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+					 EmitOrrImm32OrReg(HOST_TMP1, src_high, constant_high, HOST_TMP2));
+			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, high_result);
 		};
 		if (!rs_pinned && rs_known && (!rt_pinned || IsCheapA32LogicalConstant64(rs_low_value, rs_high_value)))
 		{
@@ -16741,10 +16766,12 @@ namespace VitaEE
 
 		unsigned rs_low;
 		unsigned rt_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
+		unsigned rs_high;
+		unsigned rt_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
 			   m_code.EmitOrrReg(HOST_TMP0, rs_low, rt_low) &&
-			   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   m_code.EmitOrrReg(HOST_TMP1, rs_high, rt_high) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
@@ -16767,8 +16794,9 @@ namespace VitaEE
 				return true;
 
 			unsigned src_low;
-			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
-				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+			unsigned src_high;
+			return EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high) &&
+				   EmitStoreGpr64(rd, src_low, src_high);
 		}
 
 		u32 rs_low_value = 0;
@@ -16790,15 +16818,17 @@ namespace VitaEE
 				return true;
 
 			unsigned src_low;
-			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
-				   EmitStoreGpr64(rd, src_low, HOST_TMP1);
+			unsigned src_high;
+			return EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high) &&
+				   EmitStoreGpr64(rd, src_low, src_high);
 		};
 		const auto emit_xor_constant = [&](unsigned src, u32 constant_low, u32 constant_high) {
 			if (constant_low == 0 && constant_high == 0)
 				return emit_copy_source(src);
 
 			unsigned src_low;
-			if (!EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low))
+			unsigned src_high;
+			if (!EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high))
 				return false;
 
 			const bool low_ok = constant_low == 0 ?
@@ -16808,10 +16838,11 @@ namespace VitaEE
 			if (!low_ok)
 				return false;
 
+			unsigned high_result = HOST_TMP1;
 			const bool high_ok = constant_high == 0 ?
-				true :
-				EmitEorImm32OrReg(HOST_TMP1, HOST_TMP1, constant_high, HOST_TMP2);
-			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+				((high_result = src_high), true) :
+				EmitEorImm32OrReg(HOST_TMP1, src_high, constant_high, HOST_TMP2);
+			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, high_result);
 		};
 		if (!rs_pinned && rs_known && (!rt_pinned || IsCheapA32LogicalConstant64(rs_low_value, rs_high_value)))
 		{
@@ -16828,10 +16859,12 @@ namespace VitaEE
 
 		unsigned rs_low;
 		unsigned rt_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
+		unsigned rs_high;
+		unsigned rt_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
 			   m_code.EmitEorReg(HOST_TMP0, rs_low, rt_low) &&
-			   m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   m_code.EmitEorReg(HOST_TMP1, rs_high, rt_high) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
@@ -16855,9 +16888,10 @@ namespace VitaEE
 		{
 			const unsigned src = (rs == 0) ? rt : rs;
 			unsigned src_low;
-			return EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low) &&
+			unsigned src_high;
+			return EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high) &&
 				   m_code.EmitMvnReg(HOST_TMP0, src_low) &&
-				   m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1) &&
+				   m_code.EmitMvnReg(HOST_TMP1, src_high) &&
 				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 		}
 
@@ -16880,7 +16914,8 @@ namespace VitaEE
 				return EmitStoreGprZero64(rd);
 
 			unsigned src_low;
-			if (!EmitGpr64OperandLow(src, HOST_TMP0, HOST_TMP1, &src_low))
+			unsigned src_high;
+			if (!EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high))
 				return false;
 
 			const bool low_ok = constant_low == 0 ?
@@ -16893,10 +16928,10 @@ namespace VitaEE
 				return false;
 
 			const bool high_ok = constant_high == 0 ?
-				m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1) :
+				m_code.EmitMvnReg(HOST_TMP1, src_high) :
 				(constant_high == 0xffffffffu ?
 					 m_code.EmitMovImm8(HOST_TMP1, 0) :
-					 (EmitOrrImm32OrReg(HOST_TMP1, HOST_TMP1, constant_high, HOST_TMP2) &&
+					 (EmitOrrImm32OrReg(HOST_TMP1, src_high, constant_high, HOST_TMP2) &&
 						 m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1)));
 			return low_ok && high_ok && EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 		};
@@ -16915,10 +16950,12 @@ namespace VitaEE
 
 		unsigned rs_low;
 		unsigned rt_low;
-		return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-			   EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) &&
+		unsigned rs_high;
+		unsigned rt_high;
+		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
 			   m_code.EmitOrrReg(HOST_TMP0, rs_low, rt_low) &&
-			   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP3) &&
+			   m_code.EmitOrrReg(HOST_TMP1, rs_high, rt_high) &&
 			   m_code.EmitMvnReg(HOST_TMP0, HOST_TMP0) &&
 			   m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
@@ -17186,15 +17223,19 @@ namespace VitaEE
 			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
 		}
 
+		if (amount == 0)
+		{
+			unsigned rt_low;
+			unsigned rt_high;
+			return EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high) &&
+				   EmitStoreGpr64(rd, rt_low, rt_high);
+		}
+
 		unsigned rt_low;
 		if (!EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low))
 			return false;
 
-		if (amount == 0)
-		{
-			return EmitStoreGpr64(rd, rt_low, HOST_TMP1);
-		}
-		else if (amount < 32)
+		if (amount < 32)
 		{
 			return m_code.EmitMovRegShiftImm(HOST_TMP2, rt_low, VitaA32::ShiftType::LSR, static_cast<u8>(32 - amount)) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
@@ -17240,16 +17281,20 @@ namespace VitaEE
 			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
 		}
 
+		const VitaA32::ShiftType high_shift = arithmetic ? VitaA32::ShiftType::ASR : VitaA32::ShiftType::LSR;
+		if (amount == 0)
+		{
+			unsigned rt_low;
+			unsigned rt_high;
+			return EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high) &&
+				   EmitStoreGpr64(rd, rt_low, rt_high);
+		}
+
 		unsigned rt_low;
 		if (!EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low))
 			return false;
 
-		const VitaA32::ShiftType high_shift = arithmetic ? VitaA32::ShiftType::ASR : VitaA32::ShiftType::LSR;
-		if (amount == 0)
-		{
-			return EmitStoreGpr64(rd, rt_low, HOST_TMP1);
-		}
-		else if (amount < 32)
+		if (amount < 32)
 		{
 			return m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::LSL, static_cast<u8>(32 - amount)) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP0, rt_low, VitaA32::ShiftType::LSR, static_cast<u8>(amount)) &&
@@ -17308,8 +17353,9 @@ namespace VitaEE
 		if (rs == 0)
 		{
 			unsigned rt_low;
-			return EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low) &&
-				   EmitStoreGpr64(rd, rt_low, HOST_TMP1);
+			unsigned rt_high;
+			return EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high) &&
+				   EmitStoreGpr64(rd, rt_low, rt_high);
 		}
 
 		unsigned rs_host;
@@ -17401,8 +17447,9 @@ namespace VitaEE
 		if (rs == 0)
 		{
 			unsigned rt_low;
-			return EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low) &&
-				   EmitStoreGpr64(rd, rt_low, HOST_TMP1);
+			unsigned rt_high;
+			return EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high) &&
+				   EmitStoreGpr64(rd, rt_low, rt_high);
 		}
 
 		unsigned rs_host;
@@ -17487,13 +17534,15 @@ namespace VitaEE
 				return EmitStoreKnown64(rd, rs_low_value, rs_high_value);
 
 			unsigned rs_low;
-			return EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) &&
-				   EmitStoreGpr64(rd, rs_low, HOST_TMP1);
+			unsigned rs_high;
+			return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+				   EmitStoreGpr64(rd, rs_low, rs_high);
 		}
 
 		unsigned rt_low;
-		if (!EmitGpr64OperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low) ||
-			!m_code.EmitOrrReg(HOST_TMP4, rt_low, HOST_TMP3, true))
+		unsigned rt_high;
+		if (!EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) ||
+			!m_code.EmitOrrReg(HOST_TMP4, rt_low, rt_high, true))
 		{
 			return false;
 		}
@@ -17504,8 +17553,9 @@ namespace VitaEE
 			return false;
 
 		unsigned rs_low;
-		if (!EmitGpr64OperandLow(rs, HOST_TMP0, HOST_TMP1, &rs_low) ||
-			!EmitStoreGpr64(rd, rs_low, HOST_TMP1))
+		unsigned rs_high;
+		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) ||
+			!EmitStoreGpr64(rd, rs_low, rs_high))
 		{
 			return false;
 		}
