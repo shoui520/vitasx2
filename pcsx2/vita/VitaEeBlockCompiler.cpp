@@ -143,6 +143,7 @@ u32 g_qemuMmiPackedWordByHalfwordDivideZeroDividendVectorOps = 0;
 u32 g_qemuMmiHalfwordShuffleVectorOps = 0;
 u32 g_qemuMmiWordShuffleVectorOps = 0;
 u32 g_qemuSigned64CompareCarryChains = 0;
+u32 g_qemuUnsignedKnown64CompareCarryChains = 0;
 u32 g_qemuAndLowMaskBitfieldFastPaths = 0;
 u32 g_qemuNegativeHighCarryFastPaths = 0;
 u32 g_qemuReverseSubtractCarryImmediateFastPaths = 0;
@@ -19161,83 +19162,62 @@ namespace VitaEE
 		if (!EmitGpr64ReadOperands(runtime_guest_reg, HOST_TMP0, HOST_TMP1, &runtime_low, &runtime_high))
 			return false;
 
-		if (signed_compare)
-		{
-			// Preserve the low-word borrow through the high-word subtraction.
-			// MOV/MOVW/MOVT do not alter APSR, so one scratch register is enough
-			// when the compile-time operand is on the left.
+		// PCSX2 x86/ix86-32/iR5900Arit.cpp::recSLTs_const() lowers both
+		// recSLT_consts()/constt() and recSLTU_consts()/constt() to one 64-bit
+		// compare followed by SETL/SETB (or the reversed predicate). Preserve the
+		// low-word carry through SBCS/RSC here so A32 also avoids control flow.
 #if defined(VITASX2_QEMU_VALIDATION)
+		if (signed_compare)
 			g_qemuSigned64CompareCarryChains++;
+		else
+			g_qemuUnsignedKnown64CompareCarryChains++;
 #endif
-			bool compare_ok;
-			if (known_is_lhs)
+		bool compare_ok;
+		if (known_is_lhs)
+		{
+			compare_ok = m_code.EmitRsbImm32(result_reg, runtime_low, known_low, true);
+			if (!compare_ok)
 			{
 				compare_ok = m_code.EmitMovImm32(HOST_TMP2, known_low) &&
-					m_code.EmitCmpReg(HOST_TMP2, runtime_low) &&
-					m_code.EmitMovImm32(HOST_TMP2, known_high) &&
+					m_code.EmitCmpReg(HOST_TMP2, runtime_low);
+			}
+			if (!compare_ok)
+				return false;
+
+			compare_ok = m_code.EmitRscImm32(result_reg, runtime_high, known_high, true);
+			if (!compare_ok)
+			{
+				compare_ok = m_code.EmitMovImm32(HOST_TMP2, known_high) &&
 					m_code.EmitSbcReg(result_reg, HOST_TMP2, runtime_high, true);
 			}
-			else
+		}
+		else
+		{
+			compare_ok = EmitCmpImm32OrReg(runtime_low, known_low, HOST_TMP2);
+			if (compare_ok && known_high == 0)
+				compare_ok = m_code.EmitSbcImm8(result_reg, runtime_high, 0, true);
+			else if (compare_ok && known_high == 0xffffffffu)
+				compare_ok = m_code.EmitAdcImm8(result_reg, runtime_high, 0, true);
+			else if (compare_ok)
 			{
-				compare_ok = EmitCmpImm32OrReg(runtime_low, known_low, HOST_TMP2);
-				if (compare_ok && known_high == 0)
-					compare_ok = m_code.EmitSbcImm8(result_reg, runtime_high, 0, true);
-				else if (compare_ok && known_high == 0xffffffffu)
-					compare_ok = m_code.EmitAdcImm8(result_reg, runtime_high, 0, true);
-				else if (compare_ok)
-				{
-					compare_ok = m_code.EmitSbcImm32(result_reg, runtime_high, known_high, true);
+				compare_ok = m_code.EmitSbcImm32(result_reg, runtime_high, known_high, true);
 #if defined(VITASX2_QEMU_VALIDATION)
-					if (compare_ok)
-						g_qemuCarryModifiedImmediateFastPaths++;
+				if (compare_ok)
+					g_qemuCarryModifiedImmediateFastPaths++;
 #endif
-					if (!compare_ok)
-					{
-						compare_ok = m_code.EmitMovImm32(HOST_TMP2, known_high) &&
-							m_code.EmitSbcReg(result_reg, runtime_high, HOST_TMP2, true);
-					}
+				if (!compare_ok)
+				{
+					compare_ok = m_code.EmitMovImm32(HOST_TMP2, known_high) &&
+						m_code.EmitSbcReg(result_reg, runtime_high, HOST_TMP2, true);
 				}
 			}
-
-			return compare_ok &&
-				m_code.EmitMovImm8(result_reg, 0) &&
-				m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::LT) &&
-				EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
 		}
 
-		if ((!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0)) ||
-			!EmitCmpImm32OrReg(runtime_high, known_high, HOST_TMP2))
-		{
-			return false;
-		}
-
-		const size_t high_equal = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (high_equal == static_cast<size_t>(-1))
-			return false;
-
-		const VitaA32::Condition high_true = known_is_lhs ? VitaA32::Condition::HI : VitaA32::Condition::CC;
-		if ((direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
-			!m_code.EmitMovImm8(result_reg, 1, high_true))
-			return false;
-
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t low_compare = m_code.Size();
-		const VitaA32::Condition low_true =
-			known_is_lhs ? VitaA32::Condition::HI : VitaA32::Condition::CC;
-		if (!EmitCmpImm32OrReg(runtime_low, known_low, HOST_TMP2) ||
-			(direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
-			!m_code.EmitMovImm8(result_reg, 1, low_true))
-		{
-			return false;
-		}
-
-		const size_t done_target = m_code.Size();
-		return m_code.PatchBranch(high_equal, low_compare, VitaA32::Condition::EQ) &&
-			   m_code.PatchBranch(done, done_target) &&
-			   EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
+		return compare_ok &&
+			m_code.EmitMovImm8(result_reg, 0) &&
+			m_code.EmitMovImm8(result_reg, 1,
+				signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC) &&
+			EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
 	}
 
 	bool BlockCompiler::EmitSetLessThan64Imm(unsigned guest_reg, s32 imm, bool signed_compare,
