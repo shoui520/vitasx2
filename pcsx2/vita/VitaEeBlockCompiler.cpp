@@ -17516,6 +17516,9 @@ namespace VitaEE
 
 		if (amount == 0)
 		{
+			if (rd == rt)
+				return true;
+
 			unsigned rt_low;
 			unsigned rt_high;
 			return EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high) &&
@@ -17527,17 +17530,19 @@ namespace VitaEE
 			if (!EmitGprLowOperand(rt, HOST_TMP0, &rt_low))
 				return false;
 
+			const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+			const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
 			if (amount == 32)
 			{
-				return m_code.EmitMovRegShiftImm(HOST_TMP1, rt_low, VitaA32::ShiftType::LSL, 0) &&
-					   m_code.EmitMovImm8(HOST_TMP0, 0) &&
-					   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+				return m_code.EmitMovRegShiftImm(high_result, rt_low, VitaA32::ShiftType::LSL, 0) &&
+					   m_code.EmitMovImm8(low_result, 0) &&
+					   EmitStoreGpr64(rd, low_result, high_result);
 			}
 
-			return m_code.EmitMovRegShiftImm(HOST_TMP1, rt_low, VitaA32::ShiftType::LSL,
+			return m_code.EmitMovRegShiftImm(high_result, rt_low, VitaA32::ShiftType::LSL,
 					   static_cast<u8>(amount - 32)) &&
-				   m_code.EmitMovImm8(HOST_TMP0, 0) &&
-				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+				   m_code.EmitMovImm8(low_result, 0) &&
+				   EmitStoreGpr64(rd, low_result, high_result);
 		}
 
 		unsigned rt_low;
@@ -17545,11 +17550,13 @@ namespace VitaEE
 		if (!EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high))
 			return false;
 
+		const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
 		return m_code.EmitMovRegShiftImm(HOST_TMP2, rt_low, VitaA32::ShiftType::LSR, static_cast<u8>(32 - amount)) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP1, rt_high, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
-			   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP0, rt_low, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+			   m_code.EmitMovRegShiftImm(high_result, rt_high, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
+			   m_code.EmitOrrReg(high_result, high_result, HOST_TMP2) &&
+			   m_code.EmitMovRegShiftImm(low_result, rt_low, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
+			   EmitStoreGpr64(rd, low_result, high_result);
 	}
 
 	bool BlockCompiler::EmitShift64RightImmediate(u32 op, unsigned amount, bool arithmetic)
@@ -17581,6 +17588,9 @@ namespace VitaEE
 		const VitaA32::ShiftType high_shift = arithmetic ? VitaA32::ShiftType::ASR : VitaA32::ShiftType::LSR;
 		if (amount == 0)
 		{
+			if (rd == rt)
+				return true;
+
 			unsigned rt_low;
 			unsigned rt_high;
 			return EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high) &&
@@ -17592,14 +17602,15 @@ namespace VitaEE
 			if (!EmitGprWordOperand(rt, 1, HOST_TMP1, &rt_high))
 				return false;
 
+			const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
 			const bool low_ok = amount == 32 ?
-				m_code.EmitMovRegShiftImm(HOST_TMP0, rt_high, VitaA32::ShiftType::LSL, 0) :
-				m_code.EmitMovRegShiftImm(HOST_TMP0, rt_high, high_shift, static_cast<u8>(amount - 32));
+				m_code.EmitMovRegShiftImm(low_result, rt_high, VitaA32::ShiftType::LSL, 0) :
+				m_code.EmitMovRegShiftImm(low_result, rt_high, high_shift, static_cast<u8>(amount - 32));
 			if (!low_ok)
 				return false;
 
-			return arithmetic ? EmitStoreGprSignExtended32FromLow(rd, HOST_TMP0) :
-								EmitStoreGprZeroExtended32FromLow(rd, HOST_TMP0);
+			return arithmetic ? EmitStoreGprSignExtended32FromLow(rd, low_result) :
+								EmitStoreGprZeroExtended32FromLow(rd, low_result);
 		}
 
 		unsigned rt_low;
@@ -17607,11 +17618,13 @@ namespace VitaEE
 		if (!EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high))
 			return false;
 
+		const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
 		return m_code.EmitMovRegShiftImm(HOST_TMP2, rt_high, VitaA32::ShiftType::LSL, static_cast<u8>(32 - amount)) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP0, rt_low, VitaA32::ShiftType::LSR, static_cast<u8>(amount)) &&
-			   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP1, rt_high, high_shift, static_cast<u8>(amount)) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+			   m_code.EmitMovRegShiftImm(low_result, rt_low, VitaA32::ShiftType::LSR, static_cast<u8>(amount)) &&
+			   m_code.EmitOrrReg(low_result, low_result, HOST_TMP2) &&
+			   m_code.EmitMovRegShiftImm(high_result, rt_high, high_shift, static_cast<u8>(amount)) &&
+			   EmitStoreGpr64(rd, low_result, high_result);
 	}
 
 	bool BlockCompiler::EmitShift64LeftVariable(u32 op)
