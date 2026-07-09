@@ -3036,6 +3036,15 @@ namespace VitaEE
 
 	bool MmiOpcodeKeepsGprQCacheLocal(u32 op)
 	{
+		switch (op >> 26)
+		{
+			case 0x1e: // LQ, owned by R5900OpcodeImpl.cpp::LQ().
+			case 0x1f: // SQ, owned by R5900OpcodeImpl.cpp::SQ().
+				return true;
+			default:
+				break;
+		}
+
 		if (IsFastCOP2VectorTransfer(op))
 		{
 			// PCSX2 owner: VU0.cpp::QMFC2()/QMTC2(). These native paths either
@@ -15868,7 +15877,7 @@ namespace VitaEE
 					   m_code.PatchBranch(zero_done, m_code.Size());
 			}
 
-			return EmitLoadCpuRegsQ128(GprOffset(rt), NEON_VALUE, HOST_TMP1) &&
+			return EmitLoadGprQ128(rt, NEON_VALUE, HOST_TMP1) &&
 				   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0);
 		};
 
