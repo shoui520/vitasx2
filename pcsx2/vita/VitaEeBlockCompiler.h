@@ -548,6 +548,7 @@ namespace VitaEE
 		bool BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const;
 		bool EmitGprPinLoads();
 		bool EmitFlushDirtyGprPins();
+		bool EmitFlushDirtyGprPinsForGuest(unsigned guest_reg);
 		bool EmitSyncGprPinsToBacking();
 		int FindGprPinIndex(unsigned guest_reg) const;
 		int FindGprPinHost(unsigned guest_reg) const;

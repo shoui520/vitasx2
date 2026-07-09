@@ -3098,6 +3098,11 @@ namespace VitaEE
 			case 0x37: // LD
 				add_write(rt);
 				return true;
+			case 0x1e: // LQ writes rt through the pin-updating EmitStoreGprQ128().
+			case 0x1f: // SQ reads rt through EmitLoadGprQ128(), which flushes
+				// deferred pinned words before touching the raw backing slot;
+				// the cold tails sync pins before their vtlb helpers.
+				return true;
 			case 0x28: // SB
 			case 0x29: // SH
 			case 0x2b: // SW
@@ -4627,6 +4632,62 @@ namespace VitaEE
 					m_pin_dirty_high[i] = false;
 				}
 			}
+
+		return true;
+	}
+
+	bool BlockCompiler::EmitFlushDirtyGprPinsForGuest(unsigned guest_reg)
+	{
+		if (!m_dirty_pins_enabled)
+			return true;
+
+		const int pin_index = FindGprPinIndex(guest_reg);
+		if (pin_index < 0)
+			return true;
+
+		const unsigned i = static_cast<unsigned>(pin_index);
+		const size_t offset = GprOffset(guest_reg);
+		if (m_pin_dirty_low[i] && m_pin_dirty_high[i] &&
+			m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+			offset <= 0xff &&
+			CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))
+		{
+			if (!m_code.EmitStrdImm8(m_pin_host[i], m_pin_high_host[i], HOST_CPU_REGS,
+				static_cast<u8>(offset)))
+			{
+				return false;
+			}
+			m_pin_dirty_low[i] = false;
+			m_pin_dirty_high[i] = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprDirtyPinFlushStores += 2;
+#endif
+			return true;
+		}
+
+		if (m_pin_dirty_low[i])
+		{
+			if (!m_code.EmitStrImm12(m_pin_host[i], HOST_CPU_REGS, static_cast<u16>(offset)))
+				return false;
+			m_pin_dirty_low[i] = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprDirtyPinFlushStores++;
+#endif
+		}
+
+		if (m_pin_dirty_high[i])
+		{
+			if (m_pin_high_host[i] == NO_GPR_PIN_HOST ||
+				!m_code.EmitStrImm12(m_pin_high_host[i], HOST_CPU_REGS,
+					static_cast<u16>(offset + sizeof(u32))))
+			{
+				return false;
+			}
+			m_pin_dirty_high[i] = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprDirtyPinFlushStores++;
+#endif
+		}
 
 		return true;
 	}
@@ -19924,6 +19985,7 @@ namespace VitaEE
 		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
+			!EmitSyncGprPinsToBacking() ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memRead128)) ||
 			!EmitStoreGprQ128(tail.rt, NEON_VALUE, HOST_TMP1))
 		{
@@ -19944,6 +20006,7 @@ namespace VitaEE
 		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
+			!EmitSyncGprPinsToBacking() ||
 			!EmitLoadCpuRegsQ128(GprOffset(tail.rt), NEON_VALUE, HOST_TMP1) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memWrite128)))
 		{
@@ -21133,6 +21196,11 @@ namespace VitaEE
 		InvalidateGprQCacheForQreg(qreg);
 		if (guest_reg == 0)
 			return m_code.EmitVeorQ(qreg, qreg, qreg);
+
+		// Full-qword reads consume the raw backing slot, so deferred pinned
+		// low/high words must land in backing first.
+		if (!EmitFlushDirtyGprPinsForGuest(guest_reg))
+			return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (m_gpr_q_cache_enabled)
