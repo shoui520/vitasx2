@@ -119,6 +119,7 @@ u32 g_qemuMmiVariableWordShiftVectorOps = 0;
 u32 g_qemuMmiPackedWordMultiplyVectorOps = 0;
 u32 g_qemuMmiPackedWordMultiplyAddVectorOps = 0;
 u32 g_qemuMmiPackedWordDivideVectorOps = 0;
+u32 g_qemuMmiPackedWordDivideZeroDivisorVectorOps = 0;
 u32 g_qemuMmiPackedHalfwordMultiplyAccumulateVectorOps = 0;
 u32 g_qemuMmiPackedHalfwordPairMultiplyVectorOps = 0;
 u32 g_qemuMmiPackedHalfwordMultiplyVectorOps = 0;
@@ -12071,6 +12072,39 @@ namespace VitaEE
 						   address_scratch);
 			};
 
+		const auto emit_zero_divisor_vector = [&]() {
+			constexpr unsigned NEON_RS = 0;
+			constexpr unsigned NEON_LO = 1;
+			constexpr unsigned NEON_SIGN = 2;
+
+			if (!EmitLoadGprQ128(rs, NEON_RS, HOST_TMP0))
+				return false;
+
+			InvalidateGprQCacheForQreg(NEON_RS);
+			InvalidateGprQCacheForQreg(NEON_LO);
+			InvalidateGprQCacheForQreg(NEON_SIGN);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuMmiPackedWordDivideVectorOps++;
+			g_qemuMmiPackedWordDivideZeroDivisorVectorOps++;
+#endif
+
+			// PCSX2 owners: MMI.cpp::_PDIVW() and _PDIVUW(). With RT=$zero,
+			// both active divisors are architecturally zero, so one vector path
+			// writes LO's divide-by-zero result and keeps the sign-extended
+			// dividend words in HI.
+			const bool lo_ok = signed_divide ?
+				(m_code.EmitVshrS32Q(NEON_LO, NEON_RS, 31) &&
+				 m_code.EmitVshlI32Q(NEON_LO, NEON_LO, 1) &&
+				 m_code.EmitVmvnQ(NEON_LO, NEON_LO)) :
+				(m_code.EmitVeorQ(NEON_LO, NEON_LO, NEON_LO) &&
+				 m_code.EmitVmvnQ(NEON_LO, NEON_LO));
+			return lo_ok &&
+			       emit_store_active_word_lanes_as_doublewords(
+					   LO_OFFSET, NEON_LO, NEON_SIGN, HOST_TMP1) &&
+			       emit_store_active_word_lanes_as_doublewords(
+					   HI_OFFSET, NEON_RS, NEON_SIGN, HOST_TMP2);
+		};
+
 		const auto emit_signed_power_of_two_test =
 			[&](unsigned divisor_reg, BranchPatch* scalar_branches,
 				unsigned& scalar_branch_count) {
@@ -12280,6 +12314,9 @@ namespace VitaEE
 				return patch_branches(scalar_branches, scalar_branch_count,
 					m_code.Size());
 			};
+
+		if (rt == 0)
+			return emit_zero_divisor_vector();
 
 		if (!load_word(rs, 0, HOST_TMP0) || !load_word(rt, 0, HOST_TMP1) ||
 			!load_word(rs, 2, HOST_TMP2) || !load_word(rt, 2, HOST_TMP3))
