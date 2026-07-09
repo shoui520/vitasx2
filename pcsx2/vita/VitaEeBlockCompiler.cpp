@@ -3098,10 +3098,25 @@ namespace VitaEE
 			case 0x37: // LD
 				add_write(rt);
 				return true;
+			case 0x11: // COP1, owned by FPU.cpp and x86/iFPU.cpp.
+				if (((op >> 21) & 0x1f) == 0x08)
+					return CanCompileCOP1(op); // BC1 reads only FCR31.C.
+				if (!IsFastCOP1InBlock(op))
+				{
+					// Accepted helper fallbacks are block-ending event tails that
+					// sync pins through EmitSystemHelperEventExit().
+					return CanCompileCOP1(op);
+				}
+				if (((op >> 21) & 0x1f) == 0x00 || ((op >> 21) & 0x1f) == 0x02)
+					add_write(rt); // MFC1/CFC1 write rt through the extended-store seam.
+				return true;
 			case 0x1e: // LQ writes rt through the pin-updating EmitStoreGprQ128().
 			case 0x1f: // SQ reads rt through EmitLoadGprQ128(), which flushes
 				// deferred pinned words before touching the raw backing slot;
 				// the cold tails sync pins before their vtlb helpers.
+				return true;
+			case 0x31: // LWC1 writes an FPR only; the cold tail syncs pins before memRead32().
+			case 0x39: // SWC1 reads an FPR only; the cold tail syncs pins before memWrite32().
 				return true;
 			case 0x28: // SB
 			case 0x29: // SH
@@ -20027,8 +20042,11 @@ namespace VitaEE
 			return false;
 
 		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
+		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
+			!EmitSyncGprPinsToBacking())
+		{
 			return false;
+		}
 
 		if (tail.store)
 		{
