@@ -6220,14 +6220,12 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t direct_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
-		if (direct_branch == static_cast<size_t>(-1))
+		// Scheduler events are rare relative to block dispatch. Keep PCSX2's
+		// signed-delta test, but invert the A32 layout so cycle < nextEventCycle
+		// falls through into the direct tail instead of taking a hot branch.
+		const size_t event_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		if (event_branch == static_cast<size_t>(-1))
 			return false;
-
-		if (!EmitEventExitReturn(event_exit))
-			return false;
-
-		const size_t direct_target = m_code.Size();
 		if (taken_link || wait_loop_taken)
 		{
 			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
@@ -6251,9 +6249,11 @@ namespace VitaEE
 				EmitWaitLoopFastForwardTail(event_exit) :
 				EmitDirectLinkTail(direct_exit, taken_link);
 
+			const size_t event_target = m_code.Size();
 			const size_t carry_branches[] = {carry_branch};
 			if (!taken_tail_ok ||
-				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI) ||
+				!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) ||
+				!EmitEventExitReturn(event_exit) ||
 				!EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1))
 			{
 				return false;
@@ -6264,29 +6264,29 @@ namespace VitaEE
 
 		if (direct_link)
 		{
-			if (!EmitDirectLinkTail(direct_exit, direct_link) ||
-				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
+			if (!EmitDirectLinkTail(direct_exit, direct_link))
 			{
 				return false;
 			}
 		}
 		else if (indirect_lookup_pages_slot && direct_linking_enabled_flag)
 		{
-			if (!EmitIndirectDispatchTail(indirect_lookup_pages_slot, direct_linking_enabled_flag) ||
-				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
+			if (!EmitIndirectDispatchTail(indirect_lookup_pages_slot, direct_linking_enabled_flag))
 			{
 				return false;
 			}
 		}
 		else if (!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
-			!m_code.EmitPop(m_saved_registers | REG_PC) ||
-			!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI))
+			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
 			return false;
 		}
 
+		const size_t event_target = m_code.Size();
 		const size_t carry_branches[] = {carry_branch};
-		return EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1);
+		return m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) &&
+			   EmitEventExitReturn(event_exit) &&
+			   EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles,
@@ -6358,14 +6358,11 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t direct_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
-		if (direct_branch == static_cast<size_t>(-1))
+		// Match the normal cycle-test layout: direct dispatch is the common
+		// fallthrough, while cycle >= nextEventCycle takes the event branch.
+		const size_t event_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		if (event_branch == static_cast<size_t>(-1))
 			return false;
-
-		if (!EmitEventExitReturn(event_exit))
-			return false;
-
-		const size_t direct_target = m_code.Size();
 		if (not_taken_link || taken_link || wait_loop_taken)
 		{
 			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
@@ -6388,9 +6385,11 @@ namespace VitaEE
 				EmitWaitLoopFastForwardTail(event_exit) :
 				EmitDirectLinkTail(direct_exit, taken_link);
 
+			const size_t event_target = m_code.Size();
 			const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
 			if (!taken_tail_ok ||
-				!m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI) ||
+				!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) ||
+				!EmitEventExitReturn(event_exit) ||
 				!EmitCycleCarryFixup(carry_branches, 2, cycle_compare_target, HOST_TMP1))
 			{
 				return false;
@@ -6400,9 +6399,15 @@ namespace VitaEE
 		}
 
 		const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
-		return m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) &&
-			   m_code.EmitPop(m_saved_registers | REG_PC) &&
-			   m_code.PatchBranch(direct_branch, direct_target, VitaA32::Condition::MI) &&
+		if (!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
+			!m_code.EmitPop(m_saved_registers | REG_PC))
+		{
+			return false;
+		}
+
+		const size_t event_target = m_code.Size();
+		return m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) &&
+			   EmitEventExitReturn(event_exit) &&
 			   EmitCycleCarryFixup(carry_branches, 2, cycle_compare_target, HOST_TMP1);
 	}
 
