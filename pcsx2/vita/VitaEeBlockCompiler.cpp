@@ -11410,8 +11410,9 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
-		return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET)) &&
-			   EmitStoreGprZeroExtended32FromLow(rd, HOST_TMP0);
+		const unsigned result_reg = SelectGprLowResultHost(rd, HOST_TMP0);
+		return m_code.EmitLdrImm12(result_reg, HOST_CPU_REGS, static_cast<u16>(SA_OFFSET)) &&
+			   EmitStoreGprZeroExtended32FromLow(rd, result_reg);
 	}
 
 	bool BlockCompiler::EmitMTSA(u32 op)
@@ -11428,8 +11429,10 @@ namespace VitaEE
 		if (rd == 0)
 			return true;
 
-		return EmitLoadCpuRegsU64(hilo_offset, HOST_TMP0, HOST_TMP1, HOST_TMP2) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
+		return EmitLoadCpuRegsU64(hilo_offset, low_result, high_result, HOST_TMP2) &&
+			   EmitStoreGpr64(rd, low_result, high_result);
 	}
 
 	bool BlockCompiler::EmitMoveToHiLo(u32 op, size_t hilo_offset)
