@@ -10120,11 +10120,7 @@ namespace VitaEE
 		// result of RS.low + sign_extend_16(imm). With RS=$zero that is just
 		// the sign-extended immediate.
 		if (rs == 0)
-		{
-			return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(imm)) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
-		}
+			return EmitStoreKnownSignExtended32(rt, static_cast<u32>(imm));
 
 		u32 rs_value = 0;
 		if (FindGprPinHost(rs) < 0 && TryGetKnownGprLow(rs, &rs_value))
@@ -10169,11 +10165,7 @@ namespace VitaEE
 		// immediate and adds it to the low 64-bit GPR value. With RS=$zero the
 		// result is exactly that sign-extended immediate.
 		if (rs == 0)
-		{
-			return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(imm)) &&
-				   m_code.EmitMovImm32(HOST_TMP1, (imm < 0) ? 0xffffffffu : 0) &&
-				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
-		}
+			return EmitStoreKnown64(rt, static_cast<u32>(imm), (imm < 0) ? 0xffffffffu : 0);
 		if (imm == 0 && rt == rs)
 			return true;
 
@@ -10227,9 +10219,7 @@ namespace VitaEE
 		if (rs == 0)
 		{
 			const u32 result = (imm > 0) ? 1u : 0u;
-			return m_code.EmitMovImm8(HOST_TMP0, static_cast<u8>(result)) &&
-				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+			return EmitStoreKnownZeroExtended32(rt, result);
 		}
 
 		u32 rs_low_value = 0;
@@ -10264,9 +10254,7 @@ namespace VitaEE
 		if (rs == 0)
 		{
 			const u32 result = (imm != 0) ? 1u : 0u;
-			return m_code.EmitMovImm8(HOST_TMP0, static_cast<u8>(result)) &&
-				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+			return EmitStoreKnownZeroExtended32(rt, result);
 		}
 
 		u32 rs_low_value = 0;
@@ -10298,11 +10286,7 @@ namespace VitaEE
 
 		// PCSX2 owner: R5900OpcodeImpl.cpp::ANDI(); result is zero-extended into the low 64 bits.
 		if (rs == 0 || imm == 0)
-		{
-			return m_code.EmitMovImm8(HOST_TMP0, 0) &&
-				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
-		}
+			return EmitStoreGprZero64(rt);
 
 		u32 rs_value = 0;
 		if (FindGprPinHost(rs) < 0 && TryGetKnownGprLow(rs, &rs_value))
@@ -10344,11 +10328,7 @@ namespace VitaEE
 			return true;
 
 		if (rs == 0)
-		{
-			return m_code.EmitMovImm32(HOST_TMP0, imm) &&
-				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
-		}
+			return EmitStoreKnownZeroExtended32(rt, imm);
 
 		u32 rs_low_value = 0;
 		u32 rs_high_value = 0;
@@ -10392,11 +10372,7 @@ namespace VitaEE
 			return true;
 
 		if (rs == 0)
-		{
-			return m_code.EmitMovImm32(HOST_TMP0, imm) &&
-				   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
-		}
+			return EmitStoreKnownZeroExtended32(rt, imm);
 
 		u32 rs_low_value = 0;
 		u32 rs_high_value = 0;
@@ -10432,9 +10408,7 @@ namespace VitaEE
 			return true;
 
 		const u32 value = op << 16;
-		return m_code.EmitMovImm32(HOST_TMP0, value) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-			   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		return EmitStoreKnownSignExtended32(rt, value);
 	}
 
 	bool BlockCompiler::EmitSLL(u32 op)
