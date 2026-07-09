@@ -3110,10 +3110,23 @@ namespace VitaEE
 				if (((op >> 21) & 0x1f) == 0x00 || ((op >> 21) & 0x1f) == 0x02)
 					add_write(rt); // MFC1/CFC1 write rt through the extended-store seam.
 				return true;
+			case 0x1a: // LDL merges through pin-aware value reads when rt is pinned,
+			case 0x1b: // LDR through raw backing otherwise; the cold tail syncs pins
+				// before its byte merge and refreshes the rt pin afterwards.
+			case 0x22: // LWL merges rt through the pin-aware loaders and the
+			case 0x26: // LWR deferring extended-store seam; the cold tail syncs
+				// pins and flushes tail deferrals before rejoining.
+				add_write(rt);
+				return true;
 			case 0x1e: // LQ writes rt through the pin-updating EmitStoreGprQ128().
 			case 0x1f: // SQ reads rt through EmitLoadGprQ128(), which flushes
 				// deferred pinned words before touching the raw backing slot;
 				// the cold tails sync pins before their vtlb helpers.
+				return true;
+			case 0x2a: // SWL reads rt through the pin-aware partial-store loader.
+			case 0x2e: // SWR reads rt through the pin-aware partial-store loader.
+			case 0x2c: // SDL flushes rt's deferred pinned words before its
+			case 0x2d: // SDR byte-lane backing reads; tails sync pins first.
 				return true;
 			case 0x31: // LWC1 writes an FPR only; the cold tail syncs pins before memRead32().
 			case 0x39: // SWC1 reads an FPR only; the cold tail syncs pins before memWrite32().
@@ -19400,6 +19413,10 @@ namespace VitaEE
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp::SDL() / SDR().
 		const unsigned rt = RT(op);
+		// The byte-lane source reads consume the raw backing slot, so deferred
+		// pinned rt words must land in backing first.
+		if (!EmitFlushDirtyGprPinsForGuest(rt))
+			return false;
 		u32 rt_low_value = 0;
 		u32 rt_high_value = 0;
 		const bool rt64_known =
@@ -20178,8 +20195,11 @@ namespace VitaEE
 		// Partial accesses do not raise address errors; handler-backed pages
 		// dispatch through PCSX2's vTLB and do the merge in generated A32,
 		// while non-handler pages fall through after the native fast path.
+		// The dword forms merge byte lanes through the raw backing slots, so
+		// deferred pinned words must be resident in backing before the merge.
 		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
+		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
+			!EmitSyncGprPinsToBacking())
 		{
 			return false;
 		}
@@ -20384,7 +20404,9 @@ namespace VitaEE
 				break;
 		}
 
-		if (!emitted)
+		// The word-load merges store rt through the deferring seam after the
+		// block-exit flush was emitted, so push any tail deferrals back out.
+		if (!emitted || !EmitFlushDirtyGprPins())
 			return false;
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();
