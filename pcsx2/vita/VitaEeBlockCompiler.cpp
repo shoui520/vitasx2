@@ -16584,14 +16584,16 @@ namespace VitaEE
 			if (!EmitGprLowOperand(guest_reg, HOST_TMP2, &guest_host))
 				return false;
 
-			if (!(m_code.EmitRsbImm32(HOST_TMP0, guest_host, constant) ||
-				  (m_code.EmitMovImm32(HOST_TMP0, constant) &&
-				   m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, guest_host))))
+			const unsigned result_reg = SelectGprLowResultHost(rd, HOST_TMP0);
+			bool result_done = m_code.EmitRsbImm32(result_reg, guest_host, constant);
+			if (!result_done)
 			{
-				return false;
+				const unsigned const_reg = (result_reg == guest_host) ? HOST_TMP0 : result_reg;
+				result_done = m_code.EmitMovImm32(const_reg, constant) &&
+							  m_code.EmitSubReg(result_reg, const_reg, guest_host);
 			}
 
-			return EmitStoreGprSignExtended32FromLow(rd, HOST_TMP0);
+			return result_done && EmitStoreGprSignExtended32FromLow(rd, result_reg);
 		};
 
 		if (rt == 0)
