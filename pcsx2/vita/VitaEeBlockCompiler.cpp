@@ -146,6 +146,7 @@ u32 g_qemuSigned64CompareCarryChains = 0;
 u32 g_qemuAndLowMaskBitfieldFastPaths = 0;
 u32 g_qemuNegativeHighCarryFastPaths = 0;
 u32 g_qemuReverseSubtractCarryImmediateFastPaths = 0;
+u32 g_qemuCarryModifiedImmediateFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -17357,14 +17358,18 @@ namespace VitaEE
 					g_qemuNegativeHighCarryFastPaths++;
 #endif
 			}
-			else if (constant_high <= 0xffu)
-			{
-				high_done = m_code.EmitAdcImm8(high_result, guest_high, static_cast<u8>(constant_high));
-			}
 			else
 			{
-				high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
-					m_code.EmitAdcReg(high_result, guest_high, HOST_TMP2);
+				high_done = m_code.EmitAdcImm32(high_result, guest_high, constant_high);
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (high_done && constant_high > 0xffu)
+					g_qemuCarryModifiedImmediateFastPaths++;
+#endif
+				if (!high_done)
+				{
+					high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
+						m_code.EmitAdcReg(high_result, guest_high, HOST_TMP2);
+				}
 			}
 			return high_done && EmitStoreGpr64(rd, low_result, high_result);
 		};
@@ -17484,14 +17489,18 @@ namespace VitaEE
 					g_qemuNegativeHighCarryFastPaths++;
 #endif
 			}
-			else if (constant_high <= 0xffu)
-			{
-				high_done = m_code.EmitSbcImm8(high_result, guest_high, static_cast<u8>(constant_high));
-			}
 			else
 			{
-				high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
-					m_code.EmitSbcReg(high_result, guest_high, HOST_TMP2);
+				high_done = m_code.EmitSbcImm32(high_result, guest_high, constant_high);
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (high_done && constant_high > 0xffu)
+					g_qemuCarryModifiedImmediateFastPaths++;
+#endif
+				if (!high_done)
+				{
+					high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
+						m_code.EmitSbcReg(high_result, guest_high, HOST_TMP2);
+				}
 			}
 			return high_done && EmitStoreGpr64(rd, low_result, high_result);
 		};
@@ -19178,8 +19187,16 @@ namespace VitaEE
 					compare_ok = m_code.EmitAdcImm8(result_reg, runtime_high, 0, true);
 				else if (compare_ok)
 				{
-					compare_ok = m_code.EmitMovImm32(HOST_TMP2, known_high) &&
-						m_code.EmitSbcReg(result_reg, runtime_high, HOST_TMP2, true);
+					compare_ok = m_code.EmitSbcImm32(result_reg, runtime_high, known_high, true);
+#if defined(VITASX2_QEMU_VALIDATION)
+					if (compare_ok)
+						g_qemuCarryModifiedImmediateFastPaths++;
+#endif
+					if (!compare_ok)
+					{
+						compare_ok = m_code.EmitMovImm32(HOST_TMP2, known_high) &&
+							m_code.EmitSbcReg(result_reg, runtime_high, HOST_TMP2, true);
+					}
 				}
 			}
 

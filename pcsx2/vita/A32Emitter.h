@@ -82,7 +82,9 @@ namespace VitaA32
 		bool EmitOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitOrrImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitAdcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+		bool EmitAdcImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitSbcImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+		bool EmitSbcImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitMovRegShiftImm(unsigned rd, unsigned rm, ShiftType shift, u8 amount, bool set_flags = false,
 			Condition condition = Condition::AL);
 		bool EmitMovRegShiftReg(unsigned rd, unsigned rm, ShiftType shift, unsigned rs, bool set_flags = false);
