@@ -702,7 +702,16 @@ namespace VitaA32
 
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
-			return false;
+		{
+			if (!EncodeModifiedImmediate(~value, &encoded))
+				return false;
+
+			// ADC x, value and SBC x, ~value are identical, including NZCV,
+			// because SBC subtracts both the complemented value and !carry.
+			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_SBC |
+						   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
+						   ((rd & 0xfu) << 12) | encoded);
+		}
 
 		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_ADC |
 					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
@@ -723,7 +732,16 @@ namespace VitaA32
 
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
-			return false;
+		{
+			if (!EncodeModifiedImmediate(~value, &encoded))
+				return false;
+
+			// The inverse ADC form preserves the SBC result and NZCV while
+			// allowing the complemented modified immediate.
+			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_ADC |
+						   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
+						   ((rd & 0xfu) << 12) | encoded);
+		}
 
 		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_SBC |
 					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |

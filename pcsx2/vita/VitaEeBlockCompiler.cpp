@@ -151,6 +151,7 @@ u32 g_qemuCarryModifiedImmediateFastPaths = 0;
 u32 g_qemuShift64FusedMergeFastPaths = 0;
 u32 g_qemuKnownVariableShiftImmediateFastPaths = 0;
 u32 g_qemuInverseFlagImmediateFastPaths = 0;
+u32 g_qemuInverseCarryImmediateFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -17361,28 +17362,25 @@ namespace VitaEE
 			if (!low_done)
 				return false;
 
-			bool high_done;
-			if (constant_high == 0xffffffffu)
-			{
-				// guest_high + 0xffffffff + carry == guest_high - !carry.
-				high_done = m_code.EmitSbcImm8(high_result, guest_high, 0);
+			bool high_done = m_code.EmitAdcImm32(high_result, guest_high, constant_high);
 #if defined(VITASX2_QEMU_VALIDATION)
-				if (high_done)
-					g_qemuNegativeHighCarryFastPaths++;
-#endif
+			if (high_done && constant_high == 0xffffffffu)
+				g_qemuNegativeHighCarryFastPaths++;
+			if (high_done && !CanEncodeA32ModifiedImmediate(constant_high) &&
+				CanEncodeA32ModifiedImmediate(~constant_high))
+			{
+				g_qemuInverseCarryImmediateFastPaths++;
 			}
-			else
+			if (high_done && constant_high > 0xffu &&
+				CanEncodeA32ModifiedImmediate(constant_high))
 			{
-				high_done = m_code.EmitAdcImm32(high_result, guest_high, constant_high);
-#if defined(VITASX2_QEMU_VALIDATION)
-				if (high_done && constant_high > 0xffu)
-					g_qemuCarryModifiedImmediateFastPaths++;
+				g_qemuCarryModifiedImmediateFastPaths++;
+			}
 #endif
-				if (!high_done)
-				{
-					high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
-						m_code.EmitAdcReg(high_result, guest_high, HOST_TMP2);
-				}
+			if (!high_done)
+			{
+				high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
+					m_code.EmitAdcReg(high_result, guest_high, HOST_TMP2);
 			}
 			return high_done && EmitStoreGpr64(rd, low_result, high_result);
 		};
@@ -17501,28 +17499,25 @@ namespace VitaEE
 			if (!low_done)
 				return false;
 
-			bool high_done;
-			if (constant_high == 0xffffffffu)
-			{
-				// guest_high - 0xffffffff - borrow == guest_high + carry.
-				high_done = m_code.EmitAdcImm8(high_result, guest_high, 0);
+			bool high_done = m_code.EmitSbcImm32(high_result, guest_high, constant_high);
 #if defined(VITASX2_QEMU_VALIDATION)
-				if (high_done)
-					g_qemuNegativeHighCarryFastPaths++;
-#endif
+			if (high_done && constant_high == 0xffffffffu)
+				g_qemuNegativeHighCarryFastPaths++;
+			if (high_done && !CanEncodeA32ModifiedImmediate(constant_high) &&
+				CanEncodeA32ModifiedImmediate(~constant_high))
+			{
+				g_qemuInverseCarryImmediateFastPaths++;
 			}
-			else
+			if (high_done && constant_high > 0xffu &&
+				CanEncodeA32ModifiedImmediate(constant_high))
 			{
-				high_done = m_code.EmitSbcImm32(high_result, guest_high, constant_high);
-#if defined(VITASX2_QEMU_VALIDATION)
-				if (high_done && constant_high > 0xffu)
-					g_qemuCarryModifiedImmediateFastPaths++;
+				g_qemuCarryModifiedImmediateFastPaths++;
+			}
 #endif
-				if (!high_done)
-				{
-					high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
-						m_code.EmitSbcReg(high_result, guest_high, HOST_TMP2);
-				}
+			if (!high_done)
+			{
+				high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
+					m_code.EmitSbcReg(high_result, guest_high, HOST_TMP2);
 			}
 			return high_done && EmitStoreGpr64(rd, low_result, high_result);
 		};
