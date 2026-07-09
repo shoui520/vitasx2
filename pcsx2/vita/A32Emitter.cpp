@@ -31,6 +31,7 @@ namespace VitaA32
 		constexpr u32 OPCODE_MVN = 0x01e00000u;
 		constexpr u32 OPCODE_ORR = 0x01800000u;
 		constexpr u32 OPCODE_RSB = 0x00600000u;
+		constexpr u32 OPCODE_RSC = 0x00e00000u;
 		constexpr u32 OPCODE_SUB = 0x00400000u;
 		constexpr u32 OPCODE_SBC = 0x00c00000u;
 		constexpr u32 OPCODE_BIC = 0x01c00000u;
@@ -560,6 +561,20 @@ namespace VitaA32
 			return false;
 
 		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_RSB |
+					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
+					   ((rd & 0xfu) << 12) | encoded);
+	}
+
+	bool CodeBuffer::EmitRscImm32(unsigned rd, unsigned rn, u32 value, bool set_flags)
+	{
+		if (!IsRegister(rd) || !IsRegister(rn))
+			return false;
+
+		u32 encoded = 0;
+		if (!EncodeModifiedImmediate(value, &encoded))
+			return false;
+
+		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_RSC |
 					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
 					   ((rd & 0xfu) << 12) | encoded);
 	}

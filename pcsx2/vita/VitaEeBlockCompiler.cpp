@@ -144,6 +144,8 @@ u32 g_qemuMmiHalfwordShuffleVectorOps = 0;
 u32 g_qemuMmiWordShuffleVectorOps = 0;
 u32 g_qemuSigned64CompareCarryChains = 0;
 u32 g_qemuAndLowMaskBitfieldFastPaths = 0;
+u32 g_qemuNegativeHighCarryFastPaths = 0;
+u32 g_qemuReverseSubtractCarryImmediateFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -17345,10 +17347,25 @@ namespace VitaEE
 				return false;
 			}
 
-			const bool high_done = (constant_high <= 0xffu) ?
-				m_code.EmitAdcImm8(high_result, guest_high, static_cast<u8>(constant_high)) :
-				(m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
-				 m_code.EmitAdcReg(high_result, guest_high, HOST_TMP2));
+			bool high_done;
+			if (constant_high == 0xffffffffu)
+			{
+				// guest_high + 0xffffffff + carry == guest_high - !carry.
+				high_done = m_code.EmitSbcImm8(high_result, guest_high, 0);
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (high_done)
+					g_qemuNegativeHighCarryFastPaths++;
+#endif
+			}
+			else if (constant_high <= 0xffu)
+			{
+				high_done = m_code.EmitAdcImm8(high_result, guest_high, static_cast<u8>(constant_high));
+			}
+			else
+			{
+				high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
+					m_code.EmitAdcReg(high_result, guest_high, HOST_TMP2);
+			}
 			return high_done && EmitStoreGpr64(rd, low_result, high_result);
 		};
 
@@ -17457,10 +17474,25 @@ namespace VitaEE
 				return false;
 			}
 
-			const bool high_done = (constant_high <= 0xffu) ?
-				m_code.EmitSbcImm8(high_result, guest_high, static_cast<u8>(constant_high)) :
-				(m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
-				 m_code.EmitSbcReg(high_result, guest_high, HOST_TMP2));
+			bool high_done;
+			if (constant_high == 0xffffffffu)
+			{
+				// guest_high - 0xffffffff - borrow == guest_high + carry.
+				high_done = m_code.EmitAdcImm8(high_result, guest_high, 0);
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (high_done)
+					g_qemuNegativeHighCarryFastPaths++;
+#endif
+			}
+			else if (constant_high <= 0xffu)
+			{
+				high_done = m_code.EmitSbcImm8(high_result, guest_high, static_cast<u8>(constant_high));
+			}
+			else
+			{
+				high_done = m_code.EmitMovImm32(HOST_TMP2, constant_high) &&
+					m_code.EmitSbcReg(high_result, guest_high, HOST_TMP2);
+			}
 			return high_done && EmitStoreGpr64(rd, low_result, high_result);
 		};
 
@@ -17480,14 +17512,21 @@ namespace VitaEE
 						   m_code.EmitSubReg(low_result, const_low, guest_low, true);
 			}
 
-			if (!low_done ||
-				!m_code.EmitMovImm32(HOST_TMP1, constant_high) ||
-				!m_code.EmitSbcReg(high_result, HOST_TMP1, guest_high))
-			{
+			if (!low_done)
 				return false;
+
+			bool high_done = m_code.EmitRscImm32(high_result, guest_high, constant_high);
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (high_done)
+				g_qemuReverseSubtractCarryImmediateFastPaths++;
+#endif
+			if (!high_done)
+			{
+				high_done = m_code.EmitMovImm32(HOST_TMP1, constant_high) &&
+					m_code.EmitSbcReg(high_result, HOST_TMP1, guest_high);
 			}
 
-			return EmitStoreGpr64(rd, low_result, high_result);
+			return high_done && EmitStoreGpr64(rd, low_result, high_result);
 		};
 
 		if (rt == 0)
@@ -17518,11 +17557,15 @@ namespace VitaEE
 
 			const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
 			const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
-			const unsigned high_zero = (high_result == rt_high) ? HOST_TMP1 : high_result;
-			return m_code.EmitRsbImm32(low_result, rt_low, 0, true) &&
-				   m_code.EmitMovImm8(high_zero, 0) &&
-				   m_code.EmitSbcReg(high_result, high_zero, rt_high) &&
-				   EmitStoreGpr64(rd, low_result, high_result);
+			if (!m_code.EmitRsbImm32(low_result, rt_low, 0, true) ||
+				!m_code.EmitRscImm32(high_result, rt_high, 0))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuReverseSubtractCarryImmediateFastPaths++;
+#endif
+			return EmitStoreGpr64(rd, low_result, high_result);
 		}
 
 		u32 rs_low_value = 0;
