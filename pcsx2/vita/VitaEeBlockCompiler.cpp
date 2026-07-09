@@ -82,6 +82,7 @@ u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
 u32 g_qemuGprConstHighWordLoadFastPaths = 0;
+u32 g_qemuGprConstRegisterJumpTargets = 0;
 u32 g_qemuWaitLoopFastForwardBlocks = 0;
 u32 g_qemuScalarZeroLoadSkips = 0;
 u32 g_qemuPartialZeroLoadSkips = 0;
@@ -4498,6 +4499,7 @@ namespace VitaEE
 		bool has_branch = false;
 		bool has_register_branch_target = false;
 		bool has_static_direct_link_target = false;
+		bool has_static_register_branch_target = false;
 		bool has_static_conditional_direct_links = false;
 		bool has_static_likely_direct_links = false;
 		bool branch_is_likely = false;
@@ -4511,6 +4513,36 @@ namespace VitaEE
 		const auto set_static_branch_link = [&](u32 target_pc) {
 			has_static_direct_link_target = true;
 			static_direct_link_target_pc = target_pc;
+		};
+		const auto try_emit_static_register_branch = [&](u32 branch_op, u32 branch_pc, bool link,
+			bool* handled) {
+			u32 known_target_pc = 0;
+			if (!TryGetKnownGprLow(RS(branch_op), &known_target_pc))
+			{
+				*handled = false;
+				return true;
+			}
+
+			// PCSX2 owners: Interpreter.cpp::JR()/JALR() and
+			// x86/ix86-32/iR5900Jump.cpp::recJR()/recJALR(). When the low
+			// target word is block-known, snapshot it here and use the same
+			// static direct-link tail as J/JAL instead of burning an indirect
+			// register-lookup exit on Cortex-A9.
+			if (EmuConfig.Gamefixes.GoemonTlbHack)
+				known_target_pc = vtlb_V2P(known_target_pc);
+			branch_target_pc = known_target_pc;
+			set_static_branch_link(known_target_pc);
+			has_static_register_branch_target = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprConstRegisterJumpTargets++;
+#endif
+
+			const unsigned rd = RD(branch_op);
+			if (link && rd != 0 && !EmitLink(rd, branch_pc))
+				return false;
+
+			*handled = true;
+			return true;
 		};
 		const auto add_raw_cycles = [&raw_cycles](u32 op) {
 			// PCSX2's x86 recRecompile() gives NOP a fixed 9-cycle raw cost before
@@ -4574,15 +4606,29 @@ namespace VitaEE
 						switch (op & 0x3f)
 						{
 							case 0x08:
+							{
+								bool handled = false;
+								if (!try_emit_static_register_branch(op, pc, false, &handled))
+									return false;
+								if (handled)
+									break;
 								has_register_branch_target = true;
 								if (!EmitJR(op, pc))
 									return false;
 								break;
+							}
 							case 0x09:
+							{
+								bool handled = false;
+								if (!try_emit_static_register_branch(op, pc, true, &handled))
+									return false;
+								if (handled)
+									break;
 								has_register_branch_target = true;
 								if (!EmitJALR(op, pc))
 									return false;
 								break;
+							}
 							default:
 								return false;
 						}
@@ -4923,10 +4969,13 @@ namespace VitaEE
 		// natively. The loop head may sit in earlier A32 blocks (counter-read
 		// loads split blocks here, unlike PCSX2's x86 blocks), so the scan
 		// covers [taken target, block end). Goemon's physical direct-link
-		// targets are excluded so the virtual target compare stays exact.
+		// targets are excluded so the virtual target compare stays exact. Known
+		// register targets still direct-link, but stay out of this J/JAL/branch
+		// fast-forward path unless PCSX2's SetBranchReg timing is proven equal.
 		const bool wait_loop_body = EmuConfig.Speedhacks.WaitLoop &&
 			!EmuConfig.Gamefixes.GoemonTlbHack &&
 			has_branch && !has_register_branch_target &&
+			!has_static_register_branch_target &&
 			branch_instruction_index + 2 == instruction_count &&
 			branch_target_pc <= start_pc &&
 			IsWaitLoopBody(branch_target_pc, next_pc,
@@ -17202,9 +17251,8 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitJump(u32 pc, bool link)
 	{
-		if (!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1))
-			return false;
-
+		// J/JAL always exit through static direct-link metadata; HOST_BRANCH_FLAG
+		// is only consumed by conditional and likely branch tails.
 		if (!link)
 			return true;
 
