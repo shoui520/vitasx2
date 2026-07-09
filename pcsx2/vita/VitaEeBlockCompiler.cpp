@@ -3514,6 +3514,15 @@ namespace VitaEE
 		return static_cast<unsigned>(pin_host);
 	}
 
+	unsigned BlockCompiler::SelectGprHighResultHost(unsigned guest_reg, unsigned fallback_host)
+	{
+		const int pin_host = FindGprPinHighHost(guest_reg);
+		if (pin_host < 0)
+			return fallback_host;
+
+		return static_cast<unsigned>(pin_host);
+	}
+
 	bool BlockCompiler::TryGetKnownEffectiveAddress(u32 op, u32* address) const
 	{
 		const unsigned rs = RS(op);
@@ -16893,11 +16902,17 @@ namespace VitaEE
 		unsigned rt_low;
 		unsigned rs_high;
 		unsigned rt_high;
-		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
-			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
-			   m_code.EmitAndReg(HOST_TMP0, rs_low, rt_low) &&
-			   m_code.EmitAndReg(HOST_TMP1, rs_high, rt_high) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) ||
+			!EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high))
+		{
+			return false;
+		}
+
+		const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
+		return m_code.EmitAndReg(low_result, rs_low, rt_low) &&
+			   m_code.EmitAndReg(high_result, rs_high, rt_high) &&
+			   EmitStoreGpr64(rd, low_result, high_result);
 	}
 
 	bool BlockCompiler::EmitOR(u32 op)
@@ -16992,11 +17007,17 @@ namespace VitaEE
 		unsigned rt_low;
 		unsigned rs_high;
 		unsigned rt_high;
-		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
-			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
-			   m_code.EmitOrrReg(HOST_TMP0, rs_low, rt_low) &&
-			   m_code.EmitOrrReg(HOST_TMP1, rs_high, rt_high) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) ||
+			!EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high))
+		{
+			return false;
+		}
+
+		const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
+		return m_code.EmitOrrReg(low_result, rs_low, rt_low) &&
+			   m_code.EmitOrrReg(high_result, rs_high, rt_high) &&
+			   EmitStoreGpr64(rd, low_result, high_result);
 	}
 
 	bool BlockCompiler::EmitXOR(u32 op)
@@ -17085,11 +17106,17 @@ namespace VitaEE
 		unsigned rt_low;
 		unsigned rs_high;
 		unsigned rt_high;
-		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
-			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
-			   m_code.EmitEorReg(HOST_TMP0, rs_low, rt_low) &&
-			   m_code.EmitEorReg(HOST_TMP1, rs_high, rt_high) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) ||
+			!EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high))
+		{
+			return false;
+		}
+
+		const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
+		return m_code.EmitEorReg(low_result, rs_low, rt_low) &&
+			   m_code.EmitEorReg(high_result, rs_high, rt_high) &&
+			   EmitStoreGpr64(rd, low_result, high_result);
 	}
 
 	bool BlockCompiler::EmitNOR(u32 op)
@@ -17104,19 +17131,21 @@ namespace VitaEE
 		// PCSX2 owner: R5900OpcodeImpl.cpp::NOR() assigns only UD[0].
 		if (rs == 0 && rt == 0)
 		{
-			return m_code.EmitMovImm32(HOST_TMP0, 0xffffffffu) &&
-				   m_code.EmitMovImm32(HOST_TMP1, 0xffffffffu) &&
-				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+			return EmitStoreKnown64(rd, 0xffffffffu, 0xffffffffu);
 		}
 		if (rs == 0 || rt == 0 || rs == rt)
 		{
 			const unsigned src = (rs == 0) ? rt : rs;
 			unsigned src_low;
 			unsigned src_high;
-			return EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high) &&
-				   m_code.EmitMvnReg(HOST_TMP0, src_low) &&
-				   m_code.EmitMvnReg(HOST_TMP1, src_high) &&
-				   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+			if (!EmitGpr64ReadOperands(src, HOST_TMP0, HOST_TMP1, &src_low, &src_high))
+				return false;
+
+			const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+			const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
+			return m_code.EmitMvnReg(low_result, src_low) &&
+				   m_code.EmitMvnReg(high_result, src_high) &&
+				   EmitStoreGpr64(rd, low_result, high_result);
 		}
 
 		u32 rs_low_value = 0;
@@ -17176,13 +17205,19 @@ namespace VitaEE
 		unsigned rt_low;
 		unsigned rs_high;
 		unsigned rt_high;
-		return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
-			   EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high) &&
-			   m_code.EmitOrrReg(HOST_TMP0, rs_low, rt_low) &&
-			   m_code.EmitOrrReg(HOST_TMP1, rs_high, rt_high) &&
-			   m_code.EmitMvnReg(HOST_TMP0, HOST_TMP0) &&
-			   m_code.EmitMvnReg(HOST_TMP1, HOST_TMP1) &&
-			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
+		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) ||
+			!EmitGpr64ReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high))
+		{
+			return false;
+		}
+
+		const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
+		return m_code.EmitOrrReg(low_result, rs_low, rt_low) &&
+			   m_code.EmitOrrReg(high_result, rs_high, rt_high) &&
+			   m_code.EmitMvnReg(low_result, low_result) &&
+			   m_code.EmitMvnReg(high_result, high_result) &&
+			   EmitStoreGpr64(rd, low_result, high_result);
 	}
 
 	bool BlockCompiler::EmitSLT(u32 op)
