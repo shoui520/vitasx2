@@ -527,6 +527,7 @@ namespace VitaEE
 		bool EmitStoreKnown64(unsigned guest_reg, u32 low, u32 high);
 		void UpdateCop1NormalizedStateAfterOpcode(u32 op);
 		bool TryGetKnownEffectiveAddress(u32 op, u32* address) const;
+		bool BlockNeedsResidentVtlbRegisters(u32 start_pc, u32 instruction_count);
 		enum class KnownVtlbFastPathKind : u8
 		{
 			Scalar,
@@ -535,16 +536,16 @@ namespace VitaEE
 			Cop2,
 			Partial,
 		};
-			bool TryEmitKnownVtlbNonHandlerHostAddress(u32 guest_addr, unsigned host_reg,
-				KnownVtlbFastPathKind kind = KnownVtlbFastPathKind::Scalar);
-			void UpdateGprConstStateAfterOpcode(u32 op, u32 pc);
-			void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
-				bool allow_r10, bool allow_r11, bool prefer_dirty_writes);
-			bool BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const;
-			bool EmitGprPinLoads();
-			bool EmitFlushDirtyGprPins();
-			bool EmitSyncGprPinsToBacking();
-			int FindGprPinIndex(unsigned guest_reg) const;
+		bool TryEmitKnownVtlbNonHandlerHostAddress(u32 guest_addr, unsigned host_reg,
+			KnownVtlbFastPathKind kind = KnownVtlbFastPathKind::Scalar);
+		void UpdateGprConstStateAfterOpcode(u32 op, u32 pc);
+		void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
+			bool allow_r10, bool allow_r11, bool prefer_dirty_writes);
+		bool BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const;
+		bool EmitGprPinLoads();
+		bool EmitFlushDirtyGprPins();
+		bool EmitSyncGprPinsToBacking();
+		int FindGprPinIndex(unsigned guest_reg) const;
 		int FindGprPinHost(unsigned guest_reg) const;
 		int FindGprPinHighHost(unsigned guest_reg) const;
 		bool TryDeferGprPinLowStore(unsigned guest_reg);

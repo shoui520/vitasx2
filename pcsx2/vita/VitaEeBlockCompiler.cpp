@@ -110,6 +110,7 @@ u32 g_qemuKnownVtlbQwordFastPaths = 0;
 u32 g_qemuKnownVtlbCop1FastPaths = 0;
 u32 g_qemuKnownVtlbCop2FastPaths = 0;
 u32 g_qemuKnownVtlbPartialFastPaths = 0;
+u32 g_qemuKnownVtlbRegisterlessBlocks = 0;
 u32 g_qemuCop1NormalizedOperandSkips = 0;
 u32 g_qemuGprQCacheBlocks = 0;
 u32 g_qemuGprQCacheHits = 0;
@@ -2448,15 +2449,89 @@ namespace VitaEE
 		}
 	}
 
-	bool BlockMayUseVtlbFastPath(u32 start_pc, u32 instruction_count)
+	bool KnownVtlbNonHandlerAddress(u32 guest_addr)
 	{
-		for (u32 i = 0; i < instruction_count; i++)
-		{
-			if (OpcodeMayUseVtlbFastPath(memRead32(start_pc + i * 4)))
-				return true;
-		}
+		if (!vtlb_private::vtlbdata.vmap)
+			return false;
 
-		return false;
+		const vtlb_private::VTLBVirtual vmv =
+			vtlb_private::vtlbdata.vmap[guest_addr >> vtlb_private::VTLB_PAGE_BITS];
+		return !vmv.isHandler(guest_addr);
+	}
+
+	bool KnownAddressUsesCounterReadEvent(u32 guest_addr)
+	{
+		return (guest_addr & 0xffffe000u) == 0x10000000u;
+	}
+
+	bool OpcodeUsesKnownVtlbNonHandlerAddress(u32 op, u32 known_address)
+	{
+		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*().
+		// Mirror the known-address direct paths below so blocks that only emit
+		// vmv.assumePtr() references don't reserve or load runtime VTLB bases.
+		switch (op >> 26)
+		{
+			case 0x1a: // LDL
+			case 0x1b: // LDR
+			case 0x2c: // SDL
+			case 0x2d: // SDR
+				return KnownVtlbNonHandlerAddress(known_address & ~7u);
+
+			case 0x1e: // LQ
+			case 0x1f: // SQ
+				return KnownVtlbNonHandlerAddress(known_address & ~0x0fu);
+
+			case 0x20: // LB
+			case 0x24: // LBU
+				return !KnownAddressUsesCounterReadEvent(known_address) &&
+					   KnownVtlbNonHandlerAddress(known_address);
+
+			case 0x21: // LH
+			case 0x25: // LHU
+				return (known_address & 1u) == 0 &&
+					   !KnownAddressUsesCounterReadEvent(known_address) &&
+					   KnownVtlbNonHandlerAddress(known_address);
+
+			case 0x22: // LWL
+			case 0x26: // LWR
+			case 0x2a: // SWL
+			case 0x2e: // SWR
+				return KnownVtlbNonHandlerAddress(known_address & ~3u);
+
+			case 0x23: // LW
+				return (known_address & 3u) == 0 &&
+					   !KnownAddressUsesCounterReadEvent(known_address) &&
+					   KnownVtlbNonHandlerAddress(known_address);
+
+			case 0x27: // LWU
+				return (known_address & 3u) == 0 &&
+					   KnownVtlbNonHandlerAddress(known_address);
+
+			case 0x28: // SB
+				return KnownVtlbNonHandlerAddress(known_address);
+
+			case 0x29: // SH
+				return (known_address & 1u) == 0 &&
+					   KnownVtlbNonHandlerAddress(known_address);
+
+			case 0x2b: // SW
+			case 0x31: // LWC1
+			case 0x39: // SWC1
+				return (known_address & 3u) == 0 &&
+					   KnownVtlbNonHandlerAddress(known_address);
+
+			case 0x36: // LQC2
+			case 0x3e: // SQC2
+				return KnownVtlbNonHandlerAddress(known_address);
+
+			case 0x37: // LD
+			case 0x3f: // SD
+				return (known_address & 7u) == 0 &&
+					   KnownVtlbNonHandlerAddress(known_address);
+
+			default:
+				return false;
+		}
 	}
 
 	namespace
@@ -3348,6 +3423,39 @@ namespace VitaEE
 		}
 #endif
 		return m_code.EmitMovImm32(host_reg, static_cast<u32>(vmv.assumePtr(guest_addr)));
+	}
+
+	bool BlockCompiler::BlockNeedsResidentVtlbRegisters(u32 start_pc, u32 instruction_count)
+	{
+		bool saw_vtlb_opcode = false;
+		ClearGprConstState();
+
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 pc = start_pc + i * 4;
+			const u32 op = memRead32(pc);
+			if (OpcodeMayUseVtlbFastPath(op))
+			{
+				saw_vtlb_opcode = true;
+
+				u32 known_address = 0;
+				if (!TryGetKnownEffectiveAddress(op, &known_address) ||
+					!OpcodeUsesKnownVtlbNonHandlerAddress(op, known_address))
+				{
+					ClearGprConstState();
+					return true;
+				}
+			}
+
+			UpdateGprConstStateAfterOpcode(op, pc);
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (saw_vtlb_opcode)
+			g_qemuKnownVtlbRegisterlessBlocks++;
+#endif
+		ClearGprConstState();
+		return false;
 	}
 
 	void BlockCompiler::UpdateGprConstStateAfterOpcode(u32 op, u32 pc)
@@ -4548,7 +4656,7 @@ namespace VitaEE
 
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() read
 		// these stable pointers from vtlbdata for every access. Keep them
-		// resident for EE A32 blocks that actually emit VTLB fast paths.
+		// resident only for blocks that emit runtime VTLB translation.
 		return !use_vtlb_registers ||
 			   (m_code.EmitMovImm32(HOST_VTLB_VMAP,
 				   static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.vmap))) &&
@@ -4569,7 +4677,7 @@ namespace VitaEE
 		if (direct_links)
 			*direct_links = {};
 
-		const bool use_vtlb_registers = BlockMayUseVtlbFastPath(start_pc, instruction_count);
+		const bool use_vtlb_registers = BlockNeedsResidentVtlbRegisters(start_pc, instruction_count);
 		const bool use_cop1_exponent_mask_register =
 			BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count);
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
