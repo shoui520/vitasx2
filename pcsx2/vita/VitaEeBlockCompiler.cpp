@@ -19826,6 +19826,8 @@ namespace VitaEE
 	{
 		if (word == 0)
 			return EmitLoadGprLow(guest_reg, host_reg);
+		if (word == 1)
+			return EmitLoadGprHigh(guest_reg, host_reg);
 
 		if (guest_reg == 0)
 			return m_code.EmitMovImm8(host_reg, 0);
@@ -19845,6 +19847,21 @@ namespace VitaEE
 	{
 		if (word == 0)
 			return EmitGprLowOperand(guest_reg, fallback_host, operand_host);
+		if (word == 1)
+		{
+			const int high_pin_host = FindGprPinHighHost(guest_reg);
+			if (high_pin_host >= 0)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuGprPinnedHighWordHits++;
+#endif
+				*operand_host = static_cast<unsigned>(high_pin_host);
+				return true;
+			}
+
+			*operand_host = fallback_host;
+			return EmitLoadGprHigh(guest_reg, fallback_host);
+		}
 
 		*operand_host = fallback_host;
 		if (guest_reg == 0)
