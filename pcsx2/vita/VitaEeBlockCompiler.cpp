@@ -10627,7 +10627,7 @@ namespace VitaEE
 
 		const auto emit_unsigned_shift_subtract_divide =
 			[this, emit_branch, patch_branch, patch_branches](unsigned dividend_reg, unsigned divisor_reg,
-				unsigned quotient_reg, unsigned remainder_reg, unsigned scratch_reg) {
+				unsigned quotient_reg, unsigned remainder_reg) {
 				BranchPatch below_branch{};
 				BranchPatch equal_branch{};
 				BranchPatch done_branches[2]{};
@@ -10642,14 +10642,14 @@ namespace VitaEE
 					return false;
 				}
 
-				if (!m_code.EmitClz(scratch_reg, divisor_reg) ||
-					!m_code.EmitClz(quotient_reg, dividend_reg) ||
-					!m_code.EmitSubReg(scratch_reg, scratch_reg, quotient_reg) ||
+				if (!m_code.EmitClz(quotient_reg, divisor_reg) ||
+					!m_code.EmitClz(dividend_reg, dividend_reg) ||
+					!m_code.EmitSubReg(quotient_reg, quotient_reg, dividend_reg) ||
 					!m_code.EmitMovRegShiftReg(dividend_reg, divisor_reg,
-						VitaA32::ShiftType::LSL, scratch_reg) ||
+						VitaA32::ShiftType::LSL, quotient_reg) ||
 					!m_code.EmitMovImm8(divisor_reg, 1) ||
 					!m_code.EmitMovRegShiftReg(divisor_reg, divisor_reg,
-						VitaA32::ShiftType::LSL, scratch_reg) ||
+						VitaA32::ShiftType::LSL, quotient_reg) ||
 					!m_code.EmitMovImm8(quotient_reg, 0))
 				{
 					return false;
@@ -10848,16 +10848,13 @@ namespace VitaEE
 			// trunc-toward-zero result as PCSX2's R5900OpcodeImpl.cpp/MMI.cpp
 			// helpers by dividing absolute values and restoring the signs.
 			if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::ASR, 31) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
-				!m_code.EmitEorReg(HOST_TMP4, HOST_TMP4, HOST_TMP5) ||
-				!m_code.EmitPush(static_cast<u16>(1u << HOST_TMP4)) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
+				!m_code.EmitEorReg(HOST_TMP4, HOST_TMP2, HOST_TMP5) ||
 				!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
 				!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1, VitaA32::ShiftType::ASR, 31) ||
-				!m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
-				!m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
-				!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1, HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
-				!m_code.EmitPop(static_cast<u16>(1u << HOST_TMP4)) ||
+				!m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
+				!m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
+				!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1, HOST_TMP2, HOST_TMP3) ||
 				!m_code.EmitEorReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
 				!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
 				!m_code.EmitEorReg(HOST_TMP3, HOST_TMP3, HOST_TMP5) ||
@@ -10868,7 +10865,7 @@ namespace VitaEE
 				return false;
 			}
 		}
-		else if (!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1, HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
+		else if (!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1, HOST_TMP2, HOST_TMP3) ||
 				 !store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
 				 !store_signed_word_as_doubleword(HOST_TMP3, hi_offset))
 		{
@@ -11617,7 +11614,7 @@ namespace VitaEE
 
 		const auto emit_unsigned_shift_subtract_divide =
 			[&](unsigned dividend_reg, unsigned divisor_reg,
-				unsigned quotient_reg, unsigned remainder_reg, unsigned scratch_reg) {
+				unsigned quotient_reg, unsigned remainder_reg) {
 				BranchPatch below_branch{};
 				BranchPatch equal_branch{};
 				BranchPatch done_branches[2]{};
@@ -11633,14 +11630,14 @@ namespace VitaEE
 					return false;
 				}
 
-				if (!m_code.EmitClz(scratch_reg, divisor_reg) ||
-					!m_code.EmitClz(quotient_reg, dividend_reg) ||
-					!m_code.EmitSubReg(scratch_reg, scratch_reg, quotient_reg) ||
+				if (!m_code.EmitClz(quotient_reg, divisor_reg) ||
+					!m_code.EmitClz(dividend_reg, dividend_reg) ||
+					!m_code.EmitSubReg(quotient_reg, quotient_reg, dividend_reg) ||
 					!m_code.EmitMovRegShiftReg(dividend_reg, divisor_reg,
-						VitaA32::ShiftType::LSL, scratch_reg) ||
+						VitaA32::ShiftType::LSL, quotient_reg) ||
 					!m_code.EmitMovImm8(divisor_reg, 1) ||
 					!m_code.EmitMovRegShiftReg(divisor_reg, divisor_reg,
-						VitaA32::ShiftType::LSL, scratch_reg) ||
+						VitaA32::ShiftType::LSL, quotient_reg) ||
 					!m_code.EmitMovImm8(quotient_reg, 0))
 				{
 					return false;
@@ -11692,7 +11689,7 @@ namespace VitaEE
 					!m_code.EmitCmpImm32(HOST_TMP1, 0) ||
 					!emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
 					!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1,
-						HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
+						HOST_TMP2, HOST_TMP3) ||
 					!store_signed_word_as_doubleword(HOST_TMP2, lo_offset) ||
 					!store_signed_word_as_doubleword(HOST_TMP3, hi_offset) ||
 					!emit_branch(done_branch, VitaA32::Condition::AL))
@@ -11733,19 +11730,15 @@ namespace VitaEE
 				// quotient/remainder signs in generated A32.
 				if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0,
 						VitaA32::ShiftType::ASR, 31) ||
-					!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1,
+					!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1,
 						VitaA32::ShiftType::ASR, 31) ||
-					!m_code.EmitEorReg(HOST_TMP4, HOST_TMP4, HOST_TMP5) ||
-					!m_code.EmitPush(static_cast<u16>(1u << HOST_TMP4)) ||
+					!m_code.EmitEorReg(HOST_TMP4, HOST_TMP2, HOST_TMP5) ||
 					!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
 					!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
-					!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1,
-						VitaA32::ShiftType::ASR, 31) ||
-					!m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
-					!m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+					!m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
+					!m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
 					!emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1,
-						HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
-					!m_code.EmitPop(static_cast<u16>(1u << HOST_TMP4)) ||
+						HOST_TMP2, HOST_TMP3) ||
 					!m_code.EmitEorReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
 					!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
 					!m_code.EmitEorReg(HOST_TMP3, HOST_TMP3, HOST_TMP5) ||
@@ -12441,8 +12434,7 @@ namespace VitaEE
 
           const auto emit_unsigned_shift_subtract_divide =
               [&](unsigned dividend_reg, unsigned divisor_reg,
-                  unsigned quotient_reg, unsigned remainder_reg,
-                  unsigned scratch_reg) {
+                  unsigned quotient_reg, unsigned remainder_reg) {
                 BranchPatch below_branch{};
                 BranchPatch equal_branch{};
                 BranchPatch done_branches[2]{};
@@ -12457,15 +12449,15 @@ namespace VitaEE
                   return false;
                 }
 
-                if (!m_code.EmitClz(scratch_reg, divisor_reg) ||
-                    !m_code.EmitClz(quotient_reg, dividend_reg) ||
-                    !m_code.EmitSubReg(scratch_reg, scratch_reg,
-                        quotient_reg) ||
+                if (!m_code.EmitClz(quotient_reg, divisor_reg) ||
+                    !m_code.EmitClz(dividend_reg, dividend_reg) ||
+                    !m_code.EmitSubReg(quotient_reg, quotient_reg,
+                        dividend_reg) ||
                     !m_code.EmitMovRegShiftReg(dividend_reg, divisor_reg,
-                        VitaA32::ShiftType::LSL, scratch_reg) ||
+                        VitaA32::ShiftType::LSL, quotient_reg) ||
                     !m_code.EmitMovImm8(divisor_reg, 1) ||
                     !m_code.EmitMovRegShiftReg(divisor_reg, divisor_reg,
-                        VitaA32::ShiftType::LSL, scratch_reg) ||
+                        VitaA32::ShiftType::LSL, quotient_reg) ||
                     !m_code.EmitMovImm8(quotient_reg, 0)) {
                   return false;
                 }
@@ -12538,19 +12530,15 @@ namespace VitaEE
             // HI receiving the signed remainder as a 32-bit lane.
             if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0,
                     VitaA32::ShiftType::ASR, 31) ||
-                !m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1,
+                !m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1,
                     VitaA32::ShiftType::ASR, 31) ||
-                !m_code.EmitEorReg(HOST_TMP4, HOST_TMP4, HOST_TMP5) ||
-                !m_code.EmitPush(static_cast<u16>(1u << HOST_TMP4)) ||
+                !m_code.EmitEorReg(HOST_TMP4, HOST_TMP2, HOST_TMP5) ||
                 !m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
                 !m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP5) ||
-                !m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP1,
-                    VitaA32::ShiftType::ASR, 31) ||
-                !m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
-                !m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+                !m_code.EmitEorReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
+                !m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) ||
                 !emit_unsigned_shift_subtract_divide(HOST_TMP0, HOST_TMP1,
-                    HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
-                !m_code.EmitPop(static_cast<u16>(1u << HOST_TMP4)) ||
+                    HOST_TMP2, HOST_TMP3) ||
                 !m_code.EmitEorReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
                 !m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
                 !m_code.EmitEorReg(HOST_TMP3, HOST_TMP3, HOST_TMP5) ||
