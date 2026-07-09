@@ -15880,14 +15880,15 @@ namespace VitaEE
 			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
 		{
 			unsigned rt_low;
-			if (!EmitGpr64ValueOperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low))
+			unsigned rt_high;
+			if (!EmitGpr64ValueReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high))
 				return false;
 
-			if (rt_low == HOST_TMP2)
+			if (rt_low == HOST_TMP2 && rt_high == HOST_TMP3)
 				return m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_TMP0, 0);
 
 			return m_code.EmitStrImm12(rt_low, HOST_TMP0, 0) &&
-				   m_code.EmitStrImm12(HOST_TMP3, HOST_TMP0, static_cast<u16>(sizeof(u32)));
+				   m_code.EmitStrImm12(rt_high, HOST_TMP0, static_cast<u16>(sizeof(u32)));
 		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
@@ -15903,22 +15904,23 @@ namespace VitaEE
 			return false;
 
 		unsigned rt_low;
+		unsigned rt_high;
 		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
-			!EmitGpr64ValueOperandLow(rt, HOST_TMP2, HOST_TMP3, &rt_low))
+			!EmitGpr64ValueReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high))
 		{
 			return false;
 		}
 
 		// PCSX2 owner: R5900OpcodeImpl.cpp::SD() via vtlb_memWrite64().
 		// Unpinned values stay in r2/r3 so Cortex-A9 can issue one STRD;
-		// pinned low words skip the load and store as two scalar words.
-		if (rt_low == HOST_TMP2)
+		// pinned low/high words skip the loads and store as two scalar words.
+		if (rt_low == HOST_TMP2 && rt_high == HOST_TMP3)
 		{
 			if (!m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_TMP0, 0))
 				return false;
 		}
 		else if (!m_code.EmitStrImm12(rt_low, HOST_TMP0, 0) ||
-				 !m_code.EmitStrImm12(HOST_TMP3, HOST_TMP0, static_cast<u16>(sizeof(u32))))
+				 !m_code.EmitStrImm12(rt_high, HOST_TMP0, static_cast<u16>(sizeof(u32))))
 		{
 			return false;
 		}
@@ -20253,18 +20255,30 @@ namespace VitaEE
 		return EmitLoadGpr64KnownValue(guest_reg, host_low, host_high, value_known, low, high);
 	}
 
-	bool BlockCompiler::EmitGpr64ValueOperandLow(unsigned guest_reg, unsigned fallback_low,
-		unsigned host_high, unsigned* low_operand_host)
+	bool BlockCompiler::EmitGpr64ValueReadOperands(unsigned guest_reg, unsigned fallback_low,
+		unsigned fallback_high, unsigned* low_operand_host, unsigned* high_operand_host)
 	{
 		const int pin_host = FindGprPinHost(guest_reg);
 		if (pin_host >= 0)
 		{
 			*low_operand_host = static_cast<unsigned>(pin_host);
-			return EmitLoadGprHigh(guest_reg, host_high);
+			const int high_pin_host = FindGprPinHighHost(guest_reg);
+			if (high_pin_host >= 0)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuGprPinHighReadOperands++;
+#endif
+				*high_operand_host = static_cast<unsigned>(high_pin_host);
+				return true;
+			}
+
+			*high_operand_host = fallback_high;
+			return EmitLoadGprHigh(guest_reg, fallback_high);
 		}
 
 		*low_operand_host = fallback_low;
-		return EmitLoadGpr64Value(guest_reg, fallback_low, host_high);
+		*high_operand_host = fallback_high;
+		return EmitLoadGpr64Value(guest_reg, fallback_low, fallback_high);
 	}
 
 	bool BlockCompiler::EmitLoadGprLow(unsigned guest_reg, unsigned host_reg)

@@ -604,8 +604,8 @@ namespace VitaEE
 		bool EmitLoadGpr64KnownValue(unsigned guest_reg, unsigned host_low, unsigned host_high,
 			bool value_known, u32 low, u32 high);
 		bool EmitLoadGpr64Value(unsigned guest_reg, unsigned host_low, unsigned host_high);
-		bool EmitGpr64ValueOperandLow(unsigned guest_reg, unsigned fallback_low, unsigned host_high,
-			unsigned* low_operand_host);
+		bool EmitGpr64ValueReadOperands(unsigned guest_reg, unsigned fallback_low, unsigned fallback_high,
+			unsigned* low_operand_host, unsigned* high_operand_host);
 		bool EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 		bool EmitLoadGprQ128(unsigned guest_reg, unsigned qreg, unsigned address_scratch);
