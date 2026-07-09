@@ -1259,11 +1259,11 @@ namespace VitaA32
 		return EmitU32(EncodeVmovCoreToS(sd, rt));
 	}
 
-	bool CodeBuffer::EmitVmovSToCore(unsigned rt, unsigned sd)
+	bool CodeBuffer::EmitVmovSToCore(unsigned rt, unsigned sd, Condition condition)
 	{
 		if (!IsRegister(rt) || !IsSRegister(sd))
 			return false;
-		return EmitU32(EncodeVmovSToCore(rt, sd));
+		return EmitU32(EncodeVmovSToCore(rt, sd, condition));
 	}
 
 	bool CodeBuffer::EmitVmovCorePairToD(unsigned dd, unsigned rt, unsigned rt2)
@@ -2589,11 +2589,12 @@ namespace VitaA32
 		return VMOV_CORE_TO_S | ((rt & 0xfu) << 12) | VfpSn(sd);
 	}
 
-	u32 EncodeVmovSToCore(unsigned rt, unsigned sd)
+	u32 EncodeVmovSToCore(unsigned rt, unsigned sd, Condition condition)
 	{
 		pxAssert(IsRegister(rt));
 		pxAssert(IsSRegister(sd));
-		return VMOV_S_TO_CORE | ((rt & 0xfu) << 12) | VfpSn(sd);
+		return (VMOV_S_TO_CORE & 0x0fffffffu) | CondBits(condition) |
+			((rt & 0xfu) << 12) | VfpSn(sd);
 	}
 
 	u32 EncodeVmovCorePairToD(unsigned dd, unsigned rt, unsigned rt2)

@@ -157,6 +157,7 @@ u32 g_qemuConditionalMovePredicatedRegisterCopies = 0;
 u32 g_qemuConditionalMovePredicatedKnownCopies = 0;
 u32 g_qemuConditionalMovePredicatedBackingCopies = 0;
 u32 g_qemuConditionalMovePredicatedMixedCopies = 0;
+u32 g_qemuConditionalMovePredicatedQCacheCopies = 0;
 #endif
 
 namespace VitaEE
@@ -18707,7 +18708,21 @@ namespace VitaEE
 				u32 rs_low_value = 0;
 				u32 rs_high_value = 0;
 				const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
-				if (rs_known && IsSingleInstructionA32MoveConstant(rs_low_value) &&
+				const int rs_qcache = FindGprQCache(rs);
+				if (rs_qcache >= 0)
+				{
+					const unsigned source_s = static_cast<unsigned>(rs_qcache) * 4;
+					if (!m_code.EmitVmovSToCore(rd_low_host, source_s, move_condition) ||
+						!m_code.EmitVmovSToCore(rd_high_host, source_s + 1, move_condition))
+					{
+						return false;
+					}
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuConditionalMovePredicatedQCacheCopies++;
+#endif
+					predicated_copy = true;
+				}
+				else if (rs_known && IsSingleInstructionA32MoveConstant(rs_low_value) &&
 					IsSingleInstructionA32MoveConstant(rs_high_value))
 				{
 					if (!m_code.EmitMovImm32(rd_low_host, rs_low_value, move_condition) ||
@@ -18720,7 +18735,7 @@ namespace VitaEE
 #endif
 					predicated_copy = true;
 				}
-				else if (rs_low_pin >= 0 && rs_high_pin < 0 && FindGprQCache(rs) < 0)
+				else if (rs_low_pin >= 0 && rs_high_pin < 0)
 				{
 					const size_t offset = GprOffset(rs);
 					if (!m_code.EmitMovRegShiftImm(rd_low_host,
@@ -18736,7 +18751,7 @@ namespace VitaEE
 #endif
 					predicated_copy = true;
 				}
-				else if (rs_low_pin < 0 && FindGprQCache(rs) < 0)
+				else if (rs_low_pin < 0)
 				{
 					const size_t offset = GprOffset(rs);
 					if (offset <= 0xff && CanUseA32DualTransferPair(rd_low_host, rd_high_host))
