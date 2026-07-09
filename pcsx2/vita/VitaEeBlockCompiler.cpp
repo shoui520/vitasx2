@@ -148,6 +148,7 @@ u32 g_qemuNegativeHighCarryFastPaths = 0;
 u32 g_qemuReverseSubtractCarryImmediateFastPaths = 0;
 u32 g_qemuCarryModifiedImmediateFastPaths = 0;
 u32 g_qemuShift64FusedMergeFastPaths = 0;
+u32 g_qemuKnownVariableShiftImmediateFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -11317,17 +11318,17 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitSLL(u32 op)
 	{
-		return EmitShift32Immediate(op, VitaA32::ShiftType::LSL);
+		return EmitShift32Immediate(op, VitaA32::ShiftType::LSL, SA(op));
 	}
 
 	bool BlockCompiler::EmitSRL(u32 op)
 	{
-		return EmitShift32Immediate(op, VitaA32::ShiftType::LSR);
+		return EmitShift32Immediate(op, VitaA32::ShiftType::LSR, SA(op));
 	}
 
 	bool BlockCompiler::EmitSRA(u32 op)
 	{
-		return EmitShift32Immediate(op, VitaA32::ShiftType::ASR);
+		return EmitShift32Immediate(op, VitaA32::ShiftType::ASR, SA(op));
 	}
 
 	bool BlockCompiler::EmitSLLV(u32 op)
@@ -18148,11 +18149,11 @@ namespace VitaEE
 			   EmitSetLessThan64(rd, false, rs_low, rs_high, rt_low, rt_high);
 	}
 
-	bool BlockCompiler::EmitShift32Immediate(u32 op, VitaA32::ShiftType shift)
+	bool BlockCompiler::EmitShift32Immediate(u32 op, VitaA32::ShiftType shift, unsigned amount)
 	{
 		const unsigned rt = RT(op);
 		const unsigned rd = RD(op);
-		const unsigned sa = SA(op);
+		const unsigned sa = amount & 0x1f;
 
 		if (rd == 0)
 			return true;
@@ -18221,34 +18222,18 @@ namespace VitaEE
 		if (rt == 0)
 			return EmitStoreGprZero64(rd);
 
-		u32 rt_value = 0;
 		u32 rs_value = 0;
-		const bool rt_pinned = FindGprPinHost(rt) >= 0;
-		const bool rs_pinned = (rs == 0 || FindGprPinHost(rs) >= 0);
-		if (!(rt_pinned && rs_pinned) &&
-			TryGetKnownGprLow(rt, &rt_value) && TryGetKnownGprLow(rs, &rs_value))
+		if (TryGetKnownGprLow(rs, &rs_value))
 		{
-			const unsigned amount = rs_value & 0x1f;
-			u32 result = rt_value;
-			if (amount != 0)
-			{
-				switch (shift)
-				{
-					case VitaA32::ShiftType::LSL:
-						result = rt_value << amount;
-						break;
-					case VitaA32::ShiftType::LSR:
-						result = rt_value >> amount;
-						break;
-					case VitaA32::ShiftType::ASR:
-						result = static_cast<u32>(static_cast<s32>(rt_value) >> amount);
-						break;
-					default:
-						break;
-				}
-			}
-
-			return EmitStoreKnownSignExtended32(rd, result);
+			// PCSX2 x86/ix86-32/iR5900Shift.cpp::recSLLV_consts(),
+			// recSRLV_consts(), and recSRAV_consts() route a known RS through
+			// the immediate-shift lowering while RT remains dynamic.
+			const bool emitted = EmitShift32Immediate(op, shift, rs_value);
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (emitted)
+				g_qemuKnownVariableShiftImmediateFastPaths++;
+#endif
+			return emitted;
 		}
 
 		// Register zero supplies a shift amount of 0; the 32-bit result still
@@ -18445,19 +18430,17 @@ namespace VitaEE
 		if (rs == 0 && rd == rt)
 			return true;
 
-		u32 rt_low_value = 0;
-		u32 rt_high_value = 0;
 		u32 rs_value = 0;
-		const bool rt_pinned = FindGprPinHost(rt) >= 0;
-		const bool rs_pinned = (rs == 0 || FindGprPinHost(rs) >= 0);
-		if (!(rt_pinned && rs_pinned) &&
-			TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value) && TryGetKnownGprLow(rs, &rs_value))
+		if (TryGetKnownGprLow(rs, &rs_value))
 		{
-			// PCSX2 x86 const-propagates DSLLV through g_cpuConstRegs; the
-			// exact high-word proof makes the Cortex-A9 fold safe for low64.
-			const u64 value = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
-			const u64 result = value << (rs_value & 0x3f);
-			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+			// PCSX2 x86/ix86-32/iR5900Shift.cpp::recDSLLV_consts() uses the
+			// immediate 64-bit shift path for a known RS and dynamic RT.
+			const bool emitted = EmitShift64LeftImmediate(op, rs_value & 0x3f);
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (emitted)
+				g_qemuKnownVariableShiftImmediateFastPaths++;
+#endif
+			return emitted;
 		}
 
 		if (rs == 0)
@@ -18530,23 +18513,17 @@ namespace VitaEE
 		if (rs == 0 && rd == rt)
 			return true;
 
-		u32 rt_low_value = 0;
-		u32 rt_high_value = 0;
 		u32 rs_value = 0;
-		const bool rt_pinned = FindGprPinHost(rt) >= 0;
-		const bool rs_pinned = (rs == 0 || FindGprPinHost(rs) >= 0);
-		if (!(rt_pinned && rs_pinned) &&
-			TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value) && TryGetKnownGprLow(rs, &rs_value))
+		if (TryGetKnownGprLow(rs, &rs_value))
 		{
-			// PCSX2 x86 const-propagates DSRLV/DSRAV through g_cpuConstRegs;
-			// the exact high-word proof preserves logical versus arithmetic
-			// high-bit behavior.
-			const u64 value = (static_cast<u64>(rt_high_value) << 32) | rt_low_value;
-			const unsigned amount = rs_value & 0x3f;
-			const u64 result = arithmetic ?
-				static_cast<u64>(static_cast<s64>(value) >> amount) :
-				(value >> amount);
-			return EmitStoreKnown64(rd, static_cast<u32>(result), static_cast<u32>(result >> 32));
+			// PCSX2 x86/ix86-32/iR5900Shift.cpp::recDSRLV_consts() and
+			// recDSRAV_consts() use the matching immediate 64-bit shift path.
+			const bool emitted = EmitShift64RightImmediate(op, rs_value & 0x3f, arithmetic);
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (emitted)
+				g_qemuKnownVariableShiftImmediateFastPaths++;
+#endif
+			return emitted;
 		}
 
 		if (rs == 0)
