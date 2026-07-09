@@ -107,6 +107,7 @@ u32 g_qemuPartialWordFullLoadFastPaths = 0;
 u32 g_qemuPartialWordFullStoreFastPaths = 0;
 u32 g_qemuGprPartialDwordStoreValueFastPaths = 0;
 u32 g_qemuPartialDwordFullLoadFastPaths = 0;
+u32 g_qemuPartialDwordMergedLoadFastPaths = 0;
 u32 g_qemuPartialDwordFullStoreFastPaths = 0;
 u32 g_qemuKnownVtlbScalarFastPaths = 0;
 u32 g_qemuKnownVtlbQwordFastPaths = 0;
@@ -18875,6 +18876,219 @@ namespace VitaEE
 #endif
 			return true;
 		};
+		const bool register_merge = rt != 0 && FindGprPinHost(rt) >= 0;
+		const auto low_bits_mask = [](unsigned bits) -> u32 {
+			return bits == 0 ? 0u : (bits >= 32 ? 0xffffffffu : ((1u << bits) - 1u));
+		};
+		const auto emit_apply_preserve_and_or =
+			[this](unsigned dest, u32 preserve_mask, unsigned loaded, bool loaded_zero) -> bool {
+				if (preserve_mask == 0)
+				{
+					if (loaded_zero)
+						return m_code.EmitMovImm8(dest, 0);
+					return m_code.EmitMovRegShiftImm(dest, loaded, VitaA32::ShiftType::LSL, 0);
+				}
+
+				if (preserve_mask != 0xffffffffu &&
+					!EmitAndImm32OrReg(dest, dest, preserve_mask, HOST_TMP2))
+				{
+					return false;
+				}
+
+				return loaded_zero || m_code.EmitOrrReg(dest, dest, loaded);
+			};
+		const auto emit_pinned_merge_load = [&](unsigned shift) -> bool {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPartialDwordMergedLoadFastPaths++;
+#endif
+			if (!m_code.EmitLdrdImm8(HOST_TMP2, HOST_TMP3, HOST_TMP0, 0) ||
+				!EmitLoadGpr64Value(rt, HOST_TMP0, HOST_TMP1))
+			{
+				return false;
+			}
+
+			u32 low_preserve = 0;
+			u32 high_preserve = 0;
+			bool loaded_low_zero = false;
+			bool loaded_high_zero = false;
+			if (left)
+			{
+				const unsigned shift_bits = (7 - shift) * 8;
+				low_preserve = low_bits_mask(shift_bits);
+				high_preserve = shift_bits <= 32 ? 0u : low_bits_mask(shift_bits - 32);
+
+				if (shift_bits < 32)
+				{
+					if (!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL,
+							static_cast<u8>(shift_bits)) ||
+						!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP3, VitaA32::ShiftType::LSL,
+							static_cast<u8>(shift_bits)) ||
+						!m_code.EmitOrrRegShiftImm(HOST_TMP5, HOST_TMP5, HOST_TMP2,
+							VitaA32::ShiftType::LSR, static_cast<u8>(32 - shift_bits)))
+					{
+						return false;
+					}
+				}
+				else if (shift_bits == 32)
+				{
+					loaded_low_zero = true;
+					if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP2, VitaA32::ShiftType::LSL, 0))
+						return false;
+				}
+				else
+				{
+					loaded_low_zero = true;
+					if (!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP2, VitaA32::ShiftType::LSL,
+							static_cast<u8>(shift_bits - 32)))
+					{
+						return false;
+					}
+				}
+			}
+			else
+			{
+				const unsigned shift_bits = shift * 8;
+				const unsigned loaded_bits = 64 - shift_bits;
+				low_preserve = loaded_bits >= 32 ? 0u : (0xffffffffu << loaded_bits);
+				high_preserve = shift_bits >= 32 ? 0xffffffffu : (0xffffffffu << (32 - shift_bits));
+
+				if (shift_bits < 32)
+				{
+					if (!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSR,
+							static_cast<u8>(shift_bits)) ||
+						!m_code.EmitOrrRegShiftImm(HOST_TMP4, HOST_TMP4, HOST_TMP3,
+							VitaA32::ShiftType::LSL, static_cast<u8>(32 - shift_bits)) ||
+						!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP3, VitaA32::ShiftType::LSR,
+							static_cast<u8>(shift_bits)))
+					{
+						return false;
+					}
+				}
+				else if (shift_bits == 32)
+				{
+					if (!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP3, VitaA32::ShiftType::LSL, 0))
+						return false;
+					loaded_high_zero = true;
+				}
+				else
+				{
+					if (!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP3, VitaA32::ShiftType::LSR,
+							static_cast<u8>(shift_bits - 32)))
+					{
+						return false;
+					}
+					loaded_high_zero = true;
+				}
+			}
+
+			return emit_apply_preserve_and_or(HOST_TMP0, low_preserve, HOST_TMP4, loaded_low_zero) &&
+				   emit_apply_preserve_and_or(HOST_TMP1, high_preserve, HOST_TMP5, loaded_high_zero) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		};
+		const auto emit_runtime_pinned_merge_load = [&]() -> bool {
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPartialDwordMergedLoadFastPaths++;
+#endif
+			const auto emit_left_below_32 = [&]() -> bool {
+				return m_code.EmitRsbImm32(HOST_TMP5, HOST_TMP4, 32) &&
+					   m_code.EmitMovRegShiftReg(HOST_TMP1, HOST_TMP3,
+						   VitaA32::ShiftType::LSL, HOST_TMP4) &&
+					   m_code.EmitOrrRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP2,
+						   VitaA32::ShiftType::LSR, HOST_TMP5) &&
+					   m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_TMP2,
+						   VitaA32::ShiftType::LSL, HOST_TMP4) &&
+					   m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) &&
+					   m_code.EmitAndRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP2,
+						   VitaA32::ShiftType::LSR, HOST_TMP5) &&
+					   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP3);
+			};
+			const auto emit_left_above_32 = [&]() -> bool {
+				return m_code.EmitSubImm8(HOST_TMP4, HOST_TMP4, 32) &&
+					   m_code.EmitRsbImm32(HOST_TMP5, HOST_TMP4, 32) &&
+					   m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_TMP2,
+						   VitaA32::ShiftType::LSL, HOST_TMP4) &&
+					   m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) &&
+					   m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP2,
+						   VitaA32::ShiftType::LSR, HOST_TMP5) &&
+					   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP3);
+			};
+			const auto emit_right_below_32 = [&]() -> bool {
+				return m_code.EmitRsbImm32(HOST_TMP5, HOST_TMP4, 32) &&
+					   m_code.EmitMovRegShiftReg(HOST_TMP0, HOST_TMP2,
+						   VitaA32::ShiftType::LSR, HOST_TMP4) &&
+					   m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP3,
+						   VitaA32::ShiftType::LSL, HOST_TMP5) &&
+					   m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_TMP3,
+						   VitaA32::ShiftType::LSR, HOST_TMP4) &&
+					   m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) &&
+					   m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP2,
+						   VitaA32::ShiftType::LSL, HOST_TMP5) &&
+					   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP3);
+			};
+			const auto emit_right_above_32 = [&]() -> bool {
+				return m_code.EmitSubImm8(HOST_TMP4, HOST_TMP4, 32) &&
+					   m_code.EmitRsbImm32(HOST_TMP5, HOST_TMP4, 32) &&
+					   m_code.EmitMovRegShiftReg(HOST_TMP3, HOST_TMP3,
+						   VitaA32::ShiftType::LSR, HOST_TMP4) &&
+					   m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) &&
+					   m_code.EmitAndRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP2,
+						   VitaA32::ShiftType::LSL, HOST_TMP5) &&
+					   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP3);
+			};
+
+			if (!(left ? m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP3, 7) :
+						 m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP3, VitaA32::ShiftType::LSL, 0)) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP4, VitaA32::ShiftType::LSL, 3) ||
+				!m_code.EmitLdrdImm8(HOST_TMP2, HOST_TMP3, HOST_TMP0, 0) ||
+				!EmitLoadGpr64Value(rt, HOST_TMP0, HOST_TMP1) ||
+				!m_code.EmitCmpImm32(HOST_TMP4, 32))
+			{
+				return false;
+			}
+
+			const size_t below_32 = m_code.EmitBranchPlaceholder(VitaA32::Condition::CC);
+			const size_t equal_32 = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (below_32 == static_cast<size_t>(-1) || equal_32 == static_cast<size_t>(-1))
+				return false;
+
+			if (!(left ? emit_left_above_32() : emit_right_above_32()))
+				return false;
+
+			const size_t done_above = m_code.EmitBranchPlaceholder();
+			if (done_above == static_cast<size_t>(-1))
+				return false;
+
+			const size_t below_32_target = m_code.Size();
+			if (!m_code.PatchBranch(below_32, below_32_target, VitaA32::Condition::CC) ||
+				!(left ? emit_left_below_32() : emit_right_below_32()))
+			{
+				return false;
+			}
+
+			const size_t done_below = m_code.EmitBranchPlaceholder();
+			if (done_below == static_cast<size_t>(-1))
+				return false;
+
+			const size_t equal_32_target = m_code.Size();
+			if (!m_code.PatchBranch(equal_32, equal_32_target, VitaA32::Condition::EQ))
+				return false;
+
+			if (!(left ? m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP2, VitaA32::ShiftType::LSL, 0) :
+						 m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3, VitaA32::ShiftType::LSL, 0)))
+			{
+				return false;
+			}
+
+			const size_t done_equal = m_code.EmitBranchPlaceholder();
+			if (done_equal == static_cast<size_t>(-1))
+				return false;
+
+			const size_t done_target = m_code.Size();
+			return m_code.PatchBranch(done_above, done_target) &&
+				   m_code.PatchBranch(done_below, done_target) &&
+				   m_code.PatchBranch(done_equal, done_target) &&
+				   EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1);
+		};
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -18889,6 +19103,9 @@ namespace VitaEE
 			{
 				if ((left && shift == 7) || (!left && shift == 0))
 					return emit_full_load();
+
+				if (register_merge)
+					return emit_pinned_merge_load(shift);
 
 				const auto emit_byte = [this, rt](unsigned memory_byte, unsigned dest_byte) {
 					return m_code.EmitLdrbImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(memory_byte)) &&
@@ -18933,6 +19150,39 @@ namespace VitaEE
 		{
 			if (!emit_zero_load_skip_counter())
 				return false;
+
+			m_partial_memory_cold_tails.push_back({
+				handler_fallback,
+				m_code.Size(),
+				left ? PartialMemoryOp::DwordLoadLeft : PartialMemoryOp::DwordLoadRight,
+				rt,
+			});
+			return true;
+		}
+
+		if (register_merge)
+		{
+			if (!m_code.EmitCmpImm32(HOST_TMP3, left ? 7 : 0))
+				return false;
+
+			const size_t full_lane_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (full_lane_branch == static_cast<size_t>(-1))
+				return false;
+
+			if (!emit_runtime_pinned_merge_load())
+				return false;
+
+			const size_t general_done = m_code.EmitBranchPlaceholder();
+			if (general_done == static_cast<size_t>(-1))
+				return false;
+
+			const size_t full_lane_target = m_code.Size();
+			if (!m_code.PatchBranch(full_lane_branch, full_lane_target, VitaA32::Condition::EQ) ||
+				!emit_full_load() ||
+				!m_code.PatchBranch(general_done, m_code.Size()))
+			{
+				return false;
+			}
 
 			m_partial_memory_cold_tails.push_back({
 				handler_fallback,
@@ -19019,7 +19269,7 @@ namespace VitaEE
 				return false;
 		}
 
-		if (!EmitRefreshGprPinFromBacking(rt))
+		if (!register_merge && !EmitRefreshGprPinFromBacking(rt))
 			return false;
 
 		const size_t join_offset = m_code.Size();
