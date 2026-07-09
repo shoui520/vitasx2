@@ -93,6 +93,8 @@ u32 g_qemuGprConstHighWordLoadFastPaths = 0;
 u32 g_qemuGprConstRegisterJumpTargets = 0;
 u32 g_qemuGprConstEffectiveAddresses = 0;
 u32 g_qemuWaitLoopFastForwardBlocks = 0;
+u32 g_qemuDeferredPcWritebackBlocks = 0;
+u32 g_qemuLinkedPcSyncBlocks = 0;
 u32 g_qemuScalarZeroLoadSkips = 0;
 u32 g_qemuPartialZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroLoadSkips = 0;
@@ -3880,6 +3882,35 @@ namespace VitaEE
 		return false;
 	}
 
+	bool BlockNeedsLinkedPcSync(u32 start_pc, u32 instruction_count, bool use_vtlb_registers)
+	{
+		// Native links may defer the predecessor's backing-PC write. Only blocks
+		// which can expose cpuRegs.pc before their own exit need to restore the
+		// block-start PC on linked entry. This mirrors PCSX2's iFlushCall(FLUSH_PC)
+		// boundary instead of charging every helper-free ALU/MMI/branch block.
+		if (use_vtlb_registers || EmuConfig.Gamefixes.GoemonTlbHack)
+			return true;
+
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		if (Pcsx2Trace::IsGsTraceEnabled() || Pcsx2Trace::IsVuTraceEnabled())
+			return true;
+#endif
+
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			if (OpcodeMayUseVtlbFastPath(op) ||
+				(op >> 26) == 0x10 || // COP0 may call perf/status helpers in-block.
+				(op >> 26) == 0x12 || // COP2 may take VU synchronization helpers.
+				((op >> 26) == 0x2f && IsHelperCACHE(op)))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	void BlockCompiler::UpdateGprConstStateAfterOpcode(u32 op, u32 pc)
 	{
 		const unsigned rs = RS(op);
@@ -5082,7 +5113,8 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::BeginBlock(bool use_vtlb_registers, bool use_cop1_exponent_mask_register,
-		bool use_vu0_base_register, size_t* linked_entry_offset)
+		bool use_vu0_base_register, size_t* linked_entry_offset,
+		u32 linked_entry_pc, bool linked_entry_needs_pc_sync)
 	{
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
@@ -5171,8 +5203,25 @@ namespace VitaEE
 		// r4 is never used as a pin/scratch register and AAPCS helpers preserve
 		// it, so generated links can skip the callable-entry frame setup and the
 		// cpuRegs base materialization while still letting final exits pop once.
-		if (linked_entry_offset)
+		// Callable entry arrives with cpuRegs.pc set by the executor and skips the
+		// linked-only synchronization used by helper/exception-observing blocks.
+		if (linked_entry_offset && linked_entry_needs_pc_sync)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuLinkedPcSyncBlocks++;
+#endif
+			const size_t callable_body = m_code.EmitBranchPlaceholder();
+			if (callable_body == static_cast<size_t>(-1))
+				return false;
+
 			*linked_entry_offset = m_code.Size();
+			if (!EmitStorePc(linked_entry_pc) || !m_code.PatchBranch(callable_body, m_code.Size()))
+				return false;
+		}
+		else if (linked_entry_offset)
+		{
+			*linked_entry_offset = m_code.Size();
+		}
 
 		if (use_cop1_exponent_mask_register &&
 			!m_code.EmitMovImm32(HOST_COP1_EXPONENT_MASK, FPU_FLOAT_EXPONENT_MASK))
@@ -5218,6 +5267,8 @@ namespace VitaEE
 		const bool use_cop1_exponent_mask_register =
 			BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count);
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
+		const bool linked_entry_needs_pc_sync =
+			BlockNeedsLinkedPcSync(start_pc, instruction_count, use_vtlb_registers);
 		const bool dirty_pins_candidate = BlockCanUseDirtyGprPins(start_pc, instruction_count);
 		m_dirty_pins_enabled = false;
 		m_gpr_q_cache_enabled = BlockShouldUseGprQCache(start_pc, instruction_count);
@@ -5227,7 +5278,7 @@ namespace VitaEE
 			*linked_entry_offset = 0;
 
 		if (!BeginBlock(use_vtlb_registers, use_cop1_exponent_mask_register, use_vu0_base_register,
-				linked_entry_offset))
+				linked_entry_offset, start_pc, linked_entry_needs_pc_sync))
 		{
 			return false;
 		}
@@ -5730,10 +5781,24 @@ namespace VitaEE
 			branch_target_pc <= start_pc &&
 			IsWaitLoopBody(branch_target_pc, next_pc,
 				start_pc + branch_instruction_index * 4);
+		const bool whole_wait_loop_fast_forward = has_branch && has_static_direct_link_target &&
+			static_direct_link_target_pc == branch_target_pc && wait_loop_body;
+		const bool can_direct_link = !has_branch || has_static_direct_link_target ||
+			has_static_conditional_direct_links;
+		const bool defer_pc_writeback = direct_links && !whole_wait_loop_fast_forward &&
+			(branch_is_likely ? has_static_likely_direct_links : can_direct_link);
+		const u32 direct_pc = has_static_direct_link_target ? static_direct_link_target_pc : next_pc;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (defer_pc_writeback)
+			g_qemuDeferredPcWritebackBlocks++;
+#endif
 
 		// Matches the fall-through/branch writeback in x86/ix86-32/iR5900.cpp,
 		// after compiling either a non-branching block or a branch plus delay slot.
-		if (has_branch)
+		// Native direct links keep this state virtual across helper-free block
+		// bodies; their event and unlinked tails materialize the selected PC.
+		if (!defer_pc_writeback && has_branch)
 		{
 			if (has_register_branch_target)
 			{
@@ -5750,7 +5815,7 @@ namespace VitaEE
 				return false;
 			}
 		}
-		else if (!EmitStorePc(next_pc))
+		else if (!defer_pc_writeback && !EmitStorePc(next_pc))
 		{
 			return false;
 		}
@@ -5760,8 +5825,7 @@ namespace VitaEE
 		// fast-forwards the whole exit; PCSX2's SetBranchImm(s_branchTo) tail
 		// does the same. A collapsed known-not-taken branch links to pc + 8
 		// instead of the taken target, so it never matches here.
-		if (has_branch && has_static_direct_link_target &&
-			static_direct_link_target_pc == branch_target_pc && wait_loop_body)
+		if (whole_wait_loop_fast_forward)
 		{
 			return EndBlockWithWaitLoopFastForward(block_cycles, event_exit) && FlushColdTails();
 		}
@@ -5775,7 +5839,8 @@ namespace VitaEE
 				(direct_links && has_static_likely_direct_links && !wait_loop_taken) ?
 					&direct_links->slots[1] : nullptr;
 			if (!EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit,
-					not_taken_link, taken_link, wait_loop_taken))
+					not_taken_link, taken_link, wait_loop_taken,
+					defer_pc_writeback, next_pc, branch_target_pc))
 			{
 				return false;
 			}
@@ -5798,8 +5863,6 @@ namespace VitaEE
 			return true;
 		}
 
-			const bool can_direct_link = !has_branch || has_static_direct_link_target ||
-									 has_static_conditional_direct_links;
 		const bool wait_loop_taken = wait_loop_body && has_static_conditional_direct_links;
 		DirectLinkSlot* const direct_link =
 			(direct_links && can_direct_link) ? &direct_links->slots[0] : nullptr;
@@ -5810,7 +5873,8 @@ namespace VitaEE
 				direct_link, taken_link,
 				has_register_branch_target ? indirect_lookup_pages_slot : nullptr,
 				has_register_branch_target ? direct_linking_enabled_flag : nullptr,
-				wait_loop_taken))
+				wait_loop_taken, defer_pc_writeback,
+				direct_pc, branch_target_pc, has_static_conditional_direct_links))
 		{
 			return false;
 		}
@@ -5940,7 +6004,8 @@ namespace VitaEE
 			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
-	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link)
+	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
+		bool defer_pc_writeback, u32 pc)
 	{
 		if (!direct_exit)
 			return false;
@@ -5952,6 +6017,7 @@ namespace VitaEE
 
 		const size_t fallback_offset = m_code.Size();
 		if (!m_code.PatchBranch(target_branch, fallback_offset) ||
+			(defer_pc_writeback && !EmitStorePc(pc)) ||
 			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
 			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
@@ -5968,7 +6034,7 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
-		DirectLinkSlot* direct_link)
+		DirectLinkSlot* direct_link, bool defer_pc_writeback, u32 pc)
 	{
 		if (!direct_exit || target_branch == static_cast<size_t>(-1))
 			return false;
@@ -5978,6 +6044,7 @@ namespace VitaEE
 		// branch when the guest branch is taken.
 		const size_t fallback_offset = m_code.Size();
 		if (!m_code.PatchBranch(target_branch, fallback_offset, VitaA32::Condition::NE) ||
+			(defer_pc_writeback && !EmitStorePc(pc)) ||
 			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
 			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
@@ -6000,6 +6067,15 @@ namespace VitaEE
 
 		return m_code.EmitMovImm8(0, EE_EVENT_EXIT_TOKEN) &&
 			   m_code.EmitPop(m_saved_registers | REG_PC);
+	}
+
+	bool BlockCompiler::EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc,
+		u32 taken_pc, bool conditional_pc)
+	{
+		if (!defer_pc_writeback)
+			return true;
+
+		return conditional_pc ? EmitStoreBranchPc(taken_pc, direct_pc) : EmitStorePc(direct_pc);
 	}
 
 	bool BlockCompiler::EmitIndirectDispatchTail(const void* lookup_pages_slot,
@@ -6152,7 +6228,8 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::EmitWaitLoopFastForwardTail(const void* event_exit)
+	bool BlockCompiler::EmitWaitLoopFastForwardTail(const void* event_exit,
+		bool defer_pc_writeback, u32 pc)
 	{
 		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest() WaitLoop form:
 		// cycle = max(cycle + block cycles, nextEventCycle), then dispatch
@@ -6171,7 +6248,7 @@ namespace VitaEE
 			return false;
 		}
 
-		return EmitEventExitReturn(event_exit);
+		return (!defer_pc_writeback || EmitStorePc(pc)) && EmitEventExitReturn(event_exit);
 	}
 
 	bool BlockCompiler::EndBlockWithWaitLoopFastForward(u32 block_cycles, const void* event_exit)
@@ -6217,7 +6294,8 @@ namespace VitaEE
 	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
 		DirectLinkSlot* direct_link, DirectLinkSlot* taken_link,
 		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
-		bool wait_loop_taken)
+		bool wait_loop_taken, bool defer_pc_writeback,
+		u32 direct_pc, u32 taken_pc, bool conditional_pc)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
@@ -6262,7 +6340,7 @@ namespace VitaEE
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!EmitDirectLinkTail(direct_exit, direct_link))
+			if (!EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback, direct_pc))
 				return false;
 
 			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
@@ -6273,17 +6351,19 @@ namespace VitaEE
 			{
 				const size_t taken_tail_target = m_code.Size();
 				taken_tail_ok = m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) &&
-					EmitWaitLoopFastForwardTail(event_exit);
+					EmitWaitLoopFastForwardTail(event_exit, defer_pc_writeback, taken_pc);
 			}
 			else
 			{
-				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link);
+				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link,
+					defer_pc_writeback, taken_pc);
 			}
 
 			const size_t event_target = m_code.Size();
 			const size_t carry_branches[] = {carry_branch};
 			if (!taken_tail_ok ||
 				!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) ||
+				!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc) ||
 				!EmitEventExitReturn(event_exit) ||
 				!EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1))
 			{
@@ -6295,7 +6375,7 @@ namespace VitaEE
 
 		if (direct_link)
 		{
-			if (!EmitDirectLinkTail(direct_exit, direct_link))
+			if (!EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback, direct_pc))
 			{
 				return false;
 			}
@@ -6307,7 +6387,8 @@ namespace VitaEE
 				return false;
 			}
 		}
-		else if (!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
+		else if (!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc) ||
+			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
 			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
 			return false;
@@ -6316,13 +6397,15 @@ namespace VitaEE
 		const size_t event_target = m_code.Size();
 		const size_t carry_branches[] = {carry_branch};
 		return m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) &&
+			   EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc) &&
 			   EmitEventExitReturn(event_exit) &&
 			   EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles,
 		const void* direct_exit, const void* event_exit, DirectLinkSlot* not_taken_link,
-		DirectLinkSlot* taken_link, bool wait_loop_taken)
+		DirectLinkSlot* taken_link, bool wait_loop_taken,
+		bool defer_pc_writeback, u32 not_taken_pc, u32 taken_pc)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
@@ -6466,7 +6549,8 @@ namespace VitaEE
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!EmitDirectLinkTail(direct_exit, not_taken_link))
+			if (!EmitDirectLinkTail(direct_exit, not_taken_link,
+					defer_pc_writeback, not_taken_pc))
 				return false;
 
 			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
@@ -6476,17 +6560,19 @@ namespace VitaEE
 			{
 				const size_t taken_tail_target = m_code.Size();
 				taken_tail_ok = m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) &&
-					EmitWaitLoopFastForwardTail(event_exit);
+					EmitWaitLoopFastForwardTail(event_exit, defer_pc_writeback, taken_pc);
 			}
 			else
 			{
-				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link);
+				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link,
+					defer_pc_writeback, taken_pc);
 			}
 
 			const size_t event_target = m_code.Size();
 			const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
 			if (!taken_tail_ok ||
 				!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) ||
+				!EmitDeferredPcWriteback(defer_pc_writeback, not_taken_pc, taken_pc, true) ||
 				!EmitEventExitReturn(event_exit) ||
 				!EmitCycleCarryFixup(carry_branches, 2, cycle_compare_target, HOST_TMP1))
 			{
@@ -6497,7 +6583,8 @@ namespace VitaEE
 		}
 
 		const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
-		if (!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
+		if (!EmitDeferredPcWriteback(defer_pc_writeback, not_taken_pc, taken_pc, true) ||
+			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
 			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
 			return false;
@@ -6505,6 +6592,7 @@ namespace VitaEE
 
 		const size_t event_target = m_code.Size();
 		return m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) &&
+			   EmitDeferredPcWriteback(defer_pc_writeback, not_taken_pc, taken_pc, true) &&
 			   EmitEventExitReturn(event_exit) &&
 			   EmitCycleCarryFixup(carry_branches, 2, cycle_compare_target, HOST_TMP1);
 	}
