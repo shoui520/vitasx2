@@ -18572,16 +18572,17 @@ namespace VitaEE
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp::LWL() / LWR().
 		const unsigned rt = RT(op);
+		const unsigned result_reg = (rt != 0) ? SelectGprLowResultHost(rt, HOST_TMP0) : HOST_TMP0;
 		constexpr u32 LWL_MASK[4] = {0x00ffffffu, 0x0000ffffu, 0x000000ffu, 0x00000000u};
 		constexpr u32 LWR_MASK[4] = {0x00000000u, 0xff000000u, 0xffff0000u, 0xffffff00u};
 		constexpr u8 LWL_SHIFT[4] = {24, 16, 8, 0};
 		constexpr u8 LWR_SHIFT[4] = {0, 8, 16, 24};
-		const auto emit_full_load = [this, rt]() {
+		const auto emit_full_load = [this, rt, result_reg]() {
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuPartialWordFullLoadFastPaths++;
 #endif
-			return m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0) &&
-				   EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0);
+			return m_code.EmitLdrImm12(result_reg, HOST_TMP0, 0) &&
+				   EmitStoreGprSignExtended32FromLow(rt, result_reg);
 		};
 		const auto emit_zero_load_skip_counter = []() -> bool {
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -18615,18 +18616,18 @@ namespace VitaEE
 					!(shift == 0 ? true :
 						(left ? m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSL, shift) :
 								m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0, VitaA32::ShiftType::LSR, shift))) ||
-					!m_code.EmitOrrReg(HOST_TMP0, HOST_TMP1, HOST_TMP0))
+					!m_code.EmitOrrReg(result_reg, HOST_TMP1, HOST_TMP0))
 				{
 					return false;
 				}
 
 				if (left || lane == 0)
 				{
-					if (!EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0))
+					if (!EmitStoreGprSignExtended32FromLow(rt, result_reg))
 						return false;
 				}
 				else if (!EmitLoadGprHigh(rt, HOST_TMP1) ||
-						 !EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP1))
+						 !EmitStoreGpr64(rt, result_reg, HOST_TMP1))
 				{
 					return false;
 				}
@@ -18691,9 +18692,9 @@ namespace VitaEE
 					!m_code.EmitMovImm32(HOST_TMP2, 0xffffffffu) ||
 					!m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP2,
 						VitaA32::ShiftType::LSR, HOST_TMP4) ||
-					!m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP1, HOST_TMP0,
+					!m_code.EmitOrrRegShiftReg(result_reg, HOST_TMP1, HOST_TMP0,
 						VitaA32::ShiftType::LSL, HOST_TMP3) ||
-					!EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0))
+					!EmitStoreGprSignExtended32FromLow(rt, result_reg))
 				{
 					return false;
 				}
@@ -18706,12 +18707,9 @@ namespace VitaEE
 					!m_code.EmitMovImm32(HOST_TMP5, 0xffffffffu) ||
 					!m_code.EmitAndRegShiftReg(HOST_TMP1, HOST_TMP1, HOST_TMP5,
 						VitaA32::ShiftType::LSL, HOST_TMP4) ||
-					!m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP1, HOST_TMP0,
+					!m_code.EmitOrrRegShiftReg(result_reg, HOST_TMP1, HOST_TMP0,
 						VitaA32::ShiftType::LSR, HOST_TMP3) ||
-					!m_code.EmitCmpImm32(HOST_TMP3, 0) ||
-					!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::ASR, 31, false,
-						VitaA32::Condition::EQ) ||
-					!EmitStoreGpr64(rt, HOST_TMP0, HOST_TMP2))
+					!EmitStoreGpr64(rt, result_reg, HOST_TMP2))
 				{
 					return false;
 				}
@@ -18729,8 +18727,8 @@ namespace VitaEE
 			g_qemuPartialWordFullLoadFastPaths++;
 #endif
 			if (!m_code.PatchBranch(full_lane_branch, full_lane_target, VitaA32::Condition::EQ) ||
-				!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0) ||
-				!EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0) ||
+				!m_code.EmitLdrImm12(result_reg, HOST_TMP0, 0) ||
+				!EmitStoreGprSignExtended32FromLow(rt, result_reg) ||
 				!m_code.PatchBranch(general_done, m_code.Size()))
 			{
 				return false;
