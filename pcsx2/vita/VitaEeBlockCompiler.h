@@ -756,10 +756,12 @@ namespace VitaEE
 		u8 m_staged_pin_guest[MAX_GPR_PINS]{};
 		u8 m_staged_pin_host[MAX_GPR_PINS]{};
 		u8 m_staged_pin_high_host[MAX_GPR_PINS]{};
+		bool m_staged_pin_needs_entry_load[MAX_GPR_PINS]{};
 		u8 m_staged_pin_count = 0;
 		u8 m_pin_guest[MAX_GPR_PINS]{};
 		u8 m_pin_host[MAX_GPR_PINS]{};
 		u8 m_pin_high_host[MAX_GPR_PINS]{};
+		bool m_pin_needs_entry_load[MAX_GPR_PINS]{};
 		u8 m_pin_count = 0;
 		bool m_dirty_pins_enabled = false;
 		bool m_pin_dirty_low[MAX_GPR_PINS]{};

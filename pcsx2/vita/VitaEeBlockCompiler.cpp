@@ -78,6 +78,7 @@ u32 g_qemuGprPinSelfStoresElided = 0;
 u32 g_qemuGprPinHighReadOperands = 0;
 u32 g_qemuGprPinExtendedHighStoreOperands = 0;
 u32 g_qemuGprPinLowResultStoreOperands = 0;
+u32 g_qemuGprPinEntryLoadInstructionsElided = 0;
 u32 g_qemuGprDirtyPinBlocks = 0;
 u32 g_qemuGprDirtyPinLowStoresElided = 0;
 u32 g_qemuGprDirtyPinHighStoresElided = 0;
@@ -3204,6 +3205,40 @@ namespace VitaEE
 		return true;
 	}
 
+	bool UpdateGprPinEntryLiveness(u32 op, u32& defined, u32& live_in_reads)
+	{
+		// PCSX2 owners: R5900OpcodeImpl.cpp::ADDIU()/DADDIU()/ANDI()/ORI()/
+		// XORI()/SLTI()/SLTIU()/LUI(). These helper-free immediate ops replace
+		// all of UD[0]. Track only a consecutive run of those safe ops; callers
+		// stop before any opcode which can call, fault, or conditionally write.
+		const unsigned opcode = op >> 26;
+		if (opcode == 0x0f) // LUI has no GPR source.
+		{
+			defined |= 1u << RT(op);
+			return true;
+		}
+
+		switch (opcode)
+		{
+			case 0x09: // ADDIU
+			case 0x0a: // SLTI
+			case 0x0b: // SLTIU
+			case 0x0c: // ANDI
+			case 0x0d: // ORI
+			case 0x0e: // XORI
+			case 0x19: // DADDIU
+				break;
+			default:
+				return false;
+		}
+
+		const u32 source_bit = 1u << RS(op);
+		if ((defined & source_bit) == 0)
+			live_in_reads |= source_bit;
+		defined |= 1u << RT(op);
+		return true;
+	}
+
 	bool BlockShouldUseCop1ExponentMaskRegister(u32 start_pc, u32 instruction_count)
 	{
 		unsigned mask_users = 0;
@@ -4362,9 +4397,18 @@ namespace VitaEE
 		u16 dword_read_counts[32]{};
 		u16 write_counts[32]{};
 		u16 dword_write_counts[32]{};
+		u32 entry_defined = 1;
+		u32 entry_live_in_reads = 0;
+		bool scanning_entry_liveness = prefer_dirty_writes;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 op = memRead32(start_pc + i * 4);
+			if (scanning_entry_liveness)
+			{
+				scanning_entry_liveness =
+					UpdateGprPinEntryLiveness(op, entry_defined, entry_live_in_reads);
+			}
+
 			GprPinOpInfo info;
 			if (!ClassifyOpcodeForGprPinning(op, &info))
 				return;
@@ -4392,6 +4436,7 @@ namespace VitaEE
 				}
 			}
 		}
+		const u32 dead_entry_values = entry_defined & ~entry_live_in_reads;
 
 		u8 hosts[MAX_GPR_PINS];
 		unsigned host_count = 0;
@@ -4483,6 +4528,8 @@ namespace VitaEE
 				m_staged_pin_guest[m_staged_pin_count] = static_cast<u8>(best_reg);
 				m_staged_pin_host[m_staged_pin_count] = hosts[low_slot];
 				m_staged_pin_high_host[m_staged_pin_count] = hosts[high_slot];
+				m_staged_pin_needs_entry_load[m_staged_pin_count] =
+					(dead_entry_values & (1u << best_reg)) == 0;
 				m_staged_pin_count++;
 				host_used[high_slot] = true;
 				used_hosts += 2;
@@ -4523,6 +4570,8 @@ namespace VitaEE
 			m_staged_pin_guest[m_staged_pin_count] = static_cast<u8>(best_reg);
 			m_staged_pin_host[m_staged_pin_count] = hosts[slot];
 			m_staged_pin_high_host[m_staged_pin_count] = NO_GPR_PIN_HOST;
+			m_staged_pin_needs_entry_load[m_staged_pin_count] =
+				(dead_entry_values & (1u << best_reg)) == 0;
 			m_staged_pin_count++;
 			host_used[slot] = true;
 			used_hosts++;
@@ -4585,6 +4634,17 @@ namespace VitaEE
 		for (unsigned i = 0; i < m_pin_count; i++)
 			{
 				const size_t offset = GprOffset(m_pin_guest[i]);
+				if (!m_pin_needs_entry_load[i])
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuGprPinEntryLoadInstructionsElided +=
+						(m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+							(offset > 0xff || !CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))) ?
+						2 : 1;
+#endif
+					continue;
+				}
+
 				if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
 					offset <= 0xff &&
 					CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))
@@ -4919,6 +4979,7 @@ namespace VitaEE
 			m_pin_guest[m_pin_count] = m_staged_pin_guest[i];
 			m_pin_host[m_pin_count] = static_cast<u8>(host);
 			m_pin_high_host[m_pin_count] = static_cast<u8>(high_host);
+			m_pin_needs_entry_load[m_pin_count] = m_staged_pin_needs_entry_load[i];
 			m_pin_count++;
 		}
 		m_staged_pin_count = 0;
