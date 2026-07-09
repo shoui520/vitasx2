@@ -19188,6 +19188,9 @@ namespace VitaEE
 		const unsigned address_reg = (width == ScalarLoadWidth::Dword) ? HOST_TMP2 : HOST_TMP0;
 		const unsigned vmap_reg = HOST_TMP1;
 		const unsigned scratch_reg = (width == ScalarLoadWidth::Dword) ? HOST_TMP0 : HOST_TMP2;
+		const unsigned result_reg = (rt != 0 && width != ScalarLoadWidth::Dword) ?
+										SelectGprLowResultHost(rt, HOST_TMP0) :
+										HOST_TMP0;
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -19195,13 +19198,13 @@ namespace VitaEE
 			switch (width)
 			{
 				case ScalarLoadWidth::Byte:
-					return sign_extend ? m_code.EmitLdrsbImm8(HOST_TMP0, HOST_TMP0, 0) :
-										 m_code.EmitLdrbImm12(HOST_TMP0, HOST_TMP0, 0);
+					return sign_extend ? m_code.EmitLdrsbImm8(result_reg, HOST_TMP0, 0) :
+										 m_code.EmitLdrbImm12(result_reg, HOST_TMP0, 0);
 				case ScalarLoadWidth::Halfword:
-					return sign_extend ? m_code.EmitLdrshImm8(HOST_TMP0, HOST_TMP0, 0) :
-										 m_code.EmitLdrhImm8(HOST_TMP0, HOST_TMP0, 0);
+					return sign_extend ? m_code.EmitLdrshImm8(result_reg, HOST_TMP0, 0) :
+										 m_code.EmitLdrhImm8(result_reg, HOST_TMP0, 0);
 				case ScalarLoadWidth::Word:
-					return m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0);
+					return m_code.EmitLdrImm12(result_reg, HOST_TMP0, 0);
 				case ScalarLoadWidth::Dword:
 					// PCSX2 owner: R5900OpcodeImpl.cpp::LD() via vtlb_memRead64().
 					// Keep the translated address out of r0/r1 so Cortex-A9 can use
@@ -19230,8 +19233,8 @@ namespace VitaEE
 			if (rt == 0)
 				return true;
 
-			return sign_extend ? EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0) :
-								 EmitStoreGprZeroExtended32FromLow(rt, HOST_TMP0);
+			return sign_extend ? EmitStoreGprSignExtended32FromLow(rt, result_reg) :
+								 EmitStoreGprZeroExtended32FromLow(rt, result_reg);
 		};
 		const bool skip_zero_load_result = rt == 0 && width != ScalarLoadWidth::Dword;
 		const auto emit_zero_load_skip_counter = []() -> bool {
