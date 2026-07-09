@@ -156,6 +156,7 @@ u32 g_qemuEorAllOnesFastPaths = 0;
 u32 g_qemuConditionalMovePredicatedRegisterCopies = 0;
 u32 g_qemuConditionalMovePredicatedKnownCopies = 0;
 u32 g_qemuConditionalMovePredicatedBackingCopies = 0;
+u32 g_qemuConditionalMovePredicatedMixedCopies = 0;
 #endif
 
 namespace VitaEE
@@ -18719,7 +18720,23 @@ namespace VitaEE
 #endif
 					predicated_copy = true;
 				}
-				else if (FindGprQCache(rs) < 0)
+				else if (rs_low_pin >= 0 && rs_high_pin < 0 && FindGprQCache(rs) < 0)
+				{
+					const size_t offset = GprOffset(rs);
+					if (!m_code.EmitMovRegShiftImm(rd_low_host,
+							static_cast<unsigned>(rs_low_pin), VitaA32::ShiftType::LSL, 0,
+							false, move_condition) ||
+						!m_code.EmitLdrImm12(rd_high_host, HOST_CPU_REGS,
+							static_cast<u16>(offset + sizeof(u32)), move_condition))
+					{
+						return false;
+					}
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuConditionalMovePredicatedMixedCopies++;
+#endif
+					predicated_copy = true;
+				}
+				else if (rs_low_pin < 0 && FindGprQCache(rs) < 0)
 				{
 					const size_t offset = GprOffset(rs);
 					if (offset <= 0xff && CanUseA32DualTransferPair(rd_low_host, rd_high_host))
