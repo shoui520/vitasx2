@@ -3207,36 +3207,157 @@ namespace VitaEE
 
 	bool UpdateGprPinEntryLiveness(u32 op, u32& defined, u32& live_in_reads)
 	{
-		// PCSX2 owners: R5900OpcodeImpl.cpp::ADDIU()/DADDIU()/ANDI()/ORI()/
-		// XORI()/SLTI()/SLTIU()/LUI(). These helper-free immediate ops replace
-		// all of UD[0]. Track only a consecutive run of those safe ops; callers
-		// stop before any opcode which can call, fault, or conditionally write.
-		const unsigned opcode = op >> 26;
-		if (opcode == 0x0f) // LUI has no GPR source.
-		{
-			defined |= 1u << RT(op);
-			return true;
-		}
+		// PCSX2 owners: R5900OpcodeImpl.cpp scalar ALU/shift/move/mult-div
+		// operations, with the matching native paths in EmitSPECIAL()/EmitOpcode().
+		// Track only consecutive helper-free operations. Callers stop before any
+		// opcode which can call, fault, branch, or otherwise expose the backing GPR
+		// file before a pin is initialized.
+		const auto read = [&](unsigned guest_reg) {
+			const u32 bit = 1u << guest_reg;
+			if ((defined & bit) == 0)
+				live_in_reads |= bit;
+		};
+		const auto define = [&](unsigned guest_reg) {
+			defined |= 1u << guest_reg;
+		};
 
+		const unsigned opcode = op >> 26;
 		switch (opcode)
 		{
+			case 0x00:
+				switch (op & 0x3f)
+				{
+					case 0x00: // SLL
+					case 0x02: // SRL
+					case 0x03: // SRA
+					case 0x38: // DSLL
+					case 0x3a: // DSRL
+					case 0x3b: // DSRA
+					case 0x3c: // DSLL32
+					case 0x3e: // DSRL32
+					case 0x3f: // DSRA32
+						if (RD(op) != 0)
+						{
+							read(RT(op));
+							define(RD(op));
+						}
+						return true;
+
+					case 0x04: // SLLV
+					case 0x06: // SRLV
+					case 0x07: // SRAV
+					case 0x14: // DSLLV
+					case 0x16: // DSRLV
+					case 0x17: // DSRAV
+						if (RD(op) != 0)
+						{
+							read(RT(op));
+							read(RS(op));
+							define(RD(op));
+						}
+						return true;
+
+					case 0x0a: // MOVZ
+					case 0x0b: // MOVN
+						if (RD(op) != 0)
+						{
+							read(RS(op));
+							read(RT(op));
+							read(RD(op)); // False predicate preserves the old destination.
+						}
+						return true;
+
+					case 0x0f: // SYNC is a PCSX2 no-op.
+						return true;
+
+					case 0x10: // MFHI
+					case 0x12: // MFLO
+					case 0x28: // MFSA
+						define(RD(op));
+						return true;
+
+					case 0x11: // MTHI
+					case 0x13: // MTLO
+					case 0x29: // MTSA
+						read(RS(op));
+						return true;
+
+					case 0x18: // MULT
+					case 0x19: // MULTU
+						read(RS(op));
+						read(RT(op));
+						define(RD(op));
+						return true;
+
+					case 0x1a: // DIV
+					case 0x1b: // DIVU
+						read(RS(op));
+						read(RT(op));
+						return true;
+
+					case 0x20: // ADD, compiled like ADDU by PCSX2's recompiler.
+					case 0x21: // ADDU
+					case 0x22: // SUB, compiled like SUBU by PCSX2's recompiler.
+					case 0x23: // SUBU
+					case 0x24: // AND
+					case 0x25: // OR
+					case 0x26: // XOR
+					case 0x27: // NOR
+					case 0x2a: // SLT
+					case 0x2b: // SLTU
+					case 0x2c: // DADD, compiled like DADDU by PCSX2's recompiler.
+					case 0x2d: // DADDU
+					case 0x2e: // DSUB, compiled like DSUBU by PCSX2's recompiler.
+					case 0x2f: // DSUBU
+						if (RD(op) != 0)
+						{
+							read(RS(op));
+							read(RT(op));
+							define(RD(op));
+						}
+						return true;
+
+					default:
+						return false;
+				}
+
+			case 0x01: // MTSAB / MTSAH share the REGIMM encoding space.
+				if (RT(op) == 0x18 || RT(op) == 0x19)
+				{
+					read(RS(op));
+					return true;
+				}
+				return false;
+
+			case 0x08: // ADDI, compiled like ADDIU by PCSX2's recompiler.
 			case 0x09: // ADDIU
 			case 0x0a: // SLTI
 			case 0x0b: // SLTIU
 			case 0x0c: // ANDI
 			case 0x0d: // ORI
 			case 0x0e: // XORI
+			case 0x18: // DADDI, compiled like DADDIU by PCSX2's recompiler.
 			case 0x19: // DADDIU
-				break;
+				if (RT(op) != 0)
+				{
+					read(RS(op));
+					define(RT(op));
+				}
+				return true;
+
+			case 0x0f: // LUI has no GPR source.
+				define(RT(op));
+				return true;
+
+			case 0x2f: // PCSX2 no-ops IXIN and BFH CACHE forms.
+				return IsNoOpCACHE(op);
+
+			case 0x33: // PREF is a PCSX2 no-op.
+				return true;
+
 			default:
 				return false;
 		}
-
-		const u32 source_bit = 1u << RS(op);
-		if ((defined & source_bit) == 0)
-			live_in_reads |= source_bit;
-		defined |= 1u << RT(op);
-		return true;
 	}
 
 	bool BlockShouldUseCop1ExponentMaskRegister(u32 start_pc, u32 instruction_count)
