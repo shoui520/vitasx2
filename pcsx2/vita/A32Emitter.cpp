@@ -508,10 +508,13 @@ namespace VitaA32
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
 		{
-			if (set_flags || !EncodeModifiedImmediate(0u - value, &encoded))
+			if (!EncodeModifiedImmediate(0u - value, &encoded))
 				return false;
 
+			// For nonzero immediates, ADD x, value and SUB x, -value have
+			// identical results and NZCV. Zero takes the direct ADD path above.
 			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_SUB |
+						   (set_flags ? SET_FLAGS : 0) |
 						   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | encoded);
 		}
 
@@ -539,10 +542,13 @@ namespace VitaA32
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))
 		{
-			if (set_flags || !EncodeModifiedImmediate(0u - value, &encoded))
+			if (!EncodeModifiedImmediate(0u - value, &encoded))
 				return false;
 
+			// The inverse ADD form preserves NZCV as well as the subtraction
+			// result; zero is already encoded as SUB directly.
 			return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_ADD |
+						   (set_flags ? SET_FLAGS : 0) |
 						   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | encoded);
 		}
 

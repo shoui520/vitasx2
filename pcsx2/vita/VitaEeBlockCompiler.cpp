@@ -150,6 +150,7 @@ u32 g_qemuReverseSubtractCarryImmediateFastPaths = 0;
 u32 g_qemuCarryModifiedImmediateFastPaths = 0;
 u32 g_qemuShift64FusedMergeFastPaths = 0;
 u32 g_qemuKnownVariableShiftImmediateFastPaths = 0;
+u32 g_qemuInverseFlagImmediateFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -17344,12 +17345,21 @@ namespace VitaEE
 
 			const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
 			const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
-			if (!(m_code.EmitAddImm32(low_result, guest_low, constant_low, true) ||
-				  (m_code.EmitMovImm32(HOST_TMP2, constant_low) &&
-				   m_code.EmitAddReg(low_result, guest_low, HOST_TMP2, true))))
+			bool low_done = m_code.EmitAddImm32(low_result, guest_low, constant_low, true);
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (low_done && !CanEncodeA32ModifiedImmediate(constant_low) &&
+				CanEncodeA32ModifiedImmediate(0u - constant_low))
 			{
-				return false;
+				g_qemuInverseFlagImmediateFastPaths++;
 			}
+#endif
+			if (!low_done)
+			{
+				low_done = m_code.EmitMovImm32(HOST_TMP2, constant_low) &&
+					m_code.EmitAddReg(low_result, guest_low, HOST_TMP2, true);
+			}
+			if (!low_done)
+				return false;
 
 			bool high_done;
 			if (constant_high == 0xffffffffu)
@@ -17475,12 +17485,21 @@ namespace VitaEE
 
 			const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
 			const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
-			if (!(m_code.EmitSubImm32(low_result, guest_low, constant_low, true) ||
-				  (m_code.EmitMovImm32(HOST_TMP2, constant_low) &&
-				   m_code.EmitSubReg(low_result, guest_low, HOST_TMP2, true))))
+			bool low_done = m_code.EmitSubImm32(low_result, guest_low, constant_low, true);
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (low_done && !CanEncodeA32ModifiedImmediate(constant_low) &&
+				CanEncodeA32ModifiedImmediate(0u - constant_low))
 			{
-				return false;
+				g_qemuInverseFlagImmediateFastPaths++;
 			}
+#endif
+			if (!low_done)
+			{
+				low_done = m_code.EmitMovImm32(HOST_TMP2, constant_low) &&
+					m_code.EmitSubReg(low_result, guest_low, HOST_TMP2, true);
+			}
+			if (!low_done)
+				return false;
 
 			bool high_done;
 			if (constant_high == 0xffffffffu)
