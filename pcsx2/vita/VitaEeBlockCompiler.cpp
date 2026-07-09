@@ -3073,20 +3073,10 @@ namespace VitaEE
 				return CanCompileMMI0(op);
 			case 0x28: // MMI1 class; every accepted op is pure A32/NEON here.
 				return CanCompileMMI1(op);
-			case 0x09: // MMI2 class.
-			{
-				const unsigned sub = (op >> 6) & 0x1f;
-				if (sub == 0x0d || sub == 0x1d) // PDIVW/PDIVBW can call C helpers.
-					return false;
+			case 0x09: // MMI2 class; accepted ops are pure A32/NEON here.
 				return CanCompileMMI2(op);
-			}
-			case 0x29: // MMI3 class.
-			{
-				const unsigned sub = (op >> 6) & 0x1f;
-				if (sub == 0x0d) // PDIVUW can call a C helper.
-					return false;
+			case 0x29: // MMI3 class; accepted ops are pure A32/NEON here.
 				return CanCompileMMI3(op);
-			}
 			default:
 				return false;
 		}
