@@ -5962,6 +5962,33 @@ namespace VitaEE
 		{
 			direct_link->target_offset = target_offset;
 			direct_link->fallback_offset = fallback_offset;
+			direct_link->branch_on_taken = false;
+		}
+		return true;
+	}
+
+	bool BlockCompiler::EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
+		DirectLinkSlot* direct_link)
+	{
+		if (!direct_exit || target_branch == static_cast<size_t>(-1))
+			return false;
+
+		// Reuse the HOST_BRANCH_FLAG selector as the patchable taken link. This
+		// preserves the normal fallback return while avoiding a second taken A32
+		// branch when the guest branch is taken.
+		const size_t fallback_offset = m_code.Size();
+		if (!m_code.PatchBranch(target_branch, fallback_offset, VitaA32::Condition::NE) ||
+			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
+			!m_code.EmitPop(m_saved_registers | REG_PC))
+		{
+			return false;
+		}
+
+		if (direct_link)
+		{
+			direct_link->target_offset = target_branch;
+			direct_link->fallback_offset = fallback_offset;
+			direct_link->branch_on_taken = true;
 		}
 		return true;
 	}
@@ -6238,16 +6265,20 @@ namespace VitaEE
 			if (!EmitDirectLinkTail(direct_exit, direct_link))
 				return false;
 
-			const size_t taken_tail_target = m_code.Size();
-			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE))
-				return false;
-
 			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
 			// tail whose newpc is the loop head (s_branchTo), i.e. the taken
 			// side of the loop branch.
-			const bool taken_tail_ok = wait_loop_taken ?
-				EmitWaitLoopFastForwardTail(event_exit) :
-				EmitDirectLinkTail(direct_exit, taken_link);
+			bool taken_tail_ok = false;
+			if (wait_loop_taken)
+			{
+				const size_t taken_tail_target = m_code.Size();
+				taken_tail_ok = m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) &&
+					EmitWaitLoopFastForwardTail(event_exit);
+			}
+			else
+			{
+				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link);
+			}
 
 			const size_t event_target = m_code.Size();
 			const size_t carry_branches[] = {carry_branch};
@@ -6438,15 +6469,19 @@ namespace VitaEE
 			if (!EmitDirectLinkTail(direct_exit, not_taken_link))
 				return false;
 
-			const size_t taken_tail_target = m_code.Size();
-			if (!m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE))
-				return false;
-
 			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
 			// taken (loop head, s_branchTo) tail of likely loop branches.
-			const bool taken_tail_ok = wait_loop_taken ?
-				EmitWaitLoopFastForwardTail(event_exit) :
-				EmitDirectLinkTail(direct_exit, taken_link);
+			bool taken_tail_ok = false;
+			if (wait_loop_taken)
+			{
+				const size_t taken_tail_target = m_code.Size();
+				taken_tail_ok = m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) &&
+					EmitWaitLoopFastForwardTail(event_exit);
+			}
+			else
+			{
+				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link);
+			}
 
 			const size_t event_target = m_code.Size();
 			const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};

@@ -22,6 +22,7 @@ namespace VitaEE
 		u32 target_pc = 0;
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
+		bool branch_on_taken = false;
 		bool valid = false;
 	};
 
@@ -183,6 +184,8 @@ namespace VitaEE
 		bool EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch);
 		bool EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch, VitaA32::Condition condition);
 		bool EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link);
+		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
+			DirectLinkSlot* direct_link);
 		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag);
 		bool EmitEventExitReturn(const void* event_exit);
 		static bool IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc);

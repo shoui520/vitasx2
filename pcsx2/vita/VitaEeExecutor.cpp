@@ -946,9 +946,11 @@ namespace VitaEE
 
 		const bool target_is_direct_exit =
 			target == reinterpret_cast<const void*>(&VitaEeA32DirectExit);
+		const VitaA32::Condition condition = link.branch_on_taken ?
+			VitaA32::Condition::NE : VitaA32::Condition::AL;
 		const bool patched = target_is_direct_exit ?
-			block.code.PatchBranch(link.target_offset, link.fallback_offset) :
-			block.code.PatchBranchToAddress(link.target_offset, target);
+			block.code.PatchBranch(link.target_offset, link.fallback_offset, condition) :
+			block.code.PatchBranchToAddress(link.target_offset, target, condition);
 		return patched && block.code.Flush();
 	}
 
