@@ -17346,9 +17346,10 @@ namespace VitaEE
 		if (rt == 0)
 		{
 			unsigned rs_high;
+			const unsigned result_reg = SelectGprLowResultHost(rd, HOST_TMP0);
 			return EmitGprWordOperand(rs, 1, HOST_TMP0, &rs_high) &&
-				   m_code.EmitMovRegShiftImm(HOST_TMP0, rs_high, VitaA32::ShiftType::LSR, 31) &&
-				   EmitStoreGprZeroExtended32FromLow(rd, HOST_TMP0);
+				   m_code.EmitMovRegShiftImm(result_reg, rs_high, VitaA32::ShiftType::LSR, 31) &&
+				   EmitStoreGprZeroExtended32FromLow(rd, result_reg);
 		}
 		if (!rs_pinned && rs_known && IsCheapA32CompareConstant64(rs_low_value, rs_high_value))
 		{
