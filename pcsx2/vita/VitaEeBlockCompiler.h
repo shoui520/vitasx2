@@ -527,6 +527,7 @@ namespace VitaEE
 		bool EmitStoreKnown64(unsigned guest_reg, u32 low, u32 high);
 		bool EmitStoreGprSignExtended32FromLow(unsigned guest_reg, unsigned host_low);
 		bool EmitStoreGprZeroExtended32FromLow(unsigned guest_reg, unsigned host_low);
+		unsigned SelectGprLowResultHost(unsigned guest_reg, unsigned fallback_host);
 		void UpdateCop1NormalizedStateAfterOpcode(u32 op);
 		bool TryGetKnownEffectiveAddress(u32 op, u32* address) const;
 		bool BlockNeedsResidentVtlbRegisters(u32 start_pc, u32 instruction_count);

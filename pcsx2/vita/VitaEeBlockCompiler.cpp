@@ -77,6 +77,7 @@ u32 g_qemuGprPinnedHighWordHits = 0;
 u32 g_qemuGprPinSelfStoresElided = 0;
 u32 g_qemuGprPinHighReadOperands = 0;
 u32 g_qemuGprPinExtendedHighStoreOperands = 0;
+u32 g_qemuGprPinLowResultStoreOperands = 0;
 u32 g_qemuGprDirtyPinBlocks = 0;
 u32 g_qemuGprDirtyPinLowStoresElided = 0;
 u32 g_qemuGprDirtyPinHighStoresElided = 0;
@@ -3497,6 +3498,19 @@ namespace VitaEE
 
 		return m_code.EmitMovImm8(high_reg, 0) &&
 			   EmitStoreGpr64(guest_reg, low_reg, high_reg);
+	}
+
+	unsigned BlockCompiler::SelectGprLowResultHost(unsigned guest_reg, unsigned fallback_host)
+	{
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host < 0)
+			return fallback_host;
+
+		// Callers use this only after all source operands have been consumed.
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGprPinLowResultStoreOperands++;
+#endif
+		return static_cast<unsigned>(pin_host);
 	}
 
 	bool BlockCompiler::TryGetKnownEffectiveAddress(u32 op, u32* address) const
@@ -18194,8 +18208,19 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return true;
 
+		const bool direct_result = FindGprPinHost(guest_reg) >= 0;
+		const unsigned result_reg = direct_result ? SelectGprLowResultHost(guest_reg, HOST_TMP4) : HOST_TMP4;
 		if (!signed_compare)
 		{
+			if (direct_result)
+			{
+				return m_code.EmitCmpReg(lhs_high, rhs_high) &&
+					   m_code.EmitCmpReg(lhs_low, rhs_low, VitaA32::Condition::EQ) &&
+					   m_code.EmitMovImm8(result_reg, 0) &&
+					   m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::CC) &&
+					   EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
+			}
+
 			return m_code.EmitMovImm8(HOST_TMP4, 0) &&
 				   m_code.EmitCmpReg(lhs_high, rhs_high) &&
 				   m_code.EmitCmpReg(lhs_low, rhs_low, VitaA32::Condition::EQ) &&
@@ -18203,8 +18228,10 @@ namespace VitaEE
 				   EmitStoreGprZeroExtended32FromLow(guest_reg, HOST_TMP4);
 		}
 
-		if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-			!m_code.EmitCmpReg(lhs_high, rhs_high))
+		if (!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0))
+			return false;
+
+		if (!m_code.EmitCmpReg(lhs_high, rhs_high))
 		{
 			return false;
 		}
@@ -18213,7 +18240,8 @@ namespace VitaEE
 		if (high_equal == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitMovImm8(HOST_TMP4, 1, signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC))
+		if ((direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
+			!m_code.EmitMovImm8(result_reg, 1, signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC))
 			return false;
 
 		const size_t done = m_code.EmitBranchPlaceholder();
@@ -18222,7 +18250,8 @@ namespace VitaEE
 
 		const size_t low_compare = m_code.Size();
 		if (!m_code.EmitCmpReg(lhs_low, rhs_low) ||
-			!m_code.EmitMovImm8(HOST_TMP4, 1, VitaA32::Condition::CC))
+			(direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
+			!m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::CC))
 		{
 			return false;
 		}
@@ -18230,7 +18259,7 @@ namespace VitaEE
 		const size_t done_target = m_code.Size();
 		return m_code.PatchBranch(high_equal, low_compare, VitaA32::Condition::EQ) &&
 			   m_code.PatchBranch(done, done_target) &&
-			   EmitStoreGprZeroExtended32FromLow(guest_reg, HOST_TMP4);
+			   EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
 	}
 
 	bool BlockCompiler::EmitSetLessThan64Known(unsigned guest_reg, bool signed_compare,
@@ -18239,10 +18268,12 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return true;
 
+		const bool direct_result = FindGprPinHost(guest_reg) >= 0;
+		const unsigned result_reg = direct_result ? SelectGprLowResultHost(guest_reg, HOST_TMP4) : HOST_TMP4;
 		unsigned runtime_low = HOST_TMP0;
 		unsigned runtime_high = HOST_TMP1;
 		if (!EmitGpr64ReadOperands(runtime_guest_reg, HOST_TMP0, HOST_TMP1, &runtime_low, &runtime_high) ||
-			!m_code.EmitMovImm8(HOST_TMP4, 0) ||
+			(!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0)) ||
 			!EmitCmpImm32OrReg(runtime_high, known_high, HOST_TMP2))
 		{
 			return false;
@@ -18255,7 +18286,8 @@ namespace VitaEE
 		const VitaA32::Condition high_true =
 			known_is_lhs ? (signed_compare ? VitaA32::Condition::GT : VitaA32::Condition::HI) :
 						   (signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC);
-		if (!m_code.EmitMovImm8(HOST_TMP4, 1, high_true))
+		if ((direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
+			!m_code.EmitMovImm8(result_reg, 1, high_true))
 			return false;
 
 		const size_t done = m_code.EmitBranchPlaceholder();
@@ -18266,7 +18298,8 @@ namespace VitaEE
 		const VitaA32::Condition low_true =
 			known_is_lhs ? VitaA32::Condition::HI : VitaA32::Condition::CC;
 		if (!EmitCmpImm32OrReg(runtime_low, known_low, HOST_TMP2) ||
-			!m_code.EmitMovImm8(HOST_TMP4, 1, low_true))
+			(direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
+			!m_code.EmitMovImm8(result_reg, 1, low_true))
 		{
 			return false;
 		}
@@ -18274,7 +18307,7 @@ namespace VitaEE
 		const size_t done_target = m_code.Size();
 		return m_code.PatchBranch(high_equal, low_compare, VitaA32::Condition::EQ) &&
 			   m_code.PatchBranch(done, done_target) &&
-			   EmitStoreGprZeroExtended32FromLow(guest_reg, HOST_TMP4);
+			   EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
 	}
 
 	bool BlockCompiler::EmitSetLessThan64Imm(unsigned guest_reg, s32 imm, bool signed_compare,
@@ -18287,23 +18320,28 @@ namespace VitaEE
 		// sign-extended to 64 bits, then compared as signed or unsigned.
 		const u32 imm_low = static_cast<u32>(imm);
 		const u32 imm_high = (imm < 0) ? 0xffffffffu : 0u;
+		const bool direct_result = FindGprPinHost(guest_reg) >= 0;
+		const unsigned result_reg = direct_result ? SelectGprLowResultHost(guest_reg, HOST_TMP4) : HOST_TMP4;
 		if (!signed_compare)
 		{
-			if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
+			if ((!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0)) ||
 				!m_code.EmitCmpImm32(lhs_high, imm_high) ||
 				!(m_code.EmitCmpImm32(lhs_low, imm_low, VitaA32::Condition::EQ) ||
 					(m_code.EmitMovImm32(HOST_TMP2, imm_low) &&
 						m_code.EmitCmpReg(lhs_low, HOST_TMP2, VitaA32::Condition::EQ))) ||
-				!m_code.EmitMovImm8(HOST_TMP4, 1, VitaA32::Condition::CC))
+				(direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
+				!m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::CC))
 			{
 				return false;
 			}
 
-			return EmitStoreGprZeroExtended32FromLow(guest_reg, HOST_TMP4);
+			return EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
 		}
 
-		if (!m_code.EmitMovImm8(HOST_TMP4, 0) ||
-			!m_code.EmitCmpImm32(lhs_high, imm_high))
+		if (!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0))
+			return false;
+
+		if (!m_code.EmitCmpImm32(lhs_high, imm_high))
 		{
 			return false;
 		}
@@ -18312,7 +18350,8 @@ namespace VitaEE
 		if (high_equal == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitMovImm8(HOST_TMP4, 1, signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC))
+		if ((direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
+			!m_code.EmitMovImm8(result_reg, 1, signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC))
 			return false;
 
 		const size_t done = m_code.EmitBranchPlaceholder();
@@ -18321,7 +18360,8 @@ namespace VitaEE
 
 		const size_t low_compare = m_code.Size();
 		if (!EmitCmpImm32OrReg(lhs_low, imm_low, HOST_TMP2) ||
-			!m_code.EmitMovImm8(HOST_TMP4, 1, VitaA32::Condition::CC))
+			(direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
+			!m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::CC))
 		{
 			return false;
 		}
@@ -18329,7 +18369,7 @@ namespace VitaEE
 		const size_t done_target = m_code.Size();
 		return m_code.PatchBranch(high_equal, low_compare, VitaA32::Condition::EQ) &&
 			   m_code.PatchBranch(done, done_target) &&
-			   EmitStoreGprZeroExtended32FromLow(guest_reg, HOST_TMP4);
+			   EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
 	}
 
 	bool BlockCompiler::EmitPartialWordLoad(u32 op, bool left)
