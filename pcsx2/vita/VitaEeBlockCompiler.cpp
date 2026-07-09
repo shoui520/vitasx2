@@ -17250,11 +17250,12 @@ namespace VitaEE
 		}
 
 		unsigned rt_low;
-		if (!EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low))
+		unsigned rt_high;
+		if (!EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high))
 			return false;
 
 		return m_code.EmitMovRegShiftImm(HOST_TMP2, rt_low, VitaA32::ShiftType::LSR, static_cast<u8>(32 - amount)) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP1, rt_high, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
 			   m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP2) &&
 			   m_code.EmitMovRegShiftImm(HOST_TMP0, rt_low, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
@@ -17313,13 +17314,14 @@ namespace VitaEE
 		}
 
 		unsigned rt_low;
-		if (!EmitGpr64OperandLow(rt, HOST_TMP0, HOST_TMP1, &rt_low))
+		unsigned rt_high;
+		if (!EmitGpr64ReadOperands(rt, HOST_TMP0, HOST_TMP1, &rt_low, &rt_high))
 			return false;
 
-		return m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP1, VitaA32::ShiftType::LSL, static_cast<u8>(32 - amount)) &&
+		return m_code.EmitMovRegShiftImm(HOST_TMP2, rt_high, VitaA32::ShiftType::LSL, static_cast<u8>(32 - amount)) &&
 			   m_code.EmitMovRegShiftImm(HOST_TMP0, rt_low, VitaA32::ShiftType::LSR, static_cast<u8>(amount)) &&
 			   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, high_shift, static_cast<u8>(amount)) &&
+			   m_code.EmitMovRegShiftImm(HOST_TMP1, rt_high, high_shift, static_cast<u8>(amount)) &&
 			   EmitStoreGpr64(rd, HOST_TMP0, HOST_TMP1);
 	}
 
@@ -20200,23 +20202,6 @@ namespace VitaEE
 
 		return m_code.EmitLdrImm12(fallback_host, HOST_CPU_REGS,
 			static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32)));
-	}
-
-	bool BlockCompiler::EmitGpr64OperandLow(unsigned guest_reg, unsigned fallback_low, unsigned host_high,
-		unsigned* low_operand_host)
-	{
-		// 64-bit reads keep the LDRD pairing when the register is unpinned; a
-		// pinned register supplies the low word directly and only the high word
-		// is loaded. The low operand is read-only for the caller.
-		const int pin_host = FindGprPinHost(guest_reg);
-		if (pin_host >= 0)
-		{
-			*low_operand_host = static_cast<unsigned>(pin_host);
-			return EmitLoadGprHigh(guest_reg, host_high);
-		}
-
-		*low_operand_host = fallback_low;
-		return EmitLoadGpr64(guest_reg, fallback_low, host_high);
 	}
 
 	bool BlockCompiler::EmitGpr64ReadOperands(unsigned guest_reg, unsigned fallback_low,
