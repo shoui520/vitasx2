@@ -3005,6 +3005,19 @@ namespace VitaEE
 					case 0x09: // JALR
 						add_write(rd);
 						return true;
+					case 0x10: // MFHI writes rd through EmitStoreGpr64().
+					case 0x12: // MFLO writes rd through EmitStoreGpr64().
+					case 0x18: // MULT writes rd through EmitStoreGpr64(); LO/HI are not GPR-file state.
+					case 0x19: // MULTU writes rd through EmitStoreGpr64().
+					case 0x28: // MFSA writes rd through EmitStoreGprZeroExtended32FromLow().
+						add_write(rd);
+						return true;
+					case 0x11: // MTHI reads rs pin-aware and writes only HI.
+					case 0x13: // MTLO reads rs pin-aware and writes only LO.
+					case 0x1a: // DIV is fully inline and writes only LO/HI.
+					case 0x1b: // DIVU is fully inline and writes only LO/HI.
+					case 0x29: // MTSA reads rs pin-aware and writes only cpuRegs.sa.
+						return true;
 					default:
 						return false;
 				}
@@ -3021,6 +3034,9 @@ namespace VitaEE
 					case 0x12: // BLTZALL
 					case 0x13: // BGEZALL
 						add_write(31);
+						return true;
+					case 0x18: // MTSAB reads rs pin-aware and writes only cpuRegs.sa.
+					case 0x19: // MTSAH reads rs pin-aware and writes only cpuRegs.sa.
 						return true;
 					default:
 						return false;
@@ -3051,6 +3067,28 @@ namespace VitaEE
 			case 0x19: // DADDIU
 				add_write(rt);
 				return true;
+			case 0x1c:
+				switch (op & 0x3f)
+				{
+					case 0x00: // MADD writes rd through EmitStoreGpr64().
+					case 0x01: // MADDU writes rd through EmitStoreGpr64().
+					case 0x04: // PLZCW writes rd words 0/1 through EmitStoreGprWord().
+					case 0x10: // MFHI1 writes rd through EmitStoreGpr64().
+					case 0x12: // MFLO1 writes rd through EmitStoreGpr64().
+					case 0x18: // MULT1 writes rd through EmitStoreGpr64().
+					case 0x19: // MULTU1 writes rd through EmitStoreGpr64().
+					case 0x20: // MADD1 writes rd through EmitStoreGpr64().
+					case 0x21: // MADDU1 writes rd through EmitStoreGpr64().
+						add_write(rd);
+						return true;
+					case 0x11: // MTHI1 reads rs pin-aware and writes only HI.
+					case 0x13: // MTLO1 reads rs pin-aware and writes only LO.
+					case 0x1a: // DIV1 is fully inline and writes only LO/HI.
+					case 0x1b: // DIVU1 is fully inline and writes only LO/HI.
+						return true;
+					default:
+						return false;
+				}
 			case 0x20: // LB
 			case 0x21: // LH
 			case 0x23: // LW
