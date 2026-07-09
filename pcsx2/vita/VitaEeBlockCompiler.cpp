@@ -120,6 +120,7 @@ u32 g_qemuMmiPackedWordMultiplyVectorOps = 0;
 u32 g_qemuMmiPackedWordMultiplyAddVectorOps = 0;
 u32 g_qemuMmiPackedWordDivideVectorOps = 0;
 u32 g_qemuMmiPackedWordDivideZeroDivisorVectorOps = 0;
+u32 g_qemuMmiPackedWordDivideZeroDividendVectorOps = 0;
 u32 g_qemuMmiPackedHalfwordMultiplyAccumulateVectorOps = 0;
 u32 g_qemuMmiPackedHalfwordPairMultiplyVectorOps = 0;
 u32 g_qemuMmiPackedHalfwordMultiplyVectorOps = 0;
@@ -12105,6 +12106,35 @@ namespace VitaEE
 					   HI_OFFSET, NEON_RS, NEON_SIGN, HOST_TMP2);
 		};
 
+		const auto emit_zero_dividend_vector = [&]() {
+			constexpr unsigned NEON_RT = 0;
+			constexpr unsigned NEON_LO = 1;
+			constexpr unsigned NEON_ZERO = 2;
+			constexpr unsigned NEON_SIGN = 3;
+
+			if (!EmitLoadGprQ128(rt, NEON_RT, HOST_TMP0))
+				return false;
+
+			InvalidateGprQCacheForQreg(NEON_RT);
+			InvalidateGprQCacheForQreg(NEON_LO);
+			InvalidateGprQCacheForQreg(NEON_ZERO);
+			InvalidateGprQCacheForQreg(NEON_SIGN);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuMmiPackedWordDivideVectorOps++;
+			g_qemuMmiPackedWordDivideZeroDividendVectorOps++;
+#endif
+
+			// PCSX2 owners: MMI.cpp::_PDIVW() and _PDIVUW(). With RS=$zero,
+			// nonzero divisors produce LO/HI zero; zero divisors produce LO -1
+			// and still leave HI zero. Compare the divisor vector once, then
+			// store only the active word lanes as sign-extended doublewords.
+			return m_code.EmitVeorQ(NEON_ZERO, NEON_ZERO, NEON_ZERO) &&
+			       m_code.EmitVceqI32Q(NEON_LO, NEON_RT, NEON_ZERO) &&
+			       emit_store_active_word_lanes_as_doublewords(
+					   LO_OFFSET, NEON_LO, NEON_SIGN, HOST_TMP1) &&
+			       EmitStoreCpuRegsQ128(HI_OFFSET, NEON_ZERO, HOST_TMP2);
+		};
+
 		const auto emit_signed_power_of_two_test =
 			[&](unsigned divisor_reg, BranchPatch* scalar_branches,
 				unsigned& scalar_branch_count) {
@@ -12317,6 +12347,9 @@ namespace VitaEE
 
 		if (rt == 0)
 			return emit_zero_divisor_vector();
+
+		if (rs == 0)
+			return emit_zero_dividend_vector();
 
 		if (!load_word(rs, 0, HOST_TMP0) || !load_word(rt, 0, HOST_TMP1) ||
 			!load_word(rs, 2, HOST_TMP2) || !load_word(rt, 2, HOST_TMP3))
