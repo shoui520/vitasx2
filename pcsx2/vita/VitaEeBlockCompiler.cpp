@@ -6304,16 +6304,6 @@ namespace VitaEE
 			g_qemuWaitLoopFastForwardBlocks++;
 #endif
 
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
-			!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
-		{
-			return false;
-		}
-
-		const size_t taken_path = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (taken_path == static_cast<size_t>(-1))
-			return false;
-
 		const auto add_cycles = [this](u32 cycles, size_t* carry_branch) {
 			if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, cycles, true))
 			{
@@ -6332,24 +6322,97 @@ namespace VitaEE
 		};
 
 		size_t not_taken_carry_branch = static_cast<size_t>(-1);
-		if (!add_cycles(not_taken_cycles, &not_taken_carry_branch))
-			return false;
-
-		const size_t cycles_done = m_code.EmitBranchPlaceholder();
-		if (cycles_done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t taken_target = m_code.Size();
 		size_t taken_carry_branch = static_cast<size_t>(-1);
-		if (!m_code.PatchBranch(taken_path, taken_target, VitaA32::Condition::NE) ||
-			!add_cycles(taken_cycles, &taken_carry_branch))
+		const u32 cycle_delta = (taken_cycles >= not_taken_cycles) ?
+			(taken_cycles - not_taken_cycles) : UINT32_MAX;
+		const bool delta_is_power_of_two = cycle_delta != 0 &&
+			(cycle_delta & (cycle_delta - 1)) == 0;
+		const bool delta_is_one_plus_power_of_two = cycle_delta > 1 &&
+			((cycle_delta - 1) & (cycle_delta - 2)) == 0;
+		if (taken_cycles == not_taken_cycles)
 		{
-			return false;
+			if (!EmitAddScaledCyclesToCpuLowWord(taken_cycles, HOST_TMP0, HOST_TMP2,
+					&not_taken_carry_branch))
+			{
+				return false;
+			}
 		}
+		else if (cycle_delta == 1 || delta_is_power_of_two || delta_is_one_plus_power_of_two)
+		{
+			// Every dynamic branch emitter normalizes HOST_BRANCH_FLAG to zero or
+			// one. Fold the scaled delay-slot delta into the addend when A32 can
+			// form flag * delta with one barrel-shifted instruction, rather than
+			// branching between duplicate add/store paths. The common default-op
+			// delta is three: flag + (flag << 1).
+			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)))
+				return false;
 
-		const size_t cycles_done_target = m_code.Size();
-		if (!m_code.PatchBranch(cycles_done, cycles_done_target))
-			return false;
+			if (cycle_delta == 1)
+			{
+				if (!m_code.EmitAddImm32(HOST_TMP2, HOST_BRANCH_FLAG, not_taken_cycles) &&
+					(!m_code.EmitMovImm32(HOST_TMP2, not_taken_cycles) ||
+					 !m_code.EmitAddReg(HOST_TMP2, HOST_BRANCH_FLAG, HOST_TMP2)))
+				{
+					return false;
+				}
+			}
+			else
+			{
+				const u32 shifted_delta = delta_is_power_of_two ? cycle_delta : cycle_delta - 1;
+				u8 shift = 0;
+				while ((1u << shift) != shifted_delta)
+					shift++;
+
+				const bool formed_delta = delta_is_power_of_two ?
+					m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, shift) :
+					m_code.EmitAddRegShiftImm(HOST_TMP2, HOST_BRANCH_FLAG, HOST_BRANCH_FLAG,
+						VitaA32::ShiftType::LSL, shift);
+				if (!formed_delta ||
+					(!m_code.EmitAddImm32(HOST_TMP2, HOST_TMP2, not_taken_cycles) &&
+					 (!m_code.EmitMovImm32(HOST_TMP1, not_taken_cycles) ||
+					  !m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP1))))
+				{
+					return false;
+				}
+			}
+
+			if (!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)))
+			{
+				return false;
+			}
+
+			not_taken_carry_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+			if (not_taken_carry_branch == static_cast<size_t>(-1))
+				return false;
+		}
+		else
+		{
+			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+				!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+			{
+				return false;
+			}
+
+			const size_t taken_path = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (taken_path == static_cast<size_t>(-1) ||
+				!add_cycles(not_taken_cycles, &not_taken_carry_branch))
+			{
+				return false;
+			}
+
+			const size_t cycles_done = m_code.EmitBranchPlaceholder();
+			if (cycles_done == static_cast<size_t>(-1))
+				return false;
+
+			const size_t taken_target = m_code.Size();
+			if (!m_code.PatchBranch(taken_path, taken_target, VitaA32::Condition::NE) ||
+				!add_cycles(taken_cycles, &taken_carry_branch) ||
+				!m_code.PatchBranch(cycles_done, m_code.Size()))
+			{
+				return false;
+			}
+		}
 
 		const size_t cycle_compare_target = m_code.Size();
 		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
