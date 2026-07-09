@@ -147,6 +147,7 @@ u32 g_qemuAndLowMaskBitfieldFastPaths = 0;
 u32 g_qemuNegativeHighCarryFastPaths = 0;
 u32 g_qemuReverseSubtractCarryImmediateFastPaths = 0;
 u32 g_qemuCarryModifiedImmediateFastPaths = 0;
+u32 g_qemuShift64FusedMergeFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -18337,11 +18338,19 @@ namespace VitaEE
 
 		const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
 		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
-		return m_code.EmitMovRegShiftImm(HOST_TMP2, rt_low, VitaA32::ShiftType::LSR, static_cast<u8>(32 - amount)) &&
-			   m_code.EmitMovRegShiftImm(high_result, rt_high, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
-			   m_code.EmitOrrReg(high_result, high_result, HOST_TMP2) &&
-			   m_code.EmitMovRegShiftImm(low_result, rt_low, VitaA32::ShiftType::LSL, static_cast<u8>(amount)) &&
-			   EmitStoreGpr64(rd, low_result, high_result);
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP2, rt_low, VitaA32::ShiftType::LSR,
+				static_cast<u8>(32 - amount)) ||
+			!m_code.EmitOrrRegShiftImm(high_result, HOST_TMP2, rt_high, VitaA32::ShiftType::LSL,
+				static_cast<u8>(amount)) ||
+			!m_code.EmitMovRegShiftImm(low_result, rt_low, VitaA32::ShiftType::LSL,
+				static_cast<u8>(amount)))
+		{
+			return false;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuShift64FusedMergeFastPaths++;
+#endif
+		return EmitStoreGpr64(rd, low_result, high_result);
 	}
 
 	bool BlockCompiler::EmitShift64RightImmediate(u32 op, unsigned amount, bool arithmetic)
@@ -18405,11 +18414,18 @@ namespace VitaEE
 
 		const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
 		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
-		return m_code.EmitMovRegShiftImm(HOST_TMP2, rt_high, VitaA32::ShiftType::LSL, static_cast<u8>(32 - amount)) &&
-			   m_code.EmitMovRegShiftImm(low_result, rt_low, VitaA32::ShiftType::LSR, static_cast<u8>(amount)) &&
-			   m_code.EmitOrrReg(low_result, low_result, HOST_TMP2) &&
-			   m_code.EmitMovRegShiftImm(high_result, rt_high, high_shift, static_cast<u8>(amount)) &&
-			   EmitStoreGpr64(rd, low_result, high_result);
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP2, rt_high, VitaA32::ShiftType::LSL,
+				static_cast<u8>(32 - amount)) ||
+			!m_code.EmitOrrRegShiftImm(low_result, HOST_TMP2, rt_low, VitaA32::ShiftType::LSR,
+				static_cast<u8>(amount)) ||
+			!m_code.EmitMovRegShiftImm(high_result, rt_high, high_shift, static_cast<u8>(amount)))
+		{
+			return false;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuShift64FusedMergeFastPaths++;
+#endif
+		return EmitStoreGpr64(rd, low_result, high_result);
 	}
 
 	bool BlockCompiler::EmitShift64LeftVariable(u32 op)
@@ -18469,12 +18485,15 @@ namespace VitaEE
 		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
 		if (!m_code.EmitRsbImm32(HOST_TMP3, HOST_TMP2, 32) ||
 			!m_code.EmitMovRegShiftReg(HOST_TMP4, HOST_TMP0, VitaA32::ShiftType::LSR, HOST_TMP3) ||
-			!m_code.EmitMovRegShiftReg(high_result, HOST_TMP1, VitaA32::ShiftType::LSL, HOST_TMP2) ||
-			!m_code.EmitOrrReg(high_result, high_result, HOST_TMP4) ||
+			!m_code.EmitOrrRegShiftReg(high_result, HOST_TMP4, HOST_TMP1,
+				VitaA32::ShiftType::LSL, HOST_TMP2) ||
 			!m_code.EmitMovRegShiftReg(low_result, HOST_TMP0, VitaA32::ShiftType::LSL, HOST_TMP2))
 		{
 			return false;
 		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuShift64FusedMergeFastPaths++;
+#endif
 
 		const size_t done_branch = m_code.EmitBranchPlaceholder();
 		if (done_branch == static_cast<size_t>(-1))
@@ -18556,12 +18575,15 @@ namespace VitaEE
 		const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
 		if (!m_code.EmitRsbImm32(HOST_TMP3, HOST_TMP2, 32) ||
 			!m_code.EmitMovRegShiftReg(HOST_TMP4, HOST_TMP1, VitaA32::ShiftType::LSL, HOST_TMP3) ||
-			!m_code.EmitMovRegShiftReg(low_result, HOST_TMP0, VitaA32::ShiftType::LSR, HOST_TMP2) ||
-			!m_code.EmitOrrReg(low_result, low_result, HOST_TMP4) ||
+			!m_code.EmitOrrRegShiftReg(low_result, HOST_TMP4, HOST_TMP0,
+				VitaA32::ShiftType::LSR, HOST_TMP2) ||
 			!m_code.EmitMovRegShiftReg(high_result, HOST_TMP1, high_shift, HOST_TMP2))
 		{
 			return false;
 		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuShift64FusedMergeFastPaths++;
+#endif
 
 		const size_t done_branch = m_code.EmitBranchPlaceholder();
 		if (done_branch == static_cast<size_t>(-1))
