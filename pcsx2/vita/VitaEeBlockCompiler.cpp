@@ -3005,6 +3005,15 @@ namespace VitaEE
 					case 0x09: // JALR
 						add_write(rd);
 						return true;
+					case 0x0c: // SYSCALL syncs pins in its block-ending exception tail.
+					case 0x0d: // BREAK syncs pins in its block-ending exception tail.
+					case 0x30: // TGE
+					case 0x31: // TGEU
+					case 0x32: // TLT
+					case 0x33: // TLTU
+					case 0x34: // TEQ
+					case 0x36: // TNE all sync pins in the block-ending trap tail.
+						return true;
 					case 0x10: // MFHI writes rd through EmitStoreGpr64().
 					case 0x12: // MFLO writes rd through EmitStoreGpr64().
 					case 0x18: // MULT writes rd through EmitStoreGpr64(); LO/HI are not GPR-file state.
@@ -3035,6 +3044,13 @@ namespace VitaEE
 					case 0x13: // BGEZALL
 						add_write(31);
 						return true;
+					case 0x08: // TGEI
+					case 0x09: // TGEIU
+					case 0x0a: // TLTI
+					case 0x0b: // TLTIU
+					case 0x0c: // TEQI
+					case 0x0e: // TNEI all sync pins in the block-ending trap tail.
+						return true;
 					case 0x18: // MTSAB reads rs pin-aware and writes only cpuRegs.sa.
 					case 0x19: // MTSAH reads rs pin-aware and writes only cpuRegs.sa.
 						return true;
@@ -3045,6 +3061,10 @@ namespace VitaEE
 				return true;
 			case 0x03: // JAL
 				add_write(31);
+				return true;
+			case 0x2f: // CACHE reads rs pin-aware; executeCacheOp() touches only
+				// the cache model and guest memory, never the GPR file.
+			case 0x33: // PREF is a PCSX2 no-op.
 				return true;
 			case 0x04: // BEQ
 			case 0x05: // BNE
@@ -4649,43 +4669,42 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitSyncGprPinsToBacking()
 	{
-		if (!m_dirty_pins_enabled)
-			return true;
-
-			for (unsigned i = 0; i < m_pin_count; i++)
-			{
-				const size_t offset = GprOffset(m_pin_guest[i]);
-				if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
-					offset <= 0xff &&
-					CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))
-				{
-					if (!m_code.EmitStrdImm8(m_pin_host[i], m_pin_high_host[i], HOST_CPU_REGS,
-						static_cast<u8>(offset)))
-					{
-						return false;
-					}
-					m_pin_dirty_low[i] = false;
-					m_pin_dirty_high[i] = false;
-					continue;
-				}
-
-				if (!m_code.EmitStrImm12(m_pin_host[i], HOST_CPU_REGS, static_cast<u16>(offset)))
-					return false;
-
-				m_pin_dirty_low[i] = false;
-				if (m_pin_high_host[i] != NO_GPR_PIN_HOST)
-				{
-					if (!m_code.EmitStrImm12(m_pin_high_host[i], HOST_CPU_REGS,
-						static_cast<u16>(offset + sizeof(u32))))
-					{
-						return false;
-					}
-					m_pin_dirty_high[i] = false;
-				}
-			}
-
+	if (!m_dirty_pins_enabled)
 		return true;
+
+	// This sync is emitted inside conditionally executed seams (helper
+	// cold tails, exception tails in likely delay slots), so it must not
+	// clear the compile-time dirty flags: the fall-through path still
+	// needs the block-exit flush to store the deferred words. Pins always
+	// hold the current architected value, so the extra stores are safe.
+	for (unsigned i = 0; i < m_pin_count; i++)
+	{
+		const size_t offset = GprOffset(m_pin_guest[i]);
+		if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+			offset <= 0xff &&
+			CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))
+		{
+			if (!m_code.EmitStrdImm8(m_pin_host[i], m_pin_high_host[i], HOST_CPU_REGS,
+				static_cast<u8>(offset)))
+			{
+				return false;
+			}
+			continue;
+		}
+
+		if (!m_code.EmitStrImm12(m_pin_host[i], HOST_CPU_REGS, static_cast<u16>(offset)))
+			return false;
+
+		if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+			!m_code.EmitStrImm12(m_pin_high_host[i], HOST_CPU_REGS,
+				static_cast<u16>(offset + sizeof(u32))))
+		{
+			return false;
+		}
 	}
+
+	return true;
+}
 
 	bool BlockCompiler::EmitFlushDirtyGprPinsForGuest(unsigned guest_reg)
 	{
@@ -10485,9 +10504,12 @@ namespace VitaEE
 		if (!event_exit || !helper || raw_cycles_through_instruction == 0)
 			return false;
 
+		// The exception helpers read the GPR file (e.g. SYSCALL's $v1), so
+		// deferred pinned words must be resident in backing before the call.
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
+			!EmitSyncGprPinsToBacking() ||
 			!EmitStorePc(pc + 4) ||
 			!m_code.EmitMovImm8(HOST_TMP0, branch_delay_slot ? 1 : 0) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(BRANCH_OFFSET)) ||
