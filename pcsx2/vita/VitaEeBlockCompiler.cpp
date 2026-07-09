@@ -2376,10 +2376,14 @@ namespace VitaEE
 
 	bool BlockCompiler::RequiresBlockEndAfterOpcode(u32 op)
 	{
-		// PCSX2 owners: R5900OpcodeImpl.cpp::LB()/LBU()/LH()/LHU()/LW()
-		// force intUpdateCPUCycles() and intEventTest() for EE counter reads.
 		// R5900OpcodeImpl.cpp::SYNC() is a no-op, but local EE docs still forbid
 		// compiling it inside a branch delay slot, so make it a one-op tail.
+		// Counter-read narrow loads (LB/LH/LW/LBU/LHU) do NOT end blocks: the
+		// PCSX2 x86 comparison point iR5900LoadStore.cpp::recLoad() only ends
+		// the block for a compile-time-constant counter-page address, and the
+		// A32 handler cold tail already ports R5900OpcodeImpl.cpp's runtime
+		// counter check as a mid-block cycle-committing event exit at pc + 4,
+		// so loads continue straight-line blocks like PCSX2 x86 blocks do.
 		switch (op >> 26)
 		{
 			case 0x00:
@@ -2396,12 +2400,6 @@ namespace VitaEE
 				return CanCompileCOP2(op) && !IsFastCOP2InBlock(op);
 			case 0x2f:
 				return IsHelperCACHE(op);
-			case 0x20:
-			case 0x21:
-			case 0x23:
-			case 0x24:
-			case 0x25:
-				return true;
 			default:
 				return false;
 		}
@@ -4838,8 +4836,12 @@ namespace VitaEE
 					return false;
 
 				const u32 next_op = memRead32(pc + 4);
+				// Counter-read loads stay rejected here: their handler cold
+				// tail can event-exit at pc + 4 before the delayed Status.EIE
+				// clear below would run.
 				if (IsSupportedBranchOpcode(next_op) ||
 					(RequiresBlockEndAfterOpcode(next_op) && !IsSYNC(next_op)) ||
+					IsCounterReadLoad(next_op) ||
 					IsCycleCommittingFastCOP0(next_op))
 				{
 					return false;
