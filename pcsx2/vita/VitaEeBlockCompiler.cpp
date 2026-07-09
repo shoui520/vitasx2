@@ -3034,7 +3034,98 @@ namespace VitaEE
 		return false;
 	}
 
-	bool MmiOpcodeKeepsGprQCacheLocal(u32 op)
+	// Pure scalar ops can sit between qword/MMI users without spilling the
+	// block-local NEON qcache; their GPR writes still go through the store seams
+	// that invalidate stale guest mappings.
+	bool ScalarOpcodeKeepsGprQCacheLocal(u32 op)
+	{
+		switch (op >> 26)
+		{
+			case 0x00:
+				switch (op & 0x3f)
+				{
+					case 0x00: // SLL
+					case 0x02: // SRL
+					case 0x03: // SRA
+					case 0x04: // SLLV
+					case 0x06: // SRLV
+					case 0x07: // SRAV
+					case 0x08: // JR
+					case 0x09: // JALR
+					case 0x0a: // MOVZ
+					case 0x0b: // MOVN
+					case 0x0f: // SYNC
+					case 0x14: // DSLLV
+					case 0x16: // DSRLV
+					case 0x17: // DSRAV
+					case 0x20: // ADD
+					case 0x21: // ADDU
+					case 0x22: // SUB
+					case 0x23: // SUBU
+					case 0x24: // AND
+					case 0x25: // OR
+					case 0x26: // XOR
+					case 0x27: // NOR
+					case 0x2a: // SLT
+					case 0x2b: // SLTU
+					case 0x2c: // DADD
+					case 0x2d: // DADDU
+					case 0x2e: // DSUB
+					case 0x2f: // DSUBU
+					case 0x38: // DSLL
+					case 0x3a: // DSRL
+					case 0x3b: // DSRA
+					case 0x3c: // DSLL32
+					case 0x3e: // DSRL32
+					case 0x3f: // DSRA32
+						return true;
+					default:
+						return false;
+				}
+			case 0x01:
+				switch (RT(op))
+				{
+					case 0x00: // BLTZ
+					case 0x01: // BGEZ
+					case 0x02: // BLTZL
+					case 0x03: // BGEZL
+					case 0x10: // BLTZAL
+					case 0x11: // BGEZAL
+					case 0x12: // BLTZALL
+					case 0x13: // BGEZALL
+					case 0x18: // MTSAB
+					case 0x19: // MTSAH
+						return true;
+					default:
+						return false;
+				}
+			case 0x02: // J
+			case 0x03: // JAL
+			case 0x04: // BEQ
+			case 0x05: // BNE
+			case 0x06: // BLEZ
+			case 0x07: // BGTZ
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+			case 0x0a: // SLTI
+			case 0x0b: // SLTIU
+			case 0x0c: // ANDI
+			case 0x0d: // ORI
+			case 0x0e: // XORI
+			case 0x0f: // LUI
+			case 0x14: // BEQL
+			case 0x15: // BNEL
+			case 0x16: // BLEZL
+			case 0x17: // BGTZL
+			case 0x18: // DADDI
+			case 0x19: // DADDIU
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	bool VectorOpcodeKeepsGprQCacheLocal(u32 op)
 	{
 		switch (op >> 26)
 		{
@@ -3096,13 +3187,21 @@ namespace VitaEE
 		if (instruction_count == 0)
 			return false;
 
+		bool has_qcache_user = false;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
-			if (!MmiOpcodeKeepsGprQCacheLocal(memRead32(start_pc + i * 4)))
+			const u32 op = memRead32(start_pc + i * 4);
+			if (VectorOpcodeKeepsGprQCacheLocal(op))
+			{
+				has_qcache_user = true;
+				continue;
+			}
+
+			if (!ScalarOpcodeKeepsGprQCacheLocal(op))
 				return false;
 		}
 
-		return true;
+		return has_qcache_user;
 	}
 
 	void BlockCompiler::ClearGprConstState()
