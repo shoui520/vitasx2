@@ -3506,7 +3506,8 @@ namespace VitaEE
 		if (pin_host < 0)
 			return fallback_host;
 
-		// Callers use this only after all source operands have been consumed.
+		// A32 data-processing results may alias either source operand, and other
+		// callers use this only after all source operands have been consumed.
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuGprPinLowResultStoreOperands++;
 #endif
@@ -10378,18 +10379,19 @@ namespace VitaEE
 		if (!EmitGprLowOperand(rs, HOST_TMP0, &rs_host))
 			return false;
 
-		const bool encoded_imm = (imm >= 0 && m_code.EmitAddImm32(HOST_TMP0, rs_host, static_cast<u32>(imm))) ||
-								 (imm < 0 && m_code.EmitSubImm32(HOST_TMP0, rs_host, static_cast<u32>(-imm)));
+		const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
+		const bool encoded_imm = (imm >= 0 && m_code.EmitAddImm32(result_reg, rs_host, static_cast<u32>(imm))) ||
+								 (imm < 0 && m_code.EmitSubImm32(result_reg, rs_host, static_cast<u32>(-imm)));
 		if (!encoded_imm)
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(imm)) ||
-				!m_code.EmitAddReg(HOST_TMP0, rs_host, HOST_TMP2))
+				!m_code.EmitAddReg(result_reg, rs_host, HOST_TMP2))
 			{
 				return false;
 			}
 		}
 
-		return EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0);
+		return EmitStoreGprSignExtended32FromLow(rt, result_reg);
 	}
 
 	bool BlockCompiler::EmitDADDIU(u32 op)
@@ -10540,16 +10542,17 @@ namespace VitaEE
 		if (!EmitGprLowOperand(rs, HOST_TMP0, &rs_host))
 			return false;
 
-		if (!m_code.EmitAndImm32(HOST_TMP0, rs_host, imm))
+		const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
+		if (!m_code.EmitAndImm32(result_reg, rs_host, imm))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
-				!m_code.EmitAndReg(HOST_TMP0, rs_host, HOST_TMP2))
+				!m_code.EmitAndReg(result_reg, rs_host, HOST_TMP2))
 			{
 				return false;
 			}
 		}
 
-		return EmitStoreGprZeroExtended32FromLow(rt, HOST_TMP0);
+		return EmitStoreGprZeroExtended32FromLow(rt, result_reg);
 	}
 
 	bool BlockCompiler::EmitORI(u32 op)
@@ -10584,16 +10587,17 @@ namespace VitaEE
 		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high))
 			return false;
 
-		if (!m_code.EmitOrrImm32(HOST_TMP0, rs_low, imm))
+		const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
+		if (!m_code.EmitOrrImm32(result_reg, rs_low, imm))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
-				!m_code.EmitOrrReg(HOST_TMP0, rs_low, HOST_TMP2))
+				!m_code.EmitOrrReg(result_reg, rs_low, HOST_TMP2))
 			{
 				return false;
 			}
 		}
 
-		return EmitStoreGpr64(rt, HOST_TMP0, rs_high);
+		return EmitStoreGpr64(rt, result_reg, rs_high);
 	}
 
 	bool BlockCompiler::EmitXORI(u32 op)
@@ -10628,16 +10632,17 @@ namespace VitaEE
 		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high))
 			return false;
 
-		if (!m_code.EmitEorImm32(HOST_TMP0, rs_low, imm))
+		const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
+		if (!m_code.EmitEorImm32(result_reg, rs_low, imm))
 		{
 			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
-				!m_code.EmitEorReg(HOST_TMP0, rs_low, HOST_TMP2))
+				!m_code.EmitEorReg(result_reg, rs_low, HOST_TMP2))
 			{
 				return false;
 			}
 		}
 
-		return EmitStoreGpr64(rt, HOST_TMP0, rs_high);
+		return EmitStoreGpr64(rt, result_reg, rs_high);
 	}
 
 	bool BlockCompiler::EmitLUI(u32 op)
@@ -16389,14 +16394,15 @@ namespace VitaEE
 			if (!EmitGprLowOperand(guest_reg, HOST_TMP0, &guest_host))
 				return false;
 
-			if (!(m_code.EmitAddImm32(HOST_TMP0, guest_host, constant) ||
+			const unsigned result_reg = SelectGprLowResultHost(rd, HOST_TMP0);
+			if (!(m_code.EmitAddImm32(result_reg, guest_host, constant) ||
 				  (m_code.EmitMovImm32(HOST_TMP2, constant) &&
-				   m_code.EmitAddReg(HOST_TMP0, guest_host, HOST_TMP2))))
+				   m_code.EmitAddReg(result_reg, guest_host, HOST_TMP2))))
 			{
 				return false;
 			}
 
-			return EmitStoreGprSignExtended32FromLow(rd, HOST_TMP0);
+			return EmitStoreGprSignExtended32FromLow(rd, result_reg);
 		};
 
 		if (rs == 0 || rt == 0)
@@ -16444,10 +16450,15 @@ namespace VitaEE
 
 		unsigned rs_host;
 		unsigned rt_host;
-		return EmitGprLowOperand(rs, HOST_TMP0, &rs_host) &&
-			   EmitGprLowOperand(rt, HOST_TMP1, &rt_host) &&
-			   m_code.EmitAddReg(HOST_TMP0, rs_host, rt_host) &&
-			   EmitStoreGprSignExtended32FromLow(rd, HOST_TMP0);
+		if (!EmitGprLowOperand(rs, HOST_TMP0, &rs_host) ||
+			!EmitGprLowOperand(rt, HOST_TMP1, &rt_host))
+		{
+			return false;
+		}
+
+		const unsigned result_reg = SelectGprLowResultHost(rd, HOST_TMP0);
+		return m_code.EmitAddReg(result_reg, rs_host, rt_host) &&
+			   EmitStoreGprSignExtended32FromLow(rd, result_reg);
 	}
 
 	bool BlockCompiler::EmitSUBU(u32 op)
@@ -16476,14 +16487,15 @@ namespace VitaEE
 			if (!EmitGprLowOperand(guest_reg, HOST_TMP0, &guest_host))
 				return false;
 
-			if (!(m_code.EmitSubImm32(HOST_TMP0, guest_host, constant) ||
+			const unsigned result_reg = SelectGprLowResultHost(rd, HOST_TMP0);
+			if (!(m_code.EmitSubImm32(result_reg, guest_host, constant) ||
 				  (m_code.EmitMovImm32(HOST_TMP2, constant) &&
-				   m_code.EmitSubReg(HOST_TMP0, guest_host, HOST_TMP2))))
+				   m_code.EmitSubReg(result_reg, guest_host, HOST_TMP2))))
 			{
 				return false;
 			}
 
-			return EmitStoreGprSignExtended32FromLow(rd, HOST_TMP0);
+			return EmitStoreGprSignExtended32FromLow(rd, result_reg);
 		};
 
 		const auto emit_constant_minus_dynamic = [&](unsigned guest_reg, u32 constant) {
@@ -16542,10 +16554,15 @@ namespace VitaEE
 
 		unsigned rs_host;
 		unsigned rt_host;
-		return EmitGprLowOperand(rs, HOST_TMP0, &rs_host) &&
-			   EmitGprLowOperand(rt, HOST_TMP1, &rt_host) &&
-			   m_code.EmitSubReg(HOST_TMP0, rs_host, rt_host) &&
-			   EmitStoreGprSignExtended32FromLow(rd, HOST_TMP0);
+		if (!EmitGprLowOperand(rs, HOST_TMP0, &rs_host) ||
+			!EmitGprLowOperand(rt, HOST_TMP1, &rt_host))
+		{
+			return false;
+		}
+
+		const unsigned result_reg = SelectGprLowResultHost(rd, HOST_TMP0);
+		return m_code.EmitSubReg(result_reg, rs_host, rt_host) &&
+			   EmitStoreGprSignExtended32FromLow(rd, result_reg);
 	}
 
 	bool BlockCompiler::EmitDADDU(u32 op)
