@@ -511,8 +511,13 @@ namespace VitaEE
 		bool EmitPartialDwordStore(u32 op, bool left);
 		bool EmitCounterReadFlagFromAddress(unsigned host_reg);
 		bool EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		struct GprPinDirtyMasks
+		{
+			u8 low = 0;
+			u8 high = 0;
+		};
 		bool EmitAddressErrorEventExit(u32 next_pc, u32 raw_cycles_through_instruction,
-			const void* event_exit, bool store);
+			const void* event_exit, bool store, const GprPinDirtyMasks& dirty_pins);
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
 		bool FlushColdTails();
@@ -549,7 +554,8 @@ namespace VitaEE
 		bool EmitGprPinLoads();
 		bool EmitFlushDirtyGprPins();
 		bool EmitFlushDirtyGprPinsForGuest(unsigned guest_reg);
-		bool EmitSyncGprPinsToBacking();
+		GprPinDirtyMasks CurrentGprPinDirtyMasks() const;
+		bool EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins = nullptr);
 		int FindGprPinIndex(unsigned guest_reg) const;
 		int FindGprPinHost(unsigned guest_reg) const;
 		int FindGprPinHighHost(unsigned guest_reg) const;
@@ -585,9 +591,9 @@ namespace VitaEE
 		bool EmitVu0ViAddress(unsigned host_reg, unsigned vi_reg);
 		bool EmitAlignQwordAddress(unsigned host_reg, unsigned scratch_reg);
 		bool EmitVtlbNonHandlerHostAddress(unsigned host_reg, unsigned vmap_reg, unsigned scratch_reg,
-			size_t* handler_fallback_branch);
+			size_t* handler_fallback_branch, GprPinDirtyMasks* dirty_pins = nullptr);
 		bool EmitVtlbNonHandlerHostAddress128(unsigned host_reg, unsigned vmap_reg, unsigned scratch_reg,
-			size_t* handler_fallback_branch);
+			size_t* handler_fallback_branch, GprPinDirtyMasks* dirty_pins = nullptr);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGprLowRawZero(unsigned guest_reg, unsigned host_reg);
 		bool EmitGprLowOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host);
@@ -641,6 +647,7 @@ namespace VitaEE
 			bool branch_delay_slot = false;
 			bool counter_read_event = false;
 			unsigned address_reg = 0;
+			GprPinDirtyMasks dirty_pins{};
 		};
 
 		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);
@@ -660,6 +667,7 @@ namespace VitaEE
 			bool rt_high_known = false;
 			u32 rt_low = 0;
 			u32 rt_high = 0;
+			GprPinDirtyMasks dirty_pins{};
 		};
 		void CaptureScalarStoreValue(ScalarStoreColdTail* tail);
 		bool EmitScalarStoreColdTail(const ScalarStoreColdTail& tail);
@@ -669,6 +677,7 @@ namespace VitaEE
 			size_t handler_fallback = static_cast<size_t>(-1);
 			size_t join_offset = 0;
 			unsigned rt = 0;
+			GprPinDirtyMasks dirty_pins{};
 		};
 		bool EmitQwordLoadColdTail(const QwordLoadColdTail& tail);
 
@@ -677,6 +686,7 @@ namespace VitaEE
 			size_t handler_fallback = static_cast<size_t>(-1);
 			size_t join_offset = 0;
 			unsigned rt = 0;
+			GprPinDirtyMasks dirty_pins{};
 		};
 		bool EmitQwordStoreColdTail(const QwordStoreColdTail& tail);
 
@@ -687,6 +697,7 @@ namespace VitaEE
 			size_t join_offset = 0;
 			unsigned rt = 0;
 			bool store = false;
+			GprPinDirtyMasks dirty_pins{};
 		};
 		bool EmitCop1WordMemoryColdTail(const Cop1WordMemoryColdTail& tail);
 
@@ -730,6 +741,7 @@ namespace VitaEE
 			u32 rt_low = 0;
 			bool rt_high_known = false;
 			u32 rt_high = 0;
+			GprPinDirtyMasks dirty_pins{};
 		};
 		void CapturePartialStoreValue(PartialMemoryColdTail* tail);
 		bool EmitPartialMemoryColdTail(const PartialMemoryColdTail& tail);
@@ -748,6 +760,7 @@ namespace VitaEE
 		bool m_cop1_exponent_mask_available = false;
 		bool m_vu0_base_available = false;
 			static constexpr unsigned MAX_GPR_PINS = 5;
+			static_assert(MAX_GPR_PINS <= 8);
 			// Per-block read pins: guest GPR low words held in callee-saved host
 			// registers for the whole block, optionally with a companion high word
 			// for hot low64 scalar state. Most blocks remain write-through; a narrow

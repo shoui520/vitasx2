@@ -83,6 +83,8 @@ u32 g_qemuGprDirtyPinBlocks = 0;
 u32 g_qemuGprDirtyPinLowStoresElided = 0;
 u32 g_qemuGprDirtyPinHighStoresElided = 0;
 u32 g_qemuGprDirtyPinFlushStores = 0;
+u32 g_qemuGprPinColdSyncWordsElided = 0;
+u32 g_qemuGprPinColdSyncWordsStored = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
@@ -4848,44 +4850,78 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::EmitSyncGprPinsToBacking()
+	BlockCompiler::GprPinDirtyMasks BlockCompiler::CurrentGprPinDirtyMasks() const
 	{
-	if (!m_dirty_pins_enabled)
-		return true;
-
-	// This sync is emitted inside conditionally executed seams (helper
-	// cold tails, exception tails in likely delay slots), so it must not
-	// clear the compile-time dirty flags: the fall-through path still
-	// needs the block-exit flush to store the deferred words. Pins always
-	// hold the current architected value, so the extra stores are safe.
-	for (unsigned i = 0; i < m_pin_count; i++)
-	{
-		const size_t offset = GprOffset(m_pin_guest[i]);
-		if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
-			offset <= 0xff &&
-			CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))
+		GprPinDirtyMasks masks;
+		for (unsigned i = 0; i < m_pin_count; i++)
 		{
-			if (!m_code.EmitStrdImm8(m_pin_host[i], m_pin_high_host[i], HOST_CPU_REGS,
-				static_cast<u8>(offset)))
+			masks.low |= static_cast<u8>(m_pin_dirty_low[i] ? (1u << i) : 0);
+			masks.high |= static_cast<u8>(m_pin_dirty_high[i] ? (1u << i) : 0);
+		}
+		return masks;
+	}
+
+	bool BlockCompiler::EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins)
+	{
+		if (!m_dirty_pins_enabled)
+			return true;
+		const GprPinDirtyMasks masks = dirty_pins ? *dirty_pins : CurrentGprPinDirtyMasks();
+
+		// PCSX2 owners: x86/iCore.cpp::_deleteGPRtoX86reg() and
+		// _deleteGPRtoXMMreg() write back only MODE_WRITE mappings. This sync is
+		// emitted inside conditionally executed seams (helper cold tails,
+		// exception tails in likely delay slots), so it must not
+		// clear the compile-time dirty flags: the fall-through path still
+		// needs the block-exit flush to store the deferred words. Deferred cold
+		// tails carry the dirty snapshot from their branch point because they are
+		// emitted after the hot block's compile-time flags have been cleared.
+		for (unsigned i = 0; i < m_pin_count; i++)
+		{
+			const bool dirty_low = (masks.low & (1u << i)) != 0;
+			const bool dirty_high = (masks.high & (1u << i)) != 0;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprPinColdSyncWordsElided += !dirty_low;
+			g_qemuGprPinColdSyncWordsStored += dirty_low;
+			if (m_pin_high_host[i] != NO_GPR_PIN_HOST)
+			{
+				g_qemuGprPinColdSyncWordsElided += !dirty_high;
+				g_qemuGprPinColdSyncWordsStored += dirty_high;
+			}
+#endif
+			if (!dirty_low && !dirty_high)
+				continue;
+
+			const size_t offset = GprOffset(m_pin_guest[i]);
+			if (dirty_low && dirty_high &&
+				m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+				offset <= 0xff &&
+				CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))
+			{
+				if (!m_code.EmitStrdImm8(m_pin_host[i], m_pin_high_host[i], HOST_CPU_REGS,
+					static_cast<u8>(offset)))
+				{
+					return false;
+				}
+				continue;
+			}
+
+			if (dirty_low &&
+				!m_code.EmitStrImm12(m_pin_host[i], HOST_CPU_REGS, static_cast<u16>(offset)))
 			{
 				return false;
 			}
-			continue;
+
+			if (dirty_high &&
+				(m_pin_high_host[i] == NO_GPR_PIN_HOST ||
+				 !m_code.EmitStrImm12(m_pin_high_host[i], HOST_CPU_REGS,
+					 static_cast<u16>(offset + sizeof(u32)))))
+			{
+				return false;
+			}
 		}
 
-		if (!m_code.EmitStrImm12(m_pin_host[i], HOST_CPU_REGS, static_cast<u16>(offset)))
-			return false;
-
-		if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
-			!m_code.EmitStrImm12(m_pin_high_host[i], HOST_CPU_REGS,
-				static_cast<u16>(offset + sizeof(u32))))
-		{
-			return false;
-		}
+		return true;
 	}
-
-	return true;
-}
 
 	bool BlockCompiler::EmitFlushDirtyGprPinsForGuest(unsigned guest_reg)
 	{
@@ -16250,9 +16286,11 @@ namespace VitaEE
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitAlignQwordAddress(HOST_TMP0, HOST_TMP1) ||
-			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
+			!EmitVtlbNonHandlerHostAddress128(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins))
 		{
 			return false;
 		}
@@ -16268,6 +16306,7 @@ namespace VitaEE
 			handler_fallback,
 			m_code.Size(),
 			rt,
+			dirty_pins,
 		});
 		return true;
 	}
@@ -16288,6 +16327,7 @@ namespace VitaEE
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
 		{
@@ -16298,7 +16338,8 @@ namespace VitaEE
 		if (unaligned_fallback == static_cast<size_t>(-1))
 			return false;
 
-		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
+		if (!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
 			!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(rt))))
 		{
@@ -16311,6 +16352,7 @@ namespace VitaEE
 			m_code.Size(),
 			rt,
 			false,
+			dirty_pins,
 		});
 		return true;
 	}
@@ -16396,9 +16438,11 @@ namespace VitaEE
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		unsigned rt_host;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
-			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
+			!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
 			!EmitGprLowValueOperand(rt, HOST_TMP1, &rt_host) ||
 			!m_code.EmitStrbImm12(rt_host, HOST_TMP0, 0))
 		{
@@ -16416,6 +16460,7 @@ namespace VitaEE
 			rt,
 			ScalarStoreWidth::Byte,
 		};
+		tail.dirty_pins = dirty_pins;
 		CaptureScalarStoreValue(&tail);
 		m_scalar_store_cold_tails.push_back(tail);
 		return true;
@@ -16437,6 +16482,7 @@ namespace VitaEE
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 1, true))
 		{
@@ -16448,7 +16494,8 @@ namespace VitaEE
 			return false;
 
 		unsigned rt_host;
-		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
+		if (!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
 			!EmitGprLowValueOperand(rt, HOST_TMP1, &rt_host) ||
 			!m_code.EmitStrhImm8(rt_host, HOST_TMP0, 0))
 		{
@@ -16466,6 +16513,7 @@ namespace VitaEE
 			rt,
 			ScalarStoreWidth::Halfword,
 		};
+		tail.dirty_pins = dirty_pins;
 		CaptureScalarStoreValue(&tail);
 		m_scalar_store_cold_tails.push_back(tail);
 		return true;
@@ -16487,6 +16535,7 @@ namespace VitaEE
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
 		{
@@ -16498,7 +16547,8 @@ namespace VitaEE
 			return false;
 
 		unsigned rt_host;
-		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
+		if (!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
 			!EmitGprLowValueOperand(rt, HOST_TMP1, &rt_host) ||
 			!m_code.EmitStrImm12(rt_host, HOST_TMP0, 0))
 		{
@@ -16516,6 +16566,7 @@ namespace VitaEE
 			rt,
 			ScalarStoreWidth::Word,
 		};
+		tail.dirty_pins = dirty_pins;
 		CaptureScalarStoreValue(&tail);
 		m_scalar_store_cold_tails.push_back(tail);
 		return true;
@@ -16554,6 +16605,7 @@ namespace VitaEE
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 7, true))
 		{
@@ -16566,7 +16618,8 @@ namespace VitaEE
 
 		unsigned rt_low;
 		unsigned rt_high;
-		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
+		if (!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
 			!EmitGpr64ValueReadOperands(rt, HOST_TMP2, HOST_TMP3, &rt_low, &rt_high))
 		{
 			return false;
@@ -16597,6 +16650,7 @@ namespace VitaEE
 			rt,
 			ScalarStoreWidth::Dword,
 		};
+		tail.dirty_pins = dirty_pins;
 		CaptureScalarStoreValue(&tail);
 		m_scalar_store_cold_tails.push_back(tail);
 		return true;
@@ -16661,9 +16715,11 @@ namespace VitaEE
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitAlignQwordAddress(HOST_TMP0, HOST_TMP1) ||
-			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
+			!EmitVtlbNonHandlerHostAddress128(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins))
 		{
 			return false;
 		}
@@ -16675,6 +16731,7 @@ namespace VitaEE
 			handler_fallback,
 			m_code.Size(),
 			rt,
+			dirty_pins,
 		});
 		return true;
 	}
@@ -16695,6 +16752,7 @@ namespace VitaEE
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
 		{
@@ -16705,7 +16763,8 @@ namespace VitaEE
 		if (unaligned_fallback == static_cast<size_t>(-1))
 			return false;
 
-		if (!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
+		if (!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(rt))) ||
 			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
 		{
@@ -16718,6 +16777,7 @@ namespace VitaEE
 			m_code.Size(),
 			rt,
 			true,
+			dirty_pins,
 		});
 		return true;
 	}
@@ -19000,6 +19060,7 @@ namespace VitaEE
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitAndImm8(HOST_TMP3, HOST_TMP0, 3) ||
@@ -19014,7 +19075,8 @@ namespace VitaEE
 		}
 
 		if (!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 3) ||
-			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
+			!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins))
 		{
 			return false;
 		}
@@ -19024,12 +19086,14 @@ namespace VitaEE
 			if (!emit_zero_load_skip_counter())
 				return false;
 
-			m_partial_memory_cold_tails.push_back({
+			PartialMemoryColdTail tail{
 				handler_fallback,
 				m_code.Size(),
 				left ? PartialMemoryOp::WordLoadLeft : PartialMemoryOp::WordLoadRight,
 				rt,
-			});
+			};
+			tail.dirty_pins = dirty_pins;
+			m_partial_memory_cold_tails.push_back(tail);
 			return true;
 		}
 
@@ -19098,12 +19162,14 @@ namespace VitaEE
 			}
 		}
 
-		m_partial_memory_cold_tails.push_back({
+		PartialMemoryColdTail tail{
 			handler_fallback,
 			m_code.Size(),
 			left ? PartialMemoryOp::WordLoadLeft : PartialMemoryOp::WordLoadRight,
 			rt,
-		});
+		};
+		tail.dirty_pins = dirty_pins;
+		m_partial_memory_cold_tails.push_back(tail);
 		return true;
 	}
 
@@ -19151,6 +19217,7 @@ namespace VitaEE
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitAndImm8(HOST_TMP3, HOST_TMP0, 3) ||
@@ -19165,7 +19232,8 @@ namespace VitaEE
 		}
 
 		if (!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 3) ||
-			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
+			!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins))
 		{
 			return false;
 		}
@@ -19216,6 +19284,7 @@ namespace VitaEE
 			left ? PartialMemoryOp::WordStoreLeft : PartialMemoryOp::WordStoreRight,
 			rt,
 		};
+		tail.dirty_pins = dirty_pins;
 		CapturePartialStoreValue(&tail);
 		m_partial_memory_cold_tails.push_back(tail);
 		return true;
@@ -19499,11 +19568,13 @@ namespace VitaEE
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitAndImm8(HOST_TMP3, HOST_TMP0, 7) ||
 			!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 7) ||
-			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
+			!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins))
 		{
 			return false;
 		}
@@ -19513,12 +19584,14 @@ namespace VitaEE
 			if (!emit_zero_load_skip_counter())
 				return false;
 
-			m_partial_memory_cold_tails.push_back({
+			PartialMemoryColdTail tail{
 				handler_fallback,
 				m_code.Size(),
 				left ? PartialMemoryOp::DwordLoadLeft : PartialMemoryOp::DwordLoadRight,
 				rt,
-			});
+			};
+			tail.dirty_pins = dirty_pins;
+			m_partial_memory_cold_tails.push_back(tail);
 			return true;
 		}
 
@@ -19546,12 +19619,14 @@ namespace VitaEE
 				return false;
 			}
 
-			m_partial_memory_cold_tails.push_back({
+			PartialMemoryColdTail tail{
 				handler_fallback,
 				m_code.Size(),
 				left ? PartialMemoryOp::DwordLoadLeft : PartialMemoryOp::DwordLoadRight,
 				rt,
-			});
+			};
+			tail.dirty_pins = dirty_pins;
+			m_partial_memory_cold_tails.push_back(tail);
 			return true;
 		}
 
@@ -19635,12 +19710,14 @@ namespace VitaEE
 			return false;
 
 		const size_t join_offset = m_code.Size();
-		m_partial_memory_cold_tails.push_back({
+		PartialMemoryColdTail tail{
 			handler_fallback,
 			join_offset,
 			left ? PartialMemoryOp::DwordLoadLeft : PartialMemoryOp::DwordLoadRight,
 			rt,
-		});
+		};
+		tail.dirty_pins = dirty_pins;
+		m_partial_memory_cold_tails.push_back(tail);
 		return true;
 	}
 
@@ -19706,11 +19783,13 @@ namespace VitaEE
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitAndImm8(HOST_TMP3, HOST_TMP0, 7) ||
 			!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 7) ||
-			!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback))
+			!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins))
 		{
 			return false;
 		}
@@ -19789,6 +19868,7 @@ namespace VitaEE
 			left ? PartialMemoryOp::DwordStoreLeft : PartialMemoryOp::DwordStoreRight,
 			rt,
 		};
+		tail.dirty_pins = dirty_pins;
 		CapturePartialStoreValue(&tail);
 		m_partial_memory_cold_tails.push_back(tail);
 		return true;
@@ -19808,6 +19888,7 @@ namespace VitaEE
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
 		size_t handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks dirty_pins;
 		const auto emit_load_from_host = [&]() -> bool {
 			switch (width)
 			{
@@ -19883,7 +19964,8 @@ namespace VitaEE
 				return false;
 		}
 
-		if (!EmitVtlbNonHandlerHostAddress(address_reg, vmap_reg, scratch_reg, &handler_fallback))
+		if (!EmitVtlbNonHandlerHostAddress(
+				address_reg, vmap_reg, scratch_reg, &handler_fallback, &dirty_pins))
 			return false;
 
 		if (skip_zero_load_result)
@@ -19905,6 +19987,7 @@ namespace VitaEE
 				branch_delay_slot,
 				counter_read_event,
 				address_reg,
+				dirty_pins,
 			});
 			return true;
 		}
@@ -19926,6 +20009,7 @@ namespace VitaEE
 			branch_delay_slot,
 			counter_read_event,
 			address_reg,
+			dirty_pins,
 		});
 		return true;
 	}
@@ -19969,13 +20053,13 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitAddressErrorEventExit(u32 next_pc, u32 raw_cycles_through_instruction,
-		const void* event_exit, bool store)
+		const void* event_exit, bool store, const GprPinDirtyMasks& dirty_pins)
 	{
 			if (!event_exit || raw_cycles_through_instruction == 0)
 				return false;
 
 			const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
-			return EmitSyncGprPinsToBacking() &&
+			return EmitSyncGprPinsToBacking(&dirty_pins) &&
 				   m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP0, VitaA32::ShiftType::LSL, 0) &&
 				   EmitStorePc(next_pc) &&
 				   EmitAddScaledCyclesToCpu(cycles) &&
@@ -20085,7 +20169,8 @@ namespace VitaEE
 			if (!m_code.PatchBranch(tail.unaligned_fallback, address_error_target, VitaA32::Condition::NE) ||
 				(tail.address_reg != HOST_TMP0 &&
 					!m_code.EmitMovRegShiftImm(HOST_TMP0, tail.address_reg, VitaA32::ShiftType::LSL, 0)) ||
-				!EmitAddressErrorEventExit(tail.pc + 4, tail.raw_cycles_through_instruction, tail.event_exit, false))
+				!EmitAddressErrorEventExit(tail.pc + 4, tail.raw_cycles_through_instruction,
+					tail.event_exit, false, tail.dirty_pins))
 			{
 				return false;
 			}
@@ -20099,7 +20184,7 @@ namespace VitaEE
 			{
 				return false;
 			}
-			if (!EmitSyncGprPinsToBacking())
+			if (!EmitSyncGprPinsToBacking(&tail.dirty_pins))
 				return false;
 
 			const bool needs_counter_event = tail.counter_read_event && tail.rt != 0;
@@ -20203,7 +20288,8 @@ namespace VitaEE
 		{
 			const size_t address_error_target = m_code.Size();
 			if (!m_code.PatchBranch(tail.unaligned_fallback, address_error_target, VitaA32::Condition::NE) ||
-				!EmitAddressErrorEventExit(tail.pc + 4, tail.raw_cycles_through_instruction, tail.event_exit, true))
+				!EmitAddressErrorEventExit(tail.pc + 4, tail.raw_cycles_through_instruction,
+					tail.event_exit, true, tail.dirty_pins))
 			{
 				return false;
 			}
@@ -20212,7 +20298,7 @@ namespace VitaEE
 			const size_t fallback_target = m_code.Size();
 			if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
 				return false;
-			if (!EmitSyncGprPinsToBacking())
+			if (!EmitSyncGprPinsToBacking(&tail.dirty_pins))
 				return false;
 
 			switch (tail.width)
@@ -20252,7 +20338,7 @@ namespace VitaEE
 		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!EmitSyncGprPinsToBacking() ||
+			!EmitSyncGprPinsToBacking(&tail.dirty_pins) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memRead128)) ||
 			!EmitStoreGprQ128(tail.rt, NEON_VALUE, HOST_TMP1))
 		{
@@ -20273,7 +20359,7 @@ namespace VitaEE
 		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!EmitSyncGprPinsToBacking() ||
+			!EmitSyncGprPinsToBacking(&tail.dirty_pins) ||
 			!EmitLoadCpuRegsQ128(GprOffset(tail.rt), NEON_VALUE, HOST_TMP1) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memWrite128)))
 		{
@@ -20295,7 +20381,7 @@ namespace VitaEE
 
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!EmitSyncGprPinsToBacking())
+			!EmitSyncGprPinsToBacking(&tail.dirty_pins))
 		{
 			return false;
 		}
@@ -20434,7 +20520,7 @@ namespace VitaEE
 		// deferred pinned words must be resident in backing before the merge.
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!EmitSyncGprPinsToBacking())
+			!EmitSyncGprPinsToBacking(&tail.dirty_pins))
 		{
 			return false;
 		}
@@ -21027,13 +21113,15 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitVtlbNonHandlerHostAddress(unsigned host_reg, unsigned vmap_reg,
-		unsigned scratch_reg, size_t* handler_fallback_branch)
+		unsigned scratch_reg, size_t* handler_fallback_branch, GprPinDirtyMasks* dirty_pins)
 	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead*() / vtlb_memWrite*().
 		// Fast path only mirrors the non-handler VTLB case. Handler-backed
 		// cache/MMIO/unmapped pages branch to the existing PCSX2 helper path.
 		constexpr u8 VTLB_VIRTUAL_ENTRY_SHIFT = 2;
 		static_assert((sizeof(vtlb_private::VTLBVirtual) >> VTLB_VIRTUAL_ENTRY_SHIFT) == 1);
+		if (dirty_pins)
+			*dirty_pins = CurrentGprPinDirtyMasks();
 
 		if (m_vtlb_registers_available)
 		{
@@ -21076,9 +21164,10 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitVtlbNonHandlerHostAddress128(unsigned host_reg, unsigned vmap_reg,
-		unsigned scratch_reg, size_t* handler_fallback_branch)
+		unsigned scratch_reg, size_t* handler_fallback_branch, GprPinDirtyMasks* dirty_pins)
 	{
-		return EmitVtlbNonHandlerHostAddress(host_reg, vmap_reg, scratch_reg, handler_fallback_branch);
+		return EmitVtlbNonHandlerHostAddress(
+			host_reg, vmap_reg, scratch_reg, handler_fallback_branch, dirty_pins);
 	}
 
 	bool BlockCompiler::EmitGprLowOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host)
