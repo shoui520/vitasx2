@@ -83,6 +83,7 @@ u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
 u32 g_qemuGprConstHighWordLoadFastPaths = 0;
 u32 g_qemuGprConstRegisterJumpTargets = 0;
+u32 g_qemuGprConstEffectiveAddresses = 0;
 u32 g_qemuWaitLoopFastForwardBlocks = 0;
 u32 g_qemuScalarZeroLoadSkips = 0;
 u32 g_qemuPartialZeroLoadSkips = 0;
@@ -19517,6 +19518,17 @@ namespace VitaEE
 		// cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_ before vtlb_memRead/Write.
 		if (rs == 0)
 			return m_code.EmitMovImm32(host_reg, static_cast<u32>(imm));
+
+		u32 known_address = 0;
+		if (FindGprPinHost(rs) < 0 && TryGetKnownEffectiveAddress(op, &known_address))
+		{
+			// Known VTLB-fast paths consume constants earlier; this catches the
+			// remaining handler/unaligned tails and avoids a cpuRegs load-use.
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprConstEffectiveAddresses++;
+#endif
+			return m_code.EmitMovImm32(host_reg, known_address);
+		}
 
 		// Callers mutate the address register, so fold a pinned base into the
 		// displacement add instead of returning the pin itself.
