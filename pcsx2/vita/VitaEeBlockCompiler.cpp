@@ -126,6 +126,7 @@ u32 g_qemuMmiPackedHalfwordPairMultiplyVectorOps = 0;
 u32 g_qemuMmiPackedHalfwordMultiplyVectorOps = 0;
 u32 g_qemuMmiPackedWordByHalfwordDivideVectorOps = 0;
 u32 g_qemuMmiPackedWordByHalfwordDivideKnownDivisorFastPaths = 0;
+u32 g_qemuMmiPackedWordByHalfwordDivideZeroDividendVectorOps = 0;
 u32 g_qemuMmiHalfwordShuffleVectorOps = 0;
 u32 g_qemuMmiWordShuffleVectorOps = 0;
 #endif
@@ -12617,6 +12618,55 @@ namespace VitaEE
                    EmitStoreCpuRegsQ128(LO_OFFSET, NEON_RS, HOST_TMP2);
           };
 
+          const auto emit_zero_dividend_vector =
+              [&](bool divisor_known, u32 known_divisor_low) {
+            constexpr unsigned NEON_ZERO = 0;
+            constexpr unsigned NEON_LO = 1;
+
+            InvalidateGprQCacheForQreg(NEON_ZERO);
+            InvalidateGprQCacheForQreg(NEON_LO);
+#if defined(VITASX2_QEMU_VALIDATION)
+            g_qemuMmiPackedWordByHalfwordDivideVectorOps++;
+            g_qemuMmiPackedWordByHalfwordDivideZeroDividendVectorOps++;
+#endif
+
+            const auto emit_zero_lo = [&]() {
+              return EmitStoreCpuRegsQ128(LO_OFFSET, NEON_ZERO, HOST_TMP1);
+            };
+
+            const auto emit_divzero_lo = [&]() {
+              return m_code.EmitVmvnQ(NEON_LO, NEON_ZERO) &&
+                     EmitStoreCpuRegsQ128(LO_OFFSET, NEON_LO, HOST_TMP1);
+            };
+
+            if (!m_code.EmitVeorQ(NEON_ZERO, NEON_ZERO, NEON_ZERO) ||
+                !EmitStoreCpuRegsQ128(HI_OFFSET, NEON_ZERO, HOST_TMP0)) {
+              return false;
+            }
+
+            // PCSX2 owner: MMI.cpp::_PDIVBW(). With RS=$zero, HI is always
+            // zero and LO is only all-ones when the scalar halfword divisor is
+            // zero; otherwise quotient and remainder are both zero.
+            if (divisor_known) {
+              return (static_cast<u16>(known_divisor_low) == 0) ?
+                         emit_divzero_lo() :
+                         emit_zero_lo();
+            }
+
+            BranchPatch divzero_branch{};
+            BranchPatch done_branch{};
+            if (!load_divisor() || !m_code.EmitCmpImm32(HOST_TMP1, 0) ||
+                !emit_branch(divzero_branch, VitaA32::Condition::EQ) ||
+                !emit_zero_lo() ||
+                !emit_branch(done_branch, VitaA32::Condition::AL)) {
+              return false;
+            }
+
+            return patch_branch(divzero_branch, m_code.Size()) &&
+                   emit_divzero_lo() &&
+                   patch_branch(done_branch, m_code.Size());
+          };
+
           // PCSX2 owner: MMI.cpp::_PDIVBW() does signed word / signed halfword,
           // with C truncation toward zero and HI = dividend - quotient *
           // divisor.
@@ -12682,7 +12732,12 @@ namespace VitaEE
           };
 
           u32 known_rt_low = 0;
-          if (TryGetKnownGprLow(rt, &known_rt_low)) {
+          const bool divisor_known = TryGetKnownGprLow(rt, &known_rt_low);
+          if (rs == 0) {
+            return emit_zero_dividend_vector(divisor_known, known_rt_low);
+          }
+
+          if (divisor_known) {
 #if defined(VITASX2_QEMU_VALIDATION)
             g_qemuMmiPackedWordByHalfwordDivideKnownDivisorFastPaths++;
 #endif
