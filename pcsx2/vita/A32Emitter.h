@@ -132,11 +132,12 @@ namespace VitaA32
 		bool EmitCmpReg(unsigned rn, unsigned rm, Condition condition = Condition::AL);
 		bool EmitCmpImm32(unsigned rn, u32 value, Condition condition = Condition::AL);
 		bool EmitTstImm32(unsigned rn, u32 value, Condition condition = Condition::AL);
-		bool EmitLdrImm12(unsigned rd, unsigned rn, u16 offset);
+		bool EmitLdrImm12(unsigned rd, unsigned rn, u16 offset, Condition condition = Condition::AL);
 		bool EmitLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 		bool EmitStrImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitStrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
-		bool EmitLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
+		bool EmitLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
+			Condition condition = Condition::AL);
 		bool EmitStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
 		bool EmitLdrbImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitLdrbRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
@@ -328,11 +329,12 @@ namespace VitaA32
 	u32 EncodeUmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeSmull(unsigned rdlo, unsigned rdhi, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeCmpReg(unsigned rn, unsigned rm, Condition condition = Condition::AL);
-	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset);
+	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset, Condition condition = Condition::AL);
 	u32 EncodeLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 	u32 EncodeStrImm12(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeStrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
-	u32 EncodeLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
+	u32 EncodeLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
+		Condition condition = Condition::AL);
 	u32 EncodeStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
 	u32 EncodeLdrbImm12(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeLdrbRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);

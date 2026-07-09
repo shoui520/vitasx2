@@ -153,6 +153,9 @@ u32 g_qemuKnownVariableShiftImmediateFastPaths = 0;
 u32 g_qemuInverseFlagImmediateFastPaths = 0;
 u32 g_qemuInverseCarryImmediateFastPaths = 0;
 u32 g_qemuEorAllOnesFastPaths = 0;
+u32 g_qemuConditionalMovePredicatedRegisterCopies = 0;
+u32 g_qemuConditionalMovePredicatedKnownCopies = 0;
+u32 g_qemuConditionalMovePredicatedBackingCopies = 0;
 #endif
 
 namespace VitaEE
@@ -919,6 +922,12 @@ namespace VitaEE
 		bool IsCheapA32CompareConstant64(u32 low, u32 high)
 		{
 			return IsCheapA32CompareConstantWord(low) && IsCheapA32CompareConstantWord(high);
+		}
+
+		bool IsSingleInstructionA32MoveConstant(u32 value)
+		{
+			return (value >> 16) == 0 || CanEncodeA32ModifiedImmediate(value) ||
+				CanEncodeA32ModifiedImmediate(~value);
 		}
 
 		constexpr size_t HiloLaneOffset(size_t hilo_offset, bool upper_pipeline)
@@ -18667,26 +18676,75 @@ namespace VitaEE
 		const int rs_high_pin = FindGprPinHighHost(rs);
 		if (m_dirty_pins_enabled && rd_pin_index >= 0 &&
 			m_pin_high_host[rd_pin_index] != NO_GPR_PIN_HOST &&
-			m_pin_dirty_low[rd_pin_index] && m_pin_dirty_high[rd_pin_index] &&
-			rs_low_pin >= 0 && rs_high_pin >= 0)
+			m_pin_dirty_low[rd_pin_index] && m_pin_dirty_high[rd_pin_index])
 		{
-			// The destination is already due for an exit flush, so predicated
-			// register copies replace the Cortex-A9 branch without adding a
-			// false-condition backing-store cost.
-			if (!m_code.EmitMovRegShiftImm(m_pin_host[rd_pin_index],
-					static_cast<unsigned>(rs_low_pin), VitaA32::ShiftType::LSL, 0,
-					false, move_condition) ||
-				!m_code.EmitMovRegShiftImm(m_pin_high_host[rd_pin_index],
-					static_cast<unsigned>(rs_high_pin), VitaA32::ShiftType::LSL, 0,
-					false, move_condition) ||
-				!TryDeferGprPinLowStore(rd) ||
-				!TryDeferGprPinHighStore(rd))
+			// PCSX2 recMOVZtemp_()/recMOVNtemp_() use CMOV for both register and
+			// memory sources. A dirty dword pin already pays its exit flush, so
+			// predicated A32 moves or loads remove the unpredictable branch without
+			// adding a false-condition guest-state store.
+			const unsigned rd_low_host = m_pin_host[rd_pin_index];
+			const unsigned rd_high_host = m_pin_high_host[rd_pin_index];
+			bool predicated_copy = false;
+			if (rs_low_pin >= 0 && rs_high_pin >= 0)
 			{
-				return false;
+				if (!m_code.EmitMovRegShiftImm(rd_low_host,
+						static_cast<unsigned>(rs_low_pin), VitaA32::ShiftType::LSL, 0,
+						false, move_condition) ||
+					!m_code.EmitMovRegShiftImm(rd_high_host,
+						static_cast<unsigned>(rs_high_pin), VitaA32::ShiftType::LSL, 0,
+						false, move_condition))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuConditionalMovePredicatedRegisterCopies++;
+#endif
+				predicated_copy = true;
+			}
+			else
+			{
+				u32 rs_low_value = 0;
+				u32 rs_high_value = 0;
+				const bool rs_known = TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value);
+				if (rs_known && IsSingleInstructionA32MoveConstant(rs_low_value) &&
+					IsSingleInstructionA32MoveConstant(rs_high_value))
+				{
+					if (!m_code.EmitMovImm32(rd_low_host, rs_low_value, move_condition) ||
+						!m_code.EmitMovImm32(rd_high_host, rs_high_value, move_condition))
+					{
+						return false;
+					}
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuConditionalMovePredicatedKnownCopies++;
+#endif
+					predicated_copy = true;
+				}
+				else if (FindGprQCache(rs) < 0)
+				{
+					const size_t offset = GprOffset(rs);
+					if (offset <= 0xff && CanUseA32DualTransferPair(rd_low_host, rd_high_host))
+					{
+						if (!m_code.EmitLdrdImm8(rd_low_host, rd_high_host, HOST_CPU_REGS,
+								static_cast<u8>(offset), move_condition))
+						{
+							return false;
+						}
+#if defined(VITASX2_QEMU_VALIDATION)
+						g_qemuConditionalMovePredicatedBackingCopies++;
+#endif
+						predicated_copy = true;
+					}
+				}
 			}
 
-			InvalidateGprQCacheForGuest(rd);
-			return true;
+			if (predicated_copy)
+			{
+				if (!TryDeferGprPinLowStore(rd) || !TryDeferGprPinHighStore(rd))
+					return false;
+
+				InvalidateGprQCacheForGuest(rd);
+				return true;
+			}
 		}
 
 		const VitaA32::Condition skip_condition = move_on_zero ? VitaA32::Condition::NE : VitaA32::Condition::EQ;

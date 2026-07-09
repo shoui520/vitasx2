@@ -1041,11 +1041,11 @@ namespace VitaA32
 					   ((rn & 0xfu) << 16) | encoded);
 	}
 
-	bool CodeBuffer::EmitLdrImm12(unsigned rd, unsigned rn, u16 offset)
+	bool CodeBuffer::EmitLdrImm12(unsigned rd, unsigned rn, u16 offset, Condition condition)
 	{
 		if (!IsLowRegister(rd) || !IsLowRegister(rn) || offset > 0x0fff)
 			return false;
-		return EmitU32(EncodeLdrImm12(rd, rn, offset));
+		return EmitU32(EncodeLdrImm12(rd, rn, offset, condition));
 	}
 
 	bool CodeBuffer::EmitLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount)
@@ -1069,11 +1069,12 @@ namespace VitaA32
 		return EmitU32(EncodeStrRegShift(rd, rn, rm, shift, amount));
 	}
 
-	bool CodeBuffer::EmitLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset)
+	bool CodeBuffer::EmitLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
+		Condition condition)
 	{
 		if (!IsLowEvenRegisterPair(rdlo, rdhi) || !IsLowRegister(rn))
 			return false;
-		return EmitU32(EncodeLdrdImm8(rdlo, rdhi, rn, offset));
+		return EmitU32(EncodeLdrdImm8(rdlo, rdhi, rn, offset, condition));
 	}
 
 	bool CodeBuffer::EmitStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset)
@@ -2335,12 +2336,12 @@ namespace VitaA32
 		return CondBits(condition) | OPCODE_CMP | SET_FLAGS | ((rn & 0xfu) << 16) | (rm & 0xfu);
 	}
 
-	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset)
+	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset, Condition condition)
 	{
 		pxAssert(IsLowRegister(rd));
 		pxAssert(IsLowRegister(rn));
 		pxAssert(offset <= 0x0fff);
-		return CondBits(Condition::AL) | LDR_IMM | ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | offset;
+		return CondBits(condition) | LDR_IMM | ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | offset;
 	}
 
 	u32 EncodeLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount)
@@ -2373,11 +2374,11 @@ namespace VitaA32
 			   ((static_cast<u32>(shift) & 0x3u) << 5) | (rm & 0xfu);
 	}
 
-	u32 EncodeLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset)
+	u32 EncodeLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset, Condition condition)
 	{
 		pxAssert(IsLowEvenRegisterPair(rdlo, rdhi));
 		pxAssert(IsLowRegister(rn));
-		return CondBits(Condition::AL) | LDRD_IMM | ((rn & 0xfu) << 16) | ((rdlo & 0xfu) << 12) |
+		return CondBits(condition) | LDRD_IMM | ((rn & 0xfu) << 16) | ((rdlo & 0xfu) << 12) |
 			   ((static_cast<u32>(offset) & 0xf0u) << 4) | (offset & 0x0fu);
 	}
 
