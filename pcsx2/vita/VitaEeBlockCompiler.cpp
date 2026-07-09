@@ -123,6 +123,7 @@ u32 g_qemuMmiPackedHalfwordMultiplyAccumulateVectorOps = 0;
 u32 g_qemuMmiPackedHalfwordPairMultiplyVectorOps = 0;
 u32 g_qemuMmiPackedHalfwordMultiplyVectorOps = 0;
 u32 g_qemuMmiPackedWordByHalfwordDivideVectorOps = 0;
+u32 g_qemuMmiPackedWordByHalfwordDivideKnownDivisorFastPaths = 0;
 u32 g_qemuMmiHalfwordShuffleVectorOps = 0;
 u32 g_qemuMmiWordShuffleVectorOps = 0;
 #endif
@@ -12452,13 +12453,22 @@ namespace VitaEE
                    m_code.EmitUxth(HOST_TMP1, rt_low);
           };
 
-          const auto emit_arbitrary_divisor_lane = [&](unsigned lane) {
+          const auto emit_arbitrary_divisor_lane = [&](unsigned lane,
+              bool divisor_known, s32 known_divisor) {
             const size_t lo_offset = LO_OFFSET + lane * sizeof(u32);
             const size_t hi_offset = HI_OFFSET + lane * sizeof(u32);
 
-            if (!EmitLoadGprWord(rs, lane, HOST_TMP0) ||
-                !load_divisor() ||
-                !m_code.EmitSxth(HOST_TMP1, HOST_TMP1)) {
+            if (!EmitLoadGprWord(rs, lane, HOST_TMP0)) {
+              return false;
+            }
+
+            if (divisor_known) {
+              if (!m_code.EmitMovImm32(HOST_TMP1,
+                      static_cast<u32>(known_divisor))) {
+                return false;
+              }
+            } else if (!load_divisor() ||
+                       !m_code.EmitSxth(HOST_TMP1, HOST_TMP1)) {
               return false;
             }
 
@@ -12601,6 +12611,39 @@ namespace VitaEE
                    EmitStoreCpuRegsQ128(HI_OFFSET, NEON_PRODUCT, HOST_TMP1);
           };
 
+          u32 known_rt_low = 0;
+          if (TryGetKnownGprLow(rt, &known_rt_low)) {
+#if defined(VITASX2_QEMU_VALIDATION)
+            g_qemuMmiPackedWordByHalfwordDivideKnownDivisorFastPaths++;
+#endif
+            const u16 raw_divisor = static_cast<u16>(known_rt_low);
+            if (raw_divisor == 0)
+              return emit_divzero_vector();
+            if (raw_divisor == 1)
+              return emit_unit_divisor_vector(false);
+            if (raw_divisor == 0xffffu)
+              return emit_unit_divisor_vector(true);
+
+            const s32 signed_divisor =
+                static_cast<s32>(static_cast<s16>(raw_divisor));
+            const u32 divisor_sign =
+                (signed_divisor < 0) ? 0xffffffffu : 0;
+            const u32 abs_divisor =
+                (static_cast<u32>(signed_divisor) ^ divisor_sign) -
+                divisor_sign;
+            if ((abs_divisor & (abs_divisor - 1)) == 0) {
+              return m_code.EmitMovImm32(HOST_TMP1,
+                         static_cast<u32>(signed_divisor)) &&
+                     m_code.EmitMovImm32(HOST_TMP3, abs_divisor) &&
+                     emit_power_of_two_vector();
+            }
+
+            return emit_arbitrary_divisor_lane(0, true, signed_divisor) &&
+                   emit_arbitrary_divisor_lane(1, true, signed_divisor) &&
+                   emit_arbitrary_divisor_lane(2, true, signed_divisor) &&
+                   emit_arbitrary_divisor_lane(3, true, signed_divisor);
+          }
+
           BranchPatch divzero_branch{};
           BranchPatch divone_branch{};
           BranchPatch negone_branch{};
@@ -12656,10 +12699,10 @@ namespace VitaEE
           }
 
           if (!patch_branch(fallback_branch, m_code.Size()) ||
-              !emit_arbitrary_divisor_lane(0) ||
-              !emit_arbitrary_divisor_lane(1) ||
-              !emit_arbitrary_divisor_lane(2) ||
-              !emit_arbitrary_divisor_lane(3)) {
+              !emit_arbitrary_divisor_lane(0, false, 0) ||
+              !emit_arbitrary_divisor_lane(1, false, 0) ||
+              !emit_arbitrary_divisor_lane(2, false, 0) ||
+              !emit_arbitrary_divisor_lane(3, false, 0)) {
             return false;
           }
 
