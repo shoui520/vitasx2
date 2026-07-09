@@ -653,6 +653,8 @@ namespace VitaA32
 			return false;
 		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
 			return true;
+		if (!set_flags && value == 0xffffffffu)
+			return EmitMvnReg(rd, rn);
 
 		u32 encoded = 0;
 		if (!EncodeModifiedImmediate(value, &encoded))

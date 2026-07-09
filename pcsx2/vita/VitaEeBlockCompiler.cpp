@@ -152,6 +152,7 @@ u32 g_qemuShift64FusedMergeFastPaths = 0;
 u32 g_qemuKnownVariableShiftImmediateFastPaths = 0;
 u32 g_qemuInverseFlagImmediateFastPaths = 0;
 u32 g_qemuInverseCarryImmediateFastPaths = 0;
+u32 g_qemuEorAllOnesFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -2232,8 +2233,13 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitEorImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags)
 	{
-		return m_code.EmitEorImm32(rd, rn, value, set_flags) ||
-			   (m_code.EmitMovImm32(scratch, value) && m_code.EmitEorReg(rd, rn, scratch, set_flags));
+		const bool immediate = m_code.EmitEorImm32(rd, rn, value, set_flags);
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (immediate && !set_flags && value == 0xffffffffu)
+			g_qemuEorAllOnesFastPaths++;
+#endif
+		return immediate ||
+			(m_code.EmitMovImm32(scratch, value) && m_code.EmitEorReg(rd, rn, scratch, set_flags));
 	}
 
 	bool BlockCompiler::EmitBicImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags)
