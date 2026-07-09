@@ -17812,6 +17812,25 @@ namespace VitaEE
 		if (rs == rd)
 			return true;
 
+		const auto emit_source_copy = [this, rs, rd]() {
+			const int rd_low_pin = FindGprPinHost(rd);
+			const int rd_high_pin = FindGprPinHighHost(rd);
+			const int rs_low_pin = FindGprPinHost(rs);
+			const int rs_high_pin = FindGprPinHighHost(rs);
+			if (rd_low_pin >= 0 && rd_high_pin >= 0 && (rs_low_pin < 0 || rs_high_pin < 0))
+			{
+				const unsigned low_result = SelectGprLowResultHost(rd, HOST_TMP0);
+				const unsigned high_result = SelectGprHighResultHost(rd, HOST_TMP1);
+				return EmitLoadGpr64(rs, low_result, high_result) &&
+					   EmitStoreGpr64(rd, low_result, high_result);
+			}
+
+			unsigned rs_low;
+			unsigned rs_high;
+			return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
+				   EmitStoreGpr64(rd, rs_low, rs_high);
+		};
+
 		u32 rt_low_value = 0;
 		u32 rt_high_value = 0;
 		if (TryGetKnownGpr64(rt, &rt_low_value, &rt_high_value))
@@ -17826,10 +17845,7 @@ namespace VitaEE
 			if (FindGprPinHost(rs) < 0 && TryGetKnownGpr64(rs, &rs_low_value, &rs_high_value))
 				return EmitStoreKnown64(rd, rs_low_value, rs_high_value);
 
-			unsigned rs_low;
-			unsigned rs_high;
-			return EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) &&
-				   EmitStoreGpr64(rd, rs_low, rs_high);
+			return emit_source_copy();
 		}
 
 		unsigned rt_low;
@@ -17840,18 +17856,41 @@ namespace VitaEE
 			return false;
 		}
 
+		const VitaA32::Condition move_condition = move_on_zero ? VitaA32::Condition::EQ : VitaA32::Condition::NE;
+		const int rd_pin_index = FindGprPinIndex(rd);
+		const int rs_low_pin = FindGprPinHost(rs);
+		const int rs_high_pin = FindGprPinHighHost(rs);
+		if (m_dirty_pins_enabled && rd_pin_index >= 0 &&
+			m_pin_high_host[rd_pin_index] != NO_GPR_PIN_HOST &&
+			m_pin_dirty_low[rd_pin_index] && m_pin_dirty_high[rd_pin_index] &&
+			rs_low_pin >= 0 && rs_high_pin >= 0)
+		{
+			// The destination is already due for an exit flush, so predicated
+			// register copies replace the Cortex-A9 branch without adding a
+			// false-condition backing-store cost.
+			if (!m_code.EmitMovRegShiftImm(m_pin_host[rd_pin_index],
+					static_cast<unsigned>(rs_low_pin), VitaA32::ShiftType::LSL, 0,
+					false, move_condition) ||
+				!m_code.EmitMovRegShiftImm(m_pin_high_host[rd_pin_index],
+					static_cast<unsigned>(rs_high_pin), VitaA32::ShiftType::LSL, 0,
+					false, move_condition) ||
+				!TryDeferGprPinLowStore(rd) ||
+				!TryDeferGprPinHighStore(rd))
+			{
+				return false;
+			}
+
+			InvalidateGprQCacheForGuest(rd);
+			return true;
+		}
+
 		const VitaA32::Condition skip_condition = move_on_zero ? VitaA32::Condition::NE : VitaA32::Condition::EQ;
 		const size_t skip_store = m_code.EmitBranchPlaceholder(skip_condition);
 		if (skip_store == static_cast<size_t>(-1))
 			return false;
 
-		unsigned rs_low;
-		unsigned rs_high;
-		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) ||
-			!EmitStoreGpr64(rd, rs_low, rs_high))
-		{
+		if (!emit_source_copy())
 			return false;
-		}
 
 		return m_code.PatchBranch(skip_store, m_code.Size(), skip_condition);
 	}
