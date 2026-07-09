@@ -142,6 +142,7 @@ u32 g_qemuMmiPackedWordByHalfwordDivideKnownDivisorFastPaths = 0;
 u32 g_qemuMmiPackedWordByHalfwordDivideZeroDividendVectorOps = 0;
 u32 g_qemuMmiHalfwordShuffleVectorOps = 0;
 u32 g_qemuMmiWordShuffleVectorOps = 0;
+u32 g_qemuSigned64CompareCarryChains = 0;
 #endif
 
 namespace VitaEE
@@ -19068,37 +19069,16 @@ namespace VitaEE
 				   EmitStoreGprZeroExtended32FromLow(guest_reg, HOST_TMP4);
 		}
 
-		if (!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0))
-			return false;
-
-		if (!m_code.EmitCmpReg(lhs_high, rhs_high))
-		{
-			return false;
-		}
-
-		const size_t high_equal = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (high_equal == static_cast<size_t>(-1))
-			return false;
-
-		if ((direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
-			!m_code.EmitMovImm8(result_reg, 1, signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC))
-			return false;
-
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t low_compare = m_code.Size();
-		if (!m_code.EmitCmpReg(lhs_low, rhs_low) ||
-			(direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
-			!m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::CC))
-		{
-			return false;
-		}
-
-		const size_t done_target = m_code.Size();
-		return m_code.PatchBranch(high_equal, low_compare, VitaA32::Condition::EQ) &&
-			   m_code.PatchBranch(done, done_target) &&
+		// Compare the low word first to feed its borrow into the high-word SBCS.
+		// N xor V after that high subtraction is the signed 64-bit predicate,
+		// avoiding the old high-equal and join branches on Cortex-A9.
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSigned64CompareCarryChains++;
+#endif
+		return m_code.EmitCmpReg(lhs_low, rhs_low) &&
+			   m_code.EmitSbcReg(result_reg, lhs_high, rhs_high, true) &&
+			   m_code.EmitMovImm8(result_reg, 0) &&
+			   m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::LT) &&
 			   EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
 	}
 
@@ -19112,8 +19092,46 @@ namespace VitaEE
 		const unsigned result_reg = direct_result ? SelectGprLowResultHost(guest_reg, HOST_TMP4) : HOST_TMP4;
 		unsigned runtime_low = HOST_TMP0;
 		unsigned runtime_high = HOST_TMP1;
-		if (!EmitGpr64ReadOperands(runtime_guest_reg, HOST_TMP0, HOST_TMP1, &runtime_low, &runtime_high) ||
-			(!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0)) ||
+		if (!EmitGpr64ReadOperands(runtime_guest_reg, HOST_TMP0, HOST_TMP1, &runtime_low, &runtime_high))
+			return false;
+
+		if (signed_compare)
+		{
+			// Preserve the low-word borrow through the high-word subtraction.
+			// MOV/MOVW/MOVT do not alter APSR, so one scratch register is enough
+			// when the compile-time operand is on the left.
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSigned64CompareCarryChains++;
+#endif
+			bool compare_ok;
+			if (known_is_lhs)
+			{
+				compare_ok = m_code.EmitMovImm32(HOST_TMP2, known_low) &&
+					m_code.EmitCmpReg(HOST_TMP2, runtime_low) &&
+					m_code.EmitMovImm32(HOST_TMP2, known_high) &&
+					m_code.EmitSbcReg(result_reg, HOST_TMP2, runtime_high, true);
+			}
+			else
+			{
+				compare_ok = EmitCmpImm32OrReg(runtime_low, known_low, HOST_TMP2);
+				if (compare_ok && known_high == 0)
+					compare_ok = m_code.EmitSbcImm8(result_reg, runtime_high, 0, true);
+				else if (compare_ok && known_high == 0xffffffffu)
+					compare_ok = m_code.EmitAdcImm8(result_reg, runtime_high, 0, true);
+				else if (compare_ok)
+				{
+					compare_ok = m_code.EmitMovImm32(HOST_TMP2, known_high) &&
+						m_code.EmitSbcReg(result_reg, runtime_high, HOST_TMP2, true);
+				}
+			}
+
+			return compare_ok &&
+				m_code.EmitMovImm8(result_reg, 0) &&
+				m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::LT) &&
+				EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
+		}
+
+		if ((!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0)) ||
 			!EmitCmpImm32OrReg(runtime_high, known_high, HOST_TMP2))
 		{
 			return false;
@@ -19123,9 +19141,7 @@ namespace VitaEE
 		if (high_equal == static_cast<size_t>(-1))
 			return false;
 
-		const VitaA32::Condition high_true =
-			known_is_lhs ? (signed_compare ? VitaA32::Condition::GT : VitaA32::Condition::HI) :
-						   (signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC);
+		const VitaA32::Condition high_true = known_is_lhs ? VitaA32::Condition::HI : VitaA32::Condition::CC;
 		if ((direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
 			!m_code.EmitMovImm8(result_reg, 1, high_true))
 			return false;
@@ -19178,37 +19194,17 @@ namespace VitaEE
 			return EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
 		}
 
-		if (!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0))
-			return false;
-
-		if (!m_code.EmitCmpImm32(lhs_high, imm_high))
-		{
-			return false;
-		}
-
-		const size_t high_equal = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (high_equal == static_cast<size_t>(-1))
-			return false;
-
-		if ((direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
-			!m_code.EmitMovImm8(result_reg, 1, signed_compare ? VitaA32::Condition::LT : VitaA32::Condition::CC))
-			return false;
-
-		const size_t done = m_code.EmitBranchPlaceholder();
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const size_t low_compare = m_code.Size();
-		if (!EmitCmpImm32OrReg(lhs_low, imm_low, HOST_TMP2) ||
-			(direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
-			!m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::CC))
-		{
-			return false;
-		}
-
-		const size_t done_target = m_code.Size();
-		return m_code.PatchBranch(high_equal, low_compare, VitaA32::Condition::EQ) &&
-			   m_code.PatchBranch(done, done_target) &&
+		// The sign-extended high word is either zero or all ones. For the latter,
+		// high - 0xffffffff - borrow is high + carry, so ADCS preserves the same
+		// N/V signed predicate without materializing the high immediate.
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSigned64CompareCarryChains++;
+#endif
+		return EmitCmpImm32OrReg(lhs_low, imm_low, HOST_TMP2) &&
+			   (imm_high == 0 ? m_code.EmitSbcImm8(result_reg, lhs_high, 0, true) :
+								m_code.EmitAdcImm8(result_reg, lhs_high, 0, true)) &&
+			   m_code.EmitMovImm8(result_reg, 0) &&
+			   m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::LT) &&
 			   EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
 	}
 
