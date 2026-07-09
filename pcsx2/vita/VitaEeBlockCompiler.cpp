@@ -21595,20 +21595,34 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc)
 	{
-		if (!EmitStorePc(fallthrough_pc) ||
-			!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+		if (target_pc == fallthrough_pc)
+			return EmitStorePc(target_pc);
+
+		// PCSX2 owners: Interpreter.cpp::_doBranch_shared() selects the taken
+		// target while x86/ix86-32/iR5900.cpp::SetBranchImm() writes that selected
+		// PC before iBranchTest(). Select the same value with predicated A32 moves
+		// and issue one store, rather than branching over a second full PC store.
+		const u16 fallthrough_upper = static_cast<u16>(fallthrough_pc >> 16);
+		if ((target_pc >> 16) == fallthrough_upper)
+		{
+			// Direct branch targets almost always share the fallthrough PC's upper
+			// half. Select the low MOVW, then materialize their common MOVT once.
+			if (!m_code.EmitMovw(HOST_TMP0, static_cast<u16>(fallthrough_pc)) ||
+				!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0) ||
+				!m_code.EmitMovw(HOST_TMP0, static_cast<u16>(target_pc), VitaA32::Condition::NE) ||
+				(fallthrough_upper != 0 && !m_code.EmitMovt(HOST_TMP0, fallthrough_upper)))
+			{
+				return false;
+			}
+		}
+		else if (!m_code.EmitMovImm32(HOST_TMP0, fallthrough_pc) ||
+			!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0) ||
+			!m_code.EmitMovImm32(HOST_TMP0, target_pc, VitaA32::Condition::NE))
 		{
 			return false;
 		}
 
-		const size_t not_taken = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (not_taken == static_cast<size_t>(-1))
-			return false;
-
-		if (!EmitStorePc(target_pc))
-			return false;
-
-		return m_code.PatchBranch(not_taken, m_code.Size(), VitaA32::Condition::EQ);
+		return m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(PC_OFFSET));
 	}
 
 	bool BlockCompiler::EmitStoreGprZero64(unsigned guest_reg)

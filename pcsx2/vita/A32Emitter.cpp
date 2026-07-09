@@ -440,6 +440,20 @@ namespace VitaA32
 		return EmitU32(EncodeMovImm8(rd, value, condition));
 	}
 
+	bool CodeBuffer::EmitMovw(unsigned rd, u16 value, Condition condition)
+	{
+		if (!IsRegister(rd))
+			return false;
+		return EmitU32(EncodeMovw(rd, value, condition));
+	}
+
+	bool CodeBuffer::EmitMovt(unsigned rd, u16 value, Condition condition)
+	{
+		if (!IsRegister(rd))
+			return false;
+		return EmitU32(EncodeMovt(rd, value, condition));
+	}
+
 	bool CodeBuffer::EmitMovImm32(unsigned rd, u32 value, Condition condition)
 	{
 		if (!IsRegister(rd))
