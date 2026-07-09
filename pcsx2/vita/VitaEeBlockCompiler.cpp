@@ -17345,10 +17345,11 @@ namespace VitaEE
 		// needed.
 		if (sa != 0)
 		{
-			if (!m_code.EmitMovRegShiftImm(HOST_TMP0, rt_host, shift, static_cast<u8>(sa)))
+			const unsigned result_reg = SelectGprLowResultHost(rd, HOST_TMP0);
+			if (!m_code.EmitMovRegShiftImm(result_reg, rt_host, shift, static_cast<u8>(sa)))
 				return false;
 
-			rt_host = HOST_TMP0;
+			rt_host = result_reg;
 		}
 
 		return EmitStoreGprSignExtended32FromLow(rd, rt_host);
@@ -17408,13 +17409,16 @@ namespace VitaEE
 		{
 			unsigned rs_host;
 			if (!EmitGprLowOperand(rs, HOST_TMP2, &rs_host) ||
-				!m_code.EmitAndImm8(HOST_TMP2, rs_host, 0x1f) ||
-				!m_code.EmitMovRegShiftReg(HOST_TMP0, rt_host, shift, HOST_TMP2))
+				!m_code.EmitAndImm8(HOST_TMP2, rs_host, 0x1f))
 			{
 				return false;
 			}
 
-			rt_host = HOST_TMP0;
+			const unsigned result_reg = SelectGprLowResultHost(rd, HOST_TMP0);
+			if (!m_code.EmitMovRegShiftReg(result_reg, rt_host, shift, HOST_TMP2))
+				return false;
+
+			rt_host = result_reg;
 		}
 
 		return EmitStoreGprSignExtended32FromLow(rd, rt_host);
