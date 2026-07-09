@@ -83,6 +83,7 @@ u32 g_qemuGprDirtyPinFlushStores = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
+u32 g_qemuGprConstPinnedStoreOperands = 0;
 u32 g_qemuGprConstHighWordLoadFastPaths = 0;
 u32 g_qemuGprConstRegisterJumpTargets = 0;
 u32 g_qemuGprConstEffectiveAddresses = 0;
@@ -3335,32 +3336,81 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitStoreKnownSignExtended32(unsigned guest_reg, u32 value)
 	{
+		if (guest_reg == 0)
+			return true;
+
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuGprConstResultStores++;
 #endif
 		if (value == 0)
 			return EmitStoreGprZero64(guest_reg);
 
-		return m_code.EmitMovImm32(HOST_TMP0, value) &&
-			   m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::ASR, 31) &&
-			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
+		unsigned low_reg = HOST_TMP0;
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0)
+		{
+			low_reg = static_cast<unsigned>(pin_host);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprConstPinnedStoreOperands++;
+#endif
+		}
+
+		unsigned high_reg = HOST_TMP1;
+		const int high_pin_host = FindGprPinHighHost(guest_reg);
+		if (high_pin_host >= 0)
+		{
+			high_reg = static_cast<unsigned>(high_pin_host);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprConstPinnedStoreOperands++;
+#endif
+		}
+
+		return m_code.EmitMovImm32(low_reg, value) &&
+			   m_code.EmitMovRegShiftImm(high_reg, low_reg, VitaA32::ShiftType::ASR, 31) &&
+			   EmitStoreGpr64(guest_reg, low_reg, high_reg);
 	}
 
 	bool BlockCompiler::EmitStoreKnownZeroExtended32(unsigned guest_reg, u32 value)
 	{
+		if (guest_reg == 0)
+			return true;
+
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuGprConstResultStores++;
 #endif
 		if (value == 0)
 			return EmitStoreGprZero64(guest_reg);
 
-		return m_code.EmitMovImm32(HOST_TMP0, value) &&
-			   m_code.EmitMovImm8(HOST_TMP1, 0) &&
-			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
+		unsigned low_reg = HOST_TMP0;
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0)
+		{
+			low_reg = static_cast<unsigned>(pin_host);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprConstPinnedStoreOperands++;
+#endif
+		}
+
+		unsigned high_reg = HOST_TMP1;
+		const int high_pin_host = FindGprPinHighHost(guest_reg);
+		if (high_pin_host >= 0)
+		{
+			high_reg = static_cast<unsigned>(high_pin_host);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprConstPinnedStoreOperands++;
+#endif
+		}
+
+		return m_code.EmitMovImm32(low_reg, value) &&
+			   m_code.EmitMovImm8(high_reg, 0) &&
+			   EmitStoreGpr64(guest_reg, low_reg, high_reg);
 	}
 
 	bool BlockCompiler::EmitStoreKnown64(unsigned guest_reg, u32 low, u32 high)
 	{
+		if (guest_reg == 0)
+			return true;
+
 		if (high == 0)
 			return EmitStoreKnownZeroExtended32(guest_reg, low);
 		if (high == (static_cast<s32>(low) < 0 ? 0xffffffffu : 0))
@@ -3369,9 +3419,29 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuGprConstResultStores++;
 #endif
-		return m_code.EmitMovImm32(HOST_TMP0, low) &&
-			   m_code.EmitMovImm32(HOST_TMP1, high) &&
-			   EmitStoreGpr64(guest_reg, HOST_TMP0, HOST_TMP1);
+		unsigned low_reg = HOST_TMP0;
+		const int pin_host = FindGprPinHost(guest_reg);
+		if (pin_host >= 0)
+		{
+			low_reg = static_cast<unsigned>(pin_host);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprConstPinnedStoreOperands++;
+#endif
+		}
+
+		unsigned high_reg = HOST_TMP1;
+		const int high_pin_host = FindGprPinHighHost(guest_reg);
+		if (high_pin_host >= 0)
+		{
+			high_reg = static_cast<unsigned>(high_pin_host);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGprConstPinnedStoreOperands++;
+#endif
+		}
+
+		return m_code.EmitMovImm32(low_reg, low) &&
+			   m_code.EmitMovImm32(high_reg, high) &&
+			   EmitStoreGpr64(guest_reg, low_reg, high_reg);
 	}
 
 	bool BlockCompiler::TryGetKnownEffectiveAddress(u32 op, u32* address) const
