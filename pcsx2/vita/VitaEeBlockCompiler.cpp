@@ -3883,27 +3883,44 @@ namespace VitaEE
 		return false;
 	}
 
-	bool BlockNeedsLinkedPcSync(u32 start_pc, u32 instruction_count, bool use_vtlb_registers)
+	static bool Cop0OpcodeNeedsLinkedPcSync(u32 op)
+	{
+		if ((op >> 26) != 0x10)
+			return false;
+
+		const unsigned rs = RS(op);
+		const unsigned rd = RD(op);
+		if (rs == 0x00)
+		{
+			// x86/iCOP0.cpp::recMFC0() requests FLUSH_INTERPRETER only for
+			// live PCR0/PCR1 reads before COP0_UpdatePCCR().
+			return rd == 25 && RT(op) != 0 && (op & 1u) != 0;
+		}
+
+		if (rs != 0x04)
+			return false;
+
+		// x86/iCOP0.cpp::recMTC0() requests FLUSH_INTERPRETER around
+		// WriteCP0Status() and the effective MTPS/PCCR helper pair. Other
+		// MTC0 forms are inline, and system forms write their own PC before exit.
+		return rd == 0x0c ||
+			(rd == 0x19 && (op & 1u) == 0 && (op & 0x3eu) == 0);
+	}
+
+	static bool BlockNeedsLinkedPcSync(u32 start_pc, u32 instruction_count)
 	{
 		// Native links may defer the predecessor's backing-PC write. Only blocks
 		// which can expose cpuRegs.pc before their own exit need to restore the
 		// block-start PC on linked entry. This mirrors PCSX2's iFlushCall(FLUSH_PC)
 		// boundary instead of charging every helper-free ALU/MMI/branch block.
-		if (use_vtlb_registers || EmuConfig.Gamefixes.GoemonTlbHack)
-			return true;
-
-#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-		if (Pcsx2Trace::IsGsTraceEnabled() || Pcsx2Trace::IsVuTraceEnabled())
-			return true;
-#endif
-
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 op = memRead32(start_pc + i * sizeof(u32));
-			if (OpcodeMayUseVtlbFastPath(op) ||
-				(op >> 26) == 0x10 || // COP0 may call perf/status helpers in-block.
-				(op >> 26) == 0x12 || // COP2 may take VU synchronization helpers.
-				((op >> 26) == 0x2f && IsHelperCACHE(op)))
+			// vTLB callbacks may inspect backing EE state. COP2's
+			// FLUSH_FOR_POSSIBLE_MICRO_EXEC, Goemon's block-start calls, CACHE's
+			// executeCacheOp(op, addr), and trace callbacks with an explicit PC do
+			// not request or consume the backing PC.
+			if (OpcodeMayUseVtlbFastPath(op) || Cop0OpcodeNeedsLinkedPcSync(op))
 			{
 				return true;
 			}
@@ -5268,8 +5285,7 @@ namespace VitaEE
 		const bool use_cop1_exponent_mask_register =
 			BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count);
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
-		const bool linked_entry_needs_pc_sync =
-			BlockNeedsLinkedPcSync(start_pc, instruction_count, use_vtlb_registers);
+		const bool linked_entry_needs_pc_sync = BlockNeedsLinkedPcSync(start_pc, instruction_count);
 		const bool dirty_pins_candidate = BlockCanUseDirtyGprPins(start_pc, instruction_count);
 		m_dirty_pins_enabled = false;
 		m_gpr_q_cache_enabled = BlockShouldUseGprQCache(start_pc, instruction_count);
