@@ -172,7 +172,8 @@ namespace VitaEE
 			DirectLinkSlot* direct_link = nullptr, DirectLinkSlot* taken_link = nullptr,
 			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
 			bool wait_loop_taken = false, bool defer_pc_writeback = false,
-			u32 direct_pc = 0, u32 taken_pc = 0, bool conditional_pc = false);
+			u32 direct_pc = 0, u32 taken_pc = 0, bool conditional_pc = false,
+			bool indirect_pc_writeback = false);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
 			const void* event_exit, DirectLinkSlot* not_taken_link = nullptr,
 			DirectLinkSlot* taken_link = nullptr, bool wait_loop_taken = false,
@@ -190,10 +191,11 @@ namespace VitaEE
 			bool defer_pc_writeback = false, u32 pc = 0);
 		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0);
-		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag);
+		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag,
+			bool defer_pc_writeback = false);
 		bool EmitEventExitReturn(const void* event_exit);
 		bool EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc, u32 taken_pc,
-			bool conditional_pc);
+			bool conditional_pc, bool indirect_pc_writeback = false);
 		static bool IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc);
 		bool EmitWaitLoopFastForwardTail(const void* event_exit,
 			bool defer_pc_writeback = false, u32 pc = 0);

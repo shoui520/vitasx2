@@ -94,6 +94,7 @@ u32 g_qemuGprConstRegisterJumpTargets = 0;
 u32 g_qemuGprConstEffectiveAddresses = 0;
 u32 g_qemuWaitLoopFastForwardBlocks = 0;
 u32 g_qemuDeferredPcWritebackBlocks = 0;
+u32 g_qemuDeferredIndirectPcWritebackBlocks = 0;
 u32 g_qemuLinkedPcSyncBlocks = 0;
 u32 g_qemuScalarZeroLoadSkips = 0;
 u32 g_qemuPartialZeroLoadSkips = 0;
@@ -5785,13 +5786,18 @@ namespace VitaEE
 			static_direct_link_target_pc == branch_target_pc && wait_loop_body;
 		const bool can_direct_link = !has_branch || has_static_direct_link_target ||
 			has_static_conditional_direct_links;
-		const bool defer_pc_writeback = direct_links && !whole_wait_loop_fast_forward &&
-			(branch_is_likely ? has_static_likely_direct_links : can_direct_link);
+		const bool defer_indirect_pc_writeback = has_register_branch_target &&
+			indirect_lookup_pages_slot && direct_linking_enabled_flag;
+		const bool defer_pc_writeback = defer_indirect_pc_writeback ||
+			(direct_links && !whole_wait_loop_fast_forward &&
+				(branch_is_likely ? has_static_likely_direct_links : can_direct_link));
 		const u32 direct_pc = has_static_direct_link_target ? static_direct_link_target_pc : next_pc;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (defer_pc_writeback)
 			g_qemuDeferredPcWritebackBlocks++;
+		if (defer_indirect_pc_writeback)
+			g_qemuDeferredIndirectPcWritebackBlocks++;
 #endif
 
 		// Matches the fall-through/branch writeback in x86/ix86-32/iR5900.cpp,
@@ -5874,7 +5880,8 @@ namespace VitaEE
 				has_register_branch_target ? indirect_lookup_pages_slot : nullptr,
 				has_register_branch_target ? direct_linking_enabled_flag : nullptr,
 				wait_loop_taken, defer_pc_writeback,
-				direct_pc, branch_target_pc, has_static_conditional_direct_links))
+				direct_pc, branch_target_pc, has_static_conditional_direct_links,
+				defer_indirect_pc_writeback))
 		{
 			return false;
 		}
@@ -6070,16 +6077,18 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc,
-		u32 taken_pc, bool conditional_pc)
+		u32 taken_pc, bool conditional_pc, bool indirect_pc_writeback)
 	{
 		if (!defer_pc_writeback)
 			return true;
+		if (indirect_pc_writeback)
+			return EmitStorePcFromHostReg(HOST_BRANCH_TARGET);
 
 		return conditional_pc ? EmitStoreBranchPc(taken_pc, direct_pc) : EmitStorePc(direct_pc);
 	}
 
 	bool BlockCompiler::EmitIndirectDispatchTail(const void* lookup_pages_slot,
-		const void* direct_linking_enabled_flag)
+		const void* direct_linking_enabled_flag, bool defer_pc_writeback)
 	{
 		if (!lookup_pages_slot || !direct_linking_enabled_flag)
 			return false;
@@ -6138,6 +6147,7 @@ namespace VitaEE
 			   m_code.PatchBranch(fallback_no_directory, fallback_target, VitaA32::Condition::EQ) &&
 			   m_code.PatchBranch(fallback_no_page, fallback_target, VitaA32::Condition::EQ) &&
 			   m_code.PatchBranch(fallback_no_entry, fallback_target, VitaA32::Condition::EQ) &&
+			   (!defer_pc_writeback || EmitStorePcFromHostReg(HOST_BRANCH_TARGET)) &&
 			   m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) &&
 			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
@@ -6295,7 +6305,7 @@ namespace VitaEE
 		DirectLinkSlot* direct_link, DirectLinkSlot* taken_link,
 		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
 		bool wait_loop_taken, bool defer_pc_writeback,
-		u32 direct_pc, u32 taken_pc, bool conditional_pc)
+		u32 direct_pc, u32 taken_pc, bool conditional_pc, bool indirect_pc_writeback)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
@@ -6363,7 +6373,8 @@ namespace VitaEE
 			const size_t carry_branches[] = {carry_branch};
 			if (!taken_tail_ok ||
 				!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) ||
-				!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc) ||
+				!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc,
+					indirect_pc_writeback) ||
 				!EmitEventExitReturn(event_exit) ||
 				!EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1))
 			{
@@ -6382,12 +6393,14 @@ namespace VitaEE
 		}
 		else if (indirect_lookup_pages_slot && direct_linking_enabled_flag)
 		{
-			if (!EmitIndirectDispatchTail(indirect_lookup_pages_slot, direct_linking_enabled_flag))
+			if (!EmitIndirectDispatchTail(indirect_lookup_pages_slot, direct_linking_enabled_flag,
+					defer_pc_writeback))
 			{
 				return false;
 			}
 		}
-		else if (!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc) ||
+		else if (!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc,
+			indirect_pc_writeback) ||
 			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
 			!m_code.EmitPop(m_saved_registers | REG_PC))
 		{
@@ -6397,7 +6410,8 @@ namespace VitaEE
 		const size_t event_target = m_code.Size();
 		const size_t carry_branches[] = {carry_branch};
 		return m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) &&
-			   EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc) &&
+			   EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc,
+				   indirect_pc_writeback) &&
 			   EmitEventExitReturn(event_exit) &&
 			   EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1);
 	}
