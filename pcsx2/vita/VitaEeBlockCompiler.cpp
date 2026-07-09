@@ -6194,13 +6194,15 @@ namespace VitaEE
 			if ((op & 1u) != 0)
 				return EmitMFC0PerfCounterFast(op, ScaleBlockCycles(raw_cycles_through_instruction));
 
-			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(PERF_OFFSET)) &&
-				   EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0);
+			const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
+			return m_code.EmitLdrImm12(result_reg, HOST_CPU_REGS, static_cast<u16>(PERF_OFFSET)) &&
+				   EmitStoreGprSignExtended32FromLow(rt, result_reg);
 		}
 
 		const size_t cp0_offset = Cp0Offset(rd);
-		return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(cp0_offset)) &&
-			   EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0);
+		const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
+		return m_code.EmitLdrImm12(result_reg, HOST_CPU_REGS, static_cast<u16>(cp0_offset)) &&
+			   EmitStoreGprSignExtended32FromLow(rt, result_reg);
 	}
 
 		bool BlockCompiler::EmitMFC0CountFast(u32 op, u32 scaled_cycles_through_instruction)
@@ -6257,10 +6259,11 @@ namespace VitaEE
 
 			const bool pcr1 = (op & 2u) != 0;
 			const size_t pcr_offset = pcr1 ? PERF_PCR1_OFFSET : PERF_PCR0_OFFSET;
+			const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
 			return EmitAddScaledCyclesToCpu(scaled_cycles_through_instruction) &&
 				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&COP0_UpdatePCCR)) &&
-				   m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(pcr_offset)) &&
-				   EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0);
+				   m_code.EmitLdrImm12(result_reg, HOST_CPU_REGS, static_cast<u16>(pcr_offset)) &&
+				   EmitStoreGprSignExtended32FromLow(rt, result_reg);
 		}
 
 		bool BlockCompiler::EmitMTC0Fast(u32 op, u32 raw_cycles_through_instruction)
@@ -9018,32 +9021,38 @@ namespace VitaEE
 			return EmitLoadGprLow(rt, host_reg);
 		};
 
-	switch ((op >> 21) & 0x1f)
-	{
-		case 0x00: // MFC1
-			if (rt == 0)
-				return true;
-			return m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) &&
-				   EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0);
+		switch ((op >> 21) & 0x1f)
+		{
+			case 0x00: // MFC1
+				if (rt == 0)
+					return true;
+				{
+					const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
+					return m_code.EmitLdrImm12(result_reg, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs))) &&
+						   EmitStoreGprSignExtended32FromLow(rt, result_reg);
+				}
 			case 0x02: // CFC1
 				if (rt == 0)
 					return true;
-				if (fs == 31)
 				{
-					if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))))
+					const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
+					if (fs == 31)
+					{
+						if (!m_code.EmitLdrImm12(result_reg, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))))
+							return false;
+					}
+					else if (fs == 0)
+					{
+						if (!m_code.EmitMovImm32(result_reg, 0x00002e00u))
+							return false;
+					}
+					else if (!m_code.EmitMovImm8(result_reg, 0))
+					{
 						return false;
-				}
-				else if (fs == 0)
-				{
-					if (!m_code.EmitMovImm32(HOST_TMP0, 0x00002e00u))
-						return false;
-				}
-				else if (!m_code.EmitMovImm8(HOST_TMP0, 0))
-				{
-				return false;
-			}
+					}
 
-			return EmitStoreGprSignExtended32FromLow(rt, HOST_TMP0);
+					return EmitStoreGprSignExtended32FromLow(rt, result_reg);
+				}
 			case 0x04: // MTC1
 				return load_rt_low(HOST_TMP0) &&
 					   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(fs)));
