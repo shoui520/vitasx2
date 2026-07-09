@@ -143,6 +143,7 @@ u32 g_qemuMmiPackedWordByHalfwordDivideZeroDividendVectorOps = 0;
 u32 g_qemuMmiHalfwordShuffleVectorOps = 0;
 u32 g_qemuMmiWordShuffleVectorOps = 0;
 u32 g_qemuSigned64CompareCarryChains = 0;
+u32 g_qemuAndLowMaskBitfieldFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -2188,9 +2189,31 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitAndImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags)
 	{
-		return m_code.EmitAndImm32(rd, rn, value, set_flags) ||
-			   (!set_flags && m_code.EmitBicImm32(rd, rn, ~value)) ||
-			   (m_code.EmitMovImm32(scratch, value) && m_code.EmitAndReg(rd, rn, scratch, set_flags));
+		if (m_code.EmitAndImm32(rd, rn, value, set_flags) ||
+			(!set_flags && m_code.EmitBicImm32(rd, rn, ~value)))
+		{
+			return true;
+		}
+
+		// UBFX is an exact one-instruction AND for a contiguous low mask when
+		// APSR is not observed. This avoids materializing common 9-23-bit EE and
+		// FPU masks which A32's modified-immediate encoding cannot represent.
+		if (!set_flags && value != 0 && value != 0xffffffffu && (value & (value + 1u)) == 0)
+		{
+			u8 width = 0;
+			for (u32 remaining = value; remaining != 0; remaining >>= 1)
+				width++;
+
+			if (m_code.EmitUbfx(rd, rn, 0, width))
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuAndLowMaskBitfieldFastPaths++;
+#endif
+				return true;
+			}
+		}
+
+		return m_code.EmitMovImm32(scratch, value) && m_code.EmitAndReg(rd, rn, scratch, set_flags);
 	}
 
 	bool BlockCompiler::EmitOrrImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags)
@@ -11184,16 +11207,8 @@ namespace VitaEE
 			return false;
 
 		const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
-		if (!m_code.EmitAndImm32(result_reg, rs_host, imm))
-		{
-			if (!m_code.EmitMovImm32(HOST_TMP2, imm) ||
-				!m_code.EmitAndReg(result_reg, rs_host, HOST_TMP2))
-			{
-				return false;
-			}
-		}
-
-		return EmitStoreGprZeroExtended32FromLow(rt, result_reg);
+		return EmitAndImm32OrReg(result_reg, rs_host, imm, HOST_TMP2) &&
+			   EmitStoreGprZeroExtended32FromLow(rt, result_reg);
 	}
 
 	bool BlockCompiler::EmitORI(u32 op)
