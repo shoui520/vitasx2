@@ -74,6 +74,7 @@ u32 g_qemuGprPinnedRegisters = 0;
 u32 g_qemuGprPinnedDwordRegisters = 0;
 u32 g_qemuGprPinnedVtlbFreeHostRegisters = 0;
 u32 g_qemuGprPinnedHighWordHits = 0;
+u32 g_qemuGprPinSelfStoresElided = 0;
 u32 g_qemuGprDirtyPinBlocks = 0;
 u32 g_qemuGprDirtyPinLowStoresElided = 0;
 u32 g_qemuGprDirtyPinHighStoresElided = 0;
@@ -20543,24 +20544,32 @@ namespace VitaEE
 		if (word == 0)
 		{
 			const int pin_host = FindGprPinHost(guest_reg);
-			if (pin_host >= 0 &&
+			if (pin_host >= 0 && static_cast<unsigned>(pin_host) != host_reg &&
 				!m_code.EmitMovRegShiftImm(static_cast<unsigned>(pin_host), host_reg,
 					VitaA32::ShiftType::LSL, 0))
 			{
 				return false;
 			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (pin_host >= 0 && static_cast<unsigned>(pin_host) == host_reg)
+				g_qemuGprPinSelfStoresElided++;
+#endif
 
 			deferred = TryDeferGprPinLowStore(guest_reg);
 		}
 		else if (word == 1)
 		{
 			const int high_pin_host = FindGprPinHighHost(guest_reg);
-			if (high_pin_host >= 0 &&
+			if (high_pin_host >= 0 && static_cast<unsigned>(high_pin_host) != host_reg &&
 				!m_code.EmitMovRegShiftImm(static_cast<unsigned>(high_pin_host), host_reg,
 					VitaA32::ShiftType::LSL, 0))
 			{
 				return false;
 			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (high_pin_host >= 0 && static_cast<unsigned>(high_pin_host) == host_reg)
+				g_qemuGprPinSelfStoresElided++;
+#endif
 
 			deferred = TryDeferGprPinHighStore(guest_reg);
 		}
@@ -20584,12 +20593,16 @@ namespace VitaEE
 		// PCSX2 VU0.cpp::CFC2(REG_R) updates only GPR.UL[0]. Keep the
 		// low-word pin in sync while preserving the existing high word.
 		const int pin_host = FindGprPinHost(guest_reg);
-		if (pin_host >= 0 &&
+		if (pin_host >= 0 && static_cast<unsigned>(pin_host) != host_low &&
 			!m_code.EmitMovRegShiftImm(static_cast<unsigned>(pin_host), host_low,
 				VitaA32::ShiftType::LSL, 0))
 		{
 			return false;
 		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (pin_host >= 0 && static_cast<unsigned>(pin_host) == host_low)
+			g_qemuGprPinSelfStoresElided++;
+#endif
 
 		const bool deferred = TryDeferGprPinLowStore(guest_reg);
 		if (!deferred &&
@@ -20610,20 +20623,28 @@ namespace VitaEE
 		// Most blocks keep memory authoritative immediately. The vetted scalar
 		// subset defers only pinned low/high words and flushes them at block exit.
 		const int pin_host = FindGprPinHost(guest_reg);
-		if (pin_host >= 0 &&
+		if (pin_host >= 0 && static_cast<unsigned>(pin_host) != host_low &&
 			!m_code.EmitMovRegShiftImm(static_cast<unsigned>(pin_host), host_low,
 				VitaA32::ShiftType::LSL, 0))
 		{
 			return false;
 		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (pin_host >= 0 && static_cast<unsigned>(pin_host) == host_low)
+			g_qemuGprPinSelfStoresElided++;
+#endif
 
 		const int high_pin_host = FindGprPinHighHost(guest_reg);
-		if (high_pin_host >= 0 &&
+		if (high_pin_host >= 0 && static_cast<unsigned>(high_pin_host) != host_high &&
 			!m_code.EmitMovRegShiftImm(static_cast<unsigned>(high_pin_host), host_high,
 				VitaA32::ShiftType::LSL, 0))
 		{
 			return false;
 		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (high_pin_host >= 0 && static_cast<unsigned>(high_pin_host) == host_high)
+			g_qemuGprPinSelfStoresElided++;
+#endif
 
 		const bool defer_low = TryDeferGprPinLowStore(guest_reg);
 		const bool defer_high = TryDeferGprPinHighStore(guest_reg);
