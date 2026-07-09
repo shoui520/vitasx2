@@ -10876,22 +10876,51 @@ namespace VitaEE
 				return false;
 		}
 
+		unsigned result_low = HOST_TMP2;
+		if (rd != 0)
+		{
+			const int low_pin = FindGprPinHost(rd);
+			if (low_pin >= 0)
+			{
+				const unsigned low_candidate = static_cast<unsigned>(low_pin);
+				if (low_candidate != HOST_TMP3)
+				{
+					result_low = low_candidate;
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuGprPinLowResultStoreOperands++;
+#endif
+				}
+			}
+		}
+
 		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(hi_offset)) ||
-			!m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP0, true) ||
+			!m_code.EmitAddReg(result_low, HOST_TMP2, HOST_TMP0, true) ||
 			!m_code.EmitAdcReg(HOST_TMP3, HOST_TMP3, HOST_TMP1))
 		{
 			return false;
 		}
 
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP2, VitaA32::ShiftType::ASR, 31) ||
-			!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
-			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(lo_offset + sizeof(u32))))
+		unsigned rd_high = HOST_TMP0;
+		if (rd != 0)
+		{
+			const int high_pin = FindGprPinHighHost(rd);
+			if (high_pin >= 0)
+			{
+				const unsigned high_candidate = static_cast<unsigned>(high_pin);
+				if (high_candidate != result_low && high_candidate != HOST_TMP3)
+					rd_high = high_candidate;
+			}
+		}
+
+		if (!m_code.EmitMovRegShiftImm(rd_high, result_low, VitaA32::ShiftType::ASR, 31) ||
+			!m_code.EmitStrImm12(result_low, HOST_CPU_REGS, static_cast<u16>(lo_offset)) ||
+			!m_code.EmitStrImm12(rd_high, HOST_CPU_REGS, static_cast<u16>(lo_offset + sizeof(u32))))
 		{
 			return false;
 		}
 
-		if (rd != 0 && !EmitStoreGpr64(rd, HOST_TMP2, HOST_TMP0))
+		if (rd != 0 && !EmitStoreGpr64(rd, result_low, rd_high))
 			return false;
 
 		return m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3, VitaA32::ShiftType::ASR, 31) &&
