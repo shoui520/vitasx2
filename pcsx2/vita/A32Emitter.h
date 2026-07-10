@@ -157,6 +157,8 @@ namespace VitaA32
 		bool EmitVst1Q32(unsigned qd, unsigned rn);
 		bool EmitVst1Q32Aligned(unsigned qd, unsigned rn);
 		bool EmitVst1D32(unsigned dd, unsigned rn);
+		bool EmitVst1D8Lane0(unsigned dd, unsigned rn);
+		bool EmitVst1D16Lane0(unsigned dd, unsigned rn);
 		bool EmitVldrSImm(unsigned sd, unsigned rn, u16 offset);
 		bool EmitVstrSImm(unsigned sd, unsigned rn, u16 offset);
 		bool EmitVldrDImm(unsigned dd, unsigned rn, u16 offset);
@@ -229,6 +231,7 @@ namespace VitaA32
 		bool EmitVqsubU32Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVqabsS16Q(unsigned qd, unsigned qm);
 		bool EmitVqabsS32Q(unsigned qd, unsigned qm);
+		bool EmitVclsS32Q(unsigned qd, unsigned qm);
 		bool EmitVrev64I32D(unsigned dd, unsigned dm);
 		bool EmitVrev64I32Q(unsigned qd, unsigned qm);
 		bool EmitVrev64I16Q(unsigned qd, unsigned qm);
@@ -256,7 +259,9 @@ namespace VitaA32
 				Condition condition = Condition::AL);
 			bool PatchNop(size_t instruction_offset);
 			bool EmitPush(u16 register_list);
+		bool EmitVpushDRange(unsigned first_d, unsigned d_count);
 		bool EmitPop(u16 register_list);
+		bool EmitVpopDRange(unsigned first_d, unsigned d_count);
 		bool EmitBx(unsigned rm);
 		bool EmitBlx(unsigned rm);
 		bool EmitCallAbsolute(const void* function, unsigned scratch_reg = 12);
@@ -356,6 +361,8 @@ namespace VitaA32
 	u32 EncodeVst1Q32(unsigned qd, unsigned rn);
 	u32 EncodeVst1Q32Aligned(unsigned qd, unsigned rn);
 	u32 EncodeVst1D32(unsigned dd, unsigned rn);
+	u32 EncodeVst1D8Lane0(unsigned dd, unsigned rn);
+	u32 EncodeVst1D16Lane0(unsigned dd, unsigned rn);
 	u32 EncodeVldrSImm(unsigned sd, unsigned rn, u16 offset);
 	u32 EncodeVstrSImm(unsigned sd, unsigned rn, u16 offset);
 	u32 EncodeVldrDImm(unsigned dd, unsigned rn, u16 offset);
@@ -428,6 +435,7 @@ namespace VitaA32
 	u32 EncodeVqsubU32Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVqabsS16Q(unsigned qd, unsigned qm);
 	u32 EncodeVqabsS32Q(unsigned qd, unsigned qm);
+	u32 EncodeVclsS32Q(unsigned qd, unsigned qm);
 	u32 EncodeVrev64I32D(unsigned dd, unsigned dm);
 	u32 EncodeVrev64I32Q(unsigned qd, unsigned qm);
 	u32 EncodeVrev64I16Q(unsigned qd, unsigned qm);
@@ -450,7 +458,9 @@ namespace VitaA32
 	u32 EncodeVorrD(unsigned dd, unsigned dn, unsigned dm);
 	u32 EncodeVmvnQ(unsigned qd, unsigned qm);
 	u32 EncodePush(u16 register_list);
+	u32 EncodeVpushDRange(unsigned first_d, unsigned d_count);
 	u32 EncodePop(u16 register_list);
+	u32 EncodeVpopDRange(unsigned first_d, unsigned d_count);
 	u32 EncodeBx(unsigned rm);
 	u32 EncodeBlx(unsigned rm);
 	bool EncodeBranch(u8* instruction, u8* target, u32* out_instruction, Condition condition = Condition::AL);

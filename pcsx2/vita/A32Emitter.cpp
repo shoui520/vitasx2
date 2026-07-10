@@ -44,6 +44,8 @@ namespace VitaA32
 		constexpr u32 STR_REG = 0x07800000u;
 		constexpr u32 LDRD_IMM = 0x01c000d0u;
 		constexpr u32 STRD_IMM = 0x01c000f0u;
+		constexpr u32 VPUSH_D = 0xed2d0b00u;
+		constexpr u32 VPOP_D = 0xecbd0b00u;
 		constexpr u32 LDRB_IMM = 0x05d00000u;
 		constexpr u32 LDRB_REG = 0x07d00000u;
 		constexpr u32 STRB_IMM = 0x05c00000u;
@@ -70,6 +72,8 @@ namespace VitaA32
 		constexpr u32 VST1_32_Q = 0xf4000a8fu;
 		constexpr u32 VST1_32_Q_ALIGNED = 0xf4000aafu;
 		constexpr u32 VST1_32_D = 0xf400078fu;
+		constexpr u32 VST1_8_D_LANE0 = 0xf480000fu;
+		constexpr u32 VST1_16_D_LANE0 = 0xf480040fu;
 		constexpr u32 VLDR_S_IMM = 0x0d900a00u;
 		constexpr u32 VSTR_S_IMM = 0x0d800a00u;
 		constexpr u32 VLDR_D_IMM = 0x0d900b00u;
@@ -139,6 +143,7 @@ namespace VitaA32
 		constexpr u32 VQSUB_U32_Q = 0xf3200250u;
 		constexpr u32 VQABS_S16_Q = 0xf3b40740u;
 		constexpr u32 VQABS_S32_Q = 0xf3b80740u;
+		constexpr u32 VCLS_S32_Q = 0xf3b80440u;
 		constexpr u32 VREV64_I32_D = 0xf3b80000u;
 		constexpr u32 VREV64_I32_Q = 0xf3b80040u;
 		constexpr u32 VREV64_I16_Q = 0xf3b40040u;
@@ -1204,6 +1209,20 @@ namespace VitaA32
 		return EmitU32(EncodeVst1D32(dd, rn));
 	}
 
+	bool CodeBuffer::EmitVst1D8Lane0(unsigned dd, unsigned rn)
+	{
+		if (!IsDRegister(dd) || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeVst1D8Lane0(dd, rn));
+	}
+
+	bool CodeBuffer::EmitVst1D16Lane0(unsigned dd, unsigned rn)
+	{
+		if (!IsDRegister(dd) || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeVst1D16Lane0(dd, rn));
+	}
+
 	bool CodeBuffer::EmitVldrDImm(unsigned dd, unsigned rn, u16 offset)
 	{
 		if (!IsDRegister(dd) || !IsLowRegister(rn) || offset > 0x3fc || (offset & 0x3u) != 0)
@@ -1701,6 +1720,13 @@ namespace VitaA32
 		return EmitU32(EncodeVqabsS32Q(qd, qm));
 	}
 
+	bool CodeBuffer::EmitVclsS32Q(unsigned qd, unsigned qm)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qm))
+			return false;
+		return EmitU32(EncodeVclsS32Q(qd, qm));
+	}
+
 	bool CodeBuffer::EmitVrev64I32D(unsigned dd, unsigned dm)
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dm))
@@ -1908,11 +1934,31 @@ namespace VitaA32
 		return EmitU32(EncodePush(register_list));
 	}
 
+	bool CodeBuffer::EmitVpushDRange(unsigned first_d, unsigned d_count)
+	{
+		if (!IsDRegister(first_d) || d_count == 0 || d_count > 16 ||
+			first_d + d_count > 32)
+		{
+			return false;
+		}
+		return EmitU32(EncodeVpushDRange(first_d, d_count));
+	}
+
 	bool CodeBuffer::EmitPop(u16 register_list)
 	{
 		if (register_list == 0)
 			return false;
 		return EmitU32(EncodePop(register_list));
+	}
+
+	bool CodeBuffer::EmitVpopDRange(unsigned first_d, unsigned d_count)
+	{
+		if (!IsDRegister(first_d) || d_count == 0 || d_count > 16 ||
+			first_d + d_count > 32)
+		{
+			return false;
+		}
+		return EmitU32(EncodeVpopDRange(first_d, d_count));
 	}
 
 	bool CodeBuffer::EmitBx(unsigned rm)
@@ -2583,6 +2629,20 @@ namespace VitaA32
 		return VST1_32_D | ((rn & 0xfu) << 16) | NeonDd(dd);
 	}
 
+	u32 EncodeVst1D8Lane0(unsigned dd, unsigned rn)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsLowRegister(rn));
+		return VST1_8_D_LANE0 | ((rn & 0xfu) << 16) | NeonDd(dd);
+	}
+
+	u32 EncodeVst1D16Lane0(unsigned dd, unsigned rn)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsLowRegister(rn));
+		return VST1_16_D_LANE0 | ((rn & 0xfu) << 16) | NeonDd(dd);
+	}
+
 	u32 EncodeVmovCoreToS(unsigned sd, unsigned rt)
 	{
 		pxAssert(IsSRegister(sd));
@@ -3100,6 +3160,13 @@ namespace VitaA32
 		return VQABS_S32_Q | NeonQd(qd) | NeonQm(qm);
 	}
 
+	u32 EncodeVclsS32Q(unsigned qd, unsigned qm)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qm));
+		return VCLS_S32_Q | NeonQd(qd) | NeonQm(qm);
+	}
+
 	u32 EncodeVrev64I32D(unsigned dd, unsigned dm)
 	{
 		pxAssert(IsDRegister(dd));
@@ -3262,10 +3329,26 @@ namespace VitaA32
 		return CondBits(Condition::AL) | PUSH | register_list;
 	}
 
+	u32 EncodeVpushDRange(unsigned first_d, unsigned d_count)
+	{
+		pxAssert(IsDRegister(first_d));
+		pxAssert(d_count != 0 && d_count <= 16);
+		pxAssert(first_d + d_count <= 32);
+		return VPUSH_D | VfpDd(first_d) | (d_count * 2);
+	}
+
 	u32 EncodePop(u16 register_list)
 	{
 		pxAssert(register_list != 0);
 		return CondBits(Condition::AL) | POP | register_list;
+	}
+
+	u32 EncodeVpopDRange(unsigned first_d, unsigned d_count)
+	{
+		pxAssert(IsDRegister(first_d));
+		pxAssert(d_count != 0 && d_count <= 16);
+		pxAssert(first_d + d_count <= 32);
+		return VPOP_D | VfpDd(first_d) | (d_count * 2);
 	}
 
 	u32 EncodeBx(unsigned rm)

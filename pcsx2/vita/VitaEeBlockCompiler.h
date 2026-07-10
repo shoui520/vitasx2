@@ -181,6 +181,7 @@ namespace VitaEE
 		static bool RequiresBlockEndAfterOpcode(u32 op);
 
 	private:
+		bool EmitLinkFrameReturn();
 		bool EmitAndImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
 		bool EmitOrrImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
 		bool EmitEorImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
@@ -534,6 +535,7 @@ namespace VitaEE
 			const void* helper, const void* event_exit, bool request_cache_reset = false);
 		bool FlushColdTails();
 		void ClearGprConstState();
+		void ClearSaConstState();
 		void ClearCop1NormalizedState();
 		bool IsCop1FprNormalized(unsigned fpr) const;
 		bool IsCop1AccNormalized() const;
@@ -562,8 +564,10 @@ namespace VitaEE
 		void UpdateGprConstStateAfterOpcode(u32 op, u32 pc);
 		void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
 			bool allow_r10, bool allow_r11, bool prefer_dirty_writes);
+		void StageGprQCacheForBlock(u32 start_pc, u32 instruction_count);
 		bool BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const;
 		bool EmitGprPinLoads();
+		bool EmitGprQCacheEntryLoads();
 		bool EmitFlushDirtyGprPins();
 		bool EmitFlushDirtyGprPinsForGuest(unsigned guest_reg);
 		GprPinDirtyMasks CurrentGprPinDirtyMasks() const;
@@ -578,6 +582,16 @@ namespace VitaEE
 		void InvalidateGprQCacheForQreg(unsigned qreg);
 		void MarkGprQCache(unsigned guest_reg, unsigned qreg);
 		int FindGprQCache(unsigned guest_reg) const;
+		bool IsGprQCacheQregResident(unsigned qreg) const;
+		bool GprQCacheGuestHasFutureQwordReadBeforeWrite(unsigned guest_reg) const;
+		bool GprQCacheGuestHasFutureQfsrvSourceReadBeforeWrite(unsigned guest_reg) const;
+		bool GprQCacheQregHasFutureQwordReadBeforeWrite(unsigned qreg) const;
+		bool GprQCacheGuestDefinedBeforeCurrentInstruction(unsigned guest_reg) const;
+		u16 GprQCacheGuestEntryQwordReadCount(unsigned guest_reg) const;
+		bool PreserveGprQCacheGuestForFutureRead(unsigned guest_reg, unsigned cached_qreg,
+			unsigned avoid_qreg0, unsigned avoid_qreg1, bool* preserved);
+		bool EmitStoreGprQ128PreservingCachedSourceIfFutureRead(unsigned dest_guest_reg,
+			unsigned source_guest_reg, unsigned cached_qreg, unsigned address_scratch, bool* preserved);
 		bool EmitDeviceTracePreInstruction(u32 pc);
 		bool EmitLoadCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
 		bool EmitStoreCpuRegsU64(size_t offset, unsigned host_low, unsigned host_high, unsigned address_scratch);
@@ -633,6 +647,9 @@ namespace VitaEE
 		bool EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 		bool EmitLoadGprQ128(unsigned guest_reg, unsigned qreg, unsigned address_scratch);
+		bool ShouldLoadGprQ128SingleUseEntry(unsigned guest_reg) const;
+		bool EmitLoadGprQ128SingleUseEntry(unsigned guest_reg, unsigned qreg,
+			unsigned address_scratch);
 		bool EmitStorePcFromHostReg(unsigned host_reg);
 		bool EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc);
 		bool EmitStorePc(u32 pc);
@@ -641,6 +658,8 @@ namespace VitaEE
 		bool EmitStoreGprDwordPair(unsigned guest_reg, unsigned low_d, unsigned high_d);
 		bool EmitStoreGprWord(unsigned guest_reg, unsigned word, unsigned host_reg);
 		bool EmitStoreGprLowPreserveHigh(unsigned guest_reg, unsigned host_low);
+		bool TryEmitStoreGprLow64FromQCache(unsigned guest_reg, unsigned source_guest_reg, bool* emitted);
+		bool TryEmitStoreGprLow64InvertFromQCache(unsigned guest_reg, unsigned source_guest_reg, bool* emitted);
 		bool EmitStoreGprZero64(unsigned guest_reg);
 		bool EmitStoreGpr64(unsigned guest_reg, unsigned host_low, unsigned host_high);
 
@@ -795,18 +814,27 @@ namespace VitaEE
 		u32 m_gpr_const_low[32]{};
 		bool m_gpr_const_high_known[32]{};
 		u32 m_gpr_const_high[32]{};
+		bool m_sa_const_known = false;
+		u8 m_sa_const_byte_offset = 0;
 		bool m_cop1_fpr_normalized[32]{};
 		bool m_cop1_acc_normalized = false;
 		// True once the vuDouble() bit-select constant quads (Q8-Q11) have been
 		// materialized in this block. Q8-Q15 are used exclusively by the COP2
-		// macro normalize scratch (the GPR-Q cache only claims Q0-Q3, and only on
-		// all-MMI blocks), so the constants survive across intervening ops and
+		// macro normalize scratch (the GPR-Q cache only claims Q0-Q7 and never
+		// Q8-Q15), so the constants survive across intervening ops and
 		// later COP2 arithmetic/outer ops in the same block can skip re-loading
 		// them. Reset per block in BeginBlock().
 		bool m_cop2_norm_consts_ready = false;
 		bool m_gpr_q_cache_enabled = false;
-		u8 m_gpr_q_cache_guest[4]{};
-		u8 m_gpr_q_cache_qreg[4]{};
+		u32 m_current_opcode = 0;
+		u32 m_current_block_start_pc = 0;
+		u32 m_current_block_instruction_count = 0;
+		u32 m_current_instruction_index = 0;
+		static constexpr unsigned MAX_GPR_QCACHE = 8;
+		u8 m_gpr_q_cache_guest[MAX_GPR_QCACHE]{};
+		u8 m_gpr_q_cache_qreg[MAX_GPR_QCACHE]{};
 		u8 m_gpr_q_cache_count = 0;
+		u8 m_staged_gpr_q_cache_guest[MAX_GPR_QCACHE]{};
+		u8 m_staged_gpr_q_cache_count = 0;
 		};
 	} // namespace VitaEE
