@@ -98,6 +98,12 @@ u32 g_qemuResidentRawGpr0QwordBlocks = 0;
 u32 g_qemuResidentRawGpr0QwordStoreSelections = 0;
 u32 g_qemuResidentRawGpr0QwordHotInstructionsElided = 0;
 u32 g_qemuResidentRawGpr0QwordColdReloadInstructions = 0;
+u32 g_qemuResidentVtlbQwordPointerBlocks = 0;
+u32 g_qemuResidentVtlbQwordPointerStores = 0;
+u32 g_qemuResidentVtlbQwordPointerGuardInstructions = 0;
+u32 g_qemuResidentVtlbQwordPointerTranslationInstructions = 0;
+u32 g_qemuResidentVtlbQwordPointerHotInstructionsElided = 0;
+u32 g_qemuResidentVtlbQwordPointerColdInvalidationInstructions = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
@@ -3536,6 +3542,36 @@ namespace VitaEE
 		return false;
 	}
 
+	bool AnalyzeResidentSequentialRawGpr0QwordStore(u32 start_pc, u32 instruction_count,
+		u32 producer_index, u32* store_op)
+	{
+		if (!store_op || instruction_count < 3)
+			return false;
+
+		u32 candidate = 0;
+		for (u32 i = 0; i < producer_index; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			if (op == 0)
+				continue;
+			if (candidate != 0 || (op >> 26) != 0x1f || RT(op) != 0 || RS(op) == 0)
+				return false;
+			candidate = op;
+		}
+		if (candidate == 0)
+			return false;
+
+		const u32 delay_op = memRead32(start_pc + (instruction_count - 1) * sizeof(u32));
+		if ((delay_op >> 26) != 0x09 || RS(delay_op) != RS(candidate) ||
+			RT(delay_op) != RS(candidate) || IMM_S(delay_op) != 16)
+		{
+			return false;
+		}
+
+		*store_op = candidate;
+		return true;
+	}
+
 	bool UpdateGprPinEntryLiveness(u32 op, u32& defined, u32& live_in_reads)
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp scalar ALU/shift/move/mult-div
@@ -6144,6 +6180,68 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::EmitStageResidentVtlbQwordPointer()
+	{
+		if (!m_resident_vtlb_qword_pointer)
+			return true;
+
+		// PCSX2 owner: recVTLB.cpp::vtlb_DynGenWrite() reduces a fastmem SQ to
+		// one indexed host store and recovers faults out of line. Vita cannot
+		// reserve a 4 GiB fastmem window, so retain the translated qword pointer
+		// in caller-saved r3 across this exact self-edge and re-run vTLB only when
+		// advancing makes its page offset zero. Direct VTLB mappings preserve the
+		// guest page offset in their page-aligned host pointer. Handler tails poison
+		// r3 to -16; the same advance/offset guard then forces retranslation.
+		const size_t canonical_retranslate = m_code.EmitBranchPlaceholder();
+		if (canonical_retranslate == static_cast<size_t>(-1))
+			return false;
+
+		m_resident_vtlb_qword_guard_offset = m_code.Size();
+		const size_t guard_start = m_code.Size();
+		if (!m_code.EmitAddImm32(HOST_TMP3, HOST_TMP3, 16) ||
+			!m_code.EmitTstImm32(HOST_TMP3, vtlb_private::VTLB_PAGE_MASK & ~0x0fu))
+		{
+			return false;
+		}
+		const size_t same_page = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (same_page == static_cast<size_t>(-1))
+			return false;
+
+		const size_t translation_start = m_code.Size();
+		if (!m_code.PatchBranch(canonical_retranslate, translation_start) ||
+			!EmitEffectiveAddress(m_resident_vtlb_qword_store_op, HOST_TMP3) ||
+			!EmitAlignQwordAddress(HOST_TMP3, HOST_TMP1) ||
+			!EmitVtlbNonHandlerHostAddress128(HOST_TMP3, HOST_TMP1, HOST_TMP2,
+				&m_resident_vtlb_qword_handler_fallback,
+				&m_resident_vtlb_qword_dirty_pins))
+		{
+			return false;
+		}
+
+		const size_t body_start = m_code.Size();
+		const size_t guard_instructions =
+			(translation_start - guard_start) / sizeof(u32);
+		const size_t translation_instructions =
+			(body_start - translation_start) / sizeof(u32);
+		if (guard_instructions > UINT8_MAX || translation_instructions > UINT8_MAX ||
+			!m_code.PatchBranch(same_page, body_start, VitaA32::Condition::NE))
+		{
+			return false;
+		}
+
+		m_resident_vtlb_qword_guard_instructions = static_cast<u8>(guard_instructions);
+		m_resident_vtlb_qword_translation_instructions =
+			static_cast<u8>(translation_instructions);
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuResidentVtlbQwordPointerBlocks++;
+		g_qemuResidentVtlbQwordPointerGuardInstructions +=
+			static_cast<u32>(guard_instructions);
+		g_qemuResidentVtlbQwordPointerTranslationInstructions +=
+			static_cast<u32>(translation_instructions);
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::EmitSyncForwardedBooleanBranchToBacking()
 	{
 		if (!m_forwarded_boolean_branch)
@@ -6857,6 +6955,15 @@ namespace VitaEE
 			ForwardedBooleanPrefixStoresRawGpr0(
 				start_pc, m_forwarded_boolean_producer_index);
 		m_resident_raw_gpr0_entry_instructions = 0;
+		m_resident_vtlb_qword_store_op = 0;
+		m_resident_vtlb_qword_pointer = m_resident_raw_gpr0_qword &&
+			AnalyzeResidentSequentialRawGpr0QwordStore(start_pc, instruction_count,
+				m_forwarded_boolean_producer_index, &m_resident_vtlb_qword_store_op);
+		m_resident_vtlb_qword_guard_offset = static_cast<size_t>(-1);
+		m_resident_vtlb_qword_handler_fallback = static_cast<size_t>(-1);
+		m_resident_vtlb_qword_dirty_pins = {};
+		m_resident_vtlb_qword_guard_instructions = 0;
+		m_resident_vtlb_qword_translation_instructions = 0;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (m_forwarded_boolean_branch)
 			g_qemuForwardedBooleanBranchBlocks++;
@@ -6907,19 +7014,24 @@ namespace VitaEE
 		}
 		if (!EmitStageResidentRawGpr0Qword())
 			return false;
+		if (!EmitStageResidentVtlbQwordPointer())
+			return false;
 		if (persistent_dispatch_exits && resident_entry_loads != 0)
 		{
 			// PCSX2 owner: iCore.cpp keeps MODE_READ mappings valid until a
 			// clobber/flush seam, while iBranchTest()/BaseBlocks owns the patched
 			// direct edge. A self-link returns to this exact allocator mapping, so
-			// it may enter after the initial pin and forwarded-transient loads. Other
-			// incoming edges retain the ordinary linked entry and rebuild the mapping
-			// from cpuRegs.
+			// it may enter after scalar/forwarded/qword staging; the sequential-SQ
+			// form enters its translated-pointer advance/guard. Other incoming edges
+			// retain the ordinary linked entry and rebuild the mapping from cpuRegs.
 			// The self edge also cannot inherit a different PC: normal entry has
 			// already synchronized this same block-start PC, and exception/event
 			// paths leave through the dispatcher rather than taking the self edge.
 			if (resident_self_link_entry_offset)
-				*resident_self_link_entry_offset = m_code.Size();
+			{
+				*resident_self_link_entry_offset = m_resident_vtlb_qword_pointer ?
+					m_resident_vtlb_qword_guard_offset : m_code.Size();
+			}
 			if (resident_self_link_entry_loads)
 				*resident_self_link_entry_loads = resident_entry_loads;
 		}
@@ -21113,7 +21225,7 @@ namespace VitaEE
 		const unsigned rt = RT(op);
 		constexpr unsigned NEON_VALUE = 0;
 
-		const auto emit_store_to_host = [&]() -> bool
+		const auto emit_store_to_host = [&](unsigned host_address = HOST_TMP0) -> bool
 		{
 			if (rt == 0)
 			{
@@ -21124,7 +21236,7 @@ namespace VitaEE
 					g_qemuResidentRawGpr0QwordHotInstructionsElided +=
 						m_resident_raw_gpr0_entry_instructions;
 #endif
-					return m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0);
+					return m_code.EmitVst1Q32Aligned(NEON_VALUE, host_address);
 				}
 
 				if (!EmitLoadRawGpr0KnownZeroFlag(HOST_TMP1) ||
@@ -21138,7 +21250,7 @@ namespace VitaEE
 					return false;
 
 				if (!m_code.EmitVeorQ(NEON_VALUE, NEON_VALUE, NEON_VALUE) ||
-					!m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0))
+					!m_code.EmitVst1Q32Aligned(NEON_VALUE, host_address))
 	{
 					return false;
 	}
@@ -21150,7 +21262,7 @@ namespace VitaEE
 				const size_t raw_fallback_target = m_code.Size();
 				return m_code.PatchBranch(raw_fallback, raw_fallback_target, VitaA32::Condition::EQ) &&
 					   EmitLoadCpuRegsQ128(GprOffset(0), NEON_VALUE, HOST_TMP1) &&
-					   m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0) &&
+					   m_code.EmitVst1Q32Aligned(NEON_VALUE, host_address) &&
 					   m_code.PatchBranch(zero_done, m_code.Size());
 			}
 
@@ -21160,7 +21272,7 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 				g_qemuGprQCacheDirectMemoryStores++;
 #endif
-				return m_code.EmitVst1Q32Aligned(static_cast<unsigned>(cached_qreg), HOST_TMP0);
+				return m_code.EmitVst1Q32Aligned(static_cast<unsigned>(cached_qreg), host_address);
 			}
 
 			unsigned value_qreg = NEON_VALUE;
@@ -21174,8 +21286,31 @@ namespace VitaEE
 			}
 
 			return EmitLoadGprQ128(rt, value_qreg, HOST_TMP1) &&
-				   m_code.EmitVst1Q32Aligned(value_qreg, HOST_TMP0);
+				   m_code.EmitVst1Q32Aligned(value_qreg, host_address);
 		};
+
+		if (m_resident_vtlb_qword_pointer && op == m_resident_vtlb_qword_store_op)
+		{
+			if (!emit_store_to_host(HOST_TMP3))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentVtlbQwordPointerStores++;
+			if (m_resident_vtlb_qword_translation_instructions >=
+				m_resident_vtlb_qword_guard_instructions)
+			{
+				g_qemuResidentVtlbQwordPointerHotInstructionsElided +=
+					m_resident_vtlb_qword_translation_instructions -
+					m_resident_vtlb_qword_guard_instructions;
+			}
+#endif
+			m_qword_store_cold_tails.push_back({
+				m_resident_vtlb_qword_handler_fallback,
+				m_code.Size(),
+				rt,
+				m_resident_vtlb_qword_dirty_pins,
+			});
+			return true;
+		}
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -25089,8 +25224,17 @@ namespace VitaEE
 		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!EmitSyncGprPinsToBacking(&tail.dirty_pins) ||
-			!EmitLoadCpuRegsQ128(GprOffset(tail.rt), NEON_VALUE, HOST_TMP1) ||
+			!EmitSyncGprPinsToBacking(&tail.dirty_pins))
+		{
+			return false;
+		}
+		if (m_resident_vtlb_qword_pointer && tail.rt == 0 &&
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3,
+				VitaA32::ShiftType::LSL, 0))
+		{
+			return false;
+		}
+		if (!EmitLoadCpuRegsQ128(GprOffset(tail.rt), NEON_VALUE, HOST_TMP1) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memWrite128)))
 		{
 			return false;
@@ -25106,6 +25250,19 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuResidentRawGpr0QwordColdReloadInstructions += static_cast<u32>(
 				(m_code.Size() - reload_start) / sizeof(u32));
+#endif
+		}
+		if (m_resident_vtlb_qword_pointer && tail.rt == 0)
+		{
+			// The resident entry advances r3 by one qword before testing its page
+			// offset. -16 therefore becomes zero and forces the full vTLB path
+			// after any handler call, including handler-to-direct page transitions.
+			const size_t invalidate_start = m_code.Size();
+			if (!m_code.EmitMovImm32(HOST_TMP3, 0xfffffff0u))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentVtlbQwordPointerColdInvalidationInstructions +=
+				static_cast<u32>((m_code.Size() - invalidate_start) / sizeof(u32));
 #endif
 		}
 
