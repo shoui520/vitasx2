@@ -104,6 +104,11 @@ u32 g_qemuResidentVtlbQwordPointerGuardInstructions = 0;
 u32 g_qemuResidentVtlbQwordPointerTranslationInstructions = 0;
 u32 g_qemuResidentVtlbQwordPointerHotInstructionsElided = 0;
 u32 g_qemuResidentVtlbQwordPointerColdInvalidationInstructions = 0;
+u32 g_qemuResidentCycleLowBlocks = 0;
+u32 g_qemuResidentCycleLowHotInstructionsElided = 0;
+u32 g_qemuResidentCycleLowSyncInstructions = 0;
+u32 g_qemuResidentCycleLowWrapFixupInstructions = 0;
+u32 g_qemuResidentCycleLowColdReloadInstructions = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
@@ -6256,9 +6261,62 @@ namespace VitaEE
 				static_cast<u16>(offset + sizeof(u32)));
 	}
 
+	bool BlockCompiler::EmitStageResidentCycleLow()
+	{
+		if (!m_resident_cycle_low)
+			return true;
+
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest() keeps the scheduler
+		// cycle in private dispatcher state until an observable exit. The exact
+		// resident self-edge has the same property: r0 is untouched by its direct
+		// SQ, integer body, event comparison, and patched branch, so stage cycle.low
+		// once at canonical entry and carry it around the hot loop.
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)))
+			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuResidentCycleLowBlocks++;
+#endif
+		return true;
+	}
+
+	bool BlockCompiler::EmitSyncResidentCycleLowToBacking()
+	{
+		if (!m_resident_cycle_low)
+			return true;
+
+		// The scheduler maintains nextEventCycle within a signed-32-bit delta, so
+		// at most one low-word wrap can occur before this event/helper/unlink seam.
+		// Compare against the last published low word, repair the high word only on
+		// wrap, then make the resident low word authoritative for external code.
+		if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1))
+		{
+			return false;
+		}
+
+		const size_t no_wrap = m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+		constexpr u16 cycle_high_offset = static_cast<u16>(CYCLE_OFFSET + sizeof(u32));
+		if (no_wrap == static_cast<size_t>(-1) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, cycle_high_offset) ||
+			!m_code.EmitAddImm8(HOST_TMP1, HOST_TMP1, 1) ||
+			!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, cycle_high_offset) ||
+			!m_code.PatchBranch(no_wrap, m_code.Size(), VitaA32::Condition::CS) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)))
+		{
+			return false;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuResidentCycleLowSyncInstructions += 4;
+		g_qemuResidentCycleLowWrapFixupInstructions += 3;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins)
 	{
-		if (!m_dirty_pins_enabled && !m_forwarded_boolean_branch)
+		if (!m_dirty_pins_enabled && !m_forwarded_boolean_branch && !m_resident_cycle_low)
 			return true;
 		const GprPinDirtyMasks masks = m_dirty_pins_enabled ?
 			(dirty_pins ? *dirty_pins : CurrentGprPinDirtyMasks()) : GprPinDirtyMasks{};
@@ -6316,7 +6374,8 @@ namespace VitaEE
 			}
 		}
 
-		return EmitSyncForwardedBooleanBranchToBacking();
+		return EmitSyncForwardedBooleanBranchToBacking() &&
+			EmitSyncResidentCycleLowToBacking();
 	}
 
 	bool BlockCompiler::EmitFlushDirtyGprPinsForGuest(unsigned guest_reg)
@@ -6959,6 +7018,7 @@ namespace VitaEE
 		m_resident_vtlb_qword_pointer = m_resident_raw_gpr0_qword &&
 			AnalyzeResidentSequentialRawGpr0QwordStore(start_pc, instruction_count,
 				m_forwarded_boolean_producer_index, &m_resident_vtlb_qword_store_op);
+		m_resident_cycle_low = m_resident_vtlb_qword_pointer;
 		m_resident_vtlb_qword_guard_offset = static_cast<size_t>(-1);
 		m_resident_vtlb_qword_handler_fallback = static_cast<size_t>(-1);
 		m_resident_vtlb_qword_dirty_pins = {};
@@ -7013,6 +7073,8 @@ namespace VitaEE
 			resident_entry_loads += 2;
 		}
 		if (!EmitStageResidentRawGpr0Qword())
+			return false;
+		if (!EmitStageResidentCycleLow())
 			return false;
 		if (!EmitStageResidentVtlbQwordPointer())
 			return false;
@@ -8100,8 +8162,27 @@ namespace VitaEE
 #endif
 
 		size_t carry_branch = static_cast<size_t>(-1);
-		if (!EmitAddScaledCyclesToCpuLowWord(block_cycles, HOST_TMP0, HOST_TMP2, &carry_branch))
+		if (m_resident_cycle_low)
+		{
+			const size_t add_start = m_code.Size();
+			if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, block_cycles) &&
+				(!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
+				 !m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2)))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			const u32 resident_add_instructions = static_cast<u32>(
+				(m_code.Size() - add_start) / sizeof(u32));
+			g_qemuResidentCycleLowHotInstructionsElided +=
+				4 > resident_add_instructions ? 4 - resident_add_instructions : 0;
+#endif
+		}
+		else if (!EmitAddScaledCyclesToCpuLowWord(
+			block_cycles, HOST_TMP0, HOST_TMP2, &carry_branch))
+		{
 			return false;
+		}
 
 		// Mirrors PCSX2's normal x86/ix86-32/iR5900.cpp::iBranchTest() path.
 		// Scheduler deltas are bounded to signed 32-bit windows
@@ -25239,6 +25320,20 @@ namespace VitaEE
 		{
 			return false;
 		}
+		if (m_resident_cycle_low)
+		{
+			// r0 is caller-clobbered and carried the handler address. Rebuild the
+			// private scheduler low word before the cold tail rejoins the resident
+			// block; the pre-call sync made backing state exact for the helper.
+			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS,
+					static_cast<u16>(CYCLE_OFFSET)))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentCycleLowColdReloadInstructions++;
+#endif
+		}
 		if (m_resident_raw_gpr0_qword && tail.rt == 0)
 		{
 			// q0 is caller-clobbered by the handler ABI. Rebuild the resident raw
@@ -25731,6 +25826,12 @@ namespace VitaEE
 		size_t resume_offset, unsigned scratch)
 	{
 		if (!carry_branches || carry_branch_count == 0)
+			return true;
+
+		bool has_carry_branch = false;
+		for (size_t i = 0; i < carry_branch_count; i++)
+			has_carry_branch = has_carry_branch || carry_branches[i] != static_cast<size_t>(-1);
+		if (!has_carry_branch)
 			return true;
 
 		const size_t carry_target = m_code.Size();
