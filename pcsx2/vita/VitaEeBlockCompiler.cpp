@@ -30,6 +30,7 @@
 #include "fmt/format.h"
 #endif
 
+#include <algorithm>
 #include <cstddef>
 #if defined(VITASX2_QEMU_VALIDATION)
 #include <cstdio>
@@ -5616,8 +5617,43 @@ namespace VitaEE
 		constexpr unsigned MAX_STAGED_GPR_QCACHE_ENTRY_LOADS = 4;
 
 		m_staged_gpr_q_cache_count = 0;
+		m_gpr_q_cache_next_use_distances.clear();
 		if (!m_gpr_q_cache_enabled)
 			return;
+
+		// PCSX2 owner: x86/iR5900Analysis.cpp::recBackpropBSC(). Build the
+		// qword subset of its backward GPR liveness once, so allocation can evict
+		// the resident value whose next 128-bit read is farthest away without
+		// repeatedly rescanning the remainder of the block.
+		constexpr u16 NO_NEXT_QWORD_USE = UINT16_MAX;
+		m_gpr_q_cache_next_use_distances.resize(
+			static_cast<size_t>(instruction_count) * 32, NO_NEXT_QWORD_USE);
+		u32 next_read_index[32];
+		for (u32& index : next_read_index)
+			index = UINT32_MAX;
+		for (u32 i = instruction_count; i-- > 0;)
+		{
+			for (unsigned reg = 1; reg < 32; reg++)
+			{
+				if (next_read_index[reg] != UINT32_MAX)
+				{
+					m_gpr_q_cache_next_use_distances[static_cast<size_t>(i) * 32 + reg] =
+						static_cast<u16>(std::min<u32>(next_read_index[reg] - i,
+							NO_NEXT_QWORD_USE - 1));
+				}
+			}
+
+			u16 reads[32]{};
+			u32 writes = 0;
+			CountGprQCacheEntryQwordUses(memRead32(start_pc + i * 4), reads, writes);
+			for (unsigned reg = 1; reg < 32; reg++)
+			{
+				if ((writes & (1u << reg)) != 0)
+					next_read_index[reg] = UINT32_MAX;
+				if (reads[reg] != 0)
+					next_read_index[reg] = i;
+			}
+		}
 
 		u16 qword_read_counts[32]{};
 		u16 variable_shift_rt_reads[32]{};
@@ -6160,6 +6196,58 @@ namespace VitaEE
 		return false;
 	}
 
+	u32 BlockCompiler::GprQCacheGuestNextQwordReadDistanceBeforeWrite(unsigned guest_reg) const
+	{
+		if (!m_gpr_q_cache_enabled || guest_reg == 0 ||
+			m_gpr_q_cache_next_use_distances.size() !=
+				static_cast<size_t>(m_current_block_instruction_count) * 32 ||
+			m_current_instruction_index >= m_current_block_instruction_count)
+		{
+			return UINT32_MAX;
+		}
+
+		const u16 distance = m_gpr_q_cache_next_use_distances[
+			static_cast<size_t>(m_current_instruction_index) * 32 + guest_reg];
+		return distance == UINT16_MAX ? UINT32_MAX : distance;
+	}
+
+	u32 BlockCompiler::GprQCacheQregNextQwordReadDistanceBeforeWrite(unsigned qreg) const
+	{
+		for (unsigned i = 0; i < m_gpr_q_cache_count; i++)
+		{
+			if (m_gpr_q_cache_qreg[i] == qreg)
+			{
+				return GprQCacheGuestNextQwordReadDistanceBeforeWrite(
+					m_gpr_q_cache_guest[i]);
+			}
+		}
+
+		return UINT32_MAX;
+	}
+
+	unsigned BlockCompiler::SelectGprQCacheScratchQreg(u32 avoid_qreg_mask) const
+	{
+		unsigned farthest_qreg = MAX_GPR_QCACHE;
+		u32 farthest_distance = 0;
+		for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
+		{
+			if ((avoid_qreg_mask & (1u << qreg)) != 0)
+				continue;
+
+			if (!IsGprQCacheQregResident(qreg))
+				return qreg;
+
+			const u32 distance = GprQCacheQregNextQwordReadDistanceBeforeWrite(qreg);
+			if (farthest_qreg == MAX_GPR_QCACHE || distance > farthest_distance)
+			{
+				farthest_qreg = qreg;
+				farthest_distance = distance;
+			}
+		}
+
+		return farthest_qreg;
+	}
+
 	bool BlockCompiler::GprQCacheGuestDefinedBeforeCurrentInstruction(unsigned guest_reg) const
 	{
 		if (!m_gpr_q_cache_enabled || guest_reg == 0 ||
@@ -6204,25 +6292,30 @@ namespace VitaEE
 		if (!GprQCacheGuestHasFutureQwordReadBeforeWrite(guest_reg))
 			return true;
 
-		for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-		{
-			if (qreg == cached_qreg || qreg == avoid_qreg0 || qreg == avoid_qreg1 ||
-				IsGprQCacheQregResident(qreg))
-			{
-				continue;
-			}
+		u32 avoid_qreg_mask = 1u << cached_qreg;
+		if (avoid_qreg0 < MAX_GPR_QCACHE)
+			avoid_qreg_mask |= 1u << avoid_qreg0;
+		if (avoid_qreg1 < MAX_GPR_QCACHE)
+			avoid_qreg_mask |= 1u << avoid_qreg1;
+		const unsigned qreg = SelectGprQCacheScratchQreg(avoid_qreg_mask);
+		if (qreg >= MAX_GPR_QCACHE)
+			return true;
 
-			if (!m_code.EmitVorrQ(qreg, cached_qreg, cached_qreg))
-				return false;
-			MarkGprQCache(guest_reg, qreg);
-			if (preserved)
-				*preserved = true;
-#if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuGprQCacheDirectPreservedMutatingSourceCopies++;
-#endif
+		if (IsGprQCacheQregResident(qreg) &&
+			GprQCacheGuestNextQwordReadDistanceBeforeWrite(guest_reg) >=
+				GprQCacheQregNextQwordReadDistanceBeforeWrite(qreg))
+		{
 			return true;
 		}
 
+		if (!m_code.EmitVorrQ(qreg, cached_qreg, cached_qreg))
+			return false;
+		MarkGprQCache(guest_reg, qreg);
+		if (preserved)
+			*preserved = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGprQCacheDirectPreservedMutatingSourceCopies++;
+#endif
 		return true;
 	}
 
@@ -6234,11 +6327,12 @@ namespace VitaEE
 
 		if (GprQCacheGuestHasFutureQwordReadBeforeWrite(source_guest_reg))
 		{
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
+			const unsigned qreg = SelectGprQCacheScratchQreg(1u << cached_qreg);
+			if (qreg < MAX_GPR_QCACHE &&
+				(!IsGprQCacheQregResident(qreg) ||
+				 GprQCacheGuestNextQwordReadDistanceBeforeWrite(source_guest_reg) <
+					 GprQCacheQregNextQwordReadDistanceBeforeWrite(qreg)))
 			{
-				if (qreg == cached_qreg || IsGprQCacheQregResident(qreg))
-					continue;
-
 				if (preserved)
 					*preserved = true;
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -16524,31 +16618,9 @@ namespace VitaEE
 		};
 
 		const auto choose_folded_result_qreg = [&](int avoid0 = -1) {
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (static_cast<int>(qreg) != avoid0 &&
-					!IsGprQCacheQregResident(qreg))
-				{
-					return qreg;
-				}
-			}
-
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (static_cast<int>(qreg) != avoid0 &&
-					!GprQCacheQregHasFutureQwordReadBeforeWrite(qreg))
-				{
-					return qreg;
-				}
-			}
-
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (static_cast<int>(qreg) != avoid0)
-					return qreg;
-			}
-
-			return NEON_RD;
+			const u32 avoid_mask = avoid0 >= 0 ? (1u << static_cast<unsigned>(avoid0)) : 0;
+			const unsigned qreg = SelectGprQCacheScratchQreg(avoid_mask);
+			return qreg < MAX_GPR_QCACHE ? qreg : NEON_RD;
 		};
 
 		const auto emit_zero_result = [&]() {
@@ -16812,36 +16884,13 @@ namespace VitaEE
 			if (rd == rt && rt != 0 && rt_qreg >= 0)
 				return static_cast<unsigned>(rt_qreg);
 
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (static_cast<int>(qreg) != rs_qreg &&
-					static_cast<int>(qreg) != rt_qreg &&
-					!IsGprQCacheQregResident(qreg))
-				{
-					return qreg;
-				}
-			}
-
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (static_cast<int>(qreg) != rs_qreg &&
-					static_cast<int>(qreg) != rt_qreg &&
-					!GprQCacheQregHasFutureQwordReadBeforeWrite(qreg))
-				{
-					return qreg;
-				}
-			}
-
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (static_cast<int>(qreg) != rs_qreg &&
-					static_cast<int>(qreg) != rt_qreg)
-				{
-					return qreg;
-				}
-			}
-
-			return NEON_RD;
+			u32 avoid_mask = 0;
+			if (rs_qreg >= 0)
+				avoid_mask |= 1u << static_cast<unsigned>(rs_qreg);
+			if (rt_qreg >= 0)
+				avoid_mask |= 1u << static_cast<unsigned>(rt_qreg);
+			const unsigned qreg = SelectGprQCacheScratchQreg(avoid_mask);
+			return qreg < MAX_GPR_QCACHE ? qreg : NEON_RD;
 		};
 		if (rs == rt && rs != 0)
 		{
@@ -16897,31 +16946,9 @@ namespace VitaEE
 				const bool in_place = result_qreg == cached_qreg;
 				const bool zero_reuses_result = !in_place;
 				const auto choose_zero_qreg = [&](unsigned avoid0, unsigned avoid1) {
-					for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-					{
-						if (qreg != avoid0 && qreg != avoid1 &&
-							!IsGprQCacheQregResident(qreg))
-						{
-							return qreg;
-						}
-					}
-
-					for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-					{
-						if (qreg != avoid0 && qreg != avoid1 &&
-							!GprQCacheQregHasFutureQwordReadBeforeWrite(qreg))
-						{
-							return qreg;
-						}
-					}
-
-					for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-					{
-						if (qreg != avoid0 && qreg != avoid1)
-							return qreg;
-					}
-
-					return NEON_RS;
+					const unsigned qreg = SelectGprQCacheScratchQreg(
+						(1u << avoid0) | (1u << avoid1));
+					return qreg < MAX_GPR_QCACHE ? qreg : NEON_RS;
 				};
 				const unsigned zero_qreg = zero_reuses_result ?
 			                                   result_qreg :
@@ -16955,22 +16982,9 @@ namespace VitaEE
 		{
 			const unsigned rs_qreg = static_cast<unsigned>(cached_rs_qreg);
 			const auto choose_operand_qreg = [&](unsigned avoid) {
-				for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-				{
-					if (qreg != avoid && !IsGprQCacheQregResident(qreg))
-						return qreg;
-				}
-
-				for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-				{
-					if (qreg != avoid &&
-						!GprQCacheQregHasFutureQwordReadBeforeWrite(qreg))
-					{
-						return qreg;
-					}
-				}
-
-				return avoid == NEON_RT ? NEON_RS : NEON_RT;
+				const unsigned qreg = SelectGprQCacheScratchQreg(1u << avoid);
+				return qreg < MAX_GPR_QCACHE ? qreg :
+					(avoid == NEON_RT ? NEON_RS : NEON_RT);
 			};
 			const unsigned rt_qreg = choose_operand_qreg(rs_qreg);
 			const unsigned result_qreg =
@@ -16993,22 +17007,9 @@ namespace VitaEE
 		{
 			const unsigned rt_qreg = static_cast<unsigned>(cached_rt_qreg);
 			const auto choose_operand_qreg = [&](unsigned avoid) {
-				for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-				{
-					if (qreg != avoid && !IsGprQCacheQregResident(qreg))
-						return qreg;
-				}
-
-				for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-				{
-					if (qreg != avoid &&
-						!GprQCacheQregHasFutureQwordReadBeforeWrite(qreg))
-					{
-						return qreg;
-					}
-				}
-
-				return avoid == NEON_RS ? NEON_RT : NEON_RS;
+				const unsigned qreg = SelectGprQCacheScratchQreg(1u << avoid);
+				return qreg < MAX_GPR_QCACHE ? qreg :
+					(avoid == NEON_RS ? NEON_RT : NEON_RS);
 			};
 			const unsigned rs_qreg = choose_operand_qreg(rt_qreg);
 			const unsigned result_qreg =
@@ -17027,37 +17028,12 @@ namespace VitaEE
 			       emit_store_rd(result_qreg);
 		}
 
-		bool used_qregs[MAX_GPR_QCACHE]{};
+		u32 used_qreg_mask = 0;
 		const auto choose_qreg = [&]() {
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (!used_qregs[qreg] && !IsGprQCacheQregResident(qreg))
-				{
-					used_qregs[qreg] = true;
-					return qreg;
-				}
-			}
-
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (!used_qregs[qreg] &&
-					!GprQCacheQregHasFutureQwordReadBeforeWrite(qreg))
-				{
-					used_qregs[qreg] = true;
-					return qreg;
-				}
-			}
-
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (!used_qregs[qreg])
-				{
-					used_qregs[qreg] = true;
-					return qreg;
-				}
-			}
-
-			return MAX_GPR_QCACHE;
+			const unsigned qreg = SelectGprQCacheScratchQreg(used_qreg_mask);
+			if (qreg < MAX_GPR_QCACHE)
+				used_qreg_mask |= 1u << qreg;
+			return qreg;
 		};
 		const unsigned rs_qreg = choose_qreg();
 		const unsigned rt_qreg = choose_qreg();

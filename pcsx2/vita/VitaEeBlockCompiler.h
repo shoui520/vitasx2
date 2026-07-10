@@ -586,6 +586,9 @@ namespace VitaEE
 		bool GprQCacheGuestHasFutureQwordReadBeforeWrite(unsigned guest_reg) const;
 		bool GprQCacheGuestHasFutureQfsrvSourceReadBeforeWrite(unsigned guest_reg) const;
 		bool GprQCacheQregHasFutureQwordReadBeforeWrite(unsigned qreg) const;
+		u32 GprQCacheGuestNextQwordReadDistanceBeforeWrite(unsigned guest_reg) const;
+		u32 GprQCacheQregNextQwordReadDistanceBeforeWrite(unsigned qreg) const;
+		unsigned SelectGprQCacheScratchQreg(u32 avoid_qreg_mask = 0) const;
 		bool GprQCacheGuestDefinedBeforeCurrentInstruction(unsigned guest_reg) const;
 		u16 GprQCacheGuestEntryQwordReadCount(unsigned guest_reg) const;
 		bool PreserveGprQCacheGuestForFutureRead(unsigned guest_reg, unsigned cached_qreg,
@@ -836,5 +839,6 @@ namespace VitaEE
 		u8 m_gpr_q_cache_count = 0;
 		u8 m_staged_gpr_q_cache_guest[MAX_GPR_QCACHE]{};
 		u8 m_staged_gpr_q_cache_count = 0;
+		std::vector<u16> m_gpr_q_cache_next_use_distances;
 		};
 	} // namespace VitaEE
