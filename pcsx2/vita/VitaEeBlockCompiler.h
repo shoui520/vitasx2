@@ -587,6 +587,7 @@ namespace VitaEE
 		bool EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins = nullptr);
 		bool EmitSyncForwardedBooleanBranchToBacking();
 		bool IsForwardedBooleanBranchResult(unsigned guest_reg) const;
+		bool EmitStageResidentRawGpr0Qword();
 		int FindGprPinIndex(unsigned guest_reg) const;
 		int FindGprPinHost(unsigned guest_reg) const;
 		int FindGprPinHighHost(unsigned guest_reg) const;
@@ -862,6 +863,8 @@ namespace VitaEE
 		bool m_forwarded_boolean_branch = false;
 		u8 m_forwarded_boolean_guest = 0;
 		u32 m_forwarded_boolean_producer_index = 0;
+		bool m_resident_raw_gpr0_qword = false;
+		u8 m_resident_raw_gpr0_entry_instructions = 0;
 		u32 m_current_opcode = 0;
 		u32 m_current_block_start_pc = 0;
 		u32 m_current_block_instruction_count = 0;

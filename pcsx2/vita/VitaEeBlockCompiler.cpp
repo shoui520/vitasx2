@@ -94,6 +94,10 @@ u32 g_qemuForwardedBooleanBranchLoadsElided = 0;
 u32 g_qemuForwardedBooleanBranchStoresElided = 0;
 u32 g_qemuForwardedBooleanBranchNormalizationsElided = 0;
 u32 g_qemuForwardedBooleanBranchSyncWords = 0;
+u32 g_qemuResidentRawGpr0QwordBlocks = 0;
+u32 g_qemuResidentRawGpr0QwordStoreSelections = 0;
+u32 g_qemuResidentRawGpr0QwordHotInstructionsElided = 0;
+u32 g_qemuResidentRawGpr0QwordColdReloadInstructions = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
@@ -3521,6 +3525,17 @@ namespace VitaEE
 		return true;
 	}
 
+	bool ForwardedBooleanPrefixStoresRawGpr0(u32 start_pc, u32 producer_index)
+	{
+		for (u32 i = 0; i < producer_index; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			if ((op >> 26) == 0x1f && RT(op) == 0) // SQ zero,imm(rs)
+				return true;
+		}
+		return false;
+	}
+
 	bool UpdateGprPinEntryLiveness(u32 op, u32& defined, u32& live_in_reads)
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp scalar ALU/shift/move/mult-div
@@ -6081,6 +6096,54 @@ namespace VitaEE
 			m_current_instruction_index == m_forwarded_boolean_producer_index;
 	}
 
+	bool BlockCompiler::EmitStageResidentRawGpr0Qword()
+	{
+		if (!m_resident_raw_gpr0_qword)
+			return true;
+
+		// PCSX2 owner: iR5900LoadStore.cpp::recStore(128) obtains the raw SQ
+		// source through iCore's persistent MODE_READ XMM mapping. Establish the
+		// same raw GPR0 value once at canonical entry, including the LD-$zero
+		// compatibility case, then let the exact resident self-edge retain q0.
+		constexpr unsigned NEON_VALUE = 0;
+		const size_t prelude_start = m_code.Size();
+		if (!EmitLoadRawGpr0KnownZeroFlag(HOST_TMP1) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1,
+				VitaA32::ShiftType::LSL, 0, true))
+		{
+			return false;
+		}
+
+		const size_t raw_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (raw_fallback == static_cast<size_t>(-1) ||
+			!m_code.EmitVeorQ(NEON_VALUE, NEON_VALUE, NEON_VALUE))
+		{
+			return false;
+		}
+
+		const size_t prelude_done = m_code.EmitBranchPlaceholder();
+		if (prelude_done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t raw_fallback_target = m_code.Size();
+		const size_t hot_instructions =
+			(raw_fallback_target - prelude_start) / sizeof(u32);
+		if (hot_instructions > UINT8_MAX ||
+			!m_code.PatchBranch(raw_fallback, raw_fallback_target,
+				VitaA32::Condition::EQ) ||
+			!EmitLoadCpuRegsQ128(GprOffset(0), NEON_VALUE, HOST_TMP1) ||
+			!m_code.PatchBranch(prelude_done, m_code.Size()))
+		{
+			return false;
+		}
+
+		m_resident_raw_gpr0_entry_instructions = static_cast<u8>(hot_instructions);
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuResidentRawGpr0QwordBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::EmitSyncForwardedBooleanBranchToBacking()
 	{
 		if (!m_forwarded_boolean_branch)
@@ -6790,6 +6853,10 @@ namespace VitaEE
 			m_forwarded_boolean_guest = 0;
 			m_forwarded_boolean_producer_index = 0;
 		}
+		m_resident_raw_gpr0_qword = m_forwarded_boolean_branch &&
+			ForwardedBooleanPrefixStoresRawGpr0(
+				start_pc, m_forwarded_boolean_producer_index);
+		m_resident_raw_gpr0_entry_instructions = 0;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (m_forwarded_boolean_branch)
 			g_qemuForwardedBooleanBranchBlocks++;
@@ -6838,6 +6905,8 @@ namespace VitaEE
 			}
 			resident_entry_loads += 2;
 		}
+		if (!EmitStageResidentRawGpr0Qword())
+			return false;
 		if (persistent_dispatch_exits && resident_entry_loads != 0)
 		{
 			// PCSX2 owner: iCore.cpp keeps MODE_READ mappings valid until a
@@ -21048,6 +21117,16 @@ namespace VitaEE
 		{
 			if (rt == 0)
 			{
+				if (m_resident_raw_gpr0_qword)
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					g_qemuResidentRawGpr0QwordStoreSelections++;
+					g_qemuResidentRawGpr0QwordHotInstructionsElided +=
+						m_resident_raw_gpr0_entry_instructions;
+#endif
+					return m_code.EmitVst1Q32Aligned(NEON_VALUE, HOST_TMP0);
+				}
+
 				if (!EmitLoadRawGpr0KnownZeroFlag(HOST_TMP1) ||
 					!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP1, VitaA32::ShiftType::LSL, 0, true))
 	{
@@ -25015,6 +25094,19 @@ namespace VitaEE
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memWrite128)))
 		{
 			return false;
+		}
+		if (m_resident_raw_gpr0_qword && tail.rt == 0)
+		{
+			// q0 is caller-clobbered by the handler ABI. Rebuild the resident raw
+			// source before rejoining so a handler-to-RAM page transition cannot
+			// feed a clobbered qword into the next native SQ.
+			const size_t reload_start = m_code.Size();
+			if (!EmitLoadCpuRegsQ128(GprOffset(0), NEON_VALUE, HOST_TMP1))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentRawGpr0QwordColdReloadInstructions += static_cast<u32>(
+				(m_code.Size() - reload_start) / sizeof(u32));
+#endif
 		}
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();
