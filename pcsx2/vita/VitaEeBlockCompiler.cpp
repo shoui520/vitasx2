@@ -15102,35 +15102,14 @@ namespace VitaEE
 		};
 
 		const auto alloc_cold_qreg = [this](auto& used_qregs) {
+			u32 used_qreg_mask = 0;
 			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (!used_qregs[qreg] && !IsGprQCacheQregResident(qreg))
-				{
-					used_qregs[qreg] = true;
-					return qreg;
-				}
-			}
+				used_qreg_mask |= static_cast<u32>(used_qregs[qreg]) << qreg;
 
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (!used_qregs[qreg] &&
-					!GprQCacheQregHasFutureQwordReadBeforeWrite(qreg))
-				{
-					used_qregs[qreg] = true;
-					return qreg;
-				}
-			}
-
-			for (unsigned qreg = 0; qreg < MAX_GPR_QCACHE; qreg++)
-			{
-				if (!used_qregs[qreg])
-				{
-					used_qregs[qreg] = true;
-					return qreg;
-				}
-			}
-
-			return MAX_GPR_QCACHE;
+			const unsigned qreg = SelectGprQCacheScratchQreg(used_qreg_mask);
+			if (qreg < MAX_GPR_QCACHE)
+				used_qregs[qreg] = true;
+			return qreg;
 		};
 
 		const auto emit_unsigned_shift_subtract_divide =
@@ -15547,6 +15526,24 @@ namespace VitaEE
 			       emit_arbitrary_divisor_lane(1, false, 0, HOST_BRANCH_STATE) &&
 			       emit_arbitrary_divisor_lane(2, false, 0, HOST_BRANCH_STATE) &&
 			       emit_arbitrary_divisor_lane(3, false, 0, HOST_BRANCH_STATE);
+		}
+
+		// PCSX2 owner: x86/iR5900Analysis.cpp::recBackpropMMI() gives
+		// PDIVBW one 128-bit RS live range across the operation. Runtime
+		// divisors fan out to four NEON edge-case bodies plus the scalar
+		// arbitrary-divisor body on Cortex-A9; materialize RS once before that
+		// fan-out so every body sees the same resident dividend instead of
+		// emitting its own qword reload. The scalar body's word reads are then
+		// extracted from this qreg by EmitLoadGprWord().
+		const int cached_dividend_qreg = FindGprQCache(rs);
+		const unsigned dividend_qreg = cached_dividend_qreg >= 0 ?
+			static_cast<unsigned>(cached_dividend_qreg) :
+			SelectGprQCacheScratchQreg();
+		if (dividend_qreg >= MAX_GPR_QCACHE ||
+			(cached_dividend_qreg < 0 &&
+			 !EmitLoadGprQ128(rs, dividend_qreg, HOST_TMP0)))
+		{
+			return false;
 		}
 
 		BranchPatch divzero_branch{};
