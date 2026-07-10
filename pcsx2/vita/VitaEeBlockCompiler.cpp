@@ -89,6 +89,11 @@ u32 g_qemuGprPinColdSyncWordsStored = 0;
 u32 g_qemuGpr64BackingLoadInstructions = 0;
 u32 g_qemuGpr64BackingStoreInstructions = 0;
 u32 g_qemuCallerSavedBranchFlagBlocks = 0;
+u32 g_qemuForwardedBooleanBranchBlocks = 0;
+u32 g_qemuForwardedBooleanBranchLoadsElided = 0;
+u32 g_qemuForwardedBooleanBranchStoresElided = 0;
+u32 g_qemuForwardedBooleanBranchNormalizationsElided = 0;
+u32 g_qemuForwardedBooleanBranchSyncWords = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
@@ -3462,6 +3467,60 @@ namespace VitaEE
 		return delay_op == 0 || (delay_op >> 26) == 0x08 || (delay_op >> 26) == 0x09;
 	}
 
+	bool AnalyzeForwardedBooleanBranch(u32 start_pc, u32 instruction_count,
+		u8* guest_reg, u32* producer_index)
+	{
+		if (!guest_reg || !producer_index || instruction_count < 3 ||
+			!BlockHasExactConditionalSelfLink(start_pc, instruction_count))
+		{
+			return false;
+		}
+
+		const u32 branch_index = instruction_count - 2;
+		const u32 branch_op = memRead32(start_pc + branch_index * sizeof(u32));
+		if ((branch_op >> 26) != 0x05) // BNE boolean,zero,loop
+			return false;
+
+		const unsigned rs = RS(branch_op);
+		const unsigned rt = RT(branch_op);
+		const unsigned boolean_guest = (rs == 0) ? rt : ((rt == 0) ? rs : 0);
+		if (boolean_guest == 0)
+			return false;
+
+		u32 producer = branch_index;
+		while (producer != 0 && memRead32(start_pc + (producer - 1) * sizeof(u32)) == 0)
+			producer--;
+		if (producer == 0)
+			return false;
+		producer--;
+
+		const u32 producer_op = memRead32(start_pc + producer * sizeof(u32));
+		if ((producer_op >> 26) != 0x00 ||
+			((producer_op & 0x3f) != 0x2a && (producer_op & 0x3f) != 0x2b) ||
+			RD(producer_op) != boolean_guest)
+		{
+			return false;
+		}
+
+		// r12 carries the low boolean and r6 its known-zero high word. Before
+		// the producer, accept only NOP and SQ zero: their audited native fast
+		// paths preserve both hosts, and SQ's handler tail synchronizes them before
+		// calling PCSX2. Also reject SQ using the forwarded guest as its base so a
+		// resident iteration never reads stale backing state.
+		for (u32 i = 0; i < producer; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			if (op == 0)
+				continue;
+			if ((op >> 26) != 0x1f || RT(op) != 0 || RS(op) == boolean_guest)
+				return false;
+		}
+
+		*guest_reg = static_cast<u8>(boolean_guest);
+		*producer_index = producer;
+		return true;
+	}
+
 	bool UpdateGprPinEntryLiveness(u32 op, u32& defined, u32& live_in_reads)
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp scalar ALU/shift/move/mult-div
@@ -6016,11 +6075,32 @@ namespace VitaEE
 		return masks;
 	}
 
+	bool BlockCompiler::IsForwardedBooleanBranchResult(unsigned guest_reg) const
+	{
+		return m_forwarded_boolean_branch && guest_reg == m_forwarded_boolean_guest &&
+			m_current_instruction_index == m_forwarded_boolean_producer_index;
+	}
+
+	bool BlockCompiler::EmitSyncForwardedBooleanBranchToBacking()
+	{
+		if (!m_forwarded_boolean_branch)
+			return true;
+
+		const size_t offset = GprOffset(m_forwarded_boolean_guest);
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuForwardedBooleanBranchSyncWords += 2;
+#endif
+		return m_code.EmitStrImm12(m_branch_flag_host, HOST_CPU_REGS, static_cast<u16>(offset)) &&
+			m_code.EmitStrImm12(HOST_TMP5, HOST_CPU_REGS,
+				static_cast<u16>(offset + sizeof(u32)));
+	}
+
 	bool BlockCompiler::EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins)
 	{
-		if (!m_dirty_pins_enabled)
+		if (!m_dirty_pins_enabled && !m_forwarded_boolean_branch)
 			return true;
-		const GprPinDirtyMasks masks = dirty_pins ? *dirty_pins : CurrentGprPinDirtyMasks();
+		const GprPinDirtyMasks masks = m_dirty_pins_enabled ?
+			(dirty_pins ? *dirty_pins : CurrentGprPinDirtyMasks()) : GprPinDirtyMasks{};
 
 		// PCSX2 owners: x86/iCore.cpp::_deleteGPRtoX86reg() and
 		// _deleteGPRtoXMMreg() write back only MODE_WRITE mappings. This sync is
@@ -6075,7 +6155,7 @@ namespace VitaEE
 			}
 		}
 
-		return true;
+		return EmitSyncForwardedBooleanBranchToBacking();
 	}
 
 	bool BlockCompiler::EmitFlushDirtyGprPinsForGuest(unsigned guest_reg)
@@ -6702,6 +6782,18 @@ namespace VitaEE
 		// SQ zero in the measured zero-fill loop).
 		const bool dirty_self_link_candidate = dirty_self_link_shape_candidate &&
 			m_staged_gpr_q_cache_count == 0;
+		m_forwarded_boolean_branch = dirty_self_link_candidate && caller_saved_branch_flag &&
+			AnalyzeForwardedBooleanBranch(start_pc, instruction_count,
+				&m_forwarded_boolean_guest, &m_forwarded_boolean_producer_index);
+		if (!m_forwarded_boolean_branch)
+		{
+			m_forwarded_boolean_guest = 0;
+			m_forwarded_boolean_producer_index = 0;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (m_forwarded_boolean_branch)
+			g_qemuForwardedBooleanBranchBlocks++;
+#endif
 		// r7/r8 are a chain-wide vTLB ABI under the persistent dispatcher, even
 		// for blocks without memory operations: letting an arithmetic block pin a
 		// guest value there would poison the next linked memory block.
@@ -6734,20 +6826,33 @@ namespace VitaEE
 			MarkGprPinsDirtyAtResidentSelfLinkEntry(start_pc, instruction_count);
 		if (!EmitGprPinLoads())
 			return false;
-		if (persistent_dispatch_exits && gpr_pin_entry_loads != 0)
+		u8 resident_entry_loads = gpr_pin_entry_loads;
+		if (m_forwarded_boolean_branch)
+		{
+			const size_t offset = GprOffset(m_forwarded_boolean_guest);
+			if (!m_code.EmitLdrImm12(m_branch_flag_host, HOST_CPU_REGS, static_cast<u16>(offset)) ||
+				!m_code.EmitLdrImm12(HOST_TMP5, HOST_CPU_REGS,
+					static_cast<u16>(offset + sizeof(u32))))
+			{
+				return false;
+			}
+			resident_entry_loads += 2;
+		}
+		if (persistent_dispatch_exits && resident_entry_loads != 0)
 		{
 			// PCSX2 owner: iCore.cpp keeps MODE_READ mappings valid until a
 			// clobber/flush seam, while iBranchTest()/BaseBlocks owns the patched
 			// direct edge. A self-link returns to this exact allocator mapping, so
-			// it may enter after the initial pin loads. Other incoming edges retain
-			// the ordinary linked entry and rebuild the mapping from cpuRegs.
+			// it may enter after the initial pin and forwarded-transient loads. Other
+			// incoming edges retain the ordinary linked entry and rebuild the mapping
+			// from cpuRegs.
 			// The self edge also cannot inherit a different PC: normal entry has
 			// already synchronized this same block-start PC, and exception/event
 			// paths leave through the dispatcher rather than taking the self edge.
 			if (resident_self_link_entry_offset)
 				*resident_self_link_entry_offset = m_code.Size();
 			if (resident_self_link_entry_loads)
-				*resident_self_link_entry_loads = gpr_pin_entry_loads;
+				*resident_self_link_entry_loads = resident_entry_loads;
 		}
 		if (!EmitGprQCacheEntryLoads())
 			return false;
@@ -7800,7 +7905,10 @@ namespace VitaEE
 		if (!direct_exit || !event_exit)
 			return false;
 
-		const bool carry_dirty_self_link = preserve_dirty_taken_self_link &&
+		// The forwarded boolean is part of the same resident self-link contract
+		// even when a future matching block has no dirty scalar pin of its own.
+		const bool carry_dirty_self_link =
+			(preserve_dirty_taken_self_link || m_forwarded_boolean_branch) &&
 			taken_link && !wait_loop_taken;
 		if (!carry_dirty_self_link && !EmitFlushDirtyGprPins())
 			return false;
@@ -23195,6 +23303,19 @@ namespace VitaEE
 	{
 		const unsigned rs = RS(op);
 		const unsigned rt = RT(op);
+		if (m_forwarded_boolean_branch && !branch_on_equal &&
+			((rs == m_forwarded_boolean_guest && rt == 0) ||
+				(rt == m_forwarded_boolean_guest && rs == 0)))
+		{
+			// PCSX2's MODE_READ mapping lets recBNE() consume the preceding
+			// SLT/SLTU boolean without a GPR-file round-trip. The forwarded value
+			// is already the normalized zero/nonzero predicate required by BNE.
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuForwardedBooleanBranchLoadsElided++;
+			g_qemuForwardedBooleanBranchNormalizationsElided += 3;
+#endif
+			return true;
+		}
 
 		if (rs == rt)
 			return m_code.EmitMovImm8(m_branch_flag_host, branch_on_equal ? 1 : 0);
@@ -23353,8 +23474,21 @@ namespace VitaEE
 		if (guest_reg == 0)
 			return true;
 
+		const bool forward_to_branch = IsForwardedBooleanBranchResult(guest_reg);
 		const bool direct_result = FindGprPinHost(guest_reg) >= 0;
-		const unsigned result_reg = direct_result ? SelectGprLowResultHost(guest_reg, HOST_TMP4) : HOST_TMP4;
+		const unsigned result_reg = forward_to_branch ? m_branch_flag_host :
+			(direct_result ? SelectGprLowResultHost(guest_reg, HOST_TMP4) : HOST_TMP4);
+		const auto commit_result = [&]() {
+			if (!forward_to_branch)
+				return EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuForwardedBooleanBranchStoresElided += 2;
+#endif
+			// SLT/SLTU produce an exact zero-extended boolean. Keep the high word
+			// beside the caller-saved low result so a pre-producer handler on the
+			// next resident iteration can materialize the complete guest value.
+			return m_code.EmitMovImm8(HOST_TMP5, 0);
+		};
 		if (!signed_compare)
 		{
 			if (direct_result)
@@ -23363,14 +23497,14 @@ namespace VitaEE
 					   m_code.EmitCmpReg(lhs_low, rhs_low, VitaA32::Condition::EQ) &&
 					   m_code.EmitMovImm8(result_reg, 0) &&
 					   m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::CC) &&
-					   EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
+					   commit_result();
 			}
 
-			return m_code.EmitMovImm8(HOST_TMP4, 0) &&
+			return m_code.EmitMovImm8(result_reg, 0) &&
 				   m_code.EmitCmpReg(lhs_high, rhs_high) &&
 				   m_code.EmitCmpReg(lhs_low, rhs_low, VitaA32::Condition::EQ) &&
-				   m_code.EmitMovImm8(HOST_TMP4, 1, VitaA32::Condition::CC) &&
-				   EmitStoreGprZeroExtended32FromLow(guest_reg, HOST_TMP4);
+				   m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::CC) &&
+				   commit_result();
 		}
 
 		// Compare the low word first to feed its borrow into the high-word SBCS.
@@ -23383,7 +23517,7 @@ namespace VitaEE
 			   m_code.EmitSbcReg(result_reg, lhs_high, rhs_high, true) &&
 			   m_code.EmitMovImm8(result_reg, 0) &&
 			   m_code.EmitMovImm8(result_reg, 1, VitaA32::Condition::LT) &&
-			   EmitStoreGprZeroExtended32FromLow(guest_reg, result_reg);
+			   commit_result();
 	}
 
 	bool BlockCompiler::EmitSetLessThan64Known(unsigned guest_reg, bool signed_compare,
