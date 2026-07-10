@@ -113,6 +113,11 @@ u32 g_qemuResidentNextEventLowBlocks = 0;
 u32 g_qemuResidentNextEventLowHotInstructionsElided = 0;
 u32 g_qemuResidentNextEventLowTranslationReloadInstructions = 0;
 u32 g_qemuResidentNextEventLowColdReloadInstructions = 0;
+u32 g_qemuResidentSchedulerCountdownBlocks = 0;
+u32 g_qemuResidentSchedulerCountdownHotInstructionsElided = 0;
+u32 g_qemuResidentSchedulerCountdownCanonicalInstructions = 0;
+u32 g_qemuResidentSchedulerCountdownPageCarryInstructions = 0;
+u32 g_qemuResidentSchedulerCountdownHandlerInstructions = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
@@ -6215,6 +6220,9 @@ namespace VitaEE
 		const size_t same_page = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (same_page == static_cast<size_t>(-1))
 			return false;
+		const size_t guard_end = m_code.Size();
+		if (!EmitSaveResidentSchedulerCountdown())
+			return false;
 
 		const size_t translation_start = m_code.Size();
 		if (!m_code.PatchBranch(canonical_retranslate, translation_start) ||
@@ -6228,11 +6236,11 @@ namespace VitaEE
 		}
 
 		const size_t translation_end = m_code.Size();
-		if (!EmitReloadResidentNextEventLow())
+		if (!EmitRestoreResidentSchedulerCountdown())
 			return false;
 		const size_t body_start = m_code.Size();
 		const size_t guard_instructions =
-			(translation_start - guard_start) / sizeof(u32);
+			(guard_end - guard_start) / sizeof(u32);
 		const size_t translation_instructions =
 			(translation_end - translation_start) / sizeof(u32);
 		if (guard_instructions > UINT8_MAX || translation_instructions > UINT8_MAX ||
@@ -6250,8 +6258,7 @@ namespace VitaEE
 			static_cast<u32>(guard_instructions);
 		g_qemuResidentVtlbQwordPointerTranslationInstructions +=
 			static_cast<u32>(translation_instructions);
-		g_qemuResidentNextEventLowBlocks++;
-		g_qemuResidentNextEventLowTranslationReloadInstructions++;
+		g_qemuResidentSchedulerCountdownPageCarryInstructions += 2;
 #endif
 		return true;
 	}
@@ -6270,21 +6277,37 @@ namespace VitaEE
 				static_cast<u16>(offset + sizeof(u32)));
 	}
 
-	bool BlockCompiler::EmitStageResidentCycleLow()
+	bool BlockCompiler::EmitStageResidentSchedulerCountdown(bool preserve_for_translation)
 	{
-		if (!m_resident_cycle_low)
+		if (!m_resident_scheduler_countdown)
 			return true;
 
-		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest() keeps the scheduler
-		// cycle in private dispatcher state until an observable exit. The exact
-		// resident self-edge has the same property: r0 is untouched by its direct
-		// SQ, integer body, event comparison, and patched branch, so stage cycle.low
-		// once at canonical entry and carry it around the hot loop.
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)))
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest() maintains private
+		// scheduler state across recompiled dispatch. r0 retains nextEventCycle.low
+		// while r2 retains the signed cycle.low-nextEventCycle.low countdown. Each
+		// resident edge can then advance time and set the event predicate with one
+		// flag-setting ADD. Canonical entry also saves r2 in q1 because the first
+		// vTLB translation uses r2 as scratch before native code begins.
+		const size_t stage_start = m_code.Size();
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS,
+				static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS,
+				static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP0) ||
+			(preserve_for_translation && !EmitSaveResidentSchedulerCountdown()))
+		{
 			return false;
+		}
 
 #if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuResidentCycleLowBlocks++;
+		if (preserve_for_translation)
+		{
+			g_qemuResidentCycleLowBlocks++;
+			g_qemuResidentNextEventLowBlocks++;
+			g_qemuResidentSchedulerCountdownBlocks++;
+			g_qemuResidentSchedulerCountdownCanonicalInstructions += static_cast<u32>(
+				(m_code.Size() - stage_start) / sizeof(u32));
+		}
 #endif
 		return true;
 	}
@@ -6293,6 +6316,11 @@ namespace VitaEE
 	{
 		if (!m_resident_cycle_low)
 			return true;
+		if (m_resident_scheduler_countdown &&
+			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2))
+		{
+			return false;
+		}
 
 		// The scheduler maintains nextEventCycle within a signed-32-bit delta, so
 		// at most one low-word wrap can occur before this event/helper/unlink seam.
@@ -6317,24 +6345,27 @@ namespace VitaEE
 		}
 
 #if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuResidentCycleLowSyncInstructions += 4;
+		g_qemuResidentCycleLowSyncInstructions +=
+			m_resident_scheduler_countdown ? 5 : 4;
 		g_qemuResidentCycleLowWrapFixupInstructions += 3;
 #endif
 		return true;
 	}
 
-	bool BlockCompiler::EmitReloadResidentNextEventLow()
+	bool BlockCompiler::EmitSaveResidentSchedulerCountdown()
 	{
-		if (!m_resident_next_event_low)
+		if (!m_resident_scheduler_countdown)
 			return true;
+		constexpr unsigned NEON_COUNTDOWN = 1;
+		return EmitMoveCoreToQWordLane(NEON_COUNTDOWN, 0, HOST_TMP2);
+	}
 
-		// PCSX2 owner: iBranchTest() keeps the next scheduler deadline in its
-		// recompiler/dispatcher state. r2 is dead after the exact loop's full vTLB
-		// translation and remains untouched by the same-page SQ body, so retain the
-		// low deadline across resident edges. Translation and AAPCS helpers are its
-		// explicit clobber seams and call this reload before native code rejoins.
-		return m_code.EmitLdrImm12(
-			HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET));
+	bool BlockCompiler::EmitRestoreResidentSchedulerCountdown()
+	{
+		if (!m_resident_scheduler_countdown)
+			return true;
+		constexpr unsigned NEON_COUNTDOWN = 1;
+		return EmitMoveQWordLaneToCore(HOST_TMP2, NEON_COUNTDOWN, 0);
 	}
 
 	bool BlockCompiler::EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins)
@@ -7042,7 +7073,7 @@ namespace VitaEE
 			AnalyzeResidentSequentialRawGpr0QwordStore(start_pc, instruction_count,
 				m_forwarded_boolean_producer_index, &m_resident_vtlb_qword_store_op);
 		m_resident_cycle_low = m_resident_vtlb_qword_pointer;
-		m_resident_next_event_low = m_resident_cycle_low;
+		m_resident_scheduler_countdown = m_resident_cycle_low;
 		m_resident_vtlb_qword_guard_offset = static_cast<size_t>(-1);
 		m_resident_vtlb_qword_handler_fallback = static_cast<size_t>(-1);
 		m_resident_vtlb_qword_dirty_pins = {};
@@ -7098,7 +7129,7 @@ namespace VitaEE
 		}
 		if (!EmitStageResidentRawGpr0Qword())
 			return false;
-		if (!EmitStageResidentCycleLow())
+		if (!EmitStageResidentSchedulerCountdown(true))
 			return false;
 		if (!EmitStageResidentVtlbQwordPointer())
 			return false;
@@ -8171,6 +8202,11 @@ namespace VitaEE
 	{
 		if (!direct_exit || !event_exit)
 			return false;
+		// The countdown candidate necessarily contains SQ, which
+		// IsWaitLoopBody() rejects. Fail closed if those analyses ever disagree;
+		// wait-loop fast-forward has a different cycle/publication contract.
+		if (m_resident_scheduler_countdown && wait_loop_taken)
+			return false;
 
 		// The forwarded boolean is part of the same resident self-link contract
 		// even when a future matching block has no dirty scalar pin of its own.
@@ -8186,7 +8222,25 @@ namespace VitaEE
 #endif
 
 		size_t carry_branch = static_cast<size_t>(-1);
-		if (m_resident_cycle_low)
+		if (m_resident_scheduler_countdown)
+		{
+			const size_t countdown_start = m_code.Size();
+			if (!m_code.EmitAddImm32(HOST_TMP2, HOST_TMP2, block_cycles, true) &&
+				(!m_code.EmitMovImm32(HOST_TMP1, block_cycles) ||
+				 !m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP1, true)))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			const u32 countdown_instructions = static_cast<u32>(
+				(m_code.Size() - countdown_start) / sizeof(u32));
+			g_qemuResidentCycleLowHotInstructionsElided +=
+				4 > countdown_instructions ? 4 - countdown_instructions : 0;
+			g_qemuResidentNextEventLowHotInstructionsElided++;
+			g_qemuResidentSchedulerCountdownHotInstructionsElided++;
+#endif
+		}
+		else if (m_resident_cycle_low)
 		{
 			const size_t add_start = m_code.Size();
 			if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, block_cycles) &&
@@ -8215,21 +8269,23 @@ namespace VitaEE
 		// Wait-loop blocks keep the nextEventCycle low word live in HOST_TMP2
 		// for the fast-forward taken tail.
 		const size_t cycle_compare_target = m_code.Size();
-		if (m_resident_next_event_low && !wait_loop_taken)
+		if (!m_resident_scheduler_countdown)
 		{
-			if (!m_code.EmitSubReg(HOST_TMP1, HOST_TMP0, HOST_TMP2, true))
+			if (m_resident_cycle_low && !wait_loop_taken)
+			{
+				if (!m_code.EmitSubReg(HOST_TMP1, HOST_TMP0, HOST_TMP2, true))
+					return false;
+			}
+			else if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS,
+					 static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+				 !m_code.EmitSubReg(wait_loop_taken ? HOST_TMP1 : HOST_TMP2,
+					 HOST_TMP0, HOST_TMP2, true))
+			{
 				return false;
-#if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuResidentNextEventLowHotInstructionsElided++;
-#endif
+			}
 		}
-		else if (!m_code.EmitLdrImm12(
-				 HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
-			 !m_code.EmitSubReg(
-				 wait_loop_taken ? HOST_TMP1 : HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
-		{
-			return false;
-		}
+		// Otherwise the flag-setting countdown ADD above already produced exactly
+		// the signed cycle.low-nextEventCycle.low predicate consumed by BPL.
 
 		// Scheduler events are rare relative to block dispatch. Keep PCSX2's
 		// signed-delta test, but invert the A32 layout so cycle < nextEventCycle
@@ -25338,11 +25394,22 @@ namespace VitaEE
 		constexpr unsigned NEON_VALUE = 0;
 		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!EmitSyncGprPinsToBacking(&tail.dirty_pins))
+		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
 		{
 			return false;
 		}
+		if (m_resident_scheduler_countdown)
+		{
+			const size_t restore_start = m_code.Size();
+			if (!EmitRestoreResidentSchedulerCountdown())
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentSchedulerCountdownHandlerInstructions += static_cast<u32>(
+				(m_code.Size() - restore_start) / sizeof(u32));
+#endif
+		}
+		if (!EmitSyncGprPinsToBacking(&tail.dirty_pins))
+			return false;
 		if (m_resident_vtlb_qword_pointer && tail.rt == 0 &&
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3,
 				VitaA32::ShiftType::LSL, 0))
@@ -25354,7 +25421,22 @@ namespace VitaEE
 		{
 			return false;
 		}
-		if (m_resident_cycle_low)
+		if (m_resident_scheduler_countdown)
+		{
+			// The helper may change the deadline and clobbers r0/r2/q1. Backing
+			// cycle was exact before the call, so rebuild both private scheduler
+			// words directly; the next forced translation will save r2 again.
+			const size_t stage_start = m_code.Size();
+			if (!EmitStageResidentSchedulerCountdown(false))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentCycleLowColdReloadInstructions++;
+			g_qemuResidentNextEventLowColdReloadInstructions++;
+			g_qemuResidentSchedulerCountdownHandlerInstructions += static_cast<u32>(
+				(m_code.Size() - stage_start) / sizeof(u32));
+#endif
+		}
+		else if (m_resident_cycle_low)
 		{
 			// r0 is caller-clobbered and carried the handler address. Rebuild the
 			// private scheduler low word before the cold tail rejoins the resident
@@ -25366,14 +25448,6 @@ namespace VitaEE
 			}
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuResidentCycleLowColdReloadInstructions++;
-#endif
-		}
-		if (m_resident_next_event_low)
-		{
-			if (!EmitReloadResidentNextEventLow())
-				return false;
-#if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuResidentNextEventLowColdReloadInstructions++;
 #endif
 		}
 		if (m_resident_raw_gpr0_qword && tail.rt == 0)

@@ -586,9 +586,10 @@ namespace VitaEE
 		GprPinDirtyMasks CurrentGprPinDirtyMasks() const;
 		bool EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins = nullptr);
 		bool EmitSyncForwardedBooleanBranchToBacking();
-		bool EmitStageResidentCycleLow();
+		bool EmitStageResidentSchedulerCountdown(bool preserve_for_translation);
 		bool EmitSyncResidentCycleLowToBacking();
-		bool EmitReloadResidentNextEventLow();
+		bool EmitSaveResidentSchedulerCountdown();
+		bool EmitRestoreResidentSchedulerCountdown();
 		bool IsForwardedBooleanBranchResult(unsigned guest_reg) const;
 		bool EmitStageResidentRawGpr0Qword();
 		bool EmitStageResidentVtlbQwordPointer();
@@ -871,7 +872,7 @@ namespace VitaEE
 		u8 m_resident_raw_gpr0_entry_instructions = 0;
 		bool m_resident_vtlb_qword_pointer = false;
 		bool m_resident_cycle_low = false;
-		bool m_resident_next_event_low = false;
+		bool m_resident_scheduler_countdown = false;
 		u32 m_resident_vtlb_qword_store_op = 0;
 		size_t m_resident_vtlb_qword_guard_offset = static_cast<size_t>(-1);
 		size_t m_resident_vtlb_qword_handler_fallback = static_cast<size_t>(-1);
