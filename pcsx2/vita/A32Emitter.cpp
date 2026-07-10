@@ -1077,11 +1077,12 @@ namespace VitaA32
 		return EmitU32(EncodeLdrdImm8(rdlo, rdhi, rn, offset, condition));
 	}
 
-	bool CodeBuffer::EmitStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset)
+	bool CodeBuffer::EmitStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
+		Condition condition)
 	{
 		if (!IsLowEvenRegisterPair(rdlo, rdhi) || !IsLowRegister(rn))
 			return false;
-		return EmitU32(EncodeStrdImm8(rdlo, rdhi, rn, offset));
+		return EmitU32(EncodeStrdImm8(rdlo, rdhi, rn, offset, condition));
 	}
 
 	bool CodeBuffer::EmitLdrbImm12(unsigned rd, unsigned rn, u16 offset)
@@ -1224,11 +1225,11 @@ namespace VitaA32
 		return EmitU32(EncodeVstrSImm(sd, rn, offset));
 	}
 
-	bool CodeBuffer::EmitVstrDImm(unsigned dd, unsigned rn, u16 offset)
+	bool CodeBuffer::EmitVstrDImm(unsigned dd, unsigned rn, u16 offset, Condition condition)
 	{
 		if (!IsDRegister(dd) || !IsLowRegister(rn) || offset > 0x3fc || (offset & 0x3u) != 0)
 			return false;
-		return EmitU32(EncodeVstrDImm(dd, rn, offset));
+		return EmitU32(EncodeVstrDImm(dd, rn, offset, condition));
 	}
 
 	bool CodeBuffer::EmitVdupI16D(unsigned dd, unsigned dm, u8 lane)
@@ -2382,11 +2383,11 @@ namespace VitaA32
 			   ((static_cast<u32>(offset) & 0xf0u) << 4) | (offset & 0x0fu);
 	}
 
-	u32 EncodeStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset)
+	u32 EncodeStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset, Condition condition)
 	{
 		pxAssert(IsLowEvenRegisterPair(rdlo, rdhi));
 		pxAssert(IsLowRegister(rn));
-		return CondBits(Condition::AL) | STRD_IMM | ((rn & 0xfu) << 16) | ((rdlo & 0xfu) << 12) |
+		return CondBits(condition) | STRD_IMM | ((rn & 0xfu) << 16) | ((rdlo & 0xfu) << 12) |
 			   ((static_cast<u32>(offset) & 0xf0u) << 4) | (offset & 0x0fu);
 	}
 
@@ -2417,12 +2418,12 @@ namespace VitaA32
 			   ((offset >> 2) & 0xffu);
 	}
 
-	u32 EncodeVstrDImm(unsigned dd, unsigned rn, u16 offset)
+	u32 EncodeVstrDImm(unsigned dd, unsigned rn, u16 offset, Condition condition)
 	{
 		pxAssert(IsDRegister(dd));
 		pxAssert(IsLowRegister(rn));
 		pxAssert(offset <= 0x3fc && (offset & 0x3u) == 0);
-		return CondBits(Condition::AL) | VSTR_D_IMM | ((rn & 0xfu) << 16) | VfpDd(dd) |
+		return CondBits(condition) | VSTR_D_IMM | ((rn & 0xfu) << 16) | VfpDd(dd) |
 			   ((offset >> 2) & 0xffu);
 	}
 

@@ -158,6 +158,8 @@ u32 g_qemuConditionalMovePredicatedKnownCopies = 0;
 u32 g_qemuConditionalMovePredicatedBackingCopies = 0;
 u32 g_qemuConditionalMovePredicatedMixedCopies = 0;
 u32 g_qemuConditionalMovePredicatedQCacheCopies = 0;
+u32 g_qemuConditionalMovePredicatedRegisterStores = 0;
+u32 g_qemuConditionalMovePredicatedQCacheStores = 0;
 #endif
 
 namespace VitaEE
@@ -18774,6 +18776,39 @@ namespace VitaEE
 				if (!TryDeferGprPinLowStore(rd) || !TryDeferGprPinHighStore(rd))
 					return false;
 
+				InvalidateGprQCacheForGuest(rd);
+				return true;
+			}
+		}
+
+		if (rd_pin_index < 0)
+		{
+			const size_t offset = GprOffset(rd);
+			if (rs_low_pin >= 0 && rs_high_pin >= 0 && offset <= 0xff &&
+				CanUseA32DualTransferPair(static_cast<unsigned>(rs_low_pin),
+					static_cast<unsigned>(rs_high_pin)))
+			{
+				if (!m_code.EmitStrdImm8(static_cast<unsigned>(rs_low_pin),
+						static_cast<unsigned>(rs_high_pin), HOST_CPU_REGS,
+						static_cast<u8>(offset), move_condition))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuConditionalMovePredicatedRegisterStores++;
+#endif
+				InvalidateGprQCacheForGuest(rd);
+				return true;
+			}
+
+			const int rs_qcache = FindGprQCache(rs);
+			if (rs_qcache >= 0 &&
+				m_code.EmitVstrDImm(static_cast<unsigned>(rs_qcache) * 2,
+					HOST_CPU_REGS, static_cast<u16>(offset), move_condition))
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuConditionalMovePredicatedQCacheStores++;
+#endif
 				InvalidateGprQCacheForGuest(rd);
 				return true;
 			}

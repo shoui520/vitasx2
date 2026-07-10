@@ -138,7 +138,8 @@ namespace VitaA32
 		bool EmitStrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 		bool EmitLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
 			Condition condition = Condition::AL);
-		bool EmitStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
+		bool EmitStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
+			Condition condition = Condition::AL);
 		bool EmitLdrbImm12(unsigned rd, unsigned rn, u16 offset);
 		bool EmitLdrbRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 		bool EmitStrbImm12(unsigned rd, unsigned rn, u16 offset);
@@ -159,7 +160,8 @@ namespace VitaA32
 		bool EmitVldrSImm(unsigned sd, unsigned rn, u16 offset);
 		bool EmitVstrSImm(unsigned sd, unsigned rn, u16 offset);
 		bool EmitVldrDImm(unsigned dd, unsigned rn, u16 offset);
-		bool EmitVstrDImm(unsigned dd, unsigned rn, u16 offset);
+		bool EmitVstrDImm(unsigned dd, unsigned rn, u16 offset,
+			Condition condition = Condition::AL);
 		bool EmitVdupI16D(unsigned dd, unsigned dm, u8 lane);
 		bool EmitVdupI32QFromCore(unsigned qd, unsigned rt);
 		bool EmitVmovS(unsigned sd, unsigned sm);
@@ -335,7 +337,8 @@ namespace VitaA32
 	u32 EncodeStrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 	u32 EncodeLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
 		Condition condition = Condition::AL);
-	u32 EncodeStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset);
+	u32 EncodeStrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
+		Condition condition = Condition::AL);
 	u32 EncodeLdrbImm12(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeLdrbRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 	u32 EncodeStrbImm12(unsigned rd, unsigned rn, u16 offset);
@@ -356,7 +359,8 @@ namespace VitaA32
 	u32 EncodeVldrSImm(unsigned sd, unsigned rn, u16 offset);
 	u32 EncodeVstrSImm(unsigned sd, unsigned rn, u16 offset);
 	u32 EncodeVldrDImm(unsigned dd, unsigned rn, u16 offset);
-	u32 EncodeVstrDImm(unsigned dd, unsigned rn, u16 offset);
+	u32 EncodeVstrDImm(unsigned dd, unsigned rn, u16 offset,
+		Condition condition = Condition::AL);
 	u32 EncodeVdupI16D(unsigned dd, unsigned dm, u8 lane);
 	u32 EncodeVdupI32QFromCore(unsigned qd, unsigned rt);
 	u32 EncodeVmovS(unsigned sd, unsigned sm);
