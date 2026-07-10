@@ -94,6 +94,9 @@ u32 g_qemuForwardedBooleanBranchLoadsElided = 0;
 u32 g_qemuForwardedBooleanBranchStoresElided = 0;
 u32 g_qemuForwardedBooleanBranchNormalizationsElided = 0;
 u32 g_qemuForwardedBooleanBranchSyncWords = 0;
+u32 g_qemuResidentForwardedBooleanHighZeroHotInstructionsElided = 0;
+u32 g_qemuResidentForwardedBooleanHighZeroTranslationInstructions = 0;
+u32 g_qemuResidentForwardedBooleanHighZeroHandlerInstructions = 0;
 u32 g_qemuResidentRawGpr0QwordBlocks = 0;
 u32 g_qemuResidentRawGpr0QwordStoreSelections = 0;
 u32 g_qemuResidentRawGpr0QwordHotInstructionsElided = 0;
@@ -6238,6 +6241,14 @@ namespace VitaEE
 		const size_t translation_end = m_code.Size();
 		if (!EmitRestoreResidentSchedulerCountdown())
 			return false;
+		// PCSX2 owner: iCore.cpp keeps the zero-extended high half of the
+		// recSLTU() MODE_WRITE mapping resident. Canonical and page-translation
+		// entries must establish that invariant only after a direct mapping has
+		// been selected: a handler edge still needs the incoming architectural
+		// high word when it synchronizes cpuRegs before calling PCSX2.
+		const size_t high_zero_start = m_code.Size();
+		if (m_forwarded_boolean_branch && !m_code.EmitMovImm8(HOST_TMP5, 0))
+			return false;
 		const size_t body_start = m_code.Size();
 		const size_t guard_instructions =
 			(guard_end - guard_start) / sizeof(u32);
@@ -6259,6 +6270,8 @@ namespace VitaEE
 		g_qemuResidentVtlbQwordPointerTranslationInstructions +=
 			static_cast<u32>(translation_instructions);
 		g_qemuResidentSchedulerCountdownPageCarryInstructions += 2;
+		g_qemuResidentForwardedBooleanHighZeroTranslationInstructions +=
+			static_cast<u32>((m_code.Size() - high_zero_start) / sizeof(u32));
 #endif
 		return true;
 	}
@@ -23869,9 +23882,20 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuForwardedBooleanBranchStoresElided += 2;
 #endif
-			// SLT/SLTU produce an exact zero-extended boolean. Keep the high word
-			// beside the caller-saved low result so a pre-producer handler on the
-			// next resident iteration can materialize the complete guest value.
+			// The exact sequential-SQ resident form establishes the zero high word
+			// at canonical/page translation and after its only helper seam. Preserve
+			// that iCore-style mapping across same-page self-links instead of
+			// rematerializing the invariant at every producer.
+			if (m_resident_vtlb_qword_pointer)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuResidentForwardedBooleanHighZeroHotInstructionsElided++;
+#endif
+				return true;
+			}
+
+			// Other forwarded forms still need to establish the complete
+			// zero-extended guest value at their producer.
 			return m_code.EmitMovImm8(HOST_TMP5, 0);
 		};
 		if (!signed_compare)
@@ -25420,6 +25444,19 @@ namespace VitaEE
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memWrite128)))
 		{
 			return false;
+		}
+		if (m_resident_vtlb_qword_pointer && m_forwarded_boolean_branch)
+		{
+			// The helper observed the incoming architectural high word through the
+			// pre-call sync. Re-establish recSLTU()'s known-zero high companion
+			// before the cold tail rejoins ahead of the producer.
+			const size_t high_zero_start = m_code.Size();
+			if (!m_code.EmitMovImm8(HOST_TMP5, 0))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentForwardedBooleanHighZeroHandlerInstructions +=
+				static_cast<u32>((m_code.Size() - high_zero_start) / sizeof(u32));
+#endif
 		}
 		if (m_resident_scheduler_countdown)
 		{
