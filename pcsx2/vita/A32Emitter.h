@@ -56,6 +56,8 @@ namespace VitaA32
 		bool Attach(u8* data, size_t capacity);
 		void Reset();
 		void Release();
+		void SetNeonQRegisterBankMapping(unsigned logical_first_q, unsigned physical_first_q,
+			unsigned q_count);
 
 		u8* Data() const { return m_base; }
 		void* EntryPoint() const { return m_base; }
@@ -157,6 +159,7 @@ namespace VitaA32
 		bool EmitVst1Q32(unsigned qd, unsigned rn);
 		bool EmitVst1Q32Aligned(unsigned qd, unsigned rn);
 		bool EmitVst1D32(unsigned dd, unsigned rn);
+		bool EmitVst1D32Lane(unsigned dd, u8 lane, unsigned rn);
 		bool EmitVst1D8Lane0(unsigned dd, unsigned rn);
 		bool EmitVst1D16Lane0(unsigned dd, unsigned rn);
 		bool EmitVldrSImm(unsigned sd, unsigned rn, u16 offset);
@@ -169,6 +172,10 @@ namespace VitaA32
 		bool EmitVmovS(unsigned sd, unsigned sm);
 		bool EmitVmovCoreToS(unsigned sd, unsigned rt);
 		bool EmitVmovSToCore(unsigned rt, unsigned sd, Condition condition = Condition::AL);
+		bool EmitVmovCoreToD32Lane(unsigned dd, u8 lane, unsigned rt,
+			Condition condition = Condition::AL);
+		bool EmitVmovD32LaneToCore(unsigned rt, unsigned dd, u8 lane,
+			Condition condition = Condition::AL);
 		bool EmitVmovCorePairToD(unsigned dd, unsigned rt, unsigned rt2);
 		bool EmitVcvtF32S32(unsigned sd, unsigned sm);
 		bool EmitVcvtF64F32(unsigned dd, unsigned sm);
@@ -270,11 +277,16 @@ namespace VitaA32
 
 	private:
 		bool HasSpace(size_t bytes) const;
+		unsigned MapNeonQRegister(unsigned qreg) const;
+		unsigned MapNeonDRegister(unsigned dreg) const;
 
 		u8* m_base = nullptr;
 		size_t m_capacity = 0;
 		size_t m_offset = 0;
 		bool m_owns_memory = false;
+		u8 m_neon_logical_first_q = 0;
+		u8 m_neon_physical_first_q = 0;
+		u8 m_neon_mapped_q_count = 0;
 	};
 
 	u32 EncodeMovImm8(unsigned rd, u8 value, Condition condition = Condition::AL);
@@ -361,6 +373,7 @@ namespace VitaA32
 	u32 EncodeVst1Q32(unsigned qd, unsigned rn);
 	u32 EncodeVst1Q32Aligned(unsigned qd, unsigned rn);
 	u32 EncodeVst1D32(unsigned dd, unsigned rn);
+	u32 EncodeVst1D32Lane(unsigned dd, u8 lane, unsigned rn);
 	u32 EncodeVst1D8Lane0(unsigned dd, unsigned rn);
 	u32 EncodeVst1D16Lane0(unsigned dd, unsigned rn);
 	u32 EncodeVldrSImm(unsigned sd, unsigned rn, u16 offset);
@@ -373,6 +386,10 @@ namespace VitaA32
 	u32 EncodeVmovS(unsigned sd, unsigned sm);
 	u32 EncodeVmovCoreToS(unsigned sd, unsigned rt);
 	u32 EncodeVmovSToCore(unsigned rt, unsigned sd, Condition condition = Condition::AL);
+	u32 EncodeVmovCoreToD32Lane(unsigned dd, u8 lane, unsigned rt,
+		Condition condition = Condition::AL);
+	u32 EncodeVmovD32LaneToCore(unsigned rt, unsigned dd, u8 lane,
+		Condition condition = Condition::AL);
 	u32 EncodeVmovCorePairToD(unsigned dd, unsigned rt, unsigned rt2);
 	u32 EncodeVcvtF32S32(unsigned sd, unsigned sm);
 	u32 EncodeVcvtF64F32(unsigned dd, unsigned sm);

@@ -604,6 +604,18 @@ namespace VitaEE
 			size_t resume_offset, unsigned scratch);
 		bool EmitLoadCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch);
 		bool EmitStoreCpuRegsQ128(size_t offset, unsigned qreg, unsigned address_scratch);
+		bool EmitMoveQWordLaneToCore(unsigned host_reg, unsigned qreg, unsigned word);
+		bool EmitMoveQWordLaneToCore(unsigned host_reg, unsigned qreg, unsigned word,
+			VitaA32::Condition condition);
+		bool EmitMoveCoreToQWordLane(unsigned qreg, unsigned word, unsigned host_reg);
+		bool EmitMoveCoreToQWordLane(unsigned qreg, unsigned word, unsigned host_reg,
+			VitaA32::Condition condition);
+		bool EmitMoveQWordLane(unsigned dest_qreg, unsigned dest_word, unsigned source_qreg,
+			unsigned source_word, unsigned host_scratch);
+		bool EmitLoadQWordLane(unsigned qreg, unsigned word, unsigned address_reg, u16 offset,
+			unsigned host_scratch);
+		bool EmitStoreQWordLane(unsigned qreg, unsigned word, unsigned address_reg, u16 offset,
+			unsigned host_scratch);
 		bool EmitCop1ExponentMask(unsigned host_reg);
 		bool EmitAndCop1ExponentMask(unsigned rd, unsigned rn, unsigned scratch);
 		bool EmitAndCop1FractionMask(unsigned rd, unsigned rn);
@@ -821,12 +833,11 @@ namespace VitaEE
 		u8 m_sa_const_byte_offset = 0;
 		bool m_cop1_fpr_normalized[32]{};
 		bool m_cop1_acc_normalized = false;
-		// True once the vuDouble() bit-select constant quads (Q8-Q11) have been
-		// materialized in this block. Q8-Q15 are used exclusively by the COP2
-		// macro normalize scratch (the GPR-Q cache only claims Q0-Q7 and never
-		// Q8-Q15), so the constants survive across intervening ops and
-		// later COP2 arithmetic/outer ops in the same block can skip re-loading
-		// them. Reset per block in BeginBlock().
+		// True once the vuDouble() bit-select constant quads (physical Q8-Q11)
+		// have been materialized in this block. Physical Q12-Q15 are ephemeral
+		// normalize scratch in COP2 macro blocks and back the private ABI's logical
+		// Q4-Q7 bank in qcache blocks; the block classifier makes those roles
+		// mutually exclusive. Reset per block in BeginBlock().
 		bool m_cop2_norm_consts_ready = false;
 		bool m_gpr_q_cache_enabled = false;
 		u32 m_current_opcode = 0;

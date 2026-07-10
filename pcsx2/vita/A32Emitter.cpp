@@ -72,6 +72,7 @@ namespace VitaA32
 		constexpr u32 VST1_32_Q = 0xf4000a8fu;
 		constexpr u32 VST1_32_Q_ALIGNED = 0xf4000aafu;
 		constexpr u32 VST1_32_D = 0xf400078fu;
+		constexpr u32 VST1_32_D_LANE = 0xf480080fu;
 		constexpr u32 VST1_8_D_LANE0 = 0xf480000fu;
 		constexpr u32 VST1_16_D_LANE0 = 0xf480040fu;
 		constexpr u32 VLDR_S_IMM = 0x0d900a00u;
@@ -83,6 +84,8 @@ namespace VitaA32
 		constexpr u32 VMOV_S = 0xeeb00a40u;
 		constexpr u32 VMOV_CORE_TO_S = 0xee000a10u;
 		constexpr u32 VMOV_S_TO_CORE = 0xee100a10u;
+		constexpr u32 VMOV_CORE_TO_D32_LANE = 0x0e000b10u;
+		constexpr u32 VMOV_D32_LANE_TO_CORE = 0x0e100b10u;
 		constexpr u32 VMOV_CORE_PAIR_TO_D = 0xec400b10u;
 		constexpr u32 VCVT_F32_S32 = 0xeeb80ac0u;
 		constexpr u32 VCVT_F64_F32 = 0xeeb70ac0u;
@@ -349,6 +352,9 @@ namespace VitaA32
 		, m_capacity(std::exchange(other.m_capacity, 0))
 		, m_offset(std::exchange(other.m_offset, 0))
 		, m_owns_memory(std::exchange(other.m_owns_memory, false))
+		, m_neon_logical_first_q(std::exchange(other.m_neon_logical_first_q, 0))
+		, m_neon_physical_first_q(std::exchange(other.m_neon_physical_first_q, 0))
+		, m_neon_mapped_q_count(std::exchange(other.m_neon_mapped_q_count, 0))
 	{
 	}
 
@@ -361,6 +367,9 @@ namespace VitaA32
 			m_capacity = std::exchange(other.m_capacity, 0);
 			m_offset = std::exchange(other.m_offset, 0);
 			m_owns_memory = std::exchange(other.m_owns_memory, false);
+			m_neon_logical_first_q = std::exchange(other.m_neon_logical_first_q, 0);
+			m_neon_physical_first_q = std::exchange(other.m_neon_physical_first_q, 0);
+			m_neon_mapped_q_count = std::exchange(other.m_neon_mapped_q_count, 0);
 		}
 
 		return *this;
@@ -410,6 +419,42 @@ namespace VitaA32
 		m_offset = 0;
 	}
 
+	void CodeBuffer::SetNeonQRegisterBankMapping(unsigned logical_first_q,
+		unsigned physical_first_q, unsigned q_count)
+	{
+		pxAssert(logical_first_q <= 16);
+		pxAssert(physical_first_q <= 16);
+		pxAssert(q_count <= 16 - logical_first_q);
+		pxAssert(q_count <= 16 - physical_first_q);
+
+		m_neon_logical_first_q = static_cast<u8>(logical_first_q);
+		m_neon_physical_first_q = static_cast<u8>(physical_first_q);
+		m_neon_mapped_q_count = static_cast<u8>(q_count);
+	}
+
+	unsigned CodeBuffer::MapNeonQRegister(unsigned qreg) const
+	{
+		if (qreg >= m_neon_logical_first_q &&
+			qreg - m_neon_logical_first_q < m_neon_mapped_q_count)
+		{
+			return m_neon_physical_first_q + (qreg - m_neon_logical_first_q);
+		}
+
+		return qreg;
+	}
+
+	unsigned CodeBuffer::MapNeonDRegister(unsigned dreg) const
+	{
+		const unsigned logical_first_d = m_neon_logical_first_q * 2;
+		const unsigned mapped_d_count = m_neon_mapped_q_count * 2;
+		if (dreg >= logical_first_d && dreg - logical_first_d < mapped_d_count)
+		{
+			return m_neon_physical_first_q * 2 + (dreg - logical_first_d);
+		}
+
+		return dreg;
+	}
+
 	void CodeBuffer::Release()
 	{
 		if (m_base)
@@ -427,6 +472,9 @@ namespace VitaA32
 		m_capacity = 0;
 		m_offset = 0;
 		m_owns_memory = false;
+		m_neon_logical_first_q = 0;
+		m_neon_physical_first_q = 0;
+		m_neon_mapped_q_count = 0;
 	}
 
 	bool CodeBuffer::EmitU32(u32 instruction)
@@ -1178,56 +1226,63 @@ namespace VitaA32
 	{
 		if (!IsQRegister(qd) || !IsLowRegister(rn))
 			return false;
-		return EmitU32(EncodeVld1Q32(qd, rn));
+		return EmitU32(EncodeVld1Q32(MapNeonQRegister(qd), rn));
 	}
 
 	bool CodeBuffer::EmitVld1Q32Aligned(unsigned qd, unsigned rn)
 	{
 		if (!IsQRegister(qd) || !IsLowRegister(rn))
 			return false;
-		return EmitU32(EncodeVld1Q32Aligned(qd, rn));
+		return EmitU32(EncodeVld1Q32Aligned(MapNeonQRegister(qd), rn));
 	}
 
 	bool CodeBuffer::EmitVst1Q32(unsigned qd, unsigned rn)
 	{
 		if (!IsQRegister(qd) || !IsLowRegister(rn))
 			return false;
-		return EmitU32(EncodeVst1Q32(qd, rn));
+		return EmitU32(EncodeVst1Q32(MapNeonQRegister(qd), rn));
 	}
 
 	bool CodeBuffer::EmitVst1Q32Aligned(unsigned qd, unsigned rn)
 	{
 		if (!IsQRegister(qd) || !IsLowRegister(rn))
 			return false;
-		return EmitU32(EncodeVst1Q32Aligned(qd, rn));
+		return EmitU32(EncodeVst1Q32Aligned(MapNeonQRegister(qd), rn));
 	}
 
 	bool CodeBuffer::EmitVst1D32(unsigned dd, unsigned rn)
 	{
 		if (!IsDRegister(dd) || !IsLowRegister(rn))
 			return false;
-		return EmitU32(EncodeVst1D32(dd, rn));
+		return EmitU32(EncodeVst1D32(MapNeonDRegister(dd), rn));
+	}
+
+	bool CodeBuffer::EmitVst1D32Lane(unsigned dd, u8 lane, unsigned rn)
+	{
+		if (!IsDRegister(dd) || lane >= 2 || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeVst1D32Lane(MapNeonDRegister(dd), lane, rn));
 	}
 
 	bool CodeBuffer::EmitVst1D8Lane0(unsigned dd, unsigned rn)
 	{
 		if (!IsDRegister(dd) || !IsLowRegister(rn))
 			return false;
-		return EmitU32(EncodeVst1D8Lane0(dd, rn));
+		return EmitU32(EncodeVst1D8Lane0(MapNeonDRegister(dd), rn));
 	}
 
 	bool CodeBuffer::EmitVst1D16Lane0(unsigned dd, unsigned rn)
 	{
 		if (!IsDRegister(dd) || !IsLowRegister(rn))
 			return false;
-		return EmitU32(EncodeVst1D16Lane0(dd, rn));
+		return EmitU32(EncodeVst1D16Lane0(MapNeonDRegister(dd), rn));
 	}
 
 	bool CodeBuffer::EmitVldrDImm(unsigned dd, unsigned rn, u16 offset)
 	{
 		if (!IsDRegister(dd) || !IsLowRegister(rn) || offset > 0x3fc || (offset & 0x3u) != 0)
 			return false;
-		return EmitU32(EncodeVldrDImm(dd, rn, offset));
+		return EmitU32(EncodeVldrDImm(MapNeonDRegister(dd), rn, offset));
 	}
 
 	bool CodeBuffer::EmitVldrSImm(unsigned sd, unsigned rn, u16 offset)
@@ -1248,21 +1303,21 @@ namespace VitaA32
 	{
 		if (!IsDRegister(dd) || !IsLowRegister(rn) || offset > 0x3fc || (offset & 0x3u) != 0)
 			return false;
-		return EmitU32(EncodeVstrDImm(dd, rn, offset, condition));
+		return EmitU32(EncodeVstrDImm(MapNeonDRegister(dd), rn, offset, condition));
 	}
 
 	bool CodeBuffer::EmitVdupI16D(unsigned dd, unsigned dm, u8 lane)
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dm) || lane >= 4)
 			return false;
-		return EmitU32(EncodeVdupI16D(dd, dm, lane));
+		return EmitU32(EncodeVdupI16D(MapNeonDRegister(dd), MapNeonDRegister(dm), lane));
 	}
 
 	bool CodeBuffer::EmitVdupI32QFromCore(unsigned qd, unsigned rt)
 	{
 		if (!IsQRegister(qd) || !IsGeneralRegister(rt))
 			return false;
-		return EmitU32(EncodeVdupI32QFromCore(qd, rt));
+		return EmitU32(EncodeVdupI32QFromCore(MapNeonQRegister(qd), rt));
 	}
 
 	bool CodeBuffer::EmitVmovS(unsigned sd, unsigned sm)
@@ -1286,11 +1341,25 @@ namespace VitaA32
 		return EmitU32(EncodeVmovSToCore(rt, sd, condition));
 	}
 
+	bool CodeBuffer::EmitVmovCoreToD32Lane(unsigned dd, u8 lane, unsigned rt, Condition condition)
+	{
+		if (!IsDRegister(dd) || lane >= 2 || !IsRegister(rt))
+			return false;
+		return EmitU32(EncodeVmovCoreToD32Lane(MapNeonDRegister(dd), lane, rt, condition));
+	}
+
+	bool CodeBuffer::EmitVmovD32LaneToCore(unsigned rt, unsigned dd, u8 lane, Condition condition)
+	{
+		if (!IsRegister(rt) || !IsDRegister(dd) || lane >= 2)
+			return false;
+		return EmitU32(EncodeVmovD32LaneToCore(rt, MapNeonDRegister(dd), lane, condition));
+	}
+
 	bool CodeBuffer::EmitVmovCorePairToD(unsigned dd, unsigned rt, unsigned rt2)
 	{
 		if (!IsDRegister(dd) || !IsRegister(rt) || !IsRegister(rt2))
 			return false;
-		return EmitU32(EncodeVmovCorePairToD(dd, rt, rt2));
+		return EmitU32(EncodeVmovCorePairToD(MapNeonDRegister(dd), rt, rt2));
 	}
 
 	bool CodeBuffer::EmitVcvtF32S32(unsigned sd, unsigned sm)
@@ -1304,28 +1373,28 @@ namespace VitaA32
 	{
 		if (!IsDRegister(dd) || !IsSRegister(sm))
 			return false;
-		return EmitU32(EncodeVcvtF64F32(dd, sm));
+		return EmitU32(EncodeVcvtF64F32(MapNeonDRegister(dd), sm));
 	}
 
 	bool CodeBuffer::EmitVcvtF32F64(unsigned sd, unsigned dm)
 	{
 		if (!IsSRegister(sd) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVcvtF32F64(sd, dm));
+		return EmitU32(EncodeVcvtF32F64(sd, MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVcvtF32S32Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVcvtF32S32Q(qd, qm));
+		return EmitU32(EncodeVcvtF32S32Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVcvtS32F32Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVcvtS32F32Q(qd, qm));
+		return EmitU32(EncodeVcvtS32F32Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVaddF32(unsigned sd, unsigned sn, unsigned sm)
@@ -1339,7 +1408,7 @@ namespace VitaA32
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dn) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVaddF64(dd, dn, dm));
+		return EmitU32(EncodeVaddF64(MapNeonDRegister(dd), MapNeonDRegister(dn), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVsubF32(unsigned sd, unsigned sn, unsigned sm)
@@ -1360,28 +1429,28 @@ namespace VitaA32
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dn) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVmulF64(dd, dn, dm));
+		return EmitU32(EncodeVmulF64(MapNeonDRegister(dd), MapNeonDRegister(dn), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVaddF32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVaddF32Q(qd, qn, qm));
+		return EmitU32(EncodeVaddF32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVsubF32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVsubF32Q(qd, qn, qm));
+		return EmitU32(EncodeVsubF32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVmulF32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVmulF32Q(qd, qn, qm));
+		return EmitU32(EncodeVmulF32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVdivF32(unsigned sd, unsigned sn, unsigned sm)
@@ -1395,7 +1464,7 @@ namespace VitaA32
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dn) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVdivF64(dd, dn, dm));
+		return EmitU32(EncodeVdivF64(MapNeonDRegister(dd), MapNeonDRegister(dn), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVsqrtF32(unsigned sd, unsigned sm)
@@ -1409,343 +1478,343 @@ namespace VitaA32
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVaddI8Q(qd, qn, qm));
+		return EmitU32(EncodeVaddI8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVaddI16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVaddI16Q(qd, qn, qm));
+		return EmitU32(EncodeVaddI16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVaddI32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVaddI32Q(qd, qn, qm));
+		return EmitU32(EncodeVaddI32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVaddI64Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVaddI64Q(qd, qn, qm));
+		return EmitU32(EncodeVaddI64Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVsubI8Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVsubI8Q(qd, qn, qm));
+		return EmitU32(EncodeVsubI8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVsubI16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVsubI16Q(qd, qn, qm));
+		return EmitU32(EncodeVsubI16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVsubI32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVsubI32Q(qd, qn, qm));
+		return EmitU32(EncodeVsubI32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVshlI16Q(unsigned qd, unsigned qm, u8 amount)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm) || amount == 0 || amount >= 16)
 			return false;
-		return EmitU32(EncodeVshlI16Q(qd, qm, amount));
+		return EmitU32(EncodeVshlI16Q(MapNeonQRegister(qd), MapNeonQRegister(qm), amount));
 	}
 
 	bool CodeBuffer::EmitVshlI32Q(unsigned qd, unsigned qm, u8 amount)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm) || amount == 0 || amount >= 32)
 			return false;
-		return EmitU32(EncodeVshlI32Q(qd, qm, amount));
+		return EmitU32(EncodeVshlI32Q(MapNeonQRegister(qd), MapNeonQRegister(qm), amount));
 	}
 
 	bool CodeBuffer::EmitVshrU16Q(unsigned qd, unsigned qm, u8 amount)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm) || amount == 0 || amount >= 16)
 			return false;
-		return EmitU32(EncodeVshrU16Q(qd, qm, amount));
+		return EmitU32(EncodeVshrU16Q(MapNeonQRegister(qd), MapNeonQRegister(qm), amount));
 	}
 
 	bool CodeBuffer::EmitVshrU32Q(unsigned qd, unsigned qm, u8 amount)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm) || amount == 0 || amount >= 32)
 			return false;
-		return EmitU32(EncodeVshrU32Q(qd, qm, amount));
+		return EmitU32(EncodeVshrU32Q(MapNeonQRegister(qd), MapNeonQRegister(qm), amount));
 	}
 
 	bool CodeBuffer::EmitVshrS16Q(unsigned qd, unsigned qm, u8 amount)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm) || amount == 0 || amount >= 16)
 			return false;
-		return EmitU32(EncodeVshrS16Q(qd, qm, amount));
+		return EmitU32(EncodeVshrS16Q(MapNeonQRegister(qd), MapNeonQRegister(qm), amount));
 	}
 
 	bool CodeBuffer::EmitVshrS32Q(unsigned qd, unsigned qm, u8 amount)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm) || amount == 0 || amount >= 32)
 			return false;
-		return EmitU32(EncodeVshrS32Q(qd, qm, amount));
+		return EmitU32(EncodeVshrS32Q(MapNeonQRegister(qd), MapNeonQRegister(qm), amount));
 	}
 
 	bool CodeBuffer::EmitVshlU32Q(unsigned qd, unsigned qm, unsigned qn)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm) || !IsQRegister(qn))
 			return false;
-		return EmitU32(EncodeVshlU32Q(qd, qm, qn));
+		return EmitU32(EncodeVshlU32Q(MapNeonQRegister(qd), MapNeonQRegister(qm), MapNeonQRegister(qn)));
 	}
 
 	bool CodeBuffer::EmitVshlS32Q(unsigned qd, unsigned qm, unsigned qn)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm) || !IsQRegister(qn))
 			return false;
-		return EmitU32(EncodeVshlS32Q(qd, qm, qn));
+		return EmitU32(EncodeVshlS32Q(MapNeonQRegister(qd), MapNeonQRegister(qm), MapNeonQRegister(qn)));
 	}
 
 	bool CodeBuffer::EmitVmullS16Q(unsigned qd, unsigned dn, unsigned dm)
 	{
 		if (!IsQRegister(qd) || !IsDRegister(dn) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVmullS16Q(qd, dn, dm));
+		return EmitU32(EncodeVmullS16Q(MapNeonQRegister(qd), MapNeonDRegister(dn), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVmullS32Q(unsigned qd, unsigned dn, unsigned dm)
 	{
 		if (!IsQRegister(qd) || !IsDRegister(dn) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVmullS32Q(qd, dn, dm));
+		return EmitU32(EncodeVmullS32Q(MapNeonQRegister(qd), MapNeonDRegister(dn), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVmullU32Q(unsigned qd, unsigned dn, unsigned dm)
 	{
 		if (!IsQRegister(qd) || !IsDRegister(dn) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVmullU32Q(qd, dn, dm));
+		return EmitU32(EncodeVmullU32Q(MapNeonQRegister(qd), MapNeonDRegister(dn), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVnegS32Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVnegS32Q(qd, qm));
+		return EmitU32(EncodeVnegS32Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqmovnS32D(unsigned dd, unsigned qm)
 	{
 		if (!IsDRegister(dd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqmovnS32D(dd, qm));
+		return EmitU32(EncodeVqmovnS32D(MapNeonDRegister(dd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqmovnS64D(unsigned dd, unsigned qm)
 	{
 		if (!IsDRegister(dd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqmovnS64D(dd, qm));
+		return EmitU32(EncodeVqmovnS64D(MapNeonDRegister(dd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVcgtS8Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVcgtS8Q(qd, qn, qm));
+		return EmitU32(EncodeVcgtS8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVcgtS16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVcgtS16Q(qd, qn, qm));
+		return EmitU32(EncodeVcgtS16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVcgtS32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVcgtS32Q(qd, qn, qm));
+		return EmitU32(EncodeVcgtS32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVceqI8Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVceqI8Q(qd, qn, qm));
+		return EmitU32(EncodeVceqI8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVceqI16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVceqI16Q(qd, qn, qm));
+		return EmitU32(EncodeVceqI16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVceqI32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVceqI32Q(qd, qn, qm));
+		return EmitU32(EncodeVceqI32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVminS16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVminS16Q(qd, qn, qm));
+		return EmitU32(EncodeVminS16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVminS32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVminS32Q(qd, qn, qm));
+		return EmitU32(EncodeVminS32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVmaxS16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVmaxS16Q(qd, qn, qm));
+		return EmitU32(EncodeVmaxS16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVmaxS32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVmaxS32Q(qd, qn, qm));
+		return EmitU32(EncodeVmaxS32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqaddS8Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqaddS8Q(qd, qn, qm));
+		return EmitU32(EncodeVqaddS8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqaddS16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqaddS16Q(qd, qn, qm));
+		return EmitU32(EncodeVqaddS16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqaddS32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqaddS32Q(qd, qn, qm));
+		return EmitU32(EncodeVqaddS32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqsubS8Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqsubS8Q(qd, qn, qm));
+		return EmitU32(EncodeVqsubS8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqsubS16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqsubS16Q(qd, qn, qm));
+		return EmitU32(EncodeVqsubS16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqsubS32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqsubS32Q(qd, qn, qm));
+		return EmitU32(EncodeVqsubS32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqaddU8Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqaddU8Q(qd, qn, qm));
+		return EmitU32(EncodeVqaddU8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqaddU16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqaddU16Q(qd, qn, qm));
+		return EmitU32(EncodeVqaddU16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqaddU32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqaddU32Q(qd, qn, qm));
+		return EmitU32(EncodeVqaddU32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqsubU8Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqsubU8Q(qd, qn, qm));
+		return EmitU32(EncodeVqsubU8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqsubU16Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqsubU16Q(qd, qn, qm));
+		return EmitU32(EncodeVqsubU16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqsubU32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqsubU32Q(qd, qn, qm));
+		return EmitU32(EncodeVqsubU32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqabsS16Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqabsS16Q(qd, qm));
+		return EmitU32(EncodeVqabsS16Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVqabsS32Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVqabsS32Q(qd, qm));
+		return EmitU32(EncodeVqabsS32Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVclsS32Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVclsS32Q(qd, qm));
+		return EmitU32(EncodeVclsS32Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVrev64I32D(unsigned dd, unsigned dm)
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVrev64I32D(dd, dm));
+		return EmitU32(EncodeVrev64I32D(MapNeonDRegister(dd), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVrev64I32Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVrev64I32Q(qd, qm));
+		return EmitU32(EncodeVrev64I32Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVrev64I16Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVrev64I16Q(qd, qm));
+		return EmitU32(EncodeVrev64I16Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVswpD(unsigned dd, unsigned dm)
@@ -1754,126 +1823,126 @@ namespace VitaA32
 			return false;
 		if (dd == dm)
 			return true;
-		return EmitU32(EncodeVswpD(dd, dm));
+		return EmitU32(EncodeVswpD(MapNeonDRegister(dd), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVtrnI16D(unsigned dd, unsigned dm)
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVtrnI16D(dd, dm));
+		return EmitU32(EncodeVtrnI16D(MapNeonDRegister(dd), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVtrnI16Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVtrnI16Q(qd, qm));
+		return EmitU32(EncodeVtrnI16Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVtrnI32D(unsigned dd, unsigned dm)
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVtrnI32D(dd, dm));
+		return EmitU32(EncodeVtrnI32D(MapNeonDRegister(dd), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVtrnI32Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVtrnI32Q(qd, qm));
+		return EmitU32(EncodeVtrnI32Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVzipI8Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVzipI8Q(qd, qm));
+		return EmitU32(EncodeVzipI8Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVzipI16Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVzipI16Q(qd, qm));
+		return EmitU32(EncodeVzipI16Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVzipI32Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVzipI32Q(qd, qm));
+		return EmitU32(EncodeVzipI32Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVuzpI8Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVuzpI8Q(qd, qm));
+		return EmitU32(EncodeVuzpI8Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVuzpI16Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVuzpI16Q(qd, qm));
+		return EmitU32(EncodeVuzpI16Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVuzpI32Q(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVuzpI32Q(qd, qm));
+		return EmitU32(EncodeVuzpI32Q(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVextI8Q(unsigned qd, unsigned qn, unsigned qm, u8 byte_offset)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm) || byte_offset >= 16)
 			return false;
-		return EmitU32(EncodeVextI8Q(qd, qn, qm, byte_offset));
+		return EmitU32(EncodeVextI8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm), byte_offset));
 	}
 
 	bool CodeBuffer::EmitVandQ(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVandQ(qd, qn, qm));
+		return EmitU32(EncodeVandQ(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVeorQ(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVeorQ(qd, qn, qm));
+		return EmitU32(EncodeVeorQ(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVeorD(unsigned dd, unsigned dn, unsigned dm)
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dn) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVeorD(dd, dn, dm));
+		return EmitU32(EncodeVeorD(MapNeonDRegister(dd), MapNeonDRegister(dn), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVorrQ(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVorrQ(qd, qn, qm));
+		return EmitU32(EncodeVorrQ(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVorrD(unsigned dd, unsigned dn, unsigned dm)
 	{
 		if (!IsDRegister(dd) || !IsDRegister(dn) || !IsDRegister(dm))
 			return false;
-		return EmitU32(EncodeVorrD(dd, dn, dm));
+		return EmitU32(EncodeVorrD(MapNeonDRegister(dd), MapNeonDRegister(dn), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVmvnQ(unsigned qd, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm))
 			return false;
-		return EmitU32(EncodeVmvnQ(qd, qm));
+		return EmitU32(EncodeVmvnQ(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	size_t CodeBuffer::EmitBranchPlaceholder(Condition condition)
@@ -2629,6 +2698,15 @@ namespace VitaA32
 		return VST1_32_D | ((rn & 0xfu) << 16) | NeonDd(dd);
 	}
 
+	u32 EncodeVst1D32Lane(unsigned dd, u8 lane, unsigned rn)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(lane < 2);
+		pxAssert(IsLowRegister(rn));
+		return VST1_32_D_LANE | ((rn & 0xfu) << 16) | NeonDd(dd) |
+			((static_cast<u32>(lane) & 1u) << 7);
+	}
+
 	u32 EncodeVst1D8Lane0(unsigned dd, unsigned rn)
 	{
 		pxAssert(IsDRegister(dd));
@@ -2656,6 +2734,26 @@ namespace VitaA32
 		pxAssert(IsSRegister(sd));
 		return (VMOV_S_TO_CORE & 0x0fffffffu) | CondBits(condition) |
 			((rt & 0xfu) << 12) | VfpSn(sd);
+	}
+
+	u32 EncodeVmovCoreToD32Lane(unsigned dd, u8 lane, unsigned rt, Condition condition)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(lane < 2);
+		pxAssert(IsRegister(rt));
+		return CondBits(condition) | VMOV_CORE_TO_D32_LANE |
+			((static_cast<u32>(lane) & 1u) << 21) | ((rt & 0xfu) << 12) |
+			((dd & 0xfu) << 16) | ((dd & 0x10u) << 3);
+	}
+
+	u32 EncodeVmovD32LaneToCore(unsigned rt, unsigned dd, u8 lane, Condition condition)
+	{
+		pxAssert(IsRegister(rt));
+		pxAssert(IsDRegister(dd));
+		pxAssert(lane < 2);
+		return CondBits(condition) | VMOV_D32_LANE_TO_CORE |
+			((static_cast<u32>(lane) & 1u) << 21) | ((rt & 0xfu) << 12) |
+			((dd & 0xfu) << 16) | ((dd & 0x10u) << 3);
 	}
 
 	u32 EncodeVmovCorePairToD(unsigned dd, unsigned rt, unsigned rt2)

@@ -333,8 +333,6 @@ namespace VitaEE
 		constexpr u16 REG_PC = 1u << 15;
 		constexpr u16 EE_LINK_FRAME_REGISTERS =
 			REG_R3 | REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_R9 | REG_R10 | REG_R11;
-		constexpr unsigned EE_LINK_FRAME_FIRST_DREG = 8;
-		constexpr unsigned EE_LINK_FRAME_DREG_COUNT = 8;
 		// Must match VitaEE::BlockExitKind without including the executor.
 		constexpr u8 EE_DIRECT_EXIT_TOKEN = 0xd1;
 		constexpr u8 EE_EVENT_EXIT_TOKEN = 0xe7;
@@ -2363,6 +2361,10 @@ namespace VitaEE
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code)
 		: m_code(code)
 	{
+		// Keep the allocator's dense logical q0-q7 domain while placing its upper
+		// bank in AAPCS caller-clobbered d24-d31. Physical q8-q11 remain available
+		// for the persistent COP2 normalization constants.
+		m_code.SetNeonQRegisterBankMapping(4, 12, 4);
 	}
 
 	bool BlockCompiler::EmitAndImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags)
@@ -6376,9 +6378,9 @@ namespace VitaEE
 		if (m_gpr_q_cache_enabled)
 			g_qemuGprQCacheBlocks++;
 #endif
-		// Native EE links can now jump body-to-body. Keep every block on the
-		// same generated frame so any linked target can eventually pop back to
-		// the original C++ caller, regardless of which resident registers it uses.
+		// Native EE links jump body-to-body under one uniform core-register frame.
+		// The private vector ABI maps logical q4-q7 to caller-clobbered q12-q15,
+		// so callable entries no longer need a vector stack frame.
 		m_saved_registers = EE_LINK_FRAME_REGISTERS;
 
 		// Adopt the staged GPR pins, dropping any whose host register a block
@@ -6427,8 +6429,7 @@ namespace VitaEE
 		}
 #endif
 
-		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
-			!m_code.EmitVpushDRange(EE_LINK_FRAME_FIRST_DREG, EE_LINK_FRAME_DREG_COUNT))
+		if (!m_code.EmitPush(m_saved_registers | REG_LR))
 		{
 			return false;
 		}
@@ -7285,8 +7286,7 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitLinkFrameReturn()
 	{
-		return m_code.EmitVpopDRange(EE_LINK_FRAME_FIRST_DREG, EE_LINK_FRAME_DREG_COUNT) &&
-			   m_code.EmitPop(m_saved_registers | REG_PC);
+		return m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
 	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
@@ -8951,7 +8951,7 @@ namespace VitaEE
 		if (mask == 0x0f)
 			return m_code.EmitVld1Q32Aligned(temp_qreg, source_address_reg) &&
 				   m_code.EmitVst1Q32Aligned(temp_qreg, dest_address_reg);
-		if (temp_qreg >= 8)
+		if (temp_qreg >= 4)
 			return false;
 
 		const auto emit_lane = [&](unsigned lane) {
@@ -8980,7 +8980,7 @@ namespace VitaEE
 			return true;
 		if (mask == 0x0f)
 			return m_code.EmitVst1Q32Aligned(value_qreg, address_reg);
-		if (value_qreg >= 8)
+		if (value_qreg >= 4)
 			return false;
 
 		const auto emit_lane = [&](unsigned lane) {
@@ -9424,12 +9424,12 @@ namespace VitaEE
 				   m_code.EmitVdupI32QFromCore(NQ_MAXF, HOST_TMP1);
 		};
 
-		// Materializes the constants once per block. Q8-Q15 are exclusive to this
-		// normalize scratch, so once the constants are in Q8-Q11 a later COP2
-		// arithmetic/outer op in the same straight-line block reuses them instead
-		// of re-emitting the 5-7 constant instructions. m_cop2_norm_consts_ready
-		// is reset in BeginBlock(), so the first COP2 op in every block always
-		// materializes.
+		// Materializes the constants once per block. Physical Q8-Q11 are exclusive
+		// to these persistent constants. Physical Q12-Q15 are normalize scratch in
+		// COP2 macro blocks and back logical Q4-Q7 in qcache blocks; the qcache
+		// classifier excludes macro arithmetic, so those roles never overlap.
+		// m_cop2_norm_consts_ready is reset in BeginBlock(), so the first COP2 op
+		// in every block always materializes.
 		const auto emit_ensure_norm_consts = [&]() {
 			if (m_cop2_norm_consts_ready)
 				return true;
@@ -9559,7 +9559,6 @@ namespace VitaEE
 			// multiply/subtract. W is ignored and its MAC bits stay untouched.
 			constexpr unsigned QUAD_FS_OUTER = 2;  // Q2 -> S8-S11
 			constexpr unsigned QUAD_FT_OUTER = 3;  // Q3 -> S12-S15
-			constexpr unsigned QUAD_ACC_OUTER = 4; // Q4 -> S16-S19
 			constexpr unsigned QUAD_FSYZX = 0;     // Q0 -> S0-S3 (shuffle, then product)
 			constexpr unsigned QUAD_FTZXY = 1;     // Q1 -> S4-S7
 			const bool opmsub = arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
@@ -9568,13 +9567,9 @@ namespace VitaEE
 				!m_code.EmitVld1Q32Aligned(QUAD_FS_OUTER, HOST_TMP0) ||
 				!EmitVu0VfAddress(HOST_TMP0, ft) ||
 				!m_code.EmitVld1Q32Aligned(QUAD_FT_OUTER, HOST_TMP0) ||
-				(opmsub &&
-					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
-						!m_code.EmitVld1Q32Aligned(QUAD_ACC_OUTER, HOST_TMP0))) ||
 				!emit_ensure_norm_consts() ||
 				!emit_normalize_quad(QUAD_FS_OUTER) ||
-				!emit_normalize_quad(QUAD_FT_OUTER) ||
-				(opmsub && !emit_normalize_quad(QUAD_ACC_OUTER)))
+				!emit_normalize_quad(QUAD_FT_OUTER))
 			{
 				return false;
 			}
@@ -9589,8 +9584,19 @@ namespace VitaEE
 				return false;
 			}
 
-			if (opmsub && !m_code.EmitVsubF32Q(QUAD_FSYZX, QUAD_ACC_OUTER, QUAD_FSYZX))
-				return false;
+			if (opmsub)
+			{
+				// FS is dead once the shuffled product is complete. Reuse Q2 for ACC
+				// so the outer path needs no fifth low quad (the old Q4), while still
+				// snapshotting ACC before any destination lane is stored.
+				if (!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
+					!m_code.EmitVld1Q32Aligned(QUAD_FS_OUTER, HOST_TMP0) ||
+					!emit_normalize_quad(QUAD_FS_OUTER) ||
+					!m_code.EmitVsubF32Q(QUAD_FSYZX, QUAD_FS_OUTER, QUAD_FSYZX))
+				{
+					return false;
+				}
+			}
 
 			for (unsigned lane = 0; lane < 3; lane++)
 			{
@@ -13223,10 +13229,9 @@ namespace VitaEE
 					break;
 			}
 			InvalidateGprQCacheForQreg(result_qreg);
-			const unsigned result_s = result_qreg * 4;
 			return m_code.EmitVclsS32Q(result_qreg, static_cast<unsigned>(cached_qreg)) &&
-				   m_code.EmitVmovSToCore(HOST_TMP0, result_s) &&
-				   m_code.EmitVmovSToCore(HOST_TMP1, result_s + 1) &&
+				   EmitMoveQWordLaneToCore(HOST_TMP0, result_qreg, 0) &&
+				   EmitMoveQWordLaneToCore(HOST_TMP1, result_qreg, 1) &&
 				   EmitStoreGprWord(rd, 0, HOST_TMP0) &&
 				   EmitStoreGprWord(rd, 1, HOST_TMP1);
 		}
@@ -13361,13 +13366,15 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuGprQCacheWordHits += 4;
 #endif
-			const unsigned source_s = static_cast<unsigned>(cached_qreg) * 4;
-			return m_code.EmitVstrSImm(source_s, HOST_CPU_REGS, static_cast<u16>(LO_OFFSET)) &&
-				   m_code.EmitVstrSImm(source_s + 1, HOST_CPU_REGS, static_cast<u16>(HI_OFFSET)) &&
-				   m_code.EmitVstrSImm(source_s + 2, HOST_CPU_REGS,
-					   static_cast<u16>(LO_OFFSET + 2 * sizeof(u32))) &&
-				   m_code.EmitVstrSImm(source_s + 3, HOST_CPU_REGS,
-					   static_cast<u16>(HI_OFFSET + 2 * sizeof(u32)));
+			const unsigned source_qreg = static_cast<unsigned>(cached_qreg);
+			return EmitStoreQWordLane(source_qreg, 0, HOST_CPU_REGS,
+					   static_cast<u16>(LO_OFFSET), HOST_TMP0) &&
+				   EmitStoreQWordLane(source_qreg, 1, HOST_CPU_REGS,
+					   static_cast<u16>(HI_OFFSET), HOST_TMP0) &&
+				   EmitStoreQWordLane(source_qreg, 2, HOST_CPU_REGS,
+					   static_cast<u16>(LO_OFFSET + 2 * sizeof(u32)), HOST_TMP0) &&
+				   EmitStoreQWordLane(source_qreg, 3, HOST_CPU_REGS,
+					   static_cast<u16>(HI_OFFSET + 2 * sizeof(u32)), HOST_TMP0);
 		}
 
 		unsigned rs_qreg = 0;
@@ -13380,16 +13387,16 @@ namespace VitaEE
 			}
 		}
 
-		const auto emit_store_source_s = [this, rs_qreg](unsigned source_word, size_t dst_offset) {
-			return m_code.EmitVstrSImm(rs_qreg * 4 + source_word, HOST_CPU_REGS,
-				static_cast<u16>(dst_offset));
+		const auto emit_store_source_word = [this, rs_qreg](unsigned source_word, size_t dst_offset) {
+			return EmitStoreQWordLane(rs_qreg, source_word, HOST_CPU_REGS,
+				static_cast<u16>(dst_offset), HOST_TMP0);
 		};
 
 		return EmitLoadGprQ128(rs, rs_qreg, HOST_TMP0) &&
-			   emit_store_source_s(0, LO_OFFSET) &&
-			   emit_store_source_s(1, HI_OFFSET) &&
-			   emit_store_source_s(2, LO_OFFSET + 2 * sizeof(u32)) &&
-			   emit_store_source_s(3, HI_OFFSET + 2 * sizeof(u32));
+			   emit_store_source_word(0, LO_OFFSET) &&
+			   emit_store_source_word(1, HI_OFFSET) &&
+			   emit_store_source_word(2, LO_OFFSET + 2 * sizeof(u32)) &&
+			   emit_store_source_word(3, HI_OFFSET + 2 * sizeof(u32));
 	}
 
 	bool BlockCompiler::EmitMFHI(u32 op)
@@ -14799,23 +14806,18 @@ namespace VitaEE
 
 			const auto set_lane_config = [&](unsigned divisor_reg,
 											 unsigned lane) {
-				const unsigned divisor_sign_s = neon_divisor_sign * 4 + lane;
-				const unsigned bias_mask_s = neon_bias_mask * 4 + lane;
-				const unsigned shift_right_s = neon_shift_right * 4 + lane;
-				const unsigned shift_left_s = neon_shift_left * 4 + lane;
-
 				return m_code.EmitMovRegShiftImm(HOST_TMP4, divisor_reg,
 						   VitaA32::ShiftType::ASR, 31) &&
-				       m_code.EmitVmovCoreToS(divisor_sign_s, HOST_TMP4) &&
+				       EmitMoveCoreToQWordLane(neon_divisor_sign, lane, HOST_TMP4) &&
 				       m_code.EmitEorReg(HOST_TMP5, divisor_reg, HOST_TMP4) &&
 				       m_code.EmitSubReg(HOST_TMP5, HOST_TMP5, HOST_TMP4) &&
 				       m_code.EmitSubImm8(HOST_TMP4, HOST_TMP5, 1) &&
-				       m_code.EmitVmovCoreToS(bias_mask_s, HOST_TMP4) &&
+				       EmitMoveCoreToQWordLane(neon_bias_mask, lane, HOST_TMP4) &&
 				       m_code.EmitClz(HOST_TMP4, HOST_TMP5) &&
 				       m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP4, 31) &&
-				       m_code.EmitVmovCoreToS(shift_left_s, HOST_TMP4) &&
+				       EmitMoveCoreToQWordLane(neon_shift_left, lane, HOST_TMP4) &&
 				       m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP4, 0) &&
-				       m_code.EmitVmovCoreToS(shift_right_s, HOST_TMP4);
+				       EmitMoveCoreToQWordLane(neon_shift_right, lane, HOST_TMP4);
 			};
 
 			if (cached_rs_qreg < 0 &&
@@ -14907,15 +14909,12 @@ namespace VitaEE
 
 			const auto set_lane_config = [&](unsigned divisor_reg,
 											 unsigned lane) {
-				const unsigned mask_s = neon_mask * 4 + lane;
-				const unsigned shift_right_s = neon_shift_right * 4 + lane;
-
 				return m_code.EmitSubImm8(HOST_TMP4, divisor_reg, 1) &&
-				       m_code.EmitVmovCoreToS(mask_s, HOST_TMP4) &&
+				       EmitMoveCoreToQWordLane(neon_mask, lane, HOST_TMP4) &&
 				       m_code.EmitClz(HOST_TMP4, divisor_reg) &&
 				       m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP4, 31) &&
 				       m_code.EmitRsbImm32(HOST_TMP4, HOST_TMP4, 0) &&
-				       m_code.EmitVmovCoreToS(shift_right_s, HOST_TMP4);
+				       EmitMoveCoreToQWordLane(neon_shift_right, lane, HOST_TMP4);
 			};
 
 			if (cached_rs_qreg < 0 &&
@@ -17403,36 +17402,29 @@ namespace VitaEE
 
 		if (rs != 0)
 		{
-			// PCSX2's x86 recPSLLVW/recPSRLVW/recPSRAVW extracts 5-bit counts
-			// in vector regs. Keep RS on NEON instead of round-tripping through core regs.
+			// PCSX2's x86 recPSLLVW/recPSRLVW/recPSRAVW keeps the shift counts
+			// vector-resident before masking them to five bits. Copy/load the whole
+			// qword: lanes 1/3 are discarded by the final VTRN, and one Q copy is
+			// cheaper than moving the two architecturally active lanes separately.
 			const int cached_shift_qreg = cached_shift_source_qreg;
 			if (cached_shift_qreg != static_cast<int>(shift_qreg))
 				InvalidateGprQCacheForQreg(shift_qreg);
 
-			const auto emit_shift_count_word = [&](unsigned source_word, unsigned target_sreg) {
-				if (cached_shift_qreg >= 0)
-	{
+			if (cached_shift_qreg >= 0)
+			{
 #if defined(VITASX2_QEMU_VALIDATION)
-					g_qemuGprQCacheWordHits++;
+				g_qemuGprQCacheWordHits += 2;
 #endif
-					const unsigned source_sreg = static_cast<unsigned>(cached_shift_qreg) * 4 + source_word;
-					return source_sreg == target_sreg ||
-						   m_code.EmitVmovS(target_sreg, source_sreg);
-	}
-
-				if (source_word == 0)
-	{
-					const int pin_host = FindGprPinHost(rs);
-					if (pin_host >= 0)
-						return m_code.EmitVmovCoreToS(target_sreg, static_cast<unsigned>(pin_host));
-	}
-
-				return m_code.EmitVldrSImm(target_sreg, HOST_CPU_REGS,
-					static_cast<u16>(GprOffset(rs) + source_word * sizeof(u32)));
-			};
-
-			if (!emit_shift_count_word(0, shift_qreg * 4) ||
-				!emit_shift_count_word(2, shift_qreg * 4 + 2))
+				if (!m_code.EmitVorrQ(shift_qreg,
+						static_cast<unsigned>(cached_shift_qreg),
+						static_cast<unsigned>(cached_shift_qreg)))
+				{
+					return false;
+				}
+			}
+			else if (!(ShouldLoadGprQ128SingleUseEntry(rs) ?
+						   EmitLoadGprQ128SingleUseEntry(rs, shift_qreg, HOST_TMP0) :
+						   EmitLoadGprQ128(rs, shift_qreg, HOST_TMP0)))
 			{
 				return false;
 			}
@@ -20570,7 +20562,8 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 				g_qemuGprQCacheDirectMemoryStores++;
 #endif
-				return m_code.EmitVstrSImm(static_cast<unsigned>(cached_qreg) * 4, HOST_TMP0, 0);
+				return EmitStoreQWordLane(static_cast<unsigned>(cached_qreg), 0,
+					HOST_TMP0, 0, HOST_TMP1);
 			}
 
 			unsigned rt_host;
@@ -22587,9 +22580,10 @@ namespace VitaEE
 				const int rs_qcache = FindGprQCache(rs);
 				if (rs_qcache >= 0)
 	{
-					const unsigned source_s = static_cast<unsigned>(rs_qcache) * 4;
-					if (!m_code.EmitVmovSToCore(rd_low_host, source_s, move_condition) ||
-						!m_code.EmitVmovSToCore(rd_high_host, source_s + 1, move_condition))
+					if (!EmitMoveQWordLaneToCore(rd_low_host,
+							static_cast<unsigned>(rs_qcache), 0, move_condition) ||
+						!EmitMoveQWordLaneToCore(rd_high_host,
+							static_cast<unsigned>(rs_qcache), 1, move_condition))
 	{
 						return false;
 	}
@@ -23484,7 +23478,8 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 				g_qemuGprQCacheDirectMemoryStores++;
 #endif
-				return m_code.EmitVstrSImm(static_cast<unsigned>(cached_qreg) * 4, address_reg, 0);
+				return EmitStoreQWordLane(static_cast<unsigned>(cached_qreg), 0,
+					address_reg, 0, HOST_TMP1);
 			}
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -25202,6 +25197,82 @@ namespace VitaEE
 			   m_code.EmitVst1Q32Aligned(qreg, address_scratch);
 	}
 
+	bool BlockCompiler::EmitMoveQWordLaneToCore(unsigned host_reg, unsigned qreg, unsigned word)
+	{
+		return EmitMoveQWordLaneToCore(host_reg, qreg, word, VitaA32::Condition::AL);
+	}
+
+	bool BlockCompiler::EmitMoveQWordLaneToCore(unsigned host_reg, unsigned qreg, unsigned word,
+		VitaA32::Condition condition)
+	{
+		if (qreg >= 16 || word >= 4)
+			return false;
+
+		return m_code.EmitVmovD32LaneToCore(host_reg, qreg * 2 + word / 2,
+			static_cast<u8>(word & 1u), condition);
+	}
+
+	bool BlockCompiler::EmitMoveCoreToQWordLane(unsigned qreg, unsigned word, unsigned host_reg)
+	{
+		return EmitMoveCoreToQWordLane(qreg, word, host_reg, VitaA32::Condition::AL);
+	}
+
+	bool BlockCompiler::EmitMoveCoreToQWordLane(unsigned qreg, unsigned word, unsigned host_reg,
+		VitaA32::Condition condition)
+	{
+		if (qreg >= 16 || word >= 4)
+			return false;
+
+		return m_code.EmitVmovCoreToD32Lane(qreg * 2 + word / 2,
+			static_cast<u8>(word & 1u), host_reg, condition);
+	}
+
+	bool BlockCompiler::EmitMoveQWordLane(unsigned dest_qreg, unsigned dest_word,
+		unsigned source_qreg, unsigned source_word, unsigned host_scratch)
+	{
+		if (dest_qreg >= 16 || source_qreg >= 16 || dest_word >= 4 || source_word >= 4)
+			return false;
+		if (dest_qreg == source_qreg && dest_word == source_word)
+			return true;
+
+		// Only q0-q3 have S-register aliases. Preserve their one-instruction lane
+		// copy; high-bank copies use the architected D-lane/core transfers.
+		if (dest_qreg < 4 && source_qreg < 4)
+			return m_code.EmitVmovS(dest_qreg * 4 + dest_word, source_qreg * 4 + source_word);
+
+		return EmitMoveQWordLaneToCore(host_scratch, source_qreg, source_word) &&
+			   EmitMoveCoreToQWordLane(dest_qreg, dest_word, host_scratch);
+	}
+
+	bool BlockCompiler::EmitLoadQWordLane(unsigned qreg, unsigned word, unsigned address_reg,
+		u16 offset, unsigned host_scratch)
+	{
+		if (qreg >= 16 || word >= 4)
+			return false;
+		if (qreg < 4)
+			return m_code.EmitVldrSImm(qreg * 4 + word, address_reg, offset);
+
+		return m_code.EmitLdrImm12(host_scratch, address_reg, offset) &&
+			   EmitMoveCoreToQWordLane(qreg, word, host_scratch);
+	}
+
+	bool BlockCompiler::EmitStoreQWordLane(unsigned qreg, unsigned word, unsigned address_reg,
+		u16 offset, unsigned host_scratch)
+	{
+		if (qreg >= 16 || word >= 4)
+			return false;
+		if (offset == 0)
+		{
+			return m_code.EmitVst1D32Lane(qreg * 2 + word / 2,
+				static_cast<u8>(word & 1u), address_reg);
+		}
+		if (qreg < 4)
+			return m_code.EmitVstrSImm(qreg * 4 + word, address_reg, offset);
+
+		return EmitMoveQWordLaneToCore(host_scratch, qreg, word) &&
+			   m_code.EmitStrImm12(host_scratch, address_reg, offset);
+	}
+
 	bool BlockCompiler::EmitCop1ExponentMask(unsigned host_reg)
 	{
 		if (!m_cop1_exponent_mask_available)
@@ -25391,14 +25462,14 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitVu0Vf0ConstantQ(unsigned qreg, unsigned host_scratch)
 	{
-		if (qreg >= 8)
+		if (qreg >= 16)
 			return false;
 
 		// PCSX2 owners: VUmicroMem.cpp initializes VF0 to 0,0,0,1 and
 		// VU0.cpp::QMTC2() rejects writes to VF0, so readers can synthesize it.
 		return m_code.EmitVeorQ(qreg, qreg, qreg) &&
 			   m_code.EmitMovImm32(host_scratch, 0x3f800000u) &&
-			   m_code.EmitVmovCoreToS(qreg * 4 + 3, host_scratch);
+			   EmitMoveCoreToQWordLane(qreg, 3, host_scratch);
 	}
 
 	bool BlockCompiler::EmitVu0VfAddress(unsigned host_reg, unsigned vf_reg)
@@ -25777,7 +25848,7 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuGprQCacheWordHits++;
 #endif
-		return m_code.EmitVmovSToCore(host_reg, static_cast<unsigned>(cached_qreg) * 4 + word);
+		return EmitMoveQWordLaneToCore(host_reg, static_cast<unsigned>(cached_qreg), word);
 	}
 
 	bool BlockCompiler::EmitLoadGprHigh(unsigned guest_reg, unsigned host_reg)
@@ -25998,20 +26069,12 @@ namespace VitaEE
 			return true;
 
 		const int pin_host = FindGprPinHost(guest_reg);
-		if (pin_host >= 0)
-		{
-			// VMOV S->core can only name S0-S31; current EE qword GPR writers use
-			// low NEON temporaries, and rejecting high qregs avoids a stale pin if
-			// a future path tries to reuse this seam with q8+.
-			if (qreg >= 8 ||
-				!m_code.EmitVmovSToCore(static_cast<unsigned>(pin_host), qreg * 4))
-			{
-				return false;
-			}
-		}
+		if (pin_host >= 0 &&
+			!EmitMoveQWordLaneToCore(static_cast<unsigned>(pin_host), qreg, 0))
+			return false;
 		const int high_pin_host = FindGprPinHighHost(guest_reg);
 		if (high_pin_host >= 0 &&
-			(qreg >= 8 || !m_code.EmitVmovSToCore(static_cast<unsigned>(high_pin_host), qreg * 4 + 1)))
+			!EmitMoveQWordLaneToCore(static_cast<unsigned>(high_pin_host), qreg, 1))
 		{
 			return false;
 		}
@@ -26029,17 +26092,12 @@ namespace VitaEE
 			return true;
 
 		const int pin_host = FindGprPinHost(guest_reg);
-		if (pin_host >= 0)
-		{
-			if (qreg >= 8 ||
-				!m_code.EmitVmovSToCore(static_cast<unsigned>(pin_host), qreg * 4))
-			{
-				return false;
-			}
-		}
+		if (pin_host >= 0 &&
+			!EmitMoveQWordLaneToCore(static_cast<unsigned>(pin_host), qreg, 0))
+			return false;
 		const int high_pin_host = FindGprPinHighHost(guest_reg);
 		if (high_pin_host >= 0 &&
-			(qreg >= 8 || !m_code.EmitVmovSToCore(static_cast<unsigned>(high_pin_host), qreg * 4 + 1)))
+			!EmitMoveQWordLaneToCore(static_cast<unsigned>(high_pin_host), qreg, 1))
 		{
 			return false;
 		}
@@ -26057,25 +26115,13 @@ namespace VitaEE
 			return true;
 
 		const int pin_host = FindGprPinHost(guest_reg);
-		if (pin_host >= 0)
-		{
-			const unsigned low_s = low_d * 2;
-			if (low_s >= 32 ||
-				!m_code.EmitVmovSToCore(static_cast<unsigned>(pin_host), low_s))
-			{
-				return false;
-			}
-		}
+		if (pin_host >= 0 &&
+			!m_code.EmitVmovD32LaneToCore(static_cast<unsigned>(pin_host), low_d, 0))
+			return false;
 		const int high_pin_host = FindGprPinHighHost(guest_reg);
-		if (high_pin_host >= 0)
-		{
-			const unsigned high_s = low_d * 2 + 1;
-			if (high_s >= 32 ||
-				!m_code.EmitVmovSToCore(static_cast<unsigned>(high_pin_host), high_s))
-			{
-				return false;
-			}
-		}
+		if (high_pin_host >= 0 &&
+			!m_code.EmitVmovD32LaneToCore(static_cast<unsigned>(high_pin_host), low_d, 1))
+			return false;
 
 		if (!m_code.EmitVstrDImm(low_d, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg))) ||
 			!m_code.EmitVstrDImm(high_d, HOST_CPU_REGS,
@@ -26184,16 +26230,14 @@ namespace VitaEE
 		const int high_pin_host = FindGprPinHighHost(guest_reg);
 		const bool needs_pin_sync = pin_host >= 0 || high_pin_host >= 0;
 		const unsigned cached_qreg_u = static_cast<unsigned>(cached_qreg);
-		if (needs_pin_sync && cached_qreg_u >= 8)
-			return true;
 
 		if (pin_host >= 0 &&
-			!m_code.EmitVmovSToCore(static_cast<unsigned>(pin_host), cached_qreg_u * 4))
+			!EmitMoveQWordLaneToCore(static_cast<unsigned>(pin_host), cached_qreg_u, 0))
 		{
 			return false;
 		}
 		if (high_pin_host >= 0 &&
-			!m_code.EmitVmovSToCore(static_cast<unsigned>(high_pin_host), cached_qreg_u * 4 + 1))
+			!EmitMoveQWordLaneToCore(static_cast<unsigned>(high_pin_host), cached_qreg_u, 1))
 		{
 			return false;
 		}
@@ -26234,12 +26278,12 @@ namespace VitaEE
 			return false;
 
 		if (pin_host >= 0 &&
-			!m_code.EmitVmovSToCore(static_cast<unsigned>(pin_host), temp_qreg * 4))
+			!EmitMoveQWordLaneToCore(static_cast<unsigned>(pin_host), temp_qreg, 0))
 		{
 			return false;
 		}
 		if (high_pin_host >= 0 &&
-			!m_code.EmitVmovSToCore(static_cast<unsigned>(high_pin_host), temp_qreg * 4 + 1))
+			!EmitMoveQWordLaneToCore(static_cast<unsigned>(high_pin_host), temp_qreg, 1))
 		{
 			return false;
 		}
