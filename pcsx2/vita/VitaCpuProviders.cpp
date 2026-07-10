@@ -39,6 +39,7 @@ static bool s_ee_a32_cache_reset_requested = false;
 static bool s_ee_a32_running_compiled_block = false;
 static bool s_ee_a32_elf_booted = false;
 static bool s_ee_a32_direct_linking_enabled = false;
+static bool s_ee_a32_persistent_dispatch_enabled = false;
 static VitaA32EeTraceMode s_ee_a32_trace_mode = VitaA32EeTraceMode::InstructionWindow;
 static bool s_ee_provider_trace_suppressed = false;
 static bool s_ee_a32_prerecording_window = false;
@@ -417,10 +418,45 @@ static void recSetEeDirectLinkingEnabled(bool enabled)
 	s_ee_a32_direct_linking_enabled = enabled;
 }
 
-static void recResetEeDirectLinkingState()
+static void recSetEePersistentDispatchEnabled(bool enabled)
+{
+	if (s_ee_a32_persistent_dispatch_enabled == enabled)
+		return;
+
+	s_ee_a32_executor.SetPersistentDispatchEnabled(enabled);
+	s_ee_a32_persistent_dispatch_enabled = enabled;
+}
+
+static void recSetEeFastDispatchEnabled(bool enabled)
+{
+	// Callable and persistent blocks use different exit ABIs. On enable, reset
+	// into the persistent ABI before exposing linked entry points; on disable,
+	// unlink first so no callable-mode transition can retain a persistent edge.
+	if (enabled)
+	{
+		recSetEePersistentDispatchEnabled(true);
+		recSetEeDirectLinkingEnabled(true);
+	}
+	else
+	{
+		recSetEeDirectLinkingEnabled(false);
+		recSetEePersistentDispatchEnabled(false);
+	}
+}
+
+static void recResetEeDispatchState()
 {
 	s_ee_a32_executor.SetDirectLinkingEnabled(false);
+	s_ee_a32_executor.SetPersistentDispatchEnabled(false);
 	s_ee_a32_direct_linking_enabled = false;
+	s_ee_a32_persistent_dispatch_enabled = false;
+}
+
+static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& result)
+{
+	recAccountEeBlockExecution(result, cpuRegs.pc);
+	return !s_ee_a32_exit_execution && !s_ee_a32_cache_reset_requested &&
+		s_ee_pre_instruction_trace_callback == nullptr;
 }
 
 static void recReserve()
@@ -429,8 +465,8 @@ static void recReserve()
 
 static void recShutdown()
 {
-	s_ee_a32_executor.Reset();
-	recResetEeDirectLinkingState();
+	s_ee_a32_executor.Shutdown();
+	recResetEeDispatchState();
 	s_ee_a32_cache_reset_requested = false;
 	s_ee_a32_elf_booted = false;
 }
@@ -440,7 +476,7 @@ static void recReset()
 	intCpu.Reset();
 	VitaEE::RefreshRawGpr0KnownZero();
 	s_ee_a32_executor.Reset();
-	recResetEeDirectLinkingState();
+	recResetEeDispatchState();
 	VitaResetA32EeProviderStats();
 	s_ee_a32_exit_execution = false;
 	s_ee_a32_cache_reset_requested = false;
@@ -467,7 +503,8 @@ static void recExecute()
 		if (!s_ee_a32_elf_booted)
 			s_ee_a32_elf_booted = VMManager::Internal::HasBootedELF();
 		const bool elf_booted = s_ee_a32_elf_booted;
-		recSetEeDirectLinkingEnabled(s_ee_pre_instruction_trace_callback == nullptr && elf_booted);
+		const bool fast_dispatch = s_ee_pre_instruction_trace_callback == nullptr && elf_booted;
+		recSetEeFastDispatchEnabled(fast_dispatch);
 
 		if (s_ee_a32_cache_reset_requested)
 		{
@@ -518,11 +555,15 @@ static void recExecute()
 		{
 			VitaEE::BlockExecutionResult result;
 			s_ee_a32_running_compiled_block = true;
-			const bool executed = s_ee_a32_executor.ExecuteCompiledBlockAtPc(pc, true, &result);
+			const bool executed = fast_dispatch ?
+				s_ee_a32_executor.ExecutePersistentAtPc(pc, true,
+					&recPersistentEeBoundary, nullptr, &result) :
+				s_ee_a32_executor.ExecuteCompiledBlockAtPc(pc, true, &result);
 			s_ee_a32_running_compiled_block = false;
 			if (executed)
 			{
-				recAccountEeBlockExecution(result, pc);
+				if (!fast_dispatch)
+					recAccountEeBlockExecution(result, pc);
 
 				if (s_ee_a32_cache_reset_requested)
 				{
@@ -530,6 +571,21 @@ static void recExecute()
 					s_ee_a32_cache_reset_requested = false;
 				}
 
+				continue;
+			}
+
+			if (fast_dispatch)
+			{
+				// A persistent block can only fail before entering generated code or
+				// while resolving its next boundary. Step the current instruction
+				// through PCSX2's interpreter and retry the dispatcher at the new PC;
+				// callable blocks cannot run in the persistent exit ABI.
+				const u32 fallback_pc = cpuRegs.pc;
+				const u32 fallback_opcode = memRead32(fallback_pc);
+				intCpu.Step();
+				VitaEE::RefreshRawGpr0KnownZero();
+				recRecordInterpreterFallback(fallback_pc, fallback_opcode,
+					VitaA32EeFallbackReason::ExecuteFailed);
 				continue;
 			}
 		}

@@ -64,23 +64,37 @@ namespace VitaEE
 		bool cache_hit = false;
 		bool lookup_hit = false;
 		bool fast_dispatch_hit = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+		u32 generated_frame_pushes = 0;
+		u32 generated_frame_pops = 0;
+		u32 dispatcher_frame_pushes = 0;
+		u32 dispatcher_frame_pops = 0;
+#endif
 	};
 
 	class BlockExecutor
 	{
 	public:
+		using PersistentBoundaryCallback = bool (*)(void* userdata,
+			const BlockExecutionResult& completed_chain);
+
 		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 64;
 
 		BlockExecutor();
 		~BlockExecutor();
 
+		u32 Shutdown();
 		u32 Reset();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		void SetDirectLinkingEnabled(bool enabled);
+		void SetPersistentDispatchEnabled(bool enabled);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
 		bool ExecuteCompiledBlockAtPc(u32 start_pc, bool run_event_test_on_event_exit,
+			BlockExecutionResult* result);
+		bool ExecutePersistentAtPc(u32 start_pc, bool run_event_test_on_event_exit,
+			PersistentBoundaryCallback boundary_callback, void* callback_userdata,
 			BlockExecutionResult* result);
 		bool ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
@@ -113,6 +127,18 @@ namespace VitaEE
 			DirectLinkSlots direct_links{};
 			bool valid = false;
 			bool queued_free = false;
+		};
+
+		struct PersistentRunContext
+		{
+			BlockExecutor* executor = nullptr;
+			CachedBlock* current_block = nullptr;
+			BlockExecutionResult current_result{};
+			BlockExecutionResult* final_result = nullptr;
+			PersistentBoundaryCallback boundary_callback = nullptr;
+			void* callback_userdata = nullptr;
+			bool run_event_test_on_event_exit = true;
+			bool failed = false;
 		};
 
 		struct LookupPage
@@ -178,7 +204,10 @@ namespace VitaEE
 		void RewindCodeCache(size_t slice_offset);
 		u32 ResetForCachePressure();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles);
+		bool PrepareCompiledBlockAtPc(u32 start_pc, CachedBlock** block, BlockExecutionResult* result);
 		bool RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result);
+		bool EnsurePersistentDispatcher();
+		static const void* PersistentDispatchThunk(u32 exit_value, void* userdata);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
 		void PatchIncomingLinks(u32 target_pc, const void* target);
@@ -192,10 +221,15 @@ namespace VitaEE
 		LookupPage** m_lookup_pages = nullptr;
 		GeneratedLookupPage** m_generated_lookup_pages = nullptr;
 		GeneratedLookupPage** m_active_generated_lookup_pages = nullptr;
+		VitaA32::CodeBuffer m_persistent_dispatch_code;
+		const void* m_persistent_dispatch_entry = nullptr;
+		const void* m_persistent_direct_exit = nullptr;
+		const void* m_persistent_event_exit = nullptr;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
 		bool m_direct_linking_enabled = true;
+		bool m_persistent_dispatch_enabled = false;
 	};
 } // namespace VitaEE

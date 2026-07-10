@@ -331,8 +331,9 @@ namespace VitaEE
 		constexpr u16 REG_R11 = 1u << 11;
 		constexpr u16 REG_LR = 1u << 14;
 		constexpr u16 REG_PC = 1u << 15;
-		constexpr u16 EE_LINK_FRAME_REGISTERS =
-			REG_R3 | REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_R9 | REG_R10 | REG_R11;
+		constexpr u16 EE_LINK_FRAME_REGISTERS = BlockCompiler::LINK_FRAME_REGISTER_MASK;
+		static_assert(EE_LINK_FRAME_REGISTERS ==
+			(REG_R3 | REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_R9 | REG_R10 | REG_R11));
 		// Must match VitaEE::BlockExitKind without including the executor.
 		constexpr u8 EE_DIRECT_EXIT_TOKEN = 0xd1;
 		constexpr u8 EE_EVENT_EXIT_TOKEN = 0xe7;
@@ -6429,35 +6430,51 @@ namespace VitaEE
 		}
 #endif
 
-		if (!m_code.EmitPush(m_saved_registers | REG_LR))
+		if (m_persistent_dispatch_exits)
 		{
-			return false;
-		}
-
-		if (!m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))))
-			return false;
-
-		// r4 is never used as a pin/scratch register and AAPCS helpers preserve
-		// it, so generated links can skip the callable-entry frame setup and the
-		// cpuRegs base materialization while still letting final exits pop once.
-		// Callable entry arrives with cpuRegs.pc set by the executor and skips the
-		// linked-only synchronization used by helper/exception-observing blocks.
-		if (linked_entry_offset && linked_entry_needs_pc_sync)
-		{
+			// PCSX2's _DynGen_EnterRecompiledCode() owns one native frame around its
+			// non-returning dispatcher. Persistent Vita blocks are entered only under
+			// the equivalent dispatcher frame, with r4 already holding &cpuRegs, so
+			// they contain no dead callable prologue.
+			if (linked_entry_offset)
+				*linked_entry_offset = m_code.Size();
 #if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuLinkedPcSyncBlocks++;
+			if (linked_entry_needs_pc_sync)
+				g_qemuLinkedPcSyncBlocks++;
 #endif
-			const size_t callable_body = m_code.EmitBranchPlaceholder();
-			if (callable_body == static_cast<size_t>(-1))
-				return false;
-
-			*linked_entry_offset = m_code.Size();
-			if (!EmitStorePc(linked_entry_pc) || !m_code.PatchBranch(callable_body, m_code.Size()))
+			if (linked_entry_needs_pc_sync && !EmitStorePc(linked_entry_pc))
 				return false;
 		}
-		else if (linked_entry_offset)
+		else
 		{
-			*linked_entry_offset = m_code.Size();
+			if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
+				!m_code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))))
+			{
+				return false;
+			}
+
+			// r4 is never used as a pin/scratch register and AAPCS helpers preserve
+			// it, so generated links can skip the callable-entry frame setup and the
+			// cpuRegs base materialization while still letting final exits pop once.
+			// Callable entry arrives with cpuRegs.pc set by the executor and skips the
+			// linked-only synchronization used by helper/exception-observing blocks.
+			if (linked_entry_offset && linked_entry_needs_pc_sync)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuLinkedPcSyncBlocks++;
+#endif
+				const size_t callable_body = m_code.EmitBranchPlaceholder();
+				if (callable_body == static_cast<size_t>(-1))
+					return false;
+
+				*linked_entry_offset = m_code.Size();
+				if (!EmitStorePc(linked_entry_pc) || !m_code.PatchBranch(callable_body, m_code.Size()))
+					return false;
+			}
+			else if (linked_entry_offset)
+			{
+				*linked_entry_offset = m_code.Size();
+			}
 		}
 
 		if (use_cop1_exponent_mask_register &&
@@ -6492,7 +6509,7 @@ namespace VitaEE
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit,
 		const void* event_exit, u32* scaled_cycles, DirectLinkSlots* direct_links,
 		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
-		size_t* linked_entry_offset)
+		size_t* linked_entry_offset, bool persistent_dispatch_exits)
 	{
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return false;
@@ -6503,24 +6520,28 @@ namespace VitaEE
 		const u32 previous_block_start_pc = m_current_block_start_pc;
 		const u32 previous_block_instruction_count = m_current_block_instruction_count;
 		const u32 previous_instruction_index = m_current_instruction_index;
+		const bool previous_persistent_dispatch_exits = m_persistent_dispatch_exits;
 		struct CurrentBlockScope
 		{
 			BlockCompiler& compiler;
 			u32 previous_start_pc;
 			u32 previous_instruction_count;
 			u32 previous_instruction_index;
+			bool previous_persistent_dispatch_exits;
 			~CurrentBlockScope()
 			{
 				compiler.m_current_block_start_pc = previous_start_pc;
 				compiler.m_current_block_instruction_count = previous_instruction_count;
 				compiler.m_current_instruction_index = previous_instruction_index;
+				compiler.m_persistent_dispatch_exits = previous_persistent_dispatch_exits;
 			}
 		} current_block_scope{
 			*this, previous_block_start_pc, previous_block_instruction_count,
-			previous_instruction_index};
+			previous_instruction_index, previous_persistent_dispatch_exits};
 		m_current_block_start_pc = start_pc;
 		m_current_block_instruction_count = instruction_count;
 		m_current_instruction_index = 0;
+		m_persistent_dispatch_exits = persistent_dispatch_exits;
 
 		const bool use_vtlb_registers = BlockNeedsResidentVtlbRegisters(start_pc, instruction_count);
 		const bool use_cop1_exponent_mask_register =
@@ -7289,6 +7310,21 @@ namespace VitaEE
 		return m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
+	bool BlockCompiler::EmitExitToTarget(const void* target, u8 callable_token)
+	{
+		if (!target)
+			return false;
+		if (!m_persistent_dispatch_exits)
+			return m_code.EmitMovImm8(0, callable_token) && EmitLinkFrameReturn();
+
+		// Persistent exits cannot rely on LR because generated helper calls own it.
+		// The dispatcher slab and every EE block share one 8 MiB mapping, so an A32
+		// B reaches it directly and avoids an address materialization plus BX.
+		const size_t branch = m_code.EmitBranchPlaceholder();
+		return branch != static_cast<size_t>(-1) &&
+		       m_code.PatchBranchToAddress(branch, target);
+	}
+
 	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
 		bool defer_pc_writeback, u32 pc)
 	{
@@ -7303,8 +7339,7 @@ namespace VitaEE
 		const size_t fallback_offset = m_code.Size();
 		if (!m_code.PatchBranch(target_branch, fallback_offset) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
-			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
-			!EmitLinkFrameReturn())
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
 			return false;
 		}
@@ -7330,8 +7365,7 @@ namespace VitaEE
 		const size_t fallback_offset = m_code.Size();
 		if (!m_code.PatchBranch(target_branch, fallback_offset, VitaA32::Condition::NE) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
-			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
-			!EmitLinkFrameReturn())
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
 			return false;
 		}
@@ -7350,8 +7384,7 @@ namespace VitaEE
 		if (!event_exit)
 			return false;
 
-		return m_code.EmitMovImm8(0, EE_EVENT_EXIT_TOKEN) &&
-			   EmitLinkFrameReturn();
+		return EmitExitToTarget(event_exit, EE_EVENT_EXIT_TOKEN);
 	}
 
 	bool BlockCompiler::EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc,
@@ -7366,9 +7399,9 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitIndirectDispatchTail(const void* lookup_pages_slot,
-		const void* direct_linking_enabled_flag, bool defer_pc_writeback)
+		const void* direct_linking_enabled_flag, const void* direct_exit, bool defer_pc_writeback)
 	{
-		if (!lookup_pages_slot || !direct_linking_enabled_flag)
+		if (!lookup_pages_slot || !direct_linking_enabled_flag || !direct_exit)
 			return false;
 
 		if (!m_code.EmitTstImm32(HOST_BRANCH_TARGET, 0x3))
@@ -7426,8 +7459,7 @@ namespace VitaEE
 			   m_code.PatchBranch(fallback_no_page, fallback_target, VitaA32::Condition::EQ) &&
 			   m_code.PatchBranch(fallback_no_entry, fallback_target, VitaA32::Condition::EQ) &&
 			   (!defer_pc_writeback || EmitStorePcFromHostReg(HOST_BRANCH_TARGET)) &&
-			   m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) &&
-			   EmitLinkFrameReturn();
+			   EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN);
 	}
 
 	bool BlockCompiler::IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc)
@@ -7672,15 +7704,14 @@ namespace VitaEE
 		else if (indirect_lookup_pages_slot && direct_linking_enabled_flag)
 		{
 			if (!EmitIndirectDispatchTail(indirect_lookup_pages_slot, direct_linking_enabled_flag,
-					defer_pc_writeback))
+					direct_exit, defer_pc_writeback))
 			{
 				return false;
 			}
 		}
 		else if (!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc,
 			indirect_pc_writeback) ||
-			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
-			!EmitLinkFrameReturn())
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
 			return false;
 		}
@@ -7876,8 +7907,7 @@ namespace VitaEE
 
 		const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
 		if (!EmitDeferredPcWriteback(defer_pc_writeback, not_taken_pc, taken_pc, true) ||
-			!m_code.EmitMovImm8(0, EE_DIRECT_EXIT_TOKEN) ||
-			!EmitLinkFrameReturn())
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
 			return false;
 		}

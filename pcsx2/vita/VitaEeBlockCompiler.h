@@ -151,6 +151,10 @@ namespace VitaEE
 		};
 
 	public:
+		// Private EE chain ABI: r3 is alignment padding; r4-r11 and LR/PC are
+		// saved by either the callable block prologue or the persistent dispatcher.
+		static constexpr u16 LINK_FRAME_REGISTER_MASK = 0x0ff8u;
+
 		explicit BlockCompiler(VitaA32::CodeBuffer& code);
 
 		static bool CanCompileOpcode(u32 op);
@@ -164,7 +168,7 @@ namespace VitaEE
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr,
 			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
-			size_t* linked_entry_offset = nullptr);
+			size_t* linked_entry_offset = nullptr, bool persistent_dispatch_exits = false);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
@@ -182,6 +186,7 @@ namespace VitaEE
 
 	private:
 		bool EmitLinkFrameReturn();
+		bool EmitExitToTarget(const void* target, u8 callable_token);
 		bool EmitAndImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
 		bool EmitOrrImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
 		bool EmitEorImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
@@ -193,7 +198,7 @@ namespace VitaEE
 		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0);
 		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag,
-			bool defer_pc_writeback = false);
+			const void* direct_exit, bool defer_pc_writeback = false);
 		bool EmitEventExitReturn(const void* event_exit);
 		bool EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc, u32 taken_pc,
 			bool conditional_pc, bool indirect_pc_writeback = false);
@@ -840,6 +845,7 @@ namespace VitaEE
 		// mutually exclusive. Reset per block in BeginBlock().
 		bool m_cop2_norm_consts_ready = false;
 		bool m_gpr_q_cache_enabled = false;
+		bool m_persistent_dispatch_exits = false;
 		u32 m_current_opcode = 0;
 		u32 m_current_block_start_pc = 0;
 		u32 m_current_block_instruction_count = 0;
