@@ -97,6 +97,11 @@ u32 g_qemuForwardedBooleanBranchSyncWords = 0;
 u32 g_qemuResidentForwardedBooleanHighZeroHotInstructionsElided = 0;
 u32 g_qemuResidentForwardedBooleanHighZeroTranslationInstructions = 0;
 u32 g_qemuResidentForwardedBooleanHighZeroHandlerInstructions = 0;
+u32 g_qemuResidentForwardedBooleanMaskHotInstructionsElided = 0;
+u32 g_qemuResidentForwardedBooleanMaskCanonicalInstructions = 0;
+u32 g_qemuResidentForwardedBooleanMaskPageInstructions = 0;
+u32 g_qemuResidentForwardedBooleanMaskHandlerInstructions = 0;
+u32 g_qemuResidentForwardedBooleanMaskPublicationInstructions = 0;
 u32 g_qemuResidentRawGpr0QwordBlocks = 0;
 u32 g_qemuResidentRawGpr0QwordStoreSelections = 0;
 u32 g_qemuResidentRawGpr0QwordHotInstructionsElided = 0;
@@ -6226,6 +6231,19 @@ namespace VitaEE
 		const size_t guard_end = m_code.Size();
 		if (!EmitSaveResidentSchedulerCountdown())
 			return false;
+		if (m_resident_forwarded_boolean_mask)
+		{
+			// q1 lane 1 distinguishes a resident page/handler retranslation from
+			// canonical entry. r4 is the persistent non-null cpuRegs base; the
+			// canonical scheduler prelude cleared the lane to zero.
+			const size_t marker_start = m_code.Size();
+			if (!EmitMoveCoreToQWordLane(1, 1, HOST_CPU_REGS))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentForwardedBooleanMaskPageInstructions += static_cast<u32>(
+				(m_code.Size() - marker_start) / sizeof(u32));
+#endif
+		}
 
 		const size_t translation_start = m_code.Size();
 		if (!m_code.PatchBranch(canonical_retranslate, translation_start) ||
@@ -6276,18 +6294,58 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::EmitSyncForwardedBooleanBranchToBacking()
+	bool BlockCompiler::EmitSyncForwardedBooleanBranchToBacking(bool value_is_architectural)
 	{
 		if (!m_forwarded_boolean_branch)
 			return true;
 
 		const size_t offset = GprOffset(m_forwarded_boolean_guest);
+		if (m_resident_forwarded_boolean_mask && !value_is_architectural)
+		{
+			const size_t normalize_start = m_code.Size();
+			if (!m_code.EmitAndImm8(m_branch_flag_host, m_branch_flag_host, 1))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentForwardedBooleanMaskPublicationInstructions += static_cast<u32>(
+				(m_code.Size() - normalize_start) / sizeof(u32));
+#endif
+		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuForwardedBooleanBranchSyncWords += 2;
 #endif
 		return m_code.EmitStrImm12(m_branch_flag_host, HOST_CPU_REGS, static_cast<u16>(offset)) &&
 			m_code.EmitStrImm12(HOST_TMP5, HOST_CPU_REGS,
 				static_cast<u16>(offset + sizeof(u32)));
+	}
+
+	bool BlockCompiler::EmitPrepareResidentForwardedBooleanForPreProducerSync()
+	{
+		if (!m_resident_forwarded_boolean_mask)
+			return true;
+
+		// Canonical entry may still carry an arbitrary architectural $at because
+		// SQ precedes its SLTU producer. q1 lane 1 is zero on that path and nonzero
+		// on every resident retranslation. Normalize the resident 0/-1 mask only;
+		// leave the canonical value untouched for the helper snapshot.
+		const size_t prepare_start = m_code.Size();
+		if (!EmitMoveQWordLaneToCore(HOST_TMP1, 1, 1) ||
+			!m_code.EmitCmpImm32(HOST_TMP1, 0))
+		{
+			return false;
+		}
+		const size_t canonical_value =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (canonical_value == static_cast<size_t>(-1) ||
+			!m_code.EmitAndImm8(m_branch_flag_host, m_branch_flag_host, 1) ||
+			!m_code.PatchBranch(canonical_value, m_code.Size(), VitaA32::Condition::EQ))
+		{
+			return false;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuResidentForwardedBooleanMaskHandlerInstructions += static_cast<u32>(
+			(m_code.Size() - prepare_start) / sizeof(u32));
+#endif
+		return true;
 	}
 
 	bool BlockCompiler::EmitStageResidentSchedulerCountdown(bool preserve_for_translation)
@@ -6307,6 +6365,8 @@ namespace VitaEE
 			!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS,
 				static_cast<u16>(CYCLE_OFFSET)) ||
 			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_TMP0) ||
+			(preserve_for_translation && m_resident_forwarded_boolean_mask &&
+			 !m_code.EmitVeorQ(1, 1, 1)) ||
 			(preserve_for_translation && !EmitSaveResidentSchedulerCountdown()))
 		{
 			return false;
@@ -6320,6 +6380,8 @@ namespace VitaEE
 			g_qemuResidentSchedulerCountdownBlocks++;
 			g_qemuResidentSchedulerCountdownCanonicalInstructions += static_cast<u32>(
 				(m_code.Size() - stage_start) / sizeof(u32));
+			if (m_resident_forwarded_boolean_mask)
+				g_qemuResidentForwardedBooleanMaskCanonicalInstructions++;
 		}
 #endif
 		return true;
@@ -6381,7 +6443,8 @@ namespace VitaEE
 		return EmitMoveQWordLaneToCore(HOST_TMP2, NEON_COUNTDOWN, 0);
 	}
 
-	bool BlockCompiler::EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins)
+	bool BlockCompiler::EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins,
+		bool forwarded_value_is_architectural)
 	{
 		if (!m_dirty_pins_enabled && !m_forwarded_boolean_branch && !m_resident_cycle_low)
 			return true;
@@ -6441,7 +6504,7 @@ namespace VitaEE
 			}
 		}
 
-		return EmitSyncForwardedBooleanBranchToBacking() &&
+		return EmitSyncForwardedBooleanBranchToBacking(forwarded_value_is_architectural) &&
 			EmitSyncResidentCycleLowToBacking();
 	}
 
@@ -7082,9 +7145,16 @@ namespace VitaEE
 				start_pc, m_forwarded_boolean_producer_index);
 		m_resident_raw_gpr0_entry_instructions = 0;
 		m_resident_vtlb_qword_store_op = 0;
+		const u32 forwarded_producer_op = m_forwarded_boolean_branch ?
+			memRead32(start_pc + m_forwarded_boolean_producer_index * sizeof(u32)) : 0;
+		const bool forwarded_producer_reads_old_result = m_forwarded_boolean_branch &&
+			(RS(forwarded_producer_op) == m_forwarded_boolean_guest ||
+			 RT(forwarded_producer_op) == m_forwarded_boolean_guest);
 		m_resident_vtlb_qword_pointer = m_resident_raw_gpr0_qword &&
+			!forwarded_producer_reads_old_result &&
 			AnalyzeResidentSequentialRawGpr0QwordStore(start_pc, instruction_count,
 				m_forwarded_boolean_producer_index, &m_resident_vtlb_qword_store_op);
+		m_resident_forwarded_boolean_mask = m_resident_vtlb_qword_pointer;
 		m_resident_cycle_low = m_resident_vtlb_qword_pointer;
 		m_resident_scheduler_countdown = m_resident_cycle_low;
 		m_resident_vtlb_qword_guard_offset = static_cast<size_t>(-1);
@@ -23904,6 +23974,24 @@ namespace VitaEE
 		};
 		if (!signed_compare)
 		{
+			if (forward_to_branch && m_resident_forwarded_boolean_mask)
+			{
+				// PCSX2 iCore keeps the branch-only MODE_WRITE result private. A32's
+				// borrow is already the inverse of unsigned less-than, so materialize
+				// the transient as 0/-1 with one SBC from the resident zero high word.
+				// Publication seams normalize its low bit back to architectural 0/1.
+				if (!m_code.EmitCmpReg(lhs_high, rhs_high) ||
+					!m_code.EmitCmpReg(lhs_low, rhs_low, VitaA32::Condition::EQ) ||
+					!m_code.EmitSbcReg(result_reg, HOST_TMP5, HOST_TMP5) ||
+					!commit_result())
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuResidentForwardedBooleanMaskHotInstructionsElided++;
+#endif
+				return true;
+			}
 			if (direct_result)
 			{
 				return m_code.EmitCmpReg(lhs_high, rhs_high) &&
@@ -25436,7 +25524,8 @@ namespace VitaEE
 				(m_code.Size() - restore_start) / sizeof(u32));
 #endif
 		}
-		if (!EmitSyncGprPinsToBacking(&tail.dirty_pins))
+		if (!EmitPrepareResidentForwardedBooleanForPreProducerSync() ||
+			!EmitSyncGprPinsToBacking(&tail.dirty_pins, true))
 			return false;
 		if (m_resident_vtlb_qword_pointer && tail.rt == 0 &&
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3,
