@@ -93,6 +93,7 @@ u32 g_qemuGprConstPinnedStoreOperands = 0;
 u32 g_qemuGprConstHighWordLoadFastPaths = 0;
 u32 g_qemuGprConstRegisterJumpTargets = 0;
 u32 g_qemuGprConstEffectiveAddresses = 0;
+u32 g_qemuPersistentVtlbResidentBlocks = 0;
 u32 g_qemuWaitLoopFastForwardBlocks = 0;
 u32 g_qemuDeferredPcWritebackBlocks = 0;
 u32 g_qemuDeferredIndirectPcWritebackBlocks = 0;
@@ -6494,10 +6495,16 @@ namespace VitaEE
 				return false;
 		}
 
-		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() read
-		// these stable pointers from vtlbdata for every access. Keep them
-		// resident only for blocks that emit runtime VTLB translation.
-		return !use_vtlb_registers ||
+		// PCSX2 owner: vtlb.cpp::vtlb_memRead*()/vtlb_memWrite*() read these
+		// stable pointers for every access. The persistent dispatcher owns r7/r8
+		// for its entire private frame, so its blocks inherit them instead of
+		// rematerializing both pointers at every linked block entry. Callable
+		// blocks still establish the same state locally.
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (use_vtlb_registers && m_persistent_dispatch_exits)
+			g_qemuPersistentVtlbResidentBlocks++;
+#endif
+		return !use_vtlb_registers || m_persistent_dispatch_exits ||
 			   (m_code.EmitMovImm32(HOST_VTLB_VMAP,
 				   static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.vmap))) &&
 			   m_code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_VTLB_VMAP, 0) &&
@@ -6549,9 +6556,15 @@ namespace VitaEE
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
 		const bool linked_entry_needs_pc_sync = BlockNeedsLinkedPcSync(start_pc, instruction_count);
 		const bool dirty_pins_candidate = BlockCanUseDirtyGprPins(start_pc, instruction_count);
+		const bool persistent_vtlb_registers = persistent_dispatch_exits;
 		m_dirty_pins_enabled = false;
 		m_gpr_q_cache_enabled = BlockShouldUseGprQCache(start_pc, instruction_count);
-		StageGprPinsForBlock(start_pc, instruction_count, !use_vtlb_registers, !use_vtlb_registers,
+		// r7/r8 are a chain-wide vTLB ABI under the persistent dispatcher, even
+		// for blocks without memory operations: letting an arithmetic block pin a
+		// guest value there would poison the next linked memory block.
+		StageGprPinsForBlock(start_pc, instruction_count,
+			!use_vtlb_registers && !persistent_vtlb_registers,
+			!use_vtlb_registers && !persistent_vtlb_registers,
 			!use_cop1_exponent_mask_register, !use_vu0_base_register, dirty_pins_candidate);
 		StageGprQCacheForBlock(start_pc, instruction_count);
 		if (linked_entry_offset)

@@ -7,6 +7,7 @@
 #include "pcsx2/Config.h"
 #include "pcsx2/Memory.h"
 #include "pcsx2/R5900.h"
+#include "pcsx2/vtlb.h"
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
 
 #include <cstring>
@@ -21,6 +22,8 @@ namespace
 	constexpr u16 REG_LR = 1u << 14;
 	constexpr u16 REG_PC = 1u << 15;
 	constexpr unsigned HOST_CPU_REGS = 4;
+	constexpr unsigned HOST_VTLB_VMAP = 7;
+	constexpr unsigned HOST_VTLB_HOST_MEMORY_BASE = 8;
 	constexpr unsigned HOST_SP = 13;
 	constexpr unsigned HOST_CALLBACK = 12;
 	constexpr u8 PERSISTENT_METADATA_SIZE = 16;
@@ -613,6 +616,16 @@ namespace VitaEE
 			!code.EmitStrImm12(1, HOST_SP, PERSISTENT_CONTEXT_OFFSET) ||
 			!code.EmitStrImm12(2, HOST_SP, PERSISTENT_CALLBACK_OFFSET) ||
 			!code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))) ||
+			// PCSX2's private recompiler dispatcher keeps stable VM bases in host
+			// registers. Do the same for ARM32's compact vTLB representation: r7 is
+			// the virtual-page table and r8 is the base added to its 32-bit pointer
+			// offsets. AAPCS callbacks preserve both registers for the whole chain.
+			!code.EmitMovImm32(HOST_VTLB_VMAP,
+				static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.vmap))) ||
+			!code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_VTLB_VMAP, 0) ||
+			!code.EmitMovImm32(HOST_VTLB_HOST_MEMORY_BASE,
+				static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.host_memory_base))) ||
+			!code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0) ||
 			!code.EmitBx(0))
 		{
 			return fail();
