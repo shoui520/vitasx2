@@ -571,9 +571,10 @@ namespace VitaEE
 		bool TryEmitKnownVtlbNonHandlerHostAddress(u32 guest_addr, unsigned host_reg,
 			KnownVtlbFastPathKind kind = KnownVtlbFastPathKind::Scalar);
 		void UpdateGprConstStateAfterOpcode(u32 op, u32 pc);
-		void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
+		void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r5,
+			bool allow_r7, bool allow_r8,
 			bool allow_r10, bool allow_r11, bool prefer_dirty_writes,
-			bool preserve_dirty_self_link);
+			bool preserve_self_link_state);
 		void StageGprQCacheForBlock(u32 start_pc, u32 instruction_count);
 		bool BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const;
 		void MarkGprPinsDirtyAtResidentSelfLinkEntry(u32 start_pc, u32 instruction_count);
@@ -855,6 +856,7 @@ namespace VitaEE
 		bool m_cop2_norm_consts_ready = false;
 		bool m_gpr_q_cache_enabled = false;
 		bool m_persistent_dispatch_exits = false;
+		u8 m_branch_flag_host = 0;
 		u32 m_current_opcode = 0;
 		u32 m_current_block_start_pc = 0;
 		u32 m_current_block_instruction_count = 0;

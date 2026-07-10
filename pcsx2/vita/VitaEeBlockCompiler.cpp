@@ -86,6 +86,9 @@ u32 g_qemuGprDirtyPinHighStoresElided = 0;
 u32 g_qemuGprDirtyPinFlushStores = 0;
 u32 g_qemuGprPinColdSyncWordsElided = 0;
 u32 g_qemuGprPinColdSyncWordsStored = 0;
+u32 g_qemuGpr64BackingLoadInstructions = 0;
+u32 g_qemuGpr64BackingStoreInstructions = 0;
+u32 g_qemuCallerSavedBranchFlagBlocks = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
@@ -350,6 +353,7 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP2 = 2;
 		constexpr unsigned HOST_TMP3 = 3;
 		constexpr unsigned HOST_TMP4 = 12;
+		constexpr unsigned HOST_CALLER_SAVED_BRANCH_FLAG = HOST_TMP4;
 		constexpr unsigned HOST_TMP5 = 6;
 		constexpr unsigned HOST_VTLB_VMAP = 7;
 		constexpr unsigned HOST_VTLB_HOST_MEMORY_BASE = 8;
@@ -2363,6 +2367,7 @@ namespace VitaEE
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code)
 		: m_code(code)
 	{
+		m_branch_flag_host = HOST_BRANCH_FLAG;
 		// Keep the allocator's dense logical q0-q7 domain while placing its upper
 		// bank in AAPCS caller-clobbered d24-d31. Physical q8-q11 remain available
 		// for the persistent COP2 normalization constants.
@@ -3441,6 +3446,20 @@ namespace VitaEE
 		const unsigned opcode = branch_op >> 26;
 		return opcode != 0x00 && opcode != 0x02 && opcode != 0x03 &&
 			BranchTarget(branch_pc, branch_op) == start_pc;
+	}
+
+	bool BlockCanUseCallerSavedBranchFlag(u32 start_pc, u32 instruction_count)
+	{
+		if (!BlockHasExactConditionalSelfLink(start_pc, instruction_count))
+			return false;
+
+		// The branch predicate is produced before the delay slot. Caller-saved
+		// r12 is therefore valid only when that slot cannot call a helper and its
+		// native lowering does not use r12. These forms use r0-r2 plus any pinned
+		// destination, and the exact self-link tail consumes the predicate before
+		// any other caller-saved seam.
+		const u32 delay_op = memRead32(start_pc + (instruction_count - 1) * sizeof(u32));
+		return delay_op == 0 || (delay_op >> 26) == 0x08 || (delay_op >> 26) == 0x09;
 	}
 
 	bool UpdateGprPinEntryLiveness(u32 op, u32& defined, u32& live_in_reads)
@@ -5447,9 +5466,10 @@ namespace VitaEE
 		}
 	}
 
-	void BlockCompiler::StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
+	void BlockCompiler::StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r5,
+		bool allow_r7, bool allow_r8,
 		bool allow_r10, bool allow_r11, bool prefer_dirty_writes,
-		bool preserve_dirty_self_link)
+		bool preserve_self_link_state)
 	{
 		m_staged_pin_count = 0;
 
@@ -5511,6 +5531,8 @@ namespace VitaEE
 		u8 hosts[MAX_GPR_PINS];
 		unsigned host_count = 0;
 		hosts[host_count++] = HOST_GPR_PIN0;
+		if (allow_r5)
+			hosts[host_count++] = HOST_BRANCH_STATE;
 		if (allow_r10)
 			hosts[host_count++] = HOST_COP1_EXPONENT_MASK;
 		if (allow_r11)
@@ -5571,20 +5593,24 @@ namespace VitaEE
 		};
 
 		// A read-before-write value carried by an exact native self-edge repays
-		// its entry load across iterations, so rank it ahead of block-local reuse
-		// without changing the ordinary three-write profitability threshold.
-		constexpr u16 SELF_LINK_WRITE_PRIORITY = 0x4000u;
+		// its entry load across iterations. Rank both loop-carried writers and
+		// read-only invariants ahead of block-local reuse without changing the
+		// ordinary three-write profitability threshold.
+		constexpr u16 SELF_LINK_RESIDENCY_PRIORITY = 0x4000u;
 		while (used_hosts + 1 < host_count)
 		{
 			unsigned best_reg = 0;
 			u16 best_count = 1; // one low64 read only trades the entry loads for moves
 			for (unsigned reg = 1; reg < 32; reg++)
 			{
-				const bool self_carried_write = preserve_dirty_self_link &&
+				const bool self_carried_write = preserve_self_link_state &&
 					dword_write_counts[reg] != 0 &&
 					(self_link_live_in_reads & (1u << reg)) != 0;
-				const u16 write_score = self_carried_write ?
-					static_cast<u16>(SELF_LINK_WRITE_PRIORITY + dword_write_counts[reg]) :
+				const bool self_carried_invariant = preserve_self_link_state &&
+					dword_read_counts[reg] != 0 && write_counts[reg] == 0 &&
+					(self_link_live_in_reads & (1u << reg)) != 0;
+				const u16 write_score = (self_carried_write || self_carried_invariant) ?
+					static_cast<u16>(SELF_LINK_RESIDENCY_PRIORITY + dword_write_counts[reg]) :
 					(dword_write_counts[reg] >= 3 ? dword_write_counts[reg] : 0);
 				const u16 score = (dword_read_counts[reg] > write_score) ?
 									  dword_read_counts[reg] :
@@ -5632,11 +5658,14 @@ namespace VitaEE
 			u16 best_count = 1; // a single read only trades the entry load for the read
 			for (unsigned reg = 1; reg < 32; reg++)
 			{
-				const bool self_carried_write = preserve_dirty_self_link &&
+				const bool self_carried_write = preserve_self_link_state &&
 					write_counts[reg] != 0 &&
 					(self_link_live_in_reads & (1u << reg)) != 0;
-				const u16 write_score = self_carried_write ?
-					static_cast<u16>(SELF_LINK_WRITE_PRIORITY + write_counts[reg]) :
+				const bool self_carried_invariant = preserve_self_link_state &&
+					read_counts[reg] != 0 && write_counts[reg] == 0 &&
+					(self_link_live_in_reads & (1u << reg)) != 0;
+				const u16 write_score = (self_carried_write || self_carried_invariant) ?
+					static_cast<u16>(SELF_LINK_RESIDENCY_PRIORITY + write_counts[reg]) :
 					(write_counts[reg] >= 3 ? write_counts[reg] : 0);
 				const u16 score = (read_counts[reg] > write_score) ? read_counts[reg] : write_score;
 				if (score > best_count)
@@ -6654,6 +6683,14 @@ namespace VitaEE
 		const bool dirty_pins_candidate = BlockCanUseDirtyGprPins(start_pc, instruction_count);
 		const bool dirty_self_link_shape_candidate = persistent_dispatch_exits && direct_links &&
 			dirty_pins_candidate && BlockHasExactConditionalSelfLink(start_pc, instruction_count);
+		const bool caller_saved_branch_flag = dirty_self_link_shape_candidate &&
+			BlockCanUseCallerSavedBranchFlag(start_pc, instruction_count);
+		m_branch_flag_host = caller_saved_branch_flag ?
+			HOST_CALLER_SAVED_BRANCH_FLAG : HOST_BRANCH_FLAG;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (caller_saved_branch_flag)
+			g_qemuCallerSavedBranchFlagBlocks++;
+#endif
 		const bool persistent_vtlb_registers = persistent_dispatch_exits;
 		m_dirty_pins_enabled = false;
 		m_gpr_q_cache_enabled = BlockShouldUseGprQCache(start_pc, instruction_count);
@@ -6669,6 +6706,7 @@ namespace VitaEE
 		// for blocks without memory operations: letting an arithmetic block pin a
 		// guest value there would poison the next linked memory block.
 		StageGprPinsForBlock(start_pc, instruction_count,
+			caller_saved_branch_flag,
 			!use_vtlb_registers && !persistent_vtlb_registers,
 			!use_vtlb_registers && !persistent_vtlb_registers,
 			!use_cop1_exponent_mask_register, !use_vu0_base_register, dirty_pins_candidate,
@@ -7072,7 +7110,7 @@ namespace VitaEE
 					// and REGIMM likely forms cancel the delay slot when the
 					// condition is false; x86/ix86-32/iR5900Branch.cpp emits a
 					// separate not-taken path without recompileNextInstruction().
-					if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+					if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
 	{
 						return false;
 	}
@@ -7499,7 +7537,7 @@ namespace VitaEE
 		if (!direct_exit || target_branch == static_cast<size_t>(-1))
 			return false;
 
-		// Reuse the HOST_BRANCH_FLAG selector as the patchable taken link. This
+		// Reuse the branch-flag selector as the patchable taken link. This
 		// preserves the normal fallback return while avoiding a second taken A32
 		// branch when the guest branch is taken.
 		const size_t fallback_offset = m_code.Size();
@@ -7797,7 +7835,7 @@ namespace VitaEE
 			return false;
 		if (taken_link || wait_loop_taken)
 		{
-			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+			if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
 				return false;
 
 			const size_t taken_tail = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
@@ -7926,7 +7964,7 @@ namespace VitaEE
 		}
 		else if (cycle_delta == 1 || delta_is_power_of_two || delta_is_one_plus_power_of_two)
 		{
-			// Every dynamic branch emitter normalizes HOST_BRANCH_FLAG to zero or
+			// Every dynamic branch emitter normalizes the branch flag to zero or
 			// one. Fold the scaled delay-slot delta into the addend when A32 can
 			// form flag * delta with one barrel-shifted instruction, rather than
 			// branching between duplicate add/store paths. The common default-op
@@ -7936,9 +7974,9 @@ namespace VitaEE
 
 			if (cycle_delta == 1)
 			{
-				if (!m_code.EmitAddImm32(HOST_TMP2, HOST_BRANCH_FLAG, not_taken_cycles) &&
+				if (!m_code.EmitAddImm32(HOST_TMP2, m_branch_flag_host, not_taken_cycles) &&
 					(!m_code.EmitMovImm32(HOST_TMP2, not_taken_cycles) ||
-					 !m_code.EmitAddReg(HOST_TMP2, HOST_BRANCH_FLAG, HOST_TMP2)))
+					 !m_code.EmitAddReg(HOST_TMP2, m_branch_flag_host, HOST_TMP2)))
 	{
 					return false;
 	}
@@ -7951,8 +7989,8 @@ namespace VitaEE
 					shift++;
 
 				const bool formed_delta = delta_is_power_of_two ?
-					m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, shift) :
-					m_code.EmitAddRegShiftImm(HOST_TMP2, HOST_BRANCH_FLAG, HOST_BRANCH_FLAG,
+					m_code.EmitMovRegShiftImm(HOST_TMP2, m_branch_flag_host, VitaA32::ShiftType::LSL, shift) :
+					m_code.EmitAddRegShiftImm(HOST_TMP2, m_branch_flag_host, m_branch_flag_host,
 						VitaA32::ShiftType::LSL, shift);
 				if (!formed_delta ||
 					(!m_code.EmitAddImm32(HOST_TMP2, HOST_TMP2, not_taken_cycles) &&
@@ -7976,7 +8014,7 @@ namespace VitaEE
 		else
 		{
 			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
-				!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+				!m_code.EmitCmpImm32(m_branch_flag_host, 0))
 			{
 				return false;
 			}
@@ -8015,7 +8053,7 @@ namespace VitaEE
 			return false;
 		if (not_taken_link || taken_link || wait_loop_taken)
 		{
-			if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+			if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
 				return false;
 
 			const size_t taken_tail = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
@@ -22875,7 +22913,7 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitJump(u32 pc, bool link)
 	{
-		// J/JAL always exit through static direct-link metadata; HOST_BRANCH_FLAG
+		// J/JAL always exit through static direct-link metadata; the branch flag
 		// is only consumed by conditional and likely branch tails.
 		if (!link)
 			return true;
@@ -23159,7 +23197,7 @@ namespace VitaEE
 		const unsigned rt = RT(op);
 
 		if (rs == rt)
-			return m_code.EmitMovImm8(HOST_BRANCH_FLAG, branch_on_equal ? 1 : 0);
+			return m_code.EmitMovImm8(m_branch_flag_host, branch_on_equal ? 1 : 0);
 
 		u32 rs_low = 0;
 		u32 rs_high = 0;
@@ -23170,12 +23208,12 @@ namespace VitaEE
 			// PCSX2 x86/ix86-32/iR5900Branch.cpp::recBEQ_const() /
 			// recBNE_const() resolve the branch predicate from GPR_IS_CONST2.
 			const bool equal = rs_low == rt_low && rs_high == rt_high;
-			return m_code.EmitMovImm8(HOST_BRANCH_FLAG, (equal == branch_on_equal) ? 1 : 0);
+			return m_code.EmitMovImm8(m_branch_flag_host, (equal == branch_on_equal) ? 1 : 0);
 		}
 
 		return EmitCompareGpr64ForBranch(rs, rt) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, branch_on_equal ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
+			   m_code.EmitMovImm8(m_branch_flag_host, 0) &&
+			   m_code.EmitMovImm8(m_branch_flag_host, 1, branch_on_equal ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
 	}
 
 	bool BlockCompiler::EmitBranchSigned(u32 op, SignedBranchCondition condition)
@@ -23190,7 +23228,7 @@ namespace VitaEE
 		{
 			const bool taken = condition == SignedBranchCondition::GreaterEqualZero ||
 							   condition == SignedBranchCondition::LessEqualZero;
-			return m_code.EmitMovImm8(HOST_BRANCH_FLAG, taken ? 1 : 0);
+			return m_code.EmitMovImm8(m_branch_flag_host, taken ? 1 : 0);
 		}
 
 		const bool regimm_link_reads_ra = (op >> 26) == 0x01 && rs == 31 &&
@@ -23219,7 +23257,7 @@ namespace VitaEE
 					taken = value > 0;
 					break;
 			}
-			return m_code.EmitMovImm8(HOST_BRANCH_FLAG, taken ? 1 : 0);
+			return m_code.EmitMovImm8(m_branch_flag_host, taken ? 1 : 0);
 		}
 
 		if (condition == SignedBranchCondition::LessThanZero ||
@@ -23227,7 +23265,7 @@ namespace VitaEE
 		{
 			unsigned rs_high;
 			if (!EmitGprWordOperand(rs, 1, HOST_TMP1, &rs_high) ||
-				!m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, rs_high,
+				!m_code.EmitMovRegShiftImm(m_branch_flag_host, rs_high,
 					VitaA32::ShiftType::LSR, 31))
 			{
 				return false;
@@ -23236,16 +23274,16 @@ namespace VitaEE
 			g_qemuSignedBranchSignBitFastPaths++;
 #endif
 			return condition == SignedBranchCondition::LessThanZero ||
-				m_code.EmitEorImm8(HOST_BRANCH_FLAG, HOST_BRANCH_FLAG, 1);
+				m_code.EmitEorImm8(m_branch_flag_host, m_branch_flag_host, 1);
 		}
 
 		unsigned rs_low;
 		unsigned rs_high;
 		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) ||
 			!m_code.EmitCmpImm32(rs_low, 1) ||
-			!m_code.EmitSbcImm8(HOST_BRANCH_FLAG, rs_high, 0, true) ||
-			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) ||
-			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
+			!m_code.EmitSbcImm8(m_branch_flag_host, rs_high, 0, true) ||
+			!m_code.EmitMovImm8(m_branch_flag_host, 0) ||
+			!m_code.EmitMovImm8(m_branch_flag_host, 1,
 				condition == SignedBranchCondition::LessEqualZero ?
 					VitaA32::Condition::LT : VitaA32::Condition::GE))
 		{
@@ -23268,8 +23306,8 @@ namespace VitaEE
 
 		return m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) &&
 			   m_code.EmitTstImm32(HOST_TMP1, FPU_FCR31_CONDITION_FLAG) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
+			   m_code.EmitMovImm8(m_branch_flag_host, 0) &&
+			   m_code.EmitMovImm8(m_branch_flag_host, 1,
 				   branch_on_true ? VitaA32::Condition::NE : VitaA32::Condition::EQ);
 	}
 
@@ -23284,8 +23322,8 @@ namespace VitaEE
 		return EmitVu0ViAddress(HOST_TMP0, VU0_REG_VPU_STAT) &&
 			   m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) &&
 			   m_code.EmitTstImm32(HOST_TMP1, 0x100u) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
+			   m_code.EmitMovImm8(m_branch_flag_host, 0) &&
+			   m_code.EmitMovImm8(m_branch_flag_host, 1,
 				   branch_on_true ? VitaA32::Condition::NE : VitaA32::Condition::EQ);
 	}
 
@@ -23304,8 +23342,8 @@ namespace VitaEE
 			   m_code.EmitBicRegShiftImm(HOST_TMP1, HOST_TMP1, HOST_TMP2, VitaA32::ShiftType::LSL, 0) &&
 			   m_code.EmitMovImm32(HOST_TMP2, DMAC_CPCOND_MASK) &&
 			   m_code.EmitAndReg(HOST_TMP1, HOST_TMP1, HOST_TMP2, true) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
+			   m_code.EmitMovImm8(m_branch_flag_host, 0) &&
+			   m_code.EmitMovImm8(m_branch_flag_host, 1,
 				   branch_on_true ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
 	}
 
@@ -24502,8 +24540,8 @@ namespace VitaEE
 		constexpr u32 EE_COUNTER_PAGE_TAG = 0x10000000u >> EE_COUNTER_PAGE_SHIFT;
 		return m_code.EmitMovRegShiftImm(HOST_TMP2, host_reg, VitaA32::ShiftType::LSR, EE_COUNTER_PAGE_SHIFT) &&
 			   m_code.EmitCmpImm32(HOST_TMP2, EE_COUNTER_PAGE_TAG) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::EQ);
+			   m_code.EmitMovImm8(m_branch_flag_host, 0) &&
+			   m_code.EmitMovImm8(m_branch_flag_host, 1, VitaA32::Condition::EQ);
 	}
 
 	bool BlockCompiler::EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit)
@@ -24511,7 +24549,7 @@ namespace VitaEE
 		if (!event_exit || raw_cycles_through_instruction == 0)
 			return false;
 
-		if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+		if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
 		{
 			return false;
 		}
@@ -24707,7 +24745,7 @@ namespace VitaEE
 		};
 
 		if ((tail.branch_delay_slot && needs_counter_event &&
-			 !m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_BRANCH_FLAG, VitaA32::ShiftType::LSL, 0)) ||
+			 !m_code.EmitMovRegShiftImm(HOST_TMP5, m_branch_flag_host, VitaA32::ShiftType::LSL, 0)) ||
 				(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
 				!m_code.EmitCallAbsolute(tail.read_helper) ||
 				(tail.width != ScalarLoadWidth::Dword && tail.rt != 0 && !emit_normalize_narrow_low()) ||
@@ -24720,7 +24758,7 @@ namespace VitaEE
 		if (needs_counter_event &&
 			(!EmitCounterReadEventExit(tail.pc + 4, tail.raw_cycles_through_instruction, tail.event_exit) ||
 			 (tail.branch_delay_slot &&
-				 !m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, HOST_TMP5, VitaA32::ShiftType::LSL, 0))))
+				 !m_code.EmitMovRegShiftImm(m_branch_flag_host, HOST_TMP5, VitaA32::ShiftType::LSL, 0))))
 		{
 			return false;
 		}
@@ -26090,8 +26128,16 @@ namespace VitaEE
 		}
 
 		if (offset <= 0xff && CanUseA32DualTransferPair(host_low, host_high))
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGpr64BackingLoadInstructions++;
+#endif
 			return m_code.EmitLdrdImm8(host_low, host_high, HOST_CPU_REGS, static_cast<u8>(offset));
+		}
 
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGpr64BackingLoadInstructions += 2;
+#endif
 		return m_code.EmitLdrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset)) &&
 		       m_code.EmitLdrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
 	}
@@ -26188,7 +26234,7 @@ namespace VitaEE
 			// Direct branch targets almost always share the fallthrough PC's upper
 			// half. Select the low MOVW, then materialize their common MOVT once.
 			if (!m_code.EmitMovw(HOST_TMP0, static_cast<u16>(fallthrough_pc)) ||
-				!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0) ||
+				!m_code.EmitCmpImm32(m_branch_flag_host, 0) ||
 				!m_code.EmitMovw(HOST_TMP0, static_cast<u16>(target_pc), VitaA32::Condition::NE) ||
 				(fallthrough_upper != 0 && !m_code.EmitMovt(HOST_TMP0, fallthrough_upper)))
 			{
@@ -26196,7 +26242,7 @@ namespace VitaEE
 			}
 		}
 		else if (!m_code.EmitMovImm32(HOST_TMP0, fallthrough_pc) ||
-			!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0) ||
+			!m_code.EmitCmpImm32(m_branch_flag_host, 0) ||
 			!m_code.EmitMovImm32(HOST_TMP0, target_pc, VitaA32::Condition::NE))
 		{
 			return false;
@@ -26517,19 +26563,33 @@ namespace VitaEE
 		const bool defer_high = TryDeferGprPinHighStore(guest_reg);
 		const size_t offset = GprOffset(guest_reg);
 		bool stored = false;
+		[[maybe_unused]] u32 backing_store_instructions = 0;
 		if (!defer_low && !defer_high && offset <= 0xff && CanUseA32DualTransferPair(host_low, host_high))
+		{
 			stored = m_code.EmitStrdImm8(host_low, host_high, HOST_CPU_REGS, static_cast<u8>(offset));
+			backing_store_instructions = 1;
+		}
 		else
 		{
 			stored = true;
 			if (!defer_low)
+			{
 				stored = m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(offset));
+				backing_store_instructions++;
+			}
 			if (stored && !defer_high)
+			{
 				stored = m_code.EmitStrImm12(host_high, HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32)));
+				backing_store_instructions++;
+			}
 		}
 
 		if (!stored)
 			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGpr64BackingStoreInstructions += backing_store_instructions;
+#endif
 
 		InvalidateGprQCacheForGuest(guest_reg);
 		return true;
