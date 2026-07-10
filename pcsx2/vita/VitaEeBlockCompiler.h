@@ -23,6 +23,7 @@ namespace VitaEE
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
 		bool branch_on_taken = false;
+		bool patched_to_resident_entry = false;
 		bool valid = false;
 	};
 
@@ -168,7 +169,9 @@ namespace VitaEE
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr,
 			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
-			size_t* linked_entry_offset = nullptr, bool persistent_dispatch_exits = false);
+			size_t* linked_entry_offset = nullptr, bool persistent_dispatch_exits = false,
+			size_t* resident_self_link_entry_offset = nullptr,
+			u8* resident_self_link_entry_loads = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
@@ -571,6 +574,7 @@ namespace VitaEE
 			bool allow_r10, bool allow_r11, bool prefer_dirty_writes);
 		void StageGprQCacheForBlock(u32 start_pc, u32 instruction_count);
 		bool BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const;
+		u8 GprPinEntryLoadInstructionCount() const;
 		bool EmitGprPinLoads();
 		bool EmitGprQCacheEntryLoads();
 		bool EmitFlushDirtyGprPins();
@@ -816,7 +820,9 @@ namespace VitaEE
 			// registers for the whole block, optionally with a companion high word
 			// for hot low64 scalar state. Most blocks remain write-through; a narrow
 			// scalar/control plus scalar-memory subset defers pinned stores and flushes
-			// at block exits or before helper/event cold seams.
+			// at block exits or before helper/event cold seams. Persistent self-links
+			// may re-enter after these loads because the exact same mapping remains
+			// live; all other incoming edges rebuild it from backing state.
 		u8 m_staged_pin_guest[MAX_GPR_PINS]{};
 		u8 m_staged_pin_host[MAX_GPR_PINS]{};
 		u8 m_staged_pin_high_host[MAX_GPR_PINS]{};

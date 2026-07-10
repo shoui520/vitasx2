@@ -69,6 +69,9 @@ namespace VitaEE
 		u32 generated_frame_pops = 0;
 		u32 dispatcher_frame_pushes = 0;
 		u32 dispatcher_frame_pops = 0;
+		u32 resident_self_links = 0;
+		u32 resident_self_link_entry_instructions = 0;
+		u32 resident_self_link_entry_loads = 0;
 #endif
 	};
 
@@ -124,6 +127,8 @@ namespace VitaEE
 			s8 ee_cycle_rate = 0;
 			u8 cp0_config_cycle_shift = 0;
 			size_t linked_entry_offset = 0;
+			size_t resident_self_link_entry_offset = static_cast<size_t>(-1);
+			u8 resident_self_link_entry_loads = 0;
 			DirectLinkSlots direct_links{};
 			bool valid = false;
 			bool queued_free = false;
@@ -209,6 +214,7 @@ namespace VitaEE
 		bool EnsurePersistentDispatcher();
 		static const void* PersistentDispatchThunk(u32 exit_value, void* userdata);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
+		const void* ResidentSelfLinkEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
 		void PatchIncomingLinks(u32 target_pc, const void* target);
 		void UnlinkIncomingLinks(u32 target_pc);

@@ -5769,6 +5769,22 @@ namespace VitaEE
 		return -1;
 	}
 
+	u8 BlockCompiler::GprPinEntryLoadInstructionCount() const
+	{
+		u8 count = 0;
+		for (unsigned i = 0; i < m_pin_count; i++)
+		{
+			if (!m_pin_needs_entry_load[i])
+				continue;
+
+			const size_t offset = GprOffset(m_pin_guest[i]);
+			count += (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+				(offset > 0xff || !CanUseA32DualTransferPair(m_pin_host[i], m_pin_high_host[i]))) ?
+				2 : 1;
+		}
+		return count;
+	}
+
 	bool BlockCompiler::EmitGprPinLoads()
 	{
 		for (unsigned i = 0; i < m_pin_count; i++)
@@ -6516,13 +6532,18 @@ namespace VitaEE
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit,
 		const void* event_exit, u32* scaled_cycles, DirectLinkSlots* direct_links,
 		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
-		size_t* linked_entry_offset, bool persistent_dispatch_exits)
+		size_t* linked_entry_offset, bool persistent_dispatch_exits,
+		size_t* resident_self_link_entry_offset, u8* resident_self_link_entry_loads)
 	{
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return false;
 
 		if (direct_links)
 			*direct_links = {};
+		if (resident_self_link_entry_offset)
+			*resident_self_link_entry_offset = static_cast<size_t>(-1);
+		if (resident_self_link_entry_loads)
+			*resident_self_link_entry_loads = 0;
 
 		const u32 previous_block_start_pc = m_current_block_start_pc;
 		const u32 previous_block_instruction_count = m_current_block_instruction_count;
@@ -6583,8 +6604,24 @@ namespace VitaEE
 		// Pins must be live before any emitted GPR read, including the Goemon
 		// hook's GPR4 argument load; the hook's helpers are AAPCS calls that
 		// preserve the callee-saved pin hosts and never write the GPR file.
+		const u8 gpr_pin_entry_loads = GprPinEntryLoadInstructionCount();
 		if (!EmitGprPinLoads())
 			return false;
+		if (persistent_dispatch_exits && gpr_pin_entry_loads != 0)
+		{
+			// PCSX2 owner: iCore.cpp keeps MODE_READ mappings valid until a
+			// clobber/flush seam, while iBranchTest()/BaseBlocks owns the patched
+			// direct edge. A self-link returns to this exact allocator mapping, so
+			// it may enter after the initial pin loads. Other incoming edges retain
+			// the ordinary linked entry and rebuild the mapping from cpuRegs.
+			// The self edge also cannot inherit a different PC: normal entry has
+			// already synchronized this same block-start PC, and exception/event
+			// paths leave through the dispatcher rather than taking the self edge.
+			if (resident_self_link_entry_offset)
+				*resident_self_link_entry_offset = m_code.Size();
+			if (resident_self_link_entry_loads)
+				*resident_self_link_entry_loads = gpr_pin_entry_loads;
+		}
 		if (!EmitGprQCacheEntryLoads())
 			return false;
 		if (!EmitGoemonBlockStartHook(start_pc))

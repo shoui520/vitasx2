@@ -367,6 +367,8 @@ namespace VitaEE
 		UnregisterBlockRecord(block);
 		block.valid = false;
 		block.linked_entry_offset = 0;
+		block.resident_self_link_entry_offset = static_cast<size_t>(-1);
+		block.resident_self_link_entry_loads = 0;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -481,6 +483,9 @@ namespace VitaEE
 			block.code.Release();
 			block.valid = false;
 			block.queued_free = false;
+			block.linked_entry_offset = 0;
+			block.resident_self_link_entry_offset = static_cast<size_t>(-1);
+			block.resident_self_link_entry_loads = 0;
 			block.direct_links = {};
 			RememberFreeCacheEntry(block);
 		}
@@ -1002,6 +1007,8 @@ namespace VitaEE
 		size_t block_code_slice_offset = 0;
 		u32 compiled_scaled_cycles = 0;
 		size_t compiled_linked_entry_offset = 0;
+		size_t compiled_resident_self_link_entry_offset = static_cast<size_t>(-1);
+		u8 compiled_resident_self_link_entry_loads = 0;
 		DirectLinkSlots direct_links;
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
@@ -1030,11 +1037,14 @@ namespace VitaEE
 			BlockCompiler compiler(block.code);
 			u32 attempt_scaled_cycles = 0;
 			size_t attempt_linked_entry_offset = 0;
+			size_t attempt_resident_self_link_entry_offset = static_cast<size_t>(-1);
+			u8 attempt_resident_self_link_entry_loads = 0;
 			DirectLinkSlots attempt_direct_links;
 			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
 				direct_exit, event_exit, &attempt_scaled_cycles, &attempt_direct_links,
 				&m_active_generated_lookup_pages, &m_direct_linking_enabled, &attempt_linked_entry_offset,
-				m_persistent_dispatch_enabled);
+				m_persistent_dispatch_enabled, &attempt_resident_self_link_entry_offset,
+				&attempt_resident_self_link_entry_loads);
 			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
 			const size_t failure_code_size = block.code.Size();
 			const size_t failure_code_capacity = block.code.Capacity();
@@ -1044,6 +1054,8 @@ namespace VitaEE
 				CommitCodeSlice(code_slice_offset, block.code.Size());
 				compiled_scaled_cycles = attempt_scaled_cycles;
 				compiled_linked_entry_offset = attempt_linked_entry_offset;
+				compiled_resident_self_link_entry_offset = attempt_resident_self_link_entry_offset;
+				compiled_resident_self_link_entry_loads = attempt_resident_self_link_entry_loads;
 				direct_links = attempt_direct_links;
 				break;
 			}
@@ -1067,6 +1079,8 @@ namespace VitaEE
 		block.ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
 		block.linked_entry_offset = compiled_linked_entry_offset;
+		block.resident_self_link_entry_offset = compiled_resident_self_link_entry_offset;
+		block.resident_self_link_entry_loads = compiled_resident_self_link_entry_loads;
 		block.direct_links = direct_links;
 		block.valid = true;
 		if (!RegisterBlockRecord(block))
@@ -1107,6 +1121,18 @@ namespace VitaEE
 		return static_cast<const u8*>(block.code.EntryPoint()) + block.linked_entry_offset;
 	}
 
+	const void* BlockExecutor::ResidentSelfLinkEntryPoint(const CachedBlock& block) const
+	{
+		if (!block.code.EntryPoint() || block.resident_self_link_entry_loads == 0 ||
+			block.resident_self_link_entry_offset >= block.code.Size())
+		{
+			return LinkedEntryPoint(block);
+		}
+
+		return static_cast<const u8*>(block.code.EntryPoint()) +
+			block.resident_self_link_entry_offset;
+	}
+
 	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target)
 	{
 		if (!target || !block.valid || !link.valid ||
@@ -1119,12 +1145,22 @@ namespace VitaEE
 		const void* direct_exit = m_persistent_dispatch_enabled ?
 			m_persistent_direct_exit : reinterpret_cast<const void*>(&VitaEeA32DirectExit);
 		const bool target_is_direct_exit = target == direct_exit;
+		// PCSX2 BaseBlocks owns reversible target-PC -> patch-site links. Only an
+		// exact persistent self-edge has the compiler's identical live GPR mapping;
+		// ordinary incoming edges and every unlinked fallback use canonical entry.
+		const bool use_resident_entry = !target_is_direct_exit && m_persistent_dispatch_enabled &&
+			link.target_pc == block.start_pc && block.resident_self_link_entry_loads != 0;
+		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) : target;
 		const VitaA32::Condition condition = link.branch_on_taken ?
 			VitaA32::Condition::NE : VitaA32::Condition::AL;
 		const bool patched = target_is_direct_exit ?
 			block.code.PatchBranch(link.target_offset, link.fallback_offset, condition) :
-			block.code.PatchBranchToAddress(link.target_offset, target, condition);
-		return patched && block.code.Flush();
+			block.code.PatchBranchToAddress(link.target_offset, patched_target, condition);
+		if (!patched || !block.code.Flush())
+			return false;
+
+		link.patched_to_resident_entry = use_resident_entry;
+		return true;
 	}
 
 	void BlockExecutor::PatchIncomingLinks(u32 target_pc, const void* target)
@@ -1218,6 +1254,17 @@ namespace VitaEE
 		result->code_cache_capacity = m_code_cache_capacity;
 #if defined(VITASX2_QEMU_VALIDATION)
 		PopulateFrameEvidence(block.code, m_persistent_dispatch_code, result);
+		for (const DirectLinkSlot& link : block.direct_links.slots)
+		{
+			if (link.valid && link.patched_to_resident_entry)
+			{
+				result->resident_self_links++;
+				result->resident_self_link_entry_instructions += static_cast<u32>(
+					(block.resident_self_link_entry_offset - block.linked_entry_offset) /
+					sizeof(u32));
+				result->resident_self_link_entry_loads += block.resident_self_link_entry_loads;
+			}
+		}
 #endif
 		return true;
 	}
@@ -1278,6 +1325,18 @@ namespace VitaEE
 			result->fast_dispatch_hit = fast_dispatch_hit;
 #if defined(VITASX2_QEMU_VALIDATION)
 			PopulateFrameEvidence(entry->code, m_persistent_dispatch_code, result);
+			for (const DirectLinkSlot& link : entry->direct_links.slots)
+			{
+				if (link.valid && link.patched_to_resident_entry)
+				{
+					result->resident_self_links++;
+					result->resident_self_link_entry_instructions += static_cast<u32>(
+						(entry->resident_self_link_entry_offset - entry->linked_entry_offset) /
+						sizeof(u32));
+					result->resident_self_link_entry_loads +=
+						entry->resident_self_link_entry_loads;
+				}
+			}
 #endif
 			return true;
 		};
