@@ -23,6 +23,7 @@ namespace VitaEE
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
 		bool branch_on_taken = false;
+		bool branch_on_unsigned_less = false;
 		bool patched_to_resident_entry = false;
 		bool valid = false;
 	};
@@ -592,6 +593,7 @@ namespace VitaEE
 		bool EmitSyncResidentCycleLowToBacking();
 		bool EmitSaveResidentSchedulerCountdown();
 		bool EmitRestoreResidentSchedulerCountdown();
+		bool EmitDeferredResidentUnsignedBranchSuffix(bool event_path = false);
 		bool IsForwardedBooleanBranchResult(unsigned guest_reg) const;
 		bool EmitStageResidentRawGpr0Qword();
 		bool EmitStageResidentVtlbQwordPointer();
@@ -876,6 +878,10 @@ namespace VitaEE
 		bool m_resident_vtlb_qword_pointer = false;
 		bool m_resident_cycle_low = false;
 		bool m_resident_scheduler_countdown = false;
+		bool m_deferred_resident_unsigned_branch_suffix = false;
+		bool m_emitting_deferred_resident_event_suffix = false;
+		u32 m_deferred_resident_unsigned_compare_op = 0;
+		u32 m_deferred_resident_delay_op = 0;
 		u32 m_resident_vtlb_qword_store_op = 0;
 		size_t m_resident_vtlb_qword_guard_offset = static_cast<size_t>(-1);
 		size_t m_resident_vtlb_qword_handler_fallback = static_cast<size_t>(-1);

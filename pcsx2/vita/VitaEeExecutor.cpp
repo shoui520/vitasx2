@@ -1152,7 +1152,8 @@ namespace VitaEE
 			link.target_pc == block.start_pc && block.resident_self_link_entry_loads != 0;
 		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) : target;
 		const VitaA32::Condition condition = link.branch_on_taken ?
-			VitaA32::Condition::NE : VitaA32::Condition::AL;
+			(link.branch_on_unsigned_less ? VitaA32::Condition::CC : VitaA32::Condition::NE) :
+			VitaA32::Condition::AL;
 		const bool patched = target_is_direct_exit ?
 			block.code.PatchBranch(link.target_offset, link.fallback_offset, condition) :
 			block.code.PatchBranchToAddress(link.target_offset, patched_target, condition);

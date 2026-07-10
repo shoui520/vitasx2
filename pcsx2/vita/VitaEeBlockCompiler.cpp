@@ -102,6 +102,9 @@ u32 g_qemuResidentForwardedBooleanMaskCanonicalInstructions = 0;
 u32 g_qemuResidentForwardedBooleanMaskPageInstructions = 0;
 u32 g_qemuResidentForwardedBooleanMaskHandlerInstructions = 0;
 u32 g_qemuResidentForwardedBooleanMaskPublicationInstructions = 0;
+u32 g_qemuResidentUnsignedBranchSuffixBlocks = 0;
+u32 g_qemuResidentUnsignedBranchSuffixHotInstructionsElided = 0;
+u32 g_qemuResidentUnsignedBranchSuffixEventInstructions = 0;
 u32 g_qemuResidentRawGpr0QwordBlocks = 0;
 u32 g_qemuResidentRawGpr0QwordStoreSelections = 0;
 u32 g_qemuResidentRawGpr0QwordHotInstructionsElided = 0;
@@ -6443,6 +6446,29 @@ namespace VitaEE
 		return EmitMoveQWordLaneToCore(HOST_TMP2, NEON_COUNTDOWN, 0);
 	}
 
+	bool BlockCompiler::EmitDeferredResidentUnsignedBranchSuffix(bool event_path)
+	{
+		if (!m_deferred_resident_unsigned_branch_suffix)
+			return true;
+
+		// PCSX2 owners: recSLTU() leaves its MODE_WRITE result available to
+		// recBNE(), while recompileNextInstruction() emits the ADDIU delay slot
+		// before iBranchTest(). The resident scheduler test is private host work,
+		// so it may run first. Emit the guest suffix afterward: CMP/CMP/SBC leaves
+		// unsigned-less in C, and ADDIU's ADD/ASR do not set flags. The self-link
+		// can therefore consume CC directly without re-comparing the 0/-1 mask.
+		const u32 previous_index = m_current_instruction_index;
+		const bool previous_event_suffix = m_emitting_deferred_resident_event_suffix;
+		m_emitting_deferred_resident_event_suffix = event_path;
+		m_current_instruction_index = m_forwarded_boolean_producer_index;
+		const bool compare_ok = EmitSLTU(m_deferred_resident_unsigned_compare_op);
+		m_current_instruction_index = m_current_block_instruction_count - 1;
+		const bool delay_ok = compare_ok && EmitADDIU(m_deferred_resident_delay_op);
+		m_current_instruction_index = previous_index;
+		m_emitting_deferred_resident_event_suffix = previous_event_suffix;
+		return delay_ok;
+	}
+
 	bool BlockCompiler::EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins,
 		bool forwarded_value_is_architectural)
 	{
@@ -7157,6 +7183,14 @@ namespace VitaEE
 		m_resident_forwarded_boolean_mask = m_resident_vtlb_qword_pointer;
 		m_resident_cycle_low = m_resident_vtlb_qword_pointer;
 		m_resident_scheduler_countdown = m_resident_cycle_low;
+		m_deferred_resident_unsigned_branch_suffix =
+			m_resident_scheduler_countdown && (forwarded_producer_op & 0x3f) == 0x2b &&
+			RS(forwarded_producer_op) != 0 && RT(forwarded_producer_op) != 0 &&
+			RS(forwarded_producer_op) != RT(forwarded_producer_op);
+		m_deferred_resident_unsigned_compare_op =
+			m_deferred_resident_unsigned_branch_suffix ? forwarded_producer_op : 0;
+		m_deferred_resident_delay_op = m_deferred_resident_unsigned_branch_suffix ?
+			memRead32(start_pc + (instruction_count - 1) * sizeof(u32)) : 0;
 		m_resident_vtlb_qword_guard_offset = static_cast<size_t>(-1);
 		m_resident_vtlb_qword_handler_fallback = static_cast<size_t>(-1);
 		m_resident_vtlb_qword_dirty_pins = {};
@@ -7165,6 +7199,8 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (m_forwarded_boolean_branch)
 			g_qemuForwardedBooleanBranchBlocks++;
+		if (m_deferred_resident_unsigned_branch_suffix)
+			g_qemuResidentUnsignedBranchSuffixBlocks++;
 #endif
 		// r7/r8 are a chain-wide vTLB ABI under the persistent dispatcher, even
 		// for blocks without memory operations: letting an arithmetic block pin a
@@ -7643,7 +7679,11 @@ namespace VitaEE
 				pending_di_clear = true;
 				continue;
 			}
-			if (!EmitOpcode(op, pc, raw_cycles, event_exit, branch_delay_slot))
+			const bool defer_resident_suffix_instruction =
+				m_deferred_resident_unsigned_branch_suffix &&
+				(i == m_forwarded_boolean_producer_index || i + 1 == instruction_count);
+			if (!defer_resident_suffix_instruction &&
+				!EmitOpcode(op, pc, raw_cycles, event_exit, branch_delay_slot))
 				return false;
 			UpdateGprConstStateAfterOpcode(op, pc);
 			UpdateCop1NormalizedStateAfterOpcode(op);
@@ -8012,6 +8052,7 @@ namespace VitaEE
 			direct_link->target_offset = target_offset;
 			direct_link->fallback_offset = fallback_offset;
 			direct_link->branch_on_taken = false;
+			direct_link->branch_on_unsigned_less = false;
 		}
 		return true;
 	}
@@ -8027,7 +8068,10 @@ namespace VitaEE
 		// preserves the normal fallback return while avoiding a second taken A32
 		// branch when the guest branch is taken.
 		const size_t fallback_offset = m_code.Size();
-		if (!m_code.PatchBranch(target_branch, fallback_offset, VitaA32::Condition::NE) ||
+		const VitaA32::Condition taken_condition =
+			m_deferred_resident_unsigned_branch_suffix ?
+				VitaA32::Condition::CC : VitaA32::Condition::NE;
+		if (!m_code.PatchBranch(target_branch, fallback_offset, taken_condition) ||
 			(sync_dirty_fallback && !EmitSyncGprPinsToBacking()) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
 			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
@@ -8040,6 +8084,8 @@ namespace VitaEE
 			direct_link->target_offset = target_branch;
 			direct_link->fallback_offset = fallback_offset;
 			direct_link->branch_on_taken = true;
+			direct_link->branch_on_unsigned_less =
+				m_deferred_resident_unsigned_branch_suffix;
 		}
 		return true;
 	}
@@ -8378,10 +8424,23 @@ namespace VitaEE
 			return false;
 		if (taken_link || wait_loop_taken)
 		{
-			if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
+			if (m_deferred_resident_unsigned_branch_suffix)
+			{
+				if (!EmitDeferredResidentUnsignedBranchSuffix())
+					return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuResidentUnsignedBranchSuffixHotInstructionsElided++;
+#endif
+			}
+			else if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
+			{
 				return false;
+			}
 
-			const size_t taken_tail = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			const VitaA32::Condition taken_condition =
+				m_deferred_resident_unsigned_branch_suffix ?
+					VitaA32::Condition::CC : VitaA32::Condition::NE;
+			const size_t taken_tail = m_code.EmitBranchPlaceholder(taken_condition);
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
@@ -8412,6 +8471,8 @@ namespace VitaEE
 			const size_t carry_branches[] = {carry_branch};
 			if (!taken_tail_ok ||
 				!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) ||
+				(m_deferred_resident_unsigned_branch_suffix &&
+					!EmitDeferredResidentUnsignedBranchSuffix(true)) ||
 				(carry_dirty_self_link && !EmitSyncGprPinsToBacking()) ||
 				!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc,
 					indirect_pc_writeback) ||
@@ -8420,6 +8481,11 @@ namespace VitaEE
 			{
 				return false;
 			}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (m_deferred_resident_unsigned_branch_suffix)
+				g_qemuResidentUnsignedBranchSuffixEventInstructions += 5;
+#endif
 
 			return true;
 		}
@@ -23963,7 +24029,8 @@ namespace VitaEE
 			if (m_resident_vtlb_qword_pointer)
 			{
 #if defined(VITASX2_QEMU_VALIDATION)
-				g_qemuResidentForwardedBooleanHighZeroHotInstructionsElided++;
+				if (!m_emitting_deferred_resident_event_suffix)
+					g_qemuResidentForwardedBooleanHighZeroHotInstructionsElided++;
 #endif
 				return true;
 			}
@@ -23988,7 +24055,8 @@ namespace VitaEE
 					return false;
 				}
 #if defined(VITASX2_QEMU_VALIDATION)
-				g_qemuResidentForwardedBooleanMaskHotInstructionsElided++;
+				if (!m_emitting_deferred_resident_event_suffix)
+					g_qemuResidentForwardedBooleanMaskHotInstructionsElided++;
 #endif
 				return true;
 			}
