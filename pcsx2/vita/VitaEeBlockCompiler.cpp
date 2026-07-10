@@ -160,6 +160,7 @@ u32 g_qemuConditionalMovePredicatedMixedCopies = 0;
 u32 g_qemuConditionalMovePredicatedQCacheCopies = 0;
 u32 g_qemuConditionalMovePredicatedRegisterStores = 0;
 u32 g_qemuConditionalMovePredicatedQCacheStores = 0;
+u32 g_qemuSignedBranchSignBitFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -19178,11 +19179,17 @@ namespace VitaEE
 			condition == SignedBranchCondition::GreaterEqualZero)
 		{
 			unsigned rs_high;
-			return EmitGprWordOperand(rs, 1, HOST_TMP1, &rs_high) &&
-				   m_code.EmitCmpImm32(rs_high, 0) &&
-				   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
-				   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
-					   condition == SignedBranchCondition::LessThanZero ? VitaA32::Condition::LT : VitaA32::Condition::GE);
+			if (!EmitGprWordOperand(rs, 1, HOST_TMP1, &rs_high) ||
+				!m_code.EmitMovRegShiftImm(HOST_BRANCH_FLAG, rs_high,
+					VitaA32::ShiftType::LSR, 31))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSignedBranchSignBitFastPaths++;
+#endif
+			return condition == SignedBranchCondition::LessThanZero ||
+				m_code.EmitEorImm8(HOST_BRANCH_FLAG, HOST_BRANCH_FLAG, 1);
 		}
 
 		unsigned rs_low;
