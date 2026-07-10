@@ -161,6 +161,7 @@ u32 g_qemuConditionalMovePredicatedQCacheCopies = 0;
 u32 g_qemuConditionalMovePredicatedRegisterStores = 0;
 u32 g_qemuConditionalMovePredicatedQCacheStores = 0;
 u32 g_qemuSignedBranchSignBitFastPaths = 0;
+u32 g_qemuSignedBranchOneCompareFastPaths = 0;
 #endif
 
 namespace VitaEE
@@ -19195,19 +19196,19 @@ namespace VitaEE
 		unsigned rs_low;
 		unsigned rs_high;
 		if (!EmitGpr64ReadOperands(rs, HOST_TMP0, HOST_TMP1, &rs_low, &rs_high) ||
+			!m_code.EmitCmpImm32(rs_low, 1) ||
+			!m_code.EmitSbcImm8(HOST_BRANCH_FLAG, rs_high, 0, true) ||
 			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) ||
-			!m_code.EmitCmpImm32(rs_high, 0) ||
-			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::LT) ||
-			!m_code.EmitCmpImm32(rs_low, 0, VitaA32::Condition::EQ) ||
-			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, VitaA32::Condition::EQ))
+			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
+				condition == SignedBranchCondition::LessEqualZero ?
+					VitaA32::Condition::LT : VitaA32::Condition::GE))
 		{
 			return false;
 		}
-
-		if (condition == SignedBranchCondition::LessEqualZero)
-			return true;
-
-		return m_code.EmitEorImm8(HOST_BRANCH_FLAG, HOST_BRANCH_FLAG, 1);
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSignedBranchOneCompareFastPaths++;
+#endif
+		return true;
 	}
 
 	bool BlockCompiler::EmitCop1Branch(u32 op)
