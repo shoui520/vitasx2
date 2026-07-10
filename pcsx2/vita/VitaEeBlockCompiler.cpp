@@ -109,6 +109,10 @@ u32 g_qemuResidentCycleLowHotInstructionsElided = 0;
 u32 g_qemuResidentCycleLowSyncInstructions = 0;
 u32 g_qemuResidentCycleLowWrapFixupInstructions = 0;
 u32 g_qemuResidentCycleLowColdReloadInstructions = 0;
+u32 g_qemuResidentNextEventLowBlocks = 0;
+u32 g_qemuResidentNextEventLowHotInstructionsElided = 0;
+u32 g_qemuResidentNextEventLowTranslationReloadInstructions = 0;
+u32 g_qemuResidentNextEventLowColdReloadInstructions = 0;
 u32 g_qemuGprConstBlocks = 0;
 u32 g_qemuGprConstResultStores = 0;
 u32 g_qemuGprConstStoreValueFastPaths = 0;
@@ -6223,11 +6227,14 @@ namespace VitaEE
 			return false;
 		}
 
+		const size_t translation_end = m_code.Size();
+		if (!EmitReloadResidentNextEventLow())
+			return false;
 		const size_t body_start = m_code.Size();
 		const size_t guard_instructions =
 			(translation_start - guard_start) / sizeof(u32);
 		const size_t translation_instructions =
-			(body_start - translation_start) / sizeof(u32);
+			(translation_end - translation_start) / sizeof(u32);
 		if (guard_instructions > UINT8_MAX || translation_instructions > UINT8_MAX ||
 			!m_code.PatchBranch(same_page, body_start, VitaA32::Condition::NE))
 		{
@@ -6243,6 +6250,8 @@ namespace VitaEE
 			static_cast<u32>(guard_instructions);
 		g_qemuResidentVtlbQwordPointerTranslationInstructions +=
 			static_cast<u32>(translation_instructions);
+		g_qemuResidentNextEventLowBlocks++;
+		g_qemuResidentNextEventLowTranslationReloadInstructions++;
 #endif
 		return true;
 	}
@@ -6312,6 +6321,20 @@ namespace VitaEE
 		g_qemuResidentCycleLowWrapFixupInstructions += 3;
 #endif
 		return true;
+	}
+
+	bool BlockCompiler::EmitReloadResidentNextEventLow()
+	{
+		if (!m_resident_next_event_low)
+			return true;
+
+		// PCSX2 owner: iBranchTest() keeps the next scheduler deadline in its
+		// recompiler/dispatcher state. r2 is dead after the exact loop's full vTLB
+		// translation and remains untouched by the same-page SQ body, so retain the
+		// low deadline across resident edges. Translation and AAPCS helpers are its
+		// explicit clobber seams and call this reload before native code rejoins.
+		return m_code.EmitLdrImm12(
+			HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET));
 	}
 
 	bool BlockCompiler::EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins)
@@ -7019,6 +7042,7 @@ namespace VitaEE
 			AnalyzeResidentSequentialRawGpr0QwordStore(start_pc, instruction_count,
 				m_forwarded_boolean_producer_index, &m_resident_vtlb_qword_store_op);
 		m_resident_cycle_low = m_resident_vtlb_qword_pointer;
+		m_resident_next_event_low = m_resident_cycle_low;
 		m_resident_vtlb_qword_guard_offset = static_cast<size_t>(-1);
 		m_resident_vtlb_qword_handler_fallback = static_cast<size_t>(-1);
 		m_resident_vtlb_qword_dirty_pins = {};
@@ -8191,8 +8215,18 @@ namespace VitaEE
 		// Wait-loop blocks keep the nextEventCycle low word live in HOST_TMP2
 		// for the fast-forward taken tail.
 		const size_t cycle_compare_target = m_code.Size();
-		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
-			!m_code.EmitSubReg(wait_loop_taken ? HOST_TMP1 : HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+		if (m_resident_next_event_low && !wait_loop_taken)
+		{
+			if (!m_code.EmitSubReg(HOST_TMP1, HOST_TMP0, HOST_TMP2, true))
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentNextEventLowHotInstructionsElided++;
+#endif
+		}
+		else if (!m_code.EmitLdrImm12(
+				 HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			 !m_code.EmitSubReg(
+				 wait_loop_taken ? HOST_TMP1 : HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
 		{
 			return false;
 		}
@@ -25332,6 +25366,14 @@ namespace VitaEE
 			}
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuResidentCycleLowColdReloadInstructions++;
+#endif
+		}
+		if (m_resident_next_event_low)
+		{
+			if (!EmitReloadResidentNextEventLow())
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentNextEventLowColdReloadInstructions++;
 #endif
 		}
 		if (m_resident_raw_gpr0_qword && tail.rt == 0)
