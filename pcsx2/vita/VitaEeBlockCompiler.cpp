@@ -107,6 +107,7 @@ u32 g_qemuResidentVtlbQwordPointerGuardInstructions = 0;
 u32 g_qemuResidentVtlbQwordPointerTranslationInstructions = 0;
 u32 g_qemuResidentVtlbQwordPointerHotInstructionsElided = 0;
 u32 g_qemuResidentVtlbQwordPointerColdInvalidationInstructions = 0;
+u32 g_qemuResidentVtlbQwordPointerPostIncrementStores = 0;
 u32 g_qemuResidentCycleLowBlocks = 0;
 u32 g_qemuResidentCycleLowHotInstructionsElided = 0;
 u32 g_qemuResidentCycleLowSyncInstructions = 0;
@@ -6206,17 +6207,16 @@ namespace VitaEE
 		// one indexed host store and recovers faults out of line. Vita cannot
 		// reserve a 4 GiB fastmem window, so retain the translated qword pointer
 		// in caller-saved r3 across this exact self-edge and re-run vTLB only when
-		// advancing makes its page offset zero. Direct VTLB mappings preserve the
+		// its post-store page offset is zero. Direct VTLB mappings preserve the
 		// guest page offset in their page-aligned host pointer. Handler tails poison
-		// r3 to -16; the same advance/offset guard then forces retranslation.
+		// r3 to zero, so the same offset guard forces retranslation.
 		const size_t canonical_retranslate = m_code.EmitBranchPlaceholder();
 		if (canonical_retranslate == static_cast<size_t>(-1))
 			return false;
 
 		m_resident_vtlb_qword_guard_offset = m_code.Size();
 		const size_t guard_start = m_code.Size();
-		if (!m_code.EmitAddImm32(HOST_TMP3, HOST_TMP3, 16) ||
-			!m_code.EmitTstImm32(HOST_TMP3, vtlb_private::VTLB_PAGE_MASK & ~0x0fu))
+		if (!m_code.EmitTstImm32(HOST_TMP3, vtlb_private::VTLB_PAGE_MASK & ~0x0fu))
 		{
 			return false;
 		}
@@ -21409,7 +21409,8 @@ namespace VitaEE
 		const unsigned rt = RT(op);
 		constexpr unsigned NEON_VALUE = 0;
 
-		const auto emit_store_to_host = [&](unsigned host_address = HOST_TMP0) -> bool
+		const auto emit_store_to_host = [&](unsigned host_address = HOST_TMP0,
+			bool writeback = false) -> bool
 		{
 			if (rt == 0)
 			{
@@ -21420,7 +21421,9 @@ namespace VitaEE
 					g_qemuResidentRawGpr0QwordHotInstructionsElided +=
 						m_resident_raw_gpr0_entry_instructions;
 #endif
-					return m_code.EmitVst1Q32Aligned(NEON_VALUE, host_address);
+					return writeback ?
+						m_code.EmitVst1Q32AlignedWriteback(NEON_VALUE, host_address) :
+						m_code.EmitVst1Q32Aligned(NEON_VALUE, host_address);
 				}
 
 				if (!EmitLoadRawGpr0KnownZeroFlag(HOST_TMP1) ||
@@ -21475,10 +21478,11 @@ namespace VitaEE
 
 		if (m_resident_vtlb_qword_pointer && op == m_resident_vtlb_qword_store_op)
 		{
-			if (!emit_store_to_host(HOST_TMP3))
+			if (!emit_store_to_host(HOST_TMP3, true))
 				return false;
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuResidentVtlbQwordPointerStores++;
+			g_qemuResidentVtlbQwordPointerPostIncrementStores++;
 			if (m_resident_vtlb_qword_translation_instructions >=
 				m_resident_vtlb_qword_guard_instructions)
 			{
@@ -25502,11 +25506,11 @@ namespace VitaEE
 		}
 		if (m_resident_vtlb_qword_pointer && tail.rt == 0)
 		{
-			// The resident entry advances r3 by one qword before testing its page
-			// offset. -16 therefore becomes zero and forces the full vTLB path
-			// after any handler call, including handler-to-direct page transitions.
+			// Direct stores advance r3 by one qword through NEON writeback. A handler
+			// bypasses that store, so zero forces the full vTLB path on the next
+			// resident entry, including handler-to-direct page transitions.
 			const size_t invalidate_start = m_code.Size();
-			if (!m_code.EmitMovImm32(HOST_TMP3, 0xfffffff0u))
+			if (!m_code.EmitMovImm8(HOST_TMP3, 0))
 				return false;
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuResidentVtlbQwordPointerColdInvalidationInstructions +=

@@ -71,6 +71,8 @@ namespace VitaA32
 		constexpr u32 VLD1_32_Q_ALIGNED = 0xf4200aafu;
 		constexpr u32 VST1_32_Q = 0xf4000a8fu;
 		constexpr u32 VST1_32_Q_ALIGNED = 0xf4000aafu;
+		// Rm=13 selects immediate writeback by the 16-byte transfer size.
+		constexpr u32 VST1_32_Q_ALIGNED_WRITEBACK = 0xf4000aadu;
 		constexpr u32 VST1_32_D = 0xf400078fu;
 		constexpr u32 VST1_32_D_LANE = 0xf480080fu;
 		constexpr u32 VST1_8_D_LANE0 = 0xf480000fu;
@@ -1248,6 +1250,13 @@ namespace VitaA32
 		if (!IsQRegister(qd) || !IsLowRegister(rn))
 			return false;
 		return EmitU32(EncodeVst1Q32Aligned(MapNeonQRegister(qd), rn));
+	}
+
+	bool CodeBuffer::EmitVst1Q32AlignedWriteback(unsigned qd, unsigned rn)
+	{
+		if (!IsQRegister(qd) || !IsLowRegister(rn))
+			return false;
+		return EmitU32(EncodeVst1Q32AlignedWriteback(MapNeonQRegister(qd), rn));
 	}
 
 	bool CodeBuffer::EmitVst1D32(unsigned dd, unsigned rn)
@@ -2689,6 +2698,13 @@ namespace VitaA32
 		pxAssert(IsQRegister(qd));
 		pxAssert(IsLowRegister(rn));
 		return VST1_32_Q_ALIGNED | ((rn & 0xfu) << 16) | NeonQd(qd);
+	}
+
+	u32 EncodeVst1Q32AlignedWriteback(unsigned qd, unsigned rn)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsLowRegister(rn));
+		return VST1_32_Q_ALIGNED_WRITEBACK | ((rn & 0xfu) << 16) | NeonQd(qd);
 	}
 
 	u32 EncodeVst1D32(unsigned dd, unsigned rn)

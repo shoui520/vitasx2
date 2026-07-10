@@ -158,6 +158,7 @@ namespace VitaA32
 		bool EmitVld1Q32Aligned(unsigned qd, unsigned rn);
 		bool EmitVst1Q32(unsigned qd, unsigned rn);
 		bool EmitVst1Q32Aligned(unsigned qd, unsigned rn);
+		bool EmitVst1Q32AlignedWriteback(unsigned qd, unsigned rn);
 		bool EmitVst1D32(unsigned dd, unsigned rn);
 		bool EmitVst1D32Lane(unsigned dd, u8 lane, unsigned rn);
 		bool EmitVst1D8Lane0(unsigned dd, unsigned rn);
@@ -372,6 +373,7 @@ namespace VitaA32
 	u32 EncodeVld1Q32Aligned(unsigned qd, unsigned rn);
 	u32 EncodeVst1Q32(unsigned qd, unsigned rn);
 	u32 EncodeVst1Q32Aligned(unsigned qd, unsigned rn);
+	u32 EncodeVst1Q32AlignedWriteback(unsigned qd, unsigned rn);
 	u32 EncodeVst1D32(unsigned dd, unsigned rn);
 	u32 EncodeVst1D32Lane(unsigned dd, u8 lane, unsigned rn);
 	u32 EncodeVst1D8Lane0(unsigned dd, unsigned rn);
