@@ -180,7 +180,7 @@ namespace VitaEE
 			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
 			bool wait_loop_taken = false, bool defer_pc_writeback = false,
 			u32 direct_pc = 0, u32 taken_pc = 0, bool conditional_pc = false,
-			bool indirect_pc_writeback = false);
+			bool indirect_pc_writeback = false, bool preserve_dirty_taken_self_link = false);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
 			const void* event_exit, DirectLinkSlot* not_taken_link = nullptr,
 			DirectLinkSlot* taken_link = nullptr, bool wait_loop_taken = false,
@@ -199,7 +199,8 @@ namespace VitaEE
 		bool EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
 			bool defer_pc_writeback = false, u32 pc = 0);
 		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
-			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0);
+			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0,
+			bool sync_dirty_fallback = false);
 		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag,
 			const void* direct_exit, bool defer_pc_writeback = false);
 		bool EmitEventExitReturn(const void* event_exit);
@@ -571,9 +572,11 @@ namespace VitaEE
 			KnownVtlbFastPathKind kind = KnownVtlbFastPathKind::Scalar);
 		void UpdateGprConstStateAfterOpcode(u32 op, u32 pc);
 		void StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
-			bool allow_r10, bool allow_r11, bool prefer_dirty_writes);
+			bool allow_r10, bool allow_r11, bool prefer_dirty_writes,
+			bool preserve_dirty_self_link);
 		void StageGprQCacheForBlock(u32 start_pc, u32 instruction_count);
 		bool BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const;
+		void MarkGprPinsDirtyAtResidentSelfLinkEntry(u32 start_pc, u32 instruction_count);
 		u8 GprPinEntryLoadInstructionCount() const;
 		bool EmitGprPinLoads();
 		bool EmitGprQCacheEntryLoads();

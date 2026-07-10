@@ -3422,6 +3422,27 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockHasExactConditionalSelfLink(u32 start_pc, u32 instruction_count)
+	{
+		if (instruction_count < 2)
+			return false;
+
+		const u32 branch_pc = start_pc + (instruction_count - 2) * sizeof(u32);
+		const u32 branch_op = memRead32(branch_pc);
+		if (!BlockCompiler::IsSupportedBranchOpcode(branch_op) ||
+			IsBranchLikelyOpcode(branch_op))
+		{
+			return false;
+		}
+
+		// Register and absolute jumps do not carry a conditional taken edge.
+		// Every remaining supported branch form uses BranchTarget()'s signed
+		// PC-relative displacement.
+		const unsigned opcode = branch_op >> 26;
+		return opcode != 0x00 && opcode != 0x02 && opcode != 0x03 &&
+			BranchTarget(branch_pc, branch_op) == start_pc;
+	}
+
 	bool UpdateGprPinEntryLiveness(u32 op, u32& defined, u32& live_in_reads)
 	{
 		// PCSX2 owners: R5900OpcodeImpl.cpp scalar ALU/shift/move/mult-div
@@ -5427,7 +5448,8 @@ namespace VitaEE
 	}
 
 	void BlockCompiler::StageGprPinsForBlock(u32 start_pc, u32 instruction_count, bool allow_r7, bool allow_r8,
-		bool allow_r10, bool allow_r11, bool prefer_dirty_writes)
+		bool allow_r10, bool allow_r11, bool prefer_dirty_writes,
+		bool preserve_dirty_self_link)
 	{
 		m_staged_pin_count = 0;
 
@@ -5437,6 +5459,8 @@ namespace VitaEE
 		u16 dword_write_counts[32]{};
 		u32 entry_defined = 1;
 		u32 entry_live_in_reads = 0;
+		u32 self_link_defined = 1;
+		u32 self_link_live_in_reads = 0;
 		bool scanning_entry_liveness = prefer_dirty_writes;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
@@ -5452,12 +5476,19 @@ namespace VitaEE
 				return;
 
 			for (unsigned read = 0; read < info.low_read_count; read++)
-				read_counts[info.low_reads[read]]++;
+			{
+				const unsigned guest_reg = info.low_reads[read];
+				read_counts[guest_reg]++;
+				if ((self_link_defined & (1u << guest_reg)) == 0)
+					self_link_live_in_reads |= 1u << guest_reg;
+			}
 			for (unsigned read = 0; read < info.dword_read_count; read++)
 			{
 				const unsigned guest_reg = info.dword_reads[read];
 				read_counts[guest_reg]++;
 				dword_read_counts[guest_reg]++;
+				if ((self_link_defined & (1u << guest_reg)) == 0)
+					self_link_live_in_reads |= 1u << guest_reg;
 			}
 
 			if (prefer_dirty_writes)
@@ -5467,11 +5498,12 @@ namespace VitaEE
 					return;
 
 				for (unsigned write = 0; write < dirty_info.write_count; write++)
-	{
+				{
 					const unsigned guest_reg = dirty_info.writes[write];
 					write_counts[guest_reg]++;
 					dword_write_counts[guest_reg]++;
-	}
+					self_link_defined |= 1u << guest_reg;
+				}
 			}
 		}
 		const u32 dead_entry_values = entry_defined & ~entry_live_in_reads;
@@ -5538,13 +5570,22 @@ namespace VitaEE
 			return *high_slot < host_count;
 		};
 
+		// A read-before-write value carried by an exact native self-edge repays
+		// its entry load across iterations, so rank it ahead of block-local reuse
+		// without changing the ordinary three-write profitability threshold.
+		constexpr u16 SELF_LINK_WRITE_PRIORITY = 0x4000u;
 		while (used_hosts + 1 < host_count)
 		{
 			unsigned best_reg = 0;
 			u16 best_count = 1; // one low64 read only trades the entry loads for moves
 			for (unsigned reg = 1; reg < 32; reg++)
 			{
-				const u16 write_score = dword_write_counts[reg] >= 3 ? dword_write_counts[reg] : 0;
+				const bool self_carried_write = preserve_dirty_self_link &&
+					dword_write_counts[reg] != 0 &&
+					(self_link_live_in_reads & (1u << reg)) != 0;
+				const u16 write_score = self_carried_write ?
+					static_cast<u16>(SELF_LINK_WRITE_PRIORITY + dword_write_counts[reg]) :
+					(dword_write_counts[reg] >= 3 ? dword_write_counts[reg] : 0);
 				const u16 score = (dword_read_counts[reg] > write_score) ?
 									  dword_read_counts[reg] :
 									  write_score;
@@ -5591,7 +5632,12 @@ namespace VitaEE
 			u16 best_count = 1; // a single read only trades the entry load for the read
 			for (unsigned reg = 1; reg < 32; reg++)
 			{
-				const u16 write_score = write_counts[reg] >= 3 ? write_counts[reg] : 0;
+				const bool self_carried_write = preserve_dirty_self_link &&
+					write_counts[reg] != 0 &&
+					(self_link_live_in_reads & (1u << reg)) != 0;
+				const u16 write_score = self_carried_write ?
+					static_cast<u16>(SELF_LINK_WRITE_PRIORITY + write_counts[reg]) :
+					(write_counts[reg] >= 3 ? write_counts[reg] : 0);
 				const u16 score = (read_counts[reg] > write_score) ? read_counts[reg] : write_score;
 				if (score > best_count)
 	{
@@ -5734,6 +5780,35 @@ namespace VitaEE
 		}
 
 		return false;
+	}
+
+	void BlockCompiler::MarkGprPinsDirtyAtResidentSelfLinkEntry(u32 start_pc,
+		u32 instruction_count)
+	{
+		// PCSX2 iCore MODE_WRITE mappings remain authoritative in their host
+		// registers until an explicit writeback seam. Compilation begins at the
+		// canonical clean entry, but an exact resident self-edge reaches the same
+		// body with the previous iteration's deferred values still in its pins.
+		// Mark every pinned block writer dirty from that join so a memory-handler
+		// cold edge before the first current-iteration write synchronizes the
+		// inherited value.
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			DirtyGprPinOpInfo info;
+			if (!ClassifyOpcodeForDirtyGprPins(memRead32(start_pc + i * 4), &info))
+				return;
+
+			for (unsigned write = 0; write < info.write_count; write++)
+			{
+				const int pin_index = FindGprPinIndex(info.writes[write]);
+				if (pin_index < 0)
+					continue;
+
+				m_pin_dirty_low[pin_index] = true;
+				if (m_pin_high_host[pin_index] != NO_GPR_PIN_HOST)
+					m_pin_dirty_high[pin_index] = true;
+			}
+		}
 	}
 
 	int BlockCompiler::FindGprPinIndex(unsigned guest_reg) const
@@ -6577,17 +6652,27 @@ namespace VitaEE
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
 		const bool linked_entry_needs_pc_sync = BlockNeedsLinkedPcSync(start_pc, instruction_count);
 		const bool dirty_pins_candidate = BlockCanUseDirtyGprPins(start_pc, instruction_count);
+		const bool dirty_self_link_shape_candidate = persistent_dispatch_exits && direct_links &&
+			dirty_pins_candidate && BlockHasExactConditionalSelfLink(start_pc, instruction_count);
 		const bool persistent_vtlb_registers = persistent_dispatch_exits;
 		m_dirty_pins_enabled = false;
 		m_gpr_q_cache_enabled = BlockShouldUseGprQCache(start_pc, instruction_count);
+		StageGprQCacheForBlock(start_pc, instruction_count);
+		// A staged qcache reload occurs after the resident scalar-pin entry. Until
+		// exact self-links can carry or synchronize overlapping qregs, keep their
+		// backing state authoritative through the ordinary exit flush. Merely using
+		// the qcache within a block is safe when it has no entry reloads (for example,
+		// SQ zero in the measured zero-fill loop).
+		const bool dirty_self_link_candidate = dirty_self_link_shape_candidate &&
+			m_staged_gpr_q_cache_count == 0;
 		// r7/r8 are a chain-wide vTLB ABI under the persistent dispatcher, even
 		// for blocks without memory operations: letting an arithmetic block pin a
 		// guest value there would poison the next linked memory block.
 		StageGprPinsForBlock(start_pc, instruction_count,
 			!use_vtlb_registers && !persistent_vtlb_registers,
 			!use_vtlb_registers && !persistent_vtlb_registers,
-			!use_cop1_exponent_mask_register, !use_vu0_base_register, dirty_pins_candidate);
-		StageGprQCacheForBlock(start_pc, instruction_count);
+			!use_cop1_exponent_mask_register, !use_vu0_base_register, dirty_pins_candidate,
+			dirty_self_link_candidate);
 		if (linked_entry_offset)
 			*linked_entry_offset = 0;
 
@@ -6605,6 +6690,10 @@ namespace VitaEE
 		// hook's GPR4 argument load; the hook's helpers are AAPCS calls that
 		// preserve the callee-saved pin hosts and never write the GPR file.
 		const u8 gpr_pin_entry_loads = GprPinEntryLoadInstructionCount();
+		const bool preserve_dirty_self_link = dirty_self_link_candidate &&
+			m_dirty_pins_enabled && gpr_pin_entry_loads != 0;
+		if (preserve_dirty_self_link)
+			MarkGprPinsDirtyAtResidentSelfLinkEntry(start_pc, instruction_count);
 		if (!EmitGprPinLoads())
 			return false;
 		if (persistent_dispatch_exits && gpr_pin_entry_loads != 0)
@@ -7213,7 +7302,7 @@ namespace VitaEE
 				has_register_branch_target ? direct_linking_enabled_flag : nullptr,
 				wait_loop_taken, defer_pc_writeback,
 				direct_pc, branch_target_pc, has_static_conditional_direct_links,
-				defer_indirect_pc_writeback))
+				defer_indirect_pc_writeback, preserve_dirty_self_link))
 		{
 			return false;
 		}
@@ -7404,7 +7493,8 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
-		DirectLinkSlot* direct_link, bool defer_pc_writeback, u32 pc)
+		DirectLinkSlot* direct_link, bool defer_pc_writeback, u32 pc,
+		bool sync_dirty_fallback)
 	{
 		if (!direct_exit || target_branch == static_cast<size_t>(-1))
 			return false;
@@ -7414,6 +7504,7 @@ namespace VitaEE
 		// branch when the guest branch is taken.
 		const size_t fallback_offset = m_code.Size();
 		if (!m_code.PatchBranch(target_branch, fallback_offset, VitaA32::Condition::NE) ||
+			(sync_dirty_fallback && !EmitSyncGprPinsToBacking()) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
 			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
@@ -7665,12 +7756,15 @@ namespace VitaEE
 		DirectLinkSlot* direct_link, DirectLinkSlot* taken_link,
 		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
 		bool wait_loop_taken, bool defer_pc_writeback,
-		u32 direct_pc, u32 taken_pc, bool conditional_pc, bool indirect_pc_writeback)
+		u32 direct_pc, u32 taken_pc, bool conditional_pc, bool indirect_pc_writeback,
+		bool preserve_dirty_taken_self_link)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
 
-		if (!EmitFlushDirtyGprPins())
+		const bool carry_dirty_self_link = preserve_dirty_taken_self_link &&
+			taken_link && !wait_loop_taken;
+		if (!carry_dirty_self_link && !EmitFlushDirtyGprPins())
 			return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -7710,7 +7804,11 @@ namespace VitaEE
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback, direct_pc))
+			// The fall-through edge leaves this allocator contract. When the taken
+			// self-edge carries dirty pins, keep backing state authoritative before
+			// even a patched fall-through link.
+			if ((carry_dirty_self_link && !EmitSyncGprPinsToBacking()) ||
+				!EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback, direct_pc))
 				return false;
 
 			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
@@ -7726,13 +7824,14 @@ namespace VitaEE
 			else
 			{
 				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link,
-					defer_pc_writeback, taken_pc);
+					defer_pc_writeback, taken_pc, carry_dirty_self_link);
 			}
 
 			const size_t event_target = m_code.Size();
 			const size_t carry_branches[] = {carry_branch};
 			if (!taken_tail_ok ||
 				!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) ||
+				(carry_dirty_self_link && !EmitSyncGprPinsToBacking()) ||
 				!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc,
 					indirect_pc_writeback) ||
 				!EmitEventExitReturn(event_exit) ||
@@ -7769,6 +7868,7 @@ namespace VitaEE
 		const size_t event_target = m_code.Size();
 		const size_t carry_branches[] = {carry_branch};
 		return m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) &&
+			   (!carry_dirty_self_link || EmitSyncGprPinsToBacking()) &&
 			   EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc,
 				   indirect_pc_writeback) &&
 			   EmitEventExitReturn(event_exit) &&
