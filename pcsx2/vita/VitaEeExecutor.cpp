@@ -1013,7 +1013,6 @@ namespace VitaEE
 		RefreshRawGpr0KnownZero();
 		cpuRegs.pc = block.start_pc;
 		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
-		RefreshRawGpr0KnownZero();
 
 		BlockExitKind exit = BlockExitKind::Direct;
 		if (!DecodeExitKind(exit_value, &exit))
@@ -1024,7 +1023,10 @@ namespace VitaEE
 		// until the full VM scheduler/device state is initialized.
 		if (exit == BlockExitKind::Event && run_event_test_on_event_exit)
 			_cpuEventTest_Shared();
-		RefreshRawGpr0KnownZero();
+		// s_raw_gpr0_known_zero is consumed only by generated EE code. Native LD
+		// $zero write seams refresh it in-chain, and the next callable entry always
+		// derives it from cpuRegs before executing, so rescanning after the block
+		// and again after an event is redundant host work.
 
 		result->path = BlockExecutionPath::Compiled;
 		result->exit = exit;
