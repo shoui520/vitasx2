@@ -260,11 +260,17 @@ namespace VitaIOP
 		void ResetInstrumentationCounters();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		void SetDirectLinkingEnabled(bool enabled);
+		u32 GetCodeCacheResetCount() const { return m_code_cache_resets; }
+#if defined(VITASX2_QEMU_VALIDATION)
+		void SnapshotInstrumentation(BlockExecutionResult* result) const;
+#endif
 		static void SetTrustedSourceAuditEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
-		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result);
-		bool ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result);
+		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
+			bool publish_details = true);
+		bool ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result,
+			bool publish_details = true);
 
 	private:
 		// PCSX2 owner: x86/BaseblockEx.h::BaseBlocks() starts at 0x4000
@@ -399,7 +405,8 @@ namespace VitaIOP
 		void RewindCodeCache(size_t slice_offset);
 		u32 ResetForCachePressure();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count);
-		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result);
+		void PublishExecutionDetails(const CachedBlock& block, BlockExecutionResult* result) const;
+		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result, bool publish_details);
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
 		void PatchIncomingLinks(u32 target_pc, const void* target);
 		void UnlinkIncomingLinks(u32 target_pc);

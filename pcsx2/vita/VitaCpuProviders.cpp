@@ -764,7 +764,11 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 
 		VitaIOP::BlockExecutionResult result;
 		const u32 pc = psxRegs.pc;
-		if (!s_iop_a32_executor.ExecuteCompiledBlockAtPc(pc, &result))
+		// PCSX2 owner: x86/iR3000A.cpp::_DynGen_EnterRecompiledCode()
+		// deliberately avoids per-entry stack/parameter work. The product
+		// provider likewise requests only its consumed control/compile fields;
+		// diagnostics retain the full executor snapshot contract.
+		if (!s_iop_a32_executor.ExecuteCompiledBlockAtPc(pc, &result, false))
 		{
 			const u32 opcode = iopMemRead32(pc);
 			VitaIOP::BlockScanResult scan;
@@ -797,27 +801,12 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.compiled_instructions += result.instruction_count;
 			s_iop_a32_stats.native_instructions += result.native_instruction_count;
 			s_iop_a32_stats.helper_instructions += result.helper_instruction_count;
+			s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
 		}
 		if (result.lookup_hit)
 			s_iop_a32_stats.lookup_hits++;
 		if (result.fast_dispatch_hit)
 			s_iop_a32_stats.fast_dispatch_hits++;
-		s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
-#if defined(VITASX2_QEMU_VALIDATION)
-		s_iop_a32_stats.hot_dispatch_cache_hits = result.hot_dispatch_cache_hits;
-		s_iop_a32_stats.hot_dispatch_cache_misses = result.hot_dispatch_cache_misses;
-		s_iop_a32_stats.validation_calls = result.validation_calls;
-		s_iop_a32_stats.validation_words = result.validation_words;
-		s_iop_a32_stats.raw_validation_calls = result.raw_validation_calls;
-		s_iop_a32_stats.raw_validation_words = result.raw_validation_words;
-		s_iop_a32_stats.translated_validation_words = result.translated_validation_words;
-		s_iop_a32_stats.wait_loop_configuration_checks = result.wait_loop_configuration_checks;
-		s_iop_a32_stats.trusted_source_hits = result.trusted_source_hits;
-		s_iop_a32_stats.trusted_source_audit_words = result.trusted_source_audit_words;
-		s_iop_a32_stats.trusted_source_audit_failures = result.trusted_source_audit_failures;
-		s_iop_a32_stats.ram_invalidation_calls = result.ram_invalidation_calls;
-		s_iop_a32_stats.ram_invalidation_record_visits = result.ram_invalidation_record_visits;
-#endif
 		if (result.wait_loop_fast_forward)
 			continue;
 
@@ -1049,6 +1038,24 @@ void VitaResetA32IopProviderStats()
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
 {
+	s_iop_a32_stats.code_cache_resets = s_iop_a32_executor.GetCodeCacheResetCount();
+#if defined(VITASX2_QEMU_VALIDATION)
+	VitaIOP::BlockExecutionResult snapshot{};
+	s_iop_a32_executor.SnapshotInstrumentation(&snapshot);
+	s_iop_a32_stats.hot_dispatch_cache_hits = snapshot.hot_dispatch_cache_hits;
+	s_iop_a32_stats.hot_dispatch_cache_misses = snapshot.hot_dispatch_cache_misses;
+	s_iop_a32_stats.validation_calls = snapshot.validation_calls;
+	s_iop_a32_stats.validation_words = snapshot.validation_words;
+	s_iop_a32_stats.raw_validation_calls = snapshot.raw_validation_calls;
+	s_iop_a32_stats.raw_validation_words = snapshot.raw_validation_words;
+	s_iop_a32_stats.translated_validation_words = snapshot.translated_validation_words;
+	s_iop_a32_stats.wait_loop_configuration_checks = snapshot.wait_loop_configuration_checks;
+	s_iop_a32_stats.trusted_source_hits = snapshot.trusted_source_hits;
+	s_iop_a32_stats.trusted_source_audit_words = snapshot.trusted_source_audit_words;
+	s_iop_a32_stats.trusted_source_audit_failures = snapshot.trusted_source_audit_failures;
+	s_iop_a32_stats.ram_invalidation_calls = snapshot.ram_invalidation_calls;
+	s_iop_a32_stats.ram_invalidation_record_visits = snapshot.ram_invalidation_record_visits;
+#endif
 	return s_iop_a32_stats;
 }
 

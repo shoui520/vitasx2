@@ -6461,7 +6461,48 @@ namespace VitaIOP
 		}
 	}
 
-	bool BlockExecutor::RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result)
+	void BlockExecutor::PublishExecutionDetails(
+		const CachedBlock& block, BlockExecutionResult* result) const
+	{
+		result->instruction_count = block.instruction_count;
+		result->native_instruction_count = block.native_instruction_count;
+		result->helper_instruction_count = block.helper_instruction_count;
+		result->code_size = block.code.Size();
+		result->block_records = static_cast<u32>(m_block_records.size());
+		result->link_records = static_cast<u32>(m_incoming_links.size());
+		result->cache_slots = static_cast<u32>(m_cache.size());
+		result->code_cache_resets = m_code_cache_resets;
+		result->code_cache_used = m_code_cache_used;
+		result->code_cache_capacity = m_code_cache_capacity;
+#if defined(VITASX2_QEMU_VALIDATION)
+		SnapshotInstrumentation(result);
+#endif
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	void BlockExecutor::SnapshotInstrumentation(BlockExecutionResult* result) const
+	{
+		if (!result)
+			return;
+
+		result->hot_dispatch_cache_hits = m_hot_dispatch_cache_hits;
+		result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
+		result->validation_calls = m_validation_calls;
+		result->validation_words = m_validation_words;
+		result->raw_validation_calls = m_raw_validation_calls;
+		result->raw_validation_words = m_raw_validation_words;
+		result->translated_validation_words = m_translated_validation_words;
+		result->wait_loop_configuration_checks = m_wait_loop_configuration_checks;
+		result->trusted_source_hits = m_trusted_source_hits;
+		result->trusted_source_audit_words = m_trusted_source_audit_words;
+		result->trusted_source_audit_failures = m_trusted_source_audit_failures;
+		result->ram_invalidation_calls = m_ram_invalidation_calls;
+		result->ram_invalidation_record_visits = m_ram_invalidation_record_visits;
+	}
+#endif
+
+	bool BlockExecutor::RunValidatedBlock(
+		CachedBlock& block, BlockExecutionResult* result, bool publish_details)
 	{
 		if (!result || !block.valid)
 			return false;
@@ -6478,31 +6519,14 @@ namespace VitaIOP
 			(block.poll_call_wait_loop ? TryFastForwardPollCallWaitLoop(block) :
 									TryFastForwardWaitLoopAtPc(block.start_pc)))
 		{
-			result->exit = BlockExitKind::Direct;
-			result->instruction_count = block.instruction_count;
-			result->native_instruction_count = block.native_instruction_count;
-			result->helper_instruction_count = block.helper_instruction_count;
-			result->code_size = block.code.Size();
-			result->block_records = static_cast<u32>(m_block_records.size());
-			result->link_records = static_cast<u32>(m_incoming_links.size());
-			result->cache_slots = static_cast<u32>(m_cache.size());
-			result->code_cache_resets = m_code_cache_resets;
-			result->code_cache_used = m_code_cache_used;
-			result->code_cache_capacity = m_code_cache_capacity;
+			if (publish_details)
+			{
+				result->exit = BlockExitKind::Direct;
+				PublishExecutionDetails(block, result);
+			}
 #if defined(VITASX2_QEMU_VALIDATION)
-			result->hot_dispatch_cache_hits = m_hot_dispatch_cache_hits;
-			result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
-			result->validation_calls = m_validation_calls;
-			result->validation_words = m_validation_words;
-			result->raw_validation_calls = m_raw_validation_calls;
-			result->raw_validation_words = m_raw_validation_words;
-			result->translated_validation_words = m_translated_validation_words;
-			result->wait_loop_configuration_checks = m_wait_loop_configuration_checks;
-			result->trusted_source_hits = m_trusted_source_hits;
-			result->trusted_source_audit_words = m_trusted_source_audit_words;
-			result->trusted_source_audit_failures = m_trusted_source_audit_failures;
-			result->ram_invalidation_calls = m_ram_invalidation_calls;
-			result->ram_invalidation_record_visits = m_ram_invalidation_record_visits;
+			else
+				result->instruction_count = block.instruction_count;
 #endif
 			result->wait_loop_fast_forward = true;
 			return true;
@@ -6514,36 +6538,20 @@ namespace VitaIOP
 		if (!DecodeExitKind(exit_value, &exit))
 			return false;
 
-		result->exit = exit;
-		result->instruction_count = block.instruction_count;
-		result->native_instruction_count = block.native_instruction_count;
-		result->helper_instruction_count = block.helper_instruction_count;
-		result->code_size = block.code.Size();
-		result->block_records = static_cast<u32>(m_block_records.size());
-		result->link_records = static_cast<u32>(m_incoming_links.size());
-		result->cache_slots = static_cast<u32>(m_cache.size());
-		result->code_cache_resets = m_code_cache_resets;
-		result->code_cache_used = m_code_cache_used;
-		result->code_cache_capacity = m_code_cache_capacity;
+		if (publish_details)
+		{
+			result->exit = exit;
+			PublishExecutionDetails(block, result);
+		}
 #if defined(VITASX2_QEMU_VALIDATION)
-		result->hot_dispatch_cache_hits = m_hot_dispatch_cache_hits;
-		result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
-		result->validation_calls = m_validation_calls;
-		result->validation_words = m_validation_words;
-		result->raw_validation_calls = m_raw_validation_calls;
-		result->raw_validation_words = m_raw_validation_words;
-		result->translated_validation_words = m_translated_validation_words;
-		result->wait_loop_configuration_checks = m_wait_loop_configuration_checks;
-		result->trusted_source_hits = m_trusted_source_hits;
-		result->trusted_source_audit_words = m_trusted_source_audit_words;
-		result->trusted_source_audit_failures = m_trusted_source_audit_failures;
-		result->ram_invalidation_calls = m_ram_invalidation_calls;
-		result->ram_invalidation_record_visits = m_ram_invalidation_record_visits;
+		else
+			result->instruction_count = block.instruction_count;
 #endif
 		return true;
 	}
 
-	bool BlockExecutor::ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result)
+	bool BlockExecutor::ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
+		BlockExecutionResult* result, bool publish_details)
 	{
 		if (!result || instruction_count == 0 ||
 			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -6562,7 +6570,7 @@ namespace VitaIOP
 		{
 			result->cache_hit = true;
 			result->lookup_hit = lookup_hit;
-			return RunValidatedBlock(*block, result);
+			return RunValidatedBlock(*block, result, publish_details);
 		}
 
 		block = AllocateCacheEntry();
@@ -6571,10 +6579,19 @@ namespace VitaIOP
 
 		result->cache_hit = false;
 		result->lookup_hit = false;
-		return RunValidatedBlock(*block, result);
+		const bool ran = RunValidatedBlock(*block, result, publish_details);
+		if (ran && !publish_details)
+		{
+			result->instruction_count = block->instruction_count;
+			result->native_instruction_count = block->native_instruction_count;
+			result->helper_instruction_count = block->helper_instruction_count;
+			result->code_cache_resets = m_code_cache_resets;
+		}
+		return ran;
 	}
 
-	bool BlockExecutor::ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result)
+	bool BlockExecutor::ExecuteCompiledBlockAtPc(
+		u32 start_pc, BlockExecutionResult* result, bool publish_details)
 	{
 		if (!result || (start_pc & 0x3u) != 0)
 			return false;
@@ -6600,7 +6617,7 @@ namespace VitaIOP
 				result->cache_hit = true;
 				result->lookup_hit = true;
 				result->fast_dispatch_hit = true;
-				return RunValidatedBlock(*entry, result);
+				return RunValidatedBlock(*entry, result, publish_details);
 			}
 		}
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -6616,7 +6633,7 @@ namespace VitaIOP
 				result->cache_hit = true;
 				result->lookup_hit = true;
 				result->fast_dispatch_hit = true;
-				return RunValidatedBlock(*entry, result);
+				return RunValidatedBlock(*entry, result, publish_details);
 			}
 		}
 
@@ -6625,7 +6642,7 @@ namespace VitaIOP
 			RegisterHotDispatchCache(*entry);
 			result->cache_hit = true;
 			result->fast_dispatch_hit = true;
-			return RunValidatedBlock(*entry, result);
+			return RunValidatedBlock(*entry, result, publish_details);
 		}
 
 		BlockScanResult scan;
@@ -6635,6 +6652,6 @@ namespace VitaIOP
 			return false;
 		}
 
-		return ExecuteCompiledBlock(start_pc, scan.instruction_count, result);
+		return ExecuteCompiledBlock(start_pc, scan.instruction_count, result, publish_details);
 	}
 } // namespace VitaIOP
