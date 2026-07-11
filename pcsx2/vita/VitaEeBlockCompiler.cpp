@@ -126,6 +126,12 @@ u32 g_qemuCompatibleVtlbPointerPostIncrementLoads = 0;
 u32 g_qemuCompatibleVtlbPointerColdInvalidationInstructions = 0;
 u32 g_qemuCompatibleVtlbBytePairRepeatedTranslationInstructionsElided = 0;
 u32 g_qemuCompatibleVtlbBytePairHandlerSeeds = 0;
+u32 g_qemuCompatibleVtlbWritePointerBlocks = 0;
+u32 g_qemuCompatibleVtlbWritePointerGuardInstructions = 0;
+u32 g_qemuCompatibleVtlbWritePointerTranslationInstructions = 0;
+u32 g_qemuCompatibleVtlbWritePointerHotInstructionsElided = 0;
+u32 g_qemuCompatibleVtlbWritePointerPostIncrementStores = 0;
+u32 g_qemuCompatibleVtlbWritePointerColdInvalidations = 0;
 u32 g_qemuCompatiblePredicateBlocks = 0;
 u32 g_qemuCompatiblePredicateCanonicalInstructions = 0;
 u32 g_qemuCompatiblePredicateLinkedInstructionsElided = 0;
@@ -3514,24 +3520,43 @@ namespace VitaEE
 
 	bool GprLinkSignature::IsValid() const
 	{
+		const auto valid_pointer = [](const VtlbPointerLinkMapping& pointer,
+			u8 expected_host, VtlbPointerLinkDirection expected_direction) {
+			if (!pointer.IsValid())
+				return true;
+			if (pointer.host != expected_host || pointer.guest_address == 0 ||
+				pointer.guest_address >= 32 || pointer.guest_result >= 32 ||
+				pointer.guest_result2 >= 32 || pointer.direction != expected_direction ||
+				pointer.representation != VtlbPointerLinkRepresentation::DirectHostAddress ||
+				pointer.provenance != VtlbPointerLinkProvenance::VtlbVirtualMapping)
+			{
+				return false;
+			}
+
+			if (expected_direction == VtlbPointerLinkDirection::Write)
+			{
+				return pointer.width == VtlbPointerLinkWidth::Byte8 &&
+					pointer.guest_result2 == 0 && pointer.stride == 1;
+			}
+
+			return (pointer.width == VtlbPointerLinkWidth::Word32 &&
+					pointer.guest_result != 0 && pointer.guest_result2 == 0 &&
+					pointer.stride == 4) ||
+				(pointer.width == VtlbPointerLinkWidth::BytePair8 &&
+					pointer.guest_result != 0 && pointer.guest_result2 != 0 &&
+					pointer.stride == 1);
+		};
 		if (count == 0 || count > MAX_PINS || block_count < 2 ||
 			block_count > MAX_BLOCKS ||
 			(scheduler.IsValid() && scheduler.host != SCHEDULER_HOST) ||
-			(vtlb_pointer.IsValid() &&
-				(vtlb_pointer.host != VTLB_POINTER_HOST ||
-				 vtlb_pointer.guest_address == 0 || vtlb_pointer.guest_address >= 32 ||
-				 vtlb_pointer.guest_result >= 32 || vtlb_pointer.guest_result2 >= 32 ||
-				 vtlb_pointer.direction != VtlbPointerLinkDirection::Read ||
-				 vtlb_pointer.representation !=
-					 VtlbPointerLinkRepresentation::DirectHostAddress ||
-				 vtlb_pointer.provenance !=
-					 VtlbPointerLinkProvenance::VtlbVirtualMapping ||
-				 !((vtlb_pointer.width == VtlbPointerLinkWidth::Word32 &&
-					vtlb_pointer.guest_result != 0 &&
-					vtlb_pointer.guest_result2 == 0 && vtlb_pointer.stride == 4) ||
-				   (vtlb_pointer.width == VtlbPointerLinkWidth::BytePair8 &&
-					vtlb_pointer.guest_result != 0 &&
-					vtlb_pointer.guest_result2 != 0 && vtlb_pointer.stride == 1)))) ||
+			!valid_pointer(vtlb_pointer, VTLB_POINTER_HOST,
+				VtlbPointerLinkDirection::Read) ||
+			!valid_pointer(vtlb_write_pointer, VTLB_WRITE_POINTER_HOST,
+				VtlbPointerLinkDirection::Write) ||
+			(vtlb_write_pointer.IsValid() &&
+				(!vtlb_pointer.IsValid() ||
+				 vtlb_pointer.width != VtlbPointerLinkWidth::BytePair8 ||
+				 vtlb_write_pointer.guest_address == vtlb_pointer.guest_address)) ||
 			(predicate.IsValid() &&
 				(predicate.host != PREDICATE_HOST || predicate.guest == 0 ||
 				 predicate.guest >= 32 ||
@@ -3564,6 +3589,9 @@ namespace VitaEE
 		if ((vtlb_pointer.IsValid() &&
 				(!contains_block_pc(vtlb_pointer.access_pc) ||
 				 !contains_block_pc(vtlb_pointer.advance_pc))) ||
+			(vtlb_write_pointer.IsValid() &&
+				(!contains_block_pc(vtlb_write_pointer.access_pc) ||
+				 !contains_block_pc(vtlb_write_pointer.advance_pc))) ||
 			(predicate.IsValid() &&
 				(!contains_block_pc(predicate.producer_block_pc) ||
 				 !contains_block_pc(predicate.consumer_pc))))
@@ -3571,7 +3599,8 @@ namespace VitaEE
 			return false;
 		}
 
-		u16 host_mask = 0;
+		u16 host_mask = vtlb_write_pointer.IsValid() ?
+			static_cast<u16>(1u << VTLB_WRITE_POINTER_HOST) : 0;
 		const auto valid_mapping_host = [](u8 host) {
 			return host == 1 || host == 3 ||
 				(host >= FIRST_HOST && host <= LAST_CALLEE_HOST) ||
@@ -4170,6 +4199,86 @@ namespace VitaEE
 			}
 			if (!address_is_mapped)
 				return false;
+		}
+
+		// The measured byte-copy cycle's taken route consumes the unsigned byte
+		// immediately in a destination SB and advances that destination by one in
+		// the same block. PCSX2 recStore(8) keeps the source value allocated while
+		// DynGen_PrepRegs()/DynGen_DirectWrite() form and consume the destination.
+		// Give that independent stream an r3 direct-host pointer. Requiring the SB
+		// at the destination block entry makes every preceding instruction's r3
+		// liveness explicit; the existing byte-pair opcode audit then owns the rest
+		// of the compatible cycle.
+		if (signature->vtlb_pointer.IsValid() &&
+			signature->vtlb_pointer.width == VtlbPointerLinkWidth::BytePair8)
+		{
+			const u32 write_pc = signature->vtlb_pointer.advance_pc;
+			u32 write_count = 0;
+			for (u8 block = 0; block < chain_block_count; block++)
+			{
+				if (chain_pcs[block] == write_pc)
+				{
+					write_count = chain_instruction_counts[block];
+					break;
+				}
+			}
+
+			if (write_count != 0)
+			{
+				const u32 store = memRead32(write_pc);
+				const unsigned base = RS(store);
+				if ((store >> 26) == 0x28 && base != 0 &&
+					base != signature->vtlb_pointer.guest_address &&
+					RT(store) == signature->vtlb_pointer.guest_result2)
+				{
+					u32 stores_from_base = 0;
+					u32 base_writes = 0;
+					bool advances_base = false;
+					for (u8 block = 0; block < chain_block_count; block++)
+					{
+						for (u32 i = 0; i < chain_instruction_counts[block]; i++)
+						{
+							const u32 op = memRead32(
+								chain_pcs[block] + i * sizeof(u32));
+							stores_from_base += (op >> 26) == 0x28 && RS(op) == base;
+
+							DirtyGprPinOpInfo write_info;
+							if (!ClassifyOpcodeForDirtyGprPins(op, &write_info))
+							{
+								base_writes = UINT32_MAX;
+								break;
+							}
+							for (unsigned write = 0; write < write_info.write_count; write++)
+							{
+								if (write_info.writes[write] != base)
+									continue;
+								base_writes++;
+								advances_base |= chain_pcs[block] == write_pc &&
+									(op >> 26) == 0x09 && RS(op) == base &&
+									RT(op) == base && IMM_S(op) == 1;
+							}
+						}
+					}
+
+					// Unlike the source pointer, the destination guest address need not
+					// consume a scarce r9-r11 pin. An unpinned ADDIU publishes its new
+					// architectural value immediately while r3 advances in lockstep;
+					// if allocation does select it, writes[] marks that mapping dirty and
+					// the ordinary compatible-edge publication contract still applies.
+					if (stores_from_base == 1 && base_writes == 1 && advances_base)
+					{
+						VtlbPointerLinkMapping& pointer = signature->vtlb_write_pointer;
+						pointer.host = GprLinkSignature::VTLB_WRITE_POINTER_HOST;
+						pointer.guest_address = static_cast<u8>(base);
+						pointer.guest_result = static_cast<u8>(RT(store));
+						pointer.stride = 1;
+						pointer.access_pc = write_pc;
+						pointer.advance_pc = write_pc;
+						pointer.width = VtlbPointerLinkWidth::Byte8;
+						pointer.direction = VtlbPointerLinkDirection::Write;
+					}
+				}
+			}
 		}
 
 		// PCSX2 owners: x86/iCore.cpp's MODE_READ mappings and
@@ -7190,10 +7299,11 @@ namespace VitaEE
 			return true;
 
 		// Canonical/dispatcher entries cannot inherit the private r12 mapping.
-		// Compatible links jump past this poison after signature equality proves
-		// the pointer's guest register, width, direction, and vTLB provenance.
+		// The byte-copy signature also carries its independent r3 write mapping.
+		// Compatible links jump past these poisons after signature equality proves
+		// both pointers' guest registers, widths, directions, and vTLB provenance.
 		const size_t poison_start = m_code.Size();
-		if (!m_code.EmitMovImm8(GprLinkSignature::VTLB_POINTER_HOST, 0))
+		if (!EmitInvalidateCompatibleVtlbPointers())
 			return false;
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuCompatibleVtlbPointerCanonicalPoisonInstructions += static_cast<u32>(
@@ -7202,20 +7312,31 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::EmitStageCompatibleVtlbPointer()
+	bool BlockCompiler::EmitInvalidateCompatibleVtlbPointers()
 	{
-		if (!m_compatible_vtlb_pointer_access)
+		return (!m_gpr_link_signature.HasVtlbPointer() ||
+				m_code.EmitMovImm8(GprLinkSignature::VTLB_POINTER_HOST, 0)) &&
+			(!m_gpr_link_signature.HasVtlbWritePointer() ||
+				m_code.EmitMovImm8(GprLinkSignature::VTLB_WRITE_POINTER_HOST, 0));
+	}
+
+	bool BlockCompiler::EmitStageCompatibleVtlbPointerMapping(
+		const VtlbPointerLinkMapping& pointer, bool access,
+		size_t* unaligned_fallback, size_t* handler_fallback,
+		GprPinDirtyMasks* dirty_pins, bool write_pointer)
+	{
+		if (!access)
 			return true;
 
 		// PCSX2 owner: recVTLB.cpp::DynGen_PrepRegs()/DynGen_DirectRead(). r12
-		// carries the direct host address across compatible links. Word induction
-		// advances it by four; the measured byte-pair form advances it after the
-		// delay-slot LBU. The matching guest ADDIU in another chain member catches
-		// architectural state up. Direct VTLB mappings preserve the guest page
-		// offset, so low 12 bits zero means canonical entry, a poisoned helper
-		// result, or a page transition and forces exact retranslation.
+		// carries the direct read address across compatible links; PCSX2's matching
+		// DynGen_DirectWrite() mechanism uses r3 for the byte-copy destination.
+		// Post-indexed memory operations advance either private pointer and the
+		// matching guest ADDIU catches architectural state up. Direct VTLB mappings
+		// preserve the guest page offset, so low 12 bits zero means canonical entry,
+		// a poisoned helper result, or a page transition and forces retranslation.
 		const size_t guard_start = m_code.Size();
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, GprLinkSignature::VTLB_POINTER_HOST,
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, pointer.host,
 				VitaA32::ShiftType::LSL, 20, true))
 		{
 			return false;
@@ -7225,27 +7346,26 @@ namespace VitaEE
 			return false;
 		const size_t guard_end = m_code.Size();
 
-		const u32 op = memRead32(m_gpr_link_signature.vtlb_pointer.access_pc);
+		const u32 op = memRead32(pointer.access_pc);
 		const size_t translation_start = m_code.Size();
-		if (!EmitEffectiveAddress(op, GprLinkSignature::VTLB_POINTER_HOST))
+		if (!EmitEffectiveAddress(op, pointer.host))
 		{
 			return false;
 		}
-		if (m_gpr_link_signature.vtlb_pointer.width == VtlbPointerLinkWidth::Word32)
+		if (pointer.width == VtlbPointerLinkWidth::Word32)
 		{
-			if (!m_code.EmitAndImm8(HOST_TMP1,
-					GprLinkSignature::VTLB_POINTER_HOST, 3, true))
+			if (!unaligned_fallback || !m_code.EmitAndImm8(HOST_TMP1,
+					pointer.host, 3, true))
 			{
 				return false;
 			}
-			m_compatible_vtlb_pointer_unaligned_fallback =
-				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-			if (m_compatible_vtlb_pointer_unaligned_fallback == static_cast<size_t>(-1))
+			*unaligned_fallback = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (*unaligned_fallback == static_cast<size_t>(-1))
 				return false;
 		}
-		if (!EmitVtlbNonHandlerHostAddress(GprLinkSignature::VTLB_POINTER_HOST,
-				HOST_TMP1, HOST_TMP2, &m_compatible_vtlb_pointer_handler_fallback,
-				&m_compatible_vtlb_pointer_dirty_pins))
+		if (!handler_fallback || !dirty_pins ||
+			!EmitVtlbNonHandlerHostAddress(pointer.host, HOST_TMP1, HOST_TMP2,
+				handler_fallback, dirty_pins))
 		{
 			return false;
 		}
@@ -7261,23 +7381,56 @@ namespace VitaEE
 			(translation_end - translation_start) / sizeof(u32);
 		if (guard_instructions > UINT8_MAX || translation_instructions > UINT8_MAX)
 			return false;
-		m_compatible_vtlb_pointer_guard_instructions =
-			static_cast<u8>(guard_instructions);
-		m_compatible_vtlb_pointer_translation_instructions =
-			static_cast<u8>(translation_instructions);
-#if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuCompatibleVtlbPointerBlocks++;
-		g_qemuCompatibleVtlbPointerGuardInstructions +=
-			static_cast<u32>(guard_instructions);
-		g_qemuCompatibleVtlbPointerTranslationInstructions +=
-			static_cast<u32>(translation_instructions);
-		if (translation_instructions >= guard_instructions)
+		if (!write_pointer)
 		{
-			g_qemuCompatibleVtlbPointerHotInstructionsElided += static_cast<u32>(
-				translation_instructions - guard_instructions);
+			m_compatible_vtlb_pointer_guard_instructions =
+				static_cast<u8>(guard_instructions);
+			m_compatible_vtlb_pointer_translation_instructions =
+				static_cast<u8>(translation_instructions);
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (write_pointer)
+		{
+			g_qemuCompatibleVtlbWritePointerBlocks++;
+			g_qemuCompatibleVtlbWritePointerGuardInstructions +=
+				static_cast<u32>(guard_instructions);
+			g_qemuCompatibleVtlbWritePointerTranslationInstructions +=
+				static_cast<u32>(translation_instructions);
+			if (translation_instructions >= guard_instructions)
+			{
+				g_qemuCompatibleVtlbWritePointerHotInstructionsElided +=
+					static_cast<u32>(translation_instructions - guard_instructions);
+			}
+		}
+		else
+		{
+			g_qemuCompatibleVtlbPointerBlocks++;
+			g_qemuCompatibleVtlbPointerGuardInstructions +=
+				static_cast<u32>(guard_instructions);
+			g_qemuCompatibleVtlbPointerTranslationInstructions +=
+				static_cast<u32>(translation_instructions);
+			if (translation_instructions >= guard_instructions)
+			{
+				g_qemuCompatibleVtlbPointerHotInstructionsElided += static_cast<u32>(
+					translation_instructions - guard_instructions);
+			}
 		}
 #endif
 		return true;
+	}
+
+	bool BlockCompiler::EmitStageCompatibleVtlbPointer()
+	{
+		return EmitStageCompatibleVtlbPointerMapping(
+			m_gpr_link_signature.vtlb_pointer, m_compatible_vtlb_pointer_access,
+			&m_compatible_vtlb_pointer_unaligned_fallback,
+			&m_compatible_vtlb_pointer_handler_fallback,
+			&m_compatible_vtlb_pointer_dirty_pins, false) &&
+			EmitStageCompatibleVtlbPointerMapping(
+				m_gpr_link_signature.vtlb_write_pointer,
+				m_compatible_vtlb_write_pointer_access, nullptr,
+				&m_compatible_vtlb_write_pointer_handler_fallback,
+				&m_compatible_vtlb_write_pointer_dirty_pins, true);
 	}
 
 	bool BlockCompiler::EmitStageResidentSchedulerCountdown(bool preserve_for_translation)
@@ -8224,6 +8377,9 @@ namespace VitaEE
 		m_compatible_vtlb_pointer = m_gpr_link_signature.HasVtlbPointer();
 		m_compatible_vtlb_pointer_access = m_compatible_vtlb_pointer &&
 			start_pc == m_gpr_link_signature.vtlb_pointer.access_pc;
+		m_compatible_vtlb_write_pointer_access =
+			m_gpr_link_signature.HasVtlbWritePointer() &&
+			start_pc == m_gpr_link_signature.vtlb_write_pointer.access_pc;
 		m_compatible_predicate_consumer = m_gpr_link_signature.HasPredicate() &&
 			start_pc == m_gpr_link_signature.predicate.consumer_pc;
 		const u32 compatible_predicate_consumer_pc =
@@ -8256,6 +8412,8 @@ namespace VitaEE
 		m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_byte_pair_tail_index = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_dirty_pins = {};
+		m_compatible_vtlb_write_pointer_handler_fallback = static_cast<size_t>(-1);
+		m_compatible_vtlb_write_pointer_dirty_pins = {};
 		m_compatible_vtlb_pointer_guard_instructions = 0;
 		m_compatible_vtlb_pointer_translation_instructions = 0;
 		m_deferred_resident_unsigned_branch_suffix =
@@ -22923,6 +23081,42 @@ namespace VitaEE
 	bool BlockCompiler::EmitSB(u32 op)
 	{
 		const unsigned rt = RT(op);
+		const VtlbPointerLinkMapping& write_pointer =
+			m_gpr_link_signature.vtlb_write_pointer;
+		if (m_compatible_vtlb_write_pointer_access &&
+			write_pointer.width == VtlbPointerLinkWidth::Byte8 &&
+			op == memRead32(write_pointer.access_pc) &&
+			m_compatible_vtlb_write_pointer_handler_fallback !=
+				static_cast<size_t>(-1))
+		{
+			unsigned rt_host;
+			if (!EmitGprLowValueOperand(rt, HOST_TMP1, &rt_host) ||
+				!m_code.EmitStrbImm12PostIndex(rt_host, write_pointer.host,
+					write_pointer.stride))
+			{
+				return false;
+			}
+
+			ScalarStoreColdTail tail{
+				static_cast<size_t>(-1),
+				m_compatible_vtlb_write_pointer_handler_fallback,
+				m_code.Size(),
+				0,
+				0,
+				nullptr,
+				reinterpret_cast<const void*>(&memWrite8),
+				rt,
+				ScalarStoreWidth::Byte,
+			};
+			tail.address_reg = write_pointer.host;
+			tail.dirty_pins = m_compatible_vtlb_write_pointer_dirty_pins;
+			CaptureScalarStoreValue(&tail);
+			m_scalar_store_cold_tails.push_back(tail);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCompatibleVtlbWritePointerPostIncrementStores++;
+#endif
+			return true;
+		}
 
 		const auto emit_store_to_host = [&]() -> bool
 		{
@@ -25338,6 +25532,35 @@ namespace VitaEE
 			return EmitCompareGpr64WithKnownForBranch(lhs_guest_reg, rhs_low_value, rhs_high_value);
 		}
 
+		if (m_gpr_link_signature.HasVtlbWritePointer())
+		{
+			// r3 is the compatible destination pointer. Compare the right GPR a
+			// word at a time through r2 so a future allocator-score change cannot
+			// silently clobber that pointer in the cycle's BEQ/BNE/BEQL lowering.
+			unsigned lhs_low;
+			unsigned lhs_high;
+			unsigned rhs_low;
+			if (!EmitGpr64ReadOperands(lhs_guest_reg, HOST_TMP0, HOST_TMP1,
+					&lhs_low, &lhs_high) ||
+				!EmitGprLowOperand(rhs_guest_reg, HOST_TMP2, &rhs_low) ||
+				!m_code.EmitCmpReg(lhs_low, rhs_low))
+			{
+				return false;
+			}
+
+			const int rhs_high_pin = FindGprPinHighHost(rhs_guest_reg);
+			if (rhs_high_pin >= 0)
+			{
+				return m_code.EmitCmpReg(lhs_high,
+					static_cast<unsigned>(rhs_high_pin), VitaA32::Condition::EQ);
+			}
+
+			const size_t rhs_high_offset = GprOffset(rhs_guest_reg) + sizeof(u32);
+			return m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS,
+					static_cast<u16>(rhs_high_offset), VitaA32::Condition::EQ) &&
+				m_code.EmitCmpReg(lhs_high, HOST_TMP2, VitaA32::Condition::EQ);
+		}
+
 		unsigned lhs_low;
 		unsigned rhs_low;
 		unsigned lhs_high;
@@ -25846,7 +26069,16 @@ namespace VitaEE
 		const u32 imm_low = static_cast<u32>(imm);
 		const u32 imm_high = (imm < 0) ? 0xffffffffu : 0u;
 		const bool direct_result = FindGprPinHost(guest_reg) >= 0;
+		const bool preserve_write_pointer =
+			m_gpr_link_signature.HasVtlbWritePointer();
+		// The currently admitted two-pointer chain contains signed SLTI only. Its
+		// compare consumes r0 before materializing the result, so r0 is a safe
+		// fallback while r3/r12 remain live. Reject an unsigned expansion until its
+		// pre-cleared result register has an independently audited scratch host.
+		if (preserve_write_pointer && !signed_compare)
+			return false;
 		const unsigned fallback_result =
+			preserve_write_pointer ? HOST_TMP0 :
 			m_compatible_vtlb_pointer &&
 				m_gpr_link_signature.vtlb_pointer.width == VtlbPointerLinkWidth::BytePair8 ?
 				HOST_TMP3 : HOST_TMP4;
@@ -27243,7 +27475,8 @@ namespace VitaEE
 					(1u << HOST_TMP3) | (1u << HOST_TMP4) | (1u << HOST_LR))) ||
 				(m_compatible_vtlb_pointer &&
 				 tail.pc == m_gpr_link_signature.vtlb_pointer.access_pc &&
-				 !m_code.EmitMovImm8(GprLinkSignature::VTLB_POINTER_HOST, 0)) ||
+				 tail.compatible_byte_pair_delay_join == static_cast<size_t>(-1) &&
+				 !EmitInvalidateCompatibleVtlbPointers()) ||
 				(tail.width != ScalarLoadWidth::Dword && tail.rt != 0 && !emit_normalize_narrow_low()) ||
 				!emit_store_result() ||
 				!EmitFlushDirtyGprPins())
@@ -27303,6 +27536,8 @@ namespace VitaEE
 				!EmitReloadGprPinsAfterClobber(static_cast<u16>(
 					(1u << HOST_TMP0) | (1u << HOST_TMP1) | (1u << HOST_TMP2) |
 					(1u << HOST_TMP3) | (1u << HOST_TMP4) | (1u << HOST_LR))) ||
+				(m_gpr_link_signature.HasVtlbWritePointer() &&
+				 !m_code.EmitMovImm8(GprLinkSignature::VTLB_WRITE_POINTER_HOST, 0)) ||
 				!m_code.EmitMovImm32(GprLinkSignature::VTLB_POINTER_HOST,
 					static_cast<u32>(reinterpret_cast<uptr>(
 						&s_compatible_vtlb_byte_pair_handler_page[
@@ -27371,6 +27606,12 @@ namespace VitaEE
 			const size_t fallback_target = m_code.Size();
 			if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
 				return false;
+			if (tail.address_reg != HOST_TMP0 &&
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, tail.address_reg,
+					VitaA32::ShiftType::LSL, 0))
+			{
+				return false;
+			}
 			if (!EmitSyncGprPinsToBacking(&tail.dirty_pins))
 				return false;
 
@@ -27394,9 +27635,15 @@ namespace VitaEE
 
 		if (!m_code.EmitCallAbsolute(tail.write_helper) ||
 			!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false) ||
-			(m_compatible_vtlb_pointer &&
-			 !m_code.EmitMovImm8(GprLinkSignature::VTLB_POINTER_HOST, 0)))
+			!EmitInvalidateCompatibleVtlbPointers())
 			return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (tail.address_reg == GprLinkSignature::VTLB_WRITE_POINTER_HOST &&
+			m_gpr_link_signature.HasVtlbWritePointer())
+		{
+			g_qemuCompatibleVtlbWritePointerColdInvalidations++;
+		}
+#endif
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();
 		return tail_done != static_cast<size_t>(-1) &&

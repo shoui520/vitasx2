@@ -70,6 +70,7 @@ namespace VitaEE
 
 	enum class VtlbPointerLinkWidth : u8
 	{
+		Byte8,
 		BytePair8,
 		Word32,
 	};
@@ -77,6 +78,7 @@ namespace VitaEE
 	enum class VtlbPointerLinkDirection : u8
 	{
 		Read,
+		Write,
 	};
 
 	enum class VtlbPointerLinkRepresentation : u8
@@ -95,6 +97,8 @@ namespace VitaEE
 
 		u8 host = NO_HOST;
 		u8 guest_address = 0;
+		// Read mappings name architectural result GPRs; a write mapping uses
+		// guest_result as its architectural value source and leaves result2 zero.
 		u8 guest_result = 0;
 		u8 guest_result2 = 0;
 		u8 stride = 0;
@@ -205,11 +209,13 @@ namespace VitaEE
 		static constexpr u8 LINK_REGISTER_HOST = 14;
 		static constexpr u8 SCHEDULER_HOST = 6;
 		static constexpr u8 VTLB_POINTER_HOST = 12;
+		static constexpr u8 VTLB_WRITE_POINTER_HOST = 3;
 		static constexpr u8 PREDICATE_HOST = 5;
 
 		GprLinkMapping mappings[MAX_PINS]{};
 		SchedulerLinkMapping scheduler{};
 		VtlbPointerLinkMapping vtlb_pointer{};
+		VtlbPointerLinkMapping vtlb_write_pointer{};
 		PredicateLinkMapping predicate{};
 		u32 block_pcs[MAX_BLOCKS]{};
 		u8 count = 0;
@@ -220,6 +226,7 @@ namespace VitaEE
 		bool HasWriteBack() const;
 		bool HasSchedulerCountdown() const { return scheduler.IsValid(); }
 		bool HasVtlbPointer() const { return vtlb_pointer.IsValid(); }
+		bool HasVtlbWritePointer() const { return vtlb_write_pointer.IsValid(); }
 		bool HasPredicate() const { return predicate.IsValid(); }
 		bool ReclaimsVtlbHosts() const;
 		u8 WordCount() const;
@@ -228,7 +235,9 @@ namespace VitaEE
 		{
 			if (count != rhs.count || block_count != rhs.block_count ||
 				!(scheduler == rhs.scheduler) ||
-				!(vtlb_pointer == rhs.vtlb_pointer) || !(predicate == rhs.predicate) ||
+				!(vtlb_pointer == rhs.vtlb_pointer) ||
+				!(vtlb_write_pointer == rhs.vtlb_write_pointer) ||
+				!(predicate == rhs.predicate) ||
 				block_pcs[0] != rhs.block_pcs[0] || block_pcs[1] != rhs.block_pcs[1] ||
 				block_pcs[2] != rhs.block_pcs[2])
 				return false;
@@ -855,7 +864,12 @@ namespace VitaEE
 		bool EmitSyncForwardedBooleanBranchToBacking(bool value_is_architectural = false);
 		bool EmitPrepareResidentForwardedBooleanForPreProducerSync();
 		bool EmitPoisonCompatibleVtlbPointer();
+		bool EmitInvalidateCompatibleVtlbPointers();
 		bool EmitStageCompatibleVtlbPointer();
+		bool EmitStageCompatibleVtlbPointerMapping(
+			const VtlbPointerLinkMapping& pointer, bool access,
+			size_t* unaligned_fallback, size_t* handler_fallback,
+			GprPinDirtyMasks* dirty_pins, bool write_pointer);
 		bool EmitStageCompatibleSchedulerCountdown(unsigned scratch_host,
 			bool canonical_entry = true);
 		bool EmitSyncCompatibleSchedulerCountdownToBacking();
@@ -1009,6 +1023,7 @@ namespace VitaEE
 			bool rt_high_known = false;
 			u32 rt_low = 0;
 			u32 rt_high = 0;
+			unsigned address_reg = 0;
 			GprPinDirtyMasks dirty_pins{};
 		};
 		void CaptureScalarStoreValue(ScalarStoreColdTail* tail);
@@ -1159,6 +1174,7 @@ namespace VitaEE
 		bool m_compatible_scheduler_countdown = false;
 		bool m_compatible_vtlb_pointer = false;
 		bool m_compatible_vtlb_pointer_access = false;
+		bool m_compatible_vtlb_write_pointer_access = false;
 		bool m_compatible_predicate_consumer = false;
 		bool m_compatible_predicate_entry_variant = false;
 		bool m_compatible_likely_taken_suffix = false;
@@ -1171,6 +1187,8 @@ namespace VitaEE
 		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
 		size_t m_compatible_vtlb_byte_pair_tail_index = static_cast<size_t>(-1);
 		GprPinDirtyMasks m_compatible_vtlb_pointer_dirty_pins{};
+		size_t m_compatible_vtlb_write_pointer_handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks m_compatible_vtlb_write_pointer_dirty_pins{};
 		u8 m_compatible_vtlb_pointer_guard_instructions = 0;
 		u8 m_compatible_vtlb_pointer_translation_instructions = 0;
 		bool m_deferred_resident_unsigned_branch_suffix = false;

@@ -951,7 +951,10 @@ namespace VitaEE
 			if (!m_compatible_scheduler_carry_enabled)
 				candidate->scheduler = SchedulerLinkMapping{};
 			if (!m_compatible_vtlb_pointer_carry_enabled)
+			{
 				candidate->vtlb_pointer = VtlbPointerLinkMapping{};
+				candidate->vtlb_write_pointer = VtlbPointerLinkMapping{};
+			}
 			if (!m_compatible_predicate_carry_enabled)
 				candidate->predicate = PredicateLinkMapping{};
 #else
