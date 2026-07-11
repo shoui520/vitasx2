@@ -409,6 +409,10 @@ namespace VitaEE
 		{
 			m_fused_direct_event_link_enabled = enabled;
 		}
+		void SetCombinedCompatibleTakenEventEnabled(bool enabled)
+		{
+			m_combined_compatible_taken_event_enabled = enabled;
+		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -1165,6 +1169,7 @@ namespace VitaEE
 		bool m_compatible_predicate_entry_variant_enabled = true;
 		bool m_embedded_compatible_continuation_enabled = true;
 		bool m_fused_direct_event_link_enabled = true;
+		bool m_combined_compatible_taken_event_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;

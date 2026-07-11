@@ -694,6 +694,15 @@ namespace VitaEE
 		m_fused_direct_event_link_enabled = enabled;
 	}
 
+	void BlockExecutor::SetCombinedCompatibleTakenEventEnabled(bool enabled)
+	{
+		if (m_combined_compatible_taken_event_enabled == enabled)
+			return;
+
+		Reset();
+		m_combined_compatible_taken_event_enabled = enabled;
+	}
+
 	void BlockExecutor::SetThreeBlockGprLinkEnabled(bool enabled)
 	{
 		if (m_three_block_gpr_link_enabled == enabled)
@@ -1375,6 +1384,8 @@ namespace VitaEE
 				m_embedded_compatible_continuation_enabled);
 			compiler.SetFusedDirectEventLinkEnabled(
 				m_fused_direct_event_link_enabled);
+			compiler.SetCombinedCompatibleTakenEventEnabled(
+				m_combined_compatible_taken_event_enabled);
 #endif
 			u32 attempt_scaled_cycles = 0;
 			size_t attempt_linked_entry_offset = 0;

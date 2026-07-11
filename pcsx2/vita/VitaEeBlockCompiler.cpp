@@ -151,6 +151,9 @@ u32 g_qemuCompatibleLikelyTakenSuffixHotInstructionsElided = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixColdInstructions = 0;
 u32 g_qemuFusedDirectEventLinkBlocks = 0;
 u32 g_qemuFusedDirectEventLinkHotInstructionsElided = 0;
+u32 g_qemuCombinedCompatibleTakenEventBlocks = 0;
+u32 g_qemuCombinedCompatibleTakenEventHotInstructionsElided = 0;
+u32 g_qemuCombinedCompatibleTakenEventColdInstructions = 0;
 u32 g_qemuResidentCycleLowBlocks = 0;
 u32 g_qemuResidentCycleLowHotInstructionsElided = 0;
 u32 g_qemuResidentCycleLowSyncInstructions = 0;
@@ -10099,15 +10102,63 @@ namespace VitaEE
 				HOST_TMP1);
 		}
 
-		// Scheduler events are rare relative to block dispatch. Keep PCSX2's
-		// signed-delta test, but invert the A32 layout so cycle < nextEventCycle
-		// falls through into the direct tail instead of taking a hot branch.
-		const size_t event_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		// PCSX2's branch recs normalize the guest predicate to 0/1 before
+		// iBranchTest(), and this compatible ABI keeps its signed scheduler delta
+		// in r6. For a taken edge which stays inside the measured compatible
+		// cycle, ANDS scratch,predicate,(r6 >> 31) is nonzero exactly when both
+		// conditions say "taken target now": the guest branch is taken and no
+		// scheduler event is due. That one flag producer replaces the old hot
+		// BPL-event plus CMP-flag pair. The rare combined-false route reconstructs
+		// the scheduler sign before choosing event versus guest fallthrough.
+		bool combine_compatible_taken_event =
+			m_compatible_scheduler_countdown && taken_link &&
+			preserve_dirty_taken_link && !wait_loop_taken &&
+			!m_deferred_resident_unsigned_branch_suffix &&
+			m_branch_flag_host != HOST_TMP1 &&
+			m_gpr_link_signature.ContainsPc(taken_pc);
+#if defined(VITASX2_QEMU_VALIDATION)
+		combine_compatible_taken_event &=
+			m_combined_compatible_taken_event_enabled;
+#endif
+		size_t combined_taken_tail = static_cast<size_t>(-1);
+		size_t event_branch = static_cast<size_t>(-1);
+		if (combine_compatible_taken_event)
+		{
+			if (!m_code.EmitAndRegShiftImm(HOST_TMP1, m_branch_flag_host,
+					GprLinkSignature::SCHEDULER_HOST, VitaA32::ShiftType::LSR, 31,
+					true))
+			{
+				return false;
+			}
+			combined_taken_tail =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (combined_taken_tail == static_cast<size_t>(-1) ||
+				!m_code.EmitCmpImm32(GprLinkSignature::SCHEDULER_HOST, 0))
+			{
+				return false;
+			}
+			event_branch =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCombinedCompatibleTakenEventBlocks++;
+			g_qemuCombinedCompatibleTakenEventHotInstructionsElided++;
+			g_qemuCombinedCompatibleTakenEventColdInstructions += 3;
+#endif
+		}
+		else
+		{
+			// Scheduler events are rare relative to block dispatch. Keep PCSX2's
+			// signed-delta test, but invert the A32 layout so cycle < nextEventCycle
+			// falls through into the direct tail instead of taking a hot branch.
+			event_branch =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		}
 		if (event_branch == static_cast<size_t>(-1))
 			return false;
 		if (taken_link || wait_loop_taken)
 		{
-			if (m_deferred_resident_unsigned_branch_suffix)
+			if (!combine_compatible_taken_event &&
+				m_deferred_resident_unsigned_branch_suffix)
 			{
 				if (!EmitDeferredResidentUnsignedBranchSuffix())
 					return false;
@@ -10115,7 +10166,8 @@ namespace VitaEE
 				g_qemuResidentUnsignedBranchSuffixHotInstructionsElided++;
 #endif
 			}
-			else if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
+			else if (!combine_compatible_taken_event &&
+				!m_code.EmitCmpImm32(m_branch_flag_host, 0))
 			{
 				return false;
 			}
@@ -10123,7 +10175,8 @@ namespace VitaEE
 			const VitaA32::Condition taken_condition =
 				m_deferred_resident_unsigned_branch_suffix ?
 					VitaA32::Condition::CC : VitaA32::Condition::NE;
-			const size_t taken_tail = m_code.EmitBranchPlaceholder(taken_condition);
+			const size_t taken_tail = combine_compatible_taken_event ?
+				combined_taken_tail : m_code.EmitBranchPlaceholder(taken_condition);
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 

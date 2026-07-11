@@ -110,6 +110,7 @@ namespace VitaEE
 		void SetCompatiblePredicateEntryVariantEnabled(bool enabled);
 		void SetEmbeddedCompatibleContinuationEnabled(bool enabled);
 		void SetFusedDirectEventLinkEnabled(bool enabled);
+		void SetCombinedCompatibleTakenEventEnabled(bool enabled);
 		void SetThreeBlockGprLinkEnabled(bool enabled);
 		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled);
 #endif
@@ -275,6 +276,7 @@ namespace VitaEE
 		bool m_compatible_predicate_entry_variant_enabled = true;
 		bool m_embedded_compatible_continuation_enabled = true;
 		bool m_fused_direct_event_link_enabled = true;
+		bool m_combined_compatible_taken_event_enabled = true;
 		bool m_three_block_gpr_link_enabled = true;
 		bool m_vtlb_linked_entry_pc_publication_enabled = false;
 #endif
