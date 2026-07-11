@@ -489,6 +489,8 @@ namespace VitaEE
 		static bool CanCompileDelaySlotOpcode(u32 op);
 		static bool IsExactCacheDxwbinLoop(u32 start_pc, u32 instruction_count,
 			unsigned* address_guest = nullptr, unsigned* predicate_guest = nullptr);
+		static bool IsExactCacheIxinLoop(u32 start_pc, u32 instruction_count,
+			unsigned* address_guest = nullptr, unsigned* predicate_guest = nullptr);
 		static bool BuildGprLinkSignature(u32 first_pc, u32 first_instruction_count,
 			u32 second_pc, u32 second_instruction_count, GprLinkSignature* signature,
 			bool reclaim_vtlb_hosts = true);
@@ -563,6 +565,9 @@ namespace VitaEE
 			bool defer_pc_writeback = false, u32 pc = 0);
 		bool EndBlockWithWaitLoopFastForward(u32 block_cycles, const void* event_exit);
 		bool CompileCacheDxwbinLoop(u32 start_pc, u32 instruction_count,
+			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
+			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
+		bool CompileCacheIxinLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool EmitSPECIAL(u32 op, u32 pc, u32 raw_cycles_through_instruction,

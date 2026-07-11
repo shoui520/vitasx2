@@ -418,6 +418,10 @@ u32 g_qemuCacheDxwbinLoopBlocks = 0;
 u32 g_qemuCacheDxwbinLoopHelperCalls = 0;
 u32 g_qemuCacheDxwbinLoopBatchedIterations = 0;
 u32 g_qemuCacheDxwbinLoopFallbackIterations = 0;
+u32 g_qemuCacheIxinLoopBlocks = 0;
+u32 g_qemuCacheIxinLoopHelperCalls = 0;
+u32 g_qemuCacheIxinLoopBatchedIterations = 0;
+u32 g_qemuCacheIxinLoopFallbackIterations = 0;
 #endif
 
 namespace VitaEE
@@ -441,9 +445,9 @@ namespace VitaEE
 		// Must match VitaEE::BlockExitKind without including the executor.
 		constexpr u8 EE_DIRECT_EXIT_TOKEN = 0xd1;
 		constexpr u8 EE_EVENT_EXIT_TOKEN = 0xe7;
-		constexpr u32 CACHE_DXWBIN_LOOP_COMPLETE = 0;
-		constexpr u32 CACHE_DXWBIN_LOOP_SELF = 1;
-		constexpr u32 CACHE_DXWBIN_LOOP_EVENT = 2;
+		constexpr u32 CACHE_INDUCTION_LOOP_COMPLETE = 0;
+		constexpr u32 CACHE_INDUCTION_LOOP_SELF = 1;
+		constexpr u32 CACHE_INDUCTION_LOOP_EVENT = 2;
 
 		constexpr unsigned HOST_CPU_REGS = 4;
 		constexpr unsigned HOST_BRANCH_STATE = 5;
@@ -457,7 +461,8 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP3 = 3;
 		constexpr unsigned HOST_TMP4 = 12;
 
-		__noinline u32 VitaEeExecuteCacheDxwbinLoop(u32 start_pc, u32 fallthrough_pc,
+		template <u32 Limit, bool ApplyDxwbin>
+		inline __fi u32 VitaEeExecuteCacheInductionLoop(u32 start_pc, u32 fallthrough_pc,
 			u32 block_cycles, u32 packed_guests)
 		{
 			const unsigned address_guest = packed_guests & 0x1f;
@@ -469,10 +474,10 @@ namespace VitaEE
 
 			u32 iterations = 1;
 			const bool batchable = block_cycles != 0 && address_value == sign_extended_address &&
-				(address & 63u) == 0 && address < 4096;
+				(address & 63u) == 0 && address < Limit;
 			if (batchable)
 			{
-				const u32 remaining = (4096 - address) / 64;
+				const u32 remaining = (Limit - address) / 64;
 				const s32 cycles_to_event = static_cast<s32>(
 					static_cast<u32>(cpuRegs.nextEventCycle) - static_cast<u32>(cpuRegs.cycle));
 				u32 event_iterations = 1;
@@ -485,18 +490,30 @@ namespace VitaEE
 			}
 
 #if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuCacheDxwbinLoopHelperCalls++;
-			if (batchable)
-				g_qemuCacheDxwbinLoopBatchedIterations += iterations;
+			if constexpr (ApplyDxwbin)
+			{
+				g_qemuCacheDxwbinLoopHelperCalls++;
+				if (batchable)
+					g_qemuCacheDxwbinLoopBatchedIterations += iterations;
+				else
+					g_qemuCacheDxwbinLoopFallbackIterations++;
+			}
 			else
-				g_qemuCacheDxwbinLoopFallbackIterations++;
+			{
+				g_qemuCacheIxinLoopHelperCalls++;
+				if (batchable)
+					g_qemuCacheIxinLoopBatchedIterations += iterations;
+				else
+					g_qemuCacheIxinLoopFallbackIterations++;
+			}
 #endif
 
-			executeCacheDxwbinPairRange(address, iterations);
+			if constexpr (ApplyDxwbin)
+				executeCacheDxwbinPairRange(address, iterations);
 			const u32 updated_address = address + iterations * 64;
 			const u64 updated_value = static_cast<u64>(
 				static_cast<s64>(static_cast<s32>(updated_address)));
-			const u64 predicate = static_cast<s64>(updated_value) < 4096 ? 1 : 0;
+			const u64 predicate = static_cast<s64>(updated_value) < Limit ? 1 : 0;
 			cpuRegs.GPR.r[address_guest].UD[0] = updated_value;
 			cpuRegs.GPR.r[predicate_guest].UD[0] = predicate;
 			cpuRegs.cycle += static_cast<u64>(block_cycles) * iterations;
@@ -505,9 +522,23 @@ namespace VitaEE
 			if (static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
 					static_cast<u32>(cpuRegs.nextEventCycle)) >= 0)
 			{
-				return CACHE_DXWBIN_LOOP_EVENT;
+				return CACHE_INDUCTION_LOOP_EVENT;
 			}
-			return predicate != 0 ? CACHE_DXWBIN_LOOP_SELF : CACHE_DXWBIN_LOOP_COMPLETE;
+			return predicate != 0 ? CACHE_INDUCTION_LOOP_SELF : CACHE_INDUCTION_LOOP_COMPLETE;
+		}
+
+		__noinline u32 VitaEeExecuteCacheDxwbinLoop(u32 start_pc, u32 fallthrough_pc,
+			u32 block_cycles, u32 packed_guests)
+		{
+			return VitaEeExecuteCacheInductionLoop<4096, true>(
+				start_pc, fallthrough_pc, block_cycles, packed_guests);
+		}
+
+		__noinline u32 VitaEeExecuteCacheIxinLoop(u32 start_pc, u32 fallthrough_pc,
+			u32 block_cycles, u32 packed_guests)
+		{
+			return VitaEeExecuteCacheInductionLoop<8192, false>(
+				start_pc, fallthrough_pc, block_cycles, packed_guests);
 		}
 		constexpr unsigned HOST_CALLER_SAVED_BRANCH_FLAG = HOST_TMP4;
 		constexpr unsigned HOST_TMP5 = 6;
@@ -2572,6 +2603,42 @@ namespace VitaEE
 			(compare >> 26) != 0x0a || RS(compare) != address || IMM_S(compare) != 4096 ||
 			(branch >> 26) != 0x05 || RS(branch) != predicate || RT(branch) != 0 ||
 			BranchTarget(start_pc + 7 * sizeof(u32), branch) != start_pc || delay != 0)
+		{
+			return false;
+		}
+
+		if (address_guest)
+			*address_guest = address;
+		if (predicate_guest)
+			*predicate_guest = predicate;
+		return true;
+	}
+
+	bool BlockCompiler::IsExactCacheIxinLoop(u32 start_pc, u32 instruction_count,
+		unsigned* address_guest, unsigned* predicate_guest)
+	{
+		if (instruction_count != 8 || start_pc > UINT32_MAX - 8 * sizeof(u32))
+			return false;
+
+		const u32 sync0 = memRead32(start_pc);
+		const u32 cache0 = memRead32(start_pc + sizeof(u32));
+		const u32 cache1 = memRead32(start_pc + 2 * sizeof(u32));
+		const u32 sync1 = memRead32(start_pc + 3 * sizeof(u32));
+		const u32 advance = memRead32(start_pc + 4 * sizeof(u32));
+		const u32 compare = memRead32(start_pc + 5 * sizeof(u32));
+		const u32 branch = memRead32(start_pc + 6 * sizeof(u32));
+		const u32 delay = memRead32(start_pc + 7 * sizeof(u32));
+		const unsigned address = RS(cache0);
+		const unsigned predicate = RT(compare);
+
+		if (sync0 != 0x0000040fu || sync1 != sync0 ||
+			(cache0 >> 26) != 0x2f || RT(cache0) != 0x07 || IMM_S(cache0) != 0 ||
+			(cache1 >> 26) != 0x2f || RT(cache1) != 0x07 || RS(cache1) != address || IMM_S(cache1) != 1 ||
+			address == 0 || predicate == 0 || predicate == address ||
+			(advance >> 26) != 0x09 || RS(advance) != address || RT(advance) != address || IMM_S(advance) != 64 ||
+			(compare >> 26) != 0x0a || RS(compare) != address || IMM_S(compare) != 8192 ||
+			(branch >> 26) != 0x05 || RS(branch) != predicate || RT(branch) != 0 ||
+			BranchTarget(start_pc + 6 * sizeof(u32), branch) != start_pc || delay != 0)
 		{
 			return false;
 		}
@@ -8886,6 +8953,157 @@ namespace VitaEE
 			   m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0));
 	}
 
+	bool BlockCompiler::CompileCacheIxinLoop(u32 start_pc, u32 instruction_count,
+		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
+		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
+	{
+		unsigned address_guest = 0;
+		unsigned predicate_guest = 0;
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactCacheIxinLoop(start_pc, instruction_count, &address_guest, &predicate_guest))
+		{
+			return false;
+		}
+
+		u32 raw_cycles = 0;
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) * cycle_factor;
+		}
+		const u32 block_cycles = ScaleBlockCycles(raw_cycles);
+		if (block_cycles == 0)
+			return false;
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		if (!BeginBlock(false, false, false, linked_entry_offset))
+			return false;
+
+		constexpr u32 limit = 8192;
+		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
+		const u32 packed_guests = address_guest | (predicate_guest << 8);
+		size_t cold_branches[3]{};
+		if (!EmitLoadCpuRegsU64(GprOffset(address_guest), HOST_TMP0, HOST_TMP1, HOST_TMP2) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::ASR, 31) ||
+			!m_code.EmitCmpReg(HOST_TMP1, HOST_TMP2))
+		{
+			return false;
+		}
+		cold_branches[0] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (cold_branches[0] == static_cast<size_t>(-1) ||
+			!m_code.EmitTstImm32(HOST_TMP0, 63))
+		{
+			return false;
+		}
+		cold_branches[1] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (cold_branches[1] == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, limit))
+		{
+			return false;
+		}
+		cold_branches[2] = m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+		if (cold_branches[2] == static_cast<size_t>(-1) ||
+			!m_code.EmitRsbImm32(HOST_TMP2, HOST_TMP0, limit) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP2, VitaA32::ShiftType::LSR, 6) ||
+			!m_code.EmitMovImm32(HOST_TMP3, block_cycles) ||
+			!m_code.EmitUmull(HOST_TMP1, HOST_TMP4, HOST_TMP2, HOST_TMP3) ||
+			!m_code.EmitLdrImm12(HOST_TMP4, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_TMP4) ||
+			!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP1))
+		{
+			return false;
+		}
+		const size_t hot_completion_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::GT);
+		if (hot_completion_branch == static_cast<size_t>(-1))
+			return false;
+
+		const size_t cold_target = m_code.Size();
+		if (!m_code.PatchBranch(cold_branches[0], cold_target, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(cold_branches[1], cold_target, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(cold_branches[2], cold_target, VitaA32::Condition::CS))
+		{
+			return false;
+		}
+		if (!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeExecuteCacheIxinLoop)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, CACHE_INDUCTION_LOOP_EVENT))
+		{
+			return false;
+		}
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, CACHE_INDUCTION_LOOP_SELF))
+		{
+			return false;
+		}
+		const size_t self_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		const size_t cold_complete_branch = m_code.EmitBranchPlaceholder();
+		if (self_branch == static_cast<size_t>(-1) ||
+			cold_complete_branch == static_cast<size_t>(-1))
+		{
+			return false;
+		}
+
+		const size_t hot_completion_target = m_code.Size();
+		if (!m_code.PatchBranch(hot_completion_branch, hot_completion_target,
+				VitaA32::Condition::GT) ||
+			!m_code.EmitMovImm32(HOST_TMP0, limit) ||
+			!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+			!EmitStoreCpuRegsU64(GprOffset(address_guest), HOST_TMP0, HOST_TMP3, HOST_TMP4) ||
+			!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+			!EmitStoreCpuRegsU64(GprOffset(predicate_guest), HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
+			!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS,
+				static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP1, true) ||
+			!m_code.EmitAdcImm8(HOST_TMP3, HOST_TMP3, 0) ||
+			!EmitStoreCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP3, HOST_TMP4) ||
+			!EmitStorePc(fallthrough_pc))
+		{
+			return false;
+		}
+
+		const size_t fallthrough_target = m_code.Size();
+		if (!m_code.PatchBranch(cold_complete_branch, fallthrough_target) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+		const size_t self_target = m_code.Size();
+		if (!m_code.PatchBranch(self_branch, self_target, VitaA32::Condition::EQ) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
+		{
+			return false;
+		}
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = fallthrough_pc;
+		direct_links->slots[0].valid = true;
+		direct_links->slots[1].target_pc = start_pc;
+		direct_links->slots[1].valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCacheIxinLoopBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompileCacheDxwbinLoop(u32 start_pc, u32 instruction_count,
 		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -8922,14 +9140,14 @@ namespace VitaEE
 			!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
 			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeExecuteCacheDxwbinLoop)) ||
-			!m_code.EmitCmpImm32(HOST_TMP0, CACHE_DXWBIN_LOOP_EVENT))
+			!m_code.EmitCmpImm32(HOST_TMP0, CACHE_INDUCTION_LOOP_EVENT))
 		{
 			return false;
 		}
 
 		const size_t event_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
 		if (event_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitCmpImm32(HOST_TMP0, CACHE_DXWBIN_LOOP_SELF))
+			!m_code.EmitCmpImm32(HOST_TMP0, CACHE_INDUCTION_LOOP_SELF))
 		{
 			return false;
 		}
@@ -9022,9 +9240,15 @@ namespace VitaEE
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		device_trace_enabled = Pcsx2Trace::IsGsTraceEnabled() || Pcsx2Trace::IsVuTraceEnabled();
 #endif
-		const bool cache_dxwbin_loop_batch_enabled =
+		const bool cache_loop_batch_enabled =
 			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack;
-		if (cache_dxwbin_loop_batch_enabled && direct_links &&
+		if (cache_loop_batch_enabled && direct_links &&
+			IsExactCacheIxinLoop(start_pc, instruction_count))
+		{
+			return CompileCacheIxinLoop(start_pc, instruction_count, direct_exit, event_exit,
+				scaled_cycles, direct_links, linked_entry_offset);
+		}
+		if (cache_loop_batch_enabled && direct_links &&
 			IsExactCacheDxwbinLoop(start_pc, instruction_count))
 		{
 			return CompileCacheDxwbinLoop(start_pc, instruction_count, direct_exit, event_exit,
