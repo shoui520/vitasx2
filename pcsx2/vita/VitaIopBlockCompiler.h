@@ -27,36 +27,42 @@ namespace VitaIOP
 		u32 stop_pc = 0;
 	};
 
+	// Successful executor calls publish every payload field and initialize the
+	// four control flags explicitly. Keep this aggregate free of member
+	// initializers: the provider hot path must not construct/clear the complete
+	// telemetry object before RunValidatedBlock overwrites it.
 	struct BlockExecutionResult
 	{
-		BlockExitKind exit = BlockExitKind::Direct;
-		u32 instruction_count = 0;
-		u32 native_instruction_count = 0;
-		u32 helper_instruction_count = 0;
-		size_t code_size = 0;
-		u32 block_records = 0;
-		u32 link_records = 0;
-		u32 cache_slots = 0;
-		u32 code_cache_resets = 0;
-		size_t code_cache_used = 0;
-		size_t code_cache_capacity = 0;
+		BlockExitKind exit;
+		u32 instruction_count;
+		u32 native_instruction_count;
+		u32 helper_instruction_count;
+		size_t code_size;
+		u32 block_records;
+		u32 link_records;
+		u32 cache_slots;
+		u32 code_cache_resets;
+		size_t code_cache_used;
+		size_t code_cache_capacity;
 #if defined(VITASX2_QEMU_VALIDATION)
-		u64 validation_calls = 0;
-		u64 validation_words = 0;
-		u64 raw_validation_calls = 0;
-		u64 raw_validation_words = 0;
-		u64 translated_validation_words = 0;
-		u64 wait_loop_configuration_checks = 0;
-		u64 trusted_source_hits = 0;
-		u64 trusted_source_audit_words = 0;
-		u64 trusted_source_audit_failures = 0;
-		u64 ram_invalidation_calls = 0;
-		u64 ram_invalidation_record_visits = 0;
+		u64 hot_dispatch_cache_hits;
+		u64 hot_dispatch_cache_misses;
+		u64 validation_calls;
+		u64 validation_words;
+		u64 raw_validation_calls;
+		u64 raw_validation_words;
+		u64 translated_validation_words;
+		u64 wait_loop_configuration_checks;
+		u64 trusted_source_hits;
+		u64 trusted_source_audit_words;
+		u64 trusted_source_audit_failures;
+		u64 ram_invalidation_calls;
+		u64 ram_invalidation_record_visits;
 #endif
-		bool cache_hit = false;
-		bool lookup_hit = false;
-		bool fast_dispatch_hit = false;
-		bool wait_loop_fast_forward = false;
+		bool cache_hit;
+		bool lookup_hit;
+		bool fast_dispatch_hit;
+		bool wait_loop_fast_forward;
 	};
 
 	struct DirectLinkSlot
@@ -274,6 +280,11 @@ namespace VitaIOP
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
+		// PCSX2's R3000A dispatcher indexes psxRecLUT directly by guest PC.
+		// A full flat map is wasteful on Vita, so keep the hottest exact mappings
+		// in a Cortex-A9 D-cache-sized first level ahead of the lazy page table.
+		static constexpr u32 HOT_DISPATCH_CACHE_SET_COUNT = 64;
+		static constexpr u32 HOT_DISPATCH_CACHE_WAY_COUNT = 2;
 		// PCSX2's recClearIOP() invalidates only blocks whose protected source
 		// pages were written. Use host-page-sized buckets here too: a 64 KiB LUT
 		// bucket makes every ordinary IOP RAM store walk unrelated blocks.
@@ -315,6 +326,12 @@ namespace VitaIOP
 			std::array<CachedBlock*, LOOKUP_PAGE_ENTRY_COUNT> blocks{};
 		};
 
+		struct HotDispatchCacheEntry
+		{
+			CachedBlock* block = nullptr;
+			u32 start_pc = UINT32_MAX;
+		};
+
 		struct IncomingLinkRecord
 		{
 			CachedBlock* source = nullptr;
@@ -339,12 +356,17 @@ namespace VitaIOP
 
 		static u32 LookupPageIndex(u32 start_pc);
 		static u32 LookupEntryIndex(u32 start_pc);
+		static u32 HotDispatchCacheIndex(u32 start_pc);
 		static const u32* ResolveRawOpcodeSpan(
 			u32 start_pc, u32 instruction_count, u32* ram_source_start);
 		bool EnsureLookupDirectory();
 		LookupPage* GetLookupPage(u32 start_pc, bool allocate);
 		void RegisterBlockLookup(CachedBlock& block);
 		void UnregisterBlockLookup(CachedBlock& block);
+		void RegisterHotDispatchCache(CachedBlock& block);
+		void UnregisterHotDispatchCache(CachedBlock& block);
+		CachedBlock* FindHotDispatchCacheBlock(u32 start_pc);
+		void ClearHotDispatchCache();
 		void ReleaseLookupPages();
 		void RegisterRamSource(CachedBlock& block);
 		bool AnalyzePollCallWaitLoop(CachedBlock& block, u32 start_pc, u32 instruction_count);
@@ -389,12 +411,16 @@ namespace VitaIOP
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT> m_ram_source_pages;
 		LookupPage** m_lookup_pages = nullptr;
+		std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
+			HOT_DISPATCH_CACHE_SET_COUNT> m_hot_dispatch_cache{};
 		u32 m_next_source_serial = 1;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
 #if defined(VITASX2_QEMU_VALIDATION)
+		u64 m_hot_dispatch_cache_hits = 0;
+		u64 m_hot_dispatch_cache_misses = 0;
 		u64 m_validation_calls = 0;
 		u64 m_validation_words = 0;
 		u64 m_raw_validation_calls = 0;

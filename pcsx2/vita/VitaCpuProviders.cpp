@@ -48,6 +48,7 @@ struct IopDispatchProfileEntry
 	u64 dispatches = 0;
 };
 static std::unordered_map<u32, IopDispatchProfileEntry> s_iop_a32_dispatch_profile;
+static std::unordered_map<u64, u64> s_iop_a32_dispatch_edge_profile;
 #endif
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
@@ -803,6 +804,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.fast_dispatch_hits++;
 		s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
 #if defined(VITASX2_QEMU_VALIDATION)
+		s_iop_a32_stats.hot_dispatch_cache_hits = result.hot_dispatch_cache_hits;
+		s_iop_a32_stats.hot_dispatch_cache_misses = result.hot_dispatch_cache_misses;
 		s_iop_a32_stats.validation_calls = result.validation_calls;
 		s_iop_a32_stats.validation_words = result.validation_words;
 		s_iop_a32_stats.raw_validation_calls = result.raw_validation_calls;
@@ -826,6 +829,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			dispatch_profile.instruction_count = result.instruction_count;
 		}
 		dispatch_profile.dispatches++;
+		const u64 edge_key = (static_cast<u64>(pc) << 32) | psxRegs.pc;
+		s_iop_a32_dispatch_edge_profile[edge_key]++;
 #endif
 		s_iop_a32_stats.executed_blocks++;
 		s_iop_a32_stats.direct_exits++;
@@ -1037,6 +1042,7 @@ void VitaResetA32IopProviderStats()
 	s_iop_a32_stats = {};
 #if defined(VITASX2_QEMU_VALIDATION)
 	s_iop_a32_dispatch_profile.clear();
+	s_iop_a32_dispatch_edge_profile.clear();
 #endif
 	s_iop_a32_executor.ResetInstrumentationCounters();
 }
@@ -1066,6 +1072,22 @@ VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile()
 		result.entries[i].opcode = sorted[i].second.opcode;
 		result.entries[i].instruction_count = sorted[i].second.instruction_count;
 		result.entries[i].dispatches = sorted[i].second.dispatches;
+	}
+
+	std::vector<std::pair<u64, u64>> sorted_edges;
+	sorted_edges.reserve(s_iop_a32_dispatch_edge_profile.size());
+	for (const auto& edge : s_iop_a32_dispatch_edge_profile)
+		sorted_edges.push_back(edge);
+	std::sort(sorted_edges.begin(), sorted_edges.end(), [](const auto& lhs, const auto& rhs) {
+		return lhs.second != rhs.second ? lhs.second > rhs.second : lhs.first < rhs.first;
+	});
+	result.edge_count =
+		std::min<u32>(static_cast<u32>(sorted_edges.size()), VITA_A32_IOP_HOT_DISPATCH_COUNT);
+	for (u32 i = 0; i < result.edge_count; i++)
+	{
+		result.edges[i].source_pc = static_cast<u32>(sorted_edges[i].first >> 32);
+		result.edges[i].target_pc = static_cast<u32>(sorted_edges[i].first);
+		result.edges[i].dispatches = sorted_edges[i].second;
 	}
 	return result;
 }

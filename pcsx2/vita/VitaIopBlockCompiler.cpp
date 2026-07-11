@@ -5138,6 +5138,8 @@ namespace VitaIOP
 	void BlockExecutor::ResetInstrumentationCounters()
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
+		m_hot_dispatch_cache_hits = 0;
+		m_hot_dispatch_cache_misses = 0;
 		m_validation_calls = 0;
 		m_validation_words = 0;
 		m_raw_validation_calls = 0;
@@ -5169,6 +5171,12 @@ namespace VitaIOP
 	u32 BlockExecutor::LookupEntryIndex(u32 start_pc)
 	{
 		return (start_pc & 0xffffu) >> 2;
+	}
+
+	u32 BlockExecutor::HotDispatchCacheIndex(u32 start_pc)
+	{
+		static_assert((HOT_DISPATCH_CACHE_SET_COUNT & (HOT_DISPATCH_CACHE_SET_COUNT - 1)) == 0);
+		return (start_pc >> 2) & (HOT_DISPATCH_CACHE_SET_COUNT - 1);
 	}
 
 	const u32* BlockExecutor::ResolveRawOpcodeSpan(
@@ -5230,6 +5238,8 @@ namespace VitaIOP
 		if (!block.valid || (block.start_pc & 0x3u) != 0)
 			return;
 
+		RegisterHotDispatchCache(block);
+
 		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_()/recLUT_SetPage().
 		// Vita keeps the same 64 KiB guest-page lookup granularity, allocated
 		// lazily for the R3000A address space.
@@ -5242,12 +5252,73 @@ namespace VitaIOP
 		if ((block.start_pc & 0x3u) != 0)
 			return;
 
+		UnregisterHotDispatchCache(block);
+
 		if (LookupPage* page = GetLookupPage(block.start_pc, false))
 		{
 			CachedBlock*& entry = page->blocks[LookupEntryIndex(block.start_pc)];
 			if (entry == &block)
 				entry = nullptr;
 		}
+	}
+
+	void BlockExecutor::RegisterHotDispatchCache(CachedBlock& block)
+	{
+		auto& set = m_hot_dispatch_cache[HotDispatchCacheIndex(block.start_pc)];
+		for (HotDispatchCacheEntry& entry : set)
+		{
+			if (entry.block == &block || entry.start_pc == block.start_pc)
+			{
+				entry.block = &block;
+				entry.start_pc = block.start_pc;
+				return;
+			}
+		}
+		// Keep the two most recently promoted PCs when a third PC aliases this
+		// set. Hits do not reorder the ways, so a stable two-PC call chain keeps
+		// both translations without per-dispatch cache writes.
+		set[1] = set[0];
+		set[0].block = &block;
+		set[0].start_pc = block.start_pc;
+	}
+
+	void BlockExecutor::UnregisterHotDispatchCache(CachedBlock& block)
+	{
+		auto& set = m_hot_dispatch_cache[HotDispatchCacheIndex(block.start_pc)];
+		for (HotDispatchCacheEntry& entry : set)
+		{
+			if (entry.block == &block)
+				entry = {};
+		}
+		if (!set[0].block && set[1].block)
+		{
+			set[0] = set[1];
+			set[1] = {};
+		}
+	}
+
+	BlockExecutor::CachedBlock* BlockExecutor::FindHotDispatchCacheBlock(u32 start_pc)
+	{
+		auto& set = m_hot_dispatch_cache[HotDispatchCacheIndex(start_pc)];
+		for (HotDispatchCacheEntry& entry : set)
+		{
+			if (entry.start_pc != start_pc || !entry.block)
+				continue;
+
+			if (!entry.block->valid || entry.block->start_pc != start_pc)
+			{
+				entry = {};
+				return nullptr;
+			}
+
+			return entry.block;
+		}
+		return nullptr;
+	}
+
+	void BlockExecutor::ClearHotDispatchCache()
+	{
+		m_hot_dispatch_cache = {};
 	}
 
 	void BlockExecutor::ReleaseLookupPages()
@@ -5666,6 +5737,7 @@ namespace VitaIOP
 	u32 BlockExecutor::Reset()
 	{
 		u32 invalidated = 0;
+		ClearHotDispatchCache();
 		m_free_cache_entries.clear();
 		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
 		{
@@ -6418,6 +6490,8 @@ namespace VitaIOP
 			result->code_cache_used = m_code_cache_used;
 			result->code_cache_capacity = m_code_cache_capacity;
 #if defined(VITASX2_QEMU_VALIDATION)
+			result->hot_dispatch_cache_hits = m_hot_dispatch_cache_hits;
+			result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
 			result->validation_calls = m_validation_calls;
 			result->validation_words = m_validation_words;
 			result->raw_validation_calls = m_raw_validation_calls;
@@ -6452,6 +6526,8 @@ namespace VitaIOP
 		result->code_cache_used = m_code_cache_used;
 		result->code_cache_capacity = m_code_cache_capacity;
 #if defined(VITASX2_QEMU_VALIDATION)
+		result->hot_dispatch_cache_hits = m_hot_dispatch_cache_hits;
+		result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
 		result->validation_calls = m_validation_calls;
 		result->validation_words = m_validation_words;
 		result->raw_validation_calls = m_raw_validation_calls;
@@ -6476,7 +6552,10 @@ namespace VitaIOP
 			return false;
 		}
 
-		*result = {};
+		result->cache_hit = false;
+		result->lookup_hit = false;
+		result->fast_dispatch_hit = false;
+		result->wait_loop_fast_forward = false;
 		CachedBlock* block = nullptr;
 		bool lookup_hit = false;
 		if (FindCachedBlock(start_pc, instruction_count, &block, &lookup_hit))
@@ -6500,16 +6579,40 @@ namespace VitaIOP
 		if (!result || (start_pc & 0x3u) != 0)
 			return false;
 
-		*result = {};
+		result->cache_hit = false;
+		result->lookup_hit = false;
+		result->fast_dispatch_hit = false;
+		result->wait_loop_fast_forward = false;
 
 		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_() looks up the
 		// translated BaseBlock by guest PC before doing any decode work. Keep
-		// the Vita IOP hot path on the same shape: validate the cached opcode
-		// bytes, run the block immediately, and only scan on misses or SMC.
+		// the Vita IOP hot path on the same shape. A 64-set, two-way exact
+		// first-level cache adapts psxRecLUT's direct lookup to Vita's smaller
+		// memory budget;
+		// the lazy two-level table remains the collision and cold fallback.
+		if (CachedBlock* entry = FindHotDispatchCacheBlock(start_pc))
+		{
+			if (ValidateCachedBlock(*entry))
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				m_hot_dispatch_cache_hits++;
+#endif
+				result->cache_hit = true;
+				result->lookup_hit = true;
+				result->fast_dispatch_hit = true;
+				return RunValidatedBlock(*entry, result);
+			}
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_hot_dispatch_cache_misses++;
+#endif
+
+		// Validate the page-table fallback before execution, then promote it.
 		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
 		{
 			if (entry->valid && ValidateCachedBlock(*entry))
 			{
+				RegisterHotDispatchCache(*entry);
 				result->cache_hit = true;
 				result->lookup_hit = true;
 				result->fast_dispatch_hit = true;
@@ -6519,6 +6622,7 @@ namespace VitaIOP
 
 		if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, 0, false))
 		{
+			RegisterHotDispatchCache(*entry);
 			result->cache_hit = true;
 			result->fast_dispatch_hit = true;
 			return RunValidatedBlock(*entry, result);

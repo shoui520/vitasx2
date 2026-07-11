@@ -82,6 +82,8 @@ struct VitaA32IopProviderStats
 	u64 poll_call_wait_loop_fast_forwards = 0;
 	u64 poll_call_wait_loop_dispatches_elided = 0;
 #if defined(VITASX2_QEMU_VALIDATION)
+	u64 hot_dispatch_cache_hits = 0;
+	u64 hot_dispatch_cache_misses = 0;
 	u64 validation_calls = 0;
 	u64 validation_words = 0;
 	u64 raw_validation_calls = 0;
@@ -107,10 +109,19 @@ struct VitaA32IopHotDispatch
 	u64 dispatches = 0;
 };
 
+struct VitaA32IopHotDispatchEdge
+{
+	u32 source_pc = 0;
+	u32 target_pc = 0;
+	u64 dispatches = 0;
+};
+
 struct VitaA32IopDispatchProfile
 {
 	u32 count = 0;
 	VitaA32IopHotDispatch entries[VITA_A32_IOP_HOT_DISPATCH_COUNT]{};
+	u32 edge_count = 0;
+	VitaA32IopHotDispatchEdge edges[VITA_A32_IOP_HOT_DISPATCH_COUNT]{};
 };
 #endif
 
