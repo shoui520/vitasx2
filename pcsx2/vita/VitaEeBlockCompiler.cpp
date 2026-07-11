@@ -31,6 +31,7 @@
 #endif
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #if defined(VITASX2_QEMU_VALIDATION)
 #include <cstdio>
@@ -39,6 +40,8 @@
 #include <type_traits>
 
 void executeCacheOp(u32 op, u32 addr);
+u32 executeCacheDxltgTagSweep(u32 start_pc, u32 fallthrough_pc,
+	u32 packed_guests, u32 packed_cycles);
 void executeCacheDxwbinPairRange(u32 addr, u32 pair_count);
 
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
@@ -422,6 +425,10 @@ u32 g_qemuCacheIxinLoopBlocks = 0;
 u32 g_qemuCacheIxinLoopHelperCalls = 0;
 u32 g_qemuCacheIxinLoopBatchedIterations = 0;
 u32 g_qemuCacheIxinLoopFallbackIterations = 0;
+u32 g_qemuCacheDxltgLoopBlocks = 0;
+u32 g_qemuCacheDxltgLoopHelperCalls = 0;
+u32 g_qemuCacheDxltgLoopCompletedIterations = 0;
+u32 g_qemuCacheDxltgLoopFallbackCalls = 0;
 u32 g_qemuSignedCountdownLoopBlocks = 0;
 u32 g_qemuSignedCountdownLoopHelperCalls = 0;
 u32 g_qemuSignedCountdownLoopBatchedIterations = 0;
@@ -2694,6 +2701,85 @@ namespace VitaEE
 			*address_guest = address;
 		if (predicate_guest)
 			*predicate_guest = predicate;
+		return true;
+	}
+
+	bool BlockCompiler::IsExactCacheDxltgTagSweep(u32 start_pc, u32 instruction_count,
+		u32* packed_guests)
+	{
+		if (instruction_count != 35 || start_pc > UINT32_MAX - 35 * sizeof(u32))
+			return false;
+
+		u32 ops[35]{};
+		for (u32 i = 0; i < 35; i++)
+			ops[i] = memRead32(start_pc + i * sizeof(u32));
+
+		const unsigned result = RT(ops[3]);
+		const unsigned mask = RT(ops[4]);
+		const unsigned induction = RT(ops[5]);
+		const unsigned upper = RS(ops[6]);
+		const unsigned comparison = RD(ops[6]);
+		const unsigned lower = RT(ops[7]);
+		const u32 guest_mask = (1u << result) | (1u << comparison) |
+			(1u << lower) | (1u << upper) | (1u << induction) | (1u << mask);
+		if (result == 0 || comparison == 0 || lower == 0 || upper == 0 ||
+			induction == 0 || mask == 0 || std::popcount(guest_mask) != 6)
+		{
+			return false;
+		}
+
+		const auto match_way = [&](u32 base, s16 cache_offset, u32 branch_target) {
+			const u32 mfc0 = ops[base + 3];
+			const u32 and_op = ops[base + 4];
+			const u32 addu = ops[base + 5];
+			const u32 sltu_upper = ops[base + 6];
+			const u32 sltu_lower = ops[base + 7];
+			const u32 branch = ops[base + 8];
+			if (ops[base] != 0x0000000fu ||
+				(ops[base + 1] >> 26) != 0x2f || RT(ops[base + 1]) != 0x10 ||
+				RS(ops[base + 1]) != induction || IMM_S(ops[base + 1]) != cache_offset ||
+				ops[base + 2] != 0x0000000fu ||
+				(mfc0 & ~(0x1fu << 16)) != 0x4000e000u || RT(mfc0) != result ||
+				(and_op >> 26) != 0 || (and_op & 0x3f) != 0x24 || SA(and_op) != 0 ||
+				RS(and_op) != result || RT(and_op) != mask || RD(and_op) != result ||
+				(addu >> 26) != 0 || (addu & 0x3f) != 0x21 || SA(addu) != 0 ||
+				RS(addu) != result || RT(addu) != induction || RD(addu) != result ||
+				(sltu_upper >> 26) != 0 || (sltu_upper & 0x3f) != 0x2b || SA(sltu_upper) != 0 ||
+				RS(sltu_upper) != upper || RT(sltu_upper) != result || RD(sltu_upper) != comparison ||
+				(sltu_lower >> 26) != 0 || (sltu_lower & 0x3f) != 0x2b || SA(sltu_lower) != 0 ||
+				RS(sltu_lower) != result || RT(sltu_lower) != lower || RD(sltu_lower) != result ||
+				(branch >> 26) != 0x05 || RS(branch) != result || RT(branch) != 0 ||
+				BranchTarget(start_pc + (base + 8) * sizeof(u32), branch) != branch_target ||
+				ops[base + 9] != 0)
+			{
+				return false;
+			}
+			for (u32 i = 10; i < 15; i++)
+			{
+				if (ops[base + i] != 0)
+					return false;
+			}
+			return true;
+		};
+
+		if (!match_way(0, 0, start_pc + 15 * sizeof(u32)) ||
+			!match_way(15, 1, start_pc + 30 * sizeof(u32)) ||
+			ops[30] != 0x0000000fu ||
+			(ops[31] >> 26) != 0x09 || RS(ops[31]) != induction ||
+			RT(ops[31]) != induction || IMM_S(ops[31]) != 64 ||
+			(ops[32] >> 26) != 0x0a || RS(ops[32]) != induction ||
+			RT(ops[32]) != result || IMM_S(ops[32]) != 4096 ||
+			(ops[33] >> 26) != 0x05 || RS(ops[33]) != result || RT(ops[33]) != 0 ||
+			BranchTarget(start_pc + 33 * sizeof(u32), ops[33]) != start_pc || ops[34] != 0)
+		{
+			return false;
+		}
+
+		if (packed_guests)
+		{
+			*packed_guests = result | (comparison << 5) | (lower << 10) |
+				(upper << 15) | (induction << 20) | (mask << 25);
+		}
 		return true;
 	}
 
@@ -9034,6 +9120,96 @@ namespace VitaEE
 			   m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0));
 	}
 
+	bool BlockCompiler::CompileCacheDxltgTagSweep(u32 start_pc, u32 instruction_count,
+		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
+		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
+	{
+		u32 packed_guests = 0;
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactCacheDxltgTagSweep(start_pc, instruction_count, &packed_guests))
+		{
+			return false;
+		}
+
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		const auto range_cycles = [&](u32 first, u32 count) {
+			u32 raw_cycles = 0;
+			for (u32 i = 0; i < count; i++)
+			{
+				const u32 op = memRead32(start_pc + (first + i) * sizeof(u32));
+				raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) * cycle_factor;
+			}
+			return ScaleBlockCycles(raw_cycles);
+		};
+		const u32 sync_cycles = range_cycles(0, 1);
+		const u32 cache_cycles = range_cycles(1, 1);
+		const u32 compare_cycles = range_cycles(3, 7);
+		const u32 padding_sync_cycles = range_cycles(10, 6);
+		const u32 induction_cycles = range_cycles(31, 4);
+		if (sync_cycles > 0x3f || cache_cycles > 0x3f || compare_cycles > 0x3f ||
+			padding_sync_cycles > 0x3f || induction_cycles > 0x3f)
+		{
+			return false;
+		}
+		const u32 packed_cycles = sync_cycles | (cache_cycles << 6) |
+			(compare_cycles << 12) | (padding_sync_cycles << 18) |
+			(induction_cycles << 24);
+		const u32 taken_iteration_cycles = sync_cycles * 5 + cache_cycles * 2 +
+			compare_cycles * 2 + induction_cycles;
+		if (scaled_cycles)
+			*scaled_cycles = taken_iteration_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		if (!BeginBlock(false, false, false, linked_entry_offset) ||
+			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1,
+				start_pc + instruction_count * sizeof(u32)) ||
+			!m_code.EmitMovImm32(HOST_TMP2, packed_guests) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_cycles) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&executeCacheDxltgTagSweep)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 2))
+		{
+			return false;
+		}
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 1))
+		{
+			return false;
+		}
+		const size_t self_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (self_branch == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+		const size_t self_target = m_code.Size();
+		if (!m_code.PatchBranch(self_branch, self_target, VitaA32::Condition::EQ) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
+		{
+			return false;
+		}
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = start_pc + instruction_count * sizeof(u32);
+		direct_links->slots[0].valid = true;
+		direct_links->slots[1].target_pc = start_pc;
+		direct_links->slots[1].valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCacheDxltgLoopBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompileSignedCountdownLoop(u32 start_pc, u32 instruction_count,
 		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -9457,11 +9633,28 @@ namespace VitaEE
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		device_trace_enabled = Pcsx2Trace::IsGsTraceEnabled() || Pcsx2Trace::IsVuTraceEnabled();
 #endif
-		const bool cache_loop_batch_enabled =
+		bool range_loop_dispatch_enabled = true;
+#if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		// The focused provider fixture has no pre-instruction callback and calls
+		// generated blocks directly for compile-size probes as well as through
+		// persistent execution. Neither path records per-instruction traces.
+		range_loop_dispatch_enabled = true;
+#else
+		// Range helpers execute several guest iterations per generated call and
+		// therefore cannot preserve callable instruction-window trace records.
+		range_loop_dispatch_enabled = !VitaIsEePreInstructionTraceEnabled();
+#endif
+		const bool cache_loop_batch_enabled = range_loop_dispatch_enabled &&
 			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack;
 		const bool signed_countdown_loop_batch_enabled =
-			EmuConfig.Speedhacks.WaitLoop && !device_trace_enabled &&
+			range_loop_dispatch_enabled && EmuConfig.Speedhacks.WaitLoop && !device_trace_enabled &&
 			!EmuConfig.Gamefixes.GoemonTlbHack;
+		if (cache_loop_batch_enabled && direct_links &&
+			IsExactCacheDxltgTagSweep(start_pc, instruction_count))
+		{
+			return CompileCacheDxltgTagSweep(start_pc, instruction_count, direct_exit, event_exit,
+				scaled_cycles, direct_links, linked_entry_offset);
+		}
 		if (signed_countdown_loop_batch_enabled && direct_links &&
 			IsExactSignedCountdownLoop(start_pc, instruction_count))
 		{

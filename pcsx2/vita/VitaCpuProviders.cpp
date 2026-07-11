@@ -70,6 +70,11 @@ void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback call
 	s_ee_pre_instruction_trace_callback = callback;
 }
 
+bool VitaIsEePreInstructionTraceEnabled()
+{
+	return s_ee_pre_instruction_trace_callback != nullptr;
+}
+
 void VitaSetEePreInstructionTraceWindowSkipCallback(VitaEePreInstructionTraceWindowSkipCallback callback)
 {
 	s_ee_pre_instruction_trace_window_skip_callback = callback;

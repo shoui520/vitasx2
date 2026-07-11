@@ -12,6 +12,10 @@ void resetCache();
 // This is necessary to fix a bug when enabled the recompiler while the cache was enabled.
 void writebackCache();
 void executeCacheOp(u32 op, u32 addr);
+// Executes the exact two-way DXLTG/tag-check/induction sweep owned by
+// Cache.cpp and returns complete/self/event as 0/1/2 after publishing EE state.
+u32 executeCacheDxltgTagSweep(u32 start_pc, u32 fallthrough_pc,
+	u32 packed_guests, u32 packed_cycles);
 // Executes consecutive DXWBIN index pairs at addr/addr+1, advancing addr by
 // one 64-byte EE cache line per pair. This is the exact Cache.cpp-owned
 // operation used by the EE kernel's two-way D-cache maintenance loop.

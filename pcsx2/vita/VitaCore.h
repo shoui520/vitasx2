@@ -92,6 +92,7 @@ void VitaSetFastBootDisc();
 // externally after recording the needed instruction count.
 using VitaEePreInstructionTraceCallback = bool (*)(u32 pc, u32 opcode);
 void VitaSetEePreInstructionTraceCallback(VitaEePreInstructionTraceCallback callback);
+bool VitaIsEePreInstructionTraceEnabled();
 bool VitaRecordEePreInstruction(u32 pc, u32 opcode);
 
 // Optional trace-harness fast path for A32 exact-stream recording. The callback

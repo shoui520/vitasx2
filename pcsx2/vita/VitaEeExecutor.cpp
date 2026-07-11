@@ -9,6 +9,11 @@
 #include "pcsx2/R5900.h"
 #include "pcsx2/vtlb.h"
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
+#if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
+#include "pcsx2/DebugTools/GsTrace.h"
+#include "pcsx2/DebugTools/VuTrace.h"
+#include "pcsx2/vita/VitaCore.h"
+#endif
 
 #include <cstring>
 #include <new>
@@ -874,9 +879,22 @@ namespace VitaEE
 		result->stop = BlockScanStop::MaxInstructions;
 
 		u32 exact_cache_loop_instruction_count = 0;
-		if (max_instruction_count >= 9 && BlockCompiler::IsExactCacheDxwbinLoop(start_pc, 9))
+		bool exact_cache_loop_scan_enabled = true;
+#if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
+		exact_cache_loop_scan_enabled = !VitaIsEePreInstructionTraceEnabled() &&
+			!Pcsx2Trace::IsGsTraceEnabled() && !Pcsx2Trace::IsVuTraceEnabled() &&
+			!EmuConfig.Gamefixes.GoemonTlbHack;
+#endif
+		if (exact_cache_loop_scan_enabled && max_instruction_count >= 35 &&
+			BlockCompiler::IsExactCacheDxltgTagSweep(start_pc, 35))
+		{
+			exact_cache_loop_instruction_count = 35;
+		}
+		else if (exact_cache_loop_scan_enabled && max_instruction_count >= 9 &&
+			BlockCompiler::IsExactCacheDxwbinLoop(start_pc, 9))
 			exact_cache_loop_instruction_count = 9;
-		else if (max_instruction_count >= 8 && BlockCompiler::IsExactCacheIxinLoop(start_pc, 8))
+		else if (exact_cache_loop_scan_enabled && max_instruction_count >= 8 &&
+			BlockCompiler::IsExactCacheIxinLoop(start_pc, 8))
 			exact_cache_loop_instruction_count = 8;
 		if (exact_cache_loop_instruction_count != 0)
 		{
@@ -921,6 +939,16 @@ namespace VitaEE
 			const u32 op = memRead32(pc);
 			if (BlockCompiler::IsSupportedBranchOpcode(op))
 			{
+				if (exact_cache_loop_instruction_count != 0 &&
+					i + 2 < exact_cache_loop_instruction_count)
+				{
+					// The exact DXLTG sweep's two internal BNEs only select inert
+					// padding. Its specialized compiler owns both paths and their
+					// different cycle costs; keep scanning to the outer backedge.
+					result->instruction_count++;
+					result->stop_pc = pc + 4;
+					continue;
+				}
 				// Ported from PCSX2 x86/ix86-32/iR5900.cpp::recRecompile():
 				// branches and jumps end the block after the delay slot. If the
 				// delay slot is itself a supported branch, the compiler applies
