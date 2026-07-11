@@ -284,6 +284,19 @@ enum VitaEeFourWordFillResult : u32
 u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 	u32 block_cycles, u32 packed_guests);
 
+enum VitaEePreincrementWordFillResult : u32
+{
+	VITA_EE_PREINCREMENT_WORD_FILL_COMPLETE = 0,
+	VITA_EE_PREINCREMENT_WORD_FILL_SELF = 1,
+	VITA_EE_PREINCREMENT_WORD_FILL_EVENT = 2,
+	VITA_EE_PREINCREMENT_WORD_FILL_REDISPATCH = 3,
+};
+
+// Executes the exact ADDIU/SW/SUBU/SLTIU/BEQ/NOP word-fill loop. Direct pages
+// batch to completion, page, or event; observable mappings execute one store.
+u32 VitaEeExecutePreincrementWordFill(u32 start_pc, u32 fallthrough_pc,
+	u32 packed_cycles, u32 packed_guests);
+
 enum VitaEeSelfAddressPairScanResult : u32
 {
 	VITA_EE_SELF_ADDRESS_PAIR_SCAN_COMPLETE = 0,

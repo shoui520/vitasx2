@@ -619,6 +619,193 @@ u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 	return VITA_EE_FOUR_WORD_FILL_SELF;
 }
 
+u32 VitaEeExecutePreincrementWordFill(u32 start_pc, u32 fallthrough_pc,
+	u32 packed_cycles, u32 packed_guests)
+{
+	// PCSX2 owners: x86/ix86-32/iR5900AritImm.cpp::recADDIU()/recSLTIU_(),
+	// iR5900LoadStore.cpp::recSW(), iR5900Arit.cpp::recSUBU(),
+	// iR5900Branch.cpp::recBEQ(), recVTLB.cpp::DynGen_DirectWrite(), and
+	// iR5900.cpp::iBranchTest().
+	const unsigned pointer_guest = packed_guests & 0x1f;
+	const unsigned end_guest = (packed_guests >> 5) & 0x1f;
+	const unsigned value_guest = (packed_guests >> 10) & 0x1f;
+	const unsigned result_guest = (packed_guests >> 15) & 0x1f;
+	const u32 block_cycles = packed_cycles & 0xffff;
+	const u32 store_cycles = packed_cycles >> 16;
+	const u32 address = cpuRegs.GPR.r[pointer_guest].UL[0];
+	const u32 end_low = cpuRegs.GPR.r[end_guest].UL[0];
+	const u32 value = value_guest == 0 ? 0 : cpuRegs.GPR.r[value_guest].UL[0];
+	u32 iterations = 1;
+	bool force_redispatch = false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	bool direct_bulk = false;
+	extern u32 g_qemuPreincrementWordFillHelperCalls;
+	extern u32 g_qemuPreincrementWordFillBulkChunks;
+	extern u32 g_qemuPreincrementWordFillBulkWords;
+	extern u32 g_qemuPreincrementWordFillScalarIterations;
+	extern u32 g_qemuPreincrementWordFillPageReturns;
+	extern u32 g_qemuPreincrementWordFillRedispatches;
+	extern bool g_qemuPreincrementWordFillForceRedispatch;
+	g_qemuPreincrementWordFillHelperCalls++;
+#endif
+
+	// ADDIU executes before SW -4(pointer), so its sign-extended result is
+	// observable to an address-error exit, a handler, and Cpu->Clear().
+	const u32 first_updated = address + sizeof(u32);
+	cpuRegs.GPR.r[pointer_guest].UD[0] = static_cast<u64>(
+		static_cast<s64>(static_cast<s32>(first_updated)));
+	if ((address & 3u) != 0)
+	{
+		cpuRegs.pc = start_pc + 2 * sizeof(u32);
+		cpuRegs.cycle += store_cycles;
+		if (Cpu && Cpu->CancelInstruction)
+			Cpu->CancelInstruction();
+		return VITA_EE_PREINCREMENT_WORD_FILL_EVENT;
+	}
+
+	const VTLBVirtual mapping = vtlbdata.vmap[address >> VTLB_PAGE_BITS];
+	u32 physical_address = 0;
+	bool protected_page = false;
+	if (!mapping.isHandler(address))
+	{
+		physical_address = vtlb_V2P(address);
+		const vtlb_ProtectionMode protection = mmap_GetRamPageInfo(physical_address);
+		protected_page = protection == ProtMode_Write || protection == ProtMode_Manual;
+#if defined(VITASX2_QEMU_VALIDATION)
+		protected_page |= g_qemuPreincrementWordFillForceRedispatch;
+#endif
+	}
+
+	const u32 bytes_to_page = VTLB_PAGE_SIZE - (address & VTLB_PAGE_MASK);
+	const bool batchable = !mapping.isHandler(address) && !protected_page &&
+		block_cycles != 0;
+	if (batchable)
+	{
+		iterations = bytes_to_page / sizeof(u32);
+
+		// SUBU forms sign_extend_32(end - updated_pointer), then SLTIU compares
+		// that 64-bit representation with 4. The low two delta bits are a fixed
+		// terminal residue. A zero byte distance is the do-while entry state and
+		// cannot terminate until the 32-bit induction wraps.
+		const u32 initial_delta = end_low - address;
+		const u32 terminal_residue = initial_delta & 3u;
+		const u32 bytes_to_completion = initial_delta - terminal_residue;
+		if (bytes_to_completion != 0)
+			iterations = std::min(iterations, bytes_to_completion / sizeof(u32));
+
+		const s32 cycle_delta = static_cast<s32>(
+			static_cast<u32>(cpuRegs.cycle) - static_cast<u32>(cpuRegs.nextEventCycle));
+		u32 to_event = iterations;
+		if (cycle_delta >= 0)
+		{
+			to_event = 1;
+		}
+		else
+		{
+			// The measured tail has three iterations. Probe those deadlines with
+			// low-word adds so its common path needs neither ARM's software 64-bit
+			// divide nor a multiply; retain the general quotient for longer ranges.
+			u32 projected_delta = static_cast<u32>(cycle_delta);
+			bool event_found = false;
+			projected_delta += block_cycles;
+			if (static_cast<s32>(projected_delta) >= 0)
+			{
+				to_event = 1;
+				event_found = true;
+			}
+			else if (iterations >= 2)
+			{
+				projected_delta += block_cycles;
+				if (static_cast<s32>(projected_delta) >= 0)
+				{
+					to_event = 2;
+					event_found = true;
+				}
+				else if (iterations >= 3)
+				{
+					projected_delta += block_cycles;
+					if (static_cast<s32>(projected_delta) >= 0)
+					{
+						to_event = 3;
+						event_found = true;
+					}
+				}
+			}
+			if (!event_found && iterations > 3)
+			{
+				to_event = static_cast<u32>(
+					(-static_cast<s64>(cycle_delta) + block_cycles - 1) / block_cycles);
+			}
+		}
+		iterations = std::min(iterations, to_event);
+
+		u32* const host = reinterpret_cast<u32*>(mapping.assumePtr(address));
+		if (iterations <= 3)
+		{
+			for (u32 i = 0; i < iterations; i++)
+				host[i] = value;
+		}
+		else if (value == 0)
+		{
+			std::memset(host, 0, static_cast<size_t>(iterations) * sizeof(u32));
+		}
+		else
+		{
+			for (u32 i = 0; i < iterations; i++)
+				host[i] = value;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		direct_bulk = true;
+		g_qemuPreincrementWordFillBulkChunks++;
+		g_qemuPreincrementWordFillBulkWords += iterations;
+#endif
+	}
+	else
+	{
+		vtlb_memWrite<mem32_t>(address, value);
+		if (protected_page)
+		{
+			force_redispatch = true;
+			if (Cpu && Cpu->Clear)
+				Cpu->Clear(physical_address & ~3u, 1);
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuPreincrementWordFillScalarIterations++;
+#endif
+	}
+
+	const u32 updated_low = address + iterations * sizeof(u32);
+	cpuRegs.GPR.r[pointer_guest].UD[0] = static_cast<u64>(
+		static_cast<s64>(static_cast<s32>(updated_low)));
+	const u32 difference_low = end_low - updated_low;
+	const u64 difference = static_cast<u64>(
+		static_cast<s64>(static_cast<s32>(difference_low)));
+	const u64 predicate = difference < 4 ? 1 : 0;
+	cpuRegs.GPR.r[result_guest].UD[0] = predicate;
+	cpuRegs.cycle += static_cast<u64>(iterations) * block_cycles;
+	const bool repeat = predicate == 0;
+	cpuRegs.pc = repeat ? start_pc : fallthrough_pc;
+	const bool event_due = static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
+		static_cast<u32>(cpuRegs.nextEventCycle)) >= 0;
+	if (event_due)
+		return VITA_EE_PREINCREMENT_WORD_FILL_EVENT;
+	if (force_redispatch)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuPreincrementWordFillRedispatches++;
+#endif
+		return VITA_EE_PREINCREMENT_WORD_FILL_REDISPATCH;
+	}
+	if (!repeat)
+		return VITA_EE_PREINCREMENT_WORD_FILL_COMPLETE;
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (direct_bulk)
+		g_qemuPreincrementWordFillPageReturns++;
+#endif
+	return VITA_EE_PREINCREMENT_WORD_FILL_SELF;
+}
+
 u32 VitaEeExecuteSelfAddressPairScan(u32 start_pc, u32 packed_guests,
 	u32 packed_cycles, u32 load_cycles)
 {

@@ -445,6 +445,14 @@ u32 g_qemuFourWordFillScalarIterations = 0;
 u32 g_qemuFourWordFillPageReturns = 0;
 u32 g_qemuFourWordFillRedispatches = 0;
 bool g_qemuFourWordFillForceRedispatch = false;
+u32 g_qemuPreincrementWordFillBlocks = 0;
+u32 g_qemuPreincrementWordFillHelperCalls = 0;
+u32 g_qemuPreincrementWordFillBulkChunks = 0;
+u32 g_qemuPreincrementWordFillBulkWords = 0;
+u32 g_qemuPreincrementWordFillScalarIterations = 0;
+u32 g_qemuPreincrementWordFillPageReturns = 0;
+u32 g_qemuPreincrementWordFillRedispatches = 0;
+bool g_qemuPreincrementWordFillForceRedispatch = false;
 u32 g_qemuSelfAddressPairScanBlocks = 0;
 u32 g_qemuSelfAddressPairScanHelperCalls = 0;
 u32 g_qemuSelfAddressPairScanDirectPairs = 0;
@@ -2934,6 +2942,49 @@ namespace VitaEE
 			*end_guest = end;
 		if (value_guest)
 			*value_guest = value;
+		return true;
+	}
+
+	bool BlockCompiler::IsExactPreincrementWordFillLoop(u32 start_pc,
+		u32 instruction_count, unsigned* pointer_guest, unsigned* end_guest,
+		unsigned* value_guest, unsigned* result_guest)
+	{
+		if (instruction_count != 6 || start_pc > UINT32_MAX - 6 * sizeof(u32))
+			return false;
+
+		u32 ops[6]{};
+		for (u32 i = 0; i < instruction_count; i++)
+			ops[i] = memRead32(start_pc + i * sizeof(u32));
+		const unsigned pointer = RT(ops[0]);
+		const unsigned value = RT(ops[1]);
+		const unsigned end = RS(ops[2]);
+		const unsigned result = RD(ops[2]);
+		const u32 guest_mask = (1u << pointer) | (1u << end) |
+			(1u << value) | (1u << result);
+		if (pointer == 0 || end == 0 || result == 0 ||
+			std::popcount(guest_mask) != 4 ||
+			(ops[0] >> 26) != 0x09 || RS(ops[0]) != pointer ||
+			IMM_S(ops[0]) != 4 ||
+			(ops[1] >> 26) != 0x2b || RS(ops[1]) != pointer ||
+			IMM_S(ops[1]) != -4 ||
+			(ops[2] >> 26) != 0 || (ops[2] & 0x3f) != 0x23 ||
+			RT(ops[2]) != pointer || ((ops[2] >> 6) & 0x1f) != 0 ||
+			(ops[3] >> 26) != 0x0b || RS(ops[3]) != result ||
+			RT(ops[3]) != result || IMM_S(ops[3]) != 4 ||
+			(ops[4] >> 26) != 0x04 || RS(ops[4]) != result || RT(ops[4]) != 0 ||
+			BranchTarget(start_pc + 4 * sizeof(u32), ops[4]) != start_pc || ops[5] != 0)
+		{
+			return false;
+		}
+
+		if (pointer_guest)
+			*pointer_guest = pointer;
+		if (end_guest)
+			*end_guest = end;
+		if (value_guest)
+			*value_guest = value;
+		if (result_guest)
+			*result_guest = result;
 		return true;
 	}
 
@@ -9753,6 +9804,108 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::CompilePreincrementWordFillLoop(u32 start_pc,
+		u32 instruction_count, const void* direct_exit, const void* event_exit,
+		u32* scaled_cycles, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
+	{
+		unsigned pointer_guest = 0;
+		unsigned end_guest = 0;
+		unsigned value_guest = 0;
+		unsigned result_guest = 0;
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactPreincrementWordFillLoop(start_pc, instruction_count,
+				&pointer_guest, &end_guest, &value_guest, &result_guest))
+		{
+			return false;
+		}
+
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		const auto range_cycles = [&](u32 count) {
+			u32 raw_cycles = 0;
+			for (u32 i = 0; i < count; i++)
+			{
+				const u32 op = memRead32(start_pc + i * sizeof(u32));
+				raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) * cycle_factor;
+			}
+			return ScaleBlockCycles(raw_cycles);
+		};
+		const u32 block_cycles = range_cycles(instruction_count);
+		const u32 store_cycles = range_cycles(2);
+		if (block_cycles == 0 || block_cycles > 0xffff || store_cycles > 0xffff)
+			return false;
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
+		const u32 packed_cycles = block_cycles | (store_cycles << 16);
+		const u32 packed_guests = pointer_guest | (end_guest << 5) |
+			(value_guest << 10) | (result_guest << 15);
+		if (!BeginBlock(false, false, false, linked_entry_offset) ||
+			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP2, packed_cycles) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
+				&VitaEeExecutePreincrementWordFill)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, VITA_EE_PREINCREMENT_WORD_FILL_EVENT))
+		{
+			return false;
+		}
+
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, VITA_EE_PREINCREMENT_WORD_FILL_REDISPATCH))
+		{
+			return false;
+		}
+		const size_t redispatch_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (redispatch_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, VITA_EE_PREINCREMENT_WORD_FILL_SELF))
+		{
+			return false;
+		}
+		const size_t self_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (self_branch == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+		const size_t self_target = m_code.Size();
+		if (!m_code.PatchBranch(self_branch, self_target, VitaA32::Condition::EQ) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
+		{
+			return false;
+		}
+		const size_t redispatch_target = m_code.Size();
+		if (!m_code.PatchBranch(redispatch_branch, redispatch_target,
+				VitaA32::Condition::EQ) ||
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
+		{
+			return false;
+		}
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = fallthrough_pc;
+		direct_links->slots[0].valid = true;
+		direct_links->slots[1].target_pc = start_pc;
+		direct_links->slots[1].valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuPreincrementWordFillBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompileSelfAddressPairScan(u32 start_pc,
 		u32 instruction_count, const void* direct_exit, const void* event_exit,
 		u32* scaled_cycles, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -10440,6 +10593,12 @@ namespace VitaEE
 			IsExactFourWordFillLoop(start_pc, instruction_count))
 		{
 			return CompileFourWordFillLoop(start_pc, instruction_count,
+				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
+		}
+		if (memory_range_loop_batch_enabled && direct_links &&
+			IsExactPreincrementWordFillLoop(start_pc, instruction_count))
+		{
+			return CompilePreincrementWordFillLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
 		if (memory_range_loop_batch_enabled && direct_links &&
