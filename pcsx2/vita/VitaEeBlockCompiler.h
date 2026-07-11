@@ -377,6 +377,10 @@ namespace VitaEE
 		{
 			m_compatible_likely_taken_suffix_enabled = enabled;
 		}
+		void SetCompatiblePredicateEntryVariantEnabled(bool enabled)
+		{
+			m_compatible_predicate_entry_variant_enabled = enabled;
+		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -1116,6 +1120,7 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 		bool m_vtlb_linked_entry_pc_publication_enabled = false;
 		bool m_compatible_likely_taken_suffix_enabled = true;
+		bool m_compatible_predicate_entry_variant_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;
@@ -1132,7 +1137,11 @@ namespace VitaEE
 		bool m_compatible_vtlb_pointer = false;
 		bool m_compatible_vtlb_pointer_access = false;
 		bool m_compatible_predicate_consumer = false;
+		bool m_compatible_predicate_entry_variant = false;
 		bool m_compatible_likely_taken_suffix = false;
+		u8 m_compatible_predicate_resident_host = PredicateLinkMapping::NO_HOST;
+		size_t m_compatible_predicate_canonical_skip_delay = static_cast<size_t>(-1);
+		size_t m_compatible_predicate_canonical_enter_delay = static_cast<size_t>(-1);
 		bool m_reclaimed_vtlb_link_hosts = false;
 		size_t m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);

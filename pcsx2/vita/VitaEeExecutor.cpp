@@ -661,6 +661,15 @@ namespace VitaEE
 		m_compatible_likely_taken_suffix_enabled = enabled;
 	}
 
+	void BlockExecutor::SetCompatiblePredicateEntryVariantEnabled(bool enabled)
+	{
+		if (m_compatible_predicate_entry_variant_enabled == enabled)
+			return;
+
+		Reset();
+		m_compatible_predicate_entry_variant_enabled = enabled;
+	}
+
 	void BlockExecutor::SetVtlbLinkedEntryPcPublicationEnabled(bool enabled)
 	{
 		if (m_vtlb_linked_entry_pc_publication_enabled == enabled)
@@ -1229,6 +1238,8 @@ namespace VitaEE
 				m_vtlb_linked_entry_pc_publication_enabled);
 			compiler.SetCompatibleLikelyTakenSuffixEnabled(
 				m_compatible_likely_taken_suffix_enabled);
+			compiler.SetCompatiblePredicateEntryVariantEnabled(
+				m_compatible_predicate_entry_variant_enabled);
 #endif
 			u32 attempt_scaled_cycles = 0;
 			size_t attempt_linked_entry_offset = 0;

@@ -128,6 +128,10 @@ u32 g_qemuCompatiblePredicateBlocks = 0;
 u32 g_qemuCompatiblePredicateCanonicalInstructions = 0;
 u32 g_qemuCompatiblePredicateLinkedInstructionsElided = 0;
 u32 g_qemuCompatiblePredicateEdgeInstructions = 0;
+u32 g_qemuCompatiblePredicateEntryVariantBlocks = 0;
+u32 g_qemuCompatiblePredicateEntryVariantCanonicalInstructions = 0;
+u32 g_qemuCompatiblePredicateEntryVariantEdgeInstructionsElided = 0;
+u32 g_qemuCompatiblePredicateEntryVariantEventInstructions = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixBlocks = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixHotInstructionsElided = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixColdInstructions = 0;
@@ -7973,18 +7977,31 @@ namespace VitaEE
 			start_pc == m_gpr_link_signature.vtlb_pointer.access_pc;
 		m_compatible_predicate_consumer = m_gpr_link_signature.HasPredicate() &&
 			start_pc == m_gpr_link_signature.predicate.consumer_pc;
-		const u32 compatible_predicate_branch = m_compatible_predicate_consumer ?
-			memRead32(start_pc) : 0;
+		const u32 compatible_predicate_consumer_pc =
+			m_gpr_link_signature.HasPredicate() ?
+				m_gpr_link_signature.predicate.consumer_pc : 0;
+		const u32 compatible_predicate_branch =
+			m_gpr_link_signature.HasPredicate() ?
+				memRead32(compatible_predicate_consumer_pc) : 0;
 		const u32 compatible_predicate_delay =
-			m_compatible_predicate_consumer && instruction_count == 2 ?
-				memRead32(start_pc + sizeof(u32)) : 0;
-		m_compatible_likely_taken_suffix = m_compatible_predicate_consumer &&
-			m_compatible_scheduler_countdown && persistent_dispatch_exits && direct_links &&
-			instruction_count == 2 && (compatible_predicate_branch >> 26) == 0x15 &&
+			m_gpr_link_signature.HasPredicate() ?
+				memRead32(compatible_predicate_consumer_pc + sizeof(u32)) : 0;
+		m_compatible_predicate_entry_variant =
+			m_gpr_link_signature.HasPredicate() && m_compatible_scheduler_countdown &&
+			persistent_dispatch_exits && direct_links &&
+			(compatible_predicate_branch >> 26) == 0x15 &&
 			(compatible_predicate_delay >> 26) == 0x09;
+		m_compatible_likely_taken_suffix = m_compatible_predicate_consumer &&
+			m_compatible_predicate_entry_variant && instruction_count == 2;
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_compatible_likely_taken_suffix &= m_compatible_likely_taken_suffix_enabled;
+		m_compatible_predicate_entry_variant &=
+			m_compatible_likely_taken_suffix_enabled &&
+			m_compatible_predicate_entry_variant_enabled;
 #endif
+		m_compatible_predicate_resident_host = PredicateLinkMapping::NO_HOST;
+		m_compatible_predicate_canonical_skip_delay = static_cast<size_t>(-1);
+		m_compatible_predicate_canonical_enter_delay = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_dirty_pins = {};
@@ -8483,7 +8500,12 @@ namespace VitaEE
 					// and REGIMM likely forms cancel the delay slot when the
 					// condition is false; x86/ix86-32/iR5900Branch.cpp emits a
 					// separate not-taken path without recompileNextInstruction().
-					if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
+					const unsigned likely_predicate_host =
+						m_compatible_predicate_consumer &&
+						m_compatible_predicate_entry_variant &&
+						m_compatible_predicate_resident_host != PredicateLinkMapping::NO_HOST ?
+							m_compatible_predicate_resident_host : m_branch_flag_host;
+					if (!m_code.EmitCmpImm32(likely_predicate_host, 0))
 	{
 						return false;
 	}
@@ -8504,6 +8526,13 @@ namespace VitaEE
 			m_current_instruction_index = i;
 			add_raw_cycles(op);
 			const bool branch_delay_slot = has_branch && i == branch_instruction_index + 1;
+			if (branch_delay_slot &&
+				m_compatible_predicate_canonical_enter_delay != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(m_compatible_predicate_canonical_enter_delay,
+					m_code.Size()))
+			{
+				return false;
+			}
 			if (!EmitDeviceTracePreInstruction(pc))
 				return false;
 			if (IsDI(op))
@@ -8962,6 +8991,34 @@ namespace VitaEE
 			return false;
 		}
 
+		if (m_compatible_predicate_entry_variant)
+		{
+			const int resident_host = FindGprPinHost(predicate.guest);
+			if (resident_host < 0)
+				return false;
+			m_compatible_predicate_resident_host = static_cast<u8>(resident_host);
+			if (m_compatible_predicate_resident_host != predicate.host)
+			{
+				// PCSX2's x86 register cache lets each linked entry retain its own
+				// compatible MODE_READ mapping. Keep canonical entry on the private
+				// r5 predicate, but route it around the r7-resident linked guard. The
+				// EQ flags from EmitCompareGpr64ForBranch() survive both MOVs above.
+				m_compatible_predicate_canonical_skip_delay =
+					m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+				m_compatible_predicate_canonical_enter_delay =
+					m_code.EmitBranchPlaceholder();
+				if (m_compatible_predicate_canonical_skip_delay == static_cast<size_t>(-1) ||
+					m_compatible_predicate_canonical_enter_delay == static_cast<size_t>(-1))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuCompatiblePredicateEntryVariantBlocks++;
+				g_qemuCompatiblePredicateEntryVariantCanonicalInstructions += 2;
+#endif
+			}
+		}
+
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuCompatiblePredicateCanonicalInstructions += static_cast<u32>(
 			(m_code.Size() - start) / sizeof(u32));
@@ -8981,6 +9038,14 @@ namespace VitaEE
 		const int source_host = FindGprPinHost(predicate.guest);
 		if (source_host < 0)
 			return false;
+		if (m_compatible_predicate_entry_variant &&
+			static_cast<unsigned>(source_host) != predicate.host)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCompatiblePredicateEntryVariantEdgeInstructionsElided++;
+#endif
+			return true;
+		}
 		if (static_cast<unsigned>(source_host) != predicate.host &&
 			!m_code.EmitMovRegShiftImm(predicate.host, static_cast<unsigned>(source_host),
 				VitaA32::ShiftType::LSL, 0))
@@ -9571,6 +9636,9 @@ namespace VitaEE
 
 		const size_t cold_start = m_code.Size();
 		if (!m_code.PatchBranch(not_taken_branch, cold_start, VitaA32::Condition::EQ) ||
+			(m_compatible_predicate_canonical_skip_delay != static_cast<size_t>(-1) &&
+			 !m_code.PatchBranch(m_compatible_predicate_canonical_skip_delay,
+				 cold_start, VitaA32::Condition::EQ)) ||
 			!add_countdown(not_taken_cycles))
 		{
 			return false;
@@ -9585,9 +9653,31 @@ namespace VitaEE
 			return false;
 		}
 
-		const size_t event_target = m_code.Size();
-		if (!m_code.PatchBranch(taken_event, event_target, VitaA32::Condition::PL) ||
-			!m_code.PatchBranch(not_taken_event, event_target, VitaA32::Condition::PL) ||
+		const size_t taken_event_target = m_code.Size();
+		size_t not_taken_event_target = taken_event_target;
+		if (m_compatible_predicate_canonical_skip_delay != static_cast<size_t>(-1))
+		{
+			// The compatible entry intentionally leaves its private r5 unstaged.
+			// Materialize the selected predicate only on the cold event paths so
+			// shared conditional PC publication remains exact without a hot edge move.
+			if (!m_code.EmitMovImm8(m_branch_flag_host, 1))
+				return false;
+			const size_t taken_to_event = m_code.EmitBranchPlaceholder();
+			if (taken_to_event == static_cast<size_t>(-1))
+				return false;
+			not_taken_event_target = m_code.Size();
+			if (!m_code.EmitMovImm8(m_branch_flag_host, 0) ||
+				!m_code.PatchBranch(taken_to_event, m_code.Size()))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCompatiblePredicateEntryVariantEventInstructions += 3;
+#endif
+		}
+		if (!m_code.PatchBranch(taken_event, taken_event_target, VitaA32::Condition::PL) ||
+			!m_code.PatchBranch(not_taken_event, not_taken_event_target,
+				VitaA32::Condition::PL) ||
 			!EmitSyncGprPinsToBacking() ||
 			!EmitDeferredPcWriteback(defer_pc_writeback,
 				not_taken_pc, taken_pc, true) ||
