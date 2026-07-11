@@ -61,6 +61,7 @@ namespace VitaIOP
 		u64 trusted_source_audit_failures;
 		u64 ram_invalidation_calls;
 		u64 ram_invalidation_record_visits;
+		u32 pinned_gpr_memory_ops_saved;
 #endif
 		bool cache_hit;
 		bool lookup_hit;
@@ -94,6 +95,7 @@ namespace VitaIOP
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 		bool UsesDirectBudgetExit() const { return m_has_budget_exit; }
 		bool UsesConstantCycleBudget() const { return m_defer_cycle_updates; }
+		u32 PinnedGprMemoryOpsSaved() const { return m_pinned_gpr_memory_ops_saved; }
 
 	private:
 		bool BeginBlock();
@@ -106,6 +108,9 @@ namespace VitaIOP
 		bool EmitNativeCOP2(u32 op);
 		bool EmitStoreCode(u32 op);
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
+		void AnalyzePinnedGprs(u32 start_pc, u32 instruction_count);
+		int PinnedHostForGuest(unsigned guest_reg) const;
+		bool EmitFlushPinnedGprs();
 		void ResetGprConstState();
 		bool TryGetKnownGpr(unsigned guest_reg, u32* value) const;
 		void SetKnownGpr(unsigned guest_reg, u32 value);
@@ -235,6 +240,20 @@ namespace VitaIOP
 		u32 m_helper_instruction_count = 0;
 		u16 m_saved_registers = 0;
 		u8 m_stack_frame_size = 0;
+		struct PinnedGpr
+		{
+			u8 guest = 0;
+			u8 host = 0;
+			bool needs_initial_load = false;
+			bool written = false;
+			bool ever_written = false;
+		};
+		std::array<PinnedGpr, 2> m_pinned_gprs{};
+		u8 m_pinned_gpr_count = 0;
+		u32 m_pinned_gpr_load_hits = 0;
+		u32 m_pinned_gpr_store_hits = 0;
+		u32 m_pinned_gpr_initial_loads = 0;
+		u32 m_pinned_gpr_memory_ops_saved = 0;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
 		u32 m_block_cycle_count = 0;
@@ -274,6 +293,7 @@ namespace VitaIOP
 		void SnapshotInstrumentation(BlockExecutionResult* result) const;
 #endif
 		static void SetTrustedSourceAuditEnabled(bool enabled);
+		static void SetPinnedGprResidencyEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -327,6 +347,7 @@ namespace VitaIOP
 			u32 instruction_count = 0;
 			u32 native_instruction_count = 0;
 			u32 helper_instruction_count = 0;
+			u32 pinned_gpr_memory_ops_saved = 0;
 			DirectLinkSlots direct_links{};
 			bool wait_loop_shape = false;
 			bool wait_loop_enabled_at_compile = false;

@@ -49,6 +49,7 @@ struct IopDispatchProfileEntry
 };
 static std::unordered_map<u32, IopDispatchProfileEntry> s_iop_a32_dispatch_profile;
 static std::unordered_map<u64, u64> s_iop_a32_dispatch_edge_profile;
+static u64 s_iop_a32_pinned_gpr_memory_ops_saved = 0;
 #endif
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
@@ -807,6 +808,9 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.lookup_hits++;
 		if (result.fast_dispatch_hit)
 			s_iop_a32_stats.fast_dispatch_hits++;
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_iop_a32_pinned_gpr_memory_ops_saved += result.pinned_gpr_memory_ops_saved;
+#endif
 		if (result.wait_loop_fast_forward)
 			continue;
 
@@ -1032,6 +1036,7 @@ void VitaResetA32IopProviderStats()
 #if defined(VITASX2_QEMU_VALIDATION)
 	s_iop_a32_dispatch_profile.clear();
 	s_iop_a32_dispatch_edge_profile.clear();
+	s_iop_a32_pinned_gpr_memory_ops_saved = 0;
 #endif
 	s_iop_a32_executor.ResetInstrumentationCounters();
 }
@@ -1060,6 +1065,7 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.trusted_source_audit_failures = snapshot.trusted_source_audit_failures;
 	s_iop_a32_stats.ram_invalidation_calls = snapshot.ram_invalidation_calls;
 	s_iop_a32_stats.ram_invalidation_record_visits = snapshot.ram_invalidation_record_visits;
+	s_iop_a32_stats.pinned_gpr_memory_ops_saved = s_iop_a32_pinned_gpr_memory_ops_saved;
 #endif
 	return s_iop_a32_stats;
 }

@@ -48,6 +48,7 @@ u32 g_qemuIopConstRegisterJumpFastPaths = 0;
 u32 g_qemuIopConstCop0WriteFastPaths = 0;
 u32 g_qemuIopConstCop2WriteFastPaths = 0;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
+static bool s_qemuIopPinnedGprResidencyEnabled = true;
 #endif
 
 namespace
@@ -936,13 +937,32 @@ namespace VitaIOP
 			return false;
 		}
 
-		return !m_iop_ram_registers_available ||
-			   m_code.EmitMovImm32(HOST_IOP_RAM_BASE, static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main)));
+		if (m_iop_ram_registers_available &&
+			!m_code.EmitMovImm32(HOST_IOP_RAM_BASE,
+				static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))))
+		{
+			return false;
+		}
+
+		for (u8 i = 0; i < m_pinned_gpr_count; i++)
+		{
+			const PinnedGpr& pin = m_pinned_gprs[i];
+			if (pin.needs_initial_load)
+			{
+				if (!m_code.EmitLdrImm12(pin.host, HOST_PSX_REGS,
+						static_cast<u16>(GprOffset(pin.guest))))
+				{
+					return false;
+				}
+				m_pinned_gpr_initial_loads++;
+			}
+		}
+		return true;
 	}
 
 	bool BlockCompiler::EndBlockReturn(BlockExitKind exit, bool charge_budget)
 	{
-		if (charge_budget && !EmitChargeEeBudget())
+		if (!EmitFlushPinnedGprs() || (charge_budget && !EmitChargeEeBudget()))
 			return false;
 
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
@@ -955,7 +975,7 @@ namespace VitaIOP
 		if (!direct_exit)
 			return false;
 
-		if (!EmitChargeEeBudget() ||
+		if (!EmitFlushPinnedGprs() || !EmitChargeEeBudget() ||
 			(m_stack_frame_size != 0 && !m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size)) ||
 			!m_code.EmitPop(m_saved_registers | REG_LR))
 		{
@@ -1006,7 +1026,11 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches)
 	{
-		if (!m_code.EmitMovImm32(HOST_TMP0, pc) ||
+		// Trace callbacks observe complete pre-instruction architectural state.
+		// Publishing pins here keeps the diagnostic stream exact while production
+		// blocks retain values until their real observable seam.
+		if (!EmitFlushPinnedGprs() ||
+			!m_code.EmitMovImm32(HOST_TMP0, pc) ||
 			!m_code.EmitMovImm32(HOST_TMP1, op) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaIopA32TraceInstruction)) ||
 			!m_code.EmitCmpImm32(HOST_TMP0, 0))
@@ -1015,6 +1039,159 @@ namespace VitaIOP
 		}
 
 		direct_exit_branches.push_back(m_code.EmitBranchPlaceholder(VitaA32::Condition::NE));
+		return true;
+	}
+
+	void BlockCompiler::AnalyzePinnedGprs(u32 start_pc, u32 instruction_count)
+	{
+		// PCSX2 owner: x86/iR3000A.cpp::rpsxpropBSC() computes block-local
+		// register use before emission, and iR3000Atables.cpp keeps allocated
+		// R3000A values live until its flush boundary. Start with the two
+		// callee-saved hosts which scalar/aligned-memory blocks do not otherwise
+		// consume; unusual instruction families retain the existing memory-backed
+		// path until their clobber contracts are described.
+		m_pinned_gprs = {};
+		m_pinned_gpr_count = 0;
+		m_pinned_gpr_load_hits = 0;
+		m_pinned_gpr_store_hits = 0;
+		m_pinned_gpr_initial_loads = 0;
+		m_pinned_gpr_memory_ops_saved = 0;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!s_qemuIopPinnedGprResidencyEnabled)
+			return;
+#endif
+		std::array<u16, 32> scores{};
+		u32 written_mask = 1;
+		u32 needs_initial_mask = 0;
+		bool supported = true;
+		const auto read = [&](unsigned reg) {
+			if (reg == 0 || reg >= scores.size())
+				return;
+			scores[reg] += 2;
+			if ((written_mask & (1u << reg)) == 0)
+				needs_initial_mask |= 1u << reg;
+		};
+		const auto write = [&](unsigned reg) {
+			if (reg == 0 || reg >= scores.size())
+				return;
+			scores[reg] += 1;
+			written_mask |= 1u << reg;
+		};
+
+		for (u32 i = 0; supported && i < instruction_count; i++)
+		{
+			const u32 pc = start_pc + i * 4;
+			const u32 op = iopMemRead32(pc);
+			if (IsIopBranchOrJumpOpcode(op) || IsIopExceptionOpcode(op))
+			{
+				const u32 delay_op = (i + 1 < instruction_count) ? iopMemRead32(pc + 4) : 0;
+				const bool final_delay_pair =
+					i + 2 == instruction_count &&
+					!IsIopBranchOrJumpOpcode(delay_op) &&
+					!IsIopExceptionOpcode(delay_op);
+				const bool native_static_branch =
+					IsIopStaticConditionalBranchOpcode(op) && final_delay_pair;
+				const bool native_static_jump =
+					IsIopStaticJumpOpcode(op) && final_delay_pair &&
+					((op >> 26) != 0x02 || (delay_op >> 16) != 0x2400);
+				if (!native_static_branch && !native_static_jump)
+				{
+					supported = false;
+					continue;
+				}
+			}
+			switch (op >> 26)
+			{
+				case 0x00:
+					switch (op & 0x3fu)
+					{
+						case 0x00: case 0x02: case 0x03:
+							read(RT(op)); write(RD(op)); break;
+						case 0x04: case 0x06: case 0x07:
+						case 0x20: case 0x21: case 0x22: case 0x23:
+						case 0x24: case 0x25: case 0x26: case 0x27:
+						case 0x2a: case 0x2b:
+							read(RS(op)); read(RT(op)); write(RD(op)); break;
+						default:
+							supported = false; break;
+					}
+					break;
+				case 0x01:
+					read(RS(op));
+					supported = RT(op) == 0x00 || RT(op) == 0x01 ||
+						RT(op) == 0x10 || RT(op) == 0x11;
+					break;
+				case 0x02: break;
+				case 0x03: write(31); break;
+				case 0x04: case 0x05:
+					read(RS(op)); read(RT(op)); break;
+				case 0x06: case 0x07:
+					read(RS(op)); break;
+				case 0x08: case 0x09: case 0x0a: case 0x0b:
+				case 0x0c: case 0x0d: case 0x0e:
+					read(RS(op)); write(RT(op)); break;
+				case 0x0f:
+					write(RT(op)); break;
+				case 0x20: case 0x21: case 0x23: case 0x24: case 0x25:
+					read(RS(op)); write(RT(op)); break;
+				case 0x28: case 0x29: case 0x2b:
+					read(RS(op)); read(RT(op)); break;
+				default:
+					supported = false; break;
+			}
+		}
+
+		if (!supported)
+			return;
+
+		constexpr std::array<u8, 2> pin_hosts = {HOST_SAVED1, HOST_REGISTER_JUMP_TARGET};
+		for (u8 host : pin_hosts)
+		{
+			unsigned best_guest = 0;
+			u16 best_score = 2;
+			for (unsigned guest = 1; guest < 31; guest++)
+			{
+				bool already_pinned = false;
+				for (u8 p = 0; p < m_pinned_gpr_count; p++)
+					already_pinned |= m_pinned_gprs[p].guest == guest;
+				if (!already_pinned && scores[guest] > best_score)
+				{
+					best_guest = guest;
+					best_score = scores[guest];
+				}
+			}
+
+			if (best_guest == 0)
+				break;
+			PinnedGpr& pin = m_pinned_gprs[m_pinned_gpr_count++];
+			pin.guest = static_cast<u8>(best_guest);
+			pin.host = host;
+			pin.needs_initial_load = (needs_initial_mask & (1u << best_guest)) != 0;
+		}
+	}
+
+	int BlockCompiler::PinnedHostForGuest(unsigned guest_reg) const
+	{
+		for (u8 i = 0; i < m_pinned_gpr_count; i++)
+		{
+			if (m_pinned_gprs[i].guest == guest_reg)
+				return m_pinned_gprs[i].host;
+		}
+		return -1;
+	}
+
+	bool BlockCompiler::EmitFlushPinnedGprs()
+	{
+		for (u8 i = 0; i < m_pinned_gpr_count; i++)
+		{
+			const PinnedGpr& pin = m_pinned_gprs[i];
+			if (pin.written &&
+				!m_code.EmitStrImm12(pin.host, HOST_PSX_REGS,
+					static_cast<u16>(GprOffset(pin.guest))))
+			{
+				return false;
+			}
+		}
 		return true;
 	}
 
@@ -1556,6 +1733,13 @@ namespace VitaIOP
 	{
 		if (guest_reg == 0)
 			return m_code.EmitMovImm8(host_reg, 0);
+		if (const int pinned_host = PinnedHostForGuest(guest_reg); pinned_host >= 0)
+		{
+			m_pinned_gpr_load_hits++;
+			return static_cast<unsigned>(pinned_host) == host_reg ||
+				m_code.EmitMovRegShiftImm(host_reg, static_cast<unsigned>(pinned_host),
+					VitaA32::ShiftType::LSL, 0);
+		}
 
 		return m_code.EmitLdrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(GprOffset(guest_reg)));
 	}
@@ -1582,6 +1766,21 @@ namespace VitaIOP
 	{
 		if (guest_reg == 0)
 			return true;
+		if (const int pinned_host = PinnedHostForGuest(guest_reg); pinned_host >= 0)
+		{
+			m_pinned_gpr_store_hits++;
+			for (u8 i = 0; i < m_pinned_gpr_count; i++)
+			{
+				if (m_pinned_gprs[i].guest == guest_reg)
+				{
+					m_pinned_gprs[i].written = true;
+					m_pinned_gprs[i].ever_written = true;
+				}
+			}
+			return static_cast<unsigned>(pinned_host) == host_reg ||
+				m_code.EmitMovRegShiftImm(static_cast<unsigned>(pinned_host), host_reg,
+					VitaA32::ShiftType::LSL, 0);
+		}
 
 		return m_code.EmitStrImm12(host_reg, HOST_PSX_REGS, static_cast<u16>(GprOffset(guest_reg)));
 	}
@@ -4196,20 +4395,20 @@ namespace VitaIOP
 		if (!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(&psxNextStartCounter))) ||
 			!m_code.EmitLdrImm12(HOST_SAVED0, HOST_TMP3, 0) ||
 			!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(&psxNextDeltaCounter))) ||
-			!m_code.EmitLdrImm12(HOST_SAVED1, HOST_TMP3, 0) ||
+			!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_TMP3, 0) ||
 			!m_code.EmitSubReg(HOST_TMP3, HOST_TMP0, HOST_SAVED0) ||
-			!m_code.EmitCmpReg(HOST_TMP3, HOST_SAVED1))
+			!m_code.EmitCmpReg(HOST_TMP3, HOST_CALL_SCRATCH))
 		{
 			return false;
 		}
 		helper_branches.push_back({m_code.EmitBranchPlaceholder(VitaA32::Condition::GE),
 			VitaA32::Condition::GE});
 
-		// HOST_TMP2 still holds iopNextEventCycle.low, while HOST_SAVED0/1 keep
+		// HOST_TMP2 still holds iopNextEventCycle.low, while r5/r12 keep
 		// psxNextStartCounter.low and psxNextDeltaCounter for the second
 		// no-work test.
 		if (!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_SAVED0) ||
-			!m_code.EmitCmpReg(HOST_SAVED1, HOST_TMP2))
+			!m_code.EmitCmpReg(HOST_CALL_SCRATCH, HOST_TMP2))
 		{
 			return false;
 		}
@@ -4251,6 +4450,10 @@ namespace VitaIOP
 			return false;
 
 		const size_t helper_target = m_code.Size();
+		// R3000A.cpp::iopEventTest() reads timing, CP0, interrupt, and device
+		// state but never observes or mutates GPR words. AAPCS preserves the r6/r8
+		// pin hosts through it (including counter/device callbacks), so this
+		// operation-specific seam needs neither publication nor reload.
 		if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopEventTest), HOST_CALL_SCRATCH))
 			return false;
 
@@ -4917,6 +5120,7 @@ namespace VitaIOP
 		m_defer_cycle_updates = !m_emit_trace_checks && IopBlockCanDeferCycleUpdates(start_pc, instruction_count);
 		m_has_budget_exit = false;
 		m_block_cycle_count = instruction_count;
+		AnalyzePinnedGprs(start_pc, instruction_count);
 
 		if (!BeginBlock())
 			return false;
@@ -5152,6 +5356,15 @@ namespace VitaIOP
 				return false;
 		}
 
+		u32 written_pin_count = 0;
+		for (u8 i = 0; i < m_pinned_gpr_count; i++)
+			written_pin_count += m_pinned_gprs[i].ever_written ? 1u : 0u;
+		const u32 removed_gpr_memory_ops = m_pinned_gpr_load_hits + m_pinned_gpr_store_hits;
+		const u32 added_gpr_memory_ops = m_pinned_gpr_initial_loads + written_pin_count;
+		m_pinned_gpr_memory_ops_saved =
+			removed_gpr_memory_ops > added_gpr_memory_ops ?
+				removed_gpr_memory_ops - added_gpr_memory_ops : 0;
+
 		if (!FlushColdTails())
 			return false;
 
@@ -5212,6 +5425,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopTrustedSourceAuditEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetPinnedGprResidencyEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopPinnedGprResidencyEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -6112,15 +6334,24 @@ namespace VitaIOP
 					return true;
 
 				if (IsIopStaticConditionalBranchOpcode(op) &&
+					BranchTarget(pc, op) == start_pc &&
+					!IsIopBranchOrJumpOpcode(delay_op) &&
+					!IsIopExceptionOpcode(delay_op))
+				{
+					// PCSX2 owner: x86/iR3000A.cpp ends a hot loop block at its
+					// branch/delay pair. Give a back-edge to this block's own entry
+					// the same native two-successor tail so local register residency
+					// covers the taken loop; the one-time exit keeps its fallthrough
+					// link. Other conditionals retain the compact interpreter-style
+					// fallthrough block below.
+					return true;
+				}
+
+				if (IsIopStaticConditionalBranchOpcode(op) &&
 					!IsIopBranchOrJumpOpcode(delay_op) &&
 					!IsIopExceptionOpcode(delay_op) &&
 					(delay_pc & 0xffcu) != 0)
 				{
-					// PCSX2 owner: R3000AInterpreter.cpp::intExecuteBlock()
-					// keeps running after not-taken conditional branches because
-					// branch2 is only set by doBranch(). Let the native fallthrough
-					// path continue too; taken paths still leave through
-					// psxDoBranch(), which executes the delay slot and iopEventTest().
 					i++;
 					continue;
 				}
@@ -6409,6 +6640,7 @@ namespace VitaIOP
 		size_t block_code_slice_offset = 0;
 		u32 native_instruction_count = 0;
 		u32 helper_instruction_count = 0;
+		u32 pinned_gpr_memory_ops_saved = 0;
 		bool direct_budget_exit = false;
 		bool constant_cycle_budget = false;
 		DirectLinkSlots direct_links;
@@ -6441,6 +6673,7 @@ namespace VitaIOP
 				CommitCodeSlice(code_slice_offset, block.code.Size());
 				native_instruction_count = compiler.NativeInstructionCount();
 				helper_instruction_count = compiler.HelperInstructionCount();
+				pinned_gpr_memory_ops_saved = compiler.PinnedGprMemoryOpsSaved();
 				direct_budget_exit = compiler.UsesDirectBudgetExit();
 				constant_cycle_budget = compiler.UsesConstantCycleBudget();
 				direct_links = attempt_direct_links;
@@ -6461,6 +6694,7 @@ namespace VitaIOP
 			start_pc, instruction_count, &block.ram_source_start);
 		block.native_instruction_count = native_instruction_count;
 		block.helper_instruction_count = helper_instruction_count;
+		block.pinned_gpr_memory_ops_saved = pinned_gpr_memory_ops_saved;
 		block.direct_budget_exit = direct_budget_exit;
 		block.constant_cycle_budget = constant_cycle_budget;
 		block.direct_links = direct_links;
@@ -6575,6 +6809,7 @@ namespace VitaIOP
 		result->code_cache_used = m_code_cache_used;
 		result->code_cache_capacity = m_code_cache_capacity;
 #if defined(VITASX2_QEMU_VALIDATION)
+		result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
 		SnapshotInstrumentation(result);
 #endif
 	}
@@ -6629,7 +6864,10 @@ namespace VitaIOP
 			}
 #if defined(VITASX2_QEMU_VALIDATION)
 			else
+			{
 				result->instruction_count = block.instruction_count;
+				result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
+			}
 #endif
 			result->wait_loop_fast_forward = true;
 			return true;
@@ -6654,7 +6892,10 @@ namespace VitaIOP
 		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		else
+		{
 			result->instruction_count = block.instruction_count;
+			result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
+		}
 #endif
 		return true;
 	}
