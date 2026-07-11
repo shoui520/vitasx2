@@ -76,6 +76,7 @@ namespace VitaEE
 		u32 compatible_gpr_link_entry_instructions = 0;
 		u32 compatible_gpr_link_entry_loads = 0;
 		u32 compatible_gpr_dirty_words_carried = 0;
+		u32 compatible_scheduler_links = 0;
 #endif
 	};
 
@@ -97,6 +98,7 @@ namespace VitaEE
 		void SetPersistentDispatchEnabled(bool enabled);
 #if defined(VITASX2_QEMU_VALIDATION)
 		void SetCompatibleGprDirtyCarryEnabled(bool enabled);
+		void SetCompatibleSchedulerCarryEnabled(bool enabled);
 #endif
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
@@ -252,6 +254,7 @@ namespace VitaEE
 		bool m_persistent_dispatch_enabled = false;
 #if defined(VITASX2_QEMU_VALIDATION)
 		bool m_compatible_gpr_dirty_carry_enabled = true;
+		bool m_compatible_scheduler_carry_enabled = true;
 #endif
 	};
 } // namespace VitaEE

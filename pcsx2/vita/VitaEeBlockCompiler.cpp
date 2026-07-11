@@ -3471,7 +3471,8 @@ namespace VitaEE
 	bool GprLinkSignature::IsValid() const
 	{
 		if (count == 0 || count > MAX_PINS || block_pcs[0] >= block_pcs[1] ||
-			(block_pcs[0] & 3u) != 0 || (block_pcs[1] & 3u) != 0)
+			(block_pcs[0] & 3u) != 0 || (block_pcs[1] & 3u) != 0 ||
+			(scheduler.IsValid() && scheduler.host != SCHEDULER_HOST))
 		{
 			return false;
 		}
@@ -3607,6 +3608,67 @@ namespace VitaEE
 			!score_block(second_pc, second_instruction_count))
 		{
 			return false;
+		}
+
+		// r6 is callee-saved by AAPCS and already part of the persistent private
+		// frame. Carry PCSX2 iBranchTest()'s signed cycle/deadline delta there only
+		// for lowerings whose audited A32 templates never use HOST_TMP5. This first
+		// set covers the measured reciprocal texture-transfer loop; every expansion
+		// must audit both its hot lowering and any returning cold helper tail.
+		const auto block_preserves_scheduler_host = [](u32 start_pc, u32 instruction_count) {
+			for (u32 i = 0; i < instruction_count; i++)
+			{
+				const u32 op = memRead32(start_pc + i * sizeof(u32));
+				if (op == 0)
+					continue;
+				const unsigned opcode = op >> 26;
+				if (opcode == 0)
+				{
+					const unsigned function = op & 0x3fu;
+					if (function == 0x2a || function == 0x2b) // SLT/SLTU
+						continue;
+					return false;
+				}
+				switch (opcode)
+				{
+					case 0x04: // BEQ
+					case 0x05: // BNE
+					case 0x09: // ADDIU
+					case 0x14: // BEQL
+					case 0x15: // BNEL
+						continue;
+					case 0x23: // LW
+						// A handler-backed counter-page LW in a branch delay slot
+						// temporarily saves the branch predicate in r6.
+						if (i + 1 == instruction_count)
+							return false;
+						continue;
+					default:
+						return false;
+				}
+			}
+			return true;
+		};
+		const auto block_exits_wait_loop = [](u32 start_pc, u32 instruction_count) {
+			if (instruction_count < 2)
+				return false;
+			const u32 branch_pc = start_pc + (instruction_count - 2) * sizeof(u32);
+			const u32 branch_op = memRead32(branch_pc);
+			const unsigned opcode = branch_op >> 26;
+			if (opcode != 0x04 && opcode != 0x05 && opcode != 0x14 && opcode != 0x15)
+				return false;
+			const s32 displacement = static_cast<s16>(branch_op & 0xffffu) * 4;
+			const u32 target_pc = branch_pc + sizeof(u32) + displacement;
+			const u32 end_pc = start_pc + instruction_count * sizeof(u32);
+			return target_pc <= start_pc &&
+				IsWaitLoopBody(target_pc, end_pc, branch_pc);
+		};
+		if (block_preserves_scheduler_host(first_pc, first_instruction_count) &&
+			block_preserves_scheduler_host(second_pc, second_instruction_count) &&
+			!block_exits_wait_loop(first_pc, first_instruction_count) &&
+			!block_exits_wait_loop(second_pc, second_instruction_count))
+		{
+			signature->scheduler.host = GprLinkSignature::SCHEDULER_HOST;
 		}
 
 		signature->block_pcs[0] = first_pc < second_pc ? first_pc : second_pc;
@@ -6643,8 +6705,93 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::EmitStageCompatibleSchedulerCountdown(unsigned scratch_host,
+		bool canonical_entry)
+	{
+		if (!m_compatible_scheduler_countdown)
+			return true;
+		if (scratch_host == GprLinkSignature::SCHEDULER_HOST)
+			return false;
+
+		// Adapt PCSX2 x86/ix86-32/iR5900.cpp::iBranchTest() to the tighter A32
+		// register file. r6 carries cycle.low-nextEventCycle.low across compatible
+		// direct links; canonical entry reconstructs it from authoritative state.
+		const size_t stage_start = m_code.Size();
+		if (!m_code.EmitLdrImm12(GprLinkSignature::SCHEDULER_HOST, HOST_CPU_REGS,
+				static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitLdrImm12(scratch_host, HOST_CPU_REGS,
+				static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitSubReg(GprLinkSignature::SCHEDULER_HOST,
+				GprLinkSignature::SCHEDULER_HOST, scratch_host))
+		{
+			return false;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		const u32 instructions = static_cast<u32>(
+			(m_code.Size() - stage_start) / sizeof(u32));
+		if (canonical_entry)
+		{
+			g_qemuResidentCycleLowBlocks++;
+			g_qemuResidentNextEventLowBlocks++;
+			g_qemuResidentSchedulerCountdownBlocks++;
+			g_qemuResidentSchedulerCountdownCanonicalInstructions += instructions;
+		}
+		else
+		{
+			g_qemuResidentCycleLowColdReloadInstructions++;
+			g_qemuResidentNextEventLowColdReloadInstructions++;
+			g_qemuResidentSchedulerCountdownHandlerInstructions += instructions;
+		}
+#endif
+		return true;
+	}
+
+	bool BlockCompiler::EmitSyncCompatibleSchedulerCountdownToBacking()
+	{
+		if (!m_compatible_scheduler_countdown)
+			return true;
+
+		// Helpers and the dispatcher observe full cpuRegs.cycle. Reconstruct the
+		// low word from the still-authoritative deadline, then repair the one
+		// possible wrap since the last publication. An event must occur within the
+		// scheduler's signed-32-bit window, so a compatible chain cannot cross two
+		// low-word wraps without first reaching this seam.
+		if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS,
+				static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitAddReg(HOST_TMP2, HOST_TMP1,
+				GprLinkSignature::SCHEDULER_HOST) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS,
+				static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitCmpReg(HOST_TMP2, HOST_TMP1))
+		{
+			return false;
+		}
+
+		const size_t no_wrap = m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+		constexpr u16 cycle_high_offset = static_cast<u16>(CYCLE_OFFSET + sizeof(u32));
+		if (no_wrap == static_cast<size_t>(-1) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, cycle_high_offset) ||
+			!m_code.EmitAddImm8(HOST_TMP1, HOST_TMP1, 1) ||
+			!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS, cycle_high_offset) ||
+			!m_code.PatchBranch(no_wrap, m_code.Size(), VitaA32::Condition::CS) ||
+			!m_code.EmitStrImm12(HOST_TMP2, HOST_CPU_REGS,
+				static_cast<u16>(CYCLE_OFFSET)))
+		{
+			return false;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuResidentCycleLowSyncInstructions += 6;
+		g_qemuResidentCycleLowWrapFixupInstructions += 3;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::EmitSyncResidentCycleLowToBacking()
 	{
+		if (m_compatible_scheduler_countdown)
+			return EmitSyncCompatibleSchedulerCountdownToBacking();
 		if (!m_resident_cycle_low)
 			return true;
 		if (m_resident_scheduler_countdown &&
@@ -6725,7 +6872,8 @@ namespace VitaEE
 	bool BlockCompiler::EmitSyncGprPinsToBacking(const GprPinDirtyMasks* dirty_pins,
 		bool forwarded_value_is_architectural)
 	{
-		if (!m_dirty_pins_enabled && !m_forwarded_boolean_branch && !m_resident_cycle_low)
+		if (!m_dirty_pins_enabled && !m_forwarded_boolean_branch &&
+			!m_resident_cycle_low && !m_compatible_scheduler_countdown)
 			return true;
 		const GprPinDirtyMasks masks = m_dirty_pins_enabled ?
 			(dirty_pins ? *dirty_pins : CurrentGprPinDirtyMasks()) : GprPinDirtyMasks{};
@@ -7445,6 +7593,8 @@ namespace VitaEE
 		m_resident_forwarded_boolean_mask = m_resident_vtlb_qword_pointer;
 		m_resident_cycle_low = m_resident_vtlb_qword_pointer;
 		m_resident_scheduler_countdown = m_resident_cycle_low;
+		m_compatible_scheduler_countdown =
+			m_gpr_link_signature.HasSchedulerCountdown();
 		m_deferred_resident_unsigned_branch_suffix =
 			m_resident_scheduler_countdown && (forwarded_producer_op & 0x3f) == 0x2b &&
 			RS(forwarded_producer_op) != 0 && RT(forwarded_producer_op) != 0 &&
@@ -7514,6 +7664,8 @@ namespace VitaEE
 				m_pin_dirty_high[i] = mapping.width == GprLinkWidth::Low64;
 			}
 		}
+		if (!EmitStageCompatibleSchedulerCountdown(HOST_TMP0))
+			return false;
 		if (m_gpr_link_signature.IsValid())
 		{
 			if (compatible_link_entry_offset)
@@ -8124,11 +8276,11 @@ namespace VitaEE
 			DirectLinkSlot* const taken_link =
 				(direct_links && has_static_likely_direct_links && !wait_loop_taken) ?
 					&direct_links->slots[1] : nullptr;
-			const bool preserve_dirty_not_taken_link = m_dirty_pins_enabled &&
-				m_gpr_link_signature.HasWriteBack() &&
+			const bool preserve_dirty_not_taken_link =
+				(m_dirty_pins_enabled || m_compatible_scheduler_countdown) &&
 				m_gpr_link_signature.ContainsPc(next_pc);
-			const bool preserve_dirty_taken_link = m_dirty_pins_enabled &&
-				m_gpr_link_signature.HasWriteBack() &&
+			const bool preserve_dirty_taken_link =
+				(m_dirty_pins_enabled || m_compatible_scheduler_countdown) &&
 				m_gpr_link_signature.ContainsPc(branch_target_pc);
 			if (!EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit,
 					not_taken_link, taken_link, wait_loop_taken,
@@ -8164,11 +8316,11 @@ namespace VitaEE
 				&direct_links->slots[1] : nullptr;
 		const u32 direct_link_pc = has_static_direct_link_target ?
 			static_direct_link_target_pc : next_pc;
-		const bool preserve_dirty_direct_link = m_dirty_pins_enabled &&
-			m_gpr_link_signature.HasWriteBack() &&
+		const bool preserve_dirty_direct_link =
+			(m_dirty_pins_enabled || m_compatible_scheduler_countdown) &&
 			m_gpr_link_signature.ContainsPc(direct_link_pc);
 		const bool preserve_dirty_taken_link = preserve_dirty_self_link ||
-			(m_dirty_pins_enabled && m_gpr_link_signature.HasWriteBack() &&
+			((m_dirty_pins_enabled || m_compatible_scheduler_countdown) &&
 			 m_gpr_link_signature.ContainsPc(branch_target_pc));
 		if (!EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
 				direct_link, taken_link,
@@ -8340,7 +8492,7 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
-		bool defer_pc_writeback, u32 pc, bool sync_dirty_fallback)
+		bool defer_pc_writeback, u32 pc, bool sync_private_fallback)
 	{
 		if (!direct_exit)
 			return false;
@@ -8352,7 +8504,7 @@ namespace VitaEE
 
 		const size_t fallback_offset = m_code.Size();
 		if (!m_code.PatchBranch(target_branch, fallback_offset) ||
-			(sync_dirty_fallback && !EmitSyncGprPinsToBacking()) ||
+			(sync_private_fallback && !EmitSyncGprPinsToBacking()) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
 			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
@@ -8365,8 +8517,10 @@ namespace VitaEE
 			direct_link->fallback_offset = fallback_offset;
 			direct_link->branch_on_taken = false;
 			direct_link->branch_on_unsigned_less = false;
-			direct_link->requires_compatible_gpr_entry = sync_dirty_fallback;
-			direct_link->compatible_dirty_words = sync_dirty_fallback ?
+			direct_link->requires_compatible_entry = sync_private_fallback;
+			direct_link->compatible_scheduler_countdown = sync_private_fallback &&
+				m_compatible_scheduler_countdown;
+			direct_link->compatible_dirty_words = sync_private_fallback ?
 				m_gpr_link_signature.DirtyWordCount() : 0;
 		}
 		return true;
@@ -8374,7 +8528,7 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 		DirectLinkSlot* direct_link, bool defer_pc_writeback, u32 pc,
-		bool sync_dirty_fallback)
+		bool sync_private_fallback)
 	{
 		if (!direct_exit || target_branch == static_cast<size_t>(-1))
 			return false;
@@ -8387,7 +8541,7 @@ namespace VitaEE
 			m_deferred_resident_unsigned_branch_suffix ?
 				VitaA32::Condition::CC : VitaA32::Condition::NE;
 		if (!m_code.PatchBranch(target_branch, fallback_offset, taken_condition) ||
-			(sync_dirty_fallback && !EmitSyncGprPinsToBacking()) ||
+			(sync_private_fallback && !EmitSyncGprPinsToBacking()) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
 			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
@@ -8401,8 +8555,10 @@ namespace VitaEE
 			direct_link->branch_on_taken = true;
 			direct_link->branch_on_unsigned_less =
 				m_deferred_resident_unsigned_branch_suffix;
-			direct_link->requires_compatible_gpr_entry = sync_dirty_fallback;
-			direct_link->compatible_dirty_words = sync_dirty_fallback ?
+			direct_link->requires_compatible_entry = sync_private_fallback;
+			direct_link->compatible_scheduler_countdown = sync_private_fallback &&
+				m_compatible_scheduler_countdown;
+			direct_link->compatible_dirty_words = sync_private_fallback ?
 				m_gpr_link_signature.DirtyWordCount() : 0;
 		}
 		return true;
@@ -8649,10 +8805,11 @@ namespace VitaEE
 	{
 		if (!direct_exit || !event_exit)
 			return false;
-		// The countdown candidate necessarily contains SQ, which
-		// IsWaitLoopBody() rejects. Fail closed if those analyses ever disagree;
-		// wait-loop fast-forward has a different cycle/publication contract.
-		if (m_resident_scheduler_countdown && wait_loop_taken)
+		// Wait-loop fast-forward has a different cycle/publication contract.
+		// Both resident analyses reject it during construction; fail closed if
+		// those analyses ever disagree with the final whole-loop scan.
+		if ((m_resident_scheduler_countdown || m_compatible_scheduler_countdown) &&
+			wait_loop_taken)
 			return false;
 
 		// The forwarded boolean is part of the same resident self-link contract
@@ -8671,7 +8828,23 @@ namespace VitaEE
 #endif
 
 		size_t carry_branch = static_cast<size_t>(-1);
-		if (m_resident_scheduler_countdown)
+		if (m_compatible_scheduler_countdown)
+		{
+			if (!m_code.EmitAddImm32(GprLinkSignature::SCHEDULER_HOST,
+					GprLinkSignature::SCHEDULER_HOST, block_cycles, true) &&
+				(!m_code.EmitMovImm32(HOST_TMP1, block_cycles) ||
+				 !m_code.EmitAddReg(GprLinkSignature::SCHEDULER_HOST,
+					 GprLinkSignature::SCHEDULER_HOST, HOST_TMP1, true)))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentCycleLowHotInstructionsElided += 3;
+			g_qemuResidentNextEventLowHotInstructionsElided++;
+			g_qemuResidentSchedulerCountdownHotInstructionsElided++;
+#endif
+		}
+		else if (m_resident_scheduler_countdown)
 		{
 			const size_t countdown_start = m_code.Size();
 			if (!m_code.EmitAddImm32(HOST_TMP2, HOST_TMP2, block_cycles, true) &&
@@ -8718,7 +8891,7 @@ namespace VitaEE
 		// Wait-loop blocks keep the nextEventCycle low word live in HOST_TMP2
 		// for the fast-forward taken tail.
 		const size_t cycle_compare_target = m_code.Size();
-		if (!m_resident_scheduler_countdown)
+		if (!m_resident_scheduler_countdown && !m_compatible_scheduler_countdown)
 		{
 			if (m_resident_cycle_low && !wait_loop_taken)
 			{
@@ -8893,7 +9066,74 @@ namespace VitaEE
 			(cycle_delta & (cycle_delta - 1)) == 0;
 		const bool delta_is_one_plus_power_of_two = cycle_delta > 1 &&
 			((cycle_delta - 1) & (cycle_delta - 2)) == 0;
-		if (taken_cycles == not_taken_cycles)
+		if (m_compatible_scheduler_countdown)
+		{
+			if (taken_cycles == not_taken_cycles)
+			{
+				if (!m_code.EmitAddImm32(GprLinkSignature::SCHEDULER_HOST,
+						GprLinkSignature::SCHEDULER_HOST, taken_cycles, true) &&
+					(!m_code.EmitMovImm32(HOST_TMP2, taken_cycles) ||
+					 !m_code.EmitAddReg(GprLinkSignature::SCHEDULER_HOST,
+						 GprLinkSignature::SCHEDULER_HOST, HOST_TMP2, true)))
+				{
+					return false;
+				}
+			}
+			else if (taken_cycles >= not_taken_cycles &&
+				(cycle_delta == 1 || delta_is_power_of_two ||
+				 delta_is_one_plus_power_of_two))
+			{
+				if (cycle_delta == 1)
+				{
+					if (!m_code.EmitAddImm32(HOST_TMP2, m_branch_flag_host,
+							not_taken_cycles) &&
+						(!m_code.EmitMovImm32(HOST_TMP2, not_taken_cycles) ||
+						 !m_code.EmitAddReg(HOST_TMP2, m_branch_flag_host, HOST_TMP2)))
+					{
+						return false;
+					}
+				}
+				else
+				{
+					const u32 shifted_delta =
+						delta_is_power_of_two ? cycle_delta : cycle_delta - 1;
+					u8 shift = 0;
+					while ((1u << shift) != shifted_delta)
+						shift++;
+					const bool formed_delta = delta_is_power_of_two ?
+						m_code.EmitMovRegShiftImm(HOST_TMP2, m_branch_flag_host,
+							VitaA32::ShiftType::LSL, shift) :
+						m_code.EmitAddRegShiftImm(HOST_TMP2, m_branch_flag_host,
+							m_branch_flag_host, VitaA32::ShiftType::LSL, shift);
+					if (!formed_delta ||
+						(!m_code.EmitAddImm32(HOST_TMP2, HOST_TMP2, not_taken_cycles) &&
+						 (!m_code.EmitMovImm32(HOST_TMP1, not_taken_cycles) ||
+						  !m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP1))))
+					{
+						return false;
+					}
+				}
+				if (!m_code.EmitAddReg(GprLinkSignature::SCHEDULER_HOST,
+						GprLinkSignature::SCHEDULER_HOST, HOST_TMP2, true))
+				{
+					return false;
+				}
+			}
+			else if (!m_code.EmitMovImm32(HOST_TMP2, not_taken_cycles) ||
+				!m_code.EmitCmpImm32(m_branch_flag_host, 0) ||
+				!m_code.EmitMovImm32(HOST_TMP2, taken_cycles, VitaA32::Condition::NE) ||
+				!m_code.EmitAddReg(GprLinkSignature::SCHEDULER_HOST,
+					GprLinkSignature::SCHEDULER_HOST, HOST_TMP2, true))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuResidentCycleLowHotInstructionsElided += 3;
+			g_qemuResidentNextEventLowHotInstructionsElided++;
+			g_qemuResidentSchedulerCountdownHotInstructionsElided++;
+#endif
+		}
+		else if (taken_cycles == not_taken_cycles)
 		{
 			if (!EmitAddScaledCyclesToCpuLowWord(taken_cycles, HOST_TMP0, HOST_TMP2,
 					&not_taken_carry_branch))
@@ -8979,8 +9219,11 @@ namespace VitaEE
 		}
 
 		const size_t cycle_compare_target = m_code.Size();
-		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
-			!m_code.EmitSubReg(wait_loop_taken ? HOST_TMP1 : HOST_TMP2, HOST_TMP0, HOST_TMP2, true))
+		if (!m_compatible_scheduler_countdown &&
+			(!m_code.EmitLdrImm12(HOST_TMP2, HOST_CPU_REGS,
+				 static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			 !m_code.EmitSubReg(wait_loop_taken ? HOST_TMP1 : HOST_TMP2,
+				 HOST_TMP0, HOST_TMP2, true)))
 		{
 			return false;
 		}
@@ -25786,6 +26029,7 @@ namespace VitaEE
 			 !m_code.EmitMovRegShiftImm(HOST_TMP5, m_branch_flag_host, VitaA32::ShiftType::LSL, 0)) ||
 				(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
 				!m_code.EmitCallAbsolute(tail.read_helper) ||
+				!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false) ||
 				(tail.width != ScalarLoadWidth::Dword && tail.rt != 0 && !emit_normalize_narrow_low()) ||
 				!emit_store_result() ||
 				!EmitFlushDirtyGprPins())
@@ -25874,7 +26118,8 @@ namespace VitaEE
 				break;
 		}
 
-		if (!m_code.EmitCallAbsolute(tail.write_helper))
+		if (!m_code.EmitCallAbsolute(tail.write_helper) ||
+			!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false))
 			return false;
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();

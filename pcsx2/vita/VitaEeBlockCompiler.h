@@ -26,11 +26,40 @@ namespace VitaEE
 		bool branch_on_unsigned_less = false;
 		bool patched_to_resident_entry = false;
 		bool patched_to_compatible_entry = false;
-		bool requires_compatible_gpr_entry = false;
+		bool requires_compatible_entry = false;
+		bool compatible_scheduler_countdown = false;
 		u8 compatible_entry_instructions = 0;
 		u8 compatible_entry_loads = 0;
 		u8 compatible_dirty_words = 0;
 		bool valid = false;
+	};
+
+	enum class SchedulerLinkRepresentation : u8
+	{
+		CycleLowMinusNextEventLow,
+	};
+
+	enum class SchedulerLinkProvenance : u8
+	{
+		CanonicalOrCompatibleScheduler,
+	};
+
+	struct SchedulerLinkMapping
+	{
+		static constexpr u8 NO_HOST = 0xff;
+
+		u8 host = NO_HOST;
+		SchedulerLinkRepresentation representation =
+			SchedulerLinkRepresentation::CycleLowMinusNextEventLow;
+		SchedulerLinkProvenance provenance =
+			SchedulerLinkProvenance::CanonicalOrCompatibleScheduler;
+
+		bool IsValid() const { return host != NO_HOST; }
+		bool operator==(const SchedulerLinkMapping& rhs) const
+		{
+			return host == rhs.host && representation == rhs.representation &&
+				provenance == rhs.provenance;
+		}
 	};
 
 	enum class GprLinkWidth : u8
@@ -80,18 +109,22 @@ namespace VitaEE
 		static constexpr u8 MAX_PINS = 3;
 		static constexpr u8 FIRST_HOST = 9;
 		static constexpr u8 LAST_HOST = 11;
+		static constexpr u8 SCHEDULER_HOST = 6;
 
 		GprLinkMapping mappings[MAX_PINS]{};
+		SchedulerLinkMapping scheduler{};
 		u32 block_pcs[2]{};
 		u8 count = 0;
 
 		bool IsValid() const;
 		bool ContainsPc(u32 pc) const;
 		bool HasWriteBack() const;
+		bool HasSchedulerCountdown() const { return scheduler.IsValid(); }
 		u8 DirtyWordCount() const;
 		bool operator==(const GprLinkSignature& rhs) const
 		{
-			if (count != rhs.count || block_pcs[0] != rhs.block_pcs[0] ||
+			if (count != rhs.count || !(scheduler == rhs.scheduler) ||
+				block_pcs[0] != rhs.block_pcs[0] ||
 				block_pcs[1] != rhs.block_pcs[1])
 				return false;
 			for (u8 i = 0; i < count; i++)
@@ -282,10 +315,10 @@ namespace VitaEE
 		bool EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch, VitaA32::Condition condition);
 		bool EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
 			bool defer_pc_writeback = false, u32 pc = 0,
-			bool sync_dirty_fallback = false);
+			bool sync_private_fallback = false);
 		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0,
-			bool sync_dirty_fallback = false);
+			bool sync_private_fallback = false);
 		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag,
 			const void* direct_exit, bool defer_pc_writeback = false);
 		bool EmitEventExitReturn(const void* event_exit);
@@ -675,6 +708,9 @@ namespace VitaEE
 			bool forwarded_value_is_architectural = false);
 		bool EmitSyncForwardedBooleanBranchToBacking(bool value_is_architectural = false);
 		bool EmitPrepareResidentForwardedBooleanForPreProducerSync();
+		bool EmitStageCompatibleSchedulerCountdown(unsigned scratch_host,
+			bool canonical_entry = true);
+		bool EmitSyncCompatibleSchedulerCountdownToBacking();
 		bool EmitStageResidentSchedulerCountdown(bool preserve_for_translation);
 		bool EmitSyncResidentCycleLowToBacking();
 		bool EmitSaveResidentSchedulerCountdown();
@@ -965,6 +1001,7 @@ namespace VitaEE
 		bool m_resident_vtlb_qword_pointer = false;
 		bool m_resident_cycle_low = false;
 		bool m_resident_scheduler_countdown = false;
+		bool m_compatible_scheduler_countdown = false;
 		bool m_deferred_resident_unsigned_branch_suffix = false;
 		bool m_emitting_deferred_resident_event_suffix = false;
 		u32 m_deferred_resident_unsigned_compare_op = 0;

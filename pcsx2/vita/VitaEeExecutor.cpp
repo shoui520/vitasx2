@@ -604,6 +604,16 @@ namespace VitaEE
 		Reset();
 		m_compatible_gpr_dirty_carry_enabled = enabled;
 	}
+
+	void BlockExecutor::SetCompatibleSchedulerCarryEnabled(bool enabled)
+	{
+		if (m_compatible_scheduler_carry_enabled == enabled)
+			return;
+
+		// The scheduler host/representation is part of the generated link ABI.
+		Reset();
+		m_compatible_scheduler_carry_enabled = enabled;
+	}
 #endif
 
 	bool BlockExecutor::EnsurePersistentDispatcher()
@@ -865,6 +875,8 @@ namespace VitaEE
 				for (u8 i = 0; i < signature->count; i++)
 					signature->mappings[i].dirty = GprLinkDirtyState::Clean;
 			}
+			if (!m_compatible_scheduler_carry_enabled)
+				signature->scheduler = SchedulerLinkMapping{};
 #endif
 			return true;
 		}
@@ -1246,7 +1258,7 @@ namespace VitaEE
 	const void* BlockExecutor::CompatibleLinkEntryPoint(const CachedBlock& block) const
 	{
 		if (!block.code.EntryPoint() || !block.gpr_link_signature.IsValid() ||
-			block.compatible_link_entry_loads == 0 ||
+			block.compatible_link_entry_offset == static_cast<size_t>(-1) ||
 			block.compatible_link_entry_offset >= block.code.Size())
 		{
 			return LinkedEntryPoint(block);
@@ -1278,9 +1290,10 @@ namespace VitaEE
 		const bool use_compatible_entry = target && !use_resident_entry &&
 			m_persistent_dispatch_enabled && block.gpr_link_signature.IsValid() &&
 			block.gpr_link_signature == target->gpr_link_signature &&
-			target->compatible_link_entry_loads != 0;
+			target->compatible_link_entry_offset != static_cast<size_t>(-1) &&
+			target->compatible_link_entry_offset < target->code.Size();
 		const bool use_generated_fallback = !target ||
-			(link.requires_compatible_gpr_entry &&
+			(link.requires_compatible_entry &&
 			 !use_resident_entry && !use_compatible_entry);
 		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) :
 			(use_compatible_entry ? CompatibleLinkEntryPoint(*target) :
@@ -1408,6 +1421,8 @@ namespace VitaEE
 					link.compatible_entry_instructions;
 				result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
 				result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
+				result->compatible_scheduler_links +=
+					link.compatible_scheduler_countdown ? 1u : 0u;
 			}
 		}
 #endif
@@ -1488,6 +1503,8 @@ namespace VitaEE
 						link.compatible_entry_instructions;
 					result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
 					result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
+					result->compatible_scheduler_links +=
+						link.compatible_scheduler_countdown ? 1u : 0u;
 				}
 			}
 #endif
