@@ -298,6 +298,20 @@ enum VitaEeSelfAddressPairScanResult : u32
 u32 VitaEeExecuteSelfAddressPairScan(u32 start_pc, u32 packed_guests,
 	u32 packed_cycles, u32 load_cycles);
 
+enum VitaEeWordCopyResult : u32
+{
+	VITA_EE_WORD_COPY_COMPLETE = 0,
+	VITA_EE_WORD_COPY_SELF = 1,
+	VITA_EE_WORD_COPY_EVENT = 2,
+	VITA_EE_WORD_COPY_REDISPATCH = 3,
+};
+
+// Executes the exact LW/ADDIU/SW/ADDIU/BNE/NOP forward word-copy loop.
+// Direct source/destination pages batch to completion, either page, or event;
+// handler and protected mappings execute one architecturally ordered iteration.
+u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
+	u32 packed_cycles, u32 packed_guests);
+
 // --------------------------------------------------------------------------------------
 //  Goemon game fix
 // --------------------------------------------------------------------------------------

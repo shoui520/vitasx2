@@ -501,6 +501,9 @@ namespace VitaEE
 		static bool IsExactSelfAddressPairScan(u32 start_pc, u32 instruction_count,
 			unsigned* result_guest = nullptr, unsigned* pointer_guest = nullptr,
 			unsigned* count_guest = nullptr);
+		static bool IsExactWordCopyLoop(u32 start_pc, u32 instruction_count,
+			unsigned* value_guest = nullptr, unsigned* source_guest = nullptr,
+			unsigned* destination_guest = nullptr, unsigned* end_guest = nullptr);
 		static bool IsExactGsCsrVsintPollLoop(u32 start_pc, u32 instruction_count,
 			unsigned* base_guest = nullptr, unsigned* result_guest = nullptr);
 		static bool IsExactSignedCountdownLoop(u32 start_pc, u32 instruction_count,
@@ -594,6 +597,9 @@ namespace VitaEE
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompileSelfAddressPairScan(u32 start_pc, u32 instruction_count,
+			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
+			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
+		bool CompileWordCopyLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompileGsCsrVsintPollLoop(u32 start_pc, u32 instruction_count,

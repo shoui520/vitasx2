@@ -779,6 +779,197 @@ u32 VitaEeExecuteSelfAddressPairScan(u32 start_pc, u32 packed_guests,
 	}
 }
 
+u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
+	u32 packed_cycles, u32 packed_guests)
+{
+	// PCSX2 owners: x86/ix86-32/iR5900LoadStore.cpp::recLW()/recSW(),
+	// iR5900AritImm.cpp::recADDIU(), iR5900Branch.cpp::recBNE(),
+	// recVTLB.cpp::DynGen_DirectRead()/DynGen_DirectWrite(), and
+	// iR5900.cpp::iBranchTest().
+	const unsigned value_guest = packed_guests & 0x1f;
+	const unsigned source_guest = (packed_guests >> 5) & 0x1f;
+	const unsigned destination_guest = (packed_guests >> 10) & 0x1f;
+	const unsigned end_guest = (packed_guests >> 15) & 0x1f;
+	const u32 block_cycles = packed_cycles & 0x3ff;
+	const u32 load_cycles = (packed_cycles >> 10) & 0x3ff;
+	const u32 store_prefix_cycles = (packed_cycles >> 20) & 0x3ff;
+	const u32 source_address = cpuRegs.GPR.r[source_guest].UL[0];
+	const u32 destination_address = cpuRegs.GPR.r[destination_guest].UL[0];
+	const u64 end = cpuRegs.GPR.r[end_guest].UD[0];
+	u32 iterations = 1;
+	bool pointers_published = false;
+	bool force_redispatch = false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	bool direct_bulk = false;
+	extern u32 g_qemuWordCopyHelperCalls;
+	extern u32 g_qemuWordCopyBulkChunks;
+	extern u32 g_qemuWordCopyBulkWords;
+	extern u32 g_qemuWordCopyScalarIterations;
+	extern u32 g_qemuWordCopyPageReturns;
+	extern u32 g_qemuWordCopyRedispatches;
+	extern bool g_qemuWordCopyForceRedispatch;
+	g_qemuWordCopyHelperCalls++;
+#endif
+
+	if ((source_address & 3u) != 0)
+	{
+		cpuRegs.pc = start_pc + sizeof(u32);
+		cpuRegs.cycle += load_cycles;
+		if (Cpu && Cpu->CancelInstruction)
+			Cpu->CancelInstruction();
+		return VITA_EE_WORD_COPY_EVENT;
+	}
+
+	const VTLBVirtual source_mapping =
+		vtlbdata.vmap[source_address >> VTLB_PAGE_BITS];
+	const VTLBVirtual destination_mapping =
+		vtlbdata.vmap[destination_address >> VTLB_PAGE_BITS];
+	bool destination_protected = false;
+	if (!destination_mapping.isHandler(destination_address))
+	{
+		const u32 physical = vtlb_V2P(destination_address);
+		const vtlb_ProtectionMode protection = mmap_GetRamPageInfo(physical);
+		destination_protected =
+			protection == ProtMode_Write || protection == ProtMode_Manual;
+#if defined(VITASX2_QEMU_VALIDATION)
+		destination_protected |= g_qemuWordCopyForceRedispatch;
+#endif
+	}
+	const u32 source_bytes_to_page =
+		VTLB_PAGE_SIZE - (source_address & VTLB_PAGE_MASK);
+	const u32 destination_bytes_to_page =
+		VTLB_PAGE_SIZE - (destination_address & VTLB_PAGE_MASK);
+	const bool batchable = !source_mapping.isHandler(source_address) &&
+		!destination_mapping.isHandler(destination_address) &&
+		!destination_protected && (destination_address & 3u) == 0 &&
+		(source_address & 0xffffe000u) != 0x10000000u && block_cycles != 0;
+	if (batchable)
+	{
+		iterations = std::min(source_bytes_to_page, destination_bytes_to_page) / 4;
+
+		const u32 end_low = static_cast<u32>(end);
+		const bool canonical_end = end == static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(end_low)));
+		if (canonical_end)
+		{
+			const u32 bytes_to_end = end_low - source_address;
+			if (bytes_to_end != 0 && (bytes_to_end & 3u) == 0)
+				iterations = std::min(iterations, bytes_to_end / 4);
+		}
+
+		const s32 cycle_delta = static_cast<s32>(
+			static_cast<u32>(cpuRegs.cycle) - static_cast<u32>(cpuRegs.nextEventCycle));
+		const u32 to_event = cycle_delta >= 0 ? 1u : static_cast<u32>(
+			(-static_cast<s64>(cycle_delta) + block_cycles - 1) / block_cycles);
+		iterations = std::min(iterations, to_event);
+
+		const u32* const source_host =
+			reinterpret_cast<const u32*>(source_mapping.assumePtr(source_address));
+		u32* const destination_host =
+			reinterpret_cast<u32*>(destination_mapping.assumePtr(destination_address));
+		u32 last_value = 0;
+		// Do not use memcpy/memmove: the EE loop is a forward load-then-store
+		// recurrence, so an overlapping destination ahead of the source can alter
+		// values loaded by later iterations.
+		for (u32 i = 0; i < iterations; i++)
+		{
+			last_value = source_host[i];
+			destination_host[i] = last_value;
+		}
+		cpuRegs.GPR.r[value_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(last_value)));
+#if defined(VITASX2_QEMU_VALIDATION)
+		direct_bulk = true;
+		g_qemuWordCopyBulkChunks++;
+		g_qemuWordCopyBulkWords += iterations;
+#endif
+	}
+	else
+	{
+		const u32 value = vtlb_memRead<mem32_t>(source_address);
+		cpuRegs.GPR.r[value_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(value)));
+		if ((source_address & 0xffffe000u) == 0x10000000u)
+		{
+			// EmitCounterReadEventExit() always publishes the post-LW PC/cycles
+			// and enters the event dispatcher before the following ADDIU.
+			cpuRegs.pc = start_pc + sizeof(u32);
+			cpuRegs.cycle += load_cycles;
+			return VITA_EE_WORD_COPY_EVENT;
+		}
+
+		cpuRegs.GPR.r[source_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(source_address + 4)));
+		if ((destination_address & 3u) != 0)
+		{
+			cpuRegs.pc = start_pc + 3 * sizeof(u32);
+			cpuRegs.cycle += store_prefix_cycles;
+			if (Cpu && Cpu->CancelInstruction)
+				Cpu->CancelInstruction();
+			return VITA_EE_WORD_COPY_EVENT;
+		}
+
+		const VTLBVirtual scalar_destination_mapping =
+			vtlbdata.vmap[destination_address >> VTLB_PAGE_BITS];
+		u32 destination_physical = 0;
+		bool scalar_destination_protected = false;
+		if (!scalar_destination_mapping.isHandler(destination_address))
+		{
+			destination_physical = vtlb_V2P(destination_address);
+			const vtlb_ProtectionMode protection =
+				mmap_GetRamPageInfo(destination_physical);
+			scalar_destination_protected =
+				protection == ProtMode_Write || protection == ProtMode_Manual;
+#if defined(VITASX2_QEMU_VALIDATION)
+			scalar_destination_protected |= g_qemuWordCopyForceRedispatch;
+#endif
+		}
+		vtlb_memWrite<mem32_t>(destination_address, value);
+		if (scalar_destination_protected)
+		{
+			force_redispatch = true;
+			if (Cpu && Cpu->Clear)
+				Cpu->Clear(destination_physical & ~3u, 1);
+		}
+		cpuRegs.GPR.r[destination_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(destination_address + 4)));
+		pointers_published = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuWordCopyScalarIterations++;
+#endif
+	}
+
+	if (!pointers_published)
+	{
+		cpuRegs.GPR.r[source_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(source_address + iterations * 4)));
+		cpuRegs.GPR.r[destination_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(destination_address + iterations * 4)));
+	}
+	cpuRegs.cycle += static_cast<u64>(iterations) * block_cycles;
+	const bool repeat = cpuRegs.GPR.r[source_guest].UD[0] != end;
+	cpuRegs.pc = repeat ? start_pc : fallthrough_pc;
+	const bool event_due = static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
+		static_cast<u32>(cpuRegs.nextEventCycle)) >= 0;
+	if (event_due)
+		return VITA_EE_WORD_COPY_EVENT;
+	if (force_redispatch)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuWordCopyRedispatches++;
+#endif
+		return VITA_EE_WORD_COPY_REDISPATCH;
+	}
+	if (!repeat)
+		return VITA_EE_WORD_COPY_COMPLETE;
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (direct_bulk)
+		g_qemuWordCopyPageReturns++;
+#endif
+	return VITA_EE_WORD_COPY_SELF;
+}
+
 template <typename DataType>
 DataType vtlb_ramRead(u32 addr, bool* result)
 {
