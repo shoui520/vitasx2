@@ -111,6 +111,7 @@ namespace VitaEE
 		void SetEmbeddedCompatibleContinuationEnabled(bool enabled);
 		void SetFusedDirectEventLinkEnabled(bool enabled);
 		void SetCombinedCompatibleTakenEventEnabled(bool enabled);
+		void SetCompatibleVtlbWriteGuardHoistEnabled(bool enabled);
 		void SetThreeBlockGprLinkEnabled(bool enabled);
 		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled);
 #endif
@@ -154,6 +155,7 @@ namespace VitaEE
 			u8 resident_self_link_entry_loads = 0;
 			GprLinkSignature gpr_link_signature{};
 			size_t compatible_link_entry_offset = static_cast<size_t>(-1);
+			size_t compatible_vtlb_write_fast_entry_offset = static_cast<size_t>(-1);
 			u8 compatible_link_entry_loads = 0;
 			DirectLinkSlots direct_links{};
 			bool valid = false;
@@ -244,6 +246,7 @@ namespace VitaEE
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		const void* ResidentSelfLinkEntryPoint(const CachedBlock& block) const;
 		const void* CompatibleLinkEntryPoint(const CachedBlock& block) const;
+		const void* CompatibleVtlbWriteFastEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
 		void PatchIncomingLinks(CachedBlock& target);
 		void UnlinkIncomingLinks(u32 target_pc);
@@ -277,6 +280,7 @@ namespace VitaEE
 		bool m_embedded_compatible_continuation_enabled = true;
 		bool m_fused_direct_event_link_enabled = true;
 		bool m_combined_compatible_taken_event_enabled = true;
+		bool m_compatible_vtlb_write_guard_hoist_enabled = true;
 		bool m_three_block_gpr_link_enabled = true;
 		bool m_vtlb_linked_entry_pc_publication_enabled = false;
 #endif

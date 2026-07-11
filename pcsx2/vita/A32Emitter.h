@@ -98,7 +98,7 @@ namespace VitaA32
 		bool EmitAdcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 		bool EmitAndRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
-			bool set_flags = false);
+			bool set_flags = false, Condition condition = Condition::AL);
 		bool EmitAndRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
 			bool set_flags = false);
 		bool EmitBicRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
@@ -320,7 +320,7 @@ namespace VitaA32
 	u32 EncodeAdcReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeAndReg(unsigned rd, unsigned rn, unsigned rm, bool set_flags = false);
 	u32 EncodeAndRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
-		bool set_flags = false);
+		bool set_flags = false, Condition condition = Condition::AL);
 	u32 EncodeAndRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
 		bool set_flags = false);
 	u32 EncodeBicRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,

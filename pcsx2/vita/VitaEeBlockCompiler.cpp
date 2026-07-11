@@ -154,6 +154,10 @@ u32 g_qemuFusedDirectEventLinkHotInstructionsElided = 0;
 u32 g_qemuCombinedCompatibleTakenEventBlocks = 0;
 u32 g_qemuCombinedCompatibleTakenEventHotInstructionsElided = 0;
 u32 g_qemuCombinedCompatibleTakenEventColdInstructions = 0;
+u32 g_qemuCompatibleVtlbWriteGuardHoists = 0;
+u32 g_qemuCompatibleVtlbWriteGuardHoistHotInstructionsElided = 0;
+u32 g_qemuCompatibleVtlbWriteGuardHoistSlowInstructions = 0;
+u32 g_qemuCompatibleVtlbWriteFastEntryActivations = 0;
 u32 g_qemuResidentCycleLowBlocks = 0;
 u32 g_qemuResidentCycleLowHotInstructionsElided = 0;
 u32 g_qemuResidentCycleLowSyncInstructions = 0;
@@ -7378,6 +7382,11 @@ namespace VitaEE
 			return false;
 		const size_t translation_end = m_code.Size();
 		const size_t body_start = m_code.Size();
+		// A compatible incoming edge may prove the write pointer non-canonical
+		// before linking here. Keep the ordinary guarded entry intact for first-use,
+		// page-transition, handler, invalidation, and incompatible edges.
+		if (write_pointer)
+			m_compatible_vtlb_write_fast_entry_offset = body_start;
 		if (!m_code.PatchBranch(same_page, body_start, VitaA32::Condition::NE))
 			return false;
 
@@ -8268,7 +8277,8 @@ namespace VitaEE
 		size_t* linked_entry_offset, bool persistent_dispatch_exits,
 		size_t* resident_self_link_entry_offset, u8* resident_self_link_entry_loads,
 		const GprLinkSignature* gpr_link_signature,
-		size_t* compatible_link_entry_offset, u8* compatible_link_entry_loads)
+		size_t* compatible_link_entry_offset, u8* compatible_link_entry_loads,
+		size_t* compatible_vtlb_write_fast_entry_offset)
 	{
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return false;
@@ -8283,6 +8293,8 @@ namespace VitaEE
 			*compatible_link_entry_offset = static_cast<size_t>(-1);
 		if (compatible_link_entry_loads)
 			*compatible_link_entry_loads = 0;
+		if (compatible_vtlb_write_fast_entry_offset)
+			*compatible_vtlb_write_fast_entry_offset = static_cast<size_t>(-1);
 
 		const u32 previous_block_start_pc = m_current_block_start_pc;
 		const u32 previous_block_instruction_count = m_current_block_instruction_count;
@@ -8413,6 +8425,7 @@ namespace VitaEE
 		m_compatible_predicate_canonical_skip_delay = static_cast<size_t>(-1);
 		m_compatible_predicate_canonical_enter_delay = static_cast<size_t>(-1);
 		m_compatible_link_entry_offset = static_cast<size_t>(-1);
+		m_compatible_vtlb_write_fast_entry_offset = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_byte_pair_tail_index = static_cast<size_t>(-1);
@@ -8517,6 +8530,11 @@ namespace VitaEE
 		}
 		if (!EmitStageCompatibleVtlbPointer())
 			return false;
+		if (compatible_vtlb_write_fast_entry_offset)
+		{
+			*compatible_vtlb_write_fast_entry_offset =
+				m_compatible_vtlb_write_fast_entry_offset;
+		}
 		u8 resident_entry_loads = gpr_pin_entry_loads;
 		if (m_forwarded_boolean_branch)
 		{
@@ -10120,13 +10138,32 @@ namespace VitaEE
 		combine_compatible_taken_event &=
 			m_combined_compatible_taken_event_enabled;
 #endif
+		bool prevalidate_compatible_vtlb_write =
+			combine_compatible_taken_event &&
+			m_gpr_link_signature.HasVtlbWritePointer() &&
+			m_gpr_link_signature.vtlb_write_pointer.access_pc == taken_pc;
+#if defined(VITASX2_QEMU_VALIDATION)
+		prevalidate_compatible_vtlb_write &=
+			m_compatible_vtlb_write_guard_hoist_enabled;
+#endif
 		size_t combined_taken_tail = static_cast<size_t>(-1);
+		size_t prevalidated_slow_taken = static_cast<size_t>(-1);
 		size_t event_branch = static_cast<size_t>(-1);
 		if (combine_compatible_taken_event)
 		{
-			if (!m_code.EmitAndRegShiftImm(HOST_TMP1, m_branch_flag_host,
+			// recVTLB.cpp::DynGen_PrepRegs() owns the canonical-pointer test. Move
+			// that test onto the already-selected taken edge and predicate the existing
+			// predicate/deadline AND on it. The common valid/taken/no-event route is
+			// MOVS + ANDSNE + BNE and enters the target after its redundant MOVS/BNE
+			// guard: one dynamic A32 instruction less than selecting and guarding there.
+			if ((prevalidate_compatible_vtlb_write &&
+					!m_code.EmitMovRegShiftImm(HOST_TMP1,
+						GprLinkSignature::VTLB_WRITE_POINTER_HOST,
+						VitaA32::ShiftType::LSL, 20, true)) ||
+				!m_code.EmitAndRegShiftImm(HOST_TMP1, m_branch_flag_host,
 					GprLinkSignature::SCHEDULER_HOST, VitaA32::ShiftType::LSR, 31,
-					true))
+					true, prevalidate_compatible_vtlb_write ?
+						VitaA32::Condition::NE : VitaA32::Condition::AL))
 			{
 				return false;
 			}
@@ -10143,6 +10180,12 @@ namespace VitaEE
 			g_qemuCombinedCompatibleTakenEventBlocks++;
 			g_qemuCombinedCompatibleTakenEventHotInstructionsElided++;
 			g_qemuCombinedCompatibleTakenEventColdInstructions += 3;
+			if (prevalidate_compatible_vtlb_write)
+			{
+				g_qemuCompatibleVtlbWriteGuardHoists++;
+				g_qemuCompatibleVtlbWriteGuardHoistHotInstructionsElided++;
+				g_qemuCompatibleVtlbWriteGuardHoistSlowInstructions += 3;
+			}
 #endif
 		}
 		else
@@ -10179,6 +10222,15 @@ namespace VitaEE
 				combined_taken_tail : m_code.EmitBranchPlaceholder(taken_condition);
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
+			if (prevalidate_compatible_vtlb_write)
+			{
+				if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
+					return false;
+				prevalidated_slow_taken =
+					m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+				if (prevalidated_slow_taken == static_cast<size_t>(-1))
+					return false;
+			}
 
 			// The fall-through edge leaves this allocator contract. When the taken
 			// self-edge carries dirty pins, keep backing state authoritative before
@@ -10210,6 +10262,17 @@ namespace VitaEE
 			{
 				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link,
 					defer_pc_writeback, taken_pc, carry_dirty_link);
+				if (taken_tail_ok && prevalidate_compatible_vtlb_write)
+				{
+					// BaseBlocks::Link() keeps both sites reversible: the combined hot
+					// selector targets the post-guard entry, while invalid pointers use
+					// this second site to enter the ordinary translation/handler guard.
+					taken_link->prevalidated_vtlb_write_pointer = true;
+					taken_link->secondary_target_offset = prevalidated_slow_taken;
+					taken_tail_ok = m_code.PatchBranch(
+						prevalidated_slow_taken, taken_link->fallback_offset,
+						VitaA32::Condition::NE);
+				}
 			}
 
 			const size_t event_target = m_code.Size();

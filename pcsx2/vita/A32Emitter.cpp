@@ -254,13 +254,14 @@ namespace VitaA32
 		}
 
 		u32 EncodeDataProcessingRegShiftImm(
-			u32 opcode, unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount, bool set_flags)
+			u32 opcode, unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
+			bool set_flags, Condition condition = Condition::AL)
 		{
 			pxAssert(IsRegister(rd));
 			pxAssert(IsRegister(rn));
 			pxAssert(IsRegister(rm));
 			pxAssert(amount <= 31);
-			return CondBits(Condition::AL) | opcode | (set_flags ? SET_FLAGS : 0) |
+			return CondBits(condition) | opcode | (set_flags ? SET_FLAGS : 0) |
 				   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) |
 				   ((static_cast<u32>(amount) & 0x1fu) << 7) |
 				   ((static_cast<u32>(shift) & 0x3u) << 5) | (rm & 0xfu);
@@ -865,7 +866,7 @@ namespace VitaA32
 	}
 
 	bool CodeBuffer::EmitAndRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
-		bool set_flags)
+		bool set_flags, Condition condition)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
 			return false;
@@ -874,7 +875,8 @@ namespace VitaA32
 		{
 			return true;
 		}
-		return EmitU32(EncodeAndRegShiftImm(rd, rn, rm, shift, amount, set_flags));
+		return EmitU32(EncodeAndRegShiftImm(rd, rn, rm, shift, amount, set_flags,
+			condition));
 	}
 
 	bool CodeBuffer::EmitAndRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
@@ -2320,9 +2322,10 @@ namespace VitaA32
 	}
 
 	u32 EncodeAndRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
-		bool set_flags)
+		bool set_flags, Condition condition)
 	{
-		return EncodeDataProcessingRegShiftImm(OPCODE_AND, rd, rn, rm, shift, amount, set_flags);
+		return EncodeDataProcessingRegShiftImm(OPCODE_AND, rd, rn, rm, shift, amount,
+			set_flags, condition);
 	}
 
 	u32 EncodeAndRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,

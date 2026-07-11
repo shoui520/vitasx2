@@ -22,6 +22,7 @@ namespace VitaEE
 		u32 target_pc = 0;
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
+		size_t secondary_target_offset = static_cast<size_t>(-1);
 		u32 embedded_active_instruction = 0;
 		u32 embedded_source_opcodes[2]{};
 		bool branch_on_taken = false;
@@ -34,6 +35,7 @@ namespace VitaEE
 		bool requires_compatible_entry = false;
 		bool compatible_scheduler_countdown = false;
 		bool compatible_vtlb_pointer = false;
+		bool prevalidated_vtlb_write_pointer = false;
 		u8 compatible_entry_instructions = 0;
 		u8 compatible_entry_loads = 0;
 		u8 compatible_words = 0;
@@ -413,6 +415,10 @@ namespace VitaEE
 		{
 			m_combined_compatible_taken_event_enabled = enabled;
 		}
+		void SetCompatibleVtlbWriteGuardHoistEnabled(bool enabled)
+		{
+			m_compatible_vtlb_write_guard_hoist_enabled = enabled;
+		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -437,7 +443,8 @@ namespace VitaEE
 			u8* resident_self_link_entry_loads = nullptr,
 			const GprLinkSignature* gpr_link_signature = nullptr,
 			size_t* compatible_link_entry_offset = nullptr,
-			u8* compatible_link_entry_loads = nullptr);
+			u8* compatible_link_entry_loads = nullptr,
+			size_t* compatible_vtlb_write_fast_entry_offset = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
@@ -1170,6 +1177,7 @@ namespace VitaEE
 		bool m_embedded_compatible_continuation_enabled = true;
 		bool m_fused_direct_event_link_enabled = true;
 		bool m_combined_compatible_taken_event_enabled = true;
+		bool m_compatible_vtlb_write_guard_hoist_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;
@@ -1193,6 +1201,7 @@ namespace VitaEE
 		size_t m_compatible_predicate_canonical_skip_delay = static_cast<size_t>(-1);
 		size_t m_compatible_predicate_canonical_enter_delay = static_cast<size_t>(-1);
 		size_t m_compatible_link_entry_offset = static_cast<size_t>(-1);
+		size_t m_compatible_vtlb_write_fast_entry_offset = static_cast<size_t>(-1);
 		bool m_reclaimed_vtlb_link_hosts = false;
 		size_t m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
