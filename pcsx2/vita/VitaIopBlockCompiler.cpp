@@ -868,8 +868,9 @@ namespace
 
 namespace VitaIOP
 {
-	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code)
+	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code, const u16* ram_source_page_live_counts)
 		: m_code(code)
+		, m_ram_source_page_live_counts(ram_source_page_live_counts)
 	{
 	}
 
@@ -3212,6 +3213,25 @@ namespace VitaIOP
 					   static_cast<u16>(offsetof(R3000Acpu, Clear))) &&
 				   m_code.EmitBlx(HOST_CALL_SCRATCH);
 		};
+		const auto emit_source_page_guard = [&]() -> size_t {
+			// PCSX2 owner: x86/iR3000A.cpp::PSXREC_CLEARM checks psxRecLUT
+			// before entering recClearIOP(). Vita's compact equivalent counts
+			// live source blocks per 4 KiB IOP RAM page. Convert the masked byte
+			// address to a page index, then to the halfword-table byte offset.
+			if (!m_ram_source_page_live_counts ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0,
+					VitaA32::ShiftType::LSR, 12) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0,
+					VitaA32::ShiftType::LSL, 1) ||
+				!m_code.EmitMovImm32(HOST_TMP2,
+					static_cast<u32>(reinterpret_cast<uptr>(m_ram_source_page_live_counts))) ||
+				!m_code.EmitLdrhReg(HOST_TMP0, HOST_TMP2, HOST_TMP0) ||
+				!m_code.EmitCmpImm32(HOST_TMP0, 0))
+			{
+				return static_cast<size_t>(-1);
+			}
+			return m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		};
 
 		if (!EmitEffectiveAddress(op, HOST_SAVED0) ||
 			!m_code.EmitTstImm32(HOST_SAVED0, 0x10000000u))
@@ -3248,8 +3268,14 @@ namespace VitaIOP
 		if (isolated_fallback_branch == static_cast<size_t>(-1) ||
 			!EmitLoadGprValue(RT(op), HOST_TMP1, &used_known_store_value) ||
 			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
-			!emit_store_value() ||
-			!emit_clear_stored_word())
+			!emit_store_value())
+		{
+			return false;
+		}
+		const size_t no_source_page_branch = emit_source_page_guard();
+		if (no_source_page_branch == static_cast<size_t>(-1) ||
+			!emit_clear_stored_word() ||
+			!m_code.PatchBranch(no_source_page_branch, m_code.Size(), VitaA32::Condition::EQ))
 		{
 			return false;
 		}
@@ -5386,6 +5412,7 @@ namespace VitaIOP
 					continue;
 
 				m_ram_source_pages[page_index].push_back({&block, block.source_serial});
+				m_ram_source_page_live_counts[page_index]++;
 				registered_pages[registered_page_count++] = page_index;
 			}
 		};
@@ -5395,6 +5422,40 @@ namespace VitaIOP
 		{
 			register_range(block.poll_branch_source_start, 2 * sizeof(u32));
 			register_range(block.poll_leaf_source_start, 5 * sizeof(u32));
+		}
+	}
+
+	void BlockExecutor::UnregisterRamSource(const CachedBlock& block)
+	{
+		if (!block.valid || block.ram_source_start == INVALID_RAM_SOURCE)
+			return;
+
+		std::array<u32, 6> unregistered_pages{};
+		u32 unregistered_page_count = 0;
+		const auto unregister_range = [&](u32 source_start, u32 source_size) {
+			if (source_start == INVALID_RAM_SOURCE || source_size == 0)
+				return;
+			const u32 source_end = source_start + source_size;
+			for (u32 page_index = source_start >> RAM_SOURCE_PAGE_SHIFT;
+				page_index <= ((source_end - 1) >> RAM_SOURCE_PAGE_SHIFT); page_index++)
+			{
+				bool already_unregistered = false;
+				for (u32 i = 0; i < unregistered_page_count; i++)
+					already_unregistered |= unregistered_pages[i] == page_index;
+				if (already_unregistered)
+					continue;
+
+				if (m_ram_source_page_live_counts[page_index] != 0)
+					m_ram_source_page_live_counts[page_index]--;
+				unregistered_pages[unregistered_page_count++] = page_index;
+			}
+		};
+
+		unregister_range(block.ram_source_start, block.instruction_count * sizeof(u32));
+		if (block.poll_call_wait_loop)
+		{
+			unregister_range(block.poll_branch_source_start, 2 * sizeof(u32));
+			unregister_range(block.poll_leaf_source_start, 5 * sizeof(u32));
 		}
 	}
 
@@ -5546,6 +5607,7 @@ namespace VitaIOP
 	{
 		for (std::vector<RamSourceRecord>& page : m_ram_source_pages)
 			page.clear();
+		m_ram_source_page_live_counts.fill(0);
 		m_next_source_serial = 1;
 	}
 
@@ -5794,6 +5856,7 @@ namespace VitaIOP
 		if (!block.valid)
 			return;
 
+		UnregisterRamSource(block);
 		UnlinkIncomingLinks(block.start_pc);
 		UnregisterIncomingLinks(block);
 		UnregisterBlockLookup(block);
@@ -6367,7 +6430,7 @@ namespace VitaIOP
 				return false;
 			}
 
-			BlockCompiler compiler(block.code);
+			BlockCompiler compiler(block.code, m_ram_source_page_live_counts.data());
 			DirectLinkSlots attempt_direct_links;
 			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
 				reinterpret_cast<const void*>(&VitaIopA32DirectExit), &attempt_direct_links);

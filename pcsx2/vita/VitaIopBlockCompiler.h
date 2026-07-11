@@ -84,7 +84,7 @@ namespace VitaIOP
 	class BlockCompiler
 	{
 	public:
-		explicit BlockCompiler(VitaA32::CodeBuffer& code);
+		explicit BlockCompiler(VitaA32::CodeBuffer& code, const u16* ram_source_page_live_counts);
 
 		static bool CanCompileOpcode(u32 op);
 
@@ -224,6 +224,7 @@ namespace VitaIOP
 		bool EmitCop2StoreColdTail(const Cop2StoreColdTail& tail);
 
 		VitaA32::CodeBuffer& m_code;
+		const u16* m_ram_source_page_live_counts = nullptr;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
 		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
 		std::vector<UnalignedReadColdTail> m_unaligned_read_cold_tails;
@@ -385,6 +386,7 @@ namespace VitaIOP
 		void ClearHotDispatchCache();
 		void ReleaseLookupPages();
 		void RegisterRamSource(CachedBlock& block);
+		void UnregisterRamSource(const CachedBlock& block);
 		bool AnalyzePollCallWaitLoop(CachedBlock& block, u32 start_pc, u32 instruction_count);
 		u32 InvalidateRamSourceRange(u32 start, u32 size);
 		void ClearRamSourcePages();
@@ -428,6 +430,7 @@ namespace VitaIOP
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT> m_ram_source_pages;
+		std::array<u16, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
 		LookupPage** m_lookup_pages = nullptr;
 		std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
 			HOT_DISPATCH_CACHE_SET_COUNT> m_hot_dispatch_cache{};
