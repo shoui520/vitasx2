@@ -369,7 +369,7 @@ namespace VitaEE
 		block.linked_entry_offset = 0;
 		block.resident_self_link_entry_offset = static_cast<size_t>(-1);
 		block.resident_self_link_entry_loads = 0;
-		block.gpr_link_signature = {};
+		block.gpr_link_signature = GprLinkSignature{};
 		block.compatible_link_entry_offset = static_cast<size_t>(-1);
 		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
@@ -489,7 +489,7 @@ namespace VitaEE
 			block.linked_entry_offset = 0;
 			block.resident_self_link_entry_offset = static_cast<size_t>(-1);
 			block.resident_self_link_entry_loads = 0;
-			block.gpr_link_signature = {};
+			block.gpr_link_signature = GprLinkSignature{};
 			block.compatible_link_entry_offset = static_cast<size_t>(-1);
 			block.compatible_link_entry_loads = 0;
 			block.direct_links = {};
@@ -592,6 +592,19 @@ namespace VitaEE
 		Reset();
 		m_persistent_dispatch_enabled = enabled;
 	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	void BlockExecutor::SetCompatibleGprDirtyCarryEnabled(bool enabled)
+	{
+		if (m_compatible_gpr_dirty_carry_enabled == enabled)
+			return;
+
+		// This is a validation-only A/B control. Dirty state is part of the
+		// compiled link ABI, so never mix its two forms in one cache.
+		Reset();
+		m_compatible_gpr_dirty_carry_enabled = enabled;
+	}
+#endif
 
 	bool BlockExecutor::EnsurePersistentDispatcher()
 	{
@@ -785,7 +798,7 @@ namespace VitaEE
 	{
 		if (!signature)
 			return false;
-		*signature = {};
+		*signature = GprLinkSignature{};
 		if (!m_persistent_dispatch_enabled || !m_direct_linking_enabled ||
 			instruction_count < 2)
 		{
@@ -841,8 +854,19 @@ namespace VitaEE
 				continue;
 			}
 
-			return BlockCompiler::BuildCleanGprLinkSignature(start_pc, instruction_count,
-				candidate_pc, partner.instruction_count, signature);
+			if (!BlockCompiler::BuildGprLinkSignature(start_pc, instruction_count,
+					candidate_pc, partner.instruction_count, signature))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (!m_compatible_gpr_dirty_carry_enabled)
+			{
+				for (u8 i = 0; i < signature->count; i++)
+					signature->mappings[i].dirty = GprLinkDirtyState::Clean;
+			}
+#endif
+			return true;
 		}
 
 		return false;
@@ -1243,31 +1267,35 @@ namespace VitaEE
 
 		const void* direct_exit = m_persistent_dispatch_enabled ?
 			m_persistent_direct_exit : reinterpret_cast<const void*>(&VitaEeA32DirectExit);
-		const bool target_is_direct_exit = target == nullptr;
 		// PCSX2 x86/BaseblockEx.cpp::BaseBlocks::Link() owns reversible target-PC
 		// patch sites. Exact self-edges retain their richer private state; other
-		// links may skip only canonical GPR loads when both blocks publish the same
-		// clean mapping.
+		// links may skip canonical GPR loads and dirty publication only when both
+		// blocks publish the exact same width/host/state/representation/provenance
+		// contract. A dirty incompatible edge stays on its generated writeback
+		// fallback instead of jumping directly to a canonical target.
 		const bool use_resident_entry = target && m_persistent_dispatch_enabled &&
 			link.target_pc == block.start_pc && block.resident_self_link_entry_loads != 0;
 		const bool use_compatible_entry = target && !use_resident_entry &&
 			m_persistent_dispatch_enabled && block.gpr_link_signature.IsValid() &&
 			block.gpr_link_signature == target->gpr_link_signature &&
 			target->compatible_link_entry_loads != 0;
+		const bool use_generated_fallback = !target ||
+			(link.requires_compatible_gpr_entry &&
+			 !use_resident_entry && !use_compatible_entry);
 		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) :
 			(use_compatible_entry ? CompatibleLinkEntryPoint(*target) :
-				(target ? LinkedEntryPoint(*target) : direct_exit));
+				(!use_generated_fallback ? LinkedEntryPoint(*target) : direct_exit));
 		const VitaA32::Condition condition = link.branch_on_taken ?
 			(link.branch_on_unsigned_less ? VitaA32::Condition::CC : VitaA32::Condition::NE) :
 			VitaA32::Condition::AL;
-		const bool patched = target_is_direct_exit ?
+		const bool patched = use_generated_fallback ?
 			block.code.PatchBranch(link.target_offset, link.fallback_offset, condition) :
 			block.code.PatchBranchToAddress(link.target_offset, patched_target, condition);
 		if (!patched || !block.code.Flush())
 			return false;
 
-		link.patched_to_resident_entry = use_resident_entry;
-		link.patched_to_compatible_entry = use_compatible_entry;
+		link.patched_to_resident_entry = !use_generated_fallback && use_resident_entry;
+		link.patched_to_compatible_entry = !use_generated_fallback && use_compatible_entry;
 		link.compatible_entry_instructions = use_compatible_entry ? static_cast<u8>(
 			(target->compatible_link_entry_offset - target->linked_entry_offset) /
 			sizeof(u32)) : 0;
@@ -1379,6 +1407,7 @@ namespace VitaEE
 				result->compatible_gpr_link_entry_instructions +=
 					link.compatible_entry_instructions;
 				result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
+				result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
 			}
 		}
 #endif
@@ -1458,6 +1487,7 @@ namespace VitaEE
 					result->compatible_gpr_link_entry_instructions +=
 						link.compatible_entry_instructions;
 					result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
+					result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
 				}
 			}
 #endif

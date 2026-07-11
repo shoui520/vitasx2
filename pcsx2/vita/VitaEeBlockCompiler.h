@@ -26,25 +26,77 @@ namespace VitaEE
 		bool branch_on_unsigned_less = false;
 		bool patched_to_resident_entry = false;
 		bool patched_to_compatible_entry = false;
+		bool requires_compatible_gpr_entry = false;
 		u8 compatible_entry_instructions = 0;
 		u8 compatible_entry_loads = 0;
+		u8 compatible_dirty_words = 0;
 		bool valid = false;
+	};
+
+	enum class GprLinkWidth : u8
+	{
+		Low32,
+		Low64,
+	};
+
+	enum class GprLinkDirtyState : u8
+	{
+		Clean,
+		WriteBack,
+	};
+
+	enum class GprLinkRepresentation : u8
+	{
+		Architectural,
+	};
+
+	enum class GprLinkProvenance : u8
+	{
+		CanonicalOrCompatibleGpr,
+	};
+
+	struct GprLinkMapping
+	{
+		static constexpr u8 NO_HOST = 0xff;
+
+		u8 guest = 0;
+		u8 low_host = NO_HOST;
+		u8 high_host = NO_HOST;
+		GprLinkWidth width = GprLinkWidth::Low32;
+		GprLinkDirtyState dirty = GprLinkDirtyState::Clean;
+		GprLinkRepresentation representation = GprLinkRepresentation::Architectural;
+		GprLinkProvenance provenance = GprLinkProvenance::CanonicalOrCompatibleGpr;
+
+		bool operator==(const GprLinkMapping& rhs) const
+		{
+			return guest == rhs.guest && low_host == rhs.low_host &&
+				high_host == rhs.high_host && width == rhs.width && dirty == rhs.dirty &&
+				representation == rhs.representation && provenance == rhs.provenance;
+		}
 	};
 
 	struct GprLinkSignature
 	{
 		static constexpr u8 MAX_PINS = 3;
-		u8 guests[MAX_PINS]{};
+		static constexpr u8 FIRST_HOST = 9;
+		static constexpr u8 LAST_HOST = 11;
+
+		GprLinkMapping mappings[MAX_PINS]{};
+		u32 block_pcs[2]{};
 		u8 count = 0;
 
-		bool IsValid() const { return count != 0 && count <= MAX_PINS; }
+		bool IsValid() const;
+		bool ContainsPc(u32 pc) const;
+		bool HasWriteBack() const;
+		u8 DirtyWordCount() const;
 		bool operator==(const GprLinkSignature& rhs) const
 		{
-			if (count != rhs.count)
+			if (count != rhs.count || block_pcs[0] != rhs.block_pcs[0] ||
+				block_pcs[1] != rhs.block_pcs[1])
 				return false;
 			for (u8 i = 0; i < count; i++)
 			{
-				if (guests[i] != rhs.guests[i])
+				if (!(mappings[i] == rhs.mappings[i]))
 					return false;
 			}
 			return true;
@@ -186,7 +238,7 @@ namespace VitaEE
 		static bool IsSupportedBranchOpcode(u32 op);
 		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
-		static bool BuildCleanGprLinkSignature(u32 first_pc, u32 first_instruction_count,
+		static bool BuildGprLinkSignature(u32 first_pc, u32 first_instruction_count,
 			u32 second_pc, u32 second_instruction_count, GprLinkSignature* signature);
 
 		bool BeginBlock(bool use_vtlb_registers = false, bool use_cop1_exponent_mask_register = false,
@@ -209,11 +261,14 @@ namespace VitaEE
 			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
 			bool wait_loop_taken = false, bool defer_pc_writeback = false,
 			u32 direct_pc = 0, u32 taken_pc = 0, bool conditional_pc = false,
-			bool indirect_pc_writeback = false, bool preserve_dirty_taken_self_link = false);
+			bool indirect_pc_writeback = false, bool preserve_dirty_direct_link = false,
+			bool preserve_dirty_taken_link = false);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
 			const void* event_exit, DirectLinkSlot* not_taken_link = nullptr,
 			DirectLinkSlot* taken_link = nullptr, bool wait_loop_taken = false,
-			bool defer_pc_writeback = false, u32 not_taken_pc = 0, u32 taken_pc = 0);
+			bool defer_pc_writeback = false, u32 not_taken_pc = 0, u32 taken_pc = 0,
+			bool preserve_dirty_not_taken_link = false,
+			bool preserve_dirty_taken_link = false);
 		static bool RequiresBlockEndAfterOpcode(u32 op);
 
 	private:
@@ -226,7 +281,8 @@ namespace VitaEE
 		bool EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch);
 		bool EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch, VitaA32::Condition condition);
 		bool EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
-			bool defer_pc_writeback = false, u32 pc = 0);
+			bool defer_pc_writeback = false, u32 pc = 0,
+			bool sync_dirty_fallback = false);
 		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0,
 			bool sync_dirty_fallback = false);

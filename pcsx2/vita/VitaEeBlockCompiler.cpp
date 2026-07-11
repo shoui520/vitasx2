@@ -3468,13 +3468,85 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::BuildCleanGprLinkSignature(u32 first_pc,
+	bool GprLinkSignature::IsValid() const
+	{
+		if (count == 0 || count > MAX_PINS || block_pcs[0] >= block_pcs[1] ||
+			(block_pcs[0] & 3u) != 0 || (block_pcs[1] & 3u) != 0)
+		{
+			return false;
+		}
+
+		u16 host_mask = 0;
+		for (u8 i = 0; i < count; i++)
+		{
+			const GprLinkMapping& mapping = mappings[i];
+			if (mapping.guest == 0 || mapping.guest >= 32 ||
+				mapping.low_host < FIRST_HOST || mapping.low_host > LAST_HOST)
+			{
+				return false;
+			}
+			for (u8 previous = 0; previous < i; previous++)
+			{
+				if (mappings[previous].guest == mapping.guest)
+					return false;
+			}
+			const u16 low_host_bit = static_cast<u16>(1u << mapping.low_host);
+			if ((host_mask & low_host_bit) != 0)
+				return false;
+			host_mask |= low_host_bit;
+			if (mapping.width == GprLinkWidth::Low64)
+			{
+				if (mapping.high_host < FIRST_HOST || mapping.high_host > LAST_HOST ||
+					mapping.high_host == mapping.low_host)
+				{
+					return false;
+				}
+				const u16 high_host_bit = static_cast<u16>(1u << mapping.high_host);
+				if ((host_mask & high_host_bit) != 0)
+					return false;
+				host_mask |= high_host_bit;
+			}
+			else if (mapping.high_host != GprLinkMapping::NO_HOST)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool GprLinkSignature::ContainsPc(u32 pc) const
+	{
+		return IsValid() && (block_pcs[0] == pc || block_pcs[1] == pc);
+	}
+
+	bool GprLinkSignature::HasWriteBack() const
+	{
+		for (u8 i = 0; i < count; i++)
+		{
+			if (mappings[i].dirty == GprLinkDirtyState::WriteBack)
+				return true;
+		}
+		return false;
+	}
+
+	u8 GprLinkSignature::DirtyWordCount() const
+	{
+		u8 words = 0;
+		for (u8 i = 0; i < count; i++)
+		{
+			if (mappings[i].dirty == GprLinkDirtyState::WriteBack)
+				words += mappings[i].width == GprLinkWidth::Low64 ? 2 : 1;
+		}
+		return words;
+	}
+
+	bool BlockCompiler::BuildGprLinkSignature(u32 first_pc,
 		u32 first_instruction_count, u32 second_pc, u32 second_instruction_count,
 		GprLinkSignature* signature)
 	{
 		if (!signature)
 			return false;
-		*signature = {};
+		*signature = GprLinkSignature{};
 		if (!BlockCanUseDirtyGprPins(first_pc, first_instruction_count) ||
 			!BlockCanUseDirtyGprPins(second_pc, second_instruction_count))
 		{
@@ -3485,11 +3557,13 @@ namespace VitaEE
 		// x86/iCore.cpp::_clearNeededXMMregs() define persistent
 		// MODE_READ/MODE_WRITE mappings within compiled code, while
 		// x86/BaseblockEx.cpp::BaseBlocks::Link() owns reversible direct edges.
-		// Adapt those contracts into one deterministic low-word mapping from the
-		// combined two-block use counts. r9/r10/r11 are callee-saved in the
+		// Adapt those contracts into one deterministic width-aware mapping from
+		// the combined two-block use counts. r9/r10/r11 are callee-saved in the
 		// persistent frame; reject COP1/COP2 blocks which reserve the latter two
 		// for their private fast-path constants.
 		u16 scores[32]{};
+		u16 dword_scores[32]{};
+		u16 writes[32]{};
 		const auto score_block = [&](u32 start_pc, u32 instruction_count) {
 			for (u32 i = 0; i < instruction_count; i++)
 			{
@@ -3517,9 +3591,15 @@ namespace VitaEE
 				for (unsigned read = 0; read < read_info.low_read_count; read++)
 					scores[read_info.low_reads[read]] += 2;
 				for (unsigned read = 0; read < read_info.dword_read_count; read++)
+				{
 					scores[read_info.dword_reads[read]] += 2;
+					dword_scores[read_info.dword_reads[read]] += 2;
+				}
 				for (unsigned write = 0; write < write_info.write_count; write++)
+				{
 					scores[write_info.writes[write]]++;
+					writes[write_info.writes[write]]++;
+				}
 			}
 			return true;
 		};
@@ -3529,7 +3609,39 @@ namespace VitaEE
 			return false;
 		}
 
-		for (u8 pin = 0; pin < GprLinkSignature::MAX_PINS; pin++)
+		signature->block_pcs[0] = first_pc < second_pc ? first_pc : second_pc;
+		signature->block_pcs[1] = first_pc < second_pc ? second_pc : first_pc;
+		const auto add_mapping = [&](unsigned guest, unsigned low_host, unsigned high_host,
+			GprLinkWidth width) {
+			GprLinkMapping& mapping = signature->mappings[signature->count++];
+			mapping.guest = static_cast<u8>(guest);
+			mapping.low_host = static_cast<u8>(low_host);
+			mapping.high_host = width == GprLinkWidth::Low64 ?
+				static_cast<u8>(high_host) : GprLinkMapping::NO_HOST;
+			mapping.width = width;
+			mapping.dirty = writes[guest] != 0 ?
+				GprLinkDirtyState::WriteBack : GprLinkDirtyState::Clean;
+		};
+
+		unsigned full_reg = 0;
+		u16 full_score = 3;
+		for (unsigned reg = 1; reg < 32; reg++)
+		{
+			if (dword_scores[reg] > full_score)
+			{
+				full_reg = reg;
+				full_score = dword_scores[reg];
+			}
+		}
+		unsigned next_host = GprLinkSignature::FIRST_HOST;
+		if (full_reg != 0)
+		{
+			add_mapping(full_reg, next_host, next_host + 1, GprLinkWidth::Low64);
+			next_host += 2;
+			scores[full_reg] = 0;
+		}
+
+		while (next_host <= GprLinkSignature::LAST_HOST)
 		{
 			unsigned best_reg = 0;
 			u16 best_score = 0;
@@ -3543,11 +3655,11 @@ namespace VitaEE
 			}
 			if (best_reg == 0)
 				return false;
-			signature->guests[pin] = static_cast<u8>(best_reg);
-			signature->count++;
+			add_mapping(best_reg, next_host, GprLinkMapping::NO_HOST, GprLinkWidth::Low32);
+			next_host++;
 			scores[best_reg] = 0;
 		}
-		return true;
+		return signature->IsValid();
 	}
 
 	bool BlockHasExactConditionalSelfLink(u32 start_pc, u32 instruction_count)
@@ -5916,11 +6028,11 @@ namespace VitaEE
 			return;
 
 		// These hosts are part of the persistent chain ABI and are available only
-		// because BuildCleanGprLinkSignature() rejects COP1/COP2 users. Backing
-		// GPR state remains write-through in this first compatible-link mechanism,
-		// so every incompatible/helper/event seam is already authoritative.
-		constexpr u8 hosts[GprLinkSignature::MAX_PINS] = {
-			HOST_GPR_PIN0, HOST_COP1_EXPONENT_MASK, HOST_VU0_BASE};
+		// because BuildGprLinkSignature() rejects COP1/COP2 users. Width, host,
+		// dirty ownership, representation, and provenance are all part of the
+		// signature checked by the direct linker.
+		static_assert(GprLinkSignature::FIRST_HOST == HOST_GPR_PIN0);
+		static_assert(GprLinkSignature::LAST_HOST == HOST_VU0_BASE);
 		u32 defined = 1;
 		u32 live_in_reads = 0;
 		bool scanning = true;
@@ -5958,11 +6070,13 @@ namespace VitaEE
 		m_staged_pin_count = signature.count;
 		for (u8 i = 0; i < signature.count; i++)
 		{
-			m_staged_pin_guest[i] = signature.guests[i];
-			m_staged_pin_host[i] = hosts[i];
-			m_staged_pin_high_host[i] = NO_GPR_PIN_HOST;
+			const GprLinkMapping& mapping = signature.mappings[i];
+			m_staged_pin_guest[i] = mapping.guest;
+			m_staged_pin_host[i] = mapping.low_host;
+			m_staged_pin_high_host[i] = mapping.width == GprLinkWidth::Low64 ?
+				mapping.high_host : NO_GPR_PIN_HOST;
 			m_staged_pin_needs_entry_load[i] =
-				(dead_entry_values & (1u << signature.guests[i])) == 0;
+				(dead_entry_values & (1u << mapping.guest)) == 0;
 		}
 	}
 
@@ -7284,8 +7398,7 @@ namespace VitaEE
 			BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count);
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
 		const bool linked_entry_needs_pc_sync = BlockNeedsLinkedPcSync(start_pc, instruction_count);
-		const bool dirty_pins_candidate = !m_gpr_link_signature.IsValid() &&
-			BlockCanUseDirtyGprPins(start_pc, instruction_count);
+		const bool dirty_pins_candidate = BlockCanUseDirtyGprPins(start_pc, instruction_count);
 		const bool dirty_self_link_shape_candidate = persistent_dispatch_exits && direct_links &&
 			dirty_pins_candidate && BlockHasExactConditionalSelfLink(start_pc, instruction_count);
 		const bool caller_saved_branch_flag = dirty_self_link_shape_candidate &&
@@ -7373,7 +7486,9 @@ namespace VitaEE
 		}
 		if (m_gpr_link_signature.IsValid() && m_pin_count != m_gpr_link_signature.count)
 			return false;
-		m_dirty_pins_enabled = dirty_pins_candidate && BlockWritesPinnedGpr(start_pc, instruction_count);
+		m_dirty_pins_enabled = dirty_pins_candidate &&
+			(m_gpr_link_signature.IsValid() ? m_gpr_link_signature.HasWriteBack() :
+				BlockWritesPinnedGpr(start_pc, instruction_count));
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (m_dirty_pins_enabled)
 			g_qemuGprDirtyPinBlocks++;
@@ -7388,6 +7503,17 @@ namespace VitaEE
 			MarkGprPinsDirtyAtResidentSelfLinkEntry(start_pc, instruction_count);
 		if (!EmitGprPinLoads())
 			return false;
+		if (m_dirty_pins_enabled && m_gpr_link_signature.IsValid())
+		{
+			for (u8 i = 0; i < m_gpr_link_signature.count; i++)
+			{
+				const GprLinkMapping& mapping = m_gpr_link_signature.mappings[i];
+				if (mapping.dirty != GprLinkDirtyState::WriteBack)
+					continue;
+				m_pin_dirty_low[i] = true;
+				m_pin_dirty_high[i] = mapping.width == GprLinkWidth::Low64;
+			}
+		}
 		if (m_gpr_link_signature.IsValid())
 		{
 			if (compatible_link_entry_offset)
@@ -7998,9 +8124,16 @@ namespace VitaEE
 			DirectLinkSlot* const taken_link =
 				(direct_links && has_static_likely_direct_links && !wait_loop_taken) ?
 					&direct_links->slots[1] : nullptr;
+			const bool preserve_dirty_not_taken_link = m_dirty_pins_enabled &&
+				m_gpr_link_signature.HasWriteBack() &&
+				m_gpr_link_signature.ContainsPc(next_pc);
+			const bool preserve_dirty_taken_link = m_dirty_pins_enabled &&
+				m_gpr_link_signature.HasWriteBack() &&
+				m_gpr_link_signature.ContainsPc(branch_target_pc);
 			if (!EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit,
 					not_taken_link, taken_link, wait_loop_taken,
-					defer_pc_writeback, next_pc, branch_target_pc))
+					defer_pc_writeback, next_pc, branch_target_pc,
+					preserve_dirty_not_taken_link, preserve_dirty_taken_link))
 			{
 				return false;
 			}
@@ -8029,13 +8162,22 @@ namespace VitaEE
 		DirectLinkSlot* const taken_link =
 			(direct_links && has_static_conditional_direct_links && !wait_loop_taken) ?
 				&direct_links->slots[1] : nullptr;
+		const u32 direct_link_pc = has_static_direct_link_target ?
+			static_direct_link_target_pc : next_pc;
+		const bool preserve_dirty_direct_link = m_dirty_pins_enabled &&
+			m_gpr_link_signature.HasWriteBack() &&
+			m_gpr_link_signature.ContainsPc(direct_link_pc);
+		const bool preserve_dirty_taken_link = preserve_dirty_self_link ||
+			(m_dirty_pins_enabled && m_gpr_link_signature.HasWriteBack() &&
+			 m_gpr_link_signature.ContainsPc(branch_target_pc));
 		if (!EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
 				direct_link, taken_link,
 				has_register_branch_target ? indirect_lookup_pages_slot : nullptr,
 				has_register_branch_target ? direct_linking_enabled_flag : nullptr,
 				wait_loop_taken, defer_pc_writeback,
 				direct_pc, branch_target_pc, has_static_conditional_direct_links,
-				defer_indirect_pc_writeback, preserve_dirty_self_link))
+				defer_indirect_pc_writeback, preserve_dirty_direct_link,
+				preserve_dirty_taken_link))
 		{
 			return false;
 		}
@@ -8198,7 +8340,7 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
-		bool defer_pc_writeback, u32 pc)
+		bool defer_pc_writeback, u32 pc, bool sync_dirty_fallback)
 	{
 		if (!direct_exit)
 			return false;
@@ -8210,6 +8352,7 @@ namespace VitaEE
 
 		const size_t fallback_offset = m_code.Size();
 		if (!m_code.PatchBranch(target_branch, fallback_offset) ||
+			(sync_dirty_fallback && !EmitSyncGprPinsToBacking()) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
 			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
@@ -8222,6 +8365,9 @@ namespace VitaEE
 			direct_link->fallback_offset = fallback_offset;
 			direct_link->branch_on_taken = false;
 			direct_link->branch_on_unsigned_less = false;
+			direct_link->requires_compatible_gpr_entry = sync_dirty_fallback;
+			direct_link->compatible_dirty_words = sync_dirty_fallback ?
+				m_gpr_link_signature.DirtyWordCount() : 0;
 		}
 		return true;
 	}
@@ -8255,6 +8401,9 @@ namespace VitaEE
 			direct_link->branch_on_taken = true;
 			direct_link->branch_on_unsigned_less =
 				m_deferred_resident_unsigned_branch_suffix;
+			direct_link->requires_compatible_gpr_entry = sync_dirty_fallback;
+			direct_link->compatible_dirty_words = sync_dirty_fallback ?
+				m_gpr_link_signature.DirtyWordCount() : 0;
 		}
 		return true;
 	}
@@ -8496,7 +8645,7 @@ namespace VitaEE
 		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
 		bool wait_loop_taken, bool defer_pc_writeback,
 		u32 direct_pc, u32 taken_pc, bool conditional_pc, bool indirect_pc_writeback,
-		bool preserve_dirty_taken_self_link)
+		bool preserve_dirty_direct_link, bool preserve_dirty_taken_link)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
@@ -8508,10 +8657,12 @@ namespace VitaEE
 
 		// The forwarded boolean is part of the same resident self-link contract
 		// even when a future matching block has no dirty scalar pin of its own.
-		const bool carry_dirty_self_link =
-			(preserve_dirty_taken_self_link || m_forwarded_boolean_branch) &&
+		const bool carry_dirty_direct_link = preserve_dirty_direct_link && direct_link;
+		const bool carry_dirty_taken_link =
+			(preserve_dirty_taken_link || m_forwarded_boolean_branch) &&
 			taken_link && !wait_loop_taken;
-		if (!carry_dirty_self_link && !EmitFlushDirtyGprPins())
+		const bool carry_dirty_link = carry_dirty_direct_link || carry_dirty_taken_link;
+		if (!carry_dirty_link && !EmitFlushDirtyGprPins())
 			return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -8616,8 +8767,10 @@ namespace VitaEE
 			// The fall-through edge leaves this allocator contract. When the taken
 			// self-edge carries dirty pins, keep backing state authoritative before
 			// even a patched fall-through link.
-			if ((carry_dirty_self_link && !EmitSyncGprPinsToBacking()) ||
-				!EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback, direct_pc))
+			if ((!carry_dirty_direct_link && carry_dirty_link &&
+					!EmitSyncGprPinsToBacking()) ||
+				!EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback, direct_pc,
+					carry_dirty_direct_link))
 				return false;
 
 			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
@@ -8633,7 +8786,7 @@ namespace VitaEE
 			else
 			{
 				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link,
-					defer_pc_writeback, taken_pc, carry_dirty_self_link);
+					defer_pc_writeback, taken_pc, carry_dirty_link);
 			}
 
 			const size_t event_target = m_code.Size();
@@ -8642,7 +8795,7 @@ namespace VitaEE
 				!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) ||
 				(m_deferred_resident_unsigned_branch_suffix &&
 					!EmitDeferredResidentUnsignedBranchSuffix(true)) ||
-				(carry_dirty_self_link && !EmitSyncGprPinsToBacking()) ||
+				(carry_dirty_link && !EmitSyncGprPinsToBacking()) ||
 				!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc,
 					indirect_pc_writeback) ||
 				!EmitEventExitReturn(event_exit) ||
@@ -8661,7 +8814,8 @@ namespace VitaEE
 
 		if (direct_link)
 		{
-			if (!EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback, direct_pc))
+			if (!EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback, direct_pc,
+					carry_dirty_link))
 			{
 				return false;
 			}
@@ -8684,7 +8838,7 @@ namespace VitaEE
 		const size_t event_target = m_code.Size();
 		const size_t carry_branches[] = {carry_branch};
 		return m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) &&
-			   (!carry_dirty_self_link || EmitSyncGprPinsToBacking()) &&
+			   (!carry_dirty_link || EmitSyncGprPinsToBacking()) &&
 			   EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc, conditional_pc,
 				   indirect_pc_writeback) &&
 			   EmitEventExitReturn(event_exit) &&
@@ -8694,12 +8848,19 @@ namespace VitaEE
 	bool BlockCompiler::EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles,
 		const void* direct_exit, const void* event_exit, DirectLinkSlot* not_taken_link,
 		DirectLinkSlot* taken_link, bool wait_loop_taken,
-		bool defer_pc_writeback, u32 not_taken_pc, u32 taken_pc)
+		bool defer_pc_writeback, u32 not_taken_pc, u32 taken_pc,
+		bool preserve_dirty_not_taken_link, bool preserve_dirty_taken_link)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
 
-		if (!EmitFlushDirtyGprPins())
+		const bool carry_dirty_not_taken_link =
+			preserve_dirty_not_taken_link && not_taken_link;
+		const bool carry_dirty_taken_link =
+			preserve_dirty_taken_link && taken_link && !wait_loop_taken;
+		const bool carry_dirty_link =
+			carry_dirty_not_taken_link || carry_dirty_taken_link;
+		if (!carry_dirty_link && !EmitFlushDirtyGprPins())
 			return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -8838,8 +8999,10 @@ namespace VitaEE
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
 
-			if (!EmitDirectLinkTail(direct_exit, not_taken_link,
-					defer_pc_writeback, not_taken_pc))
+			if ((!carry_dirty_not_taken_link && carry_dirty_link &&
+					!EmitSyncGprPinsToBacking()) ||
+				!EmitDirectLinkTail(direct_exit, not_taken_link,
+					defer_pc_writeback, not_taken_pc, carry_dirty_not_taken_link))
 				return false;
 
 			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
@@ -8854,13 +9017,14 @@ namespace VitaEE
 			else
 			{
 				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link,
-					defer_pc_writeback, taken_pc);
+					defer_pc_writeback, taken_pc, carry_dirty_link);
 			}
 
 			const size_t event_target = m_code.Size();
 			const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
 			if (!taken_tail_ok ||
 				!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) ||
+				(carry_dirty_link && !EmitSyncGprPinsToBacking()) ||
 				!EmitDeferredPcWriteback(defer_pc_writeback, not_taken_pc, taken_pc, true) ||
 				!EmitEventExitReturn(event_exit) ||
 				!EmitCycleCarryFixup(carry_branches, 2, cycle_compare_target, HOST_TMP1))
@@ -8872,7 +9036,8 @@ namespace VitaEE
 		}
 
 		const size_t carry_branches[] = {not_taken_carry_branch, taken_carry_branch};
-		if (!EmitDeferredPcWriteback(defer_pc_writeback, not_taken_pc, taken_pc, true) ||
+		if ((carry_dirty_link && !EmitSyncGprPinsToBacking()) ||
+			!EmitDeferredPcWriteback(defer_pc_writeback, not_taken_pc, taken_pc, true) ||
 			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
 			return false;
@@ -8880,6 +9045,7 @@ namespace VitaEE
 
 		const size_t event_target = m_code.Size();
 		return m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::PL) &&
+			   (!carry_dirty_link || EmitSyncGprPinsToBacking()) &&
 			   EmitDeferredPcWriteback(defer_pc_writeback, not_taken_pc, taken_pc, true) &&
 			   EmitEventExitReturn(event_exit) &&
 			   EmitCycleCarryFixup(carry_branches, 2, cycle_compare_target, HOST_TMP1);
