@@ -128,6 +128,9 @@ u32 g_qemuCompatiblePredicateBlocks = 0;
 u32 g_qemuCompatiblePredicateCanonicalInstructions = 0;
 u32 g_qemuCompatiblePredicateLinkedInstructionsElided = 0;
 u32 g_qemuCompatiblePredicateEdgeInstructions = 0;
+u32 g_qemuCompatibleLikelyTakenSuffixBlocks = 0;
+u32 g_qemuCompatibleLikelyTakenSuffixHotInstructionsElided = 0;
+u32 g_qemuCompatibleLikelyTakenSuffixColdInstructions = 0;
 u32 g_qemuResidentCycleLowBlocks = 0;
 u32 g_qemuResidentCycleLowHotInstructionsElided = 0;
 u32 g_qemuResidentCycleLowSyncInstructions = 0;
@@ -7970,6 +7973,18 @@ namespace VitaEE
 			start_pc == m_gpr_link_signature.vtlb_pointer.access_pc;
 		m_compatible_predicate_consumer = m_gpr_link_signature.HasPredicate() &&
 			start_pc == m_gpr_link_signature.predicate.consumer_pc;
+		const u32 compatible_predicate_branch = m_compatible_predicate_consumer ?
+			memRead32(start_pc) : 0;
+		const u32 compatible_predicate_delay =
+			m_compatible_predicate_consumer && instruction_count == 2 ?
+				memRead32(start_pc + sizeof(u32)) : 0;
+		m_compatible_likely_taken_suffix = m_compatible_predicate_consumer &&
+			m_compatible_scheduler_countdown && persistent_dispatch_exits && direct_links &&
+			instruction_count == 2 && (compatible_predicate_branch >> 26) == 0x15 &&
+			(compatible_predicate_delay >> 26) == 0x09;
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_compatible_likely_taken_suffix &= m_compatible_likely_taken_suffix_enabled;
+#endif
 		m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_dirty_pins = {};
@@ -8193,7 +8208,7 @@ namespace VitaEE
 					// detects a branch while compiling the outer branch delay slot,
 					// advances PC past it, and emits no side effects or cycles for
 					// the delay-slot branch itself.
-					if (branch_is_likely &&
+					if (branch_is_likely && !m_compatible_likely_taken_suffix &&
 						!m_code.PatchBranch(branch_likely_skip_delay, m_code.Size(), VitaA32::Condition::EQ))
 	{
 						return false;
@@ -8570,7 +8585,8 @@ namespace VitaEE
 
 			if (has_branch && branch_is_likely && i == branch_instruction_index + 1)
 			{
-				if (!m_code.PatchBranch(branch_likely_skip_delay, m_code.Size(), VitaA32::Condition::EQ))
+				if (!m_compatible_likely_taken_suffix &&
+					!m_code.PatchBranch(branch_likely_skip_delay, m_code.Size(), VitaA32::Condition::EQ))
 					return false;
 			}
 		}
@@ -8673,10 +8689,29 @@ namespace VitaEE
 				(m_dirty_pins_enabled || m_compatible_scheduler_countdown ||
 				 m_compatible_vtlb_pointer) &&
 				m_gpr_link_signature.ContainsPc(branch_target_pc);
-			if (!EndBlockWithLikelyCycleTest(block_cycles, branch_likely_not_taken_cycles, direct_exit, event_exit,
-					not_taken_link, taken_link, wait_loop_taken,
+			const bool use_compatible_likely_suffix =
+				m_compatible_likely_taken_suffix && !wait_loop_taken;
+			bool likely_tail_ok = false;
+			if (use_compatible_likely_suffix)
+			{
+				likely_tail_ok = EndBlockWithCompatibleLikelyTakenSuffix(block_cycles,
+					branch_likely_not_taken_cycles, direct_exit, event_exit,
+					not_taken_link, taken_link, branch_likely_skip_delay,
 					defer_pc_writeback, next_pc, branch_target_pc,
-					preserve_dirty_not_taken_link, preserve_dirty_taken_link))
+					preserve_dirty_not_taken_link, preserve_dirty_taken_link);
+			}
+			else
+			{
+				likely_tail_ok = (!m_compatible_likely_taken_suffix ||
+					m_code.PatchBranch(branch_likely_skip_delay, m_code.Size(),
+						VitaA32::Condition::EQ)) &&
+					EndBlockWithLikelyCycleTest(block_cycles,
+						branch_likely_not_taken_cycles, direct_exit, event_exit,
+						not_taken_link, taken_link, wait_loop_taken,
+						defer_pc_writeback, next_pc, branch_target_pc,
+						preserve_dirty_not_taken_link, preserve_dirty_taken_link);
+			}
+			if (!likely_tail_ok)
 			{
 				return false;
 			}
@@ -9495,6 +9530,82 @@ namespace VitaEE
 				   indirect_pc_writeback) &&
 			   EmitEventExitReturn(event_exit) &&
 			   EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EndBlockWithCompatibleLikelyTakenSuffix(u32 taken_cycles,
+		u32 not_taken_cycles, const void* direct_exit, const void* event_exit,
+		DirectLinkSlot* not_taken_link, DirectLinkSlot* taken_link,
+		size_t not_taken_branch, bool defer_pc_writeback,
+		u32 not_taken_pc, u32 taken_pc, bool preserve_dirty_not_taken_link,
+		bool preserve_dirty_taken_link)
+	{
+		if (!direct_exit || !event_exit || !not_taken_link || !taken_link ||
+			not_taken_branch == static_cast<size_t>(-1) ||
+			preserve_dirty_not_taken_link || !preserve_dirty_taken_link ||
+			!m_compatible_predicate_consumer || !m_compatible_scheduler_countdown)
+		{
+			return false;
+		}
+
+		const auto add_countdown = [this](u32 cycles) {
+			return m_code.EmitAddImm32(GprLinkSignature::SCHEDULER_HOST,
+				GprLinkSignature::SCHEDULER_HOST, cycles, true) ||
+				(m_code.EmitMovImm32(HOST_TMP2, cycles) &&
+				 m_code.EmitAddReg(GprLinkSignature::SCHEDULER_HOST,
+					 GprLinkSignature::SCHEDULER_HOST, HOST_TMP2, true));
+		};
+
+		// The first predicate test already routed zero around the likely delay slot.
+		// Its fallthrough is therefore proven taken: charge the taken constant and
+		// use one unconditional patchable edge, without reconstructing or retesting
+		// the predicate. PCSX2's iBranchTest() still owns the signed event decision.
+		if (!add_countdown(taken_cycles))
+			return false;
+		const size_t taken_event = m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		if (taken_event == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(direct_exit, taken_link,
+				defer_pc_writeback, taken_pc, true))
+		{
+			return false;
+		}
+
+		const size_t cold_start = m_code.Size();
+		if (!m_code.PatchBranch(not_taken_branch, cold_start, VitaA32::Condition::EQ) ||
+			!add_countdown(not_taken_cycles))
+		{
+			return false;
+		}
+		const size_t not_taken_event =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		if (not_taken_event == static_cast<size_t>(-1) ||
+			!EmitSyncGprPinsToBacking() ||
+			!EmitDirectLinkTail(direct_exit, not_taken_link,
+				defer_pc_writeback, not_taken_pc, false))
+		{
+			return false;
+		}
+
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(taken_event, event_target, VitaA32::Condition::PL) ||
+			!m_code.PatchBranch(not_taken_event, event_target, VitaA32::Condition::PL) ||
+			!EmitSyncGprPinsToBacking() ||
+			!EmitDeferredPcWriteback(defer_pc_writeback,
+				not_taken_pc, taken_pc, true) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCompatibleLikelyTakenSuffixBlocks++;
+		g_qemuCompatibleLikelyTakenSuffixHotInstructionsElided += 2;
+		g_qemuCompatibleLikelyTakenSuffixColdInstructions += static_cast<u32>(
+			(m_code.Size() - cold_start) / sizeof(u32));
+		g_qemuResidentCycleLowHotInstructionsElided += 3;
+		g_qemuResidentNextEventLowHotInstructionsElided++;
+		g_qemuResidentSchedulerCountdownHotInstructionsElided++;
+#endif
+		return true;
 	}
 
 	bool BlockCompiler::EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles,

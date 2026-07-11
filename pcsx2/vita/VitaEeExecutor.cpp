@@ -652,6 +652,15 @@ namespace VitaEE
 		m_compatible_predicate_carry_enabled = enabled;
 	}
 
+	void BlockExecutor::SetCompatibleLikelyTakenSuffixEnabled(bool enabled)
+	{
+		if (m_compatible_likely_taken_suffix_enabled == enabled)
+			return;
+
+		Reset();
+		m_compatible_likely_taken_suffix_enabled = enabled;
+	}
+
 	void BlockExecutor::SetVtlbLinkedEntryPcPublicationEnabled(bool enabled)
 	{
 		if (m_vtlb_linked_entry_pc_publication_enabled == enabled)
@@ -1218,6 +1227,8 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 			compiler.SetVtlbLinkedEntryPcPublicationEnabled(
 				m_vtlb_linked_entry_pc_publication_enabled);
+			compiler.SetCompatibleLikelyTakenSuffixEnabled(
+				m_compatible_likely_taken_suffix_enabled);
 #endif
 			u32 attempt_scaled_cycles = 0;
 			size_t attempt_linked_entry_offset = 0;

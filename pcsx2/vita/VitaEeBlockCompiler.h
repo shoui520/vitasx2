@@ -373,6 +373,10 @@ namespace VitaEE
 		{
 			m_vtlb_linked_entry_pc_publication_enabled = enabled;
 		}
+		void SetCompatibleLikelyTakenSuffixEnabled(bool enabled)
+		{
+			m_compatible_likely_taken_suffix_enabled = enabled;
+		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -415,6 +419,11 @@ namespace VitaEE
 
 	private:
 		bool EmitLinkFrameReturn();
+		bool EndBlockWithCompatibleLikelyTakenSuffix(u32 taken_cycles, u32 not_taken_cycles,
+			const void* direct_exit, const void* event_exit, DirectLinkSlot* not_taken_link,
+			DirectLinkSlot* taken_link, size_t not_taken_branch, bool defer_pc_writeback,
+			u32 not_taken_pc, u32 taken_pc, bool preserve_dirty_not_taken_link,
+			bool preserve_dirty_taken_link);
 		bool EmitStageCompatiblePredicate();
 		bool EmitPrepareCompatiblePredicateEdge(u32 target_pc);
 		bool EmitReloadGprPinsAfterClobber(u16 host_mask);
@@ -1106,6 +1115,7 @@ namespace VitaEE
 		bool m_persistent_dispatch_exits = false;
 #if defined(VITASX2_QEMU_VALIDATION)
 		bool m_vtlb_linked_entry_pc_publication_enabled = false;
+		bool m_compatible_likely_taken_suffix_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;
@@ -1122,6 +1132,7 @@ namespace VitaEE
 		bool m_compatible_vtlb_pointer = false;
 		bool m_compatible_vtlb_pointer_access = false;
 		bool m_compatible_predicate_consumer = false;
+		bool m_compatible_likely_taken_suffix = false;
 		bool m_reclaimed_vtlb_link_hosts = false;
 		size_t m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
