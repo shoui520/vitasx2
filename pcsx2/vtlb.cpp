@@ -619,6 +619,166 @@ u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 	return VITA_EE_FOUR_WORD_FILL_SELF;
 }
 
+u32 VitaEeExecuteSelfAddressPairScan(u32 start_pc, u32 packed_guests,
+	u32 packed_cycles, u32 load_cycles)
+{
+	// PCSX2 owners: x86/ix86-32/iR5900LoadStore.cpp::recLW(),
+	// iR5900Branch.cpp::recBNE()/recBEQL(), iR5900AritImm.cpp::recADDIU(),
+	// recVTLB.cpp::DynGen_DirectRead(), and iR5900.cpp::iBranchTest().
+	constexpr u32 MISMATCH_PC_OFFSET = 5 * sizeof(u32);
+	constexpr u32 SECOND_BLOCK_PC_OFFSET = 3 * sizeof(u32);
+	constexpr u32 THIRD_BLOCK_PC_OFFSET = 14 * sizeof(u32);
+	constexpr u32 FALLTHROUGH_PC_OFFSET = 17 * sizeof(u32);
+	const unsigned result_guest = packed_guests & 0x1f;
+	const unsigned pointer_guest = (packed_guests >> 5) & 0x1f;
+	const unsigned count_guest = (packed_guests >> 10) & 0x1f;
+	const u32 first_cycles = packed_cycles & 0xff;
+	const u32 second_taken_cycles = (packed_cycles >> 8) & 0xff;
+	const u32 second_false_cycles = (packed_cycles >> 16) & 0xff;
+	const u32 third_cycles = (packed_cycles >> 24) & 0xff;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	extern u32 g_qemuSelfAddressPairScanHelperCalls;
+	extern u32 g_qemuSelfAddressPairScanDirectPairs;
+	extern u32 g_qemuSelfAddressPairScanScalarPairs;
+	extern u32 g_qemuSelfAddressPairScanPageReturns;
+	extern u32 g_qemuSelfAddressPairScanFirstMismatches;
+	extern u32 g_qemuSelfAddressPairScanSecondMismatches;
+	g_qemuSelfAddressPairScanHelperCalls++;
+#endif
+
+	const auto event_due = []() {
+		return static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
+			static_cast<u32>(cpuRegs.nextEventCycle)) >= 0;
+	};
+	const auto advance = [&](u32 cycles, u32 pc) {
+		cpuRegs.cycle += cycles;
+		cpuRegs.pc = pc;
+		return event_due();
+	};
+	const auto sign_extend_word = [](u32 value) {
+		return static_cast<u64>(static_cast<s64>(static_cast<s32>(value)));
+	};
+	const u32* direct_host = nullptr;
+	u32 direct_next_address = 0;
+	u32 direct_pairs_remaining = 0;
+
+	for (;;)
+	{
+		const u64 pointer_value = cpuRegs.GPR.r[pointer_guest].UD[0];
+		const u32 address = static_cast<u32>(pointer_value);
+		if ((address & 3u) != 0)
+		{
+			// PCSX2 R5900OpcodeImpl.cpp::LW() raises before reading memory. The
+			// ordinary A32 cold tail publishes pc+4 and the single-LW cycle cost,
+			// calls CancelInstruction(), then enters the event dispatcher.
+			cpuRegs.pc = start_pc + sizeof(u32);
+			cpuRegs.cycle += load_cycles;
+			if (Cpu && Cpu->CancelInstruction)
+				Cpu->CancelInstruction();
+			return VITA_EE_SELF_ADDRESS_PAIR_SCAN_EVENT;
+		}
+		bool direct_pair = direct_pairs_remaining != 0 &&
+			direct_next_address == address;
+		if (!direct_pair)
+		{
+			const VTLBVirtual mapping = vtlbdata.vmap[address >> VTLB_PAGE_BITS];
+			const u32 bytes_to_page = VTLB_PAGE_SIZE - (address & VTLB_PAGE_MASK);
+			direct_pair = !mapping.isHandler(address) && bytes_to_page >= 8;
+			if (direct_pair)
+			{
+				direct_host = reinterpret_cast<const u32*>(mapping.assumePtr(address));
+				direct_next_address = address;
+				direct_pairs_remaining = bytes_to_page / 8;
+			}
+		}
+		u32 first_raw = 0;
+		u32 second_raw = 0;
+		if (direct_pair)
+		{
+			first_raw = direct_host[0];
+			second_raw = direct_host[1];
+			direct_host += 2;
+			direct_next_address += 8;
+			direct_pairs_remaining--;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSelfAddressPairScanDirectPairs++;
+#endif
+		}
+		else
+		{
+			// The second LW is the first BNE's ordinary delay slot and therefore
+			// executes even when the first comparison mismatches. Translate both
+			// independently so a crossing pair preserves callback/remap order.
+			first_raw = vtlb_memRead<mem32_t>(address);
+			second_raw = vtlb_memRead<mem32_t>(address + sizeof(u32));
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSelfAddressPairScanScalarPairs++;
+#endif
+		}
+
+		const u64 first = sign_extend_word(first_raw);
+		const u64 second = sign_extend_word(second_raw);
+		cpuRegs.GPR.r[result_guest].UD[0] = second;
+		const bool first_equal = first == pointer_value;
+		if (advance(first_cycles, first_equal ?
+				start_pc + SECOND_BLOCK_PC_OFFSET : start_pc + MISMATCH_PC_OFFSET))
+		{
+			return VITA_EE_SELF_ADDRESS_PAIR_SCAN_EVENT;
+		}
+		if (!first_equal)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSelfAddressPairScanFirstMismatches++;
+#endif
+			return VITA_EE_SELF_ADDRESS_PAIR_SCAN_MISMATCH;
+		}
+
+		const bool second_equal = second == pointer_value;
+		if (second_equal)
+		{
+			const u32 updated_count = cpuRegs.GPR.r[count_guest].UL[0] + 1;
+			cpuRegs.GPR.r[count_guest].UD[0] = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(updated_count)));
+		}
+		if (advance(second_equal ? second_taken_cycles : second_false_cycles,
+				second_equal ? start_pc + THIRD_BLOCK_PC_OFFSET :
+					start_pc + MISMATCH_PC_OFFSET))
+		{
+			return VITA_EE_SELF_ADDRESS_PAIR_SCAN_EVENT;
+		}
+		if (!second_equal)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSelfAddressPairScanSecondMismatches++;
+#endif
+			return VITA_EE_SELF_ADDRESS_PAIR_SCAN_MISMATCH;
+		}
+
+		const bool repeat = cpuRegs.GPR.r[count_guest].SD[0] < 129;
+		cpuRegs.GPR.r[result_guest].UD[0] = repeat ? 1 : 0;
+		const u32 updated_pointer = address + 8;
+		cpuRegs.GPR.r[pointer_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(updated_pointer)));
+		if (advance(third_cycles,
+				repeat ? start_pc : start_pc + FALLTHROUGH_PC_OFFSET))
+		{
+			return VITA_EE_SELF_ADDRESS_PAIR_SCAN_EVENT;
+		}
+		if (!repeat)
+			return VITA_EE_SELF_ADDRESS_PAIR_SCAN_COMPLETE;
+		if (!direct_pair)
+			return VITA_EE_SELF_ADDRESS_PAIR_SCAN_SELF;
+		if (direct_pairs_remaining == 0)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSelfAddressPairScanPageReturns++;
+#endif
+			return VITA_EE_SELF_ADDRESS_PAIR_SCAN_SELF;
+		}
+	}
+}
+
 template <typename DataType>
 DataType vtlb_ramRead(u32 addr, bool* result)
 {

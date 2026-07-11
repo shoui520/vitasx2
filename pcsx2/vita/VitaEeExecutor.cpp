@@ -878,33 +878,36 @@ namespace VitaEE
 		result->stop_pc = start_pc;
 		result->stop = BlockScanStop::MaxInstructions;
 
-		u32 exact_cache_loop_instruction_count = 0;
-		bool exact_cache_loop_scan_enabled = true;
+		u32 exact_region_instruction_count = 0;
+		bool exact_region_scan_enabled = true;
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
-		exact_cache_loop_scan_enabled = !VitaIsEePreInstructionTraceEnabled() &&
+		exact_region_scan_enabled = !VitaIsEePreInstructionTraceEnabled() &&
 			!Pcsx2Trace::IsGsTraceEnabled() && !Pcsx2Trace::IsVuTraceEnabled() &&
 			!EmuConfig.Gamefixes.GoemonTlbHack;
 #endif
-		if (exact_cache_loop_scan_enabled && max_instruction_count >= 35 &&
+		if (exact_region_scan_enabled && max_instruction_count >= 35 &&
 			BlockCompiler::IsExactCacheDxltgTagSweep(start_pc, 35))
 		{
-			exact_cache_loop_instruction_count = 35;
+			exact_region_instruction_count = 35;
 		}
-		else if (exact_cache_loop_scan_enabled && max_instruction_count >= 9 &&
+		else if (exact_region_scan_enabled && max_instruction_count >= 17 &&
+			BlockCompiler::IsExactSelfAddressPairScan(start_pc, 17))
+			exact_region_instruction_count = 17;
+		else if (exact_region_scan_enabled && max_instruction_count >= 9 &&
 			BlockCompiler::IsExactCacheDxwbinLoop(start_pc, 9))
-			exact_cache_loop_instruction_count = 9;
-		else if (exact_cache_loop_scan_enabled && max_instruction_count >= 8 &&
+			exact_region_instruction_count = 9;
+		else if (exact_region_scan_enabled && max_instruction_count >= 8 &&
 			BlockCompiler::IsExactCacheIxinLoop(start_pc, 8))
-			exact_cache_loop_instruction_count = 8;
-		if (exact_cache_loop_instruction_count != 0)
+			exact_region_instruction_count = 8;
+		if (exact_region_instruction_count != 0)
 		{
-			for (u32 i = 0; i < exact_cache_loop_instruction_count; i++)
+			for (u32 i = 0; i < exact_region_instruction_count; i++)
 			{
 				const u32 pc = start_pc + i * sizeof(u32);
 				if (isBreakpointNeeded(pc) != 0 || isMemcheckNeeded(pc) != 0 ||
 					(i != 0 && (pc & 0xffcu) == 0))
 				{
-					exact_cache_loop_instruction_count = 0;
+					exact_region_instruction_count = 0;
 					break;
 				}
 			}
@@ -939,12 +942,12 @@ namespace VitaEE
 			const u32 op = memRead32(pc);
 			if (BlockCompiler::IsSupportedBranchOpcode(op))
 			{
-				if (exact_cache_loop_instruction_count != 0 &&
-					i + 2 < exact_cache_loop_instruction_count)
+				if (exact_region_instruction_count != 0 &&
+					i + 2 < exact_region_instruction_count)
 				{
-					// The exact DXLTG sweep's two internal BNEs only select inert
-					// padding. Its specialized compiler owns both paths and their
-					// different cycle costs; keep scanning to the outer backedge.
+					// Exact multi-block descriptors own or side-exit before every
+					// internal branch, including its path-specific cycle seam. Keep
+					// scanning until the descriptor's outer backedge and delay slot.
 					result->instruction_count++;
 					result->stop_pc = pc + 4;
 					continue;
@@ -997,7 +1000,7 @@ namespace VitaEE
 
 			result->instruction_count++;
 			result->stop_pc = pc + 4;
-			if (BlockCompiler::RequiresBlockEndAfterOpcode(op) && exact_cache_loop_instruction_count == 0)
+			if (BlockCompiler::RequiresBlockEndAfterOpcode(op) && exact_region_instruction_count == 0)
 			{
 				result->stop = BlockScanStop::OpcodeBoundary;
 				return true;

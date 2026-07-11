@@ -284,6 +284,20 @@ enum VitaEeFourWordFillResult : u32
 u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 	u32 block_cycles, u32 packed_guests);
 
+enum VitaEeSelfAddressPairScanResult : u32
+{
+	VITA_EE_SELF_ADDRESS_PAIR_SCAN_COMPLETE = 0,
+	VITA_EE_SELF_ADDRESS_PAIR_SCAN_SELF = 1,
+	VITA_EE_SELF_ADDRESS_PAIR_SCAN_EVENT = 2,
+	VITA_EE_SELF_ADDRESS_PAIR_SCAN_MISMATCH = 3,
+};
+
+// Executes the exact two-LW self-address verification loop. Direct vTLB pages
+// scan until mismatch, count limit, page boundary, or one of the three original
+// scheduler seams; handler/crossing pairs execute one ordered iteration.
+u32 VitaEeExecuteSelfAddressPairScan(u32 start_pc, u32 packed_guests,
+	u32 packed_cycles, u32 load_cycles);
+
 // --------------------------------------------------------------------------------------
 //  Goemon game fix
 // --------------------------------------------------------------------------------------
