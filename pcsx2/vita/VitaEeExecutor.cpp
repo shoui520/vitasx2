@@ -13,6 +13,12 @@
 #include <cstring>
 #include <new>
 
+#if defined(VITASX2_QEMU_VALIDATION)
+extern u32 g_qemuEmbeddedCompatibleContinuationActivations;
+extern u32 g_qemuEmbeddedCompatibleContinuationSourceMismatches;
+extern u32 g_qemuEmbeddedCompatibleContinuationIncompatibleTargets;
+#endif
+
 namespace
 {
 	using GeneratedBlock = u32 (*)();
@@ -670,6 +676,15 @@ namespace VitaEE
 		m_compatible_predicate_entry_variant_enabled = enabled;
 	}
 
+	void BlockExecutor::SetEmbeddedCompatibleContinuationEnabled(bool enabled)
+	{
+		if (m_embedded_compatible_continuation_enabled == enabled)
+			return;
+
+		Reset();
+		m_embedded_compatible_continuation_enabled = enabled;
+	}
+
 	void BlockExecutor::SetVtlbLinkedEntryPcPublicationEnabled(bool enabled)
 	{
 		if (m_vtlb_linked_entry_pc_publication_enabled == enabled)
@@ -1240,6 +1255,8 @@ namespace VitaEE
 				m_compatible_likely_taken_suffix_enabled);
 			compiler.SetCompatiblePredicateEntryVariantEnabled(
 				m_compatible_predicate_entry_variant_enabled);
+			compiler.SetEmbeddedCompatibleContinuationEnabled(
+				m_embedded_compatible_continuation_enabled);
 #endif
 			u32 attempt_scaled_cycles = 0;
 			size_t attempt_linked_entry_offset = 0;
@@ -1384,23 +1401,44 @@ namespace VitaEE
 			block.gpr_link_signature == target->gpr_link_signature &&
 			target->compatible_link_entry_offset != static_cast<size_t>(-1) &&
 			target->compatible_link_entry_offset < target->code.Size();
+		const bool embedded_source_matches =
+			link.embedded_compatible_continuation &&
+			memRead32(link.target_pc) == link.embedded_source_opcodes[0] &&
+			memRead32(link.target_pc + sizeof(u32)) == link.embedded_source_opcodes[1];
+		const bool use_embedded_continuation =
+			use_compatible_entry && embedded_source_matches;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (link.embedded_compatible_continuation && target)
+		{
+			g_qemuEmbeddedCompatibleContinuationActivations += use_embedded_continuation;
+			g_qemuEmbeddedCompatibleContinuationSourceMismatches +=
+				use_compatible_entry && !embedded_source_matches;
+			g_qemuEmbeddedCompatibleContinuationIncompatibleTargets +=
+				!use_compatible_entry;
+		}
+#endif
 		const bool use_generated_fallback = !target ||
 			(link.requires_compatible_entry &&
-			 !use_resident_entry && !use_compatible_entry);
+				 !use_resident_entry && !use_compatible_entry) ||
+			(link.embedded_compatible_continuation && !use_embedded_continuation);
 		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) :
 			(use_compatible_entry ? CompatibleLinkEntryPoint(*target) :
 				(!use_generated_fallback ? LinkedEntryPoint(*target) : direct_exit));
 		const VitaA32::Condition condition = link.branch_on_taken ?
 			(link.branch_on_unsigned_less ? VitaA32::Condition::CC : VitaA32::Condition::NE) :
 			VitaA32::Condition::AL;
-		const bool patched = use_generated_fallback ?
-			block.code.PatchBranch(link.target_offset, link.fallback_offset, condition) :
-			block.code.PatchBranchToAddress(link.target_offset, patched_target, condition);
+		const bool patched = use_embedded_continuation ?
+			block.code.PatchInstruction(link.target_offset,
+				link.embedded_active_instruction) :
+			(use_generated_fallback ?
+				block.code.PatchBranch(link.target_offset, link.fallback_offset, condition) :
+				block.code.PatchBranchToAddress(link.target_offset, patched_target, condition));
 		if (!patched || !block.code.Flush())
 			return false;
 
 		link.patched_to_resident_entry = !use_generated_fallback && use_resident_entry;
 		link.patched_to_compatible_entry = !use_generated_fallback && use_compatible_entry;
+		link.embedded_continuation_active = use_embedded_continuation;
 		link.compatible_entry_instructions = use_compatible_entry ? static_cast<u8>(
 			(target->compatible_link_entry_offset - target->linked_entry_offset) /
 			sizeof(u32)) : 0;
@@ -1518,6 +1556,8 @@ namespace VitaEE
 					link.compatible_scheduler_countdown ? 1u : 0u;
 				result->compatible_vtlb_pointer_links +=
 					link.compatible_vtlb_pointer ? 1u : 0u;
+				result->embedded_compatible_continuations +=
+					link.embedded_continuation_active ? 1u : 0u;
 			}
 		}
 #endif
@@ -1603,6 +1643,8 @@ namespace VitaEE
 						link.compatible_scheduler_countdown ? 1u : 0u;
 					result->compatible_vtlb_pointer_links +=
 						link.compatible_vtlb_pointer ? 1u : 0u;
+					result->embedded_compatible_continuations +=
+						link.embedded_continuation_active ? 1u : 0u;
 				}
 			}
 #endif

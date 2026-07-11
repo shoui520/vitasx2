@@ -79,6 +79,7 @@ namespace VitaEE
 		u32 compatible_gpr_dirty_words_carried = 0;
 		u32 compatible_scheduler_links = 0;
 		u32 compatible_vtlb_pointer_links = 0;
+		u32 embedded_compatible_continuations = 0;
 #endif
 	};
 
@@ -106,6 +107,7 @@ namespace VitaEE
 		void SetCompatiblePredicateCarryEnabled(bool enabled);
 		void SetCompatibleLikelyTakenSuffixEnabled(bool enabled);
 		void SetCompatiblePredicateEntryVariantEnabled(bool enabled);
+		void SetEmbeddedCompatibleContinuationEnabled(bool enabled);
 		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled);
 #endif
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
@@ -268,6 +270,7 @@ namespace VitaEE
 		bool m_compatible_predicate_carry_enabled = true;
 		bool m_compatible_likely_taken_suffix_enabled = true;
 		bool m_compatible_predicate_entry_variant_enabled = true;
+		bool m_embedded_compatible_continuation_enabled = true;
 		bool m_vtlb_linked_entry_pc_publication_enabled = false;
 #endif
 	};

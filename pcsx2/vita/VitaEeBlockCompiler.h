@@ -22,8 +22,12 @@ namespace VitaEE
 		u32 target_pc = 0;
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
+		u32 embedded_active_instruction = 0;
+		u32 embedded_source_opcodes[2]{};
 		bool branch_on_taken = false;
 		bool branch_on_unsigned_less = false;
+		bool embedded_compatible_continuation = false;
+		bool embedded_continuation_active = false;
 		bool patched_to_resident_entry = false;
 		bool patched_to_compatible_entry = false;
 		bool requires_compatible_entry = false;
@@ -381,6 +385,10 @@ namespace VitaEE
 		{
 			m_compatible_predicate_entry_variant_enabled = enabled;
 		}
+		void SetEmbeddedCompatibleContinuationEnabled(bool enabled)
+		{
+			m_embedded_compatible_continuation_enabled = enabled;
+		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -423,6 +431,9 @@ namespace VitaEE
 
 	private:
 		bool EmitLinkFrameReturn();
+		bool EmitEmbeddedCompatibleLikelyContinuation(const void* direct_exit,
+			const void* event_exit, DirectLinkSlot* direct_link,
+			bool defer_pc_writeback, u32 target_pc, bool* emitted);
 		bool EndBlockWithCompatibleLikelyTakenSuffix(u32 taken_cycles, u32 not_taken_cycles,
 			const void* direct_exit, const void* event_exit, DirectLinkSlot* not_taken_link,
 			DirectLinkSlot* taken_link, size_t not_taken_branch, bool defer_pc_writeback,
@@ -1121,6 +1132,7 @@ namespace VitaEE
 		bool m_vtlb_linked_entry_pc_publication_enabled = false;
 		bool m_compatible_likely_taken_suffix_enabled = true;
 		bool m_compatible_predicate_entry_variant_enabled = true;
+		bool m_embedded_compatible_continuation_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;
@@ -1142,6 +1154,7 @@ namespace VitaEE
 		u8 m_compatible_predicate_resident_host = PredicateLinkMapping::NO_HOST;
 		size_t m_compatible_predicate_canonical_skip_delay = static_cast<size_t>(-1);
 		size_t m_compatible_predicate_canonical_enter_delay = static_cast<size_t>(-1);
+		size_t m_compatible_link_entry_offset = static_cast<size_t>(-1);
 		bool m_reclaimed_vtlb_link_hosts = false;
 		size_t m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);

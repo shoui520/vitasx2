@@ -266,6 +266,8 @@ namespace VitaA32
 			bool PatchBranch(size_t instruction_offset, size_t target_offset, Condition condition = Condition::AL);
 			bool PatchBranchToAddress(size_t instruction_offset, const void* target,
 				Condition condition = Condition::AL);
+			bool ReadInstruction(size_t instruction_offset, u32* instruction) const;
+			bool PatchInstruction(size_t instruction_offset, u32 instruction);
 			bool PatchNop(size_t instruction_offset);
 			bool EmitPush(u16 register_list);
 		bool EmitVpushDRange(unsigned first_d, unsigned d_count);

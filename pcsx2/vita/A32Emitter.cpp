@@ -2013,6 +2013,30 @@ namespace VitaA32
 		return true;
 	}
 
+	bool CodeBuffer::ReadInstruction(size_t instruction_offset, u32* instruction) const
+	{
+		if (!m_base || !instruction || instruction_offset + sizeof(u32) > m_offset ||
+			(instruction_offset & 3) != 0)
+		{
+			return false;
+		}
+
+		std::memcpy(instruction, m_base + instruction_offset, sizeof(*instruction));
+		return true;
+	}
+
+	bool CodeBuffer::PatchInstruction(size_t instruction_offset, u32 instruction)
+	{
+		if (!m_base || instruction_offset + sizeof(u32) > m_offset ||
+			(instruction_offset & 3) != 0)
+		{
+			return false;
+		}
+
+		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		return true;
+	}
+
 	bool CodeBuffer::EmitPush(u16 register_list)
 	{
 		if (register_list == 0)

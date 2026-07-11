@@ -132,6 +132,12 @@ u32 g_qemuCompatiblePredicateEntryVariantBlocks = 0;
 u32 g_qemuCompatiblePredicateEntryVariantCanonicalInstructions = 0;
 u32 g_qemuCompatiblePredicateEntryVariantEdgeInstructionsElided = 0;
 u32 g_qemuCompatiblePredicateEntryVariantEventInstructions = 0;
+u32 g_qemuEmbeddedCompatibleContinuationBlocks = 0;
+u32 g_qemuEmbeddedCompatibleContinuationHotBranchesElided = 0;
+u32 g_qemuEmbeddedCompatibleContinuationInstructions = 0;
+u32 g_qemuEmbeddedCompatibleContinuationActivations = 0;
+u32 g_qemuEmbeddedCompatibleContinuationSourceMismatches = 0;
+u32 g_qemuEmbeddedCompatibleContinuationIncompatibleTargets = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixBlocks = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixHotInstructionsElided = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixColdInstructions = 0;
@@ -8002,6 +8008,7 @@ namespace VitaEE
 		m_compatible_predicate_resident_host = PredicateLinkMapping::NO_HOST;
 		m_compatible_predicate_canonical_skip_delay = static_cast<size_t>(-1);
 		m_compatible_predicate_canonical_enter_delay = static_cast<size_t>(-1);
+		m_compatible_link_entry_offset = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_dirty_pins = {};
@@ -8087,8 +8094,9 @@ namespace VitaEE
 			return false;
 		if (m_gpr_link_signature.IsValid())
 		{
+			m_compatible_link_entry_offset = m_code.Size();
 			if (compatible_link_entry_offset)
-				*compatible_link_entry_offset = m_code.Size();
+				*compatible_link_entry_offset = m_compatible_link_entry_offset;
 			if (compatible_link_entry_loads)
 				*compatible_link_entry_loads = gpr_pin_entry_loads;
 			if (linked_entry_needs_pc_sync)
@@ -9060,6 +9068,146 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::EmitEmbeddedCompatibleLikelyContinuation(
+		const void* direct_exit, const void* event_exit, DirectLinkSlot* direct_link,
+		bool defer_pc_writeback, u32 target_pc, bool* emitted)
+	{
+		if (!emitted)
+			return false;
+		*emitted = false;
+		const PredicateLinkMapping& predicate = m_gpr_link_signature.predicate;
+		if (!direct_exit || !event_exit || !direct_link || !defer_pc_writeback ||
+			!m_compatible_predicate_entry_variant || !m_compatible_scheduler_countdown ||
+			!predicate.IsValid() || m_current_block_start_pc != predicate.producer_block_pc ||
+			target_pc != predicate.consumer_pc ||
+			m_compatible_link_entry_offset == static_cast<size_t>(-1))
+		{
+			return true;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!m_embedded_compatible_continuation_enabled)
+			return true;
+#endif
+
+		const u32 branch = memRead32(target_pc);
+		const u32 delay = memRead32(target_pc + sizeof(u32));
+		if ((branch >> 26) != 0x15 || (delay >> 26) != 0x09 ||
+			BranchTarget(target_pc, branch) != predicate.producer_block_pc)
+		{
+			return true;
+		}
+		const int resident_host = FindGprPinHost(predicate.guest);
+		if (resident_host < 0 || static_cast<unsigned>(resident_host) == predicate.host)
+			return true;
+
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		u32 raw_cycles = R5900::GetInstruction(branch).cycles * cycle_factor;
+		const u32 not_taken_cycles = ScaleBlockCycles(raw_cycles);
+		raw_cycles += R5900::GetInstruction(delay).cycles * cycle_factor;
+		const u32 taken_cycles = ScaleBlockCycles(raw_cycles);
+		const u32 not_taken_pc = target_pc + 2 * sizeof(u32);
+		const auto add_countdown = [this](u32 cycles) {
+			return m_code.EmitAddImm32(GprLinkSignature::SCHEDULER_HOST,
+				GprLinkSignature::SCHEDULER_HOST, cycles, true) ||
+				(m_code.EmitMovImm32(HOST_TMP2, cycles) &&
+				 m_code.EmitAddReg(GprLinkSignature::SCHEDULER_HOST,
+					 GprLinkSignature::SCHEDULER_HOST, HOST_TMP2, true));
+		};
+
+		// PCSX2 BaseBlocks::Link() owns this reversible edge. On A32 the first
+		// instruction of the embedded compatible target is itself the patch site:
+		// a live link restores CMP resident_predicate,zero, while an unlinked or
+		// stale target replaces it with B fallback. Thus the hot path spends no
+		// branch or NOP between the two guest blocks.
+		const size_t continuation_start = m_code.Size();
+		if (!m_code.EmitCmpImm32(static_cast<unsigned>(resident_host), 0) ||
+			!m_code.ReadInstruction(continuation_start,
+				&direct_link->embedded_active_instruction))
+		{
+			return false;
+		}
+		const size_t skip_delay =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (skip_delay == static_cast<size_t>(-1) || !EmitADDIU(delay) ||
+			!add_countdown(taken_cycles))
+		{
+			return false;
+		}
+		const size_t taken_event =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		const size_t loop_back = m_code.EmitBranchPlaceholder();
+		if (taken_event == static_cast<size_t>(-1) ||
+			loop_back == static_cast<size_t>(-1) ||
+			!m_code.PatchBranch(loop_back, m_compatible_link_entry_offset))
+		{
+			return false;
+		}
+
+		const size_t not_taken_target = m_code.Size();
+		if (!m_code.PatchBranch(skip_delay, not_taken_target, VitaA32::Condition::EQ) ||
+			!add_countdown(not_taken_cycles))
+		{
+			return false;
+		}
+		const size_t not_taken_event =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		if (not_taken_event == static_cast<size_t>(-1) ||
+			!EmitSyncGprPinsToBacking() || !EmitStorePc(not_taken_pc) ||
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
+		{
+			return false;
+		}
+
+		const size_t taken_event_target = m_code.Size();
+		if (!m_code.EmitMovImm8(m_branch_flag_host, 1))
+			return false;
+		const size_t taken_to_event = m_code.EmitBranchPlaceholder();
+		const size_t not_taken_event_target = m_code.Size();
+		if (taken_to_event == static_cast<size_t>(-1) ||
+			!m_code.EmitMovImm8(m_branch_flag_host, 0) ||
+			!m_code.PatchBranch(taken_to_event, m_code.Size()) ||
+			!m_code.PatchBranch(taken_event, taken_event_target,
+				VitaA32::Condition::PL) ||
+			!m_code.PatchBranch(not_taken_event, not_taken_event_target,
+				VitaA32::Condition::PL) ||
+			!EmitSyncGprPinsToBacking() ||
+			!EmitDeferredPcWriteback(true, not_taken_pc,
+				predicate.producer_block_pc, true) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		const size_t fallback_offset = m_code.Size();
+		if (!EmitSyncGprPinsToBacking() || !EmitStorePc(target_pc) ||
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN) ||
+			!m_code.PatchBranch(continuation_start, fallback_offset))
+		{
+			return false;
+		}
+
+		direct_link->target_offset = continuation_start;
+		direct_link->fallback_offset = fallback_offset;
+		direct_link->embedded_source_opcodes[0] = branch;
+		direct_link->embedded_source_opcodes[1] = delay;
+		direct_link->branch_on_taken = false;
+		direct_link->branch_on_unsigned_less = false;
+		direct_link->embedded_compatible_continuation = true;
+		direct_link->requires_compatible_entry = true;
+		direct_link->compatible_scheduler_countdown = true;
+		direct_link->compatible_vtlb_pointer = m_compatible_vtlb_pointer;
+		direct_link->compatible_words = m_gpr_link_signature.WordCount();
+		direct_link->compatible_dirty_words = m_gpr_link_signature.DirtyWordCount();
+		*emitted = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuEmbeddedCompatibleContinuationBlocks++;
+		g_qemuEmbeddedCompatibleContinuationHotBranchesElided++;
+		g_qemuEmbeddedCompatibleContinuationInstructions += static_cast<u32>(
+			(fallback_offset - continuation_start) / sizeof(u32));
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
 		bool defer_pc_writeback, u32 pc, bool sync_private_fallback)
 	{
@@ -9519,11 +9667,18 @@ namespace VitaEE
 			// The fall-through edge leaves this allocator contract. When the taken
 			// self-edge carries dirty pins, keep backing state authoritative before
 			// even a patched fall-through link.
+			bool embedded_continuation = false;
 			if ((!carry_dirty_direct_link && carry_dirty_link &&
 					!EmitSyncGprPinsToBacking()) ||
-				!EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback, direct_pc,
-					carry_dirty_direct_link))
+				!EmitEmbeddedCompatibleLikelyContinuation(direct_exit, event_exit,
+					direct_link, defer_pc_writeback, direct_pc,
+					&embedded_continuation) ||
+				(!embedded_continuation &&
+				 !EmitDirectLinkTail(direct_exit, direct_link, defer_pc_writeback,
+					direct_pc, carry_dirty_direct_link)))
+			{
 				return false;
+			}
 
 			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
 			// tail whose newpc is the loop head (s_branchTo), i.e. the taken
