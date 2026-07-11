@@ -641,6 +641,17 @@ namespace VitaEE
 		Reset();
 		m_compatible_vtlb_host_reclaim_enabled = enabled;
 	}
+
+	void BlockExecutor::SetVtlbLinkedEntryPcPublicationEnabled(bool enabled)
+	{
+		if (m_vtlb_linked_entry_pc_publication_enabled == enabled)
+			return;
+
+		// Validation-only A/B control for PCSX2's FLUSH_FULLVTLB == 0 contract.
+		// Entry layout changes, so discard every cached block before switching.
+		Reset();
+		m_vtlb_linked_entry_pc_publication_enabled = enabled;
+	}
 #endif
 
 	bool BlockExecutor::EnsurePersistentDispatcher()
@@ -1192,6 +1203,10 @@ namespace VitaEE
 			}
 
 			BlockCompiler compiler(block.code);
+#if defined(VITASX2_QEMU_VALIDATION)
+			compiler.SetVtlbLinkedEntryPcPublicationEnabled(
+				m_vtlb_linked_entry_pc_publication_enabled);
+#endif
 			u32 attempt_scaled_cycles = 0;
 			size_t attempt_linked_entry_offset = 0;
 			size_t attempt_resident_self_link_entry_offset = static_cast<size_t>(-1);

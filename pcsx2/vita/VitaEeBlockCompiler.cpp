@@ -150,6 +150,7 @@ u32 g_qemuWaitLoopFastForwardBlocks = 0;
 u32 g_qemuDeferredPcWritebackBlocks = 0;
 u32 g_qemuDeferredIndirectPcWritebackBlocks = 0;
 u32 g_qemuLinkedPcSyncBlocks = 0;
+u32 g_qemuCop0StatusHelperPc = 0;
 u32 g_qemuScalarZeroLoadSkips = 0;
 u32 g_qemuPartialZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroLoadSkips = 0;
@@ -2168,6 +2169,14 @@ namespace VitaEE
 			Console.Error(message);
 			Cpu->CancelInstruction();
 		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		__noinline void VitaEeWriteCp0StatusValidation(u32 value)
+		{
+			g_qemuCop0StatusHelperPc = cpuRegs.pc;
+			WriteCP0Status(value);
+		}
+#endif
 
 		__noinline void VitaEeMemReadCop1Word(u32 addr, u32 guest_reg)
 		{
@@ -5387,20 +5396,24 @@ namespace VitaEE
 			(rd == 0x19 && (op & 1u) == 0 && (op & 0x3eu) == 0);
 	}
 
-	static bool BlockNeedsLinkedPcSync(u32 start_pc, u32 instruction_count)
+	static bool BlockNeedsLinkedPcSync(u32 start_pc, u32 instruction_count,
+		bool publish_for_vtlb)
 	{
-		// Native links may defer the predecessor's backing-PC write. Only blocks
-		// which can expose cpuRegs.pc before their own exit need to restore the
-		// block-start PC on linked entry. This mirrors PCSX2's iFlushCall(FLUSH_PC)
-		// boundary instead of charging every helper-free ALU/MMI/branch block.
+		// Native links may defer the predecessor's backing-PC write. PCSX2 defines
+		// FLUSH_FULLVTLB as zero: vTLB callbacks receive the address/value ABI but
+		// not a published cpuRegs.pc. Address-error and event exits publish their
+		// exact next PC themselves. Only helpers whose PCSX2 owner requests
+		// FLUSH_PC need the block-start value at linked entry.
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 op = memRead32(start_pc + i * sizeof(u32));
-			// vTLB callbacks may inspect backing EE state. COP2's
+			// The publish_for_vtlb arm is a validation-only A/B baseline for the
+			// superseded conservative contract. COP2's
 			// FLUSH_FOR_POSSIBLE_MICRO_EXEC, Goemon's block-start calls, CACHE's
 			// executeCacheOp(op, addr), and trace callbacks with an explicit PC do
 			// not request or consume the backing PC.
-			if (OpcodeMayUseVtlbFastPath(op) || Cop0OpcodeNeedsLinkedPcSync(op))
+			if ((publish_for_vtlb && OpcodeMayUseVtlbFastPath(op)) ||
+				Cop0OpcodeNeedsLinkedPcSync(op))
 			{
 				return true;
 			}
@@ -7819,7 +7832,13 @@ namespace VitaEE
 		const bool use_cop1_exponent_mask_register =
 			BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count);
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
-		const bool linked_entry_needs_pc_sync = BlockNeedsLinkedPcSync(start_pc, instruction_count);
+		const bool linked_entry_needs_pc_sync = BlockNeedsLinkedPcSync(start_pc, instruction_count,
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_vtlb_linked_entry_pc_publication_enabled
+#else
+			false
+#endif
+		);
 		const bool dirty_pins_candidate = BlockCanUseDirtyGprPins(start_pc, instruction_count);
 		const bool dirty_self_link_shape_candidate = persistent_dispatch_exits && direct_links &&
 			dirty_pins_candidate && BlockHasExactConditionalSelfLink(start_pc, instruction_count);
@@ -9921,7 +9940,13 @@ namespace VitaEE
 						return false;
 	}
 
-					return m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&WriteCP0Status));
+					return m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
+#if defined(VITASX2_QEMU_VALIDATION)
+						&VitaEeWriteCp0StatusValidation
+#else
+						&WriteCP0Status
+#endif
+					));
 	}
 				case 0x10: // Config
 					return load_rt_low(HOST_TMP0) &&

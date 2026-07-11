@@ -331,6 +331,13 @@ namespace VitaEE
 
 		explicit BlockCompiler(VitaA32::CodeBuffer& code);
 
+#if defined(VITASX2_QEMU_VALIDATION)
+		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled)
+		{
+			m_vtlb_linked_entry_pc_publication_enabled = enabled;
+		}
+#endif
+
 		static bool CanCompileOpcode(u32 op);
 		static bool IsSupportedBranchOpcode(u32 op);
 		static bool IsBranchLikely(u32 op);
@@ -1058,6 +1065,9 @@ namespace VitaEE
 		bool m_cop2_norm_consts_ready = false;
 		bool m_gpr_q_cache_enabled = false;
 		bool m_persistent_dispatch_exits = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+		bool m_vtlb_linked_entry_pc_publication_enabled = false;
+#endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;
 		bool m_forwarded_boolean_branch = false;
