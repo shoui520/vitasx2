@@ -270,6 +270,20 @@ enum VitaEePreincrementByteZeroFillResult : u32
 u32 VitaEeExecutePreincrementByteZeroFill(u32 start_pc, u32 fallthrough_pc,
 	u32 block_cycles, u32 packed_guests);
 
+enum VitaEeFourWordFillResult : u32
+{
+	VITA_EE_FOUR_WORD_FILL_COMPLETE = 0,
+	VITA_EE_FOUR_WORD_FILL_SELF = 1,
+	VITA_EE_FOUR_WORD_FILL_EVENT = 2,
+	VITA_EE_FOUR_WORD_FILL_REDISPATCH = 3,
+};
+
+// Executes the exact SW/ADDIU/SW/SW/SW/BNE four-word fill loop. Direct vTLB
+// pages batch only whole iterations to a page, completion, or event seam;
+// handler and SMC pages execute one architecturally ordered iteration.
+u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
+	u32 block_cycles, u32 packed_guests);
+
 // --------------------------------------------------------------------------------------
 //  Goemon game fix
 // --------------------------------------------------------------------------------------

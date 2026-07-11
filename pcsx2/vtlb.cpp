@@ -464,6 +464,161 @@ u32 VitaEeExecutePreincrementByteZeroFill(u32 start_pc, u32 fallthrough_pc,
 	return VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_SELF;
 }
 
+u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
+	u32 block_cycles, u32 packed_guests)
+{
+	// PCSX2 owners: x86/ix86-32/iR5900LoadStore.cpp::recSW(),
+	// iR5900AritImm.cpp::recADDIU(), iR5900Branch.cpp::recBNE(),
+	// recVTLB.cpp::DynGen_DirectWrite(), and iR5900.cpp::iBranchTest().
+	// The compiler has proved four invariant-value SWs at offsets 0/4/8/12,
+	// pointer ADDIU +16 after the first store, and a BNE pointer,end self edge.
+	const unsigned pointer_guest = packed_guests & 0x1f;
+	const unsigned end_guest = (packed_guests >> 8) & 0x1f;
+	const unsigned value_guest = (packed_guests >> 16) & 0x1f;
+	const u32 address = cpuRegs.GPR.r[pointer_guest].UL[0];
+	const u64 end = end_guest == 0 ? 0 : cpuRegs.GPR.r[end_guest].UD[0];
+	const u32 value = value_guest == 0 ? 0 : cpuRegs.GPR.r[value_guest].UL[0];
+	u32 iterations = 1;
+	bool pointer_published = false;
+	bool force_redispatch = false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	bool direct_bulk = false;
+	extern u32 g_qemuFourWordFillHelperCalls;
+	extern u32 g_qemuFourWordFillBulkChunks;
+	extern u32 g_qemuFourWordFillBulkWords;
+	extern u32 g_qemuFourWordFillScalarIterations;
+	extern u32 g_qemuFourWordFillPageReturns;
+	extern u32 g_qemuFourWordFillRedispatches;
+	extern bool g_qemuFourWordFillForceRedispatch;
+	g_qemuFourWordFillHelperCalls++;
+#endif
+
+	const VTLBVirtual mapping = vtlbdata.vmap[address >> VTLB_PAGE_BITS];
+	u32 physical_address = 0;
+	bool protected_page = false;
+	if (!mapping.isHandler(address))
+	{
+		physical_address = vtlb_V2P(address);
+		const vtlb_ProtectionMode protection = mmap_GetRamPageInfo(physical_address);
+		protected_page = protection == ProtMode_Write || protection == ProtMode_Manual;
+#if defined(VITASX2_QEMU_VALIDATION)
+		protected_page |= g_qemuFourWordFillForceRedispatch;
+#endif
+	}
+
+	const u32 bytes_to_page = VTLB_PAGE_SIZE - (address & VTLB_PAGE_MASK);
+	const bool batchable = !mapping.isHandler(address) && !protected_page &&
+		(address & 3u) == 0 && bytes_to_page >= 16 && block_cycles != 0;
+	if (batchable)
+	{
+		iterations = bytes_to_page / 16;
+
+		// ADDIU publishes sign_extend_32(address + 16*n). Only an aligned
+		// positive modular delta can therefore terminate a multi-iteration run.
+		const u32 end_low = static_cast<u32>(end);
+		const bool canonical_end = end == static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(end_low)));
+		if (canonical_end)
+		{
+			const u32 bytes_to_end = end_low - address;
+			if (bytes_to_end != 0 && (bytes_to_end & 15u) == 0)
+				iterations = std::min(iterations, bytes_to_end / 16);
+		}
+
+		const s32 cycle_delta = static_cast<s32>(
+			static_cast<u32>(cpuRegs.cycle) - static_cast<u32>(cpuRegs.nextEventCycle));
+		const u32 to_event = cycle_delta >= 0 ? 1u : static_cast<u32>(
+			(-static_cast<s64>(cycle_delta) + block_cycles - 1) / block_cycles);
+		iterations = std::min(iterations, to_event);
+
+		u32* const host = reinterpret_cast<u32*>(mapping.assumePtr(address));
+		const size_t word_count = static_cast<size_t>(iterations) * 4;
+		if (value == 0)
+			std::memset(host, 0, word_count * sizeof(u32));
+		else
+		{
+			for (size_t i = 0; i < word_count; i++)
+				host[i] = value;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		direct_bulk = true;
+		g_qemuFourWordFillBulkChunks++;
+		g_qemuFourWordFillBulkWords += static_cast<u32>(word_count);
+#endif
+	}
+	else
+	{
+		// A canonical iteration stores once before ADDIU and three times after
+		// its sign-extended result becomes visible. Each address is translated
+		// independently so a page-crossing iteration preserves handler order.
+		for (u32 word = 0; word < 4; word++)
+		{
+			const u32 store_address = address + word * sizeof(u32);
+			if (word == 1)
+			{
+				cpuRegs.GPR.r[pointer_guest].UD[0] = static_cast<u64>(
+					static_cast<s64>(static_cast<s32>(address + 16)));
+				pointer_published = true;
+			}
+
+			const VTLBVirtual store_mapping =
+				vtlbdata.vmap[store_address >> VTLB_PAGE_BITS];
+			u32 store_physical = 0;
+			bool store_protected = false;
+			if (!store_mapping.isHandler(store_address))
+			{
+				store_physical = vtlb_V2P(store_address);
+				const vtlb_ProtectionMode protection =
+					mmap_GetRamPageInfo(store_physical);
+				store_protected = protection == ProtMode_Write ||
+					protection == ProtMode_Manual;
+#if defined(VITASX2_QEMU_VALIDATION)
+				store_protected |= g_qemuFourWordFillForceRedispatch;
+#endif
+			}
+			vtlb_memWrite<mem32_t>(store_address, value);
+			if (store_protected)
+			{
+				force_redispatch = true;
+				if (Cpu && Cpu->Clear)
+					Cpu->Clear(store_physical & ~3u, 1);
+			}
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuFourWordFillScalarIterations++;
+#endif
+	}
+
+	const u32 updated_low = address + iterations * 16;
+	if (!pointer_published)
+	{
+		cpuRegs.GPR.r[pointer_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(updated_low)));
+	}
+	cpuRegs.cycle += static_cast<u64>(iterations) * block_cycles;
+	const bool repeat = cpuRegs.GPR.r[pointer_guest].UD[0] != end;
+	cpuRegs.pc = repeat ? start_pc : fallthrough_pc;
+	const bool event_due = static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
+		static_cast<u32>(cpuRegs.nextEventCycle)) >= 0;
+	if (event_due)
+		return VITA_EE_FOUR_WORD_FILL_EVENT;
+	if (force_redispatch)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuFourWordFillRedispatches++;
+#endif
+		return VITA_EE_FOUR_WORD_FILL_REDISPATCH;
+	}
+	if (!repeat)
+		return VITA_EE_FOUR_WORD_FILL_COMPLETE;
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (direct_bulk)
+		g_qemuFourWordFillPageReturns++;
+#endif
+	return VITA_EE_FOUR_WORD_FILL_SELF;
+}
+
 template <typename DataType>
 DataType vtlb_ramRead(u32 addr, bool* result)
 {
