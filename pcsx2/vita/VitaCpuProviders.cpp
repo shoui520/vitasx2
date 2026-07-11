@@ -770,8 +770,6 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			return fallback_result;
 		}
 
-		s_iop_a32_stats.executed_blocks++;
-		s_iop_a32_stats.direct_exits++;
 		if (result.cache_hit)
 		{
 			s_iop_a32_stats.cache_hits++;
@@ -789,6 +787,11 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		if (result.fast_dispatch_hit)
 			s_iop_a32_stats.fast_dispatch_hits++;
 		s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
+		if (result.wait_loop_fast_forward)
+			continue;
+
+		s_iop_a32_stats.executed_blocks++;
+		s_iop_a32_stats.direct_exits++;
 	}
 
 	return psxRegs.iopBreak + psxRegs.iopCycleEE;
@@ -1000,4 +1003,18 @@ void VitaResetA32IopProviderStats()
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
 {
 	return s_iop_a32_stats;
+}
+
+void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles)
+{
+	s_iop_a32_stats.wait_loop_fast_forwards++;
+	s_iop_a32_stats.wait_loop_iop_cycles += iop_cycles;
+	const u64 equivalent_blocks = block_cycles ? (iop_cycles / block_cycles) : 0;
+	if (equivalent_blocks > 1)
+		s_iop_a32_stats.wait_loop_block_entries_elided += equivalent_blocks - 1;
+}
+
+void VitaRecordA32IopWaitLoopDispatchElision()
+{
+	s_iop_a32_stats.wait_loop_dispatches_elided++;
 }

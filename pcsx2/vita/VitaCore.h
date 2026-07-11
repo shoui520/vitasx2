@@ -75,10 +75,16 @@ struct VitaA32IopProviderStats
 	u32 first_interpreter_opcode = 0;
 	u32 last_interpreter_pc = 0;
 	u32 last_interpreter_opcode = 0;
+	u64 wait_loop_fast_forwards = 0;
+	u64 wait_loop_iop_cycles = 0;
+	u64 wait_loop_dispatches_elided = 0;
+	u64 wait_loop_block_entries_elided = 0;
 };
 
 void VitaResetA32IopProviderStats();
 VitaA32IopProviderStats VitaGetA32IopProviderStats();
+void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles);
+void VitaRecordA32IopWaitLoopDispatchElision();
 
 // Mirrors the fast-boot ELF state that VMManager.cpp::Initialize() seeds for
 // R5900.cpp::eeloadHook() in Vita bring-up executables.

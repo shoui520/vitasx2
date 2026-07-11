@@ -42,6 +42,7 @@ namespace VitaIOP
 		bool cache_hit = false;
 		bool lookup_hit = false;
 		bool fast_dispatch_hit = false;
+		bool wait_loop_fast_forward = false;
 	};
 
 	struct DirectLinkSlot
@@ -137,6 +138,7 @@ namespace VitaIOP
 		bool EmitReadCop2DataReg(unsigned cop2_reg, unsigned host_reg);
 		bool EmitWriteCop2DataReg(unsigned cop2_reg, unsigned host_reg);
 		bool EmitCop2LoadStoreOp(u32 op);
+		bool EmitWaitLoopFastForwardBlock(u32 start_pc, u32 block_cycles);
 		bool EmitKnownDirectRamCop2LoadOp(u32 op, u32 address);
 		bool EmitKnownDirectRamCop2StoreOp(u32 op, u32 address);
 		bool FlushColdTails();
@@ -237,6 +239,7 @@ namespace VitaIOP
 		u32 Reset();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		void SetDirectLinkingEnabled(bool enabled);
+		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result);
 		bool ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result);
@@ -265,6 +268,8 @@ namespace VitaIOP
 			u32 native_instruction_count = 0;
 			u32 helper_instruction_count = 0;
 			DirectLinkSlots direct_links{};
+			bool wait_loop_shape = false;
+			bool wait_loop_enabled_at_compile = false;
 			bool valid = false;
 			bool queued_free = false;
 		};

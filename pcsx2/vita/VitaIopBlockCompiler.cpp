@@ -4,6 +4,7 @@
 #include "pcsx2/vita/VitaIopBlockCompiler.h"
 
 #include "common/Vita/VitaJitMemory.h"
+#include "pcsx2/Config.h"
 #include "pcsx2/IopDma.h"
 #include "pcsx2/IopGte.h"
 #include "pcsx2/IopHw.h"
@@ -138,6 +139,33 @@ namespace
 	constexpr u32 JumpTarget(u32 pc, u32 op)
 	{
 		return ((pc + 4) & 0xf0000000u) | ((op & 0x03ffffffu) << 2);
+	}
+
+	bool IsIopWaitLoopShape(u32 start_pc, u32 instruction_count)
+	{
+		if (instruction_count < 2)
+			return false;
+
+		const u32 branch_index = instruction_count - 2;
+		const u32 branch_pc = start_pc + branch_index * 4;
+		const u32 branch_op = iopMemRead32(branch_pc);
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			if (i != branch_index && iopMemRead32(start_pc + i * 4) != 0)
+				return false;
+		}
+
+		const u32 primary = branch_op >> 26;
+		if (primary == 0x02 || primary == 0x03)
+			return JumpTarget(branch_pc, branch_op) == start_pc;
+		if (primary >= 0x04 && primary <= 0x07)
+			return BranchTarget(branch_pc, branch_op) == start_pc;
+		if (primary != 0x01)
+			return false;
+
+		const u32 rt = RT(branch_op);
+		return (rt == 0x00 || rt == 0x01 || rt == 0x10 || rt == 0x11) &&
+			BranchTarget(branch_pc, branch_op) == start_pc;
 	}
 
 	constexpr size_t GprOffset(unsigned guest_reg)
@@ -721,6 +749,47 @@ namespace
 		return true;
 	}
 
+	extern "C" __attribute__((noinline)) u32 VitaIopA32FastForwardWaitLoop(
+		u32 loop_pc, u32 block_cycles)
+	{
+		// PCSX2 owner: x86/iR3000A.cpp::iPsxBranchTest(). The wait-loop form
+		// advances the IOP clock to the earlier of the EE timeslice budget and
+		// the next IOP event, charges exactly that dynamic delta, and tests the
+		// event only when budget remains. The SF-only minimum deliberately
+		// mirrors xCMP/xCMOVNS rather than a C++ unsigned comparison.
+		const u64 old_cycle = psxRegs.cycle;
+		const u32 budget = static_cast<u32>(psxRegs.iopCycleEE);
+		const u64 budget_target = old_cycle + ((static_cast<u64>(budget) + 7) >> 3);
+		const u64 next_event = psxRegs.iopNextEventCycle;
+		const u64 candidate_minus_event = budget_target - next_event;
+		const u64 target_cycle = (candidate_minus_event & (1ull << 63)) == 0 ?
+			next_event : budget_target;
+
+		psxRegs.pc = loop_pc;
+		psxRegs.cycle = target_cycle;
+		const u64 iop_cycles = target_cycle - old_cycle;
+		const u32 ee_cycles = static_cast<u32>(iop_cycles << 3);
+		if ((psxHu32(HW_ICFG) & (1u << 3)) == 0)
+		{
+			psxRegs.iopCycleEE = static_cast<s32>(
+				static_cast<u32>(psxRegs.iopCycleEE) - ee_cycles);
+		}
+		else
+		{
+			// Dynamic iPsxAddEECycles(0xffffffff) receives delta << 3 in EAX.
+			const u32 numerator = ee_cycles + psxRegs.iopCycleEECarry;
+			psxRegs.iopCycleEECarry = numerator % 147u;
+			psxRegs.iopCycleEE = static_cast<s32>(
+				static_cast<u32>(psxRegs.iopCycleEE) - (numerator / 147u));
+		}
+
+		VitaRecordA32IopWaitLoopFastForward(iop_cycles, block_cycles);
+		if (psxRegs.iopCycleEE > 0)
+			iopEventTest();
+
+		return static_cast<u32>(VitaIOP::BlockExitKind::Direct);
+	}
+
 	extern "C" __attribute__((noinline)) void VitaIopA32RaiseException(u32 pc, u32 code)
 	{
 		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSYSCALL()/psxBREAK()
@@ -906,6 +975,21 @@ namespace VitaIOP
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, op) &&
 			   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, CODE_OFFSET);
+	}
+
+	bool BlockCompiler::EmitWaitLoopFastForwardBlock(u32 start_pc, u32 block_cycles)
+	{
+		// Keep SP 8-byte aligned across the one AAPCS helper call. No ordinary
+		// block frame, architectural reloads, branch tail, or direct-link stub is
+		// needed because iPsxBranchTest() owns the complete observable seam.
+		m_native_instruction_count = block_cycles;
+		m_helper_instruction_count = 0;
+		return m_code.EmitPush(REG_R4 | REG_LR) &&
+			   m_code.EmitMovImm32(HOST_TMP0, start_pc) &&
+			   m_code.EmitMovImm32(HOST_TMP1, block_cycles) &&
+			   m_code.EmitCallAbsolute(
+				   reinterpret_cast<const void*>(&VitaIopA32FastForwardWaitLoop), HOST_CALL_SCRATCH) &&
+			   m_code.EmitPop(REG_R4 | REG_PC);
 	}
 
 	bool BlockCompiler::EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches)
@@ -4740,6 +4824,29 @@ namespace VitaIOP
 		if (direct_links)
 			*direct_links = {};
 
+		if (EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled() &&
+			instruction_count >= 2)
+		{
+			const u32 branch_index = instruction_count - 2;
+			const u32 branch_pc = start_pc + branch_index * 4;
+			const u32 branch_op = iopMemRead32(branch_pc);
+			bool only_nops = true;
+			for (u32 i = 0; i < instruction_count; i++)
+			{
+				if (i != branch_index && iopMemRead32(start_pc + i * 4) != 0)
+				{
+					only_nops = false;
+					break;
+				}
+			}
+
+			// The retail dominant unconditional form can use the compact callable
+			// too. Conditional shapes keep their ordinary callable for the not-taken
+			// path; BlockExecutor bypasses it only when the cached taken edge is live.
+			if ((branch_op >> 26) == 0x02 && JumpTarget(branch_pc, branch_op) == start_pc && only_nops)
+				return EmitWaitLoopFastForwardBlock(start_pc, instruction_count);
+		}
+
 		m_iop_ram_registers_available = false;
 		m_iop_ram_mask_register_available = false;
 		m_static_branch_outcome_known = false;
@@ -5412,6 +5519,83 @@ namespace VitaIOP
 			UnlinkIncomingLinks(UINT32_MAX);
 	}
 
+	bool BlockExecutor::TryFastForwardWaitLoopAtPc(u32 start_pc)
+	{
+		if (!EmuConfig.Speedhacks.WaitLoop || VitaIsIopPreInstructionTraceEnabled())
+			return false;
+
+		u32 block_cycles = 0;
+		bool link = false;
+		bool taken = false;
+		for (u32 i = 0; i + 1 < MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS; i++)
+		{
+			const u32 pc = start_pc + i * 4;
+			const u32 op = iopMemRead32(pc);
+			if (op == 0)
+				continue;
+
+			const u32 primary = op >> 26;
+			u32 target_pc = UINT32_MAX;
+			switch (primary)
+			{
+				case 0x01:
+				{
+					const s32 value = static_cast<s32>(psxRegs.GPR.r[RS(op)]);
+					switch (RT(op))
+					{
+						case 0x00: taken = value < 0; break; // BLTZ
+						case 0x01: taken = value >= 0; break; // BGEZ
+						case 0x10: taken = value < 0; link = true; break; // BLTZAL
+						case 0x11: taken = value >= 0; link = true; break; // BGEZAL
+						default: return false;
+					}
+					target_pc = BranchTarget(pc, op);
+					break;
+				}
+				case 0x02: taken = true; target_pc = JumpTarget(pc, op); break; // J
+				case 0x03: taken = true; link = true; target_pc = JumpTarget(pc, op); break; // JAL
+				case 0x04: // BEQ
+					taken = psxRegs.GPR.r[RS(op)] == psxRegs.GPR.r[RT(op)];
+					target_pc = BranchTarget(pc, op);
+					break;
+				case 0x05: // BNE
+					taken = psxRegs.GPR.r[RS(op)] != psxRegs.GPR.r[RT(op)];
+					target_pc = BranchTarget(pc, op);
+					break;
+				case 0x06: // BLEZ
+					taken = static_cast<s32>(psxRegs.GPR.r[RS(op)]) <= 0;
+					target_pc = BranchTarget(pc, op);
+					break;
+				case 0x07: // BGTZ
+					taken = static_cast<s32>(psxRegs.GPR.r[RS(op)]) > 0;
+					target_pc = BranchTarget(pc, op);
+					break;
+				default:
+					return false;
+			}
+
+			if (!taken || target_pc != start_pc || iopMemRead32(pc + 4) != 0)
+				return false;
+
+			block_cycles = i + 2;
+			if (link)
+				psxRegs.GPR.r[31] = pc + 8;
+			break;
+		}
+
+		if (block_cycles == 0)
+			return false;
+
+		// RunCachedBlock calls this only after the ordinary cache lookup and source
+		// validation. This is the Cortex-A9 adaptation of PCSX2's generated
+		// s_nBlockFF tail: it removes the generated-block call, self-link, and
+		// return for an otherwise empty wait loop while retaining the exact owner
+		// helper and the existing cache/SMC ownership.
+		VitaIopA32FastForwardWaitLoop(start_pc, block_cycles);
+		VitaRecordA32IopWaitLoopDispatchElision();
+		return true;
+	}
+
 	bool BlockExecutor::ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result)
 	{
 		if (!result || max_instruction_count == 0)
@@ -5458,6 +5642,24 @@ namespace VitaIOP
 				// first word of the next guest page.
 				add_instruction(pc);
 				add_instruction(delay_pc);
+				bool wait_loop_candidate = false;
+				if (EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled() &&
+					IsIopStaticConditionalBranchOpcode(op) && BranchTarget(pc, op) == start_pc &&
+					delay_op == 0)
+				{
+					wait_loop_candidate = true;
+					for (u32 prefix_pc = start_pc; prefix_pc < pc; prefix_pc += 4)
+					{
+						if (iopMemRead32(prefix_pc) != 0)
+						{
+							wait_loop_candidate = false;
+							break;
+						}
+					}
+				}
+				if (wait_loop_candidate)
+					return true;
+
 				if (IsIopStaticConditionalBranchOpcode(op) &&
 					!IsIopBranchOrJumpOpcode(delay_op) &&
 					!IsIopExceptionOpcode(delay_op) &&
@@ -5491,7 +5693,10 @@ namespace VitaIOP
 		for (u32 i = 0; matches && i < block.instruction_count; i++)
 			matches = (block.opcodes[i] == iopMemRead32(block.start_pc + i * 4));
 
-		if (matches)
+		const bool wait_loop_enabled =
+			EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled();
+		if (matches && (!block.wait_loop_shape ||
+			block.wait_loop_enabled_at_compile == wait_loop_enabled))
 			return true;
 
 		// PCSX2 owner: x86/iR3000A.cpp::psxRecClearMem() invalidates changed
@@ -5664,6 +5869,9 @@ namespace VitaIOP
 
 			block.opcodes[i] = op;
 		}
+		block.wait_loop_shape = IsIopWaitLoopShape(start_pc, instruction_count);
+		block.wait_loop_enabled_at_compile =
+			EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled();
 
 		size_t block_code_capacity = STRAIGHT_LINE_BLOCK_CODE_CAPACITY;
 		size_t block_code_slice_offset = 0;
@@ -5821,6 +6029,24 @@ namespace VitaIOP
 			return false;
 
 		psxRegs.pc = block.start_pc;
+		if (block.wait_loop_shape && block.wait_loop_enabled_at_compile &&
+			TryFastForwardWaitLoopAtPc(block.start_pc))
+		{
+			result->exit = BlockExitKind::Direct;
+			result->instruction_count = block.instruction_count;
+			result->native_instruction_count = block.native_instruction_count;
+			result->helper_instruction_count = block.helper_instruction_count;
+			result->code_size = block.code.Size();
+			result->block_records = static_cast<u32>(m_block_records.size());
+			result->link_records = static_cast<u32>(m_incoming_links.size());
+			result->cache_slots = static_cast<u32>(m_cache.size());
+			result->code_cache_resets = m_code_cache_resets;
+			result->code_cache_used = m_code_cache_used;
+			result->code_cache_capacity = m_code_cache_capacity;
+			result->wait_loop_fast_forward = true;
+			return true;
+		}
+
 		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
 
 		BlockExitKind exit = BlockExitKind::Direct;
