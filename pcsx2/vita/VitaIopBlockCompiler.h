@@ -397,6 +397,7 @@ namespace VitaIOP
 		CachedBlock* AllocateCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
 		bool ValidateCachedBlock(CachedBlock& block);
+		static bool TryFastForwardTrustedWaitLoopAtPc(u32 start_pc);
 		bool TryFastForwardPollCallWaitLoop(CachedBlock& block);
 		bool EnsureCodeCache();
 		void ReleaseCodeCache();

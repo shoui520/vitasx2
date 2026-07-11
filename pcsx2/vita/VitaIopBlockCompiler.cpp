@@ -5872,7 +5872,16 @@ namespace VitaIOP
 	{
 		if (!EmuConfig.Speedhacks.WaitLoop || VitaIsIopPreInstructionTraceEnabled())
 			return false;
+		return TryFastForwardTrustedWaitLoopAtPc(start_pc);
+	}
 
+	bool BlockExecutor::TryFastForwardTrustedWaitLoopAtPc(u32 start_pc)
+	{
+		// PCSX2 owner: VMManager::CheckForCPUConfigChanges() resets psxCpu when
+		// Speedhacks changes. VitaSetIopPreInstructionTraceCallback() likewise
+		// resets this executor when trace enablement changes. RunValidatedBlock()
+		// reaches this path only through a descriptor compiled under that reset
+		// contract; the public standalone helper above retains its live guard.
 		u32 block_cycles = 0;
 		bool link = false;
 		bool taken = false;
@@ -6038,19 +6047,9 @@ namespace VitaIOP
 		if (!block.valid)
 			return false;
 
-		if (block.wait_loop_shape)
-		{
-#if defined(VITASX2_QEMU_VALIDATION)
-			m_wait_loop_configuration_checks++;
-#endif
-			const bool wait_loop_enabled =
-				EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled();
-			if (block.wait_loop_enabled_at_compile != wait_loop_enabled)
-			{
-				InvalidateCachedBlock(block);
-				return false;
-			}
-		}
+		// Configuration-dependent wait descriptors are invalidated by the same
+		// PCSX2 CPU-cache reset ownership described by the trusted helper above.
+		// Do not poll immutable-within-cache-lifetime configuration on every hit.
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_validation_calls++;
@@ -6517,7 +6516,7 @@ namespace VitaIOP
 		psxRegs.pc = block.start_pc;
 		if (block.wait_loop_shape && block.wait_loop_enabled_at_compile &&
 			(block.poll_call_wait_loop ? TryFastForwardPollCallWaitLoop(block) :
-									TryFastForwardWaitLoopAtPc(block.start_pc)))
+									TryFastForwardTrustedWaitLoopAtPc(block.start_pc)))
 		{
 			if (publish_details)
 			{
