@@ -154,6 +154,7 @@ namespace VitaA32
 		bool EmitStrhImm8(unsigned rd, unsigned rn, u8 offset);
 		bool EmitStrhReg(unsigned rd, unsigned rn, unsigned rm);
 		bool EmitLdrsbImm8(unsigned rd, unsigned rn, u8 offset);
+		bool EmitLdrsbImm8PostIndex(unsigned rd, unsigned rn, u8 offset);
 		bool EmitLdrsbReg(unsigned rd, unsigned rn, unsigned rm);
 		bool EmitLdrshImm8(unsigned rd, unsigned rn, u8 offset);
 		bool EmitLdrshReg(unsigned rd, unsigned rn, unsigned rm);
@@ -374,6 +375,7 @@ namespace VitaA32
 	u32 EncodeStrhImm8(unsigned rd, unsigned rn, u8 offset);
 	u32 EncodeStrhReg(unsigned rd, unsigned rn, unsigned rm);
 	u32 EncodeLdrsbImm8(unsigned rd, unsigned rn, u8 offset);
+	u32 EncodeLdrsbImm8PostIndex(unsigned rd, unsigned rn, u8 offset);
 	u32 EncodeLdrsbReg(unsigned rd, unsigned rn, unsigned rm);
 	u32 EncodeLdrshImm8(unsigned rd, unsigned rn, u8 offset);
 	u32 EncodeLdrshReg(unsigned rd, unsigned rn, unsigned rm);

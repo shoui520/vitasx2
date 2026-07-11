@@ -1227,6 +1227,8 @@ namespace VitaEE
 		bool m_compatible_predicate_consumer = false;
 		bool m_compatible_predicate_entry_variant = false;
 		bool m_compatible_likely_taken_suffix = false;
+		bool m_compatible_signed_byte_likely_self = false;
+		bool m_branch_likely_predicate_flags_valid = false;
 		u8 m_compatible_predicate_resident_host = PredicateLinkMapping::NO_HOST;
 		size_t m_compatible_predicate_canonical_skip_delay = static_cast<size_t>(-1);
 		size_t m_compatible_predicate_canonical_enter_delay = static_cast<size_t>(-1);
