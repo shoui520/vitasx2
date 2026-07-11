@@ -437,6 +437,10 @@ u32 g_qemuPreincrementByteZeroFillScalarIterations = 0;
 u32 g_qemuPreincrementByteZeroFillPageReturns = 0;
 u32 g_qemuPreincrementByteZeroFillRedispatches = 0;
 bool g_qemuPreincrementByteZeroFillForceRedispatch = false;
+u32 g_qemuGsCsrVsintPollBlocks = 0;
+u32 g_qemuGsCsrVsintPollHelperCalls = 0;
+u32 g_qemuGsCsrVsintPollFastForwards = 0;
+u32 g_qemuGsCsrVsintPollGuardFallbacks = 0;
 u32 g_qemuSignedCountdownLoopBlocks = 0;
 u32 g_qemuSignedCountdownLoopHelperCalls = 0;
 u32 g_qemuSignedCountdownLoopBatchedIterations = 0;
@@ -601,6 +605,58 @@ namespace VitaEE
 				return SIGNED_COUNTDOWN_LOOP_EVENT;
 			}
 			return SIGNED_COUNTDOWN_LOOP_COMPLETE;
+		}
+
+		enum GsCsrVsintPollResult : u32
+		{
+			GS_CSR_VSINT_POLL_COMPLETE = 0,
+			GS_CSR_VSINT_POLL_SELF = 1,
+			GS_CSR_VSINT_POLL_EVENT = 2,
+		};
+
+		__noinline u32 VitaEeExecuteGsCsrVsintPoll(u32 start_pc, u32 fallthrough_pc,
+			u32 block_cycles, u32 packed_guests)
+		{
+			// PCSX2 owners: GS.cpp::gsRead64() exposes GS_CSR, while
+			// Counters.cpp::GSVSync() sets VSINT at a scheduler event and x86
+			// iR5900.cpp::iBranchTest() advances a proven wait loop to that event.
+			constexpr u32 GS_CSR_ADDRESS = 0x12001000;
+			constexpr u64 GS_CSR_VSINT_MASK = 0x8;
+			const unsigned base_guest = packed_guests & 0x1f;
+			const unsigned result_guest = (packed_guests >> 8) & 0x1f;
+			const u32 address = cpuRegs.GPR.r[base_guest].UL[0] + 0x1000;
+			const u64 csr = memRead64(address);
+			const u64 masked = csr & GS_CSR_VSINT_MASK;
+			cpuRegs.GPR.r[result_guest].UD[0] = masked;
+			cpuRegs.cycle += block_cycles;
+			const bool repeat = masked == 0;
+			cpuRegs.pc = repeat ? start_pc : fallthrough_pc;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuGsCsrVsintPollHelperCalls++;
+#endif
+
+			if (repeat && address == GS_CSR_ADDRESS)
+			{
+				// This is PCSX2 iBranchTest()'s WaitLoop form exactly: the loop has
+				// executed once, then cycle=max(cycle,nextEventCycle) and the event
+				// dispatcher runs. The next block invocation re-reads GS_CSR.
+				cpuRegs.cycle = std::max(cpuRegs.cycle, cpuRegs.nextEventCycle);
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuGsCsrVsintPollFastForwards++;
+#endif
+				return GS_CSR_VSINT_POLL_EVENT;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (address != GS_CSR_ADDRESS)
+				g_qemuGsCsrVsintPollGuardFallbacks++;
+#endif
+
+			if (static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
+					static_cast<u32>(cpuRegs.nextEventCycle)) >= 0)
+			{
+				return GS_CSR_VSINT_POLL_EVENT;
+			}
+			return repeat ? GS_CSR_VSINT_POLL_SELF : GS_CSR_VSINT_POLL_COMPLETE;
 		}
 		constexpr unsigned HOST_CALLER_SAVED_BRANCH_FLAG = HOST_TMP4;
 		constexpr unsigned HOST_TMP5 = 6;
@@ -2817,6 +2873,35 @@ namespace VitaEE
 			*pointer_guest = pointer;
 		if (end_guest)
 			*end_guest = end;
+		return true;
+	}
+
+	bool BlockCompiler::IsExactGsCsrVsintPollLoop(u32 start_pc,
+		u32 instruction_count, unsigned* base_guest, unsigned* result_guest)
+	{
+		if (instruction_count != 4 || start_pc > UINT32_MAX - 4 * sizeof(u32))
+			return false;
+
+		const u32 load = memRead32(start_pc);
+		const u32 mask = memRead32(start_pc + sizeof(u32));
+		const u32 branch = memRead32(start_pc + 2 * sizeof(u32));
+		const u32 delay = memRead32(start_pc + 3 * sizeof(u32));
+		const unsigned base = RS(load);
+		const unsigned result = RT(load);
+		if ((load >> 26) != 0x37 || base == 0 || result == 0 || base == result ||
+			IMM_S(load) != 0x1000 ||
+			(mask >> 26) != 0x0c || RS(mask) != result || RT(mask) != result ||
+			IMM_U(mask) != 0x8 ||
+			(branch >> 26) != 0x04 || RS(branch) != result || RT(branch) != 0 ||
+			BranchTarget(start_pc + 2 * sizeof(u32), branch) != start_pc || delay != 0)
+		{
+			return false;
+		}
+
+		if (base_guest)
+			*base_guest = base;
+		if (result_guest)
+			*result_guest = result;
 		return true;
 	}
 
@@ -9247,6 +9332,87 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::CompileGsCsrVsintPollLoop(u32 start_pc,
+		u32 instruction_count, const void* direct_exit, const void* event_exit,
+		u32* scaled_cycles, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
+	{
+		unsigned base_guest = 0;
+		unsigned result_guest = 0;
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactGsCsrVsintPollLoop(start_pc, instruction_count,
+				&base_guest, &result_guest))
+		{
+			return false;
+		}
+
+		u32 raw_cycles = 0;
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) * cycle_factor;
+		}
+		const u32 block_cycles = ScaleBlockCycles(raw_cycles);
+		if (block_cycles == 0)
+			return false;
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
+		const u32 packed_guests = base_guest | (result_guest << 8);
+		if (!BeginBlock(false, false, false, linked_entry_offset) ||
+			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
+				&VitaEeExecuteGsCsrVsintPoll)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, GS_CSR_VSINT_POLL_EVENT))
+		{
+			return false;
+		}
+
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, GS_CSR_VSINT_POLL_SELF))
+		{
+			return false;
+		}
+		const size_t self_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (self_branch == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+
+		const size_t self_target = m_code.Size();
+		if (!m_code.PatchBranch(self_branch, self_target, VitaA32::Condition::EQ) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
+		{
+			return false;
+		}
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = fallthrough_pc;
+		direct_links->slots[0].valid = true;
+		direct_links->slots[1].target_pc = start_pc;
+		direct_links->slots[1].valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGsCsrVsintPollBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompilePreincrementByteZeroFillLoop(u32 start_pc,
 		u32 instruction_count, const void* direct_exit, const void* event_exit,
 		u32* scaled_cycles, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -9783,6 +9949,9 @@ namespace VitaEE
 			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack;
 		const bool memory_range_loop_batch_enabled = range_loop_dispatch_enabled &&
 			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack;
+		const bool gs_csr_poll_fast_forward_enabled = range_loop_dispatch_enabled &&
+			EmuConfig.Speedhacks.WaitLoop && !device_trace_enabled &&
+			!EmuConfig.Gamefixes.GoemonTlbHack;
 		const bool signed_countdown_loop_batch_enabled =
 			range_loop_dispatch_enabled && EmuConfig.Speedhacks.WaitLoop && !device_trace_enabled &&
 			!EmuConfig.Gamefixes.GoemonTlbHack;
@@ -9791,6 +9960,12 @@ namespace VitaEE
 		{
 			return CompileCacheDxltgTagSweep(start_pc, instruction_count, direct_exit, event_exit,
 				scaled_cycles, direct_links, linked_entry_offset);
+		}
+		if (gs_csr_poll_fast_forward_enabled && direct_links &&
+			IsExactGsCsrVsintPollLoop(start_pc, instruction_count))
+		{
+			return CompileGsCsrVsintPollLoop(start_pc, instruction_count,
+				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
 		if (memory_range_loop_batch_enabled && direct_links &&
 			IsExactPreincrementByteZeroFillLoop(start_pc, instruction_count))
@@ -10601,7 +10776,8 @@ namespace VitaEE
 		// targets are excluded so the virtual target compare stays exact. Known
 		// register targets still direct-link, but stay out of this J/JAL/branch
 		// fast-forward path unless PCSX2's SetBranchReg timing is proven equal.
-		const bool wait_loop_body = EmuConfig.Speedhacks.WaitLoop &&
+		const bool wait_loop_body = range_loop_dispatch_enabled &&
+			!device_trace_enabled && EmuConfig.Speedhacks.WaitLoop &&
 			!EmuConfig.Gamefixes.GoemonTlbHack &&
 			has_branch && !has_register_branch_target &&
 			!has_static_register_branch_target &&
