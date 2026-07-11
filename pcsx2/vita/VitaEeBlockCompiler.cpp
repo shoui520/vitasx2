@@ -124,6 +124,10 @@ u32 g_qemuCompatibleVtlbPointerTranslationInstructions = 0;
 u32 g_qemuCompatibleVtlbPointerHotInstructionsElided = 0;
 u32 g_qemuCompatibleVtlbPointerPostIncrementLoads = 0;
 u32 g_qemuCompatibleVtlbPointerColdInvalidationInstructions = 0;
+u32 g_qemuCompatiblePredicateBlocks = 0;
+u32 g_qemuCompatiblePredicateCanonicalInstructions = 0;
+u32 g_qemuCompatiblePredicateLinkedInstructionsElided = 0;
+u32 g_qemuCompatiblePredicateEdgeInstructions = 0;
 u32 g_qemuResidentCycleLowBlocks = 0;
 u32 g_qemuResidentCycleLowHotInstructionsElided = 0;
 u32 g_qemuResidentCycleLowSyncInstructions = 0;
@@ -3496,7 +3500,16 @@ namespace VitaEE
 				 (vtlb_pointer.access_pc != block_pcs[0] &&
 				  vtlb_pointer.access_pc != block_pcs[1]) ||
 				 (vtlb_pointer.advance_pc != block_pcs[0] &&
-				  vtlb_pointer.advance_pc != block_pcs[1]))))
+				  vtlb_pointer.advance_pc != block_pcs[1]))) ||
+			(predicate.IsValid() &&
+				(predicate.host != PREDICATE_HOST || predicate.guest == 0 ||
+				 predicate.guest >= 32 ||
+				 (predicate.producer_block_pc != block_pcs[0] &&
+				  predicate.producer_block_pc != block_pcs[1]) ||
+				 predicate.producer_pc < predicate.producer_block_pc ||
+				 predicate.consumer_pc != predicate.producer_pc + sizeof(u32) ||
+				 (predicate.consumer_pc != block_pcs[0] &&
+				  predicate.consumer_pc != block_pcs[1]))))
 		{
 			return false;
 		}
@@ -3911,6 +3924,67 @@ namespace VitaEE
 			}
 			if (!address_is_mapped)
 				return false;
+		}
+
+		// PCSX2 owners: x86/iCore.cpp's MODE_READ mappings and
+		// x86/ix86-32/iR5900Branch.cpp::recBNE() let a linked consumer reuse the
+		// normalized result of recSLTU(). Keep that edge value in the private r5
+		// branch-predicate host. Canonical entry still forms its predicate from the
+		// architectural GPR, while the compatible A->B edge enters after that work.
+		const auto try_add_predicate = [&](u32 producer_block_pc, u32 producer_count,
+			u32 consumer_block_pc, u32 consumer_count) {
+			if (producer_count < 2 || consumer_count != 2 ||
+				consumer_block_pc != producer_block_pc + producer_count * sizeof(u32))
+			{
+				return false;
+			}
+
+			const u32 producer_pc = consumer_block_pc - sizeof(u32);
+			const u32 producer_branch = memRead32(producer_pc - sizeof(u32));
+			const u32 producer = memRead32(producer_pc);
+			const u32 consumer = memRead32(consumer_block_pc);
+			const u32 consumer_delay = memRead32(consumer_block_pc + sizeof(u32));
+			if (!BlockCompiler::IsSupportedBranchOpcode(producer_branch) ||
+				BlockCompiler::IsBranchLikely(producer_branch) ||
+				(producer >> 26) != 0 || (producer & 0x3fu) != 0x2b ||
+				(consumer >> 26) != 0x15 || RD(producer) == 0 ||
+				!((RS(consumer) == RD(producer) && RT(consumer) == 0) ||
+				  (RT(consumer) == RD(producer) && RS(consumer) == 0)) ||
+				BranchTarget(consumer_block_pc, consumer) != producer_block_pc)
+			{
+				return false;
+			}
+
+			DirtyGprPinOpInfo delay_info;
+			if (!ClassifyOpcodeForDirtyGprPins(consumer_delay, &delay_info))
+				return false;
+			for (unsigned i = 0; i < delay_info.write_count; i++)
+			{
+				if (delay_info.writes[i] == RD(producer))
+					return false;
+			}
+
+			bool mapped = false;
+			for (u8 i = 0; i < signature->count; i++)
+			{
+				mapped |= signature->mappings[i].guest == RD(producer) &&
+					signature->mappings[i].dirty == GprLinkDirtyState::WriteBack;
+			}
+			if (!mapped)
+				return false;
+
+			signature->predicate.host = GprLinkSignature::PREDICATE_HOST;
+			signature->predicate.guest = static_cast<u8>(RD(producer));
+			signature->predicate.producer_block_pc = producer_block_pc;
+			signature->predicate.producer_pc = producer_pc;
+			signature->predicate.consumer_pc = consumer_block_pc;
+			return true;
+		};
+		if (!try_add_predicate(first_pc, first_instruction_count,
+				second_pc, second_instruction_count))
+		{
+			try_add_predicate(second_pc, second_instruction_count,
+				first_pc, first_instruction_count);
 		}
 		return signature->IsValid();
 	}
@@ -7846,6 +7920,8 @@ namespace VitaEE
 			BlockCanUseCallerSavedBranchFlag(start_pc, instruction_count);
 		m_branch_flag_host = caller_saved_branch_flag ?
 			HOST_CALLER_SAVED_BRANCH_FLAG : HOST_BRANCH_FLAG;
+		if (m_gpr_link_signature.HasPredicate())
+			m_branch_flag_host = m_gpr_link_signature.predicate.host;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (caller_saved_branch_flag)
 			g_qemuCallerSavedBranchFlagBlocks++;
@@ -7892,6 +7968,8 @@ namespace VitaEE
 		m_compatible_vtlb_pointer = m_gpr_link_signature.HasVtlbPointer();
 		m_compatible_vtlb_pointer_access = m_compatible_vtlb_pointer &&
 			start_pc == m_gpr_link_signature.vtlb_pointer.access_pc;
+		m_compatible_predicate_consumer = m_gpr_link_signature.HasPredicate() &&
+			start_pc == m_gpr_link_signature.predicate.consumer_pc;
 		m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_dirty_pins = {};
@@ -7915,6 +7993,8 @@ namespace VitaEE
 			g_qemuForwardedBooleanBranchBlocks++;
 		if (m_deferred_resident_unsigned_branch_suffix)
 			g_qemuResidentUnsignedBranchSuffixBlocks++;
+		if (m_compatible_predicate_consumer)
+			g_qemuCompatiblePredicateBlocks++;
 #endif
 		// r7/r8 are normally a chain-wide vTLB ABI under the persistent dispatcher.
 		// A compatible translated-pointer signature may reclaim them because its
@@ -7970,6 +8050,8 @@ namespace VitaEE
 		if (!EmitStageCompatibleSchedulerCountdown(HOST_TMP0))
 			return false;
 		if (!EmitPoisonCompatibleVtlbPointer())
+			return false;
+		if (!EmitStageCompatiblePredicate())
 			return false;
 		if (m_gpr_link_signature.IsValid())
 		{
@@ -8831,10 +8913,59 @@ namespace VitaEE
 		       m_code.PatchBranchToAddress(branch, target);
 	}
 
+	bool BlockCompiler::EmitStageCompatiblePredicate()
+	{
+		if (!m_compatible_predicate_consumer)
+			return true;
+
+		const PredicateLinkMapping& predicate = m_gpr_link_signature.predicate;
+		const size_t start = m_code.Size();
+		if (!EmitCompareGpr64ForBranch(predicate.guest, 0) ||
+			!m_code.EmitMovImm8(predicate.host, 0) ||
+			!m_code.EmitMovImm8(predicate.host, 1, VitaA32::Condition::NE))
+		{
+			return false;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCompatiblePredicateCanonicalInstructions += static_cast<u32>(
+			(m_code.Size() - start) / sizeof(u32));
+#endif
+		return true;
+	}
+
+	bool BlockCompiler::EmitPrepareCompatiblePredicateEdge(u32 target_pc)
+	{
+		const PredicateLinkMapping& predicate = m_gpr_link_signature.predicate;
+		if (!predicate.IsValid() || target_pc != predicate.consumer_pc ||
+			m_current_block_start_pc != predicate.producer_block_pc)
+		{
+			return true;
+		}
+
+		const int source_host = FindGprPinHost(predicate.guest);
+		if (source_host < 0)
+			return false;
+		if (static_cast<unsigned>(source_host) != predicate.host &&
+			!m_code.EmitMovRegShiftImm(predicate.host, static_cast<unsigned>(source_host),
+				VitaA32::ShiftType::LSL, 0))
+		{
+			return false;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (static_cast<unsigned>(source_host) != predicate.host)
+			g_qemuCompatiblePredicateEdgeInstructions++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
 		bool defer_pc_writeback, u32 pc, bool sync_private_fallback)
 	{
 		if (!direct_exit)
+			return false;
+		if (sync_private_fallback && !EmitPrepareCompatiblePredicateEdge(pc))
 			return false;
 
 		const size_t target_offset = m_code.Size();
@@ -24772,6 +24903,19 @@ namespace VitaEE
 	{
 		const unsigned rs = RS(op);
 		const unsigned rt = RT(op);
+		if (m_compatible_predicate_consumer && !branch_on_equal &&
+			m_current_block_start_pc + m_current_instruction_index * sizeof(u32) ==
+				m_gpr_link_signature.predicate.consumer_pc &&
+			((rs == m_gpr_link_signature.predicate.guest && rt == 0) ||
+			 (rt == m_gpr_link_signature.predicate.guest && rs == 0)))
+		{
+			// Canonical entry normalized r5 before the compatible-entry marker;
+			// a signed link instead arrives with the producer's architectural 0/1.
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCompatiblePredicateLinkedInstructionsElided += 3;
+#endif
+			return true;
+		}
 		if (m_forwarded_boolean_branch && !branch_on_equal &&
 			((rs == m_forwarded_boolean_guest && rt == 0) ||
 				(rt == m_forwarded_boolean_guest && rs == 0)))

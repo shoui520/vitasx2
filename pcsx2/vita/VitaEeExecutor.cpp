@@ -642,6 +642,16 @@ namespace VitaEE
 		m_compatible_vtlb_host_reclaim_enabled = enabled;
 	}
 
+	void BlockExecutor::SetCompatiblePredicateCarryEnabled(bool enabled)
+	{
+		if (m_compatible_predicate_carry_enabled == enabled)
+			return;
+
+		// The predicate host and its linked-entry skip are part of the chain ABI.
+		Reset();
+		m_compatible_predicate_carry_enabled = enabled;
+	}
+
 	void BlockExecutor::SetVtlbLinkedEntryPcPublicationEnabled(bool enabled)
 	{
 		if (m_vtlb_linked_entry_pc_publication_enabled == enabled)
@@ -931,6 +941,8 @@ namespace VitaEE
 				signature->scheduler = SchedulerLinkMapping{};
 			if (!m_compatible_vtlb_pointer_carry_enabled)
 				signature->vtlb_pointer = VtlbPointerLinkMapping{};
+			if (!m_compatible_predicate_carry_enabled)
+				signature->predicate = PredicateLinkMapping{};
 #endif
 			return true;
 		}

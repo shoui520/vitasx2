@@ -154,6 +154,40 @@ namespace VitaEE
 		}
 	};
 
+	enum class PredicateLinkRepresentation : u8
+	{
+		ArchitecturalZeroOrOne,
+	};
+
+	enum class PredicateLinkProvenance : u8
+	{
+		UnsignedLessThanToNotEqualZero,
+	};
+
+	struct PredicateLinkMapping
+	{
+		static constexpr u8 NO_HOST = 0xff;
+
+		u8 host = NO_HOST;
+		u8 guest = 0;
+		u32 producer_block_pc = 0;
+		u32 producer_pc = 0;
+		u32 consumer_pc = 0;
+		PredicateLinkRepresentation representation =
+			PredicateLinkRepresentation::ArchitecturalZeroOrOne;
+		PredicateLinkProvenance provenance =
+			PredicateLinkProvenance::UnsignedLessThanToNotEqualZero;
+
+		bool IsValid() const { return host != NO_HOST; }
+		bool operator==(const PredicateLinkMapping& rhs) const
+		{
+			return host == rhs.host && guest == rhs.guest &&
+				producer_block_pc == rhs.producer_block_pc &&
+				producer_pc == rhs.producer_pc && consumer_pc == rhs.consumer_pc &&
+				representation == rhs.representation && provenance == rhs.provenance;
+		}
+	};
+
 	struct GprLinkSignature
 	{
 		static constexpr u8 MAX_PINS = 5;
@@ -163,10 +197,12 @@ namespace VitaEE
 		static constexpr u8 LINK_REGISTER_HOST = 14;
 		static constexpr u8 SCHEDULER_HOST = 6;
 		static constexpr u8 VTLB_POINTER_HOST = 12;
+		static constexpr u8 PREDICATE_HOST = 5;
 
 		GprLinkMapping mappings[MAX_PINS]{};
 		SchedulerLinkMapping scheduler{};
 		VtlbPointerLinkMapping vtlb_pointer{};
+		PredicateLinkMapping predicate{};
 		u32 block_pcs[2]{};
 		u8 count = 0;
 
@@ -175,13 +211,14 @@ namespace VitaEE
 		bool HasWriteBack() const;
 		bool HasSchedulerCountdown() const { return scheduler.IsValid(); }
 		bool HasVtlbPointer() const { return vtlb_pointer.IsValid(); }
+		bool HasPredicate() const { return predicate.IsValid(); }
 		bool ReclaimsVtlbHosts() const;
 		u8 WordCount() const;
 		u8 DirtyWordCount() const;
 		bool operator==(const GprLinkSignature& rhs) const
 		{
 			if (count != rhs.count || !(scheduler == rhs.scheduler) ||
-				!(vtlb_pointer == rhs.vtlb_pointer) ||
+				!(vtlb_pointer == rhs.vtlb_pointer) || !(predicate == rhs.predicate) ||
 				block_pcs[0] != rhs.block_pcs[0] ||
 				block_pcs[1] != rhs.block_pcs[1])
 				return false;
@@ -378,6 +415,8 @@ namespace VitaEE
 
 	private:
 		bool EmitLinkFrameReturn();
+		bool EmitStageCompatiblePredicate();
+		bool EmitPrepareCompatiblePredicateEdge(u32 target_pc);
 		bool EmitReloadGprPinsAfterClobber(u16 host_mask);
 		bool EmitExitToTarget(const void* target, u8 callable_token);
 		bool EmitAndImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
@@ -1082,6 +1121,7 @@ namespace VitaEE
 		bool m_compatible_scheduler_countdown = false;
 		bool m_compatible_vtlb_pointer = false;
 		bool m_compatible_vtlb_pointer_access = false;
+		bool m_compatible_predicate_consumer = false;
 		bool m_reclaimed_vtlb_link_hosts = false;
 		size_t m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);

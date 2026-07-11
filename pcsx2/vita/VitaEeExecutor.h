@@ -103,6 +103,7 @@ namespace VitaEE
 		void SetCompatibleSchedulerCarryEnabled(bool enabled);
 		void SetCompatibleVtlbPointerCarryEnabled(bool enabled);
 		void SetCompatibleVtlbHostReclaimEnabled(bool enabled);
+		void SetCompatiblePredicateCarryEnabled(bool enabled);
 		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled);
 #endif
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
@@ -262,6 +263,7 @@ namespace VitaEE
 		bool m_compatible_scheduler_carry_enabled = true;
 		bool m_compatible_vtlb_pointer_carry_enabled = true;
 		bool m_compatible_vtlb_host_reclaim_enabled = true;
+		bool m_compatible_predicate_carry_enabled = true;
 		bool m_vtlb_linked_entry_pc_publication_enabled = false;
 #endif
 	};
