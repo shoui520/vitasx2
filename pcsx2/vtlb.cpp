@@ -32,6 +32,7 @@
 #include "GS/GSVector.h"
 
 #include <bit>
+#include <cstring>
 #include <map>
 #include <unordered_set>
 #include <unordered_map>
@@ -329,6 +330,139 @@ template void vtlb_memWrite<mem8_t>(u32 mem, mem8_t data);
 template void vtlb_memWrite<mem16_t>(u32 mem, mem16_t data);
 template void vtlb_memWrite<mem32_t>(u32 mem, mem32_t data);
 template void vtlb_memWrite<mem64_t>(u32 mem, mem64_t data);
+
+u32 VitaEeExecutePreincrementByteZeroFill(u32 start_pc, u32 fallthrough_pc,
+	u32 block_cycles, u32 packed_guests)
+{
+	// PCSX2 owners: R5900OpcodeImpl.cpp::ADDIU()/SB(), vtlb_memWrite<u8>(),
+	// x86 recVTLB.cpp::DynGen_DirectWrite(), and iR5900.cpp::iBranchTest().
+	// The compiler has matched ADDIU pointer,1 / SB zero,-1(pointer) /
+	// BNE pointer,end,self / NOP and packed the two distinct GPR indices.
+	const unsigned pointer_guest = packed_guests & 0x1f;
+	const unsigned end_guest = (packed_guests >> 8) & 0x1f;
+	const u32 address = cpuRegs.GPR.r[pointer_guest].UL[0];
+	const u64 end = cpuRegs.GPR.r[end_guest].UD[0];
+	u32 iterations = 1;
+	bool pointer_published = false;
+	bool force_redispatch = false;
+	u32 physical_address = 0;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	bool direct_bulk = false;
+	extern u32 g_qemuPreincrementByteZeroFillHelperCalls;
+	extern u32 g_qemuPreincrementByteZeroFillBulkChunks;
+	extern u32 g_qemuPreincrementByteZeroFillBulkBytes;
+	extern u32 g_qemuPreincrementByteZeroFillScalarIterations;
+	extern u32 g_qemuPreincrementByteZeroFillPageReturns;
+	extern u32 g_qemuPreincrementByteZeroFillRedispatches;
+	extern bool g_qemuPreincrementByteZeroFillForceRedispatch;
+	g_qemuPreincrementByteZeroFillHelperCalls++;
+#endif
+
+	const VTLBVirtual mapping = vtlbdata.vmap[address >> VTLB_PAGE_BITS];
+	if (!mapping.isHandler(address))
+	{
+		physical_address = vtlb_V2P(address);
+		const vtlb_ProtectionMode protection = mmap_GetRamPageInfo(physical_address);
+		bool protected_page =
+			protection == ProtMode_Write || protection == ProtMode_Manual;
+#if defined(VITASX2_QEMU_VALIDATION)
+		protected_page |= g_qemuPreincrementByteZeroFillForceRedispatch;
+#endif
+		if (protected_page)
+		{
+			// A protected or manually checked code page must return through the
+			// dispatcher after one store so Cpu->Clear() can unlink every stale edge.
+			force_redispatch = true;
+			cpuRegs.GPR.r[pointer_guest].UD[0] = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(address + 1)));
+			pointer_published = true;
+			vtlb_memWrite<mem8_t>(address, 0);
+			if (Cpu && Cpu->Clear)
+				Cpu->Clear(physical_address & ~3u, 1);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuPreincrementByteZeroFillScalarIterations++;
+#endif
+		}
+		else
+		{
+			iterations = VTLB_PAGE_SIZE - (address & VTLB_PAGE_MASK);
+
+			// ADDIU writes sign_extend_32(address + n). A canonical end value can
+			// therefore terminate this page chunk after the low-word modular delta.
+			const u32 end_low = static_cast<u32>(end);
+			const bool canonical_end = end == static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(end_low)));
+			if (canonical_end)
+			{
+				const u32 to_end = end_low - address;
+				if (to_end != 0 && to_end < iterations)
+					iterations = to_end;
+			}
+
+			// iBranchTest() compares the low cycle delta as signed. Starting from
+			// a negative delta, the first nonnegative iteration is ceil(-delta/cost).
+			const s32 cycle_delta = static_cast<s32>(
+				static_cast<u32>(cpuRegs.cycle) - static_cast<u32>(cpuRegs.nextEventCycle));
+			const u32 to_event = cycle_delta >= 0 ? 1u : static_cast<u32>(
+				(-static_cast<s64>(cycle_delta) + block_cycles - 1) / block_cycles);
+			if (to_event < iterations)
+				iterations = to_event;
+
+			u8* const host = reinterpret_cast<u8*>(mapping.assumePtr(address));
+			if (iterations == 1)
+				*host = 0;
+			else
+				std::memset(host, 0, iterations);
+#if defined(VITASX2_QEMU_VALIDATION)
+			direct_bulk = true;
+			g_qemuPreincrementByteZeroFillBulkChunks++;
+			g_qemuPreincrementByteZeroFillBulkBytes += iterations;
+#endif
+		}
+	}
+	else
+	{
+		// Handler calls may mutate device state and nextEventCycle. Preserve one
+		// callback per guest SB, with ADDIU already visible just as in the
+		// canonical block, and test the possibly changed deadline afterward.
+		cpuRegs.GPR.r[pointer_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(address + 1)));
+		pointer_published = true;
+		vtlb_memWrite<mem8_t>(address, 0);
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuPreincrementByteZeroFillScalarIterations++;
+#endif
+	}
+
+	const u32 updated_low = address + iterations;
+	if (!pointer_published)
+	{
+		cpuRegs.GPR.r[pointer_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(updated_low)));
+	}
+	cpuRegs.cycle += static_cast<u64>(iterations) * block_cycles;
+	const bool repeat = cpuRegs.GPR.r[pointer_guest].UD[0] != end;
+	cpuRegs.pc = repeat ? start_pc : fallthrough_pc;
+	const bool event_due = static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
+		static_cast<u32>(cpuRegs.nextEventCycle)) >= 0;
+	if (event_due)
+		return VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_EVENT;
+	if (force_redispatch)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuPreincrementByteZeroFillRedispatches++;
+#endif
+		return VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_REDISPATCH;
+	}
+	if (!repeat)
+		return VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_COMPLETE;
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (direct_bulk)
+		g_qemuPreincrementByteZeroFillPageReturns++;
+#endif
+	return VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_SELF;
+}
 
 template <typename DataType>
 DataType vtlb_ramRead(u32 addr, bool* result)

@@ -256,6 +256,20 @@ extern vtlb_ProtectionMode mmap_GetRamPageInfo(u32 paddr);
 extern void mmap_MarkCountedRamPage(u32 paddr);
 extern void mmap_ResetBlockTracking();
 
+enum VitaEePreincrementByteZeroFillResult : u32
+{
+	VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_COMPLETE = 0,
+	VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_SELF = 1,
+	VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_EVENT = 2,
+	VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_REDISPATCH = 3,
+};
+
+// Executes the exact ADDIU/SB-zero/BNE pre-increment byte-fill loop. Direct
+// vTLB pages batch only to a page, completion, or event seam; handler and SMC
+// pages execute one architecturally ordered store and return canonically.
+u32 VitaEeExecutePreincrementByteZeroFill(u32 start_pc, u32 fallthrough_pc,
+	u32 block_cycles, u32 packed_guests);
+
 // --------------------------------------------------------------------------------------
 //  Goemon game fix
 // --------------------------------------------------------------------------------------

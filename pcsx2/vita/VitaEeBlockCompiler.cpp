@@ -429,6 +429,14 @@ u32 g_qemuCacheDxltgLoopBlocks = 0;
 u32 g_qemuCacheDxltgLoopHelperCalls = 0;
 u32 g_qemuCacheDxltgLoopCompletedIterations = 0;
 u32 g_qemuCacheDxltgLoopFallbackCalls = 0;
+u32 g_qemuPreincrementByteZeroFillBlocks = 0;
+u32 g_qemuPreincrementByteZeroFillHelperCalls = 0;
+u32 g_qemuPreincrementByteZeroFillBulkChunks = 0;
+u32 g_qemuPreincrementByteZeroFillBulkBytes = 0;
+u32 g_qemuPreincrementByteZeroFillScalarIterations = 0;
+u32 g_qemuPreincrementByteZeroFillPageReturns = 0;
+u32 g_qemuPreincrementByteZeroFillRedispatches = 0;
+bool g_qemuPreincrementByteZeroFillForceRedispatch = false;
 u32 g_qemuSignedCountdownLoopBlocks = 0;
 u32 g_qemuSignedCountdownLoopHelperCalls = 0;
 u32 g_qemuSignedCountdownLoopBatchedIterations = 0;
@@ -2780,6 +2788,35 @@ namespace VitaEE
 			*packed_guests = result | (comparison << 5) | (lower << 10) |
 				(upper << 15) | (induction << 20) | (mask << 25);
 		}
+		return true;
+	}
+
+	bool BlockCompiler::IsExactPreincrementByteZeroFillLoop(u32 start_pc,
+		u32 instruction_count, unsigned* pointer_guest, unsigned* end_guest)
+	{
+		if (instruction_count != 4 || start_pc > UINT32_MAX - 4 * sizeof(u32))
+			return false;
+
+		const u32 advance = memRead32(start_pc);
+		const u32 store = memRead32(start_pc + sizeof(u32));
+		const u32 branch = memRead32(start_pc + 2 * sizeof(u32));
+		const u32 delay = memRead32(start_pc + 3 * sizeof(u32));
+		const unsigned pointer = RT(advance);
+		const unsigned end = RT(branch);
+		if ((advance >> 26) != 0x09 || pointer == 0 || RS(advance) != pointer ||
+			IMM_S(advance) != 1 ||
+			(store >> 26) != 0x28 || RS(store) != pointer || RT(store) != 0 ||
+			IMM_S(store) != -1 ||
+			(branch >> 26) != 0x05 || RS(branch) != pointer || end == pointer ||
+			BranchTarget(start_pc + 2 * sizeof(u32), branch) != start_pc || delay != 0)
+		{
+			return false;
+		}
+
+		if (pointer_guest)
+			*pointer_guest = pointer;
+		if (end_guest)
+			*end_guest = end;
 		return true;
 	}
 
@@ -9210,6 +9247,104 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::CompilePreincrementByteZeroFillLoop(u32 start_pc,
+		u32 instruction_count, const void* direct_exit, const void* event_exit,
+		u32* scaled_cycles, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
+	{
+		unsigned pointer_guest = 0;
+		unsigned end_guest = 0;
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactPreincrementByteZeroFillLoop(start_pc, instruction_count,
+				&pointer_guest, &end_guest))
+		{
+			return false;
+		}
+
+		u32 raw_cycles = 0;
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) * cycle_factor;
+		}
+		const u32 block_cycles = ScaleBlockCycles(raw_cycles);
+		if (block_cycles == 0)
+			return false;
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
+		const u32 packed_guests = pointer_guest | (end_guest << 8);
+		if (!BeginBlock(false, false, false, linked_entry_offset) ||
+			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
+				&VitaEeExecutePreincrementByteZeroFill)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0,
+				VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_EVENT))
+		{
+			return false;
+		}
+
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0,
+				VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_REDISPATCH))
+		{
+			return false;
+		}
+		const size_t redispatch_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (redispatch_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0,
+				VITA_EE_PREINCREMENT_BYTE_ZERO_FILL_SELF))
+		{
+			return false;
+		}
+		const size_t self_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (self_branch == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+
+		const size_t self_target = m_code.Size();
+		if (!m_code.PatchBranch(self_branch, self_target, VitaA32::Condition::EQ) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
+		{
+			return false;
+		}
+		const size_t redispatch_target = m_code.Size();
+		if (!m_code.PatchBranch(redispatch_branch, redispatch_target,
+				VitaA32::Condition::EQ) ||
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
+		{
+			return false;
+		}
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = fallthrough_pc;
+		direct_links->slots[0].valid = true;
+		direct_links->slots[1].target_pc = start_pc;
+		direct_links->slots[1].valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuPreincrementByteZeroFillBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompileSignedCountdownLoop(u32 start_pc, u32 instruction_count,
 		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -9646,6 +9781,8 @@ namespace VitaEE
 #endif
 		const bool cache_loop_batch_enabled = range_loop_dispatch_enabled &&
 			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack;
+		const bool memory_range_loop_batch_enabled = range_loop_dispatch_enabled &&
+			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack;
 		const bool signed_countdown_loop_batch_enabled =
 			range_loop_dispatch_enabled && EmuConfig.Speedhacks.WaitLoop && !device_trace_enabled &&
 			!EmuConfig.Gamefixes.GoemonTlbHack;
@@ -9654,6 +9791,12 @@ namespace VitaEE
 		{
 			return CompileCacheDxltgTagSweep(start_pc, instruction_count, direct_exit, event_exit,
 				scaled_cycles, direct_links, linked_entry_offset);
+		}
+		if (memory_range_loop_batch_enabled && direct_links &&
+			IsExactPreincrementByteZeroFillLoop(start_pc, instruction_count))
+		{
+			return CompilePreincrementByteZeroFillLoop(start_pc, instruction_count,
+				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
 		if (signed_countdown_loop_batch_enabled && direct_links &&
 			IsExactSignedCountdownLoop(start_pc, instruction_count))

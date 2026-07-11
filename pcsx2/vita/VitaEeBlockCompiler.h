@@ -493,6 +493,8 @@ namespace VitaEE
 			unsigned* address_guest = nullptr, unsigned* predicate_guest = nullptr);
 		static bool IsExactCacheDxltgTagSweep(u32 start_pc, u32 instruction_count,
 			u32* packed_guests = nullptr);
+		static bool IsExactPreincrementByteZeroFillLoop(u32 start_pc, u32 instruction_count,
+			unsigned* pointer_guest = nullptr, unsigned* end_guest = nullptr);
 		static bool IsExactSignedCountdownLoop(u32 start_pc, u32 instruction_count,
 			unsigned* countdown_guest = nullptr, unsigned* delay_result_guest = nullptr);
 		static bool BuildGprLinkSignature(u32 first_pc, u32 first_instruction_count,
@@ -575,6 +577,9 @@ namespace VitaEE
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompileCacheDxltgTagSweep(u32 start_pc, u32 instruction_count,
+			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
+			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
+		bool CompilePreincrementByteZeroFillLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompileSignedCountdownLoop(u32 start_pc, u32 instruction_count,
