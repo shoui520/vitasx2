@@ -792,7 +792,8 @@ namespace VitaEE
 		bool EmitPartialDwordLoad(u32 op, bool left);
 		bool EmitPartialDwordStore(u32 op, bool left);
 		bool EmitCounterReadFlagFromAddress(unsigned host_reg);
-		bool EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, unsigned counter_flag_host);
 		struct GprPinDirtyMasks
 		{
 			u8 low = 0;

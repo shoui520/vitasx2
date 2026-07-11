@@ -3759,8 +3759,12 @@ namespace VitaEE
 		// r6 is callee-saved by AAPCS and already part of the persistent private
 		// frame. Carry PCSX2 iBranchTest()'s signed cycle/deadline delta there only
 		// for lowerings whose audited A32 templates never use HOST_TMP5. This first
-		// set covers the measured reciprocal texture-transfer loop; every expansion
-		// must audit both its hot lowering and any returning cold helper tail.
+		// set covers the measured reciprocal texture-transfer loop and the
+		// three-block sceTtyWrite byte-copy cycle. Scalar byte handlers rebuild
+		// the countdown after the AAPCS call; a load in a branch delay slot saves
+		// its independent guest branch predicate in an aligned private stack slot
+		// instead of borrowing r6. Every expansion must audit both its hot lowering
+		// and any returning cold helper tail.
 		const auto block_preserves_scheduler_host = [](u32 start_pc, u32 instruction_count) {
 			for (u32 i = 0; i < instruction_count; i++)
 			{
@@ -3780,8 +3784,12 @@ namespace VitaEE
 					case 0x04: // BEQ
 					case 0x05: // BNE
 					case 0x09: // ADDIU
+					case 0x0a: // SLTI
 					case 0x14: // BEQL
 					case 0x15: // BNEL
+					case 0x20: // LB
+					case 0x24: // LBU
+					case 0x28: // SB
 						continue;
 					case 0x23: // LW
 						// A handler-backed counter-page LW in a branch delay slot
@@ -26782,12 +26790,14 @@ namespace VitaEE
 			   m_code.EmitMovImm8(m_branch_flag_host, 1, VitaA32::Condition::EQ);
 	}
 
-	bool BlockCompiler::EmitCounterReadEventExit(u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit)
+	bool BlockCompiler::EmitCounterReadEventExit(u32 next_pc,
+		u32 raw_cycles_through_instruction, const void* event_exit,
+		unsigned counter_flag_host)
 	{
-		if (!event_exit || raw_cycles_through_instruction == 0)
+		if (!event_exit || raw_cycles_through_instruction == 0 || counter_flag_host >= 16)
 			return false;
 
-		if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
+		if (!m_code.EmitCmpImm32(counter_flag_host, 0))
 		{
 			return false;
 		}
@@ -26982,8 +26992,20 @@ namespace VitaEE
 									  EmitStoreGprZeroExtended32FromLow(tail.rt, HOST_TMP0);
 		};
 
-		if ((tail.branch_delay_slot && needs_counter_event &&
-			 !m_code.EmitMovRegShiftImm(HOST_TMP5, m_branch_flag_host, VitaA32::ShiftType::LSL, 0)) ||
+		const bool preserve_branch_on_stack = tail.branch_delay_slot &&
+			needs_counter_event && m_compatible_scheduler_countdown;
+		// EmitCounterReadFlagFromAddress() owns the private branch host until its
+		// possible event exit, while the handler return must rebuild PCSX2
+		// iBranchTest()'s delta in r6. Preserve the guest branch predicate in an
+		// 8-byte stack allocation so the helper still sees AAPCS-aligned SP, then
+		// move the counter predicate to caller-saved r12 before restoring both.
+		if ((preserve_branch_on_stack &&
+			 (!m_code.EmitSubImm8(HOST_SP, HOST_SP, 8) ||
+			  !m_code.EmitStrImm12(m_branch_flag_host, HOST_SP, 0))) ||
+				(tail.branch_delay_slot && needs_counter_event &&
+				 !preserve_branch_on_stack &&
+				 !m_code.EmitMovRegShiftImm(HOST_TMP5, m_branch_flag_host,
+					 VitaA32::ShiftType::LSL, 0)) ||
 				(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
 				!m_code.EmitCallAbsolute(tail.read_helper) ||
 				!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false) ||
@@ -27007,10 +27029,22 @@ namespace VitaEE
 		}
 #endif
 
+		if (preserve_branch_on_stack &&
+			(!m_code.EmitMovRegShiftImm(HOST_TMP4, m_branch_flag_host,
+				VitaA32::ShiftType::LSL, 0) ||
+			 !m_code.EmitLdrImm12(m_branch_flag_host, HOST_SP, 0) ||
+			 !m_code.EmitAddImm8(HOST_SP, HOST_SP, 8)))
+		{
+			return false;
+		}
+
 		if (needs_counter_event &&
-			(!EmitCounterReadEventExit(tail.pc + 4, tail.raw_cycles_through_instruction, tail.event_exit) ||
-			 (tail.branch_delay_slot &&
-				 !m_code.EmitMovRegShiftImm(m_branch_flag_host, HOST_TMP5, VitaA32::ShiftType::LSL, 0))))
+			(!EmitCounterReadEventExit(tail.pc + 4,
+				tail.raw_cycles_through_instruction, tail.event_exit,
+				preserve_branch_on_stack ? HOST_TMP4 : m_branch_flag_host) ||
+			 (tail.branch_delay_slot && !preserve_branch_on_stack &&
+				 !m_code.EmitMovRegShiftImm(m_branch_flag_host, HOST_TMP5,
+					 VitaA32::ShiftType::LSL, 0))))
 		{
 			return false;
 		}
