@@ -195,6 +195,7 @@ namespace VitaEE
 	struct GprLinkSignature
 	{
 		static constexpr u8 MAX_PINS = 5;
+		static constexpr u8 MAX_BLOCKS = 3;
 		static constexpr u8 FIRST_HOST = 7;
 		static constexpr u8 DEFAULT_FIRST_HOST = 9;
 		static constexpr u8 LAST_CALLEE_HOST = 11;
@@ -207,8 +208,9 @@ namespace VitaEE
 		SchedulerLinkMapping scheduler{};
 		VtlbPointerLinkMapping vtlb_pointer{};
 		PredicateLinkMapping predicate{};
-		u32 block_pcs[2]{};
+		u32 block_pcs[MAX_BLOCKS]{};
 		u8 count = 0;
+		u8 block_count = 0;
 
 		bool IsValid() const;
 		bool ContainsPc(u32 pc) const;
@@ -221,10 +223,11 @@ namespace VitaEE
 		u8 DirtyWordCount() const;
 		bool operator==(const GprLinkSignature& rhs) const
 		{
-			if (count != rhs.count || !(scheduler == rhs.scheduler) ||
+			if (count != rhs.count || block_count != rhs.block_count ||
+				!(scheduler == rhs.scheduler) ||
 				!(vtlb_pointer == rhs.vtlb_pointer) || !(predicate == rhs.predicate) ||
-				block_pcs[0] != rhs.block_pcs[0] ||
-				block_pcs[1] != rhs.block_pcs[1])
+				block_pcs[0] != rhs.block_pcs[0] || block_pcs[1] != rhs.block_pcs[1] ||
+				block_pcs[2] != rhs.block_pcs[2])
 				return false;
 			for (u8 i = 0; i < count; i++)
 			{
@@ -398,6 +401,9 @@ namespace VitaEE
 		static bool BuildGprLinkSignature(u32 first_pc, u32 first_instruction_count,
 			u32 second_pc, u32 second_instruction_count, GprLinkSignature* signature,
 			bool reclaim_vtlb_hosts = true);
+		static bool BuildGprLinkSignature(const u32* block_pcs,
+			const u32* block_instruction_counts, u8 block_count,
+			GprLinkSignature* signature, bool reclaim_vtlb_hosts = true);
 
 		bool BeginBlock(bool use_vtlb_registers = false, bool use_cop1_exponent_mask_register = false,
 			bool use_vu0_base_register = false, size_t* linked_entry_offset = nullptr,

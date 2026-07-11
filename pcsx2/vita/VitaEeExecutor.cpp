@@ -685,6 +685,15 @@ namespace VitaEE
 		m_embedded_compatible_continuation_enabled = enabled;
 	}
 
+	void BlockExecutor::SetThreeBlockGprLinkEnabled(bool enabled)
+	{
+		if (m_three_block_gpr_link_enabled == enabled)
+			return;
+
+		Reset();
+		m_three_block_gpr_link_enabled = enabled;
+	}
+
 	void BlockExecutor::SetVtlbLinkedEntryPcPublicationEnabled(bool enabled)
 	{
 		if (m_vtlb_linked_entry_pc_publication_enabled == enabled)
@@ -932,6 +941,23 @@ namespace VitaEE
 			return false;
 
 		const u32 candidates[2] = {fallthrough, taken};
+		const auto apply_validation_options = [this](GprLinkSignature* candidate) {
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (!m_compatible_gpr_dirty_carry_enabled)
+			{
+				for (u8 i = 0; i < candidate->count; i++)
+					candidate->mappings[i].dirty = GprLinkDirtyState::Clean;
+			}
+			if (!m_compatible_scheduler_carry_enabled)
+				candidate->scheduler = SchedulerLinkMapping{};
+			if (!m_compatible_vtlb_pointer_carry_enabled)
+				candidate->vtlb_pointer = VtlbPointerLinkMapping{};
+			if (!m_compatible_predicate_carry_enabled)
+				candidate->predicate = PredicateLinkMapping{};
+#else
+			(void)candidate;
+#endif
+		};
 		for (const u32 candidate_pc : candidates)
 		{
 			if (candidate_pc == start_pc || (candidate_pc & 3u) != 0)
@@ -962,21 +988,99 @@ namespace VitaEE
 #endif
 					))
 			{
-				return false;
+				continue;
 			}
+			apply_validation_options(signature);
+			return true;
+		}
+
 #if defined(VITASX2_QEMU_VALIDATION)
-			if (!m_compatible_gpr_dirty_carry_enabled)
-			{
-				for (u8 i = 0; i < signature->count; i++)
-					signature->mappings[i].dirty = GprLinkDirtyState::Clean;
-			}
-			if (!m_compatible_scheduler_carry_enabled)
-				signature->scheduler = SchedulerLinkMapping{};
-			if (!m_compatible_vtlb_pointer_carry_enabled)
-				signature->vtlb_pointer = VtlbPointerLinkMapping{};
-			if (!m_compatible_predicate_carry_enabled)
-				signature->predicate = PredicateLinkMapping{};
+		if (!m_three_block_gpr_link_enabled)
+			return false;
 #endif
+
+		// PCSX2's x86 allocator keeps MODE_READ/MODE_WRITE mappings live across
+		// linked control flow, not only reciprocal block pairs. Adapt the first
+		// measured extension as a deterministic three-block cycle: every member
+		// discovers the same sorted PC set and therefore builds the same mapping
+		// signature independently. Side exits retain their canonical flush tails.
+		GprLinkSignature best_signature;
+		bool found_three_block_cycle = false;
+		for (const u32 second_pc : candidates)
+		{
+			if (second_pc == start_pc || (second_pc & 3u) != 0)
+				continue;
+			BlockScanResult second_scan;
+			if (!ScanStraightLineBlock(second_pc,
+					MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &second_scan) ||
+				second_scan.instruction_count < 2 ||
+				second_scan.stop != BlockScanStop::Branch)
+			{
+				continue;
+			}
+			u32 second_fallthrough = 0;
+			u32 second_taken = 0;
+			if (!successors(second_pc, second_scan.instruction_count,
+					&second_fallthrough, &second_taken))
+			{
+				continue;
+			}
+			const u32 third_candidates[2] = {second_fallthrough, second_taken};
+			for (const u32 third_pc : third_candidates)
+			{
+				if (third_pc == start_pc || third_pc == second_pc ||
+					(third_pc & 3u) != 0)
+				{
+					continue;
+				}
+				BlockScanResult third_scan;
+				if (!ScanStraightLineBlock(third_pc,
+						MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &third_scan) ||
+					third_scan.instruction_count < 2 ||
+					third_scan.stop != BlockScanStop::Branch)
+				{
+					continue;
+				}
+				u32 third_fallthrough = 0;
+				u32 third_taken = 0;
+				if (!successors(third_pc, third_scan.instruction_count,
+						&third_fallthrough, &third_taken) ||
+					(third_fallthrough != start_pc && third_taken != start_pc))
+				{
+					continue;
+				}
+
+				const u32 chain_pcs[] = {start_pc, second_pc, third_pc};
+				const u32 chain_counts[] = {instruction_count,
+					second_scan.instruction_count, third_scan.instruction_count};
+				GprLinkSignature candidate_signature;
+				if (!BlockCompiler::BuildGprLinkSignature(chain_pcs, chain_counts, 3,
+						&candidate_signature
+#if defined(VITASX2_QEMU_VALIDATION)
+						, m_compatible_vtlb_host_reclaim_enabled &&
+							m_compatible_vtlb_pointer_carry_enabled
+#endif
+						))
+				{
+					continue;
+				}
+				if (!found_three_block_cycle ||
+					candidate_signature.block_pcs[0] < best_signature.block_pcs[0] ||
+					(candidate_signature.block_pcs[0] == best_signature.block_pcs[0] &&
+					 candidate_signature.block_pcs[1] < best_signature.block_pcs[1]) ||
+					(candidate_signature.block_pcs[0] == best_signature.block_pcs[0] &&
+					 candidate_signature.block_pcs[1] == best_signature.block_pcs[1] &&
+					 candidate_signature.block_pcs[2] < best_signature.block_pcs[2]))
+				{
+					best_signature = candidate_signature;
+					found_three_block_cycle = true;
+				}
+			}
+		}
+		if (found_three_block_cycle)
+		{
+			apply_validation_options(&best_signature);
+			*signature = best_signature;
 			return true;
 		}
 
@@ -1552,6 +1656,12 @@ namespace VitaEE
 				result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
 				result->compatible_gpr_words_carried += link.compatible_words;
 				result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
+				if (block.gpr_link_signature.block_count >
+					result->compatible_gpr_chain_blocks)
+				{
+					result->compatible_gpr_chain_blocks =
+						block.gpr_link_signature.block_count;
+				}
 				result->compatible_scheduler_links +=
 					link.compatible_scheduler_countdown ? 1u : 0u;
 				result->compatible_vtlb_pointer_links +=
@@ -1639,6 +1749,12 @@ namespace VitaEE
 					result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
 					result->compatible_gpr_words_carried += link.compatible_words;
 					result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
+					if (entry->gpr_link_signature.block_count >
+						result->compatible_gpr_chain_blocks)
+					{
+						result->compatible_gpr_chain_blocks =
+							entry->gpr_link_signature.block_count;
+					}
 					result->compatible_scheduler_links +=
 						link.compatible_scheduler_countdown ? 1u : 0u;
 					result->compatible_vtlb_pointer_links +=

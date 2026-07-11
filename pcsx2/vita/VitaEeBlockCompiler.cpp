@@ -3504,25 +3504,47 @@ namespace VitaEE
 
 	bool GprLinkSignature::IsValid() const
 	{
-		if (count == 0 || count > MAX_PINS || block_pcs[0] >= block_pcs[1] ||
-			(block_pcs[0] & 3u) != 0 || (block_pcs[1] & 3u) != 0 ||
+		if (count == 0 || count > MAX_PINS || block_count < 2 ||
+			block_count > MAX_BLOCKS ||
 			(scheduler.IsValid() && scheduler.host != SCHEDULER_HOST) ||
 			(vtlb_pointer.IsValid() &&
 				(vtlb_pointer.host != VTLB_POINTER_HOST ||
-				 vtlb_pointer.guest_address == 0 || vtlb_pointer.stride == 0 ||
-				 (vtlb_pointer.access_pc != block_pcs[0] &&
-				  vtlb_pointer.access_pc != block_pcs[1]) ||
-				 (vtlb_pointer.advance_pc != block_pcs[0] &&
-				  vtlb_pointer.advance_pc != block_pcs[1]))) ||
+				 vtlb_pointer.guest_address == 0 || vtlb_pointer.stride == 0)) ||
 			(predicate.IsValid() &&
 				(predicate.host != PREDICATE_HOST || predicate.guest == 0 ||
 				 predicate.guest >= 32 ||
-				 (predicate.producer_block_pc != block_pcs[0] &&
-				  predicate.producer_block_pc != block_pcs[1]) ||
 				 predicate.producer_pc < predicate.producer_block_pc ||
-				 predicate.consumer_pc != predicate.producer_pc + sizeof(u32) ||
-				 (predicate.consumer_pc != block_pcs[0] &&
-				  predicate.consumer_pc != block_pcs[1]))))
+				 predicate.consumer_pc != predicate.producer_pc + sizeof(u32))))
+		{
+			return false;
+		}
+		for (u8 i = 0; i < block_count; i++)
+		{
+			if ((block_pcs[i] & 3u) != 0 ||
+				(i != 0 && block_pcs[i - 1] >= block_pcs[i]))
+			{
+				return false;
+			}
+		}
+		for (u8 i = block_count; i < MAX_BLOCKS; i++)
+		{
+			if (block_pcs[i] != 0)
+				return false;
+		}
+		const auto contains_block_pc = [this](u32 pc) {
+			for (u8 i = 0; i < block_count; i++)
+			{
+				if (block_pcs[i] == pc)
+					return true;
+			}
+			return false;
+		};
+		if ((vtlb_pointer.IsValid() &&
+				(!contains_block_pc(vtlb_pointer.access_pc) ||
+				 !contains_block_pc(vtlb_pointer.advance_pc))) ||
+			(predicate.IsValid() &&
+				(!contains_block_pc(predicate.producer_block_pc) ||
+				 !contains_block_pc(predicate.consumer_pc))))
 		{
 			return false;
 		}
@@ -3582,7 +3604,14 @@ namespace VitaEE
 
 	bool GprLinkSignature::ContainsPc(u32 pc) const
 	{
-		return IsValid() && (block_pcs[0] == pc || block_pcs[1] == pc);
+		if (!IsValid())
+			return false;
+		for (u8 i = 0; i < block_count; i++)
+		{
+			if (block_pcs[i] == pc)
+				return true;
+		}
+		return false;
 	}
 
 	bool GprLinkSignature::HasWriteBack() const
@@ -3636,13 +3665,37 @@ namespace VitaEE
 		u32 first_instruction_count, u32 second_pc, u32 second_instruction_count,
 		GprLinkSignature* signature, bool reclaim_vtlb_hosts)
 	{
+		const u32 block_pcs[] = {first_pc, second_pc};
+		const u32 block_instruction_counts[] = {
+			first_instruction_count, second_instruction_count};
+		return BuildGprLinkSignature(block_pcs, block_instruction_counts, 2,
+			signature, reclaim_vtlb_hosts);
+	}
+
+	bool BlockCompiler::BuildGprLinkSignature(const u32* chain_pcs,
+		const u32* chain_instruction_counts, u8 chain_block_count,
+		GprLinkSignature* signature, bool reclaim_vtlb_hosts)
+	{
 		if (!signature)
 			return false;
 		*signature = GprLinkSignature{};
-		if (!BlockCanUseDirtyGprPins(first_pc, first_instruction_count) ||
-			!BlockCanUseDirtyGprPins(second_pc, second_instruction_count))
+		if (!chain_pcs || !chain_instruction_counts || chain_block_count < 2 ||
+			chain_block_count > GprLinkSignature::MAX_BLOCKS)
 		{
 			return false;
+		}
+		for (u8 block = 0; block < chain_block_count; block++)
+		{
+			if (!BlockCanUseDirtyGprPins(chain_pcs[block],
+					chain_instruction_counts[block]))
+			{
+				return false;
+			}
+			for (u8 previous = 0; previous < block; previous++)
+			{
+				if (chain_pcs[block] == chain_pcs[previous])
+					return false;
+			}
 		}
 
 		// PCSX2 owners: x86/ix86-32/iCore.cpp::_allocX86reg() and
@@ -3697,10 +3750,10 @@ namespace VitaEE
 			}
 			return true;
 		};
-		if (!score_block(first_pc, first_instruction_count) ||
-			!score_block(second_pc, second_instruction_count))
+		for (u8 block = 0; block < chain_block_count; block++)
 		{
-			return false;
+			if (!score_block(chain_pcs[block], chain_instruction_counts[block]))
+				return false;
 		}
 
 		// r6 is callee-saved by AAPCS and already part of the persistent private
@@ -3756,16 +3809,30 @@ namespace VitaEE
 			return target_pc <= start_pc &&
 				IsWaitLoopBody(target_pc, end_pc, branch_pc);
 		};
-		if (block_preserves_scheduler_host(first_pc, first_instruction_count) &&
-			block_preserves_scheduler_host(second_pc, second_instruction_count) &&
-			!block_exits_wait_loop(first_pc, first_instruction_count) &&
-			!block_exits_wait_loop(second_pc, second_instruction_count))
+		bool chain_preserves_scheduler = true;
+		for (u8 block = 0; block < chain_block_count; block++)
+		{
+			chain_preserves_scheduler &= block_preserves_scheduler_host(
+				chain_pcs[block], chain_instruction_counts[block]) &&
+				!block_exits_wait_loop(chain_pcs[block],
+					chain_instruction_counts[block]);
+		}
+		if (chain_preserves_scheduler)
 		{
 			signature->scheduler.host = GprLinkSignature::SCHEDULER_HOST;
 		}
 
-		signature->block_pcs[0] = first_pc < second_pc ? first_pc : second_pc;
-		signature->block_pcs[1] = first_pc < second_pc ? second_pc : first_pc;
+		signature->block_count = chain_block_count;
+		for (u8 block = 0; block < chain_block_count; block++)
+		{
+			u8 insert = block;
+			while (insert != 0 && signature->block_pcs[insert - 1] > chain_pcs[block])
+			{
+				signature->block_pcs[insert] = signature->block_pcs[insert - 1];
+				insert--;
+			}
+			signature->block_pcs[insert] = chain_pcs[block];
+		}
 		const auto allocate_mappings = [&](bool retain_all_dword_values) {
 			constexpr u8 default_hosts[] = {9, 10, 11};
 			constexpr u8 reclaimed_hosts[] = {7, 8, 9, 10, 11, 14, 1, 3};
@@ -3915,11 +3982,12 @@ namespace VitaEE
 			signature->vtlb_pointer.advance_pc = advance_pc;
 			return true;
 		};
-		if (!try_add_vtlb_pointer(first_pc, first_instruction_count,
-				second_pc, second_instruction_count))
+		if (chain_block_count == 2 &&
+			!try_add_vtlb_pointer(chain_pcs[0], chain_instruction_counts[0],
+				chain_pcs[1], chain_instruction_counts[1]))
 		{
-			try_add_vtlb_pointer(second_pc, second_instruction_count,
-				first_pc, first_instruction_count);
+			try_add_vtlb_pointer(chain_pcs[1], chain_instruction_counts[1],
+				chain_pcs[0], chain_instruction_counts[0]);
 		}
 		if (reclaim_vtlb_hosts && signature->vtlb_pointer.IsValid() &&
 			!allocate_mappings(true))
@@ -3993,11 +4061,12 @@ namespace VitaEE
 			signature->predicate.consumer_pc = consumer_block_pc;
 			return true;
 		};
-		if (!try_add_predicate(first_pc, first_instruction_count,
-				second_pc, second_instruction_count))
+		if (chain_block_count == 2 &&
+			!try_add_predicate(chain_pcs[0], chain_instruction_counts[0],
+				chain_pcs[1], chain_instruction_counts[1]))
 		{
-			try_add_predicate(second_pc, second_instruction_count,
-				first_pc, first_instruction_count);
+			try_add_predicate(chain_pcs[1], chain_instruction_counts[1],
+				chain_pcs[0], chain_instruction_counts[0]);
 		}
 		return signature->IsValid();
 	}
