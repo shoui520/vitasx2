@@ -497,6 +497,26 @@ void executeCacheOp(u32 instr, u32 addr)
 	}
 }
 
+void executeCacheDxwbinPairRange(u32 addr, u32 pair_count)
+{
+	// PCSX2 owner: executeCacheOp()'s DXWBIN case. The kernel walks one set
+	// per 64-byte step and selects the two ways with address bits 0 and 1.
+	// Keep the two operations ordered so dirty writeback, invalid-PFN loss,
+	// retained LRF state, and data clearing are identical to two CACHE ops.
+	for (u32 i = 0; i < pair_count; i++, addr += 64)
+	{
+		for (u32 way_offset = 0; way_offset < 2; way_offset++)
+		{
+			const u32 operation_addr = addr + way_offset;
+			const int index = cache.setIdxFor(operation_addr);
+			const int way = operation_addr & 1;
+			CacheLine line = cache.lineAt(index, way);
+			line.writeBackIfNeeded();
+			line.clear();
+		}
+	}
+}
+
 namespace R5900
 {
 	namespace Interpreter

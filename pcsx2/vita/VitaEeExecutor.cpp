@@ -873,6 +873,22 @@ namespace VitaEE
 		result->stop_pc = start_pc;
 		result->stop = BlockScanStop::MaxInstructions;
 
+		bool exact_cache_dxwbin_loop = max_instruction_count >= 9 &&
+			BlockCompiler::IsExactCacheDxwbinLoop(start_pc, 9);
+		if (exact_cache_dxwbin_loop)
+		{
+			for (u32 i = 0; i < 9; i++)
+			{
+				const u32 pc = start_pc + i * sizeof(u32);
+				if (isBreakpointNeeded(pc) != 0 || isMemcheckNeeded(pc) != 0 ||
+					(i != 0 && (pc & 0xffcu) == 0))
+				{
+					exact_cache_dxwbin_loop = false;
+					break;
+				}
+			}
+		}
+
 		for (u32 i = 0; i < max_instruction_count; i++)
 		{
 			if (i > ((UINT32_MAX - start_pc) / 4))
@@ -950,7 +966,7 @@ namespace VitaEE
 
 			result->instruction_count++;
 			result->stop_pc = pc + 4;
-			if (BlockCompiler::RequiresBlockEndAfterOpcode(op))
+			if (BlockCompiler::RequiresBlockEndAfterOpcode(op) && !exact_cache_dxwbin_loop)
 			{
 				result->stop = BlockScanStop::OpcodeBoundary;
 				return true;

@@ -38,13 +38,14 @@
 #include <string>
 #include <type_traits>
 
+void executeCacheOp(u32 op, u32 addr);
+void executeCacheDxwbinPairRange(u32 addr, u32 pair_count);
+
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 extern void vu0Sync();
 extern void _vu0FinishMicro();
 extern void _vu0WaitMicro();
 #endif
-void executeCacheOp(u32 op, u32 addr);
-
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuDivSignedHelperCalls = 0;
 u32 g_qemuDivUnsignedHelperCalls = 0;
@@ -413,6 +414,10 @@ u32 g_qemuConditionalMovePredicatedQCacheStores = 0;
 u32 g_qemuConditionalMoveUnconditionalQCacheCopies = 0;
 u32 g_qemuSignedBranchSignBitFastPaths = 0;
 u32 g_qemuSignedBranchOneCompareFastPaths = 0;
+u32 g_qemuCacheDxwbinLoopBlocks = 0;
+u32 g_qemuCacheDxwbinLoopHelperCalls = 0;
+u32 g_qemuCacheDxwbinLoopBatchedIterations = 0;
+u32 g_qemuCacheDxwbinLoopFallbackIterations = 0;
 #endif
 
 namespace VitaEE
@@ -436,6 +441,9 @@ namespace VitaEE
 		// Must match VitaEE::BlockExitKind without including the executor.
 		constexpr u8 EE_DIRECT_EXIT_TOKEN = 0xd1;
 		constexpr u8 EE_EVENT_EXIT_TOKEN = 0xe7;
+		constexpr u32 CACHE_DXWBIN_LOOP_COMPLETE = 0;
+		constexpr u32 CACHE_DXWBIN_LOOP_SELF = 1;
+		constexpr u32 CACHE_DXWBIN_LOOP_EVENT = 2;
 
 		constexpr unsigned HOST_CPU_REGS = 4;
 		constexpr unsigned HOST_BRANCH_STATE = 5;
@@ -448,6 +456,59 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP2 = 2;
 		constexpr unsigned HOST_TMP3 = 3;
 		constexpr unsigned HOST_TMP4 = 12;
+
+		__noinline u32 VitaEeExecuteCacheDxwbinLoop(u32 start_pc, u32 fallthrough_pc,
+			u32 block_cycles, u32 packed_guests)
+		{
+			const unsigned address_guest = packed_guests & 0x1f;
+			const unsigned predicate_guest = (packed_guests >> 8) & 0x1f;
+			const u64 address_value = cpuRegs.GPR.r[address_guest].UD[0];
+			const u32 address = static_cast<u32>(address_value);
+			const u64 sign_extended_address = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(address)));
+
+			u32 iterations = 1;
+			const bool batchable = block_cycles != 0 && address_value == sign_extended_address &&
+				(address & 63u) == 0 && address < 4096;
+			if (batchable)
+			{
+				const u32 remaining = (4096 - address) / 64;
+				const s32 cycles_to_event = static_cast<s32>(
+					static_cast<u32>(cpuRegs.nextEventCycle) - static_cast<u32>(cpuRegs.cycle));
+				u32 event_iterations = 1;
+				if (cycles_to_event > 0)
+				{
+					event_iterations = static_cast<u32>(
+						(static_cast<u64>(cycles_to_event) + block_cycles - 1) / block_cycles);
+				}
+				iterations = std::min(remaining, event_iterations);
+			}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCacheDxwbinLoopHelperCalls++;
+			if (batchable)
+				g_qemuCacheDxwbinLoopBatchedIterations += iterations;
+			else
+				g_qemuCacheDxwbinLoopFallbackIterations++;
+#endif
+
+			executeCacheDxwbinPairRange(address, iterations);
+			const u32 updated_address = address + iterations * 64;
+			const u64 updated_value = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(updated_address)));
+			const u64 predicate = static_cast<s64>(updated_value) < 4096 ? 1 : 0;
+			cpuRegs.GPR.r[address_guest].UD[0] = updated_value;
+			cpuRegs.GPR.r[predicate_guest].UD[0] = predicate;
+			cpuRegs.cycle += static_cast<u64>(block_cycles) * iterations;
+			cpuRegs.pc = predicate != 0 ? start_pc : fallthrough_pc;
+
+			if (static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
+					static_cast<u32>(cpuRegs.nextEventCycle)) >= 0)
+			{
+				return CACHE_DXWBIN_LOOP_EVENT;
+			}
+			return predicate != 0 ? CACHE_DXWBIN_LOOP_SELF : CACHE_DXWBIN_LOOP_COMPLETE;
+		}
 		constexpr unsigned HOST_CALLER_SAVED_BRANCH_FLAG = HOST_TMP4;
 		constexpr unsigned HOST_TMP5 = 6;
 		constexpr unsigned HOST_VTLB_VMAP = 7;
@@ -2483,6 +2544,43 @@ namespace VitaEE
 		// bank in AAPCS caller-clobbered d24-d31. Physical q8-q11 remain available
 		// for the persistent COP2 normalization constants.
 		m_code.SetNeonQRegisterBankMapping(4, 12, 4);
+	}
+
+	bool BlockCompiler::IsExactCacheDxwbinLoop(u32 start_pc, u32 instruction_count,
+		unsigned* address_guest, unsigned* predicate_guest)
+	{
+		if (instruction_count != 9 || start_pc > UINT32_MAX - 9 * sizeof(u32))
+			return false;
+
+		const u32 sync0 = memRead32(start_pc);
+		const u32 cache0 = memRead32(start_pc + sizeof(u32));
+		const u32 sync1 = memRead32(start_pc + 2 * sizeof(u32));
+		const u32 cache1 = memRead32(start_pc + 3 * sizeof(u32));
+		const u32 sync2 = memRead32(start_pc + 4 * sizeof(u32));
+		const u32 advance = memRead32(start_pc + 5 * sizeof(u32));
+		const u32 compare = memRead32(start_pc + 6 * sizeof(u32));
+		const u32 branch = memRead32(start_pc + 7 * sizeof(u32));
+		const u32 delay = memRead32(start_pc + 8 * sizeof(u32));
+		const unsigned address = RS(cache0);
+		const unsigned predicate = RT(compare);
+
+		if (sync0 != 0x0000000fu || sync1 != sync0 || sync2 != sync0 ||
+			(cache0 >> 26) != 0x2f || RT(cache0) != 0x14 || IMM_S(cache0) != 0 ||
+			(cache1 >> 26) != 0x2f || RT(cache1) != 0x14 || RS(cache1) != address || IMM_S(cache1) != 1 ||
+			address == 0 || predicate == 0 || predicate == address ||
+			(advance >> 26) != 0x09 || RS(advance) != address || RT(advance) != address || IMM_S(advance) != 64 ||
+			(compare >> 26) != 0x0a || RS(compare) != address || IMM_S(compare) != 4096 ||
+			(branch >> 26) != 0x05 || RS(branch) != predicate || RT(branch) != 0 ||
+			BranchTarget(start_pc + 7 * sizeof(u32), branch) != start_pc || delay != 0)
+		{
+			return false;
+		}
+
+		if (address_guest)
+			*address_guest = address;
+		if (predicate_guest)
+			*predicate_guest = predicate;
+		return true;
 	}
 
 	bool BlockCompiler::EmitAndImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags)
@@ -8788,6 +8886,84 @@ namespace VitaEE
 			   m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0));
 	}
 
+	bool BlockCompiler::CompileCacheDxwbinLoop(u32 start_pc, u32 instruction_count,
+		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
+		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
+	{
+		unsigned address_guest = 0;
+		unsigned predicate_guest = 0;
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactCacheDxwbinLoop(start_pc, instruction_count, &address_guest, &predicate_guest))
+		{
+			return false;
+		}
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		if (!BeginBlock(false, false, false, linked_entry_offset))
+			return false;
+
+		u32 raw_cycles = 0;
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) * cycle_factor;
+		}
+		const u32 block_cycles = ScaleBlockCycles(raw_cycles);
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
+		const u32 packed_guests = address_guest | (predicate_guest << 8);
+		if (!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeExecuteCacheDxwbinLoop)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, CACHE_DXWBIN_LOOP_EVENT))
+		{
+			return false;
+		}
+
+		const size_t event_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, CACHE_DXWBIN_LOOP_SELF))
+		{
+			return false;
+		}
+		const size_t self_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (self_branch == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+
+		const size_t self_target = m_code.Size();
+		if (!m_code.PatchBranch(self_branch, self_target, VitaA32::Condition::EQ) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
+		{
+			return false;
+		}
+
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = fallthrough_pc;
+		direct_links->slots[0].valid = true;
+		direct_links->slots[1].target_pc = start_pc;
+		direct_links->slots[1].valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCacheDxwbinLoopBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit,
 		const void* event_exit, u32* scaled_cycles, DirectLinkSlots* direct_links,
 		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
@@ -8841,6 +9017,19 @@ namespace VitaEE
 		m_gpr_link_signature =
 			(persistent_dispatch_exits && gpr_link_signature && gpr_link_signature->IsValid()) ?
 				*gpr_link_signature : GprLinkSignature{};
+
+		bool device_trace_enabled = false;
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		device_trace_enabled = Pcsx2Trace::IsGsTraceEnabled() || Pcsx2Trace::IsVuTraceEnabled();
+#endif
+		const bool cache_dxwbin_loop_batch_enabled =
+			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack;
+		if (cache_dxwbin_loop_batch_enabled && direct_links &&
+			IsExactCacheDxwbinLoop(start_pc, instruction_count))
+		{
+			return CompileCacheDxwbinLoop(start_pc, instruction_count, direct_exit, event_exit,
+				scaled_cycles, direct_links, linked_entry_offset);
+		}
 
 		m_reclaimed_vtlb_link_hosts = m_gpr_link_signature.ReclaimsVtlbHosts();
 		const bool use_vtlb_registers =

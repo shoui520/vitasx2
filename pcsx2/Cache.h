@@ -12,6 +12,10 @@ void resetCache();
 // This is necessary to fix a bug when enabled the recompiler while the cache was enabled.
 void writebackCache();
 void executeCacheOp(u32 op, u32 addr);
+// Executes consecutive DXWBIN index pairs at addr/addr+1, advancing addr by
+// one 64-byte EE cache line per pair. This is the exact Cache.cpp-owned
+// operation used by the EE kernel's two-way D-cache maintenance loop.
+void executeCacheDxwbinPairRange(u32 addr, u32 pair_count);
 void writeCache8(u32 mem, u8 value, bool validPFN = true);
 void writeCache16(u32 mem, u16 value, bool validPFN = true);
 void writeCache32(u32 mem, u32 value, bool validPFN = true);
