@@ -5140,6 +5140,7 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_hot_dispatch_cache_hits = 0;
 		m_hot_dispatch_cache_misses = 0;
+		m_hot_dispatch_trusted_raw_hits = 0;
 		m_validation_calls = 0;
 		m_validation_words = 0;
 		m_raw_validation_calls = 0;
@@ -6486,6 +6487,7 @@ namespace VitaIOP
 
 		result->hot_dispatch_cache_hits = m_hot_dispatch_cache_hits;
 		result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
+		result->hot_dispatch_trusted_raw_hits = m_hot_dispatch_trusted_raw_hits;
 		result->validation_calls = m_validation_calls;
 		result->validation_words = m_validation_words;
 		result->raw_validation_calls = m_raw_validation_calls;
@@ -6608,7 +6610,18 @@ namespace VitaIOP
 		// the lazy two-level table remains the collision and cold fallback.
 		if (CachedBlock* entry = FindHotDispatchCacheBlock(start_pc))
 		{
-			if (ValidateCachedBlock(*entry))
+			// PCSX2's psxRecLUT dispatcher trusts a live exact translation because
+			// psxRecClearMem() removes stale RAM blocks before dispatch. Raw Vita
+			// sources have the same explicit-invalidation contract; immutable ROM
+			// also needs no per-hit comparison. Handler-backed and cross-page
+			// sources retain ValidateCachedBlock(), as does the opt-in QEMU audit.
+			bool trust_raw_source = (entry->raw_opcodes != nullptr);
+#if defined(VITASX2_QEMU_VALIDATION)
+			trust_raw_source &= !s_qemuIopTrustedSourceAuditEnabled;
+			if (trust_raw_source)
+				m_hot_dispatch_trusted_raw_hits++;
+#endif
+			if (trust_raw_source || ValidateCachedBlock(*entry))
 			{
 #if defined(VITASX2_QEMU_VALIDATION)
 				m_hot_dispatch_cache_hits++;

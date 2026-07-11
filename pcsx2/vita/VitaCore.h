@@ -84,6 +84,7 @@ struct VitaA32IopProviderStats
 #if defined(VITASX2_QEMU_VALIDATION)
 	u64 hot_dispatch_cache_hits = 0;
 	u64 hot_dispatch_cache_misses = 0;
+	u64 hot_dispatch_trusted_raw_hits = 0;
 	u64 validation_calls = 0;
 	u64 validation_words = 0;
 	u64 raw_validation_calls = 0;

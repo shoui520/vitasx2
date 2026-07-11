@@ -47,6 +47,7 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		u64 hot_dispatch_cache_hits;
 		u64 hot_dispatch_cache_misses;
+		u64 hot_dispatch_trusted_raw_hits;
 		u64 validation_calls;
 		u64 validation_words;
 		u64 raw_validation_calls;
@@ -429,6 +430,7 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		u64 m_hot_dispatch_cache_hits = 0;
 		u64 m_hot_dispatch_cache_misses = 0;
+		u64 m_hot_dispatch_trusted_raw_hits = 0;
 		u64 m_validation_calls = 0;
 		u64 m_validation_words = 0;
 		u64 m_raw_validation_calls = 0;
