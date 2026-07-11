@@ -26,6 +26,7 @@ namespace VitaEE
 		u32 embedded_source_opcodes[2]{};
 		bool branch_on_taken = false;
 		bool branch_on_unsigned_less = false;
+		bool branch_if_no_event = false;
 		bool embedded_compatible_continuation = false;
 		bool embedded_continuation_active = false;
 		bool patched_to_resident_entry = false;
@@ -403,6 +404,10 @@ namespace VitaEE
 		void SetEmbeddedCompatibleContinuationEnabled(bool enabled)
 		{
 			m_embedded_compatible_continuation_enabled = enabled;
+		}
+		void SetFusedDirectEventLinkEnabled(bool enabled)
+		{
+			m_fused_direct_event_link_enabled = enabled;
 		}
 #endif
 
@@ -1159,6 +1164,7 @@ namespace VitaEE
 		bool m_compatible_likely_taken_suffix_enabled = true;
 		bool m_compatible_predicate_entry_variant_enabled = true;
 		bool m_embedded_compatible_continuation_enabled = true;
+		bool m_fused_direct_event_link_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;

@@ -685,6 +685,15 @@ namespace VitaEE
 		m_embedded_compatible_continuation_enabled = enabled;
 	}
 
+	void BlockExecutor::SetFusedDirectEventLinkEnabled(bool enabled)
+	{
+		if (m_fused_direct_event_link_enabled == enabled)
+			return;
+
+		Reset();
+		m_fused_direct_event_link_enabled = enabled;
+	}
+
 	void BlockExecutor::SetThreeBlockGprLinkEnabled(bool enabled)
 	{
 		if (m_three_block_gpr_link_enabled == enabled)
@@ -1364,6 +1373,8 @@ namespace VitaEE
 				m_compatible_predicate_entry_variant_enabled);
 			compiler.SetEmbeddedCompatibleContinuationEnabled(
 				m_embedded_compatible_continuation_enabled);
+			compiler.SetFusedDirectEventLinkEnabled(
+				m_fused_direct_event_link_enabled);
 #endif
 			u32 attempt_scaled_cycles = 0;
 			size_t attempt_linked_entry_offset = 0;
@@ -1531,7 +1542,8 @@ namespace VitaEE
 		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) :
 			(use_compatible_entry ? CompatibleLinkEntryPoint(*target) :
 				(!use_generated_fallback ? LinkedEntryPoint(*target) : direct_exit));
-		const VitaA32::Condition condition = link.branch_on_taken ?
+		const VitaA32::Condition condition = link.branch_if_no_event ?
+			VitaA32::Condition::MI : link.branch_on_taken ?
 			(link.branch_on_unsigned_less ? VitaA32::Condition::CC : VitaA32::Condition::NE) :
 			VitaA32::Condition::AL;
 		const bool patched = use_embedded_continuation ?

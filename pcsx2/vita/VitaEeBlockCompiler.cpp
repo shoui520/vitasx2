@@ -149,6 +149,8 @@ u32 g_qemuEmbeddedCompatibleContinuationIncompatibleTargets = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixBlocks = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixHotInstructionsElided = 0;
 u32 g_qemuCompatibleLikelyTakenSuffixColdInstructions = 0;
+u32 g_qemuFusedDirectEventLinkBlocks = 0;
+u32 g_qemuFusedDirectEventLinkHotInstructionsElided = 0;
 u32 g_qemuResidentCycleLowBlocks = 0;
 u32 g_qemuResidentCycleLowHotInstructionsElided = 0;
 u32 g_qemuResidentCycleLowSyncInstructions = 0;
@@ -10037,6 +10039,65 @@ namespace VitaEE
 		}
 		// Otherwise the flag-setting countdown ADD above already produced exactly
 		// the signed cycle.low-nextEventCycle.low predicate consumed by BPL.
+
+		// PCSX2 owners: iBranchTest() routes a negative scheduler delta to the
+		// statically linked successor, while BaseBlocks::Link() owns the reversible
+		// target patch. An unconditional A32 edge can make those the same
+		// instruction: BMI is the patch site and the event exit is its fallthrough.
+		// This removes the former hot BPL-not-taken plus unconditional-B pair's
+		// first branch without weakening the event test or publishing state on the
+		// linked path. Conditional guest branches still need their independent
+		// target selection below.
+		bool fuse_direct_event_link = direct_link && !taken_link && !wait_loop_taken;
+#if defined(VITASX2_QEMU_VALIDATION)
+		fuse_direct_event_link &= m_fused_direct_event_link_enabled;
+#endif
+		if (fuse_direct_event_link)
+		{
+			const size_t target_offset =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
+			if (target_offset == static_cast<size_t>(-1) ||
+				(carry_dirty_link && !EmitSyncGprPinsToBacking()) ||
+				!EmitDeferredPcWriteback(defer_pc_writeback, direct_pc, taken_pc,
+					conditional_pc, indirect_pc_writeback) ||
+				!EmitEventExitReturn(event_exit))
+			{
+				return false;
+			}
+
+			const size_t fallback_offset = m_code.Size();
+			if (!m_code.PatchBranch(target_offset, fallback_offset,
+					VitaA32::Condition::MI) ||
+				(carry_dirty_link && !EmitSyncGprPinsToBacking()) ||
+				(defer_pc_writeback && !EmitStorePc(direct_pc)) ||
+				!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
+			{
+				return false;
+			}
+
+			direct_link->target_offset = target_offset;
+			direct_link->fallback_offset = fallback_offset;
+			direct_link->branch_on_taken = false;
+			direct_link->branch_on_unsigned_less = false;
+			direct_link->branch_if_no_event = true;
+			direct_link->requires_compatible_entry = carry_dirty_link;
+			direct_link->compatible_scheduler_countdown = carry_dirty_link &&
+				m_compatible_scheduler_countdown;
+			direct_link->compatible_vtlb_pointer = carry_dirty_link &&
+				m_compatible_vtlb_pointer;
+			direct_link->compatible_words = carry_dirty_link ?
+				m_gpr_link_signature.WordCount() : 0;
+			direct_link->compatible_dirty_words = carry_dirty_link ?
+				m_gpr_link_signature.DirtyWordCount() : 0;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuFusedDirectEventLinkBlocks++;
+			g_qemuFusedDirectEventLinkHotInstructionsElided++;
+#endif
+			const size_t carry_branches[] = {carry_branch};
+			return EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target,
+				HOST_TMP1);
+		}
 
 		// Scheduler events are rare relative to block dispatch. Keep PCSX2's
 		// signed-delta test, but invert the A32 layout so cycle < nextEventCycle
