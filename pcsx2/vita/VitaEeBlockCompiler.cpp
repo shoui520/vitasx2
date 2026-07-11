@@ -422,6 +422,9 @@ u32 g_qemuCacheIxinLoopBlocks = 0;
 u32 g_qemuCacheIxinLoopHelperCalls = 0;
 u32 g_qemuCacheIxinLoopBatchedIterations = 0;
 u32 g_qemuCacheIxinLoopFallbackIterations = 0;
+u32 g_qemuSignedCountdownLoopBlocks = 0;
+u32 g_qemuSignedCountdownLoopHelperCalls = 0;
+u32 g_qemuSignedCountdownLoopBatchedIterations = 0;
 #endif
 
 namespace VitaEE
@@ -448,6 +451,8 @@ namespace VitaEE
 		constexpr u32 CACHE_INDUCTION_LOOP_COMPLETE = 0;
 		constexpr u32 CACHE_INDUCTION_LOOP_SELF = 1;
 		constexpr u32 CACHE_INDUCTION_LOOP_EVENT = 2;
+		constexpr u32 SIGNED_COUNTDOWN_LOOP_COMPLETE = 0;
+		constexpr u32 SIGNED_COUNTDOWN_LOOP_EVENT = 1;
 
 		constexpr unsigned HOST_CPU_REGS = 4;
 		constexpr unsigned HOST_BRANCH_STATE = 5;
@@ -539,6 +544,48 @@ namespace VitaEE
 		{
 			return VitaEeExecuteCacheInductionLoop<8192, false>(
 				start_pc, fallthrough_pc, block_cycles, packed_guests);
+		}
+
+		__noinline u32 VitaEeExecuteSignedCountdownLoop(u32 start_pc, u32 fallthrough_pc,
+			u32 block_cycles, u32 packed_guests)
+		{
+			// PCSX2 owner: x86/ix86-32/iR5900.cpp::recSkipTimeoutLoop(). This
+			// signed-BGEZ adaptation retains whole compiled iterations at an event
+			// seam and publishes R5900OpcodeImpl.cpp::ADDIU()'s delay-slot result
+			// before applying Interpreter.cpp::BGEZ()'s signed branch decision.
+			const unsigned countdown_guest = packed_guests & 0x1f;
+			const unsigned delay_result_guest = (packed_guests >> 8) & 0x1f;
+			const u32 countdown = cpuRegs.GPR.r[countdown_guest].UL[0];
+			const u32 decremented = countdown - 1;
+			const u32 remaining = static_cast<s32>(decremented) < 0 ? 1 : decremented + 2;
+			const s32 cycles_to_event = static_cast<s32>(
+				static_cast<u32>(cpuRegs.nextEventCycle) - static_cast<u32>(cpuRegs.cycle));
+			u32 iterations = 1;
+			if (block_cycles != 0 && cycles_to_event > 0)
+			{
+				const u32 event_iterations = 1 +
+					(static_cast<u32>(cycles_to_event) - 1) / block_cycles;
+				iterations = std::min(remaining, event_iterations);
+			}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSignedCountdownLoopHelperCalls++;
+			g_qemuSignedCountdownLoopBatchedIterations += iterations;
+#endif
+
+			const u32 updated_countdown = countdown - iterations;
+			cpuRegs.GPR.r[countdown_guest].SD[0] = static_cast<s32>(updated_countdown);
+			cpuRegs.GPR.r[delay_result_guest].SD[0] = 2;
+			cpuRegs.cycle += static_cast<u64>(block_cycles) * iterations;
+			const bool complete = static_cast<s32>(updated_countdown) < 0;
+			cpuRegs.pc = complete ? fallthrough_pc : start_pc;
+
+			if (static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
+					static_cast<u32>(cpuRegs.nextEventCycle)) >= 0)
+			{
+				return SIGNED_COUNTDOWN_LOOP_EVENT;
+			}
+			return SIGNED_COUNTDOWN_LOOP_COMPLETE;
 		}
 		constexpr unsigned HOST_CALLER_SAVED_BRANCH_FLAG = HOST_TMP4;
 		constexpr unsigned HOST_TMP5 = 6;
@@ -2647,6 +2694,40 @@ namespace VitaEE
 			*address_guest = address;
 		if (predicate_guest)
 			*predicate_guest = predicate;
+		return true;
+	}
+
+	bool BlockCompiler::IsExactSignedCountdownLoop(u32 start_pc, u32 instruction_count,
+		unsigned* countdown_guest, unsigned* delay_result_guest)
+	{
+		if (instruction_count != 9 || start_pc > UINT32_MAX - 9 * sizeof(u32))
+			return false;
+
+		for (u32 i = 0; i < 6; i++)
+		{
+			if (memRead32(start_pc + i * sizeof(u32)) != 0)
+				return false;
+		}
+
+		const u32 decrement = memRead32(start_pc + 6 * sizeof(u32));
+		const u32 branch = memRead32(start_pc + 7 * sizeof(u32));
+		const u32 delay = memRead32(start_pc + 8 * sizeof(u32));
+		const unsigned countdown = RS(decrement);
+		const unsigned delay_result = RT(delay);
+		if ((decrement >> 26) != 0x09 || countdown == 0 || RT(decrement) != countdown ||
+			IMM_S(decrement) != -1 ||
+			(branch >> 26) != 0x01 || RS(branch) != countdown || RT(branch) != 0x01 ||
+			BranchTarget(start_pc + 7 * sizeof(u32), branch) != start_pc ||
+			(delay >> 26) != 0x09 || RS(delay) != 0 || delay_result == 0 ||
+			delay_result == countdown || IMM_S(delay) != 2)
+		{
+			return false;
+		}
+
+		if (countdown_guest)
+			*countdown_guest = countdown;
+		if (delay_result_guest)
+			*delay_result_guest = delay_result;
 		return true;
 	}
 
@@ -8953,6 +9034,142 @@ namespace VitaEE
 			   m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0));
 	}
 
+	bool BlockCompiler::CompileSignedCountdownLoop(u32 start_pc, u32 instruction_count,
+		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
+		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
+	{
+		// Port PCSX2 x86/ix86-32/iR5900.cpp::recSkipTimeoutLoop() for the
+		// measured kernel's ADDIU/BGEZ/delay-result form. The old x86 matcher
+		// accepts only a negative ADDI/U plus BNE-zero/NOP; this exact shape has
+		// one additional logical iteration and an architecturally live delay slot.
+		unsigned countdown_guest = 0;
+		unsigned delay_result_guest = 0;
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactSignedCountdownLoop(start_pc, instruction_count,
+				&countdown_guest, &delay_result_guest))
+		{
+			return false;
+		}
+
+		u32 raw_cycles = 0;
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) * cycle_factor;
+		}
+		const u32 block_cycles = ScaleBlockCycles(raw_cycles);
+		if (block_cycles == 0)
+			return false;
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		if (!BeginBlock(false, false, false, linked_entry_offset))
+			return false;
+
+		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
+		const u32 packed_guests = countdown_guest | (delay_result_guest << 8);
+		size_t helper_branches[3]{};
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS,
+				static_cast<u16>(GprOffset(countdown_guest))) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return false;
+		}
+		helper_branches[0] = m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
+		if (helper_branches[0] == static_cast<size_t>(-1) ||
+			!m_code.EmitAddImm8(HOST_TMP2, HOST_TMP0, 1) ||
+			!m_code.EmitMovImm32(HOST_TMP3, block_cycles) ||
+			!m_code.EmitUmull(HOST_TMP1, HOST_TMP4, HOST_TMP2, HOST_TMP3) ||
+			!m_code.EmitCmpImm32(HOST_TMP4, 0))
+		{
+			return false;
+		}
+		helper_branches[1] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (helper_branches[1] == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP1, 0))
+		{
+			return false;
+		}
+		helper_branches[2] = m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
+		if (helper_branches[2] == static_cast<size_t>(-1) ||
+			!m_code.EmitLdrImm12(HOST_TMP4, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS, static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP3, HOST_TMP3, HOST_TMP4) ||
+			!m_code.EmitCmpReg(HOST_TMP3, HOST_TMP1))
+		{
+			return false;
+		}
+		const size_t hot_completion_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::GT);
+		if (hot_completion_branch == static_cast<size_t>(-1))
+			return false;
+
+		const size_t helper_target = m_code.Size();
+		if (!m_code.PatchBranch(helper_branches[0], helper_target, VitaA32::Condition::MI) ||
+			!m_code.PatchBranch(helper_branches[1], helper_target, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(helper_branches[2], helper_target, VitaA32::Condition::MI) ||
+			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaEeExecuteSignedCountdownLoop)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, SIGNED_COUNTDOWN_LOOP_EVENT))
+		{
+			return false;
+		}
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		const size_t helper_complete_branch = m_code.EmitBranchPlaceholder();
+		if (event_branch == static_cast<size_t>(-1) ||
+			helper_complete_branch == static_cast<size_t>(-1))
+		{
+			return false;
+		}
+
+		const size_t hot_completion_target = m_code.Size();
+		if (!m_code.PatchBranch(hot_completion_branch, hot_completion_target,
+				VitaA32::Condition::GT) ||
+			!m_code.EmitMovImm32(HOST_TMP0, UINT32_MAX) ||
+			!EmitStoreCpuRegsU64(GprOffset(countdown_guest), HOST_TMP0, HOST_TMP0, HOST_TMP4) ||
+			!m_code.EmitMovImm8(HOST_TMP2, 2) ||
+			!m_code.EmitMovImm8(HOST_TMP3, 0) ||
+			!EmitStoreCpuRegsU64(GprOffset(delay_result_guest), HOST_TMP2, HOST_TMP3, HOST_TMP4) ||
+			!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP3, HOST_CPU_REGS,
+				static_cast<u16>(CYCLE_OFFSET + sizeof(u32))) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP1, true) ||
+			!m_code.EmitAdcImm8(HOST_TMP3, HOST_TMP3, 0) ||
+			!EmitStoreCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP3, HOST_TMP4) ||
+			!EmitStorePc(fallthrough_pc))
+		{
+			return false;
+		}
+
+		const size_t complete_target = m_code.Size();
+		if (!m_code.PatchBranch(helper_complete_branch, complete_target) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target, VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = fallthrough_pc;
+		direct_links->slots[0].valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSignedCountdownLoopBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompileCacheIxinLoop(u32 start_pc, u32 instruction_count,
 		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -9242,6 +9459,15 @@ namespace VitaEE
 #endif
 		const bool cache_loop_batch_enabled =
 			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack;
+		const bool signed_countdown_loop_batch_enabled =
+			EmuConfig.Speedhacks.WaitLoop && !device_trace_enabled &&
+			!EmuConfig.Gamefixes.GoemonTlbHack;
+		if (signed_countdown_loop_batch_enabled && direct_links &&
+			IsExactSignedCountdownLoop(start_pc, instruction_count))
+		{
+			return CompileSignedCountdownLoop(start_pc, instruction_count, direct_exit, event_exit,
+				scaled_cycles, direct_links, linked_entry_offset);
+		}
 		if (cache_loop_batch_enabled && direct_links &&
 			IsExactCacheIxinLoop(start_pc, instruction_count))
 		{
