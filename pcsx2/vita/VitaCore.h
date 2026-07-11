@@ -79,6 +79,10 @@ struct VitaA32IopProviderStats
 	u64 wait_loop_iop_cycles = 0;
 	u64 wait_loop_dispatches_elided = 0;
 	u64 wait_loop_block_entries_elided = 0;
+#if defined(VITASX2_QEMU_VALIDATION)
+	u64 validation_calls = 0;
+	u64 validation_words = 0;
+#endif
 };
 
 void VitaResetA32IopProviderStats();

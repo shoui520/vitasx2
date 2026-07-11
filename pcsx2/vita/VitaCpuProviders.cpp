@@ -787,6 +787,10 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		if (result.fast_dispatch_hit)
 			s_iop_a32_stats.fast_dispatch_hits++;
 		s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_iop_a32_stats.validation_calls = result.validation_calls;
+		s_iop_a32_stats.validation_words = result.validation_words;
+#endif
 		if (result.wait_loop_fast_forward)
 			continue;
 
@@ -998,6 +1002,7 @@ VitaA32EeProviderStats VitaGetA32EeProviderStats()
 void VitaResetA32IopProviderStats()
 {
 	s_iop_a32_stats = {};
+	s_iop_a32_executor.ResetInstrumentationCounters();
 }
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()

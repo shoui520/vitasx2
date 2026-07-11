@@ -5134,6 +5134,14 @@ namespace VitaIOP
 		ReleaseCodeCache();
 	}
 
+	void BlockExecutor::ResetInstrumentationCounters()
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_validation_calls = 0;
+		m_validation_words = 0;
+#endif
+	}
+
 	u32 BlockExecutor::LookupPageIndex(u32 start_pc)
 	{
 		return start_pc >> 16;
@@ -5586,7 +5594,7 @@ namespace VitaIOP
 		if (block_cycles == 0)
 			return false;
 
-		// RunCachedBlock calls this only after the ordinary cache lookup and source
+		// RunValidatedBlock calls this only after the ordinary cache lookup and source
 		// validation. This is the Cortex-A9 adaptation of PCSX2's generated
 		// s_nBlockFF tail: it removes the generated-block call, self-link, and
 		// return for an otherwise empty wait loop while retaining the exact owner
@@ -5689,9 +5697,17 @@ namespace VitaIOP
 		if (!block.valid)
 			return false;
 
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_validation_calls++;
+#endif
 		bool matches = true;
 		for (u32 i = 0; matches && i < block.instruction_count; i++)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_validation_words++;
+#endif
 			matches = (block.opcodes[i] == iopMemRead32(block.start_pc + i * 4));
+		}
 
 		const bool wait_loop_enabled =
 			EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled();
@@ -6020,13 +6036,18 @@ namespace VitaIOP
 		}
 	}
 
-	bool BlockExecutor::RunCachedBlock(CachedBlock& block, BlockExecutionResult* result)
+	bool BlockExecutor::RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result)
 	{
 		if (!result || !block.valid)
 			return false;
 
-		if (!ValidateCachedBlock(block))
-			return false;
+		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_() trusts the BaseBlock
+		// selected by the dispatcher; x86/iR3000A.cpp::psxRecClearMem() removes
+		// stale translations before they can run. Vita retains one source-word
+		// validation in FindCachedBlock(), FindRecordedBlockByStartPc(), or the
+		// lookup-first path in ExecuteCompiledBlockAtPc() because it cannot rely
+		// on x86 protected-page repair. A newly compiled block is source-proven by
+		// CompileIntoCacheEntry(). Do not reread the complete opcode window here.
 
 		psxRegs.pc = block.start_pc;
 		if (block.wait_loop_shape && block.wait_loop_enabled_at_compile &&
@@ -6043,6 +6064,10 @@ namespace VitaIOP
 			result->code_cache_resets = m_code_cache_resets;
 			result->code_cache_used = m_code_cache_used;
 			result->code_cache_capacity = m_code_cache_capacity;
+#if defined(VITASX2_QEMU_VALIDATION)
+			result->validation_calls = m_validation_calls;
+			result->validation_words = m_validation_words;
+#endif
 			result->wait_loop_fast_forward = true;
 			return true;
 		}
@@ -6064,6 +6089,10 @@ namespace VitaIOP
 		result->code_cache_resets = m_code_cache_resets;
 		result->code_cache_used = m_code_cache_used;
 		result->code_cache_capacity = m_code_cache_capacity;
+#if defined(VITASX2_QEMU_VALIDATION)
+		result->validation_calls = m_validation_calls;
+		result->validation_words = m_validation_words;
+#endif
 		return true;
 	}
 
@@ -6083,7 +6112,7 @@ namespace VitaIOP
 		{
 			result->cache_hit = true;
 			result->lookup_hit = lookup_hit;
-			return RunCachedBlock(*block, result);
+			return RunValidatedBlock(*block, result);
 		}
 
 		block = AllocateCacheEntry();
@@ -6092,7 +6121,7 @@ namespace VitaIOP
 
 		result->cache_hit = false;
 		result->lookup_hit = false;
-		return RunCachedBlock(*block, result);
+		return RunValidatedBlock(*block, result);
 	}
 
 	bool BlockExecutor::ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result)
@@ -6113,7 +6142,7 @@ namespace VitaIOP
 				result->cache_hit = true;
 				result->lookup_hit = true;
 				result->fast_dispatch_hit = true;
-				return RunCachedBlock(*entry, result);
+				return RunValidatedBlock(*entry, result);
 			}
 		}
 
@@ -6121,7 +6150,7 @@ namespace VitaIOP
 		{
 			result->cache_hit = true;
 			result->fast_dispatch_hit = true;
-			return RunCachedBlock(*entry, result);
+			return RunValidatedBlock(*entry, result);
 		}
 
 		BlockScanResult scan;

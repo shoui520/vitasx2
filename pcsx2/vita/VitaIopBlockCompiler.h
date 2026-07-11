@@ -39,6 +39,10 @@ namespace VitaIOP
 		u32 code_cache_resets = 0;
 		size_t code_cache_used = 0;
 		size_t code_cache_capacity = 0;
+#if defined(VITASX2_QEMU_VALIDATION)
+		u64 validation_calls = 0;
+		u64 validation_words = 0;
+#endif
 		bool cache_hit = false;
 		bool lookup_hit = false;
 		bool fast_dispatch_hit = false;
@@ -237,6 +241,7 @@ namespace VitaIOP
 		~BlockExecutor();
 
 		u32 Reset();
+		void ResetInstrumentationCounters();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		void SetDirectLinkingEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
@@ -328,7 +333,7 @@ namespace VitaIOP
 		void RewindCodeCache(size_t slice_offset);
 		u32 ResetForCachePressure();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count);
-		bool RunCachedBlock(CachedBlock& block, BlockExecutionResult* result);
+		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result);
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
 		void PatchIncomingLinks(u32 target_pc, const void* target);
 		void UnlinkIncomingLinks(u32 target_pc);
@@ -343,6 +348,10 @@ namespace VitaIOP
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
+#if defined(VITASX2_QEMU_VALIDATION)
+		u64 m_validation_calls = 0;
+		u64 m_validation_words = 0;
+#endif
 		bool m_direct_linking_enabled = true;
 	};
 } // namespace VitaIOP
