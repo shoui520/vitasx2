@@ -725,6 +725,15 @@ namespace VitaEE
 		m_compatible_vtlb_read_guard_hoist_enabled = enabled;
 	}
 
+	void BlockExecutor::SetSingleBlockGprLinkEnabled(bool enabled)
+	{
+		if (m_single_block_gpr_link_enabled == enabled)
+			return;
+
+		Reset();
+		m_single_block_gpr_link_enabled = enabled;
+	}
+
 	void BlockExecutor::SetThreeBlockGprLinkEnabled(bool enabled)
 	{
 		if (m_three_block_gpr_link_enabled == enabled)
@@ -1001,6 +1010,33 @@ namespace VitaEE
 			(void)candidate;
 #endif
 		};
+
+		// PCSX2 x86/iCore.cpp keeps one allocator mapping across an exact linked
+		// self-edge just as it does across a multi-block chain. Give a one-block
+		// cycle the same signature path so memory translation and scheduler state
+		// can participate instead of falling back to scalar-only self residency.
+		if (taken == start_pc)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (!m_single_block_gpr_link_enabled)
+				return false;
+#endif
+			const u32 chain_pcs[] = {start_pc};
+			const u32 chain_counts[] = {instruction_count};
+			GprLinkSignature candidate_signature;
+			if (BlockCompiler::BuildGprLinkSignature(chain_pcs, chain_counts, 1,
+					&candidate_signature
+#if defined(VITASX2_QEMU_VALIDATION)
+					, m_compatible_vtlb_host_reclaim_enabled &&
+						m_compatible_vtlb_pointer_carry_enabled
+#endif
+					))
+			{
+				apply_validation_options(&candidate_signature);
+				*signature = candidate_signature;
+				return true;
+			}
+		}
 		for (const u32 candidate_pc : candidates)
 		{
 			if (candidate_pc == start_pc || (candidate_pc & 3u) != 0)

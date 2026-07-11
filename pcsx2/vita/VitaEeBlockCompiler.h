@@ -127,6 +127,9 @@ namespace VitaEE
 		u8 guest_result = 0;
 		u8 guest_result2 = 0;
 		u8 stride = 0;
+		// The owning block may contain the access after its entry. access_pc names
+		// the exact guest instruction; access_block_pc names the compatible target.
+		u32 access_block_pc = 0;
 		u32 access_pc = 0;
 		u32 advance_pc = 0;
 		VtlbPointerLinkWidth width = VtlbPointerLinkWidth::Word32;
@@ -141,7 +144,7 @@ namespace VitaEE
 		{
 			return host == rhs.host && guest_address == rhs.guest_address &&
 				guest_result == rhs.guest_result && guest_result2 == rhs.guest_result2 &&
-				stride == rhs.stride &&
+				stride == rhs.stride && access_block_pc == rhs.access_block_pc &&
 				access_pc == rhs.access_pc && advance_pc == rhs.advance_pc &&
 				width == rhs.width && direction == rhs.direction &&
 				representation == rhs.representation && provenance == rhs.provenance;
