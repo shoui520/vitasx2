@@ -4077,6 +4077,94 @@ namespace VitaEE
 				chain_pcs[0], chain_instruction_counts[0]);
 		}
 
+		// PCSX2's x86 allocator keeps the live state of this common two-branch
+		// bounded byte scan across both SetBranchImm() edges:
+		//   A: LBU value,0(address); BEQ value,terminator,exit;
+		//      ADDIU count,count,-1
+		//   B: BNE count,limit,A; ADDIU address,address,1
+		// The first delay always decrements count, while the second always advances
+		// the address. Carry a post-indexed direct pointer plus the highest-frequency
+		// full-width values through A<->B rather than publishing at both boundaries.
+		const auto try_add_byte_count_scan_pointer = [&](u32 access_pc,
+			u32 access_count, u32 advance_pc, u32 advance_count) {
+			if (access_count != 3 || advance_count != 2 ||
+				advance_pc != access_pc + 3 * sizeof(u32))
+			{
+				return false;
+			}
+
+			const u32 load = memRead32(access_pc);
+			const u32 exit_branch = memRead32(access_pc + sizeof(u32));
+			const u32 decrement = memRead32(access_pc + 2 * sizeof(u32));
+			const u32 loop_branch = memRead32(advance_pc);
+			const u32 address_advance = memRead32(advance_pc + sizeof(u32));
+			if ((load >> 26) != 0x24 || IMM_S(load) != 0 ||
+				(exit_branch >> 26) != 0x04 || (decrement >> 26) != 0x09 ||
+				(loop_branch >> 26) != 0x05 ||
+				(address_advance >> 26) != 0x09)
+			{
+				return false;
+			}
+
+			const unsigned address = RS(load);
+			const unsigned value = RT(load);
+			const unsigned terminator = RS(exit_branch) == value ? RT(exit_branch) :
+				(RT(exit_branch) == value ? RS(exit_branch) : 0);
+			const unsigned count = RT(decrement);
+			const unsigned limit = RS(loop_branch) == count ? RT(loop_branch) :
+				(RT(loop_branch) == count ? RS(loop_branch) : 0);
+			const u32 guest_mask = (1u << address) | (1u << value) |
+				(1u << terminator) | (1u << count) | (1u << limit);
+			const u32 exit_target = BranchTarget(access_pc + sizeof(u32), exit_branch);
+			if (address == 0 || value == 0 || terminator == 0 || count == 0 ||
+				limit == 0 || __builtin_popcount(guest_mask) != 5 ||
+				static_cast<u32>(exit_target - access_pc) < 5 * sizeof(u32) ||
+				RS(decrement) != count || IMM_S(decrement) != -1 ||
+				BranchTarget(advance_pc, loop_branch) != access_pc ||
+				RS(address_advance) != address || RT(address_advance) != address ||
+				IMM_S(address_advance) != 1)
+			{
+				return false;
+			}
+
+			VtlbPointerLinkMapping& pointer = signature->vtlb_pointer;
+			pointer.host = GprLinkSignature::VTLB_POINTER_HOST;
+			pointer.guest_address = static_cast<u8>(address);
+			pointer.guest_result = static_cast<u8>(value);
+			pointer.stride = 1;
+			pointer.access_block_pc = access_pc;
+			pointer.access_pc = access_pc;
+			pointer.advance_pc = advance_pc;
+			pointer.width = VtlbPointerLinkWidth::Byte8;
+
+			if (reclaim_vtlb_hosts)
+			{
+				for (GprLinkMapping& mapping : signature->mappings)
+					mapping = {};
+				signature->count = 3;
+				const unsigned guests[] = {address, count, value};
+				constexpr u8 low_hosts[] = {7, 9, 11};
+				constexpr u8 high_hosts[] = {8, 10, 14};
+				for (u8 i = 0; i < signature->count; i++)
+				{
+					GprLinkMapping& mapping = signature->mappings[i];
+					mapping.guest = static_cast<u8>(guests[i]);
+					mapping.low_host = low_hosts[i];
+					mapping.high_host = high_hosts[i];
+					mapping.width = GprLinkWidth::Low64;
+					mapping.dirty = GprLinkDirtyState::WriteBack;
+				}
+			}
+			return true;
+		};
+		if (chain_block_count == 2 && !signature->vtlb_pointer.IsValid() &&
+			!try_add_byte_count_scan_pointer(chain_pcs[0], chain_instruction_counts[0],
+				chain_pcs[1], chain_instruction_counts[1]))
+		{
+			try_add_byte_count_scan_pointer(chain_pcs[1], chain_instruction_counts[1],
+				chain_pcs[0], chain_instruction_counts[0]);
+		}
+
 		const auto try_add_byte_pair_vtlb_pointer = [&](u32 access_pc,
 			u32 access_count, u32 advance_pc, u32 advance_count) {
 			if (access_count != 3 || advance_count < 2)
