@@ -888,11 +888,12 @@ namespace VitaA32
 	}
 
 	bool CodeBuffer::EmitBicRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
-		bool set_flags)
+		bool set_flags, Condition condition)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn) || !IsRegister(rm) || amount > 31)
 			return false;
-		return EmitU32(EncodeBicRegShiftImm(rd, rn, rm, shift, amount, set_flags));
+		return EmitU32(EncodeBicRegShiftImm(rd, rn, rm, shift, amount, set_flags,
+			condition));
 	}
 
 	bool CodeBuffer::EmitBicRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,
@@ -2335,9 +2336,10 @@ namespace VitaA32
 	}
 
 	u32 EncodeBicRegShiftImm(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount,
-		bool set_flags)
+		bool set_flags, Condition condition)
 	{
-		return EncodeDataProcessingRegShiftImm(OPCODE_BIC, rd, rn, rm, shift, amount, set_flags);
+		return EncodeDataProcessingRegShiftImm(OPCODE_BIC, rd, rn, rm, shift, amount,
+			set_flags, condition);
 	}
 
 	u32 EncodeBicRegShiftReg(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, unsigned rs,

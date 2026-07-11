@@ -17,6 +17,26 @@ namespace VitaA32
 
 namespace VitaEE
 {
+	enum class CompatibleVtlbGuardKind : u8
+	{
+		None,
+		Read,
+		Write,
+	};
+
+	struct CompatibleVtlbFastEntryOffsets
+	{
+		size_t read = static_cast<size_t>(-1);
+		size_t write = static_cast<size_t>(-1);
+
+		size_t For(CompatibleVtlbGuardKind kind) const
+		{
+			return kind == CompatibleVtlbGuardKind::Read ? read :
+				kind == CompatibleVtlbGuardKind::Write ? write :
+				static_cast<size_t>(-1);
+		}
+	};
+
 	struct DirectLinkSlot
 	{
 		u32 target_pc = 0;
@@ -28,6 +48,7 @@ namespace VitaEE
 		bool branch_on_taken = false;
 		bool branch_on_unsigned_less = false;
 		bool branch_if_no_event = false;
+		bool secondary_branch_unconditional = false;
 		bool embedded_compatible_continuation = false;
 		bool embedded_continuation_active = false;
 		bool patched_to_resident_entry = false;
@@ -35,6 +56,7 @@ namespace VitaEE
 		bool requires_compatible_entry = false;
 		bool compatible_scheduler_countdown = false;
 		bool compatible_vtlb_pointer = false;
+		bool prevalidated_vtlb_read_pointer = false;
 		bool prevalidated_vtlb_write_pointer = false;
 		u8 compatible_entry_instructions = 0;
 		u8 compatible_entry_loads = 0;
@@ -419,6 +441,10 @@ namespace VitaEE
 		{
 			m_compatible_vtlb_write_guard_hoist_enabled = enabled;
 		}
+		void SetCompatibleVtlbReadGuardHoistEnabled(bool enabled)
+		{
+			m_compatible_vtlb_read_guard_hoist_enabled = enabled;
+		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -444,7 +470,7 @@ namespace VitaEE
 			const GprLinkSignature* gpr_link_signature = nullptr,
 			size_t* compatible_link_entry_offset = nullptr,
 			u8* compatible_link_entry_loads = nullptr,
-			size_t* compatible_vtlb_write_fast_entry_offset = nullptr);
+			CompatibleVtlbFastEntryOffsets* compatible_vtlb_fast_entries = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
@@ -1178,6 +1204,7 @@ namespace VitaEE
 		bool m_fused_direct_event_link_enabled = true;
 		bool m_combined_compatible_taken_event_enabled = true;
 		bool m_compatible_vtlb_write_guard_hoist_enabled = true;
+		bool m_compatible_vtlb_read_guard_hoist_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;
@@ -1201,7 +1228,7 @@ namespace VitaEE
 		size_t m_compatible_predicate_canonical_skip_delay = static_cast<size_t>(-1);
 		size_t m_compatible_predicate_canonical_enter_delay = static_cast<size_t>(-1);
 		size_t m_compatible_link_entry_offset = static_cast<size_t>(-1);
-		size_t m_compatible_vtlb_write_fast_entry_offset = static_cast<size_t>(-1);
+		CompatibleVtlbFastEntryOffsets m_compatible_vtlb_fast_entries{};
 		bool m_reclaimed_vtlb_link_hosts = false;
 		size_t m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);

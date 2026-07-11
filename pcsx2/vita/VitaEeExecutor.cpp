@@ -18,6 +18,7 @@ extern u32 g_qemuEmbeddedCompatibleContinuationActivations;
 extern u32 g_qemuEmbeddedCompatibleContinuationSourceMismatches;
 extern u32 g_qemuEmbeddedCompatibleContinuationIncompatibleTargets;
 extern u32 g_qemuCompatibleVtlbWriteFastEntryActivations;
+extern u32 g_qemuCompatibleVtlbReadFastEntryActivations;
 #endif
 
 namespace
@@ -386,7 +387,7 @@ namespace VitaEE
 		block.resident_self_link_entry_loads = 0;
 		block.gpr_link_signature = GprLinkSignature{};
 		block.compatible_link_entry_offset = static_cast<size_t>(-1);
-		block.compatible_vtlb_write_fast_entry_offset = static_cast<size_t>(-1);
+		block.compatible_vtlb_fast_entries = {};
 		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
 		block.code.Release();
@@ -507,7 +508,7 @@ namespace VitaEE
 			block.resident_self_link_entry_loads = 0;
 			block.gpr_link_signature = GprLinkSignature{};
 			block.compatible_link_entry_offset = static_cast<size_t>(-1);
-			block.compatible_vtlb_write_fast_entry_offset = static_cast<size_t>(-1);
+			block.compatible_vtlb_fast_entries = {};
 			block.compatible_link_entry_loads = 0;
 			block.direct_links = {};
 			RememberFreeCacheEntry(block);
@@ -713,6 +714,15 @@ namespace VitaEE
 
 		Reset();
 		m_compatible_vtlb_write_guard_hoist_enabled = enabled;
+	}
+
+	void BlockExecutor::SetCompatibleVtlbReadGuardHoistEnabled(bool enabled)
+	{
+		if (m_compatible_vtlb_read_guard_hoist_enabled == enabled)
+			return;
+
+		Reset();
+		m_compatible_vtlb_read_guard_hoist_enabled = enabled;
 	}
 
 	void BlockExecutor::SetThreeBlockGprLinkEnabled(bool enabled)
@@ -1359,8 +1369,7 @@ namespace VitaEE
 		AnalyzeGprLinkSignature(start_pc, instruction_count, &compiled_gpr_link_signature);
 		size_t compiled_compatible_link_entry_offset = static_cast<size_t>(-1);
 		u8 compiled_compatible_link_entry_loads = 0;
-		size_t compiled_compatible_vtlb_write_fast_entry_offset =
-			static_cast<size_t>(-1);
+		CompatibleVtlbFastEntryOffsets compiled_compatible_vtlb_fast_entries{};
 		DirectLinkSlots direct_links;
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
@@ -1402,6 +1411,8 @@ namespace VitaEE
 				m_combined_compatible_taken_event_enabled);
 			compiler.SetCompatibleVtlbWriteGuardHoistEnabled(
 				m_compatible_vtlb_write_guard_hoist_enabled);
+			compiler.SetCompatibleVtlbReadGuardHoistEnabled(
+				m_compatible_vtlb_read_guard_hoist_enabled);
 #endif
 			u32 attempt_scaled_cycles = 0;
 			size_t attempt_linked_entry_offset = 0;
@@ -1409,8 +1420,7 @@ namespace VitaEE
 			u8 attempt_resident_self_link_entry_loads = 0;
 			size_t attempt_compatible_link_entry_offset = static_cast<size_t>(-1);
 			u8 attempt_compatible_link_entry_loads = 0;
-			size_t attempt_compatible_vtlb_write_fast_entry_offset =
-				static_cast<size_t>(-1);
+			CompatibleVtlbFastEntryOffsets attempt_compatible_vtlb_fast_entries{};
 			DirectLinkSlots attempt_direct_links;
 			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
 				direct_exit, event_exit, &attempt_scaled_cycles, &attempt_direct_links,
@@ -1418,7 +1428,7 @@ namespace VitaEE
 				m_persistent_dispatch_enabled, &attempt_resident_self_link_entry_offset,
 				&attempt_resident_self_link_entry_loads, &compiled_gpr_link_signature,
 				&attempt_compatible_link_entry_offset, &attempt_compatible_link_entry_loads,
-				&attempt_compatible_vtlb_write_fast_entry_offset);
+				&attempt_compatible_vtlb_fast_entries);
 			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
 			const size_t failure_code_size = block.code.Size();
 			const size_t failure_code_capacity = block.code.Capacity();
@@ -1432,8 +1442,8 @@ namespace VitaEE
 				compiled_resident_self_link_entry_loads = attempt_resident_self_link_entry_loads;
 				compiled_compatible_link_entry_offset = attempt_compatible_link_entry_offset;
 				compiled_compatible_link_entry_loads = attempt_compatible_link_entry_loads;
-				compiled_compatible_vtlb_write_fast_entry_offset =
-					attempt_compatible_vtlb_write_fast_entry_offset;
+				compiled_compatible_vtlb_fast_entries =
+					attempt_compatible_vtlb_fast_entries;
 				direct_links = attempt_direct_links;
 				break;
 			}
@@ -1462,8 +1472,7 @@ namespace VitaEE
 		block.gpr_link_signature = compiled_gpr_link_signature;
 		block.compatible_link_entry_offset = compiled_compatible_link_entry_offset;
 		block.compatible_link_entry_loads = compiled_compatible_link_entry_loads;
-		block.compatible_vtlb_write_fast_entry_offset =
-			compiled_compatible_vtlb_write_fast_entry_offset;
+		block.compatible_vtlb_fast_entries = compiled_compatible_vtlb_fast_entries;
 		block.direct_links = direct_links;
 		block.valid = true;
 		if (!RegisterBlockRecord(block))
@@ -1529,18 +1538,17 @@ namespace VitaEE
 			block.compatible_link_entry_offset;
 	}
 
-	const void* BlockExecutor::CompatibleVtlbWriteFastEntryPoint(
-		const CachedBlock& block) const
+	const void* BlockExecutor::CompatibleVtlbFastEntryPoint(
+		const CachedBlock& block, CompatibleVtlbGuardKind kind) const
 	{
-		if (!block.code.EntryPoint() ||
-			block.compatible_vtlb_write_fast_entry_offset == static_cast<size_t>(-1) ||
-			block.compatible_vtlb_write_fast_entry_offset >= block.code.Size())
+		const size_t offset = block.compatible_vtlb_fast_entries.For(kind);
+		if (!block.code.EntryPoint() || offset == static_cast<size_t>(-1) ||
+			offset >= block.code.Size())
 		{
 			return CompatibleLinkEntryPoint(block);
 		}
 
-		return static_cast<const u8*>(block.code.EntryPoint()) +
-			block.compatible_vtlb_write_fast_entry_offset;
+		return static_cast<const u8*>(block.code.EntryPoint()) + offset;
 	}
 
 	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target)
@@ -1573,14 +1581,26 @@ namespace VitaEE
 			memRead32(link.target_pc + sizeof(u32)) == link.embedded_source_opcodes[1];
 		const bool use_embedded_continuation =
 			use_compatible_entry && embedded_source_matches;
-		const bool use_prevalidated_vtlb_write_entry = use_compatible_entry &&
-			link.prevalidated_vtlb_write_pointer &&
-			target->compatible_vtlb_write_fast_entry_offset !=
-				static_cast<size_t>(-1) &&
-			target->compatible_vtlb_write_fast_entry_offset < target->code.Size();
+		const CompatibleVtlbGuardKind prevalidated_vtlb_guard =
+			(link.prevalidated_vtlb_read_pointer !=
+				link.prevalidated_vtlb_write_pointer) ?
+				(link.prevalidated_vtlb_read_pointer ? CompatibleVtlbGuardKind::Read :
+					CompatibleVtlbGuardKind::Write) :
+				CompatibleVtlbGuardKind::None;
+		const size_t prevalidated_vtlb_entry_offset = target ?
+			target->compatible_vtlb_fast_entries.For(prevalidated_vtlb_guard) :
+			static_cast<size_t>(-1);
+		const bool use_prevalidated_vtlb_entry = use_compatible_entry &&
+			prevalidated_vtlb_guard != CompatibleVtlbGuardKind::None &&
+			prevalidated_vtlb_entry_offset != static_cast<size_t>(-1) &&
+			prevalidated_vtlb_entry_offset < target->code.Size();
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuCompatibleVtlbWriteFastEntryActivations +=
-			use_prevalidated_vtlb_write_entry ? 1u : 0u;
+			(use_prevalidated_vtlb_entry &&
+				prevalidated_vtlb_guard == CompatibleVtlbGuardKind::Write) ? 1u : 0u;
+		g_qemuCompatibleVtlbReadFastEntryActivations +=
+			(use_prevalidated_vtlb_entry &&
+				prevalidated_vtlb_guard == CompatibleVtlbGuardKind::Read) ? 1u : 0u;
 #endif
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (link.embedded_compatible_continuation && target)
@@ -1597,8 +1617,8 @@ namespace VitaEE
 				 !use_resident_entry && !use_compatible_entry) ||
 			(link.embedded_compatible_continuation && !use_embedded_continuation);
 		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) :
-			(use_prevalidated_vtlb_write_entry ?
-				CompatibleVtlbWriteFastEntryPoint(*target) :
+			(use_prevalidated_vtlb_entry ?
+				CompatibleVtlbFastEntryPoint(*target, prevalidated_vtlb_guard) :
 			 (use_compatible_entry ? CompatibleLinkEntryPoint(*target) :
 				(!use_generated_fallback ? LinkedEntryPoint(*target) : direct_exit)));
 		const VitaA32::Condition condition = link.branch_if_no_event ?
@@ -1619,15 +1639,16 @@ namespace VitaEE
 			block.code.PatchBranchToAddress(link.secondary_target_offset,
 				use_compatible_entry ? CompatibleLinkEntryPoint(*target) :
 					static_cast<const u8*>(block.code.EntryPoint()) + link.fallback_offset,
-				VitaA32::Condition::NE);
+				link.secondary_branch_unconditional ? VitaA32::Condition::AL :
+					VitaA32::Condition::NE);
 		if (!patched || !secondary_patched || !block.code.Flush())
 			return false;
 
 		link.patched_to_resident_entry = !use_generated_fallback && use_resident_entry;
 		link.patched_to_compatible_entry = !use_generated_fallback && use_compatible_entry;
 		link.embedded_continuation_active = use_embedded_continuation;
-		const size_t selected_compatible_entry_offset = use_prevalidated_vtlb_write_entry ?
-			target->compatible_vtlb_write_fast_entry_offset :
+		const size_t selected_compatible_entry_offset = use_prevalidated_vtlb_entry ?
+			prevalidated_vtlb_entry_offset :
 			target ? target->compatible_link_entry_offset : 0;
 		link.compatible_entry_instructions = use_compatible_entry ? static_cast<u8>(
 			(selected_compatible_entry_offset - target->linked_entry_offset) /

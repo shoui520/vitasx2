@@ -158,6 +158,10 @@ u32 g_qemuCompatibleVtlbWriteGuardHoists = 0;
 u32 g_qemuCompatibleVtlbWriteGuardHoistHotInstructionsElided = 0;
 u32 g_qemuCompatibleVtlbWriteGuardHoistSlowInstructions = 0;
 u32 g_qemuCompatibleVtlbWriteFastEntryActivations = 0;
+u32 g_qemuCompatibleVtlbReadGuardHoists = 0;
+u32 g_qemuCompatibleVtlbReadGuardHoistHotInstructionsElided = 0;
+u32 g_qemuCompatibleVtlbReadGuardHoistSlowInstructions = 0;
+u32 g_qemuCompatibleVtlbReadFastEntryActivations = 0;
 u32 g_qemuResidentCycleLowBlocks = 0;
 u32 g_qemuResidentCycleLowHotInstructionsElided = 0;
 u32 g_qemuResidentCycleLowSyncInstructions = 0;
@@ -7382,11 +7386,13 @@ namespace VitaEE
 			return false;
 		const size_t translation_end = m_code.Size();
 		const size_t body_start = m_code.Size();
-		// A compatible incoming edge may prove the write pointer non-canonical
-		// before linking here. Keep the ordinary guarded entry intact for first-use,
-		// page-transition, handler, invalidation, and incompatible edges.
+		// A compatible incoming edge may prove this pointer non-canonical before
+		// linking here. Keep the ordinary guarded entry intact for first-use, page
+		// transition, handler, invalidation, and incompatible edges.
 		if (write_pointer)
-			m_compatible_vtlb_write_fast_entry_offset = body_start;
+			m_compatible_vtlb_fast_entries.write = body_start;
+		else
+			m_compatible_vtlb_fast_entries.read = body_start;
 		if (!m_code.PatchBranch(same_page, body_start, VitaA32::Condition::NE))
 			return false;
 
@@ -8278,7 +8284,7 @@ namespace VitaEE
 		size_t* resident_self_link_entry_offset, u8* resident_self_link_entry_loads,
 		const GprLinkSignature* gpr_link_signature,
 		size_t* compatible_link_entry_offset, u8* compatible_link_entry_loads,
-		size_t* compatible_vtlb_write_fast_entry_offset)
+		CompatibleVtlbFastEntryOffsets* compatible_vtlb_fast_entries)
 	{
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return false;
@@ -8293,8 +8299,8 @@ namespace VitaEE
 			*compatible_link_entry_offset = static_cast<size_t>(-1);
 		if (compatible_link_entry_loads)
 			*compatible_link_entry_loads = 0;
-		if (compatible_vtlb_write_fast_entry_offset)
-			*compatible_vtlb_write_fast_entry_offset = static_cast<size_t>(-1);
+		if (compatible_vtlb_fast_entries)
+			*compatible_vtlb_fast_entries = {};
 
 		const u32 previous_block_start_pc = m_current_block_start_pc;
 		const u32 previous_block_instruction_count = m_current_block_instruction_count;
@@ -8425,7 +8431,7 @@ namespace VitaEE
 		m_compatible_predicate_canonical_skip_delay = static_cast<size_t>(-1);
 		m_compatible_predicate_canonical_enter_delay = static_cast<size_t>(-1);
 		m_compatible_link_entry_offset = static_cast<size_t>(-1);
-		m_compatible_vtlb_write_fast_entry_offset = static_cast<size_t>(-1);
+		m_compatible_vtlb_fast_entries = {};
 		m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_byte_pair_tail_index = static_cast<size_t>(-1);
@@ -8530,10 +8536,9 @@ namespace VitaEE
 		}
 		if (!EmitStageCompatibleVtlbPointer())
 			return false;
-		if (compatible_vtlb_write_fast_entry_offset)
+		if (compatible_vtlb_fast_entries)
 		{
-			*compatible_vtlb_write_fast_entry_offset =
-				m_compatible_vtlb_write_fast_entry_offset;
+			*compatible_vtlb_fast_entries = m_compatible_vtlb_fast_entries;
 		}
 		u8 resident_entry_loads = gpr_pin_entry_loads;
 		if (m_forwarded_boolean_branch)
@@ -10138,14 +10143,37 @@ namespace VitaEE
 		combine_compatible_taken_event &=
 			m_combined_compatible_taken_event_enabled;
 #endif
-		bool prevalidate_compatible_vtlb_write =
+		const bool prevalidate_compatible_vtlb_read =
+			combine_compatible_taken_event &&
+			m_gpr_link_signature.HasVtlbPointer() &&
+			m_gpr_link_signature.vtlb_pointer.access_pc == taken_pc;
+		const bool prevalidate_compatible_vtlb_write =
 			combine_compatible_taken_event &&
 			m_gpr_link_signature.HasVtlbWritePointer() &&
 			m_gpr_link_signature.vtlb_write_pointer.access_pc == taken_pc;
+		// One flag-setting pointer test can guard one post-guard entry. If analysis
+		// ever assigns both independent mappings to the same target, retain both
+		// ordinary target guards until a joint-validity representation exists.
+		CompatibleVtlbGuardKind prevalidated_vtlb_guard =
+			(prevalidate_compatible_vtlb_read != prevalidate_compatible_vtlb_write) ?
+				(prevalidate_compatible_vtlb_read ? CompatibleVtlbGuardKind::Read :
+					CompatibleVtlbGuardKind::Write) :
+				CompatibleVtlbGuardKind::None;
 #if defined(VITASX2_QEMU_VALIDATION)
-		prevalidate_compatible_vtlb_write &=
-			m_compatible_vtlb_write_guard_hoist_enabled;
+		if ((prevalidated_vtlb_guard == CompatibleVtlbGuardKind::Read &&
+				!m_compatible_vtlb_read_guard_hoist_enabled) ||
+			(prevalidated_vtlb_guard == CompatibleVtlbGuardKind::Write &&
+				!m_compatible_vtlb_write_guard_hoist_enabled))
+		{
+			prevalidated_vtlb_guard = CompatibleVtlbGuardKind::None;
+		}
 #endif
+		const bool prevalidate_compatible_vtlb =
+			prevalidated_vtlb_guard != CompatibleVtlbGuardKind::None;
+		const unsigned prevalidated_vtlb_host =
+			prevalidated_vtlb_guard == CompatibleVtlbGuardKind::Write ?
+				GprLinkSignature::VTLB_WRITE_POINTER_HOST :
+				GprLinkSignature::VTLB_POINTER_HOST;
 		size_t combined_taken_tail = static_cast<size_t>(-1);
 		size_t prevalidated_slow_taken = static_cast<size_t>(-1);
 		size_t event_branch = static_cast<size_t>(-1);
@@ -10156,13 +10184,13 @@ namespace VitaEE
 			// predicate/deadline AND on it. The common valid/taken/no-event route is
 			// MOVS + ANDSNE + BNE and enters the target after its redundant MOVS/BNE
 			// guard: one dynamic A32 instruction less than selecting and guarding there.
-			if ((prevalidate_compatible_vtlb_write &&
+			if ((prevalidate_compatible_vtlb &&
 					!m_code.EmitMovRegShiftImm(HOST_TMP1,
-						GprLinkSignature::VTLB_WRITE_POINTER_HOST,
+						prevalidated_vtlb_host,
 						VitaA32::ShiftType::LSL, 20, true)) ||
 				!m_code.EmitAndRegShiftImm(HOST_TMP1, m_branch_flag_host,
 					GprLinkSignature::SCHEDULER_HOST, VitaA32::ShiftType::LSR, 31,
-					true, prevalidate_compatible_vtlb_write ?
+					true, prevalidate_compatible_vtlb ?
 						VitaA32::Condition::NE : VitaA32::Condition::AL))
 			{
 				return false;
@@ -10180,11 +10208,17 @@ namespace VitaEE
 			g_qemuCombinedCompatibleTakenEventBlocks++;
 			g_qemuCombinedCompatibleTakenEventHotInstructionsElided++;
 			g_qemuCombinedCompatibleTakenEventColdInstructions += 3;
-			if (prevalidate_compatible_vtlb_write)
+			if (prevalidated_vtlb_guard == CompatibleVtlbGuardKind::Write)
 			{
 				g_qemuCompatibleVtlbWriteGuardHoists++;
 				g_qemuCompatibleVtlbWriteGuardHoistHotInstructionsElided++;
 				g_qemuCompatibleVtlbWriteGuardHoistSlowInstructions += 3;
+			}
+			else if (prevalidated_vtlb_guard == CompatibleVtlbGuardKind::Read)
+			{
+				g_qemuCompatibleVtlbReadGuardHoists++;
+				g_qemuCompatibleVtlbReadGuardHoistHotInstructionsElided++;
+				g_qemuCompatibleVtlbReadGuardHoistSlowInstructions += 3;
 			}
 #endif
 		}
@@ -10222,7 +10256,7 @@ namespace VitaEE
 				combined_taken_tail : m_code.EmitBranchPlaceholder(taken_condition);
 			if (taken_tail == static_cast<size_t>(-1))
 				return false;
-			if (prevalidate_compatible_vtlb_write)
+			if (prevalidate_compatible_vtlb)
 			{
 				if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
 					return false;
@@ -10262,12 +10296,15 @@ namespace VitaEE
 			{
 				taken_tail_ok = EmitTakenDirectLinkTail(direct_exit, taken_tail, taken_link,
 					defer_pc_writeback, taken_pc, carry_dirty_link);
-				if (taken_tail_ok && prevalidate_compatible_vtlb_write)
+				if (taken_tail_ok && prevalidate_compatible_vtlb)
 				{
 					// BaseBlocks::Link() keeps both sites reversible: the combined hot
 					// selector targets the post-guard entry, while invalid pointers use
 					// this second site to enter the ordinary translation/handler guard.
-					taken_link->prevalidated_vtlb_write_pointer = true;
+					taken_link->prevalidated_vtlb_read_pointer =
+						prevalidated_vtlb_guard == CompatibleVtlbGuardKind::Read;
+					taken_link->prevalidated_vtlb_write_pointer =
+						prevalidated_vtlb_guard == CompatibleVtlbGuardKind::Write;
 					taken_link->secondary_target_offset = prevalidated_slow_taken;
 					taken_tail_ok = m_code.PatchBranch(
 						prevalidated_slow_taken, taken_link->fallback_offset,
@@ -10642,9 +10679,53 @@ namespace VitaEE
 			return false;
 		}
 
+		bool prevalidate_compatible_vtlb_read =
+			m_compatible_scheduler_countdown && carry_dirty_not_taken_link &&
+			m_gpr_link_signature.HasVtlbPointer() &&
+			m_gpr_link_signature.vtlb_pointer.access_pc == not_taken_pc &&
+			(!m_gpr_link_signature.HasVtlbWritePointer() ||
+			 m_gpr_link_signature.vtlb_write_pointer.access_pc != not_taken_pc) &&
+			m_branch_flag_host != HOST_TMP1 &&
+			m_gpr_link_signature.ContainsPc(not_taken_pc);
+#if defined(VITASX2_QEMU_VALIDATION)
+		prevalidate_compatible_vtlb_read &=
+			m_compatible_vtlb_read_guard_hoist_enabled;
+#endif
+		size_t prevalidated_not_taken = static_cast<size_t>(-1);
+
 		// Match the normal cycle-test layout: direct dispatch is the common
 		// fallthrough, while cycle >= nextEventCycle takes the event branch.
-		const size_t event_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		// For the compatible branch-likely not-taken edge, BICS preserves r6's
+		// negative no-event sign only when the normalized guest predicate is zero.
+		// Predicating it on the r12 page-validity MOVS makes one BMI select all three
+		// hot conditions and enter the target after its redundant read guard.
+		if (prevalidate_compatible_vtlb_read &&
+			(!m_code.EmitMovRegShiftImm(HOST_TMP1,
+				GprLinkSignature::VTLB_POINTER_HOST,
+				VitaA32::ShiftType::LSL, 20, true) ||
+			 !m_code.EmitBicRegShiftImm(HOST_TMP1,
+				GprLinkSignature::SCHEDULER_HOST, m_branch_flag_host,
+				VitaA32::ShiftType::LSL, 31, true, VitaA32::Condition::NE)))
+		{
+			return false;
+		}
+		if (prevalidate_compatible_vtlb_read)
+		{
+			prevalidated_not_taken =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
+			if (prevalidated_not_taken == static_cast<size_t>(-1) ||
+				!m_code.EmitCmpImm32(GprLinkSignature::SCHEDULER_HOST, 0))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCompatibleVtlbReadGuardHoists++;
+			g_qemuCompatibleVtlbReadGuardHoistHotInstructionsElided += 3;
+			g_qemuCompatibleVtlbReadGuardHoistSlowInstructions += 4;
+#endif
+		}
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
 		if (event_branch == static_cast<size_t>(-1))
 			return false;
 		if (not_taken_link || taken_link || wait_loop_taken)
@@ -10661,6 +10742,23 @@ namespace VitaEE
 				!EmitDirectLinkTail(direct_exit, not_taken_link,
 					defer_pc_writeback, not_taken_pc, carry_dirty_not_taken_link))
 				return false;
+			if (prevalidate_compatible_vtlb_read)
+			{
+				// BaseBlocks::Link() owns both reversible sites. The original direct
+				// tail becomes the cold ordinary-entry site; the earlier BMI becomes
+				// the primary post-read-guard site used by the warm not-taken edge.
+				not_taken_link->secondary_target_offset =
+					not_taken_link->target_offset;
+				not_taken_link->secondary_branch_unconditional = true;
+				not_taken_link->target_offset = prevalidated_not_taken;
+				not_taken_link->branch_if_no_event = true;
+				not_taken_link->prevalidated_vtlb_read_pointer = true;
+				if (!m_code.PatchBranch(prevalidated_not_taken,
+						not_taken_link->fallback_offset, VitaA32::Condition::MI))
+				{
+					return false;
+				}
+			}
 
 			// PCSX2 owner: iBranchTest()'s WaitLoop form applies only to the
 			// taken (loop head, s_branchTo) tail of likely loop branches.
