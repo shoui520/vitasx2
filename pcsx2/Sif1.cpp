@@ -71,7 +71,7 @@ static __fi bool WriteFifoToIOP()
 	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 1, Pcsx2Trace::SifTraceDirectionFifoToIop,
 		destination, static_cast<u32>(readSize), sif1ch.madr, iop_madr, sif1ch.qwc, sif1.iop.counter,
 		fifo_before, sif1.fifo.size, HW_DMA10_CHCR, sif1data, sif1ch.tadr);
-	psxCpu->Clear(hw_dma10.madr, readSize);
+	iopMemNotifyWrite(hw_dma10.madr, static_cast<u32>(readSize) * sizeof(u32));
 	hw_dma10.madr += readSize << 2;
 	sif1.iop.cycles += readSize >> 2;		// fixme: should be >> 4
 	sif1.iop.counter -= readSize;

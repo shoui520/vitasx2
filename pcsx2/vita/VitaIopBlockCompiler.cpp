@@ -47,6 +47,7 @@ u32 g_qemuIopConstDivideOperandFastPaths = 0;
 u32 g_qemuIopConstRegisterJumpFastPaths = 0;
 u32 g_qemuIopConstCop0WriteFastPaths = 0;
 u32 g_qemuIopConstCop2WriteFastPaths = 0;
+static bool s_qemuIopTrustedSourceAuditEnabled = true;
 #endif
 
 namespace
@@ -5143,6 +5144,20 @@ namespace VitaIOP
 		m_raw_validation_words = 0;
 		m_translated_validation_words = 0;
 		m_wait_loop_configuration_checks = 0;
+		m_trusted_source_hits = 0;
+		m_trusted_source_audit_words = 0;
+		m_trusted_source_audit_failures = 0;
+		m_ram_invalidation_calls = 0;
+		m_ram_invalidation_record_visits = 0;
+#endif
+	}
+
+	void BlockExecutor::SetTrustedSourceAuditEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopTrustedSourceAuditEnabled = enabled;
+#else
+		(void)enabled;
 #endif
 	}
 
@@ -5156,7 +5171,8 @@ namespace VitaIOP
 		return (start_pc & 0xffffu) >> 2;
 	}
 
-	const u32* BlockExecutor::ResolveRawOpcodeSpan(u32 start_pc, u32 instruction_count)
+	const u32* BlockExecutor::ResolveRawOpcodeSpan(
+		u32 start_pc, u32 instruction_count, u32* ram_source_start)
 	{
 		// PCSX2 owner: x86/BaseblockEx.h::recLUT_SetPage() and
 		// x86/iR3000A.cpp::recResetIOP()/psxhwLUT map the
@@ -5164,6 +5180,8 @@ namespace VitaIOP
 		// source span just as VitaEeExecutor.cpp::ValidateCachedBlock() does for
 		// page-bounded EE code, while retaining iopMemRead32() for handler-backed
 		// or 64 KiB-crossing windows whose reads are not one raw contiguous span.
+		if (ram_source_start)
+			*ram_source_start = INVALID_RAM_SOURCE;
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return nullptr;
 
@@ -5179,6 +5197,8 @@ namespace VitaIOP
 			(page >= 0x1e00u && page < 0x1e48u);
 		if (!direct_ram && !direct_rom)
 			return nullptr;
+		if (direct_ram && ram_source_start)
+			*ram_source_start = physical_pc & (Ps2MemSize::ExposedIopRam - 1);
 
 		const uptr page_base = psxMemRLUT[page];
 		return page_base ? reinterpret_cast<const u32*>(page_base + (physical_pc & 0xffffu)) : nullptr;
@@ -5240,6 +5260,82 @@ namespace VitaIOP
 
 		delete[] m_lookup_pages;
 		m_lookup_pages = nullptr;
+	}
+
+	void BlockExecutor::RegisterRamSource(CachedBlock& block)
+	{
+		if (!block.valid || block.ram_source_start == INVALID_RAM_SOURCE)
+			return;
+
+		block.source_serial = m_next_source_serial++;
+		if (m_next_source_serial == 0)
+			m_next_source_serial = 1;
+
+		const u32 source_end =
+			block.ram_source_start + block.instruction_count * sizeof(u32);
+		for (u32 page_index = block.ram_source_start >> RAM_SOURCE_PAGE_SHIFT;
+			page_index <= ((source_end - 1) >> RAM_SOURCE_PAGE_SHIFT); page_index++)
+		{
+			m_ram_source_pages[page_index].push_back({&block, block.source_serial});
+		}
+	}
+
+	u32 BlockExecutor::InvalidateRamSourceRange(u32 start, u32 size)
+	{
+		if (size == 0 || start >= Ps2MemSize::ExposedIopRam ||
+			size > Ps2MemSize::ExposedIopRam - start)
+		{
+			return 0;
+		}
+
+		const u32 end = start + size;
+		u32 invalidated = 0;
+		for (u32 page_index = start >> RAM_SOURCE_PAGE_SHIFT;
+			page_index <= ((end - 1) >> RAM_SOURCE_PAGE_SHIFT); page_index++)
+		{
+			std::vector<RamSourceRecord>& records = m_ram_source_pages[page_index];
+			u32 write_index = 0;
+			for (u32 read_index = 0; read_index < records.size(); read_index++)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				m_ram_invalidation_record_visits++;
+#endif
+				const RamSourceRecord record = records[read_index];
+				CachedBlock* block = record.block;
+				if (!block || !block->valid || block->source_serial != record.serial ||
+					block->ram_source_start == INVALID_RAM_SOURCE)
+				{
+					continue;
+				}
+
+				const u32 block_end =
+					block->ram_source_start + block->instruction_count * sizeof(u32);
+				if ((block->ram_source_start >> RAM_SOURCE_PAGE_SHIFT) > page_index ||
+					((block_end - 1) >> RAM_SOURCE_PAGE_SHIFT) < page_index)
+				{
+					continue;
+				}
+				if (start < block_end && block->ram_source_start < end)
+				{
+					InvalidateCachedBlock(*block);
+					invalidated++;
+					continue;
+				}
+
+				if (write_index != read_index)
+					records[write_index] = record;
+				write_index++;
+			}
+			records.resize(write_index);
+		}
+		return invalidated;
+	}
+
+	void BlockExecutor::ClearRamSourcePages()
+	{
+		for (std::vector<RamSourceRecord>& page : m_ram_source_pages)
+			page.clear();
+		m_next_source_serial = 1;
 	}
 
 	s32 BlockExecutor::LastBlockRecordIndex(u32 pc) const
@@ -5473,6 +5569,7 @@ namespace VitaIOP
 
 		ClearBlockRecords();
 		ClearIncomingLinks();
+		ClearRamSourcePages();
 		ReleaseLookupPages();
 		const u32 previous_resets = m_code_cache_resets;
 		ReleaseCodeCache();
@@ -5491,6 +5588,7 @@ namespace VitaIOP
 		UnregisterBlockRecord(block);
 		block.valid = false;
 		block.raw_opcodes = nullptr;
+		block.ram_source_start = INVALID_RAM_SOURCE;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -5500,6 +5598,27 @@ namespace VitaIOP
 	{
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return 0;
+
+		const u32 physical_start = start_pc & 0x1fffffffu;
+		const u32 byte_count = instruction_count * sizeof(u32);
+		if (physical_start < Ps2MemSize::TotalIopRam &&
+			byte_count <= Ps2MemSize::TotalIopRam - physical_start)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_ram_invalidation_calls++;
+#endif
+			u32 backing_start = physical_start & (Ps2MemSize::ExposedIopRam - 1);
+			u32 remaining = byte_count;
+			u32 invalidated = 0;
+			while (remaining != 0)
+			{
+				const u32 chunk = std::min(remaining, Ps2MemSize::ExposedIopRam - backing_start);
+				invalidated += InvalidateRamSourceRange(backing_start, chunk);
+				remaining -= chunk;
+				backing_start = 0;
+			}
+			return invalidated;
+		}
 
 		const u32 end_pc = start_pc + instruction_count * 4;
 		u32 invalidated = 0;
@@ -5751,16 +5870,22 @@ namespace VitaIOP
 		if (block.raw_opcodes) [[likely]]
 		{
 #if defined(VITASX2_QEMU_VALIDATION)
+			m_trusted_source_hits++;
+			if (!s_qemuIopTrustedSourceAuditEnabled)
+				return true;
 			m_raw_validation_calls++;
-#endif
 			for (u32 i = 0; matches && i < block.instruction_count; i++)
 			{
-#if defined(VITASX2_QEMU_VALIDATION)
 				m_validation_words++;
 				m_raw_validation_words++;
-#endif
+				m_trusted_source_audit_words++;
 				matches = (block.opcodes[i] == block.raw_opcodes[i]);
 			}
+			if (!matches)
+				m_trusted_source_audit_failures++;
+#else
+			return true;
+#endif
 		}
 		else
 		{
@@ -5778,8 +5903,9 @@ namespace VitaIOP
 			return true;
 
 		// PCSX2 owner: x86/iR3000A.cpp::psxRecClearMem() invalidates changed
-		// translated ranges. Vita also validates the dispatcher entry block
-		// because it cannot rely on x86 protected-page repair.
+		// translated ranges. Raw RAM sources normally return above under the
+		// explicit Vita invalidation contract; this mismatch path remains for the
+		// QEMU trust audit and handler-backed/cross-page fallback sources.
 		InvalidateCachedBlock(block);
 		return false;
 	}
@@ -5999,7 +6125,8 @@ namespace VitaIOP
 
 		block.start_pc = start_pc;
 		block.instruction_count = instruction_count;
-		block.raw_opcodes = ResolveRawOpcodeSpan(start_pc, instruction_count);
+		block.raw_opcodes = ResolveRawOpcodeSpan(
+			start_pc, instruction_count, &block.ram_source_start);
 		block.native_instruction_count = native_instruction_count;
 		block.helper_instruction_count = helper_instruction_count;
 		block.direct_links = direct_links;
@@ -6013,6 +6140,7 @@ namespace VitaIOP
 			return false;
 		}
 		RegisterBlockLookup(block);
+		RegisterRamSource(block);
 		RegisterIncomingLinks(block);
 
 		if (m_direct_linking_enabled)
@@ -6134,6 +6262,11 @@ namespace VitaIOP
 			result->raw_validation_words = m_raw_validation_words;
 			result->translated_validation_words = m_translated_validation_words;
 			result->wait_loop_configuration_checks = m_wait_loop_configuration_checks;
+			result->trusted_source_hits = m_trusted_source_hits;
+			result->trusted_source_audit_words = m_trusted_source_audit_words;
+			result->trusted_source_audit_failures = m_trusted_source_audit_failures;
+			result->ram_invalidation_calls = m_ram_invalidation_calls;
+			result->ram_invalidation_record_visits = m_ram_invalidation_record_visits;
 #endif
 			result->wait_loop_fast_forward = true;
 			return true;
@@ -6163,6 +6296,11 @@ namespace VitaIOP
 		result->raw_validation_words = m_raw_validation_words;
 		result->translated_validation_words = m_translated_validation_words;
 		result->wait_loop_configuration_checks = m_wait_loop_configuration_checks;
+		result->trusted_source_hits = m_trusted_source_hits;
+		result->trusted_source_audit_words = m_trusted_source_audit_words;
+		result->trusted_source_audit_failures = m_trusted_source_audit_failures;
+		result->ram_invalidation_calls = m_ram_invalidation_calls;
+		result->ram_invalidation_record_visits = m_ram_invalidation_record_visits;
 #endif
 		return true;
 	}

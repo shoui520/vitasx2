@@ -13,6 +13,11 @@ IopVM_MemoryAllocMess* iopMem = nullptr;
 
 alignas(__pagealignsize) u8 iopHw[Ps2MemSize::IopHardware];
 
+#if defined(VITASX2_QEMU_VALIDATION)
+u64 g_qemuIopWriteNotifications = 0;
+u64 g_qemuIopWriteNotificationBytes = 0;
+#endif
+
 void iopMemAlloc()
 {
 	Ps2MemoryMap::AllocateIopMemoryLookupTables();
@@ -227,7 +232,7 @@ void iopMemWrite8(u32 mem, u8 value)
 		if (p != NULL && !(psxRegs.CP0.n.Status & 0x10000) )
 		{
 			*(u8  *)(p + (mem & 0xffff)) = value;
-			psxCpu->Clear(mem&~3, 1);
+			psxCpu->Clear(mem & ~3u, 1);
 		}
 		else
 		{
@@ -270,7 +275,7 @@ void iopMemWrite16(u32 mem, u16 value)
 		{
 			if( t==0x1D00 ) Console.WriteLn("sw16 [0x%08X]=0x%08X", mem, value);
 			*(u16 *)(p + (mem & 0xffff)) = value;
-			psxCpu->Clear(mem&~3, 1);
+			psxCpu->Clear(mem & ~3u, 1);
 		}
 		else
 		{
@@ -343,7 +348,7 @@ void iopMemWrite32(u32 mem, u32 value)
 		if( p != NULL && !(psxRegs.CP0.n.Status & 0x10000) )
 		{
 			*(u32 *)(p + (mem & 0xffff)) = value;
-			psxCpu->Clear(mem&~3, 1);
+			psxCpu->Clear(mem & ~3u, 1);
 		}
 		else
 		{
@@ -407,6 +412,22 @@ void iopMemWrite32(u32 mem, u32 value)
 	}
 }
 
+void iopMemNotifyWrite(u32 mem, u32 size)
+{
+	if (size == 0 || !psxCpu || !psxCpu->Clear)
+		return;
+
+	mem &= 0x1fffffffu;
+	const u32 aligned_start = mem & ~3u;
+	const u64 byte_span = static_cast<u64>(mem & 3u) + size;
+	const u32 word_count = static_cast<u32>((byte_span + 3u) / 4u);
+	psxCpu->Clear(aligned_start, word_count);
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuIopWriteNotifications++;
+	g_qemuIopWriteNotificationBytes += size;
+#endif
+}
+
 int iopMemSafeCmpBytes(u32 mem, const void* src, u32 size)
 {
 	// can memcpy so long as pages aren't crossed
@@ -463,6 +484,7 @@ bool iopMemSafeWriteBytes(u32 mem, const void* src, u32 size)
 
 		const u32 remaining_in_page = std::min(0x1000 - (mem & 0xfff), static_cast<u32>(sptr_end - sptr));
 		std::memcpy(dst, sptr, remaining_in_page);
+		iopMemNotifyWrite(mem, remaining_in_page);
 		sptr += remaining_in_page;
 		mem += remaining_in_page;
 	}

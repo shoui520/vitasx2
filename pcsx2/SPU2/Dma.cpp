@@ -7,6 +7,7 @@
 #include "SPU2/spu2.h"
 #include "R3000A.h"
 #include "IopHw.h"
+#include "IopMem.h"
 #include "Config.h"
 
 #if defined(ARCH_ARM32)
@@ -606,7 +607,10 @@ void V_Core::FinishDMAread()
 	}
 
 	const u32 buff1size = (buff1end - ActiveTSA);
+	u16* const first_destination = DMARPtr;
 	Spu2DmaCopyBytes(DMARPtr, GetMemPtr(ActiveTSA), buff1size * 2);
+	iopMemNotifyWrite(static_cast<u32>(reinterpret_cast<u8*>(first_destination) - iopMem->Main),
+		buff1size * sizeof(u16));
 	// Note on TSA's position after our copy finishes:
 	// IRQA should be measured by the end of the writepos+0x20.  But the TDA
 	// should be written back at the precise endpoint of the xfer.
@@ -623,7 +627,10 @@ void V_Core::FinishDMAread()
 
 		// second branch needs cleared:
 		// It starts at the beginning of memory and moves forward to buff2end
-		Spu2DmaCopyBytes(DMARPtr, GetMemPtr(0), buff2end * 2);
+		u16* const second_destination = DMARPtr;
+		Spu2DmaCopyBytes(second_destination, GetMemPtr(0), buff2end * 2);
+		iopMemNotifyWrite(static_cast<u32>(reinterpret_cast<u8*>(second_destination) - iopMem->Main),
+			buff2end * sizeof(u16));
 
 		TDA = (buff2end) & 0xfffff;
 

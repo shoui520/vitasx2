@@ -1072,7 +1072,7 @@ void psxDma3(u32 madr, u32 bcr, u32 chcr)
 
 			cdsize = (bcr & 0xffff) * 4;
 			CdvdCopyBytes(iopPhysMem(madr), cdr.pTransfer, cdsize);
-			psxCpu->Clear(madr, cdsize / 4);
+			iopMemNotifyWrite(madr, cdsize);
 			cdr.pTransfer += cdsize;
 
 			break;

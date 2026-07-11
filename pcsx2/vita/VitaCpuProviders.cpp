@@ -794,6 +794,11 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		s_iop_a32_stats.raw_validation_words = result.raw_validation_words;
 		s_iop_a32_stats.translated_validation_words = result.translated_validation_words;
 		s_iop_a32_stats.wait_loop_configuration_checks = result.wait_loop_configuration_checks;
+		s_iop_a32_stats.trusted_source_hits = result.trusted_source_hits;
+		s_iop_a32_stats.trusted_source_audit_words = result.trusted_source_audit_words;
+		s_iop_a32_stats.trusted_source_audit_failures = result.trusted_source_audit_failures;
+		s_iop_a32_stats.ram_invalidation_calls = result.ram_invalidation_calls;
+		s_iop_a32_stats.ram_invalidation_record_visits = result.ram_invalidation_record_visits;
 #endif
 		if (result.wait_loop_fast_forward)
 			continue;

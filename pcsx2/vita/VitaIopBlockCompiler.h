@@ -5,6 +5,7 @@
 
 #include "common/Pcsx2Defs.h"
 #include "pcsx2/HostMemoryMap.h"
+#include "pcsx2/MemoryTypes.h"
 #include "pcsx2/vita/A32Emitter.h"
 
 #include <array>
@@ -46,6 +47,11 @@ namespace VitaIOP
 		u64 raw_validation_words = 0;
 		u64 translated_validation_words = 0;
 		u64 wait_loop_configuration_checks = 0;
+		u64 trusted_source_hits = 0;
+		u64 trusted_source_audit_words = 0;
+		u64 trusted_source_audit_failures = 0;
+		u64 ram_invalidation_calls = 0;
+		u64 ram_invalidation_record_visits = 0;
 #endif
 		bool cache_hit = false;
 		bool lookup_hit = false;
@@ -248,6 +254,7 @@ namespace VitaIOP
 		void ResetInstrumentationCounters();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		void SetDirectLinkingEnabled(bool enabled);
+		static void SetTrustedSourceAuditEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result);
@@ -267,12 +274,22 @@ namespace VitaIOP
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
+		// PCSX2's recClearIOP() invalidates only blocks whose protected source
+		// pages were written. Use host-page-sized buckets here too: a 64 KiB LUT
+		// bucket makes every ordinary IOP RAM store walk unrelated blocks.
+		static constexpr u32 RAM_SOURCE_PAGE_SHIFT = 12;
+		static constexpr u32 RAM_SOURCE_PAGE_SIZE = 1u << RAM_SOURCE_PAGE_SHIFT;
+		static constexpr u32 RAM_SOURCE_PAGE_COUNT =
+			Ps2MemSize::IopRam / RAM_SOURCE_PAGE_SIZE;
+		static constexpr u32 INVALID_RAM_SOURCE = UINT32_MAX;
 
 		struct CachedBlock
 		{
 			VitaA32::CodeBuffer code;
 			std::array<u32, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS> opcodes{};
 			const u32* raw_opcodes = nullptr;
+			u32 ram_source_start = INVALID_RAM_SOURCE;
+			u32 source_serial = 0;
 			u32 start_pc = 0;
 			u32 instruction_count = 0;
 			u32 native_instruction_count = 0;
@@ -296,6 +313,12 @@ namespace VitaIOP
 			u8 slot_index = 0;
 		};
 
+		struct RamSourceRecord
+		{
+			CachedBlock* block = nullptr;
+			u32 serial = 0;
+		};
+
 		struct BlockRecord
 		{
 			CachedBlock* block = nullptr;
@@ -307,12 +330,16 @@ namespace VitaIOP
 
 		static u32 LookupPageIndex(u32 start_pc);
 		static u32 LookupEntryIndex(u32 start_pc);
-		static const u32* ResolveRawOpcodeSpan(u32 start_pc, u32 instruction_count);
+		static const u32* ResolveRawOpcodeSpan(
+			u32 start_pc, u32 instruction_count, u32* ram_source_start);
 		bool EnsureLookupDirectory();
 		LookupPage* GetLookupPage(u32 start_pc, bool allocate);
 		void RegisterBlockLookup(CachedBlock& block);
 		void UnregisterBlockLookup(CachedBlock& block);
 		void ReleaseLookupPages();
+		void RegisterRamSource(CachedBlock& block);
+		u32 InvalidateRamSourceRange(u32 start, u32 size);
+		void ClearRamSourcePages();
 		s32 LastBlockRecordIndex(u32 pc) const;
 		bool RegisterBlockRecord(CachedBlock& block);
 		void UnregisterBlockRecord(CachedBlock& block);
@@ -349,7 +376,9 @@ namespace VitaIOP
 		std::vector<CachedBlock*> m_free_cache_entries;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
+		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT> m_ram_source_pages;
 		LookupPage** m_lookup_pages = nullptr;
+		u32 m_next_source_serial = 1;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;
@@ -361,6 +390,11 @@ namespace VitaIOP
 		u64 m_raw_validation_words = 0;
 		u64 m_translated_validation_words = 0;
 		u64 m_wait_loop_configuration_checks = 0;
+		u64 m_trusted_source_hits = 0;
+		u64 m_trusted_source_audit_words = 0;
+		u64 m_trusted_source_audit_failures = 0;
+		u64 m_ram_invalidation_calls = 0;
+		u64 m_ram_invalidation_record_visits = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};

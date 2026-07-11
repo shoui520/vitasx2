@@ -86,6 +86,11 @@ struct VitaA32IopProviderStats
 	u64 raw_validation_words = 0;
 	u64 translated_validation_words = 0;
 	u64 wait_loop_configuration_checks = 0;
+	u64 trusted_source_hits = 0;
+	u64 trusted_source_audit_words = 0;
+	u64 trusted_source_audit_failures = 0;
+	u64 ram_invalidation_calls = 0;
+	u64 ram_invalidation_record_visits = 0;
 #endif
 };
 

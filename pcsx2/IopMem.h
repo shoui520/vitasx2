@@ -74,10 +74,19 @@ extern void iopMemWrite8 (u32 mem, u8 value);
 extern void iopMemWrite16(u32 mem, u16 value);
 extern void iopMemWrite32(u32 mem, u32 value);
 
+// Notify the active IOP CPU provider after a direct byte-range write which
+// bypassed iopMemWrite8/16/32(). The range is measured in bytes.
+extern void iopMemNotifyWrite(u32 mem, u32 size);
+
 // NOTE: Does not call MMIO handlers.
 extern int iopMemSafeCmpBytes(u32 mem, const void* src, u32 size);
 extern bool iopMemSafeReadBytes(u32 mem, void* dst, u32 size);
 extern bool iopMemSafeWriteBytes(u32 mem, const void* src, u32 size);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+extern u64 g_qemuIopWriteNotifications;
+extern u64 g_qemuIopWriteNotificationBytes;
+#endif
 
 std::string iopMemReadString(u32 mem, int maxlen = 65536);
 

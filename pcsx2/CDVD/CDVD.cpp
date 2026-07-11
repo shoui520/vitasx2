@@ -1217,7 +1217,7 @@ int cdvdReadSector()
 
 	// Added a clear after memory write .. never seemed to be necessary before but *should*
 	// be more correct. (air)
-	psxCpu->Clear(HW_DMA3_MADR, cdvd.BlockSize / 4);
+	iopMemNotifyWrite(HW_DMA3_MADR, cdvd.BlockSize);
 
 	//	Console.WriteLn("sector %x;%x;%x", PSXMu8(madr+0), PSXMu8(madr+1), PSXMu8(madr+2));
 
@@ -2330,6 +2330,7 @@ static void cdvdWrite04(u8 rt)
 			DevCon.WriteLn("CDGetToc Param[0]=%d, Param[1]=%d", cdvd.NCMDParamBuff[0], cdvd.NCMDParamBuff[1]);
 			//}
 			cdvdGetToc(iopPhysMem(HW_DMA3_MADR));
+			iopMemNotifyWrite(HW_DMA3_MADR, 2048);
 			cdvdSetIrq();
 			HW_DMA3_CHCR &= ~0x01000000;
 			psxDmaInterrupt(3);

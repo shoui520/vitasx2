@@ -128,6 +128,7 @@ static void Sio2Dma12TransferBlock(u32& madr, u32 bytes)
 	{
 		u8* const destination = iopPhysMem(madr);
 		g_Sio2.ReadBytes(destination, bytes);
+		iopMemNotifyWrite(madr, bytes);
 
 		madr += bytes;
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -208,7 +209,6 @@ static void psxDmaGeneric(u32 madr, u32 bcr, u32 chcr, u32 spuCore)
 				SPU2readDMA7Mem((u16*)iopPhysMem(madr), size * 2);
 			else if (dmaNum == 4)
 				SPU2readDMA4Mem((u16*)iopPhysMem(madr), size * 2);
-			psxCpu->Clear(spuCore ? HW_DMA7_MADR : HW_DMA4_MADR, size);
 			break;
 
 		default:
@@ -288,6 +288,8 @@ void psxDma2(u32 madr, u32 bcr, u32 chcr) // GPU
 
 void psxDma6(u32 madr, u32 bcr, u32 chcr)
 {
+	const u32 end_madr = madr;
+	const u32 word_count = bcr;
 	u32* mem = (u32*)iopPhysMem(madr);
 
 	PSXDMA_LOG("*** DMA 6 - OT *** %lx addr = %lx size = %lx", chcr, madr, bcr);
@@ -301,6 +303,9 @@ void psxDma6(u32 madr, u32 bcr, u32 chcr)
 		}
 		mem++;
 		*mem = 0xffffff;
+		const u32 start_madr = word_count ?
+			(end_madr - (word_count - 1) * sizeof(u32)) : (end_madr + sizeof(u32));
+		iopMemNotifyWrite(start_madr, std::max<u32>(word_count, 1) * sizeof(u32));
 	}
 	else
 	{
@@ -326,6 +331,7 @@ void psxDma8(u32 madr, u32 bcr, u32 chcr)
 		case 0x01000200: //dev9 to cpu transfer
 			PSXDMA_LOG("*** DMA 8 - DEV9 dev9mem *** %lx addr = %lx size = %lx", chcr, madr, bcr);
 			DEV9readDMA8Mem((u32*)iopPhysMem(madr), size);
+			iopMemNotifyWrite(madr, static_cast<u32>(size));
 			break;
 
 		default:
