@@ -614,6 +614,16 @@ namespace VitaEE
 		Reset();
 		m_compatible_scheduler_carry_enabled = enabled;
 	}
+
+	void BlockExecutor::SetCompatibleVtlbPointerCarryEnabled(bool enabled)
+	{
+		if (m_compatible_vtlb_pointer_carry_enabled == enabled)
+			return;
+
+		// The translated pointer's host/provenance is part of the link ABI.
+		Reset();
+		m_compatible_vtlb_pointer_carry_enabled = enabled;
+	}
 #endif
 
 	bool BlockExecutor::EnsurePersistentDispatcher()
@@ -877,6 +887,8 @@ namespace VitaEE
 			}
 			if (!m_compatible_scheduler_carry_enabled)
 				signature->scheduler = SchedulerLinkMapping{};
+			if (!m_compatible_vtlb_pointer_carry_enabled)
+				signature->vtlb_pointer = VtlbPointerLinkMapping{};
 #endif
 			return true;
 		}
@@ -1423,6 +1435,8 @@ namespace VitaEE
 				result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
 				result->compatible_scheduler_links +=
 					link.compatible_scheduler_countdown ? 1u : 0u;
+				result->compatible_vtlb_pointer_links +=
+					link.compatible_vtlb_pointer ? 1u : 0u;
 			}
 		}
 #endif
@@ -1505,6 +1519,8 @@ namespace VitaEE
 					result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
 					result->compatible_scheduler_links +=
 						link.compatible_scheduler_countdown ? 1u : 0u;
+					result->compatible_vtlb_pointer_links +=
+						link.compatible_vtlb_pointer ? 1u : 0u;
 				}
 			}
 #endif

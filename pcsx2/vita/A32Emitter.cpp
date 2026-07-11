@@ -39,6 +39,7 @@ namespace VitaA32
 		constexpr u32 MOVW = 0x03000000u;
 		constexpr u32 MOVT = 0x03400000u;
 		constexpr u32 LDR_IMM = 0x05900000u;
+		constexpr u32 LDR_IMM_POST_INDEX = 0x04900000u;
 		constexpr u32 LDR_REG = 0x07900000u;
 		constexpr u32 STR_IMM = 0x05800000u;
 		constexpr u32 STR_REG = 0x07800000u;
@@ -1101,6 +1102,13 @@ namespace VitaA32
 		if (!IsLowRegister(rd) || !IsLowRegister(rn) || offset > 0x0fff)
 			return false;
 		return EmitU32(EncodeLdrImm12(rd, rn, offset, condition));
+	}
+
+	bool CodeBuffer::EmitLdrImm12PostIndex(unsigned rd, unsigned rn, u16 offset)
+	{
+		if (!IsLowRegister(rd) || !IsLowRegister(rn) || rd == rn || offset > 0x0fff)
+			return false;
+		return EmitU32(EncodeLdrImm12PostIndex(rd, rn, offset));
 	}
 
 	bool CodeBuffer::EmitLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount)
@@ -2467,6 +2475,16 @@ namespace VitaA32
 		pxAssert(IsLowRegister(rn));
 		pxAssert(offset <= 0x0fff);
 		return CondBits(condition) | LDR_IMM | ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | offset;
+	}
+
+	u32 EncodeLdrImm12PostIndex(unsigned rd, unsigned rn, u16 offset)
+	{
+		pxAssert(IsLowRegister(rd));
+		pxAssert(IsLowRegister(rn));
+		pxAssert(rd != rn);
+		pxAssert(offset <= 0x0fff);
+		return CondBits(Condition::AL) | LDR_IMM_POST_INDEX |
+			((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | offset;
 	}
 
 	u32 EncodeLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount)

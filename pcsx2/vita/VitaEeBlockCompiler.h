@@ -28,6 +28,7 @@ namespace VitaEE
 		bool patched_to_compatible_entry = false;
 		bool requires_compatible_entry = false;
 		bool compatible_scheduler_countdown = false;
+		bool compatible_vtlb_pointer = false;
 		u8 compatible_entry_instructions = 0;
 		u8 compatible_entry_loads = 0;
 		u8 compatible_dirty_words = 0;
@@ -59,6 +60,54 @@ namespace VitaEE
 		{
 			return host == rhs.host && representation == rhs.representation &&
 				provenance == rhs.provenance;
+		}
+	};
+
+	enum class VtlbPointerLinkWidth : u8
+	{
+		Word32,
+	};
+
+	enum class VtlbPointerLinkDirection : u8
+	{
+		Read,
+	};
+
+	enum class VtlbPointerLinkRepresentation : u8
+	{
+		DirectHostAddress,
+	};
+
+	enum class VtlbPointerLinkProvenance : u8
+	{
+		VtlbVirtualMapping,
+	};
+
+	struct VtlbPointerLinkMapping
+	{
+		static constexpr u8 NO_HOST = 0xff;
+
+		u8 host = NO_HOST;
+		u8 guest_address = 0;
+		u8 guest_result = 0;
+		u8 stride = 0;
+		u32 access_pc = 0;
+		u32 advance_pc = 0;
+		VtlbPointerLinkWidth width = VtlbPointerLinkWidth::Word32;
+		VtlbPointerLinkDirection direction = VtlbPointerLinkDirection::Read;
+		VtlbPointerLinkRepresentation representation =
+			VtlbPointerLinkRepresentation::DirectHostAddress;
+		VtlbPointerLinkProvenance provenance =
+			VtlbPointerLinkProvenance::VtlbVirtualMapping;
+
+		bool IsValid() const { return host != NO_HOST; }
+		bool operator==(const VtlbPointerLinkMapping& rhs) const
+		{
+			return host == rhs.host && guest_address == rhs.guest_address &&
+				guest_result == rhs.guest_result && stride == rhs.stride &&
+				access_pc == rhs.access_pc && advance_pc == rhs.advance_pc &&
+				width == rhs.width && direction == rhs.direction &&
+				representation == rhs.representation && provenance == rhs.provenance;
 		}
 	};
 
@@ -110,9 +159,11 @@ namespace VitaEE
 		static constexpr u8 FIRST_HOST = 9;
 		static constexpr u8 LAST_HOST = 11;
 		static constexpr u8 SCHEDULER_HOST = 6;
+		static constexpr u8 VTLB_POINTER_HOST = 12;
 
 		GprLinkMapping mappings[MAX_PINS]{};
 		SchedulerLinkMapping scheduler{};
+		VtlbPointerLinkMapping vtlb_pointer{};
 		u32 block_pcs[2]{};
 		u8 count = 0;
 
@@ -120,10 +171,12 @@ namespace VitaEE
 		bool ContainsPc(u32 pc) const;
 		bool HasWriteBack() const;
 		bool HasSchedulerCountdown() const { return scheduler.IsValid(); }
+		bool HasVtlbPointer() const { return vtlb_pointer.IsValid(); }
 		u8 DirtyWordCount() const;
 		bool operator==(const GprLinkSignature& rhs) const
 		{
 			if (count != rhs.count || !(scheduler == rhs.scheduler) ||
+				!(vtlb_pointer == rhs.vtlb_pointer) ||
 				block_pcs[0] != rhs.block_pcs[0] ||
 				block_pcs[1] != rhs.block_pcs[1])
 				return false;
@@ -708,6 +761,8 @@ namespace VitaEE
 			bool forwarded_value_is_architectural = false);
 		bool EmitSyncForwardedBooleanBranchToBacking(bool value_is_architectural = false);
 		bool EmitPrepareResidentForwardedBooleanForPreProducerSync();
+		bool EmitPoisonCompatibleVtlbPointer();
+		bool EmitStageCompatibleVtlbPointer();
 		bool EmitStageCompatibleSchedulerCountdown(unsigned scratch_host,
 			bool canonical_entry = true);
 		bool EmitSyncCompatibleSchedulerCountdownToBacking();
@@ -1002,6 +1057,13 @@ namespace VitaEE
 		bool m_resident_cycle_low = false;
 		bool m_resident_scheduler_countdown = false;
 		bool m_compatible_scheduler_countdown = false;
+		bool m_compatible_vtlb_pointer = false;
+		bool m_compatible_vtlb_pointer_access = false;
+		size_t m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
+		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
+		GprPinDirtyMasks m_compatible_vtlb_pointer_dirty_pins{};
+		u8 m_compatible_vtlb_pointer_guard_instructions = 0;
+		u8 m_compatible_vtlb_pointer_translation_instructions = 0;
 		bool m_deferred_resident_unsigned_branch_suffix = false;
 		bool m_emitting_deferred_resident_event_suffix = false;
 		u32 m_deferred_resident_unsigned_compare_op = 0;
