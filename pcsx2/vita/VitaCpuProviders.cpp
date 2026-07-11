@@ -1045,6 +1045,10 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.hot_dispatch_cache_hits = snapshot.hot_dispatch_cache_hits;
 	s_iop_a32_stats.hot_dispatch_cache_misses = snapshot.hot_dispatch_cache_misses;
 	s_iop_a32_stats.hot_dispatch_trusted_raw_hits = snapshot.hot_dispatch_trusted_raw_hits;
+	s_iop_a32_stats.direct_budget_exit_provider_entries =
+		snapshot.direct_budget_exit_provider_entries;
+	s_iop_a32_stats.constant_cycle_budget_provider_entries =
+		snapshot.constant_cycle_budget_provider_entries;
 	s_iop_a32_stats.validation_calls = snapshot.validation_calls;
 	s_iop_a32_stats.validation_words = snapshot.validation_words;
 	s_iop_a32_stats.raw_validation_calls = snapshot.raw_validation_calls;

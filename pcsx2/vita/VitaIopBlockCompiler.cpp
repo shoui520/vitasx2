@@ -903,12 +903,22 @@ namespace VitaIOP
 
 		const u16 pushed_registers = m_saved_registers | REG_LR;
 		const u32 pushed_count = static_cast<u32>(__builtin_popcount(static_cast<unsigned>(pushed_registers)));
-		m_stack_frame_size = (pushed_count & 1u) ? 4 : 8;
+		// PCSX2's iPsxAddEECycles(blockCycles) charges an analysis-proven block
+		// directly. Those blocks need no dynamic cycle snapshot slot; keep only
+		// the optional word required to restore AAPCS stack alignment for calls.
+		if (m_defer_cycle_updates)
+			m_stack_frame_size = (pushed_count & 1u) ? 4 : 0;
+		else
+			m_stack_frame_size = (pushed_count & 1u) ? 4 : 8;
 		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
-			!m_code.EmitSubImm8(HOST_SP, HOST_SP, m_stack_frame_size) ||
-			!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))) ||
-			!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) ||
-			!m_code.EmitStrImm12(HOST_TMP0, HOST_SP, 0))
+			(m_stack_frame_size != 0 && !m_code.EmitSubImm8(HOST_SP, HOST_SP, m_stack_frame_size)) ||
+			!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
+		{
+			return false;
+		}
+		if (!m_defer_cycle_updates &&
+			(!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_SP, 0)))
 		{
 			return false;
 		}
@@ -935,7 +945,7 @@ namespace VitaIOP
 			return false;
 
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
-			   m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size) &&
+			   (m_stack_frame_size == 0 || m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size)) &&
 			   m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
@@ -945,7 +955,7 @@ namespace VitaIOP
 			return false;
 
 		if (!EmitChargeEeBudget() ||
-			!m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size) ||
+			(m_stack_frame_size != 0 && !m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size)) ||
 			!m_code.EmitPop(m_saved_registers | REG_LR))
 		{
 			return false;
@@ -1425,13 +1435,14 @@ namespace VitaIOP
 		return EmitAddCycles(1);
 	}
 
-	bool BlockCompiler::EmitChargeEeBudgetPs1()
+	bool BlockCompiler::EmitChargeEeBudgetPs1(u32 known_block_cycles)
 	{
 		// PCSX2 owner: x86/iR3000A.cpp::iPsxAddEECycles(), PS1 clock mode.
 		// Blocks are bounded to 64 IOP instructions, so t = delta * 1280 + carry
 		// is <= 82066.  floor(t / 147) is exact as high32(t * 0x01bdd2b9)
 		// for that range, and the remainder is reconstructed as t - q * 147.
 		return
+			(known_block_cycles == 0 || m_code.EmitMovImm32(HOST_TMP0, known_block_cycles)) &&
 			m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::LSL, 10) &&
 			m_code.EmitAddRegShiftImm(HOST_TMP1, HOST_TMP1, HOST_TMP0, VitaA32::ShiftType::LSL, 8) &&
 			m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_CARRY_OFFSET)) &&
@@ -1451,24 +1462,25 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitChargeEeBudget()
 	{
-		if (!m_direct_exit_branches)
+		if (!m_direct_exit_branches || !m_budget_exit_branches)
 			return false;
+		m_has_budget_exit = true;
 
+		// PCSX2 owner: x86/iR3000A.cpp::iPsxAddEECycles() leaves the signed
+		// budget subtraction flags live for iPsxBranchTest()'s xJLE. A32 STR
+		// also preserves those flags, so branch on LE directly instead of
+		// materializing and retesting a temporary Boolean.
 		const auto emit_budget_exit_from_signed_flags = [this]() {
-			if (!m_code.EmitMovImm8(HOST_TMP3, 0) ||
-				!m_code.EmitMovImm8(HOST_TMP3, 1, VitaA32::Condition::LE) ||
-				!m_code.EmitCmpImm32(HOST_TMP3, 0))
-			{
-				return false;
-			}
-
-			m_direct_exit_branches->push_back(m_code.EmitBranchPlaceholder(VitaA32::Condition::NE));
-			return true;
+			m_budget_exit_branches->push_back(
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::LE));
+			return m_budget_exit_branches->back() != static_cast<size_t>(-1);
 		};
 
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_SP, 0) ||
-			!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP1))
+		const u32 known_block_cycles = m_defer_cycle_updates ? m_block_cycle_count : 0;
+		if (known_block_cycles == 0 &&
+			(!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) ||
+				!m_code.EmitLdrImm12(HOST_TMP1, HOST_SP, 0) ||
+				!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP1)))
 		{
 			return false;
 		}
@@ -1485,7 +1497,10 @@ namespace VitaIOP
 		if (ps1_clock_mode == static_cast<size_t>(-1))
 			return false;
 
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 3) ||
+		const bool emitted_ee_cycles = known_block_cycles != 0 ?
+			m_code.EmitMovImm32(HOST_TMP2, known_block_cycles * 8) :
+			m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 3);
+		if (!emitted_ee_cycles ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET)) ||
 			!m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP2, true) ||
 			!m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET)) ||
@@ -1500,8 +1515,7 @@ namespace VitaIOP
 
 		const size_t ps1_clock_mode_target = m_code.Size();
 		if (!m_code.PatchBranch(ps1_clock_mode, ps1_clock_mode_target, VitaA32::Condition::NE) ||
-			!EmitChargeEeBudgetPs1() ||
-			!m_code.EmitCmpImm32(HOST_TMP0, 0) ||
+			!EmitChargeEeBudgetPs1(known_block_cycles) ||
 			!emit_budget_exit_from_signed_flags())
 		{
 			return false;
@@ -4875,13 +4889,18 @@ namespace VitaIOP
 		ResetGprConstState();
 		m_emit_trace_checks = VitaIsIopPreInstructionTraceEnabled();
 		m_defer_cycle_updates = !m_emit_trace_checks && IopBlockCanDeferCycleUpdates(start_pc, instruction_count);
+		m_has_budget_exit = false;
+		m_block_cycle_count = instruction_count;
 
 		if (!BeginBlock())
 			return false;
 
 		std::vector<size_t> direct_exit_branches;
+		std::vector<size_t> budget_exit_branches;
 		m_direct_exit_branches = &direct_exit_branches;
+		m_budget_exit_branches = &budget_exit_branches;
 		direct_exit_branches.reserve(instruction_count * 2);
+		budget_exit_branches.reserve(4);
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
 		bool can_direct_link_fallthrough = true;
@@ -5115,8 +5134,14 @@ namespace VitaIOP
 			if (!m_code.PatchBranch(branch_offset, direct_exit_offset, VitaA32::Condition::NE))
 				return false;
 		}
+		for (const size_t branch_offset : budget_exit_branches)
+		{
+			if (!m_code.PatchBranch(branch_offset, direct_exit_offset, VitaA32::Condition::LE))
+				return false;
+		}
 
 		m_direct_exit_branches = nullptr;
+		m_budget_exit_branches = nullptr;
 		return true;
 	}
 
@@ -5141,6 +5166,8 @@ namespace VitaIOP
 		m_hot_dispatch_cache_hits = 0;
 		m_hot_dispatch_cache_misses = 0;
 		m_hot_dispatch_trusted_raw_hits = 0;
+		m_direct_budget_exit_provider_entries = 0;
+		m_constant_cycle_budget_provider_entries = 0;
 		m_validation_calls = 0;
 		m_validation_words = 0;
 		m_raw_validation_calls = 0;
@@ -5779,6 +5806,8 @@ namespace VitaIOP
 		block.poll_branch_source_start = INVALID_RAM_SOURCE;
 		block.poll_leaf_source_start = INVALID_RAM_SOURCE;
 		block.poll_call_wait_loop = false;
+		block.direct_budget_exit = false;
+		block.constant_cycle_budget = false;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -6301,6 +6330,8 @@ namespace VitaIOP
 			block.opcodes[i] = op;
 		}
 		block.poll_call_wait_loop = false;
+		block.direct_budget_exit = false;
+		block.constant_cycle_budget = false;
 		block.poll_branch_opcodes = nullptr;
 		block.poll_leaf_opcodes = nullptr;
 		block.poll_branch_source_start = INVALID_RAM_SOURCE;
@@ -6315,6 +6346,8 @@ namespace VitaIOP
 		size_t block_code_slice_offset = 0;
 		u32 native_instruction_count = 0;
 		u32 helper_instruction_count = 0;
+		bool direct_budget_exit = false;
+		bool constant_cycle_budget = false;
 		DirectLinkSlots direct_links;
 		for (;;)
 		{
@@ -6345,6 +6378,8 @@ namespace VitaIOP
 				CommitCodeSlice(code_slice_offset, block.code.Size());
 				native_instruction_count = compiler.NativeInstructionCount();
 				helper_instruction_count = compiler.HelperInstructionCount();
+				direct_budget_exit = compiler.UsesDirectBudgetExit();
+				constant_cycle_budget = compiler.UsesConstantCycleBudget();
 				direct_links = attempt_direct_links;
 				break;
 			}
@@ -6363,6 +6398,8 @@ namespace VitaIOP
 			start_pc, instruction_count, &block.ram_source_start);
 		block.native_instruction_count = native_instruction_count;
 		block.helper_instruction_count = helper_instruction_count;
+		block.direct_budget_exit = direct_budget_exit;
+		block.constant_cycle_budget = constant_cycle_budget;
 		block.direct_links = direct_links;
 		block.valid = true;
 		if (!RegisterBlockRecord(block))
@@ -6488,6 +6525,8 @@ namespace VitaIOP
 		result->hot_dispatch_cache_hits = m_hot_dispatch_cache_hits;
 		result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
 		result->hot_dispatch_trusted_raw_hits = m_hot_dispatch_trusted_raw_hits;
+		result->direct_budget_exit_provider_entries = m_direct_budget_exit_provider_entries;
+		result->constant_cycle_budget_provider_entries = m_constant_cycle_budget_provider_entries;
 		result->validation_calls = m_validation_calls;
 		result->validation_words = m_validation_words;
 		result->raw_validation_calls = m_raw_validation_calls;
@@ -6533,6 +6572,12 @@ namespace VitaIOP
 			return true;
 		}
 
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (block.direct_budget_exit)
+			m_direct_budget_exit_provider_entries++;
+		if (block.constant_cycle_budget)
+			m_constant_cycle_budget_provider_entries++;
+#endif
 		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
 
 		BlockExitKind exit = BlockExitKind::Direct;

@@ -48,6 +48,8 @@ namespace VitaIOP
 		u64 hot_dispatch_cache_hits;
 		u64 hot_dispatch_cache_misses;
 		u64 hot_dispatch_trusted_raw_hits;
+		u64 direct_budget_exit_provider_entries;
+		u64 constant_cycle_budget_provider_entries;
 		u64 validation_calls;
 		u64 validation_words;
 		u64 raw_validation_calls;
@@ -90,6 +92,8 @@ namespace VitaIOP
 			const void* direct_exit = nullptr, DirectLinkSlots* direct_links = nullptr);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
+		bool UsesDirectBudgetExit() const { return m_has_budget_exit; }
+		bool UsesConstantCycleBudget() const { return m_defer_cycle_updates; }
 
 	private:
 		bool BeginBlock();
@@ -117,7 +121,7 @@ namespace VitaIOP
 		bool EmitAddCycles(u32 cycles);
 		bool EmitIncrementCycle();
 		bool EmitChargeEeBudget();
-		bool EmitChargeEeBudgetPs1();
+		bool EmitChargeEeBudgetPs1(u32 known_block_cycles);
 		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches);
 		bool EmitLoadGpr(unsigned guest_reg, unsigned host_reg);
@@ -231,10 +235,13 @@ namespace VitaIOP
 		u16 m_saved_registers = 0;
 		u8 m_stack_frame_size = 0;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
+		std::vector<size_t>* m_budget_exit_branches = nullptr;
+		u32 m_block_cycle_count = 0;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
 		bool m_defer_cycle_updates = false;
+		bool m_has_budget_exit = false;
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_jump = false;
@@ -323,6 +330,8 @@ namespace VitaIOP
 			bool wait_loop_shape = false;
 			bool wait_loop_enabled_at_compile = false;
 			bool poll_call_wait_loop = false;
+			bool direct_budget_exit = false;
+			bool constant_cycle_budget = false;
 			u8 poll_result_register = 0;
 			bool valid = false;
 			bool queued_free = false;
@@ -431,6 +440,8 @@ namespace VitaIOP
 		u64 m_hot_dispatch_cache_hits = 0;
 		u64 m_hot_dispatch_cache_misses = 0;
 		u64 m_hot_dispatch_trusted_raw_hits = 0;
+		u64 m_direct_budget_exit_provider_entries = 0;
+		u64 m_constant_cycle_budget_provider_entries = 0;
 		u64 m_validation_calls = 0;
 		u64 m_validation_words = 0;
 		u64 m_raw_validation_calls = 0;
