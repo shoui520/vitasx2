@@ -70,6 +70,7 @@ namespace VitaEE
 
 	enum class VtlbPointerLinkWidth : u8
 	{
+		BytePair8,
 		Word32,
 	};
 
@@ -95,6 +96,7 @@ namespace VitaEE
 		u8 host = NO_HOST;
 		u8 guest_address = 0;
 		u8 guest_result = 0;
+		u8 guest_result2 = 0;
 		u8 stride = 0;
 		u32 access_pc = 0;
 		u32 advance_pc = 0;
@@ -109,7 +111,8 @@ namespace VitaEE
 		bool operator==(const VtlbPointerLinkMapping& rhs) const
 		{
 			return host == rhs.host && guest_address == rhs.guest_address &&
-				guest_result == rhs.guest_result && stride == rhs.stride &&
+				guest_result == rhs.guest_result && guest_result2 == rhs.guest_result2 &&
+				stride == rhs.stride &&
 				access_pc == rhs.access_pc && advance_pc == rhs.advance_pc &&
 				width == rhs.width && direction == rhs.direction &&
 				representation == rhs.representation && provenance == rhs.provenance;
@@ -986,6 +989,7 @@ namespace VitaEE
 			bool counter_read_event = false;
 			unsigned address_reg = 0;
 			GprPinDirtyMasks dirty_pins{};
+			size_t compatible_byte_pair_delay_join = static_cast<size_t>(-1);
 		};
 
 		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);
@@ -1165,6 +1169,7 @@ namespace VitaEE
 		bool m_reclaimed_vtlb_link_hosts = false;
 		size_t m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
+		size_t m_compatible_vtlb_byte_pair_tail_index = static_cast<size_t>(-1);
 		GprPinDirtyMasks m_compatible_vtlb_pointer_dirty_pins{};
 		u8 m_compatible_vtlb_pointer_guard_instructions = 0;
 		u8 m_compatible_vtlb_pointer_translation_instructions = 0;

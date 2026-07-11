@@ -124,6 +124,8 @@ u32 g_qemuCompatibleVtlbPointerTranslationInstructions = 0;
 u32 g_qemuCompatibleVtlbPointerHotInstructionsElided = 0;
 u32 g_qemuCompatibleVtlbPointerPostIncrementLoads = 0;
 u32 g_qemuCompatibleVtlbPointerColdInvalidationInstructions = 0;
+u32 g_qemuCompatibleVtlbBytePairRepeatedTranslationInstructionsElided = 0;
+u32 g_qemuCompatibleVtlbBytePairHandlerSeeds = 0;
 u32 g_qemuCompatiblePredicateBlocks = 0;
 u32 g_qemuCompatiblePredicateCanonicalInstructions = 0;
 u32 g_qemuCompatiblePredicateLinkedInstructionsElided = 0;
@@ -427,6 +429,14 @@ namespace VitaEE
 		constexpr unsigned HOST_GPR_PIN0 = 9;
 		constexpr unsigned HOST_COP1_EXPONENT_MASK = 10;
 		constexpr unsigned HOST_VU0_BASE = 11;
+		// A handler-backed first read in a compatible byte pair must perform the
+		// second PCSX2 vTLB read while it remains on the cold path, but the hot
+		// delay-slot lowering still consumes one post-indexed byte load. Seed the
+		// final byte of a private page so that load obtains the handler result and
+		// advances r12 to a page boundary, forcing retranslation on the next chain
+		// iteration. This is private JIT state and is never guest-addressable.
+		alignas(vtlb_private::VTLB_PAGE_SIZE)
+		u8 s_compatible_vtlb_byte_pair_handler_page[vtlb_private::VTLB_PAGE_SIZE]{};
 		constexpr u8 NO_GPR_PIN_HOST = 0xff;
 
 		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
@@ -3509,7 +3519,19 @@ namespace VitaEE
 			(scheduler.IsValid() && scheduler.host != SCHEDULER_HOST) ||
 			(vtlb_pointer.IsValid() &&
 				(vtlb_pointer.host != VTLB_POINTER_HOST ||
-				 vtlb_pointer.guest_address == 0 || vtlb_pointer.stride == 0)) ||
+				 vtlb_pointer.guest_address == 0 || vtlb_pointer.guest_address >= 32 ||
+				 vtlb_pointer.guest_result >= 32 || vtlb_pointer.guest_result2 >= 32 ||
+				 vtlb_pointer.direction != VtlbPointerLinkDirection::Read ||
+				 vtlb_pointer.representation !=
+					 VtlbPointerLinkRepresentation::DirectHostAddress ||
+				 vtlb_pointer.provenance !=
+					 VtlbPointerLinkProvenance::VtlbVirtualMapping ||
+				 !((vtlb_pointer.width == VtlbPointerLinkWidth::Word32 &&
+					vtlb_pointer.guest_result != 0 &&
+					vtlb_pointer.guest_result2 == 0 && vtlb_pointer.stride == 4) ||
+				   (vtlb_pointer.width == VtlbPointerLinkWidth::BytePair8 &&
+					vtlb_pointer.guest_result != 0 &&
+					vtlb_pointer.guest_result2 != 0 && vtlb_pointer.stride == 1)))) ||
 			(predicate.IsValid() &&
 				(predicate.host != PREDICATE_HOST || predicate.guest == 0 ||
 				 predicate.guest >= 32 ||
@@ -3931,7 +3953,7 @@ namespace VitaEE
 		// induction chain and carry its direct vTLB pointer in caller-saved r12.
 		// Every accepted lowering is audited to preserve r12; handler calls poison
 		// it before rejoining generated code.
-		const auto try_add_vtlb_pointer = [&](u32 access_pc, u32 access_count,
+		const auto try_add_word_vtlb_pointer = [&](u32 access_pc, u32 access_count,
 			u32 advance_pc, u32 advance_count) {
 			if (access_count != 3 || advance_count != 2 ||
 				advance_pc != access_pc + 3 * sizeof(u32))
@@ -3988,16 +4010,151 @@ namespace VitaEE
 			signature->vtlb_pointer.stride = 4;
 			signature->vtlb_pointer.access_pc = access_pc;
 			signature->vtlb_pointer.advance_pc = advance_pc;
+			signature->vtlb_pointer.width = VtlbPointerLinkWidth::Word32;
 			return true;
 		};
 		if (chain_block_count == 2 &&
-			!try_add_vtlb_pointer(chain_pcs[0], chain_instruction_counts[0],
+			!try_add_word_vtlb_pointer(chain_pcs[0], chain_instruction_counts[0],
 				chain_pcs[1], chain_instruction_counts[1]))
 		{
-			try_add_vtlb_pointer(chain_pcs[1], chain_instruction_counts[1],
+			try_add_word_vtlb_pointer(chain_pcs[1], chain_instruction_counts[1],
 				chain_pcs[0], chain_instruction_counts[0]);
 		}
+
+		const auto try_add_byte_pair_vtlb_pointer = [&](u32 access_pc,
+			u32 access_count, u32 advance_pc, u32 advance_count) {
+			if (access_count != 3 || advance_count < 2)
+				return false;
+
+			const u32 first_load = memRead32(access_pc);
+			const u32 branch = memRead32(access_pc + sizeof(u32));
+			const u32 second_load = memRead32(access_pc + 2 * sizeof(u32));
+			const unsigned branch_opcode = branch >> 26;
+			if ((first_load >> 26) != 0x20 || (second_load >> 26) != 0x24 ||
+				(branch_opcode != 0x04 && branch_opcode != 0x05) ||
+				RS(first_load) == 0 || RT(first_load) == 0 || RT(second_load) == 0 ||
+				RS(second_load) != RS(first_load) ||
+				IMM_S(second_load) != IMM_S(first_load) ||
+				RT(second_load) == RS(branch) || RT(second_load) == RT(branch) ||
+				(BranchTarget(access_pc + sizeof(u32), branch) != advance_pc &&
+				 access_pc + 3 * sizeof(u32) != advance_pc))
+			{
+				return false;
+			}
+
+			const unsigned base = RS(first_load);
+			const auto chain_contains_pc = [&](u32 pc) {
+				for (u8 block = 0; block < chain_block_count; block++)
+				{
+					if (chain_pcs[block] == pc)
+						return true;
+				}
+				return false;
+			};
+			u32 base_writes = 0;
+			bool advances_base = false;
+			for (u8 block = 0; block < chain_block_count; block++)
+			{
+				for (u32 i = 0; i < chain_instruction_counts[block]; i++)
+				{
+					const u32 op = memRead32(chain_pcs[block] + i * sizeof(u32));
+					const unsigned opcode = op >> 26;
+					switch (opcode)
+					{
+						case 0x04: // BEQ
+						case 0x05: // BNE
+						case 0x09: // ADDIU
+						case 0x0a: // SLTI
+						case 0x14: // BEQL
+						case 0x15: // BNEL
+						case 0x28: // SB
+							break;
+						case 0x20: // LB
+						case 0x24: // LBU
+							if (chain_pcs[block] != access_pc ||
+								(i != 0 && i != 2))
+							{
+								return false;
+							}
+							break;
+						default:
+							return false;
+					}
+
+					DirtyGprPinOpInfo write_info;
+					if (!ClassifyOpcodeForDirtyGprPins(op, &write_info))
+						return false;
+					for (unsigned write = 0; write < write_info.write_count; write++)
+					{
+						if (write_info.writes[write] != base)
+							continue;
+						// A branch-likely side exit may initialize the address in its
+						// taken-only delay slot. The compatible fallthrough annuls that
+						// instruction, while the taken edge publishes/discards r12.
+						if (i + 1 == chain_instruction_counts[block] && i != 0)
+						{
+							const u32 likely = memRead32(
+								chain_pcs[block] + (i - 1) * sizeof(u32));
+							const unsigned likely_opcode = likely >> 26;
+							const u32 fallthrough = chain_pcs[block] +
+								chain_instruction_counts[block] * sizeof(u32);
+							if ((likely_opcode == 0x14 || likely_opcode == 0x15) &&
+								chain_contains_pc(fallthrough) &&
+								!chain_contains_pc(BranchTarget(
+									chain_pcs[block] + (i - 1) * sizeof(u32), likely)))
+							{
+								continue;
+							}
+						}
+						base_writes++;
+						advances_base |= chain_pcs[block] == advance_pc &&
+							opcode == 0x09 && RS(op) == base && RT(op) == base &&
+							IMM_S(op) == 1;
+					}
+				}
+			}
+			if (base_writes != 1 || !advances_base)
+				return false;
+
+			bool address_is_mapped = false;
+			for (u8 i = 0; i < signature->count; i++)
+			{
+				address_is_mapped |= signature->mappings[i].guest == base &&
+					signature->mappings[i].dirty == GprLinkDirtyState::WriteBack;
+			}
+			if (!address_is_mapped)
+				return false;
+
+			signature->vtlb_pointer.host = GprLinkSignature::VTLB_POINTER_HOST;
+			signature->vtlb_pointer.guest_address = static_cast<u8>(base);
+			signature->vtlb_pointer.guest_result = static_cast<u8>(RT(first_load));
+			signature->vtlb_pointer.guest_result2 = static_cast<u8>(RT(second_load));
+			signature->vtlb_pointer.stride = 1;
+			signature->vtlb_pointer.access_pc = access_pc;
+			signature->vtlb_pointer.advance_pc = advance_pc;
+			signature->vtlb_pointer.width = VtlbPointerLinkWidth::BytePair8;
+			return true;
+		};
+		if (chain_block_count == 3 && !signature->vtlb_pointer.IsValid())
+		{
+			for (u8 access = 0; access < chain_block_count &&
+				!signature->vtlb_pointer.IsValid(); access++)
+			{
+				for (u8 advance = 0; advance < chain_block_count; advance++)
+				{
+					if (access == advance)
+						continue;
+					if (try_add_byte_pair_vtlb_pointer(chain_pcs[access],
+							chain_instruction_counts[access], chain_pcs[advance],
+							chain_instruction_counts[advance]))
+					{
+						break;
+					}
+				}
+			}
+		}
 		if (reclaim_vtlb_hosts && signature->vtlb_pointer.IsValid() &&
+			signature->vtlb_pointer.width == VtlbPointerLinkWidth::Word32 &&
 			!allocate_mappings(true))
 		{
 			return false;
@@ -7051,11 +7208,12 @@ namespace VitaEE
 			return true;
 
 		// PCSX2 owner: recVTLB.cpp::DynGen_PrepRegs()/DynGen_DirectRead(). r12
-		// carries the direct host address across the reciprocal links. A direct
-		// word load advances it by four; the guest ADDIU in the partner block then
-		// catches the architectural address up. Direct VTLB mappings preserve the
-		// guest page offset, so low 12 bits zero means canonical entry, a poisoned
-		// helper result, or a page transition and forces exact retranslation.
+		// carries the direct host address across compatible links. Word induction
+		// advances it by four; the measured byte-pair form advances it after the
+		// delay-slot LBU. The matching guest ADDIU in another chain member catches
+		// architectural state up. Direct VTLB mappings preserve the guest page
+		// offset, so low 12 bits zero means canonical entry, a poisoned helper
+		// result, or a page transition and forces exact retranslation.
 		const size_t guard_start = m_code.Size();
 		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, GprLinkSignature::VTLB_POINTER_HOST,
 				VitaA32::ShiftType::LSL, 20, true))
@@ -7069,15 +7227,23 @@ namespace VitaEE
 
 		const u32 op = memRead32(m_gpr_link_signature.vtlb_pointer.access_pc);
 		const size_t translation_start = m_code.Size();
-		if (!EmitEffectiveAddress(op, GprLinkSignature::VTLB_POINTER_HOST) ||
-			!m_code.EmitAndImm8(HOST_TMP1, GprLinkSignature::VTLB_POINTER_HOST, 3, true))
+		if (!EmitEffectiveAddress(op, GprLinkSignature::VTLB_POINTER_HOST))
 		{
 			return false;
 		}
-		m_compatible_vtlb_pointer_unaligned_fallback =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (m_compatible_vtlb_pointer_unaligned_fallback == static_cast<size_t>(-1) ||
-			!EmitVtlbNonHandlerHostAddress(GprLinkSignature::VTLB_POINTER_HOST,
+		if (m_gpr_link_signature.vtlb_pointer.width == VtlbPointerLinkWidth::Word32)
+		{
+			if (!m_code.EmitAndImm8(HOST_TMP1,
+					GprLinkSignature::VTLB_POINTER_HOST, 3, true))
+			{
+				return false;
+			}
+			m_compatible_vtlb_pointer_unaligned_fallback =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (m_compatible_vtlb_pointer_unaligned_fallback == static_cast<size_t>(-1))
+				return false;
+		}
+		if (!EmitVtlbNonHandlerHostAddress(GprLinkSignature::VTLB_POINTER_HOST,
 				HOST_TMP1, HOST_TMP2, &m_compatible_vtlb_pointer_handler_fallback,
 				&m_compatible_vtlb_pointer_dirty_pins))
 		{
@@ -8088,6 +8254,7 @@ namespace VitaEE
 		m_compatible_link_entry_offset = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
+		m_compatible_vtlb_byte_pair_tail_index = static_cast<size_t>(-1);
 		m_compatible_vtlb_pointer_dirty_pins = {};
 		m_compatible_vtlb_pointer_guard_instructions = 0;
 		m_compatible_vtlb_pointer_translation_instructions = 0;
@@ -25679,10 +25846,15 @@ namespace VitaEE
 		const u32 imm_low = static_cast<u32>(imm);
 		const u32 imm_high = (imm < 0) ? 0xffffffffu : 0u;
 		const bool direct_result = FindGprPinHost(guest_reg) >= 0;
-		const unsigned result_reg = direct_result ? SelectGprLowResultHost(guest_reg, HOST_TMP4) : HOST_TMP4;
+		const unsigned fallback_result =
+			m_compatible_vtlb_pointer &&
+				m_gpr_link_signature.vtlb_pointer.width == VtlbPointerLinkWidth::BytePair8 ?
+				HOST_TMP3 : HOST_TMP4;
+		const unsigned result_reg = direct_result ?
+			SelectGprLowResultHost(guest_reg, fallback_result) : fallback_result;
 		if (!signed_compare)
 		{
-			if ((!direct_result && !m_code.EmitMovImm8(HOST_TMP4, 0)) ||
+			if ((!direct_result && !m_code.EmitMovImm8(result_reg, 0)) ||
 				!m_code.EmitCmpImm32(lhs_high, imm_high) ||
 				!(m_code.EmitCmpImm32(lhs_low, imm_low, VitaA32::Condition::EQ) ||
 					(m_code.EmitMovImm32(HOST_TMP2, imm_low) &&
@@ -26666,6 +26838,63 @@ namespace VitaEE
 #endif
 			return true;
 		};
+		const VtlbPointerLinkMapping& link_pointer = m_gpr_link_signature.vtlb_pointer;
+		if (m_compatible_vtlb_pointer_access &&
+			link_pointer.width == VtlbPointerLinkWidth::BytePair8 &&
+			pc == link_pointer.access_pc && width == ScalarLoadWidth::Byte &&
+			sign_extend && op == memRead32(link_pointer.access_pc) &&
+			m_compatible_vtlb_pointer_handler_fallback != static_cast<size_t>(-1))
+		{
+			if (!m_code.EmitLdrsbImm8(result_reg,
+					GprLinkSignature::VTLB_POINTER_HOST, 0) ||
+				!emit_store_result())
+			{
+				return false;
+			}
+
+			ScalarLoadColdTail tail{
+				static_cast<size_t>(-1),
+				m_compatible_vtlb_pointer_handler_fallback,
+				m_code.Size(),
+				pc,
+				raw_cycles_through_instruction,
+				event_exit,
+				read_helper,
+				width,
+				static_cast<u8>(rt),
+				sign_extend,
+				branch_delay_slot,
+				counter_read_event,
+				GprLinkSignature::VTLB_POINTER_HOST,
+				m_compatible_vtlb_pointer_dirty_pins,
+			};
+			m_compatible_vtlb_byte_pair_tail_index = m_scalar_load_cold_tails.size();
+			m_scalar_load_cold_tails.push_back(tail);
+			return true;
+		}
+		if (m_compatible_vtlb_pointer_access &&
+			link_pointer.width == VtlbPointerLinkWidth::BytePair8 &&
+			pc == link_pointer.access_pc + 2 * sizeof(u32) &&
+			width == ScalarLoadWidth::Byte && !sign_extend &&
+			op == memRead32(link_pointer.access_pc + 2 * sizeof(u32)) &&
+			m_compatible_vtlb_byte_pair_tail_index < m_scalar_load_cold_tails.size())
+		{
+			m_scalar_load_cold_tails[m_compatible_vtlb_byte_pair_tail_index].
+				compatible_byte_pair_delay_join = m_code.Size();
+			if (!m_code.EmitLdrbImm12PostIndex(result_reg,
+					GprLinkSignature::VTLB_POINTER_HOST, link_pointer.stride) ||
+				!emit_store_result())
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCompatibleVtlbPointerPostIncrementLoads++;
+			// A normal dynamic byte read emits effective-address formation plus
+			// the five-instruction resident-vTLB lookup before its LDRB.
+			g_qemuCompatibleVtlbBytePairRepeatedTranslationInstructionsElided += 6;
+#endif
+			return true;
+		}
 		if (m_compatible_vtlb_pointer_access &&
 			pc == m_gpr_link_signature.vtlb_pointer.access_pc &&
 			width == ScalarLoadWidth::Word && sign_extend &&
@@ -27049,9 +27278,50 @@ namespace VitaEE
 			return false;
 		}
 
+		if (tail.compatible_byte_pair_delay_join != static_cast<size_t>(-1))
+		{
+			// The first byte resolved to a PCSX2 vTLB handler. Preserve exact
+			// branch-delay ordering without putting a poison check on the direct
+			// hot path: form BNE's guest predicate now, perform the second read
+			// through memRead8(), and seed a private page-end byte. Rejoining at
+			// the delay slot consumes that byte with the same post-indexed LDRB as
+			// a direct mapping; r12 then lands on a page boundary and the next
+			// compatible iteration must retranslate. The first counter-page test
+			// above exits before this point, so the identical second address cannot
+			// require another mid-block event test.
+			const u32 branch = memRead32(tail.pc + sizeof(u32));
+			const u32 delay_load = memRead32(tail.pc + 2 * sizeof(u32));
+			const unsigned branch_opcode = branch >> 26;
+			const u32 previous_index = m_current_instruction_index;
+			m_current_instruction_index = 1;
+			const bool branch_ok = EmitBranchEqual(branch, branch_opcode == 0x04);
+			m_current_instruction_index = previous_index;
+			if (!branch_ok || !EmitSyncGprPinsToBacking() ||
+				!EmitEffectiveAddress(delay_load, HOST_TMP0) ||
+				!m_code.EmitCallAbsolute(tail.read_helper) ||
+				!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false) ||
+				!EmitReloadGprPinsAfterClobber(static_cast<u16>(
+					(1u << HOST_TMP0) | (1u << HOST_TMP1) | (1u << HOST_TMP2) |
+					(1u << HOST_TMP3) | (1u << HOST_TMP4) | (1u << HOST_LR))) ||
+				!m_code.EmitMovImm32(GprLinkSignature::VTLB_POINTER_HOST,
+					static_cast<u32>(reinterpret_cast<uptr>(
+						&s_compatible_vtlb_byte_pair_handler_page[
+							vtlb_private::VTLB_PAGE_MASK]))) ||
+				!m_code.EmitStrbImm12(HOST_TMP0,
+					GprLinkSignature::VTLB_POINTER_HOST, 0))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCompatibleVtlbBytePairHandlerSeeds++;
+#endif
+		}
+
 		const size_t tail_done = m_code.EmitBranchPlaceholder();
 		return tail_done != static_cast<size_t>(-1) &&
-			   m_code.PatchBranch(tail_done, tail.join_offset);
+			   m_code.PatchBranch(tail_done,
+				   tail.compatible_byte_pair_delay_join != static_cast<size_t>(-1) ?
+					   tail.compatible_byte_pair_delay_join : tail.join_offset);
 	}
 
 	void BlockCompiler::CaptureScalarStoreValue(ScalarStoreColdTail* tail)
@@ -27123,7 +27393,9 @@ namespace VitaEE
 		}
 
 		if (!m_code.EmitCallAbsolute(tail.write_helper) ||
-			!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false))
+			!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false) ||
+			(m_compatible_vtlb_pointer &&
+			 !m_code.EmitMovImm8(GprLinkSignature::VTLB_POINTER_HOST, 0)))
 			return false;
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();
