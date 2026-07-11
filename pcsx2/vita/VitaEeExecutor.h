@@ -114,6 +114,7 @@ namespace VitaEE
 		void SetCompatibleVtlbWriteGuardHoistEnabled(bool enabled);
 		void SetCompatibleVtlbReadGuardHoistEnabled(bool enabled);
 		void SetSingleBlockGprLinkEnabled(bool enabled);
+		void SetReciprocalJumpGprLinkEnabled(bool enabled);
 		void SetThreeBlockGprLinkEnabled(bool enabled);
 		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled);
 #endif
@@ -286,6 +287,7 @@ namespace VitaEE
 		bool m_compatible_vtlb_write_guard_hoist_enabled = true;
 		bool m_compatible_vtlb_read_guard_hoist_enabled = true;
 		bool m_single_block_gpr_link_enabled = true;
+		bool m_reciprocal_jump_gpr_link_enabled = true;
 		bool m_three_block_gpr_link_enabled = true;
 		bool m_vtlb_linked_entry_pc_publication_enabled = false;
 #endif

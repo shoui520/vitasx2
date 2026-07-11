@@ -110,6 +110,11 @@ u32 g_qemuResidentRawGpr0QwordBlocks = 0;
 u32 g_qemuResidentRawGpr0QwordStoreSelections = 0;
 u32 g_qemuResidentRawGpr0QwordHotInstructionsElided = 0;
 u32 g_qemuResidentRawGpr0QwordColdReloadInstructions = 0;
+u32 g_qemuCompatibleRawGpr0QwordBlocks = 0;
+u32 g_qemuCompatibleRawGpr0QwordStoreSelections = 0;
+u32 g_qemuCompatibleRawGpr0QwordHotInstructionsElided = 0;
+u32 g_qemuCompatibleRawGpr0QwordColdReloadInstructions = 0;
+u32 g_qemuGenericVtlbQwordStoreTranslationInstructions = 0;
 u32 g_qemuResidentVtlbQwordPointerBlocks = 0;
 u32 g_qemuResidentVtlbQwordPointerStores = 0;
 u32 g_qemuResidentVtlbQwordPointerGuardInstructions = 0;
@@ -3551,9 +3556,12 @@ namespace VitaEE
 
 			if (expected_direction == VtlbPointerLinkDirection::Write)
 			{
-				return pointer.width == VtlbPointerLinkWidth::Byte8 &&
-					pointer.guest_result != 0 && pointer.guest_result2 == 0 &&
-					pointer.stride == 1;
+				return (pointer.width == VtlbPointerLinkWidth::Byte8 &&
+						pointer.guest_result != 0 && pointer.guest_result2 == 0 &&
+						pointer.stride == 1) ||
+					(pointer.width == VtlbPointerLinkWidth::Qword128 &&
+						pointer.guest_result == 0 && pointer.guest_result2 == 0 &&
+						pointer.stride == 16);
 			}
 
 			return (pointer.width == VtlbPointerLinkWidth::Byte8 &&
@@ -3577,6 +3585,13 @@ namespace VitaEE
 				((vtlb_pointer.width != VtlbPointerLinkWidth::Byte8 &&
 				  vtlb_pointer.width != VtlbPointerLinkWidth::BytePair8) ||
 				 vtlb_write_pointer.guest_address == vtlb_pointer.guest_address)) ||
+			(gpr_qword.IsValid() &&
+				(gpr_qword.host_qreg != 0 || gpr_qword.guest != 0 ||
+				 !vtlb_write_pointer.IsValid() ||
+				 vtlb_write_pointer.width != VtlbPointerLinkWidth::Qword128)) ||
+			(vtlb_write_pointer.IsValid() &&
+				vtlb_write_pointer.width == VtlbPointerLinkWidth::Qword128 &&
+				!gpr_qword.IsValid()) ||
 			(predicate.IsValid() &&
 				(predicate.host != PREDICATE_HOST || predicate.guest == 0 ||
 				 predicate.guest >= 32 ||
@@ -3855,6 +3870,7 @@ namespace VitaEE
 				}
 				switch (opcode)
 				{
+					case 0x02: // J only changes control flow.
 					case 0x04: // BEQ
 					case 0x05: // BNE
 					case 0x09: // ADDIU
@@ -3864,6 +3880,8 @@ namespace VitaEE
 					case 0x20: // LB
 					case 0x24: // LBU
 					case 0x28: // SB
+					case 0x1f: // SQ uses r0-r3/q0 in its direct path; its helper
+						// seam publishes and rebuilds the compatible countdown.
 						continue;
 					case 0x23: // LW
 						// A handler-backed counter-page LW in a branch delay slot
@@ -3997,7 +4015,107 @@ namespace VitaEE
 			}
 			return true;
 		};
-		if (!allocate_mappings(false, chain_block_count == 1))
+
+		// The dominant uncovered scout loop is a reciprocal conditional/J zero
+		// fill rather than the already-optimized conditional self block:
+		//   A: BEQ address,limit,exit; NOP
+		//   B: SQ zero,0(address); ADDIU address,address,16; NOP; NOP; J A; NOP
+		// PCSX2 recStore(128) keeps raw GPR0 in an XMM MODE_READ mapping,
+		// DynGen_DirectWrite() consumes a retained translated address, iCore keeps
+		// both scalar operands live, and BaseBlocks::Link()/iBranchTest() own the
+		// two reversible edges and private scheduler state. Carry the equivalent
+		// q0/r3/core-register contract across both A32 blocks.
+		bool sequential_qword_fill_requires_reclaimed_hosts = false;
+		const auto try_add_sequential_qword_fill = [&]() {
+			if (chain_block_count != 2)
+				return false;
+
+			u32 head_pc = 0;
+			u32 fill_pc = 0;
+			for (u8 block = 0; block < chain_block_count; block++)
+			{
+				if (chain_instruction_counts[block] == 2)
+					head_pc = chain_pcs[block];
+				else if (chain_instruction_counts[block] == 6)
+					fill_pc = chain_pcs[block];
+			}
+			if (head_pc == 0 || fill_pc != head_pc + 2 * sizeof(u32))
+				return false;
+
+			const u32 branch = memRead32(head_pc);
+			const u32 branch_delay = memRead32(head_pc + sizeof(u32));
+			const u32 store = memRead32(fill_pc);
+			const u32 advance = memRead32(fill_pc + sizeof(u32));
+			const u32 nop0 = memRead32(fill_pc + 2 * sizeof(u32));
+			const u32 nop1 = memRead32(fill_pc + 3 * sizeof(u32));
+			const u32 jump = memRead32(fill_pc + 4 * sizeof(u32));
+			const u32 jump_delay = memRead32(fill_pc + 5 * sizeof(u32));
+			if ((branch >> 26) != 0x04 || branch_delay != 0 ||
+				(store >> 26) != 0x1f || RT(store) != 0 || IMM_S(store) != 0 ||
+				(advance >> 26) != 0x09 || nop0 != 0 || nop1 != 0 ||
+				(jump >> 26) != 0x02 || jump_delay != 0 ||
+				JumpTarget(fill_pc + 4 * sizeof(u32), jump) != head_pc)
+			{
+				return false;
+			}
+
+			const unsigned address = RS(store);
+			const unsigned limit = RS(branch) == address ? RT(branch) :
+				(RT(branch) == address ? RS(branch) : 0);
+			const u32 exit_pc = BranchTarget(head_pc, branch);
+			if (address == 0 || limit == 0 || address == limit ||
+				RS(advance) != address || RT(advance) != address ||
+				IMM_S(advance) != 16 || exit_pc == head_pc ||
+				(exit_pc >= fill_pc && exit_pc < fill_pc + 6 * sizeof(u32)))
+			{
+				return false;
+			}
+			// BEQ compares the complete EE low 64 bits. Without reclaimed r7/r8,
+			// only three callee-saved scalar hosts remain, which cannot retain both
+			// address and limit pairs. Reject the signature instead of silently
+			// narrowing the clean limit mapping to 32 bits.
+			if (!reclaim_vtlb_hosts)
+			{
+				sequential_qword_fill_requires_reclaimed_hosts = true;
+				return false;
+			}
+
+			for (GprLinkMapping& mapping : signature->mappings)
+				mapping = {};
+			signature->count = 2;
+			GprLinkMapping& address_mapping = signature->mappings[0];
+			address_mapping.guest = static_cast<u8>(address);
+			address_mapping.low_host = 7;
+			address_mapping.high_host = 8;
+			address_mapping.width = GprLinkWidth::Low64;
+			address_mapping.dirty = GprLinkDirtyState::WriteBack;
+			GprLinkMapping& limit_mapping = signature->mappings[1];
+			limit_mapping.guest = static_cast<u8>(limit);
+			limit_mapping.low_host = 9;
+			limit_mapping.high_host = 10;
+			limit_mapping.width = GprLinkWidth::Low64;
+			limit_mapping.dirty = GprLinkDirtyState::Clean;
+
+			VtlbPointerLinkMapping& pointer = signature->vtlb_write_pointer;
+			pointer.host = GprLinkSignature::VTLB_WRITE_POINTER_HOST;
+			pointer.guest_address = static_cast<u8>(address);
+			pointer.guest_result = 0;
+			pointer.stride = 16;
+			pointer.access_block_pc = fill_pc;
+			pointer.access_pc = fill_pc;
+			pointer.advance_pc = fill_pc;
+			pointer.width = VtlbPointerLinkWidth::Qword128;
+			pointer.direction = VtlbPointerLinkDirection::Write;
+			signature->gpr_qword.host_qreg = 0;
+			signature->gpr_qword.guest = 0;
+			return true;
+		};
+
+		const bool sequential_qword_fill = try_add_sequential_qword_fill();
+		if (sequential_qword_fill_requires_reclaimed_hosts)
+			return false;
+		if (!sequential_qword_fill &&
+			!allocate_mappings(false, chain_block_count == 1))
 			return false;
 
 		// PCSX2 owner: recVTLB.cpp::DynGen_PrepRegs() keeps the translated
@@ -7483,15 +7601,15 @@ namespace VitaEE
 			m_current_instruction_index == m_forwarded_boolean_producer_index;
 	}
 
-	bool BlockCompiler::EmitStageResidentRawGpr0Qword()
+	bool BlockCompiler::EmitStageRawGpr0Qword()
 	{
-		if (!m_resident_raw_gpr0_qword)
+		if (!m_resident_raw_gpr0_qword && !m_compatible_raw_gpr0_qword)
 			return true;
 
 		// PCSX2 owner: iR5900LoadStore.cpp::recStore(128) obtains the raw SQ
 		// source through iCore's persistent MODE_READ XMM mapping. Establish the
 		// same raw GPR0 value once at canonical entry, including the LD-$zero
-		// compatibility case, then let the exact resident self-edge retain q0.
+		// compatibility case, then let a signature-equal direct edge retain q0.
 		constexpr unsigned NEON_VALUE = 0;
 		const size_t prelude_start = m_code.Size();
 		if (!EmitLoadRawGpr0KnownZeroFlag(HOST_TMP1) ||
@@ -7524,9 +7642,15 @@ namespace VitaEE
 			return false;
 		}
 
-		m_resident_raw_gpr0_entry_instructions = static_cast<u8>(hot_instructions);
+		if (m_compatible_raw_gpr0_qword)
+			m_compatible_raw_gpr0_entry_instructions = static_cast<u8>(hot_instructions);
+		else
+			m_resident_raw_gpr0_entry_instructions = static_cast<u8>(hot_instructions);
 #if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuResidentRawGpr0QwordBlocks++;
+		if (m_compatible_raw_gpr0_qword)
+			g_qemuCompatibleRawGpr0QwordBlocks++;
+		else
+			g_qemuResidentRawGpr0QwordBlocks++;
 #endif
 		return true;
 	}
@@ -7714,7 +7838,8 @@ namespace VitaEE
 
 		// PCSX2 owner: recVTLB.cpp::DynGen_PrepRegs()/DynGen_DirectRead(). r12
 		// carries the direct read address across compatible links; PCSX2's matching
-		// DynGen_DirectWrite() mechanism uses r3 for the byte-copy destination.
+		// DynGen_DirectWrite() mechanism uses r3 for write destinations, including
+		// the sequential qword-fill stream.
 		// Post-indexed memory operations advance either private pointer and the
 		// matching guest ADDIU catches architectural state up. Direct VTLB mappings
 		// preserve the guest page offset, so low 12 bits zero means canonical entry,
@@ -7747,8 +7872,20 @@ namespace VitaEE
 			if (*unaligned_fallback == static_cast<size_t>(-1))
 				return false;
 		}
-		if (!handler_fallback || !dirty_pins ||
-			!EmitVtlbNonHandlerHostAddress(pointer.host, HOST_TMP1, HOST_TMP2,
+		if (!handler_fallback || !dirty_pins)
+		{
+			return false;
+		}
+		if (pointer.width == VtlbPointerLinkWidth::Qword128)
+		{
+			if (!EmitAlignQwordAddress(pointer.host, HOST_TMP1) ||
+				!EmitVtlbNonHandlerHostAddress128(pointer.host, HOST_TMP1, HOST_TMP2,
+					handler_fallback, dirty_pins))
+			{
+				return false;
+			}
+		}
+		else if (!EmitVtlbNonHandlerHostAddress(pointer.host, HOST_TMP1, HOST_TMP2,
 				handler_fallback, dirty_pins))
 		{
 			return false;
@@ -8757,6 +8894,8 @@ namespace VitaEE
 			ForwardedBooleanPrefixStoresRawGpr0(
 				start_pc, m_forwarded_boolean_producer_index);
 		m_resident_raw_gpr0_entry_instructions = 0;
+		m_compatible_raw_gpr0_qword = m_gpr_link_signature.HasGprQword();
+		m_compatible_raw_gpr0_entry_instructions = 0;
 		m_resident_vtlb_qword_store_op = 0;
 		const u32 forwarded_producer_op = m_forwarded_boolean_branch ?
 			memRead32(start_pc + m_forwarded_boolean_producer_index * sizeof(u32)) : 0;
@@ -8921,6 +9060,10 @@ namespace VitaEE
 			return false;
 		if (!EmitStageCompatiblePredicate())
 			return false;
+		// q0 is a clean raw-GPR0 mapping in the compatible signature. Canonical
+		// entries establish it once; signature-equal links enter after this prelude.
+		if (m_compatible_raw_gpr0_qword && !EmitStageRawGpr0Qword())
+			return false;
 		if (m_gpr_link_signature.IsValid())
 		{
 			m_compatible_link_entry_offset = m_code.Size();
@@ -8955,7 +9098,7 @@ namespace VitaEE
 			}
 			resident_entry_loads += 2;
 		}
-		if (!EmitStageResidentRawGpr0Qword())
+		if (m_resident_raw_gpr0_qword && !EmitStageRawGpr0Qword())
 			return false;
 		if (!EmitStageResidentSchedulerCountdown(true))
 			return false;
@@ -24172,18 +24315,29 @@ namespace VitaEE
 	{
 		const unsigned rt = RT(op);
 		constexpr unsigned NEON_VALUE = 0;
+		const bool raw_gpr0_qword_resident =
+			m_resident_raw_gpr0_qword || m_compatible_raw_gpr0_qword;
 
 		const auto emit_store_to_host = [&](unsigned host_address = HOST_TMP0,
 			bool writeback = false) -> bool
 		{
 			if (rt == 0)
 			{
-				if (m_resident_raw_gpr0_qword)
+				if (raw_gpr0_qword_resident)
 				{
 #if defined(VITASX2_QEMU_VALIDATION)
-					g_qemuResidentRawGpr0QwordStoreSelections++;
-					g_qemuResidentRawGpr0QwordHotInstructionsElided +=
-						m_resident_raw_gpr0_entry_instructions;
+					if (m_compatible_raw_gpr0_qword)
+					{
+						g_qemuCompatibleRawGpr0QwordStoreSelections++;
+						g_qemuCompatibleRawGpr0QwordHotInstructionsElided +=
+							m_compatible_raw_gpr0_entry_instructions;
+					}
+					else
+					{
+						g_qemuResidentRawGpr0QwordStoreSelections++;
+						g_qemuResidentRawGpr0QwordHotInstructionsElided +=
+							m_resident_raw_gpr0_entry_instructions;
+					}
 #endif
 					return writeback ?
 						m_code.EmitVst1Q32AlignedWriteback(NEON_VALUE, host_address) :
@@ -24240,26 +24394,43 @@ namespace VitaEE
 				   m_code.EmitVst1Q32Aligned(value_qreg, host_address);
 		};
 
-		if (m_resident_vtlb_qword_pointer && op == m_resident_vtlb_qword_store_op)
+		const VtlbPointerLinkMapping& compatible_write_pointer =
+			m_gpr_link_signature.vtlb_write_pointer;
+		const u32 pc = m_current_block_start_pc +
+			m_current_instruction_index * sizeof(u32);
+		const bool compatible_qword_pointer =
+			m_compatible_vtlb_write_pointer_access &&
+			compatible_write_pointer.width == VtlbPointerLinkWidth::Qword128 &&
+			pc == compatible_write_pointer.access_pc;
+		const bool resident_qword_pointer =
+			m_resident_vtlb_qword_pointer && op == m_resident_vtlb_qword_store_op;
+		if (resident_qword_pointer || compatible_qword_pointer)
 		{
 			if (!emit_store_to_host(HOST_TMP3, true))
 				return false;
 #if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuResidentVtlbQwordPointerStores++;
-			g_qemuResidentVtlbQwordPointerPostIncrementStores++;
-			if (m_resident_vtlb_qword_translation_instructions >=
-				m_resident_vtlb_qword_guard_instructions)
+			if (resident_qword_pointer)
 			{
-				g_qemuResidentVtlbQwordPointerHotInstructionsElided +=
-					m_resident_vtlb_qword_translation_instructions -
-					m_resident_vtlb_qword_guard_instructions;
+				g_qemuResidentVtlbQwordPointerStores++;
+				g_qemuResidentVtlbQwordPointerPostIncrementStores++;
+				if (m_resident_vtlb_qword_translation_instructions >=
+					m_resident_vtlb_qword_guard_instructions)
+				{
+					g_qemuResidentVtlbQwordPointerHotInstructionsElided +=
+						m_resident_vtlb_qword_translation_instructions -
+						m_resident_vtlb_qword_guard_instructions;
+				}
 			}
+			else
+				g_qemuCompatibleVtlbWritePointerPostIncrementStores++;
 #endif
 			m_qword_store_cold_tails.push_back({
-				m_resident_vtlb_qword_handler_fallback,
+				resident_qword_pointer ? m_resident_vtlb_qword_handler_fallback :
+					m_compatible_vtlb_write_pointer_handler_fallback,
 				m_code.Size(),
 				rt,
-				m_resident_vtlb_qword_dirty_pins,
+				resident_qword_pointer ? m_resident_vtlb_qword_dirty_pins :
+					m_compatible_vtlb_write_pointer_dirty_pins,
 			});
 			return true;
 		}
@@ -24274,6 +24445,7 @@ namespace VitaEE
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		GprPinDirtyMasks dirty_pins;
+		const size_t translation_start = m_code.Size();
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitAlignQwordAddress(HOST_TMP0, HOST_TMP1) ||
 			!EmitVtlbNonHandlerHostAddress128(
@@ -24281,6 +24453,10 @@ namespace VitaEE
 		{
 			return false;
 		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGenericVtlbQwordStoreTranslationInstructions += static_cast<u32>(
+			(m_code.Size() - translation_start) / sizeof(u32));
+#endif
 
 		if (!emit_store_to_host())
 			return false;
@@ -28533,6 +28709,12 @@ namespace VitaEE
 		// Handler-backed pages dispatch through vTLB directly. SQ reads the raw
 		// GPR backing slot, including r0, matching R5900OpcodeImpl.cpp::SQ().
 		constexpr unsigned NEON_VALUE = 0;
+		const bool compatible_qword_pointer =
+			m_gpr_link_signature.HasVtlbWritePointer() &&
+			m_gpr_link_signature.vtlb_write_pointer.width ==
+				VtlbPointerLinkWidth::Qword128;
+		const bool raw_gpr0_qword_resident =
+			m_resident_raw_gpr0_qword || m_compatible_raw_gpr0_qword;
 		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
@@ -28552,7 +28734,8 @@ namespace VitaEE
 		if (!EmitPrepareResidentForwardedBooleanForPreProducerSync() ||
 			!EmitSyncGprPinsToBacking(&tail.dirty_pins, true))
 			return false;
-		if (m_resident_vtlb_qword_pointer && tail.rt == 0 &&
+		if ((m_resident_vtlb_qword_pointer || compatible_qword_pointer) &&
+			tail.rt == 0 &&
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP3,
 				VitaA32::ShiftType::LSL, 0))
 		{
@@ -28591,6 +28774,13 @@ namespace VitaEE
 				(m_code.Size() - stage_start) / sizeof(u32));
 #endif
 		}
+		else if (m_compatible_scheduler_countdown)
+		{
+			// The helper observed the published cycle and may tighten the deadline.
+			// Rebuild PCSX2 iBranchTest()'s private r6 delta before rejoining.
+			if (!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false))
+				return false;
+		}
 		else if (m_resident_cycle_low)
 		{
 			// r0 is caller-clobbered and carried the handler address. Rebuild the
@@ -28605,7 +28795,7 @@ namespace VitaEE
 			g_qemuResidentCycleLowColdReloadInstructions++;
 #endif
 		}
-		if (m_resident_raw_gpr0_qword && tail.rt == 0)
+		if (raw_gpr0_qword_resident && tail.rt == 0)
 		{
 			// q0 is caller-clobbered by the handler ABI. Rebuild the resident raw
 			// source before rejoining so a handler-to-RAM page transition cannot
@@ -28614,8 +28804,12 @@ namespace VitaEE
 			if (!EmitLoadCpuRegsQ128(GprOffset(0), NEON_VALUE, HOST_TMP1))
 				return false;
 #if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuResidentRawGpr0QwordColdReloadInstructions += static_cast<u32>(
+			const u32 reload_instructions = static_cast<u32>(
 				(m_code.Size() - reload_start) / sizeof(u32));
+			if (m_compatible_raw_gpr0_qword)
+				g_qemuCompatibleRawGpr0QwordColdReloadInstructions += reload_instructions;
+			else
+				g_qemuResidentRawGpr0QwordColdReloadInstructions += reload_instructions;
 #endif
 		}
 		if (m_resident_vtlb_qword_pointer && tail.rt == 0)
@@ -28629,6 +28823,16 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuResidentVtlbQwordPointerColdInvalidationInstructions +=
 				static_cast<u32>((m_code.Size() - invalidate_start) / sizeof(u32));
+#endif
+		}
+		else if (compatible_qword_pointer && tail.rt == 0)
+		{
+			const size_t invalidate_start = m_code.Size();
+			if (!EmitInvalidateCompatibleVtlbPointers())
+				return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCompatibleVtlbWritePointerColdInvalidations += static_cast<u32>(
+				(m_code.Size() - invalidate_start) / sizeof(u32));
 #endif
 		}
 

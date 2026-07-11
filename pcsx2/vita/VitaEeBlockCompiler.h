@@ -98,6 +98,7 @@ namespace VitaEE
 		Byte8,
 		BytePair8,
 		Word32,
+		Qword128,
 	};
 
 	enum class VtlbPointerLinkDirection : u8
@@ -193,6 +194,35 @@ namespace VitaEE
 		}
 	};
 
+	enum class GprQwordLinkRepresentation : u8
+	{
+		RawArchitecturalBacking,
+	};
+
+	enum class GprQwordLinkProvenance : u8
+	{
+		CanonicalOrCompatibleGpr,
+	};
+
+	struct GprQwordLinkMapping
+	{
+		static constexpr u8 NO_HOST = 0xff;
+
+		u8 host_qreg = NO_HOST;
+		u8 guest = 0;
+		GprQwordLinkRepresentation representation =
+			GprQwordLinkRepresentation::RawArchitecturalBacking;
+		GprQwordLinkProvenance provenance =
+			GprQwordLinkProvenance::CanonicalOrCompatibleGpr;
+
+		bool IsValid() const { return host_qreg != NO_HOST; }
+		bool operator==(const GprQwordLinkMapping& rhs) const
+		{
+			return host_qreg == rhs.host_qreg && guest == rhs.guest &&
+				representation == rhs.representation && provenance == rhs.provenance;
+		}
+	};
+
 	enum class PredicateLinkRepresentation : u8
 	{
 		ArchitecturalZeroOrOne,
@@ -244,6 +274,7 @@ namespace VitaEE
 		SchedulerLinkMapping scheduler{};
 		VtlbPointerLinkMapping vtlb_pointer{};
 		VtlbPointerLinkMapping vtlb_write_pointer{};
+		GprQwordLinkMapping gpr_qword{};
 		PredicateLinkMapping predicate{};
 		u32 block_pcs[MAX_BLOCKS]{};
 		u8 count = 0;
@@ -255,6 +286,7 @@ namespace VitaEE
 		bool HasSchedulerCountdown() const { return scheduler.IsValid(); }
 		bool HasVtlbPointer() const { return vtlb_pointer.IsValid(); }
 		bool HasVtlbWritePointer() const { return vtlb_write_pointer.IsValid(); }
+		bool HasGprQword() const { return gpr_qword.IsValid(); }
 		bool HasPredicate() const { return predicate.IsValid(); }
 		bool ReclaimsVtlbHosts() const;
 		u8 WordCount() const;
@@ -265,6 +297,7 @@ namespace VitaEE
 				!(scheduler == rhs.scheduler) ||
 				!(vtlb_pointer == rhs.vtlb_pointer) ||
 				!(vtlb_write_pointer == rhs.vtlb_write_pointer) ||
+				!(gpr_qword == rhs.gpr_qword) ||
 				!(predicate == rhs.predicate) ||
 				block_pcs[0] != rhs.block_pcs[0] || block_pcs[1] != rhs.block_pcs[1] ||
 				block_pcs[2] != rhs.block_pcs[2])
@@ -924,7 +957,7 @@ namespace VitaEE
 		bool EmitRestoreResidentSchedulerCountdown();
 		bool EmitDeferredResidentUnsignedBranchSuffix(bool event_path = false);
 		bool IsForwardedBooleanBranchResult(unsigned guest_reg) const;
-		bool EmitStageResidentRawGpr0Qword();
+		bool EmitStageRawGpr0Qword();
 		bool EmitStageResidentVtlbQwordPointer();
 		int FindGprPinIndex(unsigned guest_reg) const;
 		int FindGprPinHost(unsigned guest_reg) const;
@@ -1217,6 +1250,8 @@ namespace VitaEE
 		u32 m_forwarded_boolean_producer_index = 0;
 		bool m_resident_raw_gpr0_qword = false;
 		u8 m_resident_raw_gpr0_entry_instructions = 0;
+		bool m_compatible_raw_gpr0_qword = false;
+		u8 m_compatible_raw_gpr0_entry_instructions = 0;
 		bool m_resident_vtlb_qword_pointer = false;
 		bool m_resident_cycle_low = false;
 		bool m_resident_scheduler_countdown = false;

@@ -734,6 +734,15 @@ namespace VitaEE
 		m_single_block_gpr_link_enabled = enabled;
 	}
 
+	void BlockExecutor::SetReciprocalJumpGprLinkEnabled(bool enabled)
+	{
+		if (m_reciprocal_jump_gpr_link_enabled == enabled)
+			return;
+
+		Reset();
+		m_reciprocal_jump_gpr_link_enabled = enabled;
+	}
+
 	void BlockExecutor::SetThreeBlockGprLinkEnabled(bool enabled)
 	{
 		if (m_three_block_gpr_link_enabled == enabled)
@@ -963,7 +972,7 @@ namespace VitaEE
 			return false;
 		}
 
-		const auto successors = [](u32 block_pc, u32 block_instructions,
+		const auto successors = [this](u32 block_pc, u32 block_instructions,
 			u32* fallthrough, u32* taken) {
 			if (!fallthrough || !taken || block_instructions < 2 ||
 				block_instructions > ((UINT32_MAX - block_pc) / sizeof(u32)))
@@ -973,6 +982,21 @@ namespace VitaEE
 			const u32 branch_pc = block_pc + (block_instructions - 2) * sizeof(u32);
 			const u32 op = memRead32(branch_pc);
 			const unsigned opcode = op >> 26;
+			if (opcode == 0x02)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (!m_reciprocal_jump_gpr_link_enabled)
+					return false;
+#endif
+				// PCSX2 BaseBlocks::Link() treats a static J as one reversible edge.
+				// Report it in both slots so reciprocal-cycle discovery can share its
+				// existing conditional-partner walk without inventing a fallthrough.
+				const u32 target = ((branch_pc + sizeof(u32)) & 0xf0000000u) |
+					((op & 0x03ffffffu) << 2);
+				*fallthrough = target;
+				*taken = target;
+				return true;
+			}
 			if (!((opcode >= 0x04 && opcode <= 0x07) ||
 				(opcode >= 0x14 && opcode <= 0x17)))
 			{
@@ -1003,6 +1027,7 @@ namespace VitaEE
 			{
 				candidate->vtlb_pointer = VtlbPointerLinkMapping{};
 				candidate->vtlb_write_pointer = VtlbPointerLinkMapping{};
+				candidate->gpr_qword = GprQwordLinkMapping{};
 			}
 			if (!m_compatible_predicate_carry_enabled)
 				candidate->predicate = PredicateLinkMapping{};
