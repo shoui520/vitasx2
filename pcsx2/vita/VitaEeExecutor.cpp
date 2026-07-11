@@ -369,6 +369,9 @@ namespace VitaEE
 		block.linked_entry_offset = 0;
 		block.resident_self_link_entry_offset = static_cast<size_t>(-1);
 		block.resident_self_link_entry_loads = 0;
+		block.gpr_link_signature = {};
+		block.compatible_link_entry_offset = static_cast<size_t>(-1);
+		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -486,6 +489,9 @@ namespace VitaEE
 			block.linked_entry_offset = 0;
 			block.resident_self_link_entry_offset = static_cast<size_t>(-1);
 			block.resident_self_link_entry_loads = 0;
+			block.gpr_link_signature = {};
+			block.compatible_link_entry_offset = static_cast<size_t>(-1);
+			block.compatible_link_entry_loads = 0;
 			block.direct_links = {};
 			RememberFreeCacheEntry(block);
 		}
@@ -774,6 +780,74 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockExecutor::AnalyzeGprLinkSignature(u32 start_pc, u32 instruction_count,
+		GprLinkSignature* signature) const
+	{
+		if (!signature)
+			return false;
+		*signature = {};
+		if (!m_persistent_dispatch_enabled || !m_direct_linking_enabled ||
+			instruction_count < 2)
+		{
+			return false;
+		}
+
+		const auto successors = [](u32 block_pc, u32 block_instructions,
+			u32* fallthrough, u32* taken) {
+			if (!fallthrough || !taken || block_instructions < 2 ||
+				block_instructions > ((UINT32_MAX - block_pc) / sizeof(u32)))
+			{
+				return false;
+			}
+			const u32 branch_pc = block_pc + (block_instructions - 2) * sizeof(u32);
+			const u32 op = memRead32(branch_pc);
+			const unsigned opcode = op >> 26;
+			if (!((opcode >= 0x04 && opcode <= 0x07) ||
+				(opcode >= 0x14 && opcode <= 0x17)))
+			{
+				return false;
+			}
+			*fallthrough = block_pc + block_instructions * sizeof(u32);
+			const s32 displacement = static_cast<s32>(static_cast<s16>(op & 0xffffu)) * 4;
+			*taken = branch_pc + sizeof(u32) + static_cast<u32>(displacement);
+			return true;
+		};
+
+		u32 fallthrough = 0;
+		u32 taken = 0;
+		if (!successors(start_pc, instruction_count, &fallthrough, &taken))
+			return false;
+
+		const u32 candidates[2] = {fallthrough, taken};
+		for (const u32 candidate_pc : candidates)
+		{
+			if (candidate_pc == start_pc || (candidate_pc & 3u) != 0)
+				continue;
+
+			BlockScanResult partner;
+			if (!ScanStraightLineBlock(candidate_pc,
+					MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &partner) ||
+				partner.instruction_count < 2 || partner.stop != BlockScanStop::Branch)
+			{
+				continue;
+			}
+
+			u32 partner_fallthrough = 0;
+			u32 partner_taken = 0;
+			if (!successors(candidate_pc, partner.instruction_count,
+					&partner_fallthrough, &partner_taken) ||
+				(partner_fallthrough != start_pc && partner_taken != start_pc))
+			{
+				continue;
+			}
+
+			return BlockCompiler::BuildCleanGprLinkSignature(start_pc, instruction_count,
+				candidate_pc, partner.instruction_count, signature);
+		}
+
+		return false;
+	}
+
 	bool BlockExecutor::ValidateCachedBlock(CachedBlock& block, bool validate_source_words)
 	{
 		if (!block.valid)
@@ -1009,6 +1083,10 @@ namespace VitaEE
 		size_t compiled_linked_entry_offset = 0;
 		size_t compiled_resident_self_link_entry_offset = static_cast<size_t>(-1);
 		u8 compiled_resident_self_link_entry_loads = 0;
+		GprLinkSignature compiled_gpr_link_signature{};
+		AnalyzeGprLinkSignature(start_pc, instruction_count, &compiled_gpr_link_signature);
+		size_t compiled_compatible_link_entry_offset = static_cast<size_t>(-1);
+		u8 compiled_compatible_link_entry_loads = 0;
 		DirectLinkSlots direct_links;
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
@@ -1039,12 +1117,15 @@ namespace VitaEE
 			size_t attempt_linked_entry_offset = 0;
 			size_t attempt_resident_self_link_entry_offset = static_cast<size_t>(-1);
 			u8 attempt_resident_self_link_entry_loads = 0;
+			size_t attempt_compatible_link_entry_offset = static_cast<size_t>(-1);
+			u8 attempt_compatible_link_entry_loads = 0;
 			DirectLinkSlots attempt_direct_links;
 			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
 				direct_exit, event_exit, &attempt_scaled_cycles, &attempt_direct_links,
 				&m_active_generated_lookup_pages, &m_direct_linking_enabled, &attempt_linked_entry_offset,
 				m_persistent_dispatch_enabled, &attempt_resident_self_link_entry_offset,
-				&attempt_resident_self_link_entry_loads);
+				&attempt_resident_self_link_entry_loads, &compiled_gpr_link_signature,
+				&attempt_compatible_link_entry_offset, &attempt_compatible_link_entry_loads);
 			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
 			const size_t failure_code_size = block.code.Size();
 			const size_t failure_code_capacity = block.code.Capacity();
@@ -1056,6 +1137,8 @@ namespace VitaEE
 				compiled_linked_entry_offset = attempt_linked_entry_offset;
 				compiled_resident_self_link_entry_offset = attempt_resident_self_link_entry_offset;
 				compiled_resident_self_link_entry_loads = attempt_resident_self_link_entry_loads;
+				compiled_compatible_link_entry_offset = attempt_compatible_link_entry_offset;
+				compiled_compatible_link_entry_loads = attempt_compatible_link_entry_loads;
 				direct_links = attempt_direct_links;
 				break;
 			}
@@ -1081,6 +1164,9 @@ namespace VitaEE
 		block.linked_entry_offset = compiled_linked_entry_offset;
 		block.resident_self_link_entry_offset = compiled_resident_self_link_entry_offset;
 		block.resident_self_link_entry_loads = compiled_resident_self_link_entry_loads;
+		block.gpr_link_signature = compiled_gpr_link_signature;
+		block.compatible_link_entry_offset = compiled_compatible_link_entry_offset;
+		block.compatible_link_entry_loads = compiled_compatible_link_entry_loads;
 		block.direct_links = direct_links;
 		block.valid = true;
 		if (!RegisterBlockRecord(block))
@@ -1096,13 +1182,13 @@ namespace VitaEE
 
 		if (m_direct_linking_enabled)
 		{
-			PatchIncomingLinks(block.start_pc, LinkedEntryPoint(block));
+			PatchIncomingLinks(block);
 			for (DirectLinkSlot& link : block.direct_links.slots)
 			{
 				if (link.valid)
 				{
 					if (CachedBlock* target = FindCachedBlockByStartPc(link.target_pc, false))
-						PatchDirectLink(block, link, LinkedEntryPoint(*target));
+						PatchDirectLink(block, link, target);
 				}
 			}
 		}
@@ -1133,9 +1219,22 @@ namespace VitaEE
 			block.resident_self_link_entry_offset;
 	}
 
-	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target)
+	const void* BlockExecutor::CompatibleLinkEntryPoint(const CachedBlock& block) const
 	{
-		if (!target || !block.valid || !link.valid ||
+		if (!block.code.EntryPoint() || !block.gpr_link_signature.IsValid() ||
+			block.compatible_link_entry_loads == 0 ||
+			block.compatible_link_entry_offset >= block.code.Size())
+		{
+			return LinkedEntryPoint(block);
+		}
+
+		return static_cast<const u8*>(block.code.EntryPoint()) +
+			block.compatible_link_entry_offset;
+	}
+
+	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target)
+	{
+		if (!block.valid || !link.valid ||
 			link.target_offset == static_cast<size_t>(-1) ||
 			link.fallback_offset == static_cast<size_t>(-1))
 		{
@@ -1144,13 +1243,20 @@ namespace VitaEE
 
 		const void* direct_exit = m_persistent_dispatch_enabled ?
 			m_persistent_direct_exit : reinterpret_cast<const void*>(&VitaEeA32DirectExit);
-		const bool target_is_direct_exit = target == direct_exit;
-		// PCSX2 BaseBlocks owns reversible target-PC -> patch-site links. Only an
-		// exact persistent self-edge has the compiler's identical live GPR mapping;
-		// ordinary incoming edges and every unlinked fallback use canonical entry.
-		const bool use_resident_entry = !target_is_direct_exit && m_persistent_dispatch_enabled &&
+		const bool target_is_direct_exit = target == nullptr;
+		// PCSX2 x86/BaseblockEx.cpp::BaseBlocks::Link() owns reversible target-PC
+		// patch sites. Exact self-edges retain their richer private state; other
+		// links may skip only canonical GPR loads when both blocks publish the same
+		// clean mapping.
+		const bool use_resident_entry = target && m_persistent_dispatch_enabled &&
 			link.target_pc == block.start_pc && block.resident_self_link_entry_loads != 0;
-		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) : target;
+		const bool use_compatible_entry = target && !use_resident_entry &&
+			m_persistent_dispatch_enabled && block.gpr_link_signature.IsValid() &&
+			block.gpr_link_signature == target->gpr_link_signature &&
+			target->compatible_link_entry_loads != 0;
+		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) :
+			(use_compatible_entry ? CompatibleLinkEntryPoint(*target) :
+				(target ? LinkedEntryPoint(*target) : direct_exit));
 		const VitaA32::Condition condition = link.branch_on_taken ?
 			(link.branch_on_unsigned_less ? VitaA32::Condition::CC : VitaA32::Condition::NE) :
 			VitaA32::Condition::AL;
@@ -1161,34 +1267,38 @@ namespace VitaEE
 			return false;
 
 		link.patched_to_resident_entry = use_resident_entry;
+		link.patched_to_compatible_entry = use_compatible_entry;
+		link.compatible_entry_instructions = use_compatible_entry ? static_cast<u8>(
+			(target->compatible_link_entry_offset - target->linked_entry_offset) /
+			sizeof(u32)) : 0;
+		link.compatible_entry_loads =
+			use_compatible_entry ? target->compatible_link_entry_loads : 0;
 		return true;
 	}
 
-	void BlockExecutor::PatchIncomingLinks(u32 target_pc, const void* target)
+	void BlockExecutor::PatchIncomingLinks(CachedBlock& target)
 	{
-		if (!m_direct_linking_enabled || !target)
+		if (!m_direct_linking_enabled || !target.valid)
 			return;
 
-		s32 index = LastIncomingLinkIndex(target_pc);
-		while (index >= 0 && m_incoming_links[index].target_pc == target_pc)
+		s32 index = LastIncomingLinkIndex(target.start_pc);
+		while (index >= 0 && m_incoming_links[index].target_pc == target.start_pc)
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
 			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-				PatchDirectLink(*record.source, *link, target);
+				PatchDirectLink(*record.source, *link, &target);
 		}
 	}
 
 	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc)
 	{
-		const void* direct_exit = m_persistent_dispatch_enabled ?
-			m_persistent_direct_exit : reinterpret_cast<const void*>(&VitaEeA32DirectExit);
 		if (target_pc == UINT32_MAX)
 		{
 			for (u32 i = 0; i < m_incoming_links.size(); i++)
 			{
 				IncomingLinkRecord& record = m_incoming_links[i];
 				if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-					PatchDirectLink(*record.source, *link, direct_exit);
+					PatchDirectLink(*record.source, *link, nullptr);
 			}
 			return;
 		}
@@ -1198,14 +1308,12 @@ namespace VitaEE
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
 			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-				PatchDirectLink(*record.source, *link, direct_exit);
+				PatchDirectLink(*record.source, *link, nullptr);
 		}
 	}
 
 	void BlockExecutor::RelinkDirectLinks()
 	{
-		const void* direct_exit = m_persistent_dispatch_enabled ?
-			m_persistent_direct_exit : reinterpret_cast<const void*>(&VitaEeA32DirectExit);
 		for (u32 i = 0; i < m_incoming_links.size(); i++)
 		{
 			IncomingLinkRecord& record = m_incoming_links[i];
@@ -1213,8 +1321,8 @@ namespace VitaEE
 			if (!link)
 				continue;
 
-			const CachedBlock* target = FindCachedBlockByStartPc(record.target_pc, false);
-			PatchDirectLink(*record.source, *link, target ? LinkedEntryPoint(*target) : direct_exit);
+			CachedBlock* target = FindCachedBlockByStartPc(record.target_pc, false);
+			PatchDirectLink(*record.source, *link, target);
 		}
 	}
 
@@ -1264,6 +1372,13 @@ namespace VitaEE
 					(block.resident_self_link_entry_offset - block.linked_entry_offset) /
 					sizeof(u32));
 				result->resident_self_link_entry_loads += block.resident_self_link_entry_loads;
+			}
+			if (link.valid && link.patched_to_compatible_entry)
+			{
+				result->compatible_gpr_links++;
+				result->compatible_gpr_link_entry_instructions +=
+					link.compatible_entry_instructions;
+				result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
 			}
 		}
 #endif
@@ -1336,6 +1451,13 @@ namespace VitaEE
 						sizeof(u32));
 					result->resident_self_link_entry_loads +=
 						entry->resident_self_link_entry_loads;
+				}
+				if (link.valid && link.patched_to_compatible_entry)
+				{
+					result->compatible_gpr_links++;
+					result->compatible_gpr_link_entry_instructions +=
+						link.compatible_entry_instructions;
+					result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
 				}
 			}
 #endif

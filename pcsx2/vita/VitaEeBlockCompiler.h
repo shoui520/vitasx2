@@ -25,7 +25,30 @@ namespace VitaEE
 		bool branch_on_taken = false;
 		bool branch_on_unsigned_less = false;
 		bool patched_to_resident_entry = false;
+		bool patched_to_compatible_entry = false;
+		u8 compatible_entry_instructions = 0;
+		u8 compatible_entry_loads = 0;
 		bool valid = false;
+	};
+
+	struct GprLinkSignature
+	{
+		static constexpr u8 MAX_PINS = 3;
+		u8 guests[MAX_PINS]{};
+		u8 count = 0;
+
+		bool IsValid() const { return count != 0 && count <= MAX_PINS; }
+		bool operator==(const GprLinkSignature& rhs) const
+		{
+			if (count != rhs.count)
+				return false;
+			for (u8 i = 0; i < count; i++)
+			{
+				if (guests[i] != rhs.guests[i])
+					return false;
+			}
+			return true;
+		}
 	};
 
 	struct DirectLinkSlots
@@ -163,6 +186,8 @@ namespace VitaEE
 		static bool IsSupportedBranchOpcode(u32 op);
 		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
+		static bool BuildCleanGprLinkSignature(u32 first_pc, u32 first_instruction_count,
+			u32 second_pc, u32 second_instruction_count, GprLinkSignature* signature);
 
 		bool BeginBlock(bool use_vtlb_registers = false, bool use_cop1_exponent_mask_register = false,
 			bool use_vu0_base_register = false, size_t* linked_entry_offset = nullptr,
@@ -172,7 +197,10 @@ namespace VitaEE
 			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
 			size_t* linked_entry_offset = nullptr, bool persistent_dispatch_exits = false,
 			size_t* resident_self_link_entry_offset = nullptr,
-			u8* resident_self_link_entry_loads = nullptr);
+			u8* resident_self_link_entry_loads = nullptr,
+			const GprLinkSignature* gpr_link_signature = nullptr,
+			size_t* compatible_link_entry_offset = nullptr,
+			u8* compatible_link_entry_loads = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
@@ -576,6 +604,8 @@ namespace VitaEE
 			bool allow_r7, bool allow_r8,
 			bool allow_r10, bool allow_r11, bool prefer_dirty_writes,
 			bool preserve_self_link_state);
+		void StageGprPinsForLinkSignature(u32 start_pc, u32 instruction_count,
+			const GprLinkSignature& signature);
 		void StageGprQCacheForBlock(u32 start_pc, u32 instruction_count);
 		bool BlockWritesPinnedGpr(u32 start_pc, u32 instruction_count) const;
 		void MarkGprPinsDirtyAtResidentSelfLinkEntry(u32 start_pc, u32 instruction_count);
@@ -868,6 +898,7 @@ namespace VitaEE
 		bool m_cop2_norm_consts_ready = false;
 		bool m_gpr_q_cache_enabled = false;
 		bool m_persistent_dispatch_exits = false;
+		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;
 		bool m_forwarded_boolean_branch = false;
 		bool m_resident_forwarded_boolean_mask = false;

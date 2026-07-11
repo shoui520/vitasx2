@@ -3468,6 +3468,88 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::BuildCleanGprLinkSignature(u32 first_pc,
+		u32 first_instruction_count, u32 second_pc, u32 second_instruction_count,
+		GprLinkSignature* signature)
+	{
+		if (!signature)
+			return false;
+		*signature = {};
+		if (!BlockCanUseDirtyGprPins(first_pc, first_instruction_count) ||
+			!BlockCanUseDirtyGprPins(second_pc, second_instruction_count))
+		{
+			return false;
+		}
+
+		// PCSX2 owners: x86/ix86-32/iCore.cpp::_allocX86reg() and
+		// x86/iCore.cpp::_clearNeededXMMregs() define persistent
+		// MODE_READ/MODE_WRITE mappings within compiled code, while
+		// x86/BaseblockEx.cpp::BaseBlocks::Link() owns reversible direct edges.
+		// Adapt those contracts into one deterministic low-word mapping from the
+		// combined two-block use counts. r9/r10/r11 are callee-saved in the
+		// persistent frame; reject COP1/COP2 blocks which reserve the latter two
+		// for their private fast-path constants.
+		u16 scores[32]{};
+		const auto score_block = [&](u32 start_pc, u32 instruction_count) {
+			for (u32 i = 0; i < instruction_count; i++)
+			{
+				const u32 op = memRead32(start_pc + i * sizeof(u32));
+				switch (op >> 26)
+				{
+					case 0x11: // COP1
+					case 0x12: // COP2
+					case 0x31: // LWC1
+					case 0x36: // LQC2
+					case 0x39: // SWC1
+					case 0x3e: // SQC2
+						return false;
+					default:
+						break;
+				}
+
+				GprPinOpInfo read_info;
+				DirtyGprPinOpInfo write_info;
+				if (!ClassifyOpcodeForGprPinning(op, &read_info) ||
+					!ClassifyOpcodeForDirtyGprPins(op, &write_info))
+				{
+					return false;
+				}
+				for (unsigned read = 0; read < read_info.low_read_count; read++)
+					scores[read_info.low_reads[read]] += 2;
+				for (unsigned read = 0; read < read_info.dword_read_count; read++)
+					scores[read_info.dword_reads[read]] += 2;
+				for (unsigned write = 0; write < write_info.write_count; write++)
+					scores[write_info.writes[write]]++;
+			}
+			return true;
+		};
+		if (!score_block(first_pc, first_instruction_count) ||
+			!score_block(second_pc, second_instruction_count))
+		{
+			return false;
+		}
+
+		for (u8 pin = 0; pin < GprLinkSignature::MAX_PINS; pin++)
+		{
+			unsigned best_reg = 0;
+			u16 best_score = 0;
+			for (unsigned reg = 1; reg < 32; reg++)
+			{
+				if (scores[reg] > best_score)
+				{
+					best_reg = reg;
+					best_score = scores[reg];
+				}
+			}
+			if (best_reg == 0)
+				return false;
+			signature->guests[pin] = static_cast<u8>(best_reg);
+			signature->count++;
+			scores[best_reg] = 0;
+		}
+		return true;
+	}
+
 	bool BlockHasExactConditionalSelfLink(u32 start_pc, u32 instruction_count)
 	{
 		if (instruction_count < 2)
@@ -5827,6 +5909,63 @@ namespace VitaEE
 		}
 	}
 
+	void BlockCompiler::StageGprPinsForLinkSignature(u32 start_pc, u32 instruction_count,
+		const GprLinkSignature& signature)
+	{
+		if (!signature.IsValid())
+			return;
+
+		// These hosts are part of the persistent chain ABI and are available only
+		// because BuildCleanGprLinkSignature() rejects COP1/COP2 users. Backing
+		// GPR state remains write-through in this first compatible-link mechanism,
+		// so every incompatible/helper/event seam is already authoritative.
+		constexpr u8 hosts[GprLinkSignature::MAX_PINS] = {
+			HOST_GPR_PIN0, HOST_COP1_EXPONENT_MASK, HOST_VU0_BASE};
+		u32 defined = 1;
+		u32 live_in_reads = 0;
+		bool scanning = true;
+		for (u32 i = 0; i < instruction_count && scanning; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			switch (op >> 26)
+			{
+				case 0x20: // LB
+				case 0x21: // LH
+				case 0x23: // LW
+				case 0x24: // LBU
+				case 0x25: // LHU
+				case 0x27: // LWU
+				case 0x37: // LD
+				{
+					// Unlike dirty block-local pins, this link ABI keeps backing
+					// authoritative before the fault-capable vTLB operation. A
+					// helper can therefore observe the old RT in backing without
+					// requiring its clean host copy to be initialized; a successful
+					// load overwrites RT before any generated use.
+					const u32 base_bit = 1u << RS(op);
+					if ((defined & base_bit) == 0)
+						live_in_reads |= base_bit;
+					defined |= 1u << RT(op);
+					break;
+				}
+				default:
+					scanning = UpdateGprPinEntryLiveness(op, defined, live_in_reads);
+					break;
+			}
+		}
+		const u32 dead_entry_values = defined & ~live_in_reads;
+
+		m_staged_pin_count = signature.count;
+		for (u8 i = 0; i < signature.count; i++)
+		{
+			m_staged_pin_guest[i] = signature.guests[i];
+			m_staged_pin_host[i] = hosts[i];
+			m_staged_pin_high_host[i] = NO_GPR_PIN_HOST;
+			m_staged_pin_needs_entry_load[i] =
+				(dead_entry_values & (1u << signature.guests[i])) == 0;
+		}
+	}
+
 	void BlockCompiler::StageGprQCacheForBlock(u32 start_pc, u32 instruction_count)
 	{
 		constexpr unsigned MAX_STAGED_GPR_QCACHE_ENTRY_LOADS = 4;
@@ -7093,7 +7232,9 @@ namespace VitaEE
 		const void* event_exit, u32* scaled_cycles, DirectLinkSlots* direct_links,
 		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
 		size_t* linked_entry_offset, bool persistent_dispatch_exits,
-		size_t* resident_self_link_entry_offset, u8* resident_self_link_entry_loads)
+		size_t* resident_self_link_entry_offset, u8* resident_self_link_entry_loads,
+		const GprLinkSignature* gpr_link_signature,
+		size_t* compatible_link_entry_offset, u8* compatible_link_entry_loads)
 	{
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return false;
@@ -7104,6 +7245,10 @@ namespace VitaEE
 			*resident_self_link_entry_offset = static_cast<size_t>(-1);
 		if (resident_self_link_entry_loads)
 			*resident_self_link_entry_loads = 0;
+		if (compatible_link_entry_offset)
+			*compatible_link_entry_offset = static_cast<size_t>(-1);
+		if (compatible_link_entry_loads)
+			*compatible_link_entry_loads = 0;
 
 		const u32 previous_block_start_pc = m_current_block_start_pc;
 		const u32 previous_block_instruction_count = m_current_block_instruction_count;
@@ -7130,13 +7275,17 @@ namespace VitaEE
 		m_current_block_instruction_count = instruction_count;
 		m_current_instruction_index = 0;
 		m_persistent_dispatch_exits = persistent_dispatch_exits;
+		m_gpr_link_signature =
+			(persistent_dispatch_exits && gpr_link_signature && gpr_link_signature->IsValid()) ?
+				*gpr_link_signature : GprLinkSignature{};
 
 		const bool use_vtlb_registers = BlockNeedsResidentVtlbRegisters(start_pc, instruction_count);
 		const bool use_cop1_exponent_mask_register =
 			BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count);
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
 		const bool linked_entry_needs_pc_sync = BlockNeedsLinkedPcSync(start_pc, instruction_count);
-		const bool dirty_pins_candidate = BlockCanUseDirtyGprPins(start_pc, instruction_count);
+		const bool dirty_pins_candidate = !m_gpr_link_signature.IsValid() &&
+			BlockCanUseDirtyGprPins(start_pc, instruction_count);
 		const bool dirty_self_link_shape_candidate = persistent_dispatch_exits && direct_links &&
 			dirty_pins_candidate && BlockHasExactConditionalSelfLink(start_pc, instruction_count);
 		const bool caller_saved_branch_flag = dirty_self_link_shape_candidate &&
@@ -7211,14 +7360,19 @@ namespace VitaEE
 			!use_vtlb_registers && !persistent_vtlb_registers,
 			!use_cop1_exponent_mask_register, !use_vu0_base_register, dirty_pins_candidate,
 			dirty_self_link_candidate);
+		if (m_gpr_link_signature.IsValid())
+			StageGprPinsForLinkSignature(start_pc, instruction_count, m_gpr_link_signature);
 		if (linked_entry_offset)
 			*linked_entry_offset = 0;
 
 		if (!BeginBlock(use_vtlb_registers, use_cop1_exponent_mask_register, use_vu0_base_register,
-				linked_entry_offset, start_pc, linked_entry_needs_pc_sync))
+				linked_entry_offset, start_pc,
+				linked_entry_needs_pc_sync && !m_gpr_link_signature.IsValid()))
 		{
 			return false;
 		}
+		if (m_gpr_link_signature.IsValid() && m_pin_count != m_gpr_link_signature.count)
+			return false;
 		m_dirty_pins_enabled = dirty_pins_candidate && BlockWritesPinnedGpr(start_pc, instruction_count);
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (m_dirty_pins_enabled)
@@ -7234,6 +7388,21 @@ namespace VitaEE
 			MarkGprPinsDirtyAtResidentSelfLinkEntry(start_pc, instruction_count);
 		if (!EmitGprPinLoads())
 			return false;
+		if (m_gpr_link_signature.IsValid())
+		{
+			if (compatible_link_entry_offset)
+				*compatible_link_entry_offset = m_code.Size();
+			if (compatible_link_entry_loads)
+				*compatible_link_entry_loads = gpr_pin_entry_loads;
+			if (linked_entry_needs_pc_sync)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuLinkedPcSyncBlocks++;
+#endif
+				if (!EmitStorePc(start_pc))
+					return false;
+			}
+		}
 		u8 resident_entry_loads = gpr_pin_entry_loads;
 		if (m_forwarded_boolean_branch)
 		{

@@ -72,6 +72,9 @@ namespace VitaEE
 		u32 resident_self_links = 0;
 		u32 resident_self_link_entry_instructions = 0;
 		u32 resident_self_link_entry_loads = 0;
+		u32 compatible_gpr_links = 0;
+		u32 compatible_gpr_link_entry_instructions = 0;
+		u32 compatible_gpr_link_entry_loads = 0;
 #endif
 	};
 
@@ -129,6 +132,9 @@ namespace VitaEE
 			size_t linked_entry_offset = 0;
 			size_t resident_self_link_entry_offset = static_cast<size_t>(-1);
 			u8 resident_self_link_entry_loads = 0;
+			GprLinkSignature gpr_link_signature{};
+			size_t compatible_link_entry_offset = static_cast<size_t>(-1);
+			u8 compatible_link_entry_loads = 0;
 			DirectLinkSlots direct_links{};
 			bool valid = false;
 			bool queued_free = false;
@@ -209,14 +215,17 @@ namespace VitaEE
 		void RewindCodeCache(size_t slice_offset);
 		u32 ResetForCachePressure();
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles);
+		bool AnalyzeGprLinkSignature(u32 start_pc, u32 instruction_count,
+			GprLinkSignature* signature) const;
 		bool PrepareCompiledBlockAtPc(u32 start_pc, CachedBlock** block, BlockExecutionResult* result);
 		bool RunCachedBlock(CachedBlock& block, bool run_event_test_on_event_exit, BlockExecutionResult* result);
 		bool EnsurePersistentDispatcher();
 		static const void* PersistentDispatchThunk(u32 exit_value, void* userdata);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		const void* ResidentSelfLinkEntryPoint(const CachedBlock& block) const;
-		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
-		void PatchIncomingLinks(u32 target_pc, const void* target);
+		const void* CompatibleLinkEntryPoint(const CachedBlock& block) const;
+		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
+		void PatchIncomingLinks(CachedBlock& target);
 		void UnlinkIncomingLinks(u32 target_pc);
 		void RelinkDirectLinks();
 
