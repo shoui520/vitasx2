@@ -87,6 +87,7 @@ u32 g_qemuGprDirtyPinFlushStores = 0;
 u32 g_qemuGprPinColdSyncWordsElided = 0;
 u32 g_qemuGprPinColdSyncWordsStored = 0;
 u32 g_qemuGpr64BackingLoadInstructions = 0;
+u32 g_qemuGprHighBackingLoadInstructions = 0;
 u32 g_qemuGpr64BackingStoreInstructions = 0;
 u32 g_qemuCallerSavedBranchFlagBlocks = 0;
 u32 g_qemuForwardedBooleanBranchBlocks = 0;
@@ -3492,11 +3493,26 @@ namespace VitaEE
 		}
 
 		u16 host_mask = 0;
+		const auto valid_mapping_host = [](u8 host) {
+			return host == 1 || host == 3 ||
+				(host >= FIRST_HOST && host <= LAST_CALLEE_HOST) ||
+				host == LINK_REGISTER_HOST;
+		};
+		const auto default_mapping_host = [](u8 host) {
+			return host >= DEFAULT_FIRST_HOST && host <= LAST_CALLEE_HOST;
+		};
 		for (u8 i = 0; i < count; i++)
 		{
 			const GprLinkMapping& mapping = mappings[i];
 			if (mapping.guest == 0 || mapping.guest >= 32 ||
-				mapping.low_host < FIRST_HOST || mapping.low_host > LAST_HOST)
+				!valid_mapping_host(mapping.low_host))
+			{
+				return false;
+			}
+			if ((!default_mapping_host(mapping.low_host) ||
+				(mapping.width == GprLinkWidth::Low64 &&
+				 !default_mapping_host(mapping.high_host))) &&
+				!vtlb_pointer.IsValid())
 			{
 				return false;
 			}
@@ -3511,7 +3527,7 @@ namespace VitaEE
 			host_mask |= low_host_bit;
 			if (mapping.width == GprLinkWidth::Low64)
 			{
-				if (mapping.high_host < FIRST_HOST || mapping.high_host > LAST_HOST ||
+				if (!valid_mapping_host(mapping.high_host) ||
 					mapping.high_host == mapping.low_host)
 				{
 					return false;
@@ -3544,6 +3560,32 @@ namespace VitaEE
 		return false;
 	}
 
+	bool GprLinkSignature::ReclaimsVtlbHosts() const
+	{
+		if (!vtlb_pointer.IsValid())
+			return false;
+		for (u8 i = 0; i < count; i++)
+		{
+			if (mappings[i].low_host < DEFAULT_FIRST_HOST ||
+				mappings[i].low_host > LAST_CALLEE_HOST ||
+				(mappings[i].width == GprLinkWidth::Low64 &&
+				 (mappings[i].high_host < DEFAULT_FIRST_HOST ||
+				  mappings[i].high_host > LAST_CALLEE_HOST)))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	u8 GprLinkSignature::WordCount() const
+	{
+		u8 words = 0;
+		for (u8 i = 0; i < count; i++)
+			words += mappings[i].width == GprLinkWidth::Low64 ? 2 : 1;
+		return words;
+	}
+
 	u8 GprLinkSignature::DirtyWordCount() const
 	{
 		u8 words = 0;
@@ -3557,7 +3599,7 @@ namespace VitaEE
 
 	bool BlockCompiler::BuildGprLinkSignature(u32 first_pc,
 		u32 first_instruction_count, u32 second_pc, u32 second_instruction_count,
-		GprLinkSignature* signature)
+		GprLinkSignature* signature, bool reclaim_vtlb_hosts)
 	{
 		if (!signature)
 			return false;
@@ -3573,9 +3615,11 @@ namespace VitaEE
 		// MODE_READ/MODE_WRITE mappings within compiled code, while
 		// x86/BaseblockEx.cpp::BaseBlocks::Link() owns reversible direct edges.
 		// Adapt those contracts into one deterministic width-aware mapping from
-		// the combined two-block use counts. r9/r10/r11 are callee-saved in the
-		// persistent frame; reject COP1/COP2 blocks which reserve the latter two
-		// for their private fast-path constants.
+		// the combined two-block use counts. Ordinary chains use r9-r11; a proven
+		// translated-pointer chain may also reclaim r7/r8 because it materializes
+		// vTLB bases only on cold translation and restores the dispatcher ABI on
+		// every external exit. Reject COP1/COP2 blocks which reserve r10/r11 for
+		// their private fast-path constants.
 		u16 scores[32]{};
 		u16 dword_scores[32]{};
 		u16 writes[32]{};
@@ -3687,54 +3731,88 @@ namespace VitaEE
 
 		signature->block_pcs[0] = first_pc < second_pc ? first_pc : second_pc;
 		signature->block_pcs[1] = first_pc < second_pc ? second_pc : first_pc;
-		const auto add_mapping = [&](unsigned guest, unsigned low_host, unsigned high_host,
-			GprLinkWidth width) {
-			GprLinkMapping& mapping = signature->mappings[signature->count++];
-			mapping.guest = static_cast<u8>(guest);
-			mapping.low_host = static_cast<u8>(low_host);
-			mapping.high_host = width == GprLinkWidth::Low64 ?
-				static_cast<u8>(high_host) : GprLinkMapping::NO_HOST;
-			mapping.width = width;
-			mapping.dirty = writes[guest] != 0 ?
-				GprLinkDirtyState::WriteBack : GprLinkDirtyState::Clean;
-		};
-
-		unsigned full_reg = 0;
-		u16 full_score = 3;
-		for (unsigned reg = 1; reg < 32; reg++)
-		{
-			if (dword_scores[reg] > full_score)
+		const auto allocate_mappings = [&](bool retain_all_dword_values) {
+			constexpr u8 default_hosts[] = {9, 10, 11};
+			constexpr u8 reclaimed_hosts[] = {7, 8, 9, 10, 11, 14, 1, 3};
+			const u8* hosts = retain_all_dword_values ? reclaimed_hosts : default_hosts;
+			const size_t host_count = retain_all_dword_values ?
+				(sizeof(reclaimed_hosts) / sizeof(reclaimed_hosts[0])) :
+				(sizeof(default_hosts) / sizeof(default_hosts[0]));
+			u16 remaining_scores[32];
+			u16 remaining_dword_scores[32];
+			for (unsigned reg = 0; reg < 32; reg++)
 			{
-				full_reg = reg;
-				full_score = dword_scores[reg];
+				remaining_scores[reg] = scores[reg];
+				remaining_dword_scores[reg] = dword_scores[reg];
 			}
-		}
-		unsigned next_host = GprLinkSignature::FIRST_HOST;
-		if (full_reg != 0)
-		{
-			add_mapping(full_reg, next_host, next_host + 1, GprLinkWidth::Low64);
-			next_host += 2;
-			scores[full_reg] = 0;
-		}
+			signature->count = 0;
+			const auto add_mapping = [&](unsigned guest, unsigned low_host,
+				unsigned high_host, GprLinkWidth width) {
+				if (signature->count >= GprLinkSignature::MAX_PINS)
+					return false;
+				GprLinkMapping& mapping = signature->mappings[signature->count++];
+				mapping.guest = static_cast<u8>(guest);
+				mapping.low_host = static_cast<u8>(low_host);
+				mapping.high_host = width == GprLinkWidth::Low64 ?
+					static_cast<u8>(high_host) : GprLinkMapping::NO_HOST;
+				mapping.width = width;
+				mapping.dirty = writes[guest] != 0 ?
+					GprLinkDirtyState::WriteBack : GprLinkDirtyState::Clean;
+				return true;
+			};
 
-		while (next_host <= GprLinkSignature::LAST_HOST)
-		{
-			unsigned best_reg = 0;
-			u16 best_score = 0;
-			for (unsigned reg = 1; reg < 32; reg++)
+			size_t next_host = 0;
+			while (next_host + 1 < host_count)
 			{
-				if (scores[reg] > best_score)
+				unsigned full_reg = 0;
+				u16 full_score = retain_all_dword_values ? 0 : 3;
+				for (unsigned reg = 1; reg < 32; reg++)
 				{
-					best_reg = reg;
-					best_score = scores[reg];
+					if (remaining_dword_scores[reg] > full_score)
+					{
+						full_reg = reg;
+						full_score = remaining_dword_scores[reg];
+					}
 				}
+				if (full_reg == 0 ||
+					!add_mapping(full_reg, hosts[next_host], hosts[next_host + 1],
+						GprLinkWidth::Low64))
+				{
+					break;
+				}
+				next_host += 2;
+				remaining_scores[full_reg] = 0;
+				remaining_dword_scores[full_reg] = 0;
+				if (!retain_all_dword_values)
+					break;
 			}
-			if (best_reg == 0)
-				return false;
-			add_mapping(best_reg, next_host, GprLinkMapping::NO_HOST, GprLinkWidth::Low32);
-			next_host++;
-			scores[best_reg] = 0;
-		}
+
+			while (next_host < host_count)
+			{
+				unsigned best_reg = 0;
+				u16 best_score = 0;
+				for (unsigned reg = 1; reg < 32; reg++)
+				{
+					if (remaining_scores[reg] > best_score)
+					{
+						best_reg = reg;
+						best_score = remaining_scores[reg];
+					}
+				}
+				if (best_reg == 0 ||
+					!add_mapping(best_reg, hosts[next_host], GprLinkMapping::NO_HOST,
+						GprLinkWidth::Low32))
+				{
+					return false;
+				}
+				next_host++;
+				remaining_scores[best_reg] = 0;
+				remaining_dword_scores[best_reg] = 0;
+			}
+			return true;
+		};
+		if (!allocate_mappings(false))
+			return false;
 
 		// PCSX2 owner: recVTLB.cpp::DynGen_PrepRegs() keeps the translated
 		// address live through the direct memory operation, while iCore.cpp keeps
@@ -3784,7 +3862,7 @@ namespace VitaEE
 			for (u8 i = 0; i < signature->count; i++)
 			{
 				const GprLinkMapping& mapping = signature->mappings[i];
-				if (mapping.guest == base && mapping.width == GprLinkWidth::Low32 &&
+				if (mapping.guest == base &&
 					mapping.dirty == GprLinkDirtyState::WriteBack)
 				{
 					address_is_mapped = true;
@@ -3807,6 +3885,23 @@ namespace VitaEE
 		{
 			try_add_vtlb_pointer(second_pc, second_instruction_count,
 				first_pc, first_instruction_count);
+		}
+		if (reclaim_vtlb_hosts && signature->vtlb_pointer.IsValid() &&
+			!allocate_mappings(true))
+		{
+			return false;
+		}
+		if (signature->vtlb_pointer.IsValid())
+		{
+			bool address_is_mapped = false;
+			for (u8 i = 0; i < signature->count; i++)
+			{
+				address_is_mapped |=
+					signature->mappings[i].guest == signature->vtlb_pointer.guest_address &&
+					signature->mappings[i].dirty == GprLinkDirtyState::WriteBack;
+			}
+			if (!address_is_mapped)
+				return false;
 		}
 		return signature->IsValid();
 	}
@@ -6180,8 +6275,10 @@ namespace VitaEE
 		// because BuildGprLinkSignature() rejects COP1/COP2 users. Width, host,
 		// dirty ownership, representation, and provenance are all part of the
 		// signature checked by the direct linker.
-		static_assert(GprLinkSignature::FIRST_HOST == HOST_GPR_PIN0);
-		static_assert(GprLinkSignature::LAST_HOST == HOST_VU0_BASE);
+		static_assert(GprLinkSignature::FIRST_HOST == HOST_VTLB_VMAP);
+		static_assert(GprLinkSignature::DEFAULT_FIRST_HOST == HOST_GPR_PIN0);
+		static_assert(GprLinkSignature::LAST_CALLEE_HOST == HOST_VU0_BASE);
+		static_assert(GprLinkSignature::LINK_REGISTER_HOST == HOST_LR);
 		u32 defined = 1;
 		u32 live_in_reads = 0;
 		bool scanning = true;
@@ -6809,6 +6906,8 @@ namespace VitaEE
 		{
 			return false;
 		}
+		if (!EmitReloadGprPinsAfterClobber(static_cast<u16>(1u << HOST_TMP1)))
+			return false;
 		const size_t translation_end = m_code.Size();
 		const size_t body_start = m_code.Size();
 		if (!m_code.PatchBranch(same_page, body_start, VitaA32::Condition::NE))
@@ -7713,7 +7812,10 @@ namespace VitaEE
 			(persistent_dispatch_exits && gpr_link_signature && gpr_link_signature->IsValid()) ?
 				*gpr_link_signature : GprLinkSignature{};
 
-		const bool use_vtlb_registers = BlockNeedsResidentVtlbRegisters(start_pc, instruction_count);
+		m_reclaimed_vtlb_link_hosts = m_gpr_link_signature.ReclaimsVtlbHosts();
+		const bool use_vtlb_registers =
+			BlockNeedsResidentVtlbRegisters(start_pc, instruction_count) &&
+			!m_reclaimed_vtlb_link_hosts;
 		const bool use_cop1_exponent_mask_register =
 			BlockShouldUseCop1ExponentMaskRegister(start_pc, instruction_count);
 		const bool use_vu0_base_register = BlockShouldUseVu0BaseRegister(start_pc, instruction_count);
@@ -7729,7 +7831,8 @@ namespace VitaEE
 		if (caller_saved_branch_flag)
 			g_qemuCallerSavedBranchFlagBlocks++;
 #endif
-		const bool persistent_vtlb_registers = persistent_dispatch_exits;
+		const bool persistent_vtlb_registers =
+			persistent_dispatch_exits && !m_reclaimed_vtlb_link_hosts;
 		m_dirty_pins_enabled = false;
 		m_gpr_q_cache_enabled = BlockShouldUseGprQCache(start_pc, instruction_count);
 		StageGprQCacheForBlock(start_pc, instruction_count);
@@ -7794,9 +7897,10 @@ namespace VitaEE
 		if (m_deferred_resident_unsigned_branch_suffix)
 			g_qemuResidentUnsignedBranchSuffixBlocks++;
 #endif
-		// r7/r8 are a chain-wide vTLB ABI under the persistent dispatcher, even
-		// for blocks without memory operations: letting an arithmetic block pin a
-		// guest value there would poison the next linked memory block.
+		// r7/r8 are normally a chain-wide vTLB ABI under the persistent dispatcher.
+		// A compatible translated-pointer signature may reclaim them because its
+		// cold translator materializes both bases and every external exit restores
+		// the dispatcher contract before another block can observe the registers.
 		StageGprPinsForBlock(start_pc, instruction_count,
 			caller_saved_branch_flag,
 			!use_vtlb_registers && !persistent_vtlb_registers,
@@ -8664,6 +8768,35 @@ namespace VitaEE
 		return m_code.EmitPop(m_saved_registers | REG_PC);
 	}
 
+	bool BlockCompiler::EmitReloadGprPinsAfterClobber(u16 host_mask)
+	{
+		if (!m_gpr_link_signature.IsValid())
+			return true;
+
+		// The exact compatible templates may lend cold-clobbered r1/r3 and the
+		// frame-saved LR to iCore mappings. Translation and BL/BLX seams first
+		// synchronize dirty mappings where required, then reload only the words
+		// whose host registers that seam actually owns.
+		for (unsigned i = 0; i < m_pin_count; i++)
+		{
+			const size_t offset = GprOffset(m_pin_guest[i]);
+			if ((host_mask & (1u << m_pin_host[i])) != 0 &&
+				!m_code.EmitLdrImm12(m_pin_host[i],
+					HOST_CPU_REGS, static_cast<u16>(offset)))
+			{
+				return false;
+			}
+			if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+				(host_mask & (1u << m_pin_high_host[i])) != 0 &&
+				!m_code.EmitLdrImm12(m_pin_high_host[i],
+					HOST_CPU_REGS, static_cast<u16>(offset + sizeof(u32))))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
 	bool BlockCompiler::EmitExitToTarget(const void* target, u8 callable_token)
 	{
 		if (!target)
@@ -8710,6 +8843,8 @@ namespace VitaEE
 				m_compatible_scheduler_countdown;
 			direct_link->compatible_vtlb_pointer = sync_private_fallback &&
 				m_compatible_vtlb_pointer;
+			direct_link->compatible_words = sync_private_fallback ?
+				m_gpr_link_signature.WordCount() : 0;
 			direct_link->compatible_dirty_words = sync_private_fallback ?
 				m_gpr_link_signature.DirtyWordCount() : 0;
 		}
@@ -8750,6 +8885,8 @@ namespace VitaEE
 				m_compatible_scheduler_countdown;
 			direct_link->compatible_vtlb_pointer = sync_private_fallback &&
 				m_compatible_vtlb_pointer;
+			direct_link->compatible_words = sync_private_fallback ?
+				m_gpr_link_signature.WordCount() : 0;
 			direct_link->compatible_dirty_words = sync_private_fallback ?
 				m_gpr_link_signature.DirtyWordCount() : 0;
 		}
@@ -26256,6 +26393,9 @@ namespace VitaEE
 				(needs_counter_event && !EmitCounterReadFlagFromAddress(HOST_TMP0)) ||
 				!m_code.EmitCallAbsolute(tail.read_helper) ||
 				!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false) ||
+				!EmitReloadGprPinsAfterClobber(static_cast<u16>(
+					(1u << HOST_TMP0) | (1u << HOST_TMP1) | (1u << HOST_TMP2) |
+					(1u << HOST_TMP3) | (1u << HOST_TMP4) | (1u << HOST_LR))) ||
 				(m_compatible_vtlb_pointer &&
 				 tail.pc == m_gpr_link_signature.vtlb_pointer.access_pc &&
 				 !m_code.EmitMovImm8(GprLinkSignature::VTLB_POINTER_HOST, 0)) ||
@@ -27713,6 +27853,9 @@ namespace VitaEE
 		if (qcache_loaded)
 			return true;
 
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuGprHighBackingLoadInstructions++;
+#endif
 		return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg) + sizeof(u32)));
 	}
 

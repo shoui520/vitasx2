@@ -26,10 +26,18 @@ namespace
 	constexpr unsigned HOST_VTLB_HOST_MEMORY_BASE = 8;
 	constexpr unsigned HOST_SP = 13;
 	constexpr unsigned HOST_CALLBACK = 12;
-	constexpr u8 PERSISTENT_METADATA_SIZE = 16;
-	constexpr u16 PERSISTENT_CONTEXT_OFFSET = 0;
-	constexpr u16 PERSISTENT_CALLBACK_OFFSET = 4;
-	constexpr u16 PERSISTENT_EXIT_VALUE_OFFSET = 8;
+	constexpr u8 PERSISTENT_METADATA_SIZE =
+		VitaEE::BlockCompiler::PERSISTENT_LINK_METADATA_SIZE;
+	constexpr u16 PERSISTENT_CONTEXT_OFFSET =
+		VitaEE::BlockCompiler::PERSISTENT_LINK_CONTEXT_OFFSET;
+	constexpr u16 PERSISTENT_CALLBACK_OFFSET =
+		VitaEE::BlockCompiler::PERSISTENT_LINK_CALLBACK_OFFSET;
+	constexpr u16 PERSISTENT_EXIT_VALUE_OFFSET =
+		VitaEE::BlockCompiler::PERSISTENT_LINK_EXIT_VALUE_OFFSET;
+	constexpr u16 PERSISTENT_VTLB_VMAP_OFFSET =
+		VitaEE::BlockCompiler::PERSISTENT_LINK_VTLB_VMAP_OFFSET;
+	constexpr u16 PERSISTENT_VTLB_HOST_BASE_OFFSET =
+		VitaEE::BlockCompiler::PERSISTENT_LINK_VTLB_HOST_BASE_OFFSET;
 	constexpr size_t PERSISTENT_DISPATCH_CODE_CAPACITY = 4096;
 
 	extern "C" __attribute__((noinline)) u32 VitaEeA32DirectExit()
@@ -624,6 +632,15 @@ namespace VitaEE
 		Reset();
 		m_compatible_vtlb_pointer_carry_enabled = enabled;
 	}
+
+	void BlockExecutor::SetCompatibleVtlbHostReclaimEnabled(bool enabled)
+	{
+		if (m_compatible_vtlb_host_reclaim_enabled == enabled)
+			return;
+
+		Reset();
+		m_compatible_vtlb_host_reclaim_enabled = enabled;
+	}
 #endif
 
 	bool BlockExecutor::EnsurePersistentDispatcher()
@@ -670,6 +687,9 @@ namespace VitaEE
 			!code.EmitMovImm32(HOST_VTLB_HOST_MEMORY_BASE,
 				static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.host_memory_base))) ||
 			!code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0) ||
+			!code.EmitStrImm12(HOST_VTLB_VMAP, HOST_SP, PERSISTENT_VTLB_VMAP_OFFSET) ||
+			!code.EmitStrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_SP,
+				PERSISTENT_VTLB_HOST_BASE_OFFSET) ||
 			!code.EmitBx(0))
 		{
 			return fail();
@@ -688,6 +708,12 @@ namespace VitaEE
 
 		const size_t common_offset = code.Size();
 		if (!code.PatchBranch(direct_to_common, common_offset) ||
+			// Compatible chains may lend r7/r8 to GPR mappings. Restore the
+			// canonical dispatcher vTLB ABI once in this shared cold exit instead of
+			// duplicating reloads in every generated direct/event tail.
+			!code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_SP, PERSISTENT_VTLB_VMAP_OFFSET) ||
+			!code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_SP,
+				PERSISTENT_VTLB_HOST_BASE_OFFSET) ||
 			!code.EmitStrImm12(0, HOST_SP, PERSISTENT_EXIT_VALUE_OFFSET) ||
 			!code.EmitLdrImm12(1, HOST_SP, PERSISTENT_CONTEXT_OFFSET) ||
 			!code.EmitLdrImm12(HOST_CALLBACK, HOST_SP, PERSISTENT_CALLBACK_OFFSET) ||
@@ -875,7 +901,12 @@ namespace VitaEE
 			}
 
 			if (!BlockCompiler::BuildGprLinkSignature(start_pc, instruction_count,
-					candidate_pc, partner.instruction_count, signature))
+					candidate_pc, partner.instruction_count, signature
+#if defined(VITASX2_QEMU_VALIDATION)
+					, m_compatible_vtlb_host_reclaim_enabled &&
+						m_compatible_vtlb_pointer_carry_enabled
+#endif
+					))
 			{
 				return false;
 			}
@@ -1432,6 +1463,7 @@ namespace VitaEE
 				result->compatible_gpr_link_entry_instructions +=
 					link.compatible_entry_instructions;
 				result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
+				result->compatible_gpr_words_carried += link.compatible_words;
 				result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
 				result->compatible_scheduler_links +=
 					link.compatible_scheduler_countdown ? 1u : 0u;
@@ -1516,6 +1548,7 @@ namespace VitaEE
 					result->compatible_gpr_link_entry_instructions +=
 						link.compatible_entry_instructions;
 					result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
+					result->compatible_gpr_words_carried += link.compatible_words;
 					result->compatible_gpr_dirty_words_carried += link.compatible_dirty_words;
 					result->compatible_scheduler_links +=
 						link.compatible_scheduler_countdown ? 1u : 0u;

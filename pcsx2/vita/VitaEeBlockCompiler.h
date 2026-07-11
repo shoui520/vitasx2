@@ -31,6 +31,7 @@ namespace VitaEE
 		bool compatible_vtlb_pointer = false;
 		u8 compatible_entry_instructions = 0;
 		u8 compatible_entry_loads = 0;
+		u8 compatible_words = 0;
 		u8 compatible_dirty_words = 0;
 		bool valid = false;
 	};
@@ -155,9 +156,11 @@ namespace VitaEE
 
 	struct GprLinkSignature
 	{
-		static constexpr u8 MAX_PINS = 3;
-		static constexpr u8 FIRST_HOST = 9;
-		static constexpr u8 LAST_HOST = 11;
+		static constexpr u8 MAX_PINS = 5;
+		static constexpr u8 FIRST_HOST = 7;
+		static constexpr u8 DEFAULT_FIRST_HOST = 9;
+		static constexpr u8 LAST_CALLEE_HOST = 11;
+		static constexpr u8 LINK_REGISTER_HOST = 14;
 		static constexpr u8 SCHEDULER_HOST = 6;
 		static constexpr u8 VTLB_POINTER_HOST = 12;
 
@@ -172,6 +175,8 @@ namespace VitaEE
 		bool HasWriteBack() const;
 		bool HasSchedulerCountdown() const { return scheduler.IsValid(); }
 		bool HasVtlbPointer() const { return vtlb_pointer.IsValid(); }
+		bool ReclaimsVtlbHosts() const;
+		u8 WordCount() const;
 		u8 DirtyWordCount() const;
 		bool operator==(const GprLinkSignature& rhs) const
 		{
@@ -317,6 +322,12 @@ namespace VitaEE
 		// Private EE chain ABI: r3 is alignment padding; r4-r11 and LR/PC are
 		// saved by either the callable block prologue or the persistent dispatcher.
 		static constexpr u16 LINK_FRAME_REGISTER_MASK = 0x0ff8u;
+		static constexpr u8 PERSISTENT_LINK_METADATA_SIZE = 24;
+		static constexpr u8 PERSISTENT_LINK_CONTEXT_OFFSET = 0;
+		static constexpr u8 PERSISTENT_LINK_CALLBACK_OFFSET = 4;
+		static constexpr u8 PERSISTENT_LINK_EXIT_VALUE_OFFSET = 8;
+		static constexpr u8 PERSISTENT_LINK_VTLB_VMAP_OFFSET = 16;
+		static constexpr u8 PERSISTENT_LINK_VTLB_HOST_BASE_OFFSET = 20;
 
 		explicit BlockCompiler(VitaA32::CodeBuffer& code);
 
@@ -325,7 +336,8 @@ namespace VitaEE
 		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
 		static bool BuildGprLinkSignature(u32 first_pc, u32 first_instruction_count,
-			u32 second_pc, u32 second_instruction_count, GprLinkSignature* signature);
+			u32 second_pc, u32 second_instruction_count, GprLinkSignature* signature,
+			bool reclaim_vtlb_hosts = true);
 
 		bool BeginBlock(bool use_vtlb_registers = false, bool use_cop1_exponent_mask_register = false,
 			bool use_vu0_base_register = false, size_t* linked_entry_offset = nullptr,
@@ -359,6 +371,7 @@ namespace VitaEE
 
 	private:
 		bool EmitLinkFrameReturn();
+		bool EmitReloadGprPinsAfterClobber(u16 host_mask);
 		bool EmitExitToTarget(const void* target, u8 callable_token);
 		bool EmitAndImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
 		bool EmitOrrImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
@@ -1059,6 +1072,7 @@ namespace VitaEE
 		bool m_compatible_scheduler_countdown = false;
 		bool m_compatible_vtlb_pointer = false;
 		bool m_compatible_vtlb_pointer_access = false;
+		bool m_reclaimed_vtlb_link_hosts = false;
 		size_t m_compatible_vtlb_pointer_unaligned_fallback = static_cast<size_t>(-1);
 		size_t m_compatible_vtlb_pointer_handler_fallback = static_cast<size_t>(-1);
 		GprPinDirtyMasks m_compatible_vtlb_pointer_dirty_pins{};
