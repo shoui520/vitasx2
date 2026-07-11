@@ -27,6 +27,12 @@
 #include "common/Assertions.h"
 #include "common/Console.h"
 
+#if defined(VITASX2_QEMU_VALIDATION)
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
+#endif
+
 static VitaEePreInstructionTraceCallback s_ee_pre_instruction_trace_callback = nullptr;
 static VitaEePreInstructionTraceWindowSkipCallback s_ee_pre_instruction_trace_window_skip_callback = nullptr;
 static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback = nullptr;
@@ -34,6 +40,15 @@ static VitaEE::BlockExecutor s_ee_a32_executor;
 static VitaIOP::BlockExecutor s_iop_a32_executor;
 static VitaA32EeProviderStats s_ee_a32_stats;
 static VitaA32IopProviderStats s_iop_a32_stats;
+#if defined(VITASX2_QEMU_VALIDATION)
+struct IopDispatchProfileEntry
+{
+	u32 opcode = 0;
+	u32 instruction_count = 0;
+	u64 dispatches = 0;
+};
+static std::unordered_map<u32, IopDispatchProfileEntry> s_iop_a32_dispatch_profile;
+#endif
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
 static bool s_ee_a32_running_compiled_block = false;
@@ -803,6 +818,15 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		if (result.wait_loop_fast_forward)
 			continue;
 
+#if defined(VITASX2_QEMU_VALIDATION)
+		IopDispatchProfileEntry& dispatch_profile = s_iop_a32_dispatch_profile[pc];
+		if (dispatch_profile.dispatches == 0)
+		{
+			dispatch_profile.opcode = iopMemRead32(pc);
+			dispatch_profile.instruction_count = result.instruction_count;
+		}
+		dispatch_profile.dispatches++;
+#endif
 		s_iop_a32_stats.executed_blocks++;
 		s_iop_a32_stats.direct_exits++;
 	}
@@ -1011,6 +1035,9 @@ VitaA32EeProviderStats VitaGetA32EeProviderStats()
 void VitaResetA32IopProviderStats()
 {
 	s_iop_a32_stats = {};
+#if defined(VITASX2_QEMU_VALIDATION)
+	s_iop_a32_dispatch_profile.clear();
+#endif
 	s_iop_a32_executor.ResetInstrumentationCounters();
 }
 
@@ -1018,6 +1045,31 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 {
 	return s_iop_a32_stats;
 }
+
+#if defined(VITASX2_QEMU_VALIDATION)
+VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile()
+{
+	std::vector<std::pair<u32, IopDispatchProfileEntry>> sorted;
+	sorted.reserve(s_iop_a32_dispatch_profile.size());
+	for (const auto& entry : s_iop_a32_dispatch_profile)
+		sorted.push_back(entry);
+	std::sort(sorted.begin(), sorted.end(), [](const auto& lhs, const auto& rhs) {
+		return lhs.second.dispatches != rhs.second.dispatches ?
+			lhs.second.dispatches > rhs.second.dispatches : lhs.first < rhs.first;
+	});
+
+	VitaA32IopDispatchProfile result;
+	result.count = std::min<u32>(static_cast<u32>(sorted.size()), VITA_A32_IOP_HOT_DISPATCH_COUNT);
+	for (u32 i = 0; i < result.count; i++)
+	{
+		result.entries[i].pc = sorted[i].first;
+		result.entries[i].opcode = sorted[i].second.opcode;
+		result.entries[i].instruction_count = sorted[i].second.instruction_count;
+		result.entries[i].dispatches = sorted[i].second.dispatches;
+	}
+	return result;
+}
+#endif
 
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles)
 {
@@ -1031,4 +1083,10 @@ void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles)
 void VitaRecordA32IopWaitLoopDispatchElision()
 {
 	s_iop_a32_stats.wait_loop_dispatches_elided++;
+}
+
+void VitaRecordA32IopPollCallWaitLoopDispatchElision()
+{
+	s_iop_a32_stats.poll_call_wait_loop_fast_forwards++;
+	s_iop_a32_stats.poll_call_wait_loop_dispatches_elided++;
 }

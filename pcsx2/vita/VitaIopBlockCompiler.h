@@ -289,6 +289,13 @@ namespace VitaIOP
 			std::array<u32, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS> opcodes{};
 			const u32* raw_opcodes = nullptr;
 			u32 ram_source_start = INVALID_RAM_SOURCE;
+			const u32* poll_branch_opcodes = nullptr;
+			const u32* poll_leaf_opcodes = nullptr;
+			std::array<u32, 2> poll_branch_expected{};
+			std::array<u32, 5> poll_leaf_expected{};
+			u32 poll_branch_source_start = INVALID_RAM_SOURCE;
+			u32 poll_leaf_source_start = INVALID_RAM_SOURCE;
+			u32 poll_word_address = 0;
 			u32 source_serial = 0;
 			u32 start_pc = 0;
 			u32 instruction_count = 0;
@@ -297,6 +304,8 @@ namespace VitaIOP
 			DirectLinkSlots direct_links{};
 			bool wait_loop_shape = false;
 			bool wait_loop_enabled_at_compile = false;
+			bool poll_call_wait_loop = false;
+			u8 poll_result_register = 0;
 			bool valid = false;
 			bool queued_free = false;
 		};
@@ -338,6 +347,7 @@ namespace VitaIOP
 		void UnregisterBlockLookup(CachedBlock& block);
 		void ReleaseLookupPages();
 		void RegisterRamSource(CachedBlock& block);
+		bool AnalyzePollCallWaitLoop(CachedBlock& block, u32 start_pc, u32 instruction_count);
 		u32 InvalidateRamSourceRange(u32 start, u32 size);
 		void ClearRamSourcePages();
 		s32 LastBlockRecordIndex(u32 pc) const;
@@ -359,6 +369,7 @@ namespace VitaIOP
 		CachedBlock* AllocateCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
 		bool ValidateCachedBlock(CachedBlock& block);
+		bool TryFastForwardPollCallWaitLoop(CachedBlock& block);
 		bool EnsureCodeCache();
 		void ReleaseCodeCache();
 		u8* AllocateCodeSlice(size_t capacity, size_t* slice_offset);

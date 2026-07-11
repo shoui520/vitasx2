@@ -5271,13 +5271,105 @@ namespace VitaIOP
 		if (m_next_source_serial == 0)
 			m_next_source_serial = 1;
 
-		const u32 source_end =
-			block.ram_source_start + block.instruction_count * sizeof(u32);
-		for (u32 page_index = block.ram_source_start >> RAM_SOURCE_PAGE_SHIFT;
-			page_index <= ((source_end - 1) >> RAM_SOURCE_PAGE_SHIFT); page_index++)
+		std::array<u32, 6> registered_pages{};
+		u32 registered_page_count = 0;
+		const auto register_range = [&](u32 source_start, u32 source_size) {
+			if (source_start == INVALID_RAM_SOURCE || source_size == 0)
+				return;
+			const u32 source_end = source_start + source_size;
+			for (u32 page_index = source_start >> RAM_SOURCE_PAGE_SHIFT;
+				page_index <= ((source_end - 1) >> RAM_SOURCE_PAGE_SHIFT); page_index++)
+			{
+				bool already_registered = false;
+				for (u32 i = 0; i < registered_page_count; i++)
+					already_registered |= registered_pages[i] == page_index;
+				if (already_registered)
+					continue;
+
+				m_ram_source_pages[page_index].push_back({&block, block.source_serial});
+				registered_pages[registered_page_count++] = page_index;
+			}
+		};
+
+		register_range(block.ram_source_start, block.instruction_count * sizeof(u32));
+		if (block.poll_call_wait_loop)
 		{
-			m_ram_source_pages[page_index].push_back({&block, block.source_serial});
+			register_range(block.poll_branch_source_start, 2 * sizeof(u32));
+			register_range(block.poll_leaf_source_start, 5 * sizeof(u32));
 		}
+	}
+
+	bool BlockExecutor::AnalyzePollCallWaitLoop(
+		CachedBlock& block, u32 start_pc, u32 instruction_count)
+	{
+		// PCSX2 owners: x86/iR3000A.cpp::iPsxBranchTest() supplies the IOP
+		// deadline/event fast-forward contract. The pure-load proof is the
+		// R3000A adaptation of the load-aware loop analysis in
+		// x86/ix86-32/iR5900.cpp::recRecompile()/recSkipTimeoutLoop().
+		if (instruction_count != 2 || (block.opcodes[0] >> 26) != 0x03 || block.opcodes[1] != 0)
+			return false;
+		if ((start_pc & 0x1fffffffu) >= Ps2MemSize::TotalIopRam)
+			return false;
+
+		const u32 branch_pc = start_pc + 2 * sizeof(u32);
+		u32 branch_source_start = INVALID_RAM_SOURCE;
+		const u32* const branch_opcodes = ResolveRawOpcodeSpan(branch_pc, 2, &branch_source_start);
+		if (!branch_opcodes || branch_source_start == INVALID_RAM_SOURCE)
+			return false;
+
+		const u32 branch_op = branch_opcodes[0];
+		if ((branch_op >> 26) != 0x04 || BranchTarget(branch_pc, branch_op) != start_pc)
+			return false;
+
+		unsigned result_register = 0;
+		if (RS(branch_op) == 0 && RT(branch_op) != 0)
+			result_register = RT(branch_op);
+		else if (RT(branch_op) == 0 && RS(branch_op) != 0)
+			result_register = RS(branch_op);
+		else
+			return false;
+
+		const u32 branch_delay = branch_opcodes[1];
+		const u32 clear_result_delay = (result_register << 11) | 0x21u; // ADDU result,$zero,$zero
+		if (branch_delay != 0 && branch_delay != clear_result_delay)
+			return false;
+
+		const u32 leaf_pc = JumpTarget(start_pc, block.opcodes[0]);
+		u32 leaf_source_start = INVALID_RAM_SOURCE;
+		const u32* const leaf_opcodes = ResolveRawOpcodeSpan(leaf_pc, 5, &leaf_source_start);
+		if (!leaf_opcodes || leaf_source_start == INVALID_RAM_SOURCE)
+			return false;
+
+		const u32 lui = leaf_opcodes[0];
+		const u32 addiu = leaf_opcodes[1];
+		const u32 load = leaf_opcodes[2];
+		if ((lui >> 26) != 0x0f || RS(lui) != 0 ||
+			(addiu >> 26) != 0x09 || RS(addiu) != RT(lui) || RT(addiu) != RT(lui) ||
+			(load >> 26) != 0x23 || RS(load) != RT(lui) || RT(load) != result_register ||
+			leaf_opcodes[3] != 0x03e00008u || leaf_opcodes[4] != 0)
+		{
+			return false;
+		}
+
+		u32 poll_address = IMM_U(lui) << 16;
+		poll_address += static_cast<u32>(static_cast<s32>(IMM_S(addiu)));
+		poll_address += static_cast<u32>(static_cast<s32>(IMM_S(load)));
+		const u32 physical_address = poll_address & 0x1fffffffu;
+		if ((physical_address & 3u) != 0 || physical_address >= Ps2MemSize::TotalIopRam)
+			return false;
+
+		block.poll_call_wait_loop = true;
+		block.poll_result_register = static_cast<u8>(result_register);
+		block.poll_word_address = physical_address & (Ps2MemSize::ExposedIopRam - 1);
+		block.poll_branch_opcodes = branch_opcodes;
+		block.poll_leaf_opcodes = leaf_opcodes;
+		block.poll_branch_source_start = branch_source_start;
+		block.poll_leaf_source_start = leaf_source_start;
+		for (u32 i = 0; i < block.poll_branch_expected.size(); i++)
+			block.poll_branch_expected[i] = branch_opcodes[i];
+		for (u32 i = 0; i < block.poll_leaf_expected.size(); i++)
+			block.poll_leaf_expected[i] = leaf_opcodes[i];
+		return true;
 	}
 
 	u32 BlockExecutor::InvalidateRamSourceRange(u32 start, u32 size)
@@ -5290,6 +5382,17 @@ namespace VitaIOP
 
 		const u32 end = start + size;
 		u32 invalidated = 0;
+		const auto range_touches_page = [](u32 source_start, u32 source_size, u32 page_index) {
+			if (source_start == INVALID_RAM_SOURCE || source_size == 0)
+				return false;
+			const u32 source_end = source_start + source_size;
+			return (source_start >> RAM_SOURCE_PAGE_SHIFT) <= page_index &&
+				((source_end - 1) >> RAM_SOURCE_PAGE_SHIFT) >= page_index;
+		};
+		const auto range_overlaps = [start, end](u32 source_start, u32 source_size) {
+			return source_start != INVALID_RAM_SOURCE && source_size != 0 &&
+				start < source_start + source_size && source_start < end;
+		};
 		for (u32 page_index = start >> RAM_SOURCE_PAGE_SHIFT;
 			page_index <= ((end - 1) >> RAM_SOURCE_PAGE_SHIFT); page_index++)
 		{
@@ -5308,14 +5411,23 @@ namespace VitaIOP
 					continue;
 				}
 
-				const u32 block_end =
-					block->ram_source_start + block->instruction_count * sizeof(u32);
-				if ((block->ram_source_start >> RAM_SOURCE_PAGE_SHIFT) > page_index ||
-					((block_end - 1) >> RAM_SOURCE_PAGE_SHIFT) < page_index)
+				const bool source_touches_page =
+					range_touches_page(block->ram_source_start,
+						block->instruction_count * sizeof(u32), page_index) ||
+					(block->poll_call_wait_loop &&
+						(range_touches_page(block->poll_branch_source_start, 2 * sizeof(u32), page_index) ||
+						 range_touches_page(block->poll_leaf_source_start, 5 * sizeof(u32), page_index)));
+				if (!source_touches_page)
 				{
 					continue;
 				}
-				if (start < block_end && block->ram_source_start < end)
+
+				const bool overlaps =
+					range_overlaps(block->ram_source_start, block->instruction_count * sizeof(u32)) ||
+					(block->poll_call_wait_loop &&
+						(range_overlaps(block->poll_branch_source_start, 2 * sizeof(u32)) ||
+						 range_overlaps(block->poll_leaf_source_start, 5 * sizeof(u32))));
+				if (overlaps)
 				{
 					InvalidateCachedBlock(*block);
 					invalidated++;
@@ -5589,6 +5701,11 @@ namespace VitaIOP
 		block.valid = false;
 		block.raw_opcodes = nullptr;
 		block.ram_source_start = INVALID_RAM_SOURCE;
+		block.poll_branch_opcodes = nullptr;
+		block.poll_leaf_opcodes = nullptr;
+		block.poll_branch_source_start = INVALID_RAM_SOURCE;
+		block.poll_leaf_source_start = INVALID_RAM_SOURCE;
+		block.poll_call_wait_loop = false;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -5881,6 +5998,23 @@ namespace VitaIOP
 				m_trusted_source_audit_words++;
 				matches = (block.opcodes[i] == block.raw_opcodes[i]);
 			}
+			if (block.poll_call_wait_loop)
+			{
+				for (u32 i = 0; matches && i < block.poll_branch_expected.size(); i++)
+				{
+					m_validation_words++;
+					m_raw_validation_words++;
+					m_trusted_source_audit_words++;
+					matches = block.poll_branch_expected[i] == block.poll_branch_opcodes[i];
+				}
+				for (u32 i = 0; matches && i < block.poll_leaf_expected.size(); i++)
+				{
+					m_validation_words++;
+					m_raw_validation_words++;
+					m_trusted_source_audit_words++;
+					matches = block.poll_leaf_expected[i] == block.poll_leaf_opcodes[i];
+				}
+			}
 			if (!matches)
 				m_trusted_source_audit_failures++;
 #else
@@ -5908,6 +6042,27 @@ namespace VitaIOP
 		// QEMU trust audit and handler-backed/cross-page fallback sources.
 		InvalidateCachedBlock(block);
 		return false;
+	}
+
+	bool BlockExecutor::TryFastForwardPollCallWaitLoop(CachedBlock& block)
+	{
+		// RunValidatedBlock reaches this only after ValidateCachedBlock proved the
+		// cached WaitLoop/trace configuration still matches compilation.
+		const u32 value =
+			*reinterpret_cast<const u32*>(&iopMem->Main[block.poll_word_address]);
+		if (value != 0)
+			return false;
+
+		// Execute the architecturally visible results of the proven JAL/leaf-load/
+		// taken-BEQ iteration before applying PCSX2's IOP deadline skip. The
+		// branch delay is either NOP or the same zero assignment.
+		psxRegs.GPR.r[block.poll_result_register] = 0;
+		psxRegs.GPR.r[31] = block.start_pc + 2 * sizeof(u32);
+		constexpr u32 poll_loop_cycles = 2 + 5 + 2;
+		VitaIopA32FastForwardWaitLoop(block.start_pc, poll_loop_cycles);
+		VitaRecordA32IopWaitLoopDispatchElision();
+		VitaRecordA32IopPollCallWaitLoopDispatchElision();
+		return true;
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::FindLookupBlockByStartPc(u32 start_pc)
@@ -6073,7 +6228,14 @@ namespace VitaIOP
 
 			block.opcodes[i] = op;
 		}
-		block.wait_loop_shape = IsIopWaitLoopShape(start_pc, instruction_count);
+		block.poll_call_wait_loop = false;
+		block.poll_branch_opcodes = nullptr;
+		block.poll_leaf_opcodes = nullptr;
+		block.poll_branch_source_start = INVALID_RAM_SOURCE;
+		block.poll_leaf_source_start = INVALID_RAM_SOURCE;
+		block.wait_loop_shape =
+			AnalyzePollCallWaitLoop(block, start_pc, instruction_count) ||
+			IsIopWaitLoopShape(start_pc, instruction_count);
 		block.wait_loop_enabled_at_compile =
 			EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled();
 
@@ -6234,15 +6396,15 @@ namespace VitaIOP
 
 		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_() trusts the BaseBlock
 		// selected by the dispatcher; x86/iR3000A.cpp::psxRecClearMem() removes
-		// stale translations before they can run. Vita retains one source-word
-		// validation in FindCachedBlock(), FindRecordedBlockByStartPc(), or the
-		// lookup-first path in ExecuteCompiledBlockAtPc() because it cannot rely
-		// on x86 protected-page repair. A newly compiled block is source-proven by
-		// CompileIntoCacheEntry(). Do not reread the complete opcode window here.
+		// stale translations before they can run. Vita's explicit source-range
+		// dependencies provide the same trust contract for raw RAM/ROM blocks;
+		// handler-backed sources and the QEMU audit validate in FindCachedBlock().
+		// A newly compiled block is source-proven by CompileIntoCacheEntry().
 
 		psxRegs.pc = block.start_pc;
 		if (block.wait_loop_shape && block.wait_loop_enabled_at_compile &&
-			TryFastForwardWaitLoopAtPc(block.start_pc))
+			(block.poll_call_wait_loop ? TryFastForwardPollCallWaitLoop(block) :
+									TryFastForwardWaitLoopAtPc(block.start_pc)))
 		{
 			result->exit = BlockExitKind::Direct;
 			result->instruction_count = block.instruction_count;

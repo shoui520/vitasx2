@@ -79,6 +79,8 @@ struct VitaA32IopProviderStats
 	u64 wait_loop_iop_cycles = 0;
 	u64 wait_loop_dispatches_elided = 0;
 	u64 wait_loop_block_entries_elided = 0;
+	u64 poll_call_wait_loop_fast_forwards = 0;
+	u64 poll_call_wait_loop_dispatches_elided = 0;
 #if defined(VITASX2_QEMU_VALIDATION)
 	u64 validation_calls = 0;
 	u64 validation_words = 0;
@@ -94,10 +96,32 @@ struct VitaA32IopProviderStats
 #endif
 };
 
+#if defined(VITASX2_QEMU_VALIDATION)
+static constexpr u32 VITA_A32_IOP_HOT_DISPATCH_COUNT = 16;
+
+struct VitaA32IopHotDispatch
+{
+	u32 pc = 0;
+	u32 opcode = 0;
+	u32 instruction_count = 0;
+	u64 dispatches = 0;
+};
+
+struct VitaA32IopDispatchProfile
+{
+	u32 count = 0;
+	VitaA32IopHotDispatch entries[VITA_A32_IOP_HOT_DISPATCH_COUNT]{};
+};
+#endif
+
 void VitaResetA32IopProviderStats();
 VitaA32IopProviderStats VitaGetA32IopProviderStats();
+#if defined(VITASX2_QEMU_VALIDATION)
+VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile();
+#endif
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles);
 void VitaRecordA32IopWaitLoopDispatchElision();
+void VitaRecordA32IopPollCallWaitLoopDispatchElision();
 
 // Mirrors the fast-boot ELF state that VMManager.cpp::Initialize() seeds for
 // R5900.cpp::eeloadHook() in Vita bring-up executables.
