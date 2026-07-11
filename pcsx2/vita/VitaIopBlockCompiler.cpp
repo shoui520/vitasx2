@@ -5139,6 +5139,10 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_validation_calls = 0;
 		m_validation_words = 0;
+		m_raw_validation_calls = 0;
+		m_raw_validation_words = 0;
+		m_translated_validation_words = 0;
+		m_wait_loop_configuration_checks = 0;
 #endif
 	}
 
@@ -5150,6 +5154,34 @@ namespace VitaIOP
 	u32 BlockExecutor::LookupEntryIndex(u32 start_pc)
 	{
 		return (start_pc & 0xffffu) >> 2;
+	}
+
+	const u32* BlockExecutor::ResolveRawOpcodeSpan(u32 start_pc, u32 instruction_count)
+	{
+		// PCSX2 owner: x86/BaseblockEx.h::recLUT_SetPage() and
+		// x86/iR3000A.cpp::recResetIOP()/psxhwLUT map the
+		// R3000A RAM and ROM aliases to stable backing pages. Cache that resolved
+		// source span just as VitaEeExecutor.cpp::ValidateCachedBlock() does for
+		// page-bounded EE code, while retaining iopMemRead32() for handler-backed
+		// or 64 KiB-crossing windows whose reads are not one raw contiguous span.
+		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
+			return nullptr;
+
+		const u32 physical_pc = start_pc & 0x1fffffffu;
+		const u32 byte_count = instruction_count * 4;
+		if ((physical_pc & 0xffffu) > (0x10000u - byte_count))
+			return nullptr;
+
+		const u32 page = physical_pc >> 16;
+		const bool direct_ram = page < 0x80u;
+		const bool direct_rom =
+			(page >= 0x1fc0u && page < 0x2000u) ||
+			(page >= 0x1e00u && page < 0x1e48u);
+		if (!direct_ram && !direct_rom)
+			return nullptr;
+
+		const uptr page_base = psxMemRLUT[page];
+		return page_base ? reinterpret_cast<const u32*>(page_base + (physical_pc & 0xffffu)) : nullptr;
 	}
 
 	bool BlockExecutor::EnsureLookupDirectory()
@@ -5458,6 +5490,7 @@ namespace VitaIOP
 		UnregisterBlockLookup(block);
 		UnregisterBlockRecord(block);
 		block.valid = false;
+		block.raw_opcodes = nullptr;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -5697,22 +5730,51 @@ namespace VitaIOP
 		if (!block.valid)
 			return false;
 
+		if (block.wait_loop_shape)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_wait_loop_configuration_checks++;
+#endif
+			const bool wait_loop_enabled =
+				EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled();
+			if (block.wait_loop_enabled_at_compile != wait_loop_enabled)
+			{
+				InvalidateCachedBlock(block);
+				return false;
+			}
+		}
+
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_validation_calls++;
 #endif
 		bool matches = true;
-		for (u32 i = 0; matches && i < block.instruction_count; i++)
+		if (block.raw_opcodes) [[likely]]
 		{
 #if defined(VITASX2_QEMU_VALIDATION)
-			m_validation_words++;
+			m_raw_validation_calls++;
 #endif
-			matches = (block.opcodes[i] == iopMemRead32(block.start_pc + i * 4));
+			for (u32 i = 0; matches && i < block.instruction_count; i++)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				m_validation_words++;
+				m_raw_validation_words++;
+#endif
+				matches = (block.opcodes[i] == block.raw_opcodes[i]);
+			}
+		}
+		else
+		{
+			for (u32 i = 0; matches && i < block.instruction_count; i++)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				m_validation_words++;
+				m_translated_validation_words++;
+#endif
+				matches = (block.opcodes[i] == iopMemRead32(block.start_pc + i * 4));
+			}
 		}
 
-		const bool wait_loop_enabled =
-			EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled();
-		if (matches && (!block.wait_loop_shape ||
-			block.wait_loop_enabled_at_compile == wait_loop_enabled))
+		if (matches)
 			return true;
 
 		// PCSX2 owner: x86/iR3000A.cpp::psxRecClearMem() invalidates changed
@@ -5937,6 +5999,7 @@ namespace VitaIOP
 
 		block.start_pc = start_pc;
 		block.instruction_count = instruction_count;
+		block.raw_opcodes = ResolveRawOpcodeSpan(start_pc, instruction_count);
 		block.native_instruction_count = native_instruction_count;
 		block.helper_instruction_count = helper_instruction_count;
 		block.direct_links = direct_links;
@@ -6067,6 +6130,10 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 			result->validation_calls = m_validation_calls;
 			result->validation_words = m_validation_words;
+			result->raw_validation_calls = m_raw_validation_calls;
+			result->raw_validation_words = m_raw_validation_words;
+			result->translated_validation_words = m_translated_validation_words;
+			result->wait_loop_configuration_checks = m_wait_loop_configuration_checks;
 #endif
 			result->wait_loop_fast_forward = true;
 			return true;
@@ -6092,6 +6159,10 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		result->validation_calls = m_validation_calls;
 		result->validation_words = m_validation_words;
+		result->raw_validation_calls = m_raw_validation_calls;
+		result->raw_validation_words = m_raw_validation_words;
+		result->translated_validation_words = m_translated_validation_words;
+		result->wait_loop_configuration_checks = m_wait_loop_configuration_checks;
 #endif
 		return true;
 	}

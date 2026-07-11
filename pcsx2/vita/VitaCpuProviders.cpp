@@ -790,6 +790,10 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_iop_a32_stats.validation_calls = result.validation_calls;
 		s_iop_a32_stats.validation_words = result.validation_words;
+		s_iop_a32_stats.raw_validation_calls = result.raw_validation_calls;
+		s_iop_a32_stats.raw_validation_words = result.raw_validation_words;
+		s_iop_a32_stats.translated_validation_words = result.translated_validation_words;
+		s_iop_a32_stats.wait_loop_configuration_checks = result.wait_loop_configuration_checks;
 #endif
 		if (result.wait_loop_fast_forward)
 			continue;

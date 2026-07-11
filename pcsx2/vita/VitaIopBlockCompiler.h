@@ -42,6 +42,10 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		u64 validation_calls = 0;
 		u64 validation_words = 0;
+		u64 raw_validation_calls = 0;
+		u64 raw_validation_words = 0;
+		u64 translated_validation_words = 0;
+		u64 wait_loop_configuration_checks = 0;
 #endif
 		bool cache_hit = false;
 		bool lookup_hit = false;
@@ -268,6 +272,7 @@ namespace VitaIOP
 		{
 			VitaA32::CodeBuffer code;
 			std::array<u32, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS> opcodes{};
+			const u32* raw_opcodes = nullptr;
 			u32 start_pc = 0;
 			u32 instruction_count = 0;
 			u32 native_instruction_count = 0;
@@ -302,6 +307,7 @@ namespace VitaIOP
 
 		static u32 LookupPageIndex(u32 start_pc);
 		static u32 LookupEntryIndex(u32 start_pc);
+		static const u32* ResolveRawOpcodeSpan(u32 start_pc, u32 instruction_count);
 		bool EnsureLookupDirectory();
 		LookupPage* GetLookupPage(u32 start_pc, bool allocate);
 		void RegisterBlockLookup(CachedBlock& block);
@@ -351,6 +357,10 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		u64 m_validation_calls = 0;
 		u64 m_validation_words = 0;
+		u64 m_raw_validation_calls = 0;
+		u64 m_raw_validation_words = 0;
+		u64 m_translated_validation_words = 0;
+		u64 m_wait_loop_configuration_checks = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};

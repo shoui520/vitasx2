@@ -82,6 +82,10 @@ struct VitaA32IopProviderStats
 #if defined(VITASX2_QEMU_VALIDATION)
 	u64 validation_calls = 0;
 	u64 validation_words = 0;
+	u64 raw_validation_calls = 0;
+	u64 raw_validation_words = 0;
+	u64 translated_validation_words = 0;
+	u64 wait_loop_configuration_checks = 0;
 #endif
 };
 
