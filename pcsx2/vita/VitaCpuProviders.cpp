@@ -1070,6 +1070,12 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.ram_invalidation_record_visits = snapshot.ram_invalidation_record_visits;
 	s_iop_a32_stats.clock_mode_check_instructions_removed =
 		snapshot.clock_mode_check_instructions_removed;
+	s_iop_a32_stats.saved_register_stack_words_removed =
+		snapshot.saved_register_stack_words_removed;
+	s_iop_a32_stats.saved_register_frame_instructions_added =
+		snapshot.saved_register_frame_instructions_added;
+	s_iop_a32_stats.saved_register_frame_instructions_removed =
+		snapshot.saved_register_frame_instructions_removed;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved = s_iop_a32_pinned_gpr_memory_ops_saved;
 #endif
 	return s_iop_a32_stats;

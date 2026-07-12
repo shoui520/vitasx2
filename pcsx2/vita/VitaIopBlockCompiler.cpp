@@ -50,6 +50,7 @@ u32 g_qemuIopConstCop2WriteFastPaths = 0;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
 static bool s_qemuIopPinnedGprResidencyEnabled = true;
 static bool s_qemuIopClockModeSpecializationEnabled = true;
+static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 #endif
 
 namespace
@@ -898,14 +899,24 @@ namespace VitaIOP
 		// uses r10, but known direct-RAM blocks only need the r11 base pointer.
 		m_iop_cycle_base_register_available =
 			!m_iop_ram_mask_register_available && !m_emit_trace_checks && !m_defer_cycle_updates;
-		m_saved_registers = REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8;
-		if (m_iop_cycle_base_register_available || m_iop_ram_mask_register_available)
-			m_saved_registers |= REG_R10;
-		if (m_iop_ram_registers_available)
-			m_saved_registers |= REG_R11;
+		const u16 baseline_saved_registers = REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 |
+			((m_iop_cycle_base_register_available || m_iop_ram_mask_register_available) ? REG_R10 : 0) |
+			(m_iop_ram_registers_available ? REG_R11 : 0);
+		bool narrow_saved_registers = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		narrow_saved_registers = s_qemuIopSavedRegisterNarrowingEnabled;
+#endif
+		m_saved_registers = narrow_saved_registers ? m_required_saved_registers : baseline_saved_registers;
+		if ((m_saved_registers & ~baseline_saved_registers) != 0)
+			return false;
+		m_saved_register_stack_words_removed = narrow_saved_registers ?
+			2u * (static_cast<u32>(__builtin_popcount(static_cast<unsigned>(baseline_saved_registers))) -
+				static_cast<u32>(__builtin_popcount(static_cast<unsigned>(m_saved_registers)))) : 0;
 
 		const u16 pushed_registers = m_saved_registers | REG_LR;
 		const u32 pushed_count = static_cast<u32>(__builtin_popcount(static_cast<unsigned>(pushed_registers)));
+		const u32 baseline_pushed_count = static_cast<u32>(
+			__builtin_popcount(static_cast<unsigned>(baseline_saved_registers | REG_LR)));
 		// PCSX2's iPsxAddEECycles(blockCycles) charges an analysis-proven block
 		// directly. Those blocks need no dynamic cycle snapshot slot; keep only
 		// the optional word required to restore AAPCS stack alignment for calls.
@@ -913,6 +924,13 @@ namespace VitaIOP
 			m_stack_frame_size = (pushed_count & 1u) ? 4 : 0;
 		else
 			m_stack_frame_size = (pushed_count & 1u) ? 4 : 8;
+		const u8 baseline_stack_frame_size = m_defer_cycle_updates ?
+			((baseline_pushed_count & 1u) ? 4 : 0) :
+			((baseline_pushed_count & 1u) ? 4 : 8);
+		m_saved_register_frame_instructions_added =
+			(baseline_stack_frame_size == 0 && m_stack_frame_size != 0) ? 2 : 0;
+		m_saved_register_frame_instructions_removed =
+			(baseline_stack_frame_size != 0 && m_stack_frame_size == 0) ? 2 : 0;
 		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
 			(m_stack_frame_size != 0 && !m_code.EmitSubImm8(HOST_SP, HOST_SP, m_stack_frame_size)) ||
 			!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
@@ -1183,6 +1201,83 @@ namespace VitaIOP
 			pin.host = host;
 			pin.needs_initial_load = (needs_initial_mask & (1u << best_guest)) != 0;
 		}
+	}
+
+	void BlockCompiler::AnalyzeSavedRegisters(u32 start_pc, u32 instruction_count)
+	{
+		// PCSX2's _DynGen_EnterRecompiledCode() establishes one persistent host
+		// frame. Vita returns through AAPCS at each EE timeslice, so preserve only
+		// callee-saved hosts the emitted block can actually write.
+		m_required_saved_registers = REG_R4;
+		const bool cycle_base_register_available =
+			!m_iop_ram_mask_register_available && !m_emit_trace_checks && !m_defer_cycle_updates;
+		if (cycle_base_register_available || m_iop_ram_mask_register_available)
+			m_required_saved_registers |= REG_R10;
+		if (m_iop_ram_registers_available)
+			m_required_saved_registers |= REG_R11;
+		for (u8 i = 0; i < m_pinned_gpr_count; i++)
+			m_required_saved_registers |= static_cast<u16>(1u << m_pinned_gprs[i].host);
+
+		ResetGprConstState();
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 pc = start_pc + i * 4;
+			const u32 op = iopMemRead32(pc);
+			const u32 primary = op >> 26;
+			const auto dynamic_address = [&](u8 alignment_mask) {
+				u32 address = 0;
+				return !TryKnownDirectIopRamAddress(op, alignment_mask, &address);
+			};
+
+			if (primary == 0 && ((op & 0x3f) == 0x1a || (op & 0x3f) == 0x1b))
+				m_required_saved_registers |= REG_R5;
+			else if ((primary == 0x20 || primary == 0x24) && dynamic_address(0))
+				m_required_saved_registers |= REG_R5;
+			else if ((primary == 0x21 || primary == 0x25) && dynamic_address(1))
+				m_required_saved_registers |= REG_R5;
+			else if ((primary == 0x23 || primary == 0x28 || primary == 0x29 || primary == 0x2b) &&
+				dynamic_address(primary == 0x28 ? 0 : (primary == 0x29 ? 1 : 3)))
+			{
+				m_required_saved_registers |= REG_R5;
+			}
+			else if ((primary == 0x22 || primary == 0x26 || primary == 0x2a || primary == 0x2e) &&
+				dynamic_address(0))
+			{
+				m_required_saved_registers |= REG_R5 | REG_R6;
+			}
+			else if (primary == 0x32 && dynamic_address(3))
+			{
+				m_required_saved_registers |= REG_R5;
+			}
+			else if (primary == 0x3a)
+			{
+				m_required_saved_registers |= REG_R5;
+				if (dynamic_address(3))
+					m_required_saved_registers |= REG_R6;
+			}
+
+			const u32 delay_op = (i + 1 < instruction_count) ? iopMemRead32(pc + 4) : 0;
+			const bool final_delay_pair =
+				i + 2 == instruction_count &&
+				!IsIopBranchOrJumpOpcode(delay_op) &&
+				!IsIopExceptionOpcode(delay_op);
+			const bool native_static_branch =
+				IsIopStaticConditionalBranchOpcode(op) && final_delay_pair;
+			const bool native_static_jump =
+				IsIopStaticJumpOpcode(op) && final_delay_pair &&
+				((op >> 26) != 0x02 || (delay_op >> 16) != 0x2400);
+			const bool native_register_jump =
+				IsIopRegisterJumpOpcode(op) && final_delay_pair;
+			if (native_static_branch)
+				m_required_saved_registers |= REG_R5 | REG_R7;
+			else if (native_static_jump)
+				m_required_saved_registers |= REG_R5;
+			else if (native_register_jump)
+				m_required_saved_registers |= REG_R5 | REG_R8;
+
+			UpdateGprConstStateAfterOpcode(op, pc);
+		}
+		ResetGprConstState();
 	}
 
 	int BlockCompiler::PinnedHostForGuest(unsigned guest_reg) const
@@ -5185,6 +5280,7 @@ namespace VitaIOP
 		m_has_budget_exit = false;
 		m_block_cycle_count = instruction_count;
 		AnalyzePinnedGprs(start_pc, instruction_count);
+		AnalyzeSavedRegisters(start_pc, instruction_count);
 
 		if (!BeginBlock())
 			return false;
@@ -5507,6 +5603,9 @@ namespace VitaIOP
 		m_ram_invalidation_calls = 0;
 		m_ram_invalidation_record_visits = 0;
 		m_clock_mode_check_instructions_removed = 0;
+		m_saved_register_stack_words_removed = 0;
+		m_saved_register_frame_instructions_added = 0;
+		m_saved_register_frame_instructions_removed = 0;
 #endif
 	}
 
@@ -5532,6 +5631,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopClockModeSpecializationEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetSavedRegisterNarrowingEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopSavedRegisterNarrowingEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -6192,6 +6300,9 @@ namespace VitaIOP
 		block.direct_budget_exit = false;
 		block.constant_cycle_budget = false;
 		block.clock_mode_check_instructions_removed = 0;
+		block.saved_register_stack_words_removed = 0;
+		block.saved_register_frame_instructions_added = 0;
+		block.saved_register_frame_instructions_removed = 0;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -6741,6 +6852,9 @@ namespace VitaIOP
 		u32 helper_instruction_count = 0;
 		u32 pinned_gpr_memory_ops_saved = 0;
 		u32 clock_mode_check_instructions_removed = 0;
+		u32 saved_register_stack_words_removed = 0;
+		u32 saved_register_frame_instructions_added = 0;
+		u32 saved_register_frame_instructions_removed = 0;
 		bool direct_budget_exit = false;
 		bool constant_cycle_budget = false;
 		DirectLinkSlots direct_links;
@@ -6775,6 +6889,9 @@ namespace VitaIOP
 				helper_instruction_count = compiler.HelperInstructionCount();
 				pinned_gpr_memory_ops_saved = compiler.PinnedGprMemoryOpsSaved();
 				clock_mode_check_instructions_removed = compiler.ClockModeCheckInstructionsRemoved();
+				saved_register_stack_words_removed = compiler.SavedRegisterStackWordsRemoved();
+				saved_register_frame_instructions_added = compiler.SavedRegisterFrameInstructionsAdded();
+				saved_register_frame_instructions_removed = compiler.SavedRegisterFrameInstructionsRemoved();
 				direct_budget_exit = compiler.UsesDirectBudgetExit();
 				constant_cycle_budget = compiler.UsesConstantCycleBudget();
 				direct_links = attempt_direct_links;
@@ -6797,6 +6914,9 @@ namespace VitaIOP
 		block.helper_instruction_count = helper_instruction_count;
 		block.pinned_gpr_memory_ops_saved = pinned_gpr_memory_ops_saved;
 		block.clock_mode_check_instructions_removed = clock_mode_check_instructions_removed;
+		block.saved_register_stack_words_removed = saved_register_stack_words_removed;
+		block.saved_register_frame_instructions_added = saved_register_frame_instructions_added;
+		block.saved_register_frame_instructions_removed = saved_register_frame_instructions_removed;
 		block.direct_budget_exit = direct_budget_exit;
 		block.constant_cycle_budget = constant_cycle_budget;
 		block.direct_links = direct_links;
@@ -6939,6 +7059,9 @@ namespace VitaIOP
 		result->ram_invalidation_calls = m_ram_invalidation_calls;
 		result->ram_invalidation_record_visits = m_ram_invalidation_record_visits;
 		result->clock_mode_check_instructions_removed = m_clock_mode_check_instructions_removed;
+		result->saved_register_stack_words_removed = m_saved_register_stack_words_removed;
+		result->saved_register_frame_instructions_added = m_saved_register_frame_instructions_added;
+		result->saved_register_frame_instructions_removed = m_saved_register_frame_instructions_removed;
 	}
 #endif
 
@@ -6982,6 +7105,9 @@ namespace VitaIOP
 		if (block.constant_cycle_budget)
 			m_constant_cycle_budget_provider_entries++;
 		m_clock_mode_check_instructions_removed += block.clock_mode_check_instructions_removed;
+		m_saved_register_stack_words_removed += block.saved_register_stack_words_removed;
+		m_saved_register_frame_instructions_added += block.saved_register_frame_instructions_added;
+		m_saved_register_frame_instructions_removed += block.saved_register_frame_instructions_removed;
 #endif
 		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
 

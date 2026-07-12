@@ -62,6 +62,9 @@ namespace VitaIOP
 		u64 ram_invalidation_calls;
 		u64 ram_invalidation_record_visits;
 		u64 clock_mode_check_instructions_removed;
+		u64 saved_register_stack_words_removed;
+		u64 saved_register_frame_instructions_added;
+		u64 saved_register_frame_instructions_removed;
 		u32 pinned_gpr_memory_ops_saved;
 #endif
 		bool cache_hit;
@@ -97,6 +100,9 @@ namespace VitaIOP
 		bool UsesDirectBudgetExit() const { return m_has_budget_exit; }
 		bool UsesConstantCycleBudget() const { return m_defer_cycle_updates; }
 		u32 ClockModeCheckInstructionsRemoved() const { return m_clock_mode_check_instructions_removed; }
+		u32 SavedRegisterStackWordsRemoved() const { return m_saved_register_stack_words_removed; }
+		u32 SavedRegisterFrameInstructionsAdded() const { return m_saved_register_frame_instructions_added; }
+		u32 SavedRegisterFrameInstructionsRemoved() const { return m_saved_register_frame_instructions_removed; }
 		u32 PinnedGprMemoryOpsSaved() const { return m_pinned_gpr_memory_ops_saved; }
 
 	private:
@@ -111,6 +117,7 @@ namespace VitaIOP
 		bool EmitStoreCode(u32 op);
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
 		void AnalyzePinnedGprs(u32 start_pc, u32 instruction_count);
+		void AnalyzeSavedRegisters(u32 start_pc, u32 instruction_count);
 		int PinnedHostForGuest(unsigned guest_reg) const;
 		bool EmitFlushPinnedGprs();
 		void RecordPinnedGprExitPathSavings();
@@ -243,6 +250,7 @@ namespace VitaIOP
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
 		u16 m_saved_registers = 0;
+		u16 m_required_saved_registers = 0;
 		u8 m_stack_frame_size = 0;
 		struct PinnedGpr
 		{
@@ -263,6 +271,9 @@ namespace VitaIOP
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
 		u32 m_block_cycle_count = 0;
 		u32 m_clock_mode_check_instructions_removed = 0;
+		u32 m_saved_register_stack_words_removed = 0;
+		u32 m_saved_register_frame_instructions_added = 0;
+		u32 m_saved_register_frame_instructions_removed = 0;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
@@ -301,6 +312,7 @@ namespace VitaIOP
 		static void SetTrustedSourceAuditEnabled(bool enabled);
 		static void SetPinnedGprResidencyEnabled(bool enabled);
 		static void SetClockModeSpecializationEnabled(bool enabled);
+		static void SetSavedRegisterNarrowingEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -356,6 +368,9 @@ namespace VitaIOP
 			u32 helper_instruction_count = 0;
 			u32 pinned_gpr_memory_ops_saved = 0;
 			u32 clock_mode_check_instructions_removed = 0;
+			u32 saved_register_stack_words_removed = 0;
+			u32 saved_register_frame_instructions_added = 0;
+			u32 saved_register_frame_instructions_removed = 0;
 			DirectLinkSlots direct_links{};
 			bool wait_loop_shape = false;
 			bool wait_loop_enabled_at_compile = false;
@@ -486,6 +501,9 @@ namespace VitaIOP
 		u64 m_ram_invalidation_calls = 0;
 		u64 m_ram_invalidation_record_visits = 0;
 		u64 m_clock_mode_check_instructions_removed = 0;
+		u64 m_saved_register_stack_words_removed = 0;
+		u64 m_saved_register_frame_instructions_added = 0;
+		u64 m_saved_register_frame_instructions_removed = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};
