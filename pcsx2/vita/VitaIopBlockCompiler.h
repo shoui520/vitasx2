@@ -59,6 +59,10 @@ namespace VitaIOP
 		u64 wait_resume_event_fallbacks;
 		u64 wait_resume_event_installs;
 		u64 wait_resume_event_clears;
+		u64 wait_resume_descriptor_forwards;
+		u64 wait_resume_unconditional_forwards;
+		u64 wait_resume_poll_forwards;
+		u64 wait_resume_conditional_forwards;
 		u64 direct_budget_exit_provider_entries;
 		u64 constant_cycle_budget_provider_entries;
 		u64 validation_calls;
@@ -158,6 +162,14 @@ namespace VitaIOP
 		u8 rs = 0;
 		u8 rt = 0;
 		bool writes_link = false;
+	};
+
+	enum class WaitResumeKind : u32
+	{
+		Unconditional,
+		PollCall,
+		Conditional,
+		Invalid,
 	};
 
 	// PCSX2's iopEnterRecompiledCode dispatcher returns hot control state in
@@ -522,6 +534,7 @@ namespace VitaIOP
 		static void SetCachedWaitDescriptorEnabled(bool enabled);
 		static void SetInlineWaitFastForwardEnabled(bool enabled);
 		static void SetWaitResumeCacheEnabled(bool enabled);
+		static void SetWaitResumeDescriptorSpecializationEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -691,6 +704,10 @@ namespace VitaIOP
 		inline __attribute__((always_inline)) bool TryFastForwardPollCallWaitLoop(CachedBlock& block);
 		inline __attribute__((always_inline)) bool TryFastForwardCachedUnconditionalWaitLoop(
 			CachedBlock& block);
+		inline __attribute__((always_inline)) void FastForwardRetainedUnconditionalWaitLoop(
+			CachedBlock& block);
+		inline __attribute__((always_inline)) bool TryFastForwardRetainedWaitLoop(
+			CachedBlock& block, WaitResumeKind kind);
 		__attribute__((noinline, cold)) bool TryFastForwardCachedWaitLoop(CachedBlock& block);
 		bool EnsureCodeCache();
 		void ReleaseCodeCache();
@@ -715,7 +732,8 @@ namespace VitaIOP
 		__attribute__((noinline)) s32 ExecuteProviderTimeslicePrivateBody(
 			s32 ee_cycles) __asm__("VitaIopA32ProviderTimesliceBody");
 		__attribute__((no_stack_protector, noinline)) s32
-			ExecuteProviderWaitResumePrivateBody(s32 ee_cycles, CachedBlock* block)
+			ExecuteProviderWaitResumePrivateBody(
+				s32 ee_cycles, CachedBlock* block, WaitResumeKind kind)
 				__asm__("VitaIopA32ProviderWaitResumeBody");
 #endif
 		void SetWaitResumeBlock(CachedBlock* block);
@@ -743,6 +761,7 @@ namespace VitaIOP
 		{
 			BlockExecutor* executor = nullptr;
 			CachedBlock* block = nullptr;
+			WaitResumeKind kind = WaitResumeKind::Invalid;
 		} m_wait_resume_event_context;
 		bool m_owns_ee_event_entry = false;
 		u32 m_next_source_serial = 1;
@@ -763,6 +782,10 @@ namespace VitaIOP
 		u64 m_wait_resume_event_fallbacks = 0;
 		u64 m_wait_resume_event_installs = 0;
 		u64 m_wait_resume_event_clears = 0;
+		u64 m_wait_resume_descriptor_forwards = 0;
+		u64 m_wait_resume_unconditional_forwards = 0;
+		u64 m_wait_resume_poll_forwards = 0;
+		u64 m_wait_resume_conditional_forwards = 0;
 		u64 m_direct_budget_exit_provider_entries = 0;
 		u64 m_constant_cycle_budget_provider_entries = 0;
 		u64 m_validation_calls = 0;

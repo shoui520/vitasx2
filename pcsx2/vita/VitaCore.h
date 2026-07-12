@@ -142,6 +142,10 @@ struct VitaA32IopProviderStats
 	u64 wait_resume_event_fallbacks = 0;
 	u64 wait_resume_event_installs = 0;
 	u64 wait_resume_event_clears = 0;
+	u64 wait_resume_descriptor_forwards = 0;
+	u64 wait_resume_unconditional_forwards = 0;
+	u64 wait_resume_poll_forwards = 0;
+	u64 wait_resume_conditional_forwards = 0;
 	u64 direct_budget_exit_provider_entries = 0;
 	u64 constant_cycle_budget_provider_entries = 0;
 	u64 validation_calls = 0;
@@ -253,6 +257,7 @@ void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled);
 void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled);
 void VitaSetA32IopWaitResumeCacheEnabled(bool enabled);
 void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled);
+void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled);
 VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile();
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles);
 void VitaRecordA32IopWaitLoopDispatchElision();

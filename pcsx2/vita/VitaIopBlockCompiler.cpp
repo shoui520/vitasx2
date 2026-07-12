@@ -77,6 +77,7 @@ static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
 static bool s_qemuIopCachedWaitDescriptorEnabled = true;
 static bool s_qemuIopInlineWaitFastForwardEnabled = true;
 static bool s_qemuIopWaitResumeCacheEnabled = true;
+static bool s_qemuIopWaitResumeDescriptorSpecializationEnabled = true;
 static u64 s_qemuIopInlineWaitFastForwards = 0;
 #endif
 
@@ -6760,7 +6761,7 @@ namespace VitaIOP
 	}
 
 	BlockExecutor::BlockExecutor(bool owns_ee_event_entry)
-		: m_wait_resume_event_context{this, nullptr}
+		: m_wait_resume_event_context{this, nullptr, WaitResumeKind::Invalid}
 		, m_owns_ee_event_entry(owns_ee_event_entry)
 	{
 		bool isolate_variants_enabled = true;
@@ -6782,6 +6783,10 @@ namespace VitaIOP
 
 		m_wait_resume_block = block;
 		m_wait_resume_event_context.block = block;
+		m_wait_resume_event_context.kind = block->poll_call_wait_loop ?
+			WaitResumeKind::PollCall :
+			(block->wait_loop_descriptor.condition == WaitLoopCondition::Always ?
+				WaitResumeKind::Unconditional : WaitResumeKind::Conditional);
 #if defined(__arm__)
 		if (m_owns_ee_event_entry)
 		{
@@ -6801,6 +6806,7 @@ namespace VitaIOP
 
 		m_wait_resume_block = nullptr;
 		m_wait_resume_event_context.block = nullptr;
+		m_wait_resume_event_context.kind = WaitResumeKind::Invalid;
 #if defined(__arm__)
 		if (m_owns_ee_event_entry)
 		{
@@ -6834,6 +6840,10 @@ namespace VitaIOP
 		m_wait_resume_event_fallbacks = 0;
 		m_wait_resume_event_installs = 0;
 		m_wait_resume_event_clears = 0;
+		m_wait_resume_descriptor_forwards = 0;
+		m_wait_resume_unconditional_forwards = 0;
+		m_wait_resume_poll_forwards = 0;
+		m_wait_resume_conditional_forwards = 0;
 		m_direct_budget_exit_provider_entries = 0;
 		m_constant_cycle_budget_provider_entries = 0;
 		m_validation_calls = 0;
@@ -7041,6 +7051,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopWaitResumeCacheEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetWaitResumeDescriptorSpecializationEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopWaitResumeDescriptorSpecializationEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -7998,6 +8017,41 @@ namespace VitaIOP
 		return true;
 	}
 
+	inline __attribute__((always_inline)) void
+	BlockExecutor::FastForwardRetainedUnconditionalWaitLoop(CachedBlock& block)
+	{
+		// SetWaitResumeBlock() records this kind only after the same immutable,
+		// raw-backed descriptor has forwarded once. Source invalidation and every
+		// cache reset clear the scheduler context before the block can be reused,
+		// so repeating the condition/cycle classification here is redundant.
+		const WaitLoopDescriptor& descriptor = block.wait_loop_descriptor;
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_cached_wait_descriptor_checks++;
+		m_cached_wait_descriptor_forwards++;
+		m_cached_wait_descriptor_unconditional_checks++;
+		m_cached_wait_descriptor_opcode_reads_removed += descriptor.cycles;
+#endif
+		if (descriptor.writes_link) [[unlikely]]
+			psxRegs.GPR.r[31] = block.start_pc + descriptor.cycles * sizeof(u32);
+		FastForwardProviderIopWaitLoop(block.start_pc, descriptor.cycles);
+#if defined(VITASX2_QEMU_VALIDATION)
+		VitaRecordA32IopWaitLoopDispatchElision();
+#endif
+	}
+
+	inline __attribute__((always_inline)) bool
+	BlockExecutor::TryFastForwardRetainedWaitLoop(CachedBlock& block, WaitResumeKind kind)
+	{
+		if (kind == WaitResumeKind::Unconditional) [[likely]]
+		{
+			FastForwardRetainedUnconditionalWaitLoop(block);
+			return true;
+		}
+		if (kind == WaitResumeKind::PollCall)
+			return TryFastForwardPollCallWaitLoop(block);
+		return kind == WaitResumeKind::Conditional && TryFastForwardCachedWaitLoop(block);
+	}
+
 	bool BlockExecutor::ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result)
 	{
 		if (!result || max_instruction_count == 0)
@@ -8708,6 +8762,10 @@ namespace VitaIOP
 		result->wait_resume_event_fallbacks = m_wait_resume_event_fallbacks;
 		result->wait_resume_event_installs = m_wait_resume_event_installs;
 		result->wait_resume_event_clears = m_wait_resume_event_clears;
+		result->wait_resume_descriptor_forwards = m_wait_resume_descriptor_forwards;
+		result->wait_resume_unconditional_forwards = m_wait_resume_unconditional_forwards;
+		result->wait_resume_poll_forwards = m_wait_resume_poll_forwards;
+		result->wait_resume_conditional_forwards = m_wait_resume_conditional_forwards;
 		result->direct_budget_exit_provider_entries = m_direct_budget_exit_provider_entries;
 		result->constant_cycle_budget_provider_entries = m_constant_cycle_budget_provider_entries;
 		result->validation_calls = m_validation_calls;
@@ -9377,7 +9435,7 @@ namespace VitaIOP
 
 #if defined(__arm__)
 	s32 BlockExecutor::ExecuteProviderWaitResumePrivateBody(
-		s32 ee_cycles, CachedBlock* block)
+		s32 ee_cycles, CachedBlock* block, WaitResumeKind kind)
 	{
 		asm volatile("" ::: "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "lr");
 		psxRegs.iopBreak = 0;
@@ -9421,12 +9479,68 @@ namespace VitaIOP
 			m_wait_resume_cache_hits++;
 			m_private_dispatcher_inlined_hot_entries++;
 #endif
-			const u32 dispatch_flags = RunProviderBlockInline(*block,
-				ProviderDispatchCacheHit | ProviderDispatchLookupHit |
-				ProviderDispatchFastHit);
-			if ((dispatch_flags & ProviderDispatchSuccess) == 0)
+			bool wait_forward = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+			bool control_provider_executed = false;
+#endif
+#if defined(VITASX2_IOP_WAIT_RESUME_DESCRIPTOR_CONTROL)
+			constexpr bool use_descriptor_specialization = false;
+#elif defined(VITASX2_QEMU_VALIDATION)
+			const bool use_descriptor_specialization =
+				s_qemuIopWaitResumeDescriptorSpecializationEnabled;
+#else
+			constexpr bool use_descriptor_specialization = true;
+#endif
+			if (!use_descriptor_specialization)
+			{
+				const u32 dispatch_flags = RunProviderBlockInline(*block,
+					ProviderDispatchCacheHit | ProviderDispatchLookupHit |
+					ProviderDispatchFastHit);
+#if defined(VITASX2_QEMU_VALIDATION)
+				control_provider_executed =
+					(dispatch_flags & ProviderDispatchSuccess) != 0;
+#endif
+				wait_forward = (dispatch_flags &
+					(ProviderDispatchSuccess | ProviderDispatchWaitForward)) ==
+					(ProviderDispatchSuccess | ProviderDispatchWaitForward);
+			}
+			else
+			{
+				wait_forward = TryFastForwardRetainedWaitLoop(*block, kind);
+				if (wait_forward)
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					m_wait_resume_descriptor_forwards++;
+					switch (kind)
+					{
+						case WaitResumeKind::Unconditional:
+							m_wait_resume_unconditional_forwards++;
+							break;
+						case WaitResumeKind::PollCall:
+							m_wait_resume_poll_forwards++;
+							break;
+						case WaitResumeKind::Conditional:
+							m_wait_resume_conditional_forwards++;
+							break;
+						case WaitResumeKind::Invalid:
+							break;
+					}
+					m_pinned_gpr_memory_ops_saved += block->pinned_gpr_memory_ops_saved;
+					m_pinned_branch_operand_moves_removed +=
+						block->pinned_branch_operand_moves_removed;
+					m_condition_code_branch_instructions_removed +=
+						block->condition_code_branch_instructions_removed;
+#endif
+				}
+			}
+			if (!wait_forward)
 			{
 #if defined(VITASX2_QEMU_VALIDATION)
+				if (control_provider_executed)
+				{
+					m_private_dispatcher_provider_entries++;
+					m_private_dispatcher_generated_entries++;
+				}
 				m_wait_resume_event_fallbacks++;
 #endif
 				ClearWaitResumeBlock();
@@ -9435,21 +9549,10 @@ namespace VitaIOP
 			}
 #if defined(VITASX2_QEMU_VALIDATION)
 			m_private_dispatcher_provider_entries++;
+			m_private_dispatcher_wait_forwards++;
+			m_wait_resume_event_forwards++;
 #endif
-			if ((dispatch_flags & ProviderDispatchWaitForward) != 0)
-			{
-#if defined(VITASX2_QEMU_VALIDATION)
-				m_private_dispatcher_wait_forwards++;
-				m_wait_resume_event_forwards++;
-#endif
-				continue;
-			}
-#if defined(VITASX2_QEMU_VALIDATION)
-			m_private_dispatcher_generated_entries++;
-			m_wait_resume_event_fallbacks++;
-#endif
-			const s32 result = ExecuteProviderTimesliceRemainder();
-			ReturnFromPrivateProviderTimeslice(result);
+			continue;
 		}
 
 		ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
@@ -9498,9 +9601,11 @@ namespace VitaIOP
 	VitaIopA32ExecuteProviderWaitResumePrivate(void*, s32)
 	{
 		asm volatile(
-			// The scheduler context supplies {executor, retained block}. Convert
-			// it to the private member ABI and reserve the verified core CFA.
+			// The scheduler context supplies {executor, retained block, proven
+			// wait kind}. Convert it to the private member ABI and reserve the
+			// verified core CFA.
 			"ldr r2, [r0, #4]\n"
+			"ldr r3, [r0, #8]\n"
 			"ldr r0, [r0, #0]\n"
 			"sub sp, sp, #36\n"
 			"str lr, [sp, #32]\n"

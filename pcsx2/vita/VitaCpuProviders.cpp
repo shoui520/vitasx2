@@ -1245,6 +1245,11 @@ void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled)
 	UpdateIopEventEntry();
 #endif
 }
+
+void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetWaitResumeDescriptorSpecializationEnabled(enabled);
+}
 #endif
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
@@ -1265,6 +1270,13 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.wait_resume_event_fallbacks = snapshot.wait_resume_event_fallbacks;
 	s_iop_a32_stats.wait_resume_event_installs = snapshot.wait_resume_event_installs;
 	s_iop_a32_stats.wait_resume_event_clears = snapshot.wait_resume_event_clears;
+	s_iop_a32_stats.wait_resume_descriptor_forwards =
+		snapshot.wait_resume_descriptor_forwards;
+	s_iop_a32_stats.wait_resume_unconditional_forwards =
+		snapshot.wait_resume_unconditional_forwards;
+	s_iop_a32_stats.wait_resume_poll_forwards = snapshot.wait_resume_poll_forwards;
+	s_iop_a32_stats.wait_resume_conditional_forwards =
+		snapshot.wait_resume_conditional_forwards;
 	s_iop_a32_stats.direct_budget_exit_provider_entries =
 		snapshot.direct_budget_exit_provider_entries;
 	s_iop_a32_stats.constant_cycle_budget_provider_entries =
