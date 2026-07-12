@@ -7029,6 +7029,9 @@ namespace VitaIOP
 		m_hot_dispatch_cache_hits = 0;
 		m_hot_dispatch_cache_misses = 0;
 		m_hot_dispatch_cache_way_probes = 0;
+		m_hot_dispatch_cache_64_set_hits = 0;
+		m_hot_dispatch_cache_64_set_misses = 0;
+		m_hot_dispatch_cache_64_set_way_probes = 0;
 		m_hot_dispatch_trusted_raw_hits = 0;
 		m_hot_dispatch_owned_hits = 0;
 		m_wait_resume_cache_attempts = 0;
@@ -7446,44 +7449,81 @@ namespace VitaIOP
 
 	void BlockExecutor::RegisterHotDispatchCache(CachedBlock& block)
 	{
+		const auto register_block = [&block](auto& set) {
+			for (HotDispatchCacheEntry& entry : set)
+			{
+				if (entry.block == &block || entry.start_pc == block.start_pc)
+				{
+					entry.block = &block;
+					entry.start_pc = block.start_pc;
+					return;
+				}
+			}
+			set[1] = set[0];
+			set[0].block = &block;
+			set[0].start_pc = block.start_pc;
+		};
 		auto& set = m_hot_dispatch_cache[block.isolate_cache_active ? 1 : 0]
 			[HotDispatchCacheIndex(block.start_pc)];
-		for (HotDispatchCacheEntry& entry : set)
-		{
-			if (entry.block == &block || entry.start_pc == block.start_pc)
-			{
-				entry.block = &block;
-				entry.start_pc = block.start_pc;
-				return;
-			}
-		}
 		// Keep the two most recently promoted PCs when a third PC aliases this
 		// set. Hits do not reorder the ways, so a stable two-PC call chain keeps
 		// both translations without per-dispatch cache writes.
-		set[1] = set[0];
-		set[0].block = &block;
-		set[0].start_pc = block.start_pc;
+		register_block(set);
+#if defined(VITASX2_QEMU_VALIDATION)
+		auto& control_set = m_hot_dispatch_cache_64_set_control[
+			block.isolate_cache_active ? 1 : 0]
+			[(block.start_pc >> 2) & (HOT_DISPATCH_CACHE_CONTROL_SET_COUNT - 1)];
+		register_block(control_set);
+#endif
 	}
 
 	void BlockExecutor::UnregisterHotDispatchCache(CachedBlock& block)
 	{
+		const auto unregister_block = [&block](auto& set) {
+			for (HotDispatchCacheEntry& entry : set)
+			{
+				if (entry.block == &block)
+					entry = {};
+			}
+			if (!set[0].block && set[1].block)
+			{
+				set[0] = set[1];
+				set[1] = {};
+			}
+		};
 		auto& set = m_hot_dispatch_cache[block.isolate_cache_active ? 1 : 0]
 			[HotDispatchCacheIndex(block.start_pc)];
-		for (HotDispatchCacheEntry& entry : set)
-		{
-			if (entry.block == &block)
-				entry = {};
-		}
-		if (!set[0].block && set[1].block)
-		{
-			set[0] = set[1];
-			set[1] = {};
-		}
+		unregister_block(set);
+#if defined(VITASX2_QEMU_VALIDATION)
+		auto& control_set = m_hot_dispatch_cache_64_set_control[
+			block.isolate_cache_active ? 1 : 0]
+			[(block.start_pc >> 2) & (HOT_DISPATCH_CACHE_CONTROL_SET_COUNT - 1)];
+		unregister_block(control_set);
+#endif
 	}
 
 	inline __attribute__((always_inline)) BlockExecutor::CachedBlock*
 	BlockExecutor::FindHotDispatchCacheBlockInline(u32 start_pc)
 	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		auto& control_set = m_hot_dispatch_cache_64_set_control[
+			m_active_isolate_cache_mode ? 1 : 0]
+			[(start_pc >> 2) & (HOT_DISPATCH_CACHE_CONTROL_SET_COUNT - 1)];
+		bool control_hit = false;
+		for (HotDispatchCacheEntry& control_entry : control_set)
+		{
+			m_hot_dispatch_cache_64_set_way_probes++;
+			if (control_entry.start_pc == start_pc && control_entry.block)
+			{
+				control_hit = true;
+				break;
+			}
+		}
+		if (control_hit)
+			m_hot_dispatch_cache_64_set_hits++;
+		else
+			m_hot_dispatch_cache_64_set_misses++;
+#endif
 		auto& set = m_hot_dispatch_cache[m_active_isolate_cache_mode ? 1 : 0]
 			[HotDispatchCacheIndex(start_pc)];
 		for (HotDispatchCacheEntry& entry : set)
@@ -7515,6 +7555,16 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 			if (trust_cache_ownership)
 				m_hot_dispatch_owned_hits++;
+			// A miss in the retired geometry would fall through to the exact lazy
+			// page table and promote this same block before returning. The selected
+			// larger cache can hit first, so reproduce that promotion in the shadow
+			// to keep every later control lookup faithful to the retired product.
+			if (!control_hit)
+			{
+				control_set[1] = control_set[0];
+				control_set[0].block = entry.block;
+				control_set[0].start_pc = start_pc;
+			}
 #endif
 
 			return entry.block;
@@ -7530,6 +7580,9 @@ namespace VitaIOP
 	void BlockExecutor::ClearHotDispatchCache()
 	{
 		m_hot_dispatch_cache = {};
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_hot_dispatch_cache_64_set_control = {};
+#endif
 	}
 
 	void BlockExecutor::ReleaseLookupPages()
@@ -9131,6 +9184,10 @@ namespace VitaIOP
 		result->hot_dispatch_cache_hits = m_hot_dispatch_cache_hits;
 		result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
 		result->hot_dispatch_cache_way_probes = m_hot_dispatch_cache_way_probes;
+		result->hot_dispatch_cache_64_set_hits = m_hot_dispatch_cache_64_set_hits;
+		result->hot_dispatch_cache_64_set_misses = m_hot_dispatch_cache_64_set_misses;
+		result->hot_dispatch_cache_64_set_way_probes =
+			m_hot_dispatch_cache_64_set_way_probes;
 		result->hot_dispatch_trusted_raw_hits = m_hot_dispatch_trusted_raw_hits;
 		result->hot_dispatch_owned_hits = m_hot_dispatch_owned_hits;
 		result->wait_resume_cache_attempts = m_wait_resume_cache_attempts;

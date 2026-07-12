@@ -50,6 +50,9 @@ namespace VitaIOP
 		u64 hot_dispatch_cache_hits;
 		u64 hot_dispatch_cache_misses;
 		u64 hot_dispatch_cache_way_probes;
+		u64 hot_dispatch_cache_64_set_hits;
+		u64 hot_dispatch_cache_64_set_misses;
+		u64 hot_dispatch_cache_64_set_way_probes;
 		u64 hot_dispatch_trusted_raw_hits;
 		u64 hot_dispatch_owned_hits;
 		u64 wait_resume_cache_attempts;
@@ -590,8 +593,14 @@ namespace VitaIOP
 		// PCSX2's R3000A dispatcher indexes psxRecLUT directly by guest PC.
 		// A full flat map is wasteful on Vita, so keep the hottest exact mappings
 		// in a Cortex-A9 D-cache-sized first level ahead of the lazy page table.
-		static constexpr u32 HOT_DISPATCH_CACHE_SET_COUNT = 64;
+		// 512 sets use an 8 KiB active isolate bank and still compile to one UBFX;
+		// smaller geometries discarded high-value PC bits and forced millions of
+		// otherwise exact hits through their second way.
+		static constexpr u32 HOT_DISPATCH_CACHE_SET_COUNT = 512;
 		static constexpr u32 HOT_DISPATCH_CACHE_WAY_COUNT = 2;
+#if defined(VITASX2_QEMU_VALIDATION)
+		static constexpr u32 HOT_DISPATCH_CACHE_CONTROL_SET_COUNT = 64;
+#endif
 		// PCSX2's recClearIOP() invalidates only blocks whose protected source
 		// pages were written. Use host-page-sized buckets here too: a 64 KiB LUT
 		// bucket makes every ordinary IOP RAM store walk unrelated blocks.
@@ -842,13 +851,19 @@ namespace VitaIOP
 		std::vector<CachedBlock*> m_free_cache_entries;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
+		// Keep the per-dispatch selector before the large inline source/cache
+		// banks so Cortex-A9 can load it with one immediate-offset LDR.
+		bool m_active_isolate_cache_mode = false;
 		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT> m_ram_source_pages;
 		std::array<u16, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
 		std::array<u8, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_flags{};
 		LookupPage** m_lookup_pages = nullptr;
 		std::array<std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
 			HOT_DISPATCH_CACHE_SET_COUNT>, 2> m_hot_dispatch_cache{};
-		bool m_active_isolate_cache_mode = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+		std::array<std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
+			HOT_DISPATCH_CACHE_CONTROL_SET_COUNT>, 2> m_hot_dispatch_cache_64_set_control{};
+#endif
 		CachedBlock* m_wait_resume_block = nullptr;
 		struct WaitResumeEventContext
 		{
@@ -866,6 +881,9 @@ namespace VitaIOP
 		u64 m_hot_dispatch_cache_hits = 0;
 		u64 m_hot_dispatch_cache_misses = 0;
 		u64 m_hot_dispatch_cache_way_probes = 0;
+		u64 m_hot_dispatch_cache_64_set_hits = 0;
+		u64 m_hot_dispatch_cache_64_set_misses = 0;
+		u64 m_hot_dispatch_cache_64_set_way_probes = 0;
 		u64 m_hot_dispatch_trusted_raw_hits = 0;
 		u64 m_hot_dispatch_owned_hits = 0;
 		u64 m_wait_resume_cache_attempts = 0;

@@ -1295,6 +1295,17 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.hot_dispatch_cache_hits = snapshot.hot_dispatch_cache_hits;
 	s_iop_a32_stats.hot_dispatch_cache_misses = snapshot.hot_dispatch_cache_misses;
 	s_iop_a32_stats.hot_dispatch_cache_way_probes = snapshot.hot_dispatch_cache_way_probes;
+	s_iop_a32_stats.hot_dispatch_cache_64_set_hits =
+		snapshot.hot_dispatch_cache_64_set_hits;
+	s_iop_a32_stats.hot_dispatch_cache_64_set_misses =
+		snapshot.hot_dispatch_cache_64_set_misses;
+	s_iop_a32_stats.hot_dispatch_cache_64_set_way_probes =
+		snapshot.hot_dispatch_cache_64_set_way_probes;
+	s_iop_a32_stats.hot_dispatch_cache_way_probes_removed =
+		(snapshot.hot_dispatch_cache_64_set_way_probes >=
+			snapshot.hot_dispatch_cache_way_probes) ?
+			(snapshot.hot_dispatch_cache_64_set_way_probes -
+				snapshot.hot_dispatch_cache_way_probes) : 0;
 	s_iop_a32_stats.hot_dispatch_trusted_raw_hits = snapshot.hot_dispatch_trusted_raw_hits;
 	s_iop_a32_stats.hot_dispatch_owned_hits = snapshot.hot_dispatch_owned_hits;
 	// The retired stale-entry arm loads/checks CachedBlock::valid and reloads/
