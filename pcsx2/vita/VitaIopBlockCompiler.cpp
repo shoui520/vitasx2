@@ -916,7 +916,9 @@ namespace
 				static_cast<u32>(psxRegs.iopCycleEE) - (numerator / 147u));
 		}
 
+#if defined(VITASX2_QEMU_VALIDATION)
 		VitaRecordA32IopWaitLoopFastForward(iop_cycles, block_cycles);
+#endif
 		if (psxRegs.iopCycleEE > 0)
 			iopEventTest();
 
@@ -7671,7 +7673,9 @@ namespace VitaIOP
 		// return for an otherwise empty wait loop while retaining the exact owner
 		// helper and the existing cache/SMC ownership.
 		VitaIopA32FastForwardWaitLoop(start_pc, block_cycles);
+#if defined(VITASX2_QEMU_VALIDATION)
 		VitaRecordA32IopWaitLoopDispatchElision();
+#endif
 		return true;
 	}
 
@@ -7870,8 +7874,10 @@ namespace VitaIOP
 		psxRegs.GPR.r[31] = block.start_pc + 2 * sizeof(u32);
 		constexpr u32 poll_loop_cycles = 2 + 5 + 2;
 		VitaIopA32FastForwardWaitLoop(block.start_pc, poll_loop_cycles);
+#if defined(VITASX2_QEMU_VALIDATION)
 		VitaRecordA32IopWaitLoopDispatchElision();
 		VitaRecordA32IopPollCallWaitLoopDispatchElision();
+#endif
 		return true;
 	}
 

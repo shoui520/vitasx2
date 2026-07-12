@@ -51,6 +51,7 @@ struct IopDispatchProfileEntry
 static std::unordered_map<u32, IopDispatchProfileEntry> s_iop_a32_dispatch_profile;
 static std::unordered_map<u64, u64> s_iop_a32_dispatch_edge_profile;
 static bool s_iop_a32_compact_provider_dispatch_enabled = true;
+static bool s_iop_a32_runtime_stats_enabled = true;
 static u64 s_iop_a32_compact_provider_dispatch_entries = 0;
 static u64 s_iop_a32_compact_provider_cache_hit_entries = 0;
 #endif
@@ -748,7 +749,13 @@ static void psxRecReserve()
 static void psxRecReset()
 {
 	psxInt.Reset();
-	s_iop_a32_stats.invalidated_blocks += s_iop_a32_executor.Reset();
+	const u32 invalidated = s_iop_a32_executor.Reset();
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (s_iop_a32_runtime_stats_enabled)
+		s_iop_a32_stats.invalidated_blocks += invalidated;
+#else
+	(void)invalidated;
+#endif
 }
 
 static s32 psxRecExecuteBlock(s32 eeCycles)
@@ -767,9 +774,9 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		}
 
 		const u32 pc = psxRegs.pc;
-		VitaIOP::ProviderCompileResult compile_result;
 		u32 dispatch_flags = 0;
 #if defined(VITASX2_QEMU_VALIDATION)
+		VitaIOP::ProviderCompileResult compile_result;
 		if (s_iop_a32_compact_provider_dispatch_enabled)
 		{
 			dispatch_flags =
@@ -808,11 +815,15 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 #else
 		// PCSX2 owner: x86/iR3000A.cpp::_DynGen_EnterRecompiledCode() returns
 		// dispatcher control in registers. The compact Vita provider does the
-		// same; only a cold compile writes compile_result.
-		dispatch_flags = s_iop_a32_executor.ExecuteProviderBlockAtPc(pc, &compile_result);
+		// same. Product execution does not consume cold-compile diagnostics.
+		dispatch_flags = s_iop_a32_executor.ExecuteProviderBlockAtPc(pc, nullptr);
 #endif
 		if ((dispatch_flags & VitaIOP::ProviderDispatchSuccess) == 0)
 		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			// Keep the rare fallback sentinel live even when hot-path statistics
+			// are disabled, so QEMU can still prove that product-equivalent
+			// execution never entered the interpreter.
 			const u32 opcode = iopMemRead32(pc);
 			VitaIOP::BlockScanResult scan;
 			if (VitaIOP::BlockExecutor::ScanStraightLineBlock(
@@ -829,29 +840,35 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.last_interpreter_pc = pc;
 			s_iop_a32_stats.last_interpreter_opcode = opcode;
 			s_iop_a32_stats.interpreter_blocks++;
+#endif
 			const s32 fallback_result = psxInt.ExecuteBlock(psxRegs.iopCycleEE);
 			return fallback_result;
 		}
 
-		if ((dispatch_flags & VitaIOP::ProviderDispatchCacheHit) != 0)
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (s_iop_a32_runtime_stats_enabled)
 		{
-			s_iop_a32_stats.cache_hits++;
+			if ((dispatch_flags & VitaIOP::ProviderDispatchCacheHit) != 0)
+			{
+				s_iop_a32_stats.cache_hits++;
+			}
+			else
+			{
+				s_iop_a32_stats.cache_misses++;
+				s_iop_a32_stats.compiled_blocks++;
+				s_iop_a32_stats.compiled_instructions += compile_result.instruction_count;
+				s_iop_a32_stats.native_instructions += compile_result.native_instruction_count;
+				s_iop_a32_stats.helper_instructions += compile_result.helper_instruction_count;
+				s_iop_a32_stats.code_cache_resets = compile_result.code_cache_resets;
+			}
+			if ((dispatch_flags & VitaIOP::ProviderDispatchLookupHit) != 0)
+				s_iop_a32_stats.lookup_hits++;
+			if ((dispatch_flags & VitaIOP::ProviderDispatchFastHit) != 0)
+				s_iop_a32_stats.fast_dispatch_hits++;
+			if ((dispatch_flags & VitaIOP::ProviderDispatchIsolateSwitch) != 0)
+				s_iop_a32_stats.isolate_mode_switches++;
 		}
-		else
-		{
-			s_iop_a32_stats.cache_misses++;
-			s_iop_a32_stats.compiled_blocks++;
-			s_iop_a32_stats.compiled_instructions += compile_result.instruction_count;
-			s_iop_a32_stats.native_instructions += compile_result.native_instruction_count;
-			s_iop_a32_stats.helper_instructions += compile_result.helper_instruction_count;
-			s_iop_a32_stats.code_cache_resets = compile_result.code_cache_resets;
-		}
-		if ((dispatch_flags & VitaIOP::ProviderDispatchLookupHit) != 0)
-			s_iop_a32_stats.lookup_hits++;
-		if ((dispatch_flags & VitaIOP::ProviderDispatchFastHit) != 0)
-			s_iop_a32_stats.fast_dispatch_hits++;
-		if ((dispatch_flags & VitaIOP::ProviderDispatchIsolateSwitch) != 0)
-			s_iop_a32_stats.isolate_mode_switches++;
+#endif
 		if ((dispatch_flags & VitaIOP::ProviderDispatchWaitForward) != 0)
 			continue;
 
@@ -867,9 +884,12 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		dispatch_profile.dispatches++;
 		const u64 edge_key = (static_cast<u64>(pc) << 32) | psxRegs.pc;
 		s_iop_a32_dispatch_edge_profile[edge_key]++;
+		if (s_iop_a32_runtime_stats_enabled)
+		{
+			s_iop_a32_stats.executed_blocks++;
+			s_iop_a32_stats.direct_exits++;
+		}
 #endif
-		s_iop_a32_stats.executed_blocks++;
-		s_iop_a32_stats.direct_exits++;
 	}
 
 	return psxRegs.iopBreak + psxRegs.iopCycleEE;
@@ -879,7 +899,13 @@ static void psxRecClear(u32 addr, u32 size)
 {
 	// PCSX2 owner: x86/iR3000A.cpp::recClearIOP(addr, size), where size is
 	// measured in 32-bit guest words.
-	s_iop_a32_stats.invalidated_blocks += s_iop_a32_executor.InvalidateRange(addr, size);
+	const u32 invalidated = s_iop_a32_executor.InvalidateRange(addr, size);
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (s_iop_a32_runtime_stats_enabled)
+		s_iop_a32_stats.invalidated_blocks += invalidated;
+#else
+	(void)invalidated;
+#endif
 }
 
 static void psxRecShutdown()
@@ -1094,6 +1120,13 @@ void VitaSetA32IopCompactProviderDispatchEnabled(bool enabled)
 #endif
 }
 
+#if defined(VITASX2_QEMU_VALIDATION)
+void VitaSetA32IopRuntimeStatsEnabled(bool enabled)
+{
+	s_iop_a32_runtime_stats_enabled = enabled;
+}
+#endif
+
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
 {
 	s_iop_a32_stats.code_cache_resets = s_iop_a32_executor.GetCodeCacheResetCount();
@@ -1161,6 +1194,18 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	// call. The flag-word contract consumes r0 directly and removes all five.
 	s_iop_a32_stats.compact_provider_result_loads_removed =
 		s_iop_a32_compact_provider_dispatch_entries * 5u;
+	// Product A32 before this iteration executes 20 provider-stat instructions
+	// on every cache hit, six more executed/direct counter instructions on an
+	// ordinary cache-hit entry, and at least 20 instructions in the wait-forward
+	// recorder before/after its uncounted __aeabi_uldivmod body. Subtract every
+	// cold miss from ordinary entries to keep the lower bound conservative.
+	const u64 ordinary_cache_hits =
+		s_iop_a32_stats.executed_blocks > s_iop_a32_stats.cache_misses ?
+			s_iop_a32_stats.executed_blocks - s_iop_a32_stats.cache_misses : 0;
+	s_iop_a32_stats.provider_runtime_stats_instructions_removed =
+		static_cast<u64>(s_iop_a32_stats.cache_hits) * 20u +
+		ordinary_cache_hits * 6u +
+		s_iop_a32_stats.wait_loop_fast_forwards * 20u;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved =
 		snapshot.total_pinned_gpr_memory_ops_saved;
 	s_iop_a32_stats.pinned_branch_operand_moves_removed =
@@ -1224,8 +1269,11 @@ VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile()
 }
 #endif
 
+#if defined(VITASX2_QEMU_VALIDATION)
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles)
 {
+	if (!s_iop_a32_runtime_stats_enabled)
+		return;
 	s_iop_a32_stats.wait_loop_fast_forwards++;
 	s_iop_a32_stats.wait_loop_iop_cycles += iop_cycles;
 	const u64 equivalent_blocks = block_cycles ? (iop_cycles / block_cycles) : 0;
@@ -1235,11 +1283,16 @@ void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles)
 
 void VitaRecordA32IopWaitLoopDispatchElision()
 {
+	if (!s_iop_a32_runtime_stats_enabled)
+		return;
 	s_iop_a32_stats.wait_loop_dispatches_elided++;
 }
 
 void VitaRecordA32IopPollCallWaitLoopDispatchElision()
 {
+	if (!s_iop_a32_runtime_stats_enabled)
+		return;
 	s_iop_a32_stats.poll_call_wait_loop_fast_forwards++;
 	s_iop_a32_stats.poll_call_wait_loop_dispatches_elided++;
 }
+#endif
