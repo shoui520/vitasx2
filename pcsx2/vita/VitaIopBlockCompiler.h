@@ -65,6 +65,9 @@ namespace VitaIOP
 		u64 saved_register_stack_words_removed;
 		u64 saved_register_frame_instructions_added;
 		u64 saved_register_frame_instructions_removed;
+		u64 batched_cycle_instructions_removed;
+		u64 batched_cycle_stack_words_removed;
+		u64 expanded_cycle_batching_provider_entries;
 		u32 pinned_gpr_memory_ops_saved;
 #endif
 		bool cache_hit;
@@ -103,11 +106,15 @@ namespace VitaIOP
 		u32 SavedRegisterStackWordsRemoved() const { return m_saved_register_stack_words_removed; }
 		u32 SavedRegisterFrameInstructionsAdded() const { return m_saved_register_frame_instructions_added; }
 		u32 SavedRegisterFrameInstructionsRemoved() const { return m_saved_register_frame_instructions_removed; }
+		u32 BatchedCycleInstructionsRemoved() const { return m_batched_cycle_instructions_removed; }
+		u32 BatchedCycleStackWordsRemoved() const { return m_batched_cycle_stack_words_removed; }
+		bool UsesExpandedCycleBatching() const { return m_expanded_cycle_batching; }
 		u32 PinnedGprMemoryOpsSaved() const { return m_pinned_gpr_memory_ops_saved; }
 
 	private:
 		bool BeginBlock();
-		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true, bool flush_pins = true);
+		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true,
+			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot);
 		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& trace_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
@@ -136,7 +143,7 @@ namespace VitaIOP
 		bool EmitStorePcReg(unsigned host_reg);
 		bool EmitAddCycles(u32 cycles);
 		bool EmitIncrementCycle();
-		bool EmitChargeEeBudget();
+		bool EmitChargeEeBudget(u32 known_cycle_count = 0);
 		bool EmitChargeEeBudgetPs1(u32 known_block_cycles);
 		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches);
@@ -274,10 +281,16 @@ namespace VitaIOP
 		u32 m_saved_register_stack_words_removed = 0;
 		u32 m_saved_register_frame_instructions_added = 0;
 		u32 m_saved_register_frame_instructions_removed = 0;
+		u32 m_batched_cycle_instructions_removed = 0;
+		u32 m_batched_cycle_stack_words_removed = 0;
+		u32 m_min_batched_cycle_prefix = UINT32_MAX;
+		u32 m_current_instruction_count = 0;
+		bool m_has_batched_cycle_helper_exit = false;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
 		bool m_defer_cycle_updates = false;
+		bool m_expanded_cycle_batching = false;
 		bool m_has_budget_exit = false;
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
@@ -313,6 +326,7 @@ namespace VitaIOP
 		static void SetPinnedGprResidencyEnabled(bool enabled);
 		static void SetClockModeSpecializationEnabled(bool enabled);
 		static void SetSavedRegisterNarrowingEnabled(bool enabled);
+		static void SetBlockCycleBatchingEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -371,6 +385,9 @@ namespace VitaIOP
 			u32 saved_register_stack_words_removed = 0;
 			u32 saved_register_frame_instructions_added = 0;
 			u32 saved_register_frame_instructions_removed = 0;
+			u32 batched_cycle_instructions_removed = 0;
+			u32 batched_cycle_stack_words_removed = 0;
+			bool expanded_cycle_batching = false;
 			DirectLinkSlots direct_links{};
 			bool wait_loop_shape = false;
 			bool wait_loop_enabled_at_compile = false;
@@ -504,6 +521,9 @@ namespace VitaIOP
 		u64 m_saved_register_stack_words_removed = 0;
 		u64 m_saved_register_frame_instructions_added = 0;
 		u64 m_saved_register_frame_instructions_removed = 0;
+		u64 m_batched_cycle_instructions_removed = 0;
+		u64 m_batched_cycle_stack_words_removed = 0;
+		u64 m_expanded_cycle_batching_provider_entries = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};
