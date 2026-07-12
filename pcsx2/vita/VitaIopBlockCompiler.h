@@ -68,6 +68,9 @@ namespace VitaIOP
 		u64 batched_cycle_instructions_removed;
 		u64 batched_cycle_stack_words_removed;
 		u64 expanded_cycle_batching_provider_entries;
+		u64 linked_frame_bypass_entries;
+		u64 linked_frame_instructions_removed;
+		u64 linked_frame_stack_words_removed;
 		u32 pinned_gpr_memory_ops_saved;
 #endif
 		bool cache_hit;
@@ -79,8 +82,11 @@ namespace VitaIOP
 	struct DirectLinkSlot
 	{
 		u32 target_pc = 0;
+		size_t frame_bypass_offset = static_cast<size_t>(-1);
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
+		u32 frame_teardown_instruction = 0;
+		bool patched_to_frame_bypass = false;
 		bool valid = false;
 	};
 
@@ -97,7 +103,8 @@ namespace VitaIOP
 		static bool CanCompileOpcode(u32 op);
 
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count,
-			const void* direct_exit = nullptr, DirectLinkSlots* direct_links = nullptr);
+			const void* direct_exit = nullptr, DirectLinkSlots* direct_links = nullptr,
+			size_t* linked_entry_offset = nullptr);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 		bool UsesDirectBudgetExit() const { return m_has_budget_exit; }
@@ -109,10 +116,12 @@ namespace VitaIOP
 		u32 BatchedCycleInstructionsRemoved() const { return m_batched_cycle_instructions_removed; }
 		u32 BatchedCycleStackWordsRemoved() const { return m_batched_cycle_stack_words_removed; }
 		bool UsesExpandedCycleBatching() const { return m_expanded_cycle_batching; }
+		u16 SavedRegisters() const { return m_saved_registers; }
+		u8 StackFrameSize() const { return m_stack_frame_size; }
 		u32 PinnedGprMemoryOpsSaved() const { return m_pinned_gpr_memory_ops_saved; }
 
 	private:
-		bool BeginBlock();
+		bool BeginBlock(size_t* linked_entry_offset);
 		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true,
 			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot);
@@ -335,6 +344,7 @@ namespace VitaIOP
 		static void SetClockModeSpecializationEnabled(bool enabled);
 		static void SetSavedRegisterNarrowingEnabled(bool enabled);
 		static void SetBlockCycleBatchingEnabled(bool enabled);
+		static void SetLinkedFrameBypassEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -396,6 +406,9 @@ namespace VitaIOP
 			u32 batched_cycle_instructions_removed = 0;
 			u32 batched_cycle_stack_words_removed = 0;
 			bool expanded_cycle_batching = false;
+			size_t linked_entry_offset = 0;
+			u16 saved_registers = 0;
+			u8 stack_frame_size = 0;
 			DirectLinkSlots direct_links{};
 			bool wait_loop_shape = false;
 			bool wait_loop_enabled_at_compile = false;
@@ -489,8 +502,9 @@ namespace VitaIOP
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count);
 		void PublishExecutionDetails(const CachedBlock& block, BlockExecutionResult* result) const;
 		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result, bool publish_details);
-		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target);
-		void PatchIncomingLinks(u32 target_pc, const void* target);
+		const void* LinkedEntryPoint(const CachedBlock& block) const;
+		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
+		void PatchIncomingLinks(CachedBlock& target);
 		void UnlinkIncomingLinks(u32 target_pc);
 		void RelinkDirectLinks();
 

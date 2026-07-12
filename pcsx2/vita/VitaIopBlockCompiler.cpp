@@ -14,6 +14,7 @@
 #include "pcsx2/vita/VitaCore.h"
 
 #include <algorithm>
+#include <cstring>
 #include <new>
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -47,11 +48,19 @@ u32 g_qemuIopConstDivideOperandFastPaths = 0;
 u32 g_qemuIopConstRegisterJumpFastPaths = 0;
 u32 g_qemuIopConstCop0WriteFastPaths = 0;
 u32 g_qemuIopConstCop2WriteFastPaths = 0;
+struct QemuIopLinkedFrameEvidence
+{
+	u32 entries = 0;
+	u32 instructions_removed = 0;
+	u32 stack_words_removed = 0;
+};
+static QemuIopLinkedFrameEvidence s_qemuIopLinkedFrameEvidence;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
 static bool s_qemuIopPinnedGprResidencyEnabled = true;
 static bool s_qemuIopClockModeSpecializationEnabled = true;
 static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
+static bool s_qemuIopLinkedFrameBypassEnabled = true;
 #endif
 
 namespace
@@ -920,8 +929,10 @@ namespace VitaIOP
 		return IsNativeOpcode(op);
 	}
 
-	bool BlockCompiler::BeginBlock()
+	bool BlockCompiler::BeginBlock(size_t* linked_entry_offset)
 	{
+		if (linked_entry_offset)
+			*linked_entry_offset = 0;
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
 		m_unaligned_read_cold_tails.clear();
@@ -967,11 +978,48 @@ namespace VitaIOP
 		m_saved_register_frame_instructions_removed =
 			(baseline_stack_frame_size != 0 && m_stack_frame_size == 0) ? 2 : 0;
 		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
-			(m_stack_frame_size != 0 && !m_code.EmitSubImm8(HOST_SP, HOST_SP, m_stack_frame_size)) ||
-			!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
+			(m_stack_frame_size != 0 && !m_code.EmitSubImm8(HOST_SP, HOST_SP, m_stack_frame_size)))
 		{
 			return false;
 		}
+
+		// PCSX2's _DynGen_EnterRecompiledCode() owns one private frame around a
+		// linked chain. Vita keeps narrow callable frames, but an exact frame
+		// signature can enter here after the PUSH/SUB and unwind only once at the
+		// eventual event/budget exit.
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (linked_entry_offset)
+		{
+			const size_t callable_body = m_code.EmitBranchPlaceholder();
+			if (callable_body == static_cast<size_t>(-1))
+				return false;
+			*linked_entry_offset = m_code.Size();
+			const u32 frame_instructions = 2u + (m_stack_frame_size != 0 ? 2u : 0u);
+			const u32 stack_words = 2u * static_cast<u32>(
+				__builtin_popcount(static_cast<unsigned>(m_saved_registers | REG_LR)));
+			if (!m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+					static_cast<u32>(reinterpret_cast<uptr>(&s_qemuIopLinkedFrameEvidence))) ||
+				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
+				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
+				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
+				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(frame_instructions)) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
+				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)) ||
+				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(stack_words)) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)) ||
+				!m_code.PatchBranch(callable_body, m_code.Size()))
+			{
+				return false;
+			}
+		}
+#else
+		if (linked_entry_offset)
+			*linked_entry_offset = m_code.Size();
+#endif
+
+		if (!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
+			return false;
 		if (m_track_published_cycle_prefix &&
 			(!m_code.EmitMovImm8(HOST_TMP0, 0) ||
 				!m_code.EmitStrImm12(HOST_TMP0, HOST_SP, 0)))
@@ -1037,12 +1085,21 @@ namespace VitaIOP
 		if (!direct_exit)
 			return false;
 
-		if (!EmitFlushPinnedGprs() || !EmitChargeEeBudget() ||
-			(m_stack_frame_size != 0 && !m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size)) ||
+		if (!EmitFlushPinnedGprs() || !EmitChargeEeBudget())
+		{
+			return false;
+		}
+
+		const size_t frame_bypass_offset = m_code.Size();
+		if ((m_stack_frame_size != 0 &&
+				!m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size)) ||
 			!m_code.EmitPop(m_saved_registers | REG_LR))
 		{
 			return false;
 		}
+		u32 frame_teardown_instruction = 0;
+		std::memcpy(&frame_teardown_instruction,
+			m_code.Data() + frame_bypass_offset, sizeof(frame_teardown_instruction));
 
 		const size_t target_offset = m_code.Size();
 		const size_t target_branch = m_code.EmitBranchPlaceholder();
@@ -1059,8 +1116,10 @@ namespace VitaIOP
 
 		if (direct_link_slot)
 		{
+			direct_link_slot->frame_bypass_offset = frame_bypass_offset;
 			direct_link_slot->target_offset = target_offset;
 			direct_link_slot->fallback_offset = fallback_offset;
+			direct_link_slot->frame_teardown_instruction = frame_teardown_instruction;
 		}
 		return true;
 	}
@@ -5346,7 +5405,7 @@ namespace VitaIOP
 	}
 
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count,
-		const void* direct_exit, DirectLinkSlots* direct_links)
+		const void* direct_exit, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -5447,7 +5506,7 @@ namespace VitaIOP
 		AnalyzePinnedGprs(start_pc, instruction_count);
 		AnalyzeSavedRegisters(start_pc, instruction_count);
 
-		if (!BeginBlock())
+		if (!BeginBlock(linked_entry_offset))
 			return false;
 
 		std::vector<size_t> direct_exit_branches;
@@ -5777,6 +5836,7 @@ namespace VitaIOP
 		m_batched_cycle_instructions_removed = 0;
 		m_batched_cycle_stack_words_removed = 0;
 		m_expanded_cycle_batching_provider_entries = 0;
+		s_qemuIopLinkedFrameEvidence = {};
 #endif
 	}
 
@@ -5820,6 +5880,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopBlockCycleBatchingEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetLinkedFrameBypassEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopLinkedFrameBypassEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -6486,6 +6555,9 @@ namespace VitaIOP
 		block.batched_cycle_instructions_removed = 0;
 		block.batched_cycle_stack_words_removed = 0;
 		block.expanded_cycle_batching = false;
+		block.linked_entry_offset = 0;
+		block.saved_registers = 0;
+		block.stack_frame_size = 0;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -7041,6 +7113,9 @@ namespace VitaIOP
 		u32 batched_cycle_instructions_removed = 0;
 		u32 batched_cycle_stack_words_removed = 0;
 		bool expanded_cycle_batching = false;
+		size_t linked_entry_offset = 0;
+		u16 saved_registers = 0;
+		u8 stack_frame_size = 0;
 		bool direct_budget_exit = false;
 		bool constant_cycle_budget = false;
 		DirectLinkSlots direct_links;
@@ -7064,8 +7139,10 @@ namespace VitaIOP
 
 			BlockCompiler compiler(block.code, m_ram_source_page_live_counts.data());
 			DirectLinkSlots attempt_direct_links;
+			size_t attempt_linked_entry_offset = 0;
 			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
-				reinterpret_cast<const void*>(&VitaIopA32DirectExit), &attempt_direct_links);
+				reinterpret_cast<const void*>(&VitaIopA32DirectExit), &attempt_direct_links,
+				&attempt_linked_entry_offset);
 			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
 			if (compiled && block.code.Flush())
 			{
@@ -7081,6 +7158,9 @@ namespace VitaIOP
 				batched_cycle_instructions_removed = compiler.BatchedCycleInstructionsRemoved();
 				batched_cycle_stack_words_removed = compiler.BatchedCycleStackWordsRemoved();
 				expanded_cycle_batching = compiler.UsesExpandedCycleBatching();
+				linked_entry_offset = attempt_linked_entry_offset;
+				saved_registers = compiler.SavedRegisters();
+				stack_frame_size = compiler.StackFrameSize();
 				direct_budget_exit = compiler.UsesDirectBudgetExit();
 				constant_cycle_budget = compiler.UsesConstantCycleBudget();
 				direct_links = attempt_direct_links;
@@ -7109,6 +7189,9 @@ namespace VitaIOP
 		block.batched_cycle_instructions_removed = batched_cycle_instructions_removed;
 		block.batched_cycle_stack_words_removed = batched_cycle_stack_words_removed;
 		block.expanded_cycle_batching = expanded_cycle_batching;
+		block.linked_entry_offset = linked_entry_offset;
+		block.saved_registers = saved_registers;
+		block.stack_frame_size = stack_frame_size;
 		block.direct_budget_exit = direct_budget_exit;
 		block.constant_cycle_budget = constant_cycle_budget;
 		block.direct_links = direct_links;
@@ -7127,13 +7210,13 @@ namespace VitaIOP
 
 		if (m_direct_linking_enabled)
 		{
-			PatchIncomingLinks(block.start_pc, block.code.EntryPoint());
+			PatchIncomingLinks(block);
 			for (DirectLinkSlot& link : block.direct_links.slots)
 			{
 				if (link.valid)
 				{
 					if (CachedBlock* target = FindCachedBlockByStartPc(link.target_pc))
-						PatchDirectLink(block, link, target->code.EntryPoint());
+						PatchDirectLink(block, link, target);
 				}
 			}
 		}
@@ -7141,34 +7224,56 @@ namespace VitaIOP
 		return true;
 	}
 
-	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, const void* target)
+	const void* BlockExecutor::LinkedEntryPoint(const CachedBlock& block) const
 	{
-		if (!target || !block.valid || !link.valid ||
+		if (!block.code.EntryPoint() || block.linked_entry_offset >= block.code.Size())
+			return block.code.EntryPoint();
+
+		return static_cast<const u8*>(block.code.EntryPoint()) + block.linked_entry_offset;
+	}
+
+	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target)
+	{
+		if (!block.valid || !link.valid ||
+			link.frame_bypass_offset == static_cast<size_t>(-1) ||
 			link.target_offset == static_cast<size_t>(-1) ||
 			link.fallback_offset == static_cast<size_t>(-1))
 		{
 			return false;
 		}
 
-		const bool target_is_direct_exit =
-			target == reinterpret_cast<const void*>(&VitaIopA32DirectExit);
-		const bool patched = target_is_direct_exit ?
-			block.code.PatchBranch(link.target_offset, link.fallback_offset) :
-			block.code.PatchBranchToAddress(link.target_offset, target);
-		return patched && block.code.Flush();
+		bool use_frame_bypass = target &&
+			block.saved_registers == target->saved_registers &&
+			block.stack_frame_size == target->stack_frame_size;
+#if defined(VITASX2_QEMU_VALIDATION)
+		use_frame_bypass = use_frame_bypass && s_qemuIopLinkedFrameBypassEnabled;
+#endif
+		const bool frame_patched = use_frame_bypass ?
+			block.code.PatchBranchToAddress(
+				link.frame_bypass_offset, LinkedEntryPoint(*target)) :
+			block.code.PatchInstruction(
+				link.frame_bypass_offset, link.frame_teardown_instruction);
+		const bool target_patched = target ?
+			block.code.PatchBranchToAddress(link.target_offset, target->code.EntryPoint()) :
+			block.code.PatchBranch(link.target_offset, link.fallback_offset);
+		if (!frame_patched || !target_patched || !block.code.Flush())
+			return false;
+
+		link.patched_to_frame_bypass = use_frame_bypass;
+		return true;
 	}
 
-	void BlockExecutor::PatchIncomingLinks(u32 target_pc, const void* target)
+	void BlockExecutor::PatchIncomingLinks(CachedBlock& target)
 	{
-		if (!m_direct_linking_enabled || !target)
+		if (!m_direct_linking_enabled || !target.valid)
 			return;
 
-		s32 index = LastIncomingLinkIndex(target_pc);
-		while (index >= 0 && m_incoming_links[index].target_pc == target_pc)
+		s32 index = LastIncomingLinkIndex(target.start_pc);
+		while (index >= 0 && m_incoming_links[index].target_pc == target.start_pc)
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
 			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-				PatchDirectLink(*record.source, *link, target);
+				PatchDirectLink(*record.source, *link, &target);
 		}
 	}
 
@@ -7180,7 +7285,7 @@ namespace VitaIOP
 			{
 				IncomingLinkRecord& record = m_incoming_links[i];
 				if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-					PatchDirectLink(*record.source, *link, reinterpret_cast<const void*>(&VitaIopA32DirectExit));
+					PatchDirectLink(*record.source, *link, nullptr);
 			}
 			return;
 		}
@@ -7190,7 +7295,7 @@ namespace VitaIOP
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
 			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-				PatchDirectLink(*record.source, *link, reinterpret_cast<const void*>(&VitaIopA32DirectExit));
+				PatchDirectLink(*record.source, *link, nullptr);
 		}
 	}
 
@@ -7203,9 +7308,8 @@ namespace VitaIOP
 			if (!link)
 				continue;
 
-			const CachedBlock* target = FindCachedBlockByStartPc(record.target_pc);
-			PatchDirectLink(*record.source, *link, target ? target->code.EntryPoint() :
-															reinterpret_cast<const void*>(&VitaIopA32DirectExit));
+			CachedBlock* target = FindCachedBlockByStartPc(record.target_pc);
+			PatchDirectLink(*record.source, *link, target);
 		}
 	}
 
@@ -7257,6 +7361,11 @@ namespace VitaIOP
 		result->batched_cycle_instructions_removed = m_batched_cycle_instructions_removed;
 		result->batched_cycle_stack_words_removed = m_batched_cycle_stack_words_removed;
 		result->expanded_cycle_batching_provider_entries = m_expanded_cycle_batching_provider_entries;
+		result->linked_frame_bypass_entries = s_qemuIopLinkedFrameEvidence.entries;
+		result->linked_frame_instructions_removed =
+			s_qemuIopLinkedFrameEvidence.instructions_removed;
+		result->linked_frame_stack_words_removed =
+			s_qemuIopLinkedFrameEvidence.stack_words_removed;
 	}
 #endif
 

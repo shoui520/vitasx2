@@ -1082,6 +1082,11 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 		snapshot.batched_cycle_stack_words_removed;
 	s_iop_a32_stats.expanded_cycle_batching_provider_entries =
 		snapshot.expanded_cycle_batching_provider_entries;
+	s_iop_a32_stats.linked_frame_bypass_entries = snapshot.linked_frame_bypass_entries;
+	s_iop_a32_stats.linked_frame_instructions_removed =
+		snapshot.linked_frame_instructions_removed;
+	s_iop_a32_stats.linked_frame_stack_words_removed =
+		snapshot.linked_frame_stack_words_removed;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved = s_iop_a32_pinned_gpr_memory_ops_saved;
 #endif
 	return s_iop_a32_stats;

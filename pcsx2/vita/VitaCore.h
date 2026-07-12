@@ -105,6 +105,9 @@ struct VitaA32IopProviderStats
 	u64 batched_cycle_instructions_removed = 0;
 	u64 batched_cycle_stack_words_removed = 0;
 	u64 expanded_cycle_batching_provider_entries = 0;
+	u64 linked_frame_bypass_entries = 0;
+	u64 linked_frame_instructions_removed = 0;
+	u64 linked_frame_stack_words_removed = 0;
 	u64 pinned_gpr_memory_ops_saved = 0;
 #endif
 };
