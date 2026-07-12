@@ -40,6 +40,7 @@ static VitaEE::BlockExecutor s_ee_a32_executor;
 static VitaIOP::BlockExecutor s_iop_a32_executor{true};
 #if defined(__arm__)
 static uptr s_iop_wait_resume_event_context = 0;
+static uptr s_iop_wait_resume_event_target = 0;
 bool g_vita_a32_iop_private_event_entry_available =
 	VitaIOP::VitaIopA32PrivateTimesliceEntrySupported();
 bool g_vita_a32_iop_private_wait_resume_entry_available =
@@ -102,6 +103,7 @@ static void UpdateIopEventEntry()
 		g_vita_a32_iop_private_event_entry_available)
 	{
 		const bool wait_resume = s_iop_wait_resume_event_context != 0 &&
+			s_iop_wait_resume_event_target != 0 &&
 			g_vita_a32_iop_private_wait_resume_entry_available
 #if defined(VITASX2_QEMU_VALIDATION)
 			&& g_vita_a32_iop_wait_resume_event_entry_enabled
@@ -111,7 +113,7 @@ static void UpdateIopEventEntry()
 			s_iop_wait_resume_event_context :
 			reinterpret_cast<uptr>(&s_iop_a32_executor);
 		g_vita_a32_iop_event_entry.target = wait_resume ?
-			reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderWaitResumePrivate) :
+			s_iop_wait_resume_event_target :
 			reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimeslicePrivate);
 	}
 	else
@@ -122,9 +124,10 @@ static void UpdateIopEventEntry()
 	}
 }
 
-void VitaSetA32IopWaitResumeEventEntry(uptr context)
+void VitaSetA32IopWaitResumeEventEntry(uptr context, uptr target)
 {
 	s_iop_wait_resume_event_context = context;
+	s_iop_wait_resume_event_target = target;
 	UpdateIopEventEntry();
 }
 #endif
@@ -1261,6 +1264,11 @@ void VitaSetA32IopWaitResumeFirstEntryOwnershipEnabled(bool enabled)
 	VitaIOP::BlockExecutor::SetWaitResumeFirstEntryOwnershipEnabled(enabled);
 }
 
+void VitaSetA32IopWaitResumeKindEntryEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetWaitResumeKindEntryEnabled(enabled);
+}
+
 void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetWaitResumeDescriptorSpecializationEnabled(enabled);
@@ -1299,6 +1307,16 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 		snapshot.wait_resume_first_entry_owned * 15u;
 	s_iop_a32_stats.wait_resume_post_event_identity_checks =
 		snapshot.wait_resume_post_event_identity_checks;
+	s_iop_a32_stats.wait_resume_kind_specific_entries =
+		snapshot.wait_resume_kind_specific_entries;
+	// Product generic-kind disassembly performs one context-kind load in the
+	// entry thunk, then three classification instructions per tested kind:
+	// unconditional tests one, poll tests two, and conditional tests three.
+	s_iop_a32_stats.wait_resume_kind_instructions_removed =
+		snapshot.wait_resume_kind_specific_entries +
+		snapshot.wait_resume_kind_specific_unconditional_forwards * 3u +
+		snapshot.wait_resume_kind_specific_poll_forwards * 6u +
+		snapshot.wait_resume_kind_specific_conditional_forwards * 9u;
 	s_iop_a32_stats.wait_resume_descriptor_forwards =
 		snapshot.wait_resume_descriptor_forwards;
 	s_iop_a32_stats.wait_resume_unconditional_forwards =
