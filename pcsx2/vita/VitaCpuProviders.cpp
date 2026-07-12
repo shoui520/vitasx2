@@ -1148,6 +1148,11 @@ void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetCachedWaitDescriptorEnabled(enabled);
 }
+
+void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetInlineWaitFastForwardEnabled(enabled);
+}
 #endif
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
@@ -1268,6 +1273,15 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.cached_wait_descriptor_control_transfers_removed =
 		(snapshot.cached_wait_descriptor_opcode_reads_removed +
 		 snapshot.cached_wait_descriptor_unconditional_checks) * 2u;
+	s_iop_a32_stats.inline_wait_fast_forwards = snapshot.inline_wait_fast_forwards;
+	// Product Cortex-A9 disassembly of VitaIopA32FastForwardWaitLoop() saves
+	// r4-r8/LR and returns through the matching POP. The private dispatcher
+	// already owns its wider frame, so inlining retires all twelve word transfers
+	// and the caller BL/callee return without adding another save set.
+	s_iop_a32_stats.inline_wait_stack_words_removed =
+		snapshot.inline_wait_fast_forwards * 12u;
+	s_iop_a32_stats.inline_wait_control_transfers_removed =
+		snapshot.inline_wait_fast_forwards * 2u;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved =
 		snapshot.total_pinned_gpr_memory_ops_saved;
 	s_iop_a32_stats.pinned_branch_operand_moves_removed =

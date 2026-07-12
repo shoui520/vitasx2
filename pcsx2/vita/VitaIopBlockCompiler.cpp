@@ -75,6 +75,8 @@ static bool s_qemuIopSequentialQwordCopyEnabled = true;
 static bool s_qemuIopBranchTestSchedulingEnabled = true;
 static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
 static bool s_qemuIopCachedWaitDescriptorEnabled = true;
+static bool s_qemuIopInlineWaitFastForwardEnabled = true;
+static u64 s_qemuIopInlineWaitFastForwards = 0;
 #endif
 
 namespace
@@ -956,7 +958,7 @@ namespace
 		return true;
 	}
 
-	extern "C" __attribute__((noinline)) u32 VitaIopA32FastForwardWaitLoop(
+	inline __attribute__((always_inline)) u32 FastForwardCachedIopWaitLoop(
 		u32 loop_pc, u32 block_cycles)
 	{
 		// PCSX2 owner: x86/iR3000A.cpp::iPsxBranchTest(). The wait-loop form
@@ -997,6 +999,27 @@ namespace
 			iopEventTest();
 
 		return static_cast<u32>(VitaIOP::BlockExitKind::Direct);
+	}
+
+	extern "C" __attribute__((noinline)) u32 VitaIopA32FastForwardWaitLoop(
+		u32 loop_pc, u32 block_cycles)
+	{
+		// Standalone generated diagnostics retain a callable AAPCS seam. Cached
+		// provider entries inline the same PCSX2-owned body into the private
+		// dispatcher so its already-saved r4-r11 frame owns the event call too.
+		asm volatile("" ::: "memory");
+		return FastForwardCachedIopWaitLoop(loop_pc, block_cycles);
+	}
+
+	inline __attribute__((always_inline)) u32 FastForwardProviderIopWaitLoop(
+		u32 loop_pc, u32 block_cycles)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!s_qemuIopInlineWaitFastForwardEnabled)
+			return VitaIopA32FastForwardWaitLoop(loop_pc, block_cycles);
+		s_qemuIopInlineWaitFastForwards++;
+#endif
+		return FastForwardCachedIopWaitLoop(loop_pc, block_cycles);
 	}
 
 	extern "C" __attribute__((noinline)) void VitaIopA32RaiseException(u32 pc, u32 code)
@@ -6786,6 +6809,7 @@ namespace VitaIOP
 		m_cached_wait_descriptor_forwards = 0;
 		m_cached_wait_descriptor_opcode_reads_removed = 0;
 		m_cached_wait_descriptor_unconditional_checks = 0;
+		s_qemuIopInlineWaitFastForwards = 0;
 		s_qemuIopLinkedFrameEvidence = {};
 		s_qemuIopSequentialQwordCopyFastPaths = 0;
 		s_qemuIopBranchEventCandidates = 0;
@@ -6933,6 +6957,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopCachedWaitDescriptorEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetInlineWaitFastForwardEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopInlineWaitFastForwardEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -7854,7 +7887,7 @@ namespace VitaIOP
 		// directly by iPsxBranchTest(). The descriptor is protected by the same
 		// source/SMC invalidation as the generated block, so no opcode translation
 		// or branch decode belongs on this cached-entry path.
-		VitaIopA32FastForwardWaitLoop(block.start_pc, descriptor.cycles);
+		FastForwardProviderIopWaitLoop(block.start_pc, descriptor.cycles);
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_cached_wait_descriptor_forwards++;
 		VitaRecordA32IopWaitLoopDispatchElision();
@@ -7877,7 +7910,7 @@ namespace VitaIOP
 #endif
 		if (descriptor.writes_link) [[unlikely]]
 			psxRegs.GPR.r[31] = block.start_pc + descriptor.cycles * sizeof(u32);
-		VitaIopA32FastForwardWaitLoop(block.start_pc, descriptor.cycles);
+		FastForwardProviderIopWaitLoop(block.start_pc, descriptor.cycles);
 #if defined(VITASX2_QEMU_VALIDATION)
 		VitaRecordA32IopWaitLoopDispatchElision();
 #endif
@@ -8063,7 +8096,8 @@ namespace VitaIOP
 		return false;
 	}
 
-	bool BlockExecutor::TryFastForwardPollCallWaitLoop(CachedBlock& block)
+	inline __attribute__((always_inline)) bool
+	BlockExecutor::TryFastForwardPollCallWaitLoop(CachedBlock& block)
 	{
 		// RunValidatedBlock reaches this only after ValidateCachedBlock proved the
 		// cached WaitLoop/trace configuration still matches compilation.
@@ -8078,7 +8112,7 @@ namespace VitaIOP
 		psxRegs.GPR.r[block.poll_result_register] = 0;
 		psxRegs.GPR.r[31] = block.start_pc + 2 * sizeof(u32);
 		constexpr u32 poll_loop_cycles = 2 + 5 + 2;
-		VitaIopA32FastForwardWaitLoop(block.start_pc, poll_loop_cycles);
+		FastForwardProviderIopWaitLoop(block.start_pc, poll_loop_cycles);
 #if defined(VITASX2_QEMU_VALIDATION)
 		VitaRecordA32IopWaitLoopDispatchElision();
 		VitaRecordA32IopPollCallWaitLoopDispatchElision();
@@ -8648,6 +8682,7 @@ namespace VitaIOP
 			m_cached_wait_descriptor_opcode_reads_removed;
 		result->cached_wait_descriptor_unconditional_checks =
 			m_cached_wait_descriptor_unconditional_checks;
+		result->inline_wait_fast_forwards = s_qemuIopInlineWaitFastForwards;
 		result->branch_event_candidates = s_qemuIopBranchEventCandidates;
 		result->branch_event_budget_positive =
 			s_qemuIopBranchEventBudgetPositive;

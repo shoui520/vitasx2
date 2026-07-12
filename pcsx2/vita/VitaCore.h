@@ -139,6 +139,9 @@ struct VitaA32IopProviderStats
 	u64 cached_wait_descriptor_memory_control_transfers_removed = 0;
 	u64 cached_wait_descriptor_unconditional_checks = 0;
 	u64 cached_wait_descriptor_control_transfers_removed = 0;
+	u64 inline_wait_fast_forwards = 0;
+	u64 inline_wait_stack_words_removed = 0;
+	u64 inline_wait_control_transfers_removed = 0;
 	u64 pinned_gpr_memory_ops_saved = 0;
 	u64 pinned_branch_operand_moves_removed = 0;
 	u64 condition_code_branch_instructions_removed = 0;
@@ -186,6 +189,7 @@ void VitaSetA32IopRuntimeStatsEnabled(bool enabled);
 void VitaSetA32IopPrivateDispatcherEnabled(bool enabled);
 void VitaSetA32IopPrivateHotPathEnabled(bool enabled);
 void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled);
+void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled);
 VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile();
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles);
 void VitaRecordA32IopWaitLoopDispatchElision();

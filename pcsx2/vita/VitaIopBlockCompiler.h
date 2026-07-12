@@ -88,6 +88,7 @@ namespace VitaIOP
 		u64 cached_wait_descriptor_forwards;
 		u64 cached_wait_descriptor_opcode_reads_removed;
 		u64 cached_wait_descriptor_unconditional_checks;
+		u64 inline_wait_fast_forwards;
 		u64 branch_event_candidates;
 		u64 branch_event_budget_positive;
 		u64 branch_event_tests_entered;
@@ -510,6 +511,7 @@ namespace VitaIOP
 		static void SetBranchTestSchedulingEnabled(bool enabled);
 		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
 		static void SetCachedWaitDescriptorEnabled(bool enabled);
+		static void SetInlineWaitFastForwardEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -672,7 +674,7 @@ namespace VitaIOP
 		void InvalidateCachedBlock(CachedBlock& block);
 		bool ValidateCachedBlock(CachedBlock& block);
 		static bool TryFastForwardTrustedWaitLoopAtPc(u32 start_pc);
-		bool TryFastForwardPollCallWaitLoop(CachedBlock& block);
+		inline __attribute__((always_inline)) bool TryFastForwardPollCallWaitLoop(CachedBlock& block);
 		inline __attribute__((always_inline)) bool TryFastForwardCachedUnconditionalWaitLoop(
 			CachedBlock& block);
 		__attribute__((noinline, cold)) bool TryFastForwardCachedWaitLoop(CachedBlock& block);
