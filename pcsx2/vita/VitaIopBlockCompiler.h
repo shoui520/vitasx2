@@ -73,6 +73,8 @@ namespace VitaIOP
 		u64 linked_frame_bypass_entries;
 		u64 linked_frame_instructions_removed;
 		u64 linked_frame_stack_words_removed;
+		u64 sequential_qword_copy_fast_paths;
+		u64 sequential_qword_copy_instructions_removed;
 		u32 pinned_gpr_memory_ops_saved;
 		u32 pinned_branch_operand_moves_removed;
 		u32 condition_code_branch_instructions_removed;
@@ -175,6 +177,20 @@ namespace VitaIOP
 		bool EmitStoreCode(u32 op);
 		bool EmitSourcePageLiteralPool();
 		bool EmitIsolateCacheGuard(size_t* isolated_branch);
+		struct SequentialQwordCopy
+		{
+			u32 load_ops[4]{};
+			u32 store_ops[4]{};
+			u8 first_result = 0;
+		};
+		bool MatchSequentialQwordCopyShape(
+			u32 start_pc, u32 instruction_index, u32 instruction_count,
+			SequentialQwordCopy* copy) const;
+		bool MatchSequentialQwordCopy(
+			u32 start_pc, u32 instruction_index, u32 instruction_count,
+			SequentialQwordCopy* copy) const;
+		bool EmitSequentialQwordCopy(const SequentialQwordCopy& copy,
+			u32 start_pc, u32 instruction_index);
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
 		void AnalyzePinnedGprs(u32 start_pc, u32 instruction_count);
 		void AnalyzeSavedRegisters(u32 start_pc, u32 instruction_count);
@@ -417,6 +433,7 @@ namespace VitaIOP
 		static void SetSavedRegisterNarrowingEnabled(bool enabled);
 		static void SetBlockCycleBatchingEnabled(bool enabled);
 		static void SetLinkedFrameBypassEnabled(bool enabled);
+		static void SetSequentialQwordCopyEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,

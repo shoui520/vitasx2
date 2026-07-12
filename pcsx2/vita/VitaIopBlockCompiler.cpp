@@ -55,6 +55,7 @@ struct QemuIopLinkedFrameEvidence
 	u32 stack_words_removed = 0;
 };
 static QemuIopLinkedFrameEvidence s_qemuIopLinkedFrameEvidence;
+static u32 s_qemuIopSequentialQwordCopyFastPaths = 0;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
 static bool s_qemuIopPinnedGprResidencyEnabled = true;
 static bool s_qemuIopPinnedBranchDirectCompareEnabled = true;
@@ -67,6 +68,7 @@ static bool s_qemuIopClockModeSpecializationEnabled = true;
 static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
 static bool s_qemuIopLinkedFrameBypassEnabled = true;
+static bool s_qemuIopSequentialQwordCopyEnabled = true;
 #endif
 
 namespace
@@ -1320,8 +1322,21 @@ namespace VitaIOP
 		std::array<u16, 32> scores{};
 		u32 written_mask = 1;
 		u32 needs_initial_mask = 0;
+		u32 sequential_copy_result_mask = 0;
 		bool supported = true;
 		bool reserves_register_jump_host = false;
+		bool reserve_sequential_copy_results =
+			m_defer_cycle_updates && m_track_published_cycle_prefix &&
+			!m_emit_trace_checks && m_isolate_cache_specialization &&
+			m_isolate_cache_guard_stable && !m_isolate_cache_active &&
+			m_iop_ram_registers_available && m_iop_ram_mask_register_available &&
+			m_ram_source_page_live_flags &&
+			Ps2MemSize::ExposedIopRam == Ps2MemSize::IopRam;
+#if defined(VITASX2_QEMU_VALIDATION)
+		reserve_sequential_copy_results = reserve_sequential_copy_results &&
+			s_qemuIopSequentialQwordCopyEnabled &&
+			s_qemuIopRamProvenanceSpecializationEnabled;
+#endif
 		const auto read = [&](unsigned reg) {
 			if (reg == 0 || reg >= scores.size())
 				return;
@@ -1340,6 +1355,15 @@ namespace VitaIOP
 		{
 			const u32 pc = start_pc + i * 4;
 			const u32 op = iopMemRead32(pc);
+			SequentialQwordCopy sequential_copy;
+			if (reserve_sequential_copy_results &&
+				MatchSequentialQwordCopyShape(start_pc, i, instruction_count,
+					&sequential_copy))
+			{
+				for (u32 result = 0; result < 4; result++)
+					sequential_copy_result_mask |=
+						1u << (sequential_copy.first_result + result);
+			}
 			if (IsIopBranchOrJumpOpcode(op) || IsIopExceptionOpcode(op))
 			{
 				const u32 delay_op = (i + 1 < instruction_count) ? iopMemRead32(pc + 4) : 0;
@@ -1424,7 +1448,9 @@ namespace VitaIOP
 				bool already_pinned = false;
 				for (u8 p = 0; p < m_pinned_gpr_count; p++)
 					already_pinned |= m_pinned_gprs[p].guest == guest;
-				if (!already_pinned && scores[guest] > best_score)
+				if (!already_pinned &&
+					(sequential_copy_result_mask & (1u << guest)) == 0 &&
+					scores[guest] > best_score)
 				{
 					best_guest = guest;
 					best_score = scores[guest];
@@ -5725,6 +5751,252 @@ namespace VitaIOP
 		}
 	}
 
+	bool BlockCompiler::MatchSequentialQwordCopyShape(
+		u32 start_pc, u32 instruction_index, u32 instruction_count,
+		SequentialQwordCopy* copy) const
+	{
+		if (!copy || instruction_index + 8 > instruction_count)
+			return false;
+
+		SequentialQwordCopy candidate;
+		for (u32 i = 0; i < 4; i++)
+		{
+			candidate.load_ops[i] = iopMemRead32(
+				start_pc + (instruction_index + i) * sizeof(u32));
+			candidate.store_ops[i] = iopMemRead32(
+				start_pc + (instruction_index + 4 + i) * sizeof(u32));
+		}
+		const u32 first_load = candidate.load_ops[0];
+		const u32 first_store = candidate.store_ops[0];
+		if ((first_load >> 26) != 0x23 || (first_store >> 26) != 0x2b ||
+			IMM_S(first_load) != 0 || IMM_S(first_store) != 0 ||
+			RT(first_load) == 0 || RT(first_load) > 28)
+		{
+			return false;
+		}
+
+		const unsigned source_base = RS(first_load);
+		const unsigned destination_base = RS(first_store);
+		candidate.first_result = static_cast<u8>(RT(first_load));
+		for (u32 i = 0; i < 4; i++)
+		{
+			const u32 load = candidate.load_ops[i];
+			const u32 store = candidate.store_ops[i];
+			const unsigned result = candidate.first_result + i;
+			if ((load >> 26) != 0x23 || RS(load) != source_base ||
+				RT(load) != result || IMM_S(load) != static_cast<s16>(i * 4) ||
+				(store >> 26) != 0x2b || RS(store) != destination_base ||
+				RT(store) != result || IMM_S(store) != static_cast<s16>(i * 4) ||
+				result == source_base || result == destination_base)
+			{
+				return false;
+			}
+		}
+
+		*copy = candidate;
+		return true;
+	}
+
+	bool BlockCompiler::MatchSequentialQwordCopy(
+		u32 start_pc, u32 instruction_index, u32 instruction_count,
+		SequentialQwordCopy* copy) const
+	{
+		SequentialQwordCopy candidate;
+		if (!MatchSequentialQwordCopyShape(start_pc, instruction_index,
+				instruction_count, &candidate) ||
+			m_emit_trace_checks || !m_defer_cycle_updates ||
+			!m_track_published_cycle_prefix || !m_iop_ram_registers_available ||
+			!m_iop_ram_mask_register_available || !m_isolate_cache_specialization ||
+			!m_isolate_cache_guard_stable || m_isolate_cache_active ||
+			!m_ram_source_page_live_flags ||
+			Ps2MemSize::ExposedIopRam != Ps2MemSize::IopRam)
+		{
+			return false;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!s_qemuIopSequentialQwordCopyEnabled ||
+			!s_qemuIopRamProvenanceSpecializationEnabled)
+		{
+			return false;
+		}
+#endif
+		for (u32 i = 0; i < 4; i++)
+		{
+			if (PinnedHostForGuest(candidate.first_result + i) >= 0)
+				return false;
+		}
+		*copy = candidate;
+		return true;
+	}
+
+	bool BlockCompiler::EmitSequentialQwordCopy(const SequentialQwordCopy& copy,
+		u32 start_pc, u32 instruction_index)
+	{
+		// PCSX2 owners: x86/iR3000Atables.cpp::rpsxLoad()/rpsxSW(),
+		// IopMem.cpp::iopMemRead32()/iopMemWrite32(), and
+		// x86/iR3000A.cpp::PSXREC_CLEARM. The fast arm coalesces the exact
+		// ordinary-RAM result of four adjacent reads followed by the same four
+		// adjacent writes. Every rejected alias/alignment/wrap/page case executes
+		// the owner helpers in original instruction order and publishes each
+		// handler-visible cycle prefix.
+		std::array<size_t, 5> fallback_branches{};
+		fallback_branches.fill(static_cast<size_t>(-1));
+		if (!EmitEffectiveAddress(copy.load_ops[0], HOST_SAVED0) ||
+			!EmitEffectiveAddress(copy.store_ops[0], HOST_TMP3) ||
+			!m_code.EmitTstImm32(HOST_SAVED0, 0x10000003u))
+		{
+			return false;
+		}
+		fallback_branches[0] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[0] == static_cast<size_t>(-1) ||
+			!m_code.EmitAddImm8(HOST_TMP0, HOST_SAVED0, 15) ||
+			!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_SAVED0) ||
+			!m_code.EmitTstImm32(HOST_TMP0, 0x00200000u))
+		{
+			return false;
+		}
+		fallback_branches[1] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[1] == static_cast<size_t>(-1) ||
+			!m_code.EmitTstImm32(HOST_TMP3, 0x10000003u))
+		{
+			return false;
+		}
+		fallback_branches[2] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[2] == static_cast<size_t>(-1) ||
+			!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP3, 15) ||
+			!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP3) ||
+			!m_code.EmitTstImm32(HOST_TMP0, 0x00200000u))
+		{
+			return false;
+		}
+		fallback_branches[3] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[3] == static_cast<size_t>(-1) ||
+			!m_code.EmitTstImm32(HOST_TMP0, 0x00001000u))
+		{
+			return false;
+		}
+		fallback_branches[4] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[4] == static_cast<size_t>(-1))
+			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!m_code.EmitMovImm32(HOST_TMP2,
+				static_cast<u32>(reinterpret_cast<uptr>(
+					&s_qemuIopSequentialQwordCopyFastPaths))) ||
+			!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP2, 0) ||
+			!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_TMP2, 0))
+		{
+			return false;
+		}
+#endif
+
+		if (!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
+			!m_code.EmitVld1Q32(0, HOST_TMP0))
+		{
+			return false;
+		}
+		const u32 result_offset = static_cast<u32>(GprOffset(copy.first_result));
+		if (!(m_code.EmitAddImm32(HOST_TMP0, HOST_PSX_REGS, result_offset) ||
+				(m_code.EmitMovImm32(HOST_TMP0, result_offset) &&
+					m_code.EmitAddReg(HOST_TMP0, HOST_PSX_REGS, HOST_TMP0))) ||
+			!m_code.EmitVst1Q32(0, HOST_TMP0) ||
+			!m_code.EmitAndReg(HOST_TMP1, HOST_TMP3, HOST_IOP_RAM_MASK) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP1) ||
+			!m_code.EmitVst1Q32(0, HOST_TMP0))
+		{
+			return false;
+		}
+
+		bool source_page_literal_enabled = m_source_page_literal_allowed;
+#if defined(VITASX2_QEMU_VALIDATION)
+		source_page_literal_enabled = source_page_literal_enabled &&
+			s_qemuIopSourcePageLiteralEnabled;
+#endif
+		if (!m_ram_source_page_live_flags)
+			return false;
+		if (source_page_literal_enabled)
+		{
+			const size_t load = m_code.EmitLdrLiteralPlaceholder(HOST_TMP2);
+			if (load == static_cast<size_t>(-1))
+				return false;
+			m_source_page_literal_loads.push_back(load);
+		}
+		else if (!m_code.EmitMovImm32(HOST_TMP2,
+			static_cast<u32>(reinterpret_cast<uptr>(m_ram_source_page_live_flags))))
+		{
+			return false;
+		}
+		if (!m_code.EmitLdrbRegShift(HOST_TMP0, HOST_TMP2, HOST_TMP1,
+				VitaA32::ShiftType::LSR, 12) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return false;
+		}
+		const size_t no_source_page =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (no_source_page == static_cast<size_t>(-1) ||
+			!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP3, 3) ||
+			!m_code.EmitMovImm8(HOST_TMP1, 4) ||
+			!m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+				static_cast<u32>(reinterpret_cast<uptr>(&psxCpu))) ||
+			!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 0) ||
+			!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
+				static_cast<u16>(offsetof(R3000Acpu, Clear))) ||
+			!m_code.EmitBlx(HOST_CALL_SCRATCH) ||
+			!m_code.PatchBranch(no_source_page, m_code.Size(), VitaA32::Condition::EQ))
+		{
+			return false;
+		}
+		m_source_page_guard_instructions_removed += 2;
+		m_isolate_cache_guard_instructions_removed += 12;
+
+		const size_t fast_done = m_code.EmitBranchPlaceholder();
+		if (fast_done == static_cast<size_t>(-1))
+			return false;
+		const size_t fallback_target = m_code.Size();
+		for (const size_t branch : fallback_branches)
+		{
+			if (!m_code.PatchBranch(branch, fallback_target, VitaA32::Condition::NE))
+				return false;
+		}
+
+		for (u32 i = 0; i < 8; i++)
+		{
+			const bool load = i < 4;
+			const u32 op = load ? copy.load_ops[i] : copy.store_ops[i - 4];
+			const u32 pc = start_pc + (instruction_index + i) * sizeof(u32);
+			m_current_instruction_count = instruction_index + i + 1;
+			if (m_track_published_cycle_prefix &&
+				!EmitPublishCyclePrefix(m_current_instruction_count))
+			{
+				return false;
+			}
+			if (!EmitEffectiveAddress(op, HOST_TMP0))
+				return false;
+			if (load)
+			{
+				if (!m_code.EmitCallAbsolute(
+						reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) ||
+					!EmitStoreGpr(RT(op), HOST_TMP0))
+				{
+					return false;
+				}
+			}
+			else if (!EmitLoadGpr(RT(op), HOST_TMP1) ||
+				!m_code.EmitCallAbsolute(
+					reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH))
+			{
+				return false;
+			}
+			UpdateGprConstStateAfterOpcode(op, pc);
+		}
+		m_native_instruction_count += 8;
+		m_current_instruction_count = instruction_index + 8;
+		return m_code.PatchBranch(fast_done, m_code.Size());
+	}
+
 	bool BlockCompiler::EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& trace_exit_branches)
 	{
 		const u32 next_pc = pc + 4;
@@ -5826,11 +6098,41 @@ namespace VitaIOP
 		m_register_jump_target = 0;
 		u32 runtime_memory_helper_seams = 0;
 		u32 runtime_unaligned_store_saves = 0;
+		bool sequential_qword_copy_enabled =
+			!VitaIsIopPreInstructionTraceEnabled() &&
+			m_isolate_cache_specialization && m_isolate_cache_guard_stable &&
+			!m_isolate_cache_active && m_ram_source_page_live_flags &&
+			Ps2MemSize::ExposedIopRam == Ps2MemSize::IopRam;
+#if defined(VITASX2_QEMU_VALIDATION)
+		sequential_qword_copy_enabled = sequential_qword_copy_enabled &&
+			s_qemuIopSequentialQwordCopyEnabled &&
+			s_qemuIopRamProvenanceSpecializationEnabled;
+#endif
 		ResetGprConstState();
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 pc = start_pc + i * 4;
 			const u32 op = iopMemRead32(pc);
+			SequentialQwordCopy sequential_copy;
+			if (sequential_qword_copy_enabled &&
+				MatchSequentialQwordCopyShape(start_pc, i, instruction_count,
+					&sequential_copy))
+			{
+				m_iop_ram_registers_available = true;
+				m_iop_ram_mask_register_available = true;
+				// The ordinary path has one rare eight-call fallback, but the measured
+				// direct-RAM arm has only the source and destination range seams.
+				runtime_memory_helper_seams += 2;
+				for (u32 j = 0; j < 8; j++)
+				{
+					const u32 sequential_op = j < 4 ?
+						sequential_copy.load_ops[j] : sequential_copy.store_ops[j - 4];
+					UpdateGprConstStateAfterOpcode(sequential_op,
+						start_pc + (i + j) * sizeof(u32));
+				}
+				i += 7;
+				continue;
+			}
 			if (UsesDirectIopRamFastPath(op))
 			{
 				m_iop_ram_registers_available = true;
@@ -5959,6 +6261,17 @@ namespace VitaIOP
 			}
 			if (can_native_register_jump)
 				has_native_register_jump = true;
+			SequentialQwordCopy sequential_copy;
+			if (MatchSequentialQwordCopy(start_pc, i, instruction_count,
+					&sequential_copy))
+			{
+				if (!EmitSequentialQwordCopy(sequential_copy, start_pc, i))
+				{
+					return false;
+				}
+				i += 7;
+				continue;
+			}
 			if (IsIopBranchOrJumpOpcode(op) || IsIopExceptionOpcode(op))
 				can_direct_link_fallthrough = false;
 			const bool store_pc =
@@ -6266,6 +6579,7 @@ namespace VitaIOP
 		m_batched_cycle_stack_words_removed = 0;
 		m_expanded_cycle_batching_provider_entries = 0;
 		s_qemuIopLinkedFrameEvidence = {};
+		s_qemuIopSequentialQwordCopyFastPaths = 0;
 #endif
 	}
 
@@ -6372,6 +6686,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopLinkedFrameBypassEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetSequentialQwordCopyEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopSequentialQwordCopyEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -7948,6 +8271,14 @@ namespace VitaIOP
 			s_qemuIopLinkedFrameEvidence.instructions_removed;
 		result->linked_frame_stack_words_removed =
 			s_qemuIopLinkedFrameEvidence.stack_words_removed;
+		result->sequential_qword_copy_fast_paths =
+			s_qemuIopSequentialQwordCopyFastPaths;
+		// The focused control is 62 product A32 instructions larger even though
+		// the enabled QEMU block also carries a four-instruction dynamic counter.
+		// Attribute only 36: the lower bound excludes that counter, block-frame
+		// differences, the rare source-page Clear call, and every cold fallback.
+		result->sequential_qword_copy_instructions_removed =
+			static_cast<u64>(s_qemuIopSequentialQwordCopyFastPaths) * 36u;
 	}
 #endif
 
