@@ -102,6 +102,23 @@ namespace
 			  "r11", "lr", "cc", "memory");
 		return result;
 	}
+
+	[[noreturn]] inline __attribute__((always_inline)) void
+	ReturnFromPrivateProviderTimeslice(s32 result)
+	{
+		register s32 value asm("r0") = result;
+		register void* caller_cfa asm("r1") = __builtin_dwarf_cfa();
+		asm volatile(
+			// The private entry stored its caller LR at CFA-4. Restore only
+			// that value; r4-r11 are caller-owned at the EE scheduler seam.
+			"ldr lr, [r1, #-4]\n"
+			"mov sp, r1\n"
+			"bx lr\n"
+			:
+			: "r"(value), "r"(caller_cfa)
+			: "lr", "memory");
+		__builtin_unreachable();
+	}
 #endif
 
 	constexpr u16 REG_R4 = 1u << 4;
@@ -9142,7 +9159,23 @@ namespace VitaIOP
 		return ExecuteProviderBlockAtPcInline(start_pc, compile_result);
 	}
 
+#if defined(__arm__)
+	s32 BlockExecutor::ExecuteProviderTimeslice(s32)
+	{
+		asm volatile(
+			// Cold AAPCS adapter for diagnostics and non-private callers.
+			// Keep SP 8-byte aligned across the nested private call.
+			"push {r4-r11, lr}\n"
+			"sub sp, sp, #4\n"
+			"bl VitaIopA32ExecuteProviderTimeslicePrivate\n"
+			"add sp, sp, #4\n"
+			"pop {r4-r11, pc}\n");
+	}
+
+	s32 BlockExecutor::ExecuteProviderTimeslicePrivateBody(s32 ee_cycles)
+#else
 	s32 BlockExecutor::ExecuteProviderTimeslice(s32 ee_cycles)
+#endif
 	{
 		// Force one stable first instruction for the verified private entry.
 		// -fno-pie prevents a GOT literal setup from preceding this AAPCS save.
@@ -9177,7 +9210,12 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 				m_private_dispatcher_fallbacks++;
 #endif
-				return psxInt.ExecuteBlock(psxRegs.iopCycleEE);
+				const s32 result = psxInt.ExecuteBlock(psxRegs.iopCycleEE);
+#if defined(__arm__)
+				ReturnFromPrivateProviderTimeslice(result);
+#else
+				return result;
+#endif
 			}
 #if defined(VITASX2_QEMU_VALIDATION)
 			m_private_dispatcher_provider_entries++;
@@ -9194,7 +9232,12 @@ namespace VitaIOP
 #endif
 		}
 
-		return psxRegs.iopBreak + psxRegs.iopCycleEE;
+		const s32 result = psxRegs.iopBreak + psxRegs.iopCycleEE;
+#if defined(__arm__)
+		ReturnFromPrivateProviderTimeslice(result);
+#else
+		return result;
+#endif
 	}
 
 #if defined(__arm__)
@@ -9215,9 +9258,9 @@ namespace VitaIOP
 	VitaIopA32ExecuteProviderTimeslicePrivate(void*, s32)
 	{
 		asm volatile(
-			// Reserve the standard nine-word save area, but only publish LR.
-			// The unchanged one-instruction POP consumes the dummy r4-r11
-			// slots; the EE call site declares those registers caller-owned.
+			// Reserve the standard nine-word save area, but publish only LR.
+			// The body reconstructs its CFA and returns without reloading the
+			// caller-owned r4-r11 values at the private EE scheduler seam.
 			"sub sp, sp, #36\n"
 			"str lr, [sp, #32]\n"
 			"b VitaIopA32ProviderTimesliceBody + 4\n");

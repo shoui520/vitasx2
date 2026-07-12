@@ -172,7 +172,7 @@ struct VitaA32IopProviderStats
 	u64 private_dispatcher_hot_path_control_transfers_removed = 0;
 	u64 private_dispatcher_stack_guard_instructions_removed = 0;
 	u64 private_event_entries = 0;
-	u64 private_event_stack_word_stores_removed = 0;
+	u64 private_event_stack_words_removed = 0;
 	u64 private_event_frame_instructions_added = 0;
 	u64 private_frame_provider_entries = 0;
 	u64 private_frame_stack_words_removed = 0;

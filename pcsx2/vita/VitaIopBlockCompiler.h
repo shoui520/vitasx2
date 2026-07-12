@@ -520,11 +520,7 @@ namespace VitaIOP
 			bool publish_details = true);
 		u32 ExecuteProviderBlockAtPc(u32 start_pc, ProviderCompileResult* compile_result);
 #if defined(__arm__)
-#if !defined(VITASX2_IOP_DISPATCH_STACK_GUARD_CONTROL)
-		__attribute__((no_stack_protector))
-#endif
-		__attribute__((noinline)) s32 ExecuteProviderTimeslice(s32 ee_cycles)
-			__asm__("VitaIopA32ProviderTimesliceBody");
+		__attribute__((naked, noinline)) s32 ExecuteProviderTimeslice(s32 ee_cycles);
 #else
 		s32 ExecuteProviderTimeslice(s32 ee_cycles);
 #endif
@@ -702,6 +698,11 @@ namespace VitaIOP
 			u32 start_pc, ProviderCompileResult* compile_result, u32* dispatch_flags);
 		inline __attribute__((always_inline)) u32 ExecuteProviderBlockAtPcInline(
 			u32 start_pc, ProviderCompileResult* compile_result);
+#if defined(__arm__)
+		__attribute__((no_stack_protector))
+		__attribute__((noinline)) s32 ExecuteProviderTimeslicePrivateBody(
+			s32 ee_cycles) __asm__("VitaIopA32ProviderTimesliceBody");
+#endif
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		const void* ProviderEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);

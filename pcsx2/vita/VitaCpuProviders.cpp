@@ -1326,13 +1326,14 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.private_dispatcher_stack_guard_instructions_removed =
 		snapshot.private_dispatcher_calls * 16u;
 	s_iop_a32_stats.private_event_entries = g_vita_a32_iop_private_event_entries;
-	// The verified private entry reserves nine slots and stores only LR. The
-	// former PUSH stored r4-r11 too; the existing POP remains one instruction.
-	s_iop_a32_stats.private_event_stack_word_stores_removed =
-		g_vita_a32_iop_private_event_entries * 8u;
-	// SUB/STR/B replaces one PUSH: two additional simple A32 instructions.
+	// The private entry/exit transfer only LR. The former AAPCS PUSH/POP also
+	// transferred r4-r11 in both directions: sixteen words retired per entry.
+	s_iop_a32_stats.private_event_stack_words_removed =
+		g_vita_a32_iop_private_event_entries * 16u;
+	// The private entry and CFA exit add four simple instructions relative to
+	// the former PUSH/SUB + ADD/POP frame.
 	s_iop_a32_stats.private_event_frame_instructions_added =
-		g_vita_a32_iop_private_event_entries * 2u;
+		g_vita_a32_iop_private_event_entries * 4u;
 	s_iop_a32_stats.cached_wait_descriptor_checks = snapshot.cached_wait_descriptor_checks;
 	s_iop_a32_stats.cached_wait_descriptor_forwards = snapshot.cached_wait_descriptor_forwards;
 	s_iop_a32_stats.cached_wait_descriptor_opcode_reads_removed =
