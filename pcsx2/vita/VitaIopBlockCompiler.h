@@ -519,14 +519,15 @@ namespace VitaIOP
 		bool ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result,
 			bool publish_details = true);
 		u32 ExecuteProviderBlockAtPc(u32 start_pc, ProviderCompileResult* compile_result);
-#if defined(__arm__) && !defined(VITASX2_IOP_DISPATCH_STACK_GUARD_CONTROL)
-		// PCSX2's x86/iR3000A.cpp::_DynGen_EnterRecompiledCode() is emitted
-		// dispatcher code, not an addressable-buffer C frame. This A32 body has
-		// no addressable local array either; retain the compiler guard only in
-		// the focused generated-code control build.
+#if defined(__arm__)
+#if !defined(VITASX2_IOP_DISPATCH_STACK_GUARD_CONTROL)
 		__attribute__((no_stack_protector))
 #endif
+		__attribute__((noinline)) s32 ExecuteProviderTimeslice(s32 ee_cycles)
+			__asm__("VitaIopA32ProviderTimesliceBody");
+#else
 		s32 ExecuteProviderTimeslice(s32 ee_cycles);
+#endif
 
 	private:
 		// PCSX2 owner: x86/BaseblockEx.h::BaseBlocks() starts at 0x4000

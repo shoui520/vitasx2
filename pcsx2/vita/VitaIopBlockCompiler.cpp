@@ -9144,6 +9144,11 @@ namespace VitaIOP
 
 	s32 BlockExecutor::ExecuteProviderTimeslice(s32 ee_cycles)
 	{
+		// Force one stable first instruction for the verified private entry.
+		// -fno-pie prevents a GOT literal setup from preceding this AAPCS save.
+#if defined(__arm__)
+		asm volatile("" ::: "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "lr");
+#endif
 		// PCSX2 owner: x86/iR3000A.cpp::_DynGen_EnterRecompiledCode() keeps
 		// lookup, generated entry, wait forwarding, and the timeslice return in
 		// one private dispatcher. Keeping this loop beside the cache implementation
@@ -9191,4 +9196,31 @@ namespace VitaIOP
 
 		return psxRegs.iopBreak + psxRegs.iopCycleEE;
 	}
+
+#if defined(__arm__)
+	extern "C" void VitaIopA32ProviderTimesliceBodySymbol()
+		__asm__("VitaIopA32ProviderTimesliceBody");
+
+	bool VitaIopA32PrivateTimesliceEntrySupported()
+	{
+		// The private entry skips exactly one forced A32 PUSH. Keep the public
+		// AAPCS path if a future compiler/toolchain moves anything ahead of it.
+		constexpr u32 EXPECTED_PUSH_R4_R11_LR = 0xe92d4ff0u;
+		const auto* const body = reinterpret_cast<const u32*>(
+			reinterpret_cast<uptr>(&VitaIopA32ProviderTimesliceBodySymbol));
+		return body[0] == EXPECTED_PUSH_R4_R11_LR;
+	}
+
+	extern "C" __attribute__((naked, noinline)) s32
+	VitaIopA32ExecuteProviderTimeslicePrivate(void*, s32)
+	{
+		asm volatile(
+			// Reserve the standard nine-word save area, but only publish LR.
+			// The unchanged one-instruction POP consumes the dummy r4-r11
+			// slots; the EE call site declares those registers caller-owned.
+			"sub sp, sp, #36\n"
+			"str lr, [sp, #32]\n"
+			"b VitaIopA32ProviderTimesliceBody + 4\n");
+	}
+#endif
 } // namespace VitaIOP

@@ -38,6 +38,18 @@ static VitaEePreInstructionTraceWindowSkipCallback s_ee_pre_instruction_trace_wi
 static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback = nullptr;
 static VitaEE::BlockExecutor s_ee_a32_executor;
 static VitaIOP::BlockExecutor s_iop_a32_executor;
+#if defined(__arm__)
+bool g_vita_a32_iop_private_event_entry_available =
+	VitaIOP::VitaIopA32PrivateTimesliceEntrySupported();
+extern "C" s32 VitaIopA32ExecuteProviderTimesliceAapcs(void*, s32 ee_cycles)
+{
+	return psxCpu->ExecuteBlock(ee_cycles);
+}
+VitaA32IopEventEntry g_vita_a32_iop_event_entry = {
+	0, reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimesliceAapcs)};
+#else
+bool g_vita_a32_iop_private_event_entry_available = false;
+#endif
 static VitaA32EeProviderStats s_ee_a32_stats;
 static VitaA32IopProviderStats s_iop_a32_stats;
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -53,6 +65,8 @@ static std::unordered_map<u64, u64> s_iop_a32_dispatch_edge_profile;
 static bool s_iop_a32_compact_provider_dispatch_enabled = true;
 static bool s_iop_a32_runtime_stats_enabled = true;
 static bool s_iop_a32_private_dispatcher_enabled = true;
+bool g_vita_a32_iop_private_event_entry_enabled = true;
+u64 g_vita_a32_iop_private_event_entries = 0;
 static u64 s_iop_a32_compact_provider_dispatch_entries = 0;
 static u64 s_iop_a32_compact_provider_cache_hit_entries = 0;
 #endif
@@ -65,6 +79,31 @@ static bool s_ee_a32_persistent_dispatch_enabled = false;
 static VitaA32EeTraceMode s_ee_a32_trace_mode = VitaA32EeTraceMode::InstructionWindow;
 static bool s_ee_provider_trace_suppressed = false;
 static bool s_ee_a32_prerecording_window = false;
+
+#if defined(__arm__)
+static void UpdateIopEventEntry()
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	const bool private_enabled = g_vita_a32_iop_private_event_entry_enabled;
+#else
+	constexpr bool private_enabled = true;
+#endif
+	if (psxCpu == &psxRec && private_enabled &&
+		g_vita_a32_iop_private_event_entry_available)
+	{
+		g_vita_a32_iop_event_entry.context =
+			reinterpret_cast<uptr>(&s_iop_a32_executor);
+		g_vita_a32_iop_event_entry.target =
+			reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimeslicePrivate);
+	}
+	else
+	{
+		g_vita_a32_iop_event_entry.context = 0;
+		g_vita_a32_iop_event_entry.target =
+			reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimesliceAapcs);
+	}
+}
+#endif
 
 const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason)
 {
@@ -1051,6 +1090,9 @@ void VitaSelectInterpreterCpuProviders()
 	psxCpu = &psxInt;
 	CpuVU0 = &CpuIntVU0;
 	CpuVU1 = &CpuIntVU1;
+#if defined(__arm__)
+	UpdateIopEventEntry();
+#endif
 }
 
 void VitaSelectA32EeCpuProviders()
@@ -1059,6 +1101,9 @@ void VitaSelectA32EeCpuProviders()
 	psxCpu = &psxInt;
 	CpuVU0 = &CpuIntVU0;
 	CpuVU1 = &CpuIntVU1;
+#if defined(__arm__)
+	UpdateIopEventEntry();
+#endif
 }
 
 void VitaSelectA32IopCpuProviders()
@@ -1067,6 +1112,9 @@ void VitaSelectA32IopCpuProviders()
 	psxCpu = &psxRec;
 	CpuVU0 = &CpuIntVU0;
 	CpuVU1 = &CpuIntVU1;
+#if defined(__arm__)
+	UpdateIopEventEntry();
+#endif
 }
 
 void VitaSelectA32EeIopCpuProviders()
@@ -1075,6 +1123,9 @@ void VitaSelectA32EeIopCpuProviders()
 	psxCpu = &psxRec;
 	CpuVU0 = &CpuIntVU0;
 	CpuVU1 = &CpuIntVU1;
+#if defined(__arm__)
+	UpdateIopEventEntry();
+#endif
 }
 
 void VitaSelectConfiguredCpuProviders()
@@ -1115,6 +1166,7 @@ void VitaResetA32IopProviderStats()
 	s_iop_a32_dispatch_edge_profile.clear();
 	s_iop_a32_compact_provider_dispatch_entries = 0;
 	s_iop_a32_compact_provider_cache_hit_entries = 0;
+	g_vita_a32_iop_private_event_entries = 0;
 #endif
 	s_iop_a32_executor.ResetInstrumentationCounters();
 }
@@ -1137,6 +1189,14 @@ void VitaSetA32IopRuntimeStatsEnabled(bool enabled)
 void VitaSetA32IopPrivateDispatcherEnabled(bool enabled)
 {
 	s_iop_a32_private_dispatcher_enabled = enabled;
+}
+
+void VitaSetA32IopPrivateEventEntryEnabled(bool enabled)
+{
+	g_vita_a32_iop_private_event_entry_enabled = enabled;
+#if defined(__arm__)
+	UpdateIopEventEntry();
+#endif
 }
 
 void VitaSetA32IopPrivateHotPathEnabled(bool enabled)
@@ -1265,6 +1325,14 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	// normal and interpreter-tail exits. The body has no addressable buffer.
 	s_iop_a32_stats.private_dispatcher_stack_guard_instructions_removed =
 		snapshot.private_dispatcher_calls * 16u;
+	s_iop_a32_stats.private_event_entries = g_vita_a32_iop_private_event_entries;
+	// The verified private entry reserves nine slots and stores only LR. The
+	// former PUSH stored r4-r11 too; the existing POP remains one instruction.
+	s_iop_a32_stats.private_event_stack_word_stores_removed =
+		g_vita_a32_iop_private_event_entries * 8u;
+	// SUB/STR/B replaces one PUSH: two additional simple A32 instructions.
+	s_iop_a32_stats.private_event_frame_instructions_added =
+		g_vita_a32_iop_private_event_entries * 2u;
 	s_iop_a32_stats.cached_wait_descriptor_checks = snapshot.cached_wait_descriptor_checks;
 	s_iop_a32_stats.cached_wait_descriptor_forwards = snapshot.cached_wait_descriptor_forwards;
 	s_iop_a32_stats.cached_wait_descriptor_opcode_reads_removed =

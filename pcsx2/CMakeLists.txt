@@ -166,6 +166,13 @@ add_library(pcsx2core STATIC
 	vtlb.cpp
 )
 
+# The private EE-to-IOP dispatcher entry skips the compiler's forced first
+# PUSH after verifying its exact A32 opcode at runtime. Keep this translation
+# unit non-PIE so no GOT setup can legally precede that save.
+set_source_files_properties(vita/VitaIopBlockCompiler.cpp PROPERTIES
+	COMPILE_OPTIONS "-fno-pie"
+)
+
 set(VITASX2_GIT_TAG "vitasx2-ng")
 set(VITASX2_GIT_REV "vitasx2-ng-pcsx2-fe3ce7f57")
 set(VITASX2_GIT_HASH "fe3ce7f578e2dd39418ef358d84804d290e91bc1")

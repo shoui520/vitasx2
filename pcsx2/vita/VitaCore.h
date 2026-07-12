@@ -14,6 +14,46 @@ void VitaSelectA32IopCpuProviders();
 void VitaSelectA32EeIopCpuProviders();
 void VitaSelectConfiguredCpuProviders();
 
+extern bool g_vita_a32_iop_private_event_entry_available;
+#if defined(__arm__)
+extern "C" s32 VitaIopA32ExecuteProviderTimeslicePrivate(
+	void* context, s32 ee_cycles);
+namespace VitaIOP
+{
+	bool VitaIopA32PrivateTimesliceEntrySupported();
+}
+
+struct alignas(8) VitaA32IopEventEntry
+{
+	uptr context = 0;
+	uptr target = 0;
+};
+static_assert(sizeof(VitaA32IopEventEntry) == 8);
+extern VitaA32IopEventEntry g_vita_a32_iop_event_entry;
+
+inline __attribute__((always_inline)) s32 VitaExecuteA32IopTimesliceFromEeEvent(
+	s32 ee_cycles)
+{
+	register uptr context_and_result asm("r0");
+	register s32 cycles asm("r1") = ee_cycles;
+	register const VitaA32IopEventEntry* entry asm("r2") =
+		&g_vita_a32_iop_event_entry;
+	asm volatile(
+		"ldmia %[entry], {r0, r12}\n\t"
+		"blx r12"
+		: "=r"(context_and_result), "+r"(cycles), [entry] "+r"(entry)
+		:
+		: "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12",
+		  "lr", "cc", "memory");
+	return static_cast<s32>(context_and_result);
+}
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+extern bool g_vita_a32_iop_private_event_entry_enabled;
+extern u64 g_vita_a32_iop_private_event_entries;
+#endif
+
 struct VitaA32EeProviderStats
 {
 	u32 compiled_blocks = 0;
@@ -131,6 +171,9 @@ struct VitaA32IopProviderStats
 	u64 private_dispatcher_inlined_hot_entries = 0;
 	u64 private_dispatcher_hot_path_control_transfers_removed = 0;
 	u64 private_dispatcher_stack_guard_instructions_removed = 0;
+	u64 private_event_entries = 0;
+	u64 private_event_stack_word_stores_removed = 0;
+	u64 private_event_frame_instructions_added = 0;
 	u64 private_frame_provider_entries = 0;
 	u64 private_frame_stack_words_removed = 0;
 	u64 private_frame_zero_scratch_entries = 0;
@@ -188,6 +231,7 @@ void VitaSetA32IopCompactProviderDispatchEnabled(bool enabled);
 #if defined(VITASX2_QEMU_VALIDATION)
 void VitaSetA32IopRuntimeStatsEnabled(bool enabled);
 void VitaSetA32IopPrivateDispatcherEnabled(bool enabled);
+void VitaSetA32IopPrivateEventEntryEnabled(bool enabled);
 void VitaSetA32IopPrivateHotPathEnabled(bool enabled);
 void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled);
 void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled);

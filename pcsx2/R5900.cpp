@@ -12,6 +12,9 @@
 #include "COP0.h"
 #include "MTVU.h"
 #include "VMManager.h"
+#if defined(VITASX2_VITA)
+#include "vita/VitaCore.h"
+#endif
 
 #include "Hardware.h"
 #include "IPU/IPUdma.h"
@@ -393,7 +396,24 @@ __fi void _cpuEventTest_Shared()
 		//if( EEsCycle < -450 )
 		//	Console.WriteLn( " IOP ahead by: %d cycles", -EEsCycle );
 
-		EEsCycle = psxCpu->ExecuteBlock(EEsCycle);
+#if defined(__arm__)
+		// PCSX2 owner: x86/iR3000A.cpp::recExecuteBlock() documents the intended
+		// direct iopEnterRecompiledCode() scheduler seam. Provider selection
+		// installs either the verified private A32 entry or its generic AAPCS
+		// adapter, so this hot scheduler path needs no per-call provider test.
+		EEsCycle = VitaExecuteA32IopTimesliceFromEeEvent(EEsCycle);
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (g_vita_a32_iop_private_event_entry_enabled &&
+			g_vita_a32_iop_private_event_entry_available && psxCpu == &psxRec)
+		{
+			g_vita_a32_iop_private_event_entries++;
+		}
+#endif
+#else
+		{
+			EEsCycle = psxCpu->ExecuteBlock(EEsCycle);
+		}
+#endif
 
 		iopEventAction = false;
 	}
