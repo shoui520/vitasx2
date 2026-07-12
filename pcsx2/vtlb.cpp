@@ -692,7 +692,8 @@ u32 VitaEeExecutePreincrementWordFill(u32 start_pc, u32 fallthrough_pc,
 		const u32 terminal_residue = initial_delta & 3u;
 		const u32 bytes_to_completion = initial_delta - terminal_residue;
 		if (bytes_to_completion != 0)
-			iterations = std::min(iterations, bytes_to_completion / sizeof(u32));
+			iterations = std::min(iterations,
+				static_cast<u32>(bytes_to_completion / sizeof(u32)));
 
 		const s32 cycle_delta = static_cast<s32>(
 			static_cast<u32>(cpuRegs.cycle) - static_cast<u32>(cpuRegs.nextEventCycle));

@@ -19,12 +19,15 @@ extern bool g_vita_a32_iop_private_event_entry_available;
 extern bool g_vita_a32_iop_private_wait_resume_entry_available;
 extern bool g_vita_a32_iop_private_scheduler_resume_entry_available;
 extern bool g_vita_a32_iop_private_scheduler_prediction_entry_available;
+extern bool g_vita_a32_iop_private_scheduler_dispatch_cache_entry_available;
 #if defined(__arm__)
 extern "C" s32 VitaIopA32ExecuteProviderTimeslicePrivate(
 	void* context, s32 ee_cycles);
 extern "C" s32 VitaIopA32ExecuteProviderSchedulerDirectResumePrivate(
 	void* context, s32 ee_cycles);
 extern "C" s32 VitaIopA32ExecuteProviderSchedulerPredictedResumePrivate(
+	void* context, s32 ee_cycles);
+extern "C" s32 VitaIopA32ExecuteProviderSchedulerDispatchCachedResumePrivate(
 	void* context, s32 ee_cycles);
 extern "C" s32 VitaIopA32ExecuteProviderWaitResumePrivate(
 	void* context, s32 ee_cycles);
@@ -58,6 +61,7 @@ namespace VitaIOP
 	bool VitaIopA32PrivateWaitResumeEntrySupported();
 	bool VitaIopA32PrivateSchedulerResumeEntrySupported();
 	bool VitaIopA32PrivateSchedulerPredictionEntrySupported();
+	bool VitaIopA32PrivateSchedulerDispatchCacheEntrySupported();
 }
 
 struct alignas(8) VitaA32IopEventEntry
@@ -92,6 +96,7 @@ extern bool g_vita_a32_iop_private_event_entry_enabled;
 extern bool g_vita_a32_iop_wait_resume_event_entry_enabled;
 extern bool g_vita_a32_iop_scheduler_resume_event_entry_enabled;
 extern bool g_vita_a32_iop_scheduler_prediction_event_entry_enabled;
+extern bool g_vita_a32_iop_scheduler_dispatch_cache_event_entry_enabled;
 extern u64 g_vita_a32_iop_private_event_entries;
 #endif
 
@@ -121,6 +126,41 @@ struct VitaA32EeProviderStats
 	u32 interpreter_path_fallbacks = 0;
 };
 
+#if defined(VITASX2_QEMU_VALIDATION)
+static constexpr u32 VITA_A32_EE_LINK_REJECTION_EDGE_COUNT = 16;
+
+enum class VitaA32EeLinkRejectionKind : u32
+{
+	UnrecordedEdge,
+	TargetNotCompiled,
+	SourceSignatureMissing,
+	TargetSignatureMissing,
+	SignatureMismatch,
+	CompatibleEntryMissing,
+	EmbeddedSourceMismatch,
+	UnexpectedFallback,
+	Count,
+};
+
+struct VitaA32EeLinkRejectionEdge
+{
+	u32 source_pc = 0;
+	u32 target_pc = 0;
+	VitaA32EeLinkRejectionKind kind = VitaA32EeLinkRejectionKind::UnrecordedEdge;
+	u64 exits = 0;
+};
+
+struct VitaA32EeLinkRejectionProfile
+{
+	u64 persistent_boundaries = 0;
+	u64 event_exits = 0;
+	u64 direct_exits = 0;
+	u64 kinds[static_cast<u32>(VitaA32EeLinkRejectionKind::Count)]{};
+	u32 edge_count = 0;
+	VitaA32EeLinkRejectionEdge edges[VITA_A32_EE_LINK_REJECTION_EDGE_COUNT]{};
+};
+#endif
+
 enum class VitaA32EeFallbackReason : u32
 {
 	None = 0,
@@ -135,6 +175,12 @@ const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason);
 void VitaResetA32EeProviderStats();
 VitaA32EeProviderStats VitaGetA32EeProviderStats();
 void VitaRequestA32EeCacheReset();
+#if defined(VITASX2_QEMU_VALIDATION)
+void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled);
+void VitaSetA32EePersistentBoundaryLimit(u64 limit);
+bool VitaDidA32EePersistentBoundaryHitLimit();
+VitaA32EeLinkRejectionProfile VitaGetA32EeLinkRejectionProfile();
+#endif
 
 struct VitaA32IopProviderStats
 {
@@ -193,9 +239,19 @@ struct VitaA32IopProviderStats
 	u64 scheduler_prediction_forwards = 0;
 	u64 scheduler_prediction_fallbacks = 0;
 	u64 scheduler_prediction_remainders = 0;
+	u64 scheduler_dispatch_cache_attempts = 0;
+	u64 scheduler_dispatch_cache_hits = 0;
+	u64 scheduler_dispatch_cache_misses = 0;
+	u64 scheduler_dispatch_cache_forwards = 0;
+	u64 scheduler_dispatch_cache_fallbacks = 0;
+	u64 scheduler_dispatch_cache_remainders = 0;
+	u64 scheduler_dispatch_cache_installs = 0;
 	u64 hot_dispatch_trusted_raw_hits = 0;
 	u64 hot_dispatch_owned_hits = 0;
 	u64 hot_dispatch_stale_guard_instructions_removed = 0;
+	u32 hot_dispatch_hit_pc_count = 0;
+	u32 hot_dispatch_hit_pcs[16]{};
+	u64 hot_dispatch_hit_pc_hits[16]{};
 	u64 wait_resume_cache_attempts = 0;
 	u64 wait_resume_cache_hits = 0;
 	u64 wait_resume_cache_misses = 0;
@@ -335,6 +391,7 @@ void VitaSetA32IopWaitResumeCacheEnabled(bool enabled);
 void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled);
 void VitaSetA32IopSchedulerResumeEventEntryEnabled(bool enabled);
 void VitaSetA32IopSchedulerPredictionEventEntryEnabled(bool enabled);
+void VitaSetA32IopSchedulerDispatchCacheEventEntryEnabled(bool enabled);
 void VitaSetA32IopWaitResumeFirstEntryOwnershipEnabled(bool enabled);
 void VitaSetA32IopWaitResumeKindEntryEnabled(bool enabled);
 void VitaSetA32IopWaitResumeClockEntryEnabled(bool enabled);

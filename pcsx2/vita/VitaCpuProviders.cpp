@@ -50,6 +50,8 @@ bool g_vita_a32_iop_private_scheduler_resume_entry_available =
 	VitaIOP::VitaIopA32PrivateSchedulerResumeEntrySupported();
 bool g_vita_a32_iop_private_scheduler_prediction_entry_available =
 	VitaIOP::VitaIopA32PrivateSchedulerPredictionEntrySupported();
+bool g_vita_a32_iop_private_scheduler_dispatch_cache_entry_available =
+	VitaIOP::VitaIopA32PrivateSchedulerDispatchCacheEntrySupported();
 extern "C" s32 VitaIopA32ExecuteProviderTimesliceAapcs(void*, s32 ee_cycles)
 {
 	return psxCpu->ExecuteBlock(ee_cycles);
@@ -61,6 +63,7 @@ bool g_vita_a32_iop_private_event_entry_available = false;
 bool g_vita_a32_iop_private_wait_resume_entry_available = false;
 bool g_vita_a32_iop_private_scheduler_resume_entry_available = false;
 bool g_vita_a32_iop_private_scheduler_prediction_entry_available = false;
+bool g_vita_a32_iop_private_scheduler_dispatch_cache_entry_available = false;
 #endif
 static VitaA32EeProviderStats s_ee_a32_stats;
 static VitaA32IopProviderStats s_iop_a32_stats;
@@ -81,9 +84,13 @@ bool g_vita_a32_iop_private_event_entry_enabled = true;
 bool g_vita_a32_iop_wait_resume_event_entry_enabled = true;
 bool g_vita_a32_iop_scheduler_resume_event_entry_enabled = true;
 bool g_vita_a32_iop_scheduler_prediction_event_entry_enabled = true;
+bool g_vita_a32_iop_scheduler_dispatch_cache_event_entry_enabled = true;
 u64 g_vita_a32_iop_private_event_entries = 0;
 static u64 s_iop_a32_compact_provider_dispatch_entries = 0;
 static u64 s_iop_a32_compact_provider_cache_hit_entries = 0;
+static u64 s_ee_a32_persistent_boundary_limit = 0;
+static u64 s_ee_a32_persistent_boundaries = 0;
+static bool s_ee_a32_persistent_boundary_hit_limit = false;
 #endif
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
@@ -127,9 +134,13 @@ static void UpdateIopEventEntry()
 			;
 		bool scheduler_prediction = scheduler_resume &&
 			g_vita_a32_iop_private_scheduler_prediction_entry_available;
+		bool scheduler_dispatch_cache = scheduler_prediction &&
+			g_vita_a32_iop_private_scheduler_dispatch_cache_entry_available;
 #if defined(VITASX2_QEMU_VALIDATION)
 		scheduler_prediction = scheduler_prediction &&
 			g_vita_a32_iop_scheduler_prediction_event_entry_enabled;
+		scheduler_dispatch_cache = scheduler_dispatch_cache &&
+			g_vita_a32_iop_scheduler_dispatch_cache_event_entry_enabled;
 #endif
 		g_vita_a32_iop_event_entry.context = wait_resume ?
 			s_iop_wait_resume_event_context :
@@ -139,7 +150,9 @@ static void UpdateIopEventEntry()
 			s_iop_wait_resume_event_target :
 			(scheduler_resume ? reinterpret_cast<uptr>(
 				(scheduler_prediction ?
-					&VitaIopA32ExecuteProviderSchedulerPredictedResumePrivate :
+					(scheduler_dispatch_cache ?
+						&VitaIopA32ExecuteProviderSchedulerDispatchCachedResumePrivate :
+						&VitaIopA32ExecuteProviderSchedulerPredictedResumePrivate) :
 					&VitaIopA32ExecuteProviderSchedulerDirectResumePrivate)) :
 				reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimeslicePrivate));
 	}
@@ -580,6 +593,15 @@ static void recResetEeDispatchState()
 static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& result)
 {
 	recAccountEeBlockExecution(result, cpuRegs.pc);
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (s_ee_a32_persistent_boundary_limit != 0 &&
+		++s_ee_a32_persistent_boundaries >= s_ee_a32_persistent_boundary_limit)
+	{
+		s_ee_a32_persistent_boundary_hit_limit = true;
+		s_ee_a32_exit_execution = true;
+		return false;
+	}
+#endif
 	return !s_ee_a32_exit_execution && !s_ee_a32_cache_reset_requested &&
 		s_ee_pre_instruction_trace_callback == nullptr;
 }
@@ -1211,12 +1233,41 @@ void VitaSelectConfiguredCpuProviders()
 void VitaResetA32EeProviderStats()
 {
 	s_ee_a32_stats = {};
+#if defined(VITASX2_QEMU_VALIDATION)
+	s_ee_a32_executor.ResetDirectLinkRejectionProfile();
+	s_ee_a32_persistent_boundaries = 0;
+	s_ee_a32_persistent_boundary_hit_limit = false;
+#endif
 }
 
 VitaA32EeProviderStats VitaGetA32EeProviderStats()
 {
 	return s_ee_a32_stats;
 }
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled)
+{
+	s_ee_a32_executor.SetDirectLinkRejectionProfileEnabled(enabled);
+}
+
+void VitaSetA32EePersistentBoundaryLimit(u64 limit)
+{
+	s_ee_a32_persistent_boundary_limit = limit;
+	s_ee_a32_persistent_boundaries = 0;
+	s_ee_a32_persistent_boundary_hit_limit = false;
+}
+
+bool VitaDidA32EePersistentBoundaryHitLimit()
+{
+	return s_ee_a32_persistent_boundary_hit_limit;
+}
+
+VitaA32EeLinkRejectionProfile VitaGetA32EeLinkRejectionProfile()
+{
+	return s_ee_a32_executor.GetDirectLinkRejectionProfile();
+}
+#endif
 
 void VitaResetA32IopProviderStats()
 {
@@ -1303,6 +1354,14 @@ void VitaSetA32IopSchedulerResumeEventEntryEnabled(bool enabled)
 void VitaSetA32IopSchedulerPredictionEventEntryEnabled(bool enabled)
 {
 	g_vita_a32_iop_scheduler_prediction_event_entry_enabled = enabled;
+#if defined(__arm__)
+	UpdateIopEventEntry();
+#endif
+}
+
+void VitaSetA32IopSchedulerDispatchCacheEventEntryEnabled(bool enabled)
+{
+	g_vita_a32_iop_scheduler_dispatch_cache_event_entry_enabled = enabled;
 #if defined(__arm__)
 	UpdateIopEventEntry();
 #endif
@@ -1396,8 +1455,28 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 		snapshot.scheduler_prediction_fallbacks;
 	s_iop_a32_stats.scheduler_prediction_remainders =
 		snapshot.scheduler_prediction_remainders;
+	s_iop_a32_stats.scheduler_dispatch_cache_attempts =
+		snapshot.scheduler_dispatch_cache_attempts;
+	s_iop_a32_stats.scheduler_dispatch_cache_hits =
+		snapshot.scheduler_dispatch_cache_hits;
+	s_iop_a32_stats.scheduler_dispatch_cache_misses =
+		snapshot.scheduler_dispatch_cache_misses;
+	s_iop_a32_stats.scheduler_dispatch_cache_forwards =
+		snapshot.scheduler_dispatch_cache_forwards;
+	s_iop_a32_stats.scheduler_dispatch_cache_fallbacks =
+		snapshot.scheduler_dispatch_cache_fallbacks;
+	s_iop_a32_stats.scheduler_dispatch_cache_remainders =
+		snapshot.scheduler_dispatch_cache_remainders;
+	s_iop_a32_stats.scheduler_dispatch_cache_installs =
+		snapshot.scheduler_dispatch_cache_installs;
 	s_iop_a32_stats.hot_dispatch_trusted_raw_hits = snapshot.hot_dispatch_trusted_raw_hits;
 	s_iop_a32_stats.hot_dispatch_owned_hits = snapshot.hot_dispatch_owned_hits;
+	s_iop_a32_stats.hot_dispatch_hit_pc_count = snapshot.hot_dispatch_hit_pc_count;
+	for (u32 i = 0; i < snapshot.hot_dispatch_hit_pc_count; i++)
+	{
+		s_iop_a32_stats.hot_dispatch_hit_pcs[i] = snapshot.hot_dispatch_hit_pcs[i];
+		s_iop_a32_stats.hot_dispatch_hit_pc_hits[i] = snapshot.hot_dispatch_hit_pc_hits[i];
+	}
 	// The retired stale-entry arm loads/checks CachedBlock::valid and reloads/
 	// checks CachedBlock::start_pc after the cache record already matched. Product
 	// Cortex-A9 disassembly attributes six instructions to that arm.

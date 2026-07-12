@@ -7,11 +7,17 @@
 #include "pcsx2/HostMemoryMap.h"
 #include "pcsx2/vita/A32Emitter.h"
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
+#if defined(VITASX2_QEMU_VALIDATION)
+#include "pcsx2/vita/VitaCore.h"
+#endif
 
 #include <array>
 #include <cstddef>
 #include <memory>
 #include <vector>
+#if defined(VITASX2_QEMU_VALIDATION)
+#include <unordered_map>
+#endif
 
 namespace VitaEE
 {
@@ -117,6 +123,9 @@ namespace VitaEE
 		void SetReciprocalJumpGprLinkEnabled(bool enabled);
 		void SetThreeBlockGprLinkEnabled(bool enabled);
 		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled);
+		void SetDirectLinkRejectionProfileEnabled(bool enabled);
+		void ResetDirectLinkRejectionProfile();
+		VitaA32EeLinkRejectionProfile GetDirectLinkRejectionProfile() const;
 #endif
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
@@ -255,6 +264,9 @@ namespace VitaEE
 		void PatchIncomingLinks(CachedBlock& target);
 		void UnlinkIncomingLinks(u32 target_pc);
 		void RelinkDirectLinks();
+#if defined(VITASX2_QEMU_VALIDATION)
+		void RecordPersistentExit(BlockExitKind exit);
+#endif
 
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
 		std::vector<CachedBlock*> m_free_cache_entries;
@@ -290,6 +302,11 @@ namespace VitaEE
 		bool m_reciprocal_jump_gpr_link_enabled = true;
 		bool m_three_block_gpr_link_enabled = true;
 		bool m_vtlb_linked_entry_pc_publication_enabled = false;
+		bool m_direct_link_rejection_profile_enabled = false;
+		VitaA32EeLinkRejectionProfile m_direct_link_rejection_profile{};
+		std::unordered_map<u64,
+			std::array<u64, static_cast<u32>(VitaA32EeLinkRejectionKind::Count)>>
+			m_direct_link_rejection_edges;
 #endif
 	};
 } // namespace VitaEE

@@ -17,6 +17,7 @@
 
 #include <cstring>
 #include <new>
+#include <algorithm>
 
 #if defined(VITASX2_QEMU_VALIDATION)
 extern u32 g_qemuEmbeddedCompatibleContinuationActivations;
@@ -24,6 +25,7 @@ extern u32 g_qemuEmbeddedCompatibleContinuationSourceMismatches;
 extern u32 g_qemuEmbeddedCompatibleContinuationIncompatibleTargets;
 extern u32 g_qemuCompatibleVtlbWriteFastEntryActivations;
 extern u32 g_qemuCompatibleVtlbReadFastEntryActivations;
+extern u32 g_qemuEeDirectExitSourcePc;
 #endif
 
 namespace
@@ -766,6 +768,126 @@ namespace VitaEE
 		// Entry layout changes, so discard every cached block before switching.
 		Reset();
 		m_vtlb_linked_entry_pc_publication_enabled = enabled;
+	}
+
+	void BlockExecutor::SetDirectLinkRejectionProfileEnabled(bool enabled)
+	{
+		if (m_direct_link_rejection_profile_enabled == enabled)
+			return;
+
+		// Source publication is emitted only into direct-exit cold tails.
+		Reset();
+		m_direct_link_rejection_profile_enabled = enabled;
+		ResetDirectLinkRejectionProfile();
+	}
+
+	void BlockExecutor::ResetDirectLinkRejectionProfile()
+	{
+		m_direct_link_rejection_profile = VitaA32EeLinkRejectionProfile{};
+		m_direct_link_rejection_edges.clear();
+		g_qemuEeDirectExitSourcePc = 0;
+	}
+
+	VitaA32EeLinkRejectionProfile BlockExecutor::GetDirectLinkRejectionProfile() const
+	{
+		VitaA32EeLinkRejectionProfile result = m_direct_link_rejection_profile;
+		std::vector<VitaA32EeLinkRejectionEdge> edges;
+		for (const auto& [edge_key, counts] : m_direct_link_rejection_edges)
+		{
+			for (u32 kind = 0; kind < counts.size(); kind++)
+			{
+				if (counts[kind] == 0)
+					continue;
+				VitaA32EeLinkRejectionEdge edge;
+				edge.source_pc = static_cast<u32>(edge_key >> 32);
+				edge.target_pc = static_cast<u32>(edge_key);
+				edge.kind = static_cast<VitaA32EeLinkRejectionKind>(kind);
+				edge.exits = counts[kind];
+				edges.push_back(edge);
+			}
+		}
+		std::sort(edges.begin(), edges.end(), [](const auto& lhs, const auto& rhs) {
+			return lhs.exits != rhs.exits ? lhs.exits > rhs.exits :
+				(lhs.source_pc != rhs.source_pc ? lhs.source_pc < rhs.source_pc :
+				 lhs.target_pc < rhs.target_pc);
+		});
+		result.edge_count = std::min<u32>(static_cast<u32>(edges.size()),
+			VITA_A32_EE_LINK_REJECTION_EDGE_COUNT);
+		for (u32 i = 0; i < result.edge_count; i++)
+			result.edges[i] = edges[i];
+		return result;
+	}
+
+	void BlockExecutor::RecordPersistentExit(BlockExitKind exit)
+	{
+		if (!m_direct_link_rejection_profile_enabled)
+			return;
+
+		m_direct_link_rejection_profile.persistent_boundaries++;
+		if (exit == BlockExitKind::Event)
+		{
+			m_direct_link_rejection_profile.event_exits++;
+			return;
+		}
+		if (exit != BlockExitKind::Direct)
+			return;
+
+		m_direct_link_rejection_profile.direct_exits++;
+		const u32 source_pc = g_qemuEeDirectExitSourcePc;
+		const u32 target_pc = cpuRegs.pc;
+		g_qemuEeDirectExitSourcePc = 0;
+		VitaA32EeLinkRejectionKind kind = VitaA32EeLinkRejectionKind::UnrecordedEdge;
+		CachedBlock* const source = source_pc ? FindLookupBlockByStartPc(source_pc) : nullptr;
+		DirectLinkSlot* link = nullptr;
+		if (source && source->valid)
+		{
+			for (DirectLinkSlot& candidate : source->direct_links.slots)
+			{
+				if (candidate.valid && candidate.target_pc == target_pc)
+				{
+					link = &candidate;
+					break;
+				}
+			}
+		}
+
+		if (link)
+		{
+			CachedBlock* const target = FindLookupBlockByStartPc(target_pc);
+			if (!target || !target->valid)
+			{
+				kind = VitaA32EeLinkRejectionKind::TargetNotCompiled;
+			}
+			else if (link->embedded_compatible_continuation &&
+				(memRead32(target_pc) != link->embedded_source_opcodes[0] ||
+				 memRead32(target_pc + sizeof(u32)) != link->embedded_source_opcodes[1]))
+			{
+				kind = VitaA32EeLinkRejectionKind::EmbeddedSourceMismatch;
+			}
+			else if (link->requires_compatible_entry)
+			{
+				if (!source->gpr_link_signature.IsValid())
+					kind = VitaA32EeLinkRejectionKind::SourceSignatureMissing;
+				else if (!target->gpr_link_signature.IsValid())
+					kind = VitaA32EeLinkRejectionKind::TargetSignatureMissing;
+				else if (!(source->gpr_link_signature == target->gpr_link_signature))
+					kind = VitaA32EeLinkRejectionKind::SignatureMismatch;
+				else if (target->compatible_link_entry_offset == static_cast<size_t>(-1) ||
+					target->compatible_link_entry_offset >= target->code.Size())
+					kind = VitaA32EeLinkRejectionKind::CompatibleEntryMissing;
+				else
+					kind = VitaA32EeLinkRejectionKind::UnexpectedFallback;
+			}
+			else
+			{
+				kind = VitaA32EeLinkRejectionKind::UnexpectedFallback;
+			}
+		}
+
+		const u32 kind_index = static_cast<u32>(kind);
+		m_direct_link_rejection_profile.kinds[kind_index]++;
+		const u64 edge_key = (static_cast<u64>(source_pc) << 32) | target_pc;
+		m_direct_link_rejection_edges[edge_key][kind_index]++;
 	}
 #endif
 
@@ -1524,6 +1646,8 @@ namespace VitaEE
 				m_compatible_vtlb_write_guard_hoist_enabled);
 			compiler.SetCompatibleVtlbReadGuardHoistEnabled(
 				m_compatible_vtlb_read_guard_hoist_enabled);
+			compiler.SetDirectLinkRejectionProfilingEnabled(
+				m_direct_link_rejection_profile_enabled);
 #endif
 			u32 attempt_scaled_cycles = 0;
 			size_t attempt_linked_entry_offset = 0;
@@ -2043,6 +2167,10 @@ namespace VitaEE
 			context->failed = true;
 			return nullptr;
 		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		context->executor->RecordPersistentExit(exit);
+#endif
 
 		context->current_result.exit = exit;
 		context->current_result.exit_value = exit_value;

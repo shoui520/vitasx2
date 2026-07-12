@@ -7151,7 +7151,8 @@ namespace VitaIOP
 #if defined(VITASX2_IOP_SCHEDULER_PREDICTION_CONTROL)
 		(void)block;
 		return;
-#elif defined(VITASX2_QEMU_VALIDATION)
+#elif defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
 		if (!g_vita_a32_iop_scheduler_prediction_event_entry_enabled)
 			return;
 #endif
@@ -7161,7 +7162,24 @@ namespace VitaIOP
 				m_scheduler_direct_resume_event_context.predicted_block;
 			m_scheduler_direct_resume_event_context.predicted_block = block;
 		}
-#if defined(VITASX2_QEMU_VALIDATION)
+		if (block)
+		{
+			const u32 cache_index =
+				(block->start_pc >> 2) & (SchedulerDispatchCacheEntryCount() - 1);
+			auto& cache_entry =
+				m_scheduler_direct_resume_event_context.dispatch_cache[cache_index];
+			if (cache_entry.block != block || cache_entry.start_pc != block->start_pc)
+			{
+				cache_entry.block = block;
+				cache_entry.start_pc = block->start_pc;
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
+				m_scheduler_dispatch_cache_installs++;
+#endif
+			}
+		}
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
 		for (u32 i = 0; i < m_scheduler_prediction_shadow.size(); i++)
 		{
 			if (m_scheduler_prediction_shadow[i] != block)
@@ -7181,6 +7199,11 @@ namespace VitaIOP
 	{
 		m_scheduler_direct_resume_event_context.predicted_block = nullptr;
 		m_scheduler_direct_resume_event_context.predicted_block_second = nullptr;
+		for (auto& entry : m_scheduler_direct_resume_event_context.dispatch_cache)
+		{
+			entry.block = nullptr;
+			entry.start_pc = UINT32_MAX;
+		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_scheduler_prediction_shadow.fill(nullptr);
 #endif
@@ -7232,8 +7255,16 @@ namespace VitaIOP
 		m_scheduler_prediction_forwards = 0;
 		m_scheduler_prediction_fallbacks = 0;
 		m_scheduler_prediction_remainders = 0;
+		m_scheduler_dispatch_cache_attempts = 0;
+		m_scheduler_dispatch_cache_hits = 0;
+		m_scheduler_dispatch_cache_misses = 0;
+		m_scheduler_dispatch_cache_forwards = 0;
+		m_scheduler_dispatch_cache_fallbacks = 0;
+		m_scheduler_dispatch_cache_remainders = 0;
+		m_scheduler_dispatch_cache_installs = 0;
 		m_hot_dispatch_trusted_raw_hits = 0;
 		m_hot_dispatch_owned_hits = 0;
+		m_hot_dispatch_hit_pc_profile.clear();
 		m_wait_resume_cache_attempts = 0;
 		m_wait_resume_cache_hits = 0;
 		m_wait_resume_cache_misses = 0;
@@ -8314,6 +8345,15 @@ namespace VitaIOP
 		else if (m_scheduler_direct_resume_event_context.predicted_block_second == &block)
 		{
 			m_scheduler_direct_resume_event_context.predicted_block_second = nullptr;
+		}
+		const u32 dispatch_cache_index =
+			(block.start_pc >> 2) & (SchedulerDispatchCacheEntryCount() - 1);
+		auto& dispatch_cache_entry =
+			m_scheduler_direct_resume_event_context.dispatch_cache[dispatch_cache_index];
+		if (dispatch_cache_entry.block == &block)
+		{
+			dispatch_cache_entry.block = nullptr;
+			dispatch_cache_entry.start_pc = UINT32_MAX;
 		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		for (u32 i = 0; i < m_scheduler_prediction_shadow.size();)
@@ -9476,8 +9516,29 @@ namespace VitaIOP
 		result->scheduler_prediction_forwards = m_scheduler_prediction_forwards;
 		result->scheduler_prediction_fallbacks = m_scheduler_prediction_fallbacks;
 		result->scheduler_prediction_remainders = m_scheduler_prediction_remainders;
+		result->scheduler_dispatch_cache_attempts = m_scheduler_dispatch_cache_attempts;
+		result->scheduler_dispatch_cache_hits = m_scheduler_dispatch_cache_hits;
+		result->scheduler_dispatch_cache_misses = m_scheduler_dispatch_cache_misses;
+		result->scheduler_dispatch_cache_forwards = m_scheduler_dispatch_cache_forwards;
+		result->scheduler_dispatch_cache_fallbacks = m_scheduler_dispatch_cache_fallbacks;
+		result->scheduler_dispatch_cache_remainders = m_scheduler_dispatch_cache_remainders;
+		result->scheduler_dispatch_cache_installs = m_scheduler_dispatch_cache_installs;
 		result->hot_dispatch_trusted_raw_hits = m_hot_dispatch_trusted_raw_hits;
 		result->hot_dispatch_owned_hits = m_hot_dispatch_owned_hits;
+		std::vector<std::pair<u32, u64>> hot_hit_pcs;
+		hot_hit_pcs.reserve(m_hot_dispatch_hit_pc_profile.size());
+		for (const auto& entry : m_hot_dispatch_hit_pc_profile)
+			hot_hit_pcs.push_back(entry);
+		std::sort(hot_hit_pcs.begin(), hot_hit_pcs.end(), [](const auto& lhs, const auto& rhs) {
+			return lhs.second != rhs.second ? lhs.second > rhs.second : lhs.first < rhs.first;
+		});
+		result->hot_dispatch_hit_pc_count = std::min<u32>(
+			static_cast<u32>(hot_hit_pcs.size()), 16);
+		for (u32 i = 0; i < result->hot_dispatch_hit_pc_count; i++)
+		{
+			result->hot_dispatch_hit_pcs[i] = hot_hit_pcs[i].first;
+			result->hot_dispatch_hit_pc_hits[i] = hot_hit_pcs[i].second;
+		}
 		result->wait_resume_cache_attempts = m_wait_resume_cache_attempts;
 		result->wait_resume_cache_hits = m_wait_resume_cache_hits;
 		result->wait_resume_cache_misses = m_wait_resume_cache_misses;
@@ -9957,6 +10018,7 @@ namespace VitaIOP
 			{
 #if defined(VITASX2_QEMU_VALIDATION)
 				m_hot_dispatch_cache_hits++;
+				m_hot_dispatch_hit_pc_profile[start_pc]++;
 #endif
 				result->cache_hit = true;
 				result->lookup_hit = true;
@@ -10105,6 +10167,7 @@ namespace VitaIOP
 			{
 #if defined(VITASX2_QEMU_VALIDATION)
 				m_hot_dispatch_cache_hits++;
+				m_hot_dispatch_hit_pc_profile[start_pc]++;
 				publish_profile_metadata(*entry);
 				if (inline_hot_path)
 					m_private_dispatcher_inlined_hot_entries++;
@@ -10490,6 +10553,101 @@ namespace VitaIOP
 		ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
 	}
 
+	s32 BlockExecutor::ExecuteProviderSchedulerDispatchCachedResumePrivateBody(
+		s32 ee_cycles, CachedBlock* block)
+	{
+		asm volatile("" ::: "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "lr");
+		psxRegs.iopBreak = 0;
+		psxRegs.iopCycleEE = ee_cycles;
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
+		m_private_dispatcher_calls++;
+		m_scheduler_dispatch_cache_attempts++;
+#endif
+
+		if (psxRegs.iopCycleEE <= 0)
+			ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
+
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
+		const u32 cache_index =
+			(psxRegs.pc >> 2) & (SchedulerDispatchCacheEntryCount() - 1);
+		const auto& cache_entry =
+			m_scheduler_direct_resume_event_context.dispatch_cache[cache_index];
+		bool cache_match = block && block == cache_entry.block && block->valid &&
+			cache_entry.start_pc == psxRegs.pc && block->start_pc == psxRegs.pc &&
+			block->isolate_cache_active == m_active_isolate_cache_mode;
+		if (cache_match && s_qemuIopTrustedSourceAuditEnabled && block->raw_opcodes)
+		{
+			m_hot_dispatch_trusted_raw_hits++;
+			cache_match = ValidateCachedBlock(*block);
+		}
+		if (cache_match)
+			m_scheduler_dispatch_cache_hits++;
+		else
+			m_scheduler_dispatch_cache_misses++;
+#else
+		if (!block)
+			__builtin_unreachable();
+		constexpr bool cache_match = true;
+#endif
+		if (!cache_match)
+		{
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
+			m_scheduler_dispatch_cache_fallbacks++;
+#endif
+			const s32 result = ExecuteProviderTimesliceRemainder();
+			ReturnFromPrivateProviderTimeslice(result);
+		}
+
+		// A PC-indexed hit is also the newest register-dispatch target. Refresh
+		// the cheaper two-way front so alternating/local patterns return to its
+		// shorter route instead of repeatedly probing the indexed tier.
+		SetSchedulerPredictedResumeBlock(block);
+
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
+		m_private_dispatcher_inlined_hot_entries++;
+		if (CompiledPs1BiosGateEnabled())
+			m_dispatcher_ps1_bios_gate_checks_removed++;
+#endif
+		const u32 dispatch_flags = RunProviderBlockInline(*block,
+			ProviderDispatchCacheHit | ProviderDispatchLookupHit |
+				ProviderDispatchFastHit);
+		if ((dispatch_flags & ProviderDispatchSuccess) == 0)
+		{
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
+			m_private_dispatcher_fallbacks++;
+			m_scheduler_dispatch_cache_fallbacks++;
+#endif
+			const s32 result = psxInt.ExecuteBlock(psxRegs.iopCycleEE);
+			ReturnFromPrivateProviderTimeslice(result);
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
+		m_private_dispatcher_provider_entries++;
+		m_scheduler_dispatch_cache_forwards++;
+		if ((dispatch_flags & ProviderDispatchWaitForward) != 0)
+			m_private_dispatcher_wait_forwards++;
+		else
+			m_private_dispatcher_generated_entries++;
+#endif
+		if (psxRegs.iopCycleEE > 0)
+		{
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
+			m_scheduler_dispatch_cache_remainders++;
+#endif
+			const s32 result = ExecuteProviderTimesliceRemainder();
+			ReturnFromPrivateProviderTimeslice(result);
+		}
+
+		ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
+	}
+
 	inline __attribute__((always_inline)) s32
 	BlockExecutor::ExecuteProviderWaitResumePrivateBodyCore(
 		s32 ee_cycles, CachedBlock* block, WaitResumeKind kind,
@@ -10862,6 +11020,8 @@ namespace VitaIOP
 		__asm__("VitaIopA32ProviderSchedulerDirectResumeBody");
 	extern "C" void VitaIopA32ProviderSchedulerPredictedResumeBodySymbol()
 		__asm__("VitaIopA32ProviderSchedulerPredictedResumeBody");
+	extern "C" void VitaIopA32ProviderSchedulerDispatchCachedResumeBodySymbol()
+		__asm__("VitaIopA32ProviderSchedulerDispatchCachedResumeBody");
 #if defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_IOP_WAIT_RESUME_KIND_ENTRY_CONTROL)
 	extern "C" void VitaIopA32ProviderWaitResumeBodySymbol()
@@ -10918,6 +11078,15 @@ namespace VitaIOP
 		const auto* const body = reinterpret_cast<const u32*>(
 			reinterpret_cast<uptr>(
 				&VitaIopA32ProviderSchedulerPredictedResumeBodySymbol));
+		return body[0] == EXPECTED_PUSH_R4_R11_LR;
+	}
+
+	bool VitaIopA32PrivateSchedulerDispatchCacheEntrySupported()
+	{
+		constexpr u32 EXPECTED_PUSH_R4_R11_LR = 0xe92d4ff0u;
+		const auto* const body = reinterpret_cast<const u32*>(
+			reinterpret_cast<uptr>(
+				&VitaIopA32ProviderSchedulerDispatchCachedResumeBodySymbol));
 		return body[0] == EXPECTED_PUSH_R4_R11_LR;
 	}
 
@@ -11024,6 +11193,53 @@ namespace VitaIOP
 			:
 			: "i"(BlockExecutor::SchedulerPredictionStartPcOffset()),
 			  "i"(offsetof(psxRegisters, pc)));
+	}
+
+	extern "C" __attribute__((naked, noinline)) s32
+	VitaIopA32ExecuteProviderSchedulerDispatchCachedResumePrivate(void*, s32)
+	{
+		static_assert(BlockExecutor::SchedulerPredictionStartPcOffset() < 4096);
+		static_assert(BlockExecutor::SchedulerDispatchCacheOffset() < 65536);
+		static_assert(BlockExecutor::SchedulerDispatchCacheEntryCount() == 64);
+		asm volatile(
+			// Preserve the exact and two-way routes byte-for-byte. Only their miss
+			// path probes the scheduler-owned PC-indexed BaseBlock cache.
+			"ldmia r0, {r0, r2, r3, r12}\n"
+			"sub sp, sp, #36\n"
+			"str lr, [sp, #32]\n"
+			"cmp r2, #0\n"
+			"bne VitaIopA32ProviderSchedulerDirectResumeBody + 4\n"
+			"movw lr, #:lower16:psxRegs\n"
+			"movt lr, #:upper16:psxRegs\n"
+			"ldr lr, [lr, #%c1]\n"
+			"cmp r3, #0\n"
+			"beq 1f\n"
+			"ldr r2, [r3, #%c0]\n"
+			"cmp r2, lr\n"
+			"moveq r2, r3\n"
+			"beq VitaIopA32ProviderSchedulerPredictedResumeBody + 4\n"
+			"1:\n"
+			"cmp r12, #0\n"
+			"beq 2f\n"
+			"ldr r2, [r12, #%c0]\n"
+			"cmp r2, lr\n"
+			"moveq r2, r12\n"
+			"beq VitaIopA32ProviderSchedulerPredictedResumeBody + 4\n"
+			"2:\n"
+			"movw r3, #%c2\n"
+			"add r3, r0, r3\n"
+			"ubfx r12, lr, #2, #6\n"
+			"add r3, r3, r12, lsl #3\n"
+			"ldmia r3, {r2, r3}\n"
+			"cmp r2, #0\n"
+			"beq VitaIopA32ProviderTimesliceBody + 4\n"
+			"cmp r3, lr\n"
+			"beq VitaIopA32ProviderSchedulerDispatchCachedResumeBody + 4\n"
+			"b VitaIopA32ProviderTimesliceBody + 4\n"
+			:
+			: "i"(BlockExecutor::SchedulerPredictionStartPcOffset()),
+			  "i"(offsetof(psxRegisters, pc)),
+			  "i"(BlockExecutor::SchedulerDispatchCacheOffset()));
 	}
 
 #if defined(VITASX2_QEMU_VALIDATION) || \

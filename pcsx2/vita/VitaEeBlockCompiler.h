@@ -481,6 +481,10 @@ namespace VitaEE
 		{
 			m_compatible_vtlb_read_guard_hoist_enabled = enabled;
 		}
+		void SetDirectLinkRejectionProfilingEnabled(bool enabled)
+		{
+			m_direct_link_rejection_profiling_enabled = enabled;
+		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -1295,6 +1299,7 @@ namespace VitaEE
 		bool m_combined_compatible_taken_event_enabled = true;
 		bool m_compatible_vtlb_write_guard_hoist_enabled = true;
 		bool m_compatible_vtlb_read_guard_hoist_enabled = true;
+		bool m_direct_link_rejection_profiling_enabled = false;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;

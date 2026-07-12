@@ -50,6 +50,7 @@ extern void _vu0FinishMicro();
 extern void _vu0WaitMicro();
 #endif
 #if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuEeDirectExitSourcePc = 0;
 u32 g_qemuDivSignedHelperCalls = 0;
 u32 g_qemuDivUnsignedHelperCalls = 0;
 u32 g_qemuDivSigned1HelperCalls = 0;
@@ -11742,6 +11743,21 @@ namespace VitaEE
 	{
 		if (!target)
 			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		// Profiling only: publish the exact generated source block on a cold
+		// direct-dispatch exit. Successful direct links never execute this code,
+		// and product builds contain no publication instructions.
+		if (m_direct_link_rejection_profiling_enabled &&
+			m_persistent_dispatch_exits && callable_token == EE_DIRECT_EXIT_TOKEN &&
+			(!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+				reinterpret_cast<uptr>(&g_qemuEeDirectExitSourcePc))) ||
+			 !m_code.EmitMovImm32(HOST_TMP2, m_current_block_start_pc) ||
+			 !m_code.EmitStrImm12(HOST_TMP2, HOST_TMP0, 0)))
+		{
+			return false;
+		}
+#endif
 		if (!m_persistent_dispatch_exits)
 			return m_code.EmitMovImm8(0, callable_token) && EmitLinkFrameReturn();
 
