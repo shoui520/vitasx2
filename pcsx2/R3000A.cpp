@@ -14,6 +14,7 @@
 #include "IopDma.h"
 #include "CDVD/Ps1CD.h"
 #include "CDVD/CDVD.h"
+#include "vita/VitaCore.h"
 
 using namespace R3000A;
 
@@ -39,6 +40,7 @@ void psxReset()
 	std::memset(&psxRegs, 0, sizeof(psxRegs));
 
 	psxRegs.pc = 0xbfc00000; // Start in bootstrap
+	VitaNotifyIopPcDiscontinuity();
 	psxRegs.CP0.n.Status = 0x00400000; // BEV = 1
 	psxRegs.CP0.n.PRid   = 0x0000001f; // PRevID = Revision ID, same as the IOP R3000A
 
@@ -88,6 +90,7 @@ void psxException(u32 code, u32 bd)
 		psxRegs.pc = 0xbfc00180;
 	else
 		psxRegs.pc = 0x80000080;
+	VitaNotifyIopPcDiscontinuity();
 
 	// Set the Status
 	psxRegs.CP0.n.Status = (psxRegs.CP0.n.Status &~0x3f) |

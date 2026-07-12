@@ -60,6 +60,8 @@ namespace VitaIOP
 		u64 wait_resume_event_fallbacks;
 		u64 wait_resume_event_installs;
 		u64 wait_resume_event_clears;
+		u64 wait_resume_first_entry_owned;
+		u64 wait_resume_post_event_identity_checks;
 		u64 wait_resume_descriptor_forwards;
 		u64 wait_resume_unconditional_forwards;
 		u64 wait_resume_poll_forwards;
@@ -511,6 +513,7 @@ namespace VitaIOP
 
 		u32 Reset();
 		void ResetInstrumentationCounters();
+		void NotifyPcDiscontinuity();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		void SetDirectLinkingEnabled(bool enabled);
 		u32 GetCodeCacheResetCount() const { return m_code_cache_resets; }
@@ -536,6 +539,7 @@ namespace VitaIOP
 		static void SetCachedWaitDescriptorEnabled(bool enabled);
 		static void SetInlineWaitFastForwardEnabled(bool enabled);
 		static void SetWaitResumeCacheEnabled(bool enabled);
+		static void SetWaitResumeFirstEntryOwnershipEnabled(bool enabled);
 		static void SetWaitResumeDescriptorSpecializationEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
@@ -785,6 +789,8 @@ namespace VitaIOP
 		u64 m_wait_resume_event_fallbacks = 0;
 		u64 m_wait_resume_event_installs = 0;
 		u64 m_wait_resume_event_clears = 0;
+		u64 m_wait_resume_first_entry_owned = 0;
+		u64 m_wait_resume_post_event_identity_checks = 0;
 		u64 m_wait_resume_descriptor_forwards = 0;
 		u64 m_wait_resume_unconditional_forwards = 0;
 		u64 m_wait_resume_poll_forwards = 0;

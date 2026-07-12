@@ -14,6 +14,7 @@
 #include "R3000A.h"
 #include "IopMem.h"
 #include "VMManager.h"
+#include "vita/VitaCore.h"
 #include "vtlb.h"
 
 #include "common/StringUtil.h"
@@ -983,6 +984,7 @@ bool R3000DebugInterface::getCPCOND0()
 void R3000DebugInterface::setPc(u32 newPc)
 {
 	psxRegs.pc = newPc;
+	VitaNotifyIopPcDiscontinuity();
 }
 
 void R3000DebugInterface::setRegister(int cat, int num, u128 newValue)
@@ -994,6 +996,7 @@ void R3000DebugInterface::setRegister(int cat, int num, u128 newValue)
 			{
 				case 32: // pc
 					psxRegs.pc = newValue._u32[0];
+					VitaNotifyIopPcDiscontinuity();
 					break;
 				case 33: // hi
 					psxRegs.GPR.n.hi = newValue._u32[0];

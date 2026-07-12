@@ -13,6 +13,7 @@ void VitaSelectA32EeCpuProviders();
 void VitaSelectA32IopCpuProviders();
 void VitaSelectA32EeIopCpuProviders();
 void VitaSelectConfiguredCpuProviders();
+void VitaNotifyIopPcDiscontinuity();
 
 extern bool g_vita_a32_iop_private_event_entry_available;
 extern bool g_vita_a32_iop_private_wait_resume_entry_available;
@@ -144,6 +145,9 @@ struct VitaA32IopProviderStats
 	u64 wait_resume_event_fallbacks = 0;
 	u64 wait_resume_event_installs = 0;
 	u64 wait_resume_event_clears = 0;
+	u64 wait_resume_first_entry_owned = 0;
+	u64 wait_resume_first_entry_identity_instructions_removed = 0;
+	u64 wait_resume_post_event_identity_checks = 0;
 	u64 wait_resume_descriptor_forwards = 0;
 	u64 wait_resume_unconditional_forwards = 0;
 	u64 wait_resume_poll_forwards = 0;
@@ -260,6 +264,7 @@ void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled);
 void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled);
 void VitaSetA32IopWaitResumeCacheEnabled(bool enabled);
 void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled);
+void VitaSetA32IopWaitResumeFirstEntryOwnershipEnabled(bool enabled);
 void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled);
 VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile();
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles);

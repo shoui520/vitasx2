@@ -85,6 +85,11 @@ static VitaA32EeTraceMode s_ee_a32_trace_mode = VitaA32EeTraceMode::InstructionW
 static bool s_ee_provider_trace_suppressed = false;
 static bool s_ee_a32_prerecording_window = false;
 
+void VitaNotifyIopPcDiscontinuity()
+{
+	s_iop_a32_executor.NotifyPcDiscontinuity();
+}
+
 #if defined(__arm__)
 static void UpdateIopEventEntry()
 {
@@ -1251,6 +1256,11 @@ void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled)
 #endif
 }
 
+void VitaSetA32IopWaitResumeFirstEntryOwnershipEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetWaitResumeFirstEntryOwnershipEnabled(enabled);
+}
+
 void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetWaitResumeDescriptorSpecializationEnabled(enabled);
@@ -1281,6 +1291,14 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.wait_resume_event_fallbacks = snapshot.wait_resume_event_fallbacks;
 	s_iop_a32_stats.wait_resume_event_installs = snapshot.wait_resume_event_installs;
 	s_iop_a32_stats.wait_resume_event_clears = snapshot.wait_resume_event_clears;
+	s_iop_a32_stats.wait_resume_first_entry_owned =
+		snapshot.wait_resume_first_entry_owned;
+	// Product control disassembly attributes fifteen instructions to the
+	// scheduler-redundant null, retained-block, PC, and isolate identity arm.
+	s_iop_a32_stats.wait_resume_first_entry_identity_instructions_removed =
+		snapshot.wait_resume_first_entry_owned * 15u;
+	s_iop_a32_stats.wait_resume_post_event_identity_checks =
+		snapshot.wait_resume_post_event_identity_checks;
 	s_iop_a32_stats.wait_resume_descriptor_forwards =
 		snapshot.wait_resume_descriptor_forwards;
 	s_iop_a32_stats.wait_resume_unconditional_forwards =

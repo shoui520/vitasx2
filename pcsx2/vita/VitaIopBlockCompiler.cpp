@@ -78,6 +78,7 @@ static bool s_qemuIopHotDispatchOwnershipEnabled = true;
 static bool s_qemuIopCachedWaitDescriptorEnabled = true;
 static bool s_qemuIopInlineWaitFastForwardEnabled = true;
 static bool s_qemuIopWaitResumeCacheEnabled = true;
+static bool s_qemuIopWaitResumeFirstEntryOwnershipEnabled = true;
 static bool s_qemuIopWaitResumeDescriptorSpecializationEnabled = true;
 static u64 s_qemuIopInlineWaitFastForwards = 0;
 #endif
@@ -6826,6 +6827,14 @@ namespace VitaIOP
 		ReleaseCodeCache();
 	}
 
+	void BlockExecutor::NotifyPcDiscontinuity()
+	{
+		// PCSX2 owner: R3000A.cpp::psxException() is the asynchronous event
+		// path which replaces the current IOP PC. Retire the scheduler target at
+		// that owner so a retained wait can never mask the exception vector.
+		ClearWaitResumeBlock();
+	}
+
 	void BlockExecutor::ResetInstrumentationCounters()
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -6842,6 +6851,8 @@ namespace VitaIOP
 		m_wait_resume_event_fallbacks = 0;
 		m_wait_resume_event_installs = 0;
 		m_wait_resume_event_clears = 0;
+		m_wait_resume_first_entry_owned = 0;
+		m_wait_resume_post_event_identity_checks = 0;
 		m_wait_resume_descriptor_forwards = 0;
 		m_wait_resume_unconditional_forwards = 0;
 		m_wait_resume_poll_forwards = 0;
@@ -7062,6 +7073,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopWaitResumeCacheEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetWaitResumeFirstEntryOwnershipEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopWaitResumeFirstEntryOwnershipEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -8791,6 +8811,9 @@ namespace VitaIOP
 		result->wait_resume_event_fallbacks = m_wait_resume_event_fallbacks;
 		result->wait_resume_event_installs = m_wait_resume_event_installs;
 		result->wait_resume_event_clears = m_wait_resume_event_clears;
+		result->wait_resume_first_entry_owned = m_wait_resume_first_entry_owned;
+		result->wait_resume_post_event_identity_checks =
+			m_wait_resume_post_event_identity_checks;
 		result->wait_resume_descriptor_forwards = m_wait_resume_descriptor_forwards;
 		result->wait_resume_unconditional_forwards = m_wait_resume_unconditional_forwards;
 		result->wait_resume_poll_forwards = m_wait_resume_poll_forwards;
@@ -9474,38 +9497,80 @@ namespace VitaIOP
 		m_wait_resume_event_entries++;
 #endif
 
-		while (psxRegs.iopCycleEE > 0)
-		{
-			bool resume_match = block && block == m_wait_resume_block &&
-				psxRegs.pc == block->start_pc &&
-				block->isolate_cache_active == m_active_isolate_cache_mode;
+		if (psxRegs.iopCycleEE <= 0)
+			ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
+
+		const auto resume_context_matches = [&](bool identity_owned) {
+			bool resume_match = identity_owned ||
+				(block && block == m_wait_resume_block &&
+					psxRegs.pc == block->start_pc &&
+					block->isolate_cache_active == m_active_isolate_cache_mode);
 #if defined(VITASX2_QEMU_VALIDATION)
 			if (!s_qemuIopWaitResumeCacheEnabled)
 				resume_match = false;
 			m_wait_resume_cache_attempts++;
 			if (resume_match)
 			{
-				resume_match = block->valid && block->raw_opcodes;
+				// Product ownership makes the first identity exact. Keep QEMU's
+				// deliberate raw-source audit without reintroducing the product
+				// block/PC/isolate comparisons being measured here.
+				resume_match = block && block->valid && block->raw_opcodes;
 				if (resume_match)
 				{
 					m_hot_dispatch_trusted_raw_hits++;
 					resume_match = ValidateCachedBlock(*block);
 				}
 			}
-#endif
-			if (!resume_match)
-			{
-#if defined(VITASX2_QEMU_VALIDATION)
+			if (resume_match)
+				m_wait_resume_cache_hits++;
+			else
 				m_wait_resume_cache_misses++;
-				m_wait_resume_event_fallbacks++;
 #endif
+			return resume_match;
+		};
+
+#if defined(VITASX2_IOP_WAIT_RESUME_FIRST_ENTRY_CONTROL)
+		constexpr bool trust_first_entry = false;
+#elif defined(VITASX2_QEMU_VALIDATION)
+		const bool trust_first_entry =
+			s_qemuIopWaitResumeFirstEntryOwnershipEnabled;
+#else
+		constexpr bool trust_first_entry = true;
+#endif
+#if !defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_WAIT_RESUME_FIRST_ENTRY_CONTROL)
+		// The selected scheduler context cannot name the wait entry without its
+		// retained block. Preserve that fact for register allocation after the
+		// product path deliberately removes the redundant null test.
+		if (!block)
+			__builtin_unreachable();
+#endif
+		if (!trust_first_entry && !resume_context_matches(false))
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_wait_resume_event_fallbacks++;
+#endif
+			ClearWaitResumeBlock();
+			const s32 result = ExecuteProviderTimesliceRemainder();
+			ReturnFromPrivateProviderTimeslice(result);
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (trust_first_entry)
+		{
+			m_wait_resume_first_entry_owned++;
+			if (!resume_context_matches(true))
+			{
+				m_wait_resume_event_fallbacks++;
 				ClearWaitResumeBlock();
 				const s32 result = ExecuteProviderTimesliceRemainder();
 				ReturnFromPrivateProviderTimeslice(result);
 			}
+		}
+#endif
 
+		for (;;)
+		{
 #if defined(VITASX2_QEMU_VALIDATION)
-			m_wait_resume_cache_hits++;
 			m_private_dispatcher_inlined_hot_entries++;
 #endif
 			bool wait_forward = false;
@@ -9581,7 +9646,25 @@ namespace VitaIOP
 			m_private_dispatcher_wait_forwards++;
 			m_wait_resume_event_forwards++;
 #endif
-			continue;
+			if (psxRegs.iopCycleEE <= 0)
+				break;
+
+			// FastForwardCachedIopWaitLoop() reaches a positive remaining budget
+			// only after calling PCSX2's iopEventTest(). That event can change PC,
+			// isolate mode, source ownership, or the retained scheduler context, so
+			// preserve the complete identity check before another descriptor use.
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_wait_resume_post_event_identity_checks++;
+#endif
+			if (!resume_context_matches(false))
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				m_wait_resume_event_fallbacks++;
+#endif
+				ClearWaitResumeBlock();
+				const s32 result = ExecuteProviderTimesliceRemainder();
+				ReturnFromPrivateProviderTimeslice(result);
+			}
 		}
 
 		ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
