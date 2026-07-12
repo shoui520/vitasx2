@@ -838,7 +838,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 
 	while (psxRegs.iopCycleEE > 0)
 	{
-		if ((psxHu32(HW_ICFG) & 8) &&
+		if (!VitaIOP::BlockExecutor::CompiledPs1BiosGateEnabled() &&
+			(psxHu32(HW_ICFG) & 8) &&
 			((psxRegs.pc & 0x1fffffffU) == 0xa0 ||
 			 (psxRegs.pc & 0x1fffffffU) == 0xb0 ||
 			 (psxRegs.pc & 0x1fffffffU) == 0xc0))
@@ -1473,6 +1474,19 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.cached_wait_descriptor_control_transfers_removed =
 		(snapshot.cached_wait_descriptor_opcode_reads_removed +
 		 snapshot.cached_wait_descriptor_unconditional_checks) * 2u;
+	s_iop_a32_stats.compiled_ps1_bios_gate_blocks =
+		snapshot.compiled_ps1_bios_gate_blocks;
+	s_iop_a32_stats.compiled_ps1_bios_gate_entries =
+		snapshot.compiled_ps1_bios_gate_entries;
+	s_iop_a32_stats.dispatcher_ps1_bios_gate_checks_removed =
+		snapshot.dispatcher_ps1_bios_gate_checks_removed;
+	// Product/control disassembly owns the exact instruction attribution. This
+	// lower bound charges only the four always-executed instructions removed
+	// from an ordinary normal-clock dispatcher iteration: iopHw base setup, the
+	// HW_ICFG load, its test, and the skip branch. The PC load is still required
+	// by dispatch and is only rescheduled, so it is deliberately not counted.
+	s_iop_a32_stats.dispatcher_ps1_bios_gate_instructions_removed =
+		snapshot.dispatcher_ps1_bios_gate_checks_removed * 4u;
 	s_iop_a32_stats.inline_wait_fast_forwards = snapshot.inline_wait_fast_forwards;
 	// Product Cortex-A9 disassembly of VitaIopA32FastForwardWaitLoop() saves
 	// r4-r8/LR and returns through the matching POP. The private dispatcher

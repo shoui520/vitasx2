@@ -112,6 +112,9 @@ namespace VitaIOP
 		u64 cached_wait_descriptor_forwards;
 		u64 cached_wait_descriptor_opcode_reads_removed;
 		u64 cached_wait_descriptor_unconditional_checks;
+		u64 compiled_ps1_bios_gate_blocks;
+		u64 compiled_ps1_bios_gate_entries;
+		u64 dispatcher_ps1_bios_gate_checks_removed;
 		u64 inline_wait_fast_forwards;
 		u64 branch_event_candidates;
 		u64 branch_event_budget_positive;
@@ -221,6 +224,7 @@ namespace VitaIOP
 			size_t* linked_entry_offset = nullptr, size_t* provider_entry_offset = nullptr);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
+		bool UsesCompiledPs1BiosGate() const { return m_compiled_ps1_bios_gate; }
 		bool UsesDirectBudgetExit() const { return m_has_budget_exit; }
 		bool UsesConstantCycleBudget() const { return m_defer_cycle_updates; }
 		u32 ClockModeCheckInstructionsRemoved() const { return m_clock_mode_check_instructions_removed; }
@@ -364,6 +368,7 @@ namespace VitaIOP
 		bool EmitWriteCop2DataReg(unsigned cop2_reg, unsigned host_reg);
 		bool EmitCop2LoadStoreOp(u32 op);
 		bool EmitWaitLoopFastForwardBlock(u32 start_pc, u32 block_cycles);
+		bool EmitCompiledPs1BiosGate();
 		bool EmitKnownDirectRamCop2LoadOp(u32 op, u32 address);
 		bool EmitKnownDirectRamCop2StoreOp(u32 op, u32 address);
 		bool FlushColdTails();
@@ -490,6 +495,7 @@ namespace VitaIOP
 		bool m_isolate_cache_guard_stable = false;
 		bool m_isolate_cache_active = false;
 		bool m_writes_isolate_mode = false;
+		bool m_compiled_ps1_bios_gate = false;
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_branch_flags = false;
@@ -552,6 +558,8 @@ namespace VitaIOP
 		static void SetWaitResumeClockEntryEnabled(bool enabled);
 		static void SetWaitResumeNoLinkEntryEnabled(bool enabled);
 		static void SetWaitResumeDescriptorSpecializationEnabled(bool enabled);
+		static void SetCompiledPs1BiosGateEnabled(bool enabled);
+		static bool CompiledPs1BiosGateEnabled();
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -611,6 +619,7 @@ namespace VitaIOP
 			u32 instruction_count = 0;
 			u32 native_instruction_count = 0;
 			u32 helper_instruction_count = 0;
+			bool compiled_ps1_bios_gate = false;
 			u32 pinned_gpr_memory_ops_saved = 0;
 			u32 pinned_branch_operand_moves_removed = 0;
 			u32 condition_code_branch_instructions_removed = 0;
@@ -922,6 +931,9 @@ namespace VitaIOP
 		u64 m_cached_wait_descriptor_forwards = 0;
 		u64 m_cached_wait_descriptor_opcode_reads_removed = 0;
 		u64 m_cached_wait_descriptor_unconditional_checks = 0;
+		u64 m_compiled_ps1_bios_gate_blocks = 0;
+		u64 m_compiled_ps1_bios_gate_entries = 0;
+		u64 m_dispatcher_ps1_bios_gate_checks_removed = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};

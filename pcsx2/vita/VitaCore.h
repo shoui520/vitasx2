@@ -237,6 +237,10 @@ struct VitaA32IopProviderStats
 	u64 cached_wait_descriptor_memory_control_transfers_removed = 0;
 	u64 cached_wait_descriptor_unconditional_checks = 0;
 	u64 cached_wait_descriptor_control_transfers_removed = 0;
+	u64 compiled_ps1_bios_gate_blocks = 0;
+	u64 compiled_ps1_bios_gate_entries = 0;
+	u64 dispatcher_ps1_bios_gate_checks_removed = 0;
+	u64 dispatcher_ps1_bios_gate_instructions_removed = 0;
 	u64 inline_wait_fast_forwards = 0;
 	u64 inline_wait_stack_words_removed = 0;
 	u64 inline_wait_control_transfers_removed = 0;

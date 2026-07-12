@@ -83,6 +83,7 @@ static bool s_qemuIopWaitResumeKindEntryEnabled = true;
 static bool s_qemuIopWaitResumeClockEntryEnabled = true;
 static bool s_qemuIopWaitResumeNoLinkEntryEnabled = true;
 static bool s_qemuIopWaitResumeDescriptorSpecializationEnabled = true;
+static bool s_qemuIopCompiledPs1BiosGateEnabled = true;
 static u64 s_qemuIopInlineWaitFastForwards = 0;
 #endif
 
@@ -1311,7 +1312,10 @@ namespace VitaIOP
 		for (u8 i = 0; i < m_pinned_gpr_count; i++)
 		{
 			const PinnedGpr& pin = m_pinned_gprs[i];
-			if (pin.needs_initial_load)
+			// A compiled BIOS gate runs before guest state becomes private. Its
+			// false arm performs this initial load after the helper; its true arm
+			// returns without loading state which no guest instruction consumes.
+			if (pin.needs_initial_load && !m_compiled_ps1_bios_gate)
 			{
 				if (!m_code.EmitLdrImm12(pin.host, HOST_PSX_REGS,
 						static_cast<u16>(GprOffset(pin.guest))))
@@ -1333,6 +1337,50 @@ namespace VitaIOP
 
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
 			   m_code.EmitBx(HOST_CHAIN_RETURN);
+	}
+
+	bool BlockCompiler::EmitCompiledPs1BiosGate()
+	{
+		// PCSX2 owner: x86/iR3000A.cpp::iopRecRecompile() emits this helper
+		// only for PS1-clock blocks beginning at the A0/B0/C0 BIOS vectors. A
+		// true return goes directly back to the dispatcher before guest work or
+		// cycle charging; a false return continues with helper-observable GPRs
+		// reloaded into the block's private pins.
+		if (!m_code.EmitCallAbsolute(
+				reinterpret_cast<const void*>(&psxBiosCall), HOST_CALL_SCRATCH) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return false;
+		}
+
+		const size_t continue_block =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (continue_block == static_cast<size_t>(-1) ||
+			!EndBlockReturn(BlockExitKind::Direct, false, false))
+		{
+			return false;
+		}
+
+		const size_t continue_offset = m_code.Size();
+		if (!m_code.PatchBranch(
+				continue_block, continue_offset, VitaA32::Condition::EQ))
+		{
+			return false;
+		}
+
+		for (u8 i = 0; i < m_pinned_gpr_count; i++)
+		{
+			const PinnedGpr& pin = m_pinned_gprs[i];
+			if (pin.needs_initial_load &&
+				!m_code.EmitLdrImm12(pin.host, HOST_PSX_REGS,
+					static_cast<u16>(GprOffset(pin.guest))))
+			{
+				return false;
+			}
+			if (pin.needs_initial_load)
+				m_pinned_gpr_initial_loads++;
+		}
+		return true;
 	}
 
 	bool BlockCompiler::EndBlockIsolateModeWriteReturn(
@@ -6266,6 +6314,12 @@ namespace VitaIOP
 		if (direct_links)
 			*direct_links = {};
 
+		const u32 hardware_pc = start_pc & 0x1fffffffu;
+		m_compiled_ps1_bios_gate =
+			BlockExecutor::CompiledPs1BiosGateEnabled() &&
+			(psxHu32(HW_ICFG) & 8u) != 0 &&
+			(hardware_pc == 0xa0u || hardware_pc == 0xb0u || hardware_pc == 0xc0u);
+
 		m_isolate_cache_specialization = true;
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_isolate_cache_specialization = s_qemuIopIsolateCacheSpecializationEnabled;
@@ -6288,7 +6342,8 @@ namespace VitaIOP
 			}
 		}
 
-		if (EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled() &&
+		if (!m_compiled_ps1_bios_gate && EmuConfig.Speedhacks.WaitLoop &&
+			!VitaIsIopPreInstructionTraceEnabled() &&
 			instruction_count >= 2)
 		{
 			const u32 branch_index = instruction_count - 2;
@@ -6421,6 +6476,8 @@ namespace VitaIOP
 		AnalyzeSavedRegisters(start_pc, instruction_count);
 
 		if (!BeginBlock(linked_entry_offset, provider_entry_offset))
+			return false;
+		if (m_compiled_ps1_bios_gate && !EmitCompiledPs1BiosGate())
 			return false;
 
 		std::vector<size_t> direct_exit_branches;
@@ -7037,6 +7094,9 @@ namespace VitaIOP
 		m_cached_wait_descriptor_forwards = 0;
 		m_cached_wait_descriptor_opcode_reads_removed = 0;
 		m_cached_wait_descriptor_unconditional_checks = 0;
+		m_compiled_ps1_bios_gate_blocks = 0;
+		m_compiled_ps1_bios_gate_entries = 0;
+		m_dispatcher_ps1_bios_gate_checks_removed = 0;
 		s_qemuIopInlineWaitFastForwards = 0;
 		s_qemuIopLinkedFrameEvidence = {};
 		s_qemuIopSequentialQwordCopyFastPaths = 0;
@@ -7259,6 +7319,28 @@ namespace VitaIOP
 		s_qemuIopWaitResumeDescriptorSpecializationEnabled = enabled;
 #else
 		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetCompiledPs1BiosGateEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopCompiledPs1BiosGateEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	bool BlockExecutor::CompiledPs1BiosGateEnabled()
+	{
+#if defined(VITASX2_IOP_COMPILED_PS1_BIOS_GATE_CONTROL)
+		return false;
+#elif defined(VITASX2_IOP_COMPILED_PS1_BIOS_GATE_PRODUCT)
+		return true;
+#elif defined(VITASX2_QEMU_VALIDATION)
+		return s_qemuIopCompiledPs1BiosGateEnabled;
+#else
+		return true;
 #endif
 	}
 
@@ -8737,6 +8819,7 @@ namespace VitaIOP
 		size_t block_code_slice_offset = 0;
 		u32 native_instruction_count = 0;
 		u32 helper_instruction_count = 0;
+		bool compiled_ps1_bios_gate = false;
 		u32 pinned_gpr_memory_ops_saved = 0;
 		u32 pinned_branch_operand_moves_removed = 0;
 		u32 condition_code_branch_instructions_removed = 0;
@@ -8794,6 +8877,7 @@ namespace VitaIOP
 				CommitCodeSlice(code_slice_offset, block.code.Size());
 				native_instruction_count = compiler.NativeInstructionCount();
 				helper_instruction_count = compiler.HelperInstructionCount();
+				compiled_ps1_bios_gate = compiler.UsesCompiledPs1BiosGate();
 				pinned_gpr_memory_ops_saved = compiler.PinnedGprMemoryOpsSaved();
 				pinned_branch_operand_moves_removed =
 					compiler.PinnedBranchOperandMovesRemoved();
@@ -8845,6 +8929,11 @@ namespace VitaIOP
 			start_pc, instruction_count, &block.ram_source_start);
 		block.native_instruction_count = native_instruction_count;
 		block.helper_instruction_count = helper_instruction_count;
+		block.compiled_ps1_bios_gate = compiled_ps1_bios_gate;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (compiled_ps1_bios_gate)
+			m_compiled_ps1_bios_gate_blocks++;
+#endif
 		block.pinned_gpr_memory_ops_saved = pinned_gpr_memory_ops_saved;
 		block.pinned_branch_operand_moves_removed =
 			pinned_branch_operand_moves_removed;
@@ -9139,6 +9228,10 @@ namespace VitaIOP
 			m_cached_wait_descriptor_opcode_reads_removed;
 		result->cached_wait_descriptor_unconditional_checks =
 			m_cached_wait_descriptor_unconditional_checks;
+		result->compiled_ps1_bios_gate_blocks = m_compiled_ps1_bios_gate_blocks;
+		result->compiled_ps1_bios_gate_entries = m_compiled_ps1_bios_gate_entries;
+		result->dispatcher_ps1_bios_gate_checks_removed =
+			m_dispatcher_ps1_bios_gate_checks_removed;
 		result->inline_wait_fast_forwards = s_qemuIopInlineWaitFastForwards;
 		result->branch_event_candidates = s_qemuIopBranchEventCandidates;
 		result->branch_event_budget_positive =
@@ -9241,7 +9334,8 @@ namespace VitaIOP
 		// detailed API's redundant psxRegs.pc publication and result aggregate
 		// are unnecessary on this provider-only path.
 		bool wait_forward = false;
-		if (block.wait_loop_shape && block.wait_loop_enabled_at_compile)
+		if (!block.compiled_ps1_bios_gate && block.wait_loop_shape &&
+			block.wait_loop_enabled_at_compile)
 		{
 			if (block.poll_call_wait_loop)
 			{
@@ -9291,6 +9385,8 @@ namespace VitaIOP
 			ClearWaitResumeBlock();
 
 #if defined(VITASX2_QEMU_VALIDATION)
+		if (block.compiled_ps1_bios_gate)
+			m_compiled_ps1_bios_gate_entries++;
 		if (block.direct_budget_exit)
 			m_direct_budget_exit_provider_entries++;
 		if (block.constant_cycle_budget)
@@ -9617,15 +9713,21 @@ namespace VitaIOP
 
 	inline __attribute__((always_inline)) s32 BlockExecutor::ExecuteProviderTimesliceLoop()
 	{
+		const bool compiled_ps1_bios_gate = CompiledPs1BiosGateEnabled();
 		while (psxRegs.iopCycleEE > 0)
 		{
-			if ((psxHu32(HW_ICFG) & 8) &&
+			if (!compiled_ps1_bios_gate && (psxHu32(HW_ICFG) & 8) &&
 				((psxRegs.pc & 0x1fffffffu) == 0xa0 ||
 				 (psxRegs.pc & 0x1fffffffu) == 0xb0 ||
 				 (psxRegs.pc & 0x1fffffffu) == 0xc0))
 			{
 				psxBiosCall();
 			}
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_COMPILED_PS1_BIOS_GATE_PRODUCT)
+			if (compiled_ps1_bios_gate)
+				m_dispatcher_ps1_bios_gate_checks_removed++;
+#endif
 
 			u32 dispatch_flags = 0;
 #if defined(VITASX2_QEMU_VALIDATION)
