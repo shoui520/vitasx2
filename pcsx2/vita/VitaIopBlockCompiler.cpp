@@ -73,6 +73,7 @@ static bool s_qemuIopBlockCycleBatchingEnabled = true;
 static bool s_qemuIopLinkedFrameBypassEnabled = true;
 static bool s_qemuIopSequentialQwordCopyEnabled = true;
 static bool s_qemuIopBranchTestSchedulingEnabled = true;
+static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
 #endif
 
 namespace
@@ -6693,6 +6694,7 @@ namespace VitaIOP
 		m_private_dispatcher_wait_forwards = 0;
 		m_private_dispatcher_generated_entries = 0;
 		m_private_dispatcher_fallbacks = 0;
+		m_private_dispatcher_inlined_hot_entries = 0;
 		s_qemuIopLinkedFrameEvidence = {};
 		s_qemuIopSequentialQwordCopyFastPaths = 0;
 		s_qemuIopBranchEventCandidates = 0;
@@ -6822,6 +6824,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopBranchTestSchedulingEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetPrivateDispatcherHotPathEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopPrivateDispatcherHotPathEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -6964,7 +6975,8 @@ namespace VitaIOP
 		}
 	}
 
-	BlockExecutor::CachedBlock* BlockExecutor::FindHotDispatchCacheBlock(u32 start_pc)
+	inline __attribute__((always_inline)) BlockExecutor::CachedBlock*
+	BlockExecutor::FindHotDispatchCacheBlockInline(u32 start_pc)
 	{
 		auto& set = m_hot_dispatch_cache[m_active_isolate_cache_mode ? 1 : 0]
 			[HotDispatchCacheIndex(start_pc)];
@@ -6982,6 +6994,11 @@ namespace VitaIOP
 			return entry.block;
 		}
 		return nullptr;
+	}
+
+	BlockExecutor::CachedBlock* BlockExecutor::FindHotDispatchCacheBlock(u32 start_pc)
+	{
+		return FindHotDispatchCacheBlockInline(start_pc);
 	}
 
 	void BlockExecutor::ClearHotDispatchCache()
@@ -8430,6 +8447,8 @@ namespace VitaIOP
 		result->private_dispatcher_wait_forwards = m_private_dispatcher_wait_forwards;
 		result->private_dispatcher_generated_entries = m_private_dispatcher_generated_entries;
 		result->private_dispatcher_fallbacks = m_private_dispatcher_fallbacks;
+		result->private_dispatcher_inlined_hot_entries =
+			m_private_dispatcher_inlined_hot_entries;
 		result->branch_event_candidates = s_qemuIopBranchEventCandidates;
 		result->branch_event_budget_positive =
 			s_qemuIopBranchEventBudgetPositive;
@@ -8519,7 +8538,8 @@ namespace VitaIOP
 		return true;
 	}
 
-	u32 BlockExecutor::RunProviderBlock(CachedBlock& block, u32 dispatch_flags)
+	inline __attribute__((always_inline)) u32 BlockExecutor::RunProviderBlockInline(
+		CachedBlock& block, u32 dispatch_flags)
 	{
 		if (!block.valid)
 			return 0;
@@ -8592,6 +8612,11 @@ namespace VitaIOP
 		}
 
 		return dispatch_flags | ProviderDispatchSuccess;
+	}
+
+	u32 BlockExecutor::RunProviderBlock(CachedBlock& block, u32 dispatch_flags)
+	{
+		return RunProviderBlockInline(block, dispatch_flags);
 	}
 
 	bool BlockExecutor::ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
@@ -8713,12 +8738,10 @@ namespace VitaIOP
 		return ExecuteCompiledBlock(start_pc, scan.instruction_count, result, publish_details);
 	}
 
-	inline __attribute__((always_inline)) u32 BlockExecutor::ExecuteProviderBlockAtPcInline(
-		u32 start_pc, ProviderCompileResult* compile_result)
+	__attribute__((noinline, cold)) BlockExecutor::CachedBlock*
+	BlockExecutor::FindProviderBlockAtPcSlow(
+		u32 start_pc, ProviderCompileResult* compile_result, u32* dispatch_flags)
 	{
-		if ((start_pc & 0x3u) != 0)
-			return 0;
-
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto publish_profile_metadata = [compile_result](const CachedBlock& block) {
 			if (!compile_result)
@@ -8730,11 +8753,84 @@ namespace VitaIOP
 		};
 #endif
 
-		// This is the compact provider counterpart of ExecuteCompiledBlockAtPc().
-		// Hot dispatch state returns in r0 as one flag word. Product code writes
-		// the four-word metadata object only after a cold compile; QEMU also fills
-		// it on hits for the hot-PC report.
-		if (CachedBlock* entry = FindHotDispatchCacheBlock(start_pc))
+		if (CachedBlock* entry = FindLookupBlockByStartPc(
+				start_pc, m_active_isolate_cache_mode))
+		{
+			if (entry->valid && ValidateCachedBlock(*entry))
+			{
+				RegisterHotDispatchCache(*entry);
+#if defined(VITASX2_QEMU_VALIDATION)
+				publish_profile_metadata(*entry);
+#endif
+				*dispatch_flags =
+					ProviderDispatchCacheHit | ProviderDispatchLookupHit |
+					ProviderDispatchFastHit;
+				return entry;
+			}
+		}
+
+		if (CachedBlock* entry = FindRecordedBlockByStartPc(
+				start_pc, 0, false, m_active_isolate_cache_mode))
+		{
+			RegisterHotDispatchCache(*entry);
+#if defined(VITASX2_QEMU_VALIDATION)
+			publish_profile_metadata(*entry);
+#endif
+			*dispatch_flags = ProviderDispatchCacheHit | ProviderDispatchFastHit;
+			return entry;
+		}
+
+		BlockScanResult scan;
+		if (!ScanStraightLineBlock(start_pc, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
+			scan.instruction_count == 0)
+		{
+			return nullptr;
+		}
+
+		CachedBlock* block = AllocateCacheEntry();
+		if (!block || !CompileIntoCacheEntry(*block, start_pc, scan.instruction_count))
+			return nullptr;
+
+		if (compile_result)
+		{
+			compile_result->instruction_count = block->instruction_count;
+			compile_result->native_instruction_count = block->native_instruction_count;
+			compile_result->helper_instruction_count = block->helper_instruction_count;
+			compile_result->code_cache_resets = m_code_cache_resets;
+		}
+		*dispatch_flags = 0;
+		return block;
+	}
+
+	inline __attribute__((always_inline)) u32 BlockExecutor::ExecuteProviderBlockAtPcInline(
+		u32 start_pc, ProviderCompileResult* compile_result)
+	{
+		if ((start_pc & 0x3u) != 0)
+			return 0;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		const bool inline_hot_path = s_qemuIopPrivateDispatcherHotPathEnabled;
+		const auto publish_profile_metadata = [compile_result](const CachedBlock& block) {
+			if (!compile_result)
+				return;
+			compile_result->instruction_count = block.instruction_count;
+			compile_result->native_instruction_count = block.native_instruction_count;
+			compile_result->helper_instruction_count = block.helper_instruction_count;
+			compile_result->code_cache_resets = 0;
+		};
+		CachedBlock* entry = inline_hot_path ?
+			FindHotDispatchCacheBlockInline(start_pc) :
+			FindHotDispatchCacheBlock(start_pc);
+#else
+		CachedBlock* entry = FindHotDispatchCacheBlockInline(start_pc);
+#endif
+		u32 dispatch_flags = 0;
+
+		// PCSX2's PSX_GETBLOCK()/DispatcherReg pair performs one exact LUT lookup
+		// and enters generated code without crossing a C ABI. Keep the analogous
+		// two-way Vita lookup and the one shared execution body in this private
+		// dispatcher; every page/search/scan/compile operation is cold.
+		if (entry)
 		{
 			bool trust_raw_source = (entry->raw_opcodes != nullptr);
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -8747,61 +8843,34 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 				m_hot_dispatch_cache_hits++;
 				publish_profile_metadata(*entry);
+				if (inline_hot_path)
+					m_private_dispatcher_inlined_hot_entries++;
 #endif
-				return RunProviderBlock(*entry,
-					ProviderDispatchCacheHit | ProviderDispatchLookupHit |
-					ProviderDispatchFastHit);
+				dispatch_flags = ProviderDispatchCacheHit |
+					ProviderDispatchLookupHit | ProviderDispatchFastHit;
 			}
-		}
-#if defined(VITASX2_QEMU_VALIDATION)
-		m_hot_dispatch_cache_misses++;
-#endif
-
-		if (CachedBlock* entry = FindLookupBlockByStartPc(
-				start_pc, m_active_isolate_cache_mode))
-		{
-			if (entry->valid && ValidateCachedBlock(*entry))
+			else
 			{
-				RegisterHotDispatchCache(*entry);
-#if defined(VITASX2_QEMU_VALIDATION)
-				publish_profile_metadata(*entry);
-#endif
-				return RunProviderBlock(*entry,
-					ProviderDispatchCacheHit | ProviderDispatchLookupHit |
-					ProviderDispatchFastHit);
+				entry = nullptr;
 			}
 		}
 
-		if (CachedBlock* entry = FindRecordedBlockByStartPc(
-				start_pc, 0, false, m_active_isolate_cache_mode))
+		if (!entry)
 		{
-			RegisterHotDispatchCache(*entry);
 #if defined(VITASX2_QEMU_VALIDATION)
-			publish_profile_metadata(*entry);
+			m_hot_dispatch_cache_misses++;
 #endif
-			return RunProviderBlock(*entry,
-				ProviderDispatchCacheHit | ProviderDispatchFastHit);
+			entry = FindProviderBlockAtPcSlow(
+				start_pc, compile_result, &dispatch_flags);
+			if (!entry)
+				return 0;
 		}
 
-		BlockScanResult scan;
-		if (!ScanStraightLineBlock(start_pc, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
-			scan.instruction_count == 0)
-		{
-			return 0;
-		}
-
-		CachedBlock* block = AllocateCacheEntry();
-		if (!block || !CompileIntoCacheEntry(*block, start_pc, scan.instruction_count))
-			return 0;
-
-		if (compile_result)
-		{
-			compile_result->instruction_count = block->instruction_count;
-			compile_result->native_instruction_count = block->native_instruction_count;
-			compile_result->helper_instruction_count = block->helper_instruction_count;
-			compile_result->code_cache_resets = m_code_cache_resets;
-		}
-		return RunProviderBlock(*block, 0);
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!inline_hot_path)
+			return RunProviderBlock(*entry, dispatch_flags);
+#endif
+		return RunProviderBlockInline(*entry, dispatch_flags);
 	}
 
 	u32 BlockExecutor::ExecuteProviderBlockAtPc(

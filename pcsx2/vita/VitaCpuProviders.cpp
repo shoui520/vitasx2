@@ -1138,6 +1138,11 @@ void VitaSetA32IopPrivateDispatcherEnabled(bool enabled)
 {
 	s_iop_a32_private_dispatcher_enabled = enabled;
 }
+
+void VitaSetA32IopPrivateHotPathEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetPrivateDispatcherHotPathEnabled(enabled);
+}
 #endif
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
@@ -1233,6 +1238,12 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	// epilogue, and any optimizer-visible state reuse from this lower bound.
 	s_iop_a32_stats.private_dispatcher_control_transfers_removed =
 		snapshot.private_dispatcher_provider_entries * 2u;
+	s_iop_a32_stats.private_dispatcher_inlined_hot_entries =
+		snapshot.private_dispatcher_inlined_hot_entries;
+	// PCSX2's dispatcher performs neither C++ call: each inlined exact hit
+	// removes the caller BL and callee return for both lookup and execution.
+	s_iop_a32_stats.private_dispatcher_hot_path_control_transfers_removed =
+		snapshot.private_dispatcher_inlined_hot_entries * 4u;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved =
 		snapshot.total_pinned_gpr_memory_ops_saved;
 	s_iop_a32_stats.pinned_branch_operand_moves_removed =

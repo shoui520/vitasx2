@@ -80,6 +80,7 @@ namespace VitaIOP
 		u64 private_dispatcher_wait_forwards;
 		u64 private_dispatcher_generated_entries;
 		u64 private_dispatcher_fallbacks;
+		u64 private_dispatcher_inlined_hot_entries;
 		u64 branch_event_candidates;
 		u64 branch_event_budget_positive;
 		u64 branch_event_tests_entered;
@@ -482,6 +483,7 @@ namespace VitaIOP
 		static void SetLinkedFrameBypassEnabled(bool enabled);
 		static void SetSequentialQwordCopyEnabled(bool enabled);
 		static void SetBranchTestSchedulingEnabled(bool enabled);
+		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -612,6 +614,8 @@ namespace VitaIOP
 		void RegisterHotDispatchCache(CachedBlock& block);
 		void UnregisterHotDispatchCache(CachedBlock& block);
 		CachedBlock* FindHotDispatchCacheBlock(u32 start_pc);
+		inline __attribute__((always_inline)) CachedBlock* FindHotDispatchCacheBlockInline(
+			u32 start_pc);
 		void ClearHotDispatchCache();
 		void ReleaseLookupPages();
 		void RegisterRamSource(CachedBlock& block);
@@ -651,6 +655,10 @@ namespace VitaIOP
 		void PublishExecutionDetails(const CachedBlock& block, BlockExecutionResult* result) const;
 		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result, bool publish_details);
 		u32 RunProviderBlock(CachedBlock& block, u32 dispatch_flags);
+		inline __attribute__((always_inline)) u32 RunProviderBlockInline(
+			CachedBlock& block, u32 dispatch_flags);
+		__attribute__((noinline, cold)) CachedBlock* FindProviderBlockAtPcSlow(
+			u32 start_pc, ProviderCompileResult* compile_result, u32* dispatch_flags);
 		inline __attribute__((always_inline)) u32 ExecuteProviderBlockAtPcInline(
 			u32 start_pc, ProviderCompileResult* compile_result);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
@@ -712,6 +720,7 @@ namespace VitaIOP
 		u64 m_private_dispatcher_wait_forwards = 0;
 		u64 m_private_dispatcher_generated_entries = 0;
 		u64 m_private_dispatcher_fallbacks = 0;
+		u64 m_private_dispatcher_inlined_hot_entries = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};
