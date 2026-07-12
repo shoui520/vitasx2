@@ -1121,6 +1121,17 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 		snapshot.sequential_qword_copy_fast_paths;
 	s_iop_a32_stats.sequential_qword_copy_instructions_removed =
 		snapshot.sequential_qword_copy_instructions_removed;
+	s_iop_a32_stats.branch_event_candidates = snapshot.branch_event_candidates;
+	s_iop_a32_stats.branch_event_budget_positive =
+		snapshot.branch_event_budget_positive;
+	s_iop_a32_stats.branch_event_tests_entered = snapshot.branch_event_tests_entered;
+	s_iop_a32_stats.budget_before_event_fast_exits =
+		snapshot.budget_before_event_fast_exits;
+	s_iop_a32_stats.budget_before_event_instructions_removed =
+		snapshot.budget_before_event_instructions_removed;
+	s_iop_a32_stats.event_deadline_fast_skips = snapshot.event_deadline_fast_skips;
+	s_iop_a32_stats.event_deadline_instructions_removed =
+		snapshot.event_deadline_instructions_removed;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved = s_iop_a32_pinned_gpr_memory_ops_saved;
 	s_iop_a32_stats.pinned_branch_operand_moves_removed =
 		s_iop_a32_pinned_branch_operand_moves_removed;

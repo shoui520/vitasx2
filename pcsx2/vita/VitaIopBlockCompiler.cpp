@@ -56,6 +56,9 @@ struct QemuIopLinkedFrameEvidence
 };
 static QemuIopLinkedFrameEvidence s_qemuIopLinkedFrameEvidence;
 static u32 s_qemuIopSequentialQwordCopyFastPaths = 0;
+static u32 s_qemuIopBranchEventCandidates = 0;
+static u32 s_qemuIopBranchEventBudgetPositive = 0;
+static u32 s_qemuIopBranchEventTestsEntered = 0;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
 static bool s_qemuIopPinnedGprResidencyEnabled = true;
 static bool s_qemuIopPinnedBranchDirectCompareEnabled = true;
@@ -69,6 +72,7 @@ static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
 static bool s_qemuIopLinkedFrameBypassEnabled = true;
 static bool s_qemuIopSequentialQwordCopyEnabled = true;
+static bool s_qemuIopBranchTestSchedulingEnabled = true;
 #endif
 
 namespace
@@ -1192,12 +1196,13 @@ namespace VitaIOP
 			EndBlockReturn(BlockExitKind::IsolateModeWrite, false, false);
 	}
 
-	bool BlockCompiler::EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot)
+	bool BlockCompiler::EndBlockDirectTail(const void* direct_exit,
+		DirectLinkSlot* direct_link_slot, bool charge_budget)
 	{
 		if (!direct_exit)
 			return false;
 
-		if (!EmitFlushPinnedGprs() || !EmitChargeEeBudget())
+		if (!EmitFlushPinnedGprs() || (charge_budget && !EmitChargeEeBudget()))
 		{
 			return false;
 		}
@@ -2113,9 +2118,10 @@ namespace VitaIOP
 			m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET));
 	}
 
-	bool BlockCompiler::EmitChargeEeBudget(u32 known_cycle_count)
+	bool BlockCompiler::EmitChargeEeBudget(u32 known_cycle_count, bool pins_flushed)
 	{
-		if (!m_direct_exit_branches || !m_budget_exit_branches)
+		if (!m_direct_exit_branches || !m_budget_exit_branches ||
+			!m_unflushed_budget_exit_branches)
 			return false;
 		m_has_budget_exit = true;
 
@@ -2123,10 +2129,12 @@ namespace VitaIOP
 		// budget subtraction flags live for iPsxBranchTest()'s xJLE. A32 STR
 		// also preserves those flags, so branch on LE directly instead of
 		// materializing and retesting a temporary Boolean.
-		const auto emit_budget_exit_from_signed_flags = [this]() {
-			m_budget_exit_branches->push_back(
+		const auto emit_budget_exit_from_signed_flags = [this, pins_flushed]() {
+			std::vector<size_t>* exits = pins_flushed ?
+				m_budget_exit_branches : m_unflushed_budget_exit_branches;
+			exits->push_back(
 				m_code.EmitBranchPlaceholder(VitaA32::Condition::LE));
-			return m_budget_exit_branches->back() != static_cast<size_t>(-1);
+			return exits->back() != static_cast<size_t>(-1);
 		};
 
 		const u32 known_block_cycles = known_cycle_count != 0 ? known_cycle_count :
@@ -5060,8 +5068,80 @@ namespace VitaIOP
 		return m_code.PatchBranch(skip_helper, m_code.Size());
 	}
 
+	bool BlockCompiler::BranchTestSchedulingEnabled() const
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		return s_qemuIopBranchTestSchedulingEnabled;
+#else
+		return true;
+#endif
+	}
+
+	bool BlockCompiler::EmitQemuCounterIncrement(u32* counter)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		return counter &&
+			m_code.EmitMovImm32(HOST_TMP2,
+				static_cast<u32>(reinterpret_cast<uptr>(counter))) &&
+			m_code.EmitLdrImm12(HOST_TMP3, HOST_TMP2, 0) &&
+			m_code.EmitAddImm8(HOST_TMP3, HOST_TMP3, 1) &&
+			m_code.EmitStrImm12(HOST_TMP3, HOST_TMP2, 0);
+#else
+		(void)counter;
+		return true;
+#endif
+	}
+
+	bool BlockCompiler::EmitBranchEventTest()
+	{
+		// PCSX2 owner: x86/iR3000A.cpp::iPsxBranchTest() subtracts the
+		// completed block from iopCycleEE and exits on <= 0 before checking any
+		// IOP event. Keep dirty pins private until that decision; the dedicated
+		// budget-exit tail publishes them only on the exiting path.
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!EmitQemuCounterIncrement(&s_qemuIopBranchEventCandidates))
+			return false;
+#endif
+		if (BranchTestSchedulingEnabled() && !EmitChargeEeBudget(0, false))
+			return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!EmitQemuCounterIncrement(&s_qemuIopBranchEventBudgetPositive))
+			return false;
+#endif
+
+		if (!BranchTestSchedulingEnabled())
+			return EmitIopEventTestFastPath();
+
+		// PCSX2's next iPsxBranchTest() seam compares the completed 64-bit IOP
+		// cycle against iopNextEventCycle and enters iopEventTest() only when
+		// due. SUBS/SBCS plus MI reproduces x86's signed 64-bit SUB/JS test.
+		if (!(m_code.EmitAddImm32(HOST_CALL_SCRATCH, HOST_PSX_REGS,
+				static_cast<u32>(CYCLE_OFFSET)) ||
+				(m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+					static_cast<u32>(CYCLE_OFFSET)) &&
+				 m_code.EmitAddReg(HOST_CALL_SCRATCH, HOST_PSX_REGS,
+					HOST_CALL_SCRATCH))) ||
+			!m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, HOST_CALL_SCRATCH, 0) ||
+			!m_code.EmitLdrdImm8(HOST_TMP2, HOST_TMP3, HOST_CALL_SCRATCH,
+				static_cast<u8>(IOP_NEXT_EVENT_CYCLE_FROM_CYCLE_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP2, true) ||
+			!m_code.EmitSbcReg(HOST_TMP1, HOST_TMP1, HOST_TMP3, true))
+		{
+			return false;
+		}
+		const size_t not_due =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::MI);
+		return not_due != static_cast<size_t>(-1) &&
+			EmitIopEventTestFastPath() &&
+			m_code.PatchBranch(not_due, m_code.Size(), VitaA32::Condition::MI);
+	}
+
 	bool BlockCompiler::EmitIopEventTestFastPath()
 	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!EmitQemuCounterIncrement(&s_qemuIopBranchEventTestsEntered))
+			return false;
+#endif
 		struct HelperBranch
 		{
 			size_t offset;
@@ -6192,11 +6272,14 @@ namespace VitaIOP
 		std::vector<size_t> direct_exit_branches;
 		std::vector<size_t> trace_exit_branches;
 		std::vector<size_t> budget_exit_branches;
+		std::vector<size_t> unflushed_budget_exit_branches;
 		m_direct_exit_branches = &direct_exit_branches;
 		m_budget_exit_branches = &budget_exit_branches;
+		m_unflushed_budget_exit_branches = &unflushed_budget_exit_branches;
 		direct_exit_branches.reserve(instruction_count * 2);
 		trace_exit_branches.reserve(instruction_count);
 		budget_exit_branches.reserve(4);
+		unflushed_budget_exit_branches.reserve(2);
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
 		bool can_direct_link_fallthrough = true;
@@ -6300,16 +6383,18 @@ namespace VitaIOP
 				EndBlockIsolateModeWriteReturn(charge_budget, flush_pins) :
 				EndBlockReturn(BlockExitKind::Direct, charge_budget, flush_pins);
 		};
+		const bool branch_test_scheduling = BranchTestSchedulingEnabled();
 		size_t direct_exit_offset = 0;
 		const bool emit_link_tail = direct_exit && direct_links && can_direct_link_fallthrough &&
 			!m_writes_isolate_mode;
 		const bool emit_branch_link_tails = direct_exit && direct_links && has_native_static_branch &&
 			!m_writes_isolate_mode;
-		const auto emit_direct_or_return_tail = [&](u32 target_pc, u8 slot_index) -> bool {
+		const auto emit_direct_or_return_tail = [&](u32 target_pc, u8 slot_index,
+			bool charge_budget = true) -> bool {
 			if (emit_branch_link_tails)
 			{
 				DirectLinkSlot& link = direct_links->slots[slot_index];
-				if (!EndBlockDirectTail(direct_exit, &link))
+				if (!EndBlockDirectTail(direct_exit, &link, charge_budget))
 					return false;
 
 				link.target_pc = target_pc;
@@ -6317,7 +6402,7 @@ namespace VitaIOP
 				return true;
 			}
 
-			return end_completion_return();
+			return end_completion_return(charge_budget);
 		};
 
 		if (has_native_static_branch)
@@ -6333,13 +6418,14 @@ namespace VitaIOP
 					return false;
 
 				if (m_static_branch_taken &&
-					(!EmitIopEventTestFastPath() ||
+					(!EmitBranchEventTest() ||
 						!EmitPcChangedExitCheck(target_pc, direct_exit_branches)))
 				{
 					return false;
 				}
 
-				if (!emit_direct_or_return_tail(target_pc, link_slot))
+				if (!emit_direct_or_return_tail(target_pc, link_slot,
+						!m_static_branch_taken || !branch_test_scheduling))
 					return false;
 
 				direct_exit_offset = m_code.Size();
@@ -6377,9 +6463,10 @@ namespace VitaIOP
 					(m_static_branch_flags_live &&
 						!EmitPublishCyclePrefix(instruction_count)) ||
 					!EmitStorePc(static_branch_target_pc) ||
-					!EmitIopEventTestFastPath() ||
+					!EmitBranchEventTest() ||
 					!EmitPcChangedExitCheck(static_branch_target_pc, direct_exit_branches) ||
-					!emit_direct_or_return_tail(static_branch_target_pc, 1))
+					!emit_direct_or_return_tail(static_branch_target_pc, 1,
+						!branch_test_scheduling))
 				{
 					return false;
 				}
@@ -6392,7 +6479,7 @@ namespace VitaIOP
 		else if (has_native_static_jump)
 		{
 			if (!EmitStorePc(static_jump_target_pc) ||
-				!EmitIopEventTestFastPath() ||
+				!EmitBranchEventTest() ||
 				!EmitPcChangedExitCheck(static_jump_target_pc, direct_exit_branches))
 			{
 				return false;
@@ -6401,13 +6488,13 @@ namespace VitaIOP
 			if (direct_exit && direct_links && !m_writes_isolate_mode)
 			{
 				DirectLinkSlot& link = direct_links->slots[0];
-				if (!EndBlockDirectTail(direct_exit, &link))
+				if (!EndBlockDirectTail(direct_exit, &link, !branch_test_scheduling))
 					return false;
 
 				link.target_pc = static_jump_target_pc;
 				link.valid = true;
 			}
-			else if (!end_completion_return())
+			else if (!end_completion_return(!branch_test_scheduling))
 			{
 				return false;
 			}
@@ -6421,7 +6508,7 @@ namespace VitaIOP
 			if (m_register_jump_target_known)
 			{
 				if (!EmitStorePc(m_register_jump_target) ||
-					!EmitIopEventTestFastPath() ||
+					!EmitBranchEventTest() ||
 					!EmitPcChangedExitCheck(m_register_jump_target, direct_exit_branches))
 				{
 					return false;
@@ -6430,13 +6517,13 @@ namespace VitaIOP
 				if (direct_exit && direct_links && !m_writes_isolate_mode)
 				{
 					DirectLinkSlot& link = direct_links->slots[0];
-					if (!EndBlockDirectTail(direct_exit, &link))
+					if (!EndBlockDirectTail(direct_exit, &link, !branch_test_scheduling))
 						return false;
 
 					link.target_pc = m_register_jump_target;
 					link.valid = true;
 				}
-				else if (!end_completion_return())
+				else if (!end_completion_return(!branch_test_scheduling))
 				{
 					return false;
 				}
@@ -6444,9 +6531,9 @@ namespace VitaIOP
 			else
 			{
 				if (!EmitStorePcReg(HOST_REGISTER_JUMP_TARGET) ||
-					!EmitIopEventTestFastPath() ||
+					!EmitBranchEventTest() ||
 					!EmitPcChangedExitCheckReg(HOST_REGISTER_JUMP_TARGET, direct_exit_branches) ||
-					!end_completion_return())
+					!end_completion_return(!branch_test_scheduling))
 				{
 					return false;
 				}
@@ -6499,10 +6586,34 @@ namespace VitaIOP
 		if (!EmitSourcePageLiteralPool() || !FlushColdTails())
 			return false;
 
+		// Budget-before-event exits and event-driven PC changes occur before the
+		// ordinary direct-link tail publishes dirty pins. Give those paths one
+		// shared state-owning return. The former code sent PC-change exits to a
+		// post-flush return even though the skipped main tail had not flushed.
+		const bool needs_unflushed_state_exit =
+			!direct_exit_branches.empty() || !unflushed_budget_exit_branches.empty();
+		const size_t unflushed_state_exit_offset =
+			needs_unflushed_state_exit ? m_code.Size() : direct_exit_offset;
+		if (needs_unflushed_state_exit &&
+			(!EmitFlushPinnedGprs() || !end_completion_return(false, false)))
+		{
+			return false;
+		}
 		for (const size_t branch_offset : direct_exit_branches)
 		{
-			if (!m_code.PatchBranch(branch_offset, direct_exit_offset, VitaA32::Condition::NE))
+			if (!m_code.PatchBranch(branch_offset, unflushed_state_exit_offset,
+					VitaA32::Condition::NE))
+			{
 				return false;
+			}
+		}
+		for (const size_t branch_offset : unflushed_budget_exit_branches)
+		{
+			if (!m_code.PatchBranch(branch_offset, unflushed_state_exit_offset,
+					VitaA32::Condition::LE))
+			{
+				return false;
+			}
 		}
 
 		// Trace callbacks and early branch-helper budget checks publish the state
@@ -6528,6 +6639,7 @@ namespace VitaIOP
 		}
 		m_direct_exit_branches = nullptr;
 		m_budget_exit_branches = nullptr;
+		m_unflushed_budget_exit_branches = nullptr;
 		return true;
 	}
 
@@ -6580,6 +6692,9 @@ namespace VitaIOP
 		m_expanded_cycle_batching_provider_entries = 0;
 		s_qemuIopLinkedFrameEvidence = {};
 		s_qemuIopSequentialQwordCopyFastPaths = 0;
+		s_qemuIopBranchEventCandidates = 0;
+		s_qemuIopBranchEventBudgetPositive = 0;
+		s_qemuIopBranchEventTestsEntered = 0;
 #endif
 	}
 
@@ -6695,6 +6810,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopSequentialQwordCopyEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetBranchTestSchedulingEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopBranchTestSchedulingEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -8279,6 +8403,27 @@ namespace VitaIOP
 		// differences, the rare source-page Clear call, and every cold fallback.
 		result->sequential_qword_copy_instructions_removed =
 			static_cast<u64>(s_qemuIopSequentialQwordCopyFastPaths) * 36u;
+		result->branch_event_candidates = s_qemuIopBranchEventCandidates;
+		result->branch_event_budget_positive =
+			s_qemuIopBranchEventBudgetPositive;
+		result->branch_event_tests_entered = s_qemuIopBranchEventTestsEntered;
+		result->budget_before_event_fast_exits =
+			s_qemuIopBranchEventCandidates >= s_qemuIopBranchEventBudgetPositive ?
+				s_qemuIopBranchEventCandidates - s_qemuIopBranchEventBudgetPositive : 0;
+		// Before its first possible helper branch, the old product event path
+		// always scheduled iopNextEventCycle and tested the counter deadline.
+		// Twelve A32 instructions is a lower bound for that removed prefix and
+		// excludes all later INTC/device work and QEMU-only counters.
+		result->budget_before_event_instructions_removed =
+			result->budget_before_event_fast_exits * 12u;
+		result->event_deadline_fast_skips =
+			s_qemuIopBranchEventBudgetPositive >= s_qemuIopBranchEventTestsEntered ?
+				s_qemuIopBranchEventBudgetPositive - s_qemuIopBranchEventTestsEntered : 0;
+		// The focused control emits a six-instruction due guard. Charge a
+		// conservative seven-instruction allowance against the twelve-instruction
+		// event prefix and attribute only the five-instruction net lower bound.
+		result->event_deadline_instructions_removed =
+			result->event_deadline_fast_skips * 5u;
 	}
 #endif
 

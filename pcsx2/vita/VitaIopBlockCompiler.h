@@ -75,6 +75,13 @@ namespace VitaIOP
 		u64 linked_frame_stack_words_removed;
 		u64 sequential_qword_copy_fast_paths;
 		u64 sequential_qword_copy_instructions_removed;
+		u64 branch_event_candidates;
+		u64 branch_event_budget_positive;
+		u64 branch_event_tests_entered;
+		u64 budget_before_event_fast_exits;
+		u64 budget_before_event_instructions_removed;
+		u64 event_deadline_fast_skips;
+		u64 event_deadline_instructions_removed;
 		u32 pinned_gpr_memory_ops_saved;
 		u32 pinned_branch_operand_moves_removed;
 		u32 condition_code_branch_instructions_removed;
@@ -168,7 +175,8 @@ namespace VitaIOP
 			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockIsolateModeWriteReturn(bool charge_budget = true,
 			bool flush_pins = true, u32 known_cycle_count = 0);
-		bool EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot);
+		bool EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot,
+			bool charge_budget = true);
 		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& trace_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op, u32 pc);
@@ -215,7 +223,10 @@ namespace VitaIOP
 		u32 CurrentTimingHelperSeamCount() const;
 		void RecordBatchedCycleExitSavings(u32 cycle_prefix, bool preserves_argument);
 		bool EmitIncrementCycle();
-		bool EmitChargeEeBudget(u32 known_cycle_count = 0);
+		bool EmitChargeEeBudget(u32 known_cycle_count = 0, bool pins_flushed = true);
+		bool BranchTestSchedulingEnabled() const;
+		bool EmitBranchEventTest();
+		bool EmitQemuCounterIncrement(u32* counter);
 		bool EmitChargeEeBudgetPs1(u32 known_block_cycles);
 		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
 		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches);
@@ -364,6 +375,7 @@ namespace VitaIOP
 		u32 m_pinned_gpr_min_exit_savings = UINT32_MAX;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
+		std::vector<size_t>* m_unflushed_budget_exit_branches = nullptr;
 		u32 m_block_cycle_count = 0;
 		u32 m_clock_mode_check_instructions_removed = 0;
 		u32 m_saved_register_stack_words_removed = 0;
@@ -434,6 +446,7 @@ namespace VitaIOP
 		static void SetBlockCycleBatchingEnabled(bool enabled);
 		static void SetLinkedFrameBypassEnabled(bool enabled);
 		static void SetSequentialQwordCopyEnabled(bool enabled);
+		static void SetBranchTestSchedulingEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
