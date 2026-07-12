@@ -1143,6 +1143,11 @@ void VitaSetA32IopPrivateHotPathEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetPrivateDispatcherHotPathEnabled(enabled);
 }
+
+void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetCachedWaitDescriptorEnabled(enabled);
+}
 #endif
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
@@ -1244,6 +1249,19 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	// removes the caller BL and callee return for both lookup and execution.
 	s_iop_a32_stats.private_dispatcher_hot_path_control_transfers_removed =
 		snapshot.private_dispatcher_inlined_hot_entries * 4u;
+	s_iop_a32_stats.cached_wait_descriptor_checks = snapshot.cached_wait_descriptor_checks;
+	s_iop_a32_stats.cached_wait_descriptor_forwards = snapshot.cached_wait_descriptor_forwards;
+	s_iop_a32_stats.cached_wait_descriptor_opcode_reads_removed =
+		snapshot.cached_wait_descriptor_opcode_reads_removed;
+	// Every retired iopMemRead32() opcode fetch crossed AAPCS in both
+	// directions. Exclude its address translation and memory work.
+	s_iop_a32_stats.cached_wait_descriptor_memory_control_transfers_removed =
+		snapshot.cached_wait_descriptor_opcode_reads_removed * 2u;
+	s_iop_a32_stats.cached_wait_descriptor_unconditional_checks =
+		snapshot.cached_wait_descriptor_unconditional_checks;
+	s_iop_a32_stats.cached_wait_descriptor_control_transfers_removed =
+		(snapshot.cached_wait_descriptor_opcode_reads_removed +
+		 snapshot.cached_wait_descriptor_unconditional_checks) * 2u;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved =
 		snapshot.total_pinned_gpr_memory_ops_saved;
 	s_iop_a32_stats.pinned_branch_operand_moves_removed =

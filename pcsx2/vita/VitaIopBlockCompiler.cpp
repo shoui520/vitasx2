@@ -74,6 +74,7 @@ static bool s_qemuIopLinkedFrameBypassEnabled = true;
 static bool s_qemuIopSequentialQwordCopyEnabled = true;
 static bool s_qemuIopBranchTestSchedulingEnabled = true;
 static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
+static bool s_qemuIopCachedWaitDescriptorEnabled = true;
 #endif
 
 namespace
@@ -168,10 +169,12 @@ namespace
 		return ((pc + 4) & 0xf0000000u) | ((op & 0x03ffffffu) << 2);
 	}
 
-	bool IsIopWaitLoopShape(u32 start_pc, u32 instruction_count)
+	bool AnalyzeIopWaitLoopShape(
+		u32 start_pc, u32 instruction_count, VitaIOP::WaitLoopDescriptor* descriptor)
 	{
-		if (instruction_count < 2)
+		if (!descriptor || instruction_count < 2)
 			return false;
+		*descriptor = {};
 
 		const u32 branch_index = instruction_count - 2;
 		const u32 branch_pc = start_pc + branch_index * 4;
@@ -183,16 +186,60 @@ namespace
 		}
 
 		const u32 primary = branch_op >> 26;
-		if (primary == 0x02 || primary == 0x03)
-			return JumpTarget(branch_pc, branch_op) == start_pc;
-		if (primary >= 0x04 && primary <= 0x07)
-			return BranchTarget(branch_pc, branch_op) == start_pc;
-		if (primary != 0x01)
-			return false;
+		descriptor->cycles = static_cast<u8>(instruction_count);
+		descriptor->rs = static_cast<u8>(RS(branch_op));
+		descriptor->rt = static_cast<u8>(RT(branch_op));
+		switch (primary)
+		{
+			case 0x01:
+				if (BranchTarget(branch_pc, branch_op) != start_pc)
+					return false;
+				switch (RT(branch_op))
+				{
+					case 0x00:
+						descriptor->condition = VitaIOP::WaitLoopCondition::LessThanZero;
+						break;
+					case 0x01:
+						descriptor->condition = VitaIOP::WaitLoopCondition::GreaterEqualZero;
+						break;
+					case 0x10:
+						descriptor->condition = VitaIOP::WaitLoopCondition::LessThanZero;
+						descriptor->writes_link = true;
+						break;
+					case 0x11:
+						descriptor->condition = VitaIOP::WaitLoopCondition::GreaterEqualZero;
+						descriptor->writes_link = true;
+						break;
+					default:
+						return false;
+				}
+				break;
 
-		const u32 rt = RT(branch_op);
-		return (rt == 0x00 || rt == 0x01 || rt == 0x10 || rt == 0x11) &&
-			BranchTarget(branch_pc, branch_op) == start_pc;
+			case 0x02:
+			case 0x03:
+				if (JumpTarget(branch_pc, branch_op) != start_pc)
+					return false;
+				descriptor->condition = VitaIOP::WaitLoopCondition::Always;
+				descriptor->writes_link = primary == 0x03;
+				break;
+
+			case 0x04:
+			case 0x05:
+			case 0x06:
+			case 0x07:
+				if (BranchTarget(branch_pc, branch_op) != start_pc)
+					return false;
+				descriptor->condition = primary == 0x04 ? VitaIOP::WaitLoopCondition::Equal :
+					primary == 0x05 ? VitaIOP::WaitLoopCondition::NotEqual :
+					primary == 0x06 ? VitaIOP::WaitLoopCondition::LessEqualZero :
+					VitaIOP::WaitLoopCondition::GreaterThanZero;
+				break;
+
+			default:
+				return false;
+		}
+
+		return true;
 	}
 
 	constexpr size_t GprOffset(unsigned guest_reg)
@@ -6695,6 +6742,10 @@ namespace VitaIOP
 		m_private_dispatcher_generated_entries = 0;
 		m_private_dispatcher_fallbacks = 0;
 		m_private_dispatcher_inlined_hot_entries = 0;
+		m_cached_wait_descriptor_checks = 0;
+		m_cached_wait_descriptor_forwards = 0;
+		m_cached_wait_descriptor_opcode_reads_removed = 0;
+		m_cached_wait_descriptor_unconditional_checks = 0;
 		s_qemuIopLinkedFrameEvidence = {};
 		s_qemuIopSequentialQwordCopyFastPaths = 0;
 		s_qemuIopBranchEventCandidates = 0;
@@ -6833,6 +6884,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopPrivateDispatcherHotPathEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetCachedWaitDescriptorEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopCachedWaitDescriptorEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -7701,6 +7761,88 @@ namespace VitaIOP
 		return true;
 	}
 
+	__attribute__((noinline, cold)) bool BlockExecutor::TryFastForwardCachedWaitLoop(
+		CachedBlock& block)
+	{
+		const WaitLoopDescriptor& descriptor = block.wait_loop_descriptor;
+		if (descriptor.condition == WaitLoopCondition::Invalid || descriptor.cycles == 0)
+			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_cached_wait_descriptor_checks++;
+		m_cached_wait_descriptor_opcode_reads_removed += descriptor.cycles;
+		if (descriptor.condition == WaitLoopCondition::Always)
+			m_cached_wait_descriptor_unconditional_checks++;
+#endif
+		const u32 rs_value = psxRegs.GPR.r[descriptor.rs];
+		const u32 rt_value = psxRegs.GPR.r[descriptor.rt];
+		bool taken = false;
+		switch (descriptor.condition)
+		{
+			case WaitLoopCondition::Always:
+				taken = true;
+				break;
+			case WaitLoopCondition::Equal:
+				taken = rs_value == rt_value;
+				break;
+			case WaitLoopCondition::NotEqual:
+				taken = rs_value != rt_value;
+				break;
+			case WaitLoopCondition::LessThanZero:
+				taken = static_cast<s32>(rs_value) < 0;
+				break;
+			case WaitLoopCondition::GreaterEqualZero:
+				taken = static_cast<s32>(rs_value) >= 0;
+				break;
+			case WaitLoopCondition::LessEqualZero:
+				taken = static_cast<s32>(rs_value) <= 0;
+				break;
+			case WaitLoopCondition::GreaterThanZero:
+				taken = static_cast<s32>(rs_value) > 0;
+				break;
+			case WaitLoopCondition::Invalid:
+				return false;
+		}
+
+		if (!taken)
+			return false;
+		if (descriptor.writes_link) [[unlikely]]
+			psxRegs.GPR.r[31] = block.start_pc + descriptor.cycles * sizeof(u32);
+
+		// PCSX2's s_nBlockFF and s_psxBlockCycles are compile-time facts consumed
+		// directly by iPsxBranchTest(). The descriptor is protected by the same
+		// source/SMC invalidation as the generated block, so no opcode translation
+		// or branch decode belongs on this cached-entry path.
+		VitaIopA32FastForwardWaitLoop(block.start_pc, descriptor.cycles);
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_cached_wait_descriptor_forwards++;
+		VitaRecordA32IopWaitLoopDispatchElision();
+#endif
+		return true;
+	}
+
+	inline __attribute__((always_inline)) bool
+	BlockExecutor::TryFastForwardCachedUnconditionalWaitLoop(CachedBlock& block)
+	{
+		const WaitLoopDescriptor& descriptor = block.wait_loop_descriptor;
+		if (descriptor.condition != WaitLoopCondition::Always || descriptor.cycles == 0)
+			return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_cached_wait_descriptor_checks++;
+		m_cached_wait_descriptor_forwards++;
+		m_cached_wait_descriptor_unconditional_checks++;
+		m_cached_wait_descriptor_opcode_reads_removed += descriptor.cycles;
+#endif
+		if (descriptor.writes_link) [[unlikely]]
+			psxRegs.GPR.r[31] = block.start_pc + descriptor.cycles * sizeof(u32);
+		VitaIopA32FastForwardWaitLoop(block.start_pc, descriptor.cycles);
+#if defined(VITASX2_QEMU_VALIDATION)
+		VitaRecordA32IopWaitLoopDispatchElision();
+#endif
+		return true;
+	}
+
 	bool BlockExecutor::ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result)
 	{
 		if (!result || max_instruction_count == 0)
@@ -8082,9 +8224,13 @@ namespace VitaIOP
 		block.poll_leaf_opcodes = nullptr;
 		block.poll_branch_source_start = INVALID_RAM_SOURCE;
 		block.poll_leaf_source_start = INVALID_RAM_SOURCE;
-		block.wait_loop_shape =
-			AnalyzePollCallWaitLoop(block, start_pc, instruction_count) ||
-			IsIopWaitLoopShape(start_pc, instruction_count);
+		block.wait_loop_descriptor = {};
+		block.wait_loop_shape = AnalyzePollCallWaitLoop(block, start_pc, instruction_count);
+		if (!block.wait_loop_shape)
+		{
+			block.wait_loop_shape = AnalyzeIopWaitLoopShape(
+				start_pc, instruction_count, &block.wait_loop_descriptor);
+		}
 		block.wait_loop_enabled_at_compile =
 			EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled();
 
@@ -8449,6 +8595,12 @@ namespace VitaIOP
 		result->private_dispatcher_fallbacks = m_private_dispatcher_fallbacks;
 		result->private_dispatcher_inlined_hot_entries =
 			m_private_dispatcher_inlined_hot_entries;
+		result->cached_wait_descriptor_checks = m_cached_wait_descriptor_checks;
+		result->cached_wait_descriptor_forwards = m_cached_wait_descriptor_forwards;
+		result->cached_wait_descriptor_opcode_reads_removed =
+			m_cached_wait_descriptor_opcode_reads_removed;
+		result->cached_wait_descriptor_unconditional_checks =
+			m_cached_wait_descriptor_unconditional_checks;
 		result->branch_event_candidates = s_qemuIopBranchEventCandidates;
 		result->branch_event_budget_positive =
 			s_qemuIopBranchEventBudgetPositive;
@@ -8549,9 +8701,29 @@ namespace VitaIOP
 		// psxRecExecuteBlock() passes the architectural PC it just read, so the
 		// detailed API's redundant psxRegs.pc publication and result aggregate
 		// are unnecessary on this provider-only path.
-		if (block.wait_loop_shape && block.wait_loop_enabled_at_compile &&
-			(block.poll_call_wait_loop ? TryFastForwardPollCallWaitLoop(block) :
-									TryFastForwardTrustedWaitLoopAtPc(block.start_pc)))
+		bool wait_forward = false;
+		if (block.wait_loop_shape && block.wait_loop_enabled_at_compile)
+		{
+			if (block.poll_call_wait_loop)
+			{
+				wait_forward = TryFastForwardPollCallWaitLoop(block);
+			}
+			else
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				wait_forward = s_qemuIopCachedWaitDescriptorEnabled ?
+					(block.wait_loop_descriptor.condition == WaitLoopCondition::Always ?
+						TryFastForwardCachedUnconditionalWaitLoop(block) :
+						TryFastForwardCachedWaitLoop(block)) :
+					TryFastForwardTrustedWaitLoopAtPc(block.start_pc);
+#else
+				wait_forward = block.wait_loop_descriptor.condition == WaitLoopCondition::Always ?
+					TryFastForwardCachedUnconditionalWaitLoop(block) :
+					TryFastForwardCachedWaitLoop(block);
+#endif
+			}
+		}
+		if (wait_forward)
 		{
 #if defined(VITASX2_QEMU_VALIDATION)
 			m_pinned_gpr_memory_ops_saved += block.pinned_gpr_memory_ops_saved;

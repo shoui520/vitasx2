@@ -81,6 +81,10 @@ namespace VitaIOP
 		u64 private_dispatcher_generated_entries;
 		u64 private_dispatcher_fallbacks;
 		u64 private_dispatcher_inlined_hot_entries;
+		u64 cached_wait_descriptor_checks;
+		u64 cached_wait_descriptor_forwards;
+		u64 cached_wait_descriptor_opcode_reads_removed;
+		u64 cached_wait_descriptor_unconditional_checks;
 		u64 branch_event_candidates;
 		u64 branch_event_budget_positive;
 		u64 branch_event_tests_entered;
@@ -120,6 +124,27 @@ namespace VitaIOP
 		ProviderDispatchWaitForward = 1u << 4,
 		ProviderDispatchIsolateSwitch = 1u << 5,
 		ProviderDispatchIsolateWrite = 1u << 6,
+	};
+
+	enum class WaitLoopCondition : u8
+	{
+		Invalid,
+		Always,
+		Equal,
+		NotEqual,
+		LessThanZero,
+		GreaterEqualZero,
+		LessEqualZero,
+		GreaterThanZero,
+	};
+
+	struct WaitLoopDescriptor
+	{
+		WaitLoopCondition condition = WaitLoopCondition::Invalid;
+		u8 cycles = 0;
+		u8 rs = 0;
+		u8 rt = 0;
+		bool writes_link = false;
 	};
 
 	// PCSX2's iopEnterRecompiledCode dispatcher returns hot control state in
@@ -484,6 +509,7 @@ namespace VitaIOP
 		static void SetSequentialQwordCopyEnabled(bool enabled);
 		static void SetBranchTestSchedulingEnabled(bool enabled);
 		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
+		static void SetCachedWaitDescriptorEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -560,6 +586,7 @@ namespace VitaIOP
 			DirectLinkSlots direct_links{};
 			bool wait_loop_shape = false;
 			bool wait_loop_enabled_at_compile = false;
+			WaitLoopDescriptor wait_loop_descriptor{};
 			bool poll_call_wait_loop = false;
 			bool direct_budget_exit = false;
 			bool constant_cycle_budget = false;
@@ -645,6 +672,9 @@ namespace VitaIOP
 		bool ValidateCachedBlock(CachedBlock& block);
 		static bool TryFastForwardTrustedWaitLoopAtPc(u32 start_pc);
 		bool TryFastForwardPollCallWaitLoop(CachedBlock& block);
+		inline __attribute__((always_inline)) bool TryFastForwardCachedUnconditionalWaitLoop(
+			CachedBlock& block);
+		__attribute__((noinline, cold)) bool TryFastForwardCachedWaitLoop(CachedBlock& block);
 		bool EnsureCodeCache();
 		void ReleaseCodeCache();
 		u8* AllocateCodeSlice(size_t capacity, size_t* slice_offset);
@@ -721,6 +751,10 @@ namespace VitaIOP
 		u64 m_private_dispatcher_generated_entries = 0;
 		u64 m_private_dispatcher_fallbacks = 0;
 		u64 m_private_dispatcher_inlined_hot_entries = 0;
+		u64 m_cached_wait_descriptor_checks = 0;
+		u64 m_cached_wait_descriptor_forwards = 0;
+		u64 m_cached_wait_descriptor_opcode_reads_removed = 0;
+		u64 m_cached_wait_descriptor_unconditional_checks = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};
