@@ -81,6 +81,9 @@ namespace VitaIOP
 		u64 private_dispatcher_generated_entries;
 		u64 private_dispatcher_fallbacks;
 		u64 private_dispatcher_inlined_hot_entries;
+		u64 private_frame_provider_entries;
+		u64 private_frame_stack_words_removed;
+		u64 private_frame_zero_scratch_entries;
 		u64 cached_wait_descriptor_checks;
 		u64 cached_wait_descriptor_forwards;
 		u64 cached_wait_descriptor_opcode_reads_removed;
@@ -161,11 +164,8 @@ namespace VitaIOP
 	struct DirectLinkSlot
 	{
 		u32 target_pc = 0;
-		size_t frame_bypass_offset = static_cast<size_t>(-1);
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
-		u32 frame_teardown_instruction = 0;
-		bool patched_to_frame_bypass = false;
 		bool valid = false;
 	};
 
@@ -185,7 +185,7 @@ namespace VitaIOP
 
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count,
 			const void* direct_exit = nullptr, DirectLinkSlots* direct_links = nullptr,
-			size_t* linked_entry_offset = nullptr);
+			size_t* linked_entry_offset = nullptr, size_t* provider_entry_offset = nullptr);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 		bool UsesDirectBudgetExit() const { return m_has_budget_exit; }
@@ -231,7 +231,7 @@ namespace VitaIOP
 		bool SourcePageLiteralOutOfRange() const { return m_source_page_literal_out_of_range; }
 
 	private:
-		bool BeginBlock(size_t* linked_entry_offset);
+		bool BeginBlock(size_t* linked_entry_offset, size_t* provider_entry_offset);
 		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true,
 			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockIsolateModeWriteReturn(bool charge_budget = true,
@@ -581,6 +581,7 @@ namespace VitaIOP
 			u32 batched_cycle_stack_words_removed = 0;
 			bool expanded_cycle_batching = false;
 			size_t linked_entry_offset = 0;
+			size_t provider_entry_offset = 0;
 			u16 saved_registers = 0;
 			u8 stack_frame_size = 0;
 			DirectLinkSlots direct_links{};
@@ -692,6 +693,7 @@ namespace VitaIOP
 		inline __attribute__((always_inline)) u32 ExecuteProviderBlockAtPcInline(
 			u32 start_pc, ProviderCompileResult* compile_result);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
+		const void* ProviderEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
 		void PatchIncomingLinks(CachedBlock& target);
 		void UnlinkIncomingLinks(u32 target_pc, int isolate_cache_mode = -1);
@@ -751,6 +753,9 @@ namespace VitaIOP
 		u64 m_private_dispatcher_generated_entries = 0;
 		u64 m_private_dispatcher_fallbacks = 0;
 		u64 m_private_dispatcher_inlined_hot_entries = 0;
+		u64 m_private_frame_provider_entries = 0;
+		u64 m_private_frame_stack_words_removed = 0;
+		u64 m_private_frame_zero_scratch_entries = 0;
 		u64 m_cached_wait_descriptor_checks = 0;
 		u64 m_cached_wait_descriptor_forwards = 0;
 		u64 m_cached_wait_descriptor_opcode_reads_removed = 0;

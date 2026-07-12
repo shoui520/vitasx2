@@ -130,6 +130,9 @@ struct VitaA32IopProviderStats
 	u64 private_dispatcher_control_transfers_removed = 0;
 	u64 private_dispatcher_inlined_hot_entries = 0;
 	u64 private_dispatcher_hot_path_control_transfers_removed = 0;
+	u64 private_frame_provider_entries = 0;
+	u64 private_frame_stack_words_removed = 0;
+	u64 private_frame_zero_scratch_entries = 0;
 	u64 cached_wait_descriptor_checks = 0;
 	u64 cached_wait_descriptor_forwards = 0;
 	u64 cached_wait_descriptor_opcode_reads_removed = 0;

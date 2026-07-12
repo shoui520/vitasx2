@@ -1245,6 +1245,12 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 		snapshot.private_dispatcher_provider_entries * 2u;
 	s_iop_a32_stats.private_dispatcher_inlined_hot_entries =
 		snapshot.private_dispatcher_inlined_hot_entries;
+	s_iop_a32_stats.private_frame_provider_entries =
+		snapshot.private_frame_provider_entries;
+	s_iop_a32_stats.private_frame_stack_words_removed =
+		snapshot.private_frame_stack_words_removed;
+	s_iop_a32_stats.private_frame_zero_scratch_entries =
+		snapshot.private_frame_zero_scratch_entries;
 	// PCSX2's dispatcher performs neither C++ call: each inlined exact hit
 	// removes the caller BL and callee return for both lookup and execution.
 	s_iop_a32_stats.private_dispatcher_hot_path_control_transfers_removed =

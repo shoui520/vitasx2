@@ -81,11 +81,33 @@ namespace
 {
 	using GeneratedBlock = u32 (*)();
 
+#if defined(__arm__)
+	inline __attribute__((always_inline)) u32 RunGeneratedProviderEntry(const void* entry)
+	{
+		register u32 result asm("r0");
+		register const void* target asm("r12") = entry;
+		// A fixed private slot makes every linked body ABI-compatible, including
+		// transitions from blocks whose own analysis needed no cycle scratch.
+		asm volatile(
+			"sub sp, sp, #8\n\t"
+			"adr r9, 1f\n\t"
+			"bx %[target]\n\t"
+			"1:\n\t"
+			"add sp, sp, #8"
+			: "=r"(result), [target] "+r"(target)
+			:
+			: "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10",
+			  "r11", "lr", "cc", "memory");
+		return result;
+	}
+#endif
+
 	constexpr u16 REG_R4 = 1u << 4;
 	constexpr u16 REG_R5 = 1u << 5;
 	constexpr u16 REG_R6 = 1u << 6;
 	constexpr u16 REG_R7 = 1u << 7;
 	constexpr u16 REG_R8 = 1u << 8;
+	constexpr u16 REG_R9 = 1u << 9;
 	constexpr u16 REG_R10 = 1u << 10;
 	constexpr u16 REG_R11 = 1u << 11;
 	constexpr u16 REG_LR = 1u << 14;
@@ -101,6 +123,10 @@ namespace
 	constexpr unsigned HOST_SAVED1 = 6;
 	constexpr unsigned HOST_BRANCH_FLAG = 7;
 	constexpr unsigned HOST_REGISTER_JUMP_TARGET = 8;
+	// PCSX2's _DynGen_EnterRecompiledCode() owns the return continuation for a
+	// complete linked chain. r9 is otherwise unused by the IOP compiler and is
+	// callee-saved across every AAPCS helper, so it carries that continuation.
+	constexpr unsigned HOST_CHAIN_RETURN = 9;
 	// r10 is also HOST_IOP_RAM_MASK; the cycle base is only allocated in
 	// non-trace blocks that do not reserve the direct IOP RAM fast-path pair.
 	constexpr unsigned HOST_CYCLE_BASE = 10;
@@ -1058,10 +1084,12 @@ namespace VitaIOP
 		return IsNativeOpcode(op);
 	}
 
-	bool BlockCompiler::BeginBlock(size_t* linked_entry_offset)
+	bool BlockCompiler::BeginBlock(size_t* linked_entry_offset, size_t* provider_entry_offset)
 	{
 		if (linked_entry_offset)
 			*linked_entry_offset = 0;
+		if (provider_entry_offset)
+			*provider_entry_offset = 0;
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
 		m_unaligned_read_cold_tails.clear();
@@ -1106,8 +1134,29 @@ namespace VitaIOP
 			(baseline_stack_frame_size == 0 && m_stack_frame_size != 0) ? 2 : 0;
 		m_saved_register_frame_instructions_removed =
 			(baseline_stack_frame_size != 0 && m_stack_frame_size == 0) ? 2 : 0;
-		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
-			(m_stack_frame_size != 0 && !m_code.EmitSubImm8(HOST_SP, HOST_SP, m_stack_frame_size)))
+		// A standalone BlockCompiler retains a correctness/diagnostic callable
+		// adapter. Executor-managed blocks provide their private-entry output and
+		// omit these cold 24 bytes from the product code cache entirely.
+		// The adapter owns one conservative frame for the whole linked chain,
+		// just like PCSX2's _DynGen_EnterRecompiledCode(). Nine pushed words plus
+		// twelve private bytes preserve AAPCS alignment and leave [sp, #0]
+		// available to every generated body.
+		constexpr u16 callable_saved_registers =
+			REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_R9 | REG_R10 | REG_R11;
+		constexpr u8 callable_stack_frame_size = 12;
+		bool needs_callable_adapter = true;
+#if defined(__arm__)
+		needs_callable_adapter = (provider_entry_offset == nullptr);
+#endif
+		size_t callable_body = static_cast<size_t>(-1);
+		if (needs_callable_adapter &&
+			(!m_code.EmitPush(callable_saved_registers | REG_LR) ||
+			 !m_code.EmitSubImm8(HOST_SP, HOST_SP, callable_stack_frame_size) ||
+			 // At this instruction PC reads as the continuation two words ahead.
+			 !m_code.EmitAddImm8(HOST_CHAIN_RETURN, 15, 0) ||
+			 (callable_body = m_code.EmitBranchPlaceholder()) == static_cast<size_t>(-1) ||
+			 !m_code.EmitAddImm8(HOST_SP, HOST_SP, callable_stack_frame_size) ||
+			 !m_code.EmitPop(callable_saved_registers | REG_PC)))
 		{
 			return false;
 		}
@@ -1119,9 +1168,6 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (linked_entry_offset)
 		{
-			const size_t callable_body = m_code.EmitBranchPlaceholder();
-			if (callable_body == static_cast<size_t>(-1))
-				return false;
 			*linked_entry_offset = m_code.Size();
 			const u32 frame_instructions = 2u + (m_stack_frame_size != 0 ? 2u : 0u);
 			const u32 stack_words = 2u * static_cast<u32>(
@@ -1136,8 +1182,7 @@ namespace VitaIOP
 				!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
 				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)) ||
 				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, static_cast<u8>(stack_words)) ||
-				!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)) ||
-				!m_code.PatchBranch(callable_body, m_code.Size()))
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)))
 			{
 				return false;
 			}
@@ -1146,6 +1191,10 @@ namespace VitaIOP
 		if (linked_entry_offset)
 			*linked_entry_offset = m_code.Size();
 #endif
+		if (provider_entry_offset)
+			*provider_entry_offset = m_code.Size();
+		if (needs_callable_adapter && !m_code.PatchBranch(callable_body, m_code.Size()))
+			return false;
 
 		if (!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
 			return false;
@@ -1204,8 +1253,7 @@ namespace VitaIOP
 			return false;
 
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
-			   (m_stack_frame_size == 0 || m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size)) &&
-			   m_code.EmitPop(m_saved_registers | REG_PC);
+			   m_code.EmitBx(HOST_CHAIN_RETURN);
 	}
 
 	bool BlockCompiler::EndBlockIsolateModeWriteReturn(
@@ -1245,17 +1293,6 @@ namespace VitaIOP
 			return false;
 		}
 
-		const size_t frame_bypass_offset = m_code.Size();
-		if ((m_stack_frame_size != 0 &&
-				!m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size)) ||
-			!m_code.EmitPop(m_saved_registers | REG_LR))
-		{
-			return false;
-		}
-		u32 frame_teardown_instruction = 0;
-		std::memcpy(&frame_teardown_instruction,
-			m_code.Data() + frame_bypass_offset, sizeof(frame_teardown_instruction));
-
 		const size_t target_offset = m_code.Size();
 		const size_t target_branch = m_code.EmitBranchPlaceholder();
 		if (target_branch == static_cast<size_t>(-1))
@@ -1263,18 +1300,17 @@ namespace VitaIOP
 
 		const size_t fallback_offset = m_code.Size();
 		if (!m_code.PatchBranch(target_branch, fallback_offset) ||
-			!m_code.EmitMovImm32(HOST_CALL_SCRATCH, static_cast<u32>(reinterpret_cast<uptr>(direct_exit))) ||
-			!m_code.EmitBx(HOST_CALL_SCRATCH))
+			!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(BlockExitKind::Direct)) ||
+			!m_code.EmitBx(HOST_CHAIN_RETURN))
 		{
 			return false;
 		}
+		(void)direct_exit;
 
 		if (direct_link_slot)
 		{
-			direct_link_slot->frame_bypass_offset = frame_bypass_offset;
 			direct_link_slot->target_offset = target_offset;
 			direct_link_slot->fallback_offset = fallback_offset;
-			direct_link_slot->frame_teardown_instruction = frame_teardown_instruction;
 		}
 		return true;
 	}
@@ -6138,7 +6174,8 @@ namespace VitaIOP
 	}
 
 	bool BlockCompiler::CompileStraightLineBlock(u32 start_pc, u32 instruction_count,
-		const void* direct_exit, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
+		const void* direct_exit, DirectLinkSlots* direct_links, size_t* linked_entry_offset,
+		size_t* provider_entry_offset)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -6304,7 +6341,7 @@ namespace VitaIOP
 		AnalyzePinnedGprs(start_pc, instruction_count);
 		AnalyzeSavedRegisters(start_pc, instruction_count);
 
-		if (!BeginBlock(linked_entry_offset))
+		if (!BeginBlock(linked_entry_offset, provider_entry_offset))
 			return false;
 
 		std::vector<size_t> direct_exit_branches;
@@ -6742,6 +6779,9 @@ namespace VitaIOP
 		m_private_dispatcher_generated_entries = 0;
 		m_private_dispatcher_fallbacks = 0;
 		m_private_dispatcher_inlined_hot_entries = 0;
+		m_private_frame_provider_entries = 0;
+		m_private_frame_stack_words_removed = 0;
+		m_private_frame_zero_scratch_entries = 0;
 		m_cached_wait_descriptor_checks = 0;
 		m_cached_wait_descriptor_forwards = 0;
 		m_cached_wait_descriptor_opcode_reads_removed = 0;
@@ -7581,6 +7621,7 @@ namespace VitaIOP
 		block.batched_cycle_stack_words_removed = 0;
 		block.expanded_cycle_batching = false;
 		block.linked_entry_offset = 0;
+		block.provider_entry_offset = 0;
 		block.saved_registers = 0;
 		block.stack_frame_size = 0;
 		block.direct_links = {};
@@ -8254,6 +8295,7 @@ namespace VitaIOP
 		u32 batched_cycle_stack_words_removed = 0;
 		bool expanded_cycle_batching = false;
 		size_t linked_entry_offset = 0;
+		size_t provider_entry_offset = 0;
 		u16 saved_registers = 0;
 		u8 stack_frame_size = 0;
 		bool direct_budget_exit = false;
@@ -8282,9 +8324,10 @@ namespace VitaIOP
 				m_ram_source_page_live_flags.data(), source_page_literal_allowed);
 			DirectLinkSlots attempt_direct_links;
 			size_t attempt_linked_entry_offset = 0;
+			size_t attempt_provider_entry_offset = 0;
 			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
 				reinterpret_cast<const void*>(&VitaIopA32DirectExit), &attempt_direct_links,
-				&attempt_linked_entry_offset);
+				&attempt_linked_entry_offset, &attempt_provider_entry_offset);
 			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
 			const bool source_page_literal_out_of_range = compiler.SourcePageLiteralOutOfRange();
 			if (compiled && block.code.Flush())
@@ -8316,6 +8359,7 @@ namespace VitaIOP
 				batched_cycle_stack_words_removed = compiler.BatchedCycleStackWordsRemoved();
 				expanded_cycle_batching = compiler.UsesExpandedCycleBatching();
 				linked_entry_offset = attempt_linked_entry_offset;
+				provider_entry_offset = attempt_provider_entry_offset;
 				saved_registers = compiler.SavedRegisters();
 				stack_frame_size = compiler.StackFrameSize();
 				direct_budget_exit = compiler.UsesDirectBudgetExit();
@@ -8362,6 +8406,7 @@ namespace VitaIOP
 		block.batched_cycle_stack_words_removed = batched_cycle_stack_words_removed;
 		block.expanded_cycle_batching = expanded_cycle_batching;
 		block.linked_entry_offset = linked_entry_offset;
+		block.provider_entry_offset = provider_entry_offset;
 		block.saved_registers = saved_registers;
 		block.stack_frame_size = stack_frame_size;
 		block.direct_budget_exit = direct_budget_exit;
@@ -8405,10 +8450,17 @@ namespace VitaIOP
 		return static_cast<const u8*>(block.code.EntryPoint()) + block.linked_entry_offset;
 	}
 
+	const void* BlockExecutor::ProviderEntryPoint(const CachedBlock& block) const
+	{
+		if (!block.code.EntryPoint() || block.provider_entry_offset >= block.code.Size())
+			return block.code.EntryPoint();
+
+		return static_cast<const u8*>(block.code.EntryPoint()) + block.provider_entry_offset;
+	}
+
 	bool BlockExecutor::PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target)
 	{
 		if (!block.valid || !link.valid ||
-			link.frame_bypass_offset == static_cast<size_t>(-1) ||
 			link.target_offset == static_cast<size_t>(-1) ||
 			link.fallback_offset == static_cast<size_t>(-1))
 		{
@@ -8417,24 +8469,16 @@ namespace VitaIOP
 		if (target && block.isolate_cache_active != target->isolate_cache_active)
 			target = nullptr;
 
-		bool use_frame_bypass = target &&
-			block.saved_registers == target->saved_registers &&
-			block.stack_frame_size == target->stack_frame_size;
+		bool use_chain = target != nullptr;
 #if defined(VITASX2_QEMU_VALIDATION)
-		use_frame_bypass = use_frame_bypass && s_qemuIopLinkedFrameBypassEnabled;
+		use_chain = use_chain && s_qemuIopLinkedFrameBypassEnabled;
 #endif
-		const bool frame_patched = use_frame_bypass ?
-			block.code.PatchBranchToAddress(
-				link.frame_bypass_offset, LinkedEntryPoint(*target)) :
-			block.code.PatchInstruction(
-				link.frame_bypass_offset, link.frame_teardown_instruction);
-		const bool target_patched = target ?
-			block.code.PatchBranchToAddress(link.target_offset, target->code.EntryPoint()) :
+		const bool target_patched = use_chain ?
+			block.code.PatchBranchToAddress(link.target_offset, LinkedEntryPoint(*target)) :
 			block.code.PatchBranch(link.target_offset, link.fallback_offset);
-		if (!frame_patched || !target_patched || !block.code.Flush())
+		if (!target_patched || !block.code.Flush())
 			return false;
 
-		link.patched_to_frame_bypass = use_frame_bypass;
 		return true;
 	}
 
@@ -8595,6 +8639,9 @@ namespace VitaIOP
 		result->private_dispatcher_fallbacks = m_private_dispatcher_fallbacks;
 		result->private_dispatcher_inlined_hot_entries =
 			m_private_dispatcher_inlined_hot_entries;
+		result->private_frame_provider_entries = m_private_frame_provider_entries;
+		result->private_frame_stack_words_removed = m_private_frame_stack_words_removed;
+		result->private_frame_zero_scratch_entries = m_private_frame_zero_scratch_entries;
 		result->cached_wait_descriptor_checks = m_cached_wait_descriptor_checks;
 		result->cached_wait_descriptor_forwards = m_cached_wait_descriptor_forwards;
 		result->cached_wait_descriptor_opcode_reads_removed =
@@ -8748,9 +8795,18 @@ namespace VitaIOP
 		m_batched_cycle_stack_words_removed += block.batched_cycle_stack_words_removed;
 		if (block.expanded_cycle_batching)
 			m_expanded_cycle_batching_provider_entries++;
+		m_private_frame_provider_entries++;
+		m_private_frame_stack_words_removed += 2u * static_cast<u64>(
+			__builtin_popcount(static_cast<unsigned>(block.saved_registers | REG_LR)));
+		if (block.stack_frame_size == 0)
+			m_private_frame_zero_scratch_entries++;
 #endif
 
+#if defined(__arm__)
+		const u32 exit_value = RunGeneratedProviderEntry(ProviderEntryPoint(block));
+#else
 		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
+#endif
 		if (exit_value != static_cast<u32>(BlockExitKind::Direct) &&
 			exit_value != static_cast<u32>(BlockExitKind::IsolateModeWrite))
 		{
