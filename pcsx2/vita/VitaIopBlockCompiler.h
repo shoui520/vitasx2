@@ -60,6 +60,12 @@ namespace VitaIOP
 		u64 scheduler_direct_resume_misses;
 		u64 scheduler_direct_resume_no_target;
 		u64 scheduler_direct_resume_target_mismatch;
+		u64 scheduler_direct_event_entries;
+		u64 scheduler_direct_event_forwards;
+		u64 scheduler_direct_event_fallbacks;
+		u64 scheduler_direct_event_remainders;
+		u64 scheduler_direct_event_installs;
+		u64 scheduler_direct_event_clears;
 		u64 hot_dispatch_trusted_raw_hits;
 		u64 hot_dispatch_owned_hits;
 		u64 wait_resume_cache_attempts;
@@ -794,6 +800,10 @@ namespace VitaIOP
 		__attribute__((no_stack_protector))
 		__attribute__((noinline)) s32 ExecuteProviderTimeslicePrivateBody(
 			s32 ee_cycles) __asm__("VitaIopA32ProviderTimesliceBody");
+		__attribute__((no_stack_protector))
+		__attribute__((noinline)) s32 ExecuteProviderSchedulerDirectResumePrivateBody(
+			s32 ee_cycles, CachedBlock* block)
+			__asm__("VitaIopA32ProviderSchedulerDirectResumeBody");
 		inline __attribute__((always_inline)) s32
 			ExecuteProviderWaitResumePrivateBodyCore(
 				s32 ee_cycles, CachedBlock* block, WaitResumeKind kind,
@@ -856,6 +866,8 @@ namespace VitaIOP
 #endif
 		void SetWaitResumeBlock(CachedBlock* block);
 		void ClearWaitResumeBlock();
+		inline __attribute__((always_inline)) void SetSchedulerDirectResumeBlock(
+			CachedBlock* block);
 		void ClearSchedulerDirectResume();
 		inline __attribute__((always_inline)) CachedBlock* FindSchedulerDirectResumeBlock(
 			u32* dispatch_flags);
@@ -884,7 +896,11 @@ namespace VitaIOP
 			HOT_DISPATCH_CACHE_CONTROL_SET_COUNT>, 2> m_hot_dispatch_cache_64_set_control{};
 #endif
 		CachedBlock* m_wait_resume_block = nullptr;
-		CachedBlock* m_scheduler_direct_resume_block = nullptr;
+		struct SchedulerDirectResumeEventContext
+		{
+			BlockExecutor* executor = nullptr;
+			CachedBlock* block = nullptr;
+		} m_scheduler_direct_resume_event_context;
 		struct WaitResumeEventContext
 		{
 			BlockExecutor* executor = nullptr;
@@ -911,6 +927,12 @@ namespace VitaIOP
 		u64 m_scheduler_direct_resume_misses = 0;
 		u64 m_scheduler_direct_resume_no_target = 0;
 		u64 m_scheduler_direct_resume_target_mismatch = 0;
+		u64 m_scheduler_direct_event_entries = 0;
+		u64 m_scheduler_direct_event_forwards = 0;
+		u64 m_scheduler_direct_event_fallbacks = 0;
+		u64 m_scheduler_direct_event_remainders = 0;
+		u64 m_scheduler_direct_event_installs = 0;
+		u64 m_scheduler_direct_event_clears = 0;
 		u64 m_hot_dispatch_trusted_raw_hits = 0;
 		u64 m_hot_dispatch_owned_hits = 0;
 		u64 m_wait_resume_cache_attempts = 0;

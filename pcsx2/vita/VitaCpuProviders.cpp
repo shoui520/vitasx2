@@ -41,10 +41,13 @@ static VitaIOP::BlockExecutor s_iop_a32_executor{true};
 #if defined(__arm__)
 static uptr s_iop_wait_resume_event_context = 0;
 static uptr s_iop_wait_resume_event_target = 0;
+static uptr s_iop_scheduler_resume_event_context = 0;
 bool g_vita_a32_iop_private_event_entry_available =
 	VitaIOP::VitaIopA32PrivateTimesliceEntrySupported();
 bool g_vita_a32_iop_private_wait_resume_entry_available =
 	VitaIOP::VitaIopA32PrivateWaitResumeEntrySupported();
+bool g_vita_a32_iop_private_scheduler_resume_entry_available =
+	VitaIOP::VitaIopA32PrivateSchedulerResumeEntrySupported();
 extern "C" s32 VitaIopA32ExecuteProviderTimesliceAapcs(void*, s32 ee_cycles)
 {
 	return psxCpu->ExecuteBlock(ee_cycles);
@@ -54,6 +57,7 @@ VitaA32IopEventEntry g_vita_a32_iop_event_entry = {
 #else
 bool g_vita_a32_iop_private_event_entry_available = false;
 bool g_vita_a32_iop_private_wait_resume_entry_available = false;
+bool g_vita_a32_iop_private_scheduler_resume_entry_available = false;
 #endif
 static VitaA32EeProviderStats s_ee_a32_stats;
 static VitaA32IopProviderStats s_iop_a32_stats;
@@ -72,6 +76,7 @@ static bool s_iop_a32_runtime_stats_enabled = true;
 static bool s_iop_a32_private_dispatcher_enabled = true;
 bool g_vita_a32_iop_private_event_entry_enabled = true;
 bool g_vita_a32_iop_wait_resume_event_entry_enabled = true;
+bool g_vita_a32_iop_scheduler_resume_event_entry_enabled = true;
 u64 g_vita_a32_iop_private_event_entries = 0;
 static u64 s_iop_a32_compact_provider_dispatch_entries = 0;
 static u64 s_iop_a32_compact_provider_cache_hit_entries = 0;
@@ -109,12 +114,22 @@ static void UpdateIopEventEntry()
 			&& g_vita_a32_iop_wait_resume_event_entry_enabled
 #endif
 			;
+		const bool scheduler_resume = !wait_resume &&
+			s_iop_scheduler_resume_event_context != 0 &&
+			g_vita_a32_iop_private_scheduler_resume_entry_available
+#if defined(VITASX2_QEMU_VALIDATION)
+			&& g_vita_a32_iop_scheduler_resume_event_entry_enabled
+#endif
+			;
 		g_vita_a32_iop_event_entry.context = wait_resume ?
 			s_iop_wait_resume_event_context :
-			reinterpret_cast<uptr>(&s_iop_a32_executor);
+			(scheduler_resume ? s_iop_scheduler_resume_event_context :
+				reinterpret_cast<uptr>(&s_iop_a32_executor));
 		g_vita_a32_iop_event_entry.target = wait_resume ?
 			s_iop_wait_resume_event_target :
-			reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimeslicePrivate);
+			(scheduler_resume ? reinterpret_cast<uptr>(
+				&VitaIopA32ExecuteProviderSchedulerDirectResumePrivate) :
+				reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimeslicePrivate));
 	}
 	else
 	{
@@ -129,6 +144,11 @@ void VitaSetA32IopWaitResumeEventEntry(uptr context, uptr target)
 	s_iop_wait_resume_event_context = context;
 	s_iop_wait_resume_event_target = target;
 	UpdateIopEventEntry();
+}
+
+void VitaSetA32IopSchedulerDirectEventContext(uptr context)
+{
+	s_iop_scheduler_resume_event_context = context;
 }
 #endif
 
@@ -1260,6 +1280,14 @@ void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled)
 #endif
 }
 
+void VitaSetA32IopSchedulerResumeEventEntryEnabled(bool enabled)
+{
+	g_vita_a32_iop_scheduler_resume_event_entry_enabled = enabled;
+#if defined(__arm__)
+	UpdateIopEventEntry();
+#endif
+}
+
 void VitaSetA32IopWaitResumeFirstEntryOwnershipEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetWaitResumeFirstEntryOwnershipEnabled(enabled);
@@ -1322,6 +1350,18 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 		snapshot.scheduler_direct_resume_target_mismatch;
 	s_iop_a32_stats.scheduler_direct_resume_hot_lookups_removed =
 		snapshot.scheduler_direct_resume_hits;
+	s_iop_a32_stats.scheduler_direct_event_entries =
+		snapshot.scheduler_direct_event_entries;
+	s_iop_a32_stats.scheduler_direct_event_forwards =
+		snapshot.scheduler_direct_event_forwards;
+	s_iop_a32_stats.scheduler_direct_event_fallbacks =
+		snapshot.scheduler_direct_event_fallbacks;
+	s_iop_a32_stats.scheduler_direct_event_remainders =
+		snapshot.scheduler_direct_event_remainders;
+	s_iop_a32_stats.scheduler_direct_event_installs =
+		snapshot.scheduler_direct_event_installs;
+	s_iop_a32_stats.scheduler_direct_event_clears =
+		snapshot.scheduler_direct_event_clears;
 	s_iop_a32_stats.hot_dispatch_trusted_raw_hits = snapshot.hot_dispatch_trusted_raw_hits;
 	s_iop_a32_stats.hot_dispatch_owned_hits = snapshot.hot_dispatch_owned_hits;
 	// The retired stale-entry arm loads/checks CachedBlock::valid and reloads/
