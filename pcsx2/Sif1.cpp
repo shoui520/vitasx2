@@ -5,11 +5,31 @@
 
 #include "R3000A.h"
 #include "Common.h"
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#include "DebugTools/CoreEventTrace.h"
+#endif
 #include "DebugTools/SifTrace.h"
 #include "Sif.h"
 #include "IopHw.h"
 
 _sif sif1;
+
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+static __fi void TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase phase)
+{
+	const u32 state = static_cast<u32>(sif1.ee.busy) |
+		(static_cast<u32>(sif1.ee.end) << 1) |
+		(static_cast<u32>(sif1.iop.busy) << 2) |
+		(static_cast<u32>(sif1.iop.end) << 3);
+	Pcsx2Trace::RecordCoreEvent(Pcsx2Trace::CoreEventKind::Sif, phase,
+		Pcsx2Trace::CoreEventDomain::Sif1, Pcsx2Trace::CoreEventId::IopSif1, 0,
+		sif1ch.chcr._u32, sif1ch.madr, sif1ch.qwc, sif1ch.tadr,
+		HW_DMA10_CHCR, hw_dma10.madr, 0, sif1.fifo.size,
+		state, sif1.iop.counter, sif1data);
+}
+#else
+#define TraceSif1CoreEvent(phase) ((void)0)
+#endif
 
 static bool done = false;
 static bool sif1_dma_stall = false;
@@ -41,10 +61,12 @@ static __fi bool WriteEEtoFifo()
 
 	const u32 ee_madr = sif1ch.madr;
 	const u32 fifo_before = sif1.fifo.size;
+	TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::Before);
 	sif1.fifo.write((u32*)ptag, writeSize << 2);
 	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 1, Pcsx2Trace::SifTraceDirectionEeToFifo,
 		ptag, static_cast<u32>(writeSize << 2), ee_madr, hw_dma10.madr, sif1ch.qwc, sif1.iop.counter,
 		fifo_before, sif1.fifo.size, sif1ch.chcr._u32, sif1data, sif1ch.tadr);
+	TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::After);
 
 	sif1ch.madr += writeSize << 4;
 	hwDmacSrcTadrInc(sif1ch);
@@ -67,10 +89,12 @@ static __fi bool WriteFifoToIOP()
 	const u32 iop_madr = hw_dma10.madr;
 	const u32 fifo_before = sif1.fifo.size;
 	void* destination = iopPhysMem(iop_madr);
+	TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::Before);
 	sif1.fifo.read((u32*)destination, readSize);
 	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 1, Pcsx2Trace::SifTraceDirectionFifoToIop,
 		destination, static_cast<u32>(readSize), sif1ch.madr, iop_madr, sif1ch.qwc, sif1.iop.counter,
 		fifo_before, sif1.fifo.size, HW_DMA10_CHCR, sif1data, sif1ch.tadr);
+	TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::After);
 	iopMemNotifyWrite(hw_dma10.madr, static_cast<u32>(readSize) * sizeof(u32));
 	hw_dma10.madr += readSize << 2;
 	sif1.iop.cycles += readSize >> 2;		// fixme: should be >> 4
@@ -99,10 +123,12 @@ static __fi bool ProcessEETag()
 		Console.WriteLn("SIF1 TTE");
 		const u32 fifo_before = sif1.fifo.size;
 		const void* tag_source = (u32*)ptag + 2;
+		TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::Before);
 		sif1.fifo.write((u32*)tag_source, 2);
 		Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoTag, 1, Pcsx2Trace::SifTraceDirectionEeToFifo,
 			tag_source, 2, sif1ch.tadr, hw_dma10.madr, sif1ch.qwc, sif1.iop.counter,
 			fifo_before, sif1.fifo.size, sif1ch.chcr._u32, ptag->_u32, sif1ch.tadr);
+		TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::After);
 	}
 
 	SIF_LOG("%s", ptag->tag_to_str().c_str());
@@ -124,10 +150,12 @@ static __fi bool SIFIOPReadTag()
 {
 	// Read a tag.
 	const u32 fifo_before = sif1.fifo.size;
+	TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::Before);
 	sif1.fifo.read((u32*)&sif1.iop.data, 4);
 	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoTag, 1, Pcsx2Trace::SifTraceDirectionFifoToIop,
 		&sif1.iop.data, 4, sif1ch.madr, hw_dma10.madr, sif1ch.qwc, sif1.iop.counter,
 		fifo_before, sif1.fifo.size, HW_DMA10_CHCR, sif1data, sif1ch.tadr);
+	TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::After);
 	//sif1words = (sif1words + 3) & 0xfffffffc; // Round up to nearest 4.
 	SIF_LOG("SIF 1 IOP: dest chain tag madr:%08X wc:%04X id:%X irq:%d",
 		sif1data & 0xffffff, sif1words, sif1tag.ID, sif1tag.IRQ);
@@ -284,12 +312,16 @@ static __fi void Sif1End()
 __fi void SIF1Dma()
 {
 	int BusyCheck = 0;
+	TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::Enter);
 
 	if (sif1_dma_stall)
 	{
 		const int writeSize = std::min((s32)sif1ch.qwc, sif1.fifo.sif_free() >> 2);
 		if ((sif1ch.madr + (writeSize * 16)) > dmacRegs.stadr.ADDR)
+		{
+			TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::Ignored);
 			return;
+		}
 	}
 
 	sif1_dma_stall = false;
@@ -321,6 +353,7 @@ __fi void SIF1Dma()
 	} while (/*!done &&*/ BusyCheck > 0);
 
 	Sif1End();
+	TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::Exit);
 }
 
 __fi void  sif1Interrupt()
@@ -370,6 +403,7 @@ __fi void dmaSIF1()
 		}
 	}
 
+	TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase::Queued);
 	SIF1Dma();
 
 }

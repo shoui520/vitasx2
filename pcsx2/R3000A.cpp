@@ -6,6 +6,9 @@
 
 #include "SIO/Sio0.h"
 #include "Sif.h"
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#include "DebugTools/CoreEventTrace.h"
+#endif
 #include "DebugTools/Breakpoints.h"
 #include "R5900OpcodeTables.h"
 #include "IopCounters.h"
@@ -34,6 +37,26 @@ static constexpr uint iopWaitCycles = 384; // Keep inline with EE wait cycle max
 bool iopEventTestIsActive = false;
 
 alignas(16) psxRegisters psxRegs;
+
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+static __fi Pcsx2Trace::CoreEventId GetIopSifCoreEventId(IopEventId event)
+{
+	return event == IopEvt_SIF0 ? Pcsx2Trace::CoreEventId::IopSif0 :
+		event == IopEvt_SIF1 ? Pcsx2Trace::CoreEventId::IopSif1 :
+		Pcsx2Trace::CoreEventId::None;
+}
+
+static __fi void TraceIopCoreEvent(Pcsx2Trace::CoreEventKind kind,
+	Pcsx2Trace::CoreEventPhase phase, Pcsx2Trace::CoreEventId event_id, u64 target_cycle)
+{
+	Pcsx2Trace::RecordCoreEvent(kind, phase, Pcsx2Trace::CoreEventDomain::Iop,
+		event_id, target_cycle,
+		cpuRegs.interrupt, cpuRegs.dmastall, psxRegs.interrupt,
+		cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause, psxRegs.CP0.n.Status,
+		psxHu32(HW_ISTAT), psxHu32(HW_IMASK), psxHu32(HW_ICTRL),
+		cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.BadVAddr);
+}
+#endif
 
 void psxReset()
 {
@@ -146,6 +169,15 @@ __fi void PSX_INT( IopEventId n, s32 ecycle )
 
 	psxRegs.sCycle[n] = psxRegs.cycle;
 	psxRegs.eCycle[n] = ecycle;
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+	const Pcsx2Trace::CoreEventId trace_event_id = GetIopSifCoreEventId(n);
+	if (trace_event_id != Pcsx2Trace::CoreEventId::None)
+	{
+		TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Event,
+			Pcsx2Trace::CoreEventPhase::Schedule, trace_event_id,
+			psxRegs.sCycle[n] + psxRegs.eCycle[n]);
+	}
+#endif
 
 	psxSetNextBranchDelta(ecycle);
 	const float mutiplier = static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
@@ -165,8 +197,25 @@ static __fi void IopTestEvent( IopEventId n, void (*callback)() )
 
 	if( psxTestCycle( psxRegs.sCycle[n], psxRegs.eCycle[n] ) )
 	{
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+		const Pcsx2Trace::CoreEventId trace_event_id = GetIopSifCoreEventId(n);
+		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
+		{
+			TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Event,
+				Pcsx2Trace::CoreEventPhase::DispatchBegin, trace_event_id,
+				psxRegs.sCycle[n] + psxRegs.eCycle[n]);
+		}
+#endif
 		psxRegs.interrupt &= ~(1 << n);
 		callback();
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
+		{
+			TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Event,
+				Pcsx2Trace::CoreEventPhase::DispatchEnd, trace_event_id,
+				psxRegs.sCycle[n] + psxRegs.eCycle[n]);
+		}
+#endif
 	}
 	else
 		psxSetNextBranch( psxRegs.sCycle[n], psxRegs.eCycle[n] );
@@ -219,6 +268,11 @@ static __fi void _psxTestInterrupts()
 __ri void iopEventTest()
 {
 	psxRegs.iopNextEventCycle = psxRegs.cycle + iopWaitCycles;
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+	TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
+		Pcsx2Trace::CoreEventPhase::Enter, Pcsx2Trace::CoreEventId::None,
+		psxRegs.iopNextEventCycle);
+#endif
 
 	if (psxTestCycle(psxNextStartCounter, psxNextDeltaCounter))
 	{
@@ -249,6 +303,11 @@ __ri void iopEventTest()
 			iopEventAction = true;
 		}
 	}
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+	TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
+		Pcsx2Trace::CoreEventPhase::Exit, Pcsx2Trace::CoreEventId::None,
+		psxRegs.iopNextEventCycle);
+#endif
 }
 
 void iopTestIntc()

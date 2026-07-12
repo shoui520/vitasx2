@@ -3,6 +3,9 @@
 
 #include "CDVD/CDVD.h"
 #include "Config.h"
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#include "DebugTools/CoreEventTrace.h"
+#endif
 #include "DebugTools/EeTrace.h"
 #include "DebugTools/GsTrace.h"
 #include "DebugTools/IopTrace.h"
@@ -33,9 +36,13 @@ namespace VMManager
 	static VMState s_state = VMState::Shutdown;
 	static std::string s_elf_override;
 	static std::string s_elf_path;
+	static std::string s_disc_serial;
+	static std::string s_disc_elf;
+	static std::string s_disc_version;
 	static const std::string s_empty_string;
 	static const std::vector<u32> s_empty_processors;
 	static u32 s_current_crc = 0;
+	static u32 s_disc_crc = 0;
 	static u32 s_elf_entry_point = 0xFFFFFFFFu;
 	static bool s_elf_executed = false;
 	static bool s_fast_boot_requested = false;
@@ -66,6 +73,24 @@ namespace VMManager
 		s_elf_executed = false;
 		s_elf_path = {};
 		s_elf_entry_point = 0xFFFFFFFFu;
+	}
+
+	static void ClearDiscInfo()
+	{
+		s_disc_serial = {};
+		s_disc_elf = {};
+		s_disc_version = {};
+		s_disc_crc = 0;
+	}
+
+	static void UpdateDiscInfo()
+	{
+		// PCSX2 owner: VMManager.cpp::UpdateDiscDetails(). Disc metadata is
+		// machine state, not UI decoration: CDVD.cpp::cdvdReadKey() consumes the
+		// serial when emulating the MechaCon disc-key command.
+		cdvdGetDiscInfo(&s_disc_serial, &s_disc_elf, &s_disc_version, &s_disc_crc, nullptr);
+		Console.WriteLn("Vita disc metadata: serial=%s elf=%s version=%s crc=%08x",
+			s_disc_serial.c_str(), s_disc_elf.c_str(), s_disc_version.c_str(), s_disc_crc);
 	}
 
 	static bool HasBootedELFState()
@@ -100,7 +125,7 @@ namespace VMManager
 
 	std::string GetDiscELF()
 	{
-		return {};
+		return s_disc_elf;
 	}
 
 	std::string GetTitle(bool prefer_en)
@@ -110,12 +135,12 @@ namespace VMManager
 
 	u32 GetDiscCRC()
 	{
-		return s_current_crc;
+		return s_disc_crc;
 	}
 
 	std::string GetDiscVersion()
 	{
-		return {};
+		return s_disc_version;
 	}
 
 	u32 GetCurrentCRC()
@@ -150,7 +175,7 @@ namespace VMManager
 
 	std::string GetDiscSerial()
 	{
-		return {};
+		return s_disc_serial;
 	}
 
 	void UpdateTargetSpeed()
@@ -234,6 +259,9 @@ namespace VMManager
 			// trace domain immediately before EntryPointCompilingOnCPUThread().
 			// Vita's VM shim owns that edge for both interpreter and A32 EE/IOP.
 			Pcsx2Trace::NotifyEeElfEntry(s_elf_entry_point);
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+			Pcsx2Trace::NotifyCoreEventElfEntry(s_elf_entry_point);
+#endif
 			Pcsx2Trace::NotifyMemElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyGsElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyIopElfEntry(s_elf_entry_point);
@@ -272,6 +300,7 @@ void VitaClearVmBootState()
 {
 	VMManager::SetState(VMState::Shutdown);
 	VMManager::ClearELFInfo();
+	VMManager::ClearDiscInfo();
 	VMManager::s_elf_override = {};
 	VMManager::s_fast_boot_requested = false;
 }
@@ -279,6 +308,7 @@ void VitaClearVmBootState()
 void VitaSetFastBootElfOverride(const char* elf_path)
 {
 	VMManager::ClearELFInfo();
+	VMManager::ClearDiscInfo();
 	VMManager::s_elf_override = elf_path ? std::string(elf_path) : std::string();
 	VMManager::s_fast_boot_requested = !VMManager::s_elf_override.empty();
 }
@@ -286,6 +316,7 @@ void VitaSetFastBootElfOverride(const char* elf_path)
 void VitaSetFastBootDisc()
 {
 	VMManager::ClearELFInfo();
+	VMManager::UpdateDiscInfo();
 	VMManager::s_elf_override = {};
 	VMManager::s_fast_boot_requested = true;
 }

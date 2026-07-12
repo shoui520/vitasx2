@@ -7415,6 +7415,29 @@ namespace VitaEE
 					case 0x28: // MFSA
 						clear(rd);
 						return;
+					case 0x18: // MULT, owned by R5900OpcodeImpl.cpp::MULT().
+					case 0x19: // MULTU, owned by R5900OpcodeImpl.cpp::MULTU().
+					{
+						// Unlike MIPS I's two-operand spelling, the EE writes the
+						// sign-extended low product to rd as well as LO/HI. Do not
+						// let a constant defined before the multiply survive into a
+						// same-block consumer of that architectural result.
+						u32 lhs = 0;
+						u32 rhs = 0;
+						if (known(rs, &lhs) && known(rt, &rhs))
+						{
+							const u32 low = (op & 0x3f) == 0x18 ?
+								static_cast<u32>(static_cast<s64>(static_cast<s32>(lhs)) *
+									static_cast<s64>(static_cast<s32>(rhs))) :
+								static_cast<u32>(static_cast<u64>(lhs) * static_cast<u64>(rhs));
+							set_sign32(rd, low);
+						}
+						else
+						{
+							clear(rd);
+						}
+						return;
+					}
 					case 0x2a: // SLT
 					case 0x2b: // SLTU
 	{

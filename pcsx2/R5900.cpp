@@ -17,6 +17,7 @@
 #endif
 
 #include "Hardware.h"
+#include "IopHw.h"
 #include "IPU/IPUdma.h"
 
 #include "Elfheader.h"
@@ -26,6 +27,9 @@
 #include "GSDumpReplayer.h"
 
 #include "DebugTools/Breakpoints.h"
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#include "DebugTools/CoreEventTrace.h"
+#endif
 #include "DebugTools/MIPSAnalyst.h"
 #include "DebugTools/SymbolGuardian.h"
 #include "R5900OpcodeTables.h"
@@ -49,6 +53,26 @@ bool eeEventTestIsActive = false;
 EE_intProcessStatus eeRunInterruptScan = INT_NOT_RUNNING;
 
 u32 g_eeloadMain = 0, g_eeloadExec = 0, g_osdsys_str = 0;
+
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+static __fi Pcsx2Trace::CoreEventId GetEeSifCoreEventId(u8 event)
+{
+	return event == DMAC_SIF0 ? Pcsx2Trace::CoreEventId::EeDmacSif0 :
+		event == DMAC_SIF1 ? Pcsx2Trace::CoreEventId::EeDmacSif1 :
+		Pcsx2Trace::CoreEventId::None;
+}
+
+static __fi void TraceEeCoreEvent(Pcsx2Trace::CoreEventKind kind,
+	Pcsx2Trace::CoreEventPhase phase, Pcsx2Trace::CoreEventId event_id, u64 target_cycle)
+{
+	Pcsx2Trace::RecordCoreEvent(kind, phase, Pcsx2Trace::CoreEventDomain::Ee,
+		event_id, target_cycle,
+		cpuRegs.interrupt, cpuRegs.dmastall, psxRegs.interrupt,
+		cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause, psxRegs.CP0.n.Status,
+		psxHu32(HW_ISTAT), psxHu32(HW_IMASK), psxHu32(HW_ICTRL),
+		cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.BadVAddr);
+}
+#endif
 
 /* I don't know how much space for args there is in the memory block used for args in full boot mode,
 but in fast boot mode, the block we use can fit at least 16 argv pointers (varies with BIOS version).
@@ -251,8 +275,25 @@ static __fi void TESTINT( u8 n, void (*callback)() )
 
 	if(CHECK_INSTANTDMAHACK || cpuTestCycle( cpuRegs.sCycle[n], cpuRegs.eCycle[n] ) )
 	{
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+		const Pcsx2Trace::CoreEventId trace_event_id = GetEeSifCoreEventId(n);
+		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
+		{
+			TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Event,
+				Pcsx2Trace::CoreEventPhase::DispatchBegin, trace_event_id,
+				cpuRegs.sCycle[n] + cpuRegs.eCycle[n]);
+		}
+#endif
 		cpuClearInt( n );
 		callback();
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
+		{
+			TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Event,
+				Pcsx2Trace::CoreEventPhase::DispatchEnd, trace_event_id,
+				cpuRegs.sCycle[n] + cpuRegs.eCycle[n]);
+		}
+#endif
 	}
 	else
 		cpuSetNextEvent( cpuRegs.sCycle[n], cpuRegs.eCycle[n] );
@@ -366,6 +407,11 @@ __fi void _cpuEventTest_Shared()
 	eeEventTestIsActive = true;
 	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
 	cpuRegs.lastEventCycle = cpuRegs.cycle;
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+	TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
+		Pcsx2Trace::CoreEventPhase::Enter, Pcsx2Trace::CoreEventId::None,
+		cpuRegs.nextEventCycle);
+#endif
 	// ---- INTC / DMAC (CPU-level Exceptions) -----------------
 	// Done first because exceptions raised during event tests need to be postponed a few
 	// cycles (fixes Grandia II [PAL], which does a spin loop on a vsync and expects to
@@ -396,6 +442,12 @@ __fi void _cpuEventTest_Shared()
 		//if( EEsCycle < -450 )
 		//	Console.WriteLn( " IOP ahead by: %d cycles", -EEsCycle );
 
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+		TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
+			Pcsx2Trace::CoreEventPhase::Before, Pcsx2Trace::CoreEventId::None,
+			cpuRegs.nextEventCycle);
+#endif
+
 #if defined(__arm__)
 		// PCSX2 owner: x86/iR3000A.cpp::recExecuteBlock() documents the intended
 		// direct iopEnterRecompiledCode() scheduler seam. Provider selection
@@ -413,6 +465,12 @@ __fi void _cpuEventTest_Shared()
 		{
 			EEsCycle = psxCpu->ExecuteBlock(EEsCycle);
 		}
+#endif
+
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+		TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
+			Pcsx2Trace::CoreEventPhase::After, Pcsx2Trace::CoreEventId::None,
+			cpuRegs.nextEventCycle);
 #endif
 
 		iopEventAction = false;
@@ -475,6 +533,11 @@ __fi void _cpuEventTest_Shared()
 	cpuSetNextEvent(nextStartCounter, nextDeltaCounter);
 
 	eeEventTestIsActive = false;
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+	TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
+		Pcsx2Trace::CoreEventPhase::Exit, Pcsx2Trace::CoreEventId::None,
+		cpuRegs.nextEventCycle);
+#endif
 }
 
 __ri void cpuTestINTCInts()
@@ -548,6 +611,14 @@ __fi void CPU_INT( EE_EventType n, s32 ecycle)
 		cpuRegs.interrupt |= 1 << n;
 		cpuRegs.sCycle[n] = cpuRegs.cycle;
 		cpuRegs.eCycle[n] = 0;
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+		const Pcsx2Trace::CoreEventId trace_event_id = GetEeSifCoreEventId(n);
+		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
+		{
+			TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Event,
+				Pcsx2Trace::CoreEventPhase::Schedule, trace_event_id, cpuRegs.cycle);
+		}
+#endif
 		return;
 	}
 
@@ -560,6 +631,15 @@ __fi void CPU_INT( EE_EventType n, s32 ecycle)
 	cpuRegs.interrupt |= 1 << n;
 	cpuRegs.sCycle[n] = cpuRegs.cycle;
 	cpuRegs.eCycle[n] = ecycle;
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+	const Pcsx2Trace::CoreEventId trace_event_id = GetEeSifCoreEventId(n);
+	if (trace_event_id != Pcsx2Trace::CoreEventId::None)
+	{
+		TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Event,
+			Pcsx2Trace::CoreEventPhase::Schedule, trace_event_id,
+			cpuRegs.sCycle[n] + cpuRegs.eCycle[n]);
+	}
+#endif
 
 	// Interrupt is happening soon: make sure both EE and IOP are aware.
 

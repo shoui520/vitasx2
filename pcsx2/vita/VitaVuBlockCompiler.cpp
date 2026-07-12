@@ -3316,7 +3316,11 @@ namespace VitaVU
 				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
 					return false;
 
-				// Q2 = fs, Q3 = ft, Q4 = ACC (OPMSUB only).
+				// Q2 = fs, Q3 = ft. OPMSUB initially loads ACC in Q0, then
+				// moves it to Q2 only after the rearranged fs lanes have consumed
+				// that source. Keeping operand/result temporaries in Q0-Q3 (with
+				// normalization constants/scratch in caller-clobbered Q8-Q15) avoids
+				// Q4-Q7 and preserves AAPCS D8-D15 without a per-block VFP frame.
 				if (!EmitAddVfAddress(3, fs) ||
 					!m_code.EmitVld1Q32Aligned(2, 3) ||
 					!EmitAddVfAddress(3, ft) ||
@@ -3328,8 +3332,8 @@ namespace VitaVU
 				if (opmsub)
 				{
 					if (!m_code.EmitAddImm32(3, HOST_VU, VuOffset(offsetof(VURegs, ACC))) ||
-						!m_code.EmitVld1Q32Aligned(4, 3) ||
-						!EmitNormalizeVuFloatQuads3(2, 3, 4))
+						!m_code.EmitVld1Q32Aligned(0, 3) ||
+						!EmitNormalizeVuFloatQuads3(2, 3, 0))
 					{
 						return false;
 					}
@@ -3339,20 +3343,18 @@ namespace VitaVU
 					return false;
 				}
 
-				// fs_yzx = {fs.y, fs.z, fs.x, fs.x} in Q0 (S0-S3);
-				// ft_zxy = {ft.z, ft.x, ft.y, ft.y} in Q1 (S4-S7).
-				// Q2 = S8-S11 (fs), Q3 = S12-S15 (ft).
-				if (!m_code.EmitVmovS(0, 9) || !m_code.EmitVmovS(1, 10) ||
-					!m_code.EmitVmovS(2, 8) || !m_code.EmitVmovS(3, 8) ||
-					!m_code.EmitVmovS(4, 14) || !m_code.EmitVmovS(5, 12) ||
-					!m_code.EmitVmovS(6, 13) || !m_code.EmitVmovS(7, 13) ||
-					!m_code.EmitVmulF32Q(0, 0, 1))
-				{
-					return false;
-				}
-
 				if (!opmsub)
 				{
+					// fs_yzx = {fs.y, fs.z, fs.x, fs.x} in Q0;
+					// ft_zxy = {ft.z, ft.x, ft.y, ft.y} in Q1.
+					if (!m_code.EmitVmovS(0, 9) || !m_code.EmitVmovS(1, 10) ||
+						!m_code.EmitVmovS(2, 8) || !m_code.EmitVmovS(3, 8) ||
+						!m_code.EmitVmovS(4, 14) || !m_code.EmitVmovS(5, 12) ||
+						!m_code.EmitVmovS(6, 13) || !m_code.EmitVmovS(7, 13) ||
+						!m_code.EmitVmulF32Q(0, 0, 1))
+					{
+						return false;
+					}
 					if (!EmitFinishOuterLaneFromS(0, 2, true, 0, 0) ||
 						!EmitFinishOuterLaneFromS(1, 2, true, 0, 1) ||
 						!EmitFinishOuterLaneFromS(2, 2, true, 0, 2))
@@ -3362,7 +3364,16 @@ namespace VitaVU
 				}
 				else
 				{
-					if (!m_code.EmitVsubF32Q(0, 4, 0) ||
+					// Build fs_yzx in Q1 while Q0 retains ACC, then reuse dead
+					// Q2 for ACC and Q0 for ft_zxy. VMUL keeps PCSX2's fs*ft
+					// operand order for NaN behavior before ACC-product subtraction.
+					if (!m_code.EmitVmovS(4, 9) || !m_code.EmitVmovS(5, 10) ||
+						!m_code.EmitVmovS(6, 8) || !m_code.EmitVmovS(7, 8) ||
+						!m_code.EmitVorrQ(2, 0, 0) ||
+						!m_code.EmitVmovS(0, 14) || !m_code.EmitVmovS(1, 12) ||
+						!m_code.EmitVmovS(2, 13) || !m_code.EmitVmovS(3, 13) ||
+						!m_code.EmitVmulF32Q(1, 1, 0) ||
+						!m_code.EmitVsubF32Q(0, 2, 1) ||
 						!EmitFinishOuterLaneFromS(0, 2, false, fd, 0) ||
 						!EmitFinishOuterLaneFromS(1, 2, false, fd, 1) ||
 						!EmitFinishOuterLaneFromS(2, 2, false, fd, 2))

@@ -5,11 +5,31 @@
 
 #include "R3000A.h"
 #include "Common.h"
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#include "DebugTools/CoreEventTrace.h"
+#endif
 #include "DebugTools/SifTrace.h"
 #include "Sif.h"
 #include "IopHw.h"
 
 _sif sif0;
+
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+static __fi void TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase phase)
+{
+	const u32 state = static_cast<u32>(sif0.ee.busy) |
+		(static_cast<u32>(sif0.ee.end) << 1) |
+		(static_cast<u32>(sif0.iop.busy) << 2) |
+		(static_cast<u32>(sif0.iop.end) << 3);
+	Pcsx2Trace::RecordCoreEvent(Pcsx2Trace::CoreEventKind::Sif, phase,
+		Pcsx2Trace::CoreEventDomain::Sif0, Pcsx2Trace::CoreEventId::IopSif0, 0,
+		sif0ch.chcr._u32, sif0ch.madr, sif0ch.qwc, sif0ch.tadr,
+		HW_DMA9_CHCR, hw_dma9.madr, hw_dma9.tadr, sif0.fifo.size,
+		state, sif0.iop.counter, sif0data);
+}
+#else
+#define TraceSif0CoreEvent(phase) ((void)0)
+#endif
 
 static bool done = false;
 
@@ -40,10 +60,12 @@ static __fi bool WriteFifoToEE()
 
 	const u32 ee_madr = sif0ch.madr;
 	const u32 fifo_before = sif0.fifo.size;
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Before);
 	sif0.fifo.read((u32*)ptag, readSize << 2);
 	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 0, Pcsx2Trace::SifTraceDirectionFifoToEe,
 		ptag, static_cast<u32>(readSize << 2), ee_madr, hw_dma9.madr, sif0ch.qwc, sif0.iop.counter,
 		fifo_before, sif0.fifo.size, sif0ch.chcr._u32, sif0data, hw_dma9.tadr);
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::After);
 
 	// Clearing handled by vtlb memory protection and manual blocks.
 	//Cpu->Clear(sif0ch.madr, readSize*4);
@@ -73,10 +95,12 @@ static __fi bool WriteIOPtoFifo()
 	const u32 iop_madr = hw_dma9.madr;
 	const u32 fifo_before = sif0.fifo.size;
 	const void* source = iopPhysMem(iop_madr);
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Before);
 	sif0.fifo.write((u32*)source, writeSize);
 	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 0, Pcsx2Trace::SifTraceDirectionIopToFifo,
 		source, static_cast<u32>(writeSize), sif0ch.madr, iop_madr, sif0ch.qwc, sif0.iop.counter,
 		fifo_before, sif0.fifo.size, HW_DMA9_CHCR, sif0data, hw_dma9.tadr);
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::After);
 	hw_dma9.madr += writeSize << 2;
 
 	// iop is 1/8th the clock rate of the EE and psxcycles is in words (not quadwords).
@@ -94,10 +118,12 @@ static __fi bool ProcessEETag()
 	tDMA_TAG& ptag(*(tDMA_TAG*)tag);
 
 	const u32 fifo_before = sif0.fifo.size;
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Before);
 	sif0.fifo.read((u32*)&tag[0], 4); // Tag
 	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoTag, 0, Pcsx2Trace::SifTraceDirectionFifoToEe,
 		tag, 4, sif0ch.madr, hw_dma9.madr, sif0ch.qwc, sif0.iop.counter,
 		fifo_before, sif0.fifo.size, sif0ch.chcr._u32, tag[0], hw_dma9.tadr);
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::After);
 	SIF_LOG("SIF0 EE read tag: %x %x %x %x", tag[0], tag[1], tag[2], tag[3]);
 
 	sif0ch.unsafeTransfer(&ptag);
@@ -139,10 +165,12 @@ static __fi bool ProcessIOPTag()
 	// ignored by the EE, however required for alignment and used as junk data in small packets.
 	const u32 fifo_before = sif0.fifo.size;
 	const void* ee_tag_source = iopPhysMem(hw_dma9.tadr + 8);
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Before);
 	sif0.fifo.write((u32*)ee_tag_source, 4);
 	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoTag, 0, Pcsx2Trace::SifTraceDirectionIopToFifo,
 		ee_tag_source, 4, sif0ch.madr, hw_dma9.madr, sif0ch.qwc, sif0.iop.counter,
 		fifo_before, sif0.fifo.size, HW_DMA9_CHCR, sif0data, hw_dma9.tadr);
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::After);
 
 	// I know we just sent 1QW, because of the size of the EE read, but only 64bits was valid
 	// so we advance by 64bits after the EE tag to get the next IOP tag.
@@ -314,6 +342,7 @@ static __fi void Sif0End()
 __fi void SIF0Dma()
 {
 	int BusyCheck = 0;
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Enter);
 	Sif0Init();
 
 	do
@@ -347,18 +376,21 @@ __fi void SIF0Dma()
 	} while (/*!done && */BusyCheck > 0); // Substituting (sif0.ee.busy || sif0.iop.busy) breaks things.
 
 	Sif0End();
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Exit);
 }
 
 __fi void  sif0Interrupt()
 {
 	HW_DMA9_CHCR &= ~0x01000000;
 	psxDmaInterrupt2(2);
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Executed);
 }
 
 __fi void  EEsif0Interrupt()
 {
 	hwDmacIrq(DMAC_SIF0);
 	sif0ch.chcr.STR = false;
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Executed);
 }
 
 __fi void dmaSIF0()
@@ -386,6 +418,7 @@ __fi void dmaSIF0()
 	// Legend of Legaia doesn't throw a warning either :)
 	sif0.ee.end = false;
 	CPU_SET_DMASTALL(DMAC_SIF0, false);
+	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Queued);
 	SIF0Dma();
 
 }
