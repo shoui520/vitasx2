@@ -980,18 +980,6 @@ namespace
 		return (static_cast<u64>(hi) << 32) | lo;
 	}
 
-	bool DecodeExitKind(u32 value, VitaIOP::BlockExitKind* exit)
-	{
-		if (value == static_cast<u32>(VitaIOP::BlockExitKind::Direct) ||
-			value == static_cast<u32>(VitaIOP::BlockExitKind::IsolateModeWrite))
-		{
-			*exit = static_cast<VitaIOP::BlockExitKind>(value);
-			return true;
-		}
-
-		return false;
-	}
-
 	size_t AlignUp(size_t value, size_t alignment)
 	{
 		return (value + alignment - 1) & ~(alignment - 1);
@@ -6690,6 +6678,14 @@ namespace VitaIOP
 		m_batched_cycle_instructions_removed = 0;
 		m_batched_cycle_stack_words_removed = 0;
 		m_expanded_cycle_batching_provider_entries = 0;
+		m_pinned_gpr_memory_ops_saved = 0;
+		m_pinned_branch_operand_moves_removed = 0;
+		m_condition_code_branch_instructions_removed = 0;
+		m_producer_branch_compare_instructions_removed = 0;
+		m_fused_ram_guard_instructions_removed = 0;
+		m_source_page_guard_instructions_removed = 0;
+		m_source_page_literal_instructions_removed = 0;
+		m_isolate_cache_guard_instructions_removed = 0;
 		s_qemuIopLinkedFrameEvidence = {};
 		s_qemuIopSequentialQwordCopyFastPaths = 0;
 		s_qemuIopBranchEventCandidates = 0;
@@ -8390,6 +8386,21 @@ namespace VitaIOP
 		result->batched_cycle_instructions_removed = m_batched_cycle_instructions_removed;
 		result->batched_cycle_stack_words_removed = m_batched_cycle_stack_words_removed;
 		result->expanded_cycle_batching_provider_entries = m_expanded_cycle_batching_provider_entries;
+		result->total_pinned_gpr_memory_ops_saved = m_pinned_gpr_memory_ops_saved;
+		result->total_pinned_branch_operand_moves_removed =
+			m_pinned_branch_operand_moves_removed;
+		result->total_condition_code_branch_instructions_removed =
+			m_condition_code_branch_instructions_removed;
+		result->total_producer_branch_compare_instructions_removed =
+			m_producer_branch_compare_instructions_removed;
+		result->total_fused_ram_guard_instructions_removed =
+			m_fused_ram_guard_instructions_removed;
+		result->total_source_page_guard_instructions_removed =
+			m_source_page_guard_instructions_removed;
+		result->total_source_page_literal_instructions_removed =
+			m_source_page_literal_instructions_removed;
+		result->total_isolate_cache_guard_instructions_removed =
+			m_isolate_cache_guard_instructions_removed;
 		result->linked_frame_bypass_entries = s_qemuIopLinkedFrameEvidence.entries;
 		result->linked_frame_instructions_removed =
 			s_qemuIopLinkedFrameEvidence.instructions_removed;
@@ -8441,70 +8452,14 @@ namespace VitaIOP
 		// A newly compiled block is source-proven by CompileIntoCacheEntry().
 
 		psxRegs.pc = block.start_pc;
-		if (block.wait_loop_shape && block.wait_loop_enabled_at_compile &&
-			(block.poll_call_wait_loop ? TryFastForwardPollCallWaitLoop(block) :
-									TryFastForwardTrustedWaitLoopAtPc(block.start_pc)))
-		{
-			result->exit = BlockExitKind::Direct;
-			if (publish_details)
-			{
-				PublishExecutionDetails(block, result);
-			}
-#if defined(VITASX2_QEMU_VALIDATION)
-			else
-			{
-				result->instruction_count = block.instruction_count;
-				result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
-				result->pinned_branch_operand_moves_removed =
-					block.pinned_branch_operand_moves_removed;
-				result->condition_code_branch_instructions_removed =
-					block.condition_code_branch_instructions_removed;
-				result->producer_branch_compare_instructions_removed =
-					block.producer_branch_compare_instructions_removed;
-				result->fused_ram_guard_instructions_removed =
-					block.fused_ram_guard_instructions_removed;
-				result->source_page_guard_instructions_removed =
-					block.source_page_guard_instructions_removed;
-				result->source_page_literal_instructions_removed =
-					block.source_page_literal_instructions_removed;
-				result->isolate_cache_guard_instructions_removed =
-					block.isolate_cache_guard_instructions_removed;
-			}
-#endif
-			// The generated block did not execute, so no producer-to-branch CMP
-			// was dynamically removed on this wait-loop fast-forward entry.
-#if defined(VITASX2_QEMU_VALIDATION)
-			result->producer_branch_compare_instructions_removed = 0;
-			result->fused_ram_guard_instructions_removed = 0;
-			result->source_page_guard_instructions_removed = 0;
-			result->source_page_literal_instructions_removed = 0;
-			result->isolate_cache_guard_instructions_removed = 0;
-#endif
-			result->wait_loop_fast_forward = true;
-			return true;
-		}
-
-#if defined(VITASX2_QEMU_VALIDATION)
-		if (block.direct_budget_exit)
-			m_direct_budget_exit_provider_entries++;
-		if (block.constant_cycle_budget)
-			m_constant_cycle_budget_provider_entries++;
-		m_clock_mode_check_instructions_removed += block.clock_mode_check_instructions_removed;
-		m_saved_register_stack_words_removed += block.saved_register_stack_words_removed;
-		m_saved_register_frame_instructions_added += block.saved_register_frame_instructions_added;
-		m_saved_register_frame_instructions_removed += block.saved_register_frame_instructions_removed;
-		m_batched_cycle_instructions_removed += block.batched_cycle_instructions_removed;
-		m_batched_cycle_stack_words_removed += block.batched_cycle_stack_words_removed;
-		if (block.expanded_cycle_batching)
-			m_expanded_cycle_batching_provider_entries++;
-#endif
-		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
-
-		BlockExitKind exit = BlockExitKind::Direct;
-		if (!DecodeExitKind(exit_value, &exit))
+		const u32 dispatch_flags = RunProviderBlock(block, 0);
+		if ((dispatch_flags & ProviderDispatchSuccess) == 0)
 			return false;
 
-		result->exit = exit;
+		const bool wait_forward =
+			(dispatch_flags & ProviderDispatchWaitForward) != 0;
+		result->exit = (dispatch_flags & ProviderDispatchIsolateWrite) != 0 ?
+			BlockExitKind::IsolateModeWrite : BlockExitKind::Direct;
 		if (publish_details)
 		{
 			PublishExecutionDetails(block, result);
@@ -8530,13 +8485,97 @@ namespace VitaIOP
 				block.isolate_cache_guard_instructions_removed;
 		}
 #endif
-		if (exit == BlockExitKind::IsolateModeWrite)
+		if (wait_forward)
 		{
+			// The generated block did not execute, so none of its memory or
+			// producer-to-branch fast paths was dynamically traversed.
+#if defined(VITASX2_QEMU_VALIDATION)
+			result->producer_branch_compare_instructions_removed = 0;
+			result->fused_ram_guard_instructions_removed = 0;
+			result->source_page_guard_instructions_removed = 0;
+			result->source_page_literal_instructions_removed = 0;
+			result->isolate_cache_guard_instructions_removed = 0;
+#endif
+		}
+		result->wait_loop_fast_forward = wait_forward;
+		result->isolate_mode_switched =
+			(dispatch_flags & ProviderDispatchIsolateSwitch) != 0;
+		return true;
+	}
+
+	u32 BlockExecutor::RunProviderBlock(CachedBlock& block, u32 dispatch_flags)
+	{
+		if (!block.valid)
+			return 0;
+
+		// PCSX2 owner: x86/iR3000A.cpp::_DynGen_EnterRecompiledCode() enters
+		// the selected BaseBlock directly and returns only dispatcher control.
+		// psxRecExecuteBlock() passes the architectural PC it just read, so the
+		// detailed API's redundant psxRegs.pc publication and result aggregate
+		// are unnecessary on this provider-only path.
+		if (block.wait_loop_shape && block.wait_loop_enabled_at_compile &&
+			(block.poll_call_wait_loop ? TryFastForwardPollCallWaitLoop(block) :
+									TryFastForwardTrustedWaitLoopAtPc(block.start_pc)))
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_pinned_gpr_memory_ops_saved += block.pinned_gpr_memory_ops_saved;
+			m_pinned_branch_operand_moves_removed +=
+				block.pinned_branch_operand_moves_removed;
+			m_condition_code_branch_instructions_removed +=
+				block.condition_code_branch_instructions_removed;
+#endif
+			return dispatch_flags | ProviderDispatchSuccess | ProviderDispatchWaitForward;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (block.direct_budget_exit)
+			m_direct_budget_exit_provider_entries++;
+		if (block.constant_cycle_budget)
+			m_constant_cycle_budget_provider_entries++;
+		m_clock_mode_check_instructions_removed += block.clock_mode_check_instructions_removed;
+		m_saved_register_stack_words_removed += block.saved_register_stack_words_removed;
+		m_saved_register_frame_instructions_added += block.saved_register_frame_instructions_added;
+		m_saved_register_frame_instructions_removed += block.saved_register_frame_instructions_removed;
+		m_batched_cycle_instructions_removed += block.batched_cycle_instructions_removed;
+		m_batched_cycle_stack_words_removed += block.batched_cycle_stack_words_removed;
+		if (block.expanded_cycle_batching)
+			m_expanded_cycle_batching_provider_entries++;
+#endif
+
+		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
+		if (exit_value != static_cast<u32>(BlockExitKind::Direct) &&
+			exit_value != static_cast<u32>(BlockExitKind::IsolateModeWrite))
+		{
+			return 0;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_pinned_gpr_memory_ops_saved += block.pinned_gpr_memory_ops_saved;
+		m_pinned_branch_operand_moves_removed +=
+			block.pinned_branch_operand_moves_removed;
+		m_condition_code_branch_instructions_removed +=
+			block.condition_code_branch_instructions_removed;
+		m_producer_branch_compare_instructions_removed +=
+			block.producer_branch_compare_instructions_removed;
+		m_fused_ram_guard_instructions_removed += block.fused_ram_guard_instructions_removed;
+		m_source_page_guard_instructions_removed +=
+			block.source_page_guard_instructions_removed;
+		m_source_page_literal_instructions_removed +=
+			block.source_page_literal_instructions_removed;
+		m_isolate_cache_guard_instructions_removed +=
+			block.isolate_cache_guard_instructions_removed;
+#endif
+
+		if (exit_value == static_cast<u32>(BlockExitKind::IsolateModeWrite))
+		{
+			dispatch_flags |= ProviderDispatchIsolateWrite;
 			const bool new_mode = (psxRegs.CP0.n.Status & 0x10000u) != 0;
-			result->isolate_mode_switched = new_mode != m_active_isolate_cache_mode;
+			if (new_mode != m_active_isolate_cache_mode)
+				dispatch_flags |= ProviderDispatchIsolateSwitch;
 			m_active_isolate_cache_mode = new_mode;
 		}
-		return true;
+
+		return dispatch_flags | ProviderDispatchSuccess;
 	}
 
 	bool BlockExecutor::ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
@@ -8656,5 +8695,96 @@ namespace VitaIOP
 		}
 
 		return ExecuteCompiledBlock(start_pc, scan.instruction_count, result, publish_details);
+	}
+
+	u32 BlockExecutor::ExecuteProviderBlockAtPc(
+		u32 start_pc, ProviderCompileResult* compile_result)
+	{
+		if ((start_pc & 0x3u) != 0)
+			return 0;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		const auto publish_profile_metadata = [compile_result](const CachedBlock& block) {
+			if (!compile_result)
+				return;
+			compile_result->instruction_count = block.instruction_count;
+			compile_result->native_instruction_count = block.native_instruction_count;
+			compile_result->helper_instruction_count = block.helper_instruction_count;
+			compile_result->code_cache_resets = 0;
+		};
+#endif
+
+		// This is the compact provider counterpart of ExecuteCompiledBlockAtPc().
+		// Hot dispatch state returns in r0 as one flag word. Product code writes
+		// the four-word metadata object only after a cold compile; QEMU also fills
+		// it on hits for the hot-PC report.
+		if (CachedBlock* entry = FindHotDispatchCacheBlock(start_pc))
+		{
+			bool trust_raw_source = (entry->raw_opcodes != nullptr);
+#if defined(VITASX2_QEMU_VALIDATION)
+			trust_raw_source &= !s_qemuIopTrustedSourceAuditEnabled;
+			if (trust_raw_source)
+				m_hot_dispatch_trusted_raw_hits++;
+#endif
+			if (trust_raw_source || ValidateCachedBlock(*entry))
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				m_hot_dispatch_cache_hits++;
+				publish_profile_metadata(*entry);
+#endif
+				return RunProviderBlock(*entry,
+					ProviderDispatchCacheHit | ProviderDispatchLookupHit |
+					ProviderDispatchFastHit);
+			}
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_hot_dispatch_cache_misses++;
+#endif
+
+		if (CachedBlock* entry = FindLookupBlockByStartPc(
+				start_pc, m_active_isolate_cache_mode))
+		{
+			if (entry->valid && ValidateCachedBlock(*entry))
+			{
+				RegisterHotDispatchCache(*entry);
+#if defined(VITASX2_QEMU_VALIDATION)
+				publish_profile_metadata(*entry);
+#endif
+				return RunProviderBlock(*entry,
+					ProviderDispatchCacheHit | ProviderDispatchLookupHit |
+					ProviderDispatchFastHit);
+			}
+		}
+
+		if (CachedBlock* entry = FindRecordedBlockByStartPc(
+				start_pc, 0, false, m_active_isolate_cache_mode))
+		{
+			RegisterHotDispatchCache(*entry);
+#if defined(VITASX2_QEMU_VALIDATION)
+			publish_profile_metadata(*entry);
+#endif
+			return RunProviderBlock(*entry,
+				ProviderDispatchCacheHit | ProviderDispatchFastHit);
+		}
+
+		BlockScanResult scan;
+		if (!ScanStraightLineBlock(start_pc, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
+			scan.instruction_count == 0)
+		{
+			return 0;
+		}
+
+		CachedBlock* block = AllocateCacheEntry();
+		if (!block || !CompileIntoCacheEntry(*block, start_pc, scan.instruction_count))
+			return 0;
+
+		if (compile_result)
+		{
+			compile_result->instruction_count = block->instruction_count;
+			compile_result->native_instruction_count = block->native_instruction_count;
+			compile_result->helper_instruction_count = block->helper_instruction_count;
+			compile_result->code_cache_resets = m_code_cache_resets;
+		}
+		return RunProviderBlock(*block, 0);
 	}
 } // namespace VitaIOP

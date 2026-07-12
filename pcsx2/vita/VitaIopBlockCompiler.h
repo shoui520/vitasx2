@@ -82,6 +82,14 @@ namespace VitaIOP
 		u64 budget_before_event_instructions_removed;
 		u64 event_deadline_fast_skips;
 		u64 event_deadline_instructions_removed;
+		u64 total_pinned_gpr_memory_ops_saved;
+		u64 total_pinned_branch_operand_moves_removed;
+		u64 total_condition_code_branch_instructions_removed;
+		u64 total_producer_branch_compare_instructions_removed;
+		u64 total_fused_ram_guard_instructions_removed;
+		u64 total_source_page_guard_instructions_removed;
+		u64 total_source_page_literal_instructions_removed;
+		u64 total_isolate_cache_guard_instructions_removed;
 		u32 pinned_gpr_memory_ops_saved;
 		u32 pinned_branch_operand_moves_removed;
 		u32 condition_code_branch_instructions_removed;
@@ -95,6 +103,28 @@ namespace VitaIOP
 		bool lookup_hit;
 		bool fast_dispatch_hit;
 		bool wait_loop_fast_forward;
+	};
+
+	enum ProviderDispatchFlag : u32
+	{
+		ProviderDispatchSuccess = 1u << 0,
+		ProviderDispatchCacheHit = 1u << 1,
+		ProviderDispatchLookupHit = 1u << 2,
+		ProviderDispatchFastHit = 1u << 3,
+		ProviderDispatchWaitForward = 1u << 4,
+		ProviderDispatchIsolateSwitch = 1u << 5,
+		ProviderDispatchIsolateWrite = 1u << 6,
+	};
+
+	// PCSX2's iopEnterRecompiledCode dispatcher returns hot control state in
+	// registers. Product cache hits leave this cold-compile metadata untouched;
+	// QEMU fills it for the hot-PC report only.
+	struct ProviderCompileResult
+	{
+		u32 instruction_count;
+		u32 native_instruction_count;
+		u32 helper_instruction_count;
+		u32 code_cache_resets;
 	};
 
 	struct DirectLinkSlot
@@ -453,6 +483,7 @@ namespace VitaIOP
 			bool publish_details = true);
 		bool ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result,
 			bool publish_details = true);
+		u32 ExecuteProviderBlockAtPc(u32 start_pc, ProviderCompileResult* compile_result);
 
 	private:
 		// PCSX2 owner: x86/BaseblockEx.h::BaseBlocks() starts at 0x4000
@@ -613,6 +644,7 @@ namespace VitaIOP
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count);
 		void PublishExecutionDetails(const CachedBlock& block, BlockExecutionResult* result) const;
 		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result, bool publish_details);
+		u32 RunProviderBlock(CachedBlock& block, u32 dispatch_flags);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
 		void PatchIncomingLinks(CachedBlock& target);
@@ -659,6 +691,14 @@ namespace VitaIOP
 		u64 m_batched_cycle_instructions_removed = 0;
 		u64 m_batched_cycle_stack_words_removed = 0;
 		u64 m_expanded_cycle_batching_provider_entries = 0;
+		u64 m_pinned_gpr_memory_ops_saved = 0;
+		u64 m_pinned_branch_operand_moves_removed = 0;
+		u64 m_condition_code_branch_instructions_removed = 0;
+		u64 m_producer_branch_compare_instructions_removed = 0;
+		u64 m_fused_ram_guard_instructions_removed = 0;
+		u64 m_source_page_guard_instructions_removed = 0;
+		u64 m_source_page_literal_instructions_removed = 0;
+		u64 m_isolate_cache_guard_instructions_removed = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};

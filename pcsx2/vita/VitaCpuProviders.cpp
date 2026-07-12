@@ -50,14 +50,9 @@ struct IopDispatchProfileEntry
 };
 static std::unordered_map<u32, IopDispatchProfileEntry> s_iop_a32_dispatch_profile;
 static std::unordered_map<u64, u64> s_iop_a32_dispatch_edge_profile;
-static u64 s_iop_a32_pinned_gpr_memory_ops_saved = 0;
-static u64 s_iop_a32_pinned_branch_operand_moves_removed = 0;
-static u64 s_iop_a32_condition_code_branch_instructions_removed = 0;
-static u64 s_iop_a32_producer_branch_compare_instructions_removed = 0;
-static u64 s_iop_a32_fused_ram_guard_instructions_removed = 0;
-static u64 s_iop_a32_source_page_guard_instructions_removed = 0;
-static u64 s_iop_a32_source_page_literal_instructions_removed = 0;
-static u64 s_iop_a32_isolate_cache_guard_instructions_removed = 0;
+static bool s_iop_a32_compact_provider_dispatch_enabled = true;
+static u64 s_iop_a32_compact_provider_dispatch_entries = 0;
+static u64 s_iop_a32_compact_provider_cache_hit_entries = 0;
 #endif
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
@@ -771,13 +766,52 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			psxBiosCall();
 		}
 
-		VitaIOP::BlockExecutionResult result;
 		const u32 pc = psxRegs.pc;
-		// PCSX2 owner: x86/iR3000A.cpp::_DynGen_EnterRecompiledCode()
-		// deliberately avoids per-entry stack/parameter work. The product
-		// provider likewise requests only its consumed control/compile fields;
-		// diagnostics retain the full executor snapshot contract.
-		if (!s_iop_a32_executor.ExecuteCompiledBlockAtPc(pc, &result, false))
+		VitaIOP::ProviderCompileResult compile_result;
+		u32 dispatch_flags = 0;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (s_iop_a32_compact_provider_dispatch_enabled)
+		{
+			dispatch_flags =
+				s_iop_a32_executor.ExecuteProviderBlockAtPc(pc, &compile_result);
+			if ((dispatch_flags & VitaIOP::ProviderDispatchSuccess) != 0)
+			{
+				s_iop_a32_compact_provider_dispatch_entries++;
+				if ((dispatch_flags & VitaIOP::ProviderDispatchCacheHit) != 0)
+					s_iop_a32_compact_provider_cache_hit_entries++;
+			}
+		}
+		else
+		{
+			VitaIOP::BlockExecutionResult legacy_result;
+			if (s_iop_a32_executor.ExecuteCompiledBlockAtPc(pc, &legacy_result, false))
+			{
+				dispatch_flags = VitaIOP::ProviderDispatchSuccess |
+					(legacy_result.cache_hit ? VitaIOP::ProviderDispatchCacheHit : 0) |
+					(legacy_result.lookup_hit ? VitaIOP::ProviderDispatchLookupHit : 0) |
+					(legacy_result.fast_dispatch_hit ? VitaIOP::ProviderDispatchFastHit : 0) |
+					(legacy_result.wait_loop_fast_forward ?
+						VitaIOP::ProviderDispatchWaitForward : 0) |
+					(legacy_result.isolate_mode_switched ?
+						VitaIOP::ProviderDispatchIsolateSwitch : 0);
+				compile_result.instruction_count = legacy_result.instruction_count;
+				if (!legacy_result.cache_hit)
+				{
+					compile_result.native_instruction_count =
+						legacy_result.native_instruction_count;
+					compile_result.helper_instruction_count =
+						legacy_result.helper_instruction_count;
+					compile_result.code_cache_resets = legacy_result.code_cache_resets;
+				}
+			}
+		}
+#else
+		// PCSX2 owner: x86/iR3000A.cpp::_DynGen_EnterRecompiledCode() returns
+		// dispatcher control in registers. The compact Vita provider does the
+		// same; only a cold compile writes compile_result.
+		dispatch_flags = s_iop_a32_executor.ExecuteProviderBlockAtPc(pc, &compile_result);
+#endif
+		if ((dispatch_flags & VitaIOP::ProviderDispatchSuccess) == 0)
 		{
 			const u32 opcode = iopMemRead32(pc);
 			VitaIOP::BlockScanResult scan;
@@ -799,7 +833,7 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			return fallback_result;
 		}
 
-		if (result.cache_hit)
+		if ((dispatch_flags & VitaIOP::ProviderDispatchCacheHit) != 0)
 		{
 			s_iop_a32_stats.cache_hits++;
 		}
@@ -807,35 +841,18 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		{
 			s_iop_a32_stats.cache_misses++;
 			s_iop_a32_stats.compiled_blocks++;
-			s_iop_a32_stats.compiled_instructions += result.instruction_count;
-			s_iop_a32_stats.native_instructions += result.native_instruction_count;
-			s_iop_a32_stats.helper_instructions += result.helper_instruction_count;
-			s_iop_a32_stats.code_cache_resets = result.code_cache_resets;
+			s_iop_a32_stats.compiled_instructions += compile_result.instruction_count;
+			s_iop_a32_stats.native_instructions += compile_result.native_instruction_count;
+			s_iop_a32_stats.helper_instructions += compile_result.helper_instruction_count;
+			s_iop_a32_stats.code_cache_resets = compile_result.code_cache_resets;
 		}
-		if (result.lookup_hit)
+		if ((dispatch_flags & VitaIOP::ProviderDispatchLookupHit) != 0)
 			s_iop_a32_stats.lookup_hits++;
-		if (result.fast_dispatch_hit)
+		if ((dispatch_flags & VitaIOP::ProviderDispatchFastHit) != 0)
 			s_iop_a32_stats.fast_dispatch_hits++;
-#if defined(VITASX2_QEMU_VALIDATION)
-		s_iop_a32_pinned_gpr_memory_ops_saved += result.pinned_gpr_memory_ops_saved;
-		s_iop_a32_pinned_branch_operand_moves_removed +=
-			result.pinned_branch_operand_moves_removed;
-		s_iop_a32_condition_code_branch_instructions_removed +=
-			result.condition_code_branch_instructions_removed;
-		s_iop_a32_producer_branch_compare_instructions_removed +=
-			result.producer_branch_compare_instructions_removed;
-		s_iop_a32_fused_ram_guard_instructions_removed +=
-			result.fused_ram_guard_instructions_removed;
-		s_iop_a32_source_page_guard_instructions_removed +=
-			result.source_page_guard_instructions_removed;
-		s_iop_a32_source_page_literal_instructions_removed +=
-			result.source_page_literal_instructions_removed;
-		s_iop_a32_isolate_cache_guard_instructions_removed +=
-			result.isolate_cache_guard_instructions_removed;
-#endif
-		if (result.isolate_mode_switched)
+		if ((dispatch_flags & VitaIOP::ProviderDispatchIsolateSwitch) != 0)
 			s_iop_a32_stats.isolate_mode_switches++;
-		if (result.wait_loop_fast_forward)
+		if ((dispatch_flags & VitaIOP::ProviderDispatchWaitForward) != 0)
 			continue;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -843,8 +860,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		if (dispatch_profile.dispatches == 0)
 		{
 			dispatch_profile.opcode = iopMemRead32(pc);
-			dispatch_profile.instruction_count = result.instruction_count;
-			for (u32 i = 0; i < std::min<u32>(result.instruction_count, 16); i++)
+			dispatch_profile.instruction_count = compile_result.instruction_count;
+			for (u32 i = 0; i < std::min<u32>(compile_result.instruction_count, 16); i++)
 				dispatch_profile.opcodes[i] = iopMemRead32(pc + i * 4);
 		}
 		dispatch_profile.dispatches++;
@@ -1062,16 +1079,19 @@ void VitaResetA32IopProviderStats()
 #if defined(VITASX2_QEMU_VALIDATION)
 	s_iop_a32_dispatch_profile.clear();
 	s_iop_a32_dispatch_edge_profile.clear();
-	s_iop_a32_pinned_gpr_memory_ops_saved = 0;
-	s_iop_a32_pinned_branch_operand_moves_removed = 0;
-	s_iop_a32_condition_code_branch_instructions_removed = 0;
-	s_iop_a32_producer_branch_compare_instructions_removed = 0;
-	s_iop_a32_fused_ram_guard_instructions_removed = 0;
-	s_iop_a32_source_page_guard_instructions_removed = 0;
-	s_iop_a32_source_page_literal_instructions_removed = 0;
-	s_iop_a32_isolate_cache_guard_instructions_removed = 0;
+	s_iop_a32_compact_provider_dispatch_entries = 0;
+	s_iop_a32_compact_provider_cache_hit_entries = 0;
 #endif
 	s_iop_a32_executor.ResetInstrumentationCounters();
+}
+
+void VitaSetA32IopCompactProviderDispatchEnabled(bool enabled)
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	s_iop_a32_compact_provider_dispatch_enabled = enabled;
+#else
+	(void)enabled;
+#endif
 }
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
@@ -1132,21 +1152,31 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.event_deadline_fast_skips = snapshot.event_deadline_fast_skips;
 	s_iop_a32_stats.event_deadline_instructions_removed =
 		snapshot.event_deadline_instructions_removed;
-	s_iop_a32_stats.pinned_gpr_memory_ops_saved = s_iop_a32_pinned_gpr_memory_ops_saved;
+	s_iop_a32_stats.compact_provider_dispatch_entries =
+		s_iop_a32_compact_provider_dispatch_entries;
+	s_iop_a32_stats.compact_provider_cache_hit_entries =
+		s_iop_a32_compact_provider_cache_hit_entries;
+	// Product Cortex-A9 disassembly of the retired aggregate contract loads
+	// cache, lookup, fast, isolate, and wait result bytes after every successful
+	// call. The flag-word contract consumes r0 directly and removes all five.
+	s_iop_a32_stats.compact_provider_result_loads_removed =
+		s_iop_a32_compact_provider_dispatch_entries * 5u;
+	s_iop_a32_stats.pinned_gpr_memory_ops_saved =
+		snapshot.total_pinned_gpr_memory_ops_saved;
 	s_iop_a32_stats.pinned_branch_operand_moves_removed =
-		s_iop_a32_pinned_branch_operand_moves_removed;
+		snapshot.total_pinned_branch_operand_moves_removed;
 	s_iop_a32_stats.condition_code_branch_instructions_removed =
-		s_iop_a32_condition_code_branch_instructions_removed;
+		snapshot.total_condition_code_branch_instructions_removed;
 	s_iop_a32_stats.producer_branch_compare_instructions_removed =
-		s_iop_a32_producer_branch_compare_instructions_removed;
+		snapshot.total_producer_branch_compare_instructions_removed;
 	s_iop_a32_stats.fused_ram_guard_instructions_removed =
-		s_iop_a32_fused_ram_guard_instructions_removed;
+		snapshot.total_fused_ram_guard_instructions_removed;
 	s_iop_a32_stats.source_page_guard_instructions_removed =
-		s_iop_a32_source_page_guard_instructions_removed;
+		snapshot.total_source_page_guard_instructions_removed;
 	s_iop_a32_stats.source_page_literal_instructions_removed =
-		s_iop_a32_source_page_literal_instructions_removed;
+		snapshot.total_source_page_literal_instructions_removed;
 	s_iop_a32_stats.isolate_cache_guard_instructions_removed =
-		s_iop_a32_isolate_cache_guard_instructions_removed;
+		snapshot.total_isolate_cache_guard_instructions_removed;
 #endif
 	return s_iop_a32_stats;
 }

@@ -118,6 +118,9 @@ struct VitaA32IopProviderStats
 	u64 budget_before_event_instructions_removed = 0;
 	u64 event_deadline_fast_skips = 0;
 	u64 event_deadline_instructions_removed = 0;
+	u64 compact_provider_dispatch_entries = 0;
+	u64 compact_provider_cache_hit_entries = 0;
+	u64 compact_provider_result_loads_removed = 0;
 	u64 pinned_gpr_memory_ops_saved = 0;
 	u64 pinned_branch_operand_moves_removed = 0;
 	u64 condition_code_branch_instructions_removed = 0;
@@ -159,6 +162,7 @@ struct VitaA32IopDispatchProfile
 
 void VitaResetA32IopProviderStats();
 VitaA32IopProviderStats VitaGetA32IopProviderStats();
+void VitaSetA32IopCompactProviderDispatchEnabled(bool enabled);
 #if defined(VITASX2_QEMU_VALIDATION)
 VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile();
 #endif
