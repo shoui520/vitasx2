@@ -952,13 +952,14 @@ namespace VitaIOP
 		const u32 baseline_pushed_count = static_cast<u32>(
 			__builtin_popcount(static_cast<unsigned>(baseline_saved_registers | REG_LR)));
 		// PCSX2's iPsxAddEECycles(blockCycles) charges an analysis-proven block
-		// directly. Those blocks need no dynamic cycle snapshot slot; keep only
-		// the optional word required to restore AAPCS stack alignment for calls.
-		if (m_defer_cycle_updates)
+		// directly. Timing-safe blocks need no data slot. Handler-capable blocks
+		// retain one word for the greatest guest-cycle prefix already published.
+		const bool needs_cycle_stack_word = !m_defer_cycle_updates || m_track_published_cycle_prefix;
+		if (!needs_cycle_stack_word)
 			m_stack_frame_size = (pushed_count & 1u) ? 4 : 0;
 		else
 			m_stack_frame_size = (pushed_count & 1u) ? 4 : 8;
-		const u8 baseline_stack_frame_size = m_defer_cycle_updates ?
+		const u8 baseline_stack_frame_size = !needs_cycle_stack_word ?
 			((baseline_pushed_count & 1u) ? 4 : 0) :
 			((baseline_pushed_count & 1u) ? 4 : 8);
 		m_saved_register_frame_instructions_added =
@@ -968,6 +969,12 @@ namespace VitaIOP
 		if (!m_code.EmitPush(m_saved_registers | REG_LR) ||
 			(m_stack_frame_size != 0 && !m_code.EmitSubImm8(HOST_SP, HOST_SP, m_stack_frame_size)) ||
 			!m_code.EmitMovImm32(HOST_PSX_REGS, static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
+		{
+			return false;
+		}
+		if (m_track_published_cycle_prefix &&
+			(!m_code.EmitMovImm8(HOST_TMP0, 0) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_SP, 0)))
 		{
 			return false;
 		}
@@ -1364,15 +1371,11 @@ namespace VitaIOP
 		// publish the current dirty pins before it and never overwrite the
 		// helper-produced delay-slot state on this exiting arm.
 		RecordPinnedGprExitPathSavings();
-		if (m_expanded_cycle_batching)
-		{
-			m_min_batched_cycle_prefix = std::min(m_min_batched_cycle_prefix, m_current_instruction_count);
-			m_has_batched_cycle_helper_exit = true;
-		}
+		RecordBatchedCycleExitSavings(m_current_instruction_count, true);
 		const u32 known_cycle_count = m_defer_cycle_updates ? m_current_instruction_count + 1 : 0;
 		return (!m_defer_cycle_updates ||
 			(m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP0, VitaA32::ShiftType::LSL, 0) &&
-				EmitAddCycles(m_current_instruction_count) &&
+				EmitPublishCyclePrefix(m_current_instruction_count) &&
 				m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0))) &&
 			EmitFlushPinnedGprs() &&
 			m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH) &&
@@ -1790,6 +1793,68 @@ namespace VitaIOP
 		return m_code.EmitAdcImm8(HOST_TMP1, HOST_TMP1, 0) &&
 			   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) &&
 			   m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, CYCLE_OFFSET + sizeof(u32));
+	}
+
+	bool BlockCompiler::EmitPublishCyclePrefix(u32 cycle_prefix)
+	{
+		if (!m_track_published_cycle_prefix)
+			return EmitAddCycles(cycle_prefix);
+
+		// The stack word is path state, not architectural state: it records how
+		// many guest cycles this callable has already made visible. Every handler
+		// path publishes only the missing delta, while direct RAM paths leave it at
+		// zero until the final block exit.
+		return m_code.EmitLdrImm12(HOST_TMP0, HOST_SP, 0) &&
+			m_code.EmitMovImm32(HOST_TMP1, cycle_prefix) &&
+			m_code.EmitSubReg(HOST_TMP0, HOST_TMP1, HOST_TMP0) &&
+			m_code.EmitStrImm12(HOST_TMP1, HOST_SP, 0) &&
+			m_code.EmitAddImm32(HOST_CALL_SCRATCH, HOST_PSX_REGS,
+				static_cast<u32>(CYCLE_OFFSET)) &&
+			m_code.EmitLdrdImm8(HOST_TMP2, HOST_TMP3, HOST_CALL_SCRATCH, 0) &&
+			m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP0, true) &&
+			m_code.EmitAdcImm8(HOST_TMP3, HOST_TMP3, 0) &&
+			m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_CALL_SCRATCH, 0);
+	}
+
+	u32 BlockCompiler::CurrentTimingHelperSeamCount() const
+	{
+		return static_cast<u32>(m_scalar_load_cold_tails.size() +
+			m_scalar_store_cold_tails.size() +
+			m_unaligned_read_cold_tails.size() +
+			m_unaligned_write_cold_tails.size() +
+			m_cop2_load_cold_tails.size() +
+			m_cop2_store_cold_tails.size());
+	}
+
+	void BlockCompiler::RecordBatchedCycleExitSavings(
+		u32 cycle_prefix, bool preserves_argument)
+	{
+		if (!m_expanded_cycle_batching)
+			return;
+
+		const bool ps1_clock_mode = (psxHu32(HW_ICFG) & (1u << 3)) != 0;
+		s32 savings = 0;
+		if (m_track_published_cycle_prefix)
+		{
+			const u32 helper_seams = CurrentTimingHelperSeamCount();
+			savings = static_cast<s32>(4u * cycle_prefix) -
+				static_cast<s32>(9u * helper_seams) -
+				static_cast<s32>(m_unaligned_write_cold_tails.size()) -
+				static_cast<s32>(ps1_clock_mode ? 7u : 6u) -
+				(preserves_argument ? 2 : 0);
+		}
+		else
+		{
+			savings = static_cast<s32>(4u * cycle_prefix) +
+				(ps1_clock_mode ? 0 : 1) - (preserves_argument ? 2 : 0);
+		}
+
+		const u32 bounded_savings = savings > 0 ? static_cast<u32>(savings) : 0;
+		if (m_batched_cycle_instructions_removed == UINT32_MAX)
+			m_batched_cycle_instructions_removed = bounded_savings;
+		else
+			m_batched_cycle_instructions_removed =
+				std::min(m_batched_cycle_instructions_removed, bounded_savings);
 	}
 
 	bool BlockCompiler::EmitIncrementCycle()
@@ -3448,6 +3513,7 @@ namespace VitaIOP
 			helper,
 			rt,
 			opcode,
+			m_current_instruction_count,
 		});
 		return true;
 	}
@@ -3467,7 +3533,8 @@ namespace VitaIOP
 			return false;
 		}
 
-		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
+		if ((m_track_published_cycle_prefix && !EmitPublishCyclePrefix(tail.cycle_prefix)) ||
+			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(tail.helper, HOST_CALL_SCRATCH))
 		{
 			return false;
@@ -3699,6 +3766,7 @@ namespace VitaIOP
 			m_code.Size(),
 			helper,
 			RT(op),
+			m_current_instruction_count,
 		});
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (used_known_store_value)
@@ -3722,6 +3790,7 @@ namespace VitaIOP
 			return false;
 		}
 		if (!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			(m_track_published_cycle_prefix && !EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitLoadGpr(tail.rt, HOST_TMP1) ||
 			!m_code.EmitCallAbsolute(tail.helper, HOST_CALL_SCRATCH))
@@ -3788,6 +3857,7 @@ namespace VitaIOP
 		// the helper; ordinary IOP RAM falls through with HOST_TMP0 loaded.
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			(m_track_published_cycle_prefix && !EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH))
 		{
@@ -3807,7 +3877,10 @@ namespace VitaIOP
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.write_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			(m_track_published_cycle_prefix && !EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
+			(m_track_published_cycle_prefix &&
+				!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_SAVED0, VitaA32::ShiftType::LSL, 0)) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH))
 		{
 			return false;
@@ -3826,6 +3899,7 @@ namespace VitaIOP
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.PatchBranch(tail.alignment_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			(m_track_published_cycle_prefix && !EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32), HOST_CALL_SCRATCH) ||
 			!EmitWriteCop2DataReg(tail.cop2_reg, HOST_TMP0))
@@ -3847,6 +3921,7 @@ namespace VitaIOP
 		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.PatchBranch(tail.alignment_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			(m_track_published_cycle_prefix && !EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32), HOST_CALL_SCRATCH))
@@ -3955,6 +4030,7 @@ namespace VitaIOP
 		m_unaligned_read_cold_tails.push_back({
 			fallback_branch,
 			m_code.Size(),
+			m_current_instruction_count,
 		});
 
 		if (RT(op) == 0)
@@ -4134,6 +4210,7 @@ namespace VitaIOP
 		m_unaligned_read_cold_tails.push_back({
 			fallback_branch,
 			m_code.Size(),
+			m_current_instruction_count,
 		});
 
 		bool used_known_store_value = false;
@@ -4165,6 +4242,8 @@ namespace VitaIOP
 					   VitaA32::ShiftType::LSR, HOST_TMP3) :
 					 m_code.EmitOrrRegShiftReg(HOST_TMP1, HOST_TMP0, HOST_TMP1,
 					   VitaA32::ShiftType::LSL, HOST_SAVED0)) ||
+			(m_track_published_cycle_prefix &&
+				!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP1, VitaA32::ShiftType::LSL, 0)) ||
 			!m_code.EmitTstImm32(HOST_SAVED1, 0x10000000u))
 		{
 			return false;
@@ -4192,6 +4271,7 @@ namespace VitaIOP
 			write_fallback_branch,
 			isolated_fallback_branch,
 			m_code.Size(),
+			m_current_instruction_count,
 		});
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (used_known_store_value)
@@ -5006,6 +5086,7 @@ namespace VitaIOP
 				alignment_fallback_branch,
 				m_code.Size(),
 				RT(op),
+				m_current_instruction_count,
 			});
 			return true;
 		}
@@ -5064,6 +5145,7 @@ namespace VitaIOP
 				alignment_fallback_branch,
 				isolated_fallback_branch,
 				m_code.Size(),
+				m_current_instruction_count,
 			});
 			return true;
 		}
@@ -5305,6 +5387,8 @@ namespace VitaIOP
 		m_static_branch_taken = false;
 		m_register_jump_target_known = false;
 		m_register_jump_target = 0;
+		u32 runtime_memory_helper_seams = 0;
+		u32 runtime_unaligned_store_saves = 0;
 		ResetGprConstState();
 		for (u32 i = 0; i < instruction_count; i++)
 		{
@@ -5319,7 +5403,12 @@ namespace VitaIOP
 					CanEmitKnownDirectIopRamFastPath(op) &&
 					TryKnownDirectIopRamAddress(op, alignment_mask, &known_address);
 				if (!known_direct)
+				{
 					m_iop_ram_mask_register_available = true;
+					const bool unaligned_store = (op >> 26) == 0x2a || (op >> 26) == 0x2e;
+					runtime_memory_helper_seams += unaligned_store ? 2 : 1;
+					runtime_unaligned_store_saves += unaligned_store ? 1 : 0;
+				}
 			}
 			UpdateGprConstStateAfterOpcode(op, pc);
 		}
@@ -5330,21 +5419,31 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		block_cycle_batching = s_qemuIopBlockCycleBatchingEnabled;
 #endif
-		// A runtime-address memory path can call an MMIO/timer handler which
-		// observes the current cycle. Constant-proven main-RAM paths have no such
-		// seam and may follow PCSX2's block-cycle publication rule.
-		const bool can_batch_cycle_updates = !m_iop_ram_mask_register_available &&
+		// Runtime-address memory paths track how much of the compile-time block
+		// delta has already been published, so MMIO/timer handlers observe the
+		// same instruction boundary while direct RAM stays private until exit.
+		const u32 runtime_cycle_budget_instructions =
+			(psxHu32(HW_ICFG) & (1u << 3)) != 0 ? 7u : 6u;
+		const bool runtime_memory_batching_profitable =
+			4u * instruction_count >=
+				9u * runtime_memory_helper_seams + runtime_cycle_budget_instructions +
+					runtime_unaligned_store_saves;
+		const bool can_batch_cycle_updates =
+			(!m_iop_ram_mask_register_available ||
+				(instruction_count >= 2 && runtime_memory_batching_profitable)) &&
 			IopBlockCanBatchCycleUpdates(start_pc, instruction_count);
 		m_defer_cycle_updates = !m_emit_trace_checks &&
 			(legacy_cycle_deferral || (block_cycle_batching && can_batch_cycle_updates));
 		m_expanded_cycle_batching = m_defer_cycle_updates && !legacy_cycle_deferral;
+		m_track_published_cycle_prefix =
+			m_expanded_cycle_batching && m_iop_ram_mask_register_available;
 		m_has_budget_exit = false;
 		m_block_cycle_count = instruction_count;
-		m_batched_cycle_instructions_removed = 0;
-		m_batched_cycle_stack_words_removed = m_expanded_cycle_batching ? 2 : 0;
-		m_min_batched_cycle_prefix = UINT32_MAX;
+		m_batched_cycle_instructions_removed =
+			m_expanded_cycle_batching ? UINT32_MAX : 0;
+		m_batched_cycle_stack_words_removed =
+			(m_expanded_cycle_batching && !m_track_published_cycle_prefix) ? 2 : 0;
 		m_current_instruction_count = 0;
-		m_has_batched_cycle_helper_exit = false;
 		AnalyzePinnedGprs(start_pc, instruction_count);
 		AnalyzeSavedRegisters(start_pc, instruction_count);
 
@@ -5419,20 +5518,10 @@ namespace VitaIOP
 		}
 
 		const u32 next_pc = start_pc + instruction_count * 4;
-		if (m_defer_cycle_updates && !EmitAddCycles(instruction_count))
+		if (m_defer_cycle_updates && !EmitPublishCyclePrefix(instruction_count))
 			return false;
 		if (m_expanded_cycle_batching)
-		{
-			m_min_batched_cycle_prefix = std::min(m_min_batched_cycle_prefix, instruction_count);
-			// The former path emitted one four-instruction 64-bit cycle update per
-			// guest instruction, a two-instruction entry snapshot, and a three-
-			// instruction dynamic delta. The batched path emits one update and one
-			// immediate instead; normal PS2 mode also removes the old LSL.
-			const bool ps1_clock_mode = (psxHu32(HW_ICFG) & (1u << 3)) != 0;
-			m_batched_cycle_instructions_removed =
-				4u * m_min_batched_cycle_prefix + (ps1_clock_mode ? 0u : 1u) -
-				(m_has_batched_cycle_helper_exit ? 2u : 0u);
-		}
+			RecordBatchedCycleExitSavings(instruction_count, false);
 
 		size_t direct_exit_offset = 0;
 		const bool emit_link_tail = direct_exit && direct_links && can_direct_link_fallthrough;

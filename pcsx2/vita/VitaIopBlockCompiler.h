@@ -142,6 +142,9 @@ namespace VitaIOP
 		bool EmitStorePc(u32 pc);
 		bool EmitStorePcReg(unsigned host_reg);
 		bool EmitAddCycles(u32 cycles);
+		bool EmitPublishCyclePrefix(u32 cycle_prefix);
+		u32 CurrentTimingHelperSeamCount() const;
+		void RecordBatchedCycleExitSavings(u32 cycle_prefix, bool preserves_argument);
 		bool EmitIncrementCycle();
 		bool EmitChargeEeBudget(u32 known_cycle_count = 0);
 		bool EmitChargeEeBudgetPs1(u32 known_block_cycles);
@@ -199,6 +202,7 @@ namespace VitaIOP
 			const void* helper = nullptr;
 			unsigned rt = 0;
 			unsigned opcode = 0;
+			u32 cycle_prefix = 0;
 		};
 		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);
 
@@ -210,6 +214,7 @@ namespace VitaIOP
 			size_t join_offset = 0;
 			const void* helper = nullptr;
 			unsigned rt = 0;
+			u32 cycle_prefix = 0;
 		};
 		bool EmitScalarStoreColdTail(const ScalarStoreColdTail& tail);
 
@@ -217,6 +222,7 @@ namespace VitaIOP
 		{
 			size_t fallback_branch = static_cast<size_t>(-1);
 			size_t join_offset = 0;
+			u32 cycle_prefix = 0;
 		};
 		bool EmitUnalignedReadColdTail(const UnalignedReadColdTail& tail);
 
@@ -225,6 +231,7 @@ namespace VitaIOP
 			size_t write_fallback_branch = static_cast<size_t>(-1);
 			size_t isolated_fallback_branch = static_cast<size_t>(-1);
 			size_t join_offset = 0;
+			u32 cycle_prefix = 0;
 		};
 		bool EmitUnalignedWriteColdTail(const UnalignedWriteColdTail& tail);
 
@@ -234,6 +241,7 @@ namespace VitaIOP
 			size_t alignment_fallback_branch = static_cast<size_t>(-1);
 			size_t join_offset = 0;
 			unsigned cop2_reg = 0;
+			u32 cycle_prefix = 0;
 		};
 		bool EmitCop2LoadColdTail(const Cop2LoadColdTail& tail);
 
@@ -243,6 +251,7 @@ namespace VitaIOP
 			size_t alignment_fallback_branch = static_cast<size_t>(-1);
 			size_t isolated_fallback_branch = static_cast<size_t>(-1);
 			size_t join_offset = 0;
+			u32 cycle_prefix = 0;
 		};
 		bool EmitCop2StoreColdTail(const Cop2StoreColdTail& tail);
 
@@ -283,14 +292,13 @@ namespace VitaIOP
 		u32 m_saved_register_frame_instructions_removed = 0;
 		u32 m_batched_cycle_instructions_removed = 0;
 		u32 m_batched_cycle_stack_words_removed = 0;
-		u32 m_min_batched_cycle_prefix = UINT32_MAX;
 		u32 m_current_instruction_count = 0;
-		bool m_has_batched_cycle_helper_exit = false;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
 		bool m_defer_cycle_updates = false;
 		bool m_expanded_cycle_batching = false;
+		bool m_track_published_cycle_prefix = false;
 		bool m_has_budget_exit = false;
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
