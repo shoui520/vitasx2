@@ -51,6 +51,7 @@ struct IopDispatchProfileEntry
 static std::unordered_map<u32, IopDispatchProfileEntry> s_iop_a32_dispatch_profile;
 static std::unordered_map<u64, u64> s_iop_a32_dispatch_edge_profile;
 static u64 s_iop_a32_pinned_gpr_memory_ops_saved = 0;
+static u64 s_iop_a32_pinned_branch_operand_moves_removed = 0;
 #endif
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
@@ -811,6 +812,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.fast_dispatch_hits++;
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_iop_a32_pinned_gpr_memory_ops_saved += result.pinned_gpr_memory_ops_saved;
+		s_iop_a32_pinned_branch_operand_moves_removed +=
+			result.pinned_branch_operand_moves_removed;
 #endif
 		if (result.wait_loop_fast_forward)
 			continue;
@@ -1040,6 +1043,7 @@ void VitaResetA32IopProviderStats()
 	s_iop_a32_dispatch_profile.clear();
 	s_iop_a32_dispatch_edge_profile.clear();
 	s_iop_a32_pinned_gpr_memory_ops_saved = 0;
+	s_iop_a32_pinned_branch_operand_moves_removed = 0;
 #endif
 	s_iop_a32_executor.ResetInstrumentationCounters();
 }
@@ -1088,6 +1092,8 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.linked_frame_stack_words_removed =
 		snapshot.linked_frame_stack_words_removed;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved = s_iop_a32_pinned_gpr_memory_ops_saved;
+	s_iop_a32_stats.pinned_branch_operand_moves_removed =
+		s_iop_a32_pinned_branch_operand_moves_removed;
 #endif
 	return s_iop_a32_stats;
 }

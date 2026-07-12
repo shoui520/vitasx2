@@ -72,6 +72,7 @@ namespace VitaIOP
 		u64 linked_frame_instructions_removed;
 		u64 linked_frame_stack_words_removed;
 		u32 pinned_gpr_memory_ops_saved;
+		u32 pinned_branch_operand_moves_removed;
 #endif
 		bool cache_hit;
 		bool lookup_hit;
@@ -119,6 +120,10 @@ namespace VitaIOP
 		u16 SavedRegisters() const { return m_saved_registers; }
 		u8 StackFrameSize() const { return m_stack_frame_size; }
 		u32 PinnedGprMemoryOpsSaved() const { return m_pinned_gpr_memory_ops_saved; }
+		u32 PinnedBranchOperandMovesRemoved() const
+		{
+			return m_pinned_branch_operand_moves_removed;
+		}
 
 	private:
 		bool BeginBlock(size_t* linked_entry_offset);
@@ -291,6 +296,7 @@ namespace VitaIOP
 		u32 m_pinned_gpr_store_hits = 0;
 		u32 m_pinned_gpr_initial_loads = 0;
 		u32 m_pinned_gpr_memory_ops_saved = 0;
+		u32 m_pinned_branch_operand_moves_removed = 0;
 		u32 m_pinned_gpr_min_exit_savings = UINT32_MAX;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
@@ -341,6 +347,7 @@ namespace VitaIOP
 #endif
 		static void SetTrustedSourceAuditEnabled(bool enabled);
 		static void SetPinnedGprResidencyEnabled(bool enabled);
+		static void SetPinnedBranchDirectCompareEnabled(bool enabled);
 		static void SetClockModeSpecializationEnabled(bool enabled);
 		static void SetSavedRegisterNarrowingEnabled(bool enabled);
 		static void SetBlockCycleBatchingEnabled(bool enabled);
@@ -399,6 +406,7 @@ namespace VitaIOP
 			u32 native_instruction_count = 0;
 			u32 helper_instruction_count = 0;
 			u32 pinned_gpr_memory_ops_saved = 0;
+			u32 pinned_branch_operand_moves_removed = 0;
 			u32 clock_mode_check_instructions_removed = 0;
 			u32 saved_register_stack_words_removed = 0;
 			u32 saved_register_frame_instructions_added = 0;

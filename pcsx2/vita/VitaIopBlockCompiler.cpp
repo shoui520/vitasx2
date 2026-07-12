@@ -57,6 +57,7 @@ struct QemuIopLinkedFrameEvidence
 static QemuIopLinkedFrameEvidence s_qemuIopLinkedFrameEvidence;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
 static bool s_qemuIopPinnedGprResidencyEnabled = true;
+static bool s_qemuIopPinnedBranchDirectCompareEnabled = true;
 static bool s_qemuIopClockModeSpecializationEnabled = true;
 static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
@@ -1177,6 +1178,7 @@ namespace VitaIOP
 		m_pinned_gpr_store_hits = 0;
 		m_pinned_gpr_initial_loads = 0;
 		m_pinned_gpr_memory_ops_saved = 0;
+		m_pinned_branch_operand_moves_removed = 0;
 		m_pinned_gpr_min_exit_savings = UINT32_MAX;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!s_qemuIopPinnedGprResidencyEnabled)
@@ -2164,6 +2166,13 @@ namespace VitaIOP
 				   (m_code.EmitMovImm32(HOST_TMP1, value) &&
 					   m_code.EmitCmpReg(host_reg, HOST_TMP1));
 		};
+		const auto direct_pinned_host = [this](unsigned guest_reg) -> int {
+			bool enabled = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+			enabled = s_qemuIopPinnedBranchDirectCompareEnabled;
+#endif
+			return enabled ? PinnedHostForGuest(guest_reg) : -1;
+		};
 
 		if (lhs_known && rhs_known)
 		{
@@ -2182,8 +2191,15 @@ namespace VitaIOP
 			if (has_tracked_operand)
 				++g_qemuIopConstBranchCompareFastPaths;
 #endif
+			const int rhs_host = direct_pinned_host(rhs_guest_reg);
+			if (rhs_host >= 0)
+			{
+				m_pinned_gpr_load_hits++;
+				m_pinned_branch_operand_moves_removed++;
+				return emit_cmp_reg_imm(static_cast<unsigned>(rhs_host), lhs_value);
+			}
 			return EmitLoadGpr(rhs_guest_reg, HOST_TMP0) &&
-				   emit_cmp_reg_imm(HOST_TMP0, lhs_value);
+				emit_cmp_reg_imm(HOST_TMP0, lhs_value);
 		}
 
 		if (rhs_known)
@@ -2192,8 +2208,15 @@ namespace VitaIOP
 			if (has_tracked_operand)
 				++g_qemuIopConstBranchCompareFastPaths;
 #endif
+			const int lhs_host = direct_pinned_host(lhs_guest_reg);
+			if (lhs_host >= 0)
+			{
+				m_pinned_gpr_load_hits++;
+				m_pinned_branch_operand_moves_removed++;
+				return emit_cmp_reg_imm(static_cast<unsigned>(lhs_host), rhs_value);
+			}
 			return EmitLoadGpr(lhs_guest_reg, HOST_TMP0) &&
-				   emit_cmp_reg_imm(HOST_TMP0, rhs_value);
+				emit_cmp_reg_imm(HOST_TMP0, rhs_value);
 		}
 
 		if (lhs_guest_reg == 0 && rhs_guest_reg == 0)
@@ -2205,9 +2228,32 @@ namespace VitaIOP
 			return EmitLoadGpr(lhs_guest_reg, HOST_TMP0) &&
 				   m_code.EmitCmpImm32(HOST_TMP0, 0);
 
+		const int lhs_host = direct_pinned_host(lhs_guest_reg);
+		const int rhs_host = direct_pinned_host(rhs_guest_reg);
+		if (lhs_host >= 0 && rhs_host >= 0)
+		{
+			m_pinned_gpr_load_hits += 2;
+			m_pinned_branch_operand_moves_removed += 2;
+			return m_code.EmitCmpReg(
+				static_cast<unsigned>(lhs_host), static_cast<unsigned>(rhs_host));
+		}
+		if (lhs_host >= 0)
+		{
+			m_pinned_gpr_load_hits++;
+			m_pinned_branch_operand_moves_removed++;
+			return EmitLoadGpr(rhs_guest_reg, HOST_TMP1) &&
+				m_code.EmitCmpReg(static_cast<unsigned>(lhs_host), HOST_TMP1);
+		}
+		if (rhs_host >= 0)
+		{
+			m_pinned_gpr_load_hits++;
+			m_pinned_branch_operand_moves_removed++;
+			return EmitLoadGpr(lhs_guest_reg, HOST_TMP0) &&
+				m_code.EmitCmpReg(HOST_TMP0, static_cast<unsigned>(rhs_host));
+		}
 		return EmitLoadGpr(lhs_guest_reg, HOST_TMP0) &&
-			   EmitLoadGpr(rhs_guest_reg, HOST_TMP1) &&
-			   m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1);
+			EmitLoadGpr(rhs_guest_reg, HOST_TMP1) &&
+			m_code.EmitCmpReg(HOST_TMP0, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EmitBinaryRegOp(u32 op)
@@ -4559,8 +4605,21 @@ namespace VitaIOP
 			return true;
 		}
 
-		return EmitLoadGpr(RS(op), HOST_TMP0) &&
-			   m_code.EmitCmpImm32(HOST_TMP0, 0) &&
+		unsigned compare_host = HOST_TMP0;
+		bool direct_compare = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		direct_compare = s_qemuIopPinnedBranchDirectCompareEnabled;
+#endif
+		const int pinned_host = direct_compare ? PinnedHostForGuest(RS(op)) : -1;
+		if (pinned_host >= 0)
+		{
+			compare_host = static_cast<unsigned>(pinned_host);
+			m_pinned_gpr_load_hits++;
+			m_pinned_branch_operand_moves_removed++;
+		}
+
+		return (pinned_host >= 0 || EmitLoadGpr(RS(op), HOST_TMP0)) &&
+			   m_code.EmitCmpImm32(compare_host, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
 			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, taken);
 	}
@@ -5858,6 +5917,15 @@ namespace VitaIOP
 #endif
 	}
 
+	void BlockExecutor::SetPinnedBranchDirectCompareEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopPinnedBranchDirectCompareEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
 	void BlockExecutor::SetClockModeSpecializationEnabled(bool enabled)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -7106,6 +7174,7 @@ namespace VitaIOP
 		u32 native_instruction_count = 0;
 		u32 helper_instruction_count = 0;
 		u32 pinned_gpr_memory_ops_saved = 0;
+		u32 pinned_branch_operand_moves_removed = 0;
 		u32 clock_mode_check_instructions_removed = 0;
 		u32 saved_register_stack_words_removed = 0;
 		u32 saved_register_frame_instructions_added = 0;
@@ -7151,6 +7220,8 @@ namespace VitaIOP
 				native_instruction_count = compiler.NativeInstructionCount();
 				helper_instruction_count = compiler.HelperInstructionCount();
 				pinned_gpr_memory_ops_saved = compiler.PinnedGprMemoryOpsSaved();
+				pinned_branch_operand_moves_removed =
+					compiler.PinnedBranchOperandMovesRemoved();
 				clock_mode_check_instructions_removed = compiler.ClockModeCheckInstructionsRemoved();
 				saved_register_stack_words_removed = compiler.SavedRegisterStackWordsRemoved();
 				saved_register_frame_instructions_added = compiler.SavedRegisterFrameInstructionsAdded();
@@ -7182,6 +7253,8 @@ namespace VitaIOP
 		block.native_instruction_count = native_instruction_count;
 		block.helper_instruction_count = helper_instruction_count;
 		block.pinned_gpr_memory_ops_saved = pinned_gpr_memory_ops_saved;
+		block.pinned_branch_operand_moves_removed =
+			pinned_branch_operand_moves_removed;
 		block.clock_mode_check_instructions_removed = clock_mode_check_instructions_removed;
 		block.saved_register_stack_words_removed = saved_register_stack_words_removed;
 		block.saved_register_frame_instructions_added = saved_register_frame_instructions_added;
@@ -7328,6 +7401,8 @@ namespace VitaIOP
 		result->code_cache_capacity = m_code_cache_capacity;
 #if defined(VITASX2_QEMU_VALIDATION)
 		result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
+		result->pinned_branch_operand_moves_removed =
+			block.pinned_branch_operand_moves_removed;
 		SnapshotInstrumentation(result);
 #endif
 	}
@@ -7397,6 +7472,8 @@ namespace VitaIOP
 			{
 				result->instruction_count = block.instruction_count;
 				result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
+				result->pinned_branch_operand_moves_removed =
+					block.pinned_branch_operand_moves_removed;
 			}
 #endif
 			result->wait_loop_fast_forward = true;
@@ -7433,6 +7510,8 @@ namespace VitaIOP
 		{
 			result->instruction_count = block.instruction_count;
 			result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
+			result->pinned_branch_operand_moves_removed =
+				block.pinned_branch_operand_moves_removed;
 		}
 #endif
 		return true;
