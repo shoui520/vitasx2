@@ -75,6 +75,8 @@ namespace VitaIOP
 		u32 pinned_branch_operand_moves_removed;
 		u32 condition_code_branch_instructions_removed;
 		u32 producer_branch_compare_instructions_removed;
+		u32 fused_ram_guard_instructions_removed;
+		u32 source_page_guard_instructions_removed;
 #endif
 		bool cache_hit;
 		bool lookup_hit;
@@ -101,7 +103,8 @@ namespace VitaIOP
 	class BlockCompiler
 	{
 	public:
-		explicit BlockCompiler(VitaA32::CodeBuffer& code, const u16* ram_source_page_live_counts);
+		explicit BlockCompiler(VitaA32::CodeBuffer& code,
+			const u16* ram_source_page_live_counts, const u8* ram_source_page_live_flags);
 
 		static bool CanCompileOpcode(u32 op);
 
@@ -133,6 +136,14 @@ namespace VitaIOP
 		u32 ProducerBranchCompareInstructionsRemoved() const
 		{
 			return m_producer_branch_compare_instructions_removed;
+		}
+		u32 FusedRamGuardInstructionsRemoved() const
+		{
+			return m_fused_ram_guard_instructions_removed;
+		}
+		u32 SourcePageGuardInstructionsRemoved() const
+		{
+			return m_source_page_guard_instructions_removed;
 		}
 
 	private:
@@ -281,6 +292,7 @@ namespace VitaIOP
 
 		VitaA32::CodeBuffer& m_code;
 		const u16* m_ram_source_page_live_counts = nullptr;
+		const u8* m_ram_source_page_live_flags = nullptr;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
 		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
 		std::vector<UnalignedReadColdTail> m_unaligned_read_cold_tails;
@@ -309,6 +321,8 @@ namespace VitaIOP
 		u32 m_pinned_branch_operand_moves_removed = 0;
 		u32 m_condition_code_branch_instructions_removed = 0;
 		u32 m_producer_branch_compare_instructions_removed = 0;
+		u32 m_fused_ram_guard_instructions_removed = 0;
+		u32 m_source_page_guard_instructions_removed = 0;
 		u32 m_pinned_gpr_min_exit_savings = UINT32_MAX;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
@@ -369,6 +383,7 @@ namespace VitaIOP
 		static void SetPinnedBranchDirectCompareEnabled(bool enabled);
 		static void SetConditionCodeBranchEnabled(bool enabled);
 		static void SetProducerBranchFlagsEnabled(bool enabled);
+		static void SetRamProvenanceSpecializationEnabled(bool enabled);
 		static void SetClockModeSpecializationEnabled(bool enabled);
 		static void SetSavedRegisterNarrowingEnabled(bool enabled);
 		static void SetBlockCycleBatchingEnabled(bool enabled);
@@ -430,6 +445,8 @@ namespace VitaIOP
 			u32 pinned_branch_operand_moves_removed = 0;
 			u32 condition_code_branch_instructions_removed = 0;
 			u32 producer_branch_compare_instructions_removed = 0;
+			u32 fused_ram_guard_instructions_removed = 0;
+			u32 source_page_guard_instructions_removed = 0;
 			u32 clock_mode_check_instructions_removed = 0;
 			u32 saved_register_stack_words_removed = 0;
 			u32 saved_register_frame_instructions_added = 0;
@@ -545,6 +562,7 @@ namespace VitaIOP
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT> m_ram_source_pages;
 		std::array<u16, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
+		std::array<u8, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_flags{};
 		LookupPage** m_lookup_pages = nullptr;
 		std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
 			HOT_DISPATCH_CACHE_SET_COUNT> m_hot_dispatch_cache{};
