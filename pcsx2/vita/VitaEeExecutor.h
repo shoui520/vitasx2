@@ -145,7 +145,11 @@ namespace VitaEE
 		static constexpr size_t INITIAL_CACHE_CAPACITY = 512;
 		static constexpr size_t MAX_CACHE_CAPACITY = 0x4000;
 		static constexpr size_t STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 4096;
-		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 16 * 1024;
+		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() keeps a complete scanned
+		// block native even when an instruction family expands heavily. Reserve a
+		// larger temporary slice only for those rare blocks; CommitCodeSlice()
+		// still returns the unused tail to the shared Vita EE code cache.
+		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 32 * 1024;
 		static constexpr size_t EE_CODE_CACHE_CAPACITY = HostMemoryMap::EErecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;

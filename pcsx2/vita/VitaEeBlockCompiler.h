@@ -552,6 +552,7 @@ namespace VitaEE
 			bool preserve_dirty_not_taken_link = false,
 			bool preserve_dirty_taken_link = false);
 		static bool RequiresBlockEndAfterOpcode(u32 op);
+		static bool RequiresTraceWindowEndAfterOpcode(u32 op);
 
 	private:
 		bool EmitLinkFrameReturn();

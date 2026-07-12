@@ -3402,6 +3402,17 @@ namespace VitaEE
 		}
 	}
 
+	bool BlockCompiler::RequiresTraceWindowEndAfterOpcode(u32 op)
+	{
+		// PCSX2 owners: vtlb.cpp::vtlb_memRead*() and
+		// R5900.cpp::_cpuEventTest_Shared(). A narrow load may resolve to an EE
+		// counter page at runtime; its cold tail then commits cycles and event-exits
+		// at pc + 4. The product block keeps PCSX2 x86's mid-block continuation,
+		// but an ahead-of-execution trace window must stop here or it would record
+		// suffix instructions which the counter event can postpone or cancel.
+		return IsCounterReadLoad(op);
+	}
+
 	bool OpcodeMayUseVtlbFastPath(u32 op)
 	{
 		switch (op >> 26)

@@ -755,6 +755,20 @@ static void recExecute()
 		}
 
 		u32 window_instruction_count = scan.instruction_count;
+		if (s_ee_exact_trace_streams && s_ee_pre_instruction_trace_callback)
+		{
+			for (u32 i = 0; i + 1 < window_instruction_count; i++)
+			{
+				if (!VitaEE::BlockCompiler::RequiresTraceWindowEndAfterOpcode(
+						memRead32(pc + i * sizeof(u32))))
+				{
+					continue;
+				}
+
+				window_instruction_count = i + 1;
+				break;
+			}
+		}
 		bool likely_pair_trace_recorded = false;
 		bool likely_pair_full_window_recorded = false;
 		u32 likely_pair_executable_instruction_count = 0;
