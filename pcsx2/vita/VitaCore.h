@@ -98,6 +98,7 @@ struct VitaA32IopProviderStats
 	u64 trusted_source_audit_failures = 0;
 	u64 ram_invalidation_calls = 0;
 	u64 ram_invalidation_record_visits = 0;
+	u64 clock_mode_check_instructions_removed = 0;
 	u64 pinned_gpr_memory_ops_saved = 0;
 #endif
 };

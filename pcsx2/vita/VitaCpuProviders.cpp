@@ -1068,6 +1068,8 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.trusted_source_audit_failures = snapshot.trusted_source_audit_failures;
 	s_iop_a32_stats.ram_invalidation_calls = snapshot.ram_invalidation_calls;
 	s_iop_a32_stats.ram_invalidation_record_visits = snapshot.ram_invalidation_record_visits;
+	s_iop_a32_stats.clock_mode_check_instructions_removed =
+		snapshot.clock_mode_check_instructions_removed;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved = s_iop_a32_pinned_gpr_memory_ops_saved;
 #endif
 	return s_iop_a32_stats;

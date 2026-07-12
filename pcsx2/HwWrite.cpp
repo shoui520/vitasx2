@@ -184,6 +184,11 @@ void _hwWrite32( u32 mem, u32 value )
 						psxHu32(HW_ICFG) = 0x8;
 						psxHu32(HW_ICTRL) = 1;
 						psxRegs.cycle = cycle;
+						// PCSX2's x86 IOP JIT reads HW_ICFG while compiling
+						// iPsxAddEECycles(), so translations belong to one clock
+						// mode. Retire the old mode's cache at the transition after
+						// psxReset() has installed the PS1 machine state.
+						psxNotifyClockModeChange();
 					}
 					if(!(value & 0x100))
 						psHu32(mem) &= ~0x100;

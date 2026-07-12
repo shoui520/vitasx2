@@ -61,6 +61,7 @@ namespace VitaIOP
 		u64 trusted_source_audit_failures;
 		u64 ram_invalidation_calls;
 		u64 ram_invalidation_record_visits;
+		u64 clock_mode_check_instructions_removed;
 		u32 pinned_gpr_memory_ops_saved;
 #endif
 		bool cache_hit;
@@ -95,6 +96,7 @@ namespace VitaIOP
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 		bool UsesDirectBudgetExit() const { return m_has_budget_exit; }
 		bool UsesConstantCycleBudget() const { return m_defer_cycle_updates; }
+		u32 ClockModeCheckInstructionsRemoved() const { return m_clock_mode_check_instructions_removed; }
 		u32 PinnedGprMemoryOpsSaved() const { return m_pinned_gpr_memory_ops_saved; }
 
 	private:
@@ -260,6 +262,7 @@ namespace VitaIOP
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
 		u32 m_block_cycle_count = 0;
+		u32 m_clock_mode_check_instructions_removed = 0;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
@@ -297,6 +300,7 @@ namespace VitaIOP
 #endif
 		static void SetTrustedSourceAuditEnabled(bool enabled);
 		static void SetPinnedGprResidencyEnabled(bool enabled);
+		static void SetClockModeSpecializationEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -351,6 +355,7 @@ namespace VitaIOP
 			u32 native_instruction_count = 0;
 			u32 helper_instruction_count = 0;
 			u32 pinned_gpr_memory_ops_saved = 0;
+			u32 clock_mode_check_instructions_removed = 0;
 			DirectLinkSlots direct_links{};
 			bool wait_loop_shape = false;
 			bool wait_loop_enabled_at_compile = false;
@@ -480,6 +485,7 @@ namespace VitaIOP
 		u64 m_trusted_source_audit_failures = 0;
 		u64 m_ram_invalidation_calls = 0;
 		u64 m_ram_invalidation_record_visits = 0;
+		u64 m_clock_mode_check_instructions_removed = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};

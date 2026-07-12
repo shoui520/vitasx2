@@ -49,6 +49,7 @@ u32 g_qemuIopConstCop0WriteFastPaths = 0;
 u32 g_qemuIopConstCop2WriteFastPaths = 0;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
 static bool s_qemuIopPinnedGprResidencyEnabled = true;
+static bool s_qemuIopClockModeSpecializationEnabled = true;
 #endif
 
 namespace
@@ -1701,6 +1702,34 @@ namespace VitaIOP
 				!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP1)))
 		{
 			return false;
+		}
+
+		bool specialize_clock_mode = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		specialize_clock_mode = s_qemuIopClockModeSpecializationEnabled;
+#endif
+		if (specialize_clock_mode)
+		{
+			// PCSX2 owner: x86/iR3000A.cpp::iPsxAddEECycles() reads HW_ICFG
+			// while recompiling and emits only the active PS2 or PS1 clock formula.
+			// HwWrite.cpp resets the IOP CPU cache at the sole PS1-mode transition,
+			// so no generated block can outlive this compile-time fact.
+			const bool ps1_clock_mode = (psxHu32(HW_ICFG) & (1u << 3)) != 0;
+			m_clock_mode_check_instructions_removed = ps1_clock_mode ? 5 : 6;
+			if (ps1_clock_mode)
+			{
+				return EmitChargeEeBudgetPs1(known_block_cycles) &&
+					emit_budget_exit_from_signed_flags();
+			}
+
+			const bool emitted_ee_cycles = known_block_cycles != 0 ?
+				m_code.EmitMovImm32(HOST_TMP2, known_block_cycles * 8) :
+				m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 3);
+			return emitted_ee_cycles &&
+				m_code.EmitLdrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET)) &&
+				m_code.EmitSubReg(HOST_TMP1, HOST_TMP1, HOST_TMP2, true) &&
+				m_code.EmitStrImm12(HOST_TMP1, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET)) &&
+				emit_budget_exit_from_signed_flags();
 		}
 
 		if (!m_code.EmitMovImm32(HOST_TMP2,
@@ -5477,6 +5506,7 @@ namespace VitaIOP
 		m_trusted_source_audit_failures = 0;
 		m_ram_invalidation_calls = 0;
 		m_ram_invalidation_record_visits = 0;
+		m_clock_mode_check_instructions_removed = 0;
 #endif
 	}
 
@@ -5493,6 +5523,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopPinnedGprResidencyEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetClockModeSpecializationEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopClockModeSpecializationEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -6152,6 +6191,7 @@ namespace VitaIOP
 		block.poll_call_wait_loop = false;
 		block.direct_budget_exit = false;
 		block.constant_cycle_budget = false;
+		block.clock_mode_check_instructions_removed = 0;
 		block.direct_links = {};
 		block.code.Release();
 		RememberFreeCacheEntry(block);
@@ -6700,6 +6740,7 @@ namespace VitaIOP
 		u32 native_instruction_count = 0;
 		u32 helper_instruction_count = 0;
 		u32 pinned_gpr_memory_ops_saved = 0;
+		u32 clock_mode_check_instructions_removed = 0;
 		bool direct_budget_exit = false;
 		bool constant_cycle_budget = false;
 		DirectLinkSlots direct_links;
@@ -6733,6 +6774,7 @@ namespace VitaIOP
 				native_instruction_count = compiler.NativeInstructionCount();
 				helper_instruction_count = compiler.HelperInstructionCount();
 				pinned_gpr_memory_ops_saved = compiler.PinnedGprMemoryOpsSaved();
+				clock_mode_check_instructions_removed = compiler.ClockModeCheckInstructionsRemoved();
 				direct_budget_exit = compiler.UsesDirectBudgetExit();
 				constant_cycle_budget = compiler.UsesConstantCycleBudget();
 				direct_links = attempt_direct_links;
@@ -6754,6 +6796,7 @@ namespace VitaIOP
 		block.native_instruction_count = native_instruction_count;
 		block.helper_instruction_count = helper_instruction_count;
 		block.pinned_gpr_memory_ops_saved = pinned_gpr_memory_ops_saved;
+		block.clock_mode_check_instructions_removed = clock_mode_check_instructions_removed;
 		block.direct_budget_exit = direct_budget_exit;
 		block.constant_cycle_budget = constant_cycle_budget;
 		block.direct_links = direct_links;
@@ -6895,6 +6938,7 @@ namespace VitaIOP
 		result->trusted_source_audit_failures = m_trusted_source_audit_failures;
 		result->ram_invalidation_calls = m_ram_invalidation_calls;
 		result->ram_invalidation_record_visits = m_ram_invalidation_record_visits;
+		result->clock_mode_check_instructions_removed = m_clock_mode_check_instructions_removed;
 	}
 #endif
 
@@ -6937,6 +6981,7 @@ namespace VitaIOP
 			m_direct_budget_exit_provider_entries++;
 		if (block.constant_cycle_budget)
 			m_constant_cycle_budget_provider_entries++;
+		m_clock_mode_check_instructions_removed += block.clock_mode_check_instructions_removed;
 #endif
 		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
 

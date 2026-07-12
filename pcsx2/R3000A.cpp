@@ -53,6 +53,15 @@ void psxReset()
 	psxBiosReset();
 }
 
+void psxNotifyClockModeChange()
+{
+	// PCSX2's x86 iPsxAddEECycles() specializes HW_ICFG while compiling,
+	// so changing the IOP clock mode retires translations carrying the old
+	// formula. Interpreter Reset() is intentionally a no-op here.
+	if (psxCpu)
+		psxCpu->Reset();
+}
+
 void psxShutdown() {
 	//psxCpu->Shutdown();
 }
