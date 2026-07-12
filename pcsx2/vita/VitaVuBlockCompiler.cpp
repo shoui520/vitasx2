@@ -69,6 +69,7 @@ u32 g_qemuVuJitLowerEfuStallTestInlineOps = 0;
 u32 g_qemuVuJitLowerBranchStallTestInlineOps = 0;
 u32 g_qemuVuJitLowerStallInlineOps = 0;
 u32 g_qemuVuJitDtFlagInlineOps = 0;
+u32 g_qemuVuJitLinkedFrameEntries = 0;
 #endif
 
 namespace VitaVU
@@ -1127,7 +1128,6 @@ namespace VitaVU
 
 		constexpr u16 SAVED_REGISTER_MASK = 0x4ff0; // r4-r11, lr plus 36-byte frame keeps SP aligned
 		constexpr u16 RETURN_REGISTER_MASK = 0x8ff0; // r4-r11, pc
-		constexpr u16 LINK_RETURN_REGISTER_MASK = 0x4ff0; // r4-r11, lr
 		constexpr u32 STACK_FRAME_SIZE = 36;          // 32-byte VF hazard backup slots + alignment pad
 
 			struct CachedBlock;
@@ -1187,6 +1187,7 @@ namespace VitaVU
 			{
 				if (!EmitPrologue())
 					return false;
+				const size_t body_offset = m_code.Size();
 
 				for (u32 i = 0; i < m_plan.pair_count; i++)
 				{
@@ -1221,10 +1222,42 @@ namespace VitaVU
 					}
 				}
 
+				if (m_vu0_memory_map)
+					return true;
+
+				// PCSX2 owner: x86/microVU_Branch.inl links compatible block
+				// states without returning through the dispatcher.  The Vita block
+				// body uses one stable private-frame mapping, so a linked chain can
+				// retain r4/r6/r7/r11 and the existing stack frame.  Only the
+				// target's private countdown state needs rematerialization.
+				m_linked_entry_offset = m_code.Size();
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitLinkedFrameEntries))) ||
+					!m_code.EmitLdrImm12(1, 0, 0) ||
+					!m_code.EmitAddImm8(1, 1, 1) ||
+					!m_code.EmitStrImm12(1, 0, 0))
+				{
+					return false;
+				}
+#endif
+				if (m_countdown_budget &&
+					(!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
+					 !m_code.EmitSubReg(HOST_BUDGET_LEFT, HOST_LIMIT_LO, HOST_CYCLE_LO)))
+				{
+					return false;
+				}
+				const size_t linked_to_body = m_code.EmitBranchPlaceholder();
+				if (linked_to_body == static_cast<size_t>(-1) ||
+					!m_code.PatchBranch(linked_to_body, body_offset))
+				{
+					return false;
+				}
+
 				return true;
 			}
 
 			const std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS>& DirectLinks() const { return m_direct_links; }
+			size_t LinkedEntryOffset() const { return m_linked_entry_offset; }
 
 		private:
 				struct BudgetExit
@@ -1262,12 +1295,6 @@ namespace VitaVU
 			{
 				return m_code.EmitAddImm8(SP, SP, STACK_FRAME_SIZE) &&
 					m_code.EmitPop(RETURN_REGISTER_MASK);
-			}
-
-			bool EmitLinkEpilogue()
-			{
-				return m_code.EmitAddImm8(SP, SP, STACK_FRAME_SIZE) &&
-					m_code.EmitPop(LINK_RETURN_REGISTER_MASK);
 			}
 
 			bool EmitMovReg(unsigned rd, unsigned rm, Condition condition = Condition::AL)
@@ -1357,7 +1384,8 @@ namespace VitaVU
 							return false;
 					}
 
-					if (!EmitTailLinkArguments(executed_pairs))
+					if (!m_code.EmitAddImm8(HOST_EXEC_BASE, HOST_EXEC_BASE,
+							static_cast<u8>(executed_pairs)))
 						return false;
 
 					link.target_offset = m_code.Size();
@@ -1402,27 +1430,14 @@ namespace VitaVU
 					return false;
 
 				if (!EmitMovReg(HOST_CALL_SCRATCH, 0) ||
-					!EmitTailJumpToRegister(HOST_CALL_SCRATCH, executed_pairs))
+					!m_code.EmitAddImm8(HOST_EXEC_BASE, HOST_EXEC_BASE,
+						static_cast<u8>(executed_pairs)) ||
+					!m_code.EmitBx(HOST_CALL_SCRATCH))
 				{
 					return false;
 				}
 
 				return m_code.PatchBranch(skip, m_code.Size(), Condition::EQ);
-			}
-
-			bool EmitTailLinkArguments(u32 executed_pairs)
-			{
-				return m_code.EmitAddImm8(1, HOST_EXEC_BASE, static_cast<u8>(executed_pairs)) &&
-					EmitMovReg(0, HOST_VU) &&
-					EmitMovReg(2, HOST_LIMIT_LO) &&
-					EmitMovReg(3, HOST_LIMIT_HI) &&
-					EmitLinkEpilogue();
-			}
-
-			bool EmitTailJumpToRegister(unsigned target_reg, u32 executed_pairs)
-			{
-				return EmitTailLinkArguments(executed_pairs) &&
-					m_code.EmitBx(target_reg);
 			}
 
 			bool EmitCallXgkickTransferFlush()
@@ -7032,6 +7047,7 @@ namespace VitaVU
 			bool m_norm_consts_ready = false;
 			std::vector<BudgetExit> m_budget_exits;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> m_direct_links{};
+			size_t m_linked_entry_offset = static_cast<size_t>(-1);
 		};
 
 		// ------------------------------------------------------------------
@@ -7042,6 +7058,7 @@ namespace VitaVU
 		{
 			CodeBuffer code;
 			const void* entry = nullptr;
+			const void* linked_entry = nullptr;
 			size_t code_size = 0;
 			u32 start_pc = 0;
 			u32 pair_count = 0;
@@ -7333,7 +7350,7 @@ namespace VitaVU
 						SelectBlockMap(link.target_branch_tail, link.target_ebit_tail);
 					CachedBlock* target = target_map[link.target_pc / 8];
 					if (target && target != BLOCK_UNCOMPILABLE)
-						PatchVu1DirectLink(source, link, target->entry);
+						PatchVu1DirectLink(source, link, target->linked_entry);
 				}
 			}
 
@@ -7347,7 +7364,7 @@ namespace VitaVU
 				for (Vu1DirectLinkSlot& link : source->direct_links)
 				{
 					if (DirectLinkTargetsBlock(link, target))
-						PatchVu1DirectLink(*source, link, target.entry);
+						PatchVu1DirectLink(*source, link, target.linked_entry);
 				}
 			}
 		}
@@ -7464,6 +7481,7 @@ namespace VitaVU
 							block->direct_links = compiler.DirectLinks();
 							block->code = std::move(code);
 							block->entry = block->code.EntryPoint();
+							block->linked_entry = static_cast<const u8*>(block->entry) + compiler.LinkedEntryOffset();
 							block->code_size = block->code.Size();
 							if (!PatchVu1RuntimeLinkSlotPointers(*block))
 								break;
@@ -7727,7 +7745,7 @@ namespace VitaVU
 					observed_link->target_pc = target_pc;
 					observed_link->guard_tpc_value = target_pc;
 					observed_link->observed_target = true;
-					if (PatchVu1DirectLink(*observed_link->owner, *observed_link, block->entry))
+					if (PatchVu1DirectLink(*observed_link->owner, *observed_link, block->linked_entry))
 					{
 						if (first_observation)
 							s_vu1.stats.direct_link_runtime_observed_slots++;
@@ -7737,7 +7755,7 @@ namespace VitaVU
 						observed_link->observed_target = false;
 					}
 				}
-				return block->entry;
+				return block->linked_entry;
 			}
 	} // anonymous namespace
 
@@ -7998,11 +8016,22 @@ namespace VitaVU
 
 	Vu1ProviderStats GetVu1ProviderStats()
 	{
-		return s_vu1.stats;
+		Vu1ProviderStats stats = s_vu1.stats;
+#if defined(VITASX2_QEMU_VALIDATION)
+		stats.linked_frame_entries = g_qemuVuJitLinkedFrameEntries;
+		stats.linked_frame_instructions_removed =
+			static_cast<u64>(g_qemuVuJitLinkedFrameEntries) * 10;
+		stats.linked_frame_stack_words_removed =
+			static_cast<u64>(g_qemuVuJitLinkedFrameEntries) * 18;
+#endif
+		return stats;
 	}
 
 	void ResetVu1ProviderStats()
 	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuVuJitLinkedFrameEntries = 0;
+#endif
 		const size_t used = s_vu1.stats.code_cache_used;
 		const size_t capacity = s_vu1.stats.code_cache_capacity;
 		s_vu1.stats = {};

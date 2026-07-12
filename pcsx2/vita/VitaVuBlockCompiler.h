@@ -66,6 +66,9 @@ namespace VitaVU
 		u32 direct_link_patches = 0;
 		u32 direct_link_runtime_patches = 0;
 		u32 direct_link_runtime_observed_slots = 0;
+		u64 linked_frame_entries = 0;
+		u64 linked_frame_instructions_removed = 0;
+		u64 linked_frame_stack_words_removed = 0;
 		u32 code_cache_resets = 0;
 		size_t code_cache_used = 0;
 		size_t code_cache_capacity = 0;
