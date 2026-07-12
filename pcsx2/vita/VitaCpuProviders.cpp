@@ -56,6 +56,7 @@ static u64 s_iop_a32_condition_code_branch_instructions_removed = 0;
 static u64 s_iop_a32_producer_branch_compare_instructions_removed = 0;
 static u64 s_iop_a32_fused_ram_guard_instructions_removed = 0;
 static u64 s_iop_a32_source_page_guard_instructions_removed = 0;
+static u64 s_iop_a32_source_page_literal_instructions_removed = 0;
 #endif
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
@@ -826,6 +827,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			result.fused_ram_guard_instructions_removed;
 		s_iop_a32_source_page_guard_instructions_removed +=
 			result.source_page_guard_instructions_removed;
+		s_iop_a32_source_page_literal_instructions_removed +=
+			result.source_page_literal_instructions_removed;
 #endif
 		if (result.wait_loop_fast_forward)
 			continue;
@@ -1060,6 +1063,7 @@ void VitaResetA32IopProviderStats()
 	s_iop_a32_producer_branch_compare_instructions_removed = 0;
 	s_iop_a32_fused_ram_guard_instructions_removed = 0;
 	s_iop_a32_source_page_guard_instructions_removed = 0;
+	s_iop_a32_source_page_literal_instructions_removed = 0;
 #endif
 	s_iop_a32_executor.ResetInstrumentationCounters();
 }
@@ -1118,6 +1122,8 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 		s_iop_a32_fused_ram_guard_instructions_removed;
 	s_iop_a32_stats.source_page_guard_instructions_removed =
 		s_iop_a32_source_page_guard_instructions_removed;
+	s_iop_a32_stats.source_page_literal_instructions_removed =
+		s_iop_a32_source_page_literal_instructions_removed;
 #endif
 	return s_iop_a32_stats;
 }

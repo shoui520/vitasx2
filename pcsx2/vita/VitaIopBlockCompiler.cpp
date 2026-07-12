@@ -61,6 +61,7 @@ static bool s_qemuIopPinnedBranchDirectCompareEnabled = true;
 static bool s_qemuIopConditionCodeBranchEnabled = true;
 static bool s_qemuIopProducerBranchFlagsEnabled = true;
 static bool s_qemuIopRamProvenanceSpecializationEnabled = true;
+static bool s_qemuIopSourcePageLiteralEnabled = true;
 static bool s_qemuIopClockModeSpecializationEnabled = true;
 static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
@@ -987,10 +988,12 @@ namespace
 namespace VitaIOP
 {
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code,
-		const u16* ram_source_page_live_counts, const u8* ram_source_page_live_flags)
+		const u16* ram_source_page_live_counts, const u8* ram_source_page_live_flags,
+		bool source_page_literal_allowed)
 		: m_code(code)
 		, m_ram_source_page_live_counts(ram_source_page_live_counts)
 		, m_ram_source_page_live_flags(ram_source_page_live_flags)
+		, m_source_page_literal_allowed(source_page_literal_allowed)
 	{
 	}
 
@@ -3910,10 +3913,26 @@ namespace VitaIOP
 			// replaces the halfword-index construction on every RAM store.
 			if (ram_provenance_specialization)
 			{
-				if (!m_ram_source_page_live_flags ||
-					!m_code.EmitMovImm32(HOST_TMP2,
-						static_cast<u32>(reinterpret_cast<uptr>(m_ram_source_page_live_flags))) ||
-					!m_code.EmitLdrbRegShift(HOST_TMP0, HOST_TMP2, HOST_TMP0,
+				bool source_page_literal_enabled = m_source_page_literal_allowed;
+#if defined(VITASX2_QEMU_VALIDATION)
+				source_page_literal_enabled = source_page_literal_enabled &&
+					s_qemuIopSourcePageLiteralEnabled;
+#endif
+				if (!m_ram_source_page_live_flags)
+					return static_cast<size_t>(-1);
+				if (source_page_literal_enabled)
+				{
+					const size_t load = m_code.EmitLdrLiteralPlaceholder(HOST_TMP2);
+					if (load == static_cast<size_t>(-1))
+						return static_cast<size_t>(-1);
+					m_source_page_literal_loads.push_back(load);
+				}
+				else if (!m_code.EmitMovImm32(HOST_TMP2,
+					static_cast<u32>(reinterpret_cast<uptr>(m_ram_source_page_live_flags))))
+				{
+					return static_cast<size_t>(-1);
+				}
+				if (!m_code.EmitLdrbRegShift(HOST_TMP0, HOST_TMP2, HOST_TMP0,
 						VitaA32::ShiftType::LSR, 12) ||
 					!m_code.EmitCmpImm32(HOST_TMP0, 0))
 				{
@@ -4004,6 +4023,32 @@ namespace VitaIOP
 		if (used_known_store_value)
 			++g_qemuIopConstStoreValueFastPaths;
 #endif
+		return true;
+	}
+
+	bool BlockCompiler::EmitSourcePageLiteralPool()
+	{
+		if (m_source_page_literal_loads.empty())
+			return true;
+
+		// The main hot path has returned before this pool. Cold/helper paths are
+		// emitted later and their patched branches jump over this one shared word.
+		const size_t literal_offset = m_code.Size();
+		if (!m_code.EmitU32(
+				static_cast<u32>(reinterpret_cast<uptr>(m_ram_source_page_live_flags))))
+		{
+			return false;
+		}
+		for (const size_t load : m_source_page_literal_loads)
+		{
+			if (!m_code.PatchLdrLiteral(load, literal_offset))
+			{
+				m_source_page_literal_out_of_range = true;
+				return false;
+			}
+		}
+		m_source_page_literal_instructions_removed +=
+			static_cast<u32>(m_source_page_literal_loads.size());
 		return true;
 	}
 
@@ -5690,6 +5735,9 @@ namespace VitaIOP
 		m_producer_branch_compare_instructions_removed = 0;
 		m_fused_ram_guard_instructions_removed = 0;
 		m_source_page_guard_instructions_removed = 0;
+		m_source_page_literal_instructions_removed = 0;
+		m_source_page_literal_loads.clear();
+		m_source_page_literal_out_of_range = false;
 		m_branch_predicate_producer_flags_live = false;
 		m_branch_predicate_producer_guest = 0;
 		m_branch_predicate_producer_true_condition = VitaA32::Condition::AL;
@@ -6040,7 +6088,11 @@ namespace VitaIOP
 				std::min(m_pinned_gpr_memory_ops_saved, m_pinned_gpr_min_exit_savings);
 		}
 
-		if (!FlushColdTails())
+		// Place the shared word at the first block-wide unreachable seam. Cold
+		// fallback branches are patched afterwards and jump over it; their tails
+		// branch back to their main-path joins. Keeping the pool before those
+		// tails gives large blocks the same one-instruction hot guard.
+		if (!EmitSourcePageLiteralPool() || !FlushColdTails())
 			return false;
 
 		for (const size_t branch_offset : direct_exit_branches)
@@ -6070,7 +6122,6 @@ namespace VitaIOP
 			if (!m_code.PatchBranch(branch_offset, published_state_exit_offset, VitaA32::Condition::LE))
 				return false;
 		}
-
 		m_direct_exit_branches = nullptr;
 		m_budget_exit_branches = nullptr;
 		return true;
@@ -6170,6 +6221,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopRamProvenanceSpecializationEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetSourcePageLiteralEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopSourcePageLiteralEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -7432,6 +7492,7 @@ namespace VitaIOP
 		u32 producer_branch_compare_instructions_removed = 0;
 		u32 fused_ram_guard_instructions_removed = 0;
 		u32 source_page_guard_instructions_removed = 0;
+		u32 source_page_literal_instructions_removed = 0;
 		u32 clock_mode_check_instructions_removed = 0;
 		u32 saved_register_stack_words_removed = 0;
 		u32 saved_register_frame_instructions_added = 0;
@@ -7445,6 +7506,7 @@ namespace VitaIOP
 		bool direct_budget_exit = false;
 		bool constant_cycle_budget = false;
 		DirectLinkSlots direct_links;
+		bool source_page_literal_allowed = true;
 		for (;;)
 		{
 			size_t code_slice_offset = 0;
@@ -7464,13 +7526,14 @@ namespace VitaIOP
 			}
 
 			BlockCompiler compiler(block.code, m_ram_source_page_live_counts.data(),
-				m_ram_source_page_live_flags.data());
+				m_ram_source_page_live_flags.data(), source_page_literal_allowed);
 			DirectLinkSlots attempt_direct_links;
 			size_t attempt_linked_entry_offset = 0;
 			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
 				reinterpret_cast<const void*>(&VitaIopA32DirectExit), &attempt_direct_links,
 				&attempt_linked_entry_offset);
 			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
+			const bool source_page_literal_out_of_range = compiler.SourcePageLiteralOutOfRange();
 			if (compiled && block.code.Flush())
 			{
 				block_code_slice_offset = code_slice_offset;
@@ -7488,6 +7551,8 @@ namespace VitaIOP
 					compiler.FusedRamGuardInstructionsRemoved();
 				source_page_guard_instructions_removed =
 					compiler.SourcePageGuardInstructionsRemoved();
+				source_page_literal_instructions_removed =
+					compiler.SourcePageLiteralInstructionsRemoved();
 				clock_mode_check_instructions_removed = compiler.ClockModeCheckInstructionsRemoved();
 				saved_register_stack_words_removed = compiler.SavedRegisterStackWordsRemoved();
 				saved_register_frame_instructions_added = compiler.SavedRegisterFrameInstructionsAdded();
@@ -7506,6 +7571,11 @@ namespace VitaIOP
 
 			block.code.Release();
 			RewindCodeCache(code_slice_offset);
+			if (source_page_literal_out_of_range && source_page_literal_allowed)
+			{
+				source_page_literal_allowed = false;
+				continue;
+			}
 			if (!out_of_block_space || block_code_capacity >= MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY)
 				return false;
 
@@ -7527,6 +7597,7 @@ namespace VitaIOP
 			producer_branch_compare_instructions_removed;
 		block.fused_ram_guard_instructions_removed = fused_ram_guard_instructions_removed;
 		block.source_page_guard_instructions_removed = source_page_guard_instructions_removed;
+		block.source_page_literal_instructions_removed = source_page_literal_instructions_removed;
 		block.clock_mode_check_instructions_removed = clock_mode_check_instructions_removed;
 		block.saved_register_stack_words_removed = saved_register_stack_words_removed;
 		block.saved_register_frame_instructions_added = saved_register_frame_instructions_added;
@@ -7683,6 +7754,8 @@ namespace VitaIOP
 			block.fused_ram_guard_instructions_removed;
 		result->source_page_guard_instructions_removed =
 			block.source_page_guard_instructions_removed;
+		result->source_page_literal_instructions_removed =
+			block.source_page_literal_instructions_removed;
 		SnapshotInstrumentation(result);
 #endif
 	}
@@ -7762,6 +7835,8 @@ namespace VitaIOP
 					block.fused_ram_guard_instructions_removed;
 				result->source_page_guard_instructions_removed =
 					block.source_page_guard_instructions_removed;
+				result->source_page_literal_instructions_removed =
+					block.source_page_literal_instructions_removed;
 			}
 #endif
 			// The generated block did not execute, so no producer-to-branch CMP
@@ -7770,6 +7845,7 @@ namespace VitaIOP
 			result->producer_branch_compare_instructions_removed = 0;
 			result->fused_ram_guard_instructions_removed = 0;
 			result->source_page_guard_instructions_removed = 0;
+			result->source_page_literal_instructions_removed = 0;
 #endif
 			result->wait_loop_fast_forward = true;
 			return true;
@@ -7815,6 +7891,8 @@ namespace VitaIOP
 				block.fused_ram_guard_instructions_removed;
 			result->source_page_guard_instructions_removed =
 				block.source_page_guard_instructions_removed;
+			result->source_page_literal_instructions_removed =
+				block.source_page_literal_instructions_removed;
 		}
 #endif
 		return true;

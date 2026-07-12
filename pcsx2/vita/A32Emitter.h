@@ -70,6 +70,7 @@ namespace VitaA32
 		bool EmitMovt(unsigned rd, u16 value, Condition condition = Condition::AL);
 		bool EmitMovImm32(unsigned rd, u32 value, Condition condition = Condition::AL);
 		bool EmitMovImm32Patchable(unsigned rd, u32 value);
+		size_t EmitLdrLiteralPlaceholder(unsigned rd, Condition condition = Condition::AL);
 		bool EmitAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitAddImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
@@ -271,6 +272,8 @@ namespace VitaA32
 				Condition condition = Condition::AL);
 			bool ReadInstruction(size_t instruction_offset, u32* instruction) const;
 			bool PatchInstruction(size_t instruction_offset, u32 instruction);
+			bool PatchLdrLiteral(size_t instruction_offset, size_t literal_offset,
+				Condition condition = Condition::AL);
 			bool PatchNop(size_t instruction_offset);
 			bool EmitPush(u16 register_list);
 		bool EmitVpushDRange(unsigned first_d, unsigned d_count);

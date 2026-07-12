@@ -549,6 +549,18 @@ namespace VitaA32
 			   EmitU32(EncodeMovt(rd, static_cast<u16>(value >> 16)));
 	}
 
+	size_t CodeBuffer::EmitLdrLiteralPlaceholder(unsigned rd, Condition condition)
+	{
+		if (!IsLowRegister(rd))
+			return static_cast<size_t>(-1);
+
+		const size_t offset = m_offset;
+		// LDR rd, [pc, #+/-imm12]. PatchLdrLiteral() owns the U bit and
+		// displacement once the block-local pool position is known.
+		return EmitU32(CondBits(condition) | 0x051f0000u | (rd << 12)) ?
+			offset : static_cast<size_t>(-1);
+	}
+
 	bool CodeBuffer::EmitAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
@@ -2060,6 +2072,35 @@ namespace VitaA32
 			return false;
 		}
 
+		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		return true;
+	}
+
+	bool CodeBuffer::PatchLdrLiteral(size_t instruction_offset, size_t literal_offset,
+		Condition condition)
+	{
+		if (!m_base || instruction_offset + sizeof(u32) > m_offset ||
+			literal_offset + sizeof(u32) > m_offset || (instruction_offset & 3) != 0 ||
+			(literal_offset & 3) != 0)
+		{
+			return false;
+		}
+
+		u32 placeholder = 0;
+		std::memcpy(&placeholder, m_base + instruction_offset, sizeof(placeholder));
+		if ((placeholder & 0x0f7f0000u) != 0x051f0000u)
+			return false;
+		const unsigned rd = (placeholder >> 12) & 0xf;
+		if (!IsLowRegister(rd))
+			return false;
+		const ptrdiff_t displacement = static_cast<ptrdiff_t>(literal_offset) -
+			static_cast<ptrdiff_t>(instruction_offset + 8);
+		if (displacement < -4095 || displacement > 4095)
+			return false;
+
+		const u32 magnitude = static_cast<u32>(displacement < 0 ? -displacement : displacement);
+		const u32 add = displacement >= 0 ? (1u << 23) : 0;
+		const u32 instruction = CondBits(condition) | 0x051f0000u | add | (rd << 12) | magnitude;
 		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
 		return true;
 	}

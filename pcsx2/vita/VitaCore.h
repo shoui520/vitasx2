@@ -114,6 +114,7 @@ struct VitaA32IopProviderStats
 	u64 producer_branch_compare_instructions_removed = 0;
 	u64 fused_ram_guard_instructions_removed = 0;
 	u64 source_page_guard_instructions_removed = 0;
+	u64 source_page_literal_instructions_removed = 0;
 #endif
 };
 

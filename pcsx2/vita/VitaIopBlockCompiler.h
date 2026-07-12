@@ -77,6 +77,7 @@ namespace VitaIOP
 		u32 producer_branch_compare_instructions_removed;
 		u32 fused_ram_guard_instructions_removed;
 		u32 source_page_guard_instructions_removed;
+		u32 source_page_literal_instructions_removed;
 #endif
 		bool cache_hit;
 		bool lookup_hit;
@@ -104,7 +105,8 @@ namespace VitaIOP
 	{
 	public:
 		explicit BlockCompiler(VitaA32::CodeBuffer& code,
-			const u16* ram_source_page_live_counts, const u8* ram_source_page_live_flags);
+			const u16* ram_source_page_live_counts, const u8* ram_source_page_live_flags,
+			bool source_page_literal_allowed = true);
 
 		static bool CanCompileOpcode(u32 op);
 
@@ -145,6 +147,11 @@ namespace VitaIOP
 		{
 			return m_source_page_guard_instructions_removed;
 		}
+		u32 SourcePageLiteralInstructionsRemoved() const
+		{
+			return m_source_page_literal_instructions_removed;
+		}
+		bool SourcePageLiteralOutOfRange() const { return m_source_page_literal_out_of_range; }
 
 	private:
 		bool BeginBlock(size_t* linked_entry_offset);
@@ -157,6 +164,7 @@ namespace VitaIOP
 		bool EmitNativeCOP0(u32 op);
 		bool EmitNativeCOP2(u32 op);
 		bool EmitStoreCode(u32 op);
+		bool EmitSourcePageLiteralPool();
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
 		void AnalyzePinnedGprs(u32 start_pc, u32 instruction_count);
 		void AnalyzeSavedRegisters(u32 start_pc, u32 instruction_count);
@@ -293,12 +301,14 @@ namespace VitaIOP
 		VitaA32::CodeBuffer& m_code;
 		const u16* m_ram_source_page_live_counts = nullptr;
 		const u8* m_ram_source_page_live_flags = nullptr;
+		bool m_source_page_literal_allowed = true;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
 		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
 		std::vector<UnalignedReadColdTail> m_unaligned_read_cold_tails;
 		std::vector<UnalignedWriteColdTail> m_unaligned_write_cold_tails;
 		std::vector<Cop2LoadColdTail> m_cop2_load_cold_tails;
 		std::vector<Cop2StoreColdTail> m_cop2_store_cold_tails;
+		std::vector<size_t> m_source_page_literal_loads;
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
 		u16 m_saved_registers = 0;
@@ -323,6 +333,7 @@ namespace VitaIOP
 		u32 m_producer_branch_compare_instructions_removed = 0;
 		u32 m_fused_ram_guard_instructions_removed = 0;
 		u32 m_source_page_guard_instructions_removed = 0;
+		u32 m_source_page_literal_instructions_removed = 0;
 		u32 m_pinned_gpr_min_exit_savings = UINT32_MAX;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
@@ -341,6 +352,7 @@ namespace VitaIOP
 		bool m_expanded_cycle_batching = false;
 		bool m_track_published_cycle_prefix = false;
 		bool m_has_budget_exit = false;
+		bool m_source_page_literal_out_of_range = false;
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_branch_flags = false;
@@ -384,6 +396,7 @@ namespace VitaIOP
 		static void SetConditionCodeBranchEnabled(bool enabled);
 		static void SetProducerBranchFlagsEnabled(bool enabled);
 		static void SetRamProvenanceSpecializationEnabled(bool enabled);
+		static void SetSourcePageLiteralEnabled(bool enabled);
 		static void SetClockModeSpecializationEnabled(bool enabled);
 		static void SetSavedRegisterNarrowingEnabled(bool enabled);
 		static void SetBlockCycleBatchingEnabled(bool enabled);
@@ -447,6 +460,7 @@ namespace VitaIOP
 			u32 producer_branch_compare_instructions_removed = 0;
 			u32 fused_ram_guard_instructions_removed = 0;
 			u32 source_page_guard_instructions_removed = 0;
+			u32 source_page_literal_instructions_removed = 0;
 			u32 clock_mode_check_instructions_removed = 0;
 			u32 saved_register_stack_words_removed = 0;
 			u32 saved_register_frame_instructions_added = 0;
