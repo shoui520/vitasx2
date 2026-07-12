@@ -1306,6 +1306,22 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 			snapshot.hot_dispatch_cache_way_probes) ?
 			(snapshot.hot_dispatch_cache_64_set_way_probes -
 				snapshot.hot_dispatch_cache_way_probes) : 0;
+	s_iop_a32_stats.scheduler_direct_resume_candidates =
+		snapshot.scheduler_direct_resume_candidates;
+	s_iop_a32_stats.scheduler_direct_resume_installs =
+		snapshot.scheduler_direct_resume_installs;
+	s_iop_a32_stats.scheduler_direct_resume_attempts =
+		snapshot.scheduler_direct_resume_attempts;
+	s_iop_a32_stats.scheduler_direct_resume_hits =
+		snapshot.scheduler_direct_resume_hits;
+	s_iop_a32_stats.scheduler_direct_resume_misses =
+		snapshot.scheduler_direct_resume_misses;
+	s_iop_a32_stats.scheduler_direct_resume_no_target =
+		snapshot.scheduler_direct_resume_no_target;
+	s_iop_a32_stats.scheduler_direct_resume_target_mismatch =
+		snapshot.scheduler_direct_resume_target_mismatch;
+	s_iop_a32_stats.scheduler_direct_resume_hot_lookups_removed =
+		snapshot.scheduler_direct_resume_hits;
 	s_iop_a32_stats.hot_dispatch_trusted_raw_hits = snapshot.hot_dispatch_trusted_raw_hits;
 	s_iop_a32_stats.hot_dispatch_owned_hits = snapshot.hot_dispatch_owned_hits;
 	// The retired stale-entry arm loads/checks CachedBlock::valid and reloads/

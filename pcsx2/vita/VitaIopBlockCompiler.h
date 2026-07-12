@@ -53,6 +53,13 @@ namespace VitaIOP
 		u64 hot_dispatch_cache_64_set_hits;
 		u64 hot_dispatch_cache_64_set_misses;
 		u64 hot_dispatch_cache_64_set_way_probes;
+		u64 scheduler_direct_resume_candidates;
+		u64 scheduler_direct_resume_installs;
+		u64 scheduler_direct_resume_attempts;
+		u64 scheduler_direct_resume_hits;
+		u64 scheduler_direct_resume_misses;
+		u64 scheduler_direct_resume_no_target;
+		u64 scheduler_direct_resume_target_mismatch;
 		u64 hot_dispatch_trusted_raw_hits;
 		u64 hot_dispatch_owned_hits;
 		u64 wait_resume_cache_attempts;
@@ -205,6 +212,7 @@ namespace VitaIOP
 		u32 target_pc = 0;
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
+		size_t scheduler_resume_offset = static_cast<size_t>(-1);
 		bool valid = false;
 	};
 
@@ -277,7 +285,7 @@ namespace VitaIOP
 		bool EndBlockIsolateModeWriteReturn(bool charge_budget = true,
 			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot,
-			bool charge_budget = true);
+			u8 direct_link_slot_index, bool charge_budget = true);
 		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& trace_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op, u32 pc);
@@ -324,9 +332,10 @@ namespace VitaIOP
 		u32 CurrentTimingHelperSeamCount() const;
 		void RecordBatchedCycleExitSavings(u32 cycle_prefix, bool preserves_argument);
 		bool EmitIncrementCycle();
-		bool EmitChargeEeBudget(u32 known_cycle_count = 0, bool pins_flushed = true);
+		bool EmitChargeEeBudget(u32 known_cycle_count = 0, bool pins_flushed = true,
+			u8 scheduler_resume_slot = UINT8_MAX);
 		bool BranchTestSchedulingEnabled() const;
-		bool EmitBranchEventTest();
+		bool EmitBranchEventTest(u8 scheduler_resume_slot = UINT8_MAX);
 		bool EmitQemuCounterIncrement(u32* counter);
 		bool EmitChargeEeBudgetPs1(u32 known_block_cycles);
 		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
@@ -478,6 +487,8 @@ namespace VitaIOP
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
 		std::vector<size_t>* m_unflushed_budget_exit_branches = nullptr;
+		std::array<std::vector<size_t>*, 2> m_scheduler_budget_exit_branches{};
+		std::array<std::vector<size_t>*, 2> m_unflushed_scheduler_budget_exit_branches{};
 		u32 m_block_cycle_count = 0;
 		u32 m_clock_mode_check_instructions_removed = 0;
 		u32 m_saved_register_stack_words_removed = 0;
@@ -563,6 +574,8 @@ namespace VitaIOP
 		static void SetWaitResumeDescriptorSpecializationEnabled(bool enabled);
 		static void SetCompiledPs1BiosGateEnabled(bool enabled);
 		static bool CompiledPs1BiosGateEnabled();
+		static void SetSchedulerDirectResumeEnabled(bool enabled);
+		static bool SchedulerDirectResumeEnabled();
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -587,6 +600,7 @@ namespace VitaIOP
 		static constexpr size_t IOP_CODE_CACHE_CAPACITY = HostMemoryMap::IOPrecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
+		static constexpr u32 SCHEDULER_DIRECT_RESUME_TAG = 1u;
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
@@ -770,6 +784,8 @@ namespace VitaIOP
 			CachedBlock& block, u32 dispatch_flags);
 		__attribute__((noinline, cold)) CachedBlock* FindProviderBlockAtPcSlow(
 			u32 start_pc, ProviderCompileResult* compile_result, u32* dispatch_flags);
+		inline __attribute__((always_inline)) CachedBlock* FindProviderBlockAtPcInline(
+			u32 start_pc, ProviderCompileResult* compile_result, u32* dispatch_flags);
 		inline __attribute__((always_inline)) u32 ExecuteProviderBlockAtPcInline(
 			u32 start_pc, ProviderCompileResult* compile_result);
 		inline __attribute__((always_inline)) s32 ExecuteProviderTimesliceLoop();
@@ -840,6 +856,9 @@ namespace VitaIOP
 #endif
 		void SetWaitResumeBlock(CachedBlock* block);
 		void ClearWaitResumeBlock();
+		void ClearSchedulerDirectResume();
+		inline __attribute__((always_inline)) CachedBlock* FindSchedulerDirectResumeBlock(
+			u32* dispatch_flags);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		const void* ProviderEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
@@ -865,6 +884,7 @@ namespace VitaIOP
 			HOT_DISPATCH_CACHE_CONTROL_SET_COUNT>, 2> m_hot_dispatch_cache_64_set_control{};
 #endif
 		CachedBlock* m_wait_resume_block = nullptr;
+		CachedBlock* m_scheduler_direct_resume_block = nullptr;
 		struct WaitResumeEventContext
 		{
 			BlockExecutor* executor = nullptr;
@@ -884,6 +904,13 @@ namespace VitaIOP
 		u64 m_hot_dispatch_cache_64_set_hits = 0;
 		u64 m_hot_dispatch_cache_64_set_misses = 0;
 		u64 m_hot_dispatch_cache_64_set_way_probes = 0;
+		u64 m_scheduler_direct_resume_candidates = 0;
+		u64 m_scheduler_direct_resume_installs = 0;
+		u64 m_scheduler_direct_resume_attempts = 0;
+		u64 m_scheduler_direct_resume_hits = 0;
+		u64 m_scheduler_direct_resume_misses = 0;
+		u64 m_scheduler_direct_resume_no_target = 0;
+		u64 m_scheduler_direct_resume_target_mismatch = 0;
 		u64 m_hot_dispatch_trusted_raw_hits = 0;
 		u64 m_hot_dispatch_owned_hits = 0;
 		u64 m_wait_resume_cache_attempts = 0;

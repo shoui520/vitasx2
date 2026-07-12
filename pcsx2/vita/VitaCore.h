@@ -160,6 +160,14 @@ struct VitaA32IopProviderStats
 	u64 hot_dispatch_cache_64_set_misses = 0;
 	u64 hot_dispatch_cache_64_set_way_probes = 0;
 	u64 hot_dispatch_cache_way_probes_removed = 0;
+	u64 scheduler_direct_resume_candidates = 0;
+	u64 scheduler_direct_resume_installs = 0;
+	u64 scheduler_direct_resume_attempts = 0;
+	u64 scheduler_direct_resume_hits = 0;
+	u64 scheduler_direct_resume_misses = 0;
+	u64 scheduler_direct_resume_no_target = 0;
+	u64 scheduler_direct_resume_target_mismatch = 0;
+	u64 scheduler_direct_resume_hot_lookups_removed = 0;
 	u64 hot_dispatch_trusted_raw_hits = 0;
 	u64 hot_dispatch_owned_hits = 0;
 	u64 hot_dispatch_stale_guard_instructions_removed = 0;

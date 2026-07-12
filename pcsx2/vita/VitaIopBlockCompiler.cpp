@@ -84,6 +84,7 @@ static bool s_qemuIopWaitResumeClockEntryEnabled = true;
 static bool s_qemuIopWaitResumeNoLinkEntryEnabled = true;
 static bool s_qemuIopWaitResumeDescriptorSpecializationEnabled = true;
 static bool s_qemuIopCompiledPs1BiosGateEnabled = true;
+static bool s_qemuIopSchedulerDirectResumeEnabled = true;
 static u64 s_qemuIopInlineWaitFastForwards = 0;
 #endif
 
@@ -1410,12 +1411,14 @@ namespace VitaIOP
 	}
 
 	bool BlockCompiler::EndBlockDirectTail(const void* direct_exit,
-		DirectLinkSlot* direct_link_slot, bool charge_budget)
+		DirectLinkSlot* direct_link_slot, u8 direct_link_slot_index,
+		bool charge_budget)
 	{
-		if (!direct_exit)
+		if (!direct_exit || direct_link_slot_index >= 2)
 			return false;
 
-		if (!EmitFlushPinnedGprs() || (charge_budget && !EmitChargeEeBudget()))
+		if (!EmitFlushPinnedGprs() ||
+			(charge_budget && !EmitChargeEeBudget(0, true, direct_link_slot_index)))
 		{
 			return false;
 		}
@@ -2319,20 +2322,39 @@ namespace VitaIOP
 			m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(IOP_CYCLE_EE_OFFSET));
 	}
 
-	bool BlockCompiler::EmitChargeEeBudget(u32 known_cycle_count, bool pins_flushed)
+	bool BlockCompiler::EmitChargeEeBudget(
+		u32 known_cycle_count, bool pins_flushed, u8 scheduler_resume_slot)
 	{
 		if (!m_direct_exit_branches || !m_budget_exit_branches ||
 			!m_unflushed_budget_exit_branches)
 			return false;
+		if (scheduler_resume_slot != UINT8_MAX &&
+			(scheduler_resume_slot >= 2 ||
+			 !m_scheduler_budget_exit_branches[scheduler_resume_slot] ||
+			 !m_unflushed_scheduler_budget_exit_branches[scheduler_resume_slot]))
+		{
+			return false;
+		}
 		m_has_budget_exit = true;
 
 		// PCSX2 owner: x86/iR3000A.cpp::iPsxAddEECycles() leaves the signed
 		// budget subtraction flags live for iPsxBranchTest()'s xJLE. A32 STR
 		// also preserves those flags, so branch on LE directly instead of
 		// materializing and retesting a temporary Boolean.
-		const auto emit_budget_exit_from_signed_flags = [this, pins_flushed]() {
-			std::vector<size_t>* exits = pins_flushed ?
-				m_budget_exit_branches : m_unflushed_budget_exit_branches;
+		const auto emit_budget_exit_from_signed_flags =
+			[this, pins_flushed, scheduler_resume_slot]() {
+			std::vector<size_t>* exits = nullptr;
+			if (scheduler_resume_slot != UINT8_MAX)
+			{
+				exits = pins_flushed ?
+					m_scheduler_budget_exit_branches[scheduler_resume_slot] :
+					m_unflushed_scheduler_budget_exit_branches[scheduler_resume_slot];
+			}
+			else
+			{
+				exits = pins_flushed ?
+					m_budget_exit_branches : m_unflushed_budget_exit_branches;
+			}
 			exits->push_back(
 				m_code.EmitBranchPlaceholder(VitaA32::Condition::LE));
 			return exits->back() != static_cast<size_t>(-1);
@@ -5293,7 +5315,7 @@ namespace VitaIOP
 #endif
 	}
 
-	bool BlockCompiler::EmitBranchEventTest()
+	bool BlockCompiler::EmitBranchEventTest(u8 scheduler_resume_slot)
 	{
 		// PCSX2 owner: x86/iR3000A.cpp::iPsxBranchTest() subtracts the
 		// completed block from iopCycleEE and exits on <= 0 before checking any
@@ -5303,7 +5325,8 @@ namespace VitaIOP
 		if (!EmitQemuCounterIncrement(&s_qemuIopBranchEventCandidates))
 			return false;
 #endif
-		if (BranchTestSchedulingEnabled() && !EmitChargeEeBudget(0, false))
+		if (BranchTestSchedulingEnabled() &&
+			!EmitChargeEeBudget(0, false, scheduler_resume_slot))
 			return false;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!EmitQemuCounterIncrement(&s_qemuIopBranchEventBudgetPositive))
@@ -6484,9 +6507,18 @@ namespace VitaIOP
 		std::vector<size_t> trace_exit_branches;
 		std::vector<size_t> budget_exit_branches;
 		std::vector<size_t> unflushed_budget_exit_branches;
+		std::array<std::vector<size_t>, 2> scheduler_budget_exit_branches;
+		std::array<std::vector<size_t>, 2> unflushed_scheduler_budget_exit_branches;
 		m_direct_exit_branches = &direct_exit_branches;
 		m_budget_exit_branches = &budget_exit_branches;
 		m_unflushed_budget_exit_branches = &unflushed_budget_exit_branches;
+		for (u8 slot = 0; slot < 2; slot++)
+		{
+			m_scheduler_budget_exit_branches[slot] =
+				&scheduler_budget_exit_branches[slot];
+			m_unflushed_scheduler_budget_exit_branches[slot] =
+				&unflushed_scheduler_budget_exit_branches[slot];
+		}
 		direct_exit_branches.reserve(instruction_count * 2);
 		trace_exit_branches.reserve(instruction_count);
 		budget_exit_branches.reserve(4);
@@ -6605,7 +6637,8 @@ namespace VitaIOP
 			if (emit_branch_link_tails)
 			{
 				DirectLinkSlot& link = direct_links->slots[slot_index];
-				if (!EndBlockDirectTail(direct_exit, &link, charge_budget))
+				if (!EndBlockDirectTail(
+						direct_exit, &link, slot_index, charge_budget))
 					return false;
 
 				link.target_pc = target_pc;
@@ -6629,7 +6662,8 @@ namespace VitaIOP
 					return false;
 
 				if (m_static_branch_taken &&
-					(!EmitBranchEventTest() ||
+					(!EmitBranchEventTest(
+						emit_branch_link_tails ? link_slot : UINT8_MAX) ||
 						!EmitPcChangedExitCheck(target_pc, direct_exit_branches)))
 				{
 					return false;
@@ -6674,7 +6708,7 @@ namespace VitaIOP
 					(m_static_branch_flags_live &&
 						!EmitPublishCyclePrefix(instruction_count)) ||
 					!EmitStorePc(static_branch_target_pc) ||
-					!EmitBranchEventTest() ||
+					!EmitBranchEventTest(emit_branch_link_tails ? 1 : UINT8_MAX) ||
 					!EmitPcChangedExitCheck(static_branch_target_pc, direct_exit_branches) ||
 					!emit_direct_or_return_tail(static_branch_target_pc, 1,
 						!branch_test_scheduling))
@@ -6689,17 +6723,20 @@ namespace VitaIOP
 		}
 		else if (has_native_static_jump)
 		{
+			const bool can_link_static_jump =
+				direct_exit && direct_links && !m_writes_isolate_mode;
 			if (!EmitStorePc(static_jump_target_pc) ||
-				!EmitBranchEventTest() ||
+				!EmitBranchEventTest(can_link_static_jump ? 0 : UINT8_MAX) ||
 				!EmitPcChangedExitCheck(static_jump_target_pc, direct_exit_branches))
 			{
 				return false;
 			}
 
-			if (direct_exit && direct_links && !m_writes_isolate_mode)
+			if (can_link_static_jump)
 			{
 				DirectLinkSlot& link = direct_links->slots[0];
-				if (!EndBlockDirectTail(direct_exit, &link, !branch_test_scheduling))
+				if (!EndBlockDirectTail(
+						direct_exit, &link, 0, !branch_test_scheduling))
 					return false;
 
 				link.target_pc = static_jump_target_pc;
@@ -6718,17 +6755,20 @@ namespace VitaIOP
 		{
 			if (m_register_jump_target_known)
 			{
+				const bool can_link_register_jump =
+					direct_exit && direct_links && !m_writes_isolate_mode;
 				if (!EmitStorePc(m_register_jump_target) ||
-					!EmitBranchEventTest() ||
+					!EmitBranchEventTest(can_link_register_jump ? 0 : UINT8_MAX) ||
 					!EmitPcChangedExitCheck(m_register_jump_target, direct_exit_branches))
 				{
 					return false;
 				}
 
-				if (direct_exit && direct_links && !m_writes_isolate_mode)
+				if (can_link_register_jump)
 				{
 					DirectLinkSlot& link = direct_links->slots[0];
-					if (!EndBlockDirectTail(direct_exit, &link, !branch_test_scheduling))
+					if (!EndBlockDirectTail(
+							direct_exit, &link, 0, !branch_test_scheduling))
 						return false;
 
 					link.target_pc = m_register_jump_target;
@@ -6757,7 +6797,7 @@ namespace VitaIOP
 		else if (emit_link_tail)
 		{
 			DirectLinkSlot& link = direct_links->slots[0];
-			if (!EndBlockDirectTail(direct_exit, &link))
+			if (!EndBlockDirectTail(direct_exit, &link, 0))
 				return false;
 
 			link.target_pc = next_pc;
@@ -6848,9 +6888,57 @@ namespace VitaIOP
 			if (!m_code.PatchBranch(branch_offset, published_state_exit_offset, VitaA32::Condition::LE))
 				return false;
 		}
+
+		// A linked chain can enter several blocks before the EE budget expires, so
+		// its provider caller does not identify the final source block. Give each
+		// static edge a cold budget-return tail whose patchable r0 value names the
+		// already-resolved target. PatchDirectLink() updates this value atomically
+		// with the owning PCSX2-style direct branch. Bit zero tags the aligned
+		// CachedBlock pointer for the private scheduler dispatcher.
+		for (u8 slot = 0; slot < 2; slot++)
+		{
+			auto& flushed_exits = scheduler_budget_exit_branches[slot];
+			auto& unflushed_exits = unflushed_scheduler_budget_exit_branches[slot];
+			if (flushed_exits.empty() && unflushed_exits.empty())
+				continue;
+			if (!direct_links)
+				return false;
+
+			const size_t unflushed_target = m_code.Size();
+			if (!unflushed_exits.empty() && !EmitFlushPinnedGprs())
+				return false;
+			const size_t resume_return_target = m_code.Size();
+			DirectLinkSlot& link = direct_links->slots[slot];
+			link.scheduler_resume_offset = m_code.Size();
+			if (!m_code.EmitMovImm32Patchable(
+					HOST_TMP0, static_cast<u32>(BlockExitKind::Direct)) ||
+				!m_code.EmitBx(HOST_CHAIN_RETURN))
+			{
+				return false;
+			}
+
+			for (const size_t branch_offset : unflushed_exits)
+			{
+				if (!m_code.PatchBranch(branch_offset, unflushed_target,
+						VitaA32::Condition::LE))
+				{
+					return false;
+				}
+			}
+			for (const size_t branch_offset : flushed_exits)
+			{
+				if (!m_code.PatchBranch(branch_offset, resume_return_target,
+						VitaA32::Condition::LE))
+				{
+					return false;
+				}
+			}
+		}
 		m_direct_exit_branches = nullptr;
 		m_budget_exit_branches = nullptr;
 		m_unflushed_budget_exit_branches = nullptr;
+		m_scheduler_budget_exit_branches = {};
+		m_unflushed_scheduler_budget_exit_branches = {};
 		return true;
 	}
 
@@ -6872,9 +6960,12 @@ namespace VitaIOP
 
 	void BlockExecutor::SetWaitResumeBlock(CachedBlock* block)
 	{
-		if (!block || m_wait_resume_block == block)
+		if (!block)
 			return;
 
+		ClearSchedulerDirectResume();
+		if (m_wait_resume_block == block)
+			return;
 		m_wait_resume_block = block;
 		m_wait_resume_event_context.block = block;
 		m_wait_resume_event_context.kind = block->poll_call_wait_loop ?
@@ -7008,6 +7099,11 @@ namespace VitaIOP
 #endif
 	}
 
+	void BlockExecutor::ClearSchedulerDirectResume()
+	{
+		m_scheduler_direct_resume_block = nullptr;
+	}
+
 	BlockExecutor::~BlockExecutor()
 	{
 		Reset();
@@ -7021,6 +7117,7 @@ namespace VitaIOP
 		// path which replaces the current IOP PC. Retire the scheduler target at
 		// that owner so a retained wait can never mask the exception vector.
 		ClearWaitResumeBlock();
+		ClearSchedulerDirectResume();
 	}
 
 	void BlockExecutor::ResetInstrumentationCounters()
@@ -7032,6 +7129,13 @@ namespace VitaIOP
 		m_hot_dispatch_cache_64_set_hits = 0;
 		m_hot_dispatch_cache_64_set_misses = 0;
 		m_hot_dispatch_cache_64_set_way_probes = 0;
+		m_scheduler_direct_resume_candidates = 0;
+		m_scheduler_direct_resume_installs = 0;
+		m_scheduler_direct_resume_attempts = 0;
+		m_scheduler_direct_resume_hits = 0;
+		m_scheduler_direct_resume_misses = 0;
+		m_scheduler_direct_resume_no_target = 0;
+		m_scheduler_direct_resume_target_mismatch = 0;
 		m_hot_dispatch_trusted_raw_hits = 0;
 		m_hot_dispatch_owned_hits = 0;
 		m_wait_resume_cache_attempts = 0;
@@ -7342,6 +7446,28 @@ namespace VitaIOP
 		return true;
 #elif defined(VITASX2_QEMU_VALIDATION)
 		return s_qemuIopCompiledPs1BiosGateEnabled;
+#else
+		return true;
+#endif
+	}
+
+	void BlockExecutor::SetSchedulerDirectResumeEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopSchedulerDirectResumeEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	bool BlockExecutor::SchedulerDirectResumeEnabled()
+	{
+#if defined(VITASX2_IOP_SCHEDULER_DIRECT_RESUME_CONTROL)
+		return false;
+#elif defined(VITASX2_IOP_SCHEDULER_DIRECT_RESUME_PRODUCT)
+		return true;
+#elif defined(VITASX2_QEMU_VALIDATION)
+		return s_qemuIopSchedulerDirectResumeEnabled;
 #else
 		return true;
 #endif
@@ -8043,6 +8169,7 @@ namespace VitaIOP
 	{
 		u32 invalidated = 0;
 		ClearWaitResumeBlock();
+		ClearSchedulerDirectResume();
 		ClearHotDispatchCache();
 		m_free_cache_entries.clear();
 		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
@@ -8079,6 +8206,8 @@ namespace VitaIOP
 			return;
 		if (m_wait_resume_block == &block)
 			ClearWaitResumeBlock();
+		if (m_scheduler_direct_resume_block == &block)
+			ClearSchedulerDirectResume();
 
 		UnregisterRamSource(block);
 		UnlinkIncomingLinks(block.start_pc, block.isolate_cache_active ? 1 : 0);
@@ -8189,6 +8318,7 @@ namespace VitaIOP
 		if (m_direct_linking_enabled == enabled)
 			return;
 
+		ClearSchedulerDirectResume();
 		m_direct_linking_enabled = enabled;
 		if (enabled)
 			RelinkDirectLinks();
@@ -9062,7 +9192,8 @@ namespace VitaIOP
 	{
 		if (!block.valid || !link.valid ||
 			link.target_offset == static_cast<size_t>(-1) ||
-			link.fallback_offset == static_cast<size_t>(-1))
+			link.fallback_offset == static_cast<size_t>(-1) ||
+			link.scheduler_resume_offset == static_cast<size_t>(-1))
 		{
 			return false;
 		}
@@ -9076,8 +9207,17 @@ namespace VitaIOP
 		const bool target_patched = use_chain ?
 			block.code.PatchBranchToAddress(link.target_offset, LinkedEntryPoint(*target)) :
 			block.code.PatchBranch(link.target_offset, link.fallback_offset);
-		if (!target_patched || !block.code.Flush())
+		const u32 scheduler_resume = use_chain ?
+			(static_cast<u32>(reinterpret_cast<uptr>(target)) |
+				SCHEDULER_DIRECT_RESUME_TAG) :
+			static_cast<u32>(BlockExitKind::Direct);
+		if (!target_patched ||
+			!block.code.PatchMovImm32(
+				link.scheduler_resume_offset, HOST_TMP0, scheduler_resume) ||
+			!block.code.Flush())
+		{
 			return false;
+		}
 
 		return true;
 	}
@@ -9188,6 +9328,18 @@ namespace VitaIOP
 		result->hot_dispatch_cache_64_set_misses = m_hot_dispatch_cache_64_set_misses;
 		result->hot_dispatch_cache_64_set_way_probes =
 			m_hot_dispatch_cache_64_set_way_probes;
+		result->scheduler_direct_resume_candidates =
+			m_scheduler_direct_resume_candidates;
+		result->scheduler_direct_resume_installs =
+			m_scheduler_direct_resume_installs;
+		result->scheduler_direct_resume_attempts =
+			m_scheduler_direct_resume_attempts;
+		result->scheduler_direct_resume_hits = m_scheduler_direct_resume_hits;
+		result->scheduler_direct_resume_misses = m_scheduler_direct_resume_misses;
+		result->scheduler_direct_resume_no_target =
+			m_scheduler_direct_resume_no_target;
+		result->scheduler_direct_resume_target_mismatch =
+			m_scheduler_direct_resume_target_mismatch;
 		result->hot_dispatch_trusted_raw_hits = m_hot_dispatch_trusted_raw_hits;
 		result->hot_dispatch_owned_hits = m_hot_dispatch_owned_hits;
 		result->wait_resume_cache_attempts = m_wait_resume_cache_attempts;
@@ -9363,6 +9515,7 @@ namespace VitaIOP
 #endif
 		if (wait_forward)
 		{
+			ClearSchedulerDirectResume();
 			// The generated block did not execute, so none of its memory or
 			// producer-to-branch fast paths was dynamically traversed.
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -9415,6 +9568,7 @@ namespace VitaIOP
 		}
 		if (wait_forward)
 		{
+			ClearSchedulerDirectResume();
 			// PCSX2's generated wait block remains the current dispatcher target
 			// until an event changes PC. Retain that exact BaseBlock identity across
 			// EE scheduler calls; RAM source invalidation clears the pointer.
@@ -9468,10 +9622,42 @@ namespace VitaIOP
 #else
 		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
 #endif
-		if (exit_value != static_cast<u32>(BlockExitKind::Direct) &&
+		const bool scheduler_resume_exit =
+			(exit_value & SCHEDULER_DIRECT_RESUME_TAG) != 0;
+		if (!scheduler_resume_exit &&
+			exit_value != static_cast<u32>(BlockExitKind::Direct) &&
 			exit_value != static_cast<u32>(BlockExitKind::IsolateModeWrite))
 		{
+			ClearSchedulerDirectResume();
 			return 0;
+		}
+		if (scheduler_resume_exit && SchedulerDirectResumeEnabled())
+		{
+			CachedBlock* const target = reinterpret_cast<CachedBlock*>(
+				static_cast<uptr>(exit_value & ~SCHEDULER_DIRECT_RESUME_TAG));
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DIRECT_RESUME_CODEGEN)
+			m_scheduler_direct_resume_candidates++;
+			const bool target_matches = target && target->valid &&
+				target->start_pc == psxRegs.pc &&
+				target->isolate_cache_active == m_active_isolate_cache_mode;
+			if (!target_matches)
+			{
+				m_scheduler_direct_resume_target_mismatch++;
+				ClearSchedulerDirectResume();
+			}
+			else
+			{
+				m_scheduler_direct_resume_block = target;
+				m_scheduler_direct_resume_installs++;
+			}
+#else
+			m_scheduler_direct_resume_block = target;
+#endif
+		}
+		else
+		{
+			ClearSchedulerDirectResume();
 		}
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -9493,6 +9679,7 @@ namespace VitaIOP
 
 		if (exit_value == static_cast<u32>(BlockExitKind::IsolateModeWrite))
 		{
+			ClearSchedulerDirectResume();
 			dispatch_flags |= ProviderDispatchIsolateWrite;
 			const bool new_mode = (psxRegs.CP0.n.Status & 0x10000u) != 0;
 			if (new_mode != m_active_isolate_cache_mode)
@@ -9506,6 +9693,55 @@ namespace VitaIOP
 	u32 BlockExecutor::RunProviderBlock(CachedBlock& block, u32 dispatch_flags)
 	{
 		return RunProviderBlockInline(block, dispatch_flags);
+	}
+
+	inline __attribute__((always_inline)) BlockExecutor::CachedBlock*
+	BlockExecutor::FindSchedulerDirectResumeBlock(
+		u32* dispatch_flags)
+	{
+		if (!dispatch_flags)
+			return nullptr;
+		CachedBlock* const block = m_scheduler_direct_resume_block;
+		if (!block)
+			return nullptr;
+
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DIRECT_RESUME_CODEGEN)
+		m_scheduler_direct_resume_attempts++;
+#endif
+		bool match = SchedulerDirectResumeEnabled() &&
+			psxRegs.pc == block->start_pc;
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DIRECT_RESUME_CODEGEN)
+		match = match && block->valid &&
+			block->isolate_cache_active == m_active_isolate_cache_mode;
+		if (match && s_qemuIopTrustedSourceAuditEnabled && block->raw_opcodes)
+		{
+			m_hot_dispatch_trusted_raw_hits++;
+			match = ValidateCachedBlock(*block);
+		}
+#endif
+		if (!match)
+		{
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DIRECT_RESUME_CODEGEN)
+			m_scheduler_direct_resume_misses++;
+#endif
+			ClearSchedulerDirectResume();
+			return nullptr;
+		}
+
+		*dispatch_flags =
+			ProviderDispatchCacheHit | ProviderDispatchLookupHit |
+			ProviderDispatchFastHit;
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_IOP_SCHEDULER_DIRECT_RESUME_CODEGEN)
+		m_scheduler_direct_resume_hits++;
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_private_dispatcher_inlined_hot_entries++;
+#endif
+		return block;
 	}
 
 	bool BlockExecutor::ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
@@ -9563,7 +9799,7 @@ namespace VitaIOP
 
 		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_() looks up the
 		// translated BaseBlock by guest PC before doing any decode work. Keep
-		// the Vita IOP hot path on the same shape. A 64-set, two-way exact
+		// the Vita IOP hot path on the same shape. A 512-set, two-way exact
 		// first-level cache adapts psxRecLUT's direct lookup to Vita's smaller
 		// memory budget;
 		// the lazy two-level table remains the collision and cold fallback.
@@ -9691,11 +9927,12 @@ namespace VitaIOP
 		return block;
 	}
 
-	inline __attribute__((always_inline)) u32 BlockExecutor::ExecuteProviderBlockAtPcInline(
-		u32 start_pc, ProviderCompileResult* compile_result)
+	inline __attribute__((always_inline)) BlockExecutor::CachedBlock*
+	BlockExecutor::FindProviderBlockAtPcInline(
+		u32 start_pc, ProviderCompileResult* compile_result, u32* dispatch_flags)
 	{
-		if ((start_pc & 0x3u) != 0)
-			return 0;
+		if ((start_pc & 0x3u) != 0 || !dispatch_flags)
+			return nullptr;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		const bool inline_hot_path = s_qemuIopPrivateDispatcherHotPathEnabled;
@@ -9713,7 +9950,7 @@ namespace VitaIOP
 #else
 		CachedBlock* entry = FindHotDispatchCacheBlockInline(start_pc);
 #endif
-		u32 dispatch_flags = 0;
+		*dispatch_flags = 0;
 
 		// PCSX2's PSX_GETBLOCK()/DispatcherReg pair performs one exact LUT lookup
 		// and enters generated code without crossing a C ABI. Keep the analogous
@@ -9735,7 +9972,7 @@ namespace VitaIOP
 				if (inline_hot_path)
 					m_private_dispatcher_inlined_hot_entries++;
 #endif
-				dispatch_flags = ProviderDispatchCacheHit |
+				*dispatch_flags = ProviderDispatchCacheHit |
 					ProviderDispatchLookupHit | ProviderDispatchFastHit;
 			}
 			else
@@ -9750,13 +9987,24 @@ namespace VitaIOP
 			m_hot_dispatch_cache_misses++;
 #endif
 			entry = FindProviderBlockAtPcSlow(
-				start_pc, compile_result, &dispatch_flags);
+				start_pc, compile_result, dispatch_flags);
 			if (!entry)
-				return 0;
+				return nullptr;
 		}
+		return entry;
+	}
+
+	inline __attribute__((always_inline)) u32 BlockExecutor::ExecuteProviderBlockAtPcInline(
+		u32 start_pc, ProviderCompileResult* compile_result)
+	{
+		u32 dispatch_flags = 0;
+		CachedBlock* const entry = FindProviderBlockAtPcInline(
+			start_pc, compile_result, &dispatch_flags);
+		if (!entry)
+			return 0;
 
 #if defined(VITASX2_QEMU_VALIDATION)
-		if (!inline_hot_path)
+		if (!s_qemuIopPrivateDispatcherHotPathEnabled)
 			return RunProviderBlock(*entry, dispatch_flags);
 #endif
 		return RunProviderBlockInline(*entry, dispatch_flags);
@@ -9822,16 +10070,31 @@ namespace VitaIOP
 						m_wait_resume_cache_misses++;
 					ClearWaitResumeBlock();
 				}
-				dispatch_flags = ExecuteProviderBlockAtPcInline(psxRegs.pc, nullptr);
+				CachedBlock* entry = FindSchedulerDirectResumeBlock(&dispatch_flags);
+				if (!entry)
+					entry = FindProviderBlockAtPcInline(psxRegs.pc, nullptr, &dispatch_flags);
+				if (entry)
+				{
+					dispatch_flags = s_qemuIopPrivateDispatcherHotPathEnabled ?
+						RunProviderBlockInline(*entry, dispatch_flags) :
+						RunProviderBlock(*entry, dispatch_flags);
+				}
 			}
 #else
-			dispatch_flags = ExecuteProviderBlockAtPcInline(psxRegs.pc, nullptr);
+			CachedBlock* entry = FindSchedulerDirectResumeBlock(&dispatch_flags);
+			if (!entry)
+				entry = FindProviderBlockAtPcInline(psxRegs.pc, nullptr, &dispatch_flags);
+			if (entry)
+			{
+				dispatch_flags = RunProviderBlockInline(*entry, dispatch_flags);
+			}
 #endif
 			if ((dispatch_flags & ProviderDispatchSuccess) == 0)
 			{
 #if defined(VITASX2_QEMU_VALIDATION)
 				m_private_dispatcher_fallbacks++;
 #endif
+				ClearSchedulerDirectResume();
 				return psxInt.ExecuteBlock(psxRegs.iopCycleEE);
 			}
 #if defined(VITASX2_QEMU_VALIDATION)
