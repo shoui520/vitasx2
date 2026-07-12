@@ -18,10 +18,13 @@ void VitaNotifyIopPcDiscontinuity();
 extern bool g_vita_a32_iop_private_event_entry_available;
 extern bool g_vita_a32_iop_private_wait_resume_entry_available;
 extern bool g_vita_a32_iop_private_scheduler_resume_entry_available;
+extern bool g_vita_a32_iop_private_scheduler_prediction_entry_available;
 #if defined(__arm__)
 extern "C" s32 VitaIopA32ExecuteProviderTimeslicePrivate(
 	void* context, s32 ee_cycles);
 extern "C" s32 VitaIopA32ExecuteProviderSchedulerDirectResumePrivate(
+	void* context, s32 ee_cycles);
+extern "C" s32 VitaIopA32ExecuteProviderSchedulerPredictedResumePrivate(
 	void* context, s32 ee_cycles);
 extern "C" s32 VitaIopA32ExecuteProviderWaitResumePrivate(
 	void* context, s32 ee_cycles);
@@ -54,6 +57,7 @@ namespace VitaIOP
 	bool VitaIopA32PrivateTimesliceEntrySupported();
 	bool VitaIopA32PrivateWaitResumeEntrySupported();
 	bool VitaIopA32PrivateSchedulerResumeEntrySupported();
+	bool VitaIopA32PrivateSchedulerPredictionEntrySupported();
 }
 
 struct alignas(8) VitaA32IopEventEntry
@@ -87,6 +91,7 @@ inline __attribute__((always_inline)) s32 VitaExecuteA32IopTimesliceFromEeEvent(
 extern bool g_vita_a32_iop_private_event_entry_enabled;
 extern bool g_vita_a32_iop_wait_resume_event_entry_enabled;
 extern bool g_vita_a32_iop_scheduler_resume_event_entry_enabled;
+extern bool g_vita_a32_iop_scheduler_prediction_event_entry_enabled;
 extern u64 g_vita_a32_iop_private_event_entries;
 #endif
 
@@ -180,6 +185,14 @@ struct VitaA32IopProviderStats
 	u64 scheduler_direct_event_remainders = 0;
 	u64 scheduler_direct_event_installs = 0;
 	u64 scheduler_direct_event_clears = 0;
+	u64 scheduler_prediction_attempts = 0;
+	u64 scheduler_prediction_hits = 0;
+	u64 scheduler_prediction_misses = 0;
+	u64 scheduler_prediction_two_way_hits = 0;
+	u64 scheduler_prediction_four_way_hits = 0;
+	u64 scheduler_prediction_forwards = 0;
+	u64 scheduler_prediction_fallbacks = 0;
+	u64 scheduler_prediction_remainders = 0;
 	u64 hot_dispatch_trusted_raw_hits = 0;
 	u64 hot_dispatch_owned_hits = 0;
 	u64 hot_dispatch_stale_guard_instructions_removed = 0;
@@ -321,6 +334,7 @@ void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled);
 void VitaSetA32IopWaitResumeCacheEnabled(bool enabled);
 void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled);
 void VitaSetA32IopSchedulerResumeEventEntryEnabled(bool enabled);
+void VitaSetA32IopSchedulerPredictionEventEntryEnabled(bool enabled);
 void VitaSetA32IopWaitResumeFirstEntryOwnershipEnabled(bool enabled);
 void VitaSetA32IopWaitResumeKindEntryEnabled(bool enabled);
 void VitaSetA32IopWaitResumeClockEntryEnabled(bool enabled);

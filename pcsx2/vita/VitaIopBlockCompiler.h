@@ -66,6 +66,14 @@ namespace VitaIOP
 		u64 scheduler_direct_event_remainders;
 		u64 scheduler_direct_event_installs;
 		u64 scheduler_direct_event_clears;
+		u64 scheduler_prediction_attempts;
+		u64 scheduler_prediction_hits;
+		u64 scheduler_prediction_misses;
+		u64 scheduler_prediction_two_way_hits;
+		u64 scheduler_prediction_four_way_hits;
+		u64 scheduler_prediction_forwards;
+		u64 scheduler_prediction_fallbacks;
+		u64 scheduler_prediction_remainders;
 		u64 hot_dispatch_trusted_raw_hits;
 		u64 hot_dispatch_owned_hits;
 		u64 wait_resume_cache_attempts;
@@ -681,6 +689,14 @@ namespace VitaIOP
 			bool queued_free = false;
 		};
 
+	public:
+		static constexpr u32 SchedulerPredictionStartPcOffset()
+		{
+			return static_cast<u32>(offsetof(CachedBlock, start_pc));
+		}
+
+	private:
+
 		struct LookupPage
 		{
 			std::array<std::array<CachedBlock*, LOOKUP_PAGE_ENTRY_COUNT>, 2> blocks{};
@@ -804,6 +820,10 @@ namespace VitaIOP
 		__attribute__((noinline)) s32 ExecuteProviderSchedulerDirectResumePrivateBody(
 			s32 ee_cycles, CachedBlock* block)
 			__asm__("VitaIopA32ProviderSchedulerDirectResumeBody");
+		__attribute__((no_stack_protector))
+		__attribute__((noinline)) s32 ExecuteProviderSchedulerPredictedResumePrivateBody(
+			s32 ee_cycles, CachedBlock* block)
+			__asm__("VitaIopA32ProviderSchedulerPredictedResumeBody");
 		inline __attribute__((always_inline)) s32
 			ExecuteProviderWaitResumePrivateBodyCore(
 				s32 ee_cycles, CachedBlock* block, WaitResumeKind kind,
@@ -869,6 +889,9 @@ namespace VitaIOP
 		inline __attribute__((always_inline)) void SetSchedulerDirectResumeBlock(
 			CachedBlock* block);
 		void ClearSchedulerDirectResume();
+		inline __attribute__((always_inline)) void SetSchedulerPredictedResumeBlock(
+			CachedBlock* block);
+		void ClearSchedulerPredictedResume();
 		inline __attribute__((always_inline)) CachedBlock* FindSchedulerDirectResumeBlock(
 			u32* dispatch_flags);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
@@ -900,7 +923,12 @@ namespace VitaIOP
 		{
 			BlockExecutor* executor = nullptr;
 			CachedBlock* block = nullptr;
+			CachedBlock* predicted_block = nullptr;
+			CachedBlock* predicted_block_second = nullptr;
 		} m_scheduler_direct_resume_event_context;
+#if defined(VITASX2_QEMU_VALIDATION)
+		std::array<CachedBlock*, 4> m_scheduler_prediction_shadow{};
+#endif
 		struct WaitResumeEventContext
 		{
 			BlockExecutor* executor = nullptr;
@@ -933,6 +961,14 @@ namespace VitaIOP
 		u64 m_scheduler_direct_event_remainders = 0;
 		u64 m_scheduler_direct_event_installs = 0;
 		u64 m_scheduler_direct_event_clears = 0;
+		u64 m_scheduler_prediction_attempts = 0;
+		u64 m_scheduler_prediction_hits = 0;
+		u64 m_scheduler_prediction_misses = 0;
+		u64 m_scheduler_prediction_two_way_hits = 0;
+		u64 m_scheduler_prediction_four_way_hits = 0;
+		u64 m_scheduler_prediction_forwards = 0;
+		u64 m_scheduler_prediction_fallbacks = 0;
+		u64 m_scheduler_prediction_remainders = 0;
 		u64 m_hot_dispatch_trusted_raw_hits = 0;
 		u64 m_hot_dispatch_owned_hits = 0;
 		u64 m_wait_resume_cache_attempts = 0;
