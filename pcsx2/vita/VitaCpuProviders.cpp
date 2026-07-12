@@ -1269,6 +1269,11 @@ void VitaSetA32IopWaitResumeKindEntryEnabled(bool enabled)
 	VitaIOP::BlockExecutor::SetWaitResumeKindEntryEnabled(enabled);
 }
 
+void VitaSetA32IopWaitResumeClockEntryEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetWaitResumeClockEntryEnabled(enabled);
+}
+
 void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetWaitResumeDescriptorSpecializationEnabled(enabled);
@@ -1317,6 +1322,15 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 		snapshot.wait_resume_kind_specific_unconditional_forwards * 3u +
 		snapshot.wait_resume_kind_specific_poll_forwards * 6u +
 		snapshot.wait_resume_kind_specific_conditional_forwards * 9u;
+	s_iop_a32_stats.wait_resume_clock_specific_entries =
+		snapshot.wait_resume_clock_specific_entries;
+	// Selecting PCSX2's current IOP clock contract when the retained wait is
+	// installed removes one iopHw base setup per entry and the HW_ICFG load/test
+	// pair from every descriptor forward. psxNotifyClockModeChange() resets the
+	// provider before a different clock-specific entry can execute.
+	s_iop_a32_stats.wait_resume_clock_instructions_removed =
+		snapshot.wait_resume_clock_specific_entries +
+		snapshot.wait_resume_clock_specific_forwards * 2u;
 	s_iop_a32_stats.wait_resume_descriptor_forwards =
 		snapshot.wait_resume_descriptor_forwards;
 	s_iop_a32_stats.wait_resume_unconditional_forwards =

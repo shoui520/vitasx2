@@ -66,6 +66,8 @@ namespace VitaIOP
 		u64 wait_resume_kind_specific_unconditional_forwards;
 		u64 wait_resume_kind_specific_poll_forwards;
 		u64 wait_resume_kind_specific_conditional_forwards;
+		u64 wait_resume_clock_specific_entries;
+		u64 wait_resume_clock_specific_forwards;
 		u64 wait_resume_descriptor_forwards;
 		u64 wait_resume_unconditional_forwards;
 		u64 wait_resume_poll_forwards;
@@ -545,6 +547,7 @@ namespace VitaIOP
 		static void SetWaitResumeCacheEnabled(bool enabled);
 		static void SetWaitResumeFirstEntryOwnershipEnabled(bool enabled);
 		static void SetWaitResumeKindEntryEnabled(bool enabled);
+		static void SetWaitResumeClockEntryEnabled(bool enabled);
 		static void SetWaitResumeDescriptorSpecializationEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
@@ -713,13 +716,22 @@ namespace VitaIOP
 		bool ValidateCachedBlock(CachedBlock& block);
 		static bool TryFastForwardTrustedWaitLoopAtPc(u32 start_pc);
 		inline __attribute__((always_inline)) bool TryFastForwardPollCallWaitLoop(CachedBlock& block);
+		template <bool Ps1Clock>
+		inline __attribute__((always_inline)) bool TryFastForwardPollCallWaitLoopForClock(
+			CachedBlock& block);
 		inline __attribute__((always_inline)) bool TryFastForwardCachedUnconditionalWaitLoop(
 			CachedBlock& block);
 		inline __attribute__((always_inline)) void FastForwardRetainedUnconditionalWaitLoop(
 			CachedBlock& block);
+		template <bool Ps1Clock>
+		inline __attribute__((always_inline)) void
+			FastForwardRetainedUnconditionalWaitLoopForClock(CachedBlock& block);
 		inline __attribute__((always_inline)) bool TryFastForwardRetainedWaitLoop(
 			CachedBlock& block, WaitResumeKind kind);
 		__attribute__((noinline, cold)) bool TryFastForwardCachedWaitLoop(CachedBlock& block);
+		template <int ClockMode>
+		__attribute__((noinline, cold)) bool TryFastForwardCachedWaitLoopForClock(
+			CachedBlock& block);
 		bool EnsureCodeCache();
 		void ReleaseCodeCache();
 		u8* AllocateCodeSlice(size_t capacity, size_t* slice_offset);
@@ -745,7 +757,7 @@ namespace VitaIOP
 		inline __attribute__((always_inline)) s32
 			ExecuteProviderWaitResumePrivateBodyCore(
 				s32 ee_cycles, CachedBlock* block, WaitResumeKind kind,
-				bool kind_specific);
+				bool kind_specific, bool clock_specific, bool ps1_clock);
 #if defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_IOP_WAIT_RESUME_KIND_ENTRY_CONTROL)
 		__attribute__((no_stack_protector, noinline)) s32
@@ -753,6 +765,8 @@ namespace VitaIOP
 				s32 ee_cycles, CachedBlock* block, WaitResumeKind kind)
 				__asm__("VitaIopA32ProviderWaitResumeBody");
 #endif
+#if defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_IOP_WAIT_RESUME_CLOCK_ENTRY_CONTROL)
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalPrivateBody(
 				s32 ee_cycles, CachedBlock* block)
@@ -765,6 +779,31 @@ namespace VitaIOP
 			ExecuteProviderWaitResumeConditionalPrivateBody(
 				s32 ee_cycles, CachedBlock* block)
 				__asm__("VitaIopA32ProviderWaitResumeConditionalBody");
+#endif
+		__attribute__((no_stack_protector, noinline)) s32
+			ExecuteProviderWaitResumeUnconditionalNormalPrivateBody(
+				s32 ee_cycles, CachedBlock* block)
+				__asm__("VitaIopA32ProviderWaitResumeUnconditionalNormalBody");
+		__attribute__((no_stack_protector, noinline)) s32
+			ExecuteProviderWaitResumeUnconditionalPs1PrivateBody(
+				s32 ee_cycles, CachedBlock* block)
+				__asm__("VitaIopA32ProviderWaitResumeUnconditionalPs1Body");
+		__attribute__((no_stack_protector, noinline)) s32
+			ExecuteProviderWaitResumePollNormalPrivateBody(
+				s32 ee_cycles, CachedBlock* block)
+				__asm__("VitaIopA32ProviderWaitResumePollNormalBody");
+		__attribute__((no_stack_protector, noinline)) s32
+			ExecuteProviderWaitResumePollPs1PrivateBody(
+				s32 ee_cycles, CachedBlock* block)
+				__asm__("VitaIopA32ProviderWaitResumePollPs1Body");
+		__attribute__((no_stack_protector, noinline)) s32
+			ExecuteProviderWaitResumeConditionalNormalPrivateBody(
+				s32 ee_cycles, CachedBlock* block)
+				__asm__("VitaIopA32ProviderWaitResumeConditionalNormalBody");
+		__attribute__((no_stack_protector, noinline)) s32
+			ExecuteProviderWaitResumeConditionalPs1PrivateBody(
+				s32 ee_cycles, CachedBlock* block)
+				__asm__("VitaIopA32ProviderWaitResumeConditionalPs1Body");
 #endif
 		void SetWaitResumeBlock(CachedBlock* block);
 		void ClearWaitResumeBlock();
@@ -819,6 +858,8 @@ namespace VitaIOP
 		u64 m_wait_resume_kind_specific_unconditional_forwards = 0;
 		u64 m_wait_resume_kind_specific_poll_forwards = 0;
 		u64 m_wait_resume_kind_specific_conditional_forwards = 0;
+		u64 m_wait_resume_clock_specific_entries = 0;
+		u64 m_wait_resume_clock_specific_forwards = 0;
 		u64 m_wait_resume_descriptor_forwards = 0;
 		u64 m_wait_resume_unconditional_forwards = 0;
 		u64 m_wait_resume_poll_forwards = 0;

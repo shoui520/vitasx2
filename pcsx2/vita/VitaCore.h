@@ -28,6 +28,18 @@ extern "C" s32 VitaIopA32ExecuteProviderWaitResumePollPrivate(
 	void* context, s32 ee_cycles);
 extern "C" s32 VitaIopA32ExecuteProviderWaitResumeConditionalPrivate(
 	void* context, s32 ee_cycles);
+extern "C" s32 VitaIopA32ExecuteProviderWaitResumeUnconditionalNormalPrivate(
+	void* context, s32 ee_cycles);
+extern "C" s32 VitaIopA32ExecuteProviderWaitResumeUnconditionalPs1Private(
+	void* context, s32 ee_cycles);
+extern "C" s32 VitaIopA32ExecuteProviderWaitResumePollNormalPrivate(
+	void* context, s32 ee_cycles);
+extern "C" s32 VitaIopA32ExecuteProviderWaitResumePollPs1Private(
+	void* context, s32 ee_cycles);
+extern "C" s32 VitaIopA32ExecuteProviderWaitResumeConditionalNormalPrivate(
+	void* context, s32 ee_cycles);
+extern "C" s32 VitaIopA32ExecuteProviderWaitResumeConditionalPs1Private(
+	void* context, s32 ee_cycles);
 void VitaSetA32IopWaitResumeEventEntry(uptr context, uptr target);
 namespace VitaIOP
 {
@@ -156,6 +168,8 @@ struct VitaA32IopProviderStats
 	u64 wait_resume_post_event_identity_checks = 0;
 	u64 wait_resume_kind_specific_entries = 0;
 	u64 wait_resume_kind_instructions_removed = 0;
+	u64 wait_resume_clock_specific_entries = 0;
+	u64 wait_resume_clock_instructions_removed = 0;
 	u64 wait_resume_descriptor_forwards = 0;
 	u64 wait_resume_unconditional_forwards = 0;
 	u64 wait_resume_poll_forwards = 0;
@@ -274,6 +288,7 @@ void VitaSetA32IopWaitResumeCacheEnabled(bool enabled);
 void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled);
 void VitaSetA32IopWaitResumeFirstEntryOwnershipEnabled(bool enabled);
 void VitaSetA32IopWaitResumeKindEntryEnabled(bool enabled);
+void VitaSetA32IopWaitResumeClockEntryEnabled(bool enabled);
 void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled);
 VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile();
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles);
