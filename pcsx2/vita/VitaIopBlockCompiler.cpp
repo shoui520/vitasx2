@@ -76,6 +76,7 @@ static bool s_qemuIopBranchTestSchedulingEnabled = true;
 static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
 static bool s_qemuIopCachedWaitDescriptorEnabled = true;
 static bool s_qemuIopInlineWaitFastForwardEnabled = true;
+static bool s_qemuIopWaitResumeCacheEnabled = true;
 static u64 s_qemuIopInlineWaitFastForwards = 0;
 #endif
 
@@ -6784,7 +6785,11 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_hot_dispatch_cache_hits = 0;
 		m_hot_dispatch_cache_misses = 0;
+		m_hot_dispatch_cache_way_probes = 0;
 		m_hot_dispatch_trusted_raw_hits = 0;
+		m_wait_resume_cache_attempts = 0;
+		m_wait_resume_cache_hits = 0;
+		m_wait_resume_cache_misses = 0;
 		m_direct_budget_exit_provider_entries = 0;
 		m_constant_cycle_budget_provider_entries = 0;
 		m_validation_calls = 0;
@@ -6988,6 +6993,15 @@ namespace VitaIOP
 #endif
 	}
 
+	void BlockExecutor::SetWaitResumeCacheEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopWaitResumeCacheEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
 	u32 BlockExecutor::LookupPageIndex(u32 start_pc)
 	{
 		return start_pc >> 16;
@@ -7132,6 +7146,9 @@ namespace VitaIOP
 			[HotDispatchCacheIndex(start_pc)];
 		for (HotDispatchCacheEntry& entry : set)
 		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_hot_dispatch_cache_way_probes++;
+#endif
 			if (entry.start_pc != start_pc || !entry.block)
 				continue;
 
@@ -7613,6 +7630,7 @@ namespace VitaIOP
 	u32 BlockExecutor::Reset()
 	{
 		u32 invalidated = 0;
+		m_wait_resume_block = nullptr;
 		ClearHotDispatchCache();
 		m_free_cache_entries.clear();
 		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
@@ -7647,6 +7665,8 @@ namespace VitaIOP
 	{
 		if (!block.valid)
 			return;
+		if (m_wait_resume_block == &block)
+			m_wait_resume_block = nullptr;
 
 		UnregisterRamSource(block);
 		UnlinkIncomingLinks(block.start_pc, block.isolate_cache_active ? 1 : 0);
@@ -8634,7 +8654,11 @@ namespace VitaIOP
 
 		result->hot_dispatch_cache_hits = m_hot_dispatch_cache_hits;
 		result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
+		result->hot_dispatch_cache_way_probes = m_hot_dispatch_cache_way_probes;
 		result->hot_dispatch_trusted_raw_hits = m_hot_dispatch_trusted_raw_hits;
+		result->wait_resume_cache_attempts = m_wait_resume_cache_attempts;
+		result->wait_resume_cache_hits = m_wait_resume_cache_hits;
+		result->wait_resume_cache_misses = m_wait_resume_cache_misses;
 		result->direct_budget_exit_provider_entries = m_direct_budget_exit_provider_entries;
 		result->constant_cycle_budget_provider_entries = m_constant_cycle_budget_provider_entries;
 		result->validation_calls = m_validation_calls;
@@ -8824,6 +8848,16 @@ namespace VitaIOP
 		}
 		if (wait_forward)
 		{
+			// PCSX2's generated wait block remains the current dispatcher target
+			// until an event changes PC. Retain that exact BaseBlock identity across
+			// EE scheduler calls; RAM source invalidation clears the pointer.
+			if (block.raw_opcodes && psxRegs.pc == block.start_pc)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (s_qemuIopWaitResumeCacheEnabled)
+#endif
+					m_wait_resume_block = &block;
+			}
 #if defined(VITASX2_QEMU_VALIDATION)
 			m_pinned_gpr_memory_ops_saved += block.pinned_gpr_memory_ops_saved;
 			m_pinned_branch_operand_moves_removed +=
@@ -8833,6 +8867,8 @@ namespace VitaIOP
 #endif
 			return dispatch_flags | ProviderDispatchSuccess | ProviderDispatchWaitForward;
 		}
+		if (m_wait_resume_block == &block)
+			m_wait_resume_block = nullptr;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (block.direct_budget_exit)
@@ -9203,8 +9239,49 @@ namespace VitaIOP
 				psxBiosCall();
 			}
 
-			const u32 dispatch_flags =
-				ExecuteProviderBlockAtPcInline(psxRegs.pc, nullptr);
+			u32 dispatch_flags = 0;
+			CachedBlock* const wait_resume = m_wait_resume_block;
+			bool resume_match = wait_resume && psxRegs.pc == wait_resume->start_pc &&
+				wait_resume->isolate_cache_active == m_active_isolate_cache_mode;
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (!s_qemuIopWaitResumeCacheEnabled)
+				resume_match = false;
+			if (wait_resume && s_qemuIopWaitResumeCacheEnabled)
+				m_wait_resume_cache_attempts++;
+			if (resume_match)
+			{
+				// Product raw sources are protected by psxRecClearIOP invalidation.
+				// QEMU deliberately retains the source audit on the shortened path.
+				resume_match = wait_resume->valid && wait_resume->raw_opcodes;
+				if (resume_match)
+				{
+					m_hot_dispatch_trusted_raw_hits++;
+					resume_match = ValidateCachedBlock(*wait_resume);
+				}
+			}
+#endif
+			if (resume_match)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				m_wait_resume_cache_hits++;
+				m_private_dispatcher_inlined_hot_entries++;
+#endif
+				dispatch_flags = RunProviderBlockInline(*wait_resume,
+					ProviderDispatchCacheHit | ProviderDispatchLookupHit |
+					ProviderDispatchFastHit);
+			}
+			else
+			{
+				if (wait_resume)
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					if (s_qemuIopWaitResumeCacheEnabled)
+						m_wait_resume_cache_misses++;
+#endif
+					m_wait_resume_block = nullptr;
+				}
+				dispatch_flags = ExecuteProviderBlockAtPcInline(psxRegs.pc, nullptr);
+			}
 			if ((dispatch_flags & ProviderDispatchSuccess) == 0)
 			{
 #if defined(VITASX2_QEMU_VALIDATION)

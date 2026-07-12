@@ -1213,6 +1213,11 @@ void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetInlineWaitFastForwardEnabled(enabled);
 }
+
+void VitaSetA32IopWaitResumeCacheEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetWaitResumeCacheEnabled(enabled);
+}
 #endif
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
@@ -1223,7 +1228,11 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_executor.SnapshotInstrumentation(&snapshot);
 	s_iop_a32_stats.hot_dispatch_cache_hits = snapshot.hot_dispatch_cache_hits;
 	s_iop_a32_stats.hot_dispatch_cache_misses = snapshot.hot_dispatch_cache_misses;
+	s_iop_a32_stats.hot_dispatch_cache_way_probes = snapshot.hot_dispatch_cache_way_probes;
 	s_iop_a32_stats.hot_dispatch_trusted_raw_hits = snapshot.hot_dispatch_trusted_raw_hits;
+	s_iop_a32_stats.wait_resume_cache_attempts = snapshot.wait_resume_cache_attempts;
+	s_iop_a32_stats.wait_resume_cache_hits = snapshot.wait_resume_cache_hits;
+	s_iop_a32_stats.wait_resume_cache_misses = snapshot.wait_resume_cache_misses;
 	s_iop_a32_stats.direct_budget_exit_provider_entries =
 		snapshot.direct_budget_exit_provider_entries;
 	s_iop_a32_stats.constant_cycle_budget_provider_entries =

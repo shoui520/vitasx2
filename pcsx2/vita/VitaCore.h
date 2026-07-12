@@ -125,7 +125,11 @@ struct VitaA32IopProviderStats
 #if defined(VITASX2_QEMU_VALIDATION)
 	u64 hot_dispatch_cache_hits = 0;
 	u64 hot_dispatch_cache_misses = 0;
+	u64 hot_dispatch_cache_way_probes = 0;
 	u64 hot_dispatch_trusted_raw_hits = 0;
+	u64 wait_resume_cache_attempts = 0;
+	u64 wait_resume_cache_hits = 0;
+	u64 wait_resume_cache_misses = 0;
 	u64 direct_budget_exit_provider_entries = 0;
 	u64 constant_cycle_budget_provider_entries = 0;
 	u64 validation_calls = 0;
@@ -235,6 +239,7 @@ void VitaSetA32IopPrivateEventEntryEnabled(bool enabled);
 void VitaSetA32IopPrivateHotPathEnabled(bool enabled);
 void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled);
 void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled);
+void VitaSetA32IopWaitResumeCacheEnabled(bool enabled);
 VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile();
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles);
 void VitaRecordA32IopWaitLoopDispatchElision();

@@ -49,7 +49,11 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		u64 hot_dispatch_cache_hits;
 		u64 hot_dispatch_cache_misses;
+		u64 hot_dispatch_cache_way_probes;
 		u64 hot_dispatch_trusted_raw_hits;
+		u64 wait_resume_cache_attempts;
+		u64 wait_resume_cache_hits;
+		u64 wait_resume_cache_misses;
 		u64 direct_budget_exit_provider_entries;
 		u64 constant_cycle_budget_provider_entries;
 		u64 validation_calls;
@@ -512,6 +516,7 @@ namespace VitaIOP
 		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
 		static void SetCachedWaitDescriptorEnabled(bool enabled);
 		static void SetInlineWaitFastForwardEnabled(bool enabled);
+		static void SetWaitResumeCacheEnabled(bool enabled);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
@@ -721,6 +726,7 @@ namespace VitaIOP
 		std::array<std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
 			HOT_DISPATCH_CACHE_SET_COUNT>, 2> m_hot_dispatch_cache{};
 		bool m_active_isolate_cache_mode = false;
+		CachedBlock* m_wait_resume_block = nullptr;
 		u32 m_next_source_serial = 1;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;
@@ -729,7 +735,11 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		u64 m_hot_dispatch_cache_hits = 0;
 		u64 m_hot_dispatch_cache_misses = 0;
+		u64 m_hot_dispatch_cache_way_probes = 0;
 		u64 m_hot_dispatch_trusted_raw_hits = 0;
+		u64 m_wait_resume_cache_attempts = 0;
+		u64 m_wait_resume_cache_hits = 0;
+		u64 m_wait_resume_cache_misses = 0;
 		u64 m_direct_budget_exit_provider_entries = 0;
 		u64 m_constant_cycle_budget_provider_entries = 0;
 		u64 m_validation_calls = 0;
