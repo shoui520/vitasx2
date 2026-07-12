@@ -13,6 +13,7 @@
 #include "DebugTools/VifTrace.h"
 #include "DebugTools/VuTrace.h"
 #include "Elfheader.h"
+#include "Input/InputManager.h"
 #include "Memory.h"
 #include "R3000A.h"
 #include "R5900.h"
@@ -257,6 +258,11 @@ namespace VMManager
 
 		void PollInputOnCPUThread()
 		{
+			// PCSX2 owner: VMManager.cpp::Internal::PollInputOnCPUThread(),
+			// called by Counters.cpp::VSyncStart() after the frame push. Keep
+			// Vita controller sampling on that emulated-frame boundary so SIO2
+			// observes one coherent snapshot for the following frame.
+			InputManager::PollSources();
 		}
 	} // namespace Internal
 
