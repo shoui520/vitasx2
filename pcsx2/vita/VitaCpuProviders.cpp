@@ -1274,6 +1274,11 @@ void VitaSetA32IopWaitResumeClockEntryEnabled(bool enabled)
 	VitaIOP::BlockExecutor::SetWaitResumeClockEntryEnabled(enabled);
 }
 
+void VitaSetA32IopWaitResumeNoLinkEntryEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetWaitResumeNoLinkEntryEnabled(enabled);
+}
+
 void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetWaitResumeDescriptorSpecializationEnabled(enabled);
@@ -1331,6 +1336,13 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.wait_resume_clock_instructions_removed =
 		snapshot.wait_resume_clock_specific_entries +
 		snapshot.wait_resume_clock_specific_forwards * 2u;
+	s_iop_a32_stats.wait_resume_no_link_specific_entries =
+		snapshot.wait_resume_no_link_specific_entries;
+	// PCSX2's recompiler knows at block compilation whether the self-branch
+	// publishes r31. Product control disassembly attributes five instructions to
+	// the no-link path's descriptor-byte test and predicated publication arm.
+	s_iop_a32_stats.wait_resume_no_link_instructions_removed =
+		snapshot.wait_resume_no_link_specific_forwards * 5u;
 	s_iop_a32_stats.wait_resume_descriptor_forwards =
 		snapshot.wait_resume_descriptor_forwards;
 	s_iop_a32_stats.wait_resume_unconditional_forwards =
