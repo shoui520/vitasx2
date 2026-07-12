@@ -71,6 +71,7 @@ struct VitaA32IopProviderStats
 	u32 fast_dispatch_hits = 0;
 	u32 invalidated_blocks = 0;
 	u32 code_cache_resets = 0;
+	u32 isolate_mode_switches = 0;
 	u32 first_interpreter_pc = 0;
 	u32 first_interpreter_opcode = 0;
 	u32 last_interpreter_pc = 0;
@@ -115,6 +116,7 @@ struct VitaA32IopProviderStats
 	u64 fused_ram_guard_instructions_removed = 0;
 	u64 source_page_guard_instructions_removed = 0;
 	u64 source_page_literal_instructions_removed = 0;
+	u64 isolate_cache_guard_instructions_removed = 0;
 #endif
 };
 

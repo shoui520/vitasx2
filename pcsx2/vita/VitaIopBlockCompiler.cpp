@@ -62,6 +62,7 @@ static bool s_qemuIopConditionCodeBranchEnabled = true;
 static bool s_qemuIopProducerBranchFlagsEnabled = true;
 static bool s_qemuIopRamProvenanceSpecializationEnabled = true;
 static bool s_qemuIopSourcePageLiteralEnabled = true;
+static bool s_qemuIopIsolateCacheSpecializationEnabled = true;
 static bool s_qemuIopClockModeSpecializationEnabled = true;
 static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
@@ -291,6 +292,12 @@ namespace
 			default:
 				return false;
 		}
+	}
+
+	constexpr bool IsIopCop0StatusWriteOpcode(u32 op)
+	{
+		return (op >> 26) == 0x10 && (RS(op) == 0x04 || RS(op) == 0x06) &&
+			RD(op) == 12;
 	}
 
 	constexpr bool IsNativeCop2Opcode(u32 op)
@@ -969,9 +976,10 @@ namespace
 
 	bool DecodeExitKind(u32 value, VitaIOP::BlockExitKind* exit)
 	{
-		if (value == static_cast<u32>(VitaIOP::BlockExitKind::Direct))
+		if (value == static_cast<u32>(VitaIOP::BlockExitKind::Direct) ||
+			value == static_cast<u32>(VitaIOP::BlockExitKind::IsolateModeWrite))
 		{
-			*exit = VitaIOP::BlockExitKind::Direct;
+			*exit = static_cast<VitaIOP::BlockExitKind>(value);
 			return true;
 		}
 
@@ -1128,7 +1136,6 @@ namespace VitaIOP
 		{
 			return false;
 		}
-
 		for (u8 i = 0; i < m_pinned_gpr_count; i++)
 		{
 			const PinnedGpr& pin = m_pinned_gprs[i];
@@ -1155,6 +1162,32 @@ namespace VitaIOP
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
 			   (m_stack_frame_size == 0 || m_code.EmitAddImm8(HOST_SP, HOST_SP, m_stack_frame_size)) &&
 			   m_code.EmitPop(m_saved_registers | REG_PC);
+	}
+
+	bool BlockCompiler::EndBlockIsolateModeWriteReturn(
+		bool charge_budget, bool flush_pins, u32 known_cycle_count)
+	{
+		if ((flush_pins && !EmitFlushPinnedGprs()) ||
+			(charge_budget && !EmitChargeEeBudget(known_cycle_count)) ||
+			!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS,
+				static_cast<u16>(CP0_STATUS_OFFSET)) ||
+			!m_code.EmitTstImm32(HOST_TMP0, 0x10000u))
+		{
+			return false;
+		}
+
+		const VitaA32::Condition changed_condition = m_isolate_cache_active ?
+			VitaA32::Condition::EQ : VitaA32::Condition::NE;
+		const size_t changed = m_code.EmitBranchPlaceholder(changed_condition);
+		if (changed == static_cast<size_t>(-1) ||
+			!EndBlockReturn(BlockExitKind::Direct, false, false))
+		{
+			return false;
+		}
+
+		const size_t changed_target = m_code.Size();
+		return m_code.PatchBranch(changed, changed_target, changed_condition) &&
+			EndBlockReturn(BlockExitKind::IsolateModeWrite, false, false);
 	}
 
 	bool BlockCompiler::EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot)
@@ -1205,6 +1238,30 @@ namespace VitaIOP
 	{
 		return m_code.EmitMovImm32(HOST_TMP0, op) &&
 			   m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, CODE_OFFSET);
+	}
+
+	bool BlockCompiler::EmitIsolateCacheGuard(size_t* isolated_branch)
+	{
+		if (!isolated_branch)
+			return false;
+
+		if (m_isolate_cache_specialization && m_isolate_cache_guard_stable &&
+			!m_isolate_cache_active)
+		{
+			*isolated_branch = static_cast<size_t>(-1);
+			m_isolate_cache_guard_instructions_removed += 3;
+			return true;
+		}
+
+		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS,
+				static_cast<u16>(CP0_STATUS_OFFSET)) ||
+			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
+		{
+			return false;
+		}
+
+		*isolated_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		return *isolated_branch != static_cast<size_t>(-1);
 	}
 
 	bool BlockCompiler::EmitWaitLoopFastForwardBlock(u32 start_pc, u32 block_cycles)
@@ -1456,6 +1513,10 @@ namespace VitaIOP
 				m_required_saved_registers |= REG_R5 | REG_R8;
 			else if (m_defer_cycle_updates && IsIopBranchOrJumpOpcode(op))
 				m_required_saved_registers |= REG_R5;
+			if (m_isolate_cache_specialization && IsIopCop0StatusWriteOpcode(op))
+			{
+				m_writes_isolate_mode = true;
+			}
 
 			UpdateGprConstStateAfterOpcode(op, pc);
 		}
@@ -1516,7 +1577,9 @@ namespace VitaIOP
 				m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0))) &&
 			EmitFlushPinnedGprs() &&
 			m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH) &&
-			EndBlockReturn(BlockExitKind::Direct, true, false, known_cycle_count);
+			(m_writes_isolate_mode ?
+				EndBlockIsolateModeWriteReturn(true, false, known_cycle_count) :
+				EndBlockReturn(BlockExitKind::Direct, true, false, known_cycle_count));
 	}
 
 	void BlockCompiler::ResetGprConstState()
@@ -3350,7 +3413,8 @@ namespace VitaIOP
 		return m_code.EmitMovImm32(HOST_TMP0, pc) &&
 			   m_code.EmitMovImm32(HOST_TMP1, code) &&
 			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaIopA32RaiseException), HOST_CALL_SCRATCH) &&
-			   EndBlockReturn(BlockExitKind::Direct);
+			   (m_writes_isolate_mode ? EndBlockIsolateModeWriteReturn() :
+					EndBlockReturn(BlockExitKind::Direct));
 	}
 
 	bool BlockCompiler::EmitImmediateOp(u32 op)
@@ -3824,15 +3888,9 @@ namespace VitaIOP
 		// directly when isolate-cache is clear and invalidates the written word.
 		// A compile-time-known main-RAM address cannot hit the MMIO/ROM helper
 		// arm.
-		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
-			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
-		{
-			return false;
-		}
-
 		bool used_known_store_value = false;
-		const size_t isolated_skip = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (isolated_skip == static_cast<size_t>(-1) ||
+		size_t isolated_skip = static_cast<size_t>(-1);
+		if (!EmitIsolateCacheGuard(&isolated_skip) ||
 			!EmitLoadGprValue(RT(op), HOST_TMP1, &used_known_store_value) ||
 			!emit_store_value() ||
 			!emit_clear_stored_word())
@@ -3840,7 +3898,8 @@ namespace VitaIOP
 			return false;
 		}
 
-		if (!m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE))
+		if (isolated_skip != static_cast<size_t>(-1) &&
+			!m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE))
 			return false;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (used_known_store_value)
@@ -3987,15 +4046,9 @@ namespace VitaIOP
 			m_fused_ram_guard_instructions_removed += 2;
 		}
 
-		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
-			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
-		{
-			return false;
-		}
-
 		bool used_known_store_value = false;
-		const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (isolated_fallback_branch == static_cast<size_t>(-1) ||
+		size_t isolated_fallback_branch = static_cast<size_t>(-1);
+		if (!EmitIsolateCacheGuard(&isolated_fallback_branch) ||
 			!EmitLoadGprValue(RT(op), HOST_TMP1, &used_known_store_value) ||
 			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
 			!emit_store_value())
@@ -4066,7 +4119,9 @@ namespace VitaIOP
 		{
 			return false;
 		}
-		if (!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+		if ((tail.isolated_fallback_branch != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target,
+					VitaA32::Condition::NE)) ||
 			(m_track_published_cycle_prefix && !EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
 			!EmitLoadGpr(tail.rt, HOST_TMP1) ||
@@ -4153,7 +4208,9 @@ namespace VitaIOP
 		// through after the direct write and invalidation.
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.write_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
-			!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			(tail.isolated_fallback_branch != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target,
+					VitaA32::Condition::NE)) ||
 			(m_track_published_cycle_prefix && !EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
 			(m_track_published_cycle_prefix &&
@@ -4197,7 +4254,9 @@ namespace VitaIOP
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target, VitaA32::Condition::NE) ||
 			!m_code.PatchBranch(tail.alignment_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
-			!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target, VitaA32::Condition::NE) ||
+			(tail.isolated_fallback_branch != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target,
+					VitaA32::Condition::NE)) ||
 			(m_track_published_cycle_prefix && !EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1, VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_SAVED0, VitaA32::ShiftType::LSL, 0) ||
@@ -4422,21 +4481,16 @@ namespace VitaIOP
 			}
 		}
 
-		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
-			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
-		{
-			return false;
-		}
-
-		const size_t isolated_skip = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (isolated_skip == static_cast<size_t>(-1) ||
+		size_t isolated_skip = static_cast<size_t>(-1);
+		if (!EmitIsolateCacheGuard(&isolated_skip) ||
 			!emit_store_merged_word() ||
 			!emit_clear_stored_word())
 		{
 			return false;
 		}
 
-		if (!m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE))
+		if (isolated_skip != static_cast<size_t>(-1) &&
+			!m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE))
 			return false;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (used_known_store_value)
@@ -4527,16 +4581,14 @@ namespace VitaIOP
 		}
 
 		const size_t write_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		size_t isolated_fallback_branch = static_cast<size_t>(-1);
 		if (write_fallback_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
-			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
+			!EmitIsolateCacheGuard(&isolated_fallback_branch))
 		{
 			return false;
 		}
 
-		const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (isolated_fallback_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
+		if (!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
 			!m_code.EmitStrRegShift(HOST_TMP1, HOST_IOP_RAM_BASE, HOST_TMP0,
 				VitaA32::ShiftType::LSL, 0) ||
 			!emit_clear_stored_word())
@@ -4874,7 +4926,8 @@ namespace VitaIOP
 			}
 		}
 
-		return EndBlockReturn(BlockExitKind::Direct);
+		return m_writes_isolate_mode ?
+			EndBlockIsolateModeWriteReturn() : EndBlockReturn(BlockExitKind::Direct);
 	}
 
 	bool BlockCompiler::EmitStaticJumpOp(u32 op, u32 pc)
@@ -5109,9 +5162,17 @@ namespace VitaIOP
 	{
 		if (to_cop0)
 		{
+			const bool isolate_mode_write =
+				m_isolate_cache_specialization && IsIopCop0StatusWriteOpcode(op);
+			if (isolate_mode_write)
+				m_writes_isolate_mode = true;
 			bool used_known_value = false;
-			if (!EmitLoadGprValue(RT(op), HOST_TMP0, &used_known_value) ||
-				!m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS, static_cast<u16>(Cp0Offset(RD(op)))))
+			if (!EmitLoadGprValue(RT(op), HOST_TMP0, &used_known_value))
+			{
+				return false;
+			}
+			if (!m_code.EmitStrImm12(HOST_TMP0, HOST_PSX_REGS,
+					static_cast<u16>(Cp0Offset(RD(op)))))
 			{
 				return false;
 			}
@@ -5366,22 +5427,21 @@ namespace VitaIOP
 		// IopMem.cpp::iopMemWrite32(). Keep MFC2 synthesis, isolate-cache
 		// suppression, and code invalidation while skipping the runtime RAM
 		// address/mask path.
+		size_t isolated_skip = static_cast<size_t>(-1);
 		if (!EmitReadCop2DataReg(RT(op), HOST_SAVED0) ||
-			!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
-			!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
+			!EmitIsolateCacheGuard(&isolated_skip))
 		{
 			return false;
 		}
 
-		const size_t isolated_skip = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (isolated_skip == static_cast<size_t>(-1) ||
-			!emit_store_word() ||
+		if (!emit_store_word() ||
 			!emit_clear_stored_word())
 		{
 			return false;
 		}
 
-		return m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE);
+		return isolated_skip == static_cast<size_t>(-1) ||
+			m_code.PatchBranch(isolated_skip, m_code.Size(), VitaA32::Condition::NE);
 	}
 
 	bool BlockCompiler::EmitCop2LoadStoreOp(u32 op)
@@ -5467,16 +5527,14 @@ namespace VitaIOP
 			}
 
 			const size_t alignment_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			size_t isolated_fallback_branch = static_cast<size_t>(-1);
 			if (alignment_fallback_branch == static_cast<size_t>(-1) ||
-				!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS, static_cast<u16>(CP0_STATUS_OFFSET)) ||
-				!m_code.EmitTstImm32(HOST_TMP2, 0x10000u))
+				!EmitIsolateCacheGuard(&isolated_fallback_branch))
 			{
 				return false;
 			}
 
-			const size_t isolated_fallback_branch = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-			if (isolated_fallback_branch == static_cast<size_t>(-1) ||
-				!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
+			if (!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED1, HOST_IOP_RAM_MASK) ||
 				!m_code.EmitStrRegShift(HOST_SAVED0, HOST_IOP_RAM_BASE, HOST_TMP0,
 					VitaA32::ShiftType::LSL, 0) ||
 				!emit_clear_stored_word())
@@ -5702,6 +5760,28 @@ namespace VitaIOP
 		if (direct_links)
 			*direct_links = {};
 
+		m_isolate_cache_specialization = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_isolate_cache_specialization = s_qemuIopIsolateCacheSpecializationEnabled;
+#endif
+		m_isolate_cache_active = (psxRegs.CP0.n.Status & 0x10000u) != 0;
+		m_isolate_cache_guard_stable = m_isolate_cache_specialization;
+		m_writes_isolate_mode = false;
+		if (m_isolate_cache_specialization)
+		{
+			for (u32 i = 0; i + 1 < instruction_count; i++)
+			{
+				if (IsIopCop0StatusWriteOpcode(iopMemRead32(start_pc + i * 4)))
+				{
+					// Explicit fixed-window calls may include instructions after
+					// Status. Retain their runtime guards; the pre-instruction trace
+					// scanner ends the block at this ownership seam.
+					m_isolate_cache_guard_stable = false;
+					break;
+				}
+			}
+		}
+
 		if (EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled() &&
 			instruction_count >= 2)
 		{
@@ -5736,6 +5816,7 @@ namespace VitaIOP
 		m_fused_ram_guard_instructions_removed = 0;
 		m_source_page_guard_instructions_removed = 0;
 		m_source_page_literal_instructions_removed = 0;
+		m_isolate_cache_guard_instructions_removed = 0;
 		m_source_page_literal_loads.clear();
 		m_source_page_literal_out_of_range = false;
 		m_branch_predicate_producer_flags_live = false;
@@ -5900,9 +5981,17 @@ namespace VitaIOP
 		if (m_expanded_cycle_batching)
 			RecordBatchedCycleExitSavings(instruction_count, false);
 
+		const auto end_completion_return = [&](bool charge_budget = true,
+			bool flush_pins = true) -> bool {
+			return m_writes_isolate_mode ?
+				EndBlockIsolateModeWriteReturn(charge_budget, flush_pins) :
+				EndBlockReturn(BlockExitKind::Direct, charge_budget, flush_pins);
+		};
 		size_t direct_exit_offset = 0;
-		const bool emit_link_tail = direct_exit && direct_links && can_direct_link_fallthrough;
-		const bool emit_branch_link_tails = direct_exit && direct_links && has_native_static_branch;
+		const bool emit_link_tail = direct_exit && direct_links && can_direct_link_fallthrough &&
+			!m_writes_isolate_mode;
+		const bool emit_branch_link_tails = direct_exit && direct_links && has_native_static_branch &&
+			!m_writes_isolate_mode;
 		const auto emit_direct_or_return_tail = [&](u32 target_pc, u8 slot_index) -> bool {
 			if (emit_branch_link_tails)
 			{
@@ -5915,7 +6004,7 @@ namespace VitaIOP
 				return true;
 			}
 
-			return EndBlockReturn(BlockExitKind::Direct);
+			return end_completion_return();
 		};
 
 		if (has_native_static_branch)
@@ -5941,7 +6030,7 @@ namespace VitaIOP
 					return false;
 
 				direct_exit_offset = m_code.Size();
-				if (!EndBlockReturn(BlockExitKind::Direct, false))
+				if (!end_completion_return(false))
 					return false;
 			}
 			else
@@ -5983,7 +6072,7 @@ namespace VitaIOP
 				}
 
 				direct_exit_offset = m_code.Size();
-				if (!EndBlockReturn(BlockExitKind::Direct, false))
+				if (!end_completion_return(false))
 					return false;
 			}
 		}
@@ -5996,7 +6085,7 @@ namespace VitaIOP
 				return false;
 			}
 
-			if (direct_exit && direct_links)
+			if (direct_exit && direct_links && !m_writes_isolate_mode)
 			{
 				DirectLinkSlot& link = direct_links->slots[0];
 				if (!EndBlockDirectTail(direct_exit, &link))
@@ -6005,13 +6094,13 @@ namespace VitaIOP
 				link.target_pc = static_jump_target_pc;
 				link.valid = true;
 			}
-			else if (!EndBlockReturn(BlockExitKind::Direct))
+			else if (!end_completion_return())
 			{
 				return false;
 			}
 
 			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct, false))
+			if (!end_completion_return(false))
 				return false;
 		}
 		else if (has_native_register_jump)
@@ -6025,7 +6114,7 @@ namespace VitaIOP
 					return false;
 				}
 
-				if (direct_exit && direct_links)
+				if (direct_exit && direct_links && !m_writes_isolate_mode)
 				{
 					DirectLinkSlot& link = direct_links->slots[0];
 					if (!EndBlockDirectTail(direct_exit, &link))
@@ -6034,7 +6123,7 @@ namespace VitaIOP
 					link.target_pc = m_register_jump_target;
 					link.valid = true;
 				}
-				else if (!EndBlockReturn(BlockExitKind::Direct))
+				else if (!end_completion_return())
 				{
 					return false;
 				}
@@ -6044,14 +6133,14 @@ namespace VitaIOP
 				if (!EmitStorePcReg(HOST_REGISTER_JUMP_TARGET) ||
 					!EmitIopEventTestFastPath() ||
 					!EmitPcChangedExitCheckReg(HOST_REGISTER_JUMP_TARGET, direct_exit_branches) ||
-					!EndBlockReturn(BlockExitKind::Direct))
+					!end_completion_return())
 				{
 					return false;
 				}
 			}
 
 			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct, false))
+			if (!end_completion_return(false))
 				return false;
 		}
 		else if (emit_link_tail)
@@ -6064,13 +6153,15 @@ namespace VitaIOP
 			link.valid = true;
 
 			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct, false))
+			if (!end_completion_return(false))
 				return false;
 		}
 		else
 		{
+			if (m_writes_isolate_mode && !end_completion_return())
+				return false;
 			direct_exit_offset = m_code.Size();
-			if (!EndBlockReturn(BlockExitKind::Direct, false))
+			if (!end_completion_return(false))
 				return false;
 		}
 
@@ -6129,6 +6220,12 @@ namespace VitaIOP
 
 	BlockExecutor::BlockExecutor()
 	{
+		bool isolate_variants_enabled = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		isolate_variants_enabled = s_qemuIopIsolateCacheSpecializationEnabled;
+#endif
+		m_active_isolate_cache_mode =
+			isolate_variants_enabled && (psxRegs.CP0.n.Status & 0x10000u) != 0;
 		m_cache.reserve(INITIAL_CACHE_CAPACITY);
 		m_free_cache_entries.reserve(INITIAL_CACHE_CAPACITY);
 		m_block_records.reserve(INITIAL_CACHE_CAPACITY);
@@ -6230,6 +6327,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopSourcePageLiteralEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetIsolateCacheSpecializationEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopIsolateCacheSpecializationEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -6352,7 +6458,7 @@ namespace VitaIOP
 		// Vita keeps the same 64 KiB guest-page lookup granularity, allocated
 		// lazily for the R3000A address space.
 		if (LookupPage* page = GetLookupPage(block.start_pc, true))
-			page->blocks[LookupEntryIndex(block.start_pc)] = &block;
+			page->blocks[block.isolate_cache_active ? 1 : 0][LookupEntryIndex(block.start_pc)] = &block;
 	}
 
 	void BlockExecutor::UnregisterBlockLookup(CachedBlock& block)
@@ -6364,7 +6470,8 @@ namespace VitaIOP
 
 		if (LookupPage* page = GetLookupPage(block.start_pc, false))
 		{
-			CachedBlock*& entry = page->blocks[LookupEntryIndex(block.start_pc)];
+			CachedBlock*& entry =
+				page->blocks[block.isolate_cache_active ? 1 : 0][LookupEntryIndex(block.start_pc)];
 			if (entry == &block)
 				entry = nullptr;
 		}
@@ -6372,7 +6479,8 @@ namespace VitaIOP
 
 	void BlockExecutor::RegisterHotDispatchCache(CachedBlock& block)
 	{
-		auto& set = m_hot_dispatch_cache[HotDispatchCacheIndex(block.start_pc)];
+		auto& set = m_hot_dispatch_cache[block.isolate_cache_active ? 1 : 0]
+			[HotDispatchCacheIndex(block.start_pc)];
 		for (HotDispatchCacheEntry& entry : set)
 		{
 			if (entry.block == &block || entry.start_pc == block.start_pc)
@@ -6392,7 +6500,8 @@ namespace VitaIOP
 
 	void BlockExecutor::UnregisterHotDispatchCache(CachedBlock& block)
 	{
-		auto& set = m_hot_dispatch_cache[HotDispatchCacheIndex(block.start_pc)];
+		auto& set = m_hot_dispatch_cache[block.isolate_cache_active ? 1 : 0]
+			[HotDispatchCacheIndex(block.start_pc)];
 		for (HotDispatchCacheEntry& entry : set)
 		{
 			if (entry.block == &block)
@@ -6407,7 +6516,8 @@ namespace VitaIOP
 
 	BlockExecutor::CachedBlock* BlockExecutor::FindHotDispatchCacheBlock(u32 start_pc)
 	{
-		auto& set = m_hot_dispatch_cache[HotDispatchCacheIndex(start_pc)];
+		auto& set = m_hot_dispatch_cache[m_active_isolate_cache_mode ? 1 : 0]
+			[HotDispatchCacheIndex(start_pc)];
 		for (HotDispatchCacheEntry& entry : set)
 		{
 			if (entry.start_pc != start_pc || !entry.block)
@@ -6749,13 +6859,14 @@ namespace VitaIOP
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::FindRecordedBlockByStartPc(
-		u32 start_pc, u32 instruction_count, bool match_instruction_count)
+		u32 start_pc, u32 instruction_count, bool match_instruction_count,
+		bool isolate_cache_active)
 	{
 		s32 index = LastBlockRecordIndex(start_pc);
 		while (index >= 0 && m_block_records[index].start_pc == start_pc)
 		{
 			CachedBlock* block = m_block_records[index].block;
-			if (block && block->valid &&
+			if (block && block->valid && block->isolate_cache_active == isolate_cache_active &&
 				(!match_instruction_count || block->instruction_count == instruction_count))
 			{
 				if (ValidateCachedBlock(*block))
@@ -6905,6 +7016,12 @@ namespace VitaIOP
 		ReleaseLookupPages();
 		const u32 previous_resets = m_code_cache_resets;
 		ReleaseCodeCache();
+		bool isolate_variants_enabled = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		isolate_variants_enabled = s_qemuIopIsolateCacheSpecializationEnabled;
+#endif
+		m_active_isolate_cache_mode =
+			isolate_variants_enabled && (psxRegs.CP0.n.Status & 0x10000u) != 0;
 		m_code_cache_resets = previous_resets;
 		return invalidated;
 	}
@@ -6915,7 +7032,7 @@ namespace VitaIOP
 			return;
 
 		UnregisterRamSource(block);
-		UnlinkIncomingLinks(block.start_pc);
+		UnlinkIncomingLinks(block.start_pc, block.isolate_cache_active ? 1 : 0);
 		UnregisterIncomingLinks(block);
 		UnregisterBlockLookup(block);
 		UnregisterBlockRecord(block);
@@ -7123,6 +7240,11 @@ namespace VitaIOP
 		*result = {};
 		result->start_pc = start_pc;
 		result->stop_pc = start_pc;
+		bool isolate_mode_boundary = VitaIsIopPreInstructionTraceEnabled();
+#if defined(VITASX2_QEMU_VALIDATION)
+		isolate_mode_boundary = isolate_mode_boundary &&
+			s_qemuIopIsolateCacheSpecializationEnabled;
+#endif
 
 		const auto add_instruction = [&](u32 pc) {
 			result->instruction_count++;
@@ -7161,6 +7283,8 @@ namespace VitaIOP
 				// first word of the next guest page.
 				add_instruction(pc);
 				add_instruction(delay_pc);
+				if (isolate_mode_boundary && IsIopCop0StatusWriteOpcode(delay_op))
+					return true;
 				bool wait_loop_candidate = false;
 				if (EmuConfig.Speedhacks.WaitLoop && !VitaIsIopPreInstructionTraceEnabled() &&
 					IsIopStaticConditionalBranchOpcode(op) && BranchTarget(pc, op) == start_pc &&
@@ -7205,6 +7329,8 @@ namespace VitaIOP
 			}
 
 			add_instruction(pc);
+			if (isolate_mode_boundary && IsIopCop0StatusWriteOpcode(op))
+				return true;
 			if (IsIopExceptionOpcode(op))
 				return true;
 		}
@@ -7306,13 +7432,14 @@ namespace VitaIOP
 		return true;
 	}
 
-	BlockExecutor::CachedBlock* BlockExecutor::FindLookupBlockByStartPc(u32 start_pc)
+	BlockExecutor::CachedBlock* BlockExecutor::FindLookupBlockByStartPc(
+		u32 start_pc, bool isolate_cache_active)
 	{
 		if ((start_pc & 0x3u) != 0)
 			return nullptr;
 
 		LookupPage* page = GetLookupPage(start_pc, false);
-		return page ? page->blocks[LookupEntryIndex(start_pc)] : nullptr;
+		return page ? page->blocks[isolate_cache_active ? 1 : 0][LookupEntryIndex(start_pc)] : nullptr;
 	}
 
 	bool BlockExecutor::FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit)
@@ -7328,7 +7455,7 @@ namespace VitaIOP
 		if (lookup_hit)
 			*lookup_hit = false;
 
-		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc, m_active_isolate_cache_mode))
 		{
 			if (entry->valid && entry->instruction_count == instruction_count && ValidateCachedBlock(*entry))
 			{
@@ -7339,7 +7466,8 @@ namespace VitaIOP
 			}
 		}
 
-		if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, instruction_count, true))
+		if (CachedBlock* entry = FindRecordedBlockByStartPc(
+				start_pc, instruction_count, true, m_active_isolate_cache_mode))
 		{
 			*block = entry;
 			return true;
@@ -7348,15 +7476,16 @@ namespace VitaIOP
 		return false;
 	}
 
-	BlockExecutor::CachedBlock* BlockExecutor::FindCachedBlockByStartPc(u32 start_pc)
+	BlockExecutor::CachedBlock* BlockExecutor::FindCachedBlockByStartPc(
+		u32 start_pc, bool isolate_cache_active)
 	{
-		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc, isolate_cache_active))
 		{
 			if (entry->valid && ValidateCachedBlock(*entry))
 				return entry;
 		}
 
-		return FindRecordedBlockByStartPc(start_pc, 0, false);
+		return FindRecordedBlockByStartPc(start_pc, 0, false, isolate_cache_active);
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::AllocateCacheEntry()
@@ -7461,6 +7590,12 @@ namespace VitaIOP
 		}
 
 		InvalidateCachedBlock(block);
+		bool isolate_variants_enabled = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		isolate_variants_enabled = s_qemuIopIsolateCacheSpecializationEnabled;
+#endif
+		block.isolate_cache_active =
+			isolate_variants_enabled && m_active_isolate_cache_mode;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 op = iopMemRead32(start_pc + i * 4);
@@ -7493,6 +7628,7 @@ namespace VitaIOP
 		u32 fused_ram_guard_instructions_removed = 0;
 		u32 source_page_guard_instructions_removed = 0;
 		u32 source_page_literal_instructions_removed = 0;
+		u32 isolate_cache_guard_instructions_removed = 0;
 		u32 clock_mode_check_instructions_removed = 0;
 		u32 saved_register_stack_words_removed = 0;
 		u32 saved_register_frame_instructions_added = 0;
@@ -7553,6 +7689,8 @@ namespace VitaIOP
 					compiler.SourcePageGuardInstructionsRemoved();
 				source_page_literal_instructions_removed =
 					compiler.SourcePageLiteralInstructionsRemoved();
+				isolate_cache_guard_instructions_removed =
+					compiler.IsolateCacheGuardInstructionsRemoved();
 				clock_mode_check_instructions_removed = compiler.ClockModeCheckInstructionsRemoved();
 				saved_register_stack_words_removed = compiler.SavedRegisterStackWordsRemoved();
 				saved_register_frame_instructions_added = compiler.SavedRegisterFrameInstructionsAdded();
@@ -7598,6 +7736,7 @@ namespace VitaIOP
 		block.fused_ram_guard_instructions_removed = fused_ram_guard_instructions_removed;
 		block.source_page_guard_instructions_removed = source_page_guard_instructions_removed;
 		block.source_page_literal_instructions_removed = source_page_literal_instructions_removed;
+		block.isolate_cache_guard_instructions_removed = isolate_cache_guard_instructions_removed;
 		block.clock_mode_check_instructions_removed = clock_mode_check_instructions_removed;
 		block.saved_register_stack_words_removed = saved_register_stack_words_removed;
 		block.saved_register_frame_instructions_added = saved_register_frame_instructions_added;
@@ -7631,7 +7770,8 @@ namespace VitaIOP
 			{
 				if (link.valid)
 				{
-					if (CachedBlock* target = FindCachedBlockByStartPc(link.target_pc))
+					if (CachedBlock* target = FindCachedBlockByStartPc(
+							link.target_pc, block.isolate_cache_active))
 						PatchDirectLink(block, link, target);
 				}
 			}
@@ -7657,6 +7797,8 @@ namespace VitaIOP
 		{
 			return false;
 		}
+		if (target && block.isolate_cache_active != target->isolate_cache_active)
+			target = nullptr;
 
 		bool use_frame_bypass = target &&
 			block.saved_registers == target->saved_registers &&
@@ -7688,12 +7830,16 @@ namespace VitaIOP
 		while (index >= 0 && m_incoming_links[index].target_pc == target.start_pc)
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
-			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-				PatchDirectLink(*record.source, *link, &target);
+			if (record.source &&
+				record.source->isolate_cache_active == target.isolate_cache_active)
+			{
+				if (DirectLinkSlot* link = GetRecordedDirectLink(record))
+					PatchDirectLink(*record.source, *link, &target);
+			}
 		}
 	}
 
-	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc)
+	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc, int isolate_cache_mode)
 	{
 		if (target_pc == UINT32_MAX)
 		{
@@ -7710,6 +7856,11 @@ namespace VitaIOP
 		while (index >= 0 && m_incoming_links[index].target_pc == target_pc)
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
+			if (isolate_cache_mode >= 0 && record.source &&
+				static_cast<int>(record.source->isolate_cache_active) != isolate_cache_mode)
+			{
+				continue;
+			}
 			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
 				PatchDirectLink(*record.source, *link, nullptr);
 		}
@@ -7724,7 +7875,8 @@ namespace VitaIOP
 			if (!link)
 				continue;
 
-			CachedBlock* target = FindCachedBlockByStartPc(record.target_pc);
+			CachedBlock* target = FindCachedBlockByStartPc(
+				record.target_pc, record.source->isolate_cache_active);
 			PatchDirectLink(*record.source, *link, target);
 		}
 	}
@@ -7756,6 +7908,8 @@ namespace VitaIOP
 			block.source_page_guard_instructions_removed;
 		result->source_page_literal_instructions_removed =
 			block.source_page_literal_instructions_removed;
+		result->isolate_cache_guard_instructions_removed =
+			block.isolate_cache_guard_instructions_removed;
 		SnapshotInstrumentation(result);
 #endif
 	}
@@ -7815,9 +7969,9 @@ namespace VitaIOP
 			(block.poll_call_wait_loop ? TryFastForwardPollCallWaitLoop(block) :
 									TryFastForwardTrustedWaitLoopAtPc(block.start_pc)))
 		{
+			result->exit = BlockExitKind::Direct;
 			if (publish_details)
 			{
-				result->exit = BlockExitKind::Direct;
 				PublishExecutionDetails(block, result);
 			}
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -7837,6 +7991,8 @@ namespace VitaIOP
 					block.source_page_guard_instructions_removed;
 				result->source_page_literal_instructions_removed =
 					block.source_page_literal_instructions_removed;
+				result->isolate_cache_guard_instructions_removed =
+					block.isolate_cache_guard_instructions_removed;
 			}
 #endif
 			// The generated block did not execute, so no producer-to-branch CMP
@@ -7846,6 +8002,7 @@ namespace VitaIOP
 			result->fused_ram_guard_instructions_removed = 0;
 			result->source_page_guard_instructions_removed = 0;
 			result->source_page_literal_instructions_removed = 0;
+			result->isolate_cache_guard_instructions_removed = 0;
 #endif
 			result->wait_loop_fast_forward = true;
 			return true;
@@ -7871,9 +8028,9 @@ namespace VitaIOP
 		if (!DecodeExitKind(exit_value, &exit))
 			return false;
 
+		result->exit = exit;
 		if (publish_details)
 		{
-			result->exit = exit;
 			PublishExecutionDetails(block, result);
 		}
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -7893,8 +8050,16 @@ namespace VitaIOP
 				block.source_page_guard_instructions_removed;
 			result->source_page_literal_instructions_removed =
 				block.source_page_literal_instructions_removed;
+			result->isolate_cache_guard_instructions_removed =
+				block.isolate_cache_guard_instructions_removed;
 		}
 #endif
+		if (exit == BlockExitKind::IsolateModeWrite)
+		{
+			const bool new_mode = (psxRegs.CP0.n.Status & 0x10000u) != 0;
+			result->isolate_mode_switched = new_mode != m_active_isolate_cache_mode;
+			m_active_isolate_cache_mode = new_mode;
+		}
 		return true;
 	}
 
@@ -7912,6 +8077,7 @@ namespace VitaIOP
 		result->lookup_hit = false;
 		result->fast_dispatch_hit = false;
 		result->wait_loop_fast_forward = false;
+		result->isolate_mode_switched = false;
 		CachedBlock* block = nullptr;
 		bool lookup_hit = false;
 		if (FindCachedBlock(start_pc, instruction_count, &block, &lookup_hit))
@@ -7948,6 +8114,7 @@ namespace VitaIOP
 		result->lookup_hit = false;
 		result->fast_dispatch_hit = false;
 		result->wait_loop_fast_forward = false;
+		result->isolate_mode_switched = false;
 
 		// PCSX2 owner: x86/BaseblockEx.h::PC_GETBLOCK_() looks up the
 		// translated BaseBlock by guest PC before doing any decode work. Keep
@@ -7984,7 +8151,7 @@ namespace VitaIOP
 #endif
 
 		// Validate the page-table fallback before execution, then promote it.
-		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc, m_active_isolate_cache_mode))
 		{
 			if (entry->valid && ValidateCachedBlock(*entry))
 			{
@@ -7996,7 +8163,8 @@ namespace VitaIOP
 			}
 		}
 
-		if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, 0, false))
+		if (CachedBlock* entry = FindRecordedBlockByStartPc(
+				start_pc, 0, false, m_active_isolate_cache_mode))
 		{
 			RegisterHotDispatchCache(*entry);
 			result->cache_hit = true;

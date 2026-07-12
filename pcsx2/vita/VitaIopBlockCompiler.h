@@ -18,6 +18,7 @@ namespace VitaIOP
 	enum class BlockExitKind : u32
 	{
 		Direct = 0x10300a32u,
+		IsolateModeWrite = 0x10310a32u,
 	};
 
 	struct BlockScanResult
@@ -28,7 +29,7 @@ namespace VitaIOP
 	};
 
 	// Successful executor calls publish every payload field and initialize the
-	// four control flags explicitly. Keep this aggregate free of member
+	// five control flags explicitly. Keep this aggregate free of member
 	// initializers: the provider hot path must not construct/clear the complete
 	// telemetry object before RunValidatedBlock overwrites it.
 	struct BlockExecutionResult
@@ -44,6 +45,7 @@ namespace VitaIOP
 		u32 code_cache_resets;
 		size_t code_cache_used;
 		size_t code_cache_capacity;
+		bool isolate_mode_switched;
 #if defined(VITASX2_QEMU_VALIDATION)
 		u64 hot_dispatch_cache_hits;
 		u64 hot_dispatch_cache_misses;
@@ -78,6 +80,7 @@ namespace VitaIOP
 		u32 fused_ram_guard_instructions_removed;
 		u32 source_page_guard_instructions_removed;
 		u32 source_page_literal_instructions_removed;
+		u32 isolate_cache_guard_instructions_removed;
 #endif
 		bool cache_hit;
 		bool lookup_hit;
@@ -151,11 +154,17 @@ namespace VitaIOP
 		{
 			return m_source_page_literal_instructions_removed;
 		}
+		u32 IsolateCacheGuardInstructionsRemoved() const
+		{
+			return m_isolate_cache_guard_instructions_removed;
+		}
 		bool SourcePageLiteralOutOfRange() const { return m_source_page_literal_out_of_range; }
 
 	private:
 		bool BeginBlock(size_t* linked_entry_offset);
 		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true,
+			bool flush_pins = true, u32 known_cycle_count = 0);
+		bool EndBlockIsolateModeWriteReturn(bool charge_budget = true,
 			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot);
 		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& trace_exit_branches);
@@ -165,6 +174,7 @@ namespace VitaIOP
 		bool EmitNativeCOP2(u32 op);
 		bool EmitStoreCode(u32 op);
 		bool EmitSourcePageLiteralPool();
+		bool EmitIsolateCacheGuard(size_t* isolated_branch);
 		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
 		void AnalyzePinnedGprs(u32 start_pc, u32 instruction_count);
 		void AnalyzeSavedRegisters(u32 start_pc, u32 instruction_count);
@@ -334,6 +344,7 @@ namespace VitaIOP
 		u32 m_fused_ram_guard_instructions_removed = 0;
 		u32 m_source_page_guard_instructions_removed = 0;
 		u32 m_source_page_literal_instructions_removed = 0;
+		u32 m_isolate_cache_guard_instructions_removed = 0;
 		u32 m_pinned_gpr_min_exit_savings = UINT32_MAX;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
@@ -353,6 +364,10 @@ namespace VitaIOP
 		bool m_track_published_cycle_prefix = false;
 		bool m_has_budget_exit = false;
 		bool m_source_page_literal_out_of_range = false;
+		bool m_isolate_cache_specialization = false;
+		bool m_isolate_cache_guard_stable = false;
+		bool m_isolate_cache_active = false;
+		bool m_writes_isolate_mode = false;
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_branch_flags = false;
@@ -397,6 +412,7 @@ namespace VitaIOP
 		static void SetProducerBranchFlagsEnabled(bool enabled);
 		static void SetRamProvenanceSpecializationEnabled(bool enabled);
 		static void SetSourcePageLiteralEnabled(bool enabled);
+		static void SetIsolateCacheSpecializationEnabled(bool enabled);
 		static void SetClockModeSpecializationEnabled(bool enabled);
 		static void SetSavedRegisterNarrowingEnabled(bool enabled);
 		static void SetBlockCycleBatchingEnabled(bool enabled);
@@ -461,6 +477,7 @@ namespace VitaIOP
 			u32 fused_ram_guard_instructions_removed = 0;
 			u32 source_page_guard_instructions_removed = 0;
 			u32 source_page_literal_instructions_removed = 0;
+			u32 isolate_cache_guard_instructions_removed = 0;
 			u32 clock_mode_check_instructions_removed = 0;
 			u32 saved_register_stack_words_removed = 0;
 			u32 saved_register_frame_instructions_added = 0;
@@ -477,6 +494,7 @@ namespace VitaIOP
 			bool poll_call_wait_loop = false;
 			bool direct_budget_exit = false;
 			bool constant_cycle_budget = false;
+			bool isolate_cache_active = false;
 			u8 poll_result_register = 0;
 			bool valid = false;
 			bool queued_free = false;
@@ -484,7 +502,7 @@ namespace VitaIOP
 
 		struct LookupPage
 		{
-			std::array<CachedBlock*, LOOKUP_PAGE_ENTRY_COUNT> blocks{};
+			std::array<std::array<CachedBlock*, LOOKUP_PAGE_ENTRY_COUNT>, 2> blocks{};
 		};
 
 		struct HotDispatchCacheEntry
@@ -538,7 +556,8 @@ namespace VitaIOP
 		bool RegisterBlockRecord(CachedBlock& block);
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
-		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc, u32 instruction_count, bool match_instruction_count);
+		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc, u32 instruction_count,
+			bool match_instruction_count, bool isolate_cache_active);
 		void RememberFreeCacheEntry(CachedBlock& block);
 		CachedBlock* TakeFreeCacheEntry();
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
@@ -547,9 +566,9 @@ namespace VitaIOP
 		void RegisterIncomingLink(CachedBlock& block, u8 slot_index, const DirectLinkSlot& link);
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
-		CachedBlock* FindLookupBlockByStartPc(u32 start_pc);
+		CachedBlock* FindLookupBlockByStartPc(u32 start_pc, bool isolate_cache_active);
 		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit);
-		CachedBlock* FindCachedBlockByStartPc(u32 start_pc);
+		CachedBlock* FindCachedBlockByStartPc(u32 start_pc, bool isolate_cache_active);
 		CachedBlock* AllocateCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
 		bool ValidateCachedBlock(CachedBlock& block);
@@ -567,7 +586,7 @@ namespace VitaIOP
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
 		void PatchIncomingLinks(CachedBlock& target);
-		void UnlinkIncomingLinks(u32 target_pc);
+		void UnlinkIncomingLinks(u32 target_pc, int isolate_cache_mode = -1);
 		void RelinkDirectLinks();
 
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
@@ -578,8 +597,9 @@ namespace VitaIOP
 		std::array<u16, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
 		std::array<u8, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_flags{};
 		LookupPage** m_lookup_pages = nullptr;
-		std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
-			HOT_DISPATCH_CACHE_SET_COUNT> m_hot_dispatch_cache{};
+		std::array<std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
+			HOT_DISPATCH_CACHE_SET_COUNT>, 2> m_hot_dispatch_cache{};
+		bool m_active_isolate_cache_mode = false;
 		u32 m_next_source_serial = 1;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;
