@@ -99,9 +99,9 @@ namespace VitaIOP
 
 	private:
 		bool BeginBlock();
-		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true);
+		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true, bool flush_pins = true);
 		bool EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot);
-		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& direct_exit_branches);
+		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& trace_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op, u32 pc);
 		bool EmitNativeCOP0(u32 op);
@@ -111,6 +111,8 @@ namespace VitaIOP
 		void AnalyzePinnedGprs(u32 start_pc, u32 instruction_count);
 		int PinnedHostForGuest(unsigned guest_reg) const;
 		bool EmitFlushPinnedGprs();
+		void RecordPinnedGprExitPathSavings();
+		bool EmitBranchHelperExit(const void* helper);
 		void ResetGprConstState();
 		bool TryGetKnownGpr(unsigned guest_reg, u32* value) const;
 		void SetKnownGpr(unsigned guest_reg, u32 value);
@@ -254,6 +256,7 @@ namespace VitaIOP
 		u32 m_pinned_gpr_store_hits = 0;
 		u32 m_pinned_gpr_initial_loads = 0;
 		u32 m_pinned_gpr_memory_ops_saved = 0;
+		u32 m_pinned_gpr_min_exit_savings = UINT32_MAX;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
 		u32 m_block_cycle_count = 0;

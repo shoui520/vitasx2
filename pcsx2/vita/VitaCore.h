@@ -111,6 +111,7 @@ struct VitaA32IopHotDispatch
 	u32 opcode = 0;
 	u32 instruction_count = 0;
 	u64 dispatches = 0;
+	u32 opcodes[16]{};
 };
 
 struct VitaA32IopHotDispatchEdge

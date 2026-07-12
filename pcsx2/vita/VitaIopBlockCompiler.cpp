@@ -960,9 +960,9 @@ namespace VitaIOP
 		return true;
 	}
 
-	bool BlockCompiler::EndBlockReturn(BlockExitKind exit, bool charge_budget)
+	bool BlockCompiler::EndBlockReturn(BlockExitKind exit, bool charge_budget, bool flush_pins)
 	{
-		if (!EmitFlushPinnedGprs() || (charge_budget && !EmitChargeEeBudget()))
+		if ((flush_pins && !EmitFlushPinnedGprs()) || (charge_budget && !EmitChargeEeBudget()))
 			return false;
 
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
@@ -1056,6 +1056,7 @@ namespace VitaIOP
 		m_pinned_gpr_store_hits = 0;
 		m_pinned_gpr_initial_loads = 0;
 		m_pinned_gpr_memory_ops_saved = 0;
+		m_pinned_gpr_min_exit_savings = UINT32_MAX;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!s_qemuIopPinnedGprResidencyEnabled)
 			return;
@@ -1064,6 +1065,7 @@ namespace VitaIOP
 		u32 written_mask = 1;
 		u32 needs_initial_mask = 0;
 		bool supported = true;
+		bool reserves_register_jump_host = false;
 		const auto read = [&](unsigned reg) {
 			if (reg == 0 || reg >= scores.size())
 				return;
@@ -1085,16 +1087,22 @@ namespace VitaIOP
 			if (IsIopBranchOrJumpOpcode(op) || IsIopExceptionOpcode(op))
 			{
 				const u32 delay_op = (i + 1 < instruction_count) ? iopMemRead32(pc + 4) : 0;
-				const bool final_delay_pair =
-					i + 2 == instruction_count &&
+				const bool complete_delay_pair =
+					i + 1 < instruction_count &&
 					!IsIopBranchOrJumpOpcode(delay_op) &&
 					!IsIopExceptionOpcode(delay_op);
-				const bool native_static_branch =
-					IsIopStaticConditionalBranchOpcode(op) && final_delay_pair;
+				const bool final_delay_pair =
+					i + 2 == instruction_count && complete_delay_pair;
+				const bool path_specific_static_branch =
+					IsIopStaticConditionalBranchOpcode(op) && complete_delay_pair;
 				const bool native_static_jump =
 					IsIopStaticJumpOpcode(op) && final_delay_pair &&
 					((op >> 26) != 0x02 || (delay_op >> 16) != 0x2400);
-				if (!native_static_branch && !native_static_jump)
+				const bool native_register_jump =
+					IsIopRegisterJumpOpcode(op) && final_delay_pair;
+				if (native_register_jump)
+					reserves_register_jump_host = true;
+				if (!path_specific_static_branch && !native_static_jump && !native_register_jump)
 				{
 					supported = false;
 					continue;
@@ -1112,6 +1120,10 @@ namespace VitaIOP
 						case 0x24: case 0x25: case 0x26: case 0x27:
 						case 0x2a: case 0x2b:
 							read(RS(op)); read(RT(op)); write(RD(op)); break;
+						case 0x08: // JR
+							read(RS(op)); break;
+						case 0x09: // JALR
+							read(RS(op)); write(RD(op)); break;
 						default:
 							supported = false; break;
 					}
@@ -1145,8 +1157,10 @@ namespace VitaIOP
 			return;
 
 		constexpr std::array<u8, 2> pin_hosts = {HOST_SAVED1, HOST_REGISTER_JUMP_TARGET};
-		for (u8 host : pin_hosts)
+		const u8 pin_host_count = reserves_register_jump_host ? 1 : static_cast<u8>(pin_hosts.size());
+		for (u8 host_index = 0; host_index < pin_host_count; host_index++)
 		{
+			const u8 host = pin_hosts[host_index];
 			unsigned best_guest = 0;
 			u16 best_score = 2;
 			for (unsigned guest = 1; guest < 31; guest++)
@@ -1193,6 +1207,32 @@ namespace VitaIOP
 			}
 		}
 		return true;
+	}
+
+	void BlockCompiler::RecordPinnedGprExitPathSavings()
+	{
+		u32 dirty_pin_count = 0;
+		for (u8 i = 0; i < m_pinned_gpr_count; i++)
+			dirty_pin_count += m_pinned_gprs[i].written ? 1u : 0u;
+		const u32 removed_memory_ops = m_pinned_gpr_load_hits + m_pinned_gpr_store_hits;
+		const u32 added_memory_ops = m_pinned_gpr_initial_loads + dirty_pin_count;
+		const u32 savings = removed_memory_ops > added_memory_ops ?
+			removed_memory_ops - added_memory_ops : 0;
+		m_pinned_gpr_min_exit_savings = std::min(m_pinned_gpr_min_exit_savings, savings);
+	}
+
+	bool BlockCompiler::EmitBranchHelperExit(const void* helper)
+	{
+		// PCSX2 owners: x86/iR3000Atables.cpp::rpsxBEQ_process() /
+		// rpsxBNE_process() flush dirty state before saving the taken branch arm,
+		// then restore the allocator snapshot for generated fallthrough. Vita's
+		// helper executes the taken delay slot against canonical psxRegs, so
+		// publish the current dirty pins before it and never overwrite the
+		// helper-produced delay-slot state on this exiting arm.
+		RecordPinnedGprExitPathSavings();
+		return EmitFlushPinnedGprs() &&
+			m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH) &&
+			EndBlockReturn(BlockExitKind::Direct, true, false);
 	}
 
 	void BlockCompiler::ResetGprConstState()
@@ -4001,8 +4041,7 @@ namespace VitaIOP
 			((op >> 26) == 0x04) ? VitaA32::Condition::NE : VitaA32::Condition::EQ;
 		const size_t not_taken = m_code.EmitBranchPlaceholder(skip_taken);
 		return m_code.EmitMovImm32(HOST_TMP0, BranchTarget(pc, op)) &&
-			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
-			   EndBlockReturn(BlockExitKind::Direct) &&
+			   EmitBranchHelperExit(reinterpret_cast<const void*>(&psxDoBranch)) &&
 			   m_code.PatchBranch(not_taken, m_code.Size(), skip_taken);
 	}
 
@@ -4089,8 +4128,7 @@ namespace VitaIOP
 			if (!taken)
 				return true;
 			return m_code.EmitMovImm32(HOST_TMP0, BranchTarget(pc, op)) &&
-				   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
-				   EndBlockReturn(BlockExitKind::Direct);
+				   EmitBranchHelperExit(reinterpret_cast<const void*>(&psxDoBranch));
 		}
 
 		if (!EmitLoadGpr(RS(op), HOST_TMP0) ||
@@ -4131,8 +4169,7 @@ namespace VitaIOP
 
 		const size_t not_taken = m_code.EmitBranchPlaceholder(skip_taken);
 		return m_code.EmitMovImm32(HOST_TMP0, BranchTarget(pc, op)) &&
-			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
-			   EndBlockReturn(BlockExitKind::Direct) &&
+			   EmitBranchHelperExit(reinterpret_cast<const void*>(&psxDoBranch)) &&
 			   m_code.PatchBranch(not_taken, m_code.Size(), skip_taken);
 	}
 
@@ -4269,8 +4306,7 @@ namespace VitaIOP
 		}
 
 		return EmitLoadGpr(RS(op), HOST_TMP0) &&
-			   m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) &&
-			   EndBlockReturn(BlockExitKind::Direct);
+			   EmitBranchHelperExit(reinterpret_cast<const void*>(&psxDoBranch));
 	}
 
 	bool BlockCompiler::EmitRegisterJumpCaptureOp(u32 op, u32 pc)
@@ -4340,8 +4376,7 @@ namespace VitaIOP
 			!m_code.PatchBranch(sysmem_target, helper_path, VitaA32::Condition::EQ) ||
 			!m_code.PatchBranch(iopboot_target, helper_path, VitaA32::Condition::EQ) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_REGISTER_JUMP_TARGET, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&psxDoBranch), HOST_CALL_SCRATCH) ||
-			!EndBlockReturn(BlockExitKind::Direct))
+			!EmitBranchHelperExit(reinterpret_cast<const void*>(&psxDoBranch)))
 		{
 			return false;
 		}
@@ -5033,11 +5068,11 @@ namespace VitaIOP
 		}
 	}
 
-	bool BlockCompiler::EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& direct_exit_branches)
+	bool BlockCompiler::EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& trace_exit_branches)
 	{
 		const u32 next_pc = pc + 4;
 		if (((m_emit_trace_checks || IopInstructionRequiresCodeState(op)) && !EmitStoreCode(op)) ||
-			(m_emit_trace_checks && !EmitTraceCheck(pc, op, direct_exit_branches)) ||
+			(m_emit_trace_checks && !EmitTraceCheck(pc, op, trace_exit_branches)) ||
 			(store_pc && !EmitStorePc(next_pc)) ||
 			(!m_defer_cycle_updates && !EmitIncrementCycle()))
 		{
@@ -5126,10 +5161,12 @@ namespace VitaIOP
 			return false;
 
 		std::vector<size_t> direct_exit_branches;
+		std::vector<size_t> trace_exit_branches;
 		std::vector<size_t> budget_exit_branches;
 		m_direct_exit_branches = &direct_exit_branches;
 		m_budget_exit_branches = &budget_exit_branches;
 		direct_exit_branches.reserve(instruction_count * 2);
+		trace_exit_branches.reserve(instruction_count);
 		budget_exit_branches.reserve(4);
 		m_native_instruction_count = 0;
 		m_helper_instruction_count = 0;
@@ -5181,7 +5218,7 @@ namespace VitaIOP
 				can_direct_link_fallthrough = false;
 			const bool store_pc =
 				m_emit_trace_checks || (i + 1 == instruction_count) || IopInstructionRequiresPcState(op);
-			const bool emitted = CanCompileOpcode(op) && EmitInstruction(op, pc, store_pc, direct_exit_branches);
+			const bool emitted = CanCompileOpcode(op) && EmitInstruction(op, pc, store_pc, trace_exit_branches);
 			m_emit_native_static_branch = false;
 			m_emit_native_static_jump = false;
 			m_emit_native_register_jump = false;
@@ -5364,6 +5401,11 @@ namespace VitaIOP
 		m_pinned_gpr_memory_ops_saved =
 			removed_gpr_memory_ops > added_gpr_memory_ops ?
 				removed_gpr_memory_ops - added_gpr_memory_ops : 0;
+		if (m_pinned_gpr_min_exit_savings != UINT32_MAX)
+		{
+			m_pinned_gpr_memory_ops_saved =
+				std::min(m_pinned_gpr_memory_ops_saved, m_pinned_gpr_min_exit_savings);
+		}
 
 		if (!FlushColdTails())
 			return false;
@@ -5373,9 +5415,26 @@ namespace VitaIOP
 			if (!m_code.PatchBranch(branch_offset, direct_exit_offset, VitaA32::Condition::NE))
 				return false;
 		}
+
+		// Trace callbacks and early branch-helper budget checks publish the state
+		// belonging to their own control-flow path before branching. They must
+		// bypass the ordinary final-state flush: a later fallthrough write-first
+		// pin has no valid host value on an earlier exit. Ordinary blocks keep the
+		// compact existing tail because their budget exit owns final-path state.
+		const bool has_early_branch_helper = m_pinned_gpr_min_exit_savings != UINT32_MAX;
+		const bool needs_published_state_exit =
+			has_early_branch_helper || !trace_exit_branches.empty();
+		const size_t published_state_exit_offset = needs_published_state_exit ? m_code.Size() : direct_exit_offset;
+		if (needs_published_state_exit && !EndBlockReturn(BlockExitKind::Direct, false, false))
+			return false;
+		for (const size_t branch_offset : trace_exit_branches)
+		{
+			if (!m_code.PatchBranch(branch_offset, published_state_exit_offset, VitaA32::Condition::NE))
+				return false;
+		}
 		for (const size_t branch_offset : budget_exit_branches)
 		{
-			if (!m_code.PatchBranch(branch_offset, direct_exit_offset, VitaA32::Condition::LE))
+			if (!m_code.PatchBranch(branch_offset, published_state_exit_offset, VitaA32::Condition::LE))
 				return false;
 		}
 

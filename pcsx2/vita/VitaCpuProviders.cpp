@@ -46,6 +46,7 @@ struct IopDispatchProfileEntry
 	u32 opcode = 0;
 	u32 instruction_count = 0;
 	u64 dispatches = 0;
+	u32 opcodes[16]{};
 };
 static std::unordered_map<u32, IopDispatchProfileEntry> s_iop_a32_dispatch_profile;
 static std::unordered_map<u64, u64> s_iop_a32_dispatch_edge_profile;
@@ -820,6 +821,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		{
 			dispatch_profile.opcode = iopMemRead32(pc);
 			dispatch_profile.instruction_count = result.instruction_count;
+			for (u32 i = 0; i < std::min<u32>(result.instruction_count, 16); i++)
+				dispatch_profile.opcodes[i] = iopMemRead32(pc + i * 4);
 		}
 		dispatch_profile.dispatches++;
 		const u64 edge_key = (static_cast<u64>(pc) << 32) | psxRegs.pc;
@@ -1090,6 +1093,8 @@ VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile()
 		result.entries[i].opcode = sorted[i].second.opcode;
 		result.entries[i].instruction_count = sorted[i].second.instruction_count;
 		result.entries[i].dispatches = sorted[i].second.dispatches;
+		std::copy(std::begin(sorted[i].second.opcodes), std::end(sorted[i].second.opcodes),
+			std::begin(result.entries[i].opcodes));
 	}
 
 	std::vector<std::pair<u64, u64>> sorted_edges;
