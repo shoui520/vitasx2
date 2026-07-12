@@ -74,6 +74,7 @@ static bool s_qemuIopLinkedFrameBypassEnabled = true;
 static bool s_qemuIopSequentialQwordCopyEnabled = true;
 static bool s_qemuIopBranchTestSchedulingEnabled = true;
 static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
+static bool s_qemuIopHotDispatchOwnershipEnabled = true;
 static bool s_qemuIopCachedWaitDescriptorEnabled = true;
 static bool s_qemuIopInlineWaitFastForwardEnabled = true;
 static bool s_qemuIopWaitResumeCacheEnabled = true;
@@ -6832,6 +6833,7 @@ namespace VitaIOP
 		m_hot_dispatch_cache_misses = 0;
 		m_hot_dispatch_cache_way_probes = 0;
 		m_hot_dispatch_trusted_raw_hits = 0;
+		m_hot_dispatch_owned_hits = 0;
 		m_wait_resume_cache_attempts = 0;
 		m_wait_resume_cache_hits = 0;
 		m_wait_resume_cache_misses = 0;
@@ -7029,6 +7031,15 @@ namespace VitaIOP
 #endif
 	}
 
+	void BlockExecutor::SetHotDispatchOwnershipEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopHotDispatchOwnershipEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
 	void BlockExecutor::SetCachedWaitDescriptorEnabled(bool enabled)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -7215,11 +7226,28 @@ namespace VitaIOP
 			if (entry.start_pc != start_pc || !entry.block)
 				continue;
 
-			if (!entry.block->valid || entry.block->start_pc != start_pc)
+			// PCSX2 owner: x86/iR3000A.cpp::psxRecClearMem() owns recorded-block
+			// removal and clearing the corresponding psxRecLUT range as one
+			// invalidation operation. Vita's pointer-bearing first level requires
+			// the stricter UnregisterBlockLookup()-before-invalidate/reuse ordering,
+			// so a matching non-null record proves block identity and lifetime.
+#if defined(VITASX2_IOP_HOT_DISPATCH_STALE_GUARD_CONTROL)
+			constexpr bool trust_cache_ownership = false;
+#elif defined(VITASX2_QEMU_VALIDATION)
+			const bool trust_cache_ownership = s_qemuIopHotDispatchOwnershipEnabled;
+#else
+			constexpr bool trust_cache_ownership = true;
+#endif
+			if (!trust_cache_ownership &&
+				(!entry.block->valid || entry.block->start_pc != start_pc))
 			{
 				entry = {};
 				return nullptr;
 			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (trust_cache_ownership)
+				m_hot_dispatch_owned_hits++;
+#endif
 
 			return entry.block;
 		}
@@ -8754,6 +8782,7 @@ namespace VitaIOP
 		result->hot_dispatch_cache_misses = m_hot_dispatch_cache_misses;
 		result->hot_dispatch_cache_way_probes = m_hot_dispatch_cache_way_probes;
 		result->hot_dispatch_trusted_raw_hits = m_hot_dispatch_trusted_raw_hits;
+		result->hot_dispatch_owned_hits = m_hot_dispatch_owned_hits;
 		result->wait_resume_cache_attempts = m_wait_resume_cache_attempts;
 		result->wait_resume_cache_hits = m_wait_resume_cache_hits;
 		result->wait_resume_cache_misses = m_wait_resume_cache_misses;

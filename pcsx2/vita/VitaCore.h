@@ -134,6 +134,8 @@ struct VitaA32IopProviderStats
 	u64 hot_dispatch_cache_misses = 0;
 	u64 hot_dispatch_cache_way_probes = 0;
 	u64 hot_dispatch_trusted_raw_hits = 0;
+	u64 hot_dispatch_owned_hits = 0;
+	u64 hot_dispatch_stale_guard_instructions_removed = 0;
 	u64 wait_resume_cache_attempts = 0;
 	u64 wait_resume_cache_hits = 0;
 	u64 wait_resume_cache_misses = 0;
@@ -253,6 +255,7 @@ void VitaSetA32IopRuntimeStatsEnabled(bool enabled);
 void VitaSetA32IopPrivateDispatcherEnabled(bool enabled);
 void VitaSetA32IopPrivateEventEntryEnabled(bool enabled);
 void VitaSetA32IopPrivateHotPathEnabled(bool enabled);
+void VitaSetA32IopHotDispatchOwnershipEnabled(bool enabled);
 void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled);
 void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled);
 void VitaSetA32IopWaitResumeCacheEnabled(bool enabled);

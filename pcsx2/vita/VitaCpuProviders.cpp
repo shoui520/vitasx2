@@ -1223,6 +1223,11 @@ void VitaSetA32IopPrivateHotPathEnabled(bool enabled)
 	VitaIOP::BlockExecutor::SetPrivateDispatcherHotPathEnabled(enabled);
 }
 
+void VitaSetA32IopHotDispatchOwnershipEnabled(bool enabled)
+{
+	VitaIOP::BlockExecutor::SetHotDispatchOwnershipEnabled(enabled);
+}
+
 void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetCachedWaitDescriptorEnabled(enabled);
@@ -1262,6 +1267,12 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.hot_dispatch_cache_misses = snapshot.hot_dispatch_cache_misses;
 	s_iop_a32_stats.hot_dispatch_cache_way_probes = snapshot.hot_dispatch_cache_way_probes;
 	s_iop_a32_stats.hot_dispatch_trusted_raw_hits = snapshot.hot_dispatch_trusted_raw_hits;
+	s_iop_a32_stats.hot_dispatch_owned_hits = snapshot.hot_dispatch_owned_hits;
+	// The retired stale-entry arm loads/checks CachedBlock::valid and reloads/
+	// checks CachedBlock::start_pc after the cache record already matched. Product
+	// Cortex-A9 disassembly attributes six instructions to that arm.
+	s_iop_a32_stats.hot_dispatch_stale_guard_instructions_removed =
+		snapshot.hot_dispatch_owned_hits * 6u;
 	s_iop_a32_stats.wait_resume_cache_attempts = snapshot.wait_resume_cache_attempts;
 	s_iop_a32_stats.wait_resume_cache_hits = snapshot.wait_resume_cache_hits;
 	s_iop_a32_stats.wait_resume_cache_misses = snapshot.wait_resume_cache_misses;

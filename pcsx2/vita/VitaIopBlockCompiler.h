@@ -51,6 +51,7 @@ namespace VitaIOP
 		u64 hot_dispatch_cache_misses;
 		u64 hot_dispatch_cache_way_probes;
 		u64 hot_dispatch_trusted_raw_hits;
+		u64 hot_dispatch_owned_hits;
 		u64 wait_resume_cache_attempts;
 		u64 wait_resume_cache_hits;
 		u64 wait_resume_cache_misses;
@@ -531,6 +532,7 @@ namespace VitaIOP
 		static void SetSequentialQwordCopyEnabled(bool enabled);
 		static void SetBranchTestSchedulingEnabled(bool enabled);
 		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
+		static void SetHotDispatchOwnershipEnabled(bool enabled);
 		static void SetCachedWaitDescriptorEnabled(bool enabled);
 		static void SetInlineWaitFastForwardEnabled(bool enabled);
 		static void SetWaitResumeCacheEnabled(bool enabled);
@@ -774,6 +776,7 @@ namespace VitaIOP
 		u64 m_hot_dispatch_cache_misses = 0;
 		u64 m_hot_dispatch_cache_way_probes = 0;
 		u64 m_hot_dispatch_trusted_raw_hits = 0;
+		u64 m_hot_dispatch_owned_hits = 0;
 		u64 m_wait_resume_cache_attempts = 0;
 		u64 m_wait_resume_cache_hits = 0;
 		u64 m_wait_resume_cache_misses = 0;
