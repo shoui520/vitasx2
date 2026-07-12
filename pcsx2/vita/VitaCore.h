@@ -110,6 +110,7 @@ struct VitaA32IopProviderStats
 	u64 linked_frame_stack_words_removed = 0;
 	u64 pinned_gpr_memory_ops_saved = 0;
 	u64 pinned_branch_operand_moves_removed = 0;
+	u64 condition_code_branch_instructions_removed = 0;
 #endif
 };
 

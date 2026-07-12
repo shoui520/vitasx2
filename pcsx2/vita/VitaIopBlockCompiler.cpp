@@ -58,6 +58,7 @@ static QemuIopLinkedFrameEvidence s_qemuIopLinkedFrameEvidence;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
 static bool s_qemuIopPinnedGprResidencyEnabled = true;
 static bool s_qemuIopPinnedBranchDirectCompareEnabled = true;
+static bool s_qemuIopConditionCodeBranchEnabled = true;
 static bool s_qemuIopClockModeSpecializationEnabled = true;
 static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
@@ -616,6 +617,58 @@ namespace
 			case 0x06: // BLEZ
 			case 0x07: // BGTZ
 				return true;
+			default:
+				return false;
+		}
+	}
+
+	constexpr bool IopDelayInstructionPreservesHostFlags(u32 op)
+	{
+		// PCSX2 owners: x86/iR3000Atables.cpp::rpsxBEQ_process(),
+		// rpsxBNE_process(), and the signed branch routines preserve separate
+		// taken/fallthrough delay-slot state. On A32, a delay template proven not
+		// to write CPSR can instead leave the branch comparison live until the
+		// common delay slot has executed.
+		// These native A32 templates use non-S data-processing operations (or
+		// loads/stores) only. Compare-producing SLT/SLTU and helper/memory paths
+		// are intentionally excluded. This lets a final branch consume CPSR after
+		// its architectural delay slot without changing MIPS delay semantics.
+		switch (op >> 26)
+		{
+			case 0x00: // SPECIAL
+				switch (op & 0x3f)
+				{
+					case 0x00: // SLL (including NOP)
+					case 0x02: // SRL
+					case 0x03: // SRA
+					case 0x04: // SLLV
+					case 0x06: // SRLV
+					case 0x07: // SRAV
+					case 0x10: // MFHI
+					case 0x11: // MTHI
+					case 0x12: // MFLO
+					case 0x13: // MTLO
+					case 0x20: // ADD
+					case 0x21: // ADDU
+					case 0x22: // SUB
+					case 0x23: // SUBU
+					case 0x24: // AND
+					case 0x25: // OR
+					case 0x26: // XOR
+					case 0x27: // NOR
+						return true;
+					default:
+						return false;
+				}
+
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+			case 0x0c: // ANDI
+			case 0x0d: // ORI
+			case 0x0e: // XORI
+			case 0x0f: // LUI
+				return true;
+
 			default:
 				return false;
 		}
@@ -4422,14 +4475,25 @@ namespace VitaIOP
 			return true;
 		}
 
-		if (!EmitCompareGprs(RS(op), RT(op)) ||
-			!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0))
+		if (!EmitCompareGprs(RS(op), RT(op)))
 		{
 			return false;
 		}
 
-		return m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1,
-			((op >> 26) == 0x04) ? VitaA32::Condition::EQ : VitaA32::Condition::NE);
+		const VitaA32::Condition taken =
+			branch_on_equal ? VitaA32::Condition::EQ : VitaA32::Condition::NE;
+		if (m_emit_native_static_branch_flags)
+		{
+			m_static_branch_flags_live = true;
+			m_static_branch_taken_condition = taken;
+			m_condition_code_branch_instructions_removed = 3;
+			return true;
+		}
+
+		if (!m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0))
+			return false;
+
+		return m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, taken);
 	}
 
 	bool BlockCompiler::EmitSignedBranchOp(u32 op, u32 pc)
@@ -4618,10 +4682,21 @@ namespace VitaIOP
 			m_pinned_branch_operand_moves_removed++;
 		}
 
-		return (pinned_host >= 0 || EmitLoadGpr(RS(op), HOST_TMP0)) &&
-			   m_code.EmitCmpImm32(compare_host, 0) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
-			   m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, taken);
+		if (!(pinned_host >= 0 || EmitLoadGpr(RS(op), HOST_TMP0)) ||
+			!m_code.EmitCmpImm32(compare_host, 0))
+		{
+			return false;
+		}
+		if (m_emit_native_static_branch_flags)
+		{
+			m_static_branch_flags_live = true;
+			m_static_branch_taken_condition = taken;
+			m_condition_code_branch_instructions_removed = 3;
+			return true;
+		}
+
+		return m_code.EmitMovImm8(HOST_BRANCH_FLAG, 0) &&
+			m_code.EmitMovImm8(HOST_BRANCH_FLAG, 1, taken);
 	}
 
 	bool BlockCompiler::EmitJumpOp(u32 op, u32 pc)
@@ -5503,6 +5578,9 @@ namespace VitaIOP
 		m_iop_ram_mask_register_available = false;
 		m_static_branch_outcome_known = false;
 		m_static_branch_taken = false;
+		m_static_branch_flags_live = false;
+		m_static_branch_taken_condition = VitaA32::Condition::AL;
+		m_condition_code_branch_instructions_removed = 0;
 		m_register_jump_target_known = false;
 		m_register_jump_target = 0;
 		u32 runtime_memory_helper_seams = 0;
@@ -5595,6 +5673,14 @@ namespace VitaIOP
 				i + 2 == instruction_count &&
 				!IsIopBranchOrJumpOpcode(delay_op) &&
 				!IsIopExceptionOpcode(delay_op);
+			bool condition_code_branch_enabled = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+			condition_code_branch_enabled = s_qemuIopConditionCodeBranchEnabled;
+#endif
+			const bool can_keep_static_branch_flags =
+				can_native_static_branch && m_defer_cycle_updates &&
+				condition_code_branch_enabled &&
+				IopDelayInstructionPreservesHostFlags(delay_op);
 			const bool can_native_static_jump =
 				IsIopStaticJumpOpcode(op) &&
 				i + 2 == instruction_count &&
@@ -5607,6 +5693,7 @@ namespace VitaIOP
 				!IsIopBranchOrJumpOpcode(delay_op) &&
 				!IsIopExceptionOpcode(delay_op);
 			m_emit_native_static_branch = can_native_static_branch;
+			m_emit_native_static_branch_flags = can_keep_static_branch_flags;
 			m_emit_native_static_jump = can_native_static_jump;
 			m_emit_native_register_jump = can_native_register_jump;
 			if (can_native_static_branch)
@@ -5629,6 +5716,7 @@ namespace VitaIOP
 			m_current_instruction_count = i + 1;
 			const bool emitted = CanCompileOpcode(op) && EmitInstruction(op, pc, store_pc, trace_exit_branches);
 			m_emit_native_static_branch = false;
+			m_emit_native_static_branch_flags = false;
 			m_emit_native_static_jump = false;
 			m_emit_native_register_jump = false;
 			if (!emitted)
@@ -5636,7 +5724,8 @@ namespace VitaIOP
 		}
 
 		const u32 next_pc = start_pc + instruction_count * 4;
-		if (m_defer_cycle_updates && !EmitPublishCyclePrefix(instruction_count))
+		if (m_defer_cycle_updates && !m_static_branch_flags_live &&
+			!EmitPublishCyclePrefix(instruction_count))
 			return false;
 		if (m_expanded_cycle_batching)
 			RecordBatchedCycleExitSavings(instruction_count, false);
@@ -5687,23 +5776,34 @@ namespace VitaIOP
 			}
 			else
 			{
-				if (!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
+				// PCSX2 owner: x86/iR3000A.cpp::iPsxBranchTest() publishes
+				// the completed block's cycles and performs the event test only on
+				// the taken branch arm. Publishing after the conditional A32 branch
+				// keeps CPSR live through the delay slot while retaining that split.
+				const VitaA32::Condition taken_condition = m_static_branch_flags_live ?
+					m_static_branch_taken_condition : VitaA32::Condition::NE;
+				if (!m_static_branch_flags_live &&
+					!m_code.EmitCmpImm32(HOST_BRANCH_FLAG, 0))
 				{
 					return false;
 				}
 
-				const size_t taken_path = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+				const size_t taken_path = m_code.EmitBranchPlaceholder(taken_condition);
 				if (taken_path == static_cast<size_t>(-1))
 					return false;
 
-				if (!EmitStorePc(static_branch_fallthrough_pc) ||
+				if ((m_static_branch_flags_live &&
+						!EmitPublishCyclePrefix(instruction_count)) ||
+					!EmitStorePc(static_branch_fallthrough_pc) ||
 					!emit_direct_or_return_tail(static_branch_fallthrough_pc, 0))
 				{
 					return false;
 				}
 
 				const size_t taken_path_target = m_code.Size();
-				if (!m_code.PatchBranch(taken_path, taken_path_target, VitaA32::Condition::NE) ||
+				if (!m_code.PatchBranch(taken_path, taken_path_target, taken_condition) ||
+					(m_static_branch_flags_live &&
+						!EmitPublishCyclePrefix(instruction_count)) ||
 					!EmitStorePc(static_branch_target_pc) ||
 					!EmitIopEventTestFastPath() ||
 					!EmitPcChangedExitCheck(static_branch_target_pc, direct_exit_branches) ||
@@ -5921,6 +6021,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopPinnedBranchDirectCompareEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetConditionCodeBranchEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopConditionCodeBranchEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -7175,6 +7284,7 @@ namespace VitaIOP
 		u32 helper_instruction_count = 0;
 		u32 pinned_gpr_memory_ops_saved = 0;
 		u32 pinned_branch_operand_moves_removed = 0;
+		u32 condition_code_branch_instructions_removed = 0;
 		u32 clock_mode_check_instructions_removed = 0;
 		u32 saved_register_stack_words_removed = 0;
 		u32 saved_register_frame_instructions_added = 0;
@@ -7222,6 +7332,8 @@ namespace VitaIOP
 				pinned_gpr_memory_ops_saved = compiler.PinnedGprMemoryOpsSaved();
 				pinned_branch_operand_moves_removed =
 					compiler.PinnedBranchOperandMovesRemoved();
+				condition_code_branch_instructions_removed =
+					compiler.ConditionCodeBranchInstructionsRemoved();
 				clock_mode_check_instructions_removed = compiler.ClockModeCheckInstructionsRemoved();
 				saved_register_stack_words_removed = compiler.SavedRegisterStackWordsRemoved();
 				saved_register_frame_instructions_added = compiler.SavedRegisterFrameInstructionsAdded();
@@ -7255,6 +7367,8 @@ namespace VitaIOP
 		block.pinned_gpr_memory_ops_saved = pinned_gpr_memory_ops_saved;
 		block.pinned_branch_operand_moves_removed =
 			pinned_branch_operand_moves_removed;
+		block.condition_code_branch_instructions_removed =
+			condition_code_branch_instructions_removed;
 		block.clock_mode_check_instructions_removed = clock_mode_check_instructions_removed;
 		block.saved_register_stack_words_removed = saved_register_stack_words_removed;
 		block.saved_register_frame_instructions_added = saved_register_frame_instructions_added;
@@ -7403,6 +7517,8 @@ namespace VitaIOP
 		result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
 		result->pinned_branch_operand_moves_removed =
 			block.pinned_branch_operand_moves_removed;
+		result->condition_code_branch_instructions_removed =
+			block.condition_code_branch_instructions_removed;
 		SnapshotInstrumentation(result);
 #endif
 	}
@@ -7474,6 +7590,8 @@ namespace VitaIOP
 				result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
 				result->pinned_branch_operand_moves_removed =
 					block.pinned_branch_operand_moves_removed;
+				result->condition_code_branch_instructions_removed =
+					block.condition_code_branch_instructions_removed;
 			}
 #endif
 			result->wait_loop_fast_forward = true;
@@ -7512,6 +7630,8 @@ namespace VitaIOP
 			result->pinned_gpr_memory_ops_saved = block.pinned_gpr_memory_ops_saved;
 			result->pinned_branch_operand_moves_removed =
 				block.pinned_branch_operand_moves_removed;
+			result->condition_code_branch_instructions_removed =
+				block.condition_code_branch_instructions_removed;
 		}
 #endif
 		return true;
