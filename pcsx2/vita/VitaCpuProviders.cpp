@@ -52,6 +52,7 @@ static std::unordered_map<u32, IopDispatchProfileEntry> s_iop_a32_dispatch_profi
 static std::unordered_map<u64, u64> s_iop_a32_dispatch_edge_profile;
 static bool s_iop_a32_compact_provider_dispatch_enabled = true;
 static bool s_iop_a32_runtime_stats_enabled = true;
+static bool s_iop_a32_private_dispatcher_enabled = true;
 static u64 s_iop_a32_compact_provider_dispatch_entries = 0;
 static u64 s_iop_a32_compact_provider_cache_hit_entries = 0;
 #endif
@@ -760,6 +761,12 @@ static void psxRecReset()
 
 static s32 psxRecExecuteBlock(s32 eeCycles)
 {
+#if !defined(VITASX2_QEMU_VALIDATION)
+	return s_iop_a32_executor.ExecuteProviderTimeslice(eeCycles);
+#else
+	if (s_iop_a32_private_dispatcher_enabled)
+		return s_iop_a32_executor.ExecuteProviderTimeslice(eeCycles);
+
 	psxRegs.iopBreak = 0;
 	psxRegs.iopCycleEE = eeCycles;
 
@@ -893,6 +900,7 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 	}
 
 	return psxRegs.iopBreak + psxRegs.iopCycleEE;
+#endif
 }
 
 static void psxRecClear(u32 addr, u32 size)
@@ -1125,6 +1133,11 @@ void VitaSetA32IopRuntimeStatsEnabled(bool enabled)
 {
 	s_iop_a32_runtime_stats_enabled = enabled;
 }
+
+void VitaSetA32IopPrivateDispatcherEnabled(bool enabled)
+{
+	s_iop_a32_private_dispatcher_enabled = enabled;
+}
 #endif
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
@@ -1203,9 +1216,23 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 		s_iop_a32_stats.executed_blocks > s_iop_a32_stats.cache_misses ?
 			s_iop_a32_stats.executed_blocks - s_iop_a32_stats.cache_misses : 0;
 	s_iop_a32_stats.provider_runtime_stats_instructions_removed =
-		static_cast<u64>(s_iop_a32_stats.cache_hits) * 20u +
-		ordinary_cache_hits * 6u +
-		s_iop_a32_stats.wait_loop_fast_forwards * 20u;
+		snapshot.private_dispatcher_provider_entries == 0 ?
+			static_cast<u64>(s_iop_a32_stats.cache_hits) * 20u +
+				ordinary_cache_hits * 6u +
+				s_iop_a32_stats.wait_loop_fast_forwards * 20u : 0;
+	s_iop_a32_stats.private_dispatcher_calls = snapshot.private_dispatcher_calls;
+	s_iop_a32_stats.private_dispatcher_provider_entries =
+		snapshot.private_dispatcher_provider_entries;
+	s_iop_a32_stats.private_dispatcher_wait_forwards =
+		snapshot.private_dispatcher_wait_forwards;
+	s_iop_a32_stats.private_dispatcher_generated_entries =
+		snapshot.private_dispatcher_generated_entries;
+	s_iop_a32_stats.private_dispatcher_fallbacks = snapshot.private_dispatcher_fallbacks;
+	// Inlining the provider body removes at least the caller BL and callee
+	// return on every successful entry. Exclude argument setup, prologue,
+	// epilogue, and any optimizer-visible state reuse from this lower bound.
+	s_iop_a32_stats.private_dispatcher_control_transfers_removed =
+		snapshot.private_dispatcher_provider_entries * 2u;
 	s_iop_a32_stats.pinned_gpr_memory_ops_saved =
 		snapshot.total_pinned_gpr_memory_ops_saved;
 	s_iop_a32_stats.pinned_branch_operand_moves_removed =

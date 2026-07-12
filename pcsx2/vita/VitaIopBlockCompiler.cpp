@@ -6688,6 +6688,11 @@ namespace VitaIOP
 		m_source_page_guard_instructions_removed = 0;
 		m_source_page_literal_instructions_removed = 0;
 		m_isolate_cache_guard_instructions_removed = 0;
+		m_private_dispatcher_calls = 0;
+		m_private_dispatcher_provider_entries = 0;
+		m_private_dispatcher_wait_forwards = 0;
+		m_private_dispatcher_generated_entries = 0;
+		m_private_dispatcher_fallbacks = 0;
 		s_qemuIopLinkedFrameEvidence = {};
 		s_qemuIopSequentialQwordCopyFastPaths = 0;
 		s_qemuIopBranchEventCandidates = 0;
@@ -8420,6 +8425,11 @@ namespace VitaIOP
 		// differences, the rare source-page Clear call, and every cold fallback.
 		result->sequential_qword_copy_instructions_removed =
 			static_cast<u64>(s_qemuIopSequentialQwordCopyFastPaths) * 36u;
+		result->private_dispatcher_calls = m_private_dispatcher_calls;
+		result->private_dispatcher_provider_entries = m_private_dispatcher_provider_entries;
+		result->private_dispatcher_wait_forwards = m_private_dispatcher_wait_forwards;
+		result->private_dispatcher_generated_entries = m_private_dispatcher_generated_entries;
+		result->private_dispatcher_fallbacks = m_private_dispatcher_fallbacks;
 		result->branch_event_candidates = s_qemuIopBranchEventCandidates;
 		result->branch_event_budget_positive =
 			s_qemuIopBranchEventBudgetPositive;
@@ -8703,7 +8713,7 @@ namespace VitaIOP
 		return ExecuteCompiledBlock(start_pc, scan.instruction_count, result, publish_details);
 	}
 
-	u32 BlockExecutor::ExecuteProviderBlockAtPc(
+	inline __attribute__((always_inline)) u32 BlockExecutor::ExecuteProviderBlockAtPcInline(
 		u32 start_pc, ProviderCompileResult* compile_result)
 	{
 		if ((start_pc & 0x3u) != 0)
@@ -8792,5 +8802,61 @@ namespace VitaIOP
 			compile_result->code_cache_resets = m_code_cache_resets;
 		}
 		return RunProviderBlock(*block, 0);
+	}
+
+	u32 BlockExecutor::ExecuteProviderBlockAtPc(
+		u32 start_pc, ProviderCompileResult* compile_result)
+	{
+		return ExecuteProviderBlockAtPcInline(start_pc, compile_result);
+	}
+
+	s32 BlockExecutor::ExecuteProviderTimeslice(s32 ee_cycles)
+	{
+		// PCSX2 owner: x86/iR3000A.cpp::_DynGen_EnterRecompiledCode() keeps
+		// lookup, generated entry, wait forwarding, and the timeslice return in
+		// one private dispatcher. Keeping this loop beside the cache implementation
+		// lets Cortex-A9 inline the provider lookup instead of crossing AAPCS once
+		// per generated block or wait forward.
+		psxRegs.iopBreak = 0;
+		psxRegs.iopCycleEE = ee_cycles;
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_private_dispatcher_calls++;
+#endif
+
+		while (psxRegs.iopCycleEE > 0)
+		{
+			if ((psxHu32(HW_ICFG) & 8) &&
+				((psxRegs.pc & 0x1fffffffu) == 0xa0 ||
+				 (psxRegs.pc & 0x1fffffffu) == 0xb0 ||
+				 (psxRegs.pc & 0x1fffffffu) == 0xc0))
+			{
+				psxBiosCall();
+			}
+
+			const u32 dispatch_flags =
+				ExecuteProviderBlockAtPcInline(psxRegs.pc, nullptr);
+			if ((dispatch_flags & ProviderDispatchSuccess) == 0)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				m_private_dispatcher_fallbacks++;
+#endif
+				return psxInt.ExecuteBlock(psxRegs.iopCycleEE);
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_private_dispatcher_provider_entries++;
+#endif
+			if ((dispatch_flags & ProviderDispatchWaitForward) != 0)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				m_private_dispatcher_wait_forwards++;
+#endif
+				continue;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_private_dispatcher_generated_entries++;
+#endif
+		}
+
+		return psxRegs.iopBreak + psxRegs.iopCycleEE;
 	}
 } // namespace VitaIOP

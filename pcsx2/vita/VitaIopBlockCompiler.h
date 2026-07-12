@@ -75,6 +75,11 @@ namespace VitaIOP
 		u64 linked_frame_stack_words_removed;
 		u64 sequential_qword_copy_fast_paths;
 		u64 sequential_qword_copy_instructions_removed;
+		u64 private_dispatcher_calls;
+		u64 private_dispatcher_provider_entries;
+		u64 private_dispatcher_wait_forwards;
+		u64 private_dispatcher_generated_entries;
+		u64 private_dispatcher_fallbacks;
 		u64 branch_event_candidates;
 		u64 branch_event_budget_positive;
 		u64 branch_event_tests_entered;
@@ -484,6 +489,7 @@ namespace VitaIOP
 		bool ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result,
 			bool publish_details = true);
 		u32 ExecuteProviderBlockAtPc(u32 start_pc, ProviderCompileResult* compile_result);
+		s32 ExecuteProviderTimeslice(s32 ee_cycles);
 
 	private:
 		// PCSX2 owner: x86/BaseblockEx.h::BaseBlocks() starts at 0x4000
@@ -645,6 +651,8 @@ namespace VitaIOP
 		void PublishExecutionDetails(const CachedBlock& block, BlockExecutionResult* result) const;
 		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result, bool publish_details);
 		u32 RunProviderBlock(CachedBlock& block, u32 dispatch_flags);
+		inline __attribute__((always_inline)) u32 ExecuteProviderBlockAtPcInline(
+			u32 start_pc, ProviderCompileResult* compile_result);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
 		void PatchIncomingLinks(CachedBlock& target);
@@ -699,6 +707,11 @@ namespace VitaIOP
 		u64 m_source_page_guard_instructions_removed = 0;
 		u64 m_source_page_literal_instructions_removed = 0;
 		u64 m_isolate_cache_guard_instructions_removed = 0;
+		u64 m_private_dispatcher_calls = 0;
+		u64 m_private_dispatcher_provider_entries = 0;
+		u64 m_private_dispatcher_wait_forwards = 0;
+		u64 m_private_dispatcher_generated_entries = 0;
+		u64 m_private_dispatcher_fallbacks = 0;
 #endif
 		bool m_direct_linking_enabled = true;
 	};
