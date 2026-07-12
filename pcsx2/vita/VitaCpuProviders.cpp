@@ -37,10 +37,13 @@ static VitaEePreInstructionTraceCallback s_ee_pre_instruction_trace_callback = n
 static VitaEePreInstructionTraceWindowSkipCallback s_ee_pre_instruction_trace_window_skip_callback = nullptr;
 static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback = nullptr;
 static VitaEE::BlockExecutor s_ee_a32_executor;
-static VitaIOP::BlockExecutor s_iop_a32_executor;
+static VitaIOP::BlockExecutor s_iop_a32_executor{true};
 #if defined(__arm__)
+static uptr s_iop_wait_resume_event_context = 0;
 bool g_vita_a32_iop_private_event_entry_available =
 	VitaIOP::VitaIopA32PrivateTimesliceEntrySupported();
+bool g_vita_a32_iop_private_wait_resume_entry_available =
+	VitaIOP::VitaIopA32PrivateWaitResumeEntrySupported();
 extern "C" s32 VitaIopA32ExecuteProviderTimesliceAapcs(void*, s32 ee_cycles)
 {
 	return psxCpu->ExecuteBlock(ee_cycles);
@@ -49,6 +52,7 @@ VitaA32IopEventEntry g_vita_a32_iop_event_entry = {
 	0, reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimesliceAapcs)};
 #else
 bool g_vita_a32_iop_private_event_entry_available = false;
+bool g_vita_a32_iop_private_wait_resume_entry_available = false;
 #endif
 static VitaA32EeProviderStats s_ee_a32_stats;
 static VitaA32IopProviderStats s_iop_a32_stats;
@@ -66,6 +70,7 @@ static bool s_iop_a32_compact_provider_dispatch_enabled = true;
 static bool s_iop_a32_runtime_stats_enabled = true;
 static bool s_iop_a32_private_dispatcher_enabled = true;
 bool g_vita_a32_iop_private_event_entry_enabled = true;
+bool g_vita_a32_iop_wait_resume_event_entry_enabled = true;
 u64 g_vita_a32_iop_private_event_entries = 0;
 static u64 s_iop_a32_compact_provider_dispatch_entries = 0;
 static u64 s_iop_a32_compact_provider_cache_hit_entries = 0;
@@ -91,9 +96,17 @@ static void UpdateIopEventEntry()
 	if (psxCpu == &psxRec && private_enabled &&
 		g_vita_a32_iop_private_event_entry_available)
 	{
-		g_vita_a32_iop_event_entry.context =
+		const bool wait_resume = s_iop_wait_resume_event_context != 0 &&
+			g_vita_a32_iop_private_wait_resume_entry_available
+#if defined(VITASX2_QEMU_VALIDATION)
+			&& g_vita_a32_iop_wait_resume_event_entry_enabled
+#endif
+			;
+		g_vita_a32_iop_event_entry.context = wait_resume ?
+			s_iop_wait_resume_event_context :
 			reinterpret_cast<uptr>(&s_iop_a32_executor);
-		g_vita_a32_iop_event_entry.target =
+		g_vita_a32_iop_event_entry.target = wait_resume ?
+			reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderWaitResumePrivate) :
 			reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimeslicePrivate);
 	}
 	else
@@ -102,6 +115,12 @@ static void UpdateIopEventEntry()
 		g_vita_a32_iop_event_entry.target =
 			reinterpret_cast<uptr>(&VitaIopA32ExecuteProviderTimesliceAapcs);
 	}
+}
+
+void VitaSetA32IopWaitResumeEventEntry(uptr context)
+{
+	s_iop_wait_resume_event_context = context;
+	UpdateIopEventEntry();
 }
 #endif
 
@@ -1218,6 +1237,14 @@ void VitaSetA32IopWaitResumeCacheEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetWaitResumeCacheEnabled(enabled);
 }
+
+void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled)
+{
+	g_vita_a32_iop_wait_resume_event_entry_enabled = enabled;
+#if defined(__arm__)
+	UpdateIopEventEntry();
+#endif
+}
 #endif
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
@@ -1233,6 +1260,11 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	s_iop_a32_stats.wait_resume_cache_attempts = snapshot.wait_resume_cache_attempts;
 	s_iop_a32_stats.wait_resume_cache_hits = snapshot.wait_resume_cache_hits;
 	s_iop_a32_stats.wait_resume_cache_misses = snapshot.wait_resume_cache_misses;
+	s_iop_a32_stats.wait_resume_event_entries = snapshot.wait_resume_event_entries;
+	s_iop_a32_stats.wait_resume_event_forwards = snapshot.wait_resume_event_forwards;
+	s_iop_a32_stats.wait_resume_event_fallbacks = snapshot.wait_resume_event_fallbacks;
+	s_iop_a32_stats.wait_resume_event_installs = snapshot.wait_resume_event_installs;
+	s_iop_a32_stats.wait_resume_event_clears = snapshot.wait_resume_event_clears;
 	s_iop_a32_stats.direct_budget_exit_provider_entries =
 		snapshot.direct_budget_exit_provider_entries;
 	s_iop_a32_stats.constant_cycle_budget_provider_entries =

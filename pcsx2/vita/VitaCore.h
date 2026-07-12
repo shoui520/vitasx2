@@ -15,12 +15,17 @@ void VitaSelectA32EeIopCpuProviders();
 void VitaSelectConfiguredCpuProviders();
 
 extern bool g_vita_a32_iop_private_event_entry_available;
+extern bool g_vita_a32_iop_private_wait_resume_entry_available;
 #if defined(__arm__)
 extern "C" s32 VitaIopA32ExecuteProviderTimeslicePrivate(
 	void* context, s32 ee_cycles);
+extern "C" s32 VitaIopA32ExecuteProviderWaitResumePrivate(
+	void* context, s32 ee_cycles);
+void VitaSetA32IopWaitResumeEventEntry(uptr context);
 namespace VitaIOP
 {
 	bool VitaIopA32PrivateTimesliceEntrySupported();
+	bool VitaIopA32PrivateWaitResumeEntrySupported();
 }
 
 struct alignas(8) VitaA32IopEventEntry
@@ -44,13 +49,15 @@ inline __attribute__((always_inline)) s32 VitaExecuteA32IopTimesliceFromEeEvent(
 		: "=r"(context_and_result), "+r"(cycles), [entry] "+r"(entry)
 		:
 		: "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12",
-		  "lr", "cc", "memory");
+		  "lr", "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15",
+		  "cc", "memory");
 	return static_cast<s32>(context_and_result);
 }
 #endif
 
 #if defined(VITASX2_QEMU_VALIDATION)
 extern bool g_vita_a32_iop_private_event_entry_enabled;
+extern bool g_vita_a32_iop_wait_resume_event_entry_enabled;
 extern u64 g_vita_a32_iop_private_event_entries;
 #endif
 
@@ -130,6 +137,11 @@ struct VitaA32IopProviderStats
 	u64 wait_resume_cache_attempts = 0;
 	u64 wait_resume_cache_hits = 0;
 	u64 wait_resume_cache_misses = 0;
+	u64 wait_resume_event_entries = 0;
+	u64 wait_resume_event_forwards = 0;
+	u64 wait_resume_event_fallbacks = 0;
+	u64 wait_resume_event_installs = 0;
+	u64 wait_resume_event_clears = 0;
 	u64 direct_budget_exit_provider_entries = 0;
 	u64 constant_cycle_budget_provider_entries = 0;
 	u64 validation_calls = 0;
@@ -240,6 +252,7 @@ void VitaSetA32IopPrivateHotPathEnabled(bool enabled);
 void VitaSetA32IopCachedWaitDescriptorEnabled(bool enabled);
 void VitaSetA32IopInlineWaitFastForwardEnabled(bool enabled);
 void VitaSetA32IopWaitResumeCacheEnabled(bool enabled);
+void VitaSetA32IopWaitResumeEventEntryEnabled(bool enabled);
 VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile();
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles);
 void VitaRecordA32IopWaitLoopDispatchElision();

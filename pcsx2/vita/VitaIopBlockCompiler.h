@@ -54,6 +54,11 @@ namespace VitaIOP
 		u64 wait_resume_cache_attempts;
 		u64 wait_resume_cache_hits;
 		u64 wait_resume_cache_misses;
+		u64 wait_resume_event_entries;
+		u64 wait_resume_event_forwards;
+		u64 wait_resume_event_fallbacks;
+		u64 wait_resume_event_installs;
+		u64 wait_resume_event_clears;
 		u64 direct_budget_exit_provider_entries;
 		u64 constant_cycle_budget_provider_entries;
 		u64 validation_calls;
@@ -488,7 +493,7 @@ namespace VitaIOP
 	public:
 		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 64;
 
-		BlockExecutor();
+		explicit BlockExecutor(bool owns_ee_event_entry = false);
 		~BlockExecutor();
 
 		u32 Reset();
@@ -703,11 +708,18 @@ namespace VitaIOP
 			u32 start_pc, ProviderCompileResult* compile_result, u32* dispatch_flags);
 		inline __attribute__((always_inline)) u32 ExecuteProviderBlockAtPcInline(
 			u32 start_pc, ProviderCompileResult* compile_result);
+		inline __attribute__((always_inline)) s32 ExecuteProviderTimesliceLoop();
+		__attribute__((noinline, cold)) s32 ExecuteProviderTimesliceRemainder();
 #if defined(__arm__)
 		__attribute__((no_stack_protector))
 		__attribute__((noinline)) s32 ExecuteProviderTimeslicePrivateBody(
 			s32 ee_cycles) __asm__("VitaIopA32ProviderTimesliceBody");
+		__attribute__((no_stack_protector, noinline)) s32
+			ExecuteProviderWaitResumePrivateBody(s32 ee_cycles, CachedBlock* block)
+				__asm__("VitaIopA32ProviderWaitResumeBody");
 #endif
+		void SetWaitResumeBlock(CachedBlock* block);
+		void ClearWaitResumeBlock();
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		const void* ProviderEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
@@ -727,6 +739,12 @@ namespace VitaIOP
 			HOT_DISPATCH_CACHE_SET_COUNT>, 2> m_hot_dispatch_cache{};
 		bool m_active_isolate_cache_mode = false;
 		CachedBlock* m_wait_resume_block = nullptr;
+		struct WaitResumeEventContext
+		{
+			BlockExecutor* executor = nullptr;
+			CachedBlock* block = nullptr;
+		} m_wait_resume_event_context;
+		bool m_owns_ee_event_entry = false;
 		u32 m_next_source_serial = 1;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;
@@ -740,6 +758,11 @@ namespace VitaIOP
 		u64 m_wait_resume_cache_attempts = 0;
 		u64 m_wait_resume_cache_hits = 0;
 		u64 m_wait_resume_cache_misses = 0;
+		u64 m_wait_resume_event_entries = 0;
+		u64 m_wait_resume_event_forwards = 0;
+		u64 m_wait_resume_event_fallbacks = 0;
+		u64 m_wait_resume_event_installs = 0;
+		u64 m_wait_resume_event_clears = 0;
 		u64 m_direct_budget_exit_provider_entries = 0;
 		u64 m_constant_cycle_budget_provider_entries = 0;
 		u64 m_validation_calls = 0;
