@@ -74,6 +74,7 @@ namespace VitaIOP
 		u32 pinned_gpr_memory_ops_saved;
 		u32 pinned_branch_operand_moves_removed;
 		u32 condition_code_branch_instructions_removed;
+		u32 producer_branch_compare_instructions_removed;
 #endif
 		bool cache_hit;
 		bool lookup_hit;
@@ -128,6 +129,10 @@ namespace VitaIOP
 		u32 ConditionCodeBranchInstructionsRemoved() const
 		{
 			return m_condition_code_branch_instructions_removed;
+		}
+		u32 ProducerBranchCompareInstructionsRemoved() const
+		{
+			return m_producer_branch_compare_instructions_removed;
 		}
 
 	private:
@@ -303,6 +308,7 @@ namespace VitaIOP
 		u32 m_pinned_gpr_memory_ops_saved = 0;
 		u32 m_pinned_branch_operand_moves_removed = 0;
 		u32 m_condition_code_branch_instructions_removed = 0;
+		u32 m_producer_branch_compare_instructions_removed = 0;
 		u32 m_pinned_gpr_min_exit_savings = UINT32_MAX;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
@@ -324,12 +330,16 @@ namespace VitaIOP
 		bool m_emit_trace_checks = false;
 		bool m_emit_native_static_branch = false;
 		bool m_emit_native_static_branch_flags = false;
+		bool m_emit_branch_predicate_producer = false;
 		bool m_emit_native_static_jump = false;
 		bool m_emit_native_register_jump = false;
 		bool m_static_branch_outcome_known = false;
 		bool m_static_branch_taken = false;
 		bool m_static_branch_flags_live = false;
 		VitaA32::Condition m_static_branch_taken_condition = VitaA32::Condition::AL;
+		bool m_branch_predicate_producer_flags_live = false;
+		unsigned m_branch_predicate_producer_guest = 0;
+		VitaA32::Condition m_branch_predicate_producer_true_condition = VitaA32::Condition::AL;
 		bool m_register_jump_target_known = false;
 		u32 m_register_jump_target = 0;
 		std::array<u32, 32> m_gpr_const_values{};
@@ -358,6 +368,7 @@ namespace VitaIOP
 		static void SetPinnedGprResidencyEnabled(bool enabled);
 		static void SetPinnedBranchDirectCompareEnabled(bool enabled);
 		static void SetConditionCodeBranchEnabled(bool enabled);
+		static void SetProducerBranchFlagsEnabled(bool enabled);
 		static void SetClockModeSpecializationEnabled(bool enabled);
 		static void SetSavedRegisterNarrowingEnabled(bool enabled);
 		static void SetBlockCycleBatchingEnabled(bool enabled);
@@ -418,6 +429,7 @@ namespace VitaIOP
 			u32 pinned_gpr_memory_ops_saved = 0;
 			u32 pinned_branch_operand_moves_removed = 0;
 			u32 condition_code_branch_instructions_removed = 0;
+			u32 producer_branch_compare_instructions_removed = 0;
 			u32 clock_mode_check_instructions_removed = 0;
 			u32 saved_register_stack_words_removed = 0;
 			u32 saved_register_frame_instructions_added = 0;
