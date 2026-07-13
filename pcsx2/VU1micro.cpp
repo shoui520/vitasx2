@@ -8,6 +8,9 @@
 #include <cmath>
 #include "VUmicro.h"
 #include "MTVU.h"
+#if defined(VITASX2_QEMU_VALIDATION)
+#include "DebugTools/MachineCheckpointTrace.h"
+#endif
 
 #ifdef PCSX2_DEBUG
 u32 vudump = 0;
@@ -73,6 +76,9 @@ void vu1ExecMicro(u32 addr)
 
 	CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
 	_vuExecMicroDebug(VU1);
+#if defined(VITASX2_QEMU_VALIDATION)
+	Pcsx2Trace::NotifyMachineCheckpointVu1ProgramStarted();
+#endif
 	if(!INSTANT_VU1)
 		CpuVU1->ExecuteBlock(1);
 	else

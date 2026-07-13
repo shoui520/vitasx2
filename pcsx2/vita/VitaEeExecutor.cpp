@@ -1095,12 +1095,6 @@ namespace VitaEE
 				}
 
 				const u32 delay_pc = pc + 4;
-				if ((delay_pc & 0xffcu) == 0)
-				{
-					result->stop = BlockScanStop::PageBoundary;
-					return true;
-				}
-
 				const u32 delay_op = memRead32(delay_pc);
 				if (!BlockCompiler::CanCompileDelaySlotOpcode(delay_op))
 				{
@@ -1376,11 +1370,13 @@ namespace VitaEE
 		if (matches && validate_source_words)
 		{
 			// PCSX2's x86 recompiler validates source words through recRAMCopy
-			// and protected-page invalidation. Vita blocks are page-bounded by
-			// ScanStraightLineBlock(), so a raw vmap pointer compare replaces
-			// the old per-opcode vtlb read loop on normal RAM/ROM/scratchpad
-			// dispatcher hits; handler-backed pages keep the exact memRead32()
-			// fallback.
+			// and protected-page invalidation. Ordinary Vita blocks are page-
+			// bounded, so a raw vmap pointer compare replaces the old per-opcode
+			// vtlb read loop on normal RAM/ROM/scratchpad dispatcher hits. PCSX2
+			// keeps a branch at the final page word together with its delay slot;
+			// that two-page block and handler-backed pages use the exact memRead32()
+			// fallback. InvalidateRange() checks the complete block span, so a write
+			// to either source page still discards the cached translation.
 			const u32 opcode_bytes = block.instruction_count * static_cast<u32>(sizeof(u32));
 			const u32 page_remaining =
 				vtlb_private::VTLB_PAGE_SIZE - (block.start_pc & vtlb_private::VTLB_PAGE_MASK);

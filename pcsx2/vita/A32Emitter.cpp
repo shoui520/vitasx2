@@ -90,6 +90,8 @@ namespace VitaA32
 		constexpr u32 VMOV_S = 0xeeb00a40u;
 		constexpr u32 VMOV_CORE_TO_S = 0xee000a10u;
 		constexpr u32 VMOV_S_TO_CORE = 0xee100a10u;
+		constexpr u32 VMRS_FPSCR = 0xeef10a10u;
+		constexpr u32 VMSR_FPSCR = 0xeee10a10u;
 		constexpr u32 VMOV_CORE_TO_D32_LANE = 0x0e000b10u;
 		constexpr u32 VMOV_D32_LANE_TO_CORE = 0x0e100b10u;
 		constexpr u32 VMOV_CORE_PAIR_TO_D = 0xec400b10u;
@@ -1395,6 +1397,20 @@ namespace VitaA32
 		if (!IsRegister(rt) || !IsSRegister(sd))
 			return false;
 		return EmitU32(EncodeVmovSToCore(rt, sd, condition));
+	}
+
+	bool CodeBuffer::EmitVmrsFpscr(unsigned rt)
+	{
+		if (!IsLowRegister(rt))
+			return false;
+		return EmitU32(EncodeVmrsFpscr(rt));
+	}
+
+	bool CodeBuffer::EmitVmsrFpscr(unsigned rt)
+	{
+		if (!IsLowRegister(rt))
+			return false;
+		return EmitU32(EncodeVmsrFpscr(rt));
 	}
 
 	bool CodeBuffer::EmitVmovCoreToD32Lane(unsigned dd, u8 lane, unsigned rt, Condition condition)
@@ -2892,6 +2908,18 @@ namespace VitaA32
 		pxAssert(IsSRegister(sd));
 		return (VMOV_S_TO_CORE & 0x0fffffffu) | CondBits(condition) |
 			((rt & 0xfu) << 12) | VfpSn(sd);
+	}
+
+	u32 EncodeVmrsFpscr(unsigned rt)
+	{
+		pxAssert(IsLowRegister(rt));
+		return VMRS_FPSCR | ((rt & 0xfu) << 12);
+	}
+
+	u32 EncodeVmsrFpscr(unsigned rt)
+	{
+		pxAssert(IsLowRegister(rt));
+		return VMSR_FPSCR | ((rt & 0xfu) << 12);
 	}
 
 	u32 EncodeVmovCoreToD32Lane(unsigned dd, u8 lane, unsigned rt, Condition condition)

@@ -16281,10 +16281,11 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCOP1MoveControlFast(u32 op)
 	{
-		// PCSX2 owners: FPU.cpp::MFC1()/MTC1()/CFC1()/CTC1() and
-		// x86/iFPU.cpp::recMFC1()/recMTC1()/recCFC1()/recCTC1(). The ARMv7
-		// validation oracle currently runs PCSX2's interpreter-owned FPU.cpp
-		// path, so CFC1 keeps that helper's raw fs=31 and fs=0 behavior here.
+		// PCSX2 owners: FPU.cpp::MFC1()/MTC1()/CTC1() and
+		// x86/iFPU.cpp::recMFC1()/recMTC1()/recCFC1()/recCTC1(). CFC1 must
+		// follow recCFC1(), which exposes FCR31 for every fs >= 16 after removing
+		// its always-zero bits and setting its always-one bits. The interpreter's
+		// raw fs=31 behavior is not the x86-64 JIT oracle used by game execution.
 		const unsigned rt = RT(op);
 		const unsigned fs = RD(op);
 		const auto load_rt_low = [this, rt](unsigned host_reg) {
@@ -16316,17 +16317,14 @@ namespace VitaEE
 					return true;
 	{
 					const unsigned result_reg = SelectGprLowResultHost(rt, HOST_TMP0);
-					if (fs == 31)
+					if (fs >= 16)
 	{
-						if (!m_code.EmitLdrImm12(result_reg, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))))
+						if (!m_code.EmitLdrImm12(result_reg, HOST_CPU_REGS, static_cast<u16>(FprcOffset(31))) ||
+							!EmitAndImm32OrReg(result_reg, result_reg, 0x0083c078u, HOST_TMP1) ||
+							!EmitOrrImm32OrReg(result_reg, result_reg, 0x01000001u, HOST_TMP1))
 							return false;
 	}
-					else if (fs == 0)
-	{
-						if (!m_code.EmitMovImm32(result_reg, 0x00002e00u))
-							return false;
-	}
-					else if (!m_code.EmitMovImm8(result_reg, 0))
+					else if (!m_code.EmitLdrImm12(result_reg, HOST_CPU_REGS, static_cast<u16>(FprcOffset(0))))
 	{
 						return false;
 	}
@@ -16543,11 +16541,14 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCOP1DivSqrtFast(u32 op)
 	{
-		// PCSX2 owners: FPU.cpp::DIV_S()/SQRT_S()/RSQRT_S(), plus
+		// PCSX2 owners: x86/iFPU.cpp::recDIV_S_xmm()/recSQRT_S_xmm()/
+		// recRSQRT_S_xmm(), FPU.cpp::DIV_S()/SQRT_S()/RSQRT_S(), plus
 		// FPU.cpp::checkDivideByZero(), fpuDouble(), checkOverflow(), and
 		// checkUnderflow(). DIV/RSQRT clamp overflow/underflow results without
 		// touching O/U flags because FPU.cpp passes cFlagsToSet=0. SQRT clears
-		// only I/D cause flags and does not run overflow/underflow checks.
+		// only I/D cause flags and does not run overflow/underflow checks. The x86
+		// owner executes DIV under FPUDivFPCR and SQRT under nearest rounding,
+		// restoring FPUFPCR afterward; the A32 VFP operations must do the same.
 		const unsigned fs = (op >> 11) & 0x1f;
 		const unsigned ft = (op >> 16) & 0x1f;
 		const unsigned fd = (op >> 6) & 0x1f;
@@ -16556,6 +16557,24 @@ namespace VitaEE
 		constexpr unsigned VFP_FT_S1 = 1;
 		constexpr unsigned VFP_FD_S2 = 2;
 		const bool same_source = fs == ft;
+		const bool switch_div_fpcr =
+			EmuConfig.Cpu.FPUFPCR.bitmask != EmuConfig.Cpu.FPUDivFPCR.bitmask;
+		FPControlRegister sqrt_fpcr = EmuConfig.Cpu.FPUFPCR;
+		sqrt_fpcr.SetRoundMode(FPRoundMode::Nearest);
+		const bool switch_sqrt_fpcr =
+			EmuConfig.Cpu.FPUFPCR.bitmask != sqrt_fpcr.bitmask;
+
+		// Save the live FPSCR rather than assuming no surrounding helper changed
+		// it. This preserves host accrued flags while reproducing PCSX2's
+		// operation-specific control register for the single VFP instruction.
+		const auto enter_operation_fpcr = [&](u32 fpcr) {
+			return m_code.EmitVmrsFpscr(HOST_TMP4) &&
+				   m_code.EmitMovImm32(HOST_TMP3, fpcr) &&
+				   m_code.EmitVmsrFpscr(HOST_TMP3);
+		};
+		const auto restore_operation_fpcr = [&]() {
+			return m_code.EmitVmsrFpscr(HOST_TMP4);
+		};
 
 		const auto normalize_arithmetic_word_with_mask = [&](unsigned reg, unsigned exponent_mask_reg) {
 			if (!m_code.EmitAndReg(HOST_TMP3, reg, exponent_mask_reg) ||
@@ -16785,8 +16804,10 @@ namespace VitaEE
 				!normalize_tracked_arithmetic_word_with_mask(HOST_TMP1, HOST_TMP5, IsCop1FprNormalized(ft)) ||
 				!m_code.EmitVmovCoreToS(VFP_FS_S0, HOST_TMP0) ||
 				!m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1) ||
+				(switch_div_fpcr && !enter_operation_fpcr(EmuConfig.Cpu.FPUDivFPCR.bitmask)) ||
 				!m_code.EmitVdivF32(VFP_FD_S2, VFP_FS_S0, VFP_FT_S1) ||
 				!m_code.EmitVmovSToCore(HOST_TMP0, VFP_FD_S2) ||
+				(switch_div_fpcr && !restore_operation_fpcr()) ||
 				!clamp_result_no_flags_with_mask(false, HOST_TMP5))
 			{
 				return false;
@@ -16852,8 +16873,10 @@ namespace VitaEE
 			const size_t operand_ready_target = m_code.Size();
 			return m_code.PatchBranch(operand_ready, operand_ready_target) &&
 				   m_code.EmitVmovCoreToS(VFP_FT_S1, HOST_TMP1) &&
+				   (!switch_sqrt_fpcr || enter_operation_fpcr(sqrt_fpcr.bitmask)) &&
 				   m_code.EmitVsqrtF32(VFP_FD_S2, VFP_FT_S1) &&
 				   m_code.EmitVmovSToCore(HOST_TMP0, VFP_FD_S2) &&
+				   (!switch_sqrt_fpcr || restore_operation_fpcr()) &&
 				   m_code.PatchBranch(done_from_zero, m_code.Size()) &&
 				   store_result(true);
 		}

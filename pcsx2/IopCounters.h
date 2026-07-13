@@ -48,6 +48,8 @@ struct psxCounter {
 #define NUM_COUNTERS 8
 
 extern psxCounter psxCounters[NUM_COUNTERS];
+extern bool hBlanking;
+extern bool vBlanking;
 
 extern void psxRcntInit();
 extern void psxRcntUpdate();

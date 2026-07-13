@@ -178,6 +178,8 @@ namespace VitaA32
 		bool EmitVmovS(unsigned sd, unsigned sm);
 		bool EmitVmovCoreToS(unsigned sd, unsigned rt);
 		bool EmitVmovSToCore(unsigned rt, unsigned sd, Condition condition = Condition::AL);
+		bool EmitVmrsFpscr(unsigned rt);
+		bool EmitVmsrFpscr(unsigned rt);
 		bool EmitVmovCoreToD32Lane(unsigned dd, u8 lane, unsigned rt,
 			Condition condition = Condition::AL);
 		bool EmitVmovD32LaneToCore(unsigned rt, unsigned dd, u8 lane,
@@ -401,6 +403,8 @@ namespace VitaA32
 	u32 EncodeVmovS(unsigned sd, unsigned sm);
 	u32 EncodeVmovCoreToS(unsigned sd, unsigned rt);
 	u32 EncodeVmovSToCore(unsigned rt, unsigned sd, Condition condition = Condition::AL);
+	u32 EncodeVmrsFpscr(unsigned rt);
+	u32 EncodeVmsrFpscr(unsigned rt);
 	u32 EncodeVmovCoreToD32Lane(unsigned dd, u8 lane, unsigned rt,
 		Condition condition = Condition::AL);
 	u32 EncodeVmovD32LaneToCore(unsigned rt, unsigned dd, u8 lane,

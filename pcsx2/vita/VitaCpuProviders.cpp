@@ -7,6 +7,9 @@
 #include "DebugTools/IpuTrace.h"
 #include "DebugTools/Spu2Trace.h"
 #include "DebugTools/VuTrace.h"
+#if defined(VITASX2_QEMU_VALIDATION)
+#include "DebugTools/MachineCheckpointTrace.h"
+#endif
 #include "Hw.h"
 #include "IopBios.h"
 #include "IopHw.h"
@@ -1147,6 +1150,9 @@ void recMicroVU1::Execute(u32 cycles)
 	// PCSX2 owner: InterpVU1::Execute()'s loop, with eligible windows routed
 	// through the A32 block provider in pcsx2/vita/VitaVuBlockCompiler.cpp.
 	VitaVU::ExecuteVu1Blocks(cycles);
+#if defined(VITASX2_QEMU_VALIDATION)
+	Pcsx2Trace::NotifyMachineCheckpointVu1ExecutionCompleted();
+#endif
 }
 
 void recMicroVU1::Clear(u32 addr, u32 size)
