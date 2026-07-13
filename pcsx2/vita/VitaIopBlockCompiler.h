@@ -9,6 +9,7 @@
 #include "pcsx2/vita/A32Emitter.h"
 
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <memory>
 #include <vector>
@@ -22,6 +23,8 @@ namespace VitaIOP
 	{
 		Direct = 0x10300a32u,
 		IsolateModeWrite = 0x10310a32u,
+		LogicalContinuation = 0x10320a32u,
+		LogicalContinuationIsolateModeWrite = 0x10330a32u,
 	};
 
 	struct BlockScanResult
@@ -29,6 +32,16 @@ namespace VitaIOP
 		u32 start_pc = 0;
 		u32 instruction_count = 0;
 		u32 stop_pc = 0;
+		bool logical_continuation = false;
+	};
+
+	enum class BlockScanStatus : u8
+	{
+		Success,
+		InvalidStart,
+		UnmappedStart,
+		AnalysisCeiling,
+		SourceBoundary,
 	};
 
 	// Successful executor calls publish every payload field and initialize the
@@ -42,6 +55,8 @@ namespace VitaIOP
 		u32 native_instruction_count;
 		u32 helper_instruction_count;
 		size_t code_size;
+		size_t code_cache_footprint;
+		u32 physical_fragment_count;
 		u32 block_records;
 		u32 link_records;
 		u32 cache_slots;
@@ -192,6 +207,7 @@ namespace VitaIOP
 		ProviderDispatchWaitForward = 1u << 4,
 		ProviderDispatchIsolateSwitch = 1u << 5,
 		ProviderDispatchIsolateWrite = 1u << 6,
+		ProviderDispatchLogicalContinuation = 1u << 7,
 	};
 
 	enum class WaitLoopCondition : u8
@@ -209,7 +225,7 @@ namespace VitaIOP
 	struct WaitLoopDescriptor
 	{
 		WaitLoopCondition condition = WaitLoopCondition::Invalid;
-		u8 cycles = 0;
+		u32 cycles = 0;
 		u8 rs = 0;
 		u8 rt = 0;
 		bool writes_link = false;
@@ -240,7 +256,9 @@ namespace VitaIOP
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
 		size_t scheduler_resume_offset = static_cast<size_t>(-1);
+		u16 fragment_index = 0;
 		bool valid = false;
+		bool logical_continuation = false;
 	};
 
 	struct DirectLinkSlots
@@ -252,25 +270,51 @@ namespace VitaIOP
 	{
 	public:
 		explicit BlockCompiler(VitaA32::CodeBuffer& code,
-			const u16* ram_source_page_live_counts, const u8* ram_source_page_live_flags,
+			const u16* ram_source_page_live_counts,
+			const u8* ram_source_page_live_flags,
 			bool source_page_literal_allowed = true);
 
 		static bool CanCompileOpcode(u32 op);
 
-		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count,
-			const void* direct_exit = nullptr, DirectLinkSlots* direct_links = nullptr,
-			size_t* linked_entry_offset = nullptr, size_t* provider_entry_offset = nullptr);
+		bool CompileStraightLineBlock(
+			u32 start_pc, u32 instruction_count, const void* direct_exit = nullptr,
+			DirectLinkSlots* direct_links = nullptr,
+			size_t* linked_entry_offset = nullptr,
+			size_t* provider_entry_offset = nullptr,
+			bool test_fallthrough_budget = true, bool allow_entry_gate = true,
+			bool inherited_isolate_write = false, u32 logical_cycle_prefix = 0,
+			u32 logical_cycle_total = 0, bool fragmented_logical_block = false,
+			bool logical_continuation_tail = false);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 		bool UsesCompiledPs1BiosGate() const { return m_compiled_ps1_bios_gate; }
 		bool UsesDirectBudgetExit() const { return m_has_budget_exit; }
 		bool UsesConstantCycleBudget() const { return m_defer_cycle_updates; }
-		u32 ClockModeCheckInstructionsRemoved() const { return m_clock_mode_check_instructions_removed; }
-		u32 SavedRegisterStackWordsRemoved() const { return m_saved_register_stack_words_removed; }
-		u32 SavedRegisterFrameInstructionsAdded() const { return m_saved_register_frame_instructions_added; }
-		u32 SavedRegisterFrameInstructionsRemoved() const { return m_saved_register_frame_instructions_removed; }
-		u32 BatchedCycleInstructionsRemoved() const { return m_batched_cycle_instructions_removed; }
-		u32 BatchedCycleStackWordsRemoved() const { return m_batched_cycle_stack_words_removed; }
+		bool WritesIsolateMode() const { return m_writes_isolate_mode; }
+		u32 ClockModeCheckInstructionsRemoved() const
+		{
+			return m_clock_mode_check_instructions_removed;
+		}
+		u32 SavedRegisterStackWordsRemoved() const
+		{
+			return m_saved_register_stack_words_removed;
+		}
+		u32 SavedRegisterFrameInstructionsAdded() const
+		{
+			return m_saved_register_frame_instructions_added;
+		}
+		u32 SavedRegisterFrameInstructionsRemoved() const
+		{
+			return m_saved_register_frame_instructions_removed;
+		}
+		u32 BatchedCycleInstructionsRemoved() const
+		{
+			return m_batched_cycle_instructions_removed;
+		}
+		u32 BatchedCycleStackWordsRemoved() const
+		{
+			return m_batched_cycle_stack_words_removed;
+		}
 		bool UsesExpandedCycleBatching() const { return m_expanded_cycle_batching; }
 		u16 SavedRegisters() const { return m_saved_registers; }
 		u8 StackFrameSize() const { return m_stack_frame_size; }
@@ -303,17 +347,27 @@ namespace VitaIOP
 		{
 			return m_isolate_cache_guard_instructions_removed;
 		}
-		bool SourcePageLiteralOutOfRange() const { return m_source_page_literal_out_of_range; }
+		bool SourcePageLiteralOutOfRange() const
+		{
+			return m_source_page_literal_out_of_range;
+		}
 
 	private:
 		bool BeginBlock(size_t* linked_entry_offset, size_t* provider_entry_offset);
 		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true,
 			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockIsolateModeWriteReturn(bool charge_budget = true,
-			bool flush_pins = true, u32 known_cycle_count = 0);
-		bool EndBlockDirectTail(const void* direct_exit, DirectLinkSlot* direct_link_slot,
-			u8 direct_link_slot_index, bool charge_budget = true);
-		bool EmitInstruction(u32 op, u32 pc, bool store_pc, std::vector<size_t>& trace_exit_branches);
+			bool flush_pins = true,
+			u32 known_cycle_count = 0);
+		bool EndBlockLogicalContinuationReturn(bool charge_budget = true,
+			bool flush_pins = true);
+		bool EndBlockDirectTail(const void* direct_exit,
+			DirectLinkSlot* direct_link_slot,
+			u8 direct_link_slot_index, bool charge_budget = true,
+			bool test_budget = true,
+			BlockExitKind fallback_exit = BlockExitKind::Direct);
+		bool EmitInstruction(u32 op, u32 pc, bool store_pc,
+			std::vector<size_t>& trace_exit_branches);
 		bool EmitNativeInstruction(u32 op, u32 pc);
 		bool EmitNativeSPECIAL(u32 op, u32 pc);
 		bool EmitNativeCOP0(u32 op);
@@ -327,15 +381,16 @@ namespace VitaIOP
 			u32 store_ops[4]{};
 			u8 first_result = 0;
 		};
-		bool MatchSequentialQwordCopyShape(
-			u32 start_pc, u32 instruction_index, u32 instruction_count,
+		bool MatchSequentialQwordCopyShape(u32 start_pc, u32 instruction_index,
+			u32 instruction_count,
 			SequentialQwordCopy* copy) const;
-		bool MatchSequentialQwordCopy(
-			u32 start_pc, u32 instruction_index, u32 instruction_count,
+		bool MatchSequentialQwordCopy(u32 start_pc, u32 instruction_index,
+			u32 instruction_count,
 			SequentialQwordCopy* copy) const;
-		bool EmitSequentialQwordCopy(const SequentialQwordCopy& copy,
-			u32 start_pc, u32 instruction_index);
-		bool EmitTraceCheck(u32 pc, u32 op, std::vector<size_t>& direct_exit_branches);
+		bool EmitSequentialQwordCopy(const SequentialQwordCopy& copy, u32 start_pc,
+			u32 instruction_index);
+		bool EmitTraceCheck(u32 pc, u32 op,
+			std::vector<size_t>& direct_exit_branches);
 		void AnalyzePinnedGprs(u32 start_pc, u32 instruction_count);
 		void AnalyzeSavedRegisters(u32 start_pc, u32 instruction_count);
 		int PinnedHostForGuest(unsigned guest_reg) const;
@@ -351,7 +406,8 @@ namespace VitaIOP
 		void ClearKnownHiLo(bool lo);
 		void ClearKnownHiLo();
 		void UpdateGprConstStateAfterOpcode(u32 op, u32 pc);
-		bool TryKnownDirectIopRamAddress(u32 op, u8 alignment_mask, u32* address) const;
+		bool TryKnownDirectIopRamAddress(u32 op, u8 alignment_mask,
+			u32* address) const;
 		bool EmitStorePc(u32 pc);
 		bool EmitStorePcReg(unsigned host_reg);
 		bool EmitAddCycles(u32 cycles);
@@ -359,15 +415,19 @@ namespace VitaIOP
 		u32 CurrentTimingHelperSeamCount() const;
 		void RecordBatchedCycleExitSavings(u32 cycle_prefix, bool preserves_argument);
 		bool EmitChargeEeBudget(u32 known_cycle_count = 0, bool pins_flushed = true,
-			u8 scheduler_resume_slot = UINT8_MAX);
+			u8 scheduler_resume_slot = UINT8_MAX,
+			bool test_budget = true);
 		bool BranchTestSchedulingEnabled() const;
 		bool EmitBranchEventTest(u8 scheduler_resume_slot = UINT8_MAX);
 		bool EmitQemuCounterIncrement(u32* counter);
 		bool EmitChargeEeBudgetPs1(u32 known_block_cycles);
-		bool EmitPcChangedExitCheck(u32 expected_pc, std::vector<size_t>& direct_exit_branches);
-		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg, std::vector<size_t>& direct_exit_branches);
+		bool EmitPcChangedExitCheck(u32 expected_pc,
+			std::vector<size_t>& direct_exit_branches);
+		bool EmitPcChangedExitCheckReg(unsigned expected_host_reg,
+			std::vector<size_t>& direct_exit_branches);
 		bool EmitLoadGpr(unsigned guest_reg, unsigned host_reg);
-		bool EmitLoadGprValue(unsigned guest_reg, unsigned host_reg, bool* used_known_value);
+		bool EmitLoadGprValue(unsigned guest_reg, unsigned host_reg,
+			bool* used_known_value);
 		bool EmitStoreGpr(unsigned guest_reg, unsigned host_reg);
 		bool EmitStoreGprZero(unsigned guest_reg);
 		bool EmitMoveGpr(unsigned dst_guest_reg, unsigned src_guest_reg);
@@ -516,7 +576,8 @@ namespace VitaIOP
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
 		std::vector<size_t>* m_unflushed_budget_exit_branches = nullptr;
 		std::array<std::vector<size_t>*, 2> m_scheduler_budget_exit_branches{};
-		std::array<std::vector<size_t>*, 2> m_unflushed_scheduler_budget_exit_branches{};
+		std::array<std::vector<size_t>*, 2>
+			m_unflushed_scheduler_budget_exit_branches{};
 		u32 m_block_cycle_count = 0;
 		u32 m_clock_mode_check_instructions_removed = 0;
 		u32 m_saved_register_stack_words_removed = 0;
@@ -526,12 +587,16 @@ namespace VitaIOP
 		u32 m_batched_cycle_stack_words_removed = 0;
 		u32 m_current_instruction_count = 0;
 		u32 m_current_cycle_count = 0;
+		u32 m_logical_cycle_prefix = 0;
+		u32 m_budget_cycle_count = 0;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
 		bool m_defer_cycle_updates = false;
 		bool m_expanded_cycle_batching = false;
 		bool m_track_published_cycle_prefix = false;
+		bool m_initialize_cycle_prefix = false;
+		bool m_fragmented_logical_block = false;
 		bool m_has_budget_exit = false;
 		bool m_source_page_literal_out_of_range = false;
 		bool m_isolate_cache_specialization = false;
@@ -551,7 +616,8 @@ namespace VitaIOP
 		VitaA32::Condition m_static_branch_taken_condition = VitaA32::Condition::AL;
 		bool m_branch_predicate_producer_flags_live = false;
 		unsigned m_branch_predicate_producer_guest = 0;
-		VitaA32::Condition m_branch_predicate_producer_true_condition = VitaA32::Condition::AL;
+		VitaA32::Condition m_branch_predicate_producer_true_condition =
+			VitaA32::Condition::AL;
 		bool m_register_jump_target_known = false;
 		u32 m_register_jump_target = 0;
 		bool m_emit_irx_import = false;
@@ -570,7 +636,11 @@ namespace VitaIOP
 	class BlockExecutor
 	{
 	public:
+		// A PCSX2 logical IOP block is allowed to span host-code and guest-page
+		// allocation boundaries. A32 generation is deliberately bounded per
+		// fragment; only the complete logical block owns scheduling and events.
 		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 64;
+		static constexpr u32 MAX_LOGICAL_BLOCK_INSTRUCTIONS = 0xffff;
 
 		explicit BlockExecutor(bool owns_ee_event_entry = false);
 		~BlockExecutor();
@@ -611,15 +681,26 @@ namespace VitaIOP
 		static void SetCompiledPs1BiosGateEnabled(bool enabled);
 		static bool CompiledPs1BiosGateEnabled();
 		static void SetSchedulerDirectResumeEnabled(bool enabled);
+		static void SetNullOpcodeCompilationEnabled(bool enabled);
 		static bool SchedulerDirectResumeEnabled();
+		static bool ReadRecompilerOwnedOpcode(u32 pc, u32* opcode);
+		static void SetCodeCacheCapacityLimit(size_t capacity);
 		static bool TryFastForwardWaitLoopAtPc(u32 start_pc);
-		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
-		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count, BlockExecutionResult* result,
+		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count,
+			BlockScanResult* result);
+		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
+			BlockExecutionResult* result,
 			bool publish_details = true);
 		bool ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result,
-			bool publish_details = true);
-		u32 ExecuteProviderBlockAtPc(u32 start_pc, ProviderCompileResult* compile_result);
+			bool publish_details = true,
+			bool forced_continuation = false);
+		u32 ExecuteProviderBlockAtPc(u32 start_pc,
+			ProviderCompileResult* compile_result,
+			bool forced_continuation = false);
 		s32 ExecuteInterpreterFallbackTimeslice(s32 ee_cycles);
+		s32 ExecuteInterpreterRecompilerBlock(s32 ee_cycles,
+			bool* logical_continuation = nullptr,
+			bool* execution_terminated = nullptr);
 #if defined(__arm__)
 		__attribute__((naked, noinline)) s32 ExecuteProviderTimeslice(s32 ee_cycles);
 #else
@@ -638,7 +719,8 @@ namespace VitaIOP
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
 		static constexpr u32 SCHEDULER_DIRECT_RESUME_TAG = 1u;
-		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
+		static constexpr size_t MAX_INCOMING_LINKS =
+			MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
 		// PCSX2's R3000A dispatcher indexes psxRecLUT directly by guest PC.
@@ -658,13 +740,76 @@ namespace VitaIOP
 		static constexpr u32 RAM_SOURCE_PAGE_SHIFT = 12;
 		static constexpr u32 RAM_SOURCE_PAGE_SIZE = 1u << RAM_SOURCE_PAGE_SHIFT;
 		static constexpr u32 RAM_SOURCE_PAGE_COUNT =
-			Ps2MemSize::IopRam / RAM_SOURCE_PAGE_SIZE;
+			Ps2MemSize::TotalIopRam / RAM_SOURCE_PAGE_SIZE;
 		static constexpr u32 INVALID_RAM_SOURCE = UINT32_MAX;
 
 		struct CachedBlock
 		{
+			struct CodeFragment
+		{
 			VitaA32::CodeBuffer code;
+				u32 start_pc = 0;
+				u32 instruction_count = 0;
+				size_t linked_entry_offset = 0;
+				size_t provider_entry_offset = 0;
+			};
+
+			// Keep the overwhelmingly common <=64-opcode/single-fragment block
+			// allocation-free. Only a PCSX2 logical block which actually crosses
+			// an A32 code-generation boundary allocates overflow metadata.
+			CodeFragment first_fragment;
+			std::vector<CodeFragment> overflow_fragments;
 			std::array<u32, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS> opcodes{};
+			std::vector<u32> overflow_opcodes;
+			u16 fragment_count = 0;
+
+			bool HasFragments() const { return fragment_count != 0; }
+			CodeFragment& Fragment(u32 index)
+			{
+				return index == 0 ? first_fragment : overflow_fragments[index - 1];
+			}
+			const CodeFragment& Fragment(u32 index) const
+			{
+				return index == 0 ? first_fragment : overflow_fragments[index - 1];
+			}
+			void ReserveFragments(u32 count)
+			{
+				if (count > 1)
+					overflow_fragments.reserve(count - 1);
+			}
+			CodeFragment& AddFragment()
+			{
+				if (fragment_count++ == 0)
+					return first_fragment;
+				overflow_fragments.emplace_back();
+				return overflow_fragments.back();
+			}
+			void ClearFragments()
+			{
+				first_fragment = {};
+				overflow_fragments.clear();
+				fragment_count = 0;
+			}
+			void PrepareOpcodes(u32 count)
+			{
+				overflow_opcodes.resize(count > opcodes.size() ? count - opcodes.size() : 0);
+			}
+			u32& Opcode(u32 index)
+			{
+				return index < opcodes.size() ? opcodes[index] : overflow_opcodes[index - opcodes.size()];
+			}
+			u32 Opcode(u32 index) const
+			{
+				return index < opcodes.size() ? opcodes[index] : overflow_opcodes[index - opcodes.size()];
+			}
+			void ClearOpcodes() { overflow_opcodes.clear(); }
+			void ReleaseOversizedMetadata()
+			{
+				if (overflow_fragments.capacity() > 8)
+					std::vector<CodeFragment>().swap(overflow_fragments);
+				if (overflow_opcodes.capacity() > 512)
+					std::vector<u32>().swap(overflow_opcodes);
+			}
 			const u32* raw_opcodes = nullptr;
 			u32 ram_source_start = INVALID_RAM_SOURCE;
 			const u32* poll_branch_opcodes = nullptr;
@@ -676,6 +821,8 @@ namespace VitaIOP
 			u32 poll_word_address = 0;
 			u32 source_serial = 0;
 			u32 start_pc = 0;
+			u32 rec_lookup_identity = UINT32_MAX;
+			u32 rec_link_identity = UINT32_MAX;
 			u32 instruction_count = 0;
 			u32 native_instruction_count = 0;
 			u32 helper_instruction_count = 0;
@@ -695,8 +842,6 @@ namespace VitaIOP
 			u32 batched_cycle_instructions_removed = 0;
 			u32 batched_cycle_stack_words_removed = 0;
 			bool expanded_cycle_batching = false;
-			size_t linked_entry_offset = 0;
-			size_t provider_entry_offset = 0;
 			u16 saved_registers = 0;
 			u8 stack_frame_size = 0;
 			DirectLinkSlots direct_links{};
@@ -707,26 +852,29 @@ namespace VitaIOP
 			bool direct_budget_exit = false;
 			bool constant_cycle_budget = false;
 			bool isolate_cache_active = false;
+			bool logical_continuation = false;
+			bool discovered_topology = false;
+			bool trusted_source = false;
 			u8 poll_result_register = 0;
 			bool valid = false;
 			bool queued_free = false;
 		};
 
 	public:
-		static constexpr u32 SchedulerPredictionStartPcOffset()
+		static constexpr u32 SchedulerPredictionIdentityOffset()
 		{
-			return static_cast<u32>(offsetof(CachedBlock, start_pc));
+			return static_cast<u32>(offsetof(CachedBlock, rec_lookup_identity));
 		}
 		static constexpr u32 SchedulerDispatchCacheEntryCount() { return 64; }
 		static constexpr u32 SchedulerDispatchCacheOffset()
 		{
-			return static_cast<u32>(offsetof(BlockExecutor,
-				m_scheduler_direct_resume_event_context) +
+			return static_cast<u32>(
+				offsetof(BlockExecutor, m_scheduler_direct_resume_event_context) +
 				4 * sizeof(CachedBlock*));
 		}
+		static constexpr u32 SchedulerRamIdentityMaskOffset();
 
 	private:
-
 		struct LookupPage
 		{
 			std::array<std::array<CachedBlock*, LOOKUP_PAGE_ENTRY_COUNT>, 2> blocks{};
@@ -735,19 +883,35 @@ namespace VitaIOP
 		struct HotDispatchCacheEntry
 		{
 			CachedBlock* block = nullptr;
-			u32 start_pc = UINT32_MAX;
+			u32 rec_lookup_identity = UINT32_MAX;
 		};
 
 		struct IncomingLinkRecord
 		{
 			CachedBlock* source = nullptr;
-			u32 target_pc = 0;
+			u32 target_lookup_identity = UINT32_MAX;
+			u32 target_link_identity = UINT32_MAX;
 			u8 slot_index = 0;
+		};
+
+		struct InterpreterFallbackBlock
+		{
+			std::vector<u32> opcodes;
+			u32 start_pc = 0;
+			u32 rec_lookup_identity = UINT32_MAX;
+			u32 rec_link_identity = UINT32_MAX;
+			u32 instruction_count = 0;
+			u32 stop_pc = 0;
+			u32 ram_source_start = INVALID_RAM_SOURCE;
+			u32 source_serial = 0;
+			bool logical_continuation = false;
+			bool valid = false;
 		};
 
 		struct RamSourceRecord
 		{
 			CachedBlock* block = nullptr;
+			InterpreterFallbackBlock* fallback = nullptr;
 			u32 serial = 0;
 		};
 
@@ -755,16 +919,18 @@ namespace VitaIOP
 		{
 			CachedBlock* block = nullptr;
 			const void* entry_point = nullptr;
-			u32 start_pc = 0;
+			u32 rec_lookup_identity = UINT32_MAX;
 			u32 instruction_count = 0;
 			size_t code_size = 0;
 		};
 
-		static u32 LookupPageIndex(u32 start_pc);
-		static u32 LookupEntryIndex(u32 start_pc);
-		static u32 HotDispatchCacheIndex(u32 start_pc);
-		static const u32* ResolveRawOpcodeSpan(
-			u32 start_pc, u32 instruction_count, u32* ram_source_start);
+		static inline __attribute__((always_inline)) u32 RecLookupIdentity(u32 pc);
+		static inline __attribute__((always_inline)) u32 RecLinkIdentity(u32 pc);
+		static u32 LookupPageIndex(u32 rec_lookup_identity);
+		static u32 LookupEntryIndex(u32 rec_lookup_identity);
+		static u32 HotDispatchCacheIndex(u32 rec_lookup_identity);
+		static const u32* ResolveRawOpcodeSpan(u32 start_pc, u32 instruction_count,
+			u32* ram_source_start);
 		bool EnsureLookupDirectory();
 		LookupPage* GetLookupPage(u32 start_pc, bool allocate);
 		void RegisterBlockLookup(CachedBlock& block);
@@ -772,188 +938,242 @@ namespace VitaIOP
 		void RegisterHotDispatchCache(CachedBlock& block);
 		void UnregisterHotDispatchCache(CachedBlock& block);
 		CachedBlock* FindHotDispatchCacheBlock(u32 start_pc);
-		inline __attribute__((always_inline)) CachedBlock* FindHotDispatchCacheBlockInline(
-			u32 start_pc);
+		inline __attribute__((always_inline)) CachedBlock*
+		FindHotDispatchCacheBlockInline(u32 start_pc);
 		void ClearHotDispatchCache();
 		void ReleaseLookupPages();
 		void RegisterRamSource(CachedBlock& block);
 		void UnregisterRamSource(const CachedBlock& block);
-		bool AnalyzePollCallWaitLoop(CachedBlock& block, u32 start_pc, u32 instruction_count);
+		void RegisterRamSource(InterpreterFallbackBlock& block);
+		void UnregisterRamSource(const InterpreterFallbackBlock& block);
+		bool AnalyzePollCallWaitLoop(CachedBlock& block, u32 start_pc,
+			u32 instruction_count);
 		u32 InvalidateRamSourceRange(u32 start, u32 size);
 		void ClearRamSourcePages();
-		s32 LastBlockRecordIndex(u32 pc) const;
+		InterpreterFallbackBlock* FindInterpreterFallbackBlock(u32 start_pc) const;
+		bool RegisterInterpreterFallbackBlock(u32 start_pc);
+		void InvalidateInterpreterFallbackBlock(InterpreterFallbackBlock& block);
+		s32 LastBlockRecordIndex(u32 rec_lookup_identity) const;
 		bool RegisterBlockRecord(CachedBlock& block);
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
-		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc, u32 instruction_count,
-			bool match_instruction_count, bool isolate_cache_active);
+		CachedBlock* FindRecordedBlockByStartPc(
+			u32 start_pc, u32 instruction_count, bool match_instruction_count,
+			bool isolate_cache_active, bool discovered_topology_only = false);
 		void RememberFreeCacheEntry(CachedBlock& block);
 		CachedBlock* TakeFreeCacheEntry();
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
-		s32 LastIncomingLinkIndex(u32 target_pc) const;
+		s32 LastIncomingLinkIndex(u32 target_lookup_identity) const;
 		void ClearIncomingLinks();
-		void RegisterIncomingLink(CachedBlock& block, u8 slot_index, const DirectLinkSlot& link);
+		void RegisterIncomingLink(CachedBlock& block, u8 slot_index,
+			const DirectLinkSlot& link);
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
-		CachedBlock* FindLookupBlockByStartPc(u32 start_pc, bool isolate_cache_active);
-		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit);
-		CachedBlock* FindCachedBlockByStartPc(u32 start_pc, bool isolate_cache_active);
+		CachedBlock* FindLookupBlockByStartPc(u32 start_pc,
+			bool isolate_cache_active);
+		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block,
+			bool* lookup_hit);
+		CachedBlock* FindCachedBlockByStartPc(u32 start_pc,
+			bool isolate_cache_active);
 		CachedBlock* AllocateCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
 		bool ValidateCachedBlock(CachedBlock& block);
 		static bool TryFastForwardTrustedWaitLoopAtPc(u32 start_pc);
-		inline __attribute__((always_inline)) bool TryFastForwardPollCallWaitLoop(CachedBlock& block);
+		inline __attribute__((always_inline)) bool
+		TryFastForwardPollCallWaitLoop(CachedBlock& block);
 		template <bool Ps1Clock>
-		inline __attribute__((always_inline)) bool TryFastForwardPollCallWaitLoopForClock(
-			CachedBlock& block);
-		inline __attribute__((always_inline)) bool TryFastForwardCachedUnconditionalWaitLoop(
-			CachedBlock& block);
-		inline __attribute__((always_inline)) void FastForwardRetainedUnconditionalWaitLoop(
-			CachedBlock& block);
+		inline __attribute__((always_inline)) bool
+		TryFastForwardPollCallWaitLoopForClock(CachedBlock& block);
+		inline __attribute__((always_inline)) bool
+		TryFastForwardCachedUnconditionalWaitLoop(CachedBlock& block);
+		inline __attribute__((always_inline)) void
+		FastForwardRetainedUnconditionalWaitLoop(CachedBlock& block);
 		template <bool Ps1Clock>
 		inline __attribute__((always_inline)) void
 			FastForwardRetainedUnconditionalWaitLoopForClock(CachedBlock& block);
 		template <bool Ps1Clock>
 		inline __attribute__((always_inline)) void
 			FastForwardRetainedUnconditionalNoLinkWaitLoopForClock(CachedBlock& block);
-		inline __attribute__((always_inline)) bool TryFastForwardRetainedWaitLoop(
-			CachedBlock& block, WaitResumeKind kind);
-		__attribute__((noinline, cold)) bool TryFastForwardCachedWaitLoop(CachedBlock& block);
+		inline __attribute__((always_inline)) bool
+		TryFastForwardRetainedWaitLoop(CachedBlock& block, WaitResumeKind kind);
+		__attribute__((noinline, cold)) bool
+		TryFastForwardCachedWaitLoop(CachedBlock& block);
 		template <int ClockMode>
-		__attribute__((noinline, cold)) bool TryFastForwardCachedWaitLoopForClock(
-			CachedBlock& block);
+		__attribute__((noinline, cold)) bool
+		TryFastForwardCachedWaitLoopForClock(CachedBlock& block);
 		bool EnsureCodeCache();
 		void ReleaseCodeCache();
 		u8* AllocateCodeSlice(size_t capacity, size_t* slice_offset);
 		void CommitCodeSlice(size_t slice_offset, size_t code_size);
 		void RewindCodeCache(size_t slice_offset);
 		u32 ResetForCachePressure();
-		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count,
-			bool entry_effects_already_applied = false);
+		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc,
+			u32 instruction_count,
+			bool entry_effects_already_applied = false,
+			bool allow_cache_pressure_retry = true,
+			bool logical_continuation = false,
+			bool discovered_topology = false);
+		BlockScanStatus ScanProviderLogicalBlock(u32 start_pc,
+			BlockScanResult* result);
+		static size_t TotalCodeSize(const CachedBlock& block);
+		static size_t TotalCodeCacheFootprint(const CachedBlock& block);
+		static VitaA32::CodeBuffer* DirectLinkCode(CachedBlock& block,
+			const DirectLinkSlot& link);
 		bool ExecuteCompiledBlockInternal(u32 start_pc, u32 instruction_count,
-			BlockExecutionResult* result, bool publish_details,
-			bool entry_effects_already_applied);
-		void PublishExecutionDetails(const CachedBlock& block, BlockExecutionResult* result) const;
-		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result, bool publish_details);
-		u32 RunProviderBlock(CachedBlock& block, u32 dispatch_flags);
-		inline __attribute__((always_inline)) u32 RunProviderBlockInline(
-			CachedBlock& block, u32 dispatch_flags);
-		__attribute__((noinline, cold)) CachedBlock* FindProviderBlockAtPcSlow(
-			u32 start_pc, ProviderCompileResult* compile_result, u32* dispatch_flags);
-		inline __attribute__((always_inline)) CachedBlock* FindProviderBlockAtPcInline(
-			u32 start_pc, ProviderCompileResult* compile_result, u32* dispatch_flags);
-		inline __attribute__((always_inline)) u32 ExecuteProviderBlockAtPcInline(
-			u32 start_pc, ProviderCompileResult* compile_result);
+			BlockExecutionResult* result,
+			bool publish_details,
+			bool entry_effects_already_applied,
+			bool logical_continuation = false,
+			bool discovered_topology = false,
+			bool forced_continuation = false);
+		void PublishExecutionDetails(const CachedBlock& block,
+			BlockExecutionResult* result) const;
+		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result,
+			bool publish_details,
+			bool forced_continuation = false);
+		u32 RunProviderBlock(CachedBlock& block, u32 dispatch_flags,
+			bool forced_continuation = false);
+		inline __attribute__((always_inline)) u32
+		RunProviderBlockInline(CachedBlock& block, u32 dispatch_flags,
+			bool forced_continuation = false);
+		__attribute__((noinline, cold)) CachedBlock*
+		FindProviderBlockAtPcSlow(u32 start_pc, ProviderCompileResult* compile_result,
+			u32* dispatch_flags);
+		inline __attribute__((always_inline)) CachedBlock*
+		FindProviderBlockAtPcInline(u32 start_pc,
+			ProviderCompileResult* compile_result,
+			u32* dispatch_flags);
+		inline __attribute__((always_inline)) u32
+		ExecuteProviderBlockAtPcInline(u32 start_pc,
+			ProviderCompileResult* compile_result,
+			bool forced_continuation = false);
 		inline __attribute__((always_inline)) s32 ExecuteProviderTimesliceLoop();
 		__attribute__((noinline, cold)) s32 ExecuteProviderTimesliceRemainder();
 #if defined(__arm__)
-		__attribute__((no_stack_protector))
-		__attribute__((noinline)) s32 ExecuteProviderTimeslicePrivateBody(
-			s32 ee_cycles) __asm__("VitaIopA32ProviderTimesliceBody");
-		__attribute__((no_stack_protector))
-		__attribute__((noinline)) s32 ExecuteProviderSchedulerDirectResumePrivateBody(
-			s32 ee_cycles, CachedBlock* block)
-			__asm__("VitaIopA32ProviderSchedulerDirectResumeBody");
-		__attribute__((no_stack_protector))
-		__attribute__((noinline)) s32 ExecuteProviderSchedulerPredictedResumePrivateBody(
-			s32 ee_cycles, CachedBlock* block)
-			__asm__("VitaIopA32ProviderSchedulerPredictedResumeBody");
-		__attribute__((noinline)) s32 ExecuteProviderSchedulerDispatchCachedResumePrivateBody(
-			s32 ee_cycles, CachedBlock* block)
-			__asm__("VitaIopA32ProviderSchedulerDispatchCachedResumeBody");
+		__attribute__((no_stack_protector)) __attribute__((noinline)) s32
+		ExecuteProviderTimeslicePrivateBody(s32 ee_cycles) __asm__(
+			"VitaIopA32ProviderTimesliceBody");
+		__attribute__((no_stack_protector)) __attribute__((noinline)) s32
+		ExecuteProviderSchedulerDirectResumePrivateBody(
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderSchedulerDirectResumeBody");
+		__attribute__((no_stack_protector)) __attribute__((noinline)) s32
+		ExecuteProviderSchedulerPredictedResumePrivateBody(
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderSchedulerPredictedResumeBody");
+		__attribute__((noinline)) s32
+		ExecuteProviderSchedulerDispatchCachedResumePrivateBody(
+			s32 ee_cycles,
+			CachedBlock*
+				block) __asm__("VitaIopA32ProviderSchedulerDispatchCachedResumeBody");
 		inline __attribute__((always_inline)) s32
-			ExecuteProviderWaitResumePrivateBodyCore(
-				s32 ee_cycles, CachedBlock* block, WaitResumeKind kind,
-				bool kind_specific, bool clock_specific, bool ps1_clock,
+		ExecuteProviderWaitResumePrivateBodyCore(s32 ee_cycles, CachedBlock* block,
+			WaitResumeKind kind,
+			bool kind_specific,
+			bool clock_specific, bool ps1_clock,
 				bool no_link_specific);
 #if defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_IOP_WAIT_RESUME_KIND_ENTRY_CONTROL)
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumePrivateBody(
-				s32 ee_cycles, CachedBlock* block, WaitResumeKind kind)
-				__asm__("VitaIopA32ProviderWaitResumeBody");
+			s32 ee_cycles, CachedBlock* block,
+			WaitResumeKind kind) __asm__("VitaIopA32ProviderWaitResumeBody");
 #endif
 #if defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_IOP_WAIT_RESUME_CLOCK_ENTRY_CONTROL)
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalPrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumeUnconditionalBody");
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeUnconditionalBody");
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumePollPrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumePollBody");
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumePollBody");
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeConditionalPrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumeConditionalBody");
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeConditionalBody");
 #endif
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalNormalPrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumeUnconditionalNormalBody");
+			s32 ee_cycles,
+			CachedBlock*
+				block) __asm__("VitaIopA32ProviderWaitResumeUnconditionalNormalBody");
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalPs1PrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumeUnconditionalPs1Body");
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeUnconditionalPs1Body");
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalNoLinkNormalPrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumeUnconditionalNoLinkNormalBody");
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeUnconditionalNoL"
+										"inkNormalBody");
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalNoLinkPs1PrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumeUnconditionalNoLinkPs1Body");
+			s32 ee_cycles, CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeU"
+													   "nconditionalNoLinkPs1Body");
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumePollNormalPrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumePollNormalBody");
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumePollNormalBody");
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumePollPs1PrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumePollPs1Body");
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumePollPs1Body");
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeConditionalNormalPrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumeConditionalNormalBody");
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeConditionalNormalBody");
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeConditionalPs1PrivateBody(
-				s32 ee_cycles, CachedBlock* block)
-				__asm__("VitaIopA32ProviderWaitResumeConditionalPs1Body");
+			s32 ee_cycles,
+			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeConditionalPs1Body");
 #endif
 		void SetWaitResumeBlock(CachedBlock* block);
 		void ClearWaitResumeBlock();
-		inline __attribute__((always_inline)) void SetSchedulerDirectResumeBlock(
-			CachedBlock* block);
+		inline __attribute__((always_inline)) void
+		SetSchedulerDirectResumeBlock(CachedBlock* block);
 		void ClearSchedulerDirectResume();
-		inline __attribute__((always_inline)) void SetSchedulerPredictedResumeBlock(
-			CachedBlock* block);
+		inline __attribute__((always_inline)) void
+		SetSchedulerPredictedResumeBlock(CachedBlock* block);
 		void ClearSchedulerPredictedResume();
-		inline __attribute__((always_inline)) CachedBlock* FindSchedulerDirectResumeBlock(
-			u32* dispatch_flags);
+		inline __attribute__((always_inline)) CachedBlock*
+		FindSchedulerDirectResumeBlock(u32* dispatch_flags);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		const void* ProviderEntryPoint(const CachedBlock& block) const;
-		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
+		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link,
+			CachedBlock* target);
 		void PatchIncomingLinks(CachedBlock& target);
-		void UnlinkIncomingLinks(u32 target_pc, int isolate_cache_mode = -1);
+		void UnlinkIncomingLinks(u32 target_link_identity,
+			int isolate_cache_mode = -1);
 		void RelinkDirectLinks();
 
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
+		std::vector<std::unique_ptr<InterpreterFallbackBlock>>
+			m_interpreter_fallback_blocks;
 		std::vector<CachedBlock*> m_free_cache_entries;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		// Keep the per-dispatch selector before the large inline source/cache
 		// banks so Cortex-A9 can load it with one immediate-offset LDR.
 		bool m_active_isolate_cache_mode = false;
-		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT> m_ram_source_pages;
+		bool m_force_logical_continuation = false;
+		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT>
+			m_ram_source_pages;
 		std::array<u16, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
 		std::array<u8, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_flags{};
 		LookupPage** m_lookup_pages = nullptr;
-		std::array<std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
-			HOT_DISPATCH_CACHE_SET_COUNT>, 2> m_hot_dispatch_cache{};
+		std::array<std::array<std::array<HotDispatchCacheEntry,
+								  HOT_DISPATCH_CACHE_WAY_COUNT>,
+					   HOT_DISPATCH_CACHE_SET_COUNT>,
+			2>
+			m_hot_dispatch_cache{};
 #if defined(VITASX2_QEMU_VALIDATION)
-		std::array<std::array<std::array<HotDispatchCacheEntry, HOT_DISPATCH_CACHE_WAY_COUNT>,
-			HOT_DISPATCH_CACHE_CONTROL_SET_COUNT>, 2> m_hot_dispatch_cache_64_set_control{};
+		std::array<std::array<std::array<HotDispatchCacheEntry,
+								  HOT_DISPATCH_CACHE_WAY_COUNT>,
+					   HOT_DISPATCH_CACHE_CONTROL_SET_COUNT>,
+			2>
+			m_hot_dispatch_cache_64_set_control{};
 #endif
 		CachedBlock* m_wait_resume_block = nullptr;
 		struct SchedulerDirectResumeEventContext
@@ -961,13 +1181,14 @@ namespace VitaIOP
 			struct DispatchCacheEntry
 			{
 				CachedBlock* block = nullptr;
-				u32 start_pc = UINT32_MAX;
+				u32 rec_lookup_identity = UINT32_MAX;
 			};
 			BlockExecutor* executor = nullptr;
 			CachedBlock* block = nullptr;
 			CachedBlock* predicted_block = nullptr;
 			CachedBlock* predicted_block_second = nullptr;
 			std::array<DispatchCacheEntry, 64> dispatch_cache{};
+			u32 ram_identity_mask = 0;
 		} m_scheduler_direct_resume_event_context;
 #if defined(VITASX2_QEMU_VALIDATION)
 		std::array<CachedBlock*, 4> m_scheduler_prediction_shadow{};
@@ -1091,4 +1312,11 @@ namespace VitaIOP
 #endif
 		bool m_direct_linking_enabled = true;
 	};
+
+	inline constexpr u32 BlockExecutor::SchedulerRamIdentityMaskOffset()
+	{
+		return static_cast<u32>(
+			offsetof(BlockExecutor, m_scheduler_direct_resume_event_context) +
+			offsetof(SchedulerDirectResumeEventContext, ram_identity_mask));
+	}
 } // namespace VitaIOP

@@ -35,6 +35,7 @@
 #if defined(VITASX2_QEMU_VALIDATION)
 #include <algorithm>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #endif
 
@@ -1000,9 +1001,14 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 
 	psxRegs.iopBreak = 0;
 	psxRegs.iopCycleEE = eeCycles;
+	bool force_logical_continuation = false;
 
-	while (psxRegs.iopCycleEE > 0)
+	for (;;)
 	{
+		const bool forced_continuation =
+			std::exchange(force_logical_continuation, false);
+		if (!forced_continuation && psxRegs.iopCycleEE <= 0)
+			break;
 		if (!VitaIOP::BlockExecutor::CompiledPs1BiosGateEnabled() &&
 			(psxHu32(HW_ICFG) & 8) &&
 			((psxRegs.pc & 0x1fffffffU) == 0xa0 ||
@@ -1018,8 +1024,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		VitaIOP::ProviderCompileResult compile_result;
 		if (s_iop_a32_compact_provider_dispatch_enabled)
 		{
-			dispatch_flags =
-				s_iop_a32_executor.ExecuteProviderBlockAtPc(pc, &compile_result);
+			dispatch_flags = s_iop_a32_executor.ExecuteProviderBlockAtPc(
+				pc, &compile_result, forced_continuation);
 			if ((dispatch_flags & VitaIOP::ProviderDispatchSuccess) != 0)
 			{
 				s_iop_a32_compact_provider_dispatch_entries++;
@@ -1030,7 +1036,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		else
 		{
 			VitaIOP::BlockExecutionResult legacy_result;
-			if (s_iop_a32_executor.ExecuteCompiledBlockAtPc(pc, &legacy_result, false))
+			if (s_iop_a32_executor.ExecuteCompiledBlockAtPc(
+					pc, &legacy_result, false, forced_continuation))
 			{
 				dispatch_flags = VitaIOP::ProviderDispatchSuccess |
 					(legacy_result.cache_hit ? VitaIOP::ProviderDispatchCacheHit : 0) |
@@ -1039,7 +1046,11 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 					(legacy_result.wait_loop_fast_forward ?
 						VitaIOP::ProviderDispatchWaitForward : 0) |
 					(legacy_result.isolate_mode_switched ?
-						VitaIOP::ProviderDispatchIsolateSwitch : 0);
+						VitaIOP::ProviderDispatchIsolateSwitch : 0) |
+					(legacy_result.exit == VitaIOP::BlockExitKind::LogicalContinuation ||
+						legacy_result.exit ==
+							VitaIOP::BlockExitKind::LogicalContinuationIsolateModeWrite ?
+						VitaIOP::ProviderDispatchLogicalContinuation : 0);
 				compile_result.instruction_count = legacy_result.instruction_count;
 				if (!legacy_result.cache_hit)
 				{
@@ -1055,7 +1066,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 		// PCSX2 owner: x86/iR3000A.cpp::_DynGen_EnterRecompiledCode() returns
 		// dispatcher control in registers. The compact Vita provider does the
 		// same. Product execution does not consume cold-compile diagnostics.
-		dispatch_flags = s_iop_a32_executor.ExecuteProviderBlockAtPc(pc, nullptr);
+		dispatch_flags = s_iop_a32_executor.ExecuteProviderBlockAtPc(
+			pc, nullptr, forced_continuation);
 #endif
 		if ((dispatch_flags & VitaIOP::ProviderDispatchSuccess) == 0)
 		{
@@ -1063,14 +1075,12 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			// Keep the rare fallback sentinel live even when hot-path statistics
 			// are disabled, so QEMU can still prove that product-equivalent
 			// execution never entered the interpreter.
-			const u32 opcode = iopMemRead32(pc);
-			VitaIOP::BlockScanResult scan;
-			if (VitaIOP::BlockExecutor::ScanStraightLineBlock(
-					pc, VitaIOP::BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) &&
-				scan.instruction_count != 0)
-			{
-				s_iop_a32_stats.failed_blocks++;
-			}
+			u32 opcode = UINT32_MAX;
+			VitaIOP::BlockExecutor::ReadRecompilerOwnedOpcode(pc, &opcode);
+			// FindProviderBlockAtPcSlow already performed the complete logical
+			// scan. Count that rejected candidate directly instead of rereading up
+			// to 65,535 guest words on the diagnostic fallback path.
+			s_iop_a32_stats.failed_blocks++;
 			if (s_iop_a32_stats.interpreter_blocks == 0)
 			{
 				s_iop_a32_stats.first_interpreter_pc = pc;
@@ -1080,10 +1090,29 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.last_interpreter_opcode = opcode;
 			s_iop_a32_stats.interpreter_blocks++;
 #endif
+			if (VitaIsIopPreInstructionTraceEnabled())
+				return s_iop_a32_executor.ExecuteInterpreterFallbackTimeslice(
+					psxRegs.iopCycleEE);
+
+			bool interpreter_logical_continuation = false;
+			bool interpreter_execution_terminated = false;
 			const s32 fallback_result =
-				s_iop_a32_executor.ExecuteInterpreterFallbackTimeslice(psxRegs.iopCycleEE);
+				s_iop_a32_executor.ExecuteInterpreterRecompilerBlock(
+					psxRegs.iopCycleEE, &interpreter_logical_continuation,
+					&interpreter_execution_terminated);
+			if (interpreter_execution_terminated)
+				return fallback_result;
+			if (interpreter_logical_continuation)
+			{
+				force_logical_continuation = true;
+				continue;
+			}
+			if (psxRegs.iopCycleEE > 0)
+				continue;
 			return fallback_result;
 		}
+		if ((dispatch_flags & VitaIOP::ProviderDispatchLogicalContinuation) != 0)
+			force_logical_continuation = true;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (s_iop_a32_runtime_stats_enabled)

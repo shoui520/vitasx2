@@ -197,6 +197,24 @@ extern void psxDoBranch(u32 target);
 extern void psxDoJump(u32 target);
 extern void iopEventTest();
 
+#ifdef VITASX2_VITA
+enum class VitaIopInterpreterRecompilerExit : u8
+{
+	Failed,
+	Completed,
+	IrxHandled,
+	ExceptionHandled,
+	UnalignedTarget,
+	Breakpoint,
+};
+
+// Executes exactly one PCSX2 IOP-recompiler analysis window without allowing
+// the interpreter's branch helper to run its event test. The caller owns the
+// recompiler's block-cycle publication, EE-budget charge, and event seam.
+extern VitaIopInterpreterRecompilerExit VitaExecuteIopInterpreterRecompilerBlock(
+	const u32* opcodes, u32 instruction_count, u32* executed_instruction_count);
+#endif
+
 int psxIsBreakpointNeeded(u32 addr);
 int psxIsMemcheckNeeded(u32 pc);
 

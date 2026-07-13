@@ -117,9 +117,13 @@ void psxSRL() { if (!_Rd_) return; _rRd_ = _u32(_rRt_) >> _Sa_; } // Rd = Rt >> 
 * Shift arithmetic with variant register shift           *
 * Format:  OP rd, rt, rs                                 *
 *********************************************************/
-void psxSLLV() { if (!_Rd_) return; _rRd_ = _u32(_rRt_) << _u32(_rRs_); } // Rd = Rt << rs
-void psxSRAV() { if (!_Rd_) return; _rRd_ = _i32(_rRt_) >> _u32(_rRs_); } // Rd = Rt >> rs (arithmetic)
-void psxSRLV() { if (!_Rd_) return; _rRd_ = _u32(_rRt_) >> _u32(_rRs_); } // Rd = Rt >> rs (logical)
+// PCSX2 owner: x86/iR3000Atables.cpp::rpsx{SLLV,SRLV,SRAV} masks the
+// R3000A variable shift count to five bits. Besides matching the ISA, this
+// avoids host-language UB in the interpreter path borrowed by Vita's exact
+// recompiler fallback.
+void psxSLLV() { if (!_Rd_) return; _rRd_ = _u32(_rRt_) << (_u32(_rRs_) & 0x1f); } // Rd = Rt << rs
+void psxSRAV() { if (!_Rd_) return; _rRd_ = _i32(_rRt_) >> (_u32(_rRs_) & 0x1f); } // Rd = Rt >> rs (arithmetic)
+void psxSRLV() { if (!_Rd_) return; _rRd_ = _u32(_rRt_) >> (_u32(_rRs_) & 0x1f); } // Rd = Rt >> rs (logical)
 
 /*********************************************************
 * Load higher 16 bits of the first word in GPR with imm  *
