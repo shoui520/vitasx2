@@ -8,6 +8,7 @@
 #include "DebugTools/Spu2Trace.h"
 #include "DebugTools/VuTrace.h"
 #if defined(VITASX2_QEMU_VALIDATION)
+#include "DebugTools/EeTrace.h"
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
 #include "Hw.h"
@@ -609,6 +610,22 @@ static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& r
 		s_ee_pre_instruction_trace_callback == nullptr;
 }
 
+static bool recCanSplitEeBlockForCodeBudget()
+{
+	if (!s_ee_pre_instruction_trace_callback)
+		return true;
+#if defined(VITASX2_QEMU_VALIDATION)
+	// Exact trace windows must not pre-record instructions which an artificial
+	// continuation defers.  Once the bounded EE oracle sample is full it no
+	// longer consumes those records; the retained callback only watches the
+	// stronger cross-core terminal condition, so ordinary budget splitting is
+	// safe again for the remainder of that integrated run.
+	return s_ee_exact_trace_streams && Pcsx2Trace::DidEeTraceHitLimit();
+#else
+	return false;
+#endif
+}
+
 static void recReserve()
 {
 }
@@ -821,7 +838,9 @@ static void recExecute()
 
 		VitaEE::BlockExecutionResult result;
 		s_ee_a32_running_compiled_block = true;
-		const bool executed = s_ee_a32_executor.ExecuteCompiledBlock(pc, executable_instruction_count, true, &result);
+		const bool executed = s_ee_a32_executor.ExecuteCompiledBlock(pc,
+			executable_instruction_count, true, &result,
+			recCanSplitEeBlockForCodeBudget());
 		s_ee_a32_running_compiled_block = false;
 		if (!executed)
 		{

@@ -59,6 +59,11 @@ namespace VitaEE
 		BlockExitKind exit = BlockExitKind::Direct;
 		u32 exit_value = 0;
 		u32 instruction_count = 0;
+		// The scanner may expose a larger straight-line region than fits the
+		// bounded A32 code slice.  PCSX2's split-block path makes the emitted
+		// prefix a normal block boundary; retain the original region size so
+		// validation can prove that the split was adaptive rather than fallback.
+		u32 source_instruction_count = 0;
 		u32 scaled_cycles = 0;
 		size_t code_size = 0;
 		u32 block_records = 0;
@@ -129,7 +134,8 @@ namespace VitaEE
 #endif
 		static bool ScanStraightLineBlock(u32 start_pc, u32 max_instruction_count, BlockScanResult* result);
 		bool ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
-			bool run_event_test_on_event_exit, BlockExecutionResult* result);
+			bool run_event_test_on_event_exit, BlockExecutionResult* result,
+			bool allow_code_budget_split = false);
 		bool ExecuteCompiledBlockAtPc(u32 start_pc, bool run_event_test_on_event_exit,
 			BlockExecutionResult* result);
 		bool ExecutePersistentAtPc(u32 start_pc, bool run_event_test_on_event_exit,
@@ -145,10 +151,11 @@ namespace VitaEE
 		static constexpr size_t INITIAL_CACHE_CAPACITY = 512;
 		static constexpr size_t MAX_CACHE_CAPACITY = 0x4000;
 		static constexpr size_t STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 4096;
-		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() keeps a complete scanned
-		// block native even when an instruction family expands heavily. Reserve a
-		// larger temporary slice only for those rare blocks; CommitCodeSlice()
-		// still returns the unused tail to the shared Vita EE code cache.
+		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() uses its split-block
+		// continuation when a block must remain manageable.  A32 first grows the
+		// temporary slice for ordinary variance, then turns an over-budget region
+		// into two normal directly-linkable blocks instead of admitting a single
+		// pathological body into the Cortex-A9 instruction cache.
 		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 32 * 1024;
 		static constexpr size_t EE_CODE_CACHE_CAPACITY = HostMemoryMap::EErecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
@@ -163,6 +170,10 @@ namespace VitaEE
 			std::array<u32, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS> opcodes{};
 			u32 start_pc = 0;
 			u32 instruction_count = 0;
+			u32 source_instruction_count = 0;
+			u32 dependency_start_pc = 0;
+			u32 dependency_instruction_count = 0;
+			u32 dependency_charged_cycles_before = 0;
 			u32 scaled_cycles = 0;
 			s8 ee_cycle_rate = 0;
 			u8 cp0_config_cycle_shift = 0;
@@ -243,8 +254,12 @@ namespace VitaEE
 		void UnregisterIncomingLinks(CachedBlock& block);
 		bool ValidateCachedBlock(CachedBlock& block, bool validate_source_words = true);
 		CachedBlock* FindLookupBlockByStartPc(u32 start_pc);
-		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit);
+		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block,
+			bool* lookup_hit, bool match_code_budget_source = false);
 		CachedBlock* FindCachedBlockByStartPc(u32 start_pc, bool validate_source_words = true);
+		void ResolveAdjacentSplitDependency(u32 start_pc, u32 instruction_count,
+			u32* dependency_start_pc, u32* dependency_instruction_count,
+			u32* dependency_charged_cycles_before) const;
 		CachedBlock* AllocateCacheEntry();
 		bool EnsureCodeCache();
 		void ReleaseCodeCache();
@@ -252,7 +267,10 @@ namespace VitaEE
 		void CommitCodeSlice(size_t slice_offset, size_t code_size);
 		void RewindCodeCache(size_t slice_offset);
 		u32 ResetForCachePressure();
-		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles);
+		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count,
+			u32* scaled_cycles, bool allow_code_budget_split = false,
+			u32 dependency_start_pc = 0, u32 dependency_instruction_count = 0,
+			u32 dependency_charged_cycles_before = 0);
 		bool AnalyzeGprLinkSignature(u32 start_pc, u32 instruction_count,
 			GprLinkSignature* signature) const;
 		bool PrepareCompiledBlockAtPc(u32 start_pc, CachedBlock** block, BlockExecutionResult* result);

@@ -5,6 +5,7 @@
 #include "SIO/Pad/PadDualshock2.h"
 #include "SIO/Pad/PadNotConnected.h"
 #include "SIO/Sio.h"
+#include "Config.h"
 
 #include "common/SettingsInterface.h"
 
@@ -40,7 +41,14 @@ namespace Pad
 			unified_slot = 0;
 
 		if (!s_controllers[unified_slot])
-			s_controllers[unified_slot] = CreatePad(GetDefaultControllerType(unified_slot), unified_slot);
+		{
+			// PCSX2 owner: SIO/Pad/Pad.cpp::LoadConfig() constructs the
+			// controller selected in EmuConfig. Vita's headless/product-core
+			// lifecycle can initialize PAD without a SettingsInterface pass, so
+			// lazy construction must consume that same already-loaded contract.
+			s_controllers[unified_slot] =
+				CreatePad(EmuConfig.Pad.Ports[unified_slot].Type, unified_slot);
+		}
 
 		return s_controllers[unified_slot].get();
 	}
@@ -50,7 +58,11 @@ bool Pad::Initialize()
 {
 	InputManager::InvalidateVitaPadStateCache();
 	for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
-		EnsurePad(i);
+	{
+		const ControllerType configured_type = EmuConfig.Pad.Ports[i].Type;
+		if (!s_controllers[i] || s_controllers[i]->GetType() != configured_type)
+			s_controllers[i] = CreatePad(configured_type, i);
+	}
 	return true;
 }
 
@@ -68,12 +80,14 @@ Pad::ControllerType Pad::GetDefaultPadType(u32 pad)
 
 void Pad::LoadConfig(const SettingsInterface& si)
 {
+	(void)si;
 	InputManager::InvalidateVitaPadStateCache();
 	for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
 	{
-		const std::string section = GetConfigSection(i);
-		const ControllerInfo* ci = GetConfigControllerType(si, section.c_str(), i);
-		s_controllers[i] = CreatePad(ci ? ci->type : GetDefaultControllerType(i), i);
+		// VMManager has already resolved settings and per-game overrides into
+		// EmuConfig before this Vita lifecycle seam.  Use that resolved type as
+		// the live-machine authority, as PCSX2 SIO/Pad/Pad.cpp::LoadConfig() does.
+		s_controllers[i] = CreatePad(EmuConfig.Pad.Ports[i].Type, i);
 	}
 }
 

@@ -552,9 +552,21 @@ namespace VitaEE
 			bool preserve_dirty_not_taken_link = false,
 			bool preserve_dirty_taken_link = false);
 		static bool RequiresBlockEndAfterOpcode(u32 op);
+		static bool RequiresFollowingInstructionInBlock(u32 op);
 		static bool RequiresTraceWindowEndAfterOpcode(u32 op);
+		static bool CalculateScaledCyclesForRange(u32 start_pc, u32 instruction_count,
+			bool omit_final_likely_delay_slot, u32* scaled_cycles);
+		static bool DoesSplitPreserveScaledCycleTimeline(u32 start_pc,
+			u32 instruction_count, u32 prefix_instruction_count);
+		static bool DoesSplitAfterChargedPrefixPreserveScaledCycleTimeline(
+			u32 dependency_start_pc, u32 dependency_instruction_count,
+			u32 segment_start_instruction, u32 charged_prefix_cycles,
+			u32 segment_prefix_instruction_count);
 
 	private:
+		static bool CalculateScaledCycleStateForRange(u32 start_pc,
+			u32 instruction_count, bool omit_final_likely_delay_slot,
+			u32* committed_scaled_cycles, u32* final_scaled_cycles);
 		bool EmitLinkFrameReturn();
 		bool EmitEmbeddedCompatibleLikelyContinuation(const void* direct_exit,
 			const void* event_exit, DirectLinkSlot* direct_link,

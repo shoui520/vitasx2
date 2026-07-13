@@ -63,6 +63,7 @@ namespace VitaA32
 		void* EntryPoint() const { return m_base; }
 		size_t Size() const { return m_offset; }
 		size_t Capacity() const { return m_capacity; }
+		bool OutOfSpace() const { return m_out_of_space; }
 
 		bool EmitU32(u32 instruction);
 		bool EmitMovImm8(unsigned rd, u8 value, Condition condition = Condition::AL);
@@ -296,6 +297,7 @@ namespace VitaA32
 		size_t m_capacity = 0;
 		size_t m_offset = 0;
 		bool m_owns_memory = false;
+		bool m_out_of_space = false;
 		u8 m_neon_logical_first_q = 0;
 		u8 m_neon_physical_first_q = 0;
 		u8 m_neon_mapped_q_count = 0;

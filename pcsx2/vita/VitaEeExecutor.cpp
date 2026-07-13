@@ -510,6 +510,10 @@ namespace VitaEE
 			block.code.Release();
 			block.valid = false;
 			block.queued_free = false;
+			block.source_instruction_count = 0;
+			block.dependency_start_pc = 0;
+			block.dependency_instruction_count = 0;
+			block.dependency_charged_cycles_before = 0;
 			block.linked_entry_offset = 0;
 			block.resident_self_link_entry_offset = static_cast<size_t>(-1);
 			block.resident_self_link_entry_loads = 0;
@@ -544,6 +548,8 @@ namespace VitaEE
 		u32 invalidated = 0;
 		constexpr u32 max_block_bytes = MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS * 4;
 		const u32 first_candidate_pc = (start_pc > max_block_bytes) ? (start_pc - max_block_bytes) : 0;
+		const u32 last_candidate_pc =
+			end_pc > UINT32_MAX - max_block_bytes ? UINT32_MAX : end_pc + max_block_bytes;
 		// PCSX2 keeps BaseBlocks sorted by guest start PC. Since Vita blocks are
 		// bounded, entries before this lower bound cannot overlap the cleared
 		// word range.
@@ -570,11 +576,19 @@ namespace VitaEE
 				continue;
 			}
 
-			if (block->start_pc >= end_pc)
+			if (block->start_pc >= last_candidate_pc)
 				break;
 
-			const u32 block_end = block->start_pc + block->instruction_count * 4;
-			if (start_pc < block_end)
+			// Every physical part of a code-budget split shares one proof group.
+			// The chosen seams depend on all of the group's opcodes, so a write to
+			// either a prefix or suffix must retire every part and every incoming link.
+			const u32 dependency_start_pc = block->dependency_instruction_count != 0 ?
+				block->dependency_start_pc : block->start_pc;
+			const u32 dependency_instruction_count = block->dependency_instruction_count != 0 ?
+				block->dependency_instruction_count : block->instruction_count;
+			const u32 dependency_end_pc =
+				dependency_start_pc + dependency_instruction_count * 4;
+			if (start_pc < dependency_end_pc && dependency_start_pc < end_pc)
 			{
 				InvalidateCachedBlock(*block);
 				invalidated++;
@@ -1116,6 +1130,14 @@ namespace VitaEE
 
 			result->instruction_count++;
 			result->stop_pc = pc + 4;
+			if (i + 1 == max_instruction_count &&
+				BlockCompiler::RequiresFollowingInstructionInBlock(op))
+			{
+				result->instruction_count--;
+				result->stop_pc = pc;
+				result->stop = BlockScanStop::MaxInstructions;
+				return true;
+			}
 			if (BlockCompiler::RequiresBlockEndAfterOpcode(op) && exact_region_instruction_count == 0)
 			{
 				result->stop = BlockScanStop::OpcodeBoundary;
@@ -1377,26 +1399,35 @@ namespace VitaEE
 			// that two-page block and handler-backed pages use the exact memRead32()
 			// fallback. InvalidateRange() checks the complete block span, so a write
 			// to either source page still discards the cached translation.
-			const u32 opcode_bytes = block.instruction_count * static_cast<u32>(sizeof(u32));
+			const u32 dependency_start_pc = block.dependency_instruction_count != 0 ?
+				block.dependency_start_pc : block.start_pc;
+			const u32 dependency_instruction_count = block.dependency_instruction_count != 0 ?
+				block.dependency_instruction_count : block.instruction_count;
+			const u32 opcode_bytes =
+				dependency_instruction_count * static_cast<u32>(sizeof(u32));
 			const u32 page_remaining =
-				vtlb_private::VTLB_PAGE_SIZE - (block.start_pc & vtlb_private::VTLB_PAGE_MASK);
+				vtlb_private::VTLB_PAGE_SIZE -
+				(dependency_start_pc & vtlb_private::VTLB_PAGE_MASK);
 			bool compared_raw_window = false;
 			if (vtlb_private::vtlbdata.vmap && opcode_bytes <= page_remaining)
 			{
 				const vtlb_private::VTLBVirtual vmv =
-					vtlb_private::vtlbdata.vmap[block.start_pc >> vtlb_private::VTLB_PAGE_BITS];
-				if (!vmv.isHandler(block.start_pc))
+					vtlb_private::vtlbdata.vmap[
+						dependency_start_pc >> vtlb_private::VTLB_PAGE_BITS];
+				if (!vmv.isHandler(dependency_start_pc))
 				{
 					matches = (std::memcmp(block.opcodes.data(),
-								   reinterpret_cast<const void*>(vmv.assumePtr(block.start_pc)), opcode_bytes) == 0);
+								   reinterpret_cast<const void*>(
+									   vmv.assumePtr(dependency_start_pc)), opcode_bytes) == 0);
 					compared_raw_window = true;
 				}
 			}
 
 			if (!compared_raw_window)
 			{
-				for (u32 i = 0; matches && i < block.instruction_count; i++)
-					matches = (block.opcodes[i] == memRead32(block.start_pc + i * 4));
+				for (u32 i = 0; matches && i < dependency_instruction_count; i++)
+					matches = (block.opcodes[i] ==
+						memRead32(dependency_start_pc + i * 4));
 			}
 		}
 
@@ -1404,10 +1435,23 @@ namespace VitaEE
 			return true;
 
 		// PCSX2's x86 path combines recRAMCopy with protected-page faults.
-		// Vita has no user-mode fault repair, so validate the dispatcher entry
-		// block and rely on Cpu->Clear() invalidation to repair other blocks
-		// and their direct links.
-		InvalidateCachedBlock(block);
+		// Vita has no user-mode fault repair, so validate dispatcher entries and
+		// rely on Cpu->Clear() for linked paths.  A mismatch in one code-budget
+		// member invalidates the entire proof group: retaining an adjacent member
+		// could otherwise preserve a seam which is no longer cycle-exact.
+		const u32 dependency_start_pc = block.dependency_instruction_count != 0 ?
+			block.dependency_start_pc : block.start_pc;
+		const u32 dependency_instruction_count = block.dependency_instruction_count != 0 ?
+			block.dependency_instruction_count : block.instruction_count;
+		if (dependency_start_pc != block.start_pc ||
+			dependency_instruction_count != block.instruction_count)
+		{
+			InvalidateRange(dependency_start_pc, dependency_instruction_count);
+		}
+		else
+		{
+			InvalidateCachedBlock(block);
+		}
 		return false;
 	}
 
@@ -1420,7 +1464,8 @@ namespace VitaEE
 		return page ? page->blocks[LookupEntryIndex(start_pc)] : nullptr;
 	}
 
-	bool BlockExecutor::FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block, bool* lookup_hit)
+	bool BlockExecutor::FindCachedBlock(u32 start_pc, u32 instruction_count,
+		CachedBlock** block, bool* lookup_hit, bool match_code_budget_source)
 	{
 		if (!block || instruction_count == 0 ||
 			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -1435,7 +1480,11 @@ namespace VitaEE
 
 		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
 		{
-			if (entry->valid && entry->instruction_count == instruction_count && ValidateCachedBlock(*entry))
+			const bool count_matches = entry->instruction_count == instruction_count ||
+				(match_code_budget_source &&
+				 entry->source_instruction_count == instruction_count &&
+				 entry->instruction_count < entry->source_instruction_count);
+			if (entry->valid && count_matches && ValidateCachedBlock(*entry))
 			{
 				*block = entry;
 				if (lookup_hit)
@@ -1444,10 +1493,23 @@ namespace VitaEE
 			}
 		}
 
-		if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, instruction_count, true))
+		if (!match_code_budget_source)
 		{
-			*block = entry;
-			return true;
+			if (CachedBlock* entry =
+					FindRecordedBlockByStartPc(start_pc, instruction_count, true))
+			{
+				*block = entry;
+				return true;
+			}
+		}
+		else if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, 0, false))
+		{
+			if (entry->source_instruction_count == instruction_count &&
+				entry->instruction_count < entry->source_instruction_count)
+			{
+				*block = entry;
+				return true;
+			}
 		}
 
 		return false;
@@ -1462,6 +1524,66 @@ namespace VitaEE
 		}
 
 		return FindRecordedBlockByStartPc(start_pc, 0, false, validate_source_words);
+	}
+
+	void BlockExecutor::ResolveAdjacentSplitDependency(u32 start_pc,
+		u32 instruction_count, u32* dependency_start_pc,
+		u32* dependency_instruction_count,
+		u32* dependency_charged_cycles_before) const
+	{
+		if (!dependency_start_pc || !dependency_instruction_count ||
+			!dependency_charged_cycles_before)
+		{
+			return;
+		}
+
+		*dependency_start_pc = start_pc;
+		*dependency_instruction_count = instruction_count;
+		*dependency_charged_cycles_before = 0;
+		const u32 source_end_pc = start_pc + instruction_count * sizeof(u32);
+		const auto predecessor_end = std::lower_bound(m_block_records.begin(),
+			m_block_records.end(), start_pc,
+			[](const BlockRecord& record, u32 pc) { return record.start_pc < pc; });
+		constexpr u32 max_dependency_bytes =
+			MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS * sizeof(u32);
+		for (auto predecessor = predecessor_end;
+			predecessor != m_block_records.begin();)
+		{
+			--predecessor;
+			if (start_pc - predecessor->start_pc > max_dependency_bytes)
+				break;
+
+			CachedBlock* predecessor_block = predecessor->block;
+			if (!predecessor_block || !predecessor_block->valid)
+				continue;
+			const u32 predecessor_physical_end = predecessor_block->start_pc +
+				predecessor_block->instruction_count * sizeof(u32);
+			if (predecessor_physical_end != start_pc ||
+				predecessor_block->instruction_count >=
+					predecessor_block->source_instruction_count ||
+				predecessor_block->dependency_instruction_count == 0 ||
+				(predecessor_block->dependency_start_pc ==
+						predecessor_block->start_pc &&
+					predecessor_block->dependency_instruction_count ==
+						predecessor_block->instruction_count))
+			{
+				continue;
+			}
+
+			const u32 predecessor_dependency_end =
+				predecessor_block->dependency_start_pc +
+				predecessor_block->dependency_instruction_count * sizeof(u32);
+			if (source_end_pc <= predecessor_dependency_end)
+			{
+				*dependency_start_pc = predecessor_block->dependency_start_pc;
+				*dependency_instruction_count =
+					predecessor_block->dependency_instruction_count;
+				*dependency_charged_cycles_before =
+					predecessor_block->dependency_charged_cycles_before +
+					predecessor_block->scaled_cycles;
+			}
+			break;
+		}
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::AllocateCacheEntry()
@@ -1560,7 +1682,10 @@ namespace VitaEE
 		return invalidated;
 	}
 
-	bool BlockExecutor::CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count, u32* scaled_cycles)
+	bool BlockExecutor::CompileIntoCacheEntry(CachedBlock& block, u32 start_pc,
+		u32 instruction_count, u32* scaled_cycles, bool allow_code_budget_split,
+		u32 dependency_start_pc, u32 dependency_instruction_count,
+		u32 dependency_charged_cycles_before)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -1568,6 +1693,22 @@ namespace VitaEE
 		{
 			return false;
 		}
+		if (dependency_instruction_count == 0)
+		{
+			dependency_start_pc = start_pc;
+			dependency_instruction_count = instruction_count;
+		}
+		if (dependency_instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
+			dependency_instruction_count >
+				((UINT32_MAX - dependency_start_pc) / sizeof(u32)))
+		{
+			return false;
+		}
+		const u32 dependency_end_pc =
+			dependency_start_pc + dependency_instruction_count * sizeof(u32);
+		const u32 source_end_pc = start_pc + instruction_count * sizeof(u32);
+		if (start_pc < dependency_start_pc || source_end_pc > dependency_end_pc)
+			return false;
 		if (m_persistent_dispatch_enabled && !EnsurePersistentDispatcher())
 			return false;
 
@@ -1578,6 +1719,9 @@ namespace VitaEE
 
 		InvalidateCachedBlock(block);
 
+		for (u32 i = 0; i < dependency_instruction_count; i++)
+			block.opcodes[i] = memRead32(dependency_start_pc + i * 4);
+
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 op = memRead32(start_pc + i * 4);
@@ -1585,17 +1729,15 @@ namespace VitaEE
 			{
 				return false;
 			}
-			block.opcodes[i] = op;
 		}
 
-		size_t block_code_capacity = STRAIGHT_LINE_BLOCK_CODE_CAPACITY;
 		size_t block_code_slice_offset = 0;
 		u32 compiled_scaled_cycles = 0;
+		u32 compiled_instruction_count = instruction_count;
 		size_t compiled_linked_entry_offset = 0;
 		size_t compiled_resident_self_link_entry_offset = static_cast<size_t>(-1);
 		u8 compiled_resident_self_link_entry_loads = 0;
 		GprLinkSignature compiled_gpr_link_signature{};
-		AnalyzeGprLinkSignature(start_pc, instruction_count, &compiled_gpr_link_signature);
 		size_t compiled_compatible_link_entry_offset = static_cast<size_t>(-1);
 		u8 compiled_compatible_link_entry_loads = 0;
 		CompatibleVtlbFastEntryOffsets compiled_compatible_vtlb_fast_entries{};
@@ -1606,94 +1748,193 @@ namespace VitaEE
 				start_pc, instruction_count, code_size, code_capacity);
 		};
 #endif
+		u32 candidate_instruction_count = instruction_count;
 		for (;;)
 		{
-			size_t code_slice_offset = 0;
-			u8* code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
-			if (!code_slice)
+			compiled_gpr_link_signature = GprLinkSignature{};
+			AnalyzeGprLinkSignature(start_pc, candidate_instruction_count,
+				&compiled_gpr_link_signature);
+			size_t block_code_capacity = STRAIGHT_LINE_BLOCK_CODE_CAPACITY;
+			bool split_candidate = false;
+			for (;;)
 			{
-				ResetForCachePressure();
-				code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
+				size_t code_slice_offset = 0;
+				u8* code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
 				if (!code_slice)
+				{
+					ResetForCachePressure();
+					code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
+					if (!code_slice)
+						return false;
+				}
+
+				if (!block.code.Attach(code_slice, block_code_capacity))
+				{
+					RewindCodeCache(code_slice_offset);
 					return false;
-			}
+				}
 
-			if (!block.code.Attach(code_slice, block_code_capacity))
-			{
-				RewindCodeCache(code_slice_offset);
-				return false;
-			}
-
-			BlockCompiler compiler(block.code);
+				BlockCompiler compiler(block.code);
 #if defined(VITASX2_QEMU_VALIDATION)
-			compiler.SetVtlbLinkedEntryPcPublicationEnabled(
-				m_vtlb_linked_entry_pc_publication_enabled);
-			compiler.SetCompatibleLikelyTakenSuffixEnabled(
-				m_compatible_likely_taken_suffix_enabled);
-			compiler.SetCompatiblePredicateEntryVariantEnabled(
-				m_compatible_predicate_entry_variant_enabled);
-			compiler.SetEmbeddedCompatibleContinuationEnabled(
-				m_embedded_compatible_continuation_enabled);
-			compiler.SetFusedDirectEventLinkEnabled(
-				m_fused_direct_event_link_enabled);
-			compiler.SetCombinedCompatibleTakenEventEnabled(
-				m_combined_compatible_taken_event_enabled);
-			compiler.SetCompatibleVtlbWriteGuardHoistEnabled(
-				m_compatible_vtlb_write_guard_hoist_enabled);
-			compiler.SetCompatibleVtlbReadGuardHoistEnabled(
-				m_compatible_vtlb_read_guard_hoist_enabled);
-			compiler.SetDirectLinkRejectionProfilingEnabled(
-				m_direct_link_rejection_profile_enabled);
+				compiler.SetVtlbLinkedEntryPcPublicationEnabled(
+					m_vtlb_linked_entry_pc_publication_enabled);
+				compiler.SetCompatibleLikelyTakenSuffixEnabled(
+					m_compatible_likely_taken_suffix_enabled);
+				compiler.SetCompatiblePredicateEntryVariantEnabled(
+					m_compatible_predicate_entry_variant_enabled);
+				compiler.SetEmbeddedCompatibleContinuationEnabled(
+					m_embedded_compatible_continuation_enabled);
+				compiler.SetFusedDirectEventLinkEnabled(
+					m_fused_direct_event_link_enabled);
+				compiler.SetCombinedCompatibleTakenEventEnabled(
+					m_combined_compatible_taken_event_enabled);
+				compiler.SetCompatibleVtlbWriteGuardHoistEnabled(
+					m_compatible_vtlb_write_guard_hoist_enabled);
+				compiler.SetCompatibleVtlbReadGuardHoistEnabled(
+					m_compatible_vtlb_read_guard_hoist_enabled);
+				compiler.SetDirectLinkRejectionProfilingEnabled(
+					m_direct_link_rejection_profile_enabled);
 #endif
-			u32 attempt_scaled_cycles = 0;
-			size_t attempt_linked_entry_offset = 0;
-			size_t attempt_resident_self_link_entry_offset = static_cast<size_t>(-1);
-			u8 attempt_resident_self_link_entry_loads = 0;
-			size_t attempt_compatible_link_entry_offset = static_cast<size_t>(-1);
-			u8 attempt_compatible_link_entry_loads = 0;
-			CompatibleVtlbFastEntryOffsets attempt_compatible_vtlb_fast_entries{};
-			DirectLinkSlots attempt_direct_links;
-			const bool compiled = compiler.CompileStraightLineBlock(start_pc, instruction_count,
-				direct_exit, event_exit, &attempt_scaled_cycles, &attempt_direct_links,
-				&m_active_generated_lookup_pages, &m_direct_linking_enabled, &attempt_linked_entry_offset,
-				m_persistent_dispatch_enabled, &attempt_resident_self_link_entry_offset,
-				&attempt_resident_self_link_entry_loads, &compiled_gpr_link_signature,
-				&attempt_compatible_link_entry_offset, &attempt_compatible_link_entry_loads,
-				&attempt_compatible_vtlb_fast_entries);
-			const bool out_of_block_space = !compiled && block.code.Size() >= block.code.Capacity();
-			const size_t failure_code_size = block.code.Size();
-			const size_t failure_code_capacity = block.code.Capacity();
-			if (compiled && block.code.Flush())
-			{
-				block_code_slice_offset = code_slice_offset;
-				CommitCodeSlice(code_slice_offset, block.code.Size());
-				compiled_scaled_cycles = attempt_scaled_cycles;
-				compiled_linked_entry_offset = attempt_linked_entry_offset;
-				compiled_resident_self_link_entry_offset = attempt_resident_self_link_entry_offset;
-				compiled_resident_self_link_entry_loads = attempt_resident_self_link_entry_loads;
-				compiled_compatible_link_entry_offset = attempt_compatible_link_entry_offset;
-				compiled_compatible_link_entry_loads = attempt_compatible_link_entry_loads;
-				compiled_compatible_vtlb_fast_entries =
-					attempt_compatible_vtlb_fast_entries;
-				direct_links = attempt_direct_links;
+				u32 attempt_scaled_cycles = 0;
+				size_t attempt_linked_entry_offset = 0;
+				size_t attempt_resident_self_link_entry_offset = static_cast<size_t>(-1);
+				u8 attempt_resident_self_link_entry_loads = 0;
+				size_t attempt_compatible_link_entry_offset = static_cast<size_t>(-1);
+				u8 attempt_compatible_link_entry_loads = 0;
+				CompatibleVtlbFastEntryOffsets attempt_compatible_vtlb_fast_entries{};
+				DirectLinkSlots attempt_direct_links;
+				const bool compiled = compiler.CompileStraightLineBlock(start_pc,
+					candidate_instruction_count, direct_exit, event_exit,
+					&attempt_scaled_cycles, &attempt_direct_links,
+					&m_active_generated_lookup_pages, &m_direct_linking_enabled,
+					&attempt_linked_entry_offset, m_persistent_dispatch_enabled,
+					&attempt_resident_self_link_entry_offset,
+					&attempt_resident_self_link_entry_loads, &compiled_gpr_link_signature,
+					&attempt_compatible_link_entry_offset, &attempt_compatible_link_entry_loads,
+					&attempt_compatible_vtlb_fast_entries);
+				u32 calculated_prefix_cycles = 0;
+				const bool cycle_contract_matches =
+					candidate_instruction_count == instruction_count ||
+					(compiled && BlockCompiler::CalculateScaledCyclesForRange(start_pc,
+						candidate_instruction_count, false, &calculated_prefix_cycles) &&
+					 attempt_scaled_cycles == calculated_prefix_cycles);
+				const bool flushed = compiled && cycle_contract_matches && block.code.Flush();
+				const bool out_of_block_space = !flushed && block.code.OutOfSpace();
+				const size_t failure_code_size = block.code.Size();
+				const size_t failure_code_capacity = block.code.Capacity();
+				if (flushed)
+				{
+					block_code_slice_offset = code_slice_offset;
+					CommitCodeSlice(code_slice_offset, block.code.Size());
+					compiled_instruction_count = candidate_instruction_count;
+					compiled_scaled_cycles = attempt_scaled_cycles;
+					compiled_linked_entry_offset = attempt_linked_entry_offset;
+					compiled_resident_self_link_entry_offset =
+						attempt_resident_self_link_entry_offset;
+					compiled_resident_self_link_entry_loads =
+						attempt_resident_self_link_entry_loads;
+					compiled_compatible_link_entry_offset =
+						attempt_compatible_link_entry_offset;
+					compiled_compatible_link_entry_loads =
+						attempt_compatible_link_entry_loads;
+					compiled_compatible_vtlb_fast_entries =
+						attempt_compatible_vtlb_fast_entries;
+					direct_links = attempt_direct_links;
+					break;
+				}
+
+				block.code.Release();
+				RewindCodeCache(code_slice_offset);
+				if (!out_of_block_space)
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					if (compiled && !cycle_contract_matches)
+					{
+						std::printf("a32-block-code-budget-cycle-contract-mismatch "
+							"pc=%08x instructions=%u compiled_cycles=%u calculated_cycles=%u\n",
+							start_pc, candidate_instruction_count, attempt_scaled_cycles,
+							calculated_prefix_cycles);
+					}
+					report_compile_failure(failure_code_size, failure_code_capacity);
+#endif
+					return false;
+				}
+				if (block_code_capacity < MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY)
+				{
+					block_code_capacity *= 2;
+					continue;
+				}
+
+				if (!allow_code_budget_split || candidate_instruction_count <= 1)
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					report_compile_failure(failure_code_size, failure_code_capacity);
+#endif
+					return false;
+				}
+
+				split_candidate = true;
 				break;
 			}
 
-			block.code.Release();
-			RewindCodeCache(code_slice_offset);
-			if (!out_of_block_space || block_code_capacity >= MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY)
+			if (!split_candidate)
+				break;
+
+			// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile() emits the
+			// ordinary split-block continuation when a block must stay manageable.
+			// Search downward from half the overflowing candidate. Besides keeping
+			// branch/delay and DI/follower pairs atomic, accept only a boundary whose
+			// independently rounded prefix and suffix reproduce the unsplit block's
+			// complete observable cycle timeline. This prevents a host-code budget
+			// from changing Count, helper/exception timing, or event timing merely by
+			// adding an A32 physical seam.
+			BlockScanResult prefix;
+			u32 prefix_limit = candidate_instruction_count / 2;
+			bool found_cycle_exact_prefix = false;
+			while (prefix_limit != 0)
+			{
+				if (!ScanStraightLineBlock(start_pc, prefix_limit, &prefix))
+					return false;
+				const u32 segment_start_instruction =
+					(start_pc - dependency_start_pc) / sizeof(u32);
+				if (prefix.instruction_count != 0 &&
+					prefix.instruction_count < instruction_count &&
+					BlockCompiler::
+						DoesSplitAfterChargedPrefixPreserveScaledCycleTimeline(
+							dependency_start_pc, dependency_instruction_count,
+							segment_start_instruction,
+							dependency_charged_cycles_before,
+							prefix.instruction_count) &&
+					BlockCompiler::DoesSplitPreserveScaledCycleTimeline(
+						start_pc, instruction_count, prefix.instruction_count))
+				{
+					found_cycle_exact_prefix = true;
+					break;
+				}
+
+				if (prefix.instruction_count <= 1)
+					break;
+				prefix_limit = prefix.instruction_count - 1;
+			}
+			if (!found_cycle_exact_prefix)
 			{
 #if defined(VITASX2_QEMU_VALIDATION)
-				report_compile_failure(failure_code_size, failure_code_capacity);
+				std::printf("a32-block-code-budget-cycle-boundary-failed "
+					"pc=%08x source_instructions=%u candidate_instructions=%u\n",
+					start_pc, instruction_count, candidate_instruction_count);
 #endif
 				return false;
 			}
-
-			block_code_capacity *= 2;
+			candidate_instruction_count = prefix.instruction_count;
 		}
 
 		block.start_pc = start_pc;
-		block.instruction_count = instruction_count;
+		block.instruction_count = compiled_instruction_count;
+		block.source_instruction_count = instruction_count;
+		block.dependency_start_pc = dependency_start_pc;
+		block.dependency_instruction_count = dependency_instruction_count;
+		block.dependency_charged_cycles_before =
+			dependency_charged_cycles_before;
 		block.scaled_cycles = compiled_scaled_cycles;
 		block.ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
@@ -1705,6 +1946,120 @@ namespace VitaEE
 		block.compatible_link_entry_loads = compiled_compatible_link_entry_loads;
 		block.compatible_vtlb_fast_entries = compiled_compatible_vtlb_fast_entries;
 		block.direct_links = direct_links;
+
+		if (compiled_instruction_count < instruction_count)
+		{
+			// PCSX2 recRecompile()/BaseBlocks::Remove() does not let a newly
+			// formed split chain inherit arbitrary interior BaseBlock boundaries.
+			// Exact/callback callers can request a region which already has an
+			// independently compiled suffix; retire every interior entry before
+			// publishing this prefix so each continuation inherits the charged-cycle
+			// proof group instead of reusing non-additive local rounding.
+			const u32 continuation_pc =
+				start_pc + compiled_instruction_count * sizeof(u32);
+			constexpr u32 max_physical_block_bytes =
+				MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS * sizeof(u32);
+			const u32 first_converging_start =
+				continuation_pc > max_physical_block_bytes ?
+					continuation_pc - max_physical_block_bytes : 0;
+			for (;;)
+			{
+				// Two independently rounded proof groups must not own the same
+				// artificial continuation.  For example, 64- and 63-instruction
+				// requests beginning one word apart naturally half-split at the
+				// same PC.  If the later continuation inherited just one group's
+				// charged-cycle context, an incoming edge from the other group could
+				// observe a seam which that group's timeline proof never considered.
+				// PCSX2's BaseBlocks::Remove()/New() gives a continuation topology one
+				// owning compilation context; retire the older proof group likewise.
+				auto converging = std::lower_bound(m_block_records.begin(),
+					m_block_records.end(), first_converging_start,
+					[](const BlockRecord& record, u32 pc) {
+						return record.start_pc < pc;
+					});
+				CachedBlock* conflict = nullptr;
+				for (; converging != m_block_records.end() &&
+					converging->start_pc < continuation_pc; ++converging)
+				{
+					CachedBlock* candidate = converging->block;
+					if (!candidate || !candidate->valid ||
+						candidate->instruction_count >= candidate->source_instruction_count)
+					{
+						continue;
+					}
+
+					const u32 candidate_end_pc = candidate->start_pc +
+						candidate->instruction_count * sizeof(u32);
+					const bool same_proof_group =
+						candidate->dependency_start_pc == dependency_start_pc &&
+						candidate->dependency_instruction_count ==
+							dependency_instruction_count;
+					if (candidate_end_pc == continuation_pc && !same_proof_group)
+					{
+						conflict = candidate;
+						break;
+					}
+				}
+
+				if (!conflict)
+					break;
+
+				const u32 conflict_dependency_start =
+					conflict->dependency_instruction_count != 0 ?
+						conflict->dependency_start_pc : conflict->start_pc;
+				const u32 conflict_dependency_count =
+					conflict->dependency_instruction_count != 0 ?
+						conflict->dependency_instruction_count :
+						conflict->instruction_count;
+				if (InvalidateRange(conflict_dependency_start,
+						conflict_dependency_count) == 0)
+				{
+					InvalidateCachedBlock(*conflict);
+				}
+			}
+
+			const u32 dependency_end_pc = dependency_start_pc +
+				dependency_instruction_count * sizeof(u32);
+			for (;;)
+			{
+				const auto interior_record = std::lower_bound(m_block_records.begin(),
+					m_block_records.end(), start_pc,
+					[](const BlockRecord& record, u32 pc) {
+						return record.start_pc < pc;
+					});
+				if (interior_record == m_block_records.end() ||
+					interior_record->start_pc >= dependency_end_pc)
+				{
+					break;
+				}
+
+				CachedBlock* interior = interior_record->block;
+				if (!interior || !interior->valid)
+				{
+					if (interior)
+						UnregisterBlockRecord(*interior);
+					else
+						m_block_records.erase(interior_record);
+					continue;
+				}
+
+				// Retire the old entry through its own proof dependency rather
+				// than removing one physical member. Its group may extend outside
+				// this new source interval, and every old seam must disappear.
+				const u32 interior_dependency_start =
+					interior->dependency_instruction_count != 0 ?
+					interior->dependency_start_pc : interior->start_pc;
+				const u32 interior_dependency_count =
+					interior->dependency_instruction_count != 0 ?
+					interior->dependency_instruction_count :
+					interior->instruction_count;
+				if (InvalidateRange(interior_dependency_start,
+						interior_dependency_count) == 0)
+				{
+					InvalidateCachedBlock(*interior);
+				}
+			}
+		}
 		block.valid = true;
 		if (!RegisterBlockRecord(block))
 		{
@@ -1732,6 +2087,16 @@ namespace VitaEE
 
 		if (scaled_cycles)
 			*scaled_cycles = compiled_scaled_cycles;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (compiled_instruction_count != instruction_count)
+		{
+			std::printf("a32-block-code-budget-split pc=%08x source_instructions=%u "
+				"emitted_instructions=%u code=%zu capacity=%zu\n",
+				start_pc, instruction_count, compiled_instruction_count,
+				block.code.Size(), MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY);
+		}
+#endif
 
 		return true;
 	}
@@ -1966,6 +2331,7 @@ namespace VitaEE
 		result->exit = exit;
 		result->exit_value = exit_value;
 		result->instruction_count = block.instruction_count;
+		result->source_instruction_count = block.source_instruction_count;
 		result->scaled_cycles = block.scaled_cycles;
 		result->code_size = block.code.Size();
 		result->block_records = static_cast<u32>(m_block_records.size());
@@ -2013,7 +2379,8 @@ namespace VitaEE
 	}
 
 	bool BlockExecutor::ExecuteCompiledBlock(u32 start_pc, u32 instruction_count,
-		bool run_event_test_on_event_exit, BlockExecutionResult* result)
+		bool run_event_test_on_event_exit, BlockExecutionResult* result,
+		bool allow_code_budget_split)
 	{
 		if (!result || m_persistent_dispatch_enabled || instruction_count == 0 ||
 			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -2026,15 +2393,26 @@ namespace VitaEE
 
 		CachedBlock* block = nullptr;
 		bool lookup_hit = false;
-		if (FindCachedBlock(start_pc, instruction_count, &block, &lookup_hit))
+		if (FindCachedBlock(start_pc, instruction_count, &block, &lookup_hit,
+				allow_code_budget_split))
 		{
 			result->cache_hit = true;
 			result->lookup_hit = lookup_hit;
 			return RunCachedBlock(*block, run_event_test_on_event_exit, result);
 		}
 
+		u32 dependency_start_pc = start_pc;
+		u32 dependency_instruction_count = instruction_count;
+		u32 dependency_charged_cycles_before = 0;
+		ResolveAdjacentSplitDependency(start_pc, instruction_count,
+			&dependency_start_pc, &dependency_instruction_count,
+			&dependency_charged_cycles_before);
+
 		block = AllocateCacheEntry();
-		if (!block || !CompileIntoCacheEntry(*block, start_pc, instruction_count, &result->scaled_cycles))
+		if (!block || !CompileIntoCacheEntry(*block, start_pc, instruction_count,
+				&result->scaled_cycles, allow_code_budget_split,
+				dependency_start_pc, dependency_instruction_count,
+				dependency_charged_cycles_before))
 			return false;
 
 		result->cache_hit = false;
@@ -2055,6 +2433,7 @@ namespace VitaEE
 			*block = entry;
 			result->path = BlockExecutionPath::Compiled;
 			result->instruction_count = entry->instruction_count;
+			result->source_instruction_count = entry->source_instruction_count;
 			result->scaled_cycles = entry->scaled_cycles;
 			result->code_size = entry->code.Size();
 			result->block_records = static_cast<u32>(m_block_records.size());
@@ -2126,9 +2505,68 @@ namespace VitaEE
 			return false;
 		}
 
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile() stops block
+		// discovery at the next existing BaseBlock. Independent block entries can
+		// therefore remain the authoritative boundary for ordinary rediscovery.
+		// Code-budget split parts are different: InvalidateRange() retires their
+		// complete shared proof group, so an opcode change can never preserve a
+		// stale artificial seam through this truncation.
+		const u32 natural_stop_pc = scan.stop_pc;
+		const auto next_record = std::upper_bound(m_block_records.begin(),
+			m_block_records.end(), start_pc,
+			[](u32 pc, const BlockRecord& record) { return pc < record.start_pc; });
+		if (next_record != m_block_records.end() &&
+			next_record->start_pc < natural_stop_pc)
+		{
+			const u32 boundary_instructions =
+				(next_record->start_pc - start_pc) / sizeof(u32);
+			BlockScanResult bounded_scan;
+			if (boundary_instructions != 0 &&
+				ScanStraightLineBlock(start_pc, boundary_instructions, &bounded_scan) &&
+				bounded_scan.instruction_count == boundary_instructions &&
+				bounded_scan.stop_pc == next_record->start_pc)
+			{
+				scan = bounded_scan;
+			}
+			else if (boundary_instructions != 0 &&
+				boundary_instructions + 1 <= MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS)
+			{
+				// PCSX2 recDI()/recompileNextInstruction() keeps DI with its
+				// following instruction, just as recRecompile() keeps a branch with
+				// its delay slot. If an existing target names that required follower,
+				// overlap exactly the atomic pair instead of ignoring the target and
+				// rediscovering the entire natural region.
+				const u32 preceding_op = memRead32(next_record->start_pc - sizeof(u32));
+				BlockScanResult atomic_scan;
+				if ((BlockCompiler::RequiresFollowingInstructionInBlock(preceding_op) ||
+						BlockCompiler::IsSupportedBranchOpcode(preceding_op)) &&
+					ScanStraightLineBlock(start_pc, boundary_instructions + 1, &atomic_scan) &&
+					atomic_scan.instruction_count == boundary_instructions + 1 &&
+					atomic_scan.stop_pc == next_record->start_pc + sizeof(u32))
+				{
+					scan = atomic_scan;
+				}
+			}
+		}
+
+		// A continuation created by the A32 code budget inherits the original
+		// source span from its immediately adjacent predecessor.  All later split
+		// parts then validate and invalidate as one proof group, because changing
+		// any member can change the cycle-exactness of every artificial seam.
+		// ExecuteCompiledBlock() uses this same resolver for exact trace windows,
+		// whose provider loop rescans and submits each remainder explicitly.
+		u32 dependency_start_pc = start_pc;
+		u32 dependency_instruction_count = scan.instruction_count;
+		u32 dependency_charged_cycles_before = 0;
+		ResolveAdjacentSplitDependency(start_pc, scan.instruction_count,
+			&dependency_start_pc, &dependency_instruction_count,
+			&dependency_charged_cycles_before);
+
 		CachedBlock* entry = AllocateCacheEntry();
 		if (!entry || !CompileIntoCacheEntry(*entry, start_pc, scan.instruction_count,
-				&result->scaled_cycles))
+				&result->scaled_cycles, true, dependency_start_pc,
+				dependency_instruction_count,
+				dependency_charged_cycles_before))
 		{
 			return false;
 		}
@@ -2254,6 +2692,7 @@ namespace VitaEE
 				result->exit = BlockExitKind::InterpreterStep;
 				result->exit_value = static_cast<u32>(BlockExitKind::InterpreterStep);
 				result->instruction_count = 1;
+				result->source_instruction_count = 1;
 				return true;
 			}
 		}

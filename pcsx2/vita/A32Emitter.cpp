@@ -361,6 +361,7 @@ namespace VitaA32
 		, m_capacity(std::exchange(other.m_capacity, 0))
 		, m_offset(std::exchange(other.m_offset, 0))
 		, m_owns_memory(std::exchange(other.m_owns_memory, false))
+		, m_out_of_space(std::exchange(other.m_out_of_space, false))
 		, m_neon_logical_first_q(std::exchange(other.m_neon_logical_first_q, 0))
 		, m_neon_physical_first_q(std::exchange(other.m_neon_physical_first_q, 0))
 		, m_neon_mapped_q_count(std::exchange(other.m_neon_mapped_q_count, 0))
@@ -376,6 +377,7 @@ namespace VitaA32
 			m_capacity = std::exchange(other.m_capacity, 0);
 			m_offset = std::exchange(other.m_offset, 0);
 			m_owns_memory = std::exchange(other.m_owns_memory, false);
+			m_out_of_space = std::exchange(other.m_out_of_space, false);
 			m_neon_logical_first_q = std::exchange(other.m_neon_logical_first_q, 0);
 			m_neon_physical_first_q = std::exchange(other.m_neon_physical_first_q, 0);
 			m_neon_mapped_q_count = std::exchange(other.m_neon_mapped_q_count, 0);
@@ -400,12 +402,14 @@ namespace VitaA32
 		m_capacity = aligned_capacity;
 		m_offset = 0;
 		m_owns_memory = true;
+		m_out_of_space = false;
 		return true;
 #else
 		m_base = static_cast<u8*>(VitaVM::AllocJitMemory(capacity));
 		m_capacity = m_base ? capacity : 0;
 		m_offset = 0;
 		m_owns_memory = (m_base != nullptr);
+		m_out_of_space = false;
 		return (m_base != nullptr);
 #endif
 	}
@@ -420,12 +424,14 @@ namespace VitaA32
 		m_capacity = capacity;
 		m_offset = 0;
 		m_owns_memory = false;
+		m_out_of_space = false;
 		return true;
 	}
 
 	void CodeBuffer::Reset()
 	{
 		m_offset = 0;
+		m_out_of_space = false;
 	}
 
 	void CodeBuffer::SetNeonQRegisterBankMapping(unsigned logical_first_q,
@@ -481,6 +487,7 @@ namespace VitaA32
 		m_capacity = 0;
 		m_offset = 0;
 		m_owns_memory = false;
+		m_out_of_space = false;
 		m_neon_logical_first_q = 0;
 		m_neon_physical_first_q = 0;
 		m_neon_mapped_q_count = 0;
@@ -489,7 +496,10 @@ namespace VitaA32
 	bool CodeBuffer::EmitU32(u32 instruction)
 	{
 		if (!HasSpace(sizeof(instruction)))
+		{
+			m_out_of_space = true;
 			return false;
+		}
 
 		std::memcpy(m_base + m_offset, &instruction, sizeof(instruction));
 		m_offset += sizeof(instruction);

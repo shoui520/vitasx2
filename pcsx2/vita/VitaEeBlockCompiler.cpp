@@ -3356,6 +3356,237 @@ namespace VitaEE
 		return IsBranchLikelyOpcode(op);
 	}
 
+	bool BlockCompiler::CalculateScaledCyclesForRange(u32 start_pc,
+		u32 instruction_count, bool omit_final_likely_delay_slot,
+		u32* scaled_cycles)
+	{
+		u32 committed_scaled_cycles = 0;
+		return CalculateScaledCycleStateForRange(start_pc, instruction_count,
+			omit_final_likely_delay_slot, &committed_scaled_cycles, scaled_cycles);
+	}
+
+	bool BlockCompiler::CalculateScaledCycleStateForRange(u32 start_pc,
+		u32 instruction_count, bool omit_final_likely_delay_slot,
+		u32* committed_scaled_cycles, u32* final_scaled_cycles)
+	{
+		if (!committed_scaled_cycles || !final_scaled_cycles || instruction_count == 0 ||
+			instruction_count > ((UINT32_MAX - start_pc) / sizeof(u32)))
+		{
+			return false;
+		}
+
+		const u32 branch_index = instruction_count >= 2 ?
+			instruction_count - 2 : UINT32_MAX;
+		const u32 final_branch_op = branch_index != UINT32_MAX ?
+			memRead32(start_pc + branch_index * sizeof(u32)) : 0;
+		const bool final_branch = branch_index != UINT32_MAX &&
+			IsSupportedBranchOpcode(final_branch_op);
+		const bool final_branch_likely = final_branch &&
+			IsBranchLikelyOpcode(final_branch_op);
+		u32 raw_cycles = 0;
+		u32 committed_cycles = 0;
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			if ((omit_final_likely_delay_slot && final_branch_likely &&
+					i + 1 == instruction_count) ||
+				(final_branch && i == branch_index + 1 &&
+					IsSupportedBranchOpcode(op)))
+			{
+				continue;
+			}
+
+			const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+			raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) *
+				cycle_factor;
+			if (IsCycleCommittingFastCOP0(op))
+			{
+				committed_cycles += ScaleBlockCycles(raw_cycles);
+				raw_cycles = RawCycleRemainderAfterClear(raw_cycles);
+			}
+		}
+
+		*committed_scaled_cycles = committed_cycles;
+		*final_scaled_cycles = committed_cycles + ScaleBlockCycles(raw_cycles);
+		return true;
+	}
+
+	bool BlockCompiler::DoesSplitPreserveScaledCycleTimeline(u32 start_pc,
+		u32 instruction_count, u32 prefix_instruction_count)
+	{
+		return DoesSplitAfterChargedPrefixPreserveScaledCycleTimeline(
+			start_pc, instruction_count, 0, 0, prefix_instruction_count);
+	}
+
+	bool BlockCompiler::DoesSplitAfterChargedPrefixPreserveScaledCycleTimeline(
+		u32 dependency_start_pc, u32 dependency_instruction_count,
+		u32 segment_start_instruction, u32 charged_prefix_cycles,
+		u32 segment_prefix_instruction_count)
+	{
+		if (dependency_instruction_count == 0 ||
+			dependency_instruction_count >
+				((UINT32_MAX - dependency_start_pc) / sizeof(u32)) ||
+			segment_start_instruction >= dependency_instruction_count ||
+			segment_prefix_instruction_count == 0 ||
+			segment_prefix_instruction_count >=
+				dependency_instruction_count - segment_start_instruction)
+		{
+			return false;
+		}
+		const u32 segment_pc = dependency_start_pc +
+			segment_start_instruction * sizeof(u32);
+		const u32 absolute_prefix_instruction_count =
+			segment_start_instruction + segment_prefix_instruction_count;
+
+		// MTC0 Config can change the bit-18 EE cycle factor.  PCSX2's unsplit
+		// recRecompile() charges the complete source block with the factor that
+		// was active at compile time, whereas a physical continuation is compiled
+		// after the prefix has executed.  Without proving the value written by RT,
+		// no cycle calculation performed here can make that new compilation seam
+		// equivalent.  Keep Config writes and their suffix in one physical block.
+		for (u32 i = 0; i < segment_prefix_instruction_count; i++)
+		{
+			const u32 op = memRead32(segment_pc + i * sizeof(u32));
+			if ((op >> 26) == 0x10 && ((op >> 21) & 0x1f) == 0x04 && RD(op) == 0x10)
+				return false;
+		}
+
+		const u32 suffix_pc = dependency_start_pc +
+			absolute_prefix_instruction_count * sizeof(u32);
+		const u32 suffix_instruction_count =
+			dependency_instruction_count - absolute_prefix_instruction_count;
+		u32 segment_committed_cycles = 0;
+		u32 segment_final_cycles = 0;
+		u32 unsplit_prefix_committed_cycles = 0;
+		u32 unsplit_prefix_final_cycles = 0;
+		if (!CalculateScaledCycleStateForRange(segment_pc,
+				segment_prefix_instruction_count, false,
+				&segment_committed_cycles, &segment_final_cycles) ||
+			!CalculateScaledCycleStateForRange(dependency_start_pc,
+				absolute_prefix_instruction_count, false,
+				&unsplit_prefix_committed_cycles, &unsplit_prefix_final_cycles))
+		{
+			return false;
+		}
+		const u32 prefix_tail_op = memRead32(suffix_pc - sizeof(u32));
+		if (charged_prefix_cycles + segment_final_cycles !=
+			unsplit_prefix_final_cycles ||
+			(IsCycleCommittingFastCOP0(prefix_tail_op) &&
+				charged_prefix_cycles + segment_committed_cycles !=
+					unsplit_prefix_committed_cycles))
+		{
+			return false;
+		}
+		const u32 charged_through_candidate =
+			charged_prefix_cycles + segment_final_cycles;
+
+		const auto can_observe_cycles = [](u32 op) {
+			if (IsCycleCommittingFastCOP0(op) || RequiresBlockEndAfterOpcode(op))
+				return true;
+
+			// Every supported memory family can enter a vTLB handler, counter-read,
+			// alignment-exception, or VU synchronization cold tail. COP helpers and
+			// interlocks likewise publish the current EE time.
+			switch (op >> 26)
+			{
+				case 0x10: // COP0
+				case 0x11: // COP1
+				case 0x12: // COP2
+				case 0x1a: // LDL
+				case 0x1b: // LDR
+				case 0x1e: // LQ
+				case 0x1f: // SQ
+				case 0x20: // LB
+				case 0x21: // LH
+				case 0x22: // LWL
+				case 0x23: // LW
+				case 0x24: // LBU
+				case 0x25: // LHU
+				case 0x26: // LWR
+				case 0x27: // LWU
+				case 0x28: // SB
+				case 0x29: // SH
+				case 0x2a: // SWL
+				case 0x2b: // SW
+				case 0x2c: // SDL
+				case 0x2d: // SDR
+				case 0x2e: // SWR
+				case 0x2f: // CACHE
+				case 0x31: // LWC1
+				case 0x36: // LQC2
+				case 0x37: // LD
+				case 0x39: // SWC1
+				case 0x3e: // SQC2
+				case 0x3f: // SD
+					return true;
+				default:
+					return false;
+			}
+		};
+
+		// A split adds a real block tail and restarts PCSX2's fixed-point cycle
+		// accumulator. Aggregate equality is insufficient: Count/perf reads,
+		// helper/exception cold tails, address errors, counter reads, and COP2
+		// interlocks can observe cycles before the suffix finishes.  When this is
+		// a later split, charged_prefix_cycles is the exact sum of all earlier
+		// physical parts, so the proof composes without assuming scaled cycles are
+		// additive.
+		for (u32 suffix_prefix = 1; suffix_prefix <= suffix_instruction_count;
+			suffix_prefix++)
+		{
+			const u32 op = memRead32(suffix_pc + (suffix_prefix - 1) * sizeof(u32));
+			if (suffix_prefix != suffix_instruction_count && !can_observe_cycles(op))
+				continue;
+
+			u32 unsplit_committed_cycles = 0;
+			u32 unsplit_final_cycles = 0;
+			u32 split_committed_cycles = 0;
+			u32 split_final_cycles = 0;
+			if (!CalculateScaledCycleStateForRange(dependency_start_pc,
+					absolute_prefix_instruction_count + suffix_prefix, false,
+					&unsplit_committed_cycles, &unsplit_final_cycles) ||
+				!CalculateScaledCycleStateForRange(suffix_pc, suffix_prefix, false,
+					&split_committed_cycles, &split_final_cycles))
+			{
+				return false;
+			}
+
+			// A fast Count/perf/status transfer observes the commit before the
+			// eventual block tail adds ScaleBlockCycles(raw_remainder). Compare that
+			// exact instant separately; the final-tail comparison alone can hide a
+			// one-cycle discrepancy under aggressive EE cycle-rate speedhacks.
+			if (IsCycleCommittingFastCOP0(op) &&
+				charged_through_candidate + split_committed_cycles !=
+					unsplit_committed_cycles)
+			{
+				return false;
+			}
+			if ((!IsCycleCommittingFastCOP0(op) ||
+					suffix_prefix == suffix_instruction_count) &&
+				charged_through_candidate + split_final_cycles !=
+					unsplit_final_cycles)
+			{
+				return false;
+			}
+		}
+
+		const bool final_branch_likely = dependency_instruction_count >= 2 &&
+			IsBranchLikely(memRead32(dependency_start_pc +
+				(dependency_instruction_count - 2) * sizeof(u32)));
+		if (!final_branch_likely)
+			return true;
+
+		u32 unsplit_not_taken_cycles = 0;
+		u32 split_not_taken_cycles = 0;
+		return CalculateScaledCyclesForRange(dependency_start_pc,
+			dependency_instruction_count, true,
+				&unsplit_not_taken_cycles) &&
+			CalculateScaledCyclesForRange(suffix_pc, suffix_instruction_count, true,
+				&split_not_taken_cycles) &&
+			charged_through_candidate + split_not_taken_cycles ==
+				unsplit_not_taken_cycles;
+	}
+
 	bool BlockCompiler::CanCompileDelaySlotOpcode(u32 op)
 	{
 		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() detects branches in
@@ -3400,6 +3631,14 @@ namespace VitaEE
 			default:
 				return false;
 		}
+	}
+
+	bool BlockCompiler::RequiresFollowingInstructionInBlock(u32 op)
+	{
+		// PCSX2 owner: x86/iCOP0.cpp::recDI() recompiles the following
+		// instruction before clearing Status.EIE.  A physical A32 code-budget
+		// boundary therefore cannot publish DI as the final instruction.
+		return IsDI(op);
 	}
 
 	bool BlockCompiler::RequiresTraceWindowEndAfterOpcode(u32 op)
