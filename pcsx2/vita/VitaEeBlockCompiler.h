@@ -638,6 +638,7 @@ namespace VitaEE
 		bool EmitMFC0CountFast(u32 op, u32 scaled_cycles_through_instruction);
 		bool EmitMFC0PerfCounterFast(u32 op, u32 scaled_cycles_through_instruction);
 		bool EmitMTC0Fast(u32 op, u32 raw_cycles_through_instruction);
+		bool EmitTLBWriteInBlock(u32 op, u32 next_pc, const void* helper);
 		bool EmitSetNextEventDelta4FromCurrentCycle();
 		bool EmitEIEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
 		bool EmitERETEventExit(u32 op, u32 raw_cycles_through_instruction, const void* event_exit);
@@ -963,7 +964,7 @@ namespace VitaEE
 		bool EmitAddressErrorEventExit(u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, bool store, const GprPinDirtyMasks& dirty_pins);
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
-			const void* helper, const void* event_exit, bool request_cache_reset = false);
+			const void* helper, const void* event_exit);
 		bool FlushColdTails();
 		void ClearGprConstState();
 		void ClearSaConstState();
@@ -1301,6 +1302,9 @@ namespace VitaEE
 		// Q4-Q7 bank in qcache blocks; the block classifier makes those roles
 		// mutually exclusive. Reset per block in BeginBlock().
 		bool m_cop2_norm_consts_ready = false;
+		// Once an in-block TLB write has executed, suffix memory operations must
+		// not embed a compile-time vmv.assumePtr() from the preceding mapping.
+		bool m_runtime_tlb_mapping_may_have_changed = false;
 		bool m_gpr_q_cache_enabled = false;
 		bool m_persistent_dispatch_exits = false;
 #if defined(VITASX2_QEMU_VALIDATION)

@@ -501,9 +501,12 @@ u32 executeCacheDxltgTagSweep(u32 start_pc, u32 fallthrough_pc,
 	u32 packed_guests, u32 packed_cycles)
 {
 	// PCSX2 owners: executeCacheOp()'s DXLTG case, COP0.cpp::MFC0(),
-	// R5900OpcodeImpl.cpp scalar arithmetic, and x86 iR5900.cpp::iBranchTest().
+	// R5900OpcodeImpl.cpp scalar arithmetic, and
+	// x86/ix86-32/iR5900.cpp::iBranchTest().
 	// The caller has matched the exact two-way kernel loop and packed its six
-	// distinct GPRs plus the ordinary A32 block-boundary cycle costs.
+	// distinct GPRs plus PCSX2's entry-dependent logical-block cycle costs.
+	// x86/iR5900Misc.cpp::recSYNC()/recCACHE() emit no branch test, so the only
+	// observable scheduler seams are the two inner BNEs and the outer BNE.
 	constexpr u32 COMPLETE = 0;
 	constexpr u32 SELF = 1;
 	constexpr u32 EVENT = 2;
@@ -513,11 +516,11 @@ u32 executeCacheDxltgTagSweep(u32 start_pc, u32 fallthrough_pc,
 	const unsigned upper_guest = (packed_guests >> 15) & 0x1f;
 	const unsigned induction_guest = (packed_guests >> 20) & 0x1f;
 	const unsigned mask_guest = (packed_guests >> 25) & 0x1f;
-	const u32 sync_cycles = packed_cycles & 0x3f;
-	const u32 cache_cycles = (packed_cycles >> 6) & 0x3f;
-	const u32 compare_cycles = (packed_cycles >> 12) & 0x3f;
-	const u32 padding_sync_cycles = (packed_cycles >> 18) & 0x3f;
-	const u32 induction_cycles = (packed_cycles >> 24) & 0x3f;
+	const u32 first_way_cycles = packed_cycles & 0x3f;
+	const u32 second_way_target_cycles = (packed_cycles >> 6) & 0x3f;
+	const u32 second_way_fallthrough_cycles = (packed_cycles >> 12) & 0x3f;
+	const u32 outer_target_cycles = (packed_cycles >> 18) & 0x3f;
+	const u32 outer_fallthrough_cycles = (packed_cycles >> 24) & 0x3f;
 	const u64 induction_value = cpuRegs.GPR.r[induction_guest].UD[0];
 	const u32 induction = static_cast<u32>(induction_value);
 	const bool batchable = induction_value == static_cast<u64>(
@@ -572,28 +575,15 @@ u32 executeCacheDxltgTagSweep(u32 start_pc, u32 fallthrough_pc,
 
 	for (;;)
 	{
-		if (advance(sync_cycles, start_pc + 4))
-			return finish(EVENT);
 		load_tag(cpuRegs.GPR.r[induction_guest].UL[0]);
-		if (advance(cache_cycles, start_pc + 8))
-			return finish(EVENT);
-		if (advance(sync_cycles, start_pc + 12))
-			return finish(EVENT);
 		const bool first_taken = compare_tag();
-		if (advance(compare_cycles, first_taken ? start_pc + 60 : start_pc + 40))
-			return finish(EVENT);
-		if (advance(first_taken ? sync_cycles : padding_sync_cycles, start_pc + 64))
+		if (advance(first_way_cycles, first_taken ? start_pc + 60 : start_pc + 40))
 			return finish(EVENT);
 
 		load_tag(cpuRegs.GPR.r[induction_guest].UL[0] + 1);
-		if (advance(cache_cycles, start_pc + 68))
-			return finish(EVENT);
-		if (advance(sync_cycles, start_pc + 72))
-			return finish(EVENT);
 		const bool second_taken = compare_tag();
-		if (advance(compare_cycles, second_taken ? start_pc + 120 : start_pc + 100))
-			return finish(EVENT);
-		if (advance(second_taken ? sync_cycles : padding_sync_cycles, start_pc + 124))
+		if (advance(first_taken ? second_way_target_cycles : second_way_fallthrough_cycles,
+				second_taken ? start_pc + 120 : start_pc + 100))
 			return finish(EVENT);
 
 		const u32 updated_induction = cpuRegs.GPR.r[induction_guest].UL[0] + 64;
@@ -601,7 +591,8 @@ u32 executeCacheDxltgTagSweep(u32 start_pc, u32 fallthrough_pc,
 		const bool repeat = cpuRegs.GPR.r[induction_guest].SD[0] < 4096;
 		cpuRegs.GPR.r[result_guest].UD[0] = repeat ? 1 : 0;
 		completed_iterations++;
-		if (advance(induction_cycles, repeat ? start_pc : fallthrough_pc))
+		if (advance(second_taken ? outer_target_cycles : outer_fallthrough_cycles,
+				repeat ? start_pc : fallthrough_pc))
 			return finish(EVENT);
 		if (!repeat)
 			return finish(COMPLETE);

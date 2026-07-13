@@ -1685,6 +1685,15 @@ namespace VitaEE
 			}
 		}
 
+		bool IsInBlockTLBWrite(u32 op)
+		{
+			if ((op >> 26) != 0x10 || ((op >> 21) & 0x1f) != 0x10)
+				return false;
+
+			const u32 function = op & 0x3f;
+			return function == 0x02 || function == 0x06; // TLBWI / TLBWR
+		}
+
 		bool IsCycleCommittingFastCOP0(u32 op)
 		{
 			if ((op >> 26) != 0x10)
@@ -3444,10 +3453,15 @@ namespace VitaEE
 		// after the prefix has executed.  Without proving the value written by RT,
 		// no cycle calculation performed here can make that new compilation seam
 		// equivalent.  Keep Config writes and their suffix in one physical block.
+		// TLBWI/TLBWR similarly request deferred A32 cache invalidation which must
+		// be consumed only after their owning source block reaches its natural tail.
+		// A code-budget seam after either write would consume that reset early, so a
+		// correct fallback may split before the first write but never after one.
 		for (u32 i = 0; i < segment_prefix_instruction_count; i++)
 		{
 			const u32 op = memRead32(segment_pc + i * sizeof(u32));
-			if ((op >> 26) == 0x10 && ((op >> 21) & 0x1f) == 0x04 && RD(op) == 0x10)
+			if (((op >> 26) == 0x10 && ((op >> 21) & 0x1f) == 0x04 && RD(op) == 0x10) ||
+				IsInBlockTLBWrite(op))
 				return false;
 		}
 
@@ -3597,15 +3611,20 @@ namespace VitaEE
 		// are helper-backed exception paths, and Interpreter.cpp::_doBranch_shared()
 		// marks cpuRegs.branch before executing them as delay slots.
 		// Trap ops use the same exception-shaped helper/event tail.
-		return CanCompileOpcode(op) && (op >> 26) != 0x12 && !IsDI(op) && !IsInBlockTLBReadProbe(op) &&
+		return CanCompileOpcode(op) && (op >> 26) != 0x12 && !IsDI(op) &&
+			   !IsInBlockTLBReadProbe(op) && !IsInBlockTLBWrite(op) &&
 			   (!RequiresBlockEndAfterOpcode(op) || IsSYSCALL(op) || IsBREAK(op) ||
 				   IsTrapOpcode(op) || IsCounterReadLoad(op));
 	}
 
 	bool BlockCompiler::RequiresBlockEndAfterOpcode(u32 op)
 	{
-		// R5900OpcodeImpl.cpp::SYNC() is a no-op, but local EE docs still forbid
-		// compiling it inside a branch delay slot, so make it a one-op tail.
+		// PCSX2 owners R5900OpcodeImpl.cpp::SYNC() and
+		// x86/iR5900Misc.cpp::recSYNC() both make SYNC a generated no-op.  In
+		// particular, the x86 recompiler does not turn it into a logical block or
+		// event-test boundary, including when it occupies a delay slot.  Keeping
+		// SYNC inside the surrounding A32 block is therefore required for both the
+		// owning block shape and scheduler cadence.
 		// Counter-read narrow loads (LB/LH/LW/LBU/LHU) do NOT end blocks: the
 		// PCSX2 x86 comparison point iR5900LoadStore.cpp::recLoad() only ends
 		// the block for a compile-time-constant counter-page address, and the
@@ -3616,12 +3635,12 @@ namespace VitaEE
 		{
 			case 0x00:
 				return (op & 0x3f) == 0x0c || (op & 0x3f) == 0x0d ||
-					   (op & 0x3f) == 0x0f || IsSpecialTrap(op);
+					   IsSpecialTrap(op);
 			case 0x01:
 				return IsRegImmTrap(op);
 			case 0x10:
 				return CanCompileCOP0(op) && !IsDI(op) && !IsFastMFC0(op) && !IsFastMTC0(op) &&
-					   !IsInBlockTLBReadProbe(op);
+					   !IsInBlockTLBReadProbe(op) && !IsInBlockTLBWrite(op);
 			case 0x11:
 				return CanCompileCOP1(op) && !IsFastCOP1InBlock(op);
 			case 0x12:
@@ -4705,6 +4724,11 @@ namespace VitaEE
 			for (u32 i = 0; i < instruction_count; i++)
 			{
 				const u32 op = memRead32(start_pc + i * sizeof(u32));
+				// A TLB write requests deferred code-cache invalidation.  No allocator
+				// signature may cross the forced provider boundary which follows the
+				// owning source block.
+				if (IsInBlockTLBWrite(op))
+					return false;
 				switch (op >> 26)
 				{
 					case 0x11: // COP1
@@ -7140,7 +7164,11 @@ namespace VitaEE
 	bool BlockCompiler::TryEmitKnownVtlbNonHandlerHostAddress(u32 guest_addr, unsigned host_reg,
 		KnownVtlbFastPathKind kind)
 	{
-		if (!vtlb_private::vtlbdata.vmap)
+		// A known-address fast path embeds vmv.assumePtr() at compile time.  Once
+		// an earlier TLBWI/TLBWR in this same generated block has executed, that
+		// literal can name the old mapping even though the guest address remains a
+		// constant.  Force every suffix access through the runtime vTLB lookup.
+		if (m_runtime_tlb_mapping_may_have_changed || !vtlb_private::vtlbdata.vmap)
 			return false;
 
 		const vtlb_private::VTLBVirtual vmv =
@@ -9569,6 +9597,7 @@ namespace VitaEE
 		ClearSaConstState();
 		ClearCop1NormalizedState();
 		m_cop2_norm_consts_ready = false;
+		m_runtime_tlb_mapping_may_have_changed = false;
 		for (unsigned i = 0; i < MAX_GPR_PINS; i++)
 		{
 			m_pin_dirty_low[i] = false;
@@ -9733,21 +9762,25 @@ namespace VitaEE
 			}
 			return ScaleBlockCycles(raw_cycles);
 		};
-		const u32 sync_cycles = range_cycles(0, 1);
-		const u32 cache_cycles = range_cycles(1, 1);
-		const u32 compare_cycles = range_cycles(3, 7);
-		const u32 padding_sync_cycles = range_cycles(10, 6);
-		const u32 induction_cycles = range_cycles(31, 4);
-		if (sync_cycles > 0x3f || cache_cycles > 0x3f || compare_cycles > 0x3f ||
-			padding_sync_cycles > 0x3f || induction_cycles > 0x3f)
+		// PCSX2 owners: x86/iR5900Misc.cpp::recSYNC()/recCACHE() emit no
+		// iBranchTest().  Pack the complete logical blocks ending at each BNE,
+		// including the longer fallthrough entries through the padding NOPs.
+		const u32 first_way_cycles = range_cycles(0, 10);
+		const u32 second_way_target_cycles = range_cycles(15, 10);
+		const u32 second_way_fallthrough_cycles = range_cycles(10, 15);
+		const u32 outer_target_cycles = range_cycles(30, 5);
+		const u32 outer_fallthrough_cycles = range_cycles(25, 10);
+		if (first_way_cycles > 0x3f || second_way_target_cycles > 0x3f ||
+			second_way_fallthrough_cycles > 0x3f || outer_target_cycles > 0x3f ||
+			outer_fallthrough_cycles > 0x3f)
 		{
 			return false;
 		}
-		const u32 packed_cycles = sync_cycles | (cache_cycles << 6) |
-			(compare_cycles << 12) | (padding_sync_cycles << 18) |
-			(induction_cycles << 24);
-		const u32 taken_iteration_cycles = sync_cycles * 5 + cache_cycles * 2 +
-			compare_cycles * 2 + induction_cycles;
+		const u32 packed_cycles = first_way_cycles | (second_way_target_cycles << 6) |
+			(second_way_fallthrough_cycles << 12) | (outer_target_cycles << 18) |
+			(outer_fallthrough_cycles << 24);
+		const u32 taken_iteration_cycles = first_way_cycles +
+			second_way_target_cycles + outer_target_cycles;
 		if (scaled_cycles)
 			*scaled_cycles = taken_iteration_cycles;
 
@@ -10785,6 +10818,33 @@ namespace VitaEE
 		if (compatible_vtlb_fast_entries)
 			*compatible_vtlb_fast_entries = {};
 
+		bool contains_in_block_tlb_write = false;
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			if (IsInBlockTLBWrite(memRead32(start_pc + i * sizeof(u32))))
+			{
+				contains_in_block_tlb_write = true;
+				break;
+			}
+		}
+		if (contains_in_block_tlb_write)
+		{
+			// PCSX2's TLBWI/TLBWR recCall() continues to the natural block tail,
+			// but MapTLB()/UnmapTLB() can invalidate generated translations.  Vita
+			// defers that invalidation until this generated block has unwound, so no
+			// outgoing edge may bypass the provider boundary.  Incoming canonical
+			// links remain safe: they execute the TLB write before reaching this tail.
+			direct_links = nullptr;
+			indirect_lookup_pages_slot = nullptr;
+			direct_linking_enabled_flag = nullptr;
+			gpr_link_signature = nullptr;
+			resident_self_link_entry_offset = nullptr;
+			resident_self_link_entry_loads = nullptr;
+			compatible_link_entry_offset = nullptr;
+			compatible_link_entry_loads = nullptr;
+			compatible_vtlb_fast_entries = nullptr;
+		}
+
 		const u32 previous_block_start_pc = m_current_block_start_pc;
 		const u32 previous_block_instruction_count = m_current_block_instruction_count;
 		const u32 previous_instruction_index = m_current_instruction_index;
@@ -11634,7 +11694,7 @@ namespace VitaEE
 			}
 
 			if ((op >> 26) == 0x10 && CanCompileCOP0(op) && !IsFastMFC0(op) && !IsFastMTC0(op) &&
-				!IsInBlockTLBReadProbe(op))
+				!IsInBlockTLBReadProbe(op) && !IsInBlockTLBWrite(op))
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
@@ -11687,6 +11747,7 @@ namespace VitaEE
 		const bool wait_loop_body = range_loop_dispatch_enabled &&
 			!device_trace_enabled && EmuConfig.Speedhacks.WaitLoop &&
 			!EmuConfig.Gamefixes.GoemonTlbHack &&
+			!contains_in_block_tlb_write &&
 			has_branch && !has_register_branch_target &&
 			!has_static_register_branch_target &&
 			branch_instruction_index + 2 == instruction_count &&
@@ -13614,11 +13675,12 @@ namespace VitaEE
 	{
 		// PCSX2 owner: x86/iCOP0.cpp. CP0_RECOMPILE keeps ordinary MFC0/MTC0,
 		// Count, perf-counter direct cases, straight-line delayed DI, and TLB
-		// read/probe ops inside generated code. MTC0 Status calls
+		// read/probe/write ops inside generated code. MTC0 Status calls
 		// WriteCP0Status() in-block after committing cycles, and EI emits its
 		// Status.EIE/event scheduling directly before the required event tail.
-		// TLB writes, ERET, and the remaining perf helpers keep the event tail
-		// until their exact side effects are ported directly.
+		// TLB writes use PCSX2's helper in-block, then force the natural block tail
+		// through the provider so deferred A32 cache invalidation is safe. ERET and
+		// the remaining perf helpers keep their required event tails.
 		using namespace R5900::Interpreter::OpcodeImpl::COP0;
 			switch ((op >> 21) & 0x1f)
 			{
@@ -13638,11 +13700,11 @@ namespace VitaEE
 					case 0x01: // TLBR, owned by COP0.cpp::TLBR().
 						return EmitTLBRInBlock();
 					case 0x02: // TLBWI, owned by COP0.cpp::TLBWI().
-						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
-							reinterpret_cast<const void*>(&TLBWI), event_exit, true);
+						return EmitTLBWriteInBlock(op, pc + 4,
+							reinterpret_cast<const void*>(&TLBWI));
 					case 0x06: // TLBWR, owned by COP0.cpp::TLBWR().
-						return EmitSystemHelperEventExit(op, pc + 4, raw_cycles_through_instruction,
-							reinterpret_cast<const void*>(&TLBWR), event_exit, true);
+						return EmitTLBWriteInBlock(op, pc + 4,
+							reinterpret_cast<const void*>(&TLBWR));
 					case 0x08: // TLBP, owned by COP0.cpp::TLBP().
 						return EmitTLBPInBlock();
 					case 0x18: // ERET, owned by COP0.cpp::ERET().
@@ -13655,6 +13717,46 @@ namespace VitaEE
 			default:
 				return false;
 		}
+	}
+
+	bool BlockCompiler::EmitTLBWriteInBlock(u32 op, u32 next_pc, const void* helper)
+	{
+		// PCSX2 owner: x86/iCOP0.cpp::recTLBWI()/recTLBWR() call the
+		// COP0.cpp interpreter operation through
+		// x86/ix86-32/iR5900.cpp::recCall(), publishing the
+		// interpreter-visible PC/code and dirty mappings but neither clearing the
+		// block cycle accumulator nor running iBranchTest(). Continue the A32
+		// source block in exactly that shape. MapTLB()/UnmapTLB() can call
+		// Cpu->Clear() while this code is live, so Vita requests the existing
+		// deferred reset; CompileStraightLineBlock suppresses every outgoing link
+		// until the natural tail returns to the provider.
+		if (!helper || !m_code.EmitMovImm32(HOST_TMP0, op) ||
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
+			!EmitFlushDirtyGprPins() ||
+			!EmitStorePc(next_pc) ||
+			!m_code.EmitCallAbsolute(helper) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaRequestA32EeCacheReset)) ||
+			!EmitInvalidateCompatibleVtlbPointers())
+		{
+			return false;
+		}
+
+		// The GPR qcache's logical q0-q7 map entirely to AAPCS caller-clobbered
+		// physical registers, while the persistent COP2 normalization constants
+		// occupy caller-clobbered q8-q11. Architectural GPR backing is already
+		// coherent, so forget those physical representations and let a suffix
+		// reload/rematerialize them after the helper.
+		ClearGprQCache();
+		m_cop2_norm_consts_ready = false;
+		m_runtime_tlb_mapping_may_have_changed = true;
+
+		// Local pins use callee-saved AAPCS hosts. Compatible signatures can
+		// additionally lend caller-clobbered hosts, though TLB-write blocks reject
+		// such signatures today; retain the exact reload contract here so the
+		// helper remains safe if that allocator restriction is later relaxed.
+		return EmitReloadGprPinsAfterClobber(static_cast<u16>(
+			(1u << HOST_TMP0) | (1u << HOST_TMP1) | (1u << HOST_TMP2) |
+			(1u << HOST_TMP3) | (1u << HOST_TMP4) | (1u << HOST_LR)));
 	}
 
 	bool BlockCompiler::EmitMFC0Fast(u32 op, u32 raw_cycles_through_instruction)
@@ -30403,7 +30505,7 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
-		const void* helper, const void* event_exit, bool request_cache_reset)
+		const void* helper, const void* event_exit)
 	{
 		if (!helper || !event_exit || raw_cycles_through_instruction == 0)
 			return false;
@@ -30415,12 +30517,6 @@ namespace VitaEE
 				!EmitStorePc(next_pc) ||
 				!EmitAddScaledCyclesToCpu(cycles) ||
 				!m_code.EmitCallAbsolute(helper))
-		{
-			return false;
-		}
-
-		if (request_cache_reset &&
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&VitaRequestA32EeCacheReset)))
 		{
 			return false;
 		}
