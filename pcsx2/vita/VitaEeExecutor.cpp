@@ -1090,20 +1090,9 @@ namespace VitaEE
 			!Pcsx2Trace::IsGsTraceEnabled() && !Pcsx2Trace::IsVuTraceEnabled() &&
 			!EmuConfig.Gamefixes.GoemonTlbHack;
 #endif
-		if (exact_region_scan_enabled && max_instruction_count >= 35 &&
-			BlockCompiler::IsExactCacheDxltgTagSweep(start_pc, 35))
-		{
-			exact_region_instruction_count = 35;
-		}
-		else if (exact_region_scan_enabled && max_instruction_count >= 17 &&
+		if (exact_region_scan_enabled && max_instruction_count >= 17 &&
 			BlockCompiler::IsExactSelfAddressPairScan(start_pc, 17))
 			exact_region_instruction_count = 17;
-		else if (exact_region_scan_enabled && max_instruction_count >= 9 &&
-			BlockCompiler::IsExactCacheDxwbinLoop(start_pc, 9))
-			exact_region_instruction_count = 9;
-		else if (exact_region_scan_enabled && max_instruction_count >= 8 &&
-			BlockCompiler::IsExactCacheIxinLoop(start_pc, 8))
-			exact_region_instruction_count = 8;
 		if (exact_region_instruction_count != 0)
 		{
 			for (u32 i = 0; i < exact_region_instruction_count; i++)
@@ -1223,7 +1212,7 @@ namespace VitaEE
 
 				const u32 delay_pc = pc + 4;
 				const u32 delay_op = memRead32(delay_pc);
-				if (!BlockCompiler::CanCompileDelaySlotOpcode(delay_op))
+				if (!BlockCompiler::CanCompileDelaySlotOpcode(op, delay_op))
 				{
 					result->stop = BlockScanStop::UnsupportedOpcode;
 					return true;

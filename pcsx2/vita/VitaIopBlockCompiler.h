@@ -104,6 +104,13 @@ namespace VitaIOP
 		u32 hot_dispatch_hit_pc_count;
 		u32 hot_dispatch_hit_pcs[16];
 		u64 hot_dispatch_hit_pc_hits[16];
+		u32 interpreter_fallback_pc_count;
+		u32 interpreter_fallback_pcs[16];
+		u32 interpreter_fallback_owner_pcs[16];
+		u32 interpreter_fallback_owner_opcodes[16];
+		u32 interpreter_fallback_instruction_counts[16];
+		u64 interpreter_fallback_source_hashes[16];
+		u64 interpreter_fallback_hits[16];
 		u64 wait_resume_cache_attempts;
 		u64 wait_resume_cache_hits;
 		u64 wait_resume_cache_misses;
@@ -360,7 +367,7 @@ namespace VitaIOP
 			bool flush_pins = true,
 			u32 known_cycle_count = 0);
 		bool EndBlockLogicalContinuationReturn(bool charge_budget = true,
-			bool flush_pins = true);
+			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockDirectTail(const void* direct_exit,
 			DirectLinkSlot* direct_link_slot,
 			u8 direct_link_slot_index, bool charge_budget = true,
@@ -412,7 +419,6 @@ namespace VitaIOP
 		bool EmitStorePcReg(unsigned host_reg);
 		bool EmitAddCycles(u32 cycles);
 		bool EmitPublishCyclePrefix(u32 cycle_prefix);
-		u32 CurrentTimingHelperSeamCount() const;
 		void RecordBatchedCycleExitSavings(u32 cycle_prefix, bool preserves_argument);
 		bool EmitChargeEeBudget(u32 known_cycle_count = 0, bool pins_flushed = true,
 			u8 scheduler_resume_slot = UINT8_MAX,
@@ -439,6 +445,7 @@ namespace VitaIOP
 		bool EmitMultiplyOp(u32 op, bool is_signed);
 		bool EmitDivideOp(u32 op, bool is_signed);
 		bool EmitExceptionOp(u32 pc, u32 code);
+		bool EmitPrivateCycleHelperCall(const void* helper);
 		bool EmitImmediateOp(u32 op, u32 pc);
 		void ResolveIrxImport(u32 marker_pc, u32 marker_op);
 		bool EmitIrxImportMarker(u32 marker_pc, u32 marker_op);
@@ -481,7 +488,6 @@ namespace VitaIOP
 			const void* helper = nullptr;
 			unsigned rt = 0;
 			unsigned opcode = 0;
-			u32 cycle_prefix = 0;
 		};
 		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);
 
@@ -493,7 +499,6 @@ namespace VitaIOP
 			size_t join_offset = 0;
 			const void* helper = nullptr;
 			unsigned rt = 0;
-			u32 cycle_prefix = 0;
 		};
 		bool EmitScalarStoreColdTail(const ScalarStoreColdTail& tail);
 
@@ -501,7 +506,6 @@ namespace VitaIOP
 		{
 			size_t fallback_branch = static_cast<size_t>(-1);
 			size_t join_offset = 0;
-			u32 cycle_prefix = 0;
 		};
 		bool EmitUnalignedReadColdTail(const UnalignedReadColdTail& tail);
 
@@ -510,7 +514,6 @@ namespace VitaIOP
 			size_t write_fallback_branch = static_cast<size_t>(-1);
 			size_t isolated_fallback_branch = static_cast<size_t>(-1);
 			size_t join_offset = 0;
-			u32 cycle_prefix = 0;
 		};
 		bool EmitUnalignedWriteColdTail(const UnalignedWriteColdTail& tail);
 
@@ -520,7 +523,6 @@ namespace VitaIOP
 			size_t alignment_fallback_branch = static_cast<size_t>(-1);
 			size_t join_offset = 0;
 			unsigned cop2_reg = 0;
-			u32 cycle_prefix = 0;
 		};
 		bool EmitCop2LoadColdTail(const Cop2LoadColdTail& tail);
 
@@ -530,7 +532,6 @@ namespace VitaIOP
 			size_t alignment_fallback_branch = static_cast<size_t>(-1);
 			size_t isolated_fallback_branch = static_cast<size_t>(-1);
 			size_t join_offset = 0;
-			u32 cycle_prefix = 0;
 		};
 		bool EmitCop2StoreColdTail(const Cop2StoreColdTail& tail);
 
@@ -594,8 +595,6 @@ namespace VitaIOP
 		bool m_iop_cycle_base_register_available = false;
 		bool m_defer_cycle_updates = false;
 		bool m_expanded_cycle_batching = false;
-		bool m_track_published_cycle_prefix = false;
-		bool m_initialize_cycle_prefix = false;
 		bool m_fragmented_logical_block = false;
 		bool m_has_budget_exit = false;
 		bool m_source_page_literal_out_of_range = false;
@@ -1243,6 +1242,17 @@ namespace VitaIOP
 		u64 m_hot_dispatch_trusted_raw_hits = 0;
 		u64 m_hot_dispatch_owned_hits = 0;
 		std::unordered_map<u32, u64> m_hot_dispatch_hit_pc_profile;
+		struct InterpreterFallbackProfileEntry
+		{
+			u32 start_pc = 0;
+			u32 owner_pc = 0;
+			u32 owner_opcode = 0;
+			u32 instruction_count = 0;
+			u64 source_hash = 0;
+			u64 hits = 0;
+		};
+		std::unordered_map<u64, InterpreterFallbackProfileEntry>
+			m_interpreter_fallback_pc_profile;
 		u64 m_wait_resume_cache_attempts = 0;
 		u64 m_wait_resume_cache_hits = 0;
 		u64 m_wait_resume_cache_misses = 0;

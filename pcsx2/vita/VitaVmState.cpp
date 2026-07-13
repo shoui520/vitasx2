@@ -5,6 +5,7 @@
 #include "Config.h"
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
 #include "DebugTools/CoreEventTrace.h"
+#include "DebugTools/MachineCheckpointTrace.h"
 #endif
 #include "DebugTools/EeTrace.h"
 #include "DebugTools/GsTrace.h"
@@ -261,6 +262,7 @@ namespace VMManager
 			Pcsx2Trace::NotifyEeElfEntry(s_elf_entry_point);
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
 			Pcsx2Trace::NotifyCoreEventElfEntry(s_elf_entry_point);
+			Pcsx2Trace::NotifyMachineCheckpointElfEntry(s_elf_entry_point);
 #endif
 			Pcsx2Trace::NotifyMemElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyGsElfEntry(s_elf_entry_point);

@@ -7,6 +7,9 @@
 #include "common/Vita/VitaJitMemory.h"
 #include "pcsx2/Config.h"
 #include "pcsx2/DebugTools/Debug.h"
+#if defined(VITASX2_QEMU_VALIDATION)
+#include "pcsx2/DebugTools/CoreEventTrace.h"
+#endif
 #include "pcsx2/DebugTools/SymbolGuardian.h"
 #include "pcsx2/Host.h"
 #include "pcsx2/IopBios.h"
@@ -754,14 +757,14 @@ namespace
 		return (op >> 26) == 0x10 && RS(op) == 0x10;
 	}
 
-	bool IopLogicalBlockRequiresExactHelperTiming(u32 start_pc,
+	bool IopLogicalBlockHasPrivateCycleHelper(u32 start_pc,
 		u32 instruction_count)
 	{
 		// PCSX2 owners: x86/iR3000A.cpp::rpsxSYSCALL/rpsxBREAK and
 		// x86/iR3000Atables.cpp::rpsxRFE(). Their helpers run while
-		// s_psxBlockCycles is still private. The current native helper ABI can
-		// only publish that prefix, so retain the complete PCSX2 BaseBlock and
-		// execute its exact recompiler fallback instead.
+		// s_psxBlockCycles is still private. Native blocks containing one of
+		// these operations therefore require deferred state. Nondeferred
+		// validation controls retain the exact recompiler fallback.
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32* const opcode = ResolveIopRecOpcode(start_pc + i * 4);
@@ -784,47 +787,6 @@ namespace
 		// COP2 GTE command calls. Native A32 templates decode other fields from
 		// the compile-time opcode and do not need the architectural code slot.
 		return IsIopExceptionOpcode(op) || IsIopCop2CommandOpcode(op);
-	}
-
-	constexpr bool IopInstructionRequiresPcState(u32 op)
-	{
-		// PCSX2 owner: x86/iR3000A.cpp keeps psxpc as compile-time state and
-		// stores psxRegs.pc around helper/exit paths. Vita keeps the same rule
-		// conservatively for branches, exceptions, event tests, and memory
-		// operations that can reach helper-backed cold tails.
-		switch (op >> 26)
-		{
-			case 0x00: // SPECIAL
-				return (op & 0x3f) == 0x08 || (op & 0x3f) == 0x09 || // JR/JALR
-					   (op & 0x3f) == 0x0c || (op & 0x3f) == 0x0d; // SYSCALL/BREAK
-			case 0x01: // REGIMM
-			case 0x02: // J
-			case 0x03: // JAL
-			case 0x04: // BEQ
-			case 0x05: // BNE
-			case 0x06: // BLEZ
-			case 0x07: // BGTZ
-				return true;
-			case 0x10: // COP0
-				return RS(op) == 0x10; // RFE calls iopTestIntc().
-			case 0x20: // LB
-			case 0x21: // LH
-			case 0x22: // LWL
-			case 0x23: // LW
-			case 0x24: // LBU
-			case 0x25: // LHU
-			case 0x26: // LWR
-			case 0x28: // SB
-			case 0x29: // SH
-			case 0x2a: // SWL
-			case 0x2b: // SW
-			case 0x2e: // SWR
-			case 0x32: // LWC2
-			case 0x3a: // SWC2
-				return true;
-			default:
-				return false;
-		}
 	}
 
 	constexpr bool IopInstructionCanDeferCycleState(u32 op)
@@ -1010,20 +972,13 @@ namespace
 	bool IopBlockCanBatchCycleUpdates(u32 start_pc, u32 instruction_count)
 	{
 		// PCSX2's R3000A recompiler accumulates s_psxBlockCycles across native
-		// ALU, memory, COP and helper-backed operations, then publishes it at the
-		// actual branch/block exit. Vita retains per-instruction publication only
-		// where the existing helper owns a non-uniform instruction path.
+		// ALU, memory, COP, helper-backed, and rpsxNULL decode slots, then publishes
+		// it at the actual branch/block exit. CanCompileOpcode() has already
+		// established that every non-native word here is exactly that one-cycle,
+		// no-runtime-semantics PCSX2 table entry.
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 op = iopMemRead32(start_pc + i * 4);
-			if (!IsNativeOpcode(op) || IsIopExceptionOpcode(op))
-				return false;
-			// iopTestIntc() schedules from the architecturally current cycle.
-			// Keep RFE on the dynamic path until a prefix-publication contract
-			// handles both its IOP-running and EE-running interrupt arms.
-			if ((op >> 26) == 0x10 && RS(op) == 0x10)
-				return false;
-
 			if (IsIopBranchOrJumpOpcode(op) && i + 1 < instruction_count)
 			{
 				const u32 delay_op = iopMemRead32(start_pc + (i + 1) * 4);
@@ -1156,6 +1111,22 @@ namespace
 		return static_cast<u32>(VitaIOP::BlockExitKind::Direct);
 	}
 
+#if defined(VITASX2_QEMU_VALIDATION)
+	extern "C" __attribute__((noinline)) bool
+	VitaIopA32RunTracedEventTest()
+	{
+		// The product no-work path below is deliberately helper-free. CORE traces
+		// also own iopEventTest()'s Enter/Exit records, so validation executes the
+		// PCSX2 owner whenever that oracle is active instead of silently hiding an
+		// otherwise-correct event boundary.
+		if (!Pcsx2Trace::IsCoreEventTraceEnabled())
+			return false;
+
+		iopEventTest();
+		return true;
+	}
+#endif
+
 	extern "C" __attribute__((noinline)) bool
 	VitaIopA32TraceInstruction(u32 pc, u32 opcode)
 	{
@@ -1271,8 +1242,10 @@ namespace
 	{
 		// PCSX2 owner: R3000AOpcodeTables.cpp::psxSYSCALL()/psxBREAK()
 		// subtract the pre-incremented pc before entering R3000A.cpp::psxException().
+		// Native exception opcodes are admitted only outside a branch delay slot;
+		// the path-dependent x86 delay copies retain their exact fallback.
 		psxRegs.pc = pc;
-		psxException(code, iopIsDelaySlot);
+		psxException(code, false);
 	}
 
 	extern "C" __attribute__((noinline)) u64 VitaIopA32DivResult(u32 rs_value,
@@ -1408,11 +1381,13 @@ namespace VitaIOP
 			__builtin_popcount(static_cast<unsigned>(pushed_registers)));
 		const u32 baseline_pushed_count = static_cast<u32>(__builtin_popcount(
 			static_cast<unsigned>(baseline_saved_registers | REG_LR)));
-		// PCSX2's iPsxAddEECycles(blockCycles) charges an analysis-proven block
-		// directly. Timing-safe blocks need no data slot. Handler-capable blocks
-		// retain one word for the greatest guest-cycle prefix already published.
+		// PCSX2's s_psxBlockCycles remains private through the complete logical
+		// BaseBlock, including every memory/helper call. Deferred blocks therefore
+		// need no cycle-path stack word; only the nondeferred validation control
+		// keeps its entry-cycle snapshot so the final tail can derive its published
+		// delta for EE-budget charging.
 		const bool needs_cycle_stack_word =
-			!m_defer_cycle_updates || m_track_published_cycle_prefix;
+			!m_defer_cycle_updates;
 		if (!needs_cycle_stack_word)
 			m_stack_frame_size = (pushed_count & 1u) ? 4 : 0;
 		else
@@ -1494,12 +1469,6 @@ namespace VitaIOP
 		if (!m_code.EmitMovImm32(HOST_PSX_REGS,
 				static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
 			return false;
-		if (m_initialize_cycle_prefix &&
-			(!m_code.EmitMovImm8(HOST_TMP0, 0) ||
-				!m_code.EmitStrImm12(HOST_TMP0, HOST_SP, 0)))
-		{
-			return false;
-		}
 		if (!m_defer_cycle_updates &&
 			(!m_code.EmitLdrImm12(HOST_TMP0, HOST_PSX_REGS, CYCLE_OFFSET) ||
 				!m_code.EmitStrImm12(HOST_TMP0, HOST_SP, 0)))
@@ -1629,10 +1598,11 @@ namespace VitaIOP
 	}
 
 	bool BlockCompiler::EndBlockLogicalContinuationReturn(bool charge_budget,
-		bool flush_pins)
+		bool flush_pins, u32 known_cycle_count)
 	{
 		if ((flush_pins && !EmitFlushPinnedGprs()) ||
-			(charge_budget && !EmitChargeEeBudget(0, true, UINT8_MAX, false)))
+			(charge_budget && !EmitChargeEeBudget(
+				known_cycle_count, true, UINT8_MAX, false)))
 		{
 			return false;
 		}
@@ -1795,7 +1765,7 @@ namespace VitaIOP
 		bool supported = true;
 		bool reserves_register_jump_host = false;
 		bool reserve_sequential_copy_results =
-			m_defer_cycle_updates && m_track_published_cycle_prefix &&
+			m_defer_cycle_updates &&
 			!m_emit_trace_checks && m_isolate_cache_specialization &&
 			m_isolate_cache_guard_stable && !m_isolate_cache_active &&
 			m_iop_ram_registers_available && m_iop_ram_mask_register_available &&
@@ -2547,36 +2517,11 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitPublishCyclePrefix(u32 cycle_prefix)
 	{
-		// Physical A32 fragments share one private provider frame. The x86 owner
-		// accumulates s_psxBlockCycles for the complete logical BaseBlock, so a
-		// helper in a later fragment must observe the cumulative prefix rather
-		// than time rebased at the artificial fragment entry.
-		cycle_prefix += m_logical_cycle_prefix;
-		if (!m_track_published_cycle_prefix)
-			return EmitAddCycles(cycle_prefix);
-
-		// The stack word is path state, not architectural state: it records how
-		// many guest cycles this callable has already made visible. Every handler
-		// path publishes only the missing delta, while direct RAM paths leave it at
-		// zero until the final block exit.
-		return m_code.EmitLdrImm12(HOST_TMP0, HOST_SP, 0) &&
-			m_code.EmitMovImm32(HOST_TMP1, cycle_prefix) &&
-			m_code.EmitSubReg(HOST_TMP0, HOST_TMP1, HOST_TMP0) &&
-			m_code.EmitStrImm12(HOST_TMP1, HOST_SP, 0) &&
-			m_code.EmitAddImm32(HOST_CALL_SCRATCH, HOST_PSX_REGS,
-				static_cast<u32>(CYCLE_OFFSET)) &&
-			m_code.EmitLdrdImm8(HOST_TMP2, HOST_TMP3, HOST_CALL_SCRATCH, 0) &&
-			m_code.EmitAddReg(HOST_TMP2, HOST_TMP2, HOST_TMP0, true) &&
-			m_code.EmitAdcImm8(HOST_TMP3, HOST_TMP3, 0) &&
-			m_code.EmitStrdImm8(HOST_TMP2, HOST_TMP3, HOST_CALL_SCRATCH, 0);
-	}
-
-	u32 BlockCompiler::CurrentTimingHelperSeamCount() const
-	{
-		return static_cast<u32>(
-			m_scalar_load_cold_tails.size() + m_scalar_store_cold_tails.size() +
-			m_unaligned_read_cold_tails.size() + m_unaligned_write_cold_tails.size() +
-			m_cop2_load_cold_tails.size() + m_cop2_store_cold_tails.size());
+		// PCSX2 owner: x86/iR3000A.cpp::s_psxBlockCycles and
+		// iPsxBranchTest(). Physical A32 fragments are one logical BaseBlock, so
+		// only an owner exit commits the accumulated prefix. Memory helpers never
+		// call this routine and continue to observe the BaseBlock-entry cycle.
+		return EmitAddCycles(m_logical_cycle_prefix + cycle_prefix);
 	}
 
 	void BlockCompiler::RecordBatchedCycleExitSavings(u32 cycle_prefix,
@@ -2587,20 +2532,8 @@ namespace VitaIOP
 
 		const bool ps1_clock_mode = (psxHu32(HW_ICFG) & (1u << 3)) != 0;
 		s32 savings = 0;
-		if (m_track_published_cycle_prefix)
-		{
-			const u32 helper_seams = CurrentTimingHelperSeamCount();
-			savings = static_cast<s32>(4u * cycle_prefix) -
-				static_cast<s32>(9u * helper_seams) -
-				static_cast<s32>(m_unaligned_write_cold_tails.size()) -
-				static_cast<s32>(ps1_clock_mode ? 7u : 6u) -
-				(preserves_argument ? 2 : 0);
-		}
-		else
-		{
-			savings = static_cast<s32>(4u * cycle_prefix) + (ps1_clock_mode ? 0 : 1) -
-			          (preserves_argument ? 2 : 0);
-		}
+		savings = static_cast<s32>(4u * cycle_prefix) +
+			(ps1_clock_mode ? 0 : 1) - (preserves_argument ? 2 : 0);
 
 		const u32 bounded_savings = savings > 0 ? static_cast<u32>(savings) : 0;
 		if (m_batched_cycle_instructions_removed == UINT32_MAX)
@@ -4054,7 +3987,11 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitExceptionOp(u32 pc, u32 code)
 	{
-		if (!m_code.EmitMovImm32(HOST_TMP0, pc) ||
+		// PCSX2 rpsxSYSCALL()/rpsxBREAK() use FLUSH_NODESTROY: dirty guest
+		// values become helper-visible while their allocation remains valid on
+		// the rare exception-vector equality arm.
+		if (!EmitFlushPinnedGprs() ||
+			!m_code.EmitMovImm32(HOST_TMP0, pc) ||
 			!m_code.EmitMovImm32(HOST_TMP1, code) ||
 			!m_code.EmitCallAbsolute(
 				reinterpret_cast<const void*>(&VitaIopA32RaiseException),
@@ -4075,16 +4012,33 @@ namespace VitaIOP
 		// continues compiling/executing the same BaseBlock.
 		const size_t continue_block =
 			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		const u32 logical_cycle_prefix =
+			m_logical_cycle_prefix + m_current_cycle_count;
 		if (continue_block == static_cast<size_t>(-1) ||
-			!EndBlockLogicalContinuationReturn())
+			(m_defer_cycle_updates &&
+				!EmitPublishCyclePrefix(m_current_cycle_count)) ||
+			!EndBlockLogicalContinuationReturn(
+				true, false, logical_cycle_prefix))
 		{
 			return false;
 		}
 
 		const size_t continue_offset = m_code.Size();
+		// On the equality arm x86 keeps the fault/vector PC visible until the
+		// logical BaseBlock's real tail. A later memory/helper call must not see an
+		// artificial compile-time psxpc prefix.
 		return m_code.PatchBranch(
-				continue_block, continue_offset, VitaA32::Condition::EQ) &&
-			EmitStorePc(pc + 4);
+			continue_block, continue_offset, VitaA32::Condition::EQ);
+	}
+
+	bool BlockCompiler::EmitPrivateCycleHelperCall(const void* helper)
+	{
+		// CompileStraightLineBlock rejects this opcode family whenever time is
+		// nondeferred. Keep the invariant local too so a future caller cannot make
+		// rpsxRFE() observe an already-published instruction prefix.
+		if (!m_defer_cycle_updates)
+			return false;
+		return m_code.EmitCallAbsolute(helper, HOST_CALL_SCRATCH);
 	}
 
 	void BlockCompiler::ResolveIrxImport(u32 marker_pc, u32 marker_op)
@@ -4568,7 +4522,6 @@ namespace VitaIOP
 			helper,
 			rt,
 			opcode,
-			m_current_cycle_count,
 		});
 		return true;
 	}
@@ -4590,9 +4543,7 @@ namespace VitaIOP
 			return false;
 		}
 
-		if ((m_track_published_cycle_prefix &&
-				!EmitPublishCyclePrefix(tail.cycle_prefix)) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0,
+		if (!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0,
 				VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(tail.helper, HOST_CALL_SCRATCH))
 		{
@@ -4858,7 +4809,6 @@ namespace VitaIOP
 			m_code.Size(),
 			helper,
 			RT(op),
-			m_current_cycle_count,
 		});
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (used_known_store_value)
@@ -4912,8 +4862,6 @@ namespace VitaIOP
 		if ((tail.isolated_fallback_branch != static_cast<size_t>(-1) &&
 				!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target,
 					VitaA32::Condition::NE)) ||
-			(m_track_published_cycle_prefix &&
-				!EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0,
 				VitaA32::ShiftType::LSL, 0) ||
 			!EmitLoadGpr(tail.rt, HOST_TMP1) ||
@@ -4983,8 +4931,6 @@ namespace VitaIOP
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.fallback_branch, fallback_target,
 				VitaA32::Condition::NE) ||
-			(m_track_published_cycle_prefix &&
-				!EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1,
 				VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32),
@@ -5010,13 +4956,8 @@ namespace VitaIOP
 			(tail.isolated_fallback_branch != static_cast<size_t>(-1) &&
 				!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target,
 					VitaA32::Condition::NE)) ||
-			(m_track_published_cycle_prefix &&
-				!EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1,
 				VitaA32::ShiftType::LSL, 0) ||
-			(m_track_published_cycle_prefix &&
-				!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_SAVED0,
-					VitaA32::ShiftType::LSL, 0)) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemWrite32),
 				HOST_CALL_SCRATCH))
 		{
@@ -5038,8 +4979,6 @@ namespace VitaIOP
 				VitaA32::Condition::NE) ||
 			!m_code.PatchBranch(tail.alignment_fallback_branch, fallback_target,
 				VitaA32::Condition::NE) ||
-			(m_track_published_cycle_prefix &&
-				!EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED0,
 				VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopMemRead32),
@@ -5067,8 +5006,6 @@ namespace VitaIOP
 			(tail.isolated_fallback_branch != static_cast<size_t>(-1) &&
 				!m_code.PatchBranch(tail.isolated_fallback_branch, fallback_target,
 					VitaA32::Condition::NE)) ||
-			(m_track_published_cycle_prefix &&
-				!EmitPublishCyclePrefix(tail.cycle_prefix)) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_SAVED1,
 				VitaA32::ShiftType::LSL, 0) ||
 			!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_SAVED0,
@@ -5182,7 +5119,6 @@ namespace VitaIOP
 		m_unaligned_read_cold_tails.push_back({
 			fallback_branch,
 			m_code.Size(),
-			m_current_cycle_count,
 		});
 
 		if (RT(op) == 0)
@@ -5364,7 +5300,6 @@ namespace VitaIOP
 		m_unaligned_read_cold_tails.push_back({
 			fallback_branch,
 			m_code.Size(),
-			m_current_cycle_count,
 		});
 
 		bool used_known_store_value = false;
@@ -5397,9 +5332,6 @@ namespace VitaIOP
 					 m_code.EmitOrrRegShiftReg(HOST_TMP1, HOST_TMP0, HOST_TMP1,
 						 VitaA32::ShiftType::LSL,
 						 HOST_SAVED0)) ||
-			(m_track_published_cycle_prefix &&
-				!m_code.EmitMovRegShiftImm(HOST_SAVED0, HOST_TMP1,
-					VitaA32::ShiftType::LSL, 0)) ||
 			!m_code.EmitTstImm32(HOST_SAVED1, 0x1f800000u))
 		{
 			return false;
@@ -5426,7 +5358,6 @@ namespace VitaIOP
 			write_fallback_branch,
 			isolated_fallback_branch,
 			m_code.Size(),
-			m_current_cycle_count,
 		});
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (used_known_store_value)
@@ -5901,6 +5832,17 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!EmitQemuCounterIncrement(&s_qemuIopBranchEventTestsEntered))
 			return false;
+		if (!m_code.EmitCallAbsolute(
+				reinterpret_cast<const void*>(&VitaIopA32RunTracedEventTest),
+				HOST_CALL_SCRATCH) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return false;
+		}
+		const size_t traced_event_done =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (traced_event_done == static_cast<size_t>(-1))
+			return false;
 #endif
 		struct HelperBranch
 		{
@@ -6027,7 +5969,14 @@ namespace VitaIOP
 				return false;
 		}
 
-		return m_code.PatchBranch(skip_helper, done_target);
+		if (!m_code.PatchBranch(skip_helper, done_target))
+			return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+		return m_code.PatchBranch(
+			traced_event_done, done_target, VitaA32::Condition::NE);
+#else
+		return true;
+#endif
 	}
 
 	bool BlockCompiler::EmitCop0TransferOp(u32 op, bool to_cop0)
@@ -6074,8 +6023,8 @@ namespace VitaIOP
 			   m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP0) &&
 		       m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS,
 				   static_cast<u16>(CP0_STATUS_OFFSET)) &&
-		       m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopTestIntc),
-				   HOST_CALL_SCRATCH);
+		       EmitPrivateCycleHelperCall(
+				   reinterpret_cast<const void*>(&iopTestIntc));
 	}
 
 	bool BlockCompiler::EmitCop2CommandOp(u32 op)
@@ -6451,7 +6400,6 @@ namespace VitaIOP
 				alignment_fallback_branch,
 				m_code.Size(),
 				RT(op),
-				m_current_cycle_count,
 			});
 			return true;
 		}
@@ -6513,7 +6461,6 @@ namespace VitaIOP
 				alignment_fallback_branch,
 				isolated_fallback_branch,
 				m_code.Size(),
-				m_current_cycle_count,
 			});
 			return true;
 		}
@@ -6748,7 +6695,7 @@ namespace VitaIOP
 		if (!MatchSequentialQwordCopyShape(start_pc, instruction_index,
 				instruction_count, &candidate) ||
 			m_emit_trace_checks || !m_defer_cycle_updates ||
-			!m_track_published_cycle_prefix || !m_iop_ram_registers_available ||
+			!m_iop_ram_registers_available ||
 			!m_iop_ram_mask_register_available || !m_isolate_cache_specialization ||
 			!m_isolate_cache_guard_stable || m_isolate_cache_active ||
 			!m_ram_source_page_live_flags ||
@@ -6781,8 +6728,8 @@ namespace VitaIOP
 		// x86/iR3000A.cpp::PSXREC_CLEARM. The fast arm coalesces the exact
 		// ordinary-RAM result of four adjacent reads followed by the same four
 		// adjacent writes. Every rejected alias/alignment/wrap/page case executes
-		// the owner helpers in original instruction order and publishes each
-		// handler-visible cycle prefix.
+		// the owner helpers in original instruction order while the complete
+		// BaseBlock cycle delta remains private; the owner tail publishes it once.
 		std::array<size_t, 5> fallback_branches{};
 		fallback_branches.fill(static_cast<size_t>(-1));
 		if (!EmitEffectiveAddress(copy.load_ops[0], HOST_SAVED0) ||
@@ -6916,11 +6863,6 @@ namespace VitaIOP
 			m_current_instruction_count = instruction_index + i + 1;
 			m_current_cycle_count = IopCompilerBlockCycles(
 				start_pc, m_current_instruction_count, m_emit_trace_checks);
-			if (m_track_published_cycle_prefix &&
-				!EmitPublishCyclePrefix(m_current_cycle_count))
-			{
-				return false;
-			}
 			if (!EmitEffectiveAddress(op, HOST_TMP0))
 				return false;
 			if (load)
@@ -7106,8 +7048,6 @@ namespace VitaIOP
 		m_branch_predicate_producer_true_condition = VitaA32::Condition::AL;
 		m_register_jump_target_known = false;
 		m_register_jump_target = 0;
-		u32 runtime_memory_helper_seams = 0;
-		u32 runtime_unaligned_store_saves = 0;
 		bool sequential_qword_copy_enabled =
 			!VitaIsIopPreInstructionTraceEnabled() &&
 			m_isolate_cache_specialization && m_isolate_cache_guard_stable &&
@@ -7130,9 +7070,6 @@ namespace VitaIOP
 			{
 				m_iop_ram_registers_available = true;
 				m_iop_ram_mask_register_available = true;
-				// The ordinary path has one rare eight-call fallback, but the measured
-				// direct-RAM arm has only the source and destination range seams.
-				runtime_memory_helper_seams += 2;
 				for (u32 j = 0; j < 8; j++)
 				{
 					const u32 sequential_op = j < 4 ? sequential_copy.load_ops[j] : sequential_copy.store_ops[j - 4];
@@ -7153,9 +7090,6 @@ namespace VitaIOP
 				if (!known_direct)
 				{
 					m_iop_ram_mask_register_available = true;
-					const bool unaligned_store = (op >> 26) == 0x2a || (op >> 26) == 0x2e;
-					runtime_memory_helper_seams += unaligned_store ? 2 : 1;
-					runtime_unaligned_store_saves += unaligned_store ? 1 : 0;
 				}
 			}
 			UpdateGprConstStateAfterOpcode(op, pc);
@@ -7168,18 +7102,11 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		block_cycle_batching = s_qemuIopBlockCycleBatchingEnabled;
 #endif
-		// Runtime-address memory paths track how much of the compile-time block
-		// delta has already been published, so MMIO/timer handlers observe the
-		// same instruction boundary while direct RAM stays private until exit.
-		const u32 runtime_cycle_budget_instructions =
-			(psxHu32(HW_ICFG) & (1u << 3)) != 0 ? 7u : 6u;
-		const bool runtime_memory_batching_profitable =
-			4u * instruction_count >= 9u * runtime_memory_helper_seams +
-										  runtime_cycle_budget_instructions +
-					runtime_unaligned_store_saves;
+		// PCSX2's x86 JIT keeps s_psxBlockCycles private across all generated
+		// memory calls, including one-op and handler-heavy blocks. Helper count is
+		// therefore not a batching profitability term: deferral is both cheaper
+		// and the owner-exact device/timer observation contract.
 		const bool can_batch_cycle_updates =
-			(!m_iop_ram_mask_register_available ||
-				(instruction_count >= 2 && runtime_memory_batching_profitable)) &&
 			IopBlockCanBatchCycleUpdates(start_pc, instruction_count);
 		if (m_fragmented_logical_block &&
 			(interpreter_trace || !block_cycle_batching ||
@@ -7194,23 +7121,27 @@ namespace VitaIOP
 		m_defer_cycle_updates = !m_emit_trace_checks &&
 		                        (legacy_cycle_deferral ||
 									(block_cycle_batching && can_batch_cycle_updates));
+		// SYSCALL/BREAK/RFE helpers must see the BaseBlock-entry cycle. Product
+		// blocks defer it; trace and QEMU attribution controls which disable
+		// deferral retain the exact recompiler fallback instead of publishing an
+		// instruction prefix before the helper.
+		if (IopLogicalBlockHasPrivateCycleHelper(start_pc, instruction_count) &&
+			!m_defer_cycle_updates)
+		{
+			return false;
+		}
 		m_expanded_cycle_batching = m_defer_cycle_updates && !legacy_cycle_deferral;
-		m_track_published_cycle_prefix =
-			m_fragmented_logical_block ||
-			(m_expanded_cycle_batching && m_iop_ram_mask_register_available);
-		m_initialize_cycle_prefix =
-			m_track_published_cycle_prefix &&
-			(!m_fragmented_logical_block || logical_cycle_prefix == 0);
+		// A physical A32 fragment is not a PCSX2 BaseBlock boundary. No generated
+		// product helper sees or publishes a partial prefix; the final fragment or
+		// an architectural early exit commits it exactly once.
 		const bool active_irx_import = m_irx_import_hle || m_irx_import_debug ||
 			(m_irx_import_log && m_irx_import_funcname);
-		if (active_irx_import &&
-			(!m_defer_cycle_updates || m_track_published_cycle_prefix))
+		if (active_irx_import && !m_defer_cycle_updates)
 		{
 			// The x86 owner can leave the complete block-cycle delta private when
-			// a handled HLE dispatches early. Vita's nondeferred/helper-prefix
-			// shapes may already have exposed time and cannot undo that observation,
-			// so keep those rare mixed blocks on the interpreter until they have a
-			// complete pending-cycle contract.
+			// a handled HLE dispatches early. Keep the interpreter-trace/nondeferred
+			// validation shape out of this early-exit path because it has already
+			// advanced architectural time instruction by instruction.
 			return false;
 		}
 		m_has_budget_exit = false;
@@ -7221,7 +7152,7 @@ namespace VitaIOP
 		m_batched_cycle_instructions_removed =
 			m_expanded_cycle_batching ? UINT32_MAX : 0;
 		m_batched_cycle_stack_words_removed =
-			(m_expanded_cycle_batching && !m_track_published_cycle_prefix) ? 2 : 0;
+			m_expanded_cycle_batching ? 2 : 0;
 		m_current_instruction_count = 0;
 		m_current_cycle_count = 0;
 		AnalyzePinnedGprs(start_pc, instruction_count);
@@ -7261,6 +7192,8 @@ namespace VitaIOP
 		u32 static_branch_target_pc = 0;
 		u32 static_branch_fallthrough_pc = 0;
 		u32 static_jump_target_pc = 0;
+		const bool physical_continuation =
+			!test_fallthrough_budget && !logical_continuation_tail;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 pc = start_pc + i * 4;
@@ -7328,8 +7261,11 @@ namespace VitaIOP
 			}
 			if (IsIopBranchOrJumpOpcode(op))
 				can_direct_link_fallthrough = false;
-			const bool store_pc = m_emit_trace_checks || (i + 1 == instruction_count) ||
-			                      IopInstructionRequiresPcState(op);
+			// PCSX2 keeps psxpc private for the complete BaseBlock. Product helpers,
+			// including branch-delay memory and RFE, observe the entry PC; their
+			// owning tail publishes the final PC after the last opcode. The separate
+			// preinstruction trace deliberately retains interpreter-style PC writes.
+			const bool store_pc = m_emit_trace_checks;
 			const bool emitted = CanCompileOpcode(op) &&
 			                     EmitInstruction(op, pc, store_pc, trace_exit_branches);
 			m_emit_native_static_branch = false;
@@ -7342,8 +7278,12 @@ namespace VitaIOP
 		}
 
 		const u32 next_pc = start_pc + instruction_count * 4;
-		const bool physical_continuation =
-			!test_fallthrough_budget && !logical_continuation_tail;
+		if (!physical_continuation && !has_native_static_branch &&
+			!has_native_static_jump && !has_native_register_jump &&
+			!EmitStorePc(next_pc))
+		{
+			return false;
+		}
 		if (!physical_continuation && m_defer_cycle_updates &&
 			!m_static_branch_flags_live &&
 			!EmitPublishCyclePrefix(m_block_cycle_count))
@@ -8015,6 +7955,7 @@ namespace VitaIOP
 		m_hot_dispatch_trusted_raw_hits = 0;
 		m_hot_dispatch_owned_hits = 0;
 		m_hot_dispatch_hit_pc_profile.clear();
+		m_interpreter_fallback_pc_profile.clear();
 		m_wait_resume_cache_attempts = 0;
 		m_wait_resume_cache_hits = 0;
 		m_wait_resume_cache_misses = 0;
@@ -10658,7 +10599,8 @@ namespace VitaIOP
 					reinterpret_cast<const void*>(&VitaIopA32DirectExit),
 					&attempt_direct_links, &attempt_linked_entry_offset,
 					&attempt_provider_entry_offset,
-					!continuation_fragment && !logical_continuation, fragment_index == 0,
+					!continuation_fragment && !logical_continuation,
+					fragment_index == 0,
 					logical_writes_isolate_mode, logical_cycle_prefix,
 					logical_cycle_total, fragmented_logical_block,
 					logical_continuation && !continuation_fragment);
@@ -11152,6 +11094,31 @@ namespace VitaIOP
 		{
 			result->hot_dispatch_hit_pcs[i] = hot_hit_pcs[i].first;
 			result->hot_dispatch_hit_pc_hits[i] = hot_hit_pcs[i].second;
+		}
+		std::vector<std::pair<u64, InterpreterFallbackProfileEntry>> fallback_pcs;
+		fallback_pcs.reserve(m_interpreter_fallback_pc_profile.size());
+		for (const auto& entry : m_interpreter_fallback_pc_profile)
+			fallback_pcs.push_back(entry);
+		std::sort(fallback_pcs.begin(), fallback_pcs.end(),
+			[](const auto& lhs, const auto& rhs) {
+				return lhs.second.hits != rhs.second.hits ?
+					lhs.second.hits > rhs.second.hits : lhs.first < rhs.first;
+			});
+		result->interpreter_fallback_pc_count =
+			std::min<u32>(static_cast<u32>(fallback_pcs.size()), 16);
+		for (u32 i = 0; i < result->interpreter_fallback_pc_count; i++)
+		{
+			result->interpreter_fallback_pcs[i] =
+				fallback_pcs[i].second.start_pc;
+			result->interpreter_fallback_owner_pcs[i] =
+				fallback_pcs[i].second.owner_pc;
+			result->interpreter_fallback_owner_opcodes[i] =
+				fallback_pcs[i].second.owner_opcode;
+			result->interpreter_fallback_instruction_counts[i] =
+				fallback_pcs[i].second.instruction_count;
+			result->interpreter_fallback_source_hashes[i] =
+				fallback_pcs[i].second.source_hash;
+			result->interpreter_fallback_hits[i] = fallback_pcs[i].second.hits;
 		}
 		result->wait_resume_cache_attempts = m_wait_resume_cache_attempts;
 		result->wait_resume_cache_hits = m_wait_resume_cache_hits;
@@ -11776,13 +11743,6 @@ namespace VitaIOP
 			RememberFreeCacheEntry(*block);
 			return false;
 		}
-		if (IopLogicalBlockRequiresExactHelperTiming(start_pc,
-				scan.instruction_count))
-		{
-			RememberFreeCacheEntry(*block);
-			RegisterInterpreterFallbackBlock(start_pc);
-			return false;
-		}
 		if (!CompileIntoCacheEntry(*block, start_pc, scan.instruction_count, true,
 				true, scan.logical_continuation, true))
 		{
@@ -11866,13 +11826,6 @@ namespace VitaIOP
 			scan.instruction_count == 0)
 		{
 			RememberFreeCacheEntry(*block);
-			return nullptr;
-		}
-		if (IopLogicalBlockRequiresExactHelperTiming(start_pc,
-				scan.instruction_count))
-		{
-			RememberFreeCacheEntry(*block);
-			RegisterInterpreterFallbackBlock(start_pc);
 			return nullptr;
 		}
 		if (!CompileIntoCacheEntry(*block, start_pc, scan.instruction_count, true,
@@ -12091,6 +12044,45 @@ namespace VitaIOP
 		}
 		if (opcodes.size() != scan.instruction_count)
 			pxFailRel("Retained IOP BaseBlock snapshot size mismatch");
+#if defined(VITASX2_QEMU_VALIDATION)
+		// The private dispatcher bypasses VitaCpuProviders.cpp's legacy detailed
+		// result path, so its exact recompiler fallbacks used to publish only one
+		// aggregate count. Keep a cold per-source-descriptor profile at this seam
+		// and publish only its bounded top 16; the source hash prevents an SMC/IRX
+		// overlay at the same PC from inheriting stale owner metadata. It names the
+		// owning SYSCALL/BREAK/RFE word when present and leaves a zero owner for
+		// allocation, scan, or compile failures. This makes an all-native failure
+		// actionable without adding work to generated IOP blocks.
+		u64 source_hash = 1469598103934665603ull;
+		const auto mix_source_word = [&source_hash](u32 word) {
+			source_hash ^= word;
+			source_hash *= 1099511628211ull;
+		};
+		mix_source_word(start_pc);
+		mix_source_word(scan.instruction_count);
+		for (const u32 opcode : opcodes)
+			mix_source_word(opcode);
+		InterpreterFallbackProfileEntry& fallback_profile =
+			m_interpreter_fallback_pc_profile[source_hash];
+		if (fallback_profile.hits == 0)
+		{
+			fallback_profile.start_pc = start_pc;
+			fallback_profile.instruction_count = scan.instruction_count;
+			fallback_profile.source_hash = source_hash;
+			for (u32 i = 0; i < scan.instruction_count; i++)
+			{
+				if (!IsIopExceptionOpcode(opcodes[i]) &&
+					!IsIopCop0RfeOpcode(opcodes[i]))
+				{
+					continue;
+				}
+				fallback_profile.owner_pc = start_pc + i * sizeof(u32);
+				fallback_profile.owner_opcode = opcodes[i];
+				break;
+			}
+		}
+		fallback_profile.hits++;
+#endif
 		psxRegs.pc = start_pc;
 		const bool ps1_clock = (psxHu32(HW_ICFG) & (1u << 3)) != 0;
 
@@ -12194,12 +12186,19 @@ namespace VitaIOP
 	BlockExecutor::ExecuteProviderTimesliceLoop()
 	{
 		const bool compiled_ps1_bios_gate = CompiledPs1BiosGateEnabled();
+		bool first_dispatch = true;
 		for (;;)
 		{
 			const bool forced_continuation =
 				std::exchange(m_force_logical_continuation, false);
-			if (!forced_continuation && psxRegs.iopCycleEE <= 0)
+			// PCSX2 owner: x86/iR3000A.cpp::recExecuteBlock() enters
+			// _DynGen_EnterRecompiledCode() unconditionally. The generated
+			// dispatcher has no budget gate before its first BaseBlock; only the
+			// completed block's iPsxBranchTest() may return to the EE scheduler.
+			if ((!first_dispatch || VitaIsIopPreInstructionTraceEnabled()) &&
+				!forced_continuation && psxRegs.iopCycleEE <= 0)
 				break;
+			first_dispatch = false;
 			if (!compiled_ps1_bios_gate && (psxHu32(HW_ICFG) & 8) &&
 				((psxRegs.pc & 0x1fffffffu) == 0xa0 ||
 				 (psxRegs.pc & 0x1fffffffu) == 0xb0 ||
@@ -12391,9 +12390,6 @@ namespace VitaIOP
 		m_scheduler_direct_event_entries++;
 #endif
 
-		if (psxRegs.iopCycleEE <= 0)
-			ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
-
 		bool resume_match = true;
 #if defined(VITASX2_QEMU_VALIDATION) && \
 	!defined(VITASX2_IOP_SCHEDULER_DIRECT_EVENT_CODEGEN)
@@ -12480,9 +12476,6 @@ namespace VitaIOP
 		m_private_dispatcher_calls++;
 		m_scheduler_prediction_attempts++;
 #endif
-
-		if (psxRegs.iopCycleEE <= 0)
-			ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		const bool first_way_match =
@@ -12586,9 +12579,6 @@ namespace VitaIOP
 		m_private_dispatcher_calls++;
 		m_scheduler_dispatch_cache_attempts++;
 #endif
-
-		if (psxRegs.iopCycleEE <= 0)
-			ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
 
 #if defined(VITASX2_QEMU_VALIDATION) && \
 	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
@@ -12697,9 +12687,6 @@ namespace VitaIOP
 		if (no_link_specific)
 			m_wait_resume_no_link_specific_entries++;
 #endif
-
-		if (psxRegs.iopCycleEE <= 0)
-			ReturnFromPrivateProviderTimeslice(psxRegs.iopBreak + psxRegs.iopCycleEE);
 
 		const auto resume_context_matches = [&](bool identity_owned) {
 			bool resume_match =

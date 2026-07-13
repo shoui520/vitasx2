@@ -267,6 +267,13 @@ struct VitaA32IopProviderStats
 	u32 hot_dispatch_hit_pc_count = 0;
 	u32 hot_dispatch_hit_pcs[16]{};
 	u64 hot_dispatch_hit_pc_hits[16]{};
+	u32 interpreter_fallback_pc_count = 0;
+	u32 interpreter_fallback_pcs[16]{};
+	u32 interpreter_fallback_owner_pcs[16]{};
+	u32 interpreter_fallback_owner_opcodes[16]{};
+	u32 interpreter_fallback_instruction_counts[16]{};
+	u64 interpreter_fallback_source_hashes[16]{};
+	u64 interpreter_fallback_hits[16]{};
 	u64 wait_resume_cache_attempts = 0;
 	u64 wait_resume_cache_hits = 0;
 	u64 wait_resume_cache_misses = 0;

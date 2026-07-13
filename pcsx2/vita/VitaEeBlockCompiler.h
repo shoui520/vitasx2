@@ -491,12 +491,7 @@ namespace VitaEE
 		static bool IsSupportedBranchOpcode(u32 op);
 		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
-		static bool IsExactCacheDxwbinLoop(u32 start_pc, u32 instruction_count,
-			unsigned* address_guest = nullptr, unsigned* predicate_guest = nullptr);
-		static bool IsExactCacheIxinLoop(u32 start_pc, u32 instruction_count,
-			unsigned* address_guest = nullptr, unsigned* predicate_guest = nullptr);
-		static bool IsExactCacheDxltgTagSweep(u32 start_pc, u32 instruction_count,
-			u32* packed_guests = nullptr);
+		static bool CanCompileDelaySlotOpcode(u32 branch_op, u32 delay_op);
 		static bool IsExactPreincrementByteZeroFillLoop(u32 start_pc, u32 instruction_count,
 			unsigned* pointer_guest = nullptr, unsigned* end_guest = nullptr);
 		static bool IsExactFourWordFillLoop(u32 start_pc, u32 instruction_count,
@@ -608,15 +603,6 @@ namespace VitaEE
 		bool EmitWaitLoopFastForwardTail(const void* event_exit,
 			bool defer_pc_writeback = false, u32 pc = 0);
 		bool EndBlockWithWaitLoopFastForward(u32 block_cycles, const void* event_exit);
-		bool CompileCacheDxwbinLoop(u32 start_pc, u32 instruction_count,
-			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
-			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
-		bool CompileCacheIxinLoop(u32 start_pc, u32 instruction_count,
-			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
-			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
-		bool CompileCacheDxltgTagSweep(u32 start_pc, u32 instruction_count,
-			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
-			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompilePreincrementByteZeroFillLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
@@ -648,7 +634,8 @@ namespace VitaEE
 		bool EmitTLBWriteInBlock(u32 op, u32 next_pc, const void* helper);
 		bool EmitSetNextEventDelta4FromCurrentCycle();
 		bool EmitEIEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction, const void* event_exit);
-		bool EmitERETEventExit(u32 op, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitERETEventExit(u32 op, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool apply_delayed_di = false);
 		bool EmitTLBRInBlock();
 		bool EmitTLBPInBlock();
 		bool EmitDIDelayedStatusClear();
@@ -661,7 +648,8 @@ namespace VitaEE
 		bool EmitCOP1CompareFast(u32 op);
 		bool EmitCOP1ConvertWordFast(u32 op);
 		bool EmitCOP1ConvertSingleFast(u32 op);
-		bool EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+			const void* event_exit, bool register_jump_delay_slot);
 		bool EmitCOP2IdleBranch(size_t* vu0_idle);
 		bool EmitCOP2VectorTransferBody(u32 op);
 		bool EmitCOP2ControlReadBody(u32 op);
@@ -692,13 +680,14 @@ namespace VitaEE
 		bool EmitCOP2MacroFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
 		bool EmitCOP2InterlockCall(u32 op, bool wait_for_mbit);
-		bool EmitCOP2VectorTransferFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
-			const void* event_exit);
+		bool EmitCOP2VectorTransferFast(u32 op, u32 next_pc,
+			u32 raw_cycles_through_instruction, const void* event_exit,
+			bool register_jump_delay_slot);
 		bool EmitCOP2ControlReadFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
 		bool EmitCOP2ControlWriteFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
-		bool EmitCACHE(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit);
+		bool EmitCACHE(u32 op);
 		bool EmitSpecialExceptionEventExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, bool branch_delay_slot, const void* helper);
 		bool EmitSYSCALL(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit,

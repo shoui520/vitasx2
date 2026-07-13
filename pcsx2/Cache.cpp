@@ -374,7 +374,7 @@ void doCacheHitOp(u32 addr, const char* name, u32 instr, Op op)
 	op(cache.lineAt(index, way));
 }
 
-void executeCacheOp(u32 instr, u32 addr)
+static void executeCacheOp(u32 instr, u32 addr)
 {
 	const u32 mode = (instr >> 16) & 0x1f;
 
@@ -494,130 +494,6 @@ void executeCacheOp(u32 instr, u32 addr)
 		default:
 			DevCon.Warning("Cache mode %x not implemented", mode);
 			break;
-	}
-}
-
-u32 executeCacheDxltgTagSweep(u32 start_pc, u32 fallthrough_pc,
-	u32 packed_guests, u32 packed_cycles)
-{
-	// PCSX2 owners: executeCacheOp()'s DXLTG case, COP0.cpp::MFC0(),
-	// R5900OpcodeImpl.cpp scalar arithmetic, and
-	// x86/ix86-32/iR5900.cpp::iBranchTest().
-	// The caller has matched the exact two-way kernel loop and packed its six
-	// distinct GPRs plus PCSX2's entry-dependent logical-block cycle costs.
-	// x86/iR5900Misc.cpp::recSYNC()/recCACHE() emit no branch test, so the only
-	// observable scheduler seams are the two inner BNEs and the outer BNE.
-	constexpr u32 COMPLETE = 0;
-	constexpr u32 SELF = 1;
-	constexpr u32 EVENT = 2;
-	const unsigned result_guest = packed_guests & 0x1f;
-	const unsigned comparison_guest = (packed_guests >> 5) & 0x1f;
-	const unsigned lower_guest = (packed_guests >> 10) & 0x1f;
-	const unsigned upper_guest = (packed_guests >> 15) & 0x1f;
-	const unsigned induction_guest = (packed_guests >> 20) & 0x1f;
-	const unsigned mask_guest = (packed_guests >> 25) & 0x1f;
-	const u32 first_way_cycles = packed_cycles & 0x3f;
-	const u32 second_way_target_cycles = (packed_cycles >> 6) & 0x3f;
-	const u32 second_way_fallthrough_cycles = (packed_cycles >> 12) & 0x3f;
-	const u32 outer_target_cycles = (packed_cycles >> 18) & 0x3f;
-	const u32 outer_fallthrough_cycles = (packed_cycles >> 24) & 0x3f;
-	const u64 induction_value = cpuRegs.GPR.r[induction_guest].UD[0];
-	const u32 induction = static_cast<u32>(induction_value);
-	const bool batchable = induction_value == static_cast<u64>(
-		static_cast<s64>(static_cast<s32>(induction))) &&
-		(induction & 63u) == 0 && induction < 4096;
-	u32 completed_iterations = 0;
-
-#if defined(VITASX2_QEMU_VALIDATION)
-	extern u32 g_qemuCacheDxltgLoopHelperCalls;
-	extern u32 g_qemuCacheDxltgLoopCompletedIterations;
-	extern u32 g_qemuCacheDxltgLoopFallbackCalls;
-	g_qemuCacheDxltgLoopHelperCalls++;
-	if (!batchable)
-		g_qemuCacheDxltgLoopFallbackCalls++;
-#endif
-
-	const auto finish = [&](u32 result) {
-#if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuCacheDxltgLoopCompletedIterations += completed_iterations;
-#endif
-		return result;
-	};
-	const auto event_due = []() {
-		return static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
-			static_cast<u32>(cpuRegs.nextEventCycle)) >= 0;
-	};
-	const auto advance = [&](u32 cycles, u32 pc) {
-		cpuRegs.cycle += cycles;
-		cpuRegs.pc = pc;
-		return event_due();
-	};
-	const auto load_tag = [&](u32 addr) {
-		const int index = (addr >> 6) & 0x3f;
-		const int way = addr & 1;
-		CacheLine line = cache.lineAt(index, way);
-		line.writeBackIfNeeded();
-		cpuRegs.CP0.n.TagLo = line.tag.flags();
-	};
-	const auto compare_tag = [&]() {
-		const u64 mfc0_value = static_cast<u64>(
-			static_cast<s64>(static_cast<s32>(cpuRegs.CP0.n.TagLo)));
-		const u64 masked = mfc0_value & cpuRegs.GPR.r[mask_guest].UD[0];
-		const u32 sum = static_cast<u32>(masked) +
-			cpuRegs.GPR.r[induction_guest].UL[0];
-		const u64 value = static_cast<u64>(static_cast<s64>(static_cast<s32>(sum)));
-		cpuRegs.GPR.r[comparison_guest].UD[0] =
-			cpuRegs.GPR.r[upper_guest].UD[0] < value ? 1 : 0;
-		cpuRegs.GPR.r[result_guest].UD[0] =
-			value < cpuRegs.GPR.r[lower_guest].UD[0] ? 1 : 0;
-		return cpuRegs.GPR.r[result_guest].UD[0] != 0;
-	};
-
-	for (;;)
-	{
-		load_tag(cpuRegs.GPR.r[induction_guest].UL[0]);
-		const bool first_taken = compare_tag();
-		if (advance(first_way_cycles, first_taken ? start_pc + 60 : start_pc + 40))
-			return finish(EVENT);
-
-		load_tag(cpuRegs.GPR.r[induction_guest].UL[0] + 1);
-		const bool second_taken = compare_tag();
-		if (advance(first_taken ? second_way_target_cycles : second_way_fallthrough_cycles,
-				second_taken ? start_pc + 120 : start_pc + 100))
-			return finish(EVENT);
-
-		const u32 updated_induction = cpuRegs.GPR.r[induction_guest].UL[0] + 64;
-		cpuRegs.GPR.r[induction_guest].SD[0] = static_cast<s32>(updated_induction);
-		const bool repeat = cpuRegs.GPR.r[induction_guest].SD[0] < 4096;
-		cpuRegs.GPR.r[result_guest].UD[0] = repeat ? 1 : 0;
-		completed_iterations++;
-		if (advance(second_taken ? outer_target_cycles : outer_fallthrough_cycles,
-				repeat ? start_pc : fallthrough_pc))
-			return finish(EVENT);
-		if (!repeat)
-			return finish(COMPLETE);
-		if (!batchable)
-			return finish(SELF);
-	}
-}
-
-void executeCacheDxwbinPairRange(u32 addr, u32 pair_count)
-{
-	// PCSX2 owner: executeCacheOp()'s DXWBIN case. The kernel walks one set
-	// per 64-byte step and selects the two ways with address bits 0 and 1.
-	// Keep the two operations ordered so dirty writeback, invalid-PFN loss,
-	// retained LRF state, and data clearing are identical to two CACHE ops.
-	for (u32 i = 0; i < pair_count; i++, addr += 64)
-	{
-		for (u32 way_offset = 0; way_offset < 2; way_offset++)
-		{
-			const u32 operation_addr = addr + way_offset;
-			const int index = cache.setIdxFor(operation_addr);
-			const int way = operation_addr & 1;
-			CacheLine line = cache.lineAt(index, way);
-			line.writeBackIfNeeded();
-			line.clear();
-		}
 	}
 }
 

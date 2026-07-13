@@ -1002,13 +1002,22 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 	psxRegs.iopBreak = 0;
 	psxRegs.iopCycleEE = eeCycles;
 	bool force_logical_continuation = false;
+	bool first_dispatch = true;
 
 	for (;;)
 	{
 		const bool forced_continuation =
 			std::exchange(force_logical_continuation, false);
-		if (!forced_continuation && psxRegs.iopCycleEE <= 0)
+		// PCSX2 owner: x86/iR3000A.cpp::recExecuteBlock() enters
+		// _DynGen_EnterRecompiledCode() unconditionally. Its dispatcher executes
+		// the selected first BaseBlock before iPsxBranchTest() applies the signed
+		// budget exit. The EE event path can deliberately arrive with a
+		// non-positive budget when iopEventAction is pending, so do not turn that
+		// call into an interpreter-style no-op.
+		if ((!first_dispatch || VitaIsIopPreInstructionTraceEnabled()) &&
+			!forced_continuation && psxRegs.iopCycleEE <= 0)
 			break;
+		first_dispatch = false;
 		if (!VitaIOP::BlockExecutor::CompiledPs1BiosGateEnabled() &&
 			(psxHu32(HW_ICFG) & 8) &&
 			((psxRegs.pc & 0x1fffffffU) == 0xa0 ||
@@ -1635,6 +1644,23 @@ VitaA32IopProviderStats VitaGetA32IopProviderStats()
 	{
 		s_iop_a32_stats.hot_dispatch_hit_pcs[i] = snapshot.hot_dispatch_hit_pcs[i];
 		s_iop_a32_stats.hot_dispatch_hit_pc_hits[i] = snapshot.hot_dispatch_hit_pc_hits[i];
+	}
+	s_iop_a32_stats.interpreter_fallback_pc_count =
+		snapshot.interpreter_fallback_pc_count;
+	for (u32 i = 0; i < snapshot.interpreter_fallback_pc_count; i++)
+	{
+		s_iop_a32_stats.interpreter_fallback_pcs[i] =
+			snapshot.interpreter_fallback_pcs[i];
+		s_iop_a32_stats.interpreter_fallback_owner_pcs[i] =
+			snapshot.interpreter_fallback_owner_pcs[i];
+		s_iop_a32_stats.interpreter_fallback_owner_opcodes[i] =
+			snapshot.interpreter_fallback_owner_opcodes[i];
+		s_iop_a32_stats.interpreter_fallback_instruction_counts[i] =
+			snapshot.interpreter_fallback_instruction_counts[i];
+		s_iop_a32_stats.interpreter_fallback_source_hashes[i] =
+			snapshot.interpreter_fallback_source_hashes[i];
+		s_iop_a32_stats.interpreter_fallback_hits[i] =
+			snapshot.interpreter_fallback_hits[i];
 	}
 	// The retired stale-entry arm loads/checks CachedBlock::valid and reloads/
 	// checks CachedBlock::start_pc after the cache record already matched. Product
