@@ -650,6 +650,7 @@ namespace VitaEE
 		constexpr size_t VU0_MACFLAG_OFFSET = offsetof(Vu0State, macflag);
 		constexpr size_t VU0_STATUSFLAG_OFFSET = offsetof(Vu0State, statusflag);
 		constexpr size_t VU0_CLIPFLAG_OFFSET = offsetof(Vu0State, clipflag);
+		constexpr size_t VU0_MICRO_STATUSFLAGS_OFFSET = offsetof(Vu0State, micro_statusflags);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		constexpr size_t VU0_MEM_OFFSET = offsetof(Vu0State, Mem);
 		constexpr size_t VU0_CODE_OFFSET = offsetof(Vu0State, code);
@@ -1902,17 +1903,17 @@ namespace VitaEE
 			{
 				switch ((op >> 21) & 0x1f)
 	{
-					case 0x01: // QMFC2 checks VU0 run state and reads VF when rt is writable.
-						return RT(op) != 0 ? 1 : 0;
-					case 0x05: // QMTC2 writes VF when fs is writable.
-						return RD(op) != 0 ? 1 : 0;
+					case 0x01: // Run-state guard, plus a nonconstant VF read when rt is writable.
+						return 1 + ((RT(op) != 0 && RD(op) != 0) ? 1 : 0);
+					case 0x05: // Run-state guard, plus VF write when fs is writable.
+						return 1 + (RD(op) != 0 ? 1 : 0);
 					default:
 						return 0;
 	}
 			}
 
 			if (IsFastCOP2ControlRead(op))
-				return RT(op) != 0 ? 1 : 0;
+				return 1 + ((RT(op) != 0 && RD(op) != 0) ? 1 : 0);
 
 			if (IsFastCOP2ControlWrite(op))
 			{
@@ -1922,9 +1923,12 @@ namespace VitaEE
 					case VU0_REG_MAC_FLAG:
 					case VU0_REG_TPC:
 					case VU0_REG_VPU_STAT:
-						return 0;
+						return 1; // Run-state guard only.
+					case VU0_REG_STATUS_FLAG:
+					case VU0_REG_CLIP_FLAG:
+						return 3; // Guard plus two body addresses.
 					default:
-						return 1;
+						return 2; // Guard plus one body address.
 	}
 			}
 
@@ -2603,6 +2607,7 @@ namespace VitaEE
 	static_assert(VU0_VF_OFFSET == 0);
 	static_assert(VU0_VI_OFFSET + VU0_VI_STRIDE * 32 <= 0x0fff);
 	static_assert(VU0_CLIPFLAG_OFFSET + sizeof(u32) <= 0x0fff);
+	static_assert(VU0_MICRO_STATUSFLAGS_OFFSET + 4 * sizeof(u32) <= 0x0fff);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 	static_assert(VU0_MEM_OFFSET <= 0x0fff);
 #endif
@@ -3615,8 +3620,8 @@ namespace VitaEE
 
 	// Classifies one accepted EE opcode for the write-through GPR pin cache.
 	// Returns true when every GPR-file write the op can perform goes through
-	// EmitStoreGpr64()/EmitStoreGprZero64()/EmitStoreGprLowPreserveHigh(),
-	// EmitStoreGprWord(), EmitStoreGprQ128(), EmitStoreGprQ128ToAddress(), or
+	// EmitStoreGpr64()/EmitStoreGprZero64(), EmitStoreGprWord(),
+	// EmitStoreGprQ128(), EmitStoreGprQ128ToAddress(), or
 	// EmitStoreGprDwordPair().
 	// Returns false for op classes whose write paths are not certified yet;
 	// those blocks compile without pins. The read lists score low32 and
@@ -3792,7 +3797,7 @@ namespace VitaEE
 	}
 
 				if (IsFastCOP2ControlRead(op))
-					return true; // CFC2 uses EmitStoreGpr64() or EmitStoreGprLowPreserveHigh().
+					return true; // Every CFC2 class publishes its complete low GPR doubleword.
 
 				if (IsFastCOP2ControlWrite(op))
 	{
@@ -3804,7 +3809,7 @@ namespace VitaEE
 						case VU0_REG_VPU_STAT:
 							return true;
 						default:
-							add_low_read(rt); // CTC2 active writes read nonzero rt through the pin-aware raw-zero loader.
+							add_low_read(rt); // CTC2 active writes use the pin-aware architectural source loader.
 							return true;
 	}
 	}
@@ -6021,11 +6026,12 @@ namespace VitaEE
 		}
 		if (IsFastCOP2ControlWrite(op))
 		{
-			// PCSX2 owner: VU0.cpp::CTC2(). Active native VI writes read the
-			// low GPR word through the qcache-aware raw-zero load seam. Keep
-			// reset and CMSAR1 out because they call helpers or exit at an event.
+			// PCSX2 owner: x86/microVU_Macro.inl::recCTC2(). Active native VI
+			// writes read the architectural low GPR word through the qcache-aware
+			// source seam. FBRST consumes its source before reset helpers and then
+			// clears the cache; CMSAR1 remains an event-ending helper path.
 			const unsigned fs = RD(op);
-			return fs != VU0_REG_FBRST && fs != VU0_REG_CMSAR1;
+			return fs != VU0_REG_CMSAR1;
 		}
 
 		if ((op >> 26) != 0x1c)
@@ -14168,14 +14174,21 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCOP2ControlReadBody(u32 op)
 	{
-		// PCSX2 owners: VU0.cpp::CFC2() and x86/microVU_Macro.inl::recCFC2().
-		// REG_R only writes the low GPR word, while other VI registers
-		// sign-extend into the low 64-bit GPR half.
+		// PCSX2 owner: x86/microVU_Macro.inl::recCFC2(). REG_R zero-extends
+		// its masked 23 bits into the low GPR doubleword, ordinary VI registers zero-extend their low
+		// halfword, and control registers sign-extend their complete word.
 		const unsigned rt = RT(op);
 		const unsigned fs = RD(op);
 
 		if (rt != 0)
 		{
+			if (fs == 0)
+			{
+				return m_code.EmitMovImm8(HOST_TMP1, 0) &&
+					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
+					   EmitStoreGpr64(rt, HOST_TMP1, HOST_TMP2);
+			}
+
 			if (!EmitVu0ViAddress(HOST_TMP0, fs) ||
 				!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0))
 			{
@@ -14185,7 +14198,17 @@ namespace VitaEE
 			if (fs == VU0_REG_R)
 			{
 				if (!m_code.EmitUbfx(HOST_TMP1, HOST_TMP1, 0, 23) ||
-					!EmitStoreGprLowPreserveHigh(rt, HOST_TMP1))
+					!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+					!EmitStoreGpr64(rt, HOST_TMP1, HOST_TMP2))
+	{
+					return false;
+	}
+			}
+			else if (fs < VU0_REG_STATUS_FLAG)
+			{
+				if (!m_code.EmitUbfx(HOST_TMP1, HOST_TMP1, 0, 16) ||
+					!m_code.EmitMovImm8(HOST_TMP2, 0) ||
+					!EmitStoreGpr64(rt, HOST_TMP1, HOST_TMP2))
 	{
 					return false;
 	}
@@ -14202,11 +14225,12 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCOP2ControlWriteBody(u32 op)
 	{
-		// PCSX2 owners: VU0.cpp::CTC2() and x86/microVU_Macro.inl::recCTC2().
+		// PCSX2 owner: x86/microVU_Macro.inl::recCTC2().
 		// CMSAR1 is emitted as a separate cycle-committing event tail because
 		// it starts VU1 microcode; this fall-through body is no-op, masked, raw
-		// VI low-word writes, or FBRST's reset-bit calls followed by the masked
-		// mode-bit store.
+		// control-word writes, low-halfword ordinary-VI writes, Status's sticky
+		// preservation plus microVU broadcast, or FBRST's reset-bit calls followed
+		// by the masked mode-bit store.
 		const unsigned rt = RT(op);
 		const unsigned fs = RD(op);
 
@@ -14219,7 +14243,7 @@ namespace VitaEE
 				break;
 
 			case VU0_REG_R:
-				if (!EmitLoadGprLowRawZero(rt, HOST_TMP1) ||
+				if (!EmitLoadCop2ControlSource(rt, HOST_TMP1) ||
 					!m_code.EmitUbfx(HOST_TMP1, HOST_TMP1, 0, 23) ||
 					!EmitOrrImm32OrReg(HOST_TMP1, HOST_TMP1, 0x3f800000u, HOST_TMP2) ||
 					!EmitVu0ViAddress(HOST_TMP0, fs) ||
@@ -14229,9 +14253,60 @@ namespace VitaEE
 	}
 				break;
 
+			case VU0_REG_STATUS_FLAG:
+			{
+				if (!EmitVu0ViAddress(HOST_TMP0, fs) ||
+					!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP0, 0) ||
+					!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP2, 0x3fu, HOST_TMP3))
+	{
+					return false;
+	}
+
+				if (rt != 0 &&
+					(!EmitLoadCop2ControlSource(rt, HOST_TMP1) ||
+					 !EmitAndImm32OrReg(HOST_TMP1, HOST_TMP1, 0x0fc0u, HOST_TMP3) ||
+					 !m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP1)))
+	{
+					return false;
+	}
+
+				// mVUallocSFLAGd() owns this normalized-to-microVU conversion.
+				// Keep all four flag instances coherent with recCTC2() before the
+				// next macro or micro consumer can observe them.
+				if (!m_code.EmitStrImm12(HOST_TMP2, HOST_TMP0, 0) ||
+					!m_code.EmitMovRegShiftImm(HOST_TMP1, HOST_TMP2, VitaA32::ShiftType::LSR, 3) ||
+					!EmitAndImm32OrReg(HOST_TMP1, HOST_TMP1, 0x18u, HOST_TMP3) ||
+					!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL, 11) ||
+					!EmitAndImm32OrReg(HOST_TMP4, HOST_TMP4, 0x1800u, HOST_TMP3) ||
+					!m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+					!m_code.EmitMovRegShiftImm(HOST_TMP4, HOST_TMP2, VitaA32::ShiftType::LSL, 14) ||
+					!EmitAndImm32OrReg(HOST_TMP4, HOST_TMP4, 0x03cf0000u, HOST_TMP3) ||
+					!m_code.EmitOrrReg(HOST_TMP1, HOST_TMP1, HOST_TMP4) ||
+					!EmitVu0RegisterAddress(HOST_TMP0, VU0_MICRO_STATUSFLAGS_OFFSET) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, sizeof(u32)) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 2 * sizeof(u32)) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 3 * sizeof(u32)))
+	{
+					return false;
+	}
+				break;
+			}
+
 			case VU0_REG_FBRST:
 			{
-				if (!EmitLoadGprLowRawZero(rt, HOST_TMP5) ||
+				if (rt == 0)
+				{
+					if (!m_code.EmitMovImm8(HOST_TMP1, 0) ||
+						!EmitVu0ViAddress(HOST_TMP0, fs) ||
+						!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+	{
+						return false;
+	}
+					break;
+				}
+
+				if (!EmitLoadCop2ControlSource(rt, HOST_TMP5) ||
 					!m_code.EmitTstImm32(HOST_TMP5, 0x2u))
 	{
 					return false;
@@ -14260,11 +14335,17 @@ namespace VitaEE
 	{
 					return false;
 	}
+				// Both reset helpers follow AAPCS and may clobber q8-q11, where
+				// native COP2 normalization constants reside. Conservatively rebuild
+				// them for a later macro and reload any qcached GPR for the suffix,
+				// even when the runtime reset bits were clear.
+				m_cop2_norm_consts_ready = false;
+				ClearGprQCache();
 				break;
 			}
 
 			case VU0_REG_CLIP_FLAG:
-				if (!EmitLoadGprLowRawZero(rt, HOST_TMP1) ||
+				if (!EmitLoadCop2ControlSource(rt, HOST_TMP1) ||
 					!EmitVu0ClipflagAddress(HOST_TMP0) ||
 					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
 					!EmitVu0ViAddress(HOST_TMP0, fs) ||
@@ -14275,9 +14356,11 @@ namespace VitaEE
 				break;
 
 			default:
-				if (!EmitLoadGprLowRawZero(rt, HOST_TMP1) ||
+				if (!EmitLoadCop2ControlSource(rt, HOST_TMP1) ||
 					!EmitVu0ViAddress(HOST_TMP0, fs) ||
-					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+					(fs < VU0_REG_STATUS_FLAG ?
+						!m_code.EmitStrhImm8(HOST_TMP1, HOST_TMP0, 0) :
+						!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0)))
 	{
 					return false;
 	}
@@ -16163,8 +16246,15 @@ namespace VitaEE
 			fallthrough_pin_dirty_low[i] = m_pin_dirty_low[i];
 			fallthrough_pin_dirty_high[i] = m_pin_dirty_high[i];
 		}
-		if (!EmitCOP2IdleBranch(&vu0_idle) ||
-			!m_code.EmitMovImm32(HOST_TMP0, op) ||
+		if (!EmitCOP2IdleBranch(&vu0_idle))
+			return false;
+
+		// vu0Sync() and the optional interlock helper follow AAPCS and may
+		// clobber every physical qreg used by the block-local GPR qcache.
+		// Architectural backing is coherent, so make the running arm reload its
+		// source instead of trusting a pre-call vector representation.
+		ClearGprQCache();
+		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
 			!(register_jump_delay_slot ?
 				EmitStorePcFromHostReg(HOST_BRANCH_TARGET) : EmitStorePc(next_pc)) ||
@@ -16207,19 +16297,51 @@ namespace VitaEE
 
 		size_t vu0_idle = static_cast<size_t>(-1);
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
-		if (!EmitCOP2IdleBranch(&vu0_idle) ||
-			!m_code.EmitMovImm32(HOST_TMP0, op) ||
+		const u8 fallthrough_qcache_count = m_gpr_q_cache_count;
+		u8 fallthrough_qcache_guest[MAX_GPR_QCACHE]{};
+		u8 fallthrough_qcache_qreg[MAX_GPR_QCACHE]{};
+		bool fallthrough_pin_dirty_low[MAX_GPR_PINS]{};
+		bool fallthrough_pin_dirty_high[MAX_GPR_PINS]{};
+		for (unsigned i = 0; i < MAX_GPR_QCACHE; i++)
+		{
+			fallthrough_qcache_guest[i] = m_gpr_q_cache_guest[i];
+			fallthrough_qcache_qreg[i] = m_gpr_q_cache_qreg[i];
+		}
+		for (unsigned i = 0; i < MAX_GPR_PINS; i++)
+		{
+			fallthrough_pin_dirty_low[i] = m_pin_dirty_low[i];
+			fallthrough_pin_dirty_high[i] = m_pin_dirty_high[i];
+		}
+
+		if (!EmitCOP2IdleBranch(&vu0_idle))
+			return false;
+
+		ClearGprQCache();
+		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
 			!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
 			!EmitCOP2InterlockCall(op, false) ||
 			!EmitCOP2ControlReadBody(op) ||
-			!EmitEventExitReturn(event_exit) ||
-			!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+			!EmitEventExitReturn(event_exit))
 		{
 			return false;
 		}
+
+		m_gpr_q_cache_count = fallthrough_qcache_count;
+		for (unsigned i = 0; i < MAX_GPR_QCACHE; i++)
+		{
+			m_gpr_q_cache_guest[i] = fallthrough_qcache_guest[i];
+			m_gpr_q_cache_qreg[i] = fallthrough_qcache_qreg[i];
+		}
+		for (unsigned i = 0; i < MAX_GPR_PINS; i++)
+		{
+			m_pin_dirty_low[i] = fallthrough_pin_dirty_low[i];
+			m_pin_dirty_high[i] = fallthrough_pin_dirty_high[i];
+		}
+		if (!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+			return false;
 
 		return EmitCOP2ControlReadBody(op);
 	}
@@ -16266,9 +16388,16 @@ namespace VitaEE
 			}
 
 			if (!m_code.EmitMovImm8(HOST_TMP0, 1) ||
-				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu1Finish)) ||
-				!EmitLoadGprLowRawZero(RT(op), HOST_TMP0) ||
-				!m_code.EmitUbfx(HOST_TMP0, HOST_TMP0, 0, 16) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu1Finish)))
+	{
+				return false;
+	}
+
+			// The VU helpers may clobber every qcache register. recCTC2() reads
+			// CMSAR1's source after vu1Finish(), so reload it from coherent EE
+			// backing instead of consuming a stale pre-call vector mapping.
+			ClearGprQCache();
+			if (!EmitLoadCop2ControlSource(RT(op), HOST_TMP0) ||
 				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu1ExecMicro)) ||
 				!EmitEventExitReturn(event_exit))
 			{
@@ -16280,19 +16409,42 @@ namespace VitaEE
 
 		size_t vu0_idle = static_cast<size_t>(-1);
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
-		if (!EmitCOP2IdleBranch(&vu0_idle) ||
-			!m_code.EmitMovImm32(HOST_TMP0, op) ||
+		const u8 fallthrough_qcache_count = m_gpr_q_cache_count;
+		u8 fallthrough_qcache_guest[MAX_GPR_QCACHE]{};
+		u8 fallthrough_qcache_qreg[MAX_GPR_QCACHE]{};
+		for (unsigned i = 0; i < MAX_GPR_QCACHE; i++)
+		{
+			fallthrough_qcache_guest[i] = m_gpr_q_cache_guest[i];
+			fallthrough_qcache_qreg[i] = m_gpr_q_cache_qreg[i];
+		}
+
+		if (!EmitCOP2IdleBranch(&vu0_idle))
+			return false;
+
+		// The guarded running arm crosses vu0Sync()/interlock AAPCS calls.
+		// Its source must come from architectural backing, while the idle arm
+		// retains the pre-branch qcache and can consume it directly.
+		ClearGprQCache();
+		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
 			!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
 			!EmitCOP2InterlockCall(op, true) ||
 			!EmitCOP2ControlWriteBody(op) ||
-			!EmitEventExitReturn(event_exit) ||
-			!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+			!EmitEventExitReturn(event_exit))
 		{
 			return false;
 		}
+
+		m_gpr_q_cache_count = fallthrough_qcache_count;
+		for (unsigned i = 0; i < MAX_GPR_QCACHE; i++)
+		{
+			m_gpr_q_cache_guest[i] = fallthrough_qcache_guest[i];
+			m_gpr_q_cache_qreg[i] = fallthrough_qcache_qreg[i];
+		}
+		if (!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+			return false;
 
 		return EmitCOP2ControlWriteBody(op);
 	}
@@ -31853,8 +32005,11 @@ namespace VitaEE
 		return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg)));
 	}
 
-	bool BlockCompiler::EmitLoadGprLowRawZero(unsigned guest_reg, unsigned host_reg)
+	bool BlockCompiler::EmitLoadCop2ControlSource(unsigned guest_reg, unsigned host_reg)
 	{
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::_eeMoveGPRtoR(). recCTC2()
+		// consumes architectural $zero, even though the interpreter's direct
+		// cpuRegs.GPR access can expose a poisoned backing slot.
 		if (guest_reg != 0)
 		{
 			u32 value = 0;
@@ -31866,9 +32021,7 @@ namespace VitaEE
 			return EmitLoadGprLowKnownValue(guest_reg, host_reg, value_known, value);
 		}
 
-		// PCSX2 VU0.cpp::CTC2() reads cpuRegs.GPR.r[_Rt_].UL[0] directly, so
-		// rt=$zero observes the raw backing slot instead of architectural zero.
-		return m_code.EmitLdrImm12(host_reg, HOST_CPU_REGS, static_cast<u16>(GprOffset(0)));
+		return m_code.EmitMovImm8(host_reg, 0);
 	}
 
 	bool BlockCompiler::EmitRefreshGprPinFromBacking(unsigned guest_reg)
@@ -32256,36 +32409,6 @@ namespace VitaEE
 		if (!deferred &&
 			!m_code.EmitStrImm12(host_reg, HOST_CPU_REGS,
 				static_cast<u16>(GprOffset(guest_reg) + word * sizeof(u32))))
-		{
-			return false;
-		}
-
-		InvalidateGprQCacheForGuest(guest_reg);
-		return true;
-	}
-
-	bool BlockCompiler::EmitStoreGprLowPreserveHigh(unsigned guest_reg, unsigned host_low)
-	{
-		if (guest_reg == 0)
-			return true;
-
-		// PCSX2 VU0.cpp::CFC2(REG_R) updates only GPR.UL[0]. Keep the
-		// low-word pin in sync while preserving the existing high word.
-		const int pin_host = FindGprPinHost(guest_reg);
-		if (pin_host >= 0 && static_cast<unsigned>(pin_host) != host_low &&
-			!m_code.EmitMovRegShiftImm(static_cast<unsigned>(pin_host), host_low,
-				VitaA32::ShiftType::LSL, 0))
-		{
-			return false;
-		}
-#if defined(VITASX2_QEMU_VALIDATION)
-		if (pin_host >= 0 && static_cast<unsigned>(pin_host) == host_low)
-			g_qemuGprPinSelfStoresElided++;
-#endif
-
-		const bool deferred = TryDeferGprPinLowStore(guest_reg);
-		if (!deferred &&
-			!m_code.EmitStrImm12(host_low, HOST_CPU_REGS, static_cast<u16>(GprOffset(guest_reg))))
 		{
 			return false;
 		}

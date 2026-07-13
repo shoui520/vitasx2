@@ -1097,7 +1097,7 @@ namespace VitaEE
 		bool EmitVtlbNonHandlerHostAddress128(unsigned host_reg, unsigned vmap_reg, unsigned scratch_reg,
 			size_t* handler_fallback_branch, GprPinDirtyMasks* dirty_pins = nullptr);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
-		bool EmitLoadGprLowRawZero(unsigned guest_reg, unsigned host_reg);
+		bool EmitLoadCop2ControlSource(unsigned guest_reg, unsigned host_reg);
 		bool EmitGprLowOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host);
 		bool EmitLoadGprLowKnownValue(unsigned guest_reg, unsigned host_reg, bool value_known, u32 value);
 		bool EmitLoadGprLowValue(unsigned guest_reg, unsigned host_reg);
@@ -1133,7 +1133,6 @@ namespace VitaEE
 		bool EmitStoreGprQ128ToAddress(unsigned guest_reg, unsigned qreg, unsigned address_reg);
 		bool EmitStoreGprDwordPair(unsigned guest_reg, unsigned low_d, unsigned high_d);
 		bool EmitStoreGprWord(unsigned guest_reg, unsigned word, unsigned host_reg);
-		bool EmitStoreGprLowPreserveHigh(unsigned guest_reg, unsigned host_low);
 		bool TryEmitStoreGprLow64FromQCache(unsigned guest_reg, unsigned source_guest_reg, bool* emitted);
 		bool TryEmitStoreGprLow64InvertFromQCache(unsigned guest_reg, unsigned source_guest_reg, bool* emitted);
 		bool EmitStoreGprZero64(unsigned guest_reg);

@@ -6,6 +6,7 @@
 
 #include "Common.h"
 #include "VUmicro.h"
+#include "Vu0FlagConversion.h"
 
 #include <cmath>
 
@@ -19,21 +20,9 @@ void vu0ResetRegs()
 	vif0Regs.stat.VEW = false;
 }
 
-static __fi u32 vu0DenormalizeMicroStatus(u32 nstatus)
-{
-	// from mVUallocSFLAGd()
-	return ((nstatus >> 3) & 0x18u) | ((nstatus >> 11) & 0x1800u) | ((nstatus >> 14) & 0x3cf0000u);
-}
-
 static __fi void vu0SetMicroFlags(u32* flags, u32 value)
 {
-#ifdef ARCH_X86
-	_mm_store_si128(reinterpret_cast<__m128i*>(flags), _mm_set1_epi32(value));
-#elif defined(ARCH_ARM64)
-	vst1q_u32(flags, vdupq_n_u32(value));
-#else
-	flags[0] = flags[1] = flags[2] = flags[3] = value;
-#endif
+	Vu0FlagConversion::Broadcast(flags, value);
 }
 
 void vu0ExecMicro(u32 addr) {
@@ -57,7 +46,7 @@ void vu0ExecMicro(u32 addr) {
 	// but long-running program may be interrupted so we can't do it at dispatch time.
 	vu0SetMicroFlags(VU0.micro_clipflags, CLIP);
 	vu0SetMicroFlags(VU0.micro_macflags, MAC);
-	vu0SetMicroFlags(VU0.micro_statusflags, vu0DenormalizeMicroStatus(STATUS));
+	vu0SetMicroFlags(VU0.micro_statusflags, Vu0FlagConversion::DenormalizeStatus(STATUS));
 
 	VU0.VI[REG_VPU_STAT].UL &= ~0xFF;
 	VU0.VI[REG_VPU_STAT].UL |=  0x01;
