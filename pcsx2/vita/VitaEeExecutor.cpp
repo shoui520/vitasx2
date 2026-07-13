@@ -2781,11 +2781,12 @@ namespace VitaEE
 		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() concatenates a
 		// discovered prefix of at most six instructions to the following
 		// BaseBlock without an intervening iBranchTest(). Vita can do so only when
-		// that successor is already a compiled BaseBlock or the internal-target
-		// scan reaches a native branch tail which owns iBranchTest(). A page/debug
-		// successor can fall into an interpreter-only region; keep its scheduler
-		// seam until the provider can carry PCSX2's pending event-test contract
-		// through fallback.
+		// that successor is already a compiled BaseBlock, the internal-target
+		// scan reaches a native branch tail which owns iBranchTest(), or a
+		// constant FlushCache SYSCALL boundary has a nonempty native successor.
+		// A page/debug/unsupported successor can fall into an interpreter-only
+		// region; keep its scheduler seam until the provider can carry PCSX2's
+		// pending event-test contract through fallback.
 		// DI is an important overlap case: recDI() consumes the first instruction
 		// of an existing block, so the actual generated successor is one word after
 		// that known entry. Do not infer that this post-follower address is native
@@ -2801,9 +2802,20 @@ namespace VitaEE
 				&branch_target_successor) &&
 			branch_target_successor.instruction_count != 0 &&
 			branch_target_successor.stop == BlockScanStop::Branch;
+		BlockScanResult flush_cache_successor;
+		const bool flush_cache_successor_scannable =
+			scan.stop == BlockScanStop::OpcodeBoundary &&
+			scan.instruction_count <= 6 &&
+			BlockCompiler::IsConstantFlushCacheSyscallBlock(
+				start_pc, scan.instruction_count) &&
+			ScanStraightLineBlock(scan.stop_pc,
+				MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS,
+				&flush_cache_successor) &&
+			flush_cache_successor.instruction_count != 0;
 		const bool concatenate_short_split = scan.instruction_count <= 6 &&
 			(compiled_successor ||
-				branch_target_successor_scannable);
+				branch_target_successor_scannable ||
+				flush_cache_successor_scannable);
 
 		CachedBlock* entry = AllocateCacheEntry();
 		if (!entry || !CompileIntoCacheEntry(*entry, start_pc, scan.instruction_count,

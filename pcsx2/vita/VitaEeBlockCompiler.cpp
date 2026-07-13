@@ -486,6 +486,10 @@ namespace VitaEE
 		constexpr u8 EE_DIRECT_EXIT_TOKEN = 0xd1;
 		constexpr u8 EE_CONCATENATED_DIRECT_EXIT_TOKEN = 0xc1;
 		constexpr u8 EE_EVENT_EXIT_TOKEN = 0xe7;
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recSYSCALL(). Keep this
+		// measured handler replacement in the raw fixed-point cycle domain and
+		// use one value for generated execution and code-budget split analysis.
+		constexpr u32 FLUSH_CACHE_RAW_CYCLE_CHARGE = 5650;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_COMPLETE = 0;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_EVENT = 1;
 
@@ -3104,6 +3108,14 @@ namespace VitaEE
 			omit_final_likely_delay_slot, &committed_scaled_cycles, scaled_cycles);
 	}
 
+	bool BlockCompiler::IsConstantFlushCacheSyscallBlock(u32 start_pc,
+		u32 instruction_count)
+	{
+		return instruction_count != 0 &&
+			instruction_count <= ((UINT32_MAX - start_pc) / sizeof(u32)) &&
+			IsConstantFlushCacheSyscallAt(start_pc, instruction_count - 1);
+	}
+
 	bool BlockCompiler::CalculateScaledCycleStateForRange(u32 start_pc,
 		u32 instruction_count, bool omit_final_likely_delay_slot,
 		u32* committed_scaled_cycles, u32* final_scaled_cycles)
@@ -3138,6 +3150,14 @@ namespace VitaEE
 			const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
 			raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) *
 				cycle_factor;
+			// PCSX2 owner: x86/ix86-32/iR5900.cpp::recSYSCALL(). A
+			// block-local constant FlushCache/iFlushCache call is not an
+			// exception in the JIT; its measured handler time is accumulated in
+			// the same raw fixed-point domain as s_nBlockCycles. Keep this in the
+			// split proof as well as emission so an artificial A32 code-budget seam
+			// cannot silently lose or rescale the owner charge.
+			if (IsSYSCALL(op) && IsConstantFlushCacheSyscallAt(start_pc, i))
+				raw_cycles += FLUSH_CACHE_RAW_CYCLE_CHARGE;
 			if (IsCycleCommittingFastCOP0(op))
 			{
 				committed_cycles += ScaleBlockCycles(raw_cycles);
@@ -3148,6 +3168,45 @@ namespace VitaEE
 		*committed_scaled_cycles = committed_cycles;
 		*final_scaled_cycles = committed_cycles + ScaleBlockCycles(raw_cycles);
 		return true;
+	}
+
+	bool BlockCompiler::IsConstantFlushCacheSyscallAt(u32 start_pc, u32 instruction_index)
+	{
+		if (instruction_index > ((UINT32_MAX - start_pc) / sizeof(u32)))
+			return false;
+
+		// Reuse the emitter's complete block-local constant-propagation owner
+		// instead of maintaining a second, narrower decoder in the cycle/split
+		// analysis. The default CodeBuffer owns no executable allocation; it is
+		// only the required construction context for this compile-time state walk.
+		VitaA32::CodeBuffer analysis_code;
+		BlockCompiler analysis(analysis_code);
+		analysis.ClearGprConstState();
+		for (u32 i = 0; i < instruction_index; i++)
+		{
+			const u32 pc = start_pc + i * sizeof(u32);
+			analysis.UpdateGprConstStateAfterOpcode(memRead32(pc), pc);
+		}
+
+		return analysis.IsConstantFlushCacheSyscall(
+			memRead32(start_pc + instruction_index * sizeof(u32)));
+	}
+
+	bool BlockCompiler::IsConstantFlushCacheSyscall(u32 op) const
+	{
+		if (!IsSYSCALL(op))
+			return false;
+
+		u32 syscall_number = 0;
+		if (!TryGetKnownGpr64(3, &syscall_number, nullptr))
+			return false;
+
+		// GPR_IS_CONST1 means the complete low 64-bit lane is constant, but the
+		// subsequent UC[0] comparison deliberately tests only its lowest byte.
+		// Preserve both parts of that contract, including constant upper-byte
+		// aliases, rather than promoting a merely low-word-known A32 value.
+		const u8 low_byte = static_cast<u8>(syscall_number);
+		return low_byte == 0x64 || low_byte == 0x68;
 	}
 
 	bool BlockCompiler::DoesSplitPreserveScaledCycleTimeline(u32 start_pc,
@@ -3339,7 +3398,8 @@ namespace VitaEE
 		// SYSCALL/BREAK are different: R5900OpcodeImpl.cpp::SYSCALL()/BREAK()
 		// are helper-backed exception paths, and Interpreter.cpp::_doBranch_shared()
 		// marks cpuRegs.branch before executing them as delay slots.
-		// Trap ops use the same exception-shaped helper/event tail.
+		// Trap ops use the same exception-shaped helper tail but force the
+		// scheduler through PCSX2's distinct recBranchCall() deadline contract.
 		return CanCompileOpcode(op) && (op >> 26) != 0x12 && !IsDI(op) &&
 			   !IsInBlockTLBReadProbe(op) && !IsInBlockTLBWrite(op) &&
 			   (!RequiresBlockEndAfterOpcode(op) || IsSYSCALL(op) || IsBREAK(op) ||
@@ -3641,8 +3701,8 @@ namespace VitaEE
 						add_dword_read(rs);
 						add_dword_read(rt);
 						return true;
-					case 0x0c: // SYSCALL exits the block through the event helper
-					case 0x0d: // BREAK exits the block through the event helper
+					case 0x0c: // SYSCALL exits through its dynamic-PC cycle-test tail
+					case 0x0d: // BREAK exits through its dynamic-PC cycle-test tail
 					case 0x0f: // SYNC
 					case 0x10: // MFHI writes rd through the seam
 					case 0x12: // MFLO writes rd through the seam
@@ -10253,13 +10313,25 @@ namespace VitaEE
 				break;
 			}
 		}
-		if (contains_in_block_tlb_write)
+		const u32 final_op = memRead32(start_pc +
+			(instruction_count - 1) * sizeof(u32));
+		const bool contains_helper_backed_syscall_delay = instruction_count >= 2 &&
+			IsSupportedBranchOpcode(memRead32(start_pc +
+				(instruction_count - 2) * sizeof(u32))) &&
+			IsSYSCALL(final_op) &&
+			!IsConstantFlushCacheSyscallAt(start_pc, instruction_count - 1);
+		if (contains_in_block_tlb_write || contains_helper_backed_syscall_delay)
 		{
 			// PCSX2's TLBWI/TLBWR recCall() continues to the natural block tail,
 			// but MapTLB()/UnmapTLB() can invalidate generated translations.  Vita
 			// defers that invalidation until this generated block has unwound, so no
 			// outgoing edge may bypass the provider boundary.  Incoming canonical
 			// links remain safe: they execute the TLB write before reaching this tail.
+			// R5900OpcodeImpl.cpp::SYSCALL() has two HLE returns. GetMemorySize
+			// changes $v0 and GetOsdConfigParam2 can write guest code pages. The x86
+			// recCall(FLUSH_INTERPRETER) seam discards register mappings and can
+			// invalidate immediately; Vita reloads its pins below and must unwind so
+			// recClear() can consume the deferred cache reset before the branch target.
 			direct_links = nullptr;
 			indirect_lookup_pages_slot = nullptr;
 			direct_linking_enabled_flag = nullptr;
@@ -10275,6 +10347,7 @@ namespace VitaEE
 		const u32 previous_block_instruction_count = m_current_block_instruction_count;
 		const u32 previous_instruction_index = m_current_instruction_index;
 		const bool previous_persistent_dispatch_exits = m_persistent_dispatch_exits;
+		const void* previous_direct_exit = m_current_direct_exit;
 		struct CurrentBlockScope
 		{
 			BlockCompiler& compiler;
@@ -10282,20 +10355,24 @@ namespace VitaEE
 			u32 previous_instruction_count;
 			u32 previous_instruction_index;
 			bool previous_persistent_dispatch_exits;
+			const void* previous_direct_exit;
 			~CurrentBlockScope()
 			{
 				compiler.m_current_block_start_pc = previous_start_pc;
 				compiler.m_current_block_instruction_count = previous_instruction_count;
 				compiler.m_current_instruction_index = previous_instruction_index;
 				compiler.m_persistent_dispatch_exits = previous_persistent_dispatch_exits;
+				compiler.m_current_direct_exit = previous_direct_exit;
 			}
 		} current_block_scope{
 			*this, previous_block_start_pc, previous_block_instruction_count,
-			previous_instruction_index, previous_persistent_dispatch_exits};
+			previous_instruction_index, previous_persistent_dispatch_exits,
+			previous_direct_exit};
 		m_current_block_start_pc = start_pc;
 		m_current_block_instruction_count = instruction_count;
 		m_current_instruction_index = 0;
 		m_persistent_dispatch_exits = persistent_dispatch_exits;
+		m_current_direct_exit = direct_exit;
 		m_gpr_link_signature =
 			(persistent_dispatch_exits && gpr_link_signature && gpr_link_signature->IsValid()) ?
 				*gpr_link_signature : GprLinkSignature{};
@@ -11037,7 +11114,18 @@ namespace VitaEE
 				return false;
 
 			m_current_instruction_index = i;
+			const bool constant_flush_cache_syscall =
+				IsConstantFlushCacheSyscall(op);
 			add_raw_cycles(op);
+			if (constant_flush_cache_syscall)
+			{
+				// PCSX2 recSYSCALL() adds this measured exception-handler cost
+				// directly to s_nBlockCycles, emits no helper or architectural
+				// exception writes, and leaves g_branch clear. The ordinary block or
+				// enclosing delay-slot branch tail below therefore owns PC, linking,
+				// and the path-specific event test.
+				raw_cycles += FLUSH_CACHE_RAW_CYCLE_CHARGE;
+			}
 			const bool branch_delay_slot = has_branch && i == branch_instruction_index + 1;
 			if (branch_delay_slot &&
 				m_compatible_predicate_canonical_enter_delay != static_cast<size_t>(-1) &&
@@ -11066,9 +11154,9 @@ namespace VitaEE
 						!IsERET(next_op)) ||
 					IsCounterReadLoad(next_op) ||
 					IsCycleCommittingFastCOP0(next_op))
-	{
+				{
 					return false;
-	}
+				}
 
 				pending_di_clear = true;
 				continue;
@@ -11089,7 +11177,8 @@ namespace VitaEE
 						return false;
 					pending_di_clear = false;
 				}
-				else if (!EmitOpcode(op, pc, raw_cycles, event_exit, branch_delay_slot))
+				else if (!constant_flush_cache_syscall &&
+					!EmitOpcode(op, pc, raw_cycles, event_exit, branch_delay_slot))
 				{
 					return false;
 				}
@@ -11111,7 +11200,8 @@ namespace VitaEE
 				raw_cycles = RawCycleRemainderAfterClear(raw_cycles);
 			}
 
-			if ((IsSYSCALL(op) || IsBREAK(op) || IsTrapOpcode(op)) && !branch_delay_slot)
+			if ((IsSYSCALL(op) || IsBREAK(op) || IsTrapOpcode(op)) &&
+				!branch_delay_slot && !constant_flush_cache_syscall)
 			{
 				if (scaled_cycles)
 					*scaled_cycles = committed_scaled_cycles + ScaleBlockCycles(raw_cycles);
@@ -11513,6 +11603,31 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::EmitReloadAllGprPinsFromBacking()
+	{
+		// PCSX2 owner: x86/iCore.cpp::iFlushCall(FLUSH_INTERPRETER), used by
+		// recCall(), makes the architectural register file authoritative across an
+		// interpreter helper. A delay-slot SYSCALL can return through HLE instead
+		// of raising an exception, so rebuild every active scalar mapping before
+		// the outer branch tail can flush or carry it.
+		for (unsigned i = 0; i < m_pin_count; i++)
+		{
+			const size_t offset = GprOffset(m_pin_guest[i]);
+			if (!m_code.EmitLdrImm12(m_pin_host[i], HOST_CPU_REGS,
+					static_cast<u16>(offset)))
+			{
+				return false;
+			}
+			if (m_pin_high_host[i] != NO_GPR_PIN_HOST &&
+				!m_code.EmitLdrImm12(m_pin_high_host[i], HOST_CPU_REGS,
+					static_cast<u16>(offset + sizeof(u32))))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
 	bool BlockCompiler::EmitExitToTarget(const void* target, u8 callable_token)
 	{
 		if (!target)
@@ -11862,6 +11977,40 @@ namespace VitaEE
 			return false;
 
 		return EmitExitToTarget(event_exit, EE_EVENT_EXIT_TOKEN);
+	}
+
+	bool BlockCompiler::EmitIndirectCycleTestExit(const void* event_exit)
+	{
+		if (!m_current_direct_exit || !event_exit)
+			return false;
+
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest() with its
+		// default dynamic-PC argument. Exception helpers have already published
+		// the selected PC, so a negative signed cycle/deadline delta resumes the
+		// register dispatcher without running _cpuEventTest_Shared(). Only a due
+		// deadline enters DispatcherEvent. The scheduler bounds this delta to the
+		// signed low-word window, matching the ordinary A32 block tail.
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS,
+				static_cast<u16>(CYCLE_OFFSET)) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS,
+				static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP2, HOST_TMP0, HOST_TMP1, true))
+		{
+			return false;
+		}
+
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!EmitExitToTarget(m_current_direct_exit, EE_DIRECT_EXIT_TOKEN))
+		{
+			return false;
+		}
+
+		const size_t event_target = m_code.Size();
+		return m_code.PatchBranch(event_branch, event_target,
+				   VitaA32::Condition::PL) &&
+			   EmitEventExitReturn(event_exit);
 	}
 
 	bool BlockCompiler::EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc,
@@ -17459,44 +17608,97 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::EmitSpecialExceptionEventExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
-		const void* event_exit, bool branch_delay_slot, const void* helper)
+	bool BlockCompiler::EmitSpecialExceptionExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
+		const void* event_exit, bool branch_delay_slot, const void* helper,
+		bool force_event_dispatch)
 	{
-		if (!event_exit || !helper || raw_cycles_through_instruction == 0)
+		if (!m_current_direct_exit || !event_exit || !helper ||
+			raw_cycles_through_instruction == 0)
 			return false;
 
-		// The exception helpers read the GPR file (e.g. SYSCALL's $v1), so
-		// deferred pinned words must be resident in backing before the call.
+		// PCSX2 owners: recSYSCALL()/recBREAK() use recCall() followed by the
+		// dynamic-PC iBranchTest(), while trap opcodes use recBranchCall(), which
+		// first makes the current cycle the event deadline. In both forms the
+		// helper observes the currently published cycle before the uncommitted
+		// prefix and iBranchTest() charges that complete prefix afterward.
+		// Deferred pinned words must still be resident in backing before the
+		// helper reads them (for example SYSCALL's $v1).
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
 			!EmitSyncGprPinsToBacking() ||
 			!EmitStorePc(pc + 4) ||
 			!m_code.EmitMovImm8(HOST_TMP0, branch_delay_slot ? 1 : 0) ||
-			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(BRANCH_OFFSET)) ||
-			!EmitAddScaledCyclesToCpu(cycles) ||
-			!m_code.EmitCallAbsolute(helper))
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(BRANCH_OFFSET)))
 		{
 			return false;
 		}
 
-		return EmitEventExitReturn(event_exit);
+		if (force_event_dispatch &&
+			(!EmitLoadCpuRegsU64(CYCLE_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2) ||
+			 !EmitStoreCpuRegsU64(NEXT_EVENT_OFFSET, HOST_TMP0, HOST_TMP1, HOST_TMP2)))
+		{
+			return false;
+		}
+
+		if (!m_code.EmitCallAbsolute(helper))
+			return false;
+
+		// Interpreter.cpp::_doBranch_shared() completes the selected outer
+		// branch only when a delay-slot helper leaves cpuRegs.branch nonzero.
+		// SYSCALL's HLE GetMemorySize/GetOsdConfigParam2 paths and a non-taken trap
+		// can do exactly that. Preserve the already-selected callee-saved branch
+		// predicate; a returning SYSCALL rebuilds every scalar mapping from
+		// helper-authoritative backing below. Then rejoin the ordinary branch tail
+		// without charging the private BaseBlock prefix twice. An exception clears
+		// branch and takes the dynamic-PC event-test exit below.
+		size_t continue_outer_branch = static_cast<size_t>(-1);
+		if (branch_delay_slot)
+		{
+			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS,
+					static_cast<u16>(BRANCH_OFFSET)) ||
+				!m_code.EmitCmpImm32(HOST_TMP0, 0))
+			{
+				return false;
+			}
+			continue_outer_branch =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (continue_outer_branch == static_cast<size_t>(-1))
+				return false;
+		}
+
+		if (!EmitAddScaledCyclesToCpu(cycles) ||
+			!EmitIndirectCycleTestExit(event_exit))
+		{
+			return false;
+		}
+
+		if (!branch_delay_slot)
+			return true;
+
+		const size_t outer_branch_target = m_code.Size();
+		return m_code.PatchBranch(continue_outer_branch, outer_branch_target,
+				   VitaA32::Condition::NE) &&
+			   (!IsSYSCALL(op) || EmitReloadAllGprPinsFromBacking()) &&
+			   m_code.EmitMovImm8(HOST_TMP0, 0) &&
+			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS,
+				   static_cast<u16>(BRANCH_OFFSET));
 	}
 
 	bool BlockCompiler::EmitSYSCALL(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 		const void* event_exit, bool branch_delay_slot)
 	{
 		using namespace R5900::Interpreter::OpcodeImpl;
-		return EmitSpecialExceptionEventExit(op, pc, raw_cycles_through_instruction,
-			event_exit, branch_delay_slot, reinterpret_cast<const void*>(&SYSCALL));
+		return EmitSpecialExceptionExit(op, pc, raw_cycles_through_instruction,
+			event_exit, branch_delay_slot, reinterpret_cast<const void*>(&SYSCALL), false);
 	}
 
 	bool BlockCompiler::EmitBREAK(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 		const void* event_exit, bool branch_delay_slot)
 	{
 		using namespace R5900::Interpreter::OpcodeImpl;
-		return EmitSpecialExceptionEventExit(op, pc, raw_cycles_through_instruction,
-			event_exit, branch_delay_slot, reinterpret_cast<const void*>(&BREAK));
+		return EmitSpecialExceptionExit(op, pc, raw_cycles_through_instruction,
+			event_exit, branch_delay_slot, reinterpret_cast<const void*>(&BREAK), false);
 	}
 
 	bool BlockCompiler::EmitTrapEventExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -17505,8 +17707,8 @@ namespace VitaEE
 		// PCSX2 owners: R5900OpcodeImpl.cpp::TGE/TGEU/TLT/TLTU/TEQ/TNE and
 		// TGEI/TGEIU/TLTI/TLTIU/TEQI/TNEI. The x86 recompiler keeps these as
 		// recBranchCall() helper tails, so the first A32 port does the same.
-		return EmitSpecialExceptionEventExit(op, pc, raw_cycles_through_instruction,
-			event_exit, branch_delay_slot, TrapHelperForOpcode(op));
+		return EmitSpecialExceptionExit(op, pc, raw_cycles_through_instruction,
+			event_exit, branch_delay_slot, TrapHelperForOpcode(op), true);
 	}
 
 	bool BlockCompiler::EmitADDIU(u32 op)
