@@ -8,6 +8,7 @@
 #include "DebugTools/Spu2Trace.h"
 #include "DebugTools/VuTrace.h"
 #if defined(VITASX2_QEMU_VALIDATION)
+#include "DebugTools/CoreEventTrace.h"
 #include "DebugTools/EeTrace.h"
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
@@ -72,6 +73,7 @@ bool g_vita_a32_iop_private_scheduler_dispatch_cache_entry_available = false;
 static VitaA32EeProviderStats s_ee_a32_stats;
 static VitaA32IopProviderStats s_iop_a32_stats;
 #if defined(VITASX2_QEMU_VALIDATION)
+static VitaA32EeProviderStats s_ee_a32_session_fallback_stats;
 struct IopDispatchProfileEntry
 {
 	u32 opcode = 0;
@@ -95,6 +97,8 @@ static u64 s_iop_a32_compact_provider_cache_hit_entries = 0;
 static u64 s_ee_a32_persistent_boundary_limit = 0;
 static u64 s_ee_a32_persistent_boundaries = 0;
 static bool s_ee_a32_persistent_boundary_hit_limit = false;
+static VitaA32EeTraceLimitStopCondition s_ee_a32_trace_limit_stop_condition =
+	VitaA32EeTraceLimitStopCondition::None;
 #endif
 static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
@@ -282,40 +286,51 @@ bool VitaRecordIopPreInstruction(u32 pc, u32 opcode)
 	return callback ? callback(pc, opcode) : false;
 }
 
-static void recRecordInterpreterFallback(u32 pc, u32 opcode, VitaA32EeFallbackReason reason)
+static void recRecordInterpreterFallbackInStats(VitaA32EeProviderStats& stats,
+	u32 pc, u32 opcode, VitaA32EeFallbackReason reason)
 {
-	if (s_ee_a32_stats.interpreter_steps == 0)
+	if (stats.interpreter_steps == 0)
 	{
-		s_ee_a32_stats.first_interpreter_pc = pc;
-		s_ee_a32_stats.first_interpreter_opcode = opcode;
-		s_ee_a32_stats.first_interpreter_reason = static_cast<u32>(reason);
+		stats.first_interpreter_pc = pc;
+		stats.first_interpreter_opcode = opcode;
+		stats.first_interpreter_reason = static_cast<u32>(reason);
 	}
 
-	s_ee_a32_stats.last_interpreter_pc = pc;
-	s_ee_a32_stats.last_interpreter_opcode = opcode;
-	s_ee_a32_stats.last_interpreter_reason = static_cast<u32>(reason);
-	s_ee_a32_stats.interpreter_steps++;
+	stats.last_interpreter_pc = pc;
+	stats.last_interpreter_opcode = opcode;
+	stats.last_interpreter_reason = static_cast<u32>(reason);
+	stats.interpreter_steps++;
 
 	switch (reason)
 	{
 		case VitaA32EeFallbackReason::ScanUnsupportedOpcode:
-			s_ee_a32_stats.scan_unsupported_fallbacks++;
+			stats.scan_unsupported_fallbacks++;
 			break;
 		case VitaA32EeFallbackReason::ScanBoundary:
-			s_ee_a32_stats.scan_boundary_fallbacks++;
+			stats.scan_boundary_fallbacks++;
 			break;
 		case VitaA32EeFallbackReason::ExactTraceBranchLikely:
-			s_ee_a32_stats.exact_trace_branch_likely_fallbacks++;
+			stats.exact_trace_branch_likely_fallbacks++;
 			break;
 		case VitaA32EeFallbackReason::ExecuteFailed:
-			s_ee_a32_stats.execute_failed_fallbacks++;
+			stats.execute_failed_fallbacks++;
 			break;
 		case VitaA32EeFallbackReason::InterpreterPath:
-			s_ee_a32_stats.interpreter_path_fallbacks++;
+			stats.interpreter_path_fallbacks++;
 			break;
 		case VitaA32EeFallbackReason::None:
 			break;
 	}
+}
+
+static void recRecordInterpreterFallback(u32 pc, u32 opcode,
+	VitaA32EeFallbackReason reason)
+{
+	recRecordInterpreterFallbackInStats(s_ee_a32_stats, pc, opcode, reason);
+#if defined(VITASX2_QEMU_VALIDATION)
+	recRecordInterpreterFallbackInStats(
+		s_ee_a32_session_fallback_stats, pc, opcode, reason);
+#endif
 }
 
 static VitaA32EeFallbackReason recFallbackReasonForScanStop(VitaEE::BlockScanStop stop)
@@ -594,11 +609,40 @@ static void recResetEeDispatchState()
 	s_ee_a32_persistent_dispatch_enabled = false;
 }
 
+#if defined(VITASX2_QEMU_VALIDATION)
+static bool recDidEeTraceLimitHitAtNaturalBoundary()
+{
+	switch (s_ee_a32_trace_limit_stop_condition)
+	{
+		case VitaA32EeTraceLimitStopCondition::CoreEventTrace:
+			return Pcsx2Trace::DidCoreEventTraceHitLimit();
+		case VitaA32EeTraceLimitStopCondition::MachineCheckpointTrace:
+			return Pcsx2Trace::DidMachineCheckpointTraceHitLimit();
+		case VitaA32EeTraceLimitStopCondition::None:
+		default:
+			return false;
+	}
+}
+#endif
+
 static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& result)
 {
 	recAccountEeBlockExecution(result, cpuRegs.pc);
 #if defined(VITASX2_QEMU_VALIDATION)
-	if (s_ee_a32_persistent_boundary_limit != 0 &&
+	// The trace-free full-core route must retain the production persistent
+	// dispatch/link shape. Poll bounded CORE/checkpoint completion only here,
+	// after generated code has reached the same natural tail which owns the
+	// scheduler event test; never install an EE pre-instruction stop hook. A
+	// PCSX2-style <=6-instruction structural prefix returns through this cold
+	// callback only until its direct link is patched, but deliberately has no
+	// iBranchTest(). Do not turn that link seam into an oracle checkpoint.
+	const bool natural_scheduler_boundary = !result.scheduler_test_elided;
+	if (natural_scheduler_boundary && recDidEeTraceLimitHitAtNaturalBoundary())
+	{
+		s_ee_a32_exit_execution = true;
+		return false;
+	}
+	if (natural_scheduler_boundary && s_ee_a32_persistent_boundary_limit != 0 &&
 		++s_ee_a32_persistent_boundaries >= s_ee_a32_persistent_boundary_limit)
 	{
 		s_ee_a32_persistent_boundary_hit_limit = true;
@@ -659,9 +703,25 @@ static void recStep()
 static void recExecute()
 {
 	s_ee_a32_exit_execution = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+	// A cold PCSX2-style short structural prefix returns through the provider
+	// without iBranchTest() until its successor link exists. Do not stop a
+	// bounded trace at that non-architectural seam.
+	bool can_observe_trace_limit = true;
+#endif
 
 	while (!s_ee_a32_exit_execution)
 	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		// Before ELF entry the provider deliberately uses callable blocks so the
+		// PCSX2 EELOAD hooks remain visible. Observe a completed limit before the
+		// next block only when the preceding return owned a scheduler test.
+		if (can_observe_trace_limit && recDidEeTraceLimitHitAtNaturalBoundary())
+		{
+			s_ee_a32_exit_execution = true;
+			break;
+		}
+#endif
 		// Direct-linked chains bypass this dispatcher, so linking stays off
 		// while tracing and until the ELF boots: pre-boot, every arrival at
 		// the EELOAD/entry hook pcs below must pass through here, matching
@@ -730,7 +790,13 @@ static void recExecute()
 			if (executed)
 			{
 				if (!fast_dispatch)
+				{
 					recAccountEeBlockExecution(result, pc);
+#if defined(VITASX2_QEMU_VALIDATION)
+					can_observe_trace_limit =
+						!result.scheduler_test_elided;
+#endif
+				}
 
 				if (s_ee_a32_cache_reset_requested)
 				{
@@ -845,6 +911,9 @@ static void recExecute()
 		if (!executed)
 		{
 			s_ee_a32_stats.failed_blocks++;
+#if defined(VITASX2_QEMU_VALIDATION)
+			s_ee_a32_session_fallback_stats.failed_blocks++;
+#endif
 			recRunInterpreterStepsWithoutProviderTrace(executable_instruction_count);
 			if (!full_window_recorded)
 				break;
@@ -853,6 +922,12 @@ static void recExecute()
 		}
 
 		recAccountEeBlockExecution(result, pc);
+#if defined(VITASX2_QEMU_VALIDATION)
+		// A code-budget split can still end in a PCSX2-owned concatenated short
+		// prefix. Keep the same natural-boundary contract as the callable path
+		// above even though an exact trace normally exits immediately afterward.
+		can_observe_trace_limit = !result.scheduler_test_elided;
+#endif
 
 		if (s_ee_a32_cache_reset_requested)
 		{
@@ -1286,6 +1361,16 @@ VitaA32EeProviderStats VitaGetA32EeProviderStats()
 }
 
 #if defined(VITASX2_QEMU_VALIDATION)
+void VitaResetA32EeSessionFallbackStats()
+{
+	s_ee_a32_session_fallback_stats = {};
+}
+
+VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats()
+{
+	return s_ee_a32_session_fallback_stats;
+}
+
 void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled)
 {
 	s_ee_a32_executor.SetDirectLinkRejectionProfileEnabled(enabled);
@@ -1301,6 +1386,11 @@ void VitaSetA32EePersistentBoundaryLimit(u64 limit)
 bool VitaDidA32EePersistentBoundaryHitLimit()
 {
 	return s_ee_a32_persistent_boundary_hit_limit;
+}
+
+void VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition condition)
+{
+	s_ee_a32_trace_limit_stop_condition = condition;
 }
 
 VitaA32EeLinkRejectionProfile VitaGetA32EeLinkRejectionProfile()

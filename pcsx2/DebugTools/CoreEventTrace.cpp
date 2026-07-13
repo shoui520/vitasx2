@@ -27,6 +27,7 @@ namespace Pcsx2Trace
 		static constexpr u32 TRACE_VERSION = 1;
 		static constexpr u32 TRACE_FLAG_WAITED_FOR_ELF_ENTRY = 1u << 0;
 		static constexpr u32 TRACE_FLAG_GATED_ON_SIF_RECORDS = 1u << 1;
+		static constexpr u32 TRACE_EXECUTION_PROVIDER_SHIFT = 8;
 
 #pragma pack(push, 1)
 		struct CoreEventTraceFileHeader
@@ -94,7 +95,8 @@ namespace Pcsx2Trace
 			header.record_size = sizeof(CoreEventTraceRecord);
 			header.flags =
 				(s_config.wait_for_elf_entry ? TRACE_FLAG_WAITED_FOR_ELF_ENTRY : 0) |
-				(s_config.after_sif_records != 0 ? TRACE_FLAG_GATED_ON_SIF_RECORDS : 0);
+				(s_config.after_sif_records != 0 ? TRACE_FLAG_GATED_ON_SIF_RECORDS : 0) |
+				(s_config.execution_provider_mask << TRACE_EXECUTION_PROVIDER_SHIFT);
 			header.max_records = s_config.max_records;
 			header.records_written = s_records_written;
 			header.entry_pc = s_entry_pc;

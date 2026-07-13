@@ -176,9 +176,24 @@ void VitaResetA32EeProviderStats();
 VitaA32EeProviderStats VitaGetA32EeProviderStats();
 void VitaRequestA32EeCacheReset();
 #if defined(VITASX2_QEMU_VALIDATION)
+// Unlike cache/reset-scoped provider telemetry, these fallback sentinels span
+// the complete validation session, including the two ELF-entry cache resets.
+void VitaResetA32EeSessionFallbackStats();
+VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats();
+
+enum class VitaA32EeTraceLimitStopCondition : u32
+{
+	None = 0,
+	CoreEventTrace = 1,
+	MachineCheckpointTrace = 2,
+};
+
 void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled);
 void VitaSetA32EePersistentBoundaryLimit(u64 limit);
 bool VitaDidA32EePersistentBoundaryHitLimit();
+// Stop an uninstrumented persistent EE chain only after its current natural
+// block boundary observes the selected bounded cross-core trace limit.
+void VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition condition);
 VitaA32EeLinkRejectionProfile VitaGetA32EeLinkRejectionProfile();
 #endif
 

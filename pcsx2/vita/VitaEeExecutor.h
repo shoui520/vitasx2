@@ -39,6 +39,8 @@ namespace VitaEE
 		UnsupportedOpcode,
 		PageBoundary,
 		DebugBoundary,
+		BranchTargetBoundary,
+		ExistingBlockBoundary,
 		OpcodeBoundary,
 		Branch,
 		MaxInstructions,
@@ -75,7 +77,14 @@ namespace VitaEE
 		bool cache_hit = false;
 		bool lookup_hit = false;
 		bool fast_dispatch_hit = false;
+		// Set from the token emitted by the generated block which actually
+		// returned to the dispatcher. Unlike the prepared-entry telemetry below,
+		// this remains authoritative after one or more patched direct links.
+		bool scheduler_test_elided = false;
 #if defined(VITASX2_QEMU_VALIDATION)
+		u32 concatenated_short_blocks = 0;
+		u32 concatenated_short_scheduler_tests_elided = 0;
+		u32 concatenated_short_hot_instructions_elided = 0;
 		u32 generated_frame_pushes = 0;
 		u32 generated_frame_pops = 0;
 		u32 dispatcher_frame_pushes = 0;
@@ -101,7 +110,13 @@ namespace VitaEE
 		using PersistentBoundaryCallback = bool (*)(void* userdata,
 			const BlockExecutionResult& completed_chain);
 
-		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 64;
+		// PCSX2 recRecompile() discovers through the next branch, existing
+		// BaseBlock, debugger seam, or 4 KiB source-page boundary. A branch in the
+		// final page word still owns its delay slot on the following page, hence
+		// 1024 page words plus one atomic follower. Host-code budget splitting is a
+		// separate concern below; imposing a smaller discovery ceiling changes
+		// fixed-point cycle rounding and therefore Count/event timing.
+		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 1025;
 
 		BlockExecutor();
 		~BlockExecutor();
@@ -167,7 +182,11 @@ namespace VitaEE
 		struct CachedBlock
 		{
 			VitaA32::CodeBuffer code;
-			std::array<u32, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS> opcodes{};
+			// Match recRAMCopy without charging every cached block for a worst-case
+			// page-sized inline array. The nothrow allocation is released with the
+			// BaseBlock, so cold long blocks cannot leave page-sized capacity behind
+			// in every recycled Vita cache slot.
+			std::unique_ptr<u32[]> opcodes;
 			u32 start_pc = 0;
 			u32 instruction_count = 0;
 			u32 source_instruction_count = 0;
@@ -185,6 +204,8 @@ namespace VitaEE
 			CompatibleVtlbFastEntryOffsets compatible_vtlb_fast_entries{};
 			u8 compatible_link_entry_loads = 0;
 			DirectLinkSlots direct_links{};
+			bool concatenated_short = false;
+			bool discovered_topology = false;
 			bool valid = false;
 			bool queued_free = false;
 		};
@@ -229,8 +250,9 @@ namespace VitaEE
 
 		static u32 LookupPageIndex(u32 start_pc);
 		static u32 LookupEntryIndex(u32 start_pc);
-		bool EnsureLookupDirectory();
-		LookupPage* GetLookupPage(u32 start_pc, bool allocate);
+		bool EnsureLookupDirectory(bool discovered_topology);
+		LookupPage* GetLookupPage(u32 start_pc, bool allocate,
+			bool discovered_topology);
 		bool EnsureGeneratedLookupDirectory();
 		GeneratedLookupPage* GetGeneratedLookupPage(u32 start_pc, bool allocate);
 		void RegisterBlockLookup(CachedBlock& block);
@@ -241,8 +263,9 @@ namespace VitaEE
 		bool RegisterBlockRecord(CachedBlock& block);
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
-		CachedBlock* FindRecordedBlockByStartPc(
-			u32 start_pc, u32 instruction_count, bool match_instruction_count, bool validate_source_words = true);
+		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc,
+			u32 instruction_count, bool match_instruction_count,
+			bool discovered_topology, bool validate_source_words = true);
 		void RememberFreeCacheEntry(CachedBlock& block);
 		CachedBlock* TakeFreeCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
@@ -253,11 +276,14 @@ namespace VitaEE
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
 		bool ValidateCachedBlock(CachedBlock& block, bool validate_source_words = true);
-		CachedBlock* FindLookupBlockByStartPc(u32 start_pc);
+		CachedBlock* FindLookupBlockByStartPc(u32 start_pc,
+			bool discovered_topology);
 		bool FindCachedBlock(u32 start_pc, u32 instruction_count, CachedBlock** block,
 			bool* lookup_hit, bool match_code_budget_source = false);
-		CachedBlock* FindCachedBlockByStartPc(u32 start_pc, bool validate_source_words = true);
+		CachedBlock* FindLinkTargetByStartPc(u32 start_pc,
+			bool discovered_topology, bool validate_source_words = true);
 		void ResolveAdjacentSplitDependency(u32 start_pc, u32 instruction_count,
+			bool discovered_topology,
 			u32* dependency_start_pc, u32* dependency_instruction_count,
 			u32* dependency_charged_cycles_before) const;
 		CachedBlock* AllocateCacheEntry();
@@ -267,10 +293,14 @@ namespace VitaEE
 		void CommitCodeSlice(size_t slice_offset, size_t code_size);
 		void RewindCodeCache(size_t slice_offset);
 		u32 ResetForCachePressure();
+		u32 InvalidateRangeInternal(u32 start_pc, u32 instruction_count,
+			const bool* discovered_topology);
 		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count,
 			u32* scaled_cycles, bool allow_code_budget_split = false,
 			u32 dependency_start_pc = 0, u32 dependency_instruction_count = 0,
-			u32 dependency_charged_cycles_before = 0);
+			u32 dependency_charged_cycles_before = 0,
+			bool concatenate_short_split = false,
+			bool discovered_topology = false);
 		bool AnalyzeGprLinkSignature(u32 start_pc, u32 instruction_count,
 			GprLinkSignature* signature) const;
 		bool PrepareCompiledBlockAtPc(u32 start_pc, CachedBlock** block, BlockExecutionResult* result);
@@ -284,7 +314,8 @@ namespace VitaEE
 			CompatibleVtlbGuardKind kind) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
 		void PatchIncomingLinks(CachedBlock& target);
-		void UnlinkIncomingLinks(u32 target_pc);
+		void UnlinkIncomingLinks(u32 target_pc,
+			const bool* discovered_topology = nullptr);
 		void RelinkDirectLinks();
 #if defined(VITASX2_QEMU_VALIDATION)
 		void RecordPersistentExit(BlockExitKind exit);
@@ -294,12 +325,16 @@ namespace VitaEE
 		std::vector<CachedBlock*> m_free_cache_entries;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
-		LookupPage** m_lookup_pages = nullptr;
+		// Explicit trace windows and PCSX2-discovered BaseBlocks can have the same
+		// guest PC but different spans and scheduler tails. Keep their metadata
+		// lookups independent; only discovered blocks enter generated dispatch.
+		std::array<LookupPage**, 2> m_lookup_pages{};
 		GeneratedLookupPage** m_generated_lookup_pages = nullptr;
 		GeneratedLookupPage** m_active_generated_lookup_pages = nullptr;
 		VitaA32::CodeBuffer m_persistent_dispatch_code;
 		const void* m_persistent_dispatch_entry = nullptr;
 		const void* m_persistent_direct_exit = nullptr;
+		const void* m_persistent_concatenated_direct_exit = nullptr;
 		const void* m_persistent_event_exit = nullptr;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;

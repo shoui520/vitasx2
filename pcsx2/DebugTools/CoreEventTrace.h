@@ -12,6 +12,14 @@ class Error;
 
 namespace Pcsx2Trace
 {
+	enum CoreEventTraceExecutionProvider : u32
+	{
+		CoreEventTraceExecutionEeRecompiler = 1u << 0,
+		CoreEventTraceExecutionIopRecompiler = 1u << 1,
+		CoreEventTraceExecutionVu0Recompiler = 1u << 2,
+		CoreEventTraceExecutionVu1Recompiler = 1u << 3,
+	};
+
 	enum class CoreEventKind : u8
 	{
 		DomainStatus = 0,
@@ -60,6 +68,7 @@ namespace Pcsx2Trace
 		u64 max_records = 0;
 		u64 skip_records = 0;
 		u64 after_sif_records = 0;
+		u32 execution_provider_mask = 0;
 		bool wait_for_elf_entry = true;
 	};
 

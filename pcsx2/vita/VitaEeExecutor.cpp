@@ -54,6 +54,7 @@ namespace
 	constexpr u16 PERSISTENT_VTLB_HOST_BASE_OFFSET =
 		VitaEE::BlockCompiler::PERSISTENT_LINK_VTLB_HOST_BASE_OFFSET;
 	constexpr size_t PERSISTENT_DISPATCH_CODE_CAPACITY = 4096;
+	constexpr u32 EE_CONCATENATED_DIRECT_EXIT_TOKEN = 0xc1;
 
 	extern "C" __attribute__((noinline)) u32 VitaEeA32DirectExit()
 	{
@@ -65,8 +66,12 @@ namespace
 		return static_cast<u32>(VitaEE::BlockExitKind::Event);
 	}
 
-	bool DecodeExitKind(u32 value, VitaEE::BlockExitKind* exit)
+	bool DecodeExitKind(u32 value, VitaEE::BlockExitKind* exit,
+		bool* scheduler_test_elided = nullptr)
 	{
+		if (scheduler_test_elided)
+			*scheduler_test_elided = false;
+
 		if (value == static_cast<u32>(VitaEE::BlockExitKind::Direct))
 		{
 			*exit = VitaEE::BlockExitKind::Direct;
@@ -76,6 +81,14 @@ namespace
 		if (value == static_cast<u32>(VitaEE::BlockExitKind::Event))
 		{
 			*exit = VitaEE::BlockExitKind::Event;
+			return true;
+		}
+
+		if (value == EE_CONCATENATED_DIRECT_EXIT_TOKEN)
+		{
+			*exit = VitaEE::BlockExitKind::Direct;
+			if (scheduler_test_elided)
+				*scheduler_test_elided = true;
 			return true;
 		}
 
@@ -146,25 +159,28 @@ namespace VitaEE
 		return (start_pc & 0xffffu) >> 2;
 	}
 
-	bool BlockExecutor::EnsureLookupDirectory()
+	bool BlockExecutor::EnsureLookupDirectory(bool discovered_topology)
 	{
-		if (m_lookup_pages)
+		LookupPage**& directory = m_lookup_pages[discovered_topology ? 1u : 0u];
+		if (directory)
 			return true;
 
-		m_lookup_pages = new (std::nothrow) LookupPage*[LOOKUP_DIRECTORY_ENTRY_COUNT] {};
-		return (m_lookup_pages != nullptr);
+		directory = new (std::nothrow) LookupPage*[LOOKUP_DIRECTORY_ENTRY_COUNT] {};
+		return (directory != nullptr);
 	}
 
-	BlockExecutor::LookupPage* BlockExecutor::GetLookupPage(u32 start_pc, bool allocate)
+	BlockExecutor::LookupPage* BlockExecutor::GetLookupPage(u32 start_pc,
+		bool allocate, bool discovered_topology)
 	{
-		if (!m_lookup_pages && (!allocate || !EnsureLookupDirectory()))
+		LookupPage**& directory = m_lookup_pages[discovered_topology ? 1u : 0u];
+		if (!directory && (!allocate || !EnsureLookupDirectory(discovered_topology)))
 			return nullptr;
 
 		const u32 page = LookupPageIndex(start_pc);
-		if (!m_lookup_pages[page] && allocate)
-			m_lookup_pages[page] = new (std::nothrow) LookupPage();
+		if (!directory[page] && allocate)
+			directory[page] = new (std::nothrow) LookupPage();
 
-		return m_lookup_pages[page];
+		return directory[page];
 	}
 
 	bool BlockExecutor::EnsureGeneratedLookupDirectory()
@@ -199,10 +215,17 @@ namespace VitaEE
 		// Vita keeps the same 64 KiB guest-page lookup granularity, but allocates
 		// pages lazily instead of reserving a BASEBLOCK for every possible EE word.
 		const u32 index = LookupEntryIndex(block.start_pc);
-		if (LookupPage* page = GetLookupPage(block.start_pc, true))
+		if (LookupPage* page = GetLookupPage(
+				block.start_pc, true, block.discovered_topology))
 			page->blocks[index] = &block;
-		if (GeneratedLookupPage* page = GetGeneratedLookupPage(block.start_pc, true))
-			page->entry_points[index] = LinkedEntryPoint(block);
+		if (block.discovered_topology)
+		{
+			if (GeneratedLookupPage* page =
+					GetGeneratedLookupPage(block.start_pc, true))
+			{
+				page->entry_points[index] = LinkedEntryPoint(block);
+			}
+		}
 	}
 
 	void BlockExecutor::UnregisterBlockLookup(CachedBlock& block)
@@ -211,31 +234,39 @@ namespace VitaEE
 			return;
 
 		const u32 index = LookupEntryIndex(block.start_pc);
-		if (LookupPage* page = GetLookupPage(block.start_pc, false))
+		if (LookupPage* page = GetLookupPage(
+				block.start_pc, false, block.discovered_topology))
 		{
 			CachedBlock*& entry = page->blocks[index];
 			if (entry == &block)
 				entry = nullptr;
 		}
 
-		if (GeneratedLookupPage* page = GetGeneratedLookupPage(block.start_pc, false))
+		if (block.discovered_topology)
 		{
-			const void*& entry = page->entry_points[index];
-			if (entry == LinkedEntryPoint(block))
-				entry = nullptr;
+			if (GeneratedLookupPage* page =
+					GetGeneratedLookupPage(block.start_pc, false))
+			{
+				const void*& entry = page->entry_points[index];
+				if (entry == LinkedEntryPoint(block))
+					entry = nullptr;
+			}
 		}
 	}
 
 	void BlockExecutor::ReleaseLookupPages()
 	{
-		if (!m_lookup_pages)
-			return;
+		for (LookupPage**& directory : m_lookup_pages)
+		{
+			if (!directory)
+				continue;
 
-		for (u32 i = 0; i < LOOKUP_DIRECTORY_ENTRY_COUNT; i++)
-			delete m_lookup_pages[i];
+			for (u32 i = 0; i < LOOKUP_DIRECTORY_ENTRY_COUNT; i++)
+				delete directory[i];
 
-		delete[] m_lookup_pages;
-		m_lookup_pages = nullptr;
+			delete[] directory;
+			directory = nullptr;
+		}
 	}
 
 	void BlockExecutor::ReleaseGeneratedLookupPages()
@@ -331,13 +362,15 @@ namespace VitaEE
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::FindRecordedBlockByStartPc(
-		u32 start_pc, u32 instruction_count, bool match_instruction_count, bool validate_source_words)
+		u32 start_pc, u32 instruction_count, bool match_instruction_count,
+		bool discovered_topology, bool validate_source_words)
 	{
 		s32 index = LastBlockRecordIndex(start_pc);
 		while (index >= 0 && m_block_records[index].start_pc == start_pc)
 		{
 			CachedBlock* block = m_block_records[index].block;
 			if (block && block->valid &&
+				block->discovered_topology == discovered_topology &&
 				(!match_instruction_count || block->instruction_count == instruction_count))
 			{
 				if (ValidateCachedBlock(*block, validate_source_words))
@@ -384,7 +417,8 @@ namespace VitaEE
 		if (!block.valid)
 			return;
 
-		UnlinkIncomingLinks(block.start_pc);
+		const bool discovered_topology = block.discovered_topology;
+		UnlinkIncomingLinks(block.start_pc, &discovered_topology);
 		UnregisterIncomingLinks(block);
 		UnregisterBlockLookup(block);
 		UnregisterBlockRecord(block);
@@ -397,6 +431,9 @@ namespace VitaEE
 		block.compatible_vtlb_fast_entries = {};
 		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
+		block.concatenated_short = false;
+		block.discovered_topology = false;
+		block.opcodes.reset();
 		block.code.Release();
 		RememberFreeCacheEntry(block);
 	}
@@ -492,6 +529,7 @@ namespace VitaEE
 		m_persistent_dispatch_code.Release();
 		m_persistent_dispatch_entry = nullptr;
 		m_persistent_direct_exit = nullptr;
+		m_persistent_concatenated_direct_exit = nullptr;
 		m_persistent_event_exit = nullptr;
 		ReleaseCodeCache();
 		return invalidated;
@@ -522,6 +560,9 @@ namespace VitaEE
 			block.compatible_vtlb_fast_entries = {};
 			block.compatible_link_entry_loads = 0;
 			block.direct_links = {};
+			block.concatenated_short = false;
+			block.discovered_topology = false;
+			block.opcodes.reset();
 			RememberFreeCacheEntry(block);
 		}
 
@@ -540,6 +581,12 @@ namespace VitaEE
 	}
 
 	u32 BlockExecutor::InvalidateRange(u32 start_pc, u32 instruction_count)
+	{
+		return InvalidateRangeInternal(start_pc, instruction_count, nullptr);
+	}
+
+	u32 BlockExecutor::InvalidateRangeInternal(u32 start_pc,
+		u32 instruction_count, const bool* discovered_topology)
 	{
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return 0;
@@ -578,6 +625,12 @@ namespace VitaEE
 
 			if (block->start_pc >= last_candidate_pc)
 				break;
+			if (discovered_topology &&
+				block->discovered_topology != *discovered_topology)
+			{
+				i++;
+				continue;
+			}
 
 			// Every physical part of a code-budget split shares one proof group.
 			// The chosen seams depend on all of the group's opcodes, so a write to
@@ -851,7 +904,8 @@ namespace VitaEE
 		const u32 target_pc = cpuRegs.pc;
 		g_qemuEeDirectExitSourcePc = 0;
 		VitaA32EeLinkRejectionKind kind = VitaA32EeLinkRejectionKind::UnrecordedEdge;
-		CachedBlock* const source = source_pc ? FindLookupBlockByStartPc(source_pc) : nullptr;
+		CachedBlock* const source = source_pc ?
+			FindLookupBlockByStartPc(source_pc, true) : nullptr;
 		DirectLinkSlot* link = nullptr;
 		if (source && source->valid)
 		{
@@ -867,7 +921,7 @@ namespace VitaEE
 
 		if (link)
 		{
-			CachedBlock* const target = FindLookupBlockByStartPc(target_pc);
+			CachedBlock* const target = FindLookupBlockByStartPc(target_pc, true);
 			if (!target || !target->valid)
 			{
 				kind = VitaA32EeLinkRejectionKind::TargetNotCompiled;
@@ -928,6 +982,7 @@ namespace VitaEE
 			RewindCodeCache(dispatcher_slice_offset);
 			m_persistent_dispatch_entry = nullptr;
 			m_persistent_direct_exit = nullptr;
+			m_persistent_concatenated_direct_exit = nullptr;
 			m_persistent_event_exit = nullptr;
 			return false;
 		};
@@ -964,12 +1019,24 @@ namespace VitaEE
 		if (direct_to_common == static_cast<size_t>(-1))
 			return fail();
 
+		const size_t concatenated_direct_exit_offset = code.Size();
+		if (!code.EmitMovImm8(0,
+				static_cast<u8>(EE_CONCATENATED_DIRECT_EXIT_TOKEN)))
+		{
+			return fail();
+		}
+		const size_t concatenated_direct_to_common =
+			code.EmitBranchPlaceholder();
+		if (concatenated_direct_to_common == static_cast<size_t>(-1))
+			return fail();
+
 		const size_t event_exit_offset = code.Size();
 		if (!code.EmitMovImm8(0, static_cast<u8>(BlockExitKind::Event)))
 			return fail();
 
 		const size_t common_offset = code.Size();
 		if (!code.PatchBranch(direct_to_common, common_offset) ||
+			!code.PatchBranch(concatenated_direct_to_common, common_offset) ||
 			// Compatible chains may lend r7/r8 to GPR mappings. Restore the
 			// canonical dispatcher vTLB ABI once in this shared cold exit instead of
 			// duplicating reloads in every generated direct/event tail.
@@ -1000,6 +1067,8 @@ namespace VitaEE
 
 		m_persistent_dispatch_entry = code.EntryPoint();
 		m_persistent_direct_exit = code.Data() + direct_exit_offset;
+		m_persistent_concatenated_direct_exit =
+			code.Data() + concatenated_direct_exit_offset;
 		m_persistent_event_exit = code.Data() + event_exit_offset;
 		return true;
 	}
@@ -1087,6 +1156,50 @@ namespace VitaEE
 					result->instruction_count++;
 					result->stop_pc = pc + 4;
 					continue;
+				}
+
+				// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile().
+				// Conditional relative branches whose target lies inside the region
+				// already scanned retroactively end the current BaseBlock at that
+				// target. The target then owns the loop body and its independent
+				// fixed-point cycle rounding. This does not apply to J/JAL or JR/JALR:
+				// recRecompile() only performs the interior-target test for REGIMM,
+				// primary conditional, and COP0/1/2 branch forms.
+				const u32 opcode = op >> 26;
+				const u32 regimm_rt = (op >> 16) & 0x1fu;
+				const bool regimm_branch = opcode == 0x01 &&
+					(regimm_rt < 4 || (regimm_rt >= 16 && regimm_rt < 20));
+				const bool relative_conditional =
+					regimm_branch ||
+					(opcode >= 0x04 && opcode <= 0x07) ||
+					(opcode >= 0x14 && opcode <= 0x17) ||
+					((opcode >= 0x10 && opcode <= 0x12) &&
+						((op >> 21) & 0x1fu) == 0x08);
+				if (relative_conditional)
+				{
+					const s32 displacement =
+						static_cast<s32>(static_cast<s16>(op & 0xffffu)) * 4;
+					const u32 target_pc = pc + sizeof(u32) +
+						static_cast<u32>(displacement);
+					if (target_pc > start_pc && target_pc < pc)
+					{
+						u32 boundary_instructions =
+							(target_pc - start_pc) / sizeof(u32);
+						// recDI()/recompileNextInstruction() may consume the target
+						// word as DI's required follower. Preserve that atomic pair in
+						// A32 just as the existing-BaseBlock boundary path below does.
+						if (boundary_instructions != 0 &&
+							BlockCompiler::RequiresFollowingInstructionInBlock(
+								memRead32(target_pc - sizeof(u32))))
+						{
+							boundary_instructions++;
+						}
+						result->instruction_count = boundary_instructions;
+						result->stop_pc = start_pc +
+							boundary_instructions * sizeof(u32);
+						result->stop = BlockScanStop::BranchTargetBoundary;
+						return true;
+					}
 				}
 				// Ported from PCSX2 x86/ix86-32/iR5900.cpp::recRecompile():
 				// branches and jumps end the block after the delay slot. If the
@@ -1416,7 +1529,7 @@ namespace VitaEE
 						dependency_start_pc >> vtlb_private::VTLB_PAGE_BITS];
 				if (!vmv.isHandler(dependency_start_pc))
 				{
-					matches = (std::memcmp(block.opcodes.data(),
+					matches = (std::memcmp(block.opcodes.get(),
 								   reinterpret_cast<const void*>(
 									   vmv.assumePtr(dependency_start_pc)), opcode_bytes) == 0);
 					compared_raw_window = true;
@@ -1455,12 +1568,13 @@ namespace VitaEE
 		return false;
 	}
 
-	BlockExecutor::CachedBlock* BlockExecutor::FindLookupBlockByStartPc(u32 start_pc)
+	BlockExecutor::CachedBlock* BlockExecutor::FindLookupBlockByStartPc(
+		u32 start_pc, bool discovered_topology)
 	{
 		if ((start_pc & 0x3u) != 0)
 			return nullptr;
 
-		LookupPage* page = GetLookupPage(start_pc, false);
+		LookupPage* page = GetLookupPage(start_pc, false, discovered_topology);
 		return page ? page->blocks[LookupEntryIndex(start_pc)] : nullptr;
 	}
 
@@ -1478,13 +1592,15 @@ namespace VitaEE
 		if (lookup_hit)
 			*lookup_hit = false;
 
-		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc, false))
 		{
 			const bool count_matches = entry->instruction_count == instruction_count ||
 				(match_code_budget_source &&
 				 entry->source_instruction_count == instruction_count &&
 				 entry->instruction_count < entry->source_instruction_count);
-			if (entry->valid && count_matches && ValidateCachedBlock(*entry))
+			if (entry->valid && !entry->discovered_topology &&
+				count_matches &&
+				ValidateCachedBlock(*entry))
 			{
 				*block = entry;
 				if (lookup_hit)
@@ -1496,13 +1612,17 @@ namespace VitaEE
 		if (!match_code_budget_source)
 		{
 			if (CachedBlock* entry =
-					FindRecordedBlockByStartPc(start_pc, instruction_count, true))
+					FindRecordedBlockByStartPc(
+						start_pc, instruction_count, true, false);
+				entry)
 			{
 				*block = entry;
 				return true;
 			}
 		}
-		else if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, 0, false))
+		else if (CachedBlock* entry = FindRecordedBlockByStartPc(
+				start_pc, 0, false, false);
+			entry)
 		{
 			if (entry->source_instruction_count == instruction_count &&
 				entry->instruction_count < entry->source_instruction_count)
@@ -1515,19 +1635,39 @@ namespace VitaEE
 		return false;
 	}
 
-	BlockExecutor::CachedBlock* BlockExecutor::FindCachedBlockByStartPc(u32 start_pc, bool validate_source_words)
+	BlockExecutor::CachedBlock* BlockExecutor::FindLinkTargetByStartPc(
+		u32 start_pc, bool discovered_topology, bool validate_source_words)
 	{
-		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		if (CachedBlock* entry = FindLookupBlockByStartPc(
+				start_pc, discovered_topology))
 		{
-			if (entry->valid && ValidateCachedBlock(*entry, validate_source_words))
+			if (entry->valid &&
+				entry->discovered_topology == discovered_topology &&
+				ValidateCachedBlock(*entry, validate_source_words))
 				return entry;
 		}
 
-		return FindRecordedBlockByStartPc(start_pc, 0, false, validate_source_words);
+		s32 index = LastBlockRecordIndex(start_pc);
+		while (index >= 0 && m_block_records[index].start_pc == start_pc)
+		{
+			CachedBlock* entry = m_block_records[index--].block;
+			if (!entry || !entry->valid ||
+				entry->discovered_topology != discovered_topology)
+			{
+				continue;
+			}
+
+			if (ValidateCachedBlock(*entry, validate_source_words))
+				return entry;
+			break;
+		}
+
+		return nullptr;
 	}
 
 	void BlockExecutor::ResolveAdjacentSplitDependency(u32 start_pc,
-		u32 instruction_count, u32* dependency_start_pc,
+		u32 instruction_count, bool discovered_topology,
+		u32* dependency_start_pc,
 		u32* dependency_instruction_count,
 		u32* dependency_charged_cycles_before) const
 	{
@@ -1554,7 +1694,8 @@ namespace VitaEE
 				break;
 
 			CachedBlock* predecessor_block = predecessor->block;
-			if (!predecessor_block || !predecessor_block->valid)
+			if (!predecessor_block || !predecessor_block->valid ||
+				predecessor_block->discovered_topology != discovered_topology)
 				continue;
 			const u32 predecessor_physical_end = predecessor_block->start_pc +
 				predecessor_block->instruction_count * sizeof(u32);
@@ -1685,7 +1826,8 @@ namespace VitaEE
 	bool BlockExecutor::CompileIntoCacheEntry(CachedBlock& block, u32 start_pc,
 		u32 instruction_count, u32* scaled_cycles, bool allow_code_budget_split,
 		u32 dependency_start_pc, u32 dependency_instruction_count,
-		u32 dependency_charged_cycles_before)
+		u32 dependency_charged_cycles_before, bool concatenate_short_split,
+		bool discovered_topology)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -1718,9 +1860,13 @@ namespace VitaEE
 			m_persistent_event_exit : reinterpret_cast<const void*>(&VitaEeA32EventExit);
 
 		InvalidateCachedBlock(block);
+		std::unique_ptr<u32[]> source_opcodes(
+			new (std::nothrow) u32[dependency_instruction_count]);
+		if (!source_opcodes)
+			return false;
 
 		for (u32 i = 0; i < dependency_instruction_count; i++)
-			block.opcodes[i] = memRead32(dependency_start_pc + i * 4);
+			source_opcodes[i] = memRead32(dependency_start_pc + i * 4);
 
 		for (u32 i = 0; i < instruction_count; i++)
 		{
@@ -1741,6 +1887,7 @@ namespace VitaEE
 		size_t compiled_compatible_link_entry_offset = static_cast<size_t>(-1);
 		u8 compiled_compatible_link_entry_loads = 0;
 		CompatibleVtlbFastEntryOffsets compiled_compatible_vtlb_fast_entries{};
+		bool compiled_concatenated_short = false;
 		DirectLinkSlots direct_links;
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
@@ -1803,15 +1950,27 @@ namespace VitaEE
 				u8 attempt_compatible_link_entry_loads = 0;
 				CompatibleVtlbFastEntryOffsets attempt_compatible_vtlb_fast_entries{};
 				DirectLinkSlots attempt_direct_links;
+				// PCSX2 recRecompile() uses the same <=6-instruction
+				// concatenation for a physical code-size split as for a page or
+				// existing-BaseBlock split. The original exact request remains the
+				// proof dependency, while this emitted prefix omits iBranchTest().
+				const bool attempt_concatenated_short = concatenate_short_split ||
+					(candidate_instruction_count < instruction_count &&
+						candidate_instruction_count <= 6);
+				bool attempt_concatenated_short_emitted = false;
 				const bool compiled = compiler.CompileStraightLineBlock(start_pc,
 					candidate_instruction_count, direct_exit, event_exit,
 					&attempt_scaled_cycles, &attempt_direct_links,
-					&m_active_generated_lookup_pages, &m_direct_linking_enabled,
+					discovered_topology ? &m_active_generated_lookup_pages : nullptr,
+					discovered_topology ? &m_direct_linking_enabled : nullptr,
 					&attempt_linked_entry_offset, m_persistent_dispatch_enabled,
 					&attempt_resident_self_link_entry_offset,
 					&attempt_resident_self_link_entry_loads, &compiled_gpr_link_signature,
 					&attempt_compatible_link_entry_offset, &attempt_compatible_link_entry_loads,
-					&attempt_compatible_vtlb_fast_entries);
+					&attempt_compatible_vtlb_fast_entries, attempt_concatenated_short,
+					&attempt_concatenated_short_emitted,
+					m_persistent_dispatch_enabled ?
+						m_persistent_concatenated_direct_exit : direct_exit);
 				u32 calculated_prefix_cycles = 0;
 				const bool cycle_contract_matches =
 					candidate_instruction_count == instruction_count ||
@@ -1839,6 +1998,8 @@ namespace VitaEE
 						attempt_compatible_link_entry_loads;
 					compiled_compatible_vtlb_fast_entries =
 						attempt_compatible_vtlb_fast_entries;
+					compiled_concatenated_short =
+						attempt_concatenated_short_emitted;
 					direct_links = attempt_direct_links;
 					break;
 				}
@@ -1946,6 +2107,8 @@ namespace VitaEE
 		block.compatible_link_entry_loads = compiled_compatible_link_entry_loads;
 		block.compatible_vtlb_fast_entries = compiled_compatible_vtlb_fast_entries;
 		block.direct_links = direct_links;
+		block.concatenated_short = compiled_concatenated_short;
+		block.discovered_topology = discovered_topology;
 
 		if (compiled_instruction_count < instruction_count)
 		{
@@ -1983,6 +2146,7 @@ namespace VitaEE
 				{
 					CachedBlock* candidate = converging->block;
 					if (!candidate || !candidate->valid ||
+						candidate->discovered_topology != discovered_topology ||
 						candidate->instruction_count >= candidate->source_instruction_count)
 					{
 						continue;
@@ -2011,8 +2175,8 @@ namespace VitaEE
 					conflict->dependency_instruction_count != 0 ?
 						conflict->dependency_instruction_count :
 						conflict->instruction_count;
-				if (InvalidateRange(conflict_dependency_start,
-						conflict_dependency_count) == 0)
+				if (InvalidateRangeInternal(conflict_dependency_start,
+						conflict_dependency_count, &discovered_topology) == 0)
 				{
 					InvalidateCachedBlock(*conflict);
 				}
@@ -2033,13 +2197,31 @@ namespace VitaEE
 					break;
 				}
 
-				CachedBlock* interior = interior_record->block;
+				CachedBlock* interior = nullptr;
+				auto matching_interior = interior_record;
+				while (matching_interior != m_block_records.end() &&
+					matching_interior->start_pc < dependency_end_pc)
+				{
+					CachedBlock* candidate = matching_interior->block;
+					if (!candidate || !candidate->valid ||
+						candidate->discovered_topology == discovered_topology)
+					{
+						interior = candidate;
+						break;
+					}
+					++matching_interior;
+				}
+				if (matching_interior == m_block_records.end() ||
+					matching_interior->start_pc >= dependency_end_pc)
+				{
+					break;
+				}
 				if (!interior || !interior->valid)
 				{
 					if (interior)
 						UnregisterBlockRecord(*interior);
 					else
-						m_block_records.erase(interior_record);
+						m_block_records.erase(matching_interior);
 					continue;
 				}
 
@@ -2053,22 +2235,26 @@ namespace VitaEE
 					interior->dependency_instruction_count != 0 ?
 					interior->dependency_instruction_count :
 					interior->instruction_count;
-				if (InvalidateRange(interior_dependency_start,
-						interior_dependency_count) == 0)
+				if (InvalidateRangeInternal(interior_dependency_start,
+						interior_dependency_count, &discovered_topology) == 0)
 				{
 					InvalidateCachedBlock(*interior);
 				}
 			}
 		}
+		block.opcodes = std::move(source_opcodes);
 		block.valid = true;
 		if (!RegisterBlockRecord(block))
 		{
 			block.valid = false;
 			block.direct_links = {};
+			block.opcodes.reset();
 			block.code.Release();
 			RewindCodeCache(block_code_slice_offset);
 			return false;
 		}
+		// Explicit validation windows retain a separate metadata lookup, while
+		// only PCSX2-discovered BaseBlocks publish generated dispatch entries.
 		RegisterBlockLookup(block);
 		RegisterIncomingLinks(block);
 
@@ -2079,7 +2265,8 @@ namespace VitaEE
 			{
 				if (link.valid)
 				{
-					if (CachedBlock* target = FindCachedBlockByStartPc(link.target_pc, false))
+					if (CachedBlock* target = FindLinkTargetByStartPc(
+							link.target_pc, block.discovered_topology, false))
 						PatchDirectLink(block, link, target);
 				}
 			}
@@ -2155,6 +2342,8 @@ namespace VitaEE
 		{
 			return false;
 		}
+		if (target && target->discovered_topology != block.discovered_topology)
+			return false;
 
 		const void* direct_exit = m_persistent_dispatch_enabled ?
 			m_persistent_direct_exit : reinterpret_cast<const void*>(&VitaEeA32DirectExit);
@@ -2263,12 +2452,17 @@ namespace VitaEE
 		while (index >= 0 && m_incoming_links[index].target_pc == target.start_pc)
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
-			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-				PatchDirectLink(*record.source, *link, &target);
+			if (record.source &&
+				record.source->discovered_topology == target.discovered_topology)
+			{
+				if (DirectLinkSlot* link = GetRecordedDirectLink(record))
+					PatchDirectLink(*record.source, *link, &target);
+			}
 		}
 	}
 
-	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc)
+	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc,
+		const bool* discovered_topology)
 	{
 		if (target_pc == UINT32_MAX)
 		{
@@ -2285,6 +2479,11 @@ namespace VitaEE
 		while (index >= 0 && m_incoming_links[index].target_pc == target_pc)
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
+			if (discovered_topology && (!record.source ||
+				record.source->discovered_topology != *discovered_topology))
+			{
+				continue;
+			}
 			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
 				PatchDirectLink(*record.source, *link, nullptr);
 		}
@@ -2299,7 +2498,8 @@ namespace VitaEE
 			if (!link)
 				continue;
 
-			CachedBlock* target = FindCachedBlockByStartPc(record.target_pc, false);
+			CachedBlock* target = FindLinkTargetByStartPc(record.target_pc,
+				record.source->discovered_topology, false);
 			PatchDirectLink(*record.source, *link, target);
 		}
 	}
@@ -2314,7 +2514,8 @@ namespace VitaEE
 		const u32 exit_value = reinterpret_cast<GeneratedBlock>(block.code.EntryPoint())();
 
 		BlockExitKind exit = BlockExitKind::Direct;
-		if (!DecodeExitKind(exit_value, &exit))
+		bool scheduler_test_elided = false;
+		if (!DecodeExitKind(exit_value, &exit, &scheduler_test_elided))
 			return false;
 
 		// Mirrors the x86 provider's DispatcherEvent -> recEventTest() path in
@@ -2330,6 +2531,7 @@ namespace VitaEE
 		result->path = BlockExecutionPath::Compiled;
 		result->exit = exit;
 		result->exit_value = exit_value;
+		result->scheduler_test_elided = scheduler_test_elided;
 		result->instruction_count = block.instruction_count;
 		result->source_instruction_count = block.source_instruction_count;
 		result->scaled_cycles = block.scaled_cycles;
@@ -2341,6 +2543,11 @@ namespace VitaEE
 		result->code_cache_used = m_code_cache_used;
 		result->code_cache_capacity = m_code_cache_capacity;
 #if defined(VITASX2_QEMU_VALIDATION)
+		result->concatenated_short_blocks = block.concatenated_short ? 1u : 0u;
+		result->concatenated_short_scheduler_tests_elided =
+			block.concatenated_short ? 1u : 0u;
+		result->concatenated_short_hot_instructions_elided =
+			block.concatenated_short ? 2u : 0u;
 		PopulateFrameEvidence(block.code, m_persistent_dispatch_code, result);
 		for (const DirectLinkSlot& link : block.direct_links.slots)
 		{
@@ -2404,7 +2611,7 @@ namespace VitaEE
 		u32 dependency_start_pc = start_pc;
 		u32 dependency_instruction_count = instruction_count;
 		u32 dependency_charged_cycles_before = 0;
-		ResolveAdjacentSplitDependency(start_pc, instruction_count,
+		ResolveAdjacentSplitDependency(start_pc, instruction_count, false,
 			&dependency_start_pc, &dependency_instruction_count,
 			&dependency_charged_cycles_before);
 
@@ -2446,6 +2653,11 @@ namespace VitaEE
 			result->lookup_hit = lookup_hit;
 			result->fast_dispatch_hit = fast_dispatch_hit;
 #if defined(VITASX2_QEMU_VALIDATION)
+			result->concatenated_short_blocks = entry->concatenated_short ? 1u : 0u;
+			result->concatenated_short_scheduler_tests_elided =
+				entry->concatenated_short ? 1u : 0u;
+			result->concatenated_short_hot_instructions_elided =
+				entry->concatenated_short ? 2u : 0u;
 			PopulateFrameEvidence(entry->code, m_persistent_dispatch_code, result);
 			for (const DirectLinkSlot& link : entry->direct_links.slots)
 			{
@@ -2489,14 +2701,21 @@ namespace VitaEE
 		// linking is enabled, generated transitions trust recClear() invalidation;
 		// pre-ELF/non-linked runs retain source-word validation.
 		const bool validate_source_words = !m_direct_linking_enabled;
-		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc))
+		if (CachedBlock* entry = FindLookupBlockByStartPc(start_pc, true))
 		{
-			if (entry->valid && ValidateCachedBlock(*entry, validate_source_words))
+			// An explicit validation window has a caller-selected span. Even when
+			// its tail happens to use the same event policy, it is not PCSX2's
+			// discovered BaseBlock and cannot satisfy product dispatch by PC alone.
+			if (entry->valid && entry->discovered_topology &&
+				ValidateCachedBlock(*entry, validate_source_words))
 				return finish(entry, true, true, true);
 		}
 
-		if (CachedBlock* entry = FindRecordedBlockByStartPc(start_pc, 0, false, validate_source_words))
+		if (CachedBlock* entry = FindLinkTargetByStartPc(
+				start_pc, true, validate_source_words))
+		{
 			return finish(entry, false, true, true);
+		}
 
 		BlockScanResult scan;
 		if (!ScanStraightLineBlock(start_pc, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
@@ -2512,9 +2731,15 @@ namespace VitaEE
 		// complete shared proof group, so an opcode change can never preserve a
 		// stale artificial seam through this truncation.
 		const u32 natural_stop_pc = scan.stop_pc;
-		const auto next_record = std::upper_bound(m_block_records.begin(),
+		auto next_record = std::upper_bound(m_block_records.begin(),
 			m_block_records.end(), start_pc,
 			[](u32 pc, const BlockRecord& record) { return pc < record.start_pc; });
+		while (next_record != m_block_records.end() &&
+			(!next_record->block || !next_record->block->valid ||
+			 !next_record->block->discovered_topology))
+		{
+			++next_record;
+		}
 		if (next_record != m_block_records.end() &&
 			next_record->start_pc < natural_stop_pc)
 		{
@@ -2526,6 +2751,7 @@ namespace VitaEE
 				bounded_scan.instruction_count == boundary_instructions &&
 				bounded_scan.stop_pc == next_record->start_pc)
 			{
+				bounded_scan.stop = BlockScanStop::ExistingBlockBoundary;
 				scan = bounded_scan;
 			}
 			else if (boundary_instructions != 0 &&
@@ -2544,6 +2770,7 @@ namespace VitaEE
 					atomic_scan.instruction_count == boundary_instructions + 1 &&
 					atomic_scan.stop_pc == next_record->start_pc + sizeof(u32))
 				{
+					atomic_scan.stop = BlockScanStop::ExistingBlockBoundary;
 					scan = atomic_scan;
 				}
 			}
@@ -2558,15 +2785,42 @@ namespace VitaEE
 		u32 dependency_start_pc = start_pc;
 		u32 dependency_instruction_count = scan.instruction_count;
 		u32 dependency_charged_cycles_before = 0;
-		ResolveAdjacentSplitDependency(start_pc, scan.instruction_count,
+		ResolveAdjacentSplitDependency(start_pc, scan.instruction_count, true,
 			&dependency_start_pc, &dependency_instruction_count,
 			&dependency_charged_cycles_before);
+
+		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() concatenates a
+		// discovered prefix of at most six instructions to the following
+		// BaseBlock without an intervening iBranchTest(). Vita can do so only when
+		// that successor is already a compiled BaseBlock or the internal-target
+		// scan reaches a native branch tail which owns iBranchTest(). A page/debug
+		// successor can fall into an interpreter-only region; keep its scheduler
+		// seam until the provider can carry PCSX2's pending event-test contract
+		// through fallback.
+		// DI is an important overlap case: recDI() consumes the first instruction
+		// of an existing block, so the actual generated successor is one word after
+		// that known entry. Do not infer that this post-follower address is native
+		// merely from the ExistingBlockBoundary tag.
+		const bool compiled_successor =
+			scan.stop == BlockScanStop::ExistingBlockBoundary &&
+			FindLinkTargetByStartPc(scan.stop_pc, true) != nullptr;
+		BlockScanResult branch_target_successor;
+		const bool branch_target_successor_scannable =
+			scan.stop == BlockScanStop::BranchTargetBoundary &&
+			ScanStraightLineBlock(scan.stop_pc,
+				MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS,
+				&branch_target_successor) &&
+			branch_target_successor.instruction_count != 0 &&
+			branch_target_successor.stop == BlockScanStop::Branch;
+		const bool concatenate_short_split = scan.instruction_count <= 6 &&
+			(compiled_successor ||
+				branch_target_successor_scannable);
 
 		CachedBlock* entry = AllocateCacheEntry();
 		if (!entry || !CompileIntoCacheEntry(*entry, start_pc, scan.instruction_count,
 				&result->scaled_cycles, true, dependency_start_pc,
 				dependency_instruction_count,
-				dependency_charged_cycles_before))
+				dependency_charged_cycles_before, concatenate_short_split, true))
 		{
 			return false;
 		}
@@ -2596,7 +2850,8 @@ namespace VitaEE
 		}
 
 		BlockExitKind exit = BlockExitKind::Direct;
-		if (!DecodeExitKind(exit_value, &exit))
+		bool scheduler_test_elided = false;
+		if (!DecodeExitKind(exit_value, &exit, &scheduler_test_elided))
 		{
 			context->failed = true;
 			return nullptr;
@@ -2608,6 +2863,7 @@ namespace VitaEE
 
 		context->current_result.exit = exit;
 		context->current_result.exit_value = exit_value;
+		context->current_result.scheduler_test_elided = scheduler_test_elided;
 		*context->final_result = context->current_result;
 
 		// PCSX2 owner: _DynGen_DispatcherEvent() calls recEventTest() without

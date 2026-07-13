@@ -197,6 +197,9 @@ u32 g_qemuGprConstRegisterJumpTargets = 0;
 u32 g_qemuGprConstEffectiveAddresses = 0;
 u32 g_qemuPersistentVtlbResidentBlocks = 0;
 u32 g_qemuWaitLoopFastForwardBlocks = 0;
+u32 g_qemuEeConcatenatedShortBlocks = 0;
+u32 g_qemuEeConcatenatedShortSchedulerTestsElided = 0;
+u32 g_qemuEeConcatenatedShortHotInstructionsElided = 0;
 u32 g_qemuDeferredPcWritebackBlocks = 0;
 u32 g_qemuDeferredIndirectPcWritebackBlocks = 0;
 u32 g_qemuLinkedPcSyncBlocks = 0;
@@ -498,6 +501,7 @@ namespace VitaEE
 			(REG_R3 | REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 | REG_R9 | REG_R10 | REG_R11));
 		// Must match VitaEE::BlockExitKind without including the executor.
 		constexpr u8 EE_DIRECT_EXIT_TOKEN = 0xd1;
+		constexpr u8 EE_CONCATENATED_DIRECT_EXIT_TOKEN = 0xc1;
 		constexpr u8 EE_EVENT_EXIT_TOKEN = 0xe7;
 		constexpr u32 CACHE_INDUCTION_LOOP_COMPLETE = 0;
 		constexpr u32 CACHE_INDUCTION_LOOP_SELF = 1;
@@ -10800,9 +10804,15 @@ namespace VitaEE
 		size_t* resident_self_link_entry_offset, u8* resident_self_link_entry_loads,
 		const GprLinkSignature* gpr_link_signature,
 		size_t* compatible_link_entry_offset, u8* compatible_link_entry_loads,
-		CompatibleVtlbFastEntryOffsets* compatible_vtlb_fast_entries)
+		CompatibleVtlbFastEntryOffsets* compatible_vtlb_fast_entries,
+		bool concatenate_short_split, bool* concatenated_short_emitted,
+		const void* concatenated_direct_exit)
 	{
+		if (concatenated_short_emitted)
+			*concatenated_short_emitted = false;
 		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
+			return false;
+		if (concatenate_short_split && instruction_count > 6)
 			return false;
 
 		if (direct_links)
@@ -11890,17 +11900,31 @@ namespace VitaEE
 			  m_compatible_vtlb_pointer ||
 			  m_gpr_link_signature.HasVtlbWritePointer()) &&
 			 m_gpr_link_signature.ContainsPc(branch_target_pc));
-		if (!EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
+		// TLBWI/TLBWR deliberately suppress outgoing generated links so their
+		// deferred cache invalidation is consumed at the provider boundary. Such a
+		// prefix cannot use PCSX2's short-block concatenation; retain the canonical
+		// event-tested tail instead of turning the missing link slot into a compile
+		// failure and interpreter fallback.
+		const bool emit_concatenated_short =
+			concatenate_short_split && !has_branch && direct_link;
+		const bool tail_ok = emit_concatenated_short ?
+			EndBlockWithConcatenatedDirectLink(block_cycles,
+				concatenated_direct_exit ? concatenated_direct_exit : direct_exit,
+				direct_link, defer_pc_writeback, direct_pc) :
+			EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
 				direct_link, taken_link,
 				has_register_branch_target ? indirect_lookup_pages_slot : nullptr,
 				has_register_branch_target ? direct_linking_enabled_flag : nullptr,
 				wait_loop_taken, defer_pc_writeback,
 				direct_pc, branch_target_pc, has_static_conditional_direct_links,
 				defer_indirect_pc_writeback, preserve_dirty_direct_link,
-				preserve_dirty_taken_link))
+				preserve_dirty_taken_link);
+		if (!tail_ok)
 		{
 			return false;
 		}
+		if (concatenated_short_emitted)
+			*concatenated_short_emitted = emit_concatenated_short;
 
 		if (!FlushColdTails())
 			return false;
@@ -12083,7 +12107,9 @@ namespace VitaEE
 		// direct-dispatch exit. Successful direct links never execute this code,
 		// and product builds contain no publication instructions.
 		if (m_direct_link_rejection_profiling_enabled &&
-			m_persistent_dispatch_exits && callable_token == EE_DIRECT_EXIT_TOKEN &&
+			m_persistent_dispatch_exits &&
+			(callable_token == EE_DIRECT_EXIT_TOKEN ||
+				callable_token == EE_CONCATENATED_DIRECT_EXIT_TOKEN) &&
 			(!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
 				reinterpret_cast<uptr>(&g_qemuEeDirectExitSourcePc))) ||
 			 !m_code.EmitMovImm32(HOST_TMP2, m_current_block_start_pc) ||
@@ -12328,7 +12354,8 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
-		bool defer_pc_writeback, u32 pc, bool sync_private_fallback)
+		bool defer_pc_writeback, u32 pc, bool sync_private_fallback,
+		bool concatenated_direct_fallback)
 	{
 		if (!direct_exit)
 			return false;
@@ -12344,7 +12371,8 @@ namespace VitaEE
 		if (!m_code.PatchBranch(target_branch, fallback_offset) ||
 			(sync_private_fallback && !EmitSyncGprPinsToBacking()) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
-			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
+			!EmitExitToTarget(direct_exit, concatenated_direct_fallback ?
+				EE_CONCATENATED_DIRECT_EXIT_TOKEN : EE_DIRECT_EXIT_TOKEN))
 		{
 			return false;
 		}
@@ -12642,6 +12670,50 @@ namespace VitaEE
 
 		const size_t carry_branches[] = {carry_branch};
 		return EmitCycleCarryFixup(carry_branches, 1, cycle_compare_target, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EndBlockWithConcatenatedDirectLink(u32 block_cycles,
+		const void* concatenated_direct_exit, DirectLinkSlot* direct_link,
+		bool defer_pc_writeback, u32 direct_pc)
+	{
+		if (!concatenated_direct_exit || !direct_link || block_cycles == 0)
+			return false;
+
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile()'s
+		// `numinsts <= 6` split-block concatenation. A short prefix created by a
+		// page, existing-BaseBlock, debugger, or internal branch-target boundary
+		// publishes its architectural state and cycles, then links to the
+		// continuation without running iBranchTest(). The continuation owns the
+		// next scheduler test. Keep the 64-bit wrap fixup cold just like the normal
+		// A32 event tail, so the common linked entry removes the nextEventCycle load
+		// and signed compare rather than replacing them with eager high-word work.
+		if (!EmitFlushDirtyGprPins())
+			return false;
+
+		size_t carry_branch = static_cast<size_t>(-1);
+		if (!EmitAddScaledCyclesToCpuLowWord(
+				block_cycles, HOST_TMP0, HOST_TMP2, &carry_branch))
+		{
+			return false;
+		}
+
+		const size_t direct_tail = m_code.Size();
+		if (!EmitDirectLinkTail(concatenated_direct_exit, direct_link,
+				defer_pc_writeback, direct_pc, false, true))
+		{
+			return false;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuEeConcatenatedShortBlocks++;
+		g_qemuEeConcatenatedShortSchedulerTestsElided++;
+		// The direct edge remains, but its normal no-event path no longer loads
+		// nextEventCycle or subtracts it from the charged cycle low word.
+		g_qemuEeConcatenatedShortHotInstructionsElided += 2;
+#endif
+		const size_t carry_branches[] = {carry_branch};
+		return EmitCycleCarryFixup(
+			carry_branches, 1, direct_tail, HOST_TMP1);
 	}
 
 	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,

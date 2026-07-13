@@ -534,7 +534,10 @@ namespace VitaEE
 			const GprLinkSignature* gpr_link_signature = nullptr,
 			size_t* compatible_link_entry_offset = nullptr,
 			u8* compatible_link_entry_loads = nullptr,
-			CompatibleVtlbFastEntryOffsets* compatible_vtlb_fast_entries = nullptr);
+			CompatibleVtlbFastEntryOffsets* compatible_vtlb_fast_entries = nullptr,
+			bool concatenate_short_split = false,
+			bool* concatenated_short_emitted = nullptr,
+			const void* concatenated_direct_exit = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
@@ -545,6 +548,9 @@ namespace VitaEE
 			u32 direct_pc = 0, u32 taken_pc = 0, bool conditional_pc = false,
 			bool indirect_pc_writeback = false, bool preserve_dirty_direct_link = false,
 			bool preserve_dirty_taken_link = false);
+		bool EndBlockWithConcatenatedDirectLink(u32 block_cycles,
+			const void* concatenated_direct_exit, DirectLinkSlot* direct_link,
+			bool defer_pc_writeback, u32 direct_pc);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
 			const void* event_exit, DirectLinkSlot* not_taken_link = nullptr,
 			DirectLinkSlot* taken_link = nullptr, bool wait_loop_taken = false,
@@ -588,7 +594,8 @@ namespace VitaEE
 		bool EmitCmpImm32OrReg(unsigned rn, u32 value, unsigned scratch, VitaA32::Condition condition);
 		bool EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
 			bool defer_pc_writeback = false, u32 pc = 0,
-			bool sync_private_fallback = false);
+			bool sync_private_fallback = false,
+			bool concatenated_direct_fallback = false);
 		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0,
 			bool sync_private_fallback = false);
