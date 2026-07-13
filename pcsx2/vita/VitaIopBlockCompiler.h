@@ -341,7 +341,7 @@ namespace VitaIOP
 		int PinnedHostForGuest(unsigned guest_reg) const;
 		bool EmitFlushPinnedGprs();
 		void RecordPinnedGprExitPathSavings();
-		bool EmitBranchHelperExit(const void* helper);
+		bool EmitInterpreterTraceBranchHelperExit(const void* helper);
 		void ResetGprConstState();
 		bool TryGetKnownGpr(unsigned guest_reg, u32* value) const;
 		void SetKnownGpr(unsigned guest_reg, u32 value);
@@ -358,7 +358,6 @@ namespace VitaIOP
 		bool EmitPublishCyclePrefix(u32 cycle_prefix);
 		u32 CurrentTimingHelperSeamCount() const;
 		void RecordBatchedCycleExitSavings(u32 cycle_prefix, bool preserves_argument);
-		bool EmitIncrementCycle();
 		bool EmitChargeEeBudget(u32 known_cycle_count = 0, bool pins_flushed = true,
 			u8 scheduler_resume_slot = UINT8_MAX);
 		bool BranchTestSchedulingEnabled() const;
@@ -380,7 +379,9 @@ namespace VitaIOP
 		bool EmitMultiplyOp(u32 op, bool is_signed);
 		bool EmitDivideOp(u32 op, bool is_signed);
 		bool EmitExceptionOp(u32 pc, u32 code);
-		bool EmitImmediateOp(u32 op);
+		bool EmitImmediateOp(u32 op, u32 pc);
+		void ResolveIrxImport(u32 marker_pc, u32 marker_op);
+		bool EmitIrxImportMarker(u32 marker_pc, u32 marker_op);
 		bool EmitEffectiveAddress(u32 op);
 		bool EmitEffectiveAddress(u32 op, unsigned host_reg);
 		bool EmitLoadOp(u32 op);
@@ -524,6 +525,7 @@ namespace VitaIOP
 		u32 m_batched_cycle_instructions_removed = 0;
 		u32 m_batched_cycle_stack_words_removed = 0;
 		u32 m_current_instruction_count = 0;
+		u32 m_current_cycle_count = 0;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
@@ -552,6 +554,13 @@ namespace VitaIOP
 		VitaA32::Condition m_branch_predicate_producer_true_condition = VitaA32::Condition::AL;
 		bool m_register_jump_target_known = false;
 		u32 m_register_jump_target = 0;
+		bool m_emit_irx_import = false;
+		bool m_irx_import_log = false;
+		u32 m_irx_import_table = 0;
+		u16 m_irx_import_index = 0;
+		const void* m_irx_import_hle = nullptr;
+		const void* m_irx_import_debug = nullptr;
+		const char* m_irx_import_funcname = nullptr;
 		std::array<u32, 32> m_gpr_const_values{};
 		u32 m_gpr_const_known_mask = 1;
 		std::array<u32, 2> m_hilo_const_values{};
@@ -610,6 +619,7 @@ namespace VitaIOP
 		bool ExecuteCompiledBlockAtPc(u32 start_pc, BlockExecutionResult* result,
 			bool publish_details = true);
 		u32 ExecuteProviderBlockAtPc(u32 start_pc, ProviderCompileResult* compile_result);
+		s32 ExecuteInterpreterFallbackTimeslice(s32 ee_cycles);
 #if defined(__arm__)
 		__attribute__((naked, noinline)) s32 ExecuteProviderTimeslice(s32 ee_cycles);
 #else
@@ -818,7 +828,11 @@ namespace VitaIOP
 		void CommitCodeSlice(size_t slice_offset, size_t code_size);
 		void RewindCodeCache(size_t slice_offset);
 		u32 ResetForCachePressure();
-		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count);
+		bool CompileIntoCacheEntry(CachedBlock& block, u32 start_pc, u32 instruction_count,
+			bool entry_effects_already_applied = false);
+		bool ExecuteCompiledBlockInternal(u32 start_pc, u32 instruction_count,
+			BlockExecutionResult* result, bool publish_details,
+			bool entry_effects_already_applied);
 		void PublishExecutionDetails(const CachedBlock& block, BlockExecutionResult* result) const;
 		bool RunValidatedBlock(CachedBlock& block, BlockExecutionResult* result, bool publish_details);
 		u32 RunProviderBlock(CachedBlock& block, u32 dispatch_flags);

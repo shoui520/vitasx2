@@ -1005,7 +1005,8 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 			s_iop_a32_stats.last_interpreter_opcode = opcode;
 			s_iop_a32_stats.interpreter_blocks++;
 #endif
-			const s32 fallback_result = psxInt.ExecuteBlock(psxRegs.iopCycleEE);
+			const s32 fallback_result =
+				s_iop_a32_executor.ExecuteInterpreterFallbackTimeslice(psxRegs.iopCycleEE);
 			return fallback_result;
 		}
 
