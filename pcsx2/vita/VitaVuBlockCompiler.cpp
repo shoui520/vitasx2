@@ -7770,6 +7770,30 @@ namespace VitaVU
 			}
 	} // anonymous namespace
 
+	static void UpdateNextBlockCyclesAtExecuteExit(VURegs& vu, u32 busy_mask,
+		bool forced_program_exit)
+	{
+		// PCSX2 owner: x86/microVU_Compile.inl::mVUtestCycles() publishes
+		// nextBlockCycles only for the VU sync hacks when the upcoming compiled
+		// block cannot enter its cycle budget.  microVU_Branch.inl clears it at
+		// architectural program exits.  With both hacks disabled the field stays
+		// at the zero established by mVUreset().
+		if (!EmuConfig.Gamefixes.VUSyncHack && !EmuConfig.Gamefixes.FullVU0SyncHack)
+			return;
+
+		if (forced_program_exit || !(VU0.VI[REG_VPU_STAT].UL & busy_mask))
+		{
+			vu.nextBlockCycles = 0;
+			return;
+		}
+
+		// The A32 provider currently admits dynamic-stall blocks pair by pair, so
+		// it does not yet own microVU's pipeline-specialized upcoming block span.
+		// Preserve the interpreter-compatible estimate only for this tracked
+		// sync-hack fallback; it must not leak into the ordinary native contract.
+		vu.nextBlockCycles = (vu.cycle - cpuRegs.cycle) + 1;
+	}
+
 	void ExecuteVu0Blocks(u32 cycles)
 	{
 		// PCSX2 owner: InterpVU0::Execute(). Vita keeps the same TPC
@@ -7860,7 +7884,8 @@ namespace VitaVU
 			VU0.cycle += cycle_change;
 		}
 
-		VU0.nextBlockCycles = (VU0.cycle - cpuRegs.cycle) + 1;
+		UpdateNextBlockCyclesAtExecuteExit(VU0, 0x1,
+			(VU0.flags & VUFLAG_MFLAGSET) != 0);
 	}
 
 	void InvalidateVu0Blocks(u32 addr, u32 size)
@@ -7893,6 +7918,9 @@ namespace VitaVU
 
 	void ResetVu0Blocks()
 	{
+		// PCSX2 owner: x86/microVU.cpp::mVUreset().  InterpVU0::Reset() does
+		// not own this native-provider scheduling hint.
+		VU0.nextBlockCycles = 0;
 		DropVu0Blocks();
 	}
 
@@ -7923,10 +7951,10 @@ namespace VitaVU
 
 	void ExecuteVu1Blocks(u32 cycles)
 	{
-		// PCSX2 owner: InterpVU1::Execute(). The loop shape, TPC byte/index
-		// conversion, VPU_STAT stop fixup, budget condition, and
-		// nextBlockCycles update are byte-for-byte the interpreter's; only
-		// eligible windows run through compiled blocks.
+		// PCSX2 owners: InterpVU1::Execute() supplies the loop shape, TPC
+		// byte/index conversion, VPU_STAT stop fixup, and budget condition;
+		// x86 microVU owns the native-provider nextBlockCycles contract.
+		// Eligible windows run through compiled blocks.
 		const FPControlRegisterBackup fpcr_backup(EmuConfig.Cpu.VU1FPCR);
 
 		VU1.VI[REG_TPC].UL <<= 3;
@@ -7974,7 +8002,7 @@ namespace VitaVU
 		}
 
 		VU1.VI[REG_TPC].UL >>= 3;
-		VU1.nextBlockCycles = (VU1.cycle - cpuRegs.cycle) + 1;
+		UpdateNextBlockCyclesAtExecuteExit(VU1, 0x100, false);
 	}
 
 	void InvalidateVu1Blocks(u32 addr, u32 size)
@@ -8011,6 +8039,9 @@ namespace VitaVU
 
 	void ResetVu1Blocks()
 	{
+		// PCSX2 owner: x86/microVU.cpp::mVUreset().  InterpVU1::Reset() does
+		// not own this native-provider scheduling hint.
+		VU1.nextBlockCycles = 0;
 		DropVu1Blocks();
 	}
 
