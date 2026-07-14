@@ -97,6 +97,7 @@ add_library(pcsx2core STATIC
 	R5900.cpp
 	R5900OpcodeImpl.cpp
 	R5900OpcodeTables.cpp
+	SaveStateRaw.cpp
 	SIO/Pad/PadBase.cpp
 	SIO/Pad/PadDualshock2.cpp
 	SIO/Pad/PadNotConnected.cpp
@@ -125,6 +126,11 @@ add_library(pcsx2core STATIC
 	Sif1.cpp
 	SourceLog.cpp
 	StateWrapper.cpp
+	USB/USB.cpp
+	USB/qemu-usb/bus.cpp
+	USB/qemu-usb/core.cpp
+	USB/qemu-usb/desc.cpp
+	USB/qemu-usb/usb-ohci.cpp
 	VU0.cpp
 	VU0micro.cpp
 	VU0microInterp.cpp
@@ -162,6 +168,8 @@ add_library(pcsx2core STATIC
 	vita/VitaHostSurface.cpp
 	vita/VitaInputManager.cpp
 	vita/VitaPad.cpp
+	vita/VitaSaveState.cpp
+	vita/VitaUsbDeviceRegistry.cpp
 	vita/VitaVifInterpreter.cpp
 	vita/VitaVmState.cpp
 	vita/VitaVuBlockCompiler.cpp
@@ -173,6 +181,14 @@ add_library(pcsx2core STATIC
 # unit non-PIE so no GOT setup can legally precede that save.
 set_source_files_properties(vita/VitaIopBlockCompiler.cpp PROPERTIES
 	COMPILE_OPTIONS "-fno-pie"
+)
+
+# VU multiply/add instructions round after each architectural operation.
+# Contracting the interpreter's separate expressions changes PS2-visible bits
+# and makes trace output compiler-dependent, so keep contraction disabled only
+# for the translation unit which owns those expressions.
+set_source_files_properties(VUops.cpp PROPERTIES
+	COMPILE_OPTIONS "-ffp-contract=off"
 )
 
 set(VITASX2_GIT_TAG "vitasx2-ng")

@@ -54,7 +54,7 @@ namespace
 	constexpr u16 PERSISTENT_VTLB_HOST_BASE_OFFSET =
 		VitaEE::BlockCompiler::PERSISTENT_LINK_VTLB_HOST_BASE_OFFSET;
 	constexpr size_t PERSISTENT_DISPATCH_CODE_CAPACITY = 4096;
-	constexpr u32 EE_CONCATENATED_DIRECT_EXIT_TOKEN = 0xc1;
+	constexpr u32 EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN = 0xc1;
 
 	extern "C" __attribute__((noinline)) u32 VitaEeA32DirectExit()
 	{
@@ -84,7 +84,7 @@ namespace
 			return true;
 		}
 
-		if (value == EE_CONCATENATED_DIRECT_EXIT_TOKEN)
+		if (value == EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN)
 		{
 			*exit = VitaEE::BlockExitKind::Direct;
 			if (scheduler_test_elided)
@@ -637,7 +637,8 @@ namespace VitaEE
 		block.ram_source_fragments = {};
 		block.ram_source_fragment_count = 0;
 		block.source_serial = 0;
-		block.concatenated_short = false;
+		block.direct_continuation_kind =
+			DirectContinuationKind::SchedulerTestedTail;
 		block.discovered_topology = false;
 		block.opcodes.reset();
 		block.code.Release();
@@ -735,7 +736,7 @@ namespace VitaEE
 		m_persistent_dispatch_code.Release();
 		m_persistent_dispatch_entry = nullptr;
 		m_persistent_direct_exit = nullptr;
-		m_persistent_concatenated_direct_exit = nullptr;
+		m_persistent_scheduler_elided_direct_exit = nullptr;
 		m_persistent_event_exit = nullptr;
 		ReleaseCodeCache();
 		return invalidated;
@@ -769,7 +770,8 @@ namespace VitaEE
 			block.compatible_vtlb_fast_entries = {};
 			block.compatible_link_entry_loads = 0;
 			block.direct_links = {};
-			block.concatenated_short = false;
+			block.direct_continuation_kind =
+				DirectContinuationKind::SchedulerTestedTail;
 			block.discovered_topology = false;
 			block.opcodes.reset();
 			RememberFreeCacheEntry(block);
@@ -1304,7 +1306,7 @@ namespace VitaEE
 			RewindCodeCache(dispatcher_slice_offset);
 			m_persistent_dispatch_entry = nullptr;
 			m_persistent_direct_exit = nullptr;
-			m_persistent_concatenated_direct_exit = nullptr;
+			m_persistent_scheduler_elided_direct_exit = nullptr;
 			m_persistent_event_exit = nullptr;
 			return false;
 		};
@@ -1341,15 +1343,15 @@ namespace VitaEE
 		if (direct_to_common == static_cast<size_t>(-1))
 			return fail();
 
-		const size_t concatenated_direct_exit_offset = code.Size();
+		const size_t scheduler_elided_direct_exit_offset = code.Size();
 		if (!code.EmitMovImm8(0,
-				static_cast<u8>(EE_CONCATENATED_DIRECT_EXIT_TOKEN)))
+				static_cast<u8>(EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN)))
 		{
 			return fail();
 		}
-		const size_t concatenated_direct_to_common =
+		const size_t scheduler_elided_direct_to_common =
 			code.EmitBranchPlaceholder();
-		if (concatenated_direct_to_common == static_cast<size_t>(-1))
+		if (scheduler_elided_direct_to_common == static_cast<size_t>(-1))
 			return fail();
 
 		const size_t event_exit_offset = code.Size();
@@ -1358,7 +1360,7 @@ namespace VitaEE
 
 		const size_t common_offset = code.Size();
 		if (!code.PatchBranch(direct_to_common, common_offset) ||
-			!code.PatchBranch(concatenated_direct_to_common, common_offset) ||
+			!code.PatchBranch(scheduler_elided_direct_to_common, common_offset) ||
 			// Compatible chains may lend r7/r8 to GPR mappings. Restore the
 			// canonical dispatcher vTLB ABI once in this shared cold exit instead of
 			// duplicating reloads in every generated direct/event tail.
@@ -1389,8 +1391,8 @@ namespace VitaEE
 
 		m_persistent_dispatch_entry = code.EntryPoint();
 		m_persistent_direct_exit = code.Data() + direct_exit_offset;
-		m_persistent_concatenated_direct_exit =
-			code.Data() + concatenated_direct_exit_offset;
+		m_persistent_scheduler_elided_direct_exit =
+			code.Data() + scheduler_elided_direct_exit_offset;
 		m_persistent_event_exit = code.Data() + event_exit_offset;
 		return true;
 	}
@@ -2226,7 +2228,7 @@ namespace VitaEE
 	bool BlockExecutor::CompileIntoCacheEntry(CachedBlock& block, u32 start_pc,
 		u32 instruction_count, u32* scaled_cycles, bool allow_code_budget_split,
 		u32 dependency_start_pc, u32 dependency_instruction_count,
-		u32 dependency_charged_cycles_before, bool concatenate_short_split,
+		u32 dependency_charged_cycles_before, bool pcsx2_short_split,
 		bool discovered_topology)
 	{
 		if (instruction_count == 0 ||
@@ -2287,7 +2289,8 @@ namespace VitaEE
 		size_t compiled_compatible_link_entry_offset = static_cast<size_t>(-1);
 		u8 compiled_compatible_link_entry_loads = 0;
 		CompatibleVtlbFastEntryOffsets compiled_compatible_vtlb_fast_entries{};
-		bool compiled_concatenated_short = false;
+		DirectContinuationKind compiled_direct_continuation_kind =
+			DirectContinuationKind::SchedulerTestedTail;
 		DirectLinkSlots direct_links;
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
@@ -2352,14 +2355,16 @@ namespace VitaEE
 				u8 attempt_compatible_link_entry_loads = 0;
 				CompatibleVtlbFastEntryOffsets attempt_compatible_vtlb_fast_entries{};
 				DirectLinkSlots attempt_direct_links;
-				// PCSX2 recRecompile() uses the same <=6-instruction
-				// concatenation for a physical code-size split as for a page or
-				// existing-BaseBlock split. The original exact request remains the
-				// proof dependency, while this emitted prefix omits iBranchTest().
-				const bool attempt_concatenated_short = concatenate_short_split ||
-					(candidate_instruction_count < instruction_count &&
-						candidate_instruction_count <= 6);
-				bool attempt_concatenated_short_emitted = false;
+				// A PCSX2-created <=6-instruction split omits iBranchTest(). A32 may
+				// additionally need several host-code fragments for one PCSX2 logical
+				// block. Those fragments must not expose host code capacity as a new
+				// scheduler boundary: only the final logical tail owns the event test.
+				const DirectContinuationKind attempt_direct_continuation_kind =
+					pcsx2_short_split ? DirectContinuationKind::Pcsx2ShortSplit :
+					(candidate_instruction_count < instruction_count ?
+						DirectContinuationKind::A32PhysicalFragment :
+						DirectContinuationKind::SchedulerTestedTail);
+				bool attempt_scheduler_test_elided_continuation_emitted = false;
 				const bool compiled = compiler.CompileStraightLineBlock(start_pc,
 					candidate_instruction_count, direct_exit, event_exit,
 					&attempt_scaled_cycles, &attempt_direct_links,
@@ -2369,17 +2374,23 @@ namespace VitaEE
 					&attempt_resident_self_link_entry_offset,
 					&attempt_resident_self_link_entry_loads, &compiled_gpr_link_signature,
 					&attempt_compatible_link_entry_offset, &attempt_compatible_link_entry_loads,
-					&attempt_compatible_vtlb_fast_entries, attempt_concatenated_short,
-					&attempt_concatenated_short_emitted,
+					&attempt_compatible_vtlb_fast_entries,
+					attempt_direct_continuation_kind,
+					&attempt_scheduler_test_elided_continuation_emitted,
 					m_persistent_dispatch_enabled ?
-						m_persistent_concatenated_direct_exit : direct_exit);
+						m_persistent_scheduler_elided_direct_exit : direct_exit);
 				u32 calculated_prefix_cycles = 0;
 				const bool cycle_contract_matches =
 					candidate_instruction_count == instruction_count ||
 					(compiled && BlockCompiler::CalculateScaledCyclesForRange(start_pc,
 						candidate_instruction_count, false, &calculated_prefix_cycles) &&
 					 attempt_scaled_cycles == calculated_prefix_cycles);
-				const bool flushed = compiled && cycle_contract_matches && block.code.Flush();
+				const bool continuation_contract_matches =
+					attempt_direct_continuation_kind !=
+						DirectContinuationKind::A32PhysicalFragment ||
+					attempt_scheduler_test_elided_continuation_emitted;
+				const bool flushed = compiled && cycle_contract_matches &&
+					continuation_contract_matches && block.code.Flush();
 				const bool out_of_block_space = !flushed && block.code.OutOfSpace();
 				const size_t failure_code_size = block.code.Size();
 				const size_t failure_code_capacity = block.code.Capacity();
@@ -2400,8 +2411,10 @@ namespace VitaEE
 						attempt_compatible_link_entry_loads;
 					compiled_compatible_vtlb_fast_entries =
 						attempt_compatible_vtlb_fast_entries;
-					compiled_concatenated_short =
-						attempt_concatenated_short_emitted;
+					compiled_direct_continuation_kind =
+						attempt_scheduler_test_elided_continuation_emitted ?
+							attempt_direct_continuation_kind :
+							DirectContinuationKind::SchedulerTestedTail;
 					direct_links = attempt_direct_links;
 					break;
 				}
@@ -2516,7 +2529,7 @@ namespace VitaEE
 		block.compatible_link_entry_loads = compiled_compatible_link_entry_loads;
 		block.compatible_vtlb_fast_entries = compiled_compatible_vtlb_fast_entries;
 		block.direct_links = direct_links;
-		block.concatenated_short = compiled_concatenated_short;
+		block.direct_continuation_kind = compiled_direct_continuation_kind;
 		block.discovered_topology = discovered_topology;
 
 		RetireStaleOverlappingBlocks(start_pc, compiled_instruction_count,
@@ -2972,11 +2985,21 @@ namespace VitaEE
 		result->code_cache_used = m_code_cache_used;
 		result->code_cache_capacity = m_code_cache_capacity;
 #if defined(VITASX2_QEMU_VALIDATION)
-		result->concatenated_short_blocks = block.concatenated_short ? 1u : 0u;
+		const bool pcsx2_short_split = block.direct_continuation_kind ==
+			DirectContinuationKind::Pcsx2ShortSplit;
+		const bool code_budget_continuation = block.direct_continuation_kind ==
+			DirectContinuationKind::A32PhysicalFragment;
+		result->concatenated_short_blocks = pcsx2_short_split ? 1u : 0u;
 		result->concatenated_short_scheduler_tests_elided =
-			block.concatenated_short ? 1u : 0u;
+			pcsx2_short_split ? 1u : 0u;
 		result->concatenated_short_hot_instructions_elided =
-			block.concatenated_short ? 2u : 0u;
+			pcsx2_short_split ? 2u : 0u;
+		result->code_budget_continuation_blocks =
+			code_budget_continuation ? 1u : 0u;
+		result->code_budget_continuation_scheduler_tests_elided =
+			code_budget_continuation ? 1u : 0u;
+		result->code_budget_continuation_hot_instructions_elided =
+			code_budget_continuation ? 2u : 0u;
 		PopulateFrameEvidence(block.code, m_persistent_dispatch_code, result);
 		for (const DirectLinkSlot& link : block.direct_links.slots)
 		{
@@ -3082,11 +3105,22 @@ namespace VitaEE
 			result->lookup_hit = lookup_hit;
 			result->fast_dispatch_hit = fast_dispatch_hit;
 #if defined(VITASX2_QEMU_VALIDATION)
-			result->concatenated_short_blocks = entry->concatenated_short ? 1u : 0u;
+			const bool pcsx2_short_split = entry->direct_continuation_kind ==
+				DirectContinuationKind::Pcsx2ShortSplit;
+			const bool code_budget_continuation =
+				entry->direct_continuation_kind ==
+					DirectContinuationKind::A32PhysicalFragment;
+			result->concatenated_short_blocks = pcsx2_short_split ? 1u : 0u;
 			result->concatenated_short_scheduler_tests_elided =
-				entry->concatenated_short ? 1u : 0u;
+				pcsx2_short_split ? 1u : 0u;
 			result->concatenated_short_hot_instructions_elided =
-				entry->concatenated_short ? 2u : 0u;
+				pcsx2_short_split ? 2u : 0u;
+			result->code_budget_continuation_blocks =
+				code_budget_continuation ? 1u : 0u;
+			result->code_budget_continuation_scheduler_tests_elided =
+				code_budget_continuation ? 1u : 0u;
+			result->code_budget_continuation_hot_instructions_elided =
+				code_budget_continuation ? 2u : 0u;
 			PopulateFrameEvidence(entry->code, m_persistent_dispatch_code, result);
 			for (const DirectLinkSlot& link : entry->direct_links.slots)
 			{
@@ -3252,7 +3286,7 @@ namespace VitaEE
 				MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS,
 				&flush_cache_successor) &&
 			flush_cache_successor.instruction_count != 0;
-		const bool concatenate_short_split = scan.instruction_count <= 6 &&
+		const bool pcsx2_short_split = scan.instruction_count <= 6 &&
 			(compiled_successor ||
 				branch_target_successor_scannable ||
 				flush_cache_successor_scannable);
@@ -3261,7 +3295,7 @@ namespace VitaEE
 		if (!entry || !CompileIntoCacheEntry(*entry, start_pc, scan.instruction_count,
 				&result->scaled_cycles, true, dependency_start_pc,
 				dependency_instruction_count,
-				dependency_charged_cycles_before, concatenate_short_split, true))
+				dependency_charged_cycles_before, pcsx2_short_split, true))
 		{
 			return false;
 		}

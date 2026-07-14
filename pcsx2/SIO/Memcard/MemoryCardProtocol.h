@@ -7,6 +7,8 @@
 
 #include "common/Pcsx2Defs.h"
 
+class StateWrapper;
+
 struct PS1MemoryCardState
 {
 	size_t currentByte = 2;
@@ -30,6 +32,7 @@ private:
 
 public:
 	void ResetPS1State();
+	bool DoPortableState(StateWrapper& sw);
 
 	void Probe();
 	void UnknownWriteDeleteEnd();

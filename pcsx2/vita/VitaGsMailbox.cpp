@@ -238,6 +238,13 @@ namespace MTGS
 	}
 } // namespace MTGS
 
+bool GSValidatePortableState()
+{
+	// PCSX2 owner: GS/GS.cpp::GSValidatePortableState(). The Vita headless
+	// mailbox owns the live GSState instance instead of g_gs_renderer.
+	return MTGS::EnsureGsOpen() && MTGS::s_gs->ValidatePortableState();
+}
+
 void GSTraceStateSnapshot(u8 trigger)
 {
 	if (MTGS::s_gs)

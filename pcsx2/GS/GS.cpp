@@ -468,7 +468,11 @@ int GSfreeze(FreezeAction mode, freezeData* data)
 		// Since Defrost doesn't do a hardware reset (since it would be clearing
 		// local memory just before it's overwritten), we have to manually wipe
 		// out the current textures.
-		g_gs_device->ClearCurrent();
+		// The Null renderer intentionally has no GSDevice. Savestate restore is
+		// still valid there: its software-visible GSState/local memory is owned by
+		// the renderer, while there are no host textures to discard.
+		if (g_gs_device)
+			g_gs_device->ClearCurrent();
 
 		// Dump audio frames in video capture if it's been started, otherwise we get
 		// a buildup of audio frames from the CPU thread.
@@ -477,6 +481,11 @@ int GSfreeze(FreezeAction mode, freezeData* data)
 
 		return g_gs_renderer->Defrost(data);
 	}
+}
+
+bool GSValidatePortableState()
+{
+	return g_gs_renderer && g_gs_renderer->ValidatePortableState();
 }
 
 void GSQueueSnapshot(const std::string& path, u32 gsdump_frames)

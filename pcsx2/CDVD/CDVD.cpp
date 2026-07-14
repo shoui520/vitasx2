@@ -70,6 +70,84 @@ static constexpr u8 monthmap[13] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 
 static constexpr u8 cdvdParamLength[16] = { 0, 0, 0, 0, 0, 4, 11, 11, 11, 1, 255, 255, 7, 2, 11, 1 };
 
+static bool IsCanonicalPortableCdvdBool(const bool& value)
+{
+	static_assert(sizeof(bool) == sizeof(unsigned char));
+	return *reinterpret_cast<const unsigned char*>(&value) <= 1;
+}
+
+static bool ValidatePortableCdvdState()
+{
+	// Inspect the object representation before evaluating either raw-frozen bool.
+	if (!IsCanonicalPortableCdvdBool(cdvd.Spinning) ||
+		!IsCanonicalPortableCdvdBool(cdvd.AbortRequested))
+	{
+		Console.Error("Portable CDVD replay state contains a non-canonical boolean.");
+		return false;
+	}
+
+	if ((cdvd.SeekCompleted != 0 && cdvd.SeekCompleted != 1) ||
+		(cdvd.Reading != 0 && cdvd.Reading != 1) ||
+		(cdvd.WaitingDMA != 0 && cdvd.WaitingDMA != 1) ||
+		cdvd.nextSectorsBuffered > 16 || cdvd.RTC.month < 1 || cdvd.RTC.month > 12)
+	{
+		Console.Error("Portable CDVD replay state contains invalid controller or RTC state.");
+		return false;
+	}
+
+	if (cdvd.NCMDParamCnt > sizeof(cdvd.NCMDParamBuff) ||
+		cdvd.NCMDParamPos > sizeof(cdvd.NCMDParamBuff) ||
+		cdvd.NCMDParamCnt != cdvd.NCMDParamPos)
+	{
+		Console.Error("Portable CDVD replay state contains an invalid N-command parameter cursor.");
+		return false;
+	}
+
+	if (cdvd.SCMDParamCnt > sizeof(cdvd.SCMDParamBuff) ||
+		cdvd.SCMDParamPos > sizeof(cdvd.SCMDParamBuff) ||
+		cdvd.SCMDParamCnt != cdvd.SCMDParamPos)
+	{
+		Console.Error("Portable CDVD replay state contains an invalid S-command parameter cursor.");
+		return false;
+	}
+
+	if (cdvd.SCMDResultCnt > sizeof(cdvd.SCMDResultBuff) ||
+		cdvd.SCMDResultPos > cdvd.SCMDResultCnt)
+	{
+		Console.Error("Portable CDVD replay state contains an invalid S-command result cursor.");
+		return false;
+	}
+
+	switch (cdvd.BlockSize)
+	{
+		case 2048:
+		case 2064:
+		case 2328:
+		case 2340:
+		case 2352:
+		case 2368:
+			break;
+
+		default:
+			Console.Error("Portable CDVD replay state contains an invalid sector block size.");
+			return false;
+	}
+
+	constexpr int MAX_MAGICGATE_SIZE = static_cast<int>(sizeof(cdvd.mg_buffer)) - 1;
+	if (cdvd.mg_size < 0 || cdvd.mg_size > MAX_MAGICGATE_SIZE ||
+		cdvd.mg_maxsize < 0 || cdvd.mg_maxsize > MAX_MAGICGATE_SIZE ||
+		(cdvd.mg_maxsize != 0 && cdvd.mg_size > cdvd.mg_maxsize) ||
+		(cdvd.mg_datatype != 0 && cdvd.mg_datatype != 1))
+	{
+		// A zero maximum disables further writes while retaining buffered data for
+		// reads, so mg_size may exceed mg_maxsize only in that inactive-write state.
+		Console.Error("Portable CDVD replay state contains invalid MagicGate buffer bounds.");
+		return false;
+	}
+
+	return true;
+}
+
 static constexpr size_t NVRAM_SIZE = 1024;
 static u8 s_nvram[NVRAM_SIZE];
 
@@ -1061,9 +1139,20 @@ bool SaveStateBase::cdvdFreeze()
 	if (!FreezeTag("cdvd"))
 		return false;
 
+	if (IsPortableReplay() && IsSaving() && !ValidatePortableCdvdState())
+	{
+		m_error = true;
+		return false;
+	}
+
 	Freeze(cdvd);
 	if (!IsOkay())
 		return false;
+	if (IsPortableReplay() && IsLoading() && !ValidatePortableCdvdState())
+	{
+		m_error = true;
+		return false;
+	}
 
 	if (IsLoading())
 	{

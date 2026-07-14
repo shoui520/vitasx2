@@ -8,10 +8,11 @@
 
 StateWrapper::IStream::~IStream() = default;
 
-StateWrapper::StateWrapper(IStream* stream, Mode mode, u32 version)
+StateWrapper::StateWrapper(IStream* stream, Mode mode, u32 version, DataFormat data_format)
 	: m_stream(stream)
 	, m_mode(mode)
 	, m_version(version)
+	, m_data_format(data_format)
 {
 }
 
@@ -50,12 +51,46 @@ void StateWrapper::Do(bool* value_ptr)
 
 void StateWrapper::Do(std::string* value_ptr)
 {
+	static constexpr u32 PORTABLE_REPLAY_MAX_STRING_LENGTH = 4096;
+
+	if (m_mode == Mode::Write && IsPortableReplay() &&
+		value_ptr->length() > PORTABLE_REPLAY_MAX_STRING_LENGTH)
+	{
+		m_error = true;
+		return;
+	}
+
 	u32 length = static_cast<u32>(value_ptr->length());
 	Do(&length);
 	if (m_mode == Mode::Read)
+	{
+		if (m_error)
+		{
+			value_ptr->clear();
+			return;
+		}
+
+		if (IsPortableReplay())
+		{
+			// Portable data is an untrusted, fixed-schema replay envelope. Prove
+			// both the schema bound and the bytes remaining before allocating.
+			const u32 data_position = m_stream->GetPosition();
+			if (length > PORTABLE_REPLAY_MAX_STRING_LENGTH ||
+				!m_stream->SeekRelative(static_cast<s32>(length)) ||
+				!m_stream->SeekAbsolute(data_position))
+			{
+				m_error = true;
+				value_ptr->clear();
+				return;
+			}
+		}
+
 		value_ptr->resize(length);
-	DoBytes(&(*value_ptr)[0], length);
-	value_ptr->resize(std::strlen(&(*value_ptr)[0]));
+	}
+	if (length > 0)
+		DoBytes(value_ptr->data(), length);
+	if (m_mode == Mode::Read && !m_error)
+		value_ptr->resize(std::strlen(value_ptr->c_str()));
 }
 
 bool StateWrapper::DoMarker(const char* marker)

@@ -33,7 +33,8 @@ namespace USB
 	static bool DoOHCIState(StateWrapper& sw);
 	static void DoEndpointState(USBEndpoint* ep, StateWrapper& sw);
 	static void DoDeviceState(USBDevice* dev, StateWrapper& sw);
-	static void DoPacketState(USBPacket* p, StateWrapper& sw, const std::array<bool, 2>& valid_devices);
+	static bool DoPacketState(USBPacket* p, StateWrapper& sw,
+		const std::array<bool, NUM_PORTS>& valid_devices);
 } // namespace USB
 
 static OHCIState* s_qemu_ohci = nullptr;
@@ -286,10 +287,11 @@ void USB::DoEndpointState(USBEndpoint* ep, StateWrapper& sw)
 	}
 }
 
-void USB::DoPacketState(USBPacket* p, StateWrapper& sw, const std::array<bool, 2>& valid_devices)
+bool USB::DoPacketState(USBPacket* p, StateWrapper& sw,
+	const std::array<bool, NUM_PORTS>& valid_devices)
 {
 	if (!sw.DoMarker("USBPacket"))
-		return;
+		return false;
 
 	s32 dev_index = -1;
 	s32 ep_index = -1;
@@ -341,15 +343,30 @@ void USB::DoPacketState(USBPacket* p, StateWrapper& sw, const std::array<bool, 2
 	sw.Do(&p->status);
 	sw.Do(&p->actual_length);
 	sw.Do(&p->state);
+	if (sw.HasError())
+		return false;
 
 	if (sw.IsReading())
 	{
 		p->ep = nullptr;
 
-		if (dev_index >= 0 && ep_index >= 0 && valid_devices[static_cast<u32>(dev_index)])
+		if (sw.IsPortableReplay() &&
+			(dev_index != -1 || ep_index != -1 || queued || p->buffer_size != 0))
+		{
+			Console.Error("Portable USB state contains an in-flight device packet.");
+			sw.SetError();
+			return false;
+		}
+
+		const bool valid_device_index =
+			(dev_index >= 0 && static_cast<u32>(dev_index) < valid_devices.size());
+		const bool valid_endpoint_index =
+			(ep_index >= 0 && ep_index < (1 + USB_MAX_ENDPOINTS + USB_MAX_ENDPOINTS));
+		if (valid_device_index && valid_endpoint_index &&
+			valid_devices[static_cast<u32>(dev_index)] &&
+			s_usb_device[static_cast<u32>(dev_index)])
 		{
 			USBDevice* dev = s_usb_device[static_cast<u32>(dev_index)];
-			pxAssert(dev);
 
 			p->buffer_ptr = (p->buffer_size > 0) ? s_qemu_ohci->usb_buf : nullptr;
 
@@ -369,16 +386,35 @@ void USB::DoPacketState(USBPacket* p, StateWrapper& sw, const std::array<bool, 2
 			p->buffer_size = 0;
 		}
 	}
+
+	return !sw.HasError();
 }
 
 bool USB::DoState(StateWrapper& sw)
 {
-	std::array<bool, 2> valid_devices = {};
+	std::array<bool, NUM_PORTS> valid_devices = {};
+
+	if (sw.IsPortableReplay())
+	{
+		for (u32 port = 0; port < NUM_PORTS; port++)
+		{
+			if (EmuConfig.USB.Ports[port].DeviceType != DEVTYPE_NONE ||
+				s_usb_device[port] || s_usb_device_proxy[port])
+			{
+				Console.Error("Portable USB state requires port %u to be disconnected.", port);
+				sw.SetError();
+				return false;
+			}
+		}
+	}
 
 	if (sw.IsReading())
 	{
 		if (!sw.DoMarker("USB") || !USB::DoOHCIState(sw))
 		{
+			if (sw.IsPortableReplay())
+				return false;
+
 			Console.Error("USB state is invalid, resetting.");
 			USBreset();
 			return true;
@@ -392,6 +428,22 @@ bool USB::DoState(StateWrapper& sw)
 			sw.Do(&state_devtype);
 			sw.Do(&state_devsubtype);
 			sw.Do(&state_size);
+			if (sw.HasError())
+				return false;
+
+			if (sw.IsPortableReplay())
+			{
+				if (state_devtype != DEVTYPE_NONE ||
+					state_devtype != EmuConfig.USB.Ports[port].DeviceType ||
+					state_devsubtype != EmuConfig.USB.Ports[port].DeviceSubtype ||
+					state_size != 0)
+				{
+					Console.Error("Portable USB state has incompatible data for disconnected port %u.", port);
+					sw.SetError();
+					return false;
+				}
+				continue;
+			}
 
 			// this is *assuming* the config is correct... there's no reason it shouldn't be.
 			if (sw.HasError() ||
@@ -426,9 +478,11 @@ bool USB::DoState(StateWrapper& sw)
 			valid_devices[port] = true;
 		}
 
-		USB::DoPacketState(&s_qemu_ohci->usb_packet, sw, valid_devices);
-		if (sw.HasError())
+		if (!USB::DoPacketState(&s_qemu_ohci->usb_packet, sw, valid_devices) || sw.HasError())
 		{
+			if (sw.IsPortableReplay())
+				return false;
+
 			Console.WriteLn("Failed to read USB packet, resetting all devices.");
 			USBreset();
 			return true;
@@ -475,8 +529,7 @@ bool USB::DoState(StateWrapper& sw)
 			valid_devices[port] = true;
 		}
 
-		USB::DoPacketState(&s_qemu_ohci->usb_packet, sw, valid_devices);
-		if (sw.HasError())
+		if (!USB::DoPacketState(&s_qemu_ohci->usb_packet, sw, valid_devices) || sw.HasError())
 			return false;
 	}
 

@@ -7,6 +7,8 @@
 #include "SIO/Sio2.h"
 #include "SIO/Sio0.h"
 
+#include "StateWrapper.h"
+
 #include "common/Assertions.h"
 #include "common/Console.h"
 
@@ -73,6 +75,39 @@ void MemoryCardProtocol::ResetPS1State()
 	ps1McState.checksum = 0;
 	ps1McState.expectedChecksum = 0;
 	memset(ps1McState.buf.data(), 0, ps1McState.buf.size());
+}
+
+bool MemoryCardProtocol::DoPortableState(StateWrapper& sw)
+{
+	if (!sw.IsPortableReplay() || !sw.DoMarker("MemoryCardProtocol-v1"))
+		return false;
+
+	// PS1Read() can process byte 139 before dropping ACK. Sio0::SetTxData()
+	// immediately calls SoftReset(), so the following increment to 140 is never
+	// a durable owner boundary; resuming it would index beyond the 130-byte buf.
+	static constexpr u32 MAX_PS1_PROTOCOL_BYTE = 139;
+	if (sw.IsWriting() && ps1McState.currentByte > MAX_PS1_PROTOCOL_BYTE)
+	{
+		Console.Error("Portable replay PS1 memory-card byte position is invalid.");
+		return false;
+	}
+	u32 current_byte = static_cast<u32>(ps1McState.currentByte);
+
+	sw.Do(&current_byte);
+	sw.Do(&ps1McState.sectorAddrMSB);
+	sw.Do(&ps1McState.sectorAddrLSB);
+	sw.Do(&ps1McState.checksum);
+	sw.Do(&ps1McState.expectedChecksum);
+	sw.Do(&ps1McState.buf);
+	if (sw.HasError() || current_byte > MAX_PS1_PROTOCOL_BYTE)
+	{
+		Console.Error("Portable replay PS1 memory-card protocol state is invalid.");
+		return false;
+	}
+
+	if (sw.IsReading())
+		ps1McState.currentByte = current_byte;
+	return true;
 }
 
 void MemoryCardProtocol::Probe()

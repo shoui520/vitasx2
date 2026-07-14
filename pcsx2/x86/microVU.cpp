@@ -7,6 +7,8 @@
 #include "common/Perf.h"
 #include "common/StringUtil.h"
 
+#include <array>
+
 //------------------------------------------------------------------
 // Micro VU - Main Functions
 //------------------------------------------------------------------
@@ -413,6 +415,17 @@ bool SaveStateBase::vuJITFreeze()
 {
 	if (IsSaving())
 		vu1Thread.WaitVU();
+
+	if (IsPortableReplay())
+	{
+		// lpState is provider-private program-cache state, not VU architecture.
+		// Portable replay is captured with both VUs idle and rebuilds every native
+		// cache after load, matching Vita's vuJITFreeze compatibility contract.
+		std::array<u8, 96> empty_state{};
+		Freeze(empty_state);
+		Freeze(empty_state);
+		return IsOkay();
+	}
 
 	Freeze(microVU0.prog.lpState);
 	Freeze(microVU1.prog.lpState);

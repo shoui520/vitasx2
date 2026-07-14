@@ -1448,6 +1448,28 @@ bool SaveStateBase::handleFreeze()
 		R3000A::ioman::reset();
 
 	const int firstfd = R3000A::ioman::firstfd;
+	if (IsPortableReplay())
+	{
+		// HostFS file handles are host resources and cannot be replayed
+		// deterministically on another machine. Keep the portable schema fixed-width
+		// even when native size_t differs between x86-64 and AArch32.
+		u32 portable_handle_count = 0;
+		if (EmuConfig.HostFs)
+		{
+			Console.Error("Portable replay state requires HostFS to be disabled.");
+			m_error = true;
+			return false;
+		}
+		Freeze(portable_handle_count);
+		if (portable_handle_count != 0)
+		{
+			Console.Error("Portable replay state contains unsupported HostFS handles.");
+			m_error = true;
+			return false;
+		}
+		return IsOkay();
+	}
+
 	size_t handleCount = EmuConfig.HostFs ? R3000A::handles.size() : 0;
 	Freeze(handleCount);
 

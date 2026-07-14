@@ -14,20 +14,26 @@
 #include "GS.h"
 #include "GS/GS.h"
 #include "Host.h"
+#include "IPU/IPU.h"
+#include "IPU/IPUdma.h"
 #include "MTGS.h"
 #include "MTVU.h"
 #include "Patch.h"
 #include "R3000A.h"
 #include "SIO/Multitap/MultitapProtocol.h"
 #include "SIO/Pad/Pad.h"
+#include "SIO/Pad/PadBase.h"
 #include "SIO/Sio.h"
 #include "SIO/Sio0.h"
 #include "SIO/Sio2.h"
 #include "SPU2/spu2.h"
 #include "SaveState.h"
+#include "SaveStateRaw.h"
 #include "StateWrapper.h"
 #include "USB/USB.h"
+#include "USB/deviceproxy.h"
 #include "VMManager.h"
+#include "Vif.h"
 #include "VUmicro.h"
 #include "ps2/BiosTools.h"
 
@@ -48,6 +54,68 @@ using namespace R5900;
 
 static tlbs s_tlb_backup[std::size(tlb)];
 
+static bool GetPortableTlbCacheMask(const tlbs& entry, u32* cache_mask)
+{
+	u32 mask_bits = entry.PageMask.UL >> 13;
+	u32 bit_count = 0;
+	while (mask_bits != 0)
+	{
+		bit_count += mask_bits & 1u;
+		mask_bits >>= 1;
+	}
+
+	// COP0.cpp::ConvertPageMask() owns this derived cache metadata and asserts
+	// exactly this contract before shifting by the bit count.
+	if ((bit_count & 1u) != 0 || bit_count > 12u)
+		return false;
+
+	*cache_mask = (1u << (12u + bit_count)) - 1u;
+	return true;
+}
+
+static bool ValidatePortableCachedTlbs()
+{
+	if (cachedTlbs.count > cachedTlbs.PageMasks.size())
+		return false;
+
+	bool matched[std::size(tlb)] = {};
+	size_t expected_count = 0;
+	for (const tlbs& entry : tlb)
+	{
+		if (entry.isSPR() ||
+			!((entry.EntryLo0.V && entry.EntryLo0.isCached()) ||
+				(entry.EntryLo1.V && entry.EntryLo1.isCached())))
+			continue;
+
+		u32 cache_mask = 0;
+		if (!GetPortableTlbCacheMask(entry, &cache_mask))
+			return false;
+
+		++expected_count;
+		bool found = false;
+		for (size_t i = 0; i < cachedTlbs.count; i++)
+		{
+			if (matched[i] || cachedTlbs.PageMasks[i] != cache_mask ||
+				cachedTlbs.PFN0s[i] != entry.PFN0() ||
+				cachedTlbs.PFN1s[i] != entry.PFN1() ||
+				cachedTlbs.CacheEnabled0[i] != (entry.EntryLo0.isCached() ? ~0u : 0u) ||
+				cachedTlbs.CacheEnabled1[i] != (entry.EntryLo1.isCached() ? ~0u : 0u))
+			{
+				continue;
+			}
+
+			matched[i] = true;
+			found = true;
+			break;
+		}
+
+		if (!found)
+			return false;
+	}
+
+	return expected_count == cachedTlbs.count;
+}
+
 static void PreLoadPrep()
 {
 	// ensure everything is in sync before we start overwriting stuff.
@@ -64,10 +132,16 @@ static void PreLoadPrep()
 	VMManager::Internal::ClearCPUExecutionCaches();
 }
 
-static void PostLoadPrep()
+static void PostLoadPrep(bool refresh_vsync = true)
 {
 	resetCache();
 //	WriteCP0Status(cpuRegs.CP0.n.Status.val);
+	// FreezeInternals() has already restored cachedTlbs. UnmapTLB() removes cache
+	// descriptors by PFN/page-mask identity rather than by TLB index, so unmapping
+	// the pre-load table can otherwise delete a restored descriptor when a cached
+	// physical mapping moved to another index or VPN. Preserve the serialized
+	// ordering while rebuilding only the host vTLB map.
+	const cachedTlbs_t restored_cached_tlbs = cachedTlbs;
 	for (int i = 0; i < 48; i++)
 	{
 		if (std::memcmp(&s_tlb_backup[i], &tlb[i], sizeof(tlbs)) != 0)
@@ -76,12 +150,14 @@ static void PostLoadPrep()
 			MapTLB(tlb[i], i);
 		}
 	}
+	cachedTlbs = restored_cached_tlbs;
 
 	if (EmuConfig.Gamefixes.GoemonTlbHack) GoemonPreloadTlb();
 	CBreakPoints::SetSkipFirst(BREAKPOINT_EE, 0);
 	CBreakPoints::SetSkipFirst(BREAKPOINT_IOP, 0);
 
-	UpdateVSyncRate(true);
+	if (refresh_vsync)
+		UpdateVSyncRate(true);
 
 	if (VMManager::Internal::HasBootedELF())
 		R5900SymbolImporter.OnElfLoadedInMemory();
@@ -90,8 +166,9 @@ static void PostLoadPrep()
 // --------------------------------------------------------------------------------------
 //  SaveStateBase  (implementations)
 // --------------------------------------------------------------------------------------
-SaveStateBase::SaveStateBase(VmStateBuffer& memblock)
+SaveStateBase::SaveStateBase(VmStateBuffer& memblock, DataFormat data_format)
 	: m_memory(memblock)
+	, m_data_format(data_format)
 	, m_version(g_SaveVersion)
 {
 }
@@ -158,6 +235,13 @@ bool SaveStateBase::FreezeBios()
 
 	if (bioscheck != BiosChecksum)
 	{
+		if (IsPortableReplay())
+		{
+			Console.Error("Portable replay BIOS checksum mismatch: current=0x%08x state=0x%08x",
+				BiosChecksum, bioscheck);
+			m_error = true;
+			return false;
+		}
 		Console.Error("\n  Warning: BIOS Version Mismatch, savestate may be unstable!");
 		Console.Error(
 			"    Current BIOS:   %s (crc=0x%08x)\n"
@@ -184,11 +268,34 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	if (!FreezeTag("cpuRegs"))
 		return false;
 
-	Freeze(cpuRegs);		// cpu regs + COP0
-	Freeze(psxRegs);		// iop regs
+	if (IsPortableReplay() && IsSaving())
+	{
+		// MachineCheckpointTrace.cpp::CaptureRecord() owns this cross-provider
+		// distinction: code is decoder scratch, not the instruction at the
+		// architectural PC. Canonicalize it without mutating the running VM so an
+		// x86 and A32 continuation can compare every remaining serialized byte.
+		cpuRegisters portable_cpu_regs = cpuRegs;
+		psxRegisters portable_psx_regs = psxRegs;
+		portable_cpu_regs.code = 0;
+		portable_psx_regs.code = 0;
+		Freeze(portable_cpu_regs);
+		Freeze(portable_psx_regs);
+	}
+	else
+	{
+		Freeze(cpuRegs);		// cpu regs + COP0
+		Freeze(psxRegs);		// iop regs
+	}
 	Freeze(fpuRegs);
 	Freeze(tlb);			// tlbs
 	Freeze(cachedTlbs);		// cached tlbs
+	if (IsPortableReplay() && (HasError() || !ValidatePortableCachedTlbs()))
+	{
+		Error::SetString(error,
+			"Portable replay cached-TLB state is inconsistent with the 48 PCSX2 TLB entries.");
+		m_error = true;
+		return false;
+	}
 	Freeze(AllowParams1);	//OSDConfig written (Fast Boot)
 	Freeze(AllowParams2);
 
@@ -249,7 +356,9 @@ bool SaveStateBase::FreezeInternals(Error* error)
 
 		StateWrapper sw(IsSaving() ? static_cast<StateWrapper::IStream*>(&save_stream.value()) :
 									 static_cast<StateWrapper::IStream*>(&load_stream.value()),
-			IsSaving() ? StateWrapper::Mode::Write : StateWrapper::Mode::Read, g_SaveVersion);
+			IsSaving() ? StateWrapper::Mode::Write : StateWrapper::Mode::Read, g_SaveVersion,
+			IsPortableReplay() ? StateWrapper::DataFormat::PortableReplayV1 :
+				StateWrapper::DataFormat::Native);
 
 		okay = okay && g_Sio0.DoState(sw);
 		okay = okay && g_Sio2.DoState(sw);
@@ -293,8 +402,8 @@ bool SaveStateBase::FreezeInternals(Error* error)
 // --------------------------------------------------------------------------------------
 // uncompressed to/from memory state saves implementation
 
-memSavingState::memSavingState(VmStateBuffer& save_to)
-	: SaveStateBase(save_to)
+memSavingState::memSavingState(VmStateBuffer& save_to, DataFormat data_format)
+	: SaveStateBase(save_to, data_format)
 {
 }
 
@@ -314,8 +423,8 @@ void memSavingState::FreezeMem(void* data, int size)
 // --------------------------------------------------------------------------------------
 //  memLoadingState  (implementations)
 // --------------------------------------------------------------------------------------
-memLoadingState::memLoadingState(const VmStateBuffer& load_from)
-	: SaveStateBase(const_cast<VmStateBuffer&>(load_from))
+memLoadingState::memLoadingState(const VmStateBuffer& load_from, DataFormat data_format)
+	: SaveStateBase(const_cast<VmStateBuffer&>(load_from), data_format)
 {
 }
 
@@ -435,10 +544,12 @@ static bool SysState_ComponentFreezeInNew(zip_file_t* zf, const char* name, bool
 	return do_state_func(sw);
 }
 
-static bool SysState_ComponentFreezeOutNew(SaveStateBase& writer, const char* name, u32 reserve, bool (*do_state_func)(StateWrapper&))
+static bool SysState_ComponentFreezeOutNew(SaveStateBase& writer, const char* name, u32 reserve,
+	bool (*do_state_func)(StateWrapper&),
+	StateWrapper::DataFormat data_format = StateWrapper::DataFormat::Native)
 {
 	StateWrapper::VectorMemoryStream stream(reserve);
-	StateWrapper sw(&stream, StateWrapper::Mode::Write, g_SaveVersion);
+	StateWrapper sw(&stream, StateWrapper::Mode::Write, g_SaveVersion, data_format);
 
 	if (!do_state_func(sw))
 		return false;
@@ -753,6 +864,368 @@ std::unique_ptr<ArchiveEntryList> SaveState_DownloadState(Error* error)
 	}
 
 	return destlist;
+}
+
+namespace
+{
+	static constexpr std::array<std::string_view, 16> PORTABLE_ENTRY_NAMES = {{
+		SaveStateRaw::PORTABLE_VERSION_ENTRY_NAME,
+		"PCSX2 Internal Structures.dat", "eeMemory.bin", "iopMemory.bin",
+		"eeHwRegs.bin", "iopHwRegs.bin", "Scratchpad.bin", "vu0Memory.bin",
+		"vu1Memory.bin", "vu0MicroMem.bin", "vu1MicroMem.bin", "SPU2.bin",
+		"USB.bin", "PAD.bin", "GS.bin", "Achievements.bin",
+	}};
+
+	std::span<const u8> GetPortableEntrySpan(const ArchiveEntryList& entries, u32 index)
+	{
+		const ArchiveEntry& entry = entries[index];
+		return std::span<const u8>(entries.GetBuffer()).subspan(
+			static_cast<size_t>(entry.GetDataIndex()), entry.GetDataSize());
+	}
+
+	bool LoadPortableStateWrapperEntry(std::span<const u8> data,
+		bool (*do_state_func)(StateWrapper&))
+	{
+		StateWrapper::ReadOnlyMemoryStream stream(data.data(), data.size());
+		StateWrapper sw(&stream, StateWrapper::Mode::Read, g_SaveVersion,
+			StateWrapper::DataFormat::PortableReplayV1);
+		return do_state_func(sw) && sw.IsGood() && stream.GetPosition() == data.size();
+	}
+
+	bool LoadPortableLegacyComponent(std::span<const u8> data, SysState_Component component)
+	{
+		freezeData state = {};
+		if (component.freeze(FreezeAction::Size, &state) != 0 || state.size < 0 ||
+			static_cast<size_t>(state.size) != data.size())
+		{
+			return false;
+		}
+		state.data = const_cast<u8*>(data.data());
+		return component.freeze(FreezeAction::Load, &state) == 0;
+	}
+
+	bool ValidatePortableBiosHeader(std::span<const u8> data, Error* error)
+	{
+		static constexpr size_t BIOS_TAG_SIZE = 32;
+		static constexpr size_t BIOS_DESCRIPTION_SIZE = 256;
+		static constexpr size_t BIOS_HEADER_SIZE =
+			BIOS_TAG_SIZE + sizeof(u32) + BIOS_DESCRIPTION_SIZE;
+		if (data.size() < BIOS_HEADER_SIZE)
+		{
+			Error::SetStringView(error, "Portable replay BIOS header is truncated.");
+			return false;
+		}
+		std::array<u8, BIOS_TAG_SIZE> expected_tag = {};
+		std::memcpy(expected_tag.data(), "BIOS", 4);
+		if (!std::equal(expected_tag.begin(), expected_tag.end(), data.begin()))
+		{
+			Error::SetStringView(error, "Portable replay BIOS marker is invalid.");
+			return false;
+		}
+		u32 state_checksum = 0;
+		std::memcpy(&state_checksum, data.data() + BIOS_TAG_SIZE, sizeof(state_checksum));
+		if (state_checksum != BiosChecksum)
+		{
+			Error::SetStringFmt(error,
+				"Portable replay BIOS checksum mismatch (state {:08x}, current {:08x}).",
+				state_checksum, BiosChecksum);
+			return false;
+		}
+		return true;
+	}
+} // namespace
+
+std::unique_ptr<ArchiveEntryList> SaveState_DownloadPortableState(Error* error)
+{
+	// Cache.cpp owns PS2-visible EE data-cache contents. The portable format
+	// does not yet encode them and PostLoadPrep() clears them, so reject rather
+	// than silently changing the captured machine state.
+	if (EmuConfig.Cpu.Recompiler.EnableEECache || !isCacheEmpty())
+	{
+		Error::SetStringView(error,
+			"Portable replay capture requires EE data-cache emulation disabled and an empty EE data cache.");
+		return nullptr;
+	}
+	if (THREAD_VU1 || (VU0.VI[REG_VPU_STAT].UL & 0x101u) != 0)
+	{
+		Error::SetStringView(error,
+			"Portable replay capture requires MTVU disabled and both VUs idle.");
+		return nullptr;
+	}
+	if (!EmuConfig.GS.SynchronousMTGS)
+	{
+		Error::SetStringView(error,
+			"Portable replay capture requires synchronous MTGS.");
+		return nullptr;
+	}
+	if (Achievements::IsActive())
+	{
+		Error::SetStringView(error,
+			"Portable replay capture requires achievements to be inactive.");
+		return nullptr;
+	}
+	if (!GSValidatePortableState())
+	{
+		Error::SetStringView(error,
+			"Portable replay capture found an unsafe GS transfer continuation.");
+		return nullptr;
+	}
+	for (u32 port = 0; port < Pad::NUM_CONTROLLER_PORTS; port++)
+	{
+		if (!Pad::GetPad(static_cast<u8>(port)) ||
+			Pad::GetPad(static_cast<u8>(port))->GetType() != Pad::ControllerType::NotConnected)
+		{
+			Error::SetStringView(error,
+				"Portable replay capture currently requires every pad port disconnected.");
+			return nullptr;
+		}
+	}
+	for (u32 port = 0; port < Pcsx2Config::USBOptions::NUM_PORTS; port++)
+	{
+		if (EmuConfig.USB.Ports[port].DeviceType != DEVTYPE_NONE)
+		{
+			Error::SetStringView(error,
+				"Portable replay capture currently requires every USB port disconnected.");
+			return nullptr;
+		}
+	}
+
+	std::unique_ptr<ArchiveEntryList> entries = std::make_unique<ArchiveEntryList>();
+	entries->GetBuffer().resize(64 * 1024 * 1024);
+	memSavingState state(entries->GetBuffer(), SaveStateBase::DataFormat::PortableReplayV1);
+
+	const auto add_entry = [&](std::string_view name, uint start) {
+		entries->Add(ArchiveEntry(std::string(name))
+			.SetDataIndex(start).SetDataSize(state.GetCurrentPos() - start));
+	};
+
+	uint start = state.GetCurrentPos();
+	state.FreezeMem(const_cast<u8*>(SaveStateRaw::PORTABLE_VERSION_ENTRY_PAYLOAD.data()),
+		static_cast<int>(SaveStateRaw::PORTABLE_VERSION_ENTRY_PAYLOAD.size()));
+	add_entry(PORTABLE_ENTRY_NAMES[0], start);
+
+	start = state.GetCurrentPos();
+	if (!state.FreezeBios() || !state.FreezeInternals(error))
+	{
+		if (!error->IsValid())
+			Error::SetString(error, "Portable internal-state serialization failed.");
+		return nullptr;
+	}
+	add_entry(PORTABLE_ENTRY_NAMES[1], start);
+
+	for (u32 source_index = 0; source_index < std::size(SavestateEntries); source_index++)
+	{
+		const std::unique_ptr<BaseSavestateEntry>& entry = SavestateEntries[source_index];
+		start = state.GetCurrentPos();
+		bool okay = true;
+		if (std::strcmp(entry->GetFilename(), "SPU2.bin") == 0)
+		{
+			okay = SysState_ComponentFreezeOutNew(state, "SPU2-portable", 3 * 1024 * 1024,
+				&SPU2::DoPortableState, StateWrapper::DataFormat::PortableReplayV1);
+		}
+		else if (std::strcmp(entry->GetFilename(), "USB.bin") == 0)
+		{
+			okay = SysState_ComponentFreezeOutNew(state, "USB-portable", 16 * 1024,
+				&USB::DoState, StateWrapper::DataFormat::PortableReplayV1);
+		}
+		else if (std::strcmp(entry->GetFilename(), "PAD.bin") == 0)
+		{
+			okay = SysState_ComponentFreezeOutNew(state, "PAD-portable", 16 * 1024,
+				&Pad::Freeze, StateWrapper::DataFormat::PortableReplayV1);
+		}
+		else if (std::strcmp(entry->GetFilename(), "Achievements.bin") == 0)
+		{
+			// Achievements are desktop frontend state, not PS2 machine state. Keep
+			// the canonical transport entry present and empty.
+			okay = true;
+		}
+		else
+		{
+			okay = entry->FreezeOut(state);
+		}
+		if (!okay || !state.IsOkay())
+		{
+			Error::SetString(error,
+				fmt::format("Portable serialization failed for {}.", entry->GetFilename()));
+			return nullptr;
+		}
+		add_entry(PORTABLE_ENTRY_NAMES[source_index + 2], start);
+	}
+
+	return entries;
+}
+
+PortableStateLoadResult SaveState_LoadPortableState(
+	const ArchiveEntryList& entries, Error* error)
+{
+	if (EmuConfig.Cpu.Recompiler.EnableEECache || !isCacheEmpty())
+	{
+		Error::SetStringView(error,
+			"Portable replay load requires EE data-cache emulation disabled and an empty EE data cache.");
+		return PortableStateLoadResult::RejectedBeforeMutation;
+	}
+	if (THREAD_VU1 || (VU0.VI[REG_VPU_STAT].UL & 0x101u) != 0 ||
+		!EmuConfig.GS.SynchronousMTGS)
+	{
+		Error::SetStringView(error,
+			"Portable replay load requires synchronous MTGS, MTVU disabled, and both VUs idle.");
+		return PortableStateLoadResult::RejectedBeforeMutation;
+	}
+	if (Achievements::IsActive())
+	{
+		Error::SetStringView(error,
+			"Portable replay load requires achievements to be inactive.");
+		return PortableStateLoadResult::RejectedBeforeMutation;
+	}
+	for (u32 port = 0; port < Pad::NUM_CONTROLLER_PORTS; port++)
+	{
+		if (!Pad::GetPad(static_cast<u8>(port)) ||
+			Pad::GetPad(static_cast<u8>(port))->GetType() != Pad::ControllerType::NotConnected)
+		{
+			Error::SetStringView(error,
+				"Portable replay load currently requires every pad port disconnected.");
+			return PortableStateLoadResult::RejectedBeforeMutation;
+		}
+	}
+	for (u32 port = 0; port < Pcsx2Config::USBOptions::NUM_PORTS; port++)
+	{
+		if (EmuConfig.USB.Ports[port].DeviceType != DEVTYPE_NONE)
+		{
+			Error::SetStringView(error,
+				"Portable replay load currently requires every USB port disconnected.");
+			return PortableStateLoadResult::RejectedBeforeMutation;
+		}
+	}
+	if (entries.GetLength() != PORTABLE_ENTRY_NAMES.size())
+	{
+		Error::SetStringFmt(error, "Portable replay state has {} entries, expected {}.",
+			entries.GetLength(), PORTABLE_ENTRY_NAMES.size());
+		return PortableStateLoadResult::RejectedBeforeMutation;
+	}
+
+	const std::vector<u8>& source = entries.GetBuffer();
+	for (u32 i = 0; i < PORTABLE_ENTRY_NAMES.size(); i++)
+	{
+		const ArchiveEntry& entry = entries[i];
+		if (entry.GetFilename() != PORTABLE_ENTRY_NAMES[i])
+		{
+			Error::SetStringFmt(error, "Portable replay entry {} is '{}', expected '{}'.",
+				i, entry.GetFilename(), PORTABLE_ENTRY_NAMES[i]);
+			return PortableStateLoadResult::RejectedBeforeMutation;
+		}
+		const u64 begin = entry.GetDataIndex();
+		const u64 size = entry.GetDataSize();
+		if (begin > source.size() || size > source.size() - begin)
+		{
+			Error::SetStringFmt(error, "Portable replay entry '{}' is out of bounds.",
+				entry.GetFilename());
+			return PortableStateLoadResult::RejectedBeforeMutation;
+		}
+		if (size != 0)
+		{
+			for (u32 previous = 0; previous < i; previous++)
+			{
+				const ArchiveEntry& other = entries[previous];
+				const u64 other_begin = other.GetDataIndex();
+				const u64 other_size = other.GetDataSize();
+				if (other_size != 0 && begin < other_begin + other_size && other_begin < begin + size)
+				{
+					Error::SetString(error, "Portable replay entries overlap.");
+					return PortableStateLoadResult::RejectedBeforeMutation;
+				}
+			}
+		}
+	}
+
+	const auto size_is = [&](u32 index, size_t expected) {
+		return entries[index].GetDataSize() == expected;
+	};
+	if (!size_is(0, SaveStateRaw::PORTABLE_VERSION_ENTRY_PAYLOAD.size()) ||
+		!std::equal(SaveStateRaw::PORTABLE_VERSION_ENTRY_PAYLOAD.begin(),
+			SaveStateRaw::PORTABLE_VERSION_ENTRY_PAYLOAD.end(), GetPortableEntrySpan(entries, 0).begin()) ||
+		entries[1].GetDataSize() == 0 ||
+		!size_is(2, Ps2MemSize::ExposedRam) || !size_is(3, Ps2MemSize::ExposedIopRam) ||
+		!size_is(4, sizeof(eeHw)) || !size_is(5, sizeof(iopHw)) ||
+		!size_is(6, sizeof(eeMem->Scratch)) || !size_is(7, VU0_MEMSIZE) ||
+		!size_is(8, VU1_MEMSIZE) || !size_is(9, VU0_PROGSIZE) ||
+		!size_is(10, VU1_PROGSIZE) || entries[11].GetDataSize() == 0 ||
+		entries[12].GetDataSize() == 0 || entries[13].GetDataSize() == 0 ||
+		entries[14].GetDataSize() == 0 || entries[15].GetDataSize() != 0)
+	{
+		Error::SetString(error, "Portable replay entry sizes do not match the PCSX2 schema.");
+		return PortableStateLoadResult::RejectedBeforeMutation;
+	}
+	if (!ValidatePortableBiosHeader(GetPortableEntrySpan(entries, 1), error))
+		return PortableStateLoadResult::RejectedBeforeMutation;
+
+	freezeData gs_size = {};
+	if (GS.freeze(FreezeAction::Size, &gs_size) != 0 || gs_size.size < 0 ||
+		static_cast<size_t>(gs_size.size) != entries[14].GetDataSize())
+	{
+		Error::SetString(error, "Portable replay GS entry size is incompatible.");
+		return PortableStateLoadResult::RejectedBeforeMutation;
+	}
+
+	PreLoadPrep();
+	const std::span<const u8> internal = GetPortableEntrySpan(entries, 1);
+	SaveStateBase::VmStateBuffer internal_buffer(internal.begin(), internal.end());
+	memLoadingState state(internal_buffer, SaveStateBase::DataFormat::PortableReplayV1);
+	if (!state.FreezeBios() || !state.FreezeInternals(error) || !state.IsOkay() ||
+		state.GetCurrentPos() != internal.size())
+	{
+		if (!error->IsValid())
+			Error::SetString(error, "Portable replay internal state is corrupt or under-consumed.");
+		VMManager::Reset();
+		return PortableStateLoadResult::FailedAfterMutation;
+	}
+
+	std::memcpy(eeMem->Main, GetPortableEntrySpan(entries, 2).data(), Ps2MemSize::ExposedRam);
+	std::memcpy(iopMem->Main, GetPortableEntrySpan(entries, 3).data(), Ps2MemSize::ExposedIopRam);
+	std::memcpy(eeHw, GetPortableEntrySpan(entries, 4).data(), sizeof(eeHw));
+	std::memcpy(iopHw, GetPortableEntrySpan(entries, 5).data(), sizeof(iopHw));
+	std::memcpy(eeMem->Scratch, GetPortableEntrySpan(entries, 6).data(), sizeof(eeMem->Scratch));
+	std::memcpy(VU0.Mem, GetPortableEntrySpan(entries, 7).data(), VU0_MEMSIZE);
+	std::memcpy(VU1.Mem, GetPortableEntrySpan(entries, 8).data(), VU1_MEMSIZE);
+	std::memcpy(VU0.Micro, GetPortableEntrySpan(entries, 9).data(), VU0_PROGSIZE);
+	std::memcpy(VU1.Micro, GetPortableEntrySpan(entries, 10).data(), VU1_PROGSIZE);
+
+	if (!vifValidatePortableRegisters())
+	{
+		Error::SetString(error,
+			"Portable replay VIF hardware registers are unsafe or inconsistent with active UNPACK state.");
+		return PortableStateLoadResult::FailedAfterMutation;
+	}
+	if (!ipuValidatePortableState() || !ipuValidatePortableDmaState())
+	{
+		Error::SetString(error,
+			"Portable replay IPU state is unsafe or inconsistent with its FIFO, command, or DMA registers.");
+		return PortableStateLoadResult::FailedAfterMutation;
+	}
+
+	if (!LoadPortableStateWrapperEntry(GetPortableEntrySpan(entries, 11), &SPU2::DoPortableState) ||
+		!LoadPortableStateWrapperEntry(GetPortableEntrySpan(entries, 12), &USB::DoState) ||
+		!LoadPortableStateWrapperEntry(GetPortableEntrySpan(entries, 13), &Pad::Freeze) ||
+		!LoadPortableLegacyComponent(GetPortableEntrySpan(entries, 14), GS))
+	{
+		Error::SetString(error, "Portable replay device state is corrupt or under-consumed.");
+		VMManager::Reset();
+		return PortableStateLoadResult::FailedAfterMutation;
+	}
+	if (!GSValidatePortableState())
+	{
+		Error::SetString(error,
+			"Portable replay GS transfer continuation is out of bounds.");
+		return PortableStateLoadResult::FailedAfterMutation;
+	}
+
+	PostLoadPrep(false);
+	if (!ValidatePortableCachedTlbs())
+	{
+		Error::SetString(error,
+			"Portable replay post-load TLB remapping corrupted the restored cached-TLB descriptors.");
+		return PortableStateLoadResult::FailedAfterMutation;
+	}
+	return PortableStateLoadResult::Loaded;
 }
 
 std::unique_ptr<SaveStateScreenshotData> SaveState_SaveScreenshot()

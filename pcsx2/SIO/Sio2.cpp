@@ -29,6 +29,15 @@ Sio2ByteFifo g_Sio2FifoOut;
 
 Sio2 g_Sio2;
 
+namespace
+{
+	static constexpr u32 PORTABLE_SIO2_INPUT_FIFO_LIMIT = 0xffffu * 4u;
+	// DMA11's BCR can append more than one padded response block, so one block
+	// is not a complete output bound. A retail portable replay cannot consume
+	// more than its 2 MiB IOP RAM without wrapping; reject a larger retained FIFO.
+	static constexpr u32 PORTABLE_SIO2_OUTPUT_FIFO_LIMIT = Ps2MemSize::IopRam;
+}
+
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSio2FifoBulkReadBytes = 0;
 u32 g_qemuSio2FifoBulkWriteBytes = 0;
@@ -396,10 +405,15 @@ void Sio2ByteFifo::reserve(size_t capacity)
 	m_data.reserve(capacity);
 }
 
-void Sio2ByteFifo::DoState(StateWrapper& sw)
+bool Sio2ByteFifo::DoState(StateWrapper& sw, u32 portable_limit)
 {
+	if (sw.IsPortableReplay() && size() > portable_limit)
+		return false;
+
 	u32 length = static_cast<u32>(size());
 	sw.Do(&length);
+	if (sw.HasError() || (sw.IsPortableReplay() && length > portable_limit))
+		return false;
 
 	if (sw.IsReading())
 	{
@@ -421,6 +435,7 @@ void Sio2ByteFifo::DoState(StateWrapper& sw)
 			sw.Do(&value);
 		}
 	}
+	return sw.IsGood();
 }
 
 void Sio2ByteFifo::CompactConsumed()
@@ -810,7 +825,7 @@ void Sio2::Write(u8 data)
 	if (!queueRead)
 	{
 		// No more queue positions to access, but the game is still sending us SIO2 writes. Lets ignore them.
-		if (queuePosition > CmdQueue.size())
+		if (queuePosition >= CmdQueue.size())
 		{
 			Console.Warning("%s(%02X) Received data after exhausting all queue entries!", __FUNCTION__, data);
 			return;
@@ -868,7 +883,7 @@ void Sio2::WriteBytes(const u8* source, size_t bytes)
 	}
 
 	// No more queue positions to access, but the game is still sending us SIO2 writes. Lets ignore them.
-	if (queuePosition > CmdQueue.size())
+	if (queuePosition >= CmdQueue.size())
 	{
 		Console.Warning("%s(%02X) Received data after exhausting all queue entries!", __FUNCTION__, source[0]);
 		return;
@@ -996,14 +1011,50 @@ bool Sio2::DoState(StateWrapper& sw)
 	sw.Do(&iStat);
 	sw.Do(&port);
 	sw.Do(&queueRead);
-	sw.Do(&queuePosition);
-	sw.Do(&commandLength);
-	sw.Do(&processedLength);
-	sw.Do(&dmaBlockSize);
+	if (sw.IsPortableReplay())
+	{
+		auto do_portable_size = [&](size_t& value, u32 maximum) {
+			if (sw.IsWriting() && value > maximum)
+				return false;
+			u32 portable_value = static_cast<u32>(value);
+			sw.Do(&portable_value);
+			if (sw.HasError() || portable_value > maximum)
+				return false;
+			if (sw.IsReading())
+				value = portable_value;
+			return true;
+		};
+		if (!do_portable_size(queuePosition, static_cast<u32>(CmdQueue.size())) ||
+			!do_portable_size(commandLength, Sio2Cmd::COMMAND_LENGTH_MASK) ||
+			!do_portable_size(processedLength, Sio2Cmd::COMMAND_LENGTH_MASK) ||
+			!do_portable_size(dmaBlockSize, 0xffffu * 4u))
+		{
+			Console.Error("Portable replay SIO2 transfer state is invalid.");
+			return false;
+		}
+	}
+	else
+	{
+		sw.Do(&queuePosition);
+		sw.Do(&commandLength);
+		sw.Do(&processedLength);
+		sw.Do(&dmaBlockSize);
+	}
 	sw.Do(&queueComplete);
+	if (sw.IsPortableReplay() &&
+		(sw.HasError() || port >= SIO::PORTS ||
+		 (!queueComplete && queuePosition >= CmdQueue.size())))
+	{
+		Console.Error("Portable replay SIO2 queue provenance is invalid.");
+		return false;
+	}
 
-	g_Sio2FifoIn.DoState(sw);
-	g_Sio2FifoOut.DoState(sw);
+	if (!g_Sio2FifoIn.DoState(sw, PORTABLE_SIO2_INPUT_FIFO_LIMIT) ||
+		!g_Sio2FifoOut.DoState(sw, PORTABLE_SIO2_OUTPUT_FIFO_LIMIT))
+	{
+		Console.Error("Portable replay SIO2 FIFO state is invalid.");
+		return false;
+	}
 
 	// CRCs for memory cards.
 	// If the memory card hasn't changed when loading state, we can safely skip ejecting it.
@@ -1027,6 +1078,12 @@ bool Sio2::DoState(StateWrapper& sw)
 			{
 				if (mcdCrcs[port][slot] != mcds[port][slot].GetChecksum())
 				{
+					if (sw.IsPortableReplay())
+					{
+						Console.Error("Portable replay memory-card backing data does not match slot %u:%u.",
+							port, slot);
+						return false;
+					}
 					AutoEject::SetAll();
 					ejected = true;
 					break;
@@ -1034,6 +1091,8 @@ bool Sio2::DoState(StateWrapper& sw)
 			}
 		}
 	}
+	if (sw.IsPortableReplay() && !sioDoPortableMemoryCardState(sw))
+		return false;
 
 	sw.Do(&sioLastFrameMcdBusy);
 	return sw.IsGood();

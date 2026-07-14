@@ -75,6 +75,7 @@ void GSvsync(u32 field, bool registers_written);
 void GSTraceStateSnapshot(u8 trigger);
 const u8* GSTraceLocalMemoryData(size_t* size);
 int GSfreeze(FreezeAction mode, freezeData* data);
+bool GSValidatePortableState();
 std::string GSGetBaseSnapshotFilename();
 std::string GSGetBaseVideoFilename();
 void GSQueueSnapshot(const std::string& path, u32 gsdump_frames = 0);

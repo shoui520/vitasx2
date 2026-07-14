@@ -11,6 +11,8 @@
 #include <limits.h>
 #include "Config.h"
 
+#include <cstddef>
+
 // the BP doesn't advance and returns -1 if there is no data to be read
 alignas(16) tIPU_cmd ipu_cmd;
 alignas(16) tIPU_BP g_BP;
@@ -43,6 +45,149 @@ alignas(16) const int non_linear_quantizer_scale[32] =
 u64 eecount_on_last_vdec = 0;
 bool FMVstarted = false;
 bool EnableFMV = false;
+
+namespace
+{
+bool PortableIpuBoolIsCanonical(const bool& value)
+{
+	u8 raw = 0;
+	static_assert(sizeof(raw) == sizeof(value));
+	std::memcpy(&raw, &value, sizeof(raw));
+	return raw <= 1;
+}
+
+bool PortableIpuPositionsAreZeroFrom(size_t first)
+{
+	for (size_t i = first; i < std::size(ipu_cmd.pos); i++)
+	{
+		if (ipu_cmd.pos[i] != 0)
+			return false;
+	}
+	return true;
+}
+
+bool PortableIpuFifoPositionIsValid(int position)
+{
+	return position >= 0 && position < 32 && (position & 3) == 0;
+}
+
+bool PortableIpuCommandProgressIsValid()
+{
+	if (!ipuRegs.ctrl.BUSY)
+		return true;
+
+	switch (ipu_cmd.CMD)
+	{
+		case SCE_IPU_IDEC:
+		case SCE_IPU_BDEC:
+			// mpeg2sliceIDEC()/mpeg2_slice() retain a DCT-table pointer,
+			// macroblock-address count, and output-delay latches in function
+			// statics outside ipuFreeze(). Their values can affect any later stage
+			// of an active decode, so cross-process continuation is not exact.
+			return false;
+
+		case SCE_IPU_VDEC:
+			return ipu_cmd.index == 0 && ipu_cmd.pos[0] >= 0 && ipu_cmd.pos[0] <= 1 &&
+				PortableIpuPositionsAreZeroFrom(1);
+
+		case SCE_IPU_FDEC:
+			return ipu_cmd.index == 0 && PortableIpuPositionsAreZeroFrom(0);
+
+		case SCE_IPU_SETIQ:
+			return ipu_cmd.index == 0 && ipu_cmd.pos[0] >= 0 && ipu_cmd.pos[0] < 8 &&
+				PortableIpuPositionsAreZeroFrom(1);
+
+		case SCE_IPU_SETVQ:
+			return ipu_cmd.index == 0 && ipu_cmd.pos[0] >= 0 && ipu_cmd.pos[0] < 4 &&
+				PortableIpuPositionsAreZeroFrom(1);
+
+		case SCE_IPU_CSC:
+		{
+			const tIPU_CMD_CSC command(ipu_cmd.current);
+			const int output_qwc = command.OFM ? 32 : 64;
+			return command.MBC != 0 && ipu_cmd.index >= 0 &&
+				static_cast<u32>(ipu_cmd.index) < command.MBC &&
+				ipu_cmd.pos[0] >= 0 && ipu_cmd.pos[0] <= 48 &&
+				ipu_cmd.pos[1] >= 0 && ipu_cmd.pos[1] < output_qwc &&
+				(ipu_cmd.pos[0] == 48 || ipu_cmd.pos[1] == 0) &&
+				PortableIpuPositionsAreZeroFrom(2);
+		}
+
+		case SCE_IPU_PACK:
+		{
+			const tIPU_CMD_CSC command(ipu_cmd.current);
+			const int output_qwc = command.OFM ? 32 : 8;
+			return command.MBC != 0 && ipu_cmd.index >= 0 &&
+				static_cast<u32>(ipu_cmd.index) < command.MBC &&
+				ipu_cmd.pos[0] >= 0 && ipu_cmd.pos[0] <= 128 &&
+				ipu_cmd.pos[1] >= 0 && ipu_cmd.pos[1] < output_qwc &&
+				(ipu_cmd.pos[0] == 128 || ipu_cmd.pos[1] == 0) &&
+				PortableIpuPositionsAreZeroFrom(2);
+		}
+
+		// BCLR and SETTH execute synchronously in IPUCMD_WRITE(). Unknown command
+		// values likewise have no resumable IPUWorker() owner.
+		default:
+			return false;
+	}
+}
+} // namespace
+
+bool ipuValidatePortableState()
+{
+	if (!PortableIpuFifoPositionIsValid(ipu_fifo.in.readpos) ||
+		!PortableIpuFifoPositionIsValid(ipu_fifo.in.writepos) ||
+		!PortableIpuFifoPositionIsValid(ipu_fifo.out.readpos) ||
+		!PortableIpuFifoPositionIsValid(ipu_fifo.out.writepos) ||
+		g_BP.BP > 127 || g_BP.IFC > 8 || g_BP.FP > 2 ||
+		ipuRegs.ctrl.OFC > 8)
+	{
+		return false;
+	}
+
+	if (((ipu_fifo.in.readpos + static_cast<int>(g_BP.IFC * 4)) & 31) !=
+		ipu_fifo.in.writepos ||
+		((ipu_fifo.out.readpos + static_cast<int>(ipuRegs.ctrl.OFC * 4)) & 31) !=
+		ipu_fifo.out.writepos)
+	{
+		return false;
+	}
+
+	constexpr size_t output_begin = offsetof(decoder_t, mb8);
+	constexpr size_t output_end = offsetof(decoder_t, ipu0_data);
+	static_assert(output_end > output_begin && ((output_end - output_begin) % 16) == 0);
+	constexpr u32 output_capacity_qwc = static_cast<u32>((output_end - output_begin) / 16);
+	if (decoder.ipu0_idx > output_capacity_qwc ||
+		decoder.ipu0_data > output_capacity_qwc - decoder.ipu0_idx)
+	{
+		return false;
+	}
+
+	if (!PortableIpuBoolIsCanonical(decoder.scantype) ||
+		!PortableIpuBoolIsCanonical(IPUCoreStatus.DataRequested) ||
+		!PortableIpuBoolIsCanonical(IPUCoreStatus.WaitingOnIPUFrom) ||
+		!PortableIpuBoolIsCanonical(IPUCoreStatus.WaitingOnIPUTo) ||
+		decoder.quantizer_scale < 0 || decoder.quantizer_scale > 112 ||
+		decoder.coding_type < 0 || decoder.coding_type > 7 ||
+		decoder.intra_dc_precision < 0 || decoder.intra_dc_precision > 3 ||
+		decoder.picture_structure < TOP_FIELD || decoder.picture_structure > FRAME_PICTURE ||
+		decoder.frame_pred_frame_dct < 0 || decoder.frame_pred_frame_dct > 1 ||
+		decoder.concealment_motion_vectors < 0 || decoder.concealment_motion_vectors > 1 ||
+		decoder.q_scale_type < 0 || decoder.q_scale_type > 1 ||
+		decoder.intra_vlc_format < 0 || decoder.intra_vlc_format > 1 ||
+		decoder.top_field_first < 0 || decoder.top_field_first > 1 ||
+		decoder.sgn < 0 || decoder.sgn > 1 || decoder.dte < 0 || decoder.dte > 1 ||
+		decoder.ofm < 0 || decoder.ofm > 1 || decoder.dcr < 0 || decoder.dcr > 1 ||
+		decoder.mpeg1 < 0 || decoder.mpeg1 > 1 ||
+		decoder.coded_block_pattern < 0 || decoder.coded_block_pattern > 0x3f ||
+		coded_block_pattern < 0 || coded_block_pattern > 0x3f ||
+		g_ipu_thresh[0] > 0x1ff || g_ipu_thresh[1] > 0x1ff)
+	{
+		return false;
+	}
+
+	return PortableIpuCommandProgressIsValid();
+}
 
 // Also defined in IPU_MultiISA.cpp, but IPU.cpp is not unshared.
 // whenever reading fractions of bytes. The low bits always come from the next byte
@@ -135,6 +280,12 @@ bool SaveStateBase::ipuFreeze()
 	Freeze(decoder);
 	Freeze(ipu_cmd);
 	Freeze(IPUCoreStatus);
+
+	if (IsPortableReplay() && IsSaving() && !ipuValidatePortableState())
+	{
+		Console.Error("Portable replay capture rejected unsafe or incomplete IPU continuation state.");
+		m_error = true;
+	}
 
 	return IsOkay();
 }

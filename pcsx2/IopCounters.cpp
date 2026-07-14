@@ -804,7 +804,11 @@ bool SaveStateBase::psxRcntFreeze()
 	if (!IsOkay())
 		return false;
 
-	if (IsLoading())
+	// Normal .p2s loading repairs its configuration-tolerant timer schedule.
+	// Portable replay already restores the exact IOP counter/deadline and device
+	// state. psxRcntUpdate() would advance USB/SPU2/DEV9 and may raise an IRQ
+	// before the first replay instruction, destroying that boundary.
+	if (IsLoading() && !IsPortableReplay())
 		psxRcntUpdate();
 
 	return true;

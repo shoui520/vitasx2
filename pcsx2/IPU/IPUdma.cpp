@@ -9,6 +9,83 @@
 
 IPUDMAStatus IPU1Status;
 
+namespace
+{
+bool PortableIpuDmaBoolIsCanonical(const bool& value)
+{
+	u8 raw = 0;
+	static_assert(sizeof(raw) == sizeof(value));
+	std::memcpy(&raw, &value, sizeof(raw));
+	return raw <= 1;
+}
+
+bool PortableIpuDmaSpanIsValid(u32 address, u32 bytes)
+{
+	if (bytes == 0)
+		return true;
+
+	if ((address & 0x80000000u) != 0)
+	{
+		const u32 offset = address & 0x3ff0u;
+		return bytes <= Ps2MemSize::Scratch - offset;
+	}
+
+	const u32 physical = address & 0x1ffffff0u;
+	if (physical < Ps2MemSize::ExposedRam)
+		return bytes <= Ps2MemSize::ExposedRam - physical;
+	if (physical < 0x10000000u)
+		return bytes <= _1mb;
+	if (physical < 0x10004000u)
+	{
+		const u32 offset = physical & 0x3ff0u;
+		return bytes <= Ps2MemSize::Scratch - offset;
+	}
+
+	return false;
+}
+} // namespace
+
+bool ipuValidatePortableDmaState()
+{
+	if (!PortableIpuDmaBoolIsCanonical(IPU1Status.InProgress) ||
+		!PortableIpuDmaBoolIsCanonical(IPU1Status.DMAFinished) ||
+		ipu0ch.qwc > 0x10000u || ipu1ch.qwc > 0x10000u ||
+		ipu0ch.chcr.MOD > 2 || ipu1ch.chcr.MOD > 2)
+	{
+		return false;
+	}
+
+	if (IPU1Status.InProgress && ipu1ch.qwc == 0)
+		return false;
+
+	if (ipu0ch.chcr.STR && ipu0ch.qwc != 0)
+	{
+		if (ipu0ch.chcr.MOD != NORMAL_MODE || ipu0ch.chcr.TTE)
+			return false;
+
+		const u32 transfer_qwc = std::min(ipu0ch.qwc, static_cast<u32>(ipuRegs.ctrl.OFC));
+		if (!PortableIpuDmaSpanIsValid(ipu0ch.madr, transfer_qwc << 4))
+			return false;
+	}
+
+	if (ipu1ch.chcr.STR)
+	{
+		if (IPU1Status.InProgress)
+		{
+			const u32 transfer_qwc = std::min(ipu1ch.qwc, 8u - g_BP.IFC);
+			if (!PortableIpuDmaSpanIsValid(ipu1ch.madr, transfer_qwc << 4))
+				return false;
+		}
+		else if (!IPU1Status.DMAFinished &&
+			!PortableIpuDmaSpanIsValid(ipu1ch.tadr, sizeof(tDMA_TAG) * 2))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
 void ipuDmaReset()
 {
 	IPU1Status.InProgress	= false;
@@ -21,6 +98,11 @@ bool SaveStateBase::ipuDmaFreeze()
 		return false;
 
 	Freeze(IPU1Status);
+	if (IsPortableReplay() && IsSaving() && !ipuValidatePortableDmaState())
+	{
+		Console.Error("Portable replay capture rejected unsafe or inconsistent IPU DMA state.");
+		m_error = true;
+	}
 	return IsOkay();
 }
 

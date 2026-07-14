@@ -545,7 +545,6 @@ __fi void _cpuEventTest_Shared()
 	// Apply vsync and other counter nextCycles
 	cpuSetNextEvent(nextStartCounter, nextDeltaCounter);
 
-	eeEventTestIsActive = false;
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
 	TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
 		Pcsx2Trace::CoreEventPhase::Exit, Pcsx2Trace::CoreEventId::None,
@@ -554,6 +553,7 @@ __fi void _cpuEventTest_Shared()
 #if defined(VITASX2_QEMU_VALIDATION)
 	Pcsx2Trace::RecordPendingMachineCheckpointAtEventTest();
 #endif
+	eeEventTestIsActive = false;
 }
 
 __ri void cpuTestINTCInts()

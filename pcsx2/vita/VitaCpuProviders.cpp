@@ -1334,7 +1334,11 @@ void vtlb_DynBackpatchLoadStore(uptr code_address, u32 code_size, u32 guest_pc, 
 
 bool SaveStateBase::vuJITFreeze()
 {
-	if (IsSaving())
+	// PCSX2's x86 microVU owner opens vu1Thread from recMicroVU1::Reserve(), so
+	// its save barrier can unconditionally wait for the worker. Vita's A32 VU1
+	// provider executes synchronously and deliberately leaves that worker closed;
+	// waiting on its empty semaphore would have no thread capable of signalling it.
+	if (IsSaving() && vu1Thread.IsOpen())
 		vu1Thread.WaitVU();
 
 	Console.Warning("recompiler state is unavailable in the Vita ARM32 interpreter build.");

@@ -24,6 +24,7 @@
 #include "Vif.h"
 
 #include "vita/A32Emitter.h"
+#include "vita/VitaFpRounding.h"
 #include "vita/VitaVuBlockCompiler.h"
 
 #include "common/Vita/VitaJitMemory.h"
@@ -555,6 +556,7 @@ namespace VitaVU
 			bool lower_stall_inline = false;
 			// Tail work windows.
 			bool branch_tail = false;
+			bool resolves_branch = false;
 			bool ebit_tail = false;
 			u32 ebit_store = 0; // valid when ebit_tail: statically-known post-decrement value
 			bool ends_block = false;
@@ -582,6 +584,10 @@ namespace VitaVU
 			u32 pair_count = 0;
 			bool entry_branch_tail = false;
 			bool entry_ebit_tail = false;
+			// True when this A32 fragment stopped before PCSX2 microVU's natural
+			// block boundary (currently the 64-pair emitter cap, a decode fallback,
+			// or a D/T pair whose runtime FBRST condition did not stop the VU).
+			bool continues_logical_block_if_busy = false;
 			u32 test_pipes_fast_guard_pairs = 0;
 			u32 fmac_clear_inline_pairs = 0;
 			u32 upper_fmac_stall_test_inline_pairs = 0;
@@ -865,6 +871,7 @@ namespace VitaVU
 			block->pair_count = 0;
 			block->entry_branch_tail = entry_branch_tail;
 			block->entry_ebit_tail = entry_ebit_tail;
+			block->continues_logical_block_if_busy = false;
 			block->test_pipes_fast_guard_pairs = 0;
 			block->fmac_clear_inline_pairs = 0;
 			block->upper_fmac_stall_test_inline_pairs = 0;
@@ -988,6 +995,7 @@ namespace VitaVU
 				if (branch_window > 0)
 				{
 					plan.branch_tail = true;
+					plan.resolves_branch = true;
 					branch_window--;
 					if (branch_window == 0)
 						plan.ends_block = true; // TPC may have been redirected
@@ -1029,7 +1037,10 @@ namespace VitaVU
 			if (block->pair_count != 0)
 			{
 				const PairPlan& last = block->pairs[block->pair_count - 1];
-				block->direct_link_tail = !conservative_vu0 && !last.dflag && !last.tflag &&
+				block->continues_logical_block_if_busy = !last.ends_block ||
+					(!last.resolves_branch && (last.dflag || last.tflag));
+				block->direct_link_tail = !block->continues_logical_block_if_busy &&
+					!conservative_vu0 && !last.dflag && !last.tflag &&
 					!(last.ebit_tail && last.ebit_store == 0);
 				if (block->direct_link_tail)
 				{
@@ -1097,10 +1108,13 @@ namespace VitaVU
 		// ------------------------------------------------------------------
 
 		// Generated block ABI: u32 executed_pairs = block(VURegs*, executed_base,
-		// limit_lo, limit_hi) with limit = startcycles + cycles, matching
-		// InterpVU1::Execute()'s budget condition. Generated tail links carry
-		// executed_base across block-to-block jumps without growing the stack.
+		// limit_lo, limit_hi) with limit = startcycles + cycles. PCSX2's
+		// x86/microVU_Compile.inl::mVUtestCycles() admits an entire compiled block
+		// whenever at least one requested cycle remains, then tests the budget at
+		// the next block entry. Generated tail links carry executed_base across
+		// those block-entry tests without growing the stack.
 		using BlockFn = u32 (*)(VURegs*, u32, u32, u32);
+		constexpr u32 EXECUTED_PAIRS_LOGICAL_CONTINUATION = 0x80000000u;
 
 		constexpr unsigned HOST_VU = 4;       // VURegs*
 		constexpr unsigned HOST_CYCLE_LO = 5; // cycle low word after this pair's increment
@@ -1200,13 +1214,15 @@ namespace VitaVU
 				// otherwise return to the dispatcher.
 				if (m_plan.direct_link_tail && !EmitDirectLinkTail(m_plan.pair_count))
 					return false;
-				if (!EmitReturnExecutedPairs(m_plan.pair_count))
+				if (!EmitReturnExecutedPairs(m_plan.pair_count,
+						m_plan.continues_logical_block_if_busy))
 					return false;
 				const size_t epilogue_offset = m_code.Size();
 				if (!EmitEpilogue())
 					return false;
 
-				// Budget-exit stubs: return the number of fully executed pairs.
+				// Block-admission exit stubs: return the accumulated number of fully
+				// executed pairs before entering an over-budget linked target.
 				for (const BudgetExit& exit : m_budget_exits)
 				{
 					const size_t stub_offset = m_code.Size();
@@ -1228,8 +1244,10 @@ namespace VitaVU
 				// PCSX2 owner: x86/microVU_Branch.inl links compatible block
 				// states without returning through the dispatcher.  The Vita block
 				// body uses one stable private-frame mapping, so a linked chain can
-				// retain r4/r6/r7/r11 and the existing stack frame.  Only the
-				// target's private countdown state needs rematerialization.
+				// retain r4/r6/r7/r11 and the existing stack frame.  The target's
+				// private countdown is refreshed before its microVU block-admission
+				// test; this also converts a preceding block's permitted overshoot
+				// back into an ordinary target-entry rejection.
 				m_linked_entry_offset = m_code.Size();
 #if defined(VITASX2_QEMU_VALIDATION)
 				if (!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitLinkedFrameEntries))) ||
@@ -1282,11 +1300,11 @@ namespace VitaVU
 				if (!m_countdown_budget)
 					return true;
 
-				// PCSX2 owner: InterpVU1::Execute() checks the 64-bit cycle
-				// budget before each step. If static analysis proves no
-				// stall/XGKICK path can advance VU1.cycle beyond the normal
-				// one cycle per pair, compute the remaining pair budget once
-				// and keep the low cycle word live for the block.
+				// If static analysis proves no stall/XGKICK path can advance
+				// VU1.cycle beyond one cycle per pair, keep the low cycle word and
+				// remaining countdown live for the admitted block. The countdown
+				// may become negative after microVU's permitted block overshoot;
+				// every linked target refreshes it and performs a full 64-bit test.
 				return m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
 					m_code.EmitSubReg(HOST_BUDGET_LEFT, HOST_LIMIT_LO, HOST_CYCLE_LO);
 			}
@@ -1302,23 +1320,39 @@ namespace VitaVU
 				return m_code.EmitMovRegShiftImm(rd, rm, ShiftType::LSL, 0, false, condition);
 			}
 
-			bool EmitReturnExecutedPairs(u32 executed_pairs)
+			bool EmitReturnExecutedPairs(u32 executed_pairs,
+				bool logical_continuation = false)
 			{
-				if (executed_pairs == 0)
-					return EmitMovReg(0, HOST_EXEC_BASE);
-				return m_code.EmitAddImm8(0, HOST_EXEC_BASE, static_cast<u8>(executed_pairs));
+				const bool emitted_count = executed_pairs == 0 ?
+					EmitMovReg(0, HOST_EXEC_BASE) :
+					m_code.EmitAddImm8(0, HOST_EXEC_BASE,
+						static_cast<u8>(executed_pairs));
+				return emitted_count && (!logical_continuation ||
+					m_code.EmitOrrImm32(0, 0, EXECUTED_PAIRS_LOGICAL_CONTINUATION));
 			}
 
 			bool EmitCallHelper(const void* fn)
 			{
-				return EmitMovReg(0, HOST_VU) && m_code.EmitCallAbsolute(fn);
+				return EmitMovReg(0, HOST_VU) && EmitCallAbsoluteClobberVectorState(fn);
 			}
 
 			bool EmitCallHelperRegs(const void* fn, const _VURegsNum* regs)
 			{
 				return EmitMovReg(0, HOST_VU) &&
 					m_code.EmitMovImm32(1, static_cast<u32>(reinterpret_cast<uptr>(regs))) &&
-					m_code.EmitCallAbsolute(fn);
+					EmitCallAbsoluteClobberVectorState(fn);
+			}
+
+			bool EmitCallAbsoluteClobberVectorState(const void* fn)
+			{
+				// AAPCS32 makes D16-D31/Q8-Q15 caller-clobbered. Q8-Q11 cache
+				// vuDouble() normalization constants across pairs, so every helper
+				// seam must force a later normalize to rematerialize them. This is
+				// required even for a conditional call: compile-time state joins the
+				// called and skipped arms after the call site.
+				const bool emitted = m_code.EmitCallAbsolute(fn);
+				m_norm_consts_ready = false;
+				return emitted;
 			}
 
 			bool EmitDirectLinkTail(u32 executed_pairs)
@@ -1419,7 +1453,7 @@ namespace VitaVU
 					return false;
 				}
 
-				if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&LookupVu1DirectLinkBlock)) ||
+				if (!EmitCallAbsoluteClobberVectorState(reinterpret_cast<const void*>(&LookupVu1DirectLinkBlock)) ||
 					!m_code.EmitCmpImm32(0, 0))
 				{
 					return false;
@@ -1444,7 +1478,7 @@ namespace VitaVU
 			{
 				return m_code.EmitMovImm8(0, 0) &&
 					m_code.EmitMovImm8(1, 1) &&
-					m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&_vuXGKICKTransfer));
+					EmitCallAbsoluteClobberVectorState(reinterpret_cast<const void*>(&_vuXGKICKTransfer));
 			}
 
 			bool EmitOrVuWordField(unsigned accum, size_t offset)
@@ -2064,7 +2098,7 @@ namespace VitaVU
 						!m_code.EmitSubReg(0, 0, 1) ||
 						!m_code.EmitSubImm8(0, 0, 1) ||
 						!m_code.EmitMovImm8(1, 0) ||
-						!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&_vuXGKICKTransfer)))
+						!EmitCallAbsoluteClobberVectorState(reinterpret_cast<const void*>(&_vuXGKICKTransfer)))
 					{
 						return false;
 					}
@@ -2254,10 +2288,11 @@ namespace VitaVU
 #endif
 				}
 
-				// PCSX2 owner: VUmicroFast.h::ExecuteUpperNoLowerKnownKind()
-				// ABS/FTOI*/ITOF* direct ARM32 paths. Keep the same NEON transforms
-				// but emit them into the VU1 block instead of calling the
-				// per-kind thunk.
+				// PCSX2 owner: VUops.cpp::{floatToInt,intToFloat}() and
+				// VUmicroFast.h::ExecuteUpperNoLowerKnownKind(). Cortex-A9 Advanced
+				// SIMD arithmetic ignores FPSCR.RMode, while scalar VFP observes it.
+				// Keep the qword load/store and exact integer ABS work and use scalar
+				// VFP for rounding-sensitive arithmetic and ITOF.
 				if (!EmitAddVfAddress(0, fs) ||
 					!m_code.EmitVld1Q32Aligned(0, 0))
 				{
@@ -2286,55 +2321,64 @@ namespace VitaVU
 						else if (kind == VUInterpFast::UpperFastKind::FTOI15)
 							offset = 15;
 
-						emitted_body = m_code.EmitVorrQ(2, 0, 0);
+						emitted_body = true;
 						if (offset != 0)
 						{
 							emitted_body = emitted_body &&
 								m_code.EmitMovImm32(0, 0x3f800000u + (offset << 23)) &&
-								m_code.EmitVdupI32QFromCore(3, 0) &&
-								m_code.EmitVmulF32Q(0, 0, 3);
+								m_code.EmitVmovCoreToS(4, 0);
 						}
 
-						// saturate_mask = ((scaled_bits & 0x7f800000) >= 0x4f000000)
-						// using signed `>` against 0x4effffff, which is equivalent
-						// for exponent-field values.
-						emitted_body = emitted_body &&
-							m_code.EmitMovImm32(0, FPU_FLOAT_EXPONENT_MASK) &&
-							m_code.EmitVdupI32QFromCore(1, 0) &&
-							m_code.EmitVandQ(1, 0, 1) &&
-							m_code.EmitMovImm32(0, 0x4effffffu) &&
-							m_code.EmitVdupI32QFromCore(3, 0) &&
-							m_code.EmitVcgtS32Q(1, 1, 3) &&
-							// saturated = source_sign ? 0x80000000 : 0x7fffffff
-							m_code.EmitVshrS32Q(2, 2, 31) &&
-							m_code.EmitMovImm32(0, 0x7fffffffu) &&
-							m_code.EmitVdupI32QFromCore(3, 0) &&
-							m_code.EmitVeorQ(2, 2, 3) &&
-							// result = converted ^ (saturate_mask & (converted ^ saturated))
-							m_code.EmitVcvtS32F32Q(0, 0) &&
-							m_code.EmitVeorQ(3, 0, 2) &&
-							m_code.EmitVandQ(3, 3, 1) &&
-							m_code.EmitVeorQ(0, 0, 3);
+						for (unsigned lane = 0; lane < 4 && emitted_body; lane++)
+						{
+							const unsigned lane_bit = 1u << (3 - lane);
+							if ((mask & lane_bit) == 0)
+								continue;
+
+							emitted_body =
+								(offset == 0 || m_code.EmitVmulF32(lane, lane, 4)) &&
+								m_code.EmitVmovSToCore(0, lane) &&
+								EmitAndRegImm32(1, 0, FPU_FLOAT_EXPONENT_MASK, HOST_CALL_SCRATCH) &&
+								m_code.EmitMovRegShiftImm(2, 0, ShiftType::ASR, 31) &&
+								// signmask ^ 0x80000000, then invert, maps positive to
+								// INT_MAX and negative to INT_MIN using two encodable ops.
+								m_code.EmitEorImm32(2, 2, FPU_FLOAT_SIGN_MASK) &&
+								m_code.EmitMvnReg(2, 2) &&
+								m_code.EmitVcvtS32F32(lane, lane) &&
+								m_code.EmitVmovSToCore(0, lane) &&
+								EmitCmpRegImm32(1, 0x4f000000u, HOST_CALL_SCRATCH) &&
+								EmitMovReg(0, 2, Condition::CS) &&
+								m_code.EmitVmovCoreToS(lane, 0);
+						}
 						break;
 					}
 					case VUInterpFast::UpperFastKind::ITOF0:
-						emitted_body = m_code.EmitVcvtF32S32Q(0, 0);
-						break;
 					case VUInterpFast::UpperFastKind::ITOF4:
 					case VUInterpFast::UpperFastKind::ITOF12:
 					case VUInterpFast::UpperFastKind::ITOF15:
 					{
-						unsigned offset = 4;
+						unsigned offset = 0;
+						if (kind == VUInterpFast::UpperFastKind::ITOF4)
+							offset = 4;
 						if (kind == VUInterpFast::UpperFastKind::ITOF12)
 							offset = 12;
 						else if (kind == VUInterpFast::UpperFastKind::ITOF15)
 							offset = 15;
 
-						emitted_body =
-							m_code.EmitVcvtF32S32Q(0, 0) &&
-							m_code.EmitMovImm32(0, 0x3f800000u - (offset << 23)) &&
-							m_code.EmitVdupI32QFromCore(1, 0) &&
-							m_code.EmitVmulF32Q(0, 0, 1);
+						// Ordinary scalar VFP conversion observes the installed VU FPCR.
+						// Scaling by 2^-offset is exact for the complete signed-int domain;
+						// materialize it once and use scalar VMUL only on active lanes.
+						emitted_body = offset == 0 ||
+							(m_code.EmitMovImm32(0, 0x3f800000u - (offset << 23)) &&
+							 m_code.EmitVmovCoreToS(4, 0));
+						for (unsigned lane = 0; lane < 4 && emitted_body; lane++)
+						{
+							const unsigned lane_bit = 1u << (3 - lane);
+							if ((mask & lane_bit) == 0)
+								continue;
+							emitted_body = m_code.EmitVcvtF32S32(lane, lane) &&
+								(offset == 0 || m_code.EmitVmulF32(lane, lane, 4));
+						}
 						break;
 					}
 					default:
@@ -3037,8 +3081,10 @@ namespace VitaVU
 
 				// PCSX2 owners: VUops.cpp::_vuADD* / _vuSUB* /
 				// _vuADDA* / _vuSUBA* and
-				// VUmicroFast.h::ExecuteAddSubMaskedNeon(). Keep the NEON
-				// add/sub arithmetic body and generated MAC/status finishing.
+				// VUmicroFast.h::ExecuteAddSubMasked(). NEON still owns qword
+				// loads and exact integer vuDouble() normalization, but Cortex-A9
+				// Advanced SIMD FP ignores FPSCR rounding. Execute only the active
+				// arithmetic lanes with scalar VFP under the installed VU FPCR.
 				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
 					return false;
 
@@ -3079,9 +3125,13 @@ namespace VitaVU
 					}
 				}
 
-				if (mask != 0)
+				for (unsigned lane = 0; lane < 4; lane++)
 				{
-					if (subtract ? !m_code.EmitVsubF32Q(0, 0, 1) : !m_code.EmitVaddF32Q(0, 0, 1))
+					const unsigned lane_bit = 1u << (3 - lane);
+					if ((mask & lane_bit) == 0)
+						continue;
+					if (subtract ? !m_code.EmitVsubF32(lane, lane, 4 + lane) :
+						!m_code.EmitVaddF32(lane, lane, 4 + lane))
 						return false;
 				}
 
@@ -3124,10 +3174,10 @@ namespace VitaVU
 				const bool acc = IsUpperMulAccKind(kind);
 
 				// PCSX2 owners: VUops.cpp::_vuMUL* / _vuMULA* and
-				// VUmicroFast.h::ExecuteMulMaskedNeon(). Normalize operands
-				// lane-by-lane, run the multiply through NEON qword hardware
-				// to match PCSX2's ARM32 direct path, then finish each active
-				// lane with generated VU_MAC_UPDATE/VU_STAT_UPDATE logic.
+				// VUmicroFast.h::ExecuteMulMasked(). Normalize operands in NEON,
+				// then use scalar VFP per active lane because Advanced SIMD VMUL
+				// is fixed round-to-nearest and cannot implement PCSX2's VU
+				// chop-zero MXCSR/FPSCR contract.
 				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
 					return false;
 
@@ -3145,8 +3195,15 @@ namespace VitaVU
 					}
 				}
 
-				if (mask != 0 && !m_code.EmitVmulF32Q(0, 0, 1))
-					return false;
+				for (unsigned lane = 0; lane < 4; lane++)
+				{
+					const unsigned lane_bit = 1u << (3 - lane);
+					if ((mask & lane_bit) != 0 &&
+						!m_code.EmitVmulF32(lane, lane, 4 + lane))
+					{
+						return false;
+					}
+				}
 
 				for (unsigned lane = 0; lane < 4; lane++)
 				{
@@ -3307,10 +3364,10 @@ namespace VitaVU
 				// ACC for OPMSUB) as NEON quads, normalize them with the shared
 				// vuDouble() quad path, then arrange the cross-product lanes with
 				// cheap S-register moves instead of per-lane scalar normalize plus
-				// ARM->NEON transfers. The multiply/subtract stays qword to match
-				// OuterProductNeon (scalar VFP drifts by 1 ULP here). fs/ft/ACC are
-				// all read before any store, so Fd aliases keep the same source
-				// visibility as the direct path.
+				// ARM->NEON transfers. The three products and subtractions use
+				// scalar VFP because Advanced SIMD FP is fixed nearest on Cortex-A9.
+				// fs/ft/ACC are all read before any store, so Fd aliases keep the
+				// same source visibility as the direct path.
 				const bool opmsub = kind != VUInterpFast::UpperFastKind::OPMULA;
 
 				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
@@ -3351,7 +3408,9 @@ namespace VitaVU
 						!m_code.EmitVmovS(2, 8) || !m_code.EmitVmovS(3, 8) ||
 						!m_code.EmitVmovS(4, 14) || !m_code.EmitVmovS(5, 12) ||
 						!m_code.EmitVmovS(6, 13) || !m_code.EmitVmovS(7, 13) ||
-						!m_code.EmitVmulF32Q(0, 0, 1))
+						!m_code.EmitVmulF32(0, 0, 4) ||
+						!m_code.EmitVmulF32(1, 1, 5) ||
+						!m_code.EmitVmulF32(2, 2, 6))
 					{
 						return false;
 					}
@@ -3372,8 +3431,12 @@ namespace VitaVU
 						!m_code.EmitVorrQ(2, 0, 0) ||
 						!m_code.EmitVmovS(0, 14) || !m_code.EmitVmovS(1, 12) ||
 						!m_code.EmitVmovS(2, 13) || !m_code.EmitVmovS(3, 13) ||
-						!m_code.EmitVmulF32Q(1, 1, 0) ||
-						!m_code.EmitVsubF32Q(0, 2, 1) ||
+						!m_code.EmitVmulF32(4, 4, 0) ||
+						!m_code.EmitVmulF32(5, 5, 1) ||
+						!m_code.EmitVmulF32(6, 6, 2) ||
+						!m_code.EmitVsubF32(0, 8, 4) ||
+						!m_code.EmitVsubF32(1, 9, 5) ||
+						!m_code.EmitVsubF32(2, 10, 6) ||
 						!EmitFinishOuterLaneFromS(0, 2, false, fd, 0) ||
 						!EmitFinishOuterLaneFromS(1, 2, false, fd, 1) ||
 						!EmitFinishOuterLaneFromS(2, 2, false, fd, 2))
@@ -5191,12 +5254,14 @@ namespace VitaVU
 			bool EmitEfuSumXyzSquaresToS0(unsigned vf)
 			{
 				// PCSX2 owner: VUmicroFast.h::VuSumXYZSquaresNeon(). Quad load and
-				// normalize, square every lane with one vmulq, then reduce
+				// normalize, square XYZ with FPSCR-aware scalar VFP, then reduce
 				// (x*x + y*y) + z*z with the same scalar order as the reference.
 				return EmitAddVfAddress(3, vf) &&
 					m_code.EmitVld1Q32Aligned(0, 3) &&
 					EmitNormalizeVuFloatQuad1(0) &&
-					m_code.EmitVmulF32Q(0, 0, 0) &&
+					m_code.EmitVmulF32(0, 0, 0) &&
+					m_code.EmitVmulF32(1, 1, 1) &&
+					m_code.EmitVmulF32(2, 2, 2) &&
 					m_code.EmitVaddF32(0, 0, 1) &&
 					m_code.EmitVaddF32(0, 0, 2);
 			}
@@ -6089,11 +6154,11 @@ namespace VitaVU
 
 			bool EmitInlineEbitFinish()
 			{
-				// PCSX2 owners: VU0microInterp.cpp::_vu0Exec() and
-				// VU1microInterp.cpp::_vu1Exec() E-bit completion bodies plus
-				// VUops.cpp::_vuFlushAll(). VU0 clears VPU_STAT bit 0/vif0 VEW;
-				// VU1 clears bit 8/vif1 VEW and owns the XGKICK completion side
-				// effects.
+				// PCSX2 owners: x86/microVU_Branch.inl::mVUendProgram() and
+				// mVUDTendProgram(), plus VUops.cpp::_vuFlushAll(). microVU clears
+				// the VPU_STAT busy bit but, unlike the interpreter, deliberately
+				// leaves VIF_STAT_VEW unchanged. VU1 also owns the XGKICK completion
+				// side effects.
 #if defined(VITASX2_QEMU_VALIDATION)
 				if (!EmitQemuEbitFinishInlineCounter())
 					return false;
@@ -6110,16 +6175,9 @@ namespace VitaVU
 				}
 
 				const u32 vpu_stat_run_bit = m_vu0_memory_map ? 0x1u : 0x100u;
-				const uptr vif_regs = m_vu0_memory_map ?
-					reinterpret_cast<uptr>(&vif0Regs) :
-					reinterpret_cast<uptr>(&vif1Regs);
 				if (!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(&VU0) + ViOffset(REG_VPU_STAT))) ||
 					!m_code.EmitLdrImm12(0, 3, 0) ||
 					!m_code.EmitBicImm32(0, 0, vpu_stat_run_bit) ||
-					!m_code.EmitStrImm12(0, 3, 0) ||
-					!m_code.EmitMovImm32(3, static_cast<u32>(vif_regs + offsetof(VIFregisters, stat))) ||
-					!m_code.EmitLdrImm12(0, 3, 0) ||
-					!m_code.EmitBicImm32(0, 0, VIF_STAT_VEW) ||
 					!m_code.EmitStrImm12(0, 3, 0))
 				{
 					return false;
@@ -6187,7 +6245,7 @@ namespace VitaVU
 					!m_code.EmitOrrImm32(0, 0, vpu_stat_bit) ||
 					!m_code.EmitStrImm12(0, 3, 0) ||
 					!m_code.EmitMovImm8(0, intc_irq) ||
-					!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&hwIntcIrq)) ||
+					!EmitCallAbsoluteClobberVectorState(reinterpret_cast<const void*>(&hwIntcIrq)) ||
 					!m_code.EmitMovImm8(0, 1) ||
 					!m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, ebit))))
 				{
@@ -6513,10 +6571,13 @@ namespace VitaVU
 #endif
 			}
 
-			// PCSX2 owner: InterpVU1::Execute()'s `(VU1.cycle - startcycles) <
-			// cycles` guard, evaluated before every step, plus vu1Exec()'s
-			// unconditional cycle increment. Leaves the post-increment low
-			// word in HOST_CYCLE_LO for the VIBackupCycles window math.
+			// PCSX2 owner: x86/microVU_Compile.inl::mVUtestCycles(). The caller
+			// admits the initial block only with a positive budget; a generated link
+			// tests again before entering its target. Once admitted, the whole block
+			// runs even when its final pairs overshoot the requested window. This is
+			// microVU's observable scheduling contract, not the interpreter's
+			// per-step Execute() guard. Each pair still performs vu1Exec()'s cycle
+			// increment and leaves its low word in HOST_CYCLE_LO for VIBackupCycles.
 			bool EmitBudgetCheckAndCycleIncrement(u32 pair_index)
 			{
 				if (m_countdown_budget)
@@ -6549,20 +6610,6 @@ namespace VitaVU
 					if (!m_code.PatchBranch(skip_entry_check, m_code.Size(), Condition::EQ))
 						return false;
 				}
-				else
-				{
-					// Later pairs always test the budget; pair 0 only tests
-					// when reached through a generated tail link.
-					if (!m_code.EmitCmpReg(1, HOST_LIMIT_HI) ||
-						!m_code.EmitCmpReg(0, HOST_LIMIT_LO, Condition::EQ))
-					{
-						return false;
-					}
-					const size_t exit_site = m_code.EmitBranchPlaceholder(Condition::CS);
-					if (exit_site == static_cast<size_t>(-1))
-						return false;
-					m_budget_exits.push_back({exit_site, pair_index, Condition::CS});
-				}
 
 				return m_code.EmitAddImm8(0, 0, 1, true) &&
 					m_code.EmitAdcImm8(1, 1, 0) &&
@@ -6580,23 +6627,21 @@ namespace VitaVU
 					const size_t skip_entry_check = m_code.EmitBranchPlaceholder(Condition::EQ);
 					if (skip_entry_check == static_cast<size_t>(-1))
 						return false;
-					if (!m_code.EmitCmpImm32(HOST_BUDGET_LEFT, 0))
+					// The linked-entry stub has refreshed HOST_CYCLE_LO and the
+					// countdown. Compare the full 64-bit cycle so a block which
+					// overshot by one or more pairs cannot turn the low-word
+					// subtraction into a large unsigned remaining budget.
+					if (!m_code.EmitLdrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, cycle) + 4)) ||
+						!m_code.EmitCmpReg(0, HOST_LIMIT_HI) ||
+						!m_code.EmitCmpReg(HOST_CYCLE_LO, HOST_LIMIT_LO, Condition::EQ))
 						return false;
-					const size_t exit_site = m_code.EmitBranchPlaceholder(Condition::EQ);
+					const size_t exit_site = m_code.EmitBranchPlaceholder(Condition::CS);
 					if (exit_site == static_cast<size_t>(-1))
 						return false;
-					m_budget_exits.push_back({exit_site, pair_index, Condition::EQ});
+					m_budget_exits.push_back({exit_site, pair_index, Condition::CS});
 					if (!m_code.PatchBranch(skip_entry_check, m_code.Size(), Condition::EQ))
 						return false;
-				}
-				else
-				{
-					if (!m_code.EmitCmpImm32(HOST_BUDGET_LEFT, 0))
-						return false;
-					const size_t exit_site = m_code.EmitBranchPlaceholder(Condition::EQ);
-					if (exit_site == static_cast<size_t>(-1))
-						return false;
-					m_budget_exits.push_back({exit_site, pair_index, Condition::EQ});
 				}
 
 				if (!m_code.EmitSubImm8(HOST_BUDGET_LEFT, HOST_BUDGET_LEFT, 1) ||
@@ -7077,6 +7122,7 @@ namespace VitaVU
 			u32 micro_hash = 0;
 			bool entry_branch_tail = false;
 			bool entry_ebit_tail = false;
+			bool continues_logical_block_if_busy = false;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> direct_links{};
 			// Generated code embeds pointers into this array (stall-helper
 			// _VURegsNum arguments), so it must stay stable for the lifetime
@@ -7473,6 +7519,7 @@ namespace VitaVU
 			block->micro_hash = micro_hash;
 			block->entry_branch_tail = entry_branch_tail;
 			block->entry_ebit_tail = entry_ebit_tail;
+			block->continues_logical_block_if_busy = plan.continues_logical_block_if_busy;
 			block->pairs = std::make_unique<PairPlan[]>(plan.pair_count);
 			std::copy_n(plan.pairs.begin(), plan.pair_count, block->pairs.get());
 			block->micro_bytes = std::make_unique<u8[]>(micro_size);
@@ -7617,6 +7664,7 @@ namespace VitaVU
 			block->micro_hash = micro_hash;
 			block->entry_branch_tail = entry_branch_tail;
 			block->entry_ebit_tail = entry_ebit_tail;
+			block->continues_logical_block_if_busy = plan.continues_logical_block_if_busy;
 			block->pairs = std::make_unique<PairPlan[]>(plan.pair_count);
 			std::copy_n(plan.pairs.begin(), plan.pair_count, block->pairs.get());
 			block->micro_bytes = std::make_unique<u8[]>(micro_size);
@@ -7787,11 +7835,39 @@ namespace VitaVU
 			return;
 		}
 
-		// The A32 provider currently admits dynamic-stall blocks pair by pair, so
-		// it does not yet own microVU's pipeline-specialized upcoming block span.
-		// Preserve the interpreter-compatible estimate only for this tracked
-		// sync-hack fallback; it must not leak into the ordinary native contract.
+		// A32 now owns microVU's default whole-logical-block admission rule, but
+		// it does not yet retain the pipeline-specialized static span of the next
+		// block. Preserve the interpreter-compatible estimate only for this
+		// tracked sync-hack fallback; it must not leak into the ordinary contract.
 		vu.nextBlockCycles = (vu.cycle - cpuRegs.cycle) + 1;
+	}
+
+	static void ClampVuCycleAfterAdmittedBlock(VURegs& vu, u64 start_cycle,
+		u32 requested_cycles)
+	{
+		// PCSX2 owner: x86/microVU_Execute.inl::mVUcleanUp(). Generated microVU
+		// may execute beyond the requested window to finish an admitted logical
+		// block, but its public VU clock advances by
+		// totalCycles - max(0, remainingCycles), never by the overshoot. A32 uses
+		// VURegs::cycle as its private work clock too, so translate every live
+		// absolute pipeline anchor with the public clock when clamping it.
+		const u64 work_cycles = vu.cycle - start_cycle;
+		if (work_cycles <= requested_cycles)
+			return;
+
+		const u64 overshoot = work_cycles - requested_cycles;
+		vu.cycle -= overshoot;
+
+		for (u32 offset = 0; offset < vu.fmaccount && offset < 4; offset++)
+			vu.fmac[(vu.fmacreadpos + offset) & 3].sCycle -= overshoot;
+		if (vu.fdiv.enable)
+			vu.fdiv.sCycle -= overshoot;
+		if (vu.efu.enable)
+			vu.efu.sCycle -= overshoot;
+		for (u32 offset = 0; offset < vu.ialucount && offset < 4; offset++)
+			vu.ialu[(vu.ialureadpos + offset) & 3].sCycle -= overshoot;
+		if (vu.xgkickenable)
+			vu.xgkicklastcycle -= overshoot;
 	}
 
 	void ExecuteVu0Blocks(u32 cycles)
@@ -7807,7 +7883,8 @@ namespace VitaVU
 		const u64 limit = startcycles + cycles;
 		const bool blocks_eligible = !Pcsx2Trace::IsVuTraceEnabled();
 
-		while ((VU0.cycle - startcycles) < cycles)
+		bool admitted_logical_continuation = false;
+		while (admitted_logical_continuation || (VU0.cycle - startcycles) < cycles)
 		{
 			if (!(VU0.VI[REG_VPU_STAT].UL & 0x1))
 			{
@@ -7832,21 +7909,36 @@ namespace VitaVU
 						entry_branch_tail, entry_ebit_tail))
 				{
 					const BlockFn fn = reinterpret_cast<BlockFn>(const_cast<void*>(block->entry));
-					const u32 executed = fn(&VU0, 0,
+					const u32 result = fn(&VU0, 0,
 						static_cast<u32>(limit), static_cast<u32>(limit >> 32));
+					const u32 executed = result & ~EXECUTED_PAIRS_LOGICAL_CONTINUATION;
 					if (executed != 0)
 					{
 						s_vu0.stats.executed_blocks++;
 						s_vu0.stats.executed_pairs += executed;
+						admitted_logical_continuation =
+							(result & EXECUTED_PAIRS_LOGICAL_CONTINUATION) != 0 &&
+							(VU0.VI[REG_VPU_STAT].UL & 0x1) != 0 &&
+							!(VU0.flags & VUFLAG_MFLAGSET);
 						continue;
 					}
 				}
 			}
 
+			const bool resolving_admitted_branch = VU0.branch != 0;
 			CpuIntVU0.Step();
 			s_vu0.stats.interpreter_steps++;
+			if (blocks_eligible)
+			{
+				// A decode fallback is still part of the already admitted natural
+				// microVU block. Keep stepping until its branch/program boundary.
+				admitted_logical_continuation =
+					(VU0.VI[REG_VPU_STAT].UL & 0x1) != 0 &&
+					!(VU0.flags & VUFLAG_MFLAGSET) && !resolving_admitted_branch;
+			}
 		}
 
+		ClampVuCycleAfterAdmittedBlock(VU0, startcycles, cycles);
 		VU0.VI[REG_TPC].UL >>= 3;
 
 		if (EmuConfig.Speedhacks.EECycleRate != 0 &&
@@ -7963,7 +8055,8 @@ namespace VitaVU
 		// Micro-step tracing must go through vu1Exec() so every step records.
 		const bool blocks_eligible = !Pcsx2Trace::IsVuTraceEnabled();
 
-		while ((VU1.cycle - startcycles) < cycles)
+		bool admitted_logical_continuation = false;
+		while (admitted_logical_continuation || (VU1.cycle - startcycles) < cycles)
 		{
 			if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
 			{
@@ -7989,18 +8082,33 @@ namespace VitaVU
 						entry_branch_tail, entry_ebit_tail))
 				{
 					const BlockFn fn = reinterpret_cast<BlockFn>(const_cast<void*>(block->entry));
-					const u32 executed = fn(&VU1, 0,
+					const u32 result = fn(&VU1, 0,
 						static_cast<u32>(limit), static_cast<u32>(limit >> 32));
-					s_vu1.stats.executed_blocks++;
-					s_vu1.stats.executed_pairs += executed;
-					continue;
+					const u32 executed = result & ~EXECUTED_PAIRS_LOGICAL_CONTINUATION;
+					if (executed != 0)
+					{
+						s_vu1.stats.executed_blocks++;
+						s_vu1.stats.executed_pairs += executed;
+						admitted_logical_continuation =
+							(result & EXECUTED_PAIRS_LOGICAL_CONTINUATION) != 0 &&
+							(VU0.VI[REG_VPU_STAT].UL & 0x100) != 0;
+						continue;
+					}
 				}
 			}
 
+			const bool resolving_admitted_branch = VU1.branch != 0;
 			CpuIntVU1.Step();
 			s_vu1.stats.interpreter_steps++;
+			if (blocks_eligible)
+			{
+				admitted_logical_continuation =
+					(VU0.VI[REG_VPU_STAT].UL & 0x100) != 0 &&
+					!resolving_admitted_branch;
+			}
 		}
 
+		ClampVuCycleAfterAdmittedBlock(VU1, startcycles, cycles);
 		VU1.VI[REG_TPC].UL >>= 3;
 		UpdateNextBlockCyclesAtExecuteExit(VU1, 0x100, false);
 	}

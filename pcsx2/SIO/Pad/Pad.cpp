@@ -553,6 +553,20 @@ void Pad::SetControllerState(u32 controller, u32 bind, float value)
 
 bool Pad::Freeze(StateWrapper& sw)
 {
+	if (sw.IsPortableReplay())
+	{
+		for (u32 unifiedSlot = 0; unifiedSlot < NUM_CONTROLLER_PORTS; unifiedSlot++)
+		{
+			PadBase* pad = GetPad(static_cast<u8>(unifiedSlot));
+			if (!pad || pad->GetType() != ControllerType::NotConnected)
+			{
+				Console.Error("Portable PAD state requires slot %u to be disconnected.", unifiedSlot);
+				sw.SetError();
+				return false;
+			}
+		}
+	}
+
 	if (sw.IsReading())
 	{
 		if (!sw.DoMarker("PAD"))
@@ -570,6 +584,12 @@ bool Pad::Freeze(StateWrapper& sw)
 
 			if (sw.HasError())
 				return false;
+			if (sw.IsPortableReplay() && statePadType != ControllerType::NotConnected)
+			{
+				Console.Error("Portable PAD state contains a connected controller in slot %u.", unifiedSlot);
+				sw.SetError();
+				return false;
+			}
 
 			if (!currentPad)
 			{

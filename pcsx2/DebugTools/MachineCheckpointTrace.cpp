@@ -35,8 +35,8 @@
 
 namespace Pcsx2Trace
 {
-	namespace
-	{
+		namespace
+		{
 		static constexpr std::array<char, 8> TRACE_MAGIC = {'P', 'C', 'S', 'X', '2', 'C', 'K', 'P'};
 		static constexpr u32 TRACE_VERSION = 1;
 		static constexpr u32 TRACE_PROJECTION_VERSION = 5;
@@ -45,6 +45,7 @@ namespace Pcsx2Trace
 		static constexpr u32 TRACE_FLAG_GATED_ON_VIF_RECORDS = 1u << 2;
 		static constexpr u32 TRACE_FLAG_GATED_ON_VSYNC_FRAMES = 1u << 3;
 		static constexpr u32 CHECKPOINT_TRIGGER_VU1_COMPLETED_EVENT_TEST = 1;
+		static constexpr u32 CHECKPOINT_TRIGGER_PORTABLE_REPLAY_START = 2;
 		static constexpr u64 FNV1A64_OFFSET = 14695981039346656037ull;
 		static constexpr u64 FNV1A64_PRIME = 1099511628211ull;
 
@@ -199,6 +200,8 @@ namespace Pcsx2Trace
 		bool s_pending_checkpoint = false;
 		u32 s_entry_pc = 0;
 		std::string s_error;
+		PortableReplayExternalDeviceAccessCounts s_external_device_access_counts;
+		bool s_external_device_access_window_active = false;
 
 		void SetError(std::string error)
 		{
@@ -830,13 +833,13 @@ namespace Pcsx2Trace
 					DiagnosticPath(record.index, "projection.txt"), record);
 		}
 
-		void CaptureRecord(MachineCheckpointTraceRecord& record)
+		void CaptureRecord(MachineCheckpointTraceRecord& record, u32 trigger)
 		{
 			record = {};
 			record.index = s_records_written;
 			record.vu1_completion_ordinal = s_last_completion_ordinal;
 			record.vu1_completions_at_event_test = s_pending_completion_count;
-			record.trigger = CHECKPOINT_TRIGGER_VU1_COMPLETED_EVENT_TEST;
+			record.trigger = trigger;
 			record.configured_after_sif_records = s_config.after_sif_records;
 			record.configured_after_vif_records = s_config.after_vif_records;
 			record.configured_after_vsync_frames = s_config.after_vsync_frames;
@@ -898,7 +901,82 @@ namespace Pcsx2Trace
 			record.vif_state_hash[1] = HashVifState(vif1, 1);
 			record.dmac_state_hash = HashDmacState();
 		}
+
+		bool WriteCurrentRecord(u32 trigger)
+		{
+			GSTraceStateSnapshot(GsTraceStateTriggerManual);
+			MachineCheckpointTraceRecord record = {};
+			CaptureRecord(record, trigger);
+			if (!WriteDiagnosticSnapshot(record))
+			{
+				s_hit_limit = true;
+				return false;
+			}
+			if (std::fwrite(&record, sizeof(record), 1, s_trace_file) != 1)
+			{
+				SetError("Failed to write machine checkpoint trace record.");
+				s_hit_limit = true;
+				return false;
+			}
+			s_records_written++;
+			if (s_config.max_records != 0 && s_records_written >= s_config.max_records)
+				s_hit_limit = true;
+			return true;
+		}
 	} // namespace
+
+	void BeginPortableReplayExternalDeviceAccessWindow()
+	{
+		s_external_device_access_counts = {};
+		s_external_device_access_window_active = true;
+	}
+
+	void EndPortableReplayExternalDeviceAccessWindow()
+	{
+		s_external_device_access_window_active = false;
+	}
+
+	void NotifyPortableReplayExternalDeviceAccess(PortableReplayExternalDeviceAccess access)
+	{
+		if (!s_external_device_access_window_active)
+			return;
+
+		u64* counter = nullptr;
+		switch (access)
+		{
+			case PortableReplayExternalDeviceAccess::Dev9Read:
+				counter = &s_external_device_access_counts.dev9_reads;
+				break;
+			case PortableReplayExternalDeviceAccess::Dev9Write:
+				counter = &s_external_device_access_counts.dev9_writes;
+				break;
+			case PortableReplayExternalDeviceAccess::Dev9Dma:
+				counter = &s_external_device_access_counts.dev9_dma;
+				break;
+			case PortableReplayExternalDeviceAccess::Dev9IrqScheduled:
+				counter = &s_external_device_access_counts.dev9_irq_scheduled;
+				break;
+			case PortableReplayExternalDeviceAccess::Dev9IrqDelivered:
+				counter = &s_external_device_access_counts.dev9_irq_delivered;
+				break;
+			case PortableReplayExternalDeviceAccess::FireWireRead:
+				counter = &s_external_device_access_counts.firewire_reads;
+				break;
+			case PortableReplayExternalDeviceAccess::FireWireWrite:
+				counter = &s_external_device_access_counts.firewire_writes;
+				break;
+			case PortableReplayExternalDeviceAccess::FireWireIrq:
+				counter = &s_external_device_access_counts.firewire_irq;
+				break;
+		}
+		if (*counter != std::numeric_limits<u64>::max())
+			(*counter)++;
+	}
+
+	PortableReplayExternalDeviceAccessCounts GetPortableReplayExternalDeviceAccessCounts()
+	{
+		return s_external_device_access_counts;
+	}
 
 	bool StartMachineCheckpointTrace(const MachineCheckpointTraceConfig& config, Error* error)
 	{
@@ -1043,26 +1121,36 @@ namespace Pcsx2Trace
 		// Provider-private branch/backup state is then non-continuation residue.
 		if ((VU0.VI[REG_VPU_STAT].UL & 0x101) != 0)
 			return false;
-		GSTraceStateSnapshot(GsTraceStateTriggerManual);
-		MachineCheckpointTraceRecord record = {};
-		CaptureRecord(record);
-		if (!WriteDiagnosticSnapshot(record))
-		{
-			s_hit_limit = true;
-			return true;
-		}
-		if (std::fwrite(&record, sizeof(record), 1, s_trace_file) != 1)
-		{
-			SetError("Failed to write machine checkpoint trace record.");
-			s_hit_limit = true;
-			return true;
-		}
-		s_records_written++;
+		const bool wrote = WriteCurrentRecord(CHECKPOINT_TRIGGER_VU1_COMPLETED_EVENT_TEST);
 		s_pending_checkpoint = false;
 		s_pending_completion_count = 0;
-		if (s_config.max_records != 0 && s_records_written >= s_config.max_records)
-			s_hit_limit = true;
+		if (!wrote)
+			return true;
 		return s_hit_limit;
+	}
+
+	bool RecordMachineCheckpointAtReplayStart()
+	{
+		if (!IsMachineCheckpointTraceEnabled())
+		{
+			SetError("Replay-start checkpoint requested while the trace is inactive.");
+			return false;
+		}
+		if ((VU0.VI[REG_VPU_STAT].UL & 0x101) != 0)
+		{
+			SetError("Replay-start checkpoint requires both VUs to be idle.");
+			return false;
+		}
+		if (s_records_written != 0 || s_pending_checkpoint)
+		{
+			SetError("Replay-start checkpoint must be the first trace record.");
+			return false;
+		}
+
+		s_last_completion_ordinal = 0;
+		s_pending_completion_count = 0;
+		s_trigger_vsync_frame = g_FrameCount;
+		return WriteCurrentRecord(CHECKPOINT_TRIGGER_PORTABLE_REPLAY_START);
 	}
 
 	u64 GetMachineCheckpointTraceRecordsWritten() { return s_records_written; }

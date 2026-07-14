@@ -63,9 +63,9 @@ namespace VitaEE
 		u32 exit_value = 0;
 		u32 instruction_count = 0;
 		// The scanner may expose a larger straight-line region than fits the
-		// bounded A32 code slice.  PCSX2's split-block path makes the emitted
-		// prefix a normal block boundary; retain the original region size so
-		// validation can prove that the split was adaptive rather than fallback.
+		// bounded A32 code slice. Retain the original PCSX2 logical region size so
+		// validation can prove that an A32 physical fragment did not become an
+		// extra scheduler boundary or an interpreter fallback.
 		u32 source_instruction_count = 0;
 		u32 scaled_cycles = 0;
 		size_t code_size = 0;
@@ -86,6 +86,9 @@ namespace VitaEE
 		u32 concatenated_short_blocks = 0;
 		u32 concatenated_short_scheduler_tests_elided = 0;
 		u32 concatenated_short_hot_instructions_elided = 0;
+		u32 code_budget_continuation_blocks = 0;
+		u32 code_budget_continuation_scheduler_tests_elided = 0;
+		u32 code_budget_continuation_hot_instructions_elided = 0;
 		u32 generated_frame_pushes = 0;
 		u32 generated_frame_pops = 0;
 		u32 dispatcher_frame_pushes = 0;
@@ -242,7 +245,8 @@ namespace VitaEE
 			CompatibleVtlbFastEntryOffsets compatible_vtlb_fast_entries{};
 			u8 compatible_link_entry_loads = 0;
 			DirectLinkSlots direct_links{};
-			bool concatenated_short = false;
+			DirectContinuationKind direct_continuation_kind =
+				DirectContinuationKind::SchedulerTestedTail;
 			bool discovered_topology = false;
 			bool valid = false;
 			bool queued_free = false;
@@ -353,7 +357,7 @@ namespace VitaEE
 			u32* scaled_cycles, bool allow_code_budget_split = false,
 			u32 dependency_start_pc = 0, u32 dependency_instruction_count = 0,
 			u32 dependency_charged_cycles_before = 0,
-			bool concatenate_short_split = false,
+			bool pcsx2_short_split = false,
 			bool discovered_topology = false);
 		bool AnalyzeGprLinkSignature(u32 start_pc, u32 instruction_count,
 			GprLinkSignature* signature) const;
@@ -394,7 +398,7 @@ namespace VitaEE
 		VitaA32::CodeBuffer m_persistent_dispatch_code;
 		const void* m_persistent_dispatch_entry = nullptr;
 		const void* m_persistent_direct_exit = nullptr;
-		const void* m_persistent_concatenated_direct_exit = nullptr;
+		const void* m_persistent_scheduler_elided_direct_exit = nullptr;
 		const void* m_persistent_event_exit = nullptr;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;

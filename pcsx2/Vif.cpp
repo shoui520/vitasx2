@@ -10,7 +10,130 @@
 #include "Vif_Dma.h"
 #include "Vif_Dynarec.h"
 
+#include <type_traits>
+
 alignas(16) vifStruct vif0, vif1;
+
+static bool PortableBoolIsCanonical(const bool& value)
+{
+	static_assert(sizeof(bool) == sizeof(u8));
+	u8 representation = 0;
+	std::memcpy(&representation, &value, sizeof(representation));
+	return representation <= 1u;
+}
+
+static bool IsActiveVifUnpack(const vifStruct& vif)
+{
+	const u32 command = static_cast<u32>(vif.cmd) & 0x7fu;
+	return command >= 0x60u && command <= 0x7fu && vif.pass != 0;
+}
+
+static bool ValidatePortableVifContinuation(const vifStruct& vif, const nVifStruct& nvif, u32 index)
+{
+	if (!PortableBoolIsCanonical(vif.done) ||
+		!PortableBoolIsCanonical(vif.vifstalled.enabled) ||
+		!PortableBoolIsCanonical(vif.stallontag) ||
+		!PortableBoolIsCanonical(vif.waitforvu) ||
+		!PortableBoolIsCanonical(vif.irqoffset.enabled) ||
+		!PortableBoolIsCanonical(vif.queued_program) ||
+		!PortableBoolIsCanonical(vif.queued_gif_wait) ||
+		vif.cmd < 0 || vif.cmd > 0xff || vif.pass < 0 || vif.pass > 1 ||
+		vif.irq < 0 || vif.irq > 1 || vif.usn > 1u || vif.start_aligned > 4u ||
+		vif.tag.cmd > 0xffu || vif.vifstalled.value > VIF_IRQ_STALL ||
+		vif.irqoffset.value >= 4u || (vif.inprogress & ~0x11u) != 0 ||
+		vif.dmamode > VIF_CHAIN_MODE || nvif.bSize > sizeof(nvif.buffer) ||
+		(nvif.bSize & 3u) != 0)
+	{
+		return false;
+	}
+
+	if (vif.queued_program && vif.queued_pc != ~0u &&
+		vif.queued_pc > (index ? 0x7ffu : 0x1ffu))
+	{
+		return false;
+	}
+
+	if (vif.cmd == 0)
+		return vif.pass == 0 && nvif.bSize == 0;
+	if (vif.pass == 0)
+		return nvif.bSize == 0;
+
+	const u32 command = static_cast<u32>(vif.cmd) & 0x7fu;
+	switch (command)
+	{
+		case 0x20: // Vif_Codes.cpp::vifCode_STMask().
+			return vif.tag.size == 1u && nvif.bSize == 0;
+
+		case 0x30: // Vif_Codes.cpp::vifCode_STRow().
+		case 0x31: // Vif_Codes.cpp::vifCode_STCol().
+			return vif.tag.addr < 4u && vif.tag.size <= 4u &&
+				vif.tag.addr + vif.tag.size == 4u && nvif.bSize == 0;
+
+		case 0x4a: // Vif_Codes.cpp::vifCode_MPG().
+			return vif.tag.addr <= (index ? VU1_PROGSIZE : VU0_PROGSIZE) &&
+				(vif.tag.addr & 3u) == 0 && vif.tag.size > 0 &&
+				vif.tag.size <= 512u && nvif.bSize == 0;
+
+		case 0x50: // Vif_Codes.cpp::vifCode_Direct().
+		case 0x51: // Vif_Codes.cpp::vifCode_DirectHL().
+			return index == 1u && vif.tag.size > 0 && vif.tag.size <= 65536u * 4u &&
+				nvif.bSize == 0;
+
+		default:
+			break;
+	}
+
+	if (command >= 0x60u)
+	{
+		const u32 unpack_type = command & 0x0fu;
+		const bool valid_unpack_type = unpack_type != 0x03u && unpack_type != 0x07u &&
+			unpack_type != 0x0bu;
+		const u32 memory_size = index ? VU1_MEMSIZE : VU0_MEMSIZE;
+		return valid_unpack_type && vif.tag.addr < memory_size &&
+			(vif.tag.addr & 0xfu) == 0 && vif.tag.size <= 1024u &&
+			static_cast<u64>(nvif.bSize) + static_cast<u64>(vif.tag.size) * 4u <=
+				sizeof(nvif.buffer) && vif.start_aligned >= 1u;
+	}
+
+	return nvif.bSize == 0;
+}
+
+static bool ValidatePortableVifRegistersForUnit(const vifStruct& vif,
+	const nVifStruct& nvif, const VIFregisters& regs)
+{
+	if (regs.mode > 3u || regs.num > 256u)
+		return false;
+
+	if (vif.cmd == 0 || vif.pass == 0 || (static_cast<u32>(vif.cmd) & 0x7fu) < 0x60u)
+		return true;
+
+	const u32 command_byte = static_cast<u32>(vif.cmd);
+	const u32 unpack_type = command_byte & 0x0fu;
+	const u32 vector_bytes = nVifT[unpack_type];
+	const u32 original_num_byte = (regs.code >> 16) & 0xffu;
+	const u32 original_num = original_num_byte != 0 ? original_num_byte : 256u;
+	const u32 write_length = regs.cycle.wl != 0 ? regs.cycle.wl : 256u;
+	u32 source_vectors = original_num;
+	if (write_length > regs.cycle.cl)
+	{
+		source_vectors = static_cast<u32>(regs.cycle.cl) * (original_num / write_length) +
+			std::min(original_num % write_length, static_cast<u32>(regs.cycle.cl));
+	}
+	const u32 expected_words = (source_vectors * vector_bytes + 3u) / 4u;
+
+	return vector_bytes != 0 && expected_words != 0 && vif.tag.size != 0 &&
+		((regs.code >> 24) & 0xffu) == command_byte && vif.tag.cmd == command_byte &&
+		vif.usn == ((regs.code >> 14) & 1u) && regs.num != 0 && regs.num <= original_num &&
+		(nvif.bSize != 0 || regs.num == original_num) &&
+		static_cast<u64>(nvif.bSize) + static_cast<u64>(vif.tag.size) * 4u ==
+			static_cast<u64>(expected_words) * 4u;
+}
+
+bool vifValidatePortableRegisters()
+{
+	return ValidatePortableVifRegistersForUnit(vif0, nVif[0], vif0Regs) &&
+		ValidatePortableVifRegistersForUnit(vif1, nVif[1], vif1Regs);
+}
 
 void vif0Reset()
 {
@@ -37,9 +160,47 @@ bool SaveStateBase::vif0Freeze()
 
 	Freeze(g_vif0Cycles);
 
-	Freeze(vif0);
+	if (IsPortableReplay())
+	{
+		// Vif_Dynarec.cpp::dVifUnpack() and VitaVifInterpreter.cpp leave
+		// different cycle-position residue after a completed UNPACK. The next
+		// vifUnpackSetup() resets it, exactly matching HashVifState's boundary.
+		static_assert(std::is_trivially_copyable_v<vifStruct>);
+		vifStruct portable_vif;
+		std::memcpy(&portable_vif, &vif0, sizeof(portable_vif));
+		if (IsSaving() && !IsActiveVifUnpack(portable_vif))
+			portable_vif.cl = 0;
+		Freeze(portable_vif);
+		if (IsLoading())
+		{
+			if (!IsActiveVifUnpack(portable_vif) && portable_vif.cl != 0)
+			{
+				Console.Error("Portable replay VIF0 has non-canonical completed-UNPACK residue.");
+				m_error = true;
+				return false;
+			}
+			std::memcpy(&vif0, &portable_vif, sizeof(vif0));
+		}
+	}
+	else
+	{
+		Freeze(vif0);
+	}
 
 	Freeze(nVif[0].bSize);
+	if (IsPortableReplay() && !ValidatePortableVifContinuation(vif0, nVif[0], 0))
+	{
+		Console.Error("Portable replay VIF0 continuation is invalid.");
+		m_error = true;
+		return false;
+	}
+	if (IsPortableReplay() && IsSaving() &&
+		!ValidatePortableVifRegistersForUnit(vif0, nVif[0], vif0Regs))
+	{
+		Console.Error("Portable replay VIF0 hardware-register continuation is invalid.");
+		m_error = true;
+		return false;
+	}
 	FreezeMem(nVif[0].buffer, nVif[0].bSize);
 
 	return IsOkay();
@@ -52,9 +213,44 @@ bool SaveStateBase::vif1Freeze()
 
 	Freeze(g_vif1Cycles);
 
-	Freeze(vif1);
+	if (IsPortableReplay())
+	{
+		static_assert(std::is_trivially_copyable_v<vifStruct>);
+		vifStruct portable_vif;
+		std::memcpy(&portable_vif, &vif1, sizeof(portable_vif));
+		if (IsSaving() && !IsActiveVifUnpack(portable_vif))
+			portable_vif.cl = 0;
+		Freeze(portable_vif);
+		if (IsLoading())
+		{
+			if (!IsActiveVifUnpack(portable_vif) && portable_vif.cl != 0)
+			{
+				Console.Error("Portable replay VIF1 has non-canonical completed-UNPACK residue.");
+				m_error = true;
+				return false;
+			}
+			std::memcpy(&vif1, &portable_vif, sizeof(vif1));
+		}
+	}
+	else
+	{
+		Freeze(vif1);
+	}
 
 	Freeze(nVif[1].bSize);
+	if (IsPortableReplay() && !ValidatePortableVifContinuation(vif1, nVif[1], 1))
+	{
+		Console.Error("Portable replay VIF1 continuation is invalid.");
+		m_error = true;
+		return false;
+	}
+	if (IsPortableReplay() && IsSaving() &&
+		!ValidatePortableVifRegistersForUnit(vif1, nVif[1], vif1Regs))
+	{
+		Console.Error("Portable replay VIF1 hardware-register continuation is invalid.");
+		m_error = true;
+		return false;
+	}
 	FreezeMem(nVif[1].buffer, nVif[1].bSize);
 
 	return IsOkay();

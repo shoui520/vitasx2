@@ -6,6 +6,9 @@
 #include "GS.h"
 #include "Gif_Unit.h"
 #include "MTVU.h"
+#if defined(ARCH_ARM32)
+#include "vita/VitaFpRounding.h"
+#endif
 
 #include <cmath>
 u32 laststall = 0;
@@ -420,6 +423,14 @@ __fi void _vuAddLowerStalls(VURegs* VU, _VURegsNum* VUregsn)
 __fi void _vuBackupVI(VURegs* VU, u32 reg)
 {
 #ifdef VI_BACKUP
+	// EE COP2 macro instructions are not VU microprogram pairs. PCSX2's x86
+	// microVU_Macro.inl leaves mVUlow.backupVI clear for those one-op macro
+	// compilations, so the shared interpreter bodies must not leak a macro VI
+	// write into the next microprogram's two-cycle branch-hazard window.
+	const u32 active_mask = (VU == &VU0) ? 0x1u : 0x100u;
+	if ((VU0.VI[REG_VPU_STAT].UL & active_mask) == 0)
+		return;
+
 	if (VU->VIBackupCycles && reg == VU->VIRegNumber)
 	{
 		//On repeat writes we need to remember the value from before the chain
@@ -895,10 +906,18 @@ static __fi void _vuFTOI15(VURegs* VU) { applyUnaryFunction<floatToInt<15>>(VU);
 template <u32 Offset>
 static __fi u32 intToFloat(u32 uvalue)
 {
+#if defined(ARCH_ARM32)
+	// The generic four-lane owner can be auto-vectorized into Advanced SIMD
+	// VCVT, whose fixed round-to-nearest semantics ignore the VU FPSCR. Keep the
+	// interpreter fallback bit-identical to PCSX2's x86/MXCSR conversion and the
+	// A32 JIT by forcing scalar VFP under the installed VU rounding mode.
+	return VitaA32::ConvertSignedIntToFloatBits(uvalue, Offset);
+#else
 	float fvalue = static_cast<float>(static_cast<s32>(uvalue));
 	if (Offset)
 		fvalue *= std::bit_cast<float>(0x3f800000 - (Offset << 23));
 	return std::bit_cast<u32>(fvalue);
+#endif
 }
 
 static __fi void _vuITOF0 (VURegs* VU) { applyUnaryFunction<intToFloat< 0>>(VU); }

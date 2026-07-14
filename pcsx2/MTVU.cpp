@@ -48,6 +48,38 @@ bool SaveStateBase::mtvuFreeze()
 	if (!FreezeTag("MTVU"))
 		return false;
 
+	if (IsPortableReplay())
+	{
+		// Portable replay explicitly requires MTVU to be disabled and both VUs
+		// idle. In that configuration the worker ring is host-private cache state:
+		// encode one canonical empty state and reset it directly on load instead of
+		// enqueueing architecture-owned pointers into an inactive worker.
+		u32 vu_cycles[4] = {};
+		u32 interrupts = 0;
+		u64 signal = 0;
+		u64 label = 0;
+		u32 cycle_index = 0;
+		Freeze(vu_cycles);
+		Freeze(interrupts);
+		Freeze(signal);
+		Freeze(label);
+		Freeze(cycle_index);
+		if (IsLoading())
+		{
+			for (const u32 cycles : vu_cycles)
+			{
+				if (cycles != 0)
+					m_error = true;
+			}
+			if (interrupts != 0 || signal != 0 || label != 0 || cycle_index != 0)
+				m_error = true;
+			if (m_error)
+				return false;
+			vu1Thread.Reset();
+		}
+		return IsOkay();
+	}
+
 	pxAssert(vu1Thread.IsDone());
 	if (!IsSaving())
 	{

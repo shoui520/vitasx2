@@ -1104,11 +1104,149 @@ void cdrReset()
 	cdReadTime = (PSXCLK / 1757) * BIAS;
 }
 
+static bool ValidatePortableCdromState(s32 transfer_offset)
+{
+	if (cdr.ParamC > sizeof(cdr.Param) || cdr.ParamP > sizeof(cdr.Param) ||
+		cdr.ParamC != cdr.ParamP)
+	{
+		Console.Error("Portable PS1 CD replay state contains an invalid parameter cursor.");
+		return false;
+	}
+
+	if (cdr.ResultC > sizeof(cdr.Result) || cdr.ResultP > cdr.ResultC ||
+		cdr.ResultReady > 1 ||
+		(cdr.ResultReady && (cdr.ResultC == 0 || cdr.ResultP == cdr.ResultC)))
+	{
+		Console.Error("Portable PS1 CD replay state contains an invalid result cursor.");
+		return false;
+	}
+
+	if (cdr.Readed != 0 && cdr.Readed != 1 && cdr.Readed != 0xff)
+	{
+		Console.Error("Portable PS1 CD replay state contains an invalid transfer phase.");
+		return false;
+	}
+
+	if (transfer_offset < -1 ||
+		transfer_offset > static_cast<s32>(sizeof(cdr.Transfer)))
+	{
+		Console.Error("Portable PS1 CD replay state contains an invalid transfer offset.");
+		return false;
+	}
+
+	// Readed == 1 is the data-port phase initialized by cdrWrite3(0x80).
+	// StartReading() uses 0xff for an asynchronous pending phase without
+	// initializing pTransfer, so preserve its null/stale in-buffer representation
+	// rather than rejecting an owner-produced continuation.
+	if (cdr.Readed == 1 &&
+		(transfer_offset < 0 || transfer_offset >= static_cast<s32>(sizeof(cdr.Transfer))))
+	{
+		Console.Error("Portable PS1 CD replay state contains an invalid active transfer cursor.");
+		return false;
+	}
+
+	return true;
+}
+
 bool SaveStateBase::cdrFreeze()
 {
 	if (!FreezeTag("cdrom"))
 		return false;
 
-	Freeze(cdr);
+	if (!IsPortableReplay())
+	{
+		Freeze(cdr);
+		return IsOkay();
+	}
+
+	// PCSX2's native .p2s payload deliberately freezes cdrStruct verbatim.
+	// That struct contains pTransfer and therefore differs between x86-64 and
+	// AArch32. The validation replay format keeps the owning fields and encodes
+	// only a checked offset into Transfer; normal savestates remain unchanged.
+	if (!FreezeTag("cdrom-portable-v1"))
+		return false;
+
+	s32 transfer_offset = -1;
+	if (IsSaving() && cdr.pTransfer)
+	{
+		const uptr transfer_base = reinterpret_cast<uptr>(cdr.Transfer);
+		const uptr transfer_pointer = reinterpret_cast<uptr>(cdr.pTransfer);
+		if (transfer_pointer < transfer_base ||
+			transfer_pointer - transfer_base > sizeof(cdr.Transfer))
+		{
+			Console.Error("PS1 CD replay state has an out-of-range transfer pointer.");
+			m_error = true;
+			return false;
+		}
+		transfer_offset = static_cast<s32>(transfer_pointer - transfer_base);
+	}
+	if (IsSaving() && !ValidatePortableCdromState(transfer_offset))
+	{
+		m_error = true;
+		return false;
+	}
+
+	Freeze(cdr.OCUP);
+	Freeze(cdr.Reg1Mode);
+	Freeze(cdr.Reg2);
+	Freeze(cdr.CmdProcess);
+	Freeze(cdr.Ctrl);
+	Freeze(cdr.Stat);
+	Freeze(cdr.StatP);
+	Freeze(cdr.Transfer);
+	Freeze(transfer_offset);
+	Freeze(cdr.Prev);
+	Freeze(cdr.Param);
+	Freeze(cdr.Result);
+	Freeze(cdr.ParamC);
+	Freeze(cdr.ParamP);
+	Freeze(cdr.ResultC);
+	Freeze(cdr.ResultP);
+	Freeze(cdr.ResultReady);
+	Freeze(cdr.Cmd);
+	Freeze(cdr.SetlocPending);
+	Freeze(cdr.Readed);
+	Freeze(cdr.Reading);
+	Freeze(cdr.ResultTN.strack);
+	Freeze(cdr.ResultTN.etrack);
+	Freeze(cdr.ResultTD);
+	Freeze(cdr.SetSector);
+	Freeze(cdr.SetSectorSeek);
+	Freeze(cdr.Track);
+	Freeze(cdr.Play);
+	Freeze(cdr.CurTrack);
+	Freeze(cdr.Mode);
+	Freeze(cdr.File);
+	Freeze(cdr.Channel);
+	Freeze(cdr.Muted);
+	Freeze(cdr.Reset);
+	Freeze(cdr.RErr);
+	Freeze(cdr.FirstSector);
+	Freeze(cdr.Xa.freq);
+	Freeze(cdr.Xa.nbits);
+	Freeze(cdr.Xa.stereo);
+	Freeze(cdr.Xa.nsamples);
+	Freeze(cdr.Xa.left.y0);
+	Freeze(cdr.Xa.left.y1);
+	Freeze(cdr.Xa.right.y0);
+	Freeze(cdr.Xa.right.y1);
+	Freeze(cdr.Xa.pcm);
+	Freeze(cdr.Init);
+	Freeze(cdr.IrqMask);
+	Freeze(cdr.Irq);
+	Freeze(cdr.eCycle);
+	Freeze(cdr.Unused);
+	if (!IsOkay())
+		return false;
+
+	if (IsLoading())
+	{
+		if (!ValidatePortableCdromState(transfer_offset))
+		{
+			m_error = true;
+			return false;
+		}
+		cdr.pTransfer = transfer_offset < 0 ? nullptr : cdr.Transfer + transfer_offset;
+	}
 	return IsOkay();
 }

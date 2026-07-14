@@ -320,6 +320,12 @@ bool Sio0::DoState(StateWrapper& sw)
 	sw.Do(&rxDataSet);
 	sw.Do(&port);
 	sw.Do(&slot);
+	if (sw.IsPortableReplay() &&
+		(sw.HasError() || port >= SIO::PORTS || slot >= SIO::SLOTS))
+	{
+		Console.Error("Portable replay SIO0 port/slot state is invalid.");
+		return false;
+	}
 
 	return sw.IsGood();
 }

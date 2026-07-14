@@ -8,6 +8,10 @@
 #include "common/SingleRegisterTypes.h"
 
 void resetCache();
+// True only for resetCache()'s complete empty state. Portable replay currently
+// excludes EE data-cache continuation and must reject any live tag/data/LRF
+// state before serialization.
+bool isCacheEmpty();
 // Dumps all dirty cache entries to memory
 // This is necessary to fix a bug when enabled the recompiler while the cache was enabled.
 void writebackCache();

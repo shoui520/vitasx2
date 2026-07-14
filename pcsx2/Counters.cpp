@@ -1053,7 +1053,12 @@ bool SaveStateBase::rcntFreeze()
 	Freeze(gsVideoMode);
 	Freeze(gsIsInterlaced);
 
-	if (IsLoading())
+	// Native .p2s states are configuration-tolerant, so rebuild their next
+	// counter representation from the restored counters. Portable replay also
+	// restores cpuRegs' event deadline and requires the exact saved
+	// nextStartCounter/nextDeltaCounter pair; cpuRcntSet() preserves the deadline
+	// but rewrites that pair and destroys an exact cross-provider boundary.
+	if (IsLoading() && !IsPortableReplay())
 		cpuRcntSet();
 
 	return IsOkay();

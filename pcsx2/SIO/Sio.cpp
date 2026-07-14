@@ -7,13 +7,191 @@
 #include "SIO/Memcard/MemoryCardProtocol.h"
 #include "Counters.h"
 
+#include "StateWrapper.h"
+
+#include "common/Console.h"
 #include "Host.h"
 #include "IconsPromptFont.h"
 
+#include <algorithm>
 #include <atomic>
+#include <utility>
 
 _mcd mcds[2][4];
 _mcd *mcd;
+
+namespace
+{
+	// MemoryCardFile.cpp::MC2_ERASE_SIZE is 528 * 16 = 8448 bytes. The protocol's
+	// dynamic legacy buffer is currently unused, but keep a generous bound above
+	// the concrete owner maximum while preventing arbitrary replay allocations.
+	static constexpr u32 PORTABLE_MCD_BUFFER_LIMIT = 64 * 1024;
+	static constexpr u32 PORTABLE_MCD_MAX_AUTO_EJECT_TICKS = 60;
+	static constexpr u32 PS1_MEMORY_CARD_SECTORS = 0x400;
+	static constexpr u32 PS1_MEMORY_CARD_SECTOR_SIZE = 128;
+
+	bool PortableMemoryCardAddressIsValid(_mcd& card, u32 sector_address,
+		u32 transfer_address)
+	{
+		if (!card.IsPresent())
+			return true;
+
+		if (card.IsPSX())
+		{
+			if (sector_address >= PS1_MEMORY_CARD_SECTORS)
+				return false;
+			const u32 sector_begin = sector_address * PS1_MEMORY_CARD_SECTOR_SIZE;
+			return transfer_address >= sector_begin &&
+				transfer_address <= sector_begin + PS1_MEMORY_CARD_SECTOR_SIZE;
+		}
+
+		McdSizeInfo info = {};
+		card.GetSizeInfo(info);
+		if ((info.SectorSize != 512 && info.SectorSize != 1024) ||
+			info.EraseBlockSizeInSectors == 0 || info.EraseBlockSizeInSectors > 16 ||
+			info.McdSizeInSectors == 0 || sector_address >= info.McdSizeInSectors)
+		{
+			return false;
+		}
+
+		const u64 backing_size =
+			static_cast<u64>(info.SectorSize + 16) * info.McdSizeInSectors;
+		const u64 sector_begin =
+			static_cast<u64>(info.SectorSize + 16) * sector_address;
+		const u64 sector_end = std::min<u64>(
+			sector_begin + info.SectorSize + 16, backing_size);
+		return transfer_address >= sector_begin && transfer_address <= sector_end;
+	}
+
+	bool DoPortableMemoryCardSlot(StateWrapper& sw, _mcd& card,
+		u8 expected_port, u8 expected_slot)
+	{
+		u8 current_command = card.currentCommand;
+		u8 term = card.term;
+		u8 good_sector = card.goodSector ? 1 : 0;
+		u8 msb = card.msb;
+		u8 lsb = card.lsb;
+		u32 sector_address = card.sectorAddr;
+		u32 transfer_address = card.transferAddr;
+		u32 buffer_size = static_cast<u32>(card.buf.size());
+		u8 flag = card.FLAG;
+		u8 port = card.port;
+		u8 slot = card.slot;
+		u32 auto_eject_ticks = static_cast<u32>(card.autoEjectTicks);
+
+		if (sw.IsWriting() &&
+			(card.buf.size() > PORTABLE_MCD_BUFFER_LIMIT ||
+			 card.autoEjectTicks > PORTABLE_MCD_MAX_AUTO_EJECT_TICKS ||
+			 port != expected_port || slot != expected_slot ||
+			 !PortableMemoryCardAddressIsValid(card, sector_address, transfer_address)))
+		{
+			Console.Error("Portable replay memory-card slot state is invalid.");
+			return false;
+		}
+
+		sw.Do(&current_command);
+		sw.Do(&term);
+		sw.Do(&good_sector);
+		sw.Do(&msb);
+		sw.Do(&lsb);
+		sw.Do(&sector_address);
+		sw.Do(&transfer_address);
+		sw.Do(&buffer_size);
+		if (sw.HasError() || buffer_size > PORTABLE_MCD_BUFFER_LIMIT)
+		{
+			Console.Error("Portable replay memory-card transfer buffer is invalid.");
+			return false;
+		}
+
+		std::vector<u8> buffer;
+		if (sw.IsWriting())
+			buffer = card.buf;
+		else
+			buffer.resize(buffer_size);
+		if (buffer_size != 0)
+			sw.DoBytes(buffer.data(), buffer_size);
+
+		sw.Do(&flag);
+		sw.Do(&port);
+		sw.Do(&slot);
+		sw.Do(&auto_eject_ticks);
+		if (sw.HasError() || good_sector > 1 || port != expected_port ||
+			slot != expected_slot ||
+			auto_eject_ticks > PORTABLE_MCD_MAX_AUTO_EJECT_TICKS ||
+			!PortableMemoryCardAddressIsValid(card, sector_address, transfer_address))
+		{
+			Console.Error("Portable replay memory-card slot provenance is invalid.");
+			return false;
+		}
+
+		if (sw.IsReading())
+		{
+			card.currentCommand = current_command;
+			card.term = term;
+			card.goodSector = (good_sector != 0);
+			card.msb = msb;
+			card.lsb = lsb;
+			card.sectorAddr = sector_address;
+			card.transferAddr = transfer_address;
+			card.buf = std::move(buffer);
+			card.FLAG = flag;
+			card.port = port;
+			card.slot = slot;
+			card.autoEjectTicks = auto_eject_ticks;
+		}
+		return true;
+	}
+} // namespace
+
+bool sioDoPortableMemoryCardState(StateWrapper& sw)
+{
+	if (!sw.IsPortableReplay() || !sw.DoMarker("SioMemoryCards-v1"))
+		return false;
+
+	u8 selected_port = 0xff;
+	u8 selected_slot = 0xff;
+	if (sw.IsWriting())
+	{
+		for (u8 port = 0; port < SIO::PORTS; port++)
+		{
+			for (u8 slot = 0; slot < SIO::SLOTS; slot++)
+			{
+				if (mcd == &mcds[port][slot])
+				{
+					selected_port = port;
+					selected_slot = slot;
+				}
+			}
+		}
+		if (selected_port == 0xff)
+		{
+			Console.Error("Portable replay selected memory-card pointer has no slot provenance.");
+			return false;
+		}
+	}
+
+	for (u8 port = 0; port < SIO::PORTS; port++)
+	{
+		for (u8 slot = 0; slot < SIO::SLOTS; slot++)
+		{
+			if (!DoPortableMemoryCardSlot(sw, mcds[port][slot], port, slot))
+				return false;
+		}
+	}
+
+	sw.Do(&selected_port);
+	sw.Do(&selected_slot);
+	if (sw.HasError() || selected_port >= SIO::PORTS || selected_slot >= SIO::SLOTS ||
+		!g_MemoryCardProtocol.DoPortableState(sw))
+	{
+		Console.Error("Portable replay selected memory-card provenance is invalid.");
+		return false;
+	}
+
+	if (sw.IsReading())
+		mcd = &mcds[selected_port][selected_slot];
+	return true;
+}
 
 void sioNextFrame() {
 	for ( uint port = 0; port < 2; ++port ) {

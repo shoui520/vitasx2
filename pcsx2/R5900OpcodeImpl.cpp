@@ -22,6 +22,10 @@
 GS_VideoMode gsVideoMode = GS_VideoMode::Uninitialized;
 bool gsIsInterlaced = false;
 
+#if defined(ARCH_ARM32) && defined(VITASX2_QEMU_VALIDATION) && !defined(VITASX2_QEMU_FULL_CORE)
+extern "C" void VitaEeQemuPoisonReturningHelperVectorState();
+#endif
+
 static __fi bool _add64_Overflow( s64 x, s64 y, s64 &ret )
 {
 	const s64 result = x + y;
@@ -914,6 +918,19 @@ void MOVN() {
 
 void SYSCALL()
 {
+#if defined(ARCH_ARM32) && defined(VITASX2_QEMU_VALIDATION) && !defined(VITASX2_QEMU_FULL_CORE)
+	// The provider fixture deliberately makes this returning interpreter helper
+	// exercise the complete AAPCS vector-clobber contract. The guard runs on HLE
+	// early returns as well as exception paths, immediately before the C++ return.
+	struct QemuReturningHelperVectorPoisonGuard
+	{
+		~QemuReturningHelperVectorPoisonGuard()
+		{
+			VitaEeQemuPoisonReturningHelperVectorState();
+		}
+	} qemu_returning_helper_vector_poison_guard;
+#endif
+
 	u8 call;
 
 	if (cpuRegs.GPR.n.v1.SL[0] < 0)

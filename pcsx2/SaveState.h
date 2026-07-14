@@ -50,9 +50,25 @@ struct SaveStateScreenshotData
 
 class ArchiveEntryList;
 
+enum class PortableStateLoadResult : u8
+{
+	RejectedBeforeMutation,
+	FailedAfterMutation,
+	Loaded,
+};
+
 // Wrappers to generate a save state compatible across all frontends.
 // These functions assume that the caller has paused the core thread.
 extern std::unique_ptr<ArchiveEntryList> SaveState_DownloadState(Error* error);
+// Validation-only little-endian x86-64/AArch32 replay schema. Pointer- and
+// host-resource-bearing state has explicit portable owners; the remaining POD
+// owner payloads are guarded by strict sizes and an exact cross-ABI round trip.
+extern std::unique_ptr<ArchiveEntryList> SaveState_DownloadPortableState(Error* error);
+// Loading is deliberately non-transactional. RejectedBeforeMutation leaves the
+// live VM untouched; FailedAfterMutation requires the caller to destroy/reset
+// the VM and forbids resuming guest execution.
+extern PortableStateLoadResult SaveState_LoadPortableState(
+	const ArchiveEntryList& entries, Error* error);
 extern std::unique_ptr<SaveStateScreenshotData> SaveState_SaveScreenshot();
 extern bool SaveState_ZipToDisk(
 	std::unique_ptr<ArchiveEntryList> srclist, std::unique_ptr<SaveStateScreenshotData> screenshot,
@@ -70,9 +86,15 @@ class SaveStateBase
 {
 public:
 	using VmStateBuffer = std::vector<u8>;
+	enum class DataFormat : u8
+	{
+		Native,
+		PortableReplayV1,
+	};
 
 protected:
 	VmStateBuffer& m_memory;
+	DataFormat m_data_format = DataFormat::Native;
 
 	u32 m_version = 0;		// version of the savestate being loaded.
 
@@ -81,7 +103,7 @@ protected:
 	bool m_error = false; // error occurred while reading/writing
 
 public:
-	SaveStateBase(VmStateBuffer& memblock);
+	SaveStateBase(VmStateBuffer& memblock, DataFormat data_format = DataFormat::Native);
 	virtual ~SaveStateBase() = default;
 
 	__fi bool HasError() const { return m_error; }
@@ -147,12 +169,38 @@ public:
 
 	void FreezeString(std::string& s)
 	{
+		static constexpr size_t PORTABLE_REPLAY_MAX_STRING_LENGTH = 4096;
+
+		if (IsPortableReplay() && IsSaving() && s.length() > PORTABLE_REPLAY_MAX_STRING_LENGTH)
+		{
+			m_error = true;
+			return;
+		}
+
 		// overwritten when loading
 		u32 length = static_cast<u32>(s.length());
 		Freeze(length);
+		if (HasError())
+		{
+			if (IsLoading())
+				s.clear();
+			return;
+		}
 
 		if (IsLoading())
+		{
+			if (IsPortableReplay() &&
+				(length > PORTABLE_REPLAY_MAX_STRING_LENGTH || m_idx < 0 ||
+				 static_cast<size_t>(m_idx) > m_memory.size() ||
+				 length > (m_memory.size() - static_cast<size_t>(m_idx))))
+			{
+				m_error = true;
+				s.clear();
+				return;
+			}
+
 			s.resize(length);
+		}
 
 		FreezeMem(s.data(), length);
 	}
@@ -180,6 +228,7 @@ public:
 
 	// Returns true if this object is a StateLoading type object.
 	bool IsLoading() const { return !IsSaving(); }
+	bool IsPortableReplay() const { return m_data_format == DataFormat::PortableReplayV1; }
 
 	// Loads or saves a memory block.
 	virtual void FreezeMem( void* data, int size )=0;
@@ -340,7 +389,7 @@ class memSavingState final : public SaveStateBase
 	typedef SaveStateBase _parent;
 
 public:
-	memSavingState(VmStateBuffer& save_to);
+	memSavingState(VmStateBuffer& save_to, DataFormat data_format = DataFormat::Native);
 	~memSavingState() override = default;
 
 	void FreezeMem(void* data, int size) override;
@@ -350,7 +399,7 @@ public:
 class memLoadingState final : public SaveStateBase
 {
 public:
-	memLoadingState(const VmStateBuffer& load_from);
+	memLoadingState(const VmStateBuffer& load_from, DataFormat data_format = DataFormat::Native);
 	~memLoadingState() override = default;
 
 	void FreezeMem(void* data, int size) override;

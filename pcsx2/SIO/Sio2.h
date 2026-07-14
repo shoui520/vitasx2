@@ -24,7 +24,7 @@ public:
 	size_t pop_front(u8* destination, size_t bytes);
 	void clear();
 	void reserve(size_t capacity);
-	void DoState(StateWrapper& sw);
+	bool DoState(StateWrapper& sw, u32 portable_limit);
 
 private:
 	void CompactConsumed();

@@ -107,6 +107,12 @@ bool MultitapProtocol::DoState(StateWrapper& sw)
 
 	sw.Do(&currentPadSlot);
 	sw.Do(&currentMemcardSlot);
+	if (sw.IsPortableReplay() &&
+		(sw.HasError() || currentPadSlot >= SIO::SLOTS || currentMemcardSlot >= SIO::SLOTS))
+	{
+		Console.Error("Portable replay multitap slot state is invalid.");
+		return false;
+	}
 	return true;
 }
 

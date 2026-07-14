@@ -297,3 +297,6 @@ extern void IPUCMD_WRITE(u32 val);
 extern void ipuSoftReset();
 extern void IPUProcessInterrupt();
 
+// Portable replay restores IPU internals before eeHw. Call this only after the
+// saved hardware-register image has also been installed.
+extern bool ipuValidatePortableState();

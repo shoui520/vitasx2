@@ -187,6 +187,7 @@ namespace VitaA32
 			Condition condition = Condition::AL);
 		bool EmitVmovCorePairToD(unsigned dd, unsigned rt, unsigned rt2);
 		bool EmitVcvtF32S32(unsigned sd, unsigned sm);
+		bool EmitVcvtS32F32(unsigned sd, unsigned sm);
 		bool EmitVcvtF64F32(unsigned dd, unsigned sm);
 		bool EmitVcvtF32F64(unsigned sd, unsigned dm);
 		bool EmitVcvtF32S32Q(unsigned qd, unsigned qm);
@@ -413,6 +414,7 @@ namespace VitaA32
 		Condition condition = Condition::AL);
 	u32 EncodeVmovCorePairToD(unsigned dd, unsigned rt, unsigned rt2);
 	u32 EncodeVcvtF32S32(unsigned sd, unsigned sm);
+	u32 EncodeVcvtS32F32(unsigned sd, unsigned sm);
 	u32 EncodeVcvtF64F32(unsigned dd, unsigned sm);
 	u32 EncodeVcvtF32F64(unsigned sd, unsigned dm);
 	u32 EncodeVcvtF32S32Q(unsigned qd, unsigned qm);

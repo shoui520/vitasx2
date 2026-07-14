@@ -21,6 +21,11 @@ public:
 		Read,
 		Write
 	};
+	enum class DataFormat : u8
+	{
+		Native,
+		PortableReplayV1,
+	};
 
 	// Only supports up to 4GB. More than enough.
 	class IStream
@@ -90,18 +95,21 @@ public:
 	};
 
 public:
-	StateWrapper(IStream* stream, Mode mode, u32 version);
+	StateWrapper(IStream* stream, Mode mode, u32 version,
+		DataFormat data_format = DataFormat::Native);
 	StateWrapper(const StateWrapper&) = delete;
 	~StateWrapper();
 
 	IStream* GetStream() const { return m_stream; }
 	bool HasError() const { return m_error; }
 	bool IsGood() const { return !m_error; }
+	void SetError() { m_error = true; }
 	bool IsReading() const { return (m_mode == Mode::Read); }
 	bool IsWriting() const { return (m_mode == Mode::Write); }
 	Mode GetMode() const { return m_mode; }
 	void SetMode(Mode mode) { m_mode = mode; }
 	u32 GetVersion() const { return m_version; }
+	bool IsPortableReplay() const { return m_data_format == DataFormat::PortableReplayV1; }
 
 	/// Overload for integral or floating-point types. Writes bytes as-is.
 	template <typename T>
@@ -267,5 +275,6 @@ private:
 	IStream* m_stream;
 	Mode m_mode;
 	u32 m_version;
+	DataFormat m_data_format;
 	bool m_error = false;
 };

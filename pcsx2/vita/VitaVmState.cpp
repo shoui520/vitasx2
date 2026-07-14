@@ -21,6 +21,7 @@
 #include "Memory.h"
 #include "R3000A.h"
 #include "R5900.h"
+#include "SaveState.h"
 #include "VMManager.h"
 #include "VUmicro.h"
 #include "vita/VitaCore.h"
@@ -321,4 +322,81 @@ void VitaSetFastBootDisc()
 	VMManager::UpdateDiscInfo();
 	VMManager::s_elf_override = {};
 	VMManager::s_fast_boot_requested = true;
+}
+
+bool SaveStateBase::vmFreeze()
+{
+	// PCSX2 owner: VMManager.cpp::SaveStateBase::vmFreeze(). Keep the ELF
+	// identity in the internal-structures entry; it determines whether the
+	// restored PC is BIOS/EELOAD or game code and therefore whether the
+	// pre-entry InstantDMA contract is still active.
+	const u32 previous_crc = VMManager::s_current_crc;
+	const std::string previous_elf = VMManager::s_elf_path;
+	const bool previous_elf_executed = VMManager::s_elf_executed;
+	Freeze(VMManager::s_current_crc);
+	FreezeString(VMManager::s_elf_path);
+	Freeze(VMManager::s_elf_executed);
+
+	if (IsLoading())
+	{
+		if (IsPortableReplay())
+		{
+			const u32 replay_crc = VMManager::s_current_crc;
+			const std::string replay_elf = VMManager::s_elf_path;
+			const bool replay_elf_executed = VMManager::s_elf_executed;
+			if (replay_elf.empty())
+			{
+				if (replay_crc != 0 || replay_elf_executed)
+				{
+					Console.Error("Portable replay contains an invalid empty ELF identity.");
+					m_error = true;
+					return false;
+				}
+				VMManager::ClearELFInfo();
+			}
+			else
+			{
+				// Re-read the ELF from the currently mounted disc. Normal PCSX2
+				// savestates tolerate a changed image; an oracle replay must not.
+				VMManager::UpdateELFInfo(replay_elf);
+				if (VMManager::s_elf_path != replay_elf ||
+					VMManager::s_current_crc != replay_crc)
+				{
+					Console.Error("Portable replay ELF identity does not match the mounted disc.");
+					m_error = true;
+					return false;
+				}
+				VMManager::s_elf_executed = replay_elf_executed;
+			}
+
+			EmuConfig.Gamefixes.InstantDMAHack = !VMManager::s_elf_executed;
+			return IsOkay();
+		}
+
+		if (VMManager::s_elf_path != previous_elf)
+		{
+			if (VMManager::s_elf_path.empty())
+			{
+				if (VMManager::s_elf_executed)
+					Console.Error("Loaded VM state marks an empty ELF path as executed.");
+				VMManager::ClearELFInfo();
+			}
+			else
+			{
+				VMManager::UpdateELFInfo(std::move(VMManager::s_elf_path));
+			}
+		}
+
+		if (VMManager::s_current_crc != previous_crc ||
+			VMManager::s_elf_path != previous_elf ||
+			VMManager::s_elf_executed != previous_elf_executed)
+		{
+			// Vita's pruned VM has no desktop settings/patch layer. This is the
+			// machine-visible part of VMManager.cpp::HandleELFChange() retained by
+			// EntryPointCompilingOnCPUThread() for the deterministic Vita core.
+			EmuConfig.Gamefixes.InstantDMAHack = !VMManager::s_elf_executed;
+		}
+	}
+
+	return IsOkay();
 }

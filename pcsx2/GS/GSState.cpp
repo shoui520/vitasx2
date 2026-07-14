@@ -3985,17 +3985,26 @@ int GSState::Freeze(freezeData* fd, bool sizeonly)
 
 	for (GIFPath& path : m_path)
 	{
-		path.tag.NREG = path.nreg;
-		path.tag.NLOOP = path.nloop;
-		path.tag.REGS = 0;
+		// Empty paths retain stale decoded register metadata which SetTag()
+		// intentionally ignores when NLOOP is zero. Do not publish that
+		// continuation-irrelevant residue: it makes a save/load/save cycle differ
+		// even though the GS machine state did not. Keep the live path untouched
+		// while constructing the canonical freeze representation.
+		GIFTag saved_tag = path.tag;
+		u32 saved_reg = path.reg;
+		saved_tag.NLOOP = path.nloop;
+		saved_tag.NREG = path.nloop != 0 ? path.nreg : 0;
+		saved_tag.REGS = 0;
+		if (path.nloop == 0)
+			saved_reg = 0;
 
-		for (size_t j = 0; j < std::size(path.regs.U8); j++)
+		for (size_t j = 0; path.nloop != 0 && j < std::size(path.regs.U8); j++)
 		{
-			path.tag.U32[2 + (j >> 3)] |= path.regs.U8[j] << ((j & 7) << 2);
+			saved_tag.U32[2 + (j >> 3)] |= path.regs.U8[j] << ((j & 7) << 2);
 		}
 
-		WriteState(data, &path.tag);
-		WriteState(data, &path.reg);
+		WriteState(data, &saved_tag);
+		WriteState(data, &saved_reg);
 	}
 
 	WriteState(data, &m_q);
@@ -4149,6 +4158,38 @@ int GSState::Defrost(const freezeData* fd)
 	ResetPCRTC();
 
 	return 0;
+}
+
+bool GSState::ValidatePortableState() const
+{
+	static_assert(sizeof(bool) == sizeof(u8));
+	u8 write_representation = 0;
+	std::memcpy(&write_representation, &m_tr.write, sizeof(write_representation));
+	if (write_representation > 1u)
+		return false;
+
+	// GSTransferBuffer::Init() owns the dimensions and immutable rectangle.
+	// GSLocalMemory's image helpers advance x/y by reference as chunks flush, so
+	// retain that cursor but require it to stay inside the Init()-derived extent.
+	// FlushWrite() consumes all of these fields before any register can rebuild them.
+	const bool is_write = write_representation != 0;
+	const int start_x = is_write ? m_tr.m_pos.DSAX : m_tr.m_pos.SSAX;
+	const int start_y = is_write ? m_tr.m_pos.DSAY : m_tr.m_pos.SSAY;
+
+	constexpr int TRANSFER_BUFFER_SIZE = 4 * 1024 * 1024;
+	const bool valid = m_tr.w == static_cast<int>(m_tr.m_reg.RRW) &&
+		m_tr.h == static_cast<int>(m_tr.m_reg.RRH) &&
+		m_tr.rect.x == start_x && m_tr.rect.y == start_y &&
+		m_tr.rect.z == start_x + m_tr.w && m_tr.rect.w == start_y + m_tr.h &&
+		m_tr.x >= start_x && m_tr.x <= start_x + m_tr.w &&
+		m_tr.y >= start_y && m_tr.y <= start_y + m_tr.h &&
+		m_tr.start >= 0 && m_tr.start <= m_tr.end && m_tr.end <= m_tr.total &&
+		m_tr.total <= TRANSFER_BUFFER_SIZE;
+	if (!valid)
+	{
+		Console.Error("Portable GS replay state contains an inconsistent transfer continuation.");
+	}
+	return valid;
 }
 
 //

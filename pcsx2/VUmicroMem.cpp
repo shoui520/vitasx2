@@ -5,6 +5,8 @@
 #include "VUmicro.h"
 #include "MTVU.h"
 
+#include <type_traits>
+
 alignas(16) VURegs vuRegs[2];
 
 void vuMemAllocate()
@@ -53,96 +55,212 @@ void vuMemReset()
 
 bool SaveStateBase::vuMicroFreeze()
 {
-	if(IsSaving())
+	// PCSX2's x86 microVU provider opens vu1Thread before this save barrier.
+	// Vita's synchronous A32 VU1 provider has no worker, so waiting on the closed
+	// worker's empty semaphore would deadlock with nobody able to signal it.
+	if (IsSaving() && vu1Thread.IsOpen())
 		vu1Thread.WaitVU();
+
+	// Portable replays are captured only at the all-native checkpoint's idle VU
+	// seam. MachineCheckpointTrace::HashVuState() defines the state which can
+	// affect later PS2 execution there: published registers/cycles remain strict,
+	// while interpreter/microVU bookkeeping is either empty or reconstructible.
+	// Reject a real continuation before replacing its provider-private storage
+	// representation with the portable canonical zero.
+	if (IsPortableReplay() && IsSaving())
+	{
+		const auto is_zero = [](const auto& value) {
+			using T = std::remove_cv_t<std::remove_reference_t<decltype(value)>>;
+			static_assert(std::is_trivially_copyable_v<T>);
+			T zero;
+			std::memset(&zero, 0, sizeof(T));
+			return std::memcmp(&value, &zero, sizeof(T)) == 0;
+		};
+		const bool idle = (VU0.VI[REG_VPU_STAT].UL & 0x101u) == 0 &&
+			is_zero(VU0.branch) && is_zero(VU0.takedelaybranch) && is_zero(VU0.ebit) &&
+			is_zero(VU0.VIBackupCycles) && is_zero(VU0.fmaccount) && is_zero(VU0.fdiv.enable) &&
+			is_zero(VU0.efu.enable) && is_zero(VU0.ialucount) &&
+			is_zero(VU1.branch) && is_zero(VU1.takedelaybranch) && is_zero(VU1.ebit) &&
+			is_zero(VU1.VIBackupCycles) && is_zero(VU1.fmaccount) && is_zero(VU1.fdiv.enable) &&
+			is_zero(VU1.efu.enable) && is_zero(VU1.ialucount) && is_zero(VU1.xgkickenable);
+		if (!idle)
+		{
+			Console.Error("Portable replay capture reached a non-idle VU continuation.");
+			m_error = true;
+			return false;
+		}
+	}
 
 	if (!FreezeTag("vuMicroRegs"))
 		return false;
+
+	// Preserve the native savestate schema exactly. For a portable replay this
+	// freezes an equally-sized zero object instead, verifies that loads contain
+	// the canonical representation, and clears only provider-private live state.
+	// Published architectural state never passes through this helper.
+	const auto freeze_portable_zero = [this](auto& live, const char* field) {
+		if (!IsPortableReplay())
+		{
+			Freeze(live);
+			return IsOkay();
+		}
+
+		using T = std::remove_cv_t<std::remove_reference_t<decltype(live)>>;
+		static_assert(std::is_trivially_copyable_v<T>);
+		T canonical;
+		std::memset(&canonical, 0, sizeof(T));
+		Freeze(canonical);
+		if (!IsOkay())
+			return false;
+
+		if (IsLoading())
+		{
+			T zero;
+			std::memset(&zero, 0, sizeof(T));
+			if (std::memcmp(&canonical, &zero, sizeof(T)) != 0)
+			{
+				Console.Error("Portable replay contains non-canonical VU scratch field '%s'.", field);
+				m_error = true;
+				return false;
+			}
+			std::memcpy(&live, &zero, sizeof(T));
+		}
+		return true;
+	};
 
 	// VU0 state information
 
 	Freeze(VU0.ACC);
 	Freeze(VU0.VF);
 	Freeze(VU0.VI);
-	Freeze(VU0.q);
+	if (IsPortableReplay() && IsLoading() &&
+		(HasError() || (VU0.VI[REG_VPU_STAT].UL & 0x101u) != 0))
+	{
+		Console.Error("Portable replay contains a busy VU continuation.");
+		m_error = true;
+		return false;
+	}
+	if (!freeze_portable_zero(VU0.q, "VU0.q"))
+		return false;
 
 	Freeze(VU0.cycle);
 	Freeze(VU0.flags);
-	Freeze(VU0.code);
-	Freeze(VU0.start_pc);
-	Freeze(VU0.branch);
-	Freeze(VU0.branchpc);
-	Freeze(VU0.delaybranchpc);
-	Freeze(VU0.takedelaybranch);
-	Freeze(VU0.ebit);
-	Freeze(VU0.pending_q);
-	Freeze(VU0.pending_p);
-	Freeze(VU0.micro_macflags);
-	Freeze(VU0.micro_clipflags);
-	Freeze(VU0.micro_statusflags);
-	Freeze(VU0.macflag);
-	Freeze(VU0.statusflag);
-	Freeze(VU0.clipflag);
+	if (!freeze_portable_zero(VU0.code, "VU0.code") ||
+		!freeze_portable_zero(VU0.start_pc, "VU0.start_pc") ||
+		!freeze_portable_zero(VU0.branch, "VU0.branch") ||
+		!freeze_portable_zero(VU0.branchpc, "VU0.branchpc") ||
+		!freeze_portable_zero(VU0.delaybranchpc, "VU0.delaybranchpc") ||
+		!freeze_portable_zero(VU0.takedelaybranch, "VU0.takedelaybranch") ||
+		!freeze_portable_zero(VU0.ebit, "VU0.ebit") ||
+		!freeze_portable_zero(VU0.pending_q, "VU0.pending_q") ||
+		!freeze_portable_zero(VU0.pending_p, "VU0.pending_p") ||
+		!freeze_portable_zero(VU0.micro_macflags, "VU0.micro_macflags") ||
+		!freeze_portable_zero(VU0.micro_clipflags, "VU0.micro_clipflags") ||
+		!freeze_portable_zero(VU0.micro_statusflags, "VU0.micro_statusflags") ||
+		!freeze_portable_zero(VU0.macflag, "VU0.macflag") ||
+		!freeze_portable_zero(VU0.statusflag, "VU0.statusflag") ||
+		!freeze_portable_zero(VU0.clipflag, "VU0.clipflag"))
+	{
+		return false;
+	}
 	Freeze(VU0.nextBlockCycles);
-	Freeze(VU0.VIBackupCycles);
-	Freeze(VU0.VIOldValue);
-	Freeze(VU0.VIRegNumber);
-	Freeze(VU0.fmac);
-	Freeze(VU0.fmacreadpos);
-	Freeze(VU0.fmacwritepos);
-	Freeze(VU0.fmaccount);
-	Freeze(VU0.fdiv);
-	Freeze(VU0.efu);
-	Freeze(VU0.ialu);
-	Freeze(VU0.ialureadpos);
-	Freeze(VU0.ialuwritepos);
-	Freeze(VU0.ialucount);
+	if (!freeze_portable_zero(VU0.VIBackupCycles, "VU0.VIBackupCycles") ||
+		!freeze_portable_zero(VU0.VIOldValue, "VU0.VIOldValue") ||
+		!freeze_portable_zero(VU0.VIRegNumber, "VU0.VIRegNumber") ||
+		!freeze_portable_zero(VU0.fmac, "VU0.fmac") ||
+		!freeze_portable_zero(VU0.fmacreadpos, "VU0.fmacreadpos") ||
+		!freeze_portable_zero(VU0.fmacwritepos, "VU0.fmacwritepos") ||
+		!freeze_portable_zero(VU0.fmaccount, "VU0.fmaccount") ||
+		!freeze_portable_zero(VU0.fdiv, "VU0.fdiv") ||
+		!freeze_portable_zero(VU0.efu, "VU0.efu") ||
+		!freeze_portable_zero(VU0.ialu, "VU0.ialu") ||
+		!freeze_portable_zero(VU0.ialureadpos, "VU0.ialureadpos") ||
+		!freeze_portable_zero(VU0.ialuwritepos, "VU0.ialuwritepos") ||
+		!freeze_portable_zero(VU0.ialucount, "VU0.ialucount"))
+	{
+		return false;
+	}
 
 	// VU1 state information
 	Freeze(VU1.ACC);
 	Freeze(VU1.VF);
 	Freeze(VU1.VI);
-	Freeze(VU1.q);
-	Freeze(VU1.p);
+	if (!freeze_portable_zero(VU1.q, "VU1.q") || !freeze_portable_zero(VU1.p, "VU1.p"))
+		return false;
 
 	Freeze(VU1.cycle);
 	Freeze(VU1.flags);
-	Freeze(VU1.code);
-	Freeze(VU1.start_pc);
-	Freeze(VU1.branch);
-	Freeze(VU1.branchpc);
-	Freeze(VU1.delaybranchpc);
-	Freeze(VU1.takedelaybranch);
-	Freeze(VU1.ebit);
-	Freeze(VU1.pending_q);
-	Freeze(VU1.pending_p);
-	Freeze(VU1.micro_macflags);
-	Freeze(VU1.micro_clipflags);
-	Freeze(VU1.micro_statusflags);
-	Freeze(VU1.macflag);
-	Freeze(VU1.statusflag);
-	Freeze(VU1.clipflag);
+	if (!freeze_portable_zero(VU1.code, "VU1.code") ||
+		!freeze_portable_zero(VU1.start_pc, "VU1.start_pc") ||
+		!freeze_portable_zero(VU1.branch, "VU1.branch") ||
+		!freeze_portable_zero(VU1.branchpc, "VU1.branchpc") ||
+		!freeze_portable_zero(VU1.delaybranchpc, "VU1.delaybranchpc") ||
+		!freeze_portable_zero(VU1.takedelaybranch, "VU1.takedelaybranch") ||
+		!freeze_portable_zero(VU1.ebit, "VU1.ebit") ||
+		!freeze_portable_zero(VU1.pending_q, "VU1.pending_q") ||
+		!freeze_portable_zero(VU1.pending_p, "VU1.pending_p") ||
+		!freeze_portable_zero(VU1.micro_macflags, "VU1.micro_macflags") ||
+		!freeze_portable_zero(VU1.micro_clipflags, "VU1.micro_clipflags") ||
+		!freeze_portable_zero(VU1.micro_statusflags, "VU1.micro_statusflags") ||
+		!freeze_portable_zero(VU1.macflag, "VU1.macflag") ||
+		!freeze_portable_zero(VU1.statusflag, "VU1.statusflag") ||
+		!freeze_portable_zero(VU1.clipflag, "VU1.clipflag"))
+	{
+		return false;
+	}
 	Freeze(VU1.nextBlockCycles);
-	Freeze(VU1.xgkickaddr);
-	Freeze(VU1.xgkickdiff);
-	Freeze(VU1.xgkicksizeremaining);
-	Freeze(VU1.xgkicklastcycle);
-	Freeze(VU1.xgkickcyclecount);
-	Freeze(VU1.xgkickenable);
-	Freeze(VU1.xgkickendpacket);
-	Freeze(VU1.VIBackupCycles);
-	Freeze(VU1.VIOldValue);
-	Freeze(VU1.VIRegNumber);
-	Freeze(VU1.fmac);
-	Freeze(VU1.fmacreadpos);
-	Freeze(VU1.fmacwritepos);
-	Freeze(VU1.fmaccount);
-	Freeze(VU1.fdiv);
-	Freeze(VU1.efu);
-	Freeze(VU1.ialu);
-	Freeze(VU1.ialureadpos);
-	Freeze(VU1.ialuwritepos);
-	Freeze(VU1.ialucount);
+	if (!freeze_portable_zero(VU1.xgkickaddr, "VU1.xgkickaddr") ||
+		!freeze_portable_zero(VU1.xgkickdiff, "VU1.xgkickdiff") ||
+		!freeze_portable_zero(VU1.xgkicksizeremaining, "VU1.xgkicksizeremaining") ||
+		!freeze_portable_zero(VU1.xgkicklastcycle, "VU1.xgkicklastcycle") ||
+		!freeze_portable_zero(VU1.xgkickcyclecount, "VU1.xgkickcyclecount") ||
+		!freeze_portable_zero(VU1.xgkickenable, "VU1.xgkickenable") ||
+		!freeze_portable_zero(VU1.xgkickendpacket, "VU1.xgkickendpacket") ||
+		!freeze_portable_zero(VU1.VIBackupCycles, "VU1.VIBackupCycles") ||
+		!freeze_portable_zero(VU1.VIOldValue, "VU1.VIOldValue") ||
+		!freeze_portable_zero(VU1.VIRegNumber, "VU1.VIRegNumber") ||
+		!freeze_portable_zero(VU1.fmac, "VU1.fmac") ||
+		!freeze_portable_zero(VU1.fmacreadpos, "VU1.fmacreadpos") ||
+		!freeze_portable_zero(VU1.fmacwritepos, "VU1.fmacwritepos") ||
+		!freeze_portable_zero(VU1.fmaccount, "VU1.fmaccount") ||
+		!freeze_portable_zero(VU1.fdiv, "VU1.fdiv") ||
+		!freeze_portable_zero(VU1.efu, "VU1.efu") ||
+		!freeze_portable_zero(VU1.ialu, "VU1.ialu") ||
+		!freeze_portable_zero(VU1.ialureadpos, "VU1.ialureadpos") ||
+		!freeze_portable_zero(VU1.ialuwritepos, "VU1.ialuwritepos") ||
+		!freeze_portable_zero(VU1.ialucount, "VU1.ialucount"))
+	{
+		return false;
+	}
+
+	if (IsPortableReplay() && IsLoading())
+	{
+		// The portable bytes deliberately omit provider-specific delayed copies,
+		// but both microVU's next dispatcher entry and the A32/interpreter path
+		// consume them. Rebuild the idle representation from the published flags
+		// and scalar registers before either provider can resume.
+		const auto rebuild_idle_provider_state = [](VURegs& vu) {
+			vu.q.UL = vu.VI[REG_Q].UL;
+			vu.p.UL = vu.VI[REG_P].UL;
+			vu.pending_q = vu.VI[REG_Q].UL;
+			vu.pending_p = vu.VI[REG_P].UL;
+			vu.macflag = vu.VI[REG_MAC_FLAG].UL;
+			vu.statusflag = vu.VI[REG_STATUS_FLAG].UL;
+			vu.clipflag = vu.VI[REG_CLIP_FLAG].UL;
+			// PCSX2 owner: x86/microVU_Alloc.inl::mVUallocSFLAGd().
+			const u32 denormalized_status = ((vu.statusflag >> 3) & 0x18u) |
+				((vu.statusflag << 11) & 0x1800u) |
+				((vu.statusflag << 14) & 0x03cf0000u);
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				vu.micro_macflags[lane] = vu.macflag;
+				vu.micro_clipflags[lane] = vu.clipflag;
+				vu.micro_statusflags[lane] = denormalized_status;
+			}
+		};
+		rebuild_idle_provider_state(VU0);
+		rebuild_idle_provider_state(VU1);
+	}
 
 	return IsOkay();
 }

@@ -521,6 +521,7 @@ public:
 	const u8* TraceGsLocalMemoryData(size_t* size) const;
 	int Freeze(freezeData* fd, bool sizeonly);
 	int Defrost(const freezeData* fd);
+	bool ValidatePortableState() const;
 
 	u8* GetRegsMem() const { return reinterpret_cast<u8*>(m_regs); }
 	void SetRegsMem(u8* basemem) { m_regs = reinterpret_cast<GSPrivRegSet*>(basemem); }

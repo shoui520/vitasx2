@@ -7,6 +7,7 @@
 #include "MTVU.h"
 #include "VUflags.h"
 #include "VUmicro.h"
+#include "vita/VitaFpRounding.h"
 
 #if defined(ARCH_ARM32)
 #include <arm_neon.h>
@@ -1768,45 +1769,92 @@ namespace VUInterpFast
 		return false;
 	}
 
+	static inline float VuAddScalar(float left, float right)
+	{
+#if defined(ARCH_ARM32)
+		float result;
+		__asm__("vadd.f32 %0, %1, %2" : "=t"(result) : "t"(left), "t"(right));
+		return result;
+#else
+		return left + right;
+#endif
+	}
+
+	static inline float VuSubScalar(float left, float right)
+	{
+#if defined(ARCH_ARM32)
+		float result;
+		__asm__("vsub.f32 %0, %1, %2" : "=t"(result) : "t"(left), "t"(right));
+		return result;
+#else
+		return left - right;
+#endif
+	}
+
+	static inline float VuMulScalar(float left, float right)
+	{
+#if defined(ARCH_ARM32)
+		float result;
+		__asm__("vmul.f32 %0, %1, %2" : "=t"(result) : "t"(left), "t"(right));
+		return result;
+#else
+		return left * right;
+#endif
+	}
+
+	static inline s32 VuFloatToSignedIntChopScalar(float value)
+	{
+#if defined(ARCH_ARM32)
+		float converted;
+		s32 result;
+		__asm__(
+			"vcvt.s32.f32 %0, %2\n\t"
+			"vmov %1, %0"
+			: "=&t"(converted), "=r"(result)
+			: "t"(value));
+		return result;
+#else
+		return static_cast<s32>(value);
+#endif
+	}
+
 	template <u32 Offset>
-	static inline bool StoreFtoiUpperMaskedNeon(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
+	static inline u32 VuSignedIntToFloatBits(u32 bits)
+	{
+		return VitaA32::ConvertSignedIntToFloatBits(bits, Offset);
+	}
+
+	template <u32 Offset>
+	static inline bool StoreFtoiUpperMaskedArm32(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
 	{
 #if defined(ARCH_ARM32)
 		if (ft == 0 || mask == 0)
 			return false;
 
-		const uint32x4_t source_bits = vld1q_u32(VU->VF[fs].UL);
-		float32x4_t scaled = vreinterpretq_f32_u32(source_bits);
-		if (Offset != 0)
-			scaled = vmulq_f32(scaled, vdupq_n_f32(FloatFromBits(0x3f800000u + (Offset << 23))));
-
-		const uint32x4_t scaled_bits = vreinterpretq_u32_f32(scaled);
-		const uint32x4_t exponent = vandq_u32(scaled_bits, vdupq_n_u32(0x7f800000u));
-		const uint32x4_t sign_mask = vtstq_u32(source_bits, vdupq_n_u32(0x80000000u));
-		const uint32x4_t saturated = vbslq_u32(
-			sign_mask,
-			vdupq_n_u32(0x80000000u),
-			vdupq_n_u32(0x7fffffffu));
-		const uint32x4_t converted = vreinterpretq_u32_s32(vcvtq_s32_f32(scaled));
-		const uint32x4_t saturate_mask = vcgeq_u32(exponent, vdupq_n_u32(0x4f000000u));
-		StoreUpperResultMaskedNeon(VU, ft, mask, vbslq_u32(saturate_mask, saturated, converted));
+		StoreUnaryUpperMasked(VU, ft, mask, fs, [](u32 bits) {
+			float value = FloatFromBits(bits);
+			if constexpr (Offset != 0)
+				value = VuMulScalar(value, FloatFromBits(0x3f800000u + (Offset << 23)));
+			bits = FloatToBits(value);
+			if ((bits & 0x7f800000u) >= 0x4f000000u)
+				return (bits & 0x80000000u) ? 0x80000000u : 0x7fffffffu;
+			return static_cast<u32>(VuFloatToSignedIntChopScalar(value));
+		});
 		return true;
 #endif
 		return false;
 	}
 
 	template <u32 Offset>
-	static inline bool StoreItofUpperMaskedNeon(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
+	static inline bool StoreItofUpperMaskedArm32(VURegs* VU, unsigned ft, unsigned mask, unsigned fs)
 	{
 #if defined(ARCH_ARM32)
 		if (ft == 0 || mask == 0)
 			return false;
 
-		float32x4_t result = vcvtq_f32_s32(vreinterpretq_s32_u32(vld1q_u32(VU->VF[fs].UL)));
-		if (Offset != 0)
-			result = vmulq_f32(result, vdupq_n_f32(FloatFromBits(0x3f800000u - (Offset << 23))));
-
-		StoreUpperResultMaskedNeon(VU, ft, mask, vreinterpretq_u32_f32(result));
+		StoreUnaryUpperMasked(VU, ft, mask, fs, [](u32 bits) {
+			return VuSignedIntToFloatBits<Offset>(bits);
+		});
 		return true;
 #endif
 		return false;
@@ -2024,7 +2072,7 @@ namespace VUInterpFast
 			b &= 0x80000000u;
 		if (a_exp - b_exp <= -25)
 			a &= 0x80000000u;
-		return VuDouble(a) + VuDouble(b);
+		return VuAddScalar(VuDouble(a), VuDouble(b));
 	}
 
 #if defined(ARCH_ARM32)
@@ -2071,13 +2119,15 @@ namespace VUInterpFast
 
 	static inline float VuSumXYZSquaresNeon(VURegs* VU, unsigned reg)
 	{
-		const float32x4_t value = VuFloatQNeon(vld1q_u32(VU->VF[reg].UL));
-		const float32x4_t squared = vmulq_f32(value, value);
+		const uint32x4_t value_bits = VuDoubleBitsNeon(vld1q_u32(VU->VF[reg].UL));
+		const float x = FloatFromBits(vgetq_lane_u32(value_bits, 0));
+		const float y = FloatFromBits(vgetq_lane_u32(value_bits, 1));
+		const float z = FloatFromBits(vgetq_lane_u32(value_bits, 2));
 #if defined(VITASX2_QEMU_VALIDATION)
 		++::g_qemuVuLowerNeonQwordOps;
 #endif
-		return (vgetq_lane_f32(squared, 0) + vgetq_lane_f32(squared, 1)) +
-			vgetq_lane_f32(squared, 2);
+		return VuAddScalar(VuAddScalar(VuMulScalar(x, x), VuMulScalar(y, y)),
+			VuMulScalar(z, z));
 	}
 
 	static inline float VuSumXYZWNeon(VURegs* VU, unsigned reg)
@@ -2086,32 +2136,45 @@ namespace VUInterpFast
 #if defined(VITASX2_QEMU_VALIDATION)
 		++::g_qemuVuLowerNeonQwordOps;
 #endif
-		return ((vgetq_lane_f32(value, 0) + vgetq_lane_f32(value, 1)) +
-			vgetq_lane_f32(value, 2)) + vgetq_lane_f32(value, 3);
+		return VuAddScalar(VuAddScalar(VuAddScalar(vgetq_lane_f32(value, 0),
+			vgetq_lane_f32(value, 1)), vgetq_lane_f32(value, 2)),
+			vgetq_lane_f32(value, 3));
 	}
 
-	struct FinishMacVectorLaneOp
+	struct FinishMacScalarLaneOp
 	{
 		VURegs* VU;
 		bool acc;
 		unsigned fd;
-		float32x4_t result;
+		uint32x4_t fs_bits;
+		uint32x4_t operand_bits;
+		bool subtract;
+		bool multiply;
 
 		template <unsigned lane, bool active>
 		void operator()() const
 		{
 			if constexpr (active)
-				WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, vgetq_lane_f32(result, lane)));
+			{
+				const float fs = FloatFromBits(vgetq_lane_u32(fs_bits, lane));
+				const float operand = FloatFromBits(vgetq_lane_u32(operand_bits, lane));
+				const float result = multiply ? VuMulScalar(fs, operand) :
+					(subtract ? VuSubScalar(fs, operand) : VuAddScalar(fs, operand));
+				WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, result));
+			}
 			else
+			{
 				ClearMacLane(VU, lane);
+			}
 		}
 	};
 
-	static inline void FinishMacVectorNeon(VURegs* VU, bool acc, unsigned fd, unsigned mask, float32x4_t result)
+	static inline void FinishMacScalarLanes(VURegs* VU, bool acc, unsigned fd,
+		unsigned mask, uint32x4_t fs_bits, uint32x4_t operand_bits,
+		bool subtract, bool multiply)
 	{
-		FinishMacVectorLaneOp op{VU, acc, fd, result};
+		FinishMacScalarLaneOp op{VU, acc, fd, fs_bits, operand_bits, subtract, multiply};
 		ForEachXyzwLaneState(mask, op);
-
 		VU_STAT_UPDATE(VU);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++::g_qemuVuUpperNeonQwordOps;
@@ -2128,9 +2191,8 @@ namespace VUInterpFast
 		if (triace_add && !subtract)
 			ApplyTriAceAddHackNeon(fs_bits, operand_bits);
 
-		const float32x4_t fs = VuFloatQNeon(fs_bits);
-		const float32x4_t operand = VuFloatQNeon(operand_bits);
-		FinishMacVectorNeon(VU, acc, Fd(code), mask, subtract ? vsubq_f32(fs, operand) : vaddq_f32(fs, operand));
+		FinishMacScalarLanes(VU, acc, Fd(code), mask,
+			VuDoubleBitsNeon(fs_bits), VuDoubleBitsNeon(operand_bits), subtract, false);
 		return true;
 	}
 
@@ -2140,47 +2202,24 @@ namespace VUInterpFast
 		if (mask == 0)
 			return false;
 
-		const float32x4_t fs = VuFloatQNeon(vld1q_u32(VU->VF[Fs(code)].UL));
-		const float32x4_t operand = VuFloatQNeon(operand_bits);
-		FinishMacVectorNeon(VU, acc, Fd(code), mask, vmulq_f32(fs, operand));
+		FinishMacScalarLanes(VU, acc, Fd(code), mask,
+			VuDoubleBitsNeon(vld1q_u32(VU->VF[Fs(code)].UL)),
+			VuDoubleBitsNeon(operand_bits), false, true);
 		return true;
-	}
-
-	static inline bool ExecuteMaddMsubMaskedNeon(VURegs* VU, u32 code, bool acc, bool subtract, uint32x4_t operand_bits)
-	{
-		const unsigned mask = XYZW(code);
-		if (mask == 0)
-			return false;
-
-		const float32x4_t acc_value = VuFloatQNeon(vld1q_u32(VU->ACC.UL));
-		const float32x4_t fs = VuFloatQNeon(vld1q_u32(VU->VF[Fs(code)].UL));
-		const float32x4_t operand = VuFloatQNeon(operand_bits);
-		const float32x4_t product = vmulq_f32(fs, operand);
-		FinishMacVectorNeon(VU, acc, Fd(code), mask,
-			subtract ? vsubq_f32(acc_value, product) : vaddq_f32(acc_value, product));
-		return true;
-	}
-
-	static inline float32x4_t OuterProductNeon(VURegs* VU, u32 code)
-	{
-		// PCSX2 owner: VUops.cpp::_vuOPMULA()/_vuOPMSUB() use
-		// {Fs.y * Ft.z, Fs.z * Ft.x, Fs.x * Ft.y}; W is ignored.
-		const float32x4_t fs = VuFloatQNeon(vld1q_u32(VU->VF[Fs(code)].UL));
-		const float32x4_t ft = VuFloatQNeon(vld1q_u32(VU->VF[Ft(code)].UL));
-		float32x4_t fs_yzx = vextq_f32(fs, fs, 1);
-		float32x4_t ft_zxy = vextq_f32(ft, ft, 2);
-		fs_yzx = vsetq_lane_f32(vgetq_lane_f32(fs, 0), fs_yzx, 2);
-		ft_zxy = vsetq_lane_f32(vgetq_lane_f32(ft, 0), ft_zxy, 1);
-		ft_zxy = vsetq_lane_f32(vgetq_lane_f32(ft, 1), ft_zxy, 2);
-		return vmulq_f32(fs_yzx, ft_zxy);
 	}
 
 	static inline bool ExecuteOpmulaNeon(VURegs* VU, u32 code)
 	{
-		const float32x4_t product = OuterProductNeon(VU, code);
-		VU->ACC.UL[0] = UpdateMacLane(VU, 0, vgetq_lane_f32(product, 0));
-		VU->ACC.UL[1] = UpdateMacLane(VU, 1, vgetq_lane_f32(product, 1));
-		VU->ACC.UL[2] = UpdateMacLane(VU, 2, vgetq_lane_f32(product, 2));
+		// Keep the qword loads and exact integer normalization, but execute the
+		// three cross products with FPSCR-aware scalar VFP.
+		const uint32x4_t fs = VuDoubleBitsNeon(vld1q_u32(VU->VF[Fs(code)].UL));
+		const uint32x4_t ft = VuDoubleBitsNeon(vld1q_u32(VU->VF[Ft(code)].UL));
+		VU->ACC.UL[0] = UpdateMacLane(VU, 0, VuMulScalar(
+			FloatFromBits(vgetq_lane_u32(fs, 1)), FloatFromBits(vgetq_lane_u32(ft, 2))));
+		VU->ACC.UL[1] = UpdateMacLane(VU, 1, VuMulScalar(
+			FloatFromBits(vgetq_lane_u32(fs, 2)), FloatFromBits(vgetq_lane_u32(ft, 0))));
+		VU->ACC.UL[2] = UpdateMacLane(VU, 2, VuMulScalar(
+			FloatFromBits(vgetq_lane_u32(fs, 0)), FloatFromBits(vgetq_lane_u32(ft, 1))));
 		VU_STAT_UPDATE(VU);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++::g_qemuVuUpperNeonQwordOps;
@@ -2190,11 +2229,19 @@ namespace VUInterpFast
 
 	static inline bool ExecuteOpmsubNeon(VURegs* VU, u32 code)
 	{
-		const float32x4_t result = vsubq_f32(VuFloatQNeon(vld1q_u32(VU->ACC.UL)), OuterProductNeon(VU, code));
+		const uint32x4_t acc = VuDoubleBitsNeon(vld1q_u32(VU->ACC.UL));
+		const uint32x4_t fs = VuDoubleBitsNeon(vld1q_u32(VU->VF[Fs(code)].UL));
+		const uint32x4_t ft = VuDoubleBitsNeon(vld1q_u32(VU->VF[Ft(code)].UL));
 		const unsigned fd = Fd(code);
-		WriteMacResult(VU, false, fd, 0, UpdateMacLane(VU, 0, vgetq_lane_f32(result, 0)));
-		WriteMacResult(VU, false, fd, 1, UpdateMacLane(VU, 1, vgetq_lane_f32(result, 1)));
-		WriteMacResult(VU, false, fd, 2, UpdateMacLane(VU, 2, vgetq_lane_f32(result, 2)));
+		WriteMacResult(VU, false, fd, 0, UpdateMacLane(VU, 0, VuMaddMsubScalar<true>(
+			FloatFromBits(vgetq_lane_u32(acc, 0)), FloatFromBits(vgetq_lane_u32(fs, 1)),
+			FloatFromBits(vgetq_lane_u32(ft, 2)))));
+		WriteMacResult(VU, false, fd, 1, UpdateMacLane(VU, 1, VuMaddMsubScalar<true>(
+			FloatFromBits(vgetq_lane_u32(acc, 1)), FloatFromBits(vgetq_lane_u32(fs, 2)),
+			FloatFromBits(vgetq_lane_u32(ft, 0)))));
+		WriteMacResult(VU, false, fd, 2, UpdateMacLane(VU, 2, VuMaddMsubScalar<true>(
+			FloatFromBits(vgetq_lane_u32(acc, 2)), FloatFromBits(vgetq_lane_u32(fs, 0)),
+			FloatFromBits(vgetq_lane_u32(ft, 1)))));
 		VU_STAT_UPDATE(VU);
 #if defined(VITASX2_QEMU_VALIDATION)
 		++::g_qemuVuUpperNeonQwordOps;
@@ -2307,8 +2354,9 @@ namespace VUInterpFast
 
 			const u32 fs_bits = VU->VF[fs].UL[lane];
 			const u32 operand_bits = operand(lane);
-			const float result = subtract ? (VuDouble(fs_bits) - VuDouble(operand_bits)) :
-				(triace_add ? VuAddTriAceHack(fs_bits, operand_bits) : VuDouble(fs_bits) + VuDouble(operand_bits));
+			const float result = subtract ? VuSubScalar(VuDouble(fs_bits), VuDouble(operand_bits)) :
+				(triace_add ? VuAddTriAceHack(fs_bits, operand_bits) :
+					VuAddScalar(VuDouble(fs_bits), VuDouble(operand_bits)));
 			WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, result));
 		}
 
@@ -2331,7 +2379,7 @@ namespace VUInterpFast
 				continue;
 			}
 
-			const float result = VuDouble(VU->VF[fs].UL[lane]) * VuDouble(operand(lane));
+			const float result = VuMulScalar(VuDouble(VU->VF[fs].UL[lane]), VuDouble(operand(lane)));
 			WriteMacResult(VU, acc, fd, lane, UpdateMacLane(VU, lane, result));
 		}
 
@@ -2461,9 +2509,9 @@ namespace VUInterpFast
 		const float fsy = VuDouble(VU->VF[fs].UL[1]);
 		const float fsz = VuDouble(VU->VF[fs].UL[2]);
 
-		VU->ACC.UL[0] = UpdateMacLane(VU, 0, fsy * ftz);
-		VU->ACC.UL[1] = UpdateMacLane(VU, 1, fsz * ftx);
-		VU->ACC.UL[2] = UpdateMacLane(VU, 2, fsx * fty);
+		VU->ACC.UL[0] = UpdateMacLane(VU, 0, VuMulScalar(fsy, ftz));
+		VU->ACC.UL[1] = UpdateMacLane(VU, 1, VuMulScalar(fsz, ftx));
+		VU->ACC.UL[2] = UpdateMacLane(VU, 2, VuMulScalar(fsx, fty));
 		VU_STAT_UPDATE(VU);
 	}
 
@@ -2480,9 +2528,12 @@ namespace VUInterpFast
 		const float fsy = VuDouble(VU->VF[fs].UL[1]);
 		const float fsz = VuDouble(VU->VF[fs].UL[2]);
 
-		WriteMacResult(VU, false, fd, 0, UpdateMacLane(VU, 0, VuDouble(VU->ACC.UL[0]) - fsy * ftz));
-		WriteMacResult(VU, false, fd, 1, UpdateMacLane(VU, 1, VuDouble(VU->ACC.UL[1]) - fsz * ftx));
-		WriteMacResult(VU, false, fd, 2, UpdateMacLane(VU, 2, VuDouble(VU->ACC.UL[2]) - fsx * fty));
+		WriteMacResult(VU, false, fd, 0, UpdateMacLane(VU, 0,
+			VuMaddMsubScalar<true>(VuDouble(VU->ACC.UL[0]), fsy, ftz)));
+		WriteMacResult(VU, false, fd, 1, UpdateMacLane(VU, 1,
+			VuMaddMsubScalar<true>(VuDouble(VU->ACC.UL[1]), fsz, ftx)));
+		WriteMacResult(VU, false, fd, 2, UpdateMacLane(VU, 2,
+			VuMaddMsubScalar<true>(VuDouble(VU->ACC.UL[2]), fsx, fty)));
 		VU_STAT_UPDATE(VU);
 	}
 
@@ -2491,21 +2542,18 @@ namespace VUInterpFast
 	{
 		float value = FloatFromBits(bits);
 		if (Offset != 0)
-			value *= FloatFromBits(0x3f800000u + (Offset << 23));
+			value = VuMulScalar(value, FloatFromBits(0x3f800000u + (Offset << 23)));
 		bits = FloatToBits(value);
 
 		if ((bits & 0x7f800000u) >= 0x4f000000u)
 			return (bits & 0x80000000u) ? 0x80000000u : 0x7fffffffu;
-		return static_cast<u32>(static_cast<s32>(value));
+		return static_cast<u32>(VuFloatToSignedIntChopScalar(value));
 	}
 
 	template <u32 Offset>
 	static inline u32 IntToFloatBits(u32 bits)
 	{
-		float value = static_cast<float>(static_cast<s32>(bits));
-		if (Offset != 0)
-			value *= FloatFromBits(0x3f800000u - (Offset << 23));
-		return FloatToBits(value);
+		return VuSignedIntToFloatBits<Offset>(bits);
 	}
 
 	static inline void ExecuteUpperNoLowerKnownKind(VURegs* VU, u32 code, UpperFastKind kind)
@@ -2520,42 +2568,42 @@ namespace VUInterpFast
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), [](u32 bits) { return bits & 0x7fffffffu; });
 				return;
 			case UpperFastKind::FTOI0:
-				if (StoreFtoiUpperMaskedNeon<0>(VU, Ft(code), XYZW(code), Fs(code)))
+				if (StoreFtoiUpperMaskedArm32<0>(VU, Ft(code), XYZW(code), Fs(code)))
 					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), FloatToIntBits<0>);
 				return;
 			case UpperFastKind::FTOI4:
-				if (StoreFtoiUpperMaskedNeon<4>(VU, Ft(code), XYZW(code), Fs(code)))
+				if (StoreFtoiUpperMaskedArm32<4>(VU, Ft(code), XYZW(code), Fs(code)))
 					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), FloatToIntBits<4>);
 				return;
 			case UpperFastKind::FTOI12:
-				if (StoreFtoiUpperMaskedNeon<12>(VU, Ft(code), XYZW(code), Fs(code)))
+				if (StoreFtoiUpperMaskedArm32<12>(VU, Ft(code), XYZW(code), Fs(code)))
 					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), FloatToIntBits<12>);
 				return;
 			case UpperFastKind::FTOI15:
-				if (StoreFtoiUpperMaskedNeon<15>(VU, Ft(code), XYZW(code), Fs(code)))
+				if (StoreFtoiUpperMaskedArm32<15>(VU, Ft(code), XYZW(code), Fs(code)))
 					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), FloatToIntBits<15>);
 				return;
 			case UpperFastKind::ITOF0:
-				if (StoreItofUpperMaskedNeon<0>(VU, Ft(code), XYZW(code), Fs(code)))
+				if (StoreItofUpperMaskedArm32<0>(VU, Ft(code), XYZW(code), Fs(code)))
 					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<0>);
 				return;
 			case UpperFastKind::ITOF4:
-				if (StoreItofUpperMaskedNeon<4>(VU, Ft(code), XYZW(code), Fs(code)))
+				if (StoreItofUpperMaskedArm32<4>(VU, Ft(code), XYZW(code), Fs(code)))
 					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<4>);
 				return;
 			case UpperFastKind::ITOF12:
-				if (StoreItofUpperMaskedNeon<12>(VU, Ft(code), XYZW(code), Fs(code)))
+				if (StoreItofUpperMaskedArm32<12>(VU, Ft(code), XYZW(code), Fs(code)))
 					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<12>);
 				return;
 			case UpperFastKind::ITOF15:
-				if (StoreItofUpperMaskedNeon<15>(VU, Ft(code), XYZW(code), Fs(code)))
+				if (StoreItofUpperMaskedArm32<15>(VU, Ft(code), XYZW(code), Fs(code)))
 					return;
 				StoreUnaryUpperMasked(VU, Ft(code), XYZW(code), Fs(code), IntToFloatBits<15>);
 				return;

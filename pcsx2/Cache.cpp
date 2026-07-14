@@ -178,6 +178,27 @@ void resetCache()
 	std::memset(&cache, 0, sizeof(cache));
 }
 
+bool isCacheEmpty()
+{
+	for (const CacheSet& set : cache.sets)
+	{
+		for (const CacheTag& tag : set.tags)
+		{
+			if (tag.rawValue != 0)
+				return false;
+		}
+		for (const CacheData& data : set.data)
+		{
+			for (const u8 byte : data.bytes)
+			{
+				if (byte != 0)
+					return false;
+			}
+		}
+	}
+	return true;
+}
+
 void writebackCache()
 {
 	for (int i = 0; i < 64; i++)

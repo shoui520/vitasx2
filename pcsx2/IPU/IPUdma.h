@@ -28,3 +28,6 @@ extern void IPU1dma();
 extern void ipuDmaReset();
 extern IPUDMAStatus IPU1Status;
 extern IPUStatus IPUCoreStatus;
+
+// Must run after portable replay has installed the saved eeHw DMA registers.
+extern bool ipuValidatePortableDmaState();

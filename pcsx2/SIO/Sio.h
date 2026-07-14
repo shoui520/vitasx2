@@ -8,6 +8,8 @@
 
 #include "SIO/Memcard/MemoryCardFile.h"
 
+class StateWrapper;
+
 struct _mcd
 {
 	u8 currentCommand;
@@ -91,6 +93,8 @@ struct _mcd
 
 extern _mcd mcds[2][4];
 extern _mcd *mcd;
+
+bool sioDoPortableMemoryCardState(StateWrapper& sw);
 
 extern void sioNextFrame();
 

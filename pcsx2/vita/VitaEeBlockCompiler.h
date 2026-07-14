@@ -17,6 +17,13 @@ namespace VitaA32
 
 namespace VitaEE
 {
+	enum class DirectContinuationKind : u8
+	{
+		SchedulerTestedTail,
+		Pcsx2ShortSplit,
+		A32PhysicalFragment,
+	};
+
 	enum class CompatibleVtlbGuardKind : u8
 	{
 		None,
@@ -537,9 +544,10 @@ namespace VitaEE
 			size_t* compatible_link_entry_offset = nullptr,
 			u8* compatible_link_entry_loads = nullptr,
 			CompatibleVtlbFastEntryOffsets* compatible_vtlb_fast_entries = nullptr,
-			bool concatenate_short_split = false,
-			bool* concatenated_short_emitted = nullptr,
-			const void* concatenated_direct_exit = nullptr);
+			DirectContinuationKind direct_continuation_kind =
+				DirectContinuationKind::SchedulerTestedTail,
+			bool* scheduler_test_elided_continuation_emitted = nullptr,
+			const void* scheduler_test_elided_direct_exit = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
@@ -550,8 +558,8 @@ namespace VitaEE
 			u32 direct_pc = 0, u32 taken_pc = 0, bool conditional_pc = false,
 			bool indirect_pc_writeback = false, bool preserve_dirty_direct_link = false,
 			bool preserve_dirty_taken_link = false);
-		bool EndBlockWithConcatenatedDirectLink(u32 block_cycles,
-			const void* concatenated_direct_exit, DirectLinkSlot* direct_link,
+		bool EndBlockWithSchedulerElidedDirectContinuation(u32 block_cycles,
+			const void* scheduler_test_elided_direct_exit, DirectLinkSlot* direct_link,
 			bool defer_pc_writeback, u32 direct_pc);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
 			const void* event_exit, DirectLinkSlot* not_taken_link = nullptr,
@@ -604,7 +612,7 @@ namespace VitaEE
 		bool EmitDirectLinkTail(const void* direct_exit, DirectLinkSlot* direct_link,
 			bool defer_pc_writeback = false, u32 pc = 0,
 			bool sync_private_fallback = false,
-			bool concatenated_direct_fallback = false);
+			bool scheduler_test_elided_fallback = false);
 		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0,
 			bool sync_private_fallback = false);
@@ -677,7 +685,6 @@ namespace VitaEE
 			unsigned address_reg);
 		bool EmitCOP2MacroBody(u32 op);
 		bool EmitCOP2MacroArithmeticBody(u32 op);
-		bool EmitVu0ViBackup(unsigned vi_reg);
 		bool EmitCOP2MacroViBody(u32 op);
 		bool EmitCOP2MacroViTransferBody(u32 op);
 		bool EmitVu0RandomAdvance();

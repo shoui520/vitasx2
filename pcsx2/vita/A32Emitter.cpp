@@ -96,6 +96,7 @@ namespace VitaA32
 		constexpr u32 VMOV_D32_LANE_TO_CORE = 0x0e100b10u;
 		constexpr u32 VMOV_CORE_PAIR_TO_D = 0xec400b10u;
 		constexpr u32 VCVT_F32_S32 = 0xeeb80ac0u;
+		constexpr u32 VCVT_S32_F32 = 0xeebd0ac0u;
 		constexpr u32 VCVT_F64_F32 = 0xeeb70ac0u;
 		constexpr u32 VCVT_F32_F64 = 0xeeb70bc0u;
 		constexpr u32 VCVT_F32_S32_Q = 0xf3bb0640u;
@@ -1449,6 +1450,13 @@ namespace VitaA32
 		if (!IsSRegister(sd) || !IsSRegister(sm))
 			return false;
 		return EmitU32(EncodeVcvtF32S32(sd, sm));
+	}
+
+	bool CodeBuffer::EmitVcvtS32F32(unsigned sd, unsigned sm)
+	{
+		if (!IsSRegister(sd) || !IsSRegister(sm))
+			return false;
+		return EmitU32(EncodeVcvtS32F32(sd, sm));
 	}
 
 	bool CodeBuffer::EmitVcvtF64F32(unsigned dd, unsigned sm)
@@ -2972,6 +2980,13 @@ namespace VitaA32
 		pxAssert(IsSRegister(sd));
 		pxAssert(IsSRegister(sm));
 		return VCVT_F32_S32 | VfpSd(sd) | VfpSm(sm);
+	}
+
+	u32 EncodeVcvtS32F32(unsigned sd, unsigned sm)
+	{
+		pxAssert(IsSRegister(sd));
+		pxAssert(IsSRegister(sm));
+		return VCVT_S32_F32 | VfpSd(sd) | VfpSm(sm);
 	}
 
 	u32 EncodeVcvtF64F32(unsigned dd, unsigned sm)

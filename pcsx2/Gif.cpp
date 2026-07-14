@@ -789,11 +789,33 @@ void gifMFIFOInterrupt()
 bool SaveStateBase::gifDmaFreeze()
 {
 	// Note: mfifocycles is not a persistent var, so no need to save it here.
+	const auto portable_bools_are_canonical = []() {
+		static_assert(sizeof(bool) == sizeof(u8));
+		u8 path_done = 0;
+		u8 mfifo_irq = 0;
+		std::memcpy(&path_done, &gif.gspath3done, sizeof(path_done));
+		std::memcpy(&mfifo_irq, &gif.gifmfifoirq, sizeof(mfifo_irq));
+		return path_done <= 1u && mfifo_irq <= 1u;
+	};
+	if (IsPortableReplay() && IsSaving() &&
+		(gif_fifo.fifoSize > 16 || !portable_bools_are_canonical()))
+	{
+		Console.Error("Portable GIF replay capture found an invalid 16-QW FIFO size.");
+		m_error = true;
+		return false;
+	}
 	if (!FreezeTag("GIFdma"))
 		return false;
 
 	Freeze(gif);
 	Freeze(gif_fifo);
+	if (IsPortableReplay() &&
+		(gif_fifo.fifoSize > 16 || !portable_bools_are_canonical()))
+	{
+		Console.Error("Portable GIF replay state contains an invalid 16-QW FIFO size.");
+		m_error = true;
+		return false;
+	}
 
 	return IsOkay();
 }

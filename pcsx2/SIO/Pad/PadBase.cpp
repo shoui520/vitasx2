@@ -3,6 +3,8 @@
 
 #include "SIO/Pad/PadBase.h"
 
+#include <limits>
+
 PadBase::PadBase(u8 unifiedSlot, size_t ejectTicks)
 {
 	this->unifiedSlot = unifiedSlot;
@@ -32,6 +34,18 @@ bool PadBase::Freeze(StateWrapper& sw)
 	sw.Do(&isInConfig);
 	sw.Do(&currentMode);
 	sw.Do(&currentCommand);
-	sw.Do(&commandBytesReceived);
+	if (sw.IsPortableReplay())
+	{
+		if (sw.IsWriting() && commandBytesReceived > std::numeric_limits<u32>::max())
+			return false;
+		u32 portable_command_bytes = static_cast<u32>(commandBytesReceived);
+		sw.Do(&portable_command_bytes);
+		if (sw.IsReading())
+			commandBytesReceived = portable_command_bytes;
+	}
+	else
+	{
+		sw.Do(&commandBytesReceived);
+	}
 	return !sw.HasError();
 }
