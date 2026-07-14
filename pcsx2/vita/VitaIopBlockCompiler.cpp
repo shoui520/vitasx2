@@ -1311,7 +1311,7 @@ namespace
 namespace VitaIOP
 {
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code,
-		const u16* ram_source_page_live_counts,
+		const u32* ram_source_page_live_counts,
 		const u8* ram_source_page_live_flags,
 		bool source_page_literal_allowed)
 		: m_code(code)
@@ -4745,11 +4745,10 @@ namespace VitaIOP
 			if (!m_ram_source_page_live_counts ||
 				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0,
 					VitaA32::ShiftType::LSR, 12) ||
-				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP0,
-					VitaA32::ShiftType::LSL, 1) ||
 				!m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(reinterpret_cast<uptr>(
-													m_ram_source_page_live_counts))) ||
-				!m_code.EmitLdrhReg(HOST_TMP0, HOST_TMP2, HOST_TMP0) ||
+												m_ram_source_page_live_counts))) ||
+				!m_code.EmitLdrRegShift(HOST_TMP0, HOST_TMP2, HOST_TMP0,
+					VitaA32::ShiftType::LSL, 2) ||
 				!m_code.EmitCmpImm32(HOST_TMP0, 0))
 			{
 				return static_cast<size_t>(-1);
@@ -8878,106 +8877,278 @@ namespace VitaIOP
 			return 0;
 		}
 
-		const u32 end = start + size;
-		u32 invalidated = 0;
-		const auto range_touches_page = [](u32 source_start, u32 source_size,
-											u32 page_index) {
-			if (source_start == INVALID_RAM_SOURCE || source_size == 0)
-				return false;
-			source_start &= Ps2MemSize::ExposedIopRam - 1;
-			u32 remaining = source_size;
-			const u32 page_start = page_index << RAM_SOURCE_PAGE_SHIFT;
-			const u32 page_end = page_start + RAM_SOURCE_PAGE_SIZE;
-			while (remaining != 0)
-			{
-				const u32 chunk =
-					std::min(remaining, Ps2MemSize::ExposedIopRam - source_start);
-				if (source_start < page_end && page_start < source_start + chunk)
-					return true;
-				remaining -= chunk;
-				source_start = 0;
-			}
-			return false;
-		};
-		const auto range_overlaps = [start, end](u32 source_start, u32 source_size) {
-			if (source_start == INVALID_RAM_SOURCE || source_size == 0)
-				return false;
-			source_start &= Ps2MemSize::ExposedIopRam - 1;
-			u32 remaining = source_size;
-			while (remaining != 0)
-			{
-				const u32 chunk =
-					std::min(remaining, Ps2MemSize::ExposedIopRam - source_start);
-				if (start < source_start + chunk && source_start < end)
-					return true;
-				remaining -= chunk;
-				source_start = 0;
-			}
-			return false;
-		};
-		for (u32 page_index = start >> RAM_SOURCE_PAGE_SHIFT;
-			page_index <= ((end - 1) >> RAM_SOURCE_PAGE_SHIFT); page_index++)
+		struct SourceRange
 		{
-			std::vector<RamSourceRecord>& records = m_ram_source_pages[page_index];
-			u32 write_index = 0;
-			for (u32 read_index = 0; read_index < records.size(); read_index++)
+			u32 start;
+			u32 end;
+		};
+		// A connected source extent on circular IOP RAM has at most two linear
+		// components. Keep them on the stack: psxRecClearMem() is reached from a
+		// generated store and must not allocate or sort heap storage.
+		std::array<SourceRange, 2> closure{};
+		u32 closure_count = 0;
+		const auto add_range = [&closure, &closure_count](
+			u32 range_start, u32 range_end) {
+			if (range_start >= range_end)
+				return false;
+			for (u32 i = 0; i < closure_count; i++)
 			{
-#if defined(VITASX2_QEMU_VALIDATION)
-				m_ram_invalidation_record_visits++;
-#endif
-				const RamSourceRecord record = records[read_index];
-				CachedBlock* block = record.block;
-				InterpreterFallbackBlock* fallback = record.fallback;
-				const bool cached_owner = block && block->valid &&
-				                          block->source_serial == record.serial &&
-				                          block->ram_source_start != INVALID_RAM_SOURCE;
-				const bool fallback_owner =
-					fallback && fallback->valid &&
-					fallback->source_serial == record.serial &&
-					fallback->ram_source_start != INVALID_RAM_SOURCE;
-				if (!cached_owner && !fallback_owner)
-				{
-					continue;
-				}
-				const u32 owner_source_start =
-					cached_owner ? block->ram_source_start : fallback->ram_source_start;
-				const u32 owner_source_size =
-					(cached_owner ? block->instruction_count : fallback->instruction_count) *
-					sizeof(u32);
-
-				const bool source_touches_page =
-					range_touches_page(owner_source_start, owner_source_size,
-						page_index) ||
-					(cached_owner && block->poll_call_wait_loop &&
-						(range_touches_page(block->poll_branch_source_start, 2 * sizeof(u32),
-							 page_index) ||
-							range_touches_page(block->poll_leaf_source_start, 5 * sizeof(u32),
-								page_index)));
-				if (!source_touches_page)
-				{
-					continue;
-				}
-
-				const bool overlaps =
-					range_overlaps(owner_source_start, owner_source_size) ||
-					(cached_owner && block->poll_call_wait_loop &&
-						(range_overlaps(block->poll_branch_source_start, 2 * sizeof(u32)) ||
-						 range_overlaps(block->poll_leaf_source_start, 5 * sizeof(u32))));
-				if (overlaps)
-				{
-					if (cached_owner)
-					InvalidateCachedBlock(*block);
-					else
-						InvalidateInterpreterFallbackBlock(*fallback);
-					invalidated++;
-					continue;
-				}
-
-				if (write_index != read_index)
-					records[write_index] = record;
-				write_index++;
+				const SourceRange& range = closure[i];
+				if (range_start >= range.start && range_end <= range.end)
+					return false;
 			}
-			records.resize(write_index);
+
+			std::array<SourceRange, 3> candidates{};
+			for (u32 i = 0; i < closure_count; i++)
+				candidates[i] = closure[i];
+			candidates[closure_count] = {range_start, range_end};
+			const u32 candidate_count = closure_count + 1;
+			for (u32 i = 1; i < candidate_count; i++)
+			{
+				const SourceRange candidate = candidates[i];
+				u32 j = i;
+				while (j != 0 && candidates[j - 1].start > candidate.start)
+				{
+					candidates[j] = candidates[j - 1];
+					j--;
+				}
+				candidates[j] = candidate;
+			}
+			u32 write_index = 0;
+			closure[0] = candidates[0];
+			for (u32 read_index = 1; read_index < candidate_count; read_index++)
+			{
+				if (candidates[read_index].start <= closure[write_index].end)
+				{
+					closure[write_index].end =
+						std::max(closure[write_index].end, candidates[read_index].end);
+					continue;
+				}
+				pxAssertRel(write_index + 1 < closure.size(),
+					"IOP SMC closure exceeded its two circular-RAM components");
+				if (write_index + 1 < closure.size())
+					closure[++write_index] = candidates[read_index];
+			}
+			closure_count = write_index + 1;
+			return true;
+		};
+		const auto visit_source_ranges = [](u32 source_start, u32 source_size,
+			const auto& visitor) {
+			if (source_start == INVALID_RAM_SOURCE || source_size == 0)
+				return;
+			source_start &= Ps2MemSize::ExposedIopRam - 1;
+			u32 remaining = source_size;
+			while (remaining != 0)
+			{
+				const u32 chunk =
+					std::min(remaining, Ps2MemSize::ExposedIopRam - source_start);
+				visitor(source_start, source_start + chunk);
+				remaining -= chunk;
+				source_start = 0;
+			}
+		};
+		const auto range_overlaps =
+			[&closure, &closure_count, &visit_source_ranges](
+			u32 source_start, u32 source_size) {
+			bool overlaps = false;
+			visit_source_ranges(source_start, source_size,
+				[&](u32 range_start, u32 range_end) {
+					for (u32 i = 0; i < closure_count; i++)
+					{
+						const SourceRange& invalidation = closure[i];
+						if (range_start < invalidation.end &&
+							invalidation.start < range_end)
+						{
+							overlaps = true;
+							return;
+						}
+					}
+				});
+			return overlaps;
+		};
+
+		add_range(start, start + size);
+		const auto first_descriptor_at_or_after = [&](u32 identity) {
+			return static_cast<u32>(std::lower_bound(
+				m_semantic_block_descriptors.begin(),
+				m_semantic_block_descriptors.end(), identity,
+				[](const SemanticBlockDescriptor& descriptor, u32 value) {
+					return descriptor.rec_lookup_identity < value;
+				}) - m_semantic_block_descriptors.begin());
+		};
+		const auto expand_descriptor = [&](
+			const SemanticBlockDescriptor& descriptor) {
+			const u32 source_size = descriptor.instruction_count * sizeof(u32);
+			if (!range_overlaps(descriptor.ram_source_start, source_size))
+				return false;
+			bool expanded = false;
+			visit_source_ranges(descriptor.ram_source_start, source_size,
+				[&](u32 range_start, u32 range_end) {
+					expanded |= add_range(range_start, range_end);
+				});
+			return expanded;
+		};
+		for (;;)
+		{
+			bool expanded = false;
+			if (closure_count == 1)
+			{
+				constexpr u32 max_source_bytes =
+					MAX_LOGICAL_BLOCK_INSTRUCTIONS * sizeof(u32);
+				const u32 ram_size = Ps2MemSize::ExposedIopRam;
+
+				// A low interval can overlap the low half of a source which wraps
+				// from the end of exposed RAM. Probe only the maximum legal block
+				// window at that end; ordinary invalidations stay on the local path.
+				if (closure[0].start < max_source_bytes)
+				{
+					const u32 tail_begin =
+						first_descriptor_at_or_after(ram_size - max_source_bytes);
+					const u32 tail_end = first_descriptor_at_or_after(ram_size);
+					for (u32 i = tail_end; i > tail_begin; i--)
+						expanded |= expand_descriptor(
+							m_semantic_block_descriptors[i - 1]);
+				}
+
+				if (closure_count == 1)
+				{
+					// PCSX2 psxRecClearMem() finds the containing block, grows the
+					// lower extent backwards, then consumes starts below the dynamic
+					// upper extent forwards. recLUT identity equals RAM source offset,
+					// and the maximum block size supplies a safe early lower bound.
+					u32 i = first_descriptor_at_or_after(closure[0].end);
+					while (i != 0)
+					{
+						const SemanticBlockDescriptor& descriptor =
+							m_semantic_block_descriptors[i - 1];
+						if (descriptor.rec_lookup_identity >= ram_size)
+						{
+							i--;
+							continue;
+						}
+						if (static_cast<u64>(descriptor.rec_lookup_identity) +
+								max_source_bytes <= closure[0].start)
+						{
+							break;
+						}
+						expanded |= expand_descriptor(descriptor);
+						i--;
+					}
+
+					i = first_descriptor_at_or_after(closure[0].start);
+					while (i < m_semantic_block_descriptors.size() &&
+						m_semantic_block_descriptors[i].rec_lookup_identity <
+							closure[0].end)
+					{
+						expanded |=
+							expand_descriptor(m_semantic_block_descriptors[i]);
+						i++;
+					}
+				}
+			}
+			else
+			{
+				// Crossing exposed-RAM wrap produces two linear components. It is
+				// rare; retain the allocation-free exhaustive owner walk so neither
+				// side can miss a transitive overlap.
+				for (u32 i = static_cast<u32>(m_semantic_block_descriptors.size());
+					i != 0; i--)
+				{
+					expanded |=
+						expand_descriptor(m_semantic_block_descriptors[i - 1]);
+				}
+				for (const SemanticBlockDescriptor& descriptor :
+					m_semantic_block_descriptors)
+				{
+					expanded |= expand_descriptor(descriptor);
+				}
+			}
+			if (!expanded)
+				break;
+		}
+
+		// PCSX2 owner: x86/iR3000A.cpp::psxRecClearMem() expands lowerextent
+		// and upperextent through every overlapping BaseBlock before removing
+		// recBlocks and clearing recLUT. The compact descriptors are the Vita
+		// equivalent after physical code eviction, including wraparound RAM spans.
+		u32 descriptor_write_index = 0;
+		for (u32 descriptor_read_index = 0;
+			descriptor_read_index < m_semantic_block_descriptors.size();
+			descriptor_read_index++)
+		{
+			const SemanticBlockDescriptor& descriptor =
+				m_semantic_block_descriptors[descriptor_read_index];
+			if (!range_overlaps(descriptor.ram_source_start,
+					descriptor.instruction_count * sizeof(u32)))
+			{
+				if (descriptor_write_index != descriptor_read_index)
+				{
+					m_semantic_block_descriptors[descriptor_write_index] = descriptor;
+				}
+				descriptor_write_index++;
+				continue;
+			}
+			UnregisterSemanticRamSource(descriptor);
+		}
+		m_semantic_block_descriptors.resize(descriptor_write_index);
+
+		u32 invalidated = 0;
+		std::bitset<RAM_SOURCE_PAGE_COUNT> visited_pages;
+		for (u32 closure_index = 0; closure_index < closure_count; closure_index++)
+		{
+			const SourceRange& invalidation = closure[closure_index];
+			for (u32 page_index = invalidation.start >> RAM_SOURCE_PAGE_SHIFT;
+				page_index <= ((invalidation.end - 1) >> RAM_SOURCE_PAGE_SHIFT);
+				page_index++)
+			{
+				if (visited_pages.test(page_index))
+					continue;
+				visited_pages.set(page_index);
+				std::vector<RamSourceRecord>& records =
+					m_ram_source_pages[page_index];
+				u32 write_index = 0;
+				for (u32 read_index = 0; read_index < records.size(); read_index++)
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					m_ram_invalidation_record_visits++;
+#endif
+					const RamSourceRecord record = records[read_index];
+					CachedBlock* block = record.block;
+					InterpreterFallbackBlock* fallback = record.fallback;
+					const bool cached_owner = block && block->valid &&
+						block->source_serial == record.serial &&
+						block->ram_source_start != INVALID_RAM_SOURCE;
+					const bool fallback_owner = fallback && fallback->valid &&
+						fallback->source_serial == record.serial &&
+						fallback->ram_source_start != INVALID_RAM_SOURCE;
+					if (!cached_owner && !fallback_owner)
+						continue;
+
+					const u32 owner_source_start = cached_owner ?
+						block->ram_source_start : fallback->ram_source_start;
+					const u32 owner_source_size = (cached_owner ?
+						block->instruction_count : fallback->instruction_count) * sizeof(u32);
+					const bool overlaps =
+						range_overlaps(owner_source_start, owner_source_size) ||
+						(cached_owner && block->poll_call_wait_loop &&
+							(range_overlaps(block->poll_branch_source_start, 2 * sizeof(u32)) ||
+							 range_overlaps(block->poll_leaf_source_start, 5 * sizeof(u32))));
+					if (overlaps)
+					{
+						if (cached_owner)
+							InvalidateCachedBlock(*block);
+						else
+							InvalidateInterpreterFallbackBlock(*fallback);
+						invalidated++;
+						continue;
+					}
+
+					if (write_index != read_index)
+						records[write_index] = record;
+					write_index++;
+				}
+				records.resize(write_index);
+			}
 		}
 		return invalidated;
 	}
@@ -8987,6 +9158,7 @@ namespace VitaIOP
 		for (std::vector<RamSourceRecord>& page : m_ram_source_pages)
 			page.clear();
 		m_ram_source_page_live_counts.fill(0);
+		m_semantic_ram_source_page_counts.fill(0);
 		m_ram_source_page_live_flags.fill(0);
 		m_next_source_serial = 1;
 	}
@@ -9079,6 +9251,9 @@ namespace VitaIOP
 		block->logical_continuation = scan.logical_continuation;
 		block->valid = true;
 		RegisterRamSource(*block);
+		RememberSemanticBlockDescriptor(block->rec_lookup_identity,
+			block->ram_source_start, block->instruction_count,
+			block->logical_continuation);
 		return true;
 	}
 
@@ -9176,6 +9351,156 @@ namespace VitaIOP
 	}
 
 	void BlockExecutor::ClearBlockRecords() { m_block_records.clear(); }
+
+	const BlockExecutor::SemanticBlockDescriptor*
+	BlockExecutor::FindSemanticBlockDescriptor(u32 rec_lookup_identity) const
+	{
+		const auto it = std::lower_bound(m_semantic_block_descriptors.begin(),
+			m_semantic_block_descriptors.end(), rec_lookup_identity,
+			[](const SemanticBlockDescriptor& descriptor, u32 identity) {
+				return descriptor.rec_lookup_identity < identity;
+			});
+		return it != m_semantic_block_descriptors.end() &&
+			it->rec_lookup_identity == rec_lookup_identity ?
+			&*it : nullptr;
+	}
+
+	void BlockExecutor::RegisterSemanticRamSource(
+		const SemanticBlockDescriptor& descriptor)
+	{
+		if (descriptor.ram_source_start == INVALID_RAM_SOURCE ||
+			descriptor.instruction_count == 0)
+		{
+			return;
+		}
+
+		std::bitset<RAM_SOURCE_PAGE_COUNT> registered_pages;
+		u32 source_start =
+			descriptor.ram_source_start & (Ps2MemSize::ExposedIopRam - 1);
+		u32 remaining = descriptor.instruction_count * sizeof(u32);
+		while (remaining != 0)
+		{
+			const u32 chunk =
+				std::min(remaining, Ps2MemSize::ExposedIopRam - source_start);
+			const u32 source_end = source_start + chunk;
+			for (u32 page_index = source_start >> RAM_SOURCE_PAGE_SHIFT;
+				 page_index <= ((source_end - 1) >> RAM_SOURCE_PAGE_SHIFT);
+				 page_index++)
+			{
+				if (registered_pages.test(page_index))
+					continue;
+				pxAssertRel(m_ram_source_page_live_counts[page_index] != UINT32_MAX,
+					"IOP semantic source-page ownership overflow");
+				if (m_ram_source_page_live_counts[page_index] != UINT32_MAX)
+					m_ram_source_page_live_counts[page_index]++;
+				pxAssertRel(
+					m_semantic_ram_source_page_counts[page_index] != UINT32_MAX,
+					"IOP semantic source-page ownership overflow");
+				if (m_semantic_ram_source_page_counts[page_index] != UINT32_MAX)
+					m_semantic_ram_source_page_counts[page_index]++;
+				m_ram_source_page_live_flags[page_index] = 1;
+				registered_pages.set(page_index);
+			}
+			remaining -= chunk;
+			source_start = 0;
+		}
+	}
+
+	void BlockExecutor::UnregisterSemanticRamSource(
+		const SemanticBlockDescriptor& descriptor)
+	{
+		if (descriptor.ram_source_start == INVALID_RAM_SOURCE ||
+			descriptor.instruction_count == 0)
+		{
+			return;
+		}
+
+		std::bitset<RAM_SOURCE_PAGE_COUNT> unregistered_pages;
+		u32 source_start =
+			descriptor.ram_source_start & (Ps2MemSize::ExposedIopRam - 1);
+		u32 remaining = descriptor.instruction_count * sizeof(u32);
+		while (remaining != 0)
+		{
+			const u32 chunk =
+				std::min(remaining, Ps2MemSize::ExposedIopRam - source_start);
+			const u32 source_end = source_start + chunk;
+			for (u32 page_index = source_start >> RAM_SOURCE_PAGE_SHIFT;
+				 page_index <= ((source_end - 1) >> RAM_SOURCE_PAGE_SHIFT);
+				 page_index++)
+			{
+				if (unregistered_pages.test(page_index))
+					continue;
+				pxAssertRel(m_ram_source_page_live_counts[page_index] != 0,
+					"IOP semantic source-page ownership underflow");
+				if (m_ram_source_page_live_counts[page_index] != 0)
+					m_ram_source_page_live_counts[page_index]--;
+				pxAssertRel(
+					m_semantic_ram_source_page_counts[page_index] != 0,
+					"IOP semantic source-page ownership underflow");
+				if (m_semantic_ram_source_page_counts[page_index] != 0)
+					m_semantic_ram_source_page_counts[page_index]--;
+				m_ram_source_page_live_flags[page_index] =
+					m_ram_source_page_live_counts[page_index] != 0 ? 1 : 0;
+				unregistered_pages.set(page_index);
+			}
+			remaining -= chunk;
+			source_start = 0;
+		}
+	}
+
+	void BlockExecutor::RememberSemanticBlockDescriptor(u32 rec_lookup_identity,
+		u32 ram_source_start, u32 instruction_count, bool logical_continuation)
+	{
+		if (rec_lookup_identity == UINT32_MAX || instruction_count == 0)
+			return;
+
+		auto it = std::lower_bound(m_semantic_block_descriptors.begin(),
+			m_semantic_block_descriptors.end(), rec_lookup_identity,
+			[](const SemanticBlockDescriptor& descriptor, u32 identity) {
+				return descriptor.rec_lookup_identity < identity;
+			});
+		SemanticBlockDescriptor replacement = {
+			rec_lookup_identity,
+			ram_source_start,
+			instruction_count,
+			logical_continuation,
+		};
+		if (it != m_semantic_block_descriptors.end() &&
+			it->rec_lookup_identity == rec_lookup_identity)
+		{
+			// PCSX2 leaves an already-published BASEBLOCKEX and recLUT entry in
+			// place until psxRecClearMem() or a true recompiler reset removes it.
+			// An overlapping block compiled later cannot reshape this start.
+			return;
+		}
+
+		it = m_semantic_block_descriptors.insert(it, replacement);
+		RegisterSemanticRamSource(*it);
+	}
+
+	void BlockExecutor::ForgetSemanticBlockDescriptorsForLookupRange(
+		u32 start, u32 size)
+	{
+		if (size == 0)
+			return;
+		const u64 end = static_cast<u64>(start) + size;
+		for (u32 i = 0; i < m_semantic_block_descriptors.size();)
+		{
+			const SemanticBlockDescriptor& descriptor =
+				m_semantic_block_descriptors[i];
+			const u64 descriptor_start = descriptor.rec_lookup_identity;
+			const u64 descriptor_end = descriptor_start +
+				static_cast<u64>(descriptor.instruction_count) * sizeof(u32);
+			if (static_cast<u64>(start) >= descriptor_end || descriptor_start >= end)
+			{
+				i++;
+				continue;
+			}
+			UnregisterSemanticRamSource(descriptor);
+			m_semantic_block_descriptors.erase(
+				m_semantic_block_descriptors.begin() + i);
+		}
+	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::FindRecordedBlockByStartPc(
 		u32 start_pc, u32 instruction_count, bool match_instruction_count,
@@ -9366,6 +9691,7 @@ namespace VitaIOP
 
 		ClearBlockRecords();
 		ClearIncomingLinks();
+		m_semantic_block_descriptors.clear();
 		ClearRamSourcePages();
 		m_interpreter_fallback_blocks.clear();
 		ReleaseLookupPages();
@@ -9513,6 +9839,7 @@ namespace VitaIOP
 			return 0;
 		}
 		const u32 rec_lookup_end = rec_lookup_start + byte_count;
+		ForgetSemanticBlockDescriptorsForLookupRange(rec_lookup_start, byte_count);
 		u32 invalidated = 0;
 		for (const std::unique_ptr<InterpreterFallbackBlock>& block :
 			m_interpreter_fallback_blocks)
@@ -9992,6 +10319,22 @@ namespace VitaIOP
 		*result = {};
 		result->start_pc = start_pc;
 		result->stop_pc = start_pc;
+		const u32 start_identity = RecLookupIdentity(start_pc);
+		if (start_identity != UINT32_MAX)
+		{
+			if (const SemanticBlockDescriptor* descriptor =
+					FindSemanticBlockDescriptor(start_identity))
+			{
+				// A compiled PCSX2 BASEBLOCKEX keeps its first published shape even
+				// if another entry is later compiled inside that source extent. Code
+				// eviction must recreate that shape instead of rescanning against the
+				// newer interior recLUT entry.
+				result->instruction_count = descriptor->instruction_count;
+				result->stop_pc = start_pc + descriptor->instruction_count * sizeof(u32);
+				result->logical_continuation = descriptor->logical_continuation;
+				return BlockScanStatus::Success;
+			}
+		}
 		const auto add_instruction = [&](u32 pc) {
 			result->instruction_count++;
 			result->stop_pc = pc + 4;
@@ -10000,6 +10343,8 @@ namespace VitaIOP
 			const u32 rec_lookup_identity = RecLookupIdentity(pc);
 			if (rec_lookup_identity == UINT32_MAX)
 				return false;
+			if (FindSemanticBlockDescriptor(rec_lookup_identity))
+				return true;
 			if (FindInterpreterFallbackBlock(pc))
 				return true;
 			s32 index = LastBlockRecordIndex(rec_lookup_identity);
@@ -10111,6 +10456,7 @@ namespace VitaIOP
 			return true;
 #endif
 		bool matches = true;
+		u32 source_mismatch_pc = UINT32_MAX;
 		if (block.raw_opcodes) [[likely]]
 		{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -10121,6 +10467,8 @@ namespace VitaIOP
 				m_raw_validation_words++;
 				m_trusted_source_audit_words++;
 				matches = (block.Opcode(i) == block.raw_opcodes[i]);
+				if (!matches)
+					source_mismatch_pc = block.start_pc + i * sizeof(u32);
 			}
 			if (block.poll_call_wait_loop)
 			{
@@ -10155,6 +10503,8 @@ namespace VitaIOP
 					m_trusted_source_audit_words++;
 #endif
 				matches = opcode && block.Opcode(i) == *opcode;
+				if (!matches)
+					source_mismatch_pc = block.start_pc + i * sizeof(u32);
 			}
 		}
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -10169,6 +10519,11 @@ namespace VitaIOP
 		// translated ranges. Raw RAM sources normally return above under the
 		// explicit Vita invalidation contract; this mismatch path remains for the
 		// QEMU trust audit and handler-backed/cross-page fallback sources.
+		if (source_mismatch_pc != UINT32_MAX)
+		{
+			InvalidateRange(source_mismatch_pc, 1);
+			return false;
+		}
 		InvalidateCachedBlock(block);
 		return false;
 	}
@@ -10377,8 +10732,25 @@ namespace VitaIOP
 
 	u32 BlockExecutor::ResetForCachePressure()
 	{
+		// PCSX2 couples recLUT's semantic starts to its 32 MiB x86 code arena.
+		// Vita's 1 MiB A32 arena recycles much earlier, so retain the semantic
+		// descriptors while retiring every physical code/link/dispatch pointer.
+		// True Reset() and psxRecClearMem()-owned range invalidation still retire
+		// descriptors at their architectural ownership seams.
+		std::vector<SemanticBlockDescriptor> semantic_descriptors =
+			std::move(m_semantic_block_descriptors);
+		const std::array<u32, RAM_SOURCE_PAGE_COUNT> semantic_page_counts =
+			m_semantic_ram_source_page_counts;
 		const u32 previous_resets = m_code_cache_resets;
 		const u32 invalidated = Reset();
+		m_semantic_block_descriptors = std::move(semantic_descriptors);
+		m_semantic_ram_source_page_counts = semantic_page_counts;
+		m_ram_source_page_live_counts = semantic_page_counts;
+		for (u32 page_index = 0; page_index < RAM_SOURCE_PAGE_COUNT; page_index++)
+		{
+			m_ram_source_page_live_flags[page_index] =
+				semantic_page_counts[page_index] != 0 ? 1 : 0;
+		}
 		m_code_cache_resets = previous_resets + 1;
 		return invalidated;
 	}
@@ -10784,6 +11156,12 @@ namespace VitaIOP
 		}
 		RegisterBlockLookup(block);
 		RegisterRamSource(block);
+		if (block.discovered_topology)
+		{
+			RememberSemanticBlockDescriptor(block.rec_lookup_identity,
+				block.ram_source_start, block.instruction_count,
+				block.logical_continuation);
+		}
 		RegisterIncomingLinks(block);
 
 		if (m_direct_linking_enabled)

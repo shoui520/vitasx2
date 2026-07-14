@@ -277,7 +277,7 @@ namespace VitaIOP
 	{
 	public:
 		explicit BlockCompiler(VitaA32::CodeBuffer& code,
-			const u16* ram_source_page_live_counts,
+			const u32* ram_source_page_live_counts,
 			const u8* ram_source_page_live_flags,
 			bool source_page_literal_allowed = true);
 
@@ -536,7 +536,7 @@ namespace VitaIOP
 		bool EmitCop2StoreColdTail(const Cop2StoreColdTail& tail);
 
 		VitaA32::CodeBuffer& m_code;
-		const u16* m_ram_source_page_live_counts = nullptr;
+		const u32* m_ram_source_page_live_counts = nullptr;
 		const u8* m_ram_source_page_live_flags = nullptr;
 		bool m_source_page_literal_allowed = true;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
@@ -650,6 +650,10 @@ namespace VitaIOP
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		void SetDirectLinkingEnabled(bool enabled);
 		u32 GetCodeCacheResetCount() const { return m_code_cache_resets; }
+		u32 GetSemanticBlockDescriptorCount() const
+		{
+			return static_cast<u32>(m_semantic_block_descriptors.size());
+		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		void SnapshotInstrumentation(BlockExecutionResult* result) const;
 #endif
@@ -923,6 +927,18 @@ namespace VitaIOP
 			size_t code_size = 0;
 		};
 
+		// PCSX2's recLUT entry is both a code pointer and the semantic fact that a
+		// BaseBlock starts at this guest word. Vita's much smaller physical code
+		// arena can recycle code without discarding that second fact. Source extent
+		// remains attached so psxRecClearMem()-owned SMC can retire it selectively.
+		struct SemanticBlockDescriptor
+		{
+			u32 rec_lookup_identity = UINT32_MAX;
+			u32 ram_source_start = INVALID_RAM_SOURCE;
+			u32 instruction_count = 0;
+			bool logical_continuation = false;
+		};
+
 		static inline __attribute__((always_inline)) u32 RecLookupIdentity(u32 pc);
 		static inline __attribute__((always_inline)) u32 RecLinkIdentity(u32 pc);
 		static u32 LookupPageIndex(u32 rec_lookup_identity);
@@ -956,6 +972,13 @@ namespace VitaIOP
 		bool RegisterBlockRecord(CachedBlock& block);
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
+		const SemanticBlockDescriptor* FindSemanticBlockDescriptor(
+			u32 rec_lookup_identity) const;
+		void RememberSemanticBlockDescriptor(u32 rec_lookup_identity,
+			u32 ram_source_start, u32 instruction_count, bool logical_continuation);
+		void ForgetSemanticBlockDescriptorsForLookupRange(u32 start, u32 size);
+		void RegisterSemanticRamSource(const SemanticBlockDescriptor& descriptor);
+		void UnregisterSemanticRamSource(const SemanticBlockDescriptor& descriptor);
 		CachedBlock* FindRecordedBlockByStartPc(
 			u32 start_pc, u32 instruction_count, bool match_instruction_count,
 			bool isolate_cache_active, bool discovered_topology_only = false);
@@ -1152,6 +1175,7 @@ namespace VitaIOP
 			m_interpreter_fallback_blocks;
 		std::vector<CachedBlock*> m_free_cache_entries;
 		std::vector<BlockRecord> m_block_records;
+		std::vector<SemanticBlockDescriptor> m_semantic_block_descriptors;
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		// Keep the per-dispatch selector before the large inline source/cache
 		// banks so Cortex-A9 can load it with one immediate-offset LDR.
@@ -1159,7 +1183,9 @@ namespace VitaIOP
 		bool m_force_logical_continuation = false;
 		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT>
 			m_ram_source_pages;
-		std::array<u16, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
+		std::array<u32, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
+		std::array<u32, RAM_SOURCE_PAGE_COUNT>
+			m_semantic_ram_source_page_counts{};
 		std::array<u8, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_flags{};
 		LookupPage** m_lookup_pages = nullptr;
 		std::array<std::array<std::array<HotDispatchCacheEntry,
