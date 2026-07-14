@@ -1481,6 +1481,124 @@ namespace VitaEE
 		return false;
 	}
 
+	bool BlockExecutor::CachedBlockHasDirectSourceSpan(const CachedBlock& block) const
+	{
+		if (!block.opcodes || !vtlb_private::vtlbdata.vmap)
+			return false;
+
+		const u32 dependency_start_pc = block.dependency_instruction_count != 0 ?
+			block.dependency_start_pc : block.start_pc;
+		const u32 dependency_instruction_count = block.dependency_instruction_count != 0 ?
+			block.dependency_instruction_count : block.instruction_count;
+		u32 source_pc = dependency_start_pc;
+		u32 remaining =
+			dependency_instruction_count * static_cast<u32>(sizeof(u32));
+		while (remaining != 0)
+		{
+			const vtlb_private::VTLBVirtual vmv =
+				vtlb_private::vtlbdata.vmap[
+					source_pc >> vtlb_private::VTLB_PAGE_BITS];
+			if (vmv.isHandler(source_pc))
+				return false;
+
+			const u32 page_remaining =
+				vtlb_private::VTLB_PAGE_SIZE -
+					(source_pc & vtlb_private::VTLB_PAGE_MASK);
+			const u32 chunk = std::min(remaining, page_remaining);
+			source_pc += chunk;
+			remaining -= chunk;
+		}
+		return true;
+	}
+
+	bool BlockExecutor::CachedBlockSourceMatches(const CachedBlock& block) const
+	{
+		if (!block.opcodes)
+			return false;
+
+		const u32 dependency_start_pc = block.dependency_instruction_count != 0 ?
+			block.dependency_start_pc : block.start_pc;
+		const u32 dependency_instruction_count = block.dependency_instruction_count != 0 ?
+			block.dependency_instruction_count : block.instruction_count;
+		const u32 opcode_bytes =
+			dependency_instruction_count * static_cast<u32>(sizeof(u32));
+		const u32 page_remaining =
+			vtlb_private::VTLB_PAGE_SIZE -
+				(dependency_start_pc & vtlb_private::VTLB_PAGE_MASK);
+		if (vtlb_private::vtlbdata.vmap && opcode_bytes <= page_remaining)
+		{
+			const vtlb_private::VTLBVirtual vmv =
+				vtlb_private::vtlbdata.vmap[
+					dependency_start_pc >> vtlb_private::VTLB_PAGE_BITS];
+			if (!vmv.isHandler(dependency_start_pc))
+			{
+				return std::memcmp(block.opcodes.get(),
+					reinterpret_cast<const void*>(
+						vmv.assumePtr(dependency_start_pc)), opcode_bytes) == 0;
+			}
+		}
+
+		for (u32 i = 0; i < dependency_instruction_count; i++)
+		{
+			if (block.opcodes[i] != memRead32(dependency_start_pc + i * sizeof(u32)))
+				return false;
+		}
+		return true;
+	}
+
+	u32 BlockExecutor::RetireStaleOverlappingBlocks(u32 start_pc,
+		u32 instruction_count, bool discovered_topology)
+	{
+		if (instruction_count == 0 ||
+			instruction_count > ((UINT32_MAX - start_pc) / sizeof(u32)))
+		{
+			return 0;
+		}
+
+		const u32 end_pc = start_pc + instruction_count * sizeof(u32);
+		constexpr u32 max_block_bytes =
+			MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS * sizeof(u32);
+		const u32 first_candidate_pc =
+			start_pc > max_block_bytes ? start_pc - max_block_bytes : 0;
+		auto candidate = std::lower_bound(m_block_records.begin(),
+			m_block_records.end(), first_candidate_pc,
+			[](const BlockRecord& record, u32 pc) {
+				return record.start_pc < pc;
+			});
+		for (; candidate != m_block_records.end() &&
+			candidate->start_pc < end_pc; ++candidate)
+		{
+			CachedBlock* old_block = candidate->block;
+			if (!old_block || !old_block->valid ||
+				old_block->discovered_topology != discovered_topology)
+			{
+				continue;
+			}
+
+			const u32 old_end_pc = old_block->start_pc +
+				old_block->instruction_count * sizeof(u32);
+			// PCSX2 avoids handler reads by bounding recRAMCopy overlap checks to
+			// RAM. A32 may also prove ROM or scratchpad through a non-handler direct
+			// source span, but compilation must not add observable handler reads.
+			if (old_end_pc <= start_pc ||
+				!CachedBlockHasDirectSourceSpan(*old_block) ||
+				CachedBlockSourceMatches(*old_block))
+				continue;
+
+			// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile(). After
+			// compiling a new BaseBlock, PCSX2 compares recRAMCopy for every
+			// overlapping old block. One stale snapshot invokes recClear() for
+			// the complete new span before its entry is published. Besides SMC
+			// correctness, this retires stale outer topology so rediscovery sees
+			// an already-published interior entry and preserves PCSX2's per-block
+			// fixed-point cycle rounding.
+			return InvalidateRangeInternal(start_pc, instruction_count,
+				&discovered_topology);
+		}
+
+		return 0;
+	}
+
 	bool BlockExecutor::ValidateCachedBlock(CachedBlock& block, bool validate_source_words)
 	{
 		if (!block.valid)
@@ -1501,36 +1619,7 @@ namespace VitaEE
 			// that two-page block and handler-backed pages use the exact memRead32()
 			// fallback. InvalidateRange() checks the complete block span, so a write
 			// to either source page still discards the cached translation.
-			const u32 dependency_start_pc = block.dependency_instruction_count != 0 ?
-				block.dependency_start_pc : block.start_pc;
-			const u32 dependency_instruction_count = block.dependency_instruction_count != 0 ?
-				block.dependency_instruction_count : block.instruction_count;
-			const u32 opcode_bytes =
-				dependency_instruction_count * static_cast<u32>(sizeof(u32));
-			const u32 page_remaining =
-				vtlb_private::VTLB_PAGE_SIZE -
-				(dependency_start_pc & vtlb_private::VTLB_PAGE_MASK);
-			bool compared_raw_window = false;
-			if (vtlb_private::vtlbdata.vmap && opcode_bytes <= page_remaining)
-			{
-				const vtlb_private::VTLBVirtual vmv =
-					vtlb_private::vtlbdata.vmap[
-						dependency_start_pc >> vtlb_private::VTLB_PAGE_BITS];
-				if (!vmv.isHandler(dependency_start_pc))
-				{
-					matches = (std::memcmp(block.opcodes.get(),
-								   reinterpret_cast<const void*>(
-									   vmv.assumePtr(dependency_start_pc)), opcode_bytes) == 0);
-					compared_raw_window = true;
-				}
-			}
-
-			if (!compared_raw_window)
-			{
-				for (u32 i = 0; matches && i < dependency_instruction_count; i++)
-					matches = (block.opcodes[i] ==
-						memRead32(dependency_start_pc + i * 4));
-			}
+			matches = CachedBlockSourceMatches(block);
 		}
 
 		if (matches)
@@ -2098,6 +2187,9 @@ namespace VitaEE
 		block.direct_links = direct_links;
 		block.concatenated_short = compiled_concatenated_short;
 		block.discovered_topology = discovered_topology;
+
+		RetireStaleOverlappingBlocks(start_pc, compiled_instruction_count,
+			discovered_topology);
 
 		if (compiled_instruction_count < instruction_count)
 		{

@@ -275,6 +275,10 @@ namespace VitaEE
 		void RegisterIncomingLink(CachedBlock& block, u8 slot_index, const DirectLinkSlot& link);
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
+		bool CachedBlockHasDirectSourceSpan(const CachedBlock& block) const;
+		bool CachedBlockSourceMatches(const CachedBlock& block) const;
+		u32 RetireStaleOverlappingBlocks(u32 start_pc, u32 instruction_count,
+			bool discovered_topology);
 		bool ValidateCachedBlock(CachedBlock& block, bool validate_source_words = true);
 		CachedBlock* FindLookupBlockByStartPc(u32 start_pc,
 			bool discovered_topology);
