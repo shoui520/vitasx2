@@ -19,9 +19,12 @@
 #include "common/Error.h"
 #include "common/Vita/VitaJitMemory.h"
 
+#include <condition_variable>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <thread>
 
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
@@ -37,6 +40,48 @@ namespace VitaVM
 
 	static std::mutex s_blocks_mutex;
 	static std::map<uptr, Block> s_blocks; // base address -> block
+	static std::mutex s_write_mutex;
+	static std::condition_variable s_write_cv;
+	static bool s_write_active = false;
+	static std::thread::id s_write_owner;
+
+	static bool SyncJitMemoryLocked(void* address, size_t size)
+	{
+		if (!address || size == 0 || size > std::numeric_limits<SceSize>::max())
+			return false;
+
+		std::unique_lock lock(s_blocks_mutex);
+		const uptr addr = reinterpret_cast<uptr>(address);
+		const uptr end = addr + size;
+		if (end < addr)
+			return false;
+
+		auto it = s_blocks.upper_bound(addr);
+		if (it == s_blocks.begin())
+			return false;
+		--it;
+		const uptr block_end = it->first + it->second.size;
+		if (addr < it->first || end > block_end)
+			return false;
+
+		const int result = sceKernelSyncVMDomain(
+			it->second.uid, address, static_cast<SceSize>(size));
+		if (result < 0)
+		{
+			Console.Error("sceKernelSyncVMDomain(%08x, %p, %zu) failed: %08x",
+				it->second.uid, address, size, result);
+			return false;
+		}
+		return true;
+	}
+
+	static void FinishJitWrite(std::unique_lock<std::mutex>& lock)
+	{
+		s_write_active = false;
+		s_write_owner = {};
+		lock.unlock();
+		s_write_cv.notify_one();
+	}
 
 	void* AllocJitMemory(size_t size, SceUID* out_uid)
 	{
@@ -78,18 +123,74 @@ namespace VitaVM
 		s_blocks.erase(it);
 	}
 
-	// Finds the VM block containing [address, address+size).
-	static SceUID FindBlock(const void* address)
+	bool BeginJitWrite()
 	{
-		std::unique_lock lock(s_blocks_mutex);
-		const uptr addr = reinterpret_cast<uptr>(address);
-		auto it = s_blocks.upper_bound(addr);
-		if (it == s_blocks.begin())
-			return -1;
-		--it;
-		if (addr >= it->first && addr < (it->first + it->second.size))
-			return it->second.uid;
-		return -1;
+		const std::thread::id owner = std::this_thread::get_id();
+		std::unique_lock lock(s_write_mutex);
+		if (s_write_active && s_write_owner == owner)
+		{
+			Console.Error("Nested Vita VM-domain code writes are unsupported.");
+			return false;
+		}
+
+		s_write_cv.wait(lock, [] { return !s_write_active; });
+		const int result = sceKernelOpenVMDomain();
+		if (result < 0)
+		{
+			Console.Error("sceKernelOpenVMDomain() failed: %08x", result);
+			return false;
+		}
+
+		s_write_active = true;
+		s_write_owner = owner;
+		return true;
+	}
+
+	bool EndJitWrite()
+	{
+		std::unique_lock lock(s_write_mutex);
+		if (!s_write_active)
+		{
+			Console.Error("sceKernelCloseVMDomain() requested without an active code write.");
+			return false;
+		}
+
+		const int result = sceKernelCloseVMDomain();
+		FinishJitWrite(lock);
+		if (result < 0)
+		{
+			Console.Error("sceKernelCloseVMDomain() failed: %08x", result);
+			return false;
+		}
+		return true;
+	}
+
+	bool EndJitWriteAndSync(void* address, size_t size)
+	{
+		std::unique_lock lock(s_write_mutex);
+		if (!s_write_active)
+		{
+			Console.Error("Vita JIT publication requested without an active code write.");
+			return false;
+		}
+
+		const int close_result = sceKernelCloseVMDomain();
+		const bool sync_result = close_result >= 0 && SyncJitMemoryLocked(address, size);
+		FinishJitWrite(lock);
+		if (close_result < 0)
+		{
+			Console.Error("sceKernelCloseVMDomain() failed before publication: %08x",
+				close_result);
+			return false;
+		}
+		return sync_result;
+	}
+
+	bool SyncJitMemory(void* address, size_t size)
+	{
+		std::unique_lock write_lock(s_write_mutex);
+		s_write_cv.wait(write_lock, [] { return !s_write_active; });
+		return SyncJitMemoryLocked(address, size);
 	}
 } // namespace VitaVM
 
@@ -118,15 +219,8 @@ void HostSys::DestroySharedMemory(void* ptr)
 
 void HostSys::FlushInstructionCache(void* address, u32 size)
 {
-	const SceUID uid = VitaVM::FindBlock(address);
-	if (uid >= 0)
-	{
-		sceKernelSyncVMDomain(uid, address, size);
-		return;
-	}
-
-	// Not JIT memory; nothing we can (or should) flush from user mode.
-	pxAssertRel(false, "FlushInstructionCache() outside a VM block");
+	pxAssertRel(VitaVM::SyncJitMemory(address, size),
+		"FlushInstructionCache() failed or addressed memory outside a VM block");
 }
 
 size_t HostSys::GetRuntimePageSize()

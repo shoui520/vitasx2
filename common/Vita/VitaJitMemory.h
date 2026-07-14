@@ -15,4 +15,8 @@ namespace VitaVM
 {
 	void* AllocJitMemory(size_t size, SceUID* out_uid = nullptr);
 	void FreeJitMemory(void* ptr);
+	bool BeginJitWrite();
+	bool EndJitWrite();
+	bool EndJitWriteAndSync(void* address, size_t size);
+	bool SyncJitMemory(void* address, size_t size);
 } // namespace VitaVM

@@ -21,9 +21,7 @@ namespace
 
 	bool IsValidPortableGifUnitState()
 	{
-		u32 transfer_type = 0;
-		static_assert(sizeof(transfer_type) == sizeof(gifUnit.lastTranType));
-		std::memcpy(&transfer_type, &gifUnit.lastTranType, sizeof(transfer_type));
+		const u32 transfer_type = static_cast<u32>(gifUnit.lastTranType);
 		const bool valid_transfer_type = transfer_type == GIF_TRANS_INVALID ||
 			transfer_type == GIF_TRANS_XGKICK || transfer_type == GIF_TRANS_MTVU ||
 			transfer_type == GIF_TRANS_DIRECT || transfer_type == GIF_TRANS_DIRECTHL ||

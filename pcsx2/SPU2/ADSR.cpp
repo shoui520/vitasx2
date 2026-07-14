@@ -76,7 +76,9 @@ static __forceinline s32 ClampVolumeNonPositive_selected(s32 value)
 	__asm__(
 		"ssat %0, #16, %1\n\t"
 		"cmp %0, #0\n\t"
-		"movgt %0, #0"
+		"ble 1f\n\t"
+		"mov %0, #0\n"
+		"1:"
 		: "=&r"(result)
 		: "r"(value)
 		: "cc");

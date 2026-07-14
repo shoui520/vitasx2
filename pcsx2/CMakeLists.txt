@@ -180,7 +180,7 @@ add_library(pcsx2core STATIC
 # PUSH after verifying its exact A32 opcode at runtime. Keep this translation
 # unit non-PIE so no GOT setup can legally precede that save.
 set_source_files_properties(vita/VitaIopBlockCompiler.cpp PROPERTIES
-	COMPILE_OPTIONS "-fno-pie"
+	COMPILE_OPTIONS "-fno-pie;-marm"
 )
 
 # VU multiply/add instructions round after each architectural operation.

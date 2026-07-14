@@ -12,6 +12,7 @@
 #include "common/Vita/VitaJitMemory.h"
 #endif
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 
@@ -361,8 +362,11 @@ namespace VitaA32
 		: m_base(std::exchange(other.m_base, nullptr))
 		, m_capacity(std::exchange(other.m_capacity, 0))
 		, m_offset(std::exchange(other.m_offset, 0))
+		, m_dirty_begin(std::exchange(other.m_dirty_begin, 0))
+		, m_dirty_end(std::exchange(other.m_dirty_end, 0))
 		, m_owns_memory(std::exchange(other.m_owns_memory, false))
 		, m_out_of_space(std::exchange(other.m_out_of_space, false))
+		, m_write_domain_open(std::exchange(other.m_write_domain_open, false))
 		, m_neon_logical_first_q(std::exchange(other.m_neon_logical_first_q, 0))
 		, m_neon_physical_first_q(std::exchange(other.m_neon_physical_first_q, 0))
 		, m_neon_mapped_q_count(std::exchange(other.m_neon_mapped_q_count, 0))
@@ -377,8 +381,11 @@ namespace VitaA32
 			m_base = std::exchange(other.m_base, nullptr);
 			m_capacity = std::exchange(other.m_capacity, 0);
 			m_offset = std::exchange(other.m_offset, 0);
+			m_dirty_begin = std::exchange(other.m_dirty_begin, 0);
+			m_dirty_end = std::exchange(other.m_dirty_end, 0);
 			m_owns_memory = std::exchange(other.m_owns_memory, false);
 			m_out_of_space = std::exchange(other.m_out_of_space, false);
+			m_write_domain_open = std::exchange(other.m_write_domain_open, false);
 			m_neon_logical_first_q = std::exchange(other.m_neon_logical_first_q, 0);
 			m_neon_physical_first_q = std::exchange(other.m_neon_physical_first_q, 0);
 			m_neon_mapped_q_count = std::exchange(other.m_neon_mapped_q_count, 0);
@@ -402,15 +409,21 @@ namespace VitaA32
 		m_base = static_cast<u8*>(mapping);
 		m_capacity = aligned_capacity;
 		m_offset = 0;
+		m_dirty_begin = 0;
+		m_dirty_end = 0;
 		m_owns_memory = true;
 		m_out_of_space = false;
+		m_write_domain_open = false;
 		return true;
 #else
 		m_base = static_cast<u8*>(VitaVM::AllocJitMemory(capacity));
 		m_capacity = m_base ? capacity : 0;
 		m_offset = 0;
+		m_dirty_begin = 0;
+		m_dirty_end = 0;
 		m_owns_memory = (m_base != nullptr);
 		m_out_of_space = false;
+		m_write_domain_open = false;
 		return (m_base != nullptr);
 #endif
 	}
@@ -424,14 +437,20 @@ namespace VitaA32
 		m_base = data;
 		m_capacity = capacity;
 		m_offset = 0;
+		m_dirty_begin = 0;
+		m_dirty_end = 0;
 		m_owns_memory = false;
 		m_out_of_space = false;
+		m_write_domain_open = false;
 		return true;
 	}
 
 	void CodeBuffer::Reset()
 	{
+		pxAssertRel(CloseWriteDomain(), "Failed to close the Vita VM domain before resetting code");
 		m_offset = 0;
+		m_dirty_begin = 0;
+		m_dirty_end = 0;
 		m_out_of_space = false;
 	}
 
@@ -473,6 +492,7 @@ namespace VitaA32
 
 	void CodeBuffer::Release()
 	{
+		pxAssertRel(CloseWriteDomain(), "Failed to close the Vita VM domain before releasing code");
 		if (m_base)
 		{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -487,8 +507,11 @@ namespace VitaA32
 
 		m_capacity = 0;
 		m_offset = 0;
+		m_dirty_begin = 0;
+		m_dirty_end = 0;
 		m_owns_memory = false;
 		m_out_of_space = false;
+		m_write_domain_open = false;
 		m_neon_logical_first_q = 0;
 		m_neon_physical_first_q = 0;
 		m_neon_mapped_q_count = 0;
@@ -501,9 +524,13 @@ namespace VitaA32
 			m_out_of_space = true;
 			return false;
 		}
+		if (!EnsureWritable())
+			return false;
 
-		std::memcpy(m_base + m_offset, &instruction, sizeof(instruction));
+		const size_t instruction_offset = m_offset;
+		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
 		m_offset += sizeof(instruction);
+		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
 
@@ -2052,8 +2079,11 @@ namespace VitaA32
 		u32 instruction = 0;
 		if (!EncodeBranch(m_base + instruction_offset, m_base + target_offset, &instruction, condition))
 			return false;
+		if (!EnsureWritable())
+			return false;
 
 		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
 
@@ -2071,8 +2101,11 @@ namespace VitaA32
 		{
 			return false;
 		}
+		if (!EnsureWritable())
+			return false;
 
 		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
 
@@ -2082,7 +2115,10 @@ namespace VitaA32
 			return false;
 
 		const u32 instruction = CondBits(Condition::AL) | NOP;
+		if (!EnsureWritable())
+			return false;
 		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
 
@@ -2106,7 +2142,10 @@ namespace VitaA32
 			return false;
 		}
 
+		if (!EnsureWritable())
+			return false;
 		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
 
@@ -2135,7 +2174,10 @@ namespace VitaA32
 		const u32 magnitude = static_cast<u32>(displacement < 0 ? -displacement : displacement);
 		const u32 add = displacement >= 0 ? (1u << 23) : 0;
 		const u32 instruction = CondBits(condition) | 0x051f0000u | add | (rd << 12) | magnitude;
+		if (!EnsureWritable())
+			return false;
 		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
 
@@ -2206,8 +2248,11 @@ namespace VitaA32
 
 		const u32 movw = EncodeMovw(rd, static_cast<u16>(value));
 		const u32 movt = EncodeMovt(rd, static_cast<u16>(value >> 16));
+		if (!EnsureWritable())
+			return false;
 		std::memcpy(m_base + instruction_offset, &movw, sizeof(movw));
 		std::memcpy(m_base + instruction_offset + sizeof(movw), &movt, sizeof(movt));
+		MarkDirty(instruction_offset, sizeof(movw) + sizeof(movt));
 		return true;
 	}
 
@@ -2215,13 +2260,62 @@ namespace VitaA32
 	{
 		if (!m_base || m_offset == 0)
 			return false;
+		if (m_dirty_begin == m_dirty_end)
+			return CloseWriteDomain();
 
 #if defined(VITASX2_QEMU_VALIDATION)
-		__builtin___clear_cache(reinterpret_cast<char*>(m_base), reinterpret_cast<char*>(m_base + m_offset));
+		__builtin___clear_cache(reinterpret_cast<char*>(m_base + m_dirty_begin),
+			reinterpret_cast<char*>(m_base + m_dirty_end));
 #else
-		HostSys::FlushInstructionCache(m_base, static_cast<u32>(m_offset));
+		if (!m_write_domain_open)
+			return false;
+		m_write_domain_open = false;
+		if (!VitaVM::EndJitWriteAndSync(
+				m_base + m_dirty_begin, m_dirty_end - m_dirty_begin))
+			return false;
 #endif
+		m_dirty_begin = 0;
+		m_dirty_end = 0;
 		return true;
+	}
+
+	bool CodeBuffer::EnsureWritable()
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		return true;
+#else
+		if (m_write_domain_open)
+			return true;
+		m_write_domain_open = VitaVM::BeginJitWrite();
+		return m_write_domain_open;
+#endif
+	}
+
+	bool CodeBuffer::CloseWriteDomain()
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		return true;
+#else
+		if (!m_write_domain_open)
+			return true;
+		m_write_domain_open = false;
+		return VitaVM::EndJitWrite();
+#endif
+	}
+
+	void CodeBuffer::MarkDirty(size_t offset, size_t size)
+	{
+		const size_t end = offset + size;
+		if (m_dirty_begin == m_dirty_end)
+		{
+			m_dirty_begin = offset;
+			m_dirty_end = end;
+		}
+		else
+		{
+			m_dirty_begin = std::min(m_dirty_begin, offset);
+			m_dirty_end = std::max(m_dirty_end, end);
+		}
 	}
 
 	bool CodeBuffer::HasSpace(size_t bytes) const

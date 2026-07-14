@@ -291,14 +291,20 @@ namespace VitaA32
 
 	private:
 		bool HasSpace(size_t bytes) const;
+		bool EnsureWritable();
+		bool CloseWriteDomain();
+		void MarkDirty(size_t offset, size_t size);
 		unsigned MapNeonQRegister(unsigned qreg) const;
 		unsigned MapNeonDRegister(unsigned dreg) const;
 
 		u8* m_base = nullptr;
 		size_t m_capacity = 0;
 		size_t m_offset = 0;
+		size_t m_dirty_begin = 0;
+		size_t m_dirty_end = 0;
 		bool m_owns_memory = false;
 		bool m_out_of_space = false;
+		bool m_write_domain_open = false;
 		u8 m_neon_logical_first_q = 0;
 		u8 m_neon_physical_first_q = 0;
 		u8 m_neon_mapped_q_count = 0;
