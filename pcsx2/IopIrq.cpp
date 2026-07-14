@@ -35,7 +35,7 @@ void usbIrq(int cycles)
 
 void fwIrq()
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::FireWireIrq);
 #endif

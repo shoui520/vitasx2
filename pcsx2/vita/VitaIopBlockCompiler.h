@@ -35,6 +35,17 @@ namespace VitaIOP
 		bool logical_continuation = false;
 	};
 
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	// Minimal product-dispatch sentinels for real-hardware all-native replay.
+	// Keep the large QEMU profiling surface out of the PSP2 validation build.
+	struct PortableValidationStats
+	{
+		u32 native_provider_entries = 0;
+		u32 interpreter_fallback_entries = 0;
+		u32 invalid_provider_results = 0;
+	};
+#endif
+
 	enum class BlockScanStatus : u8
 	{
 		Success,
@@ -646,6 +657,9 @@ namespace VitaIOP
 
 		u32 Reset();
 		void ResetInstrumentationCounters();
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		PortableValidationStats GetPortableValidationStats() const;
+#endif
 		void NotifyPcDiscontinuity();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
 		void SetDirectLinkingEnabled(bool enabled);
@@ -1345,6 +1359,10 @@ namespace VitaIOP
 		u64 m_compiled_ps1_bios_gate_blocks = 0;
 		u64 m_compiled_ps1_bios_gate_entries = 0;
 		u64 m_dispatcher_ps1_bios_gate_checks_removed = 0;
+#endif
+
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		PortableValidationStats m_portable_validation_stats{};
 #endif
 		bool m_direct_linking_enabled = true;
 	};

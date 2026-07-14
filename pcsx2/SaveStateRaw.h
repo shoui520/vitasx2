@@ -6,6 +6,7 @@
 #include "common/Pcsx2Defs.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -46,5 +47,42 @@ namespace SaveStateRaw
 	// missing, duplicate, reordered, overlapping, out-of-bounds, corrupt, or
 	// trailing data causes failure.
 	std::unique_ptr<ArchiveEntryList> Decode(std::span<const u8> input,
+		Error* error = nullptr);
+
+	// A strict, bounded-memory reader for the same canonical PCSX2RAW v2
+	// transport accepted by Decode(). Open() validates the complete fixed
+	// header/directory, exact file length, canonical entry layout, version
+	// marker, and every payload CRC before returning. ReadEntry() seeks back to
+	// the cached payload location and verifies that entry's CRC again while
+	// filling the caller-owned destination, closing the preflight/use race.
+	class FileReader final
+	{
+	public:
+		~FileReader();
+
+		static std::unique_ptr<FileReader> Open(const char* filename,
+			Error* error = nullptr);
+
+		size_t GetEntryCount() const;
+		std::string_view GetEntryName(u32 index) const;
+		u64 GetEntrySize(u32 index) const;
+		bool ReadEntry(u32 index, std::span<u8> destination,
+			Error* error = nullptr);
+
+	private:
+		struct Impl;
+		explicit FileReader(std::unique_ptr<Impl> impl);
+
+		std::unique_ptr<Impl> m_impl;
+	};
+
+	// Supplies one canonical payload at a time. The returned span may refer to
+	// scratch (for serialized device state) or directly to stable VM memory.
+	// EncodeFile() consumes it before requesting the next entry. This permits a
+	// portable replay to be emitted without constructing a 42+ MiB aggregate
+	// ArchiveEntryList. Any incomplete output is deleted on failure.
+	using FileEntryProvider = std::function<bool(u32 index, std::string_view name,
+		std::vector<u8>* scratch, std::span<const u8>* data, Error* error)>;
+	bool EncodeFile(const char* filename, const FileEntryProvider& provider,
 		Error* error = nullptr);
 } // namespace SaveStateRaw

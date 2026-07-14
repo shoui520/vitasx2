@@ -27,10 +27,11 @@
 #include "GSDumpReplayer.h"
 
 #include "DebugTools/Breakpoints.h"
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 #include "DebugTools/CoreEventTrace.h"
 #endif
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
 #include "DebugTools/MIPSAnalyst.h"
@@ -67,7 +68,8 @@ EE_intProcessStatus eeRunInterruptScan = INT_NOT_RUNNING;
 
 u32 g_eeloadMain = 0, g_eeloadExec = 0, g_osdsys_str = 0;
 
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 static __fi Pcsx2Trace::CoreEventId GetEeSifCoreEventId(u8 event)
 {
 	return event == DMAC_SIF0 ? Pcsx2Trace::CoreEventId::EeDmacSif0 :
@@ -288,7 +290,8 @@ static __fi void TESTINT( u8 n, void (*callback)() )
 
 	if(CHECK_INSTANTDMAHACK || cpuTestCycle( cpuRegs.sCycle[n], cpuRegs.eCycle[n] ) )
 	{
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		const Pcsx2Trace::CoreEventId trace_event_id = GetEeSifCoreEventId(n);
 		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
 		{
@@ -299,7 +302,8 @@ static __fi void TESTINT( u8 n, void (*callback)() )
 #endif
 		cpuClearInt( n );
 		callback();
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
 		{
 			TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Event,
@@ -420,7 +424,8 @@ __fi void _cpuEventTest_Shared()
 	eeEventTestIsActive = true;
 	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
 	cpuRegs.lastEventCycle = cpuRegs.cycle;
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
 		Pcsx2Trace::CoreEventPhase::Enter, Pcsx2Trace::CoreEventId::None,
 		cpuRegs.nextEventCycle);
@@ -455,7 +460,8 @@ __fi void _cpuEventTest_Shared()
 		//if( EEsCycle < -450 )
 		//	Console.WriteLn( " IOP ahead by: %d cycles", -EEsCycle );
 
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
 			Pcsx2Trace::CoreEventPhase::Before, Pcsx2Trace::CoreEventId::None,
 			cpuRegs.nextEventCycle);
@@ -480,7 +486,8 @@ __fi void _cpuEventTest_Shared()
 		}
 #endif
 
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
 			Pcsx2Trace::CoreEventPhase::After, Pcsx2Trace::CoreEventId::None,
 			cpuRegs.nextEventCycle);
@@ -545,12 +552,13 @@ __fi void _cpuEventTest_Shared()
 	// Apply vsync and other counter nextCycles
 	cpuSetNextEvent(nextStartCounter, nextDeltaCounter);
 
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	TraceEeCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
 		Pcsx2Trace::CoreEventPhase::Exit, Pcsx2Trace::CoreEventId::None,
 		cpuRegs.nextEventCycle);
 #endif
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::RecordPendingMachineCheckpointAtEventTest();
 #endif
 	eeEventTestIsActive = false;
@@ -627,7 +635,8 @@ __fi void CPU_INT( EE_EventType n, s32 ecycle)
 		cpuRegs.interrupt |= 1 << n;
 		cpuRegs.sCycle[n] = cpuRegs.cycle;
 		cpuRegs.eCycle[n] = 0;
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		const Pcsx2Trace::CoreEventId trace_event_id = GetEeSifCoreEventId(n);
 		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
 		{
@@ -647,7 +656,8 @@ __fi void CPU_INT( EE_EventType n, s32 ecycle)
 	cpuRegs.interrupt |= 1 << n;
 	cpuRegs.sCycle[n] = cpuRegs.cycle;
 	cpuRegs.eCycle[n] = ecycle;
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	const Pcsx2Trace::CoreEventId trace_event_id = GetEeSifCoreEventId(n);
 	if (trace_event_id != Pcsx2Trace::CoreEventId::None)
 	{

@@ -6,7 +6,8 @@
 
 #include "SIO/Sio0.h"
 #include "Sif.h"
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 #include "DebugTools/CoreEventTrace.h"
 #endif
 #include "DebugTools/Breakpoints.h"
@@ -38,7 +39,8 @@ bool iopEventTestIsActive = false;
 
 alignas(16) psxRegisters psxRegs;
 
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 static __fi Pcsx2Trace::CoreEventId GetIopSifCoreEventId(IopEventId event)
 {
 	return event == IopEvt_SIF0 ? Pcsx2Trace::CoreEventId::IopSif0 :
@@ -169,7 +171,8 @@ __fi void PSX_INT( IopEventId n, s32 ecycle )
 
 	psxRegs.sCycle[n] = psxRegs.cycle;
 	psxRegs.eCycle[n] = ecycle;
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	const Pcsx2Trace::CoreEventId trace_event_id = GetIopSifCoreEventId(n);
 	if (trace_event_id != Pcsx2Trace::CoreEventId::None)
 	{
@@ -197,7 +200,8 @@ static __fi void IopTestEvent( IopEventId n, void (*callback)() )
 
 	if( psxTestCycle( psxRegs.sCycle[n], psxRegs.eCycle[n] ) )
 	{
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		const Pcsx2Trace::CoreEventId trace_event_id = GetIopSifCoreEventId(n);
 		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
 		{
@@ -208,7 +212,8 @@ static __fi void IopTestEvent( IopEventId n, void (*callback)() )
 #endif
 		psxRegs.interrupt &= ~(1 << n);
 		callback();
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		if (trace_event_id != Pcsx2Trace::CoreEventId::None)
 		{
 			TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Event,
@@ -268,7 +273,8 @@ static __fi void _psxTestInterrupts()
 __ri void iopEventTest()
 {
 	psxRegs.iopNextEventCycle = psxRegs.cycle + iopWaitCycles;
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
 		Pcsx2Trace::CoreEventPhase::Enter, Pcsx2Trace::CoreEventId::None,
 		psxRegs.iopNextEventCycle);
@@ -303,7 +309,8 @@ __ri void iopEventTest()
 			iopEventAction = true;
 		}
 	}
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
 		Pcsx2Trace::CoreEventPhase::Exit, Pcsx2Trace::CoreEventId::None,
 		psxRegs.iopNextEventCycle);

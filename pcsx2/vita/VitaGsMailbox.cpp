@@ -59,7 +59,10 @@ namespace MTGS
 
 		s_gs = std::make_unique<VitaHeadlessGsState>();
 		s_gs->SetRegsMem(g_RealGSMem);
-		s_gs->Reset(true);
+		// PCSX2 owner: GS/GS.cpp::OpenGSRenderer(). Construction establishes
+		// GSState; the MTGS::ResetGS() caller applies the requested hardware or
+		// soft reset. Repeating a hardware reset here was both redundant and
+		// observably different from the renderer lifecycle owner.
 		g_perfmon.Reset();
 		return true;
 	}

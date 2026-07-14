@@ -7,11 +7,19 @@
 
 #include <cstdio>
 
+#if defined(__vita__)
+#include <psp2common/types.h>
+#endif
+
 class FlatFileReader final : public ThreadedFileReader
 {
 	DeclareNoncopyableObject(FlatFileReader);
 
+#if defined(__vita__)
+	SceUID m_file = -1;
+#else
 	std::FILE* m_file = nullptr;
+#endif
 	std::unique_ptr<u8[]> m_file_cache;
 	u64 m_file_size = 0;
 

@@ -146,8 +146,8 @@ protected:
 		GSVector4i xyhead;
 	};
 
-	GSVertexBuff m_vertex_buffers[MAX_DRAW_BUFFERS];
-	GSVertexBuff* m_vertex;
+	GSVertexBuff m_vertex_buffers[MAX_DRAW_BUFFERS] = {};
+	GSVertexBuff* m_vertex = nullptr;
 
 	struct GSIndexBuff
 	{
@@ -155,9 +155,9 @@ protected:
 		u32 tail;
 	};
 
-	GSIndexBuff m_index_buffers[MAX_DRAW_BUFFERS];
+	GSIndexBuff m_index_buffers[MAX_DRAW_BUFFERS] = {};
 
-	GSIndexBuff* m_index;
+	GSIndexBuff* m_index = nullptr;
 
 	GSVertexBuff m_draw_vertex = {};
 

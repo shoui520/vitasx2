@@ -7,7 +7,7 @@
 #include "common/Vita/VitaJitMemory.h"
 #include "pcsx2/Config.h"
 #include "pcsx2/DebugTools/Debug.h"
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 #include "pcsx2/DebugTools/CoreEventTrace.h"
 #endif
 #include "pcsx2/DebugTools/SymbolGuardian.h"
@@ -1111,7 +1111,7 @@ namespace
 		return static_cast<u32>(VitaIOP::BlockExitKind::Direct);
 	}
 
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	extern "C" __attribute__((noinline)) bool
 	VitaIopA32RunTracedEventTest()
 	{
@@ -5831,6 +5831,8 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!EmitQemuCounterIncrement(&s_qemuIopBranchEventTestsEntered))
 			return false;
+#endif
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		if (!m_code.EmitCallAbsolute(
 				reinterpret_cast<const void*>(&VitaIopA32RunTracedEventTest),
 				HOST_CALL_SCRATCH) ||
@@ -5970,7 +5972,7 @@ namespace VitaIOP
 
 		if (!m_code.PatchBranch(skip_helper, done_target))
 			return false;
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		return m_code.PatchBranch(
 			traced_event_done, done_target, VitaA32::Condition::NE);
 #else
@@ -7916,6 +7918,9 @@ namespace VitaIOP
 
 	void BlockExecutor::ResetInstrumentationCounters()
 	{
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		m_portable_validation_stats = {};
+#endif
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_hot_dispatch_cache_hits = 0;
 		m_hot_dispatch_cache_misses = 0;
@@ -8029,6 +8034,13 @@ namespace VitaIOP
 		s_qemuIopBranchEventTestsEntered = 0;
 #endif
 	}
+
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	PortableValidationStats BlockExecutor::GetPortableValidationStats() const
+	{
+		return m_portable_validation_stats;
+	}
+#endif
 
 	void BlockExecutor::SetTrustedSourceAuditEnabled(bool enabled)
 	{
@@ -11770,6 +11782,10 @@ namespace VitaIOP
 			m_condition_code_branch_instructions_removed +=
 				block.condition_code_branch_instructions_removed;
 #endif
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+			if (m_portable_validation_stats.native_provider_entries != UINT32_MAX)
+				m_portable_validation_stats.native_provider_entries++;
+#endif
 			return dispatch_flags | ProviderDispatchSuccess |
 			       ProviderDispatchWaitForward;
 		}
@@ -11832,6 +11848,10 @@ namespace VitaIOP
 			// before the exact recompiler fallback executes this PC.
 			ClearSchedulerDirectResume();
 			InvalidateCachedBlock(block);
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+			if (m_portable_validation_stats.invalid_provider_results != UINT32_MAX)
+				m_portable_validation_stats.invalid_provider_results++;
+#endif
 			return 0;
 		}
 		if (scheduler_resume_exit && SchedulerDirectResumeEnabled())
@@ -11899,6 +11919,10 @@ namespace VitaIOP
 			m_active_isolate_cache_mode = new_mode;
 		}
 
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		if (m_portable_validation_stats.native_provider_entries != UINT32_MAX)
+			m_portable_validation_stats.native_provider_entries++;
+#endif
 		return dispatch_flags | ProviderDispatchSuccess;
 	}
 
@@ -12320,6 +12344,10 @@ namespace VitaIOP
 
 	s32 BlockExecutor::ExecuteInterpreterFallbackTimeslice(s32 ee_cycles)
 	{
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		if (m_portable_validation_stats.interpreter_fallback_entries != UINT32_MAX)
+			m_portable_validation_stats.interpreter_fallback_entries++;
+#endif
 		const s32 result = psxInt.ExecuteBlock(ee_cycles);
 		bool isolate_variants_enabled = true;
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -12343,6 +12371,10 @@ namespace VitaIOP
 	s32 BlockExecutor::ExecuteInterpreterRecompilerBlock(
 		s32 ee_cycles, bool* logical_continuation, bool* execution_terminated)
 	{
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		if (m_portable_validation_stats.interpreter_fallback_entries != UINT32_MAX)
+			m_portable_validation_stats.interpreter_fallback_entries++;
+#endif
 		if (logical_continuation)
 			*logical_continuation = false;
 		if (execution_terminated)
@@ -13229,6 +13261,10 @@ namespace VitaIOP
 				}
 				if (wait_forward)
 				{
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+					if (m_portable_validation_stats.native_provider_entries != UINT32_MAX)
+						m_portable_validation_stats.native_provider_entries++;
+#endif
 #if defined(VITASX2_QEMU_VALIDATION)
 					m_wait_resume_descriptor_forwards++;
 					if (clock_specific)

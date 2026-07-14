@@ -69,6 +69,13 @@ extern std::unique_ptr<ArchiveEntryList> SaveState_DownloadPortableState(Error* 
 // the VM and forbids resuming guest execution.
 extern PortableStateLoadResult SaveState_LoadPortableState(
 	const ArchiveEntryList& entries, Error* error);
+// Bounded-memory PCSX2RAW v2 file paths for Vita replay validation. The load
+// path validates the entire transport before touching the VM and preserves the
+// same non-transactional result contract as SaveState_LoadPortableState(). The
+// save path emits canonical bytes entry-by-entry and deletes partial output.
+extern PortableStateLoadResult SaveState_LoadPortableStateFile(
+	const char* filename, Error* error);
+extern bool SaveState_SavePortableStateFile(const char* filename, Error* error);
 extern std::unique_ptr<SaveStateScreenshotData> SaveState_SaveScreenshot();
 extern bool SaveState_ZipToDisk(
 	std::unique_ptr<ArchiveEntryList> srclist, std::unique_ptr<SaveStateScreenshotData> screenshot,

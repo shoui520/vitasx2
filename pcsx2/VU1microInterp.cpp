@@ -6,7 +6,7 @@
 #include "VUmicro.h"
 #include "VUmicroFast.h"
 #include "DebugTools/VuTrace.h"
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
 #include "GS.h"
@@ -981,7 +981,7 @@ void InterpVU1::Execute(u32 cycles)
 	}
 	VU1.VI[REG_TPC].UL >>= 3;
 	VU1.nextBlockCycles = (VU1.cycle - cpuRegs.cycle) + 1;
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyMachineCheckpointVu1ExecutionCompleted();
 #endif
 }

@@ -26,6 +26,13 @@ if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE Release CACHE STRING "build type" FORCE)
 endif()
 
+option(VITASX2_PORTABLE_REPLAY_VALIDATION
+	"Enable the bounded cross-core hooks required by portable replay validation."
+	OFF)
+if(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	add_compile_definitions(VITASX2_PORTABLE_REPLAY_VALIDATION=1)
+endif()
+
 # Target CPU contract: Cortex-A9 MPCore, VFPv3, NEON, hard-float.
 # NEON is mandatory (see docs/ps2-vita/GENERIC_CORTEX_A9_OPTIMIZATION.md).
 add_compile_options(

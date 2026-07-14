@@ -26,14 +26,14 @@ s32 DEV9open() { return 0; }
 void DEV9shutdown() {}
 void _DEV9irq(int cause, int cycles)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9IrqScheduled);
 #endif
 }
 int DEV9irqHandler(void)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9IrqDelivered);
 #endif
@@ -43,14 +43,14 @@ void DEV9async(u32 cycles) {}
 void DEV9runFIFO() {}
 void DEV9writeDMA8Mem(u32* pMem, int size)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9Dma);
 #endif
 }
 void DEV9readDMA8Mem(u32* pMem, int size)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9Dma);
 #endif
@@ -59,7 +59,7 @@ void DEV9readDMA8Mem(u32* pMem, int size)
 }
 u8 DEV9read8(u32 addr)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9Read);
 #endif
@@ -67,7 +67,7 @@ u8 DEV9read8(u32 addr)
 }
 u16 DEV9read16(u32 addr)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9Read);
 #endif
@@ -75,7 +75,7 @@ u16 DEV9read16(u32 addr)
 }
 u32 DEV9read32(u32 addr)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9Read);
 #endif
@@ -83,21 +83,21 @@ u32 DEV9read32(u32 addr)
 }
 void DEV9write8(u32 addr, u8 value)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9Write);
 #endif
 }
 void DEV9write16(u32 addr, u16 value)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9Write);
 #endif
 }
 void DEV9write32(u32 addr, u32 value)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::Dev9Write);
 #endif
@@ -114,7 +114,7 @@ void PHYWrite() {}
 void PHYRead() {}
 u32 FWread32(u32 addr)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::FireWireRead);
 #endif
@@ -122,7 +122,7 @@ u32 FWread32(u32 addr)
 }
 void FWwrite32(u32 addr, u32 value)
 {
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	Pcsx2Trace::NotifyPortableReplayExternalDeviceAccess(
 		Pcsx2Trace::PortableReplayExternalDeviceAccess::FireWireWrite);
 #endif

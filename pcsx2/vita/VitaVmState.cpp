@@ -3,7 +3,8 @@
 
 #include "CDVD/CDVD.h"
 #include "Config.h"
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 #include "DebugTools/CoreEventTrace.h"
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
@@ -261,7 +262,8 @@ namespace VMManager
 			// trace domain immediately before EntryPointCompilingOnCPUThread().
 			// Vita's VM shim owns that edge for both interpreter and A32 EE/IOP.
 			Pcsx2Trace::NotifyEeElfEntry(s_elf_entry_point);
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 			Pcsx2Trace::NotifyCoreEventElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyMachineCheckpointElfEntry(s_elf_entry_point);
 #endif

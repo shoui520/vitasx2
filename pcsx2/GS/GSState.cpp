@@ -549,17 +549,33 @@ void GSState::ResetDrawBufferIdx()
 void GSState::ResetDrawBuffers()
 {
 	m_used_buffers_idx = 1;
+	m_current_buffer_idx = 0;
+	m_recent_buffer_switch = false;
+	temp_draw_rect = GSVector4i::zero();
 
 	for (int i = 0; i < MAX_DRAW_BUFFERS; i++)
 	{
-		memset(&m_index_buffers[i], 0, sizeof(GSIndexBuff));
-		memset(&m_vertex_buffers[i], 0, sizeof(GSVertexBuff));
+		GSIndexBuff& index = m_index_buffers[i];
+		GSVertexBuff& vertex = m_vertex_buffers[i];
+
+		// PCSX2's draw-buffering owner keeps the allocation capacity in these
+		// records. Clearing the complete records here discarded their pointers
+		// before GrowVertexBuffer() could replace them, leaking every per-draw
+		// vertex, copy, and index buffer on each GS reset. Preserve the backing
+		// stores and their capacity while resetting only the accumulated draw.
+		index.tail = 0;
+		vertex.head = 0;
+		vertex.tail = 0;
+		vertex.next = 0;
+		vertex.xy_tail = 0;
+		std::fill(std::begin(vertex.xy), std::end(vertex.xy), GSVector4i::zero());
+		vertex.xyhead = GSVector4i::zero();
 		memset(&m_env_buffers[i], 0, sizeof(GSDrawBufferEnv));
 		m_env_buffers[i].m_dirty_regs = 0xffff;
-		m_index = &m_index_buffers[i];
-		m_vertex = &m_vertex_buffers[i];
-		m_vertex_buffers[i].head = m_vertex_buffers[i].tail = m_vertex_buffers[i].next = 0;
-		GrowVertexBuffer();
+		m_index = &index;
+		m_vertex = &vertex;
+		if (!vertex.buff)
+			GrowVertexBuffer();
 	}
 
 	ResetDrawBufferIdx();

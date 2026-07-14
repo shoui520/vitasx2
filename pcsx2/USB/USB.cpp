@@ -342,7 +342,25 @@ bool USB::DoPacketState(USBPacket* p, StateWrapper& sw,
 	sw.Do(&p->int_req);
 	sw.Do(&p->status);
 	sw.Do(&p->actual_length);
-	sw.Do(&p->state);
+	if (sw.IsPortableReplay())
+	{
+		// USBPacketState is four bytes in the x86 PCSX2 oracle but one byte under
+		// the Vita ARM ABI. Keep the portable schema independent of either host's
+		// enum representation while preserving the existing x86 stream bytes.
+		u32 packet_state = static_cast<u32>(p->state);
+		sw.Do(&packet_state);
+		if (!sw.HasError() && packet_state <= static_cast<u32>(USB_PACKET_CANCELED))
+			p->state = static_cast<USBPacketState>(packet_state);
+		else
+		{
+			Console.Error("Portable USB state contains an invalid packet state.");
+			sw.SetError();
+		}
+	}
+	else
+	{
+		sw.Do(&p->state);
+	}
 	if (sw.HasError())
 		return false;
 

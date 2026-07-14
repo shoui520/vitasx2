@@ -5,7 +5,8 @@
 
 #include "R3000A.h"
 #include "Common.h"
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 #include "DebugTools/CoreEventTrace.h"
 #endif
 #include "DebugTools/SifTrace.h"
@@ -14,7 +15,8 @@
 
 _sif sif1;
 
-#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION)
+#if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 static __fi void TraceSif1CoreEvent(Pcsx2Trace::CoreEventPhase phase)
 {
 	const u32 state = static_cast<u32>(sif1.ee.busy) |

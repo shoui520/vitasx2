@@ -2173,9 +2173,9 @@ bool FileSystem::DeleteSymbolicLink(const char* path, Error* error)
 
 #else
 
-// No 32-bit file offsets breaking stuff please.
-// The Vita's newlib keeps a 32-bit off_t; 64-bit file access goes through the
-// explicit fseeko64/ftello64 entry points in FSeek64/FTell64 instead.
+// No 32-bit file offsets breaking stuff please. Vita newlib keeps a 32-bit
+// off_t and does not export its declared fseeko64/ftello64 entry points. Vita
+// owners of files larger than 2 GiB therefore use sceIo with SceOff directly.
 #ifndef __vita__
 static_assert(sizeof(off_t) == sizeof(s64));
 #endif

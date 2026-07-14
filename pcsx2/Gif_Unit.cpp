@@ -19,18 +19,22 @@ namespace
 		return representation <= 1u;
 	}
 
-	bool IsValidPortableGifUnitState()
+	bool IsValidPortableGifTransferType(u32 transfer_type)
 	{
-		const u32 transfer_type = static_cast<u32>(gifUnit.lastTranType);
-		const bool valid_transfer_type = transfer_type == GIF_TRANS_INVALID ||
+		return transfer_type == GIF_TRANS_INVALID ||
 			transfer_type == GIF_TRANS_XGKICK || transfer_type == GIF_TRANS_MTVU ||
 			transfer_type == GIF_TRANS_DIRECT || transfer_type == GIF_TRANS_DIRECTHL ||
 			transfer_type == GIF_TRANS_DMA || transfer_type == GIF_TRANS_FIFO;
+	}
+
+	bool IsValidPortableGifUnitState()
+	{
+		const u32 transfer_type = static_cast<u32>(gifUnit.lastTranType);
 
 		return IsCanonicalPortableGifBool(gifUnit.gsSIGNAL.queued) &&
 			IsCanonicalPortableGifBool(gifUnit.gsFINISH.gsFINISHFired) &&
 			IsCanonicalPortableGifBool(gifUnit.gsFINISH.gsFINISHPending) &&
-			valid_transfer_type;
+			IsValidPortableGifTransferType(transfer_type);
 	}
 
 	bool IsValidPortableGifTag(const Gif_Path& gif_path, u32 saved_state,
@@ -445,7 +449,26 @@ bool SaveStateBase::gifFreeze()
 	Freeze(gifUnit.stat);
 	Freeze(gifUnit.gsSIGNAL);
 	Freeze(gifUnit.gsFINISH);
-	Freeze(gifUnit.lastTranType);
+	if (IsPortableReplay())
+	{
+		// ARM EABI permits the compiler to use a 16-bit representation for this
+		// enum, while the x86 PCSX2 producer uses 32 bits. The portable stream is
+		// an architectural schema, so never let either host enum ABI set its width.
+		u32 last_transfer_type = static_cast<u32>(gifUnit.lastTranType);
+		Freeze(last_transfer_type);
+		if (!IsOkay() || !IsValidPortableGifTransferType(last_transfer_type))
+		{
+			Console.Error("Portable GIF replay state contains an invalid transfer type.");
+			m_error = true;
+			return false;
+		}
+		if (!IsSaving())
+			gifUnit.lastTranType = static_cast<GIF_TRANSFER_TYPE>(last_transfer_type);
+	}
+	else
+	{
+		Freeze(gifUnit.lastTranType);
+	}
 	if (IsPortableReplay() && (!IsOkay() || !IsValidPortableGifUnitState()))
 	{
 		Console.Error("Portable GIF replay state contains invalid signal or transfer state.");

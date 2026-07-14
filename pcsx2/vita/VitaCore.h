@@ -179,12 +179,7 @@ void VitaRequestA32EeCacheReset();
 // directly through an eeMem->Main host pointer. Returns the number of cached
 // translations retired by the write.
 u32 VitaNotifyA32EeRamWrite(const void* host_address, u32 size);
-#if defined(VITASX2_QEMU_VALIDATION)
-// Unlike cache/reset-scoped provider telemetry, these fallback sentinels span
-// the complete validation session, including the two ELF-entry cache resets.
-void VitaResetA32EeSessionFallbackStats();
-VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats();
-
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 enum class VitaA32EeTraceLimitStopCondition : u32
 {
 	None = 0,
@@ -192,12 +187,20 @@ enum class VitaA32EeTraceLimitStopCondition : u32
 	MachineCheckpointTrace = 2,
 };
 
-void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled);
-void VitaSetA32EePersistentBoundaryLimit(u64 limit);
-bool VitaDidA32EePersistentBoundaryHitLimit();
 // Stop an uninstrumented persistent EE chain only after its current natural
 // block boundary observes the selected bounded cross-core trace limit.
 void VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition condition);
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+// Unlike cache/reset-scoped provider telemetry, these fallback sentinels span
+// the complete validation session, including the two ELF-entry cache resets.
+void VitaResetA32EeSessionFallbackStats();
+VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats();
+
+void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled);
+void VitaSetA32EePersistentBoundaryLimit(u64 limit);
+bool VitaDidA32EePersistentBoundaryHitLimit();
 VitaA32EeLinkRejectionProfile VitaGetA32EeLinkRejectionProfile();
 #endif
 
