@@ -40,6 +40,11 @@ namespace Pcsx2Trace
 		u64 skip_records = 0;
 		u64 after_sif_records = 0;
 		u64 after_vif_records = 0;
+		// Gate eligible VU1 completions until this many VSyncEnd transitions
+		// have completed since the trace became active (normally ELF entry).
+		// This is a temporal gate; workload progress must be corroborated by the
+		// captured architectural, VU, device, and memory state.
+		u64 after_vsync_frames = 0;
 		bool wait_for_elf_entry = true;
 	};
 
@@ -58,10 +63,12 @@ namespace Pcsx2Trace
 
 	// A VU provider can finish while an EE event test is still mutating IOP and
 	// device state. Snapshot only after _cpuEventTest_Shared() has completed.
-	// Projection v4 compares published architecture, all EE TLB entries, counter
+	// Projection v5 compares published architecture, all EE TLB entries, counter
 	// continuation state, canonical active pipelines, and logical SIF/VIF transfer
-	// continuation. A record is emitted only while both VUs are idle, so provider-
-	// private branch/backup state is not continuation-semantic at the checkpoint.
+	// continuation. It also records the completed VSync-frame ordinal used by the
+	// provider-independent temporal gate. A record is emitted only while both VUs
+	// are idle, so provider-private branch/backup state is not continuation-semantic
+	// at the checkpoint.
 	bool RecordPendingMachineCheckpointAtEventTest();
 
 	u64 GetMachineCheckpointTraceRecordsWritten();

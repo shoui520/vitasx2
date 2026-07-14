@@ -30,6 +30,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 namespace Pcsx2Trace
@@ -38,10 +39,11 @@ namespace Pcsx2Trace
 	{
 		static constexpr std::array<char, 8> TRACE_MAGIC = {'P', 'C', 'S', 'X', '2', 'C', 'K', 'P'};
 		static constexpr u32 TRACE_VERSION = 1;
-		static constexpr u32 TRACE_PROJECTION_VERSION = 4;
+		static constexpr u32 TRACE_PROJECTION_VERSION = 5;
 		static constexpr u32 TRACE_FLAG_WAITED_FOR_ELF_ENTRY = 1u << 0;
 		static constexpr u32 TRACE_FLAG_GATED_ON_SIF_RECORDS = 1u << 1;
 		static constexpr u32 TRACE_FLAG_GATED_ON_VIF_RECORDS = 1u << 2;
+		static constexpr u32 TRACE_FLAG_GATED_ON_VSYNC_FRAMES = 1u << 3;
 		static constexpr u32 CHECKPOINT_TRIGGER_VU1_COMPLETED_EVENT_TEST = 1;
 		static constexpr u64 FNV1A64_OFFSET = 14695981039346656037ull;
 		static constexpr u64 FNV1A64_PRIME = 1099511628211ull;
@@ -87,6 +89,10 @@ namespace Pcsx2Trace
 			u32 memory_available_mask;
 			u64 configured_after_sif_records;
 			u64 configured_after_vif_records;
+			u64 configured_after_vsync_frames;
+			u64 trace_start_vsync_frame;
+			u64 trigger_vsync_frame;
+			u64 capture_vsync_frame;
 			u64 sif_records;
 			u64 vif_records;
 			u64 core_event_records;
@@ -140,7 +146,7 @@ namespace Pcsx2Trace
 
 		static_assert(sizeof(MachineCheckpointTraceFileHeader) == 48,
 			"Machine checkpoint trace header size must stay fixed.");
-		static_assert(sizeof(MachineCheckpointTraceRecord) == 588,
+		static_assert(sizeof(MachineCheckpointTraceRecord) == 620,
 			"Machine checkpoint trace record size must stay fixed.");
 
 		class StableHash final
@@ -180,10 +186,13 @@ namespace Pcsx2Trace
 
 		FILE* s_trace_file = nullptr;
 		MachineCheckpointTraceConfig s_config;
+		u64 s_vu1_completions_seen = 0;
 		u64 s_eligible_completions_seen = 0;
 		u64 s_records_written = 0;
 		u64 s_last_completion_ordinal = 0;
 		u32 s_pending_completion_count = 0;
+		u32 s_trace_start_vsync_frame = 0;
+		u32 s_trigger_vsync_frame = 0;
 		bool s_started = false;
 		bool s_hit_limit = false;
 		bool s_vu1_program_armed = false;
@@ -207,7 +216,8 @@ namespace Pcsx2Trace
 			header.flags =
 				(s_config.wait_for_elf_entry ? TRACE_FLAG_WAITED_FOR_ELF_ENTRY : 0) |
 				(s_config.after_sif_records != 0 ? TRACE_FLAG_GATED_ON_SIF_RECORDS : 0) |
-				(s_config.after_vif_records != 0 ? TRACE_FLAG_GATED_ON_VIF_RECORDS : 0);
+				(s_config.after_vif_records != 0 ? TRACE_FLAG_GATED_ON_VIF_RECORDS : 0) |
+				(s_config.after_vsync_frames != 0 ? TRACE_FLAG_GATED_ON_VSYNC_FRAMES : 0);
 			header.max_records = s_config.max_records;
 			header.records_written = s_records_written;
 			header.entry_pc = s_entry_pc;
@@ -692,6 +702,15 @@ namespace Pcsx2Trace
 			std::fprintf(file, "format=PCSX2-machine-checkpoint-projection-detail-v1\n");
 			std::fprintf(file, "checkpoint.index=%llu\n",
 				static_cast<unsigned long long>(record.index));
+			std::fprintf(file, "checkpoint.trace_start_vsync_frame=%llu\n",
+				static_cast<unsigned long long>(record.trace_start_vsync_frame));
+			std::fprintf(file, "checkpoint.trigger_vsync_frame=%llu\n",
+				static_cast<unsigned long long>(record.trigger_vsync_frame));
+			std::fprintf(file, "checkpoint.capture_vsync_frame=%llu\n",
+				static_cast<unsigned long long>(record.capture_vsync_frame));
+			std::fprintf(file, "checkpoint.vsync_frames_since_trace_start=%llu\n",
+				static_cast<unsigned long long>(
+					static_cast<u32>(record.trigger_vsync_frame - record.trace_start_vsync_frame)));
 			std::fprintf(file, "ee.pc=%08x\n", record.ee_pc);
 			std::fprintf(file, "ee.cycle=%016llx\n",
 				static_cast<unsigned long long>(record.ee_cycle));
@@ -820,6 +839,10 @@ namespace Pcsx2Trace
 			record.trigger = CHECKPOINT_TRIGGER_VU1_COMPLETED_EVENT_TEST;
 			record.configured_after_sif_records = s_config.after_sif_records;
 			record.configured_after_vif_records = s_config.after_vif_records;
+			record.configured_after_vsync_frames = s_config.after_vsync_frames;
+			record.trace_start_vsync_frame = s_trace_start_vsync_frame;
+			record.trigger_vsync_frame = s_trigger_vsync_frame;
+			record.capture_vsync_frame = g_FrameCount;
 			record.sif_records = GetSifTraceRecordsWritten();
 			record.vif_records = GetVifTraceRecordsWritten();
 			record.core_event_records = GetCoreEventTraceRecordsWritten();
@@ -880,6 +903,12 @@ namespace Pcsx2Trace
 	bool StartMachineCheckpointTrace(const MachineCheckpointTraceConfig& config, Error* error)
 	{
 		StopMachineCheckpointTrace();
+		if (config.after_vsync_frames > std::numeric_limits<u32>::max())
+		{
+			Error::SetStringView(error,
+				"Machine checkpoint VSync gate exceeds the 32-bit PCSX2 frame-counter range.");
+			return false;
+		}
 		if (config.output_path.empty())
 		{
 			Error::SetStringView(error, "Machine checkpoint trace output path is empty.");
@@ -914,10 +943,13 @@ namespace Pcsx2Trace
 		}
 
 		s_config = config;
+		s_vu1_completions_seen = 0;
 		s_eligible_completions_seen = 0;
 		s_records_written = 0;
 		s_last_completion_ordinal = 0;
 		s_pending_completion_count = 0;
+		s_trace_start_vsync_frame = g_FrameCount;
+		s_trigger_vsync_frame = 0;
 		s_started = !s_config.wait_for_elf_entry;
 		s_hit_limit = false;
 		s_vu1_program_armed = false;
@@ -957,6 +989,7 @@ namespace Pcsx2Trace
 		if (!s_trace_file || s_started)
 			return;
 		s_entry_pc = pc;
+		s_trace_start_vsync_frame = g_FrameCount;
 		s_started = true;
 	}
 
@@ -974,21 +1007,29 @@ namespace Pcsx2Trace
 			return;
 		}
 		s_vu1_program_armed = false;
+		const u64 completion_ordinal = s_vu1_completions_seen++;
+		const u64 completed_vsync_frames =
+			static_cast<u32>(g_FrameCount - s_trace_start_vsync_frame);
 		if (GetSifTraceRecordsWritten() < s_config.after_sif_records ||
-			GetVifTraceRecordsWritten() < s_config.after_vif_records)
+			GetVifTraceRecordsWritten() < s_config.after_vif_records ||
+			completed_vsync_frames < s_config.after_vsync_frames)
 		{
 			return;
 		}
-		const u64 completion_ordinal = s_eligible_completions_seen++;
-		if (completion_ordinal < s_config.skip_records)
+		const u64 eligible_ordinal = s_eligible_completions_seen++;
+		if (eligible_ordinal < s_config.skip_records)
 			return;
 		if (s_config.max_records != 0 && s_records_written >= s_config.max_records)
 		{
 			s_hit_limit = true;
 			return;
 		}
-		s_pending_checkpoint = true;
-		s_last_completion_ordinal = completion_ordinal;
+		if (!s_pending_checkpoint)
+		{
+			s_last_completion_ordinal = completion_ordinal;
+			s_trigger_vsync_frame = g_FrameCount;
+			s_pending_checkpoint = true;
+		}
 		s_pending_completion_count++;
 	}
 
