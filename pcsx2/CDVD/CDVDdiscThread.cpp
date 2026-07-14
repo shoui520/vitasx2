@@ -13,6 +13,7 @@
 #include <thread>
 
 const u32 sectors_per_read = 16;
+static constexpr u32 MaxPrefetchBlocks = 16;
 
 static_assert(sectors_per_read > 1 && !(sectors_per_read & (sectors_per_read - 1)),
 			  "sectors_per_read must by a power of 2");
@@ -36,11 +37,21 @@ static std::mutex s_cache_lock;
 
 static std::atomic<bool> cdvd_is_open;
 
-//bits: 12 would use 1<<12 entries, or 4096*16 sectors ~ 128MB
-#define CACHE_SIZE 12
-
-static constexpr u32 CacheSize = 1U << CACHE_SIZE;
+// PCSX2's desktop owner uses 12 index bits.  With the actual 2352-byte raw
+// sector stride that is 154,157,056 bytes, before any emulated RAM or JIT
+// arena exists.  Vita keeps the same direct-mapped 16-sector block cache and
+// miss/fill semantics, but uses 8 index bits: 256 blocks / 4096 sectors / less
+// than 10 MiB.  This still has far more entries than one requested block plus
+// the complete maximum prefetch window while leaving retail LPDDR for the
+// machine the cache is serving.  Hash collisions may evict a block early, but
+// the full LSN tag turns that into a source refill rather than stale data.
+static constexpr u32 CacheIndexBits = 8;
+static constexpr u32 CacheSize = 1U << CacheIndexBits;
 static SectorInfo Cache[CacheSize];
+
+static_assert(sizeof(Cache) < 10 * 1024 * 1024);
+static_assert(CacheSize >= MaxPrefetchBlocks + 1,
+	"The cache must have capacity for a request and its prefetch window.");
 
 static u32 cdvdSectorHash(u32 lsn)
 {
@@ -52,8 +63,8 @@ static u32 cdvdSectorHash(u32 lsn)
 	while (i >= 0)
 	{
 		t ^= lsn & m;
-		lsn >>= CACHE_SIZE;
-		i -= CACHE_SIZE;
+		lsn >>= CacheIndexBits;
+		i -= CacheIndexBits;
 	}
 
 	return t & m;
@@ -242,9 +253,8 @@ static void cdvdThread()
 		}
 		else
 		{
-			const u32 max_prefetches = 16;
 			u32 remaining = src->GetSectorCount() - next_prefetch_lsn;
-			prefetches_left = std::min((remaining + sectors_per_read - 1) / sectors_per_read, max_prefetches);
+			prefetches_left = std::min((remaining + sectors_per_read - 1) / sectors_per_read, MaxPrefetchBlocks);
 		}
 	}
 	printf(" * CDVD: IO thread finished.\n");

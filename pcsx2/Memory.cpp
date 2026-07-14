@@ -101,6 +101,7 @@ bool SysMemory::AllocateMemoryMap()
 
 #if defined(ARCH_ARM32)
 	s_data_memory = static_cast<u8*>(s_data_memory_file_handle);
+#if !defined(__vita__)
 	s_code_memory_file_handle = HostSys::CreateSharedMemory(HostSys::GetFileMappingName("pcsx2-code").c_str(), HostMemoryMap::CodeSize);
 	if (!s_code_memory_file_handle)
 	{
@@ -109,6 +110,14 @@ bool SysMemory::AllocateMemoryMap()
 		return false;
 	}
 	s_code_memory = static_cast<u8*>(s_code_memory_file_handle);
+#else
+	// PCSX2's x86/ARM64 recompilers use this legacy HostMemoryMap code arena.
+	// Vita's EE, IOP, VU0, and VU1 A32 providers instead own executable
+	// VitaVM memblocks, while Vita VIF uses the native interpreter/generator.
+	// Do not strand a second, non-executable 13.5 MiB arena in newlib's heap.
+	s_code_memory_file_handle = nullptr;
+	s_code_memory = nullptr;
+#endif
 #else
 	if (!(s_memory_mapping_area = SharedMemoryMappingArea::Create(HostMemoryMap::MainSize + HostMemoryMap::CodeSize, true)))
 	{
@@ -152,6 +161,7 @@ void SysMemory::DumpMemoryMap()
 	DUMP_REGION("VTLB Virtual Map", s_data_memory, HostMemoryMap::VTLBVirtualMapOffset, HostMemoryMap::VTLBVirtualMapSize);
 	DUMP_REGION("VTLB Address Map", s_data_memory, HostMemoryMap::VTLBAddressMapOffset, HostMemoryMap::VTLBAddressMapSize);
 
+#if !defined(__vita__)
 	DUMP_REGION("R5900 Recompiler Cache", s_code_memory, HostMemoryMap::EErecOffset, HostMemoryMap::EErecSize);
 	DUMP_REGION("R3000A Recompiler Cache", s_code_memory, HostMemoryMap::IOPrecOffset, HostMemoryMap::IOPrecSize);
 	DUMP_REGION("Micro VU0 Recompiler Cache", s_code_memory, HostMemoryMap::mVU0recOffset, HostMemoryMap::mVU0recSize);
@@ -160,7 +170,7 @@ void SysMemory::DumpMemoryMap()
 	DUMP_REGION("VIF1 Unpack Recompiler Cache", s_code_memory, HostMemoryMap::VIF1recOffset, HostMemoryMap::VIF1recSize);
 	DUMP_REGION("VIF Unpack Recompiler Cache", s_code_memory, HostMemoryMap::VIFUnpackRecOffset, HostMemoryMap::VIFUnpackRecSize);
 	DUMP_REGION("GS Software Renderer", s_code_memory, HostMemoryMap::SWrecOffset, HostMemoryMap::SWrecSize);
-
+#endif
 
 #undef DUMP_REGION
 }
@@ -255,7 +265,12 @@ u8* SysMemory::GetDataPtr(size_t offset)
 u8* SysMemory::GetCodePtr(size_t offset)
 {
 	pxAssert(offset <= HostMemoryMap::CodeSize);
+#if defined(__vita__)
+	pxFailRel("The Vita has no legacy HostMemoryMap code arena");
+	return nullptr;
+#else
 	return s_code_memory + offset;
+#endif
 }
 
 void* SysMemory::GetDataFileHandle()
