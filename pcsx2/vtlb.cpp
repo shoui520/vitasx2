@@ -23,6 +23,7 @@
 #include "IopMem.h"
 #include "Host.h"
 #include "VMManager.h"
+#include "vita/VitaCore.h"
 
 #include "common/BitUtils.h"
 #include "common/Error.h"
@@ -42,6 +43,17 @@
 
 using namespace R5900;
 using namespace vtlb_private;
+
+static __fi u32 NotifyVitaEeRamWrite(const void* host_address, u32 size)
+{
+#if defined(ARCH_ARM32)
+	return VitaNotifyA32EeRamWrite(host_address, size);
+#else
+	(void)host_address;
+	(void)size;
+	return 0;
+#endif
+}
 
 #define verify pxAssert
 
@@ -283,7 +295,9 @@ void vtlb_memWrite(u32 addr, DataType data)
 			}
 		}
 
-		*reinterpret_cast<DataType*>(vmv.assumePtr(addr)) = data;
+		DataType* const host = reinterpret_cast<DataType*>(vmv.assumePtr(addr));
+		*host = data;
+		NotifyVitaEeRamWrite(host, sizeof(DataType));
 	}
 	else
 	{
@@ -310,7 +324,9 @@ void TAKES_R128 vtlb_memWrite128(u32 mem, r128 value)
 			}
 		}
 
-		r128_store_unaligned((void*)vmv.assumePtr(mem), value);
+		void* const host = reinterpret_cast<void*>(vmv.assumePtr(mem));
+		r128_store_unaligned(host, value);
+		NotifyVitaEeRamWrite(host, 16);
 	}
 	else
 	{
@@ -414,6 +430,7 @@ u32 VitaEeExecutePreincrementByteZeroFill(u32 start_pc, u32 fallthrough_pc,
 				*host = 0;
 			else
 				std::memset(host, 0, iterations);
+			force_redispatch |= NotifyVitaEeRamWrite(host, iterations) != 0;
 #if defined(VITASX2_QEMU_VALIDATION)
 			direct_bulk = true;
 			g_qemuPreincrementByteZeroFillBulkChunks++;
@@ -541,6 +558,8 @@ u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 			for (size_t i = 0; i < word_count; i++)
 				host[i] = value;
 		}
+		force_redispatch |= NotifyVitaEeRamWrite(
+			host, static_cast<u32>(word_count * sizeof(u32))) != 0;
 #if defined(VITASX2_QEMU_VALIDATION)
 		direct_bulk = true;
 		g_qemuFourWordFillBulkChunks++;
@@ -756,6 +775,8 @@ u32 VitaEeExecutePreincrementWordFill(u32 start_pc, u32 fallthrough_pc,
 			for (u32 i = 0; i < iterations; i++)
 				host[i] = value;
 		}
+		force_redispatch |= NotifyVitaEeRamWrite(
+			host, iterations * sizeof(u32)) != 0;
 #if defined(VITASX2_QEMU_VALIDATION)
 		direct_bulk = true;
 		g_qemuPreincrementWordFillBulkChunks++;
@@ -1065,6 +1086,8 @@ u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
 			last_value = source_host[i];
 			destination_host[i] = last_value;
 		}
+		force_redispatch |= NotifyVitaEeRamWrite(
+			destination_host, iterations * sizeof(u32)) != 0;
 		cpuRegs.GPR.r[value_guest].UD[0] = static_cast<u64>(
 			static_cast<s64>(static_cast<s32>(last_value)));
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -1185,6 +1208,7 @@ bool vtlb_ramWrite(u32 addr, const DataType& data)
 		return false;
 
 	std::memcpy(reinterpret_cast<DataType*>(vmv.assumePtr(addr)), &data, sizeof(DataType));
+	NotifyVitaEeRamWrite(reinterpret_cast<void*>(vmv.assumePtr(addr)), sizeof(DataType));
 	return true;
 }
 
@@ -1258,7 +1282,9 @@ bool vtlb_memSafeWriteBytes(u32 mem, const void* src, u32 size)
 
 		const size_t remaining_in_page =
 			std::min(VTLB_PAGE_SIZE - (mem & VTLB_PAGE_MASK), static_cast<u32>(sptr_end - sptr));
-		std::memcpy(reinterpret_cast<void*>(vmv.assumePtr(mem)), sptr, remaining_in_page);
+		void* const host = reinterpret_cast<void*>(vmv.assumePtr(mem));
+		std::memcpy(host, sptr, remaining_in_page);
+		NotifyVitaEeRamWrite(host, static_cast<u32>(remaining_in_page));
 		sptr += remaining_in_page;
 		mem += remaining_in_page;
 	}

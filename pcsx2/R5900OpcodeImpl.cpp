@@ -13,6 +13,9 @@
 #include "DebugTools/Breakpoints.h"
 #include "Host.h"
 #include "VMManager.h"
+#if defined(VITASX2_VITA)
+#include "vita/VitaCore.h"
+#endif
 
 #include "fmt/format.h"
 
@@ -219,7 +222,11 @@ static int __Deci2Call(int call, u32 *addr)
 
 				eeConLog( ShiftJIS_ConvertString(deci2buffer) );
 			}
-			((u32*)PSM(deci2addr))[3] = 0;
+			u32* const deci2_status = &((u32*)PSM(deci2addr))[3];
+			*deci2_status = 0;
+#if defined(VITASX2_VITA)
+			VitaNotifyA32EeRamWrite(deci2_status, sizeof(*deci2_status));
+#endif
 			return 1;
 		}
 

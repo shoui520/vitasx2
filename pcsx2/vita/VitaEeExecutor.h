@@ -5,6 +5,7 @@
 
 #include "common/Pcsx2Defs.h"
 #include "pcsx2/HostMemoryMap.h"
+#include "pcsx2/MemoryTypes.h"
 #include "pcsx2/vita/A32Emitter.h"
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -117,6 +118,20 @@ namespace VitaEE
 		// separate concern below; imposing a smaller discovery ceiling changes
 		// fixed-point cycle rounding and therefore Count/event timing.
 		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 1025;
+		// EE source ownership is tracked at the same 4 KiB granularity as the
+		// vTLB and PCSX2's mmap code-page protection. Records and reference
+		// counts cover retail EE RAM only. Generated direct-store guards can see
+		// any non-handler pointer in the compact ARM32 HostMemoryMap arena, so
+		// their byte lookup table spans that complete arena; entries outside RAM
+		// remain zero throughout the executor's lifetime.
+		static constexpr u32 RAM_SOURCE_PAGE_SHIFT = 12;
+		static constexpr u32 RAM_SOURCE_PAGE_COUNT =
+			Ps2MemSize::MainRam >> RAM_SOURCE_PAGE_SHIFT;
+		static constexpr u32 RAM_WRITE_GUARD_PAGE_COUNT =
+			HostMemoryMap::MainSize >> RAM_SOURCE_PAGE_SHIFT;
+		static_assert((HostMemoryMap::MainSize &
+			((1u << RAM_SOURCE_PAGE_SHIFT) - 1)) == 0);
+		static_assert(RAM_SOURCE_PAGE_COUNT <= RAM_WRITE_GUARD_PAGE_COUNT);
 
 		BlockExecutor();
 		~BlockExecutor();
@@ -124,6 +139,14 @@ namespace VitaEE
 		u32 Shutdown();
 		u32 Reset();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
+		// backing_start is a byte offset into eeMem->Main, not a guest virtual
+		// address.  This is deliberately separate from InvalidateRange(): several
+		// physical/KSEG/TLB aliases can own the same compiled source bytes.
+		u32 InvalidateRamSourceRange(u32 backing_start, u32 size);
+		const u8* RamSourcePageLiveFlags() const
+		{
+			return m_ram_source_page_live_flags.data();
+		}
 		void SetDirectLinkingEnabled(bool enabled);
 		void SetPersistentDispatchEnabled(bool enabled);
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -178,6 +201,17 @@ namespace VitaEE
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
+		static constexpr u32 INVALID_RAM_SOURCE = UINT32_MAX;
+		// A maximum-size aligned EE block covers at most the tail of one vTLB
+		// page and the complete following page. Keep one spare fragment so this
+		// invariant remains robust if the scanner's atomic follower grows.
+		static constexpr u32 MAX_RAM_SOURCE_FRAGMENTS = 3;
+
+		struct RamSourceFragment
+		{
+			u32 start = INVALID_RAM_SOURCE;
+			u32 size = 0;
+		};
 
 		struct CachedBlock
 		{
@@ -193,6 +227,10 @@ namespace VitaEE
 			u32 dependency_start_pc = 0;
 			u32 dependency_instruction_count = 0;
 			u32 dependency_charged_cycles_before = 0;
+			std::array<RamSourceFragment, MAX_RAM_SOURCE_FRAGMENTS>
+				ram_source_fragments{};
+			u32 source_serial = 0;
+			u8 ram_source_fragment_count = 0;
 			u32 scaled_cycles = 0;
 			s8 ee_cycle_rate = 0;
 			u8 cp0_config_cycle_shift = 0;
@@ -248,6 +286,12 @@ namespace VitaEE
 			size_t code_size = 0;
 		};
 
+		struct RamSourceRecord
+		{
+			CachedBlock* block = nullptr;
+			u32 serial = 0;
+		};
+
 		static u32 LookupPageIndex(u32 start_pc);
 		static u32 LookupEntryIndex(u32 start_pc);
 		bool EnsureLookupDirectory(bool discovered_topology);
@@ -263,6 +307,12 @@ namespace VitaEE
 		bool RegisterBlockRecord(CachedBlock& block);
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
+		bool CaptureRamSourceFragments(CachedBlock& block);
+		void RegisterRamSource(CachedBlock& block);
+		void UnregisterRamSource(const CachedBlock& block);
+		void ClearRamSourcePages();
+		static void InvalidateRamSourceRangeThunk(
+			void* context, u32 backing_start, u32 size);
 		CachedBlock* FindRecordedBlockByStartPc(u32 start_pc,
 			u32 instruction_count, bool match_instruction_count,
 			bool discovered_topology, bool validate_source_words = true);
@@ -329,6 +379,12 @@ namespace VitaEE
 		std::vector<CachedBlock*> m_free_cache_entries;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
+		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT>
+			m_ram_source_pages;
+		std::array<u32, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
+		std::array<u8, RAM_WRITE_GUARD_PAGE_COUNT>
+			m_ram_source_page_live_flags{};
+		u32 m_next_source_serial = 1;
 		// Explicit trace windows and PCSX2-discovered BaseBlocks can have the same
 		// guest PC but different spans and scheduler tails. Keep their metadata
 		// lookups independent; only discovered blocks enter generated dispatch.

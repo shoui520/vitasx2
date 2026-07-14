@@ -361,6 +361,198 @@ namespace VitaEE
 		m_block_records.clear();
 	}
 
+	bool BlockExecutor::CaptureRamSourceFragments(CachedBlock& block)
+	{
+		block.ram_source_fragments = {};
+		block.ram_source_fragment_count = 0;
+		block.source_serial = 0;
+		if (!eeMem || !vtlb_private::vtlbdata.vmap)
+			return true;
+
+		const u32 dependency_start_pc = block.dependency_instruction_count != 0 ?
+			block.dependency_start_pc : block.start_pc;
+		const u32 dependency_instruction_count =
+			block.dependency_instruction_count != 0 ?
+				block.dependency_instruction_count : block.instruction_count;
+		if (dependency_instruction_count == 0)
+			return true;
+
+		const uptr ram_begin = reinterpret_cast<uptr>(eeMem->Main);
+		const u32 exposed_ram = std::min(Ps2MemSize::ExposedRam,
+			Ps2MemSize::MainRam);
+		const uptr ram_end = ram_begin + exposed_ram;
+		u32 source_pc = dependency_start_pc;
+		u32 remaining = dependency_instruction_count * sizeof(u32);
+		while (remaining != 0)
+		{
+			const u32 page_remaining = vtlb_private::VTLB_PAGE_SIZE -
+				(source_pc & vtlb_private::VTLB_PAGE_MASK);
+			const u32 chunk = std::min(remaining, page_remaining);
+			const vtlb_private::VTLBVirtual vmv =
+				vtlb_private::vtlbdata.vmap[
+					source_pc >> vtlb_private::VTLB_PAGE_BITS];
+			if (!vmv.isHandler(source_pc))
+			{
+				const uptr host_start = vmv.assumePtr(source_pc);
+				if (host_start >= ram_begin && host_start < ram_end)
+				{
+					const u32 ram_chunk = static_cast<u32>(std::min<uptr>(
+						chunk, ram_end - host_start));
+					const u32 backing_start =
+						static_cast<u32>(host_start - ram_begin);
+					RamSourceFragment* previous =
+						block.ram_source_fragment_count != 0 ?
+							&block.ram_source_fragments[
+								block.ram_source_fragment_count - 1] : nullptr;
+					if (previous && previous->start + previous->size == backing_start)
+					{
+						previous->size += ram_chunk;
+					}
+					else
+					{
+						if (block.ram_source_fragment_count <
+							MAX_RAM_SOURCE_FRAGMENTS)
+						{
+							block.ram_source_fragments[
+								block.ram_source_fragment_count++] =
+								{backing_start, ram_chunk};
+						}
+						else
+						{
+							// The aligned 1025-word scanner bound proves this cannot
+							// occur today. Refuse publication if that contract grows;
+							// a partial owner map would make linked SMC unsafe.
+							block.ram_source_fragments = {};
+							block.ram_source_fragment_count = 0;
+							return false;
+						}
+					}
+				}
+			}
+
+			source_pc += chunk;
+			remaining -= chunk;
+		}
+		return true;
+	}
+
+	void BlockExecutor::RegisterRamSource(CachedBlock& block)
+	{
+		if (!block.valid || block.ram_source_fragment_count == 0)
+			return;
+
+		block.source_serial = m_next_source_serial++;
+		if (m_next_source_serial == 0)
+			m_next_source_serial = 1;
+
+		for (u32 fragment_index = 0;
+			fragment_index < block.ram_source_fragment_count; fragment_index++)
+		{
+			const RamSourceFragment& fragment =
+				block.ram_source_fragments[fragment_index];
+			if (fragment.start == INVALID_RAM_SOURCE || fragment.size == 0)
+				continue;
+			const u32 first_page = fragment.start >> RAM_SOURCE_PAGE_SHIFT;
+			const u32 last_page =
+				(fragment.start + fragment.size - 1) >> RAM_SOURCE_PAGE_SHIFT;
+			for (u32 page_index = first_page; page_index <= last_page; page_index++)
+			{
+				bool already_registered = false;
+				for (u32 previous_index = 0; previous_index < fragment_index;
+					previous_index++)
+				{
+					const RamSourceFragment& previous =
+						block.ram_source_fragments[previous_index];
+					if (previous.start == INVALID_RAM_SOURCE || previous.size == 0)
+						continue;
+					const u32 previous_first =
+						previous.start >> RAM_SOURCE_PAGE_SHIFT;
+					const u32 previous_last =
+						(previous.start + previous.size - 1) >> RAM_SOURCE_PAGE_SHIFT;
+					if (page_index >= previous_first && page_index <= previous_last)
+					{
+						already_registered = true;
+						break;
+					}
+				}
+				if (page_index >= RAM_SOURCE_PAGE_COUNT || already_registered)
+				{
+					continue;
+				}
+				m_ram_source_pages[page_index].push_back(
+					{&block, block.source_serial});
+				m_ram_source_page_live_counts[page_index]++;
+				m_ram_source_page_live_flags[page_index] = 1;
+			}
+		}
+	}
+
+	void BlockExecutor::UnregisterRamSource(const CachedBlock& block)
+	{
+		if (block.ram_source_fragment_count == 0 || block.source_serial == 0)
+			return;
+
+		for (u32 fragment_index = 0;
+			fragment_index < block.ram_source_fragment_count; fragment_index++)
+		{
+			const RamSourceFragment& fragment =
+				block.ram_source_fragments[fragment_index];
+			if (fragment.start == INVALID_RAM_SOURCE || fragment.size == 0)
+				continue;
+			const u32 first_page = fragment.start >> RAM_SOURCE_PAGE_SHIFT;
+			const u32 last_page =
+				(fragment.start + fragment.size - 1) >> RAM_SOURCE_PAGE_SHIFT;
+			for (u32 page_index = first_page; page_index <= last_page; page_index++)
+			{
+				bool already_unregistered = false;
+				for (u32 previous_index = 0; previous_index < fragment_index;
+					previous_index++)
+				{
+					const RamSourceFragment& previous =
+						block.ram_source_fragments[previous_index];
+					if (previous.start == INVALID_RAM_SOURCE || previous.size == 0)
+						continue;
+					const u32 previous_first =
+						previous.start >> RAM_SOURCE_PAGE_SHIFT;
+					const u32 previous_last =
+						(previous.start + previous.size - 1) >> RAM_SOURCE_PAGE_SHIFT;
+					if (page_index >= previous_first && page_index <= previous_last)
+					{
+						already_unregistered = true;
+						break;
+					}
+				}
+				if (page_index >= RAM_SOURCE_PAGE_COUNT || already_unregistered)
+				{
+					continue;
+				}
+				if (m_ram_source_page_live_counts[page_index] != 0)
+					m_ram_source_page_live_counts[page_index]--;
+				m_ram_source_page_live_flags[page_index] =
+					m_ram_source_page_live_counts[page_index] != 0 ? 1 : 0;
+			}
+		}
+	}
+
+	void BlockExecutor::ClearRamSourcePages()
+	{
+		for (std::vector<RamSourceRecord>& records : m_ram_source_pages)
+			records.clear();
+		m_ram_source_page_live_counts.fill(0);
+		m_ram_source_page_live_flags.fill(0);
+		m_next_source_serial = 1;
+	}
+
+	void BlockExecutor::InvalidateRamSourceRangeThunk(
+		void* context, u32 backing_start, u32 size)
+	{
+		if (context)
+		{
+			static_cast<BlockExecutor*>(context)->InvalidateRamSourceRange(
+				backing_start, size);
+		}
+	}
+
 	BlockExecutor::CachedBlock* BlockExecutor::FindRecordedBlockByStartPc(
 		u32 start_pc, u32 instruction_count, bool match_instruction_count,
 		bool discovered_topology, bool validate_source_words)
@@ -417,7 +609,18 @@ namespace VitaEE
 		if (!block.valid)
 			return;
 
+		// A generated store can invalidate the block which is currently running.
+		// Restore every outgoing patch site before removing any metadata so its
+		// eventual link tail cannot enter code retired by the same write. PCSX2's
+		// BaseBlocks::Remove() likewise reverses links before discarding the owner.
+		for (DirectLinkSlot& link : block.direct_links.slots)
+		{
+			if (link.valid)
+				PatchDirectLink(block, link, nullptr);
+		}
+
 		const bool discovered_topology = block.discovered_topology;
+		UnregisterRamSource(block);
 		UnlinkIncomingLinks(block.start_pc, &discovered_topology);
 		UnregisterIncomingLinks(block);
 		UnregisterBlockLookup(block);
@@ -431,6 +634,9 @@ namespace VitaEE
 		block.compatible_vtlb_fast_entries = {};
 		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
+		block.ram_source_fragments = {};
+		block.ram_source_fragment_count = 0;
+		block.source_serial = 0;
 		block.concatenated_short = false;
 		block.discovered_topology = false;
 		block.opcodes.reset();
@@ -552,6 +758,9 @@ namespace VitaEE
 			block.dependency_start_pc = 0;
 			block.dependency_instruction_count = 0;
 			block.dependency_charged_cycles_before = 0;
+			block.ram_source_fragments = {};
+			block.ram_source_fragment_count = 0;
+			block.source_serial = 0;
 			block.linked_entry_offset = 0;
 			block.resident_self_link_entry_offset = static_cast<size_t>(-1);
 			block.resident_self_link_entry_loads = 0;
@@ -568,6 +777,7 @@ namespace VitaEE
 
 		ClearBlockRecords();
 		ClearIncomingLinks();
+		ClearRamSourcePages();
 		ReleaseLookupPages();
 		ReleaseGeneratedLookupPages();
 		m_code_cache_resets = 0;
@@ -582,7 +792,119 @@ namespace VitaEE
 
 	u32 BlockExecutor::InvalidateRange(u32 start_pc, u32 instruction_count)
 	{
-		return InvalidateRangeInternal(start_pc, instruction_count, nullptr);
+		if (instruction_count == 0 ||
+			instruction_count > ((UINT32_MAX - start_pc) / sizeof(u32)))
+		{
+			return 0;
+		}
+
+		// Cpu->Clear() is expressed in guest words, while the source owner is the
+		// RAM allocation reached through the current vTLB mapping. Resolve all
+		// direct RAM fragments first so physical/KSEG/TLB aliases retire one
+		// another. Keep the raw-PC pass for ROM, scratchpad, handlers, and callers
+		// which deliberately clear an architectural entry rather than RAM bytes.
+		u32 invalidated = 0;
+		if (eeMem && vtlb_private::vtlbdata.vmap)
+		{
+			const uptr ram_begin = reinterpret_cast<uptr>(eeMem->Main);
+			const u32 exposed_ram = std::min(Ps2MemSize::ExposedRam,
+				Ps2MemSize::MainRam);
+			const uptr ram_end = ram_begin + exposed_ram;
+			u32 source_pc = start_pc;
+			u32 remaining = instruction_count * sizeof(u32);
+			while (remaining != 0)
+			{
+				const u32 page_remaining = vtlb_private::VTLB_PAGE_SIZE -
+					(source_pc & vtlb_private::VTLB_PAGE_MASK);
+				const u32 chunk = std::min(remaining, page_remaining);
+				const vtlb_private::VTLBVirtual vmv =
+					vtlb_private::vtlbdata.vmap[
+						source_pc >> vtlb_private::VTLB_PAGE_BITS];
+				if (!vmv.isHandler(source_pc))
+				{
+					const uptr host_start = vmv.assumePtr(source_pc);
+					if (host_start >= ram_begin && host_start < ram_end)
+					{
+						const u32 ram_chunk = static_cast<u32>(std::min<uptr>(
+							chunk, ram_end - host_start));
+						invalidated += InvalidateRamSourceRange(
+							static_cast<u32>(host_start - ram_begin), ram_chunk);
+					}
+				}
+				source_pc += chunk;
+				remaining -= chunk;
+			}
+		}
+
+		invalidated +=
+			InvalidateRangeInternal(start_pc, instruction_count, nullptr);
+		return invalidated;
+	}
+
+	u32 BlockExecutor::InvalidateRamSourceRange(u32 backing_start, u32 size)
+	{
+		const u32 exposed_ram = std::min(Ps2MemSize::ExposedRam,
+			Ps2MemSize::MainRam);
+		if (size == 0 || backing_start >= exposed_ram)
+			return 0;
+		size = std::min(size, exposed_ram - backing_start);
+		const u32 backing_end = backing_start + size;
+
+		u32 invalidated = 0;
+		const u32 first_page = backing_start >> RAM_SOURCE_PAGE_SHIFT;
+		const u32 last_page = (backing_end - 1) >> RAM_SOURCE_PAGE_SHIFT;
+		for (u32 page_index = first_page; page_index <= last_page; page_index++)
+		{
+			// The bounded ascending interval visits each page exactly once. Most
+			// helper and DMA writes target data-only pages, so reject those before
+			// touching the owner vectors.
+			if (page_index >= RAM_SOURCE_PAGE_COUNT ||
+				m_ram_source_page_live_flags[page_index] == 0)
+				continue;
+
+			std::vector<RamSourceRecord>& records =
+				m_ram_source_pages[page_index];
+			u32 write_index = 0;
+			for (u32 read_index = 0; read_index < records.size(); read_index++)
+			{
+				const RamSourceRecord record = records[read_index];
+				CachedBlock* const block = record.block;
+				const bool live_owner = block && block->valid &&
+					block->source_serial == record.serial &&
+					block->ram_source_fragment_count != 0;
+				if (!live_owner)
+					continue;
+
+				bool overlaps = false;
+				for (u32 fragment_index = 0;
+					fragment_index < block->ram_source_fragment_count;
+					fragment_index++)
+				{
+					const RamSourceFragment& fragment =
+						block->ram_source_fragments[fragment_index];
+					const u32 fragment_end = fragment.start + fragment.size;
+					if (backing_start < fragment_end &&
+						fragment.start < backing_end)
+					{
+						overlaps = true;
+						break;
+					}
+				}
+
+				if (overlaps)
+				{
+					InvalidateCachedBlock(*block);
+					invalidated++;
+					continue;
+				}
+
+				if (write_index != read_index)
+					records[write_index] = record;
+				write_index++;
+			}
+			records.resize(write_index);
+		}
+		return invalidated;
 	}
 
 	u32 BlockExecutor::InvalidateRangeInternal(u32 start_pc,
@@ -1999,7 +2321,9 @@ namespace VitaEE
 					return false;
 				}
 
-				BlockCompiler compiler(block.code);
+				BlockCompiler compiler(block.code,
+					RamSourcePageLiveFlags(), this,
+					&BlockExecutor::InvalidateRamSourceRangeThunk);
 #if defined(VITASX2_QEMU_VALIDATION)
 				compiler.SetVtlbLinkedEntryPcPublicationEnabled(
 					m_vtlb_linked_entry_pc_publication_enabled);
@@ -2331,11 +2655,23 @@ namespace VitaEE
 			}
 		}
 		block.opcodes = std::move(source_opcodes);
+		if (!CaptureRamSourceFragments(block))
+		{
+			block.opcodes.reset();
+			block.code.Release();
+			RewindCodeCache(block_code_slice_offset);
+			return false;
+		}
 		block.valid = true;
+		RegisterRamSource(block);
 		if (!RegisterBlockRecord(block))
 		{
+			UnregisterRamSource(block);
 			block.valid = false;
 			block.direct_links = {};
+			block.ram_source_fragments = {};
+			block.ram_source_fragment_count = 0;
+			block.source_serial = 0;
 			block.opcodes.reset();
 			block.code.Release();
 			RewindCodeCache(block_code_slice_offset);

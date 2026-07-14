@@ -41,6 +41,16 @@
 
 using namespace R5900;	// for R5900 disasm tools
 
+static __fi void NotifyEeRamHostWrite(const void* address, u32 size)
+{
+#if defined(VITASX2_VITA)
+	VitaNotifyA32EeRamWrite(address, size);
+#else
+	(void)address;
+	(void)size;
+#endif
+}
+
 s32 EEsCycle;		// used to sync the IOP to the EE
 u64 EEoCycle;
 
@@ -678,7 +688,11 @@ int ParseArgumentString(u32 arg_block)
 
 		bool isSpace = (curchar == ' ');
 		if (isSpace)
-			memset(PSM(arg_block + i), 0, 1);
+		{
+			void* const separator = PSM(arg_block + i);
+			memset(separator, 0, 1);
+			NotifyEeRamHostWrite(separator, 1);
+		}
 		else if (wasSpace) // then we're at a new arg
 		{
 			if (argc < kMaxArgs)
@@ -738,9 +752,15 @@ void eeloadHook()
 			{
 				arg_ptr = memRead32(cpuRegs.GPR.n.a1.UD[0] + (a * 4));
 				arg_len = strlen((char *)PSM(arg_ptr));
-				memset(PSM(arg_ptr + arg_len), 0x20, 1);
+				void* const separator = PSM(arg_ptr + arg_len);
+				memset(separator, 0x20, 1);
+				NotifyEeRamHostWrite(separator, 1);
 			}
-			strcpy((char *)PSM(arg_ptr + arg_len + 1), EmuConfig.CurrentGameArgs.c_str());
+			char* const argument_destination =
+				static_cast<char*>(PSM(arg_ptr + arg_len + 1));
+			strcpy(argument_destination, EmuConfig.CurrentGameArgs.c_str());
+			NotifyEeRamHostWrite(argument_destination,
+				static_cast<u32>(EmuConfig.CurrentGameArgs.size() + 1));
 			u32 first_arg_ptr = memRead32(cpuRegs.GPR.n.a1.UD[0]);
 #if DEBUG_LAUNCHARG
 			Console.WriteLn("eeloadHook: arg block is '%s'.", (char *)PSM(first_arg_ptr));
@@ -805,7 +825,10 @@ void eeloadHook()
 				if (!strcmp((char*)PSM(g_osdsys_str), "rom0:OSDSYS"))
 				{
 					// Overwrite OSDSYS with game's ELF name
-					strcpy((char*)PSM(g_osdsys_str), elfname.c_str());
+					char* const destination = static_cast<char*>(PSM(g_osdsys_str));
+					strcpy(destination, elfname.c_str());
+					NotifyEeRamHostWrite(destination,
+						static_cast<u32>(elfname.size() + 1));
 					break;
 				}
 			}
@@ -851,8 +874,14 @@ void eeloadHook2()
 	// Add args string after game's ELF name that was written over "rom0:OSDSYS" by eeloadHook(). In between the ELF name and args
 	// string we insert a space character so that ParseArgumentString() has one continuous string to process.
 	int game_len = strlen((char *)PSM(g_osdsys_str));
-	memset(PSM(g_osdsys_str + game_len), 0x20, 1);
-	strcpy((char *)PSM(g_osdsys_str + game_len + 1), EmuConfig.CurrentGameArgs.c_str());
+	void* const separator = PSM(g_osdsys_str + game_len);
+	memset(separator, 0x20, 1);
+	NotifyEeRamHostWrite(separator, 1);
+	char* const argument_destination =
+		static_cast<char*>(PSM(g_osdsys_str + game_len + 1));
+	strcpy(argument_destination, EmuConfig.CurrentGameArgs.c_str());
+	NotifyEeRamHostWrite(argument_destination,
+		static_cast<u32>(EmuConfig.CurrentGameArgs.size() + 1));
 #if DEBUG_LAUNCHARG
 	Console.WriteLn("eeloadHook2: arg block is '%s'.", (char *)PSM(g_osdsys_str));
 #endif

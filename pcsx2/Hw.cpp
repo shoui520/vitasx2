@@ -6,6 +6,7 @@
 #include "Hardware.h"
 #include "SPU2/spu2.h"
 #include "USB/USB.h"
+#include "vita/VitaCore.h"
 
 #include "common/WrappedMemCopy.h"
 
@@ -140,6 +141,21 @@ __ri bool hwMFIFOWrite(u32 addr, const u128* data, uint qwc)
 		pxAssertMsg( PSM(dmacRegs.rbor.ADDR+ringsize-1) != NULL, "Scratchpad/MFIFO ringbuffer spans into invalid (unmapped) physical memory!" );
 		uint startpos = (addr & dmacRegs.rbsr.RMSK)/16;
 		MemCopy_WrappedDest( data, dst, startpos, ringsize, qwc );
+		// PCSX2's protected-page fault retires generated source on each page the
+		// MFIFO copy actually touches. Preserve that selectivity across a wrap;
+		// once a transfer covers the complete ring, one bounded notification is
+		// sufficient even when the copy laps it more than once.
+		if (qwc >= ringsize)
+		{
+			VitaNotifyA32EeRamWrite(dst, ringsize * sizeof(u128));
+		}
+		else
+		{
+			const uint first_qwc = std::min(qwc, ringsize - startpos);
+			VitaNotifyA32EeRamWrite(dst + startpos, first_qwc * sizeof(u128));
+			if (qwc > first_qwc)
+				VitaNotifyA32EeRamWrite(dst, (qwc - first_qwc) * sizeof(u128));
+		}
 	}
 	else
 	{
@@ -366,4 +382,3 @@ bool hwDmacSrcChain(DMACh& dma, int id)
 
 	return false;
 }
-

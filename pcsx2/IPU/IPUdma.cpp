@@ -5,6 +5,7 @@
 #include "IPU/IPU.h"
 #include "IPU/IPUdma.h"
 #include "IPU/IPU_MultiISA.h"
+#include "vita/VitaCore.h"
 
 IPUDMAStatus IPU1Status;
 
@@ -177,6 +178,7 @@ void IPU0dma()
 
 	readsize = std::min(ipu0ch.qwc, (u32)ipuRegs.ctrl.OFC);
 	ipu_fifo.out.read(pMem, readsize);
+	VitaNotifyA32EeRamWrite(pMem, static_cast<u32>(readsize) << 4);
 
 	ipu0ch.madr += readsize << 4;
 	ipu0ch.qwc -= readsize;

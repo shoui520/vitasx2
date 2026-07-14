@@ -7,6 +7,7 @@
 #include "Common.h"
 #include "Sif.h"
 #include "IopHw.h"
+#include "vita/VitaCore.h"
 
 _sif sif2;
 
@@ -64,6 +65,7 @@ static __fi bool WriteFifoToEE()
 	}
 
 	sif2.fifo.read((u32*)ptag, readSize << 2);
+	VitaNotifyA32EeRamWrite(ptag, static_cast<u32>(readSize) << 4);
 
 	// Clearing handled by vtlb memory protection and manual blocks.
 	//Cpu->Clear(sif2dma.madr, readSize*4);

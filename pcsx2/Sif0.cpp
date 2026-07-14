@@ -11,6 +11,7 @@
 #include "DebugTools/SifTrace.h"
 #include "Sif.h"
 #include "IopHw.h"
+#include "vita/VitaCore.h"
 
 _sif sif0;
 
@@ -62,6 +63,7 @@ static __fi bool WriteFifoToEE()
 	const u32 fifo_before = sif0.fifo.size;
 	TraceSif0CoreEvent(Pcsx2Trace::CoreEventPhase::Before);
 	sif0.fifo.read((u32*)ptag, readSize << 2);
+	VitaNotifyA32EeRamWrite(ptag, static_cast<u32>(readSize) << 4);
 	Pcsx2Trace::RecordSifTransfer(Pcsx2Trace::SifTraceKindFifoData, 0, Pcsx2Trace::SifTraceDirectionFifoToEe,
 		ptag, static_cast<u32>(readSize << 2), ee_madr, hw_dma9.madr, sif0ch.qwc, sif0.iop.counter,
 		fifo_before, sif0.fifo.size, sif0ch.chcr._u32, sif0data, hw_dma9.tadr);

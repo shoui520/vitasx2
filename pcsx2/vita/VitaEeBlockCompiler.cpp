@@ -3,6 +3,7 @@
 
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
 #include "pcsx2/COP0.h"
+#include "pcsx2/HostMemoryMap.h"
 #include "pcsx2/MemoryTypes.h"
 #include "pcsx2/vtlb.h"
 
@@ -470,6 +471,9 @@ namespace VitaEE
 {
 	namespace
 	{
+		constexpr u16 REG_R0 = 1u << 0;
+		constexpr u16 REG_R1 = 1u << 1;
+		constexpr u16 REG_R2 = 1u << 2;
 		constexpr u16 REG_R3 = 1u << 3;
 		constexpr u16 REG_R4 = 1u << 4;
 		constexpr u16 REG_R5 = 1u << 5;
@@ -479,6 +483,7 @@ namespace VitaEE
 		constexpr u16 REG_R9 = 1u << 9;
 		constexpr u16 REG_R10 = 1u << 10;
 		constexpr u16 REG_R11 = 1u << 11;
+		constexpr u16 REG_R12 = 1u << 12;
 		constexpr u16 REG_LR = 1u << 14;
 		constexpr u16 REG_PC = 1u << 15;
 		constexpr u16 EE_LINK_FRAME_REGISTERS = BlockCompiler::LINK_FRAME_REGISTER_MASK;
@@ -2619,8 +2624,14 @@ namespace VitaEE
 		s_raw_gpr0_known_zero = (cpuRegs.GPR.r[0].UD[0] == 0 && cpuRegs.GPR.r[0].UD[1] == 0) ? 1u : 0u;
 	}
 
-	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code)
+	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code,
+		const u8* ram_source_page_live_flags,
+		void* ram_write_invalidation_context,
+		RamWriteInvalidationCallback ram_write_invalidation_callback)
 		: m_code(code)
+		, m_ram_source_page_live_flags(ram_source_page_live_flags)
+		, m_ram_write_invalidation_context(ram_write_invalidation_context)
+		, m_ram_write_invalidation_callback(ram_write_invalidation_callback)
 	{
 		m_branch_flag_host = HOST_BRANCH_FLAG;
 		// Keep the allocator's dense logical q0-q7 domain while placing its upper
@@ -9400,6 +9411,7 @@ namespace VitaEE
 		m_cop2_qword_memory_cold_tails.clear();
 		m_vu0_sync_cold_tails.clear();
 		m_partial_memory_cold_tails.clear();
+		m_ram_store_invalidation_cold_tails.clear();
 		m_vtlb_registers_available = use_vtlb_registers;
 		m_cop1_exponent_mask_available = use_cop1_exponent_mask_register;
 		m_vu0_base_available = use_vu0_base_register;
@@ -26180,6 +26192,8 @@ namespace VitaEE
 			unsigned rt_host;
 			if (!EmitGprLowValueOperand(rt, HOST_TMP1, &rt_host) ||
 				!m_code.EmitStrbImm12PostIndex(rt_host, write_pointer.host,
+					write_pointer.stride) ||
+				!EmitRamSourceStoreGuard(write_pointer.host, sizeof(u8),
 					write_pointer.stride))
 			{
 				return false;
@@ -26226,7 +26240,8 @@ namespace VitaEE
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
 			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
 		{
-			return emit_store_to_host();
+			return emit_store_to_host() &&
+				EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u8));
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -26234,7 +26249,8 @@ namespace VitaEE
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitVtlbNonHandlerHostAddress(
 				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
-			!emit_store_to_host())
+			!emit_store_to_host() ||
+			!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u8)))
 		{
 			return false;
 		}
@@ -26281,7 +26297,8 @@ namespace VitaEE
 			(known_address & 1u) == 0 &&
 			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
 		{
-			return emit_store_to_host();
+			return emit_store_to_host() &&
+				EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u16));
 		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
@@ -26299,7 +26316,8 @@ namespace VitaEE
 
 		if (!EmitVtlbNonHandlerHostAddress(
 				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
-			!emit_store_to_host())
+			!emit_store_to_host() ||
+			!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u16)))
 		{
 			return false;
 		}
@@ -26347,7 +26365,8 @@ namespace VitaEE
 			(known_address & 3u) == 0 &&
 			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
 		{
-			return emit_store_to_host();
+			return emit_store_to_host() &&
+				EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u32));
 		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
@@ -26365,7 +26384,8 @@ namespace VitaEE
 
 		if (!EmitVtlbNonHandlerHostAddress(
 				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
-			!emit_store_to_host())
+			!emit_store_to_host() ||
+			!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u32)))
 		{
 			return false;
 		}
@@ -26432,7 +26452,8 @@ namespace VitaEE
 			(known_address & 7u) == 0 &&
 			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
 		{
-			return emit_store_to_host();
+			return emit_store_to_host() &&
+				EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u64));
 		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
@@ -26454,7 +26475,8 @@ namespace VitaEE
 			return false;
 		}
 
-		if (!emit_store_to_host())
+		if (!emit_store_to_host() ||
+			!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u64)))
 			return false;
 
 		ScalarStoreColdTail tail{
@@ -26579,7 +26601,8 @@ namespace VitaEE
 			m_resident_vtlb_qword_pointer && op == m_resident_vtlb_qword_store_op;
 		if (resident_qword_pointer || compatible_qword_pointer)
 		{
-			if (!emit_store_to_host(HOST_TMP3, true))
+			if (!emit_store_to_host(HOST_TMP3, true) ||
+				!EmitRamSourceStoreGuard(HOST_TMP3, sizeof(u128), sizeof(u128)))
 				return false;
 #if defined(VITASX2_QEMU_VALIDATION)
 			if (resident_qword_pointer)
@@ -26613,7 +26636,8 @@ namespace VitaEE
 			TryEmitKnownVtlbNonHandlerHostAddress(known_address & ~0x0fu, HOST_TMP0,
 				KnownVtlbFastPathKind::Qword))
 		{
-			return emit_store_to_host();
+			return emit_store_to_host() &&
+				EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u128));
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -26631,7 +26655,8 @@ namespace VitaEE
 			(m_code.Size() - translation_start) / sizeof(u32));
 #endif
 
-		if (!emit_store_to_host())
+		if (!emit_store_to_host() ||
+			!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u128)))
 			return false;
 
 		m_qword_store_cold_tails.push_back({
@@ -26654,7 +26679,8 @@ namespace VitaEE
 				KnownVtlbFastPathKind::Cop1))
 		{
 			return m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(rt))) &&
-				   m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0);
+				   m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) &&
+				   EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u32));
 		}
 
 		size_t unaligned_fallback = static_cast<size_t>(-1);
@@ -26673,7 +26699,8 @@ namespace VitaEE
 		if (!EmitVtlbNonHandlerHostAddress(
 				HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback, &dirty_pins) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(rt))) ||
-			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u32)))
 		{
 			return false;
 		}
@@ -26716,14 +26743,16 @@ namespace VitaEE
 				KnownVtlbFastPathKind::Cop2))
 		{
 			return EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5) &&
-				   emit_store_to_host();
+				   emit_store_to_host() &&
+				   EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u128), 0, true);
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
 		if (!EmitEffectiveAddress(op, HOST_TMP0) ||
 			!EmitVtlbNonHandlerHostAddress128(HOST_TMP0, HOST_TMP1, HOST_TMP2, &handler_fallback) ||
 			!EmitVu0SyncIfRunning(HOST_TMP0, HOST_TMP5) ||
-			!emit_store_to_host())
+			!emit_store_to_host() ||
+			!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u128), 0, true))
 		{
 			return false;
 		}
@@ -29476,7 +29505,10 @@ namespace VitaEE
 			const u8 shift = left ? SWL_SHIFT[lane] : SWR_SHIFT[lane];
 			const u32 mask = left ? SWL_MASK[lane] : SWR_MASK[lane];
 			if ((left && lane == 3) || (!left && lane == 0))
-				return emit_full_store(HOST_TMP5);
+			{
+				return emit_full_store(HOST_TMP5) &&
+					EmitRamSourceStoreGuard(HOST_TMP5, sizeof(u32));
+			}
 
 			if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_TMP5, 0) ||
 				!(mask == 0 ? m_code.EmitMovImm8(HOST_TMP0, 0) :
@@ -29491,7 +29523,7 @@ namespace VitaEE
 				return false;
 			}
 
-			return true;
+			return EmitRamSourceStoreGuard(HOST_TMP5, sizeof(u32));
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -29535,7 +29567,8 @@ namespace VitaEE
 						   VitaA32::ShiftType::LSR, HOST_TMP3) :
 						 m_code.EmitOrrRegShiftReg(HOST_TMP0, HOST_TMP0, HOST_TMP1,
 						   VitaA32::ShiftType::LSL, HOST_TMP3)) ||
-			!m_code.EmitStrImm12(HOST_TMP0, HOST_TMP5, 0))
+			!m_code.EmitStrImm12(HOST_TMP0, HOST_TMP5, 0) ||
+			!EmitRamSourceStoreGuard(HOST_TMP5, sizeof(u32)))
 		{
 			return false;
 		}
@@ -29550,6 +29583,7 @@ namespace VitaEE
 #endif
 		if (!m_code.PatchBranch(full_lane_branch, full_lane_target, VitaA32::Condition::EQ) ||
 			!emit_full_store(HOST_TMP0) ||
+			!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u32)) ||
 			!m_code.PatchBranch(general_done, m_code.Size()))
 		{
 			return false;
@@ -30035,7 +30069,10 @@ namespace VitaEE
 		{
 			const unsigned shift = known_address & 7u;
 			if (rt != 0 && ((left && shift == 7) || (!left && shift == 0)))
-				return emit_full_store();
+			{
+				return emit_full_store() &&
+					EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u64));
+			}
 
 			if (left)
 			{
@@ -30056,7 +30093,7 @@ namespace VitaEE
 	}
 			}
 
-			return true;
+			return EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u64));
 		}
 
 		size_t handler_fallback = static_cast<size_t>(-1);
@@ -30138,10 +30175,12 @@ namespace VitaEE
 			if (!m_code.PatchBranch(branch, done_target))
 				return false;
 		}
+		if (!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u64)))
+			return false;
 
 		PartialMemoryColdTail tail{
 			handler_fallback,
-			done_target,
+			m_code.Size(),
 			left ? PartialMemoryOp::DwordStoreLeft : PartialMemoryOp::DwordStoreRight,
 			rt,
 		};
@@ -30548,6 +30587,13 @@ namespace VitaEE
 				return false;
 		}
 
+		for (const RamStoreInvalidationColdTail& tail :
+			m_ram_store_invalidation_cold_tails)
+		{
+			if (!EmitRamStoreInvalidationColdTail(tail))
+				return false;
+		}
+
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
 		m_qword_load_cold_tails.clear();
@@ -30556,7 +30602,176 @@ namespace VitaEE
 		m_cop2_qword_memory_cold_tails.clear();
 		m_vu0_sync_cold_tails.clear();
 		m_partial_memory_cold_tails.clear();
+		m_ram_store_invalidation_cold_tails.clear();
 		return true;
+	}
+
+	bool BlockCompiler::EmitRamSourceStoreGuard(unsigned host_address_reg,
+		u32 size, u8 post_increment, bool may_cross_page)
+	{
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::{recRecompile,recClear} and
+		// recLUT. A direct vTLB store can only invalidate generated EE code when
+		// its translated host address belongs to main RAM and that physical source
+		// page currently owns at least one block. The live-byte table covers the
+		// complete compact ARM32 HostMemoryMap arena, with permanent zeroes outside
+		// RAM, so the common path needs no range branch. r1 retains the backing
+		// offset for the cold callback. Resident SQ keeps nextEventCycle.low in r0,
+		// so that exact mode uses r12 before its branch predicate is produced; every
+		// other mode uses r0 and leaves a compatible r12 read pointer intact. r2/r3
+		// remain untouched for the scheduler countdown and compatible write pointer.
+		if (!m_ram_source_page_live_flags ||
+			!m_ram_write_invalidation_callback || !m_ram_write_invalidation_context)
+		{
+			return true;
+		}
+		if (!eeMem || host_address_reg >= 15 || host_address_reg == HOST_TMP1 ||
+			size == 0 || size > 16)
+			return false;
+
+		static_assert(vtlb_private::VTLB_PAGE_BITS == 12);
+		static_assert((HostMemoryMap::MainSize &
+			(vtlb_private::VTLB_PAGE_SIZE - 1)) == 0);
+		// Resident cycle-low state is owned solely by the exact sequential SQ shape;
+		// compatible link signatures instead carry their countdown in r6. If a
+		// future mechanism combines resident r0 time with a compatible r12 pointer,
+		// it must provide another scratch/preservation contract rather than silently
+		// corrupt either private value.
+		const bool resident_r12_predicate_live = m_resident_cycle_low &&
+			m_branch_flag_host == HOST_TMP4 &&
+			(!m_forwarded_boolean_branch ||
+			 m_current_instruction_index >= m_forwarded_boolean_producer_index);
+		if ((m_resident_cycle_low && m_compatible_vtlb_pointer) ||
+			resident_r12_predicate_live)
+		{
+			return false;
+		}
+		const unsigned flag_scratch = m_resident_cycle_low ?
+			HOST_TMP4 : HOST_TMP0;
+		// BlockCanUseCallerSavedBranchFlag() rejects store delay slots, while
+		// AnalyzeForwardedBooleanBranch() admits the resident guarded SQ only before
+		// its boolean producer. Therefore r12 is not yet a live predicate when the
+		// resident store guard uses it.
+		// Every current store address is r0/r3/r5. Reject r1 above because the
+		// registerless form first loads the arena base there; this also makes it
+		// explicit that a future lowering must re-audit the scratch contract.
+		const bool backing_offset_ok = m_vtlb_registers_available ?
+			m_code.EmitSubReg(HOST_TMP1, host_address_reg,
+				HOST_VTLB_HOST_MEMORY_BASE) :
+			(m_code.EmitMovImm32(HOST_TMP1, static_cast<u32>(
+				reinterpret_cast<uptr>(eeMem->Main))) &&
+			 m_code.EmitSubReg(HOST_TMP1, host_address_reg, HOST_TMP1));
+		if (!backing_offset_ok ||
+			(post_increment != 0 &&
+				!m_code.EmitSubImm8(HOST_TMP1, HOST_TMP1, post_increment)))
+		{
+			return false;
+		}
+
+		if (!m_code.EmitMovImm32(flag_scratch, static_cast<u32>(
+				reinterpret_cast<uptr>(m_ram_source_page_live_flags))) ||
+			!m_code.EmitLdrbRegShift(flag_scratch, flag_scratch, HOST_TMP1,
+				VitaA32::ShiftType::LSR, vtlb_private::VTLB_PAGE_BITS) ||
+			!m_code.EmitCmpImm32(flag_scratch, 0))
+		{
+			return false;
+		}
+
+		const size_t live_source =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (live_source == static_cast<size_t>(-1))
+			return false;
+
+		size_t end_outside_arena = static_cast<size_t>(-1);
+		size_t same_page = static_cast<size_t>(-1);
+		size_t secondary_live_source = static_cast<size_t>(-1);
+		if (may_cross_page)
+		{
+			// SQC2 is the only native unaligned 128-bit store. If its end remains
+			// in the compact host arena but crosses a 4 KiB source-page boundary,
+			// either page can own generated code. r3 is not a compatible/persistent
+			// mapping in COP2 blocks and is dead after the store.
+			if (!m_code.EmitAddImm8(HOST_TMP3, HOST_TMP1,
+					static_cast<u8>(size - 1)) ||
+				!m_code.EmitCmpImm32(HOST_TMP3, HostMemoryMap::MainSize))
+			{
+				return false;
+			}
+			end_outside_arena =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+			if (end_outside_arena == static_cast<size_t>(-1) ||
+				!m_code.EmitEorReg(flag_scratch, HOST_TMP3, HOST_TMP1) ||
+				!m_code.EmitTstImm32(flag_scratch, vtlb_private::VTLB_PAGE_SIZE))
+			{
+				return false;
+			}
+			same_page =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (same_page == static_cast<size_t>(-1) ||
+				!m_code.EmitMovImm32(flag_scratch, static_cast<u32>(
+					reinterpret_cast<uptr>(m_ram_source_page_live_flags))) ||
+				!m_code.EmitLdrbRegShift(flag_scratch, flag_scratch, HOST_TMP3,
+					VitaA32::ShiftType::LSR, vtlb_private::VTLB_PAGE_BITS) ||
+				!m_code.EmitCmpImm32(flag_scratch, 0))
+			{
+				return false;
+			}
+			secondary_live_source =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (secondary_live_source == static_cast<size_t>(-1))
+				return false;
+		}
+
+		const size_t join_offset = m_code.Size();
+		if (may_cross_page &&
+			(!m_code.PatchBranch(end_outside_arena, join_offset,
+				 VitaA32::Condition::CS) ||
+			 !m_code.PatchBranch(same_page, join_offset,
+				 VitaA32::Condition::EQ)))
+		{
+			return false;
+		}
+		m_ram_store_invalidation_cold_tails.push_back({
+			live_source,
+			secondary_live_source,
+			join_offset,
+			size,
+		});
+		return true;
+	}
+
+	bool BlockCompiler::EmitRamStoreInvalidationColdTail(
+		const RamStoreInvalidationColdTail& tail)
+	{
+		// The callback can retire the block currently executing this cold tail.
+		// Preserve the complete AAPCS caller-clobbered portion of the private EE
+		// chain ABI, including the allocator's physical q0-q3/q8-q15 banks. The
+		// callee-saved d8-d15 bank is owned by AAPCS and the callback itself.
+		constexpr u16 CALLER_CORE_REGISTERS =
+			REG_R0 | REG_R1 | REG_R2 | REG_R3 | REG_R12 | REG_LR;
+		const size_t cold_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.live_source_branch, cold_target,
+				VitaA32::Condition::NE) ||
+			(tail.secondary_live_source_branch != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(tail.secondary_live_source_branch, cold_target,
+					VitaA32::Condition::NE)) ||
+			!m_code.EmitPush(CALLER_CORE_REGISTERS) ||
+			!m_code.EmitVpushDRange(0, 8) ||
+			!m_code.EmitVpushDRange(16, 16) ||
+			!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+				reinterpret_cast<uptr>(m_ram_write_invalidation_context))) ||
+			!m_code.EmitMovImm32(HOST_TMP2, tail.size) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
+				m_ram_write_invalidation_callback)) ||
+			!m_code.EmitVpopDRange(16, 16) ||
+			!m_code.EmitVpopDRange(0, 8) ||
+			!m_code.EmitPop(CALLER_CORE_REGISTERS))
+		{
+			return false;
+		}
+
+		const size_t tail_done = m_code.EmitBranchPlaceholder();
+		return tail_done != static_cast<size_t>(-1) &&
+			m_code.PatchBranch(tail_done, tail.join_offset);
 	}
 
 	bool BlockCompiler::EmitScalarLoadColdTail(const ScalarLoadColdTail& tail)

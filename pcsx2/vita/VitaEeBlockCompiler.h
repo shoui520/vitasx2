@@ -437,6 +437,9 @@ namespace VitaEE
 		};
 
 	public:
+		using RamWriteInvalidationCallback = void (*)(void* context,
+			u32 backing_offset, u32 size);
+
 		// Private EE chain ABI: r3 is alignment padding; r4-r11 and LR/PC are
 		// saved by either the callable block prologue or the persistent dispatcher.
 		static constexpr u16 LINK_FRAME_REGISTER_MASK = 0x0ff8u;
@@ -447,7 +450,10 @@ namespace VitaEE
 		static constexpr u8 PERSISTENT_LINK_VTLB_VMAP_OFFSET = 16;
 		static constexpr u8 PERSISTENT_LINK_VTLB_HOST_BASE_OFFSET = 20;
 
-		explicit BlockCompiler(VitaA32::CodeBuffer& code);
+		explicit BlockCompiler(VitaA32::CodeBuffer& code,
+			const u8* ram_source_page_live_flags = nullptr,
+			void* ram_write_invalidation_context = nullptr,
+			RamWriteInvalidationCallback ram_write_invalidation_callback = nullptr);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled)
@@ -1258,7 +1264,22 @@ namespace VitaEE
 		void CapturePartialStoreValue(PartialMemoryColdTail* tail);
 		bool EmitPartialMemoryColdTail(const PartialMemoryColdTail& tail);
 
+		struct RamStoreInvalidationColdTail
+		{
+			size_t live_source_branch = static_cast<size_t>(-1);
+			size_t secondary_live_source_branch = static_cast<size_t>(-1);
+			size_t join_offset = 0;
+			u32 size = 0;
+		};
+		bool EmitRamSourceStoreGuard(unsigned host_address_reg, u32 size,
+			u8 post_increment = 0, bool may_cross_page = false);
+		bool EmitRamStoreInvalidationColdTail(
+			const RamStoreInvalidationColdTail& tail);
+
 		VitaA32::CodeBuffer& m_code;
+		const u8* m_ram_source_page_live_flags = nullptr;
+		void* m_ram_write_invalidation_context = nullptr;
+		RamWriteInvalidationCallback m_ram_write_invalidation_callback = nullptr;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
 		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
 		std::vector<QwordLoadColdTail> m_qword_load_cold_tails;
@@ -1267,6 +1288,7 @@ namespace VitaEE
 		std::vector<Cop2QwordMemoryColdTail> m_cop2_qword_memory_cold_tails;
 		std::vector<Vu0SyncColdTail> m_vu0_sync_cold_tails;
 		std::vector<PartialMemoryColdTail> m_partial_memory_cold_tails;
+		std::vector<RamStoreInvalidationColdTail> m_ram_store_invalidation_cold_tails;
 		u16 m_saved_registers = 0;
 		bool m_vtlb_registers_available = false;
 		bool m_cop1_exponent_mask_available = false;

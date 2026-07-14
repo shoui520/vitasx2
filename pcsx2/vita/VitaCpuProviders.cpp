@@ -116,6 +116,32 @@ void VitaNotifyIopPcDiscontinuity()
 	s_iop_a32_executor.NotifyPcDiscontinuity();
 }
 
+u32 VitaNotifyA32EeRamWrite(const void* host_address, u32 size)
+{
+	// PCSX2 owner: vtlb.cpp::mmap_ClearCpuBlock() converts a faulting
+	// eeMem->Main host page back to its physical RAM identity before calling
+	// R5900::Dynarec::OpcodeImpl::recClear(). Vita cannot rely on host page
+	// protection, so direct C++ writers publish that same backing identity here.
+	if (!eeMem || !host_address || size == 0)
+		return 0;
+
+	const uptr ram_start = reinterpret_cast<uptr>(eeMem->Main);
+	const uptr write_start = reinterpret_cast<uptr>(host_address);
+	if (write_start < ram_start)
+		return 0;
+
+	const uptr backing_start = write_start - ram_start;
+	if (backing_start >= Ps2MemSize::MainRam)
+		return 0;
+
+	const uptr remaining = Ps2MemSize::MainRam - backing_start;
+	const u32 bounded_size = static_cast<u32>(size < remaining ? size : remaining);
+	const u32 invalidated = s_ee_a32_executor.InvalidateRamSourceRange(
+		static_cast<u32>(backing_start), bounded_size);
+	s_ee_a32_stats.invalidated_blocks += invalidated;
+	return invalidated;
+}
+
 #if defined(__arm__)
 static void UpdateIopEventEntry()
 {

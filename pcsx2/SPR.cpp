@@ -7,6 +7,7 @@
 #include "SPR.h"
 #include "VUmicro.h"
 #include "MTVU.h"
+#include "vita/VitaCore.h"
 
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSprCopyNeonQwords = 0;
@@ -133,6 +134,7 @@ int  _SPR0chain()
 		// the cycle delay out of the way before the end.
 		partialqwc = std::min(spr0ch.qwc, 0x400 - ((spr0ch.sadr & 0x3fff) >> 4));
 		memcpy_from_spr((u8*)pMem, spr0ch.sadr, partialqwc*16);
+		VitaNotifyA32EeRamWrite(pMem, static_cast<u32>(partialqwc) * 16);
 
 		// Clear VU mem also!
 		TestClearVUs(spr0ch.madr, partialqwc, true);
@@ -197,6 +199,7 @@ void _SPR0interleave()
 				// Clear VU mem also!
 				TestClearVUs(spr0ch.madr, spr0ch.qwc, true);
 				memcpy_from_spr((u8*)pMem, spr0ch.sadr, spr0ch.qwc*16);
+				VitaNotifyA32EeRamWrite(pMem, spr0ch.qwc * 16);
 				break;
  		}
 		spr0ch.sadr += spr0ch.qwc * 16;

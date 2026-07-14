@@ -175,6 +175,10 @@ const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason);
 void VitaResetA32EeProviderStats();
 VitaA32EeProviderStats VitaGetA32EeProviderStats();
 void VitaRequestA32EeCacheReset();
+// Notify the active EE A32 provider after a C++ helper or device has written
+// directly through an eeMem->Main host pointer. Returns the number of cached
+// translations retired by the write.
+u32 VitaNotifyA32EeRamWrite(const void* host_address, u32 size);
 #if defined(VITASX2_QEMU_VALIDATION)
 // Unlike cache/reset-scoped provider telemetry, these fallback sentinels span
 // the complete validation session, including the two ELF-entry cache resets.

@@ -8,6 +8,7 @@
 #include "VUmicro.h"
 #include "Vif_Dma.h"
 #include "Vif_Dynarec.h"
+#include "vita/VitaCore.h"
 
 u32 g_vif1Cycles = 0;
 
@@ -61,6 +62,7 @@ void vif1TransferToMemory()
 #endif
 
 	MTGS::InitAndReadFIFO(reinterpret_cast<u8*>(pMem), size);
+	VitaNotifyA32EeRamWrite(pMem, size * sizeof(u128));
 	//	pMem += size;
 
 	//Some games such as Alex Ferguson's Player Manager 2001 reads less than GSLastDownloadSize by VIF then reads the remainder by FIFO
