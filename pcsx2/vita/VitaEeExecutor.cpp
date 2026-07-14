@@ -2167,6 +2167,13 @@ namespace VitaEE
 			candidate_instruction_count = prefix.instruction_count;
 		}
 
+		// Exact specialized compilers return before adopting the analyzed generic
+		// mapping. Do not publish that speculative signature as executable ABI:
+		// BaseBlocks-style linking may enter a compatible target only when this
+		// source actually emitted the corresponding compatible entry.
+		if (compiled_compatible_link_entry_offset == static_cast<size_t>(-1))
+			compiled_gpr_link_signature = GprLinkSignature{};
+
 		block.start_pc = start_pc;
 		block.instruction_count = compiled_instruction_count;
 		block.source_instruction_count = instruction_count;
@@ -2435,9 +2442,14 @@ namespace VitaEE
 		// contract. A dirty incompatible edge stays on its generated writeback
 		// fallback instead of jumping directly to a canonical target.
 		const bool use_resident_entry = target && m_persistent_dispatch_enabled &&
+			!link.canonicalizes_reclaimed_vtlb_hosts &&
 			link.target_pc == block.start_pc && block.resident_self_link_entry_loads != 0;
 		const bool use_compatible_entry = target && !use_resident_entry &&
-			m_persistent_dispatch_enabled && block.gpr_link_signature.IsValid() &&
+			m_persistent_dispatch_enabled &&
+			!link.canonicalizes_reclaimed_vtlb_hosts &&
+			block.gpr_link_signature.IsValid() &&
+			block.compatible_link_entry_offset != static_cast<size_t>(-1) &&
+			block.compatible_link_entry_offset < block.code.Size() &&
 			block.gpr_link_signature == target->gpr_link_signature &&
 			target->compatible_link_entry_offset != static_cast<size_t>(-1) &&
 			target->compatible_link_entry_offset < target->code.Size();

@@ -54,6 +54,7 @@ namespace VitaEE
 		bool patched_to_resident_entry = false;
 		bool patched_to_compatible_entry = false;
 		bool requires_compatible_entry = false;
+		bool canonicalizes_reclaimed_vtlb_hosts = false;
 		bool compatible_scheduler_countdown = false;
 		bool compatible_vtlb_pointer = false;
 		bool prevalidated_vtlb_read_pointer = false;
@@ -582,6 +583,9 @@ namespace VitaEE
 			bool preserve_dirty_taken_link);
 		bool EmitStageCompatiblePredicate();
 		bool EmitPrepareCompatiblePredicateEdge(u32 target_pc);
+		bool EdgeLeavesGprLinkSignature(u32 target_pc) const;
+		bool EdgeLeavesReclaimedVtlbHosts(u32 target_pc) const;
+		bool EmitReclaimedVtlbCanonicalEdge();
 		bool EmitReloadGprPinsAfterClobber(u16 host_mask);
 		bool EmitReloadAllGprPinsFromBacking();
 		bool EmitExitToTarget(const void* target, u8 callable_token);
