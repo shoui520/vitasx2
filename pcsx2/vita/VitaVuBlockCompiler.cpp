@@ -7533,17 +7533,16 @@ namespace VitaVU
 					code.Attach(s_vu1.code_cache + offset, s_vu1.code_cache_capacity - offset))
 				{
 					BlockCompiler compiler(code, plan, block->pairs.get(), VU1_MEMMASK);
-					if (compiler.Compile())
+					if (compiler.Compile() && code.Flush())
 					{
-						code.Flush();
-							block->direct_links = compiler.DirectLinks();
-							block->code = std::move(code);
-							block->entry = block->code.EntryPoint();
-							block->linked_entry = static_cast<const u8*>(block->entry) + compiler.LinkedEntryOffset();
-							block->code_size = block->code.Size();
-							if (!PatchVu1RuntimeLinkSlotPointers(*block))
-								break;
-							s_vu1.code_cache_used = offset + block->code_size;
+						block->direct_links = compiler.DirectLinks();
+						block->code = std::move(code);
+						block->entry = block->code.EntryPoint();
+						block->linked_entry = static_cast<const u8*>(block->entry) + compiler.LinkedEntryOffset();
+						block->code_size = block->code.Size();
+						if (!PatchVu1RuntimeLinkSlotPointers(*block))
+							break;
+						s_vu1.code_cache_used = offset + block->code_size;
 						s_vu1.stats.code_cache_used = s_vu1.code_cache_used;
 						s_vu1.stats.compiled_blocks++;
 						s_vu1.stats.compiled_pairs += plan.pair_count;
@@ -7678,9 +7677,8 @@ namespace VitaVU
 					code.Attach(s_vu0.code_cache + offset, s_vu0.code_cache_capacity - offset))
 				{
 					BlockCompiler compiler(code, plan, block->pairs.get(), VU0_MEMMASK);
-					if (compiler.Compile())
+					if (compiler.Compile() && code.Flush())
 					{
-						code.Flush();
 						block->code = std::move(code);
 						block->entry = block->code.EntryPoint();
 						block->code_size = block->code.Size();

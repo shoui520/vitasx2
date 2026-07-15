@@ -714,8 +714,8 @@ void SaveStateBase::PrepBlock(int size)
 	}
 	else if (m_memory.size() < static_cast<u32>(end))
 	{
-		Console.Error("(SaveStateBase) Buffer overflow in PrepBlock(), expected %d got %zu",
-			end, m_memory.size());
+		Console.Error("(SaveStateBase) Buffer overflow in PrepBlock(), expected %d got %u",
+			end, static_cast<u32>(m_memory.size()));
 		m_error = true;
 	}
 }

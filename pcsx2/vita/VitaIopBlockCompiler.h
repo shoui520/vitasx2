@@ -657,6 +657,7 @@ namespace VitaIOP
 		~BlockExecutor();
 
 		u32 Reset();
+		u32 Shutdown();
 		void ResetInstrumentationCounters();
 #if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
 	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
@@ -764,6 +765,7 @@ namespace VitaIOP
 
 		struct CachedBlock
 		{
+			CachedBlock* next_free = nullptr;
 			struct CodeFragment
 		{
 			VitaA32::CodeBuffer code;
@@ -1000,6 +1002,7 @@ namespace VitaIOP
 			bool isolate_cache_active, bool discovered_topology_only = false);
 		void RememberFreeCacheEntry(CachedBlock& block);
 		CachedBlock* TakeFreeCacheEntry();
+		void RemoveFreeCacheEntry(CachedBlock& block);
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
 		s32 LastIncomingLinkIndex(u32 target_lookup_identity) const;
 		void ClearIncomingLinks();
@@ -1189,7 +1192,7 @@ namespace VitaIOP
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
 		std::vector<std::unique_ptr<InterpreterFallbackBlock>>
 			m_interpreter_fallback_blocks;
-		std::vector<CachedBlock*> m_free_cache_entries;
+		CachedBlock* m_free_cache_head = nullptr;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<SemanticBlockDescriptor> m_semantic_block_descriptors;
 		std::vector<IncomingLinkRecord> m_incoming_links;

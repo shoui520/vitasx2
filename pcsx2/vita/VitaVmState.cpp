@@ -6,7 +6,8 @@
 #include "Config.h"
 #include "DEV9/DEV9.h"
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
-	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 #include "DebugTools/CoreEventTrace.h"
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
@@ -50,6 +51,10 @@
 #include "common/Console.h"
 
 #include <utility>
+
+#if defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+static VitaVSyncProgressCallback s_vsync_progress_callback = nullptr;
+#endif
 
 namespace VMManager
 {
@@ -686,7 +691,8 @@ namespace VMManager
 			VitaSetEePreInstructionTraceCallback(Pcsx2Trace::RecordEePreInstruction);
 #endif
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
-	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 			Pcsx2Trace::NotifyCoreEventElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyMachineCheckpointElfEntry(s_elf_entry_point);
 #endif
@@ -717,6 +723,10 @@ namespace VMManager
 
 		void VSyncOnCPUThread()
 		{
+#if defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+			if (s_vsync_progress_callback)
+				s_vsync_progress_callback();
+#endif
 		}
 
 		void PollInputOnCPUThread()
@@ -730,6 +740,13 @@ namespace VMManager
 	} // namespace Internal
 
 } // namespace VMManager
+
+#if defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+void VitaSetVSyncProgressCallback(VitaVSyncProgressCallback callback)
+{
+	s_vsync_progress_callback = callback;
+}
+#endif
 
 void VitaClearVmBootState()
 {

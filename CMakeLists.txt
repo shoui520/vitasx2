@@ -34,7 +34,7 @@ if(VITASX2_PORTABLE_REPLAY_VALIDATION)
 endif()
 
 option(VITASX2_PRODUCT_BOOT_VALIDATION
-	"Stop the normal VitaSX2 product after a bounded all-native reset-to-ELF-entry oracle trace."
+	"Stop the normal VitaSX2 product after bounded reset-to-entry and later-workload oracle gates."
 	OFF)
 if(VITASX2_PRODUCT_BOOT_VALIDATION)
 	# The IOP provider's bounded fallback sentinels live in pcsx2core. Keep them

@@ -7648,7 +7648,6 @@ namespace VitaIOP
 		m_active_isolate_cache_mode =
 			isolate_variants_enabled && (psxRegs.CP0.n.Status & 0x10000u) != 0;
 		m_cache.reserve(INITIAL_CACHE_CAPACITY);
-		m_free_cache_entries.reserve(INITIAL_CACHE_CAPACITY);
 		m_block_records.reserve(INITIAL_CACHE_CAPACITY);
 		m_incoming_links.reserve(INITIAL_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT);
 #if defined(__arm__)
@@ -7902,9 +7901,8 @@ namespace VitaIOP
 
 	BlockExecutor::~BlockExecutor()
 	{
-		Reset();
+		Shutdown();
 		ReleaseLookupPages();
-		ReleaseCodeCache();
 	}
 
 	void BlockExecutor::NotifyPcDiscontinuity()
@@ -9555,22 +9553,37 @@ namespace VitaIOP
 			return;
 
 		block.queued_free = true;
-		m_free_cache_entries.push_back(&block);
+		block.next_free = m_free_cache_head;
+		m_free_cache_head = &block;
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::TakeFreeCacheEntry()
 	{
-		while (!m_free_cache_entries.empty())
+		while (m_free_cache_head)
 		{
-			CachedBlock* block = m_free_cache_entries.back();
-			m_free_cache_entries.pop_back();
-			if (block)
-				block->queued_free = false;
-			if (block && !block->valid)
+			CachedBlock* block = m_free_cache_head;
+			m_free_cache_head = block->next_free;
+			block->next_free = nullptr;
+			block->queued_free = false;
+			if (!block->valid)
 				return block;
 		}
 
 		return nullptr;
+	}
+
+	void BlockExecutor::RemoveFreeCacheEntry(CachedBlock& block)
+	{
+		if (!block.queued_free)
+			return;
+
+		CachedBlock** link = &m_free_cache_head;
+		while (*link && *link != &block)
+			link = &(*link)->next_free;
+		if (*link == &block)
+			*link = block.next_free;
+		block.next_free = nullptr;
+		block.queued_free = false;
 	}
 
 	DirectLinkSlot*
@@ -9677,7 +9690,7 @@ namespace VitaIOP
 			Ps2MemSize::ExposedIopRam - 1;
 		m_force_logical_continuation = false;
 		ClearHotDispatchCache();
-		m_free_cache_entries.clear();
+		m_free_cache_head = nullptr;
 		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
 		{
 			if (entry->valid)
@@ -9685,6 +9698,7 @@ namespace VitaIOP
 
 			entry->valid = false;
 			entry->queued_free = false;
+			entry->next_free = nullptr;
 			entry->rec_lookup_identity = UINT32_MAX;
 			entry->rec_link_identity = UINT32_MAX;
 			entry->logical_continuation = false;
@@ -9710,7 +9724,11 @@ namespace VitaIOP
 		m_interpreter_fallback_blocks.clear();
 		ReleaseLookupPages();
 		const u32 previous_resets = m_code_cache_resets;
-		ReleaseCodeCache();
+		// PCSX2 owner: x86/iR3000A.cpp::recResetIOP() rewinds recPtr inside
+		// the one recReserve()-owned arena.  Keep the Vita VM slice as well;
+		// freeing and reallocating it at ordinary cache pressure both changes
+		// that ownership and can fail after VM-domain publication has begun.
+		m_code_cache_used = 0;
 		bool isolate_variants_enabled = true;
 #if defined(VITASX2_QEMU_VALIDATION)
 		isolate_variants_enabled = s_qemuIopIsolateCacheSpecializationEnabled;
@@ -9718,6 +9736,13 @@ namespace VitaIOP
 		m_active_isolate_cache_mode =
 			isolate_variants_enabled && (psxRegs.CP0.n.Status & 0x10000u) != 0;
 		m_code_cache_resets = previous_resets;
+		return invalidated;
+	}
+
+	u32 BlockExecutor::Shutdown()
+	{
+		const u32 invalidated = Reset();
+		ReleaseCodeCache();
 		return invalidated;
 	}
 
@@ -10947,11 +10972,7 @@ namespace VitaIOP
 					// reclaiming its arena. Restart the complete logical transaction;
 					// no provisional fragment or entry effect may survive the reset.
 					ResetForCachePressure();
-					m_free_cache_entries.erase(std::remove(m_free_cache_entries.begin(),
-												   m_free_cache_entries.end(),
-												   &block),
-						m_free_cache_entries.end());
-					block.queued_free = false;
+					RemoveFreeCacheEntry(block);
 					if (discovered_topology)
 					{
 						BlockScanResult retry_scan;
@@ -10996,6 +11017,12 @@ namespace VitaIOP
 					compiler.SourcePageLiteralOutOfRange();
 				if (compiled)
 				{
+					// A VM-domain write lease is process-global on PSP2.  Publish
+					// this physical fragment before the next fragment opens its
+					// own CodeBuffer; otherwise a >64-opcode PCSX2 logical block
+					// attempts a nested sceKernelOpenVMDomain() on fragment two.
+					if (!fragment.code.Flush())
+						return abandon_compilation();
 					CommitCodeSlice(code_slice_offset, fragment.code.Size());
 					fragment.linked_entry_offset = attempt_linked_entry_offset;
 					fragment.provider_entry_offset = attempt_provider_entry_offset;
@@ -11097,12 +11124,10 @@ namespace VitaIOP
 			{
 				return abandon_compilation();
 			}
-		}
-		for (u32 i = 0; i < block.fragment_count; i++)
-		{
-			// Continuation branches are final before publication, so each physical
-			// slice needs only one D-cache clean/I-cache invalidate operation.
-			if (!block.Fragment(i).code.Flush())
+			// The source was already published to release the process-global
+			// write lease before compiling its successor.  Republish only the
+			// patched continuation word now that the target address is known.
+			if (!source.code.Flush())
 				return abandon_compilation();
 		}
 

@@ -7,10 +7,18 @@
 // pcsx2/vita/VitaVmState.cpp; the product owns only Vita paths, target policy,
 // persistent status/log files, and the foreground state loop.
 
+#ifndef VITASX2_PRODUCT_BOOT_VALIDATION
+#define VITASX2_PRODUCT_BOOT_VALIDATION 0
+#endif
+
 #include "CDVD/CDVD.h"
 #include "CDVD/CDVDcommon.h"
 #include "Config.h"
+#include "Counters.h"
 #include "DebugTools/EeTrace.h"
+#if VITASX2_PRODUCT_BOOT_VALIDATION
+#include "DebugTools/MachineCheckpointTrace.h"
+#endif
 #include "Host.h"
 #include "R3000A.h"
 #include "R5900.h"
@@ -31,15 +39,16 @@
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/sysmem.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <malloc.h>
 #include <string>
 #include <string_view>
 
-#ifndef VITASX2_PRODUCT_BOOT_VALIDATION
-#define VITASX2_PRODUCT_BOOT_VALIDATION 0
-#endif
+extern "C" unsigned int _newlib_heap_size_user;
 
 namespace
 {
@@ -66,6 +75,10 @@ namespace
 		"ux0:data/vitasx2/product-validation/vitasx2.log";
 	constexpr const char* VALIDATION_TRACE_PATH =
 		"ux0:data/vitasx2/product-validation/vitasx2.ee.bin";
+	constexpr const char* VALIDATION_CHECKPOINT_PATH =
+		"ux0:data/vitasx2/product-validation/vitasx2.machine-checkpoint.bin";
+	constexpr const char* VALIDATION_PROGRESS_PATH =
+		"ux0:data/vitasx2/product-validation/vitasx2.progress";
 	constexpr const char* VALIDATION_INITIALIZED_PATH =
 		"ux0:data/vitasx2/product-validation/vitasx2.initialized";
 	constexpr const char* VALIDATION_DONE_PATH =
@@ -76,7 +89,14 @@ namespace
 		"ux0:data/vitasx2/product-validation/memcards/Mcd001.ps2";
 	constexpr const char* VALIDATION_CARD_2 =
 		"ux0:data/vitasx2/product-validation/memcards/Mcd002.ps2";
+	// Sony PSP2 SDK target/include/sceerror.h::SCE_ERROR_ERRNO_ENOENT.
+	// VitaSDK does not currently expose the errno-family constants.
+	constexpr s32 PSP2_ERROR_ERRNO_ENOENT = -2147418110;
 	constexpr u64 VALIDATION_EE_RECORDS = 128;
+	constexpr u64 VALIDATION_CHECKPOINT_RECORDS = 1;
+	constexpr u64 VALIDATION_AFTER_VSYNC_FRAMES = 1280;
+	constexpr u32 VALIDATION_EXPECTED_CAPTURE_FRAME = 1303;
+	constexpr u32 VALIDATION_PROGRESS_FRAME_INTERVAL = 128;
 	// PCSX2's CPU-thread lifecycle requires process-lifetime base and secrets
 	// layers even when this frontend supplies EmuConfig directly. Empty memory
 	// layers preserve all caller defaults and make base-only getters safe.
@@ -130,6 +150,18 @@ namespace
 		sceIoRemove(path);
 		const std::string temporary = std::string(path) + ".tmp";
 		sceIoRemove(temporary.c_str());
+	}
+
+	bool RemoveValidationFileIfPresent(const char* path, Error* error)
+	{
+		const int result = sceIoRemove(path);
+		if (result == 0 || result == PSP2_ERROR_ERRNO_ENOENT)
+			return true;
+
+		Error::SetStringFmt(error,
+			"Failed to reset validation file '{}' (error={:08x}).", path,
+			static_cast<u32>(result));
+		return false;
 	}
 
 	bool EnsureDirectories(Error* error)
@@ -272,7 +304,249 @@ namespace
 	}
 
 #if VITASX2_PRODUCT_BOOT_VALIDATION
-	bool NativeSuffixHasNoFallback(std::string* evidence,
+	struct ValidationProgressState
+	{
+		u32 entry_frame = 0;
+		u32 last_frame_delta = 0;
+		u32 next_sequence = 0;
+		u32 sampled_peak_heap_used = 0;
+		u32 sampled_minimum_heap_free = 0;
+		u32 sampled_minimum_heap_headroom = 0;
+		u32 sampled_minimum_lpddr_free = 0;
+		bool has_heap_sample = false;
+		bool has_lpddr_sample = false;
+		bool active = false;
+		bool write_failed = false;
+	};
+
+	ValidationProgressState s_validation_progress;
+
+	struct ValidationMemorySnapshot
+	{
+		u32 heap_limit = 0;
+		u32 heap_arena = 0;
+		u32 heap_used = 0;
+		u32 heap_free = 0;
+		u32 heap_free_chunks = 0;
+		u32 heap_top_free = 0;
+		u32 heap_sbrk_remaining = 0;
+		u32 heap_headroom = 0;
+		u32 lpddr_free = 0;
+		s32 lpddr_result = 0;
+	};
+
+	ValidationMemorySnapshot CaptureValidationMemory()
+	{
+		const struct mallinfo heap = mallinfo();
+		ValidationMemorySnapshot snapshot;
+		snapshot.heap_limit = _newlib_heap_size_user;
+		snapshot.heap_arena = static_cast<u32>(heap.arena);
+		snapshot.heap_used = static_cast<u32>(heap.uordblks);
+		snapshot.heap_free = static_cast<u32>(heap.fordblks);
+		snapshot.heap_free_chunks = static_cast<u32>(heap.ordblks);
+		snapshot.heap_top_free = static_cast<u32>(heap.keepcost);
+		snapshot.heap_sbrk_remaining =
+			snapshot.heap_limit > snapshot.heap_arena ?
+				snapshot.heap_limit - snapshot.heap_arena : 0;
+		snapshot.heap_headroom =
+			snapshot.heap_sbrk_remaining + snapshot.heap_free;
+
+		SceKernelFreeMemorySizeInfo free_info = {};
+		free_info.size = sizeof(free_info);
+		snapshot.lpddr_result = sceKernelGetFreeMemorySize(&free_info);
+		if (snapshot.lpddr_result >= 0)
+			snapshot.lpddr_free = static_cast<u32>(free_info.size_user);
+		return snapshot;
+	}
+
+	void AccumulateValidationMemory(const ValidationMemorySnapshot& memory)
+	{
+		if (!s_validation_progress.has_heap_sample)
+		{
+			s_validation_progress.sampled_minimum_heap_free = memory.heap_free;
+			s_validation_progress.sampled_minimum_heap_headroom =
+				memory.heap_headroom;
+			s_validation_progress.has_heap_sample = true;
+		}
+		s_validation_progress.sampled_peak_heap_used = std::max(
+			s_validation_progress.sampled_peak_heap_used, memory.heap_used);
+		s_validation_progress.sampled_minimum_heap_free = std::min(
+			s_validation_progress.sampled_minimum_heap_free, memory.heap_free);
+		s_validation_progress.sampled_minimum_heap_headroom = std::min(
+			s_validation_progress.sampled_minimum_heap_headroom,
+			memory.heap_headroom);
+		if (memory.lpddr_result >= 0)
+		{
+			if (!s_validation_progress.has_lpddr_sample)
+			{
+				s_validation_progress.sampled_minimum_lpddr_free =
+					memory.lpddr_free;
+				s_validation_progress.has_lpddr_sample = true;
+			}
+			s_validation_progress.sampled_minimum_lpddr_free = std::min(
+				s_validation_progress.sampled_minimum_lpddr_free,
+				memory.lpddr_free);
+		}
+	}
+
+	bool AppendValidationProgress(std::string_view line, bool first_record)
+	{
+		const SceUID fd = sceIoOpen(VALIDATION_PROGRESS_PATH,
+			SCE_O_WRONLY | SCE_O_CREAT |
+				(first_record ? SCE_O_TRUNC : SCE_O_APPEND),
+			0666);
+		if (fd < 0)
+			return false;
+
+		const bool wrote = WriteAll(fd, line.data(), line.size());
+		// Official PSP2 iofilemgr ownership: synchronize this closed-record
+		// receipt to storage so a later forced reboot can still locate the last
+		// completed guest-frame milestone.
+		const bool synced = wrote && sceIoSyncByFd(fd, 0) >= 0;
+		const bool closed = sceIoClose(fd) >= 0;
+		return wrote && synced && closed;
+	}
+
+	bool RecordValidationProgress(const char* phase, u32 frame_delta,
+		bool first_record = false)
+	{
+		const VitaA32EeProviderStats ee = VitaGetA32EeProviderStats();
+		const VitaA32EeProviderStats ee_session =
+			VitaGetA32EeSessionFallbackStats();
+		const VitaA32IopProviderStats iop = VitaGetA32IopProviderStats();
+		const VitaVU::Vu1ProviderStats vu0 = VitaVU::GetVu0ProviderStats();
+		const VitaVU::Vu1ProviderStats vu1 = VitaVU::GetVu1ProviderStats();
+		const ValidationMemorySnapshot memory = CaptureValidationMemory();
+		AccumulateValidationMemory(memory);
+
+		char text[1024];
+		const int length = std::snprintf(text, sizeof(text),
+			"v=1 seq=%u phase=%s frame=%u frame_delta=%u "
+			"ee_pc=%08x ee_cycle=%llu ee_records=%llu checkpoint_records=%llu "
+			"ee_blocks=%u ee_instructions=%u ee_interpreter=%u ee_failed=%u "
+			"iop_pc=%08x iop_entries=%llu iop_interpreter=%u iop_failed=%u "
+			"vu0_pairs=%llu vu0_interpreter=%llu vu0_failed=%u "
+			"vu1_tpc=%03x vu1_pairs=%llu vu1_interpreter=%llu vu1_failed=%u "
+			"heap_limit=%u heap_arena=%u heap_used=%u heap_free=%u "
+			"heap_chunks=%u heap_top=%u heap_sbrk_remaining=%u heap_headroom=%u "
+			"heap_sampled_peak=%u heap_sampled_min_free=%u "
+			"heap_sampled_min_headroom=%u lpddr_free=%u "
+			"lpddr_sampled_min_free=%u "
+			"lpddr_result=%08x\n",
+			s_validation_progress.next_sequence, phase, g_FrameCount, frame_delta,
+			cpuRegs.pc, static_cast<unsigned long long>(cpuRegs.cycle),
+			static_cast<unsigned long long>(Pcsx2Trace::GetEeTraceRecordsWritten()),
+			static_cast<unsigned long long>(
+				Pcsx2Trace::GetMachineCheckpointTraceRecordsWritten()),
+			ee.compiled_blocks, ee.compiled_instructions,
+			ee_session.interpreter_steps, ee_session.failed_blocks,
+			psxRegs.pc, static_cast<unsigned long long>(iop.executed_blocks),
+			iop.interpreter_blocks, iop.failed_blocks,
+			static_cast<unsigned long long>(vu0.executed_pairs),
+			static_cast<unsigned long long>(vu0.interpreter_steps),
+			vu0.compile_failures, VU1.VI[REG_TPC].UL,
+			static_cast<unsigned long long>(vu1.executed_pairs),
+			static_cast<unsigned long long>(vu1.interpreter_steps),
+			vu1.compile_failures, memory.heap_limit, memory.heap_arena,
+			memory.heap_used, memory.heap_free, memory.heap_free_chunks,
+			memory.heap_top_free, memory.heap_sbrk_remaining,
+			memory.heap_headroom,
+			s_validation_progress.sampled_peak_heap_used,
+			s_validation_progress.sampled_minimum_heap_free,
+			s_validation_progress.sampled_minimum_heap_headroom,
+			memory.lpddr_free,
+			s_validation_progress.sampled_minimum_lpddr_free,
+			static_cast<u32>(memory.lpddr_result));
+		if (length <= 0 || static_cast<size_t>(length) >= sizeof(text) ||
+			!AppendValidationProgress(
+				std::string_view(text, static_cast<size_t>(length)), first_record))
+		{
+			return false;
+		}
+
+		Console.WriteLn(
+			"VitaSX2 progress receipt %u: phase=%s frame=%u delta=%u ee=%u iop=%llu vu1_pairs=%llu heap=%u/%u headroom=%u lpddr_free=%u.",
+			s_validation_progress.next_sequence, phase, g_FrameCount, frame_delta,
+			ee.compiled_instructions,
+			static_cast<unsigned long long>(iop.executed_blocks),
+			static_cast<unsigned long long>(vu1.executed_pairs), memory.heap_used,
+			memory.heap_arena, memory.heap_headroom, memory.lpddr_free);
+		s_validation_progress.next_sequence++;
+		s_validation_progress.last_frame_delta = frame_delta;
+		return true;
+	}
+
+	void RecordValidationVSyncProgress()
+	{
+		if (!s_validation_progress.active)
+			return;
+		const u32 frame_delta =
+			static_cast<u32>(g_FrameCount - s_validation_progress.entry_frame);
+		if (frame_delta == 0 ||
+			(frame_delta % VALIDATION_PROGRESS_FRAME_INTERVAL) != 0 ||
+			frame_delta == s_validation_progress.last_frame_delta)
+		{
+			return;
+		}
+
+		if (RecordValidationProgress("frame", frame_delta))
+			return;
+
+		s_validation_progress.write_failed = true;
+		s_validation_progress.active = false;
+		Console.Error("VitaSX2 failed to synchronize its frame-progress receipt.");
+		VMManager::SetState(VMState::Stopping);
+		if (Cpu)
+			Cpu->ExitExecution();
+	}
+
+	bool StartValidationProgress()
+	{
+		s_validation_progress = {};
+		s_validation_progress.entry_frame = g_FrameCount;
+		// Truncate here rather than relying on the startup's best-effort stale-file
+		// removal. A failed truncate is terminal; a new run must never append its
+		// sequence zero to receipts from an older process.
+		if (!RecordValidationProgress("entry", 0, true))
+		{
+			s_validation_progress.write_failed = true;
+			return false;
+		}
+		s_validation_progress.active = true;
+		VitaSetVSyncProgressCallback(RecordValidationVSyncProgress);
+		return true;
+	}
+
+	void StopValidationProgress()
+	{
+		VitaSetVSyncProgressCallback(nullptr);
+		s_validation_progress.active = false;
+	}
+
+	bool SealValidationCheckpointProgress()
+	{
+		const u32 frame_delta =
+			static_cast<u32>(g_FrameCount - s_validation_progress.entry_frame);
+		if (s_validation_progress.last_frame_delta >=
+			VALIDATION_AFTER_VSYNC_FRAMES)
+		{
+			return true;
+		}
+
+		// Counters.cpp increments g_FrameCount at VSyncEnd. A VU1 completion can
+		// therefore reach the shared event-test checkpoint before the following
+		// VSyncStart callback observes delta 1280. Seal exactly that legitimate
+		// ordering here at the natural EE boundary which observed the checkpoint.
+		if (frame_delta != VALIDATION_AFTER_VSYNC_FRAMES ||
+			!RecordValidationProgress("checkpoint", frame_delta))
+		{
+			s_validation_progress.write_failed = true;
+			return false;
+		}
+		return true;
+	}
+
+	bool NativeMilestoneHasNoFallback(std::string* evidence,
 		const VitaGS::CanonicalRingValidationResult& gs_ring)
 	{
 		const VitaA32EeProviderStats ee = VitaGetA32EeProviderStats();
@@ -281,11 +555,15 @@ namespace
 		const VitaA32IopProviderStats iop = VitaGetA32IopProviderStats();
 		const VitaVU::Vu1ProviderStats vu0 = VitaVU::GetVu0ProviderStats();
 		const VitaVU::Vu1ProviderStats vu1 = VitaVU::GetVu1ProviderStats();
+		const ValidationMemorySnapshot memory = CaptureValidationMemory();
+		AccumulateValidationMemory(memory);
 
 		char text[2048];
 		const int length = std::snprintf(text, sizeof(text),
 			"status=ok\nserial=%s\nelf=%s\ncrc=%08x\nentry=%08x\n"
-			"ee_records=%llu\nee_blocks=%u\nee_instructions=%u\nee_interpreter=%u\nee_failed=%u\n"
+			"ee_records=%llu\ncheckpoint_records=%llu\nframe_count=%u\n"
+			"progress_records=%u\nprogress_frame_delta=%u\n"
+			"ee_blocks=%u\nee_instructions=%u\nee_interpreter=%u\nee_failed=%u\n"
 			"ee_session_interpreter=%u\nee_session_failed=%u\n"
 			"ee_session_scan_unsupported=%u\nee_session_scan_boundary=%u\n"
 			"ee_session_trace_branch_likely=%u\nee_session_execute_failed=%u\n"
@@ -293,6 +571,11 @@ namespace
 			"iop_entries=%llu\niop_interpreter=%u\niop_failed=%u\n"
 			"vu0_blocks=%llu\nvu0_pairs=%llu\nvu0_interpreter=%llu\nvu0_failed=%u\n"
 			"vu1_blocks=%llu\nvu1_pairs=%llu\nvu1_interpreter=%llu\nvu1_failed=%u\n"
+			"heap_limit=%u\nheap_arena=%u\nheap_used=%u\nheap_free=%u\n"
+			"heap_free_chunks=%u\nheap_top_free=%u\nheap_sbrk_remaining=%u\n"
+			"heap_headroom=%u\nheap_sampled_peak=%u\n"
+			"heap_sampled_min_free=%u\nheap_sampled_min_headroom=%u\n"
+			"lpddr_free=%u\nlpddr_sampled_min_free=%u\nlpddr_result=%08x\n"
 			"gs_ring_canonical_bytes=%u\ngs_ring_packet_qwc=%u\n"
 			"gs_ring_packet_hash=%016llx\ngs_ring_local_hash=%016llx\n"
 			"gs_ring_pixel_checks=%u\ngs_ring_address_checks=%u\n"
@@ -301,6 +584,10 @@ namespace
 			VMManager::GetDiscSerial().c_str(), VMManager::GetDiscELF().c_str(),
 			VMManager::GetDiscCRC(), VMManager::Internal::GetCurrentELFEntryPoint(),
 			static_cast<unsigned long long>(Pcsx2Trace::GetEeTraceRecordsWritten()),
+			static_cast<unsigned long long>(
+				Pcsx2Trace::GetMachineCheckpointTraceRecordsWritten()),
+			g_FrameCount, s_validation_progress.next_sequence,
+			s_validation_progress.last_frame_delta,
 			ee.compiled_blocks, ee.compiled_instructions, ee.interpreter_steps,
 			ee.failed_blocks, ee_session.interpreter_steps,
 			ee_session.failed_blocks,
@@ -317,6 +604,15 @@ namespace
 			static_cast<unsigned long long>(vu1.executed_blocks),
 			static_cast<unsigned long long>(vu1.executed_pairs),
 			static_cast<unsigned long long>(vu1.interpreter_steps), vu1.compile_failures,
+			memory.heap_limit, memory.heap_arena, memory.heap_used,
+			memory.heap_free, memory.heap_free_chunks, memory.heap_top_free,
+			memory.heap_sbrk_remaining, memory.heap_headroom,
+			s_validation_progress.sampled_peak_heap_used,
+			s_validation_progress.sampled_minimum_heap_free,
+			s_validation_progress.sampled_minimum_heap_headroom,
+			memory.lpddr_free,
+			s_validation_progress.sampled_minimum_lpddr_free,
+			static_cast<u32>(memory.lpddr_result),
 			gs_ring.canonical_bytes, gs_ring.packet_qwc,
 			static_cast<unsigned long long>(gs_ring.packet_hash),
 			static_cast<unsigned long long>(gs_ring.local_hash),
@@ -335,11 +631,20 @@ namespace
 			ee_session.scan_boundary_fallbacks == 0 &&
 			ee_session.execute_failed_fallbacks == 0 &&
 			ee_session.interpreter_path_fallbacks == 0;
-		return NativeProvidersSelected() && ee.compiled_blocks > 0 &&
+		return NativeProvidersSelected() &&
+			Pcsx2Trace::GetMachineCheckpointTraceRecordsWritten() ==
+				VALIDATION_CHECKPOINT_RECORDS &&
+			g_FrameCount == VALIDATION_EXPECTED_CAPTURE_FRAME &&
+			!s_validation_progress.write_failed &&
+			s_validation_progress.next_sequence == 11 &&
+			s_validation_progress.last_frame_delta ==
+				VALIDATION_AFTER_VSYNC_FRAMES &&
+			ee.compiled_blocks > 0 &&
 			iop.executed_blocks > 0 && ee_only_used_trace_steps &&
 			ee_session.failed_blocks == 0 && iop.interpreter_blocks == 0 &&
 			iop.failed_blocks == 0 && vu0.interpreter_steps == 0 &&
-			vu0.compile_failures == 0 && vu1.interpreter_steps == 0 &&
+			vu0.compile_failures == 0 && vu1.executed_blocks > 0 &&
+			vu1.executed_pairs > 0 && vu1.interpreter_steps == 0 &&
 			vu1.compile_failures == 0 && gs_ring.reopened_clean;
 	}
 #endif
@@ -361,6 +666,8 @@ int main()
 	bool trace_started = false;
 	bool vm_initialized = false;
 #if VITASX2_PRODUCT_BOOT_VALIDATION
+	bool entry_trace_complete = false;
+	bool checkpoint_started = false;
 	VitaGS::CanonicalRingValidationResult gs_ring_validation;
 #endif
 	const char* log_path = VITASX2_PRODUCT_BOOT_VALIDATION ?
@@ -381,12 +688,17 @@ int main()
 	if (VITASX2_PRODUCT_BOOT_VALIDATION)
 	{
 		RemoveOutput(VALIDATION_TRACE_PATH);
+		RemoveOutput(VALIDATION_CHECKPOINT_PATH);
+		RemoveOutput(VALIDATION_PROGRESS_PATH);
 		RemoveOutput(VALIDATION_DONE_PATH);
 		// This build owns an isolated pair of throwaway cards. Recreate them so
 		// the physical boot and x86 oracle begin with the same SIO2 state; normal
 		// product cards are never touched.
-		sceIoRemove(VALIDATION_CARD_1);
-		sceIoRemove(VALIDATION_CARD_2);
+		if (!RemoveValidationFileIfPresent(VALIDATION_CARD_1, &error) ||
+			!RemoveValidationFileIfPresent(VALIDATION_CARD_2, &error))
+		{
+			goto fail;
+		}
 	}
 
 	Log::SetConsoleOutputLevel(LOGLEVEL_INFO);
@@ -482,8 +794,19 @@ int main()
 		if (!Pcsx2Trace::StartEeTrace(trace, &error))
 			goto fail;
 		trace_started = true;
+
+		Pcsx2Trace::MachineCheckpointTraceConfig checkpoint;
+		checkpoint.output_path = VALIDATION_CHECKPOINT_PATH;
+		checkpoint.max_records = VALIDATION_CHECKPOINT_RECORDS;
+		checkpoint.after_vsync_frames = VALIDATION_AFTER_VSYNC_FRAMES;
+		checkpoint.wait_for_elf_entry = true;
+		if (!Pcsx2Trace::StartMachineCheckpointTrace(checkpoint, &error))
+			goto fail;
+		checkpoint_started = true;
 		// The ELF-entry owner installs the callback and exact stream handling,
 		// leaving the complete BIOS/EELOAD prefix on the normal callable native path.
+		// Once that bounded stream fills, the host removes the callback and the
+		// same VM continues through the production persistent/direct-linked path.
 #endif
 	}
 
@@ -494,8 +817,50 @@ int main()
 		if (state == VMState::Running)
 		{
 			VMManager::Execute();
-			if (VITASX2_PRODUCT_BOOT_VALIDATION && Pcsx2Trace::DidEeTraceHitLimit())
+#if VITASX2_PRODUCT_BOOT_VALIDATION
+			if (!entry_trace_complete && Pcsx2Trace::DidEeTraceHitLimit())
+			{
+				VitaSetEePreInstructionTraceCallback(nullptr);
+				VitaSetEeExactTraceStreams(false);
+				Pcsx2Trace::StopEeTrace();
+				trace_started = false;
+				if (Pcsx2Trace::GetEeTraceRecordsWritten() != VALIDATION_EE_RECORDS ||
+					!Pcsx2Trace::GetEeTraceError().empty() ||
+					!VMManager::Internal::HasBootedELF())
+				{
+					Error::SetStringFmt(&error,
+						"Boot trace failed (records={}, booted={}, error='{}').",
+						Pcsx2Trace::GetEeTraceRecordsWritten(),
+						VMManager::Internal::HasBootedELF(),
+						Pcsx2Trace::GetEeTraceError());
+					goto fail;
+				}
+				entry_trace_complete = true;
+				if (!StartValidationProgress())
+				{
+					Error::SetString(&error,
+						"Failed to publish the synchronized entry progress receipt.");
+					goto fail;
+				}
+				VitaSetA32EeTraceLimitStopCondition(
+					VitaA32EeTraceLimitStopCondition::MachineCheckpointTrace);
+				Console.WriteLn(
+					"VitaSX2 exact entry gate passed; continuing to the later GS/VU milestone.");
+				continue;
+			}
+			if (entry_trace_complete &&
+				Pcsx2Trace::DidMachineCheckpointTraceHitLimit())
+			{
+				if (!SealValidationCheckpointProgress())
+				{
+					Error::SetString(&error,
+						"Failed to seal the synchronized checkpoint progress receipt.");
+					goto fail;
+				}
+				StopValidationProgress();
 				VMManager::SetState(VMState::Stopping);
+			}
+#endif
 			continue;
 		}
 		if (state == VMState::Paused)
@@ -507,17 +872,9 @@ int main()
 		break;
 	}
 
-	if (!VITASX2_PRODUCT_BOOT_VALIDATION)
-	{
-		Error::SetString(&error, "The VitaSX2 execution loop stopped unexpectedly.");
-		goto fail;
-	}
-
-	VitaSetEePreInstructionTraceCallback(nullptr);
-	VitaSetEeExactTraceStreams(false);
-	Pcsx2Trace::StopEeTrace();
-	trace_started = false;
-	if (!Pcsx2Trace::DidEeTraceHitLimit() ||
+#if VITASX2_PRODUCT_BOOT_VALIDATION
+	StopValidationProgress();
+	if (!entry_trace_complete || !Pcsx2Trace::DidEeTraceHitLimit() ||
 		Pcsx2Trace::GetEeTraceRecordsWritten() != VALIDATION_EE_RECORDS ||
 		!Pcsx2Trace::GetEeTraceError().empty() ||
 		!VMManager::Internal::HasBootedELF())
@@ -528,16 +885,37 @@ int main()
 			VMManager::Internal::HasBootedELF(), Pcsx2Trace::GetEeTraceError());
 		goto fail;
 	}
+	if (s_validation_progress.write_failed)
+	{
+		Error::SetString(&error,
+			"The synchronized frame-progress receipt failed during execution.");
+		goto fail;
+	}
+	if (!Pcsx2Trace::DidMachineCheckpointTraceHitLimit() ||
+		Pcsx2Trace::GetMachineCheckpointTraceRecordsWritten() !=
+			VALIDATION_CHECKPOINT_RECORDS ||
+		!Pcsx2Trace::GetMachineCheckpointTraceError().empty())
+	{
+		Error::SetStringFmt(&error,
+			"Later milestone failed (records={}, hit_limit={}, error='{}').",
+			Pcsx2Trace::GetMachineCheckpointTraceRecordsWritten(),
+			Pcsx2Trace::DidMachineCheckpointTraceHitLimit(),
+			Pcsx2Trace::GetMachineCheckpointTraceError());
+		goto fail;
+	}
+	VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition::None);
+	Pcsx2Trace::StopMachineCheckpointTrace();
+	checkpoint_started = false;
 
 	{
-#if VITASX2_PRODUCT_BOOT_VALIDATION
 		std::string evidence;
-		if (!NativeSuffixHasNoFallback(&evidence, gs_ring_validation))
+		if (!NativeMilestoneHasNoFallback(&evidence, gs_ring_validation))
 		{
-			Error::SetString(&error, "The all-native ELF-entry suffix used a fallback.");
+			Error::SetString(&error,
+				"The all-native reset-to-later milestone used a fallback or missed its workload.");
 			goto fail;
 		}
-		Console.WriteLn("VitaSX2 all-native reset-to-entry validation passed.");
+		Console.WriteLn("VitaSX2 all-native reset-to-later SOTC milestone passed.");
 		VMManager::Shutdown(false);
 		vm_initialized = false;
 		VMManager::Internal::CPUThreadShutdown();
@@ -548,18 +926,23 @@ int main()
 			Error::SetString(&error, "Failed to publish sealed validation evidence.");
 			goto fail;
 		}
-#else
-		Error::SetString(&error,
-			"The non-validation VitaSX2 execution loop stopped unexpectedly.");
-		goto fail;
-#endif
 	}
+#else
+	Error::SetString(&error, "The VitaSX2 execution loop stopped unexpectedly.");
+	goto fail;
+#endif
 
 	return ExitProduct(0);
 
 fail:
 	VitaSetEePreInstructionTraceCallback(nullptr);
 	VitaSetEeExactTraceStreams(false);
+#if VITASX2_PRODUCT_BOOT_VALIDATION
+	StopValidationProgress();
+	VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition::None);
+	if (checkpoint_started)
+		Pcsx2Trace::StopMachineCheckpointTrace();
+#endif
 	if (trace_started)
 		Pcsx2Trace::StopEeTrace();
 	if (vm_initialized || VMManager::GetState() != VMState::Shutdown)

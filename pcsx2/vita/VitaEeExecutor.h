@@ -121,6 +121,8 @@ namespace VitaEE
 		// separate concern below; imposing a smaller discovery ceiling changes
 		// fixed-point cycle rounding and therefore Count/event timing.
 		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 1025;
+		static_assert(MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ==
+			BlockCompiler::MAX_COMPILE_INSTRUCTIONS);
 		// EE source ownership is tracked at the same 4 KiB granularity as the
 		// vTLB and PCSX2's mmap code-page protection. Records and reference
 		// counts cover retail EE RAM only. Generated direct-store guards can see
@@ -218,6 +220,7 @@ namespace VitaEE
 
 		struct CachedBlock
 		{
+			CachedBlock* next_free = nullptr;
 			VitaA32::CodeBuffer code;
 			// Match recRAMCopy without charging every cached block for a worst-case
 			// page-sized inline array. The nothrow allocation is released with the
@@ -380,7 +383,7 @@ namespace VitaEE
 #endif
 
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
-		std::vector<CachedBlock*> m_free_cache_entries;
+		CachedBlock* m_free_cache_head = nullptr;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT>

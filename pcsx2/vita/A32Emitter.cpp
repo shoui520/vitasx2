@@ -4,12 +4,12 @@
 #include "pcsx2/vita/A32Emitter.h"
 
 #include "common/Assertions.h"
+#include "common/Vita/VitaJitMemory.h"
 #if defined(VITASX2_QEMU_VALIDATION)
 #include <sys/mman.h>
 #include <unistd.h>
 #else
 #include "common/HostSys.h"
-#include "common/Vita/VitaJitMemory.h"
 #endif
 
 #include <algorithm>
@@ -2263,17 +2263,12 @@ namespace VitaA32
 		if (m_dirty_begin == m_dirty_end)
 			return CloseWriteDomain();
 
-#if defined(VITASX2_QEMU_VALIDATION)
-		__builtin___clear_cache(reinterpret_cast<char*>(m_base + m_dirty_begin),
-			reinterpret_cast<char*>(m_base + m_dirty_end));
-#else
 		if (!m_write_domain_open)
 			return false;
 		m_write_domain_open = false;
 		if (!VitaVM::EndJitWriteAndSync(
-				m_base + m_dirty_begin, m_dirty_end - m_dirty_begin))
+			m_base + m_dirty_begin, m_dirty_end - m_dirty_begin))
 			return false;
-#endif
 		m_dirty_begin = 0;
 		m_dirty_end = 0;
 		return true;
@@ -2281,26 +2276,18 @@ namespace VitaA32
 
 	bool CodeBuffer::EnsureWritable()
 	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		return true;
-#else
 		if (m_write_domain_open)
 			return true;
 		m_write_domain_open = VitaVM::BeginJitWrite();
 		return m_write_domain_open;
-#endif
 	}
 
 	bool CodeBuffer::CloseWriteDomain()
 	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		return true;
-#else
 		if (!m_write_domain_open)
 			return true;
 		m_write_domain_open = false;
 		return VitaVM::EndJitWrite();
-#endif
 	}
 
 	void CodeBuffer::MarkDirty(size_t offset, size_t size)

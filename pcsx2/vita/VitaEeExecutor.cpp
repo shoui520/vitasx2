@@ -136,10 +136,13 @@ namespace VitaEE
 {
 	BlockExecutor::BlockExecutor()
 	{
-		m_cache.reserve(INITIAL_CACHE_CAPACITY);
-		m_free_cache_entries.reserve(INITIAL_CACHE_CAPACITY);
-		m_block_records.reserve(INITIAL_CACHE_CAPACITY);
-		m_incoming_links.reserve(INITIAL_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT);
+		// These bounds are already enforced by AllocateCacheEntry() and
+		// RegisterIncomingLink(). Reserve the complete process-lifetime metadata
+		// topology before guest execution so ordinary cold compilation never grows
+		// these vectors from a fragmented game-time heap.
+		m_cache.reserve(MAX_CACHE_CAPACITY);
+		m_block_records.reserve(MAX_CACHE_CAPACITY);
+		m_incoming_links.reserve(MAX_INCOMING_LINKS);
 	}
 
 	BlockExecutor::~BlockExecutor()
@@ -586,18 +589,19 @@ namespace VitaEE
 			return;
 
 		block.queued_free = true;
-		m_free_cache_entries.push_back(&block);
+		block.next_free = m_free_cache_head;
+		m_free_cache_head = &block;
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::TakeFreeCacheEntry()
 	{
-		while (!m_free_cache_entries.empty())
+		while (m_free_cache_head)
 		{
-			CachedBlock* block = m_free_cache_entries.back();
-			m_free_cache_entries.pop_back();
-			if (block)
-				block->queued_free = false;
-			if (block && !block->valid)
+			CachedBlock* block = m_free_cache_head;
+			m_free_cache_head = block->next_free;
+			block->next_free = nullptr;
+			block->queued_free = false;
+			if (!block->valid)
 				return block;
 		}
 
@@ -745,7 +749,7 @@ namespace VitaEE
 	u32 BlockExecutor::Reset()
 	{
 		u32 invalidated = 0;
-		m_free_cache_entries.clear();
+		m_free_cache_head = nullptr;
 		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
 		{
 			CachedBlock& block = *entry;
@@ -755,6 +759,7 @@ namespace VitaEE
 			block.code.Release();
 			block.valid = false;
 			block.queued_free = false;
+			block.next_free = nullptr;
 			block.source_instruction_count = 0;
 			block.dependency_start_pc = 0;
 			block.dependency_instruction_count = 0;

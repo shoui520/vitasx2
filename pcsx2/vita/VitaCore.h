@@ -179,7 +179,8 @@ void VitaRequestA32EeCacheReset();
 // directly through an eeMem->Main host pointer. Returns the number of cached
 // translations retired by the write.
 u32 VitaNotifyA32EeRamWrite(const void* host_address, u32 size);
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 enum class VitaA32EeTraceLimitStopCondition : u32
 {
 	None = 0,
@@ -190,6 +191,15 @@ enum class VitaA32EeTraceLimitStopCondition : u32
 // Stop an uninstrumented persistent EE chain only after its current natural
 // block boundary observes the selected bounded cross-core trace limit.
 void VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition condition);
+#endif
+
+#if defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+using VitaVSyncProgressCallback = void (*)();
+
+// Observe PCSX2's CPU-thread VSync seam without moving device/event work out of
+// its owner. The product validation uses this only for sparse durable progress
+// receipts; normal Vita builds carry no callback branch.
+void VitaSetVSyncProgressCallback(VitaVSyncProgressCallback callback);
 #endif
 
 #if defined(VITASX2_QEMU_VALIDATION) || \

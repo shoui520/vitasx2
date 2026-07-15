@@ -2671,15 +2671,57 @@ namespace VitaEE
 		s_raw_gpr0_known_zero = (cpuRegs.GPR.r[0].UD[0] == 0 && cpuRegs.GPR.r[0].UD[1] == 0) ? 1u : 0u;
 	}
 
+	BlockCompiler::CompileScratch& BlockCompiler::DefaultCompileScratch()
+	{
+		// EE cold compilation is serialized by the provider. Keep its bounded
+		// analysis/tail workspace at process lifetime instead of placing it on the
+		// Vita main stack or growing the progressively fragmented general heap.
+		static CompileScratch scratch;
+		return scratch;
+	}
+
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code,
 		const u8* ram_source_page_live_flags,
 		void* ram_write_invalidation_context,
 		RamWriteInvalidationCallback ram_write_invalidation_callback)
+		: BlockCompiler(code, DefaultCompileScratch(), ram_source_page_live_flags,
+			ram_write_invalidation_context, ram_write_invalidation_callback, true)
+	{
+	}
+
+	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code,
+		CompileScratch& compile_scratch, const u8* ram_source_page_live_flags,
+		void* ram_write_invalidation_context,
+		RamWriteInvalidationCallback ram_write_invalidation_callback,
+		bool reset_compile_scratch)
 		: m_code(code)
+		, m_compile_scratch(compile_scratch)
 		, m_ram_source_page_live_flags(ram_source_page_live_flags)
 		, m_ram_write_invalidation_context(ram_write_invalidation_context)
 		, m_ram_write_invalidation_callback(ram_write_invalidation_callback)
+		, m_scalar_load_cold_tails(compile_scratch.scalar_load_cold_tails)
+		, m_scalar_store_cold_tails(compile_scratch.scalar_store_cold_tails)
+		, m_qword_load_cold_tails(compile_scratch.qword_load_cold_tails)
+		, m_qword_store_cold_tails(compile_scratch.qword_store_cold_tails)
+		, m_cop1_word_memory_cold_tails(compile_scratch.cop1_word_memory_cold_tails)
+		, m_cop2_qword_memory_cold_tails(compile_scratch.cop2_qword_memory_cold_tails)
+		, m_vu0_sync_cold_tails(compile_scratch.vu0_sync_cold_tails)
+		, m_partial_memory_cold_tails(compile_scratch.partial_memory_cold_tails)
+		, m_ram_store_invalidation_cold_tails(
+			compile_scratch.ram_store_invalidation_cold_tails)
 	{
+		if (reset_compile_scratch)
+		{
+			m_scalar_load_cold_tails.clear();
+			m_scalar_store_cold_tails.clear();
+			m_qword_load_cold_tails.clear();
+			m_qword_store_cold_tails.clear();
+			m_cop1_word_memory_cold_tails.clear();
+			m_cop2_qword_memory_cold_tails.clear();
+			m_vu0_sync_cold_tails.clear();
+			m_partial_memory_cold_tails.clear();
+			m_ram_store_invalidation_cold_tails.clear();
+		}
 		m_branch_flag_host = HOST_BRANCH_FLAG;
 		// Keep the allocator's dense logical q0-q7 domain while placing its upper
 		// bank in AAPCS caller-clobbered d24-d31. Physical q8-q11 remain available
@@ -3245,7 +3287,11 @@ namespace VitaEE
 		// analysis. The default CodeBuffer owns no executable allocation; it is
 		// only the required construction context for this compile-time state walk.
 		VitaA32::CodeBuffer analysis_code;
-		BlockCompiler analysis(analysis_code);
+		// This compiler is an analysis-only view used while the owning compiler may
+		// already have queued cold tails. It does not emit or stage qcache state, so
+		// share the process-lifetime workspace without clearing the active contents.
+		BlockCompiler analysis(analysis_code, DefaultCompileScratch(), nullptr,
+			nullptr, nullptr, false);
 		analysis.ClearGprConstState();
 		for (u32 i = 0; i < instruction_index; i++)
 		{
@@ -8096,7 +8142,7 @@ namespace VitaEE
 		constexpr unsigned MAX_STAGED_GPR_QCACHE_ENTRY_LOADS = 4;
 
 		m_staged_gpr_q_cache_count = 0;
-		m_gpr_q_cache_next_use_distances.clear();
+		m_gpr_q_cache_next_use_distance_count = 0;
 		if (!m_gpr_q_cache_enabled)
 			return;
 
@@ -8105,8 +8151,10 @@ namespace VitaEE
 		// the resident value whose next 128-bit read is farthest away without
 		// repeatedly rescanning the remainder of the block.
 		constexpr u16 NO_NEXT_QWORD_USE = UINT16_MAX;
-		m_gpr_q_cache_next_use_distances.resize(
-			static_cast<size_t>(instruction_count) * 32, NO_NEXT_QWORD_USE);
+		const size_t distance_count = static_cast<size_t>(instruction_count) * 32;
+		std::fill_n(m_compile_scratch.gpr_q_cache_next_use_distances.begin(),
+			distance_count, NO_NEXT_QWORD_USE);
+		m_gpr_q_cache_next_use_distance_count = distance_count;
 		u32 next_read_index[32];
 		for (u32& index : next_read_index)
 			index = UINT32_MAX;
@@ -8116,7 +8164,8 @@ namespace VitaEE
 			{
 				if (next_read_index[reg] != UINT32_MAX)
 				{
-					m_gpr_q_cache_next_use_distances[static_cast<size_t>(i) * 32 + reg] =
+					m_compile_scratch.gpr_q_cache_next_use_distances[
+						static_cast<size_t>(i) * 32 + reg] =
 						static_cast<u16>(std::min<u32>(next_read_index[reg] - i,
 							NO_NEXT_QWORD_USE - 1));
 				}
@@ -9299,14 +9348,14 @@ namespace VitaEE
 	u32 BlockCompiler::GprQCacheGuestNextQwordReadDistanceBeforeWrite(unsigned guest_reg) const
 	{
 		if (!m_gpr_q_cache_enabled || guest_reg == 0 ||
-			m_gpr_q_cache_next_use_distances.size() !=
+			m_gpr_q_cache_next_use_distance_count !=
 				static_cast<size_t>(m_current_block_instruction_count) * 32 ||
 			m_current_instruction_index >= m_current_block_instruction_count)
 		{
 			return UINT32_MAX;
 		}
 
-		const u16 distance = m_gpr_q_cache_next_use_distances[
+		const u16 distance = m_compile_scratch.gpr_q_cache_next_use_distances[
 			static_cast<size_t>(m_current_instruction_index) * 32 + guest_reg];
 		return distance == UINT16_MAX ? UINT32_MAX : distance;
 	}
@@ -10354,7 +10403,8 @@ namespace VitaEE
 	{
 		if (scheduler_test_elided_continuation_emitted)
 			*scheduler_test_elided_continuation_emitted = false;
-		if (instruction_count == 0 || instruction_count > ((UINT32_MAX - start_pc) / 4))
+		if (instruction_count == 0 || instruction_count > MAX_COMPILE_INSTRUCTIONS ||
+			instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return false;
 		if (direct_continuation_kind == DirectContinuationKind::Pcsx2ShortSplit &&
 			instruction_count > 6)
@@ -26105,13 +26155,12 @@ namespace VitaEE
 			return false;
 		}
 
-		m_qword_load_cold_tails.push_back({
+		return m_qword_load_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
 			rt,
 			dirty_pins,
 		});
-		return true;
 	}
 
 	bool BlockCompiler::EmitLWC1(u32 op)
@@ -26149,7 +26198,7 @@ namespace VitaEE
 			return false;
 		}
 
-		m_cop1_word_memory_cold_tails.push_back({
+		return m_cop1_word_memory_cold_tails.push_back({
 			unaligned_fallback,
 			handler_fallback,
 			m_code.Size(),
@@ -26157,7 +26206,6 @@ namespace VitaEE
 			false,
 			dirty_pins,
 		});
-		return true;
 	}
 
 	bool BlockCompiler::EmitLQC2(u32 op)
@@ -26198,13 +26246,12 @@ namespace VitaEE
 			if (!emit_zero_load_skip_counter())
 				return false;
 
-			m_cop2_qword_memory_cold_tails.push_back({
+			return m_cop2_qword_memory_cold_tails.push_back({
 				handler_fallback,
 				m_code.Size(),
 				rt,
 				false,
 			});
-			return true;
 		}
 
 		if (!m_code.EmitVld1Q32(NEON_VALUE, HOST_TMP0))
@@ -26217,13 +26264,12 @@ namespace VitaEE
 			return false;
 		}
 
-		m_cop2_qword_memory_cold_tails.push_back({
+		return m_cop2_qword_memory_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
 			rt,
 			false,
 		});
-		return true;
 	}
 
 	bool BlockCompiler::EmitSB(u32 op)
@@ -26281,7 +26327,8 @@ namespace VitaEE
 			tail.address_reg = write_pointer.host;
 			tail.dirty_pins = m_compatible_vtlb_write_pointer_dirty_pins;
 			CaptureScalarStoreValue(&tail);
-			m_scalar_store_cold_tails.push_back(tail);
+			if (!m_scalar_store_cold_tails.push_back(tail))
+				return false;
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuCompatibleVtlbWritePointerPostIncrementStores++;
 #endif
@@ -26336,8 +26383,7 @@ namespace VitaEE
 		};
 		tail.dirty_pins = dirty_pins;
 		CaptureScalarStoreValue(&tail);
-		m_scalar_store_cold_tails.push_back(tail);
-		return true;
+		return m_scalar_store_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitSH(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
@@ -26403,8 +26449,7 @@ namespace VitaEE
 		};
 		tail.dirty_pins = dirty_pins;
 		CaptureScalarStoreValue(&tail);
-		m_scalar_store_cold_tails.push_back(tail);
-		return true;
+		return m_scalar_store_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitSW(u32 op, u32 pc, u32 raw_cycles_through_instruction, const void* event_exit)
@@ -26471,8 +26516,7 @@ namespace VitaEE
 		};
 		tail.dirty_pins = dirty_pins;
 		CaptureScalarStoreValue(&tail);
-		m_scalar_store_cold_tails.push_back(tail);
-		return true;
+		return m_scalar_store_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitSWL(u32 op)
@@ -26560,8 +26604,7 @@ namespace VitaEE
 		};
 		tail.dirty_pins = dirty_pins;
 		CaptureScalarStoreValue(&tail);
-		m_scalar_store_cold_tails.push_back(tail);
-		return true;
+		return m_scalar_store_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitSDL(u32 op)
@@ -26688,7 +26731,7 @@ namespace VitaEE
 			else
 				g_qemuCompatibleVtlbWritePointerPostIncrementStores++;
 #endif
-			m_qword_store_cold_tails.push_back({
+			return m_qword_store_cold_tails.push_back({
 				resident_qword_pointer ? m_resident_vtlb_qword_handler_fallback :
 					m_compatible_vtlb_write_pointer_handler_fallback,
 				m_code.Size(),
@@ -26696,7 +26739,6 @@ namespace VitaEE
 				resident_qword_pointer ? m_resident_vtlb_qword_dirty_pins :
 					m_compatible_vtlb_write_pointer_dirty_pins,
 			});
-			return true;
 		}
 
 		u32 known_address = 0;
@@ -26727,13 +26769,12 @@ namespace VitaEE
 			!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u128)))
 			return false;
 
-		m_qword_store_cold_tails.push_back({
+		return m_qword_store_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
 			rt,
 			dirty_pins,
 		});
-		return true;
 	}
 
 	bool BlockCompiler::EmitSWC1(u32 op)
@@ -26773,7 +26814,7 @@ namespace VitaEE
 			return false;
 		}
 
-		m_cop1_word_memory_cold_tails.push_back({
+		return m_cop1_word_memory_cold_tails.push_back({
 			unaligned_fallback,
 			handler_fallback,
 			m_code.Size(),
@@ -26781,7 +26822,6 @@ namespace VitaEE
 			true,
 			dirty_pins,
 		});
-		return true;
 	}
 
 	bool BlockCompiler::EmitSQC2(u32 op)
@@ -26825,13 +26865,12 @@ namespace VitaEE
 			return false;
 		}
 
-		m_cop2_qword_memory_cold_tails.push_back({
+		return m_cop2_qword_memory_cold_tails.push_back({
 			handler_fallback,
 			m_code.Size(),
 			rt,
 			true,
 		});
-		return true;
 	}
 
 	bool BlockCompiler::EmitDSLLV(u32 op)
@@ -29470,8 +29509,7 @@ namespace VitaEE
 				rt,
 			};
 			tail.dirty_pins = dirty_pins;
-			m_partial_memory_cold_tails.push_back(tail);
-			return true;
+			return m_partial_memory_cold_tails.push_back(tail);
 		}
 
 		size_t full_lane_branch = static_cast<size_t>(-1);
@@ -29546,8 +29584,7 @@ namespace VitaEE
 			rt,
 		};
 		tail.dirty_pins = dirty_pins;
-		m_partial_memory_cold_tails.push_back(tail);
-		return true;
+		return m_partial_memory_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitPartialWordStore(u32 op, bool left)
@@ -29677,8 +29714,7 @@ namespace VitaEE
 		};
 		tail.dirty_pins = dirty_pins;
 		CapturePartialStoreValue(&tail);
-		m_partial_memory_cold_tails.push_back(tail);
-		return true;
+		return m_partial_memory_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitPartialDwordLoad(u32 op, bool left)
@@ -29982,8 +30018,7 @@ namespace VitaEE
 				rt,
 			};
 			tail.dirty_pins = dirty_pins;
-			m_partial_memory_cold_tails.push_back(tail);
-			return true;
+			return m_partial_memory_cold_tails.push_back(tail);
 		}
 
 		if (register_merge)
@@ -30017,8 +30052,7 @@ namespace VitaEE
 				rt,
 			};
 			tail.dirty_pins = dirty_pins;
-			m_partial_memory_cold_tails.push_back(tail);
-			return true;
+			return m_partial_memory_cold_tails.push_back(tail);
 		}
 
 		const auto emit_byte = [this, rt](unsigned memory_byte, unsigned dest_byte) {
@@ -30108,8 +30142,7 @@ namespace VitaEE
 			rt,
 		};
 		tail.dirty_pins = dirty_pins;
-		m_partial_memory_cold_tails.push_back(tail);
-		return true;
+		return m_partial_memory_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitPartialDwordStore(u32 op, bool left)
@@ -30266,8 +30299,7 @@ namespace VitaEE
 		};
 		tail.dirty_pins = dirty_pins;
 		CapturePartialStoreValue(&tail);
-		m_partial_memory_cold_tails.push_back(tail);
-		return true;
+		return m_partial_memory_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitLoadWithCounterReadEvent(u32 op, u32 pc, u32 raw_cycles_through_instruction,
@@ -30352,7 +30384,7 @@ namespace VitaEE
 				return false;
 			}
 
-			m_scalar_load_cold_tails.push_back({
+			if (!m_scalar_load_cold_tails.push_back({
 				static_cast<size_t>(-1),
 				m_compatible_vtlb_pointer_handler_fallback,
 				m_code.Size(),
@@ -30367,7 +30399,10 @@ namespace VitaEE
 				counter_read_event,
 				GprLinkSignature::VTLB_POINTER_HOST,
 				m_compatible_vtlb_pointer_dirty_pins,
-			});
+			}))
+			{
+				return false;
+			}
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuCompatibleVtlbPointerPostIncrementLoads++;
 #endif
@@ -30402,8 +30437,10 @@ namespace VitaEE
 				GprLinkSignature::VTLB_POINTER_HOST,
 				m_compatible_vtlb_pointer_dirty_pins,
 			};
-			m_compatible_vtlb_byte_pair_tail_index = m_scalar_load_cold_tails.size();
-			m_scalar_load_cold_tails.push_back(tail);
+			const size_t tail_index = m_scalar_load_cold_tails.size();
+			if (!m_scalar_load_cold_tails.push_back(tail))
+				return false;
+			m_compatible_vtlb_byte_pair_tail_index = tail_index;
 			return true;
 		}
 		if (m_compatible_vtlb_pointer_access &&
@@ -30446,7 +30483,7 @@ namespace VitaEE
 #if defined(VITASX2_QEMU_VALIDATION)
 			g_qemuCompatibleVtlbPointerPostIncrementLoads++;
 #endif
-			m_scalar_load_cold_tails.push_back({
+			return m_scalar_load_cold_tails.push_back({
 				m_compatible_vtlb_pointer_unaligned_fallback,
 				m_compatible_vtlb_pointer_handler_fallback,
 				m_code.Size(),
@@ -30462,7 +30499,6 @@ namespace VitaEE
 				GprLinkSignature::VTLB_POINTER_HOST,
 				m_compatible_vtlb_pointer_dirty_pins,
 			});
-			return true;
 		}
 
 		u32 known_address = 0;
@@ -30499,7 +30535,7 @@ namespace VitaEE
 			if (!emit_zero_load_skip_counter())
 				return false;
 
-			m_scalar_load_cold_tails.push_back({
+			return m_scalar_load_cold_tails.push_back({
 				unaligned_fallback,
 				handler_fallback,
 				m_code.Size(),
@@ -30515,13 +30551,12 @@ namespace VitaEE
 				address_reg,
 				dirty_pins,
 			});
-			return true;
 		}
 
 		if (!emit_load_from_host() || !emit_store_result())
 			return false;
 
-		m_scalar_load_cold_tails.push_back({
+		return m_scalar_load_cold_tails.push_back({
 			unaligned_fallback,
 			handler_fallback,
 			m_code.Size(),
@@ -30537,7 +30572,6 @@ namespace VitaEE
 			address_reg,
 			dirty_pins,
 		});
-		return true;
 	}
 
 	bool BlockCompiler::EmitCounterReadFlagFromAddress(unsigned host_reg)
@@ -30619,58 +30653,57 @@ namespace VitaEE
 
 	bool BlockCompiler::FlushColdTails()
 	{
-		for (const ScalarLoadColdTail& tail : m_scalar_load_cold_tails)
+		for (size_t i = 0; i < m_scalar_load_cold_tails.size(); i++)
 		{
-			if (!EmitScalarLoadColdTail(tail))
+			if (!EmitScalarLoadColdTail(m_scalar_load_cold_tails[i]))
 				return false;
 		}
 
-		for (const ScalarStoreColdTail& tail : m_scalar_store_cold_tails)
+		for (size_t i = 0; i < m_scalar_store_cold_tails.size(); i++)
 		{
-			if (!EmitScalarStoreColdTail(tail))
+			if (!EmitScalarStoreColdTail(m_scalar_store_cold_tails[i]))
 				return false;
 		}
 
-		for (const QwordLoadColdTail& tail : m_qword_load_cold_tails)
+		for (size_t i = 0; i < m_qword_load_cold_tails.size(); i++)
 		{
-			if (!EmitQwordLoadColdTail(tail))
+			if (!EmitQwordLoadColdTail(m_qword_load_cold_tails[i]))
 				return false;
 		}
 
-		for (const QwordStoreColdTail& tail : m_qword_store_cold_tails)
+		for (size_t i = 0; i < m_qword_store_cold_tails.size(); i++)
 		{
-			if (!EmitQwordStoreColdTail(tail))
+			if (!EmitQwordStoreColdTail(m_qword_store_cold_tails[i]))
 				return false;
 		}
 
-		for (const Cop1WordMemoryColdTail& tail : m_cop1_word_memory_cold_tails)
+		for (size_t i = 0; i < m_cop1_word_memory_cold_tails.size(); i++)
 		{
-			if (!EmitCop1WordMemoryColdTail(tail))
+			if (!EmitCop1WordMemoryColdTail(m_cop1_word_memory_cold_tails[i]))
 				return false;
 		}
 
-		for (const Cop2QwordMemoryColdTail& tail : m_cop2_qword_memory_cold_tails)
+		for (size_t i = 0; i < m_cop2_qword_memory_cold_tails.size(); i++)
 		{
-			if (!EmitCop2QwordMemoryColdTail(tail))
+			if (!EmitCop2QwordMemoryColdTail(m_cop2_qword_memory_cold_tails[i]))
 				return false;
 		}
 
-		for (const Vu0SyncColdTail& tail : m_vu0_sync_cold_tails)
+		for (size_t i = 0; i < m_vu0_sync_cold_tails.size(); i++)
 		{
-			if (!EmitVu0SyncColdTail(tail))
+			if (!EmitVu0SyncColdTail(m_vu0_sync_cold_tails[i]))
 				return false;
 		}
 
-		for (const PartialMemoryColdTail& tail : m_partial_memory_cold_tails)
+		for (size_t i = 0; i < m_partial_memory_cold_tails.size(); i++)
 		{
-			if (!EmitPartialMemoryColdTail(tail))
+			if (!EmitPartialMemoryColdTail(m_partial_memory_cold_tails[i]))
 				return false;
 		}
 
-		for (const RamStoreInvalidationColdTail& tail :
-			m_ram_store_invalidation_cold_tails)
+		for (size_t i = 0; i < m_ram_store_invalidation_cold_tails.size(); i++)
 		{
-			if (!EmitRamStoreInvalidationColdTail(tail))
+			if (!EmitRamStoreInvalidationColdTail(m_ram_store_invalidation_cold_tails[i]))
 				return false;
 		}
 
@@ -30810,13 +30843,12 @@ namespace VitaEE
 		{
 			return false;
 		}
-		m_ram_store_invalidation_cold_tails.push_back({
+		return m_ram_store_invalidation_cold_tails.push_back({
 			live_source,
 			secondary_live_source,
 			join_offset,
 			size,
 		});
-		return true;
 	}
 
 	bool BlockCompiler::EmitRamStoreInvalidationColdTail(
@@ -32088,13 +32120,12 @@ namespace VitaEE
 		if (vu0_running == static_cast<size_t>(-1))
 			return false;
 
-		m_vu0_sync_cold_tails.push_back({
+		return m_vu0_sync_cold_tails.push_back({
 			vu0_running,
 			m_code.Size(),
 			preserve_reg,
 			save_reg,
 		});
-		return true;
 	}
 
 	bool BlockCompiler::EmitVu0RegisterAddress(unsigned host_reg, size_t offset)

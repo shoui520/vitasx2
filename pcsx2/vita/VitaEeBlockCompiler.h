@@ -5,8 +5,11 @@
 
 #include "common/Pcsx2Defs.h"
 
+#include <array>
 #include <cstddef>
-#include <vector>
+#include <cstring>
+#include <new>
+#include <type_traits>
 
 namespace VitaA32
 {
@@ -17,6 +20,57 @@ namespace VitaA32
 
 namespace VitaEE
 {
+	template <typename T, size_t Capacity>
+	class FixedCompileBuffer
+	{
+		static_assert(Capacity != 0);
+		static_assert(std::is_trivially_copyable_v<T>);
+		static_assert(std::is_trivially_destructible_v<T>);
+
+	public:
+		bool push_back(const T& value)
+		{
+			if (m_size >= Capacity)
+				return false;
+
+			// memcpy starts the lifetime of these implicit-lifetime records without
+			// default-constructing every unused slot. Several tail records deliberately
+			// default sentinel fields to SIZE_MAX; constructing all N/2N slots would
+			// turn this process-lifetime workspace into more than 256 KiB of packaged
+			// initialized data instead of zero-fill storage.
+			std::memcpy(m_storage[m_size].bytes, &value, sizeof(T));
+			m_size++;
+			return true;
+		}
+
+		void clear() { m_size = 0; }
+		size_t size() const { return m_size; }
+		T& operator[](size_t index)
+		{
+			return *std::launder(reinterpret_cast<T*>(m_storage[index].bytes));
+		}
+		const T& operator[](size_t index) const
+		{
+			return *std::launder(reinterpret_cast<const T*>(m_storage[index].bytes));
+		}
+
+	private:
+		struct Slot
+		{
+			alignas(T) std::byte bytes[sizeof(T)];
+		};
+		static_assert(sizeof(Slot) == sizeof(T));
+
+		// Slot pointer arithmetic stays within a real Slot array. Each indexed
+		// access then launders the T object whose lifetime push_back() started in
+		// that slot, rather than pretending the independently created records form
+		// a T array.
+		Slot m_storage[Capacity];
+		size_t m_size = 0;
+	};
+
+	class BlockExecutor;
+
 	enum class DirectContinuationKind : u8
 	{
 		SchedulerTestedTail,
@@ -336,6 +390,9 @@ namespace VitaEE
 
 	class BlockCompiler
 	{
+		struct CompileScratch;
+		friend class BlockExecutor;
+
 		enum class MmiVectorOp : u8
 		{
 			AddWord,
@@ -456,6 +513,10 @@ namespace VitaEE
 		static constexpr u8 PERSISTENT_LINK_EXIT_VALUE_OFFSET = 8;
 		static constexpr u8 PERSISTENT_LINK_VTLB_VMAP_OFFSET = 16;
 		static constexpr u8 PERSISTENT_LINK_VTLB_HOST_BASE_OFFSET = 20;
+		// PCSX2 recRecompile() can own one complete 4 KiB source page plus an
+		// atomic branch follower on the next page. The executor and this reusable
+		// compile workspace share that exact discovery ceiling.
+		static constexpr u32 MAX_COMPILE_INSTRUCTIONS = 1025;
 
 		explicit BlockCompiler(VitaA32::CodeBuffer& code,
 			const u8* ram_source_page_live_flags = nullptr,
@@ -581,6 +642,13 @@ namespace VitaEE
 			u32 segment_prefix_instruction_count);
 
 	private:
+		BlockCompiler(VitaA32::CodeBuffer& code, CompileScratch& compile_scratch,
+			const u8* ram_source_page_live_flags,
+			void* ram_write_invalidation_context,
+			RamWriteInvalidationCallback ram_write_invalidation_callback,
+			bool reset_compile_scratch);
+		static CompileScratch& DefaultCompileScratch();
+
 		static bool CalculateScaledCycleStateForRange(u32 start_pc,
 			u32 instruction_count, bool omit_final_likely_delay_slot,
 			u32* committed_scaled_cycles, u32* final_scaled_cycles);
@@ -1283,19 +1351,62 @@ namespace VitaEE
 		bool EmitRamStoreInvalidationColdTail(
 			const RamStoreInvalidationColdTail& tail);
 
+		// A guest instruction can enqueue at most one typed operation tail. VU0
+		// synchronization likewise occurs at most once for LQC2/SQC2. The only
+		// doubled collection is RAM invalidation: dynamic SWL/SWR emit mutually
+		// exclusive general/full-lane store paths and each path needs its own SMC
+		// guard. Keep this storage outside BlockCompiler's stack object and reuse it
+		// for every cold compilation attempt.
+		static constexpr size_t MAX_RAM_INVALIDATION_COLD_TAILS =
+			static_cast<size_t>(MAX_COMPILE_INSTRUCTIONS) * 2;
+		struct CompileScratch
+		{
+			FixedCompileBuffer<ScalarLoadColdTail, MAX_COMPILE_INSTRUCTIONS>
+				scalar_load_cold_tails;
+			FixedCompileBuffer<ScalarStoreColdTail, MAX_COMPILE_INSTRUCTIONS>
+				scalar_store_cold_tails;
+			FixedCompileBuffer<QwordLoadColdTail, MAX_COMPILE_INSTRUCTIONS>
+				qword_load_cold_tails;
+			FixedCompileBuffer<QwordStoreColdTail, MAX_COMPILE_INSTRUCTIONS>
+				qword_store_cold_tails;
+			FixedCompileBuffer<Cop1WordMemoryColdTail, MAX_COMPILE_INSTRUCTIONS>
+				cop1_word_memory_cold_tails;
+			FixedCompileBuffer<Cop2QwordMemoryColdTail, MAX_COMPILE_INSTRUCTIONS>
+				cop2_qword_memory_cold_tails;
+			FixedCompileBuffer<Vu0SyncColdTail, MAX_COMPILE_INSTRUCTIONS>
+				vu0_sync_cold_tails;
+			FixedCompileBuffer<PartialMemoryColdTail, MAX_COMPILE_INSTRUCTIONS>
+				partial_memory_cold_tails;
+			FixedCompileBuffer<RamStoreInvalidationColdTail,
+				MAX_RAM_INVALIDATION_COLD_TAILS> ram_store_invalidation_cold_tails;
+			std::array<u16,
+				static_cast<size_t>(MAX_COMPILE_INSTRUCTIONS) * 32>
+				gpr_q_cache_next_use_distances{};
+		};
+
 		VitaA32::CodeBuffer& m_code;
+		CompileScratch& m_compile_scratch;
 		const u8* m_ram_source_page_live_flags = nullptr;
 		void* m_ram_write_invalidation_context = nullptr;
 		RamWriteInvalidationCallback m_ram_write_invalidation_callback = nullptr;
-		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
-		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
-		std::vector<QwordLoadColdTail> m_qword_load_cold_tails;
-		std::vector<QwordStoreColdTail> m_qword_store_cold_tails;
-		std::vector<Cop1WordMemoryColdTail> m_cop1_word_memory_cold_tails;
-		std::vector<Cop2QwordMemoryColdTail> m_cop2_qword_memory_cold_tails;
-		std::vector<Vu0SyncColdTail> m_vu0_sync_cold_tails;
-		std::vector<PartialMemoryColdTail> m_partial_memory_cold_tails;
-		std::vector<RamStoreInvalidationColdTail> m_ram_store_invalidation_cold_tails;
+		FixedCompileBuffer<ScalarLoadColdTail, MAX_COMPILE_INSTRUCTIONS>&
+			m_scalar_load_cold_tails;
+		FixedCompileBuffer<ScalarStoreColdTail, MAX_COMPILE_INSTRUCTIONS>&
+			m_scalar_store_cold_tails;
+		FixedCompileBuffer<QwordLoadColdTail, MAX_COMPILE_INSTRUCTIONS>&
+			m_qword_load_cold_tails;
+		FixedCompileBuffer<QwordStoreColdTail, MAX_COMPILE_INSTRUCTIONS>&
+			m_qword_store_cold_tails;
+		FixedCompileBuffer<Cop1WordMemoryColdTail, MAX_COMPILE_INSTRUCTIONS>&
+			m_cop1_word_memory_cold_tails;
+		FixedCompileBuffer<Cop2QwordMemoryColdTail, MAX_COMPILE_INSTRUCTIONS>&
+			m_cop2_qword_memory_cold_tails;
+		FixedCompileBuffer<Vu0SyncColdTail, MAX_COMPILE_INSTRUCTIONS>&
+			m_vu0_sync_cold_tails;
+		FixedCompileBuffer<PartialMemoryColdTail, MAX_COMPILE_INSTRUCTIONS>&
+			m_partial_memory_cold_tails;
+		FixedCompileBuffer<RamStoreInvalidationColdTail,
+			MAX_RAM_INVALIDATION_COLD_TAILS>& m_ram_store_invalidation_cold_tails;
 		u16 m_saved_registers = 0;
 		bool m_vtlb_registers_available = false;
 		bool m_cop1_exponent_mask_available = false;
@@ -1409,6 +1520,6 @@ namespace VitaEE
 		u8 m_gpr_q_cache_count = 0;
 		u8 m_staged_gpr_q_cache_guest[MAX_GPR_QCACHE]{};
 		u8 m_staged_gpr_q_cache_count = 0;
-		std::vector<u16> m_gpr_q_cache_next_use_distances;
-		};
-	} // namespace VitaEE
+		size_t m_gpr_q_cache_next_use_distance_count = 0;
+	};
+} // namespace VitaEE

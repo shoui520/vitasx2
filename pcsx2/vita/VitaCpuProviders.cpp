@@ -7,7 +7,8 @@
 #include "DebugTools/IpuTrace.h"
 #include "DebugTools/Spu2Trace.h"
 #include "DebugTools/VuTrace.h"
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 #include "DebugTools/CoreEventTrace.h"
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
@@ -104,7 +105,8 @@ static u64 s_ee_a32_persistent_boundary_limit = 0;
 static u64 s_ee_a32_persistent_boundaries = 0;
 static bool s_ee_a32_persistent_boundary_hit_limit = false;
 #endif
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 static VitaA32EeTraceLimitStopCondition s_ee_a32_trace_limit_stop_condition =
 	VitaA32EeTraceLimitStopCondition::None;
 #endif
@@ -644,7 +646,8 @@ static void recResetEeDispatchState()
 	s_ee_a32_persistent_dispatch_enabled = false;
 }
 
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 static bool recDidEeTraceLimitHitAtNaturalBoundary()
 {
 	switch (s_ee_a32_trace_limit_stop_condition)
@@ -663,7 +666,8 @@ static bool recDidEeTraceLimitHitAtNaturalBoundary()
 static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& result)
 {
 	recAccountEeBlockExecution(result, cpuRegs.pc);
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 	// The trace-free full-core route must retain the production persistent
 	// dispatch/link shape. Poll bounded CORE/checkpoint completion only here,
 	// after generated code has reached the same natural tail which owns the
@@ -740,7 +744,8 @@ static void recStep()
 static void recExecute()
 {
 	s_ee_a32_exit_execution = false;
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 	// A cold PCSX2-style short structural prefix returns through the provider
 	// without iBranchTest() until its successor link exists. Do not stop a
 	// bounded trace at that non-architectural seam.
@@ -749,7 +754,8 @@ static void recExecute()
 
 	while (!s_ee_a32_exit_execution)
 	{
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 		// Before ELF entry the provider deliberately uses callable blocks so the
 		// PCSX2 EELOAD hooks remain visible. Observe a completed limit before the
 		// next block only when the preceding return owned a scheduler test.
@@ -829,7 +835,8 @@ static void recExecute()
 				if (!fast_dispatch)
 				{
 					recAccountEeBlockExecution(result, pc);
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 					can_observe_trace_limit =
 						!result.scheduler_test_elided;
 #endif
@@ -960,7 +967,8 @@ static void recExecute()
 		}
 
 		recAccountEeBlockExecution(result, pc);
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 		// A code-budget split can still end in a PCSX2-owned concatenated short
 		// prefix. Keep the same natural-boundary contract as the callable path
 		// above even though an exact trace normally exits immediately afterward.
@@ -1226,7 +1234,7 @@ static void psxRecClear(u32 addr, u32 size)
 
 static void psxRecShutdown()
 {
-	s_iop_a32_executor.Reset();
+	s_iop_a32_executor.Shutdown();
 }
 
 R3000Acpu psxRec = {
@@ -1320,7 +1328,8 @@ void recMicroVU1::Execute(u32 cycles)
 	// PCSX2 owner: InterpVU1::Execute()'s loop, with eligible windows routed
 	// through the A32 block provider in pcsx2/vita/VitaVuBlockCompiler.cpp.
 	VitaVU::ExecuteVu1Blocks(cycles);
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 	Pcsx2Trace::NotifyMachineCheckpointVu1ExecutionCompleted();
 #endif
 }
@@ -1476,7 +1485,8 @@ VitaA32EeLinkRejectionProfile VitaGetA32EeLinkRejectionProfile()
 }
 #endif
 
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 void VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition condition)
 {
 	s_ee_a32_trace_limit_stop_condition = condition;
