@@ -1,11 +1,84 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include "vita/VitaGsMemory.h"
+
 #include "GS/GSExtra.h"
 
 #include "common/AlignedMalloc.h"
 #include "common/Assertions.h"
 #include "common/Console.h"
+
+namespace
+{
+	void FillPsmct32Rows(u32* vm, const GSOffset& offset,
+		const GSVector4i& rect, u32 color)
+	{
+		if (rect.rempty())
+			return;
+
+		for (int y = rect.top; y < rect.bottom; y++)
+		{
+			const GSOffset::PAHelper pa = offset.paMulti(0, y);
+			for (int x = rect.left; x < rect.right; x++)
+				vm[pa.value(x)] = color;
+		}
+	}
+}
+
+void VitaGS::FillPsmct32Rect(GSLocalMemory& memory, const GSOffset& offset,
+	const GSVector4i& rect, u32 color)
+{
+	pxAssert(offset.psm() == PSMCT32);
+	if (rect.rempty())
+		return;
+
+	// PCSX2 owner: GS/Renderers/SW/GSDrawScanline.cpp free functions
+	// DrawRectT()/FillRect()/FillBlock(). Split partial 8x8 blocks into edge
+	// rows, then fill each complete PSMCT32 block with 16 vector stores.
+	// GSRendererHW::ClearGSLocalMemory() owns the same constant-write
+	// optimization for page-aligned hardware clears.
+	const GSOffset psmct32_offset =
+		offset.assertSizesMatch(GSLocalMemory::swizzle32);
+	const GSVector4i block_rect =
+		rect.ralign<Align_Inside>(GSVector2i(8, 8));
+	u32* const vm = memory.vm32();
+
+	if (block_rect.rempty())
+	{
+		FillPsmct32Rows(vm, psmct32_offset, rect, color);
+		return;
+	}
+
+	FillPsmct32Rows(vm, psmct32_offset,
+		GSVector4i(rect.left, rect.top, rect.right, block_rect.top), color);
+	FillPsmct32Rows(vm, psmct32_offset,
+		GSVector4i(rect.left, block_rect.bottom, rect.right, rect.bottom), color);
+	FillPsmct32Rows(vm, psmct32_offset,
+		GSVector4i(rect.left, block_rect.top, block_rect.left, block_rect.bottom),
+		color);
+	FillPsmct32Rows(vm, psmct32_offset,
+		GSVector4i(block_rect.right, block_rect.top, rect.right, block_rect.bottom),
+		color);
+
+	const GSVector4i vector_color(static_cast<int>(color));
+	for (int y = block_rect.top; y < block_rect.bottom; y += 8)
+	{
+		const GSOffset::PAHelper pa = psmct32_offset.paMulti(0, y);
+		for (int x = block_rect.left; x < block_rect.right; x += 8)
+		{
+			GSVector4i* const block =
+				reinterpret_cast<GSVector4i*>(&vm[pa.value(x)]);
+			for (int i = 0; i < 16; i += 4)
+			{
+				block[i + 0] = vector_color;
+				block[i + 1] = vector_color;
+				block[i + 2] = vector_color;
+				block[i + 3] = vector_color;
+			}
+		}
+	}
+}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 

@@ -168,6 +168,7 @@ add_library(pcsx2core STATIC
 	vita/VitaGsMailbox.cpp
 	vita/VitaGsDiagnosticsDisabled.cpp
 	vita/VitaGsMemory.cpp
+	vita/VitaGsMemory.h
 	vita/VitaHostSurface.cpp
 	vita/VitaInputManager.cpp
 	vita/VitaPad.cpp

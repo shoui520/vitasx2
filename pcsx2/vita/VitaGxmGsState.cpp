@@ -120,6 +120,7 @@ void VitaGxmGsState::InvalidateLocalMem(const GIFRegBITBLTBUF& blit,
 #include "Config.h"
 #include "GS/Renderers/Common/GSVertex.h"
 #include "vita/VitaGxmDisplay.h"
+#include "vita/VitaGsMemory.h"
 #include "vita/VitaGxmMemory.h"
 
 #include <psp2/gxm.h>
@@ -1551,6 +1552,8 @@ void VitaGxmGsState::Draw()
 
 	// Commit canonical GS memory only after libgxm accepted the matching draw.
 	// This preserves the GSState read/download oracle on submission failures.
+	const GSOffset frame_offset =
+		GSOffset::fromKnownPSM(frame.Block(), frame.FBW, PSMCT32);
 	for (u32 sprite = 0; sprite < sprite_count; sprite++)
 	{
 		const GSVertex& first = m_vertex->buff[m_index->buff[sprite * 2]];
@@ -1571,11 +1574,7 @@ void VitaGxmGsState::Draw()
 			(static_cast<u32>(second.RGBAQ.G) << 8) |
 			(static_cast<u32>(second.RGBAQ.B) << 16) |
 			(static_cast<u32>(second.RGBAQ.A) << 24);
-		for (int y = rect.top; y < rect.bottom; y++)
-		{
-			for (int x = rect.left; x < rect.right; x++)
-				m_mem.WritePixel32(x, y, color, frame.Block(), frame.FBW);
-		}
+		VitaGS::FillPsmct32Rect(m_mem, frame_offset, rect, color);
 	}
 }
 
