@@ -11,6 +11,9 @@ class Error;
 
 namespace VitaGS
 {
+	void SetNativePresenterEnabled(bool enabled);
+	bool IsNativePresenterEnabled();
+
 	const u8* GetLocalMemoryForTrace(size_t* size);
 
 #if defined(VITASX2_PRODUCT_BOOT_VALIDATION) && VITASX2_PRODUCT_BOOT_VALIDATION

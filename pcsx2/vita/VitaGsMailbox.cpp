@@ -9,7 +9,9 @@
 #include "GS/GSState.h"
 #include "MTGS.h"
 #include "MTVU.h"
+#include "common/Assertions.h"
 #include "common/Error.h"
+#include "vita/VitaGxmGsState.h"
 #include "vita/VitaGsMailbox.h"
 
 #include <array>
@@ -25,6 +27,10 @@ GSRendererType GSGetCurrentRenderer()
 
 bool GSIsHardwareRenderer()
 {
+	// This predicate selects PCSX2 hardware texture-cache, transfer, reset and
+	// PCRTC semantics; it is not an accelerator-presence bit. VitaGxmGsState
+	// still owns canonical GSLocalMemory like the software path, so reporting
+	// hardware here would enter unported GSRendererHW mechanisms.
 	return false;
 }
 
@@ -32,13 +38,8 @@ namespace MTGS
 {
 	static Threading::ThreadHandle s_thread_handle;
 
-	class VitaHeadlessGsState final : public GSState
-	{
-	public:
-		void Draw() override {}
-	};
-
-	static std::unique_ptr<VitaHeadlessGsState> s_gs;
+	static bool s_native_presenter_enabled = false;
+	static std::unique_ptr<VitaGxmGsState> s_gs;
 
 	static u8 GsTraceSourceForGifPath(GIF_PATH path)
 	{
@@ -60,7 +61,12 @@ namespace MTGS
 		GSConfig.Renderer = GSRendererType::SW;
 		GSConfig.UserHacks_GPUTargetCLUTMode = GSGPUTargetCLUTMode::Disabled;
 
-		s_gs = std::make_unique<VitaHeadlessGsState>();
+		s_gs = std::make_unique<VitaGxmGsState>(s_native_presenter_enabled);
+		if (s_native_presenter_enabled && !s_gs->IsNativePresenterReady())
+		{
+			s_gs.reset();
+			return false;
+		}
 		s_gs->SetRegsMem(g_RealGSMem);
 		// PCSX2 owner: GS/GS.cpp::OpenGSRenderer(). Construction establishes
 		// GSState; the MTGS::ResetGS() caller applies the requested hardware or
@@ -123,6 +129,8 @@ namespace MTGS
 
 	void PresentCurrentFrame()
 	{
+		if (s_gs)
+			s_gs->Present();
 	}
 
 	void WaitGS(bool syncRegs, bool weakWait, bool isMTVU)
@@ -171,7 +179,6 @@ namespace MTGS
 		if (!EnsureGsOpen())
 			return;
 
-		s_gs->TraceGsStateSnapshot(Pcsx2Trace::GsTraceStateTriggerVSyncStart);
 		s_gs->PCRTCDisplays.SetVideoMode(s_gs->GetVideoMode());
 		s_gs->PCRTCDisplays.EnableDisplays(s_gs->m_regs->PMODE, s_gs->m_regs->SMODE2, s_gs->isReallyInterlaced());
 		s_gs->PCRTCDisplays.SetRects(0, s_gs->m_regs->DISP[0].DISPLAY, s_gs->m_regs->DISP[0].DISPFB);
@@ -180,9 +187,14 @@ namespace MTGS
 		s_gs->PCRTCDisplays.CalculateDisplayOffset(s_gs->m_scanmask_used);
 		s_gs->PCRTCDisplays.CalculateFramebufferOffset(s_gs->m_scanmask_used, s_gs->m_regs->DISP[0].DISPFB, s_gs->m_regs->DISP[1].DISPFB);
 		s_gs->Flush(GSState::VSYNC);
+		s_gs->VSync();
 		g_perfmon.EndFrame(false);
 		if ((g_perfmon.GetFrame() & 0x1f) == 0)
 			g_perfmon.Update();
+		// PCSX2 owner: GS.cpp::GSvsync() snapshots only after Flush() and
+		// GSRenderer::VSync(), so pending draws and frame-aged state are visible at
+		// the same architectural boundary as the x86 trace oracle.
+		s_gs->TraceGsStateSnapshot(Pcsx2Trace::GsTraceStateTriggerVSyncStart);
 		(void)registers_written;
 	}
 
@@ -244,10 +256,23 @@ namespace MTGS
 	}
 } // namespace MTGS
 
+void VitaGS::SetNativePresenterEnabled(bool enabled)
+{
+	// The GS owner must be selected before VMManager opens it. Changing GXM
+	// process ownership while a GSState is live would violate libgxm teardown.
+	pxAssertRel(!MTGS::s_gs, "native GS presenter selection changed while open");
+	MTGS::s_native_presenter_enabled = enabled;
+}
+
+bool VitaGS::IsNativePresenterEnabled()
+{
+	return MTGS::s_native_presenter_enabled;
+}
+
 bool GSValidatePortableState()
 {
-	// PCSX2 owner: GS/GS.cpp::GSValidatePortableState(). The Vita headless
-	// mailbox owns the live GSState instance instead of g_gs_renderer.
+	// PCSX2 owner: GS/GS.cpp::GSValidatePortableState(). The Vita mailbox owns
+	// the live canonical GSState instance instead of g_gs_renderer.
 	return MTGS::EnsureGsOpen() && MTGS::s_gs->ValidatePortableState();
 }
 

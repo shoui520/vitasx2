@@ -347,6 +347,25 @@ template void vtlb_memWrite<mem16_t>(u32 mem, mem16_t data);
 template void vtlb_memWrite<mem32_t>(u32 mem, mem32_t data);
 template void vtlb_memWrite<mem64_t>(u32 mem, mem64_t data);
 
+static bool VitaEeGetDirectRamProtection(const VTLBVirtual& mapping,
+	u32 address, u32* physical_address)
+{
+	// vtlb_V2P() is backed by ppmap, which PCSX2 allocates only for the Goemon
+	// TLB gamefix. Direct A32 store helpers need the physical EE-RAM page on
+	// every title for SMC protection, so recover it from the already-resolved
+	// host mapping instead. This also handles kseg and TLB aliases without
+	// spending the Vita's memory on the optional 4 MiB reverse LUT.
+	const uptr host = mapping.assumePtr(address);
+	const uptr ram = reinterpret_cast<uptr>(eeMem->Main);
+	if (host < ram || host >= ram + Ps2MemSize::ExposedRam)
+		return false;
+
+	*physical_address = static_cast<u32>(host - ram);
+	const vtlb_ProtectionMode protection =
+		mmap_GetRamPageInfo(*physical_address);
+	return protection == ProtMode_Write || protection == ProtMode_Manual;
+}
+
 u32 VitaEeExecutePreincrementByteZeroFill(u32 start_pc, u32 fallthrough_pc,
 	u32 block_cycles, u32 packed_guests)
 {
@@ -378,10 +397,8 @@ u32 VitaEeExecutePreincrementByteZeroFill(u32 start_pc, u32 fallthrough_pc,
 	const VTLBVirtual mapping = vtlbdata.vmap[address >> VTLB_PAGE_BITS];
 	if (!mapping.isHandler(address))
 	{
-		physical_address = vtlb_V2P(address);
-		const vtlb_ProtectionMode protection = mmap_GetRamPageInfo(physical_address);
-		bool protected_page =
-			protection == ProtMode_Write || protection == ProtMode_Manual;
+		bool protected_page = VitaEeGetDirectRamProtection(
+			mapping, address, &physical_address);
 #if defined(VITASX2_QEMU_VALIDATION)
 		protected_page |= g_qemuPreincrementByteZeroFillForceRedispatch;
 #endif
@@ -516,9 +533,8 @@ u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 	bool protected_page = false;
 	if (!mapping.isHandler(address))
 	{
-		physical_address = vtlb_V2P(address);
-		const vtlb_ProtectionMode protection = mmap_GetRamPageInfo(physical_address);
-		protected_page = protection == ProtMode_Write || protection == ProtMode_Manual;
+		protected_page = VitaEeGetDirectRamProtection(
+			mapping, address, &physical_address);
 #if defined(VITASX2_QEMU_VALIDATION)
 		protected_page |= g_qemuFourWordFillForceRedispatch;
 #endif
@@ -587,11 +603,8 @@ u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 			bool store_protected = false;
 			if (!store_mapping.isHandler(store_address))
 			{
-				store_physical = vtlb_V2P(store_address);
-				const vtlb_ProtectionMode protection =
-					mmap_GetRamPageInfo(store_physical);
-				store_protected = protection == ProtMode_Write ||
-					protection == ProtMode_Manual;
+				store_protected = VitaEeGetDirectRamProtection(
+					store_mapping, store_address, &store_physical);
 #if defined(VITASX2_QEMU_VALIDATION)
 				store_protected |= g_qemuFourWordFillForceRedispatch;
 #endif
@@ -688,9 +701,8 @@ u32 VitaEeExecutePreincrementWordFill(u32 start_pc, u32 fallthrough_pc,
 	bool protected_page = false;
 	if (!mapping.isHandler(address))
 	{
-		physical_address = vtlb_V2P(address);
-		const vtlb_ProtectionMode protection = mmap_GetRamPageInfo(physical_address);
-		protected_page = protection == ProtMode_Write || protection == ProtMode_Manual;
+		protected_page = VitaEeGetDirectRamProtection(
+			mapping, address, &physical_address);
 #if defined(VITASX2_QEMU_VALIDATION)
 		protected_page |= g_qemuPreincrementWordFillForceRedispatch;
 #endif
@@ -1037,10 +1049,9 @@ u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
 	bool destination_protected = false;
 	if (!destination_mapping.isHandler(destination_address))
 	{
-		const u32 physical = vtlb_V2P(destination_address);
-		const vtlb_ProtectionMode protection = mmap_GetRamPageInfo(physical);
-		destination_protected =
-			protection == ProtMode_Write || protection == ProtMode_Manual;
+		u32 destination_physical = 0;
+		destination_protected = VitaEeGetDirectRamProtection(
+			destination_mapping, destination_address, &destination_physical);
 #if defined(VITASX2_QEMU_VALIDATION)
 		destination_protected |= g_qemuWordCopyForceRedispatch;
 #endif
@@ -1127,11 +1138,9 @@ u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
 		bool scalar_destination_protected = false;
 		if (!scalar_destination_mapping.isHandler(destination_address))
 		{
-			destination_physical = vtlb_V2P(destination_address);
-			const vtlb_ProtectionMode protection =
-				mmap_GetRamPageInfo(destination_physical);
-			scalar_destination_protected =
-				protection == ProtMode_Write || protection == ProtMode_Manual;
+			scalar_destination_protected = VitaEeGetDirectRamProtection(
+				scalar_destination_mapping, destination_address,
+				&destination_physical);
 #if defined(VITASX2_QEMU_VALIDATION)
 			scalar_destination_protected |= g_qemuWordCopyForceRedispatch;
 #endif

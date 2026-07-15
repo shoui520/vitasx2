@@ -1,0 +1,10 @@
+float4 main(
+	float4 vColor : COLOR0,
+	float2 vTexCoord : TEXCOORD0,
+	uniform sampler2D source : TEXUNIT0) : COLOR
+{
+	float4 sampled = tex2D(source, vTexCoord);
+	// PCSX2 merge1 replaces RC1 alpha with PMODE.ALP before source-over
+	// blending. vColor.a carries that fixed alpha; RGB remains a multiplier.
+	return float4(vColor.rgb * sampled.rgb, vColor.a);
+}

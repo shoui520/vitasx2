@@ -57,7 +57,8 @@ namespace
 	constexpr const char* BIOS_DIR = "ux0:data/vitasx2/bios";
 	constexpr const char* BIOS_FILE = "SCPH-30000 JP 150-010118.BIN";
 	constexpr const char* DISC_DIR = "ux0:data/vitasx2/disc";
-	constexpr const char* DEFAULT_DISC_PATH =
+	constexpr const char* ELF_DIR = "ux0:data/vitasx2/elf";
+	constexpr const char* VALIDATION_DISC_PATH =
 		"ux0:data/vitasx2/disc/Wander to Kyozou (Japan).iso";
 	constexpr const char* BOOT_PATH_CONFIG = "ux0:data/vitasx2/boot-path.txt";
 	constexpr const char* PRODUCT_MEMORY_CARD_DIR = "ux0:data/vitasx2/memcards";
@@ -89,6 +90,13 @@ namespace
 		"ux0:data/vitasx2/product-validation/memcards/Mcd001.ps2";
 	constexpr const char* VALIDATION_CARD_2 =
 		"ux0:data/vitasx2/product-validation/memcards/Mcd002.ps2";
+
+	enum class ConfiguredBootKind : u8
+	{
+		Disc,
+		Elf,
+	};
+
 	// Sony PSP2 SDK target/include/sceerror.h::SCE_ERROR_ERRNO_ENOENT.
 	// VitaSDK does not currently expose the errno-family constants.
 	constexpr s32 PSP2_ERROR_ERRNO_ENOENT = -2147418110;
@@ -185,23 +193,41 @@ namespace
 		{
 			return false;
 		}
+		if (!VITASX2_PRODUCT_BOOT_VALIDATION &&
+			!FileSystem::EnsureDirectoryExists(ELF_DIR, false, error))
+		{
+			return false;
+		}
 		return FileSystem::EnsureDirectoryExists(memory_card_dir, false, error);
 	}
 
-	std::string ReadConfiguredDiscPath()
+	bool ReadConfiguredBootPath(std::string* boot_path,
+		ConfiguredBootKind* boot_kind, Error* error)
 	{
 		if (VITASX2_PRODUCT_BOOT_VALIDATION)
-			return DEFAULT_DISC_PATH;
+		{
+			*boot_path = VALIDATION_DISC_PATH;
+			*boot_kind = ConfiguredBootKind::Disc;
+			return true;
+		}
 
 		std::FILE* file = FileSystem::OpenCFile(BOOT_PATH_CONFIG, "rb");
 		if (!file)
-			return DEFAULT_DISC_PATH;
+		{
+			Error::SetStringFmt(error,
+				"Missing VitaSX2 boot selector '{}'.", BOOT_PATH_CONFIG);
+			return false;
+		}
 
 		char buffer[1024] = {};
 		const bool read = std::fgets(buffer, sizeof(buffer), file) != nullptr;
 		std::fclose(file);
 		if (!read)
-			return DEFAULT_DISC_PATH;
+		{
+			Error::SetStringFmt(error,
+				"Failed to read VitaSX2 boot selector '{}'.", BOOT_PATH_CONFIG);
+			return false;
+		}
 
 		size_t length = std::strlen(buffer);
 		while (length > 0 &&
@@ -214,18 +240,33 @@ namespace
 		// This unsafe-homebrew product only accepts user-provisioned images in
 		// its own data directory. A malformed selector must never broaden reads
 		// to the owner's other applications or savedata.
-		constexpr std::string_view allowed_prefix = "ux0:data/vitasx2/disc/";
-		if (!path.starts_with(allowed_prefix) || path.size() <= allowed_prefix.size())
-			return DEFAULT_DISC_PATH;
-		const std::string_view filename = path.substr(allowed_prefix.size());
+		constexpr std::string_view disc_prefix = "ux0:data/vitasx2/disc/";
+		constexpr std::string_view elf_prefix = "ux0:data/vitasx2/elf/";
+		const bool is_disc = path.starts_with(disc_prefix) &&
+			path.size() > disc_prefix.size();
+		const bool is_elf = path.starts_with(elf_prefix) &&
+			path.size() > elf_prefix.size() && VMManager::IsElfFileName(path);
+		if (!is_disc && !is_elf)
+		{
+			Error::SetString(error,
+				"Boot selector must name one file below the VitaSX2 disc directory "
+				"or a PCSX2-recognized ELF below the VitaSX2 ELF directory.");
+			return false;
+		}
+		const std::string_view filename = path.substr(
+			is_elf ? elf_prefix.size() : disc_prefix.size());
 		if (filename == "." || filename == ".." ||
 			filename.find('/') != std::string_view::npos ||
 			filename.find('\\') != std::string_view::npos ||
 			filename.find(':') != std::string_view::npos)
 		{
-			return DEFAULT_DISC_PATH;
+			Error::SetString(error,
+				"Boot selector must name a single file without traversal or subdirectories.");
+			return false;
 		}
-		return std::string(path);
+		boot_path->assign(path.data(), path.size());
+		*boot_kind = is_elf ? ConfiguredBootKind::Elf : ConfiguredBootKind::Disc;
+		return true;
 	}
 
 	void ConfigureProductSettings()
@@ -269,9 +310,10 @@ namespace
 		if (!VITASX2_PRODUCT_BOOT_VALIDATION)
 			EmuConfig.Pad.Ports[0].Type = Pad::ControllerType::DualShock2;
 
-		// The PCSX2 GS state/mailbox is live, but the current Vita target is
-		// deliberately headless until the GXM renderer owns Draw()/PCRTC output.
-		EmuConfig.GS.Renderer = GSRendererType::Null;
+		// VitaGxmGsState consumes PCSX2's decoded GSState boundary directly. The
+		// enum remains SW because PCSX2 has no Vita renderer enum; hardware-cache
+		// behavior is reported separately by GSIsHardwareRenderer().
+		EmuConfig.GS.Renderer = GSRendererType::SW;
 		EmuConfig.GS.SynchronousMTGS = true;
 		EmuConfig.GS.VsyncEnable = false;
 
@@ -718,6 +760,7 @@ int main()
 	EmuFolders::MemoryCards = VITASX2_PRODUCT_BOOT_VALIDATION ?
 		VALIDATION_MEMORY_CARD_DIR : PRODUCT_MEMORY_CARD_DIR;
 	ConfigureProductSettings();
+	VitaGS::SetNativePresenterEnabled(!VITASX2_PRODUCT_BOOT_VALIDATION);
 	EmuConfig.BaseFilenames.Bios = BIOS_FILE;
 
 	if (!VMManager::Internal::CPUThreadInitialize())
@@ -729,10 +772,23 @@ int main()
 
 	{
 		VMBootParameters boot;
-		boot.filename = ReadConfiguredDiscPath();
-		boot.source_type = CDVD_SourceType::Iso;
+		std::string boot_path;
+		ConfiguredBootKind boot_kind = ConfiguredBootKind::Disc;
+		if (!ReadConfiguredBootPath(&boot_path, &boot_kind, &error))
+			goto fail;
+		if (boot_kind == ConfiguredBootKind::Elf)
+		{
+			boot.elf_override = boot_path;
+			boot.source_type = CDVD_SourceType::NoDisc;
+			Console.WriteLn("VitaSX2 boot ELF: %s", boot_path.c_str());
+		}
+		else
+		{
+			boot.filename = boot_path;
+			boot.source_type = CDVD_SourceType::Iso;
+			Console.WriteLn("VitaSX2 boot disc: %s", boot_path.c_str());
+		}
 		boot.fast_boot = true;
-		Console.WriteLn("VitaSX2 boot disc: %s", boot.filename.c_str());
 		if (VMManager::Initialize(boot, &error) != VMBootResult::StartupSuccess)
 			goto fail;
 	}

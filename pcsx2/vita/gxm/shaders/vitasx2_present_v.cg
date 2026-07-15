@@ -1,0 +1,12 @@
+void main(
+	float3 aPosition,
+	float4 aColor,
+	float2 aTexCoord,
+	out float4 vPosition : POSITION,
+	out float4 vColor : COLOR0,
+	out float2 vTexCoord : TEXCOORD0)
+{
+	vPosition = float4(aPosition, 1.0f);
+	vColor = aColor;
+	vTexCoord = aTexCoord;
+}

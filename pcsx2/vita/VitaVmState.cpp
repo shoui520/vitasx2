@@ -49,6 +49,8 @@
 #include "common/FPControl.h"
 #include "common/FileSystem.h"
 #include "common/Console.h"
+#include "common/Path.h"
+#include "common/StringUtil.h"
 
 #include <utility>
 
@@ -323,37 +325,57 @@ namespace VMManager
 			Error::SetString(error, "The virtual machine is already running.");
 			return VMBootResult::StartupFailure;
 		}
-		if (!boot_params.source_type.has_value() ||
-			boot_params.source_type.value() != CDVD_SourceType::Iso ||
-			boot_params.filename.empty())
+		const bool booting_iso = boot_params.source_type.has_value() &&
+			boot_params.source_type.value() == CDVD_SourceType::Iso &&
+			!boot_params.filename.empty() && boot_params.elf_override.empty();
+		const bool booting_elf = !boot_params.elf_override.empty() &&
+			boot_params.filename.empty() &&
+			(!boot_params.source_type.has_value() ||
+			 boot_params.source_type.value() == CDVD_SourceType::NoDisc);
+		if (!booting_iso && !booting_elf)
 		{
-			// Vita-only product policy: physical drives and desktop auto-detection
-			// are not part of the target.  The machine-visible ISO route below is
-			// otherwise the PCSX2 VMManager.cpp::Initialize() owner.
-			Error::SetString(error, "The Vita product currently requires an ISO boot path.");
+			// Vita-only product policy excludes physical drives and desktop source
+			// auto-detection. These are the two PCSX2-owned product routes: an ISO,
+			// or an ELF override with no disc.
+			Error::SetString(error,
+				"The Vita product requires either an ISO or a direct ELF boot path.");
 			return VMBootResult::StartupFailure;
 		}
-		if (!boot_params.elf_override.empty() || !boot_params.save_state.empty() ||
-			boot_params.state_index.has_value())
+		if (!boot_params.save_state.empty() || boot_params.state_index.has_value())
 		{
 			Error::SetString(error,
-				"ELF overrides and frontend savestate boot are not enabled in the Vita product lifecycle.");
+				"Frontend savestate boot is not enabled in the Vita product lifecycle.");
 			return VMBootResult::StartupFailure;
 		}
-		if (!FileSystem::FileExists(boot_params.filename.c_str()))
+		const std::string& boot_path =
+			booting_elf ? boot_params.elf_override : boot_params.filename;
+		if (!FileSystem::FileExists(boot_path.c_str()))
 		{
-			Error::SetStringFmt(error, "Requested disc '{}' does not exist.", boot_params.filename);
+			Error::SetStringFmt(error, "Requested boot file '{}' does not exist.", boot_path);
+			return VMBootResult::StartupFailure;
+		}
+		if (booting_elf && !IsElfFileName(boot_path))
+		{
+			Error::SetStringFmt(error, "Requested direct boot file '{}' is not an ELF.", boot_path);
 			return VMBootResult::StartupFailure;
 		}
 
 		VitaClearVmBootState();
+		s_elf_override = booting_elf ? boot_path : std::string();
 		s_state = VMState::Initializing;
 		if (!cdvdLock(error))
 			goto fail;
 		s_lifecycle.cdvd_locked = true;
 
-		CDVDsys_SetFile(CDVD_SourceType::Iso, boot_params.filename);
-		CDVDsys_ChangeSource(CDVD_SourceType::Iso);
+		if (booting_iso)
+		{
+			CDVDsys_SetFile(CDVD_SourceType::Iso, boot_path);
+			CDVDsys_ChangeSource(CDVD_SourceType::Iso);
+		}
+		else
+		{
+			CDVDsys_ChangeSource(CDVD_SourceType::NoDisc);
+		}
 
 		if (!LoadBIOS())
 		{
@@ -365,12 +387,29 @@ namespace VMManager
 			goto fail;
 		s_lifecycle.cdvd_open = true;
 
-		s_fast_boot_requested = boot_params.fast_boot.value_or(
+		s_fast_boot_requested = booting_elf || boot_params.fast_boot.value_or(
 			static_cast<bool>(EmuConfig.EnableFastBoot));
-		UpdateDiscInfo();
-		if (s_disc_serial.empty() || s_disc_elf.empty())
+		if (booting_elf)
 		{
-			Error::SetString(error, "The mounted image does not contain a valid PS2 disc identity.");
+			// PCSX2 owner: VMManager::UpdateDiscDetails(). With an ELF override and
+			// no disc, the filename supplies the session identity and its own CRC.
+			s_disc_serial = Path::GetFileTitle(boot_path);
+			s_disc_elf = {};
+			s_disc_version = {};
+			s_disc_crc = cdvdGetElfCRC(boot_path);
+			Console.WriteLn("Vita direct ELF: title=%s crc=%08x path=%s",
+				s_disc_serial.c_str(), s_disc_crc, boot_path.c_str());
+		}
+		else
+		{
+			UpdateDiscInfo();
+		}
+		// A serial is optional for bootable homebrew discs. PCSX2 uses the ELF
+		// filename as a title fallback and an empty memory-card filter.
+		if (booting_iso && s_disc_elf.empty())
+		{
+			Error::SetString(error,
+				"The mounted image does not contain a valid PS2 boot executable.");
 			goto fail;
 		}
 		// PCSX2 owner: VMManager.cpp::UpdateDiscDetails() reopens cards only
@@ -378,7 +417,7 @@ namespace VMManager
 		// serial to SIO2 for per-game card filtering/eject behavior.
 		FileMcd_Reopen(s_disc_serial);
 		s_lifecycle.memory_cards_open = true;
-		Hle_SetHostRoot(boot_params.filename.c_str());
+		Hle_SetHostRoot(boot_path.c_str());
 
 		// PCSX2 owner: UpdateCPUImplementations(), ClearCPUExecutionCaches(),
 		// FPCR installation, memory-handler binding, and cold reset in
@@ -507,6 +546,12 @@ namespace VMManager
 	bool PerformEarlyHardwareChecks(const char** error)
 	{
 		return true;
+	}
+
+	bool IsElfFileName(const std::string_view path)
+	{
+		// Exact PCSX2 owner: VMManager.cpp::IsElfFileName().
+		return StringUtil::EndsWithNoCase(path, ".elf");
 	}
 
 	VMState GetState()

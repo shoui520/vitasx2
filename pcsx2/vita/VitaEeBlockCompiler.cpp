@@ -65,6 +65,9 @@ u32 g_qemuCop1MemoryHelperCalls = 0;
 u32 g_qemuQwordGprMemoryHelperCalls = 0;
 u32 g_qemuQwordCop2MemoryHelperCalls = 0;
 u32 g_qemuCpuCancelInstructionCalls = 0;
+u32 g_qemuCpuClearCalls = 0;
+u32 g_qemuCpuClearLastAddress = 0;
+u32 g_qemuCpuClearLastSize = 0;
 u32 g_qemuVu0SyncCalls = 0;
 u32 g_qemuVu0FinishMicroCalls = 0;
 u32 g_qemuVu0WaitMicroCalls = 0;
@@ -3547,8 +3550,10 @@ namespace VitaEE
 		// PCSX2 x86 comparison point iR5900LoadStore.cpp::recLoad() only ends
 		// the block for a compile-time-constant counter-page address, and the
 		// A32 handler cold tail already ports R5900OpcodeImpl.cpp's runtime
-		// counter check as a mid-block cycle-committing event exit at pc + 4,
-		// so loads continue straight-line blocks like PCSX2 x86 blocks do.
+		// counter check. An ordinary load uses a mid-block cycle-committing event
+		// exit at pc + 4; a delay-slot load rejoins the outer branch tail so that
+		// branch retains ownership of the selected PC. Loads therefore continue
+		// straight-line blocks like PCSX2 x86 blocks do.
 		switch (op >> 26)
 		{
 			case 0x00:
@@ -30917,7 +30922,17 @@ namespace VitaEE
 			if (!EmitSyncGprPinsToBacking(&tail.dirty_pins))
 				return false;
 
-			const bool needs_counter_event = tail.counter_read_event && tail.rt != 0;
+			// PCSX2 owner: ix86-32/iR5900LoadStore.cpp::recLoad() marks a
+			// counter read with g_branch=2, but an enclosing branch compiles its
+			// delay slot recursively and then SetBranchImm()/SetBranchReg() replaces
+			// that temporary exit with the branch's selected PC and event test. Do
+			// the same here: ordinary counter reads exit at this instruction, while
+			// a delay-slot read rejoins the already-emitted outer branch tail. Using
+			// tail.pc + 4 for that case publishes the not-taken PC even when the
+			// branch is taken. Loads to r0 still require the PCSX2 counter sync even
+			// though their result is discarded.
+			const bool needs_counter_event =
+				tail.counter_read_event && !tail.branch_delay_slot;
 			const auto emit_normalize_narrow_low = [&]() -> bool {
 			switch (tail.width)
 			{
@@ -30958,7 +30973,7 @@ namespace VitaEE
 		};
 
 		const bool preserve_branch_on_stack = tail.branch_delay_slot &&
-			needs_counter_event && m_compatible_scheduler_countdown;
+			tail.counter_read_event && m_compatible_scheduler_countdown;
 		const bool preserve_counter_on_stack = needs_counter_event &&
 			(m_branch_flag_host < 4 || m_branch_flag_host > 11);
 		// EmitCounterReadFlagFromAddress() owns the private branch host until its
@@ -30969,7 +30984,7 @@ namespace VitaEE
 		if ((preserve_branch_on_stack &&
 			 (!m_code.EmitSubImm8(HOST_SP, HOST_SP, 8) ||
 			  !m_code.EmitStrImm12(m_branch_flag_host, HOST_SP, 0))) ||
-				(tail.branch_delay_slot && needs_counter_event &&
+				(tail.branch_delay_slot && tail.counter_read_event &&
 					 !preserve_branch_on_stack &&
 					 !m_code.EmitMovRegShiftImm(HOST_TMP5, m_branch_flag_host,
 						 VitaA32::ShiftType::LSL, 0)) ||
@@ -31018,13 +31033,17 @@ namespace VitaEE
 		}
 
 		if (needs_counter_event &&
-			(!EmitCounterReadEventExit(tail.pc + 4,
+			!EmitCounterReadEventExit(tail.pc + 4,
 				tail.raw_cycles_through_instruction, tail.event_exit,
-				(preserve_branch_on_stack || preserve_counter_on_stack) ?
-					HOST_TMP4 : m_branch_flag_host) ||
-			 (tail.branch_delay_slot && !preserve_branch_on_stack &&
-				 !m_code.EmitMovRegShiftImm(m_branch_flag_host, HOST_TMP5,
-					 VitaA32::ShiftType::LSL, 0))))
+				preserve_counter_on_stack ? HOST_TMP4 : m_branch_flag_host))
+		{
+			return false;
+		}
+
+		if (tail.branch_delay_slot && tail.counter_read_event &&
+			!preserve_branch_on_stack &&
+			!m_code.EmitMovRegShiftImm(m_branch_flag_host, HOST_TMP5,
+				VitaA32::ShiftType::LSL, 0))
 		{
 			return false;
 		}

@@ -162,6 +162,9 @@ add_library(pcsx2core STATIC
 	vita/VitaEeBlockCompiler.cpp
 	vita/VitaEeExecutor.cpp
 	vita/VitaIopBlockCompiler.cpp
+	vita/VitaGxmGsState.cpp
+	vita/VitaGxmDisplay.cpp
+	vita/VitaGxmMemory.cpp
 	vita/VitaGsMailbox.cpp
 	vita/VitaGsDiagnosticsDisabled.cpp
 	vita/VitaGsMemory.cpp
@@ -228,4 +231,60 @@ target_link_libraries(pcsx2core PUBLIC
 	demanglegnu
 	SceCtrl_stub
 	SceAudio_stub
+	SceDisplay_stub
+	SceGxm_stub
 )
+
+# Sony's api_libgxm/basic sample owns the shader pipeline used here: compile
+# Cg to GXP with psp2cgc, then embed the program with psp2bin at four-byte
+# alignment. VitaSDK deliberately does not ship Sony's shader compiler.
+set(VITASX2_PSP2_SDK_ROOT
+	"$ENV{VITASX2_PSP2_SDK_ROOT}"
+	CACHE PATH "Root of the official Sony PSP2 SDK used for GXM shader compilation")
+set(VITASX2_PSP2CGC
+	"${VITASX2_PSP2_SDK_ROOT}/host_tools/bin/psp2cgc.exe")
+set(VITASX2_PSP2BIN
+	"${VITASX2_PSP2_SDK_ROOT}/host_tools/build/bin/psp2bin.exe")
+set(VITASX2_GXM_SHADER_OBJECTS)
+if(NOT EXISTS "${VITASX2_PSP2CGC}" OR NOT EXISTS "${VITASX2_PSP2BIN}")
+	# Keep non-core utilities configurable without the proprietary shader tools.
+	# The dependency makes every pcsx2core-linked build fail at build time with a
+	# targeted diagnostic instead of silently producing a renderer without GXP.
+	add_custom_target(vitasx2-gxm-shaders
+		COMMAND "${CMAKE_COMMAND}" -E echo
+			"The official PSP2 SDK psp2cgc/psp2bin tools are required for pcsx2core; set VITASX2_PSP2_SDK_ROOT."
+		COMMAND "${CMAKE_COMMAND}" -E false
+		VERBATIM)
+else()
+	function(vitasx2_add_gxm_shader shader_name profile)
+		set(shader_source
+			"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/${shader_name}.cg")
+		set(shader_gxp "${CMAKE_CURRENT_BINARY_DIR}/${shader_name}.gxp")
+		set(shader_object "${CMAKE_CURRENT_BINARY_DIR}/${shader_name}_gxp.obj")
+		add_custom_command(
+			OUTPUT "${shader_object}"
+			BYPRODUCTS "${shader_gxp}"
+			COMMAND "${VITASX2_PSP2CGC}" --profile "${profile}"
+				"${shader_source}" -o "${shader_gxp}"
+			COMMAND "${VITASX2_PSP2BIN}" "${shader_gxp}"
+				-b2e "PSP2,_binary_${shader_name}_gxp_start,_binary_${shader_name}_gxp_size,4,_binary_${shader_name}_gxp_end"
+				-o "${shader_object}"
+			DEPENDS "${shader_source}"
+			VERBATIM)
+		set_source_files_properties("${shader_object}" PROPERTIES
+			GENERATED TRUE EXTERNAL_OBJECT TRUE)
+		set(VITASX2_GXM_SHADER_OBJECTS
+			${VITASX2_GXM_SHADER_OBJECTS} "${shader_object}" PARENT_SCOPE)
+	endfunction()
+
+	vitasx2_add_gxm_shader(vitasx2_color_v sce_vp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_color_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_present_v sce_vp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_present_f sce_fp_psp2)
+	# INTERFACE object sources are direct final-link inputs, but CMake does not
+	# retain their generation edge. Give the outputs an owner and pass them to
+	# final executables because GNU ar does not index psp2bin's slot-zero symbol.
+	add_custom_target(vitasx2-gxm-shaders DEPENDS ${VITASX2_GXM_SHADER_OBJECTS})
+	target_sources(pcsx2core INTERFACE ${VITASX2_GXM_SHADER_OBJECTS})
+endif()
+add_dependencies(pcsx2core vitasx2-gxm-shaders)
