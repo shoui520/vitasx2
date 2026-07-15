@@ -20,6 +20,20 @@ set(VITASX2_SIMPLE2000_EE_TRACE_RECORDS "4096" CACHE STRING "Simple 2000 EE trac
 set(VITASX2_SIMPLE2000_EE_TRACE_SKIP_RECORDS "0" CACHE STRING "Simple 2000 EE trace records to skip before writing.")
 option(VITASX2_SIMPLE2000_EE_TRACE_FROM_BOOT "Start the Simple 2000 EE trace at BIOS boot instead of ELF entry." OFF)
 
+# --- normal Vita product -----------------------------------------------------
+add_executable(vitasx2
+	product/VitaSx2Main.cpp
+)
+target_link_libraries(vitasx2
+	pcsx2core
+)
+
+vita_create_self(vitasx2.self vitasx2 UNSAFE)
+vita_create_vpk(vitasx2.vpk ${VITASX2_TITLEID} vitasx2.self
+	VERSION "00.01"
+	NAME "VitaSX2"
+)
+
 # --- all-native portable replay validation ----------------------------------
 # This target is deliberately absent from ordinary builds. It reuses the one
 # installed VSX200001 container and enables only the bounded PCSX2 trace hooks

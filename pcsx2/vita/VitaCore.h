@@ -192,12 +192,15 @@ enum class VitaA32EeTraceLimitStopCondition : u32
 void VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition condition);
 #endif
 
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 // Unlike cache/reset-scoped provider telemetry, these fallback sentinels span
 // the complete validation session, including the two ELF-entry cache resets.
 void VitaResetA32EeSessionFallbackStats();
 VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats();
+#endif
 
+#if defined(VITASX2_QEMU_VALIDATION)
 void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled);
 void VitaSetA32EePersistentBoundaryLimit(u64 limit);
 bool VitaDidA32EePersistentBoundaryHitLimit();

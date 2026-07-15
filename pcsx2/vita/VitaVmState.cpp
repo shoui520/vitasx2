@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "CDVD/CDVD.h"
+#include "CDVD/CDVDcommon.h"
 #include "Config.h"
+#include "DEV9/DEV9.h"
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 #include "DebugTools/CoreEventTrace.h"
@@ -18,17 +20,32 @@
 #include "DebugTools/VifTrace.h"
 #include "DebugTools/VuTrace.h"
 #include "Elfheader.h"
+#include "FW.h"
+#include "Hw.h"
 #include "Input/InputManager.h"
+#include "IopBios.h"
 #include "Memory.h"
+#include "MTGS.h"
+#include "MTVU.h"
 #include "R3000A.h"
 #include "R5900.h"
 #include "SaveState.h"
+#include "SIO/Memcard/MemoryCardFile.h"
+#include "SIO/Pad/Pad.h"
+#include "SIO/Sio.h"
+#include "SIO/Sio0.h"
+#include "SIO/Sio2.h"
+#include "SPU2/spu2.h"
+#include "USB/USB.h"
 #include "VMManager.h"
 #include "VUmicro.h"
+#include "Vif_Dynarec.h"
 #include "vita/VitaCore.h"
 #include "vtlb.h"
+#include "ps2/BiosTools.h"
 
 #include "common/Error.h"
+#include "common/FPControl.h"
 #include "common/FileSystem.h"
 #include "common/Console.h"
 
@@ -49,6 +66,34 @@ namespace VMManager
 	static u32 s_elf_entry_point = 0xFFFFFFFFu;
 	static bool s_elf_executed = false;
 	static bool s_fast_boot_requested = false;
+
+	// PCSX2 owner: VMManager.cpp::{CPUThreadInitialize,Initialize,Shutdown,
+	// CPUThreadShutdown}.  Vita has one CPU thread and no desktop frontend, but
+	// the same subsystem lifetimes still matter: native code caches may not
+	// outlive SysMemory, USB is initialized once per CPU-thread lifetime, and a
+	// partially-open VM must unwind in strict reverse order.
+	struct VitaLifecycleState
+	{
+		bool cpu_thread_initialized = false;
+		bool memory_allocated = false;
+		bool providers_reserved = false;
+		bool usb_initialized = false;
+		bool vtlb_initialized = false;
+		bool cdvd_locked = false;
+		bool cdvd_open = false;
+		bool memory_cards_open = false;
+		bool gs_open = false;
+		bool spu2_open = false;
+		bool pad_initialized = false;
+		bool sio2_initialized = false;
+		bool sio0_initialized = false;
+		bool dev9_initialized = false;
+		bool dev9_open = false;
+		bool usb_open = false;
+		bool fw_open = false;
+	};
+
+	static VitaLifecycleState s_lifecycle;
 
 	static void UpdateELFInfo(std::string elf_path)
 	{
@@ -101,6 +146,359 @@ namespace VMManager
 		return s_current_crc != 0 && s_elf_executed;
 	}
 
+	static void CloseVMSubsystems(bool save_nvram)
+	{
+		// Mirrors VMManager.cpp::Shutdown() and the failure guards in
+		// VMManager.cpp::Initialize().  Each flag is set only after its owner has
+		// completed, so this is also safe for initialization failures.
+		if (s_lifecycle.fw_open)
+		{
+			FWclose();
+			s_lifecycle.fw_open = false;
+		}
+		if (s_lifecycle.usb_open)
+		{
+			USBclose();
+			s_lifecycle.usb_open = false;
+		}
+		if (s_lifecycle.dev9_open)
+		{
+			DEV9close();
+			s_lifecycle.dev9_open = false;
+		}
+		if (s_lifecycle.dev9_initialized)
+		{
+			DEV9shutdown();
+			s_lifecycle.dev9_initialized = false;
+		}
+		if (s_lifecycle.sio0_initialized)
+		{
+			g_Sio0.Shutdown();
+			s_lifecycle.sio0_initialized = false;
+		}
+		if (s_lifecycle.sio2_initialized)
+		{
+			g_Sio2.Shutdown();
+			s_lifecycle.sio2_initialized = false;
+		}
+		if (s_lifecycle.pad_initialized)
+		{
+			Pad::Shutdown();
+			s_lifecycle.pad_initialized = false;
+		}
+		if (s_lifecycle.spu2_open)
+		{
+			SPU2::Close();
+			s_lifecycle.spu2_open = false;
+		}
+		if (s_lifecycle.gs_open)
+		{
+			MTGS::WaitForClose();
+			s_lifecycle.gs_open = false;
+		}
+		if (s_lifecycle.memory_cards_open)
+		{
+			FileMcd_EmuClose();
+			s_lifecycle.memory_cards_open = false;
+		}
+		if (s_lifecycle.cdvd_open)
+		{
+			DoCDVDclose();
+			s_lifecycle.cdvd_open = false;
+			if (save_nvram)
+				cdvdSaveNVRAM();
+		}
+
+		CDVDsys_ClearFiles();
+		Hle_ClearHostRoot();
+		if (s_lifecycle.cdvd_locked)
+		{
+			cdvdUnlock();
+			s_lifecycle.cdvd_locked = false;
+		}
+	}
+
+	static void ShutdownMachineServices()
+	{
+		if (!s_lifecycle.vtlb_initialized)
+			return;
+
+		// PCSX2 owner: VMManager.cpp::Shutdown(). These services become live in
+		// SysMemory::Reset()/cpuReset(), before device opens complete, so the
+		// partial-initialization path must retire them independently of VMState.
+		R3000A::ioman::reset();
+		MemcardBusy::ClearBusy();
+		vtlb_Shutdown();
+		s_lifecycle.vtlb_initialized = false;
+	}
+
+	bool Internal::CPUThreadInitialize()
+	{
+		if (s_lifecycle.cpu_thread_initialized)
+			return true;
+
+		// PCSX2 initializes the host FP environment before allocating the VM.
+		// Initialize() installs the configured EE FPCR after provider selection.
+		FPControlRegister::SetCurrent(FPControlRegister::GetDefault());
+		if (!SysMemory::Allocate())
+		{
+			Console.Error("Vita VM lifecycle failed to allocate PS2 memory.");
+			return false;
+		}
+		s_lifecycle.memory_allocated = true;
+
+		// PCSX2 owner: VMManager.cpp::InitializeCPUProviders().  All four Vita
+		// Reserve() implementations are allocation-free today, but retaining the
+		// owner boundary keeps future cache reservations before VM reset.
+		recCpu.Reserve();
+		psxRec.Reserve();
+		CpuMicroVU0.Reserve();
+		CpuMicroVU1.Reserve();
+		s_lifecycle.providers_reserved = true;
+		VifUnpackSSE_Init();
+
+		USBinit();
+		s_lifecycle.usb_initialized = true;
+		s_lifecycle.cpu_thread_initialized = true;
+		return true;
+	}
+
+	void Internal::CPUThreadShutdown()
+	{
+		if (!s_lifecycle.cpu_thread_initialized)
+			return;
+
+		if (s_state != VMState::Shutdown)
+			Shutdown(false);
+		ShutdownMachineServices();
+
+		InputManager::CloseSources();
+		if (s_lifecycle.usb_initialized)
+		{
+			USBshutdown();
+			s_lifecycle.usb_initialized = false;
+		}
+		if (s_lifecycle.providers_reserved)
+		{
+			// The validated standalone all-native route uses this same order: VU1,
+			// VU0, IOP, EE, then SysMemory.  It prevents any provider-private
+			// translation from retaining a pointer into released guest memory.
+			if (newVifDynaRec)
+			{
+				dVifRelease(1);
+				dVifRelease(0);
+			}
+			CpuMicroVU1.Shutdown();
+			CpuMicroVU0.Shutdown();
+			psxRec.Shutdown();
+			recCpu.Shutdown();
+			s_lifecycle.providers_reserved = false;
+		}
+		MTGS::ShutdownThread();
+		if (s_lifecycle.memory_allocated)
+		{
+			SysMemory::Release();
+			s_lifecycle.memory_allocated = false;
+		}
+
+		FPControlRegister::SetCurrent(FPControlRegister::GetDefault());
+		s_lifecycle.cpu_thread_initialized = false;
+	}
+
+	VMBootResult Initialize(const VMBootParameters& boot_params, Error* error)
+	{
+		if (!s_lifecycle.cpu_thread_initialized || !s_lifecycle.memory_allocated)
+		{
+			Error::SetString(error,
+				"The Vita CPU-thread lifecycle must be initialized before booting a VM.");
+			return VMBootResult::StartupFailure;
+		}
+		if (s_state != VMState::Shutdown)
+		{
+			Error::SetString(error, "The virtual machine is already running.");
+			return VMBootResult::StartupFailure;
+		}
+		if (!boot_params.source_type.has_value() ||
+			boot_params.source_type.value() != CDVD_SourceType::Iso ||
+			boot_params.filename.empty())
+		{
+			// Vita-only product policy: physical drives and desktop auto-detection
+			// are not part of the target.  The machine-visible ISO route below is
+			// otherwise the PCSX2 VMManager.cpp::Initialize() owner.
+			Error::SetString(error, "The Vita product currently requires an ISO boot path.");
+			return VMBootResult::StartupFailure;
+		}
+		if (!boot_params.elf_override.empty() || !boot_params.save_state.empty() ||
+			boot_params.state_index.has_value())
+		{
+			Error::SetString(error,
+				"ELF overrides and frontend savestate boot are not enabled in the Vita product lifecycle.");
+			return VMBootResult::StartupFailure;
+		}
+		if (!FileSystem::FileExists(boot_params.filename.c_str()))
+		{
+			Error::SetStringFmt(error, "Requested disc '{}' does not exist.", boot_params.filename);
+			return VMBootResult::StartupFailure;
+		}
+
+		VitaClearVmBootState();
+		s_state = VMState::Initializing;
+		if (!cdvdLock(error))
+			goto fail;
+		s_lifecycle.cdvd_locked = true;
+
+		CDVDsys_SetFile(CDVD_SourceType::Iso, boot_params.filename);
+		CDVDsys_ChangeSource(CDVD_SourceType::Iso);
+
+		if (!LoadBIOS())
+		{
+			Error::SetString(error, "Failed to load the configured PlayStation 2 BIOS.");
+			goto fail;
+		}
+		cdvdLoadNVRAM();
+		if (!DoCDVDopen(error))
+			goto fail;
+		s_lifecycle.cdvd_open = true;
+
+		s_fast_boot_requested = boot_params.fast_boot.value_or(
+			static_cast<bool>(EmuConfig.EnableFastBoot));
+		UpdateDiscInfo();
+		if (s_disc_serial.empty() || s_disc_elf.empty())
+		{
+			Error::SetString(error, "The mounted image does not contain a valid PS2 disc identity.");
+			goto fail;
+		}
+		// PCSX2 owner: VMManager.cpp::UpdateDiscDetails() reopens cards only
+		// after the disc serial is known. FileMcd_Reopen() also publishes that
+		// serial to SIO2 for per-game card filtering/eject behavior.
+		FileMcd_Reopen(s_disc_serial);
+		s_lifecycle.memory_cards_open = true;
+		Hle_SetHostRoot(boot_params.filename.c_str());
+
+		// PCSX2 owner: UpdateCPUImplementations(), ClearCPUExecutionCaches(),
+		// FPCR installation, memory-handler binding, and cold reset in
+		// VMManager.cpp::Initialize().  Provider flags and pointers are selected
+		// together so generic EE/IOP/VU code observes one coherent contract.
+		VitaSelectConfiguredCpuProviders();
+		mmap_ResetBlockTracking();
+		memSetExtraMemMode(EmuConfig.Cpu.ExtraMemory);
+		Internal::ClearCPUExecutionCaches();
+		EmuConfig.Gamefixes.InstantDMAHack = s_fast_boot_requested;
+		FPControlRegister::SetCurrent(EmuConfig.Cpu.FPUFPCR);
+		if (FPControlRegister::GetCurrent() != EmuConfig.Cpu.FPUFPCR)
+		{
+			Error::SetString(error, "The Cortex-A9 FPCR does not match the configured EE contract.");
+			goto fail;
+		}
+		memBindConditionalHandlers();
+		SysMemory::Reset();
+		s_lifecycle.vtlb_initialized = true;
+		cpuReset();
+
+		if (!MTGS::WaitForOpen())
+		{
+			Error::SetString(error, "Failed to initialize the GS state owner.");
+			goto fail;
+		}
+		s_lifecycle.gs_open = true;
+		if (!SPU2::Open())
+		{
+			Error::SetString(error, "Failed to initialize SPU2.");
+			goto fail;
+		}
+		s_lifecycle.spu2_open = true;
+		if (!Pad::Initialize())
+		{
+			Error::SetString(error, "Failed to initialize PAD.");
+			goto fail;
+		}
+		s_lifecycle.pad_initialized = true;
+		if (!g_Sio2.Initialize())
+		{
+			Error::SetString(error, "Failed to initialize SIO2.");
+			goto fail;
+		}
+		s_lifecycle.sio2_initialized = true;
+		if (!g_Sio0.Initialize())
+		{
+			Error::SetString(error, "Failed to initialize SIO0.");
+			goto fail;
+		}
+		s_lifecycle.sio0_initialized = true;
+		if (DEV9init() != 0)
+		{
+			Error::SetString(error, "Failed to initialize DEV9.");
+			goto fail;
+		}
+		s_lifecycle.dev9_initialized = true;
+		if (DEV9open() != 0)
+		{
+			Error::SetString(error, "Failed to open DEV9.");
+			goto fail;
+		}
+		s_lifecycle.dev9_open = true;
+		if (!USBopen())
+		{
+			Error::SetString(error, "Failed to open USB.");
+			goto fail;
+		}
+		s_lifecycle.usb_open = true;
+		if (FWopen() != 0)
+		{
+			Error::SetString(error, "Failed to open FireWire.");
+			goto fail;
+		}
+		s_lifecycle.fw_open = true;
+
+		hwReset();
+		s_state = VMState::Paused;
+		SPU2::SetOutputPaused(true);
+		return VMBootResult::StartupSuccess;
+
+	fail:
+		ShutdownMachineServices();
+		CloseVMSubsystems(false);
+		ClearELFInfo();
+		ClearDiscInfo();
+		s_elf_override = {};
+		s_fast_boot_requested = false;
+		s_state = VMState::Shutdown;
+		return VMBootResult::StartupFailure;
+	}
+
+	void Shutdown(bool save_resume_state)
+	{
+		(void)save_resume_state;
+		if (s_state == VMState::Shutdown)
+			return;
+
+		s_state = VMState::Stopping;
+		if (THREAD_VU1 && vu1Thread.IsOpen())
+			vu1Thread.WaitVU();
+		MTGS::WaitGS(false, false, false);
+		FPControlRegister::SetCurrent(FPControlRegister::GetDefault());
+		InputManager::PauseVibration();
+		ShutdownMachineServices();
+		CloseVMSubsystems(true);
+		ClearELFInfo();
+		ClearDiscInfo();
+		s_elf_override = {};
+		s_fast_boot_requested = false;
+		s_state = VMState::Shutdown;
+	}
+
+	void Execute()
+	{
+		if (s_state != VMState::Running || !Cpu)
+			return;
+		Cpu->Execute();
+	}
+
+	void IdlePollUpdate()
+	{
+		InputManager::PollSources();
+	}
+
 	bool PerformEarlyHardwareChecks(const char** error)
 	{
 		return true;
@@ -113,17 +511,32 @@ namespace VMManager
 
 	void SetState(VMState state)
 	{
+		const VMState old_state = s_state;
 		s_state = state;
+		if (old_state == VMState::Running && state != VMState::Running &&
+			Cpu && Cpu->ExitExecution)
+		{
+			Cpu->ExitExecution();
+		}
+		if (s_lifecycle.spu2_open && state != VMState::Stopping &&
+			(state == VMState::Paused || old_state == VMState::Paused))
+		{
+			const bool paused = state == VMState::Paused;
+			if (paused)
+				InputManager::PauseVibration();
+			SPU2::SetOutputPaused(paused);
+		}
 	}
 
 	bool HasValidVM()
 	{
-		return s_state != VMState::Shutdown;
+		return s_state == VMState::Running || s_state == VMState::Paused ||
+			s_state == VMState::Resetting;
 	}
 
 	std::string GetDiscPath()
 	{
-		return {};
+		return CDVDsys_GetFile(CDVDsys_GetSourceType());
 	}
 
 	std::string GetDiscELF()
@@ -158,7 +571,9 @@ namespace VMManager
 
 	void SetPaused(bool paused)
 	{
-		s_state = paused ? VMState::Paused : VMState::Running;
+		if (!HasValidVM())
+			return;
+		SetState(paused ? VMState::Paused : VMState::Running);
 	}
 
 	float GetTargetSpeed()
@@ -244,7 +659,7 @@ namespace VMManager
 
 		bool IsExecutionInterrupted()
 		{
-			return false;
+			return s_state != VMState::Running;
 		}
 
 		void ELFLoadingOnCPUThread(std::string elf_path)
@@ -262,6 +677,14 @@ namespace VMManager
 			// trace domain immediately before EntryPointCompilingOnCPUThread().
 			// Vita's VM shim owns that edge for both interpreter and A32 EE/IOP.
 			Pcsx2Trace::NotifyEeElfEntry(s_elf_entry_point);
+#if defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+			// Do not install the callback before this owner boundary: its presence
+			// routes callable blocks through validation prerecording. BIOS/EELOAD
+			// therefore retains the normal callable native path, and the exact
+			// bounded stream begins on the first game instruction.
+			VitaSetEeExactTraceStreams(true);
+			VitaSetEePreInstructionTraceCallback(Pcsx2Trace::RecordEePreInstruction);
+#endif
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 			Pcsx2Trace::NotifyCoreEventElfEntry(s_elf_entry_point);
@@ -279,10 +702,17 @@ namespace VMManager
 			// Mirrors VMManager.cpp::EntryPointCompilingOnCPUThread() -> HandleELFChange(true):
 			// the BIOS/EELOAD-only InstantDMAHack from ApplyGameFixes() is cleared once the game ELF owns execution.
 			EmuConfig.Gamefixes.InstantDMAHack = false;
+			// Any configuration-driven card reopen happened before the game could
+			// observe the card. Keep PCSX2's entry-point eject cancellation even
+			// while the Vita product has no patch/settings frontend.
+			FileMcd_CancelEject();
 			mmap_ResetBlockTracking();
 			ClearCPUExecutionCaches();
 			memBindConditionalHandlers();
 			ClearCPUExecutionCaches();
+			// PCSX2 owner: VMManager.cpp records the final pre-first-instruction
+			// boundary only after boot patches/settings and cache publication.
+			Pcsx2Trace::RecordEeElfEntryState(s_elf_entry_point);
 		}
 
 		void VSyncOnCPUThread()

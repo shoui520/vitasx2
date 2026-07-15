@@ -7918,7 +7918,8 @@ namespace VitaIOP
 
 	void BlockExecutor::ResetInstrumentationCounters()
 	{
-#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 		m_portable_validation_stats = {};
 #endif
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -8035,7 +8036,8 @@ namespace VitaIOP
 #endif
 	}
 
-#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 	PortableValidationStats BlockExecutor::GetPortableValidationStats() const
 	{
 		return m_portable_validation_stats;
@@ -11782,7 +11784,8 @@ namespace VitaIOP
 			m_condition_code_branch_instructions_removed +=
 				block.condition_code_branch_instructions_removed;
 #endif
-#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 			if (m_portable_validation_stats.native_provider_entries != UINT32_MAX)
 				m_portable_validation_stats.native_provider_entries++;
 #endif
@@ -11848,7 +11851,8 @@ namespace VitaIOP
 			// before the exact recompiler fallback executes this PC.
 			ClearSchedulerDirectResume();
 			InvalidateCachedBlock(block);
-#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 			if (m_portable_validation_stats.invalid_provider_results != UINT32_MAX)
 				m_portable_validation_stats.invalid_provider_results++;
 #endif
@@ -11919,7 +11923,8 @@ namespace VitaIOP
 			m_active_isolate_cache_mode = new_mode;
 		}
 
-#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 		if (m_portable_validation_stats.native_provider_entries != UINT32_MAX)
 			m_portable_validation_stats.native_provider_entries++;
 #endif
@@ -12344,7 +12349,8 @@ namespace VitaIOP
 
 	s32 BlockExecutor::ExecuteInterpreterFallbackTimeslice(s32 ee_cycles)
 	{
-#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 		if (m_portable_validation_stats.interpreter_fallback_entries != UINT32_MAX)
 			m_portable_validation_stats.interpreter_fallback_entries++;
 #endif
@@ -12371,7 +12377,8 @@ namespace VitaIOP
 	s32 BlockExecutor::ExecuteInterpreterRecompilerBlock(
 		s32 ee_cycles, bool* logical_continuation, bool* execution_terminated)
 	{
-#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 		if (m_portable_validation_stats.interpreter_fallback_entries != UINT32_MAX)
 			m_portable_validation_stats.interpreter_fallback_entries++;
 #endif
@@ -13261,7 +13268,8 @@ namespace VitaIOP
 				}
 				if (wait_forward)
 				{
-#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 					if (m_portable_validation_stats.native_provider_entries != UINT32_MAX)
 						m_portable_validation_stats.native_provider_entries++;
 #endif

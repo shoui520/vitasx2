@@ -75,8 +75,11 @@ bool g_vita_a32_iop_private_scheduler_dispatch_cache_entry_available = false;
 #endif
 static VitaA32EeProviderStats s_ee_a32_stats;
 static VitaA32IopProviderStats s_iop_a32_stats;
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 static VitaA32EeProviderStats s_ee_a32_session_fallback_stats;
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
 struct IopDispatchProfileEntry
 {
 	u32 opcode = 0;
@@ -358,7 +361,8 @@ static void recRecordInterpreterFallback(u32 pc, u32 opcode,
 	VitaA32EeFallbackReason reason)
 {
 	recRecordInterpreterFallbackInStats(s_ee_a32_stats, pc, opcode, reason);
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 	recRecordInterpreterFallbackInStats(
 		s_ee_a32_session_fallback_stats, pc, opcode, reason);
 #endif
@@ -944,7 +948,8 @@ static void recExecute()
 		if (!executed)
 		{
 			s_ee_a32_stats.failed_blocks++;
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 			s_ee_a32_session_fallback_stats.failed_blocks++;
 #endif
 			recRunInterpreterStepsWithoutProviderTrace(executable_instruction_count);
@@ -1434,7 +1439,8 @@ VitaA32EeProviderStats VitaGetA32EeProviderStats()
 	return s_ee_a32_stats;
 }
 
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 void VitaResetA32EeSessionFallbackStats()
 {
 	s_ee_a32_session_fallback_stats = {};
@@ -1444,7 +1450,9 @@ VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats()
 {
 	return s_ee_a32_session_fallback_stats;
 }
+#endif
 
+#if defined(VITASX2_QEMU_VALIDATION)
 void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled)
 {
 	s_ee_a32_executor.SetDirectLinkRejectionProfileEnabled(enabled);
@@ -1602,7 +1610,8 @@ void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled)
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
 {
 	s_iop_a32_stats.code_cache_resets = s_iop_a32_executor.GetCodeCacheResetCount();
-#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 	// Product execution uses BlockExecutor::ExecuteProviderTimeslice(), bypassing
 	// the detailed QEMU dispatcher counters below. These three bounded sentinels
 	// prove native activity and zero retained interpreter/invalid-result exits

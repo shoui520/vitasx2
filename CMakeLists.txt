@@ -33,6 +33,16 @@ if(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	add_compile_definitions(VITASX2_PORTABLE_REPLAY_VALIDATION=1)
 endif()
 
+option(VITASX2_PRODUCT_BOOT_VALIDATION
+	"Stop the normal VitaSX2 product after a bounded all-native reset-to-ELF-entry oracle trace."
+	OFF)
+if(VITASX2_PRODUCT_BOOT_VALIDATION)
+	# The IOP provider's bounded fallback sentinels live in pcsx2core. Keep them
+	# out of the normal product hot path, but compile them into this validation
+	# configuration as well as the portable-replay configuration.
+	add_compile_definitions(VITASX2_PRODUCT_BOOT_VALIDATION=1)
+endif()
+
 # Target CPU contract: Cortex-A9 MPCore, VFPv3, NEON, hard-float.
 # NEON is mandatory (see docs/ps2-vita/GENERIC_CORTEX_A9_OPTIMIZATION.md).
 add_compile_options(
