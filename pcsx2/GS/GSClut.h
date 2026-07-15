@@ -64,6 +64,8 @@ class alignas(32) GSClut final : public GSAlignedClass<32>
 	void WriteCLUT16_I4_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT);
 	void WriteCLUT16S_I8_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT);
 	void WriteCLUT16S_I4_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT);
+	__noinline void WriteCLUT32_I8_CSM1Wrapped(const u8* source, u16 offset);
+	__noinline void WriteCLUT16_I8_CSM1Wrapped(const u8* source, u16* clut);
 
 	template <int n>
 	void WriteCLUT32_CSM2(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT);

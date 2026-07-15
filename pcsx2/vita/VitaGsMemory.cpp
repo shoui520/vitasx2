@@ -12,62 +12,45 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
-static int s_vita_gs_shm_fd = -1;
+static void* s_vita_gs_mapping = nullptr;
+static size_t s_vita_gs_mapping_size = 0;
 
 void* GSAllocateWrappedMemory(size_t size, size_t repeat)
 {
-	pxAssert(s_vita_gs_shm_fd == -1);
+	pxAssert(s_vita_gs_mapping == nullptr);
+	if (s_vita_gs_mapping || size == 0 || repeat == 0)
+		return nullptr;
 
-	const char* file_name = "/vitasx2-gs.mem";
-	s_vita_gs_shm_fd = shm_open(file_name, O_RDWR | O_CREAT | O_EXCL, 0600);
-	if (s_vita_gs_shm_fd != -1)
+	// Vita folds every PAHelper address into the canonical 4 MiB GS ring and
+	// splits the few raw spans which can cross its seam. Keep QEMU on that same
+	// representation so an accidental dependency on PCSX2's repeated mappings
+	// cannot hide behind the Linux validation environment.
+	s_vita_gs_mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (s_vita_gs_mapping == MAP_FAILED)
 	{
-		shm_unlink(file_name);
-	}
-	else
-	{
-		std::fprintf(stderr, "Failed to open %s due to %s\n", file_name, std::strerror(errno));
+		std::fprintf(stderr, "Failed to map canonical GS memory due to %s\n",
+			std::strerror(errno));
+		s_vita_gs_mapping = nullptr;
 		return nullptr;
 	}
-
-	if (ftruncate(s_vita_gs_shm_fd, repeat * size) < 0)
-		std::fprintf(stderr, "Failed to reserve GS memory due to %s\n", std::strerror(errno));
-
-	void* fifo = mmap(nullptr, size * repeat, PROT_READ | PROT_WRITE, MAP_SHARED, s_vita_gs_shm_fd, 0);
-	if (fifo == MAP_FAILED)
-	{
-		std::fprintf(stderr, "Failed to mmap GS memory due to %s\n", std::strerror(errno));
-		close(s_vita_gs_shm_fd);
-		s_vita_gs_shm_fd = -1;
-		return nullptr;
-	}
-
-	for (size_t i = 1; i < repeat; i++)
-	{
-		void* base = static_cast<u8*>(fifo) + size * i;
-		u8* next = static_cast<u8*>(mmap(base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, s_vita_gs_shm_fd, 0));
-		if (next != base)
-			std::fprintf(stderr, "Failed to mmap contiguous GS segment\n");
-	}
-
-	return fifo;
+	s_vita_gs_mapping_size = size;
+	return s_vita_gs_mapping;
 }
 
 void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
 {
-	pxAssert(s_vita_gs_shm_fd >= 0);
-
-	if (s_vita_gs_shm_fd < 0)
+	pxAssert(ptr == s_vita_gs_mapping);
+	pxAssert(size == s_vita_gs_mapping_size);
+	(void)repeat;
+	if (!s_vita_gs_mapping)
 		return;
 
-	munmap(ptr, size * repeat);
-	close(s_vita_gs_shm_fd);
-	s_vita_gs_shm_fd = -1;
+	munmap(s_vita_gs_mapping, s_vita_gs_mapping_size);
+	s_vita_gs_mapping = nullptr;
+	s_vita_gs_mapping_size = 0;
 }
 
 #else
@@ -82,20 +65,19 @@ static void* s_vita_gs_memblock_base = nullptr;
 void* GSAllocateWrappedMemory(size_t size, size_t repeat)
 {
 	pxAssertRel(s_vita_gs_memblock < 0, "GS memory has no existing Vita memblock");
-	if (s_vita_gs_memblock >= 0 || size == 0 || repeat == 0 ||
-		size > (std::numeric_limits<size_t>::max() / repeat))
+	if (s_vita_gs_memblock >= 0 || size == 0 || repeat == 0)
 	{
 		return nullptr;
 	}
 
-	// PCSX2 owns the repeated-storage contract in GS.cpp.  The documented PSP2
-	// user API exposes no operation for aliasing one memblock at several virtual
-	// addresses, so the known Vita fallback still reserves every repeat
-	// contiguously.  Allocate that large, long-lived object directly from cached
-	// LPDDR instead of fragmenting newlib's heap.
+	// PCSX2 owns the wrapped-storage contract in GS.cpp by repeating one mapping.
+	// The documented PSP2 user API exposes no fixed-alias operation. Vita instead
+	// keeps one canonical 4 MiB ring: GSOffset::PAHelper folds scalar and image-
+	// transfer addresses, while CLUT stages its rare raw seam crossings. Allocate
+	// that long-lived store directly from cached LPDDR instead of newlib's heap.
 	// Sony's sysmem contract requires an LPDDR memblock size rounded to 4 KiB.
 	constexpr size_t MEMBLOCK_ALIGNMENT = 4096;
-	const size_t requested_size = size * repeat;
+	const size_t requested_size = size;
 	if (requested_size > (std::numeric_limits<SceSize>::max() - (MEMBLOCK_ALIGNMENT - 1)))
 		return nullptr;
 	const SceSize allocation_size = static_cast<SceSize>(

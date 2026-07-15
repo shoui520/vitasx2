@@ -5,6 +5,7 @@
 #include "GS/GSLocalMemory.h"
 #include "GS/GSExtra.h"
 #include "GS/GSPng.h"
+#include <cstring>
 #include <unordered_set>
 
 template <typename Fn>
@@ -253,6 +254,27 @@ GSLocalMemory::~GSLocalMemory()
 	{
 		delete[] i.second;
 	}
+}
+
+const u8* GSLocalMemory::GetContiguousWrappedSpan(const void* source,
+	size_t size, void* scratch) const
+{
+	const u8* const bytes = static_cast<const u8*>(source);
+	pxAssert(bytes >= m_vm8 && bytes < (m_vm8 + m_vmsize));
+	pxAssert(size <= m_vmsize);
+	pxAssert(scratch || size <= static_cast<size_t>((m_vm8 + m_vmsize) - bytes));
+
+	const size_t offset = static_cast<size_t>(bytes - m_vm8);
+	const size_t tail = m_vmsize - offset;
+	if (size <= tail)
+		return bytes;
+
+	// PCSX2's repeated virtual views make this span contiguous. The Vita keeps
+	// one canonical ring, so only seam-crossing raw consumers pay for staging.
+	u8* const output = static_cast<u8*>(scratch);
+	std::memcpy(output, bytes, tail);
+	std::memcpy(output + tail, m_vm8, size - tail);
+	return output;
 }
 
 GSPixelOffset* GSLocalMemory::GetPixelOffset(const GIFRegFRAME& FRAME, const GIFRegZBUF& ZBUF)

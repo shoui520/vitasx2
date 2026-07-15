@@ -229,7 +229,15 @@ void GSClut::Write(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT)
 void GSClut::WriteCLUT32_I8_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT)
 {
 	ALIGN_STACK(32);
-	WriteCLUT_T32_I8_CSM1((u32*)m_mem->BlockPtr32(0, 0, TEX0.CBP, 1), m_clut, (TEX0.CSA & 15));
+	const u8* const source = m_mem->BlockPtr32(0, 0, TEX0.CBP, 1);
+	const u16 offset = TEX0.CSA & 15;
+	if (!m_mem->IsContiguousWrappedSpan(source, 1024))
+	{
+		WriteCLUT32_I8_CSM1Wrapped(source, offset);
+		return;
+	}
+
+	WriteCLUT_T32_I8_CSM1(reinterpret_cast<const u32*>(source), m_clut, offset);
 }
 
 void GSClut::WriteCLUT32_I4_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT)
@@ -241,7 +249,15 @@ void GSClut::WriteCLUT32_I4_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TE
 
 void GSClut::WriteCLUT16_I8_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT)
 {
-	WriteCLUT_T16_I8_CSM1((u16*)m_mem->BlockPtr16(0, 0, TEX0.CBP, 1), m_clut + (TEX0.CSA << 4));
+	const u8* const source = m_mem->BlockPtr16(0, 0, TEX0.CBP, 1);
+	u16* const clut = m_clut + (TEX0.CSA << 4);
+	if (!m_mem->IsContiguousWrappedSpan(source, 512))
+	{
+		WriteCLUT16_I8_CSM1Wrapped(source, clut);
+		return;
+	}
+
+	WriteCLUT_T16_I8_CSM1(reinterpret_cast<const u16*>(source), clut);
 }
 
 void GSClut::WriteCLUT16_I4_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT)
@@ -251,12 +267,36 @@ void GSClut::WriteCLUT16_I4_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TE
 
 void GSClut::WriteCLUT16S_I8_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT)
 {
-	WriteCLUT_T16_I8_CSM1((u16*)m_mem->BlockPtr16S(0, 0, TEX0.CBP, 1), m_clut + (TEX0.CSA << 4));
+	const u8* const source = m_mem->BlockPtr16S(0, 0, TEX0.CBP, 1);
+	u16* const clut = m_clut + (TEX0.CSA << 4);
+	if (!m_mem->IsContiguousWrappedSpan(source, 512))
+	{
+		WriteCLUT16_I8_CSM1Wrapped(source, clut);
+		return;
+	}
+
+	WriteCLUT_T16_I8_CSM1(reinterpret_cast<const u16*>(source), clut);
 }
 
 void GSClut::WriteCLUT16S_I4_CSM1(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT)
 {
 	WriteCLUT_T16_I4_CSM1((u16*)m_mem->BlockPtr16S(0, 0, TEX0.CBP, 1), m_clut + (TEX0.CSA << 4));
+}
+
+void GSClut::WriteCLUT32_I8_CSM1Wrapped(const u8* source, u16 offset)
+{
+	ALIGN_STACK(32);
+	alignas(32) u8 seam[1024];
+	const u8* const src = m_mem->GetContiguousWrappedSpan(source, sizeof(seam), seam);
+	WriteCLUT_T32_I8_CSM1(reinterpret_cast<const u32*>(src), m_clut, offset);
+}
+
+void GSClut::WriteCLUT16_I8_CSM1Wrapped(const u8* source, u16* clut)
+{
+	ALIGN_STACK(32);
+	alignas(32) u8 seam[512];
+	const u8* const src = m_mem->GetContiguousWrappedSpan(source, sizeof(seam), seam);
+	WriteCLUT_T16_I8_CSM1(reinterpret_cast<const u16*>(src), clut);
 }
 
 template <int n>

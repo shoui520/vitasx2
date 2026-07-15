@@ -25,6 +25,7 @@
 #include "common/MemorySettingsInterface.h"
 #include "common/Threading.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaGsMailbox.h"
 #include "vita/VitaVuBlockCompiler.h"
 
 #include <psp2/io/fcntl.h>
@@ -271,7 +272,8 @@ namespace
 	}
 
 #if VITASX2_PRODUCT_BOOT_VALIDATION
-	bool NativeSuffixHasNoFallback(std::string* evidence)
+	bool NativeSuffixHasNoFallback(std::string* evidence,
+		const VitaGS::CanonicalRingValidationResult& gs_ring)
 	{
 		const VitaA32EeProviderStats ee = VitaGetA32EeProviderStats();
 		const VitaA32EeProviderStats ee_session =
@@ -290,7 +292,12 @@ namespace
 			"ee_session_interpreter_path=%u\n"
 			"iop_entries=%llu\niop_interpreter=%u\niop_failed=%u\n"
 			"vu0_blocks=%llu\nvu0_pairs=%llu\nvu0_interpreter=%llu\nvu0_failed=%u\n"
-			"vu1_blocks=%llu\nvu1_pairs=%llu\nvu1_interpreter=%llu\nvu1_failed=%u\n",
+			"vu1_blocks=%llu\nvu1_pairs=%llu\nvu1_interpreter=%llu\nvu1_failed=%u\n"
+			"gs_ring_canonical_bytes=%u\ngs_ring_packet_qwc=%u\n"
+			"gs_ring_packet_hash=%016llx\ngs_ring_local_hash=%016llx\n"
+			"gs_ring_pixel_checks=%u\ngs_ring_address_checks=%u\n"
+			"gs_ring_clut_cases=%u\ngs_ring_readback_checks=%u\n"
+			"gs_ring_reopened_hash=%016llx\ngs_ring_reopened_clean=%u\n",
 			VMManager::GetDiscSerial().c_str(), VMManager::GetDiscELF().c_str(),
 			VMManager::GetDiscCRC(), VMManager::Internal::GetCurrentELFEntryPoint(),
 			static_cast<unsigned long long>(Pcsx2Trace::GetEeTraceRecordsWritten()),
@@ -309,7 +316,14 @@ namespace
 			static_cast<unsigned long long>(vu0.interpreter_steps), vu0.compile_failures,
 			static_cast<unsigned long long>(vu1.executed_blocks),
 			static_cast<unsigned long long>(vu1.executed_pairs),
-			static_cast<unsigned long long>(vu1.interpreter_steps), vu1.compile_failures);
+			static_cast<unsigned long long>(vu1.interpreter_steps), vu1.compile_failures,
+			gs_ring.canonical_bytes, gs_ring.packet_qwc,
+			static_cast<unsigned long long>(gs_ring.packet_hash),
+			static_cast<unsigned long long>(gs_ring.local_hash),
+			gs_ring.pixel_checks, gs_ring.address_checks, gs_ring.clut_cases,
+			gs_ring.readback_checks,
+			static_cast<unsigned long long>(gs_ring.reopened_hash),
+			gs_ring.reopened_clean ? 1u : 0u);
 		if (length <= 0 || static_cast<size_t>(length) >= sizeof(text))
 			return false;
 		evidence->assign(text, static_cast<size_t>(length));
@@ -326,7 +340,7 @@ namespace
 			ee_session.failed_blocks == 0 && iop.interpreter_blocks == 0 &&
 			iop.failed_blocks == 0 && vu0.interpreter_steps == 0 &&
 			vu0.compile_failures == 0 && vu1.interpreter_steps == 0 &&
-			vu1.compile_failures == 0;
+			vu1.compile_failures == 0 && gs_ring.reopened_clean;
 	}
 #endif
 
@@ -346,6 +360,9 @@ int main()
 	bool cpu_thread_initialized = false;
 	bool trace_started = false;
 	bool vm_initialized = false;
+#if VITASX2_PRODUCT_BOOT_VALIDATION
+	VitaGS::CanonicalRingValidationResult gs_ring_validation;
+#endif
 	const char* log_path = VITASX2_PRODUCT_BOOT_VALIDATION ?
 		VALIDATION_LOG_PATH : PRODUCT_LOG_PATH;
 	const char* initialized_path = VITASX2_PRODUCT_BOOT_VALIDATION ?
@@ -423,6 +440,16 @@ int main()
 			VMManager::GetDiscSerial(), VMManager::GetDiscCRC());
 		goto fail;
 	}
+
+#if VITASX2_PRODUCT_BOOT_VALIDATION
+	if (!VitaGS::ValidateCanonicalLocalMemoryRing(&gs_ring_validation, &error))
+		goto fail;
+	Console.WriteLn(
+		"VitaSX2 canonical GS ring validation passed (bytes=%u, hash=%016llx, clut=%u).",
+		gs_ring_validation.canonical_bytes,
+		static_cast<unsigned long long>(gs_ring_validation.local_hash),
+		gs_ring_validation.clut_cases);
+#endif
 
 	{
 		char initialized[1024];
@@ -505,7 +532,7 @@ int main()
 	{
 #if VITASX2_PRODUCT_BOOT_VALIDATION
 		std::string evidence;
-		if (!NativeSuffixHasNoFallback(&evidence))
+		if (!NativeSuffixHasNoFallback(&evidence, gs_ring_validation))
 		{
 			Error::SetString(&error, "The all-native ELF-entry suffix used a fallback.");
 			goto fail;

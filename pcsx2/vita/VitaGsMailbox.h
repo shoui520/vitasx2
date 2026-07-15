@@ -7,7 +7,28 @@
 
 #include <cstddef>
 
+class Error;
+
 namespace VitaGS
 {
 	const u8* GetLocalMemoryForTrace(size_t* size);
+
+#if defined(VITASX2_PRODUCT_BOOT_VALIDATION) && VITASX2_PRODUCT_BOOT_VALIDATION
+	struct CanonicalRingValidationResult
+	{
+		u32 canonical_bytes = 0;
+		u32 packet_qwc = 0;
+		u32 pixel_checks = 0;
+		u32 address_checks = 0;
+		u32 clut_cases = 0;
+		u32 readback_checks = 0;
+		u64 packet_hash = 0;
+		u64 local_hash = 0;
+		u64 reopened_hash = 0;
+		bool reopened_clean = false;
+	};
+
+	bool ValidateCanonicalLocalMemoryRing(
+		CanonicalRingValidationResult* result, Error* error);
+#endif
 }

@@ -234,6 +234,7 @@ public:
 		const int* m_pixelSwizzleRow;
 		int m_base;
 		u32 m_xor;
+		u32 m_addressMask;
 
 	public:
 		PAHelper() = default;
@@ -242,12 +243,18 @@ public:
 			m_pixelSwizzleRow = off.m_pixelSwizzleRow[y & off.m_pixelRowMask]->value + x;
 			m_base = off.pixelAddressZeroXRaw(y);
 			m_xor = off.m_pixelAddressXor;
+			// PCSX2 normally makes this wrap free by mapping the 4 MiB GS store
+			// four times. PSP2 has no documented user-mode fixed-alias API, so the
+			// Vita representation keeps one canonical ring and folds the final
+			// address here. The mask is expressed in this PSM's pixel units.
+			m_addressMask =
+				(GS_MAX_PAGES << (off.m_pageShiftX + off.m_pageShiftY)) - 1;
 		}
 
 		/// Get pixel reference for the given x offset from the one used to create the PAHelper
 		u32 value(int x) const
 		{
-			return (m_base + m_pixelSwizzleRow[x]) ^ m_xor;
+			return ((m_base + m_pixelSwizzleRow[x]) ^ m_xor) & m_addressMask;
 		}
 	};
 
@@ -515,6 +522,15 @@ public:
 	__forceinline u8* vm8() const { return m_vm8; }
 	__forceinline u16* vm16() const { return reinterpret_cast<u16*>(m_vm8); }
 	__forceinline u32* vm32() const { return reinterpret_cast<u32*>(m_vm8); }
+	__forceinline bool IsContiguousWrappedSpan(const void* source, size_t size) const
+	{
+		const u8* const bytes = static_cast<const u8*>(source);
+		pxAssert(bytes >= m_vm8 && bytes < (m_vm8 + m_vmsize));
+		pxAssert(size <= m_vmsize);
+		return size <= static_cast<size_t>((m_vm8 + m_vmsize) - bytes);
+	}
+	const u8* GetContiguousWrappedSpan(const void* source, size_t size,
+		void* scratch) const;
 
 	GSOffset GetOffset(u32 bp, u32 bw, u32 psm) const
 	{
