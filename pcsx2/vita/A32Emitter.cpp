@@ -5,7 +5,9 @@
 
 #include "common/Assertions.h"
 #include "common/Vita/VitaJitMemory.h"
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	(!defined(VITASX2_QEMU_FULL_CORE) || defined(VITASX2_NATIVE_VALIDATION) || \
+	 defined(VITASX2_STANDALONE_EMITTER_VALIDATION))
 #include <sys/mman.h>
 #include <unistd.h>
 #else
@@ -397,7 +399,12 @@ namespace VitaA32
 	bool CodeBuffer::Allocate(size_t capacity)
 	{
 		Release();
-#if defined(VITASX2_QEMU_VALIDATION)
+		// Standalone/native validation owns a self-contained executable mmap.
+		// Full-core QEMU must use VitaVM so the publication range remains in
+		// the live-allocation registry enforced by SyncJitMemory().
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	(!defined(VITASX2_QEMU_FULL_CORE) || defined(VITASX2_NATIVE_VALIDATION) || \
+	 defined(VITASX2_STANDALONE_EMITTER_VALIDATION))
 		const long page_size = sysconf(_SC_PAGESIZE);
 		const size_t aligned_capacity = (capacity + static_cast<size_t>(page_size - 1)) &
 			~static_cast<size_t>(page_size - 1);
@@ -495,7 +502,9 @@ namespace VitaA32
 		pxAssertRel(CloseWriteDomain(), "Failed to close the Vita VM domain before releasing code");
 		if (m_base)
 		{
-#if defined(VITASX2_QEMU_VALIDATION)
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	(!defined(VITASX2_QEMU_FULL_CORE) || defined(VITASX2_NATIVE_VALIDATION) || \
+	 defined(VITASX2_STANDALONE_EMITTER_VALIDATION))
 			if (m_owns_memory)
 				munmap(m_base, m_capacity);
 #else

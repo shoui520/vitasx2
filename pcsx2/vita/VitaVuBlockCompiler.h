@@ -66,6 +66,33 @@ namespace VitaVU
 		u32 direct_link_patches = 0;
 		u32 direct_link_runtime_patches = 0;
 		u32 direct_link_runtime_observed_slots = 0;
+		// Compile-time code-generation evidence, not runtime counters. Hits,
+		// misses, evictions, and writebacks are allocator events; uncached_*
+		// count counterfactual wrapper accesses; canonical_* count emitted
+		// backing-state operations.
+		u64 vector_cache_hits = 0;
+		u64 vector_cache_misses = 0;
+		u64 vector_cache_evictions = 0;
+		u64 vector_cache_writebacks = 0;
+		u64 vector_cache_acc_hits = 0;
+		u64 vector_cache_scalar_invalidations = 0;
+		u32 vector_cache_candidate_blocks = 0;
+		u32 vector_cache_selected_blocks = 0;
+		u32 vector_cache_rejected_blocks = 0;
+		u64 vector_cache_baseline_instructions = 0;
+		u64 vector_cache_selected_instructions = 0;
+		u64 vector_cache_instructions_removed = 0;
+		u64 vector_cache_canonical_bytes_removed = 0;
+		u64 uncached_vector_loads = 0;
+		u64 uncached_vector_stores = 0;
+		u64 canonical_vf_word_loads = 0;
+		u64 canonical_vf_word_stores = 0;
+		u64 canonical_vf_quad_loads = 0;
+		u64 canonical_vf_quad_stores = 0;
+		u64 canonical_acc_word_loads = 0;
+		u64 canonical_acc_word_stores = 0;
+		u64 canonical_acc_quad_loads = 0;
+		u64 canonical_acc_quad_stores = 0;
 		u64 linked_frame_entries = 0;
 		u64 linked_frame_instructions_removed = 0;
 		u64 linked_frame_stack_words_removed = 0;

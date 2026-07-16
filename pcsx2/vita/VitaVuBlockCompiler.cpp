@@ -71,6 +71,7 @@ u32 g_qemuVuJitLowerBranchStallTestInlineOps = 0;
 u32 g_qemuVuJitLowerStallInlineOps = 0;
 u32 g_qemuVuJitDtFlagInlineOps = 0;
 u32 g_qemuVuJitLinkedFrameEntries = 0;
+u32 g_qemuVuJitLinkedVectorFrameEntries = 0;
 #endif
 
 namespace VitaVU
@@ -1139,8 +1140,11 @@ namespace VitaVU
 		constexpr unsigned VU_NORM_SIGNV_Q = 13; // sign = v & sign mask
 		constexpr unsigned VU_NORM_TMP_Q = 14;  // select scratch
 		constexpr unsigned VU_NORM_MASK_Q = 15; // per-lane select mask
+		constexpr unsigned VU_VECTOR_CACHE_FIRST_Q = 4;
+		constexpr unsigned VU_VECTOR_CACHE_SLOTS = 4;
+		constexpr u8 VU_VECTOR_CACHE_ACC = 32;
 
-		constexpr u16 SAVED_REGISTER_MASK = 0x4ff0; // r4-r11, lr plus 36-byte frame keeps SP aligned
+		constexpr u16 SAVED_REGISTER_MASK = 0x4ff0; // r4-r11, lr; each VU path realigns its private frame
 		constexpr u16 RETURN_REGISTER_MASK = 0x8ff0; // r4-r11, pc
 		constexpr u32 STACK_FRAME_SIZE = 36;          // 32-byte VF hazard backup slots + alignment pad
 
@@ -1165,7 +1169,8 @@ namespace VitaVU
 				const void* patched_target = nullptr;
 			};
 
-			const void* LookupVu1DirectLinkBlock(VURegs* vu, Vu1DirectLinkSlot* runtime_link);
+			const void* LookupVu1DirectLinkBlockScalar(VURegs* vu, Vu1DirectLinkSlot* runtime_link);
+			const void* LookupVu1DirectLinkBlockVector(VURegs* vu, Vu1DirectLinkSlot* runtime_link);
 
 		u16 VuOffset(size_t offset)
 		{
@@ -1186,15 +1191,72 @@ namespace VitaVU
 		class BlockCompiler
 		{
 		public:
+			enum class VectorCacheMode : u8
+			{
+				Disabled,
+				Trace,
+				Enabled,
+			};
+
+			enum class VectorAccessKind : u8
+			{
+				WordLoad,
+				WordStore,
+				QuadLoad,
+				QuadStore,
+				Barrier,
+			};
+
+			struct VectorAccessEvent
+			{
+				VectorAccessKind kind = VectorAccessKind::Barrier;
+				u8 guest = 0;
+				bool needs_old_value = false;
+				bool admit = false;
+				u32 next_same_guest = 0xffffffffu;
+			};
+
+			struct VectorCacheOpportunity
+			{
+				u32 wrapper_instructions_removed = 0;
+				u32 canonical_bytes_removed = 0;
+				bool profitable = false;
+			};
+
+			struct VectorCacheStats
+			{
+				u64 hits = 0;
+				u64 misses = 0;
+				u64 evictions = 0;
+				u64 writebacks = 0;
+				u64 acc_hits = 0;
+				u64 scalar_invalidations = 0;
+				u64 uncached_loads = 0;
+				u64 uncached_stores = 0;
+				u64 vf_word_loads = 0;
+				u64 vf_word_stores = 0;
+				u64 vf_quad_loads = 0;
+				u64 vf_quad_stores = 0;
+				u64 acc_word_loads = 0;
+				u64 acc_word_stores = 0;
+				u64 acc_quad_loads = 0;
+				u64 acc_quad_stores = 0;
+			};
+
 			explicit BlockCompiler(CodeBuffer& code, const BlockPlan& plan, PairPlan* stable_pairs,
-				u32 mem_mask)
+				u32 mem_mask, VectorCacheMode vector_cache_mode = VectorCacheMode::Disabled,
+				std::vector<VectorAccessEvent>* vector_accesses = nullptr)
 				: m_code(code)
 				, m_plan(plan)
 				, m_pairs(stable_pairs)
 				, m_mem_mask(mem_mask)
 				, m_vu0_memory_map(mem_mask == VU0_MEMMASK)
 				, m_countdown_budget(plan.countdown_budget)
+				, m_vector_cache_mode(vector_cache_mode)
+				, m_vector_accesses(vector_accesses)
 			{
+				pxAssert(m_vu0_memory_map || vector_cache_mode != VectorCacheMode::Trace || vector_accesses);
+				pxAssert(m_vu0_memory_map || vector_cache_mode != VectorCacheMode::Enabled || vector_accesses);
 			}
 
 			bool Compile()
@@ -1208,6 +1270,11 @@ namespace VitaVU
 					if (!EmitPair(i))
 						return false;
 				}
+
+				// Block-local vector mappings never cross an externally observable
+				// seam. PCSX2 owner: x86/microVU_IR.h::microRegAlloc::flushAll().
+				if (!EmitFlushVectorCache())
+					return false;
 
 				// Fall-through: every pair executed. If the next block is
 				// already cached, tail-call it with the accumulated count;
@@ -1243,8 +1310,9 @@ namespace VitaVU
 
 				// PCSX2 owner: x86/microVU_Branch.inl links compatible block
 				// states without returning through the dispatcher.  The Vita block
-				// body uses one stable private-frame mapping, so a linked chain can
-				// retain r4/r6/r7/r11 and the existing stack frame.  The target's
+				// body uses one of two stable private-frame mappings (ordinary or
+				// D8-D15-preserving), so compatible linked chains can retain
+				// r4/r6/r7/r11 and the existing stack frame. The target's
 				// private countdown is refreshed before its microVU block-admission
 				// test; this also converts a preceding block's permitted overshoot
 				// back into an ordinary target-entry rejection.
@@ -1254,6 +1322,14 @@ namespace VitaVU
 					!m_code.EmitLdrImm12(1, 0, 0) ||
 					!m_code.EmitAddImm8(1, 1, 1) ||
 					!m_code.EmitStrImm12(1, 0, 0))
+				{
+					return false;
+				}
+				if (UsesVectorCacheFrame() &&
+					(!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitLinkedVectorFrameEntries))) ||
+					 !m_code.EmitLdrImm12(1, 0, 0) ||
+					 !m_code.EmitAddImm8(1, 1, 1) ||
+					 !m_code.EmitStrImm12(1, 0, 0)))
 				{
 					return false;
 				}
@@ -1271,11 +1347,105 @@ namespace VitaVU
 					return false;
 				}
 
-				return true;
+				return m_vector_cache_mode != VectorCacheMode::Enabled ||
+					(m_vector_accesses && m_vector_access_cursor == m_vector_accesses->size());
 			}
 
 			const std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS>& DirectLinks() const { return m_direct_links; }
 			size_t LinkedEntryOffset() const { return m_linked_entry_offset; }
+			const VectorCacheStats& GetVectorCacheStats() const { return m_vector_cache_stats; }
+
+			static VectorCacheOpportunity AnalyzeVectorCacheOpportunity(
+				std::vector<VectorAccessEvent>* events)
+			{
+				VectorCacheOpportunity opportunity;
+				if (!events)
+					return opportunity;
+
+				struct Lifetime
+				{
+					u32 first = 0xffffffffu;
+					u32 last = 0xffffffffu;
+					u32 accesses = 0;
+					bool needs_old_value = false;
+					bool dirty = false;
+				};
+				std::array<Lifetime, VU_VECTOR_CACHE_ACC + 1> lifetimes{};
+				const auto finish_lifetime = [&](u8 guest) {
+					Lifetime& lifetime = lifetimes[guest];
+					if (lifetime.accesses == 0)
+						return;
+
+					const u32 fixed_cost = (lifetime.needs_old_value ? 2u : 0u) +
+						(lifetime.dirty ? 2u : 0u);
+					if (lifetime.accesses > fixed_cost)
+					{
+						opportunity.wrapper_instructions_removed +=
+							lifetime.accesses - fixed_cost;
+						const u32 canonical_transfers =
+							lifetime.accesses - (lifetime.needs_old_value ? 1u : 0u) -
+							(lifetime.dirty ? 1u : 0u);
+						opportunity.canonical_bytes_removed += canonical_transfers * 16u;
+						for (u32 index = lifetime.first; index != 0xffffffffu;
+							index = (*events)[index].next_same_guest)
+						{
+							(*events)[index].admit = true;
+						}
+					}
+					lifetime = {};
+				};
+				const auto finish_all = [&]() {
+					for (u8 guest = 1; guest <= VU_VECTOR_CACHE_ACC; guest++)
+						finish_lifetime(guest);
+				};
+
+				for (size_t index = 0; index < events->size(); index++)
+				{
+					VectorAccessEvent& event = (*events)[index];
+					event.admit = false;
+					event.next_same_guest = 0xffffffffu;
+					if (event.kind == VectorAccessKind::Barrier)
+					{
+						finish_all();
+						continue;
+					}
+					if (event.guest == 0 || event.guest > VU_VECTOR_CACHE_ACC)
+						continue;
+					if (event.kind == VectorAccessKind::WordLoad ||
+						event.kind == VectorAccessKind::WordStore)
+					{
+						finish_lifetime(event.guest);
+						continue;
+					}
+					Lifetime& lifetime = lifetimes[event.guest];
+					const u32 event_index = static_cast<u32>(index);
+					if (lifetime.accesses == 0)
+					{
+						lifetime.first = event_index;
+						lifetime.needs_old_value = event.needs_old_value;
+					}
+					else
+					{
+						(*events)[lifetime.last].next_same_guest = event_index;
+					}
+					lifetime.last = event_index;
+					lifetime.accesses++;
+					lifetime.dirty |= event.kind == VectorAccessKind::QuadStore;
+				}
+				finish_all();
+
+				// Cortex-A9 NEON MPE timing tables make the outer D8-D15 save/restore
+				// roughly sixteen MPE issue cycles. Demand a clear block-wide surplus
+				// and more than one frame's 128-byte traffic before enabling residency.
+				opportunity.profitable = opportunity.wrapper_instructions_removed >= 20 &&
+					opportunity.canonical_bytes_removed > 128;
+				if (!opportunity.profitable)
+				{
+					for (VectorAccessEvent& event : *events)
+						event.admit = false;
+				}
+				return opportunity;
+			}
 
 		private:
 				struct BudgetExit
@@ -1285,11 +1455,23 @@ namespace VitaVU
 					Condition condition = Condition::CS;
 				};
 
-				bool EmitPrologue()
+			bool EmitPrologue()
 			{
-				if (!m_code.EmitPush(SAVED_REGISTER_MASK) ||
-					!m_code.EmitSubImm8(SP, SP, STACK_FRAME_SIZE) ||
-					!EmitMovReg(HOST_VU, 0) ||
+				if (!m_code.EmitPush(SAVED_REGISTER_MASK))
+					return false;
+				if (!UsesVectorCacheFrame())
+				{
+					if (!m_code.EmitSubImm8(SP, SP, STACK_FRAME_SIZE))
+						return false;
+				}
+				else if (!m_code.EmitSubImm8(SP, SP, 4) ||
+					!m_code.EmitVpushDRange(8, 8) ||
+					!m_code.EmitSubImm8(SP, SP, 32))
+				{
+					return false;
+				}
+
+				if (!EmitMovReg(HOST_VU, 0) ||
 					!EmitMovReg(HOST_LIMIT_LO, 2) ||
 					!EmitMovReg(HOST_LIMIT_HI, 3) ||
 					!EmitMovReg(HOST_EXEC_BASE, 1))
@@ -1311,8 +1493,20 @@ namespace VitaVU
 
 			bool EmitEpilogue()
 			{
-				return m_code.EmitAddImm8(SP, SP, STACK_FRAME_SIZE) &&
+				if (!UsesVectorCacheFrame())
+					return m_code.EmitAddImm8(SP, SP, STACK_FRAME_SIZE) &&
+						m_code.EmitPop(RETURN_REGISTER_MASK);
+
+				return m_code.EmitAddImm8(SP, SP, 32) &&
+					m_code.EmitVpopDRange(8, 8) &&
+					m_code.EmitAddImm8(SP, SP, 4) &&
 					m_code.EmitPop(RETURN_REGISTER_MASK);
+			}
+
+			bool UsesVectorCacheFrame() const
+			{
+				return !m_vu0_memory_map &&
+					m_vector_cache_mode == VectorCacheMode::Enabled;
 			}
 
 			bool EmitMovReg(unsigned rd, unsigned rm, Condition condition = Condition::AL)
@@ -1349,7 +1543,10 @@ namespace VitaVU
 				// vuDouble() normalization constants across pairs, so every helper
 				// seam must force a later normalize to rematerialize them. This is
 				// required even for a conditional call: compile-time state joins the
-				// called and skipped arms after the call site.
+				// called and skipped arms after the call site. Q4-Q7 are AAPCS
+				// callee-saved. The helpers reachable here own pipe/GIF/INTC/link
+				// state, not VF/ACC storage; D/T and E-bit observable joins publish
+				// the block-local cache explicitly at their unconditional barriers.
 				const bool emitted = m_code.EmitCallAbsolute(fn);
 				m_norm_consts_ready = false;
 				return emitted;
@@ -1453,7 +1650,10 @@ namespace VitaVU
 					return false;
 				}
 
-				if (!EmitCallAbsoluteClobberVectorState(reinterpret_cast<const void*>(&LookupVu1DirectLinkBlock)) ||
+				const void* const lookup = UsesVectorCacheFrame() ?
+					reinterpret_cast<const void*>(&LookupVu1DirectLinkBlockVector) :
+					reinterpret_cast<const void*>(&LookupVu1DirectLinkBlockScalar);
+				if (!EmitCallAbsoluteClobberVectorState(lookup) ||
 					!m_code.EmitCmpImm32(0, 0))
 				{
 					return false;
@@ -2188,6 +2388,218 @@ namespace VitaVU
 					m_code.EmitLdrshImm8(rd, 3, 0);
 			}
 
+			// PCSX2 owners: x86/microVU_IR.h::microRegAlloc,
+			// microVU_Analyze.inl's per-block use information, and
+			// microVU_Alloc.inl's dirty writeback. Cortex-A9 has only four
+			// practical callee-saved quads, so use a compact next-use cache and
+			// admit only values proven reusable before the next state barrier.
+			struct VectorCacheSlot
+			{
+				u8 guest = 0;
+				bool dirty = false;
+			};
+
+			bool RecordOrConsumeVectorAccess(u8 guest, VectorAccessKind kind,
+				bool needs_old_value, bool* admit)
+			{
+				if (admit)
+					*admit = false;
+				if (m_vu0_memory_map || m_vector_cache_mode == VectorCacheMode::Disabled)
+					return true;
+				if (!m_vector_accesses)
+					return false;
+
+				if (m_vector_cache_mode == VectorCacheMode::Trace)
+				{
+					m_vector_accesses->push_back({kind, guest, needs_old_value, false});
+					return true;
+				}
+
+				if (m_vector_access_cursor >= m_vector_accesses->size())
+					return false;
+				const VectorAccessEvent& event = (*m_vector_accesses)[m_vector_access_cursor++];
+				if (event.kind != kind || event.guest != guest ||
+					event.needs_old_value != needs_old_value)
+				{
+					return false;
+				}
+				if (admit)
+					*admit = event.admit;
+				return true;
+			}
+
+			bool RecordOrConsumeVectorBarrier()
+			{
+				return RecordOrConsumeVectorAccess(0, VectorAccessKind::Barrier, false, nullptr);
+			}
+
+			u32 NextAdmittedVectorUse(u8 guest) const
+			{
+				if (m_vector_cache_mode != VectorCacheMode::Enabled || !m_vector_accesses)
+					return 0xffffffffu;
+				for (size_t index = m_vector_access_cursor; index < m_vector_accesses->size(); index++)
+				{
+					const VectorAccessEvent& event = (*m_vector_accesses)[index];
+					if (event.kind == VectorAccessKind::Barrier ||
+						(event.guest == guest &&
+						 (event.kind == VectorAccessKind::WordLoad ||
+						  event.kind == VectorAccessKind::WordStore)))
+					{
+						break;
+					}
+					if (event.guest == guest && event.admit)
+						return static_cast<u32>(index);
+				}
+				return 0xffffffffu;
+			}
+
+			int FindVectorCacheSlot(u8 guest) const
+			{
+				for (u32 slot = 0; slot < VU_VECTOR_CACHE_SLOTS; slot++)
+				{
+					if (m_vector_cache[slot].guest == guest)
+						return static_cast<int>(slot);
+				}
+				return -1;
+			}
+
+			bool EmitCanonicalVectorAddress(unsigned rd, u8 guest)
+			{
+				const size_t offset = guest == VU_VECTOR_CACHE_ACC ?
+					offsetof(VURegs, ACC) : VfOffset(guest);
+				return m_code.EmitAddImm32(rd, HOST_VU, VuOffset(offset));
+			}
+
+			bool EmitWritebackVectorCacheSlot(u32 slot)
+			{
+				VectorCacheSlot& mapping = m_vector_cache[slot];
+				if (mapping.guest == 0 || !mapping.dirty)
+					return true;
+
+				if (!EmitCanonicalVectorAddress(HOST_CALL_SCRATCH, mapping.guest) ||
+					!m_code.EmitVst1Q32Aligned(VU_VECTOR_CACHE_FIRST_Q + slot, HOST_CALL_SCRATCH))
+				{
+					return false;
+				}
+				mapping.dirty = false;
+				m_vector_cache_stats.writebacks++;
+				if (mapping.guest == VU_VECTOR_CACHE_ACC)
+					m_vector_cache_stats.acc_quad_stores++;
+				else
+					m_vector_cache_stats.vf_quad_stores++;
+				return true;
+			}
+
+			bool EmitFlushVectorCache()
+			{
+				if (m_vu0_memory_map)
+					return true;
+				if (!RecordOrConsumeVectorBarrier())
+					return false;
+				for (u32 slot = 0; slot < VU_VECTOR_CACHE_SLOTS; slot++)
+				{
+					if (!EmitWritebackVectorCacheSlot(slot))
+						return false;
+					m_vector_cache[slot] = {};
+				}
+				return true;
+			}
+
+			bool VectorCacheEnabled() const
+			{
+				return !m_vu0_memory_map &&
+					m_vector_cache_mode == VectorCacheMode::Enabled &&
+					!m_vector_cache_suspended;
+			}
+
+			bool EmitInvalidateCachedVector(u8 guest)
+			{
+				const int slot = FindVectorCacheSlot(guest);
+				if (slot < 0)
+					return true;
+				if (!EmitWritebackVectorCacheSlot(static_cast<u32>(slot)))
+					return false;
+				m_vector_cache_stats.scalar_invalidations++;
+				m_vector_cache[slot] = {};
+				return true;
+			}
+
+			bool AcquireCachedVector(u8 guest, bool needs_old_value, unsigned* qreg)
+			{
+				pxAssert(!m_vu0_memory_map && guest != 0 && qreg != nullptr);
+				int slot = FindVectorCacheSlot(guest);
+				if (slot >= 0)
+				{
+					m_vector_cache_stats.hits++;
+					if (guest == VU_VECTOR_CACHE_ACC)
+						m_vector_cache_stats.acc_hits++;
+					*qreg = VU_VECTOR_CACHE_FIRST_Q + static_cast<unsigned>(slot);
+					return true;
+				}
+
+				m_vector_cache_stats.misses++;
+				for (u32 candidate = 0; candidate < VU_VECTOR_CACHE_SLOTS; candidate++)
+				{
+					if (m_vector_cache[candidate].guest == 0)
+					{
+						slot = static_cast<int>(candidate);
+						break;
+					}
+				}
+				if (slot < 0)
+				{
+					u32 farthest_use = 0;
+					slot = 0;
+					for (u32 candidate = 0; candidate < VU_VECTOR_CACHE_SLOTS; candidate++)
+					{
+						const u32 next_use = NextAdmittedVectorUse(m_vector_cache[candidate].guest);
+						if (next_use >= farthest_use)
+						{
+							farthest_use = next_use;
+							slot = static_cast<int>(candidate);
+						}
+					}
+					m_vector_cache_stats.evictions++;
+				}
+
+				if (!EmitWritebackVectorCacheSlot(static_cast<u32>(slot)))
+					return false;
+				m_vector_cache[slot] = {guest, false};
+				*qreg = VU_VECTOR_CACHE_FIRST_Q + static_cast<unsigned>(slot);
+				if (!needs_old_value)
+					return true;
+
+				if (!EmitCanonicalVectorAddress(HOST_CALL_SCRATCH, guest) ||
+					!m_code.EmitVld1Q32Aligned(*qreg, HOST_CALL_SCRATCH))
+				{
+					return false;
+				}
+				if (guest == VU_VECTOR_CACHE_ACC)
+					m_vector_cache_stats.acc_quad_loads++;
+				else
+					m_vector_cache_stats.vf_quad_loads++;
+				return true;
+			}
+
+			bool EmitLoadCachedVectorQuad(unsigned qd, u8 guest)
+			{
+				unsigned cached_q = 0;
+				return AcquireCachedVector(guest, true, &cached_q) &&
+					(qd == cached_q || m_code.EmitVorrQ(qd, cached_q, cached_q));
+			}
+
+			bool EmitStoreCachedVectorQuad(unsigned qs, u8 guest, bool needs_old_value)
+			{
+				unsigned cached_q = 0;
+				if (!AcquireCachedVector(guest, needs_old_value, &cached_q) ||
+					(qs != cached_q && !m_code.EmitVorrQ(cached_q, qs, qs)))
+				{
+					return false;
+				}
+				m_vector_cache[cached_q - VU_VECTOR_CACHE_FIRST_Q].dirty = true;
+				return true;
+			}
+
 			u16 VfLaneOffset(unsigned reg, unsigned lane)
 			{
 				return VuOffset(static_cast<size_t>(VfOffset(reg)) + lane * sizeof(u32));
@@ -2195,17 +2607,125 @@ namespace VitaVU
 
 			bool EmitLoadVfWord(unsigned rd, unsigned reg, unsigned lane)
 			{
+				if (!RecordOrConsumeVectorAccess(static_cast<u8>(reg),
+						VectorAccessKind::WordLoad, true, nullptr) ||
+					(VectorCacheEnabled() && reg != 0 &&
+					 !EmitInvalidateCachedVector(static_cast<u8>(reg))))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.uncached_loads++;
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.vf_word_loads++;
 				return m_code.EmitLdrImm12(rd, HOST_VU, VfLaneOffset(reg, lane));
 			}
 
 			bool EmitStoreVfWord(unsigned rs, unsigned reg, unsigned lane)
 			{
+				if (!RecordOrConsumeVectorAccess(static_cast<u8>(reg),
+						VectorAccessKind::WordStore, false, nullptr) ||
+					(VectorCacheEnabled() && reg != 0 &&
+					 !EmitInvalidateCachedVector(static_cast<u8>(reg))))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map && reg != 0)
+					m_vector_cache_stats.uncached_stores++;
+				if (!m_vu0_memory_map && reg != 0)
+					m_vector_cache_stats.vf_word_stores++;
 				return m_code.EmitStrImm12(rs, HOST_VU, VfLaneOffset(reg, lane));
 			}
 
-			bool EmitAddVfAddress(unsigned rd, unsigned reg)
+			bool EmitLoadVfQuad(unsigned qd, unsigned reg)
 			{
-				return m_code.EmitAddImm32(rd, HOST_VU, VfOffset(reg));
+				bool admit = false;
+				if (!RecordOrConsumeVectorAccess(static_cast<u8>(reg),
+					VectorAccessKind::QuadLoad, true, &admit))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.uncached_loads++;
+				if (VectorCacheEnabled() && reg != 0 &&
+					(FindVectorCacheSlot(static_cast<u8>(reg)) >= 0 || admit))
+					return EmitLoadCachedVectorQuad(qd, static_cast<u8>(reg));
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.vf_quad_loads++;
+				return EmitCanonicalVectorAddress(3, static_cast<u8>(reg)) &&
+					m_code.EmitVld1Q32Aligned(qd, 3);
+			}
+
+			bool EmitStoreVfQuad(unsigned qs, unsigned reg, bool needs_old_value = false)
+			{
+				if (reg == 0)
+					return true;
+				bool admit = false;
+				if (!RecordOrConsumeVectorAccess(static_cast<u8>(reg),
+					VectorAccessKind::QuadStore, needs_old_value, &admit))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.uncached_stores++;
+				if (VectorCacheEnabled() &&
+					(FindVectorCacheSlot(static_cast<u8>(reg)) >= 0 || admit))
+					return EmitStoreCachedVectorQuad(qs, static_cast<u8>(reg), needs_old_value);
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.vf_quad_stores++;
+				return EmitCanonicalVectorAddress(3, static_cast<u8>(reg)) &&
+					m_code.EmitVst1Q32Aligned(qs, 3);
+			}
+
+			bool EmitLoadAccWord(unsigned rd, unsigned lane)
+			{
+				if (!RecordOrConsumeVectorAccess(VU_VECTOR_CACHE_ACC,
+						VectorAccessKind::WordLoad, true, nullptr) ||
+					(VectorCacheEnabled() && !EmitInvalidateCachedVector(VU_VECTOR_CACHE_ACC)))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.uncached_loads++;
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.acc_word_loads++;
+				return m_code.EmitLdrImm12(rd, HOST_VU,
+					VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32)));
+			}
+
+			bool EmitStoreAccWord(unsigned rs, unsigned lane)
+			{
+				if (!RecordOrConsumeVectorAccess(VU_VECTOR_CACHE_ACC,
+						VectorAccessKind::WordStore, false, nullptr) ||
+					(VectorCacheEnabled() && !EmitInvalidateCachedVector(VU_VECTOR_CACHE_ACC)))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.uncached_stores++;
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.acc_word_stores++;
+				return m_code.EmitStrImm12(rs, HOST_VU,
+					VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32)));
+			}
+
+			bool EmitLoadAccQuad(unsigned qd)
+			{
+				bool admit = false;
+				if (!RecordOrConsumeVectorAccess(VU_VECTOR_CACHE_ACC,
+					VectorAccessKind::QuadLoad, true, &admit))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.uncached_loads++;
+				if (VectorCacheEnabled() &&
+					(FindVectorCacheSlot(VU_VECTOR_CACHE_ACC) >= 0 || admit))
+					return EmitLoadCachedVectorQuad(qd, VU_VECTOR_CACHE_ACC);
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.acc_quad_loads++;
+				return EmitCanonicalVectorAddress(3, VU_VECTOR_CACHE_ACC) &&
+					m_code.EmitVld1Q32Aligned(qd, 3);
 			}
 
 			bool EmitStoreWordToVfMasked(unsigned value_reg, unsigned ft, unsigned mask)
@@ -2216,8 +2736,7 @@ namespace VitaVU
 				if (mask == 0x0f)
 				{
 					return m_code.EmitVdupI32QFromCore(0, value_reg) &&
-						EmitAddVfAddress(3, ft) &&
-						m_code.EmitVst1Q32Aligned(0, 3);
+						EmitStoreVfQuad(0, ft);
 				}
 
 				bool emitted = true;
@@ -2238,10 +2757,7 @@ namespace VitaVU
 					return true;
 
 				if (mask == 0x0f)
-				{
-					return EmitAddVfAddress(1, ft) &&
-						m_code.EmitVst1Q32Aligned(0, 1);
-				}
+					return EmitStoreVfQuad(0, ft);
 
 				bool emitted =
 					m_code.EmitAddImm32(1, SP, stack_offset) &&
@@ -2293,8 +2809,7 @@ namespace VitaVU
 				// SIMD arithmetic ignores FPSCR.RMode, while scalar VFP observes it.
 				// Keep the qword load/store and exact integer ABS work and use scalar
 				// VFP for rounding-sensitive arithmetic and ITOF.
-				if (!EmitAddVfAddress(0, fs) ||
-					!m_code.EmitVld1Q32Aligned(0, 0))
+				if (!EmitLoadVfQuad(0, fs))
 				{
 					return false;
 				}
@@ -2462,8 +2977,7 @@ namespace VitaVU
 				{
 					case VUInterpFast::UpperFastKind::MAX:
 					case VUInterpFast::UpperFastKind::MINI:
-						return EmitAddVfAddress(0, ft) &&
-							m_code.EmitVld1Q32Aligned(1, 0);
+						return EmitLoadVfQuad(1, ft);
 					case VUInterpFast::UpperFastKind::MAXi:
 					case VUInterpFast::UpperFastKind::MINIi:
 						return EmitLoadViWordRaw(0, REG_I) &&
@@ -2515,8 +3029,7 @@ namespace VitaVU
 				// implements VUops.cpp::fp_max()/fp_min() signed raw-bit
 				// ordering with the both-negative lane inversion.
 				bool emitted_body =
-					EmitAddVfAddress(0, fs) &&
-					m_code.EmitVld1Q32Aligned(0, 0) &&
+					EmitLoadVfQuad(0, fs) &&
 					EmitLoadUpperMinMaxOperandQ1(code, kind) &&
 					m_code.EmitVminS32Q(2, 0, 1) &&
 					m_code.EmitVmaxS32Q(3, 0, 1) &&
@@ -2779,8 +3292,7 @@ namespace VitaVU
 				VUInterpFast::UpperFastKind kind)
 			{
 				if (IsUpperVectorOperandForm(kind))
-					return EmitAddVfAddress(3, VUInterpFast::Ft(code)) &&
-						m_code.EmitVld1Q32Aligned(qd, 3);
+					return EmitLoadVfQuad(qd, VUInterpFast::Ft(code));
 
 				return EmitLoadUpperAddSubOperandWord(3, code, kind, 0) &&
 					m_code.EmitVdupI32QFromCore(qd, 3);
@@ -2824,8 +3336,7 @@ namespace VitaVU
 				VUInterpFast::UpperFastKind kind)
 			{
 				if (IsUpperVectorOperandForm(kind))
-					return EmitAddVfAddress(3, VUInterpFast::Ft(code)) &&
-						m_code.EmitVld1Q32Aligned(qd, 3);
+					return EmitLoadVfQuad(qd, VUInterpFast::Ft(code));
 
 				return EmitLoadUpperMulOperandWord(3, code, kind, 0) &&
 					m_code.EmitVdupI32QFromCore(qd, 3);
@@ -2884,8 +3395,7 @@ namespace VitaVU
 				VUInterpFast::UpperFastKind kind)
 			{
 				if (IsUpperMaddMsubVectorForm(kind))
-					return EmitAddVfAddress(3, VUInterpFast::Ft(code)) &&
-						m_code.EmitVld1Q32Aligned(qd, 3);
+					return EmitLoadVfQuad(qd, VUInterpFast::Ft(code));
 
 				return EmitLoadUpperMaddMsubOperandWord(3, code, kind, 0) &&
 					m_code.EmitVdupI32QFromCore(qd, 3);
@@ -3023,10 +3533,7 @@ namespace VitaVU
 			bool EmitStoreMacResultWord(unsigned value_reg, bool acc, unsigned fd, unsigned lane)
 			{
 				if (acc)
-				{
-					return m_code.EmitStrImm12(value_reg, HOST_VU,
-						VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32)));
-				}
+					return EmitStoreAccWord(value_reg, lane);
 
 				if (fd == 0)
 					return true;
@@ -3116,8 +3623,7 @@ namespace VitaVU
 					// Load both operands as NEON quads (Q0=fs, Q1=ft/broadcast) and
 					// normalize all four lanes at once, avoiding the per-lane scalar
 					// vuDouble() and the ARM->NEON single-register transfers.
-					if (!EmitAddVfAddress(3, fs) ||
-						!m_code.EmitVld1Q32Aligned(0, 3) ||
+					if (!EmitLoadVfQuad(0, fs) ||
 						!EmitLoadUpperAddSubOperandQuad(1, code, kind) ||
 						!EmitNormalizeVuFloatQuads(0, 1))
 					{
@@ -3186,8 +3692,7 @@ namespace VitaVU
 					// Load both operands as NEON quads (Q0=fs, Q1=ft/broadcast) and
 					// normalize all four lanes at once, avoiding the per-lane scalar
 					// vuDouble() and the ARM->NEON single-register transfers.
-					if (!EmitAddVfAddress(3, fs) ||
-						!m_code.EmitVld1Q32Aligned(0, 3) ||
+					if (!EmitLoadVfQuad(0, fs) ||
 						!EmitLoadUpperMulOperandQuad(1, code, kind) ||
 						!EmitNormalizeVuFloatQuads(0, 1))
 					{
@@ -3273,8 +3778,7 @@ namespace VitaVU
 							continue;
 						}
 
-						if (!m_code.EmitLdrImm12(0, HOST_VU,
-								VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32))) ||
+						if (!EmitLoadAccWord(0, lane) ||
 							!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
 							!m_code.EmitVmovCoreToS(0, 0) ||
 							!EmitLoadVfWord(0, fs, lane) ||
@@ -3297,10 +3801,8 @@ namespace VitaVU
 				{
 					if (mask != 0)
 					{
-						if (!m_code.EmitAddImm32(3, HOST_VU, VuOffset(offsetof(VURegs, ACC))) ||
-							!m_code.EmitVld1Q32Aligned(0, 3) ||
-							!EmitAddVfAddress(3, fs) ||
-							!m_code.EmitVld1Q32Aligned(1, 3) ||
+						if (!EmitLoadAccQuad(0) ||
+							!EmitLoadVfQuad(1, fs) ||
 							!EmitLoadUpperMaddMsubOperandQuad(2, code, kind) ||
 							!EmitNormalizeVuFloatQuads3(0, 1, 2))
 						{
@@ -3377,19 +3879,17 @@ namespace VitaVU
 				// moves it to Q2 only after the rearranged fs lanes have consumed
 				// that source. Keeping operand/result temporaries in Q0-Q3 (with
 				// normalization constants/scratch in caller-clobbered Q8-Q15) avoids
-				// Q4-Q7 and preserves AAPCS D8-D15 without a per-block VFP frame.
-				if (!EmitAddVfAddress(3, fs) ||
-					!m_code.EmitVld1Q32Aligned(2, 3) ||
-					!EmitAddVfAddress(3, ft) ||
-					!m_code.EmitVld1Q32Aligned(3, 3))
+				// Q4-Q7, which are reserved for block-local VF/ACC residency and
+				// preserved once by the generated private frame.
+				if (!EmitLoadVfQuad(2, fs) ||
+					!EmitLoadVfQuad(3, ft))
 				{
 					return false;
 				}
 
 				if (opmsub)
 				{
-					if (!m_code.EmitAddImm32(3, HOST_VU, VuOffset(offsetof(VURegs, ACC))) ||
-						!m_code.EmitVld1Q32Aligned(0, 3) ||
+					if (!EmitLoadAccQuad(0) ||
 						!EmitNormalizeVuFloatQuads3(2, 3, 0))
 					{
 						return false;
@@ -3881,10 +4381,8 @@ namespace VitaVU
 						if (mask == 0x0f)
 						{
 							emitted_body =
-								EmitAddVfAddress(0, fs) &&
-								m_code.EmitVld1Q32Aligned(0, 0) &&
-								EmitAddVfAddress(0, ft) &&
-								m_code.EmitVst1Q32Aligned(0, 0);
+								EmitLoadVfQuad(0, fs) &&
+								EmitStoreVfQuad(0, ft);
 							break;
 						}
 
@@ -3910,11 +4408,9 @@ namespace VitaVU
 						if (mask == 0x0f)
 						{
 							emitted_body =
-								EmitAddVfAddress(0, fs) &&
-								m_code.EmitVld1Q32Aligned(0, 0) &&
+								EmitLoadVfQuad(0, fs) &&
 								m_code.EmitVextI8Q(0, 0, 0, 4) &&
-								EmitAddVfAddress(0, ft) &&
-								m_code.EmitVst1Q32Aligned(0, 0);
+								EmitStoreVfQuad(0, ft);
 							break;
 						}
 
@@ -3945,8 +4441,7 @@ namespace VitaVU
 						{
 							emitted_body = emitted_body &&
 								m_code.EmitVdupI32QFromCore(0, 0) &&
-								EmitAddVfAddress(3, ft) &&
-								m_code.EmitVst1Q32Aligned(0, 3);
+								EmitStoreVfQuad(0, ft);
 							break;
 						}
 
@@ -3996,8 +4491,7 @@ namespace VitaVU
 				if (mask == 0x0f)
 				{
 					return m_code.EmitVld1Q32Aligned(0, 0) &&
-						EmitAddVfAddress(1, ft) &&
-						m_code.EmitVst1Q32Aligned(0, 1);
+						EmitStoreVfQuad(0, ft);
 				}
 
 				bool emitted = true;
@@ -4019,8 +4513,7 @@ namespace VitaVU
 
 				if (mask == 0x0f)
 				{
-					return EmitAddVfAddress(1, fs) &&
-						m_code.EmitVld1Q32Aligned(0, 1) &&
+					return EmitLoadVfQuad(0, fs) &&
 						m_code.EmitVst1Q32Aligned(0, 0);
 				}
 
@@ -5256,8 +5749,7 @@ namespace VitaVU
 				// PCSX2 owner: VUmicroFast.h::VuSumXYZSquaresNeon(). Quad load and
 				// normalize, square XYZ with FPSCR-aware scalar VFP, then reduce
 				// (x*x + y*y) + z*z with the same scalar order as the reference.
-				return EmitAddVfAddress(3, vf) &&
-					m_code.EmitVld1Q32Aligned(0, 3) &&
+				return EmitLoadVfQuad(0, vf) &&
 					EmitNormalizeVuFloatQuad1(0) &&
 					m_code.EmitVmulF32(0, 0, 0) &&
 					m_code.EmitVmulF32(1, 1, 1) &&
@@ -5270,8 +5762,7 @@ namespace VitaVU
 			{
 				// PCSX2 owner: VUmicroFast.h::VuSumXYZWNeon(). Quad load and
 				// normalize, then reduce ((x + y) + z) + w.
-				return EmitAddVfAddress(3, vf) &&
-					m_code.EmitVld1Q32Aligned(0, 3) &&
+				return EmitLoadVfQuad(0, vf) &&
 					EmitNormalizeVuFloatQuad1(0) &&
 					m_code.EmitVaddF32(0, 0, 1) &&
 					m_code.EmitVaddF32(0, 0, 2) &&
@@ -6753,8 +7244,7 @@ namespace VitaVU
 			// and the stack frame hazard slots.
 			bool EmitVfCopyToStack(unsigned vf_reg, u32 stack_offset)
 			{
-				return m_code.EmitAddImm32(0, HOST_VU, VfOffset(vf_reg)) &&
-					m_code.EmitVld1Q32Aligned(0, 0) &&
+				return EmitLoadVfQuad(0, vf_reg) &&
 					m_code.EmitAddImm32(1, SP, stack_offset) &&
 					m_code.EmitVst1Q32(0, 1);
 			}
@@ -6763,13 +7253,23 @@ namespace VitaVU
 			{
 				return m_code.EmitAddImm32(1, SP, stack_offset) &&
 					m_code.EmitVld1Q32(0, 1) &&
-					m_code.EmitAddImm32(0, HOST_VU, VfOffset(vf_reg)) &&
-					m_code.EmitVst1Q32Aligned(0, 0);
+					EmitStoreVfQuad(0, vf_reg);
 			}
 
 			bool EmitPair(u32 pair_index)
 			{
 				const PairPlan& plan = m_pairs[pair_index];
+				// microVU's paired old-value swap and D/T exits are state joins with
+				// canonical observers. Keep those uncommon pairs entirely outside the
+				// block-local mapping instead of inventing path-specific cache states.
+				const bool suspend_vector_cache = !m_vu0_memory_map &&
+					(plan.vf_backup_reg != 0 || plan.dflag || plan.tflag);
+				if (suspend_vector_cache)
+				{
+					if (!EmitFlushVectorCache())
+						return false;
+					m_vector_cache_suspended = true;
+				}
 
 				if (!EmitBudgetCheckAndCycleIncrement(pair_index))
 					return false;
@@ -6938,10 +7438,7 @@ namespace VitaVU
 				if (plan.vf_backup_reg != 0)
 				{
 					// _VFc = VF[reg]; VF[reg] = _VF (pre-upper value).
-					if (!m_code.EmitAddImm32(0, HOST_VU, VfOffset(plan.vf_backup_reg)) ||
-						!m_code.EmitVld1Q32Aligned(0, 0) ||
-						!m_code.EmitAddImm32(1, SP, 16) ||
-						!m_code.EmitVst1Q32(0, 1) ||
+					if (!EmitVfCopyToStack(plan.vf_backup_reg, 16) ||
 						!EmitVfCopyFromStack(plan.vf_backup_reg, 0))
 					{
 						return false;
@@ -7062,7 +7559,7 @@ namespace VitaVU
 						return false;
 					}
 					if (plan.ebit_store == 0 &&
-						!EmitInlineEbitFinish())
+						(!EmitFlushVectorCache() || !EmitInlineEbitFinish()))
 					{
 						return false;
 					}
@@ -7085,6 +7582,7 @@ namespace VitaVU
 					}
 				}
 
+				m_vector_cache_suspended = false;
 				return true;
 			}
 
@@ -7094,9 +7592,16 @@ namespace VitaVU
 			u32 m_mem_mask = VU1_MEMMASK;
 			bool m_vu0_memory_map = false;
 			bool m_countdown_budget = false;
+			bool m_vector_cache_suspended = false;
+			VectorCacheMode m_vector_cache_mode = VectorCacheMode::Disabled;
+			std::vector<VectorAccessEvent>* m_vector_accesses = nullptr;
+			size_t m_vector_access_cursor = 0;
+			std::array<VectorCacheSlot, VU_VECTOR_CACHE_SLOTS> m_vector_cache{};
+			VectorCacheStats m_vector_cache_stats{};
 			// True once the vuDouble() bit-select constant quads (Q8-Q11) have been
 			// materialized in this block. Q8-Q15 are exclusive to the normalize
-			// scratch (all other VU NEON ops use Q0-Q7), so once loaded the
+			// scratch (operation temporaries use Q0-Q3 and the vector cache owns
+			// Q4-Q7), so once loaded the
 			// constants survive across pairs and later FMAC/EFU ops in the same
 			// straight-line block skip re-materializing them. Fresh per block via
 			// the per-block BlockCompiler construction.
@@ -7123,6 +7628,7 @@ namespace VitaVU
 			bool entry_branch_tail = false;
 			bool entry_ebit_tail = false;
 			bool continues_logical_block_if_busy = false;
+			bool vector_cache_frame = false;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> direct_links{};
 			// Generated code embeds pointers into this array (stall-helper
 			// _VURegsNum arguments), so it must stay stable for the lifetime
@@ -7327,6 +7833,15 @@ namespace VitaVU
 					link.target_ebit_tail == target.entry_ebit_tail;
 			}
 
+			bool DirectLinkFramesCompatible(const CachedBlock& source, const CachedBlock& target)
+			{
+				// A selected block owns an additional D8-D15 save area. Linked
+				// entries bypass both prologues, so only equal private-frame ABIs
+				// may share an epilogue. Incompatible edges return through the
+				// dispatcher with canonical VF/ACC state already published.
+				return source.vector_cache_frame == target.vector_cache_frame;
+			}
+
 			bool PatchVu1DirectLink(CachedBlock& source, Vu1DirectLinkSlot& link, const void* target)
 			{
 				if (!link.valid ||
@@ -7406,8 +7921,11 @@ namespace VitaVU
 					std::array<CachedBlock*, VU1_PAIR_SLOTS>& target_map =
 						SelectBlockMap(link.target_branch_tail, link.target_ebit_tail);
 					CachedBlock* target = target_map[link.target_pc / 8];
-					if (target && target != BLOCK_UNCOMPILABLE)
+					if (target && target != BLOCK_UNCOMPILABLE &&
+						DirectLinkFramesCompatible(source, *target))
 						PatchVu1DirectLink(source, link, target->linked_entry);
+					else if (link.patched_target)
+						PatchVu1DirectLink(source, link, nullptr);
 				}
 			}
 
@@ -7420,8 +7938,11 @@ namespace VitaVU
 
 				for (Vu1DirectLinkSlot& link : source->direct_links)
 				{
-					if (DirectLinkTargetsBlock(link, target))
+					if (DirectLinkTargetsBlock(link, target) &&
+						DirectLinkFramesCompatible(*source, target))
 						PatchVu1DirectLink(*source, link, target.linked_entry);
+					else if (DirectLinkTargetsBlock(link, target) && link.patched_target)
+						PatchVu1DirectLink(*source, link, nullptr);
 				}
 			}
 		}
@@ -7532,13 +8053,98 @@ namespace VitaVU
 				if (offset < s_vu1.code_cache_capacity &&
 					code.Attach(s_vu1.code_cache + offset, s_vu1.code_cache_capacity - offset))
 				{
-					BlockCompiler compiler(code, plan, block->pairs.get(), VU1_MEMMASK);
-					if (compiler.Compile() && code.Flush())
+					std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> chosen_direct_links{};
+					size_t chosen_linked_entry_offset = static_cast<size_t>(-1);
+					BlockCompiler::VectorCacheStats chosen_vector_stats{};
+					bool compiled = false;
+					bool vector_cache_candidate = false;
+					bool vector_cache_selected = false;
+					u64 vector_cache_baseline_instructions = 0;
+					u64 vector_cache_selected_instructions = 0;
+					u64 vector_cache_canonical_bytes_removed = 0;
+					std::vector<BlockCompiler::VectorAccessEvent> vector_accesses;
+					vector_accesses.reserve(static_cast<size_t>(plan.pair_count) * 4 + 16);
+
+					const auto canonical_vector_bytes = [](const BlockCompiler::VectorCacheStats& stats) {
+						return static_cast<u64>(stats.vf_word_loads + stats.vf_word_stores +
+							stats.acc_word_loads + stats.acc_word_stores) * 4u +
+							static_cast<u64>(stats.vf_quad_loads + stats.vf_quad_stores +
+								stats.acc_quad_loads + stats.acc_quad_stores) * 16u;
+					};
+
 					{
-						block->direct_links = compiler.DirectLinks();
+						BlockCompiler baseline(code, plan, block->pairs.get(), VU1_MEMMASK,
+							BlockCompiler::VectorCacheMode::Trace, &vector_accesses);
+						if (baseline.Compile())
+						{
+							const size_t baseline_size = code.Size();
+							const auto baseline_links = baseline.DirectLinks();
+							const size_t baseline_linked_entry = baseline.LinkedEntryOffset();
+							const BlockCompiler::VectorCacheStats baseline_stats =
+								baseline.GetVectorCacheStats();
+							const BlockCompiler::VectorCacheOpportunity opportunity =
+								BlockCompiler::AnalyzeVectorCacheOpportunity(&vector_accesses);
+
+							if (!opportunity.profitable)
+							{
+								chosen_direct_links = baseline_links;
+								chosen_linked_entry_offset = baseline_linked_entry;
+								chosen_vector_stats = baseline_stats;
+								compiled = true;
+							}
+							else
+							{
+								vector_cache_candidate = true;
+								code.Reset();
+								BlockCompiler cached(code, plan, block->pairs.get(), VU1_MEMMASK,
+									BlockCompiler::VectorCacheMode::Enabled, &vector_accesses);
+								if (cached.Compile())
+								{
+									const size_t cached_size = code.Size();
+									const BlockCompiler::VectorCacheStats cached_stats =
+										cached.GetVectorCacheStats();
+									const u64 baseline_bytes = canonical_vector_bytes(baseline_stats);
+									const u64 cached_bytes = canonical_vector_bytes(cached_stats);
+									constexpr size_t MIN_TOTAL_INSTRUCTION_GAIN = 20;
+									constexpr u64 VECTOR_FRAME_TRAFFIC_BYTES = 128;
+									vector_cache_selected =
+										baseline_size >= cached_size + MIN_TOTAL_INSTRUCTION_GAIN * sizeof(u32) &&
+										baseline_bytes > cached_bytes + VECTOR_FRAME_TRAFFIC_BYTES;
+									if (vector_cache_selected)
+									{
+										chosen_direct_links = cached.DirectLinks();
+										chosen_linked_entry_offset = cached.LinkedEntryOffset();
+										chosen_vector_stats = cached_stats;
+										vector_cache_baseline_instructions = baseline_size / sizeof(u32);
+										vector_cache_selected_instructions = cached_size / sizeof(u32);
+										vector_cache_canonical_bytes_removed = baseline_bytes - cached_bytes;
+										compiled = true;
+									}
+								}
+
+								if (!vector_cache_selected)
+								{
+									code.Reset();
+									BlockCompiler fallback(code, plan, block->pairs.get(), VU1_MEMMASK);
+									if (fallback.Compile())
+									{
+										chosen_direct_links = fallback.DirectLinks();
+										chosen_linked_entry_offset = fallback.LinkedEntryOffset();
+										chosen_vector_stats = fallback.GetVectorCacheStats();
+										compiled = true;
+									}
+								}
+							}
+						}
+					}
+
+					if (compiled && code.Flush())
+					{
+						block->direct_links = chosen_direct_links;
+						block->vector_cache_frame = vector_cache_selected;
 						block->code = std::move(code);
 						block->entry = block->code.EntryPoint();
-						block->linked_entry = static_cast<const u8*>(block->entry) + compiler.LinkedEntryOffset();
+						block->linked_entry = static_cast<const u8*>(block->entry) + chosen_linked_entry_offset;
 						block->code_size = block->code.Size();
 						if (!PatchVu1RuntimeLinkSlotPointers(*block))
 							break;
@@ -7546,6 +8152,42 @@ namespace VitaVU
 						s_vu1.stats.code_cache_used = s_vu1.code_cache_used;
 						s_vu1.stats.compiled_blocks++;
 						s_vu1.stats.compiled_pairs += plan.pair_count;
+						const BlockCompiler::VectorCacheStats& vector_stats = chosen_vector_stats;
+						if (vector_cache_candidate)
+							s_vu1.stats.vector_cache_candidate_blocks++;
+						if (vector_cache_selected)
+						{
+							s_vu1.stats.vector_cache_selected_blocks++;
+							s_vu1.stats.vector_cache_baseline_instructions +=
+								vector_cache_baseline_instructions;
+							s_vu1.stats.vector_cache_selected_instructions +=
+								vector_cache_selected_instructions;
+							s_vu1.stats.vector_cache_instructions_removed +=
+								vector_cache_baseline_instructions - vector_cache_selected_instructions;
+							s_vu1.stats.vector_cache_canonical_bytes_removed +=
+								vector_cache_canonical_bytes_removed;
+						}
+						else if (vector_cache_candidate)
+						{
+							s_vu1.stats.vector_cache_rejected_blocks++;
+						}
+						s_vu1.stats.vector_cache_hits += vector_stats.hits;
+						s_vu1.stats.vector_cache_misses += vector_stats.misses;
+						s_vu1.stats.vector_cache_evictions += vector_stats.evictions;
+						s_vu1.stats.vector_cache_writebacks += vector_stats.writebacks;
+						s_vu1.stats.vector_cache_acc_hits += vector_stats.acc_hits;
+						s_vu1.stats.vector_cache_scalar_invalidations +=
+							vector_stats.scalar_invalidations;
+						s_vu1.stats.uncached_vector_loads += vector_stats.uncached_loads;
+						s_vu1.stats.uncached_vector_stores += vector_stats.uncached_stores;
+						s_vu1.stats.canonical_vf_word_loads += vector_stats.vf_word_loads;
+						s_vu1.stats.canonical_vf_word_stores += vector_stats.vf_word_stores;
+						s_vu1.stats.canonical_vf_quad_loads += vector_stats.vf_quad_loads;
+						s_vu1.stats.canonical_vf_quad_stores += vector_stats.vf_quad_stores;
+						s_vu1.stats.canonical_acc_word_loads += vector_stats.acc_word_loads;
+						s_vu1.stats.canonical_acc_word_stores += vector_stats.acc_word_stores;
+						s_vu1.stats.canonical_acc_quad_loads += vector_stats.acc_quad_loads;
+						s_vu1.stats.canonical_acc_quad_stores += vector_stats.acc_quad_stores;
 						if (plan.entry_branch_tail)
 						{
 							s_vu1.stats.branch_continuation_blocks++;
@@ -7765,7 +8407,8 @@ namespace VitaVU
 			return block;
 		}
 
-			const void* LookupVu1DirectLinkBlock(VURegs* vu, Vu1DirectLinkSlot* runtime_link)
+			const void* LookupVu1DirectLinkBlockCommon(VURegs* vu,
+				Vu1DirectLinkSlot* runtime_link, bool source_vector_frame)
 			{
 				if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
 				{
@@ -7793,6 +8436,12 @@ namespace VitaVU
 				CachedBlock* block = map[target_pc / 8];
 				if (!block || block == BLOCK_UNCOMPILABLE)
 					return nullptr;
+				if (block->vector_cache_frame != source_vector_frame ||
+					(runtime_link && (!runtime_link->owner ||
+						runtime_link->owner->vector_cache_frame != source_vector_frame)))
+				{
+					return nullptr;
+				}
 
 				s_vu1.stats.direct_link_exits++;
 				if (Vu1DirectLinkSlot* observed_link = SelectVu1RuntimeObservedSlot(
@@ -7813,6 +8462,18 @@ namespace VitaVU
 					}
 				}
 				return block->linked_entry;
+			}
+
+			const void* LookupVu1DirectLinkBlockScalar(VURegs* vu,
+				Vu1DirectLinkSlot* runtime_link)
+			{
+				return LookupVu1DirectLinkBlockCommon(vu, runtime_link, false);
+			}
+
+			const void* LookupVu1DirectLinkBlockVector(VURegs* vu,
+				Vu1DirectLinkSlot* runtime_link)
+			{
+				return LookupVu1DirectLinkBlockCommon(vu, runtime_link, true);
 			}
 	} // anonymous namespace
 
@@ -8168,9 +8829,11 @@ namespace VitaVU
 #if defined(VITASX2_QEMU_VALIDATION)
 		stats.linked_frame_entries = g_qemuVuJitLinkedFrameEntries;
 		stats.linked_frame_instructions_removed =
-			static_cast<u64>(g_qemuVuJitLinkedFrameEntries) * 10;
+			static_cast<u64>(g_qemuVuJitLinkedFrameEntries) * 10 +
+			static_cast<u64>(g_qemuVuJitLinkedVectorFrameEntries) * 4;
 		stats.linked_frame_stack_words_removed =
-			static_cast<u64>(g_qemuVuJitLinkedFrameEntries) * 18;
+			static_cast<u64>(g_qemuVuJitLinkedFrameEntries) * 18 +
+			static_cast<u64>(g_qemuVuJitLinkedVectorFrameEntries) * 32;
 #endif
 		return stats;
 	}
@@ -8179,6 +8842,7 @@ namespace VitaVU
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuVuJitLinkedFrameEntries = 0;
+		g_qemuVuJitLinkedVectorFrameEntries = 0;
 #endif
 		const size_t used = s_vu1.stats.code_cache_used;
 		const size_t capacity = s_vu1.stats.code_cache_capacity;
