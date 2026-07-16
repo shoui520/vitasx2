@@ -142,6 +142,12 @@ u32 g_qemuCompatibleVtlbWritePointerTranslationInstructions = 0;
 u32 g_qemuCompatibleVtlbWritePointerHotInstructionsElided = 0;
 u32 g_qemuCompatibleVtlbWritePointerPostIncrementStores = 0;
 u32 g_qemuCompatibleVtlbWritePointerColdInvalidations = 0;
+u32 g_qemuCompatibleVtlbStaticPageBlocks = 0;
+u32 g_qemuCompatibleVtlbStaticPageGuardInstructions = 0;
+u32 g_qemuCompatibleVtlbStaticPageTranslationInstructions = 0;
+u32 g_qemuCompatibleVtlbStaticPageDirectAccesses = 0;
+u32 g_qemuCompatibleVtlbStaticPageGenericTranslationsElided = 0;
+u32 g_qemuCompatibleVtlbStaticPageColdFallbackSites = 0;
 u32 g_qemuReclaimedVtlbCanonicalEdges = 0;
 u32 g_qemuReclaimedVtlbCanonicalEdgeReloadInstructions = 0;
 u32 g_qemuCompatiblePredicateBlocks = 0;
@@ -4417,6 +4423,21 @@ namespace VitaEE
 					pointer.guest_result != 0 && pointer.guest_result2 != 0 &&
 					pointer.stride == 1);
 		};
+		const bool valid_static_page = !vtlb_static_page.IsValid() ||
+			(vtlb_static_page.host == VTLB_STATIC_PAGE_HOST &&
+			 vtlb_static_page.guest_base != 0 &&
+			 vtlb_static_page.guest_base < 32 &&
+			 (vtlb_static_page.alignment_mask == 0 ||
+			  vtlb_static_page.alignment_mask == 1 ||
+			  vtlb_static_page.alignment_mask == 3) &&
+			 vtlb_static_page.max_offset_end != 0 &&
+			 vtlb_static_page.max_offset_end <= vtlb_private::VTLB_PAGE_SIZE &&
+			 vtlb_static_page.access_count >= 9 &&
+			 (vtlb_static_page.access_block_pc & 3u) == 0 &&
+			 vtlb_static_page.representation ==
+				 VtlbStaticPageLinkRepresentation::DirectHostBase &&
+			 vtlb_static_page.provenance ==
+				 VtlbStaticPageLinkProvenance::GuardedVtlbVirtualMapping);
 		if (count == 0 || count > MAX_PINS || block_count < 1 ||
 			block_count > MAX_BLOCKS ||
 			(scheduler.IsValid() && scheduler.host != SCHEDULER_HOST) ||
@@ -4424,6 +4445,9 @@ namespace VitaEE
 				VtlbPointerLinkDirection::Read) ||
 			!valid_pointer(vtlb_write_pointer, VTLB_WRITE_POINTER_HOST,
 				VtlbPointerLinkDirection::Write) ||
+			!valid_static_page ||
+			(vtlb_static_page.IsValid() &&
+				(vtlb_pointer.IsValid() || vtlb_write_pointer.IsValid())) ||
 			(vtlb_write_pointer.IsValid() && vtlb_pointer.IsValid() &&
 				((vtlb_pointer.width != VtlbPointerLinkWidth::Byte8 &&
 				  vtlb_pointer.width != VtlbPointerLinkWidth::BytePair8) ||
@@ -4470,6 +4494,8 @@ namespace VitaEE
 			(vtlb_write_pointer.IsValid() &&
 				(!contains_block_pc(vtlb_write_pointer.access_block_pc) ||
 				 !contains_block_pc(vtlb_write_pointer.advance_pc))) ||
+			(vtlb_static_page.IsValid() &&
+				 !contains_block_pc(vtlb_static_page.access_block_pc)) ||
 			(predicate.IsValid() &&
 				(!contains_block_pc(predicate.producer_block_pc) ||
 				 !contains_block_pc(predicate.consumer_pc))))
@@ -4479,6 +4505,8 @@ namespace VitaEE
 
 		u16 host_mask = vtlb_write_pointer.IsValid() ?
 			static_cast<u16>(1u << VTLB_WRITE_POINTER_HOST) : 0;
+		if (vtlb_static_page.IsValid())
+			host_mask |= static_cast<u16>(1u << VTLB_STATIC_PAGE_HOST);
 		const auto valid_mapping_host = [](u8 host) {
 			return host == 1 || host == 3 ||
 				(host >= FIRST_HOST && host <= LAST_CALLEE_HOST) ||
@@ -4498,7 +4526,8 @@ namespace VitaEE
 			if ((!default_mapping_host(mapping.low_host) ||
 				(mapping.width == GprLinkWidth::Low64 &&
 				 !default_mapping_host(mapping.high_host))) &&
-				!vtlb_pointer.IsValid() && !vtlb_write_pointer.IsValid())
+				!vtlb_pointer.IsValid() && !vtlb_write_pointer.IsValid() &&
+				!vtlb_static_page.IsValid())
 			{
 				return false;
 			}
@@ -5629,6 +5658,197 @@ namespace VitaEE
 				}
 			}
 		}
+
+		// PCSX2 owner: x86/ix86-32/recVTLB.cpp::DynGen_PrepRegs() and the
+		// iCore MODE_READ allocator. x86 fastmem removes translation from every
+		// direct access; Cortex-A9 cannot reserve that 4 GiB aperture, so retain one
+		// guarded page translation for a repeatedly-used, invariant scalar base.
+		// r11 carries the direct host address; the clean invariant guest base is
+		// loaded once while staging rather than consuming a durable host register.
+		// r7/r8 remain the ordinary resident vmap/host-base pair for other pages,
+		// while r9/r10 remain available for the chain's hottest guest values.
+		// The page span and alignment are part of the compatible-link signature;
+		// canonical entries poison r11, and failed guards use the ordinary per-access
+		// vTLB path without invoking a handler early.
+		const auto try_add_static_scalar_page = [&]() {
+			if (signature->vtlb_pointer.IsValid() ||
+				signature->vtlb_write_pointer.IsValid() ||
+				EmuConfig.Gamefixes.GoemonTlbHack ||
+				EmuConfig.Cpu.Recompiler.EnableEECache)
+			{
+				return false;
+			}
+
+			u16 access_counts[32]{};
+			u16 block_access_counts[GprLinkSignature::MAX_BLOCKS][32]{};
+			u16 max_offset_ends[32]{};
+			u8 alignment_masks[32]{};
+			for (u8 block = 0; block < chain_block_count; block++)
+			{
+				for (u32 i = 0; i < chain_instruction_counts[block]; i++)
+				{
+					const u32 op = memRead32(chain_pcs[block] + i * sizeof(u32));
+					const unsigned opcode = op >> 26;
+					u32 size = 0;
+					u8 alignment_mask = 0;
+					switch (opcode)
+					{
+						case 0x20: // LB
+						case 0x24: // LBU
+						case 0x28: // SB
+							size = 1;
+							break;
+						case 0x21: // LH
+						case 0x25: // LHU
+						case 0x29: // SH
+							size = 2;
+							alignment_mask = 1;
+							break;
+						case 0x23: // LW
+						case 0x27: // LWU
+						case 0x2b: // SW
+							size = 4;
+							alignment_mask = 3;
+							break;
+						case 0x1a: // LDL
+						case 0x1b: // LDR
+						case 0x1e: // LQ
+						case 0x1f: // SQ
+						case 0x22: // LWL
+						case 0x26: // LWR
+						case 0x2a: // SWL
+						case 0x2c: // SDL
+						case 0x2d: // SDR
+						case 0x2e: // SWR
+						case 0x31: // LWC1
+						case 0x36: // LQC2
+						case 0x37: // LD
+						case 0x39: // SWC1
+						case 0x3e: // SQC2
+						case 0x3f: // SD
+							return false;
+						default:
+							continue;
+					}
+
+					const unsigned base = RS(op);
+					const s32 offset = IMM_S(op);
+					if (base == 0 || offset < 0 ||
+						(static_cast<u32>(offset) & alignment_mask) != 0)
+					{
+						continue;
+					}
+					const u32 end = static_cast<u32>(offset) + size;
+					if (end > vtlb_private::VTLB_PAGE_SIZE)
+						continue;
+
+					access_counts[base]++;
+					block_access_counts[block][base]++;
+					max_offset_ends[base] = std::max<u16>(
+						max_offset_ends[base], static_cast<u16>(end));
+					alignment_masks[base] = std::max(alignment_masks[base], alignment_mask);
+				}
+			}
+
+			unsigned best_base = 0;
+			u16 best_count = 8;
+			for (unsigned base = 1; base < 32; base++)
+			{
+				u16 concentrated_count = 0;
+				for (u8 block = 0; block < chain_block_count; block++)
+				{
+					concentrated_count = std::max(
+						concentrated_count, block_access_counts[block][base]);
+				}
+				if (writes[base] == 0 && concentrated_count >= 9 &&
+					access_counts[base] > best_count)
+				{
+					best_base = base;
+					best_count = access_counts[base];
+				}
+			}
+			if (best_base == 0)
+				return false;
+
+			u8 access_block = 0;
+			for (u8 block = 1; block < chain_block_count; block++)
+			{
+				if (block_access_counts[block][best_base] >
+						block_access_counts[access_block][best_base] ||
+					(block_access_counts[block][best_base] ==
+						block_access_counts[access_block][best_base] &&
+					 chain_pcs[block] < chain_pcs[access_block]))
+				{
+					access_block = block;
+				}
+			}
+			if (block_access_counts[access_block][best_base] < 9)
+				return false;
+
+			for (GprLinkMapping& mapping : signature->mappings)
+				mapping = {};
+			signature->count = 0;
+			const auto add_mapping = [&](unsigned guest, unsigned low_host,
+				unsigned high_host, GprLinkWidth width) {
+				if (guest == 0 || signature->count >= GprLinkSignature::MAX_PINS)
+					return false;
+				GprLinkMapping& mapping = signature->mappings[signature->count++];
+				mapping.guest = static_cast<u8>(guest);
+				mapping.low_host = static_cast<u8>(low_host);
+				mapping.high_host = width == GprLinkWidth::Low64 ?
+					static_cast<u8>(high_host) : GprLinkMapping::NO_HOST;
+				mapping.width = width;
+				mapping.dirty = writes[guest] != 0 ?
+					GprLinkDirtyState::WriteBack : GprLinkDirtyState::Clean;
+				return true;
+			};
+			u16 remaining_scores[32];
+			for (unsigned reg = 0; reg < 32; reg++)
+			{
+				remaining_scores[reg] = reg == best_base ? 0 : scores[reg];
+			}
+			for (unsigned mapping_index = 0; mapping_index < 2; mapping_index++)
+			{
+				unsigned best_reg = 0;
+				u16 best_score = 0;
+				for (unsigned reg = 1; reg < 32; reg++)
+				{
+					if (remaining_scores[reg] > best_score)
+					{
+						best_reg = reg;
+						best_score = remaining_scores[reg];
+					}
+				}
+				if (best_reg == 0)
+					break;
+				if (!add_mapping(best_reg,
+						GprLinkSignature::DEFAULT_FIRST_HOST + mapping_index,
+						GprLinkMapping::NO_HOST, GprLinkWidth::Low32))
+				{
+					return false;
+				}
+				remaining_scores[best_reg] = 0;
+			}
+			// GprLinkSignature's existing compatible-entry machinery requires at
+			// least one scalar mapping. A chain containing only base+r0 memory work
+			// can still use the page pointer, so carry the clean base as a fallback.
+			if (signature->count == 0 &&
+				!add_mapping(best_base, GprLinkSignature::DEFAULT_FIRST_HOST,
+					GprLinkMapping::NO_HOST, GprLinkWidth::Low32))
+			{
+				return false;
+			}
+
+			VtlbStaticPageLinkMapping& page = signature->vtlb_static_page;
+			page.host = GprLinkSignature::VTLB_STATIC_PAGE_HOST;
+			page.guest_base = static_cast<u8>(best_base);
+			page.alignment_mask = alignment_masks[best_base];
+			page.max_offset_end = max_offset_ends[best_base];
+			page.access_count = best_count;
+			page.access_block_pc = chain_pcs[access_block];
+			return true;
+		};
+		try_add_static_scalar_page();
 
 		// PCSX2 owners: x86/iCore.cpp's MODE_READ mappings and
 		// x86/ix86-32/iR5900Branch.cpp::recBNE() let a linked consumer reuse the
@@ -8681,11 +8901,12 @@ namespace VitaEE
 	bool BlockCompiler::EmitPoisonCompatibleVtlbPointer()
 	{
 		if (!m_gpr_link_signature.HasVtlbPointer() &&
-			!m_gpr_link_signature.HasVtlbWritePointer())
+			!m_gpr_link_signature.HasVtlbWritePointer() &&
+			!m_gpr_link_signature.HasVtlbStaticPage())
 			return true;
 
-		// Canonical/dispatcher entries cannot inherit the private r12 mapping.
-		// The byte-copy signature also carries its independent r3 write mapping.
+		// Canonical/dispatcher entries cannot inherit private translated addresses.
+		// Stream signatures use r12/r3; fixed-base page signatures use r11.
 		// Compatible links jump past these poisons after signature equality proves
 		// both pointers' guest registers, widths, directions, and vTLB provenance.
 		const size_t poison_start = m_code.Size();
@@ -8703,7 +8924,109 @@ namespace VitaEE
 		return (!m_gpr_link_signature.HasVtlbPointer() ||
 				m_code.EmitMovImm8(GprLinkSignature::VTLB_POINTER_HOST, 0)) &&
 			(!m_gpr_link_signature.HasVtlbWritePointer() ||
-				m_code.EmitMovImm8(GprLinkSignature::VTLB_WRITE_POINTER_HOST, 0));
+				m_code.EmitMovImm8(GprLinkSignature::VTLB_WRITE_POINTER_HOST, 0)) &&
+			(!m_gpr_link_signature.HasVtlbStaticPage() ||
+				m_code.EmitMovImm8(GprLinkSignature::VTLB_STATIC_PAGE_HOST, 0));
+	}
+
+	bool BlockCompiler::EmitStageCompatibleVtlbStaticPage()
+	{
+		const VtlbStaticPageLinkMapping& page =
+			m_gpr_link_signature.vtlb_static_page;
+		if (!m_compatible_vtlb_static_page_access ||
+			m_current_block_start_pc != page.access_block_pc)
+			return true;
+		if (!page.IsValid() || page.max_offset_end == 0 ||
+			page.max_offset_end > vtlb_private::VTLB_PAGE_SIZE)
+		{
+			return false;
+		}
+
+		// This is a speculative, non-observable guard. It must neither raise an
+		// address error nor invoke a handler: a failed condition leaves r11 zero,
+		// and the first actual guest access takes its ordinary vTLB cold path.
+		const size_t guard_start = m_code.Size();
+		if (!m_code.EmitCmpImm32(page.host, 0))
+			return false;
+		const size_t already_valid =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (already_valid == static_cast<size_t>(-1))
+		{
+			return false;
+		}
+		const int base_host = FindGprPinHost(page.guest_base);
+		if ((base_host >= 0 &&
+				!m_code.EmitMovRegShiftImm(page.host,
+					static_cast<unsigned>(base_host), VitaA32::ShiftType::LSL, 0)) ||
+			(base_host < 0 && !EmitLoadGprLow(page.guest_base, page.host)))
+		{
+			return false;
+		}
+
+		size_t invalid_alignment = static_cast<size_t>(-1);
+		if (page.alignment_mask != 0)
+		{
+			if (!m_code.EmitTstImm32(page.host, page.alignment_mask))
+				return false;
+			invalid_alignment =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (invalid_alignment == static_cast<size_t>(-1))
+				return false;
+		}
+
+		if (!EmitAndImm32OrReg(HOST_TMP0, page.host,
+				vtlb_private::VTLB_PAGE_MASK, HOST_TMP2) ||
+			!EmitCmpImm32OrReg(HOST_TMP0,
+				vtlb_private::VTLB_PAGE_SIZE - page.max_offset_end, HOST_TMP2))
+		{
+			return false;
+		}
+		const size_t invalid_range =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::HI);
+		if (invalid_range == static_cast<size_t>(-1))
+			return false;
+		const size_t guard_end = m_code.Size();
+
+		size_t handler_fallback = static_cast<size_t>(-1);
+		const size_t translation_start = m_code.Size();
+		if (!EmitVtlbNonHandlerHostAddress(
+				page.host, HOST_TMP1, HOST_TMP2, &handler_fallback))
+		{
+			return false;
+		}
+		const size_t translation_end = m_code.Size();
+		const size_t skip_invalid = m_code.EmitBranchPlaceholder();
+		if (skip_invalid == static_cast<size_t>(-1))
+			return false;
+
+		const size_t invalid_target = m_code.Size();
+		if ((invalid_alignment != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(invalid_alignment, invalid_target,
+					VitaA32::Condition::NE)) ||
+			!m_code.PatchBranch(invalid_range, invalid_target,
+				VitaA32::Condition::HI) ||
+			!m_code.PatchBranch(handler_fallback, invalid_target,
+				VitaA32::Condition::MI) ||
+			!m_code.EmitMovImm8(page.host, 0))
+		{
+			return false;
+		}
+
+		const size_t ready = m_code.Size();
+		if (!m_code.PatchBranch(already_valid, ready, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(skip_invalid, ready))
+		{
+			return false;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCompatibleVtlbStaticPageBlocks++;
+		g_qemuCompatibleVtlbStaticPageGuardInstructions += static_cast<u32>(
+			(guard_end - guard_start) / sizeof(u32));
+		g_qemuCompatibleVtlbStaticPageTranslationInstructions += static_cast<u32>(
+			(translation_end - translation_start) / sizeof(u32));
+#endif
+		return true;
 	}
 
 	bool BlockCompiler::EmitStageCompatibleVtlbPointerMapping(
@@ -10657,6 +10980,8 @@ namespace VitaEE
 		m_compatible_vtlb_write_pointer_access =
 			m_gpr_link_signature.HasVtlbWritePointer() &&
 			start_pc == m_gpr_link_signature.vtlb_write_pointer.access_block_pc;
+		m_compatible_vtlb_static_page_access =
+			m_gpr_link_signature.HasVtlbStaticPage();
 		m_compatible_predicate_consumer = m_gpr_link_signature.HasPredicate() &&
 			start_pc == m_gpr_link_signature.predicate.consumer_pc;
 		const u32 compatible_predicate_consumer_pc =
@@ -10820,7 +11145,8 @@ namespace VitaEE
 					return false;
 			}
 		}
-		if (!EmitStageCompatibleVtlbPointer())
+		if (!EmitStageCompatibleVtlbStaticPage() ||
+			!EmitStageCompatibleVtlbPointer())
 			return false;
 		if (compatible_vtlb_fast_entries)
 		{
@@ -11474,12 +11800,14 @@ namespace VitaEE
 			const bool preserve_dirty_not_taken_link =
 				(m_dirty_pins_enabled || m_compatible_scheduler_countdown ||
 				 m_compatible_vtlb_pointer ||
-				 m_gpr_link_signature.HasVtlbWritePointer()) &&
+				 m_gpr_link_signature.HasVtlbWritePointer() ||
+				 m_gpr_link_signature.HasVtlbStaticPage()) &&
 				m_gpr_link_signature.ContainsPc(next_pc);
 			const bool preserve_dirty_taken_link =
 				(m_dirty_pins_enabled || m_compatible_scheduler_countdown ||
 				 m_compatible_vtlb_pointer ||
-				 m_gpr_link_signature.HasVtlbWritePointer()) &&
+				 m_gpr_link_signature.HasVtlbWritePointer() ||
+				 m_gpr_link_signature.HasVtlbStaticPage()) &&
 				m_gpr_link_signature.ContainsPc(branch_target_pc);
 			const bool use_compatible_likely_suffix =
 				(m_compatible_likely_taken_suffix ||
@@ -11538,12 +11866,14 @@ namespace VitaEE
 		const bool preserve_dirty_direct_link =
 			(m_dirty_pins_enabled || m_compatible_scheduler_countdown ||
 			 m_compatible_vtlb_pointer ||
-			 m_gpr_link_signature.HasVtlbWritePointer()) &&
+			 m_gpr_link_signature.HasVtlbWritePointer() ||
+			 m_gpr_link_signature.HasVtlbStaticPage()) &&
 			m_gpr_link_signature.ContainsPc(direct_link_pc);
 		const bool preserve_dirty_taken_link = preserve_dirty_self_link ||
 			((m_dirty_pins_enabled || m_compatible_scheduler_countdown ||
 			  m_compatible_vtlb_pointer ||
-			  m_gpr_link_signature.HasVtlbWritePointer()) &&
+			  m_gpr_link_signature.HasVtlbWritePointer() ||
+			  m_gpr_link_signature.HasVtlbStaticPage()) &&
 			 m_gpr_link_signature.ContainsPc(branch_target_pc));
 		// TLBWI/TLBWR deliberately suppress outgoing generated links so their
 		// deferred cache invalidation is consumed at the provider boundary. Such a
@@ -12130,7 +12460,8 @@ namespace VitaEE
 		direct_link->requires_compatible_entry = true;
 		direct_link->compatible_scheduler_countdown = true;
 		direct_link->compatible_vtlb_pointer = m_compatible_vtlb_pointer ||
-			m_gpr_link_signature.HasVtlbWritePointer();
+			m_gpr_link_signature.HasVtlbWritePointer() ||
+			m_gpr_link_signature.HasVtlbStaticPage();
 		direct_link->compatible_words = m_gpr_link_signature.WordCount();
 		direct_link->compatible_dirty_words = m_gpr_link_signature.DirtyWordCount();
 		*emitted = true;
@@ -12201,7 +12532,8 @@ namespace VitaEE
 				m_compatible_scheduler_countdown;
 			direct_link->compatible_vtlb_pointer = requires_compatible_entry &&
 				(m_compatible_vtlb_pointer ||
-				 m_gpr_link_signature.HasVtlbWritePointer());
+				 m_gpr_link_signature.HasVtlbWritePointer() ||
+				 m_gpr_link_signature.HasVtlbStaticPage());
 			direct_link->compatible_words = requires_compatible_entry ?
 				m_gpr_link_signature.WordCount() : 0;
 			direct_link->compatible_dirty_words = requires_compatible_entry ?
@@ -12284,7 +12616,8 @@ namespace VitaEE
 				m_compatible_scheduler_countdown;
 			direct_link->compatible_vtlb_pointer = requires_compatible_entry &&
 				(m_compatible_vtlb_pointer ||
-				 m_gpr_link_signature.HasVtlbWritePointer());
+				 m_gpr_link_signature.HasVtlbWritePointer() ||
+				 m_gpr_link_signature.HasVtlbStaticPage());
 			direct_link->compatible_words = requires_compatible_entry ?
 				m_gpr_link_signature.WordCount() : 0;
 			direct_link->compatible_dirty_words = requires_compatible_entry ?
@@ -12850,7 +13183,8 @@ namespace VitaEE
 				m_compatible_scheduler_countdown;
 			direct_link->compatible_vtlb_pointer = sync_private_exit &&
 				(m_compatible_vtlb_pointer ||
-				 m_gpr_link_signature.HasVtlbWritePointer());
+				 m_gpr_link_signature.HasVtlbWritePointer() ||
+				 m_gpr_link_signature.HasVtlbStaticPage());
 			direct_link->compatible_words = sync_private_exit ?
 				m_gpr_link_signature.WordCount() : 0;
 			direct_link->compatible_dirty_words = sync_private_exit ?
@@ -26515,6 +26849,31 @@ namespace VitaEE
 				   m_code.EmitStrbImm12(rt_host, HOST_TMP0, 0);
 		};
 
+		if (IsCompatibleVtlbStaticPageAccess(
+				op, ScalarStoreWidth::Byte, 0))
+		{
+			size_t static_page_fallback = static_cast<size_t>(-1);
+			const GprPinDirtyMasks dirty_pins = CurrentGprPinDirtyMasks();
+			if (!EmitCompatibleVtlbStaticPageAddress(
+					op, HOST_TMP0, &static_page_fallback) ||
+				!emit_store_to_host() ||
+				!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u8)))
+			{
+				return false;
+			}
+
+			ScalarStoreColdTail tail{
+				static_cast<size_t>(-1), static_cast<size_t>(-1), m_code.Size(),
+				0, 0, nullptr, reinterpret_cast<const void*>(&memWrite8),
+				rt, ScalarStoreWidth::Byte};
+			tail.address_reg = HOST_TMP0;
+			tail.dirty_pins = dirty_pins;
+			tail.static_page_fallback = static_page_fallback;
+			tail.op = op;
+			CaptureScalarStoreValue(&tail);
+			return m_scalar_store_cold_tails.push_back(tail);
+		}
+
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
 			TryEmitKnownVtlbNonHandlerHostAddress(known_address, HOST_TMP0))
@@ -26569,6 +26928,32 @@ namespace VitaEE
 			return EmitGprLowValueOperand(rt, HOST_TMP1, &rt_host) &&
 				   m_code.EmitStrhImm8(rt_host, HOST_TMP0, 0);
 		};
+
+		if (IsCompatibleVtlbStaticPageAccess(
+				op, ScalarStoreWidth::Halfword, 1))
+		{
+			size_t static_page_fallback = static_cast<size_t>(-1);
+			const GprPinDirtyMasks dirty_pins = CurrentGprPinDirtyMasks();
+			if (!EmitCompatibleVtlbStaticPageAddress(
+					op, HOST_TMP0, &static_page_fallback) ||
+				!emit_store_to_host() ||
+				!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u16)))
+			{
+				return false;
+			}
+
+			ScalarStoreColdTail tail{
+				static_cast<size_t>(-1), static_cast<size_t>(-1), m_code.Size(),
+				pc, raw_cycles_through_instruction, event_exit,
+				reinterpret_cast<const void*>(&memWrite16), rt,
+				ScalarStoreWidth::Halfword};
+			tail.address_reg = HOST_TMP0;
+			tail.dirty_pins = dirty_pins;
+			tail.static_page_fallback = static_page_fallback;
+			tail.op = op;
+			CaptureScalarStoreValue(&tail);
+			return m_scalar_store_cold_tails.push_back(tail);
+		}
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -26636,6 +27021,32 @@ namespace VitaEE
 			return EmitGprLowValueOperand(rt, HOST_TMP1, &rt_host) &&
 				   m_code.EmitStrImm12(rt_host, HOST_TMP0, 0);
 		};
+
+		if (IsCompatibleVtlbStaticPageAccess(
+				op, ScalarStoreWidth::Word, 3))
+		{
+			size_t static_page_fallback = static_cast<size_t>(-1);
+			const GprPinDirtyMasks dirty_pins = CurrentGprPinDirtyMasks();
+			if (!EmitCompatibleVtlbStaticPageAddress(
+					op, HOST_TMP0, &static_page_fallback) ||
+				!emit_store_to_host() ||
+				!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u32)))
+			{
+				return false;
+			}
+
+			ScalarStoreColdTail tail{
+				static_cast<size_t>(-1), static_cast<size_t>(-1), m_code.Size(),
+				pc, raw_cycles_through_instruction, event_exit,
+				reinterpret_cast<const void*>(&memWrite32), rt,
+				ScalarStoreWidth::Word};
+			tail.address_reg = HOST_TMP0;
+			tail.dirty_pins = dirty_pins;
+			tail.static_page_fallback = static_page_fallback;
+			tail.op = op;
+			CaptureScalarStoreValue(&tail);
+			return m_scalar_store_cold_tails.push_back(tail);
+		}
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -30665,6 +31076,39 @@ namespace VitaEE
 			});
 		}
 
+		if (IsCompatibleVtlbStaticPageAccess(op, width, alignment_mask))
+		{
+			const GprPinDirtyMasks access_dirty_pins = CurrentGprPinDirtyMasks();
+			size_t static_page_fallback = static_cast<size_t>(-1);
+			if (!EmitCompatibleVtlbStaticPageAddress(
+					op, address_reg, &static_page_fallback) ||
+				(!skip_zero_load_result &&
+					(!emit_load_from_host() || !emit_store_result())))
+			{
+				return false;
+			}
+
+			ScalarLoadColdTail tail{
+				static_cast<size_t>(-1),
+				static_cast<size_t>(-1),
+				m_code.Size(),
+				pc,
+				raw_cycles_through_instruction,
+				event_exit,
+				read_helper,
+				width,
+				static_cast<u8>(rt),
+				sign_extend,
+				branch_delay_slot,
+				counter_read_event,
+				address_reg,
+				access_dirty_pins,
+			};
+			tail.static_page_fallback = static_page_fallback;
+			tail.op = op;
+			return m_scalar_load_cold_tails.push_back(tail);
+		}
+
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
 			(alignment_mask == 0 || (known_address & alignment_mask) == 0) &&
@@ -31052,6 +31496,89 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitScalarLoadColdTail(const ScalarLoadColdTail& tail)
 	{
+		if (tail.static_page_fallback == static_cast<size_t>(-1))
+			return EmitResolvedScalarLoadColdTail(tail);
+		if (tail.op == 0 || tail.width == ScalarLoadWidth::Dword)
+			return false;
+
+		ScalarLoadColdTail resolved = tail;
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.static_page_fallback, fallback_target,
+				VitaA32::Condition::EQ) ||
+			!EmitEffectiveAddress(tail.op, HOST_TMP0))
+		{
+			return false;
+		}
+
+		u8 alignment_mask = 0;
+		if (tail.width == ScalarLoadWidth::Halfword)
+			alignment_mask = 1;
+		else if (tail.width == ScalarLoadWidth::Word)
+			alignment_mask = 3;
+		if (alignment_mask != 0)
+		{
+			if (!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0,
+					alignment_mask, true))
+			{
+				return false;
+			}
+			resolved.unaligned_fallback =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (resolved.unaligned_fallback == static_cast<size_t>(-1))
+				return false;
+		}
+
+		if (!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2,
+				&resolved.handler_fallback))
+		{
+			return false;
+		}
+
+		if (tail.rt != 0)
+		{
+			const unsigned result_reg = SelectGprLowResultHost(tail.rt, HOST_TMP0);
+			bool load_ok = false;
+			switch (tail.width)
+			{
+				case ScalarLoadWidth::Byte:
+					load_ok = tail.sign_extend ?
+						m_code.EmitLdrsbImm8(result_reg, HOST_TMP0, 0) :
+						m_code.EmitLdrbImm12(result_reg, HOST_TMP0, 0);
+					break;
+				case ScalarLoadWidth::Halfword:
+					load_ok = tail.sign_extend ?
+						m_code.EmitLdrshImm8(result_reg, HOST_TMP0, 0) :
+						m_code.EmitLdrhImm8(result_reg, HOST_TMP0, 0);
+					break;
+				case ScalarLoadWidth::Word:
+					load_ok = m_code.EmitLdrImm12(result_reg, HOST_TMP0, 0);
+					break;
+				case ScalarLoadWidth::Dword:
+					return false;
+			}
+			if (!load_ok ||
+				(tail.sign_extend ?
+					!EmitStoreGprSignExtended32FromLow(tail.rt, result_reg) :
+					!EmitStoreGprZeroExtended32FromLow(tail.rt, result_reg)))
+			{
+				return false;
+			}
+		}
+
+		const size_t direct_done = m_code.EmitBranchPlaceholder();
+		if (direct_done == static_cast<size_t>(-1) ||
+			!m_code.PatchBranch(direct_done, tail.join_offset))
+		{
+			return false;
+		}
+
+		resolved.static_page_fallback = static_cast<size_t>(-1);
+		return EmitResolvedScalarLoadColdTail(resolved);
+	}
+
+	bool BlockCompiler::EmitResolvedScalarLoadColdTail(const ScalarLoadColdTail& tail)
+	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead*() /
 		// R5900OpcodeImpl.cpp::LB/LBU/LH/LHU/LW/LWU/LD().
 		// Handler pages dispatch through PCSX2's vTLB directly; unaligned pages
@@ -31135,6 +31662,11 @@ namespace VitaEE
 			tail.counter_read_event && m_compatible_scheduler_countdown;
 		const bool preserve_counter_on_stack = needs_counter_event &&
 			(m_branch_flag_host < 4 || m_branch_flag_host > 11);
+		const bool invalidate_compatible_translation =
+			m_gpr_link_signature.HasVtlbStaticPage() ||
+			(m_compatible_vtlb_pointer &&
+			 tail.pc == m_gpr_link_signature.vtlb_pointer.access_pc &&
+			 tail.compatible_byte_pair_delay_join == static_cast<size_t>(-1));
 		// EmitCounterReadFlagFromAddress() owns the private branch host until its
 		// possible event exit, while the handler return must rebuild PCSX2
 		// iBranchTest()'s delta in r6. Preserve a displaced guest branch predicate
@@ -31157,9 +31689,7 @@ namespace VitaEE
 				!EmitReloadGprPinsAfterClobber(static_cast<u16>(
 					(1u << HOST_TMP0) | (1u << HOST_TMP1) | (1u << HOST_TMP2) |
 					(1u << HOST_TMP3) | (1u << HOST_TMP4) | (1u << HOST_LR))) ||
-				(m_compatible_vtlb_pointer &&
-				 tail.pc == m_gpr_link_signature.vtlb_pointer.access_pc &&
-				 tail.compatible_byte_pair_delay_join == static_cast<size_t>(-1) &&
+				(invalidate_compatible_translation &&
 				 !EmitInvalidateCompatibleVtlbPointers()) ||
 				(tail.width != ScalarLoadWidth::Dword && tail.rt != 0 && !emit_normalize_narrow_low()) ||
 				!emit_store_result() ||
@@ -31284,6 +31814,81 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitScalarStoreColdTail(const ScalarStoreColdTail& tail)
+	{
+		if (tail.static_page_fallback == static_cast<size_t>(-1))
+			return EmitResolvedScalarStoreColdTail(tail);
+		if (tail.op == 0 || tail.width == ScalarStoreWidth::Dword)
+			return false;
+
+		ScalarStoreColdTail resolved = tail;
+		const size_t fallback_target = m_code.Size();
+		if (!m_code.PatchBranch(tail.static_page_fallback, fallback_target,
+				VitaA32::Condition::EQ) ||
+			!EmitEffectiveAddress(tail.op, HOST_TMP0))
+		{
+			return false;
+		}
+
+		u8 alignment_mask = 0;
+		if (tail.width == ScalarStoreWidth::Halfword)
+			alignment_mask = 1;
+		else if (tail.width == ScalarStoreWidth::Word)
+			alignment_mask = 3;
+		if (alignment_mask != 0)
+		{
+			if (!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0,
+					alignment_mask, true))
+			{
+				return false;
+			}
+			resolved.unaligned_fallback =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (resolved.unaligned_fallback == static_cast<size_t>(-1))
+				return false;
+		}
+
+		if (!EmitVtlbNonHandlerHostAddress(
+				HOST_TMP0, HOST_TMP1, HOST_TMP2,
+				&resolved.handler_fallback) ||
+			!EmitLoadGprLowKnownValue(tail.rt, HOST_TMP1,
+				tail.rt_low_known, tail.rt_low))
+		{
+			return false;
+		}
+		switch (tail.width)
+		{
+			case ScalarStoreWidth::Byte:
+				if (!m_code.EmitStrbImm12(HOST_TMP1, HOST_TMP0, 0))
+					return false;
+				break;
+			case ScalarStoreWidth::Halfword:
+				if (!m_code.EmitStrhImm8(HOST_TMP1, HOST_TMP0, 0))
+					return false;
+				break;
+			case ScalarStoreWidth::Word:
+				if (!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+					return false;
+				break;
+			case ScalarStoreWidth::Dword:
+				return false;
+		}
+		const u32 store_size = tail.width == ScalarStoreWidth::Byte ? 1 :
+			(tail.width == ScalarStoreWidth::Halfword ? 2 : 4);
+		if (!EmitRamSourceStoreGuard(HOST_TMP0, store_size))
+			return false;
+
+		const size_t direct_done = m_code.EmitBranchPlaceholder();
+		if (direct_done == static_cast<size_t>(-1) ||
+			!m_code.PatchBranch(direct_done, tail.join_offset))
+		{
+			return false;
+		}
+
+		resolved.static_page_fallback = static_cast<size_t>(-1);
+		return EmitResolvedScalarStoreColdTail(resolved);
+	}
+
+	bool BlockCompiler::EmitResolvedScalarStoreColdTail(const ScalarStoreColdTail& tail)
 	{
 		// PCSX2 owner: vtlb.cpp::vtlb_memWrite*() / R5900OpcodeImpl.cpp::SB/SH/SW/SD().
 		// Handler pages dispatch through PCSX2's vTLB directly; unaligned pages
@@ -32429,6 +33034,91 @@ namespace VitaEE
 	{
 		return EmitVtlbNonHandlerHostAddress(
 			host_reg, vmap_reg, scratch_reg, handler_fallback_branch, dirty_pins);
+	}
+
+	bool BlockCompiler::IsCompatibleVtlbStaticPageAccess(
+		u32 op, ScalarLoadWidth width, u8 alignment_mask) const
+	{
+		if (!m_compatible_vtlb_static_page_access || width == ScalarLoadWidth::Dword)
+			return false;
+		const VtlbStaticPageLinkMapping& page =
+			m_gpr_link_signature.vtlb_static_page;
+		if (!page.IsValid() || RS(op) != page.guest_base)
+			return false;
+
+		const unsigned opcode = op >> 26;
+		const bool opcode_matches =
+			(width == ScalarLoadWidth::Byte &&
+				(opcode == 0x20 || opcode == 0x24)) ||
+			(width == ScalarLoadWidth::Halfword &&
+				(opcode == 0x21 || opcode == 0x25)) ||
+			(width == ScalarLoadWidth::Word &&
+				(opcode == 0x23 || opcode == 0x27));
+		const s32 offset = IMM_S(op);
+		const u32 size = width == ScalarLoadWidth::Byte ? 1 :
+			(width == ScalarLoadWidth::Halfword ? 2 : 4);
+		return opcode_matches && offset >= 0 &&
+			(static_cast<u32>(offset) & alignment_mask) == 0 &&
+			static_cast<u32>(offset) + size <= page.max_offset_end;
+	}
+
+	bool BlockCompiler::IsCompatibleVtlbStaticPageAccess(
+		u32 op, ScalarStoreWidth width, u8 alignment_mask) const
+	{
+		if (!m_compatible_vtlb_static_page_access || width == ScalarStoreWidth::Dword)
+			return false;
+		const VtlbStaticPageLinkMapping& page =
+			m_gpr_link_signature.vtlb_static_page;
+		if (!page.IsValid() || RS(op) != page.guest_base)
+			return false;
+
+		const unsigned opcode = op >> 26;
+		const bool opcode_matches =
+			(width == ScalarStoreWidth::Byte && opcode == 0x28) ||
+			(width == ScalarStoreWidth::Halfword && opcode == 0x29) ||
+			(width == ScalarStoreWidth::Word && opcode == 0x2b);
+		const s32 offset = IMM_S(op);
+		const u32 size = width == ScalarStoreWidth::Byte ? 1 :
+			(width == ScalarStoreWidth::Halfword ? 2 : 4);
+		return opcode_matches && offset >= 0 &&
+			(static_cast<u32>(offset) & alignment_mask) == 0 &&
+			static_cast<u32>(offset) + size <= page.max_offset_end;
+	}
+
+	bool BlockCompiler::EmitCompatibleVtlbStaticPageAddress(
+		u32 op, unsigned host_reg, size_t* fallback_branch)
+	{
+		if (!fallback_branch || host_reg >= 15)
+			return false;
+		const VtlbStaticPageLinkMapping& page =
+			m_gpr_link_signature.vtlb_static_page;
+		if (!page.IsValid() || RS(op) != page.guest_base || IMM_S(op) < 0)
+			return false;
+
+		if (!m_code.EmitCmpImm32(page.host, 0))
+			return false;
+		*fallback_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (*fallback_branch == static_cast<size_t>(-1))
+		{
+			return false;
+		}
+		const u32 offset = static_cast<u32>(IMM_S(op));
+		if (!m_code.EmitAddImm32(host_reg, page.host, offset))
+		{
+			const unsigned scratch_reg = host_reg == HOST_TMP2 ? HOST_TMP0 : HOST_TMP2;
+			if (!m_code.EmitMovImm32(scratch_reg, offset) ||
+				!m_code.EmitAddReg(host_reg, page.host, scratch_reg))
+			{
+				return false;
+			}
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCompatibleVtlbStaticPageDirectAccesses++;
+		g_qemuCompatibleVtlbStaticPageGenericTranslationsElided += 5;
+		g_qemuCompatibleVtlbStaticPageColdFallbackSites++;
+#endif
+		return true;
 	}
 
 	bool BlockCompiler::EmitGprLowOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host)

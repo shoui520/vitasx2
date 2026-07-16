@@ -217,6 +217,44 @@ namespace VitaEE
 		}
 	};
 
+	enum class VtlbStaticPageLinkRepresentation : u8
+	{
+		DirectHostBase,
+	};
+
+	enum class VtlbStaticPageLinkProvenance : u8
+	{
+		GuardedVtlbVirtualMapping,
+	};
+
+	struct VtlbStaticPageLinkMapping
+	{
+		static constexpr u8 NO_HOST = 0xff;
+
+		u8 host = NO_HOST;
+		u8 guest_base = 0;
+		u8 alignment_mask = 0;
+		u16 max_offset_end = 0;
+		u16 access_count = 0;
+		u32 access_block_pc = 0;
+		VtlbStaticPageLinkRepresentation representation =
+			VtlbStaticPageLinkRepresentation::DirectHostBase;
+		VtlbStaticPageLinkProvenance provenance =
+			VtlbStaticPageLinkProvenance::GuardedVtlbVirtualMapping;
+
+		bool IsValid() const { return host != NO_HOST; }
+		bool operator==(const VtlbStaticPageLinkMapping& rhs) const
+		{
+			return host == rhs.host && guest_base == rhs.guest_base &&
+				alignment_mask == rhs.alignment_mask &&
+				max_offset_end == rhs.max_offset_end &&
+				access_count == rhs.access_count &&
+				access_block_pc == rhs.access_block_pc &&
+				representation == rhs.representation &&
+				provenance == rhs.provenance;
+		}
+	};
+
 	enum class GprLinkWidth : u8
 	{
 		Low32,
@@ -333,12 +371,14 @@ namespace VitaEE
 		static constexpr u8 SCHEDULER_HOST = 6;
 		static constexpr u8 VTLB_POINTER_HOST = 12;
 		static constexpr u8 VTLB_WRITE_POINTER_HOST = 3;
+		static constexpr u8 VTLB_STATIC_PAGE_HOST = 11;
 		static constexpr u8 PREDICATE_HOST = 5;
 
 		GprLinkMapping mappings[MAX_PINS]{};
 		SchedulerLinkMapping scheduler{};
 		VtlbPointerLinkMapping vtlb_pointer{};
 		VtlbPointerLinkMapping vtlb_write_pointer{};
+		VtlbStaticPageLinkMapping vtlb_static_page{};
 		GprQwordLinkMapping gpr_qword{};
 		PredicateLinkMapping predicate{};
 		u32 block_pcs[MAX_BLOCKS]{};
@@ -351,6 +391,7 @@ namespace VitaEE
 		bool HasSchedulerCountdown() const { return scheduler.IsValid(); }
 		bool HasVtlbPointer() const { return vtlb_pointer.IsValid(); }
 		bool HasVtlbWritePointer() const { return vtlb_write_pointer.IsValid(); }
+		bool HasVtlbStaticPage() const { return vtlb_static_page.IsValid(); }
 		bool HasGprQword() const { return gpr_qword.IsValid(); }
 		bool HasPredicate() const { return predicate.IsValid(); }
 		bool ReclaimsVtlbHosts() const;
@@ -362,6 +403,7 @@ namespace VitaEE
 				!(scheduler == rhs.scheduler) ||
 				!(vtlb_pointer == rhs.vtlb_pointer) ||
 				!(vtlb_write_pointer == rhs.vtlb_write_pointer) ||
+				!(vtlb_static_page == rhs.vtlb_static_page) ||
 				!(gpr_qword == rhs.gpr_qword) ||
 				!(predicate == rhs.predicate) ||
 				block_pcs[0] != rhs.block_pcs[0] || block_pcs[1] != rhs.block_pcs[1] ||
@@ -1113,6 +1155,7 @@ namespace VitaEE
 		bool EmitPrepareResidentForwardedBooleanForPreProducerSync();
 		bool EmitPoisonCompatibleVtlbPointer();
 		bool EmitInvalidateCompatibleVtlbPointers();
+		bool EmitStageCompatibleVtlbStaticPage();
 		bool EmitStageCompatibleVtlbPointer();
 		bool EmitStageCompatibleVtlbPointerMapping(
 			const VtlbPointerLinkMapping& pointer, bool access,
@@ -1192,6 +1235,12 @@ namespace VitaEE
 			size_t* handler_fallback_branch, GprPinDirtyMasks* dirty_pins = nullptr);
 		bool EmitVtlbNonHandlerHostAddress128(unsigned host_reg, unsigned vmap_reg, unsigned scratch_reg,
 			size_t* handler_fallback_branch, GprPinDirtyMasks* dirty_pins = nullptr);
+		bool IsCompatibleVtlbStaticPageAccess(u32 op, ScalarLoadWidth width,
+			u8 alignment_mask) const;
+		bool IsCompatibleVtlbStaticPageAccess(u32 op, ScalarStoreWidth width,
+			u8 alignment_mask) const;
+		bool EmitCompatibleVtlbStaticPageAddress(u32 op, unsigned host_reg,
+			size_t* fallback_branch);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
 		bool EmitLoadCop2ControlSource(unsigned guest_reg, unsigned host_reg);
 		bool EmitGprLowOperand(unsigned guest_reg, unsigned fallback_host, unsigned* operand_host);
@@ -1251,9 +1300,12 @@ namespace VitaEE
 			unsigned address_reg = 0;
 			GprPinDirtyMasks dirty_pins{};
 			size_t compatible_byte_pair_delay_join = static_cast<size_t>(-1);
+			size_t static_page_fallback = static_cast<size_t>(-1);
+			u32 op = 0;
 		};
 
 		bool EmitScalarLoadColdTail(const ScalarLoadColdTail& tail);
+		bool EmitResolvedScalarLoadColdTail(const ScalarLoadColdTail& tail);
 
 		struct ScalarStoreColdTail
 		{
@@ -1272,9 +1324,12 @@ namespace VitaEE
 			u32 rt_high = 0;
 			unsigned address_reg = 0;
 			GprPinDirtyMasks dirty_pins{};
+			size_t static_page_fallback = static_cast<size_t>(-1);
+			u32 op = 0;
 		};
 		void CaptureScalarStoreValue(ScalarStoreColdTail* tail);
 		bool EmitScalarStoreColdTail(const ScalarStoreColdTail& tail);
+		bool EmitResolvedScalarStoreColdTail(const ScalarStoreColdTail& tail);
 
 		struct QwordLoadColdTail
 		{
@@ -1491,6 +1546,7 @@ namespace VitaEE
 		bool m_compatible_vtlb_pointer = false;
 		bool m_compatible_vtlb_pointer_access = false;
 		bool m_compatible_vtlb_write_pointer_access = false;
+		bool m_compatible_vtlb_static_page_access = false;
 		bool m_compatible_predicate_consumer = false;
 		bool m_compatible_predicate_entry_variant = false;
 		bool m_compatible_likely_taken_suffix = false;

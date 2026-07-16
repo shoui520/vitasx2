@@ -1989,6 +1989,7 @@ namespace VitaEE
 			{
 				candidate->vtlb_pointer = VtlbPointerLinkMapping{};
 				candidate->vtlb_write_pointer = VtlbPointerLinkMapping{};
+				candidate->vtlb_static_page = VtlbStaticPageLinkMapping{};
 				candidate->gpr_qword = GprQwordLinkMapping{};
 			}
 			if (!m_compatible_predicate_carry_enabled)
