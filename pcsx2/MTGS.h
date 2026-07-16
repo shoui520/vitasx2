@@ -80,10 +80,16 @@ namespace MTGS
 	void SetRunIdle(bool enabled);
 
 	// Size of the ringbuffer as a power of 2 -- size is a multiple of simd128s.
-	// (actual size is 1<<m_RingBufferSizeFactor simd vectors [128-bit values])
-	// A value of 19 is a 8meg ring buffer.  18 would be 4 megs, and 20 would be 16 megs.
-	// Default was 2mb, but some games with lots of MTGS activity want 8mb to run fast (rama)
+	// Vita keeps GIF payloads in Gif_Path and queues only their offset/size, so
+	// PCSX2's desktop 8 MiB ring would waste scarce LPDDR and also inflate the
+	// MTVU packet queues which key their capacity from this constant. 16K
+	// command qwords retain room for several measured packet-heavy frames while
+	// consuming 256 KiB.
+#if defined(VITASX2_VITA)
+	static const uint RingBufferSizeFactor = 14;
+#else
 	static const uint RingBufferSizeFactor = 19;
+#endif
 
 	// size of the ringbuffer in simd128's.
 	static const uint RingBufferSize = 1 << RingBufferSizeFactor;

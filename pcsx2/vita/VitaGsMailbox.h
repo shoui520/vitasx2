@@ -16,6 +16,10 @@ namespace VitaGS
 
 	const u8* GetLocalMemoryForTrace(size_t* size);
 
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+	bool CopyPrivilegedRegistersForValidation(u8* output, size_t size);
+#endif
+
 #if defined(VITASX2_PRODUCT_BOOT_VALIDATION) && VITASX2_PRODUCT_BOOT_VALIDATION
 	struct CanonicalRingValidationResult
 	{

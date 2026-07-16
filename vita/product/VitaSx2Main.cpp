@@ -314,7 +314,10 @@ namespace
 		// enum remains SW because PCSX2 has no Vita renderer enum; hardware-cache
 		// behavior is reported separately by GSIsHardwareRenderer().
 		EmuConfig.GS.Renderer = GSRendererType::SW;
-		EmuConfig.GS.SynchronousMTGS = true;
+		// PCSX2 owner: MTGS.cpp. Normal product execution overlaps the EE and GS
+		// on separate Cortex-A9 cores; oracle validation remains deliberately
+		// synchronous so every trace boundary is immediately quiescent.
+		EmuConfig.GS.SynchronousMTGS = VITASX2_PRODUCT_BOOT_VALIDATION;
 		EmuConfig.GS.VsyncEnable = false;
 
 		EmuConfig.SPU2.Backend = VITASX2_PRODUCT_BOOT_VALIDATION ?
@@ -760,6 +763,16 @@ int main()
 	EmuFolders::MemoryCards = VITASX2_PRODUCT_BOOT_VALIDATION ?
 		VALIDATION_MEMORY_CARD_DIR : PRODUCT_MEMORY_CARD_DIR;
 	ConfigureProductSettings();
+	// PCSX2's MTGS ownership expects the CPU and GS producers to execute in
+	// parallel. Keep the product CPU thread on user core 0; the mailbox pins its
+	// sole GXM-owning worker to core 1, leaving core 2 available to system/audio
+	// work. Sony's thread-manager API treats a rejected affinity as recoverable.
+	{
+		const Threading::ThreadHandle cpu_thread =
+			Threading::ThreadHandle::GetForCallingThread();
+		if (!cpu_thread.SetAffinity(1u << 0))
+			Console.Warning("Vita CPU-thread affinity was rejected; using the scheduler default.");
+	}
 	VitaGS::SetNativePresenterEnabled(!VITASX2_PRODUCT_BOOT_VALIDATION);
 	EmuConfig.BaseFilenames.Bios = BIOS_FILE;
 

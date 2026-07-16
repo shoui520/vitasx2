@@ -9,6 +9,7 @@
 #include "common/Assertions.h"
 
 #include <memory>
+#include <utility>
 
 #include <pthread.h>
 #include <sched.h>
@@ -41,11 +42,24 @@ u64 Threading::GetThreadTicksPerSecond()
 	return 1000000;
 }
 
+static u64 GetVitaThreadCpuTime(SceUID thread_id)
+{
+	if (thread_id < 0)
+		return 0;
+
+	SceKernelThreadInfo info = {};
+	info.size = sizeof(info);
+	if (sceKernelGetThreadInfo(thread_id, &info) < 0)
+		return 0;
+
+	// Sony documents runClocks as cumulative thread execution time in
+	// microseconds, matching GetThreadTicksPerSecond().
+	return static_cast<u64>(info.runClocks);
+}
+
 u64 Threading::GetThreadCpuTime()
 {
-	// No per-thread CPU clock is exposed to user code; this feeds the
-	// performance overlay only. Report zero rather than lying.
-	return 0;
+	return GetVitaThreadCpuTime(static_cast<SceUID>(sceKernelGetThreadId()));
 }
 
 Threading::ThreadHandle::ThreadHandle() = default;
@@ -92,7 +106,8 @@ Threading::ThreadHandle& Threading::ThreadHandle::operator=(const ThreadHandle& 
 
 u64 Threading::ThreadHandle::GetCPUTime() const
 {
-	return 0;
+	return (m_native_id != 0) ?
+		GetVitaThreadCpuTime(static_cast<SceUID>(m_native_id)) : 0;
 }
 
 bool Threading::ThreadHandle::SetAffinity(u64 processor_mask) const
@@ -123,7 +138,7 @@ bool Threading::ThreadHandle::SetAffinity(u64 processor_mask) const
 Threading::Thread::Thread() = default;
 
 Threading::Thread::Thread(Thread&& thread)
-	: ThreadHandle(thread)
+	: ThreadHandle(std::move(thread))
 	, m_stack_size(thread.m_stack_size)
 {
 	thread.m_stack_size = 0;
@@ -176,17 +191,30 @@ bool Threading::Thread::Start(EntryPoint func)
 	params->thread_id_ptr = &m_native_id;
 
 	pthread_attr_t attrs;
-	bool has_attributes = false;
+	pthread_attr_t* attrs_ptr = nullptr;
 
 	if (m_stack_size != 0)
 	{
-		has_attributes = true;
-		pthread_attr_init(&attrs);
-		pthread_attr_setstacksize(&attrs, m_stack_size);
+		if (pthread_attr_init(&attrs) != 0)
+			return false;
+
+		if (pthread_attr_setstacksize(&attrs, m_stack_size) != 0)
+		{
+			const int destroy_res = pthread_attr_destroy(&attrs);
+			pxAssertRel(destroy_res == 0, "pthread_attr_destroy() failed after stack-size rejection");
+			return false;
+		}
+
+		attrs_ptr = &attrs;
 	}
 
 	pthread_t handle;
-	const int res = pthread_create(&handle, has_attributes ? &attrs : nullptr, ThreadProc, params.get());
+	const int res = pthread_create(&handle, attrs_ptr, ThreadProc, params.get());
+	if (attrs_ptr)
+	{
+		const int destroy_res = pthread_attr_destroy(attrs_ptr);
+		pxAssertRel(destroy_res == 0, "pthread_attr_destroy() failed after thread creation");
+	}
 	if (res != 0)
 		return false;
 
@@ -221,7 +249,11 @@ void Threading::Thread::Join()
 
 Threading::ThreadHandle& Threading::Thread::operator=(Thread&& thread)
 {
-	ThreadHandle::operator=(thread);
+	if (this == &thread)
+		return *this;
+
+	pxAssertRel(!m_native_handle, "Can't move-assign over a joinable thread");
+	ThreadHandle::operator=(std::move(thread));
 	m_stack_size = thread.m_stack_size;
 	thread.m_stack_size = 0;
 	return *this;
