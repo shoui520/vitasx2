@@ -27,21 +27,26 @@ extern u32 g_qemuCompatibleVtlbWriteFastEntryActivations;
 extern u32 g_qemuCompatibleVtlbReadFastEntryActivations;
 extern u32 g_qemuEeDirectExitSourcePc;
 u32 g_qemuEeGeneratedLookupSuspensions = 0;
+u32 g_qemuEeInFrameEventResumeHits = 0;
+u32 g_qemuEeInFrameEventResumeFallbacks = 0;
 #endif
 
 namespace
 {
 	using GeneratedBlock = u32 (*)();
 	using PersistentDispatcher = u32 (*)(const void* entry_point, void* context,
-		const void* dispatch_callback);
+		const void* dispatch_callback, const void* event_callback);
 
 	constexpr u16 REG_LR = 1u << 14;
 	constexpr u16 REG_PC = 1u << 15;
 	constexpr unsigned HOST_CPU_REGS = 4;
+	constexpr unsigned HOST_BRANCH_TARGET = 5;
 	constexpr unsigned HOST_VTLB_VMAP = 7;
 	constexpr unsigned HOST_VTLB_HOST_MEMORY_BASE = 8;
 	constexpr unsigned HOST_SP = 13;
 	constexpr unsigned HOST_CALLBACK = 12;
+	constexpr unsigned HOST_TMP0 = 0;
+	constexpr unsigned HOST_TMP1 = 1;
 	constexpr u8 PERSISTENT_METADATA_SIZE =
 		VitaEE::BlockCompiler::PERSISTENT_LINK_METADATA_SIZE;
 	constexpr u16 PERSISTENT_CONTEXT_OFFSET =
@@ -50,12 +55,16 @@ namespace
 		VitaEE::BlockCompiler::PERSISTENT_LINK_CALLBACK_OFFSET;
 	constexpr u16 PERSISTENT_EXIT_VALUE_OFFSET =
 		VitaEE::BlockCompiler::PERSISTENT_LINK_EXIT_VALUE_OFFSET;
+	constexpr u16 PERSISTENT_EVENT_CALLBACK_OFFSET =
+		VitaEE::BlockCompiler::PERSISTENT_LINK_EVENT_CALLBACK_OFFSET;
 	constexpr u16 PERSISTENT_VTLB_VMAP_OFFSET =
 		VitaEE::BlockCompiler::PERSISTENT_LINK_VTLB_VMAP_OFFSET;
 	constexpr u16 PERSISTENT_VTLB_HOST_BASE_OFFSET =
 		VitaEE::BlockCompiler::PERSISTENT_LINK_VTLB_HOST_BASE_OFFSET;
+	constexpr u16 PC_OFFSET = static_cast<u16>(offsetof(cpuRegisters, pc));
 	constexpr size_t PERSISTENT_DISPATCH_CODE_CAPACITY = 4096;
 	constexpr u32 EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN = 0xc1;
+	constexpr u32 EE_EVENT_HANDLED_EXIT_TOKEN = 0xe8;
 
 	extern "C" __attribute__((noinline)) u32 VitaEeA32DirectExit()
 	{
@@ -68,10 +77,13 @@ namespace
 	}
 
 	bool DecodeExitKind(u32 value, VitaEE::BlockExitKind* exit,
-		bool* scheduler_test_elided = nullptr)
+		bool* scheduler_test_elided = nullptr,
+		bool* event_already_handled = nullptr)
 	{
 		if (scheduler_test_elided)
 			*scheduler_test_elided = false;
+		if (event_already_handled)
+			*event_already_handled = false;
 
 		if (value == static_cast<u32>(VitaEE::BlockExitKind::Direct))
 		{
@@ -82,6 +94,14 @@ namespace
 		if (value == static_cast<u32>(VitaEE::BlockExitKind::Event))
 		{
 			*exit = VitaEE::BlockExitKind::Event;
+			return true;
+		}
+
+		if (value == EE_EVENT_HANDLED_EXIT_TOKEN)
+		{
+			*exit = VitaEE::BlockExitKind::Event;
+			if (event_already_handled)
+				*event_already_handled = true;
 			return true;
 		}
 
@@ -1518,6 +1538,7 @@ namespace VitaEE
 			!code.EmitSubImm8(HOST_SP, HOST_SP, PERSISTENT_METADATA_SIZE) ||
 			!code.EmitStrImm12(1, HOST_SP, PERSISTENT_CONTEXT_OFFSET) ||
 			!code.EmitStrImm12(2, HOST_SP, PERSISTENT_CALLBACK_OFFSET) ||
+			!code.EmitStrImm12(3, HOST_SP, PERSISTENT_EVENT_CALLBACK_OFFSET) ||
 			!code.EmitMovImm32(HOST_CPU_REGS, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs))) ||
 			// PCSX2's private recompiler dispatcher keeps stable VM bases in host
 			// registers. Do the same for ARM32's compact vTLB representation: r7 is
@@ -1556,12 +1577,138 @@ namespace VitaEE
 			return fail();
 
 		const size_t event_exit_offset = code.Size();
-		if (!code.EmitMovImm8(0, static_cast<u8>(BlockExitKind::Event)))
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::_DynGen_DispatcherEvent()
+		// calls recEventTest() and falls directly into _DynGen_DispatcherReg().
+		// Keep that same event-only path inside the persistent A32 frame when the
+		// provider supplies a callback with an explicit safe-resume contract.
+		if (!code.EmitLdrImm12(HOST_CALLBACK, HOST_SP,
+				PERSISTENT_EVENT_CALLBACK_OFFSET) ||
+			!code.EmitCmpImm32(HOST_CALLBACK, 0))
+		{
 			return fail();
+		}
+		const size_t event_without_callback =
+			code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_without_callback == static_cast<size_t>(-1) ||
+			// Compatible chains may have lent r7/r8 to guest mappings. Publish
+			// canonical architectural state at the Event tail, then restore the
+			// private vTLB ABI before any C++ scheduler/device code can re-enter an
+			// A32 provider.
+			!code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_SP,
+				PERSISTENT_VTLB_VMAP_OFFSET) ||
+			!code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_SP,
+				PERSISTENT_VTLB_HOST_BASE_OFFSET) ||
+			!code.EmitBlx(HOST_CALLBACK) || !code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return fail();
+		}
+		const size_t event_callback_refused =
+			code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_callback_refused == static_cast<size_t>(-1) ||
+			!code.EmitLdrImm12(HOST_BRANCH_TARGET, HOST_CPU_REGS, PC_OFFSET) ||
+			// Fill Cortex-A9's PC load-use slot with the independent live-directory
+			// address materialization used after the alignment gate.
+			!code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+				reinterpret_cast<uptr>(&m_active_generated_lookup_pages))) ||
+			!code.EmitTstImm32(HOST_BRANCH_TARGET, 0x3))
+		{
+			return fail();
+		}
+		const size_t event_unaligned =
+			code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (event_unaligned == static_cast<size_t>(-1) ||
+			!code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0) ||
+			// High16 depends only on the already-loaded PC, so schedule it across
+			// the directory load before testing that load's result.
+			!code.EmitMovRegShiftImm(HOST_TMP1, HOST_BRANCH_TARGET,
+				VitaA32::ShiftType::LSR, 16) ||
+			!code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return fail();
+		}
+		const size_t event_no_directory =
+			code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_no_directory == static_cast<size_t>(-1) ||
+			!code.EmitLdrRegShift(HOST_TMP0, HOST_TMP0, HOST_TMP1,
+				VitaA32::ShiftType::LSL, 2) ||
+			// Bits[15:2] are independent of the page load and fill its load-use
+			// slot on Cortex-A9.
+			!code.EmitUbfx(HOST_TMP1, HOST_BRANCH_TARGET, 2, 14) ||
+			!code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return fail();
+		}
+		const size_t event_no_page =
+			code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_no_page == static_cast<size_t>(-1) ||
+			!code.EmitLdrRegShift(HOST_CALLBACK, HOST_TMP0, HOST_TMP1,
+				VitaA32::ShiftType::LSL, 2) ||
+			!code.EmitCmpImm32(HOST_CALLBACK, 0))
+		{
+			return fail();
+		}
+		const size_t event_no_entry =
+			code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_no_entry == static_cast<size_t>(-1))
+			return fail();
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+				reinterpret_cast<uptr>(&g_qemuEeInFrameEventResumeHits))) ||
+			!code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!code.EmitAddImm8(HOST_TMP1, HOST_TMP1, 1) ||
+			!code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+		{
+			return fail();
+		}
+#endif
+		if (!code.EmitBx(HOST_CALLBACK))
+			return fail();
+
+		const size_t event_handled_fallback = code.Size();
+		if (!code.PatchBranch(event_callback_refused, event_handled_fallback,
+				VitaA32::Condition::EQ) ||
+			!code.PatchBranch(event_unaligned, event_handled_fallback,
+				VitaA32::Condition::NE) ||
+			!code.PatchBranch(event_no_directory, event_handled_fallback,
+				VitaA32::Condition::EQ) ||
+			!code.PatchBranch(event_no_page, event_handled_fallback,
+				VitaA32::Condition::EQ) ||
+			!code.PatchBranch(event_no_entry, event_handled_fallback,
+				VitaA32::Condition::EQ))
+		{
+			return fail();
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+				reinterpret_cast<uptr>(&g_qemuEeInFrameEventResumeFallbacks))) ||
+			!code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!code.EmitAddImm8(HOST_TMP1, HOST_TMP1, 1) ||
+			!code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+		{
+			return fail();
+		}
+#endif
+		if (!code.EmitMovImm8(HOST_TMP0,
+				static_cast<u8>(EE_EVENT_HANDLED_EXIT_TOKEN)))
+		{
+			return fail();
+		}
+		const size_t handled_to_common = code.EmitBranchPlaceholder();
+		if (handled_to_common == static_cast<size_t>(-1))
+			return fail();
+
+		const size_t event_unhandled = code.Size();
+		if (!code.PatchBranch(event_without_callback, event_unhandled,
+				VitaA32::Condition::EQ) ||
+			!code.EmitMovImm8(HOST_TMP0, static_cast<u8>(BlockExitKind::Event)))
+		{
+			return fail();
+		}
 
 		const size_t common_offset = code.Size();
 		if (!code.PatchBranch(direct_to_common, common_offset) ||
 			!code.PatchBranch(scheduler_elided_direct_to_common, common_offset) ||
+			!code.PatchBranch(handled_to_common, common_offset) ||
 			// Compatible chains may lend r7/r8 to GPR mappings. Restore the
 			// canonical dispatcher vTLB ABI once in this shared cold exit instead of
 			// duplicating reloads in every generated direct/event tail.
@@ -3553,7 +3700,9 @@ namespace VitaEE
 
 		BlockExitKind exit = BlockExitKind::Direct;
 		bool scheduler_test_elided = false;
-		if (!DecodeExitKind(exit_value, &exit, &scheduler_test_elided))
+		bool event_already_handled = false;
+		if (!DecodeExitKind(exit_value, &exit, &scheduler_test_elided,
+				&event_already_handled))
 		{
 			context->failed = true;
 			return nullptr;
@@ -3564,13 +3713,15 @@ namespace VitaEE
 #endif
 
 		context->current_result.exit = exit;
-		context->current_result.exit_value = exit_value;
+		context->current_result.exit_value = event_already_handled ?
+			static_cast<u32>(BlockExitKind::Event) : exit_value;
 		context->current_result.scheduler_test_elided = scheduler_test_elided;
 		*context->final_result = context->current_result;
 
 		// PCSX2 owner: _DynGen_DispatcherEvent() calls recEventTest() without
 		// unwinding the private JIT frame, then resumes the main dispatcher.
-		if (exit == BlockExitKind::Event && context->run_event_test_on_event_exit)
+		if (exit == BlockExitKind::Event &&
+			context->run_event_test_on_event_exit && !event_already_handled)
 			_cpuEventTest_Shared();
 
 		if (!context->boundary_callback ||
@@ -3595,7 +3746,8 @@ namespace VitaEE
 
 	bool BlockExecutor::ExecutePersistentAtPc(u32 start_pc,
 		bool run_event_test_on_event_exit, PersistentBoundaryCallback boundary_callback,
-		void* callback_userdata, BlockExecutionResult* result)
+		void* callback_userdata, BlockExecutionResult* result,
+		PersistentEventCallback event_callback)
 	{
 		if (!result || !m_persistent_dispatch_enabled || !EnsurePersistentDispatcher())
 			return false;
@@ -3616,9 +3768,15 @@ namespace VitaEE
 
 		RefreshRawGpr0KnownZero();
 		cpuRegs.pc = start_pc;
+		// A caller which suppresses event tests owns that policy even if it
+		// accidentally supplies a bridge. Keep the private ABI fail-closed rather
+		// than letting an Event tail run scheduler work the caller forbade.
+		if (!run_event_test_on_event_exit)
+			event_callback = nullptr;
 		const u32 exit_value = reinterpret_cast<PersistentDispatcher>(m_persistent_dispatch_entry)(
 			LinkedEntryPoint(*block), &context,
-			reinterpret_cast<const void*>(&BlockExecutor::PersistentDispatchThunk));
+			reinterpret_cast<const void*>(&BlockExecutor::PersistentDispatchThunk),
+			reinterpret_cast<const void*>(event_callback));
 		if (context.failed)
 			return false;
 

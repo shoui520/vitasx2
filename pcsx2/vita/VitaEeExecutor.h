@@ -114,6 +114,9 @@ namespace VitaEE
 	public:
 		using PersistentBoundaryCallback = bool (*)(void* userdata,
 			const BlockExecutionResult& completed_chain);
+		// Runs the complete PCSX2 EE event owner and returns nonzero only when the
+		// active generated lookup may resume inside the persistent JIT frame.
+		using PersistentEventCallback = u32 (*)();
 
 		// PCSX2 recRecompile() discovers through the next branch, existing
 		// BaseBlock, debugger seam, or 4 KiB source-page boundary. A branch in the
@@ -200,7 +203,8 @@ namespace VitaEE
 			BlockExecutionResult* result);
 		bool ExecutePersistentAtPc(u32 start_pc, bool run_event_test_on_event_exit,
 			PersistentBoundaryCallback boundary_callback, void* callback_userdata,
-			BlockExecutionResult* result);
+			BlockExecutionResult* result,
+			PersistentEventCallback event_callback = nullptr);
 		bool ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
 

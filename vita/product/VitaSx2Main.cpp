@@ -776,6 +776,10 @@ int main()
 	EmuFolders::MemoryCards = VITASX2_PRODUCT_BOOT_VALIDATION ?
 		VALIDATION_MEMORY_CARD_DIR : PRODUCT_MEMORY_CARD_DIR;
 	ConfigureProductSettings();
+	// PCSX2's _DynGen_DispatcherEvent() calls the event owner and falls directly
+	// into register dispatch. Normal product execution can use the equivalent
+	// persistent A32 path; bounded validation keeps its natural event callbacks.
+	VitaSetA32EeInFrameEventResumeEnabled(!VITASX2_PRODUCT_BOOT_VALIDATION);
 	// PCSX2's MTGS ownership expects the CPU and GS producers to execute in
 	// parallel. Keep the product CPU thread on user core 0; the mailbox pins its
 	// sole GXM-owning worker to core 1, and PCSX2's software raster worker uses

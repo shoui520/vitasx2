@@ -507,13 +507,15 @@ namespace VitaEE
 		using RamWriteInvalidationCallback = void (*)(void* context,
 			u32 backing_offset, u32 size);
 
-		// Private EE chain ABI: r3 is alignment padding; r4-r11 and LR/PC are
-		// saved by either the callable block prologue or the persistent dispatcher.
+		// Private EE chain ABI: persistent entry captures its optional event bridge
+		// from r3 before generated blocks may use it; r4-r11 and LR/PC are saved by
+		// either the callable block prologue or the persistent dispatcher.
 		static constexpr u16 LINK_FRAME_REGISTER_MASK = 0x0ff8u;
 		static constexpr u8 PERSISTENT_LINK_METADATA_SIZE = 24;
 		static constexpr u8 PERSISTENT_LINK_CONTEXT_OFFSET = 0;
 		static constexpr u8 PERSISTENT_LINK_CALLBACK_OFFSET = 4;
 		static constexpr u8 PERSISTENT_LINK_EXIT_VALUE_OFFSET = 8;
+		static constexpr u8 PERSISTENT_LINK_EVENT_CALLBACK_OFFSET = 12;
 		static constexpr u8 PERSISTENT_LINK_VTLB_VMAP_OFFSET = 16;
 		static constexpr u8 PERSISTENT_LINK_VTLB_HOST_BASE_OFFSET = 20;
 		// PCSX2 recRecompile() can own one complete 4 KiB source page plus an

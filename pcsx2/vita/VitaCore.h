@@ -113,6 +113,11 @@ struct VitaA32EeProviderStats
 	u32 lookup_hits = 0;
 	u32 fast_dispatch_hits = 0;
 	u32 invalidated_blocks = 0;
+	// Bounded product telemetry. Candidates are derived from tests-refusals so
+	// the hot accepted path performs only one 32-bit increment on ARMv7.
+	u32 in_frame_event_tests = 0;
+	u32 in_frame_event_resume_candidates = 0;
+	u32 in_frame_event_resume_refusals = 0;
 	u32 first_interpreter_pc = 0;
 	u32 first_interpreter_opcode = 0;
 	u32 first_interpreter_reason = 0;
@@ -175,6 +180,10 @@ const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason);
 void VitaResetA32EeProviderStats();
 VitaA32EeProviderStats VitaGetA32EeProviderStats();
 void VitaRequestA32EeCacheReset();
+// Normal product execution enables PCSX2-style DispatcherEvent fallthrough.
+// Validation modes leave it disabled unless they explicitly own the event
+// callback contract and its natural-boundary observations.
+void VitaSetA32EeInFrameEventResumeEnabled(bool enabled);
 // Notify the active EE A32 provider after a C++ helper or device has written
 // directly through an eeMem->Main host pointer. Returns the number of cached
 // translations retired by the write.

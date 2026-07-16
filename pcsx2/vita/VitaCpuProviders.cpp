@@ -105,6 +105,7 @@ static u64 s_iop_a32_compact_provider_cache_hit_entries = 0;
 static u64 s_ee_a32_persistent_boundary_limit = 0;
 static u64 s_ee_a32_persistent_boundaries = 0;
 static bool s_ee_a32_persistent_boundary_hit_limit = false;
+static bool s_ee_a32_link_rejection_profile_enabled = false;
 #endif
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
 	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
@@ -118,6 +119,7 @@ static bool s_ee_a32_elf_booted = false;
 static u64 s_ee_a32_pre_elf_boundaries = 0;
 static bool s_ee_a32_direct_linking_enabled = false;
 static bool s_ee_a32_persistent_dispatch_enabled = false;
+static bool s_ee_a32_in_frame_event_resume_enabled = false;
 static VitaA32EeTraceMode s_ee_a32_trace_mode = VitaA32EeTraceMode::InstructionWindow;
 static bool s_ee_provider_trace_suppressed = false;
 static bool s_ee_a32_prerecording_window = false;
@@ -621,13 +623,17 @@ static void recAccountEeBlockExecution(const VitaEE::BlockExecutionResult& resul
 			Console.WriteLn(
 				"Vita EE pre-ELF progress: boundaries=%llu start_pc=%08x next_pc=%08x "
 				"ee_cycle=%llu ee_next=%llu iop_pc=%08x iop_cycle=%llu iop_next=%llu "
-				"iop_budget=%d frame=%u",
+				"iop_budget=%d frame=%u in_frame_events=%u:%u:%u",
 				static_cast<unsigned long long>(boundaries), fallback_pc, cpuRegs.pc,
 				static_cast<unsigned long long>(cpuRegs.cycle),
 				static_cast<unsigned long long>(cpuRegs.nextEventCycle), psxRegs.pc,
 				static_cast<unsigned long long>(psxRegs.cycle),
 				static_cast<unsigned long long>(psxRegs.iopNextEventCycle),
-				psxRegs.iopCycleEE, g_FrameCount);
+				psxRegs.iopCycleEE, g_FrameCount,
+				s_ee_a32_stats.in_frame_event_tests,
+				s_ee_a32_stats.in_frame_event_tests -
+					s_ee_a32_stats.in_frame_event_resume_refusals,
+				s_ee_a32_stats.in_frame_event_resume_refusals);
 		}
 	}
 #endif
@@ -803,6 +809,44 @@ static bool recDidEeTraceLimitHitAtNaturalBoundary()
 }
 #endif
 
+static __attribute__((noinline)) u32 recRunEeEventForGeneratedResume()
+{
+	// PCSX2 owner: x86/ix86-32/iR5900.cpp::recEventTest() runs the complete
+	// shared scheduler owner, checks the recompiler-exit request, and then falls
+	// directly into _DynGen_DispatcherReg(). The persistent A32 dispatcher calls
+	// this bridge without unwinding its private frame. recClear() has already
+	// nulled the active generated directory before setting the reset request, so
+	// returning false is enough to force the existing provider boundary safely.
+	s_ee_a32_stats.in_frame_event_tests++;
+	_cpuEventTest_Shared();
+
+	bool resume = s_ee_a32_in_frame_event_resume_enabled &&
+		!s_ee_a32_exit_execution && !s_ee_a32_cache_reset_requested &&
+		s_ee_a32_running_compiled_block &&
+		s_ee_a32_persistent_dispatch_enabled &&
+		s_ee_pre_instruction_trace_callback == nullptr &&
+		!VMManager::Internal::IsExecutionInterrupted();
+	// SetState() normally publishes the same transition through ExitExecution;
+	// keep the PCSX2 IsExecutionInterrupted() owner as a fail-closed guard for
+	// lifecycle calls which occur inside the scheduler itself.
+#if defined(VITASX2_QEMU_VALIDATION)
+	// These counters deliberately observe every natural scheduler boundary.
+	// Never bypass them when an explicit bounded validation owns the seam.
+	resume = resume && s_ee_a32_persistent_boundary_limit == 0 &&
+		!s_ee_a32_link_rejection_profile_enabled;
+#endif
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+	resume = resume && s_ee_a32_trace_limit_stop_condition ==
+		VitaA32EeTraceLimitStopCondition::None;
+#endif
+	if (resume)
+		VitaEE::RefreshRawGpr0KnownZero();
+	else
+		s_ee_a32_stats.in_frame_event_resume_refusals++;
+	return resume ? 1u : 0u;
+}
+
 static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& result)
 {
 	recAccountEeBlockExecution(result, cpuRegs.pc);
@@ -954,7 +998,9 @@ static void recExecute()
 			s_ee_a32_running_compiled_block = true;
 			const bool executed = fast_dispatch ?
 				s_ee_a32_executor.ExecutePersistentAtPc(pc, true,
-					&recPersistentEeBoundary, nullptr, &result) :
+					&recPersistentEeBoundary, nullptr, &result,
+					s_ee_a32_in_frame_event_resume_enabled ?
+						&recRunEeEventForGeneratedResume : nullptr) :
 				s_ee_a32_executor.ExecuteCompiledBlockAtPc(pc, true, &result);
 			s_ee_a32_running_compiled_block = false;
 			if (executed)
@@ -1576,7 +1622,18 @@ void VitaResetA32EeProviderStats()
 
 VitaA32EeProviderStats VitaGetA32EeProviderStats()
 {
-	return s_ee_a32_stats;
+	VitaA32EeProviderStats result = s_ee_a32_stats;
+	result.in_frame_event_resume_candidates =
+		result.in_frame_event_tests - result.in_frame_event_resume_refusals;
+	return result;
+}
+
+void VitaSetA32EeInFrameEventResumeEnabled(bool enabled)
+{
+	// This is a product/validation policy switch, not guest state. If it changes
+	// during a live chain, the callback checks the new value before permitting
+	// another generated lookup and therefore unwinds at the next due event.
+	s_ee_a32_in_frame_event_resume_enabled = enabled;
 }
 
 #if defined(VITASX2_QEMU_VALIDATION) || \
@@ -1595,6 +1652,7 @@ VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats()
 #if defined(VITASX2_QEMU_VALIDATION)
 void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled)
 {
+	s_ee_a32_link_rejection_profile_enabled = enabled;
 	s_ee_a32_executor.SetDirectLinkRejectionProfileEnabled(enabled);
 }
 
