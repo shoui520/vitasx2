@@ -7676,12 +7676,10 @@ namespace VitaIOP
 	}
 
 	BlockExecutor::BlockExecutor(bool owns_ee_event_entry)
-		: m_scheduler_direct_resume_event_context{this, nullptr, nullptr, nullptr}
+		: m_scheduler_direct_resume_event_context{this, nullptr}
 		, m_wait_resume_event_context{this, nullptr, WaitResumeKind::Invalid}
 		, m_owns_ee_event_entry(owns_ee_event_entry)
 	{
-		m_scheduler_direct_resume_event_context.ram_identity_mask =
-			Ps2MemSize::ExposedIopRam - 1;
 		bool isolate_variants_enabled = true;
 #if defined(VITASX2_QEMU_VALIDATION)
 		isolate_variants_enabled = s_qemuIopIsolateCacheSpecializationEnabled;
@@ -7886,28 +7884,34 @@ namespace VitaIOP
 		if (!g_vita_a32_iop_scheduler_prediction_event_entry_enabled)
 			return;
 #endif
-		if (m_scheduler_direct_resume_event_context.predicted_block != block)
+		// UINT32_MAX is the empty-key sentinel consumed by the product thunk.
+		// Architectural IOP PCs are word aligned, so a matching key proves that
+		// the paired block pointer was installed as well.
+		if (!block)
+			return;
+		const u32 guest_pc = psxRegs.pc;
+		if (m_scheduler_direct_resume_event_context.predicted_block != block ||
+			m_scheduler_direct_resume_event_context.predicted_pc != guest_pc)
 		{
 			m_scheduler_direct_resume_event_context.predicted_block_second =
 				m_scheduler_direct_resume_event_context.predicted_block;
+			m_scheduler_direct_resume_event_context.predicted_pc_second =
+				m_scheduler_direct_resume_event_context.predicted_pc;
 			m_scheduler_direct_resume_event_context.predicted_block = block;
+			m_scheduler_direct_resume_event_context.predicted_pc = guest_pc;
 		}
-		if (block)
+		const u32 cache_index = (guest_pc >> 2) &
+		                        (SchedulerDispatchCacheEntryCount() - 1);
+		auto& cache_entry =
+			m_scheduler_direct_resume_event_context.dispatch_cache[cache_index];
+		if (cache_entry.block != block || cache_entry.guest_pc != guest_pc)
 		{
-			const u32 cache_index = (block->rec_lookup_identity >> 2) &
-			                        (SchedulerDispatchCacheEntryCount() - 1);
-			auto& cache_entry =
-				m_scheduler_direct_resume_event_context.dispatch_cache[cache_index];
-			if (cache_entry.block != block ||
-				cache_entry.rec_lookup_identity != block->rec_lookup_identity)
-			{
-				cache_entry.block = block;
-				cache_entry.rec_lookup_identity = block->rec_lookup_identity;
+			cache_entry.block = block;
+			cache_entry.guest_pc = guest_pc;
 #if defined(VITASX2_QEMU_VALIDATION) && \
 	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
-				m_scheduler_dispatch_cache_installs++;
+			m_scheduler_dispatch_cache_installs++;
 #endif
-			}
 		}
 #if defined(VITASX2_QEMU_VALIDATION) && \
 	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
@@ -7930,10 +7934,12 @@ namespace VitaIOP
 	{
 		m_scheduler_direct_resume_event_context.predicted_block = nullptr;
 		m_scheduler_direct_resume_event_context.predicted_block_second = nullptr;
+		m_scheduler_direct_resume_event_context.predicted_pc = UINT32_MAX;
+		m_scheduler_direct_resume_event_context.predicted_pc_second = UINT32_MAX;
 		for (auto& entry : m_scheduler_direct_resume_event_context.dispatch_cache)
 		{
 			entry.block = nullptr;
-			entry.rec_lookup_identity = UINT32_MAX;
+			entry.guest_pc = UINT32_MAX;
 		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		m_scheduler_prediction_shadow.fill(nullptr);
@@ -9792,8 +9798,6 @@ namespace VitaIOP
 		ClearWaitResumeBlock();
 		ClearSchedulerDirectResume();
 		ClearSchedulerPredictedResume();
-		m_scheduler_direct_resume_event_context.ram_identity_mask =
-			Ps2MemSize::ExposedIopRam - 1;
 		m_force_logical_continuation = false;
 		ClearHotDispatchCache();
 		m_free_cache_head = nullptr;
@@ -9866,15 +9870,34 @@ namespace VitaIOP
 			ClearSchedulerDirectResume();
 		if (m_scheduler_direct_resume_event_context.predicted_block == &block)
 		{
-			m_scheduler_direct_resume_event_context.predicted_block =
-				m_scheduler_direct_resume_event_context.predicted_block_second;
+			if (m_scheduler_direct_resume_event_context.predicted_block_second ==
+				&block)
+			{
+				// Exact architectural aliases may occupy both tuples while sharing
+				// one recLUT block. Retiring that block must not compact its other
+				// alias back into the first way.
+				m_scheduler_direct_resume_event_context.predicted_block = nullptr;
+				m_scheduler_direct_resume_event_context.predicted_pc = UINT32_MAX;
+			}
+			else
+			{
+				m_scheduler_direct_resume_event_context.predicted_block =
+					m_scheduler_direct_resume_event_context.predicted_block_second;
+				m_scheduler_direct_resume_event_context.predicted_pc =
+					m_scheduler_direct_resume_event_context.predicted_pc_second;
+			}
 			m_scheduler_direct_resume_event_context.predicted_block_second = nullptr;
+			m_scheduler_direct_resume_event_context.predicted_pc_second = UINT32_MAX;
 		}
 		else if (m_scheduler_direct_resume_event_context.predicted_block_second ==
 				 &block)
 		{
 			m_scheduler_direct_resume_event_context.predicted_block_second = nullptr;
+			m_scheduler_direct_resume_event_context.predicted_pc_second = UINT32_MAX;
 		}
+		// RecLookupIdentity strips only segment/RAM-mirror bits above this
+		// cache's PC[7:2] index, so every exact architectural alias of this
+		// canonical block occupies the same direct-mapped slot.
 		const u32 dispatch_cache_index = (block.rec_lookup_identity >> 2) &
 		                                 (SchedulerDispatchCacheEntryCount() - 1);
 		auto& dispatch_cache_entry = m_scheduler_direct_resume_event_context
@@ -9882,7 +9905,7 @@ namespace VitaIOP
 		if (dispatch_cache_entry.block == &block)
 		{
 			dispatch_cache_entry.block = nullptr;
-			dispatch_cache_entry.rec_lookup_identity = UINT32_MAX;
+			dispatch_cache_entry.guest_pc = UINT32_MAX;
 		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		for (u32 i = 0; i < m_scheduler_prediction_shadow.size();)
@@ -13117,14 +13140,17 @@ namespace VitaIOP
 #endif
 
 #if defined(VITASX2_QEMU_VALIDATION)
+		const u32 current_guest_pc = psxRegs.pc;
 		const bool first_way_match =
-			block == m_scheduler_direct_resume_event_context.predicted_block;
-		const u32 current_rec_lookup_identity = RecLookupIdentity(psxRegs.pc);
+			block == m_scheduler_direct_resume_event_context.predicted_block &&
+			current_guest_pc == m_scheduler_direct_resume_event_context.predicted_pc;
+		const bool second_way_match =
+			block == m_scheduler_direct_resume_event_context.predicted_block_second &&
+			current_guest_pc ==
+				m_scheduler_direct_resume_event_context.predicted_pc_second;
+		const u32 current_rec_lookup_identity = RecLookupIdentity(current_guest_pc);
 		bool prediction_match =
-			block && block->valid &&
-			(block == m_scheduler_direct_resume_event_context.predicted_block ||
-				block ==
-					m_scheduler_direct_resume_event_context.predicted_block_second) &&
+			block && block->valid && (first_way_match || second_way_match) &&
 			block->rec_lookup_identity == current_rec_lookup_identity &&
 			block->isolate_cache_active == m_active_isolate_cache_mode;
 		if (prediction_match && s_qemuIopTrustedSourceAuditEnabled &&
@@ -13221,14 +13247,15 @@ namespace VitaIOP
 
 #if defined(VITASX2_QEMU_VALIDATION) && \
 	!defined(VITASX2_IOP_SCHEDULER_DISPATCH_CACHE_CODEGEN)
-		const u32 current_rec_lookup_identity = RecLookupIdentity(psxRegs.pc);
-		const u32 cache_index = (current_rec_lookup_identity >> 2) &
+		const u32 current_guest_pc = psxRegs.pc;
+		const u32 current_rec_lookup_identity = RecLookupIdentity(current_guest_pc);
+		const u32 cache_index = (current_guest_pc >> 2) &
 		                        (SchedulerDispatchCacheEntryCount() - 1);
 		const auto& cache_entry =
 			m_scheduler_direct_resume_event_context.dispatch_cache[cache_index];
 		bool cache_match =
 			block && block == cache_entry.block && block->valid &&
-			cache_entry.rec_lookup_identity == current_rec_lookup_identity &&
+			cache_entry.guest_pc == current_guest_pc &&
 			block->rec_lookup_identity == current_rec_lookup_identity &&
 			block->isolate_cache_active == m_active_isolate_cache_mode;
 		if (cache_match && s_qemuIopTrustedSourceAuditEnabled &&
@@ -13820,11 +13847,43 @@ namespace VitaIOP
 	extern "C" __attribute__((naked, noinline)) s32
 	VitaIopA32ExecuteProviderSchedulerPredictedResumePrivate(void*, s32)
 	{
-		static_assert(BlockExecutor::SchedulerPredictionIdentityOffset() < 4096);
-		static_assert(BlockExecutor::SchedulerRamIdentityMaskOffset() < 65536);
+		static_assert(BlockExecutor::SchedulerPredictionSecondOffset() < 65536);
 		asm volatile(
 			// Exact scheduler identity wins. Otherwise match the two cached
-			// register-dispatch targets against PCSX2's recLUT slot identity.
+			// register-dispatch targets against the exact architectural PC. An
+			// alias miss falls through to the complete recLUT dispatcher.
+			"ldmia r0, {r0, r2, r3, r12}\n"
+			"sub sp, sp, #36\n"
+			"str lr, [sp, #32]\n"
+			"cmp r2, #0\n"
+			"bne VitaIopA32ProviderSchedulerDirectResumeBody + 4\n"
+			"movw lr, #:lower16:psxRegs\n"
+			"movt lr, #:upper16:psxRegs\n"
+			"ldr lr, [lr, #%c1]\n"
+			"cmp r12, lr\n"
+			"moveq r2, r3\n"
+			"beq VitaIopA32ProviderSchedulerPredictedResumeBody + 4\n"
+			"movw r2, #%c0\n"
+			"add r2, r0, r2\n"
+			"ldmia r2, {r2, r3}\n"
+			"cmp r3, lr\n"
+			"beq VitaIopA32ProviderSchedulerPredictedResumeBody + 4\n"
+			"b VitaIopA32ProviderTimesliceBody + 4\n"
+			:
+			: "i"(BlockExecutor::SchedulerPredictionSecondOffset()),
+			  "i"(offsetof(psxRegisters, pc)));
+	}
+
+	extern "C" __attribute__((naked, noinline, aligned(32))) s32
+	VitaIopA32ExecuteProviderSchedulerDispatchCachedResumePrivate(void*, s32)
+	{
+		static_assert(BlockExecutor::SchedulerPredictionSecondOffset() < 65536);
+		static_assert(BlockExecutor::SchedulerDispatchCacheOffset() < 65536);
+		static_assert(BlockExecutor::SchedulerDispatchCacheEntryCount() == 64);
+		asm volatile(
+			// Preserve the exact route. Key both predictor ways and the indexed
+			// tier with the exact architectural PC, so their hits do not normalize
+			// a recLUT alias. A mismatch reaches the complete generic dispatcher.
 			"ldmia r0, {r0, r2, r3, r12}\n"
 			"sub sp, sp, #36\n"
 			"str lr, [sp, #32]\n"
@@ -13833,110 +13892,25 @@ namespace VitaIOP
 			"movw lr, #:lower16:psxRegs\n"
 			"movt lr, #:upper16:psxRegs\n"
 			"ldr lr, [lr, #%c2]\n"
-			"lsr r2, lr, #29\n"
-			"cmp r2, #0\n"
-			"beq 8f\n"
-			"cmp r2, #4\n"
-			"beq 8f\n"
-			"cmp r2, #5\n"
-			"beq 8f\n"
-			"movw lr, #0xffff\n"
-			"movt lr, #0xffff\n"
-			"b 7f\n"
-			"8:\n"
-			"bfc lr, #29, #3\n"
-			"lsr r2, lr, #23\n"
-			"cmp r2, #0\n"
-			"bne 7f\n"
-			"movw r2, #%c1\n"
-			"ldr r2, [r0, r2]\n"
-			"and lr, lr, r2\n"
-			"7:\n"
-			"cmp r3, #0\n"
-			"beq 1f\n"
-			"ldr r2, [r3, #%c0]\n"
-			"cmp r2, lr\n"
+			"cmp r12, lr\n"
 			"moveq r2, r3\n"
 			"beq VitaIopA32ProviderSchedulerPredictedResumeBody + 4\n"
-			"1:\n"
-			"cmp r12, #0\n"
-			"beq VitaIopA32ProviderTimesliceBody + 4\n"
-			"ldr r2, [r12, #%c0]\n"
-			"cmp r2, lr\n"
-			"moveq r2, r12\n"
+			"movw r2, #%c0\n"
+			"add r2, r0, r2\n"
+			"ldmia r2, {r2, r3}\n"
+			"cmp r3, lr\n"
 			"beq VitaIopA32ProviderSchedulerPredictedResumeBody + 4\n"
-			"b VitaIopA32ProviderTimesliceBody + 4\n"
-			:
-			: "i"(BlockExecutor::SchedulerPredictionIdentityOffset()),
-			"i"(BlockExecutor::SchedulerRamIdentityMaskOffset()),
-			  "i"(offsetof(psxRegisters, pc)));
-	}
-
-	extern "C" __attribute__((naked, noinline)) s32
-	VitaIopA32ExecuteProviderSchedulerDispatchCachedResumePrivate(void*, s32)
-	{
-		static_assert(BlockExecutor::SchedulerPredictionIdentityOffset() < 4096);
-		static_assert(BlockExecutor::SchedulerDispatchCacheOffset() < 65536);
-		static_assert(BlockExecutor::SchedulerRamIdentityMaskOffset() < 65536);
-		static_assert(BlockExecutor::SchedulerDispatchCacheEntryCount() == 64);
-		asm volatile(
-			// Preserve the exact and two-way routes byte-for-byte. Only their miss
-			// path probes the scheduler-owned PC-indexed BaseBlock cache.
-			"ldmia r0, {r0, r2, r3, r12}\n"
-			"sub sp, sp, #36\n"
-			"str lr, [sp, #32]\n"
-			"cmp r2, #0\n"
-			"bne VitaIopA32ProviderSchedulerDirectResumeBody + 4\n"
-			"movw lr, #:lower16:psxRegs\n"
-			"movt lr, #:upper16:psxRegs\n"
-			"ldr lr, [lr, #%c3]\n"
-			"lsr r2, lr, #29\n"
-			"cmp r2, #0\n"
-			"beq 8f\n"
-			"cmp r2, #4\n"
-			"beq 8f\n"
-			"cmp r2, #5\n"
-			"beq 8f\n"
-			"movw lr, #0xffff\n"
-			"movt lr, #0xffff\n"
-			"b 7f\n"
-			"8:\n"
-			"bfc lr, #29, #3\n"
-			"lsr r2, lr, #23\n"
-			"cmp r2, #0\n"
-			"bne 7f\n"
-			"movw r2, #%c2\n"
-			"ldr r2, [r0, r2]\n"
-			"and lr, lr, r2\n"
-			"7:\n"
-			"cmp r3, #0\n"
-			"beq 1f\n"
-			"ldr r2, [r3, #%c0]\n"
-			"cmp r2, lr\n"
-			"moveq r2, r3\n"
-			"beq VitaIopA32ProviderSchedulerPredictedResumeBody + 4\n"
-			"1:\n"
-			"cmp r12, #0\n"
-			"beq 2f\n"
-			"ldr r2, [r12, #%c0]\n"
-			"cmp r2, lr\n"
-			"moveq r2, r12\n"
-			"beq VitaIopA32ProviderSchedulerPredictedResumeBody + 4\n"
-			"2:\n"
 			"movw r3, #%c1\n"
 			"add r3, r0, r3\n"
 			"ubfx r12, lr, #2, #6\n"
 			"add r3, r3, r12, lsl #3\n"
 			"ldmia r3, {r2, r3}\n"
-			"cmp r2, #0\n"
-			"beq VitaIopA32ProviderTimesliceBody + 4\n"
 			"cmp r3, lr\n"
 			"beq VitaIopA32ProviderSchedulerDispatchCachedResumeBody + 4\n"
 			"b VitaIopA32ProviderTimesliceBody + 4\n"
 			:
-			: "i"(BlockExecutor::SchedulerPredictionIdentityOffset()),
+			: "i"(BlockExecutor::SchedulerPredictionSecondOffset()),
 			"i"(BlockExecutor::SchedulerDispatchCacheOffset()),
-			"i"(BlockExecutor::SchedulerRamIdentityMaskOffset()),
 			"i"(offsetof(psxRegisters, pc)));
 	}
 

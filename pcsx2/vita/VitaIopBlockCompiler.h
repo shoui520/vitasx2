@@ -889,18 +889,9 @@ namespace VitaIOP
 		};
 
 	public:
-		static constexpr u32 SchedulerPredictionIdentityOffset()
-		{
-			return static_cast<u32>(offsetof(CachedBlock, rec_lookup_identity));
-		}
+		static constexpr u32 SchedulerPredictionSecondOffset();
 		static constexpr u32 SchedulerDispatchCacheEntryCount() { return 64; }
-		static constexpr u32 SchedulerDispatchCacheOffset()
-		{
-			return static_cast<u32>(
-				offsetof(BlockExecutor, m_scheduler_direct_resume_event_context) +
-				4 * sizeof(CachedBlock*));
-		}
-		static constexpr u32 SchedulerRamIdentityMaskOffset();
+		static constexpr u32 SchedulerDispatchCacheOffset();
 
 	private:
 		struct LookupPage
@@ -1241,14 +1232,15 @@ namespace VitaIOP
 			struct DispatchCacheEntry
 			{
 				CachedBlock* block = nullptr;
-				u32 rec_lookup_identity = UINT32_MAX;
+				u32 guest_pc = UINT32_MAX;
 			};
 			BlockExecutor* executor = nullptr;
 			CachedBlock* block = nullptr;
 			CachedBlock* predicted_block = nullptr;
+			u32 predicted_pc = UINT32_MAX;
 			CachedBlock* predicted_block_second = nullptr;
+			u32 predicted_pc_second = UINT32_MAX;
 			std::array<DispatchCacheEntry, 64> dispatch_cache{};
-			u32 ram_identity_mask = 0;
 		} m_scheduler_direct_resume_event_context;
 #if defined(VITASX2_QEMU_VALIDATION)
 		std::array<CachedBlock*, 4> m_scheduler_prediction_shadow{};
@@ -1389,10 +1381,17 @@ namespace VitaIOP
 		bool m_direct_linking_enabled = true;
 	};
 
-	inline constexpr u32 BlockExecutor::SchedulerRamIdentityMaskOffset()
+	inline constexpr u32 BlockExecutor::SchedulerPredictionSecondOffset()
 	{
 		return static_cast<u32>(
 			offsetof(BlockExecutor, m_scheduler_direct_resume_event_context) +
-			offsetof(SchedulerDirectResumeEventContext, ram_identity_mask));
+			offsetof(SchedulerDirectResumeEventContext, predicted_block_second));
+	}
+
+	inline constexpr u32 BlockExecutor::SchedulerDispatchCacheOffset()
+	{
+		return static_cast<u32>(
+			offsetof(BlockExecutor, m_scheduler_direct_resume_event_context) +
+			offsetof(SchedulerDirectResumeEventContext, dispatch_cache));
 	}
 } // namespace VitaIOP
