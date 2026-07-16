@@ -564,9 +564,14 @@ namespace VitaEE
 		// atomic branch follower on the next page. The executor and this reusable
 		// compile workspace share that exact discovery ceiling.
 		static constexpr u32 MAX_COMPILE_INSTRUCTIONS = 1025;
+		// A page-positive direct RAM store uses this finer conservative
+		// source-ownership granularity before entering the exact PCSX2
+		// recClear-equivalent callback.
+		static constexpr u8 RAM_SOURCE_GUARD_CHUNK_SHIFT = 6;
 
 		explicit BlockCompiler(VitaA32::CodeBuffer& code,
 			const u8* ram_source_page_live_flags = nullptr,
+			const u8* ram_source_chunk_live_bits = nullptr,
 			void* ram_write_invalidation_context = nullptr,
 			RamWriteInvalidationCallback ram_write_invalidation_callback = nullptr);
 
@@ -691,6 +696,7 @@ namespace VitaEE
 	private:
 		BlockCompiler(VitaA32::CodeBuffer& code, CompileScratch& compile_scratch,
 			const u8* ram_source_page_live_flags,
+			const u8* ram_source_chunk_live_bits,
 			void* ram_write_invalidation_context,
 			RamWriteInvalidationCallback ram_write_invalidation_callback,
 			bool reset_compile_scratch);
@@ -1411,9 +1417,10 @@ namespace VitaEE
 			size_t secondary_live_source_branch = static_cast<size_t>(-1);
 			size_t join_offset = 0;
 			u32 size = 0;
+			bool may_cross_chunk = false;
 		};
 		bool EmitRamSourceStoreGuard(unsigned host_address_reg, u32 size,
-			u8 post_increment = 0, bool may_cross_page = false);
+			u8 post_increment = 0, bool may_cross_chunk = false);
 		bool EmitRamStoreInvalidationColdTail(
 			const RamStoreInvalidationColdTail& tail);
 
@@ -1453,6 +1460,7 @@ namespace VitaEE
 		VitaA32::CodeBuffer& m_code;
 		CompileScratch& m_compile_scratch;
 		const u8* m_ram_source_page_live_flags = nullptr;
+		const u8* m_ram_source_chunk_live_bits = nullptr;
 		void* m_ram_write_invalidation_context = nullptr;
 		RamWriteInvalidationCallback m_ram_write_invalidation_callback = nullptr;
 		FixedCompileBuffer<ScalarLoadColdTail, MAX_COMPILE_INSTRUCTIONS>&

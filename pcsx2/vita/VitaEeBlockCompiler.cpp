@@ -2694,21 +2694,25 @@ namespace VitaEE
 
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code,
 		const u8* ram_source_page_live_flags,
+		const u8* ram_source_chunk_live_bits,
 		void* ram_write_invalidation_context,
 		RamWriteInvalidationCallback ram_write_invalidation_callback)
 		: BlockCompiler(code, DefaultCompileScratch(), ram_source_page_live_flags,
+			ram_source_chunk_live_bits,
 			ram_write_invalidation_context, ram_write_invalidation_callback, true)
 	{
 	}
 
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code,
 		CompileScratch& compile_scratch, const u8* ram_source_page_live_flags,
+		const u8* ram_source_chunk_live_bits,
 		void* ram_write_invalidation_context,
 		RamWriteInvalidationCallback ram_write_invalidation_callback,
 		bool reset_compile_scratch)
 		: m_code(code)
 		, m_compile_scratch(compile_scratch)
 		, m_ram_source_page_live_flags(ram_source_page_live_flags)
+		, m_ram_source_chunk_live_bits(ram_source_chunk_live_bits)
 		, m_ram_write_invalidation_context(ram_write_invalidation_context)
 		, m_ram_write_invalidation_callback(ram_write_invalidation_callback)
 		, m_scalar_load_cold_tails(compile_scratch.scalar_load_cold_tails)
@@ -3303,7 +3307,7 @@ namespace VitaEE
 		// already have queued cold tails. It does not emit or stage qcache state, so
 		// share the process-lifetime workspace without clearing the active contents.
 		BlockCompiler analysis(analysis_code, DefaultCompileScratch(), nullptr,
-			nullptr, nullptr, false);
+			nullptr, nullptr, nullptr, false);
 		analysis.ClearGprConstState();
 		for (u32 i = 0; i < instruction_index; i++)
 		{
@@ -31328,19 +31332,21 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitRamSourceStoreGuard(unsigned host_address_reg,
-		u32 size, u8 post_increment, bool may_cross_page)
+		u32 size, u8 post_increment, bool may_cross_chunk)
 	{
 		// PCSX2 owner: x86/ix86-32/iR5900.cpp::{recRecompile,recClear} and
 		// recLUT. A direct vTLB store can only invalidate generated EE code when
 		// its translated host address belongs to main RAM and that physical source
-		// page currently owns at least one block. The live-byte table covers the
+		// page currently owns at least one block. This hot byte table covers the
 		// complete compact ARM32 HostMemoryMap arena, with permanent zeroes outside
-		// RAM, so the common path needs no range branch. r1 retains the backing
-		// offset for the cold callback. Resident SQ keeps nextEventCycle.low in r0,
-		// so that exact mode uses r12 before its branch predicate is produced; every
-		// other mode uses r0 and leaves a compatible r12 read pointer intact. r2/r3
-		// remain untouched for the scheduler countdown and compatible write pointer.
-		if (!m_ram_source_page_live_flags ||
+		// RAM, so the common path needs no range branch. A finer 64-byte bitset in
+		// the cold tail rejects page-sharing data writes before any NEON state is
+		// saved or the exact callback is entered. r1 retains the backing offset.
+		// Resident SQ keeps nextEventCycle.low in r0, so that exact mode uses r12
+		// before its branch predicate is produced; every other mode uses r0 and
+		// leaves a compatible r12 read pointer intact. r2/r3 remain untouched for
+		// the scheduler countdown and compatible write pointer.
+		if (!m_ram_source_page_live_flags || !m_ram_source_chunk_live_bits ||
 			!m_ram_write_invalidation_callback || !m_ram_write_invalidation_context)
 		{
 			return true;
@@ -31405,7 +31411,7 @@ namespace VitaEE
 		size_t end_outside_arena = static_cast<size_t>(-1);
 		size_t same_page = static_cast<size_t>(-1);
 		size_t secondary_live_source = static_cast<size_t>(-1);
-		if (may_cross_page)
+		if (may_cross_chunk)
 		{
 			// SQC2 is the only native unaligned 128-bit store. If its end remains
 			// in the compact host arena but crosses a 4 KiB source-page boundary,
@@ -31443,7 +31449,7 @@ namespace VitaEE
 		}
 
 		const size_t join_offset = m_code.Size();
-		if (may_cross_page &&
+		if (may_cross_chunk &&
 			(!m_code.PatchBranch(end_outside_arena, join_offset,
 				 VitaA32::Condition::CS) ||
 			 !m_code.PatchBranch(same_page, join_offset,
@@ -31456,16 +31462,18 @@ namespace VitaEE
 			secondary_live_source,
 			join_offset,
 			size,
+			may_cross_chunk,
 		});
 	}
 
 	bool BlockCompiler::EmitRamStoreInvalidationColdTail(
 		const RamStoreInvalidationColdTail& tail)
 	{
-		// The callback can retire the block currently executing this cold tail.
-		// Preserve the complete AAPCS caller-clobbered portion of the private EE
-		// chain ABI, including the allocator's physical q0-q3/q8-q15 banks. The
-		// callee-saved d8-d15 bank is owned by AAPCS and the callback itself.
+		// The page table deliberately over-approximates ownership. Preserve core
+		// caller state, then use a compact one-bit-per-64-byte table to reject the
+		// overwhelmingly common page-sharing write without touching NEON state or
+		// entering C++. The callback remains the exact PCSX2 recClear authority and
+		// can retire the block currently executing this cold tail.
 		constexpr u16 CALLER_CORE_REGISTERS =
 			REG_R0 | REG_R1 | REG_R2 | REG_R3 | REG_R12 | REG_LR;
 		const size_t cold_target = m_code.Size();
@@ -31474,7 +31482,88 @@ namespace VitaEE
 			(tail.secondary_live_source_branch != static_cast<size_t>(-1) &&
 				!m_code.PatchBranch(tail.secondary_live_source_branch, cold_target,
 					VitaA32::Condition::NE)) ||
-			!m_code.EmitPush(CALLER_CORE_REGISTERS) ||
+			!m_code.EmitPush(CALLER_CORE_REGISTERS))
+		{
+			return false;
+		}
+
+		auto emit_live_chunk_branch = [this](unsigned backing_offset_reg,
+			size_t* live_branch) -> bool
+		{
+			if (!live_branch ||
+				!m_code.EmitMovImm32Patchable(HOST_TMP0, static_cast<u32>(
+					reinterpret_cast<uptr>(m_ram_source_chunk_live_bits))) ||
+				!m_code.EmitLdrbRegShift(HOST_TMP0, HOST_TMP0,
+					backing_offset_reg, VitaA32::ShiftType::LSR,
+					RAM_SOURCE_GUARD_CHUNK_SHIFT + 3) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP2, backing_offset_reg,
+					VitaA32::ShiftType::LSR, RAM_SOURCE_GUARD_CHUNK_SHIFT) ||
+				!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 7) ||
+				!m_code.EmitMovImm8(HOST_TMP4, 1) ||
+				!m_code.EmitMovRegShiftReg(HOST_TMP4, HOST_TMP4,
+					VitaA32::ShiftType::LSL, HOST_TMP2) ||
+				!m_code.EmitAndReg(HOST_TMP0, HOST_TMP0, HOST_TMP4, true))
+			{
+				return false;
+			}
+			*live_branch =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			return *live_branch != static_cast<size_t>(-1);
+		};
+
+		size_t first_chunk_live = static_cast<size_t>(-1);
+		if (!emit_live_chunk_branch(HOST_TMP1, &first_chunk_live))
+			return false;
+
+		size_t end_outside_ram = static_cast<size_t>(-1);
+		size_t same_chunk = static_cast<size_t>(-1);
+		size_t second_chunk_live = static_cast<size_t>(-1);
+		if (tail.may_cross_chunk)
+		{
+			constexpr u32 CHUNK_SIZE = 1u << RAM_SOURCE_GUARD_CHUNK_SHIFT;
+			if (!m_code.EmitAddImm8(HOST_TMP3, HOST_TMP1,
+					static_cast<u8>(tail.size - 1)) ||
+				!m_code.EmitCmpImm32(HOST_TMP3, Ps2MemSize::MainRam))
+			{
+				return false;
+			}
+			end_outside_ram =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::CS);
+			if (end_outside_ram == static_cast<size_t>(-1) ||
+				!m_code.EmitEorReg(HOST_TMP2, HOST_TMP3, HOST_TMP1) ||
+				!m_code.EmitTstImm32(HOST_TMP2, CHUNK_SIZE))
+			{
+				return false;
+			}
+			same_chunk =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (same_chunk == static_cast<size_t>(-1) ||
+				!emit_live_chunk_branch(HOST_TMP3, &second_chunk_live))
+			{
+				return false;
+			}
+		}
+
+		const size_t no_live_chunk = m_code.Size();
+		if ((tail.may_cross_chunk &&
+				(!m_code.PatchBranch(end_outside_ram, no_live_chunk,
+					 VitaA32::Condition::CS) ||
+				 !m_code.PatchBranch(same_chunk, no_live_chunk,
+					 VitaA32::Condition::EQ))) ||
+			!m_code.EmitPop(CALLER_CORE_REGISTERS))
+		{
+			return false;
+		}
+		const size_t no_live_done = m_code.EmitBranchPlaceholder();
+		if (no_live_done == static_cast<size_t>(-1))
+			return false;
+
+		const size_t exact_callback = m_code.Size();
+		if (!m_code.PatchBranch(first_chunk_live, exact_callback,
+				VitaA32::Condition::NE) ||
+			(tail.may_cross_chunk &&
+				!m_code.PatchBranch(second_chunk_live, exact_callback,
+					VitaA32::Condition::NE)) ||
 			!m_code.EmitVpushDRange(0, 8) ||
 			!m_code.EmitVpushDRange(16, 16) ||
 			!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
@@ -31491,6 +31580,7 @@ namespace VitaEE
 
 		const size_t tail_done = m_code.EmitBranchPlaceholder();
 		return tail_done != static_cast<size_t>(-1) &&
+			m_code.PatchBranch(no_live_done, tail.join_offset) &&
 			m_code.PatchBranch(tail_done, tail.join_offset);
 	}
 

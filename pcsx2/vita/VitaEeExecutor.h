@@ -127,17 +127,21 @@ namespace VitaEE
 		static constexpr u32 MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS = 1025;
 		static_assert(MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ==
 			BlockCompiler::MAX_COMPILE_INSTRUCTIONS);
-		// EE source ownership is tracked at the same 4 KiB granularity as the
-		// vTLB and PCSX2's mmap code-page protection. Records and reference
-		// counts cover retail EE RAM only. Generated direct-store guards can see
-		// any non-handler pointer in the compact ARM32 HostMemoryMap arena, so
-		// their byte lookup table spans that complete arena; entries outside RAM
-		// remain zero throughout the executor's lifetime.
+		// Exact owners and reference counts remain grouped by PCSX2's 4 KiB
+		// source pages. The generated hot path uses a byte per arena page. Its
+		// page-positive cold path uses one bit per 64-byte retail-RAM chunk so
+		// data writes sharing a page with code avoid the exact-overlap callback.
 		static constexpr u32 RAM_SOURCE_PAGE_SHIFT = 12;
 		static constexpr u32 RAM_SOURCE_PAGE_COUNT =
 			Ps2MemSize::MainRam >> RAM_SOURCE_PAGE_SHIFT;
+		static constexpr u32 RAM_SOURCE_CHUNK_SHIFT =
+			BlockCompiler::RAM_SOURCE_GUARD_CHUNK_SHIFT;
+		static constexpr u32 RAM_SOURCE_CHUNK_COUNT =
+			Ps2MemSize::MainRam >> RAM_SOURCE_CHUNK_SHIFT;
 		static constexpr u32 RAM_WRITE_GUARD_PAGE_COUNT =
 			HostMemoryMap::MainSize >> RAM_SOURCE_PAGE_SHIFT;
+		static constexpr u32 RAM_SOURCE_CHUNK_LIVE_BIT_BYTES =
+			(RAM_SOURCE_CHUNK_COUNT + 7) / 8;
 		static_assert((HostMemoryMap::MainSize &
 			((1u << RAM_SOURCE_PAGE_SHIFT) - 1)) == 0);
 		static_assert(RAM_SOURCE_PAGE_COUNT <= RAM_WRITE_GUARD_PAGE_COUNT);
@@ -156,6 +160,11 @@ namespace VitaEE
 		{
 			return m_ram_source_page_live_flags.data();
 		}
+		const u8* RamSourceChunkLiveBits() const
+		{
+			return m_ram_source_chunk_live_bits.data();
+		}
+		bool IsRamSourceChunkLive(u32 backing_offset) const;
 		void SetDirectLinkingEnabled(bool enabled);
 		// A helper can request a whole-cache reset while generated code is still
 		// executing. Stop dynamic lookup immediately without patching the current
@@ -338,6 +347,9 @@ namespace VitaEE
 		bool CaptureRamSourceFragments(CachedBlock& block);
 		void RegisterRamSource(CachedBlock& block);
 		void UnregisterRamSource(const CachedBlock& block);
+		bool RamSourceChunkHasLiveOwner(u32 chunk_index,
+			const CachedBlock& removed_block) const;
+		void RefreshRamSourceChunksForBlockRemoval(const CachedBlock& block);
 		void ClearRamSourcePages();
 		static void InvalidateRamSourceRangeThunk(
 			void* context, u32 backing_start, u32 size);
@@ -414,6 +426,8 @@ namespace VitaEE
 		std::array<u32, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
 		std::array<u8, RAM_WRITE_GUARD_PAGE_COUNT>
 			m_ram_source_page_live_flags{};
+		std::array<u8, RAM_SOURCE_CHUNK_LIVE_BIT_BYTES>
+			m_ram_source_chunk_live_bits{};
 		u32 m_next_source_serial = 1;
 		// Explicit trace windows and PCSX2-discovered BaseBlocks can have the same
 		// guest PC but different spans and scheduler tails. Keep their metadata

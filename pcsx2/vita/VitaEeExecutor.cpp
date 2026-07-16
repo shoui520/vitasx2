@@ -509,6 +509,89 @@ namespace VitaEE
 				m_ram_source_page_live_counts[page_index]++;
 				m_ram_source_page_live_flags[page_index] = 1;
 			}
+
+			const u32 first_chunk = fragment.start >> RAM_SOURCE_CHUNK_SHIFT;
+			const u32 last_chunk =
+				(fragment.start + fragment.size - 1) >> RAM_SOURCE_CHUNK_SHIFT;
+			for (u32 chunk_index = first_chunk;
+				chunk_index <= last_chunk && chunk_index < RAM_SOURCE_CHUNK_COUNT;
+				chunk_index++)
+			{
+				m_ram_source_chunk_live_bits[chunk_index >> 3] |=
+					static_cast<u8>(1u << (chunk_index & 7));
+			}
+		}
+	}
+
+	bool BlockExecutor::RamSourceChunkHasLiveOwner(u32 chunk_index,
+		const CachedBlock& removed_block) const
+	{
+		if (chunk_index >= RAM_SOURCE_CHUNK_COUNT)
+			return false;
+
+		const u32 chunk_start = chunk_index << RAM_SOURCE_CHUNK_SHIFT;
+		const u32 chunk_end = chunk_start + (1u << RAM_SOURCE_CHUNK_SHIFT);
+		const u32 page_index = chunk_start >> RAM_SOURCE_PAGE_SHIFT;
+		for (const RamSourceRecord& record : m_ram_source_pages[page_index])
+		{
+			CachedBlock* const owner = record.block;
+			if (!owner || !owner->valid || owner->source_serial != record.serial ||
+				owner->ram_source_fragment_count == 0 ||
+				(owner == &removed_block && record.serial == removed_block.source_serial))
+			{
+				continue;
+			}
+
+			for (u32 fragment_index = 0;
+				fragment_index < owner->ram_source_fragment_count; fragment_index++)
+			{
+				const RamSourceFragment& fragment =
+					owner->ram_source_fragments[fragment_index];
+				if (fragment.start == INVALID_RAM_SOURCE || fragment.size == 0)
+					continue;
+				const u32 fragment_end = fragment.start + fragment.size;
+				if (chunk_start < fragment_end && fragment.start < chunk_end)
+					return true;
+			}
+		}
+		return false;
+	}
+
+	bool BlockExecutor::IsRamSourceChunkLive(u32 backing_offset) const
+	{
+		if (backing_offset >= Ps2MemSize::MainRam)
+			return false;
+		const u32 chunk_index = backing_offset >> RAM_SOURCE_CHUNK_SHIFT;
+		return (m_ram_source_chunk_live_bits[chunk_index >> 3] &
+			static_cast<u8>(1u << (chunk_index & 7))) != 0;
+	}
+
+	void BlockExecutor::RefreshRamSourceChunksForBlockRemoval(
+		const CachedBlock& block)
+	{
+		for (u32 fragment_index = 0;
+			fragment_index < block.ram_source_fragment_count; fragment_index++)
+		{
+			const RamSourceFragment& fragment =
+				block.ram_source_fragments[fragment_index];
+			if (fragment.start == INVALID_RAM_SOURCE || fragment.size == 0)
+				continue;
+			const u32 first_chunk = fragment.start >> RAM_SOURCE_CHUNK_SHIFT;
+			const u32 last_chunk =
+				(fragment.start + fragment.size - 1) >> RAM_SOURCE_CHUNK_SHIFT;
+			for (u32 chunk_index = first_chunk;
+				chunk_index <= last_chunk && chunk_index < RAM_SOURCE_CHUNK_COUNT;
+				chunk_index++)
+			{
+				u8& live_byte =
+					m_ram_source_chunk_live_bits[chunk_index >> 3];
+				const u8 live_bit =
+					static_cast<u8>(1u << (chunk_index & 7));
+				if (RamSourceChunkHasLiveOwner(chunk_index, block))
+					live_byte |= live_bit;
+				else
+					live_byte &= static_cast<u8>(~live_bit);
+			}
 		}
 	}
 
@@ -557,6 +640,7 @@ namespace VitaEE
 					m_ram_source_page_live_counts[page_index] != 0 ? 1 : 0;
 			}
 		}
+		RefreshRamSourceChunksForBlockRemoval(block);
 	}
 
 	void BlockExecutor::ClearRamSourcePages()
@@ -565,6 +649,7 @@ namespace VitaEE
 			records.clear();
 		m_ram_source_page_live_counts.fill(0);
 		m_ram_source_page_live_flags.fill(0);
+		m_ram_source_chunk_live_bits.fill(0);
 		m_next_source_serial = 1;
 	}
 
@@ -2674,7 +2759,7 @@ namespace VitaEE
 				}
 
 				BlockCompiler compiler(block.code,
-					RamSourcePageLiveFlags(), this,
+					RamSourcePageLiveFlags(), RamSourceChunkLiveBits(), this,
 					&BlockExecutor::InvalidateRamSourceRangeThunk);
 #if defined(VITASX2_QEMU_VALIDATION)
 				compiler.SetVtlbLinkedEntryPcPublicationEnabled(
