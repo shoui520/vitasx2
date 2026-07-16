@@ -849,6 +849,7 @@ namespace VitaEE
 		m_persistent_direct_exit = nullptr;
 		m_persistent_scheduler_elided_direct_exit = nullptr;
 		m_persistent_event_exit = nullptr;
+		m_persistent_retained_wait_event_exit = nullptr;
 		ReleaseCodeCache();
 		return invalidated;
 	}
@@ -1614,6 +1615,7 @@ namespace VitaEE
 			m_persistent_direct_exit = nullptr;
 			m_persistent_scheduler_elided_direct_exit = nullptr;
 			m_persistent_event_exit = nullptr;
+			m_persistent_retained_wait_event_exit = nullptr;
 			return false;
 		};
 
@@ -1666,6 +1668,13 @@ namespace VitaEE
 		// calls recEventTest() and falls directly into _DynGen_DispatcherReg().
 		// Keep that same event-only path inside the persistent A32 frame when the
 		// provider supplies a callback with an explicit safe-resume contract.
+		// Ordinary generated event tails do not spend block-cache bytes
+		// materializing callback metadata. Normalize their token once in this
+		// shared dispatcher. A retained-wait tail branches past this instruction
+		// after publishing its exact scaled loop-cycle token in r0.
+		if (!code.EmitMovImm8(0, static_cast<u8>(BlockExitKind::Event)))
+			return fail();
+		const size_t retained_wait_event_exit_offset = code.Size();
 		if (!code.EmitLdrImm12(HOST_CALLBACK, HOST_SP,
 				PERSISTENT_EVENT_CALLBACK_OFFSET) ||
 			!code.EmitCmpImm32(HOST_CALLBACK, 0))
@@ -1827,6 +1836,8 @@ namespace VitaEE
 		m_persistent_scheduler_elided_direct_exit =
 			code.Data() + scheduler_elided_direct_exit_offset;
 		m_persistent_event_exit = code.Data() + event_exit_offset;
+		m_persistent_retained_wait_event_exit =
+			code.Data() + retained_wait_event_exit_offset;
 		return true;
 	}
 
@@ -2812,7 +2823,9 @@ namespace VitaEE
 					attempt_direct_continuation_kind,
 					&attempt_scheduler_test_elided_continuation_emitted,
 					m_persistent_dispatch_enabled ?
-						m_persistent_scheduler_elided_direct_exit : direct_exit);
+						m_persistent_scheduler_elided_direct_exit : direct_exit,
+					m_persistent_dispatch_enabled ?
+						m_persistent_retained_wait_event_exit : nullptr);
 				u32 calculated_prefix_cycles = 0;
 				const bool cycle_contract_matches =
 					candidate_instruction_count == instruction_count ||

@@ -20,6 +20,13 @@ namespace VitaA32
 
 namespace VitaEE
 {
+	// Persistent event callbacks receive a negative exact scaled-cycle count when
+	// the generated source is a PCSX2-proven, side-effect-free unconditional
+	// wait. The sign bit distinguishes it from every public BlockExitKind token;
+	// small waits materialize as one A32 MVN-class immediate instead of MOVW/MOVT.
+	inline constexpr u32 RETAINED_UNCONDITIONAL_WAIT_EVENT_MASK = 0x80000000u;
+	inline constexpr u32 RETAINED_UNCONDITIONAL_WAIT_MAX_CYCLES = 0x7fffffffu;
+
 	template <typename T, size_t Capacity>
 	class FixedCompileBuffer
 	{
@@ -660,7 +667,8 @@ namespace VitaEE
 			DirectContinuationKind direct_continuation_kind =
 				DirectContinuationKind::SchedulerTestedTail,
 			bool* scheduler_test_elided_continuation_emitted = nullptr,
-			const void* scheduler_test_elided_direct_exit = nullptr);
+			const void* scheduler_test_elided_direct_exit = nullptr,
+			const void* retained_wait_event_exit = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
@@ -744,15 +752,23 @@ namespace VitaEE
 		bool EmitGeneratedDispatchLookup(const void* lookup_pages_slot,
 			const void* direct_exit, bool defer_pc_writeback,
 			bool special_exception_lookup);
-		bool EmitEventExitReturn(const void* event_exit);
+		bool EmitEventExitReturn(const void* event_exit,
+			u32 persistent_event_token = 0xe7u);
 		bool EmitIndirectCycleTestExit(const void* event_exit,
 			bool allow_generated_lookup);
 		bool EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc, u32 taken_pc,
 			bool conditional_pc, bool indirect_pc_writeback = false);
 		static bool IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc);
 		bool EmitWaitLoopFastForwardTail(const void* event_exit,
-			bool defer_pc_writeback = false, u32 pc = 0);
-		bool EndBlockWithWaitLoopFastForward(u32 block_cycles, const void* event_exit);
+			bool defer_pc_writeback = false, u32 pc = 0,
+			u32 persistent_event_token = 0xe7u);
+		bool EndBlockWithWaitLoopFastForward(u32 block_cycles,
+			const void* event_exit, bool retain_across_events = false);
+		static bool IsRetainableUnconditionalWaitBlock(u32 start_pc,
+			u32 instruction_count);
+		bool CompileRetainedUnconditionalWaitBlock(u32 start_pc,
+			u32 instruction_count, const void* retained_wait_event_exit,
+			u32* scaled_cycles, size_t* linked_entry_offset);
 		bool CompilePreincrementByteZeroFillLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);

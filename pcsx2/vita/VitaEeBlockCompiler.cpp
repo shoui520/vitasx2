@@ -9995,6 +9995,85 @@ namespace VitaEE
 			   m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0));
 	}
 
+	bool BlockCompiler::IsRetainableUnconditionalWaitBlock(u32 start_pc,
+		u32 instruction_count)
+	{
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile() identifies
+		// s_nBlockFF loops and iBranchTest() advances them to nextEventCycle.
+		// Retaining the event frame omits entire guest iterations, so use a much
+		// narrower proof than s_nBlockFF: the final branch is unconditionally
+		// self-taken and every other instruction, including its delay slot, is NOP.
+		if (instruction_count < 2 ||
+			instruction_count > ((UINT32_MAX - start_pc) / sizeof(u32)))
+		{
+			return false;
+		}
+
+		const u32 branch_index = instruction_count - 2;
+		const u32 branch_pc = start_pc + branch_index * sizeof(u32);
+		const u32 branch_op = memRead32(branch_pc);
+		const u32 primary = branch_op >> 26;
+		const u32 rs = RS(branch_op);
+		const u32 rt = RT(branch_op);
+		u32 target_pc = 0;
+		if (primary == 0x02) // J; JAL is deliberately excluded.
+			target_pc = JumpTarget(branch_pc, branch_op);
+		else if ((primary == 0x04 && rs == rt) || // BEQ r,r.
+			(primary == 0x06 && rs == 0) || // BLEZ zero.
+			(primary == 0x01 && rs == 0 && rt == 0x01)) // BGEZ zero.
+		{
+			target_pc = BranchTarget(branch_pc, branch_op);
+		}
+		else
+		{
+			return false;
+		}
+
+		if (target_pc != start_pc)
+			return false;
+
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			if (i != branch_index && memRead32(start_pc + i * sizeof(u32)) != 0)
+				return false;
+		}
+		return true;
+	}
+
+	bool BlockCompiler::CompileRetainedUnconditionalWaitBlock(u32 start_pc,
+		u32 instruction_count, const void* retained_wait_event_exit,
+		u32* scaled_cycles, size_t* linked_entry_offset)
+	{
+		if (!retained_wait_event_exit ||
+			!IsRetainableUnconditionalWaitBlock(start_pc, instruction_count))
+		{
+			return false;
+		}
+
+		u32 block_cycles = 0;
+		if (!CalculateScaledCyclesForRange(start_pc, instruction_count, false,
+				&block_cycles) ||
+			block_cycles == 0 ||
+			block_cycles > RETAINED_UNCONDITIONAL_WAIT_MAX_CYCLES)
+		{
+			return false;
+		}
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		// No guest instruction has an architectural effect. Publish the loop head
+		// as PCSX2's normal taken branch tail would, then emit only its exact cycle
+		// charge, WaitLoop max(cycle,nextEventCycle), and scheduler event edge.
+		return BeginBlock(false, false, false, linked_entry_offset) &&
+			EmitStorePc(start_pc) &&
+			EndBlockWithWaitLoopFastForward(block_cycles,
+				retained_wait_event_exit, true) &&
+			FlushColdTails();
+	}
+
 	bool BlockCompiler::CompileGsCsrVsintPollLoop(u32 start_pc,
 		u32 instruction_count, const void* direct_exit, const void* event_exit,
 		u32* scaled_cycles, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -10734,7 +10813,8 @@ namespace VitaEE
 		CompatibleVtlbFastEntryOffsets* compatible_vtlb_fast_entries,
 		DirectContinuationKind direct_continuation_kind,
 		bool* scheduler_test_elided_continuation_emitted,
-		const void* scheduler_test_elided_direct_exit)
+		const void* scheduler_test_elided_direct_exit,
+		const void* retained_wait_event_exit)
 	{
 		if (scheduler_test_elided_continuation_emitted)
 			*scheduler_test_elided_continuation_emitted = false;
@@ -10867,6 +10947,18 @@ namespace VitaEE
 		const bool signed_countdown_loop_batch_enabled =
 			range_loop_dispatch_enabled && EmuConfig.Speedhacks.WaitLoop && !device_trace_enabled &&
 			!EmuConfig.Gamefixes.GoemonTlbHack;
+		const bool retained_unconditional_wait_enabled =
+			range_loop_dispatch_enabled && EmuConfig.Speedhacks.WaitLoop &&
+			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack &&
+			persistent_dispatch_exits && retained_wait_event_exit &&
+			direct_continuation_kind == DirectContinuationKind::SchedulerTestedTail;
+		if (retained_unconditional_wait_enabled &&
+			IsRetainableUnconditionalWaitBlock(start_pc, instruction_count))
+		{
+			return CompileRetainedUnconditionalWaitBlock(start_pc,
+				instruction_count, retained_wait_event_exit, scaled_cycles,
+				linked_entry_offset);
+		}
 		if (gs_csr_poll_fast_forward_enabled && direct_links &&
 			IsExactGsCsrVsintPollLoop(start_pc, instruction_count))
 		{
@@ -11739,7 +11831,8 @@ namespace VitaEE
 			branch_target_pc <= start_pc &&
 			IsWaitLoopBody(branch_target_pc, next_pc,
 				start_pc + branch_instruction_index * 4);
-		const bool whole_wait_loop_fast_forward = has_branch && has_static_direct_link_target &&
+		const bool whole_wait_loop_fast_forward = has_branch &&
+			has_static_direct_link_target &&
 			static_direct_link_target_pc == branch_target_pc && wait_loop_body;
 		const bool can_direct_link = !has_branch || has_static_direct_link_target ||
 			has_static_conditional_direct_links;
@@ -12630,11 +12723,22 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::EmitEventExitReturn(const void* event_exit)
+	bool BlockCompiler::EmitEventExitReturn(const void* event_exit,
+		u32 persistent_event_token)
 	{
 		if (!event_exit)
 			return false;
 
+		// Callable blocks return the public u8 exit kind. Persistent blocks branch
+		// into the resident dispatcher instead, so r0 is otherwise unconstrained.
+		// Publish an explicit callback token only on this cold event edge; retained
+		// unconditional waits use it to carry their exact loop-cycle contract.
+		if (m_persistent_dispatch_exits &&
+			persistent_event_token != static_cast<u32>(EE_EVENT_EXIT_TOKEN) &&
+			!m_code.EmitMovImm32(HOST_TMP0, persistent_event_token))
+		{
+			return false;
+		}
 		return EmitExitToTarget(event_exit, EE_EVENT_EXIT_TOKEN);
 	}
 
@@ -12919,7 +13023,7 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitWaitLoopFastForwardTail(const void* event_exit,
-		bool defer_pc_writeback, u32 pc)
+		bool defer_pc_writeback, u32 pc, u32 persistent_event_token)
 	{
 		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest() WaitLoop form:
 		// cycle = max(cycle + block cycles, nextEventCycle), then dispatch
@@ -12938,10 +13042,12 @@ namespace VitaEE
 			return false;
 		}
 
-		return (!defer_pc_writeback || EmitStorePc(pc)) && EmitEventExitReturn(event_exit);
+		return (!defer_pc_writeback || EmitStorePc(pc)) &&
+			EmitEventExitReturn(event_exit, persistent_event_token);
 	}
 
-	bool BlockCompiler::EndBlockWithWaitLoopFastForward(u32 block_cycles, const void* event_exit)
+	bool BlockCompiler::EndBlockWithWaitLoopFastForward(u32 block_cycles,
+		const void* event_exit, bool retain_across_events)
 	{
 		if (!event_exit)
 			return false;
@@ -12968,11 +13074,14 @@ namespace VitaEE
 		if (no_skip == static_cast<size_t>(-1))
 			return false;
 
-		if (!EmitWaitLoopFastForwardTail(event_exit))
+		const u32 event_token = retain_across_events ?
+			(0u - block_cycles) :
+			static_cast<u32>(EE_EVENT_EXIT_TOKEN);
+		if (!EmitWaitLoopFastForwardTail(event_exit, false, 0, event_token))
 			return false;
 
 		if (!m_code.PatchBranch(no_skip, m_code.Size(), VitaA32::Condition::PL) ||
-			!EmitEventExitReturn(event_exit))
+			!EmitEventExitReturn(event_exit, event_token))
 		{
 			return false;
 		}

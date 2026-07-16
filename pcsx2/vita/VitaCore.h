@@ -118,6 +118,7 @@ struct VitaA32EeProviderStats
 	u32 in_frame_event_tests = 0;
 	u32 in_frame_event_resume_candidates = 0;
 	u32 in_frame_event_resume_refusals = 0;
+	u32 retained_unconditional_wait_events = 0;
 	u32 first_interpreter_pc = 0;
 	u32 first_interpreter_opcode = 0;
 	u32 first_interpreter_reason = 0;

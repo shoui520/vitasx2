@@ -623,7 +623,7 @@ static void recAccountEeBlockExecution(const VitaEE::BlockExecutionResult& resul
 			Console.WriteLn(
 				"Vita EE pre-ELF progress: boundaries=%llu start_pc=%08x next_pc=%08x "
 				"ee_cycle=%llu ee_next=%llu iop_pc=%08x iop_cycle=%llu iop_next=%llu "
-				"iop_budget=%d frame=%u in_frame_events=%u:%u:%u",
+				"iop_budget=%d frame=%u in_frame_events=%u:%u:%u retained_wait=%u",
 				static_cast<unsigned long long>(boundaries), fallback_pc, cpuRegs.pc,
 				static_cast<unsigned long long>(cpuRegs.cycle),
 				static_cast<unsigned long long>(cpuRegs.nextEventCycle), psxRegs.pc,
@@ -633,7 +633,8 @@ static void recAccountEeBlockExecution(const VitaEE::BlockExecutionResult& resul
 				s_ee_a32_stats.in_frame_event_tests,
 				s_ee_a32_stats.in_frame_event_tests -
 					s_ee_a32_stats.in_frame_event_resume_refusals,
-				s_ee_a32_stats.in_frame_event_resume_refusals);
+				s_ee_a32_stats.in_frame_event_resume_refusals,
+				s_ee_a32_stats.retained_unconditional_wait_events);
 		}
 	}
 #endif
@@ -809,17 +810,8 @@ static bool recDidEeTraceLimitHitAtNaturalBoundary()
 }
 #endif
 
-static __attribute__((noinline)) u32 recRunEeEventForGeneratedResume()
+static bool recCanResumeGeneratedEeAfterEvent()
 {
-	// PCSX2 owner: x86/ix86-32/iR5900.cpp::recEventTest() runs the complete
-	// shared scheduler owner, checks the recompiler-exit request, and then falls
-	// directly into _DynGen_DispatcherReg(). The persistent A32 dispatcher calls
-	// this bridge without unwinding its private frame. recClear() has already
-	// nulled the active generated directory before setting the reset request, so
-	// returning false is enough to force the existing provider boundary safely.
-	s_ee_a32_stats.in_frame_event_tests++;
-	_cpuEventTest_Shared();
-
 	bool resume = s_ee_a32_in_frame_event_resume_enabled &&
 		!s_ee_a32_exit_execution && !s_ee_a32_cache_reset_requested &&
 		s_ee_a32_running_compiled_block &&
@@ -840,6 +832,53 @@ static __attribute__((noinline)) u32 recRunEeEventForGeneratedResume()
 	resume = resume && s_ee_a32_trace_limit_stop_condition ==
 		VitaA32EeTraceLimitStopCondition::None;
 #endif
+	return resume;
+}
+
+static __attribute__((noinline)) u32 recRunEeEventForGeneratedResume(
+	u32 event_token)
+{
+	// PCSX2 owner: x86/ix86-32/iR5900.cpp::recEventTest() runs the complete
+	// shared scheduler owner, checks the recompiler-exit request, and then falls
+	// directly into _DynGen_DispatcherReg(). The persistent A32 dispatcher calls
+	// this bridge without unwinding its private frame. recClear() has already
+	// nulled the active generated directory before setting the reset request, so
+	// returning false is enough to force the existing provider boundary safely.
+	const bool retain_unconditional_wait =
+		(event_token & VitaEE::RETAINED_UNCONDITIONAL_WAIT_EVENT_MASK) != 0;
+	const u32 wait_cycles = 0u - event_token;
+	const u32 wait_pc = cpuRegs.pc;
+	u32 event_tests = 0;
+	u32 retained_events = 0;
+	bool resume = false;
+	for (;;)
+	{
+		event_tests++;
+		_cpuEventTest_Shared();
+		resume = recCanResumeGeneratedEeAfterEvent();
+		if (!resume || !retain_unconditional_wait || wait_cycles == 0 ||
+			cpuRegs.pc != wait_pc)
+		{
+			break;
+		}
+
+		// PCSX2 iBranchTest() would re-enter this proven empty self-loop,
+		// charge one iteration, then set cycle=max(cycle,nextEventCycle) and
+		// dispatch the same event owner. When the new deadline is at least one
+		// iteration away, publish that identical maximum here and retain the C++
+		// event frame. Device work, interrupts, IOP execution, and every exact
+		// deadline still run; only generated block/lookup redispatch is omitted.
+		const s32 deadline_delta = static_cast<s32>(
+			static_cast<u32>(cpuRegs.nextEventCycle) -
+			static_cast<u32>(cpuRegs.cycle));
+		if (deadline_delta < static_cast<s32>(wait_cycles))
+			break;
+
+		cpuRegs.cycle = cpuRegs.nextEventCycle;
+		retained_events++;
+	}
+	s_ee_a32_stats.in_frame_event_tests += event_tests;
+	s_ee_a32_stats.retained_unconditional_wait_events += retained_events;
 	if (resume)
 		VitaEE::RefreshRawGpr0KnownZero();
 	else

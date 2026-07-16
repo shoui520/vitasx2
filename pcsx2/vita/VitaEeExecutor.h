@@ -116,7 +116,7 @@ namespace VitaEE
 			const BlockExecutionResult& completed_chain);
 		// Runs the complete PCSX2 EE event owner and returns nonzero only when the
 		// active generated lookup may resume inside the persistent JIT frame.
-		using PersistentEventCallback = u32 (*)();
+		using PersistentEventCallback = u32 (*)(u32 event_token);
 
 		// PCSX2 recRecompile() discovers through the next branch, existing
 		// BaseBlock, debugger seam, or 4 KiB source-page boundary. A branch in the
@@ -440,6 +440,7 @@ namespace VitaEE
 		const void* m_persistent_direct_exit = nullptr;
 		const void* m_persistent_scheduler_elided_direct_exit = nullptr;
 		const void* m_persistent_event_exit = nullptr;
+		const void* m_persistent_retained_wait_event_exit = nullptr;
 		static constexpr size_t MAX_PERSISTENT_DISPATCH_BARRIERS = 8;
 		std::array<u32, MAX_PERSISTENT_DISPATCH_BARRIERS>
 			m_persistent_dispatch_barriers{};
