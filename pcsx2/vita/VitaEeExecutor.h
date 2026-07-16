@@ -97,6 +97,7 @@ namespace VitaEE
 		u32 resident_self_link_entry_instructions = 0;
 		u32 resident_self_link_entry_loads = 0;
 		u32 compatible_gpr_links = 0;
+		u32 post_writeback_canonical_links = 0;
 		u32 compatible_gpr_link_entry_instructions = 0;
 		u32 compatible_gpr_link_entry_loads = 0;
 		u32 compatible_gpr_words_carried = 0;
@@ -153,7 +154,23 @@ namespace VitaEE
 			return m_ram_source_page_live_flags.data();
 		}
 		void SetDirectLinkingEnabled(bool enabled);
+		// A helper can request a whole-cache reset while generated code is still
+		// executing. Stop dynamic lookup immediately without patching the current
+		// code page; Reset() and the next directory allocation republish it.
+		void SuspendGeneratedLookupUntilReset();
 		void SetPersistentDispatchEnabled(bool enabled);
+		// A persistent block normally enters its next block without returning to
+		// the provider. PCSX2's x86 recRecompile() embeds a few lifecycle hooks at
+		// specific block entries; A32 keeps those entries on the private
+		// dispatcher boundary so the provider can run the same hooks before the
+		// target block executes, without disabling linking for the rest of boot.
+		static u32 CanonicalizeRamBackedPc(u32 pc);
+		bool SetPersistentDispatchBarrier(u32 pc, bool enabled);
+		// Reconcile the complete set of lifecycle owners as one unique union.
+		// Required barriers are installed before stale barriers are removed, so a
+		// failed code patch leaves dispatch conservatively on provider boundaries.
+		bool SetPersistentDispatchBarriers(const u32* pcs, size_t count);
+		void ClearPersistentDispatchBarriers();
 #if defined(VITASX2_QEMU_VALIDATION)
 		void SetCompatibleGprDirtyCarryEnabled(bool enabled);
 		void SetCompatibleSchedulerCarryEnabled(bool enabled);
@@ -375,9 +392,11 @@ namespace VitaEE
 			CompatibleVtlbGuardKind kind) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link, CachedBlock* target);
 		void PatchIncomingLinks(CachedBlock& target);
-		void UnlinkIncomingLinks(u32 target_pc,
+		bool UnlinkIncomingLinks(u32 target_pc,
 			const bool* discovered_topology = nullptr);
 		void RelinkDirectLinks();
+		bool IsPersistentDispatchBarrier(u32 pc) const;
+		bool SetCanonicalPersistentDispatchBarrier(u32 canonical_pc, bool enabled);
 #if defined(VITASX2_QEMU_VALIDATION)
 		void RecordPersistentExit(BlockExitKind exit);
 #endif
@@ -403,6 +422,10 @@ namespace VitaEE
 		const void* m_persistent_direct_exit = nullptr;
 		const void* m_persistent_scheduler_elided_direct_exit = nullptr;
 		const void* m_persistent_event_exit = nullptr;
+		static constexpr size_t MAX_PERSISTENT_DISPATCH_BARRIERS = 8;
+		std::array<u32, MAX_PERSISTENT_DISPATCH_BARRIERS>
+			m_persistent_dispatch_barriers{};
+		u8 m_persistent_dispatch_barrier_count = 0;
 		u8* m_code_cache = nullptr;
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;

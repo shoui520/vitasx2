@@ -3,6 +3,7 @@
 
 #include "GS.h"
 #include "Host.h"
+#include "VMManager.h"
 
 #include "common/WindowInfo.h"
 #include "common/ProgressCallback.h"
@@ -184,6 +185,13 @@ void Host::OnCaptureStarted(const std::string& filename)
 
 void Host::OnCaptureStopped()
 {
+}
+
+void Host::OnPerformanceMetricsUpdated()
+{
+	// The fixed Vita frontend has no desktop status widgets to invalidate. The
+	// metrics themselves are still updated by the GS worker and consumed by the
+	// product/runtime diagnostics.
 }
 
 s32 Host::Internal::GetTranslatedStringImpl(const std::string_view context, const std::string_view msg, char* tbuf, size_t tbuf_space)

@@ -4,10 +4,15 @@
 #include "GS/Renderers/SW/GSTextureCacheSW.h"
 #include "GS/GSExtra.h"
 #include "GS/GSPerfMon.h"
+#if !defined(VITASX2_VITA)
 #include "GS/GSPng.h"
+#endif
 #include "GS/GSUtil.h"
 
-GSTextureCacheSW::GSTextureCacheSW() = default;
+GSTextureCacheSW::GSTextureCacheSW(GSLocalMemory& memory)
+	: m_memory(&memory)
+{
+}
 
 GSTextureCacheSW::~GSTextureCacheSW()
 {
@@ -46,7 +51,7 @@ GSTextureCacheSW::Texture* GSTextureCacheSW::Lookup(const GIFRegTEX0& TEX0, cons
 	}
 
 	// Lookup miss
-	Texture* t = new Texture(tw0, TEX0, TEXA);
+	Texture* t = new Texture(*m_memory, tw0, TEX0, TEXA);
 
 	m_textures.insert(t);
 
@@ -125,8 +130,10 @@ void GSTextureCacheSW::IncAge()
 
 //
 
-GSTextureCacheSW::Texture::Texture(u32 tw0, const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA)
-	: m_TEX0(TEX0)
+GSTextureCacheSW::Texture::Texture(GSLocalMemory& memory, u32 tw0,
+	const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA)
+	: m_memory(&memory)
+	, m_TEX0(TEX0)
 	, m_TEXA(TEXA)
 	, m_buff(nullptr)
 	, m_tw(tw0)
@@ -143,14 +150,14 @@ GSTextureCacheSW::Texture::Texture(u32 tw0, const GIFRegTEX0& TEX0, const GIFReg
 
 	m_sharedbits = GSUtil::HasSharedBitsPtr(m_TEX0.PSM);
 
-	m_offset = g_gs_renderer->m_mem.GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM);
+	m_offset = m_memory->GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM);
 	m_pages = m_offset.pageLooperForRect(GSVector4i(0, 0, 1 << TEX0.TW, 1 << TEX0.TH));
 
 	m_repeating = m_TEX0.IsRepeating(); // repeating mode always works, it is just slightly slower
 
 	if (m_repeating)
 	{
-		m_p2t = g_gs_renderer->m_mem.GetPage2TileMap(m_TEX0);
+		m_p2t = m_memory->GetPage2TileMap(m_TEX0);
 	}
 }
 
@@ -186,14 +193,14 @@ void GSTextureCacheSW::Texture::Reset(u32 tw0, const GIFRegTEX0& TEX0, const GIF
 
 	m_sharedbits = GSUtil::HasSharedBitsPtr(m_TEX0.PSM);
 
-	m_offset = g_gs_renderer->m_mem.GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM);
+	m_offset = m_memory->GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM);
 	m_pages = m_offset.pageLooperForRect(GSVector4i(0, 0, 1 << TEX0.TW, 1 << TEX0.TH));
 
 	m_repeating = m_TEX0.IsRepeating(); // repeating mode always works, it is just slightly slower
 
 	if (m_repeating)
 	{
-		m_p2t = g_gs_renderer->m_mem.GetPage2TileMap(m_TEX0);
+		m_p2t = m_memory->GetPage2TileMap(m_TEX0);
 	}
 }
 
@@ -236,7 +243,7 @@ bool GSTextureCacheSW::Texture::Update(const GSVector4i& rect)
 		std::memset(m_buff, 0, size);
 	}
 
-	GSLocalMemory& mem = g_gs_renderer->m_mem;
+	GSLocalMemory& mem = *m_memory;
 
 	GSOffset off = m_offset;
 
@@ -312,7 +319,14 @@ bool GSTextureCacheSW::Texture::Update(const GSVector4i& rect)
 
 bool GSTextureCacheSW::Texture::Save(const std::string& fn) const
 {
-	const u32* RESTRICT clut = g_gs_renderer->m_mem.m_clut;
+#if defined(VITASX2_VITA)
+	// GS dumps are a desktop debugging facility. Keeping the method as a
+	// harmless failure preserves the texture-cache interface without pulling
+	// the PNG/image stack into the Vita product.
+	(void)fn;
+	return false;
+#else
+	const u32* RESTRICT clut = m_memory->m_clut;
 
 	const u32 w = 1 << m_TEX0.TW;
 	const u32 h = 1 << m_TEX0.TH;
@@ -342,4 +356,5 @@ bool GSTextureCacheSW::Texture::Save(const std::string& fn) const
 		return GSPng::Save(format, fn, reinterpret_cast<const u8*>(dumptex.get()),
 			w, h, w * sizeof(u32), GSConfig.PNGCompressionLevel);
 	}
+#endif
 }

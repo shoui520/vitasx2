@@ -108,8 +108,14 @@ namespace VMManager
 		ElfObject elfo;
 		if (elf_path.empty() || !cdvdLoadElf(&elfo, elf_path, false, &error))
 		{
-			Console.Error("Vita ELF load info failed for '%s': %s",
-				elf_path.c_str(), error.GetDescription().c_str());
+			// PCSX2 owner: VMManager.cpp::UpdateELFInfo(). The first full-boot
+			// EELOAD call intentionally has no ELF argument and enters OSDSYS; it
+			// clears game identity without reporting a load failure.
+			if (!elf_path.empty())
+			{
+				Console.Error("Vita ELF load info failed for '%s': %s",
+					elf_path.c_str(), error.GetDescription().c_str());
+			}
 			s_elf_path = {};
 			s_elf_entry_point = 0xFFFFFFFFu;
 			s_current_crc = 0;
@@ -328,17 +334,20 @@ namespace VMManager
 		const bool booting_iso = boot_params.source_type.has_value() &&
 			boot_params.source_type.value() == CDVD_SourceType::Iso &&
 			!boot_params.filename.empty() && boot_params.elf_override.empty();
+		const bool no_disc_source = !boot_params.source_type.has_value() ||
+			boot_params.source_type.value() == CDVD_SourceType::NoDisc;
 		const bool booting_elf = !boot_params.elf_override.empty() &&
 			boot_params.filename.empty() &&
-			(!boot_params.source_type.has_value() ||
-			 boot_params.source_type.value() == CDVD_SourceType::NoDisc);
-		if (!booting_iso && !booting_elf)
+			no_disc_source;
+		const bool booting_bios = boot_params.filename.empty() &&
+			boot_params.elf_override.empty() && no_disc_source;
+		if (!booting_iso && !booting_elf && !booting_bios)
 		{
 			// Vita-only product policy excludes physical drives and desktop source
-			// auto-detection. These are the two PCSX2-owned product routes: an ISO,
-			// or an ELF override with no disc.
+			// auto-detection. These are the three PCSX2-owned product routes: an
+			// ISO, an ELF override with no disc, or OSDSYS with no disc.
 			Error::SetString(error,
-				"The Vita product requires either an ISO or a direct ELF boot path.");
+				"The Vita product requires an ISO, a direct ELF, or a BIOS-only boot.");
 			return VMBootResult::StartupFailure;
 		}
 		if (!boot_params.save_state.empty() || boot_params.state_index.has_value())
@@ -347,9 +356,9 @@ namespace VMManager
 				"Frontend savestate boot is not enabled in the Vita product lifecycle.");
 			return VMBootResult::StartupFailure;
 		}
-		const std::string& boot_path =
-			booting_elf ? boot_params.elf_override : boot_params.filename;
-		if (!FileSystem::FileExists(boot_path.c_str()))
+		const std::string& boot_path = booting_elf ?
+			boot_params.elf_override : boot_params.filename;
+		if (!booting_bios && !FileSystem::FileExists(boot_path.c_str()))
 		{
 			Error::SetStringFmt(error, "Requested boot file '{}' does not exist.", boot_path);
 			return VMBootResult::StartupFailure;
@@ -387,8 +396,10 @@ namespace VMManager
 			goto fail;
 		s_lifecycle.cdvd_open = true;
 
-		s_fast_boot_requested = booting_elf || boot_params.fast_boot.value_or(
-			static_cast<bool>(EmuConfig.EnableFastBoot));
+		// PCSX2 owner: VMManager.cpp::Initialize(). NoDisc OSDSYS must never
+		// enter eeload fast boot even when the global setting is enabled.
+		s_fast_boot_requested = (booting_elf || boot_params.fast_boot.value_or(
+			static_cast<bool>(EmuConfig.EnableFastBoot))) && !booting_bios;
 		if (booting_elf)
 		{
 			// PCSX2 owner: VMManager::UpdateDiscDetails(). With an ELF override and
@@ -400,9 +411,18 @@ namespace VMManager
 			Console.WriteLn("Vita direct ELF: title=%s crc=%08x path=%s",
 				s_disc_serial.c_str(), s_disc_crc, boot_path.c_str());
 		}
-		else
+		else if (booting_iso)
 		{
 			UpdateDiscInfo();
+		}
+		else
+		{
+			// PCSX2 owner: VMManager.cpp::UpdateDiscDetails(). A no-disc OSDSYS
+			// session uses the loaded BIOS identity for cards and diagnostics.
+			ClearDiscInfo();
+			s_disc_serial = BiosSerial;
+			Console.WriteLn("Vita BIOS session: serial=%s zone=%s",
+				s_disc_serial.c_str(), BiosZone.c_str());
 		}
 		// A serial is optional for bootable homebrew discs. PCSX2 uses the ELF
 		// filename as a title fallback and an empty memory-card filter.
@@ -417,7 +437,10 @@ namespace VMManager
 		// serial to SIO2 for per-game card filtering/eject behavior.
 		FileMcd_Reopen(s_disc_serial);
 		s_lifecycle.memory_cards_open = true;
-		Hle_SetHostRoot(boot_path.c_str());
+		if (booting_bios)
+			Hle_ClearHostRoot();
+		else
+			Hle_SetHostRoot(boot_path.c_str());
 
 		// PCSX2 owner: UpdateCPUImplementations(), ClearCPUExecutionCaches(),
 		// FPCR installation, memory-handler binding, and cold reset in
@@ -427,7 +450,11 @@ namespace VMManager
 		mmap_ResetBlockTracking();
 		memSetExtraMemMode(EmuConfig.Cpu.ExtraMemory);
 		Internal::ClearCPUExecutionCaches();
-		EmuConfig.Gamefixes.InstantDMAHack = s_fast_boot_requested;
+		// PCSX2 owner: VMManager.cpp::ApplyGameFixes(). BIOS/EELOAD always
+		// requires InstantDMAHack, including a NoDisc OSDSYS boot; the ELF-entry
+		// seam below clears it before ordinary game execution becomes observable.
+		EmuConfig.Gamefixes.InstantDMAHack = true;
+		EmuConfig.GS.ManualUserHacks = false;
 		FPControlRegister::SetCurrent(EmuConfig.Cpu.FPUFPCR);
 		if (FPControlRegister::GetCurrent() != EmuConfig.Cpu.FPUFPCR)
 		{
@@ -695,6 +722,14 @@ namespace VMManager
 			psxCpu->Reset();
 			CpuVU0->Reset();
 			CpuVU1->Reset();
+			// Exact PCSX2 owner: VMManager::Internal::ClearCPUExecutionCaches().
+			// The Vita VIF dynarec owns persistent unpack state independently of
+			// the VU providers, so reset both channels at the same lifecycle seam.
+			if constexpr (newVifDynaRec)
+			{
+				dVifReset(0);
+				dVifReset(1);
+			}
 		}
 
 		const std::vector<u32>& GetSoftwareRendererProcessorList()

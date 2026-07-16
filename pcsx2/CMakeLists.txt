@@ -54,6 +54,7 @@ add_library(pcsx2core STATIC
 	GS/GSLocalMemory.cpp
 	GS/GSLocalMemoryMultiISA.cpp
 	GS/GSPerfMon.cpp
+	GS/GSRingHeap.cpp
 	GS/GSState.cpp
 	GS/GSTables.cpp
 	GS/GSUtil.cpp
@@ -61,6 +62,10 @@ add_library(pcsx2core STATIC
 	GS/GSXXH.cpp
 	GS/Renderers/Common/GSVertexTrace.cpp
 	GS/Renderers/Common/GSVertexTraceFMM.cpp
+	GS/Renderers/SW/GSDrawScanline.cpp
+	GS/Renderers/SW/GSRasterizer.cpp
+	GS/Renderers/SW/GSRendererSW.cpp
+	GS/Renderers/SW/GSTextureCacheSW.cpp
 	Gif.cpp
 	Gif_Logger.cpp
 	Gif_Unit.cpp
@@ -282,6 +287,10 @@ else()
 	vitasx2_add_gxm_shader(vitasx2_color_f sce_fp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_present_v sce_vp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_present_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_merge_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_copy_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_mad_buffer_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_mad_reconstruct_f sce_fp_psp2)
 	# INTERFACE object sources are direct final-link inputs, but CMake does not
 	# retain their generation edge. Give the outputs an owner and pass them to
 	# final executables because GNU ar does not index psp2bin's slot-zero symbol.

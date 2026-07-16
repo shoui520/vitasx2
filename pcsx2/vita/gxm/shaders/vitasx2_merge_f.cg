@@ -1,0 +1,10 @@
+float4 main(
+	float4 vColor : COLOR0,
+	float2 vTexCoord : TEXCOORD0,
+	uniform sampler2D source : TEXUNIT0) : COLOR
+{
+	float4 sampled = tex2D(source, vTexCoord);
+	// PCSX2 bin/resources/shaders/opengl/merge.glsl::ps_main0 owns this
+	// PMODE.MMOD=0 merge: RC1 contributes twice its framebuffer alpha.
+	return float4(vColor.rgb * sampled.rgb, sampled.a * 2.0f);
+}

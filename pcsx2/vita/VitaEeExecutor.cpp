@@ -26,6 +26,7 @@ extern u32 g_qemuEmbeddedCompatibleContinuationIncompatibleTargets;
 extern u32 g_qemuCompatibleVtlbWriteFastEntryActivations;
 extern u32 g_qemuCompatibleVtlbReadFastEntryActivations;
 extern u32 g_qemuEeDirectExitSourcePc;
+u32 g_qemuEeGeneratedLookupSuspensions = 0;
 #endif
 
 namespace
@@ -221,7 +222,8 @@ namespace VitaEE
 		if (LookupPage* page = GetLookupPage(
 				block.start_pc, true, block.discovered_topology))
 			page->blocks[index] = &block;
-		if (block.discovered_topology)
+		if (block.discovered_topology &&
+			!IsPersistentDispatchBarrier(block.start_pc))
 		{
 			if (GeneratedLookupPage* page =
 					GetGeneratedLookupPage(block.start_pc, true))
@@ -1001,6 +1003,21 @@ namespace VitaEE
 		}
 	}
 
+	void BlockExecutor::SuspendGeneratedLookupUntilReset()
+	{
+		// recClear() can be called from a returning interpreter helper while its
+		// generated source block is still live. Patching or freeing that block here
+		// is unsafe, but an indirect transition must not enter any cached target
+		// before the provider consumes the deferred reset. The active-directory
+		// slot is loaded at every generated lookup, so nulling it is an immediate,
+		// same-thread gate which leaves the executing code untouched.
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (m_active_generated_lookup_pages)
+			g_qemuEeGeneratedLookupSuspensions++;
+#endif
+		m_active_generated_lookup_pages = nullptr;
+	}
+
 	void BlockExecutor::SetPersistentDispatchEnabled(bool enabled)
 	{
 		if (m_persistent_dispatch_enabled == enabled)
@@ -1012,6 +1029,185 @@ namespace VitaEE
 		// when its recompiler ABI changes.
 		Reset();
 		m_persistent_dispatch_enabled = enabled;
+	}
+
+	u32 BlockExecutor::CanonicalizeRamBackedPc(u32 pc)
+	{
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::HWADDR(). Lifecycle
+		// hooks are compiled against the physical EE-RAM identity, so KSEG and
+		// TLB aliases must converge on the same dispatch seam. Vita omits x86's
+		// 256 KiB hwLUT; recover the identity from the already-resolved vTLB host
+		// mapping without allocating another reverse table.
+		if (!eeMem || !vtlb_private::vtlbdata.vmap)
+			return pc;
+
+		const vtlb_private::VTLBVirtual& mapping =
+			vtlb_private::vtlbdata.vmap[pc >> vtlb_private::VTLB_PAGE_BITS];
+		if (mapping.isHandler(pc))
+			return pc;
+
+		const uptr host = mapping.assumePtr(pc);
+		const uptr ram = reinterpret_cast<uptr>(eeMem->Main);
+		if (host < ram || host >= ram + Ps2MemSize::ExposedRam)
+			return pc;
+		return static_cast<u32>(host - ram);
+	}
+
+	bool BlockExecutor::IsPersistentDispatchBarrier(u32 pc) const
+	{
+		pc = CanonicalizeRamBackedPc(pc);
+		for (u8 i = 0; i < m_persistent_dispatch_barrier_count; i++)
+		{
+			if (m_persistent_dispatch_barriers[i] == pc)
+				return true;
+		}
+		return false;
+	}
+
+	bool BlockExecutor::SetPersistentDispatchBarrier(u32 pc, bool enabled)
+	{
+		if ((pc & 0x3u) != 0)
+			return false;
+		return SetCanonicalPersistentDispatchBarrier(
+			CanonicalizeRamBackedPc(pc), enabled);
+	}
+
+	bool BlockExecutor::SetCanonicalPersistentDispatchBarrier(
+		u32 canonical_pc, bool enabled)
+	{
+		// canonical_pc is deliberately not translated here. A stored barrier is
+		// the physical-RAM identity resolved when its owner published it. Running
+		// that identity through a subsequently changed TLB mapping would turn
+		// remove/clear into a lookup for a different seam.
+		const u32 pc = canonical_pc;
+
+		u8 index = 0;
+		while (index < m_persistent_dispatch_barrier_count &&
+			m_persistent_dispatch_barriers[index] != pc)
+		{
+			index++;
+		}
+
+		if (enabled)
+		{
+			if (index < m_persistent_dispatch_barrier_count)
+				return true;
+			if (m_persistent_dispatch_barrier_count >=
+				MAX_PERSISTENT_DISPATCH_BARRIERS)
+			{
+				return false;
+			}
+			m_persistent_dispatch_barriers[m_persistent_dispatch_barrier_count++] = pc;
+
+			// Both static and indirect links for every RAM alias must reach
+			// PersistentDispatchThunk so its boundary callback can run the owner hook
+			// before the block. Existing aliases have distinct raw lookup slots even
+			// though PCSX2 gives them one physical block identity.
+			bool unlinked = true;
+			for (const std::unique_ptr<CachedBlock>& entry : m_cache)
+			{
+				CachedBlock& block = *entry;
+				if (!block.valid || CanonicalizeRamBackedPc(block.start_pc) != pc)
+					continue;
+				if (GeneratedLookupPage* page =
+						GetGeneratedLookupPage(block.start_pc, false))
+				{
+					page->entry_points[LookupEntryIndex(block.start_pc)] = nullptr;
+				}
+				unlinked &= UnlinkIncomingLinks(block.start_pc);
+			}
+			// Keep the barrier installed and every generated lookup suppressed if a
+			// branch patch or instruction-cache publication fails. Returning false
+			// then makes the provider stop instead of executing past an owner hook.
+			return unlinked;
+		}
+
+		if (index == m_persistent_dispatch_barrier_count)
+			return true;
+		m_persistent_dispatch_barriers[index] =
+			m_persistent_dispatch_barriers[--m_persistent_dispatch_barrier_count];
+
+		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
+		{
+			CachedBlock& block = *entry;
+			if (!block.valid || CanonicalizeRamBackedPc(block.start_pc) != pc)
+				continue;
+			if (block.discovered_topology)
+			{
+				if (GeneratedLookupPage* page =
+						GetGeneratedLookupPage(block.start_pc, true))
+				{
+					page->entry_points[LookupEntryIndex(block.start_pc)] =
+						LinkedEntryPoint(block);
+				}
+			}
+			if (m_direct_linking_enabled)
+				PatchIncomingLinks(block);
+		}
+		return true;
+	}
+
+	bool BlockExecutor::SetPersistentDispatchBarriers(const u32* pcs, size_t count)
+	{
+		if ((count != 0 && !pcs) || count > MAX_PERSISTENT_DISPATCH_BARRIERS)
+			return false;
+
+		std::array<u32, MAX_PERSISTENT_DISPATCH_BARRIERS> desired{};
+		u8 desired_count = 0;
+		for (size_t i = 0; i < count; i++)
+		{
+			if ((pcs[i] & 0x3u) != 0)
+				return false;
+
+			const u32 canonical_pc = CanonicalizeRamBackedPc(pcs[i]);
+			bool duplicate = false;
+			for (u8 j = 0; j < desired_count; j++)
+				duplicate |= desired[j] == canonical_pc;
+			if (!duplicate)
+				desired[desired_count++] = canonical_pc;
+		}
+
+		// Capacity is checked before mutating the current set. Additions happen
+		// before removals so lifecycle ownership transitions never expose a gap.
+		if (desired_count > MAX_PERSISTENT_DISPATCH_BARRIERS)
+			return false;
+		for (u8 i = 0; i < desired_count; i++)
+		{
+			if (!SetCanonicalPersistentDispatchBarrier(desired[i], true))
+				return false;
+		}
+
+		u8 index = 0;
+		while (index < m_persistent_dispatch_barrier_count)
+		{
+			const u32 current = m_persistent_dispatch_barriers[index];
+			bool keep = false;
+			for (u8 i = 0; i < desired_count; i++)
+				keep |= desired[i] == current;
+			if (keep)
+			{
+				index++;
+				continue;
+			}
+
+			if (!SetCanonicalPersistentDispatchBarrier(current, false))
+				return false;
+			// Removal swaps the final entry into this slot.
+		}
+		return true;
+	}
+
+	void BlockExecutor::ClearPersistentDispatchBarriers()
+	{
+		while (m_persistent_dispatch_barrier_count != 0)
+		{
+			const u32 pc = m_persistent_dispatch_barriers[
+				m_persistent_dispatch_barrier_count - 1];
+			// Stored entries are already canonical. The private operation always
+			// removes the entry before attempting optional relinking, so a changed
+			// TLB mapping cannot strand this loop on the same count.
+			SetCanonicalPersistentDispatchBarrier(pc, false);
+		}
 	}
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -2786,6 +2982,8 @@ namespace VitaEE
 		}
 		if (target && target->discovered_topology != block.discovered_topology)
 			return false;
+		if (target && IsPersistentDispatchBarrier(target->start_pc))
+			target = nullptr;
 
 		const void* direct_exit = m_persistent_dispatch_enabled ?
 			m_persistent_direct_exit : reinterpret_cast<const void*>(&VitaEeA32DirectExit);
@@ -2793,8 +2991,9 @@ namespace VitaEE
 		// patch sites. Exact self-edges retain their richer private state; other
 		// links may skip canonical GPR loads and dirty publication only when both
 		// blocks publish the exact same width/host/state/representation/provenance
-		// contract. A dirty incompatible edge stays on its generated writeback
-		// fallback instead of jumping directly to a canonical target.
+		// contract. An incompatible edge first runs its generated canonical
+		// publication and then uses a second reversible hardlink to the target's
+		// ordinary entry, matching BaseBlocks::Link() without exposing private state.
 		const bool use_resident_entry = target && m_persistent_dispatch_enabled &&
 			!link.canonicalizes_reclaimed_vtlb_hosts &&
 			link.target_pc == block.start_pc && block.resident_self_link_entry_loads != 0;
@@ -2848,6 +3047,15 @@ namespace VitaEE
 			(link.requires_compatible_entry &&
 				 !use_resident_entry && !use_compatible_entry) ||
 			(link.embedded_compatible_continuation && !use_embedded_continuation);
+		const bool has_canonical_target =
+			link.canonical_target_offset != static_cast<size_t>(-1);
+		if (has_canonical_target &&
+			link.canonical_target_offset + sizeof(u32) > block.code.Size())
+		{
+			return false;
+		}
+		const bool use_canonical_entry = target && m_persistent_dispatch_enabled &&
+			use_generated_fallback && has_canonical_target;
 		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) :
 			(use_prevalidated_vtlb_entry ?
 				CompatibleVtlbFastEntryPoint(*target, prevalidated_vtlb_guard) :
@@ -2873,11 +3081,19 @@ namespace VitaEE
 					static_cast<const u8*>(block.code.EntryPoint()) + link.fallback_offset,
 				link.secondary_branch_unconditional ? VitaA32::Condition::AL :
 					VitaA32::Condition::NE);
-		if (!patched || !secondary_patched || !block.code.Flush())
+		const bool canonical_patched = !has_canonical_target ||
+			(use_canonical_entry ?
+				block.code.PatchBranchToAddress(link.canonical_target_offset,
+					LinkedEntryPoint(*target), VitaA32::Condition::AL) :
+				block.code.PatchInstruction(link.canonical_target_offset,
+					link.canonical_fallback_instruction));
+		if (!patched || !secondary_patched || !canonical_patched ||
+			!block.code.Flush())
 			return false;
 
 		link.patched_to_resident_entry = !use_generated_fallback && use_resident_entry;
 		link.patched_to_compatible_entry = !use_generated_fallback && use_compatible_entry;
+		link.patched_to_canonical_entry = use_canonical_entry;
 		link.embedded_continuation_active = use_embedded_continuation;
 		const size_t selected_compatible_entry_offset = use_prevalidated_vtlb_entry ?
 			prevalidated_vtlb_entry_offset :
@@ -2908,18 +3124,19 @@ namespace VitaEE
 		}
 	}
 
-	void BlockExecutor::UnlinkIncomingLinks(u32 target_pc,
+	bool BlockExecutor::UnlinkIncomingLinks(u32 target_pc,
 		const bool* discovered_topology)
 	{
+		bool unlinked = true;
 		if (target_pc == UINT32_MAX)
 		{
 			for (u32 i = 0; i < m_incoming_links.size(); i++)
 			{
 				IncomingLinkRecord& record = m_incoming_links[i];
 				if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-					PatchDirectLink(*record.source, *link, nullptr);
+					unlinked &= PatchDirectLink(*record.source, *link, nullptr);
 			}
-			return;
+			return unlinked;
 		}
 
 		s32 index = LastIncomingLinkIndex(target_pc);
@@ -2932,8 +3149,9 @@ namespace VitaEE
 				continue;
 			}
 			if (DirectLinkSlot* link = GetRecordedDirectLink(record))
-				PatchDirectLink(*record.source, *link, nullptr);
+				unlinked &= PatchDirectLink(*record.source, *link, nullptr);
 		}
+		return unlinked;
 	}
 
 	void BlockExecutor::RelinkDirectLinks()
@@ -3008,6 +3226,8 @@ namespace VitaEE
 		PopulateFrameEvidence(block.code, m_persistent_dispatch_code, result);
 		for (const DirectLinkSlot& link : block.direct_links.slots)
 		{
+			if (link.valid && link.patched_to_canonical_entry)
+				result->post_writeback_canonical_links++;
 			if (link.valid && link.patched_to_resident_entry)
 			{
 				result->resident_self_links++;
@@ -3129,6 +3349,8 @@ namespace VitaEE
 			PopulateFrameEvidence(entry->code, m_persistent_dispatch_code, result);
 			for (const DirectLinkSlot& link : entry->direct_links.slots)
 			{
+				if (link.valid && link.patched_to_canonical_entry)
+					result->post_writeback_canonical_links++;
 				if (link.valid && link.patched_to_resident_entry)
 				{
 					result->resident_self_links++;

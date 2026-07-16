@@ -8,13 +8,28 @@
 #include "GS/GSRingHeap.h"
 #include "GS/MultiISA.h"
 
+#if !defined(VITASX2_VITA)
+#include "GS/Renderers/Common/GSRenderer.h"
+#endif
+
 MULTI_ISA_UNSHARED_START
 
-class GSRendererSW final : public GSRenderer
+#if defined(VITASX2_VITA)
+using GSRendererSWBase = GSState;
+#else
+using GSRendererSWBase = GSRenderer;
+#endif
+
+class GSRendererSW
+#if !defined(VITASX2_VITA)
+	final
+#endif
+	: public GSRendererSWBase
 {
 public:
 	class SharedData : public GSRasterizerData
 	{
+		GSRendererSW* m_owner;
 		struct alignas(16) TextureLevel
 		{
 			GSVector4i r;
@@ -36,7 +51,7 @@ public:
 		} m_syncpoint;
 
 	public:
-		SharedData();
+		explicit SharedData(GSRendererSW& owner);
 		virtual ~SharedData();
 
 		void UsePages(const GSOffset::PageLooper* fb_pages, int fpsm, const GSOffset::PageLooper* zb_pages, int zpsm);
@@ -50,8 +65,10 @@ protected:
 	std::unique_ptr<IRasterizer> m_rl;
 	std::unique_ptr<GSTextureCacheSW> m_tc;
 	GSRingHeap m_vertex_heap;
+#if !defined(VITASX2_VITA)
 	std::array<GSTexture*, 3> m_texture = {};
 	u8* m_output;
+#endif
 	GSPixelOffset4* m_fzb;
 	GSVector4i m_fzb_bbox;
 	u32 m_fzb_cur_pages[16];
@@ -61,9 +78,11 @@ protected:
 	GSVector4i m_dimx[8] = {};
 
 	void Reset(bool hardware_reset) override;
+#if !defined(VITASX2_VITA)
 	void VSync(u32 field, bool registers_written, bool idle_frame) override;
 	GSTexture* GetOutput(int i, float& scale, int& y_offset) override;
 	GSTexture* GetFeedbackOutput(float& scale) override;
+#endif
 
 	void Draw() override;
 	void Queue(GSRingHeap::SharedPtr<GSRasterizerData>& item);
@@ -87,9 +106,23 @@ public:
 	GSRendererSW(int threads);
 	~GSRendererSW() override;
 
+#if !defined(VITASX2_VITA)
 	__fi static GSRendererSW* GetInstance() { return static_cast<GSRendererSW*>(g_gs_renderer.get()); }
-
 	void Destroy() override;
+#else
+	void Destroy();
+
+	// Complete the PCSX2 software renderer's per-VSync lifetime without entering
+	// desktop GSRenderer/GSDevice presentation. The Vita presenter consumes the
+	// now-quiescent canonical GSLocalMemory separately.
+	void CompleteVSync();
+#endif
 };
 
 MULTI_ISA_UNSHARED_END
+
+#if defined(VITASX2_VITA)
+// Vita builds compile only the native ISA copy.  Keep the public renderer name
+// used by the Vita GS front end while MultiISA retains ownership of the class.
+using GSRendererSW = isa_native::GSRendererSW;
+#endif

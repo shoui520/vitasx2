@@ -1,0 +1,9 @@
+float4 main(
+	float4 vColor : COLOR0,
+	float2 vTexCoord : TEXCOORD0,
+	uniform sampler2D source : TEXUNIT0) : COLOR
+{
+	// PCSX2 GSDeviceOGL::DoMerge() uses ShaderConvert::COPY for RC2 and
+	// GSDevice::PresentRect() copies the completed merge without replacing A.
+	return vColor * tex2D(source, vTexCoord);
+}

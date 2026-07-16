@@ -2,18 +2,26 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS/Renderers/SW/GSRendererSW.h"
-#include "GS/GSGL.h"
+#if !defined(VITASX2_VITA)
 #include "GS/GSPng.h"
+#endif
 #include "GS/GSUtil.h"
 
+#include "common/Console.h"
 #include "common/StringUtil.h"
+
+#if defined(VITASX2_VITA)
+#include <system_error>
+#endif
 
 MULTI_ISA_UNSHARED_IMPL;
 
+#if !defined(VITASX2_VITA)
 GSRenderer* CURRENT_ISA::makeGSRendererSW(int threads)
 {
 	return new GSRendererSW(threads);
 }
+#endif
 
 #define LOG 0
 
@@ -22,14 +30,35 @@ GSRenderer* CURRENT_ISA::makeGSRendererSW(int threads)
 static constexpr GSVector4 s_pos_scale = GSVector4::cxpr(1.0f / 16, 1.0f / 16, 1.0f, 128.0f);
 
 GSRendererSW::GSRendererSW(int threads)
-	: GSRenderer(), m_fzb(NULL)
+	: GSRendererSWBase(), m_fzb(NULL)
 {
 	m_nativeres = true; // ignore ini, sw is always native
 
-	m_tc = std::make_unique<GSTextureCacheSW>();
-	m_rl = GSRasterizerList::Create(threads);
+	m_tc = std::make_unique<GSTextureCacheSW>(m_mem);
 
+#if defined(VITASX2_VITA)
+	// PCSX2's multi-threaded software renderer is still the owner, but its
+	// GSJobQueue currently creates workers through std::thread.  Vita's
+	// pthread shim can reject that creation contract; do not terminate the GS
+	// thread and lose the complete software renderer.  Preserve correctness by
+	// falling back to PCSX2's own single-rasterizer implementation.
+	try
+	{
+		m_rl = GSRasterizerList::Create(threads);
+	}
+	catch (const std::system_error& error)
+	{
+		Console.Warning("Vita GS: software worker creation failed (%d: %s); using the PCSX2 single rasterizer.",
+			error.code().value(), error.what());
+		m_rl = GSRasterizerList::Create(0);
+	}
+#else
+	m_rl = GSRasterizerList::Create(threads);
+#endif
+
+#if !defined(VITASX2_VITA)
 	m_output = (u8*)_aligned_malloc(1024 * 1024 * sizeof(u32), VECTOR_ALIGNMENT);
+#endif
 
 	std::fill(std::begin(m_fzb_pages), std::end(m_fzb_pages), 0);
 	std::fill(std::begin(m_tex_pages), std::end(m_tex_pages), 0);
@@ -49,7 +78,11 @@ void GSRendererSW::Reset(bool hardware_reset)
 
 	m_tc->RemoveAll();
 
+#if defined(VITASX2_VITA)
+	GSState::Reset(hardware_reset);
+#else
 	GSRenderer::Reset(hardware_reset);
+#endif
 }
 
 void GSRendererSW::Destroy()
@@ -58,6 +91,7 @@ void GSRendererSW::Destroy()
 	m_rl.reset();
 	m_tc.reset();
 
+#if !defined(VITASX2_VITA)
 	for (GSTexture*& tex : m_texture)
 	{
 		delete tex;
@@ -66,8 +100,10 @@ void GSRendererSW::Destroy()
 
 	_aligned_free(m_output);
 	m_output = nullptr;
+#endif
 }
 
+#if !defined(VITASX2_VITA)
 void GSRendererSW::VSync(u32 field, bool registers_written, bool idle_frame)
 {
 	Sync(0); // IncAge might delete a cached texture in use
@@ -202,6 +238,14 @@ GSTexture* GSRendererSW::GetFeedbackOutput(float& scale)
 
 	return nullptr;
 }
+#else
+void GSRendererSW::CompleteVSync()
+{
+	Sync(0); // IncAge may delete a cached texture which a worker still uses.
+	m_tc->IncAge();
+	m_draw_transfers.clear();
+}
+#endif
 
 MULTI_ISA_DEF(void GSVertexSWInitStatic();)
 
@@ -447,7 +491,7 @@ void GSRendererSW::Draw()
 			break;
 	}
 	
-	auto data = m_vertex_heap.make_shared<SharedData>().cast<GSRasterizerData>();
+	auto data = m_vertex_heap.make_shared<SharedData>(*this).cast<GSRasterizerData>();
 	SharedData* sd = static_cast<SharedData*>(data.get());
 
 	sd->primclass = m_vt.m_primclass;
@@ -558,6 +602,9 @@ void GSRendererSW::Draw()
 
 	sd->UsePages(fb_pages, m_context->offset.fb.psm(), zb_pages, m_context->offset.zb.psm());
 
+#if defined(VITASX2_VITA)
+	Queue(data);
+#else
 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
 	{
 		Sync(2);
@@ -631,6 +678,7 @@ void GSRendererSW::Draw()
 	{
 		Queue(data);
 	}
+#endif
 
 	/*
 	if(0)//stats.ticks > 5000000)
@@ -1546,8 +1594,9 @@ bool GSRendererSW::IsCoverageAlphaSupported()
 	return IsCoverageAlpha();
 }
 
-GSRendererSW::SharedData::SharedData()
-	: m_fpsm(0)
+GSRendererSW::SharedData::SharedData(GSRendererSW& owner)
+	: m_owner(&owner)
+	, m_fpsm(0)
 	, m_zpsm(0)
 	, m_using_pages(false)
 	, m_syncpoint(SyncNone)
@@ -1592,17 +1641,17 @@ void GSRendererSW::SharedData::UsePages(const GSOffset::PageLooper* fb_pages, in
 
 		if (global.sel.fb)
 		{
-			GSRendererSW::GetInstance()->UsePages(*fb_pages, 0);
+			m_owner->UsePages(*fb_pages, 0);
 		}
 
 		if (global.sel.zb)
 		{
-			GSRendererSW::GetInstance()->UsePages(*zb_pages, 1);
+			m_owner->UsePages(*zb_pages, 1);
 		}
 
 		for (size_t i = 0; m_tex[i].t != NULL; i++)
 		{
-			GSRendererSW::GetInstance()->UsePages(m_tex[i].t->m_pages, 2);
+			m_owner->UsePages(m_tex[i].t->m_pages, 2);
 		}
 	}
 
@@ -1626,17 +1675,17 @@ void GSRendererSW::SharedData::ReleasePages()
 
 		if (global.sel.fb)
 		{
-			GSRendererSW::GetInstance()->ReleasePages(m_fb_pages, 0);
+			m_owner->ReleasePages(m_fb_pages, 0);
 		}
 
 		if (global.sel.zb)
 		{
-			GSRendererSW::GetInstance()->ReleasePages(m_zb_pages, 1);
+			m_owner->ReleasePages(m_zb_pages, 1);
 		}
 
 		for (size_t i = 0; m_tex[i].t != NULL; i++)
 		{
-			GSRendererSW::GetInstance()->ReleasePages(m_tex[i].t->m_pages, 2);
+			m_owner->ReleasePages(m_tex[i].t->m_pages, 2);
 		}
 	}
 
@@ -1669,6 +1718,7 @@ void GSRendererSW::SharedData::UpdateSource()
 		}
 	}
 
+#if !defined(VITASX2_VITA)
 	if (GSConfig.SaveTexture && GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
 	{
 		const u64 frame = g_perfmon.GetFrame();
@@ -1677,17 +1727,18 @@ void GSRendererSW::SharedData::UpdateSource()
 
 		for (u32 i = 0; m_tex[i].t; i++)
 		{
-			const GIFRegTEX0& TEX0 = g_gs_renderer->GetTex0Layer(i);
+			const GIFRegTEX0& TEX0 = m_owner->GetTex0Layer(i);
 
-			s = GetDrawDumpPath("%05lld_f%05lld_itex%d_%05x_%s.bmp", g_gs_renderer->s_n, frame, i, TEX0.TBP0, GSUtil::GetPSMName(TEX0.PSM));
+			s = GetDrawDumpPath("%05lld_f%05lld_itex%d_%05x_%s.bmp", m_owner->s_n, frame, i, TEX0.TBP0, GSUtil::GetPSMName(TEX0.PSM));
 
 			m_tex[i].t->Save(s);
 		}
 
 		if (global.clut)
 		{
-			s = GetDrawDumpPath("%05lld_f%05lld_itexp_%05x_%s.bmp", g_gs_renderer->s_n, frame, (int)g_gs_renderer->m_context->TEX0.CBP, GSUtil::GetPSMName(g_gs_renderer->m_context->TEX0.CPSM));
+			s = GetDrawDumpPath("%05lld_f%05lld_itexp_%05x_%s.bmp", m_owner->s_n, frame, (int)m_owner->m_context->TEX0.CBP, GSUtil::GetPSMName(m_owner->m_context->TEX0.CPSM));
 			GSPng::Save((IsDevBuild || GSConfig.SaveAlpha) ? GSPng::RGB_A_PNG : GSPng::RGB_PNG, s, reinterpret_cast<const u8*>(global.clut), 256, 1, sizeof(u32) * 256, GSConfig.PNGCompressionLevel, false);
 		}
 	}
+#endif
 }

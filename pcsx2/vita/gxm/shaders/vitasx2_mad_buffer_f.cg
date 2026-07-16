@@ -1,0 +1,27 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+float4 main(
+	float2 vTexCoord : TEXCOORD0,
+	float2 windowPosition : WPOS,
+	uniform float4 ZrH,
+	uniform sampler2D source : TEXUNIT0) : COLOR
+{
+	// PCSX2 owner: bin/resources/shaders/opengl/interlace.glsl::ps_main3.
+	// The persistent target contains two banks of two interleaved fields. Only
+	// the line belonging to this VSync's field is replaced; discard preserves
+	// the other three fields already stored in the color surface.
+	const int index = (int)ZrH.x;
+	const int bank = index / 2;
+	const int field = index - bank * 2;
+	const int sourceHeight = (int)ZrH.z / 2;
+	const int alignedHeight = ((sourceHeight + 1) / 2) * 2;
+	const int lineOffset = (alignedHeight - sourceHeight) * bank;
+	const int destinationLine = (int)windowPosition.y + lineOffset;
+	const int destinationField = destinationLine - (destinationLine / 2) * 2;
+
+	if (destinationField != field)
+		discard;
+
+	return tex2D(source, vTexCoord);
+}

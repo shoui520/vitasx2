@@ -1,4 +1,6 @@
 // This version is a stripped down version of boost/lockfree/spsc_queue.hpp boost_spsc_queue.hpp
+#pragma once
+
 // Rational
 // * Performance is better on linux than the standard std::queue
 // * Performance in the same on windows

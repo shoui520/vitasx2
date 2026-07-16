@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "GS/Renderers/Common/GSRenderer.h"
+#include "GS/GSState.h"
 #include "GS/Renderers/Common/GSFastList.h"
 #include <unordered_set>
 
@@ -13,6 +13,7 @@ public:
 	class Texture
 	{
 	public:
+		GSLocalMemory* m_memory;
 		GSOffset m_offset;
 		GSOffset::PageLooper m_pages;
 		GIFRegTEX0 m_TEX0;
@@ -31,7 +32,7 @@ public:
 		// fast mode: each u32 bits map to the 32 blocks of that page
 		// repeating mode: 1 bpp image of the texture tiles (8x8), also having 512 elements is just a coincidence (worst case: (1024*1024)/(8*8)/(sizeof(u32)*8))
 
-		Texture(u32 tw0, const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA);
+		Texture(GSLocalMemory& memory, u32 tw0, const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA);
 		virtual ~Texture();
 
 		void Reset(u32 tw0, const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA);
@@ -41,11 +42,12 @@ public:
 	};
 
 protected:
+	GSLocalMemory* m_memory;
 	std::unordered_set<Texture*> m_textures;
 	std::array<FastList<Texture*>, GS_MAX_PAGES> m_map;
 
 public:
-	GSTextureCacheSW();
+	explicit GSTextureCacheSW(GSLocalMemory& memory);
 	virtual ~GSTextureCacheSW();
 
 	Texture* Lookup(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, u32 tw0 = 0);

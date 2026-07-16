@@ -5,11 +5,10 @@
 
 #include "GS/GSState.h"
 
-#ifdef ARCH_X86
+#if defined(ARCH_X86)
 #include "GS/Renderers/SW/GSSetupPrimCodeGenerator.all.h"
 #include "GS/Renderers/SW/GSDrawScanlineCodeGenerator.all.h"
-#endif
-#ifdef ARCH_ARM64
+#elif defined(ARCH_ARM64)
 #include "GS/Renderers/SW/GSSetupPrimCodeGenerator.arm64.h"
 #include "GS/Renderers/SW/GSDrawScanlineCodeGenerator.arm64.h"
 #endif
@@ -22,8 +21,10 @@ class GSRasterizerData;
 
 class GSDrawScanline : public GSVirtualAlignedClass<32>
 {
+#if defined(ARCH_X86) || defined(ARCH_ARM64)
 	friend GSSetupPrimCodeGenerator;
 	friend GSDrawScanlineCodeGenerator;
+#endif
 
 public:
 	GSDrawScanline();
@@ -52,8 +53,10 @@ public:
 	void PrintStats();
 
 private:
+#if defined(ARCH_X86) || defined(ARCH_ARM64)
 	GSCodeGeneratorFunctionMap<GSSetupPrimCodeGenerator, u64, SetupPrimPtr> m_sp_map;
 	GSCodeGeneratorFunctionMap<GSDrawScanlineCodeGenerator, u64, DrawScanlinePtr> m_ds_map;
+#endif
 
 	static void CSetupPrim(const GSVertexSW* vertex, const u16* index, const GSVertexSW& dscan, GSScanlineLocalData& local);
 	static void CDrawScanline(int pixels, int left, int top, const GSVertexSW& scan, GSScanlineLocalData& local);

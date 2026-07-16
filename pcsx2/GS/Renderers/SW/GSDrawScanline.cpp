@@ -8,10 +8,15 @@
 
 #include "common/Console.h"
 
+#include <cstring>
 #include <fstream>
 
-// Comment to disable all dynamic code generation.
+// PCSX2 has native scanline generators for x86 and AArch64. ARM32 deliberately
+// uses the same C scanline implementation which PCSX2 keeps as its generator
+// oracle; there is no A32 generator to instantiate on the Vita.
+#if defined(ARCH_X86) || defined(ARCH_ARM64)
 #define ENABLE_JIT_RASTERIZER
+#endif
 
 #if MULTI_ISA_COMPILE_ONCE
 // Lack of a better home
@@ -27,16 +32,22 @@ static __forceinline const GSScanlineGlobalData& GlobalFromLocal(const GSScanlin
 }
 
 GSDrawScanline::GSDrawScanline()
+#if defined(ARCH_X86) || defined(ARCH_ARM64)
 	: m_sp_map("GSSetupPrim")
 	, m_ds_map("GSDrawScanline")
+#endif
 {
+#if defined(ARCH_X86) || defined(ARCH_ARM64)
 	GSCodeReserve::ResetMemory();
+#endif
 }
 
 GSDrawScanline::~GSDrawScanline()
 {
+#if defined(ARCH_X86) || defined(ARCH_ARM64)
 	if (const size_t used = GSCodeReserve::GetMemoryUsed(); used > 0)
 		DevCon.WriteLn("SW JIT generated %zu bytes of code", used);
+#endif
 }
 
 bool GSDrawScanline::ShouldUseCDrawScanline(u64 key)
@@ -115,10 +126,12 @@ void GSDrawScanline::BeginDraw(const GSRasterizerData& data, GSScanlineLocalData
 
 void GSDrawScanline::ResetCodeCache()
 {
+#if defined(ARCH_X86) || defined(ARCH_ARM64)
 	Console.Warning("GS Software JIT cache overflow, resetting.");
 	m_sp_map.Clear();
 	m_ds_map.Clear();
 	GSCodeReserve::ResetMemory();
+#endif
 }
 
 bool GSDrawScanline::SetupDraw(GSRasterizerData& data)
@@ -176,12 +189,22 @@ bool GSDrawScanline::SetupDraw(GSRasterizerData& data)
 
 void GSDrawScanline::UpdateDrawStats(u64 frame, u64 ticks, int actual, int total, int prims)
 {
+#if defined(ARCH_X86) || defined(ARCH_ARM64)
 	m_ds_map.UpdateStats(frame, ticks, actual, total, prims);
+#else
+	(void)frame;
+	(void)ticks;
+	(void)actual;
+	(void)total;
+	(void)prims;
+#endif
 }
 
 void GSDrawScanline::PrintStats()
 {
+#if defined(ARCH_X86) || defined(ARCH_ARM64)
 	m_ds_map.PrintStats();
+#endif
 }
 
 #if _M_SSE >= 0x501
@@ -467,6 +490,42 @@ __ri static bool TestAlpha(T& test, T& fm, T& zm, const T& ga, const GSScanlineG
 
 static const int s_offsets[] = {0, 2, 8, 10, 16, 18, 24, 26}; // columnTable16[0]
 
+#if defined(VITASX2_VITA)
+__ri static GSVector4i LoadFrameOrDepthVector(const GSScanlineGlobalData& global,
+	int address, u32 psm)
+{
+	const u8* const vm = static_cast<const u8*>(global.vm);
+	// PCSX2's desktop GS memory repeats the 4 MiB mapping. The 16-bit swizzle
+	// group at the final page can place its second 8-byte NEON load six bytes
+	// before the canonical ring seam, with the final padding halfword wrapping
+	// to byte zero. Vita owns one physical ring, so reproduce that alias only for
+	// the rare seam group; every selected 16-bit pixel remains bit-identical.
+	if (psm == 2 && address > static_cast<int>(HALF_VM_SIZE - 12)) [[unlikely]]
+	{
+		alignas(16) u8 wrapped[16];
+		auto load_segment = [vm](u8* destination, u32 byte_address) {
+			byte_address &= VM_SIZE - 1;
+			const u32 tail = VM_SIZE - byte_address;
+			if (tail >= 8)
+			{
+				std::memcpy(destination, vm + byte_address, 8);
+			}
+			else
+			{
+				std::memcpy(destination, vm + byte_address, tail);
+				std::memcpy(destination + tail, vm, 8 - tail);
+			}
+		};
+		const u32 byte_address = static_cast<u32>(address) * 2;
+		load_segment(wrapped, byte_address);
+		load_segment(wrapped + 8, byte_address + 16);
+		return GSVector4i::load<true>(wrapped);
+	}
+
+	return GSVector4i::load(vm + address * 2, vm + address * 2 + 16);
+}
+#endif
+
 template <class T>
 __ri static void WritePixel(const T& src, int addr, int i, u32 psm, const GSScanlineGlobalData& global)
 {
@@ -691,7 +750,11 @@ __ri void GSDrawScanline::CDrawScanline(int pixels, int left, int top, const GSV
 						(u8*)global.vm + za * 2     , (u8*)global.vm + za * 2 + 16,
 						(u8*)global.vm + za * 2 + 32, (u8*)global.vm + za * 2 + 48);
 #else
+	#if defined(VITASX2_VITA)
+					zd = LoadFrameOrDepthVector(global, za, sel.zpsm);
+	#else
 					zd = GSVector4i::load((u8*)global.vm + za * 2, (u8*)global.vm + za * 2 + 16);
+	#endif
 #endif
 
 					VectorI zso = zs;
@@ -1312,7 +1375,11 @@ __ri void GSDrawScanline::CDrawScanline(int pixels, int left, int top, const GSV
 						(u8*)global.vm + fa * 2     , (u8*)global.vm + fa * 2 + 16,
 						(u8*)global.vm + fa * 2 + 32, (u8*)global.vm + fa * 2 + 48);
 #else
+	#if defined(VITASX2_VITA)
+					fd = LoadFrameOrDepthVector(global, fa, sel.fpsm);
+	#else
 					fd = GSVector4i::load((u8*)global.vm + fa * 2, (u8*)global.vm + fa * 2 + 16);
+	#endif
 #endif
 				}
 			}

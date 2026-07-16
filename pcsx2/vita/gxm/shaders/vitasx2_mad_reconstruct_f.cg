@@ -1,0 +1,100 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+float4 main(
+	float2 vTexCoord : TEXCOORD0,
+	float2 windowPosition : WPOS,
+	uniform float4 ZrH,
+	uniform sampler2D source : TEXUNIT0) : COLOR
+{
+	// PCSX2 owner: bin/resources/shaders/opengl/interlace.glsl::ps_main4.
+	const int index = (int)ZrH.x;
+	const int field = index - (index / 2) * 2;
+	const int destinationLine = (int)windowPosition.y;
+	const int destinationField = destinationLine - (destinationLine / 2) * 2;
+	const float sensitivity = ZrH.w;
+	const float3 motionThreshold = float3(sensitivity, sensitivity, sensitivity);
+	const float2 bankOffset = float2(0.0f, 0.5f);
+	const float2 verticalScale = float2(1.0f, 0.5f);
+	const float2 lineOffset = float2(0.0f, ZrH.y) * verticalScale;
+	const float2 inputPointer = vTexCoord * verticalScale;
+
+	float2 newest;
+	float2 oneFrameOld;
+	float2 twoFramesOld;
+	float2 threeFramesOld;
+	if (index == 1)
+	{
+		newest = inputPointer;
+		oneFrameOld = inputPointer;
+		twoFramesOld = inputPointer + bankOffset;
+		threeFramesOld = inputPointer + bankOffset;
+	}
+	else if (index == 2)
+	{
+		newest = inputPointer + bankOffset;
+		oneFrameOld = inputPointer;
+		twoFramesOld = inputPointer;
+		threeFramesOld = inputPointer + bankOffset;
+	}
+	else if (index == 3)
+	{
+		newest = inputPointer + bankOffset;
+		oneFrameOld = inputPointer + bankOffset;
+		twoFramesOld = inputPointer;
+		threeFramesOld = inputPointer;
+	}
+	else
+	{
+		newest = inputPointer;
+		oneFrameOld = inputPointer + bankOffset;
+		twoFramesOld = inputPointer + bankOffset;
+		threeFramesOld = inputPointer;
+	}
+
+	const float4 newHigh = tex2D(source, newest - lineOffset);
+	const float4 newCenter = tex2D(source, oneFrameOld);
+	const float4 newLow = tex2D(source, newest + lineOffset);
+	const float4 oldHigh = tex2D(source, twoFramesOld - lineOffset);
+	const float4 oldCenter = tex2D(source, threeFramesOld);
+	const float4 oldLow = tex2D(source, twoFramesOld + lineOffset);
+
+	const float3 highMotion = abs(newHigh.rgb - oldHigh.rgb) - motionThreshold;
+	const float3 centerMotion = abs(newCenter.rgb - oldCenter.rgb) - motionThreshold;
+	const float3 lowMotion = abs(newLow.rgb - oldLow.rgb) - motionThreshold;
+	const float highMaximum = max(max(highMotion.x, highMotion.y), highMotion.z);
+	const float centerMaximum = max(max(centerMotion.x, centerMotion.y), centerMotion.z);
+	const float lowMaximum = max(max(lowMotion.x, lowMotion.y), lowMotion.z);
+
+	if (destinationField == field)
+		return tex2D(source, newest);
+
+	if (inputPointer.y > 0.5f - lineOffset.y || inputPointer.y < lineOffset.y)
+		return newCenter;
+
+	if (highMaximum > 0.0f || centerMaximum > 0.0f || lowMaximum > 0.0f)
+		return (newHigh + newLow) * 0.5f;
+
+	// Completely static fields can be woven without the spatial comparison.
+	if (highMaximum == -sensitivity && centerMaximum == -sensitivity &&
+		lowMaximum == -sensitivity)
+	{
+		return newCenter;
+	}
+
+	const float3 highLowDifference =
+		abs(newHigh.rgb - newLow.rgb) - motionThreshold;
+	const float3 centerHighDifference =
+		abs(newHigh.rgb - newCenter.rgb) - motionThreshold;
+	const float highLowMaximum = max(max(highLowDifference.x,
+		highLowDifference.y), highLowDifference.z);
+	const float centerHighMaximum = max(max(centerHighDifference.x,
+		centerHighDifference.y), centerHighDifference.z);
+	if (highLowMaximum < 0.0f &&
+		centerHighMaximum >= highLowMaximum * 0.90f)
+	{
+		return (newHigh + newLow) * 0.5f;
+	}
+
+	return newCenter;
+}

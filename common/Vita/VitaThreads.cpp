@@ -115,21 +115,23 @@ bool Threading::ThreadHandle::SetAffinity(u64 processor_mask) const
 	if (m_native_id == 0)
 		return false;
 
-	// User threads may run on cores 0-2 (bit 16..18 of the kernel mask); a
-	// kernel plugin is required for core 3. Mask bits beyond what the kernel
-	// grants are rejected by the call itself.
-	int mask = 0;
+	// Sony's thread-manager contract exposes only USER_0..USER_2 to game
+	// applications.  Keep that contract even when CapUnlocker expands the
+	// process default: CPU3 owns shell, plugin, and background work.
+	constexpr u64 user_processor_mask = 0x7;
+	if ((processor_mask & ~user_processor_mask) != 0)
+		return false;
+
+	int mask = SCE_KERNEL_CPU_MASK_USER_ALL;
 	if (processor_mask != 0)
 	{
-		for (u32 i = 0; i < 4; i++)
-		{
-			if (processor_mask & (static_cast<u64>(1) << i))
-				mask |= (0x10000 << i);
-		}
-	}
-	else
-	{
-		mask = 0; // 0 = default/all allowed cores
+		mask = 0;
+		if (processor_mask & (1u << 0))
+			mask |= SCE_KERNEL_CPU_MASK_USER_0;
+		if (processor_mask & (1u << 1))
+			mask |= SCE_KERNEL_CPU_MASK_USER_1;
+		if (processor_mask & (1u << 2))
+			mask |= SCE_KERNEL_CPU_MASK_USER_2;
 	}
 
 	return sceKernelChangeThreadCpuAffinityMask(static_cast<SceUID>(m_native_id), mask) >= 0;
@@ -174,7 +176,12 @@ struct ThreadProcParameters
 void* Threading::Thread::ThreadProc(void* param)
 {
 	std::unique_ptr<ThreadProcParameters> entry(static_cast<ThreadProcParameters*>(param));
-	*entry->thread_id_ptr = static_cast<unsigned int>(sceKernelGetThreadId());
+	const SceUID thread_id = sceKernelGetThreadId();
+	// The official default normally means USER_ALL, but an installed capability
+	// plugin can widen it. Establish the documented application mask before any
+	// emulator entry point executes; owners may narrow it after Start().
+	(void)sceKernelChangeThreadCpuAffinityMask(thread_id, SCE_KERNEL_CPU_MASK_USER_ALL);
+	*entry->thread_id_ptr = static_cast<unsigned int>(thread_id);
 	entry->start_semaphore->Post();
 	entry->func();
 	return nullptr;

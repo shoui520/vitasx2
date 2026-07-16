@@ -7,7 +7,9 @@
 #include "GS/Renderers/SW/GSDrawScanline.h"
 #include "GS/GSExtra.h"
 #include "PerformanceMetrics.h"
+#if !defined(VITASX2_VITA)
 #include "VMManager.h"
+#endif
 
 #include "common/AlignedMalloc.h"
 #include "common/Console.h"
@@ -1529,7 +1531,13 @@ void GSRasterizerList::OnWorkerStartup(int i, u64 affinity)
 	if (affinity != 0)
 	{
 		INFO_LOG("Pinning GS thread {} to CPU {} (0x{:x})", i, std::countr_zero(affinity), affinity);
-		handle.SetAffinity(affinity);
+		if (!handle.SetAffinity(affinity))
+			WARNING_LOG("Failed to pin GS thread {} to CPU {}", i, std::countr_zero(affinity));
+#if defined(VITASX2_VITA)
+		else
+			Console.WriteLn("Vita GS-SW worker %d pinned to USER_%u.", i,
+				static_cast<unsigned>(std::countr_zero(affinity)));
+#endif
 	}
 
 	PerformanceMetrics::SetGSSWThread(i, std::move(handle));
@@ -1610,14 +1618,26 @@ std::unique_ptr<IRasterizer> GSRasterizerList::Create(int threads)
 
 	std::unique_ptr<GSRasterizerList> rl(new GSRasterizerList(threads));
 
+#if defined(VITASX2_VITA)
+	// PCSX2's desktop owner obtains a topology-aware processor list from
+	// VMManager. Sony's documented game-application masks expose USER_0..USER_2;
+	// VitaSX2 assigns EE to 0, MTGS to 1, and the sole SW raster worker to 2.
+	// CPU3 remains reserved for shell, plugin, and background work even when a
+	// capability plugin makes it visible.
+#else
 	const std::vector<u32>& procs = VMManager::Internal::GetSoftwareRendererProcessorList();
 	const bool pin = (EmuConfig.EnableThreadPinning && static_cast<size_t>(threads) <= procs.size());
 	if (EmuConfig.EnableThreadPinning && !pin)
 		WARNING_LOG("Not pinning SW threads, we need {} processors, but only have {}", threads, procs.size());
+#endif
 
 	for (int i = 0; i < threads; i++)
 	{
+#if defined(VITASX2_VITA)
+		const u64 affinity = 1u << 2;
+#else
 		const u64 affinity = pin ? (static_cast<u64>(1u) << procs[i]) : 0;
+#endif
 		rl->m_r.push_back(std::unique_ptr<GSRasterizer>(new GSRasterizer(&rl->m_ds, i, threads)));
 		auto& r = *rl->m_r[i];
 		rl->m_workers.push_back(std::unique_ptr<GSWorker>(new GSWorker(

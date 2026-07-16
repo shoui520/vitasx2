@@ -3,6 +3,7 @@
 
 #include "MTVU.h"
 #include "Config.h"
+#include "Counters.h"
 #include "DebugTools/GsTrace.h"
 #include "DebugTools/IpuTrace.h"
 #include "DebugTools/Spu2Trace.h"
@@ -114,6 +115,7 @@ static bool s_ee_a32_exit_execution = false;
 static bool s_ee_a32_cache_reset_requested = false;
 static bool s_ee_a32_running_compiled_block = false;
 static bool s_ee_a32_elf_booted = false;
+static u64 s_ee_a32_pre_elf_boundaries = 0;
 static bool s_ee_a32_direct_linking_enabled = false;
 static bool s_ee_a32_persistent_dispatch_enabled = false;
 static VitaA32EeTraceMode s_ee_a32_trace_mode = VitaA32EeTraceMode::InstructionWindow;
@@ -259,6 +261,7 @@ void VitaSetEePreInstructionTraceWindowSkipCallback(VitaEePreInstructionTraceWin
 
 void VitaRequestA32EeCacheReset()
 {
+	s_ee_a32_executor.SuspendGeneratedLookupUntilReset();
 	s_ee_a32_cache_reset_requested = true;
 }
 
@@ -601,6 +604,33 @@ static void recAccountEeBlockExecution(const VitaEE::BlockExecutionResult& resul
 		s_ee_a32_stats.lookup_hits++;
 	if (result.fast_dispatch_hit)
 		s_ee_a32_stats.fast_dispatch_hits++;
+
+#if defined(VITASX2_VITA) && !defined(VITASX2_PRODUCT_BOOT_VALIDATION) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	// A NoDisc OSDSYS session deliberately has no game ELF entry, so the
+	// provider can remain in its PCSX2 EELOAD-visible lifecycle phase for a long
+	// time. Publish exponentially sparse, coherent dispatcher-boundary progress
+	// to the normal product log. This is startup/hang evidence, not a per-block
+	// profiler: after 4096 cold provider boundaries it emits only when the count
+	// doubles. Direct-linked blocks within a completed chain are not counted.
+	if (!s_ee_a32_elf_booted)
+	{
+		const u64 boundaries = ++s_ee_a32_pre_elf_boundaries;
+		if (boundaries >= 4096 && (boundaries & (boundaries - 1)) == 0)
+		{
+			Console.WriteLn(
+				"Vita EE pre-ELF progress: boundaries=%llu start_pc=%08x next_pc=%08x "
+				"ee_cycle=%llu ee_next=%llu iop_pc=%08x iop_cycle=%llu iop_next=%llu "
+				"iop_budget=%d frame=%u",
+				static_cast<unsigned long long>(boundaries), fallback_pc, cpuRegs.pc,
+				static_cast<unsigned long long>(cpuRegs.cycle),
+				static_cast<unsigned long long>(cpuRegs.nextEventCycle), psxRegs.pc,
+				static_cast<unsigned long long>(psxRegs.cycle),
+				static_cast<unsigned long long>(psxRegs.iopNextEventCycle),
+				psxRegs.iopCycleEE, g_FrameCount);
+		}
+	}
+#endif
 }
 
 static void recSetEeDirectLinkingEnabled(bool enabled)
@@ -646,6 +676,116 @@ static void recResetEeDispatchState()
 	s_ee_a32_persistent_dispatch_enabled = false;
 }
 
+static bool recRefreshEeLifecycleDispatchBarriers()
+{
+	// These are owners, not independent registrations. Their addresses can
+	// collide (or be distinct virtual aliases of one RAM word), so publish the
+	// complete desired union in one executor transaction. EELOAD_START remains
+	// present for later BIOS/OSDSYS reloads even after the other hooks move.
+	std::array<u32, 4> barriers{};
+	size_t count = 0;
+	barriers[count++] = EELOAD_START;
+	if (g_eeloadMain)
+		barriers[count++] = g_eeloadMain;
+	if (g_eeloadExec)
+		barriers[count++] = g_eeloadExec;
+	const u32 entry = VMManager::Internal::GetCurrentELFEntryPoint();
+	if (entry != UINT32_MAX)
+		barriers[count++] = entry;
+	return s_ee_a32_executor.SetPersistentDispatchBarriers(
+		barriers.data(), count);
+}
+
+static void recResetEeLifecycleDispatchBarriers()
+{
+	s_ee_a32_executor.ClearPersistentDispatchBarriers();
+	// PCSX2's recRecompile() discovers the EELOAD main hook when it compiles
+	// this entry. Keep only this exceptional entry on the provider boundary;
+	// the rest of the BIOS may use the normal persistent/link ABI immediately.
+	const u32 initial_barrier = EELOAD_START;
+	pxAssertRel(s_ee_a32_executor.SetPersistentDispatchBarriers(
+		&initial_barrier, 1),
+		"failed to install the EELOAD lifecycle dispatch barrier");
+}
+
+static bool recProcessEeLifecycleBoundary(u32 pc)
+{
+	// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile(). Its generated
+	// blocks call these helpers at entry. A32's dispatch barriers provide the
+	// same before-block ordering while allowing every ordinary BIOS edge to
+	// remain directly linked.
+	const u32 lifecycle_pc = VitaEE::BlockExecutor::CanonicalizeRamBackedPc(pc);
+	bool refresh_barriers = false;
+	// recRecompile() owns this check before cache-reset processing and before all
+	// EELOAD checks. Keep every check independent: lifecycle addresses are not
+	// required to be distinct.
+	if (const u32 entry = VMManager::Internal::GetCurrentELFEntryPoint();
+		entry != UINT32_MAX && lifecycle_pc ==
+			VitaEE::BlockExecutor::CanonicalizeRamBackedPc(entry))
+	{
+		VMManager::Internal::EntryPointCompilingOnCPUThread();
+		refresh_barriers = true;
+	}
+
+	if (lifecycle_pc == EELOAD_START)
+	{
+		const u32 mainjump = memRead32(EELOAD_START + 0x9c);
+		if (mainjump >> 26 == 3) // JAL
+		{
+			const u32 eeload_main = ((EELOAD_START + 0xa0) & 0xf0000000U) |
+				(mainjump << 2 & 0x0fffffffU);
+			if (g_eeloadMain != eeload_main)
+			{
+				g_eeloadMain = eeload_main;
+				refresh_barriers = true;
+			}
+		}
+	}
+	if (g_eeloadMain && lifecycle_pc ==
+		VitaEE::BlockExecutor::CanonicalizeRamBackedPc(g_eeloadMain))
+	{
+		// x86 tests this while compiling, before its emitted eeloadHook runs.
+		// Snapshot it before invoking the hook to preserve that ordering on A32.
+		const bool fast_boot_in_progress =
+			VMManager::Internal::IsFastBootInProgress();
+		eeloadHook();
+		refresh_barriers = true;
+		if (fast_boot_in_progress)
+		{
+			const u32 typeAexecjump = memRead32(EELOAD_START + 0x470);
+			const u32 typeBexecjump = memRead32(EELOAD_START + 0x5B0);
+			const u32 typeCexecjump = memRead32(EELOAD_START + 0x618);
+			const u32 typeDexecjump = memRead32(EELOAD_START + 0x600);
+			if ((typeBexecjump >> 26 == 3) || (typeCexecjump >> 26 == 3) ||
+				(typeDexecjump >> 26 == 3))
+			{
+				g_eeloadExec = EELOAD_START + 0x2B8;
+			}
+			else if (typeAexecjump >> 26 == 3)
+			{
+				g_eeloadExec = EELOAD_START + 0x170;
+			}
+			else
+			{
+				Console.WriteLn("recExecute: Could not enable launch arguments for fast boot mode; unidentified BIOS version!");
+			}
+		}
+	}
+	if (g_eeloadExec && lifecycle_pc ==
+		VitaEE::BlockExecutor::CanonicalizeRamBackedPc(g_eeloadExec))
+	{
+		eeloadHook2();
+		refresh_barriers = true;
+	}
+	s_ee_a32_elf_booted = VMManager::Internal::HasBootedELF();
+	// Ordinary persistent-dispatch returns cannot mutate any lifecycle owner.
+	// Republishing the complete canonical barrier union here made every helper,
+	// scheduler, and incompatible-link return pay a four-address transaction.
+	// PCSX2 updates these hooks only at the EELOAD/ELF seams above, so reconcile
+	// the executor only when one of those owners was actually observed.
+	return !refresh_barriers || recRefreshEeLifecycleDispatchBarriers();
+}
+
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
 	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 static bool recDidEeTraceLimitHitAtNaturalBoundary()
@@ -666,6 +806,12 @@ static bool recDidEeTraceLimitHitAtNaturalBoundary()
 static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& result)
 {
 	recAccountEeBlockExecution(result, cpuRegs.pc);
+	if (!recProcessEeLifecycleBoundary(cpuRegs.pc))
+	{
+		Console.Error("Vita EE could not preserve a PCSX2 lifecycle dispatch seam.");
+		s_ee_a32_exit_execution = true;
+		return false;
+	}
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
 	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 	// The trace-free full-core route must retain the production persistent
@@ -691,7 +837,13 @@ static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& r
 		return false;
 	}
 #endif
+	// EntryPointCompilingOnCPUThread() owns a whole-provider cache reset.  The
+	// callback is running from the persistent dispatcher's cold exit at that
+	// point, so it must unwind that frame before newly compiled callable/persistent
+	// code can be entered.  Continuing here would tail-enter a block compiled for
+	// the replacement ABI from the old dispatch frame.
 	return !s_ee_a32_exit_execution && !s_ee_a32_cache_reset_requested &&
+		s_ee_a32_persistent_dispatch_enabled &&
 		s_ee_pre_instruction_trace_callback == nullptr;
 }
 
@@ -717,10 +869,12 @@ static void recReserve()
 
 static void recShutdown()
 {
+	s_ee_a32_executor.ClearPersistentDispatchBarriers();
 	s_ee_a32_executor.Shutdown();
 	recResetEeDispatchState();
 	s_ee_a32_cache_reset_requested = false;
 	s_ee_a32_elf_booted = false;
+	s_ee_a32_pre_elf_boundaries = 0;
 }
 
 static void recReset()
@@ -729,10 +883,12 @@ static void recReset()
 	VitaEE::RefreshRawGpr0KnownZero();
 	s_ee_a32_executor.Reset();
 	recResetEeDispatchState();
+	recResetEeLifecycleDispatchBarriers();
 	VitaResetA32EeProviderStats();
 	s_ee_a32_exit_execution = false;
 	s_ee_a32_cache_reset_requested = false;
 	s_ee_a32_elf_booted = false;
+	s_ee_a32_pre_elf_boundaries = 0;
 }
 
 static void recStep()
@@ -756,24 +912,21 @@ static void recExecute()
 	{
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
 	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
-		// Before ELF entry the provider deliberately uses callable blocks so the
-		// PCSX2 EELOAD hooks remain visible. Observe a completed limit before the
-		// next block only when the preceding return owned a scheduler test.
+		// Observe a completed limit before the next block only when the preceding
+		// return owned a scheduler test. Lifecycle dispatch barriers keep PCSX2's
+		// EELOAD/entry hooks visible without forcing all pre-entry blocks callable.
 		if (can_observe_trace_limit && recDidEeTraceLimitHitAtNaturalBoundary())
 		{
 			s_ee_a32_exit_execution = true;
 			break;
 		}
 #endif
-		// Direct-linked chains bypass this dispatcher, so linking stays off
-		// while tracing and until the ELF boots: pre-boot, every arrival at
-		// the EELOAD/entry hook pcs below must pass through here, matching
-		// Interpreter.cpp::intExecute() and the compile-time hooks in
-		// x86/ix86-32/iR5900.cpp::recRecompile().
-		if (!s_ee_a32_elf_booted)
-			s_ee_a32_elf_booted = VMManager::Internal::HasBootedELF();
-		const bool elf_booted = s_ee_a32_elf_booted;
-		const bool fast_dispatch = s_ee_pre_instruction_trace_callback == nullptr && elf_booted;
+		// Exact instruction traces retain callable block boundaries. Normal boot
+		// uses the persistent PCSX2-style dispatcher from reset onward; only the
+		// explicit EELOAD/entry barriers above return to the provider for lifecycle
+		// hooks. A no-disc OSDSYS boot therefore no longer waits for a game ELF
+		// before gaining direct links.
+		const bool fast_dispatch = s_ee_pre_instruction_trace_callback == nullptr;
 		recSetEeFastDispatchEnabled(fast_dispatch);
 
 		if (s_ee_a32_cache_reset_requested)
@@ -783,43 +936,17 @@ static void recExecute()
 		}
 
 		const u32 pc = cpuRegs.pc;
-
-		if (!elf_booted)
+		if (!recProcessEeLifecycleBoundary(pc))
 		{
-			if (pc == EELOAD_START)
-			{
-				// The EELOAD _start function is the same across all BIOS versions.
-				const u32 mainjump = memRead32(EELOAD_START + 0x9c);
-				if (mainjump >> 26 == 3) // JAL
-					g_eeloadMain = ((EELOAD_START + 0xa0) & 0xf0000000U) | (mainjump << 2 & 0x0fffffffU);
-			}
-			else if (g_eeloadMain && pc == g_eeloadMain)
-			{
-				eeloadHook();
-				if (VMManager::Internal::IsFastBootInProgress())
-				{
-					// See comments on this code in iR5900.cpp's recRecompile().
-					const u32 typeAexecjump = memRead32(EELOAD_START + 0x470);
-					const u32 typeBexecjump = memRead32(EELOAD_START + 0x5B0);
-					const u32 typeCexecjump = memRead32(EELOAD_START + 0x618);
-					const u32 typeDexecjump = memRead32(EELOAD_START + 0x600);
-					if ((typeBexecjump >> 26 == 3) || (typeCexecjump >> 26 == 3) || (typeDexecjump >> 26 == 3))
-						g_eeloadExec = EELOAD_START + 0x2B8;
-					else if (typeAexecjump >> 26 == 3)
-						g_eeloadExec = EELOAD_START + 0x170;
-					else
-						Console.WriteLn("recExecute: Could not enable launch arguments for fast boot mode; unidentified BIOS version!");
-				}
-			}
-			else if (g_eeloadExec && pc == g_eeloadExec)
-			{
-				eeloadHook2();
-			}
-			else if (pc == VMManager::Internal::GetCurrentELFEntryPoint())
-			{
-				VMManager::Internal::EntryPointCompilingOnCPUThread();
-			}
+			Console.Error("Vita EE could not install a PCSX2 lifecycle dispatch seam.");
+			s_ee_a32_exit_execution = true;
+			break;
 		}
+		// The ELF-entry owner may have reset every CPU provider and changed the EE
+		// block ABI. Re-enter this loop so recSetEeFastDispatchEnabled() publishes
+		// the requested ABI before executing the first ELF instruction.
+		if (fast_dispatch && !s_ee_a32_persistent_dispatch_enabled)
+			continue;
 
 		if (!s_ee_pre_instruction_trace_callback)
 		{
@@ -1002,6 +1129,10 @@ static void recClear(u32 addr, u32 size)
 	// measured in 32-bit guest words.
 	if (s_ee_a32_running_compiled_block)
 	{
+		// A returning helper may reach a dynamic exception/continuation tail
+		// before the provider can unwind and consume this reset. Suppress its
+		// generated lookup immediately so stale code cannot be entered.
+		s_ee_a32_executor.SuspendGeneratedLookupUntilReset();
 		s_ee_a32_cache_reset_requested = true;
 		return;
 	}

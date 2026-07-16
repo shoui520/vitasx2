@@ -93,6 +93,7 @@ namespace
 
 	enum class ConfiguredBootKind : u8
 	{
+		Bios,
 		Disc,
 		Elf,
 	};
@@ -237,6 +238,17 @@ namespace
 			buffer[--length] = 0;
 		}
 		const std::string_view path(buffer, length);
+		// PCSX2 owner: pcsx2-qt/MainWindow.cpp::onStartBIOSActionTriggered()
+		// starts VMManager with no boot filename, while the command-line `-bios`
+		// route selects CDVD_SourceType::NoDisc explicitly. Keep the selector
+		// literal outside every filesystem namespace so BIOS boot cannot broaden
+		// this unsafe home's file access.
+		if (path == "bios")
+		{
+			boot_path->clear();
+			*boot_kind = ConfiguredBootKind::Bios;
+			return true;
+		}
 		// This unsafe-homebrew product only accepts user-provisioned images in
 		// its own data directory. A malformed selector must never broaden reads
 		// to the owner's other applications or savedata.
@@ -249,8 +261,9 @@ namespace
 		if (!is_disc && !is_elf)
 		{
 			Error::SetString(error,
-				"Boot selector must name one file below the VitaSX2 disc directory "
-				"or a PCSX2-recognized ELF below the VitaSX2 ELF directory.");
+				"Boot selector must be 'bios', name one file below the VitaSX2 disc "
+				"directory, or name a PCSX2-recognized ELF below the VitaSX2 ELF "
+				"directory.");
 			return false;
 		}
 		const std::string_view filename = path.substr(
@@ -765,8 +778,9 @@ int main()
 	ConfigureProductSettings();
 	// PCSX2's MTGS ownership expects the CPU and GS producers to execute in
 	// parallel. Keep the product CPU thread on user core 0; the mailbox pins its
-	// sole GXM-owning worker to core 1, leaving core 2 available to system/audio
-	// work. Sony's thread-manager API treats a rejected affinity as recoverable.
+	// sole GXM-owning worker to core 1, and PCSX2's software raster worker uses
+	// core 2. CPU3 remains reserved for the system and plugins. Sony's
+	// thread-manager API treats a rejected affinity as recoverable.
 	{
 		const Threading::ThreadHandle cpu_thread =
 			Threading::ThreadHandle::GetForCallingThread();
@@ -789,19 +803,29 @@ int main()
 		ConfiguredBootKind boot_kind = ConfiguredBootKind::Disc;
 		if (!ReadConfiguredBootPath(&boot_path, &boot_kind, &error))
 			goto fail;
-		if (boot_kind == ConfiguredBootKind::Elf)
+		if (boot_kind == ConfiguredBootKind::Bios)
+		{
+			// Exact PCSX2 Start BIOS contract: MainWindow::
+			// onStartBIOSActionTriggered() and FullscreenUI::DoStartBIOS() pass a
+			// completely default VMBootParameters. VMManager owns resolving the
+			// empty filename to NoDisc and suppressing fast boot; the frontend must
+			// not encode either result as an override.
+			Console.WriteLn("VitaSX2 Start BIOS (default PCSX2 boot parameters).");
+		}
+		else if (boot_kind == ConfiguredBootKind::Elf)
 		{
 			boot.elf_override = boot_path;
 			boot.source_type = CDVD_SourceType::NoDisc;
+			boot.fast_boot = true;
 			Console.WriteLn("VitaSX2 boot ELF: %s", boot_path.c_str());
 		}
 		else
 		{
 			boot.filename = boot_path;
 			boot.source_type = CDVD_SourceType::Iso;
+			boot.fast_boot = true;
 			Console.WriteLn("VitaSX2 boot disc: %s", boot_path.c_str());
 		}
-		boot.fast_boot = true;
 		if (VMManager::Initialize(boot, &error) != VMBootResult::StartupSuccess)
 			goto fail;
 	}

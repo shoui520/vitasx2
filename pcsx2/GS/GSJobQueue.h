@@ -10,13 +10,18 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <system_error>
 #include <thread>
 
 template <class T, int CAPACITY>
 class GSJobQueue final
 {
 private:
+#if defined(__vita__)
+	Threading::Thread m_thread;
+#else
 	std::thread m_thread;
+#endif
 	std::function<void()> m_startup;
 	std::function<void(T&)> m_func;
 	std::function<void()> m_shutdown;
@@ -50,14 +55,29 @@ public:
 		, m_shutdown(std::move(shutdown))
 		, m_exit(false)
 	{
+#if defined(__vita__)
+		// Sony's thread-manager API requires an explicit stack size and CPU
+		// affinity contract. Vita's Threading::Thread supplies the PSP2/pte
+		// lifetime handshake; the rasterizer owner narrows it to USER_2 from its
+		// startup callback.
+		m_thread.SetStackSize(256 * 1024);
+		if (!m_thread.Start([this]() { ThreadProc(); }))
+			throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+				"failed to start Vita GS job worker");
+#else
 		m_thread = std::thread(&GSJobQueue::ThreadProc, this);
+#endif
 	}
 
 	~GSJobQueue()
 	{
 		m_exit = true;
 		m_sema.NotifyOfWork();
+	#if defined(__vita__)
+		m_thread.Join();
+	#else
 		m_thread.join();
+	#endif
 	}
 
 	bool IsEmpty()
@@ -68,7 +88,11 @@ public:
 	void Push(const T& item)
 	{
 		while (!m_queue.push(item))
+	#if defined(__vita__)
+			Threading::Timeslice();
+	#else
 			std::this_thread::yield();
+	#endif
 		m_sema.NotifyOfWork();
 	}
 

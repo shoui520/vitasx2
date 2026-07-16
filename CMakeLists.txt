@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.19)
 
+if(POLICY CMP0118)
+	# GXM shader objects are generated in pcsx2/ and consumed as INTERFACE
+	# sources by final executables in vita/. Keep GENERATED visible across those
+	# directory scopes on clean builds.
+	cmake_policy(SET CMP0118 NEW)
+endif()
+
 # VitaSX2 targets only the PlayStation Vita. Default to the VitaSDK toolchain
 # so a plain `cmake -B build` does the right thing.
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)

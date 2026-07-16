@@ -104,6 +104,8 @@ namespace VitaEE
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
 		size_t secondary_target_offset = static_cast<size_t>(-1);
+		size_t canonical_target_offset = static_cast<size_t>(-1);
+		u32 canonical_fallback_instruction = 0;
 		u32 embedded_active_instruction = 0;
 		u32 embedded_source_opcodes[2]{};
 		bool branch_on_taken = false;
@@ -114,6 +116,7 @@ namespace VitaEE
 		bool embedded_continuation_active = false;
 		bool patched_to_resident_entry = false;
 		bool patched_to_compatible_entry = false;
+		bool patched_to_canonical_entry = false;
 		bool requires_compatible_entry = false;
 		bool canonicalizes_reclaimed_vtlb_hosts = false;
 		bool compatible_scheduler_countdown = false;
@@ -670,7 +673,9 @@ namespace VitaEE
 		bool EmitReclaimedVtlbCanonicalEdge();
 		bool EmitReloadGprPinsAfterClobber(u16 host_mask);
 		bool EmitReloadAllGprPinsFromBacking();
-		bool EmitExitToTarget(const void* target, u8 callable_token);
+		bool EmitExitToTarget(const void* target, u8 callable_token,
+			size_t* persistent_branch_offset = nullptr,
+			u32* persistent_branch_instruction = nullptr);
 		bool EmitAndImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
 		bool EmitOrrImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
 		bool EmitEorImm32OrReg(unsigned rd, unsigned rn, u32 value, unsigned scratch, bool set_flags = false);
@@ -686,8 +691,12 @@ namespace VitaEE
 			bool sync_private_fallback = false);
 		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag,
 			const void* direct_exit, bool defer_pc_writeback = false);
+		bool EmitGeneratedDispatchLookup(const void* lookup_pages_slot,
+			const void* direct_exit, bool defer_pc_writeback,
+			bool special_exception_lookup);
 		bool EmitEventExitReturn(const void* event_exit);
-		bool EmitIndirectCycleTestExit(const void* event_exit);
+		bool EmitIndirectCycleTestExit(const void* event_exit,
+			bool allow_generated_lookup);
 		bool EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc, u32 taken_pc,
 			bool conditional_pc, bool indirect_pc_writeback = false);
 		static bool IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc);
@@ -1514,6 +1523,8 @@ namespace VitaEE
 		u32 m_current_block_instruction_count = 0;
 		u32 m_current_instruction_index = 0;
 		const void* m_current_direct_exit = nullptr;
+		const void* m_current_indirect_lookup_pages_slot = nullptr;
+		const void* m_current_direct_linking_enabled_flag = nullptr;
 		static constexpr unsigned MAX_GPR_QCACHE = 8;
 		u8 m_gpr_q_cache_guest[MAX_GPR_QCACHE]{};
 		u8 m_gpr_q_cache_qreg[MAX_GPR_QCACHE]{};

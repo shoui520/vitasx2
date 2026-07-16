@@ -7,8 +7,10 @@
 #include "GS.h"
 #include "GS/GSPerfMon.h"
 #include "GS/GSState.h"
+#include "GS/Renderers/SW/GSVertexSW.h"
 #include "MTGS.h"
 #include "MTVU.h"
+#include "PerformanceMetrics.h"
 #include "common/Assertions.h"
 #include "common/Console.h"
 #include "common/Error.h"
@@ -128,6 +130,20 @@ namespace MTGS
 			return;
 
 		const u32 boundary = profile.boundaries++;
+		// Keep the first guest-VSync handoff visible even for boot paths which
+		// never reach the warm-up interval. This distinguishes a stalled EE from
+		// a lost MTGS command or a presenter which is only drawing BGCOLOR.
+		const u32 boundary_count = boundary + 1;
+		if (boundary < 4 ||
+			(boundary_count <= 64 &&
+			 (boundary_count & (boundary_count - 1)) == 0))
+		{
+			Console.WriteLn("Vita GS flow: %s_vsync=%u queued=%d ring_read=%u ring_write=%u",
+				owner, boundary_count,
+				s_queued_frame_count.load(std::memory_order_relaxed),
+				s_read_pos.load(std::memory_order_relaxed),
+				s_write_pos.load(std::memory_order_relaxed));
+		}
 		if (boundary == WARMUP_BOUNDARIES)
 		{
 			profile.wall_start = Common::Timer::GetCurrentValue();
@@ -174,7 +190,15 @@ namespace MTGS
 		GSConfig = EmuConfig.GS;
 		GSConfig.Renderer = GSRendererType::SW;
 		GSConfig.UserHacks_GPUTargetCLUTMode = GSGPUTargetCLUTMode::Disabled;
+		// Keep one PCSX2 SW raster worker on the third documented application
+		// core. EE owns USER_0 and MTGS owns USER_1; a second raster worker would
+		// oversubscribe those cores and may escape to CapUnlocker's CPU3.
+		GSConfig.SWExtraThreads = 1;
 
+		// PCSX2 owner: GS/GS.cpp::OpenGSRenderer(). The software vertex
+		// conversion table is process-global and must be populated before the
+		// first decoded draw, even though Vita supplies its own presenter.
+		GSVertexSW::InitStatic();
 		s_gs = std::make_unique<VitaGxmGsState>(s_native_presenter_enabled);
 		if (s_native_presenter_enabled && !s_gs->IsNativePresenterReady())
 		{
@@ -182,6 +206,7 @@ namespace MTGS
 			return false;
 		}
 		s_gs->SetRegsMem(s_ring.regs);
+		s_gs->ResetPCRTC();
 		// PCSX2 owner: GS/GS.cpp::OpenGSRenderer(). Construction establishes
 		// GSState; the MTGS::ResetGS() caller applies the requested hardware or
 		// soft reset. Repeating a hardware reset here was both redundant and
@@ -190,7 +215,7 @@ namespace MTGS
 		return true;
 	}
 
-	static void ProcessVSync(bool registers_written)
+	static void ProcessVSync(u32 field, bool registers_written)
 	{
 		if (!s_gs)
 			return;
@@ -207,16 +232,24 @@ namespace MTGS
 		s_gs->PCRTCDisplays.CalculateFramebufferOffset(s_gs->m_scanmask_used,
 			s_gs->m_regs->DISP[0].DISPFB, s_gs->m_regs->DISP[1].DISPFB);
 		s_gs->Flush(GSState::VSYNC);
-		s_gs->VSync();
+		const bool idle_frame = s_gs->IsIdleFrame();
+		const bool framebuffer_sprite_frame =
+			g_perfmon.GetDisplayFramebufferSpriteBlits() > 0;
+		s_gs->VSync(field);
 #if defined(__vita__)
 		RecordHardwareVsyncProfile(s_worker_profile, "worker");
 #endif
-		g_perfmon.EndFrame(false);
+		g_perfmon.EndFrame(idle_frame);
 		if ((g_perfmon.GetFrame() & 0x1f) == 0)
 			g_perfmon.Update();
+		// PCSX2 GSRenderer::VSync() publishes the frame after presentation.
+		// The Vita presenter owns that stage directly, so retain the same
+		// privileged-register and framebuffer-blit inputs here instead of leaving
+		// the product FPS counter permanently at zero.
+		PerformanceMetrics::Update(registers_written,
+			framebuffer_sprite_frame, false);
 		// PCSX2 owner: GS.cpp::GSvsync() snapshots after Flush() and VSync().
 		s_gs->TraceGsStateSnapshot(Pcsx2Trace::GsTraceStateTriggerVSyncStart);
-		(void)registers_written;
 	}
 
 	static void ThreadEntryPoint()
@@ -381,7 +414,9 @@ namespace MTGS
 							sizeof(snapshot.imr));
 						std::memcpy(&s_ring.regs[0x1080], &snapshot.siglblid,
 							sizeof(snapshot.siglblid));
-						ProcessVSync(snapshot.registers_written != 0);
+						// PCSX2 MTGS.cpp owns FIELD derivation from CSR bit 0x2000.
+						const u32 field = (snapshot.csr & 0x2000u) ? 0u : 1u;
+						ProcessVSync(field, snapshot.registers_written != 0);
 						s_queued_frame_count.fetch_sub(1, std::memory_order_acq_rel);
 						if (s_vsync_signal_listener.exchange(false,
 							std::memory_order_acq_rel))

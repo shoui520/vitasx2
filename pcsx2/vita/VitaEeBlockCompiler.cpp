@@ -205,6 +205,9 @@ u32 g_qemuEeConcatenatedShortHotInstructionsElided = 0;
 u32 g_qemuDeferredPcWritebackBlocks = 0;
 u32 g_qemuDeferredIndirectPcWritebackBlocks = 0;
 u32 g_qemuLinkedPcSyncBlocks = 0;
+u32 g_qemuSpecialExceptionGeneratedLookupTails = 0;
+u32 g_qemuSpecialExceptionGeneratedLookupHits = 0;
+u32 g_qemuSpecialExceptionGeneratedLookupFallbacks = 0;
 u32 g_qemuCop0StatusHelperPc = 0;
 u32 g_qemuScalarZeroLoadSkips = 0;
 u32 g_qemuPartialZeroLoadSkips = 0;
@@ -10472,6 +10475,10 @@ namespace VitaEE
 		const u32 previous_instruction_index = m_current_instruction_index;
 		const bool previous_persistent_dispatch_exits = m_persistent_dispatch_exits;
 		const void* previous_direct_exit = m_current_direct_exit;
+		const void* previous_indirect_lookup_pages_slot =
+			m_current_indirect_lookup_pages_slot;
+		const void* previous_direct_linking_enabled_flag =
+			m_current_direct_linking_enabled_flag;
 		struct CurrentBlockScope
 		{
 			BlockCompiler& compiler;
@@ -10480,6 +10487,8 @@ namespace VitaEE
 			u32 previous_instruction_index;
 			bool previous_persistent_dispatch_exits;
 			const void* previous_direct_exit;
+			const void* previous_indirect_lookup_pages_slot;
+			const void* previous_direct_linking_enabled_flag;
 			~CurrentBlockScope()
 			{
 				compiler.m_current_block_start_pc = previous_start_pc;
@@ -10487,16 +10496,23 @@ namespace VitaEE
 				compiler.m_current_instruction_index = previous_instruction_index;
 				compiler.m_persistent_dispatch_exits = previous_persistent_dispatch_exits;
 				compiler.m_current_direct_exit = previous_direct_exit;
+				compiler.m_current_indirect_lookup_pages_slot =
+					previous_indirect_lookup_pages_slot;
+				compiler.m_current_direct_linking_enabled_flag =
+					previous_direct_linking_enabled_flag;
 			}
 		} current_block_scope{
 			*this, previous_block_start_pc, previous_block_instruction_count,
 			previous_instruction_index, previous_persistent_dispatch_exits,
-			previous_direct_exit};
+			previous_direct_exit, previous_indirect_lookup_pages_slot,
+			previous_direct_linking_enabled_flag};
 		m_current_block_start_pc = start_pc;
 		m_current_block_instruction_count = instruction_count;
 		m_current_instruction_index = 0;
 		m_persistent_dispatch_exits = persistent_dispatch_exits;
 		m_current_direct_exit = direct_exit;
+		m_current_indirect_lookup_pages_slot = indirect_lookup_pages_slot;
+		m_current_direct_linking_enabled_flag = direct_linking_enabled_flag;
 		m_gpr_link_signature =
 			(persistent_dispatch_exits && gpr_link_signature && gpr_link_signature->IsValid()) ?
 				*gpr_link_signature : GprLinkSignature{};
@@ -11784,12 +11800,41 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::EmitExitToTarget(const void* target, u8 callable_token)
+	bool BlockCompiler::EmitExitToTarget(const void* target, u8 callable_token,
+		size_t* persistent_branch_offset, u32* persistent_branch_instruction)
 	{
+		if (persistent_branch_offset)
+			*persistent_branch_offset = static_cast<size_t>(-1);
+		if (persistent_branch_instruction)
+			*persistent_branch_instruction = 0;
 		if (!target)
 			return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
+		bool captured_profile_bypass = false;
+		if (m_direct_link_rejection_profiling_enabled &&
+			m_persistent_dispatch_exits &&
+			(callable_token == EE_DIRECT_EXIT_TOKEN ||
+				callable_token == EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN) &&
+			persistent_branch_offset && persistent_branch_instruction)
+		{
+			// A post-writeback canonical hardlink patches this site and must skip
+			// the cold-exit source publication below. Otherwise the successful
+			// hardlink would leave a stale source for the next measured provider
+			// boundary. Product code has no rejection profiling and therefore keeps
+			// using the direct-exit branch itself as its zero-overhead patch site.
+			const size_t bypass = m_code.EmitBranchPlaceholder();
+			if (bypass == static_cast<size_t>(-1) ||
+				!m_code.PatchBranch(bypass, m_code.Size()) ||
+				!m_code.ReadInstruction(bypass,
+					persistent_branch_instruction))
+			{
+				return false;
+			}
+			*persistent_branch_offset = bypass;
+			captured_profile_bypass = true;
+		}
+
 		// Profiling only: publish the exact generated source block on a cold
 		// direct-dispatch exit. Successful direct links never execute this code,
 		// and product builds contain no publication instructions.
@@ -11812,8 +11857,23 @@ namespace VitaEE
 		// The dispatcher slab and every EE block share one 8 MiB mapping, so an A32
 		// B reaches it directly and avoids an address materialization plus BX.
 		const size_t branch = m_code.EmitBranchPlaceholder();
-		return branch != static_cast<size_t>(-1) &&
-		       m_code.PatchBranchToAddress(branch, target);
+		if (branch == static_cast<size_t>(-1) ||
+			!m_code.PatchBranchToAddress(branch, target))
+		{
+			return false;
+		}
+
+		if (persistent_branch_offset
+#if defined(VITASX2_QEMU_VALIDATION)
+			&& !captured_profile_bypass
+#endif
+		)
+			*persistent_branch_offset = branch;
+		return !persistent_branch_instruction
+#if defined(VITASX2_QEMU_VALIDATION)
+			|| captured_profile_bypass
+#endif
+			|| m_code.ReadInstruction(branch, persistent_branch_instruction);
 	}
 
 	bool BlockCompiler::EmitStageCompatiblePredicate()
@@ -12048,8 +12108,13 @@ namespace VitaEE
 		}
 
 		const size_t fallback_offset = m_code.Size();
-		if (!EmitSyncGprPinsToBacking() || !EmitStorePc(target_pc) ||
-			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN) ||
+		if ((m_reclaimed_vtlb_link_hosts ?
+				!EmitReclaimedVtlbCanonicalEdge() :
+				!EmitSyncGprPinsToBacking()) ||
+			!EmitStorePc(target_pc) ||
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN,
+				&direct_link->canonical_target_offset,
+				&direct_link->canonical_fallback_instruction) ||
 			!m_code.PatchBranch(continuation_start, fallback_offset))
 		{
 			return false;
@@ -12108,10 +12173,17 @@ namespace VitaEE
 
 		const size_t fallback_offset = m_code.Size();
 		if (!m_code.PatchBranch(target_branch, fallback_offset) ||
-			(requires_compatible_entry && !EmitSyncGprPinsToBacking()) ||
+			(requires_compatible_entry &&
+				(m_reclaimed_vtlb_link_hosts ?
+					!EmitReclaimedVtlbCanonicalEdge() :
+					!EmitSyncGprPinsToBacking())) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
 			!EmitExitToTarget(direct_exit, scheduler_test_elided_fallback ?
-				EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN : EE_DIRECT_EXIT_TOKEN))
+					EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN : EE_DIRECT_EXIT_TOKEN,
+				requires_compatible_entry && direct_link ?
+					&direct_link->canonical_target_offset : nullptr,
+				requires_compatible_entry && direct_link ?
+					&direct_link->canonical_fallback_instruction : nullptr))
 		{
 			return false;
 		}
@@ -12183,9 +12255,16 @@ namespace VitaEE
 				!m_code.PatchBranch(target_branch, fallback_offset, taken_condition)) ||
 			(leaves_signature &&
 				!m_code.PatchBranch(patchable_target, fallback_offset)) ||
-			(requires_compatible_entry && !EmitSyncGprPinsToBacking()) ||
+			(requires_compatible_entry &&
+				(m_reclaimed_vtlb_link_hosts ?
+					!EmitReclaimedVtlbCanonicalEdge() :
+					!EmitSyncGprPinsToBacking())) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
-			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN,
+				requires_compatible_entry && direct_link ?
+					&direct_link->canonical_target_offset : nullptr,
+				requires_compatible_entry && direct_link ?
+					&direct_link->canonical_fallback_instruction : nullptr))
 		{
 			return false;
 		}
@@ -12222,7 +12301,8 @@ namespace VitaEE
 		return EmitExitToTarget(event_exit, EE_EVENT_EXIT_TOKEN);
 	}
 
-	bool BlockCompiler::EmitIndirectCycleTestExit(const void* event_exit)
+	bool BlockCompiler::EmitIndirectCycleTestExit(const void* event_exit,
+		bool allow_generated_lookup)
 	{
 		if (!m_current_direct_exit || !event_exit)
 			return false;
@@ -12244,8 +12324,40 @@ namespace VitaEE
 
 		const size_t event_branch =
 			m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
-		if (event_branch == static_cast<size_t>(-1) ||
-			!EmitExitToTarget(m_current_direct_exit, EE_DIRECT_EXIT_TOKEN))
+		if (event_branch == static_cast<size_t>(-1))
+		{
+			return false;
+		}
+
+		const bool generated_lookup = allow_generated_lookup &&
+			m_persistent_dispatch_exits &&
+			m_current_indirect_lookup_pages_slot &&
+			m_current_direct_linking_enabled_flag;
+		if (generated_lookup)
+		{
+			// The exception helper observed and published all dirty scalar words
+			// before the call, and may itself have changed architectural GPRs. Do
+			// not run the ordinary indirect-tail sync here: its compile-time dirty
+			// masks would write stale host pins over helper results. A compatible
+			// signature can nevertheless have borrowed the persistent r7/r8 vTLB
+			// ABI; restore only those bases before entering a canonical target.
+			if ((m_reclaimed_vtlb_link_hosts &&
+				(!m_code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_SP,
+					PERSISTENT_LINK_VTLB_VMAP_OFFSET) ||
+				 !m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_SP,
+					PERSISTENT_LINK_VTLB_HOST_BASE_OFFSET))) ||
+				!m_code.EmitLdrImm12(HOST_BRANCH_TARGET, HOST_CPU_REGS,
+					static_cast<u16>(PC_OFFSET)) ||
+				!EmitGeneratedDispatchLookup(m_current_indirect_lookup_pages_slot,
+					m_current_direct_exit, false, true))
+			{
+				return false;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSpecialExceptionGeneratedLookupTails++;
+#endif
+		}
+		else if (!EmitExitToTarget(m_current_direct_exit, EE_DIRECT_EXIT_TOKEN))
 		{
 			return false;
 		}
@@ -12284,6 +12396,21 @@ namespace VitaEE
 		{
 			return false;
 		}
+
+		return EmitGeneratedDispatchLookup(lookup_pages_slot, direct_exit,
+			defer_pc_writeback, false);
+	}
+
+	bool BlockCompiler::EmitGeneratedDispatchLookup(const void* lookup_pages_slot,
+		const void* direct_exit, bool defer_pc_writeback,
+		bool special_exception_lookup)
+	{
+		if (!lookup_pages_slot || !direct_exit)
+			return false;
+
+#if !defined(VITASX2_QEMU_VALIDATION)
+		(void)special_exception_lookup;
+#endif
 
 		if (!m_code.EmitTstImm32(HOST_BRANCH_TARGET, 0x3))
 			return false;
@@ -12329,17 +12456,42 @@ namespace VitaEE
 		if (fallback_no_entry == static_cast<size_t>(-1))
 			return false;
 
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (special_exception_lookup &&
+			(!m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(
+				reinterpret_cast<uptr>(&g_qemuSpecialExceptionGeneratedLookupHits))) ||
+			 !m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP2, 0) ||
+			 !m_code.EmitAddImm8(HOST_TMP1, HOST_TMP1, 1) ||
+			 !m_code.EmitStrImm12(HOST_TMP1, HOST_TMP2, 0)))
+		{
+			return false;
+		}
+#endif
 		if (!m_code.EmitBx(HOST_TMP4))
 		{
 			return false;
 		}
 
 		const size_t fallback_target = m_code.Size();
-		return m_code.PatchBranch(fallback_unaligned, fallback_target, VitaA32::Condition::NE) &&
-			   m_code.PatchBranch(fallback_no_directory, fallback_target, VitaA32::Condition::EQ) &&
-			   m_code.PatchBranch(fallback_no_page, fallback_target, VitaA32::Condition::EQ) &&
-			   m_code.PatchBranch(fallback_no_entry, fallback_target, VitaA32::Condition::EQ) &&
-			   (!defer_pc_writeback || EmitStorePcFromHostReg(HOST_BRANCH_TARGET)) &&
+		if (!m_code.PatchBranch(fallback_unaligned, fallback_target, VitaA32::Condition::NE) ||
+			!m_code.PatchBranch(fallback_no_directory, fallback_target, VitaA32::Condition::EQ) ||
+			!m_code.PatchBranch(fallback_no_page, fallback_target, VitaA32::Condition::EQ) ||
+			!m_code.PatchBranch(fallback_no_entry, fallback_target, VitaA32::Condition::EQ))
+		{
+			return false;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (special_exception_lookup &&
+			(!m_code.EmitMovImm32(HOST_TMP2, static_cast<u32>(
+				reinterpret_cast<uptr>(&g_qemuSpecialExceptionGeneratedLookupFallbacks))) ||
+			 !m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP2, 0) ||
+			 !m_code.EmitAddImm8(HOST_TMP1, HOST_TMP1, 1) ||
+			 !m_code.EmitStrImm12(HOST_TMP1, HOST_TMP2, 0)))
+		{
+			return false;
+		}
+#endif
+		return (!defer_pc_writeback || EmitStorePcFromHostReg(HOST_BRANCH_TARGET)) &&
 			   EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN);
 	}
 
@@ -12674,9 +12826,16 @@ namespace VitaEE
 			const size_t fallback_offset = m_code.Size();
 			if (!m_code.PatchBranch(target_offset, fallback_offset,
 					VitaA32::Condition::MI) ||
-				(sync_private_exit && !EmitSyncGprPinsToBacking()) ||
+				(sync_private_exit &&
+					(m_reclaimed_vtlb_link_hosts ?
+						!EmitReclaimedVtlbCanonicalEdge() :
+						!EmitSyncGprPinsToBacking())) ||
 				(defer_pc_writeback && !EmitStorePc(direct_pc)) ||
-				!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
+				!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN,
+					sync_private_exit ?
+						&direct_link->canonical_target_offset : nullptr,
+					sync_private_exit ?
+						&direct_link->canonical_fallback_instruction : nullptr))
 			{
 				return false;
 			}
@@ -18080,7 +18239,7 @@ namespace VitaEE
 		}
 
 		if (!EmitAddScaledCyclesToCpu(cycles) ||
-			!EmitIndirectCycleTestExit(event_exit))
+			!EmitIndirectCycleTestExit(event_exit, !force_event_dispatch))
 		{
 			return false;
 		}
