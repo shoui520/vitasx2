@@ -6727,49 +6727,96 @@ namespace VitaIOP
 		// PCSX2 owners: x86/iR3000Atables.cpp::rpsxLoad()/rpsxSW(),
 		// IopMem.cpp::iopMemRead32()/iopMemWrite32(), and
 		// x86/iR3000A.cpp::PSXREC_CLEARM. The fast arm coalesces the exact
-		// ordinary-RAM result of four adjacent reads followed by the same four
-		// adjacent writes. Every rejected alias/alignment/wrap/page case executes
-		// the owner helpers in original instruction order while the complete
-		// BaseBlock cycle delta remains private; the owner tail publishes it once.
-		std::array<size_t, 5> fallback_branches{};
+		// directly mapped result of four adjacent reads followed by the same four
+		// adjacent ordinary-RAM writes. Main RAM aliases and the immutable 4 MiB
+		// BIOS ROM use their owning backing arrays; every rejected mapping,
+		// alignment, wrap, or destination-page case executes the owner helpers in
+		// original instruction order while the complete BaseBlock cycle delta
+		// remains private. The owner tail publishes it once.
+		constexpr u32 ram_mapping_guard_mask = 0x1f800000u;
+		std::array<size_t, 8> fallback_branches{};
 		fallback_branches.fill(static_cast<size_t>(-1));
 		if (!EmitEffectiveAddress(copy.load_ops[0], HOST_SAVED0) ||
 			!EmitEffectiveAddress(copy.store_ops[0], HOST_TMP3) ||
-			!m_code.EmitTstImm32(HOST_SAVED0, 0x10000003u))
+			!m_code.EmitTstImm32(HOST_TMP3, ram_mapping_guard_mask))
 		{
 			return false;
 		}
 		fallback_branches[0] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (fallback_branches[0] == static_cast<size_t>(-1) ||
-			!m_code.EmitAddImm8(HOST_TMP0, HOST_SAVED0, 15) ||
-			!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_SAVED0) ||
-			!m_code.EmitTstImm32(HOST_TMP0, 0x00200000u))
+			!m_code.EmitTstImm32(HOST_TMP3, 3u))
 		{
 			return false;
 		}
 		fallback_branches[1] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
 		if (fallback_branches[1] == static_cast<size_t>(-1) ||
-			!m_code.EmitTstImm32(HOST_TMP3, 0x10000003u))
-		{
-			return false;
-		}
-		fallback_branches[2] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (fallback_branches[2] == static_cast<size_t>(-1) ||
 			!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP3, 15) ||
 			!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_TMP3) ||
 			!m_code.EmitTstImm32(HOST_TMP0, 0x00200000u))
 		{
 			return false;
 		}
-		fallback_branches[3] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (fallback_branches[3] == static_cast<size_t>(-1) ||
+		fallback_branches[2] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[2] == static_cast<size_t>(-1) ||
 			!m_code.EmitTstImm32(HOST_TMP0, 0x00001000u))
 		{
 			return false;
 		}
-		fallback_branches[4] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (fallback_branches[4] == static_cast<size_t>(-1))
+		fallback_branches[3] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[3] == static_cast<size_t>(-1) ||
+			!m_code.EmitTstImm32(HOST_SAVED0, 3u))
+		{
 			return false;
+		}
+		fallback_branches[4] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[4] == static_cast<size_t>(-1) ||
+			!m_code.EmitTstImm32(HOST_SAVED0, ram_mapping_guard_mask))
+		{
+			return false;
+		}
+		const size_t ram_source =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (ram_source == static_cast<size_t>(-1) ||
+			!m_code.EmitEorImm32(HOST_TMP0, HOST_SAVED0, 0x1fc00000u) ||
+			!m_code.EmitTstImm32(HOST_TMP0, 0x1fc00000u))
+		{
+			return false;
+		}
+		fallback_branches[5] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[5] == static_cast<size_t>(-1) ||
+			!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP0, 0xe0000000u) ||
+			!m_code.EmitAddImm8(HOST_TMP1, HOST_TMP0, 15) ||
+			!m_code.EmitTstImm32(HOST_TMP1, Ps2MemSize::Rom))
+		{
+			return false;
+		}
+		fallback_branches[6] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[6] == static_cast<size_t>(-1) ||
+			!m_code.EmitMovImm32(HOST_TMP2,
+				static_cast<u32>(reinterpret_cast<uptr>(eeMem->ROM))) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_TMP2, HOST_TMP0) ||
+			!m_code.EmitVld1Q32(0, HOST_TMP0))
+		{
+			return false;
+		}
+		const size_t source_ready = m_code.EmitBranchPlaceholder();
+		if (source_ready == static_cast<size_t>(-1) ||
+			!m_code.PatchBranch(ram_source, m_code.Size(), VitaA32::Condition::EQ) ||
+			!m_code.EmitAddImm8(HOST_TMP0, HOST_SAVED0, 15) ||
+			!m_code.EmitEorReg(HOST_TMP0, HOST_TMP0, HOST_SAVED0) ||
+			!m_code.EmitTstImm32(HOST_TMP0, 0x00200000u))
+		{
+			return false;
+		}
+		fallback_branches[7] = m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (fallback_branches[7] == static_cast<size_t>(-1) ||
+			!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
+			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
+			!m_code.EmitVld1Q32(0, HOST_TMP0) ||
+			!m_code.PatchBranch(source_ready, m_code.Size()))
+		{
+			return false;
+		}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!m_code.EmitMovImm32(HOST_TMP2,
@@ -6783,12 +6830,6 @@ namespace VitaIOP
 		}
 #endif
 
-		if (!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
-			!m_code.EmitAddReg(HOST_TMP0, HOST_IOP_RAM_BASE, HOST_TMP0) ||
-			!m_code.EmitVld1Q32(0, HOST_TMP0))
-		{
-			return false;
-		}
 		const u32 result_offset = static_cast<u32>(GprOffset(copy.first_result));
 		if (!(m_code.EmitAddImm32(HOST_TMP0, HOST_PSX_REGS, result_offset) ||
 				(m_code.EmitMovImm32(HOST_TMP0, result_offset) &&
@@ -7670,7 +7711,7 @@ namespace VitaIOP
 		m_wait_resume_block = block;
 		m_wait_resume_event_context.block = block;
 		m_wait_resume_event_context.kind =
-			block->poll_call_wait_loop ? WaitResumeKind::PollCall : (block->wait_loop_descriptor.condition == WaitLoopCondition::Always ? WaitResumeKind::Unconditional : WaitResumeKind::Conditional);
+			block->HasRamPollWaitLoop() ? WaitResumeKind::PollCall : (block->wait_loop_descriptor.condition == WaitLoopCondition::Always ? WaitResumeKind::Unconditional : WaitResumeKind::Conditional);
 #if defined(__arm__)
 		if (m_owns_ee_event_entry)
 		{
@@ -8868,7 +8909,9 @@ namespace VitaIOP
 			return false;
 
 		block.poll_call_wait_loop = true;
+		block.inline_ram_poll_wait_loop = false;
 		block.poll_result_register = static_cast<u8>(result_register);
+		block.poll_load_opcode = 0x23; // LW
 		block.poll_word_address = physical_address & (Ps2MemSize::ExposedIopRam - 1);
 		block.poll_branch_opcodes = branch_opcodes;
 		block.poll_leaf_opcodes = leaf_opcodes;
@@ -8878,6 +8921,69 @@ namespace VitaIOP
 			block.poll_branch_expected[i] = branch_opcodes[i];
 		for (u32 i = 0; i < block.poll_leaf_expected.size(); i++)
 			block.poll_leaf_expected[i] = leaf_opcodes[i];
+		return true;
+	}
+
+	bool BlockExecutor::AnalyzeInlineRamPollWaitLoop(CachedBlock& block,
+		u32 start_pc, u32 instruction_count)
+	{
+		// PCSX2 owners: x86/ix86-32/iR5900.cpp::recRecompile() permits a
+		// self-loop whose only machine-state input is a load to use s_nBlockFF;
+		// x86/iR3000A.cpp::iPsxBranchTest() owns the IOP deadline/event advance.
+		// Keep this first R3000A adaptation deliberately narrower: one constant
+		// address, one ordinary-RAM scalar load, its required load-delay NOP, and
+		// a BEQ-zero backedge with a NOP delay slot.
+		if (instruction_count != 5)
+			return false;
+
+		const u32 lui = block.Opcode(0);
+		const u32 load = block.Opcode(1);
+		const u32 load_delay = block.Opcode(2);
+		const u32 branch = block.Opcode(3);
+		const u32 branch_delay = block.Opcode(4);
+		if ((lui >> 26) != 0x0f || RS(lui) != 0 || RT(lui) == 0 ||
+			load_delay != 0 || branch_delay != 0 || (branch >> 26) != 0x04 ||
+			BranchTarget(start_pc + 3 * sizeof(u32), branch) != start_pc)
+		{
+			return false;
+		}
+
+		const u32 load_opcode = load >> 26;
+		switch (load_opcode)
+		{
+			case 0x20: // LB
+			case 0x21: // LH
+			case 0x23: // LW
+			case 0x24: // LBU
+			case 0x25: // LHU
+				break;
+			default:
+				return false;
+		}
+
+		const unsigned base_register = RT(lui);
+		const unsigned result_register = RT(load);
+		if (RS(load) != base_register || result_register != base_register ||
+			!((RS(branch) == result_register && RT(branch) == 0) ||
+				(RT(branch) == result_register && RS(branch) == 0)))
+		{
+			return false;
+		}
+
+		const u32 effective_address =
+			(IMM_U(lui) << 16) + static_cast<u32>(static_cast<s32>(IMM_S(load)));
+		u32 poll_address = 0;
+		if (!TryMappedIopRamEffectiveAddress(effective_address,
+				DirectIopRamAlignmentMask(load), &poll_address))
+		{
+			return false;
+		}
+
+		block.inline_ram_poll_wait_loop = true;
+		block.poll_call_wait_loop = false;
+		block.poll_result_register = static_cast<u8>(result_register);
+		block.poll_load_opcode = static_cast<u8>(load_opcode);
+		block.poll_word_address = poll_address;
 		return true;
 	}
 
@@ -9825,6 +9931,10 @@ namespace VitaIOP
 		block.poll_branch_source_start = INVALID_RAM_SOURCE;
 		block.poll_leaf_source_start = INVALID_RAM_SOURCE;
 		block.poll_call_wait_loop = false;
+		block.inline_ram_poll_wait_loop = false;
+		block.poll_word_address = 0;
+		block.poll_result_register = 0;
+		block.poll_load_opcode = 0;
 		block.direct_budget_exit = false;
 		block.constant_cycle_budget = false;
 		block.clock_mode_check_instructions_removed = 0;
@@ -10570,6 +10680,9 @@ namespace VitaIOP
 	inline __attribute__((always_inline)) bool
 	BlockExecutor::TryFastForwardPollCallWaitLoop(CachedBlock& block)
 	{
+		if (block.inline_ram_poll_wait_loop)
+			return TryFastForwardInlineRamPollWaitLoop(block);
+
 		// RunValidatedBlock reaches this only after ValidateCachedBlock proved the
 		// cached WaitLoop/trace configuration still matches compilation.
 		const u32 value =
@@ -10595,6 +10708,9 @@ namespace VitaIOP
 	inline __attribute__((always_inline)) bool
 	BlockExecutor::TryFastForwardPollCallWaitLoopForClock(CachedBlock& block)
 	{
+		if (block.inline_ram_poll_wait_loop)
+			return TryFastForwardInlineRamPollWaitLoopForClock<Ps1Clock>(block);
+
 		const u32 value =
 			*reinterpret_cast<const u32*>(&iopMem->Main[block.poll_word_address]);
 		if (value != 0)
@@ -10608,6 +10724,78 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 		VitaRecordA32IopWaitLoopDispatchElision();
 		VitaRecordA32IopPollCallWaitLoopDispatchElision();
+#endif
+		return true;
+	}
+
+	inline __attribute__((always_inline)) u32
+	BlockExecutor::ReadInlineRamPollValue(const CachedBlock& block)
+	{
+		const u8* const address = &iopMem->Main[block.poll_word_address];
+		switch (block.poll_load_opcode)
+		{
+			case 0x20: // LB
+				return static_cast<u32>(static_cast<s32>(
+					static_cast<s8>(*address)));
+			case 0x21: // LH
+			{
+				u16 value = 0;
+				std::memcpy(&value, address, sizeof(value));
+				return static_cast<u32>(static_cast<s32>(static_cast<s16>(value)));
+			}
+			case 0x23: // LW
+			{
+				u32 value = 0;
+				std::memcpy(&value, address, sizeof(value));
+				return value;
+			}
+			case 0x24: // LBU
+				return *address;
+			case 0x25: // LHU
+			{
+				u16 value = 0;
+				std::memcpy(&value, address, sizeof(value));
+				return value;
+			}
+			default:
+				// Invalid metadata must take the generated path, never suppress a load.
+				return 1;
+		}
+	}
+
+	inline __attribute__((always_inline)) bool
+	BlockExecutor::TryFastForwardInlineRamPollWaitLoop(CachedBlock& block)
+	{
+		const u32 value = ReadInlineRamPollValue(block);
+		if (value != 0)
+			return false;
+
+		// LUI and the load deliberately share a destination in the recognized
+		// shape. Publishing the loaded zero therefore owns every architectural GPR
+		// effect of the taken iteration; both delay slots are proven NOPs.
+		psxRegs.GPR.r[block.poll_result_register] = value;
+		constexpr u32 poll_loop_cycles = 5;
+		FastForwardProviderIopWaitLoop(block.start_pc, poll_loop_cycles);
+#if defined(VITASX2_QEMU_VALIDATION)
+		VitaRecordA32IopWaitLoopDispatchElision();
+#endif
+		return true;
+	}
+
+	template <bool Ps1Clock>
+	inline __attribute__((always_inline)) bool
+	BlockExecutor::TryFastForwardInlineRamPollWaitLoopForClock(CachedBlock& block)
+	{
+		const u32 value = ReadInlineRamPollValue(block);
+		if (value != 0)
+			return false;
+
+		psxRegs.GPR.r[block.poll_result_register] = value;
+		constexpr u32 poll_loop_cycles = 5;
+		FastForwardProviderIopWaitLoopForClock<Ps1Clock>(block.start_pc,
+			poll_loop_cycles);
+#if defined(VITASX2_QEMU_VALIDATION)
+		VitaRecordA32IopWaitLoopDispatchElision();
 #endif
 		return true;
 	}
@@ -10856,6 +11044,10 @@ namespace VitaIOP
 			block.Opcode(i) = op;
 		}
 		block.poll_call_wait_loop = false;
+		block.inline_ram_poll_wait_loop = false;
+		block.poll_word_address = 0;
+		block.poll_result_register = 0;
+		block.poll_load_opcode = 0;
 		block.direct_budget_exit = false;
 		block.constant_cycle_budget = false;
 		block.poll_branch_opcodes = nullptr;
@@ -10865,6 +11057,11 @@ namespace VitaIOP
 		block.wait_loop_descriptor = {};
 		block.wait_loop_shape =
 			AnalyzePollCallWaitLoop(block, start_pc, instruction_count);
+		if (!block.wait_loop_shape)
+		{
+			block.wait_loop_shape = AnalyzeInlineRamPollWaitLoop(
+				block, start_pc, instruction_count);
+		}
 		if (!block.wait_loop_shape)
 		{
 			block.wait_loop_shape = AnalyzeIopWaitLoopShape(
@@ -11760,12 +11957,12 @@ namespace VitaIOP
 		// detailed API's redundant psxRegs.pc publication and result aggregate
 		// are unnecessary on this provider-only path.
 		bool wait_forward = false;
-		if ((!block.poll_call_wait_loop ||
+		if ((!block.HasRamPollWaitLoop() ||
 				!(forced_continuation && psxRegs.iopCycleEE <= 0)) &&
 			!block.compiled_ps1_bios_gate && block.wait_loop_shape &&
 			block.wait_loop_enabled_at_compile)
 		{
-			if (block.poll_call_wait_loop)
+			if (block.HasRamPollWaitLoop())
 			{
 				wait_forward = TryFastForwardPollCallWaitLoop(block);
 			}

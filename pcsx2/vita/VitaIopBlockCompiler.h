@@ -870,6 +870,7 @@ namespace VitaIOP
 			bool wait_loop_enabled_at_compile = false;
 			WaitLoopDescriptor wait_loop_descriptor{};
 			bool poll_call_wait_loop = false;
+			bool inline_ram_poll_wait_loop = false;
 			bool direct_budget_exit = false;
 			bool constant_cycle_budget = false;
 			bool isolate_cache_active = false;
@@ -877,8 +878,14 @@ namespace VitaIOP
 			bool discovered_topology = false;
 			bool trusted_source = false;
 			u8 poll_result_register = 0;
+			u8 poll_load_opcode = 0;
 			bool valid = false;
 			bool queued_free = false;
+
+			bool HasRamPollWaitLoop() const
+			{
+				return poll_call_wait_loop || inline_ram_poll_wait_loop;
+			}
 		};
 
 	public:
@@ -981,6 +988,8 @@ namespace VitaIOP
 		void UnregisterRamSource(const InterpreterFallbackBlock& block);
 		bool AnalyzePollCallWaitLoop(CachedBlock& block, u32 start_pc,
 			u32 instruction_count);
+		bool AnalyzeInlineRamPollWaitLoop(CachedBlock& block, u32 start_pc,
+			u32 instruction_count);
 		u32 InvalidateRamSourceRange(u32 start, u32 size);
 		void ClearRamSourcePages();
 		InterpreterFallbackBlock* FindInterpreterFallbackBlock(u32 start_pc) const;
@@ -1020,11 +1029,18 @@ namespace VitaIOP
 		void InvalidateCachedBlock(CachedBlock& block);
 		bool ValidateCachedBlock(CachedBlock& block);
 		static bool TryFastForwardTrustedWaitLoopAtPc(u32 start_pc);
+		static inline __attribute__((always_inline)) u32
+		ReadInlineRamPollValue(const CachedBlock& block);
 		inline __attribute__((always_inline)) bool
 		TryFastForwardPollCallWaitLoop(CachedBlock& block);
+		inline __attribute__((always_inline)) bool
+		TryFastForwardInlineRamPollWaitLoop(CachedBlock& block);
 		template <bool Ps1Clock>
 		inline __attribute__((always_inline)) bool
 		TryFastForwardPollCallWaitLoopForClock(CachedBlock& block);
+		template <bool Ps1Clock>
+		inline __attribute__((always_inline)) bool
+		TryFastForwardInlineRamPollWaitLoopForClock(CachedBlock& block);
 		inline __attribute__((always_inline)) bool
 		TryFastForwardCachedUnconditionalWaitLoop(CachedBlock& block);
 		inline __attribute__((always_inline)) void
