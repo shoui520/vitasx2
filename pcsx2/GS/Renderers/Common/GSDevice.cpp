@@ -16,7 +16,9 @@
 #include "common/StringUtil.h"
 #include "common/Threading.h"
 
+#if !defined(VITASX2_VITA)
 #include "imgui.h"
+#endif
 
 #include <algorithm>
 #include <ostream>
@@ -264,6 +266,7 @@ const char* GSDevice::RenderAPIToString(RenderAPI api)
 		CASE(Metal);
 		CASE(Vulkan);
 		CASE(OpenGL);
+		CASE(GXM);
 #undef CASE
 		// clang-format on
 	default:
@@ -493,6 +496,11 @@ void GSDevice::InvalidateRenderTarget(GSTexture* t)
 
 void GSDevice::UpdateImGuiTextures()
 {
+#if defined(VITASX2_VITA)
+	// VitaSX2 has no desktop ImGui texture platform. PCSX2's GS texture pool
+	// remains the owner of emulation surfaces; the Vita UI does not inject any.
+	return;
+#else
 	// TODO, use ImDrawData https://github.com/ocornut/imgui/issues/8597#issuecomment-2871835598
 	for (ImTextureData* im_tex : ImGui::GetPlatformIO().Textures)
 	{
@@ -569,10 +577,14 @@ void GSDevice::UpdateImGuiTextures()
 				break;
 		}
 	}
+#endif
 }
 
 void GSDevice::DestroyImGuiTextures()
 {
+#if defined(VITASX2_VITA)
+	return;
+#else
 	if (!ImGui::GetCurrentContext())
 		return;
 
@@ -593,6 +605,7 @@ void GSDevice::DestroyImGuiTextures()
 			im_tex->Status = ImTextureStatus_Destroyed;
 		}
 	}
+#endif
 }
 
 void GSDevice::TextureRecycleDeleter::operator()(GSTexture* const tex)
@@ -1123,28 +1136,34 @@ void GSDevice::EndDSAsRT()
 	m_ds_as_rt = nullptr;
 }
 
-#if defined(__clang__)
+#if !defined(VITASX2_VITA) && defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wignored-qualifiers"
-#elif defined(__GNUC__)
+#elif !defined(VITASX2_VITA) && defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wignored-qualifiers"
 #endif
 
 // Kinda grotty, but better than copy/pasting the relevant bits in..
+#if !defined(VITASX2_VITA)
 #define A_CPU 1
 #include "bin/resources/shaders/common/ffx_a.h"
 #include "bin/resources/shaders/common/ffx_cas.h"
+#endif
 
-#if defined(__clang__)
+#if !defined(VITASX2_VITA) && defined(__clang__)
 #pragma clang diagnostic pop
-#elif defined(__GNUC__)
+#elif !defined(VITASX2_VITA) && defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
 
 bool GSDevice::GetCASShaderSource(std::string* source)
 {
+#if defined(VITASX2_VITA)
+	(void)source;
+	return false;
+#else
 	std::optional<std::string> ffx_a_source = ReadShaderSource("shaders/common/ffx_a.h");
 	std::optional<std::string> ffx_cas_source = ReadShaderSource("shaders/common/ffx_cas.h");
 	if (!ffx_a_source.has_value() || !ffx_cas_source.has_value())
@@ -1154,10 +1173,22 @@ bool GSDevice::GetCASShaderSource(std::string* source)
 	StringUtil::ReplaceAll(source, "#include \"ffx_a.h\"", ffx_a_source.value());
 	StringUtil::ReplaceAll(source, "#include \"ffx_cas.h\"", ffx_cas_source.value());
 	return true;
+#endif
 }
 
 void GSDevice::CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool sharpen_only)
 {
+#if defined(VITASX2_VITA)
+	// PCSX2's optional FidelityFX CAS post-process is not part of GS
+	// correctness. The direct GXM backend advertises it as unsupported and
+	// leaves the already-correct merge texture untouched.
+	(void)tex;
+	(void)src_rect;
+	(void)src_uv;
+	(void)draw_rect;
+	(void)sharpen_only;
+	return;
+#else
 	const int dst_width = sharpen_only ? src_rect.width() : static_cast<int>(std::ceil(draw_rect.z - draw_rect.x));
 	const int dst_height = sharpen_only ? src_rect.height() : static_cast<int>(std::ceil(draw_rect.w - draw_rect.y));
 	const int src_offset_x = static_cast<int>(src_rect.x);
@@ -1192,6 +1223,7 @@ void GSDevice::CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, con
 	tex = m_cas;
 	src_rect = GSVector4i(0, 0, dst_width, dst_height);
 	src_uv = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+#endif
 }
 
 bool GSHWDrawConfig::BlendState::IsEffective(ColorMaskSelector colormask) const

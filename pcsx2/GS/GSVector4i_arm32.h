@@ -1681,7 +1681,7 @@ public:
 #if __has_builtin(__builtin_nontemporal_store)
 		return GSVector4i(__builtin_nontemporal_load((int32x4_t*)p));
 #else
-		return GSVector4i(vreinterpretq_s32_s64(vld1q_s64((int64_t*)p)));
+		return GSVector4i(vld1q_s32(static_cast<const int32_t*>(p)));
 #endif
 	}
 
@@ -1692,12 +1692,13 @@ public:
 
 	__forceinline static GSVector4i loadh(const void* p)
 	{
-		return GSVector4i(vreinterpretq_s32_s64(vcombine_s64(vdup_n_s64(0), vld1_s64((int64_t*)p))));
+		return GSVector4i(vcombine_s32(vdup_n_s32(0), vld1_s32(static_cast<const int32_t*>(p))));
 	}
 
 	__forceinline static GSVector4i loadh(const void* p, const GSVector4i& v)
 	{
-		return GSVector4i(vreinterpretq_s32_s64(vcombine_s64(vget_low_s64(vreinterpretq_s64_s32(v.v4s)), vld1_s64((int64_t*)p))));
+		return GSVector4i(vcombine_s32(vget_low_s32(v.v4s),
+			vld1_s32(static_cast<const int32_t*>(p))));
 	}
 
 	__forceinline static GSVector4i loadh(const GSVector2i& v)
@@ -1707,13 +1708,14 @@ public:
 
 	__forceinline static GSVector4i load(const void* pl, const void* ph)
 	{
-		return GSVector4i(vreinterpretq_s32_s64(vcombine_s64(vld1_s64((int64_t*)pl), vld1_s64((int64_t*)ph))));
+		return GSVector4i(vcombine_s32(vld1_s32(static_cast<const int32_t*>(pl)),
+			vld1_s32(static_cast<const int32_t*>(ph))));
 	}
 
 	template <bool aligned>
 	__forceinline static GSVector4i load(const void* p)
 	{
-		return GSVector4i(vreinterpretq_s32_s64(vld1q_s64((int64_t*)p)));
+		return GSVector4i(vld1q_s32(static_cast<const int32_t*>(p)));
 	}
 
 	__forceinline static GSVector4i load(int i)
@@ -1731,18 +1733,18 @@ public:
 #if __has_builtin(__builtin_nontemporal_store)
 		__builtin_nontemporal_store(v.v4s, ((int32x4_t*)p));
 #else
-		vst1q_s64((int64_t*)p, vreinterpretq_s64_s32(v.v4s));
+		vst1q_s32(static_cast<int32_t*>(p), v.v4s);
 #endif
 	}
 
 	__forceinline static void storel(void* p, const GSVector4i& v)
 	{
-		vst1_s64((int64_t*)p, vget_low_s64(vreinterpretq_s64_s32(v.v4s)));
+		vst1_s32(static_cast<int32_t*>(p), vget_low_s32(v.v4s));
 	}
 
 	__forceinline static void storeh(void* p, const GSVector4i& v)
 	{
-		vst1_s64((int64_t*)p, vget_high_s64(vreinterpretq_s64_s32(v.v4s)));
+		vst1_s32(static_cast<int32_t*>(p), vget_high_s32(v.v4s));
 	}
 
 	__forceinline static void store(void* pl, void* ph, const GSVector4i& v)
@@ -1754,7 +1756,7 @@ public:
 	template <bool aligned>
 	__forceinline static void store(void* p, const GSVector4i& v)
 	{
-		vst1q_s64((int64_t*)p, vreinterpretq_s64_s32(v.v4s));
+		vst1q_s32(static_cast<int32_t*>(p), v.v4s);
 	}
 
 	__forceinline static int store(const GSVector4i& v)

@@ -1,0 +1,6 @@
+// Compile the PCSX2 TFX arithmetic without a framebuffer-read dependency.
+// GSDeviceGXM patches PCSX2's computed host blend and write mask into this
+// program; the general shader remains the exact fallback for true SW_BLEND and
+// per-bit FBMASK draws.
+#define VITASX2_TFX_FAST 1
+#include "vitasx2_tfx_f.cg"

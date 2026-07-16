@@ -681,6 +681,21 @@ namespace VMManager
 	{
 	}
 
+	GSVSyncMode GetEffectiveVSyncMode()
+	{
+		// PCSX2 owner: VMManager.cpp::GetEffectiveVSyncMode(). Vita has one
+		// fixed display queue and no desktop host-refresh synchronizer; retain
+		// the user-visible enable/disable decision and use its blocking mode.
+		return EmuConfig.GS.VsyncEnable ? GSVSyncMode::FIFO : GSVSyncMode::Disabled;
+	}
+
+	bool ShouldAllowPresentThrottle()
+	{
+		// PCSX2 only enables this while running away from normal target speed.
+		// Vita's product VM currently exposes normal-speed execution only.
+		return false;
+	}
+
 	namespace Internal
 	{
 		bool IsFastBootInProgress()

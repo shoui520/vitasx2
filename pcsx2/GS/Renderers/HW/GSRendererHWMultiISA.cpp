@@ -191,7 +191,7 @@ bool GSRendererHWFunctions::SwPrimRender(GSRendererHW& hw, bool invalidate_tc, b
 			const GSVector4i r = hw.GetTextureMinMax(TEX0, context->CLAMP, gd.sel.ltf, true).coverage;
 
 			if (!hw.m_sw_texture[0])
-				hw.m_sw_texture[0] = std::make_unique<GSTextureCacheSW::Texture>(0, TEX0, env.TEXA);
+				hw.m_sw_texture[0] = std::make_unique<GSTextureCacheSW::Texture>(hw.m_mem, 0, TEX0, env.TEXA);
 			else
 				hw.m_sw_texture[0]->Reset(0, TEX0, env.TEXA);
 
@@ -285,7 +285,7 @@ bool GSRendererHWFunctions::SwPrimRender(GSRendererHW& hw, bool invalidate_tc, b
 					vt.m_max.t *= 0.5f;
 
 					if (!hw.m_sw_texture[i])
-						hw.m_sw_texture[i] = std::make_unique<GSTextureCacheSW::Texture>(gd.sel.tw + 3, MIP_TEX0, env.TEXA);
+						hw.m_sw_texture[i] = std::make_unique<GSTextureCacheSW::Texture>(hw.m_mem, gd.sel.tw + 3, MIP_TEX0, env.TEXA);
 					else
 						hw.m_sw_texture[i]->Reset(gd.sel.tw + 3, MIP_TEX0, env.TEXA);
 

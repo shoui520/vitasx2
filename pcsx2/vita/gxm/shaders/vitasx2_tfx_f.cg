@@ -1,0 +1,343 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owner: bin/resources/shaders/opengl/tfx_fs.glsl. GXM has no runtime
+// compiler, so selector fields are branch-uniform inputs to one offline GXP.
+// The backend can split hot selector families into specialized GXPs without
+// changing this PS2-visible arithmetic.
+
+float4 SelectGsColor(float selector, float4 source, float4 destination)
+{
+	if (selector < 0.5f)
+		return source;
+	if (selector < 1.5f)
+		return destination;
+	return float4(0.0f);
+}
+
+float4 SelectHardwareFactor(float selector, float4 source,
+	float4 destination, float4 source1, float constantValue)
+{
+	if (selector < 0.5f) return source;
+	if (selector < 1.5f) return 1.0f - source;
+	if (selector < 2.5f) return destination;
+	if (selector < 3.5f) return 1.0f - destination;
+	if (selector < 4.5f) return source1;
+	if (selector < 5.5f) return 1.0f - source1;
+	if (selector < 6.5f) return source.aaaa;
+	if (selector < 7.5f) return 1.0f - source.aaaa;
+	if (selector < 8.5f) return destination.aaaa;
+	if (selector < 9.5f) return 1.0f - destination.aaaa;
+	if (selector < 10.5f) return source1.aaaa;
+	if (selector < 11.5f) return 1.0f - source1.aaaa;
+	if (selector < 12.5f) return float4(constantValue);
+	if (selector < 13.5f) return float4(1.0f - constantValue);
+	if (selector < 14.5f) return float4(1.0f);
+	return float4(0.0f);
+}
+
+float4 ApplyHardwareBlend(float4 source, float4 destination, float4 source1,
+	float4 state0, float4 state1)
+{
+	if (state0.x < 0.5f)
+		return source;
+
+	const float constantValue = state1.z;
+	const float4 sf = SelectHardwareFactor(state0.z, source, destination,
+		source1, constantValue);
+	const float4 df = SelectHardwareFactor(state0.w, source, destination,
+		source1, constantValue);
+	const float4 left = source * sf;
+	const float4 right = destination * df;
+	float4 result = state0.y < 0.5f ? left + right :
+		(state0.y < 1.5f ? left - right : right - left);
+
+	const float4 saf = SelectHardwareFactor(state1.x, source, destination,
+		source1, constantValue);
+	const float4 daf = SelectHardwareFactor(state1.y, source, destination,
+		source1, constantValue);
+	// PCSX2 GSDeviceOGL::OMSetBlendState fixes the alpha equation to ADD even
+	// when RGB uses subtract or reverse-subtract.
+	result.a = source.a * saf.a + destination.a * daf.a;
+	return result;
+}
+
+float2 RegionCoordinate(float2 coordinate, float wms, float wmt)
+{
+	coordinate.x = wms < 0.5f ? frac(coordinate.x) : saturate(coordinate.x);
+	coordinate.y = wmt < 0.5f ? frac(coordinate.y) : saturate(coordinate.y);
+	return coordinate;
+}
+
+float4 ApplyTextureAem(float4 sampled, float aem, float aemFormat,
+	float4 textureAlpha)
+{
+	if (aemFormat > 0.5f && aemFormat < 1.5f)
+	{
+		const bool nonzero = sampled.r != 0.0f || sampled.g != 0.0f ||
+			sampled.b != 0.0f;
+		sampled.a = (aem < 0.5f || nonzero) ? textureAlpha.x : 0.0f;
+	}
+	else if (aemFormat > 1.5f)
+	{
+		const bool nonzero = sampled.r >= (8.0f / 255.0f) ||
+			sampled.g >= (8.0f / 255.0f) || sampled.b >= (8.0f / 255.0f);
+		sampled.a = sampled.a >= 0.5f ? textureAlpha.y :
+			((aem < 0.5f || nonzero) ? textureAlpha.x : 0.0f);
+	}
+	return sampled;
+}
+
+float4 SampleOne(uniform sampler2D textureSampler, float2 coordinate,
+	float regionRect, float2 wrapMode, float4 textureSize,
+	float4 stRange, float4 nativeTextureSize, float2 stScale,
+	float aem, float aemFormat, float4 textureAlpha)
+{
+	if (regionRect < 0.5f)
+	{
+		return ApplyTextureAem(tex2D(textureSampler, coordinate * stScale),
+			aem, aemFormat, textureAlpha);
+	}
+
+	// PCSX2 tfx_fs.glsl::clamp_wrap_uv/sample_c: target-region textures use
+	// integer texel coordinates and clamp to the exact target-backed rectangle.
+	// GXM has no texelFetch Cg intrinsic, so address the point-filtered texel
+	// centre through the actual host texture dimensions.
+	float2 wrapped = RegionCoordinate(coordinate, wrapMode.x, wrapMode.y);
+	float2 texel = clamp(wrapped * textureSize.zw + stRange.xy,
+		stRange.xy, stRange.zw);
+	return ApplyTextureAem(tex2D(textureSampler,
+		(floor(texel) + 0.5f) * nativeTextureSize.zw),
+		aem, aemFormat, textureAlpha);
+}
+
+float4 SampleTexture(uniform sampler2D textureSampler, float2 st,
+	float manualLinear, float4 halfTexel, float4 textureSize,
+	float regionRect, float2 wrapMode, float4 stRange,
+	float4 nativeTextureSize, float2 stScale, float aem,
+	float aemFormat, float4 textureAlpha)
+{
+	if (manualLinear < 0.5f)
+		return SampleOne(textureSampler, st, regionRect, wrapMode,
+			textureSize, stRange, nativeTextureSize, stScale,
+			aem, aemFormat, textureAlpha);
+
+	const float4 uv = st.xyxy + halfTexel;
+	const float2 weight = saturate(frac(uv.xy * textureSize.zw));
+	const float4 c0 = SampleOne(textureSampler, uv.xy, regionRect, wrapMode,
+		textureSize, stRange, nativeTextureSize, stScale,
+		aem, aemFormat, textureAlpha);
+	const float4 c1 = SampleOne(textureSampler, uv.zy, regionRect, wrapMode,
+		textureSize, stRange, nativeTextureSize, stScale,
+		aem, aemFormat, textureAlpha);
+	const float4 c2 = SampleOne(textureSampler, uv.xw, regionRect, wrapMode,
+		textureSize, stRange, nativeTextureSize, stScale,
+		aem, aemFormat, textureAlpha);
+	const float4 c3 = SampleOne(textureSampler, uv.zw, regionRect, wrapMode,
+		textureSize, stRange, nativeTextureSize, stScale,
+		aem, aemFormat, textureAlpha);
+	return lerp(lerp(c0, c1, weight.x), lerp(c2, c3, weight.x), weight.y);
+}
+
+__nativecolor __regformat unsigned char4 main(
+#if !defined(VITASX2_TFX_FAST)
+	__regformat unsigned char4 fragColor : FRAGCOLOR,
+#endif
+	float4 vTexFloat : TEXCOORD0,
+	float4 vTexInt : TEXCOORD1,
+	float4 vColor : TEXCOORD2,
+	float2 windowPosition : WPOS,
+#if !defined(VITASX2_TFX_UNTEXTURED)
+	uniform sampler2D sourceTexture : TEXUNIT0,
+#endif
+	uniform float4 Selector0,
+	uniform float4 Selector1,
+	uniform float4 Selector2,
+	uniform float4 Selector3,
+	uniform float4 Selector4,
+	uniform float4 Selector5,
+	uniform float4 Selector6,
+	uniform float4 FogColorAref,
+	uniform float4 TextureSize,
+	uniform float4 NativeTextureSize,
+	uniform float4 TextureAlpha,
+	uniform float4 HalfTexel,
+	uniform float4 STScale,
+	uniform float4 STRange,
+	uniform float4 FbMask,
+	uniform float4 HardwareBlend0,
+	uniform float4 HardwareBlend1,
+	uniform float4 ColorMask)
+{
+	// Selector0: tme/fst/tfx/tcc.
+	// Selector1: fog/atst/fba/dst_fmt.
+	// Selector2: aem/aem_fmt/ltf/rta_source_correction.
+	// Selector3: blend_a/blend_b/blend_c/blend_d.
+	// Selector4: pabe/rta_correction/colclip/fbmask.
+	// Selector5: date/no_color/blend_mix/blend_hw.
+	// Selector6: region_rect/wms/wmt/fixed_one_a.
+	// PCSX2's OGL owner carries unnormalized GL_UNSIGNED_BYTE vertex color in a
+	// generic varying. GXM COLOR0 saturates that 0..255 value, so TEXCOORD2 is
+	// deliberately used as the unrestricted interpolant instead.
+	const float4 vertexColor = vColor;
+#if !defined(VITASX2_TFX_UNTEXTURED)
+	const bool textured = Selector0.x > 0.5f;
+	const bool fixedTexture = Selector0.y > 0.5f;
+	const float safeQ = abs(vTexFloat.w) >= 1.0e-32f ? vTexFloat.w :
+		(vTexFloat.w < 0.0f ? -1.0e-32f : 1.0e-32f);
+	float2 st = fixedTexture ? vTexInt.xy : (vTexFloat.xy / safeQ);
+
+	float4 textureColor = float4(0.0f);
+	if (textured)
+	{
+		float4 sampled = SampleTexture(sourceTexture, st, Selector2.z,
+			HalfTexel, TextureSize, Selector6.x, Selector6.yz,
+			STRange, NativeTextureSize, STScale.xy, Selector2.x,
+			Selector2.y, TextureAlpha);
+		if (Selector2.y < 0.5f && Selector2.w > 0.5f)
+			sampled.a *= 128.5f / 255.0f;
+		textureColor = trunc(sampled * 255.0f + 0.05f);
+	}
+
+	float4 color;
+	const float tfx = Selector0.z;
+	if (!textured || tfx > 3.5f)
+		color = vertexColor;
+	else if (tfx < 0.5f)
+		color = trunc((vertexColor * textureColor) / 128.0f);
+	else if (tfx < 1.5f)
+		color = textureColor;
+	else if (tfx < 2.5f)
+	{
+		color.rgb = trunc((vertexColor.rgb * textureColor.rgb) / 128.0f) + vertexColor.a;
+		color.a = textureColor.a + vertexColor.a;
+	}
+	else
+	{
+		color.rgb = trunc((vertexColor.rgb * textureColor.rgb) / 128.0f) + vertexColor.a;
+		color.a = textureColor.a;
+	}
+	if (Selector0.w < 0.5f)
+		color.a = vertexColor.a;
+	if (tfx < 0.5f || (tfx > 1.5f && tfx < 3.5f))
+		color = min(color, 255.0f);
+#else
+	// TME=0 makes TFX/TCC and all sampling state architecturally irrelevant.
+	// This is the same specialization PCSX2's shader selector owns.
+	float4 color = vertexColor;
+#endif
+
+	if (Selector1.x > 0.5f)
+		color.rgb = trunc(lerp(FogColorAref.rgb, color.rgb,
+			(vTexFloat.z * 255.0f) / 256.0f));
+
+	// PCSX2 tfx_fs.glsl applies fixed coverage alpha before ATST. Moving this
+	// below ATST changes both fragment survival and the alpha value visible to
+	// blending.
+	if (Selector6.w > 0.5f)
+		color.a = 128.0f;
+
+	const float atst = Selector1.y;
+	bool alphaPass = true;
+	if (atst > 0.5f && atst < 1.5f) alphaPass = color.a <= FogColorAref.a;
+	else if (atst > 1.5f && atst < 2.5f) alphaPass = color.a >= FogColorAref.a;
+	else if (atst > 2.5f && atst < 3.5f) alphaPass = abs(color.a - FogColorAref.a) <= 0.5f;
+	else if (atst > 3.5f) alphaPass = abs(color.a - FogColorAref.a) >= 0.5f;
+	if (!alphaPass)
+		discard;
+
+#if defined(VITASX2_TFX_FAST)
+	const float4 destination = float4(0.0f);
+#else
+	const float4 destination = float4(fragColor);
+#endif
+	if (Selector5.x > 4.5f)
+	{
+		const float threshold = Selector4.y > 0.5f ? 254.5f : 127.5f;
+		const float dateMode = Selector5.x - 4.0f;
+		if ((dateMode < 1.5f && destination.a > threshold) ||
+			(dateMode > 1.5f && destination.a < threshold))
+			discard;
+	}
+
+	// PCSX2 derives the blend factor from pre-FBA source alpha.
+	float4 secondary = float4(color.a / 128.0f);
+	if (Selector1.z > 0.5f && color.a < 128.0f)
+		color.a += 128.0f;
+
+#if !defined(VITASX2_TFX_FAST)
+	const bool softwareBlend = Selector3.x > 0.5f || Selector3.y > 0.5f ||
+		Selector3.w > 0.5f;
+	if (softwareBlend)
+	{
+		if (!(Selector4.x > 0.5f && secondary.a < 1.0f))
+		{
+			if (Selector4.x > 0.5f)
+				secondary.rgb = 1.0f;
+			const float4 A = SelectGsColor(Selector3.x, color, destination);
+			const float4 B = SelectGsColor(Selector3.y, color, destination);
+			float coefficient = secondary.a;
+			if (Selector3.z > 0.5f && Selector3.z < 1.5f)
+				coefficient = Selector4.y > 0.5f ?
+					trunc(destination.a * (128.0f / 255.0f) + 0.1f) / 128.0f :
+					trunc(destination.a + 0.1f) / 128.0f;
+			else if (Selector3.z > 1.5f)
+				coefficient = TextureAlpha.w;
+			const float4 D = SelectGsColor(Selector3.w, color, destination);
+			float3 blended = (A.rgb - B.rgb) * coefficient + D.rgb;
+			if (Selector5.z < 0.5f)
+				blended = trunc(blended);
+			else if (Selector5.z < 1.5f)
+				blended -= 124.0f / 256.0f;
+			else
+				blended += 124.0f / 256.0f;
+			color.rgb = blended;
+		}
+		else
+		{
+			secondary.rgb = 0.0f;
+		}
+	}
+	else
+#endif
+	if (Selector5.w > 2.5f && Selector5.w < 3.5f &&
+		Selector4.y < 0.5f)
+	{
+		// PCSX2 tfx_fs.glsl PS_BLEND_HW=SRC_DOUBLE compensates GXM's
+		// destination-alpha /255 blend factor for the GS /128 convention.
+		const float maximum = max(max(color.r, color.g), color.b);
+		color.rgb *= 255.0f / max(128.0f, maximum);
+	}
+
+	if (Selector4.z > 0.5f)
+		color.rgb = float3((unsigned int3)color.rgb & unsigned int3(255));
+	else
+		color.rgb = saturate(color.rgb / 255.0f) * 255.0f;
+
+	// Scaled RT alpha is PCSX2's storage representation: an architectural
+	// 0..128 alpha occupies the full 8-bit host channel.
+	const float outputAlpha = Selector4.y > 0.5f ?
+		color.a * (255.0f / 128.0f) : color.a;
+#if defined(VITASX2_TFX_FAST)
+	float4 result = float4(color.rgb, outputAlpha);
+#else
+	float4 source = float4(color.rgb, outputAlpha) / 255.0f;
+	float4 result = ApplyHardwareBlend(source, destination / 255.0f,
+		secondary, HardwareBlend0, HardwareBlend1) * 255.0f;
+	result = saturate(result / 255.0f) * 255.0f;
+
+	// PCSX2's component write mask and exact per-bit GS FBMASK both preserve
+	// the ordered tile-local destination supplied through FRAGCOLOR.
+	result = lerp(destination, result, ColorMask);
+	if (Selector4.w > 0.5f)
+	{
+		const unsigned int4 sourceBits = (unsigned int4)floor(result + 0.5f);
+		const unsigned int4 destinationBits = (unsigned int4)floor(destination + 0.5f);
+		const unsigned int4 keepBits = (unsigned int4)FbMask;
+		result = float4((sourceBits & ~keepBits) | (destinationBits & keepBits));
+	}
+	if (Selector5.y > 0.5f)
+		result = destination;
+#endif
+	return (unsigned char4)result;
+}

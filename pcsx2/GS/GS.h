@@ -21,7 +21,8 @@ enum class RenderAPI
 	Metal,
 	D3D12,
 	Vulkan,
-	OpenGL
+	OpenGL,
+	GXM
 };
 
 enum class GSVideoMode : u8

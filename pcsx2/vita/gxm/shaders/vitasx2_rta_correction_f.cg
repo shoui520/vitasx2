@@ -1,0 +1,10 @@
+float4 main(
+	float2 vTexCoord : TEXCOORD0,
+	uniform sampler2D source : TEXUNIT0) : COLOR
+{
+	// PCSX2 convert.glsl::ps_rta_correction owns this conversion. Render-target
+	// alpha is stored on the Vita as A / (128.25 / 255); recovering it must not
+	// disturb RGB.
+	const float4 value = tex2D(source, vTexCoord);
+	return float4(value.rgb, value.a / (128.25f / 255.0f));
+}

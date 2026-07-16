@@ -1,0 +1,39 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owner: bin/resources/shaders/opengl/tfx_vgs.glsl::vs_main.
+// GSRendererHW has already CPU-expanded sprites for a device which does not
+// advertise vertex-shader expansion, so this is the ordinary GSVertex path.
+void main(
+	float2 aST,
+	float4 aColor,
+	float aQ,
+	float2 aPosition,
+	float aDepth,
+	float2 aUV,
+	float4 aFog,
+	uniform float4 VertexScaleOffset[2],
+	out float4 vPosition : POSITION,
+	out float4 vTexFloat : TEXCOORD0,
+	out float4 vTexInt : TEXCOORD1,
+	out float4 vColor : TEXCOORD2)
+{
+	const float2 vertexScale = VertexScaleOffset[0].xy;
+	const float2 vertexOffset = VertexScaleOffset[0].zw;
+	const float2 textureScale = VertexScaleOffset[1].xy;
+	const float2 textureOffset = VertexScaleOffset[1].zw;
+	const float2 uv = aUV - textureOffset;
+	const float2 st = aST - textureOffset;
+
+	// The 0.05 host-coordinate bias is PCSX2's rasterization contract. GXM's
+	// viewport maps -1..1 depth to 0..1, so retain the non-clip-control form of
+	// PCSX2's shader here.
+	vPosition.xy = (aPosition - float2(0.05f, 0.05f)) * vertexScale - vertexOffset;
+	vPosition.z = aDepth * (2.0f / 4294967296.0f) - 1.0f;
+	vPosition.w = 1.0f;
+
+	vTexFloat = float4(st.x, st.y, aFog.x, aQ);
+	vTexInt.xy = uv * textureScale;
+	vTexInt.zw = uv;
+	vColor = aColor;
+}

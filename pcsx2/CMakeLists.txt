@@ -60,8 +60,17 @@ add_library(pcsx2core STATIC
 	GS/GSUtil.cpp
 	GS/GSVector.cpp
 	GS/GSXXH.cpp
+	GS/Renderers/Common/GSDevice.cpp
+	GS/Renderers/Common/GSDirtyRect.cpp
+	GS/Renderers/Common/GSFunctionMap.cpp
+	GS/Renderers/Common/GSRenderer.cpp
+	GS/Renderers/Common/GSTexture.cpp
 	GS/Renderers/Common/GSVertexTrace.cpp
 	GS/Renderers/Common/GSVertexTraceFMM.cpp
+	GS/Renderers/HW/GSHwHack.cpp
+	GS/Renderers/HW/GSRendererHW.cpp
+	GS/Renderers/HW/GSRendererHWMultiISA.cpp
+	GS/Renderers/HW/GSTextureCache.cpp
 	GS/Renderers/SW/GSDrawScanline.cpp
 	GS/Renderers/SW/GSRasterizer.cpp
 	GS/Renderers/SW/GSRendererSW.cpp
@@ -167,11 +176,16 @@ add_library(pcsx2core STATIC
 	vita/VitaEeBlockCompiler.cpp
 	vita/VitaEeExecutor.cpp
 	vita/VitaIopBlockCompiler.cpp
+	vita/GSDeviceGXM.cpp
+	vita/VitaGxmArena.cpp
 	vita/VitaGxmGsState.cpp
 	vita/VitaGxmDisplay.cpp
 	vita/VitaGxmMemory.cpp
+	vita/VitaGxmTexture.cpp
 	vita/VitaGsMailbox.cpp
 	vita/VitaGsDiagnosticsDisabled.cpp
+	vita/VitaGsRuntime.cpp
+	vita/VitaGsTextureReplacements.cpp
 	vita/VitaGsMemory.cpp
 	vita/VitaGsMemory.h
 	vita/VitaHostSurface.cpp
@@ -275,7 +289,7 @@ else()
 			COMMAND "${VITASX2_PSP2BIN}" "${shader_gxp}"
 				-b2e "PSP2,_binary_${shader_name}_gxp_start,_binary_${shader_name}_gxp_size,4,_binary_${shader_name}_gxp_end"
 				-o "${shader_object}"
-			DEPENDS "${shader_source}"
+			DEPENDS "${shader_source}" ${ARGN}
 			VERBATIM)
 		set_source_files_properties("${shader_object}" PROPERTIES
 			GENERATED TRUE EXTERNAL_OBJECT TRUE)
@@ -289,8 +303,16 @@ else()
 	vitasx2_add_gxm_shader(vitasx2_present_f sce_fp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_merge_f sce_fp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_copy_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_rta_correction_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_rta_decorrection_f sce_fp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_mad_buffer_f sce_fp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_mad_reconstruct_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_tfx_v sce_vp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_tfx_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_tfx_fast_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	vitasx2_add_gxm_shader(vitasx2_tfx_untextured_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	# INTERFACE object sources are direct final-link inputs, but CMake does not
 	# retain their generation edge. Give the outputs an owner and pass them to
 	# final executables because GNU ar does not index psp2bin's slot-zero symbol.

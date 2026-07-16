@@ -1,0 +1,9 @@
+float4 main(
+	float2 vTexCoord : TEXCOORD0,
+	uniform sampler2D source : TEXUNIT0) : COLOR
+{
+	// PCSX2 convert.glsl::ps_rta_decorrection owns this conversion. Preserve
+	// RGB and return alpha to the representation used by scaled render targets.
+	const float4 value = tex2D(source, vTexCoord);
+	return float4(value.rgb, value.a * (128.25f / 255.0f));
+}

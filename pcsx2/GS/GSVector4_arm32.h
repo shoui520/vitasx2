@@ -524,12 +524,15 @@ public:
 
 	__forceinline static void storel(void* p, const GSVector4& v)
 	{
-		vst1_u64(static_cast<u64*>(p), vget_low_u64(vreinterpretq_u64_f32(v.v4s)));
+		// PCSX2's storel contract permits the naturally 32-bit-aligned fields in
+		// GSVertex (notably ST.U64). A u64 pointer makes GCC add a :64 alignment
+		// qualifier, which data-aborts on Cortex-A9 when the field is 4 mod 8.
+		vst1_f32(static_cast<float*>(p), vget_low_f32(v.v4s));
 	}
 
 	__forceinline static void storeh(void* p, const GSVector4& v)
 	{
-		vst1_u64(static_cast<u64*>(p), vget_high_u64(vreinterpretq_u64_f32(v.v4s)));
+		vst1_f32(static_cast<float*>(p), vget_high_f32(v.v4s));
 	}
 
 	template <bool aligned>

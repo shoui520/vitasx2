@@ -1,28 +1,42 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#if !defined(VITASX2_VITA)
 #include "ImGui/FullscreenUI.h"
 #include "ImGui/ImGuiManager.h"
+#endif
 #include "GS/Renderers/Common/GSRenderer.h"
 #include "GS/GSCapture.h"
+#if !defined(VITASX2_VITA)
 #include "GS/GSDump.h"
+#endif
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
+#if !defined(VITASX2_VITA)
 #include "GSDumpReplayer.h"
+#endif
 #include "Host.h"
 #include "PerformanceMetrics.h"
 #include "pcsx2/Config.h"
 #include "VMManager.h"
 
 #include "common/FileSystem.h"
+#include "common/Console.h"
+#if !defined(VITASX2_VITA)
 #include "common/Image.h"
+#endif
 #include "common/Path.h"
 #include "common/StringUtil.h"
 #include "common/Timer.h"
 
 #include "fmt/format.h"
+#if !defined(VITASX2_VITA)
 #include "IconsFontAwesome.h"
+#else
+static constexpr const char* ICON_FA_CAMERA = "";
+static constexpr const char* ICON_FA_TRIANGLE_EXCLAMATION = "";
+#endif
 
 #include <algorithm>
 #include <array>
@@ -38,8 +52,10 @@ static constexpr std::array<PresentShader, 8> s_tv_shader_indices = {
 	PresentShader::COMPLEX_FILTER, PresentShader::LOTTES_FILTER,
 	PresentShader::SUPERSAMPLE_4xRGSS, PresentShader::SUPERSAMPLE_AUTO};
 
+#if !defined(VITASX2_VITA)
 static std::deque<std::thread> s_screenshot_threads;
 static std::mutex s_screenshot_threads_mutex;
+#endif
 
 std::unique_ptr<GSRenderer> g_gs_renderer;
 
@@ -454,6 +470,7 @@ static GSVector4i CalculateDrawSrcRect(const GSTexture* src, const GSVector2i re
 	return GSVector4i(left, top, right, bottom);
 }
 
+#if !defined(VITASX2_VITA)
 static const char* GetScreenshotSuffix()
 {
 	static constexpr const char* suffixes[static_cast<u8>(GSScreenshotFormat::Count)] = {
@@ -521,6 +538,11 @@ void GSJoinSnapshotThreads()
 		lock.lock();
 	}
 }
+#else
+void GSJoinSnapshotThreads()
+{
+}
+#endif
 
 bool GSRenderer::BeginPresentFrame(bool frame_skip)
 {
@@ -531,7 +553,9 @@ bool GSRenderer::BeginPresentFrame(bool frame_skip)
 	{
 		// If we're skipping a frame, we need to reset imgui's state, since
 		// we won't be calling EndPresentFrame().
+#if !defined(VITASX2_VITA)
 		ImGuiManager::SkipFrame();
+#endif
 		return false;
 	}
 	else if (res == GSDevice::PresentResult::OK)
@@ -551,6 +575,13 @@ bool GSRenderer::BeginPresentFrame(bool frame_skip)
 	}
 	s_last_gpu_reset_time = current_time;
 
+#if defined(VITASX2_VITA)
+	// A live libGXM context cannot be reconstructed through PCSX2's desktop
+	// window/device reopen path. Fail this frame closed; the product lifecycle
+	// tears the renderer down in owner order on the GS worker.
+	Console.Error("Vita GXM device reported a fatal presentation failure.");
+	return false;
+#else
 	// Device lost, something went really bad.
 	// Let's just toss out everything, and try to hobble on.
 	if (!GSreopen(true, false, GSGetCurrentRenderer(), std::nullopt))
@@ -564,10 +595,12 @@ bool GSRenderer::BeginPresentFrame(bool frame_skip)
 		TRANSLATE_SV("GS", "Host GPU device encountered an error and was recovered. This may have broken rendering."),
 		Host::OSD_CRITICAL_ERROR_DURATION);
 	return false;
+#endif
 }
 
 void GSRenderer::EndPresentFrame()
 {
+#if !defined(VITASX2_VITA)
 	if (GSDumpReplayer::IsReplayingDump())
 		GSDumpReplayer::RenderUI();
 
@@ -575,10 +608,16 @@ void GSRenderer::EndPresentFrame()
 	ImGuiManager::RenderOSD();
 	g_gs_device->EndPresent();
 	ImGuiManager::NewFrame();
+#else
+	// Vita has no desktop UI compositor. The GXM device owns the complete
+	// display-queue submission at this seam.
+	g_gs_device->EndPresent();
+#endif
 }
 
 void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 {
+#if !defined(VITASX2_VITA)
 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
 	{
 		if (GSConfig.SaveInfo)
@@ -598,6 +637,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			m_perfmon_frame = g_perfmon;
 		}
 	}
+#endif
 
 	const int fb_sprite_blits = g_perfmon.GetDisplayFramebufferSpriteBlits();
 	const bool fb_sprite_frame = (fb_sprite_blits > 0);
@@ -708,6 +748,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		PerformanceMetrics::Update(registers_written, fb_sprite_frame, false);
 	}
 
+#if !defined(VITASX2_VITA)
 	// snapshot
 	if (!m_snapshot.empty())
 	{
@@ -844,10 +885,16 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 
 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()) && GSConfig.SaveTransferImages)
 		DumpTransferImages();
+#endif
 }
 
 void GSRenderer::QueueSnapshot(const std::string& path, const u32 gsdump_frames)
 {
+#if defined(VITASX2_VITA)
+	(void)path;
+	(void)gsdump_frames;
+	return;
+#else
 	if (!m_snapshot.empty())
 		return;
 
@@ -859,6 +906,7 @@ void GSRenderer::QueueSnapshot(const std::string& path, const u32 gsdump_frames)
 
 	// this is really gross, but wx we get the snapshot request after shift...
 	m_dump_frames = gsdump_frames;
+#endif
 }
 
 static std::string GSGetBaseFilename()

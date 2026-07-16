@@ -11,6 +11,7 @@
 #include "MTGS.h"
 #include "MTVU.h"
 #include "PerformanceMetrics.h"
+#include "VMManager.h"
 #include "common/Assertions.h"
 #include "common/Console.h"
 #include "common/Error.h"
@@ -19,6 +20,10 @@
 #include "common/WrappedMemCopy.h"
 #include "vita/VitaGxmGsState.h"
 #include "vita/VitaGsMailbox.h"
+#if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
+#include "GS/Renderers/HW/GSTextureReplacements.h"
+#include "vita/GSDeviceGXM.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -31,16 +36,22 @@ Pcsx2Config::GSOptions GSConfig;
 
 GSRendererType GSGetCurrentRenderer()
 {
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 	return GSRendererType::SW;
+#else
+	// Vita has one hardware backend. Auto is the existing PCSX2 renderer value
+	// which selects GSRendererHW; the actual API is RenderAPI::GXM.
+	return GSRendererType::Auto;
+#endif
 }
 
 bool GSIsHardwareRenderer()
 {
-	// This predicate selects PCSX2 hardware texture-cache, transfer, reset and
-	// PCRTC semantics; it is not an accelerator-presence bit. VitaGxmGsState
-	// still owns canonical GSLocalMemory like the software path, so reporting
-	// hardware here would enter unported GSRendererHW mechanisms.
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 	return false;
+#else
+	return true;
+#endif
 }
 
 namespace MTGS
@@ -105,7 +116,12 @@ namespace MTGS
 	static std::atomic_bool s_open_flag{false};
 	static std::atomic_bool s_shutdown_flag{false};
 	static bool s_native_presenter_enabled = false;
-	static std::unique_ptr<VitaGxmGsState> s_gs;
+	// On Vita g_gs_renderer owns this instance, matching PCSX2 GS.cpp. QEMU's
+	// software-only GSState keeps its existing mailbox-local owner instead.
+	static VitaGxmGsState* s_gs = nullptr;
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+	static std::unique_ptr<VitaGxmGsState> s_qemu_gs;
+#endif
 
 #if defined(__vita__)
 	struct HardwareVsyncProfile
@@ -185,28 +201,83 @@ namespace MTGS
 		}
 	}
 
+	static void CloseGsOnWorker()
+	{
+		// PCSX2 owners: GS.cpp::CloseGSRenderer() and CloseGSDevice(). The
+		// texture cache must release every device object while GXM is still live.
+		s_gs = nullptr;
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+		s_qemu_gs.reset();
+#else
+		GSTextureReplacements::Shutdown();
+		if (g_gs_renderer)
+		{
+			g_gs_renderer->Destroy();
+			g_gs_renderer.reset();
+		}
+		if (g_gs_device)
+		{
+			g_gs_device->Destroy();
+			g_gs_device.reset();
+		}
+#endif
+	}
+
 	static bool OpenGsOnWorker()
 	{
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+		pxAssert(!s_qemu_gs && !s_gs);
+#else
+		pxAssert(!g_gs_renderer && !g_gs_device && !s_gs);
+#endif
 		GSConfig = EmuConfig.GS;
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 		GSConfig.Renderer = GSRendererType::SW;
-		GSConfig.UserHacks_GPUTargetCLUTMode = GSGPUTargetCLUTMode::Disabled;
-		// Keep one PCSX2 SW raster worker on the third documented application
-		// core. EE owns USER_0 and MTGS owns USER_1; a second raster worker would
-		// oversubscribe those cores and may escape to CapUnlocker's CPU3.
-		GSConfig.SWExtraThreads = 1;
+		GSConfig.SWExtraThreads = 0;
+#else
+		GSConfig.Renderer = GSRendererType::Auto;
+		GSConfig.UpscaleMultiplier = 1.0f;
+		GSConfig.DumpReplaceableTextures = false;
+		GSConfig.LoadTextureReplacements = false;
+#endif
 
 		// PCSX2 owner: GS/GS.cpp::OpenGSRenderer(). The software vertex
 		// conversion table is process-global and must be populated before the
-		// first decoded draw, even though Vita supplies its own presenter.
+		// first decoded draw, including GSRendererHW's owned CPU fallbacks.
 		GSVertexSW::InitStatic();
-		s_gs = std::make_unique<VitaGxmGsState>(s_native_presenter_enabled);
-		if (s_native_presenter_enabled && !s_gs->IsNativePresenterReady())
+
+#if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
+		// PCSX2 owner: GS.cpp::OpenGSDevice(). GSDeviceGXM owns the process's
+		// only immediate GXM context and must precede GSRendererHW/GSTextureCache.
+		g_gs_device = std::make_unique<GSDeviceGXM>();
+		if (!g_gs_device->Create(VMManager::GetEffectiveVSyncMode(),
+			VMManager::ShouldAllowPresentThrottle()))
 		{
-			s_gs.reset();
+			g_gs_device->Destroy();
+			g_gs_device.reset();
 			return false;
 		}
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+		s_qemu_gs = std::make_unique<VitaGxmGsState>(false);
+		s_gs = s_qemu_gs.get();
+#else
+		auto renderer = std::make_unique<VitaGxmGsState>(
+			s_native_presenter_enabled);
+		s_gs = renderer.get();
+		g_gs_renderer = std::move(renderer);
+		if (!s_gs->IsNativePresenterReady())
+		{
+			CloseGsOnWorker();
+			return false;
+		}
+#endif
 		s_gs->SetRegsMem(s_ring.regs);
 		s_gs->ResetPCRTC();
+#if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
+		s_gs->UpdateRenderFixes();
+#endif
 		// PCSX2 owner: GS/GS.cpp::OpenGSRenderer(). Construction establishes
 		// GSState; the MTGS::ResetGS() caller applies the requested hardware or
 		// soft reset. Repeating a hardware reset here was both redundant and
@@ -233,21 +304,23 @@ namespace MTGS
 			s_gs->m_regs->DISP[0].DISPFB, s_gs->m_regs->DISP[1].DISPFB);
 		s_gs->Flush(GSState::VSYNC);
 		const bool idle_frame = s_gs->IsIdleFrame();
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 		const bool framebuffer_sprite_frame =
 			g_perfmon.GetDisplayFramebufferSpriteBlits() > 0;
 		s_gs->VSync(field);
-#if defined(__vita__)
-		RecordHardwareVsyncProfile(s_worker_profile, "worker");
-#endif
 		g_perfmon.EndFrame(idle_frame);
 		if ((g_perfmon.GetFrame() & 0x1f) == 0)
 			g_perfmon.Update();
-		// PCSX2 GSRenderer::VSync() publishes the frame after presentation.
-		// The Vita presenter owns that stage directly, so retain the same
-		// privileged-register and framebuffer-blit inputs here instead of leaving
-		// the product FPS counter permanently at zero.
 		PerformanceMetrics::Update(registers_written,
 			framebuffer_sprite_frame, false);
+#else
+		// PCSX2 owner: GS.cpp::GSvsync(). GSRendererHW::VSync() owns texture-cache
+		// aging, PCRTC merge, presentation, perfmon and frame metrics.
+		s_gs->VSync(field, registers_written, idle_frame);
+#endif
+#if defined(__vita__)
+		RecordHardwareVsyncProfile(s_worker_profile, "worker");
+#endif
 		// PCSX2 owner: GS.cpp::GSvsync() snapshots after Flush() and VSync().
 		s_gs->TraceGsStateSnapshot(Pcsx2Trace::GsTraceStateTriggerVSyncStart);
 	}
@@ -279,7 +352,7 @@ namespace MTGS
 			MainLoop();
 			pxAssertRel(!s_open_flag.load(std::memory_order_relaxed),
 				"GS worker returned while still open");
-			s_gs.reset();
+			CloseGsOnWorker();
 			// MainLoop kills WorkSema to release any waiter. Reset it before the
 			// close acknowledgement so an immediate reopen cannot lose its wakeup.
 			s_work_sema.Reset();
@@ -452,7 +525,13 @@ namespace MTGS
 						else if (mode == FreezeAction::Size)
 							data->retval = s_gs->Freeze(data->fdata, true);
 						else
+						{
+							// PCSX2 owner: GS.cpp::GSfreeze(). Defrost replaces GS local
+							// state, so no cached render target may survive it.
+							if (g_gs_device)
+								g_gs_device->ClearCurrent();
 							data->retval = s_gs->Defrost(data->fdata);
+						}
 						break;
 					}
 
@@ -635,7 +714,15 @@ namespace MTGS
 			return;
 		RunOnGSThread([]() {
 			if (s_gs)
+			{
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 				s_gs->Present();
+#else
+				// PCSX2 owner: GSRenderer::PresentCurrentFrame(). Reuse the
+				// completed merge texture; do not replay GS work.
+				s_gs->PresentCurrentFrame();
+#endif
+			}
 		});
 	}
 
@@ -825,8 +912,15 @@ namespace MTGS
 	void ApplySettings()
 	{
 		Pcsx2Config::GSOptions options = EmuConfig.GS;
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 		options.Renderer = GSRendererType::SW;
 		options.UserHacks_GPUTargetCLUTMode = GSGPUTargetCLUTMode::Disabled;
+#else
+		options.Renderer = GSRendererType::Auto;
+		options.UpscaleMultiplier = 1.0f;
+		options.DumpReplaceableTextures = false;
+		options.LoadTextureReplacements = false;
+#endif
 		RunOnGSThread([options = std::move(options)]() {
 			Pcsx2Config::GSOptions old_options = std::move(GSConfig);
 			GSConfig = options;
@@ -837,23 +931,38 @@ namespace MTGS
 
 	void ResizeDisplayWindow(u32 width, u32 height, float scale)
 	{
-		(void)width;
-		(void)height;
-		(void)scale;
+		if (!IsOpen())
+			return;
+		RunOnGSThread([width, height, scale]() {
+			if (g_gs_device)
+				g_gs_device->ResizeWindow(width, height, scale);
+		});
 	}
 
 	void UpdateDisplayWindow()
 	{
+		if (!IsOpen())
+			return;
+		RunOnGSThread([]() {
+			if (g_gs_device && !g_gs_device->UpdateWindow())
+				Console.Error("Vita GXM display-window update failed.");
+		});
 	}
 
 	void SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle)
 	{
-		(void)mode;
-		(void)allow_present_throttle;
+		if (!IsOpen())
+			return;
+		RunOnGSThread([mode, allow_present_throttle]() {
+			if (g_gs_device)
+				g_gs_device->SetVSyncMode(mode, allow_present_throttle);
+		});
 	}
 
 	void UpdateVSyncMode()
 	{
+		SetVSyncMode(VMManager::GetEffectiveVSyncMode(),
+			VMManager::ShouldAllowPresentThrottle());
 	}
 
 	void SetSoftwareRendering(bool software, GSInterlaceMode interlace,
@@ -882,8 +991,9 @@ namespace MTGS
 
 void VitaGS::SetNativePresenterEnabled(bool enabled)
 {
-	// The GS owner must be selected before VMManager opens it. Changing GXM
-	// process ownership while a GSState is live would violate libgxm teardown.
+	// Product/QEMU setup fixes this contract before VMManager opens the GS. The
+	// Vita product always uses GSRendererHW/GSDeviceGXM; the flag remains the
+	// boundary for hardware-only flow profiling and validation entry points.
 	pxAssertRel(!MTGS::IsOpen(),
 		"native GS presenter selection changed while open");
 	MTGS::s_native_presenter_enabled = enabled;
@@ -896,9 +1006,9 @@ bool VitaGS::IsNativePresenterEnabled()
 
 bool GSValidatePortableState()
 {
-	// PCSX2 owner: GS/GS.cpp::GSValidatePortableState(). The Vita mailbox owns
-	// the live canonical GSState instance instead of g_gs_renderer. Query it on
-	// the worker so its GS/GXM ownership never migrates back to the EE thread.
+	// PCSX2 owner: GS/GS.cpp::GSValidatePortableState(). Query the mailbox's
+	// typed live renderer on its worker so GS/GXM ownership never migrates back
+	// to the EE thread (QEMU deliberately has no g_gs_renderer).
 	if (!MTGS::WaitForOpen())
 		return false;
 	bool valid = false;
