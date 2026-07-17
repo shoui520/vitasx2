@@ -1,0 +1,9 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owner: tfx_fs.glsl::sample_c and its compile-time PSSelector axes.
+// Source-only blending and the direct FMT_32 sampler-owned family are both
+// proven by GSDeviceGXM before selecting this offline specialization.
+#define VITASX2_TFX_SOURCE_ONLY 1
+#define VITASX2_TFX_DIRECT_TEXTURE 1
+#include "vitasx2_tfx_f.cg"

@@ -181,7 +181,11 @@ __nativecolor __regformat unsigned char4 main(
 	// deliberately used as the unrestricted interpolant instead.
 	const float4 vertexColor = vColor;
 #if !defined(VITASX2_TFX_UNTEXTURED)
+#if defined(VITASX2_TFX_DIRECT_TEXTURE)
+	const bool textured = true;
+#else
 	const bool textured = Selector0.x > 0.5f;
+#endif
 	const bool fixedTexture = Selector0.y > 0.5f;
 	const float safeQ = abs(vTexFloat.w) >= 1.0e-32f ? vTexFloat.w :
 		(vTexFloat.w < 0.0f ? -1.0e-32f : 1.0e-32f);
@@ -190,11 +194,23 @@ __nativecolor __regformat unsigned char4 main(
 	float4 textureColor = float4(0.0f);
 	if (textured)
 	{
+#if defined(VITASX2_TFX_DIRECT_TEXTURE)
+		// PCSX2 tfx_fs.glsl::sample_c specializes this exact selector family:
+		// sampler-owned filtering, FMT_32 alpha, and no target-region remap
+		// collapse to one ordinary texture lookup. The C++ route proves those
+		// facts.
+		float4 sampled = tex2D(sourceTexture, st * STScale.xy);
+#else
 		float4 sampled = SampleTexture(sourceTexture, st, Selector2.z,
 			HalfTexel, TextureSize, Selector6.x, Selector6.yz,
 			STRange, NativeTextureSize, STScale.xy, Selector2.x,
 			Selector2.y, TextureAlpha);
+#endif
+#if defined(VITASX2_TFX_DIRECT_TEXTURE)
+		if (Selector2.w > 0.5f)
+#else
 		if (Selector2.y < 0.5f && Selector2.w > 0.5f)
+#endif
 			sampled.a *= 128.5f / 255.0f;
 		textureColor = trunc(sampled * 255.0f + 0.05f);
 	}
@@ -250,7 +266,6 @@ __nativecolor __regformat unsigned char4 main(
 	const float4 destination = float4(0.0f);
 #else
 	const float4 destination = float4(fragColor);
-#endif
 	if (Selector5.x > 4.5f)
 	{
 		const float threshold = Selector4.y > 0.5f ? 254.5f : 127.5f;
@@ -259,13 +274,34 @@ __nativecolor __regformat unsigned char4 main(
 			(dateMode > 1.5f && destination.a < threshold))
 			discard;
 	}
+#endif
 
 	// PCSX2 derives the blend factor from pre-FBA source alpha.
 	float4 secondary = float4(color.a / 128.0f);
 	if (Selector1.z > 0.5f && color.a < 128.0f)
 		color.a += 128.0f;
 
-#if !defined(VITASX2_TFX_FAST) || defined(VITASX2_TFX_SOURCE_ONLY)
+#if defined(VITASX2_TFX_SOURCE_ONLY)
+	// CanUseSourceOnlyTfx() mirrors PCSX2's SW_BLEND_NEEDS_RT proof. A/B/D
+	// therefore select only Cs or zero, C selects only As or FIX, PABE is off,
+	// and software blending is known active. Keeping the impossible Cd/Ad/PABE
+	// branches in an offline uber-shader made SGX543 execute much more work for
+	// every covered pixel.
+	const float4 A = Selector3.x < 0.5f ? color : float4(0.0f);
+	const float4 B = Selector3.y < 0.5f ? color : float4(0.0f);
+	const float coefficient = Selector3.z < 0.5f ?
+		secondary.a : TextureAlpha.w;
+	const float4 D = Selector3.w < 0.5f ? color : float4(0.0f);
+	float3 blended = (A.rgb - B.rgb) * coefficient + D.rgb;
+	if (Selector5.z < 0.5f)
+		blended = trunc(blended);
+	else if (Selector5.z < 1.5f)
+		blended -= 124.0f / 256.0f;
+	else
+		blended += 124.0f / 256.0f;
+	color.rgb = blended;
+#else
+#if !defined(VITASX2_TFX_FAST)
 	const bool softwareBlend = Selector3.x > 0.5f || Selector3.y > 0.5f ||
 		Selector3.w > 0.5f;
 	if (softwareBlend)
@@ -308,6 +344,7 @@ __nativecolor __regformat unsigned char4 main(
 		const float maximum = max(max(color.r, color.g), color.b);
 		color.rgb *= 255.0f / max(128.0f, maximum);
 	}
+#endif
 
 	if (Selector4.z > 0.5f)
 		color.rgb = float3((unsigned int3)color.rgb & unsigned int3(255));
