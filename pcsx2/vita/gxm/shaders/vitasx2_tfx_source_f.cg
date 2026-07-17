@@ -1,0 +1,10 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2's SW_BLEND_NEEDS_RT predicate proves that this software blend reads
+// only Cs, As, and Af. Keep its exact GS /128 arithmetic in the fragment
+// shader, but do not request GXM FRAGCOLOR for a destination the equation
+// cannot observe. GSDeviceGXM patches PCSX2's remaining hardware blend and
+// component mask into the fragment program.
+#define VITASX2_TFX_SOURCE_ONLY 1
+#include "vitasx2_tfx_f.cg"

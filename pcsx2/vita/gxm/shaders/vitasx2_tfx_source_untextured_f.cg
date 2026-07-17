@@ -1,0 +1,9 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// Source-only software blending and TME=0 are independent PCSX2 shader
+// selector facts. Combining them removes both FRAGCOLOR and dead sampling
+// work without changing the shared alpha, fog, blend, clamp, or RTA math.
+#define VITASX2_TFX_SOURCE_ONLY 1
+#define VITASX2_TFX_UNTEXTURED 1
+#include "vitasx2_tfx_f.cg"

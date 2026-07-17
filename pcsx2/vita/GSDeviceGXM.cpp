@@ -47,6 +47,8 @@ extern "C"
 	extern const SceGxmProgram _binary_vitasx2_tfx_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_fast_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_untextured_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_source_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_source_untextured_f_gxp_start;
 }
 
 namespace
@@ -58,7 +60,7 @@ namespace
 	constexpr u32 GEOMETRY_INDEX_BYTES = 512 * 1024;
 	constexpr u32 MAX_STAGED_INDICES = 65532;
 	constexpr u32 MAX_RENDER_TARGETS = 48;
-	constexpr size_t MAX_TFX_FAST_PROGRAMS = 128;
+	constexpr size_t MAX_TFX_PATCHED_PROGRAMS = 128;
 
 	struct TfxVertex
 	{
@@ -162,6 +164,24 @@ namespace
 		return true;
 	}
 
+	bool CanPatchTfxBlend(const GSHWDrawConfig& config)
+	{
+		const GSHWDrawConfig::ColorMaskSelector mask(
+			config.ps.no_color ? 0 : config.colormask.wrgba);
+		if (!config.blend.IsEffective(mask) || !config.blend.enable)
+			return true;
+		if (config.blend.constant_enable ||
+			config.blend.op > GSDevice::OP_REV_SUBTRACT)
+		{
+			return false;
+		}
+		SceGxmBlendFactor ignored{};
+		return TranslateBlendFactor(config.blend.src_factor, &ignored) &&
+			TranslateBlendFactor(config.blend.dst_factor, &ignored) &&
+			TranslateBlendFactor(config.blend.src_factor_alpha, &ignored) &&
+			TranslateBlendFactor(config.blend.dst_factor_alpha, &ignored);
+	}
+
 	void SetQuadVertex(QuadVertex& vertex, float x, float y, u32 color,
 		float u, float v)
 	{
@@ -248,6 +268,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmShaderPatcherId tfx_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_fast_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_untextured_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_source_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_source_untextured_fragment_id = nullptr;
 	SceGxmShaderPatcherId present_vertex_id = nullptr;
 	SceGxmShaderPatcherId present_fragment_id = nullptr;
 	SceGxmShaderPatcherId merge_fragment_id = nullptr;
@@ -276,9 +298,13 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	ProgramUniforms uniforms;
 	ProgramUniforms fast_uniforms;
 	ProgramUniforms untextured_uniforms;
+	ProgramUniforms source_uniforms;
+	ProgramUniforms source_untextured_uniforms;
 	std::map<u64, SceGxmFragmentProgram*> tfx_fast_programs;
 	std::map<u64, SceGxmFragmentProgram*> tfx_untextured_programs;
-	bool tfx_fast_program_limit_logged = false;
+	std::map<u64, SceGxmFragmentProgram*> tfx_source_programs;
+	std::map<u64, SceGxmFragmentProgram*> tfx_source_untextured_programs;
+	bool tfx_patched_program_limit_logged = false;
 
 	std::map<std::pair<int, int>, std::unique_ptr<VitaGXM::GSTextureGXM>> feedback_textures;
 	std::map<std::tuple<int, int, GSTexture::Format>, std::unique_ptr<VitaGXM::GSTextureGXM>> post_textures;
@@ -306,6 +332,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 		bool exact_depth);
 	bool DrawMaskRect(const GSVector4i& rect, u32 width, u32 height,
 		SceGxmStencilFunc operation);
+	bool HasGeometryCapacity(u32 vertices, u32 indices) const;
 	bool ReserveGeometry(u32 vertices, u32 indices, void** vertex_data,
 		u16** index_data);
 	bool DrawQuad(VitaGXM::GSTextureGXM* source, const GSVector4& source_rect,
@@ -315,13 +342,16 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool StageAndDraw(const GSHWDrawConfig& config,
 		const GSHWDrawConfig::PSSelector& ps, u32 first_index, u32 index_count,
 		VitaGXM::GSTextureGXM* source, SceGxmFragmentProgram* fragment,
-		bool fast_fragment, bool untextured_fragment);
+		bool fast_fragment, bool source_only_fragment,
+		bool untextured_fragment);
 	bool UploadTfxUniforms(const GSHWDrawConfig& config,
 		const GSHWDrawConfig::PSSelector& ps, VitaGXM::GSTextureGXM* source,
-		bool fast_fragment, bool untextured_fragment);
-	bool CanUseFastTfx(const GSHWDrawConfig& config) const;
-	SceGxmFragmentProgram* GetFastTfxProgram(const GSHWDrawConfig& config,
+		bool fast_fragment, bool source_only_fragment,
 		bool untextured_fragment);
+	bool CanUseFastTfx(const GSHWDrawConfig& config) const;
+	bool CanUseSourceOnlyTfx(const GSHWDrawConfig& config) const;
+	SceGxmFragmentProgram* GetPatchedTfxProgram(const GSHWDrawConfig& config,
+		bool source_only_fragment, bool untextured_fragment);
 	VitaGXM::GSTextureGXM* SnapshotTexture(VitaGXM::GSTextureGXM& source,
 		const GSVector4i& area);
 
@@ -540,6 +570,10 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		&_binary_vitasx2_tfx_fast_f_gxp_start;
 	const SceGxmProgram* const tfx_untextured_f =
 		&_binary_vitasx2_tfx_untextured_f_gxp_start;
+	const SceGxmProgram* const tfx_source_f =
+		&_binary_vitasx2_tfx_source_f_gxp_start;
+	const SceGxmProgram* const tfx_source_untextured_f =
+		&_binary_vitasx2_tfx_source_untextured_f_gxp_start;
 	const SceGxmProgram* const present_v = &_binary_vitasx2_present_v_gxp_start;
 	const SceGxmProgram* const present_f = &_binary_vitasx2_present_f_gxp_start;
 	const SceGxmProgram* const merge_f = &_binary_vitasx2_merge_f_gxp_start;
@@ -555,7 +589,7 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 	const SceGxmProgram* const mad_reconstruct_f =
 		&_binary_vitasx2_mad_reconstruct_f_gxp_start;
 	for (const SceGxmProgram* program : {tfx_v, tfx_f, tfx_fast_f,
-		tfx_untextured_f,
+		tfx_untextured_f, tfx_source_f, tfx_source_untextured_f,
 		present_v, present_f,
 		merge_f, copy_f, rta_correction_f, rta_decorrection_f, color_v,
 		color_f, mad_buffer_f, mad_reconstruct_f})
@@ -576,6 +610,11 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 			"register fast TFX fragment program") ||
 		!register_program(tfx_untextured_f, &tfx_untextured_fragment_id,
 			"register untextured TFX fragment program") ||
+		!register_program(tfx_source_f, &tfx_source_fragment_id,
+			"register source-only TFX fragment program") ||
+		!register_program(tfx_source_untextured_f,
+			&tfx_source_untextured_fragment_id,
+			"register source-only untextured TFX fragment program") ||
 		!register_program(present_v, &present_vertex_id, "register present vertex program") ||
 		!register_program(present_f, &present_fragment_id, "register present fragment program") ||
 		!register_program(merge_f, &merge_fragment_id, "register merge fragment program") ||
@@ -610,22 +649,39 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		"Selector5", "Selector6"};
 	uniforms.vertex_scale_offset = parameter(tfx_v, "VertexScaleOffset",
 		SCE_GXM_PARAMETER_CATEGORY_UNIFORM);
+	const auto find_uniform = [](const SceGxmProgram* program,
+		const char* name) {
+		const SceGxmProgramParameter* value =
+			sceGxmProgramFindParameterByName(program, name);
+		return (value && sceGxmProgramParameterGetCategory(value) ==
+			SCE_GXM_PARAMETER_CATEGORY_UNIFORM) ? value : nullptr;
+	};
+	const auto load_variant_uniforms = [&find_uniform, &selector_names](
+		const SceGxmProgram* program, ProgramUniforms* destination) {
+		for (u32 i = 0; i < selector_names.size(); i++)
+			destination->selector[i] = find_uniform(program, selector_names[i]);
+		destination->fog_color_aref = find_uniform(program, "FogColorAref");
+		destination->texture_size = find_uniform(program, "TextureSize");
+		destination->native_texture_size = find_uniform(program, "NativeTextureSize");
+		destination->texture_alpha = find_uniform(program, "TextureAlpha");
+		destination->half_texel = find_uniform(program, "HalfTexel");
+		destination->st_scale = find_uniform(program, "STScale");
+		destination->st_range = find_uniform(program, "STRange");
+		destination->fb_mask = find_uniform(program, "FbMask");
+		destination->hardware_blend[0] = find_uniform(program, "HardwareBlend0");
+		destination->hardware_blend[1] = find_uniform(program, "HardwareBlend1");
+		destination->color_mask = find_uniform(program, "ColorMask");
+	};
 	for (u32 i = 0; i < selector_names.size(); i++)
 	{
 		uniforms.selector[i] = parameter(tfx_f, selector_names[i],
 			SCE_GXM_PARAMETER_CATEGORY_UNIFORM);
-		const SceGxmProgramParameter* fast_parameter =
-			sceGxmProgramFindParameterByName(tfx_fast_f, selector_names[i]);
-		fast_uniforms.selector[i] = (fast_parameter &&
-			sceGxmProgramParameterGetCategory(fast_parameter) ==
-				SCE_GXM_PARAMETER_CATEGORY_UNIFORM) ? fast_parameter : nullptr;
-		const SceGxmProgramParameter* untextured_parameter =
-			sceGxmProgramFindParameterByName(tfx_untextured_f,
-				selector_names[i]);
-		untextured_uniforms.selector[i] = (untextured_parameter &&
-			sceGxmProgramParameterGetCategory(untextured_parameter) ==
-				SCE_GXM_PARAMETER_CATEGORY_UNIFORM) ? untextured_parameter : nullptr;
 	}
+	load_variant_uniforms(tfx_fast_f, &fast_uniforms);
+	load_variant_uniforms(tfx_untextured_f, &untextured_uniforms);
+	load_variant_uniforms(tfx_source_f, &source_uniforms);
+	load_variant_uniforms(tfx_source_untextured_f,
+		&source_untextured_uniforms);
 	uniforms.fog_color_aref = parameter(tfx_f, "FogColorAref",
 		SCE_GXM_PARAMETER_CATEGORY_UNIFORM);
 	uniforms.texture_size = parameter(tfx_f, "TextureSize",
@@ -648,36 +704,6 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		SCE_GXM_PARAMETER_CATEGORY_UNIFORM);
 	uniforms.color_mask = parameter(tfx_f, "ColorMask",
 		SCE_GXM_PARAMETER_CATEGORY_UNIFORM);
-	const auto find_fast_uniform = [tfx_fast_f](const char* name) {
-		const SceGxmProgramParameter* value =
-			sceGxmProgramFindParameterByName(tfx_fast_f, name);
-		return (value && sceGxmProgramParameterGetCategory(value) ==
-			SCE_GXM_PARAMETER_CATEGORY_UNIFORM) ? value : nullptr;
-	};
-	fast_uniforms.fog_color_aref = find_fast_uniform("FogColorAref");
-	fast_uniforms.texture_size = find_fast_uniform("TextureSize");
-	fast_uniforms.native_texture_size = find_fast_uniform("NativeTextureSize");
-	fast_uniforms.texture_alpha = find_fast_uniform("TextureAlpha");
-	fast_uniforms.half_texel = find_fast_uniform("HalfTexel");
-	fast_uniforms.st_scale = find_fast_uniform("STScale");
-	fast_uniforms.st_range = find_fast_uniform("STRange");
-	const auto find_untextured_uniform = [tfx_untextured_f](const char* name) {
-		const SceGxmProgramParameter* value =
-			sceGxmProgramFindParameterByName(tfx_untextured_f, name);
-		return (value && sceGxmProgramParameterGetCategory(value) ==
-			SCE_GXM_PARAMETER_CATEGORY_UNIFORM) ? value : nullptr;
-	};
-	untextured_uniforms.fog_color_aref =
-		find_untextured_uniform("FogColorAref");
-	untextured_uniforms.texture_size =
-		find_untextured_uniform("TextureSize");
-	untextured_uniforms.native_texture_size =
-		find_untextured_uniform("NativeTextureSize");
-	untextured_uniforms.texture_alpha =
-		find_untextured_uniform("TextureAlpha");
-	untextured_uniforms.half_texel = find_untextured_uniform("HalfTexel");
-	untextured_uniforms.st_scale = find_untextured_uniform("STScale");
-	untextured_uniforms.st_range = find_untextured_uniform("STRange");
 	uniforms.interlace[0] = parameter(mad_buffer_f, "ZrH",
 		SCE_GXM_PARAMETER_CATEGORY_UNIFORM);
 	uniforms.interlace[1] = parameter(mad_reconstruct_f, "ZrH",
@@ -983,6 +1009,11 @@ bool GSDeviceGXM::Impl::EnsureScene(VitaGXM::GSTextureGXM* rt,
 	{
 		return true;
 	}
+	// Exact depth scissoring emits two mask rectangles while establishing the
+	// new scene. Retire the staging arena before BeginScene when those quads
+	// would cross its end; no caller has staged this draw yet.
+	if (ds && !HasGeometryCapacity(8, 12) && !Finish())
+		return false;
 	if (!EndScene(false))
 		return false;
 	SceGxmRenderTarget* target = GetRenderTarget(size.x, size.y);
@@ -1043,21 +1074,29 @@ bool GSDeviceGXM::Impl::ReserveGeometry(u32 vertices, u32 indices,
 {
 	if (!vertex_data || !index_data)
 		return false;
+	if (!HasGeometryCapacity(vertices, indices))
+		return false;
 	const u32 vertex_bytes = vertices * std::max<u32>(sizeof(TfxVertex), sizeof(QuadVertex));
 	const u32 index_bytes = indices * sizeof(u16);
 	vertex_offset = (vertex_offset + 15u) & ~15u;
 	index_offset = (index_offset + 1u) & ~1u;
-	if (vertex_bytes > geometry_vertices.size - vertex_offset ||
-		index_bytes > geometry_indices.size - index_offset)
-	{
-		return false;
-	}
 	*vertex_data = static_cast<u8*>(geometry_vertices.base) + vertex_offset;
 	*index_data = reinterpret_cast<u16*>(
 		static_cast<u8*>(geometry_indices.base) + index_offset);
 	vertex_offset += vertex_bytes;
 	index_offset += index_bytes;
 	return true;
+}
+
+bool GSDeviceGXM::Impl::HasGeometryCapacity(u32 vertices, u32 indices) const
+{
+	const u64 aligned_vertex_offset = (static_cast<u64>(vertex_offset) + 15u) & ~15ull;
+	const u64 aligned_index_offset = (static_cast<u64>(index_offset) + 1u) & ~1ull;
+	const u64 vertex_bytes = static_cast<u64>(vertices) *
+		std::max<u32>(sizeof(TfxVertex), sizeof(QuadVertex));
+	const u64 index_bytes = static_cast<u64>(indices) * sizeof(u16);
+	return aligned_vertex_offset + vertex_bytes <= geometry_vertices.size &&
+		aligned_index_offset + index_bytes <= geometry_indices.size;
 }
 
 bool GSDeviceGXM::Impl::DrawMaskRect(const GSVector4i& rect, u32 width,
@@ -1248,30 +1287,32 @@ bool GSDeviceGXM::Impl::QueueTextureMipmaps(VitaGXM::GSTextureGXM& texture,
 
 bool GSDeviceGXM::Impl::CanUseFastTfx(const GSHWDrawConfig& config) const
 {
-	// PCSX2's blend state is already the host-GPU lowering for this first fast
-	// family. Shader-side GS equations retain the general program even when a
-	// later source-only specialization could prove that they do not consume Cd.
+	// PCSX2's blend state is already the host-GPU lowering for this family.
+	// Any surviving software blend is handled by CanUseSourceOnlyTfx() or by
+	// the destination-reading general program.
 	if (config.ps.fbmask || config.ps.pabe || config.ps.blend_a ||
 		config.ps.blend_b || config.ps.blend_d)
 	{
 		return false;
 	}
-
-	GSHWDrawConfig::ColorMaskSelector mask(
-		config.ps.no_color ? 0 : config.colormask.wrgba);
-	if (!config.blend.IsEffective(mask) || !config.blend.enable)
-		return true;
-	if (config.blend.constant_enable || config.blend.op > GSDevice::OP_REV_SUBTRACT)
-		return false;
-	SceGxmBlendFactor ignored{};
-	return TranslateBlendFactor(config.blend.src_factor, &ignored) &&
-		TranslateBlendFactor(config.blend.dst_factor, &ignored) &&
-		TranslateBlendFactor(config.blend.src_factor_alpha, &ignored) &&
-		TranslateBlendFactor(config.blend.dst_factor_alpha, &ignored);
+	return CanPatchTfxBlend(config);
 }
 
-SceGxmFragmentProgram* GSDeviceGXM::Impl::GetFastTfxProgram(
-	const GSHWDrawConfig& config, bool untextured_fragment)
+bool GSDeviceGXM::Impl::CanUseSourceOnlyTfx(
+	const GSHWDrawConfig& config) const
+{
+	// PCSX2 owner: tfx_fs.glsl::SW_BLEND_NEEDS_RT and
+	// PSSelector::IsFeedbackLoopRT(). A software blend is source-only exactly
+	// when none of A, B, C, or D selects Cd/Ad and no other shader feature needs
+	// the render target. PABE's dual-source contract is retained on the general
+	// path until GXM has a proven secondary-color output.
+	return config.ps.IsSWBlending() && !config.ps.IsFeedbackLoopRT() &&
+		!config.ps.pabe && CanPatchTfxBlend(config);
+}
+
+SceGxmFragmentProgram* GSDeviceGXM::Impl::GetPatchedTfxProgram(
+	const GSHWDrawConfig& config, bool source_only_fragment,
+	bool untextured_fragment)
 {
 	const u8 color_mask = config.ps.no_color ? 0 : config.colormask.wrgba;
 	const GSHWDrawConfig::ColorMaskSelector mask(color_mask);
@@ -1283,19 +1324,22 @@ SceGxmFragmentProgram* GSDeviceGXM::Impl::GetFastTfxProgram(
 		canonical_blend.constant = 0;
 	const u64 key = static_cast<u64>(canonical_blend.key) |
 		(static_cast<u64>(color_mask) << 32);
-	auto& programs = untextured_fragment ?
-		tfx_untextured_programs : tfx_fast_programs;
+	auto& programs = source_only_fragment ?
+		(untextured_fragment ? tfx_source_untextured_programs :
+			tfx_source_programs) :
+		(untextured_fragment ? tfx_untextured_programs : tfx_fast_programs);
 	const auto existing = programs.find(key);
 	if (existing != programs.end())
 		return existing->second;
-	if (tfx_fast_programs.size() + tfx_untextured_programs.size() >=
-		MAX_TFX_FAST_PROGRAMS)
+	if (tfx_fast_programs.size() + tfx_untextured_programs.size() +
+		tfx_source_programs.size() + tfx_source_untextured_programs.size() >=
+		MAX_TFX_PATCHED_PROGRAMS)
 	{
-		if (!tfx_fast_program_limit_logged)
+		if (!tfx_patched_program_limit_logged)
 		{
-			tfx_fast_program_limit_logged = true;
+			tfx_patched_program_limit_logged = true;
 			Console.Warning(
-				"GXM GS: fixed TFX program cache full; retaining exact general fallback.");
+				"GXM GS: patched TFX program cache full; retaining exact general fallback.");
 		}
 		return nullptr;
 	}
@@ -1340,8 +1384,13 @@ SceGxmFragmentProgram* GSDeviceGXM::Impl::GetFastTfxProgram(
 	}
 
 	SceGxmFragmentProgram* program = nullptr;
+	const SceGxmShaderPatcherId fragment_id = source_only_fragment ?
+		(untextured_fragment ? tfx_source_untextured_fragment_id :
+			tfx_source_fragment_id) :
+		(untextured_fragment ? tfx_untextured_fragment_id :
+			tfx_fast_fragment_id);
 	const int result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
-		untextured_fragment ? tfx_untextured_fragment_id : tfx_fast_fragment_id,
+		fragment_id,
 		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
 		SCE_GXM_MULTISAMPLE_NONE, &blend,
 		&_binary_vitasx2_tfx_v_gxp_start, &program);
@@ -1382,11 +1431,12 @@ void GSDeviceGXM::Impl::RetireTextureAllocation(
 
 bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	const GSHWDrawConfig::PSSelector& ps, VitaGXM::GSTextureGXM* source,
-	bool fast_fragment, bool untextured_fragment)
+	bool fast_fragment, bool source_only_fragment, bool untextured_fragment)
 {
-	const ProgramUniforms& fragment_uniforms =
-		untextured_fragment ? untextured_uniforms :
-		(fast_fragment ? fast_uniforms : uniforms);
+	const ProgramUniforms& fragment_uniforms = source_only_fragment ?
+		(untextured_fragment ? source_untextured_uniforms : source_uniforms) :
+		(untextured_fragment ? untextured_uniforms :
+			(fast_fragment ? fast_uniforms : uniforms));
 	void* vertex_buffer = nullptr;
 	int result = sceGxmReserveVertexDefaultUniformBuffer(context, &vertex_buffer);
 	if (result < 0 || !vertex_buffer)
@@ -1552,7 +1602,7 @@ VitaGXM::GSTextureGXM* GSDeviceGXM::Impl::SnapshotTexture(
 bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	const GSHWDrawConfig::PSSelector& ps, u32 first_index, u32 index_count,
 	VitaGXM::GSTextureGXM* source, SceGxmFragmentProgram* fragment,
-	bool fast_fragment, bool untextured_fragment)
+	bool fast_fragment, bool source_only_fragment, bool untextured_fragment)
 {
 	if (!config.verts || !config.indices || config.nverts == 0 || index_count == 0 ||
 		first_index > config.nindices || index_count > config.nindices - first_index ||
@@ -1561,11 +1611,15 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	{
 		return Reject("invalid indexed hardware draw geometry");
 	}
+	VitaGXM::GSTextureGXM* rt = CheckedCast<VitaGXM::GSTextureGXM>(config.rt);
+	VitaGXM::GSTextureGXM* ds = CheckedCast<VitaGXM::GSTextureGXM>(config.ds);
+	if (!EnsureScene(rt, ds, config.scissor))
+		return false;
 	void* vertex_memory = nullptr;
 	u16* staged_indices = nullptr;
 	if (!ReserveGeometry(index_count, index_count, &vertex_memory, &staged_indices))
 	{
-		if (!Finish() ||
+		if (!Finish() || !EnsureScene(rt, ds, config.scissor) ||
 			!ReserveGeometry(index_count, index_count, &vertex_memory, &staged_indices))
 		{
 			return Reject("hardware draw exceeds GXM geometry staging capacity");
@@ -1603,10 +1657,6 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 		staged_indices[i] = static_cast<u16>(i);
 	}
 
-	VitaGXM::GSTextureGXM* rt = CheckedCast<VitaGXM::GSTextureGXM>(config.rt);
-	VitaGXM::GSTextureGXM* ds = CheckedCast<VitaGXM::GSTextureGXM>(config.ds);
-	if (!EnsureScene(rt, ds, config.scissor))
-		return false;
 	sceGxmSetVertexProgram(context, tfx_vertex_program);
 	sceGxmSetFragmentProgram(context, fragment);
 	sceGxmSetVertexStream(context, 0, staged_vertices);
@@ -1667,7 +1717,7 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	sceGxmSetFrontDepthWriteEnable(context, depth_write);
 	sceGxmSetBackDepthWriteEnable(context, depth_write);
 	if (!UploadTfxUniforms(config, ps, source, fast_fragment,
-			untextured_fragment))
+			source_only_fragment, untextured_fragment))
 		return false;
 
 	result = sceGxmDraw(context, TranslateTopology(config.topology),
@@ -1698,7 +1748,18 @@ bool GSDeviceGXM::Impl::DrawQuad(VitaGXM::GSTextureGXM* source,
 	void* vertex_memory = nullptr;
 	u16* indices = nullptr;
 	if (!ReserveGeometry(4, 6, &vertex_memory, &indices))
-		return Reject("presentation geometry exhausted before scene retirement");
+	{
+		const bool restart_display_scene = scene_is_display;
+		VitaGXM::GSTextureGXM* const restart_rt = scene_rt;
+		VitaGXM::GSTextureGXM* const restart_ds = scene_ds;
+		const GSVector4i restart_scissor = scene_scissor;
+		if (!Finish())
+			return false;
+		const bool restarted = restart_display_scene ? BeginDisplayScene() :
+			EnsureScene(restart_rt, restart_ds, restart_scissor);
+		if (!restarted || !ReserveGeometry(4, 6, &vertex_memory, &indices))
+			return Reject("quad geometry exceeds GXM staging capacity");
+	}
 	QuadVertex* vertices = static_cast<QuadVertex*>(vertex_memory);
 	const float left = PixelToNdc(destination_rect.x, width);
 	const float right = PixelToNdc(destination_rect.z, width);
@@ -1850,15 +1911,20 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 	}
 
 	bool fast_fragment = m_impl->CanUseFastTfx(config);
-	bool untextured_fragment = fast_fragment && !config.vs.tme;
-	SceGxmFragmentProgram* fragment = fast_fragment ?
-		m_impl->GetFastTfxProgram(config, untextured_fragment) :
-		m_impl->tfx_fragment_program;
+	bool source_only_fragment = !fast_fragment &&
+		m_impl->CanUseSourceOnlyTfx(config);
+	bool untextured_fragment = (fast_fragment || source_only_fragment) &&
+		!config.vs.tme;
+	SceGxmFragmentProgram* fragment =
+		(fast_fragment || source_only_fragment) ?
+		m_impl->GetPatchedTfxProgram(config, source_only_fragment,
+			untextured_fragment) : m_impl->tfx_fragment_program;
 	if (!fragment)
 	{
 		// Shader-patcher memory exhaustion must not change GS behavior. The
 		// general FRAGCOLOR program remains the exact fallback for this draw.
 		fast_fragment = false;
+		source_only_fragment = false;
 		untextured_fragment = false;
 		fragment = m_impl->tfx_fragment_program;
 	}
@@ -1868,7 +1934,8 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 	{
 		const u32 count = std::min(max_chunk, config.nindices - first);
 		if (count == 0 || !m_impl->StageAndDraw(config, config.ps, first, count,
-			source, fragment, fast_fragment, untextured_fragment))
+			source, fragment, fast_fragment, source_only_fragment,
+			untextured_fragment))
 		{
 			return;
 		}
@@ -2096,10 +2163,12 @@ GSDevice::PresentResult GSDeviceGXM::BeginPresent(bool frame_skip)
 		m_impl->EndScene(false);
 		return PresentResult::FrameSkipped;
 	}
-	// This first implementation retires the shared staging ring once per
-	// presented frame. It is a bounded synchronization seam, not an implicit
-	// texture lifetime assumption.
-	if (!m_impl->Finish() || !m_impl->BeginDisplayScene())
+	// PCSX2's device backends submit presentation after the preceding render
+	// pass without forcing the GPU idle. Sony's basic/display_queue samples use
+	// the same ordered-context + display-sync contract: EndScene, begin the
+	// back-buffer scene with its sync object, then queue the flip. Geometry is
+	// retained monotonically and drained only when its staging arena wraps.
+	if (!m_impl->BeginDisplayScene())
 		return PresentResult::DeviceLost;
 	const GSVector4 full(0.0f, 0.0f, static_cast<float>(VitaGXM::Display::Width),
 		static_cast<float>(VitaGXM::Display::Height));
@@ -2461,6 +2530,13 @@ void GSDeviceGXM::Impl::Shutdown()
 	for (auto& entry : tfx_untextured_programs)
 		release_fragment(entry.second, "release untextured TFX program");
 	tfx_untextured_programs.clear();
+	for (auto& entry : tfx_source_programs)
+		release_fragment(entry.second, "release source-only TFX program");
+	tfx_source_programs.clear();
+	for (auto& entry : tfx_source_untextured_programs)
+		release_fragment(entry.second,
+			"release source-only untextured TFX program");
+	tfx_source_untextured_programs.clear();
 	release_fragment(tfx_fragment_program, "release TFX fragment program");
 	release_vertex(color_vertex_program, "release color vertex program");
 	release_vertex(present_vertex_program, "release presentation vertex program");
@@ -2489,6 +2565,10 @@ void GSDeviceGXM::Impl::Shutdown()
 	unregister(merge_fragment_id, "unregister merge fragment");
 	unregister(present_fragment_id, "unregister present fragment");
 	unregister(present_vertex_id, "unregister present vertex");
+	unregister(tfx_source_untextured_fragment_id,
+		"unregister source-only untextured TFX fragment");
+	unregister(tfx_source_fragment_id,
+		"unregister source-only TFX fragment");
 	unregister(tfx_untextured_fragment_id,
 		"unregister untextured TFX fragment");
 	unregister(tfx_fast_fragment_id, "unregister fast TFX fragment");

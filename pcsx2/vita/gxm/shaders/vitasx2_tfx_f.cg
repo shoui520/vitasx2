@@ -140,7 +140,7 @@ float4 SampleTexture(uniform sampler2D textureSampler, float2 st,
 }
 
 __nativecolor __regformat unsigned char4 main(
-#if !defined(VITASX2_TFX_FAST)
+#if !defined(VITASX2_TFX_FAST) && !defined(VITASX2_TFX_SOURCE_ONLY)
 	__regformat unsigned char4 fragColor : FRAGCOLOR,
 #endif
 	float4 vTexFloat : TEXCOORD0,
@@ -246,7 +246,7 @@ __nativecolor __regformat unsigned char4 main(
 	if (!alphaPass)
 		discard;
 
-#if defined(VITASX2_TFX_FAST)
+#if defined(VITASX2_TFX_FAST) || defined(VITASX2_TFX_SOURCE_ONLY)
 	const float4 destination = float4(0.0f);
 #else
 	const float4 destination = float4(fragColor);
@@ -265,7 +265,7 @@ __nativecolor __regformat unsigned char4 main(
 	if (Selector1.z > 0.5f && color.a < 128.0f)
 		color.a += 128.0f;
 
-#if !defined(VITASX2_TFX_FAST)
+#if !defined(VITASX2_TFX_FAST) || defined(VITASX2_TFX_SOURCE_ONLY)
 	const bool softwareBlend = Selector3.x > 0.5f || Selector3.y > 0.5f ||
 		Selector3.w > 0.5f;
 	if (softwareBlend)
@@ -318,7 +318,7 @@ __nativecolor __regformat unsigned char4 main(
 	// 0..128 alpha occupies the full 8-bit host channel.
 	const float outputAlpha = Selector4.y > 0.5f ?
 		color.a * (255.0f / 128.0f) : color.a;
-#if defined(VITASX2_TFX_FAST)
+#if defined(VITASX2_TFX_FAST) || defined(VITASX2_TFX_SOURCE_ONLY)
 	float4 result = float4(color.rgb, outputAlpha);
 #else
 	float4 source = float4(color.rgb, outputAlpha) / 255.0f;
