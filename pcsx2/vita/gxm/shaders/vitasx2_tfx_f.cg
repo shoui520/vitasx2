@@ -186,10 +186,16 @@ __nativecolor __regformat unsigned char4 main(
 #else
 	const bool textured = Selector0.x > 0.5f;
 #endif
+	#if !defined(VITASX2_TFX_STQ)
 	const bool fixedTexture = Selector0.y > 0.5f;
+	#endif
 	const float safeQ = abs(vTexFloat.w) >= 1.0e-32f ? vTexFloat.w :
 		(vTexFloat.w < 0.0f ? -1.0e-32f : 1.0e-32f);
+	#if defined(VITASX2_TFX_STQ)
+	float2 st = vTexFloat.xy / safeQ;
+	#else
 	float2 st = fixedTexture ? vTexInt.xy : (vTexFloat.xy / safeQ);
+	#endif
 
 	float4 textureColor = float4(0.0f);
 	if (textured)
@@ -206,7 +212,8 @@ __nativecolor __regformat unsigned char4 main(
 			STRange, NativeTextureSize, STScale.xy, Selector2.x,
 			Selector2.y, TextureAlpha);
 #endif
-#if defined(VITASX2_TFX_DIRECT_TEXTURE)
+#if defined(VITASX2_TFX_NO_RTA_SOURCE_CORRECTION)
+#elif defined(VITASX2_TFX_DIRECT_TEXTURE)
 		if (Selector2.w > 0.5f)
 #else
 		if (Selector2.y < 0.5f && Selector2.w > 0.5f)
@@ -216,6 +223,12 @@ __nativecolor __regformat unsigned char4 main(
 	}
 
 	float4 color;
+#if defined(VITASX2_TFX_MODULATE_RGBA)
+	// PCSX2 tfx_fs.glsl compiles PS_TFX/TCC as selector constants. MODULATE
+	// with RGBA uses all four sampled channels and saturates the multiplied
+	// result to the GS 0..255 range.
+	color = min(trunc((vertexColor * textureColor) / 128.0f), 255.0f);
+#else
 	const float tfx = Selector0.z;
 	if (!textured || tfx > 3.5f)
 		color = vertexColor;
@@ -237,12 +250,14 @@ __nativecolor __regformat unsigned char4 main(
 		color.a = vertexColor.a;
 	if (tfx < 0.5f || (tfx > 1.5f && tfx < 3.5f))
 		color = min(color, 255.0f);
+#endif
 #else
 	// TME=0 makes TFX/TCC and all sampling state architecturally irrelevant.
 	// This is the same specialization PCSX2's shader selector owns.
 	float4 color = vertexColor;
 #endif
 
+#if !defined(VITASX2_TFX_NO_FOG_ALPHA_TEST)
 	if (Selector1.x > 0.5f)
 		color.rgb = trunc(lerp(FogColorAref.rgb, color.rgb,
 			(vTexFloat.z * 255.0f) / 256.0f));
@@ -261,6 +276,7 @@ __nativecolor __regformat unsigned char4 main(
 	else if (atst > 3.5f) alphaPass = abs(color.a - FogColorAref.a) >= 0.5f;
 	if (!alphaPass)
 		discard;
+#endif
 
 #if defined(VITASX2_TFX_FAST) || defined(VITASX2_TFX_SOURCE_ONLY)
 	const float4 destination = float4(0.0f);
@@ -278,8 +294,10 @@ __nativecolor __regformat unsigned char4 main(
 
 	// PCSX2 derives the blend factor from pre-FBA source alpha.
 	float4 secondary = float4(color.a / 128.0f);
+#if !defined(VITASX2_TFX_NO_FBA)
 	if (Selector1.z > 0.5f && color.a < 128.0f)
 		color.a += 128.0f;
+#endif
 
 #if defined(VITASX2_TFX_SOURCE_ONLY)
 	// CanUseSourceOnlyTfx() mirrors PCSX2's SW_BLEND_NEEDS_RT proof. A/B/D
@@ -287,18 +305,28 @@ __nativecolor __regformat unsigned char4 main(
 	// and software blending is known active. Keeping the impossible Cd/Ad/PABE
 	// branches in an offline uber-shader made SGX543 execute much more work for
 	// every covered pixel.
+#if defined(VITASX2_TFX_SOURCE_BLEND_AF)
+	// PCSX2's compile-time blend tuple (Cs - 0) * Af + 0. Blend-mix
+	// correction remains below because it is an independent selector axis.
+	float3 blended = color.rgb * TextureAlpha.w;
+#else
 	const float4 A = Selector3.x < 0.5f ? color : float4(0.0f);
 	const float4 B = Selector3.y < 0.5f ? color : float4(0.0f);
 	const float coefficient = Selector3.z < 0.5f ?
 		secondary.a : TextureAlpha.w;
 	const float4 D = Selector3.w < 0.5f ? color : float4(0.0f);
 	float3 blended = (A.rgb - B.rgb) * coefficient + D.rgb;
+#endif
+#if defined(VITASX2_TFX_BLEND_MIX0)
+	blended = trunc(blended);
+#else
 	if (Selector5.z < 0.5f)
 		blended = trunc(blended);
 	else if (Selector5.z < 1.5f)
 		blended -= 124.0f / 256.0f;
 	else
 		blended += 124.0f / 256.0f;
+#endif
 	color.rgb = blended;
 #else
 #if !defined(VITASX2_TFX_FAST)
@@ -346,10 +374,14 @@ __nativecolor __regformat unsigned char4 main(
 	}
 #endif
 
+#if defined(VITASX2_TFX_NO_COLCLIP)
+	color.rgb = saturate(color.rgb / 255.0f) * 255.0f;
+#else
 	if (Selector4.z > 0.5f)
 		color.rgb = float3((unsigned int3)color.rgb & unsigned int3(255));
 	else
 		color.rgb = saturate(color.rgb / 255.0f) * 255.0f;
+#endif
 
 	// Scaled RT alpha is PCSX2's storage representation: an architectural
 	// 0..128 alpha occupies the full 8-bit host channel.

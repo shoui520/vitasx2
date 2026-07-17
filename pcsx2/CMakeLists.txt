@@ -317,6 +317,10 @@ else()
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_source_direct_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	vitasx2_add_gxm_shader(vitasx2_tfx_source_direct_modulate_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	vitasx2_add_gxm_shader(vitasx2_tfx_source_direct_modulate_af_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_source_untextured_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	# INTERFACE object sources are direct final-link inputs, but CMake does not

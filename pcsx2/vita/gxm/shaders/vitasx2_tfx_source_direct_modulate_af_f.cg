@@ -1,0 +1,16 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owner: tfx_fs.glsl compile-time PS_TFX=MODULATE/PS_TCC=RGBA,
+// PS_BLEND_A/B/C/D=(Cs,0,Af,0), sample_c axes and destination-use proof.
+#define VITASX2_TFX_SOURCE_ONLY 1
+#define VITASX2_TFX_DIRECT_TEXTURE 1
+#define VITASX2_TFX_MODULATE_RGBA 1
+#define VITASX2_TFX_SOURCE_BLEND_AF 1
+#define VITASX2_TFX_STQ 1
+#define VITASX2_TFX_NO_RTA_SOURCE_CORRECTION 1
+#define VITASX2_TFX_NO_FOG_ALPHA_TEST 1
+#define VITASX2_TFX_NO_FBA 1
+#define VITASX2_TFX_BLEND_MIX0 1
+#define VITASX2_TFX_NO_COLCLIP 1
+#include "vitasx2_tfx_f.cg"
