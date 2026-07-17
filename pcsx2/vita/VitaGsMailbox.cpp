@@ -36,7 +36,9 @@ Pcsx2Config::GSOptions GSConfig;
 
 GSRendererType GSGetCurrentRenderer()
 {
-#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+#if (defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 	return GSRendererType::SW;
 #else
 	// Vita has one hardware backend. Auto is the existing PCSX2 renderer value
@@ -47,7 +49,9 @@ GSRendererType GSGetCurrentRenderer()
 
 bool GSIsHardwareRenderer()
 {
-#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+#if (defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 	return false;
 #else
 	return true;
@@ -235,7 +239,18 @@ namespace MTGS
 		GSConfig.Renderer = GSRendererType::SW;
 		GSConfig.SWExtraThreads = 0;
 #else
+	#if defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+		VITASX2_VITA_SOFTWARE_GS_CONTROL
+		// PCSX2 owner: GS.cpp::OpenGSRenderer() passes the configured worker
+		// count to makeGSRendererSW(). Keep EE on USER_0 and split scanline bands
+		// over USER_1/USER_2; the MTGS producer shares USER_1 but spends most of a
+		// software-bound frame feeding and waiting for those workers. CPU3 remains
+		// reserved for the shell, plugins, and background work.
+		GSConfig.Renderer = GSRendererType::SW;
+		GSConfig.SWExtraThreads = 2;
+	#else
 		GSConfig.Renderer = GSRendererType::Auto;
+	#endif
 		GSConfig.UpscaleMultiplier = 1.0f;
 		GSConfig.DumpReplaceableTextures = false;
 		GSConfig.LoadTextureReplacements = false;
@@ -916,7 +931,13 @@ namespace MTGS
 		options.Renderer = GSRendererType::SW;
 		options.UserHacks_GPUTargetCLUTMode = GSGPUTargetCLUTMode::Disabled;
 #else
+	#if defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+		VITASX2_VITA_SOFTWARE_GS_CONTROL
+		options.Renderer = GSRendererType::SW;
+		options.SWExtraThreads = 2;
+	#else
 		options.Renderer = GSRendererType::Auto;
+	#endif
 		options.UpscaleMultiplier = 1.0f;
 		options.DumpReplaceableTextures = false;
 		options.LoadTextureReplacements = false;

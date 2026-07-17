@@ -8,13 +8,17 @@
 #include "GS/GSRingHeap.h"
 #include "GS/MultiISA.h"
 
-#if !defined(VITASX2_VITA)
+#if !defined(VITASX2_VITA) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 #include "GS/Renderers/Common/GSRenderer.h"
 #endif
 
 MULTI_ISA_UNSHARED_START
 
-#if defined(VITASX2_VITA)
+#if defined(VITASX2_VITA) && \
+	(!defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) || \
+	 !VITASX2_VITA_SOFTWARE_GS_CONTROL)
 using GSRendererSWBase = GSState;
 #else
 using GSRendererSWBase = GSRenderer;
@@ -65,7 +69,9 @@ protected:
 	std::unique_ptr<IRasterizer> m_rl;
 	std::unique_ptr<GSTextureCacheSW> m_tc;
 	GSRingHeap m_vertex_heap;
-#if !defined(VITASX2_VITA)
+#if !defined(VITASX2_VITA) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 	std::array<GSTexture*, 3> m_texture = {};
 	u8* m_output;
 #endif
@@ -78,7 +84,9 @@ protected:
 	GSVector4i m_dimx[8] = {};
 
 	void Reset(bool hardware_reset) override;
-#if !defined(VITASX2_VITA)
+#if !defined(VITASX2_VITA) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 	void VSync(u32 field, bool registers_written, bool idle_frame) override;
 	GSTexture* GetOutput(int i, float& scale, int& y_offset) override;
 	GSTexture* GetFeedbackOutput(float& scale) override;
@@ -106,7 +114,9 @@ public:
 	GSRendererSW(int threads);
 	~GSRendererSW() override;
 
-#if !defined(VITASX2_VITA)
+#if !defined(VITASX2_VITA) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 	__fi static GSRendererSW* GetInstance() { return static_cast<GSRendererSW*>(g_gs_renderer.get()); }
 	void Destroy() override;
 #else

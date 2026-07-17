@@ -315,6 +315,12 @@ else()
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_source_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	vitasx2_add_gxm_shader(vitasx2_tfx_programmable_add_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	vitasx2_add_gxm_shader(vitasx2_tfx_programmable_add_direct_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	vitasx2_add_gxm_shader(vitasx2_tfx_programmable_over_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_source_direct_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_source_direct_modulate_f sce_fp_psp2

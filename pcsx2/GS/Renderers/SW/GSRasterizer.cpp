@@ -1621,9 +1621,10 @@ std::unique_ptr<IRasterizer> GSRasterizerList::Create(int threads)
 #if defined(VITASX2_VITA)
 	// PCSX2's desktop owner obtains a topology-aware processor list from
 	// VMManager. Sony's documented game-application masks expose USER_0..USER_2;
-	// VitaSX2 assigns EE to 0, MTGS to 1, and the sole SW raster worker to 2.
-	// CPU3 remains reserved for shell, plugin, and background work even when a
-	// capability plugin makes it visible.
+	// VitaSX2 assigns EE to USER_0 and raster workers to USER_1/USER_2. MTGS
+	// shares USER_1 but mostly feeds and waits for the workers when software GS
+	// dominates. CPU3 remains reserved for shell, plugin, and background work
+	// even when a capability plugin makes it visible.
 #else
 	const std::vector<u32>& procs = VMManager::Internal::GetSoftwareRendererProcessorList();
 	const bool pin = (EmuConfig.EnableThreadPinning && static_cast<size_t>(threads) <= procs.size());
@@ -1634,7 +1635,7 @@ std::unique_ptr<IRasterizer> GSRasterizerList::Create(int threads)
 	for (int i = 0; i < threads; i++)
 	{
 #if defined(VITASX2_VITA)
-		const u64 affinity = 1u << 2;
+		const u64 affinity = 1u << ((i & 1) ? 1 : 2);
 #else
 		const u64 affinity = pin ? (static_cast<u64>(1u) << procs[i]) : 0;
 #endif

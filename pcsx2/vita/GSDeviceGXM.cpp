@@ -48,6 +48,9 @@ extern "C"
 	extern const SceGxmProgram _binary_vitasx2_tfx_fast_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_untextured_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_source_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_programmable_add_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_programmable_add_direct_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_programmable_over_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_source_direct_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_source_direct_modulate_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_source_direct_modulate_af_f_gxp_start;
@@ -272,6 +275,9 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmShaderPatcherId tfx_fast_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_untextured_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_source_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_programmable_add_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_programmable_add_direct_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_programmable_over_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_source_direct_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_source_direct_modulate_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_source_direct_modulate_af_fragment_id = nullptr;
@@ -288,6 +294,10 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmShaderPatcherId mad_reconstruct_fragment_id = nullptr;
 	SceGxmVertexProgram* tfx_vertex_program = nullptr;
 	SceGxmFragmentProgram* tfx_fragment_program = nullptr;
+	SceGxmFragmentProgram* tfx_opaque_program = nullptr;
+	SceGxmFragmentProgram* tfx_programmable_add_program = nullptr;
+	SceGxmFragmentProgram* tfx_programmable_add_direct_program = nullptr;
+	SceGxmFragmentProgram* tfx_programmable_over_program = nullptr;
 	SceGxmVertexProgram* present_vertex_program = nullptr;
 	std::array<SceGxmFragmentProgram*, 16> copy_programs{};
 	std::array<SceGxmFragmentProgram*, 16> rta_correction_programs{};
@@ -305,6 +315,9 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	ProgramUniforms fast_uniforms;
 	ProgramUniforms untextured_uniforms;
 	ProgramUniforms source_uniforms;
+	ProgramUniforms programmable_add_uniforms;
+	ProgramUniforms programmable_add_direct_uniforms;
+	ProgramUniforms programmable_over_uniforms;
 	ProgramUniforms source_direct_uniforms;
 	ProgramUniforms source_direct_modulate_uniforms;
 	ProgramUniforms source_direct_modulate_af_uniforms;
@@ -336,6 +349,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool EndScene(bool finish);
 	bool Finish();
 	bool CommitClear(VitaGXM::GSTextureGXM& texture);
+	bool DrawTargetClear(u32 color, bool write_color, float depth,
+		bool write_depth);
 	bool EnsureScene(VitaGXM::GSTextureGXM* rt, VitaGXM::GSTextureGXM* ds,
 		const GSVector4i& scissor);
 	bool BeginDisplayScene();
@@ -354,19 +369,26 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool StageAndDraw(const GSHWDrawConfig& config,
 		const GSHWDrawConfig::PSSelector& ps, u32 first_index, u32 index_count,
 		VitaGXM::GSTextureGXM* source, SceGxmFragmentProgram* fragment,
-		bool fast_fragment, bool source_only_fragment,
+		bool fast_fragment, bool programmable_add_fragment,
+		bool programmable_add_direct_fragment,
+		bool programmable_over_fragment,
+		bool source_only_fragment,
 		bool source_direct_fragment,
 		bool source_direct_modulate_fragment,
 		bool source_direct_modulate_af_fragment,
 		bool untextured_fragment);
 	bool UploadTfxUniforms(const GSHWDrawConfig& config,
 		const GSHWDrawConfig::PSSelector& ps, VitaGXM::GSTextureGXM* source,
-		bool fast_fragment, bool source_only_fragment,
+		bool fast_fragment, bool programmable_add_fragment,
+		bool programmable_add_direct_fragment,
+		bool programmable_over_fragment,
+		bool source_only_fragment,
 		bool source_direct_fragment,
 		bool source_direct_modulate_fragment,
 		bool source_direct_modulate_af_fragment,
 		bool untextured_fragment);
 	bool CanUseFastTfx(const GSHWDrawConfig& config) const;
+	bool CanUseGsSourceOnlyTfx(const GSHWDrawConfig& config) const;
 	bool CanUseSourceOnlyTfx(const GSHWDrawConfig& config) const;
 	bool CanUseSourceDirectTfx(const GSHWDrawConfig& config) const;
 	bool CanUseSourceDirectModulateTfx(const GSHWDrawConfig& config) const;
@@ -596,6 +618,12 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		&_binary_vitasx2_tfx_untextured_f_gxp_start;
 	const SceGxmProgram* const tfx_source_f =
 		&_binary_vitasx2_tfx_source_f_gxp_start;
+	const SceGxmProgram* const tfx_programmable_add_f =
+		&_binary_vitasx2_tfx_programmable_add_f_gxp_start;
+	const SceGxmProgram* const tfx_programmable_add_direct_f =
+		&_binary_vitasx2_tfx_programmable_add_direct_f_gxp_start;
+	const SceGxmProgram* const tfx_programmable_over_f =
+		&_binary_vitasx2_tfx_programmable_over_f_gxp_start;
 	const SceGxmProgram* const tfx_source_direct_f =
 		&_binary_vitasx2_tfx_source_direct_f_gxp_start;
 	const SceGxmProgram* const tfx_source_direct_modulate_f =
@@ -619,7 +647,10 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 	const SceGxmProgram* const mad_reconstruct_f =
 		&_binary_vitasx2_mad_reconstruct_f_gxp_start;
 	for (const SceGxmProgram* program : {tfx_v, tfx_f, tfx_fast_f,
-		tfx_untextured_f, tfx_source_f, tfx_source_direct_f,
+		tfx_untextured_f, tfx_source_f, tfx_programmable_add_f,
+		tfx_programmable_add_direct_f,
+		tfx_programmable_over_f,
+		tfx_source_direct_f,
 		tfx_source_direct_modulate_f,
 		tfx_source_direct_modulate_af_f,
 		tfx_source_untextured_f,
@@ -645,6 +676,15 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 			"register untextured TFX fragment program") ||
 		!register_program(tfx_source_f, &tfx_source_fragment_id,
 			"register source-only TFX fragment program") ||
+		!register_program(tfx_programmable_add_f,
+			&tfx_programmable_add_fragment_id,
+			"register programmable additive TFX fragment program") ||
+		!register_program(tfx_programmable_add_direct_f,
+			&tfx_programmable_add_direct_fragment_id,
+			"register direct-texture programmable additive TFX fragment program") ||
+		!register_program(tfx_programmable_over_f,
+			&tfx_programmable_over_fragment_id,
+			"register programmable source-alpha TFX fragment program") ||
 		!register_program(tfx_source_direct_f, &tfx_source_direct_fragment_id,
 			"register source-only direct-texture TFX fragment program") ||
 		!register_program(tfx_source_direct_modulate_f,
@@ -721,6 +761,10 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 	load_variant_uniforms(tfx_fast_f, &fast_uniforms);
 	load_variant_uniforms(tfx_untextured_f, &untextured_uniforms);
 	load_variant_uniforms(tfx_source_f, &source_uniforms);
+	load_variant_uniforms(tfx_programmable_add_f, &programmable_add_uniforms);
+	load_variant_uniforms(tfx_programmable_add_direct_f,
+		&programmable_add_direct_uniforms);
+	load_variant_uniforms(tfx_programmable_over_f, &programmable_over_uniforms);
 	load_variant_uniforms(tfx_source_direct_f, &source_direct_uniforms);
 	load_variant_uniforms(tfx_source_direct_modulate_f,
 		&source_direct_modulate_uniforms);
@@ -808,6 +852,38 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		nullptr, tfx_v, &tfx_fragment_program);
 	if (result < 0 || !tfx_fragment_program)
 		return Fail("create TFX fragment program", result);
+
+	// Full-channel opaque output requires neither FRAGCOLOR nor fixed blending.
+	// Create it with the same null blend contract as Sony's non-blended samples;
+	// partial masks remain on the general programmable path.
+	result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_fast_fragment_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED, SCE_GXM_MULTISAMPLE_NONE,
+		nullptr, tfx_v, &tfx_opaque_program);
+	if (result < 0 || !tfx_opaque_program)
+		return Fail("create opaque TFX fragment program", result);
+
+	// Sony's programmable- and masked-blending samples create FRAGCOLOR programs
+	// without a patcher blend state. These programs preserve PCSX2's general TFX
+	// path and compile out only one independently proven host blend equation.
+	result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_programmable_add_fragment_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED, SCE_GXM_MULTISAMPLE_NONE,
+		nullptr, tfx_v, &tfx_programmable_add_program);
+	if (result < 0 || !tfx_programmable_add_program)
+		return Fail("create programmable additive TFX fragment program", result);
+	result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_programmable_add_direct_fragment_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED, SCE_GXM_MULTISAMPLE_NONE,
+		nullptr, tfx_v, &tfx_programmable_add_direct_program);
+	if (result < 0 || !tfx_programmable_add_direct_program)
+		return Fail("create direct-texture programmable additive TFX fragment program", result);
+	result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_programmable_over_fragment_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED, SCE_GXM_MULTISAMPLE_NONE,
+		nullptr, tfx_v, &tfx_programmable_over_program);
+	if (result < 0 || !tfx_programmable_over_program)
+		return Fail("create programmable source-alpha TFX fragment program", result);
 
 	const std::array<const char*, 3> quad_attribute_names = {
 		"aPosition", "aColor", "aTexCoord"};
@@ -992,47 +1068,83 @@ bool GSDeviceGXM::Impl::CommitClear(VitaGXM::GSTextureGXM& texture)
 {
 	if (texture.GetState() != GSTexture::State::Cleared)
 		return true;
-	if (!Finish())
-		return false;
 
-	if (texture.IsDepthStencil())
-	{
-		const VitaGXM::TextureLevelLayout* layout = texture.Level(0);
-		if (!layout || !texture.LevelData(0))
-			return false;
-		const float depth = texture.GetClearDepth();
-		for (u32 y = 0; y < layout->height; y++)
-		{
-			float* row = reinterpret_cast<float*>(
-				static_cast<u8*>(texture.LevelData(0)) +
-				static_cast<size_t>(y) * layout->pitch);
-			std::fill_n(row, layout->width, depth);
-		}
-		if (texture.StencilData())
-		{
-			for (u32 y = 0; y < layout->height; y++)
-				std::memset(static_cast<u8*>(texture.StencilData()) +
-					static_cast<size_t>(y) * texture.StencilPitch(), 0, layout->width);
-		}
-	}
-	else
-	{
-		const VitaGXM::TextureLevelLayout* layout = texture.Level(0);
-		if (!layout || !texture.LevelData(0))
-			return false;
-		const VitaGXM::TextureFormatInfo& format = texture.NativeFormat();
-		if (format.bytes_per_pixel != 4)
-			return Reject("lazy clear of non-32-bit color target");
-		for (u32 y = 0; y < layout->height; y++)
-		{
-			u32* row = reinterpret_cast<u32*>(
-				static_cast<u8*>(texture.LevelData(0)) +
-				static_cast<size_t>(y) * layout->pitch);
-			std::fill_n(row, layout->width, texture.GetClearColor());
-		}
-	}
+	// PCSX2 owner: GSDeviceOGL::CommitClear() materializes a lazy clear on the
+	// GPU without waiting for earlier draws. Sony's api_libgxm/basic sample uses
+	// the same ordered-scene clear triangle before ordinary rendering and calls
+	// sceGxmFinish() only during teardown. Keep the lazy value out of recursive
+	// EnsureScene() calls while its target-only clear scene is established.
+	const bool depth_stencil = texture.IsDepthStencil();
+	const u32 clear_color = depth_stencil ? 0 : texture.GetClearColor();
+	const float clear_depth = depth_stencil ? texture.GetClearDepth() : 1.0f;
+	const GSVector4i bounds = texture.GetRect();
 	texture.SetState(GSTexture::State::Dirty);
-	return true;
+	const bool gpu_clear = depth_stencil ?
+		(texture.DepthStencilSurface() && EnsureScene(nullptr, &texture, bounds) &&
+			DrawTargetClear(0, false, clear_depth, true)) :
+		(texture.ColorSurface() && EnsureScene(&texture, nullptr, bounds) &&
+			DrawTargetClear(clear_color, true, 1.0f, false));
+	if (gpu_clear)
+		return true;
+
+	// A failed target clear must remain lazy; claiming Dirty would expose
+	// uninitialized storage to a later draw or readback.
+	texture.SetState(GSTexture::State::Cleared);
+	return false;
+}
+
+bool GSDeviceGXM::Impl::DrawTargetClear(u32 color, bool write_color,
+	float depth, bool write_depth)
+{
+	if (!scene_active || write_color != (scene_rt != nullptr) ||
+		write_depth != (scene_ds != nullptr))
+	{
+		return false;
+	}
+	void* vertex_memory = nullptr;
+	u16* indices = nullptr;
+	if (!ReserveGeometry(3, 3, &vertex_memory, &indices))
+	{
+		// Geometry is retained until the GPU completes it. The caller has not
+		// staged guest geometry, so the ordinary rare arena-wrap drain can safely
+		// rebuild this exact clear scene.
+		VitaGXM::GSTextureGXM* const rt = scene_rt;
+		VitaGXM::GSTextureGXM* const ds = scene_ds;
+		const GSVector4i scissor = scene_scissor;
+		if (!Finish() || !EnsureScene(rt, ds, scissor) ||
+			!ReserveGeometry(3, 3, &vertex_memory, &indices))
+		{
+			return false;
+		}
+	}
+
+	// Sony's clear_v.cg owns this oversized triangle. The color vertex program
+	// accepts clip-space XYZ directly; GXM's configured 0..1 viewport maps the
+	// requested PCSX2 depth back from clip Z = depth * 2 - 1.
+	QuadVertex* vertices = static_cast<QuadVertex*>(vertex_memory);
+	SetQuadVertex(vertices[0], -1.0f, -1.0f, color, 0.0f, 0.0f);
+	SetQuadVertex(vertices[1], 3.0f, -1.0f, color, 0.0f, 0.0f);
+	SetQuadVertex(vertices[2], -1.0f, 3.0f, color, 0.0f, 0.0f);
+	const float clip_depth = depth * 2.0f - 1.0f;
+	vertices[0].z = clip_depth;
+	vertices[1].z = clip_depth;
+	vertices[2].z = clip_depth;
+	indices[0] = 0;
+	indices[1] = 1;
+	indices[2] = 2;
+
+	sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+	sceGxmSetBackDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+	const SceGxmDepthWriteMode depth_write = write_depth ?
+		SCE_GXM_DEPTH_WRITE_ENABLED : SCE_GXM_DEPTH_WRITE_DISABLED;
+	sceGxmSetFrontDepthWriteEnable(context, depth_write);
+	sceGxmSetBackDepthWriteEnable(context, depth_write);
+	sceGxmSetVertexProgram(context, color_vertex_program);
+	sceGxmSetFragmentProgram(context, color_fragment_program);
+	sceGxmSetVertexStream(context, 0, vertices);
+	const int result = sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 3);
+	return result >= 0 ? true : Fail("sceGxmDraw(lazy clear)", result);
 }
 
 bool GSDeviceGXM::Impl::EnsureScene(VitaGXM::GSTextureGXM* rt,
@@ -1347,13 +1459,19 @@ bool GSDeviceGXM::Impl::CanUseFastTfx(const GSHWDrawConfig& config) const
 bool GSDeviceGXM::Impl::CanUseSourceOnlyTfx(
 	const GSHWDrawConfig& config) const
 {
+	return CanUseGsSourceOnlyTfx(config) && CanPatchTfxBlend(config);
+}
+
+bool GSDeviceGXM::Impl::CanUseGsSourceOnlyTfx(
+	const GSHWDrawConfig& config) const
+{
 	// PCSX2 owner: tfx_fs.glsl::SW_BLEND_NEEDS_RT and
 	// PSSelector::IsFeedbackLoopRT(). A software blend is source-only exactly
 	// when none of A, B, C, or D selects Cd/Ad and no other shader feature needs
 	// the render target. PABE's dual-source contract is retained on the general
 	// path until GXM has a proven secondary-color output.
 	return config.ps.IsSWBlending() && !config.ps.IsFeedbackLoopRT() &&
-		!config.ps.pabe && CanPatchTfxBlend(config);
+		!config.ps.pabe;
 }
 
 bool GSDeviceGXM::Impl::CanUseSourceDirectTfx(
@@ -1380,7 +1498,8 @@ bool GSDeviceGXM::Impl::CanUseSourceDirectModulateAfTfx(
 	// PCSX2 owner: tfx_fs.glsl's PS selector constants. Every skipped shader
 	// branch is proven here; this is the general (Cs - 0) * Af + 0 STQ path,
 	// independent of title, CRC, guest PC, texture address, and draw size.
-	return CanUseSourceDirectModulateTfx(config) && !config.ps.fst &&
+	return CanUseSourceOnlyTfx(config) &&
+		CanUseSourceDirectModulateTfx(config) && !config.ps.fst &&
 		!config.ps.fog && config.ps.atst == GSHWDrawConfig::PS_ATST::NONE &&
 		!config.ps.fba && !config.ps.rta_source_correction &&
 		!config.ps.colclip && !config.ps.blend_mix && !config.ps.fixed_one_a &&
@@ -1482,9 +1601,16 @@ SceGxmFragmentProgram* GSDeviceGXM::Impl::GetPatchedTfxProgram(
 				tfx_source_fragment_id)))) :
 		(untextured_fragment ? tfx_untextured_fragment_id :
 			tfx_fast_fragment_id);
+	// Sony api_libgxm/blending patches normalized float4 output to the target
+	// UCHAR4 format. DECLARED native-color output belongs to programmable
+	// blending and caused real-hardware tile corruption when combined with a
+	// patcher blend state.
+	const SceGxmOutputRegisterFormat output_format = source_only_fragment ?
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4 :
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED;
 	const int result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
 		fragment_id,
-		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
+		output_format,
 		SCE_GXM_MULTISAMPLE_NONE, &blend,
 		&_binary_vitasx2_tfx_v_gxp_start, &program);
 	if (result < 0 || !program)
@@ -1524,12 +1650,19 @@ void GSDeviceGXM::Impl::RetireTextureAllocation(
 
 bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	const GSHWDrawConfig::PSSelector& ps, VitaGXM::GSTextureGXM* source,
-	bool fast_fragment, bool source_only_fragment, bool source_direct_fragment,
+	bool fast_fragment, bool programmable_add_fragment,
+	bool programmable_add_direct_fragment,
+	bool programmable_over_fragment,
+	bool source_only_fragment, bool source_direct_fragment,
 	bool source_direct_modulate_fragment,
 	bool source_direct_modulate_af_fragment,
 	bool untextured_fragment)
 {
-	const ProgramUniforms& fragment_uniforms = source_only_fragment ?
+	const ProgramUniforms& fragment_uniforms =
+		programmable_add_direct_fragment ?
+		programmable_add_direct_uniforms : (programmable_add_fragment ?
+		programmable_add_uniforms : (programmable_over_fragment ?
+		programmable_over_uniforms : (source_only_fragment ?
 		(untextured_fragment ? source_untextured_uniforms :
 			(source_direct_modulate_af_fragment ?
 				source_direct_modulate_af_uniforms :
@@ -1537,7 +1670,7 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 				source_direct_modulate_uniforms :
 			(source_direct_fragment ? source_direct_uniforms : source_uniforms)))) :
 		(untextured_fragment ? untextured_uniforms :
-			(fast_fragment ? fast_uniforms : uniforms));
+			(fast_fragment ? fast_uniforms : uniforms)))));
 	void* vertex_buffer = nullptr;
 	int result = sceGxmReserveVertexDefaultUniformBuffer(context, &vertex_buffer);
 	if (result < 0 || !vertex_buffer)
@@ -1703,7 +1836,10 @@ VitaGXM::GSTextureGXM* GSDeviceGXM::Impl::SnapshotTexture(
 bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	const GSHWDrawConfig::PSSelector& ps, u32 first_index, u32 index_count,
 	VitaGXM::GSTextureGXM* source, SceGxmFragmentProgram* fragment,
-	bool fast_fragment, bool source_only_fragment, bool source_direct_fragment,
+	bool fast_fragment, bool programmable_add_fragment,
+	bool programmable_add_direct_fragment,
+	bool programmable_over_fragment,
+	bool source_only_fragment, bool source_direct_fragment,
 	bool source_direct_modulate_fragment,
 	bool source_direct_modulate_af_fragment,
 	bool untextured_fragment)
@@ -1715,15 +1851,40 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	{
 		return Reject("invalid indexed hardware draw geometry");
 	}
-	VitaGXM::GSTextureGXM* rt = CheckedCast<VitaGXM::GSTextureGXM>(config.rt);
-	VitaGXM::GSTextureGXM* ds = CheckedCast<VitaGXM::GSTextureGXM>(config.ds);
-	if (!EnsureScene(rt, ds, config.scissor))
+	VitaGXM::GSTextureGXM* const rt =
+		CheckedCast<VitaGXM::GSTextureGXM>(config.rt);
+	VitaGXM::GSTextureGXM* const ds =
+		CheckedCast<VitaGXM::GSTextureGXM>(config.ds);
+	VitaGXM::GSTextureGXM* draw_rt = rt;
+	VitaGXM::GSTextureGXM* draw_ds = ds;
+
+	// PCSX2 owner: GSDeviceOGL::RenderHW() keeps a size-compatible attachment
+	// when the next draw omits only RT or DS, avoiding a framebuffer transition.
+	// GXM scenes have immutable attachments, so this avoids an EndScene/BeginScene
+	// pair. Unlike desktop GL, GXM cannot sample an attached surface; also require
+	// the omitted attachment's writes to be disabled before retaining it.
+	if (scene_active && !scene_is_display)
+	{
+		if (!draw_rt && draw_ds && scene_rt && source != scene_rt &&
+			(config.ps.no_color || config.colormask.wrgba == 0) &&
+			scene_rt->GetSize() == draw_ds->GetSize())
+		{
+			draw_rt = scene_rt;
+		}
+		else if (!draw_ds && draw_rt && scene_ds && source != scene_ds &&
+			!config.depth.zwe && config.depth.ztst == ZTST_ALWAYS &&
+			scene_ds->GetSize() == draw_rt->GetSize())
+		{
+			draw_ds = scene_ds;
+		}
+	}
+	if (!EnsureScene(draw_rt, draw_ds, config.scissor))
 		return false;
 	void* vertex_memory = nullptr;
 	u16* staged_indices = nullptr;
 	if (!ReserveGeometry(index_count, index_count, &vertex_memory, &staged_indices))
 	{
-		if (!Finish() || !EnsureScene(rt, ds, config.scissor) ||
+		if (!Finish() || !EnsureScene(draw_rt, draw_ds, config.scissor) ||
 			!ReserveGeometry(index_count, index_count, &vertex_memory, &staged_indices))
 		{
 			return Reject("hardware draw exceeds GXM geometry staging capacity");
@@ -1821,6 +1982,9 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	sceGxmSetFrontDepthWriteEnable(context, depth_write);
 	sceGxmSetBackDepthWriteEnable(context, depth_write);
 	if (!UploadTfxUniforms(config, ps, source, fast_fragment,
+			programmable_add_fragment,
+			programmable_add_direct_fragment,
+			programmable_over_fragment,
 			source_only_fragment, source_direct_fragment,
 			source_direct_modulate_fragment,
 			source_direct_modulate_af_fragment, untextured_fragment))
@@ -2016,28 +2180,84 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		return;
 	}
 
-	bool fast_fragment = m_impl->CanUseFastTfx(config);
-	bool source_only_fragment = !fast_fragment &&
-		m_impl->CanUseSourceOnlyTfx(config);
-	bool untextured_fragment = (fast_fragment || source_only_fragment) &&
-		!config.vs.tme;
+	const GSHWDrawConfig::ColorMaskSelector color_mask(
+		config.ps.no_color ? 0 : config.colormask.wrgba);
+	const bool blend_effective = config.blend.enable &&
+		config.blend.IsEffective(color_mask);
+	// PCSX2's opaque TFX lowering needs no destination value. GXM's fixed-patched
+	// fragment programs are excluded: real-hardware A/B evidence showed tile
+	// seams, while null-blend programs preserve the oracle image.
+	const bool full_color_write = config.colormask.wrgba == 0xf &&
+		!config.ps.no_color;
+	// No patcher blend state is involved: this program is valid only when PCSX2
+	// proves blending ineffective and every color component is overwritten.
+	bool fast_fragment = !blend_effective && full_color_write &&
+		m_impl->CanUseFastTfx(config);
+	const bool programmable_add = blend_effective &&
+		m_impl->CanUseSourceOnlyTfx(config) &&
+		full_color_write &&
+		!config.blend.constant_enable &&
+		config.blend.op == GSDevice::OP_ADD &&
+		config.blend.src_factor == GSDevice::CONST_ONE &&
+		config.blend.dst_factor == GSDevice::CONST_ONE &&
+		config.blend.src_factor_alpha == GSDevice::CONST_ONE &&
+		config.blend.dst_factor_alpha == GSDevice::CONST_ZERO;
+	const bool programmable_add_direct = programmable_add &&
+		m_impl->CanUseSourceDirectTfx(config);
+	const bool programmable_over = blend_effective &&
+		full_color_write && !config.ps.fbmask &&
+		!config.blend.constant_enable &&
+		config.blend.op == GSDevice::OP_ADD &&
+		config.blend.src_factor == GSDevice::CONST_ONE &&
+		config.blend.dst_factor == GSDevice::INV_SRC1_COLOR &&
+		config.blend.src_factor_alpha == GSDevice::CONST_ONE &&
+		config.blend.dst_factor_alpha == GSDevice::CONST_ZERO;
+	// PCSX2 tfx_fs.glsl proves this family never observes Cd/Ad while its
+	// remaining host blend is ordinary ADD/ONE/ONE. Use Sony's fixed-blend
+	// contract to avoid the SGX framebuffer fetch entirely.
+	bool source_only_fragment = blend_effective && full_color_write &&
+		!config.ps.fbmask && m_impl->CanUseSourceOnlyTfx(config);
+	bool untextured_fragment = source_only_fragment && !config.vs.tme;
 	bool source_direct_fragment = source_only_fragment &&
-		!untextured_fragment && m_impl->CanUseSourceDirectTfx(config);
+		m_impl->CanUseSourceDirectTfx(config);
 	bool source_direct_modulate_fragment = source_direct_fragment &&
 		m_impl->CanUseSourceDirectModulateTfx(config);
-	bool source_direct_modulate_af_fragment = source_direct_modulate_fragment &&
+	bool source_direct_modulate_af_fragment =
+		source_direct_modulate_fragment &&
 		m_impl->CanUseSourceDirectModulateAfTfx(config);
-	SceGxmFragmentProgram* fragment =
-		(fast_fragment || source_only_fragment) ?
-		m_impl->GetPatchedTfxProgram(config, source_only_fragment,
+	SceGxmFragmentProgram* fixed_source_fragment =
+		source_only_fragment ? m_impl->GetPatchedTfxProgram(config, true,
 			source_direct_fragment, source_direct_modulate_fragment,
-			source_direct_modulate_af_fragment,
-			untextured_fragment) : m_impl->tfx_fragment_program;
+			source_direct_modulate_af_fragment, untextured_fragment) :
+		nullptr;
+	if (source_only_fragment && !fixed_source_fragment)
+	{
+		source_direct_modulate_af_fragment = false;
+		source_only_fragment = false;
+		source_direct_fragment = false;
+		source_direct_modulate_fragment = false;
+	}
+	bool programmable_add_direct_fragment = programmable_add_direct &&
+		!fixed_source_fragment;
+	bool programmable_add_fragment = programmable_add &&
+		!programmable_add_direct && !fixed_source_fragment;
+	bool programmable_over_fragment = programmable_over;
+	SceGxmFragmentProgram* fragment = fixed_source_fragment ?
+		fixed_source_fragment : (programmable_add_direct ?
+		m_impl->tfx_programmable_add_direct_program :
+		(programmable_add ?
+		m_impl->tfx_programmable_add_program :
+		(programmable_over ? m_impl->tfx_programmable_over_program :
+		(fast_fragment ? m_impl->tfx_opaque_program :
+			m_impl->tfx_fragment_program))));
 	if (!fragment)
 	{
 		// Shader-patcher memory exhaustion must not change GS behavior. The
 		// general FRAGCOLOR program remains the exact fallback for this draw.
 		fast_fragment = false;
+		programmable_add_direct_fragment = false;
+		programmable_add_fragment = false;
+		programmable_over_fragment = false;
 		source_only_fragment = false;
 		source_direct_fragment = false;
 		source_direct_modulate_fragment = false;
@@ -2051,7 +2271,10 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 	{
 		const u32 count = std::min(max_chunk, config.nindices - first);
 		if (count == 0 || !m_impl->StageAndDraw(config, config.ps, first, count,
-			source, fragment, fast_fragment, source_only_fragment,
+			source, fragment, fast_fragment, programmable_add_fragment,
+			programmable_add_direct_fragment,
+			programmable_over_fragment,
+			source_only_fragment,
 			source_direct_fragment, source_direct_modulate_fragment,
 			source_direct_modulate_af_fragment,
 			untextured_fragment))
@@ -2668,6 +2891,13 @@ void GSDeviceGXM::Impl::Shutdown()
 		release_fragment(entry.second,
 			"release source-only untextured TFX program");
 	tfx_source_untextured_programs.clear();
+	release_fragment(tfx_programmable_add_program,
+		"release programmable additive TFX fragment program");
+	release_fragment(tfx_programmable_add_direct_program,
+		"release direct-texture programmable additive TFX fragment program");
+	release_fragment(tfx_programmable_over_program,
+		"release programmable source-alpha TFX fragment program");
+	release_fragment(tfx_opaque_program, "release opaque TFX fragment program");
 	release_fragment(tfx_fragment_program, "release TFX fragment program");
 	release_vertex(color_vertex_program, "release color vertex program");
 	release_vertex(present_vertex_program, "release presentation vertex program");
@@ -2704,6 +2934,12 @@ void GSDeviceGXM::Impl::Shutdown()
 		"unregister source-only direct MODULATE/RGBA TFX fragment");
 	unregister(tfx_source_direct_modulate_af_fragment_id,
 		"unregister source-only direct MODULATE/RGBA (Cs-0)*Af+0 TFX fragment");
+	unregister(tfx_programmable_add_fragment_id,
+		"unregister programmable additive TFX fragment");
+	unregister(tfx_programmable_add_direct_fragment_id,
+		"unregister direct-texture programmable additive TFX fragment");
+	unregister(tfx_programmable_over_fragment_id,
+		"unregister programmable source-alpha TFX fragment");
 	unregister(tfx_source_fragment_id,
 		"unregister source-only TFX fragment");
 	unregister(tfx_untextured_fragment_id,

@@ -111,6 +111,34 @@ void VitaGxmGsState::InvalidateLocalMem(const GIFRegBITBLTBUF& blit,
 	GSRendererSW::InvalidateLocalMem(blit, rect, clut);
 }
 
+#elif defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	VITASX2_VITA_SOFTWARE_GS_CONTROL
+
+#include "GS/Renderers/Common/GSDevice.h"
+
+VitaGxmGsState::VitaGxmGsState(bool enable_native_presenter)
+	: GSRendererSW(GSConfig.SWExtraThreads)
+{
+	(void)enable_native_presenter;
+}
+
+VitaGxmGsState::~VitaGxmGsState() = default;
+
+bool VitaGxmGsState::IsNativePresenterReady() const
+{
+	return g_gs_device != nullptr;
+}
+
+void VitaGxmGsState::Reset(bool hardware_reset)
+{
+	GSRendererSW::Reset(hardware_reset);
+}
+
+void VitaGxmGsState::VSync(u32 field, bool registers_written, bool idle_frame)
+{
+	GSRendererSW::VSync(field, registers_written, idle_frame);
+}
+
 #else
 
 #include "GS/Renderers/Common/GSDevice.h"

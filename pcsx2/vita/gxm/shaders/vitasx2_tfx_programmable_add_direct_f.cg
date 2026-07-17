@@ -1,0 +1,10 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 tfx_fs.glsl::sample_c: a 32-bit source with no shader bilinear filter
+// and no target-region remap is one ordinary sampler-owned lookup. Preserve all
+// other general TFX selectors and the proven programmable ADD host stage.
+#define VITASX2_TFX_PROGRAMMABLE_BLEND 1
+#define VITASX2_TFX_PROGRAMMABLE_ADD 1
+#define VITASX2_TFX_DIRECT_TEXTURE 1
+#include "vitasx2_tfx_f.cg"

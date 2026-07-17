@@ -16,7 +16,9 @@
 
 MULTI_ISA_UNSHARED_IMPL;
 
-#if !defined(VITASX2_VITA)
+#if !defined(VITASX2_VITA) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 GSRenderer* CURRENT_ISA::makeGSRendererSW(int threads)
 {
 	return new GSRendererSW(threads);
@@ -56,7 +58,9 @@ GSRendererSW::GSRendererSW(int threads)
 	m_rl = GSRasterizerList::Create(threads);
 #endif
 
-#if !defined(VITASX2_VITA)
+#if !defined(VITASX2_VITA) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 	m_output = (u8*)_aligned_malloc(1024 * 1024 * sizeof(u32), VECTOR_ALIGNMENT);
 #endif
 
@@ -78,7 +82,9 @@ void GSRendererSW::Reset(bool hardware_reset)
 
 	m_tc->RemoveAll();
 
-#if defined(VITASX2_VITA)
+#if defined(VITASX2_VITA) && \
+	(!defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) || \
+	 !VITASX2_VITA_SOFTWARE_GS_CONTROL)
 	GSState::Reset(hardware_reset);
 #else
 	GSRenderer::Reset(hardware_reset);
@@ -91,7 +97,9 @@ void GSRendererSW::Destroy()
 	m_rl.reset();
 	m_tc.reset();
 
-#if !defined(VITASX2_VITA)
+#if !defined(VITASX2_VITA) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 	for (GSTexture*& tex : m_texture)
 	{
 		delete tex;
@@ -103,7 +111,9 @@ void GSRendererSW::Destroy()
 #endif
 }
 
-#if !defined(VITASX2_VITA)
+#if !defined(VITASX2_VITA) || \
+	(defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	 VITASX2_VITA_SOFTWARE_GS_CONTROL)
 void GSRendererSW::VSync(u32 field, bool registers_written, bool idle_frame)
 {
 	Sync(0); // IncAge might delete a cached texture in use

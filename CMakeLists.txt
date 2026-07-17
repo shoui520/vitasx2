@@ -50,6 +50,16 @@ if(VITASX2_PRODUCT_BOOT_VALIDATION)
 	add_compile_definitions(VITASX2_PRODUCT_BOOT_VALIDATION=1)
 endif()
 
+option(VITASX2_VITA_SOFTWARE_GS_CONTROL
+	"Use PCSX2's software GS renderer with the current Vita core and GXM presenter."
+	OFF)
+if(VITASX2_VITA_SOFTWARE_GS_CONTROL)
+	# This is a bounded renderer-isolation control, not a second product mode.
+	# GS.cpp::OpenGSRenderer() owns the SW/HW distinction; keep the definition
+	# process-wide so GS state, texture-cache behavior, and the Vita mailbox agree.
+	add_compile_definitions(VITASX2_VITA_SOFTWARE_GS_CONTROL=1)
+endif()
+
 # Target CPU contract: Cortex-A9 MPCore, VFPv3, NEON, hard-float.
 # NEON is mandatory (see docs/ps2-vita/GENERIC_CORTEX_A9_OPTIMIZATION.md).
 add_compile_options(

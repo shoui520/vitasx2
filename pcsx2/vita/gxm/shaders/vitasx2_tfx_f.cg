@@ -139,8 +139,18 @@ float4 SampleTexture(uniform sampler2D textureSampler, float2 st,
 	return lerp(lerp(c0, c1, weight.x), lerp(c2, c3, weight.x), weight.y);
 }
 
+#if defined(VITASX2_TFX_SOURCE_ONLY) && \
+	!defined(VITASX2_TFX_PROGRAMMABLE_BLEND)
+// Sony's api_libgxm/blending sample supplies fixed blending to a normalized
+// float4 shader and patches it for UCHAR4 output. Native-color output is the
+// separate programmable-blending contract and must not be mixed with this one.
+float4 main(
+#else
 __nativecolor __regformat unsigned char4 main(
-#if !defined(VITASX2_TFX_FAST) && !defined(VITASX2_TFX_SOURCE_ONLY)
+#endif
+#if !defined(VITASX2_TFX_FAST) && \
+	(!defined(VITASX2_TFX_SOURCE_ONLY) || \
+	 defined(VITASX2_TFX_PROGRAMMABLE_BLEND))
 	__regformat unsigned char4 fragColor : FRAGCOLOR,
 #endif
 	float4 vTexFloat : TEXCOORD0,
@@ -278,7 +288,9 @@ __nativecolor __regformat unsigned char4 main(
 		discard;
 #endif
 
-#if defined(VITASX2_TFX_FAST) || defined(VITASX2_TFX_SOURCE_ONLY)
+#if defined(VITASX2_TFX_FAST) || \
+	(defined(VITASX2_TFX_SOURCE_ONLY) && \
+	 !defined(VITASX2_TFX_PROGRAMMABLE_BLEND))
 	const float4 destination = float4(0.0f);
 #else
 	const float4 destination = float4(fragColor);
@@ -387,7 +399,21 @@ __nativecolor __regformat unsigned char4 main(
 	// 0..128 alpha occupies the full 8-bit host channel.
 	const float outputAlpha = Selector4.y > 0.5f ?
 		color.a * (255.0f / 128.0f) : color.a;
-#if defined(VITASX2_TFX_FAST) || defined(VITASX2_TFX_SOURCE_ONLY)
+#if defined(VITASX2_TFX_PROGRAMMABLE_BLEND)
+	// This is ApplyHardwareBlend() specialized for PCSX2's proven host state:
+	// RGB ADD/ONE/ONE and alpha ADD/ONE/ZERO. Keep the source in float until the
+	// final native-color conversion, matching the exact general program's
+	// blend-mix rounding and saturation order.
+	const float4 sourceResult = float4(color.rgb, outputAlpha);
+	const float4 destinationResult = float4(fragColor);
+	#if defined(VITASX2_TFX_PROGRAMMABLE_ADD)
+	float4 result = sourceResult + destinationResult;
+	#elif defined(VITASX2_TFX_PROGRAMMABLE_OVER)
+	float4 result = sourceResult + destinationResult * (1.0f - secondary);
+	#endif
+	result.a = sourceResult.a;
+	result = saturate(result / 255.0f) * 255.0f;
+#elif defined(VITASX2_TFX_FAST) || defined(VITASX2_TFX_SOURCE_ONLY)
 	float4 result = float4(color.rgb, outputAlpha);
 #else
 	float4 source = float4(color.rgb, outputAlpha) / 255.0f;
@@ -408,5 +434,10 @@ __nativecolor __regformat unsigned char4 main(
 	if (Selector5.y > 0.5f)
 		result = destination;
 #endif
+#if defined(VITASX2_TFX_SOURCE_ONLY) && \
+	!defined(VITASX2_TFX_PROGRAMMABLE_BLEND)
+	return result / 255.0f;
+#else
 	return (unsigned char4)result;
+#endif
 }

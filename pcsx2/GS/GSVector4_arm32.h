@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0
 
-class alignas(16) GSVector4
+// AAPCS32 guarantees only 8-byte stack and indirect-result alignment. Declaring
+// this value 16-byte aligned makes GCC attach a :128 qualifier to NEON VLD/VST
+// instructions even when a conforming caller supplies only eight-byte-aligned
+// storage. Cortex-A9 accepts the ordinary unqualified VLD1/VST1 forms there.
+class alignas(8) GSVector4
 {
 	struct cxpr_init_tag
 	{

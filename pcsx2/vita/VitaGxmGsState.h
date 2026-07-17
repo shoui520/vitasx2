@@ -35,6 +35,25 @@ private:
 	u64 m_last_present_transfer = 0;
 };
 
+#elif defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+	VITASX2_VITA_SOFTWARE_GS_CONTROL
+
+#include "GS/Renderers/SW/GSRendererSW.h"
+
+// PCSX2 owner: GS.cpp::OpenGSRenderer(). This bounded physical-Vita control
+// keeps the current core, MTGS, GSDeviceGXM, and presentation path, changing
+// only the renderer which consumes decoded GS state.
+class VitaGxmGsState final : public GSRendererSW
+{
+public:
+	explicit VitaGxmGsState(bool enable_native_presenter);
+	~VitaGxmGsState() override;
+
+	bool IsNativePresenterReady() const;
+	void Reset(bool hardware_reset) override;
+	void VSync(u32 field, bool registers_written, bool idle_frame) override;
+};
+
 #else
 
 #include "GS/Renderers/HW/GSRendererHW.h"

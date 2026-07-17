@@ -1,0 +1,9 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// Preserve PCSX2's complete general TFX source and GS software-blend path.
+// Only the separately-proven host RGB ADD/ONE/ONE, alpha ADD/ONE/ZERO stage is
+// specialized through Sony's ordered tile-local FRAGCOLOR input.
+#define VITASX2_TFX_PROGRAMMABLE_BLEND 1
+#define VITASX2_TFX_PROGRAMMABLE_ADD 1
+#include "vitasx2_tfx_f.cg"

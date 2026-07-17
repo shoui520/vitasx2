@@ -5683,7 +5683,12 @@ void GSTextureCache::CopyPages(Target* src, u32 sbw, u32 src_offset, Target* dst
 	const GSVector4i page_rc = GSVector4i::loadh(pgs);
 	const GSVector4 src_size = GSVector4(src->GetUnscaledSize()).xyxy();
 	const GSVector4 dst_scale = GSVector4(dst->GetScale());
-	GSDevice::MultiStretchRect* rects = static_cast<GSDevice::MultiStretchRect*>(alloca(sizeof(GSDevice::MultiStretchRect) * num_pages));
+	constexpr size_t rect_alignment = alignof(GSDevice::MultiStretchRect);
+	const size_t rect_bytes = sizeof(GSDevice::MultiStretchRect) * num_pages;
+	void* const rect_storage = alloca(rect_bytes + rect_alignment - 1);
+	GSDevice::MultiStretchRect* rects = reinterpret_cast<GSDevice::MultiStretchRect*>(
+		(reinterpret_cast<uptr>(rect_storage) + rect_alignment - 1) &
+		~static_cast<uptr>(rect_alignment - 1));
 	for (u32 i = 0; i < num_pages; i++)
 	{
 		const u32 src_page_num = src_offset + i;
@@ -6678,8 +6683,13 @@ GSTextureCache::Source* GSTextureCache::CreateMergedSource(GIFRegTEX0 TEX0, GIFR
 
 	// Queue of rectangles to copy, we try to batch as many at once as possible.
 	// Multiply by 2 in case we need to preload.
+	constexpr size_t copy_alignment = alignof(GSDevice::MultiStretchRect);
+	const size_t copy_bytes = sizeof(GSDevice::MultiStretchRect) * num_pages * 2;
+	void* const copy_storage = alloca(copy_bytes + copy_alignment - 1);
 	GSDevice::MultiStretchRect* copy_queue =
-		static_cast<GSDevice::MultiStretchRect*>(alloca(sizeof(GSDevice::MultiStretchRect) * num_pages * 2));
+		reinterpret_cast<GSDevice::MultiStretchRect*>(
+			(reinterpret_cast<uptr>(copy_storage) + copy_alignment - 1) &
+			~static_cast<uptr>(copy_alignment - 1));
 	u32 copy_count = 0;
 
 	// Page counters.
@@ -7896,8 +7906,13 @@ void GSTextureCache::Target::Update(bool cannot_scale)
 	const bool override_linear = (upscaled && GSConfig.UserHacks_BilinearHack == GSBilinearDirtyMode::ForceBilinear);
 	const bool linear = (m_type == RenderTarget && upscaled && GSConfig.UserHacks_BilinearHack != GSBilinearDirtyMode::ForceNearest);
 
-	GSDevice::MultiStretchRect* drects = static_cast<GSDevice::MultiStretchRect*>(
-		alloca(sizeof(GSDevice::MultiStretchRect) * static_cast<u32>(m_dirty.size())));
+	constexpr size_t drect_alignment = alignof(GSDevice::MultiStretchRect);
+	const size_t drect_bytes = sizeof(GSDevice::MultiStretchRect) * m_dirty.size();
+	void* const drect_storage = alloca(drect_bytes + drect_alignment - 1);
+	GSDevice::MultiStretchRect* drects =
+		reinterpret_cast<GSDevice::MultiStretchRect*>(
+			(reinterpret_cast<uptr>(drect_storage) + drect_alignment - 1) &
+			~static_cast<uptr>(drect_alignment - 1));
 	u32 ndrects = 0;
 
 	const GSOffset off(g_gs_renderer->m_mem.GetOffset(m_TEX0.TBP0, m_TEX0.TBW, m_TEX0.PSM));

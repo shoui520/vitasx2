@@ -112,7 +112,10 @@ static inline uint64x2_t vceqq_s64(int64x2_t a, int64x2_t b)
 	return vreinterpretq_u64_u32(vandq_u32(eq32, vrev64q_u32(eq32)));
 }
 
-class alignas(16) GSVector4i
+// Match the AAPCS32 eight-byte stack/indirect-result contract. Explicitly
+// 16-byte-aligned arrays remain aligned, but by-value temporaries must not make
+// GCC emit alignment-qualified NEON accesses to merely eight-byte storage.
+class alignas(8) GSVector4i
 {
 	static const GSVector4i m_xff[17];
 	static const GSVector4i m_x0f[17];
