@@ -823,6 +823,12 @@ namespace VitaEE
 			Finish,
 		};
 		Vu0SyncMode CurrentVu0SyncMode() const;
+		struct Cop2ArithmeticFlagNeeds
+		{
+			bool status = true;
+			bool mac = true;
+		};
+		Cop2ArithmeticFlagNeeds CurrentCop2ArithmeticFlagNeeds(u32 op) const;
 		bool EmitCOP2IdleBranch(Vu0SyncMode sync_mode, size_t* vu0_idle);
 		bool EmitCOP2VectorTransferBody(u32 op);
 		bool EmitCOP2ControlReadBody(u32 op);

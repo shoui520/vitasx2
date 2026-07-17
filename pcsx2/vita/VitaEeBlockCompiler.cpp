@@ -223,6 +223,9 @@ u32 g_qemuPartialZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroLoadSkips = 0;
 u32 g_qemuCop2QwordZeroStoreFastPaths = 0;
 u32 g_qemuCop2Vf0ConstantTransferFastPaths = 0;
+u32 g_qemuCop2DeadStatusFlagOps = 0;
+u32 g_qemuCop2DeadMacFlagOps = 0;
+u32 g_qemuCop2ResultOnlyQuadOps = 0;
 u32 g_qemuCop2RawGpr0Qmtc2ZeroFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheDirectStores = 0;
@@ -15046,6 +15049,115 @@ namespace VitaEE
 		return Vu0SyncMode::Sync;
 	}
 
+	BlockCompiler::Cop2ArithmeticFlagNeeds BlockCompiler::CurrentCop2ArithmeticFlagNeeds(u32 op) const
+	{
+		// PCSX2 owner: x86/iR5900Analysis.cpp::COP2FlagHackPass::Run() and
+		// ix86-32/iR5900.cpp::cop2flags().  The x86 pass postpones COP2 flag
+		// publication until an observer.  Keep the same block-wide question here,
+		// but use a deliberately stricter proof than PCSX2's optional flag hack:
+		// only remove a flag result when a later instruction overwrites every bit
+		// which the current instruction could contribute before any helper or
+		// architectural observation.  This is valid even when vuFlagHack is off.
+		Cop2ArithmeticFlagNeeds needs{};
+		if (!DecodeCop2MacroArithmetic(op).valid ||
+			m_current_block_instruction_count == 0 ||
+			m_current_instruction_index >= m_current_block_instruction_count)
+		{
+			return needs;
+		}
+
+		bool later_status_writer = false;
+		for (u32 i = m_current_instruction_index + 1;
+			i < m_current_block_instruction_count; i++)
+		{
+			const u32 following = memRead32(
+				m_current_block_start_pc + i * sizeof(u32));
+			const unsigned opcode = following >> 26;
+			if (opcode != 0x12)
+				break;
+
+			const unsigned rs = RS(following);
+			const unsigned rd = RD(following);
+			if (rs == 0x02) // CFC2
+			{
+				if (rd == VU0_REG_STATUS_FLAG)
+					break;
+				// Other control reads do not observe STATUS.
+				continue;
+			}
+			if (rs == 0x06) // CTC2
+			{
+				if (rd == VU0_REG_STATUS_FLAG)
+				{
+					// recCTC2(Status) preserves current bits 0..5 but replaces
+					// sticky bits 6..11.  A later flag writer therefore kills
+					// both contributions from this instruction; without one, its
+					// current bits remain observable through the CTC2.
+					needs.status = !later_status_writer;
+				}
+				break;
+			}
+
+			if (!IsFastCOP2MacroInBlock(following))
+				break;
+			if (DecodeCop2MacroArithmetic(following).valid)
+			{
+				// Ordinary FMAC arithmetic replaces every current STATUS bit
+				// this instruction can contribute (Z/S/U/O). FDIV/SQRT/RSQRT
+				// replace only D/I and therefore cannot kill an earlier FMAC
+				// current result before CTC2 preserves bits 0..5.
+				later_status_writer = true;
+			}
+		}
+
+		for (u32 i = m_current_instruction_index + 1;
+			i < m_current_block_instruction_count; i++)
+		{
+			const u32 following = memRead32(
+				m_current_block_start_pc + i * sizeof(u32));
+			if ((following >> 26) != 0x12)
+				break;
+
+			const unsigned rs = RS(following);
+			const unsigned rd = RD(following);
+			if (rs == 0x02) // CFC2
+			{
+				if (rd == VU0_REG_MAC_FLAG)
+					break;
+				continue;
+			}
+			if (rs == 0x06)
+			{
+				// PCSX2's COP2FlagHackPass does not commit MAC for a STATUS
+				// transfer, and recCTC2(Status) neither reads nor writes it.  FBRST
+				// and CMSAR1 can call/reset another engine; keep those as barriers.
+				// Ordinary VI/control writes and the read-only MAC destination are
+				// transparent to the pending value.
+				if (rd != VU0_REG_FBRST && rd != VU0_REG_CMSAR1)
+					continue;
+				break;
+			}
+			if (!IsFastCOP2MacroInBlock(following))
+				break;
+
+			const Cop2MacroArithmeticOp arithmetic =
+				DecodeCop2MacroArithmetic(following);
+			if (!arithmetic.valid)
+				continue;
+			if (arithmetic.kind != Cop2MacroArithmeticKind::OpMula &&
+				arithmetic.kind != Cop2MacroArithmeticKind::OpMSub)
+			{
+				// Ordinary macro arithmetic rewrites/clears every MAC lane,
+				// including masked-off destination lanes.  Outer-product forms
+				// preserve W and therefore are not a complete kill.
+				needs.mac = false;
+				break;
+			}
+		}
+
+		return needs;
+	}
+
 	bool BlockCompiler::EmitCOP2IdleBranch(Vu0SyncMode sync_mode, size_t* vu0_idle)
 	{
 		// PCSX2 owners: iR5900Analysis.cpp::COP2MicroFinishPass::Run() and
@@ -15593,6 +15705,13 @@ namespace VitaEE
 									 arithmetic.kind == Cop2MacroArithmeticKind::MSub ||
 									 arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
 		const bool use_addi_triace_hack = arithmetic.addi_triace_hack && CHECK_VUADDSUBHACK;
+		const Cop2ArithmeticFlagNeeds flag_needs = CurrentCop2ArithmeticFlagNeeds(op);
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!flag_needs.status)
+			g_qemuCop2DeadStatusFlagOps++;
+		if (!flag_needs.mac)
+			g_qemuCop2DeadMacFlagOps++;
+#endif
 
 		const auto emit_normalize_vu_float_word = [&](unsigned reg) {
 			if (!EmitAndImm32OrReg(HOST_TMP3, reg, FPU_FLOAT_EXPONENT_MASK, HOST_TMP5) ||
@@ -15829,6 +15948,9 @@ namespace VitaEE
 		};
 
 		const auto emit_sync_msflags = [&]() {
+			if (!flag_needs.status && !flag_needs.mac)
+				return true;
+
 			const auto emit_status_bit = [&](u32 mac_mask, u8 status_bit) {
 				return m_code.EmitTstImm32(HOST_TMP4, mac_mask) &&
 					   m_code.EmitMovImm8(HOST_TMP2, 0) &&
@@ -15836,15 +15958,22 @@ namespace VitaEE
 					   m_code.EmitOrrReg(HOST_TMP0, HOST_TMP0, HOST_TMP2);
 			};
 
+			if (flag_needs.mac &&
+				(!EmitVu0RegisterAddress(HOST_TMP1, VU0_MACFLAG_OFFSET) ||
+				 !m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, 0) ||
+				 !EmitVu0ViAddress(HOST_TMP1, VU0_REG_MAC_FLAG) ||
+				 !m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, 0)))
+			{
+				return false;
+			}
+			if (!flag_needs.status)
+				return true;
+
 			if (!m_code.EmitMovImm8(HOST_TMP0, 0) ||
 				!emit_status_bit(0x000fu, 0x1) ||
 				!emit_status_bit(0x00f0u, 0x2) ||
 				!emit_status_bit(0x0f00u, 0x4) ||
 				!emit_status_bit(0xf000u, 0x8) ||
-				!EmitVu0RegisterAddress(HOST_TMP1, VU0_MACFLAG_OFFSET) ||
-				!m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, 0) ||
-				!EmitVu0ViAddress(HOST_TMP1, VU0_REG_MAC_FLAG) ||
-				!m_code.EmitStrImm12(HOST_TMP4, HOST_TMP1, 0) ||
 				!EmitVu0RegisterAddress(HOST_TMP1, VU0_STATUSFLAG_OFFSET) ||
 				!m_code.EmitStrImm12(HOST_TMP0, HOST_TMP1, 0) ||
 				!EmitVu0ViAddress(HOST_TMP1, VU0_REG_STATUS_FLAG) ||
@@ -15938,18 +16067,110 @@ namespace VitaEE
 				   m_code.EmitVeorQ(vq, vq, NQ_TMP);
 		};
 
-		if (!EmitVu0RegisterAddress(HOST_TMP2, VU0_MACFLAG_OFFSET) ||
-			!m_code.EmitLdrImm12(HOST_TMP4, HOST_TMP2, 0))
-		{
-			return false;
-		}
-
 		// The TriAce add hack does a per-lane exponent compare that resists
 		// vectorization, and the outer product has cross-lane fd==fs/ft store
 		// hazards; both keep the scalar loop. Everything else preloads and
 		// NEON-normalizes fs/ft/ACC once, then runs scalar VFP arithmetic per
 		// active lane against the pre-normalized quad lanes.
 		const bool use_quad = !use_addi_triace_hack && !is_outer_product;
+		if (use_quad && !flag_needs.status && !flag_needs.mac)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCop2ResultOnlyQuadOps++;
+#endif
+			// With both flag products proven dead, retain all four scalar VFP
+			// results in Q3, normalize once with the existing bit-exact vuDouble()
+			// quad sequence, and publish only the architectural destination.  This
+			// removes four VFP->ARM transfers, per-lane flag reconstruction, and
+			// the immediate MAC/STATUS stores.  Q3 is disjoint from Q0-Q2 inputs
+			// and physical Q8-Q15 normalization constants/scratch.
+			if (mask == 0 || (!arithmetic.acc_destination && fd == 0))
+				return true;
+
+			constexpr unsigned QUAD_RESULT = 3; // Q3 -> S12-S15
+			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+				!m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0) ||
+				!emit_prepare_operand_quad() ||
+				(uses_acc_source &&
+					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
+					 !m_code.EmitVld1Q32Aligned(QUAD_ACC, HOST_TMP0))) ||
+				!emit_ensure_norm_consts() ||
+				!emit_normalize_quad(QUAD_FS) ||
+				!emit_normalize_quad(QUAD_FT) ||
+				(uses_acc_source && !emit_normalize_quad(QUAD_ACC)))
+			{
+				return false;
+			}
+
+			for (unsigned lane = 0; lane < 4; lane++)
+			{
+				if ((mask & (1u << (3 - lane))) == 0)
+					continue;
+
+				const unsigned result_s = QUAD_RESULT * 4 + lane;
+				const unsigned fs_s = QUAD_FS * 4 + lane;
+				const unsigned ft_s = QUAD_FT * 4 + lane;
+				const unsigned acc_s = QUAD_ACC * 4 + lane;
+				switch (arithmetic.kind)
+				{
+					case Cop2MacroArithmeticKind::Add:
+						if (!m_code.EmitVaddF32(result_s, fs_s, ft_s))
+							return false;
+						break;
+					case Cop2MacroArithmeticKind::Sub:
+						if (!m_code.EmitVsubF32(result_s, fs_s, ft_s))
+							return false;
+						break;
+					case Cop2MacroArithmeticKind::Mul:
+						if (!m_code.EmitVmulF32(result_s, fs_s, ft_s))
+							return false;
+						break;
+					case Cop2MacroArithmeticKind::MAdd:
+						if (!m_code.EmitVmulF32(result_s, fs_s, ft_s) ||
+							!m_code.EmitVaddF32(result_s, acc_s, result_s))
+						{
+							return false;
+						}
+						break;
+					case Cop2MacroArithmeticKind::MSub:
+						if (!m_code.EmitVmulF32(result_s, fs_s, ft_s) ||
+							!m_code.EmitVsubF32(result_s, acc_s, result_s))
+						{
+							return false;
+						}
+						break;
+					case Cop2MacroArithmeticKind::OpMula:
+					case Cop2MacroArithmeticKind::OpMSub:
+						return false;
+				}
+			}
+
+			if (!emit_normalize_quad(QUAD_RESULT))
+				return false;
+			if (arithmetic.acc_destination)
+			{
+				return EmitVu0RegisterAddress(HOST_TMP1, VU0_ACC_OFFSET) &&
+					   EmitCOP2MacroStoreSelectedLanes(mask, QUAD_RESULT, HOST_TMP1);
+			}
+			return EmitCOP2MacroStoreVfSelectedLanes(
+				fd, mask, QUAD_RESULT, HOST_TMP1);
+		}
+
+		// Every regular arithmetic form overwrites or clears all four MAC lanes,
+		// so it does not need the previous MAC value. Outer products preserve W.
+		if (is_outer_product)
+		{
+			if (!EmitVu0RegisterAddress(HOST_TMP2, VU0_MACFLAG_OFFSET) ||
+				!m_code.EmitLdrImm12(HOST_TMP4, HOST_TMP2, 0))
+			{
+				return false;
+			}
+		}
+		else if (!m_code.EmitMovImm8(HOST_TMP4, 0))
+		{
+			return false;
+		}
+
 		if (use_quad)
 		{
 			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
