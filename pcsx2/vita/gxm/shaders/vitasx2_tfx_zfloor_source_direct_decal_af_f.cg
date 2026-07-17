@@ -1,0 +1,24 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owner: tfx_fs.glsl's compile-time PS selector. This is the general
+// Z-floor + DECAL/RGB + (Cs-0)*Af+0 + blend-mix-one STQ family, including
+// PCSX2's host ADD/ONE/(1-CONST) split through FRAGCOLOR. The C++ route proves
+// every axis compiled out here; selection is independent of title, guest PC,
+// texture address, dimensions, and geometry.
+#define VITASX2_TFX_ZFLOOR 1
+#define VITASX2_TFX_SOURCE_ONLY 1
+#define VITASX2_TFX_PROGRAMMABLE_BLEND 1
+#define VITASX2_TFX_PROGRAMMABLE_CONST_OVER 1
+#define VITASX2_TFX_DIRECT_TEXTURE 1
+#define VITASX2_TFX_STQ 1
+#define VITASX2_TFX_DECAL_RGB 1
+#define VITASX2_TFX_SOURCE_BLEND_AF 1
+#define VITASX2_TFX_BLEND_MIX1 1
+#define VITASX2_TFX_NO_FOG_ALPHA_TEST 1
+#define VITASX2_TFX_NO_DATE 1
+#define VITASX2_TFX_NO_FBA 1
+#define VITASX2_TFX_NO_RTA_SOURCE_CORRECTION 1
+#define VITASX2_TFX_NO_COLCLIP 1
+#define VITASX2_TFX_RTA_CORRECTION 1
+#include "vitasx2_tfx_f.cg"

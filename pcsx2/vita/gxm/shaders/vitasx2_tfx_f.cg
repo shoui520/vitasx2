@@ -245,7 +245,11 @@ __nativecolor __regformat unsigned char4 main(
 	}
 
 	float4 color;
-#if defined(VITASX2_TFX_MODULATE_RGBA)
+#if defined(VITASX2_TFX_DECAL_RGB)
+	// PCSX2's compile-time PS_TFX=DECAL/PS_TCC=RGB path. Texture RGB
+	// replaces vertex RGB while alpha remains the vertex alpha.
+	color = float4(textureColor.rgb, vertexColor.a);
+#elif defined(VITASX2_TFX_MODULATE_RGBA)
 	// PCSX2 tfx_fs.glsl compiles PS_TFX/TCC as selector constants. MODULATE
 	// with RGBA uses all four sampled channels and saturates the multiplied
 	// result to the GS 0..255 range.
@@ -306,6 +310,7 @@ __nativecolor __regformat unsigned char4 main(
 	const float4 destination = float4(0.0f);
 #else
 	const float4 destination = float4(fragColor);
+#if !defined(VITASX2_TFX_NO_DATE)
 	if (Selector5.x > 4.5f)
 	{
 		const float threshold = Selector4.y > 0.5f ? 254.5f : 127.5f;
@@ -314,6 +319,7 @@ __nativecolor __regformat unsigned char4 main(
 			(dateMode > 1.5f && destination.a < threshold))
 			discard;
 	}
+#endif
 #endif
 
 	// PCSX2 derives the blend factor from pre-FBA source alpha.
@@ -332,7 +338,12 @@ __nativecolor __regformat unsigned char4 main(
 #if defined(VITASX2_TFX_SOURCE_BLEND_AF)
 	// PCSX2's compile-time blend tuple (Cs - 0) * Af + 0. Blend-mix
 	// correction remains below because it is an independent selector axis.
+	#if defined(VITASX2_TFX_BLEND_MIX1) || \
+		defined(VITASX2_TFX_BLEND_MIX2)
+	float3 blended = color.rgb * min(TextureAlpha.w, 1.0f);
+	#else
 	float3 blended = color.rgb * TextureAlpha.w;
+	#endif
 #else
 	const float4 A = Selector3.x < 0.5f ? color : float4(0.0f);
 	const float4 B = Selector3.y < 0.5f ? color : float4(0.0f);
@@ -343,6 +354,8 @@ __nativecolor __regformat unsigned char4 main(
 #endif
 #if defined(VITASX2_TFX_BLEND_MIX0)
 	blended = trunc(blended);
+#elif defined(VITASX2_TFX_BLEND_MIX1)
+	blended -= 124.0f / 256.0f;
 #else
 	if (Selector5.z < 0.5f)
 		blended = trunc(blended);
@@ -409,19 +422,25 @@ __nativecolor __regformat unsigned char4 main(
 
 	// Scaled RT alpha is PCSX2's storage representation: an architectural
 	// 0..128 alpha occupies the full 8-bit host channel.
+#if defined(VITASX2_TFX_RTA_CORRECTION)
+	const float outputAlpha = color.a * (255.0f / 128.0f);
+#else
 	const float outputAlpha = Selector4.y > 0.5f ?
 		color.a * (255.0f / 128.0f) : color.a;
+#endif
 #if defined(VITASX2_TFX_PROGRAMMABLE_BLEND)
-	// This is ApplyHardwareBlend() specialized for PCSX2's proven host state:
-	// RGB ADD/ONE/ONE and alpha ADD/ONE/ZERO. Keep the source in float until the
-	// final native-color conversion, matching the exact general program's
-	// blend-mix rounding and saturation order.
+	// Apply PCSX2's selector-proven host equation without retaining the general
+	// factor selection. Keep the source in float until native-color conversion,
+	// matching the general program's blend-mix rounding and saturation order.
 	const float4 sourceResult = float4(color.rgb, outputAlpha);
 	const float4 destinationResult = float4(fragColor);
 	#if defined(VITASX2_TFX_PROGRAMMABLE_ADD)
 	float4 result = sourceResult + destinationResult;
 	#elif defined(VITASX2_TFX_PROGRAMMABLE_OVER)
 	float4 result = sourceResult + destinationResult * (1.0f - secondary);
+	#elif defined(VITASX2_TFX_PROGRAMMABLE_CONST_OVER)
+	float4 result = sourceResult + destinationResult *
+		(1.0f - HardwareBlend1.z);
 	#endif
 	result.a = sourceResult.a;
 	result = saturate(result / 255.0f) * 255.0f;
