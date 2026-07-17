@@ -156,7 +156,10 @@ __nativecolor __regformat unsigned char4 main(
 	float4 vTexFloat : TEXCOORD0,
 	float4 vTexInt : TEXCOORD1,
 	float4 vColor : TEXCOORD2,
-	float2 windowPosition : WPOS,
+	float4 windowPosition : WPOS,
+#if defined(VITASX2_TFX_ZFLOOR)
+	out float fragmentDepth : DEPTH,
+#endif
 #if !defined(VITASX2_TFX_UNTEXTURED)
 	uniform sampler2D sourceTexture : TEXUNIT0,
 #endif
@@ -179,6 +182,15 @@ __nativecolor __regformat unsigned char4 main(
 	uniform float4 HardwareBlend1,
 	uniform float4 ColorMask)
 {
+	// PCSX2 tfx_fs.glsl::ps_main floors interpolated Z before testing and
+	// writing. A DEPTH output makes GXM use the replacement value for both;
+	// Sony's tutorial_hidden_surface_removal/depth_replace_f.cg owns this API
+	// contract. Keep this in a dedicated GXP so ordinary draws retain early Z.
+#if defined(VITASX2_TFX_ZFLOOR)
+	fragmentDepth = floor(windowPosition.z * 4294967296.0f) *
+		(1.0f / 4294967296.0f);
+#endif
+
 	// Selector0: tme/fst/tfx/tcc.
 	// Selector1: fog/atst/fba/dst_fmt.
 	// Selector2: aem/aem_fmt/ltf/rta_source_correction.

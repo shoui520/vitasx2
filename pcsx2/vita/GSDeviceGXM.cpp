@@ -45,6 +45,7 @@ extern "C"
 	extern const SceGxmProgram _binary_vitasx2_mad_reconstruct_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_v_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_zfloor_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_fast_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_untextured_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_source_f_gxp_start;
@@ -280,6 +281,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 
 	SceGxmShaderPatcherId tfx_vertex_id = nullptr;
 	SceGxmShaderPatcherId tfx_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_zfloor_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_fast_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_untextured_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_source_fragment_id = nullptr;
@@ -302,6 +304,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmShaderPatcherId mad_reconstruct_fragment_id = nullptr;
 	SceGxmVertexProgram* tfx_vertex_program = nullptr;
 	SceGxmFragmentProgram* tfx_fragment_program = nullptr;
+	SceGxmFragmentProgram* tfx_zfloor_fragment_program = nullptr;
 	SceGxmFragmentProgram* tfx_opaque_program = nullptr;
 	SceGxmFragmentProgram* tfx_programmable_add_program = nullptr;
 	SceGxmFragmentProgram* tfx_programmable_add_direct_program = nullptr;
@@ -320,6 +323,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmFragmentProgram* color_fragment_program = nullptr;
 	SceGxmFragmentProgram* mask_update_program = nullptr;
 	ProgramUniforms uniforms;
+	ProgramUniforms zfloor_uniforms;
 	ProgramUniforms fast_uniforms;
 	ProgramUniforms untextured_uniforms;
 	ProgramUniforms source_uniforms;
@@ -717,6 +721,8 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 {
 	const SceGxmProgram* const tfx_v = &_binary_vitasx2_tfx_v_gxp_start;
 	const SceGxmProgram* const tfx_f = &_binary_vitasx2_tfx_f_gxp_start;
+	const SceGxmProgram* const tfx_zfloor_f =
+		&_binary_vitasx2_tfx_zfloor_f_gxp_start;
 	const SceGxmProgram* const tfx_fast_f =
 		&_binary_vitasx2_tfx_fast_f_gxp_start;
 	const SceGxmProgram* const tfx_untextured_f =
@@ -751,7 +757,7 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		&_binary_vitasx2_mad_buffer_f_gxp_start;
 	const SceGxmProgram* const mad_reconstruct_f =
 		&_binary_vitasx2_mad_reconstruct_f_gxp_start;
-	for (const SceGxmProgram* program : {tfx_v, tfx_f, tfx_fast_f,
+	for (const SceGxmProgram* program : {tfx_v, tfx_f, tfx_zfloor_f, tfx_fast_f,
 		tfx_untextured_f, tfx_source_f, tfx_programmable_add_f,
 		tfx_programmable_add_direct_f,
 		tfx_programmable_over_f,
@@ -775,6 +781,8 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 	};
 	if (!register_program(tfx_v, &tfx_vertex_id, "register TFX vertex program") ||
 		!register_program(tfx_f, &tfx_fragment_id, "register TFX fragment program") ||
+		!register_program(tfx_zfloor_f, &tfx_zfloor_fragment_id,
+			"register Z-floor TFX fragment program") ||
 		!register_program(tfx_fast_f, &tfx_fast_fragment_id,
 			"register fast TFX fragment program") ||
 		!register_program(tfx_untextured_f, &tfx_untextured_fragment_id,
@@ -863,6 +871,7 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		uniforms.selector[i] = parameter(tfx_f, selector_names[i],
 			SCE_GXM_PARAMETER_CATEGORY_UNIFORM);
 	}
+	load_variant_uniforms(tfx_zfloor_f, &zfloor_uniforms);
 	load_variant_uniforms(tfx_fast_f, &fast_uniforms);
 	load_variant_uniforms(tfx_untextured_f, &untextured_uniforms);
 	load_variant_uniforms(tfx_source_f, &source_uniforms);
@@ -957,6 +966,12 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		nullptr, tfx_v, &tfx_fragment_program);
 	if (result < 0 || !tfx_fragment_program)
 		return Fail("create TFX fragment program", result);
+	result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_zfloor_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
+		SCE_GXM_MULTISAMPLE_NONE, nullptr, tfx_v,
+		&tfx_zfloor_fragment_program);
+	if (result < 0 || !tfx_zfloor_fragment_program)
+		return Fail("create Z-floor TFX fragment program", result);
 
 	// Full-channel opaque output requires neither FRAGCOLOR nor fixed blending.
 	// Create it with the same null blend contract as Sony's non-blended samples;
@@ -1454,15 +1469,8 @@ bool GSDeviceGXM::Impl::QueueTextureUpload(VitaGXM::GSTextureGXM& texture,
 	const u32 row_bytes = destination.width() * bpp;
 	if (source_pitch < row_bytes)
 		return false;
-	u8* target = static_cast<u8*>(texture.LevelData(level)) +
-		static_cast<size_t>(destination.y) * layout->pitch +
-		static_cast<size_t>(destination.x) * bpp;
-	const u8* input = static_cast<const u8*>(source.Data());
-	for (int y = 0; y < destination.height(); y++)
-	{
-		std::memcpy(target + static_cast<size_t>(y) * layout->pitch,
-			input + static_cast<size_t>(y) * source_pitch, row_bytes);
-	}
+	if (!texture.CopyFromLinear(level, destination, source.Data(), source_pitch))
+		return false;
 	*serial = ++transfer_serial;
 	completed_transfer_serial = transfer_serial;
 	texture.MarkTransferUse(*serial);
@@ -1481,17 +1489,11 @@ bool GSDeviceGXM::Impl::QueueTextureReadback(VitaGXM::GSTextureGXM& texture,
 	const u32 row_bytes = source.width() * bpp;
 	if (destination_pitch < row_bytes)
 		return false;
-	const u8* input = static_cast<const u8*>(texture.LevelData(level)) +
-		static_cast<size_t>(source.y) * layout->pitch +
-		static_cast<size_t>(source.x) * bpp;
 	u8* output = static_cast<u8*>(destination) +
 		static_cast<size_t>(destination_rect.y) * destination_pitch +
 		static_cast<size_t>(destination_rect.x) * bpp;
-	for (int y = 0; y < source.height(); y++)
-	{
-		std::memcpy(output + static_cast<size_t>(y) * destination_pitch,
-			input + static_cast<size_t>(y) * layout->pitch, row_bytes);
-	}
+	if (!texture.CopyToLinear(level, source, output, destination_pitch))
+		return false;
 	*serial = ++transfer_serial;
 	completed_transfer_serial = transfer_serial;
 	texture.MarkTransferUse(*serial);
@@ -1764,7 +1766,7 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	bool untextured_fragment)
 {
 	const ProgramUniforms& fragment_uniforms =
-		programmable_add_direct_fragment ?
+		ps.zfloor ? zfloor_uniforms : (programmable_add_direct_fragment ?
 		programmable_add_direct_uniforms : (programmable_add_fragment ?
 		programmable_add_uniforms : (programmable_over_fragment ?
 		programmable_over_uniforms : (source_only_fragment ?
@@ -1775,7 +1777,7 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 				source_direct_modulate_uniforms :
 			(source_direct_fragment ? source_direct_uniforms : source_uniforms)))) :
 		(untextured_fragment ? untextured_uniforms :
-			(fast_fragment ? fast_uniforms : uniforms)))));
+			(fast_fragment ? fast_uniforms : uniforms))))));
 	void* vertex_buffer = nullptr;
 	int result = sceGxmReserveVertexDefaultUniformBuffer(context, &vertex_buffer);
 	if (result < 0 || !vertex_buffer)
@@ -1920,20 +1922,13 @@ VitaGXM::GSTextureGXM* GSDeviceGXM::Impl::SnapshotTexture(
 		it = feedback_textures.emplace(key, std::move(texture)).first;
 	}
 	VitaGXM::GSTextureGXM& destination = *it->second;
-	const VitaGXM::TextureLevelLayout* src_layout = source.Level(0);
 	const VitaGXM::TextureLevelLayout* dst_layout = destination.Level(0);
-	if (!src_layout || !dst_layout)
+	if (!source.Level(0) || !dst_layout)
 		return nullptr;
-	const u32 row_bytes = area.width() * 4;
-	const u8* src = static_cast<const u8*>(source.LevelData(0)) +
-		static_cast<size_t>(area.y) * src_layout->pitch + area.x * 4;
 	u8* dst = static_cast<u8*>(destination.LevelData(0)) +
 		static_cast<size_t>(area.y) * dst_layout->pitch + area.x * 4;
-	for (int y = 0; y < area.height(); y++)
-	{
-		std::memcpy(dst + static_cast<size_t>(y) * dst_layout->pitch,
-			src + static_cast<size_t>(y) * src_layout->pitch, row_bytes);
-	}
+	if (!source.CopyToLinear(0, area, dst, dst_layout->pitch))
+		return nullptr;
 	destination.SetState(GSTexture::State::Dirty);
 	return &destination;
 }
@@ -2219,7 +2214,7 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		config.ps.rov_color ||
 		config.ps.rov_depth != GSHWDrawConfig::PS_ROV_DEPTH::NONE ||
 		config.ps.wms > 1 || config.ps.wmt > 1 || config.ps.zclamp ||
-		config.ps.zfloor || config.ps.tcoffsethack || config.ps.adjs ||
+		config.ps.tcoffsethack || config.ps.adjs ||
 		config.ps.adjt || config.ps.tex_is_fb ||
 		config.ps.manual_lod || config.ps.date || config.ps.abe ||
 		config.depth.date || config.depth.date_one ||
@@ -2321,7 +2316,8 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 	// remaining host blend is ordinary ADD/ONE/ONE. Use Sony's fixed-blend
 	// contract to avoid the SGX framebuffer fetch entirely.
 	bool source_only_fragment = blend_effective && full_color_write &&
-		!config.ps.fbmask && m_impl->CanUseSourceOnlyTfx(config);
+		!config.ps.fbmask && !config.ps.zfloor &&
+		m_impl->CanUseSourceOnlyTfx(config);
 	bool untextured_fragment = source_only_fragment && !config.vs.tme;
 	bool source_direct_fragment = source_only_fragment &&
 		m_impl->CanUseSourceDirectTfx(config);
@@ -2347,14 +2343,30 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 	bool programmable_add_fragment = programmable_add &&
 		!programmable_add_direct && !fixed_source_fragment;
 	bool programmable_over_fragment = programmable_over;
-	SceGxmFragmentProgram* fragment = fixed_source_fragment ?
+	if (config.ps.zfloor)
+	{
+		// Fragment-depth replacement is deliberately isolated from the fast and
+		// fixed-blend programs. PCSX2 requires flooring after rasterization;
+		// retaining a vertex-only or non-depth-output specialization is wrong.
+		fast_fragment = false;
+		programmable_add_direct_fragment = false;
+		programmable_add_fragment = false;
+		programmable_over_fragment = false;
+		source_only_fragment = false;
+		source_direct_fragment = false;
+		source_direct_modulate_fragment = false;
+		source_direct_modulate_af_fragment = false;
+		untextured_fragment = false;
+	}
+	SceGxmFragmentProgram* fragment = config.ps.zfloor ?
+		m_impl->tfx_zfloor_fragment_program : (fixed_source_fragment ?
 		fixed_source_fragment : (programmable_add_direct ?
 		m_impl->tfx_programmable_add_direct_program :
 		(programmable_add ?
 		m_impl->tfx_programmable_add_program :
 		(programmable_over ? m_impl->tfx_programmable_over_program :
 		(fast_fragment ? m_impl->tfx_opaque_program :
-			m_impl->tfx_fragment_program))));
+			m_impl->tfx_fragment_program)))));
 	if (!fragment)
 	{
 		// Shader-patcher memory exhaustion must not change GS behavior. The
@@ -2466,6 +2478,24 @@ void GSDeviceGXM::CopyRect(GSTexture* source_texture,
 		return;
 	const u32 bpp = source->NativeFormat().bytes_per_pixel;
 	const size_t row_bytes = static_cast<size_t>(requested.width()) * bpp;
+	if (src_layout->tiled || dst_layout->tiled)
+	{
+		std::vector<u8> staging(row_bytes * static_cast<size_t>(requested.height()));
+		const GSVector4i destination_rect(
+			static_cast<int>(destination_x), static_cast<int>(destination_y),
+			static_cast<int>(destination_x) + requested.width(),
+			static_cast<int>(destination_y) + requested.height());
+		if (!source->CopyToLinear(0, requested, staging.data(),
+				static_cast<u32>(row_bytes)) ||
+			!destination->CopyFromLinear(0, destination_rect, staging.data(),
+				static_cast<u32>(row_bytes)))
+		{
+			m_impl->Reject("failed tiled CopyRect staging");
+			return;
+		}
+		destination->SetState(GSTexture::State::Dirty);
+		return;
+	}
 	const u8* src_base = static_cast<const u8*>(source->LevelData(0)) +
 		static_cast<size_t>(requested.y) * src_layout->pitch +
 		static_cast<size_t>(requested.x) * bpp;
@@ -3004,6 +3034,8 @@ void GSDeviceGXM::Impl::Shutdown()
 	release_fragment(tfx_programmable_over_program,
 		"release programmable source-alpha TFX fragment program");
 	release_fragment(tfx_opaque_program, "release opaque TFX fragment program");
+	release_fragment(tfx_zfloor_fragment_program,
+		"release Z-floor TFX fragment program");
 	release_fragment(tfx_fragment_program, "release TFX fragment program");
 	release_vertex(color_vertex_program, "release color vertex program");
 	release_vertex(present_vertex_program, "release presentation vertex program");
@@ -3051,6 +3083,7 @@ void GSDeviceGXM::Impl::Shutdown()
 	unregister(tfx_untextured_fragment_id,
 		"unregister untextured TFX fragment");
 	unregister(tfx_fast_fragment_id, "unregister fast TFX fragment");
+	unregister(tfx_zfloor_fragment_id, "unregister Z-floor TFX fragment");
 	unregister(tfx_fragment_id, "unregister TFX fragment");
 	unregister(tfx_vertex_id, "unregister TFX vertex");
 	if (!group_ok)

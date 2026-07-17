@@ -30,6 +30,7 @@ namespace VitaGXM
 		std::uint32_t pitch = 0;
 		std::uint32_t width = 0;
 		std::uint32_t height = 0;
+		bool tiled = false;
 	};
 
 	struct TextureFormatInfo
@@ -112,6 +113,10 @@ namespace VitaGXM
 
 		const TextureLevelLayout* Level(std::uint32_t level) const;
 		void* LevelData(std::uint32_t level) const;
+		bool CopyFromLinear(std::uint32_t level, const GSVector4i& destination,
+			const void* source, std::uint32_t source_pitch);
+		bool CopyToLinear(std::uint32_t level, const GSVector4i& source,
+			void* destination, std::uint32_t destination_pitch) const;
 		void* StencilData() const { return m_stencil_storage.Data(); }
 		std::uint32_t DepthPitch() const { return m_depth_pitch; }
 		std::uint32_t StencilPitch() const { return m_stencil_pitch; }

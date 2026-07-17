@@ -225,6 +225,79 @@ namespace VitaGXM
 
 	int GSTextureGXM::InitializeColorStorage()
 	{
+		// Sony's GPU guide and tutorial_postprocessing/renderbuffer.c define the
+		// same 32x32 scanline-ordered tile layout for a color surface and its
+		// texture view. Render targets are the only VitaSX2 color allocations
+		// which are both PBE outputs and subsequent texture inputs, so use that
+		// matched layout there. Upload/source textures stay linear: the guide
+		// explicitly makes the choice workload-dependent, and linear storage is
+		// the better CPU/upload contract.
+		const bool tiled_render_target = GSTexture::IsRenderTarget(m_usage) &&
+			m_mipmap_levels == 1 && m_size.x >= 32 && m_size.y >= 32;
+		if (tiled_render_target)
+		{
+			std::size_t storage_width = 0;
+			std::size_t storage_height = 0;
+			std::size_t pitch = 0;
+			std::size_t total_size = 0;
+			if (!AlignUp(static_cast<std::size_t>(m_size.x), 32, &storage_width) ||
+				!AlignUp(static_cast<std::size_t>(m_size.y), 32, &storage_height) ||
+				!Multiply(storage_width, m_native_format.bytes_per_pixel, &pitch) ||
+				!Multiply(pitch, storage_height, &total_size) ||
+				pitch > std::numeric_limits<std::uint32_t>::max())
+			{
+				return SCE_GXM_ERROR_INVALID_VALUE;
+			}
+
+			m_levels.push_back(TextureLevelLayout{0,
+				static_cast<std::uint32_t>(pitch),
+				static_cast<std::uint32_t>(m_size.x),
+				static_cast<std::uint32_t>(m_size.y), true});
+			int result = m_owner->TextureArena().Allocate(
+				total_size, SCE_GXM_TEXTURE_ALIGNMENT, &m_storage);
+			if (result < 0)
+				return result;
+
+			result = sceGxmTextureInitTiled(&m_texture, m_storage.Data(),
+				m_native_format.texture_format,
+				static_cast<std::uint32_t>(m_size.x),
+				static_cast<std::uint32_t>(m_size.y), 0);
+			if (result < 0)
+				return result;
+			result = sceGxmTextureSetUAddrMode(
+				&m_texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+			if (result >= 0)
+				result = sceGxmTextureSetVAddrMode(
+					&m_texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+			if (result >= 0)
+				result = sceGxmTextureSetMinFilter(
+					&m_texture, SCE_GXM_TEXTURE_FILTER_POINT);
+			if (result >= 0)
+				result = sceGxmTextureSetMagFilter(
+					&m_texture, SCE_GXM_TEXTURE_FILTER_POINT);
+			if (result >= 0)
+				result = sceGxmTextureSetMipFilter(
+					&m_texture, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+			if (result >= 0)
+				result = sceGxmTextureValidate(&m_texture);
+			if (result < 0)
+				return result;
+
+			// The official renderbuffer sample passes the logical surface width as
+			// the stride; GXM derives the whole-tile footprint internally.
+			result = sceGxmColorSurfaceInit(&m_color_surface,
+				m_native_format.color_format, SCE_GXM_COLOR_SURFACE_TILED,
+				SCE_GXM_COLOR_SURFACE_SCALE_NONE,
+				m_native_format.output_register_size,
+				static_cast<std::uint32_t>(m_size.x),
+				static_cast<std::uint32_t>(m_size.y),
+				static_cast<std::uint32_t>(m_size.x), m_storage.Data());
+			if (result < 0)
+				return result;
+			m_has_color_surface = true;
+			return 0;
+		}
+
 		std::size_t total_size = 0;
 		std::uint32_t level_width = static_cast<std::uint32_t>(m_size.x);
 		std::uint32_t level_height = static_cast<std::uint32_t>(m_size.y);
@@ -268,7 +341,7 @@ namespace VitaGXM
 
 			m_levels.push_back(TextureLevelLayout{
 				static_cast<std::uint32_t>(total_size),
-				static_cast<std::uint32_t>(pitch), level_width, level_height});
+				static_cast<std::uint32_t>(pitch), level_width, level_height, false});
 			total_size += level_size;
 			level_width = std::max<std::uint32_t>(1, level_width >> 1);
 			level_height = std::max<std::uint32_t>(1, level_height >> 1);
@@ -364,7 +437,7 @@ namespace VitaGXM
 		m_stencil_pitch = static_cast<std::uint32_t>(stencil_pitch);
 		m_levels.push_back(TextureLevelLayout{0, m_depth_pitch,
 			static_cast<std::uint32_t>(m_size.x),
-			static_cast<std::uint32_t>(m_size.y)});
+			static_cast<std::uint32_t>(m_size.y), false});
 
 		// Depth surfaces require a 32-sample stride. A linear-strided texture
 		// view preserves that pitch for PCSX2's depth conversion passes.
@@ -641,6 +714,114 @@ namespace VitaGXM
 	{
 		const TextureLevelLayout* const layout = Level(level);
 		return (layout && m_storage) ? static_cast<std::uint8_t*>(m_storage.Data()) + layout->offset : nullptr;
+	}
+
+	bool GSTextureGXM::CopyFromLinear(std::uint32_t level,
+		const GSVector4i& destination, const void* source,
+		std::uint32_t source_pitch)
+	{
+		const TextureLevelLayout* const layout = Level(level);
+		if (!layout || !source || !ValidateRect(destination, level))
+			return false;
+		const std::size_t row_bytes = static_cast<std::size_t>(destination.width()) *
+			m_native_format.bytes_per_pixel;
+		if (source_pitch < row_bytes)
+			return false;
+
+		const auto* input = static_cast<const std::uint8_t*>(source);
+		auto* output = static_cast<std::uint8_t*>(LevelData(level));
+		if (!layout->tiled)
+		{
+			output += static_cast<std::size_t>(destination.y) * layout->pitch +
+				static_cast<std::size_t>(destination.x) *
+				m_native_format.bytes_per_pixel;
+			for (int y = 0; y < destination.height(); y++)
+			{
+				std::memcpy(output + static_cast<std::size_t>(y) * layout->pitch,
+					input + static_cast<std::size_t>(y) * source_pitch, row_bytes);
+			}
+			return true;
+		}
+
+		const std::size_t width_in_tiles =
+			(layout->pitch / m_native_format.bytes_per_pixel) / 32;
+		for (int row = 0; row < destination.height(); row++)
+		{
+			const std::uint32_t y = static_cast<std::uint32_t>(destination.y + row);
+			std::uint32_t x = static_cast<std::uint32_t>(destination.x);
+			const std::uint32_t end_x = static_cast<std::uint32_t>(destination.z);
+			const std::uint8_t* row_input =
+				input + static_cast<std::size_t>(row) * source_pitch;
+			while (x < end_x)
+			{
+				const std::uint32_t run = std::min<std::uint32_t>(
+					end_x - x, 32 - (x & 31));
+				const std::size_t pixel =
+					(((static_cast<std::size_t>(y >> 5) * width_in_tiles) +
+						(x >> 5)) * 1024) +
+					(static_cast<std::size_t>(y & 31) * 32) + (x & 31);
+				std::memcpy(output + pixel * m_native_format.bytes_per_pixel,
+					row_input + static_cast<std::size_t>(x - destination.x) *
+						m_native_format.bytes_per_pixel,
+					static_cast<std::size_t>(run) * m_native_format.bytes_per_pixel);
+				x += run;
+			}
+		}
+		return true;
+	}
+
+	bool GSTextureGXM::CopyToLinear(std::uint32_t level,
+		const GSVector4i& source, void* destination,
+		std::uint32_t destination_pitch) const
+	{
+		const TextureLevelLayout* const layout = Level(level);
+		if (!layout || !destination || !ValidateRect(source, level))
+			return false;
+		const std::size_t row_bytes = static_cast<std::size_t>(source.width()) *
+			m_native_format.bytes_per_pixel;
+		if (destination_pitch < row_bytes)
+			return false;
+
+		const auto* input = static_cast<const std::uint8_t*>(LevelData(level));
+		auto* output = static_cast<std::uint8_t*>(destination);
+		if (!layout->tiled)
+		{
+			input += static_cast<std::size_t>(source.y) * layout->pitch +
+				static_cast<std::size_t>(source.x) *
+				m_native_format.bytes_per_pixel;
+			for (int y = 0; y < source.height(); y++)
+			{
+				std::memcpy(output + static_cast<std::size_t>(y) * destination_pitch,
+					input + static_cast<std::size_t>(y) * layout->pitch, row_bytes);
+			}
+			return true;
+		}
+
+		const std::size_t width_in_tiles =
+			(layout->pitch / m_native_format.bytes_per_pixel) / 32;
+		for (int row = 0; row < source.height(); row++)
+		{
+			const std::uint32_t y = static_cast<std::uint32_t>(source.y + row);
+			std::uint32_t x = static_cast<std::uint32_t>(source.x);
+			const std::uint32_t end_x = static_cast<std::uint32_t>(source.z);
+			std::uint8_t* row_output =
+				output + static_cast<std::size_t>(row) * destination_pitch;
+			while (x < end_x)
+			{
+				const std::uint32_t run = std::min<std::uint32_t>(
+					end_x - x, 32 - (x & 31));
+				const std::size_t pixel =
+					(((static_cast<std::size_t>(y >> 5) * width_in_tiles) +
+						(x >> 5)) * 1024) +
+					(static_cast<std::size_t>(y & 31) * 32) + (x & 31);
+				std::memcpy(row_output + static_cast<std::size_t>(x - source.x) *
+						m_native_format.bytes_per_pixel,
+					input + pixel * m_native_format.bytes_per_pixel,
+					static_cast<std::size_t>(run) * m_native_format.bytes_per_pixel);
+				x += run;
+			}
+		}
+		return true;
 	}
 
 	void GSTextureGXM::MarkSceneUse(std::uint64_t serial)

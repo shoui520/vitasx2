@@ -309,6 +309,8 @@ else()
 	vitasx2_add_gxm_shader(vitasx2_mad_reconstruct_f sce_fp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_tfx_v sce_vp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_tfx_f sce_fp_psp2)
+	vitasx2_add_gxm_shader(vitasx2_tfx_zfloor_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_fast_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_untextured_f sce_fp_psp2

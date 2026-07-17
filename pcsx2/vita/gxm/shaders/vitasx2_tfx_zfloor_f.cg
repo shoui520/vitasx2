@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owner: tfx_fs.glsl::ps_main. Interpolated GS Z is floored to the
+// 32-bit GS depth grid after rasterization and replaces the fragment depth.
+#define VITASX2_TFX_ZFLOOR 1
+#include "vitasx2_tfx_f.cg"
