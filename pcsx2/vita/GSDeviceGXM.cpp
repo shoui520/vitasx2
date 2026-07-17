@@ -67,6 +67,10 @@ namespace
 	constexpr u32 MAX_STAGED_INDICES = 65532;
 	constexpr u32 MAX_RENDER_TARGETS = 48;
 	constexpr size_t MAX_TFX_PATCHED_PROGRAMS = 128;
+	// vitaGL's GXM owner records eight as libGXM's per-target maximum. Sony's
+	// macrotile_sync and tutorial_postprocessing samples raise scenesPerFrame
+	// for targets used by several ordered passes instead of leaving it at one.
+	constexpr u16 MAX_GXM_SCENES_PER_RENDER_TARGET = 8;
 
 	struct TfxVertex
 	{
@@ -215,6 +219,10 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	{
 		u32 width = 0;
 		u32 height = 0;
+		u16 scenes_per_frame = 1;
+		u16 scenes_this_frame = 0;
+		u16 requested_scenes_per_frame = 1;
+		bool upgrade_disabled = false;
 		SceGxmRenderTarget* target = nullptr;
 	};
 
@@ -344,8 +352,10 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool CreatePatcher();
 	bool CreatePrograms();
 	bool CreateGeometry();
-	bool CreateRenderTarget(u32 width, u32 height, SceGxmRenderTarget** target);
+	bool CreateRenderTarget(u32 width, u32 height, u16 scenes_per_frame,
+		SceGxmRenderTarget** target, bool required = true);
 	SceGxmRenderTarget* GetRenderTarget(u32 width, u32 height);
+	void RetuneRenderTargets();
 	bool EndScene(bool finish);
 	bool Finish();
 	bool CommitClear(VitaGXM::GSTextureGXM& texture);
@@ -523,27 +533,60 @@ bool GSDeviceGXM::Impl::CreateGeometry()
 }
 
 bool GSDeviceGXM::Impl::CreateRenderTarget(u32 width, u32 height,
-	SceGxmRenderTarget** target)
+	u16 scenes_per_frame, SceGxmRenderTarget** target, bool required)
 {
-	if (!target || width == 0 || height == 0 || width > 4096 || height > 4096)
+	if (!target || width == 0 || height == 0 || width > 4096 || height > 4096 ||
+		scenes_per_frame == 0 ||
+		scenes_per_frame > MAX_GXM_SCENES_PER_RENDER_TARGET)
 		return false;
 	SceGxmRenderTargetParams params{};
 	params.width = static_cast<u16>(width);
 	params.height = static_cast<u16>(height);
-	params.scenesPerFrame = 1;
+	params.scenesPerFrame = scenes_per_frame;
 	params.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
 	params.driverMemBlock = static_cast<SceUID>(-1);
 	const int result = sceGxmCreateRenderTarget(&params, target);
-	return (result >= 0 && *target) ? true : Fail("sceGxmCreateRenderTarget",
-		result < 0 ? result : SCE_GXM_ERROR_INVALID_POINTER);
+	if (result >= 0 && *target)
+		return true;
+	const int error = result < 0 ? result : SCE_GXM_ERROR_INVALID_POINTER;
+	if (required)
+		return Fail("sceGxmCreateRenderTarget", error);
+	Console.Warning(
+		"GXM GS: retaining smaller per-frame scene capacity after render-target upgrade failed (%08x).",
+		static_cast<u32>(error));
+	return false;
 }
 
 SceGxmRenderTarget* GSDeviceGXM::Impl::GetRenderTarget(u32 width, u32 height)
 {
-	for (const RenderTargetEntry& entry : render_targets)
+	for (RenderTargetEntry& entry : render_targets)
 	{
 		if (entry.width == width && entry.height == height)
+		{
+			// Eight is libGXM's maximum, so a saturated entry has nothing
+			// left to learn. This is the common hot geometry in multi-pass
+			// workloads; keep its steady-state lookup identical to the old
+			// dimension cache instead of accounting every scene forever.
+			if (entry.scenes_per_frame ==
+				MAX_GXM_SCENES_PER_RENDER_TARGET)
+			{
+				return entry.target;
+			}
+			entry.scenes_this_frame = std::min<u16>(
+				MAX_GXM_SCENES_PER_RENDER_TARGET,
+				static_cast<u16>(entry.scenes_this_frame + 1));
+			if (!entry.upgrade_disabled)
+			{
+				while (entry.requested_scenes_per_frame <
+						entry.scenes_this_frame &&
+					entry.requested_scenes_per_frame <
+						MAX_GXM_SCENES_PER_RENDER_TARGET)
+				{
+					entry.requested_scenes_per_frame *= 2;
+				}
+			}
 			return entry.target;
+		}
 	}
 	if (render_targets.size() >= MAX_RENDER_TARGETS)
 	{
@@ -551,10 +594,72 @@ SceGxmRenderTarget* GSDeviceGXM::Impl::GetRenderTarget(u32 width, u32 height)
 		return nullptr;
 	}
 	SceGxmRenderTarget* target = nullptr;
-	if (!CreateRenderTarget(width, height, &target))
+	if (!CreateRenderTarget(width, height, 1, &target))
 		return nullptr;
-	render_targets.push_back({width, height, target});
+	render_targets.push_back({width, height, 1, 1, 1, false, target});
 	return target;
+}
+
+void GSDeviceGXM::Impl::RetuneRenderTargets()
+{
+	struct PendingUpgrade
+	{
+		RenderTargetEntry* entry;
+		SceGxmRenderTarget* replacement;
+	};
+	std::array<PendingUpgrade, MAX_RENDER_TARGETS> pending{};
+	size_t pending_count = 0;
+
+	for (RenderTargetEntry& entry : render_targets)
+	{
+		entry.scenes_this_frame = 0;
+		if (entry.upgrade_disabled ||
+			entry.requested_scenes_per_frame <= entry.scenes_per_frame)
+		{
+			continue;
+		}
+		SceGxmRenderTarget* upgraded = nullptr;
+		if (!CreateRenderTarget(entry.width, entry.height,
+				entry.requested_scenes_per_frame, &upgraded, false))
+		{
+			entry.upgrade_disabled = true;
+			continue;
+		}
+		pending[pending_count++] = {&entry, upgraded};
+	}
+
+	if (pending_count == 0)
+		return;
+
+	// Sony's libGXM teardown contract and vitaGL's render-target recycler both
+	// finish the context before destroying a handle which may still be owned by
+	// queued GPU work. Retuning is a one-time event for each geometry, so take
+	// that bounded synchronization here rather than leaking old handles or
+	// adding a per-frame wait.
+	if (!Finish())
+	{
+		for (size_t i = 0; i < pending_count; i++)
+			sceGxmDestroyRenderTarget(pending[i].replacement);
+		return;
+	}
+
+	for (size_t i = 0; i < pending_count; i++)
+	{
+		PendingUpgrade& upgrade = pending[i];
+		RenderTargetEntry& entry = *upgrade.entry;
+		const int result = sceGxmDestroyRenderTarget(entry.target);
+		if (result < 0)
+		{
+			Console.Warning(
+				"GXM GS: retaining smaller per-frame scene capacity after old render-target destruction failed (%08x).",
+				static_cast<u32>(result));
+			sceGxmDestroyRenderTarget(upgrade.replacement);
+			entry.upgrade_disabled = true;
+			continue;
+		}
+		entry.target = upgrade.replacement;
+		entry.scenes_per_frame = entry.requested_scenes_per_frame;
+	}
 }
 
 bool GSDeviceGXM::Impl::Initialize()
@@ -581,7 +686,7 @@ bool GSDeviceGXM::Impl::Initialize()
 
 	if (!CreateContext() || !CreatePatcher() || !CreatePrograms() ||
 		!CreateGeometry() ||
-		!CreateRenderTarget(VitaGXM::Display::Width, VitaGXM::Display::Height,
+		!CreateRenderTarget(VitaGXM::Display::Width, VitaGXM::Display::Height, 1,
 			&display_render_target))
 	{
 		return false;
@@ -2531,6 +2636,7 @@ void GSDeviceGXM::EndPresent()
 	m_impl->present_active = false;
 	if (!m_impl->EndScene(false))
 		return;
+	m_impl->RetuneRenderTargets();
 	int result = sceGxmPadHeartbeat(m_impl->display.BackColorSurface(),
 		m_impl->display.BackSyncObject());
 	if (result < 0)
