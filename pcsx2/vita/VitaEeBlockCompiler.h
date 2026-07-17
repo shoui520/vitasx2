@@ -816,7 +816,14 @@ namespace VitaEE
 		bool EmitCOP1ConvertSingleFast(u32 op);
 		bool EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, bool register_jump_delay_slot);
-		bool EmitCOP2IdleBranch(size_t* vu0_idle);
+		enum class Vu0SyncMode : u8
+		{
+			None,
+			Sync,
+			Finish,
+		};
+		Vu0SyncMode CurrentVu0SyncMode() const;
+		bool EmitCOP2IdleBranch(Vu0SyncMode sync_mode, size_t* vu0_idle);
 		bool EmitCOP2VectorTransferBody(u32 op);
 		bool EmitCOP2ControlReadBody(u32 op);
 		bool EmitCOP2ControlWriteBody(u32 op);
@@ -1388,6 +1395,7 @@ namespace VitaEE
 			size_t join_offset = 0;
 			unsigned rt = 0;
 			bool store = false;
+			Vu0SyncMode sync_mode = Vu0SyncMode::Sync;
 		};
 		bool EmitCop2QwordMemoryColdTail(const Cop2QwordMemoryColdTail& tail);
 
@@ -1397,6 +1405,7 @@ namespace VitaEE
 			size_t join_offset = 0;
 			unsigned preserve_reg = 16;
 			unsigned save_reg = 16;
+			Vu0SyncMode sync_mode = Vu0SyncMode::Sync;
 		};
 		bool EmitVu0SyncColdTail(const Vu0SyncColdTail& tail);
 

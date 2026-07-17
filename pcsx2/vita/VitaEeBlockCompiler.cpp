@@ -71,6 +71,9 @@ u32 g_qemuCpuClearLastSize = 0;
 u32 g_qemuVu0SyncCalls = 0;
 u32 g_qemuVu0FinishMicroCalls = 0;
 u32 g_qemuVu0WaitMicroCalls = 0;
+u32 g_qemuCop2SynchronizationGuardsEmitted = 0;
+u32 g_qemuCop2SynchronizationGuardsElided = 0;
+u32 g_qemuCop2FinishSynchronizationGuards = 0;
 u32 g_qemuVu1FinishCalls = 0;
 u32 g_qemuVu1FinishAddCyclesCalls = 0;
 u32 g_qemuVu1ExecMicroCalls = 0;
@@ -14916,13 +14919,155 @@ namespace VitaEE
 #endif
 	}
 
-	bool BlockCompiler::EmitCOP2IdleBranch(size_t* vu0_idle)
+	BlockCompiler::Vu0SyncMode BlockCompiler::CurrentVu0SyncMode() const
 	{
-		// PCSX2 owner: VU0.cpp::vu0Sync(). The native in-block path is valid
-		// only while VU0 is idle; if a microprogram is running, the caller emits
-		// the previous sync-and-exit path at this instruction's EE cycle.
+		// PCSX2 owner: x86/iR5900Analysis.cpp::COP2MicroFinishPass::Run().
+		// That pass makes VU0 synchronization a property of the complete EE block,
+		// rather than paying for it independently at every LQC2/SQC2/COP2.  Keep
+		// the same two pieces of state here: whether a macro instruction still has
+		// to finish a running microprogram, and whether a transfer only has to catch
+		// VU0 up to EE time.  Recompute the small analysis on demand so nested block
+		// compilation cannot overwrite an outer block's annotations.
+		if (m_current_block_instruction_count == 0 ||
+			m_current_instruction_index >= m_current_block_instruction_count)
+		{
+			return Vu0SyncMode::Sync;
+		}
+
+		bool block_interlocked = false;
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		block_interlocked = CHECK_FULLVU0SYNCHACK;
+#endif
+		for (u32 i = 0; i < m_current_block_instruction_count && !block_interlocked; i++)
+		{
+			const u32 op = memRead32(m_current_block_start_pc + i * sizeof(u32));
+			const unsigned opcode = op >> 26;
+			const unsigned rs = RS(op);
+			if (opcode == 0x12 &&
+				(rs == 0x01 || rs == 0x02 || rs == 0x05 || rs == 0x06) &&
+				(op & 1u) != 0)
+			{
+				block_interlocked = true;
+			}
+		}
+
+		bool needs_vu0_sync = true;
+		bool needs_vu0_finish = true;
+		for (u32 i = 0; i <= m_current_instruction_index; i++)
+		{
+			const u32 op = memRead32(m_current_block_start_pc + i * sizeof(u32));
+			const unsigned opcode = op >> 26;
+			const unsigned rs = RS(op);
+			Vu0SyncMode mode = Vu0SyncMode::None;
+
+			// PCSX2 treats ordinary scalar stores as possible DMA -> VIF0 -> VU0
+			// starts. VCALLMS/VCALLMSR are explicit starts. Either seam invalidates
+			// the preceding chain-wide proof before a later COP2 consumer.
+			const bool starts_vu0 =
+				opcode == 0x28 || opcode == 0x29 || opcode == 0x2b || opcode == 0x3f ||
+				(opcode == 0x12 && rs >= 0x10 &&
+					((op & 0x3fu) == 0x38 || (op & 0x3fu) == 0x39));
+			if (starts_vu0)
+			{
+				needs_vu0_sync = true;
+				needs_vu0_finish = true;
+				if (i == m_current_instruction_index)
+					return mode;
+				continue;
+			}
+
+			const bool qword_vu_memory = opcode == 0x36 || opcode == 0x3e;
+			const bool non_interlocked_move =
+				opcode == 0x12 && rs < 0x10 && (op & 1u) == 0;
+			const bool likely_clear =
+				opcode == 0x12 && rs > 0x04 && rs < 0x10 && RT(op) == 0;
+			if ((needs_vu0_sync && (qword_vu_memory || non_interlocked_move)) ||
+				likely_clear)
+			{
+				bool following_needs_finish = false;
+				for (u32 j = i + 1; j < m_current_block_instruction_count; j++)
+				{
+					const u32 following = memRead32(
+						m_current_block_start_pc + j * sizeof(u32));
+					if ((following >> 26) != 0x12)
+						continue;
+
+					const unsigned following_rs = RS(following);
+					if (following_rs >= 0x10 &&
+						((following & 0x3fu) == 0x38 ||
+						 (following & 0x3fu) == 0x39))
+					{
+						break;
+					}
+
+					following_needs_finish = following_rs >= 0x10;
+					if (following_needs_finish)
+						break;
+				}
+
+				if (following_needs_finish && !block_interlocked)
+				{
+					mode = Vu0SyncMode::Finish;
+					needs_vu0_sync = false;
+					needs_vu0_finish = false;
+				}
+				else
+				{
+					mode = Vu0SyncMode::Sync;
+					needs_vu0_sync = block_interlocked ||
+						(non_interlocked_move && likely_clear);
+					needs_vu0_finish = true;
+				}
+
+				if (i == m_current_instruction_index)
+					return mode;
+				continue;
+			}
+
+			if (opcode == 0x12)
+			{
+				if (rs >= 0x10 && needs_vu0_finish)
+				{
+					mode = Vu0SyncMode::Finish;
+					needs_vu0_finish = false;
+					needs_vu0_sync = false;
+				}
+				else if (needs_vu0_sync)
+				{
+					mode = Vu0SyncMode::Sync;
+					needs_vu0_sync = block_interlocked;
+				}
+			}
+
+			if (i == m_current_instruction_index)
+				return mode;
+		}
+
+		return Vu0SyncMode::Sync;
+	}
+
+	bool BlockCompiler::EmitCOP2IdleBranch(Vu0SyncMode sync_mode, size_t* vu0_idle)
+	{
+		// PCSX2 owners: iR5900Analysis.cpp::COP2MicroFinishPass::Run() and
+		// VU0.cpp::vu0Sync(). A chain annotation of None means an earlier
+		// instruction already established the synchronization contract and no
+		// scalar VPU_STAT load/test/branch belongs on this hot path.
 		if (!vu0_idle)
 			return false;
+		if (sync_mode == Vu0SyncMode::None)
+		{
+			*vu0_idle = static_cast<size_t>(-1);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCop2SynchronizationGuardsElided++;
+#endif
+			return true;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCop2SynchronizationGuardsEmitted++;
+		if (sync_mode == Vu0SyncMode::Finish)
+			g_qemuCop2FinishSynchronizationGuards++;
+#endif
 
 		if (!EmitVu0ViAddress(HOST_TMP0, VU0_REG_VPU_STAT) ||
 			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
@@ -17057,11 +17202,14 @@ namespace VitaEE
 		if (!event_exit || raw_cycles_through_instruction == 0)
 			return false;
 
+		const Vu0SyncMode sync_mode = CurrentVu0SyncMode();
 		size_t vu0_idle = static_cast<size_t>(-1);
-		if (!EmitCOP2IdleBranch(&vu0_idle) ||
-			!EmitSystemHelperEventExit(op, next_pc, raw_cycles_through_instruction,
+		if (!EmitCOP2IdleBranch(sync_mode, &vu0_idle))
+			return false;
+		if (vu0_idle != static_cast<size_t>(-1) &&
+			(!EmitSystemHelperEventExit(op, next_pc, raw_cycles_through_instruction,
 				reinterpret_cast<const void*>(&R5900::Interpreter::OpcodeImpl::COP2), event_exit) ||
-			!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+			 !m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ)))
 		{
 			return false;
 		}
@@ -17092,6 +17240,7 @@ namespace VitaEE
 		if (!event_exit || raw_cycles_through_instruction == 0)
 			return false;
 
+		const Vu0SyncMode sync_mode = CurrentVu0SyncMode();
 		size_t vu0_idle = static_cast<size_t>(-1);
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 		const bool wait_for_mbit = ((op >> 21) & 0x1f) == 0x05;
@@ -17110,8 +17259,10 @@ namespace VitaEE
 			fallthrough_pin_dirty_low[i] = m_pin_dirty_low[i];
 			fallthrough_pin_dirty_high[i] = m_pin_dirty_high[i];
 		}
-		if (!EmitCOP2IdleBranch(&vu0_idle))
+		if (!EmitCOP2IdleBranch(sync_mode, &vu0_idle))
 			return false;
+		if (vu0_idle == static_cast<size_t>(-1))
+			return EmitCOP2VectorTransferBody(op);
 
 		// vu0Sync() and the optional interlock helper follow AAPCS and may
 		// clobber every physical qreg used by the block-local GPR qcache.
@@ -17123,7 +17274,9 @@ namespace VitaEE
 			!(register_jump_delay_slot ?
 				EmitStorePcFromHostReg(HOST_BRANCH_TARGET) : EmitStorePc(next_pc)) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			!m_code.EmitCallAbsolute(sync_mode == Vu0SyncMode::Finish ?
+				reinterpret_cast<const void*>(&_vu0FinishMicro) :
+				reinterpret_cast<const void*>(&vu0Sync)) ||
 			!EmitCOP2InterlockCall(op, wait_for_mbit) ||
 			!EmitCOP2VectorTransferBody(op) ||
 			!EmitEventExitReturn(event_exit))
@@ -17159,6 +17312,7 @@ namespace VitaEE
 		if (!event_exit || raw_cycles_through_instruction == 0)
 			return false;
 
+		const Vu0SyncMode sync_mode = CurrentVu0SyncMode();
 		size_t vu0_idle = static_cast<size_t>(-1);
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 		const u8 fallthrough_qcache_count = m_gpr_q_cache_count;
@@ -17177,15 +17331,19 @@ namespace VitaEE
 			fallthrough_pin_dirty_high[i] = m_pin_dirty_high[i];
 		}
 
-		if (!EmitCOP2IdleBranch(&vu0_idle))
+		if (!EmitCOP2IdleBranch(sync_mode, &vu0_idle))
 			return false;
+		if (vu0_idle == static_cast<size_t>(-1))
+			return EmitCOP2ControlReadBody(op);
 
 		ClearGprQCache();
 		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
 			!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			!m_code.EmitCallAbsolute(sync_mode == Vu0SyncMode::Finish ?
+				reinterpret_cast<const void*>(&_vu0FinishMicro) :
+				reinterpret_cast<const void*>(&vu0Sync)) ||
 			!EmitCOP2InterlockCall(op, false) ||
 			!EmitCOP2ControlReadBody(op) ||
 			!EmitEventExitReturn(event_exit))
@@ -17222,12 +17380,16 @@ namespace VitaEE
 			// x86/microVU_Macro.inl::recCTC2(). CMSAR1 starts VU1 at the
 			// committed EE cycle, so emit a native event tail instead of a
 			// fall-through body under this compiler's deferred-cycle model.
+			const Vu0SyncMode sync_mode = CurrentVu0SyncMode();
 			const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 			if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 				!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
 				!EmitStorePc(next_pc) ||
 				!EmitAddScaledCyclesToCpu(cycles) ||
-				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)))
+				(sync_mode != Vu0SyncMode::None &&
+				 !m_code.EmitCallAbsolute(sync_mode == Vu0SyncMode::Finish ?
+					reinterpret_cast<const void*>(&_vu0FinishMicro) :
+					reinterpret_cast<const void*>(&vu0Sync))))
 			{
 				return false;
 			}
@@ -17271,6 +17433,7 @@ namespace VitaEE
 			return true;
 		}
 
+		const Vu0SyncMode sync_mode = CurrentVu0SyncMode();
 		size_t vu0_idle = static_cast<size_t>(-1);
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 		const u8 fallthrough_qcache_count = m_gpr_q_cache_count;
@@ -17282,8 +17445,10 @@ namespace VitaEE
 			fallthrough_qcache_qreg[i] = m_gpr_q_cache_qreg[i];
 		}
 
-		if (!EmitCOP2IdleBranch(&vu0_idle))
+		if (!EmitCOP2IdleBranch(sync_mode, &vu0_idle))
 			return false;
+		if (vu0_idle == static_cast<size_t>(-1))
+			return EmitCOP2ControlWriteBody(op);
 
 		// The guarded running arm crosses vu0Sync()/interlock AAPCS calls.
 		// Its source must come from architectural backing, while the idle arm
@@ -17293,7 +17458,9 @@ namespace VitaEE
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
 			!EmitStorePc(next_pc) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vu0Sync)) ||
+			!m_code.EmitCallAbsolute(sync_mode == Vu0SyncMode::Finish ?
+				reinterpret_cast<const void*>(&_vu0FinishMicro) :
+				reinterpret_cast<const void*>(&vu0Sync)) ||
 			!EmitCOP2InterlockCall(op, true) ||
 			!EmitCOP2ControlWriteBody(op) ||
 			!EmitEventExitReturn(event_exit))
@@ -26822,6 +26989,7 @@ namespace VitaEE
 	bool BlockCompiler::EmitLQC2(u32 op)
 	{
 		const unsigned rt = RT(op);
+		const Vu0SyncMode sync_mode = CurrentVu0SyncMode();
 		constexpr unsigned NEON_VALUE = 0;
 		const auto emit_zero_load_skip_counter = []() -> bool {
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -26862,6 +27030,7 @@ namespace VitaEE
 				m_code.Size(),
 				rt,
 				false,
+				sync_mode,
 			});
 		}
 
@@ -26880,6 +27049,7 @@ namespace VitaEE
 			m_code.Size(),
 			rt,
 			false,
+			sync_mode,
 		});
 	}
 
@@ -27515,6 +27685,7 @@ namespace VitaEE
 	bool BlockCompiler::EmitSQC2(u32 op)
 	{
 		const unsigned rt = RT(op);
+		const Vu0SyncMode sync_mode = CurrentVu0SyncMode();
 		constexpr unsigned NEON_VALUE = 0;
 		const auto emit_store_to_host = [&]() -> bool {
 			if (rt == 0)
@@ -27558,6 +27729,7 @@ namespace VitaEE
 			m_code.Size(),
 			rt,
 			true,
+			sync_mode,
 		});
 	}
 
@@ -32373,24 +32545,31 @@ namespace VitaEE
 		constexpr unsigned NEON_VALUE = 0;
 		InvalidateGprQCacheForQreg(NEON_VALUE);
 		const size_t fallback_target = m_code.Size();
-		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!EmitVu0ViAddress(HOST_TMP1, VU0_REG_VPU_STAT) ||
-			!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, 0) ||
-			!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 1, true))
-		{
+		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI))
 			return false;
-		}
 
-		const size_t vu0_idle = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (vu0_idle == static_cast<size_t>(-1) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
-			!EmitReturningAapcsHelperCall(m_code,
-				reinterpret_cast<const void*>(&vu0Sync),
-				&m_cop2_norm_consts_ready, Cop2NormConstCallContract::Preserve) ||
-			!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
-			!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+		if (tail.sync_mode != Vu0SyncMode::None)
 		{
-			return false;
+			if (!EmitVu0ViAddress(HOST_TMP1, VU0_REG_VPU_STAT) ||
+				!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, 0) ||
+				!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 1, true))
+			{
+				return false;
+			}
+
+			const size_t vu0_idle = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			const void* helper = tail.sync_mode == Vu0SyncMode::Finish ?
+				reinterpret_cast<const void*>(&_vu0FinishMicro) :
+				reinterpret_cast<const void*>(&vu0Sync);
+			if (vu0_idle == static_cast<size_t>(-1) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP5, HOST_TMP0, VitaA32::ShiftType::LSL, 0) ||
+				!EmitReturningAapcsHelperCall(m_code, helper,
+					&m_cop2_norm_consts_ready, Cop2NormConstCallContract::Preserve) ||
+				!m_code.EmitMovRegShiftImm(HOST_TMP0, HOST_TMP5, VitaA32::ShiftType::LSL, 0) ||
+				!m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ))
+			{
+				return false;
+			}
 		}
 
 		if (tail.store)
@@ -32437,10 +32616,12 @@ namespace VitaEE
 			return false;
 
 		const bool preserve = tail.preserve_reg < 16;
+		const void* helper = tail.sync_mode == Vu0SyncMode::Finish ?
+			reinterpret_cast<const void*>(&_vu0FinishMicro) :
+			reinterpret_cast<const void*>(&vu0Sync);
 		if ((preserve &&
 				 (!m_code.EmitMovRegShiftImm(tail.save_reg, tail.preserve_reg, VitaA32::ShiftType::LSL, 0))) ||
-			!EmitReturningAapcsHelperCall(m_code,
-				reinterpret_cast<const void*>(&vu0Sync),
+			!EmitReturningAapcsHelperCall(m_code, helper,
 				&m_cop2_norm_consts_ready, Cop2NormConstCallContract::Preserve) ||
 			(preserve &&
 			 !m_code.EmitMovRegShiftImm(tail.preserve_reg, tail.save_reg, VitaA32::ShiftType::LSL, 0)))
@@ -33091,6 +33272,20 @@ namespace VitaEE
 		// side effect when VU0.VI[REG_VPU_STAT].UL bit 0 is clear. Keep that
 		// idle case as fallthrough and branch only the running case to a cold
 		// helper tail.
+		const Vu0SyncMode sync_mode = CurrentVu0SyncMode();
+		if (sync_mode == Vu0SyncMode::None)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCop2SynchronizationGuardsElided++;
+#endif
+			return true;
+		}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCop2SynchronizationGuardsEmitted++;
+		if (sync_mode == Vu0SyncMode::Finish)
+			g_qemuCop2FinishSynchronizationGuards++;
+#endif
 		if (!EmitVu0ViAddress(HOST_TMP1, VU0_REG_VPU_STAT) ||
 			!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, 0) ||
 			!m_code.EmitAndImm8(HOST_TMP2, HOST_TMP2, 1, true))
@@ -33107,6 +33302,7 @@ namespace VitaEE
 			m_code.Size(),
 			preserve_reg,
 			save_reg,
+			sync_mode,
 		});
 	}
 
