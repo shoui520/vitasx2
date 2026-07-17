@@ -623,7 +623,8 @@ static void recAccountEeBlockExecution(const VitaEE::BlockExecutionResult& resul
 			Console.WriteLn(
 				"Vita EE pre-ELF progress: boundaries=%llu start_pc=%08x next_pc=%08x "
 				"ee_cycle=%llu ee_next=%llu iop_pc=%08x iop_cycle=%llu iop_next=%llu "
-				"iop_budget=%d frame=%u in_frame_events=%u:%u:%u retained_wait=%u",
+				"iop_budget=%d frame=%u in_frame_events=%u:%u:%u retained_wait=%u "
+				"identity_ram=%u",
 				static_cast<unsigned long long>(boundaries), fallback_pc, cpuRegs.pc,
 				static_cast<unsigned long long>(cpuRegs.cycle),
 				static_cast<unsigned long long>(cpuRegs.nextEventCycle), psxRegs.pc,
@@ -634,7 +635,8 @@ static void recAccountEeBlockExecution(const VitaEE::BlockExecutionResult& resul
 				s_ee_a32_stats.in_frame_event_tests -
 					s_ee_a32_stats.in_frame_event_resume_refusals,
 				s_ee_a32_stats.in_frame_event_resume_refusals,
-				s_ee_a32_stats.retained_unconditional_wait_events);
+				s_ee_a32_stats.retained_unconditional_wait_events,
+				vtlb_private::HasDefaultMainRamIdentityWindow() ? 1u : 0u);
 		}
 	}
 #endif

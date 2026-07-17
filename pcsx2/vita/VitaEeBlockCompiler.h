@@ -244,6 +244,10 @@ namespace VitaEE
 		u16 max_offset_end = 0;
 		u16 access_count = 0;
 		u32 access_block_pc = 0;
+		// A nonzero PC names a same-register ADDIU after the final access. The
+		// translated page is valid through that instruction, then poisoned so the
+		// next compatible entry translates the advanced architectural base once.
+		u32 invalidate_after_pc = 0;
 		VtlbStaticPageLinkRepresentation representation =
 			VtlbStaticPageLinkRepresentation::DirectHostBase;
 		VtlbStaticPageLinkProvenance provenance =
@@ -257,6 +261,7 @@ namespace VitaEE
 				max_offset_end == rhs.max_offset_end &&
 				access_count == rhs.access_count &&
 				access_block_pc == rhs.access_block_pc &&
+				invalidate_after_pc == rhs.invalidate_after_pc &&
 				representation == rhs.representation &&
 				provenance == rhs.provenance;
 		}
@@ -1274,6 +1279,7 @@ namespace VitaEE
 			u8 alignment_mask) const;
 		bool IsCompatibleVtlbStaticPageAccess(u32 op, ScalarStoreWidth width,
 			u8 alignment_mask) const;
+		bool IsCompatibleVtlbStaticPageCop1Access(u32 op) const;
 		bool EmitCompatibleVtlbStaticPageAddress(u32 op, unsigned host_reg,
 			size_t* fallback_branch);
 		bool EmitLoadGprLow(unsigned guest_reg, unsigned host_reg);
@@ -1386,9 +1392,11 @@ namespace VitaEE
 
 		struct Cop1WordMemoryColdTail
 		{
+			size_t static_page_fallback = static_cast<size_t>(-1);
 			size_t unaligned_fallback = static_cast<size_t>(-1);
 			size_t handler_fallback = static_cast<size_t>(-1);
 			size_t join_offset = 0;
+			u32 op = 0;
 			unsigned rt = 0;
 			bool store = false;
 			GprPinDirtyMasks dirty_pins{};

@@ -32,6 +32,7 @@
 
 #include "GS/GSVector.h"
 
+#include <array>
 #include <bit>
 #include <cstring>
 #include <map>
@@ -2029,6 +2030,55 @@ bool vtlb_IsFaultingPC(u32 guest_pc)
 	return (s_fastmem_faulting_pcs.find(guest_pc) != s_fastmem_faulting_pcs.end());
 }
 
+namespace vtlb_private
+{
+	static constexpr u32 MAIN_RAM_IDENTITY_PAGE_COUNT =
+		Ps2MemSize::MainRam / VTLB_PAGE_SIZE;
+	static_assert((MAIN_RAM_IDENTITY_PAGE_COUNT % 32) == 0);
+	static std::array<u32, MAIN_RAM_IDENTITY_PAGE_COUNT / 32>
+		s_default_main_ram_identity_pages{};
+	static u32 s_default_main_ram_identity_page_count = 0;
+
+	bool HasDefaultMainRamIdentityWindow()
+	{
+		return s_default_main_ram_identity_page_count ==
+			MAIN_RAM_IDENTITY_PAGE_COUNT;
+	}
+
+	void SetDefaultMainRamIdentityWindow(bool enabled)
+	{
+		for (u32& word : s_default_main_ram_identity_pages)
+			word = enabled ? 0xffffffffu : 0u;
+		s_default_main_ram_identity_page_count =
+			enabled ? MAIN_RAM_IDENTITY_PAGE_COUNT : 0;
+	}
+
+	static void SetDefaultMainRamIdentityPage(u32 vaddr, bool identity)
+	{
+		if (vaddr >= Ps2MemSize::MainRam)
+			return;
+
+		const u32 page = vaddr >> VTLB_PAGE_BITS;
+		const u32 word = page >> 5;
+		const u32 mask = 1u << (page & 31);
+		const bool was_identity =
+			(s_default_main_ram_identity_pages[word] & mask) != 0;
+		if (was_identity == identity)
+			return;
+
+		if (identity)
+		{
+			s_default_main_ram_identity_pages[word] |= mask;
+			s_default_main_ram_identity_page_count++;
+		}
+		else
+		{
+			s_default_main_ram_identity_pages[word] &= ~mask;
+			s_default_main_ram_identity_page_count--;
+		}
+	}
+}
+
 //virtual mappings
 //TODO: Add invalid paddr checks
 void vtlb_VMap(u32 vaddr, u32 paddr, u32 size)
@@ -2063,6 +2113,11 @@ void vtlb_VMap(u32 vaddr, u32 paddr, u32 size)
 			vmv = VTLBVirtual(vtlbdata.pmap[paddr >> VTLB_PAGE_BITS], paddr, vaddr);
 
 		vtlbdata.vmap[vaddr >> VTLB_PAGE_BITS] = vmv;
+		// The BIOS can unmap and then republish a large identity TLB entry.
+		// Account for the final mapping page by page so a transient unmap does not
+		// permanently disable the ARM32 direct window, while any real remap keeps
+		// the proof false. The owning mapping path supplies the code-cache seam.
+		vtlb_private::SetDefaultMainRamIdentityPage(vaddr, paddr == vaddr);
 		if (vtlbdata.ppmap)
 		{
 			if (!(vaddr & 0x80000000)) // those address are already physical don't change them
@@ -2100,6 +2155,8 @@ void vtlb_VMapBuffer(u32 vaddr, void* buffer, u32 size)
 	while (size > 0)
 	{
 		vtlbdata.vmap[vaddr >> VTLB_PAGE_BITS] = VTLBVirtual::fromPointer(bu8, vaddr);
+		vtlb_private::SetDefaultMainRamIdentityPage(vaddr,
+			eeMem && bu8 == reinterpret_cast<uptr>(eeMem->Main + vaddr));
 		vaddr += VTLB_PAGE_SIZE;
 		bu8 += VTLB_PAGE_SIZE;
 		size -= VTLB_PAGE_SIZE;
@@ -2116,6 +2173,7 @@ void vtlb_VMapUnmap(u32 vaddr, u32 size)
 	while (size > 0)
 	{
 		vtlbdata.vmap[vaddr >> VTLB_PAGE_BITS] = VTLBVirtual(VTLBPhysical::fromHandler(UnmappedVirtHandler), vaddr, vaddr);
+		vtlb_private::SetDefaultMainRamIdentityPage(vaddr, false);
 		vaddr += VTLB_PAGE_SIZE;
 		size -= VTLB_PAGE_SIZE;
 	}
@@ -2124,6 +2182,7 @@ void vtlb_VMapUnmap(u32 vaddr, u32 size)
 // vtlb_Init -- Clears vtlb handlers and memory mappings.
 void vtlb_Init()
 {
+	vtlb_private::SetDefaultMainRamIdentityWindow(false);
 	vtlbHandlerCount = 0;
 	std::memset(vtlbdata.RWFT, 0, sizeof(vtlbdata.RWFT));
 
@@ -2273,6 +2332,7 @@ void vtlb_Alloc_Ppmap()
 
 void vtlb_Core_Free()
 {
+	vtlb_private::SetDefaultMainRamIdentityWindow(false);
 	vtlbdata.vmap = nullptr;
 	vtlbdata.ppmap = nullptr;
 

@@ -418,6 +418,40 @@ static bool cpuIntsEnabled(int Interrupt)
 		!cpuRegs.CP0.n.Status.b.EXL && (cpuRegs.CP0.n.Status.b.ERL == 0);
 }
 
+#if defined(VITASX2_VITA) && !defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+static __fi void VitaIopEventTestFromEe()
+{
+	// PCSX2 owner: R3000A.cpp::iopEventTest(). The EE scheduler calls this at
+	// every 384-IOP-cycle interleave seam, while the overwhelmingly common path
+	// only publishes the next deadline. Keep that negative path in this TU so
+	// Cortex-A9 does not cross an out-of-line C++ call and repeat its global
+	// address setup. Every state-changing case still enters the owning function.
+	constexpr u32 IOP_WAIT_CYCLES = 384;
+	psxRegs.iopNextEventCycle = psxRegs.cycle + IOP_WAIT_CYCLES;
+
+	if (static_cast<s32>(static_cast<u32>(psxRegs.cycle - psxNextStartCounter)) >=
+		psxNextDeltaCounter)
+	{
+		iopEventTest();
+		return;
+	}
+
+	if (psxNextDeltaCounter <
+		static_cast<s32>(psxRegs.iopNextEventCycle - psxNextStartCounter))
+	{
+		psxRegs.iopNextEventCycle = psxNextStartCounter + psxNextDeltaCounter;
+	}
+
+	if (psxRegs.interrupt != 0 ||
+		(psxHu32(HW_ICTRL) != 0 &&
+			(psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0))
+	{
+		iopEventTest();
+	}
+}
+#endif
+
 // Shared portion of the branch test, called from both the Interpreter
 // and the recompiler.  (moved here to help alleviate redundant code)
 __fi void _cpuEventTest_Shared()
@@ -497,7 +531,12 @@ __fi void _cpuEventTest_Shared()
 		iopEventAction = false;
 	}
 
+#if defined(VITASX2_VITA) && !defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	VitaIopEventTestFromEe();
+#else
 	iopEventTest();
+#endif
 
 	if (cpuTestCycle(nextStartCounter, nextDeltaCounter))
 	{
@@ -529,8 +568,15 @@ __fi void _cpuEventTest_Shared()
 	// ---- VU Sync -------------
 	// We're in a EventTest.  All dynarec registers are flushed
 	// so there is no need to freeze registers here.
-	CpuVU0->ExecuteBlock();
-	CpuVU1->ExecuteBlock();
+	// PCSX2 owner: VUmicro.cpp::BaseVUmicroCPU::ExecuteBlock(). Preserve its
+	// exact running-bit contract, but reject the two inactive virtual calls in
+	// the shared scheduler TU. Threaded VU1 must still collect MTVU changes even
+	// when VPU_STAT is clear.
+	const u32 vu_running = VU0.VI[REG_VPU_STAT].UL;
+	if (vu_running & 1)
+		CpuVU0->ExecuteBlock();
+	if (THREAD_VU1 || (vu_running & 0x100))
+		CpuVU1->ExecuteBlock();
 
 	// ---- Schedule Next Event Test --------------
 	const float mutiplier = static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);

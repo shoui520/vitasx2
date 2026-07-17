@@ -105,6 +105,12 @@ void Ps2MemoryMap::MapDirectVirtualMemoryWindow()
 {
 	vtlb_VMap(0x00000000, 0x00000000, _1mb * 512);
 	vtlb_VMapUnmap(0x20000000, 0x60000000);
+	// PCSX2 owner: the first 32 MiB of the direct user window above maps the
+	// retail EE RAM block one-to-one. TLB and scratchpad mappings go through the
+	// vTLB mutation functions, which retire this ARM32 proof if they replace any
+	// part of that window with a non-identity mapping.
+	vtlb_private::SetDefaultMainRamIdentityWindow(
+		Ps2MemSize::ExposedRam == Ps2MemSize::MainRam);
 }
 
 void Ps2MemoryMap::AllocateIopMemoryLookupTables()

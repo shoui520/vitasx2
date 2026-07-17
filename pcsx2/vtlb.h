@@ -213,6 +213,15 @@ namespace vtlb_private
 
 	alignas(64) extern MapData vtlbdata;
 
+	// ARM32 cannot reserve PCSX2's 4 GiB fastmem aperture. While the default
+	// low virtual window is still the identity-mapped retail EE RAM range, the
+	// A32 JIT can nevertheless address that overwhelmingly common range through
+	// host_memory_base without consulting the 4 MiB virtual-page table. A low
+	// vmap mutation which changes that identity relation clears this proof before
+	// generated code can be reused; identity TLB publication preserves it.
+	bool HasDefaultMainRamIdentityWindow();
+	void SetDefaultMainRamIdentityWindow(bool enabled);
+
 	inline uptr VTLBPhysical::assumePtr() const
 	{
 #if defined(ARCH_ARM32)

@@ -151,6 +151,10 @@ u32 g_qemuCompatibleVtlbStaticPageTranslationInstructions = 0;
 u32 g_qemuCompatibleVtlbStaticPageDirectAccesses = 0;
 u32 g_qemuCompatibleVtlbStaticPageGenericTranslationsElided = 0;
 u32 g_qemuCompatibleVtlbStaticPageColdFallbackSites = 0;
+u32 g_qemuCompatibleVtlbStaticPagePostAccessInvalidations = 0;
+u32 g_qemuIdentityMainRamFastPathSites = 0;
+u32 g_qemuIdentityMainRamFastPathHotInstructions = 0;
+u32 g_qemuIdentityMainRamGenericInstructionsElided = 0;
 u32 g_qemuReclaimedVtlbCanonicalEdges = 0;
 u32 g_qemuReclaimedVtlbCanonicalEdgeReloadInstructions = 0;
 u32 g_qemuCompatiblePredicateBlocks = 0;
@@ -4442,8 +4446,16 @@ namespace VitaEE
 			  vtlb_static_page.alignment_mask == 3) &&
 			 vtlb_static_page.max_offset_end != 0 &&
 			 vtlb_static_page.max_offset_end <= vtlb_private::VTLB_PAGE_SIZE &&
-			 vtlb_static_page.access_count >= 9 &&
+			 vtlb_static_page.access_count >= 4 &&
 			 (vtlb_static_page.access_block_pc & 3u) == 0 &&
+			 (vtlb_static_page.invalidate_after_pc == 0 ||
+			  (block_count == 1 &&
+			   (vtlb_static_page.invalidate_after_pc & 3u) == 0 &&
+			   vtlb_static_page.invalidate_after_pc >
+				   vtlb_static_page.access_block_pc &&
+			   vtlb_static_page.invalidate_after_pc -
+				   vtlb_static_page.access_block_pc <
+				   vtlb_private::VTLB_PAGE_SIZE + sizeof(u32))) &&
 			 vtlb_static_page.representation ==
 				 VtlbStaticPageLinkRepresentation::DirectHostBase &&
 			 vtlb_static_page.provenance ==
@@ -4677,15 +4689,25 @@ namespace VitaEE
 		// the combined two-block use counts. Ordinary chains use r9-r11; a proven
 		// translated-pointer chain may also reclaim r7/r8 because it materializes
 		// vTLB bases only on cold translation and restores the dispatcher ABI on
-		// every external exit. Reject COP1/COP2 blocks which reserve r10/r11 for
-		// their private fast-path constants.
+		// every external exit. COP2 blocks still reserve r11 for the VU0 base.
+		// COP1 blocks are admitted only when every COP1 operation is native and a
+		// guarded static-page signature is ultimately selected; their optional r10
+		// exponent-mask reservation is accounted for when choosing scalar hosts.
 		u16 scores[32]{};
 		u16 dword_scores[32]{};
 		u16 writes[32]{};
+		bool chain_has_cop1 = false;
+		bool chain_uses_cop1_exponent_mask = false;
 		const auto score_block = [&](u32 start_pc, u32 instruction_count) {
+			unsigned cop1_exponent_mask_users = 0;
 			for (u32 i = 0; i < instruction_count; i++)
 			{
 				const u32 op = memRead32(start_pc + i * sizeof(u32));
+				if (FastCOP1UsesExponentMask(op) &&
+					++cop1_exponent_mask_users >= 2)
+				{
+					chain_uses_cop1_exponent_mask = true;
+				}
 				// A TLB write requests deferred code-cache invalidation.  No allocator
 				// signature may cross the forced provider boundary which follows the
 				// owning source block.
@@ -4694,12 +4716,18 @@ namespace VitaEE
 				switch (op >> 26)
 				{
 					case 0x11: // COP1
+						if (!IsFastCOP1InBlock(op))
+							return false;
+						chain_has_cop1 = true;
+						break;
 					case 0x12: // COP2
-					case 0x31: // LWC1
 					case 0x36: // LQC2
-					case 0x39: // SWC1
 					case 0x3e: // SQC2
 						return false;
+					case 0x31: // LWC1
+					case 0x39: // SWC1
+						chain_has_cop1 = true;
+						break;
 					default:
 						break;
 				}
@@ -5556,6 +5584,7 @@ namespace VitaEE
 			}
 			return true;
 		};
+		bool unmatched_single_block_cycle = false;
 		if (chain_block_count == 1 && !signature->vtlb_pointer.IsValid() &&
 			!signature->vtlb_write_pointer.IsValid())
 		{
@@ -5566,7 +5595,11 @@ namespace VitaEE
 				!try_add_byte_fill_self_pointer(chain_pcs[0],
 					chain_instruction_counts[0]))
 			{
-				return false;
+				// General one-block cycles remain ineligible unless page-use analysis
+				// below proves a profitable translated-page mapping. This preserves the
+				// narrow stream-pointer signatures while letting PCSX2 fastmem's page
+				// reuse cover non-pattern-specific loops.
+				unmatched_single_block_cycle = true;
 			}
 		}
 		if (reclaim_vtlb_hosts && signature->vtlb_pointer.IsValid() &&
@@ -5672,15 +5705,17 @@ namespace VitaEE
 		// PCSX2 owner: x86/ix86-32/recVTLB.cpp::DynGen_PrepRegs() and the
 		// iCore MODE_READ allocator. x86 fastmem removes translation from every
 		// direct access; Cortex-A9 cannot reserve that 4 GiB aperture, so retain one
-		// guarded page translation for a repeatedly-used, invariant scalar base.
+		// guarded page translation for a repeatedly-used scalar base.
 		// r11 carries the direct host address; the clean invariant guest base is
 		// loaded once while staging rather than consuming a durable host register.
 		// r7/r8 remain the ordinary resident vmap/host-base pair for other pages,
 		// while r9/r10 remain available for the chain's hottest guest values.
 		// The page span and alignment are part of the compatible-link signature;
 		// canonical entries poison r11, and failed guards use the ordinary per-access
-		// vTLB path without invoking a handler early.
-		const auto try_add_static_scalar_page = [&]() {
+		// vTLB path without invoking a handler early. A block-local induction update
+		// after the final access also poisons r11, so its next linked iteration
+		// translates the new base once instead of inheriting a stale host address.
+		const auto try_add_static_memory_page = [&]() {
 			if (signature->vtlb_pointer.IsValid() ||
 				signature->vtlb_write_pointer.IsValid() ||
 				EmuConfig.Gamefixes.GoemonTlbHack ||
@@ -5691,13 +5726,28 @@ namespace VitaEE
 
 			u16 access_counts[32]{};
 			u16 block_access_counts[GprLinkSignature::MAX_BLOCKS][32]{};
+			u16 block_cop1_access_counts[GprLinkSignature::MAX_BLOCKS][32]{};
 			u16 max_offset_ends[32]{};
 			u8 alignment_masks[32]{};
+			u16 first_write_indices[GprLinkSignature::MAX_BLOCKS][32];
+			u16 last_access_indices[GprLinkSignature::MAX_BLOCKS][32]{};
+			bool has_access[GprLinkSignature::MAX_BLOCKS][32]{};
+			for (auto& block_indices : first_write_indices)
+				std::fill(std::begin(block_indices), std::end(block_indices), UINT16_MAX);
 			for (u8 block = 0; block < chain_block_count; block++)
 			{
 				for (u32 i = 0; i < chain_instruction_counts[block]; i++)
 				{
 					const u32 op = memRead32(chain_pcs[block] + i * sizeof(u32));
+					DirtyGprPinOpInfo write_info;
+					if (!ClassifyOpcodeForDirtyGprPins(op, &write_info))
+						return false;
+					for (u8 write = 0; write < write_info.write_count; write++)
+					{
+						const unsigned guest = write_info.writes[write];
+						first_write_indices[block][guest] = std::min<u16>(
+							first_write_indices[block][guest], static_cast<u16>(i));
+					}
 					const unsigned opcode = op >> 26;
 					u32 size = 0;
 					u8 alignment_mask = 0;
@@ -5717,6 +5767,8 @@ namespace VitaEE
 						case 0x23: // LW
 						case 0x27: // LWU
 						case 0x2b: // SW
+						case 0x31: // LWC1
+						case 0x39: // SWC1
 							size = 4;
 							alignment_mask = 3;
 							break;
@@ -5730,10 +5782,8 @@ namespace VitaEE
 						case 0x2c: // SDL
 						case 0x2d: // SDR
 						case 0x2e: // SWR
-						case 0x31: // LWC1
 						case 0x36: // LQC2
 						case 0x37: // LD
-						case 0x39: // SWC1
 						case 0x3e: // SQC2
 						case 0x3f: // SD
 							return false;
@@ -5754,6 +5804,12 @@ namespace VitaEE
 
 					access_counts[base]++;
 					block_access_counts[block][base]++;
+					has_access[block][base] = true;
+					last_access_indices[block][base] = static_cast<u16>(i);
+					if (opcode == 0x31 || opcode == 0x39)
+					{
+						block_cop1_access_counts[block][base]++;
+					}
 					max_offset_ends[base] = std::max<u16>(
 						max_offset_ends[base], static_cast<u16>(end));
 					alignment_masks[base] = std::max(alignment_masks[base], alignment_mask);
@@ -5761,16 +5817,42 @@ namespace VitaEE
 			}
 
 			unsigned best_base = 0;
-			u16 best_count = 8;
+			u16 best_count = 0;
+			u32 invalidate_after_pcs[32]{};
 			for (unsigned base = 1; base < 32; base++)
 			{
 				u16 concentrated_count = 0;
+				u16 concentrated_cop1_count = 0;
 				for (u8 block = 0; block < chain_block_count; block++)
 				{
 					concentrated_count = std::max(
 						concentrated_count, block_access_counts[block][base]);
+					concentrated_cop1_count = std::max(
+						concentrated_cop1_count,
+						block_cop1_access_counts[block][base]);
 				}
-				if (writes[base] == 0 && concentrated_count >= 9 &&
+				const u16 minimum_count = concentrated_cop1_count >= 4 ? 4 : 9;
+				bool base_lifetime_supported = writes[base] == 0;
+				if (!base_lifetime_supported && chain_block_count == 1 &&
+					writes[base] == 1 && has_access[0][base] &&
+					first_write_indices[0][base] > last_access_indices[0][base])
+				{
+					const u16 write_index = first_write_indices[0][base];
+					const u32 write_op = memRead32(chain_pcs[0] +
+						static_cast<u32>(write_index) * sizeof(u32));
+					// A same-register ADDIU is a common induction update and cannot
+					// fault. Keep the already translated page through every earlier
+					// access, then poison it after the architectural update. This is
+					// block-local translation CSE, not a loop/address signature.
+					base_lifetime_supported = (write_op >> 26) == 0x09 &&
+						RS(write_op) == base && RT(write_op) == base;
+					if (base_lifetime_supported)
+					{
+						invalidate_after_pcs[base] = chain_pcs[0] +
+							static_cast<u32>(write_index) * sizeof(u32);
+					}
+				}
+				if (base_lifetime_supported && concentrated_count >= minimum_count &&
 					access_counts[base] > best_count)
 				{
 					best_base = base;
@@ -5792,7 +5874,9 @@ namespace VitaEE
 					access_block = block;
 				}
 			}
-			if (block_access_counts[access_block][best_base] < 9)
+			const u16 minimum_best_count =
+				block_cop1_access_counts[access_block][best_base] >= 4 ? 4 : 9;
+			if (block_access_counts[access_block][best_base] < minimum_best_count)
 				return false;
 
 			for (GprLinkMapping& mapping : signature->mappings)
@@ -5817,6 +5901,12 @@ namespace VitaEE
 			{
 				remaining_scores[reg] = reg == best_base ? 0 : scores[reg];
 			}
+			const u8 static_mapping_hosts[2] = {
+				GprLinkSignature::DEFAULT_FIRST_HOST,
+				chain_uses_cop1_exponent_mask ?
+					GprLinkSignature::LINK_REGISTER_HOST :
+					static_cast<u8>(GprLinkSignature::DEFAULT_FIRST_HOST + 1),
+			};
 			for (unsigned mapping_index = 0; mapping_index < 2; mapping_index++)
 			{
 				unsigned best_reg = 0;
@@ -5831,8 +5921,7 @@ namespace VitaEE
 				}
 				if (best_reg == 0)
 					break;
-				if (!add_mapping(best_reg,
-						GprLinkSignature::DEFAULT_FIRST_HOST + mapping_index,
+				if (!add_mapping(best_reg, static_mapping_hosts[mapping_index],
 						GprLinkMapping::NO_HOST, GprLinkWidth::Low32))
 				{
 					return false;
@@ -5856,9 +5945,15 @@ namespace VitaEE
 			page.max_offset_end = max_offset_ends[best_base];
 			page.access_count = best_count;
 			page.access_block_pc = chain_pcs[access_block];
+			page.invalidate_after_pc = invalidate_after_pcs[best_base];
 			return true;
 		};
-		try_add_static_scalar_page();
+		const bool added_static_memory_page = try_add_static_memory_page();
+		if ((unmatched_single_block_cycle || chain_has_cop1) &&
+			!added_static_memory_page)
+		{
+			return false;
+		}
 
 		// PCSX2 owners: x86/iCore.cpp's MODE_READ mappings and
 		// x86/ix86-32/iR5900Branch.cpp::recBNE() let a linked consumer reuse the
@@ -11750,6 +11845,19 @@ namespace VitaEE
 				{
 					return false;
 				}
+			}
+			if (m_compatible_vtlb_static_page_access &&
+				m_gpr_link_signature.vtlb_static_page.invalidate_after_pc == pc)
+			{
+				if (defer_resident_suffix_instruction ||
+					!m_code.EmitMovImm8(
+						m_gpr_link_signature.vtlb_static_page.host, 0))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuCompatibleVtlbStaticPagePostAccessInvalidations++;
+#endif
 			}
 			UpdateGprConstStateAfterOpcode(op, pc);
 			UpdateCop1NormalizedStateAfterOpcode(op);
@@ -27165,6 +27273,23 @@ namespace VitaEE
 	bool BlockCompiler::EmitLWC1(u32 op)
 	{
 		const unsigned rt = RT(op);
+		if (IsCompatibleVtlbStaticPageCop1Access(op))
+		{
+			Cop1WordMemoryColdTail tail;
+			tail.dirty_pins = CurrentGprPinDirtyMasks();
+			tail.op = op;
+			tail.rt = rt;
+			if (!EmitCompatibleVtlbStaticPageAddress(
+					op, HOST_TMP0, &tail.static_page_fallback) ||
+				!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+				!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS,
+					static_cast<u16>(FprOffset(rt))))
+			{
+				return false;
+			}
+			tail.join_offset = m_code.Size();
+			return m_cop1_word_memory_cold_tails.push_back(tail);
+		}
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -27197,14 +27322,14 @@ namespace VitaEE
 			return false;
 		}
 
-		return m_cop1_word_memory_cold_tails.push_back({
-			unaligned_fallback,
-			handler_fallback,
-			m_code.Size(),
-			rt,
-			false,
-			dirty_pins,
-		});
+		Cop1WordMemoryColdTail tail;
+		tail.unaligned_fallback = unaligned_fallback;
+		tail.handler_fallback = handler_fallback;
+		tail.join_offset = m_code.Size();
+		tail.op = op;
+		tail.rt = rt;
+		tail.dirty_pins = dirty_pins;
+		return m_cop1_word_memory_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitLQC2(u32 op)
@@ -27859,6 +27984,25 @@ namespace VitaEE
 	bool BlockCompiler::EmitSWC1(u32 op)
 	{
 		const unsigned rt = RT(op);
+		if (IsCompatibleVtlbStaticPageCop1Access(op))
+		{
+			Cop1WordMemoryColdTail tail;
+			tail.dirty_pins = CurrentGprPinDirtyMasks();
+			tail.op = op;
+			tail.rt = rt;
+			tail.store = true;
+			if (!EmitCompatibleVtlbStaticPageAddress(
+					op, HOST_TMP0, &tail.static_page_fallback) ||
+				!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS,
+					static_cast<u16>(FprOffset(rt))) ||
+				!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+				!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u32)))
+			{
+				return false;
+			}
+			tail.join_offset = m_code.Size();
+			return m_cop1_word_memory_cold_tails.push_back(tail);
+		}
 
 		u32 known_address = 0;
 		if (TryGetKnownEffectiveAddress(op, &known_address) &&
@@ -27893,14 +28037,15 @@ namespace VitaEE
 			return false;
 		}
 
-		return m_cop1_word_memory_cold_tails.push_back({
-			unaligned_fallback,
-			handler_fallback,
-			m_code.Size(),
-			rt,
-			true,
-			dirty_pins,
-		});
+		Cop1WordMemoryColdTail tail;
+		tail.unaligned_fallback = unaligned_fallback;
+		tail.handler_fallback = handler_fallback;
+		tail.join_offset = m_code.Size();
+		tail.op = op;
+		tail.rt = rt;
+		tail.store = true;
+		tail.dirty_pins = dirty_pins;
+		return m_cop1_word_memory_cold_tails.push_back(tail);
 	}
 
 	bool BlockCompiler::EmitSQC2(u32 op)
@@ -32721,6 +32866,57 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCop1WordMemoryColdTail(const Cop1WordMemoryColdTail& tail)
 	{
+		if (tail.static_page_fallback != static_cast<size_t>(-1))
+		{
+			if (tail.op == 0 ||
+				!m_code.PatchBranch(tail.static_page_fallback, m_code.Size(),
+					VitaA32::Condition::EQ))
+			{
+				return false;
+			}
+
+			Cop1WordMemoryColdTail resolved = tail;
+			resolved.static_page_fallback = static_cast<size_t>(-1);
+			if (!EmitEffectiveAddress(tail.op, HOST_TMP0) ||
+				!m_code.EmitAndImm8(HOST_TMP1, HOST_TMP0, 3, true))
+			{
+				return false;
+			}
+			resolved.unaligned_fallback =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+			if (resolved.unaligned_fallback == static_cast<size_t>(-1) ||
+				!EmitVtlbNonHandlerHostAddress(HOST_TMP0, HOST_TMP1, HOST_TMP2,
+					&resolved.handler_fallback, &resolved.dirty_pins))
+			{
+				return false;
+			}
+
+			if (tail.store)
+			{
+				if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS,
+						static_cast<u16>(FprOffset(tail.rt))) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+					!EmitRamSourceStoreGuard(HOST_TMP0, sizeof(u32)))
+				{
+					return false;
+				}
+			}
+			else if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+				!m_code.EmitStrImm12(HOST_TMP1, HOST_CPU_REGS,
+					static_cast<u16>(FprOffset(tail.rt))))
+			{
+				return false;
+			}
+
+			const size_t direct_done = m_code.EmitBranchPlaceholder();
+			if (direct_done == static_cast<size_t>(-1) ||
+				!m_code.PatchBranch(direct_done, tail.join_offset))
+			{
+				return false;
+			}
+			return EmitCop1WordMemoryColdTail(resolved);
+		}
+
 		// PCSX2 owner: vtlb.cpp::vtlb_memRead32()/vtlb_memWrite32() plus
 		// FPU.cpp::LWC1()/SWC1(). Unaligned FPU word accesses return before
 		// memory dispatch in FPU.cpp, while handler pages still dispatch through vTLB.
@@ -32739,7 +32935,10 @@ namespace VitaEE
 			if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS, static_cast<u16>(FprOffset(tail.rt))) ||
 				!EmitReturningAapcsHelperCall(m_code,
 					reinterpret_cast<const void*>(&memWrite32),
-					&m_cop2_norm_consts_ready, Cop2NormConstCallContract::Preserve))
+					&m_cop2_norm_consts_ready, Cop2NormConstCallContract::Preserve) ||
+				!EmitReloadGprPinsAfterClobber(static_cast<u16>(
+					(1u << HOST_TMP0) | (1u << HOST_TMP1) | (1u << HOST_TMP2) |
+					(1u << HOST_TMP3) | (1u << HOST_TMP4) | (1u << HOST_LR))))
 			{
 				return false;
 			}
@@ -32747,7 +32946,11 @@ namespace VitaEE
 		else if (!EmitReturningAapcsHelperCall(m_code,
 				 reinterpret_cast<const void*>(&memRead32),
 				 &m_cop2_norm_consts_ready, Cop2NormConstCallContract::Preserve) ||
-				 !m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(FprOffset(tail.rt))))
+				 !m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS,
+					 static_cast<u16>(FprOffset(tail.rt))) ||
+				 !EmitReloadGprPinsAfterClobber(static_cast<u16>(
+					 (1u << HOST_TMP0) | (1u << HOST_TMP1) | (1u << HOST_TMP2) |
+					 (1u << HOST_TMP3) | (1u << HOST_TMP4) | (1u << HOST_LR))))
 		{
 			return false;
 		}
@@ -33607,6 +33810,28 @@ namespace VitaEE
 
 		if (m_vtlb_registers_available)
 		{
+			// PCSX2 owners: MemoryMap.cpp::{MapEERamHighMemoryAndRoms,
+			// MapDirectVirtualMemoryWindow} establish the default 0..32 MiB
+			// virtual-to-physical identity mapping; recVTLB.cpp's fastmem path then
+			// addresses it through RFASTMEMBASE without a vmap lookup. Vita cannot
+			// reserve that aperture, but its persistent r8 host-memory base can form
+			// the same direct address. A low-vmap mutation which changes the identity
+			// relation retires the proof; TLBWI/TLBWR and the other owning mapping
+			// mechanisms already impose the deferred whole-cache boundary before
+			// generated code can be reused. Identity TLB publication preserves it.
+			const bool identity_main_ram =
+				vtlb_private::HasDefaultMainRamIdentityWindow();
+			size_t identity_direct = static_cast<size_t>(-1);
+			if (identity_main_ram)
+			{
+				if (!m_code.EmitCmpImm32(host_reg, Ps2MemSize::MainRam))
+					return false;
+				identity_direct =
+					m_code.EmitBranchPlaceholder(VitaA32::Condition::CC);
+				if (identity_direct == static_cast<size_t>(-1))
+					return false;
+			}
+
 			if (!m_code.EmitMovRegShiftImm(scratch_reg, host_reg, VitaA32::ShiftType::LSR,
 					vtlb_private::VTLB_PAGE_BITS) ||
 				!m_code.EmitLdrRegShift(vmap_reg, HOST_VTLB_VMAP, scratch_reg, VitaA32::ShiftType::LSL,
@@ -33620,7 +33845,33 @@ namespace VitaEE
 			if (*handler_fallback_branch == static_cast<size_t>(-1))
 				return false;
 
-			return m_code.EmitAddReg(host_reg, vmap_reg, HOST_VTLB_HOST_MEMORY_BASE);
+			if (!m_code.EmitAddReg(host_reg, vmap_reg,
+					HOST_VTLB_HOST_MEMORY_BASE))
+			{
+				return false;
+			}
+
+			if (identity_main_ram)
+			{
+				const size_t generic_done = m_code.EmitBranchPlaceholder();
+				const size_t direct_target = m_code.Size();
+				if (generic_done == static_cast<size_t>(-1) ||
+					!m_code.PatchBranch(identity_direct, direct_target,
+						VitaA32::Condition::CC) ||
+					!m_code.EmitAddReg(host_reg, HOST_VTLB_HOST_MEMORY_BASE,
+						host_reg) ||
+					!m_code.PatchBranch(generic_done, m_code.Size()))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuIdentityMainRamFastPathSites++;
+				g_qemuIdentityMainRamFastPathHotInstructions += 3;
+				g_qemuIdentityMainRamGenericInstructionsElided += 5;
+#endif
+			}
+
+			return true;
 		}
 
 		if (!m_code.EmitMovImm32(vmap_reg,
@@ -33699,6 +33950,20 @@ namespace VitaEE
 		return opcode_matches && offset >= 0 &&
 			(static_cast<u32>(offset) & alignment_mask) == 0 &&
 			static_cast<u32>(offset) + size <= page.max_offset_end;
+	}
+
+	bool BlockCompiler::IsCompatibleVtlbStaticPageCop1Access(u32 op) const
+	{
+		if (!m_compatible_vtlb_static_page_access)
+			return false;
+		const VtlbStaticPageLinkMapping& page =
+			m_gpr_link_signature.vtlb_static_page;
+		const unsigned opcode = op >> 26;
+		const s32 offset = IMM_S(op);
+		return page.IsValid() && RS(op) == page.guest_base &&
+			(opcode == 0x31 || opcode == 0x39) && offset >= 0 &&
+			(static_cast<u32>(offset) & 3u) == 0 &&
+			static_cast<u32>(offset) + sizeof(u32) <= page.max_offset_end;
 	}
 
 	bool BlockCompiler::EmitCompatibleVtlbStaticPageAddress(
