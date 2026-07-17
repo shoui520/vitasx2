@@ -1204,7 +1204,7 @@ void GSDeviceGXM::Impl::ConfigureRaster(u32 width, u32 height)
 {
 	sceGxmSetViewport(context, static_cast<float>(width) * 0.5f,
 		static_cast<float>(width) * 0.5f, static_cast<float>(height) * 0.5f,
-		static_cast<float>(height) * 0.5f, 0.5f, 0.5f);
+		static_cast<float>(height) * 0.5f, 0.0f, 1.0f);
 	sceGxmSetViewportEnable(context, SCE_GXM_VIEWPORT_ENABLED);
 	sceGxmSetCullMode(context, SCE_GXM_CULL_NONE);
 	sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
@@ -1274,13 +1274,13 @@ bool GSDeviceGXM::Impl::DrawTargetClear(u32 color, bool write_color,
 	}
 
 	// Sony's clear_v.cg owns this oversized triangle. The color vertex program
-	// accepts clip-space XYZ directly; GXM's configured 0..1 viewport maps the
-	// requested PCSX2 depth back from clip Z = depth * 2 - 1.
+	// accepts clip-space XYZ directly. ConfigureRaster() maps clip Z directly to
+	// screen Z so low GS depth values retain their PCSX2 32-bit normalization.
 	QuadVertex* vertices = static_cast<QuadVertex*>(vertex_memory);
 	SetQuadVertex(vertices[0], -1.0f, -1.0f, color, 0.0f, 0.0f);
 	SetQuadVertex(vertices[1], 3.0f, -1.0f, color, 0.0f, 0.0f);
 	SetQuadVertex(vertices[2], -1.0f, 3.0f, color, 0.0f, 0.0f);
-	const float clip_depth = depth * 2.0f - 1.0f;
+	const float clip_depth = depth;
 	vertices[0].z = clip_depth;
 	vertices[1].z = clip_depth;
 	vertices[2].z = clip_depth;

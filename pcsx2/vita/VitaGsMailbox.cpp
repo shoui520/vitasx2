@@ -254,6 +254,11 @@ namespace MTGS
 		GSConfig.UpscaleMultiplier = 1.0f;
 		GSConfig.DumpReplaceableTextures = false;
 		GSConfig.LoadTextureReplacements = false;
+		// PCSX2 owner: GSTextureCache::LookupSource(). Keep PCSX2's proven CPU
+		// palette expansion until GXM's native P8 lookup path passes the same
+		// texture samples on hardware; ordinary RGBA sampling is the correctness
+		// baseline for the direct renderer.
+		GSConfig.GPUPaletteConversion = false;
 #endif
 
 		// PCSX2 owner: GS/GS.cpp::OpenGSRenderer(). The software vertex
@@ -941,6 +946,7 @@ namespace MTGS
 		options.UpscaleMultiplier = 1.0f;
 		options.DumpReplaceableTextures = false;
 		options.LoadTextureReplacements = false;
+		options.GPUPaletteConversion = false;
 #endif
 		RunOnGSThread([options = std::move(options)]() {
 			Pcsx2Config::GSOptions old_options = std::move(GSConfig);

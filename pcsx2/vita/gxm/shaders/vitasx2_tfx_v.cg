@@ -25,11 +25,12 @@ void main(
 	const float2 uv = aUV - textureOffset;
 	const float2 st = aST - textureOffset;
 
-	// The 0.05 host-coordinate bias is PCSX2's rasterization contract. GXM's
-	// viewport maps -1..1 depth to 0..1, so retain the non-clip-control form of
-	// PCSX2's shader here.
+	// The 0.05 host-coordinate bias is PCSX2's rasterization contract. Keep GS
+	// depth in normalized 0..1 clip space and let GXM's zOffset=0/zScale=1
+	// viewport pass it through. Subtracting 1 here loses low GS Z values (for
+	// example Z=16 rounds exactly to -1.0f), unlike PCSX2's Vulkan/D3D path.
 	vPosition.xy = (aPosition - float2(0.05f, 0.05f)) * vertexScale - vertexOffset;
-	vPosition.z = aDepth * (2.0f / 4294967296.0f) - 1.0f;
+	vPosition.z = aDepth * (1.0f / 4294967296.0f);
 	vPosition.w = 1.0f;
 
 	vTexFloat = float4(st.x, st.y, aFog.x, aQ);
