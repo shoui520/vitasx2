@@ -1313,10 +1313,12 @@ namespace VitaIOP
 	BlockCompiler::BlockCompiler(VitaA32::CodeBuffer& code,
 		const u32* ram_source_page_live_counts,
 		const u8* ram_source_page_live_flags,
+		const u8* ram_source_chunk_live_flags,
 		bool source_page_literal_allowed)
 		: m_code(code)
 		, m_ram_source_page_live_counts(ram_source_page_live_counts)
 		, m_ram_source_page_live_flags(ram_source_page_live_flags)
+		, m_ram_source_chunk_live_flags(ram_source_chunk_live_flags)
 		, m_source_page_literal_allowed(source_page_literal_allowed)
 	{
 	}
@@ -4628,11 +4630,41 @@ namespace VitaIOP
 		// directly when isolate-cache is clear and invalidates the written word.
 		// A compile-time-known main-RAM address cannot hit the MMIO/ROM helper
 		// arm.
+		bool source_chunk_guard_enabled = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		source_chunk_guard_enabled = s_qemuIopRamProvenanceSpecializationEnabled;
+#endif
 		bool used_known_store_value = false;
 		size_t isolated_skip = static_cast<size_t>(-1);
 		if (!EmitIsolateCacheGuard(&isolated_skip) ||
 			!EmitLoadGprValue(RT(op), HOST_TMP1, &used_known_store_value) ||
-			!emit_store_value() || !emit_clear_stored_word())
+			!emit_store_value())
+		{
+			return false;
+		}
+		size_t no_source_chunk = static_cast<size_t>(-1);
+		if (source_chunk_guard_enabled)
+		{
+			constexpr u32 source_chunk_shift = 6;
+			if (!m_ram_source_chunk_live_flags ||
+				!m_code.EmitMovImm32(HOST_TMP2,
+					static_cast<u32>(reinterpret_cast<uptr>(
+						m_ram_source_chunk_live_flags +
+						(address >> source_chunk_shift)))) ||
+				!m_code.EmitLdrbImm12(HOST_TMP0, HOST_TMP2, 0) ||
+				!m_code.EmitCmpImm32(HOST_TMP0, 0))
+			{
+				return false;
+			}
+			no_source_chunk =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (no_source_chunk == static_cast<size_t>(-1))
+				return false;
+		}
+		if (!emit_clear_stored_word() ||
+			(no_source_chunk != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(no_source_chunk, m_code.Size(),
+					VitaA32::Condition::EQ)))
 		{
 			return false;
 		}
@@ -4704,6 +4736,39 @@ namespace VitaIOP
 				   m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
 					   static_cast<u16>(offsetof(R3000Acpu, Clear))) &&
 				   m_code.EmitBlx(HOST_CALL_SCRATCH);
+		};
+		const auto emit_source_chunk_guard = [&]() -> size_t {
+			if (!ram_provenance_specialization ||
+				!m_ram_source_chunk_live_flags)
+			{
+				return static_cast<size_t>(-1);
+			}
+			bool source_page_literal_enabled = m_source_page_literal_allowed;
+#if defined(VITASX2_QEMU_VALIDATION)
+			source_page_literal_enabled =
+				source_page_literal_enabled && s_qemuIopSourcePageLiteralEnabled;
+#endif
+			if (source_page_literal_enabled)
+			{
+				const size_t load = m_code.EmitLdrLiteralPlaceholder(HOST_TMP2);
+				if (load == static_cast<size_t>(-1))
+					return static_cast<size_t>(-1);
+				m_source_chunk_literal_loads.push_back(load);
+			}
+			else if (!m_code.EmitMovImm32(HOST_TMP2,
+					static_cast<u32>(reinterpret_cast<uptr>(
+						m_ram_source_chunk_live_flags))))
+			{
+				return static_cast<size_t>(-1);
+			}
+			if (!m_code.EmitAndReg(HOST_TMP0, HOST_SAVED0, HOST_IOP_RAM_MASK) ||
+				!m_code.EmitLdrbRegShift(HOST_TMP0, HOST_TMP2, HOST_TMP0,
+					VitaA32::ShiftType::LSR, 6) ||
+				!m_code.EmitCmpImm32(HOST_TMP0, 0))
+			{
+				return static_cast<size_t>(-1);
+			}
+			return m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
 		};
 		const auto emit_source_page_guard = [&]() -> size_t {
 			// PCSX2 owner: x86/iR3000A.cpp::PSXREC_CLEARM checks psxRecLUT
@@ -4793,10 +4858,16 @@ namespace VitaIOP
 			return false;
 		}
 		const size_t no_source_page_branch = emit_source_page_guard();
+		const size_t no_source_chunk_branch = emit_source_chunk_guard();
 		if (no_source_page_branch == static_cast<size_t>(-1) ||
+			(ram_provenance_specialization &&
+				no_source_chunk_branch == static_cast<size_t>(-1)) ||
 			!emit_clear_stored_word() ||
 			!m_code.PatchBranch(no_source_page_branch, m_code.Size(),
-				VitaA32::Condition::EQ))
+				VitaA32::Condition::EQ) ||
+			(no_source_chunk_branch != static_cast<size_t>(-1) &&
+				!m_code.PatchBranch(no_source_chunk_branch, m_code.Size(),
+					VitaA32::Condition::EQ)))
 		{
 			return false;
 		}
@@ -4818,27 +4889,49 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitSourcePageLiteralPool()
 	{
-		if (m_source_page_literal_loads.empty())
+		if (m_source_page_literal_loads.empty() &&
+			m_source_chunk_literal_loads.empty())
 			return true;
 
 		// The main hot path has returned before this pool. Cold/helper paths are
-		// emitted later and their patched branches jump over this one shared word.
-		const size_t literal_offset = m_code.Size();
-		if (!m_code.EmitU32(static_cast<u32>(
-				reinterpret_cast<uptr>(m_ram_source_page_live_flags))))
+		// emitted later and their patched branches jump over the shared words.
+		if (!m_source_page_literal_loads.empty())
 		{
-			return false;
-		}
-		for (const size_t load : m_source_page_literal_loads)
-		{
-			if (!m_code.PatchLdrLiteral(load, literal_offset))
+			const size_t literal_offset = m_code.Size();
+			if (!m_code.EmitU32(static_cast<u32>(
+					reinterpret_cast<uptr>(m_ram_source_page_live_flags))))
 			{
-				m_source_page_literal_out_of_range = true;
 				return false;
+			}
+			for (const size_t load : m_source_page_literal_loads)
+			{
+				if (!m_code.PatchLdrLiteral(load, literal_offset))
+				{
+					m_source_page_literal_out_of_range = true;
+					return false;
+				}
+			}
+		}
+		if (!m_source_chunk_literal_loads.empty())
+		{
+			const size_t literal_offset = m_code.Size();
+			if (!m_code.EmitU32(static_cast<u32>(
+					reinterpret_cast<uptr>(m_ram_source_chunk_live_flags))))
+			{
+				return false;
+			}
+			for (const size_t load : m_source_chunk_literal_loads)
+			{
+				if (!m_code.PatchLdrLiteral(load, literal_offset))
+				{
+					m_source_page_literal_out_of_range = true;
+					return false;
+				}
 			}
 		}
 		m_source_page_literal_instructions_removed +=
-			static_cast<u32>(m_source_page_literal_loads.size());
+			static_cast<u32>(m_source_page_literal_loads.size() +
+				m_source_chunk_literal_loads.size());
 		return true;
 	}
 
@@ -6699,7 +6792,7 @@ namespace VitaIOP
 			!m_iop_ram_registers_available ||
 			!m_iop_ram_mask_register_available || !m_isolate_cache_specialization ||
 			!m_isolate_cache_guard_stable || m_isolate_cache_active ||
-			!m_ram_source_page_live_flags ||
+			!m_ram_source_page_live_flags || !m_ram_source_chunk_live_flags ||
 			Ps2MemSize::ExposedIopRam != Ps2MemSize::IopRam)
 		{
 			return false;
@@ -6870,7 +6963,43 @@ namespace VitaIOP
 		}
 		const size_t no_source_page =
 			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (no_source_page == static_cast<size_t>(-1) ||
+		if (no_source_page == static_cast<size_t>(-1))
+			return false;
+		if (source_page_literal_enabled)
+		{
+			const size_t load = m_code.EmitLdrLiteralPlaceholder(HOST_TMP2);
+			if (load == static_cast<size_t>(-1))
+				return false;
+			m_source_chunk_literal_loads.push_back(load);
+		}
+		else if (!m_code.EmitMovImm32(HOST_TMP2,
+				 static_cast<u32>(reinterpret_cast<uptr>(
+					 m_ram_source_chunk_live_flags))))
+		{
+			return false;
+		}
+		if (!m_code.EmitLdrbRegShift(HOST_TMP0, HOST_TMP2, HOST_TMP1,
+				VitaA32::ShiftType::LSR, 6) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return false;
+		}
+		const size_t first_source_chunk =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (first_source_chunk == static_cast<size_t>(-1) ||
+			!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP1, 15) ||
+			!m_code.EmitLdrbRegShift(HOST_TMP0, HOST_TMP2, HOST_TMP0,
+				VitaA32::ShiftType::LSR, 6) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return false;
+		}
+		const size_t no_source_chunk =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		const size_t clear_source_chunk = m_code.Size();
+		if (no_source_chunk == static_cast<size_t>(-1) ||
+			!m_code.PatchBranch(first_source_chunk, clear_source_chunk,
+				VitaA32::Condition::NE) ||
 			!m_code.EmitBicImm32(HOST_TMP0, HOST_TMP3, 3) ||
 			!m_code.EmitMovImm8(HOST_TMP1, 4) ||
 			!m_code.EmitMovImm32(HOST_CALL_SCRATCH,
@@ -6880,6 +7009,8 @@ namespace VitaIOP
 				static_cast<u16>(offsetof(R3000Acpu, Clear))) ||
 			!m_code.EmitBlx(HOST_CALL_SCRATCH) ||
 			!m_code.PatchBranch(no_source_page, m_code.Size(),
+				VitaA32::Condition::EQ) ||
+			!m_code.PatchBranch(no_source_chunk, m_code.Size(),
 				VitaA32::Condition::EQ))
 		{
 			return false;
@@ -7084,6 +7215,7 @@ namespace VitaIOP
 		m_source_page_literal_instructions_removed = 0;
 		m_isolate_cache_guard_instructions_removed = 0;
 		m_source_page_literal_loads.clear();
+		m_source_chunk_literal_loads.clear();
 		m_source_page_literal_out_of_range = false;
 		m_branch_predicate_producer_flags_live = false;
 		m_branch_predicate_producer_guest = 0;
@@ -7094,6 +7226,7 @@ namespace VitaIOP
 			!VitaIsIopPreInstructionTraceEnabled() &&
 			m_isolate_cache_specialization && m_isolate_cache_guard_stable &&
 			!m_isolate_cache_active && m_ram_source_page_live_flags &&
+			m_ram_source_chunk_live_flags &&
 			Ps2MemSize::ExposedIopRam == Ps2MemSize::IopRam;
 #if defined(VITASX2_QEMU_VALIDATION)
 		sequential_qword_copy_enabled = sequential_qword_copy_enabled &&
@@ -7676,7 +7809,8 @@ namespace VitaIOP
 	}
 
 	BlockExecutor::BlockExecutor(bool owns_ee_event_entry)
-		: m_scheduler_direct_resume_event_context{this, nullptr}
+		: m_ram_source_chunks(std::make_unique<RamSourceChunkOwnership>())
+		, m_scheduler_direct_resume_event_context{this, nullptr}
 		, m_wait_resume_event_context{this, nullptr, WaitResumeKind::Invalid}
 		, m_owns_ee_event_entry(owns_ee_event_entry)
 	{
@@ -8690,6 +8824,62 @@ namespace VitaIOP
 		m_lookup_pages = nullptr;
 	}
 
+	void BlockExecutor::RegisterRamSourceChunks(u32 source_start, u32 source_size)
+	{
+		if (source_start == INVALID_RAM_SOURCE || source_size == 0)
+			return;
+
+		source_start &= Ps2MemSize::ExposedIopRam - 1;
+		u32 remaining = source_size;
+		while (remaining != 0)
+		{
+			const u32 span =
+				std::min(remaining, Ps2MemSize::ExposedIopRam - source_start);
+			const u32 source_end = source_start + span;
+			for (u32 chunk_index = source_start >> RAM_SOURCE_CHUNK_SHIFT;
+				chunk_index <= ((source_end - 1) >> RAM_SOURCE_CHUNK_SHIFT);
+				chunk_index++)
+			{
+				pxAssertRel(m_ram_source_chunks->live_counts[chunk_index] != UINT32_MAX,
+					"IOP source-chunk ownership overflow");
+				if (m_ram_source_chunks->live_counts[chunk_index] != UINT32_MAX)
+					m_ram_source_chunks->live_counts[chunk_index]++;
+				m_ram_source_chunks->live_flags[chunk_index] = 1;
+			}
+			remaining -= span;
+			source_start = 0;
+		}
+	}
+
+	void BlockExecutor::UnregisterRamSourceChunks(u32 source_start,
+		u32 source_size)
+	{
+		if (source_start == INVALID_RAM_SOURCE || source_size == 0)
+			return;
+
+		source_start &= Ps2MemSize::ExposedIopRam - 1;
+		u32 remaining = source_size;
+		while (remaining != 0)
+		{
+			const u32 span =
+				std::min(remaining, Ps2MemSize::ExposedIopRam - source_start);
+			const u32 source_end = source_start + span;
+			for (u32 chunk_index = source_start >> RAM_SOURCE_CHUNK_SHIFT;
+				chunk_index <= ((source_end - 1) >> RAM_SOURCE_CHUNK_SHIFT);
+				chunk_index++)
+			{
+				pxAssertRel(m_ram_source_chunks->live_counts[chunk_index] != 0,
+					"IOP source-chunk ownership underflow");
+				if (m_ram_source_chunks->live_counts[chunk_index] != 0)
+					m_ram_source_chunks->live_counts[chunk_index]--;
+				m_ram_source_chunks->live_flags[chunk_index] =
+					m_ram_source_chunks->live_counts[chunk_index] != 0 ? 1 : 0;
+			}
+			remaining -= span;
+			source_start = 0;
+		}
+	}
+
 	void BlockExecutor::RegisterRamSource(CachedBlock& block)
 	{
 		if (!block.valid || block.ram_source_start == INVALID_RAM_SOURCE)
@@ -8703,6 +8893,7 @@ namespace VitaIOP
 		const auto register_range = [&](u32 source_start, u32 source_size) {
 			if (source_start == INVALID_RAM_SOURCE || source_size == 0)
 				return;
+			RegisterRamSourceChunks(source_start, source_size);
 			source_start &= Ps2MemSize::ExposedIopRam - 1;
 			u32 remaining = source_size;
 			while (remaining != 0)
@@ -8745,6 +8936,7 @@ namespace VitaIOP
 		const auto unregister_range = [&](u32 source_start, u32 source_size) {
 			if (source_start == INVALID_RAM_SOURCE || source_size == 0)
 				return;
+			UnregisterRamSourceChunks(source_start, source_size);
 			source_start &= Ps2MemSize::ExposedIopRam - 1;
 			u32 remaining = source_size;
 			while (remaining != 0)
@@ -8790,6 +8982,8 @@ namespace VitaIOP
 		block.source_serial = m_next_source_serial++;
 		if (m_next_source_serial == 0)
 			m_next_source_serial = 1;
+		RegisterRamSourceChunks(block.ram_source_start,
+			block.instruction_count * sizeof(u32));
 
 		std::bitset<RAM_SOURCE_PAGE_COUNT> registered_pages;
 		u32 source_start = block.ram_source_start & (Ps2MemSize::ExposedIopRam - 1);
@@ -8823,6 +9017,8 @@ namespace VitaIOP
 		{
 			return;
 		}
+		UnregisterRamSourceChunks(block.ram_source_start,
+			block.instruction_count * sizeof(u32));
 
 		std::bitset<RAM_SOURCE_PAGE_COUNT> unregistered_pages;
 		u32 source_start = block.ram_source_start & (Ps2MemSize::ExposedIopRam - 1);
@@ -9282,8 +9478,9 @@ namespace VitaIOP
 		for (std::vector<RamSourceRecord>& page : m_ram_source_pages)
 			page.clear();
 		m_ram_source_page_live_counts.fill(0);
-		m_semantic_ram_source_page_counts.fill(0);
 		m_ram_source_page_live_flags.fill(0);
+		m_ram_source_chunks->live_counts.fill(0);
+		m_ram_source_chunks->live_flags.fill(0);
 		m_next_source_serial = 1;
 	}
 
@@ -9497,6 +9694,8 @@ namespace VitaIOP
 		{
 			return;
 		}
+		RegisterRamSourceChunks(descriptor.ram_source_start,
+			descriptor.instruction_count * sizeof(u32));
 
 		std::bitset<RAM_SOURCE_PAGE_COUNT> registered_pages;
 		u32 source_start =
@@ -9517,11 +9716,6 @@ namespace VitaIOP
 					"IOP semantic source-page ownership overflow");
 				if (m_ram_source_page_live_counts[page_index] != UINT32_MAX)
 					m_ram_source_page_live_counts[page_index]++;
-				pxAssertRel(
-					m_semantic_ram_source_page_counts[page_index] != UINT32_MAX,
-					"IOP semantic source-page ownership overflow");
-				if (m_semantic_ram_source_page_counts[page_index] != UINT32_MAX)
-					m_semantic_ram_source_page_counts[page_index]++;
 				m_ram_source_page_live_flags[page_index] = 1;
 				registered_pages.set(page_index);
 			}
@@ -9538,6 +9732,8 @@ namespace VitaIOP
 		{
 			return;
 		}
+		UnregisterRamSourceChunks(descriptor.ram_source_start,
+			descriptor.instruction_count * sizeof(u32));
 
 		std::bitset<RAM_SOURCE_PAGE_COUNT> unregistered_pages;
 		u32 source_start =
@@ -9558,11 +9754,6 @@ namespace VitaIOP
 					"IOP semantic source-page ownership underflow");
 				if (m_ram_source_page_live_counts[page_index] != 0)
 					m_ram_source_page_live_counts[page_index]--;
-				pxAssertRel(
-					m_semantic_ram_source_page_counts[page_index] != 0,
-					"IOP semantic source-page ownership underflow");
-				if (m_semantic_ram_source_page_counts[page_index] != 0)
-					m_semantic_ram_source_page_counts[page_index]--;
 				m_ram_source_page_live_flags[page_index] =
 					m_ram_source_page_live_counts[page_index] != 0 ? 1 : 0;
 				unregistered_pages.set(page_index);
@@ -9974,6 +10165,44 @@ namespace VitaIOP
 		block.ClearOpcodes();
 		RememberFreeCacheEntry(block);
 
+	}
+
+	bool BlockExecutor::MayInvalidateRange(u32 start_pc,
+		u32 instruction_count) const
+	{
+		if (instruction_count == 0)
+			return false;
+		if (instruction_count > ((UINT32_MAX - start_pc) / 4))
+			return true;
+
+		const u32 physical_start = start_pc & 0x1fffffffu;
+		const u32 byte_count = instruction_count * sizeof(u32);
+		if (physical_start >= Ps2MemSize::TotalIopRam ||
+			byte_count > Ps2MemSize::TotalIopRam - physical_start)
+		{
+			// ROM and hardware lookup identities retain the existing exact-range
+			// invalidation path. The compact chunk map describes writable RAM only.
+			return true;
+		}
+
+		u32 backing_start = physical_start & (Ps2MemSize::ExposedIopRam - 1);
+		u32 remaining = byte_count;
+		while (remaining != 0)
+		{
+			const u32 span =
+				std::min(remaining, Ps2MemSize::ExposedIopRam - backing_start);
+			const u32 backing_end = backing_start + span;
+			for (u32 chunk_index = backing_start >> RAM_SOURCE_CHUNK_SHIFT;
+				chunk_index <= ((backing_end - 1) >> RAM_SOURCE_CHUNK_SHIFT);
+				chunk_index++)
+			{
+				if (m_ram_source_chunks->live_flags[chunk_index] != 0)
+					return true;
+			}
+			remaining -= span;
+			backing_start = 0;
+		}
+		return false;
 	}
 
 	u32 BlockExecutor::InvalidateRange(u32 start_pc, u32 instruction_count)
@@ -10989,17 +11218,16 @@ namespace VitaIOP
 		// descriptors at their architectural ownership seams.
 		std::vector<SemanticBlockDescriptor> semantic_descriptors =
 			std::move(m_semantic_block_descriptors);
-		const std::array<u32, RAM_SOURCE_PAGE_COUNT> semantic_page_counts =
-			m_semantic_ram_source_page_counts;
 		const u32 previous_resets = m_code_cache_resets;
 		const u32 invalidated = Reset();
 		m_semantic_block_descriptors = std::move(semantic_descriptors);
-		m_semantic_ram_source_page_counts = semantic_page_counts;
-		m_ram_source_page_live_counts = semantic_page_counts;
-		for (u32 page_index = 0; page_index < RAM_SOURCE_PAGE_COUNT; page_index++)
+		// Rebuild both ownership levels from the retained semantic descriptors.
+		// This rare cache-pressure seam avoids copying a 512 KiB count table onto
+		// the Vita's bounded thread stack.
+		for (const SemanticBlockDescriptor& descriptor :
+			m_semantic_block_descriptors)
 		{
-			m_ram_source_page_live_flags[page_index] =
-				semantic_page_counts[page_index] != 0 ? 1 : 0;
+			RegisterSemanticRamSource(descriptor);
 		}
 		m_code_cache_resets = previous_resets + 1;
 		return invalidated;
@@ -11217,7 +11445,9 @@ namespace VitaIOP
 
 				BlockCompiler compiler(
 					fragment.code, m_ram_source_page_live_counts.data(),
-				m_ram_source_page_live_flags.data(), source_page_literal_allowed);
+					m_ram_source_page_live_flags.data(),
+					m_ram_source_chunks->live_flags.data(),
+					source_page_literal_allowed);
 			DirectLinkSlots attempt_direct_links;
 			size_t attempt_linked_entry_offset = 0;
 			size_t attempt_provider_entry_offset = 0;

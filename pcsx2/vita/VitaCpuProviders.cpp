@@ -1437,8 +1437,14 @@ static s32 psxRecExecuteBlock(s32 eeCycles)
 
 static void psxRecClear(u32 addr, u32 size)
 {
-	// PCSX2 owner: x86/iR3000A.cpp::recClearIOP(addr, size), where size is
-	// measured in 32-bit guest words.
+	// PCSX2 owner: x86/iR3000A.cpp::PSXREC_CLEARM rejects a store when the
+	// exact recLUT word has no compiled source before recClearIOP() enters the
+	// transitive BaseBlock invalidator. Vita's compact 64-byte ownership level
+	// provides the same negative fast path for generated and helper-originated
+	// writes; a positive remains conservative and keeps recClearIOP semantics.
+	// Size is measured in 32-bit guest words.
+	if (!s_iop_a32_executor.MayInvalidateRange(addr, size))
+		return;
 	const u32 invalidated = s_iop_a32_executor.InvalidateRange(addr, size);
 #if defined(VITASX2_QEMU_VALIDATION)
 	if (s_iop_a32_runtime_stats_enabled)

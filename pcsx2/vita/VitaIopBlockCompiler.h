@@ -291,6 +291,7 @@ namespace VitaIOP
 		explicit BlockCompiler(VitaA32::CodeBuffer& code,
 			const u32* ram_source_page_live_counts,
 			const u8* ram_source_page_live_flags,
+			const u8* ram_source_chunk_live_flags,
 			bool source_page_literal_allowed = true);
 
 		static bool CanCompileOpcode(u32 op);
@@ -550,6 +551,7 @@ namespace VitaIOP
 		VitaA32::CodeBuffer& m_code;
 		const u32* m_ram_source_page_live_counts = nullptr;
 		const u8* m_ram_source_page_live_flags = nullptr;
+		const u8* m_ram_source_chunk_live_flags = nullptr;
 		bool m_source_page_literal_allowed = true;
 		std::vector<ScalarLoadColdTail> m_scalar_load_cold_tails;
 		std::vector<ScalarStoreColdTail> m_scalar_store_cold_tails;
@@ -558,6 +560,7 @@ namespace VitaIOP
 		std::vector<Cop2LoadColdTail> m_cop2_load_cold_tails;
 		std::vector<Cop2StoreColdTail> m_cop2_store_cold_tails;
 		std::vector<size_t> m_source_page_literal_loads;
+		std::vector<size_t> m_source_chunk_literal_loads;
 		u32 m_native_instruction_count = 0;
 		u32 m_helper_instruction_count = 0;
 		u16 m_saved_registers = 0;
@@ -665,6 +668,7 @@ namespace VitaIOP
 #endif
 		void NotifyPcDiscontinuity();
 		u32 InvalidateRange(u32 start_pc, u32 instruction_count);
+		bool MayInvalidateRange(u32 start_pc, u32 instruction_count) const;
 		void SetDirectLinkingEnabled(bool enabled);
 		u32 GetCodeCacheResetCount() const { return m_code_cache_resets; }
 		u32 GetSemanticBlockDescriptorCount() const
@@ -761,7 +765,21 @@ namespace VitaIOP
 		static constexpr u32 RAM_SOURCE_PAGE_SIZE = 1u << RAM_SOURCE_PAGE_SHIFT;
 		static constexpr u32 RAM_SOURCE_PAGE_COUNT =
 			Ps2MemSize::TotalIopRam / RAM_SOURCE_PAGE_SIZE;
+		// PCSX2 x86's PSXREC_CLEARM tests the exact recLUT word before entering
+		// psxRecClearMem(). A byte per 64 guest bytes gives A32 a compact second
+		// level after the page guard, eliminating code/data page-sharing false
+		// positives without putting an 18 MiB exact-word count table on Vita.
+		static constexpr u32 RAM_SOURCE_CHUNK_SHIFT = 6;
+		static constexpr u32 RAM_SOURCE_CHUNK_SIZE =
+			1u << RAM_SOURCE_CHUNK_SHIFT;
+		static constexpr u32 RAM_SOURCE_CHUNK_COUNT =
+			Ps2MemSize::TotalIopRam / RAM_SOURCE_CHUNK_SIZE;
 		static constexpr u32 INVALID_RAM_SOURCE = UINT32_MAX;
+		struct RamSourceChunkOwnership
+		{
+			std::array<u32, RAM_SOURCE_CHUNK_COUNT> live_counts{};
+			std::array<u8, RAM_SOURCE_CHUNK_COUNT> live_flags{};
+		};
 
 		struct CachedBlock
 		{
@@ -977,6 +995,8 @@ namespace VitaIOP
 		void UnregisterRamSource(const CachedBlock& block);
 		void RegisterRamSource(InterpreterFallbackBlock& block);
 		void UnregisterRamSource(const InterpreterFallbackBlock& block);
+		void RegisterRamSourceChunks(u32 source_start, u32 source_size);
+		void UnregisterRamSourceChunks(u32 source_start, u32 source_size);
 		bool AnalyzePollCallWaitLoop(CachedBlock& block, u32 start_pc,
 			u32 instruction_count);
 		bool AnalyzeInlineRamPollWaitLoop(CachedBlock& block, u32 start_pc,
@@ -1210,9 +1230,8 @@ namespace VitaIOP
 		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT>
 			m_ram_source_pages;
 		std::array<u32, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
-		std::array<u32, RAM_SOURCE_PAGE_COUNT>
-			m_semantic_ram_source_page_counts{};
 		std::array<u8, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_flags{};
+		std::unique_ptr<RamSourceChunkOwnership> m_ram_source_chunks;
 		LookupPage** m_lookup_pages = nullptr;
 		std::array<std::array<std::array<HotDispatchCacheEntry,
 								  HOT_DISPATCH_CACHE_WAY_COUNT>,
