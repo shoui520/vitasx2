@@ -106,6 +106,11 @@ namespace VitaVU
 		u64 canonical_acc_word_stores = 0;
 		u64 canonical_acc_quad_loads = 0;
 		u64 canonical_acc_quad_stores = 0;
+		// Compile-time representation evidence. PCSX2 microVU keeps the
+		// clamped/normalized representation of resident VF/ACC values; these
+		// count redundant vuDouble() operand passes removed from emitted A32.
+		u64 normalized_operand_quads_bypassed = 0;
+		u64 normalization_instructions_removed = 0;
 		u64 linked_frame_entries = 0;
 		u64 linked_frame_instructions_removed = 0;
 		u64 linked_frame_stack_words_removed = 0;

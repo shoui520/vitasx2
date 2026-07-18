@@ -73,6 +73,8 @@ u32 g_qemuVuJitLowerEfuStallTestInlineOps = 0;
 u32 g_qemuVuJitLowerBranchStallTestInlineOps = 0;
 u32 g_qemuVuJitLowerStallInlineOps = 0;
 u32 g_qemuVuJitDtFlagInlineOps = 0;
+u32 g_qemuVuJitNormalizedOperandQuadBypasses = 0;
+u32 g_qemuVu0JitNormalizedOperandQuadBypasses = 0;
 u32 g_qemuVuJitLinkedFrameEntries = 0;
 u32 g_qemuVuJitLinkedVectorFrameEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineEntries = 0;
@@ -1415,6 +1417,10 @@ namespace VitaVU
 			{
 				pxAssert(m_vu0_memory_map || vector_cache_mode != VectorCacheMode::Trace || vector_accesses);
 				pxAssert(m_vu0_memory_map || vector_cache_mode != VectorCacheMode::Enabled || vector_accesses);
+				// VF0 is the architectural (0, 0, 0, 1) constant. Other live-ins
+				// may have arrived through VU memory, COP2, or an earlier program and
+				// therefore start with unknown vuDouble() representation.
+				m_normalized_vector_lanes[0] = 0x0f;
 				for (u32 i = 0; i < m_local_fmac_entries.size(); i++)
 					m_local_fmac_entries[i].slot = static_cast<u8>(i);
 			}
@@ -1591,6 +1597,8 @@ namespace VitaVU
 			size_t LinkedEntryOffset() const { return m_linked_entry_offset; }
 			size_t DeferredFmacLinkedEntryOffset() const { return m_deferred_fmac_linked_entry_offset; }
 			const VectorCacheStats& GetVectorCacheStats() const { return m_vector_cache_stats; }
+			u32 GetNormalizedOperandQuadBypasses() const { return m_normalized_operand_quad_bypasses; }
+			u32 GetNormalizationInstructionsRemoved() const { return m_normalization_instructions_removed; }
 
 			static VectorCacheOpportunity AnalyzeVectorCacheOpportunity(
 				std::vector<VectorAccessEvent>* events)
@@ -2390,6 +2398,17 @@ namespace VitaVU
 					m_code.EmitAddImm8(1, 1, 1) &&
 					m_code.EmitStrImm12(1, 0, 0);
 			}
+
+			bool EmitQemuNormalizedOperandBypassCounter()
+			{
+				u32* const counter = m_vu0_memory_map ?
+					&g_qemuVu0JitNormalizedOperandQuadBypasses :
+					&g_qemuVuJitNormalizedOperandQuadBypasses;
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(counter))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1, 1) &&
+					m_code.EmitStrImm12(1, 0, 0);
+			}
 #endif
 
 			bool EmitInlineTestPipesFmacFlush(bool full_queue_fast_path,
@@ -2984,6 +3003,24 @@ namespace VitaVU
 				bool dirty = false;
 			};
 
+			bool AreVectorLanesNormalized(u8 guest, u8 lanes) const
+			{
+				return lanes == 0 ||
+					(m_normalized_vector_lanes[guest] & lanes) == lanes;
+			}
+
+			void MarkVectorLanesUnknown(u8 guest, u8 lanes)
+			{
+				if (guest != 0)
+					m_normalized_vector_lanes[guest] &= static_cast<u8>(~lanes);
+			}
+
+			void MarkVectorLanesNormalized(u8 guest, u8 lanes)
+			{
+				if (guest != 0)
+					m_normalized_vector_lanes[guest] |= lanes;
+			}
+
 			bool RecordOrConsumeVectorAccess(u8 guest, VectorAccessKind kind,
 				bool needs_old_value, bool* admit)
 			{
@@ -3219,7 +3256,11 @@ namespace VitaVU
 					m_vector_cache_stats.uncached_stores++;
 				if (!m_vu0_memory_map && reg != 0)
 					m_vector_cache_stats.vf_word_stores++;
-				return m_code.EmitStrImm12(rs, HOST_VU, VfLaneOffset(reg, lane));
+				if (!m_code.EmitStrImm12(rs, HOST_VU, VfLaneOffset(reg, lane)))
+					return false;
+				MarkVectorLanesUnknown(static_cast<u8>(reg),
+					static_cast<u8>(1u << (3 - lane)));
+				return true;
 			}
 
 			bool EmitStoreVfWordFromS(unsigned ss, unsigned reg, unsigned lane)
@@ -3235,7 +3276,11 @@ namespace VitaVU
 					m_vector_cache_stats.uncached_stores++;
 				if (!m_vu0_memory_map && reg != 0)
 					m_vector_cache_stats.vf_word_stores++;
-				return m_code.EmitVstrSImm(ss, HOST_VU, VfLaneOffset(reg, lane));
+				if (!m_code.EmitVstrSImm(ss, HOST_VU, VfLaneOffset(reg, lane)))
+					return false;
+				MarkVectorLanesUnknown(static_cast<u8>(reg),
+					static_cast<u8>(1u << (3 - lane)));
+				return true;
 			}
 
 			bool EmitLoadVfQuad(unsigned qd, unsigned reg)
@@ -3269,13 +3314,23 @@ namespace VitaVU
 				}
 				if (!m_vu0_memory_map)
 					m_vector_cache_stats.uncached_stores++;
+				bool emitted = false;
 				if (VectorCacheEnabled() &&
 					(FindVectorCacheSlot(static_cast<u8>(reg)) >= 0 || admit))
-					return EmitStoreCachedVectorQuad(qs, static_cast<u8>(reg), needs_old_value);
-				if (!m_vu0_memory_map)
-					m_vector_cache_stats.vf_quad_stores++;
-				return EmitCanonicalVectorAddress(3, static_cast<u8>(reg)) &&
-					m_code.EmitVst1Q32Aligned(qs, 3);
+				{
+					emitted = EmitStoreCachedVectorQuad(qs, static_cast<u8>(reg), needs_old_value);
+				}
+				else
+				{
+					if (!m_vu0_memory_map)
+						m_vector_cache_stats.vf_quad_stores++;
+					emitted = EmitCanonicalVectorAddress(3, static_cast<u8>(reg)) &&
+						m_code.EmitVst1Q32Aligned(qs, 3);
+				}
+				if (!emitted)
+					return false;
+				MarkVectorLanesUnknown(static_cast<u8>(reg), 0x0f);
+				return true;
 			}
 
 			bool EmitLoadAccWord(unsigned rd, unsigned lane)
@@ -3306,8 +3361,14 @@ namespace VitaVU
 					m_vector_cache_stats.uncached_stores++;
 				if (!m_vu0_memory_map)
 					m_vector_cache_stats.acc_word_stores++;
-				return m_code.EmitStrImm12(rs, HOST_VU,
-					VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32)));
+				if (!m_code.EmitStrImm12(rs, HOST_VU,
+						VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32))))
+				{
+					return false;
+				}
+				MarkVectorLanesUnknown(VU_VECTOR_CACHE_ACC,
+					static_cast<u8>(1u << (3 - lane)));
+				return true;
 			}
 
 			bool EmitStoreAccWordFromS(unsigned ss, unsigned lane)
@@ -3325,8 +3386,14 @@ namespace VitaVU
 				// ACC begins at byte 1024, just beyond VSTR's 10-bit scaled
 				// immediate range. Materialize its base once for this lane rather
 				// than forcing the value through an ARM core register.
-				return EmitCanonicalVectorAddress(3, VU_VECTOR_CACHE_ACC) &&
-					m_code.EmitVstrSImm(ss, 3, static_cast<u16>(lane * sizeof(u32)));
+				if (!EmitCanonicalVectorAddress(3, VU_VECTOR_CACHE_ACC) ||
+					!m_code.EmitVstrSImm(ss, 3, static_cast<u16>(lane * sizeof(u32))))
+				{
+					return false;
+				}
+				MarkVectorLanesUnknown(VU_VECTOR_CACHE_ACC,
+					static_cast<u8>(1u << (3 - lane)));
+				return true;
 			}
 
 			bool EmitLoadAccQuad(unsigned qd)
@@ -3773,6 +3840,71 @@ namespace VitaVU
 					default:
 						return false;
 				}
+			}
+
+			int UpperVfBroadcastLane(VUInterpFast::UpperFastKind kind) const
+			{
+				switch (kind)
+				{
+					case VUInterpFast::UpperFastKind::ADDx:
+					case VUInterpFast::UpperFastKind::ADDAx:
+					case VUInterpFast::UpperFastKind::SUBx:
+					case VUInterpFast::UpperFastKind::SUBAx:
+					case VUInterpFast::UpperFastKind::MULx:
+					case VUInterpFast::UpperFastKind::MULAx:
+					case VUInterpFast::UpperFastKind::MADDx:
+					case VUInterpFast::UpperFastKind::MADDAx:
+					case VUInterpFast::UpperFastKind::MSUBx:
+					case VUInterpFast::UpperFastKind::MSUBAx:
+						return 0;
+					case VUInterpFast::UpperFastKind::ADDy:
+					case VUInterpFast::UpperFastKind::ADDAy:
+					case VUInterpFast::UpperFastKind::SUBy:
+					case VUInterpFast::UpperFastKind::SUBAy:
+					case VUInterpFast::UpperFastKind::MULy:
+					case VUInterpFast::UpperFastKind::MULAy:
+					case VUInterpFast::UpperFastKind::MADDy:
+					case VUInterpFast::UpperFastKind::MADDAy:
+					case VUInterpFast::UpperFastKind::MSUBy:
+					case VUInterpFast::UpperFastKind::MSUBAy:
+						return 1;
+					case VUInterpFast::UpperFastKind::ADDz:
+					case VUInterpFast::UpperFastKind::ADDAz:
+					case VUInterpFast::UpperFastKind::SUBz:
+					case VUInterpFast::UpperFastKind::SUBAz:
+					case VUInterpFast::UpperFastKind::MULz:
+					case VUInterpFast::UpperFastKind::MULAz:
+					case VUInterpFast::UpperFastKind::MADDz:
+					case VUInterpFast::UpperFastKind::MADDAz:
+					case VUInterpFast::UpperFastKind::MSUBz:
+					case VUInterpFast::UpperFastKind::MSUBAz:
+						return 2;
+					case VUInterpFast::UpperFastKind::ADDw:
+					case VUInterpFast::UpperFastKind::ADDAw:
+					case VUInterpFast::UpperFastKind::SUBw:
+					case VUInterpFast::UpperFastKind::SUBAw:
+					case VUInterpFast::UpperFastKind::MULw:
+					case VUInterpFast::UpperFastKind::MULAw:
+					case VUInterpFast::UpperFastKind::MADDw:
+					case VUInterpFast::UpperFastKind::MADDAw:
+					case VUInterpFast::UpperFastKind::MSUBw:
+					case VUInterpFast::UpperFastKind::MSUBAw:
+						return 3;
+					default:
+						return -1;
+				}
+			}
+
+			bool IsUpperOperandNormalized(u32 code, VUInterpFast::UpperFastKind kind,
+				u8 active_lanes, bool vector_form) const
+			{
+				const u8 ft = static_cast<u8>(VUInterpFast::Ft(code));
+				if (vector_form)
+					return AreVectorLanesNormalized(ft, active_lanes);
+
+				const int lane = UpperVfBroadcastLane(kind);
+				return lane >= 0 && AreVectorLanesNormalized(ft,
+					static_cast<u8>(1u << (3 - lane)));
 			}
 
 			// MADD/MSUB whose second operand broadcasts one VF[ft] lane. When the
@@ -4242,8 +4374,21 @@ namespace VitaVU
 					}
 				}
 
-				return m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) &&
-					EmitUpdateStatusFromMacReg(2, 0, 1);
+				if (!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) ||
+					!EmitUpdateStatusFromMacReg(2, 0, 1))
+				{
+					return false;
+				}
+
+				// PCSX2 microVU's register allocator retains the clamped FMAC
+				// representation. EmitFinishMacQ0 just applied the same vuFloat()
+				// normalization to every active result lane, so later FMAC operands
+				// in this straight-line block do not need another vuDouble() pass.
+				if (acc)
+					MarkVectorLanesNormalized(VU_VECTOR_CACHE_ACC, static_cast<u8>(mask));
+				else if (fd != 0)
+					MarkVectorLanesNormalized(static_cast<u8>(fd), static_cast<u8>(mask));
+				return true;
 			}
 
 			bool EmitApplyTriAceAddHack(unsigned fs_reg, unsigned operand_reg, unsigned diff_reg,
@@ -4325,9 +4470,14 @@ namespace VitaVU
 					// Load both operands as NEON quads (Q0=fs, Q1=ft/broadcast) and
 					// normalize all four lanes at once, avoiding the per-lane scalar
 					// vuDouble() and the ARM->NEON single-register transfers.
+					const bool fs_normalized = AreVectorLanesNormalized(
+						static_cast<u8>(fs), static_cast<u8>(mask));
+					const bool operand_normalized = IsUpperOperandNormalized(code, kind,
+						static_cast<u8>(mask), IsUpperVectorOperandForm(kind));
 					if (!EmitLoadVfQuad(0, fs) ||
 						!EmitLoadUpperAddSubOperandQuad(1, code, kind) ||
-						!EmitNormalizeVuFloatQuads(0, 1))
+						!EmitNormalizeVuFloatQuadsKnown(0, fs_normalized,
+							1, operand_normalized))
 					{
 						return false;
 					}
@@ -4370,9 +4520,14 @@ namespace VitaVU
 					// Load both operands as NEON quads (Q0=fs, Q1=ft/broadcast) and
 					// normalize all four lanes at once, avoiding the per-lane scalar
 					// vuDouble() and the ARM->NEON single-register transfers.
+					const bool fs_normalized = AreVectorLanesNormalized(
+						static_cast<u8>(fs), static_cast<u8>(mask));
+					const bool operand_normalized = IsUpperOperandNormalized(code, kind,
+						static_cast<u8>(mask), IsUpperVectorOperandForm(kind));
 					if (!EmitLoadVfQuad(0, fs) ||
 						!EmitLoadUpperMulOperandQuad(1, code, kind) ||
-						!EmitNormalizeVuFloatQuads(0, 1))
+						!EmitNormalizeVuFloatQuadsKnown(0, fs_normalized,
+							1, operand_normalized))
 					{
 						return false;
 					}
@@ -4459,10 +4614,17 @@ namespace VitaVU
 				{
 					if (mask != 0)
 					{
+						const bool acc_normalized = AreVectorLanesNormalized(
+							VU_VECTOR_CACHE_ACC, static_cast<u8>(mask));
+						const bool fs_normalized = AreVectorLanesNormalized(
+							static_cast<u8>(fs), static_cast<u8>(mask));
+						const bool operand_normalized = IsUpperOperandNormalized(code, kind,
+							static_cast<u8>(mask), IsUpperMaddMsubVectorForm(kind));
 						if (!EmitLoadAccQuad(0) ||
 							!EmitLoadVfQuad(1, fs) ||
 							!EmitLoadUpperMaddMsubOperandQuad(2, code, kind) ||
-							!EmitNormalizeVuFloatQuads3(0, 1, 2))
+							!EmitNormalizeVuFloatQuads3Known(0, acc_normalized,
+								1, fs_normalized, 2, operand_normalized))
 						{
 							return false;
 						}
@@ -4495,6 +4657,13 @@ namespace VitaVU
 					!EmitFinishMacQ0(acc, fd, mask, false))
 				{
 					return false;
+				}
+				if (alias_hazard)
+				{
+					if (acc)
+						MarkVectorLanesNormalized(VU_VECTOR_CACHE_ACC, static_cast<u8>(mask));
+					else if (fd != 0)
+						MarkVectorLanesNormalized(static_cast<u8>(fd), static_cast<u8>(mask));
 				}
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -5845,6 +6014,68 @@ namespace VitaVU
 					EmitNormalizeVuFloatQuadInPlace(vq_a, overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_b, overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_c, overflow_clamp);
+#endif
+			}
+
+			void RecordNormalizedOperandBypass(bool overflow_clamp)
+			{
+				m_normalized_operand_quad_bypasses++;
+				// EmitNormalizeVuFloatQuadInPlace() is six NEON instructions for
+				// signed-denormal flushing plus five for overflow clamping.
+				m_normalization_instructions_removed += overflow_clamp ? 11 : 6;
+			}
+
+			bool EmitNormalizeKnownQuad(unsigned vq, bool already_normalized,
+				bool overflow_clamp)
+			{
+				if (already_normalized)
+				{
+					RecordNormalizedOperandBypass(overflow_clamp);
+#if defined(VITASX2_QEMU_VALIDATION)
+					return EmitQemuNormalizedOperandBypassCounter();
+#else
+					return true;
+#endif
+				}
+				return EmitNormalizeVuFloatQuadInPlace(vq, overflow_clamp);
+			}
+
+			bool EmitNormalizeVuFloatQuadsKnown(unsigned vq_a, bool a_normalized,
+				unsigned vq_b, bool b_normalized)
+			{
+#if defined(INT_VUDOUBLEHACK)
+				(void)vq_a;
+				(void)a_normalized;
+				(void)vq_b;
+				(void)b_normalized;
+				return true;
+#else
+				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				return ((a_normalized && b_normalized) ||
+					EmitEnsureVuFloatNormalizeConstants(overflow_clamp)) &&
+					EmitNormalizeKnownQuad(vq_a, a_normalized, overflow_clamp) &&
+					EmitNormalizeKnownQuad(vq_b, b_normalized, overflow_clamp);
+#endif
+			}
+
+			bool EmitNormalizeVuFloatQuads3Known(unsigned vq_a, bool a_normalized,
+				unsigned vq_b, bool b_normalized, unsigned vq_c, bool c_normalized)
+			{
+#if defined(INT_VUDOUBLEHACK)
+				(void)vq_a;
+				(void)a_normalized;
+				(void)vq_b;
+				(void)b_normalized;
+				(void)vq_c;
+				(void)c_normalized;
+				return true;
+#else
+				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				return ((a_normalized && b_normalized && c_normalized) ||
+					EmitEnsureVuFloatNormalizeConstants(overflow_clamp)) &&
+					EmitNormalizeKnownQuad(vq_a, a_normalized, overflow_clamp) &&
+					EmitNormalizeKnownQuad(vq_b, b_normalized, overflow_clamp) &&
+					EmitNormalizeKnownQuad(vq_c, c_normalized, overflow_clamp);
 #endif
 			}
 
@@ -8654,6 +8885,9 @@ namespace VitaVU
 			size_t m_vector_access_cursor = 0;
 			std::array<VectorCacheSlot, VU_VECTOR_CACHE_SLOTS> m_vector_cache{};
 			VectorCacheStats m_vector_cache_stats{};
+			std::array<u8, VU_VECTOR_CACHE_ACC + 1> m_normalized_vector_lanes{};
+			u32 m_normalized_operand_quad_bypasses = 0;
+			u32 m_normalization_instructions_removed = 0;
 			std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT> m_local_fmac_entries{};
 			// True once the vuDouble() bit-select constant quads (Q8-Q11) have been
 			// materialized in this block. Q8-Q15 are exclusive to the normalize
@@ -9132,6 +9366,8 @@ namespace VitaVU
 					size_t chosen_linked_entry_offset = static_cast<size_t>(-1);
 					size_t chosen_deferred_fmac_linked_entry_offset = static_cast<size_t>(-1);
 					BlockCompiler::VectorCacheStats chosen_vector_stats{};
+					u32 chosen_normalized_operand_quad_bypasses = 0;
+					u32 chosen_normalization_instructions_removed = 0;
 					bool compiled = false;
 					bool vector_cache_candidate = false;
 					bool vector_cache_selected = false;
@@ -9170,6 +9406,10 @@ namespace VitaVU
 								chosen_deferred_fmac_linked_entry_offset =
 									baseline_deferred_fmac_linked_entry;
 								chosen_vector_stats = baseline_stats;
+								chosen_normalized_operand_quad_bypasses =
+									baseline.GetNormalizedOperandQuadBypasses();
+								chosen_normalization_instructions_removed =
+									baseline.GetNormalizationInstructionsRemoved();
 								compiled = true;
 							}
 							else
@@ -9197,6 +9437,10 @@ namespace VitaVU
 										chosen_deferred_fmac_linked_entry_offset =
 											cached.DeferredFmacLinkedEntryOffset();
 										chosen_vector_stats = cached_stats;
+										chosen_normalized_operand_quad_bypasses =
+											cached.GetNormalizedOperandQuadBypasses();
+										chosen_normalization_instructions_removed =
+											cached.GetNormalizationInstructionsRemoved();
 										vector_cache_baseline_instructions = baseline_size / sizeof(u32);
 										vector_cache_selected_instructions = cached_size / sizeof(u32);
 										vector_cache_canonical_bytes_removed = baseline_bytes - cached_bytes;
@@ -9215,6 +9459,10 @@ namespace VitaVU
 										chosen_deferred_fmac_linked_entry_offset =
 											fallback.DeferredFmacLinkedEntryOffset();
 										chosen_vector_stats = fallback.GetVectorCacheStats();
+										chosen_normalized_operand_quad_bypasses =
+											fallback.GetNormalizedOperandQuadBypasses();
+										chosen_normalization_instructions_removed =
+											fallback.GetNormalizationInstructionsRemoved();
 										compiled = true;
 									}
 								}
@@ -9243,6 +9491,10 @@ namespace VitaVU
 						s_vu1.stats.code_cache_used = s_vu1.code_cache_used;
 						s_vu1.stats.compiled_blocks++;
 						s_vu1.stats.compiled_pairs += plan.pair_count;
+						s_vu1.stats.normalized_operand_quads_bypassed +=
+							chosen_normalized_operand_quad_bypasses;
+						s_vu1.stats.normalization_instructions_removed +=
+							chosen_normalization_instructions_removed;
 						if (plan.local_fmac_pipeline)
 						{
 							s_vu1.stats.local_fmac_pipeline_blocks++;
@@ -9434,6 +9686,10 @@ namespace VitaVU
 						s_vu0.stats.code_cache_used = s_vu0.code_cache_used;
 						s_vu0.stats.compiled_blocks++;
 						s_vu0.stats.compiled_pairs += plan.pair_count;
+						s_vu0.stats.normalized_operand_quads_bypassed +=
+							compiler.GetNormalizedOperandQuadBypasses();
+						s_vu0.stats.normalization_instructions_removed +=
+							compiler.GetNormalizationInstructionsRemoved();
 						if (plan.entry_branch_tail)
 						{
 							s_vu0.stats.branch_continuation_blocks++;
