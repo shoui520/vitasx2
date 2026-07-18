@@ -651,8 +651,8 @@ namespace VitaVU
 		bool CanUseLocalFmacPipeline(const BlockPlan& block)
 		{
 			constexpr u32 WARMUP_PAIRS = 4;
-			constexpr u32 MIN_LOCAL_PAIRS = 8;
-			if (block.pair_count < WARMUP_PAIRS + MIN_LOCAL_PAIRS)
+			constexpr u32 MIN_LOCAL_COMMITS = 6;
+			if (block.pair_count < WARMUP_PAIRS + MIN_LOCAL_COMMITS)
 				return false;
 
 			const u32 flag_mask = (1u << REG_STATUS_FLAG) |
@@ -661,20 +661,31 @@ namespace VitaVU
 			for (u32 i = WARMUP_PAIRS; i < block.pair_count; i++)
 			{
 				const PairPlan& pair = block.pairs[i];
-				// A block-local delayed publisher is valid only while nothing in
-				// the block can observe the architectural flag instances. E/D/T
-				// completion and PATH1 calls are observable seams and remain on
-				// the canonical interpreter-queue path.
-				if (pair.ebit || pair.dflag || pair.tflag || pair.lower_flag_inline ||
-					pair.lower_xgkick_inline ||
-					((pair.uregs.VIread | pair.lregs.VIread) & flag_mask) != 0)
+				// E/D/T completion and PATH1 calls are externally observable seams
+				// and retain the canonical interpreter queue. A flag instruction or
+				// flag-register read is compatible only when every older compiler-owned
+				// snapshot has reached PCSX2's fixed four-cycle FMAC visibility point.
+				// EmitRetireLocalFmacEntries() publishes those snapshots before this
+				// pair executes; an FMAC produced by the observer pair itself is queued
+				// later in the pair tail and therefore remains eligible.
+				if (pair.ebit || pair.dflag || pair.tflag || pair.lower_xgkick_inline)
 				{
 					return false;
+				}
+				const bool observes_flags = pair.lower_flag_inline ||
+					((pair.uregs.VIread | pair.lregs.VIread) & flag_mask) != 0;
+				if (observes_flags)
+				{
+					for (u32 writer = WARMUP_PAIRS; writer < i; writer++)
+					{
+						if (block.pairs[writer].fmac_pipe && writer + 4 > i)
+							return false;
+					}
 				}
 				fmac_pairs += pair.fmac_pipe ? 1u : 0u;
 			}
 
-			return fmac_pairs >= MIN_LOCAL_PAIRS;
+			return fmac_pairs >= MIN_LOCAL_COMMITS;
 		}
 
 		bool CanDeferLocalFmacFlags(const BlockPlan& block)
