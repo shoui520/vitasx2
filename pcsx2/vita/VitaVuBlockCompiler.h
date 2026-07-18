@@ -29,6 +29,10 @@ namespace VitaVU
 		u32 cycle_resident_blocks = 0;
 		u32 cycle_resident_pairs = 0;
 		u64 cycle_resident_pair_instructions_removed = 0;
+		u32 local_fmac_pipeline_blocks = 0;
+		u32 local_fmac_pipeline_pairs = 0;
+		u64 local_fmac_pipeline_entries = 0;
+		u64 local_fmac_pipeline_commits = 0;
 		u32 test_pipes_fast_guard_pairs = 0;
 		u32 fmac_clear_inline_pairs = 0;
 		u32 upper_fmac_stall_test_inline_pairs = 0;

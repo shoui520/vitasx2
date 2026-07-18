@@ -73,6 +73,8 @@ u32 g_qemuVuJitLowerStallInlineOps = 0;
 u32 g_qemuVuJitDtFlagInlineOps = 0;
 u32 g_qemuVuJitLinkedFrameEntries = 0;
 u32 g_qemuVuJitLinkedVectorFrameEntries = 0;
+u32 g_qemuVuJitLocalFmacPipelineEntries = 0;
+u32 g_qemuVuJitLocalFmacPipelineCommits = 0;
 #endif
 
 namespace VitaVU
@@ -619,10 +621,47 @@ namespace VitaVU
 			u32 lower_stall_inline_pairs = 0;
 			u32 dt_flag_inline_pairs = 0;
 			bool resident_cycle = false;
+			// PCSX2 microVU owner: microVU_IR.h::microRegInfo plus
+			// microVU_Compile.inl::mVUincCycles()/mVUsetCycles(). Long VU1
+			// blocks with no architectural flag observer can keep the fixed
+			// four-cycle FMAC window in compile-time-owned local slots after a
+			// four-pair canonical warm-up. The emitter republishes the exact
+			// interpreter fmacPipe state at the block seam.
+			bool local_fmac_pipeline = false;
+			u32 local_fmac_pipeline_pairs = 0;
 			bool direct_link_tail = false;
 			std::array<DirectLinkPlan, MAX_DIRECT_LINK_SLOTS> direct_links{};
 			std::array<PairPlan, MAX_BLOCK_PAIRS> pairs{};
 		};
+
+		bool CanUseLocalFmacPipeline(const BlockPlan& block)
+		{
+			constexpr u32 WARMUP_PAIRS = 4;
+			constexpr u32 MIN_LOCAL_PAIRS = 8;
+			if (block.pair_count < WARMUP_PAIRS + MIN_LOCAL_PAIRS)
+				return false;
+
+			const u32 flag_mask = (1u << REG_STATUS_FLAG) |
+				(1u << REG_MAC_FLAG) | (1u << REG_CLIP_FLAG);
+			u32 fmac_pairs = 0;
+			for (u32 i = WARMUP_PAIRS; i < block.pair_count; i++)
+			{
+				const PairPlan& pair = block.pairs[i];
+				// A block-local delayed publisher is valid only while nothing in
+				// the block can observe the architectural flag instances. E/D/T
+				// completion and PATH1 calls are observable seams and remain on
+				// the canonical interpreter-queue path.
+				if (pair.ebit || pair.dflag || pair.tflag || pair.lower_flag_inline ||
+					pair.lower_xgkick_inline ||
+					((pair.uregs.VIread | pair.lregs.VIread) & flag_mask) != 0)
+				{
+					return false;
+				}
+				fmac_pairs += pair.fmac_pipe ? 1u : 0u;
+			}
+
+			return fmac_pairs >= MIN_LOCAL_PAIRS;
+		}
 
 		bool IsImmediateBranchKind(VUInterpFast::LowerFastKind kind)
 		{
@@ -1101,6 +1140,13 @@ namespace VitaVU
 						}
 					}
 				}
+
+				block->local_fmac_pipeline = !conservative_vu0 && CanUseLocalFmacPipeline(*block);
+				if (block->local_fmac_pipeline)
+				{
+					for (u32 i = 4; i < block->pair_count; i++)
+						block->local_fmac_pipeline_pairs += block->pairs[i].fmac_pipe ? 1u : 0u;
+				}
 			}
 			return block->pair_count != 0;
 		}
@@ -1162,7 +1208,14 @@ namespace VitaVU
 
 		constexpr u16 SAVED_REGISTER_MASK = 0x4ff0; // r4-r11, lr; each VU path realigns its private frame
 		constexpr u16 RETURN_REGISTER_MASK = 0x8ff0; // r4-r11, pc
-		constexpr u32 STACK_FRAME_SIZE = 36;          // 32-byte VF hazard backup slots + alignment pad
+		constexpr u32 LOCAL_FMAC_BASE = 32;
+		constexpr u32 LOCAL_FMAC_SLOT_SIZE = 24;
+		constexpr u32 LOCAL_FMAC_SLOT_COUNT = 4;
+		constexpr u32 LOCAL_FMAC_CYCLE_OFFSET = 0;
+		constexpr u32 LOCAL_FMAC_MAC_OFFSET = 8;
+		constexpr u32 LOCAL_FMAC_STATUS_OFFSET = 12;
+		constexpr u32 LOCAL_FMAC_CLIP_OFFSET = 16;
+		constexpr u32 STACK_FRAME_SIZE = 132; // 32-byte VF hazard + 4 local FMAC slots + alignment pad
 
 			struct CachedBlock;
 
@@ -1273,6 +1326,8 @@ namespace VitaVU
 			{
 				pxAssert(m_vu0_memory_map || vector_cache_mode != VectorCacheMode::Trace || vector_accesses);
 				pxAssert(m_vu0_memory_map || vector_cache_mode != VectorCacheMode::Enabled || vector_accesses);
+				for (u32 i = 0; i < m_local_fmac_entries.size(); i++)
+					m_local_fmac_entries[i].slot = static_cast<u8>(i);
 			}
 
 			bool Compile()
@@ -1286,6 +1341,8 @@ namespace VitaVU
 					if (!EmitPair(i))
 						return false;
 				}
+				if (!EmitCanonicalizeLocalFmacPipeline())
+					return false;
 
 				// PCSX2 owner: x86/microVU_Compile.inl keeps the micro PC in
 				// compiler state and publishes it at block-management seams. Branch
@@ -1507,7 +1564,7 @@ namespace VitaVU
 				}
 				else if (!m_code.EmitSubImm8(SP, SP, 4) ||
 					!m_code.EmitVpushDRange(8, 8) ||
-					!m_code.EmitSubImm8(SP, SP, 32))
+					!m_code.EmitSubImm8(SP, SP, 128))
 				{
 					return false;
 				}
@@ -1538,7 +1595,7 @@ namespace VitaVU
 					return m_code.EmitAddImm8(SP, SP, STACK_FRAME_SIZE) &&
 						m_code.EmitPop(RETURN_REGISTER_MASK);
 
-				return m_code.EmitAddImm8(SP, SP, 32) &&
+				return m_code.EmitAddImm8(SP, SP, 128) &&
 					m_code.EmitVpopDRange(8, 8) &&
 					m_code.EmitAddImm8(SP, SP, 4) &&
 					m_code.EmitPop(RETURN_REGISTER_MASK);
@@ -1842,6 +1899,23 @@ namespace VitaVU
 			}
 
 #if defined(VITASX2_QEMU_VALIDATION)
+			bool EmitQemuLocalFmacPipelineCounters()
+			{
+				if (!m_plan.local_fmac_pipeline)
+					return true;
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitLocalFmacPipelineEntries))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1, 1) &&
+					m_code.EmitStrImm12(1, 0, 0) &&
+					m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitLocalFmacPipelineCommits))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1,
+						static_cast<u8>(m_plan.local_fmac_pipeline_pairs)) &&
+					m_code.EmitStrImm12(1, 0, 0);
+			}
+
 				bool EmitQemuEbitFinishInlineCounter()
 				{
 					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitEbitFinishInlineOps))) &&
@@ -7302,6 +7376,283 @@ namespace VitaVU
 					m_code.EmitAddRegShiftImm(ptr_reg, ptr_reg, index_reg, ShiftType::LSL, 4);
 			}
 
+			struct LocalFmacEntry
+			{
+				u32 pair_index = 0;
+				u8 slot = 0;
+				bool active = false;
+			};
+
+			static u32 FmacRegUpper(const PairPlan& plan)
+			{
+				return plan.add_upper_stalls ? plan.uregs.VFwrite : 0;
+			}
+
+			static u32 FmacRegLower(const PairPlan& plan)
+			{
+				return (plan.add_lower_stalls && plan.lregs.pipe == VUPIPE_FMAC) ?
+					plan.lregs.VFwrite : 0;
+			}
+
+			static u32 FmacFlagReg(const PairPlan& plan)
+			{
+				return (plan.add_upper_stalls ? plan.uregs.VIwrite : 0) |
+					((plan.add_lower_stalls && plan.lregs.pipe == VUPIPE_FMAC) ?
+						plan.lregs.VIwrite : 0);
+			}
+
+			static u32 FmacXyzwUpper(const PairPlan& plan)
+			{
+				return plan.add_upper_stalls ? plan.uregs.VFwxyzw : 0;
+			}
+
+			static u32 FmacXyzwLower(const PairPlan& plan)
+			{
+				return (plan.add_lower_stalls && plan.lregs.pipe == VUPIPE_FMAC) ?
+					plan.lregs.VFwxyzw : 0;
+			}
+
+			static u32 LocalFmacOffset(const LocalFmacEntry& entry, u32 field)
+			{
+				return LOCAL_FMAC_BASE + static_cast<u32>(entry.slot) * LOCAL_FMAC_SLOT_SIZE + field;
+			}
+
+			bool LocalFmacConflicts(const LocalFmacEntry& entry, const _VURegsNum& regs) const
+			{
+				const PairPlan& writer = m_pairs[entry.pair_index];
+				const auto conflicts = [](u32 write_reg, u32 write_mask, u32 read_reg, u32 read_mask) {
+					return write_reg != 0 && write_reg == read_reg && (write_mask & read_mask) != 0;
+				};
+				return conflicts(FmacRegUpper(writer), FmacXyzwUpper(writer), regs.VFread0, regs.VFr0xyzw) ||
+					conflicts(FmacRegUpper(writer), FmacXyzwUpper(writer), regs.VFread1, regs.VFr1xyzw) ||
+					conflicts(FmacRegLower(writer), FmacXyzwLower(writer), regs.VFread0, regs.VFr0xyzw) ||
+					conflicts(FmacRegLower(writer), FmacXyzwLower(writer), regs.VFread1, regs.VFr1xyzw);
+			}
+
+			bool EmitLocalFmacStallTest(const _VURegsNum& regs)
+			{
+				if (!m_plan.local_fmac_pipeline || (regs.VFread0 == 0 && regs.VFread1 == 0))
+					return true;
+
+				for (const LocalFmacEntry& entry : m_local_fmac_entries)
+				{
+					if (!entry.active || !LocalFmacConflicts(entry, regs))
+						continue;
+
+					const u8 offset = static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET));
+					if (!m_code.EmitLdrdImm8(0, 1, SP, offset) ||
+						!m_code.EmitAddImm8(0, 0, 4, true) ||
+						!m_code.EmitAdcImm8(1, 1, 0) ||
+						!EmitStoreCycleIfNewer(0, 1, 2, 3))
+					{
+						return false;
+					}
+				}
+				return true;
+			}
+
+			bool EmitPublishLocalFmacFlags(const LocalFmacEntry& entry)
+			{
+				const PairPlan& plan = m_pairs[entry.pair_index];
+				const u32 flagreg = FmacFlagReg(plan);
+				if ((flagreg & (1u << REG_CLIP_FLAG)) != 0 &&
+					(!m_code.EmitLdrImm12(0, SP, LocalFmacOffset(entry, LOCAL_FMAC_CLIP_OFFSET)) ||
+					 !m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_CLIP_FLAG))))
+				{
+					return false;
+				}
+
+				if ((flagreg & (1u << REG_STATUS_FLAG)) != 0)
+				{
+					if (!m_code.EmitLdrImm12(0, HOST_VU, ViOffset(REG_STATUS_FLAG)) ||
+						!EmitAndRegImm32(0, 0, 0x30u, HOST_CALL_SCRATCH) ||
+						!m_code.EmitLdrImm12(1, SP, LocalFmacOffset(entry, LOCAL_FMAC_STATUS_OFFSET)) ||
+						!EmitAndRegImm32(2, 1, 0xfc0u, HOST_CALL_SCRATCH) ||
+						!m_code.EmitOrrReg(0, 0, 2) ||
+						!EmitAndRegImm32(1, 1, 0x0fu, HOST_CALL_SCRATCH) ||
+						!m_code.EmitOrrReg(0, 0, 1) ||
+						!m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_STATUS_FLAG)))
+					{
+						return false;
+					}
+				}
+				else
+				{
+					if (!m_code.EmitLdrImm12(0, HOST_VU, ViOffset(REG_STATUS_FLAG)) ||
+						!EmitAndRegImm32(0, 0, 0xff0u, HOST_CALL_SCRATCH) ||
+						!m_code.EmitLdrImm12(1, SP, LocalFmacOffset(entry, LOCAL_FMAC_STATUS_OFFSET)) ||
+						!EmitAndRegImm32(1, 1, 0x0fu, HOST_CALL_SCRATCH) ||
+						!m_code.EmitOrrReg(0, 0, 1) ||
+						!m_code.EmitOrrRegShiftImm(0, 0, 1, ShiftType::LSL, 6) ||
+						!m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_STATUS_FLAG)))
+					{
+						return false;
+					}
+				}
+
+				return m_code.EmitLdrImm12(0, SP, LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET)) &&
+					m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_MAC_FLAG));
+			}
+
+			bool EmitRetireLocalFmacEntries(u32 pair_index)
+			{
+				if (!m_plan.local_fmac_pipeline)
+					return true;
+				for (u32 ordered_index = 0; ordered_index < LOCAL_FMAC_SLOT_COUNT; ordered_index++)
+				{
+					LocalFmacEntry* oldest_ready = nullptr;
+					for (LocalFmacEntry& candidate : m_local_fmac_entries)
+					{
+						if (!candidate.active || candidate.pair_index + 4 > pair_index)
+							continue;
+						if (!oldest_ready || candidate.pair_index < oldest_ready->pair_index)
+							oldest_ready = &candidate;
+					}
+					if (!oldest_ready)
+						break;
+					if (!EmitPublishLocalFmacFlags(*oldest_ready))
+						return false;
+					oldest_ready->active = false;
+				}
+				return true;
+			}
+
+			bool EmitCommitLocalFmac(u32 pair_index, const PairPlan& plan)
+			{
+				LocalFmacEntry* entry = nullptr;
+				for (LocalFmacEntry& candidate : m_local_fmac_entries)
+				{
+					if (!candidate.active)
+					{
+						entry = &candidate;
+						break;
+					}
+				}
+				if (!entry)
+					return false;
+
+				entry->pair_index = pair_index;
+				entry->active = true;
+				const u8 cycle_offset = static_cast<u8>(LocalFmacOffset(*entry, LOCAL_FMAC_CYCLE_OFFSET));
+				const bool emitted =
+					EmitLoadCurrentCycleLow(0) &&
+					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
+					m_code.EmitStrdImm8(0, 1, SP, cycle_offset) &&
+					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, macflag))) &&
+					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, statusflag))) &&
+					m_code.EmitStrdImm8(0, 1, SP,
+						static_cast<u8>(LocalFmacOffset(*entry, LOCAL_FMAC_MAC_OFFSET))) &&
+					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, clipflag))) &&
+					m_code.EmitStrImm12(0, SP, LocalFmacOffset(*entry, LOCAL_FMAC_CLIP_OFFSET));
+				if (!emitted)
+					return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (!EmitQemuFmacClearInlineCounter())
+					return false;
+				if (plan.add_upper_stalls && !EmitQemuUpperFmacStallInlineCounter())
+					return false;
+				if (plan.add_lower_stalls && plan.lregs.pipe == VUPIPE_FMAC &&
+					(!EmitQemuLowerFmacStallInlineCounter() || !EmitQemuLowerStallInlineCounter()))
+				{
+					return false;
+				}
+#endif
+				return true;
+			}
+
+			bool EmitAppendLocalFmacEntry(const LocalFmacEntry& entry)
+			{
+				const PairPlan& plan = m_pairs[entry.pair_index];
+				if (!m_code.EmitAddImm32(HOST_CALL_SCRATCH, HOST_VU, offsetof(VURegs, fmac)) ||
+					!m_code.EmitAddRegShiftImm(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
+						HOST_STALL_SCRATCH, ShiftType::LSL, 5) ||
+					!m_code.EmitAddRegShiftImm(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
+						HOST_STALL_SCRATCH, ShiftType::LSL, 4) ||
+					!m_code.EmitMovImm32(0, FmacRegUpper(plan)) ||
+					!m_code.EmitMovImm32(1, FmacRegLower(plan)) ||
+					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, regupper)) ||
+					!m_code.EmitMovImm32(0, FmacFlagReg(plan)) ||
+					!m_code.EmitMovImm32(1, FmacXyzwUpper(plan)) ||
+					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, flagreg)) ||
+					!m_code.EmitMovImm32(0, FmacXyzwLower(plan)) ||
+					!m_code.EmitMovImm8(1, 0) ||
+					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, xyzwlower)) ||
+					!m_code.EmitLdrdImm8(0, 1, SP,
+						static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET))) ||
+					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, sCycle)) ||
+					!m_code.EmitMovImm8(0, 4) ||
+					!m_code.EmitLdrImm12(1, SP, LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET)) ||
+					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, Cycle)) ||
+					!m_code.EmitLdrImm12(0, SP, LocalFmacOffset(entry, LOCAL_FMAC_STATUS_OFFSET)) ||
+					!m_code.EmitLdrImm12(1, SP, LocalFmacOffset(entry, LOCAL_FMAC_CLIP_OFFSET)) ||
+					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, statusflag)) ||
+					!m_code.EmitAddImm8(HOST_STALL_SCRATCH, HOST_STALL_SCRATCH, 1))
+				{
+					return false;
+				}
+				return true;
+			}
+
+			bool EmitCanonicalizeLocalFmacPipeline()
+			{
+				if (!m_plan.local_fmac_pipeline)
+					return true;
+
+				if (!m_code.EmitMovImm8(HOST_STALL_SCRATCH, 0))
+					return false;
+				for (u32 ordered_index = 0; ordered_index < LOCAL_FMAC_SLOT_COUNT; ordered_index++)
+				{
+					LocalFmacEntry* ordered_entry = nullptr;
+					for (LocalFmacEntry& candidate : m_local_fmac_entries)
+					{
+						if (candidate.active && (!ordered_entry ||
+							candidate.pair_index < ordered_entry->pair_index))
+						{
+							ordered_entry = &candidate;
+						}
+					}
+					if (!ordered_entry)
+						break;
+					LocalFmacEntry& entry = *ordered_entry;
+
+					// Entries made ready early by an FDIV/EFU/IALU or dependency
+					// stall publish here; younger entries retain their exact sCycle
+					// and are compacted into PCSX2's canonical circular queue.
+					if (!m_code.EmitLdrdImm8(0, 1, SP,
+							static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET))) ||
+						!m_code.EmitAddImm8(0, 0, 4, true) ||
+						!m_code.EmitAdcImm8(1, 1, 0) ||
+						!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
+						!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) ||
+						!m_code.EmitCmpReg(3, 1) ||
+						!m_code.EmitCmpReg(2, 0, Condition::EQ))
+					{
+						return false;
+					}
+					const size_t ready = m_code.EmitBranchPlaceholder(Condition::CS);
+					if (ready == static_cast<size_t>(-1) || !EmitAppendLocalFmacEntry(entry))
+						return false;
+					const size_t done = m_code.EmitBranchPlaceholder();
+					if (done == static_cast<size_t>(-1))
+						return false;
+					const size_t ready_target = m_code.Size();
+					if (!m_code.PatchBranch(ready, ready_target, Condition::CS) ||
+						!EmitPublishLocalFmacFlags(entry) ||
+						!m_code.PatchBranch(done, m_code.Size()))
+					{
+						return false;
+					}
+					entry.active = false;
+				}
+
+				return m_code.EmitMovImm8(0, 0) &&
+					m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) &&
+					EmitAndRegImm32(0, HOST_STALL_SCRATCH, 3u, 1) &&
+					m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, fmacwritepos))) &&
+					m_code.EmitStrImm12(HOST_STALL_SCRATCH, HOST_VU, VuOffset(offsetof(VURegs, fmaccount)));
+			}
+
 			bool EmitInlineCommitFmacPipe(const PairPlan& plan)
 			{
 				// PCSX2 owner: VUops.cpp::_vuClearFMAC() followed immediately by
@@ -7618,6 +7969,12 @@ namespace VitaVU
 
 				if (!EmitBudgetCheckAndCycleIncrement(pair_index))
 					return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+				// Count only admitted blocks. A linked target can reach its body and
+				// reject on the pair-zero budget check without executing any VU pair.
+				if (pair_index == 0 && !EmitQemuLocalFmacPipelineCounters())
+					return false;
+#endif
 
 				// E flag decode, compile-time: VU->ebit = 2.
 				if (plan.ebit)
@@ -7654,6 +8011,10 @@ namespace VitaVU
 				{
 					return false;
 				}
+				if (plan.test_upper_stalls && !EmitLocalFmacStallTest(plan.uregs))
+					return false;
+				if (plan.test_lower_stalls && !EmitLocalFmacStallTest(plan.lregs))
+					return false;
 				if (plan.test_lower_stalls && plan.lower_fmac_stall_test_inline)
 				{
 					if (!EmitInlineFmacStallTest(m_pairs[pair_index].lregs, false))
@@ -7688,6 +8049,8 @@ namespace VitaVU
 				{
 					return false;
 				}
+				if (!EmitRetireLocalFmacEntries(pair_index))
+					return false;
 
 				if (!EmitViBackupUpdate())
 					return false;
@@ -7846,7 +8209,12 @@ namespace VitaVU
 				}
 
 				// Step tail, in _vu1Exec() order.
-				if (plan.fmac_pipe &&
+				const bool local_fmac_commit = m_plan.local_fmac_pipeline && pair_index >= 4 && plan.fmac_pipe;
+				if (local_fmac_commit && !EmitCommitLocalFmac(pair_index, plan))
+				{
+					return false;
+				}
+				if (plan.fmac_pipe && !local_fmac_commit &&
 					!EmitInlineCommitFmacPipe(plan))
 				{
 					return false;
@@ -7893,7 +8261,7 @@ namespace VitaVU
 					return false;
 				}
 
-				if (plan.fmac_pipe)
+				if (plan.fmac_pipe && !local_fmac_commit)
 				{
 					const u16 writepos = VuOffset(offsetof(VURegs, fmacwritepos));
 					if (!m_code.EmitLdrImm12(0, HOST_VU, writepos) ||
@@ -7921,6 +8289,7 @@ namespace VitaVU
 			size_t m_vector_access_cursor = 0;
 			std::array<VectorCacheSlot, VU_VECTOR_CACHE_SLOTS> m_vector_cache{};
 			VectorCacheStats m_vector_cache_stats{};
+			std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT> m_local_fmac_entries{};
 			// True once the vuDouble() bit-select constant quads (Q8-Q11) have been
 			// materialized in this block. Q8-Q15 are exclusive to the normalize
 			// scratch (operation temporaries use Q0-Q3 and the vector cache owns
@@ -8479,6 +8848,12 @@ namespace VitaVU
 						s_vu1.stats.code_cache_used = s_vu1.code_cache_used;
 						s_vu1.stats.compiled_blocks++;
 						s_vu1.stats.compiled_pairs += plan.pair_count;
+						if (plan.local_fmac_pipeline)
+						{
+							s_vu1.stats.local_fmac_pipeline_blocks++;
+							s_vu1.stats.local_fmac_pipeline_pairs +=
+								plan.local_fmac_pipeline_pairs;
+						}
 						const BlockCompiler::VectorCacheStats& vector_stats = chosen_vector_stats;
 						if (vector_cache_candidate)
 							s_vu1.stats.vector_cache_candidate_blocks++;
@@ -9166,6 +9541,8 @@ namespace VitaVU
 		stats.linked_frame_stack_words_removed =
 			static_cast<u64>(g_qemuVuJitLinkedFrameEntries) * 18 +
 			static_cast<u64>(g_qemuVuJitLinkedVectorFrameEntries) * 32;
+		stats.local_fmac_pipeline_entries = g_qemuVuJitLocalFmacPipelineEntries;
+		stats.local_fmac_pipeline_commits = g_qemuVuJitLocalFmacPipelineCommits;
 #endif
 		return stats;
 	}
@@ -9175,6 +9552,8 @@ namespace VitaVU
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuVuJitLinkedFrameEntries = 0;
 		g_qemuVuJitLinkedVectorFrameEntries = 0;
+		g_qemuVuJitLocalFmacPipelineEntries = 0;
+		g_qemuVuJitLocalFmacPipelineCommits = 0;
 #endif
 		const size_t used = s_vu1.stats.code_cache_used;
 		const size_t capacity = s_vu1.stats.code_cache_capacity;
