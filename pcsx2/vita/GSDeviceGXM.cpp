@@ -2233,8 +2233,27 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 			source_direct_modulate_af_fragment, untextured_fragment))
 		return false;
 
+	// PCSX2 owner: GSDeviceOGL::RenderHW() submits native GL_LINES for an
+	// unexpanded GS line draw. GXM additionally requires LINE polygon mode;
+	// SCE_GXM_PRIMITIVE_LINES by itself only selects line-list assembly. Sony's
+	// libGXM context contract and vitaGL's gl_primitive_to_gxm() both establish
+	// the paired state, including a one-pixel width. Restore triangle fill after
+	// submission so a following triangle in the same scene cannot inherit it.
+	const bool line_topology = config.topology == GSHWDrawConfig::Topology::Line;
+	if (line_topology)
+	{
+		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_LINE);
+		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_LINE);
+		sceGxmSetFrontPointLineWidth(context, 1);
+		sceGxmSetBackPointLineWidth(context, 1);
+	}
 	result = sceGxmDraw(context, TranslateTopology(config.topology),
 		SCE_GXM_INDEX_FORMAT_U16, staged_indices, index_count);
+	if (line_topology)
+	{
+		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+	}
 	if (result < 0)
 		return Fail("sceGxmDraw(TFX)", result);
 	if (rt)
