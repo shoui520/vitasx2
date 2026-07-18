@@ -44,6 +44,7 @@ u32 g_qemuVuJitTestPipesFdivFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesEfuFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesXgkickTransferInlineOps = 0;
 u32 g_qemuVuJitNopPipeTestDeferrals = 0;
+u32 g_qemuVuJitAllPipesEmptyFastSkips = 0;
 u32 g_qemuVuJitNormConstantMaterializations = 0;
 u32 g_qemuVuJitFmacClearInlineOps = 0;
 u32 g_qemuVuJitUpperFmacStallTestInlineOps = 0;
@@ -2154,6 +2155,15 @@ namespace VitaVU
 						m_code.EmitStrImm12(1, 0, 0);
 				}
 
+				bool EmitQemuAllPipesEmptyFastSkipCounter()
+				{
+					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitAllPipesEmptyFastSkips))) &&
+						m_code.EmitLdrImm12(1, 0, 0) &&
+						m_code.EmitAddImm8(1, 1, 1) &&
+						m_code.EmitStrImm12(1, 0, 0);
+				}
+
 				bool EmitQemuFmacClearInlineCounter()
 				{
 					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitFmacClearInlineOps))) &&
@@ -2796,15 +2806,61 @@ namespace VitaVU
 					// interpreter-state publisher in every pair streams far more code
 					// than the 32 KiB L1 I-cache can retain. Multi-pair blocks call one
 					// block-local copy; single-pair blocks remain inline.
-					if (m_plan.pair_count < 2)
-						return EmitTestPipesFastGuardBody(false, deferred_fmac_flags);
-
-					const size_t call_site = m_code.EmitBranchLinkPlaceholder();
-					if (call_site == static_cast<size_t>(-1))
+					// PCSX2's interpreter-side _vu1CanFastForwardPlainNopPairs() owns
+					// the exact aggregate-empty predicate. Test its five independent
+					// words in parallel before entering the publisher; ORRS supplies the
+					// branch condition without a separate CMP. This makes the common
+					// no-pipeline path ten straight-line A32 instructions and avoids the
+					// shared thunk, five queue arms, and return entirely.
+					if (!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
+						!m_code.EmitLdrImm12(1, HOST_VU,
+							VuOffset(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable))) ||
+						!m_code.EmitLdrImm12(2, HOST_VU,
+							VuOffset(offsetof(VURegs, efu) + offsetof(efuPipe, enable))) ||
+						!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(offsetof(VURegs, ialucount))) ||
+						!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_VU,
+							VuOffset(offsetof(VURegs, xgkickenable))) ||
+						!m_code.EmitOrrReg(0, 0, 1) ||
+						!m_code.EmitOrrReg(2, 2, 3) ||
+						!m_code.EmitOrrReg(0, 0, 2) ||
+						!m_code.EmitOrrReg(0, 0, HOST_CALL_SCRATCH, true))
+					{
 						return false;
-					(deferred_fmac_flags ? m_deferred_test_pipes_fast_guard_calls :
-						m_test_pipes_fast_guard_calls).push_back(call_site);
-					return true;
+					}
+					const size_t empty = m_code.EmitBranchPlaceholder(Condition::EQ);
+					if (empty == static_cast<size_t>(-1))
+						return false;
+
+					bool emitted_body = false;
+					if (m_plan.pair_count < 2)
+					{
+						emitted_body = EmitTestPipesFastGuardBody(false, deferred_fmac_flags);
+					}
+					else
+					{
+						const size_t call_site = m_code.EmitBranchLinkPlaceholder();
+						if (call_site != static_cast<size_t>(-1))
+						{
+							(deferred_fmac_flags ? m_deferred_test_pipes_fast_guard_calls :
+								m_test_pipes_fast_guard_calls).push_back(call_site);
+							emitted_body = true;
+						}
+					}
+					if (!emitted_body)
+						return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+					const size_t done = m_code.EmitBranchPlaceholder();
+					if (done == static_cast<size_t>(-1) ||
+						!m_code.PatchBranch(empty, m_code.Size(), Condition::EQ) ||
+						!EmitQemuAllPipesEmptyFastSkipCounter())
+					{
+						return false;
+					}
+					return m_code.PatchBranch(done, m_code.Size());
+#else
+					return m_code.PatchBranch(empty, m_code.Size(), Condition::EQ);
+#endif
 				}
 
 				bool EmitDeferredNopPipeTest(bool deferred_fmac_flags)
