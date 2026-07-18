@@ -6401,15 +6401,37 @@ namespace VitaVU
 #endif
 			}
 
-			bool EmitInlineOneFmacStallTest(unsigned vf_reg, unsigned xyzw)
+			bool EmitInlineFmacStallTestReads(unsigned vf_reg0, unsigned xyzw0,
+				unsigned vf_reg1, unsigned xyzw1)
 			{
-				if (vf_reg == 0 || xyzw == 0)
+				if (vf_reg0 == 0 || xyzw0 == 0)
+				{
+					vf_reg0 = vf_reg1;
+					xyzw0 = xyzw1;
+					vf_reg1 = 0;
+					xyzw1 = 0;
+				}
+				if (vf_reg1 == vf_reg0)
+				{
+					xyzw0 |= xyzw1;
+					vf_reg1 = 0;
+					xyzw1 = 0;
+				}
+				if (vf_reg1 == 0 || xyzw1 == 0)
+				{
+					vf_reg1 = 0;
+					xyzw1 = 0;
+				}
+				if (vf_reg0 == 0 || xyzw0 == 0)
 					return true;
 
-				// PCSX2 owner: VUops.cpp::_vuFMACTestStall(). This scans the
-				// same four-entry FMAC queue without publishing pipe results;
-				// `_vuTestPipes()` still owns flag/VF visibility after the
-				// stall cycle is applied.
+				// PCSX2 owners: microVU_Analyze.inl::analyzeReg1(), where both
+				// source hazards contribute to one maximum mVUstall, and
+				// VUops.cpp::_vuTestFMACStalls(). The interpreter expresses two
+				// sources as two queue walks, but their only result is the maximum
+				// pending ready cycle. Scan once and match either dependency. A
+				// ready entry can be ignored and `_vuTestPipes()` still owns
+				// flag/VF visibility after the stall cycle is applied.
 				constexpr unsigned HOST_INDEX = 0;
 				constexpr unsigned HOST_PTR = 1;
 				constexpr unsigned HOST_VALUE = 2;
@@ -6459,45 +6481,101 @@ namespace VitaVU
 				if (skip_elapsed_low == static_cast<size_t>(-1))
 					return false;
 
+				std::array<size_t, 4> matched_jumps{};
+				u32 matched_count = 0;
 				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, regupper)) ||
-					!m_code.EmitCmpImm32(HOST_VALUE, vf_reg))
+					!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0))
 				{
 					return false;
 				}
-				const size_t check_lower = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (check_lower == static_cast<size_t>(-1))
+				const size_t check_upper1 = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (check_upper1 == static_cast<size_t>(-1))
 					return false;
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, xyzwupper)) ||
-					!m_code.EmitTstImm32(HOST_VALUE, xyzw))
+				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, xyzwupper)) ||
+					!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
 				{
 					return false;
 				}
-				const size_t matched_upper = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (matched_upper == static_cast<size_t>(-1))
+				matched_jumps[matched_count++] = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1))
 					return false;
 
-				const size_t lower_target = m_code.Size();
-				if (!m_code.PatchBranch(check_lower, lower_target, Condition::NE) ||
-					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, reglower)) ||
-					!m_code.EmitCmpImm32(HOST_VALUE, vf_reg))
+				const size_t upper1_target = m_code.Size();
+				if (!m_code.PatchBranch(check_upper1, upper1_target, Condition::NE))
 				{
 					return false;
 				}
-				const size_t skip_lower_reg = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (skip_lower_reg == static_cast<size_t>(-1))
-					return false;
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, xyzwlower)) ||
-					!m_code.EmitTstImm32(HOST_VALUE, xyzw))
+				if (vf_reg1 != 0)
+				{
+					if (!m_code.EmitCmpImm32(HOST_VALUE, vf_reg1))
+						return false;
+					const size_t check_lower = m_code.EmitBranchPlaceholder(Condition::NE);
+					if (check_lower == static_cast<size_t>(-1))
+						return false;
+					if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, xyzwupper)) ||
+						!m_code.EmitTstImm32(HOST_TEMP, xyzw1))
+					{
+						return false;
+					}
+					matched_jumps[matched_count++] = m_code.EmitBranchPlaceholder(Condition::NE);
+					if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1) ||
+						!m_code.PatchBranch(check_lower, m_code.Size(), Condition::NE))
+					{
+						return false;
+					}
+				}
+
+				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, reglower)) ||
+					!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0))
 				{
 					return false;
 				}
-				const size_t skip_no_match = m_code.EmitBranchPlaceholder(Condition::EQ);
-				if (skip_no_match == static_cast<size_t>(-1))
+				const size_t check_lower1 = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (check_lower1 == static_cast<size_t>(-1))
 					return false;
+				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, xyzwlower)) ||
+					!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
+				{
+					return false;
+				}
+				matched_jumps[matched_count++] = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1) ||
+					!m_code.PatchBranch(check_lower1, m_code.Size(), Condition::NE))
+				{
+					return false;
+				}
+
+				size_t skip_no_lower_reg = static_cast<size_t>(-1);
+				size_t skip_no_match = static_cast<size_t>(-1);
+				if (vf_reg1 != 0)
+				{
+					if (!m_code.EmitCmpImm32(HOST_VALUE, vf_reg1))
+						return false;
+					skip_no_lower_reg = m_code.EmitBranchPlaceholder(Condition::NE);
+					if (skip_no_lower_reg == static_cast<size_t>(-1) ||
+						!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, xyzwlower)) ||
+						!m_code.EmitTstImm32(HOST_TEMP, xyzw1))
+					{
+						return false;
+					}
+					skip_no_match = m_code.EmitBranchPlaceholder(Condition::EQ);
+					if (skip_no_match == static_cast<size_t>(-1))
+						return false;
+				}
+				else
+				{
+					skip_no_match = m_code.EmitBranchPlaceholder();
+					if (skip_no_match == static_cast<size_t>(-1))
+						return false;
+				}
 
 				const size_t match_target = m_code.Size();
-				if (!m_code.PatchBranch(matched_upper, match_target, Condition::NE) ||
-					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
+				for (u32 i = 0; i < matched_count; i++)
+				{
+					if (!m_code.PatchBranch(matched_jumps[i], match_target, Condition::NE))
+						return false;
+				}
+				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, Cycle)) ||
 					!m_code.EmitAddReg(HOST_VALUE, HOST_VALUE, HOST_TEMP, true) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, sCycle) + 4) ||
@@ -6513,8 +6591,10 @@ namespace VitaVU
 				const size_t advance_index = m_code.Size();
 				if (!m_code.PatchBranch(skip_elapsed_high, advance_index, Condition::NE) ||
 					!m_code.PatchBranch(skip_elapsed_low, advance_index, Condition::CS) ||
-					!m_code.PatchBranch(skip_lower_reg, advance_index, Condition::NE) ||
-					!m_code.PatchBranch(skip_no_match, advance_index, Condition::EQ) ||
+					(vf_reg1 != 0 &&
+						!m_code.PatchBranch(skip_no_lower_reg, advance_index, Condition::NE)) ||
+					!m_code.PatchBranch(skip_no_match, advance_index,
+						vf_reg1 != 0 ? Condition::EQ : Condition::AL) ||
 					!m_code.EmitAddImm8(HOST_INDEX, HOST_INDEX, 1) ||
 					!m_code.EmitAndImm32(HOST_INDEX, HOST_INDEX, 3) ||
 					!m_code.EmitAddImm8(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 1))
@@ -6533,12 +6613,8 @@ namespace VitaVU
 
 			bool EmitInlineFmacStallTestBody(const _VURegsNum& regs)
 			{
-				bool emitted_body = true;
-				if (regs.VFread0)
-					emitted_body = emitted_body && EmitInlineOneFmacStallTest(regs.VFread0, regs.VFr0xyzw);
-				if (regs.VFread1)
-					emitted_body = emitted_body && EmitInlineOneFmacStallTest(regs.VFread1, regs.VFr1xyzw);
-				return emitted_body;
+				return EmitInlineFmacStallTestReads(regs.VFread0, regs.VFr0xyzw,
+					regs.VFread1, regs.VFr1xyzw);
 			}
 
 			bool EmitInlineFmacStallTest(const _VURegsNum& regs, bool upper)
