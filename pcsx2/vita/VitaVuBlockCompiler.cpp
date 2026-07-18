@@ -7012,35 +7012,45 @@ namespace VitaVU
 					m_code.EmitAddRegShiftImm(ptr_reg, ptr_reg, index_reg, ShiftType::LSL, 4);
 			}
 
-			bool EmitStoreFmacCycleAndFlagSnapshot(unsigned ptr_reg)
+			bool EmitInlineCommitFmacPipe(const PairPlan& plan)
 			{
-				return m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
-					m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
-					m_code.EmitStrImm12(1, ptr_reg, offsetof(fmacPipe, sCycle)) &&
-					m_code.EmitStrImm12(2, ptr_reg, offsetof(fmacPipe, sCycle) + 4) &&
-					m_code.EmitMovImm8(1, 4) &&
-					m_code.EmitStrImm12(1, ptr_reg, offsetof(fmacPipe, Cycle)) &&
-					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, macflag))) &&
-					m_code.EmitStrImm12(1, ptr_reg, offsetof(fmacPipe, macflag)) &&
-					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, statusflag))) &&
-					m_code.EmitStrImm12(1, ptr_reg, offsetof(fmacPipe, statusflag)) &&
-					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, clipflag))) &&
-					m_code.EmitStrImm12(1, ptr_reg, offsetof(fmacPipe, clipflag));
-			}
+				// PCSX2 owner: VUops.cpp::_vuClearFMAC() followed immediately by
+				// _vuAddUpperStalls() and _vuAddLowerStalls(). No observer exists
+				// between those operations. Build their exact final 48-byte pipe
+				// state once from the compile-time register metadata.
+				const bool upper_fmac = plan.add_upper_stalls;
+				const bool lower_fmac = plan.add_lower_stalls && plan.lregs.pipe == VUPIPE_FMAC;
+				if (!upper_fmac && !lower_fmac)
+					return false;
 
-			bool EmitInlineClearFmac()
-			{
-				// PCSX2 owner: VUops.cpp::_vuClearFMAC(). The whole slot is
-				// memset to zero before upper/lower stall records are added.
+				const u32 regupper = upper_fmac ? plan.uregs.VFwrite : 0;
+				const u32 reglower = lower_fmac ? plan.lregs.VFwrite : 0;
+				const u32 flagreg = (upper_fmac ? plan.uregs.VIwrite : 0) |
+					(lower_fmac ? plan.lregs.VIwrite : 0);
+				const u32 xyzwupper = upper_fmac ? plan.uregs.VFwxyzw : 0;
+				const u32 xyzwlower = lower_fmac ? plan.lregs.VFwxyzw : 0;
+
+				// R12 holds the slot address so R0/R1 remain an even STRD pair.
 				bool emitted_body =
-					EmitComputeFmacWritePtr(3, 0) &&
+					EmitComputeFmacWritePtr(HOST_CALL_SCRATCH, 0) &&
+					m_code.EmitMovImm32(0, regupper) &&
+					m_code.EmitMovImm32(1, reglower) &&
+					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, regupper)) &&
+					m_code.EmitMovImm32(0, flagreg) &&
+					m_code.EmitMovImm32(1, xyzwupper) &&
+					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, flagreg)) &&
+					m_code.EmitMovImm32(0, xyzwlower) &&
 					m_code.EmitMovImm8(1, 0) &&
-					m_code.EmitVdupI32QFromCore(0, 1) &&
-					m_code.EmitVst1Q32(0, 3) &&
-					m_code.EmitAddImm8(3, 3, 16) &&
-					m_code.EmitVst1Q32(0, 3) &&
-					m_code.EmitAddImm8(3, 3, 16) &&
-					m_code.EmitVst1Q32(0, 3) &&
+					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, xyzwlower)) &&
+					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
+					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
+					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, sCycle)) &&
+					m_code.EmitMovImm8(0, 4) &&
+					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, macflag))) &&
+					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, Cycle)) &&
+					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, statusflag))) &&
+					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, clipflag))) &&
+					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, statusflag)) &&
 					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) &&
 					m_code.EmitAddImm8(0, 0, 1) &&
 					m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, fmaccount)));
@@ -7048,61 +7058,17 @@ namespace VitaVU
 					return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
-				return EmitQemuFmacClearInlineCounter();
-#else
-				return true;
-#endif
-			}
-
-			bool EmitInlineAddUpperFmacStalls(const _VURegsNum& regs)
-			{
-				// PCSX2 owner: VUops.cpp::_vuAddFMACStalls(..., true) via
-				// _vuAddUpperStalls(). The op body has already updated the
-				// live MAC/Status/CLIP flags, so snapshot them into the slot
-				// cleared above.
-				bool emitted_body =
-					EmitComputeFmacWritePtr(3, 0) &&
-					EmitStoreFmacCycleAndFlagSnapshot(3) &&
-					m_code.EmitMovImm32(1, regs.VFwrite) &&
-					m_code.EmitStrImm12(1, 3, offsetof(fmacPipe, regupper)) &&
-					m_code.EmitMovImm32(1, regs.VFwxyzw) &&
-					m_code.EmitStrImm12(1, 3, offsetof(fmacPipe, xyzwupper)) &&
-					m_code.EmitMovImm32(1, regs.VIwrite) &&
-					m_code.EmitStrImm12(1, 3, offsetof(fmacPipe, flagreg));
-				if (!emitted_body)
+				if (!EmitQemuFmacClearInlineCounter())
 					return false;
-
-#if defined(VITASX2_QEMU_VALIDATION)
-				return EmitQemuUpperFmacStallInlineCounter();
-#else
-				return true;
-#endif
-			}
-
-			bool EmitInlineAddLowerFmacStalls(const _VURegsNum& regs)
-			{
-				// PCSX2 owner: VUops.cpp::_vuAddFMACStalls(..., false) via
-				// _vuAddLowerStalls(). Lower FMAC ORs its VI flag target into
-				// the slot so paired upper+lower flag writes share one record.
-				bool emitted_body =
-					EmitComputeFmacWritePtr(3, 0) &&
-					EmitStoreFmacCycleAndFlagSnapshot(3) &&
-					m_code.EmitMovImm32(1, regs.VFwrite) &&
-					m_code.EmitStrImm12(1, 3, offsetof(fmacPipe, reglower)) &&
-					m_code.EmitMovImm32(1, regs.VFwxyzw) &&
-					m_code.EmitStrImm12(1, 3, offsetof(fmacPipe, xyzwlower)) &&
-					m_code.EmitLdrImm12(1, 3, offsetof(fmacPipe, flagreg)) &&
-					m_code.EmitMovImm32(2, regs.VIwrite) &&
-					m_code.EmitOrrReg(1, 1, 2) &&
-					m_code.EmitStrImm12(1, 3, offsetof(fmacPipe, flagreg));
-				if (!emitted_body)
+				if (upper_fmac && !EmitQemuUpperFmacStallInlineCounter())
 					return false;
-
-#if defined(VITASX2_QEMU_VALIDATION)
-				return EmitQemuLowerFmacStallInlineCounter();
-#else
-				return true;
+				if (lower_fmac &&
+					(!EmitQemuLowerFmacStallInlineCounter() || !EmitQemuLowerStallInlineCounter()))
+				{
+					return false;
+				}
 #endif
+				return true;
 			}
 
 			bool EmitInlineAddLowerStalls(const PairPlan& plan)
@@ -7110,9 +7076,6 @@ namespace VitaVU
 				bool emitted_body = true;
 				switch (plan.lregs.pipe)
 				{
-					case VUPIPE_FMAC:
-						emitted_body = EmitInlineAddLowerFmacStalls(plan.lregs);
-						break;
 					case VUPIPE_IALU:
 						emitted_body = EmitInlineAddIaluStalls(plan.lregs);
 						break;
@@ -7593,21 +7556,16 @@ namespace VitaVU
 
 				// Step tail, in _vu1Exec() order.
 				if (plan.fmac_pipe &&
-					!EmitInlineClearFmac())
+					!EmitInlineCommitFmacPipe(plan))
 				{
 					return false;
 				}
-				if (plan.add_upper_stalls &&
-					!EmitInlineAddUpperFmacStalls(m_pairs[pair_index].uregs))
-				{
-					return false;
-				}
-				if (plan.add_lower_stalls && plan.lower_stall_inline)
+				if (plan.add_lower_stalls && plan.lregs.pipe != VUPIPE_FMAC && plan.lower_stall_inline)
 				{
 					if (!EmitInlineAddLowerStalls(plan))
 						return false;
 				}
-				else if (plan.add_lower_stalls &&
+				else if (plan.add_lower_stalls && plan.lregs.pipe != VUPIPE_FMAC &&
 					!EmitCallHelperRegs(reinterpret_cast<const void*>(&_vuAddLowerStalls), &m_pairs[pair_index].lregs))
 				{
 					return false;
