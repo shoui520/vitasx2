@@ -618,7 +618,7 @@ namespace VitaVU
 			u32 lower_branch_stall_test_inline_pairs = 0;
 			u32 lower_stall_inline_pairs = 0;
 			u32 dt_flag_inline_pairs = 0;
-			bool countdown_budget = false;
+			bool resident_cycle = false;
 			bool direct_link_tail = false;
 			std::array<DirectLinkPlan, MAX_DIRECT_LINK_SLOTS> direct_links{};
 			std::array<PairPlan, MAX_BLOCK_PAIRS> pairs{};
@@ -902,7 +902,7 @@ namespace VitaVU
 			block->lower_branch_stall_test_inline_pairs = 0;
 			block->lower_stall_inline_pairs = 0;
 			block->dt_flag_inline_pairs = 0;
-			block->countdown_budget = false;
+			block->resident_cycle = false;
 			block->direct_link_tail = false;
 			block->direct_links = {};
 
@@ -913,7 +913,7 @@ namespace VitaVU
 			bool pending_branch_unconditional = false;
 			u32 pending_branch_target = 0;
 			u32 pending_branch_fallthrough = 0;
-			bool countdown_budget = true;
+			bool resident_cycle = true;
 
 			while (block->pair_count < MAX_BLOCK_PAIRS && pc < prog_size)
 			{
@@ -932,7 +932,7 @@ namespace VitaVU
 				if (plan.test_upper_stalls || plan.test_lower_stalls ||
 					(plan.lregs.pipe == VUPIPE_XGKICK && !conservative_vu0))
 				{
-					countdown_budget = false;
+					resident_cycle = false;
 				}
 				if (plan.test_pipes_fast_guard)
 					block->test_pipes_fast_guard_pairs++;
@@ -1035,7 +1035,7 @@ namespace VitaVU
 			if (block->pair_count == 0)
 				return false;
 
-			block->countdown_budget = countdown_budget;
+			block->resident_cycle = resident_cycle;
 			if (block->pair_count != 0)
 			{
 				const PairPlan& last = block->pairs[block->pair_count - 1];
@@ -1124,7 +1124,7 @@ namespace VitaVU
 		constexpr unsigned HOST_LIMIT_HI = 7;
 		constexpr unsigned HOST_CLIP_OLD = 8; // paired clip-flag hazard backups
 		constexpr unsigned HOST_CLIP_NEW = 9;
-		constexpr unsigned HOST_BUDGET_LEFT = 10; // countdown for one-cycle blocks
+		constexpr unsigned HOST_STALL_SCRATCH = 10;
 		constexpr unsigned HOST_EXEC_BASE = 11;
 		constexpr unsigned HOST_CALL_SCRATCH = 12;
 		constexpr unsigned SP = 13;
@@ -1264,7 +1264,7 @@ namespace VitaVU
 				, m_pairs(stable_pairs)
 				, m_mem_mask(mem_mask)
 				, m_vu0_memory_map(mem_mask == VU0_MEMMASK)
-				, m_countdown_budget(plan.countdown_budget)
+				, m_resident_cycle(plan.resident_cycle)
 				, m_vector_cache_mode(vector_cache_mode)
 				, m_vector_accesses(vector_accesses)
 			{
@@ -1332,7 +1332,7 @@ namespace VitaVU
 				// body uses one of two stable private-frame mappings (ordinary or
 				// D8-D15-preserving), so compatible linked chains can retain
 				// r4/r6/r7/r11 and the existing stack frame. The target's
-				// private countdown is refreshed before its microVU block-admission
+				// private cycle word is refreshed before its microVU block-admission
 				// test; this also converts a preceding block's permitted overshoot
 				// back into an ordinary target-entry rejection.
 				m_linked_entry_offset = m_code.Size();
@@ -1353,9 +1353,9 @@ namespace VitaVU
 					return false;
 				}
 #endif
-				if (m_countdown_budget &&
-					(!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
-					 !m_code.EmitSubReg(HOST_BUDGET_LEFT, HOST_LIMIT_LO, HOST_CYCLE_LO)))
+				if (m_resident_cycle &&
+					!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle))))
 				{
 					return false;
 				}
@@ -1498,16 +1498,16 @@ namespace VitaVU
 					return false;
 				}
 
-				if (!m_countdown_budget)
+				if (!m_resident_cycle)
 					return true;
 
 				// If static analysis proves no stall/XGKICK path can advance
 				// VU1.cycle beyond one cycle per pair, keep the low cycle word and
-				// remaining countdown live for the admitted block. The countdown
-				// may become negative after microVU's permitted block overshoot;
-				// every linked target refreshes it and performs a full 64-bit test.
-				return m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
-					m_code.EmitSubReg(HOST_BUDGET_LEFT, HOST_LIMIT_LO, HOST_CYCLE_LO);
+				// cycle low word live for the admitted block. Admission still uses
+				// the exact 64-bit limit, so no redundant per-pair countdown is
+				// required.
+				return m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
+					VuOffset(offsetof(VURegs, cycle)));
 			}
 
 			bool EmitEpilogue()
@@ -1539,7 +1539,7 @@ namespace VitaVU
 				// whole analyzed block and publishes it only at scheduling seams. The
 				// Vita emitter retains only blocks whose scan proves one cycle per
 				// pair, so their current low word can remain in r5 as well.
-				if (m_countdown_budget)
+				if (m_resident_cycle)
 					return rd == HOST_CYCLE_LO || EmitMovReg(rd, HOST_CYCLE_LO);
 
 				return m_code.EmitLdrImm12(rd, HOST_VU, VuOffset(offsetof(VURegs, cycle)));
@@ -1550,15 +1550,15 @@ namespace VitaVU
 				// Helper calls, dispatcher returns, and linked-entry admission are
 				// the observable joins. The high word is already canonical: the rare
 				// low-word wrap updates it at the exact pair where carry occurs.
-				return !m_countdown_budget ||
+				return !m_resident_cycle ||
 					m_code.EmitStrImm12(HOST_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle)));
 			}
 
 			bool EmitResyncResidentCycle()
 			{
-				return !m_countdown_budget ||
-					(m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
-					 m_code.EmitSubReg(HOST_BUDGET_LEFT, HOST_LIMIT_LO, HOST_CYCLE_LO));
+				return !m_resident_cycle ||
+					m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle)));
 			}
 
 			bool EmitReturnExecutedPairs(u32 executed_pairs,
@@ -6310,7 +6310,7 @@ namespace VitaVU
 				constexpr unsigned HOST_TEMP = 3;
 				constexpr unsigned HOST_STALL_CYCLE_LO = HOST_CLIP_OLD;
 				constexpr unsigned HOST_STALL_CYCLE_HI = HOST_CLIP_NEW;
-				constexpr unsigned HOST_COUNT = HOST_BUDGET_LEFT; // countdown is disabled for stall-test blocks
+				constexpr unsigned HOST_COUNT = HOST_STALL_SCRATCH; // resident-cycle mode is disabled for stall-test blocks
 				constexpr size_t base = offsetof(VURegs, ialu);
 
 				std::array<size_t, 4> done_jumps{};
@@ -6416,7 +6416,7 @@ namespace VitaVU
 				constexpr unsigned HOST_TEMP = 3;
 				constexpr unsigned HOST_STALL_CYCLE_LO = HOST_CLIP_OLD;
 				constexpr unsigned HOST_STALL_CYCLE_HI = HOST_CLIP_NEW;
-				constexpr unsigned HOST_COUNT = HOST_BUDGET_LEFT; // countdown is disabled for stall-test blocks
+				constexpr unsigned HOST_COUNT = HOST_STALL_SCRATCH; // resident-cycle mode is disabled for stall-test blocks
 				constexpr size_t base = offsetof(VURegs, fmac);
 
 				if (!m_code.EmitLdrImm12(HOST_COUNT, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
@@ -7212,8 +7212,8 @@ namespace VitaVU
 			// link-admission, or dispatcher-return seam observes VURegs.
 			bool EmitBudgetCheckAndCycleIncrement(u32 pair_index)
 			{
-				if (m_countdown_budget)
-					return EmitCountdownBudgetCheckAndCycleIncrement(pair_index);
+				if (m_resident_cycle)
+					return EmitResidentCycleBudgetCheckAndIncrement(pair_index);
 
 				const u16 lo = VuOffset(offsetof(VURegs, cycle));
 				const u16 hi = VuOffset(offsetof(VURegs, cycle) + 4);
@@ -7250,7 +7250,7 @@ namespace VitaVU
 					EmitMovReg(HOST_CYCLE_LO, 0);
 			}
 
-			bool EmitCountdownBudgetCheckAndCycleIncrement(u32 pair_index)
+			bool EmitResidentCycleBudgetCheckAndIncrement(u32 pair_index)
 			{
 				if (pair_index == 0)
 				{
@@ -7259,10 +7259,9 @@ namespace VitaVU
 					const size_t skip_entry_check = m_code.EmitBranchPlaceholder(Condition::EQ);
 					if (skip_entry_check == static_cast<size_t>(-1))
 						return false;
-					// The linked-entry stub has refreshed HOST_CYCLE_LO and the
-					// countdown. Compare the full 64-bit cycle so a block which
-					// overshot by one or more pairs cannot turn the low-word
-					// subtraction into a large unsigned remaining budget.
+					// The linked-entry stub has refreshed HOST_CYCLE_LO. Compare
+					// the full 64-bit cycle so a preceding block's permitted
+					// overshoot cannot enter another block.
 					if (!m_code.EmitLdrImm12(0, HOST_VU,
 							VuOffset(offsetof(VURegs, cycle) + 4)) ||
 						!m_code.EmitCmpReg(0, HOST_LIMIT_HI) ||
@@ -7276,8 +7275,7 @@ namespace VitaVU
 						return false;
 				}
 
-				if (!m_code.EmitSubImm8(HOST_BUDGET_LEFT, HOST_BUDGET_LEFT, 1) ||
-					!m_code.EmitAddImm8(HOST_CYCLE_LO, HOST_CYCLE_LO, 1, true))
+				if (!m_code.EmitAddImm8(HOST_CYCLE_LO, HOST_CYCLE_LO, 1, true))
 				{
 					return false;
 				}
@@ -7312,11 +7310,11 @@ namespace VitaVU
 				if (skip == static_cast<size_t>(-1))
 					return false;
 
-				// Static countdown blocks cannot take a stall path, so the exact
+				// Resident-cycle blocks cannot take a stall path, so the exact
 				// _vu0Exec()/_vu1Exec() delta is one. Keep the cycle private and
 				// decrement the nonzero backup directly instead of round-tripping the
 				// resident low word through VURegs just to reconstruct that constant.
-				if (m_countdown_budget)
+				if (m_resident_cycle)
 				{
 					if (!m_code.EmitSubImm8(0, 0, 1) ||
 						!m_code.EmitStrbImm12(0, HOST_VU, backup))
@@ -7740,7 +7738,7 @@ namespace VitaVU
 			PairPlan* m_pairs;
 			u32 m_mem_mask = VU1_MEMMASK;
 			bool m_vu0_memory_map = false;
-			bool m_countdown_budget = false;
+			bool m_resident_cycle = false;
 			bool m_vector_cache_suspended = false;
 			VectorCacheMode m_vector_cache_mode = VectorCacheMode::Disabled;
 			std::vector<VectorAccessEvent>* m_vector_accesses = nullptr;
@@ -7993,7 +7991,8 @@ namespace VitaVU
 				return source.vector_cache_frame == target.vector_cache_frame;
 			}
 
-			bool PatchVu1DirectLink(CachedBlock& source, Vu1DirectLinkSlot& link, const void* target)
+			bool PatchVu1DirectLink(CachedBlock& source, Vu1DirectLinkSlot& link,
+				const void* target)
 			{
 				if (!link.valid ||
 					link.unlinked_fallback_offset == static_cast<size_t>(-1) ||
@@ -8377,10 +8376,12 @@ namespace VitaVU
 						s_vu1.stats.lower_branch_stall_test_inline_pairs += plan.lower_branch_stall_test_inline_pairs;
 						s_vu1.stats.lower_stall_inline_pairs += plan.lower_stall_inline_pairs;
 						s_vu1.stats.dt_flag_inline_pairs += plan.dt_flag_inline_pairs;
-						if (plan.countdown_budget)
+						if (plan.resident_cycle)
 						{
-							s_vu1.stats.budget_countdown_blocks++;
-							s_vu1.stats.budget_countdown_pairs += plan.pair_count;
+							s_vu1.stats.cycle_resident_blocks++;
+							s_vu1.stats.cycle_resident_pairs += plan.pair_count;
+							s_vu1.stats.cycle_resident_pair_instructions_removed +=
+								plan.pair_count;
 						}
 
 						CachedBlock* result = block.get();
@@ -8517,10 +8518,12 @@ namespace VitaVU
 						s_vu0.stats.lower_branch_stall_test_inline_pairs += plan.lower_branch_stall_test_inline_pairs;
 						s_vu0.stats.lower_stall_inline_pairs += plan.lower_stall_inline_pairs;
 						s_vu0.stats.dt_flag_inline_pairs += plan.dt_flag_inline_pairs;
-						if (plan.countdown_budget)
+						if (plan.resident_cycle)
 						{
-							s_vu0.stats.budget_countdown_blocks++;
-							s_vu0.stats.budget_countdown_pairs += plan.pair_count;
+							s_vu0.stats.cycle_resident_blocks++;
+							s_vu0.stats.cycle_resident_pairs += plan.pair_count;
+							s_vu0.stats.cycle_resident_pair_instructions_removed +=
+								plan.pair_count;
 						}
 
 						CachedBlock* result = block.get();
@@ -8602,7 +8605,8 @@ namespace VitaVU
 					observed_link->target_pc = target_pc;
 					observed_link->guard_tpc_value = target_pc;
 					observed_link->observed_target = true;
-					if (PatchVu1DirectLink(*observed_link->owner, *observed_link, block->linked_entry))
+					if (PatchVu1DirectLink(*observed_link->owner, *observed_link,
+							block->linked_entry))
 					{
 						if (first_observation)
 							s_vu1.stats.direct_link_runtime_observed_slots++;
