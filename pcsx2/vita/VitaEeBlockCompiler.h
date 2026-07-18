@@ -1313,6 +1313,7 @@ namespace VitaEE
 		bool EmitLoadGprQ128SingleUseEntry(unsigned guest_reg, unsigned qreg,
 			unsigned address_scratch);
 		bool EmitStorePcFromHostReg(unsigned host_reg);
+		bool EmitStorePcWithScratch(u32 pc, unsigned scratch_reg);
 		bool EmitStoreBranchPc(u32 target_pc, u32 fallthrough_pc);
 		bool EmitStorePc(u32 pc);
 		bool EmitStoreGprQ128(unsigned guest_reg, unsigned qreg, unsigned address_scratch);

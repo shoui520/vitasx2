@@ -15,6 +15,7 @@
 #include "vita/qemu/VitaEeQemuStubs.h"
 #else
 #include "pcsx2/Config.h"
+#include "pcsx2/DebugTools/CoreEventTrace.h"
 #include "pcsx2/DebugTools/GsTrace.h"
 #include "pcsx2/DebugTools/VuTrace.h"
 #include "pcsx2/Memory.h"
@@ -11027,7 +11028,12 @@ namespace VitaEE
 
 		bool device_trace_enabled = false;
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-		device_trace_enabled = Pcsx2Trace::IsGsTraceEnabled() || Pcsx2Trace::IsVuTraceEnabled();
+		// pcsx2-trace/Main.cpp::ConfigureDeterministicSettings disables WaitLoop.
+		// CORE traces expose scheduler entry/exit timing, so range and wait-loop
+		// collapsing must follow that oracle contract just like GS/VU traces follow
+		// their per-operation contracts. Product execution remains unchanged.
+		device_trace_enabled = Pcsx2Trace::IsCoreEventTraceEnabled() ||
+			Pcsx2Trace::IsGsTraceEnabled() || Pcsx2Trace::IsVuTraceEnabled();
 #endif
 		bool range_loop_dispatch_enabled = true;
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
@@ -32420,6 +32426,7 @@ namespace VitaEE
 				(preserve_counter_on_stack &&
 				 (!m_code.EmitSubImm8(HOST_SP, HOST_SP, 8) ||
 				  !m_code.EmitStrImm12(m_branch_flag_host, HOST_SP, 0))) ||
+				!EmitStorePcWithScratch(m_current_block_start_pc, HOST_LR) ||
 					!EmitReturningAapcsHelperCall(m_code, tail.read_helper,
 						&m_cop2_norm_consts_ready, Cop2NormConstCallContract::Preserve) ||
 				!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false) ||
@@ -32494,6 +32501,7 @@ namespace VitaEE
 			m_current_instruction_index = previous_index;
 			if (!branch_ok || !EmitSyncGprPinsToBacking() ||
 				!EmitEffectiveAddress(delay_load, HOST_TMP0) ||
+				!EmitStorePcWithScratch(m_current_block_start_pc, HOST_LR) ||
 					!EmitReturningAapcsHelperCall(m_code, tail.read_helper,
 						&m_cop2_norm_consts_ready, Cop2NormConstCallContract::Preserve) ||
 				!EmitStageCompatibleSchedulerCountdown(HOST_TMP2, false) ||
@@ -32653,6 +32661,8 @@ namespace VitaEE
 			}
 			if (!EmitSyncGprPinsToBacking(&tail.dirty_pins))
 				return false;
+			if (!EmitStorePcWithScratch(m_current_block_start_pc, HOST_LR))
+				return false;
 
 			switch (tail.width)
 		{
@@ -32709,6 +32719,7 @@ namespace VitaEE
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
 			!EmitSyncGprPinsToBacking(&tail.dirty_pins) ||
+			!EmitStorePcWithScratch(m_current_block_start_pc, HOST_LR) ||
 			!EmitPushReturningAapcsVectorState(m_code) ||
 			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&vtlb_memRead128)) ||
 			!EmitStoreGprQ128(tail.rt, NEON_VALUE, HOST_TMP1) ||
@@ -32754,6 +32765,8 @@ namespace VitaEE
 		}
 		if (!EmitPrepareResidentForwardedBooleanForPreProducerSync() ||
 			!EmitSyncGprPinsToBacking(&tail.dirty_pins, true))
+			return false;
+		if (!EmitStorePcWithScratch(m_current_block_start_pc, HOST_LR))
 			return false;
 		if ((m_resident_vtlb_qword_pointer || compatible_qword_pointer) &&
 			tail.rt == 0 &&
@@ -32925,7 +32938,8 @@ namespace VitaEE
 
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!EmitSyncGprPinsToBacking(&tail.dirty_pins))
+			!EmitSyncGprPinsToBacking(&tail.dirty_pins) ||
+			!EmitStorePcWithScratch(m_current_block_start_pc, HOST_LR))
 		{
 			return false;
 		}
@@ -32995,6 +33009,9 @@ namespace VitaEE
 				return false;
 			}
 		}
+
+		if (!EmitStorePcWithScratch(m_current_block_start_pc, HOST_LR))
+			return false;
 
 		if (tail.store)
 		{
@@ -33093,7 +33110,8 @@ namespace VitaEE
 		// deferred pinned words must be resident in backing before the merge.
 		const size_t fallback_target = m_code.Size();
 		if (!m_code.PatchBranch(tail.handler_fallback, fallback_target, VitaA32::Condition::MI) ||
-			!EmitSyncGprPinsToBacking(&tail.dirty_pins))
+			!EmitSyncGprPinsToBacking(&tail.dirty_pins) ||
+			!EmitStorePcWithScratch(m_current_block_start_pc, HOST_LR))
 		{
 			return false;
 		}
@@ -34453,8 +34471,14 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitStorePc(u32 pc)
 	{
-		return m_code.EmitMovImm32(HOST_TMP0, pc) &&
-			   m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(PC_OFFSET));
+		return EmitStorePcWithScratch(pc, HOST_TMP0);
+	}
+
+	bool BlockCompiler::EmitStorePcWithScratch(u32 pc, unsigned scratch_reg)
+	{
+		return m_code.EmitMovImm32(scratch_reg, pc) &&
+			   m_code.EmitStrImm12(scratch_reg, HOST_CPU_REGS,
+				   static_cast<u16>(PC_OFFSET));
 	}
 
 	bool BlockCompiler::EmitStorePcFromHostReg(unsigned host_reg)
