@@ -1288,6 +1288,8 @@ namespace VitaVU
 				// seam. PCSX2 owner: x86/microVU_IR.h::microRegAlloc::flushAll().
 				if (!EmitFlushVectorCache())
 					return false;
+				if (!EmitPublishResidentCycle())
+					return false;
 
 				// Fall-through: every pair executed. If the next block is
 				// already cached, tail-call it with the accumulated count;
@@ -1308,7 +1310,8 @@ namespace VitaVU
 					const size_t stub_offset = m_code.Size();
 					if (!m_code.PatchBranch(exit.branch_site, stub_offset, exit.condition))
 						return false;
-					if (!EmitReturnExecutedPairs(exit.executed_pairs))
+					if (!EmitPublishResidentCycle() ||
+						!EmitReturnExecutedPairs(exit.executed_pairs))
 						return false;
 					const size_t jump = m_code.EmitBranchPlaceholder();
 					if (jump == static_cast<size_t>(-1) ||
@@ -1530,6 +1533,34 @@ namespace VitaVU
 				return m_code.EmitMovRegShiftImm(rd, rm, ShiftType::LSL, 0, false, condition);
 			}
 
+			bool EmitLoadCurrentCycleLow(unsigned rd)
+			{
+				// PCSX2 owner: x86/microVU_Compile.inl accumulates mVUcycles for a
+				// whole analyzed block and publishes it only at scheduling seams. The
+				// Vita emitter retains only blocks whose scan proves one cycle per
+				// pair, so their current low word can remain in r5 as well.
+				if (m_countdown_budget)
+					return rd == HOST_CYCLE_LO || EmitMovReg(rd, HOST_CYCLE_LO);
+
+				return m_code.EmitLdrImm12(rd, HOST_VU, VuOffset(offsetof(VURegs, cycle)));
+			}
+
+			bool EmitPublishResidentCycle()
+			{
+				// Helper calls, dispatcher returns, and linked-entry admission are
+				// the observable joins. The high word is already canonical: the rare
+				// low-word wrap updates it at the exact pair where carry occurs.
+				return !m_countdown_budget ||
+					m_code.EmitStrImm12(HOST_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle)));
+			}
+
+			bool EmitResyncResidentCycle()
+			{
+				return !m_countdown_budget ||
+					(m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
+					 m_code.EmitSubReg(HOST_BUDGET_LEFT, HOST_LIMIT_LO, HOST_CYCLE_LO));
+			}
+
 			bool EmitReturnExecutedPairs(u32 executed_pairs,
 				bool logical_continuation = false)
 			{
@@ -1563,7 +1594,8 @@ namespace VitaVU
 				// callee-saved. The helpers reachable here own pipe/GIF/INTC/link
 				// state, not VF/ACC storage; D/T and E-bit observable joins publish
 				// the block-local cache explicitly at their unconditional barriers.
-				const bool emitted = m_code.EmitCallAbsolute(fn);
+				const bool emitted = EmitPublishResidentCycle() &&
+					m_code.EmitCallAbsolute(fn) && EmitResyncResidentCycle();
 				m_norm_consts_ready = false;
 				m_norm_maxf_ready = false;
 				return emitted;
@@ -1573,8 +1605,11 @@ namespace VitaVU
 			{
 				if (!m_norm_consts_ready)
 				{
-					return EmitCallAbsoluteClobberVectorState(
+					const bool emitted = m_code.EmitCallAbsolute(
 						reinterpret_cast<const void*>(&_vuXGKICKTransfer));
+					m_norm_consts_ready = false;
+					m_norm_maxf_ready = false;
+					return emitted;
 				}
 
 				// PCSX2 owner: x86/microVU_Lower.inl::mVU_XGKICK_SYNC(). The
@@ -1741,7 +1776,9 @@ namespace VitaVU
 			{
 				return m_code.EmitMovImm8(0, 0) &&
 					m_code.EmitMovImm8(1, 1) &&
-					EmitCallXgkickPreserveNormalizeState();
+					EmitPublishResidentCycle() &&
+					EmitCallXgkickPreserveNormalizeState() &&
+					EmitResyncResidentCycle();
 			}
 
 			bool EmitOrVuWordField(unsigned accum, size_t offset)
@@ -2364,7 +2401,7 @@ namespace VitaVU
 					if (done_disabled == static_cast<size_t>(-1))
 						return false;
 
-					if (!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
+					if (!EmitLoadCurrentCycleLow(0) ||
 						!m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, xgkicklastcycle))) ||
 						!m_code.EmitSubReg(0, 0, 1) ||
 						!m_code.EmitSubImm8(0, 0, 1) ||
@@ -2386,7 +2423,7 @@ namespace VitaVU
 				{
 					// PCSX2 owner: VUops.cpp::_vuTestPipes(). The generated path
 					// handles FMAC, FDIV, EFU, IALU, then XGKICK in helper order.
-					if (!m_code.EmitLdrImm12(HOST_CLIP_OLD, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
+					if (!EmitLoadCurrentCycleLow(HOST_CLIP_OLD) ||
 						!m_code.EmitLdrImm12(HOST_CLIP_NEW, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)))
 					{
 						return false;
@@ -7010,7 +7047,7 @@ namespace VitaVU
 				constexpr size_t base = offsetof(VURegs, fdiv);
 				return m_code.EmitMovImm8(0, 1) &&
 					m_code.EmitStrImm12(0, HOST_VU, VuOffset(base + offsetof(fdivPipe, enable))) &&
-					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
+					EmitLoadCurrentCycleLow(0) &&
 					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
 					m_code.EmitStrImm12(0, HOST_VU, VuOffset(base + offsetof(fdivPipe, sCycle))) &&
 					m_code.EmitStrImm12(1, HOST_VU, VuOffset(base + offsetof(fdivPipe, sCycle) + 4)) &&
@@ -7030,7 +7067,7 @@ namespace VitaVU
 				constexpr size_t base = offsetof(VURegs, efu);
 				return m_code.EmitMovImm8(0, 1) &&
 					m_code.EmitStrImm12(0, HOST_VU, VuOffset(base + offsetof(efuPipe, enable))) &&
-					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
+					EmitLoadCurrentCycleLow(0) &&
 					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
 					m_code.EmitStrImm12(0, HOST_VU, VuOffset(base + offsetof(efuPipe, sCycle))) &&
 					m_code.EmitStrImm12(1, HOST_VU, VuOffset(base + offsetof(efuPipe, sCycle) + 4)) &&
@@ -7055,7 +7092,7 @@ namespace VitaVU
 					m_code.EmitAddRegShiftImm(3, 3, 0, ShiftType::LSL, 3) &&
 					m_code.EmitMovImm32(1, regs.VIwrite) &&
 					m_code.EmitStrImm12(1, 3, offsetof(ialuPipe, reg)) &&
-					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
+					EmitLoadCurrentCycleLow(1) &&
 					m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
 					m_code.EmitStrImm12(1, 3, offsetof(ialuPipe, sCycle)) &&
 					m_code.EmitStrImm12(2, 3, offsetof(ialuPipe, sCycle) + 4) &&
@@ -7107,7 +7144,7 @@ namespace VitaVU
 					m_code.EmitMovImm32(0, xyzwlower) &&
 					m_code.EmitMovImm8(1, 0) &&
 					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, xyzwlower)) &&
-					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, cycle))) &&
+					EmitLoadCurrentCycleLow(0) &&
 					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
 					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, sCycle)) &&
 					m_code.EmitMovImm8(0, 4) &&
@@ -7171,6 +7208,8 @@ namespace VitaVU
 			// microVU's observable scheduling contract, not the interpreter's
 			// per-step Execute() guard. Each pair still performs vu1Exec()'s cycle
 			// increment and leaves its low word in HOST_CYCLE_LO for VIBackupCycles.
+			// Scan-proven one-cycle blocks keep that word private until a helper,
+			// link-admission, or dispatcher-return seam observes VURegs.
 			bool EmitBudgetCheckAndCycleIncrement(u32 pair_index)
 			{
 				if (m_countdown_budget)
@@ -7238,8 +7277,7 @@ namespace VitaVU
 				}
 
 				if (!m_code.EmitSubImm8(HOST_BUDGET_LEFT, HOST_BUDGET_LEFT, 1) ||
-					!m_code.EmitAddImm8(HOST_CYCLE_LO, HOST_CYCLE_LO, 1, true) ||
-					!m_code.EmitStrImm12(HOST_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle))))
+					!m_code.EmitAddImm8(HOST_CYCLE_LO, HOST_CYCLE_LO, 1, true))
 				{
 					return false;
 				}
@@ -7273,6 +7311,20 @@ namespace VitaVU
 				const size_t skip = m_code.EmitBranchPlaceholder(Condition::EQ);
 				if (skip == static_cast<size_t>(-1))
 					return false;
+
+				// Static countdown blocks cannot take a stall path, so the exact
+				// _vu0Exec()/_vu1Exec() delta is one. Keep the cycle private and
+				// decrement the nonzero backup directly instead of round-tripping the
+				// resident low word through VURegs just to reconstruct that constant.
+				if (m_countdown_budget)
+				{
+					if (!m_code.EmitSubImm8(0, 0, 1) ||
+						!m_code.EmitStrbImm12(0, HOST_VU, backup))
+					{
+						return false;
+					}
+					return m_code.PatchBranch(skip, m_code.Size(), Condition::EQ);
+				}
 
 				// delta = (u8)(cycle_now - (cycle_at_step_start - 1))
 				if (!m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
