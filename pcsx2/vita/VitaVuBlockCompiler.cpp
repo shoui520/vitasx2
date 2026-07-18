@@ -77,6 +77,7 @@ u32 g_qemuVuJitLocalFmacPipelineEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineCommits = 0;
 u32 g_qemuVuJitDeferredFmacFlagEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagRetirements = 0;
+u32 g_qemuVuJitDeferredFmacLinkedEntries = 0;
 #endif
 
 namespace VitaVU
@@ -1277,6 +1278,10 @@ namespace VitaVU
 
 			const void* LookupVu1DirectLinkBlockScalar(VURegs* vu, Vu1DirectLinkSlot* runtime_link);
 			const void* LookupVu1DirectLinkBlockVector(VURegs* vu, Vu1DirectLinkSlot* runtime_link);
+			const void* LookupVu1DirectLinkBlockScalarDeferredFmac(
+				VURegs* vu, Vu1DirectLinkSlot* runtime_link);
+			const void* LookupVu1DirectLinkBlockVectorDeferredFmac(
+				VURegs* vu, Vu1DirectLinkSlot* runtime_link);
 
 		u16 VuOffset(size_t offset)
 		{
@@ -1380,8 +1385,6 @@ namespace VitaVU
 				}
 				if (!EmitCanonicalizeLocalFmacPipeline())
 					return false;
-				if (!EmitFinishDeferredFmacFlags())
-					return false;
 
 				// PCSX2 owner: x86/microVU_Compile.inl keeps the micro PC in
 				// compiler state and publishes it at block-management seams. Branch
@@ -1411,6 +1414,13 @@ namespace VitaVU
 				// otherwise return to the dispatcher.
 				if (m_plan.direct_link_tail && !EmitDirectLinkTail(m_plan.pair_count))
 					return false;
+				// PCSX2's microRegAlloc/pStateEnd keeps compatible block state in
+				// host registers. A deferred-FMAC source reaches this point with the
+				// current STATUS/MAC values in r6/r7; a compatible linked target owns
+				// those values directly. Publish them only after the link fast path has
+				// declined the edge, at the actual dispatcher/architectural seam.
+				if (!EmitPublishDeferredFmacFlags())
+					return false;
 				if (!EmitReturnExecutedPairs(m_plan.pair_count,
 						m_plan.continues_logical_block_if_busy))
 					return false;
@@ -1428,6 +1438,7 @@ namespace VitaVU
 					if (!EmitPublishPairTpc(exit.executed_pairs) ||
 						!EmitPublishPairCode(exit.executed_pairs) ||
 						!EmitPublishResidentCycle() ||
+						!EmitPublishDeferredFmacFlags() ||
 						!EmitReturnExecutedPairs(exit.executed_pairs))
 						return false;
 					const size_t jump = m_code.EmitBranchPlaceholder();
@@ -1454,6 +1465,33 @@ namespace VitaVU
 				// private cycle word is refreshed before its microVU block-admission
 				// test; this also converts a preceding block's permitted overshoot
 				// back into an ordinary target-entry rejection.
+				if (m_plan.deferred_fmac_flags)
+				{
+					m_deferred_fmac_linked_entry_offset = m_code.Size();
+#if defined(VITASX2_QEMU_VALIDATION)
+					if (!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitDeferredFmacLinkedEntries))) ||
+						!m_code.EmitLdrImm12(1, 0, 0) ||
+						!m_code.EmitAddImm8(1, 1, 1) ||
+						!m_code.EmitStrImm12(1, 0, 0))
+					{
+						return false;
+					}
+#endif
+					if (m_resident_cycle &&
+						!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
+							VuOffset(offsetof(VURegs, cycle))))
+					{
+						return false;
+					}
+					const size_t deferred_flags_linked_to_body = m_code.EmitBranchPlaceholder();
+					if (deferred_flags_linked_to_body == static_cast<size_t>(-1) ||
+						!m_code.PatchBranch(deferred_flags_linked_to_body, body_offset))
+					{
+						return false;
+					}
+				}
+
 				m_linked_entry_offset = m_code.Size();
 #if defined(VITASX2_QEMU_VALIDATION)
 				if (!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitLinkedFrameEntries))) ||
@@ -1504,6 +1542,7 @@ namespace VitaVU
 
 			const std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS>& DirectLinks() const { return m_direct_links; }
 			size_t LinkedEntryOffset() const { return m_linked_entry_offset; }
+			size_t DeferredFmacLinkedEntryOffset() const { return m_deferred_fmac_linked_entry_offset; }
 			const VectorCacheStats& GetVectorCacheStats() const { return m_vector_cache_stats; }
 
 			static VectorCacheOpportunity AnalyzeVectorCacheOpportunity(
@@ -1925,9 +1964,19 @@ namespace VitaVU
 					return false;
 				}
 
-				const void* const lookup = UsesVectorCacheFrame() ?
-					reinterpret_cast<const void*>(&LookupVu1DirectLinkBlockVector) :
-					reinterpret_cast<const void*>(&LookupVu1DirectLinkBlockScalar);
+				const void* lookup = nullptr;
+				if (m_plan.deferred_fmac_flags)
+				{
+					lookup = UsesVectorCacheFrame() ?
+						reinterpret_cast<const void*>(&LookupVu1DirectLinkBlockVectorDeferredFmac) :
+						reinterpret_cast<const void*>(&LookupVu1DirectLinkBlockScalarDeferredFmac);
+				}
+				else
+				{
+					lookup = UsesVectorCacheFrame() ?
+						reinterpret_cast<const void*>(&LookupVu1DirectLinkBlockVector) :
+						reinterpret_cast<const void*>(&LookupVu1DirectLinkBlockScalar);
+				}
 				if (!EmitCallAbsoluteClobberVectorState(lookup) ||
 					!m_code.EmitCmpImm32(0, 0))
 				{
@@ -7629,16 +7678,14 @@ namespace VitaVU
 					m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_MAC_FLAG));
 			}
 
-			bool EmitFinishDeferredFmacFlags()
+			bool EmitPublishDeferredFmacFlags()
 			{
 				if (!m_plan.deferred_fmac_flags)
 					return true;
 
 				return m_code.EmitStrImm12(HOST_LIMIT_LO, HOST_VU,
 						ViOffset(REG_STATUS_FLAG)) &&
-					m_code.EmitStrImm12(HOST_LIMIT_HI, HOST_VU, ViOffset(REG_MAC_FLAG)) &&
-					m_code.EmitLdrdImm8(HOST_LIMIT_LO, HOST_LIMIT_HI, SP,
-						static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET));
+					m_code.EmitStrImm12(HOST_LIMIT_HI, HOST_VU, ViOffset(REG_MAC_FLAG));
 			}
 
 			bool EmitRetireLocalFmacEntries(u32 pair_index)
@@ -8476,6 +8523,7 @@ namespace VitaVU
 			std::vector<BudgetExit> m_budget_exits;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> m_direct_links{};
 			size_t m_linked_entry_offset = static_cast<size_t>(-1);
+			size_t m_deferred_fmac_linked_entry_offset = static_cast<size_t>(-1);
 		};
 
 		// ------------------------------------------------------------------
@@ -8487,6 +8535,7 @@ namespace VitaVU
 			CodeBuffer code;
 			const void* entry = nullptr;
 			const void* linked_entry = nullptr;
+			const void* deferred_fmac_linked_entry = nullptr;
 			size_t code_size = 0;
 			u32 start_pc = 0;
 			u32 pair_count = 0;
@@ -8496,6 +8545,7 @@ namespace VitaVU
 			bool entry_ebit_tail = false;
 			bool continues_logical_block_if_busy = false;
 			bool vector_cache_frame = false;
+			bool deferred_fmac_flags = false;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> direct_links{};
 			// Generated code embeds pointers into this array (stall-helper
 			// _VURegsNum arguments), so it must stay stable for the lifetime
@@ -8706,7 +8756,15 @@ namespace VitaVU
 				// entries bypass both prologues, so only equal private-frame ABIs
 				// may share an epilogue. Incompatible edges return through the
 				// dispatcher with canonical VF/ACC state already published.
-				return source.vector_cache_frame == target.vector_cache_frame;
+				return source.vector_cache_frame == target.vector_cache_frame &&
+					(!source.deferred_fmac_flags || target.deferred_fmac_flags);
+			}
+
+			const void* DirectLinkTargetEntry(const CachedBlock& source,
+				const CachedBlock& target)
+			{
+				return source.deferred_fmac_flags ?
+					target.deferred_fmac_linked_entry : target.linked_entry;
 			}
 
 			bool PatchVu1DirectLink(CachedBlock& source, Vu1DirectLinkSlot& link,
@@ -8791,7 +8849,8 @@ namespace VitaVU
 					CachedBlock* target = target_map[link.target_pc / 8];
 					if (target && target != BLOCK_UNCOMPILABLE &&
 						DirectLinkFramesCompatible(source, *target))
-						PatchVu1DirectLink(source, link, target->linked_entry);
+						PatchVu1DirectLink(source, link,
+							DirectLinkTargetEntry(source, *target));
 					else if (link.patched_target)
 						PatchVu1DirectLink(source, link, nullptr);
 				}
@@ -8808,7 +8867,8 @@ namespace VitaVU
 				{
 					if (DirectLinkTargetsBlock(link, target) &&
 						DirectLinkFramesCompatible(*source, target))
-						PatchVu1DirectLink(*source, link, target.linked_entry);
+						PatchVu1DirectLink(*source, link,
+							DirectLinkTargetEntry(*source, target));
 					else if (DirectLinkTargetsBlock(link, target) && link.patched_target)
 						PatchVu1DirectLink(*source, link, nullptr);
 				}
@@ -8923,6 +8983,7 @@ namespace VitaVU
 				{
 					std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> chosen_direct_links{};
 					size_t chosen_linked_entry_offset = static_cast<size_t>(-1);
+					size_t chosen_deferred_fmac_linked_entry_offset = static_cast<size_t>(-1);
 					BlockCompiler::VectorCacheStats chosen_vector_stats{};
 					bool compiled = false;
 					bool vector_cache_candidate = false;
@@ -8948,6 +9009,8 @@ namespace VitaVU
 							const size_t baseline_size = code.Size();
 							const auto baseline_links = baseline.DirectLinks();
 							const size_t baseline_linked_entry = baseline.LinkedEntryOffset();
+							const size_t baseline_deferred_fmac_linked_entry =
+								baseline.DeferredFmacLinkedEntryOffset();
 							const BlockCompiler::VectorCacheStats baseline_stats =
 								baseline.GetVectorCacheStats();
 							const BlockCompiler::VectorCacheOpportunity opportunity =
@@ -8957,6 +9020,8 @@ namespace VitaVU
 							{
 								chosen_direct_links = baseline_links;
 								chosen_linked_entry_offset = baseline_linked_entry;
+								chosen_deferred_fmac_linked_entry_offset =
+									baseline_deferred_fmac_linked_entry;
 								chosen_vector_stats = baseline_stats;
 								compiled = true;
 							}
@@ -8982,6 +9047,8 @@ namespace VitaVU
 									{
 										chosen_direct_links = cached.DirectLinks();
 										chosen_linked_entry_offset = cached.LinkedEntryOffset();
+										chosen_deferred_fmac_linked_entry_offset =
+											cached.DeferredFmacLinkedEntryOffset();
 										chosen_vector_stats = cached_stats;
 										vector_cache_baseline_instructions = baseline_size / sizeof(u32);
 										vector_cache_selected_instructions = cached_size / sizeof(u32);
@@ -8998,6 +9065,8 @@ namespace VitaVU
 									{
 										chosen_direct_links = fallback.DirectLinks();
 										chosen_linked_entry_offset = fallback.LinkedEntryOffset();
+										chosen_deferred_fmac_linked_entry_offset =
+											fallback.DeferredFmacLinkedEntryOffset();
 										chosen_vector_stats = fallback.GetVectorCacheStats();
 										compiled = true;
 									}
@@ -9010,9 +9079,16 @@ namespace VitaVU
 					{
 						block->direct_links = chosen_direct_links;
 						block->vector_cache_frame = vector_cache_selected;
+						block->deferred_fmac_flags = plan.deferred_fmac_flags;
 						block->code = std::move(code);
 						block->entry = block->code.EntryPoint();
 						block->linked_entry = static_cast<const u8*>(block->entry) + chosen_linked_entry_offset;
+						if (chosen_deferred_fmac_linked_entry_offset != static_cast<size_t>(-1))
+						{
+							block->deferred_fmac_linked_entry =
+								static_cast<const u8*>(block->entry) +
+								chosen_deferred_fmac_linked_entry_offset;
+						}
 						block->code_size = block->code.Size();
 						if (!PatchVu1RuntimeLinkSlotPointers(*block))
 							break;
@@ -9292,7 +9368,8 @@ namespace VitaVU
 		}
 
 			const void* LookupVu1DirectLinkBlockCommon(VURegs* vu,
-				Vu1DirectLinkSlot* runtime_link, bool source_vector_frame)
+				Vu1DirectLinkSlot* runtime_link, bool source_vector_frame,
+				bool source_deferred_fmac_flags)
 			{
 				if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
 				{
@@ -9321,8 +9398,10 @@ namespace VitaVU
 				if (!block || block == BLOCK_UNCOMPILABLE)
 					return nullptr;
 				if (block->vector_cache_frame != source_vector_frame ||
+					(source_deferred_fmac_flags && !block->deferred_fmac_flags) ||
 					(runtime_link && (!runtime_link->owner ||
-						runtime_link->owner->vector_cache_frame != source_vector_frame)))
+						runtime_link->owner->vector_cache_frame != source_vector_frame ||
+						runtime_link->owner->deferred_fmac_flags != source_deferred_fmac_flags)))
 				{
 					return nullptr;
 				}
@@ -9336,7 +9415,7 @@ namespace VitaVU
 					observed_link->guard_tpc_value = target_pc;
 					observed_link->observed_target = true;
 					if (PatchVu1DirectLink(*observed_link->owner, *observed_link,
-							block->linked_entry))
+							DirectLinkTargetEntry(*observed_link->owner, *block)))
 					{
 						if (first_observation)
 							s_vu1.stats.direct_link_runtime_observed_slots++;
@@ -9346,19 +9425,32 @@ namespace VitaVU
 						observed_link->observed_target = false;
 					}
 				}
-				return block->linked_entry;
+				return source_deferred_fmac_flags ?
+					block->deferred_fmac_linked_entry : block->linked_entry;
 			}
 
 			const void* LookupVu1DirectLinkBlockScalar(VURegs* vu,
 				Vu1DirectLinkSlot* runtime_link)
 			{
-				return LookupVu1DirectLinkBlockCommon(vu, runtime_link, false);
+				return LookupVu1DirectLinkBlockCommon(vu, runtime_link, false, false);
 			}
 
 			const void* LookupVu1DirectLinkBlockVector(VURegs* vu,
 				Vu1DirectLinkSlot* runtime_link)
 			{
-				return LookupVu1DirectLinkBlockCommon(vu, runtime_link, true);
+				return LookupVu1DirectLinkBlockCommon(vu, runtime_link, true, false);
+			}
+
+			const void* LookupVu1DirectLinkBlockScalarDeferredFmac(VURegs* vu,
+				Vu1DirectLinkSlot* runtime_link)
+			{
+				return LookupVu1DirectLinkBlockCommon(vu, runtime_link, false, true);
+			}
+
+			const void* LookupVu1DirectLinkBlockVectorDeferredFmac(VURegs* vu,
+				Vu1DirectLinkSlot* runtime_link)
+			{
+				return LookupVu1DirectLinkBlockCommon(vu, runtime_link, true, true);
 			}
 	} // anonymous namespace
 
@@ -9724,6 +9816,11 @@ namespace VitaVU
 		stats.deferred_fmac_flag_entries = g_qemuVuJitDeferredFmacFlagEntries;
 		stats.deferred_fmac_flag_runtime_retirements =
 			g_qemuVuJitDeferredFmacFlagRetirements;
+		stats.deferred_fmac_linked_entries = g_qemuVuJitDeferredFmacLinkedEntries;
+		stats.deferred_fmac_linked_instructions_removed =
+			static_cast<u64>(g_qemuVuJitDeferredFmacLinkedEntries) * 6;
+		stats.deferred_fmac_linked_memory_words_removed =
+			static_cast<u64>(g_qemuVuJitDeferredFmacLinkedEntries) * 8;
 #endif
 		return stats;
 	}
@@ -9737,6 +9834,7 @@ namespace VitaVU
 		g_qemuVuJitLocalFmacPipelineCommits = 0;
 		g_qemuVuJitDeferredFmacFlagEntries = 0;
 		g_qemuVuJitDeferredFmacFlagRetirements = 0;
+		g_qemuVuJitDeferredFmacLinkedEntries = 0;
 #endif
 		const size_t used = s_vu1.stats.code_cache_used;
 		const size_t capacity = s_vu1.stats.code_cache_capacity;

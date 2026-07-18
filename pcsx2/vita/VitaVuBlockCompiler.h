@@ -37,6 +37,9 @@ namespace VitaVU
 		u32 deferred_fmac_flag_retirements = 0;
 		u64 deferred_fmac_flag_entries = 0;
 		u64 deferred_fmac_flag_runtime_retirements = 0;
+		u64 deferred_fmac_linked_entries = 0;
+		u64 deferred_fmac_linked_instructions_removed = 0;
+		u64 deferred_fmac_linked_memory_words_removed = 0;
 		u32 test_pipes_fast_guard_pairs = 0;
 		u32 fmac_clear_inline_pairs = 0;
 		u32 upper_fmac_stall_test_inline_pairs = 0;
