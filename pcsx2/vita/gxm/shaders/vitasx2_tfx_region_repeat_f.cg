@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owner: tfx_fs.glsl/tfx.fx::clamp_wrap_uv(). GS REGION_REPEAT applies
+// an integer texel mask/fix transform which no GXM sampler mode provides.
+#define VITASX2_TFX_REGION_REPEAT 1
+#include "vitasx2_tfx_f.cg"

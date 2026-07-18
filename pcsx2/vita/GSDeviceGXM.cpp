@@ -50,6 +50,8 @@ extern "C"
 	extern const SceGxmProgram _binary_vitasx2_tfx_zfloor_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_zfloor_source_direct_decal_af_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_fast_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_region_repeat_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_region_repeat_fast_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_untextured_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_source_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_programmable_add_f_gxp_start;
@@ -244,6 +246,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 		const SceGxmProgramParameter* fb_mask = nullptr;
 		const SceGxmProgramParameter* hardware_blend[2]{};
 		const SceGxmProgramParameter* color_mask = nullptr;
+		const SceGxmProgramParameter* region_mask_fix = nullptr;
 		const SceGxmProgramParameter* lod_params = nullptr;
 		const SceGxmProgramParameter* interlace[2]{};
 	};
@@ -290,6 +293,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmShaderPatcherId tfx_zfloor_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_zfloor_source_direct_decal_af_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_fast_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_region_repeat_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_region_repeat_fast_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_untextured_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_source_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_programmable_add_fragment_id = nullptr;
@@ -316,6 +321,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmFragmentProgram* tfx_zfloor_fragment_program = nullptr;
 	SceGxmFragmentProgram* tfx_zfloor_source_direct_decal_af_program = nullptr;
 	SceGxmFragmentProgram* tfx_opaque_program = nullptr;
+	SceGxmFragmentProgram* tfx_region_repeat_program = nullptr;
+	SceGxmFragmentProgram* tfx_region_repeat_opaque_program = nullptr;
 	SceGxmFragmentProgram* tfx_programmable_add_program = nullptr;
 	SceGxmFragmentProgram* tfx_programmable_add_direct_program = nullptr;
 	SceGxmFragmentProgram* tfx_programmable_over_program = nullptr;
@@ -338,6 +345,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	ProgramUniforms zfloor_uniforms;
 	ProgramUniforms zfloor_source_direct_decal_af_uniforms;
 	ProgramUniforms fast_uniforms;
+	ProgramUniforms region_repeat_uniforms;
+	ProgramUniforms region_repeat_fast_uniforms;
 	ProgramUniforms untextured_uniforms;
 	ProgramUniforms source_uniforms;
 	ProgramUniforms programmable_add_uniforms;
@@ -397,7 +406,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool StageAndDraw(const GSHWDrawConfig& config,
 		const GSHWDrawConfig::PSSelector& ps, u32 first_index, u32 index_count,
 		VitaGXM::GSTextureGXM* source, SceGxmFragmentProgram* fragment,
-		bool fast_fragment, bool programmable_add_fragment,
+		bool region_repeat_fragment, bool fast_fragment,
+		bool programmable_add_fragment,
 		bool programmable_add_direct_fragment,
 		bool programmable_over_fragment,
 		bool source_only_fragment,
@@ -408,7 +418,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool UploadTfxUniforms(const GSHWDrawConfig& config,
 		const GSHWDrawConfig::PSSelector& ps, VitaGXM::GSTextureGXM* source,
 		bool zfloor_programmable_constant_fragment,
-		bool fast_fragment, bool programmable_add_fragment,
+		bool region_repeat_fragment, bool fast_fragment,
+		bool programmable_add_fragment,
 		bool programmable_add_direct_fragment,
 		bool programmable_over_fragment,
 		bool source_only_fragment,
@@ -748,6 +759,10 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		&_binary_vitasx2_tfx_zfloor_source_direct_decal_af_f_gxp_start;
 	const SceGxmProgram* const tfx_fast_f =
 		&_binary_vitasx2_tfx_fast_f_gxp_start;
+	const SceGxmProgram* const tfx_region_repeat_f =
+		&_binary_vitasx2_tfx_region_repeat_f_gxp_start;
+	const SceGxmProgram* const tfx_region_repeat_fast_f =
+		&_binary_vitasx2_tfx_region_repeat_fast_f_gxp_start;
 	const SceGxmProgram* const tfx_untextured_f =
 		&_binary_vitasx2_tfx_untextured_f_gxp_start;
 	const SceGxmProgram* const tfx_source_f =
@@ -783,7 +798,7 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 	for (const SceGxmProgram* program : {tfx_v, tfx_f, tfx_manual_lod_f,
 		tfx_manual_lod_zfloor_f, tfx_zfloor_f,
 		tfx_zfloor_source_direct_decal_af_f,
-		tfx_fast_f,
+		tfx_fast_f, tfx_region_repeat_f, tfx_region_repeat_fast_f,
 		tfx_untextured_f, tfx_source_f, tfx_programmable_add_f,
 		tfx_programmable_add_direct_f,
 		tfx_programmable_over_f,
@@ -819,6 +834,11 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 			"register Z-floor direct DECAL/RGB (Cs-0)*Af+0 TFX fragment program") ||
 		!register_program(tfx_fast_f, &tfx_fast_fragment_id,
 			"register fast TFX fragment program") ||
+		!register_program(tfx_region_repeat_f, &tfx_region_repeat_fragment_id,
+			"register REGION_REPEAT TFX fragment program") ||
+		!register_program(tfx_region_repeat_fast_f,
+			&tfx_region_repeat_fast_fragment_id,
+			"register fast REGION_REPEAT TFX fragment program") ||
 		!register_program(tfx_untextured_f, &tfx_untextured_fragment_id,
 			"register untextured TFX fragment program") ||
 		!register_program(tfx_source_f, &tfx_source_fragment_id,
@@ -899,6 +919,7 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		destination->hardware_blend[0] = find_uniform(program, "HardwareBlend0");
 		destination->hardware_blend[1] = find_uniform(program, "HardwareBlend1");
 		destination->color_mask = find_uniform(program, "ColorMask");
+		destination->region_mask_fix = find_uniform(program, "RegionMaskFix");
 		destination->lod_params = find_uniform(program, "LODParams");
 	};
 	for (u32 i = 0; i < selector_names.size(); i++)
@@ -926,6 +947,15 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 			SCE_GXM_ERROR_INVALID_VALUE);
 	}
 	load_variant_uniforms(tfx_fast_f, &fast_uniforms);
+	load_variant_uniforms(tfx_region_repeat_f, &region_repeat_uniforms);
+	load_variant_uniforms(tfx_region_repeat_fast_f,
+		&region_repeat_fast_uniforms);
+	if (!region_repeat_uniforms.region_mask_fix ||
+		!region_repeat_fast_uniforms.region_mask_fix)
+	{
+		return Fail("validate REGION_REPEAT TFX uniforms",
+			SCE_GXM_ERROR_INVALID_VALUE);
+	}
 	load_variant_uniforms(tfx_untextured_f, &untextured_uniforms);
 	load_variant_uniforms(tfx_source_f, &source_uniforms);
 	load_variant_uniforms(tfx_programmable_add_f, &programmable_add_uniforms);
@@ -1058,6 +1088,18 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		nullptr, tfx_v, &tfx_opaque_program);
 	if (result < 0 || !tfx_opaque_program)
 		return Fail("create opaque TFX fragment program", result);
+	result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_region_repeat_fragment_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED, SCE_GXM_MULTISAMPLE_NONE,
+		nullptr, tfx_v, &tfx_region_repeat_program);
+	if (result < 0 || !tfx_region_repeat_program)
+		return Fail("create REGION_REPEAT TFX fragment program", result);
+	result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_region_repeat_fast_fragment_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED, SCE_GXM_MULTISAMPLE_NONE,
+		nullptr, tfx_v, &tfx_region_repeat_opaque_program);
+	if (result < 0 || !tfx_region_repeat_opaque_program)
+		return Fail("create fast REGION_REPEAT TFX fragment program", result);
 
 	// Sony's programmable- and masked-blending samples create FRAGCOLOR programs
 	// without a patcher blend state. These programs preserve PCSX2's general TFX
@@ -1664,7 +1706,7 @@ bool GSDeviceGXM::Impl::CanUseSourceDirectTfx(
 	// linear filtering, and no target-region remap, sample_c is one ordinary
 	// texture lookup. GXM's sampler owns repeat/clamp and host linear filtering.
 	return config.vs.tme && config.ps.aem_fmt == 0 && !config.ps.ltf &&
-		!config.ps.region_rect;
+		!config.ps.region_rect && config.ps.wms <= 1 && config.ps.wmt <= 1;
 }
 
 bool GSDeviceGXM::Impl::CanUseSourceDirectModulateTfx(
@@ -1859,7 +1901,8 @@ void GSDeviceGXM::Impl::RetireTextureAllocation(
 bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	const GSHWDrawConfig::PSSelector& ps, VitaGXM::GSTextureGXM* source,
 	bool zfloor_programmable_constant_fragment,
-	bool fast_fragment, bool programmable_add_fragment,
+	bool region_repeat_fragment, bool fast_fragment,
+	bool programmable_add_fragment,
 	bool programmable_add_direct_fragment,
 	bool programmable_over_fragment,
 	bool source_only_fragment, bool source_direct_fragment,
@@ -1868,7 +1911,12 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	bool untextured_fragment)
 {
 	const ProgramUniforms* fragment_uniforms = &uniforms;
-	if (ps.manual_lod)
+	if (region_repeat_fragment)
+	{
+		fragment_uniforms = fast_fragment ? &region_repeat_fast_uniforms :
+			&region_repeat_uniforms;
+	}
+	else if (ps.manual_lod)
 	{
 		fragment_uniforms = ps.zfloor ? &manual_lod_zfloor_uniforms :
 			&manual_lod_uniforms;
@@ -1985,6 +2033,16 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 		0.0f, 0.0f};
 	if (!upload4(fragment_uniforms->st_scale, st_scale, "upload ST scale"))
 		return false;
+	const float region_mask_fix[4] = {
+		static_cast<float>(config.cb_ps.MinMax.U32[0]),
+		static_cast<float>(config.cb_ps.MinMax.U32[1]),
+		static_cast<float>(config.cb_ps.MinMax.U32[2]),
+		static_cast<float>(config.cb_ps.MinMax.U32[3])};
+	if (!upload4(fragment_uniforms->region_mask_fix, region_mask_fix,
+			"upload REGION_REPEAT mask/fix"))
+	{
+		return false;
+	}
 	if (!upload4(fragment_uniforms->lod_params, config.cb_ps.LODParams.F32,
 			"upload manual LOD parameters"))
 	{
@@ -2075,7 +2133,8 @@ VitaGXM::GSTextureGXM* GSDeviceGXM::Impl::SnapshotTexture(
 bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	const GSHWDrawConfig::PSSelector& ps, u32 first_index, u32 index_count,
 	VitaGXM::GSTextureGXM* source, SceGxmFragmentProgram* fragment,
-	bool fast_fragment, bool programmable_add_fragment,
+	bool region_repeat_fragment, bool fast_fragment,
+	bool programmable_add_fragment,
 	bool programmable_add_direct_fragment,
 	bool programmable_over_fragment,
 	bool source_only_fragment, bool source_direct_fragment,
@@ -2224,7 +2283,8 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	sceGxmSetFrontDepthWriteEnable(context, depth_write);
 	sceGxmSetBackDepthWriteEnable(context, depth_write);
 	if (!UploadTfxUniforms(config, ps, source,
-			fragment == tfx_zfloor_source_direct_decal_af_program, fast_fragment,
+			fragment == tfx_zfloor_source_direct_decal_af_program,
+			region_repeat_fragment, fast_fragment,
 			programmable_add_fragment,
 			programmable_add_direct_fragment,
 			programmable_over_fragment,
@@ -2381,7 +2441,7 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		config.ps.scanmsk || config.ps.aa1 != GSHWDrawConfig::PS_AA1::NONE ||
 		config.ps.rov_color ||
 		config.ps.rov_depth != GSHWDrawConfig::PS_ROV_DEPTH::NONE ||
-		config.ps.wms > 1 || config.ps.wmt > 1 || config.ps.zclamp ||
+		config.ps.wms == 2 || config.ps.wmt == 2 || config.ps.zclamp ||
 		config.ps.tcoffsethack || config.ps.adjs ||
 		config.ps.adjt || config.ps.tex_is_fb ||
 		config.ps.date || config.ps.abe ||
@@ -2396,6 +2456,14 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 			static_cast<u32>(config.ps.key_lo), config.vs.key,
 			config.sampler.key, config.depth.key, config.blend.key,
 			config.colormask.key, static_cast<u32>(config.topology));
+		return;
+	}
+	const bool region_repeat_fragment = config.ps.wms == 3 || config.ps.wmt == 3;
+	if (region_repeat_fragment &&
+		(config.ps.region_rect || config.ps.manual_lod || config.ps.zfloor))
+	{
+		m_impl->Reject(
+			"REGION_REPEAT combined with target-region, manual-LOD, or Z-floor");
 		return;
 	}
 	if (config.destination_alpha != GSHWDrawConfig::DestinationAlphaMode::Off ||
@@ -2496,7 +2564,8 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		Console.WriteLn(
 			"GXM GS: source-direct Z-floor DECAL/RGB constant-blend path active.");
 	}
-	bool source_only_fragment = source_only_contract && !config.ps.zfloor;
+	bool source_only_fragment = source_only_contract && !config.ps.zfloor &&
+		!region_repeat_fragment;
 	bool untextured_fragment = source_only_fragment && !config.vs.tme;
 	bool source_direct_fragment = source_only_fragment &&
 		m_impl->CanUseSourceDirectTfx(config);
@@ -2537,7 +2606,20 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		source_direct_modulate_af_fragment = false;
 		untextured_fragment = false;
 	}
-	SceGxmFragmentProgram* fragment = manual_lod_fragment ?
+	if (region_repeat_fragment)
+	{
+		programmable_add_direct_fragment = false;
+		programmable_add_fragment = false;
+		programmable_over_fragment = false;
+		source_only_fragment = false;
+		source_direct_fragment = false;
+		source_direct_modulate_fragment = false;
+		source_direct_modulate_af_fragment = false;
+		untextured_fragment = false;
+	}
+	SceGxmFragmentProgram* fragment = region_repeat_fragment ?
+		(fast_fragment ? m_impl->tfx_region_repeat_opaque_program :
+			m_impl->tfx_region_repeat_program) : (manual_lod_fragment ?
 		(config.ps.zfloor ? m_impl->tfx_manual_lod_zfloor_fragment_program :
 			m_impl->tfx_manual_lod_fragment_program) : (config.ps.zfloor ?
 		(zfloor_programmable_constant_fragment ?
@@ -2550,7 +2632,7 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		m_impl->tfx_programmable_add_program :
 		(programmable_over ? m_impl->tfx_programmable_over_program :
 		(fast_fragment ? m_impl->tfx_opaque_program :
-			m_impl->tfx_fragment_program))))));
+			m_impl->tfx_fragment_program)))))));
 	if (!fragment)
 	{
 		// Shader-patcher memory exhaustion must not change GS behavior. The
@@ -2576,7 +2658,8 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 	{
 		const u32 count = std::min(max_chunk, config.nindices - first);
 		if (count == 0 || !m_impl->StageAndDraw(config, config.ps, first, count,
-			source, fragment, fast_fragment, programmable_add_fragment,
+			source, fragment, region_repeat_fragment, fast_fragment,
+			programmable_add_fragment,
 			programmable_add_direct_fragment,
 			programmable_over_fragment,
 			source_only_fragment,
@@ -3278,6 +3361,10 @@ void GSDeviceGXM::Impl::Shutdown()
 		"unregister source-only TFX fragment");
 	unregister(tfx_untextured_fragment_id,
 		"unregister untextured TFX fragment");
+	unregister(tfx_region_repeat_fast_fragment_id,
+		"unregister fast REGION_REPEAT TFX fragment");
+	unregister(tfx_region_repeat_fragment_id,
+		"unregister REGION_REPEAT TFX fragment");
 	unregister(tfx_fast_fragment_id, "unregister fast TFX fragment");
 	unregister(tfx_zfloor_fragment_id, "unregister Z-floor TFX fragment");
 	unregister(tfx_manual_lod_zfloor_fragment_id,

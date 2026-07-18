@@ -69,6 +69,37 @@ float2 RegionCoordinate(float2 coordinate, float wms, float wmt)
 	return coordinate;
 }
 
+#if defined(VITASX2_TFX_REGION_REPEAT)
+float2 ApplyRegionRepeat(float2 coordinate, float2 wrapMode, float fst,
+	float2 textureSize, float4 maskFix)
+{
+	// PCSX2 owners: tfx_fs.glsl/tfx.fx::clamp_wrap_uv() and
+	// GSRendererHW::EmulateTextureSampler(). REGION_REPEAT is not ordinary
+	// sampler repeat: the GS converts to integer texels, ANDs MINU/MINV as a
+	// mask, then ORs MAXU/MAXV as a fixed pattern. GXM has no matching address
+	// mode, so perform the exact transform before applying the target scale.
+	if (wrapMode.x > 2.5f)
+	{
+		if (fst < 0.5f)
+			coordinate.x = frac(coordinate.x);
+		unsigned int texel = (unsigned int)(coordinate.x * textureSize.x);
+		texel = (texel & (unsigned int)maskFix.x) |
+			(unsigned int)maskFix.z;
+		coordinate.x = (float)texel / textureSize.x;
+	}
+	if (wrapMode.y > 2.5f)
+	{
+		if (fst < 0.5f)
+			coordinate.y = frac(coordinate.y);
+		unsigned int texel = (unsigned int)(coordinate.y * textureSize.y);
+		texel = (texel & (unsigned int)maskFix.y) |
+			(unsigned int)maskFix.w;
+		coordinate.y = (float)texel / textureSize.y;
+	}
+	return coordinate;
+}
+#endif
+
 float4 ApplyTextureAem(float4 sampled, float aem, float aemFormat,
 	float4 textureAlpha)
 {
@@ -105,10 +136,15 @@ float4 SampleTextureLevel(uniform sampler2D textureSampler, float2 coordinate,
 float4 SampleOne(uniform sampler2D textureSampler, float2 coordinate,
 	float regionRect, float2 wrapMode, float4 textureSize,
 	float4 stRange, float4 nativeTextureSize, float2 stScale,
-	float aem, float aemFormat, float4 textureAlpha, float lod)
+	float aem, float aemFormat, float4 textureAlpha, float lod,
+	float fst, float4 regionMaskFix)
 {
 	if (regionRect < 0.5f)
 	{
+#if defined(VITASX2_TFX_REGION_REPEAT)
+		coordinate = ApplyRegionRepeat(coordinate, wrapMode, fst,
+			textureSize.xy, regionMaskFix);
+#endif
 		return ApplyTextureAem(SampleTextureLevel(textureSampler,
 			coordinate * stScale, lod),
 			aem, aemFormat, textureAlpha);
@@ -132,27 +168,28 @@ float4 SampleTexture(uniform sampler2D textureSampler, float2 st,
 	float manualLinear, float4 halfTexel, float4 textureSize,
 	float regionRect, float2 wrapMode, float4 stRange,
 	float4 nativeTextureSize, float2 stScale, float aem,
-	float aemFormat, float4 textureAlpha, float lod)
+	float aemFormat, float4 textureAlpha, float lod, float fst,
+	float4 regionMaskFix)
 {
 	if (manualLinear < 0.5f)
 		return SampleOne(textureSampler, st, regionRect, wrapMode,
 			textureSize, stRange, nativeTextureSize, stScale,
-			aem, aemFormat, textureAlpha, lod);
+			aem, aemFormat, textureAlpha, lod, fst, regionMaskFix);
 
 	const float4 uv = st.xyxy + halfTexel;
 	const float2 weight = saturate(frac(uv.xy * textureSize.zw));
 	const float4 c0 = SampleOne(textureSampler, uv.xy, regionRect, wrapMode,
 		textureSize, stRange, nativeTextureSize, stScale,
-		aem, aemFormat, textureAlpha, lod);
+		aem, aemFormat, textureAlpha, lod, fst, regionMaskFix);
 	const float4 c1 = SampleOne(textureSampler, uv.zy, regionRect, wrapMode,
 		textureSize, stRange, nativeTextureSize, stScale,
-		aem, aemFormat, textureAlpha, lod);
+		aem, aemFormat, textureAlpha, lod, fst, regionMaskFix);
 	const float4 c2 = SampleOne(textureSampler, uv.xw, regionRect, wrapMode,
 		textureSize, stRange, nativeTextureSize, stScale,
-		aem, aemFormat, textureAlpha, lod);
+		aem, aemFormat, textureAlpha, lod, fst, regionMaskFix);
 	const float4 c3 = SampleOne(textureSampler, uv.zw, regionRect, wrapMode,
 		textureSize, stRange, nativeTextureSize, stScale,
-		aem, aemFormat, textureAlpha, lod);
+		aem, aemFormat, textureAlpha, lod, fst, regionMaskFix);
 	return lerp(lerp(c0, c1, weight.x), lerp(c2, c3, weight.x), weight.y);
 }
 
@@ -198,6 +235,9 @@ __nativecolor __regformat unsigned char4 main(
 	uniform float4 HardwareBlend0,
 	uniform float4 HardwareBlend1,
 	uniform float4 ColorMask
+#if defined(VITASX2_TFX_REGION_REPEAT)
+	, uniform float4 RegionMaskFix
+#endif
 #if defined(VITASX2_TFX_MANUAL_LOD)
 	, uniform float4 LODParams
 #endif
@@ -261,7 +301,12 @@ __nativecolor __regformat unsigned char4 main(
 		float4 sampled = SampleTexture(sourceTexture, st, Selector2.z,
 			HalfTexel, TextureSize, Selector6.x, Selector6.yz,
 			STRange, NativeTextureSize, STScale.xy, Selector2.x,
-			Selector2.y, TextureAlpha, sampleLod);
+			Selector2.y, TextureAlpha, sampleLod, Selector0.y,
+#if defined(VITASX2_TFX_REGION_REPEAT)
+			RegionMaskFix);
+#else
+			float4(0.0f));
+#endif
 #endif
 #if defined(VITASX2_TFX_NO_RTA_SOURCE_CORRECTION)
 #elif defined(VITASX2_TFX_DIRECT_TEXTURE)

@@ -1,0 +1,8 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// Null-blend/full-write REGION_REPEAT descendant for opaque mosaic passes.
+// The C++ selector proof is identical to the ordinary fast TFX path.
+#define VITASX2_TFX_REGION_REPEAT 1
+#define VITASX2_TFX_FAST 1
+#include "vitasx2_tfx_f.cg"
