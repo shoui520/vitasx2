@@ -1124,6 +1124,9 @@ namespace VitaVU
 		constexpr unsigned HOST_LIMIT_HI = 7;
 		constexpr unsigned HOST_CLIP_OLD = 8; // paired clip-flag hazard backups
 		constexpr unsigned HOST_CLIP_NEW = 9;
+		// Stall scans use r10 before the per-pair pipe test.  A shared pipe-test
+		// thunk reuses it as its private return register; all C++ callees preserve
+		// r10 under AAPCS32.
 		constexpr unsigned HOST_STALL_SCRATCH = 10;
 		constexpr unsigned HOST_EXEC_BASE = 11;
 		constexpr unsigned HOST_CALL_SCRATCH = 12;
@@ -1339,7 +1342,8 @@ namespace VitaVU
 					}
 				}
 
-				if (!EmitXgkickNormalizePreserveThunk())
+				if (!EmitSharedTestPipesFastGuardThunk() ||
+					!EmitXgkickNormalizePreserveThunk())
 					return false;
 
 				if (m_vu0_memory_map)
@@ -1657,6 +1661,11 @@ namespace VitaVU
 					return emitted;
 				}
 
+				return EmitCallXgkickAlwaysPreserveNormalizeState();
+			}
+
+			bool EmitCallXgkickAlwaysPreserveNormalizeState()
+			{
 				// PCSX2 owner: x86/microVU_Lower.inl::mVU_XGKICK_SYNC(). The
 				// PATH1 helper owns GIF/XGKICK state, not the host-only vuDouble()
 				// constants. Q8-Q11 are AAPCS caller-clobbered, so route the rare
@@ -2114,11 +2123,17 @@ namespace VitaVU
 			}
 #endif
 
-				bool EmitInlineTestPipesFmacFlush()
-				{
+			bool EmitInlineTestPipesFmacFlush(bool full_queue_fast_path)
+			{
 				// PCSX2 owner: VUops.cpp::_vuFMACflush(). Publish all ready
 				// FMAC flag snapshots in queue order, stopping at the first
-				// not-ready head entry exactly like the helper.
+				// not-ready head entry exactly like the helper. PCSX2 microVU's
+				// microVU_Flags.inl::mVUsetFlags() models the same four flag
+				// instances at a fixed four-cycle latency. A full interpreter
+				// queue therefore has an unconditionally ready head: at most one
+				// merged FMAC entry is committed per pair, so four distinct prior
+				// pairs have elapsed. Keep the timestamp path for partial queues
+				// and for any additional entries made ready by a stall.
 				constexpr unsigned HOST_INDEX = 0;
 				constexpr unsigned HOST_PTR = 1;
 				constexpr unsigned HOST_TEMP = 2;
@@ -2138,8 +2153,22 @@ namespace VitaVU
 				if (!m_code.EmitLdrImm12(HOST_INDEX, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
 					!m_code.EmitAddImm32(HOST_PTR, HOST_VU, offsetof(VURegs, fmac)) ||
 					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_INDEX, ShiftType::LSL, 5) ||
-					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_INDEX, ShiftType::LSL, 4) ||
-					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
+					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_INDEX, ShiftType::LSL, 4))
+				{
+					return false;
+				}
+
+				size_t ready_full = static_cast<size_t>(-1);
+				if (full_queue_fast_path)
+				{
+					if (!m_code.EmitCmpImm32(HOST_COUNT, 4))
+						return false;
+					ready_full = m_code.EmitBranchPlaceholder(Condition::EQ);
+					if (ready_full == static_cast<size_t>(-1))
+						return false;
+				}
+
+				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
 					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, sCycle) + 4) ||
 					!m_code.EmitSubReg(HOST_TEMP, HOST_CLIP_OLD, HOST_TEMP, true) ||
 					!m_code.EmitSbcReg(HOST_VALUE, HOST_CLIP_NEW, HOST_VALUE, true) ||
@@ -2160,7 +2189,9 @@ namespace VitaVU
 					return false;
 
 				const size_t ready_target = m_code.Size();
-				if (!m_code.PatchBranch(ready_high, ready_target, Condition::NE) ||
+				if ((ready_full != static_cast<size_t>(-1) &&
+						!m_code.PatchBranch(ready_full, ready_target, Condition::EQ)) ||
+					!m_code.PatchBranch(ready_high, ready_target, Condition::NE) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, flagreg)) ||
 					!m_code.EmitTstImm32(HOST_TEMP, 1u << REG_CLIP_FLAG))
 				{
@@ -2428,7 +2459,7 @@ namespace VitaVU
 						m_code.PatchBranch(done_not_ready, done_target, Condition::CC);
 				}
 
-				bool EmitInlineTestPipesXgkickTransfer()
+				bool EmitInlineTestPipesXgkickTransfer(bool always_preserve_normalize_state)
 				{
 					// PCSX2 owner: VUops.cpp::_vuTestPipes() XGKICK arm. GIF
 					// packet parsing remains owned by _vuXGKICKTransfer(); generated
@@ -2451,7 +2482,9 @@ namespace VitaVU
 						!m_code.EmitSubReg(0, 0, 1) ||
 						!m_code.EmitSubImm8(0, 0, 1) ||
 						!m_code.EmitMovImm8(1, 0) ||
-						!EmitCallXgkickPreserveNormalizeState())
+						!(always_preserve_normalize_state ?
+							EmitCallXgkickAlwaysPreserveNormalizeState() :
+							EmitCallXgkickPreserveNormalizeState()))
 					{
 						return false;
 					}
@@ -2464,7 +2497,7 @@ namespace VitaVU
 					return m_code.PatchBranch(done_disabled, m_code.Size(), Condition::EQ);
 				}
 
-				bool EmitTestPipesFastGuard()
+				bool EmitTestPipesFastGuardBody(bool shared_thunk)
 				{
 					// PCSX2 owner: VUops.cpp::_vuTestPipes(). The generated path
 					// handles FMAC, FDIV, EFU, IALU, then XGKICK in helper order.
@@ -2474,7 +2507,7 @@ namespace VitaVU
 						return false;
 					}
 
-					if (!EmitInlineTestPipesFmacFlush())
+					if (!EmitInlineTestPipesFmacFlush(shared_thunk))
 						return false;
 					if (!EmitInlineTestPipesFdivFlush())
 						return false;
@@ -2482,7 +2515,7 @@ namespace VitaVU
 						return false;
 					if (!EmitInlineTestPipesIaluFlush())
 						return false;
-					if (!EmitInlineTestPipesXgkickTransfer())
+					if (!EmitInlineTestPipesXgkickTransfer(shared_thunk))
 						return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -2490,11 +2523,43 @@ namespace VitaVU
 					return false;
 #endif
 
-				const size_t done_jump = m_code.EmitBranchPlaceholder();
-					if (done_jump == static_cast<size_t>(-1))
-						return false;
+					return true;
+				}
 
-					return m_code.PatchBranch(done_jump, m_code.Size());
+				bool EmitTestPipesFastGuard()
+				{
+					// PCSX2 microVU keeps pipeline scheduling outside individual
+					// opcode bodies. On Cortex-A9, duplicating this large exact
+					// interpreter-state publisher in every pair streams far more code
+					// than the 32 KiB L1 I-cache can retain. Multi-pair blocks call one
+					// block-local copy; single-pair blocks remain inline.
+					if (m_plan.pair_count < 2)
+						return EmitTestPipesFastGuardBody(false);
+
+					const size_t call_site = m_code.EmitBranchLinkPlaceholder();
+					if (call_site == static_cast<size_t>(-1))
+						return false;
+					m_test_pipes_fast_guard_calls.push_back(call_site);
+					return true;
+				}
+
+				bool EmitSharedTestPipesFastGuardThunk()
+				{
+					if (m_test_pipes_fast_guard_calls.empty())
+						return true;
+
+					const size_t thunk_offset = m_code.Size();
+					for (const size_t call_site : m_test_pipes_fast_guard_calls)
+					{
+						if (!m_code.PatchBranchLink(call_site, thunk_offset))
+							return false;
+					}
+
+					// r10 is dead after each pair's stall tests and is callee-saved
+					// across the only possible C++ call (_vuXGKICKTransfer).
+					return EmitMovReg(HOST_STALL_SCRATCH, 14) &&
+						EmitTestPipesFastGuardBody(true) &&
+						m_code.EmitBx(HOST_STALL_SCRATCH);
 				}
 
 			bool EmitLoadViHalfword(unsigned rd, unsigned reg)
@@ -7866,6 +7931,7 @@ namespace VitaVU
 			bool m_norm_consts_ready = false;
 			bool m_norm_maxf_ready = false;
 			std::vector<size_t> m_xgkick_norm_preserve_calls;
+			std::vector<size_t> m_test_pipes_fast_guard_calls;
 			std::vector<BudgetExit> m_budget_exits;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> m_direct_links{};
 			size_t m_linked_entry_offset = static_cast<size_t>(-1);
