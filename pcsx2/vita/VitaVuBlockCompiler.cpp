@@ -75,6 +75,8 @@ u32 g_qemuVuJitLinkedFrameEntries = 0;
 u32 g_qemuVuJitLinkedVectorFrameEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineCommits = 0;
+u32 g_qemuVuJitDeferredFmacFlagEntries = 0;
+u32 g_qemuVuJitDeferredFmacFlagRetirements = 0;
 #endif
 
 namespace VitaVU
@@ -629,6 +631,13 @@ namespace VitaVU
 			// interpreter fmacPipe state at the block seam.
 			bool local_fmac_pipeline = false;
 			u32 local_fmac_pipeline_pairs = 0;
+			// PCSX2 owner: microVU_Flags.inl::mVUsetFlags() retains flag
+			// instances in compiler state until an observer or block seam. Keep
+			// STATUS and MAC in callee-saved A32 registers from block entry and
+			// publish them once at the seam; canonical queue flushes update the
+			// same private instances.
+			bool deferred_fmac_flags = false;
+			u32 deferred_fmac_flag_retirements = 0;
 			bool direct_link_tail = false;
 			std::array<DirectLinkPlan, MAX_DIRECT_LINK_SLOTS> direct_links{};
 			std::array<PairPlan, MAX_BLOCK_PAIRS> pairs{};
@@ -661,6 +670,23 @@ namespace VitaVU
 			}
 
 			return fmac_pairs >= MIN_LOCAL_PAIRS;
+		}
+
+		bool CanDeferLocalFmacFlags(const BlockPlan& block)
+		{
+			const u32 flag_mask = (1u << REG_STATUS_FLAG) |
+				(1u << REG_MAC_FLAG) | (1u << REG_CLIP_FLAG);
+			for (u32 i = 0; i < block.pair_count; i++)
+			{
+				const PairPlan& pair = block.pairs[i];
+				if (pair.ebit || pair.dflag || pair.tflag || pair.lower_flag_inline ||
+					pair.lower_xgkick_inline ||
+					((pair.uregs.VIread | pair.lregs.VIread) & flag_mask) != 0)
+				{
+					return false;
+				}
+			}
+			return true;
 		}
 
 		bool IsImmediateBranchKind(VUInterpFast::LowerFastKind kind)
@@ -1145,7 +1171,16 @@ namespace VitaVU
 				if (block->local_fmac_pipeline)
 				{
 					for (u32 i = 4; i < block->pair_count; i++)
-						block->local_fmac_pipeline_pairs += block->pairs[i].fmac_pipe ? 1u : 0u;
+					{
+						if (!block->pairs[i].fmac_pipe)
+							continue;
+						block->local_fmac_pipeline_pairs++;
+						block->deferred_fmac_flag_retirements +=
+							(i + 4 < block->pair_count) ? 1u : 0u;
+					}
+					block->deferred_fmac_flags =
+						block->deferred_fmac_flag_retirements >= 4 &&
+						CanDeferLocalFmacFlags(*block);
 				}
 			}
 			return block->pair_count != 0;
@@ -1215,7 +1250,9 @@ namespace VitaVU
 		constexpr u32 LOCAL_FMAC_MAC_OFFSET = 8;
 		constexpr u32 LOCAL_FMAC_STATUS_OFFSET = 12;
 		constexpr u32 LOCAL_FMAC_CLIP_OFFSET = 16;
-		constexpr u32 STACK_FRAME_SIZE = 132; // 32-byte VF hazard + 4 local FMAC slots + alignment pad
+		constexpr u32 DEFERRED_LIMIT_SAVE_OFFSET = 128;
+		constexpr u32 STACK_FRAME_SIZE = 140; // hazards + local FMAC slots + saved linked-chain limit
+		constexpr u32 VECTOR_STACK_FRAME_SIZE = 136;
 
 			struct CachedBlock;
 
@@ -1343,6 +1380,8 @@ namespace VitaVU
 				}
 				if (!EmitCanonicalizeLocalFmacPipeline())
 					return false;
+				if (!EmitFinishDeferredFmacFlags())
+					return false;
 
 				// PCSX2 owner: x86/microVU_Compile.inl keeps the micro PC in
 				// compiler state and publishes it at block-management seams. Branch
@@ -1399,7 +1438,8 @@ namespace VitaVU
 					}
 				}
 
-				if (!EmitSharedTestPipesFastGuardThunk() ||
+				if (!EmitSharedTestPipesFastGuardThunk(false) ||
+					!EmitSharedTestPipesFastGuardThunk(true) ||
 					!EmitXgkickNormalizePreserveThunk())
 					return false;
 
@@ -1432,6 +1472,19 @@ namespace VitaVU
 					return false;
 				}
 #endif
+				if (m_plan.deferred_fmac_flags &&
+					!m_code.EmitStrdImm8(HOST_LIMIT_LO, HOST_LIMIT_HI, SP,
+						static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET)))
+				{
+					return false;
+				}
+				if (m_plan.deferred_fmac_flags &&
+					(!m_code.EmitLdrImm12(HOST_LIMIT_LO, HOST_VU,
+							ViOffset(REG_STATUS_FLAG)) ||
+					 !m_code.EmitLdrImm12(HOST_LIMIT_HI, HOST_VU, ViOffset(REG_MAC_FLAG))))
+				{
+					return false;
+				}
 				if (m_resident_cycle &&
 					!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
 						VuOffset(offsetof(VURegs, cycle))))
@@ -1564,7 +1617,7 @@ namespace VitaVU
 				}
 				else if (!m_code.EmitSubImm8(SP, SP, 4) ||
 					!m_code.EmitVpushDRange(8, 8) ||
-					!m_code.EmitSubImm8(SP, SP, 128))
+					!m_code.EmitSubImm8(SP, SP, VECTOR_STACK_FRAME_SIZE))
 				{
 					return false;
 				}
@@ -1573,6 +1626,19 @@ namespace VitaVU
 					!EmitMovReg(HOST_LIMIT_LO, 2) ||
 					!EmitMovReg(HOST_LIMIT_HI, 3) ||
 					!EmitMovReg(HOST_EXEC_BASE, 1))
+				{
+					return false;
+				}
+				if (m_plan.deferred_fmac_flags &&
+					!m_code.EmitStrdImm8(HOST_LIMIT_LO, HOST_LIMIT_HI, SP,
+						static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET)))
+				{
+					return false;
+				}
+				if (m_plan.deferred_fmac_flags &&
+					(!m_code.EmitLdrImm12(HOST_LIMIT_LO, HOST_VU,
+							ViOffset(REG_STATUS_FLAG)) ||
+					 !m_code.EmitLdrImm12(HOST_LIMIT_HI, HOST_VU, ViOffset(REG_MAC_FLAG))))
 				{
 					return false;
 				}
@@ -1595,7 +1661,7 @@ namespace VitaVU
 					return m_code.EmitAddImm8(SP, SP, STACK_FRAME_SIZE) &&
 						m_code.EmitPop(RETURN_REGISTER_MASK);
 
-				return m_code.EmitAddImm8(SP, SP, 128) &&
+				return m_code.EmitAddImm8(SP, SP, VECTOR_STACK_FRAME_SIZE) &&
 					m_code.EmitVpopDRange(8, 8) &&
 					m_code.EmitAddImm8(SP, SP, 4) &&
 					m_code.EmitPop(RETURN_REGISTER_MASK);
@@ -1903,7 +1969,8 @@ namespace VitaVU
 			{
 				if (!m_plan.local_fmac_pipeline)
 					return true;
-				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+				const bool local_counts =
+					m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitLocalFmacPipelineEntries))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
 					m_code.EmitAddImm8(1, 1, 1) &&
@@ -1913,6 +1980,20 @@ namespace VitaVU
 					m_code.EmitLdrImm12(1, 0, 0) &&
 					m_code.EmitAddImm8(1, 1,
 						static_cast<u8>(m_plan.local_fmac_pipeline_pairs)) &&
+					m_code.EmitStrImm12(1, 0, 0);
+				if (!local_counts || !m_plan.deferred_fmac_flags)
+					return local_counts;
+
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitDeferredFmacFlagEntries))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1, 1) &&
+					m_code.EmitStrImm12(1, 0, 0) &&
+					m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitDeferredFmacFlagRetirements))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1,
+						static_cast<u8>(m_plan.deferred_fmac_flag_retirements)) &&
 					m_code.EmitStrImm12(1, 0, 0);
 			}
 
@@ -2197,7 +2278,8 @@ namespace VitaVU
 			}
 #endif
 
-			bool EmitInlineTestPipesFmacFlush(bool full_queue_fast_path)
+			bool EmitInlineTestPipesFmacFlush(bool full_queue_fast_path,
+				bool deferred_fmac_flags)
 			{
 				// PCSX2 owner: VUops.cpp::_vuFMACflush(). Publish all ready
 				// FMAC flag snapshots in queue order, stopping at the first
@@ -2287,14 +2369,17 @@ namespace VitaVU
 				if (no_sticky_status == static_cast<size_t>(-1))
 					return false;
 
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_VU, ViOffset(REG_STATUS_FLAG)) ||
-					!EmitAndRegImm32(HOST_VALUE, HOST_VALUE, 0x30u, HOST_COUNT) ||
+				const unsigned status_reg = deferred_fmac_flags ? HOST_LIMIT_LO : HOST_VALUE;
+				if ((!deferred_fmac_flags &&
+						!m_code.EmitLdrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))) ||
+					!EmitAndRegImm32(status_reg, status_reg, 0x30u, HOST_COUNT) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, statusflag)) ||
 					!EmitAndRegImm32(HOST_INDEX, HOST_TEMP, 0x0fc0u, HOST_COUNT) ||
-					!m_code.EmitOrrReg(HOST_VALUE, HOST_VALUE, HOST_INDEX) ||
+					!m_code.EmitOrrReg(status_reg, status_reg, HOST_INDEX) ||
 					!EmitAndRegImm32(HOST_INDEX, HOST_TEMP, 0x0fu, HOST_COUNT) ||
-					!m_code.EmitOrrReg(HOST_VALUE, HOST_VALUE, HOST_INDEX) ||
-					!m_code.EmitStrImm12(HOST_VALUE, HOST_VU, ViOffset(REG_STATUS_FLAG)))
+					!m_code.EmitOrrReg(status_reg, status_reg, HOST_INDEX) ||
+					(!deferred_fmac_flags &&
+						!m_code.EmitStrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))))
 				{
 					return false;
 				}
@@ -2304,21 +2389,25 @@ namespace VitaVU
 
 				const size_t no_sticky_target = m_code.Size();
 				if (!m_code.PatchBranch(no_sticky_status, no_sticky_target, Condition::EQ) ||
-					!m_code.EmitLdrImm12(HOST_VALUE, HOST_VU, ViOffset(REG_STATUS_FLAG)) ||
-					!EmitAndRegImm32(HOST_VALUE, HOST_VALUE, 0x0ff0u, HOST_COUNT) ||
+					(!deferred_fmac_flags &&
+						!m_code.EmitLdrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))) ||
+					!EmitAndRegImm32(status_reg, status_reg, 0x0ff0u, HOST_COUNT) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, statusflag)) ||
 					!EmitAndRegImm32(HOST_INDEX, HOST_TEMP, 0x0fu, HOST_COUNT) ||
-					!m_code.EmitOrrReg(HOST_VALUE, HOST_VALUE, HOST_INDEX) ||
-					!m_code.EmitOrrRegShiftImm(HOST_VALUE, HOST_VALUE, HOST_INDEX, ShiftType::LSL, 6) ||
-					!m_code.EmitStrImm12(HOST_VALUE, HOST_VU, ViOffset(REG_STATUS_FLAG)))
+					!m_code.EmitOrrReg(status_reg, status_reg, HOST_INDEX) ||
+					!m_code.EmitOrrRegShiftImm(status_reg, status_reg, HOST_INDEX, ShiftType::LSL, 6) ||
+					(!deferred_fmac_flags &&
+						!m_code.EmitStrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))))
 				{
 					return false;
 				}
 
 				const size_t after_status = m_code.Size();
+				const unsigned mac_reg = deferred_fmac_flags ? HOST_LIMIT_HI : HOST_VALUE;
 				if (!m_code.PatchBranch(status_done, after_status) ||
-					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, macflag)) ||
-					!m_code.EmitStrImm12(HOST_VALUE, HOST_VU, ViOffset(REG_MAC_FLAG)) ||
+					!m_code.EmitLdrImm12(mac_reg, HOST_PTR, offsetof(fmacPipe, macflag)) ||
+					(!deferred_fmac_flags &&
+						!m_code.EmitStrImm12(mac_reg, HOST_VU, ViOffset(REG_MAC_FLAG))) ||
 					!m_code.EmitLdrImm12(HOST_INDEX, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
 					!m_code.EmitAddImm8(HOST_INDEX, HOST_INDEX, 1) ||
 					!m_code.EmitAndImm32(HOST_INDEX, HOST_INDEX, 3) ||
@@ -2347,7 +2436,7 @@ namespace VitaVU
 					m_code.PatchBranch(done_not_ready, done_target, Condition::CC);
 			}
 
-				bool EmitInlineTestPipesFdivFlush()
+				bool EmitInlineTestPipesFdivFlush(bool deferred_fmac_flags)
 				{
 				// PCSX2 owner: VUops.cpp::_vuFDIVflush(). FDIV publication
 				// exposes Q and FDIV-owned D/I status bits when the pipe latency
@@ -2386,13 +2475,20 @@ namespace VitaVU
 					!m_code.EmitMovImm8(0, 0) ||
 					!m_code.EmitStrImm12(0, HOST_VU, VuOffset(base + offsetof(fdivPipe, enable))) ||
 					!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(base + offsetof(fdivPipe, reg))) ||
-					!m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_Q)) ||
-					!m_code.EmitLdrImm12(0, HOST_VU, ViOffset(REG_STATUS_FLAG)) ||
-					!EmitAndRegImm32(0, 0, 0x0fcfu, HOST_CALL_SCRATCH) ||
+					!m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_Q)))
+				{
+					return false;
+				}
+
+				const unsigned status_reg = deferred_fmac_flags ? HOST_LIMIT_LO : 0;
+				if ((!deferred_fmac_flags &&
+						!m_code.EmitLdrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))) ||
+					!EmitAndRegImm32(status_reg, status_reg, 0x0fcfu, HOST_CALL_SCRATCH) ||
 					!m_code.EmitLdrImm12(1, HOST_VU, VuOffset(base + offsetof(fdivPipe, statusflag))) ||
 					!EmitAndRegImm32(1, 1, 0x0c30u, HOST_CALL_SCRATCH) ||
-					!m_code.EmitOrrReg(0, 0, 1) ||
-					!m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_STATUS_FLAG)))
+					!m_code.EmitOrrReg(status_reg, status_reg, 1) ||
+					(!deferred_fmac_flags &&
+						!m_code.EmitStrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))))
 				{
 					return false;
 				}
@@ -2571,7 +2667,7 @@ namespace VitaVU
 					return m_code.PatchBranch(done_disabled, m_code.Size(), Condition::EQ);
 				}
 
-				bool EmitTestPipesFastGuardBody(bool shared_thunk)
+				bool EmitTestPipesFastGuardBody(bool shared_thunk, bool deferred_fmac_flags)
 				{
 					// PCSX2 owner: VUops.cpp::_vuTestPipes(). The generated path
 					// handles FMAC, FDIV, EFU, IALU, then XGKICK in helper order.
@@ -2581,9 +2677,9 @@ namespace VitaVU
 						return false;
 					}
 
-					if (!EmitInlineTestPipesFmacFlush(shared_thunk))
+					if (!EmitInlineTestPipesFmacFlush(shared_thunk, deferred_fmac_flags))
 						return false;
-					if (!EmitInlineTestPipesFdivFlush())
+					if (!EmitInlineTestPipesFdivFlush(deferred_fmac_flags))
 						return false;
 					if (!EmitInlineTestPipesEfuFlush())
 						return false;
@@ -2600,7 +2696,7 @@ namespace VitaVU
 					return true;
 				}
 
-				bool EmitTestPipesFastGuard()
+				bool EmitTestPipesFastGuard(bool deferred_fmac_flags)
 				{
 					// PCSX2 microVU keeps pipeline scheduling outside individual
 					// opcode bodies. On Cortex-A9, duplicating this large exact
@@ -2608,22 +2704,25 @@ namespace VitaVU
 					// than the 32 KiB L1 I-cache can retain. Multi-pair blocks call one
 					// block-local copy; single-pair blocks remain inline.
 					if (m_plan.pair_count < 2)
-						return EmitTestPipesFastGuardBody(false);
+						return EmitTestPipesFastGuardBody(false, deferred_fmac_flags);
 
 					const size_t call_site = m_code.EmitBranchLinkPlaceholder();
 					if (call_site == static_cast<size_t>(-1))
 						return false;
-					m_test_pipes_fast_guard_calls.push_back(call_site);
+					(deferred_fmac_flags ? m_deferred_test_pipes_fast_guard_calls :
+						m_test_pipes_fast_guard_calls).push_back(call_site);
 					return true;
 				}
 
-				bool EmitSharedTestPipesFastGuardThunk()
+				bool EmitSharedTestPipesFastGuardThunk(bool deferred_fmac_flags)
 				{
-					if (m_test_pipes_fast_guard_calls.empty())
+					std::vector<size_t>& calls = deferred_fmac_flags ?
+						m_deferred_test_pipes_fast_guard_calls : m_test_pipes_fast_guard_calls;
+					if (calls.empty())
 						return true;
 
 					const size_t thunk_offset = m_code.Size();
-					for (const size_t call_site : m_test_pipes_fast_guard_calls)
+					for (const size_t call_site : calls)
 					{
 						if (!m_code.PatchBranchLink(call_site, thunk_offset))
 							return false;
@@ -2632,7 +2731,7 @@ namespace VitaVU
 					// r10 is dead after each pair's stall tests and is callee-saved
 					// across the only possible C++ call (_vuXGKICKTransfer).
 					return EmitMovReg(HOST_STALL_SCRATCH, 14) &&
-						EmitTestPipesFastGuardBody(true) &&
+						EmitTestPipesFastGuardBody(true, deferred_fmac_flags) &&
 						m_code.EmitBx(HOST_STALL_SCRATCH);
 				}
 
@@ -7462,6 +7561,42 @@ namespace VitaVU
 					return false;
 				}
 
+				if (m_plan.deferred_fmac_flags)
+				{
+					// PCSX2 owner: VUops.cpp::_vuFMACflush(). r6/r7 are the
+					// block-private STATUS/MAC instances loaded at block entry.
+					// Preserve the sticky/non-sticky STATUS formulas exactly, but do not
+					// round-trip either flag through VURegs for every retired pair.
+					if ((flagreg & (1u << REG_STATUS_FLAG)) != 0)
+					{
+						if (!EmitAndRegImm32(HOST_LIMIT_LO, HOST_LIMIT_LO, 0x30u,
+								HOST_CALL_SCRATCH) ||
+							!m_code.EmitLdrImm12(0, SP,
+								LocalFmacOffset(entry, LOCAL_FMAC_STATUS_OFFSET)) ||
+							!EmitAndRegImm32(1, 0, 0xfc0u, HOST_CALL_SCRATCH) ||
+							!m_code.EmitOrrReg(HOST_LIMIT_LO, HOST_LIMIT_LO, 1) ||
+							!EmitAndRegImm32(0, 0, 0x0fu, HOST_CALL_SCRATCH) ||
+							!m_code.EmitOrrReg(HOST_LIMIT_LO, HOST_LIMIT_LO, 0))
+						{
+							return false;
+						}
+					}
+					else if (!EmitAndRegImm32(HOST_LIMIT_LO, HOST_LIMIT_LO, 0xff0u,
+							HOST_CALL_SCRATCH) ||
+						!m_code.EmitLdrImm12(0, SP,
+							LocalFmacOffset(entry, LOCAL_FMAC_STATUS_OFFSET)) ||
+						!EmitAndRegImm32(0, 0, 0x0fu, HOST_CALL_SCRATCH) ||
+						!m_code.EmitOrrReg(HOST_LIMIT_LO, HOST_LIMIT_LO, 0) ||
+						!m_code.EmitOrrRegShiftImm(HOST_LIMIT_LO, HOST_LIMIT_LO, 0,
+							ShiftType::LSL, 6))
+					{
+						return false;
+					}
+
+					return m_code.EmitLdrImm12(HOST_LIMIT_HI, SP,
+						LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET));
+				}
+
 				if ((flagreg & (1u << REG_STATUS_FLAG)) != 0)
 				{
 					if (!m_code.EmitLdrImm12(0, HOST_VU, ViOffset(REG_STATUS_FLAG)) ||
@@ -7492,6 +7627,18 @@ namespace VitaVU
 
 				return m_code.EmitLdrImm12(0, SP, LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET)) &&
 					m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_MAC_FLAG));
+			}
+
+			bool EmitFinishDeferredFmacFlags()
+			{
+				if (!m_plan.deferred_fmac_flags)
+					return true;
+
+				return m_code.EmitStrImm12(HOST_LIMIT_LO, HOST_VU,
+						ViOffset(REG_STATUS_FLAG)) &&
+					m_code.EmitStrImm12(HOST_LIMIT_HI, HOST_VU, ViOffset(REG_MAC_FLAG)) &&
+					m_code.EmitLdrdImm8(HOST_LIMIT_LO, HOST_LIMIT_HI, SP,
+						static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET));
 			}
 
 			bool EmitRetireLocalFmacEntries(u32 pair_index)
@@ -7769,8 +7916,20 @@ namespace VitaVU
 					const size_t skip_entry_check = m_code.EmitBranchPlaceholder(Condition::EQ);
 					if (skip_entry_check == static_cast<size_t>(-1))
 						return false;
-					if (!m_code.EmitCmpReg(1, HOST_LIMIT_HI) ||
-						!m_code.EmitCmpReg(0, HOST_LIMIT_LO, Condition::EQ))
+					unsigned limit_lo = HOST_LIMIT_LO;
+					unsigned limit_hi = HOST_LIMIT_HI;
+					if (m_plan.deferred_fmac_flags)
+					{
+						limit_lo = 2;
+						limit_hi = 3;
+						if (!m_code.EmitLdrdImm8(limit_lo, limit_hi, SP,
+								static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET)))
+						{
+							return false;
+						}
+					}
+					if (!m_code.EmitCmpReg(1, limit_hi) ||
+						!m_code.EmitCmpReg(0, limit_lo, Condition::EQ))
 					{
 						return false;
 					}
@@ -7801,10 +7960,22 @@ namespace VitaVU
 					// The linked-entry stub has refreshed HOST_CYCLE_LO. Compare
 					// the full 64-bit cycle so a preceding block's permitted
 					// overshoot cannot enter another block.
+					unsigned limit_lo = HOST_LIMIT_LO;
+					unsigned limit_hi = HOST_LIMIT_HI;
+					if (m_plan.deferred_fmac_flags)
+					{
+						limit_lo = 2;
+						limit_hi = 3;
+						if (!m_code.EmitLdrdImm8(limit_lo, limit_hi, SP,
+								static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET)))
+						{
+							return false;
+						}
+					}
 					if (!m_code.EmitLdrImm12(0, HOST_VU,
 							VuOffset(offsetof(VURegs, cycle) + 4)) ||
-						!m_code.EmitCmpReg(0, HOST_LIMIT_HI) ||
-						!m_code.EmitCmpReg(HOST_CYCLE_LO, HOST_LIMIT_LO, Condition::EQ))
+						!m_code.EmitCmpReg(0, limit_hi) ||
+						!m_code.EmitCmpReg(HOST_CYCLE_LO, limit_lo, Condition::EQ))
 						return false;
 					const size_t exit_site = m_code.EmitBranchPlaceholder(Condition::CS);
 					if (exit_site == static_cast<size_t>(-1))
@@ -8042,7 +8213,7 @@ namespace VitaVU
 				}
 				if (plan.test_pipes_fast_guard)
 				{
-					if (!EmitTestPipesFastGuard())
+					if (!EmitTestPipesFastGuard(m_plan.deferred_fmac_flags))
 						return false;
 				}
 				else if (!EmitCallHelper(reinterpret_cast<const void*>(&_vuTestPipes)))
@@ -8301,6 +8472,7 @@ namespace VitaVU
 			bool m_norm_maxf_ready = false;
 			std::vector<size_t> m_xgkick_norm_preserve_calls;
 			std::vector<size_t> m_test_pipes_fast_guard_calls;
+			std::vector<size_t> m_deferred_test_pipes_fast_guard_calls;
 			std::vector<BudgetExit> m_budget_exits;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> m_direct_links{};
 			size_t m_linked_entry_offset = static_cast<size_t>(-1);
@@ -8853,6 +9025,12 @@ namespace VitaVU
 							s_vu1.stats.local_fmac_pipeline_blocks++;
 							s_vu1.stats.local_fmac_pipeline_pairs +=
 								plan.local_fmac_pipeline_pairs;
+						}
+						if (plan.deferred_fmac_flags)
+						{
+							s_vu1.stats.deferred_fmac_flag_blocks++;
+							s_vu1.stats.deferred_fmac_flag_retirements +=
+								plan.deferred_fmac_flag_retirements;
 						}
 						const BlockCompiler::VectorCacheStats& vector_stats = chosen_vector_stats;
 						if (vector_cache_candidate)
@@ -9543,6 +9721,9 @@ namespace VitaVU
 			static_cast<u64>(g_qemuVuJitLinkedVectorFrameEntries) * 32;
 		stats.local_fmac_pipeline_entries = g_qemuVuJitLocalFmacPipelineEntries;
 		stats.local_fmac_pipeline_commits = g_qemuVuJitLocalFmacPipelineCommits;
+		stats.deferred_fmac_flag_entries = g_qemuVuJitDeferredFmacFlagEntries;
+		stats.deferred_fmac_flag_runtime_retirements =
+			g_qemuVuJitDeferredFmacFlagRetirements;
 #endif
 		return stats;
 	}
@@ -9554,6 +9735,8 @@ namespace VitaVU
 		g_qemuVuJitLinkedVectorFrameEntries = 0;
 		g_qemuVuJitLocalFmacPipelineEntries = 0;
 		g_qemuVuJitLocalFmacPipelineCommits = 0;
+		g_qemuVuJitDeferredFmacFlagEntries = 0;
+		g_qemuVuJitDeferredFmacFlagRetirements = 0;
 #endif
 		const size_t used = s_vu1.stats.code_cache_used;
 		const size_t capacity = s_vu1.stats.code_cache_capacity;

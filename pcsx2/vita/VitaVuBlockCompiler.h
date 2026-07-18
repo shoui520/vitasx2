@@ -33,6 +33,10 @@ namespace VitaVU
 		u32 local_fmac_pipeline_pairs = 0;
 		u64 local_fmac_pipeline_entries = 0;
 		u64 local_fmac_pipeline_commits = 0;
+		u32 deferred_fmac_flag_blocks = 0;
+		u32 deferred_fmac_flag_retirements = 0;
+		u64 deferred_fmac_flag_entries = 0;
+		u64 deferred_fmac_flag_runtime_retirements = 0;
 		u32 test_pipes_fast_guard_pairs = 0;
 		u32 fmac_clear_inline_pairs = 0;
 		u32 upper_fmac_stall_test_inline_pairs = 0;
