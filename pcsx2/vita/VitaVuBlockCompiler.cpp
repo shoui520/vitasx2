@@ -1284,12 +1284,19 @@ namespace VitaVU
 						return false;
 				}
 
+				// PCSX2 owner: x86/microVU_Compile.inl keeps the micro PC in
+				// compiler state and publishes it at block-management seams. Branch
+				// lowering below consumes the compile-time post-increment PC, while a
+				// branch-tail pair publishes its runtime-selected target itself.
+				if (!EmitPublishPairTpc(m_plan.pair_count))
+					return false;
+
 				// PCSX2 owner: x86/microVU_Compile.inl keeps the decoded opcode in
 				// compiler state and publishes architectural state at block-management
 				// seams. No native op or stall helper observes VURegs::code between
 				// pairs, so materialize its final value once before a dispatcher return
-				// or direct link instead of emitting MOV+STR for every pair. TPC remains
-				// pair-visible below because the current branch/link contract consumes it.
+				// or direct link instead of emitting MOV+STR for every pair.
+				// TPC follows the separate block-private publication contract above.
 				if (!EmitPublishPairCode(m_plan.pair_count))
 					return false;
 
@@ -1319,7 +1326,8 @@ namespace VitaVU
 					const size_t stub_offset = m_code.Size();
 					if (!m_code.PatchBranch(exit.branch_site, stub_offset, exit.condition))
 						return false;
-					if (!EmitPublishPairCode(exit.executed_pairs) ||
+					if (!EmitPublishPairTpc(exit.executed_pairs) ||
+						!EmitPublishPairCode(exit.executed_pairs) ||
 						!EmitPublishResidentCycle() ||
 						!EmitReturnExecutedPairs(exit.executed_pairs))
 						return false;
@@ -1581,6 +1589,21 @@ namespace VitaVU
 					(last.shape == PairShape::IBit) ? last.upper : last.lower;
 				return m_code.EmitMovImm32(0, final_code) &&
 					m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, code)));
+			}
+
+			bool EmitPublishPairTpc(u32 executed_pairs)
+			{
+				if (executed_pairs == 0)
+					return true;
+
+				const PairPlan& last = m_pairs[executed_pairs - 1];
+				// EmitBranchTail() publishes either the sequential PC or the exact
+				// runtime-selected branch target, including branch-in-delay handoff.
+				if (last.branch_tail)
+					return true;
+
+				return m_code.EmitMovImm32(0, last.pc + 8) &&
+					m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_TPC));
 			}
 
 			bool EmitReturnExecutedPairs(u32 executed_pairs,
@@ -5065,16 +5088,16 @@ namespace VitaVU
 					m_code.EmitSxth(rd, rd);
 			}
 
-			bool EmitBranchAddressToR0(u32 code)
+			bool EmitBranchAddressToR0(u32 code, u32 postincrement_tpc)
 			{
 				// PCSX2 owner: VUops.cpp::_branchAddr() /
-				// VUmicroFast.h::BranchAddress(). The block has already stored
-				// this step's post-increment byte TPC.
+				// VUmicroFast.h::BranchAddress(). Sony's VU contract defines the
+				// target relative to the branch delay-slot address, which is this
+				// compile-time post-increment byte TPC.
 				const s32 byte_offset = static_cast<s32>(VUInterpFast::Imm11(code)) * 8;
 				const u32 prog_mask = m_vu0_memory_map ? VU0_PROGMASK : VU1_PROGMASK;
-				return EmitLoadViWordRaw(0, REG_TPC) &&
-					EmitAddSignedImmToR0(byte_offset) &&
-					EmitAndRegImm32(0, 0, prog_mask, 1);
+				return m_code.EmitMovImm32(0,
+					(static_cast<u32>(static_cast<s32>(postincrement_tpc) + byte_offset) & prog_mask));
 			}
 
 			bool EmitSetBranchFromReg(unsigned bpc_reg)
@@ -5114,7 +5137,7 @@ namespace VitaVU
 				return m_code.PatchBranch(done, m_code.Size());
 			}
 
-			bool EmitWriteBranchLink(unsigned reg)
+			bool EmitWriteBranchLink(unsigned reg, u32 postincrement_tpc)
 			{
 				if (reg == 0)
 					return true;
@@ -5127,8 +5150,8 @@ namespace VitaVU
 				{
 					return false;
 				}
-				const size_t use_tpc = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (use_tpc == static_cast<size_t>(-1))
+				const size_t use_static_tpc = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (use_static_tpc == static_cast<size_t>(-1))
 					return false;
 
 				if (!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, branchpc))))
@@ -5137,9 +5160,9 @@ namespace VitaVU
 				if (have_base == static_cast<size_t>(-1))
 					return false;
 
-				const size_t use_tpc_target = m_code.Size();
-				if (!m_code.PatchBranch(use_tpc, use_tpc_target, Condition::NE) ||
-					!EmitLoadViWordRaw(0, REG_TPC))
+				const size_t use_static_tpc_target = m_code.Size();
+				if (!m_code.PatchBranch(use_static_tpc, use_static_tpc_target, Condition::NE) ||
+					!m_code.EmitMovImm32(0, postincrement_tpc + 8))
 				{
 					return false;
 				}
@@ -5151,13 +5174,14 @@ namespace VitaVU
 					EmitStoreViHalfword(0, reg);
 			}
 
-			bool EmitSetBranchWhenCondition(u32 code, Condition skip_condition)
+			bool EmitSetBranchWhenCondition(u32 code, u32 postincrement_tpc,
+				Condition skip_condition)
 			{
 				const size_t skip = m_code.EmitBranchPlaceholder(skip_condition);
 				if (skip == static_cast<size_t>(-1))
 					return false;
 
-				if (!EmitBranchAddressToR0(code) ||
+				if (!EmitBranchAddressToR0(code, postincrement_tpc) ||
 					!EmitSetBranchFromReg(0))
 				{
 					return false;
@@ -5166,7 +5190,8 @@ namespace VitaVU
 				return m_code.PatchBranch(skip, m_code.Size(), skip_condition);
 			}
 
-			bool EmitInlineLowerBranch(u32 code, VUInterpFast::LowerFastKind kind)
+			bool EmitInlineLowerBranch(u32 code, u32 postincrement_tpc,
+				VUInterpFast::LowerFastKind kind)
 			{
 				bool emitted_body = true;
 
@@ -5181,7 +5206,7 @@ namespace VitaVU
 							EmitLoadViBranchOperand(0, VUInterpFast::It(code)) &&
 							EmitLoadViBranchOperand(1, VUInterpFast::Is(code)) &&
 							m_code.EmitCmpReg(0, 1) &&
-							EmitSetBranchWhenCondition(code, Condition::NE);
+							EmitSetBranchWhenCondition(code, postincrement_tpc, Condition::NE);
 						break;
 
 					case VUInterpFast::LowerFastKind::IBNE:
@@ -5189,47 +5214,47 @@ namespace VitaVU
 							EmitLoadViBranchOperand(0, VUInterpFast::It(code)) &&
 							EmitLoadViBranchOperand(1, VUInterpFast::Is(code)) &&
 							m_code.EmitCmpReg(0, 1) &&
-							EmitSetBranchWhenCondition(code, Condition::EQ);
+							EmitSetBranchWhenCondition(code, postincrement_tpc, Condition::EQ);
 						break;
 
 					case VUInterpFast::LowerFastKind::IBLTZ:
 						emitted_body =
 							EmitLoadViBranchOperand(0, VUInterpFast::Is(code)) &&
 							m_code.EmitCmpImm32(0, 0) &&
-							EmitSetBranchWhenCondition(code, Condition::GE);
+							EmitSetBranchWhenCondition(code, postincrement_tpc, Condition::GE);
 						break;
 
 					case VUInterpFast::LowerFastKind::IBGTZ:
 						emitted_body =
 							EmitLoadViBranchOperand(0, VUInterpFast::Is(code)) &&
 							m_code.EmitCmpImm32(0, 0) &&
-							EmitSetBranchWhenCondition(code, Condition::LE);
+							EmitSetBranchWhenCondition(code, postincrement_tpc, Condition::LE);
 						break;
 
 					case VUInterpFast::LowerFastKind::IBLEZ:
 						emitted_body =
 							EmitLoadViBranchOperand(0, VUInterpFast::Is(code)) &&
 							m_code.EmitCmpImm32(0, 0) &&
-							EmitSetBranchWhenCondition(code, Condition::GT);
+							EmitSetBranchWhenCondition(code, postincrement_tpc, Condition::GT);
 						break;
 
 					case VUInterpFast::LowerFastKind::IBGEZ:
 						emitted_body =
 							EmitLoadViBranchOperand(0, VUInterpFast::Is(code)) &&
 							m_code.EmitCmpImm32(0, 0) &&
-							EmitSetBranchWhenCondition(code, Condition::LT);
+							EmitSetBranchWhenCondition(code, postincrement_tpc, Condition::LT);
 						break;
 
 					case VUInterpFast::LowerFastKind::B:
 						emitted_body =
-							EmitBranchAddressToR0(code) &&
+							EmitBranchAddressToR0(code, postincrement_tpc) &&
 							EmitSetBranchFromReg(0);
 						break;
 
 					case VUInterpFast::LowerFastKind::BAL:
 						emitted_body =
-							EmitWriteBranchLink(VUInterpFast::It(code)) &&
-							EmitBranchAddressToR0(code) &&
+							EmitWriteBranchLink(VUInterpFast::It(code), postincrement_tpc) &&
+							EmitBranchAddressToR0(code, postincrement_tpc) &&
 							EmitSetBranchFromReg(0);
 						break;
 
@@ -5244,7 +5269,7 @@ namespace VitaVU
 						emitted_body =
 							EmitLoadViHalfwordRaw(2, VUInterpFast::Is(code)) &&
 							m_code.EmitMovRegShiftImm(2, 2, ShiftType::LSL, 3) &&
-							EmitWriteBranchLink(VUInterpFast::It(code)) &&
+							EmitWriteBranchLink(VUInterpFast::It(code), postincrement_tpc) &&
 							EmitSetBranchFromReg(2);
 						break;
 
@@ -7440,10 +7465,15 @@ namespace VitaVU
 
 			// PCSX2 owner: _vu0Exec()/_vu1Exec() per-step branch-delay countdown,
 			// including the branch-in-delay-slot takedelaybranch handoff.
-			bool EmitBranchTail()
+			bool EmitBranchTail(u32 sequential_tpc)
 			{
 				const u16 branch = VuOffset(offsetof(VURegs, branch));
-				if (!m_code.EmitLdrImm12(0, HOST_VU, branch) ||
+				// The interpreter writes the sequential post-increment TPC before
+				// branch countdown. Publish that value here, then overwrite it only
+				// when this pair resolves a taken branch.
+				if (!m_code.EmitMovImm32(1, sequential_tpc) ||
+					!m_code.EmitStrImm12(1, HOST_VU, ViOffset(REG_TPC)) ||
+					!m_code.EmitLdrImm12(0, HOST_VU, branch) ||
 					!m_code.EmitCmpImm32(0, 0))
 				{
 					return false;
@@ -7523,15 +7553,6 @@ namespace VitaVU
 
 				if (!EmitBudgetCheckAndCycleIncrement(pair_index))
 					return false;
-
-				// VU branch/link lowering consumes the architectural post-increment
-				// TPC during the pair. Keep its interpreter cadence until that state is
-				// made block-private as part of the branch mapping contract.
-				if (!m_code.EmitMovImm32(0, plan.pc + 8) ||
-					!m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_TPC)))
-				{
-					return false;
-				}
 
 				// E flag decode, compile-time: VU->ebit = 2.
 				if (plan.ebit)
@@ -7720,7 +7741,8 @@ namespace VitaVU
 					return false;
 				}
 				else if (plan.exec_lower && plan.lower_branch_inline &&
-					!EmitInlineLowerBranch(plan.lower, static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind)))
+					!EmitInlineLowerBranch(plan.lower, plan.pc + 8,
+						static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind)))
 				{
 					return false;
 				}
@@ -7775,7 +7797,7 @@ namespace VitaVU
 					return false;
 				}
 
-				if (plan.branch_tail && !EmitBranchTail())
+				if (plan.branch_tail && !EmitBranchTail(plan.pc + 8))
 					return false;
 
 				size_t skip_static_ebit = static_cast<size_t>(-1);
