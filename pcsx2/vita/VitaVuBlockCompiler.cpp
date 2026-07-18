@@ -3546,8 +3546,14 @@ namespace VitaVU
 					m_code.PatchBranch(done_special, done);
 			}
 
-			bool EmitUpdateStatusFromMacReg(unsigned mac_reg, unsigned status_reg, unsigned temp_reg)
+			bool EmitUpdateStatusFromMacReg(unsigned mac_reg, unsigned status_reg, unsigned /*temp_reg*/)
 			{
+				// PCSX2 owner: VUflags.cpp::VU_STAT_UPDATE(). Each MAC nibble
+				// contributes one Status bit when any of its four XYZW lanes is
+				// set. A32 conditional execution maps the four PCSX2 tests directly:
+				// no branch and no temporary zero/materialize/merge sequence. Keeping
+				// the tests independent also avoids the long dependent shift chain
+				// which measured slower on the real Cortex-A9 despite smaller code.
 				if (!m_code.EmitMovImm8(status_reg, 0))
 					return false;
 
@@ -3561,9 +3567,7 @@ namespace VitaVU
 				for (const auto& [mask, bit] : groups)
 				{
 					if (!m_code.EmitTstImm32(mac_reg, mask) ||
-						!m_code.EmitMovImm8(temp_reg, 0) ||
-						!m_code.EmitMovImm8(temp_reg, bit, Condition::NE) ||
-						!m_code.EmitOrrReg(status_reg, status_reg, temp_reg))
+						!m_code.EmitOrrImm32(status_reg, status_reg, bit, false, Condition::NE))
 					{
 						return false;
 					}

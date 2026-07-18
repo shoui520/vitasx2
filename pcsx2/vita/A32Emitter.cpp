@@ -795,7 +795,8 @@ namespace VitaA32
 		return EmitU32(EncodeOrrImm8(rd, rn, value, set_flags));
 	}
 
-	bool CodeBuffer::EmitOrrImm32(unsigned rd, unsigned rn, u32 value, bool set_flags)
+	bool CodeBuffer::EmitOrrImm32(unsigned rd, unsigned rn, u32 value, bool set_flags,
+		Condition condition)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
@@ -806,7 +807,7 @@ namespace VitaA32
 		if (!EncodeModifiedImmediate(value, &encoded))
 			return false;
 
-		return EmitU32(CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_ORR |
+		return EmitU32(CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_ORR |
 					   (set_flags ? SET_FLAGS : 0) | ((rn & 0xfu) << 16) |
 					   ((rd & 0xfu) << 12) | encoded);
 	}
