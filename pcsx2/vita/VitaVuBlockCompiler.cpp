@@ -1284,6 +1284,15 @@ namespace VitaVU
 						return false;
 				}
 
+				// PCSX2 owner: x86/microVU_Compile.inl keeps the decoded opcode in
+				// compiler state and publishes architectural state at block-management
+				// seams. No native op or stall helper observes VURegs::code between
+				// pairs, so materialize its final value once before a dispatcher return
+				// or direct link instead of emitting MOV+STR for every pair. TPC remains
+				// pair-visible below because the current branch/link contract consumes it.
+				if (!EmitPublishPairCode(m_plan.pair_count))
+					return false;
+
 				// Block-local vector mappings never cross an externally observable
 				// seam. PCSX2 owner: x86/microVU_IR.h::microRegAlloc::flushAll().
 				if (!EmitFlushVectorCache())
@@ -1310,7 +1319,8 @@ namespace VitaVU
 					const size_t stub_offset = m_code.Size();
 					if (!m_code.PatchBranch(exit.branch_site, stub_offset, exit.condition))
 						return false;
-					if (!EmitPublishResidentCycle() ||
+					if (!EmitPublishPairCode(exit.executed_pairs) ||
+						!EmitPublishResidentCycle() ||
 						!EmitReturnExecutedPairs(exit.executed_pairs))
 						return false;
 					const size_t jump = m_code.EmitBranchPlaceholder();
@@ -1559,6 +1569,18 @@ namespace VitaVU
 				return !m_resident_cycle ||
 					m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
 						VuOffset(offsetof(VURegs, cycle)));
+			}
+
+			bool EmitPublishPairCode(u32 executed_pairs)
+			{
+				if (executed_pairs == 0)
+					return true;
+
+				const PairPlan& last = m_pairs[executed_pairs - 1];
+				const u32 final_code =
+					(last.shape == PairShape::IBit) ? last.upper : last.lower;
+				return m_code.EmitMovImm32(0, final_code) &&
+					m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, code)));
 			}
 
 			bool EmitReturnExecutedPairs(u32 executed_pairs,
@@ -7502,7 +7524,9 @@ namespace VitaVU
 				if (!EmitBudgetCheckAndCycleIncrement(pair_index))
 					return false;
 
-				// VU->VI[REG_TPC].UL += 8, as a compile-time constant.
+				// VU branch/link lowering consumes the architectural post-increment
+				// TPC during the pair. Keep its interpreter cadence until that state is
+				// made block-private as part of the branch mapping contract.
 				if (!m_code.EmitMovImm32(0, plan.pc + 8) ||
 					!m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_TPC)))
 				{
@@ -7529,17 +7553,6 @@ namespace VitaVU
 				if (plan.tflag && !(m_vu0_memory_map ?
 					EmitInlineDtFlag(0x8u, 0x4u, INTC_VU0) :
 					EmitInlineDtFlag(0x800u, 0x400u, INTC_VU1)))
-				{
-					return false;
-				}
-
-				// VU->code ends every interpreter step holding the lower word,
-				// except I-bit steps which keep the upper word. Nothing in the
-				// fast op bodies or stall helpers reads it mid-step, so one
-				// store of the final value is exact.
-				const u32 final_code = (plan.shape == PairShape::IBit) ? plan.upper : plan.lower;
-				if (!m_code.EmitMovImm32(0, final_code) ||
-					!m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, code))))
 				{
 					return false;
 				}
