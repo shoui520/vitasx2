@@ -43,6 +43,7 @@ u32 g_qemuVuJitTestPipesFmacFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesFdivFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesEfuFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesXgkickTransferInlineOps = 0;
+u32 g_qemuVuJitNopPipeTestDeferrals = 0;
 u32 g_qemuVuJitNormConstantMaterializations = 0;
 u32 g_qemuVuJitFmacClearInlineOps = 0;
 u32 g_qemuVuJitUpperFmacStallTestInlineOps = 0;
@@ -538,6 +539,7 @@ namespace VitaVU
 			bool add_lower_stalls = false;
 			bool fmac_pipe = false;
 			bool test_pipes_fast_guard = false;
+			bool defer_nop_pipe_test = false;
 			bool upper_fmac_stall_test_inline = false;
 			bool lower_fmac_stall_test_inline = false;
 			bool upper_unary_inline = false;
@@ -596,6 +598,7 @@ namespace VitaVU
 			// or a D/T pair whose runtime FBRST condition did not stop the VU).
 			bool continues_logical_block_if_busy = false;
 			u32 test_pipes_fast_guard_pairs = 0;
+			u32 nop_pipe_test_defer_pairs = 0;
 			u32 fmac_clear_inline_pairs = 0;
 			u32 upper_fmac_stall_test_inline_pairs = 0;
 			u32 lower_fmac_stall_test_inline_pairs = 0;
@@ -927,6 +930,17 @@ namespace VitaVU
 			return false;
 		}
 
+		bool IsUnobservableNopPair(const PairPlan& plan)
+		{
+			// PCSX2 owners: VU1microInterp.cpp::_vu1IsUpperNop()/
+			// _vu1IsLowerNop() and x86/microVU_Compile.inl::mVUincCycles().
+			// A pair is an empty scheduling slot only when neither half executes and
+			// no pair flag, branch-delay, or E-bit seam has architectural work.
+			return plan.shape == PairShape::UpperNop && !plan.exec_upper && !plan.exec_lower &&
+				!plan.ebit && !plan.mflag && !plan.dflag && !plan.tflag &&
+				!plan.branch_tail && !plan.ebit_tail && !plan.ends_block;
+		}
+
 		// Scans a straight-line pair run from start_pc, statically simulating
 		// _vu0Exec()/_vu1Exec() branch-delay and E-bit windows. Entry contract
 		// (checked by the dispatcher): ebit is 0 or 1 and branch is either 0 for
@@ -941,6 +955,7 @@ namespace VitaVU
 			block->entry_ebit_tail = entry_ebit_tail;
 			block->continues_logical_block_if_busy = false;
 			block->test_pipes_fast_guard_pairs = 0;
+			block->nop_pipe_test_defer_pairs = 0;
 			block->fmac_clear_inline_pairs = 0;
 			block->upper_fmac_stall_test_inline_pairs = 0;
 			block->lower_fmac_stall_test_inline_pairs = 0;
@@ -1100,6 +1115,26 @@ namespace VitaVU
 
 			if (block->pair_count == 0)
 				return false;
+
+			// PCSX2 microVU advances compile-time pipe state through unobservable
+			// scheduling slots instead of publishing every intermediate cycle. Keep
+			// the final NOP in each run canonical so every real consumer and every
+			// generated-code seam sees the exact VUops.cpp pipeline state. VU0 stays
+			// conservative until its COP2 macro visibility contract is represented by
+			// the same compile-time pipeline model.
+			if (!conservative_vu0)
+			{
+				for (u32 i = 0; i + 1 < block->pair_count; i++)
+				{
+					PairPlan& current = block->pairs[i];
+					const PairPlan& next = block->pairs[i + 1];
+					if (IsUnobservableNopPair(current) && IsUnobservableNopPair(next))
+					{
+						current.defer_nop_pipe_test = true;
+						block->nop_pipe_test_defer_pairs++;
+					}
+				}
+			}
 
 			block->resident_cycle = resident_cycle;
 			if (block->pair_count != 0)
@@ -2110,6 +2145,15 @@ namespace VitaVU
 						m_code.EmitStrImm12(1, 0, 0);
 				}
 
+				bool EmitQemuNopPipeTestDeferralCounter()
+				{
+					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitNopPipeTestDeferrals))) &&
+						m_code.EmitLdrImm12(1, 0, 0) &&
+						m_code.EmitAddImm8(1, 1, 1) &&
+						m_code.EmitStrImm12(1, 0, 0);
+				}
+
 				bool EmitQemuFmacClearInlineCounter()
 				{
 					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitFmacClearInlineOps))) &&
@@ -2761,6 +2805,40 @@ namespace VitaVU
 					(deferred_fmac_flags ? m_deferred_test_pipes_fast_guard_calls :
 						m_test_pipes_fast_guard_calls).push_back(call_site);
 					return true;
+				}
+
+				bool EmitDeferredNopPipeTest(bool deferred_fmac_flags)
+				{
+					// Publishing FMAC/FDIV/EFU/IALU state may move to the next empty
+					// pair because no VU instruction can observe it there. XGKICK is
+					// different: PATH1 transfer progress is device-visible each cycle,
+					// so retain the exact VUops.cpp path whenever it is active.
+					if (!m_code.EmitLdrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, xgkickenable))) ||
+						!m_code.EmitCmpImm32(0, 0))
+					{
+						return false;
+					}
+
+					const size_t defer = m_code.EmitBranchPlaceholder(Condition::EQ);
+					if (defer == static_cast<size_t>(-1) ||
+						!EmitTestPipesFastGuard(deferred_fmac_flags))
+					{
+						return false;
+					}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+					const size_t done = m_code.EmitBranchPlaceholder();
+					if (done == static_cast<size_t>(-1) ||
+						!m_code.PatchBranch(defer, m_code.Size(), Condition::EQ) ||
+						!EmitQemuNopPipeTestDeferralCounter())
+					{
+						return false;
+					}
+					return m_code.PatchBranch(done, m_code.Size());
+#else
+					return m_code.PatchBranch(defer, m_code.Size(), Condition::EQ);
+#endif
 				}
 
 				bool EmitSharedTestPipesFastGuardThunk(bool deferred_fmac_flags)
@@ -8260,7 +8338,9 @@ namespace VitaVU
 				}
 				if (plan.test_pipes_fast_guard)
 				{
-					if (!EmitTestPipesFastGuard(m_plan.deferred_fmac_flags))
+					if (!(plan.defer_nop_pipe_test ?
+						EmitDeferredNopPipeTest(m_plan.deferred_fmac_flags) :
+						EmitTestPipesFastGuard(m_plan.deferred_fmac_flags)))
 						return false;
 				}
 				else if (!EmitCallHelper(reinterpret_cast<const void*>(&_vuTestPipes)))
@@ -9155,6 +9235,7 @@ namespace VitaVU
 							s_vu1.stats.ebit_continuation_pairs += plan.pair_count;
 						}
 						s_vu1.stats.test_pipes_fast_guard_pairs += plan.test_pipes_fast_guard_pairs;
+						s_vu1.stats.nop_pipe_test_defer_pairs += plan.nop_pipe_test_defer_pairs;
 						s_vu1.stats.fmac_clear_inline_pairs += plan.fmac_clear_inline_pairs;
 						s_vu1.stats.upper_fmac_stall_test_inline_pairs += plan.upper_fmac_stall_test_inline_pairs;
 						s_vu1.stats.lower_fmac_stall_test_inline_pairs += plan.lower_fmac_stall_test_inline_pairs;
@@ -9297,6 +9378,7 @@ namespace VitaVU
 							s_vu0.stats.ebit_continuation_pairs += plan.pair_count;
 						}
 						s_vu0.stats.test_pipes_fast_guard_pairs += plan.test_pipes_fast_guard_pairs;
+						s_vu0.stats.nop_pipe_test_defer_pairs += plan.nop_pipe_test_defer_pairs;
 						s_vu0.stats.fmac_clear_inline_pairs += plan.fmac_clear_inline_pairs;
 						s_vu0.stats.upper_fmac_stall_test_inline_pairs += plan.upper_fmac_stall_test_inline_pairs;
 						s_vu0.stats.lower_fmac_stall_test_inline_pairs += plan.lower_fmac_stall_test_inline_pairs;
