@@ -2078,6 +2078,13 @@ namespace VitaA32
 		return EmitU32(CondBits(condition) | BRANCH) ? offset : static_cast<size_t>(-1);
 	}
 
+	size_t CodeBuffer::EmitBranchLinkPlaceholder(Condition condition)
+	{
+		const size_t offset = m_offset;
+		return EmitU32(CondBits(condition) | BRANCH | (1u << 24)) ?
+			offset : static_cast<size_t>(-1);
+	}
+
 	bool CodeBuffer::PatchBranch(size_t instruction_offset, size_t target_offset, Condition condition)
 	{
 		if (!m_base || instruction_offset + sizeof(u32) > m_offset || target_offset > m_offset ||
@@ -2089,6 +2096,30 @@ namespace VitaA32
 		u32 instruction = 0;
 		if (!EncodeBranch(m_base + instruction_offset, m_base + target_offset, &instruction, condition))
 			return false;
+		if (!EnsureWritable())
+			return false;
+
+		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		MarkDirty(instruction_offset, sizeof(instruction));
+		return true;
+	}
+
+	bool CodeBuffer::PatchBranchLink(size_t instruction_offset, size_t target_offset,
+		Condition condition)
+	{
+		if (!m_base || instruction_offset + sizeof(u32) > m_offset || target_offset > m_offset ||
+			(instruction_offset & 3) != 0 || (target_offset & 3) != 0)
+		{
+			return false;
+		}
+
+		u32 instruction = 0;
+		if (!EncodeBranch(m_base + instruction_offset, m_base + target_offset,
+				&instruction, condition))
+		{
+			return false;
+		}
+		instruction |= 1u << 24;
 		if (!EnsureWritable())
 			return false;
 

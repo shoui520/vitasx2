@@ -43,6 +43,7 @@ u32 g_qemuVuJitTestPipesFmacFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesFdivFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesEfuFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesXgkickTransferInlineOps = 0;
+u32 g_qemuVuJitNormConstantMaterializations = 0;
 u32 g_qemuVuJitFmacClearInlineOps = 0;
 u32 g_qemuVuJitUpperFmacStallTestInlineOps = 0;
 u32 g_qemuVuJitLowerFmacStallTestInlineOps = 0;
@@ -1317,6 +1318,9 @@ namespace VitaVU
 					}
 				}
 
+				if (!EmitXgkickNormalizePreserveThunk())
+					return false;
+
 				if (m_vu0_memory_map)
 					return true;
 
@@ -1565,6 +1569,52 @@ namespace VitaVU
 				return emitted;
 			}
 
+			bool EmitCallXgkickPreserveNormalizeState()
+			{
+				if (!m_norm_consts_ready)
+				{
+					return EmitCallAbsoluteClobberVectorState(
+						reinterpret_cast<const void*>(&_vuXGKICKTransfer));
+				}
+
+				// PCSX2 owner: x86/microVU_Lower.inl::mVU_XGKICK_SYNC(). The
+				// PATH1 helper owns GIF/XGKICK state, not the host-only vuDouble()
+				// constants. Q8-Q11 are AAPCS caller-clobbered, so route the rare
+				// taken edge through one block-local save/call/restore thunk. A local
+				// BL also contracts every eligible hot call site from MOVW/MOVT/BLX
+				// to one instruction. The skipped arm retains the constants without
+				// executing any additional instruction.
+				const size_t call_site = m_code.EmitBranchLinkPlaceholder();
+				if (call_site == static_cast<size_t>(-1))
+					return false;
+				m_xgkick_norm_preserve_calls.push_back(call_site);
+				return true;
+			}
+
+			bool EmitXgkickNormalizePreserveThunk()
+			{
+				if (m_xgkick_norm_preserve_calls.empty())
+					return true;
+
+				const size_t thunk_offset = m_code.Size();
+				for (const size_t call_site : m_xgkick_norm_preserve_calls)
+				{
+					if (!m_code.PatchBranchLink(call_site, thunk_offset))
+						return false;
+				}
+
+				// Preserve LR from the local BL and keep the AAPCS stack 8-byte
+				// aligned across the C++ helper. r3 is caller-clobbered padding. Only
+				// D16-D23 contain live block state; Q12-Q15 remain operation scratch.
+				constexpr u16 THUNK_CORE_SAVE = (1u << 3) | (1u << 14);
+				return m_code.EmitPush(THUNK_CORE_SAVE) &&
+					m_code.EmitVpushDRange(16, 8) &&
+					m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&_vuXGKICKTransfer)) &&
+					m_code.EmitVpopDRange(16, 8) &&
+					m_code.EmitPop(THUNK_CORE_SAVE) &&
+					m_code.EmitBx(14);
+			}
+
 			bool EmitDirectLinkTail(u32 executed_pairs)
 			{
 				// PCSX2 owner: x86/microVU_Branch.inl block manager links.
@@ -1691,7 +1741,7 @@ namespace VitaVU
 			{
 				return m_code.EmitMovImm8(0, 0) &&
 					m_code.EmitMovImm8(1, 1) &&
-					EmitCallAbsoluteClobberVectorState(reinterpret_cast<const void*>(&_vuXGKICKTransfer));
+					EmitCallXgkickPreserveNormalizeState();
 			}
 
 			bool EmitOrVuWordField(unsigned accum, size_t offset)
@@ -1744,6 +1794,14 @@ namespace VitaVU
 				bool EmitQemuTestPipesEfuFlushInlineCounter()
 				{
 					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitTestPipesEfuFlushInlineOps))) &&
+						m_code.EmitLdrImm12(1, 0, 0) &&
+						m_code.EmitAddImm8(1, 1, 1) &&
+						m_code.EmitStrImm12(1, 0, 0);
+				}
+
+				bool EmitQemuNormConstantMaterializationCounter()
+				{
+					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitNormConstantMaterializations))) &&
 						m_code.EmitLdrImm12(1, 0, 0) &&
 						m_code.EmitAddImm8(1, 1, 1) &&
 						m_code.EmitStrImm12(1, 0, 0);
@@ -2311,7 +2369,7 @@ namespace VitaVU
 						!m_code.EmitSubReg(0, 0, 1) ||
 						!m_code.EmitSubImm8(0, 0, 1) ||
 						!m_code.EmitMovImm8(1, 0) ||
-						!EmitCallAbsoluteClobberVectorState(reinterpret_cast<const void*>(&_vuXGKICKTransfer)))
+						!EmitCallXgkickPreserveNormalizeState())
 					{
 						return false;
 					}
@@ -5159,11 +5217,18 @@ namespace VitaVU
 					return false;
 				}
 
-				if (!overflow_clamp)
-					return true;
+				if (overflow_clamp &&
+					(!m_code.EmitMovImm32(3, FPU_FLOAT_MAX_FINITE) ||
+					 !m_code.EmitVdupI32QFromCore(VU_NORM_MAXF_Q, 3)))
+				{
+					return false;
+				}
 
-				return m_code.EmitMovImm32(3, FPU_FLOAT_MAX_FINITE) &&
-					m_code.EmitVdupI32QFromCore(VU_NORM_MAXF_Q, 3);
+#if defined(VITASX2_QEMU_VALIDATION)
+				return EmitQemuNormConstantMaterializationCounter();
+#else
+				return true;
+#endif
 			}
 
 			// Materializes the constants once per block. Q8-Q11 are then reused by
@@ -7639,6 +7704,7 @@ namespace VitaVU
 			// the per-block BlockCompiler construction.
 			bool m_norm_consts_ready = false;
 			bool m_norm_maxf_ready = false;
+			std::vector<size_t> m_xgkick_norm_preserve_calls;
 			std::vector<BudgetExit> m_budget_exits;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> m_direct_links{};
 			size_t m_linked_entry_offset = static_cast<size_t>(-1);

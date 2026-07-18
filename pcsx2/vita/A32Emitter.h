@@ -272,7 +272,10 @@ namespace VitaA32
 			bool EmitVorrD(unsigned dd, unsigned dn, unsigned dm);
 			bool EmitVmvnQ(unsigned qd, unsigned qm);
 			size_t EmitBranchPlaceholder(Condition condition = Condition::AL);
+			size_t EmitBranchLinkPlaceholder(Condition condition = Condition::AL);
 			bool PatchBranch(size_t instruction_offset, size_t target_offset, Condition condition = Condition::AL);
+			bool PatchBranchLink(size_t instruction_offset, size_t target_offset,
+				Condition condition = Condition::AL);
 			bool PatchBranchToAddress(size_t instruction_offset, const void* target,
 				Condition condition = Condition::AL);
 			bool ReadInstruction(size_t instruction_offset, u32* instruction) const;
