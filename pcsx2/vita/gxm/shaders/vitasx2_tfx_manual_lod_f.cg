@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owner: tfx_fs.glsl::manual_lod()/sample_c(). Supplied GS mip chains
+// use TEX1 K/L and interpolated Q to select an explicit texture level.
+#define VITASX2_TFX_MANUAL_LOD 1
+#include "vitasx2_tfx_f.cg"

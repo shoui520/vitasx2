@@ -1,0 +1,8 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// Preserve PCSX2's post-raster GS Z-floor contract when a supplied mip chain
+// and manual TEX1/Q LOD are active in the same draw.
+#define VITASX2_TFX_MANUAL_LOD 1
+#define VITASX2_TFX_ZFLOOR 1
+#include "vitasx2_tfx_f.cg"
