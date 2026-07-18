@@ -1144,6 +1144,18 @@ namespace VitaVU
 		constexpr unsigned VU_VECTOR_CACHE_SLOTS = 4;
 		constexpr u8 VU_VECTOR_CACHE_ACC = 32;
 
+		// XYZW lane weights used to pack four per-lane NEON comparison masks into
+		// the VU MAC flag. The row is selected at compile time by the instruction's
+		// destination mask. PCSX2's MAC layout repeats the XYZW nibble for
+		// zero/sign/underflow/overflow, so one weighted horizontal OR produces the
+		// base nibble for all four flag groups.
+		alignas(16) static constexpr u32 VU_MAC_LANE_WEIGHTS[16][4] = {
+			{0, 0, 0, 0}, {0, 0, 0, 1}, {0, 0, 2, 0}, {0, 0, 2, 1},
+			{0, 4, 0, 0}, {0, 4, 0, 1}, {0, 4, 2, 0}, {0, 4, 2, 1},
+			{8, 0, 0, 0}, {8, 0, 0, 1}, {8, 0, 2, 0}, {8, 0, 2, 1},
+			{8, 4, 0, 0}, {8, 4, 0, 1}, {8, 4, 2, 0}, {8, 4, 2, 1},
+		};
+
 		constexpr u16 SAVED_REGISTER_MASK = 0x4ff0; // r4-r11, lr; each VU path realigns its private frame
 		constexpr u16 RETURN_REGISTER_MASK = 0x8ff0; // r4-r11, pc
 		constexpr u32 STACK_FRAME_SIZE = 36;          // 32-byte VF hazard backup slots + alignment pad
@@ -1549,6 +1561,7 @@ namespace VitaVU
 				// the block-local cache explicitly at their unconditional barriers.
 				const bool emitted = m_code.EmitCallAbsolute(fn);
 				m_norm_consts_ready = false;
+				m_norm_maxf_ready = false;
 				return emitted;
 			}
 
@@ -2637,6 +2650,22 @@ namespace VitaVU
 				return m_code.EmitStrImm12(rs, HOST_VU, VfLaneOffset(reg, lane));
 			}
 
+			bool EmitStoreVfWordFromS(unsigned ss, unsigned reg, unsigned lane)
+			{
+				if (!RecordOrConsumeVectorAccess(static_cast<u8>(reg),
+						VectorAccessKind::WordStore, false, nullptr) ||
+					(VectorCacheEnabled() && reg != 0 &&
+						!EmitInvalidateCachedVector(static_cast<u8>(reg))))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map && reg != 0)
+					m_vector_cache_stats.uncached_stores++;
+				if (!m_vu0_memory_map && reg != 0)
+					m_vector_cache_stats.vf_word_stores++;
+				return m_code.EmitVstrSImm(ss, HOST_VU, VfLaneOffset(reg, lane));
+			}
+
 			bool EmitLoadVfQuad(unsigned qd, unsigned reg)
 			{
 				bool admit = false;
@@ -2709,6 +2738,25 @@ namespace VitaVU
 					VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32)));
 			}
 
+			bool EmitStoreAccWordFromS(unsigned ss, unsigned lane)
+			{
+				if (!RecordOrConsumeVectorAccess(VU_VECTOR_CACHE_ACC,
+						VectorAccessKind::WordStore, false, nullptr) ||
+					(VectorCacheEnabled() && !EmitInvalidateCachedVector(VU_VECTOR_CACHE_ACC)))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.uncached_stores++;
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.acc_word_stores++;
+				// ACC begins at byte 1024, just beyond VSTR's 10-bit scaled
+				// immediate range. Materialize its base once for this lane rather
+				// than forcing the value through an ARM core register.
+				return EmitCanonicalVectorAddress(3, VU_VECTOR_CACHE_ACC) &&
+					m_code.EmitVstrSImm(ss, 3, static_cast<u16>(lane * sizeof(u32)));
+			}
+
 			bool EmitLoadAccQuad(unsigned qd)
 			{
 				bool admit = false;
@@ -2751,7 +2799,7 @@ namespace VitaVU
 				return emitted;
 			}
 
-			bool EmitStoreQ0ToVfMasked(unsigned ft, unsigned mask, u32 stack_offset)
+			bool EmitStoreQ0ToVfMasked(unsigned ft, unsigned mask)
 			{
 				if (ft == 0 || mask == 0)
 					return true;
@@ -2759,21 +2807,15 @@ namespace VitaVU
 				if (mask == 0x0f)
 					return EmitStoreVfQuad(0, ft);
 
-				bool emitted =
-					m_code.EmitAddImm32(1, SP, stack_offset) &&
-					m_code.EmitVst1Q32(0, 1);
+				bool emitted = true;
 				if ((mask & 0x8) != 0)
-					emitted = emitted && m_code.EmitLdrImm12(0, SP, stack_offset + 0) &&
-						EmitStoreVfWord(0, ft, 0);
+					emitted = emitted && EmitStoreVfWordFromS(0, ft, 0);
 				if ((mask & 0x4) != 0)
-					emitted = emitted && m_code.EmitLdrImm12(0, SP, stack_offset + 4) &&
-						EmitStoreVfWord(0, ft, 1);
+					emitted = emitted && EmitStoreVfWordFromS(1, ft, 1);
 				if ((mask & 0x2) != 0)
-					emitted = emitted && m_code.EmitLdrImm12(0, SP, stack_offset + 8) &&
-						EmitStoreVfWord(0, ft, 2);
+					emitted = emitted && EmitStoreVfWordFromS(2, ft, 2);
 				if ((mask & 0x1) != 0)
-					emitted = emitted && m_code.EmitLdrImm12(0, SP, stack_offset + 12) &&
-						EmitStoreVfWord(0, ft, 3);
+					emitted = emitted && EmitStoreVfWordFromS(3, ft, 3);
 				return emitted;
 			}
 
@@ -2901,7 +2943,7 @@ namespace VitaVU
 				}
 
 				if (!emitted_body ||
-					!EmitStoreQ0ToVfMasked(ft, mask, 16))
+					!EmitStoreQ0ToVfMasked(ft, mask))
 				{
 					return false;
 				}
@@ -3044,7 +3086,7 @@ namespace VitaVU
 					m_code.EmitVandQ(1, 1, 0);
 				emitted_body = emitted_body &&
 					(take_max ? m_code.EmitVeorQ(0, 3, 1) : m_code.EmitVeorQ(0, 2, 1)) &&
-					EmitStoreQ0ToVfMasked(fd, mask, 16);
+					EmitStoreQ0ToVfMasked(fd, mask);
 
 				if (!emitted_body)
 					return false;
@@ -3541,6 +3583,93 @@ namespace VitaVU
 				return EmitStoreVfWord(value_reg, fd, lane);
 			}
 
+			bool EmitStoreMacResultS(unsigned value_sreg, bool acc, unsigned fd, unsigned lane)
+			{
+				if (acc)
+					return EmitStoreAccWordFromS(value_sreg, lane);
+
+				if (fd == 0)
+					return true;
+
+				return EmitStoreVfWordFromS(value_sreg, fd, lane);
+			}
+
+			bool EmitFinishMacQ0(bool acc, unsigned fd, unsigned mask, bool preserve_inactive)
+			{
+				mask &= 0x0f;
+				if (mask != 0)
+				{
+					// PCSX2 owners: VUflags.cpp::VU_MAC_UPDATE()/VU_STAT_UPDATE()
+					// and x86/microVU_Upper.inl::mVUupdateFlags(). Classify all
+					// four result lanes together, weight the active XYZW lanes, and
+					// horizontally OR them into the exact 16-bit MAC layout. This
+					// replaces four scalar branch trees and four S->ARM transfers.
+					if (!EmitEnsureVuFloatNormalizeConstants(CHECK_VU_OVERFLOW(1)) ||
+						!m_code.EmitVandQ(VU_NORM_EXPV_Q, 0, VU_NORM_EXP_Q) ||
+						!m_code.EmitVcgtS32Q(VU_NORM_SIGNV_Q, VU_NORM_ZERO_Q, 0) ||
+						!m_code.EmitVshlI32Q(VU_NORM_TMP_Q, 0, 1) ||
+						!m_code.EmitVceqI32Q(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_ZERO_Q) ||
+						!m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_ZERO_Q) ||
+						!m_code.EmitVceqI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q) ||
+						!m_code.EmitVmvnQ(3, VU_NORM_TMP_Q) ||
+						!m_code.EmitVandQ(3, 3, VU_NORM_MASK_Q) ||
+						!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(
+							VU_MAC_LANE_WEIGHTS[mask]))) ||
+						!m_code.EmitVld1Q32Aligned(1, 3) ||
+						!m_code.EmitVandQ(2, VU_NORM_MASK_Q, 1) ||
+						!m_code.EmitVandQ(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 1) ||
+						!m_code.EmitVshlI32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 4) ||
+						!m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q) ||
+						!m_code.EmitVandQ(3, 3, 1) ||
+						!m_code.EmitVshlI32Q(3, 3, 8) ||
+						!m_code.EmitVorrQ(2, 2, 3) ||
+						!m_code.EmitVandQ(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 1) ||
+						!m_code.EmitVshlI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 12) ||
+						!m_code.EmitVorrQ(2, 2, VU_NORM_EXPV_Q) ||
+						!m_code.EmitVextI8Q(3, 2, 2, 8) ||
+						!m_code.EmitVorrQ(2, 2, 3) ||
+						!m_code.EmitVextI8Q(3, 2, 2, 4) ||
+						!m_code.EmitVorrQ(2, 2, 3) ||
+						!m_code.EmitVmovSToCore(2, 8))
+					{
+						return false;
+					}
+				}
+				else if (!m_code.EmitMovImm8(2, 0))
+				{
+					return false;
+				}
+
+				if (preserve_inactive)
+				{
+					const u32 active_mac_bits = mask * 0x1111u;
+					if (!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, macflag))) ||
+						!EmitAndRegImm32(0, 0, ~active_mac_bits, HOST_CALL_SCRATCH) ||
+						!m_code.EmitOrrReg(2, 2, 0))
+					{
+						return false;
+					}
+				}
+
+				if (mask != 0 &&
+					!EmitNormalizeVuFloatQuadInPlace(0, CHECK_VU_OVERFLOW(1)))
+				{
+					return false;
+				}
+
+				for (unsigned lane = 0; lane < 4; lane++)
+				{
+					if ((mask & (1u << (3 - lane))) != 0 &&
+						!EmitStoreMacResultS(lane, acc, fd, lane))
+					{
+						return false;
+					}
+				}
+
+				return m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) &&
+					EmitUpdateStatusFromMacReg(2, 0, 1);
+			}
+
 			bool EmitApplyTriAceAddHack(unsigned fs_reg, unsigned operand_reg, unsigned diff_reg,
 				unsigned scratch_reg)
 			{
@@ -3592,9 +3721,6 @@ namespace VitaVU
 				// loads and exact integer vuDouble() normalization, but Cortex-A9
 				// Advanced SIMD FP ignores FPSCR rounding. Execute only the active
 				// arithmetic lanes with scalar VFP under the installed VU FPCR.
-				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
-					return false;
-
 				if (triace_add)
 				{
 					// The VUADDSUBHACK gamefix rewrites operands based on their
@@ -3641,29 +3767,8 @@ namespace VitaVU
 						return false;
 				}
 
-				for (unsigned lane = 0; lane < 4; lane++)
-				{
-					const unsigned lane_bit = 1u << (3 - lane);
-					if ((mask & lane_bit) == 0)
-					{
-						if (!EmitClearMacLaneInReg(2, lane, HOST_CALL_SCRATCH))
-							return false;
-						continue;
-					}
-
-					if (!m_code.EmitVmovSToCore(0, lane) ||
-						!EmitUpdateMacLaneFromResult(2, 0, lane, 1, HOST_CALL_SCRATCH) ||
-						!EmitStoreMacResultWord(0, acc, fd, lane))
-					{
-						return false;
-					}
-				}
-
-				if (!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) ||
-					!EmitUpdateStatusFromMacReg(2, 0, 1))
-				{
+				if (!EmitFinishMacQ0(acc, fd, mask, false))
 					return false;
-				}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				return EmitQemuUpperAddSubInlineCounter();
@@ -3684,9 +3789,6 @@ namespace VitaVU
 				// then use scalar VFP per active lane because Advanced SIMD VMUL
 				// is fixed round-to-nearest and cannot implement PCSX2's VU
 				// chop-zero MXCSR/FPSCR contract.
-				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
-					return false;
-
 				if (mask != 0)
 				{
 					// Load both operands as NEON quads (Q0=fs, Q1=ft/broadcast) and
@@ -3710,29 +3812,8 @@ namespace VitaVU
 					}
 				}
 
-				for (unsigned lane = 0; lane < 4; lane++)
-				{
-					const unsigned lane_bit = 1u << (3 - lane);
-					if ((mask & lane_bit) == 0)
-					{
-						if (!EmitClearMacLaneInReg(2, lane, HOST_CALL_SCRATCH))
-							return false;
-						continue;
-					}
-
-					if (!m_code.EmitVmovSToCore(0, lane) ||
-						!EmitUpdateMacLaneFromResult(2, 0, lane, 1, HOST_CALL_SCRATCH) ||
-						!EmitStoreMacResultWord(0, acc, fd, lane))
-					{
-						return false;
-					}
-				}
-
-				if (!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) ||
-					!EmitUpdateStatusFromMacReg(2, 0, 1))
-				{
+				if (!EmitFinishMacQ0(acc, fd, mask, false))
 					return false;
-				}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				return EmitQemuUpperMulInlineCounter();
@@ -3763,7 +3844,8 @@ namespace VitaVU
 				// ExecuteMaddMsubMaskedScalar()'s store order.
 				const bool alias_hazard = IsUpperMaddMsubVfBroadcastForm(kind) && fd == ft;
 
-				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
+				if (alias_hazard &&
+					!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
 					return false;
 
 				if (alias_hazard)
@@ -3824,17 +3906,17 @@ namespace VitaVU
 						if (!m_code.EmitVmulF32(12, 4 + lane, 8 + lane) ||
 							(subtract ? !m_code.EmitVsubF32(12, 0 + lane, 12)
 									  : !m_code.EmitVaddF32(12, 0 + lane, 12)) ||
-							!m_code.EmitVmovSToCore(0, 12) ||
-							!EmitUpdateMacLaneFromResult(2, 0, lane, 1, HOST_CALL_SCRATCH) ||
-							!EmitStoreMacResultWord(0, acc, fd, lane))
+							!m_code.EmitVmovS(lane, 12))
 						{
 							return false;
 						}
 					}
 				}
 
-				if (!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) ||
-					!EmitUpdateStatusFromMacReg(2, 0, 1))
+				if (alias_hazard ?
+					(!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) ||
+						!EmitUpdateStatusFromMacReg(2, 0, 1)) :
+					!EmitFinishMacQ0(acc, fd, mask, false))
 				{
 					return false;
 				}
@@ -3844,14 +3926,6 @@ namespace VitaVU
 #else
 				return true;
 #endif
-			}
-
-			bool EmitFinishOuterLaneFromS(unsigned result_sreg, unsigned mac_reg,
-				bool acc, unsigned fd, unsigned lane)
-			{
-				return m_code.EmitVmovSToCore(0, result_sreg) &&
-					EmitUpdateMacLaneFromResult(mac_reg, 0, lane, 1, HOST_CALL_SCRATCH) &&
-					EmitStoreMacResultWord(0, acc, fd, lane);
 			}
 
 			bool EmitInlineUpperOuter(u32 code, VUInterpFast::UpperFastKind kind)
@@ -3871,9 +3945,6 @@ namespace VitaVU
 				// fs/ft/ACC are all read before any store, so Fd aliases keep the
 				// same source visibility as the direct path.
 				const bool opmsub = kind != VUInterpFast::UpperFastKind::OPMULA;
-
-				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))))
-					return false;
 
 				// Q2 = fs, Q3 = ft. OPMSUB initially loads ACC in Q0, then
 				// moves it to Q2 only after the rearranged fs lanes have consumed
@@ -3914,12 +3985,6 @@ namespace VitaVU
 					{
 						return false;
 					}
-					if (!EmitFinishOuterLaneFromS(0, 2, true, 0, 0) ||
-						!EmitFinishOuterLaneFromS(1, 2, true, 0, 1) ||
-						!EmitFinishOuterLaneFromS(2, 2, true, 0, 2))
-					{
-						return false;
-					}
 				}
 				else
 				{
@@ -3936,20 +4001,14 @@ namespace VitaVU
 						!m_code.EmitVmulF32(6, 6, 2) ||
 						!m_code.EmitVsubF32(0, 8, 4) ||
 						!m_code.EmitVsubF32(1, 9, 5) ||
-						!m_code.EmitVsubF32(2, 10, 6) ||
-						!EmitFinishOuterLaneFromS(0, 2, false, fd, 0) ||
-						!EmitFinishOuterLaneFromS(1, 2, false, fd, 1) ||
-						!EmitFinishOuterLaneFromS(2, 2, false, fd, 2))
+						!m_code.EmitVsubF32(2, 10, 6))
 					{
 						return false;
 					}
 				}
 
-				if (!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) ||
-					!EmitUpdateStatusFromMacReg(2, 0, 1))
-				{
+				if (!EmitFinishMacQ0(!opmsub, fd, 0x0e, true))
 					return false;
-				}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				return EmitQemuUpperOuterInlineCounter();
@@ -5110,11 +5169,22 @@ namespace VitaVU
 			// every block always materializes.
 			bool EmitEnsureVuFloatNormalizeConstants(bool overflow_clamp)
 			{
-				if (m_norm_consts_ready)
+				if (m_norm_consts_ready && (!overflow_clamp || m_norm_maxf_ready))
 					return true;
+				if (m_norm_consts_ready)
+				{
+					if (!m_code.EmitMovImm32(3, FPU_FLOAT_MAX_FINITE) ||
+						!m_code.EmitVdupI32QFromCore(VU_NORM_MAXF_Q, 3))
+					{
+						return false;
+					}
+					m_norm_maxf_ready = true;
+					return true;
+				}
 				if (!EmitMaterializeVuFloatNormalizeConstants(overflow_clamp))
 					return false;
 				m_norm_consts_ready = true;
+				m_norm_maxf_ready = overflow_clamp;
 				return true;
 			}
 
@@ -7606,6 +7676,7 @@ namespace VitaVU
 			// straight-line block skip re-materializing them. Fresh per block via
 			// the per-block BlockCompiler construction.
 			bool m_norm_consts_ready = false;
+			bool m_norm_maxf_ready = false;
 			std::vector<BudgetExit> m_budget_exits;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> m_direct_links{};
 			size_t m_linked_entry_offset = static_cast<size_t>(-1);
