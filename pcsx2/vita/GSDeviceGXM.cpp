@@ -2280,8 +2280,15 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 			return Reject("hardware draw index exceeds vertex count");
 		const u32 primitive_first = first_index +
 			(i / config.indices_per_prim) * config.indices_per_prim;
+		// PCSX2's GS uses the last vertex as the provoking vertex. GXM has no
+		// selectable provoking-vertex state, so the device-owned staging path
+		// makes flat shading explicit by assigning the last vertex's color to
+		// every staged vertex in the primitive. This also keeps de-indexing inside
+		// the bounded MAX_STAGED_INDICES chunks instead of invoking
+		// GSRendererHW::HandleProvokingVertexFirst() on the complete draw.
 		const u32 color_index = config.vs.iip ? source_index :
-			static_cast<u32>(config.indices[primitive_first]);
+			static_cast<u32>(config.indices[primitive_first +
+				config.indices_per_prim - 1]);
 		if (color_index >= config.nverts)
 			return Reject("flat-shading provoking index exceeds vertex count");
 		const GSVertex& vertex = config.verts[source_index];
@@ -2986,6 +2993,11 @@ bool GSDeviceGXM::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	// PSIZE output for point lists, including scaled points, so no six-index
 	// vertex-expansion fallback is needed.
 	m_features.point_expand = true;
+	// PCSX2 owner: GSRendererHW::HandleProvokingVertexFirst(). StageAndDraw()
+	// implements the same last-provoking color contract while expanding each
+	// primitive into bounded GXM staging chunks, so the generic whole-draw
+	// de-index fallback must not run before the device sees the geometry.
+	m_features.provoking_vertex_last = true;
 	// FRAGCOLOR provides ordered same-pixel framebuffer fetch. Per-primitive
 	// draw-list snapshots are not implemented yet, so do not advertise PCSX2's
 	// separate multidraw_fb_copy contract.
