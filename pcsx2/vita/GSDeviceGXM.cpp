@@ -136,6 +136,8 @@ namespace
 	{
 		switch (topology)
 		{
+			case GSHWDrawConfig::Topology::Point:
+				return SCE_GXM_PRIMITIVE_POINTS;
 			case GSHWDrawConfig::Topology::Line:
 				return SCE_GXM_PRIMITIVE_LINES;
 			case GSHWDrawConfig::Topology::Triangle:
@@ -2005,16 +2007,19 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	if (result < 0 || !vertex_buffer)
 		return Fail("reserve TFX vertex uniforms",
 			result < 0 ? result : SCE_GXM_ERROR_INVALID_POINTER);
-	const std::array<float, 8> vertex_values = {
+	// Keep PCSX2's point-size member in the same GXM uniform-array upload as the
+	// ordinary transform. A separate scalar upload would add a libGXM call to
+	// every triangle draw merely because the shared vertex program emits PSIZE.
+	const std::array<float, 12> vertex_values = {
 		config.cb_vs.vertex_scale.x, config.cb_vs.vertex_scale.y,
 		config.cb_vs.vertex_offset.x, config.cb_vs.vertex_offset.y,
 		config.cb_vs.texture_scale.x, config.cb_vs.texture_scale.y,
-		config.cb_vs.texture_offset.x, config.cb_vs.texture_offset.y};
+		config.cb_vs.texture_offset.x, config.cb_vs.texture_offset.y,
+		config.cb_vs.point_size.x, config.cb_vs.point_size.y, 0.0f, 0.0f};
 	result = sceGxmSetUniformDataF(vertex_buffer, uniforms.vertex_scale_offset,
 		0, vertex_values.size(), vertex_values.data());
 	if (result < 0)
 		return Fail("upload TFX vertex uniforms", result);
-
 	void* fragment_buffer = nullptr;
 	result = sceGxmReserveFragmentDefaultUniformBuffer(context, &fragment_buffer);
 	if (result < 0 || !fragment_buffer)
@@ -2373,14 +2378,22 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 			source_direct_modulate_af_fragment, untextured_fragment))
 		return false;
 
-	// PCSX2 owner: GSDeviceOGL::RenderHW() submits native GL_LINES for an
-	// unexpanded GS line draw. GXM additionally requires LINE polygon mode;
-	// SCE_GXM_PRIMITIVE_LINES by itself only selects line-list assembly. Sony's
-	// libGXM context contract and vitaGL's gl_primitive_to_gxm() both establish
-	// the paired state, including a one-pixel width. Restore triangle fill after
-	// submission so a following triangle in the same scene cannot inherit it.
+	// PCSX2 owner: GSRendererHW::SetupIA() keeps native points as one index per
+	// primitive and supplies cb_vs.point_size. Sony's libGXM draw contract
+	// requires SCE_GXM_PRIMITIVE_POINTS to use a vertex program with PSIZE; its
+	// point samples and vitaGL additionally select POINT_01UV polygon mode.
+	// Lines retain their native PCSX2 list assembly and GXM LINE polygon mode.
+	// Restore triangle fill after either draw so later triangles in this scene
+	// cannot inherit the primitive-specific raster state.
+	const bool point_topology =
+		config.topology == GSHWDrawConfig::Topology::Point;
 	const bool line_topology = config.topology == GSHWDrawConfig::Topology::Line;
-	if (line_topology)
+	if (point_topology)
+	{
+		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_POINT_01UV);
+		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_POINT_01UV);
+	}
+	else if (line_topology)
 	{
 		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_LINE);
 		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_LINE);
@@ -2389,7 +2402,7 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	}
 	result = sceGxmDraw(context, TranslateTopology(config.topology),
 		SCE_GXM_INDEX_FORMAT_U16, staged_indices, index_count);
-	if (line_topology)
+	if (point_topology || line_topology)
 	{
 		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
 		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
@@ -2496,11 +2509,13 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		m_impl->Reject("RenderHW without a target");
 		return;
 	}
-	if (config.topology == GSHWDrawConfig::Topology::Point ||
-		config.vs.expand != GSHWDrawConfig::VSExpand::None || config.vs.point_size ||
+	const bool point_topology =
+		config.topology == GSHWDrawConfig::Topology::Point;
+	if (config.vs.expand != GSHWDrawConfig::VSExpand::None ||
+		(config.vs.point_size != point_topology) ||
 		config.line_expand)
 	{
-		m_impl->Reject("point/vertex/line expansion not lowered by GSRendererHW");
+		m_impl->Reject("unsupported point-size/vertex/line expansion contract");
 		return;
 	}
 	const bool mip_lod = config.ps.manual_lod || config.ps.automatic_lod;
@@ -2967,6 +2982,10 @@ bool GSDeviceGXM::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	m_name = "Sony SGX543MP4+ / GXM";
 	m_max_texture_size = 4096;
 	m_features.framebuffer_fetch = true;
+	// PCSX2 owner: GSRendererHW::SetupIA(). GXM natively consumes the shader's
+	// PSIZE output for point lists, including scaled points, so no six-index
+	// vertex-expansion fallback is needed.
+	m_features.point_expand = true;
 	// FRAGCOLOR provides ordered same-pixel framebuffer fetch. Per-primitive
 	// draw-list snapshots are not implemented yet, so do not advertise PCSX2's
 	// separate multidraw_fb_copy contract.

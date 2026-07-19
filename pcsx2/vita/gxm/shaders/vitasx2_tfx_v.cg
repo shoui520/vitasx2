@@ -12,8 +12,9 @@ void main(
 	float aDepth,
 	float2 aUV,
 	float4 aFog,
-	uniform float4 VertexScaleOffset[2],
+	uniform float4 VertexScaleOffset[3],
 	out float4 vPosition : POSITION,
+	out float vPointSize : PSIZE,
 	out float4 vTexFloat : TEXCOORD0,
 	out float4 vTexInt : TEXCOORD1,
 	out float4 vColor : TEXCOORD2)
@@ -32,6 +33,7 @@ void main(
 	vPosition.xy = (aPosition - float2(0.05f, 0.05f)) * vertexScale - vertexOffset;
 	vPosition.z = aDepth * (1.0f / 4294967296.0f);
 	vPosition.w = 1.0f;
+	vPointSize = VertexScaleOffset[2].x;
 
 	vTexFloat = float4(st.x, st.y, aFog.x, aQ);
 	vTexInt.xy = uv * textureScale;
