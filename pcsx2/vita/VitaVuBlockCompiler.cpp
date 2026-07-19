@@ -19,6 +19,7 @@
 #include "Config.h"
 #include "Dmac.h"
 #include "DebugTools/VuTrace.h"
+#include "MTVU.h"
 #include "VUmicro.h"
 #include "VUmicroFast.h"
 #include "Vif.h"
@@ -30,6 +31,7 @@
 #include "common/Vita/VitaJitMemory.h"
 
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -82,6 +84,7 @@ u32 g_qemuVuJitLocalFmacPipelineCommits = 0;
 u32 g_qemuVuJitDeferredFmacFlagEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagRetirements = 0;
 u32 g_qemuVuJitDeferredFmacLinkedEntries = 0;
+bool g_qemuVuJitForceInterpreterFallback = false;
 #endif
 
 namespace VitaVU
@@ -104,6 +107,34 @@ namespace VitaVU
 		constexpr u32 FPU_FLOAT_EXPONENT_MASK = 0x7f800000u;
 		constexpr u32 FPU_FLOAT_MANTISSA_MASK = 0x007fffffu;
 		constexpr u32 FPU_FLOAT_MAX_FINITE = 0x7f7fffffu;
+
+		bool Vu1ProgramActive()
+		{
+			return THREAD_VU1 ? vu1Thread.IsProgramActive() :
+				(VU0.VI[REG_VPU_STAT].UL & 0x100) != 0;
+		}
+
+		void Vu1MtvuMarkDBitEnd()
+		{
+			// PCSX2 owner: x86/microVU_Branch.inl::mVUDTendProgram()
+			// publishes both enabled D and T exits through mVUTBit().
+			vu1Thread.MarkDtProgramEnd(VU_Thread::InterruptFlagVUTBit);
+		}
+
+		void Vu1MtvuMarkTBitEnd()
+		{
+			vu1Thread.MarkDtProgramEnd(VU_Thread::InterruptFlagVUTBit);
+		}
+
+		void Vu1MtvuFinishDtProgram()
+		{
+			vu1Thread.EndProgram(0);
+		}
+
+		void Vu1MtvuFinishEbitProgram()
+		{
+			vu1Thread.EndProgram(VU_Thread::InterruptFlagVUEBit);
+		}
 		static_assert(sizeof(ialuPipe) == 24);
 		static_assert(offsetof(ialuPipe, reg) == 0);
 		static_assert(offsetof(ialuPipe, sCycle) == 8);
@@ -1872,7 +1903,7 @@ namespace VitaVU
 				if (!m_norm_consts_ready)
 				{
 					const bool emitted = m_code.EmitCallAbsolute(
-						reinterpret_cast<const void*>(&_vuXGKICKTransfer));
+						 reinterpret_cast<const void*>(&_vuXGKICKTransferMicroVU));
 					m_norm_consts_ready = false;
 					m_norm_maxf_ready = false;
 					return emitted;
@@ -1915,7 +1946,7 @@ namespace VitaVU
 				constexpr u16 THUNK_CORE_SAVE = (1u << 3) | (1u << 14);
 				return m_code.EmitPush(THUNK_CORE_SAVE) &&
 					m_code.EmitVpushDRange(16, 8) &&
-					m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&_vuXGKICKTransfer)) &&
+					m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&_vuXGKICKTransferMicroVU)) &&
 					m_code.EmitVpopDRange(16, 8) &&
 					m_code.EmitPop(THUNK_CORE_SAVE) &&
 					m_code.EmitBx(14);
@@ -2764,10 +2795,10 @@ namespace VitaVU
 
 				bool EmitInlineTestPipesXgkickTransfer(bool always_preserve_normalize_state)
 				{
-					// PCSX2 owner: VUops.cpp::_vuTestPipes() XGKICK arm. GIF
-					// packet parsing remains owned by _vuXGKICKTransfer(); generated
-					// A32 only computes the same signed cycle argument. VU0 has no
-					// XGKICK arm in _vuTestPipes(); only VU1 can trigger PATH1 here.
+					// PCSX2 owners: VUops.cpp::_vuTestPipes() XGKICK arm and
+					// x86/microVU_Lower.inl::mVU_XGKICK_DELAY(). Generated A32
+					// computes the scheduling delta; the microVU helper performs one
+					// complete EOP-bounded PATH1 transfer. VU0 has no XGKICK arm.
 					if (m_vu0_memory_map)
 						return true;
 
@@ -2942,7 +2973,8 @@ namespace VitaVU
 					}
 
 					// r10 is dead after each pair's stall tests and is callee-saved
-					// across the only possible C++ call (_vuXGKICKTransfer).
+					// across the only possible C++ call
+					// (_vuXGKICKTransferMicroVU).
 					return EmitMovReg(HOST_STALL_SCRATCH, 14) &&
 						EmitTestPipesFastGuardBody(true, deferred_fmac_flags) &&
 						m_code.EmitBx(HOST_STALL_SCRATCH);
@@ -4764,7 +4796,8 @@ namespace VitaVU
 
 			bool EmitLoadVifWord(unsigned rd, size_t offset)
 			{
-				const uptr base = reinterpret_cast<uptr>(m_vu0_memory_map ? &vif0Regs : &vif1Regs);
+				const uptr base = reinterpret_cast<uptr>(m_vu0_memory_map ? &vif0Regs :
+					(THREAD_VU1 ? &vu1Thread.vifRegs : &vif1Regs));
 				return m_code.EmitMovImm32(3, static_cast<u32>(base + offset)) &&
 					m_code.EmitLdrImm12(rd, 3, 0);
 			}
@@ -5763,7 +5796,7 @@ namespace VitaVU
 
 				const size_t use_static_tpc_target = m_code.Size();
 				if (!m_code.PatchBranch(use_static_tpc, use_static_tpc_target, Condition::NE) ||
-					!m_code.EmitMovImm32(0, postincrement_tpc + 8))
+					!m_code.EmitMovImm32(0, postincrement_tpc))
 				{
 					return false;
 				}
@@ -6941,10 +6974,9 @@ namespace VitaVU
 			bool EmitInlineLowerXgkick(u32 code)
 			{
 				// PCSX2 owners: VUmicroFast.h::ExecuteLowerNoUpperKnownKind(XGKICK)
-				// and VUops.cpp::VU0MI_XGKICK()/VU1MI_XGKICK(). VU0's opcode body
-				// is an explicit no-op; VU1 emits queue setup while _vuXGKICKTransfer()
-				// still owns GIF parsing and PATH1 side effects when a transfer is
-				// already pending.
+				// and x86/microVU_Lower.inl::mVU_XGKICK(). VU0's opcode body is an
+				// explicit no-op; VU1 records the delayed address while the microVU
+				// transfer helper owns GIF parsing and PATH1 side effects.
 				if (m_vu0_memory_map)
 				{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -6969,7 +7001,6 @@ namespace VitaVU
 				}
 
 				const unsigned is = VUInterpFast::Is(code);
-				constexpr size_t vpu_stat_offset = offsetof(VURegs, VI) + REG_VPU_STAT * sizeof(REG_VI);
 				bool emitted_body =
 					EmitLoadViHalfwordRaw(0, is) &&
 					EmitAndRegImm32(0, 0, 0x3ffu, HOST_CALL_SCRATCH) &&
@@ -6988,13 +7019,23 @@ namespace VitaVU
 					m_code.EmitStrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, xgkicklastcycle))) &&
 					m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, xgkicklastcycle) + 4)) &&
 					m_code.EmitMovImm8(1, 1) &&
-					m_code.EmitStrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, xgkickcyclecount))) &&
-					m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(&VU0) + vpu_stat_offset)) &&
-					m_code.EmitLdrImm12(1, 3, 0) &&
-					EmitOrrRegImm32(1, 1, 1u << 12, HOST_CALL_SCRATCH) &&
-					m_code.EmitStrImm12(1, 3, 0);
+					m_code.EmitStrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, xgkickcyclecount)));
 				if (!emitted_body)
 					return false;
+
+				if (!THREAD_VU1)
+				{
+					constexpr size_t vpu_stat_offset = offsetof(VURegs, VI) +
+						REG_VPU_STAT * sizeof(REG_VI);
+					emitted_body =
+						m_code.EmitMovImm32(3, static_cast<u32>(
+							reinterpret_cast<uptr>(&VU0) + vpu_stat_offset)) &&
+						m_code.EmitLdrImm12(1, 3, 0) &&
+						EmitOrrRegImm32(1, 1, 1u << 12, HOST_CALL_SCRATCH) &&
+						m_code.EmitStrImm12(1, 3, 0);
+					if (!emitted_body)
+						return false;
+				}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				return EmitQemuLowerXgkickInlineCounter();
@@ -7605,7 +7646,7 @@ namespace VitaVU
 				return m_code.PatchBranch(done_empty, m_code.Size(), Condition::EQ);
 			}
 
-			bool EmitInlineEbitFinish()
+			bool EmitInlineEbitFinish(bool publish_ebit = true)
 			{
 				// PCSX2 owners: x86/microVU_Branch.inl::mVUendProgram() and
 				// mVUDTendProgram(), plus VUops.cpp::_vuFlushAll(). microVU clears
@@ -7627,13 +7668,16 @@ namespace VitaVU
 					return false;
 				}
 
-				const u32 vpu_stat_run_bit = m_vu0_memory_map ? 0x1u : 0x100u;
-				if (!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(&VU0) + ViOffset(REG_VPU_STAT))) ||
-					!m_code.EmitLdrImm12(0, 3, 0) ||
-					!m_code.EmitBicImm32(0, 0, vpu_stat_run_bit) ||
-					!m_code.EmitStrImm12(0, 3, 0))
+				if (m_vu0_memory_map || !THREAD_VU1)
 				{
-					return false;
+					const u32 vpu_stat_run_bit = m_vu0_memory_map ? 0x1u : 0x100u;
+					if (!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(&VU0) + ViOffset(REG_VPU_STAT))) ||
+						!m_code.EmitLdrImm12(0, 3, 0) ||
+						!m_code.EmitBicImm32(0, 0, vpu_stat_run_bit) ||
+						!m_code.EmitStrImm12(0, 3, 0))
+					{
+						return false;
+					}
 				}
 
 				if (m_vu0_memory_map)
@@ -7675,7 +7719,16 @@ namespace VitaVU
 					return false;
 				}
 
-				return m_code.PatchBranch(skip_instant, m_code.Size(), Condition::EQ);
+				if (!m_code.PatchBranch(skip_instant, m_code.Size(), Condition::EQ))
+					return false;
+
+				if (THREAD_VU1)
+				{
+					return EmitCallAbsoluteClobberVectorState(publish_ebit ?
+						reinterpret_cast<const void*>(&Vu1MtvuFinishEbitProgram) :
+						reinterpret_cast<const void*>(&Vu1MtvuFinishDtProgram));
+				}
+				return true;
 			}
 
 			bool EmitInlineDtFlag(u32 fbrst_mask, u32 vpu_stat_bit, u8 intc_irq)
@@ -7683,7 +7736,10 @@ namespace VitaVU
 				// PCSX2 owners: VU0microInterp.cpp::_vu0Exec() and
 				// VU1microInterp.cpp::_vu1Exec() D/T flag handling. FBRST is a
 				// runtime VU0 register; the D/T opcode bit is compile-time-known.
-				if (!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(&VU0) + ViOffset(REG_FBRST))) ||
+				const uptr fbrst_address = (!m_vu0_memory_map && THREAD_VU1) ?
+					reinterpret_cast<uptr>(&vu1Thread.vuFBRST) :
+					reinterpret_cast<uptr>(&VU0) + ViOffset(REG_FBRST);
+				if (!m_code.EmitMovImm32(3, static_cast<u32>(fbrst_address)) ||
 					!m_code.EmitLdrImm12(0, 3, 0) ||
 					!m_code.EmitTstImm32(0, fbrst_mask))
 				{
@@ -7693,7 +7749,19 @@ namespace VitaVU
 				if (skip == static_cast<size_t>(-1))
 					return false;
 
-				if (!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(&VU0) + ViOffset(REG_VPU_STAT))) ||
+				if (!m_vu0_memory_map && THREAD_VU1)
+				{
+					const void* mark_end = (vpu_stat_bit == 0x400u) ?
+						reinterpret_cast<const void*>(&Vu1MtvuMarkTBitEnd) :
+						reinterpret_cast<const void*>(&Vu1MtvuMarkDBitEnd);
+					if (!EmitCallAbsoluteClobberVectorState(mark_end) ||
+						!m_code.EmitMovImm8(0, 1) ||
+						!m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, ebit))))
+					{
+						return false;
+					}
+				}
+				else if (!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(&VU0) + ViOffset(REG_VPU_STAT))) ||
 					!m_code.EmitLdrImm12(0, 3, 0) ||
 					!m_code.EmitOrrImm32(0, 0, vpu_stat_bit) ||
 					!m_code.EmitStrImm12(0, 3, 0) ||
@@ -7728,7 +7796,7 @@ namespace VitaVU
 
 				if (!m_code.EmitMovImm8(0, 0) ||
 					!m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, ebit))) ||
-					!EmitInlineEbitFinish())
+					!EmitInlineEbitFinish(false))
 				{
 					return false;
 				}
@@ -8959,6 +9027,71 @@ namespace VitaVU
 
 		Vu1State s_vu1;
 
+		struct Vu1CompileKey
+		{
+			u32 pc;
+			bool entry_branch_tail;
+			bool entry_ebit_tail;
+		};
+
+		constexpr u32 VU1_COMPILE_REQUEST_WORDS = VU1_PAIR_SLOTS / 64;
+		constexpr u32 VU1_COMPILE_REQUEST_VARIANTS = 4;
+		std::array<std::atomic<u64>,
+			VU1_COMPILE_REQUEST_WORDS * VU1_COMPILE_REQUEST_VARIANTS>
+			s_vu1_compile_requests{};
+
+		u32 Vu1CompileVariant(bool entry_branch_tail, bool entry_ebit_tail)
+		{
+			return static_cast<u32>(entry_branch_tail) |
+				(static_cast<u32>(entry_ebit_tail) << 1);
+		}
+
+		void RequestVu1Compile(u32 pc, bool entry_branch_tail,
+			bool entry_ebit_tail)
+		{
+			if ((pc & 7) != 0 || pc > VU1_PROGMASK)
+				return;
+			const u32 slot = pc / 8;
+			const u32 word = Vu1CompileVariant(entry_branch_tail,
+				entry_ebit_tail) * VU1_COMPILE_REQUEST_WORDS + slot / 64;
+			s_vu1_compile_requests[word].fetch_or(1ull << (slot & 63),
+				std::memory_order_release);
+		}
+
+		bool HasVu1CompileRequests()
+		{
+			for (const std::atomic<u64>& requests : s_vu1_compile_requests)
+			{
+				if (requests.load(std::memory_order_acquire) != 0)
+					return true;
+			}
+			return false;
+		}
+
+		void DrainVu1CompileRequests(std::vector<Vu1CompileKey>* keys)
+		{
+			for (u32 word = 0; word < s_vu1_compile_requests.size(); word++)
+			{
+				u64 bits = s_vu1_compile_requests[word].exchange(0,
+					std::memory_order_acq_rel);
+				const u32 variant = word / VU1_COMPILE_REQUEST_WORDS;
+				const u32 slot_base = (word % VU1_COMPILE_REQUEST_WORDS) * 64;
+				while (bits != 0)
+				{
+					const u32 bit = static_cast<u32>(__builtin_ctzll(bits));
+					keys->push_back({(slot_base + bit) * 8,
+						(variant & 1) != 0, (variant & 2) != 0});
+					bits &= bits - 1;
+				}
+			}
+		}
+
+		void ClearVu1CompileRequests()
+		{
+			for (std::atomic<u64>& requests : s_vu1_compile_requests)
+				requests.store(0, std::memory_order_relaxed);
+		}
+
 		constexpr u32 VU0_PAIR_SLOTS = VU0_PROGSIZE / 8;
 		// VU0 has a 4 KiB microprogram space; keep its first native cache
 		// separate from VU1 so VU0 macro/micro invalidation cannot disturb PATH1
@@ -9320,7 +9453,6 @@ namespace VitaVU
 				s_vu1.stats.scan_rejects++;
 				return nullptr;
 			}
-
 			const u32 micro_size = plan.pair_count * 8;
 			const u8* const micro_bytes = &VU1.Micro[start_pc];
 			const u32 micro_hash = HashVu1MicroBytes(micro_bytes, micro_size);
@@ -9617,6 +9749,11 @@ namespace VitaVU
 				return nullptr;
 			if (block)
 				return block;
+			if (THREAD_VU1)
+			{
+				RequestVu1Compile(start_pc, entry_branch_tail, entry_ebit_tail);
+				return nullptr;
+			}
 
 			block = CompileVu1Block(start_pc, entry_branch_tail, entry_ebit_tail);
 			if (!block)
@@ -9776,7 +9913,7 @@ namespace VitaVU
 				Vu1DirectLinkSlot* runtime_link, bool source_vector_frame,
 				bool source_deferred_fmac_flags)
 			{
-				if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
+				if (!Vu1ProgramActive())
 				{
 				if (vu->branch == 1)
 				{
@@ -9801,7 +9938,11 @@ namespace VitaVU
 					SelectBlockMap(entry_branch_tail, entry_ebit_tail);
 				CachedBlock* block = map[target_pc / 8];
 				if (!block || block == BLOCK_UNCOMPILABLE)
+				{
+					if (!block && THREAD_VU1)
+						RequestVu1Compile(target_pc, entry_branch_tail, entry_ebit_tail);
 					return nullptr;
+				}
 				if (block->vector_cache_frame != source_vector_frame ||
 					(source_deferred_fmac_flags && !block->deferred_fmac_flags) ||
 					(runtime_link && (!runtime_link->owner ||
@@ -9812,22 +9953,25 @@ namespace VitaVU
 				}
 
 				s_vu1.stats.direct_link_exits++;
-				if (Vu1DirectLinkSlot* observed_link = SelectVu1RuntimeObservedSlot(
-						runtime_link, target_pc, entry_branch_tail, entry_ebit_tail))
+				if (!THREAD_VU1)
 				{
-					const bool first_observation = !observed_link->observed_target;
-					observed_link->target_pc = target_pc;
-					observed_link->guard_tpc_value = target_pc;
-					observed_link->observed_target = true;
-					if (PatchVu1DirectLink(*observed_link->owner, *observed_link,
-							DirectLinkTargetEntry(*observed_link->owner, *block)))
+					if (Vu1DirectLinkSlot* observed_link = SelectVu1RuntimeObservedSlot(
+							runtime_link, target_pc, entry_branch_tail, entry_ebit_tail))
 					{
-						if (first_observation)
-							s_vu1.stats.direct_link_runtime_observed_slots++;
-					}
-					else
-					{
-						observed_link->observed_target = false;
+						const bool first_observation = !observed_link->observed_target;
+						observed_link->target_pc = target_pc;
+						observed_link->guard_tpc_value = target_pc;
+						observed_link->observed_target = true;
+						if (PatchVu1DirectLink(*observed_link->owner, *observed_link,
+								DirectLinkTargetEntry(*observed_link->owner, *block)))
+						{
+							if (first_observation)
+								s_vu1.stats.direct_link_runtime_observed_slots++;
+						}
+						else
+						{
+							observed_link->observed_target = false;
+						}
 					}
 				}
 				return source_deferred_fmac_flags ?
@@ -9859,6 +10003,67 @@ namespace VitaVU
 			}
 	} // anonymous namespace
 
+	bool Vu1ProgramNeedsPreparation(s32 vu_addr)
+	{
+		if (HasVu1CompileRequests())
+			return true;
+		const u32 start_pc = (vu_addr == -1) ?
+			((VU1.VI[REG_TPC].UL & 0x7ffu) << 3) :
+			((static_cast<u32>(vu_addr) & 0x7ffu) << 3);
+		return s_vu1.map[start_pc / 8] == nullptr;
+	}
+
+	void PrepareVu1Program(s32 vu_addr)
+	{
+		std::vector<Vu1CompileKey> queue;
+		queue.reserve(32);
+		queue.push_back({(vu_addr == -1) ?
+				((VU1.VI[REG_TPC].UL & 0x7ffu) << 3) :
+				((static_cast<u32>(vu_addr) & 0x7ffu) << 3),
+			false, false});
+		DrainVu1CompileRequests(&queue);
+
+		std::array<u64,
+			VU1_COMPILE_REQUEST_WORDS * VU1_COMPILE_REQUEST_VARIANTS> visited{};
+		for (size_t cursor = 0; cursor < queue.size(); cursor++)
+		{
+			const Vu1CompileKey key = queue[cursor];
+			const u32 slot = key.pc / 8;
+			const u32 visited_word = Vu1CompileVariant(key.entry_branch_tail,
+				key.entry_ebit_tail) * VU1_COMPILE_REQUEST_WORDS + slot / 64;
+			const u64 visited_bit = 1ull << (slot & 63);
+			if (visited[visited_word] & visited_bit)
+				continue;
+			visited[visited_word] |= visited_bit;
+
+			std::array<CachedBlock*, VU1_PAIR_SLOTS>& map =
+				SelectBlockMap(key.entry_branch_tail, key.entry_ebit_tail);
+			CachedBlock* block = map[slot];
+			if (block == BLOCK_UNCOMPILABLE)
+				continue;
+			if (!block)
+			{
+				block = CompileVu1Block(key.pc, key.entry_branch_tail,
+					key.entry_ebit_tail);
+				if (!block)
+				{
+					map[slot] = BLOCK_UNCOMPILABLE;
+					s_vu1.map_populated = true;
+					continue;
+				}
+			}
+
+			for (const Vu1DirectLinkSlot& link : block->direct_links)
+			{
+				if (link.valid && !link.runtime_observed)
+				{
+					queue.push_back({link.target_pc, link.target_branch_tail,
+						link.target_ebit_tail});
+				}
+			}
+		}
+	}
+
 	static void UpdateNextBlockCyclesAtExecuteExit(VURegs& vu, u32 busy_mask,
 		bool forced_program_exit)
 	{
@@ -9870,7 +10075,10 @@ namespace VitaVU
 		if (!EmuConfig.Gamefixes.VUSyncHack && !EmuConfig.Gamefixes.FullVU0SyncHack)
 			return;
 
-		if (forced_program_exit || !(VU0.VI[REG_VPU_STAT].UL & busy_mask))
+		const bool running = (busy_mask == 0x100u && THREAD_VU1) ?
+			vu1Thread.IsProgramActive() :
+			(VU0.VI[REG_VPU_STAT].UL & busy_mask) != 0;
+		if (forced_program_exit || !running)
 		{
 			vu.nextBlockCycles = 0;
 			return;
@@ -10094,12 +10302,16 @@ namespace VitaVU
 		const u64 startcycles = VU1.cycle;
 		const u64 limit = startcycles + cycles;
 		// Micro-step tracing must go through vu1Exec() so every step records.
-		const bool blocks_eligible = !Pcsx2Trace::IsVuTraceEnabled();
+		const bool blocks_eligible = !Pcsx2Trace::IsVuTraceEnabled()
+#if defined(VITASX2_QEMU_VALIDATION)
+			&& !g_qemuVuJitForceInterpreterFallback
+#endif
+			;
 
 		bool admitted_logical_continuation = false;
 		while (admitted_logical_continuation || (VU1.cycle - startcycles) < cycles)
 		{
-			if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
+			if (!Vu1ProgramActive())
 			{
 				if (VU1.branch == 1)
 				{
@@ -10132,7 +10344,7 @@ namespace VitaVU
 						s_vu1.stats.executed_pairs += executed;
 						admitted_logical_continuation =
 							(result & EXECUTED_PAIRS_LOGICAL_CONTINUATION) != 0 &&
-							(VU0.VI[REG_VPU_STAT].UL & 0x100) != 0;
+							Vu1ProgramActive();
 						continue;
 					}
 				}
@@ -10144,7 +10356,7 @@ namespace VitaVU
 			if (blocks_eligible)
 			{
 				admitted_logical_continuation =
-					(VU0.VI[REG_VPU_STAT].UL & 0x100) != 0 &&
+					Vu1ProgramActive() &&
 					!resolving_admitted_branch;
 			}
 		}
@@ -10191,11 +10403,13 @@ namespace VitaVU
 		// PCSX2 owner: x86/microVU.cpp::mVUreset().  InterpVU1::Reset() does
 		// not own this native-provider scheduling hint.
 		VU1.nextBlockCycles = 0;
+		ClearVu1CompileRequests();
 		DropVu1Blocks();
 	}
 
 	void ShutdownVu1Blocks()
 	{
+		ClearVu1CompileRequests();
 		DropVu1Blocks();
 		if (s_vu1.code_cache)
 		{

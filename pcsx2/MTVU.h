@@ -27,10 +27,34 @@ class VU_Thread final {
 	int  m_write_pos; // temporary write pos (local to the EE thread)
 	Threading::WorkSema semaEvent;
 	std::atomic_bool m_shutdown_flag{false};
+	// Worker-private execution state. PCSX2's x86 microVU exits generated
+	// code directly and therefore never consults the EE-owned VPU_STAT busy
+	// bit while MTVU is active. Vita's block dispatcher needs the equivalent
+	// private stop condition without racing the EE core.
+	bool m_program_active = false;
+	bool m_dt_program_end = false;
+	u32 m_pending_program_interrupts = 0;
+	// Producer-only counters. Keeping these on the EE side avoids adding an
+	// atomic RMW to every VU program merely for hardware telemetry.
+	u64 m_profile_execute_enqueues = 0;
+	u64 m_profile_wait_calls = 0;
+	u64 m_profile_ring_waits = 0;
+	u64 m_profile_compile_barriers = 0;
+	bool m_micro_write_pending = false;
+	u32 m_micro_invalidate_start = 0;
+	u32 m_micro_invalidate_end = 0;
 
 	Threading::Thread m_thread;
 
 public:
+	struct ProducerProfileStats
+	{
+		u64 execute_enqueues;
+		u64 wait_calls;
+		u64 ring_waits;
+		u64 compile_barriers;
+	};
+
 	alignas(16)  vifStruct        vif;
 	alignas(16)  VIFregisters     vifRegs;
 	Threading::UserspaceSemaphore semaXGkick;
@@ -76,6 +100,18 @@ public:
 	void WaitVU();
 
 	void Get_MTVUChanges();
+	__fi ProducerProfileStats GetProducerProfileStats() const
+	{
+		return {m_profile_execute_enqueues, m_profile_wait_calls,
+			m_profile_ring_waits, m_profile_compile_barriers};
+	}
+
+	// These methods are VU-worker-only. Release publication in EndProgram()
+	// makes completed VU state visible before the EE observes its event bit.
+	__fi bool IsProgramActive() const { return m_program_active; }
+	void BeginProgram();
+	void MarkDtProgramEnd(u32 interrupt_flag);
+	void EndProgram(u32 interrupt_flag);
 
 	void ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst);
 
@@ -118,6 +154,7 @@ private:
 	void WriteRegs(VIFregisters* src);
 
 	u32 Get_vuCycles();
+	void PrepareVuCodeForExecute(s32 vu_addr);
 };
 
 extern VU_Thread vu1Thread;

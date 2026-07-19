@@ -1524,15 +1524,24 @@ recMicroVU1::recMicroVU1()
 
 void recMicroVU1::Reserve()
 {
+	if (THREAD_VU1)
+		vu1Thread.Open();
 }
 
 void recMicroVU1::Shutdown()
 {
+	if (vu1Thread.IsOpen())
+		vu1Thread.WaitVU();
 	VitaVU::ShutdownVu1Blocks();
 }
 
 void recMicroVU1::Reset()
 {
+	if (vu1Thread.IsOpen())
+	{
+		vu1Thread.WaitVU();
+		vu1Thread.Get_MTVUChanges();
+	}
 	CpuIntVU1.Reset();
 	VitaVU::ResetVu1Blocks();
 }

@@ -6,6 +6,7 @@
 #include "MTVU.h"
 #include "VMManager.h"
 #include "Vif_Dynarec.h"
+#include "vita/VitaVuBlockCompiler.h"
 
 #include <thread>
 
@@ -131,6 +132,13 @@ void VU_Thread::Open()
 	m_shutdown_flag.store(false, std::memory_order_release);
 	m_thread.SetStackSize(VMManager::EMU_THREAD_STACK_SIZE);
 	m_thread.Start([this]() { ExecuteRingBuffer(); });
+#if defined(__vita__)
+	// PCSX2 owner: VMManager::SetEmuThreadAffinities(). Sony's documented
+	// application topology is EE=USER_0, VU=USER_1, GS=USER_2. CPU3 remains
+	// reserved for the shell, plugins, and system services.
+	if (!m_thread.SetAffinity(1u << 1))
+		Console.Warning("Vita VU worker affinity was rejected; using the scheduler default.");
+#endif
 }
 
 void VU_Thread::Close()
@@ -145,6 +153,16 @@ void VU_Thread::Close()
 
 void VU_Thread::Reset()
 {
+	m_program_active = false;
+	m_dt_program_end = false;
+	m_pending_program_interrupts = 0;
+	m_profile_execute_enqueues = 0;
+	m_profile_wait_calls = 0;
+	m_profile_ring_waits = 0;
+	m_profile_compile_barriers = 0;
+	m_micro_write_pending = false;
+	m_micro_invalidate_start = 0;
+	m_micro_invalidate_end = 0;
 	vuCycleIdx = 0;
 	m_ato_write_pos = 0;
 	m_write_pos = 0;
@@ -155,6 +173,35 @@ void VU_Thread::Reset()
 	for (size_t i = 0; i < 4; ++i)
 		vu1Thread.vuCycles[i] = 0;
 	vu1Thread.mtvuInterrupts = 0;
+}
+
+void VU_Thread::BeginProgram()
+{
+	m_program_active = true;
+	m_dt_program_end = false;
+	m_pending_program_interrupts = 0;
+}
+
+void VU_Thread::MarkDtProgramEnd(u32 interrupt_flag)
+{
+	m_dt_program_end = true;
+	m_pending_program_interrupts |= interrupt_flag;
+}
+
+void VU_Thread::EndProgram(u32 interrupt_flag)
+{
+	// PCSX2 owner: x86/microVU_Branch.inl publishes E and T through
+	// mVUEBit()/mVUTBit(). Its MTVU path uses the VUTBit handoff for either
+	// enabled D or T because both stop VU1 and raise the EE-side VU1 event.
+	// A D/T exit takes precedence over a static E bit on the same pair.
+	if (m_dt_program_end)
+		interrupt_flag &= ~InterruptFlagVUEBit;
+	interrupt_flag |= m_pending_program_interrupts;
+	m_pending_program_interrupts = 0;
+	m_dt_program_end = false;
+	m_program_active = false;
+	if (interrupt_flag != 0)
+		mtvuInterrupts.fetch_or(interrupt_flag, std::memory_order_release);
 }
 
 void VU_Thread::ExecuteRingBuffer()
@@ -182,6 +229,7 @@ void VU_Thread::ExecuteRingBuffer()
 					if (addr != -1)
 						VU1.VI[REG_TPC].UL = addr & 0x7FF;
 					CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
+					BeginProgram();
 					CpuVU1->Execute(vu1RunCycles);
 					gifUnit.gifPath[GIF_PATH_1].FinishGSPacketMTVU();
 					semaXGkick.Post(); // Tell MTGS a path1 packet is complete
@@ -193,7 +241,6 @@ void VU_Thread::ExecuteRingBuffer()
 				{
 					u32 vu_micro_addr = Read();
 					u32 size = Read();
-					CpuVU1->Clear(vu_micro_addr, size);
 					Read(&VU1.Micro[vu_micro_addr], size);
 					break;
 				}
@@ -243,6 +290,7 @@ void VU_Thread::ExecuteRingBuffer()
 // Should only be called by ReserveSpace()
 __ri void VU_Thread::WaitOnSize(s32 size)
 {
+	bool counted_wait = false;
 	for (;;)
 	{
 		s32 readPos = GetReadPos();
@@ -256,6 +304,11 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 		if (readPos > m_write_pos + size + _4kb)
 			break; // Enough free front space
 		{          // Let MTVU run to free up buffer space
+			if (!counted_wait)
+			{
+				m_profile_ring_waits++;
+				counted_wait = true;
+			}
 			KickStart();
 			// Locking might trigger a full flush of the ring buffer. Yield
 			// will be more aggressive, and only flush the minimal size.
@@ -383,7 +436,11 @@ u32 VU_Thread::Get_vuCycles()
 void VU_Thread::Get_MTVUChanges()
 {
 	// Note: Atomic communication is with Gif_Unit.cpp Gif_HandlerAD_MTVU
-	u32 interrupts = mtvuInterrupts.load(std::memory_order_relaxed);
+	// The Vita worker publishes completed VU register/memory state before its
+	// E/D/T flag. Cortex-A9 needs an acquire here; x86's ordering made the
+	// upstream relaxed load sufficient, but it does not establish that contract
+	// on a three-core ARM execution route.
+	u32 interrupts = mtvuInterrupts.load(std::memory_order_acquire);
 	if (!interrupts)
 		return;
 
@@ -467,12 +524,14 @@ bool VU_Thread::IsDone()
 void VU_Thread::WaitVU()
 {
 	MTVU_LOG("MTVU - WaitVU!");
+	m_profile_wait_calls++;
 	semaEvent.WaitForEmpty();
 }
 
 void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 {
 	MTVU_LOG("MTVU - ExecuteVU!");
+	PrepareVuCodeForExecute(static_cast<s32>(vu_addr));
 	Get_MTVUChanges(); // Clear any pending interrupts
 	ReserveSpace(5);
 	Write(MTVU_VU_EXECUTE);
@@ -481,6 +540,7 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 	Write(vif_itop);
 	Write(fbrst);
 	CommitWritePos();
+	m_profile_execute_enqueues++;
 	gifUnit.TransferGSPacketData(GIF_TRANS_MTVU, NULL, 0);
 	KickStart();
 	u32 cycles = std::max(Get_vuCycles(), 4u);
@@ -513,6 +573,21 @@ void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* dat
 void VU_Thread::WriteMicroMem(u32 vu_micro_addr, const void* data, u32 size)
 {
 	MTVU_LOG("MTVU - WriteMicroMem!");
+	if (size != 0)
+	{
+		const u32 end = std::min<u32>(vu_micro_addr + size, VU1_PROGSIZE);
+		if (!m_micro_write_pending)
+		{
+			m_micro_invalidate_start = vu_micro_addr;
+			m_micro_invalidate_end = end;
+			m_micro_write_pending = true;
+		}
+		else
+		{
+			m_micro_invalidate_start = std::min(m_micro_invalidate_start, vu_micro_addr);
+			m_micro_invalidate_end = std::max(m_micro_invalidate_end, end);
+		}
+	}
 	ReserveSpace(3 + size_u32(size));
 	Write(MTVU_VU_WRITE_MICRO);
 	Write(vu_micro_addr);
@@ -520,6 +595,28 @@ void VU_Thread::WriteMicroMem(u32 vu_micro_addr, const void* data, u32 size)
 	Write(data, size);
 	CommitWritePos();
 	KickStart();
+}
+
+void VU_Thread::PrepareVuCodeForExecute(s32 vu_addr)
+{
+	if (!m_micro_write_pending && !VitaVU::Vu1ProgramNeedsPreparation(vu_addr))
+		return;
+
+	// Sony PSP2 VM-domain write mode applies to the process, not one core. The
+	// PCSX2 x86 MTVU worker may compile at first use, but doing so on Vita races
+	// CPU0's executable EE cache. Drain pending micro writes, invalidate and
+	// compile on the EE-side C++ seam, then publish only executable code to CPU1.
+	WaitVU();
+	m_profile_compile_barriers++;
+	if (m_micro_write_pending)
+	{
+		CpuVU1->Clear(m_micro_invalidate_start,
+			m_micro_invalidate_end - m_micro_invalidate_start);
+		m_micro_write_pending = false;
+		m_micro_invalidate_start = 0;
+		m_micro_invalidate_end = 0;
+	}
+	VitaVU::PrepareVu1Program(vu_addr);
 }
 
 void VU_Thread::WriteDataMem(u32 vu_data_addr, const void* data, u32 size)

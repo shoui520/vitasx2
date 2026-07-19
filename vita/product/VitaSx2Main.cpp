@@ -306,6 +306,12 @@ namespace
 		EmuConfig.Cpu.Recompiler.EnableVU1 = true;
 		EmuConfig.Cpu.Recompiler.EnableFastmem = false;
 		EmuConfig.Cpu.Recompiler.EnableEECache = false;
+		// PCSX2 owner: Pcsx2Config::SpeedhackOptions::MTVU and
+		// VMManager::SetEmuThreadAffinities(). Normal Vita execution overlaps
+		// VU1 micro work with EE/IOP on the three documented application cores.
+		// Oracle validation remains single-threaded so every checkpoint is an
+		// immediately quiescent architectural boundary.
+		EmuConfig.Speedhacks.vuThread = !VITASX2_PRODUCT_BOOT_VALIDATION;
 		EmuConfig.DEV9.EthEnable = false;
 		EmuConfig.DEV9.HddEnable = false;
 		if (!VITASX2_PRODUCT_BOOT_VALIDATION)

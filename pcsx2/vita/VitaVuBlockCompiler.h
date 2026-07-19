@@ -123,6 +123,14 @@ namespace VitaVU
 	// routing eligible windows through compiled blocks.
 	void ExecuteVu1Blocks(u32 cycles);
 
+	// MTVU producer-side compilation seam. PSP2 VM-domain write mode is
+	// process-wide, so the VU worker must never generate or patch code while the
+	// EE thread can be executing its own VM-domain blocks. The EE producer calls
+	// this only after draining the VU queue; it compiles the requested entry and
+	// its statically-owned PCSX2 microVU link closure before execution is queued.
+	bool Vu1ProgramNeedsPreparation(s32 vu_addr);
+	void PrepareVu1Program(s32 vu_addr);
+
 	// recMicroVU1::Clear() hook. VU1 micro writes clear the affected quick
 	// block-map slots while retaining compiled blocks for content-matched
 	// reuse, mirroring x86 microVU's Clear()+program-search split.

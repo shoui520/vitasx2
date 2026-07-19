@@ -205,7 +205,8 @@ __fi void _vuTestPipes(VURegs* VU)
 	{
 		if (VU1.xgkickenable)
 		{
-			_vuXGKICKTransfer((VU1.cycle - VU1.xgkicklastcycle) - 1, false);
+			_vuXGKICKTransferActiveProvider(
+				(VU1.cycle - VU1.xgkicklastcycle) - 1, false);
 		}
 	}
 }
@@ -1838,7 +1839,6 @@ void _vuXGKICKTransfer(s32 cycles, bool flush)
 {
 	if (!VU1.xgkickenable)
 		return;
-
 	VU1.xgkickcyclecount += cycles;
 	VU1.xgkicklastcycle += cycles;
 
@@ -1879,21 +1879,24 @@ void _vuXGKICKTransfer(s32 cycles, bool flush)
 
 		VUM_LOG("XGKICK Transferring %x bytes from %x size %x", transfersize * 0x10, VU1.xgkickaddr, VU1.xgkicksizeremaining);
 
-		// Would be "nicer" to do the copy until it's all up, however this really screws up PATH3 masking stuff
-		// So lets just do it the other way :)
-		/*if (THREAD_VU1)
+		// PCSX2 owner: x86/microVU_Lower.inl::_vuXGKICKTransfermVU().
+		// An MTVU worker must not parse a packed A+D tag until its complete
+		// packet has arrived. Publishing a partially copied NLOOP lets MTGS walk
+		// beyond the borrowed PATH1 buffer. Keep partial cycle-budget chunks in
+		// the path buffer and parse only when the final chunk is present.
+		if (THREAD_VU1)
 		{
 			if ((transfersize * 0x10) < VU1.xgkicksizeremaining)
 				gifUnit.gifPath[GIF_PATH_1].CopyGSPacketData(&VU1.Mem[VU1.xgkickaddr], transfersize * 0x10, true);
 			else
 				gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[VU1.xgkickaddr], transfersize * 0x10, true);
 		}
-		else*/
-		//{
+		else
+		{
 			gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[VU1.xgkickaddr], transfersize * 0x10, true);
-		//}
+		}
 
-		if ((VU0.VI[REG_VPU_STAT].UL & 0x100) && flush)
+		if (flush && (THREAD_VU1 || (VU0.VI[REG_VPU_STAT].UL & 0x100)))
 			VU1.cycle += transfersize * 2;
 
 		VU1.xgkickcyclecount -= transfersize * 2;
@@ -1908,12 +1911,15 @@ void _vuXGKICKTransfer(s32 cycles, bool flush)
 		{
 			VUM_LOG("XGKICK transfer finished");
 			VU1.xgkickenable = false;
-			VU0.VI[REG_VPU_STAT].UL &= ~(1 << 12);
-			// Check if VIF is waiting for the GIF to not be busy
-			if (vif1Regs.stat.VGW)
+			if (!THREAD_VU1)
 			{
-				vif1Regs.stat.VGW = false;
-				CPU_INT(DMAC_VIF1, 8);
+				VU0.VI[REG_VPU_STAT].UL &= ~(1 << 12);
+				// Check if VIF is waiting for the GIF to not be busy
+				if (vif1Regs.stat.VGW)
+				{
+					vif1Regs.stat.VGW = false;
+					CPU_INT(DMAC_VIF1, 8);
+				}
 			}
 		}
 	}
@@ -1925,10 +1931,81 @@ void _vuXGKICKTransfer(s32 cycles, bool flush)
 	VUM_LOG("XGKick run complete Enabled %d", VU1.xgkickenable);
 }
 
+void _vuXGKICKTransferMicroVU(s32 cycles, bool flush)
+{
+	// PCSX2 owner: x86/microVU_Lower.inl::{mVU_XGKICK_,
+	// mVU_XGKICK_DELAY,mVU_XGKICK_SYNC}. Normal microVU delays one complete
+	// EOP-bounded packet and then transfers it in one operation. The stateful
+	// cycle-by-cycle helper above belongs only to the explicit XgKick gamefix.
+	if (CHECK_XGKICKHACK)
+	{
+		_vuXGKICKTransfer(cycles, flush);
+		return;
+	}
+
+	if (!VU1.xgkickenable)
+		return;
+
+	VU1.xgkickcyclecount += cycles;
+	VU1.xgkicklastcycle += cycles;
+	if (!flush && VU1.xgkickcyclecount < 2)
+		return;
+
+	const u32 addr = VU1.xgkickaddr & 0x3fffu;
+	const u32 diff = 0x4000u - addr;
+	u32 size = gifUnit.GetGSPacketSize(GIF_PATH_1, VU1.Mem, addr, ~0u, true);
+	size &= 0x7fffffffu;
+	if (size != 0)
+	{
+		if (size > diff)
+		{
+			gifUnit.gifPath[GIF_PATH_1].CopyGSPacketData(&VU1.Mem[addr], diff, true);
+			gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, VU1.Mem,
+				size - diff, true);
+		}
+		else
+		{
+			gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &VU1.Mem[addr],
+				size, true);
+		}
+	}
+
+	VU1.xgkickaddr = (addr + size) & 0x3fffu;
+	VU1.xgkickdiff = 0x4000u - VU1.xgkickaddr;
+	VU1.xgkicksizeremaining = 0;
+	VU1.xgkickendpacket = size != 0;
+	VU1.xgkickcyclecount = 0;
+	VU1.xgkickenable = false;
+	if (!THREAD_VU1)
+	{
+		VU0.VI[REG_VPU_STAT].UL &= ~(1u << 12);
+		if (vif1Regs.stat.VGW)
+		{
+			vif1Regs.stat.VGW = false;
+			CPU_INT(DMAC_VIF1, 8);
+		}
+	}
+}
+
+void _vuXGKICKTransferActiveProvider(s32 cycles, bool flush)
+{
+	// PCSX2 owner: x86/microVU_Lower.inl::{mVU_XGKICK_DELAY,
+	// mVU_XGKICK_SYNC} versus VUops.cpp::_vuXGKICKTransfer(). Vita's A32
+	// recompiler deliberately falls back to InterpVU1::Step() for unsupported
+	// pairs, but that must not switch the enclosing provider's delayed XGKICK
+	// contract back to the interpreter's stateful transfer. In particular, an
+	// interpreter-owned E-bit tail must still publish one EOP-bounded microVU
+	// packet to MTVU/MTGS.
+	if (REC_VU1)
+		_vuXGKICKTransferMicroVU(cycles, flush);
+	else
+		_vuXGKICKTransfer(cycles, flush);
+}
+
 static __ri void _vuXGKICK(VURegs* VU)
 {
 	if (VU->xgkickenable)
-		_vuXGKICKTransfer(0, true);
+		_vuXGKICKTransferActiveProvider(0, true);
 
 	u32 addr = (VU->VI[_Is_].US[0] & 0x3ff) * 16;
 	u32 diff = 0x4000 - addr;
@@ -1942,7 +2019,10 @@ static __ri void _vuXGKICK(VURegs* VU)
 	// XGKick command counts as one cycle for the transfer.
 	// Can be tested with Resident Evil: Outbreak, Kingdom Hearts, CART Fury.
 	VU->xgkickcyclecount = 1;
-	VU0.VI[REG_VPU_STAT].UL |= (1 << 12);
+	// PCSX2 microVU keeps MTVU XGKICK progress worker-private. The EE-side
+	// VPU_STAT/VGW state is not written from the worker.
+	if (!THREAD_VU1)
+		VU0.VI[REG_VPU_STAT].UL |= (1 << 12);
 	VUM_LOG("XGKICK addr %x", addr);
 }
 
@@ -4065,4 +4145,3 @@ void VFCOR()   { VU0.code = cpuRegs.code; _vuFCOR(&VU0); }
 void VFCSET()  { VU0.code = cpuRegs.code; _vuFCSET(&VU0); SYNCCLIPFLAG(); }
 void VFCGET()  { VU0.code = cpuRegs.code; _vuFCGET(&VU0); }
 void VXITOP()  { VU0.code = cpuRegs.code; _vuXITOP(&VU0); }
-

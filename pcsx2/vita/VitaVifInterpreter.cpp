@@ -4,10 +4,12 @@
 #include "common/Assertions.h"
 #include "common/Console.h"
 
+#include "Config.h"
 #include "Vif_Dynarec.h"
 #include "Vif_Dma.h"
 #include "Vif_Unpack.h"
 #include "VUmicro.h"
+#include "MTVU.h"
 
 #include <cstring>
 
@@ -1331,8 +1333,8 @@ namespace
 		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_S() and UNPACK_V2(). This path
 		// keeps only the contiguous no-mode/no-mask case; MODE, row/col masks,
 		// fill, skip, and VU-memory wrap stay on the per-vector path.
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 format = upk_num & 0x0f;
 		const u32 wl = regs.cycle.wl;
@@ -1375,8 +1377,8 @@ namespace
 		// PCSX2 owners: x86/Vif_Dynarec.cpp::ModUnpack() and
 		// x86/Vif_UnpackSSE.cpp::xUPK_V3_*(). Generated V3 has alignment-based
 		// W-lane zeroing, so only the contiguous no-mode/no-mask case is hoisted.
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 format = upk_num & 0x0f;
 		const u32 wl = regs.cycle.wl;
@@ -1432,8 +1434,8 @@ namespace
 		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4(). This is the contiguous
 		// no-mask/no-mode V4 case; row/col, fill, skip, and VU-memory wrap
 		// cases stay on the generic fast vector path below.
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 format = upk_num & 0x0f;
 		const u32 wl = regs.cycle.wl;
@@ -1543,8 +1545,8 @@ namespace
 		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4_5(). V4-5 ignores USN/MODE,
 		// but row/col mask, fill, skip, and VU-memory wrap still need the
 		// per-vector path below.
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 wl = regs.cycle.wl;
 		if (isFill || (upk_num & 0x10) != 0 || (upk_num & 0x0f) != 0x0f ||
@@ -1584,8 +1586,8 @@ namespace
 		// Contiguous unmasked V4 MODE traffic has no lane selectors, so keep the
 		// same MaskRow side effects in direct NEON loops instead of the generic
 		// per-vector mode/mask dispatcher.
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 format = upk_num & 0x0f;
 		const u32 mode = regs.mode & 0x3;
@@ -1693,8 +1695,8 @@ namespace
 		// UNPACK_V2(), UNPACK_V4(), UNPACK_V4_5(), and generated V3 from
 		// x86/Vif_Dynarec.cpp::ModUnpack(). This keeps row/col/protect and
 		// MODE side effects per-vector while hoisting contiguous loop control.
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 format = upk_num & 0x0f;
 		const bool doMask = (upk_num & 0x10) != 0;
@@ -1763,8 +1765,8 @@ namespace
 		// V3 from x86/Vif_Dynarec.cpp::ModUnpack(). This path keeps the exact
 		// per-vector unpack/write semantics, but hoists fill/skip cycle control
 		// when the destination VU memory span does not wrap.
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 format = upk_num & 0x0f;
 		const u32 mode = regs.mode & 0x3;
@@ -1853,8 +1855,8 @@ namespace
 	template <int idx>
 	bool VitaVifTryFastPlainUnmasked(const u8* data, bool isFill)
 	{
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 format = upk_num & 0x0f;
 		const bool doMask = (upk_num & 0x10) != 0;
@@ -1902,8 +1904,8 @@ namespace
 	template <int idx>
 	bool VitaVifTryFastV4_5(const u8* data, bool isFill)
 	{
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		if ((upk_num & 0x0f) != 0x0f)
 			return false;
@@ -1945,8 +1947,8 @@ namespace
 	template <int idx>
 	bool VitaVifTryFastUnpack(const u8* data, bool isFill)
 	{
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const u32 upk_num = static_cast<u32>(vif.cmd & 0x1f);
 		const u32 format = upk_num & 0x0f;
 		if (!VitaVifIsFastVectorFormat(format))
@@ -2004,8 +2006,8 @@ namespace
 		// PCSX2 owner: Vif_Unpack.cpp::_nVifUnpackLoop(). Vita reuses the
 		// interpreter-owned VIFfuncTable entries and avoids the desktop
 		// generated nVifUpk table, which is not produced on ARM32 yet.
-		vifStruct& vif = GetVifX;
-		VIFregisters& regs = vifXRegs;
+		vifStruct& vif = MTVU_VifX;
+		VIFregisters& regs = MTVU_VifXRegs;
 		const int skip_size = (regs.cycle.cl - regs.cycle.wl) * 16;
 		const int upk_num = vif.cmd & 0x1f;
 		const u8 vsize = nVifT[upk_num & 0x0f];

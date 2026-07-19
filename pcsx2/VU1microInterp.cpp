@@ -18,6 +18,50 @@
 extern void _vuFlushAll(VURegs* VU);
 extern void _vuXGKICKFlush(VURegs* VU);
 
+static __fi bool _vu1ProgramActive()
+{
+	return THREAD_VU1 ? vu1Thread.IsProgramActive() :
+		(VU0.VI[REG_VPU_STAT].UL & 0x100) != 0;
+}
+
+static __fi u32 _vu1Fbrst()
+{
+	return THREAD_VU1 ? vu1Thread.vuFBRST : VU0.VI[REG_FBRST].UL;
+}
+
+static __fi void _vu1MarkDtProgramEnd(bool tbit)
+{
+	if (THREAD_VU1)
+	{
+		// PCSX2 owner: x86/microVU_Branch.inl::mVUDTendProgram() uses
+		// mVUTBit() for both enabled D and T exits under MTVU.
+		vu1Thread.MarkDtProgramEnd(VU_Thread::InterruptFlagVUTBit);
+		return;
+	}
+
+	VU0.VI[REG_VPU_STAT].UL |= tbit ? 0x400 : 0x200;
+	hwIntcIrq(INTC_VU1);
+}
+
+static __fi void _vu1FinishProgram(VURegs* VU)
+{
+	VU->VIBackupCycles = 0;
+	_vuFlushAll(VU);
+	if (!THREAD_VU1)
+	{
+		VU0.VI[REG_VPU_STAT].UL &= ~0x100;
+		vif1Regs.stat.VEW = false;
+	}
+
+	if (VU->xgkickenable)
+		_vuXGKICKTransferActiveProvider(0, true);
+	if (INSTANT_VU1)
+		VU->xgkicklastcycle = cpuRegs.cycle;
+
+	if (THREAD_VU1)
+		vu1Thread.EndProgram(VU_Thread::InterruptFlagVUEBit);
+}
+
 #if defined(VITASX2_QEMU_VALIDATION)
 extern u32 g_qemuVuUpperNopFastSteps;
 extern u32 g_qemuVuLowerNopFastSteps;
@@ -138,7 +182,7 @@ static u32 _vu1FastForwardPlainNopPairs(VURegs* VU, u32 max_steps)
 	const u32 start_pc = VU->VI[REG_TPC].UL & VU1_PROGMASK;
 	u32 pc = start_pc;
 	u32 steps = 0;
-	while (steps < max_steps && (VU0.VI[REG_VPU_STAT].UL & 0x100))
+	while (steps < max_steps && _vu1ProgramActive())
 	{
 		const u32* ptr = reinterpret_cast<const u32*>(&VU->Micro[pc]);
 		if (!_vu1IsPlainNopPair(ptr[1], ptr[0]))
@@ -183,7 +227,7 @@ static u32 _vu1ExecNopPairBurst(VURegs* VU, u32 max_steps)
 	}
 
 	u32 steps = 0;
-	while (steps < max_steps && (VU0.VI[REG_VPU_STAT].UL & 0x100))
+	while (steps < max_steps && _vu1ProgramActive())
 	{
 		VU->VI[REG_TPC].UL &= VU1_PROGMASK;
 		const u32 pc = VU->VI[REG_TPC].UL;
@@ -245,7 +289,7 @@ static u32 _vu1ExecUpperNopLowerDirectBurst(VURegs* VU, u32 max_cycles)
 
 	u32 steps = 0;
 	const u64 start_cycle = VU->cycle;
-	while ((VU->cycle - start_cycle) < max_cycles && (VU0.VI[REG_VPU_STAT].UL & 0x100))
+	while ((VU->cycle - start_cycle) < max_cycles && _vu1ProgramActive())
 	{
 		VU->VI[REG_TPC].UL &= VU1_PROGMASK;
 		const u32 pc = VU->VI[REG_TPC].UL;
@@ -312,7 +356,7 @@ static u32 _vu1ExecUpperDirectLowerNopBurst(VURegs* VU, u32 max_cycles)
 
 	u32 steps = 0;
 	const u64 start_cycle = VU->cycle;
-	while ((VU->cycle - start_cycle) < max_cycles && (VU0.VI[REG_VPU_STAT].UL & 0x100))
+	while ((VU->cycle - start_cycle) < max_cycles && _vu1ProgramActive())
 	{
 		VU->VI[REG_TPC].UL &= VU1_PROGMASK;
 		const u32 pc = VU->VI[REG_TPC].UL;
@@ -384,7 +428,7 @@ static u32 _vu1ExecUpperLowerDirectBurst(VURegs* VU, u32 max_cycles)
 
 	u32 steps = 0;
 	const u64 start_cycle = VU->cycle;
-	while ((VU->cycle - start_cycle) < max_cycles && (VU0.VI[REG_VPU_STAT].UL & 0x100))
+	while ((VU->cycle - start_cycle) < max_cycles && _vu1ProgramActive())
 	{
 		VU->VI[REG_TPC].UL &= VU1_PROGMASK;
 		const u32 pc = VU->VI[REG_TPC].UL;
@@ -512,7 +556,7 @@ static u32 _vu1ExecIbitDirectBurst(VURegs* VU, u32 max_cycles)
 
 	u32 steps = 0;
 	const u64 start_cycle = VU->cycle;
-	while ((VU->cycle - start_cycle) < max_cycles && (VU0.VI[REG_VPU_STAT].UL & 0x100))
+	while ((VU->cycle - start_cycle) < max_cycles && _vu1ProgramActive())
 	{
 		VU->VI[REG_TPC].UL &= VU1_PROGMASK;
 		const u32 pc = VU->VI[REG_TPC].UL;
@@ -582,19 +626,17 @@ static void _vu1Exec(VURegs* VU)
 	}
 	if (ptr[1] & 0x10000000) // D flag
 	{
-		if (VU0.VI[REG_FBRST].UL & 0x400)
+		if (_vu1Fbrst() & 0x400)
 		{
-			VU0.VI[REG_VPU_STAT].UL |= 0x200;
-			hwIntcIrq(INTC_VU1);
+			_vu1MarkDtProgramEnd(false);
 			VU->ebit = 1;
 		}
 	}
 	if (ptr[1] & 0x08000000) // T flag
 	{
-		if (VU0.VI[REG_FBRST].UL & 0x800)
+		if (_vu1Fbrst() & 0x800)
 		{
-			VU0.VI[REG_VPU_STAT].UL |= 0x400;
-			hwIntcIrq(INTC_VU1);
+			_vu1MarkDtProgramEnd(true);
 			VU->ebit = 1;
 		}
 	}
@@ -674,15 +716,7 @@ static void _vu1Exec(VURegs* VU)
 		{
 			if (VU->ebit-- == 1)
 			{
-				VU->VIBackupCycles = 0;
-				_vuFlushAll(VU);
-				VU0.VI[REG_VPU_STAT].UL &= ~0x100;
-				vif1Regs.stat.VEW = false;
-
-				if(VU1.xgkickenable)
-					_vuXGKICKTransfer(0, true);
-				if (INSTANT_VU1)
-					VU1.xgkicklastcycle = cpuRegs.cycle;
+				_vu1FinishProgram(VU);
 			}
 		}
 
@@ -871,18 +905,7 @@ static void _vu1Exec(VURegs* VU)
 	{
 		if (VU->ebit-- == 1)
 		{
-			VU->VIBackupCycles = 0;
-			_vuFlushAll(VU);
-			VU0.VI[REG_VPU_STAT].UL &= ~0x100;
-			vif1Regs.stat.VEW = false;
-
-			if(VU1.xgkickenable)
-				_vuXGKICKTransfer(0, true);
-			// In instant VU mode, VU1 goes WAY ahead of the CPU, making the XGKick fall way behind
-			// We also have some code to update it in VIF Unpacks too, since in some games (Aggressive Inline) overwrite the XGKick data
-			// VU currently flushes XGKICK on end, so this isn't needed, yet
-			if (INSTANT_VU1)
-				VU1.xgkicklastcycle = cpuRegs.cycle;
+			_vu1FinishProgram(VU);
 		}
 	}
 
@@ -957,7 +980,7 @@ void InterpVU1::Execute(u32 cycles)
 
 	while ((VU1.cycle - startcycles) < cycles)
 	{
-		if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
+		if (!_vu1ProgramActive())
 		{
 			if (VU1.branch == 1)
 			{

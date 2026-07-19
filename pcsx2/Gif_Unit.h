@@ -498,13 +498,17 @@ struct Gif_Path
 	}
 
 	// MTVU: Gets called by MTGS thread
+	bool TryGetGSPacketMTVU(GS_Packet& packet)
+	{
+		return mtvu.gsPackQueue.front(packet);
+	}
+
+	// MTVU: Gets called by MTGS thread
 	GS_Packet GetGSPacketMTVU()
 	{
-		// FIXME is the error path useful ?
-		if (!mtvu.gsPackQueue.empty())
-		{
-			return mtvu.gsPackQueue.front();
-		}
+		GS_Packet packet;
+		if (TryGetGSPacketMTVU(packet))
+			return packet;
 
 		Console.Error("MTVU: Expected gsPackQueue to have elements!");
 		pxAssert(0);

@@ -139,6 +139,18 @@ public:
         return buffer[pending_pop_read_index];
     }
 
+    bool front(T& ret)
+    {
+        const size_t write_index = write_index_.load(std::memory_order_acquire);
+        const size_t read_index = read_index_.load(std::memory_order_relaxed); // only written from pop thread
+        if (empty(write_index, read_index))
+            return false;
+
+        pending_pop_read_index = read_index;
+        ret = buffer[read_index];
+        return true;
+    }
+
     void pop()
     {
         buffer[pending_pop_read_index].~T();

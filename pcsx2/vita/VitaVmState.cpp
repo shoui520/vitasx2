@@ -302,6 +302,8 @@ namespace VMManager
 				dVifRelease(0);
 			}
 			CpuMicroVU1.Shutdown();
+			if (vu1Thread.IsOpen())
+				vu1Thread.Close();
 			CpuMicroVU0.Shutdown();
 			psxRec.Shutdown();
 			recCpu.Shutdown();

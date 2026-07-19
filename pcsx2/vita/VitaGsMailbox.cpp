@@ -133,11 +133,14 @@ namespace MTGS
 		u32 boundaries = 0;
 		Common::Timer::Value wall_start = 0;
 		u64 cpu_start = 0;
+		u64 vu_cpu_start = 0;
+		VU_Thread::ProducerProfileStats vu_start{};
 	};
 	static HardwareVsyncProfile s_producer_profile;
 	static HardwareVsyncProfile s_worker_profile;
 	static std::atomic<u32> s_profile_ring_stalls{0};
 	static std::atomic<u32> s_profile_vsync_waits{0};
+	static std::atomic<u32> s_profile_mtvu_packet_visibility_waits{0};
 	static std::atomic<int> s_profile_max_queued_frames{0};
 
 	static void RecordHardwareVsyncProfile(HardwareVsyncProfile& profile,
@@ -168,6 +171,12 @@ namespace MTGS
 		{
 			profile.wall_start = Common::Timer::GetCurrentValue();
 			profile.cpu_start = Threading::GetThreadCpuTime();
+			if (&profile == &s_producer_profile && THREAD_VU1 &&
+				vu1Thread.IsOpen())
+			{
+				profile.vu_cpu_start = vu1Thread.GetThreadHandle().GetCPUTime();
+				profile.vu_start = vu1Thread.GetProducerProfileStats();
+			}
 			return;
 		}
 		if (boundary != WARMUP_BOUNDARIES + PROFILE_INTERVALS)
@@ -180,14 +189,38 @@ namespace MTGS
 		const u64 cpu_us = cpu_now - profile.cpu_start;
 		const double utilization = wall_us ?
 			(static_cast<double>(cpu_us) * 100.0 / static_cast<double>(wall_us)) : 0.0;
-		Console.WriteLn("Vita MTGS %s profile: warmup_vsyncs=60 interval_vsyncs=120 wall_us=%llu cpu_us=%llu cpu_util=%.1f%% ring_stalls=%u vsync_waits=%u max_queued=%d",
+		Console.WriteLn("Vita MTGS %s profile: warmup_vsyncs=60 interval_vsyncs=120 wall_us=%llu cpu_us=%llu cpu_util=%.1f%% ring_stalls=%u vsync_waits=%u mtvu_packet_visibility_waits=%u max_queued=%d",
 			owner,
 			static_cast<unsigned long long>(wall_us),
 			static_cast<unsigned long long>(cpu_us),
 			utilization,
 			s_profile_ring_stalls.load(std::memory_order_relaxed),
 			s_profile_vsync_waits.load(std::memory_order_relaxed),
+			s_profile_mtvu_packet_visibility_waits.load(std::memory_order_relaxed),
 			s_profile_max_queued_frames.load(std::memory_order_relaxed));
+		if (&profile == &s_producer_profile && THREAD_VU1 &&
+			vu1Thread.IsOpen())
+		{
+			const u64 vu_cpu_us = vu1Thread.GetThreadHandle().GetCPUTime() -
+				profile.vu_cpu_start;
+			const VU_Thread::ProducerProfileStats vu_now =
+				vu1Thread.GetProducerProfileStats();
+			const double vu_utilization = wall_us ?
+				(static_cast<double>(vu_cpu_us) * 100.0 /
+					static_cast<double>(wall_us)) : 0.0;
+			Console.WriteLn("Vita MTVU profile: wall_us=%llu cpu_us=%llu cpu_util=%.1f%% programs=%llu waits=%llu ring_waits=%llu compile_barriers=%llu",
+				static_cast<unsigned long long>(wall_us),
+				static_cast<unsigned long long>(vu_cpu_us),
+				vu_utilization,
+				static_cast<unsigned long long>(vu_now.execute_enqueues -
+					profile.vu_start.execute_enqueues),
+				static_cast<unsigned long long>(vu_now.wait_calls -
+					profile.vu_start.wait_calls),
+				static_cast<unsigned long long>(vu_now.ring_waits -
+					profile.vu_start.ring_waits),
+				static_cast<unsigned long long>(vu_now.compile_barriers -
+					profile.vu_start.compile_barriers));
+		}
 	}
 #endif
 
@@ -407,9 +440,11 @@ namespace MTGS
 			return;
 		}
 #if defined(__vita__)
-		// PCSX2's three-user-core layout starts with EE on core 0 and GS on
-		// core 1 while MTVU is absent. A rejected affinity is non-fatal.
-		if (!s_thread.SetAffinity(1u << 1))
+		// PCSX2 owner: VMManager::SetEmuThreadAffinities(). Share USER_1 with
+		// GS only when MTVU is disabled; otherwise reserve USER_1 for VU1 and
+		// move GS to USER_2. A rejected affinity is non-fatal.
+		const u64 gs_affinity = 1u << (THREAD_VU1 ? 2 : 1);
+		if (!s_thread.SetAffinity(gs_affinity))
 			Console.Warning("Vita GS worker affinity was rejected; using the scheduler default.");
 #endif
 	}
@@ -478,7 +513,18 @@ namespace MTGS
 							mtvu_lock.lock();
 						}
 						Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
-						const GS_Packet packet = path.GetGSPacketMTVU();
+						GS_Packet packet;
+						if (!path.TryGetGSPacketMTVU(packet))
+						{
+						#if defined(__vita__)
+							s_profile_mtvu_packet_visibility_waits.fetch_add(1,
+								std::memory_order_relaxed);
+						#endif
+							do
+							{
+								Threading::SpinWait();
+							} while (!path.TryGetGSPacketMTVU(packet));
+						}
 						if (s_gs && packet.size)
 						{
 							const Pcsx2Trace::ScopedGsTraceSourceOverride trace_source(
