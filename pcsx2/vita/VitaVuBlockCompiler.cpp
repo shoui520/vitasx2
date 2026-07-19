@@ -1337,6 +1337,7 @@ namespace VitaVU
 		constexpr u32 VECTOR_STACK_FRAME_SIZE = 136;
 
 			struct CachedBlock;
+			struct Vu1Program;
 
 			struct Vu1DirectLinkSlot
 			{
@@ -8996,6 +8997,10 @@ namespace VitaVU
 			bool continues_logical_block_if_busy = false;
 			bool vector_cache_frame = false;
 			bool deferred_fmac_flags = false;
+			// PCSX2 owner: x86/microVU.h::microProgram. VU1 direct links are
+			// valid only within the immutable MicroMem version which owns both
+			// source and target blocks. VU0 does not use program versions.
+			Vu1Program* program = nullptr;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> direct_links{};
 			// Generated code embeds pointers into this array (stall-helper
 			// _VURegsNum arguments), so it must stay stable for the lifetime
@@ -9009,15 +9014,39 @@ namespace VitaVU
 		// cache holds one 16 KiB microprogram's worth of expanded pair code.
 		constexpr size_t VU1_CODE_CACHE_CAPACITY = 4 * 1024 * 1024;
 		constexpr size_t CODE_ALIGNMENT = 32;
+		using Vu1BlockMap = std::array<CachedBlock*, VU1_PAIR_SLOTS>;
 
 		CachedBlock* const BLOCK_UNCOMPILABLE = reinterpret_cast<CachedBlock*>(1);
 
+		// PCSX2 owner: x86/microVU.h::{microProgram,microProgManager} and
+		// x86/microVU.cpp::{mVUclear,mVUsearchProg}. A microprogram version owns
+		// its complete compiled-block maps. MicroMem writes discard only the quick
+		// selection; selecting identical contents recovers every block and direct
+		// link at once instead of reconstructing the flat maps from CPU1 misses.
+		struct Vu1Program
+		{
+			struct MicroRange
+			{
+				u32 start;
+				u32 end;
+			};
+
+			Vu1BlockMap map{};
+			Vu1BlockMap branch_map{};
+			Vu1BlockMap ebit_map{};
+			Vu1BlockMap branch_ebit_map{};
+			std::array<u8, VU1_PROGSIZE> micro{};
+			std::vector<MicroRange> ranges;
+			u32 primary_start_pc = 0;
+			u32 mapped_blocks = 0;
+		};
+
 		struct Vu1State
 		{
-			std::array<CachedBlock*, VU1_PAIR_SLOTS> map{};
-			std::array<CachedBlock*, VU1_PAIR_SLOTS> branch_map{};
-			std::array<CachedBlock*, VU1_PAIR_SLOTS> ebit_map{};
-			std::array<CachedBlock*, VU1_PAIR_SLOTS> branch_ebit_map{};
+			std::array<std::vector<Vu1Program*>, VU1_PAIR_SLOTS> programs_by_start{};
+			std::array<Vu1Program*, VU1_PAIR_SLOTS> quick_programs{};
+			std::vector<std::unique_ptr<Vu1Program>> programs;
+			Vu1Program* active_program = nullptr;
 			std::vector<std::unique_ptr<CachedBlock>> blocks;
 			u8* code_cache = nullptr;
 			size_t code_cache_used = 0;
@@ -9145,22 +9174,6 @@ namespace VitaVU
 				std::memcmp(block.micro_bytes.get(), bytes, size) == 0;
 		}
 
-		CachedBlock* FindCachedVu1Block(u32 start_pc, bool entry_branch_tail,
-			bool entry_ebit_tail, const u8* bytes, u32 size, u32 hash)
-		{
-			for (const std::unique_ptr<CachedBlock>& block : s_vu1.blocks)
-			{
-				if (block->start_pc == start_pc &&
-					block->entry_branch_tail == entry_branch_tail &&
-					block->entry_ebit_tail == entry_ebit_tail &&
-					CachedBlockMatchesMicro(*block, bytes, size, hash))
-				{
-					return block.get();
-				}
-			}
-			return nullptr;
-		}
-
 		CachedBlock* FindCachedVu0Block(u32 start_pc, bool entry_branch_tail,
 			bool entry_ebit_tail, const u8* bytes, u32 size, u32 hash)
 		{
@@ -9203,13 +9216,14 @@ namespace VitaVU
 
 		void DropVu1Blocks()
 		{
-			if (!s_vu1.map_populated)
+			if (!s_vu1.map_populated && s_vu1.programs.empty())
 				return;
-			s_vu1.map.fill(nullptr);
-			s_vu1.branch_map.fill(nullptr);
-			s_vu1.ebit_map.fill(nullptr);
-			s_vu1.branch_ebit_map.fill(nullptr);
+			s_vu1.active_program = nullptr;
+			s_vu1.quick_programs.fill(nullptr);
 			s_vu1.blocks.clear();
+			for (std::vector<Vu1Program*>& programs : s_vu1.programs_by_start)
+				programs.clear();
+			s_vu1.programs.clear();
 			s_vu1.code_cache_used = 0;
 			s_vu1.map_populated = false;
 		}
@@ -9225,21 +9239,6 @@ namespace VitaVU
 			s_vu0.blocks.clear();
 			s_vu0.code_cache_used = 0;
 			s_vu0.map_populated = false;
-		}
-
-		void ClearVu1BlockMapSlots(std::array<CachedBlock*, VU1_PAIR_SLOTS>& map,
-			u32 first_slot, u32 last_slot)
-		{
-			for (u32 slot = first_slot; slot < last_slot; slot++)
-				map[slot] = nullptr;
-		}
-
-		void ClearVu1BlockMapSlots(u32 first_slot, u32 last_slot)
-		{
-			ClearVu1BlockMapSlots(s_vu1.map, first_slot, last_slot);
-			ClearVu1BlockMapSlots(s_vu1.branch_map, first_slot, last_slot);
-			ClearVu1BlockMapSlots(s_vu1.ebit_map, first_slot, last_slot);
-			ClearVu1BlockMapSlots(s_vu1.branch_ebit_map, first_slot, last_slot);
 		}
 
 		void ClearVu0BlockMapSlots(u32 first_slot, u32 last_slot)
@@ -9260,11 +9259,117 @@ namespace VitaVU
 			return entry_ebit_tail ? s_vu0.ebit_map : s_vu0.map;
 		}
 
-		std::array<CachedBlock*, VU1_PAIR_SLOTS>& SelectBlockMap(bool entry_branch_tail, bool entry_ebit_tail)
+		Vu1BlockMap& SelectBlockMap(Vu1Program& program, bool entry_branch_tail,
+			bool entry_ebit_tail)
 		{
 			if (entry_branch_tail)
-				return entry_ebit_tail ? s_vu1.branch_ebit_map : s_vu1.branch_map;
-			return entry_ebit_tail ? s_vu1.ebit_map : s_vu1.map;
+				return entry_ebit_tail ? program.branch_ebit_map : program.branch_map;
+			return entry_ebit_tail ? program.ebit_map : program.map;
+		}
+
+		void RegisterVu1ProgramStart(Vu1Program& program, u32 start_pc)
+		{
+			std::vector<Vu1Program*>& programs = s_vu1.programs_by_start[start_pc / 8];
+			for (Vu1Program* candidate : programs)
+			{
+				if (candidate == &program)
+					return;
+			}
+			programs.insert(programs.begin(), &program);
+		}
+
+		Vu1Program* CreateVu1Program(u32 start_pc)
+		{
+			auto program = std::make_unique<Vu1Program>();
+			program->primary_start_pc = start_pc;
+			Vu1Program* result = program.get();
+			s_vu1.programs.push_back(std::move(program));
+			RegisterVu1ProgramStart(*result, start_pc);
+			s_vu1.quick_programs[start_pc / 8] = result;
+			s_vu1.active_program = result;
+			s_vu1.stats.program_versions_created++;
+			return result;
+		}
+
+		bool Vu1ProgramMatchesMicro(const Vu1Program& program)
+		{
+			// PCSX2's release owner deliberately sets doWholeProgCompare=false.
+			// mVUcmpProg() compares only ranges which have actually contributed to
+			// generated blocks, allowing games to rewrite unrelated MicroMem without
+			// multiplying program versions.
+			if (program.ranges.empty())
+				return false;
+			for (const Vu1Program::MicroRange& range : program.ranges)
+			{
+				if (std::memcmp(program.micro.data() + range.start,
+						VU1.Micro + range.start, range.end - range.start) != 0)
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		void CacheVu1ProgramRange(Vu1Program& program, u32 start, u32 size)
+		{
+			const u32 end = std::min(start + size, VU1_PROGSIZE);
+			pxAssert(start < end);
+			std::memcpy(program.micro.data() + start, VU1.Micro + start, end - start);
+
+			Vu1Program::MicroRange merged{start, end};
+			auto it = program.ranges.begin();
+			while (it != program.ranges.end() && it->end < merged.start)
+				++it;
+			while (it != program.ranges.end() && it->start <= merged.end)
+			{
+				merged.start = std::min(merged.start, it->start);
+				merged.end = std::max(merged.end, it->end);
+				it = program.ranges.erase(it);
+			}
+			program.ranges.insert(it, merged);
+		}
+
+		Vu1Program* ActivateVu1Program(u32 start_pc)
+		{
+			pxAssert((start_pc & 7) == 0 && start_pc <= VU1_PROGMASK);
+			if (s_vu1.active_program)
+			{
+				// The Vita provider's generated block ABI consumes architectural
+				// pipeline state at runtime rather than keying x86 microBlock variants
+				// by mVU's microRegInfo. One immutable content version can therefore
+				// own all external MSCAL entry maps without duplicating its blocks.
+				RegisterVu1ProgramStart(*s_vu1.active_program, start_pc);
+				s_vu1.quick_programs[start_pc / 8] = s_vu1.active_program;
+				return s_vu1.active_program;
+			}
+
+			if (Vu1Program* quick = s_vu1.quick_programs[start_pc / 8])
+			{
+				s_vu1.active_program = quick;
+				return quick;
+			}
+
+			std::vector<Vu1Program*>& programs = s_vu1.programs_by_start[start_pc / 8];
+			for (size_t i = 0; i < programs.size(); i++)
+			{
+				Vu1Program* candidate = programs[i];
+				if (!Vu1ProgramMatchesMicro(*candidate))
+					continue;
+
+				if (i != 0)
+				{
+					programs.erase(programs.begin() + i);
+					programs.insert(programs.begin(), candidate);
+				}
+				s_vu1.quick_programs[start_pc / 8] = candidate;
+				s_vu1.active_program = candidate;
+				s_vu1.stats.content_cache_hits++;
+				s_vu1.stats.program_version_cache_hits++;
+				s_vu1.stats.program_block_maps_reused += candidate->mapped_blocks;
+				return candidate;
+			}
+
+			return CreateVu1Program(start_pc);
 		}
 
 			bool DirectLinkTargetsBlock(const Vu1DirectLinkSlot& link, const CachedBlock& target)
@@ -9365,13 +9470,15 @@ namespace VitaVU
 
 			void PatchVu1LinksForCurrentMap(CachedBlock& source)
 			{
+				if (!source.program)
+					return;
 				for (Vu1DirectLinkSlot& link : source.direct_links)
 				{
 					if (!link.valid || (link.runtime_observed && !link.observed_target))
 						continue;
 
-					std::array<CachedBlock*, VU1_PAIR_SLOTS>& target_map =
-						SelectBlockMap(link.target_branch_tail, link.target_ebit_tail);
+					Vu1BlockMap& target_map = SelectBlockMap(*source.program,
+						link.target_branch_tail, link.target_ebit_tail);
 					CachedBlock* target = target_map[link.target_pc / 8];
 					if (target && target != BLOCK_UNCOMPILABLE &&
 						DirectLinkFramesCompatible(source, *target))
@@ -9382,12 +9489,12 @@ namespace VitaVU
 				}
 			}
 
-		void PatchVu1IncomingLinks(CachedBlock& target)
-		{
-			for (const std::unique_ptr<CachedBlock>& source : s_vu1.blocks)
+			void PatchVu1IncomingLinks(CachedBlock& target)
 			{
-				if (!source)
-					continue;
+				for (const std::unique_ptr<CachedBlock>& source : s_vu1.blocks)
+				{
+					if (!source || source->program != target.program)
+						continue;
 
 				for (Vu1DirectLinkSlot& link : source->direct_links)
 				{
@@ -9406,27 +9513,6 @@ namespace VitaVU
 			PatchVu1IncomingLinks(block);
 			PatchVu1LinksForCurrentMap(block);
 		}
-
-			void UnpatchVu1DirectLinks()
-			{
-				for (const std::unique_ptr<CachedBlock>& block : s_vu1.blocks)
-			{
-				if (!block)
-					continue;
-
-					for (Vu1DirectLinkSlot& link : block->direct_links)
-					{
-						if (link.valid && link.patched_target)
-							PatchVu1DirectLink(*block, link, nullptr);
-						if (link.runtime_observed)
-						{
-							link.observed_target = false;
-							link.guard_tpc_value = 0;
-							link.target_pc = 0;
-						}
-					}
-				}
-			}
 
 			Vu1DirectLinkSlot* SelectVu1RuntimeObservedSlot(Vu1DirectLinkSlot* seed,
 				u32 target_pc, bool entry_branch_tail, bool entry_ebit_tail)
@@ -9458,30 +9544,27 @@ namespace VitaVU
 
 			CachedBlock* CompileVu1Block(u32 start_pc, bool entry_branch_tail, bool entry_ebit_tail)
 			{
+				Vu1Program* program = s_vu1.active_program;
+				if (!program)
+					return nullptr;
 			BlockPlan plan;
-			if (!ScanBlock(VU1.Micro, 1, VU1_PROGSIZE, VU1_PROGMASK, false,
-					start_pc, entry_branch_tail, entry_ebit_tail, &plan))
-			{
-				s_vu1.stats.scan_rejects++;
-				return nullptr;
-			}
+				if (!ScanBlock(VU1.Micro, 1, VU1_PROGSIZE, VU1_PROGMASK, false,
+						start_pc, entry_branch_tail, entry_ebit_tail, &plan))
+				{
+					// A retained fallback marker is part of this immutable program
+					// version too.  Record the rejected pair so a later MicroMem
+					// rewrite cannot inherit BLOCK_UNCOMPILABLE from different code.
+					CacheVu1ProgramRange(*program, start_pc, 8);
+					s_vu1.stats.scan_rejects++;
+					return nullptr;
+				}
 			const u32 micro_size = plan.pair_count * 8;
 			const u8* const micro_bytes = &VU1.Micro[start_pc];
 			const u32 micro_hash = HashVu1MicroBytes(micro_bytes, micro_size);
-			if (CachedBlock* cached = FindCachedVu1Block(start_pc, entry_branch_tail,
-					entry_ebit_tail, micro_bytes, micro_size, micro_hash))
-				{
-					SelectBlockMap(entry_branch_tail, entry_ebit_tail)[start_pc / 8] = cached;
-					s_vu1.map_populated = true;
-					s_vu1.stats.content_cache_hits++;
-					if (!PatchVu1RuntimeLinkSlotPointers(*cached))
-						return nullptr;
-					PatchVu1LinksForBlock(*cached);
-					return cached;
-				}
 
 			if (!EnsureVu1CodeCache())
 			{
+				CacheVu1ProgramRange(*program, start_pc, micro_size);
 				s_vu1.stats.compile_failures++;
 				return nullptr;
 			}
@@ -9494,6 +9577,7 @@ namespace VitaVU
 			block->entry_branch_tail = entry_branch_tail;
 			block->entry_ebit_tail = entry_ebit_tail;
 			block->continues_logical_block_if_busy = plan.continues_logical_block_if_busy;
+			block->program = program;
 			block->pairs = std::make_unique<PairPlan[]>(plan.pair_count);
 			std::copy_n(plan.pairs.begin(), plan.pair_count, block->pairs.get());
 			block->micro_bytes = std::make_unique<u8[]>(micro_size);
@@ -9751,7 +9835,11 @@ namespace VitaVU
 
 						CachedBlock* result = block.get();
 						s_vu1.blocks.push_back(std::move(block));
-						SelectBlockMap(entry_branch_tail, entry_ebit_tail)[start_pc / 8] = result;
+						Vu1BlockMap& map = SelectBlockMap(*program,
+							entry_branch_tail, entry_ebit_tail);
+						map[start_pc / 8] = result;
+						CacheVu1ProgramRange(*program, start_pc, micro_size);
+						program->mapped_blocks++;
 						s_vu1.map_populated = true;
 						PatchVu1LinksForBlock(*result);
 						return result;
@@ -9760,17 +9848,33 @@ namespace VitaVU
 
 				// Whole-cache pressure reset, PCSX2 owner:
 				// x86/microVU.cpp::mVUreset() on cache exhaustion.
+				const u32 program_start_pc = program->primary_start_pc;
 				DropVu1Blocks();
 				s_vu1.stats.code_cache_resets++;
+				program = CreateVu1Program(program_start_pc);
+				block->program = program;
 			}
 
+			// Keep a failed-emission sentinel versioned by the complete analyzed
+			// range for the same reason as a scan rejection above.
+			CacheVu1ProgramRange(*program, start_pc, micro_size);
 			s_vu1.stats.compile_failures++;
 			return nullptr;
 		}
 
 		CachedBlock* LookupOrCompileVu1Block(u32 start_pc, bool entry_branch_tail, bool entry_ebit_tail)
 		{
-			std::array<CachedBlock*, VU1_PAIR_SLOTS>& map = SelectBlockMap(entry_branch_tail, entry_ebit_tail);
+			if (!s_vu1.active_program)
+			{
+				if (THREAD_VU1)
+				{
+					RequestVu1Compile(start_pc, entry_branch_tail, entry_ebit_tail);
+					return nullptr;
+				}
+				ActivateVu1Program(start_pc);
+			}
+			Vu1BlockMap& map = SelectBlockMap(*s_vu1.active_program,
+				entry_branch_tail, entry_ebit_tail);
 			CachedBlock* block = map[start_pc / 8];
 			if (block == BLOCK_UNCOMPILABLE)
 				return nullptr;
@@ -9785,7 +9889,8 @@ namespace VitaVU
 			block = CompileVu1Block(start_pc, entry_branch_tail, entry_ebit_tail);
 			if (!block)
 			{
-				map[start_pc / 8] = BLOCK_UNCOMPILABLE;
+				SelectBlockMap(*s_vu1.active_program, entry_branch_tail,
+					entry_ebit_tail)[start_pc / 8] = BLOCK_UNCOMPILABLE;
 				s_vu1.map_populated = true;
 			}
 			return block;
@@ -9976,8 +10081,12 @@ namespace VitaVU
 
 				const bool entry_branch_tail = vu->branch == 1;
 				const bool entry_ebit_tail = vu->ebit == 1;
-				std::array<CachedBlock*, VU1_PAIR_SLOTS>& map =
-					SelectBlockMap(entry_branch_tail, entry_ebit_tail);
+				Vu1Program* const program = runtime_link && runtime_link->owner ?
+					runtime_link->owner->program : s_vu1.active_program;
+				if (!program || program != s_vu1.active_program)
+					return nullptr;
+				Vu1BlockMap& map = SelectBlockMap(*program,
+					entry_branch_tail, entry_ebit_tail);
 				CachedBlock* block = map[target_pc / 8];
 				if (!block || block == BLOCK_UNCOMPILABLE)
 				{
@@ -10051,10 +10160,27 @@ namespace VitaVU
 			s_vu1.stats.program_prepare_checks++;
 		if (HasVu1CompileRequests())
 			return true;
-		const u32 start_pc = (vu_addr == -1) ?
-			((VU1.VI[REG_TPC].UL & 0x7ffu) << 3) :
-			((static_cast<u32>(vu_addr) & 0x7ffu) << 3);
-		const bool needs_preparation = s_vu1.map[start_pc / 8] == nullptr;
+		if (!s_vu1.active_program)
+			return true;
+
+		// MSCNT resumes from the TPC owned by the MTVU worker.  CPU0's VU1
+		// register shadow is not made current until WaitVU()/Get_MTVUChanges(),
+		// so consulting it here can manufacture a compile barrier for a stale PC.
+		// PCSX2 owner: MTVU.cpp::ExecuteVU()/Get_MTVUChanges() and
+		// x86/microVU.cpp::mVUsearchProg().  The worker looks up the live TPC in
+		// the active immutable program; a genuinely absent entry publishes a
+		// compile request and takes the interpreter path for that execution.
+		if (vu_addr == -1)
+		{
+			if (VitaPerformanceTelemetry::IsEnabled())
+				s_vu1.stats.program_quick_cache_hits++;
+			return false;
+		}
+
+		const u32 start_pc =
+			(static_cast<u32>(vu_addr) & 0x7ffu) << 3;
+		const bool needs_preparation =
+			s_vu1.active_program->map[start_pc / 8] == nullptr;
 		if (!needs_preparation && VitaPerformanceTelemetry::IsEnabled())
 			s_vu1.stats.program_quick_cache_hits++;
 		return needs_preparation;
@@ -10064,12 +10190,13 @@ namespace VitaVU
 	{
 		if (VitaPerformanceTelemetry::IsEnabled())
 			s_vu1.stats.program_prepare_calls++;
+		const u32 start_pc = (vu_addr == -1) ?
+			((VU1.VI[REG_TPC].UL & 0x7ffu) << 3) :
+			((static_cast<u32>(vu_addr) & 0x7ffu) << 3);
+		ActivateVu1Program(start_pc);
 		std::vector<Vu1CompileKey> queue;
 		queue.reserve(32);
-		queue.push_back({(vu_addr == -1) ?
-				((VU1.VI[REG_TPC].UL & 0x7ffu) << 3) :
-				((static_cast<u32>(vu_addr) & 0x7ffu) << 3),
-			false, false});
+		queue.push_back({start_pc, false, false});
 		DrainVu1CompileRequests(&queue);
 
 		std::array<u64,
@@ -10085,8 +10212,8 @@ namespace VitaVU
 				continue;
 			visited[visited_word] |= visited_bit;
 
-			std::array<CachedBlock*, VU1_PAIR_SLOTS>& map =
-				SelectBlockMap(key.entry_branch_tail, key.entry_ebit_tail);
+			Vu1BlockMap& map = SelectBlockMap(*s_vu1.active_program,
+				key.entry_branch_tail, key.entry_ebit_tail);
 			CachedBlock* block = map[slot];
 			if (block == BLOCK_UNCOMPILABLE)
 				continue;
@@ -10096,7 +10223,9 @@ namespace VitaVU
 					key.entry_ebit_tail);
 				if (!block)
 				{
-					map[slot] = BLOCK_UNCOMPILABLE;
+					SelectBlockMap(*s_vu1.active_program,
+						key.entry_branch_tail, key.entry_ebit_tail)[slot] =
+						BLOCK_UNCOMPILABLE;
 					s_vu1.map_populated = true;
 					continue;
 				}
@@ -10472,33 +10601,18 @@ namespace VitaVU
 
 	void InvalidateVu1Blocks(u32 addr, u32 size)
 	{
-		if (!s_vu1.map_populated || size == 0)
+		if (size == 0)
 			return;
-
-		UnpatchVu1DirectLinks();
 
 		// PCSX2 owner: x86/microVU.cpp::mVUclear() clears the quick program
-		// references but keeps compiled microprograms for mVUsearchProg().
-		// A write can affect any cached block whose scan window includes the
-		// modified pair, so expand backward by the maximum generated block.
-		const u32 masked_addr = addr & VU1_PROGMASK;
-		const u64 end_addr = static_cast<u64>(masked_addr) + size;
-		if (size >= VU1_PROGSIZE || end_addr > VU1_PROGSIZE)
-		{
-			ClearVu1BlockMapSlots(0, VU1_PAIR_SLOTS);
-			s_vu1.stats.invalidate_alls++;
-			return;
-		}
-
-		const u32 first_touched_slot = masked_addr / 8;
-		u32 last_touched_slot = static_cast<u32>((end_addr + 7) / 8);
-		if (last_touched_slot > VU1_PAIR_SLOTS)
-			last_touched_slot = VU1_PAIR_SLOTS;
-
-		const u32 first_slot = (first_touched_slot > MAX_BLOCK_PAIRS)
-			? (first_touched_slot - MAX_BLOCK_PAIRS)
-			: 0;
-		ClearVu1BlockMapSlots(first_slot, last_touched_slot);
+		// references but keeps each microProgram's complete block-manager map.
+		// Direct links are program-owned and remain valid inside that immutable
+		// version. Pending CPU1 misses belong to the old version and must not be
+		// replayed after the next MicroMem contents are selected.
+		(void)addr;
+		s_vu1.active_program = nullptr;
+		s_vu1.quick_programs.fill(nullptr);
+		ClearVu1CompileRequests();
 		s_vu1.stats.invalidate_alls++;
 	}
 
@@ -10577,6 +10691,9 @@ namespace VitaVU
 		stats.program_quick_cache_hits = s_vu1.stats.program_quick_cache_hits;
 		stats.program_compile_requests =
 			s_vu1_compile_requests_total.load(std::memory_order_relaxed);
+		stats.program_version_cache_hits = s_vu1.stats.program_version_cache_hits;
+		stats.program_block_maps_reused = s_vu1.stats.program_block_maps_reused;
+		stats.program_versions_created = s_vu1.stats.program_versions_created;
 		stats.content_cache_hits = s_vu1.stats.content_cache_hits;
 		stats.invalidations = s_vu1.stats.invalidate_alls;
 		stats.compile_failures = s_vu1.stats.compile_failures;

@@ -782,10 +782,12 @@ namespace MTGS
 				origin.vu1.generated_pairs)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=vu1_cache prepare_checks=%llu prepare_calls=%llu "
-			"quick_hits=%llu content_hits=%llu compile_requests=%llu invalidations=%llu "
-			"compile_failures=%llu origin_prepare_checks=%llu origin_prepare_calls=%llu "
-			"origin_quick_hits=%llu origin_content_hits=%llu origin_compile_requests=%llu "
-			"origin_invalidations=%llu origin_compile_failures=%llu",
+			"quick_hits=%llu program_hits=%llu maps_reused=%llu versions_created=%llu "
+			"content_hits=%llu compile_requests=%llu invalidations=%llu compile_failures=%llu "
+			"origin_prepare_checks=%llu origin_prepare_calls=%llu origin_quick_hits=%llu "
+			"origin_program_hits=%llu origin_maps_reused=%llu origin_versions_created=%llu "
+			"origin_content_hits=%llu origin_compile_requests=%llu origin_invalidations=%llu "
+			"origin_compile_failures=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.program_prepare_checks,
 				start.vu1.program_prepare_checks)),
@@ -793,6 +795,15 @@ namespace MTGS
 				start.vu1.program_prepare_calls)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.program_quick_cache_hits,
 				start.vu1.program_quick_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_version_cache_hits,
+				start.vu1.program_version_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_block_maps_reused,
+				start.vu1.program_block_maps_reused)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_versions_created,
+				start.vu1.program_versions_created)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.content_cache_hits,
 				start.vu1.content_cache_hits)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.program_compile_requests,
@@ -810,6 +821,15 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.vu1.program_quick_cache_hits,
 				origin.vu1.program_quick_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_version_cache_hits,
+				origin.vu1.program_version_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_block_maps_reused,
+				origin.vu1.program_block_maps_reused)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_versions_created,
+				origin.vu1.program_versions_created)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.content_cache_hits,
 				origin.vu1.content_cache_hits)),
 			static_cast<unsigned long long>(CounterDelta(

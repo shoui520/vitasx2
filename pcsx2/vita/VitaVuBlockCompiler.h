@@ -33,6 +33,9 @@ namespace VitaVU
 		u64 program_prepare_checks = 0;
 		u64 program_prepare_calls = 0;
 		u64 program_quick_cache_hits = 0;
+		u64 program_version_cache_hits = 0;
+		u64 program_block_maps_reused = 0;
+		u32 program_versions_created = 0;
 		u32 scan_rejects = 0;
 		u32 compile_failures = 0;
 		u32 cycle_resident_blocks = 0;
@@ -149,6 +152,9 @@ namespace VitaVU
 		u64 program_prepare_calls = 0;
 		u64 program_quick_cache_hits = 0;
 		u64 program_compile_requests = 0;
+		u64 program_version_cache_hits = 0;
+		u64 program_block_maps_reused = 0;
+		u64 program_versions_created = 0;
 		u64 content_cache_hits = 0;
 		u64 invalidations = 0;
 		u64 compile_failures = 0;
@@ -189,9 +195,9 @@ namespace VitaVU
 	bool Vu1ProgramNeedsPreparation(s32 vu_addr);
 	void PrepareVu1Program(s32 vu_addr);
 
-	// recMicroVU1::Clear() hook. VU1 micro writes clear the affected quick
-	// block-map slots while retaining compiled blocks for content-matched
-	// reuse, mirroring x86 microVU's Clear()+program-search split.
+	// recMicroVU1::Clear() hook. VU1 micro writes clear the current program
+	// selection while retaining immutable program-owned block maps for one-shot
+	// content-matched reuse, mirroring x86 microVU's Clear()+program-search split.
 	void InvalidateVu1Blocks(u32 addr, u32 size);
 
 	// recMicroVU1::Reset()/Shutdown() hooks.
