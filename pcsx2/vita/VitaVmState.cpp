@@ -42,6 +42,7 @@
 #include "VUmicro.h"
 #include "Vif_Dynarec.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaGsMailbox.h"
 #include "vtlb.h"
 #include "ps2/BiosTools.h"
 
@@ -813,6 +814,11 @@ namespace VMManager
 			ClearCPUExecutionCaches();
 			memBindConditionalHandlers();
 			ClearCPUExecutionCaches();
+			// Capture performance counter zero points only after the PCSX2-owned
+			// execution-cache resets above. The guest VSync origin is unchanged,
+			// but every since-origin total now has one coherent lifecycle and the
+			// first game block/VU program is still compiled after this callback.
+			VitaGS::NotifyPerformanceElfEntry();
 			// PCSX2 owner: VMManager.cpp records the final pre-first-instruction
 			// boundary only after boot patches/settings and cache publication.
 			Pcsx2Trace::RecordEeElfEntryState(s_elf_entry_point);

@@ -9039,6 +9039,11 @@ namespace VitaVU
 		std::array<std::atomic<u64>,
 			VU1_COMPILE_REQUEST_WORDS * VU1_COMPILE_REQUEST_VARIANTS>
 			s_vu1_compile_requests{};
+		std::atomic<u64> s_vu1_compile_requests_total{0};
+		std::atomic<u64> s_vu1_completed_programs{0};
+		std::atomic<u64> s_vu1_published_executed_blocks{0};
+		std::atomic<u64> s_vu1_published_executed_pairs{0};
+		std::atomic<u64> s_vu1_published_interpreter_steps{0};
 
 		u32 Vu1CompileVariant(bool entry_branch_tail, bool entry_ebit_tail)
 		{
@@ -9056,6 +9061,7 @@ namespace VitaVU
 				entry_ebit_tail) * VU1_COMPILE_REQUEST_WORDS + slot / 64;
 			s_vu1_compile_requests[word].fetch_or(1ull << (slot & 63),
 				std::memory_order_release);
+			s_vu1_compile_requests_total.fetch_add(1, std::memory_order_relaxed);
 		}
 
 		bool HasVu1CompileRequests()
@@ -9113,6 +9119,7 @@ namespace VitaVU
 		};
 
 		Vu0State s_vu0;
+		u64 s_vu0_execute_calls = 0;
 
 		u32 HashVu1MicroBytes(const u8* bytes, u32 size)
 		{
@@ -9617,12 +9624,26 @@ namespace VitaVU
 								chosen_deferred_fmac_linked_entry_offset;
 						}
 						block->code_size = block->code.Size();
+						const CodeBuffer::GeneratedCodeStats generated =
+							block->code.AnalyzeGeneratedCode();
 						if (!PatchVu1RuntimeLinkSlotPointers(*block))
 							break;
 						s_vu1.code_cache_used = offset + block->code_size;
 						s_vu1.stats.code_cache_used = s_vu1.code_cache_used;
 						s_vu1.stats.compiled_blocks++;
 						s_vu1.stats.compiled_pairs += plan.pair_count;
+						s_vu1.stats.generated_host_instructions +=
+							generated.host_instructions;
+						s_vu1.stats.generated_host_load_instructions +=
+							generated.host_load_instructions;
+						s_vu1.stats.generated_host_store_instructions +=
+							generated.host_store_instructions;
+						s_vu1.stats.generated_helper_call_instructions +=
+							generated.helper_call_instructions;
+						s_vu1.stats.generated_state_load_instructions +=
+							generated.state_load_instructions;
+						s_vu1.stats.generated_state_store_instructions +=
+							generated.state_store_instructions;
 						s_vu1.stats.normalized_operand_quads_bypassed +=
 							chosen_normalized_operand_quad_bypasses;
 						s_vu1.stats.normalization_instructions_removed +=
@@ -9819,10 +9840,24 @@ namespace VitaVU
 						block->code = std::move(code);
 						block->entry = block->code.EntryPoint();
 						block->code_size = block->code.Size();
+						const CodeBuffer::GeneratedCodeStats generated =
+							block->code.AnalyzeGeneratedCode();
 						s_vu0.code_cache_used = offset + block->code_size;
 						s_vu0.stats.code_cache_used = s_vu0.code_cache_used;
 						s_vu0.stats.compiled_blocks++;
 						s_vu0.stats.compiled_pairs += plan.pair_count;
+						s_vu0.stats.generated_host_instructions +=
+							generated.host_instructions;
+						s_vu0.stats.generated_host_load_instructions +=
+							generated.host_load_instructions;
+						s_vu0.stats.generated_host_store_instructions +=
+							generated.host_store_instructions;
+						s_vu0.stats.generated_helper_call_instructions +=
+							generated.helper_call_instructions;
+						s_vu0.stats.generated_state_load_instructions +=
+							generated.state_load_instructions;
+						s_vu0.stats.generated_state_store_instructions +=
+							generated.state_store_instructions;
 						s_vu0.stats.normalized_operand_quads_bypassed +=
 							compiler.GetNormalizedOperandQuadBypasses();
 						s_vu0.stats.normalization_instructions_removed +=
@@ -10005,16 +10040,21 @@ namespace VitaVU
 
 	bool Vu1ProgramNeedsPreparation(s32 vu_addr)
 	{
+		s_vu1.stats.program_prepare_checks++;
 		if (HasVu1CompileRequests())
 			return true;
 		const u32 start_pc = (vu_addr == -1) ?
 			((VU1.VI[REG_TPC].UL & 0x7ffu) << 3) :
 			((static_cast<u32>(vu_addr) & 0x7ffu) << 3);
-		return s_vu1.map[start_pc / 8] == nullptr;
+		const bool needs_preparation = s_vu1.map[start_pc / 8] == nullptr;
+		if (!needs_preparation)
+			s_vu1.stats.program_quick_cache_hits++;
+		return needs_preparation;
 	}
 
 	void PrepareVu1Program(s32 vu_addr)
 	{
+		s_vu1.stats.program_prepare_calls++;
 		std::vector<Vu1CompileKey> queue;
 		queue.reserve(32);
 		queue.push_back({(vu_addr == -1) ?
@@ -10227,6 +10267,7 @@ namespace VitaVU
 
 		UpdateNextBlockCyclesAtExecuteExit(VU0, 0x1,
 			(VU0.flags & VUFLAG_MFLAGSET) != 0);
+		s_vu0_execute_calls++;
 	}
 
 	void InvalidateVu0Blocks(u32 addr, u32 size)
@@ -10281,6 +10322,33 @@ namespace VitaVU
 		return s_vu0.stats;
 	}
 
+	Vu0TelemetryStats GetVu0TelemetryStats()
+	{
+		Vu0TelemetryStats stats;
+		stats.execute_calls = s_vu0_execute_calls;
+		stats.executed_blocks = s_vu0.stats.executed_blocks;
+		stats.executed_pairs = s_vu0.stats.executed_pairs;
+		stats.interpreter_steps = s_vu0.stats.interpreter_steps;
+		stats.generated_blocks = s_vu0.stats.compiled_blocks;
+		stats.generated_pairs = s_vu0.stats.compiled_pairs;
+		stats.generated_host_instructions = s_vu0.stats.generated_host_instructions;
+		stats.generated_host_load_instructions =
+			s_vu0.stats.generated_host_load_instructions;
+		stats.generated_host_store_instructions =
+			s_vu0.stats.generated_host_store_instructions;
+		stats.generated_helper_call_instructions =
+			s_vu0.stats.generated_helper_call_instructions;
+		stats.generated_state_load_instructions =
+			s_vu0.stats.generated_state_load_instructions;
+		stats.generated_state_store_instructions =
+			s_vu0.stats.generated_state_store_instructions;
+		stats.content_cache_hits = s_vu0.stats.content_cache_hits;
+		stats.invalidations = s_vu0.stats.invalidate_alls;
+		stats.scan_rejects = s_vu0.stats.scan_rejects;
+		stats.compile_failures = s_vu0.stats.compile_failures;
+		return stats;
+	}
+
 	void ResetVu0ProviderStats()
 	{
 		const size_t used = s_vu0.stats.code_cache_used;
@@ -10288,6 +10356,7 @@ namespace VitaVU
 		s_vu0.stats = {};
 		s_vu0.stats.code_cache_used = used;
 		s_vu0.stats.code_cache_capacity = capacity;
+		s_vu0_execute_calls = 0;
 	}
 
 	void ExecuteVu1Blocks(u32 cycles)
@@ -10364,6 +10433,16 @@ namespace VitaVU
 		ClampVuCycleAfterAdmittedBlock(VU1, startcycles, cycles);
 		VU1.VI[REG_TPC].UL >>= 3;
 		UpdateNextBlockCyclesAtExecuteExit(VU1, 0x100, false);
+		// One release publication per MTVU Execute job keeps the hot generated
+		// block path free of atomic traffic while allowing the EE producer to
+		// sample monotonic VU work without racing the worker-owned counters.
+		s_vu1_published_executed_blocks.store(s_vu1.stats.executed_blocks,
+			std::memory_order_relaxed);
+		s_vu1_published_executed_pairs.store(s_vu1.stats.executed_pairs,
+			std::memory_order_relaxed);
+		s_vu1_published_interpreter_steps.store(s_vu1.stats.interpreter_steps,
+			std::memory_order_relaxed);
+		s_vu1_completed_programs.fetch_add(1, std::memory_order_release);
 	}
 
 	void InvalidateVu1Blocks(u32 addr, u32 size)
@@ -10444,6 +10523,41 @@ namespace VitaVU
 		return stats;
 	}
 
+	Vu1TelemetryStats GetVu1TelemetryStats()
+	{
+		Vu1TelemetryStats stats;
+		stats.completed_programs =
+			s_vu1_completed_programs.load(std::memory_order_acquire);
+		stats.executed_blocks =
+			s_vu1_published_executed_blocks.load(std::memory_order_relaxed);
+		stats.executed_pairs =
+			s_vu1_published_executed_pairs.load(std::memory_order_relaxed);
+		stats.interpreter_steps =
+			s_vu1_published_interpreter_steps.load(std::memory_order_relaxed);
+		stats.generated_blocks = s_vu1.stats.compiled_blocks;
+		stats.generated_pairs = s_vu1.stats.compiled_pairs;
+		stats.generated_host_instructions = s_vu1.stats.generated_host_instructions;
+		stats.generated_host_load_instructions =
+			s_vu1.stats.generated_host_load_instructions;
+		stats.generated_host_store_instructions =
+			s_vu1.stats.generated_host_store_instructions;
+		stats.generated_helper_call_instructions =
+			s_vu1.stats.generated_helper_call_instructions;
+		stats.generated_state_load_instructions =
+			s_vu1.stats.generated_state_load_instructions;
+		stats.generated_state_store_instructions =
+			s_vu1.stats.generated_state_store_instructions;
+		stats.program_prepare_checks = s_vu1.stats.program_prepare_checks;
+		stats.program_prepare_calls = s_vu1.stats.program_prepare_calls;
+		stats.program_quick_cache_hits = s_vu1.stats.program_quick_cache_hits;
+		stats.program_compile_requests =
+			s_vu1_compile_requests_total.load(std::memory_order_relaxed);
+		stats.content_cache_hits = s_vu1.stats.content_cache_hits;
+		stats.invalidations = s_vu1.stats.invalidate_alls;
+		stats.compile_failures = s_vu1.stats.compile_failures;
+		return stats;
+	}
+
 	void ResetVu1ProviderStats()
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -10460,5 +10574,10 @@ namespace VitaVU
 		s_vu1.stats = {};
 		s_vu1.stats.code_cache_used = used;
 		s_vu1.stats.code_cache_capacity = capacity;
+		s_vu1_compile_requests_total.store(0, std::memory_order_relaxed);
+		s_vu1_completed_programs.store(0, std::memory_order_relaxed);
+		s_vu1_published_executed_blocks.store(0, std::memory_order_relaxed);
+		s_vu1_published_executed_pairs.store(0, std::memory_order_relaxed);
+		s_vu1_published_interpreter_steps.store(0, std::memory_order_relaxed);
 	}
 } // namespace VitaVU

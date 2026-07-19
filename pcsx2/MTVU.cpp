@@ -159,7 +159,11 @@ void VU_Thread::Reset()
 	m_profile_execute_enqueues = 0;
 	m_profile_wait_calls = 0;
 	m_profile_ring_waits = 0;
+	m_profile_ring_wait_spins = 0;
 	m_profile_compile_barriers = 0;
+	m_profile_queue_submissions = 0;
+	m_profile_queue_words = 0;
+	m_profile_pending_words = 0;
 	m_micro_write_pending = false;
 	m_micro_invalidate_start = 0;
 	m_micro_invalidate_end = 0;
@@ -315,6 +319,7 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 			// Performance will be smoother but it will consume extra CPU cycle
 			// on the EE thread (not an issue on 4 cores).
 			std::this_thread::yield();
+			m_profile_ring_wait_spins++;
 		}
 	}
 }
@@ -361,6 +366,9 @@ __fi u32* VU_Thread::GetWritePtr()
 __fi void VU_Thread::CommitWritePos()
 {
 	m_ato_write_pos.store(m_write_pos, std::memory_order_release);
+	m_profile_queue_submissions++;
+	m_profile_queue_words += m_profile_pending_words;
+	m_profile_pending_words = 0;
 
 	if (MTVU_ALWAYS_KICK)
 		KickStart();
@@ -402,12 +410,14 @@ __fi void VU_Thread::Write(u32 val)
 {
 	GetWritePtr()[0] = val;
 	m_write_pos += 1;
+	m_profile_pending_words += 1;
 }
 
 __fi void VU_Thread::Write(const void* src, u32 size)
 {
 	memcpy(GetWritePtr(), src, size);
 	m_write_pos += size_u32(size);
+	m_profile_pending_words += size_u32(size);
 }
 
 __fi void VU_Thread::WriteRegs(VIFregisters* src)
@@ -420,6 +430,7 @@ __fi void VU_Thread::WriteRegs(VIFregisters* src)
 	dest->top = src->top;
 	dest->itop = src->itop;
 	m_write_pos += size_u32(sizeof(VIFregistersMTVU));
+	m_profile_pending_words += size_u32(sizeof(VIFregistersMTVU));
 }
 
 // Returns Average number of vu Cycles from last 4 runs

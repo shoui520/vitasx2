@@ -1760,9 +1760,29 @@ static void DumpVSConstantBuffer(DrawConfigWriter& out, const GSHWDrawConfig::VS
 	out.WriteLn("line_aa1_width: {}", cb.line_aa1_width);
 }
 
+static u64 HashDrawBytes(const void* data, size_t size)
+{
+	if (!data || size == 0)
+		return 0;
+	const u8* bytes = static_cast<const u8*>(data);
+	u64 hash = 14695981039346656037ull;
+	for (size_t i = 0; i < size; i++)
+		hash = (hash ^ bytes[i]) * 1099511628211ull;
+	return hash;
+}
+
 static void DumpConfig(DrawConfigWriter& out, const GSHWDrawConfig& conf,
 	bool ps, bool vs, bool bs, bool dss, bool ss, bool asp, bool bmp, bool cbvs, bool cbps)
 {
+	out.WriteLn("nverts: {}", conf.nverts);
+	out.WriteLn("nindices: {}", conf.nindices);
+	out.WriteLn("indices_per_prim: {}", conf.indices_per_prim);
+	out.WriteLn("cb_vs_hash: 0x{:016x}", HashDrawBytes(&conf.cb_vs, sizeof(conf.cb_vs)));
+	out.WriteLn("cb_ps_hash: 0x{:016x}", HashDrawBytes(&conf.cb_ps, sizeof(conf.cb_ps)));
+	out.WriteLn("vertex_hash: 0x{:016x}",
+		HashDrawBytes(conf.verts, static_cast<size_t>(conf.nverts) * sizeof(GSVertex)));
+	out.WriteLn("index_hash: 0x{:016x}",
+		HashDrawBytes(conf.indices, static_cast<size_t>(conf.nindices) * sizeof(u16)));
 	out.WriteLn("topology: {} ({})", GetTopologyName(conf.topology), static_cast<u32>(conf.topology));
 	out.WriteLn("require_one_barrier: {}", conf.require_one_barrier);
 	out.WriteLn("require_full_barrier: {}", conf.require_full_barrier);

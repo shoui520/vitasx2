@@ -412,7 +412,10 @@ __nativecolor __regformat unsigned char4 main(
 		(color.a >= 128.0f ? 128.0f : 0.0f);
 #else
 #if !defined(VITASX2_TFX_NO_FBA)
-	if (Selector1.z > 0.5f && color.a < 128.0f)
+	// PCSX2 tfx_fs.glsl::ps_main applies FBA only to FMT_32. FMT_24 uses the
+	// same RGB calculation but preserves the render target's high byte through
+	// GSRendererHW's alpha-disabled component mask.
+	if (Selector1.w < 0.5f && Selector1.z > 0.5f && color.a < 128.0f)
 		color.a += 128.0f;
 #endif
 #endif

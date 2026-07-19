@@ -42,6 +42,16 @@ namespace VitaA32
 	class CodeBuffer
 	{
 	public:
+		struct GeneratedCodeStats
+		{
+			u64 host_instructions = 0;
+			u64 host_load_instructions = 0;
+			u64 host_store_instructions = 0;
+			u64 helper_call_instructions = 0;
+			u64 state_load_instructions = 0;
+			u64 state_store_instructions = 0;
+		};
+
 		CodeBuffer() = default;
 		explicit CodeBuffer(size_t capacity);
 		~CodeBuffer();
@@ -64,6 +74,11 @@ namespace VitaA32
 		size_t Size() const { return m_offset; }
 		size_t Capacity() const { return m_capacity; }
 		bool OutOfSpace() const { return m_out_of_space; }
+		// Compile-time evidence only. This scans the selected, successfully
+		// generated A32 body, so abandoned code-budget and allocator candidates do
+		// not pollute the telemetry and generated execution remains untouched.
+		GeneratedCodeStats AnalyzeGeneratedCode(
+			unsigned architectural_state_base = 4) const;
 
 		bool EmitU32(u32 instruction);
 		bool EmitMovImm8(unsigned rd, u8 value, Condition condition = Condition::AL);

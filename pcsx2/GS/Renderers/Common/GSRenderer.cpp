@@ -20,6 +20,9 @@
 #include "PerformanceMetrics.h"
 #include "pcsx2/Config.h"
 #include "VMManager.h"
+#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+#include "vita/VitaGsDrawTrace.h"
+#endif
 
 #include "common/FileSystem.h"
 #include "common/Console.h"
@@ -726,6 +729,14 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				}
 			}
 		}
+
+#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+		if (current && !blank_frame)
+		{
+			VitaGsDrawTraceRecordPresentSource(current, src_rect, src_uv,
+				draw_rect);
+		}
+#endif
 
 		if (BeginPresentFrame(false))
 		{

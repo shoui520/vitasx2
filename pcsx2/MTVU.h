@@ -39,7 +39,11 @@ class VU_Thread final {
 	u64 m_profile_execute_enqueues = 0;
 	u64 m_profile_wait_calls = 0;
 	u64 m_profile_ring_waits = 0;
+	u64 m_profile_ring_wait_spins = 0;
 	u64 m_profile_compile_barriers = 0;
+	u64 m_profile_queue_submissions = 0;
+	u64 m_profile_queue_words = 0;
+	u64 m_profile_pending_words = 0;
 	bool m_micro_write_pending = false;
 	u32 m_micro_invalidate_start = 0;
 	u32 m_micro_invalidate_end = 0;
@@ -52,7 +56,10 @@ public:
 		u64 execute_enqueues;
 		u64 wait_calls;
 		u64 ring_waits;
+		u64 ring_wait_spins;
 		u64 compile_barriers;
+		u64 queue_submissions;
+		u64 queue_words;
 	};
 
 	alignas(16)  vifStruct        vif;
@@ -103,7 +110,9 @@ public:
 	__fi ProducerProfileStats GetProducerProfileStats() const
 	{
 		return {m_profile_execute_enqueues, m_profile_wait_calls,
-			m_profile_ring_waits, m_profile_compile_barriers};
+			m_profile_ring_waits, m_profile_ring_wait_spins,
+			m_profile_compile_barriers, m_profile_queue_submissions,
+			m_profile_queue_words};
 	}
 
 	// These methods are VU-worker-only. Release publication in EndProgram()

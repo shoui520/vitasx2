@@ -46,6 +46,86 @@ namespace VitaGXM
 		bool depth_stencil = false;
 	};
 
+	enum class TextureWriterKind : std::uint8_t
+	{
+		None = 0,
+		Clear = 1,
+		Tfx = 2,
+		Copy = 3,
+		Merge = 4,
+		Interlace = 5,
+	};
+
+	// Bounded GS-worker provenance for the last operation which populated a
+	// texture. This is deliberately plain per-texture state: RenderHW and the
+	// output merge run on the same worker, so collecting it adds no atomics to
+	// the draw path. The VSync publisher snapshots only the displayed target.
+	struct TextureWriterTelemetry
+	{
+		// Monotonic content version for trace-only readback caching. All GXM
+		// operations which change a texture pass through RecordWriter() or
+		// RecordTfxWriter(); consumers can therefore snapshot once per version.
+		std::uint64_t content_generation = 0;
+		std::uint64_t tfx_writes = 0;
+		std::uint64_t textured_tfx_writes = 0;
+		std::uint64_t untextured_tfx_writes = 0;
+		std::uint64_t render_target_source_tfx_writes = 0;
+		std::uint64_t full_mask_tfx_writes = 0;
+		std::uint64_t rgb_only_tfx_writes = 0;
+		std::uint64_t alpha_only_tfx_writes = 0;
+		std::uint64_t other_mask_tfx_writes = 0;
+		std::uint64_t ps_lo = 0;
+		std::uint64_t ps_hi = 0;
+		std::uint64_t draw_area = 0;
+		std::uint64_t sample_area = 0;
+		std::uint32_t source_id = 0;
+		std::uint32_t source_size = 0;
+		std::uint32_t blend = 0;
+		std::uint32_t selector_keys = 0;
+		std::uint64_t last_rgb_ps_lo = 0;
+		std::uint64_t last_rgb_ps_hi = 0;
+		std::uint64_t last_rgb_draw_area = 0;
+		std::uint64_t last_rgb_sample_area = 0;
+		std::uint32_t last_rgb_source_id = 0;
+		std::uint32_t last_rgb_source_size = 0;
+		std::uint32_t last_rgb_blend = 0;
+		std::uint32_t last_rgb_selector_keys = 0;
+		std::uint64_t source_writer_tfx_writes = 0;
+		std::uint64_t source_writer_textured_tfx_writes = 0;
+		std::uint64_t source_writer_untextured_tfx_writes = 0;
+		std::uint64_t source_writer_render_target_source_tfx_writes = 0;
+		std::uint64_t source_writer_full_mask_tfx_writes = 0;
+		std::uint64_t source_writer_rgb_only_tfx_writes = 0;
+		std::uint64_t source_writer_alpha_only_tfx_writes = 0;
+		std::uint64_t source_writer_other_mask_tfx_writes = 0;
+		std::uint64_t source_writer_ps_lo = 0;
+		std::uint64_t source_writer_ps_hi = 0;
+		std::uint64_t source_writer_draw_area = 0;
+		std::uint64_t source_writer_sample_area = 0;
+		std::uint32_t source_writer_source_id = 0;
+		std::uint32_t source_writer_source_size = 0;
+		std::uint32_t source_writer_blend = 0;
+		std::uint32_t source_writer_selector_keys = 0;
+		std::uint64_t source_writer_last_rgb_ps_lo = 0;
+		std::uint64_t source_writer_last_rgb_ps_hi = 0;
+		std::uint64_t source_writer_last_rgb_draw_area = 0;
+		std::uint64_t source_writer_last_rgb_sample_area = 0;
+		std::uint32_t source_writer_last_rgb_source_id = 0;
+		std::uint32_t source_writer_last_rgb_source_size = 0;
+		std::uint32_t source_writer_last_rgb_blend = 0;
+		std::uint32_t source_writer_last_rgb_selector_keys = 0;
+		TextureWriterKind kind = TextureWriterKind::None;
+		std::uint8_t topology = 0;
+		std::uint8_t color_mask = 0;
+		std::uint8_t last_rgb_topology = 0;
+		std::uint8_t last_rgb_color_mask = 0;
+		TextureWriterKind source_writer_kind = TextureWriterKind::None;
+		std::uint8_t source_writer_topology = 0;
+		std::uint8_t source_writer_color_mask = 0;
+		std::uint8_t source_writer_last_rgb_topology = 0;
+		std::uint8_t source_writer_last_rgb_color_mask = 0;
+	};
+
 	const TextureFormatInfo* GetTextureFormatInfo(GSTexture::Format format);
 
 	class GSTextureGXM;
@@ -127,6 +207,17 @@ namespace VitaGXM
 		void MarkTransferUse(std::uint64_t serial);
 		const TextureCompletionFence& CompletionFence() const { return m_fence; }
 		bool HadOperationFailure() const { return m_operation_failed; }
+		std::uint32_t TelemetryId() const { return m_telemetry_id; }
+		const TextureWriterTelemetry& WriterTelemetry() const
+		{
+			return m_writer_telemetry;
+		}
+		void RecordWriter(TextureWriterKind kind, const GSTextureGXM* source);
+		void RecordTfxWriter(const GSTextureGXM* source, std::uint64_t ps_lo,
+			std::uint64_t ps_hi, std::uint32_t blend,
+			std::uint32_t selector_keys, std::uint8_t topology,
+			std::uint8_t color_mask,
+			std::uint64_t draw_area, std::uint64_t sample_area);
 
 	private:
 		struct PendingMap
@@ -156,6 +247,8 @@ namespace VitaGXM
 		std::vector<TextureLevelLayout> m_levels;
 		PendingMap m_pending_map;
 		TextureCompletionFence m_fence{};
+		TextureWriterTelemetry m_writer_telemetry{};
+		std::uint32_t m_telemetry_id = 0;
 		std::uint32_t m_depth_pitch = 0;
 		std::uint32_t m_stencil_pitch = 0;
 		bool m_has_color_surface = false;

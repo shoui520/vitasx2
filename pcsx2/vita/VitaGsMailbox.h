@@ -13,6 +13,10 @@ namespace VitaGS
 {
 	void SetNativePresenterEnabled(bool enabled);
 	bool IsNativePresenterEnabled();
+	// Mirrors PCSX2's trace-start frame ownership at
+	// VMManager::EntryPointCompilingOnCPUThread(). Performance windows after this
+	// call use the game ELF entry as their VSync origin.
+	void NotifyPerformanceElfEntry();
 
 	const u8* GetLocalMemoryForTrace(size_t* size);
 

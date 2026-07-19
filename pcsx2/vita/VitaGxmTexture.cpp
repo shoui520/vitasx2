@@ -8,6 +8,7 @@
 #include "common/Console.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -16,6 +17,8 @@ namespace VitaGXM
 {
 	namespace
 	{
+		std::atomic<std::uint32_t> s_next_texture_telemetry_id{1};
+
 		constexpr std::uint32_t TEXTURE_UPLOAD_ALIGNMENT = 64;
 		constexpr std::uint32_t TEXTURE_UPLOAD_PITCH_ALIGNMENT = 64;
 		constexpr std::uint32_t DOWNLOAD_PITCH_ALIGNMENT = 64;
@@ -142,8 +145,205 @@ namespace VitaGXM
 	}
 
 	GSTextureGXM::GSTextureGXM(TextureOwner* owner)
-		: m_owner(owner)
+		: m_owner(owner),
+		  m_telemetry_id(s_next_texture_telemetry_id.fetch_add(
+			  1, std::memory_order_relaxed))
 	{
+	}
+
+	void GSTextureGXM::RecordWriter(TextureWriterKind kind,
+		const GSTextureGXM* source)
+	{
+		m_writer_telemetry.content_generation++;
+		const TextureWriterTelemetry* const source_writer =
+			source ? &source->WriterTelemetry() : nullptr;
+		m_writer_telemetry.kind = kind;
+		m_writer_telemetry.source_id = source ? source->TelemetryId() : 0;
+		m_writer_telemetry.source_size = source ?
+			(static_cast<std::uint32_t>(source->GetWidth()) & 0xffffu) |
+			((static_cast<std::uint32_t>(source->GetHeight()) & 0xffffu) << 16) : 0;
+		m_writer_telemetry.ps_lo = 0;
+		m_writer_telemetry.ps_hi = 0;
+		m_writer_telemetry.blend = 0;
+		m_writer_telemetry.selector_keys = 0;
+		m_writer_telemetry.topology = 0;
+		m_writer_telemetry.color_mask = 0;
+		m_writer_telemetry.draw_area = 0;
+		m_writer_telemetry.sample_area = 0;
+		m_writer_telemetry.source_writer_tfx_writes =
+			source_writer ? source_writer->tfx_writes : 0;
+		m_writer_telemetry.source_writer_textured_tfx_writes =
+			source_writer ? source_writer->textured_tfx_writes : 0;
+		m_writer_telemetry.source_writer_untextured_tfx_writes =
+			source_writer ? source_writer->untextured_tfx_writes : 0;
+		m_writer_telemetry.source_writer_render_target_source_tfx_writes =
+			source_writer ? source_writer->render_target_source_tfx_writes : 0;
+		m_writer_telemetry.source_writer_full_mask_tfx_writes =
+			source_writer ? source_writer->full_mask_tfx_writes : 0;
+		m_writer_telemetry.source_writer_rgb_only_tfx_writes =
+			source_writer ? source_writer->rgb_only_tfx_writes : 0;
+		m_writer_telemetry.source_writer_alpha_only_tfx_writes =
+			source_writer ? source_writer->alpha_only_tfx_writes : 0;
+		m_writer_telemetry.source_writer_other_mask_tfx_writes =
+			source_writer ? source_writer->other_mask_tfx_writes : 0;
+		m_writer_telemetry.source_writer_ps_lo =
+			source_writer ? source_writer->ps_lo : 0;
+		m_writer_telemetry.source_writer_ps_hi =
+			source_writer ? source_writer->ps_hi : 0;
+		m_writer_telemetry.source_writer_draw_area =
+			source_writer ? source_writer->draw_area : 0;
+		m_writer_telemetry.source_writer_sample_area =
+			source_writer ? source_writer->sample_area : 0;
+		m_writer_telemetry.source_writer_source_id =
+			source_writer ? source_writer->source_id : 0;
+		m_writer_telemetry.source_writer_source_size =
+			source_writer ? source_writer->source_size : 0;
+		m_writer_telemetry.source_writer_blend =
+			source_writer ? source_writer->blend : 0;
+		m_writer_telemetry.source_writer_selector_keys =
+			source_writer ? source_writer->selector_keys : 0;
+		m_writer_telemetry.source_writer_last_rgb_ps_lo =
+			source_writer ? source_writer->last_rgb_ps_lo : 0;
+		m_writer_telemetry.source_writer_last_rgb_ps_hi =
+			source_writer ? source_writer->last_rgb_ps_hi : 0;
+		m_writer_telemetry.source_writer_last_rgb_draw_area =
+			source_writer ? source_writer->last_rgb_draw_area : 0;
+		m_writer_telemetry.source_writer_last_rgb_sample_area =
+			source_writer ? source_writer->last_rgb_sample_area : 0;
+		m_writer_telemetry.source_writer_last_rgb_source_id =
+			source_writer ? source_writer->last_rgb_source_id : 0;
+		m_writer_telemetry.source_writer_last_rgb_source_size =
+			source_writer ? source_writer->last_rgb_source_size : 0;
+		m_writer_telemetry.source_writer_last_rgb_blend =
+			source_writer ? source_writer->last_rgb_blend : 0;
+		m_writer_telemetry.source_writer_last_rgb_selector_keys =
+			source_writer ? source_writer->last_rgb_selector_keys : 0;
+		m_writer_telemetry.source_writer_kind = source_writer ?
+			source_writer->kind : TextureWriterKind::None;
+		m_writer_telemetry.source_writer_topology =
+			source_writer ? source_writer->topology : 0;
+		m_writer_telemetry.source_writer_color_mask =
+			source_writer ? source_writer->color_mask : 0;
+		m_writer_telemetry.source_writer_last_rgb_topology =
+			source_writer ? source_writer->last_rgb_topology : 0;
+		m_writer_telemetry.source_writer_last_rgb_color_mask =
+			source_writer ? source_writer->last_rgb_color_mask : 0;
+	}
+
+	void GSTextureGXM::RecordTfxWriter(const GSTextureGXM* source,
+		std::uint64_t ps_lo, std::uint64_t ps_hi, std::uint32_t blend,
+		std::uint32_t selector_keys, std::uint8_t topology,
+		std::uint8_t color_mask,
+		std::uint64_t draw_area, std::uint64_t sample_area)
+	{
+		m_writer_telemetry.content_generation++;
+		const TextureWriterTelemetry* const source_writer =
+			source ? &source->WriterTelemetry() : nullptr;
+		m_writer_telemetry.tfx_writes++;
+		if (source)
+		{
+			m_writer_telemetry.textured_tfx_writes++;
+			if (source->IsRenderTarget())
+				m_writer_telemetry.render_target_source_tfx_writes++;
+		}
+		else
+		{
+			m_writer_telemetry.untextured_tfx_writes++;
+		}
+		switch (color_mask & 0xfu)
+		{
+			case 0xf: m_writer_telemetry.full_mask_tfx_writes++; break;
+			case 0x7: m_writer_telemetry.rgb_only_tfx_writes++; break;
+			case 0x8: m_writer_telemetry.alpha_only_tfx_writes++; break;
+			default: m_writer_telemetry.other_mask_tfx_writes++; break;
+		}
+		m_writer_telemetry.kind = TextureWriterKind::Tfx;
+		m_writer_telemetry.source_id = source ? source->TelemetryId() : 0;
+		m_writer_telemetry.source_size = source ?
+			(static_cast<std::uint32_t>(source->GetWidth()) & 0xffffu) |
+			((static_cast<std::uint32_t>(source->GetHeight()) & 0xffffu) << 16) : 0;
+		m_writer_telemetry.ps_lo = ps_lo;
+		m_writer_telemetry.ps_hi = ps_hi;
+		m_writer_telemetry.blend = blend;
+		m_writer_telemetry.selector_keys = selector_keys;
+		m_writer_telemetry.topology = topology;
+		m_writer_telemetry.color_mask = color_mask & 0xfu;
+		m_writer_telemetry.draw_area = draw_area;
+		m_writer_telemetry.sample_area = sample_area;
+		if (color_mask & 0x7u)
+		{
+			m_writer_telemetry.last_rgb_ps_lo = ps_lo;
+			m_writer_telemetry.last_rgb_ps_hi = ps_hi;
+			m_writer_telemetry.last_rgb_draw_area = draw_area;
+			m_writer_telemetry.last_rgb_sample_area = sample_area;
+			m_writer_telemetry.last_rgb_source_id =
+				source ? source->TelemetryId() : 0;
+			m_writer_telemetry.last_rgb_source_size = source ?
+				(static_cast<std::uint32_t>(source->GetWidth()) & 0xffffu) |
+				((static_cast<std::uint32_t>(source->GetHeight()) & 0xffffu) << 16) : 0;
+			m_writer_telemetry.last_rgb_blend = blend;
+			m_writer_telemetry.last_rgb_selector_keys = selector_keys;
+			m_writer_telemetry.last_rgb_topology = topology;
+			m_writer_telemetry.last_rgb_color_mask = color_mask & 0xfu;
+		}
+		m_writer_telemetry.source_writer_tfx_writes =
+			source_writer ? source_writer->tfx_writes : 0;
+		m_writer_telemetry.source_writer_textured_tfx_writes =
+			source_writer ? source_writer->textured_tfx_writes : 0;
+		m_writer_telemetry.source_writer_untextured_tfx_writes =
+			source_writer ? source_writer->untextured_tfx_writes : 0;
+		m_writer_telemetry.source_writer_render_target_source_tfx_writes =
+			source_writer ? source_writer->render_target_source_tfx_writes : 0;
+		m_writer_telemetry.source_writer_full_mask_tfx_writes =
+			source_writer ? source_writer->full_mask_tfx_writes : 0;
+		m_writer_telemetry.source_writer_rgb_only_tfx_writes =
+			source_writer ? source_writer->rgb_only_tfx_writes : 0;
+		m_writer_telemetry.source_writer_alpha_only_tfx_writes =
+			source_writer ? source_writer->alpha_only_tfx_writes : 0;
+		m_writer_telemetry.source_writer_other_mask_tfx_writes =
+			source_writer ? source_writer->other_mask_tfx_writes : 0;
+		m_writer_telemetry.source_writer_ps_lo =
+			source_writer ? source_writer->ps_lo : 0;
+		m_writer_telemetry.source_writer_ps_hi =
+			source_writer ? source_writer->ps_hi : 0;
+		m_writer_telemetry.source_writer_draw_area =
+			source_writer ? source_writer->draw_area : 0;
+		m_writer_telemetry.source_writer_sample_area =
+			source_writer ? source_writer->sample_area : 0;
+		m_writer_telemetry.source_writer_source_id =
+			source_writer ? source_writer->source_id : 0;
+		m_writer_telemetry.source_writer_source_size =
+			source_writer ? source_writer->source_size : 0;
+		m_writer_telemetry.source_writer_blend =
+			source_writer ? source_writer->blend : 0;
+		m_writer_telemetry.source_writer_selector_keys =
+			source_writer ? source_writer->selector_keys : 0;
+		m_writer_telemetry.source_writer_last_rgb_ps_lo =
+			source_writer ? source_writer->last_rgb_ps_lo : 0;
+		m_writer_telemetry.source_writer_last_rgb_ps_hi =
+			source_writer ? source_writer->last_rgb_ps_hi : 0;
+		m_writer_telemetry.source_writer_last_rgb_draw_area =
+			source_writer ? source_writer->last_rgb_draw_area : 0;
+		m_writer_telemetry.source_writer_last_rgb_sample_area =
+			source_writer ? source_writer->last_rgb_sample_area : 0;
+		m_writer_telemetry.source_writer_last_rgb_source_id =
+			source_writer ? source_writer->last_rgb_source_id : 0;
+		m_writer_telemetry.source_writer_last_rgb_source_size =
+			source_writer ? source_writer->last_rgb_source_size : 0;
+		m_writer_telemetry.source_writer_last_rgb_blend =
+			source_writer ? source_writer->last_rgb_blend : 0;
+		m_writer_telemetry.source_writer_last_rgb_selector_keys =
+			source_writer ? source_writer->last_rgb_selector_keys : 0;
+		m_writer_telemetry.source_writer_kind = source_writer ?
+			source_writer->kind : TextureWriterKind::None;
+		m_writer_telemetry.source_writer_topology =
+			source_writer ? source_writer->topology : 0;
+		m_writer_telemetry.source_writer_color_mask =
+			source_writer ? source_writer->color_mask : 0;
+		m_writer_telemetry.source_writer_last_rgb_topology =
+			source_writer ? source_writer->last_rgb_topology : 0;
+		m_writer_telemetry.source_writer_last_rgb_color_mask =
+			source_writer ? source_writer->last_rgb_color_mask : 0;
 	}
 
 	std::unique_ptr<GSTextureGXM> GSTextureGXM::Create(TextureOwner* owner,

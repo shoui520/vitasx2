@@ -102,6 +102,36 @@ extern u64 g_vita_a32_iop_private_event_entries;
 
 struct VitaA32EeProviderStats
 {
+	// Compile-time code-generation totals. These count each successfully
+	// published A32 block once; compiled_blocks below remains the existing
+	// runtime provider-boundary count.
+	u64 generated_blocks = 0;
+	u64 generated_host_instructions = 0;
+	u64 generated_host_load_instructions = 0;
+	u64 generated_host_store_instructions = 0;
+	u64 generated_helper_call_instructions = 0;
+	u64 generated_state_load_instructions = 0;
+	u64 generated_state_store_instructions = 0;
+	// Guest-family mix of the successfully published blocks above.  This is
+	// compile-seam evidence only: normal generated execution performs no
+	// telemetry stores.  Families follow VitaEeBlockCompiler.cpp's owning
+	// top-level EmitOpcode()/branch dispatch.
+	u64 generated_guest_instructions = 0;
+	u64 generated_integer_instructions = 0;
+	u64 generated_branch_instructions = 0;
+	u64 generated_gpr_load_instructions = 0;
+	u64 generated_gpr_store_instructions = 0;
+	u64 generated_mmi_instructions = 0;
+	u64 generated_cop0_instructions = 0;
+	u64 generated_cop1_instructions = 0;
+	u64 generated_cop2_instructions = 0;
+	u64 generated_other_instructions = 0;
+	u32 largest_generated_block_pc = 0;
+	u32 largest_generated_block_guest_instructions = 0;
+	u32 largest_generated_block_host_instructions = 0;
+	u32 largest_generated_block_helper_calls = 0;
+	u32 largest_generated_block_state_loads = 0;
+	u32 largest_generated_block_state_stores = 0;
 	u32 compiled_blocks = 0;
 	u32 compiled_instructions = 0;
 	u32 interpreter_steps = 0;
@@ -130,6 +160,20 @@ struct VitaA32EeProviderStats
 	u32 exact_trace_branch_likely_fallbacks = 0;
 	u32 execute_failed_fallbacks = 0;
 	u32 interpreter_path_fallbacks = 0;
+};
+
+struct VitaA32EeGeneratedGuestMix
+{
+	u32 instructions = 0;
+	u32 integer = 0;
+	u32 branch = 0;
+	u32 gpr_load = 0;
+	u32 gpr_store = 0;
+	u32 mmi = 0;
+	u32 cop0 = 0;
+	u32 cop1 = 0;
+	u32 cop2 = 0;
+	u32 other = 0;
 };
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -180,6 +224,11 @@ enum class VitaA32EeFallbackReason : u32
 const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason);
 void VitaResetA32EeProviderStats();
 VitaA32EeProviderStats VitaGetA32EeProviderStats();
+void VitaRecordA32EeGeneratedCode(u32 start_pc,
+	const VitaA32EeGeneratedGuestMix& guest_mix, u64 host_instructions,
+	u64 host_load_instructions, u64 host_store_instructions,
+	u64 helper_call_instructions, u64 state_load_instructions,
+	u64 state_store_instructions);
 void VitaRequestA32EeCacheReset();
 // Normal product execution enables PCSX2-style DispatcherEvent fallthrough.
 // Validation modes leave it disabled unless they explicitly own the event

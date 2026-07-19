@@ -24,6 +24,15 @@ namespace VitaVU
 		u64 interpreter_steps = 0;
 		u32 compiled_blocks = 0;
 		u32 compiled_pairs = 0;
+		u64 generated_host_instructions = 0;
+		u64 generated_host_load_instructions = 0;
+		u64 generated_host_store_instructions = 0;
+		u64 generated_helper_call_instructions = 0;
+		u64 generated_state_load_instructions = 0;
+		u64 generated_state_store_instructions = 0;
+		u64 program_prepare_checks = 0;
+		u64 program_prepare_calls = 0;
+		u64 program_quick_cache_hits = 0;
 		u32 scan_rejects = 0;
 		u32 compile_failures = 0;
 		u32 cycle_resident_blocks = 0;
@@ -119,6 +128,55 @@ namespace VitaVU
 		size_t code_cache_capacity = 0;
 	};
 
+	// Cross-thread-safe, deliberately narrow view used by recurring Vita
+	// performance windows. Compile/cache fields are EE-producer-owned; runtime
+	// fields are release-published by the VU worker once per Execute() job.
+	struct Vu1TelemetryStats
+	{
+		u64 completed_programs = 0;
+		u64 executed_blocks = 0;
+		u64 executed_pairs = 0;
+		u64 interpreter_steps = 0;
+		u64 generated_blocks = 0;
+		u64 generated_pairs = 0;
+		u64 generated_host_instructions = 0;
+		u64 generated_host_load_instructions = 0;
+		u64 generated_host_store_instructions = 0;
+		u64 generated_helper_call_instructions = 0;
+		u64 generated_state_load_instructions = 0;
+		u64 generated_state_store_instructions = 0;
+		u64 program_prepare_checks = 0;
+		u64 program_prepare_calls = 0;
+		u64 program_quick_cache_hits = 0;
+		u64 program_compile_requests = 0;
+		u64 content_cache_hits = 0;
+		u64 invalidations = 0;
+		u64 compile_failures = 0;
+	};
+
+	// VU0 micro execution runs synchronously on the EE thread, so this snapshot
+	// requires no cross-core publication atomics.  COP2 macro instructions are
+	// accounted separately by the EE generated guest-family telemetry.
+	struct Vu0TelemetryStats
+	{
+		u64 execute_calls = 0;
+		u64 executed_blocks = 0;
+		u64 executed_pairs = 0;
+		u64 interpreter_steps = 0;
+		u64 generated_blocks = 0;
+		u64 generated_pairs = 0;
+		u64 generated_host_instructions = 0;
+		u64 generated_host_load_instructions = 0;
+		u64 generated_host_store_instructions = 0;
+		u64 generated_helper_call_instructions = 0;
+		u64 generated_state_load_instructions = 0;
+		u64 generated_state_store_instructions = 0;
+		u64 content_cache_hits = 0;
+		u64 invalidations = 0;
+		u64 scan_rejects = 0;
+		u64 compile_failures = 0;
+	};
+
 	// recMicroVU1::Execute() body: mirrors InterpVU1::Execute()'s loop while
 	// routing eligible windows through compiled blocks.
 	void ExecuteVu1Blocks(u32 cycles);
@@ -141,6 +199,7 @@ namespace VitaVU
 	void ShutdownVu1Blocks();
 
 	Vu1ProviderStats GetVu1ProviderStats();
+	Vu1TelemetryStats GetVu1TelemetryStats();
 	void ResetVu1ProviderStats();
 
 	// recMicroVU0::Execute() body: mirrors InterpVU0::Execute()'s loop while
@@ -153,5 +212,6 @@ namespace VitaVU
 	void ShutdownVu0Blocks();
 
 	Vu1ProviderStats GetVu0ProviderStats();
+	Vu0TelemetryStats GetVu0TelemetryStats();
 	void ResetVu0ProviderStats();
 }

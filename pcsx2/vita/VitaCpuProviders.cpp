@@ -1684,6 +1684,48 @@ VitaA32EeProviderStats VitaGetA32EeProviderStats()
 	return result;
 }
 
+void VitaRecordA32EeGeneratedCode(u32 start_pc,
+	const VitaA32EeGeneratedGuestMix& guest_mix, u64 host_instructions,
+	u64 host_load_instructions, u64 host_store_instructions,
+	u64 helper_call_instructions, u64 state_load_instructions,
+	u64 state_store_instructions)
+{
+	s_ee_a32_stats.generated_blocks++;
+	s_ee_a32_stats.generated_host_instructions += host_instructions;
+	s_ee_a32_stats.generated_host_load_instructions += host_load_instructions;
+	s_ee_a32_stats.generated_host_store_instructions += host_store_instructions;
+	s_ee_a32_stats.generated_helper_call_instructions += helper_call_instructions;
+	s_ee_a32_stats.generated_state_load_instructions += state_load_instructions;
+	s_ee_a32_stats.generated_state_store_instructions += state_store_instructions;
+	s_ee_a32_stats.generated_guest_instructions += guest_mix.instructions;
+	s_ee_a32_stats.generated_integer_instructions += guest_mix.integer;
+	s_ee_a32_stats.generated_branch_instructions += guest_mix.branch;
+	s_ee_a32_stats.generated_gpr_load_instructions += guest_mix.gpr_load;
+	s_ee_a32_stats.generated_gpr_store_instructions += guest_mix.gpr_store;
+	s_ee_a32_stats.generated_mmi_instructions += guest_mix.mmi;
+	s_ee_a32_stats.generated_cop0_instructions += guest_mix.cop0;
+	s_ee_a32_stats.generated_cop1_instructions += guest_mix.cop1;
+	s_ee_a32_stats.generated_cop2_instructions += guest_mix.cop2;
+	s_ee_a32_stats.generated_other_instructions += guest_mix.other;
+	if (host_instructions > s_ee_a32_stats.largest_generated_block_host_instructions)
+	{
+		s_ee_a32_stats.largest_generated_block_pc = start_pc;
+		s_ee_a32_stats.largest_generated_block_guest_instructions =
+			guest_mix.instructions;
+		s_ee_a32_stats.largest_generated_block_host_instructions =
+			static_cast<u32>(host_instructions > UINT32_MAX ? UINT32_MAX : host_instructions);
+		s_ee_a32_stats.largest_generated_block_helper_calls =
+			static_cast<u32>(helper_call_instructions > UINT32_MAX ?
+				UINT32_MAX : helper_call_instructions);
+		s_ee_a32_stats.largest_generated_block_state_loads =
+			static_cast<u32>(state_load_instructions > UINT32_MAX ?
+				UINT32_MAX : state_load_instructions);
+		s_ee_a32_stats.largest_generated_block_state_stores =
+			static_cast<u32>(state_store_instructions > UINT32_MAX ?
+				UINT32_MAX : state_store_instructions);
+	}
+}
+
 void VitaSetA32EeInFrameEventResumeEnabled(bool enabled)
 {
 	// This is a product/validation policy switch, not guest state. If it changes

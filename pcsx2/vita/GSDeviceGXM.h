@@ -7,6 +7,112 @@
 
 #include <memory>
 
+struct VitaGxmPerformanceCounters
+{
+	u64 draw_calls = 0;
+	u64 draw_indices = 0;
+	u64 vertex_upload_bytes = 0;
+	u64 index_upload_bytes = 0;
+	u64 texture_uploads = 0;
+	u64 texture_upload_bytes = 0;
+	u64 texture_readbacks = 0;
+	u64 texture_readback_bytes = 0;
+	u64 tfx_draws = 0;
+	u64 textured_tfx_draws = 0;
+	u64 render_target_source_draws = 0;
+	u64 depth_source_draws = 0;
+	u64 rt_hazard_draws = 0;
+	u64 depth_hazard_draws = 0;
+	u64 feedback_rt_draws = 0;
+	u64 feedback_depth_draws = 0;
+	u64 software_blend_draws = 0;
+	u64 fixed_blend_draws = 0;
+	u64 alpha_test_draws = 0;
+	u64 partial_color_mask_draws = 0;
+	u64 feedback_snapshots = 0;
+	u64 feedback_snapshot_bytes = 0;
+	u64 merge_calls = 0;
+	u64 merge_rc1_draws = 0;
+	u64 merge_rc2_draws = 0;
+	u64 present_calls = 0;
+	u64 interlace_calls = 0;
+	u64 last_merge_pmode = 0;
+	u64 last_merge_extbuf = 0;
+	u32 last_merge_background = 0;
+	u32 last_merge_source_sizes[2]{};
+	u32 last_merge_source_ids[2]{};
+	u8 last_merge_source_mask = 0;
+	u8 last_merge_source_states = 0;
+	u64 last_merge_writer_tfx_writes = 0;
+	u64 last_merge_writer_ps_lo = 0;
+	u64 last_merge_writer_ps_hi = 0;
+	u64 last_merge_writer_draw_area = 0;
+	u64 last_merge_writer_sample_area = 0;
+	u32 last_merge_writer_source_id = 0;
+	u32 last_merge_writer_source_size = 0;
+	u32 last_merge_writer_blend = 0;
+	u32 last_merge_writer_selector_keys = 0;
+	u8 last_merge_trace_circuit = 0;
+	u8 last_merge_writer_kind = 0;
+	u8 last_merge_writer_topology = 0;
+	u64 last_merge_parent_tfx_writes = 0;
+	u64 last_merge_parent_textured_tfx_writes = 0;
+	u64 last_merge_parent_untextured_tfx_writes = 0;
+	u64 last_merge_parent_render_target_source_tfx_writes = 0;
+	u64 last_merge_parent_full_mask_tfx_writes = 0;
+	u64 last_merge_parent_rgb_only_tfx_writes = 0;
+	u64 last_merge_parent_alpha_only_tfx_writes = 0;
+	u64 last_merge_parent_other_mask_tfx_writes = 0;
+	u64 last_merge_parent_ps_lo = 0;
+	u64 last_merge_parent_ps_hi = 0;
+	u64 last_merge_parent_draw_area = 0;
+	u64 last_merge_parent_sample_area = 0;
+	u32 last_merge_parent_source_id = 0;
+	u32 last_merge_parent_source_size = 0;
+	u32 last_merge_parent_blend = 0;
+	u32 last_merge_parent_selector_keys = 0;
+	u64 last_merge_parent_last_rgb_ps_lo = 0;
+	u64 last_merge_parent_last_rgb_ps_hi = 0;
+	u64 last_merge_parent_last_rgb_draw_area = 0;
+	u64 last_merge_parent_last_rgb_sample_area = 0;
+	u32 last_merge_parent_last_rgb_source_id = 0;
+	u32 last_merge_parent_last_rgb_source_size = 0;
+	u32 last_merge_parent_last_rgb_blend = 0;
+	u32 last_merge_parent_last_rgb_selector_keys = 0;
+	u8 last_merge_parent_kind = 0;
+	u8 last_merge_parent_topology = 0;
+	u8 last_merge_parent_color_mask = 0;
+	u8 last_merge_parent_last_rgb_topology = 0;
+	u8 last_merge_parent_last_rgb_color_mask = 0;
+	u64 psm24_draws = 0;
+	u64 device_rejects = 0;
+	u32 last_device_reject_hash = 0;
+	u64 last_feedback_ps_lo = 0;
+	u64 last_feedback_ps_hi = 0;
+	u32 last_feedback_blend = 0;
+	u8 last_feedback_vs = 0;
+	u8 last_feedback_sampler = 0;
+	u8 last_feedback_depth = 0;
+	u8 last_feedback_colormask = 0;
+	u8 last_feedback_topology = 0;
+	u8 last_feedback_hazard = 0;
+	u64 rejected_tfx_draws = 0;
+	u64 last_rejected_tfx_features = 0;
+	u64 last_rejected_tfx_ps_lo = 0;
+	u64 last_rejected_tfx_ps_hi = 0;
+	u32 last_rejected_tfx_blend = 0;
+	u8 last_rejected_tfx_vs = 0;
+	u8 last_rejected_tfx_sampler = 0;
+	u8 last_rejected_tfx_depth = 0;
+	u8 last_rejected_tfx_colormask = 0;
+	u8 last_rejected_tfx_topology = 0;
+};
+
+// The GS worker updates plain local totals and publishes them once per VSync.
+// This avoids one cross-core atomic RMW per draw/upload on Cortex-A9.
+void VitaGxmPublishPerformanceCounters();
+VitaGxmPerformanceCounters VitaGxmGetPublishedPerformanceCounters();
+
 // Direct PCSX2 hardware-GS backend for the Vita's SGX543MP4+.  This class is
 // intentionally a GSDevice rather than an OpenGL compatibility layer: PCSX2's
 // GSRendererHW and GSTextureCache continue to own PS2 behavior, while this

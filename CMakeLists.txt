@@ -60,6 +60,42 @@ if(VITASX2_VITA_SOFTWARE_GS_CONTROL)
 	add_compile_definitions(VITASX2_VITA_SOFTWARE_GS_CONTROL=1)
 endif()
 
+option(VITASX2_GS_DRAW_TRACE
+	"Record a bounded binary GSHWDrawConfig stream for PCSX2-oracle comparison."
+	OFF)
+set(VITASX2_GS_DRAW_TRACE_RECORDS "4096" CACHE STRING
+	"Maximum GSHWDrawConfig records in an opt-in Vita GS draw trace.")
+set(VITASX2_GS_DRAW_TRACE_SKIP_RECORDS "0" CACHE STRING
+	"GSHWDrawConfig records to skip after ELF entry before tracing.")
+set(VITASX2_GS_DRAW_TRACE_START_VSYNC "0" CACHE STRING
+	"Do not record GS draws or worker packets before this VSync after ELF entry.")
+set(VITASX2_GS_DRAW_TRACE_VSYNCS "600" CACHE STRING
+	"Maximum VSyncs after ELF entry before closing an opt-in Vita GS draw trace.")
+set(VITASX2_GS_DRAW_TRACE_RT_SNAPSHOTS "512" CACHE STRING
+	"Maximum changed render-target source snapshots in an opt-in Vita GS draw trace.")
+set(VITASX2_GS_DRAW_TRACE_RT_AFTER_DRAWS "0" CACHE STRING
+	"Maximum post-draw render-target readbacks in an opt-in Vita GS draw trace.")
+set(VITASX2_GS_DRAW_TRACE_PACKETS "0" CACHE STRING
+	"Maximum raw GS worker packets in an opt-in Vita GS draw trace.")
+set(VITASX2_GS_DRAW_TRACE_PRESENT_VSYNC "0" CACHE STRING
+	"Capture the merged source and final display buffer at this opt-in trace VSync; zero disables capture.")
+if(VITASX2_GS_DRAW_TRACE)
+	# Compile the recorder into every translation unit which owns one side of
+	# the GSRendererHW -> GSDeviceGXM boundary. The normal product has neither
+	# these calls nor a per-draw enable branch.
+	add_compile_definitions(
+		VITASX2_GS_DRAW_TRACE=1
+		VITASX2_GS_DRAW_TRACE_RECORDS=${VITASX2_GS_DRAW_TRACE_RECORDS}
+		VITASX2_GS_DRAW_TRACE_SKIP_RECORDS=${VITASX2_GS_DRAW_TRACE_SKIP_RECORDS}
+		VITASX2_GS_DRAW_TRACE_START_VSYNC=${VITASX2_GS_DRAW_TRACE_START_VSYNC}
+		VITASX2_GS_DRAW_TRACE_VSYNCS=${VITASX2_GS_DRAW_TRACE_VSYNCS}
+		VITASX2_GS_DRAW_TRACE_RT_SNAPSHOTS=${VITASX2_GS_DRAW_TRACE_RT_SNAPSHOTS}
+		VITASX2_GS_DRAW_TRACE_RT_AFTER_DRAWS=${VITASX2_GS_DRAW_TRACE_RT_AFTER_DRAWS}
+		VITASX2_GS_DRAW_TRACE_PACKETS=${VITASX2_GS_DRAW_TRACE_PACKETS}
+		VITASX2_GS_DRAW_TRACE_PRESENT_VSYNC=${VITASX2_GS_DRAW_TRACE_PRESENT_VSYNC}
+	)
+endif()
+
 # Target CPU contract: Cortex-A9 MPCore, VFPv3, NEON, hard-float.
 # NEON is mandatory (see docs/ps2-vita/GENERIC_CORTEX_A9_OPTIMIZATION.md).
 add_compile_options(

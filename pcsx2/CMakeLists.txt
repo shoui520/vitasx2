@@ -182,6 +182,7 @@ add_library(pcsx2core STATIC
 	vita/VitaGxmDisplay.cpp
 	vita/VitaGxmMemory.cpp
 	vita/VitaGxmTexture.cpp
+	vita/VitaGsDrawTrace.cpp
 	vita/VitaGsMailbox.cpp
 	vita/VitaGsDiagnosticsDisabled.cpp
 	vita/VitaGsRuntime.cpp

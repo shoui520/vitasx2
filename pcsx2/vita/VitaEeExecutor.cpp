@@ -66,6 +66,82 @@ namespace
 	constexpr u32 EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN = 0xc1;
 	constexpr u32 EE_EVENT_HANDLED_EXIT_TOKEN = 0xe8;
 
+#if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
+	VitaA32EeGeneratedGuestMix AnalyzeGeneratedEeGuestMix(u32 start_pc,
+		u32 instruction_count)
+	{
+		VitaA32EeGeneratedGuestMix mix;
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			const u32 primary = op >> 26;
+			mix.instructions++;
+			// Keep this classification aligned with the top-level owners in
+			// BlockCompiler::CanCompileOpcode()/EmitOpcode().  Branch is checked
+			// first so COP0/1/2 conditional branches are control-flow work rather
+			// than being hidden inside their coprocessor buckets.
+			if (VitaEE::BlockCompiler::IsSupportedBranchOpcode(op))
+			{
+				mix.branch++;
+				continue;
+			}
+
+			switch (primary)
+			{
+				case 0x10:
+					mix.cop0++;
+					break;
+				case 0x11:
+				case 0x31: // LWC1
+				case 0x39: // SWC1
+					mix.cop1++;
+					break;
+				case 0x12:
+				case 0x36: // LQC2
+				case 0x3e: // SQC2
+					mix.cop2++;
+					break;
+				case 0x1c:
+					mix.mmi++;
+					break;
+				case 0x1a: // LDL
+				case 0x1b: // LDR
+				case 0x1e: // LQ
+				case 0x20: // LB
+				case 0x21: // LH
+				case 0x22: // LWL
+				case 0x23: // LW
+				case 0x24: // LBU
+				case 0x25: // LHU
+				case 0x26: // LWR
+				case 0x27: // LWU
+				case 0x37: // LD
+					mix.gpr_load++;
+					break;
+				case 0x1f: // SQ
+				case 0x28: // SB
+				case 0x29: // SH
+				case 0x2a: // SWL
+				case 0x2b: // SW
+				case 0x2c: // SDL
+				case 0x2d: // SDR
+				case 0x2e: // SWR
+				case 0x3f: // SD
+					mix.gpr_store++;
+					break;
+				case 0x2f: // CACHE
+				case 0x33: // PREF
+					mix.other++;
+					break;
+				default:
+					mix.integer++;
+					break;
+			}
+		}
+		return mix;
+	}
+#endif
+
 	extern "C" __attribute__((noinline)) u32 VitaEeA32DirectExit()
 	{
 		return static_cast<u32>(VitaEE::BlockExitKind::Direct);
@@ -3141,6 +3217,18 @@ namespace VitaEE
 		// only PCSX2-discovered BaseBlocks publish generated dispatch entries.
 		RegisterBlockLookup(block);
 		RegisterIncomingLinks(block);
+
+#if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
+		const VitaA32::CodeBuffer::GeneratedCodeStats generated =
+			block.code.AnalyzeGeneratedCode();
+		const VitaA32EeGeneratedGuestMix guest_mix =
+			AnalyzeGeneratedEeGuestMix(start_pc, compiled_instruction_count);
+		VitaRecordA32EeGeneratedCode(start_pc, guest_mix,
+			generated.host_instructions,
+			generated.host_load_instructions, generated.host_store_instructions,
+			generated.helper_call_instructions, generated.state_load_instructions,
+			generated.state_store_instructions);
+#endif
 
 		if (m_direct_linking_enabled)
 		{

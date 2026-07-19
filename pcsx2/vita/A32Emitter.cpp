@@ -2279,6 +2279,87 @@ namespace VitaA32
 			   EmitBlx(scratch_reg);
 	}
 
+	CodeBuffer::GeneratedCodeStats CodeBuffer::AnalyzeGeneratedCode(
+		unsigned architectural_state_base) const
+	{
+		GeneratedCodeStats stats;
+		if (!m_base || (m_offset & (sizeof(u32) - 1)) != 0)
+			return stats;
+
+		stats.host_instructions = m_offset / sizeof(u32);
+		for (size_t offset = 0; offset < m_offset; offset += sizeof(u32))
+		{
+			u32 instruction = 0;
+			std::memcpy(&instruction, m_base + offset, sizeof(instruction));
+
+			// A32 BL/BLX are the calls emitted by the EE/VU compilers for
+			// PCSX2-owned helpers and block-local helper thunks. Direct JIT links
+			// are ordinary B instructions and are deliberately excluded.
+			if ((instruction & 0x0f000000u) == 0x0b000000u ||
+				(instruction & 0xfe000000u) == 0xfa000000u ||
+				(instruction & 0x0ffffff0u) == 0x012fff30u)
+			{
+				stats.helper_call_instructions++;
+			}
+
+			bool memory = false;
+			bool load = false;
+			// Advanced-SIMD VLD1/VST1 structure transfers use the unconditional
+			// encoding space and alias the generic single-transfer mask below.
+			// Classify them first; their L bit is bit 21.
+			if ((instruction & 0xfe000000u) == 0xf4000000u)
+			{
+				memory = true;
+				load = (instruction & (1u << 21)) != 0;
+			}
+			// A32 single and block data transfers, including byte transfers and
+			// PUSH/POP aliases. Bit 20 is L for both classes.
+			else if ((instruction & 0x0c000000u) == 0x04000000u ||
+				(instruction & 0x0e000000u) == 0x08000000u)
+			{
+				memory = true;
+				load = (instruction & (1u << 20)) != 0;
+			}
+			// Extra load/store encodings used by LDRH/LDRSB/LDRSH/LDRD and
+			// their store counterparts. Exclude multiply/swap encodings by
+			// requiring a nonzero S/H subtype.
+			else if ((instruction & 0x0e000090u) == 0x00000090u &&
+				(instruction & 0x00000060u) != 0)
+			{
+				memory = true;
+				// LDRD is the one extra-transfer load whose L bit is clear;
+				// subtype 0b10 distinguishes it from STRD (0b11). The other
+				// extra transfers use bit 20 normally.
+				load = (instruction & (1u << 20)) != 0 ||
+					(instruction & 0x00000060u) == 0x00000040u;
+			}
+			// VFP VLDR/VSTR and VPUSH/VPOP use the coprocessor transfer class.
+			else if ((instruction & 0x0e000a00u) == 0x0c000a00u)
+			{
+				memory = true;
+				load = (instruction & (1u << 20)) != 0;
+			}
+			if (memory)
+			{
+				const bool architectural_state =
+					((instruction >> 16) & 0xfu) == architectural_state_base;
+				if (load)
+				{
+					stats.host_load_instructions++;
+					if (architectural_state)
+						stats.state_load_instructions++;
+				}
+				else
+				{
+					stats.host_store_instructions++;
+					if (architectural_state)
+						stats.state_store_instructions++;
+				}
+			}
+		}
+		return stats;
+	}
+
 	bool CodeBuffer::PatchMovImm32(size_t instruction_offset, unsigned rd, u32 value)
 	{
 		if (!m_base || !IsRegister(rd) || instruction_offset + sizeof(u32) * 2 > m_offset ||

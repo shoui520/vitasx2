@@ -10,6 +10,10 @@
 #include "common/Console.h"
 #include "common/BitUtils.h"
 #include "common/StringUtil.h"
+#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+#include "DebugTools/GsTrace.h"
+#include "vita/VitaGsDrawTrace.h"
+#endif
 #include <bit>
 
 using PS_ATST  = GSShader::PS_ATST;
@@ -97,6 +101,9 @@ void GSRendererHW::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
 
 void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
 {
+#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	VitaGsDrawTraceVSync();
+#endif
 	if (GSConfig.LoadTextureReplacements)
 		GSTextureReplacements::ProcessAsyncLoadedTextures();
 
@@ -9491,6 +9498,12 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 		g_gs_device->BeginDSAsRT(m_conf.ds, m_conf.drawarea);
 	}
 	
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	VitaGsDrawTraceRecordConfig(static_cast<u32>(s_n),
+		static_cast<u32>(g_perfmon.GetFrame()),
+		Pcsx2Trace::ResolveGsTraceSource(0xff), m_conf);
+	#endif
+
 	if (GSConfig.SaveHWConfig && GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
 	{
 		GSHWDrawConfig::DumpConfig(GetDrawDumpPath("%05d_hwconfig.txt", s_n), m_conf);

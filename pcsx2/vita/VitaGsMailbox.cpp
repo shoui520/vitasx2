@@ -11,6 +11,8 @@
 #include "MTGS.h"
 #include "MTVU.h"
 #include "PerformanceMetrics.h"
+#include "R3000A.h"
+#include "R5900.h"
 #include "VMManager.h"
 #include "common/Assertions.h"
 #include "common/Console.h"
@@ -19,7 +21,12 @@
 #include "common/Timer.h"
 #include "common/WrappedMemCopy.h"
 #include "vita/VitaGxmGsState.h"
+#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+#include "vita/VitaGsDrawTrace.h"
+#endif
 #include "vita/VitaGsMailbox.h"
+#include "vita/VitaCore.h"
+#include "vita/VitaVuBlockCompiler.h"
 #if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
 #include "GS/Renderers/HW/GSTextureReplacements.h"
 #include "vita/GSDeviceGXM.h"
@@ -143,6 +150,58 @@ namespace MTGS
 	static std::atomic<u32> s_profile_mtvu_packet_visibility_waits{0};
 	static std::atomic<int> s_profile_max_queued_frames{0};
 
+	struct GsProducerPerformanceTotals
+	{
+		u64 submissions = 0;
+		u64 ring_words = 0;
+		u64 gs_packets = 0;
+		u64 gs_packet_bytes = 0;
+		u64 mtvu_packets = 0;
+		u64 wait_calls = 0;
+		u64 wait_spins = 0;
+		u64 ring_spins = 0;
+	};
+
+	struct GsWorkerPerformanceTotals
+	{
+		u64 commands = 0;
+		u64 gs_packets = 0;
+		u64 gs_packet_bytes = 0;
+		u64 mtvu_packets = 0;
+		u64 mtvu_packet_bytes = 0;
+		u64 mtvu_visibility_spins = 0;
+		u64 completed_vsyncs = 0;
+	};
+
+	static GsProducerPerformanceTotals s_gs_producer_performance;
+	static GsWorkerPerformanceTotals s_gs_worker_performance;
+	static std::atomic<u64> s_gs_published_commands{0};
+	static std::atomic<u64> s_gs_published_packets{0};
+	static std::atomic<u64> s_gs_published_packet_bytes{0};
+	static std::atomic<u64> s_gs_published_mtvu_packets{0};
+	static std::atomic<u64> s_gs_published_mtvu_packet_bytes{0};
+	static std::atomic<u64> s_gs_published_mtvu_visibility_spins{0};
+	static std::atomic<u64> s_gs_published_completed_vsyncs{0};
+
+	static void PublishGsWorkerPerformance()
+	{
+		s_gs_published_commands.store(s_gs_worker_performance.commands,
+			std::memory_order_relaxed);
+		s_gs_published_packets.store(s_gs_worker_performance.gs_packets,
+			std::memory_order_relaxed);
+		s_gs_published_packet_bytes.store(s_gs_worker_performance.gs_packet_bytes,
+			std::memory_order_relaxed);
+		s_gs_published_mtvu_packets.store(s_gs_worker_performance.mtvu_packets,
+			std::memory_order_relaxed);
+		s_gs_published_mtvu_packet_bytes.store(
+			s_gs_worker_performance.mtvu_packet_bytes, std::memory_order_relaxed);
+		s_gs_published_mtvu_visibility_spins.store(
+			s_gs_worker_performance.mtvu_visibility_spins,
+			std::memory_order_relaxed);
+		s_gs_published_completed_vsyncs.store(
+			s_gs_worker_performance.completed_vsyncs, std::memory_order_release);
+	}
+
 	static void RecordHardwareVsyncProfile(HardwareVsyncProfile& profile,
 		const char* owner)
 	{
@@ -222,10 +281,798 @@ namespace MTGS
 					profile.vu_start.compile_barriers));
 		}
 	}
+
+	template <typename T>
+	static u64 CounterDelta(T current, T previous)
+	{
+		return current >= previous ? static_cast<u64>(current - previous) :
+			static_cast<u64>(current);
+	}
+
+	struct CorrelatedPerformanceSnapshot
+	{
+		Common::Timer::Value wall = 0;
+		u64 ee_cpu_us = 0;
+		u64 vu_cpu_us = 0;
+		u64 gs_cpu_us = 0;
+		u64 producer_vsyncs = 0;
+		u64 completed_vsyncs = 0;
+		u64 ee_cycle = 0;
+		u64 iop_cycle = 0;
+		u32 ee_pc = 0;
+		u32 iop_pc = 0;
+		VitaA32EeProviderStats ee;
+		VitaVU::Vu0TelemetryStats vu0;
+		VitaVU::Vu1TelemetryStats vu1;
+		VU_Thread::ProducerProfileStats mtvu{};
+		GsProducerPerformanceTotals gs_producer;
+		GsWorkerPerformanceTotals gs_worker;
+		VitaGxmPerformanceCounters gxm;
+	};
+
+	struct CorrelatedPerformanceProfile
+	{
+		u64 producer_vsyncs = 0;
+		u64 producer_vsync_origin = 0;
+		u32 sampling_boundaries = 0;
+		u32 boundaries_at_start = 0;
+		u64 window = 0;
+		bool started = false;
+		bool elf_origin = false;
+		CorrelatedPerformanceSnapshot origin;
+		CorrelatedPerformanceSnapshot start;
+	};
+	static CorrelatedPerformanceProfile s_correlated_profile;
+
+	static GsWorkerPerformanceTotals GetPublishedGsWorkerPerformance()
+	{
+		GsWorkerPerformanceTotals stats;
+		stats.completed_vsyncs =
+			s_gs_published_completed_vsyncs.load(std::memory_order_acquire);
+		stats.commands = s_gs_published_commands.load(std::memory_order_relaxed);
+		stats.gs_packets = s_gs_published_packets.load(std::memory_order_relaxed);
+		stats.gs_packet_bytes =
+			s_gs_published_packet_bytes.load(std::memory_order_relaxed);
+		stats.mtvu_packets =
+			s_gs_published_mtvu_packets.load(std::memory_order_relaxed);
+		stats.mtvu_packet_bytes =
+			s_gs_published_mtvu_packet_bytes.load(std::memory_order_relaxed);
+		stats.mtvu_visibility_spins =
+			s_gs_published_mtvu_visibility_spins.load(std::memory_order_relaxed);
+		return stats;
+	}
+
+	static CorrelatedPerformanceSnapshot CaptureCorrelatedPerformanceSnapshot(
+		u64 producer_vsyncs)
+	{
+		CorrelatedPerformanceSnapshot snapshot;
+		snapshot.producer_vsyncs = producer_vsyncs;
+		snapshot.wall = Common::Timer::GetCurrentValue();
+		snapshot.ee_cpu_us = Threading::GetThreadCpuTime();
+		snapshot.vu_cpu_us = THREAD_VU1 && vu1Thread.IsOpen() ?
+			vu1Thread.GetThreadHandle().GetCPUTime() : 0;
+		snapshot.gs_cpu_us = s_thread.Joinable() ? s_thread.GetCPUTime() : 0;
+		snapshot.ee_cycle = cpuRegs.cycle;
+		snapshot.iop_cycle = psxRegs.cycle;
+		snapshot.ee_pc = cpuRegs.pc;
+		snapshot.iop_pc = psxRegs.pc;
+		snapshot.ee = VitaGetA32EeProviderStats();
+		snapshot.vu0 = VitaVU::GetVu0TelemetryStats();
+		snapshot.vu1 = VitaVU::GetVu1TelemetryStats();
+		snapshot.mtvu = vu1Thread.GetProducerProfileStats();
+		snapshot.gs_producer = s_gs_producer_performance;
+		snapshot.gs_worker = GetPublishedGsWorkerPerformance();
+		snapshot.completed_vsyncs = snapshot.gs_worker.completed_vsyncs;
+		snapshot.gxm = VitaGxmGetPublishedPerformanceCounters();
+		return snapshot;
+	}
+
+	static void RecordCorrelatedPerformanceProfile()
+	{
+		constexpr u32 WARMUP_VSYNCS = 60;
+		constexpr u32 WINDOW_VSYNCS = 120;
+		if (!s_native_presenter_enabled)
+			return;
+
+		const u64 producer_vsync = ++s_correlated_profile.producer_vsyncs;
+		const u32 boundary = ++s_correlated_profile.sampling_boundaries;
+		if (!s_correlated_profile.started)
+		{
+			if (boundary < WARMUP_VSYNCS)
+				return;
+			s_correlated_profile.start =
+				CaptureCorrelatedPerformanceSnapshot(producer_vsync);
+			s_correlated_profile.boundaries_at_start = boundary;
+			s_correlated_profile.started = true;
+			return;
+		}
+		if (boundary - s_correlated_profile.boundaries_at_start < WINDOW_VSYNCS)
+			return;
+
+		const CorrelatedPerformanceSnapshot end =
+			CaptureCorrelatedPerformanceSnapshot(producer_vsync);
+		const CorrelatedPerformanceSnapshot& start = s_correlated_profile.start;
+		const CorrelatedPerformanceSnapshot& origin = s_correlated_profile.origin;
+		const u64 window = ++s_correlated_profile.window;
+		const u64 wall_us = static_cast<u64>(Common::Timer::ConvertValueToSeconds(
+			end.wall - start.wall) * 1000000.0);
+		const u64 ee_cpu_us = CounterDelta(end.ee_cpu_us, start.ee_cpu_us);
+		const u64 vu_cpu_us = CounterDelta(end.vu_cpu_us, start.vu_cpu_us);
+		const u64 gs_cpu_us = CounterDelta(end.gs_cpu_us, start.gs_cpu_us);
+		const auto utilization = [wall_us](u64 cpu_us) {
+			return wall_us ? static_cast<double>(cpu_us) * 100.0 /
+				static_cast<double>(wall_us) : 0.0;
+		};
+		const auto ee_fallbacks = [](const VitaA32EeProviderStats& stats) {
+			return static_cast<u64>(stats.scan_unsupported_fallbacks) +
+				stats.scan_boundary_fallbacks +
+				stats.exact_trace_branch_likely_fallbacks +
+				stats.execute_failed_fallbacks + stats.interpreter_path_fallbacks;
+		};
+
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=anchor origin=%s origin_vsync=%llu "
+			"producer_vsync_start=%llu "
+			"producer_vsync_end=%llu completed_vsync_start=%llu completed_vsync_end=%llu "
+			"ee_cycle_start=%llu ee_cycle_end=%llu ee_pc_start=%08x ee_pc_end=%08x "
+			"iop_cycle_start=%llu iop_cycle_end=%llu iop_pc_start=%08x iop_pc_end=%08x",
+			static_cast<unsigned long long>(window),
+			s_correlated_profile.elf_origin ? "elf" : "boot",
+			static_cast<unsigned long long>(
+				s_correlated_profile.producer_vsync_origin),
+			static_cast<unsigned long long>(start.producer_vsyncs),
+			static_cast<unsigned long long>(end.producer_vsyncs),
+			static_cast<unsigned long long>(start.completed_vsyncs),
+			static_cast<unsigned long long>(end.completed_vsyncs),
+			static_cast<unsigned long long>(start.ee_cycle),
+			static_cast<unsigned long long>(end.ee_cycle), start.ee_pc, end.ee_pc,
+			static_cast<unsigned long long>(start.iop_cycle),
+			static_cast<unsigned long long>(end.iop_cycle), start.iop_pc, end.iop_pc);
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=threads wall_us=%llu ee_cpu_us=%llu "
+			"ee_util=%.1f vu_cpu_us=%llu vu_util=%.1f gs_cpu_us=%llu gs_util=%.1f",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(wall_us),
+			static_cast<unsigned long long>(ee_cpu_us), utilization(ee_cpu_us),
+			static_cast<unsigned long long>(vu_cpu_us), utilization(vu_cpu_us),
+			static_cast<unsigned long long>(gs_cpu_us), utilization(gs_cpu_us));
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=ee generated_blocks=%llu host_instructions=%llu "
+			"host_loads=%llu host_stores=%llu helper_calls_generated=%llu "
+			"register_loads_generated=%llu register_stores_generated=%llu "
+			"guest_instructions_generated=%llu origin_blocks=%llu origin_host=%llu "
+			"origin_helpers=%llu origin_register_loads=%llu origin_register_stores=%llu "
+			"origin_guest=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.ee.generated_blocks,
+				start.ee.generated_blocks)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.generated_host_instructions,
+				start.ee.generated_host_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_host_load_instructions,
+				start.ee.generated_host_load_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_host_store_instructions,
+				start.ee.generated_host_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_helper_call_instructions,
+				start.ee.generated_helper_call_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_state_load_instructions,
+				start.ee.generated_state_load_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_state_store_instructions,
+				start.ee.generated_state_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_guest_instructions,
+				start.ee.generated_guest_instructions)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.generated_blocks,
+				origin.ee.generated_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_host_instructions,
+				origin.ee.generated_host_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_helper_call_instructions,
+				origin.ee.generated_helper_call_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_state_load_instructions,
+				origin.ee.generated_state_load_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_state_store_instructions,
+				origin.ee.generated_state_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_guest_instructions,
+				origin.ee.generated_guest_instructions)));
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=ee_codegen integer=%llu branch=%llu "
+			"gpr_load=%llu gpr_store=%llu mmi=%llu cop0=%llu cop1=%llu cop2=%llu "
+			"other=%llu largest_pc=0x%08x largest_guest=%u largest_host=%u "
+			"largest_helpers=%u largest_state_loads=%u largest_state_stores=%u "
+			"origin_integer=%llu origin_branch=%llu origin_gpr_load=%llu "
+			"origin_gpr_store=%llu origin_mmi=%llu origin_cop0=%llu origin_cop1=%llu "
+			"origin_cop2=%llu origin_other=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_integer_instructions,
+				start.ee.generated_integer_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_branch_instructions,
+				start.ee.generated_branch_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_gpr_load_instructions,
+				start.ee.generated_gpr_load_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_gpr_store_instructions,
+				start.ee.generated_gpr_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.generated_mmi_instructions,
+				start.ee.generated_mmi_instructions)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.generated_cop0_instructions,
+				start.ee.generated_cop0_instructions)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.generated_cop1_instructions,
+				start.ee.generated_cop1_instructions)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.generated_cop2_instructions,
+				start.ee.generated_cop2_instructions)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.generated_other_instructions,
+				start.ee.generated_other_instructions)),
+			end.ee.largest_generated_block_pc,
+			end.ee.largest_generated_block_guest_instructions,
+			end.ee.largest_generated_block_host_instructions,
+			end.ee.largest_generated_block_helper_calls,
+			end.ee.largest_generated_block_state_loads,
+			end.ee.largest_generated_block_state_stores,
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_integer_instructions,
+				origin.ee.generated_integer_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_branch_instructions,
+				origin.ee.generated_branch_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_gpr_load_instructions,
+				origin.ee.generated_gpr_load_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_gpr_store_instructions,
+				origin.ee.generated_gpr_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_mmi_instructions,
+				origin.ee.generated_mmi_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_cop0_instructions,
+				origin.ee.generated_cop0_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_cop1_instructions,
+				origin.ee.generated_cop1_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_cop2_instructions,
+				origin.ee.generated_cop2_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_other_instructions,
+				origin.ee.generated_other_instructions)));
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=ee_dispatch provider_boundaries=%llu "
+			"boundary_guest_instructions=%llu direct_exits=%llu event_exits=%llu "
+			"cache_hits=%llu cache_misses=%llu lookup_hits=%llu fast_dispatch_hits=%llu "
+			"event_tests=%llu event_resumes=%llu event_refusals=%llu retained_wait_events=%llu "
+			"invalidated_blocks=%llu failed_blocks=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.ee.compiled_blocks,
+				start.ee.compiled_blocks)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.compiled_instructions,
+				start.ee.compiled_instructions)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.direct_exits,
+				start.ee.direct_exits)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.event_exits,
+				start.ee.event_exits)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.cache_hits,
+				start.ee.cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.cache_misses,
+				start.ee.cache_misses)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.lookup_hits,
+				start.ee.lookup_hits)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.fast_dispatch_hits,
+				start.ee.fast_dispatch_hits)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.in_frame_event_tests,
+				start.ee.in_frame_event_tests)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.in_frame_event_resume_candidates,
+				start.ee.in_frame_event_resume_candidates)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.in_frame_event_resume_refusals,
+				start.ee.in_frame_event_resume_refusals)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.retained_unconditional_wait_events,
+				start.ee.retained_unconditional_wait_events)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.invalidated_blocks,
+				start.ee.invalidated_blocks)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.failed_blocks,
+				start.ee.failed_blocks)));
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=ee_fallback interpreter_steps=%llu "
+			"fallbacks=%llu unsupported=%llu scan_boundary=%llu branch_likely=%llu "
+			"execute_failed=%llu interpreter_path=%llu last_pc=0x%08x "
+			"last_opcode=0x%08x last_reason=%u",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.ee.interpreter_steps,
+				start.ee.interpreter_steps)),
+			static_cast<unsigned long long>(CounterDelta(ee_fallbacks(end.ee),
+				ee_fallbacks(start.ee))),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.scan_unsupported_fallbacks,
+				start.ee.scan_unsupported_fallbacks)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.scan_boundary_fallbacks,
+				start.ee.scan_boundary_fallbacks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.exact_trace_branch_likely_fallbacks,
+				start.ee.exact_trace_branch_likely_fallbacks)),
+			static_cast<unsigned long long>(CounterDelta(end.ee.execute_failed_fallbacks,
+				start.ee.execute_failed_fallbacks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.interpreter_path_fallbacks,
+				start.ee.interpreter_path_fallbacks)),
+			end.ee.last_interpreter_pc, end.ee.last_interpreter_opcode,
+			end.ee.last_interpreter_reason);
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=vu0 execute_calls=%llu executed_blocks=%llu "
+			"executed_pairs=%llu interpreter_steps=%llu generated_blocks=%llu "
+			"generated_pairs=%llu host_instructions=%llu host_loads=%llu host_stores=%llu "
+			"helper_calls_generated=%llu "
+			"register_loads_generated=%llu register_stores_generated=%llu "
+			"content_hits=%llu invalidations=%llu scan_rejects=%llu compile_failures=%llu "
+			"origin_execute_calls=%llu origin_executed_pairs=%llu "
+			"origin_interpreter_steps=%llu origin_generated_blocks=%llu "
+			"origin_generated_pairs=%llu origin_compile_failures=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.execute_calls,
+				start.vu0.execute_calls)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.executed_blocks,
+				start.vu0.executed_blocks)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.executed_pairs,
+				start.vu0.executed_pairs)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.interpreter_steps,
+				start.vu0.interpreter_steps)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.generated_blocks,
+				start.vu0.generated_blocks)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.generated_pairs,
+				start.vu0.generated_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu0.generated_host_instructions,
+				start.vu0.generated_host_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu0.generated_host_load_instructions,
+				start.vu0.generated_host_load_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu0.generated_host_store_instructions,
+				start.vu0.generated_host_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu0.generated_helper_call_instructions,
+				start.vu0.generated_helper_call_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu0.generated_state_load_instructions,
+				start.vu0.generated_state_load_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu0.generated_state_store_instructions,
+				start.vu0.generated_state_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.content_cache_hits,
+				start.vu0.content_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.invalidations,
+				start.vu0.invalidations)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.scan_rejects,
+				start.vu0.scan_rejects)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.compile_failures,
+				start.vu0.compile_failures)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.execute_calls,
+				origin.vu0.execute_calls)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.executed_pairs,
+				origin.vu0.executed_pairs)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.interpreter_steps,
+				origin.vu0.interpreter_steps)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.generated_blocks,
+				origin.vu0.generated_blocks)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.generated_pairs,
+				origin.vu0.generated_pairs)),
+			static_cast<unsigned long long>(CounterDelta(end.vu0.compile_failures,
+				origin.vu0.compile_failures)));
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=vu1 programs=%llu executed_blocks=%llu "
+			"executed_pairs=%llu interpreter_steps=%llu generated_blocks=%llu "
+			"generated_pairs=%llu host_instructions=%llu host_loads=%llu host_stores=%llu "
+			"helper_calls_generated=%llu register_loads_generated=%llu "
+			"register_stores_generated=%llu origin_programs=%llu "
+			"origin_executed_pairs=%llu origin_interpreter_steps=%llu "
+			"origin_generated_blocks=%llu origin_generated_pairs=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.completed_programs,
+				start.vu1.completed_programs)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.executed_blocks,
+				start.vu1.executed_blocks)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.executed_pairs,
+				start.vu1.executed_pairs)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.interpreter_steps,
+				start.vu1.interpreter_steps)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.generated_blocks,
+				start.vu1.generated_blocks)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.generated_pairs,
+				start.vu1.generated_pairs)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.generated_host_instructions,
+				start.vu1.generated_host_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.generated_host_load_instructions,
+				start.vu1.generated_host_load_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.generated_host_store_instructions,
+				start.vu1.generated_host_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.generated_helper_call_instructions,
+				start.vu1.generated_helper_call_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.generated_state_load_instructions,
+				start.vu1.generated_state_load_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.generated_state_store_instructions,
+				start.vu1.generated_state_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.completed_programs,
+				origin.vu1.completed_programs)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.executed_pairs,
+				origin.vu1.executed_pairs)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.interpreter_steps,
+				origin.vu1.interpreter_steps)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.generated_blocks,
+				origin.vu1.generated_blocks)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.generated_pairs,
+				origin.vu1.generated_pairs)));
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=vu1_cache prepare_checks=%llu prepare_calls=%llu "
+			"quick_hits=%llu content_hits=%llu compile_requests=%llu invalidations=%llu "
+			"compile_failures=%llu origin_prepare_checks=%llu origin_prepare_calls=%llu "
+			"origin_quick_hits=%llu origin_content_hits=%llu origin_compile_requests=%llu "
+			"origin_invalidations=%llu origin_compile_failures=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.program_prepare_checks,
+				start.vu1.program_prepare_checks)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.program_prepare_calls,
+				start.vu1.program_prepare_calls)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.program_quick_cache_hits,
+				start.vu1.program_quick_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.content_cache_hits,
+				start.vu1.content_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.program_compile_requests,
+				start.vu1.program_compile_requests)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.invalidations,
+				start.vu1.invalidations)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.compile_failures,
+				start.vu1.compile_failures)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_prepare_checks,
+				origin.vu1.program_prepare_checks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_prepare_calls,
+				origin.vu1.program_prepare_calls)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_quick_cache_hits,
+				origin.vu1.program_quick_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.content_cache_hits,
+				origin.vu1.content_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.program_compile_requests,
+				origin.vu1.program_compile_requests)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.invalidations,
+				origin.vu1.invalidations)),
+			static_cast<unsigned long long>(CounterDelta(end.vu1.compile_failures,
+				origin.vu1.compile_failures)));
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=mtvu submissions=%llu queue_words=%llu "
+			"execute_jobs=%llu waits=%llu ring_waits=%llu ring_spins=%llu compile_barriers=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.mtvu.queue_submissions,
+				start.mtvu.queue_submissions)),
+			static_cast<unsigned long long>(CounterDelta(end.mtvu.queue_words,
+				start.mtvu.queue_words)),
+			static_cast<unsigned long long>(CounterDelta(end.mtvu.execute_enqueues,
+				start.mtvu.execute_enqueues)),
+			static_cast<unsigned long long>(CounterDelta(end.mtvu.wait_calls,
+				start.mtvu.wait_calls)),
+			static_cast<unsigned long long>(CounterDelta(end.mtvu.ring_waits,
+				start.mtvu.ring_waits)),
+			static_cast<unsigned long long>(CounterDelta(end.mtvu.ring_wait_spins,
+				start.mtvu.ring_wait_spins)),
+			static_cast<unsigned long long>(CounterDelta(end.mtvu.compile_barriers,
+				start.mtvu.compile_barriers)));
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=gs submitted=%llu submitted_words=%llu "
+			"processed=%llu packets=%llu packet_bytes=%llu mtvu_packets=%llu "
+			"mtvu_packet_bytes=%llu waits=%llu wait_spins=%llu ring_spins=%llu "
+			"visibility_spins=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.gs_producer.submissions,
+				start.gs_producer.submissions)),
+			static_cast<unsigned long long>(CounterDelta(end.gs_producer.ring_words,
+				start.gs_producer.ring_words)),
+			static_cast<unsigned long long>(CounterDelta(end.gs_worker.commands,
+				start.gs_worker.commands)),
+			static_cast<unsigned long long>(CounterDelta(end.gs_worker.gs_packets,
+				start.gs_worker.gs_packets)),
+			static_cast<unsigned long long>(CounterDelta(end.gs_worker.gs_packet_bytes,
+				start.gs_worker.gs_packet_bytes)),
+			static_cast<unsigned long long>(CounterDelta(end.gs_worker.mtvu_packets,
+				start.gs_worker.mtvu_packets)),
+			static_cast<unsigned long long>(CounterDelta(end.gs_worker.mtvu_packet_bytes,
+				start.gs_worker.mtvu_packet_bytes)),
+			static_cast<unsigned long long>(CounterDelta(end.gs_producer.wait_calls,
+				start.gs_producer.wait_calls)),
+			static_cast<unsigned long long>(CounterDelta(end.gs_producer.wait_spins,
+				start.gs_producer.wait_spins)),
+			static_cast<unsigned long long>(CounterDelta(end.gs_producer.ring_spins,
+				start.gs_producer.ring_spins)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gs_worker.mtvu_visibility_spins,
+				start.gs_worker.mtvu_visibility_spins)));
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=gxm draws=%llu indices=%llu "
+			"vertex_bytes=%llu index_bytes=%llu texture_uploads=%llu "
+			"texture_upload_bytes=%llu readbacks=%llu readback_bytes=%llu "
+			"psm24_draws=%llu "
+			"rejected_tfx=%llu reject_features=0x%016llx "
+			"reject_ps_lo=0x%016llx reject_ps_hi=0x%016llx "
+			"reject_blend=0x%08x reject_vs=0x%02x reject_sampler=0x%02x "
+			"reject_depth=0x%02x reject_colormask=0x%02x reject_topology=%u",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.draw_calls,
+				start.gxm.draw_calls)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.draw_indices,
+				start.gxm.draw_indices)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.vertex_upload_bytes,
+				start.gxm.vertex_upload_bytes)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.index_upload_bytes,
+				start.gxm.index_upload_bytes)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.texture_uploads,
+				start.gxm.texture_uploads)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.texture_upload_bytes,
+				start.gxm.texture_upload_bytes)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.texture_readbacks,
+				start.gxm.texture_readbacks)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.texture_readback_bytes,
+				start.gxm.texture_readback_bytes)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.psm24_draws,
+				start.gxm.psm24_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.rejected_tfx_draws,
+				start.gxm.rejected_tfx_draws)),
+			static_cast<unsigned long long>(
+				end.gxm.rejected_tfx_draws != start.gxm.rejected_tfx_draws ?
+					end.gxm.last_rejected_tfx_features : 0),
+			static_cast<unsigned long long>(
+				end.gxm.rejected_tfx_draws != start.gxm.rejected_tfx_draws ?
+					end.gxm.last_rejected_tfx_ps_lo : 0),
+			static_cast<unsigned long long>(
+				end.gxm.rejected_tfx_draws != start.gxm.rejected_tfx_draws ?
+					end.gxm.last_rejected_tfx_ps_hi : 0),
+			end.gxm.rejected_tfx_draws != start.gxm.rejected_tfx_draws ?
+				end.gxm.last_rejected_tfx_blend : 0,
+			end.gxm.rejected_tfx_draws != start.gxm.rejected_tfx_draws ?
+				end.gxm.last_rejected_tfx_vs : 0,
+			end.gxm.rejected_tfx_draws != start.gxm.rejected_tfx_draws ?
+				end.gxm.last_rejected_tfx_sampler : 0,
+			end.gxm.rejected_tfx_draws != start.gxm.rejected_tfx_draws ?
+				end.gxm.last_rejected_tfx_depth : 0,
+			end.gxm.rejected_tfx_draws != start.gxm.rejected_tfx_draws ?
+				end.gxm.last_rejected_tfx_colormask : 0,
+			static_cast<u32>(
+				end.gxm.rejected_tfx_draws != start.gxm.rejected_tfx_draws ?
+					end.gxm.last_rejected_tfx_topology : 0));
+		const bool feedback_seen =
+			end.gxm.feedback_rt_draws != start.gxm.feedback_rt_draws ||
+			end.gxm.feedback_depth_draws != start.gxm.feedback_depth_draws ||
+			end.gxm.rt_hazard_draws != start.gxm.rt_hazard_draws ||
+			end.gxm.depth_hazard_draws != start.gxm.depth_hazard_draws;
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=gxm_semantics tfx=%llu textured=%llu "
+			"rt_source=%llu depth_source=%llu rt_hazard=%llu depth_hazard=%llu "
+			"feedback_rt=%llu feedback_depth=%llu snapshots=%llu snapshot_bytes=%llu "
+			"sw_blend=%llu fixed_blend=%llu alpha_test=%llu partial_mask=%llu "
+			"device_rejects=%llu reject_hash=0x%08x "
+			"feedback_ps_lo=0x%016llx feedback_ps_hi=0x%016llx "
+			"feedback_blend=0x%08x feedback_vs=0x%02x "
+			"feedback_sampler=0x%02x feedback_depth_state=0x%02x "
+			"feedback_colormask=0x%02x feedback_topology=%u feedback_hazard=%u",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.tfx_draws,
+				start.gxm.tfx_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.textured_tfx_draws,
+				start.gxm.textured_tfx_draws)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gxm.render_target_source_draws,
+				start.gxm.render_target_source_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.depth_source_draws,
+				start.gxm.depth_source_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.rt_hazard_draws,
+				start.gxm.rt_hazard_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.depth_hazard_draws,
+				start.gxm.depth_hazard_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.feedback_rt_draws,
+				start.gxm.feedback_rt_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.feedback_depth_draws,
+				start.gxm.feedback_depth_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.feedback_snapshots,
+				start.gxm.feedback_snapshots)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gxm.feedback_snapshot_bytes,
+				start.gxm.feedback_snapshot_bytes)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.software_blend_draws,
+				start.gxm.software_blend_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.fixed_blend_draws,
+				start.gxm.fixed_blend_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.alpha_test_draws,
+				start.gxm.alpha_test_draws)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gxm.partial_color_mask_draws,
+				start.gxm.partial_color_mask_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.device_rejects,
+				start.gxm.device_rejects)),
+			end.gxm.device_rejects != start.gxm.device_rejects ?
+				end.gxm.last_device_reject_hash : 0,
+			static_cast<unsigned long long>(feedback_seen ?
+				end.gxm.last_feedback_ps_lo : 0),
+			static_cast<unsigned long long>(feedback_seen ?
+				end.gxm.last_feedback_ps_hi : 0),
+			feedback_seen ? end.gxm.last_feedback_blend : 0,
+			feedback_seen ? end.gxm.last_feedback_vs : 0,
+			feedback_seen ? end.gxm.last_feedback_sampler : 0,
+			feedback_seen ? end.gxm.last_feedback_depth : 0,
+			feedback_seen ? end.gxm.last_feedback_colormask : 0,
+			static_cast<u32>(feedback_seen ?
+				end.gxm.last_feedback_topology : 0),
+			static_cast<u32>(feedback_seen ?
+				end.gxm.last_feedback_hazard : 0));
+		const bool merge_seen = end.gxm.merge_calls != start.gxm.merge_calls;
+		Console.WriteLn(
+			"Vita perf v=1 window=%llu kind=gxm_output merges=%llu rc1_draws=%llu "
+			"rc2_draws=%llu presents=%llu interlace=%llu pmode=0x%016llx "
+			"extbuf=0x%016llx background=0x%08x source_mask=0x%02x "
+			"source_states=0x%02x source1_size=0x%08x source2_size=0x%08x "
+			"source1_id=%u source2_id=%u trace_circuit=%u writer_kind=%u "
+			"writer_tfx=%llu writer_source_id=%u writer_source_size=0x%08x "
+			"writer_ps_lo=0x%016llx writer_ps_hi=0x%016llx "
+			"writer_blend=0x%08x writer_keys=0x%08x writer_topology=%u "
+			"writer_draw_area=0x%016llx writer_sample_area=0x%016llx "
+			"parent_kind=%u parent_tfx=%llu parent_textured=%llu "
+			"parent_untextured=%llu parent_rt_source=%llu "
+			"parent_full_mask=%llu parent_rgb_only=%llu "
+			"parent_alpha_only=%llu parent_other_mask=%llu "
+			"parent_source_id=%u "
+			"parent_source_size=0x%08x parent_ps_lo=0x%016llx "
+			"parent_ps_hi=0x%016llx parent_blend=0x%08x "
+			"parent_keys=0x%08x parent_topology=%u parent_colormask=0x%02x "
+			"parent_draw_area=0x%016llx parent_sample_area=0x%016llx "
+			"parent_rgb_source_id=%u parent_rgb_source_size=0x%08x "
+			"parent_rgb_ps_lo=0x%016llx parent_rgb_ps_hi=0x%016llx "
+			"parent_rgb_blend=0x%08x parent_rgb_keys=0x%08x "
+			"parent_rgb_topology=%u parent_rgb_colormask=0x%02x "
+			"parent_rgb_draw_area=0x%016llx parent_rgb_sample_area=0x%016llx",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.merge_calls,
+				start.gxm.merge_calls)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.merge_rc1_draws,
+				start.gxm.merge_rc1_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.merge_rc2_draws,
+				start.gxm.merge_rc2_draws)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.present_calls,
+				start.gxm.present_calls)),
+			static_cast<unsigned long long>(CounterDelta(end.gxm.interlace_calls,
+				start.gxm.interlace_calls)),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_pmode : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_extbuf : 0),
+			merge_seen ? end.gxm.last_merge_background : 0,
+			merge_seen ? end.gxm.last_merge_source_mask : 0,
+			merge_seen ? end.gxm.last_merge_source_states : 0,
+			merge_seen ? end.gxm.last_merge_source_sizes[0] : 0,
+			merge_seen ? end.gxm.last_merge_source_sizes[1] : 0,
+			merge_seen ? end.gxm.last_merge_source_ids[0] : 0,
+			merge_seen ? end.gxm.last_merge_source_ids[1] : 0,
+			static_cast<u32>(merge_seen ?
+				end.gxm.last_merge_trace_circuit : 0),
+			static_cast<u32>(merge_seen ?
+				end.gxm.last_merge_writer_kind : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_writer_tfx_writes : 0),
+			merge_seen ? end.gxm.last_merge_writer_source_id : 0,
+			merge_seen ? end.gxm.last_merge_writer_source_size : 0,
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_writer_ps_lo : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_writer_ps_hi : 0),
+			merge_seen ? end.gxm.last_merge_writer_blend : 0,
+			merge_seen ? end.gxm.last_merge_writer_selector_keys : 0,
+			static_cast<u32>(merge_seen ?
+				end.gxm.last_merge_writer_topology : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_writer_draw_area : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_writer_sample_area : 0),
+			static_cast<u32>(merge_seen ?
+				end.gxm.last_merge_parent_kind : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_tfx_writes : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_textured_tfx_writes : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_untextured_tfx_writes : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_render_target_source_tfx_writes : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_full_mask_tfx_writes : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_rgb_only_tfx_writes : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_alpha_only_tfx_writes : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_other_mask_tfx_writes : 0),
+			merge_seen ? end.gxm.last_merge_parent_source_id : 0,
+			merge_seen ? end.gxm.last_merge_parent_source_size : 0,
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_ps_lo : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_ps_hi : 0),
+			merge_seen ? end.gxm.last_merge_parent_blend : 0,
+			merge_seen ? end.gxm.last_merge_parent_selector_keys : 0,
+			static_cast<u32>(merge_seen ?
+				end.gxm.last_merge_parent_topology : 0),
+			static_cast<u32>(merge_seen ?
+				end.gxm.last_merge_parent_color_mask : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_draw_area : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_sample_area : 0),
+			merge_seen ? end.gxm.last_merge_parent_last_rgb_source_id : 0,
+			merge_seen ? end.gxm.last_merge_parent_last_rgb_source_size : 0,
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_last_rgb_ps_lo : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_last_rgb_ps_hi : 0),
+			merge_seen ? end.gxm.last_merge_parent_last_rgb_blend : 0,
+			merge_seen ? end.gxm.last_merge_parent_last_rgb_selector_keys : 0,
+			static_cast<u32>(merge_seen ?
+				end.gxm.last_merge_parent_last_rgb_topology : 0),
+			static_cast<u32>(merge_seen ?
+				end.gxm.last_merge_parent_last_rgb_color_mask : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_last_rgb_draw_area : 0),
+			static_cast<unsigned long long>(merge_seen ?
+				end.gxm.last_merge_parent_last_rgb_sample_area : 0));
+
+		s_correlated_profile.start = end;
+		s_correlated_profile.boundaries_at_start = boundary;
+	}
 #endif
 
 	static void SetEvent();
 	static void MainLoop();
+
+	static void ApplyVitaGsSettings(Pcsx2Config::GSOptions& options)
+	{
+#if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
+	#if defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
+		VITASX2_VITA_SOFTWARE_GS_CONTROL
+		// PCSX2 owner: GS.cpp::OpenGSRenderer() passes the configured worker
+		// count to makeGSRendererSW(). Keep EE on USER_0 and split scanline bands
+		// over USER_1/USER_2; CPU3 remains reserved for the shell and plugins.
+		options.Renderer = GSRendererType::SW;
+		options.SWExtraThreads = 2;
+	#else
+		options.Renderer = GSRendererType::Auto;
+	#endif
+		options.UpscaleMultiplier = 1.0f;
+		options.DumpReplaceableTextures = false;
+		options.LoadTextureReplacements = false;
+		options.GPUPaletteConversion = false;
+		// PCSX2 owner: GSRendererHW::PossibleCLUTDraw() and the
+		// UserHacks_CPUCLUTRender fallback. The GXM backend cannot yet consume a
+		// palette drawn into a host render target (GSClut's GPU-target branch is
+		// deliberately disabled on Vita), so conservatively render only draws
+		// which PCSX2 identifies as CLUT updates into GS local memory.
+		if (options.UserHacks_CPUCLUTRender == 0)
+			options.UserHacks_CPUCLUTRender = 1;
+#endif
+	}
 
 	static u8 GsTraceSourceForGifPath(GIF_PATH path)
 	{
@@ -272,26 +1119,10 @@ namespace MTGS
 		GSConfig.Renderer = GSRendererType::SW;
 		GSConfig.SWExtraThreads = 0;
 #else
-	#if defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
-		VITASX2_VITA_SOFTWARE_GS_CONTROL
-		// PCSX2 owner: GS.cpp::OpenGSRenderer() passes the configured worker
-		// count to makeGSRendererSW(). Keep EE on USER_0 and split scanline bands
-		// over USER_1/USER_2; the MTGS producer shares USER_1 but spends most of a
-		// software-bound frame feeding and waiting for those workers. CPU3 remains
-		// reserved for the shell, plugins, and background work.
-		GSConfig.Renderer = GSRendererType::SW;
-		GSConfig.SWExtraThreads = 2;
-	#else
-		GSConfig.Renderer = GSRendererType::Auto;
-	#endif
-		GSConfig.UpscaleMultiplier = 1.0f;
-		GSConfig.DumpReplaceableTextures = false;
-		GSConfig.LoadTextureReplacements = false;
-		// PCSX2 owner: GSTextureCache::LookupSource(). Keep PCSX2's proven CPU
-		// palette expansion until GXM's native P8 lookup path passes the same
-		// texture samples on hardware; ordinary RGBA sampling is the correctness
-		// baseline for the direct renderer.
-		GSConfig.GPUPaletteConversion = false;
+		// Apply the same Vita constraints before renderer construction and during
+		// later settings updates. GSRendererHW snapshots several settings while it
+		// builds its caches; deferring these until ApplySettings() is too late.
+		ApplyVitaGsSettings(GSConfig);
 #endif
 
 		// PCSX2 owner: GS/GS.cpp::OpenGSRenderer(). The software vertex
@@ -372,6 +1203,9 @@ namespace MTGS
 		s_gs->VSync(field, registers_written, idle_frame);
 #endif
 #if defined(__vita__)
+		VitaGxmPublishPerformanceCounters();
+		s_gs_worker_performance.completed_vsyncs++;
+		PublishGsWorkerPerformance();
 		RecordHardwareVsyncProfile(s_worker_profile, "worker");
 #endif
 		// PCSX2 owner: GS.cpp::GSvsync() snapshots after Flush() and VSync().
@@ -485,6 +1319,9 @@ namespace MTGS
 				const u32 read_pos = s_read_pos.load(std::memory_order_relaxed);
 				const PacketTag& tag = reinterpret_cast<const PacketTag&>(s_ring[read_pos]);
 				u32 ring_advance = 1;
+#if defined(__vita__)
+				s_gs_worker_performance.commands++;
+#endif
 
 				switch (static_cast<Command>(tag.command))
 				{
@@ -494,10 +1331,19 @@ namespace MTGS
 						Gif_Path& path = gifUnit.gifPath[path_index];
 						const u32 offset = tag.data[0];
 						const u32 size = tag.data[1];
+#if defined(__vita__)
+						s_gs_worker_performance.gs_packets++;
+						s_gs_worker_performance.gs_packet_bytes += size;
+#endif
 						if (s_gs && offset != ~0u)
 						{
 							const Pcsx2Trace::ScopedGsTraceSourceOverride trace_source(
 								GsTraceSourceForGifPath(path_index));
+						#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+							VitaGsDrawTraceRecordPacket(
+								GsTraceSourceForGifPath(path_index), &path.buffer[offset],
+								size, false);
+						#endif
 							s_gs->Transfer<3>(&path.buffer[offset], size / 16);
 						}
 						path.readAmount.fetch_sub(size, std::memory_order_acq_rel);
@@ -523,12 +1369,24 @@ namespace MTGS
 							do
 							{
 								Threading::SpinWait();
+#if defined(__vita__)
+								s_gs_worker_performance.mtvu_visibility_spins++;
+#endif
 							} while (!path.TryGetGSPacketMTVU(packet));
 						}
+#if defined(__vita__)
+						s_gs_worker_performance.mtvu_packets++;
+						s_gs_worker_performance.mtvu_packet_bytes += packet.size;
+#endif
 						if (s_gs && packet.size)
 						{
 							const Pcsx2Trace::ScopedGsTraceSourceOverride trace_source(
 								Pcsx2Trace::GsTraceSourcePath1);
+						#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+							VitaGsDrawTraceRecordPacket(
+								Pcsx2Trace::GsTraceSourcePath1,
+								&path.buffer[packet.offset], packet.size, true);
+						#endif
 							s_gs->Transfer<3>(&path.buffer[packet.offset], packet.size / 16);
 						}
 						path.readAmount.fetch_sub(packet.size + packet.readAmount,
@@ -686,6 +1544,9 @@ namespace MTGS
 			while (true)
 			{
 				Threading::SpinWait();
+#if defined(__vita__)
+				s_gs_producer_performance.ring_spins++;
+#endif
 				read_pos = s_read_pos.load(std::memory_order_acquire);
 				free_room = write_pos < read_pos ? read_pos - write_pos :
 					RingBufferSize - (write_pos - read_pos);
@@ -715,6 +1576,10 @@ namespace MTGS
 		pxAssert(actual_size <= s_packet_size);
 		PacketTag& tag = reinterpret_cast<PacketTag&>(s_ring[s_packet_start_pos]);
 		tag.data[0] = actual_size;
+#if defined(__vita__)
+		s_gs_producer_performance.submissions++;
+		s_gs_producer_performance.ring_words += actual_size + 1;
+#endif
 		s_write_pos.store(s_packet_write_pos, std::memory_order_release);
 		if (EmuConfig.GS.SynchronousMTGS)
 			WaitGS();
@@ -748,6 +1613,19 @@ namespace MTGS
 		tag.data[0] = data0;
 		tag.data[1] = data1;
 		tag.data[2] = data2;
+#if defined(__vita__)
+		s_gs_producer_performance.submissions++;
+		s_gs_producer_performance.ring_words++;
+		if (command == Command::GSPacket)
+		{
+			s_gs_producer_performance.gs_packets++;
+			s_gs_producer_performance.gs_packet_bytes += data1;
+		}
+		else if (command == Command::MTVUGSPacket)
+		{
+			s_gs_producer_performance.mtvu_packets++;
+		}
+#endif
 		FinishSimplePacket();
 	}
 
@@ -771,6 +1649,10 @@ namespace MTGS
 		tag.command = static_cast<u32>(command);
 		tag.data[0] = data0;
 		tag.pointer = reinterpret_cast<uptr>(pointer);
+#if defined(__vita__)
+		s_gs_producer_performance.submissions++;
+		s_gs_producer_performance.ring_words++;
+#endif
 		FinishSimplePacket();
 	}
 
@@ -797,6 +1679,10 @@ namespace MTGS
 		if (!IsOpen())
 			return;
 
+#if defined(__vita__)
+		s_gs_producer_performance.wait_calls++;
+#endif
+
 		SetEvent();
 		if (weak_wait && is_mtvu)
 		{
@@ -809,6 +1695,9 @@ namespace MTGS
 					std::lock_guard lock(s_mtvu_wait_mutex);
 					if (path.GetPendingGSPackets() != pending_packets)
 						break;
+#if defined(__vita__)
+					s_gs_producer_performance.wait_spins++;
+#endif
 				}
 			}
 		}
@@ -895,6 +1784,7 @@ namespace MTGS
 
 #if defined(__vita__)
 		RecordHardwareVsyncProfile(s_producer_profile, "producer");
+		RecordCorrelatedPerformanceProfile();
 #endif
 
 		RingVSyncSnapshot snapshot = {};
@@ -982,17 +1872,7 @@ namespace MTGS
 		options.Renderer = GSRendererType::SW;
 		options.UserHacks_GPUTargetCLUTMode = GSGPUTargetCLUTMode::Disabled;
 #else
-	#if defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) && \
-		VITASX2_VITA_SOFTWARE_GS_CONTROL
-		options.Renderer = GSRendererType::SW;
-		options.SWExtraThreads = 2;
-	#else
-		options.Renderer = GSRendererType::Auto;
-	#endif
-		options.UpscaleMultiplier = 1.0f;
-		options.DumpReplaceableTextures = false;
-		options.LoadTextureReplacements = false;
-		options.GPUPaletteConversion = false;
+		ApplyVitaGsSettings(options);
 #endif
 		RunOnGSThread([options = std::move(options)]() {
 			Pcsx2Config::GSOptions old_options = std::move(GSConfig);
@@ -1075,6 +1955,27 @@ void VitaGS::SetNativePresenterEnabled(bool enabled)
 bool VitaGS::IsNativePresenterEnabled()
 {
 	return MTGS::s_native_presenter_enabled;
+}
+
+void VitaGS::NotifyPerformanceElfEntry()
+{
+#if defined(__vita__)
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	VitaGsDrawTraceNotifyElfEntry();
+	#endif
+	// PCSX2 owner: MachineCheckpointTrace::NotifyMachineCheckpointElfEntry()
+	// snapshots g_FrameCount and measures later captures relative to that frame.
+	// Reset only the sampling cadence: lifetime counters remain monotonic.
+	MTGS::s_correlated_profile.producer_vsync_origin =
+		MTGS::s_correlated_profile.producer_vsyncs;
+	MTGS::s_correlated_profile.sampling_boundaries = 0;
+	MTGS::s_correlated_profile.boundaries_at_start = 0;
+	MTGS::s_correlated_profile.started = false;
+	MTGS::s_correlated_profile.elf_origin = true;
+	MTGS::s_correlated_profile.origin =
+		MTGS::CaptureCorrelatedPerformanceSnapshot(
+			MTGS::s_correlated_profile.producer_vsyncs);
+#endif
 }
 
 bool GSValidatePortableState()

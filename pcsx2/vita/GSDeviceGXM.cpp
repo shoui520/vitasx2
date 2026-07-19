@@ -12,10 +12,14 @@
 #include "vita/VitaGxmDisplay.h"
 #include "vita/VitaGxmMemory.h"
 #include "vita/VitaGxmTexture.h"
+#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+#include "vita/VitaGsDrawTrace.h"
+#endif
 
 #include <psp2/gxm.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdarg>
@@ -67,6 +71,135 @@ extern "C"
 
 namespace
 {
+	VitaGxmPerformanceCounters s_gxm_worker_performance;
+	std::atomic<u64> s_gxm_published_draw_calls{0};
+	std::atomic<u64> s_gxm_published_draw_indices{0};
+	std::atomic<u64> s_gxm_published_vertex_upload_bytes{0};
+	std::atomic<u64> s_gxm_published_index_upload_bytes{0};
+	std::atomic<u64> s_gxm_published_texture_uploads{0};
+	std::atomic<u64> s_gxm_published_texture_upload_bytes{0};
+	std::atomic<u64> s_gxm_published_texture_readbacks{0};
+	std::atomic<u64> s_gxm_published_texture_readback_bytes{0};
+	std::atomic<u64> s_gxm_published_tfx_draws{0};
+	std::atomic<u64> s_gxm_published_textured_tfx_draws{0};
+	std::atomic<u64> s_gxm_published_render_target_source_draws{0};
+	std::atomic<u64> s_gxm_published_depth_source_draws{0};
+	std::atomic<u64> s_gxm_published_rt_hazard_draws{0};
+	std::atomic<u64> s_gxm_published_depth_hazard_draws{0};
+	std::atomic<u64> s_gxm_published_feedback_rt_draws{0};
+	std::atomic<u64> s_gxm_published_feedback_depth_draws{0};
+	std::atomic<u64> s_gxm_published_software_blend_draws{0};
+	std::atomic<u64> s_gxm_published_fixed_blend_draws{0};
+	std::atomic<u64> s_gxm_published_alpha_test_draws{0};
+	std::atomic<u64> s_gxm_published_partial_color_mask_draws{0};
+	std::atomic<u64> s_gxm_published_feedback_snapshots{0};
+	std::atomic<u64> s_gxm_published_feedback_snapshot_bytes{0};
+	std::atomic<u64> s_gxm_published_merge_calls{0};
+	std::atomic<u64> s_gxm_published_merge_rc1_draws{0};
+	std::atomic<u64> s_gxm_published_merge_rc2_draws{0};
+	std::atomic<u64> s_gxm_published_present_calls{0};
+	std::atomic<u64> s_gxm_published_interlace_calls{0};
+	std::atomic<u64> s_gxm_published_last_merge_pmode{0};
+	std::atomic<u64> s_gxm_published_last_merge_extbuf{0};
+	std::atomic<u32> s_gxm_published_last_merge_background{0};
+	std::atomic<u32> s_gxm_published_last_merge_source_size_1{0};
+	std::atomic<u32> s_gxm_published_last_merge_source_size_2{0};
+	std::atomic<u32> s_gxm_published_last_merge_source_id_1{0};
+	std::atomic<u32> s_gxm_published_last_merge_source_id_2{0};
+	std::atomic<u8> s_gxm_published_last_merge_source_mask{0};
+	std::atomic<u8> s_gxm_published_last_merge_source_states{0};
+	std::atomic<u64> s_gxm_published_last_merge_writer_tfx_writes{0};
+	std::atomic<u64> s_gxm_published_last_merge_writer_ps_lo{0};
+	std::atomic<u64> s_gxm_published_last_merge_writer_ps_hi{0};
+	std::atomic<u64> s_gxm_published_last_merge_writer_draw_area{0};
+	std::atomic<u64> s_gxm_published_last_merge_writer_sample_area{0};
+	std::atomic<u32> s_gxm_published_last_merge_writer_source_id{0};
+	std::atomic<u32> s_gxm_published_last_merge_writer_source_size{0};
+	std::atomic<u32> s_gxm_published_last_merge_writer_blend{0};
+	std::atomic<u32> s_gxm_published_last_merge_writer_selector_keys{0};
+	std::atomic<u8> s_gxm_published_last_merge_trace_circuit{0};
+	std::atomic<u8> s_gxm_published_last_merge_writer_kind{0};
+	std::atomic<u8> s_gxm_published_last_merge_writer_topology{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_tfx_writes{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_textured_tfx_writes{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_untextured_tfx_writes{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_rt_source_tfx_writes{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_full_mask_tfx_writes{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_rgb_only_tfx_writes{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_alpha_only_tfx_writes{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_other_mask_tfx_writes{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_ps_lo{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_ps_hi{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_draw_area{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_sample_area{0};
+	std::atomic<u32> s_gxm_published_last_merge_parent_source_id{0};
+	std::atomic<u32> s_gxm_published_last_merge_parent_source_size{0};
+	std::atomic<u32> s_gxm_published_last_merge_parent_blend{0};
+	std::atomic<u32> s_gxm_published_last_merge_parent_selector_keys{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_last_rgb_ps_lo{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_last_rgb_ps_hi{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_last_rgb_draw_area{0};
+	std::atomic<u64> s_gxm_published_last_merge_parent_last_rgb_sample_area{0};
+	std::atomic<u32> s_gxm_published_last_merge_parent_last_rgb_source_id{0};
+	std::atomic<u32> s_gxm_published_last_merge_parent_last_rgb_source_size{0};
+	std::atomic<u32> s_gxm_published_last_merge_parent_last_rgb_blend{0};
+	std::atomic<u32> s_gxm_published_last_merge_parent_last_rgb_selector_keys{0};
+	std::atomic<u8> s_gxm_published_last_merge_parent_kind{0};
+	std::atomic<u8> s_gxm_published_last_merge_parent_topology{0};
+	std::atomic<u8> s_gxm_published_last_merge_parent_color_mask{0};
+	std::atomic<u8> s_gxm_published_last_merge_parent_last_rgb_topology{0};
+	std::atomic<u8> s_gxm_published_last_merge_parent_last_rgb_color_mask{0};
+	std::atomic<u64> s_gxm_published_psm24_draws{0};
+	std::atomic<u64> s_gxm_published_device_rejects{0};
+	std::atomic<u32> s_gxm_published_last_device_reject_hash{0};
+	std::atomic<u64> s_gxm_published_last_feedback_ps_lo{0};
+	std::atomic<u64> s_gxm_published_last_feedback_ps_hi{0};
+	std::atomic<u32> s_gxm_published_last_feedback_blend{0};
+	std::atomic<u8> s_gxm_published_last_feedback_vs{0};
+	std::atomic<u8> s_gxm_published_last_feedback_sampler{0};
+	std::atomic<u8> s_gxm_published_last_feedback_depth{0};
+	std::atomic<u8> s_gxm_published_last_feedback_colormask{0};
+	std::atomic<u8> s_gxm_published_last_feedback_topology{0};
+	std::atomic<u8> s_gxm_published_last_feedback_hazard{0};
+	std::atomic<u64> s_gxm_published_rejected_tfx_draws{0};
+	std::atomic<u64> s_gxm_published_last_rejected_tfx_features{0};
+	std::atomic<u64> s_gxm_published_last_rejected_tfx_ps_lo{0};
+	std::atomic<u64> s_gxm_published_last_rejected_tfx_ps_hi{0};
+	std::atomic<u32> s_gxm_published_last_rejected_tfx_blend{0};
+	std::atomic<u8> s_gxm_published_last_rejected_tfx_vs{0};
+	std::atomic<u8> s_gxm_published_last_rejected_tfx_sampler{0};
+	std::atomic<u8> s_gxm_published_last_rejected_tfx_depth{0};
+	std::atomic<u8> s_gxm_published_last_rejected_tfx_colormask{0};
+	std::atomic<u8> s_gxm_published_last_rejected_tfx_topology{0};
+
+	enum GxmTfxRejectFeature : u64
+	{
+		GxmTfxRejectPaletteTexture = 1ull << 0,
+		GxmTfxRejectPaletteFormat = 1ull << 1,
+		GxmTfxRejectDepthFormat = 1ull << 2,
+		GxmTfxRejectDestinationFormat = 1ull << 3,
+		GxmTfxRejectDither = 1ull << 4,
+		GxmTfxRejectAlphaFail = 1ull << 5,
+		GxmTfxRejectZTest = 1ull << 6,
+		GxmTfxRejectShuffle = 1ull << 7,
+		GxmTfxRejectChannelFetch = 1ull << 8,
+		GxmTfxRejectColorClip = 1ull << 9,
+		GxmTfxRejectGameHle = 1ull << 10,
+		GxmTfxRejectPointSampler = 1ull << 11,
+		GxmTfxRejectSoftwareAnisotropy = 1ull << 12,
+		GxmTfxRejectScanMask = 1ull << 13,
+		GxmTfxRejectAa1 = 1ull << 14,
+		GxmTfxRejectRov = 1ull << 15,
+		GxmTfxRejectRegionClamp = 1ull << 16,
+		GxmTfxRejectZClamp = 1ull << 17,
+		GxmTfxRejectTextureOffset = 1ull << 18,
+		GxmTfxRejectCoordinateAdjust = 1ull << 19,
+		GxmTfxRejectTextureIsFramebuffer = 1ull << 20,
+		GxmTfxRejectDateOrAbe = 1ull << 21,
+		GxmTfxRejectDepthDate = 1ull << 22,
+		GxmTfxRejectMipFilter = 1ull << 23,
+	};
+
 	constexpr u32 PATCHER_BUFFER_BYTES = 512 * 1024;
 	constexpr u32 PATCHER_VERTEX_USSE_BYTES = 256 * 1024;
 	constexpr u32 PATCHER_FRAGMENT_USSE_BYTES = 2 * 1024 * 1024;
@@ -202,6 +335,152 @@ namespace
 			TranslateBlendFactor(config.blend.dst_factor_alpha, &ignored);
 	}
 
+	u64 GetUnsupportedTfxFeatureMask(const GSHWDrawConfig& config,
+		bool invalid_destination_format, bool invalid_dither,
+		bool invalid_mip_filter)
+	{
+		u64 features = 0;
+		if (config.pal)
+			features |= GxmTfxRejectPaletteTexture;
+		if (config.ps.pal_fmt)
+			features |= GxmTfxRejectPaletteFormat;
+		if (config.ps.depth_fmt)
+			features |= GxmTfxRejectDepthFormat;
+		if (invalid_destination_format)
+			features |= GxmTfxRejectDestinationFormat;
+		if (invalid_dither)
+			features |= GxmTfxRejectDither;
+		if (config.ps.afail != GSHWDrawConfig::PS_AFAIL::KEEP)
+			features |= GxmTfxRejectAlphaFail;
+		if (config.ps.ztst)
+			features |= GxmTfxRejectZTest;
+		if (config.ps.shuffle || config.ps.shuffle_same || config.ps.real16src ||
+			config.ps.process_ba || config.ps.process_rg ||
+			config.ps.shuffle_across || config.ps.write_rg || config.ps.a_masked)
+		{
+			features |= GxmTfxRejectShuffle;
+		}
+		if (config.ps.channel)
+			features |= GxmTfxRejectChannelFetch;
+		if (config.ps.colclip_hw)
+			features |= GxmTfxRejectColorClip;
+		if (config.ps.urban_chaos_hle || config.ps.tales_of_abyss_hle)
+			features |= GxmTfxRejectGameHle;
+		if (config.ps.point_sampler)
+			features |= GxmTfxRejectPointSampler;
+		if (config.ps.sw_aniso)
+			features |= GxmTfxRejectSoftwareAnisotropy;
+		if (config.ps.scanmsk)
+			features |= GxmTfxRejectScanMask;
+		if (config.ps.aa1 != GSHWDrawConfig::PS_AA1::NONE)
+			features |= GxmTfxRejectAa1;
+		if (config.ps.rov_color ||
+			config.ps.rov_depth != GSHWDrawConfig::PS_ROV_DEPTH::NONE)
+		{
+			features |= GxmTfxRejectRov;
+		}
+		if (config.ps.wms == 2 || config.ps.wmt == 2)
+			features |= GxmTfxRejectRegionClamp;
+		if (config.ps.zclamp)
+			features |= GxmTfxRejectZClamp;
+		if (config.ps.tcoffsethack)
+			features |= GxmTfxRejectTextureOffset;
+		if (config.ps.adjs || config.ps.adjt)
+			features |= GxmTfxRejectCoordinateAdjust;
+		if (config.ps.tex_is_fb)
+			features |= GxmTfxRejectTextureIsFramebuffer;
+		if (config.ps.date || config.ps.abe)
+			features |= GxmTfxRejectDateOrAbe;
+		if (config.depth.date || config.depth.date_one)
+			features |= GxmTfxRejectDepthDate;
+		if (invalid_mip_filter)
+			features |= GxmTfxRejectMipFilter;
+		return features;
+	}
+
+	u64 RecordRejectedTfxDraw(const GSHWDrawConfig& config, u64 features)
+	{
+		VitaGxmPerformanceCounters& counters = s_gxm_worker_performance;
+		counters.rejected_tfx_draws++;
+		counters.last_rejected_tfx_features = features;
+		counters.last_rejected_tfx_ps_lo = config.ps.key_lo;
+		counters.last_rejected_tfx_ps_hi = config.ps.key_hi;
+		counters.last_rejected_tfx_blend = config.blend.key;
+		counters.last_rejected_tfx_vs = config.vs.key;
+		counters.last_rejected_tfx_sampler = config.sampler.key;
+		counters.last_rejected_tfx_depth = config.depth.key;
+		counters.last_rejected_tfx_colormask = config.colormask.key;
+		counters.last_rejected_tfx_topology = static_cast<u8>(config.topology);
+		return counters.rejected_tfx_draws;
+	}
+
+	u32 HashRejectReason(const char* reason)
+	{
+		// Stable FNV-1a lets the bounded record identify every non-TFX rejection
+		// without copying strings or logging on the hot draw path. The literal
+		// remains the authoritative decoder at each GSDeviceGXM::Reject() callsite.
+		u32 hash = 2166136261u;
+		for (const unsigned char* p =
+			reinterpret_cast<const unsigned char*>(reason); p && *p; p++)
+		{
+			hash = (hash ^ *p) * 16777619u;
+		}
+		return hash;
+	}
+
+	u64 PackTelemetryRect(const GSVector4i& rect)
+	{
+		// Preserve signed 16-bit GS coordinates in a compact, parser-friendly
+		// x/y/z/w word. GSRendererHW's draw/sample bounds are within this range.
+		return static_cast<u64>(static_cast<u16>(rect.x)) |
+			(static_cast<u64>(static_cast<u16>(rect.y)) << 16) |
+			(static_cast<u64>(static_cast<u16>(rect.z)) << 32) |
+			(static_cast<u64>(static_cast<u16>(rect.w)) << 48);
+	}
+
+	void RecordAcceptedTfxDraw(const GSHWDrawConfig& config)
+	{
+		VitaGxmPerformanceCounters& counters = s_gxm_worker_performance;
+		counters.tfx_draws++;
+		if (config.vs.tme)
+			counters.textured_tfx_draws++;
+		if (config.tex && config.tex->IsRenderTarget())
+			counters.render_target_source_draws++;
+		if (config.tex && config.tex->IsDepthLike())
+			counters.depth_source_draws++;
+		if (config.tex_hazard == GSHWDrawConfig::TEX_HAZARD_RT)
+			counters.rt_hazard_draws++;
+		else if (config.tex_hazard == GSHWDrawConfig::TEX_HAZARD_DEPTH)
+			counters.depth_hazard_draws++;
+		const bool feedback_rt = config.IsFeedbackLoopRT(config.ps);
+		const bool feedback_depth = config.IsFeedbackLoopDepth(config.ps);
+		if (feedback_rt)
+			counters.feedback_rt_draws++;
+		if (feedback_depth)
+			counters.feedback_depth_draws++;
+		if (config.ps.IsSWBlending())
+			counters.software_blend_draws++;
+		if (config.blend.enable)
+			counters.fixed_blend_draws++;
+		if (config.ps.IsAlphaTesting())
+			counters.alpha_test_draws++;
+		if (config.colormask.wrgba != 0xf)
+			counters.partial_color_mask_draws++;
+		if (feedback_rt || feedback_depth ||
+			config.tex_hazard != GSHWDrawConfig::TEX_HAZARD_NONE)
+		{
+			counters.last_feedback_ps_lo = config.ps.key_lo;
+			counters.last_feedback_ps_hi = config.ps.key_hi;
+			counters.last_feedback_blend = config.blend.key;
+			counters.last_feedback_vs = config.vs.key;
+			counters.last_feedback_sampler = config.sampler.key;
+			counters.last_feedback_depth = config.depth.key;
+			counters.last_feedback_colormask = config.colormask.key;
+			counters.last_feedback_topology = static_cast<u8>(config.topology);
+			counters.last_feedback_hazard = static_cast<u8>(config.tex_hazard);
+		}
+	}
+
 	void SetQuadVertex(QuadVertex& vertex, float x, float y, u32 color,
 		float u, float v)
 	{
@@ -222,6 +501,514 @@ namespace
 		return texture ? static_cast<T*>(texture) : nullptr;
 	}
 } // namespace
+
+void VitaGxmPublishPerformanceCounters()
+{
+	s_gxm_published_draw_calls.store(s_gxm_worker_performance.draw_calls,
+		std::memory_order_relaxed);
+	s_gxm_published_draw_indices.store(s_gxm_worker_performance.draw_indices,
+		std::memory_order_relaxed);
+	s_gxm_published_vertex_upload_bytes.store(
+		s_gxm_worker_performance.vertex_upload_bytes, std::memory_order_relaxed);
+	s_gxm_published_index_upload_bytes.store(
+		s_gxm_worker_performance.index_upload_bytes, std::memory_order_relaxed);
+	s_gxm_published_texture_uploads.store(s_gxm_worker_performance.texture_uploads,
+		std::memory_order_relaxed);
+	s_gxm_published_texture_upload_bytes.store(
+		s_gxm_worker_performance.texture_upload_bytes, std::memory_order_relaxed);
+	s_gxm_published_texture_readbacks.store(
+		s_gxm_worker_performance.texture_readbacks, std::memory_order_relaxed);
+	s_gxm_published_texture_readback_bytes.store(
+		s_gxm_worker_performance.texture_readback_bytes, std::memory_order_relaxed);
+	s_gxm_published_tfx_draws.store(s_gxm_worker_performance.tfx_draws,
+		std::memory_order_relaxed);
+	s_gxm_published_textured_tfx_draws.store(
+		s_gxm_worker_performance.textured_tfx_draws, std::memory_order_relaxed);
+	s_gxm_published_render_target_source_draws.store(
+		s_gxm_worker_performance.render_target_source_draws,
+		std::memory_order_relaxed);
+	s_gxm_published_depth_source_draws.store(
+		s_gxm_worker_performance.depth_source_draws, std::memory_order_relaxed);
+	s_gxm_published_rt_hazard_draws.store(
+		s_gxm_worker_performance.rt_hazard_draws, std::memory_order_relaxed);
+	s_gxm_published_depth_hazard_draws.store(
+		s_gxm_worker_performance.depth_hazard_draws, std::memory_order_relaxed);
+	s_gxm_published_feedback_rt_draws.store(
+		s_gxm_worker_performance.feedback_rt_draws, std::memory_order_relaxed);
+	s_gxm_published_feedback_depth_draws.store(
+		s_gxm_worker_performance.feedback_depth_draws, std::memory_order_relaxed);
+	s_gxm_published_software_blend_draws.store(
+		s_gxm_worker_performance.software_blend_draws, std::memory_order_relaxed);
+	s_gxm_published_fixed_blend_draws.store(
+		s_gxm_worker_performance.fixed_blend_draws, std::memory_order_relaxed);
+	s_gxm_published_alpha_test_draws.store(
+		s_gxm_worker_performance.alpha_test_draws, std::memory_order_relaxed);
+	s_gxm_published_partial_color_mask_draws.store(
+		s_gxm_worker_performance.partial_color_mask_draws,
+		std::memory_order_relaxed);
+	s_gxm_published_feedback_snapshots.store(
+		s_gxm_worker_performance.feedback_snapshots, std::memory_order_relaxed);
+	s_gxm_published_feedback_snapshot_bytes.store(
+		s_gxm_worker_performance.feedback_snapshot_bytes,
+		std::memory_order_relaxed);
+	s_gxm_published_merge_calls.store(s_gxm_worker_performance.merge_calls,
+		std::memory_order_relaxed);
+	s_gxm_published_merge_rc1_draws.store(
+		s_gxm_worker_performance.merge_rc1_draws, std::memory_order_relaxed);
+	s_gxm_published_merge_rc2_draws.store(
+		s_gxm_worker_performance.merge_rc2_draws, std::memory_order_relaxed);
+	s_gxm_published_present_calls.store(s_gxm_worker_performance.present_calls,
+		std::memory_order_relaxed);
+	s_gxm_published_interlace_calls.store(
+		s_gxm_worker_performance.interlace_calls, std::memory_order_relaxed);
+	s_gxm_published_last_merge_pmode.store(
+		s_gxm_worker_performance.last_merge_pmode, std::memory_order_relaxed);
+	s_gxm_published_last_merge_extbuf.store(
+		s_gxm_worker_performance.last_merge_extbuf, std::memory_order_relaxed);
+	s_gxm_published_last_merge_background.store(
+		s_gxm_worker_performance.last_merge_background,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_source_size_1.store(
+		s_gxm_worker_performance.last_merge_source_sizes[0],
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_source_size_2.store(
+		s_gxm_worker_performance.last_merge_source_sizes[1],
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_source_id_1.store(
+		s_gxm_worker_performance.last_merge_source_ids[0],
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_source_id_2.store(
+		s_gxm_worker_performance.last_merge_source_ids[1],
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_source_mask.store(
+		s_gxm_worker_performance.last_merge_source_mask,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_source_states.store(
+		s_gxm_worker_performance.last_merge_source_states,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_tfx_writes.store(
+		s_gxm_worker_performance.last_merge_writer_tfx_writes,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_ps_lo.store(
+		s_gxm_worker_performance.last_merge_writer_ps_lo,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_ps_hi.store(
+		s_gxm_worker_performance.last_merge_writer_ps_hi,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_draw_area.store(
+		s_gxm_worker_performance.last_merge_writer_draw_area,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_sample_area.store(
+		s_gxm_worker_performance.last_merge_writer_sample_area,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_source_id.store(
+		s_gxm_worker_performance.last_merge_writer_source_id,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_source_size.store(
+		s_gxm_worker_performance.last_merge_writer_source_size,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_blend.store(
+		s_gxm_worker_performance.last_merge_writer_blend,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_selector_keys.store(
+		s_gxm_worker_performance.last_merge_writer_selector_keys,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_trace_circuit.store(
+		s_gxm_worker_performance.last_merge_trace_circuit,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_kind.store(
+		s_gxm_worker_performance.last_merge_writer_kind,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_writer_topology.store(
+		s_gxm_worker_performance.last_merge_writer_topology,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_tfx_writes.store(
+		s_gxm_worker_performance.last_merge_parent_tfx_writes,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_textured_tfx_writes.store(
+		s_gxm_worker_performance.last_merge_parent_textured_tfx_writes,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_untextured_tfx_writes.store(
+		s_gxm_worker_performance.last_merge_parent_untextured_tfx_writes,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_rt_source_tfx_writes.store(
+		s_gxm_worker_performance.last_merge_parent_render_target_source_tfx_writes,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_full_mask_tfx_writes.store(
+		s_gxm_worker_performance.last_merge_parent_full_mask_tfx_writes,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_rgb_only_tfx_writes.store(
+		s_gxm_worker_performance.last_merge_parent_rgb_only_tfx_writes,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_alpha_only_tfx_writes.store(
+		s_gxm_worker_performance.last_merge_parent_alpha_only_tfx_writes,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_other_mask_tfx_writes.store(
+		s_gxm_worker_performance.last_merge_parent_other_mask_tfx_writes,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_ps_lo.store(
+		s_gxm_worker_performance.last_merge_parent_ps_lo,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_ps_hi.store(
+		s_gxm_worker_performance.last_merge_parent_ps_hi,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_draw_area.store(
+		s_gxm_worker_performance.last_merge_parent_draw_area,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_sample_area.store(
+		s_gxm_worker_performance.last_merge_parent_sample_area,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_source_id.store(
+		s_gxm_worker_performance.last_merge_parent_source_id,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_source_size.store(
+		s_gxm_worker_performance.last_merge_parent_source_size,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_blend.store(
+		s_gxm_worker_performance.last_merge_parent_blend,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_selector_keys.store(
+		s_gxm_worker_performance.last_merge_parent_selector_keys,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_ps_lo.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_ps_lo,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_ps_hi.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_ps_hi,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_draw_area.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_draw_area,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_sample_area.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_sample_area,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_source_id.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_source_id,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_source_size.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_source_size,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_blend.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_blend,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_selector_keys.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_selector_keys,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_kind.store(
+		s_gxm_worker_performance.last_merge_parent_kind,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_topology.store(
+		s_gxm_worker_performance.last_merge_parent_topology,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_color_mask.store(
+		s_gxm_worker_performance.last_merge_parent_color_mask,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_topology.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_topology,
+		std::memory_order_relaxed);
+	s_gxm_published_last_merge_parent_last_rgb_color_mask.store(
+		s_gxm_worker_performance.last_merge_parent_last_rgb_color_mask,
+		std::memory_order_relaxed);
+	s_gxm_published_psm24_draws.store(s_gxm_worker_performance.psm24_draws,
+		std::memory_order_relaxed);
+	s_gxm_published_last_device_reject_hash.store(
+		s_gxm_worker_performance.last_device_reject_hash,
+		std::memory_order_relaxed);
+	s_gxm_published_last_feedback_ps_lo.store(
+		s_gxm_worker_performance.last_feedback_ps_lo, std::memory_order_relaxed);
+	s_gxm_published_last_feedback_ps_hi.store(
+		s_gxm_worker_performance.last_feedback_ps_hi, std::memory_order_relaxed);
+	s_gxm_published_last_feedback_blend.store(
+		s_gxm_worker_performance.last_feedback_blend, std::memory_order_relaxed);
+	s_gxm_published_last_feedback_vs.store(
+		s_gxm_worker_performance.last_feedback_vs, std::memory_order_relaxed);
+	s_gxm_published_last_feedback_sampler.store(
+		s_gxm_worker_performance.last_feedback_sampler, std::memory_order_relaxed);
+	s_gxm_published_last_feedback_depth.store(
+		s_gxm_worker_performance.last_feedback_depth, std::memory_order_relaxed);
+	s_gxm_published_last_feedback_colormask.store(
+		s_gxm_worker_performance.last_feedback_colormask,
+		std::memory_order_relaxed);
+	s_gxm_published_last_feedback_topology.store(
+		s_gxm_worker_performance.last_feedback_topology,
+		std::memory_order_relaxed);
+	s_gxm_published_last_feedback_hazard.store(
+		s_gxm_worker_performance.last_feedback_hazard, std::memory_order_relaxed);
+	// Publish the monotonic device-rejection count after its identity.
+	s_gxm_published_device_rejects.store(
+		s_gxm_worker_performance.device_rejects, std::memory_order_release);
+	s_gxm_published_last_rejected_tfx_features.store(
+		s_gxm_worker_performance.last_rejected_tfx_features,
+		std::memory_order_relaxed);
+	s_gxm_published_last_rejected_tfx_ps_lo.store(
+		s_gxm_worker_performance.last_rejected_tfx_ps_lo,
+		std::memory_order_relaxed);
+	s_gxm_published_last_rejected_tfx_ps_hi.store(
+		s_gxm_worker_performance.last_rejected_tfx_ps_hi,
+		std::memory_order_relaxed);
+	s_gxm_published_last_rejected_tfx_blend.store(
+		s_gxm_worker_performance.last_rejected_tfx_blend,
+		std::memory_order_relaxed);
+	s_gxm_published_last_rejected_tfx_vs.store(
+		s_gxm_worker_performance.last_rejected_tfx_vs, std::memory_order_relaxed);
+	s_gxm_published_last_rejected_tfx_sampler.store(
+		s_gxm_worker_performance.last_rejected_tfx_sampler,
+		std::memory_order_relaxed);
+	s_gxm_published_last_rejected_tfx_depth.store(
+		s_gxm_worker_performance.last_rejected_tfx_depth,
+		std::memory_order_relaxed);
+	s_gxm_published_last_rejected_tfx_colormask.store(
+		s_gxm_worker_performance.last_rejected_tfx_colormask,
+		std::memory_order_relaxed);
+	s_gxm_published_last_rejected_tfx_topology.store(
+		s_gxm_worker_performance.last_rejected_tfx_topology,
+		std::memory_order_relaxed);
+	// Publish the monotonic rejection count last. Readers acquire it before
+	// consuming the associated last-rejection identity.
+	s_gxm_published_rejected_tfx_draws.store(
+		s_gxm_worker_performance.rejected_tfx_draws, std::memory_order_release);
+}
+
+VitaGxmPerformanceCounters VitaGxmGetPublishedPerformanceCounters()
+{
+	VitaGxmPerformanceCounters counters;
+	counters.rejected_tfx_draws =
+		s_gxm_published_rejected_tfx_draws.load(std::memory_order_acquire);
+	counters.draw_calls = s_gxm_published_draw_calls.load(std::memory_order_relaxed);
+	counters.draw_indices = s_gxm_published_draw_indices.load(std::memory_order_relaxed);
+	counters.vertex_upload_bytes =
+		s_gxm_published_vertex_upload_bytes.load(std::memory_order_relaxed);
+	counters.index_upload_bytes =
+		s_gxm_published_index_upload_bytes.load(std::memory_order_relaxed);
+	counters.texture_uploads =
+		s_gxm_published_texture_uploads.load(std::memory_order_relaxed);
+	counters.texture_upload_bytes =
+		s_gxm_published_texture_upload_bytes.load(std::memory_order_relaxed);
+	counters.texture_readbacks =
+		s_gxm_published_texture_readbacks.load(std::memory_order_relaxed);
+	counters.texture_readback_bytes =
+		s_gxm_published_texture_readback_bytes.load(std::memory_order_relaxed);
+	counters.tfx_draws = s_gxm_published_tfx_draws.load(std::memory_order_relaxed);
+	counters.textured_tfx_draws =
+		s_gxm_published_textured_tfx_draws.load(std::memory_order_relaxed);
+	counters.render_target_source_draws =
+		s_gxm_published_render_target_source_draws.load(std::memory_order_relaxed);
+	counters.depth_source_draws =
+		s_gxm_published_depth_source_draws.load(std::memory_order_relaxed);
+	counters.rt_hazard_draws =
+		s_gxm_published_rt_hazard_draws.load(std::memory_order_relaxed);
+	counters.depth_hazard_draws =
+		s_gxm_published_depth_hazard_draws.load(std::memory_order_relaxed);
+	counters.feedback_rt_draws =
+		s_gxm_published_feedback_rt_draws.load(std::memory_order_relaxed);
+	counters.feedback_depth_draws =
+		s_gxm_published_feedback_depth_draws.load(std::memory_order_relaxed);
+	counters.software_blend_draws =
+		s_gxm_published_software_blend_draws.load(std::memory_order_relaxed);
+	counters.fixed_blend_draws =
+		s_gxm_published_fixed_blend_draws.load(std::memory_order_relaxed);
+	counters.alpha_test_draws =
+		s_gxm_published_alpha_test_draws.load(std::memory_order_relaxed);
+	counters.partial_color_mask_draws =
+		s_gxm_published_partial_color_mask_draws.load(std::memory_order_relaxed);
+	counters.feedback_snapshots =
+		s_gxm_published_feedback_snapshots.load(std::memory_order_relaxed);
+	counters.feedback_snapshot_bytes =
+		s_gxm_published_feedback_snapshot_bytes.load(std::memory_order_relaxed);
+	counters.merge_calls =
+		s_gxm_published_merge_calls.load(std::memory_order_relaxed);
+	counters.merge_rc1_draws =
+		s_gxm_published_merge_rc1_draws.load(std::memory_order_relaxed);
+	counters.merge_rc2_draws =
+		s_gxm_published_merge_rc2_draws.load(std::memory_order_relaxed);
+	counters.present_calls =
+		s_gxm_published_present_calls.load(std::memory_order_relaxed);
+	counters.interlace_calls =
+		s_gxm_published_interlace_calls.load(std::memory_order_relaxed);
+	counters.last_merge_pmode =
+		s_gxm_published_last_merge_pmode.load(std::memory_order_relaxed);
+	counters.last_merge_extbuf =
+		s_gxm_published_last_merge_extbuf.load(std::memory_order_relaxed);
+	counters.last_merge_background =
+		s_gxm_published_last_merge_background.load(std::memory_order_relaxed);
+	counters.last_merge_source_sizes[0] =
+		s_gxm_published_last_merge_source_size_1.load(std::memory_order_relaxed);
+	counters.last_merge_source_sizes[1] =
+		s_gxm_published_last_merge_source_size_2.load(std::memory_order_relaxed);
+	counters.last_merge_source_ids[0] =
+		s_gxm_published_last_merge_source_id_1.load(std::memory_order_relaxed);
+	counters.last_merge_source_ids[1] =
+		s_gxm_published_last_merge_source_id_2.load(std::memory_order_relaxed);
+	counters.last_merge_source_mask =
+		s_gxm_published_last_merge_source_mask.load(std::memory_order_relaxed);
+	counters.last_merge_source_states =
+		s_gxm_published_last_merge_source_states.load(std::memory_order_relaxed);
+	counters.last_merge_writer_tfx_writes =
+		s_gxm_published_last_merge_writer_tfx_writes.load(
+			std::memory_order_relaxed);
+	counters.last_merge_writer_ps_lo =
+		s_gxm_published_last_merge_writer_ps_lo.load(std::memory_order_relaxed);
+	counters.last_merge_writer_ps_hi =
+		s_gxm_published_last_merge_writer_ps_hi.load(std::memory_order_relaxed);
+	counters.last_merge_writer_draw_area =
+		s_gxm_published_last_merge_writer_draw_area.load(
+			std::memory_order_relaxed);
+	counters.last_merge_writer_sample_area =
+		s_gxm_published_last_merge_writer_sample_area.load(
+			std::memory_order_relaxed);
+	counters.last_merge_writer_source_id =
+		s_gxm_published_last_merge_writer_source_id.load(
+			std::memory_order_relaxed);
+	counters.last_merge_writer_source_size =
+		s_gxm_published_last_merge_writer_source_size.load(
+			std::memory_order_relaxed);
+	counters.last_merge_writer_blend =
+		s_gxm_published_last_merge_writer_blend.load(std::memory_order_relaxed);
+	counters.last_merge_writer_selector_keys =
+		s_gxm_published_last_merge_writer_selector_keys.load(
+			std::memory_order_relaxed);
+	counters.last_merge_trace_circuit =
+		s_gxm_published_last_merge_trace_circuit.load(std::memory_order_relaxed);
+	counters.last_merge_writer_kind =
+		s_gxm_published_last_merge_writer_kind.load(std::memory_order_relaxed);
+	counters.last_merge_writer_topology =
+		s_gxm_published_last_merge_writer_topology.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_tfx_writes =
+		s_gxm_published_last_merge_parent_tfx_writes.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_textured_tfx_writes =
+		s_gxm_published_last_merge_parent_textured_tfx_writes.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_untextured_tfx_writes =
+		s_gxm_published_last_merge_parent_untextured_tfx_writes.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_render_target_source_tfx_writes =
+		s_gxm_published_last_merge_parent_rt_source_tfx_writes.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_full_mask_tfx_writes =
+		s_gxm_published_last_merge_parent_full_mask_tfx_writes.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_rgb_only_tfx_writes =
+		s_gxm_published_last_merge_parent_rgb_only_tfx_writes.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_alpha_only_tfx_writes =
+		s_gxm_published_last_merge_parent_alpha_only_tfx_writes.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_other_mask_tfx_writes =
+		s_gxm_published_last_merge_parent_other_mask_tfx_writes.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_ps_lo =
+		s_gxm_published_last_merge_parent_ps_lo.load(std::memory_order_relaxed);
+	counters.last_merge_parent_ps_hi =
+		s_gxm_published_last_merge_parent_ps_hi.load(std::memory_order_relaxed);
+	counters.last_merge_parent_draw_area =
+		s_gxm_published_last_merge_parent_draw_area.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_sample_area =
+		s_gxm_published_last_merge_parent_sample_area.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_source_id =
+		s_gxm_published_last_merge_parent_source_id.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_source_size =
+		s_gxm_published_last_merge_parent_source_size.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_blend =
+		s_gxm_published_last_merge_parent_blend.load(std::memory_order_relaxed);
+	counters.last_merge_parent_selector_keys =
+		s_gxm_published_last_merge_parent_selector_keys.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_ps_lo =
+		s_gxm_published_last_merge_parent_last_rgb_ps_lo.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_ps_hi =
+		s_gxm_published_last_merge_parent_last_rgb_ps_hi.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_draw_area =
+		s_gxm_published_last_merge_parent_last_rgb_draw_area.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_sample_area =
+		s_gxm_published_last_merge_parent_last_rgb_sample_area.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_source_id =
+		s_gxm_published_last_merge_parent_last_rgb_source_id.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_source_size =
+		s_gxm_published_last_merge_parent_last_rgb_source_size.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_blend =
+		s_gxm_published_last_merge_parent_last_rgb_blend.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_selector_keys =
+		s_gxm_published_last_merge_parent_last_rgb_selector_keys.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_kind =
+		s_gxm_published_last_merge_parent_kind.load(std::memory_order_relaxed);
+	counters.last_merge_parent_topology =
+		s_gxm_published_last_merge_parent_topology.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_color_mask =
+		s_gxm_published_last_merge_parent_color_mask.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_topology =
+		s_gxm_published_last_merge_parent_last_rgb_topology.load(
+			std::memory_order_relaxed);
+	counters.last_merge_parent_last_rgb_color_mask =
+		s_gxm_published_last_merge_parent_last_rgb_color_mask.load(
+			std::memory_order_relaxed);
+	counters.psm24_draws =
+		s_gxm_published_psm24_draws.load(std::memory_order_relaxed);
+	counters.device_rejects =
+		s_gxm_published_device_rejects.load(std::memory_order_acquire);
+	counters.last_device_reject_hash =
+		s_gxm_published_last_device_reject_hash.load(std::memory_order_relaxed);
+	counters.last_feedback_ps_lo =
+		s_gxm_published_last_feedback_ps_lo.load(std::memory_order_relaxed);
+	counters.last_feedback_ps_hi =
+		s_gxm_published_last_feedback_ps_hi.load(std::memory_order_relaxed);
+	counters.last_feedback_blend =
+		s_gxm_published_last_feedback_blend.load(std::memory_order_relaxed);
+	counters.last_feedback_vs =
+		s_gxm_published_last_feedback_vs.load(std::memory_order_relaxed);
+	counters.last_feedback_sampler =
+		s_gxm_published_last_feedback_sampler.load(std::memory_order_relaxed);
+	counters.last_feedback_depth =
+		s_gxm_published_last_feedback_depth.load(std::memory_order_relaxed);
+	counters.last_feedback_colormask =
+		s_gxm_published_last_feedback_colormask.load(std::memory_order_relaxed);
+	counters.last_feedback_topology =
+		s_gxm_published_last_feedback_topology.load(std::memory_order_relaxed);
+	counters.last_feedback_hazard =
+		s_gxm_published_last_feedback_hazard.load(std::memory_order_relaxed);
+	counters.last_rejected_tfx_features =
+		s_gxm_published_last_rejected_tfx_features.load(std::memory_order_relaxed);
+	counters.last_rejected_tfx_ps_lo =
+		s_gxm_published_last_rejected_tfx_ps_lo.load(std::memory_order_relaxed);
+	counters.last_rejected_tfx_ps_hi =
+		s_gxm_published_last_rejected_tfx_ps_hi.load(std::memory_order_relaxed);
+	counters.last_rejected_tfx_blend =
+		s_gxm_published_last_rejected_tfx_blend.load(std::memory_order_relaxed);
+	counters.last_rejected_tfx_vs =
+		s_gxm_published_last_rejected_tfx_vs.load(std::memory_order_relaxed);
+	counters.last_rejected_tfx_sampler =
+		s_gxm_published_last_rejected_tfx_sampler.load(std::memory_order_relaxed);
+	counters.last_rejected_tfx_depth =
+		s_gxm_published_last_rejected_tfx_depth.load(std::memory_order_relaxed);
+	counters.last_rejected_tfx_colormask =
+		s_gxm_published_last_rejected_tfx_colormask.load(std::memory_order_relaxed);
+	counters.last_rejected_tfx_topology =
+		s_gxm_published_last_rejected_tfx_topology.load(std::memory_order_relaxed);
+	return counters;
+}
+
+static void RecordGxmDraw(u64 vertices, size_t vertex_stride, u64 indices)
+{
+	s_gxm_worker_performance.draw_calls++;
+	s_gxm_worker_performance.draw_indices += indices;
+	s_gxm_worker_performance.vertex_upload_bytes += vertices * vertex_stride;
+	s_gxm_worker_performance.index_upload_bytes += indices * sizeof(u16);
+}
 
 struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 {
@@ -483,6 +1270,8 @@ bool GSDeviceGXM::Impl::Fail(const char* operation, int result)
 
 bool GSDeviceGXM::Impl::Reject(const char* reason)
 {
+	s_gxm_worker_performance.device_rejects++;
+	s_gxm_worker_performance.last_device_reject_hash = HashRejectReason(reason);
 	Console.Error("GXM GS: rejected unsupported PCSX2 device contract: %s.", reason);
 	return false;
 }
@@ -1378,7 +2167,10 @@ bool GSDeviceGXM::Impl::CommitClear(VitaGXM::GSTextureGXM& texture)
 		(texture.ColorSurface() && EnsureScene(&texture, nullptr, bounds) &&
 			DrawTargetClear(clear_color, true, 1.0f, false));
 	if (gpu_clear)
+	{
+		texture.RecordWriter(VitaGXM::TextureWriterKind::Clear, nullptr);
 		return true;
+	}
 
 	// A failed target clear must remain lazy; claiming Dirty would expose
 	// uninitialized storage to a later draw or readback.
@@ -1437,7 +2229,10 @@ bool GSDeviceGXM::Impl::DrawTargetClear(u32 color, bool write_color,
 	sceGxmSetVertexStream(context, 0, vertices);
 	const int result = sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
 		SCE_GXM_INDEX_FORMAT_U16, indices, 3);
-	return result >= 0 ? true : Fail("sceGxmDraw(lazy clear)", result);
+	if (result < 0)
+		return Fail("sceGxmDraw(lazy clear)", result);
+	RecordGxmDraw(3, sizeof(QuadVertex), 3);
+	return true;
 }
 
 bool GSDeviceGXM::Impl::EnsureScene(VitaGXM::GSTextureGXM* rt,
@@ -1582,7 +2377,10 @@ bool GSDeviceGXM::Impl::DrawMaskRect(const GSVector4i& rect, u32 width,
 	sceGxmSetVertexStream(context, 0, vertices);
 	const int result = sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
 		SCE_GXM_INDEX_FORMAT_U16, indices, quad.size());
-	return result >= 0 ? true : Fail("sceGxmDraw(scissor mask)", result);
+	if (result < 0)
+		return Fail("sceGxmDraw(scissor mask)", result);
+	RecordGxmDraw(4, sizeof(QuadVertex), quad.size());
+	return true;
 }
 
 bool GSDeviceGXM::Impl::ConfigureScissor(const GSVector4i& requested,
@@ -1644,6 +2442,12 @@ bool GSDeviceGXM::Impl::QueueTextureUpload(VitaGXM::GSTextureGXM& texture,
 		return false;
 	if (!texture.CopyFromLinear(level, destination, source.Data(), source_pitch))
 		return false;
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	VitaGsDrawTraceRecordTextureContent(texture, level, destination);
+	#endif
+	s_gxm_worker_performance.texture_uploads++;
+	s_gxm_worker_performance.texture_upload_bytes +=
+		static_cast<u64>(row_bytes) * destination.height();
 	*serial = ++transfer_serial;
 	completed_transfer_serial = transfer_serial;
 	texture.MarkTransferUse(*serial);
@@ -1667,6 +2471,9 @@ bool GSDeviceGXM::Impl::QueueTextureReadback(VitaGXM::GSTextureGXM& texture,
 		static_cast<size_t>(destination_rect.x) * bpp;
 	if (!texture.CopyToLinear(level, source, output, destination_pitch))
 		return false;
+	s_gxm_worker_performance.texture_readbacks++;
+	s_gxm_worker_performance.texture_readback_bytes +=
+		static_cast<u64>(row_bytes) * source.height();
 	*serial = ++transfer_serial;
 	completed_transfer_serial = transfer_serial;
 	texture.MarkTransferUse(*serial);
@@ -2209,7 +3016,13 @@ VitaGXM::GSTextureGXM* GSDeviceGXM::Impl::SnapshotTexture(
 		static_cast<size_t>(area.y) * dst_layout->pitch + area.x * 4;
 	if (!source.CopyToLinear(0, area, dst, dst_layout->pitch))
 		return nullptr;
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	VitaGsDrawTraceRecordTextureContent(destination, 0, area);
+	#endif
 	destination.SetState(GSTexture::State::Dirty);
+	s_gxm_worker_performance.feedback_snapshots++;
+	s_gxm_worker_performance.feedback_snapshot_bytes +=
+		static_cast<u64>(area.width()) * static_cast<u64>(area.height()) * 4u;
 	return &destination;
 }
 
@@ -2373,6 +3186,28 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 		SCE_GXM_DEPTH_WRITE_ENABLED : SCE_GXM_DEPTH_WRITE_DISABLED;
 	sceGxmSetFrontDepthWriteEnable(context, depth_write);
 	sceGxmSetBackDepthWriteEnable(context, depth_write);
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	const u32 backend_sampler =
+		(static_cast<u32>(config.sampler.tau) << 0) |
+		(static_cast<u32>(config.sampler.tav) << 1) |
+		(static_cast<u32>(min_filter == SCE_GXM_TEXTURE_FILTER_LINEAR) << 2) |
+		(static_cast<u32>(mag_filter == SCE_GXM_TEXTURE_FILTER_LINEAR) << 3) |
+		(static_cast<u32>(config.sampler.IsMipFilterLinear()) << 4) |
+		(static_cast<u32>(linear_strided) << 5) |
+		(static_cast<u32>(config.sampler.lodclamp) << 6) |
+		(static_cast<u32>(bound_source->GetMipmapLevels()) << 8);
+	const u32 backend_depth = static_cast<u32>(depth_func) |
+		(static_cast<u32>(depth_write) << 8);
+	const u32 backend_raster = static_cast<u32>(TranslateTopology(config.topology)) |
+		(static_cast<u32>(
+			config.topology == GSHWDrawConfig::Topology::Point ? 1u :
+			(config.topology == GSHWDrawConfig::Topology::Line ? 2u : 0u)) << 8);
+	VitaGsDrawTraceRecordBackendState(config, *bound_source,
+		staged_vertices, index_count * sizeof(TfxVertex),
+		staged_indices, index_count * sizeof(u16), index_count,
+		backend_sampler, backend_depth, backend_raster,
+		TranslateColorMask(config.ps.no_color ? 0 : config.colormask.wrgba));
+	#endif
 	if (!UploadTfxUniforms(config, ps, source,
 			fragment == tfx_zfloor_source_direct_decal_af_program,
 			region_repeat_fragment, fast_fragment,
@@ -2416,6 +3251,7 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	}
 	if (result < 0)
 		return Fail("sceGxmDraw(TFX)", result);
+	RecordGxmDraw(index_count, sizeof(TfxVertex), index_count);
 	if (rt)
 		rt->SetState(GSTexture::State::Dirty);
 	if (ds && config.depth.zwe)
@@ -2504,11 +3340,18 @@ bool GSDeviceGXM::Impl::DrawQuad(VitaGXM::GSTextureGXM* source,
 	}
 	const int result = sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
 		SCE_GXM_INDEX_FORMAT_U16, indices, quad.size());
-	return result >= 0 ? true : Fail("sceGxmDraw(presentation quad)", result);
+	if (result < 0)
+		return Fail("sceGxmDraw(presentation quad)", result);
+	RecordGxmDraw(4, sizeof(QuadVertex), quad.size());
+	return true;
 }
 
 void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 {
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	VitaGsDrawTraceRecordDeviceOutcome(config,
+		VitaGsDrawTraceOutcome::DeviceEntered);
+	#endif
 	if (!m_impl || !m_impl->ready)
 		return;
 	if (!config.rt && !config.ds)
@@ -2531,41 +3374,65 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 			static_cast<u8>(GS_MIN_FILTER::Linear_Mipmap_Linear) ||
 		(config.sampler.triln != static_cast<u8>(GS_MIN_FILTER::Nearest) &&
 			!mip_lod);
+	const bool psm24_fragment = config.ps.dst_fmt == 1;
 	const bool psm16_fragment = config.ps.dst_fmt == 2;
-	const bool invalid_destination_format =
-		config.ps.dst_fmt != 0 && !psm16_fragment;
+	// PCSX2 GSRendererHW::EmulateTextureShuffleAndFbmask() maps PSMCT24 to
+	// dst_fmt=1 and disables alpha writes through the component mask. Its
+	// desktop TFX shaders otherwise share the 32-bit RGB path and suppress FBA
+	// for that destination. The GXM general program carries both contracts.
+	const bool invalid_destination_format = config.ps.dst_fmt > 2;
+	// GSRendererHW::EmulateBlending() also sets round_inv for every hardware
+	// reverse-subtract blend. PCSX2's tfx_fs.glsl::ps_dither() observes it only
+	// when dithering a PSMCT16 destination; GXM's blend operation already owns
+	// the ordinary 32-bit reverse subtraction, so round_inv alone is not an
+	// unsupported dither contract.
 	const bool invalid_dither = config.ps.dither > 3 ||
 		(config.ps.dither != 0 && !psm16_fragment) ||
-		(config.ps.dither_adjust && !psm16_fragment) ||
-		(config.ps.round_inv && !psm16_fragment);
-	if (config.pal || config.ps.pal_fmt || config.ps.depth_fmt ||
-		invalid_destination_format || invalid_dither ||
+		(config.ps.dither_adjust && !psm16_fragment);
+	const bool unsupported_tfx = config.pal || config.ps.pal_fmt ||
+		config.ps.depth_fmt || invalid_destination_format || invalid_dither ||
 		config.ps.afail != GSHWDrawConfig::PS_AFAIL::KEEP || config.ps.ztst ||
 		config.ps.shuffle || config.ps.shuffle_same || config.ps.real16src ||
 		config.ps.process_ba || config.ps.process_rg || config.ps.shuffle_across ||
-		config.ps.write_rg || config.ps.a_masked ||
-		config.ps.channel ||
+		config.ps.write_rg || config.ps.a_masked || config.ps.channel ||
 		config.ps.colclip_hw || config.ps.urban_chaos_hle ||
 		config.ps.tales_of_abyss_hle || config.ps.point_sampler ||
-		config.ps.sw_aniso ||
-		config.ps.scanmsk || config.ps.aa1 != GSHWDrawConfig::PS_AA1::NONE ||
-		config.ps.rov_color ||
+		config.ps.sw_aniso || config.ps.scanmsk ||
+		config.ps.aa1 != GSHWDrawConfig::PS_AA1::NONE || config.ps.rov_color ||
 		config.ps.rov_depth != GSHWDrawConfig::PS_ROV_DEPTH::NONE ||
 		config.ps.wms == 2 || config.ps.wmt == 2 || config.ps.zclamp ||
-		config.ps.tcoffsethack || config.ps.adjs ||
-		config.ps.adjt || config.ps.tex_is_fb ||
-		config.ps.date || config.ps.abe ||
-		config.depth.date || config.depth.date_one ||
-		invalid_mip_filter)
+		config.ps.tcoffsethack || config.ps.adjs || config.ps.adjt ||
+		config.ps.tex_is_fb || config.ps.date || config.ps.abe ||
+		config.depth.date || config.depth.date_one || invalid_mip_filter;
+	if (unsupported_tfx)
 	{
-		Console.Error(
-			"GXM GS: rejected TFX selector: ps=%08x%08x%08x%08x vs=%02x sampler=%02x depth=%02x blend=%08x mask=%02x topology=%u.",
-			static_cast<u32>(config.ps.key_hi >> 32),
-			static_cast<u32>(config.ps.key_hi),
-			static_cast<u32>(config.ps.key_lo >> 32),
-			static_cast<u32>(config.ps.key_lo), config.vs.key,
-			config.sampler.key, config.depth.key, config.blend.key,
-			config.colormask.key, static_cast<u32>(config.topology));
+		const u64 unsupported_tfx_features = GetUnsupportedTfxFeatureMask(config,
+			invalid_destination_format, invalid_dither, invalid_mip_filter);
+		#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+		VitaGsDrawTraceRecordDeviceOutcome(config,
+			VitaGsDrawTraceOutcome::RejectedSelector, 0,
+			static_cast<u32>(unsupported_tfx_features) ^
+			static_cast<u32>(unsupported_tfx_features >> 32));
+		#endif
+		const u64 rejected = RecordRejectedTfxDraw(config,
+			unsupported_tfx_features);
+		// Keep the diagnostic observable without allowing a missing renderer
+		// mechanism to turn into an unbounded Console.Error hot path.
+		if ((rejected & (rejected - 1)) == 0)
+		{
+			Console.Error(
+				"GXM GS: rejected TFX selector count=%llu features=%016llx "
+				"ps=%08x%08x%08x%08x vs=%02x sampler=%02x depth=%02x "
+				"blend=%08x mask=%02x topology=%u.",
+				static_cast<unsigned long long>(rejected),
+				static_cast<unsigned long long>(unsupported_tfx_features),
+				static_cast<u32>(config.ps.key_hi >> 32),
+				static_cast<u32>(config.ps.key_hi),
+				static_cast<u32>(config.ps.key_lo >> 32),
+				static_cast<u32>(config.ps.key_lo), config.vs.key,
+				config.sampler.key, config.depth.key, config.blend.key,
+				config.colormask.key, static_cast<u32>(config.topology));
+		}
 		return;
 	}
 	const bool region_repeat_fragment = config.ps.wms == 3 || config.ps.wmt == 3;
@@ -2599,6 +3466,11 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		return;
 	}
 
+	RecordAcceptedTfxDraw(config);
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	VitaGsDrawTraceRecordDeviceOutcome(config,
+		VitaGsDrawTraceOutcome::Accepted);
+	#endif
 	VitaGXM::GSTextureGXM* source =
 		CheckedCast<VitaGXM::GSTextureGXM>(config.tex);
 	if (mip_lod && !source)
@@ -2608,6 +3480,20 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 	}
 	if (source && !m_impl->CommitClear(*source))
 		return;
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	if (source && source->IsRenderTarget())
+	{
+		const u64 generation =
+			source->WriterTelemetry().content_generation;
+		const bool needs_sync = VitaGsDrawTraceRenderTargetSourceNeedsSync(
+			config, *source, generation);
+		if ((!needs_sync || m_impl->Finish()))
+		{
+			VitaGsDrawTraceRecordRenderTargetSource(
+				config, *source, generation);
+		}
+	}
+	#endif
 	VitaGXM::GSTextureGXM* rt =
 		CheckedCast<VitaGXM::GSTextureGXM>(config.rt);
 	if (source && ((config.tex == config.rt) ||
@@ -2644,7 +3530,8 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 	// proves blending ineffective and every color component is overwritten.
 	const bool manual_lod_fragment = config.ps.manual_lod;
 	bool fast_fragment = !psm16_fragment && !manual_lod_fragment &&
-		!blend_effective && full_color_write && m_impl->CanUseFastTfx(config);
+		!blend_effective && full_color_write &&
+		m_impl->CanUseFastTfx(config);
 	const bool programmable_add = !psm16_fragment && !manual_lod_fragment &&
 		blend_effective &&
 		m_impl->CanUseSourceOnlyTfx(config) &&
@@ -2799,6 +3686,51 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		}
 		first += count;
 	}
+	if (psm24_fragment)
+		s_gxm_worker_performance.psm24_draws++;
+	if (rt)
+	{
+		const u32 selector_keys = static_cast<u32>(config.vs.key) |
+			(static_cast<u32>(config.sampler.key) << 8) |
+			(static_cast<u32>(config.depth.key) << 16) |
+			(static_cast<u32>(config.colormask.key) << 24);
+		rt->RecordTfxWriter(source, config.ps.key_lo, config.ps.key_hi,
+			config.blend.key, selector_keys,
+			static_cast<u8>(config.topology), config.colormask.wrgba,
+			PackTelemetryRect(config.drawarea),
+			PackTelemetryRect(config.samplearea));
+		#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+		VitaGsDrawTraceRecordRenderTargetWrite(config, *rt,
+			rt->WriterTelemetry().content_generation);
+		if (VitaGsDrawTraceRenderTargetAfterDrawNeedsSync(config, *rt,
+				rt->WriterTelemetry().content_generation) && m_impl->Finish())
+		{
+			VitaGsDrawTraceRecordRenderTargetAfterDraw(config, *rt,
+				rt->WriterTelemetry().content_generation);
+		}
+		#endif
+	}
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	u32 trace_paths = (psm24_fragment ? VITA_GS_DRAW_PATH_PSM24 : 0u) |
+		(psm16_fragment ? VITA_GS_DRAW_PATH_PSM16 : 0u) |
+		(mip_lod ? VITA_GS_DRAW_PATH_MIP_LOD : 0u) |
+		(region_repeat_fragment ? VITA_GS_DRAW_PATH_REGION_REPEAT : 0u) |
+		(fast_fragment ? VITA_GS_DRAW_PATH_FAST_FRAGMENT : 0u) |
+		(programmable_add_fragment ? VITA_GS_DRAW_PATH_PROGRAMMABLE_ADD : 0u) |
+		(programmable_add_direct_fragment ?
+			VITA_GS_DRAW_PATH_PROGRAMMABLE_ADD_DIRECT : 0u) |
+		(programmable_over_fragment ? VITA_GS_DRAW_PATH_PROGRAMMABLE_OVER : 0u) |
+		(source_only_fragment ? VITA_GS_DRAW_PATH_SOURCE_ONLY : 0u) |
+		(source_direct_fragment ? VITA_GS_DRAW_PATH_SOURCE_DIRECT : 0u) |
+		(source_direct_modulate_fragment ?
+			VITA_GS_DRAW_PATH_SOURCE_DIRECT_MODULATE : 0u) |
+		(source_direct_modulate_af_fragment ?
+			VITA_GS_DRAW_PATH_SOURCE_DIRECT_MODULATE_AF : 0u) |
+		(untextured_fragment ? VITA_GS_DRAW_PATH_UNTEXTURED : 0u) |
+		((config.tex && source != config.tex) ? VITA_GS_DRAW_PATH_RT_SNAPSHOT : 0u);
+	VitaGsDrawTraceRecordDeviceOutcome(config,
+		VitaGsDrawTraceOutcome::Drawn, trace_paths);
+	#endif
 }
 
 GSTexture* GSDeviceGXM::CreateSurface(GSTexture::Usage usage, int width,
@@ -2893,6 +3825,7 @@ void GSDeviceGXM::CopyRect(GSTexture* source_texture,
 			return;
 		}
 		destination->SetState(GSTexture::State::Dirty);
+		destination->RecordWriter(VitaGXM::TextureWriterKind::Copy, source);
 		return;
 	}
 	const u8* src_base = static_cast<const u8*>(source->LevelData(0)) +
@@ -2933,6 +3866,7 @@ void GSDeviceGXM::CopyRect(GSTexture* source_texture,
 		}
 	}
 	destination->SetState(GSTexture::State::Dirty);
+	destination->RecordWriter(VitaGXM::TextureWriterKind::Copy, source);
 }
 
 void GSDeviceGXM::ClearSamplerCache()
@@ -3048,6 +3982,17 @@ GSDevice::PresentResult GSDeviceGXM::BeginPresent(bool frame_skip)
 		m_impl->EndScene(false);
 		return PresentResult::FrameSkipped;
 	}
+	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	// The merged output may still be owned by an in-flight GXM scene here.
+	// Finish exactly once in the opt-in capture frame before the CPU reads its
+	// tiled storage; normal presentation retains the asynchronous path below.
+	if (VitaGsDrawTraceNeedsPresentSourceCapture())
+	{
+		if (!m_impl->Finish())
+			return PresentResult::DeviceLost;
+		VitaGsDrawTraceCapturePresentSource();
+	}
+	#endif
 	// PCSX2's device backends submit presentation after the preceding render
 	// pass without forcing the GPU idle. Sony's basic/display_queue samples use
 	// the same ordered-context + display-sync contract: EndScene, begin the
@@ -3074,6 +4019,16 @@ void GSDeviceGXM::EndPresent()
 	m_impl->present_active = false;
 	if (!m_impl->EndScene(false))
 		return;
+#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
+	if (VitaGsDrawTraceNeedsDisplayCapture())
+	{
+		if (!m_impl->Finish())
+			return;
+		VitaGsDrawTraceRecordDisplay(m_impl->display.BackBufferAddress(),
+			VitaGXM::Display::StrideInPixels * sizeof(u32),
+			VitaGXM::Display::Width, VitaGXM::Display::Height, sizeof(u32));
+	}
+#endif
 	m_impl->RetuneRenderTargets();
 	int result = sceGxmPadHeartbeat(m_impl->display.BackColorSurface(),
 		m_impl->display.BackSyncObject());
@@ -3148,6 +4103,7 @@ void GSDeviceGXM::PresentRect(GSTexture* source_texture,
 		m_impl->Reject("failed final presentation source preparation");
 		return;
 	}
+	s_gxm_worker_performance.present_calls++;
 	if (!m_impl->DrawQuad(source, source_rect, destination_rect, 0xffffffffu,
 			filter, m_impl->copy_programs[0xf]))
 	{
@@ -3209,6 +4165,7 @@ void GSDeviceGXM::DoStretchRect(GSTexture* source_texture,
 		return;
 	}
 	destination->SetState(GSTexture::State::Dirty);
+	destination->RecordWriter(VitaGXM::TextureWriterKind::Copy, source);
 }
 
 void GSDeviceGXM::DoStretchRect(GSTexture* source_texture,
@@ -3226,6 +4183,26 @@ void GSDeviceGXM::DoMerge(GSTexture* sources[3], GSVector4* source_rects,
 {
 	if (!m_impl || !destination_texture)
 		return;
+	VitaGxmPerformanceCounters& performance = s_gxm_worker_performance;
+	performance.merge_calls++;
+	performance.last_merge_pmode = pmode.U64;
+	performance.last_merge_extbuf = extbuf.U64;
+	performance.last_merge_background = background;
+	performance.last_merge_source_mask =
+		(sources[0] ? 1u : 0u) | (sources[1] ? 2u : 0u) |
+		(sources[2] ? 4u : 0u);
+	performance.last_merge_source_states =
+		(sources[0] ? static_cast<u8>(sources[0]->GetState()) & 0xfu : 0u) |
+		(sources[1] ?
+			(static_cast<u8>(sources[1]->GetState()) & 0xfu) << 4 : 0u);
+	for (u32 i = 0; i < 2; i++)
+	{
+		performance.last_merge_source_sizes[i] = sources[i] ?
+			(static_cast<u32>(sources[i]->GetWidth()) & 0xffffu) |
+			((static_cast<u32>(sources[i]->GetHeight()) & 0xffffu) << 16) : 0u;
+		auto* source = CheckedCast<VitaGXM::GSTextureGXM>(sources[i]);
+		performance.last_merge_source_ids[i] = source ? source->TelemetryId() : 0;
+	}
 	const bool feedback_2 = pmode.EN2 && sources[2] && extbuf.FBIN == 1;
 	const bool feedback_1 = pmode.EN1 && sources[2] && extbuf.FBIN == 0;
 	if (feedback_1 || feedback_2)
@@ -3238,6 +4215,119 @@ void GSDeviceGXM::DoMerge(GSTexture* sources[3], GSVector4* source_rects,
 		CheckedCast<VitaGXM::GSTextureGXM>(sources[1]) : nullptr;
 	auto* source_1 = sources[0] ?
 		CheckedCast<VitaGXM::GSTextureGXM>(sources[0]) : nullptr;
+	// Follow the frontmost enabled circuit, or RC2 when it is the only PCSX2
+	// merge input. The texture's GS-worker provenance identifies the precise
+	// operation which produced the image that PCRTC is about to consume.
+	const VitaGXM::GSTextureGXM* trace_source = source_1 ? source_1 : source_2;
+	performance.last_merge_trace_circuit = source_1 ? 1u : (source_2 ? 2u : 0u);
+	if (trace_source)
+	{
+		const VitaGXM::TextureWriterTelemetry& writer =
+			trace_source->WriterTelemetry();
+		performance.last_merge_writer_tfx_writes = writer.tfx_writes;
+		performance.last_merge_writer_ps_lo = writer.ps_lo;
+		performance.last_merge_writer_ps_hi = writer.ps_hi;
+		performance.last_merge_writer_draw_area = writer.draw_area;
+		performance.last_merge_writer_sample_area = writer.sample_area;
+		performance.last_merge_writer_source_id = writer.source_id;
+		performance.last_merge_writer_source_size = writer.source_size;
+		performance.last_merge_writer_blend = writer.blend;
+		performance.last_merge_writer_selector_keys = writer.selector_keys;
+		performance.last_merge_writer_kind = static_cast<u8>(writer.kind);
+		performance.last_merge_writer_topology = writer.topology;
+		performance.last_merge_parent_tfx_writes =
+			writer.source_writer_tfx_writes;
+		performance.last_merge_parent_textured_tfx_writes =
+			writer.source_writer_textured_tfx_writes;
+		performance.last_merge_parent_untextured_tfx_writes =
+			writer.source_writer_untextured_tfx_writes;
+		performance.last_merge_parent_render_target_source_tfx_writes =
+			writer.source_writer_render_target_source_tfx_writes;
+		performance.last_merge_parent_full_mask_tfx_writes =
+			writer.source_writer_full_mask_tfx_writes;
+		performance.last_merge_parent_rgb_only_tfx_writes =
+			writer.source_writer_rgb_only_tfx_writes;
+		performance.last_merge_parent_alpha_only_tfx_writes =
+			writer.source_writer_alpha_only_tfx_writes;
+		performance.last_merge_parent_other_mask_tfx_writes =
+			writer.source_writer_other_mask_tfx_writes;
+		performance.last_merge_parent_ps_lo = writer.source_writer_ps_lo;
+		performance.last_merge_parent_ps_hi = writer.source_writer_ps_hi;
+		performance.last_merge_parent_draw_area = writer.source_writer_draw_area;
+		performance.last_merge_parent_sample_area = writer.source_writer_sample_area;
+		performance.last_merge_parent_source_id = writer.source_writer_source_id;
+		performance.last_merge_parent_source_size = writer.source_writer_source_size;
+		performance.last_merge_parent_blend = writer.source_writer_blend;
+		performance.last_merge_parent_selector_keys =
+			writer.source_writer_selector_keys;
+		performance.last_merge_parent_last_rgb_ps_lo =
+			writer.source_writer_last_rgb_ps_lo;
+		performance.last_merge_parent_last_rgb_ps_hi =
+			writer.source_writer_last_rgb_ps_hi;
+		performance.last_merge_parent_last_rgb_draw_area =
+			writer.source_writer_last_rgb_draw_area;
+		performance.last_merge_parent_last_rgb_sample_area =
+			writer.source_writer_last_rgb_sample_area;
+		performance.last_merge_parent_last_rgb_source_id =
+			writer.source_writer_last_rgb_source_id;
+		performance.last_merge_parent_last_rgb_source_size =
+			writer.source_writer_last_rgb_source_size;
+		performance.last_merge_parent_last_rgb_blend =
+			writer.source_writer_last_rgb_blend;
+		performance.last_merge_parent_last_rgb_selector_keys =
+			writer.source_writer_last_rgb_selector_keys;
+		performance.last_merge_parent_kind =
+			static_cast<u8>(writer.source_writer_kind);
+		performance.last_merge_parent_topology = writer.source_writer_topology;
+		performance.last_merge_parent_color_mask = writer.source_writer_color_mask;
+		performance.last_merge_parent_last_rgb_topology =
+			writer.source_writer_last_rgb_topology;
+		performance.last_merge_parent_last_rgb_color_mask =
+			writer.source_writer_last_rgb_color_mask;
+	}
+	else
+	{
+		performance.last_merge_writer_tfx_writes = 0;
+		performance.last_merge_writer_ps_lo = 0;
+		performance.last_merge_writer_ps_hi = 0;
+		performance.last_merge_writer_draw_area = 0;
+		performance.last_merge_writer_sample_area = 0;
+		performance.last_merge_writer_source_id = 0;
+		performance.last_merge_writer_source_size = 0;
+		performance.last_merge_writer_blend = 0;
+		performance.last_merge_writer_selector_keys = 0;
+		performance.last_merge_writer_kind = 0;
+		performance.last_merge_writer_topology = 0;
+		performance.last_merge_parent_tfx_writes = 0;
+		performance.last_merge_parent_textured_tfx_writes = 0;
+		performance.last_merge_parent_untextured_tfx_writes = 0;
+		performance.last_merge_parent_render_target_source_tfx_writes = 0;
+		performance.last_merge_parent_full_mask_tfx_writes = 0;
+		performance.last_merge_parent_rgb_only_tfx_writes = 0;
+		performance.last_merge_parent_alpha_only_tfx_writes = 0;
+		performance.last_merge_parent_other_mask_tfx_writes = 0;
+		performance.last_merge_parent_ps_lo = 0;
+		performance.last_merge_parent_ps_hi = 0;
+		performance.last_merge_parent_draw_area = 0;
+		performance.last_merge_parent_sample_area = 0;
+		performance.last_merge_parent_source_id = 0;
+		performance.last_merge_parent_source_size = 0;
+		performance.last_merge_parent_blend = 0;
+		performance.last_merge_parent_selector_keys = 0;
+		performance.last_merge_parent_last_rgb_ps_lo = 0;
+		performance.last_merge_parent_last_rgb_ps_hi = 0;
+		performance.last_merge_parent_last_rgb_draw_area = 0;
+		performance.last_merge_parent_last_rgb_sample_area = 0;
+		performance.last_merge_parent_last_rgb_source_id = 0;
+		performance.last_merge_parent_last_rgb_source_size = 0;
+		performance.last_merge_parent_last_rgb_blend = 0;
+		performance.last_merge_parent_last_rgb_selector_keys = 0;
+		performance.last_merge_parent_kind = 0;
+		performance.last_merge_parent_topology = 0;
+		performance.last_merge_parent_color_mask = 0;
+		performance.last_merge_parent_last_rgb_topology = 0;
+		performance.last_merge_parent_last_rgb_color_mask = 0;
+	}
 	// GSDeviceVK::DoMerge owns this ordering. A lazy source clear may retire the
 	// current scene, so materialize both PCRTC inputs before opening dTex.
 	if ((source_2 && !m_impl->CommitClear(*source_2)) ||
@@ -3262,6 +4352,7 @@ void GSDeviceGXM::DoMerge(GSTexture* sources[3], GSVector4* source_rects,
 				destination_rects[1].z, destination_rects[1].w);
 			return;
 		}
+		performance.merge_rc2_draws++;
 	}
 	if (source_1)
 	{
@@ -3283,8 +4374,10 @@ void GSDeviceGXM::DoMerge(GSTexture* sources[3], GSVector4* source_rects,
 			m_impl->Reject("failed PCRTC RC1 blend");
 			return;
 		}
+		performance.merge_rc1_draws++;
 	}
 	destination->SetState(GSTexture::State::Dirty);
+	destination->RecordWriter(VitaGXM::TextureWriterKind::Merge, trace_source);
 }
 
 void GSDeviceGXM::DoInterlace(GSTexture* source_texture,
@@ -3294,6 +4387,7 @@ void GSDeviceGXM::DoInterlace(GSTexture* source_texture,
 {
 	if (!m_impl || !source_texture || !destination_texture)
 		return;
+	s_gxm_worker_performance.interlace_calls++;
 	SceGxmFragmentProgram* program = nullptr;
 	const SceGxmProgramParameter* uniform = nullptr;
 	if (shader == ShaderInterlace::MAD_BUFFER)
@@ -3322,6 +4416,7 @@ void GSDeviceGXM::DoInterlace(GSTexture* source_texture,
 		return;
 	}
 	destination->SetState(GSTexture::State::Dirty);
+	destination->RecordWriter(VitaGXM::TextureWriterKind::Interlace, source);
 }
 
 void GSDeviceGXM::DoFXAA(GSTexture*, GSTexture*)
