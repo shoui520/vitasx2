@@ -12,6 +12,7 @@
 #include "vita/VitaGxmDisplay.h"
 #include "vita/VitaGxmMemory.h"
 #include "vita/VitaGxmTexture.h"
+#include "vita/VitaPerformanceTelemetry.h"
 #if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
 #include "vita/VitaGsDrawTrace.h"
 #endif
@@ -440,6 +441,8 @@ namespace
 
 	void RecordAcceptedTfxDraw(const GSHWDrawConfig& config)
 	{
+		if (!VitaPerformanceTelemetry::IsEnabled())
+			return;
 		VitaGxmPerformanceCounters& counters = s_gxm_worker_performance;
 		counters.tfx_draws++;
 		if (config.vs.tme)
@@ -504,6 +507,8 @@ namespace
 
 void VitaGxmPublishPerformanceCounters()
 {
+	if (!VitaPerformanceTelemetry::IsEnabled())
+		return;
 	s_gxm_published_draw_calls.store(s_gxm_worker_performance.draw_calls,
 		std::memory_order_relaxed);
 	s_gxm_published_draw_indices.store(s_gxm_worker_performance.draw_indices,
@@ -1004,6 +1009,8 @@ VitaGxmPerformanceCounters VitaGxmGetPublishedPerformanceCounters()
 
 static void RecordGxmDraw(u64 vertices, size_t vertex_stride, u64 indices)
 {
+	if (!VitaPerformanceTelemetry::IsEnabled())
+		return;
 	s_gxm_worker_performance.draw_calls++;
 	s_gxm_worker_performance.draw_indices += indices;
 	s_gxm_worker_performance.vertex_upload_bytes += vertices * vertex_stride;
@@ -2445,9 +2452,12 @@ bool GSDeviceGXM::Impl::QueueTextureUpload(VitaGXM::GSTextureGXM& texture,
 	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
 	VitaGsDrawTraceRecordTextureContent(texture, level, destination);
 	#endif
-	s_gxm_worker_performance.texture_uploads++;
-	s_gxm_worker_performance.texture_upload_bytes +=
-		static_cast<u64>(row_bytes) * destination.height();
+	if (VitaPerformanceTelemetry::IsEnabled())
+	{
+		s_gxm_worker_performance.texture_uploads++;
+		s_gxm_worker_performance.texture_upload_bytes +=
+			static_cast<u64>(row_bytes) * destination.height();
+	}
 	*serial = ++transfer_serial;
 	completed_transfer_serial = transfer_serial;
 	texture.MarkTransferUse(*serial);
@@ -2471,9 +2481,12 @@ bool GSDeviceGXM::Impl::QueueTextureReadback(VitaGXM::GSTextureGXM& texture,
 		static_cast<size_t>(destination_rect.x) * bpp;
 	if (!texture.CopyToLinear(level, source, output, destination_pitch))
 		return false;
-	s_gxm_worker_performance.texture_readbacks++;
-	s_gxm_worker_performance.texture_readback_bytes +=
-		static_cast<u64>(row_bytes) * source.height();
+	if (VitaPerformanceTelemetry::IsEnabled())
+	{
+		s_gxm_worker_performance.texture_readbacks++;
+		s_gxm_worker_performance.texture_readback_bytes +=
+			static_cast<u64>(row_bytes) * source.height();
+	}
 	*serial = ++transfer_serial;
 	completed_transfer_serial = transfer_serial;
 	texture.MarkTransferUse(*serial);
@@ -3020,9 +3033,12 @@ VitaGXM::GSTextureGXM* GSDeviceGXM::Impl::SnapshotTexture(
 	VitaGsDrawTraceRecordTextureContent(destination, 0, area);
 	#endif
 	destination.SetState(GSTexture::State::Dirty);
-	s_gxm_worker_performance.feedback_snapshots++;
-	s_gxm_worker_performance.feedback_snapshot_bytes +=
-		static_cast<u64>(area.width()) * static_cast<u64>(area.height()) * 4u;
+	if (VitaPerformanceTelemetry::IsEnabled())
+	{
+		s_gxm_worker_performance.feedback_snapshots++;
+		s_gxm_worker_performance.feedback_snapshot_bytes +=
+			static_cast<u64>(area.width()) * static_cast<u64>(area.height()) * 4u;
+	}
 	return &destination;
 }
 
@@ -3686,7 +3702,7 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		}
 		first += count;
 	}
-	if (psm24_fragment)
+	if (psm24_fragment && VitaPerformanceTelemetry::IsEnabled())
 		s_gxm_worker_performance.psm24_draws++;
 	if (rt)
 	{
@@ -4103,7 +4119,8 @@ void GSDeviceGXM::PresentRect(GSTexture* source_texture,
 		m_impl->Reject("failed final presentation source preparation");
 		return;
 	}
-	s_gxm_worker_performance.present_calls++;
+	if (VitaPerformanceTelemetry::IsEnabled())
+		s_gxm_worker_performance.present_calls++;
 	if (!m_impl->DrawQuad(source, source_rect, destination_rect, 0xffffffffu,
 			filter, m_impl->copy_programs[0xf]))
 	{
@@ -4183,25 +4200,30 @@ void GSDeviceGXM::DoMerge(GSTexture* sources[3], GSVector4* source_rects,
 {
 	if (!m_impl || !destination_texture)
 		return;
+	const bool performance_telemetry_enabled =
+		VitaPerformanceTelemetry::IsEnabled();
 	VitaGxmPerformanceCounters& performance = s_gxm_worker_performance;
-	performance.merge_calls++;
-	performance.last_merge_pmode = pmode.U64;
-	performance.last_merge_extbuf = extbuf.U64;
-	performance.last_merge_background = background;
-	performance.last_merge_source_mask =
-		(sources[0] ? 1u : 0u) | (sources[1] ? 2u : 0u) |
-		(sources[2] ? 4u : 0u);
-	performance.last_merge_source_states =
-		(sources[0] ? static_cast<u8>(sources[0]->GetState()) & 0xfu : 0u) |
-		(sources[1] ?
-			(static_cast<u8>(sources[1]->GetState()) & 0xfu) << 4 : 0u);
-	for (u32 i = 0; i < 2; i++)
+	if (performance_telemetry_enabled)
 	{
-		performance.last_merge_source_sizes[i] = sources[i] ?
-			(static_cast<u32>(sources[i]->GetWidth()) & 0xffffu) |
-			((static_cast<u32>(sources[i]->GetHeight()) & 0xffffu) << 16) : 0u;
-		auto* source = CheckedCast<VitaGXM::GSTextureGXM>(sources[i]);
-		performance.last_merge_source_ids[i] = source ? source->TelemetryId() : 0;
+		performance.merge_calls++;
+		performance.last_merge_pmode = pmode.U64;
+		performance.last_merge_extbuf = extbuf.U64;
+		performance.last_merge_background = background;
+		performance.last_merge_source_mask =
+			(sources[0] ? 1u : 0u) | (sources[1] ? 2u : 0u) |
+			(sources[2] ? 4u : 0u);
+		performance.last_merge_source_states =
+			(sources[0] ? static_cast<u8>(sources[0]->GetState()) & 0xfu : 0u) |
+			(sources[1] ?
+				(static_cast<u8>(sources[1]->GetState()) & 0xfu) << 4 : 0u);
+		for (u32 i = 0; i < 2; i++)
+		{
+			performance.last_merge_source_sizes[i] = sources[i] ?
+				(static_cast<u32>(sources[i]->GetWidth()) & 0xffffu) |
+				((static_cast<u32>(sources[i]->GetHeight()) & 0xffffu) << 16) : 0u;
+			auto* source = CheckedCast<VitaGXM::GSTextureGXM>(sources[i]);
+			performance.last_merge_source_ids[i] = source ? source->TelemetryId() : 0;
+		}
 	}
 	const bool feedback_2 = pmode.EN2 && sources[2] && extbuf.FBIN == 1;
 	const bool feedback_1 = pmode.EN1 && sources[2] && extbuf.FBIN == 0;
@@ -4219,114 +4241,120 @@ void GSDeviceGXM::DoMerge(GSTexture* sources[3], GSVector4* source_rects,
 	// merge input. The texture's GS-worker provenance identifies the precise
 	// operation which produced the image that PCRTC is about to consume.
 	const VitaGXM::GSTextureGXM* trace_source = source_1 ? source_1 : source_2;
-	performance.last_merge_trace_circuit = source_1 ? 1u : (source_2 ? 2u : 0u);
-	if (trace_source)
+	if (performance_telemetry_enabled)
 	{
-		const VitaGXM::TextureWriterTelemetry& writer =
-			trace_source->WriterTelemetry();
-		performance.last_merge_writer_tfx_writes = writer.tfx_writes;
-		performance.last_merge_writer_ps_lo = writer.ps_lo;
-		performance.last_merge_writer_ps_hi = writer.ps_hi;
-		performance.last_merge_writer_draw_area = writer.draw_area;
-		performance.last_merge_writer_sample_area = writer.sample_area;
-		performance.last_merge_writer_source_id = writer.source_id;
-		performance.last_merge_writer_source_size = writer.source_size;
-		performance.last_merge_writer_blend = writer.blend;
-		performance.last_merge_writer_selector_keys = writer.selector_keys;
-		performance.last_merge_writer_kind = static_cast<u8>(writer.kind);
-		performance.last_merge_writer_topology = writer.topology;
-		performance.last_merge_parent_tfx_writes =
-			writer.source_writer_tfx_writes;
-		performance.last_merge_parent_textured_tfx_writes =
-			writer.source_writer_textured_tfx_writes;
-		performance.last_merge_parent_untextured_tfx_writes =
-			writer.source_writer_untextured_tfx_writes;
-		performance.last_merge_parent_render_target_source_tfx_writes =
-			writer.source_writer_render_target_source_tfx_writes;
-		performance.last_merge_parent_full_mask_tfx_writes =
-			writer.source_writer_full_mask_tfx_writes;
-		performance.last_merge_parent_rgb_only_tfx_writes =
-			writer.source_writer_rgb_only_tfx_writes;
-		performance.last_merge_parent_alpha_only_tfx_writes =
-			writer.source_writer_alpha_only_tfx_writes;
-		performance.last_merge_parent_other_mask_tfx_writes =
-			writer.source_writer_other_mask_tfx_writes;
-		performance.last_merge_parent_ps_lo = writer.source_writer_ps_lo;
-		performance.last_merge_parent_ps_hi = writer.source_writer_ps_hi;
-		performance.last_merge_parent_draw_area = writer.source_writer_draw_area;
-		performance.last_merge_parent_sample_area = writer.source_writer_sample_area;
-		performance.last_merge_parent_source_id = writer.source_writer_source_id;
-		performance.last_merge_parent_source_size = writer.source_writer_source_size;
-		performance.last_merge_parent_blend = writer.source_writer_blend;
-		performance.last_merge_parent_selector_keys =
-			writer.source_writer_selector_keys;
-		performance.last_merge_parent_last_rgb_ps_lo =
-			writer.source_writer_last_rgb_ps_lo;
-		performance.last_merge_parent_last_rgb_ps_hi =
-			writer.source_writer_last_rgb_ps_hi;
-		performance.last_merge_parent_last_rgb_draw_area =
-			writer.source_writer_last_rgb_draw_area;
-		performance.last_merge_parent_last_rgb_sample_area =
-			writer.source_writer_last_rgb_sample_area;
-		performance.last_merge_parent_last_rgb_source_id =
-			writer.source_writer_last_rgb_source_id;
-		performance.last_merge_parent_last_rgb_source_size =
-			writer.source_writer_last_rgb_source_size;
-		performance.last_merge_parent_last_rgb_blend =
-			writer.source_writer_last_rgb_blend;
-		performance.last_merge_parent_last_rgb_selector_keys =
-			writer.source_writer_last_rgb_selector_keys;
-		performance.last_merge_parent_kind =
-			static_cast<u8>(writer.source_writer_kind);
-		performance.last_merge_parent_topology = writer.source_writer_topology;
-		performance.last_merge_parent_color_mask = writer.source_writer_color_mask;
-		performance.last_merge_parent_last_rgb_topology =
-			writer.source_writer_last_rgb_topology;
-		performance.last_merge_parent_last_rgb_color_mask =
-			writer.source_writer_last_rgb_color_mask;
-	}
-	else
-	{
-		performance.last_merge_writer_tfx_writes = 0;
-		performance.last_merge_writer_ps_lo = 0;
-		performance.last_merge_writer_ps_hi = 0;
-		performance.last_merge_writer_draw_area = 0;
-		performance.last_merge_writer_sample_area = 0;
-		performance.last_merge_writer_source_id = 0;
-		performance.last_merge_writer_source_size = 0;
-		performance.last_merge_writer_blend = 0;
-		performance.last_merge_writer_selector_keys = 0;
-		performance.last_merge_writer_kind = 0;
-		performance.last_merge_writer_topology = 0;
-		performance.last_merge_parent_tfx_writes = 0;
-		performance.last_merge_parent_textured_tfx_writes = 0;
-		performance.last_merge_parent_untextured_tfx_writes = 0;
-		performance.last_merge_parent_render_target_source_tfx_writes = 0;
-		performance.last_merge_parent_full_mask_tfx_writes = 0;
-		performance.last_merge_parent_rgb_only_tfx_writes = 0;
-		performance.last_merge_parent_alpha_only_tfx_writes = 0;
-		performance.last_merge_parent_other_mask_tfx_writes = 0;
-		performance.last_merge_parent_ps_lo = 0;
-		performance.last_merge_parent_ps_hi = 0;
-		performance.last_merge_parent_draw_area = 0;
-		performance.last_merge_parent_sample_area = 0;
-		performance.last_merge_parent_source_id = 0;
-		performance.last_merge_parent_source_size = 0;
-		performance.last_merge_parent_blend = 0;
-		performance.last_merge_parent_selector_keys = 0;
-		performance.last_merge_parent_last_rgb_ps_lo = 0;
-		performance.last_merge_parent_last_rgb_ps_hi = 0;
-		performance.last_merge_parent_last_rgb_draw_area = 0;
-		performance.last_merge_parent_last_rgb_sample_area = 0;
-		performance.last_merge_parent_last_rgb_source_id = 0;
-		performance.last_merge_parent_last_rgb_source_size = 0;
-		performance.last_merge_parent_last_rgb_blend = 0;
-		performance.last_merge_parent_last_rgb_selector_keys = 0;
-		performance.last_merge_parent_kind = 0;
-		performance.last_merge_parent_topology = 0;
-		performance.last_merge_parent_color_mask = 0;
-		performance.last_merge_parent_last_rgb_topology = 0;
-		performance.last_merge_parent_last_rgb_color_mask = 0;
+		performance.last_merge_trace_circuit = source_1 ? 1u : (source_2 ? 2u : 0u);
+		if (trace_source)
+		{
+			const VitaGXM::TextureWriterTelemetry& writer =
+				trace_source->WriterTelemetry();
+			performance.last_merge_writer_tfx_writes = writer.tfx_writes;
+			performance.last_merge_writer_ps_lo = writer.ps_lo;
+			performance.last_merge_writer_ps_hi = writer.ps_hi;
+			performance.last_merge_writer_draw_area = writer.draw_area;
+			performance.last_merge_writer_sample_area = writer.sample_area;
+			performance.last_merge_writer_source_id = writer.source_id;
+			performance.last_merge_writer_source_size = writer.source_size;
+			performance.last_merge_writer_blend = writer.blend;
+			performance.last_merge_writer_selector_keys = writer.selector_keys;
+			performance.last_merge_writer_kind = static_cast<u8>(writer.kind);
+			performance.last_merge_writer_topology = writer.topology;
+			performance.last_merge_parent_tfx_writes =
+				writer.source_writer_tfx_writes;
+			performance.last_merge_parent_textured_tfx_writes =
+				writer.source_writer_textured_tfx_writes;
+			performance.last_merge_parent_untextured_tfx_writes =
+				writer.source_writer_untextured_tfx_writes;
+			performance.last_merge_parent_render_target_source_tfx_writes =
+				writer.source_writer_render_target_source_tfx_writes;
+			performance.last_merge_parent_full_mask_tfx_writes =
+				writer.source_writer_full_mask_tfx_writes;
+			performance.last_merge_parent_rgb_only_tfx_writes =
+				writer.source_writer_rgb_only_tfx_writes;
+			performance.last_merge_parent_alpha_only_tfx_writes =
+				writer.source_writer_alpha_only_tfx_writes;
+			performance.last_merge_parent_other_mask_tfx_writes =
+				writer.source_writer_other_mask_tfx_writes;
+			performance.last_merge_parent_ps_lo = writer.source_writer_ps_lo;
+			performance.last_merge_parent_ps_hi = writer.source_writer_ps_hi;
+			performance.last_merge_parent_draw_area = writer.source_writer_draw_area;
+			performance.last_merge_parent_sample_area =
+				writer.source_writer_sample_area;
+			performance.last_merge_parent_source_id = writer.source_writer_source_id;
+			performance.last_merge_parent_source_size =
+				writer.source_writer_source_size;
+			performance.last_merge_parent_blend = writer.source_writer_blend;
+			performance.last_merge_parent_selector_keys =
+				writer.source_writer_selector_keys;
+			performance.last_merge_parent_last_rgb_ps_lo =
+				writer.source_writer_last_rgb_ps_lo;
+			performance.last_merge_parent_last_rgb_ps_hi =
+				writer.source_writer_last_rgb_ps_hi;
+			performance.last_merge_parent_last_rgb_draw_area =
+				writer.source_writer_last_rgb_draw_area;
+			performance.last_merge_parent_last_rgb_sample_area =
+				writer.source_writer_last_rgb_sample_area;
+			performance.last_merge_parent_last_rgb_source_id =
+				writer.source_writer_last_rgb_source_id;
+			performance.last_merge_parent_last_rgb_source_size =
+				writer.source_writer_last_rgb_source_size;
+			performance.last_merge_parent_last_rgb_blend =
+				writer.source_writer_last_rgb_blend;
+			performance.last_merge_parent_last_rgb_selector_keys =
+				writer.source_writer_last_rgb_selector_keys;
+			performance.last_merge_parent_kind =
+				static_cast<u8>(writer.source_writer_kind);
+			performance.last_merge_parent_topology = writer.source_writer_topology;
+			performance.last_merge_parent_color_mask =
+				writer.source_writer_color_mask;
+			performance.last_merge_parent_last_rgb_topology =
+				writer.source_writer_last_rgb_topology;
+			performance.last_merge_parent_last_rgb_color_mask =
+				writer.source_writer_last_rgb_color_mask;
+		}
+		else
+		{
+			performance.last_merge_writer_tfx_writes = 0;
+			performance.last_merge_writer_ps_lo = 0;
+			performance.last_merge_writer_ps_hi = 0;
+			performance.last_merge_writer_draw_area = 0;
+			performance.last_merge_writer_sample_area = 0;
+			performance.last_merge_writer_source_id = 0;
+			performance.last_merge_writer_source_size = 0;
+			performance.last_merge_writer_blend = 0;
+			performance.last_merge_writer_selector_keys = 0;
+			performance.last_merge_writer_kind = 0;
+			performance.last_merge_writer_topology = 0;
+			performance.last_merge_parent_tfx_writes = 0;
+			performance.last_merge_parent_textured_tfx_writes = 0;
+			performance.last_merge_parent_untextured_tfx_writes = 0;
+			performance.last_merge_parent_render_target_source_tfx_writes = 0;
+			performance.last_merge_parent_full_mask_tfx_writes = 0;
+			performance.last_merge_parent_rgb_only_tfx_writes = 0;
+			performance.last_merge_parent_alpha_only_tfx_writes = 0;
+			performance.last_merge_parent_other_mask_tfx_writes = 0;
+			performance.last_merge_parent_ps_lo = 0;
+			performance.last_merge_parent_ps_hi = 0;
+			performance.last_merge_parent_draw_area = 0;
+			performance.last_merge_parent_sample_area = 0;
+			performance.last_merge_parent_source_id = 0;
+			performance.last_merge_parent_source_size = 0;
+			performance.last_merge_parent_blend = 0;
+			performance.last_merge_parent_selector_keys = 0;
+			performance.last_merge_parent_last_rgb_ps_lo = 0;
+			performance.last_merge_parent_last_rgb_ps_hi = 0;
+			performance.last_merge_parent_last_rgb_draw_area = 0;
+			performance.last_merge_parent_last_rgb_sample_area = 0;
+			performance.last_merge_parent_last_rgb_source_id = 0;
+			performance.last_merge_parent_last_rgb_source_size = 0;
+			performance.last_merge_parent_last_rgb_blend = 0;
+			performance.last_merge_parent_last_rgb_selector_keys = 0;
+			performance.last_merge_parent_kind = 0;
+			performance.last_merge_parent_topology = 0;
+			performance.last_merge_parent_color_mask = 0;
+			performance.last_merge_parent_last_rgb_topology = 0;
+			performance.last_merge_parent_last_rgb_color_mask = 0;
+		}
 	}
 	// GSDeviceVK::DoMerge owns this ordering. A lazy source clear may retire the
 	// current scene, so materialize both PCRTC inputs before opening dTex.
@@ -4352,7 +4380,8 @@ void GSDeviceGXM::DoMerge(GSTexture* sources[3], GSVector4* source_rects,
 				destination_rects[1].z, destination_rects[1].w);
 			return;
 		}
-		performance.merge_rc2_draws++;
+		if (performance_telemetry_enabled)
+			performance.merge_rc2_draws++;
 	}
 	if (source_1)
 	{
@@ -4374,7 +4403,8 @@ void GSDeviceGXM::DoMerge(GSTexture* sources[3], GSVector4* source_rects,
 			m_impl->Reject("failed PCRTC RC1 blend");
 			return;
 		}
-		performance.merge_rc1_draws++;
+		if (performance_telemetry_enabled)
+			performance.merge_rc1_draws++;
 	}
 	destination->SetState(GSTexture::State::Dirty);
 	destination->RecordWriter(VitaGXM::TextureWriterKind::Merge, trace_source);
@@ -4387,7 +4417,8 @@ void GSDeviceGXM::DoInterlace(GSTexture* source_texture,
 {
 	if (!m_impl || !source_texture || !destination_texture)
 		return;
-	s_gxm_worker_performance.interlace_calls++;
+	if (VitaPerformanceTelemetry::IsEnabled())
+		s_gxm_worker_performance.interlace_calls++;
 	SceGxmFragmentProgram* program = nullptr;
 	const SceGxmProgramParameter* uniform = nullptr;
 	if (shader == ShaderInterlace::MAD_BUFFER)

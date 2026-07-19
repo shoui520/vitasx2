@@ -468,6 +468,30 @@ void Log::Write(LOGLEVEL level, ConsoleColors color, std::string_view message)
 	ExecuteCallbacks(level, color, message);
 }
 
+void Log::WriteMultilineBatch(LOGLEVEL level, ConsoleColors color,
+	std::string_view message)
+{
+	if (level > s_max_level)
+		return;
+
+	pxAssert(level > LOGLEVEL_NONE);
+	if (level <= s_console_level)
+		WriteToConsole(level, color, message);
+
+	if (level <= s_debug_level)
+		WriteToDebug(level, color, message);
+
+	if (level <= s_file_level)
+		WriteToFile(level, color, message);
+
+	if (level <= s_host_level)
+	{
+		const HostCallbackType callback = s_host_callback;
+		if (callback)
+			callback(level, color, message);
+	}
+}
+
 void Log::Writef(LOGLEVEL level, ConsoleColors color, const char* format, ...)
 {
 	std::va_list ap;

@@ -26,6 +26,7 @@
 
 #include "vita/A32Emitter.h"
 #include "vita/VitaFpRounding.h"
+#include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 
 #include "common/Vita/VitaJitMemory.h"
@@ -9061,7 +9062,11 @@ namespace VitaVU
 				entry_ebit_tail) * VU1_COMPILE_REQUEST_WORDS + slot / 64;
 			s_vu1_compile_requests[word].fetch_or(1ull << (slot & 63),
 				std::memory_order_release);
-			s_vu1_compile_requests_total.fetch_add(1, std::memory_order_relaxed);
+			if (VitaPerformanceTelemetry::IsEnabled())
+			{
+				s_vu1_compile_requests_total.fetch_add(
+					1, std::memory_order_relaxed);
+			}
 		}
 
 		bool HasVu1CompileRequests()
@@ -9624,8 +9629,9 @@ namespace VitaVU
 								chosen_deferred_fmac_linked_entry_offset;
 						}
 						block->code_size = block->code.Size();
-						const CodeBuffer::GeneratedCodeStats generated =
-							block->code.AnalyzeGeneratedCode();
+						CodeBuffer::GeneratedCodeStats generated;
+						if (VitaPerformanceTelemetry::IsEnabled())
+							generated = block->code.AnalyzeGeneratedCode();
 						if (!PatchVu1RuntimeLinkSlotPointers(*block))
 							break;
 						s_vu1.code_cache_used = offset + block->code_size;
@@ -9840,8 +9846,9 @@ namespace VitaVU
 						block->code = std::move(code);
 						block->entry = block->code.EntryPoint();
 						block->code_size = block->code.Size();
-						const CodeBuffer::GeneratedCodeStats generated =
-							block->code.AnalyzeGeneratedCode();
+						CodeBuffer::GeneratedCodeStats generated;
+						if (VitaPerformanceTelemetry::IsEnabled())
+							generated = block->code.AnalyzeGeneratedCode();
 						s_vu0.code_cache_used = offset + block->code_size;
 						s_vu0.stats.code_cache_used = s_vu0.code_cache_used;
 						s_vu0.stats.compiled_blocks++;
@@ -10040,21 +10047,23 @@ namespace VitaVU
 
 	bool Vu1ProgramNeedsPreparation(s32 vu_addr)
 	{
-		s_vu1.stats.program_prepare_checks++;
+		if (VitaPerformanceTelemetry::IsEnabled())
+			s_vu1.stats.program_prepare_checks++;
 		if (HasVu1CompileRequests())
 			return true;
 		const u32 start_pc = (vu_addr == -1) ?
 			((VU1.VI[REG_TPC].UL & 0x7ffu) << 3) :
 			((static_cast<u32>(vu_addr) & 0x7ffu) << 3);
 		const bool needs_preparation = s_vu1.map[start_pc / 8] == nullptr;
-		if (!needs_preparation)
+		if (!needs_preparation && VitaPerformanceTelemetry::IsEnabled())
 			s_vu1.stats.program_quick_cache_hits++;
 		return needs_preparation;
 	}
 
 	void PrepareVu1Program(s32 vu_addr)
 	{
-		s_vu1.stats.program_prepare_calls++;
+		if (VitaPerformanceTelemetry::IsEnabled())
+			s_vu1.stats.program_prepare_calls++;
 		std::vector<Vu1CompileKey> queue;
 		queue.reserve(32);
 		queue.push_back({(vu_addr == -1) ?
@@ -10171,6 +10180,8 @@ namespace VitaVU
 		const u64 startcycles = VU0.cycle;
 		const u64 limit = startcycles + cycles;
 		const bool blocks_eligible = !Pcsx2Trace::IsVuTraceEnabled();
+		const bool performance_telemetry_enabled =
+			VitaPerformanceTelemetry::IsEnabled();
 
 		bool admitted_logical_continuation = false;
 		while (admitted_logical_continuation || (VU0.cycle - startcycles) < cycles)
@@ -10203,8 +10214,11 @@ namespace VitaVU
 					const u32 executed = result & ~EXECUTED_PAIRS_LOGICAL_CONTINUATION;
 					if (executed != 0)
 					{
-						s_vu0.stats.executed_blocks++;
-						s_vu0.stats.executed_pairs += executed;
+						if (performance_telemetry_enabled)
+						{
+							s_vu0.stats.executed_blocks++;
+							s_vu0.stats.executed_pairs += executed;
+						}
 						admitted_logical_continuation =
 							(result & EXECUTED_PAIRS_LOGICAL_CONTINUATION) != 0 &&
 							(VU0.VI[REG_VPU_STAT].UL & 0x1) != 0 &&
@@ -10216,7 +10230,8 @@ namespace VitaVU
 
 			const bool resolving_admitted_branch = VU0.branch != 0;
 			CpuIntVU0.Step();
-			s_vu0.stats.interpreter_steps++;
+			if (performance_telemetry_enabled)
+				s_vu0.stats.interpreter_steps++;
 			if (blocks_eligible)
 			{
 				// A decode fallback is still part of the already admitted natural
@@ -10267,7 +10282,8 @@ namespace VitaVU
 
 		UpdateNextBlockCyclesAtExecuteExit(VU0, 0x1,
 			(VU0.flags & VUFLAG_MFLAGSET) != 0);
-		s_vu0_execute_calls++;
+		if (VitaPerformanceTelemetry::IsEnabled())
+			s_vu0_execute_calls++;
 	}
 
 	void InvalidateVu0Blocks(u32 addr, u32 size)
@@ -10370,6 +10386,8 @@ namespace VitaVU
 		VU1.VI[REG_TPC].UL <<= 3;
 		const u64 startcycles = VU1.cycle;
 		const u64 limit = startcycles + cycles;
+		const bool performance_telemetry_enabled =
+			VitaPerformanceTelemetry::IsEnabled();
 		// Micro-step tracing must go through vu1Exec() so every step records.
 		const bool blocks_eligible = !Pcsx2Trace::IsVuTraceEnabled()
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -10409,8 +10427,11 @@ namespace VitaVU
 					const u32 executed = result & ~EXECUTED_PAIRS_LOGICAL_CONTINUATION;
 					if (executed != 0)
 					{
-						s_vu1.stats.executed_blocks++;
-						s_vu1.stats.executed_pairs += executed;
+						if (performance_telemetry_enabled)
+						{
+							s_vu1.stats.executed_blocks++;
+							s_vu1.stats.executed_pairs += executed;
+						}
 						admitted_logical_continuation =
 							(result & EXECUTED_PAIRS_LOGICAL_CONTINUATION) != 0 &&
 							Vu1ProgramActive();
@@ -10421,7 +10442,8 @@ namespace VitaVU
 
 			const bool resolving_admitted_branch = VU1.branch != 0;
 			CpuIntVU1.Step();
-			s_vu1.stats.interpreter_steps++;
+			if (performance_telemetry_enabled)
+				s_vu1.stats.interpreter_steps++;
 			if (blocks_eligible)
 			{
 				admitted_logical_continuation =
@@ -10436,13 +10458,16 @@ namespace VitaVU
 		// One release publication per MTVU Execute job keeps the hot generated
 		// block path free of atomic traffic while allowing the EE producer to
 		// sample monotonic VU work without racing the worker-owned counters.
-		s_vu1_published_executed_blocks.store(s_vu1.stats.executed_blocks,
-			std::memory_order_relaxed);
-		s_vu1_published_executed_pairs.store(s_vu1.stats.executed_pairs,
-			std::memory_order_relaxed);
-		s_vu1_published_interpreter_steps.store(s_vu1.stats.interpreter_steps,
-			std::memory_order_relaxed);
-		s_vu1_completed_programs.fetch_add(1, std::memory_order_release);
+		if (performance_telemetry_enabled)
+		{
+			s_vu1_published_executed_blocks.store(s_vu1.stats.executed_blocks,
+				std::memory_order_relaxed);
+			s_vu1_published_executed_pairs.store(s_vu1.stats.executed_pairs,
+				std::memory_order_relaxed);
+			s_vu1_published_interpreter_steps.store(s_vu1.stats.interpreter_steps,
+				std::memory_order_relaxed);
+			s_vu1_completed_programs.fetch_add(1, std::memory_order_release);
+		}
 	}
 
 	void InvalidateVu1Blocks(u32 addr, u32 size)

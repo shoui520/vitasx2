@@ -9,6 +9,7 @@
 #include "pcsx2/R5900.h"
 #include "pcsx2/vtlb.h"
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
+#include "pcsx2/vita/VitaPerformanceTelemetry.h"
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
 #include "pcsx2/DebugTools/GsTrace.h"
 #include "pcsx2/DebugTools/VuTrace.h"
@@ -3219,15 +3220,18 @@ namespace VitaEE
 		RegisterIncomingLinks(block);
 
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
-		const VitaA32::CodeBuffer::GeneratedCodeStats generated =
-			block.code.AnalyzeGeneratedCode();
-		const VitaA32EeGeneratedGuestMix guest_mix =
-			AnalyzeGeneratedEeGuestMix(start_pc, compiled_instruction_count);
-		VitaRecordA32EeGeneratedCode(start_pc, guest_mix,
-			generated.host_instructions,
-			generated.host_load_instructions, generated.host_store_instructions,
-			generated.helper_call_instructions, generated.state_load_instructions,
-			generated.state_store_instructions);
+		if (VitaPerformanceTelemetry::IsEnabled())
+		{
+			const VitaA32::CodeBuffer::GeneratedCodeStats generated =
+				block.code.AnalyzeGeneratedCode();
+			const VitaA32EeGeneratedGuestMix guest_mix =
+				AnalyzeGeneratedEeGuestMix(start_pc, compiled_instruction_count);
+			VitaRecordA32EeGeneratedCode(start_pc, guest_mix,
+				generated.host_instructions,
+				generated.host_load_instructions, generated.host_store_instructions,
+				generated.helper_call_instructions, generated.state_load_instructions,
+				generated.state_store_instructions);
+		}
 #endif
 
 		if (m_direct_linking_enabled)

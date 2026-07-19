@@ -43,7 +43,6 @@ class VU_Thread final {
 	u64 m_profile_compile_barriers = 0;
 	u64 m_profile_queue_submissions = 0;
 	u64 m_profile_queue_words = 0;
-	u64 m_profile_pending_words = 0;
 	bool m_micro_write_pending = false;
 	u32 m_micro_invalidate_start = 0;
 	u32 m_micro_invalidate_end = 0;

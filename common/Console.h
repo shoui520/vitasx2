@@ -97,6 +97,12 @@ namespace Log
 
 	// writes a message to the log
 	void Write(LOGLEVEL level, ConsoleColors color, std::string_view message);
+	// Writes a newline-delimited record set to each active sink as one batch.
+	// Unlike Write(), embedded newlines are not split into independently flushed
+	// messages. This is intended for coherent diagnostic snapshots which must not
+	// stall a latency-sensitive producer once per record.
+	void WriteMultilineBatch(LOGLEVEL level, ConsoleColors color,
+		std::string_view message);
 	void Writef(LOGLEVEL level, ConsoleColors color, const char* format, ...);
 	void Writev(LOGLEVEL level, ConsoleColors color, const char* format, va_list ap);
 	void WriteFmtArgs(LOGLEVEL level, ConsoleColors color, fmt::string_view fmt, fmt::format_args args);

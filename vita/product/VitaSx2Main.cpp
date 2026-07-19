@@ -20,6 +20,7 @@
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
 #include "Host.h"
+#include "INISettingsInterface.h"
 #include "R3000A.h"
 #include "R5900.h"
 #include "SIO/Memcard/MemoryCardFile.h"
@@ -34,6 +35,7 @@
 #include "common/Threading.h"
 #include "vita/VitaCore.h"
 #include "vita/VitaGsMailbox.h"
+#include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 
 #include <psp2/io/fcntl.h>
@@ -61,6 +63,7 @@ namespace
 	constexpr const char* VALIDATION_DISC_PATH =
 		"ux0:data/vitasx2/disc/Wander to Kyozou (Japan).iso";
 	constexpr const char* BOOT_PATH_CONFIG = "ux0:data/vitasx2/boot-path.txt";
+	constexpr const char* PRODUCT_CONFIG_PATH = "ux0:data/vitasx2/vitasx2.ini";
 	constexpr const char* PRODUCT_MEMORY_CARD_DIR = "ux0:data/vitasx2/memcards";
 	constexpr const char* PRODUCT_LOG_PATH = "ux0:data/vitasx2/vitasx2.log";
 	constexpr const char* PRODUCT_INITIALIZED_PATH =
@@ -358,6 +361,46 @@ namespace
 			EmuConfig.RtcSecond = 0;
 			EmuConfig.Speedhacks.DisableAll();
 		}
+	}
+
+	void ConfigureProductPerformanceTelemetry()
+	{
+		bool enabled = VITASX2_PRODUCT_BOOT_VALIDATION;
+		const char* source = VITASX2_PRODUCT_BOOT_VALIDATION ?
+			"boot-validation" : "default";
+		if (!VITASX2_PRODUCT_BOOT_VALIDATION &&
+			FileSystem::FileExists(PRODUCT_CONFIG_PATH))
+		{
+			INISettingsInterface settings(PRODUCT_CONFIG_PATH);
+			if (settings.Load())
+			{
+				constexpr const char* section = "Diagnostics";
+				constexpr const char* key = "EnablePerformanceTelemetry";
+				if (settings.ContainsValue(section, key) &&
+					!settings.GetBoolValue(section, key, &enabled))
+				{
+					enabled = false;
+					Console.Warning(
+						"VitaSX2 ignored malformed [%s] %s in %s; performance telemetry remains disabled.",
+						section, key, PRODUCT_CONFIG_PATH);
+				}
+				source = PRODUCT_CONFIG_PATH;
+			}
+			else
+			{
+				Console.Warning(
+					"VitaSX2 could not parse %s; performance telemetry remains disabled.",
+					PRODUCT_CONFIG_PATH);
+			}
+		}
+
+		// The flag is immutable after this point. PCSX2's worker threads are
+		// created later by CPUThreadInitialize()/OpenGS(), so their plain reads
+		// observe this startup configuration without hot-path atomic traffic.
+		VitaPerformanceTelemetry::SetEnabledBeforeVmStart(enabled);
+		Console.WriteLn(
+			"VitaSX2 performance telemetry: enabled=%u source=%s.",
+			enabled ? 1u : 0u, source);
 	}
 
 	bool NativeProvidersSelected()
@@ -781,6 +824,7 @@ int main()
 		VALIDATION_BIOS_DIR : BIOS_DIR;
 	EmuFolders::MemoryCards = VITASX2_PRODUCT_BOOT_VALIDATION ?
 		VALIDATION_MEMORY_CARD_DIR : PRODUCT_MEMORY_CARD_DIR;
+	ConfigureProductPerformanceTelemetry();
 	ConfigureProductSettings();
 	// PCSX2's _DynGen_DispatcherEvent() calls the event owner and falls directly
 	// into register dispatch. Normal product execution can use the equivalent

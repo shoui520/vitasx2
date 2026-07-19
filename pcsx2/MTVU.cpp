@@ -6,6 +6,7 @@
 #include "MTVU.h"
 #include "VMManager.h"
 #include "Vif_Dynarec.h"
+#include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 
 #include <thread>
@@ -163,7 +164,6 @@ void VU_Thread::Reset()
 	m_profile_compile_barriers = 0;
 	m_profile_queue_submissions = 0;
 	m_profile_queue_words = 0;
-	m_profile_pending_words = 0;
 	m_micro_write_pending = false;
 	m_micro_invalidate_start = 0;
 	m_micro_invalidate_end = 0;
@@ -294,6 +294,8 @@ void VU_Thread::ExecuteRingBuffer()
 // Should only be called by ReserveSpace()
 __ri void VU_Thread::WaitOnSize(s32 size)
 {
+	const bool performance_telemetry_enabled =
+		VitaPerformanceTelemetry::IsEnabled();
 	bool counted_wait = false;
 	for (;;)
 	{
@@ -308,7 +310,7 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 		if (readPos > m_write_pos + size + _4kb)
 			break; // Enough free front space
 		{          // Let MTVU run to free up buffer space
-			if (!counted_wait)
+			if (performance_telemetry_enabled && !counted_wait)
 			{
 				m_profile_ring_waits++;
 				counted_wait = true;
@@ -319,7 +321,8 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 			// Performance will be smoother but it will consume extra CPU cycle
 			// on the EE thread (not an issue on 4 cores).
 			std::this_thread::yield();
-			m_profile_ring_wait_spins++;
+			if (performance_telemetry_enabled)
+				m_profile_ring_wait_spins++;
 		}
 	}
 }
@@ -365,10 +368,16 @@ __fi u32* VU_Thread::GetWritePtr()
 
 __fi void VU_Thread::CommitWritePos()
 {
+	if (VitaPerformanceTelemetry::IsEnabled())
+	{
+		const s32 previous_write_pos =
+			m_ato_write_pos.load(std::memory_order_relaxed);
+		const u32 queued_words = static_cast<u32>(
+			m_write_pos - previous_write_pos) & (buffer_size - 1);
+		m_profile_queue_submissions++;
+		m_profile_queue_words += queued_words;
+	}
 	m_ato_write_pos.store(m_write_pos, std::memory_order_release);
-	m_profile_queue_submissions++;
-	m_profile_queue_words += m_profile_pending_words;
-	m_profile_pending_words = 0;
 
 	if (MTVU_ALWAYS_KICK)
 		KickStart();
@@ -410,14 +419,12 @@ __fi void VU_Thread::Write(u32 val)
 {
 	GetWritePtr()[0] = val;
 	m_write_pos += 1;
-	m_profile_pending_words += 1;
 }
 
 __fi void VU_Thread::Write(const void* src, u32 size)
 {
 	memcpy(GetWritePtr(), src, size);
 	m_write_pos += size_u32(size);
-	m_profile_pending_words += size_u32(size);
 }
 
 __fi void VU_Thread::WriteRegs(VIFregisters* src)
@@ -430,7 +437,6 @@ __fi void VU_Thread::WriteRegs(VIFregisters* src)
 	dest->top = src->top;
 	dest->itop = src->itop;
 	m_write_pos += size_u32(sizeof(VIFregistersMTVU));
-	m_profile_pending_words += size_u32(sizeof(VIFregistersMTVU));
 }
 
 // Returns Average number of vu Cycles from last 4 runs
@@ -535,7 +541,8 @@ bool VU_Thread::IsDone()
 void VU_Thread::WaitVU()
 {
 	MTVU_LOG("MTVU - WaitVU!");
-	m_profile_wait_calls++;
+	if (VitaPerformanceTelemetry::IsEnabled())
+		m_profile_wait_calls++;
 	semaEvent.WaitForEmpty();
 }
 
@@ -551,7 +558,8 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 	Write(vif_itop);
 	Write(fbrst);
 	CommitWritePos();
-	m_profile_execute_enqueues++;
+	if (VitaPerformanceTelemetry::IsEnabled())
+		m_profile_execute_enqueues++;
 	gifUnit.TransferGSPacketData(GIF_TRANS_MTVU, NULL, 0);
 	KickStart();
 	u32 cycles = std::max(Get_vuCycles(), 4u);
@@ -618,7 +626,8 @@ void VU_Thread::PrepareVuCodeForExecute(s32 vu_addr)
 	// CPU0's executable EE cache. Drain pending micro writes, invalidate and
 	// compile on the EE-side C++ seam, then publish only executable code to CPU1.
 	WaitVU();
-	m_profile_compile_barriers++;
+	if (VitaPerformanceTelemetry::IsEnabled())
+		m_profile_compile_barriers++;
 	if (m_micro_write_pending)
 	{
 		CpuVU1->Clear(m_micro_invalidate_start,

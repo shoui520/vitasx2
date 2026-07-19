@@ -6,6 +6,7 @@
 #if !defined(VITASX2_QEMU_VALIDATION)
 
 #include "common/Console.h"
+#include "vita/VitaPerformanceTelemetry.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +19,16 @@ namespace VitaGXM
 	namespace
 	{
 		std::atomic<std::uint32_t> s_next_texture_telemetry_id{1};
+
+		std::uint32_t AllocateTextureTelemetryId()
+		{
+#if !defined(VITASX2_GS_DRAW_TRACE) || !VITASX2_GS_DRAW_TRACE
+			if (!VitaPerformanceTelemetry::IsEnabled())
+				return 0;
+#endif
+			return s_next_texture_telemetry_id.fetch_add(
+				1, std::memory_order_relaxed);
+		}
 
 		constexpr std::uint32_t TEXTURE_UPLOAD_ALIGNMENT = 64;
 		constexpr std::uint32_t TEXTURE_UPLOAD_PITCH_ALIGNMENT = 64;
@@ -146,14 +157,17 @@ namespace VitaGXM
 
 	GSTextureGXM::GSTextureGXM(TextureOwner* owner)
 		: m_owner(owner),
-		  m_telemetry_id(s_next_texture_telemetry_id.fetch_add(
-			  1, std::memory_order_relaxed))
+		  m_telemetry_id(AllocateTextureTelemetryId())
 	{
 	}
 
 	void GSTextureGXM::RecordWriter(TextureWriterKind kind,
 		const GSTextureGXM* source)
 	{
+#if !defined(VITASX2_GS_DRAW_TRACE) || !VITASX2_GS_DRAW_TRACE
+		if (!VitaPerformanceTelemetry::IsEnabled())
+			return;
+#endif
 		m_writer_telemetry.content_generation++;
 		const TextureWriterTelemetry* const source_writer =
 			source ? &source->WriterTelemetry() : nullptr;
@@ -236,6 +250,10 @@ namespace VitaGXM
 		std::uint8_t color_mask,
 		std::uint64_t draw_area, std::uint64_t sample_area)
 	{
+#if !defined(VITASX2_GS_DRAW_TRACE) || !VITASX2_GS_DRAW_TRACE
+		if (!VitaPerformanceTelemetry::IsEnabled())
+			return;
+#endif
 		m_writer_telemetry.content_generation++;
 		const TextureWriterTelemetry* const source_writer =
 			source ? &source->WriterTelemetry() : nullptr;

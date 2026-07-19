@@ -26,6 +26,7 @@
 #endif
 #include "vita/VitaGsMailbox.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 #if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
 #include "GS/Renderers/HW/GSTextureReplacements.h"
@@ -34,9 +35,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 
 Pcsx2Config::GSOptions GSConfig;
@@ -207,7 +211,8 @@ namespace MTGS
 	{
 		constexpr u32 WARMUP_BOUNDARIES = 60;
 		constexpr u32 PROFILE_INTERVALS = 120;
-		if (!s_native_presenter_enabled ||
+		if (!VitaPerformanceTelemetry::IsEnabled() ||
+			!s_native_presenter_enabled ||
 			profile.boundaries > WARMUP_BOUNDARIES + PROFILE_INTERVALS)
 			return;
 
@@ -288,6 +293,60 @@ namespace MTGS
 		return current >= previous ? static_cast<u64>(current - previous) :
 			static_cast<u64>(current);
 	}
+
+	class CorrelatedPerformanceBatch
+	{
+	public:
+		CorrelatedPerformanceBatch()
+		{
+			m_lines.reserve(8192);
+		}
+
+		void WriteLn(const char* format, ...)
+		{
+			char local[2048];
+			std::va_list arguments;
+			std::va_list retry_arguments;
+			va_start(arguments, format);
+			va_copy(retry_arguments, arguments);
+			const int length = std::vsnprintf(
+				local, sizeof(local), format, arguments);
+			va_end(arguments);
+			if (length <= 0)
+			{
+				va_end(retry_arguments);
+				return;
+			}
+
+			if (!m_lines.empty())
+				m_lines.push_back('\n');
+			if (static_cast<size_t>(length) < sizeof(local))
+			{
+				m_lines.append(local, static_cast<size_t>(length));
+			}
+			else
+			{
+				const size_t offset = m_lines.size();
+				m_lines.resize(offset + static_cast<size_t>(length) + 1);
+				std::vsnprintf(m_lines.data() + offset,
+					static_cast<size_t>(length) + 1, format, retry_arguments);
+				m_lines.resize(offset + static_cast<size_t>(length));
+			}
+			va_end(retry_arguments);
+		}
+
+		void Flush() const
+		{
+			if (!m_lines.empty())
+			{
+				Log::WriteMultilineBatch(
+					LOGLEVEL_INFO, Color_Default, m_lines);
+			}
+		}
+
+	private:
+		std::string m_lines;
+	};
 
 	struct CorrelatedPerformanceSnapshot
 	{
@@ -371,7 +430,8 @@ namespace MTGS
 	{
 		constexpr u32 WARMUP_VSYNCS = 60;
 		constexpr u32 WINDOW_VSYNCS = 120;
-		if (!s_native_presenter_enabled)
+		if (!s_native_presenter_enabled ||
+			!VitaPerformanceTelemetry::IsEnabled())
 			return;
 
 		const u64 producer_vsync = ++s_correlated_profile.producer_vsyncs;
@@ -409,8 +469,9 @@ namespace MTGS
 				stats.exact_trace_branch_likely_fallbacks +
 				stats.execute_failed_fallbacks + stats.interpreter_path_fallbacks;
 		};
+		CorrelatedPerformanceBatch output;
 
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=anchor origin=%s origin_vsync=%llu "
 			"producer_vsync_start=%llu "
 			"producer_vsync_end=%llu completed_vsync_start=%llu completed_vsync_end=%llu "
@@ -428,7 +489,7 @@ namespace MTGS
 			static_cast<unsigned long long>(end.ee_cycle), start.ee_pc, end.ee_pc,
 			static_cast<unsigned long long>(start.iop_cycle),
 			static_cast<unsigned long long>(end.iop_cycle), start.iop_pc, end.iop_pc);
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=threads wall_us=%llu ee_cpu_us=%llu "
 			"ee_util=%.1f vu_cpu_us=%llu vu_util=%.1f gs_cpu_us=%llu gs_util=%.1f",
 			static_cast<unsigned long long>(window),
@@ -436,7 +497,7 @@ namespace MTGS
 			static_cast<unsigned long long>(ee_cpu_us), utilization(ee_cpu_us),
 			static_cast<unsigned long long>(vu_cpu_us), utilization(vu_cpu_us),
 			static_cast<unsigned long long>(gs_cpu_us), utilization(gs_cpu_us));
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee generated_blocks=%llu host_instructions=%llu "
 			"host_loads=%llu host_stores=%llu helper_calls_generated=%llu "
 			"register_loads_generated=%llu register_stores_generated=%llu "
@@ -483,7 +544,7 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_guest_instructions,
 				origin.ee.generated_guest_instructions)));
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_codegen integer=%llu branch=%llu "
 			"gpr_load=%llu gpr_store=%llu mmi=%llu cop0=%llu cop1=%llu cop2=%llu "
 			"other=%llu largest_pc=0x%08x largest_guest=%u largest_host=%u "
@@ -547,7 +608,7 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_other_instructions,
 				origin.ee.generated_other_instructions)));
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_dispatch provider_boundaries=%llu "
 			"boundary_guest_instructions=%llu direct_exits=%llu event_exits=%llu "
 			"cache_hits=%llu cache_misses=%llu lookup_hits=%llu fast_dispatch_hits=%llu "
@@ -585,7 +646,7 @@ namespace MTGS
 				start.ee.invalidated_blocks)),
 			static_cast<unsigned long long>(CounterDelta(end.ee.failed_blocks,
 				start.ee.failed_blocks)));
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_fallback interpreter_steps=%llu "
 			"fallbacks=%llu unsupported=%llu scan_boundary=%llu branch_likely=%llu "
 			"execute_failed=%llu interpreter_path=%llu last_pc=0x%08x "
@@ -610,7 +671,7 @@ namespace MTGS
 				start.ee.interpreter_path_fallbacks)),
 			end.ee.last_interpreter_pc, end.ee.last_interpreter_opcode,
 			end.ee.last_interpreter_reason);
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=vu0 execute_calls=%llu executed_blocks=%llu "
 			"executed_pairs=%llu interpreter_steps=%llu generated_blocks=%llu "
 			"generated_pairs=%llu host_instructions=%llu host_loads=%llu host_stores=%llu "
@@ -671,7 +732,7 @@ namespace MTGS
 				origin.vu0.generated_pairs)),
 			static_cast<unsigned long long>(CounterDelta(end.vu0.compile_failures,
 				origin.vu0.compile_failures)));
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=vu1 programs=%llu executed_blocks=%llu "
 			"executed_pairs=%llu interpreter_steps=%llu generated_blocks=%llu "
 			"generated_pairs=%llu host_instructions=%llu host_loads=%llu host_stores=%llu "
@@ -719,7 +780,7 @@ namespace MTGS
 				origin.vu1.generated_blocks)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.generated_pairs,
 				origin.vu1.generated_pairs)));
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=vu1_cache prepare_checks=%llu prepare_calls=%llu "
 			"quick_hits=%llu content_hits=%llu compile_requests=%llu invalidations=%llu "
 			"compile_failures=%llu origin_prepare_checks=%llu origin_prepare_calls=%llu "
@@ -758,7 +819,7 @@ namespace MTGS
 				origin.vu1.invalidations)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.compile_failures,
 				origin.vu1.compile_failures)));
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=mtvu submissions=%llu queue_words=%llu "
 			"execute_jobs=%llu waits=%llu ring_waits=%llu ring_spins=%llu compile_barriers=%llu",
 			static_cast<unsigned long long>(window),
@@ -776,7 +837,7 @@ namespace MTGS
 				start.mtvu.ring_wait_spins)),
 			static_cast<unsigned long long>(CounterDelta(end.mtvu.compile_barriers,
 				start.mtvu.compile_barriers)));
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gs submitted=%llu submitted_words=%llu "
 			"processed=%llu packets=%llu packet_bytes=%llu mtvu_packets=%llu "
 			"mtvu_packet_bytes=%llu waits=%llu wait_spins=%llu ring_spins=%llu "
@@ -805,7 +866,7 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.gs_worker.mtvu_visibility_spins,
 				start.gs_worker.mtvu_visibility_spins)));
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gxm draws=%llu indices=%llu "
 			"vertex_bytes=%llu index_bytes=%llu texture_uploads=%llu "
 			"texture_upload_bytes=%llu readbacks=%llu readback_bytes=%llu "
@@ -862,7 +923,7 @@ namespace MTGS
 			end.gxm.feedback_depth_draws != start.gxm.feedback_depth_draws ||
 			end.gxm.rt_hazard_draws != start.gxm.rt_hazard_draws ||
 			end.gxm.depth_hazard_draws != start.gxm.depth_hazard_draws;
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gxm_semantics tfx=%llu textured=%llu "
 			"rt_source=%llu depth_source=%llu rt_hazard=%llu depth_hazard=%llu "
 			"feedback_rt=%llu feedback_depth=%llu snapshots=%llu snapshot_bytes=%llu "
@@ -922,7 +983,7 @@ namespace MTGS
 			static_cast<u32>(feedback_seen ?
 				end.gxm.last_feedback_hazard : 0));
 		const bool merge_seen = end.gxm.merge_calls != start.gxm.merge_calls;
-		Console.WriteLn(
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gxm_output merges=%llu rc1_draws=%llu "
 			"rc2_draws=%llu presents=%llu interlace=%llu pmode=0x%016llx "
 			"extbuf=0x%016llx background=0x%08x source_mask=0x%02x "
@@ -1039,6 +1100,7 @@ namespace MTGS
 			static_cast<unsigned long long>(merge_seen ?
 				end.gxm.last_merge_parent_last_rgb_sample_area : 0));
 
+		output.Flush();
 		s_correlated_profile.start = end;
 		s_correlated_profile.boundaries_at_start = boundary;
 	}
@@ -1203,10 +1265,13 @@ namespace MTGS
 		s_gs->VSync(field, registers_written, idle_frame);
 #endif
 #if defined(__vita__)
-		VitaGxmPublishPerformanceCounters();
-		s_gs_worker_performance.completed_vsyncs++;
-		PublishGsWorkerPerformance();
-		RecordHardwareVsyncProfile(s_worker_profile, "worker");
+		if (VitaPerformanceTelemetry::IsEnabled())
+		{
+			VitaGxmPublishPerformanceCounters();
+			s_gs_worker_performance.completed_vsyncs++;
+			PublishGsWorkerPerformance();
+			RecordHardwareVsyncProfile(s_worker_profile, "worker");
+		}
 #endif
 		// PCSX2 owner: GS.cpp::GSvsync() snapshots after Flush() and VSync().
 		s_gs->TraceGsStateSnapshot(Pcsx2Trace::GsTraceStateTriggerVSyncStart);
@@ -1304,6 +1369,10 @@ namespace MTGS
 	static void MainLoop()
 	{
 		std::unique_lock mtvu_lock(s_mtvu_wait_mutex);
+#if defined(__vita__)
+		const bool performance_telemetry_enabled =
+			VitaPerformanceTelemetry::IsEnabled();
+#endif
 		while (true)
 		{
 			mtvu_lock.unlock();
@@ -1320,7 +1389,8 @@ namespace MTGS
 				const PacketTag& tag = reinterpret_cast<const PacketTag&>(s_ring[read_pos]);
 				u32 ring_advance = 1;
 #if defined(__vita__)
-				s_gs_worker_performance.commands++;
+				if (performance_telemetry_enabled)
+					s_gs_worker_performance.commands++;
 #endif
 
 				switch (static_cast<Command>(tag.command))
@@ -1332,8 +1402,11 @@ namespace MTGS
 						const u32 offset = tag.data[0];
 						const u32 size = tag.data[1];
 #if defined(__vita__)
-						s_gs_worker_performance.gs_packets++;
-						s_gs_worker_performance.gs_packet_bytes += size;
+						if (performance_telemetry_enabled)
+						{
+							s_gs_worker_performance.gs_packets++;
+							s_gs_worker_performance.gs_packet_bytes += size;
+						}
 #endif
 						if (s_gs && offset != ~0u)
 						{
@@ -1363,20 +1436,27 @@ namespace MTGS
 						if (!path.TryGetGSPacketMTVU(packet))
 						{
 						#if defined(__vita__)
-							s_profile_mtvu_packet_visibility_waits.fetch_add(1,
-								std::memory_order_relaxed);
+							if (performance_telemetry_enabled)
+							{
+								s_profile_mtvu_packet_visibility_waits.fetch_add(1,
+									std::memory_order_relaxed);
+							}
 						#endif
 							do
 							{
 								Threading::SpinWait();
 #if defined(__vita__)
-								s_gs_worker_performance.mtvu_visibility_spins++;
+								if (performance_telemetry_enabled)
+									s_gs_worker_performance.mtvu_visibility_spins++;
 #endif
 							} while (!path.TryGetGSPacketMTVU(packet));
 						}
 #if defined(__vita__)
-						s_gs_worker_performance.mtvu_packets++;
-						s_gs_worker_performance.mtvu_packet_bytes += packet.size;
+						if (performance_telemetry_enabled)
+						{
+							s_gs_worker_performance.mtvu_packets++;
+							s_gs_worker_performance.mtvu_packet_bytes += packet.size;
+						}
 #endif
 						if (s_gs && packet.size)
 						{
@@ -1505,6 +1585,10 @@ namespace MTGS
 
 	static void GenericStall(u32 size)
 	{
+#if defined(__vita__)
+		const bool performance_telemetry_enabled =
+			VitaPerformanceTelemetry::IsEnabled();
+#endif
 		const u32 write_pos = s_write_pos.load(std::memory_order_relaxed);
 		pxAssert(size < RingBufferSize);
 		u32 read_pos = s_read_pos.load(std::memory_order_acquire);
@@ -1514,7 +1598,7 @@ namespace MTGS
 			return;
 
 #if defined(__vita__)
-		if (s_native_presenter_enabled)
+		if (performance_telemetry_enabled && s_native_presenter_enabled)
 			s_profile_ring_stalls.fetch_add(1, std::memory_order_relaxed);
 #endif
 
@@ -1545,7 +1629,8 @@ namespace MTGS
 			{
 				Threading::SpinWait();
 #if defined(__vita__)
-				s_gs_producer_performance.ring_spins++;
+				if (performance_telemetry_enabled)
+					s_gs_producer_performance.ring_spins++;
 #endif
 				read_pos = s_read_pos.load(std::memory_order_acquire);
 				free_room = write_pos < read_pos ? read_pos - write_pos :
@@ -1577,8 +1662,11 @@ namespace MTGS
 		PacketTag& tag = reinterpret_cast<PacketTag&>(s_ring[s_packet_start_pos]);
 		tag.data[0] = actual_size;
 #if defined(__vita__)
-		s_gs_producer_performance.submissions++;
-		s_gs_producer_performance.ring_words += actual_size + 1;
+		if (VitaPerformanceTelemetry::IsEnabled())
+		{
+			s_gs_producer_performance.submissions++;
+			s_gs_producer_performance.ring_words += actual_size + 1;
+		}
 #endif
 		s_write_pos.store(s_packet_write_pos, std::memory_order_release);
 		if (EmuConfig.GS.SynchronousMTGS)
@@ -1614,16 +1702,19 @@ namespace MTGS
 		tag.data[1] = data1;
 		tag.data[2] = data2;
 #if defined(__vita__)
-		s_gs_producer_performance.submissions++;
-		s_gs_producer_performance.ring_words++;
-		if (command == Command::GSPacket)
+		if (VitaPerformanceTelemetry::IsEnabled())
 		{
-			s_gs_producer_performance.gs_packets++;
-			s_gs_producer_performance.gs_packet_bytes += data1;
-		}
-		else if (command == Command::MTVUGSPacket)
-		{
-			s_gs_producer_performance.mtvu_packets++;
+			s_gs_producer_performance.submissions++;
+			s_gs_producer_performance.ring_words++;
+			if (command == Command::GSPacket)
+			{
+				s_gs_producer_performance.gs_packets++;
+				s_gs_producer_performance.gs_packet_bytes += data1;
+			}
+			else if (command == Command::MTVUGSPacket)
+			{
+				s_gs_producer_performance.mtvu_packets++;
+			}
 		}
 #endif
 		FinishSimplePacket();
@@ -1650,8 +1741,11 @@ namespace MTGS
 		tag.data[0] = data0;
 		tag.pointer = reinterpret_cast<uptr>(pointer);
 #if defined(__vita__)
-		s_gs_producer_performance.submissions++;
-		s_gs_producer_performance.ring_words++;
+		if (VitaPerformanceTelemetry::IsEnabled())
+		{
+			s_gs_producer_performance.submissions++;
+			s_gs_producer_performance.ring_words++;
+		}
 #endif
 		FinishSimplePacket();
 	}
@@ -1680,7 +1774,10 @@ namespace MTGS
 			return;
 
 #if defined(__vita__)
-		s_gs_producer_performance.wait_calls++;
+		const bool performance_telemetry_enabled =
+			VitaPerformanceTelemetry::IsEnabled();
+		if (performance_telemetry_enabled)
+			s_gs_producer_performance.wait_calls++;
 #endif
 
 		SetEvent();
@@ -1696,7 +1793,8 @@ namespace MTGS
 					if (path.GetPendingGSPackets() != pending_packets)
 						break;
 #if defined(__vita__)
-					s_gs_producer_performance.wait_spins++;
+					if (performance_telemetry_enabled)
+						s_gs_producer_performance.wait_spins++;
 #endif
 				}
 			}
@@ -1783,8 +1881,13 @@ namespace MTGS
 			return;
 
 #if defined(__vita__)
-		RecordHardwareVsyncProfile(s_producer_profile, "producer");
-		RecordCorrelatedPerformanceProfile();
+		const bool performance_telemetry_enabled =
+			VitaPerformanceTelemetry::IsEnabled();
+		if (performance_telemetry_enabled)
+		{
+			RecordHardwareVsyncProfile(s_producer_profile, "producer");
+			RecordCorrelatedPerformanceProfile();
+		}
 #endif
 
 		RingVSyncSnapshot snapshot = {};
@@ -1806,7 +1909,7 @@ namespace MTGS
 		const int previous_queued_frames =
 			s_queued_frame_count.fetch_add(1, std::memory_order_acq_rel);
 #if defined(__vita__)
-		if (s_native_presenter_enabled)
+		if (performance_telemetry_enabled && s_native_presenter_enabled)
 			s_profile_max_queued_frames.store(std::max(
 				s_profile_max_queued_frames.load(std::memory_order_relaxed),
 				previous_queued_frames + 1), std::memory_order_relaxed);
@@ -1823,7 +1926,7 @@ namespace MTGS
 		if (force_drain)
 		{
 #if defined(__vita__)
-			if (s_native_presenter_enabled)
+			if (performance_telemetry_enabled && s_native_presenter_enabled)
 				s_profile_vsync_waits.fetch_add(1, std::memory_order_relaxed);
 #endif
 			// With no prior queued frame there is nothing which can safely satisfy
@@ -1835,7 +1938,7 @@ namespace MTGS
 		if (!wait_for_frame)
 			return;
 #if defined(__vita__)
-		if (s_native_presenter_enabled)
+		if (performance_telemetry_enabled && s_native_presenter_enabled)
 			s_profile_vsync_waits.fetch_add(1, std::memory_order_relaxed);
 #endif
 		s_vsync_sema.Wait();
@@ -1963,6 +2066,8 @@ void VitaGS::NotifyPerformanceElfEntry()
 	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
 	VitaGsDrawTraceNotifyElfEntry();
 	#endif
+	if (!VitaPerformanceTelemetry::IsEnabled())
+		return;
 	// PCSX2 owner: MachineCheckpointTrace::NotifyMachineCheckpointElfEntry()
 	// snapshots g_FrameCount and measures later captures relative to that frame.
 	// Reset only the sampling cadence: lifetime counters remain monotonic.

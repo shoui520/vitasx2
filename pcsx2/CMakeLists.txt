@@ -192,6 +192,7 @@ add_library(pcsx2core STATIC
 	vita/VitaHostSurface.cpp
 	vita/VitaInputManager.cpp
 	vita/VitaPad.cpp
+	vita/VitaPerformanceTelemetry.cpp
 	vita/VitaSaveState.cpp
 	vita/VitaUsbDeviceRegistry.cpp
 	vita/VitaVifInterpreter.cpp

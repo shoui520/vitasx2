@@ -30,6 +30,7 @@
 #include "vita/VitaEeBlockCompiler.h"
 #include "vita/VitaEeExecutor.h"
 #include "vita/VitaIopBlockCompiler.h"
+#include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 #include "vtlb.h"
 
@@ -151,7 +152,8 @@ u32 VitaNotifyA32EeRamWrite(const void* host_address, u32 size)
 	const u32 bounded_size = static_cast<u32>(size < remaining ? size : remaining);
 	const u32 invalidated = s_ee_a32_executor.InvalidateRamSourceRange(
 		static_cast<u32>(backing_start), bounded_size);
-	s_ee_a32_stats.invalidated_blocks += invalidated;
+	if (VitaPerformanceTelemetry::IsEnabled())
+		s_ee_a32_stats.invalidated_blocks += invalidated;
 	return invalidated;
 }
 
@@ -367,6 +369,8 @@ static void recRecordInterpreterFallbackInStats(VitaA32EeProviderStats& stats,
 static void recRecordInterpreterFallback(u32 pc, u32 opcode,
 	VitaA32EeFallbackReason reason)
 {
+	if (!VitaPerformanceTelemetry::IsEnabled())
+		return;
 	recRecordInterpreterFallbackInStats(s_ee_a32_stats, pc, opcode, reason);
 #if defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
@@ -581,6 +585,8 @@ static void recRunInterpreterStepsWithoutProviderTrace(u32 instruction_count)
 
 static void recAccountEeBlockExecution(const VitaEE::BlockExecutionResult& result, u32 fallback_pc)
 {
+	if (!VitaPerformanceTelemetry::IsEnabled())
+		return;
 	if (result.path == VitaEE::BlockExecutionPath::Compiled)
 	{
 		s_ee_a32_stats.compiled_blocks++;
@@ -879,12 +885,15 @@ static __attribute__((noinline)) u32 recRunEeEventForGeneratedResume(
 		cpuRegs.cycle = cpuRegs.nextEventCycle;
 		retained_events++;
 	}
-	s_ee_a32_stats.in_frame_event_tests += event_tests;
-	s_ee_a32_stats.retained_unconditional_wait_events += retained_events;
+	if (VitaPerformanceTelemetry::IsEnabled())
+	{
+		s_ee_a32_stats.in_frame_event_tests += event_tests;
+		s_ee_a32_stats.retained_unconditional_wait_events += retained_events;
+		if (!resume)
+			s_ee_a32_stats.in_frame_event_resume_refusals++;
+	}
 	if (resume)
 		VitaEE::RefreshRawGpr0KnownZero();
-	else
-		s_ee_a32_stats.in_frame_event_resume_refusals++;
 	return resume ? 1u : 0u;
 }
 
