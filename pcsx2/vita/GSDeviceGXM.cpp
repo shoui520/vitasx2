@@ -48,6 +48,8 @@ extern "C"
 	extern const SceGxmProgram _binary_vitasx2_tfx_manual_lod_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_manual_lod_zfloor_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_zfloor_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_psm16_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_psm16_zfloor_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_zfloor_source_direct_decal_af_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_fast_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_region_repeat_f_gxp_start;
@@ -236,6 +238,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	{
 		const SceGxmProgramParameter* vertex_scale_offset = nullptr;
 		const SceGxmProgramParameter* selector[7]{};
+		const SceGxmProgramParameter* selector7 = nullptr;
+		const SceGxmProgramParameter* dither_matrix[4]{};
 		const SceGxmProgramParameter* fog_color_aref = nullptr;
 		const SceGxmProgramParameter* texture_size = nullptr;
 		const SceGxmProgramParameter* native_texture_size = nullptr;
@@ -291,6 +295,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmShaderPatcherId tfx_manual_lod_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_manual_lod_zfloor_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_zfloor_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_psm16_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_psm16_zfloor_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_zfloor_source_direct_decal_af_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_fast_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_region_repeat_fragment_id = nullptr;
@@ -319,6 +325,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmFragmentProgram* tfx_manual_lod_fragment_program = nullptr;
 	SceGxmFragmentProgram* tfx_manual_lod_zfloor_fragment_program = nullptr;
 	SceGxmFragmentProgram* tfx_zfloor_fragment_program = nullptr;
+	SceGxmFragmentProgram* tfx_psm16_fragment_program = nullptr;
+	SceGxmFragmentProgram* tfx_psm16_zfloor_fragment_program = nullptr;
 	SceGxmFragmentProgram* tfx_zfloor_source_direct_decal_af_program = nullptr;
 	SceGxmFragmentProgram* tfx_opaque_program = nullptr;
 	SceGxmFragmentProgram* tfx_region_repeat_program = nullptr;
@@ -343,6 +351,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	ProgramUniforms manual_lod_uniforms;
 	ProgramUniforms manual_lod_zfloor_uniforms;
 	ProgramUniforms zfloor_uniforms;
+	ProgramUniforms psm16_uniforms;
+	ProgramUniforms psm16_zfloor_uniforms;
 	ProgramUniforms zfloor_source_direct_decal_af_uniforms;
 	ProgramUniforms fast_uniforms;
 	ProgramUniforms region_repeat_uniforms;
@@ -365,6 +375,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	std::map<u64, SceGxmFragmentProgram*> tfx_source_untextured_programs;
 	bool tfx_patched_program_limit_logged = false;
 	bool tfx_zfloor_source_direct_decal_af_logged = false;
+	bool tfx_psm16_logged = false;
 
 	std::map<std::pair<int, int>, std::unique_ptr<VitaGXM::GSTextureGXM>> feedback_textures;
 	std::map<std::tuple<int, int, GSTexture::Format>, std::unique_ptr<VitaGXM::GSTextureGXM>> post_textures;
@@ -410,6 +421,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 		bool programmable_add_fragment,
 		bool programmable_add_direct_fragment,
 		bool programmable_over_fragment,
+		bool psm16_fragment,
 		bool source_only_fragment,
 		bool source_direct_fragment,
 		bool source_direct_modulate_fragment,
@@ -422,6 +434,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 		bool programmable_add_fragment,
 		bool programmable_add_direct_fragment,
 		bool programmable_over_fragment,
+		bool psm16_fragment,
 		bool source_only_fragment,
 		bool source_direct_fragment,
 		bool source_direct_modulate_fragment,
@@ -755,6 +768,10 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		&_binary_vitasx2_tfx_manual_lod_zfloor_f_gxp_start;
 	const SceGxmProgram* const tfx_zfloor_f =
 		&_binary_vitasx2_tfx_zfloor_f_gxp_start;
+	const SceGxmProgram* const tfx_psm16_f =
+		&_binary_vitasx2_tfx_psm16_f_gxp_start;
+	const SceGxmProgram* const tfx_psm16_zfloor_f =
+		&_binary_vitasx2_tfx_psm16_zfloor_f_gxp_start;
 	const SceGxmProgram* const tfx_zfloor_source_direct_decal_af_f =
 		&_binary_vitasx2_tfx_zfloor_source_direct_decal_af_f_gxp_start;
 	const SceGxmProgram* const tfx_fast_f =
@@ -797,6 +814,7 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		&_binary_vitasx2_mad_reconstruct_f_gxp_start;
 	for (const SceGxmProgram* program : {tfx_v, tfx_f, tfx_manual_lod_f,
 		tfx_manual_lod_zfloor_f, tfx_zfloor_f,
+		tfx_psm16_f, tfx_psm16_zfloor_f,
 		tfx_zfloor_source_direct_decal_af_f,
 		tfx_fast_f, tfx_region_repeat_f, tfx_region_repeat_fast_f,
 		tfx_untextured_f, tfx_source_f, tfx_programmable_add_f,
@@ -829,6 +847,11 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 			"register manual-LOD Z-floor TFX fragment program") ||
 		!register_program(tfx_zfloor_f, &tfx_zfloor_fragment_id,
 			"register Z-floor TFX fragment program") ||
+		!register_program(tfx_psm16_f, &tfx_psm16_fragment_id,
+			"register PSMCT16 TFX fragment program") ||
+		!register_program(tfx_psm16_zfloor_f,
+			&tfx_psm16_zfloor_fragment_id,
+			"register PSMCT16 Z-floor TFX fragment program") ||
 		!register_program(tfx_zfloor_source_direct_decal_af_f,
 			&tfx_zfloor_source_direct_decal_af_fragment_id,
 			"register Z-floor direct DECAL/RGB (Cs-0)*Af+0 TFX fragment program") ||
@@ -921,6 +944,11 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		destination->color_mask = find_uniform(program, "ColorMask");
 		destination->region_mask_fix = find_uniform(program, "RegionMaskFix");
 		destination->lod_params = find_uniform(program, "LODParams");
+		destination->selector7 = find_uniform(program, "Selector7");
+		destination->dither_matrix[0] = find_uniform(program, "DitherMatrix0");
+		destination->dither_matrix[1] = find_uniform(program, "DitherMatrix1");
+		destination->dither_matrix[2] = find_uniform(program, "DitherMatrix2");
+		destination->dither_matrix[3] = find_uniform(program, "DitherMatrix3");
 	};
 	for (u32 i = 0; i < selector_names.size(); i++)
 	{
@@ -937,6 +965,19 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 			SCE_GXM_ERROR_INVALID_VALUE);
 	}
 	load_variant_uniforms(tfx_zfloor_f, &zfloor_uniforms);
+	load_variant_uniforms(tfx_psm16_f, &psm16_uniforms);
+	load_variant_uniforms(tfx_psm16_zfloor_f, &psm16_zfloor_uniforms);
+	if (!psm16_uniforms.selector7 || !psm16_zfloor_uniforms.selector7)
+		return Fail("validate PSMCT16 TFX selector", SCE_GXM_ERROR_INVALID_VALUE);
+	for (u32 i = 0; i < 4; i++)
+	{
+		if (!psm16_uniforms.dither_matrix[i] ||
+			!psm16_zfloor_uniforms.dither_matrix[i])
+		{
+			return Fail("validate PSMCT16 TFX dither matrix",
+				SCE_GXM_ERROR_INVALID_VALUE);
+		}
+	}
 	load_variant_uniforms(tfx_zfloor_source_direct_decal_af_f,
 		&zfloor_source_direct_decal_af_uniforms);
 	if (!zfloor_source_direct_decal_af_uniforms.texture_alpha ||
@@ -1067,6 +1108,18 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		&tfx_zfloor_fragment_program);
 	if (result < 0 || !tfx_zfloor_fragment_program)
 		return Fail("create Z-floor TFX fragment program", result);
+	result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_psm16_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
+		SCE_GXM_MULTISAMPLE_NONE, nullptr, tfx_v,
+		&tfx_psm16_fragment_program);
+	if (result < 0 || !tfx_psm16_fragment_program)
+		return Fail("create PSMCT16 TFX fragment program", result);
+	result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_psm16_zfloor_fragment_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED, SCE_GXM_MULTISAMPLE_NONE,
+		nullptr, tfx_v, &tfx_psm16_zfloor_fragment_program);
+	if (result < 0 || !tfx_psm16_zfloor_fragment_program)
+		return Fail("create PSMCT16 Z-floor TFX fragment program", result);
 	// PCSX2's constant-blend split requires a destination value, but GXM has no
 	// fixed constant-color blend factor. The specialized native-color program
 	// performs that one proven equation through FRAGCOLOR, matching Sony's
@@ -1905,6 +1958,7 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	bool programmable_add_fragment,
 	bool programmable_add_direct_fragment,
 	bool programmable_over_fragment,
+	bool psm16_fragment,
 	bool source_only_fragment, bool source_direct_fragment,
 	bool source_direct_modulate_fragment,
 	bool source_direct_modulate_af_fragment,
@@ -1923,6 +1977,9 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	}
 	else if (zfloor_programmable_constant_fragment)
 		fragment_uniforms = &zfloor_source_direct_decal_af_uniforms;
+	else if (psm16_fragment)
+		fragment_uniforms = ps.zfloor ? &psm16_zfloor_uniforms :
+			&psm16_uniforms;
 	else if (ps.zfloor)
 		fragment_uniforms = &zfloor_uniforms;
 	else if (programmable_add_direct_fragment)
@@ -2013,6 +2070,27 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 			fragment_uniforms->selector[i], 0, 4, selectors[i]);
 		if (result < 0)
 			return Fail("upload TFX selector", result);
+	}
+	if (psm16_fragment)
+	{
+		const float selector7[4] = {
+			static_cast<float>(ps.dither),
+			static_cast<float>(ps.dither_adjust),
+			static_cast<float>(ps.round_inv), config.cb_ps.ScaleFactor.y};
+		if (!upload4(fragment_uniforms->selector7, selector7,
+				"upload PSMCT16 selector"))
+		{
+			return false;
+		}
+		for (u32 i = 0; i < 4; i++)
+		{
+			if (!upload4(fragment_uniforms->dither_matrix[i],
+					config.cb_ps.DitherMatrix[i].F32,
+					"upload PSMCT16 dither row"))
+			{
+				return false;
+			}
+		}
 	}
 	if (!upload4(fragment_uniforms->fog_color_aref,
 			config.cb_ps.FogColor_AREF.F32,
@@ -2137,6 +2215,7 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	bool programmable_add_fragment,
 	bool programmable_add_direct_fragment,
 	bool programmable_over_fragment,
+	bool psm16_fragment,
 	bool source_only_fragment, bool source_direct_fragment,
 	bool source_direct_modulate_fragment,
 	bool source_direct_modulate_af_fragment,
@@ -2288,6 +2367,7 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 			programmable_add_fragment,
 			programmable_add_direct_fragment,
 			programmable_over_fragment,
+			psm16_fragment,
 			source_only_fragment, source_direct_fragment,
 			source_direct_modulate_fragment,
 			source_direct_modulate_af_fragment, untextured_fragment))
@@ -2429,12 +2509,20 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 			static_cast<u8>(GS_MIN_FILTER::Linear_Mipmap_Linear) ||
 		(config.sampler.triln != static_cast<u8>(GS_MIN_FILTER::Nearest) &&
 			!mip_lod);
-	if (config.pal || config.ps.pal_fmt || config.ps.depth_fmt || config.ps.dst_fmt ||
+	const bool psm16_fragment = config.ps.dst_fmt == 2;
+	const bool invalid_destination_format =
+		config.ps.dst_fmt != 0 && !psm16_fragment;
+	const bool invalid_dither = config.ps.dither > 3 ||
+		(config.ps.dither != 0 && !psm16_fragment) ||
+		(config.ps.dither_adjust && !psm16_fragment) ||
+		(config.ps.round_inv && !psm16_fragment);
+	if (config.pal || config.ps.pal_fmt || config.ps.depth_fmt ||
+		invalid_destination_format || invalid_dither ||
 		config.ps.afail != GSHWDrawConfig::PS_AFAIL::KEEP || config.ps.ztst ||
 		config.ps.shuffle || config.ps.shuffle_same || config.ps.real16src ||
 		config.ps.process_ba || config.ps.process_rg || config.ps.shuffle_across ||
 		config.ps.write_rg || config.ps.a_masked ||
-		config.ps.channel || config.ps.dither || config.ps.dither_adjust ||
+		config.ps.channel ||
 		config.ps.colclip_hw || config.ps.urban_chaos_hle ||
 		config.ps.tales_of_abyss_hle || config.ps.point_sampler ||
 		config.ps.sw_aniso ||
@@ -2459,6 +2547,11 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		return;
 	}
 	const bool region_repeat_fragment = config.ps.wms == 3 || config.ps.wmt == 3;
+	if (psm16_fragment && (config.ps.manual_lod || region_repeat_fragment))
+	{
+		m_impl->Reject("PSMCT16 combined with manual LOD or REGION_REPEAT");
+		return;
+	}
 	if (region_repeat_fragment &&
 		(config.ps.region_rect || config.ps.manual_lod || config.ps.zfloor))
 	{
@@ -2528,9 +2621,10 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 	// No patcher blend state is involved: this program is valid only when PCSX2
 	// proves blending ineffective and every color component is overwritten.
 	const bool manual_lod_fragment = config.ps.manual_lod;
-	bool fast_fragment = !manual_lod_fragment && !blend_effective &&
-		full_color_write && m_impl->CanUseFastTfx(config);
-	const bool programmable_add = !manual_lod_fragment && blend_effective &&
+	bool fast_fragment = !psm16_fragment && !manual_lod_fragment &&
+		!blend_effective && full_color_write && m_impl->CanUseFastTfx(config);
+	const bool programmable_add = !psm16_fragment && !manual_lod_fragment &&
+		blend_effective &&
 		m_impl->CanUseSourceOnlyTfx(config) &&
 		full_color_write &&
 		!config.blend.constant_enable &&
@@ -2541,7 +2635,8 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		config.blend.dst_factor_alpha == GSDevice::CONST_ZERO;
 	const bool programmable_add_direct = programmable_add &&
 		m_impl->CanUseSourceDirectTfx(config);
-	const bool programmable_over = !manual_lod_fragment && blend_effective &&
+	const bool programmable_over = !psm16_fragment && !manual_lod_fragment &&
+		blend_effective &&
 		full_color_write && !config.ps.fbmask &&
 		!config.blend.constant_enable &&
 		config.blend.op == GSDevice::OP_ADD &&
@@ -2551,11 +2646,11 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		config.blend.dst_factor_alpha == GSDevice::CONST_ZERO;
 	// PCSX2 tfx_fs.glsl proves this family never observes Cd/Ad. Use Sony's
 	// fixed-blend contract to avoid the SGX framebuffer fetch entirely.
-	const bool source_only_contract = !manual_lod_fragment &&
+	const bool source_only_contract = !psm16_fragment && !manual_lod_fragment &&
 		blend_effective && full_color_write &&
 		!config.ps.fbmask && m_impl->CanUseSourceOnlyTfx(config);
 	const bool zfloor_programmable_constant_fragment =
-		!manual_lod_fragment && blend_effective &&
+		!psm16_fragment && !manual_lod_fragment && blend_effective &&
 		m_impl->CanUseZfloorSourceDirectDecalAfTfx(config);
 	if (zfloor_programmable_constant_fragment &&
 		!m_impl->tfx_zfloor_source_direct_decal_af_logged)
@@ -2617,7 +2712,9 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		source_direct_modulate_af_fragment = false;
 		untextured_fragment = false;
 	}
-	SceGxmFragmentProgram* fragment = region_repeat_fragment ?
+	SceGxmFragmentProgram* fragment = psm16_fragment ?
+		(config.ps.zfloor ? m_impl->tfx_psm16_zfloor_fragment_program :
+			m_impl->tfx_psm16_fragment_program) : (region_repeat_fragment ?
 		(fast_fragment ? m_impl->tfx_region_repeat_opaque_program :
 			m_impl->tfx_region_repeat_program) : (manual_lod_fragment ?
 		(config.ps.zfloor ? m_impl->tfx_manual_lod_zfloor_fragment_program :
@@ -2632,7 +2729,7 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		m_impl->tfx_programmable_add_program :
 		(programmable_over ? m_impl->tfx_programmable_over_program :
 		(fast_fragment ? m_impl->tfx_opaque_program :
-			m_impl->tfx_fragment_program)))))));
+			m_impl->tfx_fragment_program))))))));
 	if (!fragment)
 	{
 		// Shader-patcher memory exhaustion must not change GS behavior. The
@@ -2646,11 +2743,19 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		source_direct_modulate_fragment = false;
 		source_direct_modulate_af_fragment = false;
 		untextured_fragment = false;
-		fragment = manual_lod_fragment ?
+		fragment = psm16_fragment ?
+			(config.ps.zfloor ? m_impl->tfx_psm16_zfloor_fragment_program :
+				m_impl->tfx_psm16_fragment_program) : (manual_lod_fragment ?
 			(config.ps.zfloor ? m_impl->tfx_manual_lod_zfloor_fragment_program :
 				m_impl->tfx_manual_lod_fragment_program) :
 			(config.ps.zfloor ? m_impl->tfx_zfloor_fragment_program :
-				m_impl->tfx_fragment_program);
+				m_impl->tfx_fragment_program));
+	}
+	if (psm16_fragment && !m_impl->tfx_psm16_logged)
+	{
+		m_impl->tfx_psm16_logged = true;
+		Console.WriteLn(
+			"GXM GS: PCSX2 PSMCT16 dither/quantization path active.");
 	}
 	const u32 primitive = config.indices_per_prim;
 	const u32 max_chunk = (MAX_STAGED_INDICES / primitive) * primitive;
@@ -2662,6 +2767,7 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 			programmable_add_fragment,
 			programmable_add_direct_fragment,
 			programmable_over_fragment,
+			psm16_fragment,
 			source_only_fragment,
 			source_direct_fragment, source_direct_modulate_fragment,
 			source_direct_modulate_af_fragment,
@@ -3307,6 +3413,10 @@ void GSDeviceGXM::Impl::Shutdown()
 	release_fragment(tfx_opaque_program, "release opaque TFX fragment program");
 	release_fragment(tfx_zfloor_source_direct_decal_af_program,
 		"release Z-floor direct DECAL/RGB constant-blend program");
+	release_fragment(tfx_psm16_zfloor_fragment_program,
+		"release PSMCT16 Z-floor TFX fragment program");
+	release_fragment(tfx_psm16_fragment_program,
+		"release PSMCT16 TFX fragment program");
 	release_fragment(tfx_zfloor_fragment_program,
 		"release Z-floor TFX fragment program");
 	release_fragment(tfx_manual_lod_zfloor_fragment_program,
@@ -3345,6 +3455,10 @@ void GSDeviceGXM::Impl::Shutdown()
 		"unregister source-only untextured TFX fragment");
 	unregister(tfx_zfloor_source_direct_decal_af_fragment_id,
 		"unregister Z-floor direct DECAL/RGB (Cs-0)*Af+0 TFX fragment");
+	unregister(tfx_psm16_zfloor_fragment_id,
+		"unregister PSMCT16 Z-floor TFX fragment");
+	unregister(tfx_psm16_fragment_id,
+		"unregister PSMCT16 TFX fragment");
 	unregister(tfx_source_direct_fragment_id,
 		"unregister source-only direct-texture TFX fragment");
 	unregister(tfx_source_direct_modulate_fragment_id,

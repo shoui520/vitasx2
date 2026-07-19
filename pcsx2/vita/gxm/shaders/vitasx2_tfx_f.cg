@@ -235,6 +235,13 @@ __nativecolor __regformat unsigned char4 main(
 	uniform float4 HardwareBlend0,
 	uniform float4 HardwareBlend1,
 	uniform float4 ColorMask
+#if defined(VITASX2_TFX_PSM16)
+	, uniform float4 Selector7
+	, uniform float4 DitherMatrix0
+	, uniform float4 DitherMatrix1
+	, uniform float4 DitherMatrix2
+	, uniform float4 DitherMatrix3
+#endif
 #if defined(VITASX2_TFX_REGION_REPEAT)
 	, uniform float4 RegionMaskFix
 #endif
@@ -396,11 +403,18 @@ __nativecolor __regformat unsigned char4 main(
 #endif
 #endif
 
-	// PCSX2 derives the blend factor from pre-FBA source alpha.
+	// PCSX2 derives the blend factor from pre-FBA/source-format alpha.
 	float4 secondary = float4(color.a / 128.0f);
+#if defined(VITASX2_TFX_PSM16)
+	// PCSX2 tfx_fs.glsl::ps_main: PSMCT16 stores one alpha bit. FBA forces
+	// that bit; otherwise values below 0x80 become zero and the rest 0x80.
+	color.a = Selector1.z > 0.5f ? 128.0f :
+		(color.a >= 128.0f ? 128.0f : 0.0f);
+#else
 #if !defined(VITASX2_TFX_NO_FBA)
 	if (Selector1.z > 0.5f && color.a < 128.0f)
 		color.a += 128.0f;
+#endif
 #endif
 
 #if defined(VITASX2_TFX_SOURCE_ONLY)
@@ -485,6 +499,35 @@ __nativecolor __regformat unsigned char4 main(
 	}
 #endif
 
+#if defined(VITASX2_TFX_PSM16)
+	// PCSX2 tfx_fs.glsl::ps_dither. Selector7 is DITHER,
+	// DITHER_ADJUST, ROUND_INV, and RcpScaleFactor. DITHER=2 addresses DIMX
+	// in native host pixels; DITHER=1 uses the unscaled guest pixel grid.
+	if (Selector7.x > 0.5f && Selector7.x < 2.5f)
+	{
+		float2 ditherPosition = windowPosition.xy;
+		if (Selector7.x < 1.5f)
+			ditherPosition *= Selector7.w;
+		const float2 ditherCell = floor(ditherPosition) -
+			floor(ditherPosition * 0.25f) * 4.0f;
+		const float4 ditherRow = ditherCell.y < 0.5f ? DitherMatrix0 :
+			(ditherCell.y < 1.5f ? DitherMatrix1 :
+			(ditherCell.y < 2.5f ? DitherMatrix2 : DitherMatrix3));
+		float ditherValue = ditherCell.x < 0.5f ? ditherRow.x :
+			(ditherCell.x < 1.5f ? ditherRow.y :
+			(ditherCell.x < 2.5f ? ditherRow.z : ditherRow.w));
+		if (Selector7.y > 0.5f)
+		{
+			const float alpha = Selector3.z > 1.5f ?
+				TextureAlpha.w : secondary.a;
+			ditherValue *= alpha > 0.0f ? min(1.0f / alpha, 1.0f) : 1.0f;
+		}
+		color.rgb += Selector7.z > 0.5f ? -ditherValue : ditherValue;
+	}
+	if (Selector5.z < 0.5f && Selector7.z > 0.5f)
+		color.rgb += 7.0f;
+#endif
+
 #if defined(VITASX2_TFX_NO_COLCLIP)
 	color.rgb = saturate(color.rgb / 255.0f) * 255.0f;
 #else
@@ -492,6 +535,18 @@ __nativecolor __regformat unsigned char4 main(
 		color.rgb = float3((unsigned int3)color.rgb & unsigned int3(255));
 	else
 		color.rgb = saturate(color.rgb / 255.0f) * 255.0f;
+#endif
+
+#if defined(VITASX2_TFX_PSM16)
+	// PCSX2 tfx_fs.glsl::ps_color_clamp_wrap. The low three bits are not
+	// stored by PSMCT16. DITHER=3 is PCSX2's force-32-bit diagnostic mode and
+	// deliberately bypasses the native quantization.
+	if (Selector7.x < 2.5f &&
+		(Selector5.z < 0.5f || Selector7.x > 0.5f))
+	{
+		color.rgb = float3((unsigned int3)floor(color.rgb) &
+			unsigned int3(0xf8));
+	}
 #endif
 
 	// Scaled RT alpha is PCSX2's storage representation: an architectural

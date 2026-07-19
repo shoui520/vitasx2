@@ -1,0 +1,8 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owner: bin/resources/shaders/opengl/tfx_fs.glsl::{ps_dither,
+// ps_color_clamp_wrap,ps_main}. PSMCT16 forces 5-bit RGB and one-bit alpha;
+// the guest DIMX matrix is applied before that quantization.
+#define VITASX2_TFX_PSM16 1
+#include "vitasx2_tfx_f.cg"

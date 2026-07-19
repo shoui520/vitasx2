@@ -1,0 +1,8 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PSMCT16 formatting and PCSX2's post-raster GS Z-floor contract are
+// independent selector axes. Keep their combined path in one offline GXP.
+#define VITASX2_TFX_PSM16 1
+#define VITASX2_TFX_ZFLOOR 1
+#include "vitasx2_tfx_f.cg"
