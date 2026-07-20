@@ -44,10 +44,12 @@ namespace VitaVU
 		u32 local_fmac_pipeline_blocks = 0;
 		u32 local_fmac_pipeline_pairs = 0;
 		u32 canonical_fmac_stall_tests_elided = 0;
+		u32 local_fmac_cycle_snapshot_elision_pairs = 0;
 		u32 resident_pipe_activity_blocks = 0;
 		u32 resident_pipe_activity_pairs = 0;
 		u64 local_fmac_pipeline_entries = 0;
 		u64 local_fmac_pipeline_commits = 0;
+		u64 local_fmac_cycle_snapshot_elisions = 0;
 		u32 local_fmac_producer_snapshot_pairs = 0;
 		u32 local_fmac_clip_snapshot_elisions = 0;
 		u64 local_fmac_producer_snapshot_entries = 0;

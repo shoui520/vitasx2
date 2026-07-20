@@ -85,6 +85,7 @@ u32 g_qemuVuJitLinkedFrameEntries = 0;
 u32 g_qemuVuJitLinkedVectorFrameEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineCommits = 0;
+u32 g_qemuVuJitLocalFmacCycleSnapshotElisions = 0;
 u32 g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagRetirements = 0;
@@ -577,6 +578,7 @@ namespace VitaVU
 			bool add_upper_stalls = false;
 			bool add_lower_stalls = false;
 			bool fmac_pipe = false;
+			bool local_fmac_cycle_snapshot = true;
 			bool test_pipes_fast_guard = false;
 			bool defer_nop_pipe_test = false;
 			bool upper_fmac_stall_test_inline = false;
@@ -688,6 +690,7 @@ namespace VitaVU
 			bool local_fmac_pipeline = false;
 			u32 local_fmac_pipeline_pairs = 0;
 			u32 canonical_fmac_stall_tests_elided = 0;
+			u32 local_fmac_cycle_snapshot_elision_pairs = 0;
 			u32 local_fmac_producer_snapshot_pairs = 0;
 			u32 local_fmac_clip_snapshot_elisions = 0;
 			// PCSX2 microVU owner: microVU_Analyze.inl's mVUregs pipeline
@@ -1349,11 +1352,58 @@ namespace VitaVU
 				block->resident_pipe_activity = block->local_fmac_pipeline;
 				if (block->local_fmac_pipeline)
 				{
+					const auto local_fmac_conflicts = [](const PairPlan& writer,
+						const _VURegsNum& reader) {
+						const u32 upper_reg = writer.add_upper_stalls ? writer.uregs.VFwrite : 0;
+						const u32 upper_mask = writer.add_upper_stalls ? writer.uregs.VFwxyzw : 0;
+						const bool lower_fmac = writer.add_lower_stalls &&
+							writer.lregs.pipe == VUPIPE_FMAC;
+						const u32 lower_reg = lower_fmac ? writer.lregs.VFwrite : 0;
+						const u32 lower_mask = lower_fmac ? writer.lregs.VFwxyzw : 0;
+						const auto overlaps = [](u32 write_reg, u32 write_mask,
+							u32 read_reg, u32 read_mask) {
+							return write_reg != 0 && write_reg == read_reg &&
+								(write_mask & read_mask) != 0;
+						};
+						return overlaps(upper_reg, upper_mask, reader.VFread0,
+								reader.VFr0xyzw) ||
+							overlaps(upper_reg, upper_mask, reader.VFread1,
+								reader.VFr1xyzw) ||
+							overlaps(lower_reg, lower_mask, reader.VFread0,
+								reader.VFr0xyzw) ||
+							overlaps(lower_reg, lower_mask, reader.VFread1,
+								reader.VFr1xyzw);
+					};
 					for (u32 i = LOCAL_FMAC_WARMUP_PAIRS; i < block->pair_count; i++)
 					{
-						const PairPlan& pair = block->pairs[i];
+						PairPlan& pair = block->pairs[i];
 						if (!pair.fmac_pipe)
 							continue;
+						// PCSX2 microVU owner: microVU_Analyze.inl::analyzeReg1()
+						// and microVU_Compile.inl::mVUsetCycles(). A compiler-owned
+						// FMAC issue time is observable only by a VF read during the
+						// remaining three-cycle hazard window, or when the entry must be
+						// reconstructed at a block seam. A read four pairs later is
+						// already at the fixed S-stage visibility point even if an older
+						// pipe introduced additional stalls.
+						bool needs_cycle_snapshot =
+							i + FMAC_PIPELINE_LATENCY_CYCLES >= block->pair_count;
+						const u32 hazard_end = std::min(block->pair_count,
+							i + FMAC_PIPELINE_LATENCY_CYCLES);
+						for (u32 reader_index = i + 1;
+							!needs_cycle_snapshot && reader_index < hazard_end;
+							reader_index++)
+						{
+							const PairPlan& reader = block->pairs[reader_index];
+							needs_cycle_snapshot =
+								(reader.test_upper_stalls &&
+									local_fmac_conflicts(pair, reader.uregs)) ||
+								(reader.test_lower_stalls &&
+									local_fmac_conflicts(pair, reader.lregs));
+						}
+						pair.local_fmac_cycle_snapshot = needs_cycle_snapshot;
+						block->local_fmac_cycle_snapshot_elision_pairs +=
+							needs_cycle_snapshot ? 0u : 1u;
 						block->local_fmac_pipeline_pairs++;
 						block->local_fmac_producer_snapshot_pairs +=
 							CanSnapshotLocalFmacFlagsAtProducer(pair) ? 1u : 0u;
@@ -2312,6 +2362,16 @@ namespace VitaVU
 					 !m_code.EmitLdrImm12(1, 0, 0) ||
 					 !m_code.EmitAddImm8(1, 1,
 						 static_cast<u8>(m_plan.local_fmac_producer_snapshot_pairs)) ||
+					 !m_code.EmitStrImm12(1, 0, 0)))
+				{
+					return false;
+				}
+				if (m_plan.local_fmac_cycle_snapshot_elision_pairs != 0 &&
+					(!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitLocalFmacCycleSnapshotElisions))) ||
+					 !m_code.EmitLdrImm12(1, 0, 0) ||
+					 !m_code.EmitAddImm8(1, 1,
+						 static_cast<u8>(m_plan.local_fmac_cycle_snapshot_elision_pairs)) ||
 					 !m_code.EmitStrImm12(1, 0, 0)))
 				{
 					return false;
@@ -8577,15 +8637,19 @@ namespace VitaVU
 					(regs.VFread0 != 0 || regs.VFread1 != 0);
 			}
 
-			bool EmitLocalFmacStallTest(const _VURegsNum& regs)
+			bool EmitLocalFmacStallTest(u32 pair_index, const _VURegsNum& regs)
 			{
 				if (!m_plan.local_fmac_pipeline || (regs.VFread0 == 0 && regs.VFread1 == 0))
 					return true;
 
 				for (const LocalFmacEntry& entry : m_local_fmac_entries)
 				{
-					if (!entry.active || !LocalFmacConflicts(entry, regs))
+					if (!entry.active ||
+						entry.pair_index + FMAC_PIPELINE_LATENCY_CYCLES <= pair_index ||
+						!LocalFmacConflicts(entry, regs))
 						continue;
+					if (!m_pairs[entry.pair_index].local_fmac_cycle_snapshot)
+						return false;
 
 					const u8 offset = static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET));
 					if (!m_code.EmitLdrImm12(0, SP, offset) ||
@@ -8720,9 +8784,14 @@ namespace VitaVU
 				if (entry->active || entry->pair_index != pair_index)
 					return false;
 				entry->active = true;
-				const u8 cycle_offset = static_cast<u8>(LocalFmacOffset(*entry, LOCAL_FMAC_CYCLE_OFFSET));
-				bool emitted = EmitLoadCurrentCycleLow(0) &&
-					m_code.EmitStrImm12(0, SP, cycle_offset);
+				bool emitted = true;
+				if (plan.local_fmac_cycle_snapshot)
+				{
+					const u8 cycle_offset = static_cast<u8>(
+						LocalFmacOffset(*entry, LOCAL_FMAC_CYCLE_OFFSET));
+					emitted = EmitLoadCurrentCycleLow(0) &&
+						m_code.EmitStrImm12(0, SP, cycle_offset);
+				}
 				if (emitted && !entry->producer_flags_captured)
 				{
 					emitted = EmitLoadWorkingFmacMacStatus(0, 1) &&
@@ -8839,7 +8908,8 @@ namespace VitaVU
 					// Entries made ready early by an FDIV/EFU/IALU or dependency
 					// stall publish here; younger entries retain their exact sCycle
 					// and are compacted into PCSX2's canonical circular queue.
-					if (!m_code.EmitLdrImm12(0, SP,
+					if (!m_pairs[entry.pair_index].local_fmac_cycle_snapshot ||
+						!m_code.EmitLdrImm12(0, SP,
 							LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET)) ||
 						!m_code.EmitAddImm8(0, 0, FMAC_PIPELINE_LATENCY_CYCLES) ||
 						!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
@@ -9277,9 +9347,9 @@ namespace VitaVU
 				{
 					return false;
 				}
-				if (plan.test_upper_stalls && !EmitLocalFmacStallTest(plan.uregs))
+				if (plan.test_upper_stalls && !EmitLocalFmacStallTest(pair_index, plan.uregs))
 					return false;
-				if (plan.test_lower_stalls && !EmitLocalFmacStallTest(plan.lregs))
+				if (plan.test_lower_stalls && !EmitLocalFmacStallTest(pair_index, plan.lregs))
 					return false;
 				if (plan.test_lower_stalls && !elide_lower_canonical_fmac &&
 					plan.lower_fmac_stall_test_inline)
@@ -10375,6 +10445,8 @@ namespace VitaVU
 								plan.local_fmac_pipeline_pairs;
 							s_vu1.stats.canonical_fmac_stall_tests_elided +=
 								plan.canonical_fmac_stall_tests_elided;
+							s_vu1.stats.local_fmac_cycle_snapshot_elision_pairs +=
+								plan.local_fmac_cycle_snapshot_elision_pairs;
 							s_vu1.stats.local_fmac_producer_snapshot_pairs +=
 								plan.local_fmac_producer_snapshot_pairs;
 							s_vu1.stats.local_fmac_clip_snapshot_elisions +=
@@ -11311,6 +11383,8 @@ namespace VitaVU
 			static_cast<u64>(g_qemuVuJitLinkedVectorFrameEntries) * 32;
 		stats.local_fmac_pipeline_entries = g_qemuVuJitLocalFmacPipelineEntries;
 		stats.local_fmac_pipeline_commits = g_qemuVuJitLocalFmacPipelineCommits;
+		stats.local_fmac_cycle_snapshot_elisions =
+			g_qemuVuJitLocalFmacCycleSnapshotElisions;
 		stats.local_fmac_producer_snapshot_entries =
 			g_qemuVuJitLocalFmacProducerSnapshotEntries;
 		stats.deferred_fmac_flag_entries = g_qemuVuJitDeferredFmacFlagEntries;
@@ -11376,6 +11450,7 @@ namespace VitaVU
 		g_qemuVuJitLinkedVectorFrameEntries = 0;
 		g_qemuVuJitLocalFmacPipelineEntries = 0;
 		g_qemuVuJitLocalFmacPipelineCommits = 0;
+		g_qemuVuJitLocalFmacCycleSnapshotElisions = 0;
 		g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 		g_qemuVuJitDeferredFmacFlagEntries = 0;
 		g_qemuVuJitDeferredFmacFlagRetirements = 0;
