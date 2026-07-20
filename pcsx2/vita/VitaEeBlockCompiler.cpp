@@ -16241,9 +16241,7 @@ namespace VitaEE
 			if (!m_code.EmitVandQ(NQ_EXPV, vq, NQ_EXP) ||
 				!m_code.EmitVandQ(NQ_SIGNV, vq, NQ_SIGN) ||
 				!m_code.EmitVceqI32Q(NQ_MASK, NQ_EXPV, NQ_ZERO) ||
-				!m_code.EmitVeorQ(NQ_TMP, NQ_SIGNV, vq) ||
-				!m_code.EmitVandQ(NQ_TMP, NQ_TMP, NQ_MASK) ||
-				!m_code.EmitVeorQ(vq, vq, NQ_TMP))
+				!m_code.EmitVbitQ(vq, NQ_SIGNV, NQ_MASK))
 			{
 				return false;
 			}
@@ -16251,9 +16249,7 @@ namespace VitaEE
 				return true;
 			return m_code.EmitVceqI32Q(NQ_MASK, NQ_EXPV, NQ_EXP) &&
 				   m_code.EmitVorrQ(NQ_TMP, NQ_SIGNV, NQ_MAXF) &&
-				   m_code.EmitVeorQ(NQ_TMP, NQ_TMP, vq) &&
-				   m_code.EmitVandQ(NQ_TMP, NQ_TMP, NQ_MASK) &&
-				   m_code.EmitVeorQ(vq, vq, NQ_TMP);
+				   m_code.EmitVbitQ(vq, NQ_TMP, NQ_MASK);
 		};
 
 		// The TriAce add hack does a per-lane exponent compare that resists

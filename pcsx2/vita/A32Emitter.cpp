@@ -175,6 +175,8 @@ namespace VitaA32
 		constexpr u32 VUZP_I32_Q = 0xf3ba0140u;
 		constexpr u32 VEXT_I8_Q = 0xf2b00040u;
 		constexpr u32 VAND_Q = 0xf2000150u;
+		// ARM ARM A8.6.279, VBIT Qd,Qn,Qm (op=0b10, Q=1).
+		constexpr u32 VBIT_Q = 0xf3200150u;
 		constexpr u32 VEOR_Q = 0xf3000150u;
 		constexpr u32 VEOR_D = 0xf3000110u;
 		constexpr u32 VORR_Q = 0xf2200150u;
@@ -2038,6 +2040,13 @@ namespace VitaA32
 		return EmitU32(EncodeVandQ(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
+	bool CodeBuffer::EmitVbitQ(unsigned qd, unsigned qn, unsigned qm)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
+			return false;
+		return EmitU32(EncodeVbitQ(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
+	}
+
 	bool CodeBuffer::EmitVeorQ(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
@@ -3796,6 +3805,14 @@ namespace VitaA32
 		pxAssert(IsQRegister(qn));
 		pxAssert(IsQRegister(qm));
 		return VAND_Q | NeonQd(qd) | NeonQn(qn) | NeonQm(qm);
+	}
+
+	u32 EncodeVbitQ(unsigned qd, unsigned qn, unsigned qm)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qn));
+		pxAssert(IsQRegister(qm));
+		return VBIT_Q | NeonQd(qd) | NeonQn(qn) | NeonQm(qm);
 	}
 
 	u32 EncodeVeorQ(unsigned qd, unsigned qn, unsigned qm)

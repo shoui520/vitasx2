@@ -282,6 +282,7 @@ namespace VitaA32
 		bool EmitVuzpI32Q(unsigned qd, unsigned qm);
 		bool EmitVextI8Q(unsigned qd, unsigned qn, unsigned qm, u8 byte_offset);
 		bool EmitVandQ(unsigned qd, unsigned qn, unsigned qm);
+		bool EmitVbitQ(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVeorQ(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVeorD(unsigned dd, unsigned dn, unsigned dm);
 		bool EmitVorrQ(unsigned qd, unsigned qn, unsigned qm);
@@ -519,6 +520,7 @@ namespace VitaA32
 	u32 EncodeVuzpI32Q(unsigned qd, unsigned qm);
 	u32 EncodeVextI8Q(unsigned qd, unsigned qn, unsigned qm, u8 byte_offset);
 	u32 EncodeVandQ(unsigned qd, unsigned qn, unsigned qm);
+	u32 EncodeVbitQ(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVeorQ(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVeorD(unsigned dd, unsigned dn, unsigned dm);
 	u32 EncodeVorrQ(unsigned qd, unsigned qn, unsigned qm);

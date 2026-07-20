@@ -6471,17 +6471,15 @@ namespace VitaVU
 			// PCSX2 owner: VUops.cpp::vuDouble() / VUmicroFast.h::VuDouble().
 			// Denormals (exponent 0) flush to signed zero; with the VU overflow
 			// clamp enabled, infinities/NaNs (exponent 0xff) become signed max
-			// finite. Both cases use the branchless bit-select
-			// v ^= (candidate ^ v) & lane_mask, so every lane is bit-identical to
-			// the scalar per-word path without branches or ARM<->NEON transfers.
+			// finite. ARM ARM A8.6.279 VBIT performs the exact branchless select
+			// v = (candidate & lane_mask) | (v & ~lane_mask) in one instruction,
+			// keeping every lane bit-identical without ARM<->NEON transfers.
 			bool EmitNormalizeVuFloatQuadInPlace(unsigned vq, bool overflow_clamp)
 			{
 				if (!m_code.EmitVandQ(VU_NORM_EXPV_Q, vq, VU_NORM_EXP_Q) ||
 					!m_code.EmitVandQ(VU_NORM_SIGNV_Q, vq, VU_NORM_SIGN_Q) ||
 					!m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_ZERO_Q) ||
-					!m_code.EmitVeorQ(VU_NORM_TMP_Q, VU_NORM_SIGNV_Q, vq) ||
-					!m_code.EmitVandQ(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_MASK_Q) ||
-					!m_code.EmitVeorQ(vq, vq, VU_NORM_TMP_Q))
+					!m_code.EmitVbitQ(vq, VU_NORM_SIGNV_Q, VU_NORM_MASK_Q))
 				{
 					return false;
 				}
@@ -6491,9 +6489,7 @@ namespace VitaVU
 
 				return m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q) &&
 					m_code.EmitVorrQ(VU_NORM_TMP_Q, VU_NORM_SIGNV_Q, VU_NORM_MAXF_Q) &&
-					m_code.EmitVeorQ(VU_NORM_TMP_Q, VU_NORM_TMP_Q, vq) &&
-					m_code.EmitVandQ(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_MASK_Q) &&
-					m_code.EmitVeorQ(vq, vq, VU_NORM_TMP_Q);
+					m_code.EmitVbitQ(vq, VU_NORM_TMP_Q, VU_NORM_MASK_Q);
 			}
 
 			// Normalizes the two FMAC operand quads with vuDouble() semantics.
@@ -6544,9 +6540,9 @@ namespace VitaVU
 			void RecordNormalizedOperandBypass(bool overflow_clamp)
 			{
 				m_normalized_operand_quad_bypasses++;
-				// EmitNormalizeVuFloatQuadInPlace() is six NEON instructions for
-				// signed-denormal flushing plus five for overflow clamping.
-				m_normalization_instructions_removed += overflow_clamp ? 11 : 6;
+				// EmitNormalizeVuFloatQuadInPlace() is four NEON instructions for
+				// signed-denormal flushing plus three for overflow clamping.
+				m_normalization_instructions_removed += overflow_clamp ? 7 : 4;
 			}
 
 			bool EmitNormalizeKnownQuad(unsigned vq, bool already_normalized,
