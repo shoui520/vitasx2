@@ -598,6 +598,9 @@ namespace VitaVU
 			bool lower_efu_stall_test_inline = false;
 			bool lower_branch_stall_test_inline = false;
 			bool lower_stall_inline = false;
+			// PCSX2 microVU owner: microVU_IR.h::microRegInfo::backupVI.
+			// True only when this exact lower opcode calls VUops.cpp::_vuBackupVI().
+			bool vi_backup_write = false;
 			// Tail work windows.
 			bool branch_tail = false;
 			bool resolves_branch = false;
@@ -660,6 +663,8 @@ namespace VitaVU
 			u32 lower_efu_stall_test_inline_pairs = 0;
 			u32 lower_branch_stall_test_inline_pairs = 0;
 			u32 lower_stall_inline_pairs = 0;
+			u32 vi_backup_update_elided_pairs = 0;
+			u32 vi_backup_zero_store_pairs = 0;
 			u32 dt_flag_inline_pairs = 0;
 			bool resident_cycle = false;
 			// PCSX2 microVU owner: microVU_IR.h::microRegInfo plus
@@ -752,6 +757,36 @@ namespace VitaVU
 				case VUInterpFast::LowerFastKind::B:
 				case VUInterpFast::LowerFastKind::BAL:
 					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool LowerWritesViBackup(u32 code, VUInterpFast::LowerFastKind kind)
+		{
+			// PCSX2 owner: VUops.cpp lower integer, MTIR, and post-indexed LSU
+			// bodies. ILW/ILWR deliberately do not create the two-cycle branch
+			// visibility window; LQI/LQD/SQI/SQD call _vuBackupVI() even for VI0.
+			switch (kind)
+			{
+				case VUInterpFast::LowerFastKind::IADDIU:
+				case VUInterpFast::LowerFastKind::ISUBIU:
+				case VUInterpFast::LowerFastKind::IADDI:
+				case VUInterpFast::LowerFastKind::MTIR:
+					return VUInterpFast::It(code) != 0;
+
+				case VUInterpFast::LowerFastKind::IADD:
+				case VUInterpFast::LowerFastKind::ISUB:
+				case VUInterpFast::LowerFastKind::IAND:
+				case VUInterpFast::LowerFastKind::IOR:
+					return VUInterpFast::Id(code) != 0;
+
+				case VUInterpFast::LowerFastKind::LQI:
+				case VUInterpFast::LowerFastKind::LQD:
+				case VUInterpFast::LowerFastKind::SQI:
+				case VUInterpFast::LowerFastKind::SQD:
+					return true;
+
 				default:
 					return false;
 			}
@@ -901,6 +936,8 @@ namespace VitaVU
 				IsInlineLowerEfuKind(static_cast<VUInterpFast::LowerFastKind>(plan->lower_kind));
 			plan->lower_xgkick_inline = plan->exec_lower &&
 				IsInlineLowerXgkickKind(static_cast<VUInterpFast::LowerFastKind>(plan->lower_kind));
+			plan->vi_backup_write = plan->exec_lower && LowerWritesViBackup(plan->lower,
+				static_cast<VUInterpFast::LowerFastKind>(plan->lower_kind));
 
 			// Stall-helper selection, PCSX2 owner: VUops.cpp. The switch arms
 			// are pure functions of the compile-time _VURegsNum:
@@ -1028,6 +1065,8 @@ namespace VitaVU
 			block->lower_efu_stall_test_inline_pairs = 0;
 			block->lower_branch_stall_test_inline_pairs = 0;
 			block->lower_stall_inline_pairs = 0;
+			block->vi_backup_update_elided_pairs = 0;
+			block->vi_backup_zero_store_pairs = 0;
 			block->dt_flag_inline_pairs = 0;
 			block->resident_cycle = false;
 			block->direct_link_tail = false;
@@ -1161,6 +1200,22 @@ namespace VitaVU
 
 			if (block->pair_count == 0)
 				return false;
+
+			// _vuBackupVI() installs exactly a two-cycle visibility window and
+			// every admitted pair advances at least one cycle before this update.
+			// Consequently a writer two pairs back is unconditionally expired here,
+			// while a pair with no writer in either preceding slot is already zero.
+			// This is the first block-state reduction owned by PCSX2 microVU's
+			// compile-time `viBackUp` model; it is independent of runtime stall size.
+			for (u32 i = 2; i < block->pair_count; i++)
+			{
+				if (block->pairs[i - 1].vi_backup_write)
+					continue;
+				if (block->pairs[i - 2].vi_backup_write)
+					block->vi_backup_zero_store_pairs++;
+				else
+					block->vi_backup_update_elided_pairs++;
+			}
 
 			// PCSX2 microVU advances compile-time pipe state through unobservable
 			// scheduling slots instead of publishing every intermediate cycle. Keep
@@ -8518,9 +8573,26 @@ namespace VitaVU
 			// PCSX2 owner: the per-step `VU->VIBackupCycles -=
 			// std::min((u8)(VU1.cycle - cyclesBeforeOp), VU->VIBackupCycles)`
 			// update, where cyclesBeforeOp is the pre-stall cycle minus one.
-			bool EmitViBackupUpdate()
+			bool EmitViBackupUpdate(u32 pair_index)
 			{
 				const u16 backup = VuOffset(offsetof(VURegs, VIBackupCycles));
+				if (pair_index >= 2 && !m_pairs[pair_index - 1].vi_backup_write)
+				{
+					if (!m_pairs[pair_index - 2].vi_backup_write)
+					{
+						// No writer exists inside the only two preceding visibility
+						// slots. Any entry-state backup has expired, so canonical state
+						// is already zero and there is no work to emit.
+						return true;
+					}
+
+					// The writer two pairs back installed 2. The intervening pair
+					// advanced at least one cycle and this pair has already advanced
+					// another, so the exact result is zero even if either pair stalled.
+					return m_code.EmitMovImm8(0, 0) &&
+						m_code.EmitStrbImm12(0, HOST_VU, backup);
+				}
+
 				if (!m_code.EmitLdrbImm12(0, HOST_VU, backup) ||
 					!m_code.EmitCmpImm32(0, 0))
 				{
@@ -8735,7 +8807,7 @@ namespace VitaVU
 				if (!EmitRetireLocalFmacEntries(pair_index))
 					return false;
 
-				if (!EmitViBackupUpdate())
+				if (!EmitViBackupUpdate(pair_index))
 					return false;
 
 				// Hazard backup of the upper target the lower op reads.
@@ -9841,6 +9913,10 @@ namespace VitaVU
 						s_vu1.stats.lower_efu_stall_test_inline_pairs += plan.lower_efu_stall_test_inline_pairs;
 						s_vu1.stats.lower_branch_stall_test_inline_pairs += plan.lower_branch_stall_test_inline_pairs;
 						s_vu1.stats.lower_stall_inline_pairs += plan.lower_stall_inline_pairs;
+						s_vu1.stats.vi_backup_update_elided_pairs +=
+							plan.vi_backup_update_elided_pairs;
+						s_vu1.stats.vi_backup_zero_store_pairs +=
+							plan.vi_backup_zero_store_pairs;
 						s_vu1.stats.dt_flag_inline_pairs += plan.dt_flag_inline_pairs;
 						if (plan.resident_cycle)
 						{
@@ -10029,6 +10105,10 @@ namespace VitaVU
 						s_vu0.stats.lower_efu_stall_test_inline_pairs += plan.lower_efu_stall_test_inline_pairs;
 						s_vu0.stats.lower_branch_stall_test_inline_pairs += plan.lower_branch_stall_test_inline_pairs;
 						s_vu0.stats.lower_stall_inline_pairs += plan.lower_stall_inline_pairs;
+						s_vu0.stats.vi_backup_update_elided_pairs +=
+							plan.vi_backup_update_elided_pairs;
+						s_vu0.stats.vi_backup_zero_store_pairs +=
+							plan.vi_backup_zero_store_pairs;
 						s_vu0.stats.dt_flag_inline_pairs += plan.dt_flag_inline_pairs;
 						if (plan.resident_cycle)
 						{

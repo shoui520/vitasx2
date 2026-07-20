@@ -80,6 +80,8 @@ namespace VitaVU
 		u32 lower_efu_stall_test_inline_pairs = 0;
 		u32 lower_branch_stall_test_inline_pairs = 0;
 		u32 lower_stall_inline_pairs = 0;
+		u32 vi_backup_update_elided_pairs = 0;
+		u32 vi_backup_zero_store_pairs = 0;
 		u32 dt_flag_inline_pairs = 0;
 		u32 branch_continuation_blocks = 0;
 		u32 branch_continuation_pairs = 0;
