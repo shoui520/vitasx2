@@ -43,6 +43,7 @@ u32 g_qemuVuJitEbitFinishInlineOps = 0;
 u32 g_qemuVuJitTestPipesFastSkips = 0;
 u32 g_qemuVuJitTestPipesIaluFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesFmacFlushInlineOps = 0;
+u32 g_qemuVuJitResidentFmacQueueRetirements = 0;
 u32 g_qemuVuJitTestPipesFdivFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesEfuFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesXgkickTransferInlineOps = 0;
@@ -2329,9 +2330,19 @@ namespace VitaVU
 						m_code.EmitStrImm12(1, 0, 0);
 				}
 
-				bool EmitQemuTestPipesFmacFlushInlineCounter()
+				bool EmitQemuTestPipesFmacFlushInlineCounter(bool resident_queue)
 				{
-					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitTestPipesFmacFlushInlineOps))) &&
+					if (!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitTestPipesFmacFlushInlineOps))) ||
+						!m_code.EmitLdrImm12(1, 0, 0) ||
+						!m_code.EmitAddImm8(1, 1, 1) ||
+						!m_code.EmitStrImm12(1, 0, 0))
+					{
+						return false;
+					}
+					if (!resident_queue)
+						return true;
+					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitResidentFmacQueueRetirements))) &&
 						m_code.EmitLdrImm12(1, 0, 0) &&
 						m_code.EmitAddImm8(1, 1, 1) &&
 						m_code.EmitStrImm12(1, 0, 0);
@@ -2615,7 +2626,7 @@ namespace VitaVU
 			}
 #endif
 
-			bool EmitInlineTestPipesFmacFlush(bool full_queue_fast_path,
+			bool EmitInlineTestPipesFmacFlush(bool shared_thunk,
 				bool deferred_fmac_flags)
 			{
 				// PCSX2 owner: VUops.cpp::_vuFMACflush(). Publish all ready
@@ -2631,11 +2642,16 @@ namespace VitaVU
 				constexpr unsigned HOST_PTR = 1;
 				constexpr unsigned HOST_TEMP = 2;
 				constexpr unsigned HOST_VALUE = 3;
-				constexpr unsigned HOST_COUNT = HOST_CALL_SCRATCH;
+				constexpr unsigned HOST_MASK_SCRATCH = HOST_CALL_SCRATCH;
+				// A shared thunk has already preserved LR in r10, leaving r14 as a
+				// private loop register. PCSX2's _vuFMACflush() keeps fmaccount and
+				// its queue iterator in local variables; retain the same state here
+				// instead of reloading both VURegs words after every retired entry.
+				const unsigned host_count = shared_thunk ? 14 : HOST_CALL_SCRATCH;
 
 				const size_t loop_start = m_code.Size();
-				if (!m_code.EmitLdrImm12(HOST_COUNT, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
-					!m_code.EmitCmpImm32(HOST_COUNT, 0))
+				if (!m_code.EmitLdrImm12(host_count, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
+					!m_code.EmitCmpImm32(host_count, 0))
 				{
 					return false;
 				}
@@ -2650,11 +2666,12 @@ namespace VitaVU
 				{
 					return false;
 				}
+				const size_t resident_loop_start = m_code.Size();
 
 				size_t ready_full = static_cast<size_t>(-1);
-				if (full_queue_fast_path)
+				if (shared_thunk)
 				{
-					if (!m_code.EmitCmpImm32(HOST_COUNT, 4))
+					if (!m_code.EmitCmpImm32(host_count, 4))
 						return false;
 					ready_full = m_code.EmitBranchPlaceholder(Condition::EQ);
 					if (ready_full == static_cast<size_t>(-1))
@@ -2709,11 +2726,11 @@ namespace VitaVU
 				const unsigned status_reg = deferred_fmac_flags ? HOST_LIMIT_LO : HOST_VALUE;
 				if ((!deferred_fmac_flags &&
 						!m_code.EmitLdrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))) ||
-					!EmitAndRegImm32(status_reg, status_reg, 0x30u, HOST_COUNT) ||
+					!EmitAndRegImm32(status_reg, status_reg, 0x30u, HOST_MASK_SCRATCH) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, statusflag)) ||
-					!EmitAndRegImm32(HOST_INDEX, HOST_TEMP, 0x0fc0u, HOST_COUNT) ||
+					!EmitAndRegImm32(HOST_INDEX, HOST_TEMP, 0x0fc0u, HOST_MASK_SCRATCH) ||
 					!m_code.EmitOrrReg(status_reg, status_reg, HOST_INDEX) ||
-					!EmitAndRegImm32(HOST_INDEX, HOST_TEMP, 0x0fu, HOST_COUNT) ||
+					!EmitAndRegImm32(HOST_INDEX, HOST_TEMP, 0x0fu, HOST_MASK_SCRATCH) ||
 					!m_code.EmitOrrReg(status_reg, status_reg, HOST_INDEX) ||
 					(!deferred_fmac_flags &&
 						!m_code.EmitStrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))))
@@ -2728,9 +2745,9 @@ namespace VitaVU
 				if (!m_code.PatchBranch(no_sticky_status, no_sticky_target, Condition::EQ) ||
 					(!deferred_fmac_flags &&
 						!m_code.EmitLdrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))) ||
-					!EmitAndRegImm32(status_reg, status_reg, 0x0ff0u, HOST_COUNT) ||
+					!EmitAndRegImm32(status_reg, status_reg, 0x0ff0u, HOST_MASK_SCRATCH) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, statusflag)) ||
-					!EmitAndRegImm32(HOST_INDEX, HOST_TEMP, 0x0fu, HOST_COUNT) ||
+					!EmitAndRegImm32(HOST_INDEX, HOST_TEMP, 0x0fu, HOST_MASK_SCRATCH) ||
 					!m_code.EmitOrrReg(status_reg, status_reg, HOST_INDEX) ||
 					!m_code.EmitOrrRegShiftImm(status_reg, status_reg, HOST_INDEX, ShiftType::LSL, 6) ||
 					(!deferred_fmac_flags &&
@@ -2748,29 +2765,72 @@ namespace VitaVU
 					!m_code.EmitLdrImm12(HOST_INDEX, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
 					!m_code.EmitAddImm8(HOST_INDEX, HOST_INDEX, 1) ||
 					!m_code.EmitAndImm32(HOST_INDEX, HOST_INDEX, 3) ||
-					!m_code.EmitStrImm12(HOST_INDEX, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
-					!m_code.EmitLdrImm12(HOST_COUNT, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
-					!m_code.EmitSubImm8(HOST_COUNT, HOST_COUNT, 1) ||
-					!m_code.EmitStrImm12(HOST_COUNT, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))))
+					!m_code.EmitStrImm12(HOST_INDEX, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))))
+				{
+					return false;
+				}
+				if (shared_thunk)
+				{
+					if (!m_code.EmitSubImm8(host_count, host_count, 1) ||
+						!m_code.EmitStrImm12(host_count, HOST_VU,
+							VuOffset(offsetof(VURegs, fmaccount))))
+					{
+						return false;
+					}
+				}
+				else if (!m_code.EmitLdrImm12(host_count, HOST_VU,
+						VuOffset(offsetof(VURegs, fmaccount))) ||
+					!m_code.EmitSubImm8(host_count, host_count, 1) ||
+					!m_code.EmitStrImm12(host_count, HOST_VU,
+						VuOffset(offsetof(VURegs, fmaccount))))
 				{
 					return false;
 				}
 
 #if defined(VITASX2_QEMU_VALIDATION)
-				if (!EmitQemuTestPipesFmacFlushInlineCounter())
+				if (!EmitQemuTestPipesFmacFlushInlineCounter(shared_thunk))
 					return false;
+				// The validation-only counter uses r0/r1. Restore the resident
+				// iterator needed by the shared-thunk loop; product code emits
+				// neither the counter nor this diagnostic reload.
+				if (shared_thunk &&
+					!m_code.EmitLdrImm12(HOST_INDEX, HOST_VU,
+						VuOffset(offsetof(VURegs, fmacreadpos))))
+				{
+					return false;
+				}
 #endif
+
+				size_t done_after_retire = static_cast<size_t>(-1);
+				if (shared_thunk)
+				{
+					if (!m_code.EmitCmpImm32(host_count, 0))
+						return false;
+					done_after_retire = m_code.EmitBranchPlaceholder(Condition::EQ);
+					if (done_after_retire == static_cast<size_t>(-1) ||
+						!m_code.EmitAddImm32(HOST_PTR, HOST_VU, offsetof(VURegs, fmac)) ||
+						!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_INDEX,
+							ShiftType::LSL, 5) ||
+						!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_INDEX,
+							ShiftType::LSL, 4))
+					{
+						return false;
+					}
+				}
 
 				const size_t loop_jump = m_code.EmitBranchPlaceholder();
 				if (loop_jump == static_cast<size_t>(-1) ||
-					!m_code.PatchBranch(loop_jump, loop_start))
+					!m_code.PatchBranch(loop_jump,
+						shared_thunk ? resident_loop_start : loop_start))
 				{
 					return false;
 				}
 
 				const size_t done_target = m_code.Size();
 				return m_code.PatchBranch(done_empty, done_target, Condition::EQ) &&
-					m_code.PatchBranch(done_not_ready, done_target, Condition::CC);
+					m_code.PatchBranch(done_not_ready, done_target, Condition::CC) &&
+					(done_after_retire == static_cast<size_t>(-1) ||
+						m_code.PatchBranch(done_after_retire, done_target, Condition::EQ));
 			}
 
 				bool EmitInlineTestPipesFdivFlush(bool deferred_fmac_flags)
