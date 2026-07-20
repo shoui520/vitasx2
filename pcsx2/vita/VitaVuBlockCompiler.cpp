@@ -44,6 +44,8 @@ u32 g_qemuVuJitTestPipesFastSkips = 0;
 u32 g_qemuVuJitTestPipesIaluFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesFmacFlushInlineOps = 0;
 u32 g_qemuVuJitResidentFmacQueueRetirements = 0;
+u32 g_qemuVuJitResidentPipeAggregateRefreshes = 0;
+u32 g_qemuVuJitResidentPipeAggregateXgkickCalls = 0;
 u32 g_qemuVuJitTestPipesFdivFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesEfuFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesXgkickTransferInlineOps = 0;
@@ -2322,6 +2324,24 @@ namespace VitaVU
 						m_code.EmitStrImm12(1, 0, 0);
 				}
 
+				bool EmitQemuResidentPipeAggregateRefreshCounter()
+				{
+					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitResidentPipeAggregateRefreshes))) &&
+						m_code.EmitLdrImm12(1, 0, 0) &&
+						m_code.EmitAddImm8(1, 1, 1) &&
+						m_code.EmitStrImm12(1, 0, 0);
+				}
+
+				bool EmitQemuResidentPipeAggregateXgkickCounter()
+				{
+					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitResidentPipeAggregateXgkickCalls))) &&
+						m_code.EmitLdrImm12(1, 0, 0) &&
+						m_code.EmitAddImm8(1, 1, 1) &&
+						m_code.EmitStrImm12(1, 0, 0);
+				}
+
 				bool EmitQemuTestPipesIaluFlushInlineCounter()
 				{
 					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitTestPipesIaluFlushInlineOps))) &&
@@ -2643,11 +2663,14 @@ namespace VitaVU
 				constexpr unsigned HOST_TEMP = 2;
 				constexpr unsigned HOST_VALUE = 3;
 				constexpr unsigned HOST_MASK_SCRATCH = HOST_CALL_SCRATCH;
-				// A shared thunk has already preserved LR in r10, leaving r14 as a
-				// private loop register. PCSX2's _vuFMACflush() keeps fmaccount and
-				// its queue iterator in local variables; retain the same state here
-				// instead of reloading both VURegs words after every retired entry.
-				const unsigned host_count = shared_thunk ? 14 : HOST_CALL_SCRATCH;
+				// PCSX2's _vuFMACflush() keeps fmaccount and its queue iterator in
+				// local variables. A normal shared thunk preserves LR in r10 and uses
+				// r14 for the count. A resident-activity thunk leaves LR in r14 and
+				// uses callee-saved r10 for both the count and the aggregate returned
+				// by the other pipe publishers.
+				const unsigned host_count = shared_thunk ?
+					(UsesResidentPipeActivity() ? HOST_STALL_SCRATCH : 14) :
+					HOST_CALL_SCRATCH;
 
 				const size_t loop_start = m_code.Size();
 				if (!m_code.EmitLdrImm12(host_count, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
@@ -2871,13 +2894,15 @@ namespace VitaVU
 				if (!m_code.PatchBranch(ready_high, ready_target, Condition::NE) ||
 					!m_code.EmitMovImm8(0, 0) ||
 					!m_code.EmitStrImm12(0, HOST_VU, VuOffset(base + offsetof(fdivPipe, enable))) ||
-					!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(base + offsetof(fdivPipe, reg))) ||
-					!m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_Q)))
+					!m_code.EmitLdrImm12(1, HOST_VU, VuOffset(base + offsetof(fdivPipe, reg))) ||
+					!m_code.EmitStrImm12(1, HOST_VU, ViOffset(REG_Q)))
 				{
 					return false;
 				}
 
-				const unsigned status_reg = deferred_fmac_flags ? HOST_LIMIT_LO : 0;
+				// Keep r0 equal to the exact post-publisher enable value for the
+				// resident aggregate. r2 is dead after the latency comparison.
+				const unsigned status_reg = deferred_fmac_flags ? HOST_LIMIT_LO : 2;
 				if ((!deferred_fmac_flags &&
 						!m_code.EmitLdrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))) ||
 					!EmitAndRegImm32(status_reg, status_reg, 0x0fcfu, HOST_CALL_SCRATCH) ||
@@ -2937,8 +2962,8 @@ namespace VitaVU
 				if (!m_code.PatchBranch(ready_high, ready_target, Condition::NE) ||
 					!m_code.EmitMovImm8(0, 0) ||
 					!m_code.EmitStrImm12(0, HOST_VU, VuOffset(base + offsetof(efuPipe, enable))) ||
-					!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(base + offsetof(efuPipe, reg))) ||
-					!m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_P)))
+					!m_code.EmitLdrImm12(1, HOST_VU, VuOffset(base + offsetof(efuPipe, reg))) ||
+					!m_code.EmitStrImm12(1, HOST_VU, ViOffset(REG_P)))
 				{
 					return false;
 				}
@@ -3026,7 +3051,8 @@ namespace VitaVU
 						m_code.PatchBranch(done_not_ready, done_target, Condition::CC);
 				}
 
-				bool EmitInlineTestPipesXgkickTransfer(bool always_preserve_normalize_state)
+				bool EmitInlineTestPipesXgkickTransfer(bool always_preserve_normalize_state,
+					bool preserve_resident_aggregate)
 				{
 					// PCSX2 owners: VUops.cpp::_vuTestPipes() XGKICK arm and
 					// x86/microVU_Lower.inl::mVU_XGKICK_DELAY(). Generated A32
@@ -3044,7 +3070,9 @@ namespace VitaVU
 					if (done_disabled == static_cast<size_t>(-1))
 						return false;
 
-					if (!EmitLoadCurrentCycleLow(0) ||
+					if ((preserve_resident_aggregate &&
+							!m_code.EmitStrImm12(14, SP, PIPE_ACTIVITY_SAVE_OFFSET)) ||
+						!EmitLoadCurrentCycleLow(0) ||
 						!m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, xgkicklastcycle))) ||
 						!m_code.EmitSubReg(0, 0, 1) ||
 						!m_code.EmitSubImm8(0, 0, 1) ||
@@ -3059,7 +3087,20 @@ namespace VitaVU
 #if defined(VITASX2_QEMU_VALIDATION)
 					if (!EmitQemuTestPipesXgkickTransferInlineCounter())
 						return false;
+					if (preserve_resident_aggregate &&
+						!EmitQemuResidentPipeAggregateXgkickCounter())
+					{
+						return false;
+					}
 #endif
+
+					if (preserve_resident_aggregate &&
+						(!m_code.EmitLdrImm12(14, SP, PIPE_ACTIVITY_SAVE_OFFSET) ||
+						 !m_code.EmitLdrImm12(0, HOST_VU,
+							 VuOffset(offsetof(VURegs, xgkickenable)))))
+					{
+						return false;
+					}
 
 					return m_code.PatchBranch(done_disabled, m_code.Size(), Condition::EQ);
 				}
@@ -3074,23 +3115,65 @@ namespace VitaVU
 						return false;
 					}
 
+					const bool resident_aggregate = shared_thunk && UsesResidentPipeActivity();
 					if (!EmitInlineTestPipesFmacFlush(shared_thunk, deferred_fmac_flags))
 						return false;
 					if (!EmitInlineTestPipesFdivFlush(deferred_fmac_flags))
 						return false;
+					if (resident_aggregate)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						if (!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(FDIV_ENABLE_OFFSET)))
+							return false;
+#endif
+						if (!m_code.EmitOrrReg(HOST_STALL_SCRATCH, HOST_STALL_SCRATCH, 0))
+							return false;
+					}
 					if (!EmitInlineTestPipesEfuFlush())
 						return false;
+					if (resident_aggregate)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						if (!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(EFU_ENABLE_OFFSET)))
+							return false;
+#endif
+						if (!m_code.EmitOrrReg(HOST_STALL_SCRATCH, HOST_STALL_SCRATCH, 0))
+							return false;
+					}
 					if (!EmitInlineTestPipesIaluFlush())
 						return false;
-					if (!EmitInlineTestPipesXgkickTransfer(shared_thunk))
+					if (resident_aggregate &&
+						!m_code.EmitOrrReg(HOST_STALL_SCRATCH, HOST_STALL_SCRATCH,
+							HOST_CALL_SCRATCH))
+					{
 						return false;
+					}
+					if (!EmitInlineTestPipesXgkickTransfer(shared_thunk,
+						resident_aggregate))
+						return false;
+					if (resident_aggregate && !m_vu0_memory_map &&
+						!m_code.EmitOrrReg(HOST_STALL_SCRATCH, HOST_STALL_SCRATCH, 0))
+					{
+						return false;
+					}
+					if (resident_aggregate &&
+						!m_code.EmitStrImm12(HOST_STALL_SCRATCH, SP,
+							PIPE_ACTIVITY_SAVE_OFFSET))
+					{
+						return false;
+					}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 					if (!EmitQemuTestPipesFastSkipCounter())
 						return false;
+					if (resident_aggregate &&
+						!EmitQemuResidentPipeAggregateRefreshCounter())
+					{
+						return false;
+					}
 #endif
 
-					return EmitRefreshResidentPipeActivity();
+					return resident_aggregate ? true : EmitRefreshResidentPipeActivity();
 				}
 
 				bool EmitTestPipesFastGuard(bool deferred_fmac_flags)
@@ -3242,7 +3325,14 @@ namespace VitaVU
 
 					// r10 is dead after each pair's stall tests and is callee-saved
 					// across the only possible C++ call
-					// (_vuXGKICKTransferMicroVU).
+					// (_vuXGKICKTransferMicroVU). The resident ABI keeps LR in r14
+					// and returns the exact post-publisher pipe aggregate in r10. The
+					// legacy ABI instead moves LR to r10 so r14 can hold fmaccount.
+					if (UsesResidentPipeActivity())
+					{
+						return EmitTestPipesFastGuardBody(true, deferred_fmac_flags) &&
+							m_code.EmitBx(14);
+					}
 					return EmitMovReg(HOST_STALL_SCRATCH, 14) &&
 						EmitTestPipesFastGuardBody(true, deferred_fmac_flags) &&
 						m_code.EmitBx(HOST_STALL_SCRATCH);
