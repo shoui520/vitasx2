@@ -82,6 +82,7 @@ u32 g_qemuVuJitLinkedFrameEntries = 0;
 u32 g_qemuVuJitLinkedVectorFrameEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineCommits = 0;
+u32 g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagRetirements = 0;
 u32 g_qemuVuJitDeferredFmacLinkedEntries = 0;
@@ -684,6 +685,8 @@ namespace VitaVU
 			bool local_fmac_pipeline = false;
 			u32 local_fmac_pipeline_pairs = 0;
 			u32 canonical_fmac_stall_tests_elided = 0;
+			u32 local_fmac_producer_snapshot_pairs = 0;
+			u32 local_fmac_clip_snapshot_elisions = 0;
 			// PCSX2 microVU owner: microVU_Analyze.inl's mVUregs pipeline
 			// state. Long local-FMAC blocks retain the coarse canonical-pipe
 			// activity predicate in their private frame instead of rebuilding it
@@ -756,6 +759,20 @@ namespace VitaVU
 				}
 			}
 			return true;
+		}
+
+		bool CanSnapshotLocalFmacFlagsAtProducer(const PairPlan& pair)
+		{
+			// PCSX2 owner: x86/microVU_Upper.inl::mVUupdateFlags() writes a
+			// rotating MAC/STATUS instance directly from the FMAC result. These
+			// Vita upper paths end with the equivalent MAC/STATUS values in core
+			// registers. A lower FDIV or FSSET can still change VURegs::statusflag
+			// before VUops.cpp::_vuAddFMACStalls() snapshots the pair, so retain the
+			// canonical post-lower loads for those mixed pairs.
+			const bool produces_mac_status = pair.add_upper_stalls &&
+				(pair.upper_addsub_inline || pair.upper_mul_inline ||
+				 pair.upper_maddmsub_inline || pair.upper_outer_inline);
+			return produces_mac_status && !pair.lower_fdiv_inline && !pair.lower_flag_inline;
 		}
 
 		bool IsImmediateBranchKind(VUInterpFast::LowerFastKind kind)
@@ -1325,9 +1342,17 @@ namespace VitaVU
 				{
 					for (u32 i = LOCAL_FMAC_WARMUP_PAIRS; i < block->pair_count; i++)
 					{
-						if (!block->pairs[i].fmac_pipe)
+						const PairPlan& pair = block->pairs[i];
+						if (!pair.fmac_pipe)
 							continue;
 						block->local_fmac_pipeline_pairs++;
+						block->local_fmac_producer_snapshot_pairs +=
+							CanSnapshotLocalFmacFlagsAtProducer(pair) ? 1u : 0u;
+						const u32 flagreg = (pair.add_upper_stalls ? pair.uregs.VIwrite : 0) |
+							((pair.add_lower_stalls && pair.lregs.pipe == VUPIPE_FMAC) ?
+								pair.lregs.VIwrite : 0);
+						block->local_fmac_clip_snapshot_elisions +=
+							(flagreg & (1u << REG_CLIP_FLAG)) == 0 ? 1u : 0u;
 						block->deferred_fmac_flag_retirements +=
 							(i + FMAC_PIPELINE_LATENCY_CYCLES < block->pair_count) ? 1u : 0u;
 					}
@@ -2249,7 +2274,19 @@ namespace VitaVU
 					m_code.EmitAddImm8(1, 1,
 						static_cast<u8>(m_plan.local_fmac_pipeline_pairs)) &&
 					m_code.EmitStrImm12(1, 0, 0);
-				if (!local_counts || !m_plan.deferred_fmac_flags)
+				if (!local_counts)
+					return false;
+				if (m_plan.local_fmac_producer_snapshot_pairs != 0 &&
+					(!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitLocalFmacProducerSnapshotEntries))) ||
+					 !m_code.EmitLdrImm12(1, 0, 0) ||
+					 !m_code.EmitAddImm8(1, 1,
+						 static_cast<u8>(m_plan.local_fmac_producer_snapshot_pairs)) ||
+					 !m_code.EmitStrImm12(1, 0, 0)))
+				{
+					return false;
+				}
+				if (!m_plan.deferred_fmac_flags)
 					return local_counts;
 
 				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
@@ -4450,7 +4487,8 @@ namespace VitaVU
 					m_code.PatchBranch(done_special, done);
 			}
 
-			bool EmitUpdateStatusFromMacReg(unsigned mac_reg, unsigned status_reg, unsigned /*temp_reg*/)
+			bool EmitUpdateStatusFromMacReg(unsigned mac_reg, unsigned status_reg,
+				unsigned /*temp_reg*/)
 			{
 				// PCSX2 owner: VUflags.cpp::VU_STAT_UPDATE(). Each MAC nibble
 				// contributes one Status bit when any of its four XYZW lanes is
@@ -4478,6 +4516,22 @@ namespace VitaVU
 				}
 
 				return m_code.EmitStrImm12(status_reg, HOST_VU, VuOffset(offsetof(VURegs, statusflag)));
+			}
+
+			bool EmitCapturePendingLocalFmacFlags(unsigned mac_reg, unsigned status_reg)
+			{
+				if (!m_capture_pending_local_fmac_flags || !m_pending_local_fmac_entry)
+					return true;
+				if (mac_reg + 1 != status_reg || (mac_reg & 1u) != 0)
+					return false;
+				if (!m_code.EmitStrdImm8(mac_reg, status_reg, SP,
+						static_cast<u8>(LocalFmacOffset(*m_pending_local_fmac_entry,
+							LOCAL_FMAC_MAC_OFFSET))))
+				{
+					return false;
+				}
+				m_pending_local_fmac_entry->producer_flags_captured = true;
+				return true;
 			}
 
 			bool EmitStoreMacResultWord(unsigned value_reg, bool acc, unsigned fd, unsigned lane)
@@ -4574,8 +4628,10 @@ namespace VitaVU
 					}
 				}
 
+				const unsigned status_reg = m_capture_pending_local_fmac_flags ? 3u : 0u;
 				if (!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) ||
-					!EmitUpdateStatusFromMacReg(2, 0, 1))
+					!EmitUpdateStatusFromMacReg(2, status_reg, 1) ||
+					!EmitCapturePendingLocalFmacFlags(2, status_reg))
 				{
 					return false;
 				}
@@ -4851,9 +4907,11 @@ namespace VitaVU
 					}
 				}
 
+				const unsigned status_reg = m_capture_pending_local_fmac_flags ? 3u : 0u;
 				if (alias_hazard ?
 					(!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag))) ||
-						!EmitUpdateStatusFromMacReg(2, 0, 1)) :
+						!EmitUpdateStatusFromMacReg(2, status_reg, 1) ||
+						!EmitCapturePendingLocalFmacFlags(2, status_reg)) :
 					!EmitFinishMacQ0(acc, fd, mask, false))
 				{
 					return false;
@@ -8160,6 +8218,7 @@ namespace VitaVU
 				u32 pair_index = 0;
 				u8 slot = 0;
 				bool active = false;
+				bool producer_flags_captured = false;
 			};
 
 			static u32 FmacRegUpper(const PairPlan& plan)
@@ -8358,33 +8417,38 @@ namespace VitaVU
 
 			bool EmitCommitLocalFmac(u32 pair_index, const PairPlan& plan)
 			{
-				LocalFmacEntry* entry = nullptr;
-				for (LocalFmacEntry& candidate : m_local_fmac_entries)
-				{
-					if (!candidate.active)
-					{
-						entry = &candidate;
-						break;
-					}
-				}
+				LocalFmacEntry* entry = m_pending_local_fmac_entry;
 				if (!entry)
 					return false;
 
-				entry->pair_index = pair_index;
+				if (entry->active || entry->pair_index != pair_index)
+					return false;
 				entry->active = true;
 				const u8 cycle_offset = static_cast<u8>(LocalFmacOffset(*entry, LOCAL_FMAC_CYCLE_OFFSET));
-				const bool emitted =
+				bool emitted =
 					EmitLoadCurrentCycleLow(0) &&
 					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
-					m_code.EmitStrdImm8(0, 1, SP, cycle_offset) &&
-					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, macflag))) &&
-					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, statusflag))) &&
-					m_code.EmitStrdImm8(0, 1, SP,
-						static_cast<u8>(LocalFmacOffset(*entry, LOCAL_FMAC_MAC_OFFSET))) &&
-					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, clipflag))) &&
-					m_code.EmitStrImm12(0, SP, LocalFmacOffset(*entry, LOCAL_FMAC_CLIP_OFFSET));
+					m_code.EmitStrdImm8(0, 1, SP, cycle_offset);
+				if (emitted && !entry->producer_flags_captured)
+				{
+					emitted = m_code.EmitLdrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, macflag))) &&
+						m_code.EmitLdrImm12(1, HOST_VU,
+							VuOffset(offsetof(VURegs, statusflag))) &&
+						m_code.EmitStrdImm8(0, 1, SP,
+							static_cast<u8>(LocalFmacOffset(*entry, LOCAL_FMAC_MAC_OFFSET)));
+				}
+				if (emitted && (FmacFlagReg(plan) & (1u << REG_CLIP_FLAG)) != 0)
+				{
+					emitted = m_code.EmitLdrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, clipflag))) &&
+						m_code.EmitStrImm12(0, SP,
+							LocalFmacOffset(*entry, LOCAL_FMAC_CLIP_OFFSET));
+				}
 				if (!emitted)
 					return false;
+				m_pending_local_fmac_entry = nullptr;
+				m_capture_pending_local_fmac_flags = false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				if (!EmitQemuFmacClearInlineCounter())
@@ -8945,6 +9009,28 @@ namespace VitaVU
 				if (!EmitRetireLocalFmacEntries(pair_index))
 					return false;
 
+				const bool local_fmac_commit = m_plan.local_fmac_pipeline &&
+					pair_index >= LOCAL_FMAC_WARMUP_PAIRS && plan.fmac_pipe;
+				m_pending_local_fmac_entry = nullptr;
+				m_capture_pending_local_fmac_flags = false;
+				if (local_fmac_commit)
+				{
+					for (LocalFmacEntry& candidate : m_local_fmac_entries)
+					{
+						if (!candidate.active)
+						{
+							m_pending_local_fmac_entry = &candidate;
+							break;
+						}
+					}
+					if (!m_pending_local_fmac_entry)
+						return false;
+					m_pending_local_fmac_entry->pair_index = pair_index;
+					m_pending_local_fmac_entry->producer_flags_captured = false;
+					m_capture_pending_local_fmac_flags =
+						CanSnapshotLocalFmacFlagsAtProducer(plan);
+				}
+
 				if (!EmitViBackupUpdate(pair_index))
 					return false;
 
@@ -9102,8 +9188,6 @@ namespace VitaVU
 				}
 
 				// Step tail, in _vu1Exec() order.
-				const bool local_fmac_commit = m_plan.local_fmac_pipeline &&
-					pair_index >= LOCAL_FMAC_WARMUP_PAIRS && plan.fmac_pipe;
 				if (local_fmac_commit && !EmitCommitLocalFmac(pair_index, plan))
 				{
 					return false;
@@ -9188,6 +9272,8 @@ namespace VitaVU
 			u32 m_normalized_operand_quad_bypasses = 0;
 			u32 m_normalization_instructions_removed = 0;
 			std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT> m_local_fmac_entries{};
+			LocalFmacEntry* m_pending_local_fmac_entry = nullptr;
+			bool m_capture_pending_local_fmac_flags = false;
 			// True once the vuDouble() bit-select constant quads (Q8-Q11) have been
 			// materialized in this block. Q8-Q15 are exclusive to the normalize
 			// scratch (operation temporaries use Q0-Q3 and the vector cache owns
@@ -9974,6 +10060,10 @@ namespace VitaVU
 								plan.local_fmac_pipeline_pairs;
 							s_vu1.stats.canonical_fmac_stall_tests_elided +=
 								plan.canonical_fmac_stall_tests_elided;
+							s_vu1.stats.local_fmac_producer_snapshot_pairs +=
+								plan.local_fmac_producer_snapshot_pairs;
+							s_vu1.stats.local_fmac_clip_snapshot_elisions +=
+								plan.local_fmac_clip_snapshot_elisions;
 						}
 						if (plan.resident_pipe_activity)
 						{
@@ -10894,6 +10984,8 @@ namespace VitaVU
 			static_cast<u64>(g_qemuVuJitLinkedVectorFrameEntries) * 32;
 		stats.local_fmac_pipeline_entries = g_qemuVuJitLocalFmacPipelineEntries;
 		stats.local_fmac_pipeline_commits = g_qemuVuJitLocalFmacPipelineCommits;
+		stats.local_fmac_producer_snapshot_entries =
+			g_qemuVuJitLocalFmacProducerSnapshotEntries;
 		stats.deferred_fmac_flag_entries = g_qemuVuJitDeferredFmacFlagEntries;
 		stats.deferred_fmac_flag_runtime_retirements =
 			g_qemuVuJitDeferredFmacFlagRetirements;
@@ -10951,6 +11043,7 @@ namespace VitaVU
 		g_qemuVuJitLinkedVectorFrameEntries = 0;
 		g_qemuVuJitLocalFmacPipelineEntries = 0;
 		g_qemuVuJitLocalFmacPipelineCommits = 0;
+		g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 		g_qemuVuJitDeferredFmacFlagEntries = 0;
 		g_qemuVuJitDeferredFmacFlagRetirements = 0;
 		g_qemuVuJitDeferredFmacLinkedEntries = 0;
