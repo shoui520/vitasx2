@@ -3940,6 +3940,37 @@ namespace VitaVU
 					m_code.EmitVld1Q32Aligned(qd, 3);
 			}
 
+			bool EmitStoreAccQuad(unsigned qs, bool needs_old_value = false)
+			{
+				bool admit = false;
+				if (!RecordOrConsumeVectorAccess(VU_VECTOR_CACHE_ACC,
+					VectorAccessKind::QuadStore, needs_old_value, &admit))
+				{
+					return false;
+				}
+				if (!m_vu0_memory_map)
+					m_vector_cache_stats.uncached_stores++;
+
+				bool emitted = false;
+				if (VectorCacheEnabled() &&
+					(FindVectorCacheSlot(VU_VECTOR_CACHE_ACC) >= 0 || admit))
+				{
+					emitted = EmitStoreCachedVectorQuad(qs, VU_VECTOR_CACHE_ACC,
+						needs_old_value);
+				}
+				else
+				{
+					if (!m_vu0_memory_map)
+						m_vector_cache_stats.acc_quad_stores++;
+					emitted = EmitCanonicalVectorAddress(3, VU_VECTOR_CACHE_ACC) &&
+						m_code.EmitVst1Q32Aligned(qs, 3);
+				}
+				if (!emitted)
+					return false;
+				MarkVectorLanesUnknown(VU_VECTOR_CACHE_ACC, 0x0f);
+				return true;
+			}
+
 			bool EmitStoreWordToVfMasked(unsigned value_reg, unsigned ft, unsigned mask)
 			{
 				if (ft == 0 || mask == 0)
@@ -4939,14 +4970,32 @@ namespace VitaVU
 					return false;
 				}
 
-				for (unsigned lane = 0; lane < 4; lane++)
+				// PCSX2 owner: microVU_IR.h::microRegAlloc::writeBackReg(). A
+				// complete XYZW result remains one cached SIMD value and is written
+				// back with mVUsaveReg() as a whole. Q0 already contains the exact
+				// normalized result, so do not split it into four scalar stores. On
+				// Cortex-A9 that also avoids rematerializing ACC's out-of-range base
+				// separately for every lane and exposes the complete result to the
+				// block-local Q-register allocator.
+				bool result_stored = true;
+				if (mask == 0x0f)
 				{
-					if ((mask & (1u << (3 - lane))) != 0 &&
-						!EmitStoreMacResultS(lane, acc, fd, lane))
+					result_stored = acc ? EmitStoreAccQuad(0) : EmitStoreVfQuad(0, fd);
+				}
+				else
+				{
+					for (unsigned lane = 0; lane < 4; lane++)
 					{
-						return false;
+						if ((mask & (1u << (3 - lane))) != 0 &&
+							!EmitStoreMacResultS(lane, acc, fd, lane))
+						{
+							result_stored = false;
+							break;
+						}
 					}
 				}
+				if (!result_stored)
+					return false;
 
 				const unsigned status_reg = m_capture_pending_local_fmac_flags ? 3u : 0u;
 				const bool defer_working_store = m_plan.resident_working_fmac_flags &&
