@@ -744,9 +744,13 @@ namespace MTGS
 			"executed_pairs=%llu interpreter_steps=%llu generated_blocks=%llu "
 			"generated_pairs=%llu host_instructions=%llu host_loads=%llu host_stores=%llu "
 			"helper_calls_generated=%llu register_loads_generated=%llu "
-			"register_stores_generated=%llu origin_programs=%llu "
+			"register_stores_generated=%llu working_flag_blocks=%llu "
+			"working_flag_producers=%llu working_state_stores_removed=%llu "
+			"origin_programs=%llu "
 			"origin_executed_pairs=%llu origin_interpreter_steps=%llu "
-			"origin_generated_blocks=%llu origin_generated_pairs=%llu",
+			"origin_generated_blocks=%llu origin_generated_pairs=%llu "
+			"origin_working_flag_blocks=%llu origin_working_flag_producers=%llu "
+			"origin_working_state_stores_removed=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.completed_programs,
 				start.vu1.completed_programs)),
@@ -777,6 +781,15 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.vu1.generated_state_store_instructions,
 				start.vu1.generated_state_store_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.resident_working_fmac_flag_blocks,
+				start.vu1.resident_working_fmac_flag_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.resident_working_fmac_flag_producers,
+				start.vu1.resident_working_fmac_flag_producers)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.resident_working_fmac_state_stores_removed,
+				start.vu1.resident_working_fmac_state_stores_removed)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.completed_programs,
 				origin.vu1.completed_programs)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.executed_pairs,
@@ -786,7 +799,16 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(end.vu1.generated_blocks,
 				origin.vu1.generated_blocks)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.generated_pairs,
-				origin.vu1.generated_pairs)));
+				origin.vu1.generated_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.resident_working_fmac_flag_blocks,
+				origin.vu1.resident_working_fmac_flag_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.resident_working_fmac_flag_producers,
+				origin.vu1.resident_working_fmac_flag_producers)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.resident_working_fmac_state_stores_removed,
+				origin.vu1.resident_working_fmac_state_stores_removed)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=vu1_cache prepare_checks=%llu prepare_calls=%llu "
 			"quick_hits=%llu program_hits=%llu maps_reused=%llu versions_created=%llu "

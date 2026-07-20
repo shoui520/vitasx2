@@ -51,6 +51,9 @@ namespace VitaVU
 		u32 local_fmac_producer_snapshot_pairs = 0;
 		u32 local_fmac_clip_snapshot_elisions = 0;
 		u64 local_fmac_producer_snapshot_entries = 0;
+		u32 resident_working_fmac_flag_blocks = 0;
+		u32 resident_working_fmac_flag_producers = 0;
+		u64 resident_working_fmac_state_stores_removed = 0;
 		u32 deferred_fmac_flag_blocks = 0;
 		u32 deferred_fmac_flag_retirements = 0;
 		u64 deferred_fmac_flag_entries = 0;
@@ -157,6 +160,9 @@ namespace VitaVU
 		u64 generated_helper_call_instructions = 0;
 		u64 generated_state_load_instructions = 0;
 		u64 generated_state_store_instructions = 0;
+		u64 resident_working_fmac_flag_blocks = 0;
+		u64 resident_working_fmac_flag_producers = 0;
+		u64 resident_working_fmac_state_stores_removed = 0;
 		u64 program_prepare_checks = 0;
 		u64 program_prepare_calls = 0;
 		u64 program_quick_cache_hits = 0;
