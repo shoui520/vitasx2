@@ -109,6 +109,7 @@ namespace VitaVU
 		u64 vector_cache_writebacks = 0;
 		u64 vector_cache_acc_hits = 0;
 		u64 vector_cache_scalar_invalidations = 0;
+		u64 vector_cache_preloads = 0;
 		u32 vector_cache_candidate_blocks = 0;
 		u32 vector_cache_selected_blocks = 0;
 		u32 vector_cache_rejected_blocks = 0;

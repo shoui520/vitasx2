@@ -1535,6 +1535,7 @@ namespace VitaVU
 				u64 writebacks = 0;
 				u64 acc_hits = 0;
 				u64 scalar_invalidations = 0;
+				u64 preloads = 0;
 				u64 uncached_loads = 0;
 				u64 uncached_stores = 0;
 				u64 vf_word_loads = 0;
@@ -1574,6 +1575,8 @@ namespace VitaVU
 				if (!EmitPrologue())
 					return false;
 				const size_t body_offset = m_code.Size();
+				if (!EmitPreloadVectorCache())
+					return false;
 
 				for (u32 i = 0; i < m_plan.pair_count; i++)
 				{
@@ -3290,6 +3293,57 @@ namespace VitaVU
 			bool RecordOrConsumeVectorBarrier()
 			{
 				return RecordOrConsumeVectorAccess(0, VectorAccessKind::Barrier, false, nullptr);
+			}
+
+			bool EmitPreloadVectorCache()
+			{
+				if (!VectorCacheEnabled())
+					return true;
+
+				// PCSX2 owner: x86/microVU_Compile.inl::mvuPreloadRegisters().
+				// It walks the analyzed block before emission and fills otherwise
+				// idle vector registers with upcoming live-ins. Cortex-A9 VLD1.32
+				// of a quad occupies two MPE issue cycles, so issue independent
+				// live-in loads at the linked/body entry rather than on the first
+				// consumer's dependency chain. A barrier ends the only lifetime
+				// region eligible for entry preloading.
+				for (const VectorAccessEvent& event : *m_vector_accesses)
+				{
+					if (event.kind == VectorAccessKind::Barrier)
+						break;
+					if (!event.admit || !event.needs_old_value || event.guest == 0 ||
+						FindVectorCacheSlot(event.guest) >= 0)
+					{
+						continue;
+					}
+
+					u32 slot = VU_VECTOR_CACHE_SLOTS;
+					for (u32 candidate = 0; candidate < VU_VECTOR_CACHE_SLOTS; candidate++)
+					{
+						if (m_vector_cache[candidate].guest == 0)
+						{
+							slot = candidate;
+							break;
+						}
+					}
+					if (slot == VU_VECTOR_CACHE_SLOTS)
+						break;
+
+					m_vector_cache[slot] = {event.guest, false};
+					if (!EmitCanonicalVectorAddress(HOST_CALL_SCRATCH, event.guest) ||
+						!m_code.EmitVld1Q32Aligned(VU_VECTOR_CACHE_FIRST_Q + slot,
+							HOST_CALL_SCRATCH))
+					{
+						return false;
+					}
+					m_vector_cache_stats.misses++;
+					m_vector_cache_stats.preloads++;
+					if (event.guest == VU_VECTOR_CACHE_ACC)
+						m_vector_cache_stats.acc_quad_loads++;
+					else
+						m_vector_cache_stats.vf_quad_loads++;
+				}
+				return true;
 			}
 
 			u32 NextAdmittedVectorUse(u8 guest) const
@@ -10102,6 +10156,7 @@ namespace VitaVU
 						s_vu1.stats.vector_cache_acc_hits += vector_stats.acc_hits;
 						s_vu1.stats.vector_cache_scalar_invalidations +=
 							vector_stats.scalar_invalidations;
+						s_vu1.stats.vector_cache_preloads += vector_stats.preloads;
 						s_vu1.stats.uncached_vector_loads += vector_stats.uncached_loads;
 						s_vu1.stats.uncached_vector_stores += vector_stats.uncached_stores;
 						s_vu1.stats.canonical_vf_word_loads += vector_stats.vf_word_loads;
