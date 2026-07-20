@@ -43,6 +43,13 @@
 #include <string>
 #include <utility>
 
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+namespace
+{
+	std::atomic<u64> s_mtvu_packet_token_resyncs_for_validation{0};
+}
+#endif
+
 Pcsx2Config::GSOptions GSConfig;
 
 GSRendererType GSGetCurrentRenderer()
@@ -151,7 +158,7 @@ namespace MTGS
 	static HardwareVsyncProfile s_worker_profile;
 	static std::atomic<u32> s_profile_ring_stalls{0};
 	static std::atomic<u32> s_profile_vsync_waits{0};
-	static std::atomic<u32> s_profile_mtvu_packet_visibility_waits{0};
+	static std::atomic<u32> s_profile_mtvu_packet_token_resyncs{0};
 	static std::atomic<int> s_profile_max_queued_frames{0};
 
 	struct GsProducerPerformanceTotals
@@ -173,7 +180,7 @@ namespace MTGS
 		u64 gs_packet_bytes = 0;
 		u64 mtvu_packets = 0;
 		u64 mtvu_packet_bytes = 0;
-		u64 mtvu_visibility_spins = 0;
+		u64 mtvu_packet_token_resyncs = 0;
 		u64 completed_vsyncs = 0;
 	};
 
@@ -184,7 +191,7 @@ namespace MTGS
 	static std::atomic<u64> s_gs_published_packet_bytes{0};
 	static std::atomic<u64> s_gs_published_mtvu_packets{0};
 	static std::atomic<u64> s_gs_published_mtvu_packet_bytes{0};
-	static std::atomic<u64> s_gs_published_mtvu_visibility_spins{0};
+	static std::atomic<u64> s_gs_published_mtvu_packet_token_resyncs{0};
 	static std::atomic<u64> s_gs_published_completed_vsyncs{0};
 
 	static void PublishGsWorkerPerformance()
@@ -199,8 +206,8 @@ namespace MTGS
 			std::memory_order_relaxed);
 		s_gs_published_mtvu_packet_bytes.store(
 			s_gs_worker_performance.mtvu_packet_bytes, std::memory_order_relaxed);
-		s_gs_published_mtvu_visibility_spins.store(
-			s_gs_worker_performance.mtvu_visibility_spins,
+		s_gs_published_mtvu_packet_token_resyncs.store(
+			s_gs_worker_performance.mtvu_packet_token_resyncs,
 			std::memory_order_relaxed);
 		s_gs_published_completed_vsyncs.store(
 			s_gs_worker_performance.completed_vsyncs, std::memory_order_release);
@@ -253,14 +260,14 @@ namespace MTGS
 		const u64 cpu_us = cpu_now - profile.cpu_start;
 		const double utilization = wall_us ?
 			(static_cast<double>(cpu_us) * 100.0 / static_cast<double>(wall_us)) : 0.0;
-		Console.WriteLn("Vita MTGS %s profile: warmup_vsyncs=60 interval_vsyncs=120 wall_us=%llu cpu_us=%llu cpu_util=%.1f%% ring_stalls=%u vsync_waits=%u mtvu_packet_visibility_waits=%u max_queued=%d",
+		Console.WriteLn("Vita MTGS %s profile: warmup_vsyncs=60 interval_vsyncs=120 wall_us=%llu cpu_us=%llu cpu_util=%.1f%% ring_stalls=%u vsync_waits=%u mtvu_packet_token_resyncs=%u max_queued=%d",
 			owner,
 			static_cast<unsigned long long>(wall_us),
 			static_cast<unsigned long long>(cpu_us),
 			utilization,
 			s_profile_ring_stalls.load(std::memory_order_relaxed),
 			s_profile_vsync_waits.load(std::memory_order_relaxed),
-			s_profile_mtvu_packet_visibility_waits.load(std::memory_order_relaxed),
+			s_profile_mtvu_packet_token_resyncs.load(std::memory_order_relaxed),
 			s_profile_max_queued_frames.load(std::memory_order_relaxed));
 		if (&profile == &s_producer_profile && THREAD_VU1 &&
 			vu1Thread.IsOpen())
@@ -396,8 +403,8 @@ namespace MTGS
 			s_gs_published_mtvu_packets.load(std::memory_order_relaxed);
 		stats.mtvu_packet_bytes =
 			s_gs_published_mtvu_packet_bytes.load(std::memory_order_relaxed);
-		stats.mtvu_visibility_spins =
-			s_gs_published_mtvu_visibility_spins.load(std::memory_order_relaxed);
+		stats.mtvu_packet_token_resyncs =
+			s_gs_published_mtvu_packet_token_resyncs.load(std::memory_order_relaxed);
 		return stats;
 	}
 
@@ -861,7 +868,7 @@ namespace MTGS
 			"Vita perf v=1 window=%llu kind=gs submitted=%llu submitted_words=%llu "
 			"processed=%llu packets=%llu packet_bytes=%llu mtvu_packets=%llu "
 			"mtvu_packet_bytes=%llu waits=%llu wait_spins=%llu ring_spins=%llu "
-			"visibility_spins=%llu",
+			"token_resyncs=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(end.gs_producer.submissions,
 				start.gs_producer.submissions)),
@@ -884,8 +891,8 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(end.gs_producer.ring_spins,
 				start.gs_producer.ring_spins)),
 			static_cast<unsigned long long>(CounterDelta(
-				end.gs_worker.mtvu_visibility_spins,
-				start.gs_worker.mtvu_visibility_spins)));
+				end.gs_worker.mtvu_packet_token_resyncs,
+				start.gs_worker.mtvu_packet_token_resyncs)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gxm draws=%llu indices=%llu "
 			"vertex_bytes=%llu index_bytes=%llu texture_uploads=%llu "
@@ -1453,23 +1460,28 @@ namespace MTGS
 						}
 						Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
 						GS_Packet packet;
-						if (!path.TryGetGSPacketMTVU(packet))
+						while (!path.TryGetGSPacketMTVU(packet))
 						{
+							// PCSX2's MTVU contract pairs each semaphore resource with one
+							// descriptor published by FinishGSPacketMTVU(). A lifecycle reset
+							// can discard an old descriptor while leaving its semaphore resource;
+							// consuming that orphan must not leave MTGS one packet ahead forever.
+							// Reacquire the resource for the descriptor instead of busy-waiting.
 						#if defined(__vita__)
 							if (performance_telemetry_enabled)
 							{
-								s_profile_mtvu_packet_visibility_waits.fetch_add(1,
+								s_profile_mtvu_packet_token_resyncs.fetch_add(1,
 									std::memory_order_relaxed);
+								s_gs_worker_performance.mtvu_packet_token_resyncs++;
 							}
 						#endif
-							do
-							{
-								Threading::SpinWait();
-#if defined(__vita__)
-								if (performance_telemetry_enabled)
-									s_gs_worker_performance.mtvu_visibility_spins++;
-#endif
-							} while (!path.TryGetGSPacketMTVU(packet));
+						#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+							s_mtvu_packet_token_resyncs_for_validation.fetch_add(1,
+								std::memory_order_relaxed);
+						#endif
+							mtvu_lock.unlock();
+							vu1Thread.semaXGkick.Wait();
+							mtvu_lock.lock();
 						}
 #if defined(__vita__)
 						if (performance_telemetry_enabled)
@@ -2166,6 +2178,12 @@ bool VitaGS::CopyPrivilegedRegistersForValidation(u8* output, size_t size)
 	});
 	MTGS::WaitGS(false);
 	return true;
+}
+
+u64 VitaGS::GetMtvuPacketTokenResyncsForValidation()
+{
+	return s_mtvu_packet_token_resyncs_for_validation.load(
+		std::memory_order_relaxed);
 }
 #endif
 

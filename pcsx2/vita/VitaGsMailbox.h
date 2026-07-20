@@ -22,6 +22,7 @@ namespace VitaGS
 
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 	bool CopyPrivilegedRegistersForValidation(u8* output, size_t size);
+	u64 GetMtvuPacketTokenResyncsForValidation();
 #endif
 
 #if defined(VITASX2_PRODUCT_BOOT_VALIDATION) && VITASX2_PRODUCT_BOOT_VALIDATION
