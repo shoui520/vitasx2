@@ -613,6 +613,14 @@ namespace VitaVU
 
 		constexpr u32 MAX_BLOCK_PAIRS = 64;
 		constexpr u32 MAX_DIRECT_LINK_SLOTS = 2;
+		// Sony VU User Manual 3.4.4: the FMAC pipeline has a fixed four-cycle
+		// latency. PCSX2 owners: microVU_Analyze.inl's compile-time pipeline
+		// state and VUops.cpp::_vuTestFMACStalls(). The first four pairs retain
+		// the canonical entry queue; later writers use compiler-owned slots.
+		constexpr u32 FMAC_PIPELINE_LATENCY_CYCLES = 4;
+		constexpr u32 LOCAL_FMAC_WARMUP_PAIRS = FMAC_PIPELINE_LATENCY_CYCLES;
+		constexpr u32 LOCAL_FMAC_CANONICAL_STALL_MATURE_PAIR =
+			LOCAL_FMAC_WARMUP_PAIRS + FMAC_PIPELINE_LATENCY_CYCLES - 1;
 
 			struct DirectLinkPlan
 			{
@@ -675,6 +683,7 @@ namespace VitaVU
 			// interpreter fmacPipe state at the block seam.
 			bool local_fmac_pipeline = false;
 			u32 local_fmac_pipeline_pairs = 0;
+			u32 canonical_fmac_stall_tests_elided = 0;
 			// PCSX2 microVU owner: microVU_Analyze.inl's mVUregs pipeline
 			// state. Long local-FMAC blocks retain the coarse canonical-pipe
 			// activity predicate in their private frame instead of rebuilding it
@@ -694,15 +703,14 @@ namespace VitaVU
 
 		bool CanUseLocalFmacPipeline(const BlockPlan& block)
 		{
-			constexpr u32 WARMUP_PAIRS = 4;
 			constexpr u32 MIN_LOCAL_COMMITS = 6;
-			if (block.pair_count < WARMUP_PAIRS + MIN_LOCAL_COMMITS)
+			if (block.pair_count < LOCAL_FMAC_WARMUP_PAIRS + MIN_LOCAL_COMMITS)
 				return false;
 
 			const u32 flag_mask = (1u << REG_STATUS_FLAG) |
 				(1u << REG_MAC_FLAG) | (1u << REG_CLIP_FLAG);
 			u32 fmac_pairs = 0;
-			for (u32 i = WARMUP_PAIRS; i < block.pair_count; i++)
+			for (u32 i = LOCAL_FMAC_WARMUP_PAIRS; i < block.pair_count; i++)
 			{
 				const PairPlan& pair = block.pairs[i];
 				// E/D/T completion and PATH1 calls are externally observable seams
@@ -720,9 +728,10 @@ namespace VitaVU
 					((pair.uregs.VIread | pair.lregs.VIread) & flag_mask) != 0;
 				if (observes_flags)
 				{
-					for (u32 writer = WARMUP_PAIRS; writer < i; writer++)
+					for (u32 writer = LOCAL_FMAC_WARMUP_PAIRS; writer < i; writer++)
 					{
-						if (block.pairs[writer].fmac_pipe && writer + 4 > i)
+						if (block.pairs[writer].fmac_pipe &&
+							writer + FMAC_PIPELINE_LATENCY_CYCLES > i)
 							return false;
 					}
 				}
@@ -1314,13 +1323,27 @@ namespace VitaVU
 				block->resident_pipe_activity = block->local_fmac_pipeline;
 				if (block->local_fmac_pipeline)
 				{
-					for (u32 i = 4; i < block->pair_count; i++)
+					for (u32 i = LOCAL_FMAC_WARMUP_PAIRS; i < block->pair_count; i++)
 					{
 						if (!block->pairs[i].fmac_pipe)
 							continue;
 						block->local_fmac_pipeline_pairs++;
 						block->deferred_fmac_flag_retirements +=
-							(i + 4 < block->pair_count) ? 1u : 0u;
+							(i + FMAC_PIPELINE_LATENCY_CYCLES < block->pair_count) ? 1u : 0u;
+					}
+					for (u32 i = LOCAL_FMAC_CANONICAL_STALL_MATURE_PAIR;
+						i < block->pair_count; i++)
+					{
+						const PairPlan& pair = block->pairs[i];
+						const auto reads_vf = [](const _VURegsNum& regs) {
+							return regs.VFread0 != 0 || regs.VFread1 != 0;
+						};
+						block->canonical_fmac_stall_tests_elided +=
+							(pair.test_upper_stalls && reads_vf(pair.uregs)) ? 1u : 0u;
+						block->canonical_fmac_stall_tests_elided +=
+							(pair.test_lower_stalls && reads_vf(pair.lregs) &&
+								(pair.lregs.pipe == VUPIPE_FMAC || pair.lregs.pipe == VUPIPE_FDIV ||
+								 pair.lregs.pipe == VUPIPE_EFU)) ? 1u : 0u;
 					}
 					block->deferred_fmac_flags =
 						block->deferred_fmac_flag_retirements >= 4 &&
@@ -7980,13 +8003,14 @@ namespace VitaVU
 					m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, flags)));
 			}
 
-			bool EmitInlineLowerFdivStallTest(const _VURegsNum& regs)
+			bool EmitInlineLowerFdivStallTest(const _VURegsNum& regs,
+				bool elide_canonical_fmac_test)
 			{
 				// PCSX2 owner: VUops.cpp::_vuTestFDIVStalls(). FMAC read
 				// stalls run first, then a pending FDIV pipe can advance
 				// VU->cycle to fdiv.sCycle + fdiv.Cycle.
 				constexpr size_t base = offsetof(VURegs, fdiv);
-				if (!EmitInlineFmacStallTestBody(regs) ||
+				if ((!elide_canonical_fmac_test && !EmitInlineFmacStallTestBody(regs)) ||
 					!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(base + offsetof(fdivPipe, enable))) ||
 					!m_code.EmitCmpImm32(0, 0))
 				{
@@ -8016,13 +8040,14 @@ namespace VitaVU
 #endif
 			}
 
-			bool EmitInlineLowerEfuStallTest(const _VURegsNum& regs)
+			bool EmitInlineLowerEfuStallTest(const _VURegsNum& regs,
+				bool elide_canonical_fmac_test)
 			{
 				// PCSX2 owner: VUops.cpp::_vuTestEFUStalls(). Preserve the
 				// helper's `efu.Cycle -= 1` side effect before waiting; the
 				// following _vuTestPipes() observes the adjusted EFU latency.
 				constexpr size_t base = offsetof(VURegs, efu);
-				if (!EmitInlineFmacStallTestBody(regs) ||
+				if ((!elide_canonical_fmac_test && !EmitInlineFmacStallTestBody(regs)) ||
 					!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(base + offsetof(efuPipe, enable))) ||
 					!m_code.EmitCmpImm32(0, 0))
 				{
@@ -8183,6 +8208,19 @@ namespace VitaVU
 					conflicts(FmacRegLower(writer), FmacXyzwLower(writer), regs.VFread1, regs.VFr1xyzw);
 			}
 
+			bool CanElideCanonicalFmacStallTest(u32 pair_index, const _VURegsNum& regs) const
+			{
+				// Pairs 0..3 are the only canonical writers in a local-FMAC block.
+				// EmitPair() increments the cycle before testing pair 7, so even the
+				// newest canonical writer is four cycles old and cannot advance cycle.
+				// Any earlier stall only makes it older. Local writers from pair 4 on
+				// are tested separately by EmitLocalFmacStallTest(). _vuTestPipes()
+				// remains in place and still owns ready flag/result publication.
+				return m_plan.local_fmac_pipeline &&
+					pair_index >= LOCAL_FMAC_CANONICAL_STALL_MATURE_PAIR &&
+					(regs.VFread0 != 0 || regs.VFread1 != 0);
+			}
+
 			bool EmitLocalFmacStallTest(const _VURegsNum& regs)
 			{
 				if (!m_plan.local_fmac_pipeline || (regs.VFread0 == 0 && regs.VFread1 == 0))
@@ -8195,7 +8233,7 @@ namespace VitaVU
 
 					const u8 offset = static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET));
 					if (!m_code.EmitLdrdImm8(0, 1, SP, offset) ||
-						!m_code.EmitAddImm8(0, 0, 4, true) ||
+						!m_code.EmitAddImm8(0, 0, FMAC_PIPELINE_LATENCY_CYCLES, true) ||
 						!m_code.EmitAdcImm8(1, 1, 0) ||
 						!EmitStoreCycleIfNewer(0, 1, 2, 3))
 					{
@@ -8303,7 +8341,8 @@ namespace VitaVU
 					LocalFmacEntry* oldest_ready = nullptr;
 					for (LocalFmacEntry& candidate : m_local_fmac_entries)
 					{
-						if (!candidate.active || candidate.pair_index + 4 > pair_index)
+						if (!candidate.active ||
+							candidate.pair_index + FMAC_PIPELINE_LATENCY_CYCLES > pair_index)
 							continue;
 						if (!oldest_ready || candidate.pair_index < oldest_ready->pair_index)
 							oldest_ready = &candidate;
@@ -8381,7 +8420,7 @@ namespace VitaVU
 					!m_code.EmitLdrdImm8(0, 1, SP,
 						static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET))) ||
 					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, sCycle)) ||
-					!m_code.EmitMovImm8(0, 4) ||
+					!m_code.EmitMovImm8(0, FMAC_PIPELINE_LATENCY_CYCLES) ||
 					!m_code.EmitLdrImm12(1, SP, LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET)) ||
 					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, Cycle)) ||
 					!m_code.EmitLdrImm12(0, SP, LocalFmacOffset(entry, LOCAL_FMAC_STATUS_OFFSET)) ||
@@ -8421,7 +8460,7 @@ namespace VitaVU
 					// and are compacted into PCSX2's canonical circular queue.
 					if (!m_code.EmitLdrdImm8(0, 1, SP,
 							static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET))) ||
-						!m_code.EmitAddImm8(0, 0, 4, true) ||
+						!m_code.EmitAddImm8(0, 0, FMAC_PIPELINE_LATENCY_CYCLES, true) ||
 						!m_code.EmitAdcImm8(1, 1, 0) ||
 						!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
 						!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) ||
@@ -8486,7 +8525,7 @@ namespace VitaVU
 					EmitLoadCurrentCycleLow(0) &&
 					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
 					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, sCycle)) &&
-					m_code.EmitMovImm8(0, 4) &&
+					m_code.EmitMovImm8(0, FMAC_PIPELINE_LATENCY_CYCLES) &&
 					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, macflag))) &&
 					m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, Cycle)) &&
 					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, statusflag))) &&
@@ -8842,12 +8881,20 @@ namespace VitaVU
 				}
 
 				// Stall tests in _vu1Exec() order: upper, lower, pipes.
-				if (plan.test_upper_stalls && plan.upper_fmac_stall_test_inline)
+				const bool elide_upper_canonical_fmac =
+					CanElideCanonicalFmacStallTest(pair_index, plan.uregs);
+				const bool lower_has_canonical_fmac_test =
+					plan.lregs.pipe == VUPIPE_FMAC || plan.lregs.pipe == VUPIPE_FDIV ||
+					plan.lregs.pipe == VUPIPE_EFU;
+				const bool elide_lower_canonical_fmac = lower_has_canonical_fmac_test &&
+					CanElideCanonicalFmacStallTest(pair_index, plan.lregs);
+				if (plan.test_upper_stalls && !elide_upper_canonical_fmac &&
+					plan.upper_fmac_stall_test_inline)
 				{
 					if (!EmitInlineFmacStallTest(m_pairs[pair_index].uregs, true))
 						return false;
 				}
-				else if (plan.test_upper_stalls &&
+				else if (plan.test_upper_stalls && !elide_upper_canonical_fmac &&
 					!EmitCallHelperRegs(reinterpret_cast<const void*>(&_vuTestUpperStalls), &m_pairs[pair_index].uregs))
 				{
 					return false;
@@ -8856,19 +8903,22 @@ namespace VitaVU
 					return false;
 				if (plan.test_lower_stalls && !EmitLocalFmacStallTest(plan.lregs))
 					return false;
-				if (plan.test_lower_stalls && plan.lower_fmac_stall_test_inline)
+				if (plan.test_lower_stalls && !elide_lower_canonical_fmac &&
+					plan.lower_fmac_stall_test_inline)
 				{
 					if (!EmitInlineFmacStallTest(m_pairs[pair_index].lregs, false))
 						return false;
 				}
 				else if (plan.test_lower_stalls && plan.lower_fdiv_stall_test_inline)
 				{
-					if (!EmitInlineLowerFdivStallTest(m_pairs[pair_index].lregs))
+					if (!EmitInlineLowerFdivStallTest(m_pairs[pair_index].lregs,
+						elide_lower_canonical_fmac))
 						return false;
 				}
 				else if (plan.test_lower_stalls && plan.lower_efu_stall_test_inline)
 				{
-					if (!EmitInlineLowerEfuStallTest(m_pairs[pair_index].lregs))
+					if (!EmitInlineLowerEfuStallTest(m_pairs[pair_index].lregs,
+						elide_lower_canonical_fmac))
 						return false;
 				}
 				else if (plan.test_lower_stalls && plan.lower_branch_stall_test_inline)
@@ -8876,7 +8926,7 @@ namespace VitaVU
 					if (!EmitInlineLowerBranchStallTest(m_pairs[pair_index].lregs))
 						return false;
 				}
-				else if (plan.test_lower_stalls &&
+				else if (plan.test_lower_stalls && !elide_lower_canonical_fmac &&
 					!EmitCallHelperRegs(reinterpret_cast<const void*>(&_vuTestLowerStalls), &m_pairs[pair_index].lregs))
 				{
 					return false;
@@ -9052,7 +9102,8 @@ namespace VitaVU
 				}
 
 				// Step tail, in _vu1Exec() order.
-				const bool local_fmac_commit = m_plan.local_fmac_pipeline && pair_index >= 4 && plan.fmac_pipe;
+				const bool local_fmac_commit = m_plan.local_fmac_pipeline &&
+					pair_index >= LOCAL_FMAC_WARMUP_PAIRS && plan.fmac_pipe;
 				if (local_fmac_commit && !EmitCommitLocalFmac(pair_index, plan))
 				{
 					return false;
@@ -9921,6 +9972,8 @@ namespace VitaVU
 							s_vu1.stats.local_fmac_pipeline_blocks++;
 							s_vu1.stats.local_fmac_pipeline_pairs +=
 								plan.local_fmac_pipeline_pairs;
+							s_vu1.stats.canonical_fmac_stall_tests_elided +=
+								plan.canonical_fmac_stall_tests_elided;
 						}
 						if (plan.resident_pipe_activity)
 						{
