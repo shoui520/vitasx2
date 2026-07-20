@@ -7867,6 +7867,42 @@ namespace VitaVU
 					m_code.PatchBranch(done_after_update, done_target);
 			}
 
+			bool EmitStoreLocalFmacCycleIfNewer(unsigned new_lo, unsigned current_lo,
+				unsigned delta, unsigned high_scratch)
+			{
+				// Sony VU User Manual 3.4.4 fixes FMAC latency at four cycles.
+				// PCSX2's microVU pipeline likewise compares the issue cycle plus four.
+				// For that bounded distance, signed subtraction of the low words is an
+				// exact modulo-2^32 ordering test, including a low-word wrap. Only the
+				// taken wrap edge touches the canonical high word.
+				if (!m_code.EmitLdrImm12(current_lo, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle))) ||
+					!m_code.EmitSubReg(delta, new_lo, current_lo, true))
+				{
+					return false;
+				}
+				const size_t done = m_code.EmitBranchPlaceholder(Condition::LE);
+				if (done == static_cast<size_t>(-1) ||
+					!m_code.EmitCmpReg(new_lo, current_lo))
+				{
+					return false;
+				}
+				const size_t no_wrap = m_code.EmitBranchPlaceholder(Condition::CS);
+				if (no_wrap == static_cast<size_t>(-1) ||
+					!m_code.EmitLdrImm12(high_scratch, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle) + 4)) ||
+					!m_code.EmitAddImm8(high_scratch, high_scratch, 1) ||
+					!m_code.EmitStrImm12(high_scratch, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle) + 4)) ||
+					!m_code.PatchBranch(no_wrap, m_code.Size(), Condition::CS) ||
+					!m_code.EmitStrImm12(new_lo, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle))))
+				{
+					return false;
+				}
+				return m_code.PatchBranch(done, m_code.Size(), Condition::LE);
+			}
+
 			bool EmitInlineFlushAllFdiv()
 			{
 				// PCSX2 owner: VUops.cpp::_vuFlushAll() FDIV section. E-bit
@@ -8495,10 +8531,9 @@ namespace VitaVU
 						continue;
 
 					const u8 offset = static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET));
-					if (!m_code.EmitLdrdImm8(0, 1, SP, offset) ||
-						!m_code.EmitAddImm8(0, 0, FMAC_PIPELINE_LATENCY_CYCLES, true) ||
-						!m_code.EmitAdcImm8(1, 1, 0) ||
-						!EmitStoreCycleIfNewer(0, 1, 2, 3))
+					if (!m_code.EmitLdrImm12(0, SP, offset) ||
+						!m_code.EmitAddImm8(0, 0, FMAC_PIPELINE_LATENCY_CYCLES) ||
+						!EmitStoreLocalFmacCycleIfNewer(0, 2, 3, 1))
 					{
 						return false;
 					}
@@ -8629,10 +8664,8 @@ namespace VitaVU
 					return false;
 				entry->active = true;
 				const u8 cycle_offset = static_cast<u8>(LocalFmacOffset(*entry, LOCAL_FMAC_CYCLE_OFFSET));
-				bool emitted =
-					EmitLoadCurrentCycleLow(0) &&
-					m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) &&
-					m_code.EmitStrdImm8(0, 1, SP, cycle_offset);
+				bool emitted = EmitLoadCurrentCycleLow(0) &&
+					m_code.EmitStrImm12(0, SP, cycle_offset);
 				if (emitted && !entry->producer_flags_captured)
 				{
 					emitted = m_code.EmitLdrImm12(0, HOST_VU,
@@ -8685,8 +8718,14 @@ namespace VitaVU
 					!m_code.EmitMovImm32(0, FmacXyzwLower(plan)) ||
 					!m_code.EmitMovImm8(1, 0) ||
 					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, xyzwlower)) ||
-					!m_code.EmitLdrdImm8(0, 1, SP,
-						static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET))) ||
+					!m_code.EmitLdrImm12(0, SP,
+						LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET)) ||
+					!m_code.EmitLdrImm12(1, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle) + 4)) ||
+					!m_code.EmitLdrImm12(2, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle))) ||
+					!m_code.EmitCmpReg(0, 2) ||
+					!m_code.EmitSubImm8(1, 1, 1, false, Condition::HI) ||
 					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, sCycle)) ||
 					!m_code.EmitMovImm8(0, FMAC_PIPELINE_LATENCY_CYCLES) ||
 					!m_code.EmitLdrImm12(1, SP, LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET)) ||
@@ -8726,25 +8765,22 @@ namespace VitaVU
 					// Entries made ready early by an FDIV/EFU/IALU or dependency
 					// stall publish here; younger entries retain their exact sCycle
 					// and are compacted into PCSX2's canonical circular queue.
-					if (!m_code.EmitLdrdImm8(0, 1, SP,
-							static_cast<u8>(LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET))) ||
-						!m_code.EmitAddImm8(0, 0, FMAC_PIPELINE_LATENCY_CYCLES, true) ||
-						!m_code.EmitAdcImm8(1, 1, 0) ||
+					if (!m_code.EmitLdrImm12(0, SP,
+							LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET)) ||
+						!m_code.EmitAddImm8(0, 0, FMAC_PIPELINE_LATENCY_CYCLES) ||
 						!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
-						!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) ||
-						!m_code.EmitCmpReg(3, 1) ||
-						!m_code.EmitCmpReg(2, 0, Condition::EQ))
+						!m_code.EmitSubReg(3, 2, 0, true))
 					{
 						return false;
 					}
-					const size_t ready = m_code.EmitBranchPlaceholder(Condition::CS);
+					const size_t ready = m_code.EmitBranchPlaceholder(Condition::GE);
 					if (ready == static_cast<size_t>(-1) || !EmitAppendLocalFmacEntry(entry))
 						return false;
 					const size_t done = m_code.EmitBranchPlaceholder();
 					if (done == static_cast<size_t>(-1))
 						return false;
 					const size_t ready_target = m_code.Size();
-					if (!m_code.PatchBranch(ready, ready_target, Condition::CS) ||
+					if (!m_code.PatchBranch(ready, ready_target, Condition::GE) ||
 						!EmitPublishLocalFmacFlags(entry) ||
 						!m_code.PatchBranch(done, m_code.Size()))
 					{
