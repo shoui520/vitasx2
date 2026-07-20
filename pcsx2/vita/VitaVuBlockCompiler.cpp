@@ -7185,7 +7185,7 @@ namespace VitaVU
 				// pending ready cycle. Scan once and match either dependency. A
 				// ready entry can be ignored and `_vuTestPipes()` still owns
 				// flag/VF visibility after the stall cycle is applied.
-				constexpr unsigned HOST_INDEX = 0;
+				constexpr unsigned HOST_RING_END = 0;
 				constexpr unsigned HOST_PTR = 1;
 				constexpr unsigned HOST_VALUE = 2;
 				constexpr unsigned HOST_TEMP = 3;
@@ -7193,27 +7193,35 @@ namespace VitaVU
 				constexpr unsigned HOST_STALL_CYCLE_HI = HOST_CLIP_NEW;
 				constexpr unsigned HOST_COUNT = HOST_STALL_SCRATCH; // resident-cycle mode is disabled for stall-test blocks
 				constexpr size_t base = offsetof(VURegs, fmac);
+				constexpr size_t ring_bytes = 4 * sizeof(fmacPipe);
+				static_assert(sizeof(fmacPipe) == 48);
+				static_assert(ring_bytes <= 255);
 
+				// Keep the current circular-queue address live. Rebuilding
+				// base + ((readpos + i) & 3) * 48 at every entry costs three
+				// address instructions plus index/mask bookkeeping on A32.
+				// FMAC is exactly four entries, so one conditionally executed
+				// subtraction wraps the retained pointer without another branch.
 				if (!m_code.EmitLdrImm12(HOST_COUNT, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
+					!m_code.EmitCmpImm32(HOST_COUNT, 0))
+				{
+					return false;
+				}
+				const size_t empty_jump = m_code.EmitBranchPlaceholder(Condition::EQ);
+				if (empty_jump == static_cast<size_t>(-1) ||
 					!m_code.EmitLdrImm12(HOST_STALL_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
 					!m_code.EmitLdrImm12(HOST_STALL_CYCLE_HI, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) ||
-					!m_code.EmitLdrImm12(HOST_INDEX, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
-					!m_code.EmitMovImm8(HOST_CALL_SCRATCH, 0))
+					!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
+					!m_code.EmitAddImm32(HOST_RING_END, HOST_VU, base) ||
+					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_RING_END, HOST_CALL_SCRATCH, ShiftType::LSL, 5) ||
+					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_CALL_SCRATCH, ShiftType::LSL, 4) ||
+					!m_code.EmitAddImm8(HOST_RING_END, HOST_RING_END, static_cast<u8>(ring_bytes)))
 				{
 					return false;
 				}
 
 				const size_t loop_start = m_code.Size();
-				if (!m_code.EmitCmpReg(HOST_CALL_SCRATCH, HOST_COUNT))
-					return false;
-				const size_t done_jump = m_code.EmitBranchPlaceholder(Condition::CS);
-				if (done_jump == static_cast<size_t>(-1))
-					return false;
-
-				if (!m_code.EmitAddImm32(HOST_PTR, HOST_VU, base) ||
-					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_INDEX, ShiftType::LSL, 5) ||
-					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_INDEX, ShiftType::LSL, 4) ||
-					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
+				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, sCycle) + 4) ||
 					!m_code.EmitSubReg(HOST_VALUE, HOST_STALL_CYCLE_LO, HOST_VALUE, true) ||
 					!m_code.EmitSbcReg(HOST_TEMP, HOST_STALL_CYCLE_HI, HOST_TEMP, true) ||
@@ -7341,16 +7349,23 @@ namespace VitaVU
 					return false;
 				}
 
-				const size_t advance_index = m_code.Size();
-				if (!m_code.PatchBranch(skip_elapsed_high, advance_index, Condition::NE) ||
-					!m_code.PatchBranch(skip_elapsed_low, advance_index, Condition::CS) ||
+				const size_t advance_entry = m_code.Size();
+				if (!m_code.PatchBranch(skip_elapsed_high, advance_entry, Condition::NE) ||
+					!m_code.PatchBranch(skip_elapsed_low, advance_entry, Condition::CS) ||
 					(vf_reg1 != 0 &&
-						!m_code.PatchBranch(skip_no_lower_reg, advance_index, Condition::NE)) ||
-					!m_code.PatchBranch(skip_no_match, advance_index,
+						!m_code.PatchBranch(skip_no_lower_reg, advance_entry, Condition::NE)) ||
+					!m_code.PatchBranch(skip_no_match, advance_entry,
 						vf_reg1 != 0 ? Condition::EQ : Condition::AL) ||
-					!m_code.EmitAddImm8(HOST_INDEX, HOST_INDEX, 1) ||
-					!m_code.EmitAndImm32(HOST_INDEX, HOST_INDEX, 3) ||
-					!m_code.EmitAddImm8(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 1))
+					!m_code.EmitSubImm8(HOST_COUNT, HOST_COUNT, 1, true))
+				{
+					return false;
+				}
+				const size_t final_jump = m_code.EmitBranchPlaceholder(Condition::EQ);
+				if (final_jump == static_cast<size_t>(-1) ||
+					!m_code.EmitAddImm8(HOST_PTR, HOST_PTR, sizeof(fmacPipe)) ||
+					!m_code.EmitCmpReg(HOST_PTR, HOST_RING_END) ||
+					!m_code.EmitSubImm8(HOST_PTR, HOST_PTR, static_cast<u8>(ring_bytes), false,
+						Condition::EQ))
 				{
 					return false;
 				}
@@ -7361,7 +7376,9 @@ namespace VitaVU
 					return false;
 				}
 
-				return m_code.PatchBranch(done_jump, m_code.Size(), Condition::CS);
+				const size_t done_target = m_code.Size();
+				return m_code.PatchBranch(empty_jump, done_target, Condition::EQ) &&
+					m_code.PatchBranch(final_jump, done_target, Condition::EQ);
 			}
 
 			bool EmitInlineFmacStallTestBody(const _VURegsNum& regs)

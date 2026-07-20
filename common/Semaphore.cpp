@@ -7,6 +7,8 @@
 
 #ifdef _WIN32
 #include "common/RedtapeWindows.h"
+#else
+#include <cerrno>
 #endif
 
 #include <limits>
@@ -171,7 +173,21 @@ void Threading::KernelSemaphore::Wait()
 #ifdef _WIN32
 	WaitForSingleObject(m_sema, INFINITE);
 #else
-	sem_wait(&m_sema);
+	// POSIX sem_wait() is interruptible.  Returning without consuming a token
+	// breaks every userspace-counted semaphore layered on top of this primitive:
+	// its atomic count has already been decremented, so the next wait consumes
+	// the stale kernel wake and runs one notification ahead forever.  This is
+	// particularly destructive to PCSX2's MTVU -> MTGS packet handoff.
+	//
+	// The VitaSDK libstdc++ semaphore implementation uses this same EINTR retry
+	// contract.  Keep waiting until a resource was actually acquired, and make
+	// non-interruption failures fatal instead of silently corrupting accounting.
+	while (sem_wait(&m_sema) != 0)
+	{
+		if (errno == EINTR)
+			continue;
+		pxFailRel("sem_wait() failed");
+	}
 #endif
 }
 
@@ -180,7 +196,16 @@ bool Threading::KernelSemaphore::TryWait()
 #ifdef _WIN32
 	return WaitForSingleObject(m_sema, 0) == WAIT_OBJECT_0;
 #else
-	return sem_trywait(&m_sema) == 0;
+	for (;;)
+	{
+		if (sem_trywait(&m_sema) == 0)
+			return true;
+		if (errno == EINTR)
+			continue;
+		if (errno == EAGAIN)
+			return false;
+		pxFailRel("sem_trywait() failed");
+	}
 #endif
 }
 

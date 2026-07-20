@@ -644,13 +644,14 @@ namespace VitaA32
 					   ((rd & 0xfu) << 12) | encoded);
 	}
 
-	bool CodeBuffer::EmitSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	bool CodeBuffer::EmitSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags,
+		Condition condition)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
 		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
 			return true;
-		return EmitU32(EncodeSubImm8(rd, rn, value, set_flags));
+		return EmitU32(EncodeSubImm8(rd, rn, value, set_flags, condition));
 	}
 
 	bool CodeBuffer::EmitSubImm32(unsigned rd, unsigned rn, u32 value, bool set_flags)
@@ -2460,11 +2461,12 @@ namespace VitaA32
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | value;
 	}
 
-	u32 EncodeSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	u32 EncodeSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags,
+		Condition condition)
 	{
 		pxAssert(IsRegister(rd));
 		pxAssert(IsRegister(rn));
-		return CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_SUB | (set_flags ? SET_FLAGS : 0) |
+		return CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_SUB | (set_flags ? SET_FLAGS : 0) |
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | value;
 	}
 
