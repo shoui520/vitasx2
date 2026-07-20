@@ -675,6 +675,11 @@ namespace VitaVU
 			// interpreter fmacPipe state at the block seam.
 			bool local_fmac_pipeline = false;
 			u32 local_fmac_pipeline_pairs = 0;
+			// PCSX2 microVU owner: microVU_Analyze.inl's mVUregs pipeline
+			// state. Long local-FMAC blocks retain the coarse canonical-pipe
+			// activity predicate in their private frame instead of rebuilding it
+			// from five VURegs words before every pair.
+			bool resident_pipe_activity = false;
 			// PCSX2 owner: microVU_Flags.inl::mVUsetFlags() retains flag
 			// instances in compiler state until an observer or block seam. Keep
 			// STATUS and MAC in callee-saved A32 registers from block entry and
@@ -1069,6 +1074,7 @@ namespace VitaVU
 			block->vi_backup_zero_store_pairs = 0;
 			block->dt_flag_inline_pairs = 0;
 			block->resident_cycle = false;
+			block->resident_pipe_activity = false;
 			block->direct_link_tail = false;
 			block->direct_links = {};
 
@@ -1305,6 +1311,7 @@ namespace VitaVU
 				}
 
 				block->local_fmac_pipeline = !conservative_vu0 && CanUseLocalFmacPipeline(*block);
+				block->resident_pipe_activity = block->local_fmac_pipeline;
 				if (block->local_fmac_pipeline)
 				{
 					for (u32 i = 4; i < block->pair_count; i++)
@@ -1388,8 +1395,9 @@ namespace VitaVU
 		constexpr u32 LOCAL_FMAC_STATUS_OFFSET = 12;
 		constexpr u32 LOCAL_FMAC_CLIP_OFFSET = 16;
 		constexpr u32 DEFERRED_LIMIT_SAVE_OFFSET = 128;
-		constexpr u32 STACK_FRAME_SIZE = 140; // hazards + local FMAC slots + saved linked-chain limit
-		constexpr u32 VECTOR_STACK_FRAME_SIZE = 136;
+		constexpr u32 PIPE_ACTIVITY_SAVE_OFFSET = 136;
+		constexpr u32 STACK_FRAME_SIZE = 140; // hazards + local FMAC slots + linked limit + pipe activity
+		constexpr u32 VECTOR_STACK_FRAME_SIZE = 144;
 
 			struct CachedBlock;
 			struct Vu1Program;
@@ -1625,6 +1633,8 @@ namespace VitaVU
 					{
 						return false;
 					}
+					if (!EmitRefreshResidentPipeActivity())
+						return false;
 					const size_t deferred_flags_linked_to_body = m_code.EmitBranchPlaceholder();
 					if (deferred_flags_linked_to_body == static_cast<size_t>(-1) ||
 						!m_code.PatchBranch(deferred_flags_linked_to_body, body_offset))
@@ -1670,6 +1680,8 @@ namespace VitaVU
 				{
 					return false;
 				}
+				if (!EmitRefreshResidentPipeActivity())
+					return false;
 				const size_t linked_to_body = m_code.EmitBranchPlaceholder();
 				if (linked_to_body == static_cast<size_t>(-1) ||
 					!m_code.PatchBranch(linked_to_body, body_offset))
@@ -1788,6 +1800,45 @@ namespace VitaVU
 					Condition condition = Condition::CS;
 				};
 
+			bool UsesResidentPipeActivity() const
+			{
+				return m_plan.resident_pipe_activity;
+			}
+
+			bool EmitRefreshResidentPipeActivity()
+			{
+				if (!UsesResidentPipeActivity())
+					return true;
+
+				// PCSX2 owner: VUops.cpp::_vuTestPipes() and microVU's mVUregs
+				// pipeline state. Only the zero/nonzero aggregate is private; the
+				// canonical queues, timestamps, values, and publication order remain
+				// in VURegs and are handled by the exact existing publisher.
+				return m_code.EmitLdrImm12(0, HOST_VU,
+						VuOffset(offsetof(VURegs, fmaccount))) &&
+					m_code.EmitLdrImm12(1, HOST_VU,
+						VuOffset(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable))) &&
+					m_code.EmitLdrImm12(2, HOST_VU,
+						VuOffset(offsetof(VURegs, efu) + offsetof(efuPipe, enable))) &&
+					m_code.EmitLdrImm12(3, HOST_VU,
+						VuOffset(offsetof(VURegs, ialucount))) &&
+					m_code.EmitOrrReg(0, 0, 1) &&
+					m_code.EmitOrrReg(2, 2, 3) &&
+					m_code.EmitLdrImm12(1, HOST_VU,
+						VuOffset(offsetof(VURegs, xgkickenable))) &&
+					m_code.EmitOrrReg(0, 0, 2) &&
+					m_code.EmitOrrReg(0, 0, 1) &&
+					m_code.EmitStrImm12(0, SP, PIPE_ACTIVITY_SAVE_OFFSET);
+			}
+
+			bool EmitMarkResidentPipeActivity()
+			{
+				if (!UsesResidentPipeActivity())
+					return true;
+				return m_code.EmitMovImm8(0, 1) &&
+					m_code.EmitStrImm12(0, SP, PIPE_ACTIVITY_SAVE_OFFSET);
+			}
+
 			bool EmitPrologue()
 			{
 				if (!m_code.EmitPush(SAVED_REGISTER_MASK))
@@ -1824,6 +1875,8 @@ namespace VitaVU
 				{
 					return false;
 				}
+				if (!EmitRefreshResidentPipeActivity())
+					return false;
 
 				if (!m_resident_cycle)
 					return true;
@@ -2911,10 +2964,10 @@ namespace VitaVU
 
 #if defined(VITASX2_QEMU_VALIDATION)
 					if (!EmitQemuTestPipesFastSkipCounter())
-					return false;
+						return false;
 #endif
 
-					return true;
+					return EmitRefreshResidentPipeActivity();
 				}
 
 				bool EmitTestPipesFastGuard(bool deferred_fmac_flags)
@@ -2930,6 +2983,41 @@ namespace VitaVU
 					// branch condition without a separate CMP. This makes the common
 					// no-pipeline path ten straight-line A32 instructions and avoids the
 					// shared thunk, five queue arms, and return entirely.
+					if (UsesResidentPipeActivity())
+					{
+						// The exact publisher refreshes this private aggregate whenever it
+						// runs, and every canonical in-block pipe creation marks it. The
+						// overwhelmingly common local-FMAC steady state therefore needs one
+						// hot-stack load and a test instead of five VURegs loads plus four ORs.
+						if (!m_code.EmitLdrImm12(0, SP, PIPE_ACTIVITY_SAVE_OFFSET) ||
+							!m_code.EmitCmpImm32(0, 0))
+						{
+							return false;
+						}
+						const size_t empty = m_code.EmitBranchPlaceholder(Condition::EQ);
+						if (empty == static_cast<size_t>(-1))
+							return false;
+
+						const size_t call_site = m_code.EmitBranchLinkPlaceholder();
+						if (call_site == static_cast<size_t>(-1))
+							return false;
+						(deferred_fmac_flags ? m_deferred_test_pipes_fast_guard_calls :
+							m_test_pipes_fast_guard_calls).push_back(call_site);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+						const size_t done = m_code.EmitBranchPlaceholder();
+						if (done == static_cast<size_t>(-1) ||
+							!m_code.PatchBranch(empty, m_code.Size(), Condition::EQ) ||
+							!EmitQemuAllPipesEmptyFastSkipCounter())
+						{
+							return false;
+						}
+						return m_code.PatchBranch(done, m_code.Size());
+#else
+						return m_code.PatchBranch(empty, m_code.Size(), Condition::EQ);
+#endif
+					}
+
 					if (!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
 						!m_code.EmitLdrImm12(1, HOST_VU,
 							VuOffset(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable))) ||
@@ -8970,17 +9058,18 @@ namespace VitaVU
 					return false;
 				}
 				if (plan.fmac_pipe && !local_fmac_commit &&
-					!EmitInlineCommitFmacPipe(plan))
+					(!EmitInlineCommitFmacPipe(plan) || !EmitMarkResidentPipeActivity()))
 				{
 					return false;
 				}
 				if (plan.add_lower_stalls && plan.lregs.pipe != VUPIPE_FMAC && plan.lower_stall_inline)
 				{
-					if (!EmitInlineAddLowerStalls(plan))
+					if (!EmitInlineAddLowerStalls(plan) || !EmitMarkResidentPipeActivity())
 						return false;
 				}
 				else if (plan.add_lower_stalls && plan.lregs.pipe != VUPIPE_FMAC &&
-					!EmitCallHelperRegs(reinterpret_cast<const void*>(&_vuAddLowerStalls), &m_pairs[pair_index].lregs))
+					(!EmitCallHelperRegs(reinterpret_cast<const void*>(&_vuAddLowerStalls),
+						&m_pairs[pair_index].lregs) || !EmitMarkResidentPipeActivity()))
 				{
 					return false;
 				}
@@ -9832,6 +9921,11 @@ namespace VitaVU
 							s_vu1.stats.local_fmac_pipeline_blocks++;
 							s_vu1.stats.local_fmac_pipeline_pairs +=
 								plan.local_fmac_pipeline_pairs;
+						}
+						if (plan.resident_pipe_activity)
+						{
+							s_vu1.stats.resident_pipe_activity_blocks++;
+							s_vu1.stats.resident_pipe_activity_pairs += plan.pair_count;
 						}
 						if (plan.deferred_fmac_flags)
 						{
