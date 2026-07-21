@@ -3930,6 +3930,18 @@ namespace VitaVU
 				return m_code.EmitLdrImm12(rd, HOST_VU, ViOffset(reg));
 			}
 
+			bool EmitLoadViLowResultOperand(unsigned rd, unsigned reg)
+			{
+				// Sony VI00-VI15 arithmetic publishes only the low 16-bit result.
+				// Loading the aligned host word is therefore congruent for ADD,
+				// SUB, AND, and OR, while using A32 LDR's 12-bit immediate instead
+				// of a separate address ADD plus LDRH.
+				if (reg == 0)
+					return m_code.EmitMovImm8(rd, 0);
+
+				return EmitLoadViWordRaw(rd, reg);
+			}
+
 			bool EmitStoreViWordRaw(unsigned rs, unsigned reg)
 			{
 				return m_code.EmitStrImm12(rs, HOST_VU, ViOffset(reg));
@@ -6482,82 +6494,169 @@ namespace VitaVU
 						dest = VUInterpFast::It(code);
 						if (dest == 0)
 							return true;
-						emitted_body =
-							EmitInlineBackupVI(dest) &&
-							EmitLoadViHalfword(0, VUInterpFast::Is(code)) &&
-							EmitAddSignedImmToR0(VUInterpFast::Imm15(code)) &&
-							EmitStoreViHalfword(0, dest);
+						emitted_body = EmitInlineBackupVI(dest);
+						if (VUInterpFast::Imm15(code) != 0 || dest != VUInterpFast::Is(code))
+						{
+							emitted_body = emitted_body &&
+								EmitLoadViLowResultOperand(0, VUInterpFast::Is(code)) &&
+								EmitAddSignedImmToR0(VUInterpFast::Imm15(code)) &&
+								EmitStoreViHalfword(0, dest);
+						}
 						break;
 
 					case VUInterpFast::LowerFastKind::ISUBIU:
 						dest = VUInterpFast::It(code);
 						if (dest == 0)
 							return true;
-						emitted_body =
-							EmitInlineBackupVI(dest) &&
-							EmitLoadViHalfword(0, VUInterpFast::Is(code)) &&
-							EmitAddSignedImmToR0(-VUInterpFast::Imm15(code)) &&
-							EmitStoreViHalfword(0, dest);
+						emitted_body = EmitInlineBackupVI(dest);
+						if (VUInterpFast::Imm15(code) != 0 || dest != VUInterpFast::Is(code))
+						{
+							emitted_body = emitted_body &&
+								EmitLoadViLowResultOperand(0, VUInterpFast::Is(code)) &&
+								EmitAddSignedImmToR0(-VUInterpFast::Imm15(code)) &&
+								EmitStoreViHalfword(0, dest);
+						}
 						break;
 
 					case VUInterpFast::LowerFastKind::IADD:
+					{
 						dest = VUInterpFast::Id(code);
 						if (dest == 0)
 							return true;
-						emitted_body =
-							EmitInlineBackupVI(dest) &&
-							EmitLoadViHalfword(0, VUInterpFast::Is(code)) &&
-							EmitLoadViHalfword(1, VUInterpFast::It(code)) &&
-							m_code.EmitAddReg(0, 0, 1) &&
-							EmitStoreViHalfword(0, dest);
+						const unsigned is = VUInterpFast::Is(code);
+						const unsigned it = VUInterpFast::It(code);
+						emitted_body = EmitInlineBackupVI(dest);
+						if (is == 0 || it == 0)
+						{
+							const unsigned source = is == 0 ? it : is;
+							if (dest != source)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, source) &&
+									EmitStoreViHalfword(0, dest);
+							}
+						}
+						else
+						{
+							emitted_body = emitted_body &&
+								EmitLoadViLowResultOperand(0, is) &&
+								EmitLoadViLowResultOperand(1, it) &&
+								m_code.EmitAddReg(0, 0, 1) &&
+								EmitStoreViHalfword(0, dest);
+						}
 						break;
+					}
 
 					case VUInterpFast::LowerFastKind::ISUB:
+					{
 						dest = VUInterpFast::Id(code);
 						if (dest == 0)
 							return true;
-						emitted_body =
-							EmitInlineBackupVI(dest) &&
-							EmitLoadViHalfword(0, VUInterpFast::Is(code)) &&
-							EmitLoadViHalfword(1, VUInterpFast::It(code)) &&
-							m_code.EmitSubReg(0, 0, 1) &&
-							EmitStoreViHalfword(0, dest);
+						const unsigned is = VUInterpFast::Is(code);
+						const unsigned it = VUInterpFast::It(code);
+						emitted_body = EmitInlineBackupVI(dest);
+						if (is == it)
+						{
+							emitted_body = emitted_body &&
+								m_code.EmitMovImm8(0, 0) &&
+								EmitStoreViHalfword(0, dest);
+						}
+						else if (it == 0)
+						{
+							if (dest != is)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									EmitStoreViHalfword(0, dest);
+							}
+						}
+						else
+						{
+							emitted_body = emitted_body &&
+								EmitLoadViLowResultOperand(0, is) &&
+								EmitLoadViLowResultOperand(1, it) &&
+								m_code.EmitSubReg(0, 0, 1) &&
+								EmitStoreViHalfword(0, dest);
+						}
 						break;
+					}
 
 					case VUInterpFast::LowerFastKind::IADDI:
 						dest = VUInterpFast::It(code);
 						if (dest == 0)
 							return true;
-						emitted_body =
-							EmitInlineBackupVI(dest) &&
-							EmitLoadViHalfword(0, VUInterpFast::Is(code)) &&
-							EmitAddSignedImmToR0(VUInterpFast::Imm5(code)) &&
-							EmitStoreViHalfword(0, dest);
+						emitted_body = EmitInlineBackupVI(dest);
+						if (VUInterpFast::Imm5(code) != 0 || dest != VUInterpFast::Is(code))
+						{
+							emitted_body = emitted_body &&
+								EmitLoadViLowResultOperand(0, VUInterpFast::Is(code)) &&
+								EmitAddSignedImmToR0(VUInterpFast::Imm5(code)) &&
+								EmitStoreViHalfword(0, dest);
+						}
 						break;
 
 					case VUInterpFast::LowerFastKind::IAND:
+					{
 						dest = VUInterpFast::Id(code);
 						if (dest == 0)
 							return true;
-						emitted_body =
-							EmitInlineBackupVI(dest) &&
-							EmitLoadViHalfword(0, VUInterpFast::Is(code)) &&
-							EmitLoadViHalfword(1, VUInterpFast::It(code)) &&
-							m_code.EmitAndReg(0, 0, 1) &&
-							EmitStoreViHalfword(0, dest);
+						const unsigned is = VUInterpFast::Is(code);
+						const unsigned it = VUInterpFast::It(code);
+						emitted_body = EmitInlineBackupVI(dest);
+						if (is == it)
+						{
+							if (dest != is)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									EmitStoreViHalfword(0, dest);
+							}
+						}
+						else if (is == 0 || it == 0)
+						{
+							emitted_body = emitted_body &&
+								m_code.EmitMovImm8(0, 0) &&
+								EmitStoreViHalfword(0, dest);
+						}
+						else
+						{
+							emitted_body = emitted_body &&
+								EmitLoadViLowResultOperand(0, is) &&
+								EmitLoadViLowResultOperand(1, it) &&
+								m_code.EmitAndReg(0, 0, 1) &&
+								EmitStoreViHalfword(0, dest);
+						}
 						break;
+					}
 
 					case VUInterpFast::LowerFastKind::IOR:
+					{
 						dest = VUInterpFast::Id(code);
 						if (dest == 0)
 							return true;
-						emitted_body =
-							EmitInlineBackupVI(dest) &&
-							EmitLoadViHalfword(0, VUInterpFast::Is(code)) &&
-							EmitLoadViHalfword(1, VUInterpFast::It(code)) &&
-							m_code.EmitOrrReg(0, 0, 1) &&
-							EmitStoreViHalfword(0, dest);
+						const unsigned is = VUInterpFast::Is(code);
+						const unsigned it = VUInterpFast::It(code);
+						emitted_body = EmitInlineBackupVI(dest);
+						if (is == it || is == 0 || it == 0)
+						{
+							const unsigned source = is == 0 ? it : is;
+							if (dest != source)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, source) &&
+									EmitStoreViHalfword(0, dest);
+							}
+						}
+						else
+						{
+							emitted_body = emitted_body &&
+								EmitLoadViLowResultOperand(0, is) &&
+								EmitLoadViLowResultOperand(1, it) &&
+								m_code.EmitOrrReg(0, 0, 1) &&
+								EmitStoreViHalfword(0, dest);
+						}
 						break;
+					}
 
 					default:
 						return false;
