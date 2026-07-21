@@ -8757,7 +8757,7 @@ namespace VitaVU
 			}
 
 			bool EmitInlineFmacStallTestReads(unsigned vf_reg0, unsigned xyzw0,
-				unsigned vf_reg1, unsigned xyzw1)
+				unsigned vf_reg1, unsigned xyzw1, bool resident_cycle_pair)
 			{
 				if (vf_reg0 == 0 || xyzw0 == 0)
 				{
@@ -8791,8 +8791,14 @@ namespace VitaVU
 				constexpr unsigned HOST_PTR = 1;
 				constexpr unsigned HOST_VALUE = 2;
 				constexpr unsigned HOST_TEMP = 3;
-				constexpr unsigned HOST_STALL_CYCLE_LO = HOST_CLIP_OLD;
-				constexpr unsigned HOST_STALL_CYCLE_HI = HOST_CLIP_NEW;
+				// Full resident-cycle blocks already own the exact current cycle in
+				// r5:r9. The scan has no externally observable seam, so consume and
+				// advance that pair directly. Other blocks retain the canonical
+				// VURegs::cycle contract and use the CLIP-backup scratch pair.
+				const unsigned HOST_STALL_CYCLE_LO =
+					resident_cycle_pair ? HOST_CYCLE_LO : HOST_CLIP_OLD;
+				const unsigned HOST_STALL_CYCLE_HI =
+					resident_cycle_pair ? HOST_CYCLE_HI : HOST_CLIP_NEW;
 				// Preserve r10 when it owns the resident pipe aggregate. LR is saved by
 				// the generated-block prologue and this inline scan contains no call.
 				const unsigned HOST_COUNT = UsesResidentPipeActivity() ? 14u :
@@ -8821,8 +8827,11 @@ namespace VitaVU
 				}
 				const size_t empty_jump = m_code.EmitBranchPlaceholder(Condition::EQ);
 				if (empty_jump == static_cast<size_t>(-1) ||
-					!m_code.EmitLdrImm12(HOST_STALL_CYCLE_LO, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
-					!m_code.EmitLdrImm12(HOST_STALL_CYCLE_HI, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) ||
+					(!resident_cycle_pair &&
+						(!m_code.EmitLdrImm12(HOST_STALL_CYCLE_LO, HOST_VU,
+							VuOffset(offsetof(VURegs, cycle))) ||
+						 !m_code.EmitLdrImm12(HOST_STALL_CYCLE_HI, HOST_VU,
+							 VuOffset(offsetof(VURegs, cycle) + 4)))) ||
 					!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
 					!m_code.EmitAddImm32(HOST_RING_END, HOST_VU, base) ||
 					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_RING_END, HOST_CALL_SCRATCH, ShiftType::LSL, 5) ||
@@ -8952,8 +8961,11 @@ namespace VitaVU
 						FMAC_PIPELINE_LATENCY_CYCLES, true) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, sCycle) + 4) ||
 					!m_code.EmitAdcImm8(HOST_TEMP, HOST_TEMP, 0) ||
-					!m_code.EmitStrImm12(HOST_VALUE, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
-					!m_code.EmitStrImm12(HOST_TEMP, HOST_VU, VuOffset(offsetof(VURegs, cycle) + 4)) ||
+					(!resident_cycle_pair &&
+						(!m_code.EmitStrImm12(HOST_VALUE, HOST_VU,
+							VuOffset(offsetof(VURegs, cycle))) ||
+						 !m_code.EmitStrImm12(HOST_TEMP, HOST_VU,
+							 VuOffset(offsetof(VURegs, cycle) + 4)))) ||
 					!EmitMovReg(HOST_STALL_CYCLE_LO, HOST_VALUE) ||
 					!EmitMovReg(HOST_STALL_CYCLE_HI, HOST_TEMP))
 				{
@@ -8992,15 +9004,17 @@ namespace VitaVU
 					m_code.PatchBranch(final_jump, done_target, Condition::EQ);
 			}
 
-			bool EmitInlineFmacStallTestBody(const _VURegsNum& regs)
+			bool EmitInlineFmacStallTestBody(const _VURegsNum& regs,
+				bool resident_cycle_pair = false)
 			{
 				return EmitInlineFmacStallTestReads(regs.VFread0, regs.VFr0xyzw,
-					regs.VFread1, regs.VFr1xyzw);
+					regs.VFread1, regs.VFr1xyzw, resident_cycle_pair);
 			}
 
-			bool EmitInlineFmacStallTest(const _VURegsNum& regs, bool upper)
+			bool EmitInlineFmacStallTest(const _VURegsNum& regs, bool upper,
+				bool resident_cycle_pair)
 			{
-				if (!EmitInlineFmacStallTestBody(regs))
+				if (!EmitInlineFmacStallTestBody(regs, resident_cycle_pair))
 					return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -9009,6 +9023,21 @@ namespace VitaVU
 #else
 				return true;
 #endif
+			}
+
+			bool EmitInlineFmacStallTestPreservingCycleResidency(
+				const _VURegsNum& regs, bool upper)
+			{
+				// Canonical queue state remains in VURegs, but a full resident block
+				// has an exact r5:r9 cycle pair. No helper or dispatcher can observe
+				// cycle during this generated scan; publisher seams already materialize
+				// the pair. Avoid six cycle loads/stores at each direct scan site.
+				if (m_resident_cycle_high)
+					return EmitInlineFmacStallTest(regs, upper, true);
+
+				return EmitPublishResidentCycle() &&
+					EmitInlineFmacStallTest(regs, upper, false) &&
+					EmitResyncResidentCycle();
 			}
 
 			bool EmitStoreCycleIfNewer(unsigned new_lo, unsigned new_hi,
@@ -10737,12 +10766,8 @@ namespace VitaVU
 				if (plan.test_upper_stalls && !elide_upper_canonical_fmac &&
 					plan.upper_fmac_stall_test_inline)
 				{
-					// Canonical queue scans may advance VURegs::cycle. Local-FMAC
-					// blocks otherwise keep cycle.low resident in r5, so publish and
-					// resynchronize only around these warm-up/exceptional scans.
-					if (!EmitPublishResidentCycle() ||
-						!EmitInlineFmacStallTest(m_pairs[pair_index].uregs, true) ||
-						!EmitResyncResidentCycle())
+					if (!EmitInlineFmacStallTestPreservingCycleResidency(
+						m_pairs[pair_index].uregs, true))
 						return false;
 				}
 				else if (plan.test_upper_stalls && !elide_upper_canonical_fmac &&
@@ -10757,9 +10782,8 @@ namespace VitaVU
 				if (plan.test_lower_stalls && !elide_lower_canonical_fmac &&
 					plan.lower_fmac_stall_test_inline)
 				{
-					if (!EmitPublishResidentCycle() ||
-						!EmitInlineFmacStallTest(m_pairs[pair_index].lregs, false) ||
-						!EmitResyncResidentCycle())
+					if (!EmitInlineFmacStallTestPreservingCycleResidency(
+						m_pairs[pair_index].lregs, false))
 						return false;
 				}
 				else if (plan.test_lower_stalls && plan.lower_fdiv_stall_test_inline)
