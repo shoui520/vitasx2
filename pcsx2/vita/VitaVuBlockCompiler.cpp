@@ -9058,25 +9058,38 @@ namespace VitaVU
 				}
 
 				const size_t loop_start = m_code.Size();
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+				// r8/r12 are not yet occupied by this pair's optional CLIP
+				// backup, so a cycle-resident scan retains the exact issue
+				// timestamp there. Keep the common elapsed test instruction-for-
+				// instruction identical to PCSX2's unsigned
+				// (current - sCycle) >= 4 operation. On a real dependency those
+				// same retained words then form sCycle + 4, removing the old
+				// second pair of Cortex-A9 data-cache loads.
+				const unsigned HOST_ISSUE_LO = resident_cycle_pair ?
+					HOST_CLIP_OLD : HOST_VALUE;
+				const unsigned HOST_ISSUE_HI = resident_cycle_pair ?
+					HOST_CALL_SCRATCH : HOST_TEMP;
+				if (!m_code.EmitLdrImm12(HOST_ISSUE_LO, HOST_PTR,
 						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle))) ||
-					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+					!m_code.EmitLdrImm12(HOST_ISSUE_HI, HOST_PTR,
 						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle) + 4)) ||
-					!m_code.EmitSubReg(HOST_VALUE, HOST_STALL_CYCLE_LO, HOST_VALUE, true) ||
-					!m_code.EmitSbcReg(HOST_TEMP, HOST_STALL_CYCLE_HI, HOST_TEMP, true) ||
+					!m_code.EmitSubReg(HOST_VALUE, HOST_STALL_CYCLE_LO,
+						HOST_ISSUE_LO, true) ||
+					!m_code.EmitSbcReg(HOST_TEMP, HOST_STALL_CYCLE_HI,
+						HOST_ISSUE_HI, true) ||
 					!m_code.EmitCmpImm32(HOST_TEMP, 0))
 				{
 					return false;
 				}
-				const size_t skip_elapsed_high = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (skip_elapsed_high == static_cast<size_t>(-1))
-					return false;
-
-				if (!m_code.EmitCmpImm32(HOST_VALUE, FMAC_PIPELINE_LATENCY_CYCLES))
+				const size_t skip_elapsed_high =
+					m_code.EmitBranchPlaceholder(Condition::NE);
+				if (skip_elapsed_high == static_cast<size_t>(-1) ||
+					!m_code.EmitCmpImm32(HOST_VALUE, FMAC_PIPELINE_LATENCY_CYCLES))
 				{
 					return false;
 				}
-				const size_t skip_elapsed_low = m_code.EmitBranchPlaceholder(Condition::CS);
+				const size_t skip_elapsed_low =
+					m_code.EmitBranchPlaceholder(Condition::CS);
 				if (skip_elapsed_low == static_cast<size_t>(-1))
 					return false;
 
@@ -9180,20 +9193,25 @@ namespace VitaVU
 					if (!m_code.PatchBranch(matched_jumps[i], match_target, Condition::NE))
 						return false;
 				}
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
-						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle))) ||
-					!m_code.EmitAddImm8(HOST_VALUE, HOST_VALUE,
+				if (resident_cycle_pair ?
+					(!m_code.EmitAddImm8(HOST_CLIP_OLD, HOST_CLIP_OLD,
 						FMAC_PIPELINE_LATENCY_CYCLES, true) ||
-					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+					 !m_code.EmitAdcImm8(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 0) ||
+					 !EmitMovReg(HOST_STALL_CYCLE_LO, HOST_CLIP_OLD) ||
+					 !EmitMovReg(HOST_STALL_CYCLE_HI, HOST_CALL_SCRATCH)) :
+					(!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle))) ||
+					 !m_code.EmitAddImm8(HOST_VALUE, HOST_VALUE,
+						FMAC_PIPELINE_LATENCY_CYCLES, true) ||
+					 !m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
 						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle) + 4)) ||
-					!m_code.EmitAdcImm8(HOST_TEMP, HOST_TEMP, 0) ||
-					(!resident_cycle_pair &&
+					 !m_code.EmitAdcImm8(HOST_TEMP, HOST_TEMP, 0) ||
 						(!m_code.EmitStrImm12(HOST_VALUE, HOST_VU,
 							VuOffset(offsetof(VURegs, cycle))) ||
 						 !m_code.EmitStrImm12(HOST_TEMP, HOST_VU,
-							 VuOffset(offsetof(VURegs, cycle) + 4)))) ||
-					!EmitMovReg(HOST_STALL_CYCLE_LO, HOST_VALUE) ||
-					!EmitMovReg(HOST_STALL_CYCLE_HI, HOST_TEMP))
+							 VuOffset(offsetof(VURegs, cycle) + 4))) ||
+					 !EmitMovReg(HOST_STALL_CYCLE_LO, HOST_VALUE) ||
+					 !EmitMovReg(HOST_STALL_CYCLE_HI, HOST_TEMP)))
 				{
 					return false;
 				}
