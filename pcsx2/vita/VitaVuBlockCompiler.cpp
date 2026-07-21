@@ -6350,7 +6350,7 @@ namespace VitaVU
 					(m_code.EmitMovImm32(1, magnitude) && m_code.EmitSubReg(0, 0, 1));
 			}
 
-			bool EmitVuDataMemoryPointerFromRawByteAddress()
+			bool EmitVuDataMemoryPointerFromRawByteAddress(unsigned mask_scratch = 2)
 			{
 				// PCSX2 owner: VUops.cpp::GET_VU_MEM(). VU1 wraps to VU1 data
 				// RAM; VU0 either wraps to VU0 data RAM or maps 0x4000-tagged
@@ -6364,7 +6364,7 @@ namespace VitaVU
 					if (data_ram == static_cast<size_t>(-1))
 						return false;
 
-					if (!EmitAndRegImm32(1, 1, 0x3ffu, 2) ||
+					if (!EmitAndRegImm32(1, 1, 0x3ffu, mask_scratch) ||
 						!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&VU1.VF[0]))) ||
 						!m_code.EmitAddReg(0, 0, 1))
 					{
@@ -6377,7 +6377,7 @@ namespace VitaVU
 					const size_t data_ram_target = m_code.Size();
 					if (!m_code.PatchBranch(data_ram, data_ram_target, Condition::EQ))
 						return false;
-					if (!EmitAndRegImm32(1, 1, m_mem_mask, 2) ||
+					if (!EmitAndRegImm32(1, 1, m_mem_mask, mask_scratch) ||
 						!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, Mem))) ||
 						!m_code.EmitAddReg(0, 0, 1))
 					{
@@ -6386,24 +6386,33 @@ namespace VitaVU
 					return m_code.PatchBranch(done, m_code.Size());
 				}
 
-				return EmitAndRegImm32(1, 1, m_mem_mask, 2) &&
+				return EmitAndRegImm32(1, 1, m_mem_mask, mask_scratch) &&
 					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, Mem))) &&
 					m_code.EmitAddReg(0, 0, 1);
 			}
 
+			bool EmitVuDataMemoryAddressFromQwordIndex(unsigned index_reg,
+				unsigned mask_scratch = 2)
+			{
+				return m_code.EmitMovRegShiftImm(1, index_reg, ShiftType::LSL, 4) &&
+					EmitVuDataMemoryPointerFromRawByteAddress(mask_scratch);
+			}
+
 			bool EmitVuDataMemoryAddressFromBaseImm(unsigned vi_reg, s32 imm)
 			{
-				return EmitLoadViSignedHalfwordRaw(0, vi_reg) &&
+				// VU VI00-VI15 are 16-bit. GET_VU_MEM discards every host word
+				// bit above that architectural value after the add and << 4, so
+				// an aligned LDR is equivalent here and avoids the Cortex-A9's
+				// separate address-forming ADD required by LDRSH.
+				return EmitLoadViWordRaw(0, vi_reg) &&
 					EmitAddSignedImmToR0(imm) &&
-					m_code.EmitMovRegShiftImm(1, 0, ShiftType::LSL, 4) &&
-					EmitVuDataMemoryPointerFromRawByteAddress();
+					EmitVuDataMemoryAddressFromQwordIndex(0);
 			}
 
 			bool EmitVuDataMemoryAddressFromVi(unsigned vi_reg)
 			{
-				return EmitLoadViHalfwordRaw(0, vi_reg) &&
-					m_code.EmitMovRegShiftImm(1, 0, ShiftType::LSL, 4) &&
-					EmitVuDataMemoryPointerFromRawByteAddress();
+				return EmitLoadViWordRaw(0, vi_reg) &&
+					EmitVuDataMemoryAddressFromQwordIndex(0);
 			}
 
 			bool EmitInlineBackupVI(unsigned reg)
@@ -6961,19 +6970,37 @@ namespace VitaVU
 					case VUInterpFast::LowerFastKind::LQI:
 					{
 						const unsigned is = VUInterpFast::Is(code);
+						const bool load_memory = VUInterpFast::Ft(code) != 0 && mask != 0;
+						const bool postincrement = VUInterpFast::Fs(code) != 0;
 						emitted_body = EmitInlineBackupVI(is);
-						if (VUInterpFast::Ft(code) != 0 && mask != 0)
+						if (load_memory && postincrement)
 						{
+							// PCSX2's microVU_Lower.inl::mVU_LQI keeps the VI value
+							// in a host register for both the load address and VI++.
+							// r2 survives the r0/r1 memory path; r3 supplies the
+							// address-mask literal and the eventual STRH address.
 							emitted_body = emitted_body &&
-								EmitVuDataMemoryAddressFromVi(is) &&
-								EmitLoadVfMaskedFromAddress(VUInterpFast::Ft(code), mask);
+								EmitLoadViWordRaw(2, is) &&
+								EmitVuDataMemoryAddressFromQwordIndex(2, 3) &&
+								EmitLoadVfMaskedFromAddress(VUInterpFast::Ft(code), mask) &&
+								m_code.EmitAddImm8(2, 2, 1) &&
+								EmitStoreViHalfword(2, is);
 						}
-						if (VUInterpFast::Fs(code) != 0)
+						else
 						{
-							emitted_body = emitted_body &&
-								EmitLoadViHalfwordRaw(0, is) &&
-								m_code.EmitAddImm8(0, 0, 1) &&
-								EmitStoreViHalfword(0, is);
+							if (load_memory)
+							{
+								emitted_body = emitted_body &&
+									EmitVuDataMemoryAddressFromVi(is) &&
+									EmitLoadVfMaskedFromAddress(VUInterpFast::Ft(code), mask);
+							}
+							if (postincrement)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViWordRaw(0, is) &&
+									m_code.EmitAddImm8(0, 0, 1) &&
+									EmitStoreViHalfword(0, is);
+							}
 						}
 						break;
 					}
@@ -6981,19 +7008,32 @@ namespace VitaVU
 					case VUInterpFast::LowerFastKind::LQD:
 					{
 						const unsigned is = VUInterpFast::Is(code);
+						const bool load_memory = VUInterpFast::Ft(code) != 0 && mask != 0;
 						emitted_body = EmitInlineBackupVI(is);
-						if (is != 0)
+						if (is != 0 && load_memory)
 						{
 							emitted_body = emitted_body &&
-								EmitLoadViHalfwordRaw(0, is) &&
-								m_code.EmitSubImm8(0, 0, 1) &&
-								EmitStoreViHalfword(0, is);
-						}
-						if (VUInterpFast::Ft(code) != 0 && mask != 0)
-						{
-							emitted_body = emitted_body &&
-								EmitVuDataMemoryAddressFromVi(is) &&
+								EmitLoadViWordRaw(2, is) &&
+								m_code.EmitSubImm8(2, 2, 1) &&
+								EmitStoreViHalfword(2, is) &&
+								EmitVuDataMemoryAddressFromQwordIndex(2, 3) &&
 								EmitLoadVfMaskedFromAddress(VUInterpFast::Ft(code), mask);
+						}
+						else
+						{
+							if (is != 0)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViWordRaw(0, is) &&
+									m_code.EmitSubImm8(0, 0, 1) &&
+									EmitStoreViHalfword(0, is);
+							}
+							if (load_memory)
+							{
+								emitted_body = emitted_body &&
+									EmitVuDataMemoryAddressFromVi(is) &&
+									EmitLoadVfMaskedFromAddress(VUInterpFast::Ft(code), mask);
+							}
 						}
 						break;
 					}
@@ -7001,19 +7041,33 @@ namespace VitaVU
 					case VUInterpFast::LowerFastKind::SQI:
 					{
 						const unsigned it = VUInterpFast::It(code);
+						const bool store_memory = mask != 0;
+						const bool postincrement = VUInterpFast::Ft(code) != 0;
 						emitted_body = EmitInlineBackupVI(it);
-						if (mask != 0)
+						if (store_memory && postincrement)
 						{
 							emitted_body = emitted_body &&
-								EmitVuDataMemoryAddressFromVi(it) &&
-								EmitStoreVfMaskedToAddress(VUInterpFast::Fs(code), mask);
+								EmitLoadViWordRaw(2, it) &&
+								EmitVuDataMemoryAddressFromQwordIndex(2, 3) &&
+								EmitStoreVfMaskedToAddress(VUInterpFast::Fs(code), mask) &&
+								m_code.EmitAddImm8(2, 2, 1) &&
+								EmitStoreViHalfword(2, it);
 						}
-						if (VUInterpFast::Ft(code) != 0)
+						else
 						{
-							emitted_body = emitted_body &&
-								EmitLoadViHalfwordRaw(0, it) &&
-								m_code.EmitAddImm8(0, 0, 1) &&
-								EmitStoreViHalfword(0, it);
+							if (store_memory)
+							{
+								emitted_body = emitted_body &&
+									EmitVuDataMemoryAddressFromVi(it) &&
+									EmitStoreVfMaskedToAddress(VUInterpFast::Fs(code), mask);
+							}
+							if (postincrement)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViWordRaw(0, it) &&
+									m_code.EmitAddImm8(0, 0, 1) &&
+									EmitStoreViHalfword(0, it);
+							}
 						}
 						break;
 					}
@@ -7021,19 +7075,32 @@ namespace VitaVU
 					case VUInterpFast::LowerFastKind::SQD:
 					{
 						const unsigned it = VUInterpFast::It(code);
+						const bool store_memory = mask != 0;
 						emitted_body = EmitInlineBackupVI(it);
-						if (VUInterpFast::Ft(code) != 0)
+						if (VUInterpFast::Ft(code) != 0 && store_memory)
 						{
 							emitted_body = emitted_body &&
-								EmitLoadViHalfwordRaw(0, it) &&
-								m_code.EmitSubImm8(0, 0, 1) &&
-								EmitStoreViHalfword(0, it);
-						}
-						if (mask != 0)
-						{
-							emitted_body = emitted_body &&
-								EmitVuDataMemoryAddressFromVi(it) &&
+								EmitLoadViWordRaw(2, it) &&
+								m_code.EmitSubImm8(2, 2, 1) &&
+								EmitStoreViHalfword(2, it) &&
+								EmitVuDataMemoryAddressFromQwordIndex(2, 3) &&
 								EmitStoreVfMaskedToAddress(VUInterpFast::Fs(code), mask);
+						}
+						else
+						{
+							if (VUInterpFast::Ft(code) != 0)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViWordRaw(0, it) &&
+									m_code.EmitSubImm8(0, 0, 1) &&
+									EmitStoreViHalfword(0, it);
+							}
+							if (store_memory)
+							{
+								emitted_body = emitted_body &&
+									EmitVuDataMemoryAddressFromVi(it) &&
+									EmitStoreVfMaskedToAddress(VUInterpFast::Fs(code), mask);
+							}
 						}
 						break;
 					}
