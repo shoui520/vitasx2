@@ -70,6 +70,10 @@ namespace VitaVU
 		u64 deferred_fmac_linked_memory_words_removed = 0;
 		u32 test_pipes_fast_guard_pairs = 0;
 		u32 nop_pipe_test_defer_pairs = 0;
+		u32 empty_pipe_nop_batch_runs = 0;
+		u32 empty_pipe_nop_batch_pairs = 0;
+		u64 empty_pipe_nop_batch_runtime_runs = 0;
+		u64 empty_pipe_nop_batch_runtime_pairs = 0;
 		u32 fmac_clear_inline_pairs = 0;
 		u32 upper_fmac_stall_test_inline_pairs = 0;
 		u32 lower_fmac_stall_test_inline_pairs = 0;

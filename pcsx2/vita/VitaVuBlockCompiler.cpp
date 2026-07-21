@@ -50,6 +50,8 @@ u32 g_qemuVuJitTestPipesFdivFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesEfuFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesXgkickTransferInlineOps = 0;
 u32 g_qemuVuJitNopPipeTestDeferrals = 0;
+u32 g_qemuVuJitEmptyPipeNopBatchRuns = 0;
+u32 g_qemuVuJitEmptyPipeNopBatchPairs = 0;
 u32 g_qemuVuJitAllPipesEmptyFastSkips = 0;
 u32 g_qemuVuJitNormConstantMaterializations = 0;
 u32 g_qemuVuJitFmacClearInlineOps = 0;
@@ -685,6 +687,8 @@ namespace VitaVU
 			bool continues_logical_block_if_busy = false;
 			u32 test_pipes_fast_guard_pairs = 0;
 			u32 nop_pipe_test_defer_pairs = 0;
+			u32 empty_pipe_nop_batch_runs = 0;
+			u32 empty_pipe_nop_batch_pairs = 0;
 			u32 fmac_clear_inline_pairs = 0;
 			u32 upper_fmac_stall_test_inline_pairs = 0;
 			u32 lower_fmac_stall_test_inline_pairs = 0;
@@ -1224,6 +1228,8 @@ namespace VitaVU
 			block->continues_logical_block_if_busy = false;
 			block->test_pipes_fast_guard_pairs = 0;
 			block->nop_pipe_test_defer_pairs = 0;
+			block->empty_pipe_nop_batch_runs = 0;
+			block->empty_pipe_nop_batch_pairs = 0;
 			block->fmac_clear_inline_pairs = 0;
 			block->upper_fmac_stall_test_inline_pairs = 0;
 			block->lower_fmac_stall_test_inline_pairs = 0;
@@ -1610,6 +1616,37 @@ namespace VitaVU
 					}
 					AnalyzeLocalMacFlagLiveness(block);
 				}
+
+				// PCSX2's interpreter-side _vu1FastForwardPlainNopPairs() owns
+				// the empty-pipeline batching contract. The native compiler may
+				// additionally have private FMAC instances, so these runs are only
+				// candidates here; emission retires those private instances at the
+				// same final scheduling point and keeps an exact cold per-pair path
+				// whenever the canonical pipe aggregate is nonzero at runtime.
+				if (block->resident_pipe_activity)
+				{
+					for (u32 i = 0; i < block->pair_count;)
+					{
+						if (!IsUnobservableNopPair(block->pairs[i]))
+						{
+							i++;
+							continue;
+						}
+						u32 end = i + 1;
+						while (end < block->pair_count &&
+							IsUnobservableNopPair(block->pairs[end]))
+						{
+							end++;
+						}
+						const u32 pairs = end - i;
+						if (pairs >= 2)
+						{
+							block->empty_pipe_nop_batch_runs++;
+							block->empty_pipe_nop_batch_pairs += pairs;
+						}
+						i = end;
+					}
+				}
 			}
 			return block->pair_count != 0;
 		}
@@ -1824,10 +1861,28 @@ namespace VitaVU
 				if (!EmitPreloadVectorCache())
 					return false;
 
-				for (u32 i = 0; i < m_plan.pair_count; i++)
+				for (u32 i = 0; i < m_plan.pair_count;)
 				{
+					u32 nop_run_end = i;
+					if (UsesResidentPipeActivity() && IsUnobservableNopPair(m_pairs[i]))
+					{
+						nop_run_end++;
+						while (nop_run_end < m_plan.pair_count &&
+							IsUnobservableNopPair(m_pairs[nop_run_end]))
+						{
+							nop_run_end++;
+						}
+					}
+					if (nop_run_end - i >= 2)
+					{
+						if (!EmitEmptyPipeNopRun(i, nop_run_end - i))
+							return false;
+						i = nop_run_end;
+						continue;
+					}
 					if (!EmitPair(i))
 						return false;
+					i++;
 				}
 				if (!EmitCanonicalizeLocalFmacPipeline())
 					return false;
@@ -1874,6 +1929,8 @@ namespace VitaVU
 					return false;
 				const size_t epilogue_offset = m_code.Size();
 				if (!EmitEpilogue())
+					return false;
+				if (!EmitEmptyPipeNopSlowPaths())
 					return false;
 
 				// Block-admission exit stubs: return the accumulated number of fully
@@ -2659,6 +2716,20 @@ namespace VitaVU
 							&g_qemuVuJitNopPipeTestDeferrals))) &&
 						m_code.EmitLdrImm12(1, 0, 0) &&
 						m_code.EmitAddImm8(1, 1, 1) &&
+						m_code.EmitStrImm12(1, 0, 0);
+				}
+
+				bool EmitQemuEmptyPipeNopBatchCounters(u8 pairs)
+				{
+					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitEmptyPipeNopBatchRuns))) &&
+						m_code.EmitLdrImm12(1, 0, 0) &&
+						m_code.EmitAddImm8(1, 1, 1) &&
+						m_code.EmitStrImm12(1, 0, 0) &&
+						m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitEmptyPipeNopBatchPairs))) &&
+						m_code.EmitLdrImm12(1, 0, 0) &&
+						m_code.EmitAddImm8(1, 1, pairs) &&
 						m_code.EmitStrImm12(1, 0, 0);
 				}
 
@@ -8899,6 +8970,193 @@ namespace VitaVU
 				bool producer_flags_captured = false;
 			};
 
+			struct EmptyPipeNopSlowPath
+			{
+				size_t branch_site = static_cast<size_t>(-1);
+				size_t continuation = static_cast<size_t>(-1);
+				u32 first_pair = 0;
+				u32 pair_count = 0;
+				std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT> initial_fmac{};
+				std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT> final_fmac{};
+				s8 initial_latest_working = -1;
+				s8 final_latest_working = -1;
+				bool initial_norm_consts_ready = false;
+				bool initial_norm_maxf_ready = false;
+				bool final_norm_consts_ready = false;
+				bool final_norm_maxf_ready = false;
+			};
+
+			s8 LocalFmacEntryIndex(const LocalFmacEntry* entry) const
+			{
+				if (!entry)
+					return -1;
+				const ptrdiff_t index = entry - m_local_fmac_entries.data();
+				return index >= 0 && index < static_cast<ptrdiff_t>(LOCAL_FMAC_SLOT_COUNT) ?
+					static_cast<s8>(index) : -1;
+			}
+
+			LocalFmacEntry* LocalFmacEntryAt(s8 index)
+			{
+				return index >= 0 ? &m_local_fmac_entries[static_cast<u32>(index)] : nullptr;
+			}
+
+			static bool LocalFmacStatesMatch(
+				const std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT>& lhs,
+				const std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT>& rhs)
+			{
+				for (u32 i = 0; i < LOCAL_FMAC_SLOT_COUNT; i++)
+				{
+					if (lhs[i].pair_index != rhs[i].pair_index ||
+						lhs[i].slot != rhs[i].slot || lhs[i].active != rhs[i].active ||
+						lhs[i].producer_flags_captured != rhs[i].producer_flags_captured)
+					{
+						return false;
+					}
+				}
+				return true;
+			}
+
+			bool EmitAdvanceAdditionalNopCycles(u8 cycles)
+			{
+				if (cycles == 0)
+					return true;
+
+				if (!m_resident_cycle)
+				{
+					return m_code.EmitLdrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, cycle) + 4)) &&
+						m_code.EmitAddImm8(HOST_CYCLE_LO, HOST_CYCLE_LO, cycles, true) &&
+						m_code.EmitAdcImm8(0, 0, 0) &&
+						m_code.EmitStrImm12(HOST_CYCLE_LO, HOST_VU,
+							VuOffset(offsetof(VURegs, cycle))) &&
+						m_code.EmitStrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, cycle) + 4));
+				}
+
+				if (!m_code.EmitAddImm8(HOST_CYCLE_LO, HOST_CYCLE_LO, cycles, true))
+					return false;
+				const size_t skip_high = m_code.EmitBranchPlaceholder(Condition::CC);
+				if (skip_high == static_cast<size_t>(-1) ||
+					!m_code.EmitLdrImm12(0, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle) + 4)) ||
+					!m_code.EmitAddImm8(0, 0, 1) ||
+					!m_code.EmitStrImm12(0, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle) + 4)))
+				{
+					return false;
+				}
+				return m_code.PatchBranch(skip_high, m_code.Size(), Condition::CC);
+			}
+
+			bool EmitEmptyPipeNopRun(u32 first_pair, u32 pair_count)
+			{
+				if (!UsesResidentPipeActivity() || pair_count < 2 || pair_count > 64)
+					return false;
+
+				EmptyPipeNopSlowPath slow;
+				slow.first_pair = first_pair;
+				slow.pair_count = pair_count;
+				slow.initial_fmac = m_local_fmac_entries;
+				slow.initial_latest_working = LocalFmacEntryIndex(m_latest_working_fmac_entry);
+				slow.initial_norm_consts_ready = m_norm_consts_ready;
+				slow.initial_norm_maxf_ready = m_norm_maxf_ready;
+
+				// PCSX2 owner: VU1microInterp.cpp::_vu1CanFastForwardPlainNopPairs().
+				// PIPE_ACTIVITY_SAVE_OFFSET is the exact OR of the five canonical
+				// publisher predicates. Compiler-owned FMAC slots are handled below.
+				if (!m_code.EmitLdrImm12(0, SP, PIPE_ACTIVITY_SAVE_OFFSET) ||
+					!m_code.EmitCmpImm32(0, 0))
+				{
+					return false;
+				}
+				slow.branch_site = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (slow.branch_site == static_cast<size_t>(-1) ||
+					!EmitBudgetCheckAndCycleIncrement(first_pair))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (first_pair == 0 && !EmitQemuLocalFmacPipelineCounters())
+					return false;
+#endif
+				if (!EmitAdvanceAdditionalNopCycles(static_cast<u8>(pair_count - 1)) ||
+					!EmitRetireLocalFmacEntries(first_pair + pair_count - 1) ||
+					// _vu1FastForwardPlainNopPairs() subtracts min(run, backup).
+					// The architectural backup window is two cycles and this run is at
+					// least two pairs, so its exact final value is unconditionally zero.
+					!m_code.EmitMovImm8(0, 0) ||
+					!m_code.EmitStrbImm12(0, HOST_VU,
+						VuOffset(offsetof(VURegs, VIBackupCycles))))
+				{
+					return false;
+				}
+#if defined(VITASX2_QEMU_VALIDATION)
+				if (!EmitQemuEmptyPipeNopBatchCounters(static_cast<u8>(pair_count)))
+					return false;
+#endif
+
+				slow.continuation = m_code.Size();
+				slow.final_fmac = m_local_fmac_entries;
+				slow.final_latest_working = LocalFmacEntryIndex(m_latest_working_fmac_entry);
+				slow.final_norm_consts_ready = m_norm_consts_ready;
+				slow.final_norm_maxf_ready = m_norm_maxf_ready;
+				m_empty_pipe_nop_slow_paths.push_back(slow);
+				return true;
+			}
+
+			bool EmitEmptyPipeNopSlowPaths()
+			{
+				if (m_empty_pipe_nop_slow_paths.empty())
+					return true;
+
+				const auto block_final_fmac = m_local_fmac_entries;
+				const s8 block_final_latest = LocalFmacEntryIndex(m_latest_working_fmac_entry);
+				const bool block_final_norm_consts = m_norm_consts_ready;
+				const bool block_final_norm_maxf = m_norm_maxf_ready;
+
+				for (const EmptyPipeNopSlowPath& slow : m_empty_pipe_nop_slow_paths)
+				{
+					const size_t slow_target = m_code.Size();
+					if (!m_code.PatchBranch(slow.branch_site, slow_target, Condition::NE))
+						return false;
+
+					m_local_fmac_entries = slow.initial_fmac;
+					m_latest_working_fmac_entry =
+						LocalFmacEntryAt(slow.initial_latest_working);
+					m_pending_local_fmac_entry = nullptr;
+					m_capture_pending_local_fmac_flags = false;
+					m_norm_consts_ready = slow.initial_norm_consts_ready;
+					m_norm_maxf_ready = slow.initial_norm_maxf_ready;
+					for (u32 i = 0; i < slow.pair_count; i++)
+					{
+						if (!EmitPair(slow.first_pair + i))
+							return false;
+					}
+					if (!LocalFmacStatesMatch(m_local_fmac_entries, slow.final_fmac) ||
+						LocalFmacEntryIndex(m_latest_working_fmac_entry) !=
+							slow.final_latest_working ||
+						m_norm_consts_ready != slow.final_norm_consts_ready ||
+						m_norm_maxf_ready != slow.final_norm_maxf_ready)
+					{
+						return false;
+					}
+					const size_t rejoin = m_code.EmitBranchPlaceholder();
+					if (rejoin == static_cast<size_t>(-1) ||
+						!m_code.PatchBranch(rejoin, slow.continuation))
+					{
+						return false;
+					}
+				}
+
+				m_local_fmac_entries = block_final_fmac;
+				m_latest_working_fmac_entry = LocalFmacEntryAt(block_final_latest);
+				m_pending_local_fmac_entry = nullptr;
+				m_capture_pending_local_fmac_flags = false;
+				m_norm_consts_ready = block_final_norm_consts;
+				m_norm_maxf_ready = block_final_norm_maxf;
+				return true;
+			}
+
 			static u32 FmacRegUpper(const PairPlan& plan)
 			{
 				return plan.add_upper_stalls ? plan.uregs.VFwrite : 0;
@@ -10032,6 +10290,7 @@ namespace VitaVU
 			std::vector<size_t> m_xgkick_norm_preserve_calls;
 			std::vector<size_t> m_test_pipes_fast_guard_calls;
 			std::vector<size_t> m_deferred_test_pipes_fast_guard_calls;
+			std::vector<EmptyPipeNopSlowPath> m_empty_pipe_nop_slow_paths;
 			std::vector<BudgetExit> m_budget_exits;
 			std::array<Vu1DirectLinkSlot, MAX_DIRECT_LINK_SLOTS> m_direct_links{};
 			size_t m_linked_entry_offset = static_cast<size_t>(-1);
@@ -10898,6 +11157,10 @@ namespace VitaVU
 						}
 						s_vu1.stats.test_pipes_fast_guard_pairs += plan.test_pipes_fast_guard_pairs;
 						s_vu1.stats.nop_pipe_test_defer_pairs += plan.nop_pipe_test_defer_pairs;
+						s_vu1.stats.empty_pipe_nop_batch_runs +=
+							plan.empty_pipe_nop_batch_runs;
+						s_vu1.stats.empty_pipe_nop_batch_pairs +=
+							plan.empty_pipe_nop_batch_pairs;
 						s_vu1.stats.fmac_clear_inline_pairs += plan.fmac_clear_inline_pairs;
 						s_vu1.stats.upper_fmac_stall_test_inline_pairs += plan.upper_fmac_stall_test_inline_pairs;
 						s_vu1.stats.lower_fmac_stall_test_inline_pairs += plan.lower_fmac_stall_test_inline_pairs;
@@ -11090,6 +11353,10 @@ namespace VitaVU
 						}
 						s_vu0.stats.test_pipes_fast_guard_pairs += plan.test_pipes_fast_guard_pairs;
 						s_vu0.stats.nop_pipe_test_defer_pairs += plan.nop_pipe_test_defer_pairs;
+						s_vu0.stats.empty_pipe_nop_batch_runs +=
+							plan.empty_pipe_nop_batch_runs;
+						s_vu0.stats.empty_pipe_nop_batch_pairs +=
+							plan.empty_pipe_nop_batch_pairs;
 						s_vu0.stats.fmac_clear_inline_pairs += plan.fmac_clear_inline_pairs;
 						s_vu0.stats.upper_fmac_stall_test_inline_pairs += plan.upper_fmac_stall_test_inline_pairs;
 						s_vu0.stats.lower_fmac_stall_test_inline_pairs += plan.lower_fmac_stall_test_inline_pairs;
@@ -11821,6 +12088,8 @@ namespace VitaVU
 			static_cast<u64>(g_qemuVuJitDeferredFmacLinkedEntries) * 6;
 		stats.deferred_fmac_linked_memory_words_removed =
 			static_cast<u64>(g_qemuVuJitDeferredFmacLinkedEntries) * 8;
+		stats.empty_pipe_nop_batch_runtime_runs = g_qemuVuJitEmptyPipeNopBatchRuns;
+		stats.empty_pipe_nop_batch_runtime_pairs = g_qemuVuJitEmptyPipeNopBatchPairs;
 #endif
 		return stats;
 	}
@@ -11887,6 +12156,8 @@ namespace VitaVU
 		g_qemuVuJitDeferredFmacCompactRetirements = 0;
 		g_qemuVuJitDeferredFmacCompactInstructionsRemoved = 0;
 		g_qemuVuJitDeferredFmacLinkedEntries = 0;
+		g_qemuVuJitEmptyPipeNopBatchRuns = 0;
+		g_qemuVuJitEmptyPipeNopBatchPairs = 0;
 #endif
 		const size_t used = s_vu1.stats.code_cache_used;
 		const size_t capacity = s_vu1.stats.code_cache_capacity;
