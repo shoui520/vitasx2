@@ -89,6 +89,8 @@ u32 g_qemuVuJitLocalFmacCycleSnapshotElisions = 0;
 u32 g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagRetirements = 0;
+u32 g_qemuVuJitDeferredFmacCompactRetirements = 0;
+u32 g_qemuVuJitDeferredFmacCompactInstructionsRemoved = 0;
 u32 g_qemuVuJitDeferredFmacLinkedEntries = 0;
 bool g_qemuVuJitForceInterpreterFallback = false;
 #endif
@@ -738,6 +740,8 @@ namespace VitaVU
 			// same private instances.
 			bool deferred_fmac_flags = false;
 			u32 deferred_fmac_flag_retirements = 0;
+			u32 deferred_fmac_compact_retirements = 0;
+			u32 deferred_fmac_compact_instructions_removed = 0;
 			// PCSX2 microVU owner: microVU_Upper.inl::mVUupdateFlags() keeps
 			// the current working MAC/STATUS instances in allocator registers.
 			// When every local producer is isolated from a flag/FDIV/helper seam,
@@ -1584,6 +1588,23 @@ namespace VitaVU
 							{
 								block->resident_working_fmac_flags = false;
 								break;
+							}
+						}
+					}
+					if (block->deferred_fmac_flags)
+					{
+						for (u32 i = LOCAL_FMAC_WARMUP_PAIRS;
+							i + FMAC_PIPELINE_LATENCY_CYCLES < block->pair_count; i++)
+						{
+							const PairPlan& pair = block->pairs[i];
+							const u32 flagreg = (pair.add_upper_stalls ? pair.uregs.VIwrite : 0) |
+								((pair.add_lower_stalls && pair.lregs.pipe == VUPIPE_FMAC) ?
+									pair.lregs.VIwrite : 0);
+							if (pair.fmac_pipe && CanSnapshotLocalFmacFlagsAtProducer(pair))
+							{
+								block->deferred_fmac_compact_retirements++;
+								block->deferred_fmac_compact_instructions_removed +=
+									(flagreg & (1u << REG_STATUS_FLAG)) != 0 ? 3u : 2u;
 							}
 						}
 					}
@@ -2513,7 +2534,7 @@ namespace VitaVU
 				if (!m_plan.deferred_fmac_flags)
 					return local_counts;
 
-				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+				const bool deferred_counts = m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitDeferredFmacFlagEntries))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
 					m_code.EmitAddImm8(1, 1, 1) &&
@@ -2523,6 +2544,20 @@ namespace VitaVU
 					m_code.EmitLdrImm12(1, 0, 0) &&
 					m_code.EmitAddImm8(1, 1,
 						static_cast<u8>(m_plan.deferred_fmac_flag_retirements)) &&
+					m_code.EmitStrImm12(1, 0, 0);
+				if (!deferred_counts || m_plan.deferred_fmac_compact_retirements == 0)
+					return deferred_counts;
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitDeferredFmacCompactRetirements))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1,
+						static_cast<u8>(m_plan.deferred_fmac_compact_retirements)) &&
+					m_code.EmitStrImm12(1, 0, 0) &&
+					m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitDeferredFmacCompactInstructionsRemoved))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1,
+						static_cast<u8>(m_plan.deferred_fmac_compact_instructions_removed)) &&
 					m_code.EmitStrImm12(1, 0, 0);
 			}
 
@@ -8965,7 +9000,24 @@ namespace VitaVU
 					// block-private STATUS/MAC instances loaded at block entry.
 					// Preserve the sticky/non-sticky STATUS formulas exactly, but do not
 					// round-trip either flag through VURegs for every retired pair.
-					if ((flagreg & (1u << REG_STATUS_FLAG)) != 0)
+					if ((flagreg & (1u << REG_STATUS_FLAG)) != 0 &&
+						entry.producer_flags_captured)
+					{
+						// VUflags.cpp::VU_STAT_UPDATE() produces only STATUS[3:0].
+						// CanSnapshotLocalFmacFlagsAtProducer() excludes a paired FSSET
+						// or FDIV, so this captured snapshot has no [11:6] sticky bits.
+						// PCSX2's STATUS-write _vuFMACflush() formula therefore reduces
+						// exactly to (architectural & 0x30) | captured_category.
+						if (!EmitAndRegImm32(HOST_LIMIT_LO, HOST_LIMIT_LO, 0x30u,
+								HOST_CALL_SCRATCH) ||
+							!m_code.EmitLdrImm12(0, SP,
+								LocalFmacOffset(entry, LOCAL_FMAC_STATUS_OFFSET)) ||
+							!m_code.EmitOrrReg(HOST_LIMIT_LO, HOST_LIMIT_LO, 0))
+						{
+							return false;
+						}
+					}
+					else if ((flagreg & (1u << REG_STATUS_FLAG)) != 0)
 					{
 						if (!EmitAndRegImm32(HOST_LIMIT_LO, HOST_LIMIT_LO, 0x30u,
 								HOST_CALL_SCRATCH) ||
@@ -8975,6 +9027,23 @@ namespace VitaVU
 							!m_code.EmitOrrReg(HOST_LIMIT_LO, HOST_LIMIT_LO, 1) ||
 							!EmitAndRegImm32(0, 0, 0x0fu, HOST_CALL_SCRATCH) ||
 							!m_code.EmitOrrReg(HOST_LIMIT_LO, HOST_LIMIT_LO, 0))
+						{
+							return false;
+						}
+					}
+					else if (entry.producer_flags_captured)
+					{
+						// EmitCapturePendingLocalFmacFlags() captured the producer's
+						// exact non-sticky category nibble. ARMv7 BFI replaces only
+						// STATUS[3:0], preserving the accumulated sticky field; the ORR
+						// then applies PCSX2's _vuFMACflush() sticky update. This is the
+						// same formula as the conservative path below in four rather than
+						// six A32 instructions, including the MAC load.
+						if (!m_code.EmitLdrImm12(0, SP,
+								LocalFmacOffset(entry, LOCAL_FMAC_STATUS_OFFSET)) ||
+							!m_code.EmitBfi(HOST_LIMIT_LO, 0, 0, 4) ||
+							!m_code.EmitOrrRegShiftImm(HOST_LIMIT_LO, HOST_LIMIT_LO, 0,
+								ShiftType::LSL, 6))
 						{
 							return false;
 						}
@@ -10776,6 +10845,8 @@ namespace VitaVU
 							s_vu1.stats.deferred_fmac_flag_blocks++;
 							s_vu1.stats.deferred_fmac_flag_retirements +=
 								plan.deferred_fmac_flag_retirements;
+							s_vu1.stats.deferred_fmac_compact_retirements +=
+								plan.deferred_fmac_compact_retirements;
 						}
 						const BlockCompiler::VectorCacheStats& vector_stats = chosen_vector_stats;
 						if (vector_cache_candidate)
@@ -11741,6 +11812,10 @@ namespace VitaVU
 		stats.deferred_fmac_flag_entries = g_qemuVuJitDeferredFmacFlagEntries;
 		stats.deferred_fmac_flag_runtime_retirements =
 			g_qemuVuJitDeferredFmacFlagRetirements;
+		stats.deferred_fmac_compact_runtime_retirements =
+			g_qemuVuJitDeferredFmacCompactRetirements;
+		stats.deferred_fmac_compact_instructions_removed =
+			g_qemuVuJitDeferredFmacCompactInstructionsRemoved;
 		stats.deferred_fmac_linked_entries = g_qemuVuJitDeferredFmacLinkedEntries;
 		stats.deferred_fmac_linked_instructions_removed =
 			static_cast<u64>(g_qemuVuJitDeferredFmacLinkedEntries) * 6;
@@ -11809,6 +11884,8 @@ namespace VitaVU
 		g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 		g_qemuVuJitDeferredFmacFlagEntries = 0;
 		g_qemuVuJitDeferredFmacFlagRetirements = 0;
+		g_qemuVuJitDeferredFmacCompactRetirements = 0;
+		g_qemuVuJitDeferredFmacCompactInstructionsRemoved = 0;
 		g_qemuVuJitDeferredFmacLinkedEntries = 0;
 #endif
 		const size_t used = s_vu1.stats.code_cache_used;

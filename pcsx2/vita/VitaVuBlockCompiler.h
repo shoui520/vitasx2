@@ -62,6 +62,9 @@ namespace VitaVU
 		u32 deferred_fmac_flag_retirements = 0;
 		u64 deferred_fmac_flag_entries = 0;
 		u64 deferred_fmac_flag_runtime_retirements = 0;
+		u32 deferred_fmac_compact_retirements = 0;
+		u64 deferred_fmac_compact_runtime_retirements = 0;
+		u64 deferred_fmac_compact_instructions_removed = 0;
 		u64 deferred_fmac_linked_entries = 0;
 		u64 deferred_fmac_linked_instructions_removed = 0;
 		u64 deferred_fmac_linked_memory_words_removed = 0;
