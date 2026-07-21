@@ -3236,9 +3236,11 @@ namespace VitaVU
 
 				const size_t ready_high = m_code.EmitBranchPlaceholder(Condition::NE);
 				if (ready_high == static_cast<size_t>(-1) ||
-					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
-						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, Cycle))) ||
-					!m_code.EmitCmpReg(HOST_TEMP, HOST_VALUE))
+					// Sony VU User Manual 3.4.4 fixes every FMAC operation at four
+					// cycles, and PCSX2's sole producer, _vuAddFMACStalls(), writes 4
+					// unconditionally. Keep that word in canonical fmacPipe state for
+					// helpers/oracle inspection, but do not reload the invariant on A9.
+					!m_code.EmitCmpImm32(HOST_TEMP, FMAC_PIPELINE_LATENCY_CYCLES))
 				{
 					return false;
 				}
@@ -8843,8 +8845,7 @@ namespace VitaVU
 				if (skip_elapsed_high == static_cast<size_t>(-1))
 					return false;
 
-				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, Cycle)) ||
-					!m_code.EmitCmpReg(HOST_VALUE, HOST_TEMP))
+				if (!m_code.EmitCmpImm32(HOST_VALUE, FMAC_PIPELINE_LATENCY_CYCLES))
 				{
 					return false;
 				}
@@ -8947,8 +8948,8 @@ namespace VitaVU
 						return false;
 				}
 				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
-					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, Cycle)) ||
-					!m_code.EmitAddReg(HOST_VALUE, HOST_VALUE, HOST_TEMP, true) ||
+					!m_code.EmitAddImm8(HOST_VALUE, HOST_VALUE,
+						FMAC_PIPELINE_LATENCY_CYCLES, true) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, sCycle) + 4) ||
 					!m_code.EmitAdcImm8(HOST_TEMP, HOST_TEMP, 0) ||
 					!m_code.EmitStrImm12(HOST_VALUE, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
@@ -9245,9 +9246,9 @@ namespace VitaVU
 					!m_code.EmitAndImm32(HOST_INDEX, HOST_INDEX, 3) ||
 					!m_code.EmitStrImm12(HOST_INDEX, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
 					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
-					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, Cycle)) ||
 					!m_code.EmitLdrImm12(HOST_PTR, HOST_PTR, offsetof(fmacPipe, sCycle) + 4) ||
-					!m_code.EmitAddReg(HOST_VALUE, HOST_VALUE, HOST_TEMP, true) ||
+					!m_code.EmitAddImm8(HOST_VALUE, HOST_VALUE,
+						FMAC_PIPELINE_LATENCY_CYCLES, true) ||
 					!m_code.EmitAdcImm8(HOST_PTR, HOST_PTR, 0) ||
 					!EmitStoreCycleIfNewer(HOST_VALUE, HOST_PTR, HOST_TEMP, HOST_COUNT) ||
 					!m_code.EmitLdrImm12(HOST_COUNT, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
