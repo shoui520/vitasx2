@@ -5062,7 +5062,10 @@ namespace VitaVU
 				mask &= 0x0f;
 				if (mask == 0)
 					return m_code.EmitMovImm8(2, 0);
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(1);
+				const unsigned vu_index = m_vu0_memory_map ? 0u : 1u;
+				const bool overflow_clamp = CHECK_VU_OVERFLOW(vu_index);
+				const bool result_flush_to_zero = (m_vu0_memory_map ?
+					EmuConfig.Cpu.VU0FPCR : EmuConfig.Cpu.VU1FPCR).GetFlushToZero();
 
 				const auto reduce_packed_lanes = [&](bool disjoint_lane_bits) {
 					// Q2 is D4:D5. Cortex-A9 NEON MPE TRM tables 3-4 and 3-7
@@ -5094,16 +5097,26 @@ namespace VitaVU
 				if (!EmitEnsureVuFloatNormalizeConstants(overflow_clamp) ||
 					!m_code.EmitVandQ(VU_NORM_EXPV_Q, 0, VU_NORM_EXP_Q) ||
 					!m_code.EmitVandQ(VU_NORM_SIGNV_Q, 0, VU_NORM_SIGN_Q) ||
-					!m_code.EmitVshlI32Q(VU_NORM_TMP_Q, 0, 1) ||
-					!m_code.EmitVceqI32Q(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_ZERO_Q) ||
 					!m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_ZERO_Q) ||
-					!m_code.EmitVceqI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q) ||
-					!m_code.EmitVmvnQ(3, VU_NORM_TMP_Q) ||
-					!m_code.EmitVandQ(3, 3, VU_NORM_MASK_Q) ||
-					!m_code.EmitVbitQ(0, VU_NORM_SIGNV_Q, VU_NORM_MASK_Q))
+					!m_code.EmitVceqI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q))
 				{
 					return false;
 				}
+				// PCSX2 installs the selected VU FPCR around native execution and
+				// VMManager::CheckForCPUConfigChanges() resets every VU code cache
+				// when it changes. With FZ set, scalar VFP cannot leave a nonzero
+				// exponent-zero result in Q0, so U is provably clear. Preserve the
+				// complete Sony U+Z classifier for the non-default FZ-disabled mode.
+				if (!result_flush_to_zero &&
+					(!m_code.EmitVshlI32Q(VU_NORM_TMP_Q, 0, 1) ||
+					 !m_code.EmitVceqI32Q(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_ZERO_Q) ||
+					 !m_code.EmitVmvnQ(3, VU_NORM_TMP_Q) ||
+					 !m_code.EmitVandQ(3, 3, VU_NORM_MASK_Q)))
+				{
+					return false;
+				}
+				if (!m_code.EmitVbitQ(0, VU_NORM_SIGNV_Q, VU_NORM_MASK_Q))
+					return false;
 				if (overflow_clamp &&
 					(!m_code.EmitVorrQ(1, VU_NORM_SIGNV_Q, VU_NORM_MAXF_Q) ||
 					 !m_code.EmitVbitQ(0, 1, VU_NORM_EXPV_Q)))
@@ -5121,14 +5134,21 @@ namespace VitaVU
 					// of the corresponding XYZW MAC bits. A full destination mask
 					// therefore needs no per-lane identity or table load. Extract
 					// one category bit in every lane, then OR-reduce the D halves.
-					return m_code.EmitVshrU32Q(2, VU_NORM_MASK_Q, 31) &&
-						m_code.EmitVshrU32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 31) &&
-						m_code.EmitVshlI32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 1) &&
-						m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q) &&
-						m_code.EmitVshrU32Q(3, 3, 31) &&
-						m_code.EmitVshlI32Q(3, 3, 2) &&
-						m_code.EmitVorrQ(2, 2, 3) &&
-						m_code.EmitVshrU32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 31) &&
+					if (!m_code.EmitVshrU32Q(2, VU_NORM_MASK_Q, 31) ||
+						!m_code.EmitVshrU32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 31) ||
+						!m_code.EmitVshlI32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 1) ||
+						!m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q))
+					{
+						return false;
+					}
+					if (!result_flush_to_zero &&
+						(!m_code.EmitVshrU32Q(3, 3, 31) ||
+						 !m_code.EmitVshlI32Q(3, 3, 2) ||
+						 !m_code.EmitVorrQ(2, 2, 3)))
+					{
+						return false;
+					}
+					return m_code.EmitVshrU32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 31) &&
 						m_code.EmitVshlI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 3) &&
 						m_code.EmitVorrQ(2, 2, VU_NORM_EXPV_Q) &&
 						reduce_packed_lanes(false);
@@ -5139,17 +5159,24 @@ namespace VitaVU
 				const u8 sign_shift = mac_result ? 4 : 1;
 				const u8 underflow_shift = mac_result ? 8 : 2;
 				const u8 overflow_shift = mac_result ? 12 : 3;
-				return m_code.EmitVcgtS32Q(VU_NORM_SIGNV_Q, VU_NORM_ZERO_Q, 0) &&
-					m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(weights))) &&
-					m_code.EmitVld1Q32Aligned(1, 3) &&
-					m_code.EmitVandQ(2, VU_NORM_MASK_Q, 1) &&
-					m_code.EmitVandQ(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 1) &&
-					m_code.EmitVshlI32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, sign_shift) &&
-					m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q) &&
-					m_code.EmitVandQ(3, 3, 1) &&
-					m_code.EmitVshlI32Q(3, 3, underflow_shift) &&
-					m_code.EmitVorrQ(2, 2, 3) &&
-					m_code.EmitVandQ(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 1) &&
+				if (!m_code.EmitVcgtS32Q(VU_NORM_SIGNV_Q, VU_NORM_ZERO_Q, 0) ||
+					!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(weights))) ||
+					!m_code.EmitVld1Q32Aligned(1, 3) ||
+					!m_code.EmitVandQ(2, VU_NORM_MASK_Q, 1) ||
+					!m_code.EmitVandQ(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 1) ||
+					!m_code.EmitVshlI32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, sign_shift) ||
+					!m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q))
+				{
+					return false;
+				}
+				if (!result_flush_to_zero &&
+					(!m_code.EmitVandQ(3, 3, 1) ||
+					 !m_code.EmitVshlI32Q(3, 3, underflow_shift) ||
+					 !m_code.EmitVorrQ(2, 2, 3)))
+				{
+					return false;
+				}
+				return m_code.EmitVandQ(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 1) &&
 					m_code.EmitVshlI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, overflow_shift) &&
 					m_code.EmitVorrQ(2, 2, VU_NORM_EXPV_Q) &&
 					reduce_packed_lanes(mac_result);
