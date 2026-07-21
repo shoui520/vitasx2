@@ -34,6 +34,107 @@ vita_create_vpk(vitasx2.vpk ${VITASX2_TITLEID} vitasx2.self
 	NAME "VitaSX2"
 )
 
+# --- finite Venezia/NEON hardware characterization --------------------------
+# This target deliberately reuses the normal VSX200001 container. It is absent
+# from product builds and embeds its MeP payload so the Vita run has no mutable
+# sidecar files.
+if(VITASX2_VENEZIA_BENCHMARK)
+	set(VITASX2_VENEZIA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/venezia")
+	set(VITASX2_MEP_GCC "${VITASX2_VENEZIA_SDK_ROOT}/bin/mep-elf-gcc")
+	set(VITASX2_MEP_INCLUDE "${VITASX2_VENEZIA_SDK_ROOT}/mep-elf/include")
+	set(VITASX2_MEP_LIBRARY "${VITASX2_VENEZIA_SDK_ROOT}/mep-elf/lib")
+	set(VITASX2_MEP_FLOAT_SOURCE
+		"${VITASX2_VVNZRUNNER_SOURCE_ROOT}/samples_new/vnz_sample_hello_draw/src/float.c")
+	if(NOT EXISTS "${VITASX2_MEP_GCC}")
+		message(FATAL_ERROR
+			"Venezia benchmark needs ${VITASX2_MEP_GCC}; set VITASX2_VENEZIA_SDK_ROOT.")
+	endif()
+	if(NOT EXISTS "${VITASX2_MEP_INCLUDE}/vnz/vthread.h" OR
+		NOT EXISTS "${VITASX2_MEP_LIBRARY}/libvkernel.a")
+		message(FATAL_ERROR
+			"${VITASX2_VENEZIA_SDK_ROOT} lacks the Venezia headers/libvkernel target library.")
+	endif()
+	if(NOT EXISTS "${VITASX2_MEP_FLOAT_SOURCE}")
+		message(FATAL_ERROR
+			"Venezia benchmark needs VVNZRunner's float.c; set VITASX2_VVNZRUNNER_SOURCE_ROOT.")
+	endif()
+
+	set(VITASX2_MEP_ELF "${CMAKE_CURRENT_BINARY_DIR}/mep_code.elf")
+	set(VITASX2_MEP_BLOB "${CMAKE_CURRENT_BINARY_DIR}/mep_code.o")
+	set(VITASX2_MEP_SOURCES
+		"${VITASX2_VENEZIA_DIR}/mep/crt0.c"
+		"${VITASX2_VENEZIA_DIR}/mep/main.c"
+		"${VITASX2_MEP_FLOAT_SOURCE}"
+	)
+	set(VITASX2_MEP_MACHINE_FLAGS
+		-mtiny=0 -mabsdiff -maverage -mbitops -mclip -mdiv -mleadz
+		-mminmax -mmult -mrepeat -msatur -mvl64 -mvliw -mcop64 -mivc2
+		-D__MEP_CONFIG_CP_DATA_BUS_WIDTH=64
+	)
+	add_custom_command(
+		OUTPUT "${VITASX2_MEP_ELF}"
+		COMMAND "${VITASX2_MEP_GCC}"
+			${VITASX2_MEP_SOURCES}
+			-I${VITASX2_VENEZIA_DIR}
+			-I${VITASX2_MEP_INCLUDE}
+			-I${VITASX2_MEP_INCLUDE}/libk
+			-L${VITASX2_MEP_LIBRARY}
+			-nostdlib -nodefaultlibs -nostartfiles -std=c99 -O3
+			-ffunction-sections -fdata-sections -Wl,-q
+			${VITASX2_MEP_MACHINE_FLAGS}
+			-lvkernel -lgcc -o "${VITASX2_MEP_ELF}"
+		DEPENDS ${VITASX2_MEP_SOURCES}
+			"${VITASX2_VENEZIA_DIR}/VeneziaBenchmarkProtocol.h"
+		VERBATIM
+		COMMENT "Building the Venezia MeP-c5/IVC2 benchmark payload"
+	)
+	add_custom_command(
+		OUTPUT "${VITASX2_MEP_BLOB}"
+		COMMAND "${CMAKE_OBJCOPY}" -I binary -O elf32-littlearm -B arm
+			--rename-section .data=.rodata,alloc,load,readonly,data,contents
+			mep_code.elf mep_code.o
+		DEPENDS "${VITASX2_MEP_ELF}"
+		WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+		VERBATIM
+		COMMENT "Embedding the Venezia MeP executable in the Vita SELF"
+	)
+	set_source_files_properties("${VITASX2_MEP_BLOB}" PROPERTIES
+		GENERATED TRUE
+		EXTERNAL_OBJECT TRUE
+	)
+
+	set(VITASX2_VVNZ_STUB_DIR "${CMAKE_CURRENT_BINARY_DIR}/vvnzrunner-stubs")
+	file(MAKE_DIRECTORY "${VITASX2_VVNZ_STUB_DIR}")
+	execute_process(
+		COMMAND "${VITASDK}/bin/vita-libs-gen" -c
+			"${VITASX2_VENEZIA_DIR}/VVNZRunner.yml" "${VITASX2_VVNZ_STUB_DIR}"
+		RESULT_VARIABLE VITASX2_VVNZ_STUB_RESULT
+	)
+	if(NOT VITASX2_VVNZ_STUB_RESULT EQUAL 0)
+		message(FATAL_ERROR "vita-libs-gen failed for the VVNZRunner import library.")
+	endif()
+	add_subdirectory("${VITASX2_VVNZ_STUB_DIR}"
+		"${CMAKE_CURRENT_BINARY_DIR}/vvnzrunner-stub-build")
+
+	add_executable(vitasx2-venezia-benchmark
+		venezia/VeneziaBenchmarkMain.cpp
+		"${VITASX2_MEP_BLOB}"
+	)
+	target_link_libraries(vitasx2-venezia-benchmark
+		VVNZRunner_stub
+		SceLibKernel_stub
+		SceIofilemgr_stub
+		SceSysmem_stub
+		ScePower_stub
+	)
+	vita_create_self(vitasx2-venezia-benchmark.self vitasx2-venezia-benchmark UNSAFE)
+	vita_create_vpk(vitasx2-venezia-benchmark.vpk ${VITASX2_TITLEID}
+		vitasx2-venezia-benchmark.self
+		VERSION "00.01"
+		NAME "VitaSX2 Venezia Benchmark"
+	)
+endif()
+
 # --- all-native portable replay validation ----------------------------------
 # This target is deliberately absent from ordinary builds. It reuses the one
 # installed VSX200001 container and enables only the bounded PCSX2 trace hooks

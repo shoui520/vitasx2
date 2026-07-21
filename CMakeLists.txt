@@ -40,6 +40,14 @@ if(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	add_compile_definitions(VITASX2_PORTABLE_REPLAY_VALIDATION=1)
 endif()
 
+option(VITASX2_VENEZIA_BENCHMARK
+	"Build the finite VVNZRunner Venezia/NEON latency and throughput benchmark."
+	OFF)
+set(VITASX2_VENEZIA_SDK_ROOT "${PROJECT_SOURCE_DIR}/build/venezia-sdk" CACHE PATH
+	"MeP SDK root containing bin/mep-elf-gcc and the Venezia target libraries.")
+set(VITASX2_VVNZRUNNER_SOURCE_ROOT "${PROJECT_SOURCE_DIR}/../VVNZRunner" CACHE PATH
+	"VVNZRunner source checkout used for its firmware floating-point helper contract.")
+
 option(VITASX2_PRODUCT_BOOT_VALIDATION
 	"Stop the normal VitaSX2 product after bounded reset-to-entry and later-workload oracle gates."
 	OFF)
