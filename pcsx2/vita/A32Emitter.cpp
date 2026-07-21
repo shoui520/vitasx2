@@ -109,6 +109,8 @@ namespace VitaA32
 		constexpr u32 VADD_F64 = 0xee300b00u;
 		constexpr u32 VSUB_F32 = 0xee300a40u;
 		constexpr u32 VMUL_F32 = 0xee200a00u;
+		constexpr u32 VMLA_F32 = 0xee000a00u;
+		constexpr u32 VMLS_F32 = 0xee000a40u;
 		constexpr u32 VMUL_F64 = 0xee200b00u;
 		constexpr u32 VADD_F32_Q = 0xf2000d40u;
 		constexpr u32 VSUB_F32_Q = 0xf2200d40u;
@@ -1563,6 +1565,20 @@ namespace VitaA32
 		if (!IsSRegister(sd) || !IsSRegister(sn) || !IsSRegister(sm))
 			return false;
 		return EmitU32(EncodeVmulF32(sd, sn, sm));
+	}
+
+	bool CodeBuffer::EmitVmlaF32(unsigned sd, unsigned sn, unsigned sm)
+	{
+		if (!IsSRegister(sd) || !IsSRegister(sn) || !IsSRegister(sm))
+			return false;
+		return EmitU32(EncodeVmlaF32(sd, sn, sm));
+	}
+
+	bool CodeBuffer::EmitVmlsF32(unsigned sd, unsigned sn, unsigned sm)
+	{
+		if (!IsSRegister(sd) || !IsSRegister(sn) || !IsSRegister(sm))
+			return false;
+		return EmitU32(EncodeVmlsF32(sd, sn, sm));
 	}
 
 	bool CodeBuffer::EmitVmulF64(unsigned dd, unsigned dn, unsigned dm)
@@ -3289,6 +3305,22 @@ namespace VitaA32
 		pxAssert(IsSRegister(sn));
 		pxAssert(IsSRegister(sm));
 		return VMUL_F32 | VfpSd(sd) | VfpSn(sn) | VfpSm(sm);
+	}
+
+	u32 EncodeVmlaF32(unsigned sd, unsigned sn, unsigned sm)
+	{
+		pxAssert(IsSRegister(sd));
+		pxAssert(IsSRegister(sn));
+		pxAssert(IsSRegister(sm));
+		return VMLA_F32 | VfpSd(sd) | VfpSn(sn) | VfpSm(sm);
+	}
+
+	u32 EncodeVmlsF32(unsigned sd, unsigned sn, unsigned sm)
+	{
+		pxAssert(IsSRegister(sd));
+		pxAssert(IsSRegister(sn));
+		pxAssert(IsSRegister(sm));
+		return VMLS_F32 | VfpSd(sd) | VfpSn(sn) | VfpSm(sm);
 	}
 
 	u32 EncodeVmulF64(unsigned dd, unsigned dn, unsigned dm)

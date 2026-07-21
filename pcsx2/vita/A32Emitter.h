@@ -214,6 +214,8 @@ namespace VitaA32
 		bool EmitVaddF64(unsigned dd, unsigned dn, unsigned dm);
 		bool EmitVsubF32(unsigned sd, unsigned sn, unsigned sm);
 		bool EmitVmulF32(unsigned sd, unsigned sn, unsigned sm);
+		bool EmitVmlaF32(unsigned sd, unsigned sn, unsigned sm);
+		bool EmitVmlsF32(unsigned sd, unsigned sn, unsigned sm);
 		bool EmitVmulF64(unsigned dd, unsigned dn, unsigned dm);
 		bool EmitVaddF32Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVsubF32Q(unsigned qd, unsigned qn, unsigned qm);
@@ -454,6 +456,8 @@ namespace VitaA32
 	u32 EncodeVaddF64(unsigned dd, unsigned dn, unsigned dm);
 	u32 EncodeVsubF32(unsigned sd, unsigned sn, unsigned sm);
 	u32 EncodeVmulF32(unsigned sd, unsigned sn, unsigned sm);
+	u32 EncodeVmlaF32(unsigned sd, unsigned sn, unsigned sm);
+	u32 EncodeVmlsF32(unsigned sd, unsigned sn, unsigned sm);
 	u32 EncodeVmulF64(unsigned dd, unsigned dn, unsigned dm);
 	u32 EncodeVaddF32Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVsubF32Q(unsigned qd, unsigned qn, unsigned qm);

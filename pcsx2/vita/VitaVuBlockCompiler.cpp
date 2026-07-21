@@ -5610,11 +5610,14 @@ namespace VitaVU
 							continue;
 						}
 
-						// S12 = fs[lane] * operand[lane]; S12 = ACC[lane] -/+ S12.
-						if (!m_code.EmitVmulF32(12, 4 + lane, 8 + lane) ||
-							(subtract ? !m_code.EmitVsubF32(12, 0 + lane, 12)
-									  : !m_code.EmitVaddF32(12, 0 + lane, 12)) ||
-							!m_code.EmitVmovS(lane, 12))
+						// ARM ARM A8.6.324 defines scalar VFP VMLA/VMLS as an
+						// ordered FPMul followed by FPAdd, which is PCSX2's exact
+						// non-fused MADD/MSUB contract. Accumulating directly into
+						// Q0 also uses Cortex-A9's multiplier-accumulator forwarding
+						// instead of VMUL -> VADD/VSUB -> VMOV for every lane.
+						if (subtract ?
+							!m_code.EmitVmlsF32(lane, 4 + lane, 8 + lane) :
+							!m_code.EmitVmlaF32(lane, 4 + lane, 8 + lane))
 						{
 							return false;
 						}
