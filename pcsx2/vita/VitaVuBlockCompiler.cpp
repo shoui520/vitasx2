@@ -9095,84 +9095,101 @@ namespace VitaVU
 
 				std::array<size_t, 4> matched_jumps{};
 				u32 matched_count = 0;
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
-						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, regupper))) ||
-					!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0))
+				// Coalescing above guarantees distinct nonzero source registers.
+				// Equal lane masks make the exact predicate
+				//   (writer == source0 || writer == source1) && writer_lanes & lanes.
+				// A32 conditional execution preserves Z when the first compare
+				// succeeds and otherwise performs CMPNE against source1. Test the
+				// shared lane mask once instead of duplicating the complete mask arm.
+				const bool shared_source_lanes = vf_reg1 != 0 && xyzw1 == xyzw0;
+				if (shared_source_lanes)
 				{
-					return false;
-				}
-				const size_t check_upper1 = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (check_upper1 == static_cast<size_t>(-1))
-					return false;
-				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
-						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwupper))) ||
-					!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
-				{
-					return false;
-				}
-				matched_jumps[matched_count++] = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1))
-					return false;
-
-				const size_t upper1_target = m_code.Size();
-				if (!m_code.PatchBranch(check_upper1, upper1_target, Condition::NE))
-				{
-					return false;
-				}
-				if (vf_reg1 != 0)
-				{
-					if (!m_code.EmitCmpImm32(HOST_VALUE, vf_reg1))
+					if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, regupper))) ||
+						!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0) ||
+						!m_code.EmitCmpImm32(HOST_VALUE, vf_reg1, Condition::NE))
+					{
 						return false;
-					const size_t check_lower = m_code.EmitBranchPlaceholder(Condition::NE);
-					if (check_lower == static_cast<size_t>(-1))
-						return false;
-					if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+					}
+					const size_t skip_upper_no_reg =
+						m_code.EmitBranchPlaceholder(Condition::NE);
+					if (skip_upper_no_reg == static_cast<size_t>(-1) ||
+						!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
 							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwupper))) ||
-						!m_code.EmitTstImm32(HOST_TEMP, xyzw1))
+						!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
 					{
 						return false;
 					}
 					matched_jumps[matched_count++] = m_code.EmitBranchPlaceholder(Condition::NE);
 					if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1) ||
-						!m_code.PatchBranch(check_lower, m_code.Size(), Condition::NE))
+						!m_code.PatchBranch(skip_upper_no_reg, m_code.Size(), Condition::NE))
 					{
 						return false;
 					}
 				}
-
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
-						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, reglower))) ||
-					!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0))
+				else
 				{
-					return false;
-				}
-				const size_t check_lower1 = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (check_lower1 == static_cast<size_t>(-1))
-					return false;
-				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
-						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwlower))) ||
-					!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
-				{
-					return false;
-				}
-				matched_jumps[matched_count++] = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1) ||
-					!m_code.PatchBranch(check_lower1, m_code.Size(), Condition::NE))
-				{
-					return false;
+					if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, regupper))) ||
+						!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0))
+					{
+						return false;
+					}
+					const size_t check_upper1 =
+						m_code.EmitBranchPlaceholder(Condition::NE);
+					if (check_upper1 == static_cast<size_t>(-1) ||
+						!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwupper))) ||
+						!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
+					{
+						return false;
+					}
+					matched_jumps[matched_count++] =
+						m_code.EmitBranchPlaceholder(Condition::NE);
+					if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1) ||
+						!m_code.PatchBranch(check_upper1, m_code.Size(), Condition::NE))
+					{
+						return false;
+					}
+					if (vf_reg1 != 0)
+					{
+						if (!m_code.EmitCmpImm32(HOST_VALUE, vf_reg1))
+							return false;
+						const size_t check_lower =
+							m_code.EmitBranchPlaceholder(Condition::NE);
+						if (check_lower == static_cast<size_t>(-1) ||
+							!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+								VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwupper))) ||
+							!m_code.EmitTstImm32(HOST_TEMP, xyzw1))
+						{
+							return false;
+						}
+						matched_jumps[matched_count++] =
+							m_code.EmitBranchPlaceholder(Condition::NE);
+						if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1) ||
+							!m_code.PatchBranch(check_lower, m_code.Size(), Condition::NE))
+						{
+							return false;
+						}
+					}
 				}
 
 				size_t skip_no_lower_reg = static_cast<size_t>(-1);
 				size_t skip_no_match = static_cast<size_t>(-1);
-				if (vf_reg1 != 0)
+				if (shared_source_lanes)
 				{
-					if (!m_code.EmitCmpImm32(HOST_VALUE, vf_reg1))
+					if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, reglower))) ||
+						!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0) ||
+						!m_code.EmitCmpImm32(HOST_VALUE, vf_reg1, Condition::NE))
+					{
 						return false;
+					}
 					skip_no_lower_reg = m_code.EmitBranchPlaceholder(Condition::NE);
 					if (skip_no_lower_reg == static_cast<size_t>(-1) ||
 						!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
 							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwlower))) ||
-						!m_code.EmitTstImm32(HOST_TEMP, xyzw1))
+						!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
 					{
 						return false;
 					}
@@ -9182,7 +9199,47 @@ namespace VitaVU
 				}
 				else
 				{
-					skip_no_match = m_code.EmitBranchPlaceholder();
+					if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, reglower))) ||
+						!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0))
+					{
+						return false;
+					}
+					const size_t check_lower1 =
+						m_code.EmitBranchPlaceholder(Condition::NE);
+					if (check_lower1 == static_cast<size_t>(-1) ||
+						!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwlower))) ||
+						!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
+					{
+						return false;
+					}
+					matched_jumps[matched_count++] =
+						m_code.EmitBranchPlaceholder(Condition::NE);
+					if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1) ||
+						!m_code.PatchBranch(check_lower1, m_code.Size(), Condition::NE))
+					{
+						return false;
+					}
+
+					if (vf_reg1 != 0)
+					{
+						if (!m_code.EmitCmpImm32(HOST_VALUE, vf_reg1))
+							return false;
+						skip_no_lower_reg = m_code.EmitBranchPlaceholder(Condition::NE);
+						if (skip_no_lower_reg == static_cast<size_t>(-1) ||
+							!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+								VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwlower))) ||
+							!m_code.EmitTstImm32(HOST_TEMP, xyzw1))
+						{
+							return false;
+						}
+						skip_no_match = m_code.EmitBranchPlaceholder(Condition::EQ);
+					}
+					else
+					{
+						skip_no_match = m_code.EmitBranchPlaceholder();
+					}
 					if (skip_no_match == static_cast<size_t>(-1))
 						return false;
 				}
