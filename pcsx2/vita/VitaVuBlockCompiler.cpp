@@ -5063,12 +5063,59 @@ namespace VitaVU
 				if (mask == 0)
 					return m_code.EmitMovImm8(2, 0);
 
+				const auto reduce_packed_lanes = [&](bool disjoint_lane_bits) {
+					// Q2 is D4:D5. Cortex-A9 NEON MPE TRM tables 3-4 and 3-7
+					// give D logical/pairwise/permute operations one issue cycle,
+					// while each old Q VEXT/VORR consumes two. MAC's lane weights
+					// are disjoint, so pairwise addition is exactly bitwise OR.
+					if (!m_code.EmitVorrD(4, 4, 5))
+						return false;
+					if (disjoint_lane_bits)
+					{
+						if (!m_code.EmitVpaddI32D(4, 4, 4))
+							return false;
+					}
+					else if (!m_code.EmitVrev64I32D(6, 4) ||
+						!m_code.EmitVorrD(4, 4, 6))
+					{
+						return false;
+					}
+					return m_code.EmitVmovSToCore(2, 8);
+				};
+
 				// PCSX2 owner: x86/microVU_Upper.inl::mVUupdateFlags(). When
 				// mFLAG.doFlag is false, the same per-lane sign/zero/underflow/
 				// overflow classification is reduced directly into STATUS's four
 				// category bits; it does not construct the 16-bit XYZW MAC layout.
 				// Vita keeps one NEON body and selects the lane weights and category
 				// shifts at compile time. Both forms return their packed word in r2.
+				if (!mac_result && mask == 0x0f)
+				{
+					// Sony VU User Manual 3.3.2: each STATUS category is the OR
+					// of the corresponding XYZW MAC bits. A full destination mask
+					// therefore needs no per-lane identity or table load. Extract
+					// one category bit in every lane, then OR-reduce the D halves.
+					return EmitEnsureVuFloatNormalizeConstants(CHECK_VU_OVERFLOW(1)) &&
+						m_code.EmitVandQ(VU_NORM_EXPV_Q, 0, VU_NORM_EXP_Q) &&
+						m_code.EmitVshrU32Q(VU_NORM_SIGNV_Q, 0, 31) &&
+						m_code.EmitVshlI32Q(VU_NORM_TMP_Q, 0, 1) &&
+						m_code.EmitVceqI32Q(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_ZERO_Q) &&
+						m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_ZERO_Q) &&
+						m_code.EmitVceqI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q) &&
+						m_code.EmitVmvnQ(3, VU_NORM_TMP_Q) &&
+						m_code.EmitVandQ(3, 3, VU_NORM_MASK_Q) &&
+						m_code.EmitVshrU32Q(2, VU_NORM_TMP_Q, 31) &&
+						m_code.EmitVshlI32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 1) &&
+						m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q) &&
+						m_code.EmitVshrU32Q(3, 3, 31) &&
+						m_code.EmitVshlI32Q(3, 3, 2) &&
+						m_code.EmitVorrQ(2, 2, 3) &&
+						m_code.EmitVshrU32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 31) &&
+						m_code.EmitVshlI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 3) &&
+						m_code.EmitVorrQ(2, 2, VU_NORM_EXPV_Q) &&
+						reduce_packed_lanes(false);
+				}
+
 				const u32* weights = mac_result ? VU_MAC_LANE_WEIGHTS[mask] :
 					VU_STATUS_LANE_WEIGHTS[mask];
 				const u8 sign_shift = mac_result ? 4 : 1;
@@ -5095,11 +5142,7 @@ namespace VitaVU
 					m_code.EmitVandQ(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 1) &&
 					m_code.EmitVshlI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, overflow_shift) &&
 					m_code.EmitVorrQ(2, 2, VU_NORM_EXPV_Q) &&
-					m_code.EmitVextI8Q(3, 2, 2, 8) &&
-					m_code.EmitVorrQ(2, 2, 3) &&
-					m_code.EmitVextI8Q(3, 2, 2, 4) &&
-					m_code.EmitVorrQ(2, 2, 3) &&
-					m_code.EmitVmovSToCore(2, 8);
+					reduce_packed_lanes(mac_result);
 			}
 
 			bool EmitFinishMacQ0(bool acc, unsigned fd, unsigned mask, bool preserve_inactive,

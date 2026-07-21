@@ -224,6 +224,7 @@ namespace VitaA32
 		bool EmitVaddI16Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVaddI32Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVaddI64Q(unsigned qd, unsigned qn, unsigned qm);
+		bool EmitVpaddI32D(unsigned dd, unsigned dn, unsigned dm);
 		bool EmitVsubI8Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVsubI16Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVsubI32Q(unsigned qd, unsigned qn, unsigned qm);
@@ -462,6 +463,7 @@ namespace VitaA32
 	u32 EncodeVaddI16Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVaddI32Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVaddI64Q(unsigned qd, unsigned qn, unsigned qm);
+	u32 EncodeVpaddI32D(unsigned dd, unsigned dn, unsigned dm);
 	u32 EncodeVsubI8Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVsubI16Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVsubI32Q(unsigned qd, unsigned qn, unsigned qm);
