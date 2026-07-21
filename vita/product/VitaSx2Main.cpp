@@ -66,6 +66,10 @@ namespace
 	constexpr const char* PRODUCT_CONFIG_PATH = "ux0:data/vitasx2/vitasx2.ini";
 	constexpr const char* PRODUCT_MEMORY_CARD_DIR = "ux0:data/vitasx2/memcards";
 	constexpr const char* PRODUCT_LOG_PATH = "ux0:data/vitasx2/vitasx2.log";
+	constexpr const char* PRODUCT_LAUNCH_REQUEST_PATH =
+		"ux0:data/vitasx2/vitasx2.launch-request";
+	constexpr const char* PRODUCT_LAUNCH_RECEIPT_PATH =
+		"ux0:data/vitasx2/vitasx2.launch-receipt";
 	constexpr const char* PRODUCT_INITIALIZED_PATH =
 		"ux0:data/vitasx2/vitasx2.initialized";
 	constexpr const char* PRODUCT_FAILED_PATH = "ux0:data/vitasx2/vitasx2.failed";
@@ -152,6 +156,45 @@ namespace
 		if (sceIoRename(temporary.c_str(), path) < 0)
 		{
 			sceIoRemove(temporary.c_str());
+			return false;
+		}
+		return true;
+	}
+
+	bool PublishHarnessLaunchReceipt(Error* error)
+	{
+		// tools/run_vita_target.sh writes one unpredictable 64-hex-byte request
+		// only after it has closed the foreground application and deployed the
+		// selected SELF. Reading it once at process startup and atomically echoing
+		// it back proves that this process began after that exact request. An
+		// already-running VitaSX2 instance never polls this file and therefore
+		// cannot satisfy a later harness invocation accidentally.
+		const SceUID fd = sceIoOpen(PRODUCT_LAUNCH_REQUEST_PATH, SCE_O_RDONLY, 0);
+		if (fd == PSP2_ERROR_ERRNO_ENOENT)
+			return true;
+		if (fd < 0)
+		{
+			Error::SetStringFmt(error, "Failed to open Vita launch request (error={:08x}).",
+				static_cast<u32>(fd));
+			return false;
+		}
+
+		char request[66] = {};
+		const SceSSize read = sceIoRead(fd, request, sizeof(request));
+		const bool closed = sceIoClose(fd) >= 0;
+		bool valid = read == 65 && request[64] == '\n';
+		for (u32 i = 0; valid && i < 64; i++)
+			valid = (request[i] >= '0' && request[i] <= '9') ||
+				(request[i] >= 'a' && request[i] <= 'f');
+		if (!closed || !valid)
+		{
+			Error::SetString(error, "Malformed Vita harness launch request.");
+			return false;
+		}
+		if (!PublishStatus(PRODUCT_LAUNCH_RECEIPT_PATH,
+				std::string_view(request, static_cast<size_t>(read))))
+		{
+			Error::SetString(error, "Failed to publish the Vita harness launch receipt.");
 			return false;
 		}
 		return true;
@@ -785,6 +828,8 @@ int main()
 		VALIDATION_FAILED_PATH : PRODUCT_FAILED_PATH;
 
 	if (!EnsureDirectories(&error))
+		goto fail;
+	if (!PublishHarnessLaunchReceipt(&error))
 		goto fail;
 	Host::Internal::SetBaseSettingsLayer(&s_base_settings);
 	Host::Internal::SetSecretsSettingsLayer(&s_secrets_settings);
