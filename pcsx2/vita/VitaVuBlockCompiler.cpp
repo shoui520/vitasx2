@@ -95,6 +95,7 @@ u32 g_qemuVuJitLocalFmacCycleSnapshotElisions = 0;
 u32 g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagEntries = 0;
 u32 g_qemuVuJitDeferredFmacFlagRetirements = 0;
+u32 g_qemuVuJitCanonicalDeferredFmacRetirements = 0;
 u32 g_qemuVuJitDeferredFmacCompactRetirements = 0;
 u32 g_qemuVuJitDeferredFmacCompactInstructionsRemoved = 0;
 u32 g_qemuVuJitDeferredFmacLinkedEntries = 0;
@@ -807,17 +808,30 @@ namespace VitaVU
 			return fmac_pairs >= MIN_LOCAL_COMMITS;
 		}
 
-		bool CanDeferLocalFmacFlags(const BlockPlan& block)
+		bool CanDeferFmacFlags(const BlockPlan& block)
 		{
-			const u32 flag_mask = (1u << REG_STATUS_FLAG) |
-				(1u << REG_MAC_FLAG) | (1u << REG_CLIP_FLAG);
+			const u32 deferred_flag_mask = (1u << REG_STATUS_FLAG) |
+				(1u << REG_MAC_FLAG);
 			for (u32 i = 0; i < block.pair_count; i++)
 			{
 				const PairPlan& pair = block.pairs[i];
-				if (pair.ebit || pair.dflag || pair.tflag || pair.lower_flag_inline ||
-					pair.lower_xgkick_inline ||
-					((pair.uregs.VIread | pair.lregs.VIread) & flag_mask) != 0)
+				if (pair.ebit || pair.dflag || pair.tflag || pair.lower_xgkick_inline)
 				{
+					return false;
+				}
+
+				const u32 deferred_flag_reads =
+					(pair.uregs.VIread | pair.lregs.VIread) & deferred_flag_mask;
+				if (deferred_flag_reads != 0 && !pair.lower_flag_inline)
+					return false;
+
+				if (pair.lower_flag_inline &&
+					static_cast<VUInterpFast::LowerFastKind>(pair.lower_kind) ==
+						VUInterpFast::LowerFastKind::FSSET)
+				{
+					// FSSET changes the working STATUS instance sampled by a paired
+					// FMAC producer. Keep that block on canonical working/deferred
+					// state until this mutation is represented in the resident path.
 					return false;
 				}
 			}
@@ -1677,7 +1691,7 @@ namespace VitaVU
 					}
 					block->deferred_fmac_flags =
 						block->deferred_fmac_flag_retirements >= 4 &&
-						CanDeferLocalFmacFlags(*block);
+						CanDeferFmacFlags(*block);
 					block->resident_working_fmac_flags = block->deferred_fmac_flags &&
 						block->local_fmac_producer_snapshot_pairs >= 2;
 					if (block->resident_working_fmac_flags)
@@ -1712,6 +1726,26 @@ namespace VitaVU
 						}
 					}
 					AnalyzeMacFlagLiveness(block);
+				}
+				else
+				{
+					// PCSX2 microVU_Flags.inl keeps delayed flag instances private
+					// independently of whether the FMAC queue itself is compiler-owned.
+					// A canonical producer is guaranteed to retire before pair i+4:
+					// Sony fixes FMAC latency at four cycles and every pair advances at
+					// least one cycle. Retaining r6/r7 across such a block therefore
+					// removes the same architectural STATUS/MAC traffic from the
+					// canonical publisher. Runtime stalls can only retire an entry
+					// earlier and increase the saving.
+					for (u32 i = 0;
+						i + FMAC_PIPELINE_LATENCY_CYCLES < block->pair_count; i++)
+					{
+						block->deferred_fmac_flag_retirements +=
+							block->pairs[i].fmac_pipe ? 1u : 0u;
+					}
+					block->deferred_fmac_flags =
+						block->deferred_fmac_flag_retirements >= 4 &&
+						CanDeferFmacFlags(*block);
 				}
 
 				for (u32 i = 0; i < block->pair_count; i++)
@@ -2123,17 +2157,18 @@ namespace VitaVU
 				// states without returning through the dispatcher. The outer VU1
 				// execution wrapper gives every target the same private frame, so linked
 				// chains retain r4/r6/r7/r10/r11 without a dispatcher round trip.
-				if (m_plan.deferred_fmac_flags)
+				// Both source representations receive an entry. A deferred source
+				// entering a canonical target publishes r6/r7 and restores the saved
+				// limit pair in EmitLinkedEntry(); the reverse transition installs
+				// r6/r7 from canonical VURegs exactly as before.
+				m_linked_entries.deferred_fmac = m_code.Size();
+				if (!EmitLinkedEntry(body_offset, true, false))
+					return false;
+				if (UsesResidentPipeActivity())
 				{
-					m_linked_entries.deferred_fmac = m_code.Size();
-					if (!EmitLinkedEntry(body_offset, true, false))
+					m_linked_entries.resident_pipe_deferred_fmac = m_code.Size();
+					if (!EmitLinkedEntry(body_offset, true, true))
 						return false;
-					if (UsesResidentPipeActivity())
-					{
-						m_linked_entries.resident_pipe_deferred_fmac = m_code.Size();
-						if (!EmitLinkedEntry(body_offset, true, true))
-							return false;
-					}
 				}
 
 				m_linked_entries.normal = m_code.Size();
@@ -2274,8 +2309,7 @@ namespace VitaVU
 			bool EmitLinkedEntry(size_t body_offset, bool deferred_values_resident,
 				bool pipe_aggregate_resident)
 			{
-				if ((deferred_values_resident && !m_plan.deferred_fmac_flags) ||
-					(pipe_aggregate_resident && !UsesResidentPipeActivity()))
+				if (pipe_aggregate_resident && !UsesResidentPipeActivity())
 					return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -2314,6 +2348,16 @@ namespace VitaVU
 					 !m_code.EmitLdrImm12(HOST_LIMIT_LO, HOST_VU,
 							ViOffset(REG_STATUS_FLAG)) ||
 					 !m_code.EmitLdrImm12(HOST_LIMIT_HI, HOST_VU, ViOffset(REG_MAC_FLAG))))
+				{
+					return false;
+				}
+				if (deferred_values_resident && !m_plan.deferred_fmac_flags &&
+					(!m_code.EmitStrImm12(HOST_LIMIT_LO, HOST_VU,
+						ViOffset(REG_STATUS_FLAG)) ||
+					 !m_code.EmitStrImm12(HOST_LIMIT_HI, HOST_VU,
+						ViOffset(REG_MAC_FLAG)) ||
+					 !m_code.EmitLdrdImm8(HOST_LIMIT_LO, HOST_LIMIT_HI, SP,
+						static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET))))
 				{
 					return false;
 				}
@@ -2807,6 +2851,15 @@ namespace VitaVU
 			}
 
 #if defined(VITASX2_QEMU_VALIDATION)
+			bool EmitQemuCanonicalDeferredFmacRetirementCounter()
+			{
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitCanonicalDeferredFmacRetirements))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1, 1) &&
+					m_code.EmitStrImm12(1, 0, 0);
+			}
+
 			bool EmitQemuLocalFmacPipelineCounters()
 			{
 				if (!m_plan.local_fmac_pipeline)
@@ -3436,7 +3489,9 @@ namespace VitaVU
 					return false;
 				}
 #if defined(VITASX2_QEMU_VALIDATION)
-				if (!EmitQemuTestPipesFmacFlushInlineCounter(shared_thunk))
+				if (!EmitQemuTestPipesFmacFlushInlineCounter(shared_thunk) ||
+					(deferred_fmac_flags &&
+						!EmitQemuCanonicalDeferredFmacRetirementCounter()))
 					return false;
 				// The validation-only counter uses r0/r1. Restore the resident
 				// iterator needed by the shared-thunk loop; product code emits
@@ -3982,6 +4037,19 @@ namespace VitaVU
 
 			bool EmitLoadViHalfwordRaw(unsigned rd, unsigned reg)
 			{
+				// PCSX2 microVU_Flags.inl keeps delayed STATUS/MAC instances in
+				// allocator registers until an actual architectural seam. Deferred-flag
+				// admission has already proved that a flag observer sees every older
+				// four-cycle instance retired before its pair executes, so r6/r7 are
+				// the exact VI flag values here. UXTH preserves the interpreter's
+				// REG_VI::US[0] read even if a seam supplied nonzero upper bits.
+				if (m_plan.deferred_fmac_flags &&
+					(reg == REG_STATUS_FLAG || reg == REG_MAC_FLAG))
+				{
+					return m_code.EmitUxth(rd,
+						reg == REG_STATUS_FLAG ? HOST_LIMIT_LO : HOST_LIMIT_HI);
+				}
+
 				return m_code.EmitAddImm32(3, HOST_VU, ViOffset(reg)) &&
 					m_code.EmitLdrhImm8(rd, 3, 0);
 			}
@@ -11927,8 +11995,7 @@ namespace VitaVU
 
 			bool DirectLinkFramesCompatible(const CachedBlock& source, const CachedBlock& target)
 			{
-				return source.vector_cache_frame == target.vector_cache_frame &&
-					(!source.deferred_fmac_flags || target.deferred_fmac_flags);
+				return source.vector_cache_frame == target.vector_cache_frame;
 			}
 
 			const void* DirectLinkTargetEntry(const CachedBlock& source,
@@ -12746,7 +12813,6 @@ namespace VitaVU
 					return nullptr;
 				}
 				if (block->vector_cache_frame != source_vector_frame ||
-					(source_deferred_fmac_flags && !block->deferred_fmac_flags) ||
 					(runtime_link && (!runtime_link->owner ||
 						runtime_link->owner->vector_cache_frame != source_vector_frame ||
 						runtime_link->owner->deferred_fmac_flags != source_deferred_fmac_flags ||
@@ -13386,6 +13452,8 @@ namespace VitaVU
 		stats.deferred_fmac_flag_entries = g_qemuVuJitDeferredFmacFlagEntries;
 		stats.deferred_fmac_flag_runtime_retirements =
 			g_qemuVuJitDeferredFmacFlagRetirements;
+		stats.canonical_deferred_fmac_runtime_retirements =
+			g_qemuVuJitCanonicalDeferredFmacRetirements;
 		stats.deferred_fmac_compact_runtime_retirements =
 			g_qemuVuJitDeferredFmacCompactRetirements;
 		stats.deferred_fmac_compact_instructions_removed =
@@ -13461,6 +13529,7 @@ namespace VitaVU
 		g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 		g_qemuVuJitDeferredFmacFlagEntries = 0;
 		g_qemuVuJitDeferredFmacFlagRetirements = 0;
+		g_qemuVuJitCanonicalDeferredFmacRetirements = 0;
 		g_qemuVuJitDeferredFmacCompactRetirements = 0;
 		g_qemuVuJitDeferredFmacCompactInstructionsRemoved = 0;
 		g_qemuVuJitDeferredFmacLinkedEntries = 0;
