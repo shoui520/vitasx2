@@ -8803,16 +8803,17 @@ namespace VitaVU
 				// the generated-block prologue and this inline scan contains no call.
 				const unsigned HOST_COUNT = UsesResidentPipeActivity() ? 14u :
 					HOST_STALL_SCRATCH;
-				constexpr size_t base = offsetof(VURegs, fmac);
+				constexpr size_t FMAC_ARRAY_OFFSET = offsetof(VURegs, fmac);
 				constexpr size_t ring_bytes = 4 * sizeof(fmacPipe);
 				static_assert(sizeof(fmacPipe) == 48);
 				static_assert(ring_bytes <= 255);
+				static_assert(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle) + 4 < 4096);
 
-				// Keep the current circular-queue address live. Rebuilding
-				// base + ((readpos + i) & 3) * 48 at every entry costs three
-				// address instructions plus index/mask bookkeeping on A32.
-				// FMAC is exactly four entries, so one conditionally executed
-				// subtraction wraps the retained pointer without another branch.
+				// Keep the current circular-queue address live. As in the canonical
+				// publisher, form VU + index*48 in two shifted ADDs and fold the
+				// fixed array offset into each LDR. FMAC is exactly four entries, so
+				// one conditionally executed subtraction wraps the retained pointer
+				// without another branch.
 				// Resident r10 already contains the exact canonical count in bits
 				// [2:0]. Extract it into scratch LR with ANDS so the empty branch
 				// consumes Z directly; preserve r10's complete pipe aggregate.
@@ -8833,17 +8834,21 @@ namespace VitaVU
 						 !m_code.EmitLdrImm12(HOST_STALL_CYCLE_HI, HOST_VU,
 							 VuOffset(offsetof(VURegs, cycle) + 4)))) ||
 					!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
-					!m_code.EmitAddImm32(HOST_RING_END, HOST_VU, base) ||
-					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_RING_END, HOST_CALL_SCRATCH, ShiftType::LSL, 5) ||
-					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_CALL_SCRATCH, ShiftType::LSL, 4) ||
-					!m_code.EmitAddImm8(HOST_RING_END, HOST_RING_END, static_cast<u8>(ring_bytes)))
+					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_CALL_SCRATCH,
+						HOST_CALL_SCRATCH, ShiftType::LSL, 1) ||
+					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_VU, HOST_PTR,
+						ShiftType::LSL, 4) ||
+					!m_code.EmitAddImm8(HOST_RING_END, HOST_VU,
+						static_cast<u8>(ring_bytes)))
 				{
 					return false;
 				}
 
 				const size_t loop_start = m_code.Size();
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
-					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, sCycle) + 4) ||
+				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle))) ||
+					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle) + 4)) ||
 					!m_code.EmitSubReg(HOST_VALUE, HOST_STALL_CYCLE_LO, HOST_VALUE, true) ||
 					!m_code.EmitSbcReg(HOST_TEMP, HOST_STALL_CYCLE_HI, HOST_TEMP, true) ||
 					!m_code.EmitCmpImm32(HOST_TEMP, 0))
@@ -8864,7 +8869,8 @@ namespace VitaVU
 
 				std::array<size_t, 4> matched_jumps{};
 				u32 matched_count = 0;
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, regupper)) ||
+				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, regupper))) ||
 					!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0))
 				{
 					return false;
@@ -8872,7 +8878,8 @@ namespace VitaVU
 				const size_t check_upper1 = m_code.EmitBranchPlaceholder(Condition::NE);
 				if (check_upper1 == static_cast<size_t>(-1))
 					return false;
-				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, xyzwupper)) ||
+				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwupper))) ||
 					!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
 				{
 					return false;
@@ -8893,7 +8900,8 @@ namespace VitaVU
 					const size_t check_lower = m_code.EmitBranchPlaceholder(Condition::NE);
 					if (check_lower == static_cast<size_t>(-1))
 						return false;
-					if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, xyzwupper)) ||
+					if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwupper))) ||
 						!m_code.EmitTstImm32(HOST_TEMP, xyzw1))
 					{
 						return false;
@@ -8906,7 +8914,8 @@ namespace VitaVU
 					}
 				}
 
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, reglower)) ||
+				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, reglower))) ||
 					!m_code.EmitCmpImm32(HOST_VALUE, vf_reg0))
 				{
 					return false;
@@ -8914,7 +8923,8 @@ namespace VitaVU
 				const size_t check_lower1 = m_code.EmitBranchPlaceholder(Condition::NE);
 				if (check_lower1 == static_cast<size_t>(-1))
 					return false;
-				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, xyzwlower)) ||
+				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwlower))) ||
 					!m_code.EmitTstImm32(HOST_TEMP, xyzw0))
 				{
 					return false;
@@ -8934,7 +8944,8 @@ namespace VitaVU
 						return false;
 					skip_no_lower_reg = m_code.EmitBranchPlaceholder(Condition::NE);
 					if (skip_no_lower_reg == static_cast<size_t>(-1) ||
-						!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, xyzwlower)) ||
+						!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+							VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, xyzwlower))) ||
 						!m_code.EmitTstImm32(HOST_TEMP, xyzw1))
 					{
 						return false;
@@ -8956,10 +8967,12 @@ namespace VitaVU
 					if (!m_code.PatchBranch(matched_jumps[i], match_target, Condition::NE))
 						return false;
 				}
-				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR, offsetof(fmacPipe, sCycle)) ||
+				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle))) ||
 					!m_code.EmitAddImm8(HOST_VALUE, HOST_VALUE,
 						FMAC_PIPELINE_LATENCY_CYCLES, true) ||
-					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, sCycle) + 4) ||
+					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle) + 4)) ||
 					!m_code.EmitAdcImm8(HOST_TEMP, HOST_TEMP, 0) ||
 					(!resident_cycle_pair &&
 						(!m_code.EmitStrImm12(HOST_VALUE, HOST_VU,
