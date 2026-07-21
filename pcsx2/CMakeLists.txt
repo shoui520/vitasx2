@@ -208,6 +208,14 @@ set_source_files_properties(vita/VitaIopBlockCompiler.cpp PROPERTIES
 	COMPILE_OPTIONS "-fno-pie;-marm"
 )
 
+# The VU1 generated-code ABI owns Q4-Q7 for VF/ACC residency.  Its outer
+# execution wrapper preserves D8-D15 once for AAPCS; prevent the C++ control
+# code in the same translation unit from allocating those registers while the
+# private generated chain is active.
+set_source_files_properties(vita/VitaVuBlockCompiler.cpp PROPERTIES
+	COMPILE_OPTIONS "-ffixed-d8;-ffixed-d9;-ffixed-d10;-ffixed-d11;-ffixed-d12;-ffixed-d13;-ffixed-d14;-ffixed-d15"
+)
+
 # VU multiply/add instructions round after each architectural operation.
 # Contracting the interpreter's separate expressions changes PS2-visible bits
 # and makes trace output compiler-dependent, so keep contraction disabled only

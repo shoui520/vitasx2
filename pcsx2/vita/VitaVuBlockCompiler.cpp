@@ -1884,88 +1884,20 @@ namespace VitaVU
 				if (m_vu0_memory_map)
 					return true;
 
-				// PCSX2 owner: x86/microVU_Branch.inl links compatible block
-				// states without returning through the dispatcher.  The Vita block
-				// body uses one of two stable private-frame mappings (ordinary or
-				// D8-D15-preserving), so compatible linked chains can retain
-				// r4/r6/r7/r11 and the existing stack frame. The target's
-				// private cycle word is refreshed before its microVU block-admission
-				// test; this also converts a preceding block's permitted overshoot
-				// back into an ordinary target-entry rejection.
+				// PCSX2 owner: x86/microVU_Branch.inl links compatible allocator
+				// states without returning through the dispatcher. The outer VU1
+				// execution wrapper gives every target the same private frame, so linked
+				// chains retain r4/r6/r7/r11 without a dispatcher round trip.
 				if (m_plan.deferred_fmac_flags)
 				{
 					m_deferred_fmac_linked_entry_offset = m_code.Size();
-#if defined(VITASX2_QEMU_VALIDATION)
-					if (!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
-							&g_qemuVuJitDeferredFmacLinkedEntries))) ||
-						!m_code.EmitLdrImm12(1, 0, 0) ||
-						!m_code.EmitAddImm8(1, 1, 1) ||
-						!m_code.EmitStrImm12(1, 0, 0))
-					{
+					if (!EmitLinkedEntry(body_offset, true))
 						return false;
-					}
-#endif
-					if (m_resident_cycle &&
-						!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
-							VuOffset(offsetof(VURegs, cycle))))
-					{
-						return false;
-					}
-					if (!EmitRefreshResidentPipeActivity())
-						return false;
-					const size_t deferred_flags_linked_to_body = m_code.EmitBranchPlaceholder();
-					if (deferred_flags_linked_to_body == static_cast<size_t>(-1) ||
-						!m_code.PatchBranch(deferred_flags_linked_to_body, body_offset))
-					{
-						return false;
-					}
 				}
 
 				m_linked_entry_offset = m_code.Size();
-#if defined(VITASX2_QEMU_VALIDATION)
-				if (!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitLinkedFrameEntries))) ||
-					!m_code.EmitLdrImm12(1, 0, 0) ||
-					!m_code.EmitAddImm8(1, 1, 1) ||
-					!m_code.EmitStrImm12(1, 0, 0))
-				{
+				if (!EmitLinkedEntry(body_offset, false))
 					return false;
-				}
-				if (UsesVectorCacheFrame() &&
-					(!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitLinkedVectorFrameEntries))) ||
-					 !m_code.EmitLdrImm12(1, 0, 0) ||
-					 !m_code.EmitAddImm8(1, 1, 1) ||
-					 !m_code.EmitStrImm12(1, 0, 0)))
-				{
-					return false;
-				}
-#endif
-				if (m_plan.deferred_fmac_flags &&
-					!m_code.EmitStrdImm8(HOST_LIMIT_LO, HOST_LIMIT_HI, SP,
-						static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET)))
-				{
-					return false;
-				}
-				if (m_plan.deferred_fmac_flags &&
-					(!m_code.EmitLdrImm12(HOST_LIMIT_LO, HOST_VU,
-							ViOffset(REG_STATUS_FLAG)) ||
-					 !m_code.EmitLdrImm12(HOST_LIMIT_HI, HOST_VU, ViOffset(REG_MAC_FLAG))))
-				{
-					return false;
-				}
-				if (m_resident_cycle &&
-					!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
-						VuOffset(offsetof(VURegs, cycle))))
-				{
-					return false;
-				}
-				if (!EmitRefreshResidentPipeActivity())
-					return false;
-				const size_t linked_to_body = m_code.EmitBranchPlaceholder();
-				if (linked_to_body == static_cast<size_t>(-1) ||
-					!m_code.PatchBranch(linked_to_body, body_offset))
-				{
-					return false;
-				}
 
 				return m_vector_cache_mode != VectorCacheMode::Enabled ||
 					(m_vector_accesses && m_vector_access_cursor == m_vector_accesses->size());
@@ -2078,6 +2010,55 @@ namespace VitaVU
 					Condition condition = Condition::CS;
 				};
 
+			bool EmitLinkedEntry(size_t body_offset, bool deferred_values_resident)
+			{
+				if (deferred_values_resident && !m_plan.deferred_fmac_flags)
+					return false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+				u32* const entry_counter = deferred_values_resident ?
+					&g_qemuVuJitDeferredFmacLinkedEntries : &g_qemuVuJitLinkedFrameEntries;
+				if (!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(entry_counter))) ||
+					!m_code.EmitLdrImm12(1, 0, 0) ||
+					!m_code.EmitAddImm8(1, 1, 1) ||
+					!m_code.EmitStrImm12(1, 0, 0))
+				{
+					return false;
+				}
+				if (!deferred_values_resident && UsesVectorCacheFrame() &&
+					(!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitLinkedVectorFrameEntries))) ||
+					 !m_code.EmitLdrImm12(1, 0, 0) ||
+					 !m_code.EmitAddImm8(1, 1, 1) ||
+					 !m_code.EmitStrImm12(1, 0, 0)))
+				{
+					return false;
+				}
+#endif
+
+				if (!deferred_values_resident && m_plan.deferred_fmac_flags &&
+					(!m_code.EmitStrdImm8(HOST_LIMIT_LO, HOST_LIMIT_HI, SP,
+						static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET)) ||
+					 !m_code.EmitLdrImm12(HOST_LIMIT_LO, HOST_VU,
+							ViOffset(REG_STATUS_FLAG)) ||
+					 !m_code.EmitLdrImm12(HOST_LIMIT_HI, HOST_VU, ViOffset(REG_MAC_FLAG))))
+				{
+					return false;
+				}
+				if (m_resident_cycle &&
+					!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
+						VuOffset(offsetof(VURegs, cycle))))
+				{
+					return false;
+				}
+				if (!EmitRefreshResidentPipeActivity())
+					return false;
+
+				const size_t linked_to_body = m_code.EmitBranchPlaceholder();
+				return linked_to_body != static_cast<size_t>(-1) &&
+					m_code.PatchBranch(linked_to_body, body_offset);
+			}
+
 			bool UsesResidentPipeActivity() const
 			{
 				return m_plan.resident_pipe_activity;
@@ -2182,8 +2163,11 @@ namespace VitaVU
 
 			bool UsesVectorCacheFrame() const
 			{
-				return !m_vu0_memory_map &&
-					m_vector_cache_mode == VectorCacheMode::Enabled;
+				// ExecuteVu1Blocks() preserves AAPCS D8-D15 once around the complete
+				// native execution window, and this translation unit reserves those
+				// registers from C++ allocation. Generated blocks therefore share the
+				// compact scalar private frame even when Q4-Q7 carry VF/ACC values.
+				return false;
 			}
 
 			bool EmitMovReg(unsigned rd, unsigned rm, Condition condition = Condition::AL)
@@ -10047,6 +10031,7 @@ namespace VitaVU
 			std::vector<MicroRange> ranges;
 			u32 primary_start_pc = 0;
 			u32 mapped_blocks = 0;
+			bool uses_vector_cache = false;
 		};
 
 		struct Vu1State
@@ -10391,10 +10376,6 @@ namespace VitaVU
 
 			bool DirectLinkFramesCompatible(const CachedBlock& source, const CachedBlock& target)
 			{
-				// A selected block owns an additional D8-D15 save area. Linked
-				// entries bypass both prologues, so only equal private-frame ABIs
-				// may share an epilogue. Incompatible edges return through the
-				// dispatcher with canonical VF/ACC state already published.
 				return source.vector_cache_frame == target.vector_cache_frame &&
 					(!source.deferred_fmac_flags || target.deferred_fmac_flags);
 			}
@@ -10661,10 +10642,15 @@ namespace VitaVU
 										cached.GetVectorCacheStats();
 									const u64 baseline_bytes = canonical_vector_bytes(baseline_stats);
 									const u64 cached_bytes = canonical_vector_bytes(cached_stats);
-									constexpr size_t MIN_TOTAL_INSTRUCTION_GAIN = 20;
 									constexpr u64 VECTOR_FRAME_TRAFFIC_BYTES = 128;
+									// AnalyzeVectorCacheOpportunity() has already required twenty
+									// removable wrappers and more than one D8-D15 frame of traffic.
+									// The emitted cache replaces canonical VLD/VST address sequences
+									// with register moves, so require that the complete generated block
+									// does not grow and that the measured memory reduction still pays for
+									// the outer execution wrapper's complete 128 frame bytes.
 									vector_cache_selected =
-										baseline_size >= cached_size + MIN_TOTAL_INSTRUCTION_GAIN * sizeof(u32) &&
+										baseline_size >= cached_size &&
 										baseline_bytes > cached_bytes + VECTOR_FRAME_TRAFFIC_BYTES;
 									if (vector_cache_selected)
 									{
@@ -10709,7 +10695,7 @@ namespace VitaVU
 					if (compiled && code.Flush())
 					{
 						block->direct_links = chosen_direct_links;
-						block->vector_cache_frame = vector_cache_selected;
+						block->vector_cache_frame = false;
 						block->deferred_fmac_flags = plan.deferred_fmac_flags;
 						block->code = std::move(code);
 						block->entry = block->code.EntryPoint();
@@ -10805,6 +10791,7 @@ namespace VitaVU
 								vector_cache_baseline_instructions - vector_cache_selected_instructions;
 							s_vu1.stats.vector_cache_canonical_bytes_removed +=
 								vector_cache_canonical_bytes_removed;
+							program->uses_vector_cache = true;
 						}
 						else if (vector_cache_candidate)
 						{
@@ -11554,7 +11541,54 @@ namespace VitaVU
 		s_vu0_execute_calls = 0;
 	}
 
+	extern "C" void VitaVu1ExecuteReservedVectorBody(u32 cycles);
+
+#if defined(_M_ARM32)
+	extern "C" void VitaVu1ExecuteReservedVectorFrame(u32 cycles);
+	asm(
+		".text\n"
+		".align 2\n"
+		".syntax unified\n"
+		".arm\n"
+		".fpu neon\n"
+		".global VitaVu1ExecuteReservedVectorFrame\n"
+		".type VitaVu1ExecuteReservedVectorFrame, %function\n"
+		"VitaVu1ExecuteReservedVectorFrame:\n"
+		"  push {r4, lr}\n"
+		"  vpush {d8-d15}\n"
+		"  bl VitaVu1ExecuteReservedVectorBody\n"
+		"  vpop {d8-d15}\n"
+		"  pop {r4, pc}\n"
+		".size VitaVu1ExecuteReservedVectorFrame, .-VitaVu1ExecuteReservedVectorFrame\n");
+#endif
+
 	void ExecuteVu1Blocks(u32 cycles)
+	{
+		// PCSX2 owner: x86/microVU_Execute.inl enters microVU's private host
+		// register domain once per Execute() window. Q4-Q7 are the Vita allocator's
+		// VF/ACC cache and D8-D15 are AAPCS callee-saved, so preserve the host values
+		// once outside the complete dispatcher/link chain instead of around every
+		// generated block or every scalar/vector transition.
+#if defined(_M_ARM32)
+		// MTVU compiles the reachable block graph on CPU0 before the worker job.
+		// A program which selected no Q4-Q7 mapping does not need the outer save.
+		// The single-threaded provider may compile inside this call, so retain the
+		// wrapper there until the same preparation separation is available.
+		if (!THREAD_VU1 ||
+			(s_vu1.active_program && s_vu1.active_program->uses_vector_cache))
+		{
+			VitaVu1ExecuteReservedVectorFrame(cycles);
+		}
+		else
+		{
+			VitaVu1ExecuteReservedVectorBody(cycles);
+		}
+#else
+		VitaVu1ExecuteReservedVectorBody(cycles);
+#endif
+	}
+
+	extern "C" __attribute__((noinline)) void VitaVu1ExecuteReservedVectorBody(u32 cycles)
 	{
 		// PCSX2 owners: InterpVU1::Execute() supplies the loop shape, TPC
 		// byte/index conversion, VPU_STAT stop fixup, and budget condition;
