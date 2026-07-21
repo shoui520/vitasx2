@@ -793,11 +793,11 @@ namespace MTGS
 				end.vu1.resident_working_fmac_state_stores_removed,
 				start.vu1.resident_working_fmac_state_stores_removed)),
 			static_cast<unsigned long long>(CounterDelta(
-				end.vu1.local_fmac_mac_classification_elisions,
-				start.vu1.local_fmac_mac_classification_elisions)),
+				end.vu1.mac_flag_classification_elisions,
+				start.vu1.mac_flag_classification_elisions)),
 			static_cast<unsigned long long>(CounterDelta(
-				end.vu1.local_fmac_mac_classification_minimum_instructions_removed,
-				start.vu1.local_fmac_mac_classification_minimum_instructions_removed)),
+				end.vu1.mac_flag_classification_minimum_instructions_removed,
+				start.vu1.mac_flag_classification_minimum_instructions_removed)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.completed_programs,
 				origin.vu1.completed_programs)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.executed_pairs,
@@ -818,11 +818,11 @@ namespace MTGS
 				end.vu1.resident_working_fmac_state_stores_removed,
 				origin.vu1.resident_working_fmac_state_stores_removed)),
 			static_cast<unsigned long long>(CounterDelta(
-				end.vu1.local_fmac_mac_classification_elisions,
-				origin.vu1.local_fmac_mac_classification_elisions)),
+				end.vu1.mac_flag_classification_elisions,
+				origin.vu1.mac_flag_classification_elisions)),
 			static_cast<unsigned long long>(CounterDelta(
-				end.vu1.local_fmac_mac_classification_minimum_instructions_removed,
-				origin.vu1.local_fmac_mac_classification_minimum_instructions_removed)));
+				end.vu1.mac_flag_classification_minimum_instructions_removed,
+				origin.vu1.mac_flag_classification_minimum_instructions_removed)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=vu1_cache prepare_checks=%llu prepare_calls=%llu "
 			"quick_hits=%llu program_hits=%llu maps_reused=%llu versions_created=%llu "

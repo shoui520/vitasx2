@@ -41,6 +41,9 @@ namespace VitaVU
 		u32 cycle_resident_blocks = 0;
 		u32 cycle_resident_pairs = 0;
 		u64 cycle_resident_pair_instructions_removed = 0;
+		u32 cycle_high_resident_blocks = 0;
+		u32 cycle_high_resident_pairs = 0;
+		u64 cycle_high_resident_hot_branches_removed = 0;
 		u32 local_fmac_pipeline_blocks = 0;
 		u32 local_fmac_pipeline_pairs = 0;
 		u32 canonical_fmac_stall_tests_elided = 0;
@@ -52,8 +55,8 @@ namespace VitaVU
 		u64 local_fmac_cycle_snapshot_elisions = 0;
 		u32 local_fmac_producer_snapshot_pairs = 0;
 		u32 local_fmac_clip_snapshot_elisions = 0;
-		u32 local_fmac_mac_classification_elisions = 0;
-		u64 local_fmac_mac_classification_minimum_instructions_removed = 0;
+		u32 mac_flag_classification_elisions = 0;
+		u64 mac_flag_classification_minimum_instructions_removed = 0;
 		u64 local_fmac_producer_snapshot_entries = 0;
 		u32 resident_working_fmac_flag_blocks = 0;
 		u32 resident_working_fmac_flag_producers = 0;
@@ -142,10 +145,12 @@ namespace VitaVU
 		u64 canonical_acc_quad_loads = 0;
 		u64 canonical_acc_quad_stores = 0;
 		// Compile-time representation evidence. PCSX2 microVU keeps the
-		// clamped/normalized representation of resident VF/ACC values; these
-		// count redundant vuDouble() operand passes removed from emitted A32.
+		// clamped/normalized representation of resident VF/ACC values, while
+		// Cortex-A9 scalar VFP under FZ natively consumes denormals as signed zero.
+		// Count redundant vuDouble() operand work removed from emitted A32.
 		u64 normalized_operand_quads_bypassed = 0;
 		u64 normalization_instructions_removed = 0;
+		u64 single_d_broadcast_operands = 0;
 		u64 linked_frame_entries = 0;
 		u64 linked_frame_instructions_removed = 0;
 		u64 linked_frame_stack_words_removed = 0;
@@ -174,8 +179,8 @@ namespace VitaVU
 		u64 resident_working_fmac_flag_blocks = 0;
 		u64 resident_working_fmac_flag_producers = 0;
 		u64 resident_working_fmac_state_stores_removed = 0;
-		u64 local_fmac_mac_classification_elisions = 0;
-		u64 local_fmac_mac_classification_minimum_instructions_removed = 0;
+		u64 mac_flag_classification_elisions = 0;
+		u64 mac_flag_classification_minimum_instructions_removed = 0;
 		u64 program_prepare_checks = 0;
 		u64 program_prepare_calls = 0;
 		u64 program_quick_cache_hits = 0;

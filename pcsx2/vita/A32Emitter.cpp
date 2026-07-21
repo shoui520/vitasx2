@@ -90,7 +90,14 @@ namespace VitaA32
 		constexpr u32 VLDR_D_IMM = 0x0d900b00u;
 		constexpr u32 VSTR_D_IMM = 0x0d800b00u;
 		constexpr u32 VDUP_I16_D = 0xf3b20c00u;
+		constexpr u32 VDUP_I32_D_CORE = 0xee800b10u;
+		constexpr u32 VDUP_I32_D_LANE = 0xf3b40c00u;
 		constexpr u32 VDUP_I32_Q_CORE = 0xeea00b10u;
+		constexpr u32 VDUP_I32_Q_LANE = 0xf3b40c40u;
+		// ARM ARM A8.6.336, VMOV.I32 Qd,#imm8 shifted by a whole-byte lane.
+		constexpr u32 VMOV_I32_Q_IMM = 0xf2800050u;
+		// ARM ARM A8.6.277, VBIC.I32 Qd,#imm8 shifted by a whole-byte lane.
+		constexpr u32 VBIC_I32_Q_IMM = 0xf2800070u;
 		constexpr u32 VMOV_S = 0xeeb00a40u;
 		constexpr u32 VMOV_CORE_TO_S = 0xee000a10u;
 		constexpr u32 VMOV_S_TO_CORE = 0xee100a10u;
@@ -131,6 +138,8 @@ namespace VitaA32
 		constexpr u32 VSHL_I32_Q = 0xf2a00550u;
 		constexpr u32 VSHR_U_Q = 0xf3800050u;
 		constexpr u32 VSHR_S_Q = 0xf2800050u;
+		// ARM ARM A8.6.411, VSRI.32 Qd,Qm,#imm.
+		constexpr u32 VSRI_I32_Q = 0xf3800450u;
 		constexpr u32 VSHL_U32_REG_Q = 0xf3200440u;
 		constexpr u32 VSHL_S32_REG_Q = 0xf2200440u;
 		constexpr u32 VMULL_S16_Q = 0xf2900c00u;
@@ -144,7 +153,12 @@ namespace VitaA32
 		constexpr u32 VCGT_S32_Q = 0xf2200340u;
 		constexpr u32 VCEQ_I8_Q = 0xf3000850u;
 		constexpr u32 VCEQ_I16_Q = 0xf3100850u;
+		constexpr u32 VCEQ_I32_D = 0xf3200810u;
 		constexpr u32 VCEQ_I32_Q = 0xf3200850u;
+		// ARM ARM A8.6.281/A8.6.290 Advanced SIMD compare-to-zero forms.
+		constexpr u32 VCEQ_I32_ZERO_D = 0xf3b90100u;
+		constexpr u32 VCEQ_I32_ZERO_Q = 0xf3b90140u;
+		constexpr u32 VCLT_S32_ZERO_Q = 0xf3b90240u;
 		constexpr u32 VMIN_S16_Q = 0xf2100650u;
 		constexpr u32 VMIN_S32_Q = 0xf2200650u;
 		constexpr u32 VMAX_S16_Q = 0xf2100640u;
@@ -179,8 +193,10 @@ namespace VitaA32
 		constexpr u32 VUZP_I16_Q = 0xf3b60140u;
 		constexpr u32 VUZP_I32_Q = 0xf3ba0140u;
 		constexpr u32 VEXT_I8_Q = 0xf2b00040u;
+		constexpr u32 VAND_D = 0xf2000110u;
 		constexpr u32 VAND_Q = 0xf2000150u;
 		// ARM ARM A8.6.279, VBIT Qd,Qn,Qm (op=0b10, Q=1).
+		constexpr u32 VBIT_D = 0xf3200110u;
 		constexpr u32 VBIT_Q = 0xf3200150u;
 		constexpr u32 VEOR_Q = 0xf3000150u;
 		constexpr u32 VEOR_D = 0xf3000110u;
@@ -189,8 +205,10 @@ namespace VitaA32
 			constexpr u32 VMVN_Q = 0xf3b005c0u;
 			constexpr u32 BRANCH = 0x0a000000u;
 			constexpr u32 NOP = 0x0320f000u;
-			constexpr u32 PUSH = 0x092d0000u;
+		constexpr u32 PUSH = 0x092d0000u;
 		constexpr u32 POP = 0x08bd0000u;
+		constexpr u32 STMIA = 0x08800000u;
+		constexpr u32 LDMIA = 0x08900000u;
 		constexpr u32 BX = 0x012fff10u;
 		constexpr u32 BLX = 0x012fff30u;
 
@@ -617,13 +635,15 @@ namespace VitaA32
 			offset : static_cast<size_t>(-1);
 	}
 
-	bool CodeBuffer::EmitAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	bool CodeBuffer::EmitAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags,
+		Condition condition)
 	{
 		if (!IsRegister(rd) || !IsRegister(rn))
 			return false;
-		if (!set_flags && value == 0 && CanElideSameRegisterWrite(rd, rn))
+		if (!set_flags && condition == Condition::AL && value == 0 &&
+			CanElideSameRegisterWrite(rd, rn))
 			return true;
-		return EmitU32(EncodeAddImm8(rd, rn, value, set_flags));
+		return EmitU32(EncodeAddImm8(rd, rn, value, set_flags, condition));
 	}
 
 	bool CodeBuffer::EmitAddImm32(unsigned rd, unsigned rn, u32 value, bool set_flags)
@@ -1201,11 +1221,12 @@ namespace VitaA32
 		return EmitU32(EncodeLdrRegShift(rd, rn, rm, shift, amount));
 	}
 
-	bool CodeBuffer::EmitStrImm12(unsigned rd, unsigned rn, u16 offset)
+	bool CodeBuffer::EmitStrImm12(unsigned rd, unsigned rn, u16 offset,
+		Condition condition)
 	{
 		if (!IsLowRegister(rd) || !IsLowRegister(rn) || offset > 0x0fff)
 			return false;
-		return EmitU32(EncodeStrImm12(rd, rn, offset));
+		return EmitU32(EncodeStrImm12(rd, rn, offset, condition));
 	}
 
 	bool CodeBuffer::EmitStrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount)
@@ -1434,11 +1455,48 @@ namespace VitaA32
 		return EmitU32(EncodeVdupI16D(MapNeonDRegister(dd), MapNeonDRegister(dm), lane));
 	}
 
+	bool CodeBuffer::EmitVdupI32DFromCore(unsigned dd, unsigned rt)
+	{
+		if (!IsDRegister(dd) || !IsGeneralRegister(rt))
+			return false;
+		return EmitU32(EncodeVdupI32DFromCore(MapNeonDRegister(dd), rt));
+	}
+
+	bool CodeBuffer::EmitVdupI32DFromQlane(unsigned dd, unsigned qm, u8 lane)
+	{
+		if (!IsDRegister(dd) || !IsQRegister(qm) || lane > 3)
+			return false;
+		return EmitU32(EncodeVdupI32DFromQlane(MapNeonDRegister(dd),
+			MapNeonQRegister(qm), lane));
+	}
+
 	bool CodeBuffer::EmitVdupI32QFromCore(unsigned qd, unsigned rt)
 	{
 		if (!IsQRegister(qd) || !IsGeneralRegister(rt))
 			return false;
 		return EmitU32(EncodeVdupI32QFromCore(MapNeonQRegister(qd), rt));
+	}
+
+	bool CodeBuffer::EmitVdupI32QFromQlane(unsigned qd, unsigned qm, u8 lane)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qm) || lane > 3)
+			return false;
+		return EmitU32(EncodeVdupI32QFromQlane(
+			MapNeonQRegister(qd), MapNeonQRegister(qm), lane));
+	}
+
+	bool CodeBuffer::EmitVmovI32Q(unsigned qd, u8 imm8, u8 left_shift)
+	{
+		if (!IsQRegister(qd) || left_shift > 24 || (left_shift & 7u) != 0)
+			return false;
+		return EmitU32(EncodeVmovI32Q(MapNeonQRegister(qd), imm8, left_shift));
+	}
+
+	bool CodeBuffer::EmitVbicI32Q(unsigned qd, u8 imm8, u8 left_shift)
+	{
+		if (!IsQRegister(qd) || left_shift > 24 || (left_shift & 7u) != 0)
+			return false;
+		return EmitU32(EncodeVbicI32Q(MapNeonQRegister(qd), imm8, left_shift));
 	}
 
 	bool CodeBuffer::EmitVmovS(unsigned sd, unsigned sm)
@@ -1714,6 +1772,13 @@ namespace VitaA32
 		return EmitU32(EncodeVshrU32Q(MapNeonQRegister(qd), MapNeonQRegister(qm), amount));
 	}
 
+	bool CodeBuffer::EmitVsriI32Q(unsigned qd, unsigned qm, u8 amount)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qm) || amount == 0 || amount >= 32)
+			return false;
+		return EmitU32(EncodeVsriI32Q(MapNeonQRegister(qd), MapNeonQRegister(qm), amount));
+	}
+
 	bool CodeBuffer::EmitVshrS16Q(unsigned qd, unsigned qm, u8 amount)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qm) || amount == 0 || amount >= 16)
@@ -1819,11 +1884,40 @@ namespace VitaA32
 		return EmitU32(EncodeVceqI16Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
 	}
 
+	bool CodeBuffer::EmitVceqI32D(unsigned dd, unsigned dn, unsigned dm)
+	{
+		if (!IsDRegister(dd) || !IsDRegister(dn) || !IsDRegister(dm))
+			return false;
+		return EmitU32(EncodeVceqI32D(MapNeonDRegister(dd),
+			MapNeonDRegister(dn), MapNeonDRegister(dm)));
+	}
+
 	bool CodeBuffer::EmitVceqI32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
 		return EmitU32(EncodeVceqI32Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
+	}
+
+	bool CodeBuffer::EmitVceqI32ZeroD(unsigned dd, unsigned dm)
+	{
+		if (!IsDRegister(dd) || !IsDRegister(dm))
+			return false;
+		return EmitU32(EncodeVceqI32ZeroD(MapNeonDRegister(dd), MapNeonDRegister(dm)));
+	}
+
+	bool CodeBuffer::EmitVceqI32ZeroQ(unsigned qd, unsigned qm)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qm))
+			return false;
+		return EmitU32(EncodeVceqI32ZeroQ(MapNeonQRegister(qd), MapNeonQRegister(qm)));
+	}
+
+	bool CodeBuffer::EmitVcltS32ZeroQ(unsigned qd, unsigned qm)
+	{
+		if (!IsQRegister(qd) || !IsQRegister(qm))
+			return false;
+		return EmitU32(EncodeVcltS32ZeroQ(MapNeonQRegister(qd), MapNeonQRegister(qm)));
 	}
 
 	bool CodeBuffer::EmitVminS16Q(unsigned qd, unsigned qn, unsigned qm)
@@ -2066,11 +2160,27 @@ namespace VitaA32
 		return EmitU32(EncodeVextI8Q(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm), byte_offset));
 	}
 
+	bool CodeBuffer::EmitVandD(unsigned dd, unsigned dn, unsigned dm)
+	{
+		if (!IsDRegister(dd) || !IsDRegister(dn) || !IsDRegister(dm))
+			return false;
+		return EmitU32(EncodeVandD(MapNeonDRegister(dd),
+			MapNeonDRegister(dn), MapNeonDRegister(dm)));
+	}
+
 	bool CodeBuffer::EmitVandQ(unsigned qd, unsigned qn, unsigned qm)
 	{
 		if (!IsQRegister(qd) || !IsQRegister(qn) || !IsQRegister(qm))
 			return false;
 		return EmitU32(EncodeVandQ(MapNeonQRegister(qd), MapNeonQRegister(qn), MapNeonQRegister(qm)));
+	}
+
+	bool CodeBuffer::EmitVbitD(unsigned dd, unsigned dn, unsigned dm)
+	{
+		if (!IsDRegister(dd) || !IsDRegister(dn) || !IsDRegister(dm))
+			return false;
+		return EmitU32(EncodeVbitD(MapNeonDRegister(dd),
+			MapNeonDRegister(dn), MapNeonDRegister(dm)));
 	}
 
 	bool CodeBuffer::EmitVbitQ(unsigned qd, unsigned qn, unsigned qm)
@@ -2270,6 +2380,37 @@ namespace VitaA32
 		if (register_list == 0)
 			return false;
 		return EmitU32(EncodePush(register_list));
+	}
+
+	bool CodeBuffer::EmitStmIa(unsigned rn, u16 register_list, bool writeback)
+	{
+		// ARM ARM A8.6.189, A1 encoding. W selects the architected post-transfer
+		// base update by four bytes per listed register. The base-in-list case is
+		// excluded even without writeback so every emitted form has one meaning.
+		// PC is excluded from both roles.
+		if (!IsGeneralRegister(rn) || register_list == 0 ||
+			(register_list & ((1u << rn) | (1u << 15))) != 0)
+		{
+			return false;
+		}
+		return EmitU32(CondBits(Condition::AL) | STMIA |
+			(static_cast<u32>(writeback) << 21) |
+			((rn & 0xfu) << 16) | register_list);
+	}
+
+	bool CodeBuffer::EmitLdmIa(unsigned rn, u16 register_list, bool writeback)
+	{
+		// ARM ARM A8.6.53, A1 encoding. Ascending memory words map to
+		// ascending register numbers. Keep the same unambiguous subset as STMIA:
+		// no PC and no base-in-list form, even when writeback is disabled.
+		if (!IsGeneralRegister(rn) || register_list == 0 ||
+			(register_list & ((1u << rn) | (1u << 15))) != 0)
+		{
+			return false;
+		}
+		return EmitU32(CondBits(Condition::AL) | LDMIA |
+			(static_cast<u32>(writeback) << 21) |
+			((rn & 0xfu) << 16) | register_list);
 	}
 
 	bool CodeBuffer::EmitVpushDRange(unsigned first_d, unsigned d_count)
@@ -2495,11 +2636,12 @@ namespace VitaA32
 			   (static_cast<u32>(value) & 0x0fffu);
 	}
 
-	u32 EncodeAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags)
+	u32 EncodeAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags,
+		Condition condition)
 	{
 		pxAssert(IsRegister(rd));
 		pxAssert(IsRegister(rn));
-		return CondBits(Condition::AL) | DATA_PROCESSING_IMM | OPCODE_ADD | (set_flags ? SET_FLAGS : 0) |
+		return CondBits(condition) | DATA_PROCESSING_IMM | OPCODE_ADD | (set_flags ? SET_FLAGS : 0) |
 			   ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | value;
 	}
 
@@ -2884,12 +3026,13 @@ namespace VitaA32
 			   ((static_cast<u32>(shift) & 0x3u) << 5) | (rm & 0xfu);
 	}
 
-	u32 EncodeStrImm12(unsigned rd, unsigned rn, u16 offset)
+	u32 EncodeStrImm12(unsigned rd, unsigned rn, u16 offset, Condition condition)
 	{
 		pxAssert(IsLowRegister(rd));
 		pxAssert(IsLowRegister(rn));
 		pxAssert(offset <= 0x0fff);
-		return CondBits(Condition::AL) | STR_IMM | ((rn & 0xfu) << 16) | ((rd & 0xfu) << 12) | offset;
+		return CondBits(condition) | STR_IMM | ((rn & 0xfu) << 16) |
+			((rd & 0xfu) << 12) | offset;
 	}
 
 	u32 EncodeStrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount)
@@ -2963,11 +3106,64 @@ namespace VitaA32
 		return VDUP_I16_D | NeonDd(dd) | NeonDm(dm) | ((static_cast<u32>(lane) & 0x3u) << 18);
 	}
 
+	u32 EncodeVdupI32DFromCore(unsigned dd, unsigned rt)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsGeneralRegister(rt));
+		return VDUP_I32_D_CORE | NeonDn(dd) | ((rt & 0xfu) << 12);
+	}
+
+	u32 EncodeVdupI32DFromQlane(unsigned dd, unsigned qm, u8 lane)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsQRegister(qm));
+		pxAssert(lane <= 3);
+		const unsigned dm = qm * 2u + (lane >> 1);
+		return VDUP_I32_D_LANE | NeonDd(dd) | NeonDm(dm) |
+			((static_cast<u32>(lane) & 1u) << 19);
+	}
+
 	u32 EncodeVdupI32QFromCore(unsigned qd, unsigned rt)
 	{
 		pxAssert(IsQRegister(qd));
 		pxAssert(IsGeneralRegister(rt));
 		return VDUP_I32_Q_CORE | NeonQn(qd) | ((rt & 0xfu) << 12);
+	}
+
+	u32 EncodeVdupI32QFromQlane(unsigned qd, unsigned qm, u8 lane)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qm));
+		pxAssert(lane <= 3);
+		const unsigned dm = qm * 2u + (lane >> 1);
+		return VDUP_I32_Q_LANE | NeonQd(qd) | NeonDm(dm) |
+			((static_cast<u32>(lane) & 1u) << 19);
+	}
+
+	u32 EncodeVmovI32Q(unsigned qd, u8 imm8, u8 left_shift)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(left_shift <= 24 && (left_shift & 7u) == 0);
+		// A8.6.336: i:imm3:imm4 carries imm8, while cmode 000x/001x/
+		// 010x/011x selects LSL #0/#8/#16/#24 for 32-bit elements.
+		return VMOV_I32_Q_IMM |
+			((static_cast<u32>(imm8) & 0x80u) << 17) |
+			((static_cast<u32>(imm8) & 0x70u) << 12) |
+			((static_cast<u32>(left_shift / 8u) * 2u) << 8) |
+			NeonQd(qd) | (static_cast<u32>(imm8) & 0x0fu);
+	}
+
+	u32 EncodeVbicI32Q(unsigned qd, u8 imm8, u8 left_shift)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(left_shift <= 24 && (left_shift & 7u) == 0);
+		// A8.6.277 uses the same i:imm3:imm4 byte and byte-position
+		// fields as VMOV.I32, with the VBIC cmode low bit set.
+		return VBIC_I32_Q_IMM |
+			((static_cast<u32>(imm8) & 0x80u) << 17) |
+			((static_cast<u32>(imm8) & 0x70u) << 12) |
+			((static_cast<u32>(left_shift / 8u) * 2u + 1u) << 8) |
+			NeonQd(qd) | (static_cast<u32>(imm8) & 0x0fu);
 	}
 
 	u32 EncodeLdrbImm12(unsigned rd, unsigned rn, u16 offset)
@@ -3480,6 +3676,16 @@ namespace VitaA32
 			   NeonQd(qd) | NeonQm(qm);
 	}
 
+	u32 EncodeVsriI32Q(unsigned qd, unsigned qm, u8 amount)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qm));
+		pxAssert(amount > 0 && amount < 32);
+		const u8 imm = static_cast<u8>(64 - amount);
+		return VSRI_I32_Q | ((static_cast<u32>(imm) & 0x3fu) << 16) |
+			   NeonQd(qd) | NeonQm(qm);
+	}
+
 	u32 EncodeVshrS16Q(unsigned qd, unsigned qm, u8 amount)
 	{
 		pxAssert(IsQRegister(qd));
@@ -3601,12 +3807,41 @@ namespace VitaA32
 		return VCEQ_I16_Q | NeonQd(qd) | NeonQn(qn) | NeonQm(qm);
 	}
 
+	u32 EncodeVceqI32D(unsigned dd, unsigned dn, unsigned dm)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsDRegister(dn));
+		pxAssert(IsDRegister(dm));
+		return VCEQ_I32_D | NeonDd(dd) | NeonDn(dn) | NeonDm(dm);
+	}
+
 	u32 EncodeVceqI32Q(unsigned qd, unsigned qn, unsigned qm)
 	{
 		pxAssert(IsQRegister(qd));
 		pxAssert(IsQRegister(qn));
 		pxAssert(IsQRegister(qm));
 		return VCEQ_I32_Q | NeonQd(qd) | NeonQn(qn) | NeonQm(qm);
+	}
+
+	u32 EncodeVceqI32ZeroD(unsigned dd, unsigned dm)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsDRegister(dm));
+		return VCEQ_I32_ZERO_D | NeonDd(dd) | NeonDm(dm);
+	}
+
+	u32 EncodeVceqI32ZeroQ(unsigned qd, unsigned qm)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qm));
+		return VCEQ_I32_ZERO_Q | NeonQd(qd) | NeonQm(qm);
+	}
+
+	u32 EncodeVcltS32ZeroQ(unsigned qd, unsigned qm)
+	{
+		pxAssert(IsQRegister(qd));
+		pxAssert(IsQRegister(qm));
+		return VCLT_S32_ZERO_Q | NeonQd(qd) | NeonQm(qm);
 	}
 
 	u32 EncodeVminS16Q(unsigned qd, unsigned qn, unsigned qm)
@@ -3867,12 +4102,28 @@ namespace VitaA32
 			   ((static_cast<u32>(byte_offset) & 0x0fu) << 8);
 	}
 
+	u32 EncodeVandD(unsigned dd, unsigned dn, unsigned dm)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsDRegister(dn));
+		pxAssert(IsDRegister(dm));
+		return VAND_D | NeonDd(dd) | NeonDn(dn) | NeonDm(dm);
+	}
+
 	u32 EncodeVandQ(unsigned qd, unsigned qn, unsigned qm)
 	{
 		pxAssert(IsQRegister(qd));
 		pxAssert(IsQRegister(qn));
 		pxAssert(IsQRegister(qm));
 		return VAND_Q | NeonQd(qd) | NeonQn(qn) | NeonQm(qm);
+	}
+
+	u32 EncodeVbitD(unsigned dd, unsigned dn, unsigned dm)
+	{
+		pxAssert(IsDRegister(dd));
+		pxAssert(IsDRegister(dn));
+		pxAssert(IsDRegister(dm));
+		return VBIT_D | NeonDd(dd) | NeonDn(dn) | NeonDm(dm);
 	}
 
 	u32 EncodeVbitQ(unsigned qd, unsigned qn, unsigned qm)

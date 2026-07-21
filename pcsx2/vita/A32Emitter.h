@@ -87,7 +87,8 @@ namespace VitaA32
 		bool EmitMovImm32(unsigned rd, u32 value, Condition condition = Condition::AL);
 		bool EmitMovImm32Patchable(unsigned rd, u32 value);
 		size_t EmitLdrLiteralPlaceholder(unsigned rd, Condition condition = Condition::AL);
-		bool EmitAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+		bool EmitAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false,
+			Condition condition = Condition::AL);
 		bool EmitAddImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false,
 			Condition condition = Condition::AL);
@@ -157,7 +158,8 @@ namespace VitaA32
 		bool EmitLdrImm12(unsigned rd, unsigned rn, u16 offset, Condition condition = Condition::AL);
 		bool EmitLdrImm12PostIndex(unsigned rd, unsigned rn, u16 offset);
 		bool EmitLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
-		bool EmitStrImm12(unsigned rd, unsigned rn, u16 offset);
+		bool EmitStrImm12(unsigned rd, unsigned rn, u16 offset,
+			Condition condition = Condition::AL);
 		bool EmitStrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 		bool EmitLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
 			Condition condition = Condition::AL);
@@ -193,7 +195,12 @@ namespace VitaA32
 		bool EmitVstrDImm(unsigned dd, unsigned rn, u16 offset,
 			Condition condition = Condition::AL);
 		bool EmitVdupI16D(unsigned dd, unsigned dm, u8 lane);
+		bool EmitVdupI32DFromCore(unsigned dd, unsigned rt);
+		bool EmitVdupI32DFromQlane(unsigned dd, unsigned qm, u8 lane);
 		bool EmitVdupI32QFromCore(unsigned qd, unsigned rt);
+		bool EmitVdupI32QFromQlane(unsigned qd, unsigned qm, u8 lane);
+		bool EmitVmovI32Q(unsigned qd, u8 imm8, u8 left_shift);
+		bool EmitVbicI32Q(unsigned qd, u8 imm8, u8 left_shift);
 		bool EmitVmovS(unsigned sd, unsigned sm);
 		bool EmitVmovCoreToS(unsigned sd, unsigned rt);
 		bool EmitVmovSToCore(unsigned rt, unsigned sd, Condition condition = Condition::AL);
@@ -235,6 +242,7 @@ namespace VitaA32
 		bool EmitVshlI32Q(unsigned qd, unsigned qm, u8 amount);
 		bool EmitVshrU16Q(unsigned qd, unsigned qm, u8 amount);
 		bool EmitVshrU32Q(unsigned qd, unsigned qm, u8 amount);
+		bool EmitVsriI32Q(unsigned qd, unsigned qm, u8 amount);
 		bool EmitVshrS16Q(unsigned qd, unsigned qm, u8 amount);
 		bool EmitVshrS32Q(unsigned qd, unsigned qm, u8 amount);
 		bool EmitVshlU32Q(unsigned qd, unsigned qm, unsigned qn);
@@ -250,7 +258,11 @@ namespace VitaA32
 		bool EmitVcgtS32Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVceqI8Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVceqI16Q(unsigned qd, unsigned qn, unsigned qm);
+		bool EmitVceqI32D(unsigned dd, unsigned dn, unsigned dm);
 		bool EmitVceqI32Q(unsigned qd, unsigned qn, unsigned qm);
+		bool EmitVceqI32ZeroD(unsigned dd, unsigned dm);
+		bool EmitVceqI32ZeroQ(unsigned qd, unsigned qm);
+		bool EmitVcltS32ZeroQ(unsigned qd, unsigned qm);
 		bool EmitVminS16Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVminS32Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVmaxS16Q(unsigned qd, unsigned qn, unsigned qm);
@@ -285,26 +297,30 @@ namespace VitaA32
 		bool EmitVuzpI16Q(unsigned qd, unsigned qm);
 		bool EmitVuzpI32Q(unsigned qd, unsigned qm);
 		bool EmitVextI8Q(unsigned qd, unsigned qn, unsigned qm, u8 byte_offset);
+		bool EmitVandD(unsigned dd, unsigned dn, unsigned dm);
 		bool EmitVandQ(unsigned qd, unsigned qn, unsigned qm);
+		bool EmitVbitD(unsigned dd, unsigned dn, unsigned dm);
 		bool EmitVbitQ(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVeorQ(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVeorD(unsigned dd, unsigned dn, unsigned dm);
 		bool EmitVorrQ(unsigned qd, unsigned qn, unsigned qm);
-			bool EmitVorrD(unsigned dd, unsigned dn, unsigned dm);
-			bool EmitVmvnQ(unsigned qd, unsigned qm);
-			size_t EmitBranchPlaceholder(Condition condition = Condition::AL);
-			size_t EmitBranchLinkPlaceholder(Condition condition = Condition::AL);
-			bool PatchBranch(size_t instruction_offset, size_t target_offset, Condition condition = Condition::AL);
-			bool PatchBranchLink(size_t instruction_offset, size_t target_offset,
-				Condition condition = Condition::AL);
-			bool PatchBranchToAddress(size_t instruction_offset, const void* target,
-				Condition condition = Condition::AL);
-			bool ReadInstruction(size_t instruction_offset, u32* instruction) const;
-			bool PatchInstruction(size_t instruction_offset, u32 instruction);
-			bool PatchLdrLiteral(size_t instruction_offset, size_t literal_offset,
-				Condition condition = Condition::AL);
-			bool PatchNop(size_t instruction_offset);
-			bool EmitPush(u16 register_list);
+		bool EmitVorrD(unsigned dd, unsigned dn, unsigned dm);
+		bool EmitVmvnQ(unsigned qd, unsigned qm);
+		size_t EmitBranchPlaceholder(Condition condition = Condition::AL);
+		size_t EmitBranchLinkPlaceholder(Condition condition = Condition::AL);
+		bool PatchBranch(size_t instruction_offset, size_t target_offset, Condition condition = Condition::AL);
+		bool PatchBranchLink(size_t instruction_offset, size_t target_offset,
+			Condition condition = Condition::AL);
+		bool PatchBranchToAddress(size_t instruction_offset, const void* target,
+			Condition condition = Condition::AL);
+		bool ReadInstruction(size_t instruction_offset, u32* instruction) const;
+		bool PatchInstruction(size_t instruction_offset, u32 instruction);
+		bool PatchLdrLiteral(size_t instruction_offset, size_t literal_offset,
+			Condition condition = Condition::AL);
+		bool PatchNop(size_t instruction_offset);
+		bool EmitLdmIa(unsigned rn, u16 register_list, bool writeback = false);
+		bool EmitStmIa(unsigned rn, u16 register_list, bool writeback = false);
+		bool EmitPush(u16 register_list);
 		bool EmitVpushDRange(unsigned first_d, unsigned d_count);
 		bool EmitPop(u16 register_list);
 		bool EmitVpopDRange(unsigned first_d, unsigned d_count);
@@ -338,7 +354,8 @@ namespace VitaA32
 	u32 EncodeMovImm8(unsigned rd, u8 value, Condition condition = Condition::AL);
 	u32 EncodeMovw(unsigned rd, u16 value, Condition condition = Condition::AL);
 	u32 EncodeMovt(unsigned rd, u16 value, Condition condition = Condition::AL);
-	u32 EncodeAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
+	u32 EncodeAddImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false,
+		Condition condition = Condition::AL);
 	u32 EncodeSubImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false,
 		Condition condition = Condition::AL);
 	u32 EncodeAndImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
@@ -399,7 +416,8 @@ namespace VitaA32
 	u32 EncodeLdrImm12(unsigned rd, unsigned rn, u16 offset, Condition condition = Condition::AL);
 	u32 EncodeLdrImm12PostIndex(unsigned rd, unsigned rn, u16 offset);
 	u32 EncodeLdrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
-	u32 EncodeStrImm12(unsigned rd, unsigned rn, u16 offset);
+	u32 EncodeStrImm12(unsigned rd, unsigned rn, u16 offset,
+		Condition condition = Condition::AL);
 	u32 EncodeStrRegShift(unsigned rd, unsigned rn, unsigned rm, ShiftType shift, u8 amount);
 	u32 EncodeLdrdImm8(unsigned rdlo, unsigned rdhi, unsigned rn, u8 offset,
 		Condition condition = Condition::AL);
@@ -435,7 +453,12 @@ namespace VitaA32
 	u32 EncodeVstrDImm(unsigned dd, unsigned rn, u16 offset,
 		Condition condition = Condition::AL);
 	u32 EncodeVdupI16D(unsigned dd, unsigned dm, u8 lane);
+	u32 EncodeVdupI32DFromCore(unsigned dd, unsigned rt);
+	u32 EncodeVdupI32DFromQlane(unsigned dd, unsigned qm, u8 lane);
 	u32 EncodeVdupI32QFromCore(unsigned qd, unsigned rt);
+	u32 EncodeVdupI32QFromQlane(unsigned qd, unsigned qm, u8 lane);
+	u32 EncodeVmovI32Q(unsigned qd, u8 imm8, u8 left_shift);
+	u32 EncodeVbicI32Q(unsigned qd, u8 imm8, u8 left_shift);
 	u32 EncodeVmovS(unsigned sd, unsigned sm);
 	u32 EncodeVmovCoreToS(unsigned sd, unsigned rt);
 	u32 EncodeVmovSToCore(unsigned rt, unsigned sd, Condition condition = Condition::AL);
@@ -477,6 +500,7 @@ namespace VitaA32
 	u32 EncodeVshlI32Q(unsigned qd, unsigned qm, u8 amount);
 	u32 EncodeVshrU16Q(unsigned qd, unsigned qm, u8 amount);
 	u32 EncodeVshrU32Q(unsigned qd, unsigned qm, u8 amount);
+	u32 EncodeVsriI32Q(unsigned qd, unsigned qm, u8 amount);
 	u32 EncodeVshrS16Q(unsigned qd, unsigned qm, u8 amount);
 	u32 EncodeVshrS32Q(unsigned qd, unsigned qm, u8 amount);
 	u32 EncodeVshlU32Q(unsigned qd, unsigned qm, unsigned qn);
@@ -492,7 +516,11 @@ namespace VitaA32
 	u32 EncodeVcgtS32Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVceqI8Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVceqI16Q(unsigned qd, unsigned qn, unsigned qm);
+	u32 EncodeVceqI32D(unsigned dd, unsigned dn, unsigned dm);
 	u32 EncodeVceqI32Q(unsigned qd, unsigned qn, unsigned qm);
+	u32 EncodeVceqI32ZeroD(unsigned dd, unsigned dm);
+	u32 EncodeVceqI32ZeroQ(unsigned qd, unsigned qm);
+	u32 EncodeVcltS32ZeroQ(unsigned qd, unsigned qm);
 	u32 EncodeVminS16Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVminS32Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVmaxS16Q(unsigned qd, unsigned qn, unsigned qm);
@@ -527,7 +555,9 @@ namespace VitaA32
 	u32 EncodeVuzpI16Q(unsigned qd, unsigned qm);
 	u32 EncodeVuzpI32Q(unsigned qd, unsigned qm);
 	u32 EncodeVextI8Q(unsigned qd, unsigned qn, unsigned qm, u8 byte_offset);
+	u32 EncodeVandD(unsigned dd, unsigned dn, unsigned dm);
 	u32 EncodeVandQ(unsigned qd, unsigned qn, unsigned qm);
+	u32 EncodeVbitD(unsigned dd, unsigned dn, unsigned dm);
 	u32 EncodeVbitQ(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVeorQ(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVeorD(unsigned dd, unsigned dn, unsigned dm);
