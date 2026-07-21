@@ -154,6 +154,9 @@ namespace VitaVU
 		u64 linked_frame_entries = 0;
 		u64 linked_frame_instructions_removed = 0;
 		u64 linked_frame_stack_words_removed = 0;
+		u64 resident_pipe_linked_entries = 0;
+		u64 resident_pipe_linked_instructions_removed = 0;
+		u64 resident_pipe_linked_state_loads_removed = 0;
 		u32 code_cache_resets = 0;
 		size_t code_cache_used = 0;
 		size_t code_cache_capacity = 0;
