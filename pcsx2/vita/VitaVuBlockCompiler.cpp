@@ -5057,11 +5057,12 @@ namespace VitaVU
 				return EmitStoreVfWordFromS(value_sreg, fd, lane);
 			}
 
-			bool EmitClassifyMacOrStatusQ0(unsigned mask, bool mac_result)
+			bool EmitClassifyAndNormalizeMacOrStatusQ0(unsigned mask, bool mac_result)
 			{
 				mask &= 0x0f;
 				if (mask == 0)
 					return m_code.EmitMovImm8(2, 0);
+				const bool overflow_clamp = CHECK_VU_OVERFLOW(1);
 
 				const auto reduce_packed_lanes = [&](bool disjoint_lane_bits) {
 					// Q2 is D4:D5. Cortex-A9 NEON MPE TRM tables 3-4 and 3-7
@@ -5083,8 +5084,33 @@ namespace VitaVU
 					return m_code.EmitVmovSToCore(2, 8);
 				};
 
-				// PCSX2 owner: x86/microVU_Upper.inl::mVUupdateFlags(). When
-				// mFLAG.doFlag is false, the same per-lane sign/zero/underflow/
+				// PCSX2 owners: x86/microVU_Upper.inl::mVUupdateFlags() and
+				// x86/microVU_Clamp.inl::mVUclampReg(). Both inspect the same raw
+				// FMAC exponent/sign state. Keep those masks live and normalize Q0
+				// before packing flags instead of reconstructing them afterward.
+				// Sony VU User Manual 2.3 requires a nonzero exponent-zero result to
+				// clamp to signed zero and set both U and Z; exponent-all-ones results
+				// clamp to signed max finite when PCSX2's overflow option is active.
+				if (!EmitEnsureVuFloatNormalizeConstants(overflow_clamp) ||
+					!m_code.EmitVandQ(VU_NORM_EXPV_Q, 0, VU_NORM_EXP_Q) ||
+					!m_code.EmitVandQ(VU_NORM_SIGNV_Q, 0, VU_NORM_SIGN_Q) ||
+					!m_code.EmitVshlI32Q(VU_NORM_TMP_Q, 0, 1) ||
+					!m_code.EmitVceqI32Q(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_ZERO_Q) ||
+					!m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_ZERO_Q) ||
+					!m_code.EmitVceqI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q) ||
+					!m_code.EmitVmvnQ(3, VU_NORM_TMP_Q) ||
+					!m_code.EmitVandQ(3, 3, VU_NORM_MASK_Q) ||
+					!m_code.EmitVbitQ(0, VU_NORM_SIGNV_Q, VU_NORM_MASK_Q))
+				{
+					return false;
+				}
+				if (overflow_clamp &&
+					(!m_code.EmitVorrQ(1, VU_NORM_SIGNV_Q, VU_NORM_MAXF_Q) ||
+					 !m_code.EmitVbitQ(0, 1, VU_NORM_EXPV_Q)))
+				{
+					return false;
+				}
+				// When mFLAG.doFlag is false, the same per-lane sign/zero/underflow/
 				// overflow classification is reduced directly into STATUS's four
 				// category bits; it does not construct the 16-bit XYZW MAC layout.
 				// Vita keeps one NEON body and selects the lane weights and category
@@ -5095,16 +5121,8 @@ namespace VitaVU
 					// of the corresponding XYZW MAC bits. A full destination mask
 					// therefore needs no per-lane identity or table load. Extract
 					// one category bit in every lane, then OR-reduce the D halves.
-					return EmitEnsureVuFloatNormalizeConstants(CHECK_VU_OVERFLOW(1)) &&
-						m_code.EmitVandQ(VU_NORM_EXPV_Q, 0, VU_NORM_EXP_Q) &&
-						m_code.EmitVshrU32Q(VU_NORM_SIGNV_Q, 0, 31) &&
-						m_code.EmitVshlI32Q(VU_NORM_TMP_Q, 0, 1) &&
-						m_code.EmitVceqI32Q(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_ZERO_Q) &&
-						m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_ZERO_Q) &&
-						m_code.EmitVceqI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q) &&
-						m_code.EmitVmvnQ(3, VU_NORM_TMP_Q) &&
-						m_code.EmitVandQ(3, 3, VU_NORM_MASK_Q) &&
-						m_code.EmitVshrU32Q(2, VU_NORM_TMP_Q, 31) &&
+					return m_code.EmitVshrU32Q(2, VU_NORM_MASK_Q, 31) &&
+						m_code.EmitVshrU32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 31) &&
 						m_code.EmitVshlI32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 1) &&
 						m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q) &&
 						m_code.EmitVshrU32Q(3, 3, 31) &&
@@ -5121,15 +5139,7 @@ namespace VitaVU
 				const u8 sign_shift = mac_result ? 4 : 1;
 				const u8 underflow_shift = mac_result ? 8 : 2;
 				const u8 overflow_shift = mac_result ? 12 : 3;
-				return EmitEnsureVuFloatNormalizeConstants(CHECK_VU_OVERFLOW(1)) &&
-					m_code.EmitVandQ(VU_NORM_EXPV_Q, 0, VU_NORM_EXP_Q) &&
-					m_code.EmitVcgtS32Q(VU_NORM_SIGNV_Q, VU_NORM_ZERO_Q, 0) &&
-					m_code.EmitVshlI32Q(VU_NORM_TMP_Q, 0, 1) &&
-					m_code.EmitVceqI32Q(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_ZERO_Q) &&
-					m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_ZERO_Q) &&
-					m_code.EmitVceqI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q) &&
-					m_code.EmitVmvnQ(3, VU_NORM_TMP_Q) &&
-					m_code.EmitVandQ(3, 3, VU_NORM_MASK_Q) &&
+				return m_code.EmitVcgtS32Q(VU_NORM_SIGNV_Q, VU_NORM_ZERO_Q, 0) &&
 					m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(weights))) &&
 					m_code.EmitVld1Q32Aligned(1, 3) &&
 					m_code.EmitVandQ(2, VU_NORM_MASK_Q, 1) &&
@@ -5151,7 +5161,7 @@ namespace VitaVU
 				mask &= 0x0f;
 				if (!mac_result_required && preserve_inactive)
 					return false;
-				if (!EmitClassifyMacOrStatusQ0(mask, mac_result_required))
+				if (!EmitClassifyAndNormalizeMacOrStatusQ0(mask, mac_result_required))
 					return false;
 
 				if (mac_result_required && preserve_inactive)
@@ -5163,12 +5173,6 @@ namespace VitaVU
 					{
 						return false;
 					}
-				}
-
-				if (mask != 0 &&
-					!EmitNormalizeVuFloatQuadInPlace(0, CHECK_VU_OVERFLOW(1)))
-				{
-					return false;
 				}
 
 				// PCSX2 owner: microVU_IR.h::microRegAlloc::writeBackReg(). A
