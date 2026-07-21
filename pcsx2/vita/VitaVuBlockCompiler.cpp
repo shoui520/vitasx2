@@ -8987,7 +8987,6 @@ namespace VitaVU
 				// pending ready cycle. Scan once and match either dependency. A
 				// ready entry can be ignored and `_vuTestPipes()` still owns
 				// flag/VF visibility after the stall cycle is applied.
-				constexpr unsigned HOST_RING_END = 0;
 				constexpr unsigned HOST_PTR = 1;
 				constexpr unsigned HOST_VALUE = 2;
 				constexpr unsigned HOST_TEMP = 3;
@@ -9009,11 +9008,14 @@ namespace VitaVU
 				static_assert(ring_bytes <= 255);
 				static_assert(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle) + 4 < 4096);
 
-				// Keep the current circular-queue address live. As in the canonical
-				// publisher, form VU + index*48 in two shifted ADDs and fold the
-				// fixed array offset into each LDR. FMAC is exactly four entries, so
-				// one conditionally executed subtraction wraps the retained pointer
-				// without another branch.
+				// Every producer appends the current nondecreasing VU cycle and the
+				// Sony VU manual fixes every FMAC latency at four cycles. Walk from
+				// newest to oldest: the first matching writer is therefore the
+				// maximum required stall, while the first elapsed entry proves every
+				// older entry elapsed. This preserves _vuFMACTestStall()'s exact
+				// result while terminating either case immediately. Form VU +
+				// index*48 in two shifted ADDs and fold the fixed array offset into
+				// each LDR.
 				// Resident r10 already contains the exact canonical count in bits
 				// [2:0]. Extract it into scratch LR with ANDS so the empty branch
 				// consumes Z directly; preserve r10's complete pipe aggregate.
@@ -9033,13 +9035,14 @@ namespace VitaVU
 							VuOffset(offsetof(VURegs, cycle))) ||
 						 !m_code.EmitLdrImm12(HOST_STALL_CYCLE_HI, HOST_VU,
 							 VuOffset(offsetof(VURegs, cycle) + 4)))) ||
-					!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_VU, VuOffset(offsetof(VURegs, fmacreadpos))) ||
+					!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_VU,
+						VuOffset(offsetof(VURegs, fmacwritepos))) ||
+					!m_code.EmitSubImm8(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 1) ||
+					!m_code.EmitAndImm32(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH, 3) ||
 					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_CALL_SCRATCH,
 						HOST_CALL_SCRATCH, ShiftType::LSL, 1) ||
 					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_VU, HOST_PTR,
-						ShiftType::LSL, 4) ||
-					!m_code.EmitAddImm8(HOST_RING_END, HOST_VU,
-						static_cast<u8>(ring_bytes)))
+						ShiftType::LSL, 4))
 				{
 					return false;
 				}
@@ -9068,16 +9071,16 @@ namespace VitaVU
 				{
 					return false;
 				}
-				const size_t skip_elapsed_high =
+				const size_t done_elapsed_high =
 					m_code.EmitBranchPlaceholder(Condition::NE);
-				if (skip_elapsed_high == static_cast<size_t>(-1) ||
+				if (done_elapsed_high == static_cast<size_t>(-1) ||
 					!m_code.EmitCmpImm32(HOST_VALUE, FMAC_PIPELINE_LATENCY_CYCLES))
 				{
 					return false;
 				}
-				const size_t skip_elapsed_low =
+				const size_t done_elapsed_low =
 					m_code.EmitBranchPlaceholder(Condition::CS);
-				if (skip_elapsed_low == static_cast<size_t>(-1))
+				if (done_elapsed_low == static_cast<size_t>(-1))
 					return false;
 
 				std::array<size_t, 4> matched_jumps{};
@@ -9162,7 +9165,6 @@ namespace VitaVU
 				}
 
 				size_t skip_no_lower_reg = static_cast<size_t>(-1);
-				size_t skip_no_match = static_cast<size_t>(-1);
 				if (shared_source_lanes)
 				{
 					if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
@@ -9180,8 +9182,9 @@ namespace VitaVU
 					{
 						return false;
 					}
-					skip_no_match = m_code.EmitBranchPlaceholder(Condition::EQ);
-					if (skip_no_match == static_cast<size_t>(-1))
+					matched_jumps[matched_count++] =
+						m_code.EmitBranchPlaceholder(Condition::NE);
+					if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1))
 						return false;
 				}
 				else
@@ -9221,14 +9224,35 @@ namespace VitaVU
 						{
 							return false;
 						}
-						skip_no_match = m_code.EmitBranchPlaceholder(Condition::EQ);
+						matched_jumps[matched_count++] =
+							m_code.EmitBranchPlaceholder(Condition::NE);
+						if (matched_jumps[matched_count - 1] == static_cast<size_t>(-1))
+							return false;
 					}
-					else
-					{
-						skip_no_match = m_code.EmitBranchPlaceholder();
-					}
-					if (skip_no_match == static_cast<size_t>(-1))
-						return false;
+				}
+
+				const size_t advance_entry = m_code.Size();
+				if ((vf_reg1 != 0 &&
+						!m_code.PatchBranch(skip_no_lower_reg, advance_entry, Condition::NE)) ||
+					!m_code.EmitSubImm8(HOST_COUNT, HOST_COUNT, 1, true))
+				{
+					return false;
+				}
+				const size_t final_jump = m_code.EmitBranchPlaceholder(Condition::EQ);
+				if (final_jump == static_cast<size_t>(-1) ||
+					!m_code.EmitCmpReg(HOST_PTR, HOST_VU) ||
+					!m_code.EmitSubImm8(HOST_PTR, HOST_PTR, sizeof(fmacPipe), false,
+						Condition::NE) ||
+					!m_code.EmitAddImm8(HOST_PTR, HOST_VU,
+						3 * sizeof(fmacPipe), false, Condition::EQ))
+				{
+					return false;
+				}
+				const size_t loop_jump = m_code.EmitBranchPlaceholder();
+				if (loop_jump == static_cast<size_t>(-1) ||
+					!m_code.PatchBranch(loop_jump, loop_start))
+				{
+					return false;
 				}
 
 				const size_t match_target = m_code.Size();
@@ -9260,35 +9284,10 @@ namespace VitaVU
 					return false;
 				}
 
-				const size_t advance_entry = m_code.Size();
-				if (!m_code.PatchBranch(skip_elapsed_high, advance_entry, Condition::NE) ||
-					!m_code.PatchBranch(skip_elapsed_low, advance_entry, Condition::CS) ||
-					(vf_reg1 != 0 &&
-						!m_code.PatchBranch(skip_no_lower_reg, advance_entry, Condition::NE)) ||
-					!m_code.PatchBranch(skip_no_match, advance_entry,
-						vf_reg1 != 0 ? Condition::EQ : Condition::AL) ||
-					!m_code.EmitSubImm8(HOST_COUNT, HOST_COUNT, 1, true))
-				{
-					return false;
-				}
-				const size_t final_jump = m_code.EmitBranchPlaceholder(Condition::EQ);
-				if (final_jump == static_cast<size_t>(-1) ||
-					!m_code.EmitAddImm8(HOST_PTR, HOST_PTR, sizeof(fmacPipe)) ||
-					!m_code.EmitCmpReg(HOST_PTR, HOST_RING_END) ||
-					!m_code.EmitSubImm8(HOST_PTR, HOST_PTR, static_cast<u8>(ring_bytes), false,
-						Condition::EQ))
-				{
-					return false;
-				}
-				const size_t loop_jump = m_code.EmitBranchPlaceholder();
-				if (loop_jump == static_cast<size_t>(-1) ||
-					!m_code.PatchBranch(loop_jump, loop_start))
-				{
-					return false;
-				}
-
 				const size_t done_target = m_code.Size();
 				return m_code.PatchBranch(empty_jump, done_target, Condition::EQ) &&
+					m_code.PatchBranch(done_elapsed_high, done_target, Condition::NE) &&
+					m_code.PatchBranch(done_elapsed_low, done_target, Condition::CS) &&
 					m_code.PatchBranch(final_jump, done_target, Condition::EQ);
 			}
 
