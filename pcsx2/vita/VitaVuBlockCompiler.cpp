@@ -293,6 +293,32 @@ namespace VitaVU
 				kind == VUInterpFast::UpperFastKind::OPMSUB;
 		}
 
+		constexpr bool IsUpperMaddMsubVfBroadcastKind(VUInterpFast::UpperFastKind kind)
+		{
+			switch (kind)
+			{
+				case VUInterpFast::UpperFastKind::MADDx:
+				case VUInterpFast::UpperFastKind::MADDAx:
+				case VUInterpFast::UpperFastKind::MSUBx:
+				case VUInterpFast::UpperFastKind::MSUBAx:
+				case VUInterpFast::UpperFastKind::MADDy:
+				case VUInterpFast::UpperFastKind::MADDAy:
+				case VUInterpFast::UpperFastKind::MSUBy:
+				case VUInterpFast::UpperFastKind::MSUBAy:
+				case VUInterpFast::UpperFastKind::MADDz:
+				case VUInterpFast::UpperFastKind::MADDAz:
+				case VUInterpFast::UpperFastKind::MSUBz:
+				case VUInterpFast::UpperFastKind::MSUBAz:
+				case VUInterpFast::UpperFastKind::MADDw:
+				case VUInterpFast::UpperFastKind::MADDAw:
+				case VUInterpFast::UpperFastKind::MSUBw:
+				case VUInterpFast::UpperFastKind::MSUBAw:
+					return true;
+				default:
+					return false;
+			}
+		}
+
 		constexpr bool IsInlineUpperAddSubKind(VUInterpFast::UpperFastKind kind)
 		{
 			switch (kind)
@@ -604,6 +630,12 @@ namespace VitaVU
 			bool lower_efu_stall_test_inline = false;
 			bool lower_branch_stall_test_inline = false;
 			bool lower_stall_inline = false;
+			// PCSX2 owner: microVU_Analyze.inl::flagSet() and
+			// microVU_Upper.inl::mVUupdateFlags(). STATUS remains live for every
+			// FMAC producer because its result contributes to delayed sticky state.
+			// MAC classification is independently live only when a later MAC reader,
+			// preserve-inactive producer, or block-seam pipeline state can observe it.
+			bool mac_flag_result_required = true;
 			// PCSX2 microVU owner: microVU_IR.h::microRegInfo::backupVI.
 			// True only when this exact lower opcode calls VUops.cpp::_vuBackupVI().
 			bool vi_backup_write = false;
@@ -693,6 +725,7 @@ namespace VitaVU
 			u32 local_fmac_cycle_snapshot_elision_pairs = 0;
 			u32 local_fmac_producer_snapshot_pairs = 0;
 			u32 local_fmac_clip_snapshot_elisions = 0;
+			u32 local_fmac_mac_classification_elisions = 0;
 			// PCSX2 microVU owner: microVU_Analyze.inl's mVUregs pipeline
 			// state. Long local-FMAC blocks retain the coarse canonical-pipe
 			// activity predicate in their private frame instead of rebuilding it
@@ -785,6 +818,111 @@ namespace VitaVU
 				(pair.upper_addsub_inline || pair.upper_mul_inline ||
 				 pair.upper_maddmsub_inline || pair.upper_outer_inline);
 			return produces_mac_status && !pair.lower_fdiv_inline && !pair.lower_flag_inline;
+		}
+
+		bool ProducesInlineMacStatus(const PairPlan& pair)
+		{
+			return pair.upper_addsub_inline || pair.upper_mul_inline ||
+				pair.upper_maddmsub_inline || pair.upper_outer_inline;
+		}
+
+		bool ReadsArchitecturalMacFlag(const PairPlan& pair)
+		{
+			const u32 reads = pair.uregs.VIread | pair.lregs.VIread;
+			if ((reads & (1u << REG_MAC_FLAG)) != 0)
+				return true;
+			if (!pair.exec_lower)
+				return false;
+
+			switch (static_cast<VUInterpFast::LowerFastKind>(pair.lower_kind))
+			{
+				case VUInterpFast::LowerFastKind::FMEQ:
+				case VUInterpFast::LowerFastKind::FMAND:
+				case VUInterpFast::LowerFastKind::FMOR:
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool IsMaddMsubAliasFlagPath(const PairPlan& pair)
+		{
+			if (!pair.upper_maddmsub_inline)
+				return false;
+			const auto kind = static_cast<VUInterpFast::UpperFastKind>(pair.upper_kind);
+			return IsUpperMaddMsubVfBroadcastKind(kind) &&
+				VUInterpFast::Fd(pair.upper) == VUInterpFast::Ft(pair.upper);
+		}
+
+		void AnalyzeLocalMacFlagLiveness(BlockPlan* block)
+		{
+			if (!block->local_fmac_pipeline)
+				return;
+
+			std::array<bool, MAX_BLOCK_PAIRS> required{};
+			const auto mark_visible_window = [&](u32 observer_pair, bool block_seam) {
+				// Sony VU User Manual 3.4.4: a producer becomes visible four
+				// cycles after issue. Every pair advances at least one cycle, so the
+				// newest producer at least four pair positions old is guaranteed
+				// visible. Runtime dependency stalls can additionally expose any
+				// younger producer; retain that complete bounded suffix.
+				s32 newest_guaranteed = -1;
+				for (u32 i = 0; i < observer_pair; i++)
+				{
+					if (!ProducesInlineMacStatus(block->pairs[i]))
+						continue;
+					const bool guaranteed = block_seam ?
+						(i + FMAC_PIPELINE_LATENCY_CYCLES < observer_pair) :
+						(i + FMAC_PIPELINE_LATENCY_CYCLES <= observer_pair);
+					if (guaranteed)
+						newest_guaranteed = static_cast<s32>(i);
+				}
+
+				const u32 first = newest_guaranteed >= 0 ?
+					static_cast<u32>(newest_guaranteed) : observer_pair;
+				for (u32 i = first; i < observer_pair; i++)
+				{
+					if (ProducesInlineMacStatus(block->pairs[i]))
+						required[i] = true;
+				}
+			};
+
+			for (u32 observer = 0; observer < block->pair_count; observer++)
+			{
+				if (ReadsArchitecturalMacFlag(block->pairs[observer]))
+					mark_visible_window(observer, false);
+
+				// OPMULA/OPMSUB preserve the inactive W MAC lane and STATUS is
+				// derived from the resulting complete MAC value. Therefore the
+				// immediately preceding working instance is live even when no FMxx
+				// instruction reads MAC architecturally.
+				if (block->pairs[observer].upper_outer_inline)
+				{
+					for (u32 i = observer; i > 0; i--)
+					{
+						if (ProducesInlineMacStatus(block->pairs[i - 1]))
+						{
+							required[i - 1] = true;
+							break;
+						}
+					}
+				}
+			}
+
+			// Preserve the exact architectural MAC and every possibly-live
+			// four-cycle queue instance reconstructed at the generated-code seam.
+			mark_visible_window(block->pair_count, true);
+
+			for (u32 i = LOCAL_FMAC_WARMUP_PAIRS; i < block->pair_count; i++)
+			{
+				PairPlan& pair = block->pairs[i];
+				if (!required[i] && CanSnapshotLocalFmacFlagsAtProducer(pair) &&
+					!pair.upper_outer_inline && !IsMaddMsubAliasFlagPath(pair))
+				{
+					pair.mac_flag_result_required = false;
+					block->local_fmac_mac_classification_elisions++;
+				}
+			}
 		}
 
 		bool IsImmediateBranchKind(VUInterpFast::LowerFastKind kind)
@@ -1111,6 +1249,7 @@ namespace VitaVU
 			block->vi_backup_update_elided_pairs = 0;
 			block->vi_backup_zero_store_pairs = 0;
 			block->dt_flag_inline_pairs = 0;
+			block->local_fmac_mac_classification_elisions = 0;
 			block->resident_cycle = false;
 			block->resident_pipe_activity = false;
 			block->direct_link_tail = false;
@@ -1448,6 +1587,7 @@ namespace VitaVU
 							}
 						}
 					}
+					AnalyzeLocalMacFlagLiveness(block);
 				}
 			}
 			return block->pair_count != 0;
@@ -1506,6 +1646,16 @@ namespace VitaVU
 			{0, 4, 0, 0}, {0, 4, 0, 1}, {0, 4, 2, 0}, {0, 4, 2, 1},
 			{8, 0, 0, 0}, {8, 0, 0, 1}, {8, 0, 2, 0}, {8, 0, 2, 1},
 			{8, 4, 0, 0}, {8, 4, 0, 1}, {8, 4, 2, 0}, {8, 4, 2, 1},
+		};
+
+		// Same active-lane selection as VU_MAC_LANE_WEIGHTS, but each lane
+		// contributes to one STATUS category bit instead of its XYZW MAC bit.
+		// This is PCSX2 microVU_Upper.inl::mVUupdateFlags()'s sFLAG-only form.
+		alignas(16) static constexpr u32 VU_STATUS_LANE_WEIGHTS[16][4] = {
+			{0, 0, 0, 0}, {0, 0, 0, 1}, {0, 0, 1, 0}, {0, 0, 1, 1},
+			{0, 1, 0, 0}, {0, 1, 0, 1}, {0, 1, 1, 0}, {0, 1, 1, 1},
+			{1, 0, 0, 0}, {1, 0, 0, 1}, {1, 0, 1, 0}, {1, 0, 1, 1},
+			{1, 1, 0, 0}, {1, 1, 0, 1}, {1, 1, 1, 0}, {1, 1, 1, 1},
 		};
 
 		constexpr u16 SAVED_REGISTER_MASK = 0x4ff0; // r4-r11, lr; each VU path realigns its private frame
@@ -4907,53 +5057,61 @@ namespace VitaVU
 				return EmitStoreVfWordFromS(value_sreg, fd, lane);
 			}
 
-			bool EmitFinishMacQ0(bool acc, unsigned fd, unsigned mask, bool preserve_inactive)
+			bool EmitClassifyMacOrStatusQ0(unsigned mask, bool mac_result)
 			{
 				mask &= 0x0f;
-				if (mask != 0)
-				{
-					// PCSX2 owners: VUflags.cpp::VU_MAC_UPDATE()/VU_STAT_UPDATE()
-					// and x86/microVU_Upper.inl::mVUupdateFlags(). Classify all
-					// four result lanes together, weight the active XYZW lanes, and
-					// horizontally OR them into the exact 16-bit MAC layout. This
-					// replaces four scalar branch trees and four S->ARM transfers.
-					if (!EmitEnsureVuFloatNormalizeConstants(CHECK_VU_OVERFLOW(1)) ||
-						!m_code.EmitVandQ(VU_NORM_EXPV_Q, 0, VU_NORM_EXP_Q) ||
-						!m_code.EmitVcgtS32Q(VU_NORM_SIGNV_Q, VU_NORM_ZERO_Q, 0) ||
-						!m_code.EmitVshlI32Q(VU_NORM_TMP_Q, 0, 1) ||
-						!m_code.EmitVceqI32Q(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_ZERO_Q) ||
-						!m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_ZERO_Q) ||
-						!m_code.EmitVceqI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q) ||
-						!m_code.EmitVmvnQ(3, VU_NORM_TMP_Q) ||
-						!m_code.EmitVandQ(3, 3, VU_NORM_MASK_Q) ||
-						!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(
-							VU_MAC_LANE_WEIGHTS[mask]))) ||
-						!m_code.EmitVld1Q32Aligned(1, 3) ||
-						!m_code.EmitVandQ(2, VU_NORM_MASK_Q, 1) ||
-						!m_code.EmitVandQ(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 1) ||
-						!m_code.EmitVshlI32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 4) ||
-						!m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q) ||
-						!m_code.EmitVandQ(3, 3, 1) ||
-						!m_code.EmitVshlI32Q(3, 3, 8) ||
-						!m_code.EmitVorrQ(2, 2, 3) ||
-						!m_code.EmitVandQ(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 1) ||
-						!m_code.EmitVshlI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 12) ||
-						!m_code.EmitVorrQ(2, 2, VU_NORM_EXPV_Q) ||
-						!m_code.EmitVextI8Q(3, 2, 2, 8) ||
-						!m_code.EmitVorrQ(2, 2, 3) ||
-						!m_code.EmitVextI8Q(3, 2, 2, 4) ||
-						!m_code.EmitVorrQ(2, 2, 3) ||
-						!m_code.EmitVmovSToCore(2, 8))
-					{
-						return false;
-					}
-				}
-				else if (!m_code.EmitMovImm8(2, 0))
-				{
-					return false;
-				}
+				if (mask == 0)
+					return m_code.EmitMovImm8(2, 0);
 
-				if (preserve_inactive)
+				// PCSX2 owner: x86/microVU_Upper.inl::mVUupdateFlags(). When
+				// mFLAG.doFlag is false, the same per-lane sign/zero/underflow/
+				// overflow classification is reduced directly into STATUS's four
+				// category bits; it does not construct the 16-bit XYZW MAC layout.
+				// Vita keeps one NEON body and selects the lane weights and category
+				// shifts at compile time. Both forms return their packed word in r2.
+				const u32* weights = mac_result ? VU_MAC_LANE_WEIGHTS[mask] :
+					VU_STATUS_LANE_WEIGHTS[mask];
+				const u8 sign_shift = mac_result ? 4 : 1;
+				const u8 underflow_shift = mac_result ? 8 : 2;
+				const u8 overflow_shift = mac_result ? 12 : 3;
+				return EmitEnsureVuFloatNormalizeConstants(CHECK_VU_OVERFLOW(1)) &&
+					m_code.EmitVandQ(VU_NORM_EXPV_Q, 0, VU_NORM_EXP_Q) &&
+					m_code.EmitVcgtS32Q(VU_NORM_SIGNV_Q, VU_NORM_ZERO_Q, 0) &&
+					m_code.EmitVshlI32Q(VU_NORM_TMP_Q, 0, 1) &&
+					m_code.EmitVceqI32Q(VU_NORM_TMP_Q, VU_NORM_TMP_Q, VU_NORM_ZERO_Q) &&
+					m_code.EmitVceqI32Q(VU_NORM_MASK_Q, VU_NORM_EXPV_Q, VU_NORM_ZERO_Q) &&
+					m_code.EmitVceqI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, VU_NORM_EXP_Q) &&
+					m_code.EmitVmvnQ(3, VU_NORM_TMP_Q) &&
+					m_code.EmitVandQ(3, 3, VU_NORM_MASK_Q) &&
+					m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(weights))) &&
+					m_code.EmitVld1Q32Aligned(1, 3) &&
+					m_code.EmitVandQ(2, VU_NORM_MASK_Q, 1) &&
+					m_code.EmitVandQ(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, 1) &&
+					m_code.EmitVshlI32Q(VU_NORM_SIGNV_Q, VU_NORM_SIGNV_Q, sign_shift) &&
+					m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q) &&
+					m_code.EmitVandQ(3, 3, 1) &&
+					m_code.EmitVshlI32Q(3, 3, underflow_shift) &&
+					m_code.EmitVorrQ(2, 2, 3) &&
+					m_code.EmitVandQ(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 1) &&
+					m_code.EmitVshlI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, overflow_shift) &&
+					m_code.EmitVorrQ(2, 2, VU_NORM_EXPV_Q) &&
+					m_code.EmitVextI8Q(3, 2, 2, 8) &&
+					m_code.EmitVorrQ(2, 2, 3) &&
+					m_code.EmitVextI8Q(3, 2, 2, 4) &&
+					m_code.EmitVorrQ(2, 2, 3) &&
+					m_code.EmitVmovSToCore(2, 8);
+			}
+
+			bool EmitFinishMacQ0(bool acc, unsigned fd, unsigned mask, bool preserve_inactive,
+				bool mac_result_required)
+			{
+				mask &= 0x0f;
+				if (!mac_result_required && preserve_inactive)
+					return false;
+				if (!EmitClassifyMacOrStatusQ0(mask, mac_result_required))
+					return false;
+
+				if (mac_result_required && preserve_inactive)
 				{
 					const u32 active_mac_bits = mask * 0x1111u;
 					if (!EmitLoadWorkingFmacMac(0) ||
@@ -5000,12 +5158,30 @@ namespace VitaVU
 				const unsigned status_reg = m_capture_pending_local_fmac_flags ? 3u : 0u;
 				const bool defer_working_store = m_plan.resident_working_fmac_flags &&
 					m_capture_pending_local_fmac_flags;
-				if ((!defer_working_store &&
-						!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag)))) ||
-					!EmitUpdateStatusFromMacReg(2, status_reg, 1, !defer_working_store) ||
-					!EmitCapturePendingLocalFmacFlags(2, status_reg))
+				if (mac_result_required)
 				{
-					return false;
+					if ((!defer_working_store &&
+							!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag)))) ||
+						!EmitUpdateStatusFromMacReg(2, status_reg, 1, !defer_working_store) ||
+						!EmitCapturePendingLocalFmacFlags(2, status_reg))
+					{
+						return false;
+					}
+				}
+				else
+				{
+					// r2 already is the exact non-sticky STATUS category nibble.
+					// Preserve the previous working MAC in this otherwise unobservable
+					// local pipeline instance so STATUS/sticky publication remains exact.
+					if (!EmitMovReg(status_reg, 2) ||
+						(!defer_working_store && !m_code.EmitStrImm12(status_reg, HOST_VU,
+							VuOffset(offsetof(VURegs, statusflag)))) ||
+						(m_capture_pending_local_fmac_flags &&
+							(!EmitLoadWorkingFmacMac(2) ||
+							 !EmitCapturePendingLocalFmacFlags(2, status_reg))))
+					{
+						return false;
+					}
 				}
 
 				// PCSX2 microVU's register allocator retains the clamped FMAC
@@ -5055,7 +5231,8 @@ namespace VitaVU
 				return m_code.PatchBranch(keep_fs, m_code.Size(), Condition::GT);
 			}
 
-			bool EmitInlineUpperAddSub(u32 code, VUInterpFast::UpperFastKind kind)
+			bool EmitInlineUpperAddSub(u32 code, VUInterpFast::UpperFastKind kind,
+				bool mac_result_required)
 			{
 				const unsigned fd = VUInterpFast::Fd(code);
 				const unsigned fs = VUInterpFast::Fs(code);
@@ -5121,7 +5298,7 @@ namespace VitaVU
 						return false;
 				}
 
-				if (!EmitFinishMacQ0(acc, fd, mask, false))
+				if (!EmitFinishMacQ0(acc, fd, mask, false, mac_result_required))
 					return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -5131,7 +5308,8 @@ namespace VitaVU
 #endif
 			}
 
-			bool EmitInlineUpperMul(u32 code, VUInterpFast::UpperFastKind kind)
+			bool EmitInlineUpperMul(u32 code, VUInterpFast::UpperFastKind kind,
+				bool mac_result_required)
 			{
 				const unsigned fd = VUInterpFast::Fd(code);
 				const unsigned fs = VUInterpFast::Fs(code);
@@ -5171,7 +5349,7 @@ namespace VitaVU
 					}
 				}
 
-				if (!EmitFinishMacQ0(acc, fd, mask, false))
+				if (!EmitFinishMacQ0(acc, fd, mask, false, mac_result_required))
 					return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -5181,7 +5359,8 @@ namespace VitaVU
 #endif
 			}
 
-			bool EmitInlineUpperMaddMsub(u32 code, VUInterpFast::UpperFastKind kind)
+			bool EmitInlineUpperMaddMsub(u32 code, VUInterpFast::UpperFastKind kind,
+				bool mac_result_required)
 			{
 				const unsigned fd = VUInterpFast::Fd(code);
 				const unsigned fs = VUInterpFast::Fs(code);
@@ -5286,7 +5465,7 @@ namespace VitaVU
 							!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag)))) ||
 						!EmitUpdateStatusFromMacReg(2, status_reg, 1, !defer_working_store) ||
 						!EmitCapturePendingLocalFmacFlags(2, status_reg)) :
-					!EmitFinishMacQ0(acc, fd, mask, false))
+					!EmitFinishMacQ0(acc, fd, mask, false, mac_result_required))
 				{
 					return false;
 				}
@@ -5384,7 +5563,7 @@ namespace VitaVU
 					}
 				}
 
-				if (!EmitFinishMacQ0(!opmsub, fd, 0x0e, true))
+				if (!EmitFinishMacQ0(!opmsub, fd, 0x0e, true, true))
 					return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -9490,17 +9669,23 @@ namespace VitaVU
 					return false;
 				}
 				else if (plan.exec_upper && plan.upper_addsub_inline &&
-					!EmitInlineUpperAddSub(plan.upper, static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind)))
+					!EmitInlineUpperAddSub(plan.upper,
+						static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind),
+						plan.mac_flag_result_required))
 				{
 					return false;
 				}
 				else if (plan.exec_upper && plan.upper_mul_inline &&
-					!EmitInlineUpperMul(plan.upper, static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind)))
+					!EmitInlineUpperMul(plan.upper,
+						static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind),
+						plan.mac_flag_result_required))
 				{
 					return false;
 				}
 				else if (plan.exec_upper && plan.upper_maddmsub_inline &&
-					!EmitInlineUpperMaddMsub(plan.upper, static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind)))
+					!EmitInlineUpperMaddMsub(plan.upper,
+						static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind),
+						plan.mac_flag_result_required))
 				{
 					return false;
 				}
@@ -10500,6 +10685,15 @@ namespace VitaVU
 								plan.local_fmac_producer_snapshot_pairs;
 							s_vu1.stats.local_fmac_clip_snapshot_elisions +=
 								plan.local_fmac_clip_snapshot_elisions;
+							s_vu1.stats.local_fmac_mac_classification_elisions +=
+								plan.local_fmac_mac_classification_elisions;
+							// Every liveness-selected producer captures its local flag
+							// instance. Reusing a resident working MAC costs one extra
+							// load, so STATUS-only classification removes seven A32
+							// instructions there and eight on the canonical local path.
+							s_vu1.stats.local_fmac_mac_classification_minimum_instructions_removed +=
+								static_cast<u64>(plan.local_fmac_mac_classification_elisions) *
+								(plan.resident_working_fmac_flags ? 7u : 8u);
 						}
 						if (plan.resident_working_fmac_flags)
 						{
@@ -11478,6 +11672,10 @@ namespace VitaVU
 			s_vu1.stats.resident_working_fmac_flag_producers;
 		stats.resident_working_fmac_state_stores_removed =
 			s_vu1.stats.resident_working_fmac_state_stores_removed;
+		stats.local_fmac_mac_classification_elisions =
+			s_vu1.stats.local_fmac_mac_classification_elisions;
+		stats.local_fmac_mac_classification_minimum_instructions_removed =
+			s_vu1.stats.local_fmac_mac_classification_minimum_instructions_removed;
 		stats.program_prepare_checks = s_vu1.stats.program_prepare_checks;
 		stats.program_prepare_calls = s_vu1.stats.program_prepare_calls;
 		stats.program_quick_cache_hits = s_vu1.stats.program_quick_cache_hits;
