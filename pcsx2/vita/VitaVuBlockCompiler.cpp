@@ -860,6 +860,48 @@ namespace VitaVU
 					reader.VFr1xyzw);
 		}
 
+		bool MergeFmacStallReadSets(const _VURegsNum& first,
+			const _VURegsNum& second, _VURegsNum* merged)
+		{
+			// PCSX2 owner: VUops.cpp::_vuTestFMACStalls() applies each VF source
+			// independently, but every matching queue entry contributes only
+			// cycle = max(cycle, sCycle + 4). Union equal-register lane masks and
+			// admit only unions representable by the existing two-source scan.
+			*merged = {};
+			const auto add_read = [&](u8 reg, u8 lanes) {
+				if (reg == 0 || lanes == 0)
+					return true;
+				if (merged->VFread0 == reg)
+				{
+					merged->VFr0xyzw |= lanes;
+					return true;
+				}
+				if (merged->VFread1 == reg)
+				{
+					merged->VFr1xyzw |= lanes;
+					return true;
+				}
+				if (merged->VFread0 == 0)
+				{
+					merged->VFread0 = reg;
+					merged->VFr0xyzw = lanes;
+					return true;
+				}
+				if (merged->VFread1 == 0)
+				{
+					merged->VFread1 = reg;
+					merged->VFr1xyzw = lanes;
+					return true;
+				}
+				return false;
+			};
+
+			return add_read(first.VFread0, first.VFr0xyzw) &&
+				add_read(first.VFread1, first.VFr1xyzw) &&
+				add_read(second.VFread0, second.VFr0xyzw) &&
+				add_read(second.VFread1, second.VFr1xyzw);
+		}
+
 		bool CanElideAnalyzedCanonicalFmacStallTest(const BlockPlan& block,
 			u32 pair_index, const _VURegsNum& regs)
 		{
@@ -10762,6 +10804,20 @@ namespace VitaVU
 					plan.lregs.pipe == VUPIPE_EFU;
 				const bool elide_lower_canonical_fmac = lower_has_canonical_fmac_test &&
 					CanElideCanonicalFmacStallTest(pair_index, plan.lregs);
+				_VURegsNum merged_pipe_wait_fmac_reads{};
+				// _vuTestFDIVStalls()/_vuTestEFUStalls() begin with the same canonical
+				// FMAC dependency test as the adjacent upper arm. No pipe publication
+				// occurs between them. Their source union can therefore share the lower
+				// walk; the private tests in between are also monotone max operations,
+				// so moving the upper contribution after them preserves the exact cycle.
+				const bool merge_upper_fmac_into_lower_pipe_wait =
+					plan.test_upper_stalls && !elide_upper_canonical_fmac &&
+					plan.upper_fmac_stall_test_inline &&
+					plan.test_lower_stalls && !elide_lower_canonical_fmac &&
+					(plan.lower_fdiv_stall_test_inline ||
+						plan.lower_efu_stall_test_inline) &&
+					MergeFmacStallReadSets(plan.uregs, plan.lregs,
+						&merged_pipe_wait_fmac_reads);
 #if defined(VITASX2_QEMU_VALIDATION)
 				if (((plan.test_upper_stalls && elide_upper_canonical_fmac) ||
 						(plan.test_lower_stalls && elide_lower_canonical_fmac)) &&
@@ -10776,14 +10832,16 @@ namespace VitaVU
 					return false;
 				}
 #endif
-				if (plan.test_upper_stalls && !elide_upper_canonical_fmac &&
+				if (!merge_upper_fmac_into_lower_pipe_wait &&
+					plan.test_upper_stalls && !elide_upper_canonical_fmac &&
 					plan.upper_fmac_stall_test_inline)
 				{
 					if (!EmitInlineFmacStallTestPreservingCycleResidency(
 						m_pairs[pair_index].uregs, true))
 						return false;
 				}
-				else if (plan.test_upper_stalls && !elide_upper_canonical_fmac &&
+				else if (!merge_upper_fmac_into_lower_pipe_wait &&
+					plan.test_upper_stalls && !elide_upper_canonical_fmac &&
 					!EmitCallHelperRegs(reinterpret_cast<const void*>(&_vuTestUpperStalls), &m_pairs[pair_index].uregs))
 				{
 					return false;
@@ -10802,7 +10860,9 @@ namespace VitaVU
 				else if (plan.test_lower_stalls && plan.lower_fdiv_stall_test_inline)
 				{
 					if (!EmitPublishResidentCycle() ||
-						!EmitInlineLowerFdivStallTest(m_pairs[pair_index].lregs,
+						!EmitInlineLowerFdivStallTest(
+							merge_upper_fmac_into_lower_pipe_wait ?
+								merged_pipe_wait_fmac_reads : m_pairs[pair_index].lregs,
 							elide_lower_canonical_fmac) ||
 						!EmitResyncResidentCycle())
 						return false;
@@ -10810,7 +10870,9 @@ namespace VitaVU
 				else if (plan.test_lower_stalls && plan.lower_efu_stall_test_inline)
 				{
 					if (!EmitPublishResidentCycle() ||
-						!EmitInlineLowerEfuStallTest(m_pairs[pair_index].lregs,
+						!EmitInlineLowerEfuStallTest(
+							merge_upper_fmac_into_lower_pipe_wait ?
+								merged_pipe_wait_fmac_reads : m_pairs[pair_index].lregs,
 							elide_lower_canonical_fmac) ||
 						!EmitResyncResidentCycle())
 						return false;
