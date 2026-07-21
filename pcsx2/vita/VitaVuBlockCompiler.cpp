@@ -3265,6 +3265,11 @@ namespace VitaVU
 						return false;
 				}
 
+				// Only the initial queue check can observe the full four entries.
+				// Every loop back follows SUBS count,#1 and the zero exit, so its
+				// surviving count is exactly 1..3 and must use the timestamp test.
+				// Re-enter there directly instead of executing a dead CMP #4/BEQ.
+				const size_t timestamp_check_start = m_code.Size();
 				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
 						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle))) ||
 					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
@@ -3410,7 +3415,7 @@ namespace VitaVU
 				const size_t loop_jump = m_code.EmitBranchPlaceholder();
 				if (loop_jump == static_cast<size_t>(-1) ||
 					!m_code.PatchBranch(loop_jump,
-						shared_thunk ? resident_loop_start : loop_start))
+						shared_thunk ? timestamp_check_start : loop_start))
 				{
 					return false;
 				}
