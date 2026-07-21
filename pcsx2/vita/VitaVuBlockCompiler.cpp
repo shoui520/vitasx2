@@ -5667,31 +5667,18 @@ namespace VitaVU
 						return true;
 					}
 
-					// Sony VU User Manual 3.3.2: each STATUS category is the OR
-					// of the corresponding XYZW MAC bits. A full destination mask
-					// therefore needs no per-lane identity or table load. Extract
-					// one category bit in every lane, then OR-reduce the D halves.
-					// Q13 contains only the isolated IEEE sign bit. An unsigned
-					// shift by 30 maps 0x80000000 directly to STATUS's S bit (2),
-					// replacing the old shift-to-one followed by shift-left-one.
-					const unsigned sign_source_q = normalize_requires_sign ?
-						VU_NORM_SIGNV_Q : result_q;
-					if (!m_code.EmitVshrU32Q(2, VU_NORM_MASK_Q, 31) ||
-						!m_code.EmitVshrU32Q(VU_NORM_SIGNV_Q, sign_source_q, 30) ||
-						!m_code.EmitVorrQ(2, 2, VU_NORM_SIGNV_Q))
-					{
-						return false;
-					}
-					if (!result_flush_to_zero &&
-						(!m_code.EmitVshrU32Q(3, 3, 31) ||
-						 !m_code.EmitVshlI32Q(3, 3, 2) ||
-						 !m_code.EmitVorrQ(2, 2, 3)))
-					{
-						return false;
-					}
-					if (!m_code.EmitVshrU32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 31) ||
-						!m_code.EmitVshlI32Q(VU_NORM_EXPV_Q, VU_NORM_EXPV_Q, 3) ||
-						!m_code.EmitVorrQ(2, 2, VU_NORM_EXPV_Q))
+					// Sony VU User Manual 3.3.2 fixes the low STATUS nibble as
+					// Z/S/U/O. Build those four all-lane category bits directly,
+					// then OR-reduce the D halves. VSRI first inserts U into bits
+					// [2:0], then the normalized result sign into [1:0], and finally
+					// Z into bit 0; each later insert deliberately overwrites the
+					// irrelevant lower source bits. O starts in bit 3 and is
+					// preserved throughout. Under FZ, U is provably zero and its
+					// insert disappears.
+					if (!m_code.EmitVshlI32Q(2, VU_NORM_EXPV_Q, 3) ||
+						(!result_flush_to_zero && !m_code.EmitVsriI32Q(2, 3, 29)) ||
+						!m_code.EmitVsriI32Q(2, result_q, 30) ||
+						!m_code.EmitVsriI32Q(2, VU_NORM_MASK_Q, 31))
 					{
 						return false;
 					}
