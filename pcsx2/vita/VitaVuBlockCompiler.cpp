@@ -3594,6 +3594,17 @@ namespace VitaVU
 						!m_code.PatchBranch(ready_full, ready_target, Condition::EQ)) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
 						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, flagreg))) ||
+					// PCSX2 owner: VUops.cpp::_vuFMACflush(). Ordinary FMAC entries
+					// carry neither a CLIP nor an explicit STATUS writer. Skip both
+					// dead TST/BEQ pairs and join their existing non-sticky formula.
+					!m_code.EmitTstImm32(HOST_TEMP,
+						(1u << REG_CLIP_FLAG) | (1u << REG_STATUS_FLAG)))
+				{
+					return false;
+				}
+				const size_t no_special_flags =
+					m_code.EmitBranchPlaceholder(Condition::EQ);
+				if (no_special_flags == static_cast<size_t>(-1) ||
 					!m_code.EmitTstImm32(HOST_TEMP, 1u << REG_CLIP_FLAG))
 				{
 					return false;
@@ -3636,7 +3647,8 @@ namespace VitaVU
 					return false;
 
 				const size_t no_sticky_target = m_code.Size();
-				if (!m_code.PatchBranch(no_sticky_status, no_sticky_target, Condition::EQ) ||
+				if (!m_code.PatchBranch(no_special_flags, no_sticky_target, Condition::EQ) ||
+					!m_code.PatchBranch(no_sticky_status, no_sticky_target, Condition::EQ) ||
 					(!deferred_fmac_flags &&
 						!m_code.EmitLdrImm12(status_reg, HOST_VU, ViOffset(REG_STATUS_FLAG))) ||
 					!EmitAndRegImm32(status_reg, status_reg, 0x0ff0u, HOST_MASK_SCRATCH) ||
