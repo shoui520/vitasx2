@@ -6958,6 +6958,15 @@ namespace VitaVU
 				constexpr unsigned BACKED_UP_VI = 2;
 				unsigned dest = 0;
 				bool emitted_body = true;
+				// A compile-time direct installation ends with r3 addressing the
+				// destination VI slot. Every IALU operand load below is an immediate
+				// LDR from HOST_VU and the ALU uses only r0-r2, so retain that address
+				// through the final halfword publication instead of forming it twice.
+				const auto emit_result_store = [&](unsigned source) {
+					return vi_backup_direct_full_install ?
+						m_code.EmitStrhImm8(source, 3, 0) :
+						EmitStoreViHalfword(source, dest);
+				};
 
 				// PCSX2 owner: VUmicroFast.h::ExecuteLowerNoUpperKnownKind()
 				// for the fixed-latency VI integer ops. These are pure
@@ -6981,7 +6990,7 @@ namespace VitaVU
 								(reuse_backup || EmitLoadViLowResultOperand(result,
 									VUInterpFast::Is(code))) &&
 								EmitAddSignedImm(result, VUInterpFast::Imm15(code), 1) &&
-								EmitStoreViHalfword(result, dest);
+								emit_result_store(result);
 						}
 						break;
 
@@ -7001,7 +7010,7 @@ namespace VitaVU
 								(reuse_backup || EmitLoadViLowResultOperand(result,
 									VUInterpFast::Is(code))) &&
 								EmitAddSignedImm(result, -VUInterpFast::Imm15(code), 1) &&
-								EmitStoreViHalfword(result, dest);
+								emit_result_store(result);
 						}
 						break;
 
@@ -7022,7 +7031,7 @@ namespace VitaVU
 							{
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(0, source) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 						}
 						else
@@ -7033,14 +7042,14 @@ namespace VitaVU
 									(it == dest || EmitLoadViLowResultOperand(1, it)) &&
 									m_code.EmitAddReg(BACKED_UP_VI, BACKED_UP_VI,
 										it == dest ? BACKED_UP_VI : 1) &&
-									EmitStoreViHalfword(BACKED_UP_VI, dest);
+									emit_result_store(BACKED_UP_VI);
 							}
 							else if (vi_backup_direct_full_install && dest == it)
 							{
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(0, is) &&
 									m_code.EmitAddReg(0, 0, BACKED_UP_VI) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 							else
 							{
@@ -7048,7 +7057,7 @@ namespace VitaVU
 									EmitLoadViLowResultOperand(0, is) &&
 									EmitLoadViLowResultOperand(1, it) &&
 									m_code.EmitAddReg(0, 0, 1) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 						}
 						break;
@@ -7068,7 +7077,7 @@ namespace VitaVU
 						{
 							emitted_body = emitted_body &&
 								m_code.EmitMovImm8(0, 0) &&
-								EmitStoreViHalfword(0, dest);
+								emit_result_store(0);
 						}
 						else if (it == 0)
 						{
@@ -7076,7 +7085,7 @@ namespace VitaVU
 							{
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(0, is) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 						}
 						else
@@ -7086,14 +7095,14 @@ namespace VitaVU
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(1, it) &&
 									m_code.EmitSubReg(BACKED_UP_VI, BACKED_UP_VI, 1) &&
-									EmitStoreViHalfword(BACKED_UP_VI, dest);
+									emit_result_store(BACKED_UP_VI);
 							}
 							else if (vi_backup_direct_full_install && dest == it)
 							{
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(0, is) &&
 									m_code.EmitSubReg(0, 0, BACKED_UP_VI) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 							else
 							{
@@ -7101,7 +7110,7 @@ namespace VitaVU
 									EmitLoadViLowResultOperand(0, is) &&
 									EmitLoadViLowResultOperand(1, it) &&
 									m_code.EmitSubReg(0, 0, 1) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 						}
 						break;
@@ -7123,7 +7132,7 @@ namespace VitaVU
 								(reuse_backup || EmitLoadViLowResultOperand(result,
 									VUInterpFast::Is(code))) &&
 								EmitAddSignedImm(result, VUInterpFast::Imm5(code), 1) &&
-								EmitStoreViHalfword(result, dest);
+								emit_result_store(result);
 						}
 						break;
 
@@ -7143,14 +7152,14 @@ namespace VitaVU
 							{
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(0, is) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 						}
 						else if (is == 0 || it == 0)
 						{
 							emitted_body = emitted_body &&
 								m_code.EmitMovImm8(0, 0) &&
-								EmitStoreViHalfword(0, dest);
+								emit_result_store(0);
 						}
 						else
 						{
@@ -7159,14 +7168,14 @@ namespace VitaVU
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(1, it) &&
 									m_code.EmitAndReg(BACKED_UP_VI, BACKED_UP_VI, 1) &&
-									EmitStoreViHalfword(BACKED_UP_VI, dest);
+									emit_result_store(BACKED_UP_VI);
 							}
 							else if (vi_backup_direct_full_install && dest == it)
 							{
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(0, is) &&
 									m_code.EmitAndReg(0, 0, BACKED_UP_VI) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 							else
 							{
@@ -7174,7 +7183,7 @@ namespace VitaVU
 									EmitLoadViLowResultOperand(0, is) &&
 									EmitLoadViLowResultOperand(1, it) &&
 									m_code.EmitAndReg(0, 0, 1) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 						}
 						break;
@@ -7197,7 +7206,7 @@ namespace VitaVU
 							{
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(0, source) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 						}
 						else
@@ -7207,14 +7216,14 @@ namespace VitaVU
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(1, it) &&
 									m_code.EmitOrrReg(BACKED_UP_VI, BACKED_UP_VI, 1) &&
-									EmitStoreViHalfword(BACKED_UP_VI, dest);
+									emit_result_store(BACKED_UP_VI);
 							}
 							else if (vi_backup_direct_full_install && dest == it)
 							{
 								emitted_body = emitted_body &&
 									EmitLoadViLowResultOperand(0, is) &&
 									m_code.EmitOrrReg(0, 0, BACKED_UP_VI) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 							else
 							{
@@ -7222,7 +7231,7 @@ namespace VitaVU
 									EmitLoadViLowResultOperand(0, is) &&
 									EmitLoadViLowResultOperand(1, it) &&
 									m_code.EmitOrrReg(0, 0, 1) &&
-									EmitStoreViHalfword(0, dest);
+									emit_result_store(0);
 							}
 						}
 						break;
