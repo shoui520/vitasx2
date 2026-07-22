@@ -6721,6 +6721,23 @@ namespace VitaVU
 				if (m_code.EmitAndImm32(rd, rn, value))
 					return true;
 
+				// ARM ARM A8.6.236: UBFX zero-extends one adjacent bitfield.  For
+				// a contiguous low mask this is exactly rn & value, and avoids the
+				// MOVW+AND pair otherwise needed by VU1's 0x3fff data-memory wrap
+				// (and VU0's corresponding 0xfff/0x3ff wraps).  PCSX2's semantic
+				// owner remains VUops.cpp::GET_VU_MEM(); this only selects the
+				// Cortex-A9 instruction which computes its exact low address bits.
+				if (value != 0 && value != 0xffffffffu &&
+					(value & (value + 1u)) == 0)
+				{
+					u8 width = 0;
+					for (u32 remaining = value; remaining != 0; remaining >>= 1)
+						width++;
+
+					if (m_code.EmitUbfx(rd, rn, 0, width))
+						return true;
+				}
+
 				return m_code.EmitMovImm32(scratch, value) &&
 					m_code.EmitAndReg(rd, rn, scratch);
 			}
