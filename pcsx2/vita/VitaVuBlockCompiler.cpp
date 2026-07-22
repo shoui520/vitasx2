@@ -46,6 +46,7 @@ u32 g_qemuVuJitTestPipesFmacFlushInlineOps = 0;
 u32 g_qemuVuJitResidentFmacQueueRetirements = 0;
 u32 g_qemuVuJitResidentPipeAggregateRefreshes = 0;
 u32 g_qemuVuJitResidentPipeAggregateXgkickCalls = 0;
+u32 g_qemuVuJitResidentFmacOnlyPublisherCalls = 0;
 u32 g_qemuVuJitTestPipesFdivFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesEfuFlushInlineOps = 0;
 u32 g_qemuVuJitTestPipesXgkickTransferInlineOps = 0;
@@ -1895,8 +1896,8 @@ namespace VitaVU
 		constexpr u32 LOCAL_FMAC_STATUS_OFFSET = 12;
 		constexpr u32 LOCAL_FMAC_CLIP_OFFSET = 16;
 		constexpr u32 DEFERRED_LIMIT_SAVE_OFFSET = 128;
-		// The resident pipe aggregate lives in r10. This stack word is used only by
-		// the shared publisher's rare XGKICK arm to preserve its LR across the C++ call.
+		// The resident pipe aggregate lives in r10. This stack word preserves the
+		// shared publisher's LR around its rare full-pipe path and XGKICK C++ call.
 		constexpr u32 XGKICK_THUNK_LR_SAVE_OFFSET = 136;
 		constexpr u32 STACK_FRAME_SIZE = 140;
 		constexpr u32 VECTOR_STACK_FRAME_SIZE = 144;
@@ -2978,6 +2979,15 @@ namespace VitaVU
 						m_code.EmitStrImm12(1, 0, 0);
 				}
 
+				bool EmitQemuResidentFmacOnlyPublisherCounter()
+				{
+					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitResidentFmacOnlyPublisherCalls))) &&
+						m_code.EmitLdrImm12(1, 0, 0) &&
+						m_code.EmitAddImm8(1, 1, 1) &&
+						m_code.EmitStrImm12(1, 0, 0);
+				}
+
 				bool EmitQemuTestPipesIaluFlushInlineCounter()
 				{
 					return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(&g_qemuVuJitTestPipesIaluFlushInlineOps))) &&
@@ -3828,9 +3838,61 @@ namespace VitaVU
 					}
 
 					const bool resident_aggregate = shared_thunk && UsesResidentPipeActivity();
+					size_t full_pipe_path = static_cast<size_t>(-1);
+					if (resident_aggregate)
+					{
+						// r10[2:0] is the exact four-entry FMAC count; every other
+						// canonical pipe predicate starts at bit 8. Values <= 7 therefore
+						// prove that PCSX2's remaining _vuTestPipes() arms are disabled.
+						// Keep one shared FMAC body and return immediately on that dominant
+						// path instead of issuing four disabled-pipe checks and rebuilds.
+						if (!m_code.EmitCmpImm32(HOST_STALL_SCRATCH,
+								RESIDENT_FMAC_COUNT_MASK))
+						{
+							return false;
+						}
+						full_pipe_path = m_code.EmitBranchPlaceholder(Condition::HI);
+						if (full_pipe_path == static_cast<size_t>(-1))
+							return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+						if (!EmitQemuResidentFmacOnlyPublisherCounter())
+							return false;
+#endif
+					}
+
+					const size_t fmac_body = m_code.Size();
 					if (!EmitInlineTestPipesFmacFlush(shared_thunk, deferred_fmac_flags,
 						current_cycle_low))
 						return false;
+					if (resident_aggregate)
+					{
+#if defined(VITASX2_QEMU_VALIDATION)
+						// Count one complete resident publisher invocation in the shared
+						// body so both its direct and nested-call entries remain identical.
+						if (!EmitQemuTestPipesFastSkipCounter() ||
+							!EmitQemuResidentPipeAggregateRefreshCounter())
+						{
+							return false;
+						}
+#endif
+						if (!m_code.EmitBx(14))
+							return false;
+
+						const size_t full_pipe_target = m_code.Size();
+						if (!m_code.PatchBranch(full_pipe_path, full_pipe_target,
+								Condition::HI) ||
+							!m_code.EmitStrImm12(14, SP, XGKICK_THUNK_LR_SAVE_OFFSET))
+						{
+							return false;
+						}
+						const size_t fmac_call = m_code.EmitBranchLinkPlaceholder();
+						if (fmac_call == static_cast<size_t>(-1) ||
+							!m_code.PatchBranchLink(fmac_call, fmac_body) ||
+							!m_code.EmitLdrImm12(14, SP, XGKICK_THUNK_LR_SAVE_OFFSET))
+						{
+							return false;
+						}
+					}
 					if (!EmitInlineTestPipesFdivFlush(deferred_fmac_flags, current_cycle_low))
 						return false;
 					if (resident_aggregate)
@@ -3877,13 +3939,8 @@ namespace VitaVU
 						return false;
 					}
 #if defined(VITASX2_QEMU_VALIDATION)
-					if (!EmitQemuTestPipesFastSkipCounter())
+					if (!resident_aggregate && !EmitQemuTestPipesFastSkipCounter())
 						return false;
-					if (resident_aggregate &&
-						!EmitQemuResidentPipeAggregateRefreshCounter())
-					{
-						return false;
-					}
 #endif
 
 					return resident_aggregate ? true : EmitRefreshResidentPipeActivity();
