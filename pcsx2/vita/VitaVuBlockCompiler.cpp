@@ -11267,6 +11267,11 @@ namespace VitaVU
 					(reused_flag_words == 1 ? FMAC_RESULT_REGS_WITHOUT_CLIP :
 						(reused_flag_words == 2 ? FMAC_RESULT_REGS_WITHOUT_STATUS_CLIP :
 							FMAC_RESULT_REGS_WITHOUT_FLAGS));
+				// Every canonical same-slot predecessor has Cycle == 4. When all
+				// trailing working flags also remain exact, only the new 64-bit
+				// timestamp needs publication. A32 STRD replaces MOV #4 + STMIA and
+				// leaves the already-correct Cycle word untouched.
+				const bool reuse_cycle_word = reused_flag_words == 3;
 				bool emitted_body =
 					EmitComputeFmacWritePtr(14, 0) &&
 					// Normal pairs have no observer between canonical queue append and
@@ -11293,8 +11298,10 @@ namespace VitaVU
 						 m_code.EmitLdmIa(0, working_flag_regs))) &&
 					EmitLoadCurrentCycleLow(0) &&
 					EmitLoadCurrentCycleHigh(1) &&
-					m_code.EmitMovImm8(2, FMAC_PIPELINE_LATENCY_CYCLES) &&
-					m_code.EmitStmIa(14, result_regs) &&
+					(reuse_cycle_word ||
+						m_code.EmitMovImm8(2, FMAC_PIPELINE_LATENCY_CYCLES)) &&
+					(reuse_cycle_word ? m_code.EmitStrdImm8(0, 1, 14, 0) :
+						m_code.EmitStmIa(14, result_regs)) &&
 					(UsesResidentPipeActivity() ?
 						// r10 is the exact local fmaccount owner until the next helper,
 						// flush, link, or dispatcher seam. Avoid feeding every append
