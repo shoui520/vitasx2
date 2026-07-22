@@ -4687,8 +4687,7 @@ namespace VitaVU
 			}
 
 			bool EmitLoadVfLaneBroadcastSelected(unsigned qd, unsigned reg, unsigned lane,
-				bool use_single_d, bool use_vfp_scalar_ingress,
-				bool allow_resident_scalar_alias, int* selected_s)
+				bool use_single_d, int* selected_s)
 			{
 				if (!selected_s)
 					return false;
@@ -4715,11 +4714,6 @@ namespace VitaVU
 					if (use_single_d)
 					{
 						m_single_d_broadcast_operands++;
-						if (use_vfp_scalar_ingress && allow_resident_scalar_alias)
-						{
-							*selected_s = static_cast<int>(cached_q * 4 + lane);
-							return true;
-						}
 						*selected_s = static_cast<int>(qd * 4);
 						return m_code.EmitVdupI32DFromQlane(qd * 2, cached_q,
 							static_cast<u8>(lane));
@@ -4730,20 +4724,6 @@ namespace VitaVU
 
 				if (!m_vu0_memory_map)
 					m_vector_cache_stats.vf_word_loads++;
-				if (use_single_d && use_vfp_scalar_ingress)
-				{
-					// PCSX2 owners: VUops.cpp::vuDouble() and VUmicroFast.h's
-					// scalar broadcast arithmetic paths. Once vuDouble() is known to
-					// emit no bit work, feed scalar VFP directly instead of paying
-					// for an integer LDR followed by VDUP.32. Cortex-A9 MPE TRM
-					// Table 3-3 gives VLDR.S a one-cycle result, while Table 3-10
-					// documents VFP/Advanced-SIMD inter-unit latency and serialization;
-					// this removes the intervening Advanced-SIMD operation entirely.
-					m_single_d_broadcast_operands++;
-					*selected_s = static_cast<int>(qd * 4);
-					return m_code.EmitVldrSImm(static_cast<unsigned>(*selected_s),
-						HOST_VU, VfLaneOffset(reg, lane));
-				}
 				if (!m_code.EmitLdrImm12(3, HOST_VU, VfLaneOffset(reg, lane)))
 					return false;
 				if (use_single_d)
@@ -4758,7 +4738,7 @@ namespace VitaVU
 			bool EmitLoadVfLaneBroadcast(unsigned qd, unsigned reg, unsigned lane)
 			{
 				int selected_s = -1;
-				return EmitLoadVfLaneBroadcastSelected(qd, reg, lane, false, false, false,
+				return EmitLoadVfLaneBroadcastSelected(qd, reg, lane, false,
 					&selected_s);
 			}
 
@@ -5555,31 +5535,6 @@ namespace VitaVU
 				return IsUpperQFormat(kind) && m_q_operand_normalized;
 			}
 
-			bool CanUseVfpNativeScalarIngress(bool source_normalized) const
-			{
-				// This is deliberately VU1-only: keep VU0 and every configuration
-				// which still needs software vuDouble() work on their existing path.
-				if (m_vu0_memory_map)
-					return false;
-#if defined(INT_VUDOUBLEHACK)
-				(void)source_normalized;
-				return true;
-#else
-				return source_normalized ||
-					(VuFpcrFlushesInputsToZero() && !CHECK_VU_OVERFLOW(0));
-#endif
-			}
-
-			bool EmitLoadUpperViScalarVfp(unsigned sd,
-				VUInterpFast::UpperFastKind kind)
-			{
-				if (IsUpperIFormat(kind))
-					return m_code.EmitVldrSImm(sd, HOST_VU, ViOffset(REG_I));
-				if (IsUpperQFormat(kind))
-					return m_code.EmitVldrSImm(sd, HOST_VU, ViOffset(REG_Q));
-				return false;
-			}
-
 			bool EmitNormalizeLoadedUpperBroadcastForFz(unsigned value_reg,
 				unsigned exponent_reg, u32 code, VUInterpFast::UpperFastKind kind)
 			{
@@ -5748,11 +5703,10 @@ namespace VitaVU
 			}
 
 			// Loads the ADD/SUB second operand. Vector forms use a complete Q
-			// register; broadcast forms report one scalar-VFP source in selected_s.
-			// Paths needing software normalization still duplicate a D register.
+			// register; broadcast forms duplicate the one semantic source word
+			// into a D register and report its low scalar-VFP alias in selected_s.
 			bool EmitLoadUpperAddSubOperand(unsigned qd, u32 code,
-				VUInterpFast::UpperFastKind kind, bool use_vfp_scalar_ingress,
-				bool allow_resident_scalar_alias, int* selected_s)
+				VUInterpFast::UpperFastKind kind, int* selected_s)
 			{
 				if (!selected_s)
 					return false;
@@ -5763,15 +5717,7 @@ namespace VitaVU
 				if (broadcast_lane >= 0)
 					return EmitLoadVfLaneBroadcastSelected(qd, VUInterpFast::Ft(code),
 						static_cast<unsigned>(broadcast_lane), true,
-						use_vfp_scalar_ingress, allow_resident_scalar_alias,
 						selected_s);
-				if (use_vfp_scalar_ingress)
-				{
-					*selected_s = static_cast<int>(qd * 4);
-					m_single_d_broadcast_operands++;
-					return EmitLoadUpperViScalarVfp(
-						static_cast<unsigned>(*selected_s), kind);
-				}
 
 				if (!EmitLoadUpperAddSubOperandWord(3, code, kind, 0) ||
 					!EmitNormalizeLoadedUpperBroadcastForFz(3, 0, code, kind))
@@ -5815,8 +5761,7 @@ namespace VitaVU
 
 			// Loads the MUL second operand (see the ADD/SUB operand loader above).
 			bool EmitLoadUpperMulOperand(unsigned qd, u32 code,
-				VUInterpFast::UpperFastKind kind, bool use_vfp_scalar_ingress,
-				bool allow_resident_scalar_alias, int* selected_s)
+				VUInterpFast::UpperFastKind kind, int* selected_s)
 			{
 				if (!selected_s)
 					return false;
@@ -5827,15 +5772,7 @@ namespace VitaVU
 				if (broadcast_lane >= 0)
 					return EmitLoadVfLaneBroadcastSelected(qd, VUInterpFast::Ft(code),
 						static_cast<unsigned>(broadcast_lane), true,
-						use_vfp_scalar_ingress, allow_resident_scalar_alias,
 						selected_s);
-				if (use_vfp_scalar_ingress)
-				{
-					*selected_s = static_cast<int>(qd * 4);
-					m_single_d_broadcast_operands++;
-					return EmitLoadUpperViScalarVfp(
-						static_cast<unsigned>(*selected_s), kind);
-				}
 
 				if (!EmitLoadUpperMulOperandWord(3, code, kind, 0) ||
 					!EmitNormalizeLoadedUpperBroadcastForFz(3, 0, code, kind))
@@ -5894,8 +5831,7 @@ namespace VitaVU
 			// Loads the MADD/MSUB second operand. Vector forms use a complete Q
 			// register; broadcast forms use the one-word D representation.
 			bool EmitLoadUpperMaddMsubOperand(unsigned qd, u32 code,
-				VUInterpFast::UpperFastKind kind, bool use_vfp_scalar_ingress,
-				bool allow_resident_scalar_alias, int* selected_s)
+				VUInterpFast::UpperFastKind kind, int* selected_s)
 			{
 				if (!selected_s)
 					return false;
@@ -5906,15 +5842,7 @@ namespace VitaVU
 				if (broadcast_lane >= 0)
 					return EmitLoadVfLaneBroadcastSelected(qd, VUInterpFast::Ft(code),
 						static_cast<unsigned>(broadcast_lane), true,
-						use_vfp_scalar_ingress, allow_resident_scalar_alias,
 						selected_s);
-				if (use_vfp_scalar_ingress)
-				{
-					*selected_s = static_cast<int>(qd * 4);
-					m_single_d_broadcast_operands++;
-					return EmitLoadUpperViScalarVfp(
-						static_cast<unsigned>(*selected_s), kind);
-				}
 
 				if (!EmitLoadUpperMaddMsubOperandWord(3, code, kind, 0) ||
 					!EmitNormalizeLoadedUpperBroadcastForFz(3, 0, code, kind))
@@ -6557,19 +6485,10 @@ namespace VitaVU
 					// vuDouble() work and ARM-to-VFP single-register transfers.
 					const bool fs_normalized = AreVectorLanesNormalized(
 						static_cast<u8>(fs), static_cast<u8>(mask));
-					const bool vector_operand = IsUpperVectorOperandForm(kind);
 					const bool operand_normalized = IsLoadedUpperOperandNormalized(code, kind,
-						static_cast<u8>(mask), vector_operand);
-					const bool use_vfp_scalar_ingress = !vector_operand &&
-						CanUseVfpNativeScalarIngress(IsUpperOperandNormalized(
-							code, kind, static_cast<u8>(mask), false));
-					const bool allow_resident_scalar_alias =
-						UpperVfBroadcastLane(kind) < 0 || acc ||
-						fd != VUInterpFast::Ft(code);
+						static_cast<u8>(mask), IsUpperVectorOperandForm(kind));
 					if (!EmitLoadVfQuad(0, fs) ||
-						!EmitLoadUpperAddSubOperand(1, code, kind,
-							use_vfp_scalar_ingress, allow_resident_scalar_alias,
-							&operand_s))
+						!EmitLoadUpperAddSubOperand(1, code, kind, &operand_s))
 					{
 						return false;
 					}
@@ -6633,19 +6552,10 @@ namespace VitaVU
 					// vuDouble() work and ARM-to-VFP single-register transfers.
 					const bool fs_normalized = AreVectorLanesNormalized(
 						static_cast<u8>(fs), static_cast<u8>(mask));
-					const bool vector_operand = IsUpperVectorOperandForm(kind);
 					const bool operand_normalized = IsLoadedUpperOperandNormalized(code, kind,
-						static_cast<u8>(mask), vector_operand);
-					const bool use_vfp_scalar_ingress = !vector_operand &&
-						CanUseVfpNativeScalarIngress(IsUpperOperandNormalized(
-							code, kind, static_cast<u8>(mask), false));
-					const bool allow_resident_scalar_alias =
-						UpperVfBroadcastLane(kind) < 0 || acc ||
-						fd != VUInterpFast::Ft(code);
+						static_cast<u8>(mask), IsUpperVectorOperandForm(kind));
 					if (!EmitLoadVfQuad(0, fs) ||
-						!EmitLoadUpperMulOperand(1, code, kind,
-							use_vfp_scalar_ingress, allow_resident_scalar_alias,
-							&operand_s))
+						!EmitLoadUpperMulOperand(1, code, kind, &operand_s))
 					{
 						return false;
 					}
@@ -6751,20 +6661,13 @@ namespace VitaVU
 							VU_VECTOR_CACHE_ACC, static_cast<u8>(mask));
 						const bool fs_normalized = AreVectorLanesNormalized(
 							static_cast<u8>(fs), static_cast<u8>(mask));
-						const bool vector_operand = IsUpperMaddMsubVectorForm(kind);
 						const bool operand_normalized = IsLoadedUpperOperandNormalized(code, kind,
-							static_cast<u8>(mask), vector_operand);
-						const bool use_vfp_scalar_ingress = !vector_operand &&
-							CanUseVfpNativeScalarIngress(IsUpperOperandNormalized(
-								code, kind, static_cast<u8>(mask), false));
+							static_cast<u8>(mask), IsUpperMaddMsubVectorForm(kind));
 						// Read both VF operands before selecting a destination mapping. This
 						// makes a complete Fd overwrite safe even when it aliases Fs/Ft, and
 						// ensures the selection observes any cache eviction caused by a load.
-						// The following ACC acquisition can evict an operand cache slot, so
-						// retain the copied-D form for resident VF broadcast sources.
 						if (!EmitLoadVfQuad(1, fs) ||
-							!EmitLoadUpperMaddMsubOperand(2, code, kind,
-								use_vfp_scalar_ingress, false, &operand_s))
+							!EmitLoadUpperMaddMsubOperand(2, code, kind, &operand_s))
 						{
 							return false;
 						}
