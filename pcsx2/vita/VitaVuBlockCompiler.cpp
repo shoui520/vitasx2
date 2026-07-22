@@ -7726,16 +7726,36 @@ namespace VitaVU
 #endif
 			}
 
-			// Synthesizes the vuDouble() bit-mask constants entirely in NEON. ARM
-			// VMOV.I32 can encode the sign bit and exponent bit 23 directly:
+			// Synthesizes the vuDouble() bit-mask constants entirely in NEON. In
+			// Vita's FZ/no-clamp mode only the exponent mask remains live: input
+			// normalization is performed by the installed FPCR and result sign
+			// classification uses VSHR.S32 directly. ARM's modified immediate can
+			// encode 0xff000000, and the exact unsigned identity
+			//   0xff000000 >> 1 = 0x7f800000
+			// produces that sole constant in two instructions. Other modes also
+			// require the sign bit and retain the complete construction:
 			//   0x80000000 - 0x00800000 = 0x7f800000 (exponent mask)
-			// ~(0x80000000 | 0x00800000) = 0x7f7fffff (max finite)
-			// This replaces the old ARM MOVW/MOVT + core-to-NEON VDUP crossings.
+			//   ~(0x80000000 | 0x00800000) = 0x7f7fffff (max finite)
+			// Both forms avoid ARM MOVW/MOVT plus core-to-NEON VDUP crossings.
 			// ARM ARM A8.6.281/A8.6.290 supply zero directly to comparisons, so
 			// this prologue does not spend an instruction or register on zero.
 			// Q14 is normalization scratch and does not need to retain bit 23.
 			bool EmitMaterializeVuFloatNormalizeConstants(bool overflow_clamp)
 			{
+				if (VuFpcrFlushesInputsToZero() && !overflow_clamp)
+				{
+					if (!m_code.EmitVmovI32Q(VU_NORM_EXP_Q, 0xffu, 24) ||
+						!m_code.EmitVshrU32Q(VU_NORM_EXP_Q, VU_NORM_EXP_Q, 1))
+					{
+						return false;
+					}
+#if defined(VITASX2_QEMU_VALIDATION)
+					return EmitQemuNormConstantMaterializationCounter();
+#else
+					return true;
+#endif
+				}
+
 				if (!m_code.EmitVmovI32Q(VU_NORM_SIGN_Q, 0x80u, 24) ||
 					!m_code.EmitVmovI32Q(VU_NORM_TMP_Q, 0x80u, 16) ||
 					!m_code.EmitVsubI32Q(VU_NORM_EXP_Q, VU_NORM_SIGN_Q, VU_NORM_TMP_Q))
@@ -7768,7 +7788,11 @@ namespace VitaVU
 					return true;
 				if (m_norm_consts_ready)
 				{
-					if (!m_code.EmitVmovI32Q(VU_NORM_TMP_Q, 0x80u, 16) ||
+					// A prior FZ/no-clamp request may have materialized only Q8.
+					// Recreate Q9 unconditionally at this uncommon representation
+					// upgrade so independently configured VU overflow modes remain exact.
+					if (!m_code.EmitVmovI32Q(VU_NORM_SIGN_Q, 0x80u, 24) ||
+						!m_code.EmitVmovI32Q(VU_NORM_TMP_Q, 0x80u, 16) ||
 						!m_code.EmitVorrQ(VU_NORM_MAXF_Q, VU_NORM_SIGN_Q, VU_NORM_TMP_Q) ||
 						!m_code.EmitVmvnQ(VU_NORM_MAXF_Q, VU_NORM_MAXF_Q))
 					{
