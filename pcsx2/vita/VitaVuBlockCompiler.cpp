@@ -6832,6 +6832,20 @@ namespace VitaVU
 			bool EmitVuDataMemoryAddressFromQwordIndex(unsigned index_reg,
 				unsigned mask_scratch = 2)
 			{
+				if (!m_vu0_memory_map)
+				{
+					// Sony VU memory operands address 16-byte qwords, and PCSX2's
+					// GET_VU_MEM() wraps VU1 byte addresses to its fixed 16 KiB RAM:
+					//   (index << 4) & 0x3fff == (index & 0x3ff) << 4.
+					// ARM ARM A8.6.6 permits the LSL in ADD's register operand, so
+					// Cortex-A9 needs no standalone shift or post-shift mask here.
+					static_assert(VU1_MEMSIZE == (1u << 14));
+					return m_code.EmitUbfx(1, index_reg, 0, 10) &&
+						m_code.EmitLdrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, Mem))) &&
+						m_code.EmitAddRegShiftImm(0, 0, 1, ShiftType::LSL, 4);
+				}
+
 				return m_code.EmitMovRegShiftImm(1, index_reg, ShiftType::LSL, 4) &&
 					EmitVuDataMemoryPointerFromRawByteAddress(mask_scratch);
 			}
