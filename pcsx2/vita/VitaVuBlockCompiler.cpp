@@ -6675,10 +6675,10 @@ namespace VitaVU
 				// PCSX2 owner: VUops.cpp::_vuBackupVI(). Keep the exact
 				// repeated-write rule in generated A32 so lower IALU ops can
 				// avoid a C++ call without changing branch-operand visibility.
-				// EmitViBackupUpdate() has just applied this pair's elapsed cycles.
-				// After any preceding pair without a writer, the two-cycle window
-				// inherited at the block entry or created earlier in the block is
-				// therefore provably empty. Install the new full backup directly.
+				// The analyzed pair timing proves that this pair's elapsed cycles make
+				// the window empty after any preceding pair without a writer. The
+				// canonical countdown can either have applied that result or have been
+				// superseded by this same full installation. Install it directly.
 				if (known_empty)
 				{
 					return m_code.EmitMovImm8(0, 2) &&
@@ -11165,8 +11165,16 @@ namespace VitaVU
 			// PCSX2 owner: the per-step `VU->VIBackupCycles -=
 			// std::min((u8)(VU1.cycle - cyclesBeforeOp), VU->VIBackupCycles)`
 			// update, where cyclesBeforeOp is the pre-stall cycle minus one.
-			bool EmitViBackupUpdate(u32 pair_index)
+			bool EmitViBackupUpdate(u32 pair_index, bool superseded_by_full_backup)
 			{
+				// A non-entry writer whose preceding pair did not write VI is
+				// compile-time-proven to reach zero here. Its lower operation installs
+				// a complete new backup later in this same pair, and no intervening
+				// upper operation observes PCSX2's private backup fields. Do not publish
+				// a zero which that installation immediately overwrites with two.
+				if (superseded_by_full_backup)
+					return true;
+
 				const u16 backup = VuOffset(offsetof(VURegs, VIBackupCycles));
 				if (pair_index >= 2 && !m_pairs[pair_index - 1].vi_backup_write)
 				{
@@ -11482,14 +11490,17 @@ namespace VitaVU
 						CanSnapshotLocalFmacFlagsAtProducer(plan);
 				}
 
-				if (!EmitViBackupUpdate(pair_index))
-					return false;
-				// The update above has consumed at least one cycle for this pair.
-				// If the immediately preceding pair did not create a new backup,
-				// every possible two-cycle entry or earlier in-block window is now
-				// empty. Pair zero has no such compile-time predecessor proof.
+				// This pair has consumed at least one cycle. If the immediately
+				// preceding pair did not create a new backup, every possible two-cycle
+				// entry or earlier in-block window is empty at the update point. Pair
+				// zero has no such compile-time predecessor proof.
 				const bool vi_backup_known_empty = pair_index != 0 &&
 					!m_pairs[pair_index - 1].vi_backup_write;
+				if (!EmitViBackupUpdate(pair_index,
+						plan.vi_backup_write && vi_backup_known_empty))
+				{
+					return false;
+				}
 
 				// Hazard backup of the upper target the lower op reads.
 				if (plan.vf_backup_reg != 0 &&
