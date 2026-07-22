@@ -5039,6 +5039,7 @@ namespace VitaVU
 					return false;
 				}
 
+				u8 normalized_result_lanes = 0;
 				bool emitted_body = true;
 					switch (kind)
 					{
@@ -5047,6 +5048,8 @@ namespace VitaVU
 							// performs exactly q0 &= ~0x80000000 in one NEON
 							// instruction, including for zero, denormals and NaNs.
 							emitted_body = m_code.EmitVbicI32Q(0, 0x80u, 24);
+							normalized_result_lanes = static_cast<u8>(
+								m_normalized_vector_lanes[fs] & mask);
 						break;
 					case VUInterpFast::UpperFastKind::FTOI0:
 					case VUInterpFast::UpperFastKind::FTOI4:
@@ -5097,6 +5100,11 @@ namespace VitaVU
 					case VUInterpFast::UpperFastKind::ITOF12:
 					case VUInterpFast::UpperFastKind::ITOF15:
 					{
+						// Signed 32-bit conversion followed by an exact 2^-N scale
+						// produces only zero or finite normal binary32 values for
+						// N={0,4,12,15}. These lanes therefore already satisfy
+						// PCSX2's vuDouble() input representation contract.
+						normalized_result_lanes = static_cast<u8>(mask);
 						unsigned offset = 0;
 						if (kind == VUInterpFast::UpperFastKind::ITOF4)
 							offset = 4;
@@ -5130,6 +5138,7 @@ namespace VitaVU
 				{
 					return false;
 				}
+				MarkVectorLanesNormalized(static_cast<u8>(ft), normalized_result_lanes);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				return EmitQemuUpperUnaryInlineCounter();
@@ -5236,6 +5245,30 @@ namespace VitaVU
 					kind == VUInterpFast::UpperFastKind::MAXy ||
 					kind == VUInterpFast::UpperFastKind::MAXz ||
 					kind == VUInterpFast::UpperFastKind::MAXw;
+				u8 normalized_result_lanes = 0;
+				const int broadcast_lane = UpperVfBroadcastLane(kind);
+				if (broadcast_lane >= 0)
+				{
+					const u8 operand_lane = static_cast<u8>(1u << (3 - broadcast_lane));
+					if (AreVectorLanesNormalized(static_cast<u8>(VUInterpFast::Ft(code)),
+						operand_lane))
+					{
+						normalized_result_lanes = static_cast<u8>(
+							m_normalized_vector_lanes[fs] & mask);
+					}
+				}
+				else if (kind == VUInterpFast::UpperFastKind::MAX ||
+					kind == VUInterpFast::UpperFastKind::MINI)
+				{
+					normalized_result_lanes = static_cast<u8>(
+						m_normalized_vector_lanes[fs] &
+						m_normalized_vector_lanes[VUInterpFast::Ft(code)] & mask);
+				}
+				else if (IsUpperIFormat(kind) && m_i_operand_normalized)
+				{
+					normalized_result_lanes = static_cast<u8>(
+						m_normalized_vector_lanes[fs] & mask);
+				}
 
 				// PCSX2 owner: VUmicroFast.h::MinMaxBitsNeon(), which
 				// implements VUops.cpp::fp_max()/fp_min() signed raw-bit
@@ -5257,6 +5290,7 @@ namespace VitaVU
 
 				if (!emitted_body)
 					return false;
+				MarkVectorLanesNormalized(static_cast<u8>(fd), normalized_result_lanes);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				return EmitQemuUpperMinMaxInlineCounter();
@@ -5355,6 +5389,48 @@ namespace VitaVU
 				}
 			}
 
+			bool IsUpperIFormat(VUInterpFast::UpperFastKind kind) const
+			{
+				switch (kind)
+				{
+					case VUInterpFast::UpperFastKind::ADDi:
+					case VUInterpFast::UpperFastKind::ADDAi:
+					case VUInterpFast::UpperFastKind::SUBi:
+					case VUInterpFast::UpperFastKind::SUBAi:
+					case VUInterpFast::UpperFastKind::MULi:
+					case VUInterpFast::UpperFastKind::MULAi:
+					case VUInterpFast::UpperFastKind::MADDi:
+					case VUInterpFast::UpperFastKind::MADDAi:
+					case VUInterpFast::UpperFastKind::MSUBi:
+					case VUInterpFast::UpperFastKind::MSUBAi:
+					case VUInterpFast::UpperFastKind::MAXi:
+					case VUInterpFast::UpperFastKind::MINIi:
+						return true;
+					default:
+						return false;
+				}
+			}
+
+			bool IsUpperQFormat(VUInterpFast::UpperFastKind kind) const
+			{
+				switch (kind)
+				{
+					case VUInterpFast::UpperFastKind::ADDq:
+					case VUInterpFast::UpperFastKind::ADDAq:
+					case VUInterpFast::UpperFastKind::SUBq:
+					case VUInterpFast::UpperFastKind::SUBAq:
+					case VUInterpFast::UpperFastKind::MULq:
+					case VUInterpFast::UpperFastKind::MULAq:
+					case VUInterpFast::UpperFastKind::MADDq:
+					case VUInterpFast::UpperFastKind::MADDAq:
+					case VUInterpFast::UpperFastKind::MSUBq:
+					case VUInterpFast::UpperFastKind::MSUBAq:
+						return true;
+					default:
+						return false;
+				}
+			}
+
 			// MADD/MSUB whose second operand is the full VF[ft] vector.
 			bool IsUpperMaddMsubVectorForm(VUInterpFast::UpperFastKind kind)
 			{
@@ -5439,8 +5515,55 @@ namespace VitaVU
 					return AreVectorLanesNormalized(ft, active_lanes);
 
 				const int lane = UpperVfBroadcastLane(kind);
-				return lane >= 0 && AreVectorLanesNormalized(ft,
-					static_cast<u8>(1u << (3 - lane)));
+				if (lane >= 0)
+					return AreVectorLanesNormalized(ft,
+						static_cast<u8>(1u << (3 - lane)));
+				if (IsUpperIFormat(kind))
+					return m_i_operand_normalized;
+				return IsUpperQFormat(kind) && m_q_operand_normalized;
+			}
+
+			bool EmitNormalizeLoadedUpperBroadcastForFz(unsigned value_reg,
+				unsigned exponent_reg, u32 code, VUInterpFast::UpperFastKind kind)
+			{
+				if (!VuFpcrFlushesInputsToZero() ||
+					IsUpperOperandNormalized(code, kind, 0, false) ||
+					!CHECK_VU_OVERFLOW(0))
+				{
+					return true;
+				}
+
+				// PCSX2 owner: VUops.cpp::vuDouble(). With FZ installed, scalar
+				// VFP itself consumes denormals as signed zero, leaving only the
+				// optional exponent-0xff clamp. The operand is already in a GPR
+				// before VDUP, so keep the common finite case off the Cortex-A9
+				// MPE: three integer instructions replace five dependent D-form
+				// NEON operations. The rare arm writes the exact signed max finite.
+				if (!m_code.EmitUbfx(exponent_reg, value_reg, 23, 8) ||
+					!m_code.EmitCmpImm32(exponent_reg, 0xffu))
+				{
+					return false;
+				}
+				const size_t finite = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (finite == static_cast<size_t>(-1) ||
+					// 0xff7fffff is one MVN-modified-immediate on ARMv7-A.
+					// Replace its low 31 bits while preserving the original sign.
+					!m_code.EmitMovImm32(exponent_reg,
+						FPU_FLOAT_SIGN_MASK | FPU_FLOAT_MAX_FINITE) ||
+					!m_code.EmitBfi(value_reg, exponent_reg, 0, 31))
+				{
+					return false;
+				}
+				return m_code.PatchBranch(finite, m_code.Size(), Condition::NE);
+			}
+
+			bool IsLoadedUpperOperandNormalized(u32 code,
+				VUInterpFast::UpperFastKind kind, u8 active_lanes,
+				bool vector_form) const
+			{
+				return IsUpperOperandNormalized(code, kind, active_lanes, vector_form) ||
+					(!vector_form && VuFpcrFlushesInputsToZero() &&
+						(IsUpperIFormat(kind) || IsUpperQFormat(kind)));
 			}
 
 			// MADD/MSUB whose second operand broadcasts one VF[ft] lane. When the
@@ -5584,7 +5707,8 @@ namespace VitaVU
 						static_cast<unsigned>(broadcast_lane), true,
 						selected_s);
 
-				if (!EmitLoadUpperAddSubOperandWord(3, code, kind, 0))
+				if (!EmitLoadUpperAddSubOperandWord(3, code, kind, 0) ||
+					!EmitNormalizeLoadedUpperBroadcastForFz(3, 0, code, kind))
 					return false;
 				*selected_s = static_cast<int>(qd * 4);
 				m_single_d_broadcast_operands++;
@@ -5638,7 +5762,8 @@ namespace VitaVU
 						static_cast<unsigned>(broadcast_lane), true,
 						selected_s);
 
-				if (!EmitLoadUpperMulOperandWord(3, code, kind, 0))
+				if (!EmitLoadUpperMulOperandWord(3, code, kind, 0) ||
+					!EmitNormalizeLoadedUpperBroadcastForFz(3, 0, code, kind))
 					return false;
 				*selected_s = static_cast<int>(qd * 4);
 				m_single_d_broadcast_operands++;
@@ -5707,7 +5832,8 @@ namespace VitaVU
 						static_cast<unsigned>(broadcast_lane), true,
 						selected_s);
 
-				if (!EmitLoadUpperMaddMsubOperandWord(3, code, kind, 0))
+				if (!EmitLoadUpperMaddMsubOperandWord(3, code, kind, 0) ||
+					!EmitNormalizeLoadedUpperBroadcastForFz(3, 0, code, kind))
 					return false;
 				*selected_s = static_cast<int>(qd * 4);
 				m_single_d_broadcast_operands++;
@@ -6347,7 +6473,7 @@ namespace VitaVU
 					// vuDouble() work and ARM-to-VFP single-register transfers.
 					const bool fs_normalized = AreVectorLanesNormalized(
 						static_cast<u8>(fs), static_cast<u8>(mask));
-					const bool operand_normalized = IsUpperOperandNormalized(code, kind,
+					const bool operand_normalized = IsLoadedUpperOperandNormalized(code, kind,
 						static_cast<u8>(mask), IsUpperVectorOperandForm(kind));
 					if (!EmitLoadVfQuad(0, fs) ||
 						!EmitLoadUpperAddSubOperand(1, code, kind, &operand_s))
@@ -6414,7 +6540,7 @@ namespace VitaVU
 					// vuDouble() work and ARM-to-VFP single-register transfers.
 					const bool fs_normalized = AreVectorLanesNormalized(
 						static_cast<u8>(fs), static_cast<u8>(mask));
-					const bool operand_normalized = IsUpperOperandNormalized(code, kind,
+					const bool operand_normalized = IsLoadedUpperOperandNormalized(code, kind,
 						static_cast<u8>(mask), IsUpperVectorOperandForm(kind));
 					if (!EmitLoadVfQuad(0, fs) ||
 						!EmitLoadUpperMulOperand(1, code, kind, &operand_s))
@@ -6523,7 +6649,7 @@ namespace VitaVU
 							VU_VECTOR_CACHE_ACC, static_cast<u8>(mask));
 						const bool fs_normalized = AreVectorLanesNormalized(
 							static_cast<u8>(fs), static_cast<u8>(mask));
-						const bool operand_normalized = IsUpperOperandNormalized(code, kind,
+						const bool operand_normalized = IsLoadedUpperOperandNormalized(code, kind,
 							static_cast<u8>(mask), IsUpperMaddMsubVectorForm(kind));
 						// Read both VF operands before selecting a destination mapping. This
 						// makes a complete Fd overwrite safe even when it aliases Fs/Ft, and
@@ -8280,6 +8406,20 @@ namespace VitaVU
 					EmuConfig.Cpu.VU1FPCR).GetFlushToZero();
 			}
 
+			bool IsVuFloatInputConstantNormalized(u32 bits) const
+			{
+				// PCSX2 owner: VUops.cpp::vuDouble(). Under FZ, scalar VFP
+				// consumes raw denormals as signed zero, so only the optional
+				// exponent-0xff clamp can require generated normalization. Without
+				// FZ, signed zero is already canonical but a nonzero denormal is not.
+				const u32 exponent = bits & FPU_FLOAT_EXPONENT_MASK;
+				const bool denormal_needs_work = exponent == 0 &&
+					(bits & FPU_FLOAT_MANTISSA_MASK) != 0 && !VuFpcrFlushesInputsToZero();
+				const bool overflow_needs_work = exponent == FPU_FLOAT_EXPONENT_MASK &&
+					CHECK_VU_OVERFLOW(0);
+				return !denormal_needs_work && !overflow_needs_work;
+			}
+
 			bool EmitEnsureVuFloatInputNormalizeConstants(bool overflow_clamp)
 			{
 				// With FZ installed and PCSX2's optional overflow clamp disabled,
@@ -8864,6 +9004,11 @@ namespace VitaVU
 
 				if (!emitted_body)
 					return false;
+				// Every result arm above is in the current vuDouble() input
+				// representation. Q has no automatic data-dependency interlock,
+				// however, so do not expose that fact until a later WAITQ or FDIV
+				// resource stall has forced this pending result into VI[Q].
+				m_pending_q_operand_normalized = true;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				return EmitQemuLowerFdivInlineCounter();
@@ -11863,6 +12008,17 @@ namespace VitaVU
 				{
 					return false;
 				}
+				// Sony VU User Manual 3.4.5: ordinary *q consumers do not
+				// interlock, but WAITQ and a new FDIV-family instruction stall on
+				// the active FDIV resource. _vuTestPipes() above then publishes the
+				// locally produced, normalized pending value before this pair's
+				// upper slot reads Q.
+				if (m_pending_q_operand_normalized && plan.test_lower_stalls &&
+					plan.lower_fdiv_stall_test_inline)
+				{
+					m_q_operand_normalized = true;
+					m_pending_q_operand_normalized = false;
+				}
 				if (!EmitRetireLocalFmacEntries(pair_index))
 					return false;
 
@@ -11998,6 +12154,7 @@ namespace VitaVU
 					{
 						return false;
 					}
+					m_i_operand_normalized = IsVuFloatInputConstantNormalized(plan.lower);
 				}
 
 				if (plan.vf_backup_reg != 0)
@@ -12177,6 +12334,9 @@ namespace VitaVU
 			std::array<VectorCacheSlot, VU_VECTOR_CACHE_SLOTS> m_vector_cache{};
 			VectorCacheStats m_vector_cache_stats{};
 			std::array<u8, VU_VECTOR_CACHE_ACC + 1> m_normalized_vector_lanes{};
+			bool m_i_operand_normalized = false;
+			bool m_q_operand_normalized = false;
+			bool m_pending_q_operand_normalized = false;
 			u32 m_normalized_operand_quad_bypasses = 0;
 			u32 m_normalization_instructions_removed = 0;
 			u32 m_single_d_broadcast_operands = 0;
