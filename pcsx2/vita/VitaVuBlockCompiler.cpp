@@ -3335,7 +3335,8 @@ namespace VitaVU
 #endif
 
 			bool EmitInlineTestPipesFmacFlush(bool shared_thunk,
-				bool deferred_fmac_flags, unsigned current_cycle_low)
+				bool deferred_fmac_flags, unsigned current_cycle_low,
+				bool defer_current_cycle_high)
 			{
 				// PCSX2 owner: VUops.cpp::_vuFMACflush(). Publish all ready
 				// FMAC flag snapshots in queue order, stopping at the first
@@ -3411,35 +3412,24 @@ namespace VitaVU
 				// surviving count is exactly 1..3 and must use the timestamp test.
 				// Re-enter there directly instead of executing a dead CMP #4/BEQ.
 				const size_t timestamp_check_start = m_code.Size();
-				if (!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
+				if (!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
 						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle))) ||
-					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
-						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle) + 4)) ||
-					!m_code.EmitSubReg(HOST_TEMP, current_cycle_low, HOST_TEMP, true) ||
-					!m_code.EmitSbcReg(HOST_VALUE, HOST_CLIP_NEW, HOST_VALUE, true) ||
-					!m_code.EmitCmpImm32(HOST_VALUE, 0))
-				{
-					return false;
-				}
-
-				const size_t ready_high = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (ready_high == static_cast<size_t>(-1) ||
-					// Sony VU User Manual 3.4.4 fixes every FMAC operation at four
-					// cycles, and PCSX2's sole producer, _vuAddFMACStalls(), writes 4
-					// unconditionally. Keep that word in canonical fmacPipe state for
-					// helpers/oracle inspection, but do not reload the invariant on A9.
+					!m_code.EmitSubReg(HOST_TEMP, current_cycle_low, HOST_VALUE) ||
 					!m_code.EmitCmpImm32(HOST_TEMP, FMAC_PIPELINE_LATENCY_CYCLES))
 				{
 					return false;
 				}
-				const size_t done_not_ready = m_code.EmitBranchPlaceholder(Condition::CC);
-				if (done_not_ready == static_cast<size_t>(-1))
+				// The low-word result proves readiness whenever it is >=4, independent
+				// of the high word. Keep that dominant path as the fall-through. Only
+				// low differences 0..3 need the exact high-word subtraction, including
+				// the borrow from a low-word cycle wrap.
+				const size_t check_high_word = m_code.EmitBranchPlaceholder(Condition::CC);
+				if (check_high_word == static_cast<size_t>(-1))
 					return false;
 
 				const size_t ready_target = m_code.Size();
 				if ((ready_full != static_cast<size_t>(-1) &&
 						!m_code.PatchBranch(ready_full, ready_target, Condition::EQ)) ||
-					!m_code.PatchBranch(ready_high, ready_target, Condition::NE) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
 						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, flagreg))) ||
 					!m_code.EmitTstImm32(HOST_TEMP, 1u << REG_CLIP_FLAG))
@@ -3565,9 +3555,29 @@ namespace VitaVU
 					return false;
 				}
 
+				const size_t check_high_word_target = m_code.Size();
+				if (!m_code.PatchBranch(check_high_word, check_high_word_target,
+						Condition::CC) ||
+					// Recreate the low-word subtraction's carry while HOST_VALUE still
+					// holds sCycle.low. The high-word loads preserve it for the SBCS.
+					!m_code.EmitCmpReg(current_cycle_low, HOST_VALUE) ||
+					(defer_current_cycle_high &&
+						!EmitLoadCurrentCycleHigh(HOST_CLIP_NEW)) ||
+					!m_code.EmitLdrImm12(HOST_VALUE, HOST_PTR,
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle) + 4)) ||
+					!m_code.EmitSbcReg(HOST_VALUE, HOST_CLIP_NEW, HOST_VALUE, true))
+				{
+					return false;
+				}
+				const size_t ready_high = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (ready_high == static_cast<size_t>(-1) ||
+					!m_code.PatchBranch(ready_high, ready_target, Condition::NE))
+				{
+					return false;
+				}
+
 				const size_t done_target = m_code.Size();
 				return m_code.PatchBranch(done_empty, done_target, Condition::EQ) &&
-					m_code.PatchBranch(done_not_ready, done_target, Condition::CC) &&
 					(done_after_retire == static_cast<size_t>(-1) ||
 						m_code.PatchBranch(done_after_retire, done_target, Condition::EQ));
 			}
@@ -3829,15 +3839,16 @@ namespace VitaVU
 					// The publishers only read the exact current cycle. Scan-admitted
 					// resident blocks can therefore consume r5 directly instead of
 					// copying it to the otherwise conventional CLIP-backup register.
+					const bool resident_aggregate = shared_thunk && UsesResidentPipeActivity();
 					const unsigned current_cycle_low =
 						m_resident_cycle ? HOST_CYCLE_LO : HOST_CLIP_OLD;
 					if (!EmitLoadCurrentCycleLow(current_cycle_low) ||
-						!EmitLoadCurrentCycleHigh(HOST_CLIP_NEW))
+						(!resident_aggregate &&
+							!EmitLoadCurrentCycleHigh(HOST_CLIP_NEW)))
 					{
 						return false;
 					}
 
-					const bool resident_aggregate = shared_thunk && UsesResidentPipeActivity();
 					size_t full_pipe_path = static_cast<size_t>(-1);
 					if (resident_aggregate)
 					{
@@ -3862,7 +3873,7 @@ namespace VitaVU
 
 					const size_t fmac_body = m_code.Size();
 					if (!EmitInlineTestPipesFmacFlush(shared_thunk, deferred_fmac_flags,
-						current_cycle_low))
+						current_cycle_low, resident_aggregate))
 						return false;
 					if (resident_aggregate)
 					{
@@ -3888,7 +3899,10 @@ namespace VitaVU
 						const size_t fmac_call = m_code.EmitBranchLinkPlaceholder();
 						if (fmac_call == static_cast<size_t>(-1) ||
 							!m_code.PatchBranchLink(fmac_call, fmac_body) ||
-							!m_code.EmitLdrImm12(14, SP, XGKICK_THUNK_LR_SAVE_OFFSET))
+							!m_code.EmitLdrImm12(14, SP, XGKICK_THUNK_LR_SAVE_OFFSET) ||
+							// The dominant FMAC-only return did not need the high word. A rare
+							// full publisher materializes it here for FDIV/EFU/IALU below.
+							!EmitLoadCurrentCycleHigh(HOST_CLIP_NEW))
 						{
 							return false;
 						}
