@@ -46,7 +46,22 @@ namespace VitaVU
 		u64 cycle_high_resident_hot_branches_removed = 0;
 		u32 local_fmac_pipeline_blocks = 0;
 		u32 local_fmac_pipeline_pairs = 0;
+		u32 empty_pipeline_entry_blocks = 0;
+		u32 empty_pipeline_entry_pairs = 0;
+		u32 empty_pipeline_local_fmac_blocks = 0;
+		u32 empty_pipeline_local_fmac_pairs = 0;
+		u32 empty_pipeline_test_pipes_elisions = 0;
+		u64 empty_pipeline_entry_executions = 0;
 		u32 canonical_fmac_stall_tests_elided = 0;
+		u32 scheduled_upper_stall_tests_elided = 0;
+		u32 scheduled_lower_stall_tests_elided = 0;
+		u32 scheduled_ialu_producers_elided = 0;
+		u32 scheduled_vi_backup_writes_elided = 0;
+		u32 scheduled_fmac_hazard_metadata_pairs = 0;
+		u32 scheduled_local_fmac_warmup_pairs_elided = 0;
+		u32 scheduled_local_fmac_relative_cycle_pairs = 0;
+		u32 instant_qp_producers = 0;
+		u32 instant_qp_waits_elided = 0;
 		u32 local_fmac_cycle_snapshot_elision_pairs = 0;
 		u32 resident_pipe_activity_blocks = 0;
 		u32 resident_pipe_activity_pairs = 0;
@@ -56,10 +71,15 @@ namespace VitaVU
 		u32 local_fmac_producer_snapshot_pairs = 0;
 		u32 local_fmac_clip_snapshot_elisions = 0;
 		u32 mac_flag_classification_elisions = 0;
+		u32 canonical_mac_flag_classification_elisions = 0;
 		u64 mac_flag_classification_minimum_instructions_removed = 0;
+		u32 mvu_flag_hack_blocks = 0;
+		u32 status_flag_classification_elisions = 0;
+		u32 complete_flag_classification_elisions = 0;
 		u64 local_fmac_producer_snapshot_entries = 0;
 		u32 resident_working_fmac_flag_blocks = 0;
 		u32 resident_working_fmac_flag_producers = 0;
+		u32 resident_working_fmac_fdiv_barriers = 0;
 		u64 resident_working_fmac_state_stores_removed = 0;
 		u32 deferred_fmac_flag_blocks = 0;
 		u32 deferred_fmac_flag_retirements = 0;
@@ -152,6 +172,15 @@ namespace VitaVU
 		u64 normalized_operand_quads_bypassed = 0;
 		u64 normalization_instructions_removed = 0;
 		u64 single_d_broadcast_operands = 0;
+		u64 nearest_neon_fmac_ops = 0;
+		u64 nearest_neon_scalar_ops_removed = 0;
+		u64 nearest_neon_conversion_ops = 0;
+		u64 nearest_neon_conversion_scalar_ops_removed = 0;
+		u64 nearest_neon_half_ops = 0;
+		u64 nearest_neon_efu_ops = 0;
+		u64 nearest_neon_efu_scalar_ops_removed = 0;
+		u64 approximate_q_ops = 0;
+		u64 approximate_p_ops = 0;
 		u64 linked_frame_entries = 0;
 		u64 linked_frame_instructions_removed = 0;
 		u64 linked_frame_stack_words_removed = 0;
@@ -182,9 +211,36 @@ namespace VitaVU
 		u64 generated_state_store_instructions = 0;
 		u64 resident_working_fmac_flag_blocks = 0;
 		u64 resident_working_fmac_flag_producers = 0;
+		u64 resident_working_fmac_fdiv_barriers = 0;
 		u64 resident_working_fmac_state_stores_removed = 0;
+		u64 nearest_neon_fmac_ops = 0;
+		u64 nearest_neon_scalar_ops_removed = 0;
+		u64 nearest_neon_conversion_ops = 0;
+		u64 nearest_neon_conversion_scalar_ops_removed = 0;
+		u64 nearest_neon_half_ops = 0;
+		u64 nearest_neon_efu_ops = 0;
+		u64 nearest_neon_efu_scalar_ops_removed = 0;
+		u64 approximate_q_ops = 0;
+		u64 approximate_p_ops = 0;
+		u64 neon_clip_pairs = 0;
 		u64 mac_flag_classification_elisions = 0;
 		u64 mac_flag_classification_minimum_instructions_removed = 0;
+		u64 mvu_flag_hack_blocks = 0;
+		u64 status_flag_classification_elisions = 0;
+		u64 complete_flag_classification_elisions = 0;
+		u64 scheduled_upper_stall_tests_elided = 0;
+		u64 scheduled_lower_stall_tests_elided = 0;
+		u64 scheduled_ialu_producers_elided = 0;
+		u64 scheduled_vi_backup_writes_elided = 0;
+		u64 scheduled_fmac_hazard_metadata_pairs = 0;
+		u64 scheduled_local_fmac_warmup_pairs_elided = 0;
+		u64 scheduled_local_fmac_relative_cycle_pairs = 0;
+		u64 empty_pipeline_entry_blocks = 0;
+		u64 empty_pipeline_entry_pairs = 0;
+		u64 empty_pipeline_local_fmac_blocks = 0;
+		u64 empty_pipeline_local_fmac_pairs = 0;
+		u64 empty_pipeline_test_pipes_elisions = 0;
+		u64 empty_pipeline_entry_executions = 0;
 		u64 program_prepare_checks = 0;
 		u64 program_prepare_calls = 0;
 		u64 program_quick_cache_hits = 0;
@@ -223,6 +279,11 @@ namespace VitaVU
 	// recMicroVU1::Execute() body: mirrors InterpVU1::Execute()'s loop while
 	// routing eligible windows through compiled blocks.
 	void ExecuteVu1Blocks(u32 cycles);
+
+	// recMicroVU1::SetStartPC() hook. Pairs PCSX2's external-program-start seam
+	// with the preceding natural program completion so the first A32 block can
+	// consume the exact empty-pipeline state without reloading every pipe field.
+	void LatchVu1ExternalProgramStart();
 
 	// MTVU producer-side compilation seam. PSP2 VM-domain write mode is
 	// process-wide, so the VU worker must never generate or patch code while the

@@ -352,6 +352,43 @@ namespace
 		EmuConfig.Cpu.Recompiler.EnableVU1 = true;
 		EmuConfig.Cpu.Recompiler.EnableFastmem = false;
 		EmuConfig.Cpu.Recompiler.EnableEECache = false;
+		// Maximum VU1 tier: select PCSX2's existing nearest-rounding contract so
+		// the Cortex-A9 provider can use its fixed-nearest Advanced SIMD FMAC
+		// datapath. Product boot/oracle validation retains PS2 chop mode below by
+		// construction; the scalar VFP path also remains available whenever VU1's
+		// configured FPCR is not nearest+FZ with standard overflow clamping.
+		if (!VITASX2_PRODUCT_BOOT_VALIDATION)
+			EmuConfig.Cpu.VU1FPCR.SetRoundMode(FPRoundMode::Nearest);
+		// Performance VU1 tier. PCSX2 owners:
+		// x86/microVU_Flags.inl::mVUsetFlags() and
+		// VU1micro.cpp::vu1ExecMicro(), plus VUops.cpp's implicit stall tests.
+		// State these explicitly instead of
+		// inheriting constructor defaults so the Vita product contract remains
+		// visible when upstream defaults change. Deterministic oracle validation
+		// below disables every speedhack and therefore retains the accurate tier.
+		EmuConfig.Speedhacks.vuFlagHack = true;
+		EmuConfig.Speedhacks.vu1Instant = true;
+		// PS2 VU microprograms are statically scheduled. Preserve explicit
+		// WAITQ/WAITP synchronization, result publication, and flag timing, but
+		// do not spend Cortex-A9 instructions proving that automatic FMAC,
+		// FDIV/EFU-resource, branch-after-IALU stalls, or the old-VI branch
+		// compatibility window are absent at runtime.
+		EmuConfig.Speedhacks.vu1AssumeScheduled = true;
+		// Sony VU User Manual 3.4.5/3.4.6 permits unsynchronized consumers to
+		// observe the old Q/P value. The Performance tier deliberately assumes
+		// microcode wants the newly computed value immediately, eliminating the
+		// pending FDIV/EFU timestamp and readiness machinery around scalar VFP.
+		EmuConfig.Speedhacks.vu1InstantQP = true;
+		// Maximum-tier arithmetic approximations. ARM ARM A8.6.371-372 and
+		// A8.6.378-379 define the Advanced SIMD reciprocal/reciprocal-square-root
+		// estimate and Newton refinement operations; the Cortex-A9 MPE TRM table
+		// 3-8 gives every D-form step one issue cycle. The generated paths retain
+		// Sony DIV D/I flags, zero exceptional results, vuDouble()/vuFloat()
+		// normalization, and Q/P visibility, while deliberately replacing the
+		// finite exact divide/square-root arithmetic. Accurate boot validation's
+		// DisableAll() below keeps the exact scalar VFP implementation.
+		EmuConfig.Speedhacks.vu1ApproximateQ = true;
+		EmuConfig.Speedhacks.vu1ApproximateP = true;
 		// PCSX2 owner: Pcsx2Config::SpeedhackOptions::MTVU and
 		// VMManager::SetEmuThreadAffinities(). Normal Vita execution overlaps
 		// VU1 micro work with EE/IOP on the three documented application cores.

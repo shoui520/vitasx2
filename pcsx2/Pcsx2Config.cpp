@@ -322,6 +322,10 @@ bool TraceLogFilters::operator!=(const TraceLogFilters& right) const
 static constexpr const char* s_speed_hack_names[] = {
 	"mvuFlag",
 	"instantVU1",
+	"vu1AssumeScheduled",
+	"vu1InstantQP",
+	"vu1ApproximateQ",
+	"vu1ApproximateP",
 	"mtvu",
 	"eeCycleRate",
 };
@@ -354,6 +358,18 @@ void Pcsx2Config::SpeedhackOptions::Set(SpeedHack id, int value)
 			break;
 		case SpeedHack::InstantVU1:
 			vu1Instant = (value != 0);
+			break;
+		case SpeedHack::VU1AssumeScheduled:
+			vu1AssumeScheduled = (value != 0);
+			break;
+		case SpeedHack::VU1InstantQP:
+			vu1InstantQP = (value != 0);
+			break;
+		case SpeedHack::VU1ApproximateQ:
+			vu1ApproximateQ = (value != 0);
+			break;
+		case SpeedHack::VU1ApproximateP:
+			vu1ApproximateP = (value != 0);
 			break;
 		case SpeedHack::MTVU:
 			vuThread = (value != 0);
@@ -407,6 +423,10 @@ void Pcsx2Config::SpeedhackOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(vuFlagHack);
 	SettingsWrapBitBool(vuThread);
 	SettingsWrapBitBool(vu1Instant);
+	SettingsWrapBitBool(vu1AssumeScheduled);
+	SettingsWrapBitBool(vu1InstantQP);
+	SettingsWrapBitBool(vu1ApproximateQ);
+	SettingsWrapBitBool(vu1ApproximateP);
 
 	EECycleRate = std::clamp(EECycleRate, MIN_EE_CYCLE_RATE, MAX_EE_CYCLE_RATE);
 	EECycleSkip = std::min(EECycleSkip, MAX_EE_CYCLE_SKIP);

@@ -185,6 +185,10 @@ enum class SpeedHack
 {
 	MVUFlag,
 	InstantVU1,
+	VU1AssumeScheduled,
+	VU1InstantQP,
+	VU1ApproximateQ,
+	VU1ApproximateP,
 	MTVU,
 	EECycleRate,
 	MaxCount,
@@ -1135,7 +1139,11 @@ struct Pcsx2Config
 			WaitLoop : 1, // enables constant loop detection and fast-forwarding
 			vuFlagHack : 1, // microVU specific flag hack
 			vuThread : 1, // Enable Threaded VU1
-			vu1Instant : 1; // Enable Instant VU1 (Without MTVU only)
+			vu1Instant : 1, // Enable Instant VU1 (Without MTVU only)
+			vu1AssumeScheduled : 1, // VU1 microcode has no implicit data/resource stalls
+			vu1InstantQP : 1, // Publish VU1 Q/P results immediately without latency pipes
+			vu1ApproximateQ : 1, // Use Cortex-A9 NEON reciprocal refinement for VU1 Q division
+			vu1ApproximateP : 1; // Use Cortex-A9 NEON estimates/refinement for VU1 EFU results
 		BITFIELD_END
 
 		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)

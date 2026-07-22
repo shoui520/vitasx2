@@ -9,6 +9,7 @@
 #if defined(ARCH_ARM32)
 #include "vita/VitaFpRounding.h"
 #endif
+#include "vita/VitaVuApproximateMath.h"
 
 #include <cmath>
 u32 laststall = 0;
@@ -97,7 +98,8 @@ static __ri bool _vuFDIVflush(VURegs* VU)
 	if (VU->fdiv.enable == 0)
 		return false;
 
-	if ((VU->cycle - VU->fdiv.sCycle) >= VU->fdiv.Cycle)
+	if ((VU == &VU1 && EmuConfig.Speedhacks.vu1InstantQP) ||
+		(VU->cycle - VU->fdiv.sCycle) >= VU->fdiv.Cycle)
 	{
 		VUM_LOG("flushing FDIV pipe");
 
@@ -116,7 +118,8 @@ static __ri bool _vuEFUflush(VURegs* VU)
 	if (VU->efu.enable == 0)
 		return false;
 
-	if ((VU->cycle - VU->efu.sCycle) >= VU->efu.Cycle)
+	if ((VU == &VU1 && EmuConfig.Speedhacks.vu1InstantQP) ||
+		(VU->cycle - VU->efu.sCycle) >= VU->efu.Cycle)
 	{
 		VUM_LOG("flushing EFU pipe");
 
@@ -140,7 +143,8 @@ void _vuFlushAll(VURegs* VU)
 		VU->VI[REG_Q].UL = VU->fdiv.reg.UL;
 		VU->VI[REG_STATUS_FLAG].UL = (VU->VI[REG_STATUS_FLAG].UL & 0xFCF) | (VU->fdiv.statusflag & 0xC30);
 
-		if ((VU->cycle - VU->fdiv.sCycle) < VU->fdiv.Cycle)
+		if (!(VU == &VU1 && EmuConfig.Speedhacks.vu1InstantQP) &&
+			(VU->cycle - VU->fdiv.sCycle) < VU->fdiv.Cycle)
 			VU->cycle = VU->fdiv.sCycle + VU->fdiv.Cycle;
 	}
 
@@ -149,7 +153,8 @@ void _vuFlushAll(VURegs* VU)
 		VU->efu.enable = 0;
 		VU->VI[REG_P].UL = VU->efu.reg.UL;
 
-		if ((VU->cycle - VU->efu.sCycle) < VU->efu.Cycle)
+		if (!(VU == &VU1 && EmuConfig.Speedhacks.vu1InstantQP) &&
+			(VU->cycle - VU->efu.sCycle) < VU->efu.Cycle)
 			VU->cycle = VU->efu.sCycle + VU->efu.Cycle;
 	}
 
@@ -299,8 +304,49 @@ static __fi void _vuTestALUStalls(VURegs* VU, _VURegsNum* VUregsn)
 	}
 }
 
+static __fi bool _vu1AssumesScheduledMicrocode(const VURegs* VU)
+{
+	return VU == &VU1 && EmuConfig.Speedhacks.vu1AssumeScheduled;
+}
+
+static __fi bool _vu1UsesInstantQp(const VURegs* VU)
+{
+	return VU == &VU1 && EmuConfig.Speedhacks.vu1InstantQP;
+}
+
+static __fi bool _vu1CanUseApproximateMath(const VURegs* VU)
+{
+	return VU == &VU1 &&
+		EmuConfig.Cpu.VU1FPCR.GetRoundMode() == FPRoundMode::Nearest &&
+		EmuConfig.Cpu.VU1FPCR.GetFlushToZero() && CHECK_VU_OVERFLOW(1);
+}
+
+static __fi bool _vu1UsesApproximateQ(const VURegs* VU)
+{
+	return EmuConfig.Speedhacks.vu1ApproximateQ && _vu1CanUseApproximateMath(VU);
+}
+
+static __fi bool _vu1UsesApproximateP(const VURegs* VU)
+{
+	return EmuConfig.Speedhacks.vu1ApproximateP && _vu1CanUseApproximateMath(VU);
+}
+
+static __fi bool _vuIsExplicitQpWait(u32 code)
+{
+	// Sony VU User Manual 3.1.5/3.1.7: ordinary Q/P consumers do not
+	// interlock; WAITQ/WAITP are the explicit synchronization instructions.
+	// This is the WAITQ/WAITP arm of VUInterpFast::DecodeLower(), kept here so
+	// the owning PCSX2 stall helper applies the same Performance-tier contract
+	// to every interpreter and native-fallback path.
+	return (code >> 25) == 0x40u && (code & 0x3fu) == 0x3fu &&
+		(((code >> 6) & 0x1fu) == 0x0eu || ((code >> 6) & 0x1fu) == 0x1eu);
+}
+
 __fi void _vuTestUpperStalls(VURegs* VU, _VURegsNum* VUregsn)
 {
+	if (_vu1AssumesScheduledMicrocode(VU))
+		return;
+
 	switch (VUregsn->pipe) {
 	case VUPIPE_FMAC: _vuTestFMACStalls(VU, VUregsn); break;
 	}
@@ -309,6 +355,20 @@ __fi void _vuTestUpperStalls(VURegs* VU, _VURegsNum* VUregsn)
 
 __fi void _vuTestLowerStalls(VURegs* VU, _VURegsNum* VUregsn)
 {
+	if (_vu1UsesInstantQp(VU) &&
+		(VUregsn->pipe == VUPIPE_FDIV || VUregsn->pipe == VUPIPE_EFU))
+	{
+		// Instant Q/P removes only the delayed scalar-result resource. Keep the
+		// producer's FMAC source dependency when the independent scheduled-code
+		// contract is disabled.
+		if (!_vu1AssumesScheduledMicrocode(VU))
+			_vuTestFMACStalls(VU, VUregsn);
+		return;
+	}
+
+	if (_vu1AssumesScheduledMicrocode(VU) && !_vuIsExplicitQpWait(VU->code))
+		return;
+
 	switch (VUregsn->pipe)
 	{
 		case VUPIPE_FMAC: _vuTestFMACStalls(VU, VUregsn); break;
@@ -322,13 +382,25 @@ __fi void _vuClearFMAC(VURegs* VU)
 {
 	int i = VU->fmacwritepos;
 
-	memset(&VU->fmac[i], 0, sizeof(fmacPipe));
+	if (_vu1AssumesScheduledMicrocode(VU))
+	{
+		// _vuFMACTestStall() is unreachable under this explicit contract.
+		// _vuAddFMACStalls() overwrites every delayed-result/timing field; only
+		// flagreg must start at zero because a lower FMAC ORs into an optional
+		// upper producer in the same pair.
+		VU->fmac[i].flagreg = 0;
+	}
+	else
+	{
+		memset(&VU->fmac[i], 0, sizeof(fmacPipe));
+	}
 	VU->fmaccount++;
 }
 
 static __ri void _vuAddFMACStalls(VURegs* VU, _VURegsNum* VUregsn, bool isUpper)
 {
 	int i = VU->fmacwritepos;
+	const bool scheduled = _vu1AssumesScheduledMicrocode(VU);
 
 	VUM_LOG("adding FMAC %s pipe[%d]; reg=%x xyzw=%x flagreg=%x target=%x current %x", isUpper ? "Upper" : "Lower", i, VUregsn->VFwrite, VUregsn->VFwxyzw, VUregsn->VIwrite, VU->cycle + 4, VU->cycle);
 	VU->fmac[i].sCycle = VU->cycle;
@@ -336,14 +408,20 @@ static __ri void _vuAddFMACStalls(VURegs* VU, _VURegsNum* VUregsn, bool isUpper)
 
 	if (isUpper)
 	{
-		VU->fmac[i].regupper = VUregsn->VFwrite;
-		VU->fmac[i].xyzwupper = VUregsn->VFwxyzw;
+		if (!scheduled)
+		{
+			VU->fmac[i].regupper = VUregsn->VFwrite;
+			VU->fmac[i].xyzwupper = VUregsn->VFwxyzw;
+		}
 		VU->fmac[i].flagreg = VUregsn->VIwrite;
 	}
 	else
 	{
-		VU->fmac[i].reglower = VUregsn->VFwrite;
-		VU->fmac[i].xyzwlower = VUregsn->VFwxyzw;
+		if (!scheduled)
+		{
+			VU->fmac[i].reglower = VUregsn->VFwrite;
+			VU->fmac[i].xyzwlower = VUregsn->VFwxyzw;
+		}
 		VU->fmac[i].flagreg |= VUregsn->VIwrite;
 	}
 
@@ -355,6 +433,19 @@ static __ri void _vuAddFMACStalls(VURegs* VU, _VURegsNum* VUregsn, bool isUpper)
 
 static __ri void _vuFDIVAdd(VURegs* VU, int cycles)
 {
+	if (_vu1UsesInstantQp(VU))
+	{
+		// PCSX2's fdiv pipe owns only delayed architectural visibility. Preserve
+		// the exact DIV/SQRT/RSQRT arithmetic and D/I flag merge, but publish it
+		// now and leave no timestamped resource for later pairs to poll.
+		VU->fdiv.enable = 0;
+		VU->VI[REG_Q].UL = VU->q.UL;
+		VU->VI[REG_STATUS_FLAG].UL =
+			(VU->VI[REG_STATUS_FLAG].UL & 0x0fcfu) |
+			(VU->statusflag & 0x0c30u);
+		return;
+	}
+
 	VUM_LOG("adding FDIV pipe");
 
 	VU->fdiv.enable = 1;
@@ -366,6 +457,13 @@ static __ri void _vuFDIVAdd(VURegs* VU, int cycles)
 
 static __ri void _vuEFUAdd(VURegs* VU, int cycles)
 {
+	if (_vu1UsesInstantQp(VU))
+	{
+		VU->efu.enable = 0;
+		VU->VI[REG_P].UL = VU->p.UL;
+		return;
+	}
+
 	VUM_LOG("adding EFU pipe for %d cycles\n", cycles);
 
 	VU->efu.enable = 1;
@@ -417,13 +515,23 @@ __fi void _vuAddLowerStalls(VURegs* VU, _VURegsNum* VUregsn)
 		case VUPIPE_FMAC: _vuAddFMACStalls(VU, VUregsn, false); break;
 		case VUPIPE_FDIV: _vuAddFDIVStalls(VU, VUregsn); break;
 		case VUPIPE_EFU:  _vuAddEFUStalls(VU, VUregsn); break;
-		case VUPIPE_IALU: _vuAddIALUStalls(VU, VUregsn); break;
+		case VUPIPE_IALU:
+			if (!_vu1AssumesScheduledMicrocode(VU))
+				_vuAddIALUStalls(VU, VUregsn);
+			break;
 	}
 }
 
 __fi void _vuBackupVI(VURegs* VU, u32 reg)
 {
 #ifdef VI_BACKUP
+	// Sony VU User Manual 3.4.8 requires one instruction between an integer
+	// condition write and the conditional branch which consumes it. Correctly
+	// scheduled VU1 microcode therefore cannot observe this compatibility
+	// window. Keep the interpreter/fallback contract identical to native code.
+	if (_vu1AssumesScheduledMicrocode(VU))
+		return;
+
 	// EE COP2 macro instructions are not VU microprogram pairs. PCSX2's x86
 	// microVU_Macro.inl leaves mVUlow.backupVI clear for those one-op macro
 	// compilations, so the shared interpreter bodies must not leak a macro VI
@@ -970,7 +1078,8 @@ static __fi void _vuDIV(VURegs* VU)
 	}
 	else
 	{
-		VU->q.F = fs / ft;
+		VU->q.F = _vu1UsesApproximateQ(VU) ?
+			VitaVU::ApproximateDivide(fs, ft) : (fs / ft);
 		VU->q.F = vuDouble(VU->q.UL);
 	}
 }
@@ -1026,7 +1135,8 @@ static __fi void _vuRSQRT(VURegs* VU)
 		}
 
 		temp = sqrt(fabs(ft));
-		VU->q.F = fs / temp;
+		VU->q.F = _vu1UsesApproximateQ(VU) ?
+			VitaVU::ApproximateDivide(fs, temp) : (fs / temp);
 		VU->q.F = vuDouble(VU->q.UL);
 	}
 }
@@ -1500,7 +1610,7 @@ static __ri void _vuIBEQ(VURegs* VU)
 	s16 dest = VU->VI[_It_].US[0];
 	s16 src = VU->VI[_Is_].US[0];
 #ifdef VI_BACKUP
-	if (VU->VIBackupCycles > 0)
+	if (!_vu1AssumesScheduledMicrocode(VU) && VU->VIBackupCycles > 0)
 	{
 		if (VU->VIRegNumber == _It_)
 			dest = VU->VIOldValue;
@@ -1520,7 +1630,7 @@ static __ri void _vuIBGEZ(VURegs* VU)
 {
 	s16 src = VU->VI[_Is_].US[0];
 #ifdef VI_BACKUP
-	if (VU->VIBackupCycles > 0)
+	if (!_vu1AssumesScheduledMicrocode(VU) && VU->VIBackupCycles > 0)
 	{
 		if (VU->VIRegNumber == _Is_)
 			src = VU->VIOldValue;
@@ -1537,7 +1647,7 @@ static __ri void _vuIBGTZ(VURegs* VU)
 {
 	s16 src = VU->VI[_Is_].US[0];
 #ifdef VI_BACKUP
-	if (VU->VIBackupCycles > 0)
+	if (!_vu1AssumesScheduledMicrocode(VU) && VU->VIBackupCycles > 0)
 	{
 		if (VU->VIRegNumber == _Is_)
 			src = VU->VIOldValue;
@@ -1555,7 +1665,7 @@ static __ri void _vuIBLEZ(VURegs* VU)
 {
 	s16 src = VU->VI[_Is_].US[0];
 #ifdef VI_BACKUP
-	if (VU->VIBackupCycles > 0)
+	if (!_vu1AssumesScheduledMicrocode(VU) && VU->VIBackupCycles > 0)
 	{
 		if (VU->VIRegNumber == _Is_)
 			src = VU->VIOldValue;
@@ -1572,7 +1682,7 @@ static __ri void _vuIBLTZ(VURegs* VU)
 {
 	s16 src = VU->VI[_Is_].US[0];
 #ifdef VI_BACKUP
-	if (VU->VIBackupCycles > 0)
+	if (!_vu1AssumesScheduledMicrocode(VU) && VU->VIBackupCycles > 0)
 	{
 		if (VU->VIRegNumber == _Is_)
 			src = VU->VIOldValue;
@@ -1590,7 +1700,7 @@ static __ri void _vuIBNE(VURegs* VU)
 	s16 dest = VU->VI[_It_].US[0];
 	s16 src = VU->VI[_Is_].US[0];
 #ifdef VI_BACKUP
-	if (VU->VIBackupCycles > 0)
+	if (!_vu1AssumesScheduledMicrocode(VU) && VU->VIBackupCycles > 0)
 	{
 		if (VU->VIRegNumber == _It_)
 			dest = VU->VIOldValue;
@@ -1681,7 +1791,7 @@ static __ri void _vuERSADD(VURegs* VU)
 	float p = (vuDouble(VU->VF[_Fs_].i.x) * vuDouble(VU->VF[_Fs_].i.x)) + (vuDouble(VU->VF[_Fs_].i.y) * vuDouble(VU->VF[_Fs_].i.y)) + (vuDouble(VU->VF[_Fs_].i.z) * vuDouble(VU->VF[_Fs_].i.z));
 
 	if (p != 0.0)
-		p = 1.0f / p;
+		p = _vu1UsesApproximateP(VU) ? VitaVU::ApproximateReciprocal(p) : (1.0f / p);
 
 	VU->p.F = p;
 }
@@ -1692,7 +1802,8 @@ static __ri void _vuELENG(VURegs* VU)
 
 	if (p >= 0)
 	{
-		p = sqrt(p);
+		p = (_vu1UsesApproximateP(VU) && p != 0.0f && !std::isinf(p)) ?
+			VitaVU::ApproximateSqrt(p) : sqrt(p);
 	}
 	VU->p.F = p;
 }
@@ -1703,10 +1814,16 @@ static __ri void _vuERLENG(VURegs* VU)
 
 	if (p >= 0)
 	{
-		p = sqrt(p);
-		if (p != 0)
+		if (_vu1UsesApproximateP(VU))
 		{
-			p = 1.0f / p;
+			if (p != 0.0f)
+				p = VitaVU::ApproximateReciprocalSqrt(p);
+		}
+		else
+		{
+			p = sqrt(p);
+			if (p != 0)
+				p = 1.0f / p;
 		}
 	}
 	VU->p.F = p;
@@ -1740,7 +1857,10 @@ static __ri void _vuEATANxy(VURegs* VU)
 	float p = 0;
 	if (vuDouble(VU->VF[_Fs_].i.x) != 0)
 	{
-		p = _vuCalculateEATAN(vuDouble(VU->VF[_Fs_].i.y) / vuDouble(VU->VF[_Fs_].i.x));
+		const float x = vuDouble(VU->VF[_Fs_].i.x);
+		const float y = vuDouble(VU->VF[_Fs_].i.y);
+		p = _vuCalculateEATAN(_vu1UsesApproximateP(VU) ?
+			VitaVU::ApproximateDivide(y, x) : (y / x));
 	}
 	VU->p.F = p;
 }
@@ -1750,7 +1870,10 @@ static __ri void _vuEATANxz(VURegs* VU)
 	float p = 0;
 	if (vuDouble(VU->VF[_Fs_].i.x) != 0)
 	{
-		p = _vuCalculateEATAN(vuDouble(VU->VF[_Fs_].i.z) / vuDouble(VU->VF[_Fs_].i.x));
+		const float x = vuDouble(VU->VF[_Fs_].i.x);
+		const float z = vuDouble(VU->VF[_Fs_].i.z);
+		p = _vuCalculateEATAN(_vu1UsesApproximateP(VU) ?
+			VitaVU::ApproximateDivide(z, x) : (z / x));
 	}
 	VU->p.F = p;
 }
@@ -1767,7 +1890,7 @@ static __ri void _vuERCPR(VURegs* VU)
 
 	if (p != 0)
 	{
-		p = 1.0 / p;
+		p = _vu1UsesApproximateP(VU) ? VitaVU::ApproximateReciprocal(p) : (1.0 / p);
 	}
 
 	VU->p.F = p;
@@ -1779,7 +1902,8 @@ static __ri void _vuESQRT(VURegs* VU)
 
 	if (p >= 0)
 	{
-		p = sqrt(p);
+		p = (_vu1UsesApproximateP(VU) && p != 0.0f && !std::isinf(p)) ?
+			VitaVU::ApproximateSqrt(p) : sqrt(p);
 	}
 
 	VU->p.F = p;
@@ -1791,10 +1915,16 @@ static __ri void _vuERSQRT(VURegs* VU)
 
 	if (p >= 0)
 	{
-		p = sqrt(p);
-		if (p)
+		if (_vu1UsesApproximateP(VU))
 		{
-			p = 1.0f / p;
+			if (p != 0.0f)
+				p = VitaVU::ApproximateReciprocalSqrt(p);
+		}
+		else
+		{
+			p = sqrt(p);
+			if (p)
+				p = 1.0f / p;
 		}
 	}
 
@@ -1819,7 +1949,7 @@ static __ri void _vuEEXP(VURegs* VU)
 	p = 1.0f + (consts[0] * p) + (consts[1] * pow(p, 2)) + (consts[2] * pow(p, 3)) + (consts[3] * pow(p, 4)) + (consts[4] * pow(p, 5)) + (consts[5] * pow(p, 6));
 	p = pow(p, 4);
 	p = vuDouble(*(u32*)&p);
-	p = 1 / p;
+	p = _vu1UsesApproximateP(VU) ? VitaVU::ApproximateReciprocal(p) : (1 / p);
 
 	VU->p.F = p;
 }

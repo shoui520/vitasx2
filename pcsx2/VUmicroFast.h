@@ -8,6 +8,7 @@
 #include "VUflags.h"
 #include "VUmicro.h"
 #include "vita/VitaFpRounding.h"
+#include "vita/VitaVuApproximateMath.h"
 
 #if defined(ARCH_ARM32)
 #include <arm_neon.h>
@@ -1647,6 +1648,23 @@ namespace VUInterpFast
 
 	static inline float VuDouble(u32 bits);
 
+	static inline bool Vu1CanUseApproximateMath(const VURegs* VU)
+	{
+		return VU == &VU1 &&
+			EmuConfig.Cpu.VU1FPCR.GetRoundMode() == FPRoundMode::Nearest &&
+			EmuConfig.Cpu.VU1FPCR.GetFlushToZero() && CHECK_VU_OVERFLOW(1);
+	}
+
+	static inline bool Vu1UsesApproximateQ(const VURegs* VU)
+	{
+		return EmuConfig.Speedhacks.vu1ApproximateQ && Vu1CanUseApproximateMath(VU);
+	}
+
+	static inline bool Vu1UsesApproximateP(const VURegs* VU)
+	{
+		return EmuConfig.Speedhacks.vu1ApproximateP && Vu1CanUseApproximateMath(VU);
+	}
+
 	static inline float VuSqrt(float value)
 	{
 #if defined(ARCH_ARM32)
@@ -2908,22 +2926,26 @@ namespace VUInterpFast
 			case UpperFastKind::MADDx:
 				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[0]))
 					return;
-				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
+				ExecuteMaddMasked(VU, code, false,
+					[operand = VU->VF[Ft(code)].UL[0]](unsigned) { return operand; });
 				return;
 			case UpperFastKind::MADDy:
 				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[1]))
 					return;
-				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
+				ExecuteMaddMasked(VU, code, false,
+					[operand = VU->VF[Ft(code)].UL[1]](unsigned) { return operand; });
 				return;
 			case UpperFastKind::MADDz:
 				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[2]))
 					return;
-				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
+				ExecuteMaddMasked(VU, code, false,
+					[operand = VU->VF[Ft(code)].UL[2]](unsigned) { return operand; });
 				return;
 			case UpperFastKind::MADDw:
 				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, false, VU->VF[Ft(code)].UL[3]))
 					return;
-				ExecuteMaddMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
+				ExecuteMaddMasked(VU, code, false,
+					[operand = VU->VF[Ft(code)].UL[3]](unsigned) { return operand; });
 				return;
 			case UpperFastKind::MADDA:
 				if (TryExecuteMaddMsubVectorNeon(VU, code, true, false))
@@ -2978,22 +3000,26 @@ namespace VUInterpFast
 			case UpperFastKind::MSUBx:
 				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[0]))
 					return;
-				ExecuteMsubMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[0]; });
+				ExecuteMsubMasked(VU, code, false,
+					[operand = VU->VF[Ft(code)].UL[0]](unsigned) { return operand; });
 				return;
 			case UpperFastKind::MSUBy:
 				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[1]))
 					return;
-				ExecuteMsubMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[1]; });
+				ExecuteMsubMasked(VU, code, false,
+					[operand = VU->VF[Ft(code)].UL[1]](unsigned) { return operand; });
 				return;
 			case UpperFastKind::MSUBz:
 				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[2]))
 					return;
-				ExecuteMsubMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[2]; });
+				ExecuteMsubMasked(VU, code, false,
+					[operand = VU->VF[Ft(code)].UL[2]](unsigned) { return operand; });
 				return;
 			case UpperFastKind::MSUBw:
 				if (TryExecuteMaddMsubBroadcastNeon(VU, code, false, true, VU->VF[Ft(code)].UL[3]))
 					return;
-				ExecuteMsubMasked(VU, code, false, [VU, code](unsigned) { return VU->VF[Ft(code)].UL[3]; });
+				ExecuteMsubMasked(VU, code, false,
+					[operand = VU->VF[Ft(code)].UL[3]](unsigned) { return operand; });
 				return;
 			case UpperFastKind::MSUBA:
 				if (TryExecuteMaddMsubVectorNeon(VU, code, true, true))
@@ -3127,7 +3153,12 @@ namespace VUInterpFast
 	static inline s16 ReadViBranchOperand(VURegs* VU, unsigned reg)
 	{
 		u32 value = VU->VI[reg].US[0];
-		if (VU->VIBackupCycles > 0 && VU->VIRegNumber == reg)
+		// Sony VU User Manual 3.4.8 requires correctly scheduled code to leave
+		// one instruction between an ordinary VI condition writer and its branch.
+		// Such VU1 code consumes the architectural value directly; preserve the
+		// PCSX2 compatibility window for accurate VU1 and every VU0 execution.
+		if (!(VU == &VU1 && EmuConfig.Speedhacks.vu1AssumeScheduled) &&
+			VU->VIBackupCycles > 0 && VU->VIRegNumber == reg)
 			value = VU->VIOldValue;
 		return static_cast<s16>(static_cast<u16>(value));
 	}
@@ -3531,7 +3562,8 @@ namespace VUInterpFast
 				}
 				else
 				{
-					WriteVuQ(VU, VuDiv(fs, ft));
+					WriteVuQ(VU, Vu1UsesApproximateQ(VU) ?
+						VitaVU::ApproximateDivide(fs, ft) : VuDiv(fs, ft));
 				}
 				return;
 			}
@@ -3572,7 +3604,9 @@ namespace VUInterpFast
 				{
 					if (ft < 0.0f)
 						VU->statusflag |= 0x10u;
-					WriteVuQ(VU, VuDiv(fs, VuSqrt(std::fabs(ft))));
+					const float root = VuSqrt(std::fabs(ft));
+					WriteVuQ(VU, Vu1UsesApproximateQ(VU) ?
+						VitaVU::ApproximateDivide(fs, root) : VuDiv(fs, root));
 				}
 				return;
 			}
@@ -3602,7 +3636,8 @@ namespace VUInterpFast
 			{
 				float p = VuSumXYZSquares(VU, Fs(code));
 				if (p != 0.0f)
-					p = VuDiv(1.0f, p);
+					p = Vu1UsesApproximateP(VU) ?
+						VitaVU::ApproximateReciprocal(p) : VuDiv(1.0f, p);
 				VU->p.F = p;
 				return;
 			}
@@ -3610,7 +3645,8 @@ namespace VUInterpFast
 			{
 				float p = VuSumXYZSquares(VU, Fs(code));
 				if (p >= 0.0f)
-					p = VuSqrt(p);
+					p = (Vu1UsesApproximateP(VU) && p != 0.0f && !std::isinf(p)) ?
+						VitaVU::ApproximateSqrt(p) : VuSqrt(p);
 				VU->p.F = p;
 				return;
 			}
@@ -3619,9 +3655,17 @@ namespace VUInterpFast
 				float p = VuSumXYZSquares(VU, Fs(code));
 				if (p >= 0.0f)
 				{
-					p = VuSqrt(p);
-					if (p != 0.0f)
-						p = VuDiv(1.0f, p);
+					if (Vu1UsesApproximateP(VU))
+					{
+						if (p != 0.0f)
+							p = VitaVU::ApproximateReciprocalSqrt(p);
+					}
+					else
+					{
+						p = VuSqrt(p);
+						if (p != 0.0f)
+							p = VuDiv(1.0f, p);
+					}
 				}
 				VU->p.F = p;
 				return;
@@ -3631,7 +3675,11 @@ namespace VUInterpFast
 				float p = 0.0f;
 				const float x = VuLane(VU, Fs(code), 0);
 				if (x != 0.0f)
-					p = VuCalculateEatan(VuDiv(VuLane(VU, Fs(code), 1), x));
+				{
+					const float numerator = VuLane(VU, Fs(code), 1);
+					p = VuCalculateEatan(Vu1UsesApproximateP(VU) ?
+						VitaVU::ApproximateDivide(numerator, x) : VuDiv(numerator, x));
+				}
 				VU->p.F = p;
 				return;
 			}
@@ -3640,7 +3688,11 @@ namespace VUInterpFast
 				float p = 0.0f;
 				const float x = VuLane(VU, Fs(code), 0);
 				if (x != 0.0f)
-					p = VuCalculateEatan(VuDiv(VuLane(VU, Fs(code), 2), x));
+				{
+					const float numerator = VuLane(VU, Fs(code), 2);
+					p = VuCalculateEatan(Vu1UsesApproximateP(VU) ?
+						VitaVU::ApproximateDivide(numerator, x) : VuDiv(numerator, x));
+				}
 				VU->p.F = p;
 				return;
 			}
@@ -3651,7 +3703,8 @@ namespace VUInterpFast
 			{
 				float p = VuLane(VU, Fs(code), Fsf(code));
 				if (p != 0.0f)
-					p = static_cast<float>(VuDoubleDiv(1.0, static_cast<double>(p)));
+					p = Vu1UsesApproximateP(VU) ? VitaVU::ApproximateReciprocal(p) :
+						static_cast<float>(VuDoubleDiv(1.0, static_cast<double>(p)));
 				VU->p.F = p;
 				return;
 			}
@@ -3659,7 +3712,8 @@ namespace VUInterpFast
 			{
 				float p = VuLane(VU, Fs(code), Fsf(code));
 				if (p >= 0.0f)
-					p = VuSqrt(p);
+					p = (Vu1UsesApproximateP(VU) && p != 0.0f && !std::isinf(p)) ?
+						VitaVU::ApproximateSqrt(p) : VuSqrt(p);
 				VU->p.F = p;
 				return;
 			}
@@ -3668,9 +3722,17 @@ namespace VUInterpFast
 				float p = VuLane(VU, Fs(code), Fsf(code));
 				if (p >= 0.0f)
 				{
-					p = VuSqrt(p);
-					if (p != 0.0f)
-						p = VuDiv(1.0f, p);
+					if (Vu1UsesApproximateP(VU))
+					{
+						if (p != 0.0f)
+							p = VitaVU::ApproximateReciprocalSqrt(p);
+					}
+					else
+					{
+						p = VuSqrt(p);
+						if (p != 0.0f)
+							p = VuDiv(1.0f, p);
+					}
 				}
 				VU->p.F = p;
 				return;
@@ -3713,7 +3775,8 @@ namespace VUInterpFast
 				const double p2 = static_cast<double>(p) * p;
 				p = static_cast<float>(p2 * p2);
 				p = VuDouble(FloatToBits(p));
-				p = VuDiv(1.0f, p);
+				p = Vu1UsesApproximateP(VU) ?
+					VitaVU::ApproximateReciprocal(p) : VuDiv(1.0f, p);
 				VU->p.F = p;
 				return;
 			}

@@ -95,6 +95,8 @@ u32 g_qemuVu0JitNormalizedOperandQuadBypasses = 0;
 u32 g_qemuVuJitLinkedFrameEntries = 0;
 u32 g_qemuVuJitLinkedVectorFrameEntries = 0;
 u32 g_qemuVuJitResidentPipeLinkedEntries = 0;
+u32 g_qemuVuJitResidentCycleLinkedEntries = 0;
+u32 g_qemuVuJitResidentCycleHighLinkedEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineEntries = 0;
 u32 g_qemuVuJitLocalFmacPipelineCommits = 0;
 u32 g_qemuVuJitLocalFmacCycleSnapshotElisions = 0;
@@ -128,6 +130,11 @@ namespace VitaVU
 		constexpr u32 FPU_FLOAT_EXPONENT_MASK = 0x7f800000u;
 		constexpr u32 FPU_FLOAT_MANTISSA_MASK = 0x007fffffu;
 		constexpr u32 FPU_FLOAT_MAX_FINITE = 0x7f7fffffu;
+		// VU CLIP emits positive/negative bits at 2*lane and 2*lane+1 for
+		// x/y/z. The dead w lane is zero so a disjoint-bit horizontal OR can
+		// reduce the exact six-bit result without scalar lane extraction.
+		alignas(16) constexpr std::array<u32, 4> VU_CLIP_POSITIVE_WEIGHTS = {
+			0x01u, 0x04u, 0x10u, 0x00u};
 
 		bool Vu1ProgramActive()
 		{
@@ -621,9 +628,22 @@ namespace VitaVU
 			bool test_lower_stalls = false;
 			bool add_upper_stalls = false;
 			bool add_lower_stalls = false;
+			bool scheduled_upper_stall_test_elided = false;
+			bool scheduled_lower_stall_test_elided = false;
+			bool scheduled_ialu_producer_elided = false;
+			bool scheduled_vi_backup_write_elided = false;
+			bool scheduled_fmac_hazard_metadata_elided = false;
+			bool instant_qp_producer = false;
+			bool instant_qp_wait = false;
 			bool fmac_pipe = false;
 			bool local_fmac_cycle_snapshot = true;
+			bool scheduled_local_fmac_relative_cycle = false;
 			bool test_pipes_fast_guard = false;
+			// The specialized external-entry map is selected only when a preceding
+			// natural completion drained every canonical VU pipeline before the next
+			// SetStartPC. Until this block creates a canonical pipe, _vuTestPipes()
+			// is a proven NOP.
+			bool test_pipes_proven_empty = false;
 			bool defer_nop_pipe_test = false;
 			bool upper_fmac_stall_test_inline = false;
 			bool lower_fmac_stall_test_inline = false;
@@ -648,11 +668,14 @@ namespace VitaVU
 			bool lower_efu_stall_test_inline = false;
 			bool lower_branch_stall_test_inline = false;
 			bool lower_stall_inline = false;
-			// PCSX2 owner: microVU_Analyze.inl::flagSet() and
-			// microVU_Upper.inl::mVUupdateFlags(). STATUS remains live for every
-			// FMAC producer because its result contributes to delayed sticky state.
-			// MAC classification is independently live only when a later MAC reader,
-			// preserve-inactive producer, or block-seam pipeline state can observe it.
+			// PCSX2 owners: microVU_Analyze.inl::flagSet(),
+			// microVU_Flags.inl::mVUsetFlags(), and
+			// microVU_Upper.inl::mVUupdateFlags(). Accurate mode keeps STATUS live
+			// for every FMAC producer because it contributes delayed sticky state.
+			// The compatible mVU flag hack can suppress that producer when no
+			// STATUS reader needs one of the four pipeline instances. MAC
+			// classification has an independent exact liveness proof.
+			bool status_flag_result_required = true;
 			bool mac_flag_result_required = true;
 			// Count of trailing MAC/STATUS/CLIP snapshot words which remain exact
 			// from the append four canonical writes earlier.
@@ -673,7 +696,13 @@ namespace VitaVU
 			_VURegsNum lregs = {};
 		};
 
-		constexpr u32 MAX_BLOCK_PAIRS = 64;
+		// This is a host-emitter bound, not a PS2-visible block boundary. Keep it
+		// within the one-instruction A32 immediate used by generated pair-count
+		// accumulation. A wider span removes an otherwise mandatory TPC/code/pipe
+		// publish and linked-entry refresh every 64 pairs while retaining bounded
+		// compile-time state and substantially reducing duplicated link/thunk code.
+		constexpr u32 MAX_BLOCK_PAIRS = 128;
+		static_assert(MAX_BLOCK_PAIRS <= 255);
 		constexpr u32 MAX_DIRECT_LINK_SLOTS = 2;
 		// Sony VU User Manual 3.4.4: the FMAC pipeline has a fixed four-cycle
 		// latency. PCSX2 owners: microVU_Analyze.inl's compile-time pipeline
@@ -682,9 +711,6 @@ namespace VitaVU
 		constexpr u32 FMAC_PIPELINE_LATENCY_CYCLES = 4;
 		constexpr u32 FMAC_PIPELINE_SLOT_COUNT = 4;
 		constexpr u32 LOCAL_FMAC_WARMUP_PAIRS = FMAC_PIPELINE_LATENCY_CYCLES;
-		constexpr u32 LOCAL_FMAC_CANONICAL_STALL_MATURE_PAIR =
-			LOCAL_FMAC_WARMUP_PAIRS + FMAC_PIPELINE_LATENCY_CYCLES - 1;
-
 			struct DirectLinkPlan
 			{
 				bool valid = false;
@@ -694,6 +720,10 @@ namespace VitaVU
 				u32 target_pc = 0;
 				bool target_branch_tail = false;
 				bool target_ebit_tail = false;
+				// The source is only an emitter-size split inside one already-admitted
+				// PCSX2 microVU logical block. Preserve the accumulated pair count in
+				// r11, but mark the target's entry budget test as already satisfied.
+				bool admitted_logical_continuation = false;
 		};
 
 		struct BlockPlan
@@ -702,8 +732,13 @@ namespace VitaVU
 			u32 pair_count = 0;
 			bool entry_branch_tail = false;
 			bool entry_ebit_tail = false;
+			// PCSX2 owner: VUops.cpp::_vuFlushAll() and
+			// x86/microVU_Compile.inl's initial pState. This variant is callable
+			// only through the dispatcher after a natural completion has established
+			// all five canonical pipelines empty; direct links never target it.
+			bool entry_pipes_empty = false;
 			// True when this A32 fragment stopped before PCSX2 microVU's natural
-			// block boundary (currently the 64-pair emitter cap, a decode fallback,
+			// block boundary (currently the bounded emitter cap, a decode fallback,
 			// or a D/T pair whose runtime FBRST condition did not stop the VU).
 			bool continues_logical_block_if_busy = false;
 			u32 test_pipes_fast_guard_pairs = 0;
@@ -751,12 +786,29 @@ namespace VitaVU
 			// four-pair canonical warm-up. The emitter republishes the exact
 			// interpreter fmacPipe state at the block seam.
 			bool local_fmac_pipeline = false;
+			u8 local_fmac_start_pair = LOCAL_FMAC_WARMUP_PAIRS;
 			u32 local_fmac_pipeline_pairs = 0;
 			u32 canonical_fmac_stall_tests_elided = 0;
+			u32 scheduled_upper_stall_tests_elided = 0;
+			u32 scheduled_lower_stall_tests_elided = 0;
+			u32 scheduled_ialu_producers_elided = 0;
+			u32 scheduled_vi_backup_writes_elided = 0;
+			u32 scheduled_fmac_hazard_metadata_pairs = 0;
+			u32 scheduled_local_fmac_warmup_pairs_elided = 0;
+			u32 scheduled_local_fmac_relative_cycle_pairs = 0;
+			u32 instant_qp_producers = 0;
+			u32 instant_qp_waits_elided = 0;
+			bool assume_scheduled_microcode = false;
+			bool instant_qp = false;
 			u32 local_fmac_cycle_snapshot_elision_pairs = 0;
 			u32 local_fmac_producer_snapshot_pairs = 0;
 			u32 local_fmac_clip_snapshot_elisions = 0;
+			u32 resident_working_fmac_fdiv_barriers = 0;
 			u32 mac_flag_classification_elisions = 0;
+			u32 canonical_mac_flag_classification_elisions = 0;
+			bool mvu_flag_hack = false;
+			u32 status_flag_classification_elisions = 0;
+			u32 complete_flag_classification_elisions = 0;
 			// PCSX2 microVU owner: microVU_Analyze.inl's mVUregs pipeline
 			// state. Profitable multi-pair VU1 blocks retain the coarse
 			// canonical-pipe activity predicate in r10 instead of rebuilding it
@@ -782,16 +834,28 @@ namespace VitaVU
 			std::array<PairPlan, MAX_BLOCK_PAIRS> pairs{};
 		};
 
+		u32 LocalFmacStartPair(const BlockPlan& block)
+		{
+			// With ordinary VU scheduling, the first four pairs keep using the
+			// canonical queue so dependency tests can see FMAC writers inherited at
+			// the block seam. Correctly-scheduled VU1 never performs those tests.
+			// Its inherited queue remains canonical and is still retired before each
+			// pair; new compiler-owned entries can therefore begin immediately.
+			return (block.entry_pipes_empty || block.assume_scheduled_microcode) ?
+				0u : LOCAL_FMAC_WARMUP_PAIRS;
+		}
+
 		bool CanUseLocalFmacPipeline(const BlockPlan& block)
 		{
 			constexpr u32 MIN_LOCAL_COMMITS = 6;
-			if (block.pair_count < LOCAL_FMAC_WARMUP_PAIRS + MIN_LOCAL_COMMITS)
+			const u32 first_local_pair = LocalFmacStartPair(block);
+			if (block.pair_count < first_local_pair + MIN_LOCAL_COMMITS)
 				return false;
 
 			const u32 flag_mask = (1u << REG_STATUS_FLAG) |
 				(1u << REG_MAC_FLAG) | (1u << REG_CLIP_FLAG);
 			u32 fmac_pairs = 0;
-			for (u32 i = LOCAL_FMAC_WARMUP_PAIRS; i < block.pair_count; i++)
+			for (u32 i = first_local_pair; i < block.pair_count; i++)
 			{
 				const PairPlan& pair = block.pairs[i];
 				// E/D/T completion and PATH1 calls are externally observable seams
@@ -809,7 +873,7 @@ namespace VitaVU
 					((pair.uregs.VIread | pair.lregs.VIread) & flag_mask) != 0;
 				if (observes_flags)
 				{
-					for (u32 writer = LOCAL_FMAC_WARMUP_PAIRS; writer < i; writer++)
+					for (u32 writer = first_local_pair; writer < i; writer++)
 					{
 						if (block.pairs[writer].fmac_pipe &&
 							writer + FMAC_PIPELINE_LATENCY_CYCLES > i)
@@ -822,9 +886,50 @@ namespace VitaVU
 			return fmac_pairs >= MIN_LOCAL_COMMITS;
 		}
 
+		bool ProducesInlineMacStatus(const PairPlan& pair)
+		{
+			return pair.upper_addsub_inline || pair.upper_mul_inline ||
+				pair.upper_maddmsub_inline || pair.upper_outer_inline;
+		}
+
+		bool LowerFmacWritesStatus(const PairPlan& pair)
+		{
+			return pair.add_lower_stalls && pair.lregs.pipe == VUPIPE_FMAC &&
+				(pair.lregs.VIwrite & (1u << REG_STATUS_FLAG)) != 0;
+		}
+
+		bool FmacStatusPublicationRequired(const PairPlan& pair)
+		{
+			// status_flag_result_required owns the upper FMAC calculation. A paired
+			// FSSET independently owns the queue's STATUS snapshot/publication even
+			// when that upper calculation is dead under PCSX2's flag hack.
+			return pair.status_flag_result_required || LowerFmacWritesStatus(pair);
+		}
+
+		u32 EffectiveFmacFlagReg(const PairPlan& plan)
+		{
+			u32 flags = (plan.add_upper_stalls ? plan.uregs.VIwrite : 0) |
+				((plan.add_lower_stalls && plan.lregs.pipe == VUPIPE_FMAC) ?
+					plan.lregs.VIwrite : 0);
+			if (!FmacStatusPublicationRequired(plan))
+				flags &= ~(1u << REG_STATUS_FLAG);
+			if (!plan.mac_flag_result_required)
+				flags &= ~(1u << REG_MAC_FLAG);
+			return flags;
+		}
+
 		bool SameCanonicalFmacStaticHeader(const PairPlan& first,
 			const PairPlan& second)
 		{
+			if (first.scheduled_fmac_hazard_metadata_elided &&
+				second.scheduled_fmac_hazard_metadata_elided)
+			{
+				// _vuFMACTestStall() is unreachable in correctly-scheduled mode.
+				// flagreg is therefore the only observable word in the static header;
+				// _vuFMACflush() and _vuFlushAll() consume it for delayed flags.
+				return EffectiveFmacFlagReg(first) == EffectiveFmacFlagReg(second);
+			}
+
 			const bool first_upper = first.add_upper_stalls;
 			const bool second_upper = second.add_upper_stalls;
 			const bool first_lower = first.add_lower_stalls &&
@@ -835,10 +940,7 @@ namespace VitaVU
 					(second_upper ? second.uregs.VFwrite : 0) &&
 				(first_lower ? first.lregs.VFwrite : 0) ==
 					(second_lower ? second.lregs.VFwrite : 0) &&
-				((first_upper ? first.uregs.VIwrite : 0) |
-					(first_lower ? first.lregs.VIwrite : 0)) ==
-					((second_upper ? second.uregs.VIwrite : 0) |
-						(second_lower ? second.lregs.VIwrite : 0)) &&
+				EffectiveFmacFlagReg(first) == EffectiveFmacFlagReg(second) &&
 				(first_upper ? first.uregs.VFwxyzw : 0) ==
 					(second_upper ? second.uregs.VFwxyzw : 0) &&
 				(first_lower ? first.lregs.VFwxyzw : 0) ==
@@ -865,7 +967,8 @@ namespace VitaVU
 			{
 				PairPlan& pair = block->pairs[pair_index];
 				const bool canonical_append = pair.fmac_pipe &&
-					(!block->local_fmac_pipeline || pair_index < LOCAL_FMAC_WARMUP_PAIRS);
+					(!block->local_fmac_pipeline ||
+					 pair_index < block->local_fmac_start_pair);
 				if (!canonical_append)
 					continue;
 
@@ -881,20 +984,23 @@ namespace VitaVU
 					for (u32 scan = previous_pair + 1; scan <= pair_index; scan++)
 					{
 						const PairPlan& intervening = block->pairs[scan];
-						working_flag_writes |=
-							intervening.uregs.VIwrite | intervening.lregs.VIwrite;
 						// PCSX2's working MAC/STATUS instances are private FMAC
 						// state, not exhaustively represented by _VURegsNum::VIwrite.
 						// These are the exact admitted upper classes which compute
 						// them. Lower FDIV and flag operations conservatively invalidate
 						// STATUS; only the CLIP word uses VIwrite ownership directly.
 						const bool upper_mac_status = intervening.add_upper_stalls &&
-							(intervening.upper_addsub_inline ||
-							 intervening.upper_mul_inline ||
-							 intervening.upper_maddmsub_inline ||
-							 intervening.upper_outer_inline);
-						mac_changed = mac_changed || upper_mac_status;
-						status_changed = status_changed || upper_mac_status ||
+							ProducesInlineMacStatus(intervening);
+						u32 upper_flag_writes = intervening.uregs.VIwrite;
+						if (upper_mac_status && !intervening.mac_flag_result_required)
+							upper_flag_writes &= ~mac_write;
+						if (upper_mac_status && !intervening.status_flag_result_required)
+							upper_flag_writes &= ~status_write;
+						working_flag_writes |= upper_flag_writes | intervening.lregs.VIwrite;
+						mac_changed = mac_changed ||
+							(upper_mac_status && intervening.mac_flag_result_required);
+						status_changed = status_changed ||
+							(upper_mac_status && intervening.status_flag_result_required) ||
 							intervening.lower_fdiv_inline || intervening.lower_flag_inline;
 					}
 					if ((working_flag_writes & clip_write) == 0)
@@ -1028,19 +1134,25 @@ namespace VitaVU
 			if (regs.VFread0 == 0 && regs.VFread1 == 0)
 				return false;
 
-			// Local-FMAC blocks retain their established split: pairs 0..3 are
-			// canonical, while later writers are tested by the private pipeline.
+			// Ordinary local-FMAC blocks retain their established four-pair
+			// canonical warmup. A dispatcher-proven empty entry has no inherited
+			// canonical writer and owns every new writer in the private pipeline.
 			if (block.local_fmac_pipeline)
-				return pair_index >= LOCAL_FMAC_CANONICAL_STALL_MATURE_PAIR;
+				return block.entry_pipes_empty ||
+					pair_index >= block.local_fmac_start_pair +
+						FMAC_PIPELINE_LATENCY_CYCLES - 1;
 
 			// Sony's FMAC latency is exactly four cycles. EmitPair() increments
 			// the cycle before this test, so after three earlier pairs every
 			// entry inherited at the block seam is at least four cycles old.
 			// Stalls can only make it older. Of this block's own canonical
 			// writers, only the preceding three issue slots can still be busy.
-			if (pair_index < FMAC_PIPELINE_LATENCY_CYCLES - 1)
+			if (!block.entry_pipes_empty &&
+				pair_index < FMAC_PIPELINE_LATENCY_CYCLES - 1)
 				return false;
-			for (u32 writer_index = pair_index - (FMAC_PIPELINE_LATENCY_CYCLES - 1);
+			const u32 first_writer = pair_index >= FMAC_PIPELINE_LATENCY_CYCLES - 1 ?
+				pair_index - (FMAC_PIPELINE_LATENCY_CYCLES - 1) : 0u;
+			for (u32 writer_index = first_writer;
 				writer_index < pair_index; writer_index++)
 			{
 				const PairPlan& writer = block.pairs[writer_index];
@@ -1048,12 +1160,6 @@ namespace VitaVU
 					return false;
 			}
 			return true;
-		}
-
-		bool ProducesInlineMacStatus(const PairPlan& pair)
-		{
-			return pair.upper_addsub_inline || pair.upper_mul_inline ||
-				pair.upper_maddmsub_inline || pair.upper_outer_inline;
 		}
 
 		bool ReadsArchitecturalMacFlag(const PairPlan& pair)
@@ -1072,6 +1178,29 @@ namespace VitaVU
 					return true;
 				default:
 					return false;
+			}
+		}
+
+		bool ReadsArchitecturalStatusFlag(const PairPlan& pair)
+		{
+			if (!pair.exec_lower)
+				return false;
+
+			// PCSX2 owner: microVU_Analyze.inl::mVUanalyzeSflag() and
+			// mVUanalyzeFSSET(). An S-flag instruction targeting VI0 is a NOP;
+			// FSSET still consumes the current non-sticky STATUS bits while
+			// replacing the sticky field.
+			switch (static_cast<VUInterpFast::LowerFastKind>(pair.lower_kind))
+			{
+				case VUInterpFast::LowerFastKind::FSEQ:
+				case VUInterpFast::LowerFastKind::FSAND:
+				case VUInterpFast::LowerFastKind::FSOR:
+					return VUInterpFast::It(pair.lower) != 0;
+				case VUInterpFast::LowerFastKind::FSSET:
+					return true;
+				default:
+					return ((pair.uregs.VIread | pair.lregs.VIread) &
+						(1u << REG_STATUS_FLAG)) != 0;
 			}
 		}
 
@@ -1143,7 +1272,7 @@ namespace VitaVU
 			// four-cycle queue instance reconstructed at the generated-code seam.
 			mark_visible_window(block->pair_count, true);
 
-			for (u32 i = LOCAL_FMAC_WARMUP_PAIRS; i < block->pair_count; i++)
+			for (u32 i = block->local_fmac_start_pair; i < block->pair_count; i++)
 			{
 				PairPlan& pair = block->pairs[i];
 				if (!required[i] && CanSnapshotLocalFmacFlagsAtProducer(pair) &&
@@ -1401,6 +1530,53 @@ namespace VitaVU
 					plan->add_lower_stalls = false;
 					break;
 			}
+
+			// Performance-tier contract: Sony VU User Manual 3.4.1/3.4.4-3.4.7
+			// defines the implicit FMAC data, FDIV/EFU resource, and branch-after-
+			// IALU interlocks. Correctly scheduled VU1 microcode has already left
+			// those producer/consumer distances, so their runtime max-cycle walks
+			// cannot change architectural state. WAITQ and WAITP are different:
+			// sections 3.1.5/3.1.7 require those explicit instructions to synchronize
+			// Q/P, and their bodies are otherwise NOPs. Keep their lower stall tests.
+			//
+			// Producer queues with architectural results or delayed flags also stay
+			// exact. The IALU queue is the sole exception: PCSX2 VUops.cpp only reads
+			// it from _vuTestALUStalls(), which this contract makes unreachable.
+			if (vu_index == 1 && EmuConfig.Speedhacks.vu1AssumeScheduled)
+			{
+				const auto lower_kind =
+					static_cast<VUInterpFast::LowerFastKind>(plan->lower_kind);
+				const bool explicit_qp_wait = plan->exec_lower &&
+					(lower_kind == VUInterpFast::LowerFastKind::WAITQ ||
+						lower_kind == VUInterpFast::LowerFastKind::WAITP);
+				plan->scheduled_upper_stall_test_elided = plan->test_upper_stalls;
+				plan->scheduled_lower_stall_test_elided =
+					plan->test_lower_stalls && !explicit_qp_wait;
+				plan->scheduled_ialu_producer_elided =
+					plan->add_lower_stalls && plan->lregs.pipe == VUPIPE_IALU;
+				plan->scheduled_vi_backup_write_elided = plan->vi_backup_write;
+				plan->test_upper_stalls = false;
+				if (!explicit_qp_wait)
+					plan->test_lower_stalls = false;
+				if (plan->scheduled_ialu_producer_elided)
+					plan->add_lower_stalls = false;
+				if (plan->scheduled_vi_backup_write_elided)
+					plan->vi_backup_write = false;
+			}
+
+			// Performance-tier Instant Q/P keeps the exact FDIV/EFU arithmetic but
+			// makes its result architectural in the producer pair. There is no
+			// pending resource to test, wait for, snapshot, or append afterward.
+			// Sony VU User Manual 3.4.5/3.4.6 defines the intentionally relaxed
+			// behavior: an ordinary early Q/P read would otherwise see the old value.
+			if (vu_index == 1 && EmuConfig.Speedhacks.vu1InstantQP &&
+				(plan->lregs.pipe == VUPIPE_FDIV || plan->lregs.pipe == VUPIPE_EFU))
+			{
+				plan->instant_qp_producer = plan->add_lower_stalls;
+				plan->instant_qp_wait = plan->test_lower_stalls && !plan->add_lower_stalls;
+				plan->test_lower_stalls = false;
+				plan->add_lower_stalls = false;
+			}
 			plan->lower_stall_inline = plan->add_lower_stalls &&
 				(plan->lregs.pipe == VUPIPE_FMAC ||
 					plan->lregs.pipe == VUPIPE_IALU ||
@@ -1418,10 +1594,279 @@ namespace VitaVU
 				plan->lregs.pipe == VUPIPE_FMAC;
 
 			plan->fmac_pipe = (plan->uregs.pipe == VUPIPE_FMAC) || (plan->lregs.pipe == VUPIPE_FMAC);
+			plan->scheduled_fmac_hazard_metadata_elided =
+				vu_index == 1 && EmuConfig.Speedhacks.vu1AssumeScheduled && plan->fmac_pipe;
 			// _vuTestPipes() can be skipped whenever the runtime pipe-ready
 			// guard proves every PCSX2 flush arm would be side-effect-free.
 			plan->test_pipes_fast_guard = true;
 			return true;
+		}
+
+		u8 ProbeMvuFlagReaders(const u8* micro, u32 vu_index, u32 prog_size,
+			u32 prog_mask, u32 pc, u32 remaining_pairs)
+		{
+			constexpr u8 NEED_STATUS = 1u << 0;
+			constexpr u8 NEED_MAC = 1u << 1;
+			if (remaining_pairs == 0)
+				return 0;
+			pc &= prog_mask;
+			if (pc + 8 > prog_size)
+				return NEED_STATUS | NEED_MAC;
+
+			u32 lower;
+			u32 upper;
+			std::memcpy(&lower, &micro[pc], sizeof(lower));
+			std::memcpy(&upper, &micro[pc + 4], sizeof(upper));
+			PairPlan pair{};
+			if (!AnalyzePair(vu_index, pc, upper, lower, &pair))
+				return NEED_STATUS | NEED_MAC;
+
+			u8 need = ReadsArchitecturalStatusFlag(pair) ? NEED_STATUS : 0;
+			need |= ReadsArchitecturalMacFlag(pair) ? NEED_MAC : 0;
+			if (remaining_pairs == 1 || need == (NEED_STATUS | NEED_MAC))
+				return need;
+
+			const auto kind = static_cast<VUInterpFast::LowerFastKind>(pair.lower_kind);
+			if (pair.exec_lower &&
+				(kind == VUInterpFast::LowerFastKind::JR ||
+				 kind == VUInterpFast::LowerFastKind::JALR))
+			{
+				// PCSX2 mVUsetFlagInfo() requires exact incoming flag state for an
+				// unresolved indirect successor.
+				return NEED_STATUS | NEED_MAC;
+			}
+
+			const u32 sequential_pc = (pc + 8) & prog_mask;
+			need |= ProbeMvuFlagReaders(micro, vu_index, prog_size, prog_mask,
+				sequential_pc, remaining_pairs - 1);
+			if (pair.exec_lower && IsImmediateBranchKind(kind))
+			{
+				// This deliberately probes both the delay-slot stream and target.
+				// It can retain one more producer than upstream's exact control-flow
+				// pass, but never drops an instance visible in the first four pairs.
+				need |= ProbeMvuFlagReaders(micro, vu_index, prog_size, prog_mask,
+					StaticBranchTargetPc(pc, lower, prog_mask), remaining_pairs - 1);
+			}
+			return need;
+		}
+
+		void AnalyzeCompatibleMacFlagInstances(const u8* micro, u32 vu_index,
+			u32 prog_size, u32 prog_mask, BlockPlan* block)
+		{
+			if (vu_index != 1 || !EmuConfig.Speedhacks.vuFlagHack)
+			{
+				return;
+			}
+			if (!block->local_fmac_pipeline)
+			{
+				// Canonical queue entries always publish their stored MAC word in
+				// VUops.cpp::_vuFMACflush(), even when flagreg has no MAC bit. A
+				// stale compatible instance is therefore safe only in a block with no
+				// externally observable completion/transfer seam. Branches remain
+				// internal control flow and are covered by the successor probe below.
+				for (u32 i = 0; i < block->pair_count; i++)
+				{
+					const PairPlan& pair = block->pairs[i];
+					if (pair.ebit || pair.dflag || pair.tflag || pair.lower_xgkick_inline)
+						return;
+				}
+			}
+
+			// PCSX2 microVU_Flags.inl::mVUsetFlags() forces the final four
+			// delayed MAC instances only when mVUsetFlagInfo() finds an FMxx reader
+			// in the successor's first four instructions. Otherwise the allocator
+			// carries one newest working instance and does not preserve the older
+			// seam-only instances. Keep Vita's exact internal-reader liveness and
+			// collapse only that unobserved block-seam suffix. For the canonical
+			// queue, dead producers snapshot the unchanged incoming working MAC;
+			// FIFO retirement can expose it only until a liveness-retained producer
+			// publishes the exact newest observable value.
+			constexpr u8 NEED_MAC = 1u << 1;
+			u8 successor_need = 0;
+			bool has_static_successor = false;
+			if (block->continues_logical_block_if_busy)
+			{
+				has_static_successor = true;
+				const u32 next_pc =
+					(block->start_pc + block->pair_count * 8) & prog_mask;
+				successor_need |= ProbeMvuFlagReaders(micro, vu_index, prog_size,
+					prog_mask, next_pc, FMAC_PIPELINE_LATENCY_CYCLES);
+			}
+			else
+			{
+				for (const DirectLinkPlan& link : block->direct_links)
+				{
+					if (!link.valid)
+						continue;
+					has_static_successor = true;
+					if (link.runtime_observed)
+						return;
+					successor_need |= ProbeMvuFlagReaders(micro, vu_index, prog_size,
+						prog_mask, link.target_pc, FMAC_PIPELINE_LATENCY_CYCLES);
+				}
+			}
+			if (!has_static_successor || (successor_need & NEED_MAC) != 0)
+				return;
+
+			std::array<bool, MAX_BLOCK_PAIRS> internally_required{};
+			const auto mark_visible_window = [&](u32 observer_pair) {
+				s32 newest_guaranteed = -1;
+				for (u32 i = 0; i < observer_pair; i++)
+				{
+					if (ProducesInlineMacStatus(block->pairs[i]) &&
+						i + FMAC_PIPELINE_LATENCY_CYCLES <= observer_pair)
+					{
+						newest_guaranteed = static_cast<s32>(i);
+					}
+				}
+				const u32 first = newest_guaranteed >= 0 ?
+					static_cast<u32>(newest_guaranteed) : observer_pair;
+				for (u32 i = first; i < observer_pair; i++)
+				{
+					if (ProducesInlineMacStatus(block->pairs[i]))
+						internally_required[i] = true;
+				}
+			};
+
+			s32 newest_producer = -1;
+			for (u32 observer = 0; observer < block->pair_count; observer++)
+			{
+				if (ProducesInlineMacStatus(block->pairs[observer]))
+					newest_producer = static_cast<s32>(observer);
+				if (ReadsArchitecturalMacFlag(block->pairs[observer]))
+					mark_visible_window(observer);
+				if (block->pairs[observer].upper_outer_inline)
+				{
+					for (u32 i = observer; i > 0; i--)
+					{
+						if (ProducesInlineMacStatus(block->pairs[i - 1]))
+						{
+							internally_required[i - 1] = true;
+							break;
+						}
+					}
+				}
+			}
+			if (newest_producer >= 0)
+				internally_required[static_cast<u32>(newest_producer)] = true;
+
+			const u32 first_candidate = block->local_fmac_pipeline ?
+				block->local_fmac_start_pair : 0u;
+			for (u32 i = first_candidate; i < block->pair_count; i++)
+			{
+				PairPlan& pair = block->pairs[i];
+				if (pair.mac_flag_result_required && !internally_required[i] &&
+					CanSnapshotLocalFmacFlagsAtProducer(pair) &&
+					!pair.upper_outer_inline && !IsMaddMsubAliasFlagPath(pair))
+				{
+					pair.mac_flag_result_required = false;
+					block->mac_flag_classification_elisions++;
+					block->canonical_mac_flag_classification_elisions +=
+						block->local_fmac_pipeline ? 0u : 1u;
+				}
+			}
+		}
+
+		void AnalyzeMvuFlagHack(const u8* micro, u32 vu_index, u32 prog_size,
+			u32 prog_mask, BlockPlan* block)
+		{
+			if (vu_index != 1 || !EmuConfig.Speedhacks.vuFlagHack)
+				return;
+
+			block->mvu_flag_hack = true;
+			for (u32 i = 0; i < block->pair_count; i++)
+			{
+				if (ProducesInlineMacStatus(block->pairs[i]))
+					block->pairs[i].status_flag_result_required = false;
+			}
+
+			const auto retain_previous_status_instances = [&](u32 observer_pair) {
+				u32 retained = 0;
+				for (u32 i = observer_pair; i > 0 && retained < FMAC_PIPELINE_LATENCY_CYCLES; i--)
+				{
+					PairPlan& producer = block->pairs[i - 1];
+					if (!ProducesInlineMacStatus(producer))
+						continue;
+					producer.status_flag_result_required = true;
+					retained++;
+				}
+			};
+			const auto retain_status_reader_window = [&](u32 observer_pair) {
+				// Sony VU User Manual 3.4.4 fixes FMAC visibility at four cycles.
+				// The newest producer at least four pair positions old is therefore
+				// visible; runtime dependency stalls can additionally expose any
+				// younger producer. This is the same bounded suffix PCSX2's flagSet()
+				// derives with its cycle counter, without retaining unrelated sparse
+				// producers merely because they are among the last four calculations.
+				s32 newest_guaranteed = -1;
+				for (u32 i = 0; i < observer_pair; i++)
+				{
+					if (ProducesInlineMacStatus(block->pairs[i]) &&
+						i + FMAC_PIPELINE_LATENCY_CYCLES <= observer_pair)
+					{
+						newest_guaranteed = static_cast<s32>(i);
+					}
+				}
+				const u32 first = newest_guaranteed >= 0 ?
+					static_cast<u32>(newest_guaranteed) : 0u;
+				for (u32 i = first; i < observer_pair; i++)
+				{
+					if (ProducesInlineMacStatus(block->pairs[i]))
+						block->pairs[i].status_flag_result_required = true;
+				}
+			};
+
+			for (u32 observer = 0; observer < block->pair_count; observer++)
+			{
+				if (ReadsArchitecturalStatusFlag(block->pairs[observer]))
+					retain_status_reader_window(observer);
+				// Upstream mVUstatusFlagOp() makes the current upper STATUS
+				// non-sticky result live when a paired FSSET consumes and replaces
+				// its sticky field. Other S-flag readers are swapped before the upper
+				// operation and therefore only retain older instances above.
+				if (ProducesInlineMacStatus(block->pairs[observer]) &&
+					static_cast<VUInterpFast::LowerFastKind>(
+						block->pairs[observer].lower_kind) ==
+						VUInterpFast::LowerFastKind::FSSET)
+				{
+					block->pairs[observer].status_flag_result_required = true;
+				}
+			}
+
+			constexpr u8 NEED_STATUS = 1u << 0;
+			u8 successor_need = 0;
+			if (block->continues_logical_block_if_busy)
+			{
+				const u32 next_pc = (block->start_pc + block->pair_count * 8) & prog_mask;
+				successor_need |= ProbeMvuFlagReaders(micro, vu_index, prog_size,
+					prog_mask, next_pc, FMAC_PIPELINE_LATENCY_CYCLES);
+			}
+			else
+			{
+				for (const DirectLinkPlan& link : block->direct_links)
+				{
+					if (!link.valid)
+						continue;
+					if (link.runtime_observed)
+						successor_need |= NEED_STATUS;
+					else
+						successor_need |= ProbeMvuFlagReaders(micro, vu_index, prog_size,
+							prog_mask, link.target_pc, FMAC_PIPELINE_LATENCY_CYCLES);
+				}
+			}
+			if ((successor_need & NEED_STATUS) != 0)
+				retain_previous_status_instances(block->pair_count);
+
+			for (u32 i = 0; i < block->pair_count; i++)
+			{
+				if (ProducesInlineMacStatus(block->pairs[i]) &&
+					!block->pairs[i].status_flag_result_required)
+				{
+					block->status_flag_classification_elisions++;
+					block->complete_flag_classification_elisions +=
+						block->pairs[i].mac_flag_result_required ? 0u : 1u;
+				}
+			}
 		}
 
 		bool IsVu0ConservativeUnsupportedPair(const PairPlan& plan)
@@ -1450,12 +1895,13 @@ namespace VitaVU
 		// a normal block or 1 for a one-pair pending-branch continuation.
 		bool ScanBlock(const u8* micro, u32 vu_index, u32 prog_size, u32 prog_mask,
 			bool conservative_vu0, u32 start_pc, bool entry_branch_tail,
-			bool entry_ebit_tail, BlockPlan* block)
+			bool entry_ebit_tail, bool entry_pipes_empty, BlockPlan* block)
 		{
 			block->start_pc = start_pc;
 			block->pair_count = 0;
 			block->entry_branch_tail = entry_branch_tail;
 			block->entry_ebit_tail = entry_ebit_tail;
+			block->entry_pipes_empty = entry_pipes_empty;
 			block->continues_logical_block_if_busy = false;
 			block->test_pipes_fast_guard_pairs = 0;
 			block->nop_pipe_test_defer_pairs = 0;
@@ -1490,10 +1936,30 @@ namespace VitaVU
 			block->vi_backup_update_elided_pairs = 0;
 			block->vi_backup_zero_store_pairs = 0;
 			block->dt_flag_inline_pairs = 0;
+			block->scheduled_upper_stall_tests_elided = 0;
+			block->scheduled_lower_stall_tests_elided = 0;
+			block->scheduled_ialu_producers_elided = 0;
+			block->scheduled_vi_backup_writes_elided = 0;
+			block->scheduled_fmac_hazard_metadata_pairs = 0;
+			block->scheduled_local_fmac_warmup_pairs_elided = 0;
+			block->scheduled_local_fmac_relative_cycle_pairs = 0;
+			block->instant_qp_producers = 0;
+			block->instant_qp_waits_elided = 0;
+			block->resident_working_fmac_fdiv_barriers = 0;
+			block->assume_scheduled_microcode =
+				!conservative_vu0 && EmuConfig.Speedhacks.vu1AssumeScheduled;
+			block->instant_qp =
+				!conservative_vu0 && EmuConfig.Speedhacks.vu1InstantQP;
 			block->mac_flag_classification_elisions = 0;
+			block->canonical_mac_flag_classification_elisions = 0;
+			block->mvu_flag_hack = false;
+			block->status_flag_classification_elisions = 0;
+			block->complete_flag_classification_elisions = 0;
 			block->resident_cycle = false;
 			block->resident_cycle_high = false;
 			block->resident_pipe_activity = false;
+			block->local_fmac_pipeline = false;
+			block->local_fmac_start_pair = LOCAL_FMAC_WARMUP_PAIRS;
 			block->direct_link_tail = false;
 			block->direct_links = {};
 
@@ -1524,6 +1990,18 @@ namespace VitaVU
 				{
 					resident_cycle = false;
 				}
+				block->scheduled_upper_stall_tests_elided +=
+					plan.scheduled_upper_stall_test_elided ? 1u : 0u;
+				block->scheduled_lower_stall_tests_elided +=
+					plan.scheduled_lower_stall_test_elided ? 1u : 0u;
+				block->scheduled_ialu_producers_elided +=
+					plan.scheduled_ialu_producer_elided ? 1u : 0u;
+				block->scheduled_vi_backup_writes_elided +=
+					plan.scheduled_vi_backup_write_elided ? 1u : 0u;
+				block->scheduled_fmac_hazard_metadata_pairs +=
+					plan.scheduled_fmac_hazard_metadata_elided ? 1u : 0u;
+				block->instant_qp_producers += plan.instant_qp_producer ? 1u : 0u;
+				block->instant_qp_waits_elided += plan.instant_qp_wait ? 1u : 0u;
 				if (plan.test_pipes_fast_guard)
 					block->test_pipes_fast_guard_pairs++;
 				if (plan.fmac_pipe)
@@ -1665,15 +2143,38 @@ namespace VitaVU
 			if (block->pair_count != 0)
 			{
 				const PairPlan& last = block->pairs[block->pair_count - 1];
+				// A successful scan can stop without reaching a PS2-visible boundary
+				// only at this emitter's bounded pair/code-memory span. Decode rejection is
+				// deliberately excluded: its next pair belongs to the interpreter.
+				const bool emitter_span_continuation = !last.ends_block &&
+					(block->pair_count == MAX_BLOCK_PAIRS || pc >= prog_size);
 				block->continues_logical_block_if_busy = !last.ends_block ||
 					(!last.resolves_branch && (last.dflag || last.tflag));
-				block->direct_link_tail = !block->continues_logical_block_if_busy &&
-					!conservative_vu0 && !last.dflag && !last.tflag &&
-					!(last.ebit_tail && last.ebit_store == 0);
+				block->direct_link_tail = !conservative_vu0 &&
+					((emitter_span_continuation && !last.dflag && !last.tflag) ||
+					 (!block->continues_logical_block_if_busy &&
+					  !last.dflag && !last.tflag &&
+					  !(last.ebit_tail && last.ebit_store == 0)));
 				if (block->direct_link_tail)
 				{
 					const bool target_ebit_tail = last.ebit_tail && last.ebit_store != 0;
-					if (!last.branch_tail)
+					if (emitter_span_continuation)
+					{
+						// This boundary exists only because Vita bounds a generated fragment.
+						// It is not microVU's mVUtestCycles() boundary: carry the
+						// current admission through the ordinary compatible linked entry.
+						block->direct_links[0] = {
+							true,
+							false,
+							false,
+							0,
+							(block->start_pc + block->pair_count * 8) & prog_mask,
+							last.branch_tail,
+							target_ebit_tail,
+							true,
+						};
+					}
+					else if (!last.branch_tail)
 					{
 						block->direct_links[0] = {
 							true,
@@ -1729,7 +2230,23 @@ namespace VitaVU
 				}
 
 				block->local_fmac_pipeline = !conservative_vu0 && CanUseLocalFmacPipeline(*block);
-				AnalyzeCanonicalFmacSameSlotReuse(block);
+				block->local_fmac_start_pair = block->local_fmac_pipeline ?
+					static_cast<u8>(LocalFmacStartPair(*block)) : LOCAL_FMAC_WARMUP_PAIRS;
+				if (block->local_fmac_pipeline && block->assume_scheduled_microcode &&
+					!block->entry_pipes_empty)
+				{
+					// Sony fixes FMAC visibility at four cycles and every pair consumes at
+					// least one. The canonical publisher therefore drains every inherited
+					// entry during these four pairs while the private queue records new
+					// entries independently. Count the canonical appends removed here.
+					const u32 warmup_end = std::min(block->pair_count,
+						LOCAL_FMAC_WARMUP_PAIRS);
+					for (u32 i = 0; i < warmup_end; i++)
+					{
+						block->scheduled_local_fmac_warmup_pairs_elided +=
+							block->pairs[i].fmac_pipe ? 1u : 0u;
+					}
+				}
 				// The canonical empty-pipe guard is five loads plus four ORRs and a
 				// branch at every pair. A resident block pays one exact five-field
 				// refresh at entry, then CMP+BLNE per guard. Three guards recover the
@@ -1763,7 +2280,8 @@ namespace VitaVU
 				}
 				if (block->local_fmac_pipeline)
 				{
-					for (u32 i = LOCAL_FMAC_WARMUP_PAIRS; i < block->pair_count; i++)
+					for (u32 i = block->local_fmac_start_pair;
+						i < block->pair_count; i++)
 					{
 						PairPlan& pair = block->pairs[i];
 						if (!pair.fmac_pipe)
@@ -1788,7 +2306,27 @@ namespace VitaVU
 								(reader.test_upper_stalls &&
 									FmacWriterConflicts(pair, reader.uregs)) ||
 								(reader.test_lower_stalls &&
-									FmacWriterConflicts(pair, reader.lregs));
+								FmacWriterConflicts(pair, reader.lregs));
+						}
+						if (needs_cycle_snapshot && block->assume_scheduled_microcode &&
+							i + FMAC_PIPELINE_LATENCY_CYCLES >= block->pair_count)
+						{
+							// In this tier only an explicit WAITQ/WAITP can add cycles. If
+							// none follows, every remaining pair advances exactly one and the
+							// seam can reconstruct sCycle from its 64-bit cycle minus age.
+							bool wait_follows = false;
+							for (u32 follower = i + 1;
+								follower < block->pair_count; follower++)
+							{
+								wait_follows = wait_follows ||
+									block->pairs[follower].test_lower_stalls;
+							}
+							if (!wait_follows)
+							{
+								pair.scheduled_local_fmac_relative_cycle = true;
+								needs_cycle_snapshot = false;
+								block->scheduled_local_fmac_relative_cycle_pairs++;
+							}
 						}
 						pair.local_fmac_cycle_snapshot = needs_cycle_snapshot;
 						block->local_fmac_cycle_snapshot_elision_pairs +=
@@ -1811,21 +2349,20 @@ namespace VitaVU
 						block->local_fmac_producer_snapshot_pairs >= 2;
 					if (block->resident_working_fmac_flags)
 					{
-						// DIV/SQRT/RSQRT update the working status bits immediately and
-						// therefore still use the canonical VURegs representation. The
-						// architectural delayed STATUS/MAC residency above remains valid.
+						// DIV/SQRT/RSQRT update only the working STATUS D/I domain. EmitPair()
+						// materializes the current private MAC/STATUS owner at that exact pair,
+						// lets the FDIV body mutate canonical working STATUS, then resumes
+						// residency from the pair's local snapshot. Do not abandon residency
+						// for all the unrelated FMAC producers in this block.
 						for (u32 i = 0; i < block->pair_count; i++)
 						{
 							if (block->pairs[i].lower_fdiv_inline)
-							{
-								block->resident_working_fmac_flags = false;
-								break;
-							}
+								block->resident_working_fmac_fdiv_barriers++;
 						}
 					}
 					if (block->deferred_fmac_flags)
 					{
-						for (u32 i = LOCAL_FMAC_WARMUP_PAIRS;
+						for (u32 i = block->local_fmac_start_pair;
 							i + FMAC_PIPELINE_LATENCY_CYCLES < block->pair_count; i++)
 						{
 							const PairPlan& pair = block->pairs[i];
@@ -1861,6 +2398,39 @@ namespace VitaVU
 					block->deferred_fmac_flags =
 						block->deferred_fmac_flag_retirements >= 4 &&
 						CanDeferFmacFlags(*block);
+				}
+
+				// Compose PCSX2's compatible STATUS hack with the exact local/canonical
+				// pipe plans above. Accurate mode never enters this analysis.
+				AnalyzeCompatibleMacFlagInstances(micro, vu_index, prog_size,
+					prog_mask, block);
+				AnalyzeMvuFlagHack(micro, vu_index, prog_size, prog_mask, block);
+				// Same-slot reuse consumes the final STATUS/MAC liveness decisions.
+				// Under the compatible hack a suppressed STATUS producer leaves that
+				// queue suffix unchanged, so the Cortex-A9 need not reload or republish it.
+				AnalyzeCanonicalFmacSameSlotReuse(block);
+
+				// The empty-entry map is selected only from the completion/SetStartPC
+				// lifecycle proof that all five canonical pipes are empty. Private FMAC
+				// entries are retired separately and do not make _vuTestPipes()
+				// observable. Omit the guard until this block creates its first pipe.
+				if (block->entry_pipes_empty)
+				{
+					bool canonical_pipe_may_be_active = false;
+					for (u32 i = 0; i < block->pair_count; i++)
+					{
+						PairPlan& pair = block->pairs[i];
+						pair.test_pipes_proven_empty =
+							!canonical_pipe_may_be_active;
+						const bool canonical_fmac_append = pair.fmac_pipe &&
+							(!block->local_fmac_pipeline ||
+							 i < block->local_fmac_start_pair);
+						const bool other_pipe_append = pair.add_lower_stalls &&
+							pair.lregs.pipe != VUPIPE_FMAC;
+						canonical_pipe_may_be_active = canonical_pipe_may_be_active ||
+							canonical_fmac_append || other_pipe_append ||
+							pair.lower_xgkick_inline;
+					}
 				}
 
 				for (u32 i = 0; i < block->pair_count; i++)
@@ -2032,6 +2602,7 @@ namespace VitaVU
 				bool target_ebit_tail = false;
 				size_t unlinked_fallback_offset = static_cast<size_t>(-1);
 				size_t target_offset = static_cast<size_t>(-1);
+				size_t cycle_publish_target_offset = static_cast<size_t>(-1);
 				size_t fallback_offset = static_cast<size_t>(-1);
 				size_t guard_tpc_offset = static_cast<size_t>(-1);
 				size_t helper_slot_offset = static_cast<size_t>(-1);
@@ -2044,6 +2615,11 @@ namespace VitaVU
 				size_t deferred_fmac = static_cast<size_t>(-1);
 				size_t resident_pipe = static_cast<size_t>(-1);
 				size_t resident_pipe_deferred_fmac = static_cast<size_t>(-1);
+				size_t resident_cycle = static_cast<size_t>(-1);
+				size_t resident_cycle_deferred_fmac = static_cast<size_t>(-1);
+				size_t resident_cycle_resident_pipe = static_cast<size_t>(-1);
+				size_t resident_cycle_resident_pipe_deferred_fmac =
+					static_cast<size_t>(-1);
 			};
 
 			const void* LookupVu1DirectLinkBlockScalar(VURegs* vu, Vu1DirectLinkSlot* runtime_link);
@@ -2164,6 +2740,8 @@ namespace VitaVU
 				const size_t body_offset = m_code.Size();
 				if (!EmitPreloadVectorCache())
 					return false;
+				if (!EmitEntryBudgetCheck())
+					return false;
 
 				for (u32 i = 0; i < m_plan.pair_count;)
 				{
@@ -2179,9 +2757,13 @@ namespace VitaVU
 					}
 					if (nop_run_end - i >= 2)
 					{
-						if (!EmitEmptyPipeNopRun(i, nop_run_end - i))
+						// EmitAdvanceAdditionalNopCycles() deliberately uses one A32
+						// immediate. Long host fragments therefore retain the existing
+						// <=64-pair fast-forward unit and chain multiple exact units.
+						const u32 batch_pairs = std::min<u32>(64, nop_run_end - i);
+						if (!EmitEmptyPipeNopRun(i, batch_pairs))
 							return false;
-						i = nop_run_end;
+						i += batch_pairs;
 						continue;
 					}
 					if (!EmitPair(i))
@@ -2215,8 +2797,12 @@ namespace VitaVU
 				// seam. PCSX2 owner: x86/microVU_IR.h::microRegAlloc::flushAll().
 				if (!EmitFlushVectorCache())
 					return false;
-				if (!EmitPublishResidentFmacCount() ||
-					!EmitPublishResidentCycle())
+				// A direct link publishes neither resident cycle nor FMAC state here.
+				// Compatible targets carry it in r5:r9/r10. An incompatible patched edge
+				// uses its source-local publication slots, and the unlinked lookup helper
+				// publishes both before returning a canonical target or the dispatcher.
+				if (!m_plan.direct_link_tail &&
+					(!EmitPublishResidentCycle() || !EmitPublishResidentFmacCount()))
 					return false;
 
 				// Fall-through: every pair executed. If the next block is
@@ -2279,22 +2865,26 @@ namespace VitaVU
 				// limit pair in EmitLinkedEntry(); the reverse transition installs
 				// r6/r7 from canonical VURegs exactly as before.
 				m_linked_entries.deferred_fmac = m_code.Size();
-				if (!EmitLinkedEntry(body_offset, true, false))
+				if (!EmitLinkedEntry(body_offset, true, false,
+						&m_linked_entries.resident_cycle_deferred_fmac))
 					return false;
 				if (UsesResidentPipeActivity())
 				{
 					m_linked_entries.resident_pipe_deferred_fmac = m_code.Size();
-					if (!EmitLinkedEntry(body_offset, true, true))
+					if (!EmitLinkedEntry(body_offset, true, true,
+							&m_linked_entries.resident_cycle_resident_pipe_deferred_fmac))
 						return false;
 				}
 
 				m_linked_entries.normal = m_code.Size();
-				if (!EmitLinkedEntry(body_offset, false, false))
+				if (!EmitLinkedEntry(body_offset, false, false,
+						&m_linked_entries.resident_cycle))
 					return false;
 				if (UsesResidentPipeActivity())
 				{
 					m_linked_entries.resident_pipe = m_code.Size();
-					if (!EmitLinkedEntry(body_offset, false, true))
+					if (!EmitLinkedEntry(body_offset, false, true,
+							&m_linked_entries.resident_cycle_resident_pipe))
 						return false;
 				}
 
@@ -2308,6 +2898,21 @@ namespace VitaVU
 			u32 GetNormalizedOperandQuadBypasses() const { return m_normalized_operand_quad_bypasses; }
 			u32 GetNormalizationInstructionsRemoved() const { return m_normalization_instructions_removed; }
 			u32 GetSingleDBroadcastOperands() const { return m_single_d_broadcast_operands; }
+			u32 GetNearestNeonFmacOps() const { return m_nearest_neon_fmac_ops; }
+			u32 GetNearestNeonScalarOpsRemoved() const { return m_nearest_neon_scalar_ops_removed; }
+			u32 GetNearestNeonConversionOps() const { return m_nearest_neon_conversion_ops; }
+			u32 GetNearestNeonConversionScalarOpsRemoved() const
+			{
+				return m_nearest_neon_conversion_scalar_ops_removed;
+			}
+			u32 GetNearestNeonHalfOps() const { return m_nearest_neon_half_ops; }
+			u32 GetNearestNeonEfuOps() const { return m_nearest_neon_efu_ops; }
+			u32 GetNearestNeonEfuScalarOpsRemoved() const
+			{
+				return m_nearest_neon_efu_scalar_ops_removed;
+			}
+			u32 GetApproximateQOps() const { return m_approximate_q_ops; }
+			u32 GetApproximatePOps() const { return m_approximate_p_ops; }
 
 			static VectorCacheOpportunity AnalyzeVectorCacheOpportunity(
 				std::vector<VectorAccessEvent>* events, bool outer_frame_already_required)
@@ -2424,10 +3029,28 @@ namespace VitaVU
 				};
 
 			bool EmitLinkedEntry(size_t body_offset, bool deferred_values_resident,
-				bool pipe_aggregate_resident)
+				bool pipe_aggregate_resident, size_t* resident_cycle_entry)
 			{
 				if (pipe_aggregate_resident && !UsesResidentPipeActivity())
 					return false;
+				if (resident_cycle_entry)
+					*resident_cycle_entry = static_cast<size_t>(-1);
+
+				// A compatible direct-link source already owns the exact target-required
+				// cycle words in r5[:r9]. Give that edge an interior entry immediately
+				// after the canonical reloads. This mirrors microVU's pStateEnd link-state
+				// contract without duplicating a target thunk or issuing target-side
+				// VURegs cycle loads.
+				if (m_resident_cycle &&
+					(!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
+							VuOffset(offsetof(VURegs, cycle))) ||
+					 (m_resident_cycle_high &&
+						 !m_code.EmitLdrImm12(HOST_CYCLE_HI, HOST_VU,
+							 VuOffset(offsetof(VURegs, cycle) + 4)))))
+				{
+					return false;
+				}
+				const size_t cycle_values_resident_offset = m_code.Size();
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				u32* const entry_counter = deferred_values_resident ?
@@ -2478,15 +3101,6 @@ namespace VitaVU
 				{
 					return false;
 				}
-				if (m_resident_cycle &&
-					(!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
-							VuOffset(offsetof(VURegs, cycle))) ||
-					 (m_resident_cycle_high &&
-						 !m_code.EmitLdrImm12(HOST_CYCLE_HI, HOST_VU,
-							 VuOffset(offsetof(VURegs, cycle) + 4)))))
-				{
-					return false;
-				}
 				// The source and target both opt into the same generated r10 ABI. The
 				// source's canonicalization leaves its exact fmaccount in bits [2:0]
 				// and the zero/nonzero aggregate of every other pipe above bit 7.
@@ -2496,8 +3110,43 @@ namespace VitaVU
 					return false;
 
 				const size_t linked_to_body = m_code.EmitBranchPlaceholder();
-				return linked_to_body != static_cast<size_t>(-1) &&
-					m_code.PatchBranch(linked_to_body, body_offset);
+				if (linked_to_body == static_cast<size_t>(-1) ||
+					!m_code.PatchBranch(linked_to_body, body_offset))
+				{
+					return false;
+				}
+
+				if (!m_resident_cycle || !resident_cycle_entry)
+					return true;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+				// Validation-only detour proves that compatible links execute the carried
+				// cycle entry. Product builds point straight at the shared interior label.
+				*resident_cycle_entry = m_code.Size();
+				if (!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitResidentCycleLinkedEntries))) ||
+					!m_code.EmitLdrImm12(1, 0, 0) ||
+					!m_code.EmitAddImm8(1, 1, 1) ||
+					!m_code.EmitStrImm12(1, 0, 0))
+				{
+					return false;
+				}
+				if (m_resident_cycle_high &&
+					(!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+							&g_qemuVuJitResidentCycleHighLinkedEntries))) ||
+					 !m_code.EmitLdrImm12(1, 0, 0) ||
+					 !m_code.EmitAddImm8(1, 1, 1) ||
+					 !m_code.EmitStrImm12(1, 0, 0)))
+				{
+					return false;
+				}
+				const size_t cycle_to_common = m_code.EmitBranchPlaceholder();
+				return cycle_to_common != static_cast<size_t>(-1) &&
+					m_code.PatchBranch(cycle_to_common, cycle_values_resident_offset);
+#else
+				*resident_cycle_entry = cycle_values_resident_offset;
+				return true;
+#endif
 			}
 
 			bool UsesResidentPipeActivity() const
@@ -2509,6 +3158,8 @@ namespace VitaVU
 			{
 				if (!UsesResidentPipeActivity())
 					return true;
+				if (m_plan.entry_pipes_empty)
+					return m_code.EmitMovImm8(HOST_STALL_SCRATCH, 0);
 
 				// PCSX2 owner: VUops.cpp::_vuTestPipes() and microVU's mVUregs
 				// pipeline state. Preserve exact fmaccount in low bits; shift every
@@ -2584,20 +3235,26 @@ namespace VitaVU
 				if (!EmitRefreshResidentPipeActivity())
 					return false;
 
-				if (!m_resident_cycle)
-					return true;
+				if (m_resident_cycle)
+				{
+					// If static analysis proves no stall/XGKICK path can advance
+					// VU1.cycle beyond the modeled scheduling operations, keep its low
+					// word in r5. Eligible local-FMAC blocks also keep the high word in
+					// r9, forming an exact 64-bit r5:r9 cycle pair.
+					if (!m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
+							VuOffset(offsetof(VURegs, cycle))) ||
+						(m_resident_cycle_high &&
+							!m_code.EmitLdrImm12(HOST_CYCLE_HI, HOST_VU,
+								VuOffset(offsetof(VURegs, cycle) + 4))))
+					{
+						return false;
+					}
+				}
 
-				// If static analysis proves no stall/XGKICK path can advance
-				// VU1.cycle beyond the modeled scheduling operations, keep its low
-				// word in r5. Eligible local-FMAC blocks also keep the high word in
-				// r9, forming an exact 64-bit r5:r9 cycle pair. Admission still uses
-				// the exact 64-bit limit, so no redundant per-pair countdown is
-				// required.
-				return m_code.EmitLdrImm12(HOST_CYCLE_LO, HOST_VU,
-						VuOffset(offsetof(VURegs, cycle))) &&
-					(!m_resident_cycle_high ||
-						m_code.EmitLdrImm12(HOST_CYCLE_HI, HOST_VU,
-							VuOffset(offsetof(VURegs, cycle) + 4)));
+				// Entry admission is encoded in Z until EmitEntryBudgetCheck(): the
+				// public ABI enters with a zero accumulated count. Direct links set
+				// the same condition immediately before their target branch.
+				return m_code.EmitCmpImm32(HOST_EXEC_BASE, 0);
 			}
 
 			bool EmitEpilogue()
@@ -2721,6 +3378,23 @@ namespace VitaVU
 					m_code.EmitOrrImm32(0, 0, EXECUTED_PAIRS_LOGICAL_CONTINUATION));
 			}
 
+			bool EmitAccumulateExecutedPairsForLink(u32 executed_pairs,
+				bool admitted_logical_continuation)
+			{
+				// Ordinary targets must execute mVUtestCycles(), so use the existing
+				// positive pair-count ADD to clear Z at no extra instruction cost.
+				// An artificial emitter-span target inherits admission and needs Z set;
+				// its ADD deliberately leaves flags intact before CMP r11,r11.
+				if (!m_code.EmitAddImm8(HOST_EXEC_BASE, HOST_EXEC_BASE,
+						static_cast<u8>(executed_pairs),
+						!admitted_logical_continuation))
+				{
+					return false;
+				}
+				return !admitted_logical_continuation ||
+					m_code.EmitCmpReg(HOST_EXEC_BASE, HOST_EXEC_BASE);
+			}
+
 			bool EmitCallHelper(const void* fn)
 			{
 				return EmitMovReg(0, HOST_VU) && EmitCallAbsoluteClobberVectorState(fn);
@@ -2839,6 +3513,7 @@ namespace VitaVU
 					link.target_ebit_tail = plan.target_ebit_tail;
 					link.unlinked_fallback_offset = m_code.Size();
 					link.target_offset = static_cast<size_t>(-1);
+					link.cycle_publish_target_offset = static_cast<size_t>(-1);
 					link.fallback_offset = static_cast<size_t>(-1);
 					link.guard_tpc_offset = static_cast<size_t>(-1);
 					if (plan.runtime_observed && !runtime_link)
@@ -2878,8 +3553,8 @@ namespace VitaVU
 							return false;
 					}
 
-					if (!m_code.EmitAddImm8(HOST_EXEC_BASE, HOST_EXEC_BASE,
-							static_cast<u8>(executed_pairs)))
+					if (!EmitAccumulateExecutedPairsForLink(executed_pairs,
+							plan.admitted_logical_continuation))
 						return false;
 
 					link.target_offset = m_code.Size();
@@ -2887,9 +3562,34 @@ namespace VitaVU
 					if (target_branch == static_cast<size_t>(-1))
 						return false;
 
+					// A resident-cycle source normally patches target_branch straight to a
+					// compatible target, skipping this cold sequence. For an incompatible
+					// target PatchVu1DirectLink() turns target_branch itself into the low-word
+					// STR, then falls through the optional high-word STR and this final branch.
+					// The incompatible edge therefore performs exactly the old stores+branch,
+					// while a compatible Cortex-A9 edge executes none of them.
+					if (m_resident_cycle)
+					{
+						if (m_resident_cycle_high &&
+							!m_code.EmitStrImm12(HOST_CYCLE_HI, HOST_VU,
+								VuOffset(offsetof(VURegs, cycle) + 4)))
+						{
+							return false;
+						}
+						link.cycle_publish_target_offset = m_code.Size();
+						if (m_code.EmitBranchPlaceholder() == static_cast<size_t>(-1))
+							return false;
+					}
+
 					link.fallback_offset = m_code.Size();
 					if (!m_code.PatchBranch(skip_fast, link.fallback_offset) ||
 						!m_code.PatchBranch(target_branch, link.fallback_offset))
+					{
+						return false;
+					}
+					if (link.cycle_publish_target_offset != static_cast<size_t>(-1) &&
+						!m_code.PatchBranch(link.cycle_publish_target_offset,
+							link.fallback_offset))
 					{
 						return false;
 					}
@@ -2955,14 +3655,15 @@ namespace VitaVU
 					return false;
 
 				if (!EmitMovReg(HOST_CALL_SCRATCH, 0) ||
-					!m_code.EmitAddImm8(HOST_EXEC_BASE, HOST_EXEC_BASE,
-						static_cast<u8>(executed_pairs)) ||
+					!EmitAccumulateExecutedPairsForLink(executed_pairs,
+						m_plan.continues_logical_block_if_busy) ||
 					!m_code.EmitBx(HOST_CALL_SCRATCH))
 				{
 					return false;
 				}
 
-				return m_code.PatchBranch(skip, m_code.Size(), Condition::EQ);
+				const size_t done_target = m_code.Size();
+				return m_code.PatchBranch(skip, done_target, Condition::EQ);
 			}
 
 			bool EmitCallXgkickTransferFlush()
@@ -3004,8 +3705,8 @@ namespace VitaVU
 					m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitLocalFmacPipelineCommits))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
-					m_code.EmitAddImm8(1, 1,
-						static_cast<u8>(m_plan.local_fmac_pipeline_pairs)) &&
+					m_code.EmitAddImm32(1, 1,
+						m_plan.local_fmac_pipeline_pairs) &&
 					m_code.EmitStrImm12(1, 0, 0);
 				if (!local_counts)
 					return false;
@@ -3013,8 +3714,8 @@ namespace VitaVU
 					(!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitLocalFmacProducerSnapshotEntries))) ||
 					 !m_code.EmitLdrImm12(1, 0, 0) ||
-					 !m_code.EmitAddImm8(1, 1,
-						 static_cast<u8>(m_plan.local_fmac_producer_snapshot_pairs)) ||
+					 !m_code.EmitAddImm32(1, 1,
+						 m_plan.local_fmac_producer_snapshot_pairs) ||
 					 !m_code.EmitStrImm12(1, 0, 0)))
 				{
 					return false;
@@ -3023,8 +3724,8 @@ namespace VitaVU
 					(!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitLocalFmacCycleSnapshotElisions))) ||
 					 !m_code.EmitLdrImm12(1, 0, 0) ||
-					 !m_code.EmitAddImm8(1, 1,
-						 static_cast<u8>(m_plan.local_fmac_cycle_snapshot_elision_pairs)) ||
+					 !m_code.EmitAddImm32(1, 1,
+						 m_plan.local_fmac_cycle_snapshot_elision_pairs) ||
 					 !m_code.EmitStrImm12(1, 0, 0)))
 				{
 					return false;
@@ -3040,22 +3741,22 @@ namespace VitaVU
 					m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitDeferredFmacFlagRetirements))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
-					m_code.EmitAddImm8(1, 1,
-						static_cast<u8>(m_plan.deferred_fmac_flag_retirements)) &&
+					m_code.EmitAddImm32(1, 1,
+						m_plan.deferred_fmac_flag_retirements) &&
 					m_code.EmitStrImm12(1, 0, 0);
 				if (!deferred_counts || m_plan.deferred_fmac_compact_retirements == 0)
 					return deferred_counts;
 				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitDeferredFmacCompactRetirements))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
-					m_code.EmitAddImm8(1, 1,
-						static_cast<u8>(m_plan.deferred_fmac_compact_retirements)) &&
+					m_code.EmitAddImm32(1, 1,
+						m_plan.deferred_fmac_compact_retirements) &&
 					m_code.EmitStrImm12(1, 0, 0) &&
 					m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitDeferredFmacCompactInstructionsRemoved))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
-					m_code.EmitAddImm8(1, 1,
-						static_cast<u8>(m_plan.deferred_fmac_compact_instructions_removed)) &&
+					m_code.EmitAddImm32(1, 1,
+						m_plan.deferred_fmac_compact_instructions_removed) &&
 					m_code.EmitStrImm12(1, 0, 0);
 			}
 
@@ -3593,7 +4294,11 @@ namespace VitaVU
 				if ((ready_full != static_cast<size_t>(-1) &&
 						!m_code.PatchBranch(ready_full, ready_target, Condition::EQ)) ||
 					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR,
-						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, flagreg))) ||
+						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, flagreg))))
+				{
+					return false;
+				}
+				if (
 					// PCSX2 owner: VUops.cpp::_vuFMACflush(). Ordinary FMAC entries
 					// carry neither a CLIP nor an explicit STATUS writer. Skip both
 					// dead TST/BEQ pairs and join their existing non-sticky formula.
@@ -3773,27 +4478,33 @@ namespace VitaVU
 				if (done_disabled == static_cast<size_t>(-1))
 					return false;
 
-				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(base + offsetof(fdivPipe, sCycle))) ||
-					!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(base + offsetof(fdivPipe, sCycle) + 4)) ||
-					!m_code.EmitSubReg(2, current_cycle_low, 2, true) ||
-					!m_code.EmitSbcReg(3, HOST_CLIP_NEW, 3, true) ||
-					!m_code.EmitCmpImm32(3, 0))
+				size_t ready_high = static_cast<size_t>(-1);
+				size_t done_not_ready = static_cast<size_t>(-1);
+				if (!m_plan.instant_qp)
 				{
-					return false;
+					if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(base + offsetof(fdivPipe, sCycle))) ||
+						!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(base + offsetof(fdivPipe, sCycle) + 4)) ||
+						!m_code.EmitSubReg(2, current_cycle_low, 2, true) ||
+						!m_code.EmitSbcReg(3, HOST_CLIP_NEW, 3, true) ||
+						!m_code.EmitCmpImm32(3, 0))
+					{
+						return false;
+					}
+					ready_high = m_code.EmitBranchPlaceholder(Condition::NE);
+					if (ready_high == static_cast<size_t>(-1) ||
+						!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(base + offsetof(fdivPipe, Cycle))) ||
+						!m_code.EmitCmpReg(2, 3))
+					{
+						return false;
+					}
+					done_not_ready = m_code.EmitBranchPlaceholder(Condition::CC);
+					if (done_not_ready == static_cast<size_t>(-1))
+						return false;
 				}
-				const size_t ready_high = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (ready_high == static_cast<size_t>(-1) ||
-					!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(base + offsetof(fdivPipe, Cycle))) ||
-					!m_code.EmitCmpReg(2, 3))
-				{
-					return false;
-				}
-				const size_t done_not_ready = m_code.EmitBranchPlaceholder(Condition::CC);
-				if (done_not_ready == static_cast<size_t>(-1))
-					return false;
 
 				const size_t ready_target = m_code.Size();
-				if (!m_code.PatchBranch(ready_high, ready_target, Condition::NE) ||
+				if ((!m_plan.instant_qp &&
+						!m_code.PatchBranch(ready_high, ready_target, Condition::NE)) ||
 					!m_code.EmitMovImm8(0, 0) ||
 					!m_code.EmitStrImm12(0, HOST_VU, VuOffset(base + offsetof(fdivPipe, enable))) ||
 					!m_code.EmitLdrImm12(1, HOST_VU, VuOffset(base + offsetof(fdivPipe, reg))) ||
@@ -3824,7 +4535,8 @@ namespace VitaVU
 
 				const size_t done_target = m_code.Size();
 				return m_code.PatchBranch(done_disabled, done_target, Condition::EQ) &&
-					m_code.PatchBranch(done_not_ready, done_target, Condition::CC);
+					(m_plan.instant_qp ||
+						m_code.PatchBranch(done_not_ready, done_target, Condition::CC));
 				}
 
 				bool EmitInlineTestPipesEfuFlush(unsigned current_cycle_low)
@@ -3841,27 +4553,33 @@ namespace VitaVU
 				if (done_disabled == static_cast<size_t>(-1))
 					return false;
 
-				if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(base + offsetof(efuPipe, sCycle))) ||
-					!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(base + offsetof(efuPipe, sCycle) + 4)) ||
-					!m_code.EmitSubReg(2, current_cycle_low, 2, true) ||
-					!m_code.EmitSbcReg(3, HOST_CLIP_NEW, 3, true) ||
-					!m_code.EmitCmpImm32(3, 0))
+				size_t ready_high = static_cast<size_t>(-1);
+				size_t done_not_ready = static_cast<size_t>(-1);
+				if (!m_plan.instant_qp)
 				{
-					return false;
+					if (!m_code.EmitLdrImm12(2, HOST_VU, VuOffset(base + offsetof(efuPipe, sCycle))) ||
+						!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(base + offsetof(efuPipe, sCycle) + 4)) ||
+						!m_code.EmitSubReg(2, current_cycle_low, 2, true) ||
+						!m_code.EmitSbcReg(3, HOST_CLIP_NEW, 3, true) ||
+						!m_code.EmitCmpImm32(3, 0))
+					{
+						return false;
+					}
+					ready_high = m_code.EmitBranchPlaceholder(Condition::NE);
+					if (ready_high == static_cast<size_t>(-1) ||
+						!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(base + offsetof(efuPipe, Cycle))) ||
+						!m_code.EmitCmpReg(2, 3))
+					{
+						return false;
+					}
+					done_not_ready = m_code.EmitBranchPlaceholder(Condition::CC);
+					if (done_not_ready == static_cast<size_t>(-1))
+						return false;
 				}
-				const size_t ready_high = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (ready_high == static_cast<size_t>(-1) ||
-					!m_code.EmitLdrImm12(3, HOST_VU, VuOffset(base + offsetof(efuPipe, Cycle))) ||
-					!m_code.EmitCmpReg(2, 3))
-				{
-					return false;
-				}
-				const size_t done_not_ready = m_code.EmitBranchPlaceholder(Condition::CC);
-				if (done_not_ready == static_cast<size_t>(-1))
-					return false;
 
 				const size_t ready_target = m_code.Size();
-				if (!m_code.PatchBranch(ready_high, ready_target, Condition::NE) ||
+				if ((!m_plan.instant_qp &&
+						!m_code.PatchBranch(ready_high, ready_target, Condition::NE)) ||
 					!m_code.EmitMovImm8(0, 0) ||
 					!m_code.EmitStrImm12(0, HOST_VU, VuOffset(base + offsetof(efuPipe, enable))) ||
 					!m_code.EmitLdrImm12(1, HOST_VU, VuOffset(base + offsetof(efuPipe, reg))) ||
@@ -3877,7 +4595,8 @@ namespace VitaVU
 
 				const size_t done_target = m_code.Size();
 				return m_code.PatchBranch(done_disabled, done_target, Condition::EQ) &&
-					m_code.PatchBranch(done_not_ready, done_target, Condition::CC);
+					(m_plan.instant_qp ||
+						m_code.PatchBranch(done_not_ready, done_target, Condition::CC));
 				}
 
 				bool EmitInlineTestPipesIaluFlush(unsigned current_cycle_low)
@@ -4832,44 +5551,6 @@ namespace VitaVU
 				return true;
 			}
 
-			bool EmitLoadAccWord(unsigned rd, unsigned lane)
-			{
-				if (!RecordOrConsumeVectorAccess(VU_VECTOR_CACHE_ACC,
-						VectorAccessKind::WordLoad, true, nullptr) ||
-					(VectorCacheEnabled() && !EmitInvalidateCachedVector(VU_VECTOR_CACHE_ACC)))
-				{
-					return false;
-				}
-				if (!m_vu0_memory_map)
-					m_vector_cache_stats.uncached_loads++;
-				if (!m_vu0_memory_map)
-					m_vector_cache_stats.acc_word_loads++;
-				return m_code.EmitLdrImm12(rd, HOST_VU,
-					VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32)));
-			}
-
-			bool EmitStoreAccWord(unsigned rs, unsigned lane)
-			{
-				if (!RecordOrConsumeVectorAccess(VU_VECTOR_CACHE_ACC,
-						VectorAccessKind::WordStore, false, nullptr) ||
-					(VectorCacheEnabled() && !EmitInvalidateCachedVector(VU_VECTOR_CACHE_ACC)))
-				{
-					return false;
-				}
-				if (!m_vu0_memory_map)
-					m_vector_cache_stats.uncached_stores++;
-				if (!m_vu0_memory_map)
-					m_vector_cache_stats.acc_word_stores++;
-				if (!m_code.EmitStrImm12(rs, HOST_VU,
-						VuOffset(offsetof(VURegs, ACC) + lane * sizeof(u32))))
-				{
-					return false;
-				}
-				MarkVectorLanesUnknown(VU_VECTOR_CACHE_ACC,
-					static_cast<u8>(1u << (3 - lane)));
-				return true;
-			}
-
 			bool EmitStoreAccWordFromS(unsigned ss, unsigned lane)
 			{
 				if (!RecordOrConsumeVectorAccess(VU_VECTOR_CACHE_ACC,
@@ -5032,6 +5713,10 @@ namespace VitaVU
 				const unsigned ft = VUInterpFast::Ft(code);
 				const unsigned fs = VUInterpFast::Fs(code);
 				const unsigned mask = VUInterpFast::XYZW(code);
+				const u32 active_lanes = ActiveLaneCount(mask);
+				const bool nearest_neon = CanUseNearestNeonFloat();
+				const bool source_normalized =
+					AreVectorLanesNormalized(static_cast<u8>(fs), static_cast<u8>(mask));
 				if (ft == 0 || mask == 0)
 				{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -5042,10 +5727,12 @@ namespace VitaVU
 				}
 
 				// PCSX2 owner: VUops.cpp::{floatToInt,intToFloat}() and
-				// VUmicroFast.h::ExecuteUpperNoLowerKnownKind(). Cortex-A9 Advanced
-				// SIMD arithmetic ignores FPSCR.RMode, while scalar VFP observes it.
-				// Keep the qword load/store and exact integer ABS work and use scalar
-				// VFP for rounding-sensitive arithmetic and ITOF.
+				// VUmicroFast.h::ExecuteUpperNoLowerKnownKind(). ARM ARM A8.6.296
+				// defines the Advanced SIMD fixed-point conversion as saturating
+				// round-to-zero for FTOI and round-to-nearest for ITOF. In the strict
+				// VU1-nearest configuration it also folds the exact 2^N scale into one
+				// Q operation. Other configurations retain scalar VFP under their
+				// installed FPCR.
 				if (!EmitLoadVfQuad(0, fs))
 				{
 					return false;
@@ -5076,34 +5763,64 @@ namespace VitaVU
 						else if (kind == VUInterpFast::UpperFastKind::FTOI15)
 							offset = 15;
 
-						emitted_body = true;
-						if (offset != 0)
+						// Every nearest-tier write can use Advanced SIMD. A one-lane mask is
+						// wholly contained in one D half: normalize those two host lanes,
+						// convert both, and discard the inactive neighbor in the masked store.
+						// This replaces the scalar scale/classify/saturate sequence without
+						// changing any active PS2 lane. Wider masks retain D/Q selection below.
+						const bool vector_conversion = nearest_neon;
+						if (vector_conversion)
 						{
-							emitted_body = emitted_body &&
-								m_code.EmitMovImm32(0, 0x3f800000u + (offset << 23)) &&
-								m_code.EmitVmovCoreToS(4, 0);
-						}
-
-						for (unsigned lane = 0; lane < 4 && emitted_body; lane++)
-						{
-							const unsigned lane_bit = 1u << (3 - lane);
-							if ((mask & lane_bit) == 0)
-								continue;
-
+							const int d_half = ActiveNeonDHalf(mask);
+							// floatToInt() saturates every exponent-0xff input according to
+							// its sign. Clamp those words to signed max finite first so NEON's
+							// architectural NaN-to-fixed result cannot change PCSX2 behavior.
 							emitted_body =
-								(offset == 0 || m_code.EmitVmulF32(lane, lane, 4)) &&
-								m_code.EmitVmovSToCore(0, lane) &&
-								EmitAndRegImm32(1, 0, FPU_FLOAT_EXPONENT_MASK, HOST_CALL_SCRATCH) &&
-								m_code.EmitMovRegShiftImm(2, 0, ShiftType::ASR, 31) &&
-								// signmask ^ 0x80000000, then invert, maps positive to
-								// INT_MAX and negative to INT_MIN using two encodable ops.
-								m_code.EmitEorImm32(2, 2, FPU_FLOAT_SIGN_MASK) &&
-								m_code.EmitMvnReg(2, 2) &&
-								m_code.EmitVcvtS32F32(lane, lane) &&
-								m_code.EmitVmovSToCore(0, lane) &&
-								EmitCmpRegImm32(1, 0x4f000000u, HOST_CALL_SCRATCH) &&
-								EmitMovReg(0, 2, Condition::CS) &&
-								m_code.EmitVmovCoreToS(lane, 0);
+								(source_normalized || EmitEnsureVuFloatInputNormalizeConstants(true)) &&
+								EmitNormalizeKnownQuad(0, source_normalized, true) &&
+								(d_half >= 0 ?
+									m_code.EmitVcvtS32F32D(static_cast<unsigned>(d_half),
+										static_cast<unsigned>(d_half), offset) :
+									m_code.EmitVcvtS32F32Q(0, 0, offset));
+							if (emitted_body)
+							{
+								m_nearest_neon_conversion_ops++;
+								m_nearest_neon_half_ops += d_half >= 0;
+								m_nearest_neon_conversion_scalar_ops_removed +=
+									active_lanes * (offset == 0 ? 1u : 2u) - 1u;
+							}
+						}
+						else
+						{
+							emitted_body = true;
+							if (offset != 0)
+							{
+								emitted_body =
+									m_code.EmitMovImm32(0, 0x3f800000u + (offset << 23)) &&
+									m_code.EmitVmovCoreToS(4, 0);
+							}
+
+							for (unsigned lane = 0; lane < 4 && emitted_body; lane++)
+							{
+								const unsigned lane_bit = 1u << (3 - lane);
+								if ((mask & lane_bit) == 0)
+									continue;
+
+								emitted_body =
+									(offset == 0 || m_code.EmitVmulF32(lane, lane, 4)) &&
+									m_code.EmitVmovSToCore(0, lane) &&
+									EmitAndRegImm32(1, 0, FPU_FLOAT_EXPONENT_MASK, HOST_CALL_SCRATCH) &&
+									m_code.EmitMovRegShiftImm(2, 0, ShiftType::ASR, 31) &&
+									// signmask ^ 0x80000000, then invert, maps positive to
+									// INT_MAX and negative to INT_MIN using two encodable ops.
+									m_code.EmitEorImm32(2, 2, FPU_FLOAT_SIGN_MASK) &&
+									m_code.EmitMvnReg(2, 2) &&
+									m_code.EmitVcvtS32F32(lane, lane) &&
+									m_code.EmitVmovSToCore(0, lane) &&
+									EmitCmpRegImm32(1, 0x4f000000u, HOST_CALL_SCRATCH) &&
+									EmitMovReg(0, 2, Condition::CS) &&
+									m_code.EmitVmovCoreToS(lane, 0);
+							}
 						}
 						break;
 					}
@@ -5125,19 +5842,43 @@ namespace VitaVU
 						else if (kind == VUInterpFast::UpperFastKind::ITOF15)
 							offset = 15;
 
-						// Ordinary scalar VFP conversion observes the installed VU FPCR.
-						// Scaling by 2^-offset is exact for the complete signed-int domain;
-						// materialize it once and use scalar VMUL only on active lanes.
-						emitted_body = offset == 0 ||
-							(m_code.EmitMovImm32(0, 0x3f800000u - (offset << 23)) &&
-							 m_code.EmitVmovCoreToS(4, 0));
-						for (unsigned lane = 0; lane < 4 && emitted_body; lane++)
+						// A nonzero fixed-point scale makes one Q conversion profitable even
+						// for a single lane by removing the dependent scalar VMUL. ITOF0
+						// retains scalar VFP for a one-lane mask because one scalar VCVT has
+						// lower issue cost than a Q operation on Cortex-A9.
+						const bool vector_conversion = nearest_neon &&
+							(active_lanes >= 2 || offset != 0);
+						if (vector_conversion)
 						{
-							const unsigned lane_bit = 1u << (3 - lane);
-							if ((mask & lane_bit) == 0)
-								continue;
-							emitted_body = m_code.EmitVcvtF32S32(lane, lane) &&
-								(offset == 0 || m_code.EmitVmulF32(lane, lane, 4));
+							const int d_half = ActiveNeonDHalf(mask);
+							emitted_body = d_half >= 0 ?
+								m_code.EmitVcvtF32S32D(static_cast<unsigned>(d_half),
+									static_cast<unsigned>(d_half), offset) :
+								m_code.EmitVcvtF32S32Q(0, 0, offset);
+							if (emitted_body)
+							{
+								m_nearest_neon_conversion_ops++;
+								m_nearest_neon_half_ops += d_half >= 0;
+								m_nearest_neon_conversion_scalar_ops_removed +=
+									active_lanes * (offset == 0 ? 1u : 2u) - 1u;
+							}
+						}
+						else
+						{
+							// Ordinary scalar VFP conversion observes the installed VU FPCR.
+							// Scaling by 2^-offset is exact for the complete signed-int domain;
+							// materialize it once and use scalar VMUL only on active lanes.
+							emitted_body = offset == 0 ||
+								(m_code.EmitMovImm32(0, 0x3f800000u - (offset << 23)) &&
+								 m_code.EmitVmovCoreToS(4, 0));
+							for (unsigned lane = 0; lane < 4 && emitted_body; lane++)
+							{
+								const unsigned lane_bit = 1u << (3 - lane);
+								if ((mask & lane_bit) == 0)
+									continue;
+								emitted_body = m_code.EmitVcvtF32S32(lane, lane) &&
+									(offset == 0 || m_code.EmitVmulF32(lane, lane, 4));
+							}
 						}
 						break;
 					}
@@ -5159,15 +5900,6 @@ namespace VitaVU
 #endif
 			}
 
-			bool EmitOrClipBitIfSignedGreater(unsigned flags_reg, unsigned value_reg,
-				unsigned lane_reg, u8 bit)
-			{
-				return m_code.EmitCmpReg(lane_reg, value_reg) &&
-					m_code.EmitMovImm8(3, 0) &&
-					m_code.EmitMovImm8(3, bit, Condition::GT) &&
-					m_code.EmitOrrReg(flags_reg, flags_reg, 3);
-			}
-
 			bool EmitInlineUpperClip(u32 code)
 			{
 				const unsigned fs = VUInterpFast::Fs(code);
@@ -5181,23 +5913,35 @@ namespace VitaVU
 					!EmitAndRegImm32(1, 0, FPU_FLOAT_EXPONENT_MASK, HOST_CALL_SCRATCH) ||
 					!EmitAndRegImm32(0, 0, ~FPU_FLOAT_SIGN_MASK, HOST_CALL_SCRATCH) ||
 					!m_code.EmitCmpImm32(1, 0) ||
-					!m_code.EmitMovImm32(0, FPU_FLOAT_MANTISSA_MASK, Condition::EQ) ||
-					!m_code.EmitMovImm8(2, 0))
+					!m_code.EmitMovImm32(0, FPU_FLOAT_MANTISSA_MASK, Condition::EQ))
 				{
 					return false;
 				}
 
-				for (unsigned lane = 0; lane < 3; lane++)
+				// PCSX2 owner: VUmicroFast.h::ExecuteClipNeon(). Q2 and Q3 are
+				// respectively the raw signed greater-than masks for Fs and Fs with
+				// its sign bit toggled. This is integer bit ordering, not host FP.
+				// Apply disjoint x/y/z weights {1,4,16}; the negative masks use the
+				// same weights shifted once. D-form OR and VPADD then reduce all six
+				// bits exactly. Cortex-A9 executes each D reduction in one issue cycle.
+				if (!EmitLoadVfQuad(0, fs) ||
+					!m_code.EmitVdupI32QFromCore(1, 0) ||
+					!m_code.EmitVcgtS32Q(2, 0, 1) ||
+					!m_code.EmitVmovI32Q(3, 0x80u, 24) ||
+					!m_code.EmitVeorQ(3, 0, 3) ||
+					!m_code.EmitVcgtS32Q(3, 3, 1) ||
+					!m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						VU_CLIP_POSITIVE_WEIGHTS.data()))) ||
+					!m_code.EmitVld1Q32Aligned(1, 0) ||
+					!m_code.EmitVandQ(2, 2, 1) ||
+					!m_code.EmitVandQ(3, 3, 1) ||
+					!m_code.EmitVshlI32Q(3, 3, 1) ||
+					!m_code.EmitVorrQ(2, 2, 3) ||
+					!m_code.EmitVorrD(4, 4, 5) ||
+					!m_code.EmitVpaddI32D(4, 4, 4) ||
+					!m_code.EmitVmovSToCore(2, 8))
 				{
-					const u8 pos_bit = static_cast<u8>(1u << (lane * 2));
-					const u8 neg_bit = static_cast<u8>(1u << (lane * 2 + 1));
-					if (!EmitLoadVfWord(1, fs, lane) ||
-						!EmitOrClipBitIfSignedGreater(2, 0, 1, pos_bit) ||
-						!m_code.EmitEorImm32(1, 1, FPU_FLOAT_SIGN_MASK) ||
-						!EmitOrClipBitIfSignedGreater(2, 0, 1, neg_bit))
-					{
-						return false;
-					}
+					return false;
 				}
 
 				if (!m_code.EmitLdrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, clipflag))) ||
@@ -5540,7 +6284,7 @@ namespace VitaVU
 			{
 				if (!VuFpcrFlushesInputsToZero() ||
 					IsUpperOperandNormalized(code, kind, 0, false) ||
-					!CHECK_VU_OVERFLOW(0))
+					!VuOverflowClampEnabled())
 				{
 					return true;
 				}
@@ -5576,36 +6320,6 @@ namespace VitaVU
 				return IsUpperOperandNormalized(code, kind, active_lanes, vector_form) ||
 					(!vector_form && VuFpcrFlushesInputsToZero() &&
 						(IsUpperIFormat(kind) || IsUpperQFormat(kind)));
-			}
-
-			// MADD/MSUB whose second operand broadcasts one VF[ft] lane. When the
-			// destination aliases ft, the interpreter's per-lane store order lets a
-			// later lane observe the just-written value, so these keep the scalar
-			// per-lane path when fd == ft.
-			bool IsUpperMaddMsubVfBroadcastForm(VUInterpFast::UpperFastKind kind)
-			{
-				switch (kind)
-				{
-					case VUInterpFast::UpperFastKind::MADDx:
-					case VUInterpFast::UpperFastKind::MADDAx:
-					case VUInterpFast::UpperFastKind::MSUBx:
-					case VUInterpFast::UpperFastKind::MSUBAx:
-					case VUInterpFast::UpperFastKind::MADDy:
-					case VUInterpFast::UpperFastKind::MADDAy:
-					case VUInterpFast::UpperFastKind::MSUBy:
-					case VUInterpFast::UpperFastKind::MSUBAy:
-					case VUInterpFast::UpperFastKind::MADDz:
-					case VUInterpFast::UpperFastKind::MADDAz:
-					case VUInterpFast::UpperFastKind::MSUBz:
-					case VUInterpFast::UpperFastKind::MSUBAz:
-					case VUInterpFast::UpperFastKind::MADDw:
-					case VUInterpFast::UpperFastKind::MADDAw:
-					case VUInterpFast::UpperFastKind::MSUBw:
-					case VUInterpFast::UpperFastKind::MSUBAw:
-						return true;
-					default:
-						return false;
-				}
 			}
 
 			bool IsUpperMaddMsubAccKind(VUInterpFast::UpperFastKind kind)
@@ -5706,7 +6420,7 @@ namespace VitaVU
 			// register; broadcast forms duplicate the one semantic source word
 			// into a D register and report its low scalar-VFP alias in selected_s.
 			bool EmitLoadUpperAddSubOperand(unsigned qd, u32 code,
-				VUInterpFast::UpperFastKind kind, int* selected_s)
+				VUInterpFast::UpperFastKind kind, int* selected_s, bool full_q)
 			{
 				if (!selected_s)
 					return false;
@@ -5716,12 +6430,14 @@ namespace VitaVU
 				const int broadcast_lane = UpperVfBroadcastLane(kind);
 				if (broadcast_lane >= 0)
 					return EmitLoadVfLaneBroadcastSelected(qd, VUInterpFast::Ft(code),
-						static_cast<unsigned>(broadcast_lane), true,
+						static_cast<unsigned>(broadcast_lane), !full_q,
 						selected_s);
 
 				if (!EmitLoadUpperAddSubOperandWord(3, code, kind, 0) ||
 					!EmitNormalizeLoadedUpperBroadcastForFz(3, 0, code, kind))
 					return false;
+				if (full_q)
+					return m_code.EmitVdupI32QFromCore(qd, 3);
 				*selected_s = static_cast<int>(qd * 4);
 				m_single_d_broadcast_operands++;
 				return m_code.EmitVdupI32DFromCore(qd * 2, 3);
@@ -5759,7 +6475,10 @@ namespace VitaVU
 				}
 			}
 
-			// Loads the MUL second operand (see the ADD/SUB operand loader above).
+			// Loads the MUL second operand. Vector forms need the complete Q register.
+			// Broadcast forms keep one snapshotted value in D2: nearest NEON consumes
+			// D2[0] directly with VMUL.F32 D/Q,D/Q,Dm[0], so expanding it to Q1 would
+			// spend an extra Cortex-A9 issue cycle without changing any VU value.
 			bool EmitLoadUpperMulOperand(unsigned qd, u32 code,
 				VUInterpFast::UpperFastKind kind, int* selected_s)
 			{
@@ -5828,8 +6547,9 @@ namespace VitaVU
 				}
 			}
 
-			// Loads the MADD/MSUB second operand. Vector forms use a complete Q
-			// register; broadcast forms use the one-word D representation.
+			// Loads the MADD/MSUB second operand. As with MUL, broadcast forms retain
+			// one pre-instruction snapshot in D4 and feed its low lane directly to
+			// the exact non-fused VMLA/VMLS operation.
 			bool EmitLoadUpperMaddMsubOperand(unsigned qd, u32 code,
 				VUInterpFast::UpperFastKind kind, int* selected_s)
 			{
@@ -5856,103 +6576,6 @@ namespace VitaVU
 			{
 				const unsigned shift = 3 - lane;
 				return EmitAndRegImm32(mac_reg, mac_reg, ~(0x1111u << shift), scratch_reg);
-			}
-
-			bool EmitUpdateMacLaneFromResult(unsigned mac_reg, unsigned value_reg, unsigned lane,
-				unsigned temp_reg, unsigned scratch_reg)
-			{
-				const unsigned shift = 3 - lane;
-				const u32 sign_bit = 0x0010u << shift;
-				const u32 zero_bit = 0x0001u << shift;
-				const u32 under_bit = 0x0100u << shift;
-				const u32 over_bit = 0x1000u << shift;
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(1);
-
-				// PCSX2 owner: VUflags.cpp::VU_MAC_UPDATE(). Recreate the
-				// MAC lane flags and returned result bits without calling the
-				// C++ helper from the generated VU1 block.
-				if (!EmitAndRegImm32(mac_reg, mac_reg, ~sign_bit, scratch_reg) ||
-					!m_code.EmitMovRegShiftImm(temp_reg, value_reg, ShiftType::LSR, 31) ||
-					!m_code.EmitMovRegShiftImm(temp_reg, temp_reg, ShiftType::LSL, 4 + shift) ||
-					!m_code.EmitOrrReg(mac_reg, mac_reg, temp_reg) ||
-					!EmitAndRegImm32(temp_reg, value_reg, ~FPU_FLOAT_SIGN_MASK, scratch_reg) ||
-					!m_code.EmitCmpImm32(temp_reg, 0))
-				{
-					return false;
-				}
-
-				const size_t nonzero = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (nonzero == static_cast<size_t>(-1))
-					return false;
-
-				if (!EmitAndRegImm32(mac_reg, mac_reg, ~((under_bit | over_bit)), scratch_reg) ||
-					!EmitOrrRegImm32(mac_reg, mac_reg, zero_bit, scratch_reg))
-				{
-					return false;
-				}
-				const size_t done_zero = m_code.EmitBranchPlaceholder();
-				if (done_zero == static_cast<size_t>(-1))
-					return false;
-
-				const size_t nonzero_target = m_code.Size();
-				if (!m_code.PatchBranch(nonzero, nonzero_target, Condition::NE) ||
-					!EmitAndRegImm32(temp_reg, value_reg, FPU_FLOAT_EXPONENT_MASK, scratch_reg) ||
-					!m_code.EmitCmpImm32(temp_reg, 0))
-				{
-					return false;
-				}
-
-				const size_t exponent_nonzero = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (exponent_nonzero == static_cast<size_t>(-1))
-					return false;
-
-				if (!EmitAndRegImm32(mac_reg, mac_reg, ~over_bit, scratch_reg) ||
-					!EmitOrrRegImm32(mac_reg, mac_reg, under_bit | zero_bit, scratch_reg) ||
-					!EmitAndRegImm32(value_reg, value_reg, FPU_FLOAT_SIGN_MASK, scratch_reg))
-				{
-					return false;
-				}
-				const size_t done_denormal = m_code.EmitBranchPlaceholder();
-				if (done_denormal == static_cast<size_t>(-1))
-					return false;
-
-				const size_t exponent_nonzero_target = m_code.Size();
-				if (!m_code.PatchBranch(exponent_nonzero, exponent_nonzero_target, Condition::NE) ||
-					!EmitCmpRegImm32(temp_reg, FPU_FLOAT_EXPONENT_MASK, scratch_reg))
-				{
-					return false;
-				}
-
-				const size_t finite = m_code.EmitBranchPlaceholder(Condition::NE);
-				if (finite == static_cast<size_t>(-1))
-					return false;
-
-				if (!EmitAndRegImm32(mac_reg, mac_reg, ~(under_bit | zero_bit), scratch_reg) ||
-					!EmitOrrRegImm32(mac_reg, mac_reg, over_bit, scratch_reg))
-				{
-					return false;
-				}
-				if (overflow_clamp &&
-					(!EmitAndRegImm32(value_reg, value_reg, FPU_FLOAT_SIGN_MASK, scratch_reg) ||
-						!EmitOrrRegImm32(value_reg, value_reg, FPU_FLOAT_MAX_FINITE, scratch_reg)))
-				{
-					return false;
-				}
-				const size_t done_special = m_code.EmitBranchPlaceholder();
-				if (done_special == static_cast<size_t>(-1))
-					return false;
-
-				const size_t finite_target = m_code.Size();
-				if (!m_code.PatchBranch(finite, finite_target, Condition::NE) ||
-					!EmitAndRegImm32(mac_reg, mac_reg, ~(over_bit | under_bit | zero_bit), scratch_reg))
-				{
-					return false;
-				}
-
-				const size_t done = m_code.Size();
-				return m_code.PatchBranch(done_zero, done) &&
-					m_code.PatchBranch(done_denormal, done) &&
-					m_code.PatchBranch(done_special, done);
 			}
 
 			bool EmitUpdateStatusFromMacReg(unsigned mac_reg, unsigned status_reg,
@@ -5989,60 +6612,85 @@ namespace VitaVU
 
 			bool EmitLoadWorkingFmacMac(unsigned target_reg)
 			{
-				if (m_plan.resident_working_fmac_flags && m_latest_working_fmac_entry)
+				if (m_plan.resident_working_fmac_flags && m_latest_working_fmac_mac_entry)
 				{
 					return m_code.EmitLdrImm12(target_reg, SP,
-						LocalFmacOffset(*m_latest_working_fmac_entry, LOCAL_FMAC_MAC_OFFSET));
+						LocalFmacOffset(*m_latest_working_fmac_mac_entry,
+							LOCAL_FMAC_MAC_OFFSET));
 				}
 
 				return m_code.EmitLdrImm12(target_reg, HOST_VU,
 					VuOffset(offsetof(VURegs, macflag)));
 			}
 
+			bool EmitLoadWorkingFmacStatus(unsigned target_reg)
+			{
+				if (m_plan.resident_working_fmac_flags && m_latest_working_fmac_status_entry)
+				{
+					return m_code.EmitLdrImm12(target_reg, SP,
+						LocalFmacOffset(*m_latest_working_fmac_status_entry,
+							LOCAL_FMAC_STATUS_OFFSET));
+				}
+
+				return m_code.EmitLdrImm12(target_reg, HOST_VU,
+					VuOffset(offsetof(VURegs, statusflag)));
+			}
+
 			bool EmitLoadWorkingFmacMacStatus(unsigned mac_reg, unsigned status_reg)
 			{
 				if (mac_reg + 1 != status_reg || (mac_reg & 1u) != 0)
 					return false;
-				if (m_plan.resident_working_fmac_flags && m_latest_working_fmac_entry)
+				if (m_plan.resident_working_fmac_flags &&
+					m_latest_working_fmac_mac_entry &&
+					m_latest_working_fmac_mac_entry == m_latest_working_fmac_status_entry)
 				{
 					return m_code.EmitLdrdImm8(mac_reg, status_reg, SP,
-						static_cast<u8>(LocalFmacOffset(*m_latest_working_fmac_entry,
+						static_cast<u8>(LocalFmacOffset(*m_latest_working_fmac_mac_entry,
 							LOCAL_FMAC_MAC_OFFSET)));
 				}
 
-				return m_code.EmitLdrImm12(mac_reg, HOST_VU,
-						VuOffset(offsetof(VURegs, macflag))) &&
-					m_code.EmitLdrImm12(status_reg, HOST_VU,
-						VuOffset(offsetof(VURegs, statusflag)));
+				return EmitLoadWorkingFmacMac(mac_reg) &&
+					EmitLoadWorkingFmacStatus(status_reg);
 			}
 
-			bool EmitCapturePendingLocalFmacFlags(unsigned mac_reg, unsigned status_reg)
+			bool EmitCapturePendingLocalFmacFlags(unsigned mac_reg, unsigned status_reg,
+				bool capture_mac, bool capture_status)
 			{
 				if (!m_capture_pending_local_fmac_flags || !m_pending_local_fmac_entry)
 					return true;
-				if (mac_reg + 1 != status_reg || (mac_reg & 1u) != 0)
-					return false;
-				if (!m_code.EmitStrdImm8(mac_reg, status_reg, SP,
-						static_cast<u8>(LocalFmacOffset(*m_pending_local_fmac_entry,
-							LOCAL_FMAC_MAC_OFFSET))))
+				if (!capture_mac && !capture_status)
+					return true;
+
+				bool emitted = false;
+				if (capture_mac && capture_status)
+				{
+					emitted = mac_reg + 1 == status_reg && (mac_reg & 1u) == 0 &&
+						m_code.EmitStrdImm8(mac_reg, status_reg, SP,
+							static_cast<u8>(LocalFmacOffset(*m_pending_local_fmac_entry,
+								LOCAL_FMAC_MAC_OFFSET)));
+				}
+				else
+				{
+					const unsigned value_reg = capture_mac ? mac_reg : status_reg;
+					const u32 field = capture_mac ? LOCAL_FMAC_MAC_OFFSET :
+						LOCAL_FMAC_STATUS_OFFSET;
+					emitted = m_code.EmitStrImm12(value_reg, SP,
+						LocalFmacOffset(*m_pending_local_fmac_entry, field));
+				}
+				if (!emitted)
 				{
 					return false;
 				}
-				m_pending_local_fmac_entry->producer_flags_captured = true;
+				m_pending_local_fmac_entry->producer_mac_captured |= capture_mac;
+				m_pending_local_fmac_entry->producer_status_captured |= capture_status;
 				if (m_plan.resident_working_fmac_flags)
-					m_latest_working_fmac_entry = m_pending_local_fmac_entry;
+				{
+					if (capture_mac)
+						m_latest_working_fmac_mac_entry = m_pending_local_fmac_entry;
+					if (capture_status)
+						m_latest_working_fmac_status_entry = m_pending_local_fmac_entry;
+				}
 				return true;
-			}
-
-			bool EmitStoreMacResultWord(unsigned value_reg, bool acc, unsigned fd, unsigned lane)
-			{
-				if (acc)
-					return EmitStoreAccWord(value_reg, lane);
-
-				if (fd == 0)
-					return true;
-
-				return EmitStoreVfWord(value_reg, fd, lane);
 			}
 
 			bool EmitStoreMacResultS(unsigned value_sreg, bool acc, unsigned fd, unsigned lane)
@@ -6299,22 +6947,42 @@ namespace VitaVU
 					reduce_packed_lanes(mac_result);
 			}
 
-			bool EmitFinishMacQ(unsigned result_q, bool acc, unsigned fd, unsigned mask, bool preserve_inactive,
-				bool mac_result_required)
+			bool EmitFinishMacQ(unsigned result_q, bool acc, unsigned fd, unsigned mask,
+				bool preserve_inactive, bool mac_result_required,
+				bool status_result_required)
 			{
 				mask &= 0x0f;
-				if (!mac_result_required && preserve_inactive)
-					return false;
-				const bool accumulate_sticky_only = !mac_result_required && mask == 0x0f &&
+				const bool accumulate_sticky_only = status_result_required &&
+					!mac_result_required && mask == 0x0f &&
 					m_plan.deferred_fmac_flags && m_plan.resident_working_fmac_flags &&
 					m_capture_pending_local_fmac_flags && m_pending_local_fmac_entry &&
 					VuFpcrFlushesInputsToZero() &&
 					!CHECK_VU_OVERFLOW(m_vu0_memory_map ? 0u : 1u) &&
 					(FmacFlagReg(m_pairs[m_pending_local_fmac_entry->pair_index]) &
 						(1u << REG_CLIP_FLAG)) == 0;
-				if (!EmitClassifyAndNormalizeMacOrStatusQ(result_q, mask, mac_result_required,
-						accumulate_sticky_only))
-					return false;
+				if (mac_result_required || status_result_required)
+				{
+					if (!EmitClassifyAndNormalizeMacOrStatusQ(result_q, mask,
+							mac_result_required, accumulate_sticky_only))
+					{
+						return false;
+					}
+				}
+				else
+				{
+					// PCSX2 microVU_Flags.inl::mVUsetFlags() clears sFLAG.doFlag
+					// under the compatible flag hack. No architectural flag consumes
+					// the classification masks, but vuFloat() result normalization
+					// remains mandatory. Vita's default FZ/no-overflow FPCR makes this
+					// path zero A32 instructions on Cortex-A9.
+					const bool overflow_clamp = CHECK_VU_OVERFLOW(
+						m_vu0_memory_map ? 0u : 1u);
+					if (!EmitEnsureVuFloatInputNormalizeConstants(overflow_clamp) ||
+						!EmitNormalizeVuFloatQuadInPlace(result_q, overflow_clamp))
+					{
+						return false;
+					}
+				}
 				if (accumulate_sticky_only)
 					m_pending_local_fmac_entry->sticky_only_accumulated = true;
 
@@ -6365,31 +7033,45 @@ namespace VitaVU
 					// non-sticky STATUS instance are liveness-proven unobservable; its
 					// sticky categories are already resident in Q11.
 				}
-				else if (mac_result_required)
+				else if (mac_result_required && status_result_required)
 				{
 					if ((!defer_working_store &&
 							!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag)))) ||
 						!EmitUpdateStatusFromMacReg(2, status_reg, 1, !defer_working_store) ||
-						!EmitCapturePendingLocalFmacFlags(2, status_reg))
+						!EmitCapturePendingLocalFmacFlags(2, status_reg, true, true))
 					{
 						return false;
 					}
 				}
-				else
+				else if (mac_result_required)
+				{
+					// mVU's flag hack leaves STATUS stale while retaining an exact MAC
+					// instance when an FMxx reader needs it. Keep only the new MAC in
+					// this local slot; the independent STATUS owner remains unchanged.
+					if ((!defer_working_store &&
+							!m_code.EmitStrImm12(2, HOST_VU,
+								VuOffset(offsetof(VURegs, macflag)))) ||
+						!EmitCapturePendingLocalFmacFlags(2, status_reg, true, false))
+					{
+						return false;
+					}
+				}
+				else if (status_result_required)
 				{
 					// r2 already is the exact non-sticky STATUS category nibble.
-					// Preserve the previous working MAC in this otherwise unobservable
-					// local pipeline instance so STATUS/sticky publication remains exact.
+					// MAC liveness proved the paired MAC result unobservable, so keep
+					// only this STATUS word in the private slot.
 					if (!EmitMovReg(status_reg, 2) ||
 						(!defer_working_store && !m_code.EmitStrImm12(status_reg, HOST_VU,
 							VuOffset(offsetof(VURegs, statusflag)))) ||
-						(m_capture_pending_local_fmac_flags &&
-							(!EmitLoadWorkingFmacMac(2) ||
-							 !EmitCapturePendingLocalFmacFlags(2, status_reg))))
+						!EmitCapturePendingLocalFmacFlags(2, status_reg, false, true))
 					{
 						return false;
 					}
 				}
+				// When neither flag result is live, the local entry retains only its
+				// four-cycle VF dependency. EmitCommitLocalFmac() does not snapshot
+				// either unchanged working flag.
 
 				// PCSX2 microVU's register allocator retains the clamped FMAC
 				// representation. EmitFinishMacQ() just applied the same vuFloat()
@@ -6439,7 +7121,7 @@ namespace VitaVU
 			}
 
 			bool EmitInlineUpperAddSub(u32 code, VUInterpFast::UpperFastKind kind,
-				bool mac_result_required)
+				bool mac_result_required, bool status_result_required)
 			{
 				const unsigned fd = VUInterpFast::Fd(code);
 				const unsigned fs = VUInterpFast::Fs(code);
@@ -6447,14 +7129,25 @@ namespace VitaVU
 				const bool acc = IsUpperAddSubAccKind(kind);
 				const bool subtract = IsUpperSubKind(kind);
 				const bool triace_add = IsUpperAddiTriAceKind(kind) && CHECK_VUADDSUBHACK;
+				const u32 active_lanes = ActiveLaneCount(mask);
+				// The existing Tri-Ace compatibility rewrite is intentionally kept on
+				// its exact per-lane path. It is not part of the general nearest-mode
+				// speedhack and its sequential GPR operand rewrites should not be
+				// widened into inactive NEON lanes.
+				const bool nearest_neon = !triace_add && CanUseNearestNeonFloat() &&
+					active_lanes >= 2;
+				const int nearest_neon_d_half = nearest_neon ? ActiveNeonDHalf(mask) : -1;
 				int operand_s = -1;
 
 				// PCSX2 owners: VUops.cpp::_vuADD* / _vuSUB* /
 				// _vuADDA* / _vuSUBA* and
-				// VUmicroFast.h::ExecuteAddSubMasked(). NEON still owns qword
-				// loads and exact integer vuDouble() normalization, but Cortex-A9
-				// Advanced SIMD FP ignores FPSCR rounding. Execute only the active
-				// arithmetic lanes with scalar VFP under the installed VU FPCR.
+				// VUmicroFast.h::ExecuteAddSubMasked(). NEON owns qword loads and
+				// exact integer vuDouble() normalization. Cortex-A9 Advanced SIMD FP
+				// is fixed to round-to-nearest, so the VU1 nearest/FZ/overflow
+				// configuration can also execute profitable multi-lane arithmetic as
+				// one Advanced SIMD operation. Contiguous XY/ZW writes select the
+				// Cortex-A9 one-issue-cycle D form; wider masks select Q. Other
+				// configurations retain scalar VFP under the installed VU FPCR.
 				if (triace_add)
 				{
 					// The VUADDSUBHACK gamefix rewrites operands based on their
@@ -6488,7 +7181,8 @@ namespace VitaVU
 					const bool operand_normalized = IsLoadedUpperOperandNormalized(code, kind,
 						static_cast<u8>(mask), IsUpperVectorOperandForm(kind));
 					if (!EmitLoadVfQuad(0, fs) ||
-						!EmitLoadUpperAddSubOperand(1, code, kind, &operand_s))
+						!EmitLoadUpperAddSubOperand(1, code, kind, &operand_s,
+							nearest_neon && nearest_neon_d_half != 0))
 					{
 						return false;
 					}
@@ -6506,22 +7200,49 @@ namespace VitaVU
 					SelectCachedCompleteOverwriteQ(acc ? VU_VECTOR_CACHE_ACC :
 						static_cast<u8>(fd), 0) : 0;
 
-				for (unsigned lane = 0; lane < 4; lane++)
+				if (nearest_neon)
 				{
-					const unsigned lane_bit = 1u << (3 - lane);
-					if ((mask & lane_bit) == 0)
-						continue;
-					if (subtract ?
-						!m_code.EmitVsubF32(result_q * 4 + lane,
-							lane, operand_s >= 0 ?
-								static_cast<unsigned>(operand_s) : 4 + lane) :
-						!m_code.EmitVaddF32(result_q * 4 + lane,
-							lane, operand_s >= 0 ?
-								static_cast<unsigned>(operand_s) : 4 + lane))
+					const unsigned d_half = nearest_neon_d_half >= 0 ?
+						static_cast<unsigned>(nearest_neon_d_half) : 0u;
+					const unsigned operand_d = operand_s >= 0 ?
+						static_cast<unsigned>(operand_s) / 2u :
+						2u + d_half;
+					const bool emitted_neon = nearest_neon_d_half >= 0 ?
+						(subtract ?
+							m_code.EmitVsubF32D(result_q * 2u + d_half,
+								d_half, operand_d) :
+							m_code.EmitVaddF32D(result_q * 2u + d_half,
+								d_half, operand_d)) :
+						(subtract ? m_code.EmitVsubF32Q(result_q, 0, 1) :
+							m_code.EmitVaddF32Q(result_q, 0, 1));
+					if (!emitted_neon)
+					{
 						return false;
+					}
+					m_nearest_neon_fmac_ops++;
+					m_nearest_neon_half_ops += nearest_neon_d_half >= 0;
+					m_nearest_neon_scalar_ops_removed += active_lanes - 1;
+				}
+				else
+				{
+					for (unsigned lane = 0; lane < 4; lane++)
+					{
+						const unsigned lane_bit = 1u << (3 - lane);
+						if ((mask & lane_bit) == 0)
+							continue;
+						if (subtract ?
+							!m_code.EmitVsubF32(result_q * 4 + lane,
+								lane, operand_s >= 0 ?
+									static_cast<unsigned>(operand_s) : 4 + lane) :
+							!m_code.EmitVaddF32(result_q * 4 + lane,
+								lane, operand_s >= 0 ?
+									static_cast<unsigned>(operand_s) : 4 + lane))
+							return false;
+					}
 				}
 
-				if (!EmitFinishMacQ(result_q, acc, fd, mask, false, mac_result_required))
+				if (!EmitFinishMacQ(result_q, acc, fd, mask, false,
+						mac_result_required, status_result_required))
 					return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -6532,19 +7253,23 @@ namespace VitaVU
 			}
 
 			bool EmitInlineUpperMul(u32 code, VUInterpFast::UpperFastKind kind,
-				bool mac_result_required)
+				bool mac_result_required, bool status_result_required)
 			{
 				const unsigned fd = VUInterpFast::Fd(code);
 				const unsigned fs = VUInterpFast::Fs(code);
 				const unsigned mask = VUInterpFast::XYZW(code);
 				const bool acc = IsUpperMulAccKind(kind);
+				const u32 active_lanes = ActiveLaneCount(mask);
+				const bool nearest_neon = CanUseNearestNeonFloat() && active_lanes >= 2;
+				const int nearest_neon_d_half = nearest_neon ? ActiveNeonDHalf(mask) : -1;
 				int operand_s = -1;
 
 				// PCSX2 owners: VUops.cpp::_vuMUL* / _vuMULA* and
-				// VUmicroFast.h::ExecuteMulMasked(). Normalize operands in NEON,
-				// then use scalar VFP per active lane because Advanced SIMD VMUL
-				// is fixed round-to-nearest and cannot implement PCSX2's VU
-				// chop-zero MXCSR/FPSCR contract.
+				// VUmicroFast.h::ExecuteMulMasked(). Normalize operands in NEON.
+				// Use D/Q VMUL only when the selected VU1 contract exactly matches
+				// Cortex-A9 Advanced SIMD's fixed nearest/FZ behavior. A contiguous
+				// two-lane half uses D; otherwise use Q or scalar VFP per active lane
+				// under the installed VU FPCR.
 				if (mask != 0)
 				{
 					// Load fs as Q0 and the second operand as either vector Q1 or a
@@ -6572,19 +7297,50 @@ namespace VitaVU
 					SelectCachedCompleteOverwriteQ(acc ? VU_VECTOR_CACHE_ACC :
 						static_cast<u8>(fd), 0) : 0;
 
-				for (unsigned lane = 0; lane < 4; lane++)
+				if (nearest_neon)
 				{
-					const unsigned lane_bit = 1u << (3 - lane);
-					if ((mask & lane_bit) != 0 &&
-						!m_code.EmitVmulF32(result_q * 4 + lane,
-							lane, operand_s >= 0 ?
-								static_cast<unsigned>(operand_s) : 4 + lane))
+					const unsigned d_half = nearest_neon_d_half >= 0 ?
+						static_cast<unsigned>(nearest_neon_d_half) : 0u;
+					const bool broadcast_operand = operand_s >= 0;
+					const unsigned operand_d = broadcast_operand ?
+						static_cast<unsigned>(operand_s) / 2u : 2u + d_half;
+					const unsigned operand_lane = broadcast_operand ?
+						static_cast<unsigned>(operand_s) & 1u : 0u;
+					const bool emitted_neon = nearest_neon_d_half >= 0 ?
+						(broadcast_operand ?
+							m_code.EmitVmulF32DByLane(result_q * 2u + d_half,
+								d_half, operand_d, operand_lane) :
+							m_code.EmitVmulF32D(result_q * 2u + d_half,
+								d_half, operand_d)) :
+						(broadcast_operand ?
+							m_code.EmitVmulF32QByLane(result_q, 0, operand_d,
+								operand_lane) :
+							m_code.EmitVmulF32Q(result_q, 0, 1));
+					if (!emitted_neon)
 					{
 						return false;
 					}
+					m_nearest_neon_fmac_ops++;
+					m_nearest_neon_half_ops += nearest_neon_d_half >= 0;
+					m_nearest_neon_scalar_ops_removed += active_lanes - 1;
+				}
+				else
+				{
+					for (unsigned lane = 0; lane < 4; lane++)
+					{
+						const unsigned lane_bit = 1u << (3 - lane);
+						if ((mask & lane_bit) != 0 &&
+							!m_code.EmitVmulF32(result_q * 4 + lane,
+								lane, operand_s >= 0 ?
+									static_cast<unsigned>(operand_s) : 4 + lane))
+						{
+							return false;
+						}
+					}
 				}
 
-				if (!EmitFinishMacQ(result_q, acc, fd, mask, false, mac_result_required))
+				if (!EmitFinishMacQ(result_q, acc, fd, mask, false,
+						mac_result_required, status_result_required))
 					return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -6595,64 +7351,36 @@ namespace VitaVU
 			}
 
 			bool EmitInlineUpperMaddMsub(u32 code, VUInterpFast::UpperFastKind kind,
-				bool mac_result_required)
+				bool mac_result_required, bool status_result_required)
 			{
 				const unsigned fd = VUInterpFast::Fd(code);
 				const unsigned fs = VUInterpFast::Fs(code);
-				const unsigned ft = VUInterpFast::Ft(code);
 				const unsigned mask = VUInterpFast::XYZW(code);
 				const bool acc = IsUpperMaddMsubAccKind(kind);
 				const bool subtract = IsUpperMsubKind(kind);
 
 				// PCSX2 owners: VUops.cpp::_vuMADD* / _vuMSUB* /
 				// _vuMADDA* / _vuMSUBA* and VUmicroFast.h::VuMaddMsubScalar() /
-				// ExecuteMaddMsubMaskedScalar(). The multiply/add stays scalar VFP
-				// because qword NEON drifts by 1 ULP in dependent ACC chains, but
-				// vuDouble() input normalization is exact integer bit work: load
+				// ExecuteMaddMsubMaskedScalar(). Under the exact/default contract the
+				// multiply/add stays scalar VFP because qword NEON's fixed nearest
+				// rounding drifts in dependent ACC chains. In the explicit VU1-nearest
+				// contract, every multi-lane write uses non-fused VMLA/VMLS: contiguous
+				// two-lane XY/ZW writes use the one-issue-cycle D form and sparse or
+				// wider masks use Q.
+				// vuDouble() input normalization remains exact integer bit work: load
 				// ACC/fs as NEON quads and the operand as either a Q vector or a D
-				// broadcast, normalize them in place (matching VuDoubleBitsNeon()),
-				// then run each active lane's scalar vmul/vadd. A VF-lane
-				// broadcast whose result aliases Ft keeps the per-lane scalar path
-				// so a later lane still observes the just-written Ft, matching
-				// ExecuteMaddMsubMaskedScalar()'s store order.
-				const bool alias_hazard = IsUpperMaddMsubVfBroadcastForm(kind) && fd == ft;
+				// broadcast, then normalize them in place (matching VuDoubleBitsNeon()).
+				const u32 active_lanes = ActiveLaneCount(mask);
+				// PCSX2's canonical VUops.cpp::applyTernaryMACOpBroadcast() receives
+				// its broadcast word by value before writing any destination lane.
+				// Consequently Fd==Ft is not a sequential alias hazard: all lanes use
+				// the same pre-instruction snapshot loaded into Q2/D4 before any store.
+				const bool nearest_contract = CanUseNearestNeonFloat();
+				const int nearest_neon_d_half = nearest_contract && active_lanes == 2 ?
+					ActiveNeonDHalf(mask) : -1;
+				const bool nearest_neon = nearest_contract && active_lanes >= 2;
 				unsigned result_q = 0;
 
-				if (alias_hazard && !EmitLoadWorkingFmacMac(2))
-					return false;
-
-				if (alias_hazard)
-				{
-					for (unsigned lane = 0; lane < 4; lane++)
-					{
-						const unsigned lane_bit = 1u << (3 - lane);
-						if ((mask & lane_bit) == 0)
-						{
-							if (!EmitClearMacLaneInReg(2, lane, HOST_CALL_SCRATCH))
-								return false;
-							continue;
-						}
-
-						if (!EmitLoadAccWord(0, lane) ||
-							!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
-							!m_code.EmitVmovCoreToS(0, 0) ||
-							!EmitLoadVfWord(0, fs, lane) ||
-							!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
-							!m_code.EmitVmovCoreToS(1, 0) ||
-							!EmitLoadUpperMaddMsubOperandWord(0, code, kind, lane) ||
-							!EmitNormalizeVuFloatWord(0, 3, HOST_CALL_SCRATCH) ||
-							!m_code.EmitVmovCoreToS(2, 0) ||
-							!m_code.EmitVmulF32(1, 1, 2) ||
-							(subtract ? !m_code.EmitVsubF32(0, 0, 1) : !m_code.EmitVaddF32(0, 0, 1)) ||
-							!m_code.EmitVmovSToCore(0, 0) ||
-							!EmitUpdateMacLaneFromResult(2, 0, lane, 1, HOST_CALL_SCRATCH) ||
-							!EmitStoreMacResultWord(0, acc, fd, lane))
-						{
-							return false;
-						}
-					}
-				}
-				else
 				{
 					int operand_s = -1;
 					if (mask != 0)
@@ -6700,54 +7428,93 @@ namespace VitaVU
 						}
 					}
 
-					for (unsigned lane = 0; lane < 4; lane++)
+					if (nearest_neon)
 					{
-						const unsigned lane_bit = 1u << (3 - lane);
-						if ((mask & lane_bit) == 0)
+						// ARM ARM A8.6.324 defines Advanced SIMD VMLA/VMLS as
+						// FPMul followed by FPAdd. This is the same non-fused
+						// operation order as PCSX2's scalar MADD/MSUB lowering.
+						const unsigned d_half = nearest_neon_d_half >= 0 ?
+							static_cast<unsigned>(nearest_neon_d_half) : 0u;
+						const bool broadcast_operand = operand_s >= 0;
+						const unsigned operand_d = broadcast_operand ?
+							static_cast<unsigned>(operand_s) / 2u : 4u + d_half;
+						const unsigned operand_lane = broadcast_operand ?
+							static_cast<unsigned>(operand_s) & 1u : 0u;
+						bool emitted_neon = false;
+						if (nearest_neon_d_half >= 0)
 						{
-							if (!EmitClearMacLaneInReg(2, lane, HOST_CALL_SCRATCH))
-								return false;
-							continue;
+							if (broadcast_operand)
+							{
+								emitted_neon = subtract ?
+									m_code.EmitVmlsF32DByLane(result_q * 2u + d_half,
+										2u + d_half, operand_d, operand_lane) :
+									m_code.EmitVmlaF32DByLane(result_q * 2u + d_half,
+										2u + d_half, operand_d, operand_lane);
+							}
+							else
+							{
+								emitted_neon = subtract ?
+									m_code.EmitVmlsF32D(result_q * 2u + d_half,
+										2u + d_half, operand_d) :
+									m_code.EmitVmlaF32D(result_q * 2u + d_half,
+										2u + d_half, operand_d);
+							}
 						}
-
-						// ARM ARM A8.6.324 defines scalar VFP VMLA/VMLS as an
-						// ordered FPMul followed by FPAdd, which is PCSX2's exact
-						// non-fused MADD/MSUB contract. Accumulating directly into
-						// the selected result quad also uses Cortex-A9's
-						// multiplier-accumulator forwarding
-						// instead of VMUL -> VADD/VSUB -> VMOV for every lane.
-						if (subtract ?
-							!m_code.EmitVmlsF32(result_q * 4 + lane,
-								4 + lane, operand_s >= 0 ?
-									static_cast<unsigned>(operand_s) : 8 + lane) :
-							!m_code.EmitVmlaF32(result_q * 4 + lane,
-								4 + lane, operand_s >= 0 ?
-									static_cast<unsigned>(operand_s) : 8 + lane))
+						else if (broadcast_operand)
+						{
+							emitted_neon = subtract ?
+								m_code.EmitVmlsF32QByLane(result_q, 1, operand_d,
+									operand_lane) :
+								m_code.EmitVmlaF32QByLane(result_q, 1, operand_d,
+									operand_lane);
+						}
+						else
+						{
+							emitted_neon = subtract ?
+								m_code.EmitVmlsF32Q(result_q, 1, 2) :
+								m_code.EmitVmlaF32Q(result_q, 1, 2);
+						}
+						if (!emitted_neon)
 						{
 							return false;
+						}
+						m_nearest_neon_fmac_ops++;
+						m_nearest_neon_half_ops += nearest_neon_d_half >= 0;
+						m_nearest_neon_scalar_ops_removed += active_lanes - 1;
+					}
+					else
+					{
+						for (unsigned lane = 0; lane < 4; lane++)
+						{
+							const unsigned lane_bit = 1u << (3 - lane);
+							if ((mask & lane_bit) == 0)
+							{
+								if (!EmitClearMacLaneInReg(2, lane, HOST_CALL_SCRATCH))
+									return false;
+								continue;
+							}
+
+							// ARM ARM A8.6.324 defines scalar VFP VMLA/VMLS as an
+							// ordered FPMul followed by FPAdd, which is PCSX2's exact
+							// non-fused MADD/MSUB contract.
+							if (subtract ?
+								!m_code.EmitVmlsF32(result_q * 4 + lane,
+									4 + lane, operand_s >= 0 ?
+										static_cast<unsigned>(operand_s) : 8 + lane) :
+								!m_code.EmitVmlaF32(result_q * 4 + lane,
+									4 + lane, operand_s >= 0 ?
+										static_cast<unsigned>(operand_s) : 8 + lane))
+							{
+								return false;
+							}
 						}
 					}
 				}
 
-				const unsigned status_reg = m_capture_pending_local_fmac_flags ? 3u : 0u;
-				const bool defer_working_store = m_plan.resident_working_fmac_flags &&
-					m_capture_pending_local_fmac_flags;
-				if (alias_hazard ?
-					((!defer_working_store &&
-							!m_code.EmitStrImm12(2, HOST_VU, VuOffset(offsetof(VURegs, macflag)))) ||
-						!EmitUpdateStatusFromMacReg(2, status_reg, 1, !defer_working_store) ||
-						!EmitCapturePendingLocalFmacFlags(2, status_reg)) :
-					!EmitFinishMacQ(result_q, acc, fd, mask, false,
-						mac_result_required))
+				if (!EmitFinishMacQ(result_q, acc, fd, mask, false,
+						mac_result_required, status_result_required))
 				{
 					return false;
-				}
-				if (alias_hazard)
-				{
-					if (acc)
-						MarkVectorLanesNormalized(VU_VECTOR_CACHE_ACC, static_cast<u8>(mask));
-					else if (fd != 0)
-						MarkVectorLanesNormalized(static_cast<u8>(fd), static_cast<u8>(mask));
 				}
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -6757,7 +7524,8 @@ namespace VitaVU
 #endif
 			}
 
-			bool EmitInlineUpperOuter(u32 code, VUInterpFast::UpperFastKind kind)
+			bool EmitInlineUpperOuter(u32 code, VUInterpFast::UpperFastKind kind,
+				bool mac_result_required, bool status_result_required)
 			{
 				const unsigned fd = VUInterpFast::Fd(code);
 				const unsigned fs = VUInterpFast::Fs(code);
@@ -6767,13 +7535,17 @@ namespace VitaVU
 				// VUmicroFast.h::ExecuteOpmula()/ExecuteOpmsub()/OuterProductNeon().
 				// W is ignored and its MAC bits are left untouched. Load fs/ft (and
 				// ACC for OPMSUB) as NEON quads, normalize them with the shared
-				// vuDouble() quad path, then arrange the cross-product lanes with
-				// cheap S-register moves instead of per-lane scalar normalize plus
-				// ARM->NEON transfers. The three products and subtractions use
-				// scalar VFP because Advanced SIMD FP is fixed nearest on Cortex-A9.
+				// vuDouble() quad path, then arrange the cross-product lanes with five
+				// D-register permutes instead of eight S-register moves. Cortex-A9
+				// MPE TRM table 3-7 assigns one issue cycle to each D VEXT/VDUP/
+				// VTRN/VREV64, saving three issue cycles while preserving the exact
+				// lane words. The explicit VU1-nearest contract executes the
+				// three products/subtractions as Q operations; other configurations
+				// retain scalar VFP.
 				// fs/ft/ACC are all read before any store, so Fd aliases keep the
 				// same source visibility as the direct path.
 				const bool opmsub = kind != VUInterpFast::UpperFastKind::OPMULA;
+				const bool nearest_neon = CanUseNearestNeonFloat();
 
 				// Q2 = fs, Q3 = ft. OPMSUB initially loads ACC in Q0, then
 				// moves it to Q2 only after the rearranged fs lanes have consumed
@@ -6804,11 +7576,22 @@ namespace VitaVU
 				{
 					// fs_yzx = {fs.y, fs.z, fs.x, fs.x} in Q0;
 					// ft_zxy = {ft.z, ft.x, ft.y, ft.y} in Q1.
-					if (!m_code.EmitVmovS(0, 9) || !m_code.EmitVmovS(1, 10) ||
-						!m_code.EmitVmovS(2, 8) || !m_code.EmitVmovS(3, 8) ||
-						!m_code.EmitVmovS(4, 14) || !m_code.EmitVmovS(5, 12) ||
-						!m_code.EmitVmovS(6, 13) || !m_code.EmitVmovS(7, 13) ||
-						!m_code.EmitVmulF32(0, 0, 4) ||
+					if (!m_code.EmitVextI8D(0, 4, 5, sizeof(u32)) ||
+						!m_code.EmitVdupI32DFromQlane(1, 2, 0) ||
+						!m_code.EmitVtrnI32D(6, 7) ||
+						!m_code.EmitVrev64I32D(2, 6) ||
+						!m_code.EmitVdupI32DFromQlane(3, 3, 2))
+					{
+						return false;
+					}
+					if (nearest_neon)
+					{
+						if (!m_code.EmitVmulF32Q(0, 0, 1))
+							return false;
+						m_nearest_neon_fmac_ops++;
+						m_nearest_neon_scalar_ops_removed += 2;
+					}
+					else if (!m_code.EmitVmulF32(0, 0, 4) ||
 						!m_code.EmitVmulF32(1, 1, 5) ||
 						!m_code.EmitVmulF32(2, 2, 6))
 					{
@@ -6817,15 +7600,30 @@ namespace VitaVU
 				}
 				else
 				{
-					// Build fs_yzx in Q1 while Q0 retains ACC, then reuse dead
-					// Q2 for ACC and Q0 for ft_zxy. VMUL keeps PCSX2's fs*ft
-					// operand order for NaN behavior before ACC-product subtraction.
-					if (!m_code.EmitVmovS(4, 9) || !m_code.EmitVmovS(5, 10) ||
-						!m_code.EmitVmovS(6, 8) || !m_code.EmitVmovS(7, 8) ||
+					// Build fs_yzx in Q1 while Q0 retains ACC, then reuse dead Q2 for
+					// ACC and Q0 for ft_zxy. The D6/D7 transpose is safe because Ft is
+					// dead after the shuffle. VMUL keeps PCSX2's fs*ft operand order for
+					// NaN behavior before ACC-product subtraction.
+					if (!m_code.EmitVextI8D(2, 4, 5, sizeof(u32)) ||
+						!m_code.EmitVdupI32DFromQlane(3, 2, 0) ||
 						!m_code.EmitVorrQ(2, 0, 0) ||
-						!m_code.EmitVmovS(0, 14) || !m_code.EmitVmovS(1, 12) ||
-						!m_code.EmitVmovS(2, 13) || !m_code.EmitVmovS(3, 13) ||
-						!m_code.EmitVmulF32(4, 4, 0) ||
+						!m_code.EmitVtrnI32D(6, 7) ||
+						!m_code.EmitVrev64I32D(0, 6) ||
+						!m_code.EmitVdupI32DFromQlane(1, 3, 2))
+					{
+						return false;
+					}
+					if (nearest_neon)
+					{
+						if (!m_code.EmitVmulF32Q(1, 1, 0) ||
+							!m_code.EmitVsubF32Q(0, 2, 1))
+						{
+							return false;
+						}
+						m_nearest_neon_fmac_ops += 2;
+						m_nearest_neon_scalar_ops_removed += 4;
+					}
+					else if (!m_code.EmitVmulF32(4, 4, 0) ||
 						!m_code.EmitVmulF32(5, 5, 1) ||
 						!m_code.EmitVmulF32(6, 6, 2) ||
 						!m_code.EmitVsubF32(0, 8, 4) ||
@@ -6836,7 +7634,8 @@ namespace VitaVU
 					}
 				}
 
-				if (!EmitFinishMacQ(0, !opmsub, fd, 0x0e, true, true))
+				if (!EmitFinishMacQ(0, !opmsub, fd, 0x0e, true,
+						mac_result_required, status_result_required))
 					return false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -7008,6 +7807,9 @@ namespace VitaVU
 			bool EmitInlineBackupVI(unsigned reg, bool direct_full_install,
 				bool direct_same_register_refresh)
 			{
+				if (m_plan.assume_scheduled_microcode)
+					return true;
+
 				// PCSX2 owner: VUops.cpp::_vuBackupVI(). Keep the exact
 				// repeated-write rule in generated A32 so lower IALU ops can
 				// avoid a C++ call without changing branch-operand visibility.
@@ -8099,6 +8901,14 @@ namespace VitaVU
 			bool EmitLoadViBranchOperand(unsigned rd, unsigned reg)
 			{
 				pxAssert(rd == 0 || rd == 1);
+				if (m_plan.assume_scheduled_microcode)
+				{
+					// Sony VU User Manual 3.4.8 makes the one-pair separation a
+					// scheduling requirement. With no legal producer for PCSX2's
+					// compatibility window, load and sign-extend the architectural VI
+					// directly instead of testing three private state fields.
+					return EmitLoadViHalfwordRaw(rd, reg) && m_code.EmitSxth(rd, rd);
+				}
 
 				// PCSX2 owner: VUmicroFast.h::ReadViBranchOperand() and
 				// VUops.cpp::_vuIBxx(). Conditional branches see the backed-up
@@ -8418,6 +9228,55 @@ namespace VitaVU
 					EmuConfig.Cpu.VU1FPCR).GetFlushToZero();
 			}
 
+			bool VuOverflowClampEnabled() const
+			{
+				return CHECK_VU_OVERFLOW(m_vu0_memory_map ? 0u : 1u);
+			}
+
+			bool CanUseNearestNeonFloat() const
+			{
+				// Cortex-A9 NEON MPE TRM 2.3.1: Advanced SIMD arithmetic is
+				// always FZ and round-to-nearest. Restrict the vector lowering to
+				// VU1 configurations which request exactly those modes. Requiring
+				// PCSX2's standard overflow clamp also ensures vuDouble() has
+				// converted every exponent-0xff input to signed max finite before
+				// the Advanced SIMD operation, avoiding VFP/NEON NaN-mode drift.
+				return !m_vu0_memory_map &&
+					EmuConfig.Cpu.VU1FPCR.GetRoundMode() == FPRoundMode::Nearest &&
+					EmuConfig.Cpu.VU1FPCR.GetFlushToZero() && CHECK_VU_OVERFLOW(1);
+			}
+
+			bool CanUseApproximateVu1Q() const
+			{
+				return EmuConfig.Speedhacks.vu1ApproximateQ && CanUseNearestNeonFloat();
+			}
+
+			bool CanUseApproximateVu1P() const
+			{
+				return EmuConfig.Speedhacks.vu1ApproximateP && CanUseNearestNeonFloat();
+			}
+
+			static u32 ActiveLaneCount(unsigned mask)
+			{
+				mask &= 0x0f;
+				return (mask & 1u) + ((mask >> 1) & 1u) +
+					((mask >> 2) & 1u) + ((mask >> 3) & 1u);
+			}
+
+			static int ActiveNeonDHalf(unsigned mask)
+			{
+				// VU mask bits C/3 select the XY/ZW halves of a loaded Q register.
+				// A nonzero mask wholly contained in one half can use Cortex-A9's
+				// one-cycle D-form Advanced SIMD operation instead of its two-cycle
+				// Q form. Mixed-half masks retain Q or scalar lowering.
+				mask &= 0x0f;
+				if (mask != 0 && (mask & 0x03) == 0)
+					return 0;
+				if (mask != 0 && (mask & 0x0c) == 0)
+					return 1;
+				return -1;
+			}
+
 			bool IsVuFloatInputConstantNormalized(u32 bits) const
 			{
 				// PCSX2 owner: VUops.cpp::vuDouble(). Under FZ, scalar VFP
@@ -8428,7 +9287,7 @@ namespace VitaVU
 				const bool denormal_needs_work = exponent == 0 &&
 					(bits & FPU_FLOAT_MANTISSA_MASK) != 0 && !VuFpcrFlushesInputsToZero();
 				const bool overflow_needs_work = exponent == FPU_FLOAT_EXPONENT_MASK &&
-					CHECK_VU_OVERFLOW(0);
+					VuOverflowClampEnabled();
 				return !denormal_needs_work && !overflow_needs_work;
 			}
 
@@ -8533,7 +9392,7 @@ namespace VitaVU
 				(void)vq_b;
 				return true;
 #else
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				const bool overflow_clamp = VuOverflowClampEnabled();
 				return EmitEnsureVuFloatInputNormalizeConstants(overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_a, overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_b, overflow_clamp);
@@ -8547,7 +9406,7 @@ namespace VitaVU
 				(void)vq;
 				return true;
 #else
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				const bool overflow_clamp = VuOverflowClampEnabled();
 				return EmitEnsureVuFloatInputNormalizeConstants(overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq, overflow_clamp);
 #endif
@@ -8562,7 +9421,7 @@ namespace VitaVU
 				(void)vq_c;
 				return true;
 #else
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				const bool overflow_clamp = VuOverflowClampEnabled();
 				return EmitEnsureVuFloatInputNormalizeConstants(overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_a, overflow_clamp) &&
 					EmitNormalizeVuFloatQuadInPlace(vq_b, overflow_clamp) &&
@@ -8621,7 +9480,7 @@ namespace VitaVU
 				(void)b_normalized;
 				return true;
 #else
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				const bool overflow_clamp = VuOverflowClampEnabled();
 				return ((a_normalized && b_normalized) ||
 					EmitEnsureVuFloatInputNormalizeConstants(overflow_clamp)) &&
 					EmitNormalizeKnownQuad(vq_a, a_normalized, overflow_clamp) &&
@@ -8641,7 +9500,7 @@ namespace VitaVU
 				(void)operand_normalized;
 				return true;
 #else
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				const bool overflow_clamp = VuOverflowClampEnabled();
 				return ((a_normalized && operand_normalized) ||
 					EmitEnsureVuFloatInputNormalizeConstants(overflow_clamp)) &&
 					EmitNormalizeKnownQuad(vq_a, a_normalized, overflow_clamp) &&
@@ -8665,7 +9524,7 @@ namespace VitaVU
 				(void)c_normalized;
 				return true;
 #else
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				const bool overflow_clamp = VuOverflowClampEnabled();
 				return ((a_normalized && b_normalized && c_normalized) ||
 					EmitEnsureVuFloatInputNormalizeConstants(overflow_clamp)) &&
 					EmitNormalizeKnownQuad(vq_a, a_normalized, overflow_clamp) &&
@@ -8688,7 +9547,7 @@ namespace VitaVU
 				(void)operand_normalized;
 				return true;
 #else
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				const bool overflow_clamp = VuOverflowClampEnabled();
 				return ((a_normalized && b_normalized && operand_normalized) ||
 					EmitEnsureVuFloatInputNormalizeConstants(overflow_clamp)) &&
 					EmitNormalizeKnownQuad(vq_a, a_normalized, overflow_clamp) &&
@@ -8712,7 +9571,7 @@ namespace VitaVU
 				// PCSX2 owner: VUops.cpp::vuDouble() / VUmicroFast.h::VuDouble().
 				// Normalize denormals to signed zero and, when the VU overflow
 				// clamp is enabled, infinities/NaNs to signed max finite.
-				const bool overflow_clamp = CHECK_VU_OVERFLOW(0);
+				const bool overflow_clamp = VuOverflowClampEnabled();
 				if (!EmitAndRegImm32(exponent_reg, reg, FPU_FLOAT_EXPONENT_MASK, scratch_reg) ||
 					!m_code.EmitCmpImm32(exponent_reg, 0))
 				{
@@ -8792,7 +9651,7 @@ namespace VitaVU
 
 				size_t exponent_not_special = static_cast<size_t>(-1);
 				size_t raw_nan = static_cast<size_t>(-1);
-				if (!CHECK_VU_OVERFLOW(0))
+				if (!VuOverflowClampEnabled())
 				{
 					if (!EmitAndRegImm32(scratch_reg, reg, FPU_FLOAT_EXPONENT_MASK, temp_reg) ||
 						!EmitCmpRegImm32(scratch_reg, FPU_FLOAT_EXPONENT_MASK, temp_reg))
@@ -8832,6 +9691,63 @@ namespace VitaVU
 						m_code.PatchBranch(raw_nan, done, Condition::NE));
 			}
 
+			bool EmitClampApproximateDivInputWord(unsigned value_reg,
+				unsigned exponent_reg, unsigned scratch_reg)
+			{
+				// The approximate-Q gate requires VU overflow clamping. Advanced SIMD
+				// already supplies the required FZ input behavior for exponent-zero
+				// values, so only the uncommon exponent-0xff representation needs a
+				// scalar repair before entering the MPE. PCSX2 owner:
+				// VUops.cpp::vuDouble().
+				if (!m_code.EmitUbfx(exponent_reg, value_reg, 23, 8) ||
+					!m_code.EmitCmpImm32(exponent_reg, 0xffu))
+				{
+					return false;
+				}
+				const size_t finite = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (finite == static_cast<size_t>(-1))
+					return false;
+				if (!EmitAndRegImm32(value_reg, value_reg, FPU_FLOAT_SIGN_MASK,
+						scratch_reg) ||
+					!EmitOrrRegImm32(value_reg, value_reg, FPU_FLOAT_MAX_FINITE,
+						scratch_reg))
+				{
+					return false;
+				}
+				return m_code.PatchBranch(finite, m_code.Size(), Condition::NE);
+			}
+
+			bool EmitComputeApproximateDivD(unsigned fs_reg, unsigned ft_reg)
+			{
+				// Put fs and ft in D0 lanes 0 and 1 with one core-to-MPE move. ARM ARM
+				// A8.6.371 defines VRECPE's reciprocal estimate; the scalar-by-lane
+				// multiply selects only 1/ft and therefore produces fs/ft in D2[0].
+				//
+				// One Newton step retains roughly 16 useful mantissa bits. Cortex-A9
+				// MPE TRM table 3-8 makes the dependent VRECPS/multiply chain too long
+				// to win in isolation over table 3-2's scalar VDIV. The complete path
+				// remains smaller by avoiding ordinary scalar input normalization,
+				// making result normalization exceptional, and keeping D2 in Advanced
+				// SIMD through publication: table 3-10 charges eleven additional cycles
+				// for a SIMD-to-integer transfer. The unrefined estimate was rejected by
+				// real Vita evidence because its roughly eight bits visibly corrupted
+				// perspective geometry without improving frame rate.
+				constexpr unsigned INPUTS_D = 0;
+				constexpr unsigned ESTIMATE_D = 1;
+				constexpr unsigned RESULT_D = 2;
+				constexpr unsigned STEP_D = 3;
+				if (!m_code.EmitVmovCorePairToD(INPUTS_D, fs_reg, ft_reg) ||
+					!m_code.EmitVrecpeF32D(ESTIMATE_D, INPUTS_D) ||
+					!m_code.EmitVrecpsF32D(STEP_D, INPUTS_D, ESTIMATE_D) ||
+					!m_code.EmitVmulF32DByLane(RESULT_D, INPUTS_D, ESTIMATE_D, 1) ||
+					!m_code.EmitVmulF32DByLane(RESULT_D, RESULT_D, STEP_D, 1))
+				{
+					return false;
+				}
+				m_approximate_q_ops++;
+				return true;
+			}
+
 			bool EmitComputeDiv(unsigned q_reg, unsigned fs_reg, unsigned ft_reg,
 				unsigned temp_reg, unsigned scratch_reg)
 			{
@@ -8860,11 +9776,110 @@ namespace VitaVU
 			bool EmitStoreVu1QAndStatus(unsigned q_reg, unsigned status_reg,
 				unsigned temp_reg, unsigned scratch_reg)
 			{
-				return m_code.EmitStrImm12(q_reg, HOST_VU, VuOffset(offsetof(VURegs, q))) &&
-					m_code.EmitLdrImm12(temp_reg, HOST_VU, VuOffset(offsetof(VURegs, statusflag))) &&
-					EmitAndRegImm32(temp_reg, temp_reg, ~0x30u, scratch_reg) &&
-					m_code.EmitOrrReg(temp_reg, temp_reg, status_reg) &&
-					m_code.EmitStrImm12(temp_reg, HOST_VU, VuOffset(offsetof(VURegs, statusflag)));
+				if (!m_code.EmitStrImm12(q_reg, HOST_VU, VuOffset(offsetof(VURegs, q))))
+					return false;
+				if (m_plan.instant_qp &&
+					!m_code.EmitStrImm12(q_reg, HOST_VU, ViOffset(REG_Q)))
+				{
+					return false;
+				}
+				return EmitStoreVu1QStatus(status_reg, temp_reg, scratch_reg);
+			}
+
+			bool EmitStoreVu1ApproximateQAndStatus(unsigned address_reg,
+				unsigned status_reg, unsigned temp_reg, unsigned scratch_reg)
+			{
+				constexpr unsigned RESULT_D = 2;
+				if (!m_code.EmitAddImm32(address_reg, HOST_VU,
+						VuOffset(offsetof(VURegs, q))) ||
+					!m_code.EmitVst1D32Lane(RESULT_D, 0, address_reg))
+				{
+					return false;
+				}
+				if (m_plan.instant_qp &&
+					(!m_code.EmitAddImm32(address_reg, HOST_VU, ViOffset(REG_Q)) ||
+					 !m_code.EmitVst1D32Lane(RESULT_D, 0, address_reg)))
+				{
+					return false;
+				}
+				return EmitStoreVu1QStatus(status_reg, temp_reg, scratch_reg);
+			}
+
+			bool EmitStoreVu1ApproximateDivQAndStatus(unsigned fs_reg,
+				unsigned ft_reg, unsigned address_reg, unsigned status_reg,
+				unsigned temp_reg, unsigned scratch_reg)
+			{
+				// Advanced SIMD's FZ result already implements the exponent-zero half
+				// of vuFloat(). A quotient whose normalized input exponent difference
+				// is below 127 cannot overflow to exponent 0xff, even with VRECPE's
+				// estimate error, so the overwhelmingly common finite path publishes
+				// D2 directly. Keep the exact PCSX2 normalization for the narrow high-
+				// exponent region, accepting table 3-10's transfer cost only there.
+				if (!m_code.EmitUbfx(temp_reg, fs_reg, 23, 8) ||
+					!m_code.EmitUbfx(scratch_reg, ft_reg, 23, 8) ||
+					!m_code.EmitSubReg(temp_reg, temp_reg, scratch_reg) ||
+					!m_code.EmitCmpImm32(temp_reg, 127u))
+				{
+					return false;
+				}
+				const size_t common_finite = m_code.EmitBranchPlaceholder(Condition::LT);
+				if (common_finite == static_cast<size_t>(-1))
+					return false;
+
+				constexpr unsigned RESULT_D = 2;
+				if (!m_code.EmitVmovD32LaneToCore(fs_reg, RESULT_D, 0) ||
+					!EmitNormalizeVuFloatWord(fs_reg, temp_reg, scratch_reg) ||
+					!EmitStoreVu1QAndStatus(fs_reg, status_reg, temp_reg, scratch_reg))
+				{
+					return false;
+				}
+				const size_t done_from_overflow_region = m_code.EmitBranchPlaceholder();
+				if (done_from_overflow_region == static_cast<size_t>(-1))
+					return false;
+
+				const size_t common_finite_target = m_code.Size();
+				if (!m_code.PatchBranch(common_finite, common_finite_target,
+						Condition::LT) ||
+					!EmitStoreVu1ApproximateQAndStatus(address_reg, status_reg,
+						temp_reg, scratch_reg))
+				{
+					return false;
+				}
+				return m_code.PatchBranch(done_from_overflow_region, m_code.Size());
+			}
+
+			bool EmitStoreVu1QStatus(unsigned status_reg,
+				unsigned temp_reg, unsigned scratch_reg)
+			{
+				if (!m_code.EmitLdrImm12(temp_reg, HOST_VU, VuOffset(offsetof(VURegs, statusflag))) ||
+					!EmitAndRegImm32(temp_reg, temp_reg, ~0x30u, scratch_reg) ||
+					!m_code.EmitOrrReg(temp_reg, temp_reg, status_reg) ||
+					!m_code.EmitStrImm12(temp_reg, HOST_VU, VuOffset(offsetof(VURegs, statusflag))))
+				{
+					return false;
+				}
+
+				if (!m_plan.instant_qp)
+					return true;
+
+				// PCSX2 owner: VUops.cpp::_vuFDIVflush(). Preserve its exact
+				// architectural D/I merge while omitting fdivPipe entirely. When
+				// delayed FMAC flags already own architectural STATUS in r6, update that
+				// exact instance in place instead of loading/storing a stale VURegs word.
+				if (m_plan.deferred_fmac_flags)
+				{
+					return EmitAndRegImm32(HOST_LIMIT_LO, HOST_LIMIT_LO, 0x0fcfu,
+							scratch_reg) &&
+						EmitAndRegImm32(temp_reg, temp_reg, 0x0c30u, scratch_reg) &&
+						m_code.EmitOrrReg(HOST_LIMIT_LO, HOST_LIMIT_LO, temp_reg);
+				}
+
+				return m_code.EmitLdrImm12(scratch_reg, HOST_VU,
+						ViOffset(REG_STATUS_FLAG)) &&
+					EmitAndRegImm32(scratch_reg, scratch_reg, 0x0fcfu, status_reg) &&
+					EmitAndRegImm32(temp_reg, temp_reg, 0x0c30u, status_reg) &&
+					m_code.EmitOrrReg(scratch_reg, scratch_reg, temp_reg) &&
+					m_code.EmitStrImm12(scratch_reg, HOST_VU, ViOffset(REG_STATUS_FLAG));
 			}
 
 			bool EmitInlineLowerFdiv(u32 code, VUInterpFast::LowerFastKind kind)
@@ -8890,13 +9905,29 @@ namespace VitaVU
 				{
 					case VUInterpFast::LowerFastKind::DIV:
 					{
-						emitted_body =
-							EmitLoadVfWord(HOST_FS_Q, fs, fsf) &&
-							EmitNormalizeVuFloatWord(HOST_FS_Q, HOST_TEMP, HOST_CALL_SCRATCH) &&
+						const bool approximate = CanUseApproximateVu1Q();
+						emitted_body = EmitLoadVfWord(HOST_FS_Q, fs, fsf) &&
+							(approximate || EmitNormalizeVuFloatWord(HOST_FS_Q,
+								HOST_TEMP, HOST_CALL_SCRATCH)) &&
 							EmitLoadVfWord(HOST_FT, ft, ftf) &&
-							EmitNormalizeVuFloatWord(HOST_FT, HOST_TEMP, HOST_CALL_SCRATCH) &&
-							EmitAbsWord(HOST_TEMP, HOST_FT, HOST_CALL_SCRATCH) &&
-							m_code.EmitCmpImm32(HOST_TEMP, 0);
+							(approximate || EmitNormalizeVuFloatWord(HOST_FT,
+								HOST_TEMP, HOST_CALL_SCRATCH));
+						if (!emitted_body)
+							return false;
+						if (approximate)
+						{
+							// Under the required FZ mode, exponent-zero is exactly the
+							// vuDouble() zero class, including raw denormals. Test it in
+							// one UBFX instead of normalizing both ordinary inputs through
+							// scalar core branches.
+							emitted_body = m_code.EmitUbfx(HOST_TEMP, HOST_FT, 23, 8) &&
+								m_code.EmitCmpImm32(HOST_TEMP, 0);
+						}
+						else
+						{
+							emitted_body = EmitAbsWord(HOST_TEMP, HOST_FT,
+								HOST_CALL_SCRATCH) && m_code.EmitCmpImm32(HOST_TEMP, 0);
+						}
 						if (!emitted_body)
 							return false;
 
@@ -8904,8 +9935,9 @@ namespace VitaVU
 						if (divisor_nonzero == static_cast<size_t>(-1))
 							return false;
 
-						emitted_body =
-							EmitAbsWord(HOST_TEMP, HOST_FS_Q, HOST_CALL_SCRATCH) &&
+						emitted_body = (approximate ?
+							m_code.EmitUbfx(HOST_TEMP, HOST_FS_Q, 23, 8) :
+							EmitAbsWord(HOST_TEMP, HOST_FS_Q, HOST_CALL_SCRATCH)) &&
 							m_code.EmitMovImm8(HOST_STATUS_BITS, 0x20) &&
 							m_code.EmitCmpImm32(HOST_TEMP, 0) &&
 							m_code.EmitMovImm8(HOST_STATUS_BITS, 0x10, Condition::EQ) &&
@@ -8920,14 +9952,44 @@ namespace VitaVU
 							return false;
 
 						const size_t divisor_nonzero_target = m_code.Size();
-						if (!m_code.PatchBranch(divisor_nonzero, divisor_nonzero_target, Condition::NE) ||
-							!EmitComputeDiv(HOST_FS_Q, HOST_FS_Q, HOST_FT, HOST_TEMP, HOST_CALL_SCRATCH))
+						if (!m_code.PatchBranch(divisor_nonzero, divisor_nonzero_target, Condition::NE))
 						{
 							return false;
 						}
-
-						emitted_body = m_code.PatchBranch(done_from_zero, m_code.Size()) &&
-							EmitStoreVu1QAndStatus(HOST_FS_Q, HOST_STATUS_BITS, HOST_TEMP, HOST_CALL_SCRATCH);
+						if (approximate)
+						{
+							if (!EmitClampApproximateDivInputWord(HOST_FS_Q,
+									HOST_TEMP, HOST_CALL_SCRATCH) ||
+								!EmitClampApproximateDivInputWord(HOST_FT,
+									HOST_TEMP, HOST_CALL_SCRATCH) ||
+								!EmitComputeApproximateDivD(HOST_FS_Q, HOST_FT) ||
+								!EmitStoreVu1ApproximateDivQAndStatus(HOST_FS_Q,
+									HOST_FT, HOST_FS_Q, HOST_STATUS_BITS, HOST_TEMP,
+									HOST_CALL_SCRATCH))
+							{
+								return false;
+							}
+							const size_t done_from_normal = m_code.EmitBranchPlaceholder();
+							if (done_from_normal == static_cast<size_t>(-1))
+								return false;
+							const size_t zero_target = m_code.Size();
+							if (!m_code.PatchBranch(done_from_zero, zero_target) ||
+								!EmitStoreVu1QAndStatus(HOST_FS_Q, HOST_STATUS_BITS,
+									HOST_TEMP, HOST_CALL_SCRATCH))
+							{
+								return false;
+							}
+							emitted_body = m_code.PatchBranch(done_from_normal, m_code.Size());
+						}
+						else
+						{
+							emitted_body =
+								EmitComputeDiv(HOST_FS_Q, HOST_FS_Q, HOST_FT,
+									HOST_TEMP, HOST_CALL_SCRATCH) &&
+								m_code.PatchBranch(done_from_zero, m_code.Size()) &&
+								EmitStoreVu1QAndStatus(HOST_FS_Q, HOST_STATUS_BITS,
+									HOST_TEMP, HOST_CALL_SCRATCH);
+						}
 						break;
 					}
 
@@ -8996,17 +10058,43 @@ namespace VitaVU
 						const size_t ft_nonzero_target = m_code.Size();
 						if (!m_code.PatchBranch(ft_nonzero, ft_nonzero_target, Condition::NE) ||
 							!EmitSetInvalidIfNegativeNonzero(HOST_FT, HOST_STATUS_BITS, HOST_TEMP, HOST_CALL_SCRATCH) ||
-							!EmitComputeSqrtAbsFt(HOST_FT, HOST_FT, HOST_TEMP, HOST_CALL_SCRATCH) ||
-							!EmitComputeDiv(HOST_FS_Q, HOST_FS_Q, HOST_FT, HOST_TEMP, HOST_CALL_SCRATCH))
+							!EmitComputeSqrtAbsFt(HOST_FT, HOST_FT, HOST_TEMP, HOST_CALL_SCRATCH))
 						{
 							return false;
 						}
-
-						const size_t done_target = m_code.Size();
-						emitted_body =
-							m_code.PatchBranch(done_from_zero_zero, done_target) &&
-							m_code.PatchBranch(done_from_zero, done_target) &&
-							EmitStoreVu1QAndStatus(HOST_FS_Q, HOST_STATUS_BITS, HOST_TEMP, HOST_CALL_SCRATCH);
+						if (CanUseApproximateVu1Q())
+						{
+							if (!EmitComputeApproximateDivD(HOST_FS_Q, HOST_FT) ||
+								!EmitStoreVu1ApproximateDivQAndStatus(HOST_FS_Q,
+									HOST_FT, HOST_FS_Q, HOST_STATUS_BITS, HOST_TEMP,
+									HOST_CALL_SCRATCH))
+							{
+								return false;
+							}
+							const size_t done_from_normal = m_code.EmitBranchPlaceholder();
+							if (done_from_normal == static_cast<size_t>(-1))
+								return false;
+							const size_t zero_target = m_code.Size();
+							if (!m_code.PatchBranch(done_from_zero_zero, zero_target) ||
+								!m_code.PatchBranch(done_from_zero, zero_target) ||
+								!EmitStoreVu1QAndStatus(HOST_FS_Q, HOST_STATUS_BITS,
+									HOST_TEMP, HOST_CALL_SCRATCH))
+							{
+								return false;
+							}
+							emitted_body = m_code.PatchBranch(done_from_normal, m_code.Size());
+						}
+						else
+						{
+							emitted_body = EmitComputeDiv(HOST_FS_Q, HOST_FS_Q, HOST_FT,
+								HOST_TEMP, HOST_CALL_SCRATCH);
+							const size_t done_target = m_code.Size();
+							emitted_body = emitted_body &&
+								m_code.PatchBranch(done_from_zero_zero, done_target) &&
+								m_code.PatchBranch(done_from_zero, done_target) &&
+								EmitStoreVu1QAndStatus(HOST_FS_Q, HOST_STATUS_BITS,
+									HOST_TEMP, HOST_CALL_SCRATCH);
+						}
 						break;
 					}
 
@@ -9020,7 +10108,15 @@ namespace VitaVU
 				// representation. Q has no automatic data-dependency interlock,
 				// however, so do not expose that fact until a later WAITQ or FDIV
 				// resource stall has forced this pending result into VI[Q].
-				m_pending_q_operand_normalized = true;
+				if (m_plan.instant_qp)
+				{
+					m_q_operand_normalized = true;
+					m_pending_q_operand_normalized = false;
+				}
+				else
+				{
+					m_pending_q_operand_normalized = true;
+				}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 				return EmitQemuLowerFdivInlineCounter();
@@ -9037,10 +10133,34 @@ namespace VitaVU
 					m_code.EmitVmovCoreToS(sreg, word_reg);
 			}
 
+			bool EmitStoreWordToVuP(unsigned word_reg)
+			{
+				return m_code.EmitStrImm12(word_reg, HOST_VU, VuOffset(offsetof(VURegs, p))) &&
+					(!m_plan.instant_qp ||
+						m_code.EmitStrImm12(word_reg, HOST_VU, ViOffset(REG_P)));
+			}
+
 			bool EmitStoreSToVuP(unsigned sreg, unsigned word_reg)
 			{
 				return m_code.EmitVmovSToCore(word_reg, sreg) &&
-					m_code.EmitStrImm12(word_reg, HOST_VU, VuOffset(offsetof(VURegs, p)));
+					EmitStoreWordToVuP(word_reg);
+			}
+
+			bool EmitStoreD32LaneToVuP(unsigned dreg, u8 lane,
+				unsigned address_reg)
+			{
+				// Approximate EFU results are produced by Advanced SIMD. Cortex-A9
+				// MPE TRM table 3-10 charges eleven additional cycles if that result
+				// first crosses to the integer core. Publish the lane directly instead.
+				if (!m_code.EmitAddImm32(address_reg, HOST_VU,
+						VuOffset(offsetof(VURegs, p))) ||
+					!m_code.EmitVst1D32Lane(dreg, lane, address_reg))
+				{
+					return false;
+				}
+				return !m_plan.instant_qp ||
+					(m_code.EmitAddImm32(address_reg, HOST_VU, ViOffset(REG_P)) &&
+						m_code.EmitVst1D32Lane(dreg, lane, address_reg));
 			}
 
 			bool EmitLoadOneToS(unsigned sreg, unsigned word_reg)
@@ -9093,6 +10213,70 @@ namespace VitaVU
 					m_code.EmitStrImm12(word_reg, HOST_VU, VuOffset(offsetof(VURegs, p)));
 			}
 
+			bool EmitApproximateReciprocalS0()
+			{
+				// One Newton step: x1=x0*(2-d*x0). The input and output remain in
+				// S0/D0 so the surrounding EFU implementation keeps its established
+				// publication path without an ARM/VFP register-file round trip.
+				constexpr unsigned VALUE_D = 0;
+				constexpr unsigned ESTIMATE_D = 1;
+				constexpr unsigned STEP_D = 2;
+				const bool emitted = m_code.EmitVrecpeF32D(ESTIMATE_D, VALUE_D) &&
+					m_code.EmitVrecpsF32D(STEP_D, VALUE_D, ESTIMATE_D) &&
+					m_code.EmitVmulF32D(VALUE_D, ESTIMATE_D, STEP_D);
+				m_approximate_p_ops += emitted;
+				return emitted;
+			}
+
+			bool EmitApproximateReciprocalSqrtS0()
+			{
+				// ARM ARM A2 reciprocal-square-root iteration:
+				// x1=x0*(3-d*x0*x0)/2. VRSQRTE/VRSQRTS are fixed-nearest/FZ
+				// Advanced SIMD operations on Cortex-A9.
+				constexpr unsigned VALUE_D = 0;
+				constexpr unsigned ESTIMATE_D = 1;
+				constexpr unsigned STEP_D = 2;
+				const bool emitted = m_code.EmitVrsqrteF32D(ESTIMATE_D, VALUE_D) &&
+					m_code.EmitVmulF32D(STEP_D, ESTIMATE_D, ESTIMATE_D) &&
+					m_code.EmitVrsqrtsF32D(STEP_D, VALUE_D, STEP_D) &&
+					m_code.EmitVmulF32D(VALUE_D, ESTIMATE_D, STEP_D);
+				m_approximate_p_ops += emitted;
+				return emitted;
+			}
+
+			bool EmitApproximateSqrtS0()
+			{
+				constexpr unsigned VALUE_D = 0;
+				constexpr unsigned ESTIMATE_D = 1;
+				constexpr unsigned STEP_D = 2;
+				const bool emitted = m_code.EmitVrsqrteF32D(ESTIMATE_D, VALUE_D) &&
+					m_code.EmitVmulF32D(STEP_D, ESTIMATE_D, ESTIMATE_D) &&
+					m_code.EmitVrsqrtsF32D(STEP_D, VALUE_D, STEP_D) &&
+					m_code.EmitVmulF32D(ESTIMATE_D, ESTIMATE_D, STEP_D) &&
+					m_code.EmitVmulF32D(VALUE_D, VALUE_D, ESTIMATE_D);
+				m_approximate_p_ops += emitted;
+				return emitted;
+			}
+
+			bool EmitApproximateS1DivS0ToS0()
+			{
+				// EATANxy/xz arrives with denominator X in S0 and numerator in S1.
+				// Duplicate X inside the MPE, refine its reciprocal once, multiply
+				// both D0 lanes, then select numerator/X from S1.
+				constexpr unsigned VALUES_D = 0;
+				constexpr unsigned DIVISOR_D = 1;
+				constexpr unsigned ESTIMATE_D = 2;
+				constexpr unsigned STEP_D = 3;
+				const bool emitted = m_code.EmitVdupI32DFromQlane(DIVISOR_D, 0, 0) &&
+					m_code.EmitVrecpeF32D(ESTIMATE_D, DIVISOR_D) &&
+					m_code.EmitVrecpsF32D(STEP_D, DIVISOR_D, ESTIMATE_D) &&
+					m_code.EmitVmulF32D(ESTIMATE_D, ESTIMATE_D, STEP_D) &&
+					m_code.EmitVmulF32D(VALUES_D, VALUES_D, ESTIMATE_D) &&
+					m_code.EmitVmovS(0, 1);
+				m_approximate_p_ops += emitted;
+				return emitted;
+			}
+
 			bool EmitReciprocalIfNonzero(unsigned value_sreg, unsigned one_sreg,
 				unsigned word_reg, unsigned temp_reg, unsigned scratch_reg)
 			{
@@ -9107,7 +10291,12 @@ namespace VitaVU
 				if (zero == static_cast<size_t>(-1))
 					return false;
 
-				if (!EmitLoadOneToS(one_sreg, word_reg) ||
+				if (CanUseApproximateVu1P())
+				{
+					if (value_sreg != 0 || !EmitApproximateReciprocalS0())
+						return false;
+				}
+				else if (!EmitLoadOneToS(one_sreg, word_reg) ||
 					!m_code.EmitVdivF32(value_sreg, one_sreg, value_sreg))
 				{
 					return false;
@@ -9130,13 +10319,22 @@ namespace VitaVU
 				if (zero == static_cast<size_t>(-1))
 					return false;
 
-				return m_code.EmitVcvtF64F32(0, value_sreg) &&
-					m_code.EmitMovImm8(word_reg, 0) &&
-					m_code.EmitMovImm32(temp_reg, 0x3ff00000u) &&
-					m_code.EmitVmovCorePairToD(1, word_reg, temp_reg) &&
-					m_code.EmitVdivF64(0, 1, 0) &&
-					m_code.EmitVcvtF32F64(value_sreg, 0) &&
-					m_code.PatchBranch(zero, m_code.Size(), Condition::EQ);
+				if (CanUseApproximateVu1P())
+				{
+					if (value_sreg != 0 || !EmitApproximateReciprocalS0())
+						return false;
+				}
+				else if (!m_code.EmitVcvtF64F32(0, value_sreg) ||
+					!m_code.EmitMovImm8(word_reg, 0) ||
+					!m_code.EmitMovImm32(temp_reg, 0x3ff00000u) ||
+					!m_code.EmitVmovCorePairToD(1, word_reg, temp_reg) ||
+					!m_code.EmitVdivF64(0, 1, 0) ||
+					!m_code.EmitVcvtF32F64(value_sreg, 0))
+				{
+					return false;
+				}
+
+				return m_code.PatchBranch(zero, m_code.Size(), Condition::EQ);
 			}
 
 			size_t EmitBranchIfFloatNotNonNegative(unsigned word_reg, unsigned temp_reg,
@@ -9206,9 +10404,83 @@ namespace VitaVU
 				return continue_from_positive_inf;
 			}
 
+			bool EmitApproximateSqrtIfNonNegative(unsigned value_sreg, unsigned word_reg,
+				unsigned temp_reg, unsigned scratch_reg)
+			{
+				// The strict nearest-NEON gate makes exponent-0xff scalar inputs
+				// impossible: vuDouble() has already clamped them to signed max finite.
+				// A length sum can still overflow to +infinity, which sqrt must leave
+				// as +infinity rather than forming infinity*zero below. Signed zero and
+				// negative inputs retain PCSX2's original value without entering NEON.
+				if (value_sreg != 0 ||
+					!m_code.EmitVmovSToCore(word_reg, value_sreg) ||
+					!EmitAbsWord(temp_reg, word_reg, scratch_reg) ||
+					!m_code.EmitCmpImm32(temp_reg, 0))
+				{
+					return false;
+				}
+				const size_t zero = m_code.EmitBranchPlaceholder(Condition::EQ);
+				if (zero == static_cast<size_t>(-1) ||
+					!EmitAndRegImm32(temp_reg, word_reg, FPU_FLOAT_SIGN_MASK, scratch_reg) ||
+					!m_code.EmitCmpImm32(temp_reg, 0))
+				{
+					return false;
+				}
+				const size_t negative = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (negative == static_cast<size_t>(-1) ||
+					!EmitAndRegImm32(temp_reg, word_reg, FPU_FLOAT_EXPONENT_MASK, scratch_reg) ||
+					!EmitCmpRegImm32(temp_reg, FPU_FLOAT_EXPONENT_MASK, scratch_reg))
+				{
+					return false;
+				}
+				const size_t positive_inf = m_code.EmitBranchPlaceholder(Condition::EQ);
+				if (positive_inf == static_cast<size_t>(-1) || !EmitApproximateSqrtS0())
+					return false;
+
+				const size_t done = m_code.Size();
+				return m_code.PatchBranch(zero, done, Condition::EQ) &&
+					m_code.PatchBranch(negative, done, Condition::NE) &&
+					m_code.PatchBranch(positive_inf, done, Condition::EQ);
+			}
+
+			bool EmitApproximateReciprocalSqrtIfNonNegative(unsigned value_sreg,
+				unsigned word_reg, unsigned temp_reg, unsigned scratch_reg)
+			{
+				// PCSX2 leaves signed zero and negative inputs unchanged. Positive
+				// infinity is allowed through: ARM's VRSQRTE result is +0 and the
+				// VRSQRTS infinity/zero special case keeps the refined result at zero.
+				if (value_sreg != 0 ||
+					!m_code.EmitVmovSToCore(word_reg, value_sreg) ||
+					!EmitAbsWord(temp_reg, word_reg, scratch_reg) ||
+					!m_code.EmitCmpImm32(temp_reg, 0))
+				{
+					return false;
+				}
+				const size_t zero = m_code.EmitBranchPlaceholder(Condition::EQ);
+				if (zero == static_cast<size_t>(-1) ||
+					!EmitAndRegImm32(temp_reg, word_reg, FPU_FLOAT_SIGN_MASK, scratch_reg) ||
+					!m_code.EmitCmpImm32(temp_reg, 0))
+				{
+					return false;
+				}
+				const size_t negative = m_code.EmitBranchPlaceholder(Condition::NE);
+				if (negative == static_cast<size_t>(-1) ||
+					!EmitApproximateReciprocalSqrtS0())
+				{
+					return false;
+				}
+
+				const size_t done = m_code.Size();
+				return m_code.PatchBranch(zero, done, Condition::EQ) &&
+					m_code.PatchBranch(negative, done, Condition::NE);
+			}
+
 			bool EmitSqrtIfNonNegative(unsigned value_sreg, unsigned word_reg,
 				unsigned temp_reg, unsigned scratch_reg)
 			{
+				if (CanUseApproximateVu1P())
+					return EmitApproximateSqrtIfNonNegative(value_sreg, word_reg, temp_reg, scratch_reg);
+
 				if (!m_code.EmitVmovSToCore(word_reg, value_sreg))
 					return false;
 
@@ -9234,6 +10506,12 @@ namespace VitaVU
 			bool EmitSqrtAndReciprocalIfNonNegative(unsigned value_sreg, unsigned one_sreg,
 				unsigned word_reg, unsigned temp_reg, unsigned scratch_reg)
 			{
+				if (CanUseApproximateVu1P())
+				{
+					return EmitApproximateReciprocalSqrtIfNonNegative(value_sreg,
+						word_reg, temp_reg, scratch_reg);
+				}
+
 				if (!m_code.EmitVmovSToCore(word_reg, value_sreg))
 					return false;
 
@@ -9260,14 +10538,30 @@ namespace VitaVU
 			bool EmitEfuSumXyzSquaresToS0(unsigned vf)
 			{
 				// PCSX2 owner: VUmicroFast.h::VuSumXYZSquaresNeon(). Quad load and
-				// normalize, square XYZ with FPSCR-aware scalar VFP, then reduce
-				// (x*x + y*y) + z*z with the same scalar order as the reference.
-				return EmitLoadVfQuad(0, vf) &&
-					EmitNormalizeVuFloatQuad1(0) &&
-					m_code.EmitVmulF32(0, 0, 0) &&
-					m_code.EmitVmulF32(1, 1, 1) &&
-					m_code.EmitVmulF32(2, 2, 2) &&
-					m_code.EmitVaddF32(0, 0, 1) &&
+				// normalize, square XYZ independently, then reduce (x*x + y*y) +
+				// z*z with the same scalar order as the reference. Under the VU1
+				// nearest/FZ/overflow-clamp contract, Cortex-A9 Advanced SIMD has the
+				// same input and multiply behavior. One Q VMUL consumes two MPE issue
+				// cycles (TRM table 3-8), replacing three one-cycle scalar VMULs while
+				// leaving the architecturally significant dependent adds scalar.
+				if (!EmitLoadVfQuad(0, vf) || !EmitNormalizeVuFloatQuad1(0))
+					return false;
+
+				if (CanUseNearestNeonFloat())
+				{
+					if (!m_code.EmitVmulF32Q(0, 0, 0))
+						return false;
+					m_nearest_neon_efu_ops++;
+					m_nearest_neon_efu_scalar_ops_removed += 2;
+				}
+				else if (!m_code.EmitVmulF32(0, 0, 0) ||
+					!m_code.EmitVmulF32(1, 1, 1) ||
+					!m_code.EmitVmulF32(2, 2, 2))
+				{
+					return false;
+				}
+
+				return m_code.EmitVaddF32(0, 0, 1) &&
 					m_code.EmitVaddF32(0, 0, 2);
 			}
 
@@ -9406,14 +10700,24 @@ namespace VitaVU
 					!m_code.EmitVmulF64(X2_D, INPUT_D, INPUT_D) ||
 					!m_code.EmitVmulF64(X2_D, X2_D, X2_D) ||
 					!m_code.EmitVcvtF32F64(0, X2_D) ||
-					!EmitNormalizeSToS(0, word_reg, temp_reg, scratch_reg) ||
-					!EmitLoadOneToS(1, word_reg) ||
+					!EmitNormalizeSToS(0, word_reg, temp_reg, scratch_reg))
+				{
+					return false;
+				}
+				if (CanUseApproximateVu1P())
+				{
+					if (!EmitApproximateReciprocalS0())
+						return false;
+				}
+				else if (!EmitLoadOneToS(1, word_reg) ||
 					!m_code.EmitVdivF32(0, 1, 0))
 				{
 					return false;
 				}
 
-				return EmitStoreSToVuP(0, word_reg);
+				return CanUseApproximateVu1P() ?
+					EmitStoreD32LaneToVuP(0, 0, word_reg) :
+					EmitStoreSToVuP(0, word_reg);
 			}
 
 			bool EmitEatanXyOrXzToP(unsigned fs, unsigned numerator_lane,
@@ -9434,7 +10738,7 @@ namespace VitaVU
 					return false;
 
 				if (!m_code.EmitMovImm8(word_reg, 0) ||
-					!m_code.EmitStrImm12(word_reg, HOST_VU, VuOffset(offsetof(VURegs, p))))
+					!EmitStoreWordToVuP(word_reg))
 				{
 					return false;
 				}
@@ -9446,7 +10750,8 @@ namespace VitaVU
 				const size_t nonzero_target = m_code.Size();
 				if (!m_code.PatchBranch(x_nonzero, nonzero_target, Condition::NE) ||
 					!EmitLoadVuLaneToS(1, fs, numerator_lane, word_reg, temp_reg, scratch_reg) ||
-					!m_code.EmitVdivF32(0, 1, 0) ||
+					!(CanUseApproximateVu1P() ? EmitApproximateS1DivS0ToS0() :
+						m_code.EmitVdivF32(0, 1, 0)) ||
 					!EmitEatanPolynomialFromS0ToP(word_reg, temp_reg, scratch_reg))
 				{
 					return false;
@@ -9479,21 +10784,27 @@ namespace VitaVU
 						emitted_body =
 							EmitEfuSumXyzSquaresToS0(fs) &&
 							EmitReciprocalIfNonzero(0, 1, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
-							EmitStoreSToVuP(0, HOST_WORD);
+							(CanUseApproximateVu1P() ?
+								EmitStoreD32LaneToVuP(0, 0, HOST_WORD) :
+								EmitStoreSToVuP(0, HOST_WORD));
 						break;
 
 					case VUInterpFast::LowerFastKind::ELENG:
 						emitted_body =
 							EmitEfuSumXyzSquaresToS0(fs) &&
 							EmitSqrtIfNonNegative(0, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
-							EmitStoreSToVuP(0, HOST_WORD);
+							(CanUseApproximateVu1P() ?
+								EmitStoreD32LaneToVuP(0, 0, HOST_WORD) :
+								EmitStoreSToVuP(0, HOST_WORD));
 						break;
 
 					case VUInterpFast::LowerFastKind::ERLENG:
 						emitted_body =
 							EmitEfuSumXyzSquaresToS0(fs) &&
 							EmitSqrtAndReciprocalIfNonNegative(0, 1, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
-							EmitStoreSToVuP(0, HOST_WORD);
+							(CanUseApproximateVu1P() ?
+								EmitStoreD32LaneToVuP(0, 0, HOST_WORD) :
+								EmitStoreSToVuP(0, HOST_WORD));
 						break;
 
 					case VUInterpFast::LowerFastKind::ESUM:
@@ -9506,21 +10817,27 @@ namespace VitaVU
 						emitted_body =
 							EmitLoadVuLaneToS(0, fs, fsf, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
 							EmitDoubleReciprocalIfNonzero(0, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
-							EmitStoreSToVuP(0, HOST_WORD);
+							(CanUseApproximateVu1P() ?
+								EmitStoreD32LaneToVuP(0, 0, HOST_WORD) :
+								EmitStoreSToVuP(0, HOST_WORD));
 						break;
 
 					case VUInterpFast::LowerFastKind::ESQRT:
 						emitted_body =
 							EmitLoadVuLaneToS(0, fs, fsf, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
 							EmitSqrtIfNonNegative(0, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
-							EmitStoreSToVuP(0, HOST_WORD);
+							(CanUseApproximateVu1P() ?
+								EmitStoreD32LaneToVuP(0, 0, HOST_WORD) :
+								EmitStoreSToVuP(0, HOST_WORD));
 						break;
 
 					case VUInterpFast::LowerFastKind::ERSQRT:
 						emitted_body =
 							EmitLoadVuLaneToS(0, fs, fsf, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
 							EmitSqrtAndReciprocalIfNonNegative(0, 1, HOST_WORD, HOST_TEMP, HOST_CALL_SCRATCH) &&
-							EmitStoreSToVuP(0, HOST_WORD);
+							(CanUseApproximateVu1P() ?
+								EmitStoreD32LaneToVuP(0, 0, HOST_WORD) :
+								EmitStoreSToVuP(0, HOST_WORD));
 						break;
 
 					case VUInterpFast::LowerFastKind::EATANxy:
@@ -10308,7 +11625,11 @@ namespace VitaVU
 					!m_code.EmitAddImm32(HOST_PTR, HOST_VU, offsetof(VURegs, fmac)) ||
 					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_INDEX, ShiftType::LSL, 5) ||
 					!m_code.EmitAddRegShiftImm(HOST_PTR, HOST_PTR, HOST_INDEX, ShiftType::LSL, 4) ||
-					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, flagreg)) ||
+					!m_code.EmitLdrImm12(HOST_TEMP, HOST_PTR, offsetof(fmacPipe, flagreg)))
+				{
+					return false;
+				}
+				if (
 					!m_code.EmitTstImm32(HOST_TEMP, 1u << REG_CLIP_FLAG))
 				{
 					return false;
@@ -10455,8 +11776,10 @@ namespace VitaVU
 					return false;
 #endif
 
-				if (!m_code.EmitMovImm8(0, 0) ||
-					!m_code.EmitStrbImm12(0, HOST_VU, VuOffset(VI_BACKUP_CYCLES_OFFSET)) ||
+				if ((!m_plan.assume_scheduled_microcode &&
+						(!m_code.EmitMovImm8(0, 0) ||
+						 !m_code.EmitStrbImm12(0, HOST_VU,
+							 VuOffset(VI_BACKUP_CYCLES_OFFSET)))) ||
 					!EmitInlineFlushAllFdiv() ||
 					!EmitInlineFlushAllEfu() ||
 					!EmitInlineFlushAllFmac() ||
@@ -10494,30 +11817,23 @@ namespace VitaVU
 					return false;
 				}
 
-				constexpr u32 SPEEDHACK_VU1_INSTANT_BIT = 1u << 5;
-				constexpr size_t speedhack_bitset_offset =
-					offsetof(Pcsx2Config, Speedhacks) + offsetof(Pcsx2Config::SpeedhackOptions, bitset);
-				if (!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(&EmuConfig) + speedhack_bitset_offset)) ||
-					!m_code.EmitLdrImm12(0, 3, 0) ||
-					!m_code.EmitTstImm32(0, SPEEDHACK_VU1_INSTANT_BIT))
+				// PCSX2 owner: VU1micro.cpp::vu1ExecMicro() and
+				// VU1microInterp.cpp::_vu1Exec(). VMManager resets both VU native
+				// caches whenever Speedhacks changes, so specialize Instant VU1 here
+				// instead of loading and testing the config bit at every E-bit.
+				if (INSTANT_VU1 &&
+					(!m_code.EmitMovImm32(3,
+						static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs) +
+							offsetof(cpuRegisters, cycle))) ||
+					 !m_code.EmitLdrImm12(0, 3, 0) ||
+					 !m_code.EmitLdrImm12(1, 3, 4) ||
+					 !m_code.EmitStrImm12(0, HOST_VU,
+						VuOffset(offsetof(VURegs, xgkicklastcycle))) ||
+					 !m_code.EmitStrImm12(1, HOST_VU,
+						VuOffset(offsetof(VURegs, xgkicklastcycle) + 4))))
 				{
 					return false;
 				}
-				const size_t skip_instant = m_code.EmitBranchPlaceholder(Condition::EQ);
-				if (skip_instant == static_cast<size_t>(-1))
-					return false;
-
-				if (!m_code.EmitMovImm32(3, static_cast<u32>(reinterpret_cast<uptr>(&cpuRegs) + offsetof(cpuRegisters, cycle))) ||
-					!m_code.EmitLdrImm12(0, 3, 0) ||
-					!m_code.EmitLdrImm12(1, 3, 4) ||
-					!m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, xgkicklastcycle))) ||
-					!m_code.EmitStrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, xgkicklastcycle) + 4)))
-				{
-					return false;
-				}
-
-				if (!m_code.PatchBranch(skip_instant, m_code.Size(), Condition::EQ))
-					return false;
 
 				if (THREAD_VU1)
 				{
@@ -10781,7 +12097,8 @@ namespace VitaVU
 				u32 pair_index = 0;
 				u8 slot = 0;
 				bool active = false;
-				bool producer_flags_captured = false;
+				bool producer_mac_captured = false;
+				bool producer_status_captured = false;
 				bool sticky_only_accumulated = false;
 			};
 
@@ -10793,8 +12110,10 @@ namespace VitaVU
 				u32 pair_count = 0;
 				std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT> initial_fmac{};
 				std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT> final_fmac{};
-				s8 initial_latest_working = -1;
-				s8 final_latest_working = -1;
+				s8 initial_latest_working_mac = -1;
+				s8 initial_latest_working_status = -1;
+				s8 final_latest_working_mac = -1;
+				s8 final_latest_working_status = -1;
 				bool initial_norm_consts_ready = false;
 				bool initial_norm_maxf_ready = false;
 				bool initial_dead_fmac_sticky_pending = false;
@@ -10827,7 +12146,8 @@ namespace VitaVU
 				{
 					if (lhs[i].pair_index != rhs[i].pair_index ||
 						lhs[i].slot != rhs[i].slot || lhs[i].active != rhs[i].active ||
-						lhs[i].producer_flags_captured != rhs[i].producer_flags_captured ||
+						lhs[i].producer_mac_captured != rhs[i].producer_mac_captured ||
+						lhs[i].producer_status_captured != rhs[i].producer_status_captured ||
 						lhs[i].sticky_only_accumulated != rhs[i].sticky_only_accumulated)
 					{
 						return false;
@@ -10883,7 +12203,10 @@ namespace VitaVU
 				slow.first_pair = first_pair;
 				slow.pair_count = pair_count;
 				slow.initial_fmac = m_local_fmac_entries;
-				slow.initial_latest_working = LocalFmacEntryIndex(m_latest_working_fmac_entry);
+				slow.initial_latest_working_mac =
+					LocalFmacEntryIndex(m_latest_working_fmac_mac_entry);
+				slow.initial_latest_working_status =
+					LocalFmacEntryIndex(m_latest_working_fmac_status_entry);
 				slow.initial_norm_consts_ready = m_norm_consts_ready;
 				slow.initial_norm_maxf_ready = m_norm_maxf_ready;
 				slow.initial_dead_fmac_sticky_pending = m_dead_fmac_sticky_pending;
@@ -10911,9 +12234,11 @@ namespace VitaVU
 					// _vu1FastForwardPlainNopPairs() subtracts min(run, backup).
 					// The architectural backup window is two cycles and this run is at
 					// least two pairs, so its exact final value is unconditionally zero.
-					!m_code.EmitMovImm8(0, 0) ||
-					!m_code.EmitStrbImm12(0, HOST_VU,
-						VuOffset(offsetof(VURegs, VIBackupCycles))))
+					// Scheduled VU1 has no producer for this private window at all.
+					(!m_plan.assume_scheduled_microcode &&
+						(!m_code.EmitMovImm8(0, 0) ||
+						 !m_code.EmitStrbImm12(0, HOST_VU,
+							 VuOffset(offsetof(VURegs, VIBackupCycles))))))
 				{
 					return false;
 				}
@@ -10924,7 +12249,10 @@ namespace VitaVU
 
 				slow.continuation = m_code.Size();
 				slow.final_fmac = m_local_fmac_entries;
-				slow.final_latest_working = LocalFmacEntryIndex(m_latest_working_fmac_entry);
+				slow.final_latest_working_mac =
+					LocalFmacEntryIndex(m_latest_working_fmac_mac_entry);
+				slow.final_latest_working_status =
+					LocalFmacEntryIndex(m_latest_working_fmac_status_entry);
 				slow.final_norm_consts_ready = m_norm_consts_ready;
 				slow.final_norm_maxf_ready = m_norm_maxf_ready;
 				slow.final_dead_fmac_sticky_pending = m_dead_fmac_sticky_pending;
@@ -10939,7 +12267,10 @@ namespace VitaVU
 					return true;
 
 				const auto block_final_fmac = m_local_fmac_entries;
-				const s8 block_final_latest = LocalFmacEntryIndex(m_latest_working_fmac_entry);
+				const s8 block_final_latest_mac =
+					LocalFmacEntryIndex(m_latest_working_fmac_mac_entry);
+				const s8 block_final_latest_status =
+					LocalFmacEntryIndex(m_latest_working_fmac_status_entry);
 				const bool block_final_norm_consts = m_norm_consts_ready;
 				const bool block_final_norm_maxf = m_norm_maxf_ready;
 				const bool block_final_dead_fmac_sticky_pending = m_dead_fmac_sticky_pending;
@@ -10952,8 +12283,10 @@ namespace VitaVU
 						return false;
 
 					m_local_fmac_entries = slow.initial_fmac;
-					m_latest_working_fmac_entry =
-						LocalFmacEntryAt(slow.initial_latest_working);
+					m_latest_working_fmac_mac_entry =
+						LocalFmacEntryAt(slow.initial_latest_working_mac);
+					m_latest_working_fmac_status_entry =
+						LocalFmacEntryAt(slow.initial_latest_working_status);
 					m_pending_local_fmac_entry = nullptr;
 					m_capture_pending_local_fmac_flags = false;
 					m_norm_consts_ready = slow.initial_norm_consts_ready;
@@ -10966,8 +12299,10 @@ namespace VitaVU
 							return false;
 					}
 					if (!LocalFmacStatesMatch(m_local_fmac_entries, slow.final_fmac) ||
-						LocalFmacEntryIndex(m_latest_working_fmac_entry) !=
-							slow.final_latest_working ||
+						LocalFmacEntryIndex(m_latest_working_fmac_mac_entry) !=
+							slow.final_latest_working_mac ||
+						LocalFmacEntryIndex(m_latest_working_fmac_status_entry) !=
+							slow.final_latest_working_status ||
 						m_norm_consts_ready != slow.final_norm_consts_ready ||
 						m_norm_maxf_ready != slow.final_norm_maxf_ready ||
 						m_dead_fmac_sticky_pending != slow.final_dead_fmac_sticky_pending ||
@@ -10984,7 +12319,8 @@ namespace VitaVU
 				}
 
 				m_local_fmac_entries = block_final_fmac;
-				m_latest_working_fmac_entry = LocalFmacEntryAt(block_final_latest);
+				m_latest_working_fmac_mac_entry = LocalFmacEntryAt(block_final_latest_mac);
+				m_latest_working_fmac_status_entry = LocalFmacEntryAt(block_final_latest_status);
 				m_pending_local_fmac_entry = nullptr;
 				m_capture_pending_local_fmac_flags = false;
 				m_norm_consts_ready = block_final_norm_consts;
@@ -11007,9 +12343,7 @@ namespace VitaVU
 
 			static u32 FmacFlagReg(const PairPlan& plan)
 			{
-				return (plan.add_upper_stalls ? plan.uregs.VIwrite : 0) |
-					((plan.add_lower_stalls && plan.lregs.pipe == VUPIPE_FMAC) ?
-						plan.lregs.VIwrite : 0);
+				return EffectiveFmacFlagReg(plan);
 			}
 
 			static u32 FmacXyzwUpper(const PairPlan& plan)
@@ -11110,6 +12444,7 @@ namespace VitaVU
 
 				const PairPlan& plan = m_pairs[entry.pair_index];
 				const u32 flagreg = FmacFlagReg(plan);
+				const bool publish_status = FmacStatusPublicationRequired(plan);
 				if ((flagreg & (1u << REG_CLIP_FLAG)) != 0 &&
 					(!m_code.EmitLdrImm12(0, SP, LocalFmacOffset(entry, LOCAL_FMAC_CLIP_OFFSET)) ||
 					 !m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_CLIP_FLAG))))
@@ -11119,12 +12454,19 @@ namespace VitaVU
 
 				if (m_plan.deferred_fmac_flags)
 				{
+					if (!publish_status)
+					{
+						return !plan.mac_flag_result_required ||
+							m_code.EmitLdrImm12(HOST_LIMIT_HI, SP,
+								LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET));
+					}
+
 					// PCSX2 owner: VUops.cpp::_vuFMACflush(). r6/r7 are the
 					// block-private STATUS/MAC instances loaded at block entry.
 					// Preserve the sticky/non-sticky STATUS formulas exactly, but do not
 					// round-trip either flag through VURegs for every retired pair.
 					if ((flagreg & (1u << REG_STATUS_FLAG)) != 0 &&
-						entry.producer_flags_captured)
+						entry.producer_status_captured)
 					{
 						// VUflags.cpp::VU_STAT_UPDATE() produces only STATUS[3:0].
 						// CanSnapshotLocalFmacFlagsAtProducer() excludes a paired FSSET
@@ -11154,7 +12496,7 @@ namespace VitaVU
 							return false;
 						}
 					}
-					else if (entry.producer_flags_captured)
+					else if (entry.producer_status_captured)
 					{
 						// EmitCapturePendingLocalFmacFlags() captured the producer's
 						// exact non-sticky category nibble. ARMv7 BFI replaces only
@@ -11183,11 +12525,13 @@ namespace VitaVU
 						return false;
 					}
 
-					return m_code.EmitLdrImm12(HOST_LIMIT_HI, SP,
-						LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET));
+					return !plan.mac_flag_result_required ||
+						m_code.EmitLdrImm12(HOST_LIMIT_HI, SP,
+							LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET));
 				}
 
-				if ((flagreg & (1u << REG_STATUS_FLAG)) != 0)
+				if (publish_status &&
+					(flagreg & (1u << REG_STATUS_FLAG)) != 0)
 				{
 					if (!m_code.EmitLdrImm12(0, HOST_VU, ViOffset(REG_STATUS_FLAG)) ||
 						!EmitAndRegImm32(0, 0, 0x30u, HOST_CALL_SCRATCH) ||
@@ -11201,7 +12545,7 @@ namespace VitaVU
 						return false;
 					}
 				}
-				else
+				else if (publish_status)
 				{
 					if (!m_code.EmitLdrImm12(0, HOST_VU, ViOffset(REG_STATUS_FLAG)) ||
 						!EmitAndRegImm32(0, 0, 0xff0u, HOST_CALL_SCRATCH) ||
@@ -11215,8 +12559,10 @@ namespace VitaVU
 					}
 				}
 
-				return m_code.EmitLdrImm12(0, SP, LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET)) &&
-					m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_MAC_FLAG));
+				return !plan.mac_flag_result_required ||
+					(m_code.EmitLdrImm12(0, SP,
+						LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET)) &&
+					 m_code.EmitStrImm12(0, HOST_VU, ViOffset(REG_MAC_FLAG)));
 			}
 
 			bool EmitPublishDeferredFmacFlags()
@@ -11270,15 +12616,45 @@ namespace VitaVU
 					emitted = EmitLoadCurrentCycleLow(0) &&
 						m_code.EmitStrImm12(0, SP, cycle_offset);
 				}
-				if (emitted && !entry->producer_flags_captured &&
-					!entry->sticky_only_accumulated)
+				const bool capture_mac = plan.mac_flag_result_required &&
+					!entry->producer_mac_captured;
+				const bool capture_status = FmacStatusPublicationRequired(plan) &&
+					!entry->producer_status_captured;
+				if (emitted && !entry->sticky_only_accumulated &&
+					(capture_mac || capture_status))
 				{
-					emitted = EmitLoadWorkingFmacMacStatus(0, 1) &&
-						m_code.EmitStrdImm8(0, 1, SP,
-							static_cast<u8>(LocalFmacOffset(*entry, LOCAL_FMAC_MAC_OFFSET)));
+					if (capture_mac && capture_status)
+					{
+						emitted = EmitLoadWorkingFmacMacStatus(0, 1) &&
+							m_code.EmitStrdImm8(0, 1, SP,
+								static_cast<u8>(LocalFmacOffset(*entry,
+									LOCAL_FMAC_MAC_OFFSET)));
+					}
+					else if (capture_mac)
+					{
+						emitted = EmitLoadWorkingFmacMac(0) &&
+							m_code.EmitStrImm12(0, SP,
+								LocalFmacOffset(*entry, LOCAL_FMAC_MAC_OFFSET));
+					}
+					else
+					{
+						emitted = EmitLoadWorkingFmacStatus(0) &&
+							m_code.EmitStrImm12(0, SP,
+								LocalFmacOffset(*entry, LOCAL_FMAC_STATUS_OFFSET));
+					}
+					entry->producer_mac_captured |= capture_mac;
+					entry->producer_status_captured |= capture_status;
 					if (emitted && m_plan.resident_working_fmac_flags)
-						m_latest_working_fmac_entry = entry;
+					{
+						if (capture_mac)
+							m_latest_working_fmac_mac_entry = entry;
+						if (capture_status)
+							m_latest_working_fmac_status_entry = entry;
+					}
 				}
+				// A local FMAC entry still owns its four-cycle VF dependency when
+				// both flag instances are dead. In that case the compile-time queue
+				// entry remains active, but no working flag crosses the A9 data side.
 				if (emitted && (FmacFlagReg(plan) & (1u << REG_CLIP_FLAG)) != 0)
 				{
 					emitted = m_code.EmitLdrImm12(0, HOST_VU,
@@ -11309,23 +12685,60 @@ namespace VitaVU
 			{
 				if (!m_plan.resident_working_fmac_flags)
 					return true;
-				if (!m_latest_working_fmac_entry)
-					return false;
 
 				// PCSX2 microVU keeps the current non-architectural MAC/STATUS
-				// instances resident in its allocator. Vita keeps the same pair in
-				// the newest private FMAC slot and publishes it once before any
-				// direct-link lookup, dispatcher return, or helper-visible seam.
-				return m_code.EmitLdrdImm8(0, 1, SP,
-						static_cast<u8>(LocalFmacOffset(*m_latest_working_fmac_entry,
-							LOCAL_FMAC_MAC_OFFSET))) &&
-					m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, macflag))) &&
-					m_code.EmitStrImm12(1, HOST_VU, VuOffset(offsetof(VURegs, statusflag)));
+				// instances resident in its allocator. Vita tracks their private
+				// slots independently: mVU's compatible hack can update MAC while
+				// leaving STATUS stale, and exact MAC liveness can do the converse.
+				// Publish only fields which actually acquired a new private owner.
+				if (m_latest_working_fmac_mac_entry &&
+					m_latest_working_fmac_mac_entry == m_latest_working_fmac_status_entry)
+				{
+					return m_code.EmitLdrdImm8(0, 1, SP,
+							static_cast<u8>(LocalFmacOffset(*m_latest_working_fmac_mac_entry,
+								LOCAL_FMAC_MAC_OFFSET))) &&
+						m_code.EmitStrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, macflag))) &&
+						m_code.EmitStrImm12(1, HOST_VU,
+							VuOffset(offsetof(VURegs, statusflag)));
+				}
+
+				return (!m_latest_working_fmac_mac_entry ||
+						(m_code.EmitLdrImm12(0, SP,
+							LocalFmacOffset(*m_latest_working_fmac_mac_entry,
+								LOCAL_FMAC_MAC_OFFSET)) &&
+						 m_code.EmitStrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, macflag))))) &&
+					(!m_latest_working_fmac_status_entry ||
+						(m_code.EmitLdrImm12(0, SP,
+							LocalFmacOffset(*m_latest_working_fmac_status_entry,
+								LOCAL_FMAC_STATUS_OFFSET)) &&
+							m_code.EmitStrImm12(0, HOST_VU,
+							VuOffset(offsetof(VURegs, statusflag)))));
+			}
+
+			bool EmitResidentWorkingFdivBarrier()
+			{
+				if (!m_plan.resident_working_fmac_flags)
+					return true;
+
+				// Sony VU User Manual 3.3.2/3.4.5 and PCSX2's _vuDIV family:
+				// FDIV changes the current working STATUS D/I bits before the pair-tail
+				// FMAC snapshot. Materialize only the current private owners here, then
+				// make VURegs authoritative for this mixed pair. EmitCommitLocalFmac()
+				// captures its exact post-lower MAC/STATUS and restores private ownership,
+				// so every later producer again avoids the canonical stores.
+				if (!EmitPublishResidentWorkingFmacFlags())
+					return false;
+				m_latest_working_fmac_mac_entry = nullptr;
+				m_latest_working_fmac_status_entry = nullptr;
+				return true;
 			}
 
 			bool EmitAppendLocalFmacEntry(const LocalFmacEntry& entry)
 			{
 				const PairPlan& plan = m_pairs[entry.pair_index];
+				const u32 flagreg = FmacFlagReg(plan);
 				// Resident-pipe blocks preserve the non-FMAC aggregate above r10's low
 				// count bits. Form the circular slot address from only that exact index;
 				// r0 is overwritten by the static FMAC header immediately afterwards.
@@ -11334,22 +12747,59 @@ namespace VitaVU
 					!m_code.EmitAddRegShiftImm(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
 						0, ShiftType::LSL, 5) ||
 					!m_code.EmitAddRegShiftImm(HOST_CALL_SCRATCH, HOST_CALL_SCRATCH,
-						0, ShiftType::LSL, 4) ||
-					!m_code.EmitMovImm32(0, FmacRegUpper(plan)) ||
+						0, ShiftType::LSL, 4))
+				{
+					return false;
+				}
+
+				if (plan.scheduled_fmac_hazard_metadata_elided)
+				{
+					// Correctly-scheduled VU1 never reads regupper/reglower or the
+					// XYZW masks. Keep only flagreg, the one static-header word consumed
+					// by delayed flag retirement. This removes five A9 data-side words
+					// (four dependency words plus _vuClearFMAC() padding) at the seam.
+					if (!m_code.EmitMovImm32(0, flagreg) ||
+						!m_code.EmitStrImm12(0, HOST_CALL_SCRATCH,
+							offsetof(fmacPipe, flagreg)))
+					{
+						return false;
+					}
+				}
+				else if (!m_code.EmitMovImm32(0, FmacRegUpper(plan)) ||
 					!m_code.EmitMovImm32(1, FmacRegLower(plan)) ||
 					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, regupper)) ||
-					!m_code.EmitMovImm32(0, FmacFlagReg(plan)) ||
+					!m_code.EmitMovImm32(0, flagreg) ||
 					!m_code.EmitMovImm32(1, FmacXyzwUpper(plan)) ||
 					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, flagreg)) ||
 					!m_code.EmitMovImm32(0, FmacXyzwLower(plan)) ||
 					!m_code.EmitMovImm8(1, 0) ||
-					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, xyzwlower)) ||
-					!m_code.EmitLdrImm12(0, SP,
-						LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET)) ||
-					!EmitLoadCurrentCycleHigh(1) ||
-					!EmitLoadCurrentCycleLow(2) ||
-					!m_code.EmitCmpReg(0, 2) ||
-					!m_code.EmitSubImm8(1, 1, 1, false, Condition::HI) ||
+					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, xyzwlower)))
+				{
+					return false;
+				}
+
+				bool emitted_cycle = false;
+				if (plan.scheduled_local_fmac_relative_cycle)
+				{
+					const u8 age = static_cast<u8>(
+						m_plan.pair_count - 1 - entry.pair_index);
+					emitted_cycle = EmitLoadCurrentCycleLow(0) &&
+						EmitLoadCurrentCycleHigh(1) &&
+						(age == 0 ||
+							(m_code.EmitSubImm8(0, 0, age, true) &&
+							 m_code.EmitSbcImm8(1, 1, 0)));
+				}
+				else
+				{
+					emitted_cycle = m_code.EmitLdrImm12(0, SP,
+							LocalFmacOffset(entry, LOCAL_FMAC_CYCLE_OFFSET)) &&
+						EmitLoadCurrentCycleHigh(1) &&
+						EmitLoadCurrentCycleLow(2) &&
+						m_code.EmitCmpReg(0, 2) &&
+						m_code.EmitSubImm8(1, 1, 1, false, Condition::HI);
+				}
+
+				if (!emitted_cycle ||
 					!m_code.EmitStrdImm8(0, 1, HOST_CALL_SCRATCH, offsetof(fmacPipe, sCycle)) ||
 					!m_code.EmitMovImm8(0, FMAC_PIPELINE_LATENCY_CYCLES) ||
 					!m_code.EmitLdrImm12(1, SP, LocalFmacOffset(entry, LOCAL_FMAC_MAC_OFFSET)) ||
@@ -11388,8 +12838,20 @@ namespace VitaVU
 					if (!oldest)
 						break;
 					LocalFmacEntry& entry = *oldest;
-					if (!m_pairs[entry.pair_index].local_fmac_cycle_snapshot)
+					const PairPlan& plan = m_pairs[entry.pair_index];
+					if (!plan.local_fmac_cycle_snapshot &&
+						!plan.scheduled_local_fmac_relative_cycle)
 						return false;
+					if (plan.scheduled_local_fmac_relative_cycle)
+					{
+						// No following explicit wait can make this less-than-four-pair
+						// suffix ready. Append directly; EmitAppendLocalFmacEntry()
+						// reconstructs the exact timestamp from seam cycle minus age.
+						if (!EmitAppendLocalFmacEntry(entry))
+							return false;
+						entry.active = false;
+						continue;
+					}
 
 					// Entries made ready early by an FDIV/EFU/IALU or dependency
 					// stall publish here; younger entries retain their exact sCycle
@@ -11446,10 +12908,11 @@ namespace VitaVU
 
 				const u32 regupper = upper_fmac ? plan.uregs.VFwrite : 0;
 				const u32 reglower = lower_fmac ? plan.lregs.VFwrite : 0;
-				const u32 flagreg = (upper_fmac ? plan.uregs.VIwrite : 0) |
-					(lower_fmac ? plan.lregs.VIwrite : 0);
+				const u32 flagreg = FmacFlagReg(plan);
 				const u32 xyzwupper = upper_fmac ? plan.uregs.VFwxyzw : 0;
 				const u32 xyzwlower = lower_fmac ? plan.lregs.VFwxyzw : 0;
+				const bool scheduled_hazard_metadata_elided =
+					plan.scheduled_fmac_hazard_metadata_elided;
 
 				// ARM ARM A8.6.189 defines STMIA's register-list order as ascending
 				// register number to ascending address. At this pair tail r0-r3, r8,
@@ -11507,13 +12970,20 @@ namespace VitaVU
 							 VuOffset(offsetof(VURegs, fmacwritepos))))) &&
 					(plan.reuse_fmac_static_header ?
 						m_code.EmitAddImm8(14, 14, offsetof(fmacPipe, sCycle)) :
-						(m_code.EmitMovImm32(0, regupper) &&
+						(scheduled_hazard_metadata_elided ?
+							// The automatic dependency walker is unreachable. Store only
+							// flagreg, then advance directly over the unused hazard/padding
+							// words to the delayed-result portion of the 48-byte entry.
+							(m_code.EmitMovImm32(0, flagreg) &&
+							 m_code.EmitStrImm12(0, 14, offsetof(fmacPipe, flagreg)) &&
+							 m_code.EmitAddImm8(14, 14, offsetof(fmacPipe, sCycle))) :
+							(m_code.EmitMovImm32(0, regupper) &&
 						 m_code.EmitMovImm32(1, reglower) &&
 						 m_code.EmitMovImm32(2, flagreg) &&
 						 m_code.EmitMovImm32(3, xyzwupper) &&
 						 m_code.EmitMovImm32(HOST_CLIP_OLD, xyzwlower) &&
 						 m_code.EmitMovImm8(HOST_CALL_SCRATCH, 0) &&
-						 m_code.EmitStmIa(14, FMAC_HEADER_REGS, true))) &&
+						 m_code.EmitStmIa(14, FMAC_HEADER_REGS, true)))) &&
 					(reused_flag_words == 3 ||
 						(m_code.EmitAddImm32(0, HOST_VU,
 							 VuOffset(offsetof(VURegs, macflag))) &&
@@ -11606,15 +13076,68 @@ namespace VitaVU
 #endif
 			}
 
-			// PCSX2 owner: x86/microVU_Compile.inl::mVUtestCycles(). The caller
-			// admits the initial block only with a positive budget; a generated link
-			// tests again before entering its target. Once admitted, the whole block
-			// runs even when its final pairs overshoot the requested window. This is
-			// microVU's observable scheduling contract, not the interpreter's
-			// per-step Execute() guard. Each pair still performs vu1Exec()'s cycle
-			// increment and leaves its low word in HOST_CYCLE_LO for VIBackupCycles.
-			// Scan-proven one-cycle blocks keep that word private until a helper,
-			// link-admission, or dispatcher-return seam observes VURegs.
+			// PCSX2 owner: x86/microVU_Compile.inl::mVUtestCycles(). The public
+			// entry and a dispatcher-carried emitter continuation arrive with Z set;
+			// an ordinary direct link arrives with Z clear. An artificial direct link
+			// keeps Z set and therefore carries the already-made microVU admission
+			// without putting a marker in the accumulated pair count. The prologue,
+			// linked entries, and vector live-in preload deliberately emit no
+			// flag-setting instruction between producing Z and this single branch.
+			bool EmitEntryBudgetCheck()
+			{
+				if (!m_resident_cycle &&
+					(!m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, cycle))) ||
+					 !m_code.EmitLdrImm12(1, HOST_VU,
+						 VuOffset(offsetof(VURegs, cycle) + 4))))
+				{
+					return false;
+				}
+
+				const size_t skip_entry_check =
+					m_code.EmitBranchPlaceholder(Condition::EQ);
+				if (skip_entry_check == static_cast<size_t>(-1))
+					return false;
+
+				unsigned limit_lo = HOST_LIMIT_LO;
+				unsigned limit_hi = HOST_LIMIT_HI;
+				if (m_plan.deferred_fmac_flags)
+				{
+					limit_lo = 2;
+					limit_hi = 3;
+					if (!m_code.EmitLdrdImm8(limit_lo, limit_hi, SP,
+							static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET)))
+					{
+						return false;
+					}
+				}
+
+				if (m_resident_cycle)
+				{
+					if (!EmitLoadCurrentCycleHigh(0) ||
+						!m_code.EmitCmpReg(0, limit_hi) ||
+						!m_code.EmitCmpReg(HOST_CYCLE_LO, limit_lo, Condition::EQ))
+					{
+						return false;
+					}
+				}
+				else if (!m_code.EmitCmpReg(1, limit_hi) ||
+					!m_code.EmitCmpReg(0, limit_lo, Condition::EQ))
+				{
+					return false;
+				}
+
+				const size_t exit_site = m_code.EmitBranchPlaceholder(Condition::CS);
+				if (exit_site == static_cast<size_t>(-1))
+					return false;
+				m_budget_exits.push_back({exit_site, 0, Condition::CS});
+				return m_code.PatchBranch(skip_entry_check, m_code.Size(), Condition::EQ);
+			}
+
+			// Once admitted, the whole block runs even when its final pairs overshoot
+			// the requested window. This is microVU's observable scheduling contract,
+			// not the interpreter's per-step Execute() guard. Each pair still performs
+			// vu1Exec()'s cycle increment and leaves its low word in HOST_CYCLE_LO for
+			// VIBackupCycles. Pair zero reuses the words loaded by the entry check.
 			bool EmitBudgetCheckAndCycleIncrement(u32 pair_index)
 			{
 				if (m_resident_cycle)
@@ -11622,42 +13145,11 @@ namespace VitaVU
 
 				const u16 lo = VuOffset(offsetof(VURegs, cycle));
 				const u16 hi = VuOffset(offsetof(VURegs, cycle) + 4);
-				if (!m_code.EmitLdrImm12(0, HOST_VU, lo) ||
-					!m_code.EmitLdrImm12(1, HOST_VU, hi))
+				if (pair_index != 0 &&
+					(!m_code.EmitLdrImm12(0, HOST_VU, lo) ||
+					 !m_code.EmitLdrImm12(1, HOST_VU, hi)))
 				{
 					return false;
-				}
-
-				if (pair_index == 0)
-				{
-					if (!m_code.EmitCmpImm32(HOST_EXEC_BASE, 0))
-						return false;
-					const size_t skip_entry_check = m_code.EmitBranchPlaceholder(Condition::EQ);
-					if (skip_entry_check == static_cast<size_t>(-1))
-						return false;
-					unsigned limit_lo = HOST_LIMIT_LO;
-					unsigned limit_hi = HOST_LIMIT_HI;
-					if (m_plan.deferred_fmac_flags)
-					{
-						limit_lo = 2;
-						limit_hi = 3;
-						if (!m_code.EmitLdrdImm8(limit_lo, limit_hi, SP,
-								static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET)))
-						{
-							return false;
-						}
-					}
-					if (!m_code.EmitCmpReg(1, limit_hi) ||
-						!m_code.EmitCmpReg(0, limit_lo, Condition::EQ))
-					{
-						return false;
-					}
-					const size_t exit_site = m_code.EmitBranchPlaceholder(Condition::CS);
-					if (exit_site == static_cast<size_t>(-1))
-						return false;
-					m_budget_exits.push_back({exit_site, pair_index, Condition::CS});
-					if (!m_code.PatchBranch(skip_entry_check, m_code.Size(), Condition::EQ))
-						return false;
 				}
 
 				return m_code.EmitAddImm8(0, 0, 1, true) &&
@@ -11669,40 +13161,6 @@ namespace VitaVU
 
 			bool EmitResidentCycleBudgetCheckAndIncrement(u32 pair_index)
 			{
-				if (pair_index == 0)
-				{
-					if (!m_code.EmitCmpImm32(HOST_EXEC_BASE, 0))
-						return false;
-					const size_t skip_entry_check = m_code.EmitBranchPlaceholder(Condition::EQ);
-					if (skip_entry_check == static_cast<size_t>(-1))
-						return false;
-					// The linked-entry stub has refreshed the resident cycle word(s). Compare
-					// the full 64-bit cycle so a preceding block's permitted
-					// overshoot cannot enter another block.
-					unsigned limit_lo = HOST_LIMIT_LO;
-					unsigned limit_hi = HOST_LIMIT_HI;
-					if (m_plan.deferred_fmac_flags)
-					{
-						limit_lo = 2;
-						limit_hi = 3;
-						if (!m_code.EmitLdrdImm8(limit_lo, limit_hi, SP,
-								static_cast<u8>(DEFERRED_LIMIT_SAVE_OFFSET)))
-						{
-							return false;
-						}
-					}
-					if (!EmitLoadCurrentCycleHigh(0) ||
-						!m_code.EmitCmpReg(0, limit_hi) ||
-						!m_code.EmitCmpReg(HOST_CYCLE_LO, limit_lo, Condition::EQ))
-						return false;
-					const size_t exit_site = m_code.EmitBranchPlaceholder(Condition::CS);
-					if (exit_site == static_cast<size_t>(-1))
-						return false;
-					m_budget_exits.push_back({exit_site, pair_index, Condition::CS});
-					if (!m_code.PatchBranch(skip_entry_check, m_code.Size(), Condition::EQ))
-						return false;
-				}
-
 				if (!m_code.EmitAddImm8(HOST_CYCLE_LO, HOST_CYCLE_LO, 1, true))
 				{
 					return false;
@@ -11730,6 +13188,9 @@ namespace VitaVU
 			// update, where cyclesBeforeOp is the pre-stall cycle minus one.
 			bool EmitViBackupUpdate(u32 pair_index, bool superseded_by_backup_write)
 			{
+				if (m_plan.assume_scheduled_microcode)
+					return true;
+
 				// Pair analysis can prove that the lower writer either takes
 				// _vuBackupVI()'s complete install arm, or refreshes a still-live
 				// same-register chain. No intervening upper operation observes PCSX2's
@@ -11871,6 +13332,15 @@ namespace VitaVU
 			bool EmitPair(u32 pair_index)
 			{
 				const PairPlan& plan = m_pairs[pair_index];
+				if (!EmitBudgetCheckAndCycleIncrement(pair_index))
+					return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+				// Count only admitted blocks. A linked target can reach its body and
+				// reject on the entry budget check without executing any VU pair.
+				if (pair_index == 0 && !EmitQemuLocalFmacPipelineCounters())
+					return false;
+#endif
+
 				// microVU's paired old-value swap and D/T exits are state joins with
 				// canonical observers. Keep those uncommon pairs entirely outside the
 				// block-local mapping instead of inventing path-specific cache states.
@@ -11882,16 +13352,6 @@ namespace VitaVU
 						return false;
 					m_vector_cache_suspended = true;
 				}
-
-				if (!EmitBudgetCheckAndCycleIncrement(pair_index))
-					return false;
-#if defined(VITASX2_QEMU_VALIDATION)
-				// Count only admitted blocks. A linked target can reach its body and
-				// reject on the pair-zero budget check without executing any VU pair.
-				if (pair_index == 0 && !EmitQemuLocalFmacPipelineCounters())
-					return false;
-#endif
-
 				// E flag decode, compile-time: VU->ebit = 2.
 				if (plan.ebit)
 				{
@@ -12009,7 +13469,13 @@ namespace VitaVU
 				{
 					return false;
 				}
-				if (plan.test_pipes_fast_guard)
+				if (plan.test_pipes_proven_empty)
+				{
+					// Dispatcher proof plus the compile-time producer prefix makes all
+					// canonical _vuTestPipes() arms side-effect-free. Private FMAC
+					// retirement remains immediately below in its original pair order.
+				}
+				else if (plan.test_pipes_fast_guard)
 				{
 					if (!(plan.defer_nop_pipe_test ?
 						EmitDeferredNopPipeTest(m_plan.deferred_fmac_flags) :
@@ -12035,7 +13501,7 @@ namespace VitaVU
 					return false;
 
 				const bool local_fmac_commit = m_plan.local_fmac_pipeline &&
-					pair_index >= LOCAL_FMAC_WARMUP_PAIRS && plan.fmac_pipe;
+					pair_index >= m_plan.local_fmac_start_pair && plan.fmac_pipe;
 				// D/T/E completion can synchronously flush or expose canonical queue
 				// metadata before the interpreter's pair-tail write-position update.
 				// Keep those rare seams in their original order; ordinary pairs can
@@ -12058,11 +13524,14 @@ namespace VitaVU
 					if (!m_pending_local_fmac_entry)
 						return false;
 					m_pending_local_fmac_entry->pair_index = pair_index;
-					m_pending_local_fmac_entry->producer_flags_captured = false;
+					m_pending_local_fmac_entry->producer_mac_captured = false;
+					m_pending_local_fmac_entry->producer_status_captured = false;
 					m_pending_local_fmac_entry->sticky_only_accumulated = false;
 					m_capture_pending_local_fmac_flags =
 						CanSnapshotLocalFmacFlagsAtProducer(plan);
 				}
+				if (plan.lower_fdiv_inline && !EmitResidentWorkingFdivBarrier())
+					return false;
 
 				// This pair has consumed at least one cycle. With no preceding writer,
 				// every possible two-cycle window is empty here. A preceding writer to
@@ -12117,26 +13586,32 @@ namespace VitaVU
 				else if (plan.exec_upper && plan.upper_addsub_inline &&
 					!EmitInlineUpperAddSub(plan.upper,
 						static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind),
-						plan.mac_flag_result_required))
+						plan.mac_flag_result_required,
+						plan.status_flag_result_required))
 				{
 					return false;
 				}
 				else if (plan.exec_upper && plan.upper_mul_inline &&
 					!EmitInlineUpperMul(plan.upper,
 						static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind),
-						plan.mac_flag_result_required))
+						plan.mac_flag_result_required,
+						plan.status_flag_result_required))
 				{
 					return false;
 				}
 				else if (plan.exec_upper && plan.upper_maddmsub_inline &&
 					!EmitInlineUpperMaddMsub(plan.upper,
 						static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind),
-						plan.mac_flag_result_required))
+						plan.mac_flag_result_required,
+						plan.status_flag_result_required))
 				{
 					return false;
 				}
 				else if (plan.exec_upper && plan.upper_outer_inline &&
-					!EmitInlineUpperOuter(plan.upper, static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind)))
+					!EmitInlineUpperOuter(plan.upper,
+						static_cast<VUInterpFast::UpperFastKind>(plan.upper_kind),
+						plan.mac_flag_result_required,
+						plan.status_flag_result_required))
 				{
 					return false;
 				}
@@ -12352,9 +13827,19 @@ namespace VitaVU
 			u32 m_normalized_operand_quad_bypasses = 0;
 			u32 m_normalization_instructions_removed = 0;
 			u32 m_single_d_broadcast_operands = 0;
+			u32 m_nearest_neon_fmac_ops = 0;
+			u32 m_nearest_neon_scalar_ops_removed = 0;
+			u32 m_nearest_neon_conversion_ops = 0;
+			u32 m_nearest_neon_conversion_scalar_ops_removed = 0;
+			u32 m_nearest_neon_half_ops = 0;
+			u32 m_nearest_neon_efu_ops = 0;
+			u32 m_nearest_neon_efu_scalar_ops_removed = 0;
+			u32 m_approximate_q_ops = 0;
+			u32 m_approximate_p_ops = 0;
 			std::array<LocalFmacEntry, LOCAL_FMAC_SLOT_COUNT> m_local_fmac_entries{};
 			LocalFmacEntry* m_pending_local_fmac_entry = nullptr;
-			LocalFmacEntry* m_latest_working_fmac_entry = nullptr;
+			LocalFmacEntry* m_latest_working_fmac_mac_entry = nullptr;
+			LocalFmacEntry* m_latest_working_fmac_status_entry = nullptr;
 			bool m_capture_pending_local_fmac_flags = false;
 			bool m_dead_fmac_sticky_pending = false;
 			// True once the vuDouble() bit-select constant quads (Q8-Q10) have been
@@ -12388,6 +13873,10 @@ namespace VitaVU
 			const void* deferred_fmac_linked_entry = nullptr;
 			const void* resident_pipe_linked_entry = nullptr;
 			const void* resident_pipe_deferred_fmac_linked_entry = nullptr;
+			const void* resident_cycle_linked_entry = nullptr;
+			const void* resident_cycle_deferred_fmac_linked_entry = nullptr;
+			const void* resident_cycle_resident_pipe_linked_entry = nullptr;
+			const void* resident_cycle_resident_pipe_deferred_fmac_linked_entry = nullptr;
 			size_t code_size = 0;
 			u32 start_pc = 0;
 			u32 pair_count = 0;
@@ -12395,10 +13884,13 @@ namespace VitaVU
 			u32 micro_hash = 0;
 			bool entry_branch_tail = false;
 			bool entry_ebit_tail = false;
+			bool entry_pipes_empty = false;
 			bool continues_logical_block_if_busy = false;
 			bool vector_cache_frame = false;
 			bool deferred_fmac_flags = false;
 			bool resident_pipe_activity = false;
+			bool resident_cycle = false;
+			bool resident_cycle_high = false;
 			// PCSX2 owner: x86/microVU.h::microProgram. VU1 direct links are
 			// valid only within the immutable MicroMem version which owns both
 			// source and target blocks. VU0 does not use program versions.
@@ -12437,6 +13929,9 @@ namespace VitaVU
 			Vu1BlockMap branch_map{};
 			Vu1BlockMap ebit_map{};
 			Vu1BlockMap branch_ebit_map{};
+			// External-entry-only variants. Generated direct links deliberately
+			// target the ordinary maps because they may carry live pipe state.
+			Vu1BlockMap empty_entry_map{};
 			std::array<u8, VU1_PROGSIZE> micro{};
 			std::vector<MicroRange> ranges;
 			u32 primary_start_pc = 0;
@@ -12465,10 +13960,11 @@ namespace VitaVU
 			u32 pc;
 			bool entry_branch_tail;
 			bool entry_ebit_tail;
+			bool entry_pipes_empty;
 		};
 
 		constexpr u32 VU1_COMPILE_REQUEST_WORDS = VU1_PAIR_SLOTS / 64;
-		constexpr u32 VU1_COMPILE_REQUEST_VARIANTS = 4;
+		constexpr u32 VU1_COMPILE_REQUEST_VARIANTS = 8;
 		std::array<std::atomic<u64>,
 			VU1_COMPILE_REQUEST_WORDS * VU1_COMPILE_REQUEST_VARIANTS>
 			s_vu1_compile_requests{};
@@ -12477,21 +13973,31 @@ namespace VitaVU
 		std::atomic<u64> s_vu1_published_executed_blocks{0};
 		std::atomic<u64> s_vu1_published_executed_pairs{0};
 		std::atomic<u64> s_vu1_published_interpreter_steps{0};
+		std::atomic<u32> s_vu1_published_empty_pipeline_entry_executions{0};
+		// Worker-owned lifecycle facts. A natural E/D/T completion drains every
+		// VU pipeline before making the program inactive. SetStartPC is PCSX2's
+		// unique external-program-start seam; a forced stop never sets the first
+		// fact, so it safely falls back to the canonical entry map.
+		bool s_vu1_pipeline_empty_after_completion = false;
+		bool s_vu1_empty_external_entry_pending = false;
 
-		u32 Vu1CompileVariant(bool entry_branch_tail, bool entry_ebit_tail)
+		u32 Vu1CompileVariant(bool entry_branch_tail, bool entry_ebit_tail,
+			bool entry_pipes_empty = false)
 		{
 			return static_cast<u32>(entry_branch_tail) |
-				(static_cast<u32>(entry_ebit_tail) << 1);
+				(static_cast<u32>(entry_ebit_tail) << 1) |
+				(static_cast<u32>(entry_pipes_empty) << 2);
 		}
 
 		void RequestVu1Compile(u32 pc, bool entry_branch_tail,
-			bool entry_ebit_tail)
+			bool entry_ebit_tail, bool entry_pipes_empty = false)
 		{
 			if ((pc & 7) != 0 || pc > VU1_PROGMASK)
 				return;
 			const u32 slot = pc / 8;
 			const u32 word = Vu1CompileVariant(entry_branch_tail,
-				entry_ebit_tail) * VU1_COMPILE_REQUEST_WORDS + slot / 64;
+				entry_ebit_tail, entry_pipes_empty) *
+				VU1_COMPILE_REQUEST_WORDS + slot / 64;
 			s_vu1_compile_requests[word].fetch_or(1ull << (slot & 63),
 				std::memory_order_release);
 			if (VitaPerformanceTelemetry::IsEnabled())
@@ -12523,7 +14029,8 @@ namespace VitaVU
 				{
 					const u32 bit = static_cast<u32>(__builtin_ctzll(bits));
 					keys->push_back({(slot_base + bit) * 8,
-						(variant & 1) != 0, (variant & 2) != 0});
+						(variant & 1) != 0, (variant & 2) != 0,
+						(variant & 4) != 0});
 					bits &= bits - 1;
 				}
 			}
@@ -12663,8 +14170,13 @@ namespace VitaVU
 		}
 
 		Vu1BlockMap& SelectBlockMap(Vu1Program& program, bool entry_branch_tail,
-			bool entry_ebit_tail)
+			bool entry_ebit_tail, bool entry_pipes_empty = false)
 		{
+			if (entry_pipes_empty)
+			{
+				pxAssert(!entry_branch_tail && !entry_ebit_tail);
+				return program.empty_entry_map;
+			}
 			if (entry_branch_tail)
 				return entry_ebit_tail ? program.branch_ebit_map : program.branch_map;
 			return entry_ebit_tail ? program.ebit_map : program.map;
@@ -12784,6 +14296,13 @@ namespace VitaVU
 					link.target_ebit_tail == target.entry_ebit_tail;
 			}
 
+			bool DirectLinkCarriesResidentCycle(const CachedBlock& source,
+				const CachedBlock& target)
+			{
+				return source.resident_cycle && target.resident_cycle &&
+					(!target.resident_cycle_high || source.resident_cycle_high);
+			}
+
 			bool DirectLinkFramesCompatible(const CachedBlock& source, const CachedBlock& target)
 			{
 				return source.vector_cache_frame == target.vector_cache_frame;
@@ -12792,14 +14311,24 @@ namespace VitaVU
 			const void* DirectLinkTargetEntry(const CachedBlock& source,
 				const CachedBlock& target)
 			{
+				const bool carry_cycle = DirectLinkCarriesResidentCycle(source, target);
 				if (source.resident_pipe_activity && target.resident_pipe_activity)
 				{
-					return source.deferred_fmac_flags ?
-						target.resident_pipe_deferred_fmac_linked_entry :
+					if (source.deferred_fmac_flags)
+					{
+						return carry_cycle ?
+							target.resident_cycle_resident_pipe_deferred_fmac_linked_entry :
+							target.resident_pipe_deferred_fmac_linked_entry;
+					}
+					return carry_cycle ? target.resident_cycle_resident_pipe_linked_entry :
 						target.resident_pipe_linked_entry;
 				}
-				return source.deferred_fmac_flags ?
-					target.deferred_fmac_linked_entry : target.linked_entry;
+				if (source.deferred_fmac_flags)
+				{
+					return carry_cycle ? target.resident_cycle_deferred_fmac_linked_entry :
+						target.deferred_fmac_linked_entry;
+				}
+				return carry_cycle ? target.resident_cycle_linked_entry : target.linked_entry;
 			}
 
 			const void* DirectLinkTargetEntry(bool source_deferred_fmac_flags,
@@ -12816,12 +14345,15 @@ namespace VitaVU
 			}
 
 			bool PatchVu1DirectLink(CachedBlock& source, Vu1DirectLinkSlot& link,
-				const void* target)
+				const void* target, bool target_accepts_resident_pipe = false,
+				bool target_accepts_resident_cycle = false)
 			{
 				if (!link.valid ||
 					link.unlinked_fallback_offset == static_cast<size_t>(-1) ||
 					link.target_offset == static_cast<size_t>(-1) ||
-					link.fallback_offset == static_cast<size_t>(-1))
+					link.fallback_offset == static_cast<size_t>(-1) ||
+					(source.resident_cycle &&
+						link.cycle_publish_target_offset == static_cast<size_t>(-1)))
 				{
 					return false;
 				}
@@ -12830,23 +14362,71 @@ namespace VitaVU
 
 				if (target)
 				{
-					if (!source.code.PatchBranchToAddress(link.target_offset, target) ||
-						!source.code.PatchNop(link.unlinked_fallback_offset))
+					// The fallback branch already occupies this hot slot. Resident-to-
+					// resident pipe links keep its patched NOP and carry exact r10 state.
+					// A canonical target instead turns the same slot into the sole required
+					// fmaccount publication, so no extra instruction or link restriction is
+					// introduced by deferring the source-side store.
+					if (source.resident_pipe_activity && !target_accepts_resident_pipe)
+					{
+						if (!source.code.PatchInstruction(link.unlinked_fallback_offset,
+								VitaA32::EncodeStrbImm12(HOST_STALL_SCRATCH, HOST_VU,
+									VuOffset(offsetof(VURegs, fmaccount)))))
+						{
+							return false;
+						}
+					}
+					else if (!source.code.PatchNop(link.unlinked_fallback_offset))
+					{
+						return false;
+					}
+
+					if (source.resident_cycle && !target_accepts_resident_cycle &&
+						!source.code.PatchBranchToAddress(
+							link.cycle_publish_target_offset, target))
+					{
+						return false;
+					}
+					if (link.guard_tpc && link.guard_tpc_offset != static_cast<size_t>(-1) &&
+						!source.code.PatchMovImm32(link.guard_tpc_offset, 1,
+							link.guard_tpc_value))
+					{
+						return false;
+					}
+
+					// Enable the edge last. A compatible target skips the cold publication
+					// sequence. An incompatible target replaces this branch with STR r5 and
+					// falls through it, preserving the old store+branch instruction count.
+					if (source.resident_cycle && !target_accepts_resident_cycle)
+					{
+						if (!source.code.PatchInstruction(link.target_offset,
+								VitaA32::EncodeStrImm12(HOST_CYCLE_LO, HOST_VU,
+									VuOffset(offsetof(VURegs, cycle)))))
+						{
+							return false;
+						}
+					}
+					else if (!source.code.PatchBranchToAddress(link.target_offset, target))
 					{
 						return false;
 					}
 				}
 				else
 				{
-					if (!source.code.PatchBranch(link.unlinked_fallback_offset, link.fallback_offset) ||
-						!source.code.PatchBranch(link.target_offset, link.fallback_offset))
+					// Disable target execution first, then restore every cold publication
+					// slot to the common helper fallback.
+					if (!source.code.PatchBranch(link.target_offset, link.fallback_offset) ||
+						!source.code.PatchBranch(link.unlinked_fallback_offset, link.fallback_offset) ||
+						(link.cycle_publish_target_offset != static_cast<size_t>(-1) &&
+							!source.code.PatchBranch(link.cycle_publish_target_offset,
+								link.fallback_offset)))
 					{
 						return false;
 					}
 				}
-				if (link.guard_tpc && link.guard_tpc_offset != static_cast<size_t>(-1) &&
-					!source.code.PatchMovImm32(link.guard_tpc_offset, 1,
-						target ? link.guard_tpc_value : 0))
+				if (!target && link.guard_tpc &&
+					link.guard_tpc_offset != static_cast<size_t>(-1) &&
+					!source.code.PatchMovImm32(link.guard_tpc_offset, 1, 0))
 				{
 					return false;
 				}
@@ -12900,7 +14480,9 @@ namespace VitaVU
 					if (target && target != BLOCK_UNCOMPILABLE &&
 						DirectLinkFramesCompatible(source, *target))
 						PatchVu1DirectLink(source, link,
-							DirectLinkTargetEntry(source, *target));
+							DirectLinkTargetEntry(source, *target),
+							source.resident_pipe_activity && target->resident_pipe_activity,
+							DirectLinkCarriesResidentCycle(source, *target));
 					else if (link.patched_target)
 						PatchVu1DirectLink(source, link, nullptr);
 				}
@@ -12918,7 +14500,9 @@ namespace VitaVU
 					if (DirectLinkTargetsBlock(link, target) &&
 						DirectLinkFramesCompatible(*source, target))
 						PatchVu1DirectLink(*source, link,
-							DirectLinkTargetEntry(*source, target));
+							DirectLinkTargetEntry(*source, target),
+							source->resident_pipe_activity && target.resident_pipe_activity,
+							DirectLinkCarriesResidentCycle(*source, target));
 					else if (DirectLinkTargetsBlock(link, target) && link.patched_target)
 						PatchVu1DirectLink(*source, link, nullptr);
 				}
@@ -12927,7 +14511,11 @@ namespace VitaVU
 
 		void PatchVu1LinksForBlock(CachedBlock& block)
 		{
-			PatchVu1IncomingLinks(block);
+			// Direct links can never establish the empty-entry proof, so an
+			// external-entry-only target must not replace the ordinary target for
+			// the same PC. Its own outgoing links still target ordinary maps.
+			if (!block.entry_pipes_empty)
+				PatchVu1IncomingLinks(block);
 			PatchVu1LinksForCurrentMap(block);
 		}
 
@@ -12959,14 +14547,18 @@ namespace VitaVU
 				return first_unobserved ? first_unobserved : replacement;
 			}
 
-			CachedBlock* CompileVu1Block(u32 start_pc, bool entry_branch_tail, bool entry_ebit_tail)
+			CachedBlock* CompileVu1Block(u32 start_pc, bool entry_branch_tail,
+				bool entry_ebit_tail, bool entry_pipes_empty = false)
 			{
+				if (entry_pipes_empty && (entry_branch_tail || entry_ebit_tail))
+					return nullptr;
 				Vu1Program* program = s_vu1.active_program;
 				if (!program)
 					return nullptr;
 			BlockPlan plan;
 				if (!ScanBlock(VU1.Micro, 1, VU1_PROGSIZE, VU1_PROGMASK, false,
-						start_pc, entry_branch_tail, entry_ebit_tail, &plan))
+						start_pc, entry_branch_tail, entry_ebit_tail,
+						entry_pipes_empty, &plan))
 				{
 					// A retained fallback marker is part of this immutable program
 					// version too.  Record the rejected pair so a later MicroMem
@@ -12993,6 +14585,7 @@ namespace VitaVU
 			block->micro_hash = micro_hash;
 			block->entry_branch_tail = entry_branch_tail;
 			block->entry_ebit_tail = entry_ebit_tail;
+			block->entry_pipes_empty = entry_pipes_empty;
 			block->continues_logical_block_if_busy = plan.continues_logical_block_if_busy;
 			block->program = program;
 			block->pairs = std::make_unique<PairPlan[]>(plan.pair_count);
@@ -13013,6 +14606,15 @@ namespace VitaVU
 					u32 chosen_normalized_operand_quad_bypasses = 0;
 					u32 chosen_normalization_instructions_removed = 0;
 					u32 chosen_single_d_broadcast_operands = 0;
+					u32 chosen_nearest_neon_fmac_ops = 0;
+					u32 chosen_nearest_neon_scalar_ops_removed = 0;
+					u32 chosen_nearest_neon_conversion_ops = 0;
+					u32 chosen_nearest_neon_conversion_scalar_ops_removed = 0;
+					u32 chosen_nearest_neon_half_ops = 0;
+					u32 chosen_nearest_neon_efu_ops = 0;
+					u32 chosen_nearest_neon_efu_scalar_ops_removed = 0;
+					u32 chosen_approximate_q_ops = 0;
+					u32 chosen_approximate_p_ops = 0;
 					bool compiled = false;
 					bool vector_cache_candidate = false;
 					bool vector_cache_selected = false;
@@ -13057,6 +14659,22 @@ namespace VitaVU
 									baseline.GetNormalizationInstructionsRemoved();
 								chosen_single_d_broadcast_operands =
 									baseline.GetSingleDBroadcastOperands();
+								chosen_nearest_neon_fmac_ops =
+									baseline.GetNearestNeonFmacOps();
+								chosen_nearest_neon_scalar_ops_removed =
+									baseline.GetNearestNeonScalarOpsRemoved();
+								chosen_nearest_neon_conversion_ops =
+									baseline.GetNearestNeonConversionOps();
+								chosen_nearest_neon_conversion_scalar_ops_removed =
+									baseline.GetNearestNeonConversionScalarOpsRemoved();
+								chosen_nearest_neon_half_ops =
+									baseline.GetNearestNeonHalfOps();
+								chosen_nearest_neon_efu_ops =
+									baseline.GetNearestNeonEfuOps();
+								chosen_nearest_neon_efu_scalar_ops_removed =
+									baseline.GetNearestNeonEfuScalarOpsRemoved();
+								chosen_approximate_q_ops = baseline.GetApproximateQOps();
+								chosen_approximate_p_ops = baseline.GetApproximatePOps();
 								compiled = true;
 							}
 							else
@@ -13092,6 +14710,22 @@ namespace VitaVU
 											cached.GetNormalizationInstructionsRemoved();
 										chosen_single_d_broadcast_operands =
 											cached.GetSingleDBroadcastOperands();
+										chosen_nearest_neon_fmac_ops =
+											cached.GetNearestNeonFmacOps();
+										chosen_nearest_neon_scalar_ops_removed =
+											cached.GetNearestNeonScalarOpsRemoved();
+										chosen_nearest_neon_conversion_ops =
+											cached.GetNearestNeonConversionOps();
+										chosen_nearest_neon_conversion_scalar_ops_removed =
+											cached.GetNearestNeonConversionScalarOpsRemoved();
+										chosen_nearest_neon_half_ops =
+											cached.GetNearestNeonHalfOps();
+										chosen_nearest_neon_efu_ops =
+											cached.GetNearestNeonEfuOps();
+										chosen_nearest_neon_efu_scalar_ops_removed =
+											cached.GetNearestNeonEfuScalarOpsRemoved();
+										chosen_approximate_q_ops = cached.GetApproximateQOps();
+										chosen_approximate_p_ops = cached.GetApproximatePOps();
 										vector_cache_baseline_instructions = baseline_size / sizeof(u32);
 										vector_cache_selected_instructions = cached_size / sizeof(u32);
 										vector_cache_canonical_bytes_removed = baseline_bytes - cached_bytes;
@@ -13112,8 +14746,24 @@ namespace VitaVU
 											fallback.GetNormalizedOperandQuadBypasses();
 										chosen_normalization_instructions_removed =
 											fallback.GetNormalizationInstructionsRemoved();
-										chosen_single_d_broadcast_operands =
-											fallback.GetSingleDBroadcastOperands();
+									chosen_single_d_broadcast_operands =
+										fallback.GetSingleDBroadcastOperands();
+									chosen_nearest_neon_fmac_ops =
+										fallback.GetNearestNeonFmacOps();
+									chosen_nearest_neon_scalar_ops_removed =
+										fallback.GetNearestNeonScalarOpsRemoved();
+									chosen_nearest_neon_conversion_ops =
+										fallback.GetNearestNeonConversionOps();
+									chosen_nearest_neon_conversion_scalar_ops_removed =
+										fallback.GetNearestNeonConversionScalarOpsRemoved();
+									chosen_nearest_neon_half_ops =
+										fallback.GetNearestNeonHalfOps();
+									chosen_nearest_neon_efu_ops =
+										fallback.GetNearestNeonEfuOps();
+									chosen_nearest_neon_efu_scalar_ops_removed =
+										fallback.GetNearestNeonEfuScalarOpsRemoved();
+									chosen_approximate_q_ops = fallback.GetApproximateQOps();
+									chosen_approximate_p_ops = fallback.GetApproximatePOps();
 										compiled = true;
 									}
 								}
@@ -13127,6 +14777,8 @@ namespace VitaVU
 						block->vector_cache_frame = false;
 						block->deferred_fmac_flags = plan.deferred_fmac_flags;
 						block->resident_pipe_activity = plan.resident_pipe_activity;
+						block->resident_cycle = plan.resident_cycle;
+						block->resident_cycle_high = plan.resident_cycle_high;
 						block->code = std::move(code);
 						block->entry = block->code.EntryPoint();
 						block->linked_entry = static_cast<const u8*>(block->entry) +
@@ -13149,6 +14801,33 @@ namespace VitaVU
 							block->resident_pipe_deferred_fmac_linked_entry =
 								static_cast<const u8*>(block->entry) +
 								chosen_linked_entries.resident_pipe_deferred_fmac;
+						}
+						if (chosen_linked_entries.resident_cycle != static_cast<size_t>(-1))
+						{
+							block->resident_cycle_linked_entry =
+								static_cast<const u8*>(block->entry) +
+								chosen_linked_entries.resident_cycle;
+						}
+						if (chosen_linked_entries.resident_cycle_deferred_fmac !=
+							static_cast<size_t>(-1))
+						{
+							block->resident_cycle_deferred_fmac_linked_entry =
+								static_cast<const u8*>(block->entry) +
+								chosen_linked_entries.resident_cycle_deferred_fmac;
+						}
+						if (chosen_linked_entries.resident_cycle_resident_pipe !=
+							static_cast<size_t>(-1))
+						{
+							block->resident_cycle_resident_pipe_linked_entry =
+								static_cast<const u8*>(block->entry) +
+								chosen_linked_entries.resident_cycle_resident_pipe;
+						}
+						if (chosen_linked_entries.resident_cycle_resident_pipe_deferred_fmac !=
+							static_cast<size_t>(-1))
+						{
+							block->resident_cycle_resident_pipe_deferred_fmac_linked_entry =
+								static_cast<const u8*>(block->entry) +
+								chosen_linked_entries.resident_cycle_resident_pipe_deferred_fmac;
 						}
 						block->code_size = block->code.Size();
 						CodeBuffer::GeneratedCodeStats generated;
@@ -13178,8 +14857,61 @@ namespace VitaVU
 							chosen_normalization_instructions_removed;
 						s_vu1.stats.single_d_broadcast_operands +=
 							chosen_single_d_broadcast_operands;
+						s_vu1.stats.nearest_neon_fmac_ops +=
+							chosen_nearest_neon_fmac_ops;
+						s_vu1.stats.nearest_neon_scalar_ops_removed +=
+							chosen_nearest_neon_scalar_ops_removed;
+						s_vu1.stats.nearest_neon_conversion_ops +=
+							chosen_nearest_neon_conversion_ops;
+						s_vu1.stats.nearest_neon_conversion_scalar_ops_removed +=
+							chosen_nearest_neon_conversion_scalar_ops_removed;
+						s_vu1.stats.nearest_neon_half_ops +=
+							chosen_nearest_neon_half_ops;
+						s_vu1.stats.nearest_neon_efu_ops +=
+							chosen_nearest_neon_efu_ops;
+						s_vu1.stats.nearest_neon_efu_scalar_ops_removed +=
+							chosen_nearest_neon_efu_scalar_ops_removed;
+						s_vu1.stats.approximate_q_ops += chosen_approximate_q_ops;
+						s_vu1.stats.approximate_p_ops += chosen_approximate_p_ops;
+						if (plan.mvu_flag_hack)
+						{
+							s_vu1.stats.mvu_flag_hack_blocks++;
+							s_vu1.stats.status_flag_classification_elisions +=
+								plan.status_flag_classification_elisions;
+							s_vu1.stats.complete_flag_classification_elisions +=
+								plan.complete_flag_classification_elisions;
+						}
 						s_vu1.stats.canonical_fmac_stall_tests_elided +=
 							plan.canonical_fmac_stall_tests_elided;
+						s_vu1.stats.scheduled_upper_stall_tests_elided +=
+							plan.scheduled_upper_stall_tests_elided;
+						s_vu1.stats.scheduled_lower_stall_tests_elided +=
+							plan.scheduled_lower_stall_tests_elided;
+							s_vu1.stats.scheduled_ialu_producers_elided +=
+								plan.scheduled_ialu_producers_elided;
+							s_vu1.stats.scheduled_vi_backup_writes_elided +=
+								plan.scheduled_vi_backup_writes_elided;
+							s_vu1.stats.scheduled_fmac_hazard_metadata_pairs +=
+							plan.scheduled_fmac_hazard_metadata_pairs;
+						s_vu1.stats.scheduled_local_fmac_warmup_pairs_elided +=
+							plan.scheduled_local_fmac_warmup_pairs_elided;
+						s_vu1.stats.scheduled_local_fmac_relative_cycle_pairs +=
+								plan.scheduled_local_fmac_relative_cycle_pairs;
+						s_vu1.stats.instant_qp_producers +=
+							plan.instant_qp_producers;
+						s_vu1.stats.instant_qp_waits_elided +=
+							plan.instant_qp_waits_elided;
+						s_vu1.stats.mac_flag_classification_elisions +=
+							plan.mac_flag_classification_elisions;
+						s_vu1.stats.canonical_mac_flag_classification_elisions +=
+							plan.canonical_mac_flag_classification_elisions;
+						// Each suppressed MAC instance removes at least the packed
+						// classifier/reduction body. Resident local working flags cost
+						// one extra reload, leaving a seven-instruction minimum; all
+						// canonical and ordinary local cases remove at least eight.
+						s_vu1.stats.mac_flag_classification_minimum_instructions_removed +=
+							static_cast<u64>(plan.mac_flag_classification_elisions) *
+							(plan.resident_working_fmac_flags ? 7u : 8u);
 						if (plan.local_fmac_pipeline)
 						{
 							s_vu1.stats.local_fmac_pipeline_blocks++;
@@ -13189,28 +14921,46 @@ namespace VitaVU
 								plan.local_fmac_cycle_snapshot_elision_pairs;
 							s_vu1.stats.local_fmac_producer_snapshot_pairs +=
 								plan.local_fmac_producer_snapshot_pairs;
-							s_vu1.stats.local_fmac_clip_snapshot_elisions +=
-								plan.local_fmac_clip_snapshot_elisions;
-							s_vu1.stats.mac_flag_classification_elisions +=
-								plan.mac_flag_classification_elisions;
-							// Every liveness-selected producer captures its local flag
-							// instance. Reusing a resident working MAC costs one extra
-							// load, so STATUS-only classification removes seven A32
-							// instructions there and eight on the canonical local path.
-							s_vu1.stats.mac_flag_classification_minimum_instructions_removed +=
-								static_cast<u64>(plan.mac_flag_classification_elisions) *
-								(plan.resident_working_fmac_flags ? 7u : 8u);
+								s_vu1.stats.local_fmac_clip_snapshot_elisions +=
+									plan.local_fmac_clip_snapshot_elisions;
+						}
+						if (plan.entry_pipes_empty)
+						{
+							s_vu1.stats.empty_pipeline_entry_blocks++;
+							s_vu1.stats.empty_pipeline_entry_pairs += plan.pair_count;
+							if (plan.local_fmac_pipeline)
+							{
+								s_vu1.stats.empty_pipeline_local_fmac_blocks++;
+								s_vu1.stats.empty_pipeline_local_fmac_pairs +=
+									plan.local_fmac_pipeline_pairs;
+							}
+							for (u32 i = 0; i < plan.pair_count; i++)
+							{
+								s_vu1.stats.empty_pipeline_test_pipes_elisions +=
+									plan.pairs[i].test_pipes_proven_empty ? 1u : 0u;
+							}
 						}
 						if (plan.resident_working_fmac_flags)
 						{
 							s_vu1.stats.resident_working_fmac_flag_blocks++;
 							s_vu1.stats.resident_working_fmac_flag_producers +=
 								plan.local_fmac_producer_snapshot_pairs;
+							s_vu1.stats.resident_working_fmac_fdiv_barriers +=
+								plan.resident_working_fmac_fdiv_barriers;
 							// The canonical path publishes MAC and STATUS after every
-							// producer. Residency replaces those 2*N stores with the two
-							// stores at the sole block-seam publication.
-							s_vu1.stats.resident_working_fmac_state_stores_removed +=
-								static_cast<u64>(plan.local_fmac_producer_snapshot_pairs) * 2u - 2u;
+							// producer. Residency publishes at the seam and, conservatively,
+							// both words at each mixed FDIV pair. The actual barrier can publish
+							// fewer words when only one private owner exists, so this is a strict
+							// lower bound on removed Cortex-A9 state stores.
+							const u64 canonical_stores =
+								static_cast<u64>(plan.local_fmac_producer_snapshot_pairs) * 2u;
+							const u64 resident_stores =
+								(static_cast<u64>(plan.resident_working_fmac_fdiv_barriers) + 1u) * 2u;
+							if (canonical_stores > resident_stores)
+							{
+								s_vu1.stats.resident_working_fmac_state_stores_removed +=
+									canonical_stores - resident_stores;
+							}
 						}
 						if (plan.resident_pipe_activity)
 						{
@@ -13328,7 +15078,7 @@ namespace VitaVU
 						CachedBlock* result = block.get();
 						s_vu1.blocks.push_back(std::move(block));
 						Vu1BlockMap& map = SelectBlockMap(*program,
-							entry_branch_tail, entry_ebit_tail);
+							entry_branch_tail, entry_ebit_tail, entry_pipes_empty);
 						map[start_pc / 8] = result;
 						CacheVu1ProgramRange(*program, start_pc, micro_size);
 						program->mapped_blocks++;
@@ -13354,19 +15104,22 @@ namespace VitaVU
 			return nullptr;
 		}
 
-		CachedBlock* LookupOrCompileVu1Block(u32 start_pc, bool entry_branch_tail, bool entry_ebit_tail)
+		CachedBlock* LookupOrCompileVu1Block(u32 start_pc, bool entry_branch_tail,
+			bool entry_ebit_tail, bool entry_pipes_empty = false)
 		{
 			if (!s_vu1.active_program)
 			{
 				if (THREAD_VU1)
 				{
 					RequestVu1Compile(start_pc, entry_branch_tail, entry_ebit_tail);
+					if (entry_pipes_empty)
+						RequestVu1Compile(start_pc, false, false, true);
 					return nullptr;
 				}
 				ActivateVu1Program(start_pc);
 			}
 			Vu1BlockMap& map = SelectBlockMap(*s_vu1.active_program,
-				entry_branch_tail, entry_ebit_tail);
+				entry_branch_tail, entry_ebit_tail, entry_pipes_empty);
 			CachedBlock* block = map[start_pc / 8];
 			if (block == BLOCK_UNCOMPILABLE)
 				return nullptr;
@@ -13374,15 +15127,29 @@ namespace VitaVU
 				return block;
 			if (THREAD_VU1)
 			{
+				// MSCNT's vu_addr == -1 start is known only to the worker. Publish
+				// that exact external-entry PC through the existing lock-free request
+				// channel so CPU0 can compile its empty-pipeline variant at the next
+				// VM-domain barrier. The current job safely uses the ordinary map.
+				if (entry_pipes_empty)
+				{
+					RequestVu1Compile(start_pc, false, false, true);
+					CachedBlock* ordinary = SelectBlockMap(*s_vu1.active_program,
+						entry_branch_tail, entry_ebit_tail)[start_pc / 8];
+					if (ordinary && ordinary != BLOCK_UNCOMPILABLE)
+						return ordinary;
+				}
 				RequestVu1Compile(start_pc, entry_branch_tail, entry_ebit_tail);
 				return nullptr;
 			}
 
-			block = CompileVu1Block(start_pc, entry_branch_tail, entry_ebit_tail);
+			block = CompileVu1Block(start_pc, entry_branch_tail, entry_ebit_tail,
+				entry_pipes_empty);
 			if (!block)
 			{
 				SelectBlockMap(*s_vu1.active_program, entry_branch_tail,
-					entry_ebit_tail)[start_pc / 8] = BLOCK_UNCOMPILABLE;
+					entry_ebit_tail, entry_pipes_empty)[start_pc / 8] =
+					BLOCK_UNCOMPILABLE;
 				s_vu1.map_populated = true;
 			}
 			return block;
@@ -13392,7 +15159,7 @@ namespace VitaVU
 		{
 			BlockPlan plan;
 			if (!ScanBlock(VU0.Micro, 0, VU0_PROGSIZE, VU0_PROGMASK, true,
-					start_pc, entry_branch_tail, entry_ebit_tail, &plan))
+					start_pc, entry_branch_tail, entry_ebit_tail, false, &plan))
 			{
 				s_vu0.stats.scan_rejects++;
 				return nullptr;
@@ -13623,8 +15390,13 @@ namespace VitaVU
 						observed_link->target_pc = target_pc;
 						observed_link->guard_tpc_value = target_pc;
 						observed_link->observed_target = true;
-						if (PatchVu1DirectLink(*observed_link->owner, *observed_link,
-								DirectLinkTargetEntry(*observed_link->owner, *block)))
+						if (DirectLinkFramesCompatible(*observed_link->owner, *block) &&
+							PatchVu1DirectLink(*observed_link->owner, *observed_link,
+								DirectLinkTargetEntry(*observed_link->owner, *block),
+								observed_link->owner->resident_pipe_activity &&
+									block->resident_pipe_activity,
+								DirectLinkCarriesResidentCycle(
+									*observed_link->owner, *block)))
 						{
 							if (first_observation)
 								s_vu1.stats.direct_link_runtime_observed_slots++;
@@ -13714,7 +15486,8 @@ namespace VitaVU
 		const u32 start_pc =
 			(static_cast<u32>(vu_addr) & 0x7ffu) << 3;
 		const bool needs_preparation =
-			s_vu1.active_program->map[start_pc / 8] == nullptr;
+			s_vu1.active_program->map[start_pc / 8] == nullptr ||
+			s_vu1.active_program->empty_entry_map[start_pc / 8] == nullptr;
 		if (!needs_preparation && VitaPerformanceTelemetry::IsEnabled())
 			s_vu1.stats.program_quick_cache_hits++;
 		return needs_preparation;
@@ -13730,7 +15503,7 @@ namespace VitaVU
 		ActivateVu1Program(start_pc);
 		std::vector<Vu1CompileKey> queue;
 		queue.reserve(32);
-		queue.push_back({start_pc, false, false});
+		queue.push_back({start_pc, false, false, false});
 		DrainVu1CompileRequests(&queue);
 
 		std::array<u64,
@@ -13740,25 +15513,28 @@ namespace VitaVU
 			const Vu1CompileKey key = queue[cursor];
 			const u32 slot = key.pc / 8;
 			const u32 visited_word = Vu1CompileVariant(key.entry_branch_tail,
-				key.entry_ebit_tail) * VU1_COMPILE_REQUEST_WORDS + slot / 64;
+				key.entry_ebit_tail, key.entry_pipes_empty) *
+				VU1_COMPILE_REQUEST_WORDS + slot / 64;
 			const u64 visited_bit = 1ull << (slot & 63);
 			if (visited[visited_word] & visited_bit)
 				continue;
 			visited[visited_word] |= visited_bit;
 
 			Vu1BlockMap& map = SelectBlockMap(*s_vu1.active_program,
-				key.entry_branch_tail, key.entry_ebit_tail);
+				key.entry_branch_tail, key.entry_ebit_tail,
+				key.entry_pipes_empty);
 			CachedBlock* block = map[slot];
 			if (block == BLOCK_UNCOMPILABLE)
 				continue;
 			if (!block)
 			{
 				block = CompileVu1Block(key.pc, key.entry_branch_tail,
-					key.entry_ebit_tail);
+					key.entry_ebit_tail, key.entry_pipes_empty);
 				if (!block)
 				{
 					SelectBlockMap(*s_vu1.active_program,
-						key.entry_branch_tail, key.entry_ebit_tail)[slot] =
+						key.entry_branch_tail, key.entry_ebit_tail,
+						key.entry_pipes_empty)[slot] =
 						BLOCK_UNCOMPILABLE;
 					s_vu1.map_populated = true;
 					continue;
@@ -13770,8 +15546,22 @@ namespace VitaVU
 				if (link.valid && !link.runtime_observed)
 				{
 					queue.push_back({link.target_pc, link.target_branch_tail,
-						link.target_ebit_tail});
+						link.target_ebit_tail, false});
 				}
+			}
+		}
+
+		// PCSX2's initial program state is distinct from an internal block link.
+		// Compile one external-entry-only version after the ordinary reachable
+		// graph so the worker can select it from natural-completion evidence
+		// without generating or patching code in the VM execution domain.
+		if (!s_vu1.active_program->empty_entry_map[start_pc / 8])
+		{
+			if (!CompileVu1Block(start_pc, false, false, true))
+			{
+				s_vu1.active_program->empty_entry_map[start_pc / 8] =
+					BLOCK_UNCOMPILABLE;
+				s_vu1.map_populated = true;
 			}
 		}
 	}
@@ -14085,6 +15875,18 @@ namespace VitaVU
 #endif
 	}
 
+	void LatchVu1ExternalProgramStart()
+	{
+		// PCSX2 owners: VU1micro.cpp::vu1ExecMicro() and
+		// MTVU.cpp::VU_Thread::ExecuteRingBuffer(). Both call SetStartPC exactly
+		// once before a new program. A natural prior finish was observed by the
+		// provider after _vuFlushAll(); vu1Finish()'s forced-stop escape remains
+		// false because the program was still active when Execute() returned.
+		s_vu1_empty_external_entry_pending =
+			s_vu1_pipeline_empty_after_completion;
+		s_vu1_pipeline_empty_after_completion = false;
+	}
+
 	extern "C" __attribute__((noinline)) void VitaVu1ExecuteReservedVectorBody(u32 cycles)
 	{
 		// PCSX2 owners: InterpVU1::Execute() supplies the loop shape, TPC
@@ -14098,6 +15900,10 @@ namespace VitaVU
 		const u64 limit = startcycles + cycles;
 		const bool performance_telemetry_enabled =
 			VitaPerformanceTelemetry::IsEnabled();
+		const bool program_was_active = Vu1ProgramActive();
+		const bool external_entry_pipes_empty =
+			s_vu1_empty_external_entry_pending;
+		s_vu1_empty_external_entry_pending = false;
 		// Micro-step tracing must go through vu1Exec() so every step records.
 		const bool blocks_eligible = !Pcsx2Trace::IsVuTraceEnabled()
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -14106,6 +15912,7 @@ namespace VitaVU
 			;
 
 		bool admitted_logical_continuation = false;
+		bool first_dispatch_entry = true;
 		while (admitted_logical_continuation || (VU1.cycle - startcycles) < cycles)
 		{
 			if (!Vu1ProgramActive())
@@ -14120,6 +15927,10 @@ namespace VitaVU
 
 			VU1.VI[REG_TPC].UL &= VU1_PROGMASK;
 
+			const bool entry_pipes_empty = first_dispatch_entry &&
+				external_entry_pipes_empty;
+			first_dispatch_entry = false;
+
 			// Pair-misaligned TPC values (possible through direct TPC writes)
 			// would alias block-map slots; the interpreter owns those steps.
 			if (blocks_eligible && (VU1.branch == 0 || VU1.branch == 1) &&
@@ -14128,8 +15939,13 @@ namespace VitaVU
 			{
 				const bool entry_branch_tail = VU1.branch == 1;
 				const bool entry_ebit_tail = VU1.ebit == 1;
+				// A natural prior program completion established empty pipeline
+				// state before SetStartPC. Branch/E-bit continuation entries never
+				// consume that external-entry-only specialization.
+				const bool use_empty_entry = entry_pipes_empty &&
+					!entry_branch_tail && !entry_ebit_tail;
 				if (CachedBlock* block = LookupOrCompileVu1Block(VU1.VI[REG_TPC].UL,
-						entry_branch_tail, entry_ebit_tail))
+						entry_branch_tail, entry_ebit_tail, use_empty_entry))
 				{
 					const BlockFn fn = reinterpret_cast<BlockFn>(const_cast<void*>(block->entry));
 					const u32 result = fn(&VU1, 0,
@@ -14141,6 +15957,8 @@ namespace VitaVU
 						{
 							s_vu1.stats.executed_blocks++;
 							s_vu1.stats.executed_pairs += executed;
+							s_vu1.stats.empty_pipeline_entry_executions +=
+								block->entry_pipes_empty ? 1u : 0u;
 						}
 						admitted_logical_continuation =
 							(result & EXECUTED_PAIRS_LOGICAL_CONTINUATION) != 0 &&
@@ -14165,6 +15983,14 @@ namespace VitaVU
 		ClampVuCycleAfterAdmittedBlock(VU1, startcycles, cycles);
 		VU1.VI[REG_TPC].UL >>= 3;
 		UpdateNextBlockCyclesAtExecuteExit(VU1, 0x100, false);
+		if (program_was_active && !Vu1ProgramActive())
+		{
+			// PCSX2 owner: _vu1FinishProgram()/mVUendProgram(). All normal E,
+			// enabled D, and enabled T exits drain every pipe and XGKICK before
+			// clearing the run state. The overlong-program forced stop happens
+			// outside this Execute() call and deliberately cannot reach here.
+			s_vu1_pipeline_empty_after_completion = true;
+		}
 		// One release publication per MTVU Execute job keeps the hot generated
 		// block path free of atomic traffic while allowing the EE producer to
 		// sample monotonic VU work without racing the worker-owned counters.
@@ -14175,6 +16001,9 @@ namespace VitaVU
 			s_vu1_published_executed_pairs.store(s_vu1.stats.executed_pairs,
 				std::memory_order_relaxed);
 			s_vu1_published_interpreter_steps.store(s_vu1.stats.interpreter_steps,
+				std::memory_order_relaxed);
+			s_vu1_published_empty_pipeline_entry_executions.store(
+				s_vu1.stats.empty_pipeline_entry_executions,
 				std::memory_order_relaxed);
 			s_vu1_completed_programs.fetch_add(1, std::memory_order_release);
 		}
@@ -14202,12 +16031,23 @@ namespace VitaVU
 		// PCSX2 owner: x86/microVU.cpp::mVUreset().  InterpVU1::Reset() does
 		// not own this native-provider scheduling hint.
 		VU1.nextBlockCycles = 0;
+		// Reset is cold and is not itself a natural program completion. Inspect
+		// the exact interpreter-owned pipe state once so a VM reset can seed the
+		// first external entry without weakening the forced-stop rule.
+		s_vu1_pipeline_empty_after_completion =
+			(VU1.fmaccount |
+			 static_cast<u32>(VU1.fdiv.enable) |
+			 static_cast<u32>(VU1.efu.enable) |
+			 VU1.ialucount | VU1.xgkickenable) == 0;
+		s_vu1_empty_external_entry_pending = false;
 		ClearVu1CompileRequests();
 		DropVu1Blocks();
 	}
 
 	void ShutdownVu1Blocks()
 	{
+		s_vu1_pipeline_empty_after_completion = false;
+		s_vu1_empty_external_entry_pending = false;
 		ClearVu1CompileRequests();
 		DropVu1Blocks();
 		if (s_vu1.code_cache)
@@ -14288,12 +16128,60 @@ namespace VitaVU
 			s_vu1.stats.resident_working_fmac_flag_blocks;
 		stats.resident_working_fmac_flag_producers =
 			s_vu1.stats.resident_working_fmac_flag_producers;
+		stats.resident_working_fmac_fdiv_barriers =
+			s_vu1.stats.resident_working_fmac_fdiv_barriers;
 		stats.resident_working_fmac_state_stores_removed =
 			s_vu1.stats.resident_working_fmac_state_stores_removed;
+		stats.nearest_neon_fmac_ops = s_vu1.stats.nearest_neon_fmac_ops;
+		stats.nearest_neon_scalar_ops_removed =
+			s_vu1.stats.nearest_neon_scalar_ops_removed;
+		stats.nearest_neon_conversion_ops =
+			s_vu1.stats.nearest_neon_conversion_ops;
+		stats.nearest_neon_conversion_scalar_ops_removed =
+			s_vu1.stats.nearest_neon_conversion_scalar_ops_removed;
+		stats.nearest_neon_half_ops = s_vu1.stats.nearest_neon_half_ops;
+		stats.nearest_neon_efu_ops = s_vu1.stats.nearest_neon_efu_ops;
+		stats.nearest_neon_efu_scalar_ops_removed =
+			s_vu1.stats.nearest_neon_efu_scalar_ops_removed;
+		stats.approximate_q_ops = s_vu1.stats.approximate_q_ops;
+		stats.approximate_p_ops = s_vu1.stats.approximate_p_ops;
+		stats.neon_clip_pairs = s_vu1.stats.upper_clip_inline_pairs;
 		stats.mac_flag_classification_elisions =
 			s_vu1.stats.mac_flag_classification_elisions;
 		stats.mac_flag_classification_minimum_instructions_removed =
 			s_vu1.stats.mac_flag_classification_minimum_instructions_removed;
+		stats.mvu_flag_hack_blocks = s_vu1.stats.mvu_flag_hack_blocks;
+		stats.status_flag_classification_elisions =
+			s_vu1.stats.status_flag_classification_elisions;
+		stats.complete_flag_classification_elisions =
+			s_vu1.stats.complete_flag_classification_elisions;
+		stats.scheduled_upper_stall_tests_elided =
+			s_vu1.stats.scheduled_upper_stall_tests_elided;
+		stats.scheduled_lower_stall_tests_elided =
+			s_vu1.stats.scheduled_lower_stall_tests_elided;
+		stats.scheduled_ialu_producers_elided =
+			s_vu1.stats.scheduled_ialu_producers_elided;
+		stats.scheduled_vi_backup_writes_elided =
+			s_vu1.stats.scheduled_vi_backup_writes_elided;
+		stats.scheduled_fmac_hazard_metadata_pairs =
+			s_vu1.stats.scheduled_fmac_hazard_metadata_pairs;
+		stats.scheduled_local_fmac_warmup_pairs_elided =
+			s_vu1.stats.scheduled_local_fmac_warmup_pairs_elided;
+		stats.scheduled_local_fmac_relative_cycle_pairs =
+			s_vu1.stats.scheduled_local_fmac_relative_cycle_pairs;
+		stats.empty_pipeline_entry_blocks =
+			s_vu1.stats.empty_pipeline_entry_blocks;
+		stats.empty_pipeline_entry_pairs =
+			s_vu1.stats.empty_pipeline_entry_pairs;
+		stats.empty_pipeline_local_fmac_blocks =
+			s_vu1.stats.empty_pipeline_local_fmac_blocks;
+		stats.empty_pipeline_local_fmac_pairs =
+			s_vu1.stats.empty_pipeline_local_fmac_pairs;
+		stats.empty_pipeline_test_pipes_elisions =
+			s_vu1.stats.empty_pipeline_test_pipes_elisions;
+		stats.empty_pipeline_entry_executions =
+			s_vu1_published_empty_pipeline_entry_executions.load(
+				std::memory_order_relaxed);
 		stats.program_prepare_checks = s_vu1.stats.program_prepare_checks;
 		stats.program_prepare_calls = s_vu1.stats.program_prepare_calls;
 		stats.program_quick_cache_hits = s_vu1.stats.program_quick_cache_hits;
@@ -14314,6 +16202,8 @@ namespace VitaVU
 		g_qemuVuJitLinkedFrameEntries = 0;
 		g_qemuVuJitLinkedVectorFrameEntries = 0;
 		g_qemuVuJitResidentPipeLinkedEntries = 0;
+		g_qemuVuJitResidentCycleLinkedEntries = 0;
+		g_qemuVuJitResidentCycleHighLinkedEntries = 0;
 		g_qemuVuJitLocalFmacPipelineEntries = 0;
 		g_qemuVuJitLocalFmacPipelineCommits = 0;
 		g_qemuVuJitLocalFmacCycleSnapshotElisions = 0;
@@ -14342,5 +16232,7 @@ namespace VitaVU
 		s_vu1_published_executed_blocks.store(0, std::memory_order_relaxed);
 		s_vu1_published_executed_pairs.store(0, std::memory_order_relaxed);
 		s_vu1_published_interpreter_steps.store(0, std::memory_order_relaxed);
+		s_vu1_published_empty_pipeline_entry_executions.store(
+			0, std::memory_order_relaxed);
 	}
 } // namespace VitaVU

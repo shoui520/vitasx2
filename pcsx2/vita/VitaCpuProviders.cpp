@@ -1563,6 +1563,7 @@ void recMicroVU1::Step()
 void recMicroVU1::SetStartPC(u32 startPC)
 {
 	CpuIntVU1.SetStartPC(startPC);
+	VitaVU::LatchVu1ExternalProgramStart();
 }
 
 void recMicroVU1::Execute(u32 cycles)

@@ -745,14 +745,53 @@ namespace MTGS
 			"generated_pairs=%llu host_instructions=%llu host_loads=%llu host_stores=%llu "
 			"helper_calls_generated=%llu register_loads_generated=%llu "
 			"register_stores_generated=%llu working_flag_blocks=%llu "
-			"working_flag_producers=%llu working_state_stores_removed=%llu "
+			"working_flag_producers=%llu working_fdiv_barriers=%llu "
+			"working_state_stores_removed=%llu "
+			"nearest_neon_fmac_ops=%llu nearest_neon_scalar_ops_removed=%llu "
+			"nearest_neon_conversion_ops=%llu "
+			"nearest_neon_conversion_scalar_ops_removed=%llu "
+			"nearest_neon_half_ops=%llu "
+			"nearest_neon_efu_ops=%llu nearest_neon_efu_scalar_ops_removed=%llu "
+			"approximate_q_ops=%llu approximate_p_ops=%llu "
+			"neon_clip_pairs=%llu "
 			"mac_classification_elisions=%llu mac_classification_min_instructions_removed=%llu "
+			"mvu_flag_hack_blocks=%llu status_classification_elisions=%llu "
+			"complete_flag_classification_elisions=%llu "
+			"scheduled_upper_tests_elided=%llu scheduled_lower_tests_elided=%llu "
+			"scheduled_ialu_producers_elided=%llu scheduled_vi_backup_writes_elided=%llu "
+			"scheduled_fmac_hazard_metadata_pairs=%llu "
+			"scheduled_local_fmac_warmup_pairs_elided=%llu "
+			"scheduled_local_fmac_relative_cycle_pairs=%llu "
+			"empty_entry_blocks=%llu empty_entry_pairs=%llu "
+			"empty_entry_local_blocks=%llu empty_entry_local_pairs=%llu "
+			"empty_entry_pipe_test_elisions=%llu empty_entry_executions=%llu "
 			"origin_programs=%llu "
 			"origin_executed_pairs=%llu origin_interpreter_steps=%llu "
 			"origin_generated_blocks=%llu origin_generated_pairs=%llu "
 			"origin_working_flag_blocks=%llu origin_working_flag_producers=%llu "
-			"origin_working_state_stores_removed=%llu origin_mac_classification_elisions=%llu "
-			"origin_mac_classification_min_instructions_removed=%llu",
+			"origin_working_fdiv_barriers=%llu origin_working_state_stores_removed=%llu "
+			"origin_nearest_neon_fmac_ops=%llu origin_nearest_neon_scalar_ops_removed=%llu "
+			"origin_nearest_neon_conversion_ops=%llu "
+			"origin_nearest_neon_conversion_scalar_ops_removed=%llu "
+			"origin_nearest_neon_half_ops=%llu "
+			"origin_nearest_neon_efu_ops=%llu "
+			"origin_nearest_neon_efu_scalar_ops_removed=%llu "
+			"origin_approximate_q_ops=%llu origin_approximate_p_ops=%llu "
+			"origin_neon_clip_pairs=%llu "
+			"origin_mac_classification_elisions=%llu "
+			"origin_mac_classification_min_instructions_removed=%llu "
+			"origin_mvu_flag_hack_blocks=%llu origin_status_classification_elisions=%llu "
+			"origin_complete_flag_classification_elisions=%llu "
+			"origin_scheduled_upper_tests_elided=%llu "
+			"origin_scheduled_lower_tests_elided=%llu "
+			"origin_scheduled_ialu_producers_elided=%llu "
+			"origin_scheduled_vi_backup_writes_elided=%llu "
+			"origin_scheduled_fmac_hazard_metadata_pairs=%llu "
+			"origin_scheduled_local_fmac_warmup_pairs_elided=%llu "
+			"origin_scheduled_local_fmac_relative_cycle_pairs=%llu "
+			"origin_empty_entry_blocks=%llu origin_empty_entry_pairs=%llu "
+			"origin_empty_entry_local_blocks=%llu origin_empty_entry_local_pairs=%llu "
+			"origin_empty_entry_pipe_test_elisions=%llu origin_empty_entry_executions=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.completed_programs,
 				start.vu1.completed_programs)),
@@ -790,14 +829,91 @@ namespace MTGS
 				end.vu1.resident_working_fmac_flag_producers,
 				start.vu1.resident_working_fmac_flag_producers)),
 			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.resident_working_fmac_fdiv_barriers,
+				start.vu1.resident_working_fmac_fdiv_barriers)),
+			static_cast<unsigned long long>(CounterDelta(
 				end.vu1.resident_working_fmac_state_stores_removed,
 				start.vu1.resident_working_fmac_state_stores_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_fmac_ops,
+				start.vu1.nearest_neon_fmac_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_scalar_ops_removed,
+				start.vu1.nearest_neon_scalar_ops_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_conversion_ops,
+				start.vu1.nearest_neon_conversion_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_conversion_scalar_ops_removed,
+				start.vu1.nearest_neon_conversion_scalar_ops_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_half_ops,
+				start.vu1.nearest_neon_half_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_efu_ops,
+				start.vu1.nearest_neon_efu_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_efu_scalar_ops_removed,
+				start.vu1.nearest_neon_efu_scalar_ops_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.approximate_q_ops, start.vu1.approximate_q_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.approximate_p_ops, start.vu1.approximate_p_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.neon_clip_pairs, start.vu1.neon_clip_pairs)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.vu1.mac_flag_classification_elisions,
 				start.vu1.mac_flag_classification_elisions)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.vu1.mac_flag_classification_minimum_instructions_removed,
 				start.vu1.mac_flag_classification_minimum_instructions_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.mvu_flag_hack_blocks, start.vu1.mvu_flag_hack_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.status_flag_classification_elisions,
+				start.vu1.status_flag_classification_elisions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.complete_flag_classification_elisions,
+				start.vu1.complete_flag_classification_elisions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_upper_stall_tests_elided,
+				start.vu1.scheduled_upper_stall_tests_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_lower_stall_tests_elided,
+				start.vu1.scheduled_lower_stall_tests_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_ialu_producers_elided,
+				start.vu1.scheduled_ialu_producers_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_vi_backup_writes_elided,
+				start.vu1.scheduled_vi_backup_writes_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_fmac_hazard_metadata_pairs,
+				start.vu1.scheduled_fmac_hazard_metadata_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_local_fmac_warmup_pairs_elided,
+				start.vu1.scheduled_local_fmac_warmup_pairs_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_local_fmac_relative_cycle_pairs,
+				start.vu1.scheduled_local_fmac_relative_cycle_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_entry_blocks,
+				start.vu1.empty_pipeline_entry_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_entry_pairs,
+				start.vu1.empty_pipeline_entry_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_local_fmac_blocks,
+				start.vu1.empty_pipeline_local_fmac_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_local_fmac_pairs,
+				start.vu1.empty_pipeline_local_fmac_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_test_pipes_elisions,
+				start.vu1.empty_pipeline_test_pipes_elisions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_entry_executions,
+				start.vu1.empty_pipeline_entry_executions)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.completed_programs,
 				origin.vu1.completed_programs)),
 			static_cast<unsigned long long>(CounterDelta(end.vu1.executed_pairs,
@@ -815,14 +931,91 @@ namespace MTGS
 				end.vu1.resident_working_fmac_flag_producers,
 				origin.vu1.resident_working_fmac_flag_producers)),
 			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.resident_working_fmac_fdiv_barriers,
+				origin.vu1.resident_working_fmac_fdiv_barriers)),
+			static_cast<unsigned long long>(CounterDelta(
 				end.vu1.resident_working_fmac_state_stores_removed,
 				origin.vu1.resident_working_fmac_state_stores_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_fmac_ops,
+				origin.vu1.nearest_neon_fmac_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_scalar_ops_removed,
+				origin.vu1.nearest_neon_scalar_ops_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_conversion_ops,
+				origin.vu1.nearest_neon_conversion_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_conversion_scalar_ops_removed,
+				origin.vu1.nearest_neon_conversion_scalar_ops_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_half_ops,
+				origin.vu1.nearest_neon_half_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_efu_ops,
+				origin.vu1.nearest_neon_efu_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.nearest_neon_efu_scalar_ops_removed,
+				origin.vu1.nearest_neon_efu_scalar_ops_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.approximate_q_ops, origin.vu1.approximate_q_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.approximate_p_ops, origin.vu1.approximate_p_ops)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.neon_clip_pairs, origin.vu1.neon_clip_pairs)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.vu1.mac_flag_classification_elisions,
 				origin.vu1.mac_flag_classification_elisions)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.vu1.mac_flag_classification_minimum_instructions_removed,
-				origin.vu1.mac_flag_classification_minimum_instructions_removed)));
+				origin.vu1.mac_flag_classification_minimum_instructions_removed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.mvu_flag_hack_blocks, origin.vu1.mvu_flag_hack_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.status_flag_classification_elisions,
+				origin.vu1.status_flag_classification_elisions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.complete_flag_classification_elisions,
+				origin.vu1.complete_flag_classification_elisions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_upper_stall_tests_elided,
+				origin.vu1.scheduled_upper_stall_tests_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_lower_stall_tests_elided,
+				origin.vu1.scheduled_lower_stall_tests_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_ialu_producers_elided,
+				origin.vu1.scheduled_ialu_producers_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_vi_backup_writes_elided,
+				origin.vu1.scheduled_vi_backup_writes_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_fmac_hazard_metadata_pairs,
+				origin.vu1.scheduled_fmac_hazard_metadata_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_local_fmac_warmup_pairs_elided,
+				origin.vu1.scheduled_local_fmac_warmup_pairs_elided)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.scheduled_local_fmac_relative_cycle_pairs,
+				origin.vu1.scheduled_local_fmac_relative_cycle_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_entry_blocks,
+				origin.vu1.empty_pipeline_entry_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_entry_pairs,
+				origin.vu1.empty_pipeline_entry_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_local_fmac_blocks,
+				origin.vu1.empty_pipeline_local_fmac_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_local_fmac_pairs,
+				origin.vu1.empty_pipeline_local_fmac_pairs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_test_pipes_elisions,
+				origin.vu1.empty_pipeline_test_pipes_elisions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.vu1.empty_pipeline_entry_executions,
+				origin.vu1.empty_pipeline_entry_executions)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=vu1_cache prepare_checks=%llu prepare_calls=%llu "
 			"quick_hits=%llu program_hits=%llu maps_reused=%llu versions_created=%llu "
