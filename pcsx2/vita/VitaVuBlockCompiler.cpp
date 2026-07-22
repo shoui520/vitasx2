@@ -2100,7 +2100,8 @@ namespace VitaVU
 				// seam. PCSX2 owner: x86/microVU_IR.h::microRegAlloc::flushAll().
 				if (!EmitFlushVectorCache())
 					return false;
-				if (!EmitPublishResidentCycle())
+				if (!EmitPublishResidentFmacCount() ||
+					!EmitPublishResidentCycle())
 					return false;
 
 				// Fall-through: every pair executed. If the next block is
@@ -2133,6 +2134,7 @@ namespace VitaVU
 						return false;
 					if (!EmitPublishPairTpc(exit.executed_pairs) ||
 						!EmitPublishPairCode(exit.executed_pairs) ||
+						!EmitPublishResidentFmacCount() ||
 						!EmitPublishResidentCycle() ||
 						!EmitPublishDeferredFmacFlags() ||
 						!EmitReturnExecutedPairs(exit.executed_pairs))
@@ -2544,6 +2546,18 @@ namespace VitaVU
 							 VuOffset(offsetof(VURegs, cycle) + 4))));
 			}
 
+			bool EmitPublishResidentFmacCount()
+			{
+				// PCSX2 owner: VUops.cpp::_vuFMACflush(), _vuClearFMAC(), and
+				// _vuFlushAll(). Resident blocks keep their exact four-entry queue
+				// count in r10[2:0], so canonical memory only needs updating at a
+				// helper, flush, link, or dispatcher seam. Every canonical producer
+				// keeps the remaining bytes zero, and Vita is fixed little-endian.
+				return !UsesResidentPipeActivity() ||
+					m_code.EmitStrbImm12(HOST_STALL_SCRATCH, HOST_VU,
+						VuOffset(offsetof(VURegs, fmaccount)));
+			}
+
 			bool EmitResyncResidentCycle()
 			{
 				return !m_resident_cycle ||
@@ -2619,7 +2633,8 @@ namespace VitaVU
 				// are runtime state and must survive either arm of a conditional helper
 				// call; an invalidated weight vector is simply rematerialized later.
 				const bool preserve_dead_sticky = m_dead_fmac_sticky_pending;
-				const bool emitted = EmitPublishResidentCycle() &&
+				const bool emitted = EmitPublishResidentFmacCount() &&
+					EmitPublishResidentCycle() &&
 					(!preserve_dead_sticky || m_code.EmitVpushDRange(22, 2)) &&
 					m_code.EmitCallAbsolute(fn) &&
 					(!preserve_dead_sticky || m_code.EmitVpopDRange(22, 2)) &&
@@ -2839,6 +2854,7 @@ namespace VitaVU
 			{
 				return m_code.EmitMovImm8(0, 0) &&
 					m_code.EmitMovImm8(1, 1) &&
+					EmitPublishResidentFmacCount() &&
 					EmitPublishResidentCycle() &&
 					EmitCallXgkickPreserveNormalizeState() &&
 					EmitResyncResidentCycle();
@@ -3507,11 +3523,13 @@ namespace VitaVU
 				size_t done_after_retire = static_cast<size_t>(-1);
 				if (shared_thunk)
 				{
-					// SUBS supplies the exact post-retirement empty predicate. STR does
-					// not change NZCV, so the following BEQ consumes it directly.
+					// SUBS supplies the exact post-retirement empty predicate. A
+					// resident block keeps the new count private in r10 until a real
+					// visibility seam; the legacy path must still update canonical state.
 					if (!m_code.EmitSubImm8(host_count, host_count, 1, true) ||
-						!m_code.EmitStrImm12(host_count, HOST_VU,
-							VuOffset(offsetof(VURegs, fmaccount))))
+						(!resident_count &&
+							!m_code.EmitStrImm12(host_count, HOST_VU,
+								VuOffset(offsetof(VURegs, fmaccount)))))
 						return false;
 					done_after_retire = m_code.EmitBranchPlaceholder(Condition::EQ);
 					if (done_after_retire == static_cast<size_t>(-1) ||
@@ -3765,6 +3783,7 @@ namespace VitaVU
 						!m_code.EmitSubReg(0, current_cycle_low, 1) ||
 						!m_code.EmitSubImm8(0, 0, 1) ||
 						!m_code.EmitMovImm8(1, 0) ||
+						!EmitPublishResidentFmacCount() ||
 						!(always_preserve_normalize_state ?
 							EmitCallXgkickAlwaysPreserveNormalizeState() :
 							EmitCallXgkickPreserveNormalizeState()))
@@ -9661,6 +9680,11 @@ namespace VitaVU
 				constexpr unsigned HOST_VALUE = 3;
 				constexpr unsigned HOST_COUNT = HOST_CALL_SCRATCH;
 
+				// _vuFlushAll() consumes canonical queue state. Publish the exact
+				// resident count once before the loop instead of once per producer.
+				if (!EmitPublishResidentFmacCount())
+					return false;
+
 				const size_t loop_start = m_code.Size();
 				if (!m_code.EmitLdrImm12(HOST_COUNT, HOST_VU, VuOffset(offsetof(VURegs, fmaccount))) ||
 					!m_code.EmitCmpImm32(HOST_COUNT, 0))
@@ -9752,7 +9776,11 @@ namespace VitaVU
 					return false;
 				}
 
-				return m_code.PatchBranch(done_empty, m_code.Size(), Condition::EQ);
+				const size_t done_target = m_code.Size();
+				return m_code.PatchBranch(done_empty, done_target, Condition::EQ) &&
+					(!UsesResidentPipeActivity() ||
+						m_code.EmitBicImm32(HOST_STALL_SCRATCH, HOST_STALL_SCRATCH,
+							RESIDENT_FMAC_COUNT_MASK));
 			}
 
 			bool EmitInlineFlushAllIalu()
@@ -10849,13 +10877,10 @@ namespace VitaVU
 					m_code.EmitMovImm8(2, FMAC_PIPELINE_LATENCY_CYCLES) &&
 					m_code.EmitStmIa(14, FMAC_HEADER_REGS) &&
 					(UsesResidentPipeActivity() ?
-						// All canonical writers keep fmaccount in 0..4, so its upper
-						// three bytes are zero. Non-FMAC activity starts at bit 8;
-						// little-endian Vita can publish the low count directly and
-						// leave those already-zero bytes unchanged.
-						(m_code.EmitAddImm8(HOST_STALL_SCRATCH, HOST_STALL_SCRATCH, 1) &&
-						 m_code.EmitStrbImm12(HOST_STALL_SCRATCH, HOST_VU,
-							 VuOffset(offsetof(VURegs, fmaccount)))) :
+						// r10 is the exact local fmaccount owner until the next helper,
+						// flush, link, or dispatcher seam. Avoid feeding every append
+						// through Cortex-A9's data-side store machinery.
+						m_code.EmitAddImm8(HOST_STALL_SCRATCH, HOST_STALL_SCRATCH, 1) :
 						(m_code.EmitLdrImm12(0, HOST_VU,
 							 VuOffset(offsetof(VURegs, fmaccount))) &&
 						 m_code.EmitAddImm8(0, 0, 1) &&
