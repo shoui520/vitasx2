@@ -3374,20 +3374,23 @@ namespace VitaVU
 
 				const bool resident_count = shared_thunk && UsesResidentPipeActivity();
 				const size_t loop_start = m_code.Size();
-				// The resident count extraction's Z result is the empty predicate.
-				// ANDS supplies it directly; the canonical load path still needs CMP.
-				if (!(resident_count ?
-						m_code.EmitAndImm32(host_count, host_count,
-							RESIDENT_FMAC_COUNT_MASK, true) :
-						(m_code.EmitLdrImm12(host_count, HOST_VU,
-							 VuOffset(offsetof(VURegs, fmaccount))) &&
-						 m_code.EmitCmpImm32(host_count, 0))))
+				size_t done_empty = static_cast<size_t>(-1);
+				if (!resident_count)
 				{
-					return false;
+					// Canonical callers do not carry a resident nonempty proof.
+					if (!m_code.EmitLdrImm12(host_count, HOST_VU,
+							VuOffset(offsetof(VURegs, fmaccount))) ||
+						!m_code.EmitCmpImm32(host_count, 0))
+					{
+						return false;
+					}
+					done_empty = m_code.EmitBranchPlaceholder(Condition::EQ);
+					if (done_empty == static_cast<size_t>(-1))
+						return false;
 				}
-				const size_t done_empty = m_code.EmitBranchPlaceholder(Condition::EQ);
-				if (done_empty == static_cast<size_t>(-1))
-					return false;
+				// A resident FMAC-only caller reaches this body through BLNE and the
+				// <=7 selector, proving its exact low count is 1..4. The full-pipe
+				// caller masks and tests the count before its nested call below.
 
 				if (!m_code.EmitLdrImm12(HOST_INDEX, HOST_VU,
 						VuOffset(offsetof(VURegs, fmacreadpos))) ||
@@ -3577,7 +3580,8 @@ namespace VitaVU
 				}
 
 				const size_t done_target = m_code.Size();
-				return m_code.PatchBranch(done_empty, done_target, Condition::EQ) &&
+				return (done_empty == static_cast<size_t>(-1) ||
+						m_code.PatchBranch(done_empty, done_target, Condition::EQ)) &&
 					(done_after_retire == static_cast<size_t>(-1) ||
 						m_code.PatchBranch(done_after_retire, done_target, Condition::EQ));
 			}
@@ -3892,6 +3896,14 @@ namespace VitaVU
 						const size_t full_pipe_target = m_code.Size();
 						if (!m_code.PatchBranch(full_pipe_path, full_pipe_target,
 								Condition::HI) ||
+							!m_code.EmitAndImm32(HOST_STALL_SCRATCH,
+								HOST_STALL_SCRATCH, RESIDENT_FMAC_COUNT_MASK, true))
+						{
+							return false;
+						}
+						const size_t skip_empty_fmac =
+							m_code.EmitBranchPlaceholder(Condition::EQ);
+						if (skip_empty_fmac == static_cast<size_t>(-1) ||
 							!m_code.EmitStrImm12(14, SP, XGKICK_THUNK_LR_SAVE_OFFSET))
 						{
 							return false;
@@ -3900,6 +3912,8 @@ namespace VitaVU
 						if (fmac_call == static_cast<size_t>(-1) ||
 							!m_code.PatchBranchLink(fmac_call, fmac_body) ||
 							!m_code.EmitLdrImm12(14, SP, XGKICK_THUNK_LR_SAVE_OFFSET) ||
+							!m_code.PatchBranch(skip_empty_fmac, m_code.Size(),
+								Condition::EQ) ||
 							// The dominant FMAC-only return did not need the high word. A rare
 							// full publisher materializes it here for FDIV/EFU/IALU below.
 							!EmitLoadCurrentCycleHigh(HOST_CLIP_NEW))
