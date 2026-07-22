@@ -651,6 +651,7 @@ namespace VitaVU
 			// PCSX2 microVU owner: microVU_IR.h::microRegInfo::backupVI.
 			// True only when this exact lower opcode calls VUops.cpp::_vuBackupVI().
 			bool vi_backup_write = false;
+			u8 vi_backup_reg = 0;
 			// Tail work windows.
 			bool branch_tail = false;
 			bool resolves_branch = false;
@@ -1069,7 +1070,8 @@ namespace VitaVU
 			}
 		}
 
-		bool LowerWritesViBackup(u32 code, VUInterpFast::LowerFastKind kind)
+		bool GetLowerViBackupRegister(u32 code, VUInterpFast::LowerFastKind kind,
+			u8* backup_reg)
 		{
 			// PCSX2 owner: VUops.cpp lower integer, MTIR, and post-indexed LSU
 			// bodies. ILW/ILWR deliberately do not create the two-cycle branch
@@ -1080,18 +1082,24 @@ namespace VitaVU
 				case VUInterpFast::LowerFastKind::ISUBIU:
 				case VUInterpFast::LowerFastKind::IADDI:
 				case VUInterpFast::LowerFastKind::MTIR:
-					return VUInterpFast::It(code) != 0;
+					*backup_reg = static_cast<u8>(VUInterpFast::It(code));
+					return *backup_reg != 0;
 
 				case VUInterpFast::LowerFastKind::IADD:
 				case VUInterpFast::LowerFastKind::ISUB:
 				case VUInterpFast::LowerFastKind::IAND:
 				case VUInterpFast::LowerFastKind::IOR:
-					return VUInterpFast::Id(code) != 0;
+					*backup_reg = static_cast<u8>(VUInterpFast::Id(code));
+					return *backup_reg != 0;
 
 				case VUInterpFast::LowerFastKind::LQI:
 				case VUInterpFast::LowerFastKind::LQD:
+					*backup_reg = static_cast<u8>(VUInterpFast::Is(code));
+					return true;
+
 				case VUInterpFast::LowerFastKind::SQI:
 				case VUInterpFast::LowerFastKind::SQD:
+					*backup_reg = static_cast<u8>(VUInterpFast::It(code));
 					return true;
 
 				default:
@@ -1243,8 +1251,10 @@ namespace VitaVU
 				IsInlineLowerEfuKind(static_cast<VUInterpFast::LowerFastKind>(plan->lower_kind));
 			plan->lower_xgkick_inline = plan->exec_lower &&
 				IsInlineLowerXgkickKind(static_cast<VUInterpFast::LowerFastKind>(plan->lower_kind));
-			plan->vi_backup_write = plan->exec_lower && LowerWritesViBackup(plan->lower,
-				static_cast<VUInterpFast::LowerFastKind>(plan->lower_kind));
+			plan->vi_backup_write = plan->exec_lower &&
+				GetLowerViBackupRegister(plan->lower,
+					static_cast<VUInterpFast::LowerFastKind>(plan->lower_kind),
+					&plan->vi_backup_reg);
 
 			// Stall-helper selection, PCSX2 owner: VUops.cpp. The switch arms
 			// are pure functions of the compile-time _VURegsNum:
@@ -6592,17 +6602,24 @@ namespace VitaVU
 					EmitStoreViHalfword(0, dest);
 			}
 
-			bool EmitAddSignedImmToR0(s32 imm)
+			bool EmitAddSignedImm(unsigned rd, s32 imm, unsigned scratch)
 			{
 				if (imm == 0)
 					return true;
 				if (imm > 0)
-					return imm <= 255 ? m_code.EmitAddImm8(0, 0, static_cast<u8>(imm)) :
-						(m_code.EmitMovImm32(1, static_cast<u32>(imm)) && m_code.EmitAddReg(0, 0, 1));
+					return imm <= 255 ? m_code.EmitAddImm8(rd, rd, static_cast<u8>(imm)) :
+						(m_code.EmitMovImm32(scratch, static_cast<u32>(imm)) &&
+							m_code.EmitAddReg(rd, rd, scratch));
 
 				const u32 magnitude = static_cast<u32>(-imm);
-				return magnitude <= 255 ? m_code.EmitSubImm8(0, 0, static_cast<u8>(magnitude)) :
-					(m_code.EmitMovImm32(1, magnitude) && m_code.EmitSubReg(0, 0, 1));
+				return magnitude <= 255 ? m_code.EmitSubImm8(rd, rd, static_cast<u8>(magnitude)) :
+					(m_code.EmitMovImm32(scratch, magnitude) &&
+						m_code.EmitSubReg(rd, rd, scratch));
+			}
+
+			bool EmitAddSignedImmToR0(s32 imm)
+			{
+				return EmitAddSignedImm(0, imm, 1);
 			}
 
 			bool EmitVuDataMemoryPointerFromRawByteAddress(unsigned mask_scratch = 2)
@@ -6670,16 +6687,15 @@ namespace VitaVU
 					EmitVuDataMemoryAddressFromQwordIndex(0);
 			}
 
-			bool EmitInlineBackupVI(unsigned reg, bool known_empty)
+			bool EmitInlineBackupVI(unsigned reg, bool direct_full_install)
 			{
 				// PCSX2 owner: VUops.cpp::_vuBackupVI(). Keep the exact
 				// repeated-write rule in generated A32 so lower IALU ops can
 				// avoid a C++ call without changing branch-operand visibility.
-				// The analyzed pair timing proves that this pair's elapsed cycles make
-				// the window empty after any preceding pair without a writer. The
-				// canonical countdown can either have applied that result or have been
-				// superseded by this same full installation. Install it directly.
-				if (known_empty)
+				// Pair analysis proves a full install when the old window is empty, or
+				// when the immediately preceding writer targeted a different VI. The
+				// countdown is superseded by the same complete state in either case.
+				if (direct_full_install)
 				{
 					return m_code.EmitMovImm8(0, 2) &&
 						m_code.EmitStrbImm12(0, HOST_VU,
@@ -6740,8 +6756,14 @@ namespace VitaVU
 			}
 
 			bool EmitInlineLowerIalu(u32 code, VUInterpFast::LowerFastKind kind,
-				bool vi_backup_known_empty)
+				bool vi_backup_direct_full_install)
 			{
+				// A direct empty-window backup leaves the exact pre-write VI halfword
+				// in r2 after publishing VIOldValue. When the destination is also an
+				// arithmetic source, consume that value instead of loading the same VI
+				// slot again. The low-halfword result is identical to the prior word-load
+				// path for every possible host upper half.
+				constexpr unsigned BACKED_UP_VI = 2;
 				unsigned dest = 0;
 				bool emitted_body = true;
 
@@ -6755,13 +6777,17 @@ namespace VitaVU
 						dest = VUInterpFast::It(code);
 						if (dest == 0)
 							return true;
-						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_direct_full_install);
 						if (VUInterpFast::Imm15(code) != 0 || dest != VUInterpFast::Is(code))
 						{
+							const bool reuse_backup = vi_backup_direct_full_install &&
+								dest == VUInterpFast::Is(code);
+							const unsigned result = reuse_backup ? BACKED_UP_VI : 0;
 							emitted_body = emitted_body &&
-								EmitLoadViLowResultOperand(0, VUInterpFast::Is(code)) &&
-								EmitAddSignedImmToR0(VUInterpFast::Imm15(code)) &&
-								EmitStoreViHalfword(0, dest);
+								(reuse_backup || EmitLoadViLowResultOperand(result,
+									VUInterpFast::Is(code))) &&
+								EmitAddSignedImm(result, VUInterpFast::Imm15(code), 1) &&
+								EmitStoreViHalfword(result, dest);
 						}
 						break;
 
@@ -6769,13 +6795,17 @@ namespace VitaVU
 						dest = VUInterpFast::It(code);
 						if (dest == 0)
 							return true;
-						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_direct_full_install);
 						if (VUInterpFast::Imm15(code) != 0 || dest != VUInterpFast::Is(code))
 						{
+							const bool reuse_backup = vi_backup_direct_full_install &&
+								dest == VUInterpFast::Is(code);
+							const unsigned result = reuse_backup ? BACKED_UP_VI : 0;
 							emitted_body = emitted_body &&
-								EmitLoadViLowResultOperand(0, VUInterpFast::Is(code)) &&
-								EmitAddSignedImmToR0(-VUInterpFast::Imm15(code)) &&
-								EmitStoreViHalfword(0, dest);
+								(reuse_backup || EmitLoadViLowResultOperand(result,
+									VUInterpFast::Is(code))) &&
+								EmitAddSignedImm(result, -VUInterpFast::Imm15(code), 1) &&
+								EmitStoreViHalfword(result, dest);
 						}
 						break;
 
@@ -6786,7 +6816,7 @@ namespace VitaVU
 							return true;
 						const unsigned is = VUInterpFast::Is(code);
 						const unsigned it = VUInterpFast::It(code);
-						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_direct_full_install);
 						if (is == 0 || it == 0)
 						{
 							const unsigned source = is == 0 ? it : is;
@@ -6799,11 +6829,29 @@ namespace VitaVU
 						}
 						else
 						{
-							emitted_body = emitted_body &&
-								EmitLoadViLowResultOperand(0, is) &&
-								EmitLoadViLowResultOperand(1, it) &&
-								m_code.EmitAddReg(0, 0, 1) &&
-								EmitStoreViHalfword(0, dest);
+							if (vi_backup_direct_full_install && dest == is)
+							{
+								emitted_body = emitted_body &&
+									(it == dest || EmitLoadViLowResultOperand(1, it)) &&
+									m_code.EmitAddReg(BACKED_UP_VI, BACKED_UP_VI,
+										it == dest ? BACKED_UP_VI : 1) &&
+									EmitStoreViHalfword(BACKED_UP_VI, dest);
+							}
+							else if (vi_backup_direct_full_install && dest == it)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									m_code.EmitAddReg(0, 0, BACKED_UP_VI) &&
+									EmitStoreViHalfword(0, dest);
+							}
+							else
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									EmitLoadViLowResultOperand(1, it) &&
+									m_code.EmitAddReg(0, 0, 1) &&
+									EmitStoreViHalfword(0, dest);
+							}
 						}
 						break;
 					}
@@ -6815,7 +6863,7 @@ namespace VitaVU
 							return true;
 						const unsigned is = VUInterpFast::Is(code);
 						const unsigned it = VUInterpFast::It(code);
-						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_direct_full_install);
 						if (is == it)
 						{
 							emitted_body = emitted_body &&
@@ -6833,11 +6881,28 @@ namespace VitaVU
 						}
 						else
 						{
-							emitted_body = emitted_body &&
-								EmitLoadViLowResultOperand(0, is) &&
-								EmitLoadViLowResultOperand(1, it) &&
-								m_code.EmitSubReg(0, 0, 1) &&
-								EmitStoreViHalfword(0, dest);
+							if (vi_backup_direct_full_install && dest == is)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(1, it) &&
+									m_code.EmitSubReg(BACKED_UP_VI, BACKED_UP_VI, 1) &&
+									EmitStoreViHalfword(BACKED_UP_VI, dest);
+							}
+							else if (vi_backup_direct_full_install && dest == it)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									m_code.EmitSubReg(0, 0, BACKED_UP_VI) &&
+									EmitStoreViHalfword(0, dest);
+							}
+							else
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									EmitLoadViLowResultOperand(1, it) &&
+									m_code.EmitSubReg(0, 0, 1) &&
+									EmitStoreViHalfword(0, dest);
+							}
 						}
 						break;
 					}
@@ -6846,13 +6911,17 @@ namespace VitaVU
 						dest = VUInterpFast::It(code);
 						if (dest == 0)
 							return true;
-						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_direct_full_install);
 						if (VUInterpFast::Imm5(code) != 0 || dest != VUInterpFast::Is(code))
 						{
+							const bool reuse_backup = vi_backup_direct_full_install &&
+								dest == VUInterpFast::Is(code);
+							const unsigned result = reuse_backup ? BACKED_UP_VI : 0;
 							emitted_body = emitted_body &&
-								EmitLoadViLowResultOperand(0, VUInterpFast::Is(code)) &&
-								EmitAddSignedImmToR0(VUInterpFast::Imm5(code)) &&
-								EmitStoreViHalfword(0, dest);
+								(reuse_backup || EmitLoadViLowResultOperand(result,
+									VUInterpFast::Is(code))) &&
+								EmitAddSignedImm(result, VUInterpFast::Imm5(code), 1) &&
+								EmitStoreViHalfword(result, dest);
 						}
 						break;
 
@@ -6863,7 +6932,7 @@ namespace VitaVU
 							return true;
 						const unsigned is = VUInterpFast::Is(code);
 						const unsigned it = VUInterpFast::It(code);
-						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_direct_full_install);
 						if (is == it)
 						{
 							if (dest != is)
@@ -6881,11 +6950,28 @@ namespace VitaVU
 						}
 						else
 						{
-							emitted_body = emitted_body &&
-								EmitLoadViLowResultOperand(0, is) &&
-								EmitLoadViLowResultOperand(1, it) &&
-								m_code.EmitAndReg(0, 0, 1) &&
-								EmitStoreViHalfword(0, dest);
+							if (vi_backup_direct_full_install && dest == is)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(1, it) &&
+									m_code.EmitAndReg(BACKED_UP_VI, BACKED_UP_VI, 1) &&
+									EmitStoreViHalfword(BACKED_UP_VI, dest);
+							}
+							else if (vi_backup_direct_full_install && dest == it)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									m_code.EmitAndReg(0, 0, BACKED_UP_VI) &&
+									EmitStoreViHalfword(0, dest);
+							}
+							else
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									EmitLoadViLowResultOperand(1, it) &&
+									m_code.EmitAndReg(0, 0, 1) &&
+									EmitStoreViHalfword(0, dest);
+							}
 						}
 						break;
 					}
@@ -6897,7 +6983,7 @@ namespace VitaVU
 							return true;
 						const unsigned is = VUInterpFast::Is(code);
 						const unsigned it = VUInterpFast::It(code);
-						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_direct_full_install);
 						if (is == it || is == 0 || it == 0)
 						{
 							const unsigned source = is == 0 ? it : is;
@@ -6910,11 +6996,28 @@ namespace VitaVU
 						}
 						else
 						{
-							emitted_body = emitted_body &&
-								EmitLoadViLowResultOperand(0, is) &&
-								EmitLoadViLowResultOperand(1, it) &&
-								m_code.EmitOrrReg(0, 0, 1) &&
-								EmitStoreViHalfword(0, dest);
+							if (vi_backup_direct_full_install && dest == is)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(1, it) &&
+									m_code.EmitOrrReg(BACKED_UP_VI, BACKED_UP_VI, 1) &&
+									EmitStoreViHalfword(BACKED_UP_VI, dest);
+							}
+							else if (vi_backup_direct_full_install && dest == it)
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									m_code.EmitOrrReg(0, 0, BACKED_UP_VI) &&
+									EmitStoreViHalfword(0, dest);
+							}
+							else
+							{
+								emitted_body = emitted_body &&
+									EmitLoadViLowResultOperand(0, is) &&
+									EmitLoadViLowResultOperand(1, it) &&
+									m_code.EmitOrrReg(0, 0, 1) &&
+									EmitStoreViHalfword(0, dest);
+							}
 						}
 						break;
 					}
@@ -7067,7 +7170,7 @@ namespace VitaVU
 			}
 
 			bool EmitInlineLowerMove(u32 code, VUInterpFast::LowerFastKind kind,
-				bool vi_backup_known_empty)
+				bool vi_backup_direct_full_install)
 			{
 				const unsigned mask = VUInterpFast::XYZW(code);
 				bool emitted_body = true;
@@ -7170,7 +7273,7 @@ namespace VitaVU
 							return true;
 
 							emitted_body =
-								EmitInlineBackupVI(it, vi_backup_known_empty) &&
+								EmitInlineBackupVI(it, vi_backup_direct_full_install) &&
 							EmitLoadVfWord(0, VUInterpFast::Fs(code), VUInterpFast::Fsf(code)) &&
 							EmitStoreViHalfword(0, it);
 						break;
@@ -7272,8 +7375,13 @@ namespace VitaVU
 			}
 
 			bool EmitInlineLowerLsu(u32 code, VUInterpFast::LowerFastKind kind,
-				bool vi_backup_known_empty)
+				bool vi_backup_direct_full_install)
 			{
+				// The direct empty-window backup leaves the exact unsigned pre-write VI
+				// halfword in r2. Indexed loads/stores use that same value for their
+				// address and pre/post update, so keep it live instead of reloading the VI
+				// slot. Address wrapping and STRH publication consume only those 16 bits.
+				constexpr unsigned BACKED_UP_VI = 2;
 				const unsigned mask = VUInterpFast::XYZW(code);
 				const s32 imm = VUInterpFast::Imm11(code);
 				bool emitted_body = true;
@@ -7334,7 +7442,7 @@ namespace VitaVU
 						const unsigned is = VUInterpFast::Is(code);
 						const bool load_memory = VUInterpFast::Ft(code) != 0 && mask != 0;
 						const bool postincrement = VUInterpFast::Fs(code) != 0;
-						emitted_body = EmitInlineBackupVI(is, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(is, vi_backup_direct_full_install);
 						if (load_memory && postincrement)
 						{
 							// PCSX2's microVU_Lower.inl::mVU_LQI keeps the VI value
@@ -7342,26 +7450,29 @@ namespace VitaVU
 							// r2 survives the r0/r1 memory path; r3 supplies the
 							// address-mask literal and the eventual STRH address.
 							emitted_body = emitted_body &&
-								EmitLoadViWordRaw(2, is) &&
-								EmitVuDataMemoryAddressFromQwordIndex(2, 3) &&
+								(vi_backup_direct_full_install || EmitLoadViWordRaw(BACKED_UP_VI, is)) &&
+								EmitVuDataMemoryAddressFromQwordIndex(BACKED_UP_VI, 3) &&
 								EmitLoadVfMaskedFromAddress(VUInterpFast::Ft(code), mask) &&
-								m_code.EmitAddImm8(2, 2, 1) &&
-								EmitStoreViHalfword(2, is);
+								m_code.EmitAddImm8(BACKED_UP_VI, BACKED_UP_VI, 1) &&
+								EmitStoreViHalfword(BACKED_UP_VI, is);
 						}
 						else
 						{
 							if (load_memory)
 							{
 								emitted_body = emitted_body &&
-									EmitVuDataMemoryAddressFromVi(is) &&
+									(vi_backup_direct_full_install ?
+										EmitVuDataMemoryAddressFromQwordIndex(BACKED_UP_VI, 3) :
+										EmitVuDataMemoryAddressFromVi(is)) &&
 									EmitLoadVfMaskedFromAddress(VUInterpFast::Ft(code), mask);
 							}
 							if (postincrement)
 							{
+								const unsigned value = vi_backup_direct_full_install ? BACKED_UP_VI : 0;
 								emitted_body = emitted_body &&
-									EmitLoadViWordRaw(0, is) &&
-									m_code.EmitAddImm8(0, 0, 1) &&
-									EmitStoreViHalfword(0, is);
+									(vi_backup_direct_full_install || EmitLoadViWordRaw(value, is)) &&
+									m_code.EmitAddImm8(value, value, 1) &&
+									EmitStoreViHalfword(value, is);
 							}
 						}
 						break;
@@ -7371,29 +7482,32 @@ namespace VitaVU
 					{
 						const unsigned is = VUInterpFast::Is(code);
 						const bool load_memory = VUInterpFast::Ft(code) != 0 && mask != 0;
-						emitted_body = EmitInlineBackupVI(is, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(is, vi_backup_direct_full_install);
 						if (is != 0 && load_memory)
 						{
 							emitted_body = emitted_body &&
-								EmitLoadViWordRaw(2, is) &&
-								m_code.EmitSubImm8(2, 2, 1) &&
-								EmitStoreViHalfword(2, is) &&
-								EmitVuDataMemoryAddressFromQwordIndex(2, 3) &&
+								(vi_backup_direct_full_install || EmitLoadViWordRaw(BACKED_UP_VI, is)) &&
+								m_code.EmitSubImm8(BACKED_UP_VI, BACKED_UP_VI, 1) &&
+								EmitStoreViHalfword(BACKED_UP_VI, is) &&
+								EmitVuDataMemoryAddressFromQwordIndex(BACKED_UP_VI, 3) &&
 								EmitLoadVfMaskedFromAddress(VUInterpFast::Ft(code), mask);
 						}
 						else
 						{
 							if (is != 0)
 							{
+								const unsigned value = vi_backup_direct_full_install ? BACKED_UP_VI : 0;
 								emitted_body = emitted_body &&
-									EmitLoadViWordRaw(0, is) &&
-									m_code.EmitSubImm8(0, 0, 1) &&
-									EmitStoreViHalfword(0, is);
+									(vi_backup_direct_full_install || EmitLoadViWordRaw(value, is)) &&
+									m_code.EmitSubImm8(value, value, 1) &&
+									EmitStoreViHalfword(value, is);
 							}
 							if (load_memory)
 							{
 								emitted_body = emitted_body &&
-									EmitVuDataMemoryAddressFromVi(is) &&
+									(vi_backup_direct_full_install ?
+										EmitVuDataMemoryAddressFromQwordIndex(BACKED_UP_VI, 3) :
+										EmitVuDataMemoryAddressFromVi(is)) &&
 									EmitLoadVfMaskedFromAddress(VUInterpFast::Ft(code), mask);
 							}
 						}
@@ -7405,30 +7519,33 @@ namespace VitaVU
 						const unsigned it = VUInterpFast::It(code);
 						const bool store_memory = mask != 0;
 						const bool postincrement = VUInterpFast::Ft(code) != 0;
-						emitted_body = EmitInlineBackupVI(it, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(it, vi_backup_direct_full_install);
 						if (store_memory && postincrement)
 						{
 							emitted_body = emitted_body &&
-								EmitLoadViWordRaw(2, it) &&
-								EmitVuDataMemoryAddressFromQwordIndex(2, 3) &&
+								(vi_backup_direct_full_install || EmitLoadViWordRaw(BACKED_UP_VI, it)) &&
+								EmitVuDataMemoryAddressFromQwordIndex(BACKED_UP_VI, 3) &&
 								EmitStoreVfMaskedToAddress(VUInterpFast::Fs(code), mask) &&
-								m_code.EmitAddImm8(2, 2, 1) &&
-								EmitStoreViHalfword(2, it);
+								m_code.EmitAddImm8(BACKED_UP_VI, BACKED_UP_VI, 1) &&
+								EmitStoreViHalfword(BACKED_UP_VI, it);
 						}
 						else
 						{
 							if (store_memory)
 							{
 								emitted_body = emitted_body &&
-									EmitVuDataMemoryAddressFromVi(it) &&
+									(vi_backup_direct_full_install ?
+										EmitVuDataMemoryAddressFromQwordIndex(BACKED_UP_VI, 3) :
+										EmitVuDataMemoryAddressFromVi(it)) &&
 									EmitStoreVfMaskedToAddress(VUInterpFast::Fs(code), mask);
 							}
 							if (postincrement)
 							{
+								const unsigned value = vi_backup_direct_full_install ? BACKED_UP_VI : 0;
 								emitted_body = emitted_body &&
-									EmitLoadViWordRaw(0, it) &&
-									m_code.EmitAddImm8(0, 0, 1) &&
-									EmitStoreViHalfword(0, it);
+									(vi_backup_direct_full_install || EmitLoadViWordRaw(value, it)) &&
+									m_code.EmitAddImm8(value, value, 1) &&
+									EmitStoreViHalfword(value, it);
 							}
 						}
 						break;
@@ -7438,29 +7555,32 @@ namespace VitaVU
 					{
 						const unsigned it = VUInterpFast::It(code);
 						const bool store_memory = mask != 0;
-						emitted_body = EmitInlineBackupVI(it, vi_backup_known_empty);
+						emitted_body = EmitInlineBackupVI(it, vi_backup_direct_full_install);
 						if (VUInterpFast::Ft(code) != 0 && store_memory)
 						{
 							emitted_body = emitted_body &&
-								EmitLoadViWordRaw(2, it) &&
-								m_code.EmitSubImm8(2, 2, 1) &&
-								EmitStoreViHalfword(2, it) &&
-								EmitVuDataMemoryAddressFromQwordIndex(2, 3) &&
+								(vi_backup_direct_full_install || EmitLoadViWordRaw(BACKED_UP_VI, it)) &&
+								m_code.EmitSubImm8(BACKED_UP_VI, BACKED_UP_VI, 1) &&
+								EmitStoreViHalfword(BACKED_UP_VI, it) &&
+								EmitVuDataMemoryAddressFromQwordIndex(BACKED_UP_VI, 3) &&
 								EmitStoreVfMaskedToAddress(VUInterpFast::Fs(code), mask);
 						}
 						else
 						{
 							if (VUInterpFast::Ft(code) != 0)
 							{
+								const unsigned value = vi_backup_direct_full_install ? BACKED_UP_VI : 0;
 								emitted_body = emitted_body &&
-									EmitLoadViWordRaw(0, it) &&
-									m_code.EmitSubImm8(0, 0, 1) &&
-									EmitStoreViHalfword(0, it);
+									(vi_backup_direct_full_install || EmitLoadViWordRaw(value, it)) &&
+									m_code.EmitSubImm8(value, value, 1) &&
+									EmitStoreViHalfword(value, it);
 							}
 							if (store_memory)
 							{
 								emitted_body = emitted_body &&
-									EmitVuDataMemoryAddressFromVi(it) &&
+									(vi_backup_direct_full_install ?
+										EmitVuDataMemoryAddressFromQwordIndex(BACKED_UP_VI, 3) :
+										EmitVuDataMemoryAddressFromVi(it)) &&
 									EmitStoreVfMaskedToAddress(VUInterpFast::Fs(code), mask);
 							}
 						}
@@ -11167,11 +11287,11 @@ namespace VitaVU
 			// update, where cyclesBeforeOp is the pre-stall cycle minus one.
 			bool EmitViBackupUpdate(u32 pair_index, bool superseded_by_full_backup)
 			{
-				// A non-entry writer whose preceding pair did not write VI is
-				// compile-time-proven to reach zero here. Its lower operation installs
-				// a complete new backup later in this same pair, and no intervening
+				// Pair analysis can prove that the lower writer takes _vuBackupVI()'s
+				// complete install arm, either because the old window is empty or because
+				// the immediately preceding writer targeted another VI. No intervening
 				// upper operation observes PCSX2's private backup fields. Do not publish
-				// a zero which that installation immediately overwrites with two.
+				// a countdown result which that installation immediately overwrites.
 				if (superseded_by_full_backup)
 					return true;
 
@@ -11490,14 +11610,22 @@ namespace VitaVU
 						CanSnapshotLocalFmacFlagsAtProducer(plan);
 				}
 
-				// This pair has consumed at least one cycle. If the immediately
-				// preceding pair did not create a new backup, every possible two-cycle
-				// entry or earlier in-block window is empty at the update point. Pair
-				// zero has no such compile-time predecessor proof.
-				const bool vi_backup_known_empty = pair_index != 0 &&
+				// This pair has consumed at least one cycle. With no preceding writer,
+				// every possible two-cycle window is empty here. A preceding writer to
+				// another register also guarantees _vuBackupVI() takes its complete
+				// install arm: if the window survived, VIRegNumber is that different
+				// register; if a stall expired it, the zero-window arm installs instead.
+				// Both facts are compile-time properties and both make the countdown and
+				// the later source reload immediately superseded.
+				const bool vi_backup_entry_proven_empty = pair_index != 0 &&
 					!m_pairs[pair_index - 1].vi_backup_write;
-				if (!EmitViBackupUpdate(pair_index,
-						plan.vi_backup_write && vi_backup_known_empty))
+				const bool vi_backup_preceded_by_different_writer = pair_index != 0 &&
+					m_pairs[pair_index - 1].vi_backup_write &&
+					m_pairs[pair_index - 1].vi_backup_reg != plan.vi_backup_reg;
+				const bool vi_backup_direct_full_install = plan.vi_backup_write &&
+					(vi_backup_entry_proven_empty ||
+						vi_backup_preceded_by_different_writer);
+				if (!EmitViBackupUpdate(pair_index, vi_backup_direct_full_install))
 				{
 					return false;
 				}
@@ -11599,7 +11727,7 @@ namespace VitaVU
 				if (plan.exec_lower && plan.lower_ialu_inline &&
 					!EmitInlineLowerIalu(plan.lower,
 						static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind),
-						vi_backup_known_empty))
+						vi_backup_direct_full_install))
 				{
 					return false;
 				}
@@ -11611,14 +11739,14 @@ namespace VitaVU
 				else if (plan.exec_lower && plan.lower_move_inline &&
 					!EmitInlineLowerMove(plan.lower,
 						static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind),
-						vi_backup_known_empty))
+						vi_backup_direct_full_install))
 				{
 					return false;
 				}
 				else if (plan.exec_lower && plan.lower_lsu_inline &&
 					!EmitInlineLowerLsu(plan.lower,
 						static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind),
-						vi_backup_known_empty))
+						vi_backup_direct_full_install))
 				{
 					return false;
 				}
