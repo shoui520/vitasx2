@@ -9687,37 +9687,42 @@ namespace VitaVU
 				const size_t loop_start = m_code.Size();
 				// r8/r12 are not yet occupied by this pair's optional CLIP
 				// backup, so a cycle-resident scan retains the exact issue
-				// timestamp there. Keep the common elapsed test instruction-for-
-				// instruction identical to PCSX2's unsigned
-				// (current - sCycle) >= 4 operation. On a real dependency those
-				// same retained words then form sCycle + 4, removing the old
-				// second pair of Cortex-A9 data-cache loads.
+				// timestamp there. On a real dependency those same retained words
+				// form sCycle + 4, removing a second pair of Cortex-A9 data-cache
+				// loads. A canonical-cycle scan instead keeps the issue low word in
+				// r12 until the slow high-word test has reconstructed the original
+				// subtraction borrow; the initial slot-index value there is dead.
 				const unsigned HOST_ISSUE_LO = resident_cycle_pair ?
-					HOST_CLIP_OLD : HOST_VALUE;
+					HOST_CLIP_OLD : HOST_CALL_SCRATCH;
 				const unsigned HOST_ISSUE_HI = resident_cycle_pair ?
 					HOST_CALL_SCRATCH : HOST_TEMP;
 				if (!m_code.EmitLdrImm12(HOST_ISSUE_LO, HOST_PTR,
 						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle))) ||
+					!m_code.EmitSubReg(HOST_VALUE, HOST_STALL_CYCLE_LO,
+						HOST_ISSUE_LO) ||
+					!m_code.EmitCmpImm32(HOST_VALUE, FMAC_PIPELINE_LATENCY_CYCLES))
+				{
+					return false;
+				}
+				// For unsigned elapsed = current - sCycle, elapsed.low >= 4 proves
+				// the complete 64-bit value ready regardless of its high word. Only
+				// low results 0..3 need the exact high subtraction. CMP recreates the
+				// original low-word carry and the intervening LDR preserves APSR for
+				// SBCS, matching the PCSX2 uint64_t comparison across low-word wrap.
+				const size_t done_elapsed_low =
+					m_code.EmitBranchPlaceholder(Condition::CS);
+				if (done_elapsed_low == static_cast<size_t>(-1) ||
+					!m_code.EmitCmpReg(HOST_STALL_CYCLE_LO, HOST_ISSUE_LO) ||
 					!m_code.EmitLdrImm12(HOST_ISSUE_HI, HOST_PTR,
 						VuOffset(FMAC_ARRAY_OFFSET + offsetof(fmacPipe, sCycle) + 4)) ||
-					!m_code.EmitSubReg(HOST_VALUE, HOST_STALL_CYCLE_LO,
-						HOST_ISSUE_LO, true) ||
 					!m_code.EmitSbcReg(HOST_TEMP, HOST_STALL_CYCLE_HI,
-						HOST_ISSUE_HI, true) ||
-					!m_code.EmitCmpImm32(HOST_TEMP, 0))
+						HOST_ISSUE_HI, true))
 				{
 					return false;
 				}
 				const size_t done_elapsed_high =
 					m_code.EmitBranchPlaceholder(Condition::NE);
-				if (done_elapsed_high == static_cast<size_t>(-1) ||
-					!m_code.EmitCmpImm32(HOST_VALUE, FMAC_PIPELINE_LATENCY_CYCLES))
-				{
-					return false;
-				}
-				const size_t done_elapsed_low =
-					m_code.EmitBranchPlaceholder(Condition::CS);
-				if (done_elapsed_low == static_cast<size_t>(-1))
+				if (done_elapsed_high == static_cast<size_t>(-1))
 					return false;
 
 				std::array<size_t, 4> matched_jumps{};
