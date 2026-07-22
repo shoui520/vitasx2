@@ -6670,11 +6670,28 @@ namespace VitaVU
 					EmitVuDataMemoryAddressFromQwordIndex(0);
 			}
 
-			bool EmitInlineBackupVI(unsigned reg)
+			bool EmitInlineBackupVI(unsigned reg, bool known_empty)
 			{
 				// PCSX2 owner: VUops.cpp::_vuBackupVI(). Keep the exact
 				// repeated-write rule in generated A32 so lower IALU ops can
 				// avoid a C++ call without changing branch-operand visibility.
+				// EmitViBackupUpdate() has just applied this pair's elapsed cycles.
+				// After any preceding pair without a writer, the two-cycle window
+				// inherited at the block entry or created earlier in the block is
+				// therefore provably empty. Install the new full backup directly.
+				if (known_empty)
+				{
+					return m_code.EmitMovImm8(0, 2) &&
+						m_code.EmitStrbImm12(0, HOST_VU,
+							VuOffset(VI_BACKUP_CYCLES_OFFSET)) &&
+						m_code.EmitMovImm32(1, reg) &&
+						m_code.EmitStrImm12(1, HOST_VU,
+							VuOffset(VI_REG_NUMBER_OFFSET)) &&
+						EmitLoadViHalfwordRaw(2, reg) &&
+						m_code.EmitStrImm12(2, HOST_VU,
+							VuOffset(VI_OLD_VALUE_OFFSET));
+				}
+
 				if (!m_code.EmitLdrbImm12(0, HOST_VU, VuOffset(VI_BACKUP_CYCLES_OFFSET)) ||
 					!m_code.EmitCmpImm32(0, 0))
 				{
@@ -6722,7 +6739,8 @@ namespace VitaVU
 				return m_code.PatchBranch(done, m_code.Size());
 			}
 
-			bool EmitInlineLowerIalu(u32 code, VUInterpFast::LowerFastKind kind)
+			bool EmitInlineLowerIalu(u32 code, VUInterpFast::LowerFastKind kind,
+				bool vi_backup_known_empty)
 			{
 				unsigned dest = 0;
 				bool emitted_body = true;
@@ -6737,7 +6755,7 @@ namespace VitaVU
 						dest = VUInterpFast::It(code);
 						if (dest == 0)
 							return true;
-						emitted_body = EmitInlineBackupVI(dest);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
 						if (VUInterpFast::Imm15(code) != 0 || dest != VUInterpFast::Is(code))
 						{
 							emitted_body = emitted_body &&
@@ -6751,7 +6769,7 @@ namespace VitaVU
 						dest = VUInterpFast::It(code);
 						if (dest == 0)
 							return true;
-						emitted_body = EmitInlineBackupVI(dest);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
 						if (VUInterpFast::Imm15(code) != 0 || dest != VUInterpFast::Is(code))
 						{
 							emitted_body = emitted_body &&
@@ -6768,7 +6786,7 @@ namespace VitaVU
 							return true;
 						const unsigned is = VUInterpFast::Is(code);
 						const unsigned it = VUInterpFast::It(code);
-						emitted_body = EmitInlineBackupVI(dest);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
 						if (is == 0 || it == 0)
 						{
 							const unsigned source = is == 0 ? it : is;
@@ -6797,7 +6815,7 @@ namespace VitaVU
 							return true;
 						const unsigned is = VUInterpFast::Is(code);
 						const unsigned it = VUInterpFast::It(code);
-						emitted_body = EmitInlineBackupVI(dest);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
 						if (is == it)
 						{
 							emitted_body = emitted_body &&
@@ -6828,7 +6846,7 @@ namespace VitaVU
 						dest = VUInterpFast::It(code);
 						if (dest == 0)
 							return true;
-						emitted_body = EmitInlineBackupVI(dest);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
 						if (VUInterpFast::Imm5(code) != 0 || dest != VUInterpFast::Is(code))
 						{
 							emitted_body = emitted_body &&
@@ -6845,7 +6863,7 @@ namespace VitaVU
 							return true;
 						const unsigned is = VUInterpFast::Is(code);
 						const unsigned it = VUInterpFast::It(code);
-						emitted_body = EmitInlineBackupVI(dest);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
 						if (is == it)
 						{
 							if (dest != is)
@@ -6879,7 +6897,7 @@ namespace VitaVU
 							return true;
 						const unsigned is = VUInterpFast::Is(code);
 						const unsigned it = VUInterpFast::It(code);
-						emitted_body = EmitInlineBackupVI(dest);
+						emitted_body = EmitInlineBackupVI(dest, vi_backup_known_empty);
 						if (is == it || is == 0 || it == 0)
 						{
 							const unsigned source = is == 0 ? it : is;
@@ -7048,7 +7066,8 @@ namespace VitaVU
 #endif
 			}
 
-			bool EmitInlineLowerMove(u32 code, VUInterpFast::LowerFastKind kind)
+			bool EmitInlineLowerMove(u32 code, VUInterpFast::LowerFastKind kind,
+				bool vi_backup_known_empty)
 			{
 				const unsigned mask = VUInterpFast::XYZW(code);
 				bool emitted_body = true;
@@ -7150,8 +7169,8 @@ namespace VitaVU
 						if (it == 0)
 							return true;
 
-						emitted_body =
-							EmitInlineBackupVI(it) &&
+							emitted_body =
+								EmitInlineBackupVI(it, vi_backup_known_empty) &&
 							EmitLoadVfWord(0, VUInterpFast::Fs(code), VUInterpFast::Fsf(code)) &&
 							EmitStoreViHalfword(0, it);
 						break;
@@ -7252,7 +7271,8 @@ namespace VitaVU
 				return emitted;
 			}
 
-			bool EmitInlineLowerLsu(u32 code, VUInterpFast::LowerFastKind kind)
+			bool EmitInlineLowerLsu(u32 code, VUInterpFast::LowerFastKind kind,
+				bool vi_backup_known_empty)
 			{
 				const unsigned mask = VUInterpFast::XYZW(code);
 				const s32 imm = VUInterpFast::Imm11(code);
@@ -7314,7 +7334,7 @@ namespace VitaVU
 						const unsigned is = VUInterpFast::Is(code);
 						const bool load_memory = VUInterpFast::Ft(code) != 0 && mask != 0;
 						const bool postincrement = VUInterpFast::Fs(code) != 0;
-						emitted_body = EmitInlineBackupVI(is);
+						emitted_body = EmitInlineBackupVI(is, vi_backup_known_empty);
 						if (load_memory && postincrement)
 						{
 							// PCSX2's microVU_Lower.inl::mVU_LQI keeps the VI value
@@ -7351,7 +7371,7 @@ namespace VitaVU
 					{
 						const unsigned is = VUInterpFast::Is(code);
 						const bool load_memory = VUInterpFast::Ft(code) != 0 && mask != 0;
-						emitted_body = EmitInlineBackupVI(is);
+						emitted_body = EmitInlineBackupVI(is, vi_backup_known_empty);
 						if (is != 0 && load_memory)
 						{
 							emitted_body = emitted_body &&
@@ -7385,7 +7405,7 @@ namespace VitaVU
 						const unsigned it = VUInterpFast::It(code);
 						const bool store_memory = mask != 0;
 						const bool postincrement = VUInterpFast::Ft(code) != 0;
-						emitted_body = EmitInlineBackupVI(it);
+						emitted_body = EmitInlineBackupVI(it, vi_backup_known_empty);
 						if (store_memory && postincrement)
 						{
 							emitted_body = emitted_body &&
@@ -7418,7 +7438,7 @@ namespace VitaVU
 					{
 						const unsigned it = VUInterpFast::It(code);
 						const bool store_memory = mask != 0;
-						emitted_body = EmitInlineBackupVI(it);
+						emitted_body = EmitInlineBackupVI(it, vi_backup_known_empty);
 						if (VUInterpFast::Ft(code) != 0 && store_memory)
 						{
 							emitted_body = emitted_body &&
@@ -11464,6 +11484,12 @@ namespace VitaVU
 
 				if (!EmitViBackupUpdate(pair_index))
 					return false;
+				// The update above has consumed at least one cycle for this pair.
+				// If the immediately preceding pair did not create a new backup,
+				// every possible two-cycle entry or earlier in-block window is now
+				// empty. Pair zero has no such compile-time predecessor proof.
+				const bool vi_backup_known_empty = pair_index != 0 &&
+					!m_pairs[pair_index - 1].vi_backup_write;
 
 				// Hazard backup of the upper target the lower op reads.
 				if (plan.vf_backup_reg != 0 &&
@@ -11560,7 +11586,9 @@ namespace VitaVU
 				}
 
 				if (plan.exec_lower && plan.lower_ialu_inline &&
-					!EmitInlineLowerIalu(plan.lower, static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind)))
+					!EmitInlineLowerIalu(plan.lower,
+						static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind),
+						vi_backup_known_empty))
 				{
 					return false;
 				}
@@ -11570,12 +11598,16 @@ namespace VitaVU
 					return false;
 				}
 				else if (plan.exec_lower && plan.lower_move_inline &&
-					!EmitInlineLowerMove(plan.lower, static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind)))
+					!EmitInlineLowerMove(plan.lower,
+						static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind),
+						vi_backup_known_empty))
 				{
 					return false;
 				}
 				else if (plan.exec_lower && plan.lower_lsu_inline &&
-					!EmitInlineLowerLsu(plan.lower, static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind)))
+					!EmitInlineLowerLsu(plan.lower,
+						static_cast<VUInterpFast::LowerFastKind>(plan.lower_kind),
+						vi_backup_known_empty))
 				{
 					return false;
 				}
