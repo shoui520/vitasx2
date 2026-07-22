@@ -58,6 +58,7 @@ u32 g_qemuVuJitNormConstantMaterializations = 0;
 u32 g_qemuVuJitFmacClearInlineOps = 0;
 u32 g_qemuVuJitFmacWriteposLoadElisions = 0;
 u32 g_qemuVuJitCanonicalFmacClipSnapshotReuses = 0;
+u32 g_qemuVuJitCanonicalFmacStaticHeaderReuses = 0;
 u32 g_qemuVuJitResidentFmacCountAppendElisions = 0;
 u32 g_qemuVuJitCanonicalFmacStallTestRuntimeElisions = 0;
 u32 g_qemuVuJitUpperFmacStallTestInlineOps = 0;
@@ -652,6 +653,8 @@ namespace VitaVU
 			// The canonical four-slot ring still contains this pair's exact working
 			// CLIP value from the append four writes earlier.
 			bool reuse_fmac_clip_snapshot = false;
+			// The same slot's compile-time dependency header is byte-identical.
+			bool reuse_fmac_static_header = false;
 			// PCSX2 microVU owner: microVU_IR.h::microRegInfo::backupVI.
 			// True only when this exact lower opcode calls VUops.cpp::_vuBackupVI().
 			bool vi_backup_write = false;
@@ -815,7 +818,30 @@ namespace VitaVU
 			return fmac_pairs >= MIN_LOCAL_COMMITS;
 		}
 
-		void AnalyzeCanonicalFmacClipSnapshotReuse(BlockPlan* block)
+		bool SameCanonicalFmacStaticHeader(const PairPlan& first,
+			const PairPlan& second)
+		{
+			const bool first_upper = first.add_upper_stalls;
+			const bool second_upper = second.add_upper_stalls;
+			const bool first_lower = first.add_lower_stalls &&
+				first.lregs.pipe == VUPIPE_FMAC;
+			const bool second_lower = second.add_lower_stalls &&
+				second.lregs.pipe == VUPIPE_FMAC;
+			return (first_upper ? first.uregs.VFwrite : 0) ==
+					(second_upper ? second.uregs.VFwrite : 0) &&
+				(first_lower ? first.lregs.VFwrite : 0) ==
+					(second_lower ? second.lregs.VFwrite : 0) &&
+				((first_upper ? first.uregs.VIwrite : 0) |
+					(first_lower ? first.lregs.VIwrite : 0)) ==
+					((second_upper ? second.uregs.VIwrite : 0) |
+						(second_lower ? second.lregs.VIwrite : 0)) &&
+				(first_upper ? first.uregs.VFwxyzw : 0) ==
+					(second_upper ? second.uregs.VFwxyzw : 0) &&
+				(first_lower ? first.lregs.VFwxyzw : 0) ==
+					(second_lower ? second.lregs.VFwxyzw : 0);
+		}
+
+		void AnalyzeCanonicalFmacSameSlotReuse(BlockPlan* block)
 		{
 			// PCSX2 owner: VUops.cpp::_vuClearFMAC()/_vuAddFMACStalls(). Every
 			// canonical append advances the four-slot write position exactly once and
@@ -823,6 +849,9 @@ namespace VitaVU
 			// appends the same physical slot is selected again. If no intervening
 			// CLIP/FCSET producer changed working CLIP, leaving that word untouched is
 			// byte-exact, including for internal pipeline/checkpoint state.
+			// _vuFMACflush() never mutates an entry's dependency header. When the
+			// current compile-time metadata also matches the append four writes ago,
+			// its five fields plus the invariant zero padding can remain untouched.
 			std::array<u32, FMAC_PIPELINE_SLOT_COUNT> previous_appends{};
 			u32 canonical_appends = 0;
 			const u32 clip_write = 1u << REG_CLIP_FLAG;
@@ -838,6 +867,8 @@ namespace VitaVU
 				if (canonical_appends >= FMAC_PIPELINE_SLOT_COUNT)
 				{
 					const u32 previous_pair = previous_appends[slot];
+					pair.reuse_fmac_static_header =
+						SameCanonicalFmacStaticHeader(block->pairs[previous_pair], pair);
 					bool clip_unchanged = true;
 					for (u32 scan = previous_pair + 1; scan <= pair_index; scan++)
 					{
@@ -1672,7 +1703,7 @@ namespace VitaVU
 				}
 
 				block->local_fmac_pipeline = !conservative_vu0 && CanUseLocalFmacPipeline(*block);
-				AnalyzeCanonicalFmacClipSnapshotReuse(block);
+				AnalyzeCanonicalFmacSameSlotReuse(block);
 				// The canonical empty-pipe guard is five loads plus four ORRs and a
 				// branch at every pair. A resident block pays one exact five-field
 				// refresh at entry, then CMP+BLNE per guard. Three guards recover the
@@ -3157,6 +3188,15 @@ namespace VitaVU
 			{
 				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitCanonicalFmacClipSnapshotReuses))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1, 1) &&
+					m_code.EmitStrImm12(1, 0, 0);
+			}
+
+			bool EmitQemuCanonicalFmacStaticHeaderReuseCounter()
+			{
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitCanonicalFmacStaticHeaderReuses))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
 					m_code.EmitAddImm8(1, 1, 1) &&
 					m_code.EmitStrImm12(1, 0, 0);
@@ -11151,10 +11191,11 @@ namespace VitaVU
 				// register number to ascending address. At this pair tail r0-r3, r8,
 				// r12, and LR are dead scratch (the generated prologue owns the real
 				// return address), so lay out the complete 24-byte static header in
-				// those registers and issue one writeback STMIA through LR. Writeback
-				// advances LR to sCycle; a second ascending STMIA then publishes the
-				// remaining live words. This preserves the implicit padding word cleared
-				// by _vuClearFMAC() and all field order while replacing six STRD stores
+				// those registers and issue one writeback STMIA through LR when the
+				// header differs. Writeback advances LR to sCycle; an identical existing
+				// header advances LR by the same constant directly. The ascending STMIA
+				// then publishes the remaining live words. This preserves the implicit padding
+				// word cleared by _vuClearFMAC() and all field order while replacing six STRD stores
 				// with two Cortex-A9 store-multiple instructions.
 				constexpr u16 FMAC_HEADER_REGS =
 					(1u << 0) | (1u << 1) | (1u << 2) |
@@ -11185,13 +11226,15 @@ namespace VitaVU
 						 m_code.EmitAndImm32(0, 0, 3) &&
 						 m_code.EmitStrImm12(0, HOST_VU,
 							 VuOffset(offsetof(VURegs, fmacwritepos))))) &&
-					m_code.EmitMovImm32(0, regupper) &&
-					m_code.EmitMovImm32(1, reglower) &&
-					m_code.EmitMovImm32(2, flagreg) &&
-					m_code.EmitMovImm32(3, xyzwupper) &&
-					m_code.EmitMovImm32(HOST_CLIP_OLD, xyzwlower) &&
-					m_code.EmitMovImm8(HOST_CALL_SCRATCH, 0) &&
-					m_code.EmitStmIa(14, FMAC_HEADER_REGS, true) &&
+					(plan.reuse_fmac_static_header ?
+						m_code.EmitAddImm8(14, 14, offsetof(fmacPipe, sCycle)) :
+						(m_code.EmitMovImm32(0, regupper) &&
+						 m_code.EmitMovImm32(1, reglower) &&
+						 m_code.EmitMovImm32(2, flagreg) &&
+						 m_code.EmitMovImm32(3, xyzwupper) &&
+						 m_code.EmitMovImm32(HOST_CLIP_OLD, xyzwlower) &&
+						 m_code.EmitMovImm8(HOST_CALL_SCRATCH, 0) &&
+						 m_code.EmitStmIa(14, FMAC_HEADER_REGS, true))) &&
 					m_code.EmitAddImm32(0, HOST_VU,
 						VuOffset(offsetof(VURegs, macflag))) &&
 					m_code.EmitLdmIa(0, working_flag_regs) &&
@@ -11219,6 +11262,11 @@ namespace VitaVU
 					return false;
 				if (plan.reuse_fmac_clip_snapshot &&
 					!EmitQemuCanonicalFmacClipSnapshotReuseCounter())
+				{
+					return false;
+				}
+				if (plan.reuse_fmac_static_header &&
+					!EmitQemuCanonicalFmacStaticHeaderReuseCounter())
 				{
 					return false;
 				}
@@ -13964,6 +14012,7 @@ namespace VitaVU
 		g_qemuVuJitLocalFmacCycleSnapshotElisions = 0;
 		g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 		g_qemuVuJitCanonicalFmacClipSnapshotReuses = 0;
+		g_qemuVuJitCanonicalFmacStaticHeaderReuses = 0;
 		g_qemuVuJitDeferredFmacFlagEntries = 0;
 		g_qemuVuJitDeferredFmacFlagRetirements = 0;
 		g_qemuVuJitCanonicalDeferredFmacRetirements = 0;
