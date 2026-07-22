@@ -57,6 +57,7 @@ u32 g_qemuVuJitAllPipesEmptyFastSkips = 0;
 u32 g_qemuVuJitNormConstantMaterializations = 0;
 u32 g_qemuVuJitFmacClearInlineOps = 0;
 u32 g_qemuVuJitFmacWriteposLoadElisions = 0;
+u32 g_qemuVuJitCanonicalFmacClipSnapshotReuses = 0;
 u32 g_qemuVuJitResidentFmacCountAppendElisions = 0;
 u32 g_qemuVuJitCanonicalFmacStallTestRuntimeElisions = 0;
 u32 g_qemuVuJitUpperFmacStallTestInlineOps = 0;
@@ -648,6 +649,9 @@ namespace VitaVU
 			// MAC classification is independently live only when a later MAC reader,
 			// preserve-inactive producer, or block-seam pipeline state can observe it.
 			bool mac_flag_result_required = true;
+			// The canonical four-slot ring still contains this pair's exact working
+			// CLIP value from the append four writes earlier.
+			bool reuse_fmac_clip_snapshot = false;
 			// PCSX2 microVU owner: microVU_IR.h::microRegInfo::backupVI.
 			// True only when this exact lower opcode calls VUops.cpp::_vuBackupVI().
 			bool vi_backup_write = false;
@@ -669,6 +673,7 @@ namespace VitaVU
 		// state and VUops.cpp::_vuTestFMACStalls(). The first four pairs retain
 		// the canonical entry queue; later writers use compiler-owned slots.
 		constexpr u32 FMAC_PIPELINE_LATENCY_CYCLES = 4;
+		constexpr u32 FMAC_PIPELINE_SLOT_COUNT = 4;
 		constexpr u32 LOCAL_FMAC_WARMUP_PAIRS = FMAC_PIPELINE_LATENCY_CYCLES;
 		constexpr u32 LOCAL_FMAC_CANONICAL_STALL_MATURE_PAIR =
 			LOCAL_FMAC_WARMUP_PAIRS + FMAC_PIPELINE_LATENCY_CYCLES - 1;
@@ -808,6 +813,47 @@ namespace VitaVU
 			}
 
 			return fmac_pairs >= MIN_LOCAL_COMMITS;
+		}
+
+		void AnalyzeCanonicalFmacClipSnapshotReuse(BlockPlan* block)
+		{
+			// PCSX2 owner: VUops.cpp::_vuClearFMAC()/_vuAddFMACStalls(). Every
+			// canonical append advances the four-slot write position exactly once and
+			// snapshots the current working CLIP value. After four later canonical
+			// appends the same physical slot is selected again. If no intervening
+			// CLIP/FCSET producer changed working CLIP, leaving that word untouched is
+			// byte-exact, including for internal pipeline/checkpoint state.
+			std::array<u32, FMAC_PIPELINE_SLOT_COUNT> previous_appends{};
+			u32 canonical_appends = 0;
+			const u32 clip_write = 1u << REG_CLIP_FLAG;
+			for (u32 pair_index = 0; pair_index < block->pair_count; pair_index++)
+			{
+				PairPlan& pair = block->pairs[pair_index];
+				const bool canonical_append = pair.fmac_pipe &&
+					(!block->local_fmac_pipeline || pair_index < LOCAL_FMAC_WARMUP_PAIRS);
+				if (!canonical_append)
+					continue;
+
+				const u32 slot = canonical_appends & (FMAC_PIPELINE_SLOT_COUNT - 1);
+				if (canonical_appends >= FMAC_PIPELINE_SLOT_COUNT)
+				{
+					const u32 previous_pair = previous_appends[slot];
+					bool clip_unchanged = true;
+					for (u32 scan = previous_pair + 1; scan <= pair_index; scan++)
+					{
+						const PairPlan& intervening = block->pairs[scan];
+						if (((intervening.uregs.VIwrite | intervening.lregs.VIwrite) &
+								clip_write) != 0)
+						{
+							clip_unchanged = false;
+							break;
+						}
+					}
+					pair.reuse_fmac_clip_snapshot = clip_unchanged;
+				}
+				previous_appends[slot] = pair_index;
+				canonical_appends++;
+			}
 		}
 
 		bool CanDeferFmacFlags(const BlockPlan& block)
@@ -1626,6 +1672,7 @@ namespace VitaVU
 				}
 
 				block->local_fmac_pipeline = !conservative_vu0 && CanUseLocalFmacPipeline(*block);
+				AnalyzeCanonicalFmacClipSnapshotReuse(block);
 				// The canonical empty-pipe guard is five loads plus four ORRs and a
 				// branch at every pair. A resident block pays one exact five-field
 				// refresh at entry, then CMP+BLNE per guard. Three guards recover the
@@ -3101,6 +3148,15 @@ namespace VitaVU
 			{
 				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitFmacWriteposLoadElisions))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1, 1) &&
+					m_code.EmitStrImm12(1, 0, 0);
+			}
+
+			bool EmitQemuCanonicalFmacClipSnapshotReuseCounter()
+			{
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitCanonicalFmacClipSnapshotReuses))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
 					m_code.EmitAddImm8(1, 1, 1) &&
 					m_code.EmitStrImm12(1, 0, 0);
@@ -11097,7 +11153,7 @@ namespace VitaVU
 				// return address), so lay out the complete 24-byte static header in
 				// those registers and issue one writeback STMIA through LR. Writeback
 				// advances LR to sCycle; a second ascending STMIA then publishes the
-				// remaining six words. This preserves the implicit padding word cleared
+				// remaining live words. This preserves the implicit padding word cleared
 				// by _vuClearFMAC() and all field order while replacing six STRD stores
 				// with two Cortex-A9 store-multiple instructions.
 				constexpr u16 FMAC_HEADER_REGS =
@@ -11109,6 +11165,15 @@ namespace VitaVU
 				// r0 is overwritten immediately by the exact current cycle low word.
 				constexpr u16 FMAC_WORKING_FLAG_REGS =
 					(1u << 3) | (1u << 8) | (1u << 12);
+				constexpr u16 FMAC_WORKING_MAC_STATUS_REGS =
+					(1u << 3) | (1u << 8);
+				constexpr u16 FMAC_RESULT_REGS_WITHOUT_CLIP =
+					(1u << 0) | (1u << 1) | (1u << 2) |
+					(1u << 3) | (1u << 8);
+				const u16 working_flag_regs = plan.reuse_fmac_clip_snapshot ?
+					FMAC_WORKING_MAC_STATUS_REGS : FMAC_WORKING_FLAG_REGS;
+				const u16 result_regs = plan.reuse_fmac_clip_snapshot ?
+					FMAC_RESULT_REGS_WITHOUT_CLIP : FMAC_HEADER_REGS;
 				bool emitted_body =
 					EmitComputeFmacWritePtr(14, 0) &&
 					// Normal pairs have no observer between canonical queue append and
@@ -11129,11 +11194,11 @@ namespace VitaVU
 					m_code.EmitStmIa(14, FMAC_HEADER_REGS, true) &&
 					m_code.EmitAddImm32(0, HOST_VU,
 						VuOffset(offsetof(VURegs, macflag))) &&
-					m_code.EmitLdmIa(0, FMAC_WORKING_FLAG_REGS) &&
+					m_code.EmitLdmIa(0, working_flag_regs) &&
 					EmitLoadCurrentCycleLow(0) &&
 					EmitLoadCurrentCycleHigh(1) &&
 					m_code.EmitMovImm8(2, FMAC_PIPELINE_LATENCY_CYCLES) &&
-					m_code.EmitStmIa(14, FMAC_HEADER_REGS) &&
+					m_code.EmitStmIa(14, result_regs) &&
 					(UsesResidentPipeActivity() ?
 						// r10 is the exact local fmaccount owner until the next helper,
 						// flush, link, or dispatcher seam. Avoid feeding every append
@@ -11152,6 +11217,11 @@ namespace VitaVU
 					return false;
 				if (advance_writepos_early && !EmitQemuFmacWriteposLoadElisionCounter())
 					return false;
+				if (plan.reuse_fmac_clip_snapshot &&
+					!EmitQemuCanonicalFmacClipSnapshotReuseCounter())
+				{
+					return false;
+				}
 				if (UsesResidentPipeActivity() &&
 					!EmitQemuResidentFmacCountAppendElisionCounter())
 				{
@@ -13893,6 +13963,7 @@ namespace VitaVU
 		g_qemuVuJitLocalFmacPipelineCommits = 0;
 		g_qemuVuJitLocalFmacCycleSnapshotElisions = 0;
 		g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
+		g_qemuVuJitCanonicalFmacClipSnapshotReuses = 0;
 		g_qemuVuJitDeferredFmacFlagEntries = 0;
 		g_qemuVuJitDeferredFmacFlagRetirements = 0;
 		g_qemuVuJitCanonicalDeferredFmacRetirements = 0;
