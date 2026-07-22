@@ -5726,17 +5726,21 @@ namespace VitaVU
 					return false;
 				}
 				// Cortex-A9 MPE TRM tables 3-4 and 3-6 put the integer sign
-				// comparison and the exponent classifiers on independent result
-				// chains. In the Vita-default FZ/no-overflow mode no normalization
-				// consumes the raw sign-vector scratch, so issue VCLT before the
-				// exponent chain and overlap its four-cycle result latency with the
+				// extraction and the exponent classifiers on independent result
+				// chains. Interpreting a raw float bit pattern as signed integer,
+				// VSHR.S32 #31 produces the same all-ones mask as VCLT.S32 #0 for
+				// every possible word. On Cortex-A9 the shift reads its source and
+				// produces its result one cycle earlier than the comparison. In the
+				// Vita-default FZ/no-overflow mode no normalization consumes the
+				// raw sign-vector scratch, so issue that shift before the
+				// exponent chain and overlap its three-cycle result latency with the
 				// two exponent comparisons. Full-XYZW STATUS uses the raw result sign
 				// directly and does not need this all-ones lane mask.
 				const bool lane_sign_mask_required = mac_result || mask != 0x0f;
 				const bool classify_sign_early = lane_sign_mask_required &&
 					!normalize_requires_sign;
 				if ((classify_sign_early &&
-						!m_code.EmitVcltS32ZeroQ(VU_NORM_SIGNV_Q, result_q)) ||
+						!m_code.EmitVshrS32Q(VU_NORM_SIGNV_Q, result_q, 31)) ||
 					!m_code.EmitVandQ(VU_NORM_EXPV_Q, result_q, VU_NORM_EXP_Q) ||
 					(normalize_requires_sign &&
 						!m_code.EmitVandQ(VU_NORM_SIGNV_Q, result_q, VU_NORM_SIGN_Q)) ||
@@ -5852,7 +5856,7 @@ namespace VitaVU
 				const u8 underflow_shift = mac_result ? 8 : 2;
 				const u8 overflow_shift = mac_result ? 12 : 3;
 				if (!classify_sign_early &&
-					!m_code.EmitVcltS32ZeroQ(VU_NORM_SIGNV_Q, result_q))
+					!m_code.EmitVshrS32Q(VU_NORM_SIGNV_Q, result_q, 31))
 					return false;
 				if (full_mac_result)
 				{
