@@ -58,6 +58,8 @@ u32 g_qemuVuJitNormConstantMaterializations = 0;
 u32 g_qemuVuJitFmacClearInlineOps = 0;
 u32 g_qemuVuJitFmacWriteposLoadElisions = 0;
 u32 g_qemuVuJitCanonicalFmacClipSnapshotReuses = 0;
+u32 g_qemuVuJitCanonicalFmacStatusSnapshotReuses = 0;
+u32 g_qemuVuJitCanonicalFmacMacSnapshotReuses = 0;
 u32 g_qemuVuJitCanonicalFmacStaticHeaderReuses = 0;
 u32 g_qemuVuJitResidentFmacCountAppendElisions = 0;
 u32 g_qemuVuJitCanonicalFmacStallTestRuntimeElisions = 0;
@@ -650,9 +652,9 @@ namespace VitaVU
 			// MAC classification is independently live only when a later MAC reader,
 			// preserve-inactive producer, or block-seam pipeline state can observe it.
 			bool mac_flag_result_required = true;
-			// The canonical four-slot ring still contains this pair's exact working
-			// CLIP value from the append four writes earlier.
-			bool reuse_fmac_clip_snapshot = false;
+			// Count of trailing MAC/STATUS/CLIP snapshot words which remain exact
+			// from the append four canonical writes earlier.
+			u8 reused_fmac_flag_suffix_words = 0;
 			// The same slot's compile-time dependency header is byte-identical.
 			bool reuse_fmac_static_header = false;
 			// PCSX2 microVU owner: microVU_IR.h::microRegInfo::backupVI.
@@ -854,6 +856,8 @@ namespace VitaVU
 			// its five fields plus the invariant zero padding can remain untouched.
 			std::array<u32, FMAC_PIPELINE_SLOT_COUNT> previous_appends{};
 			u32 canonical_appends = 0;
+			const u32 mac_write = 1u << REG_MAC_FLAG;
+			const u32 status_write = 1u << REG_STATUS_FLAG;
 			const u32 clip_write = 1u << REG_CLIP_FLAG;
 			for (u32 pair_index = 0; pair_index < block->pair_count; pair_index++)
 			{
@@ -869,18 +873,38 @@ namespace VitaVU
 					const u32 previous_pair = previous_appends[slot];
 					pair.reuse_fmac_static_header =
 						SameCanonicalFmacStaticHeader(block->pairs[previous_pair], pair);
-					bool clip_unchanged = true;
+					u32 working_flag_writes = 0;
+					bool mac_changed = false;
+					bool status_changed = false;
 					for (u32 scan = previous_pair + 1; scan <= pair_index; scan++)
 					{
 						const PairPlan& intervening = block->pairs[scan];
-						if (((intervening.uregs.VIwrite | intervening.lregs.VIwrite) &
-								clip_write) != 0)
+						working_flag_writes |=
+							intervening.uregs.VIwrite | intervening.lregs.VIwrite;
+						// PCSX2's working MAC/STATUS instances are private FMAC
+						// state, not exhaustively represented by _VURegsNum::VIwrite.
+						// These are the exact admitted upper classes which compute
+						// them. Lower FDIV and flag operations conservatively invalidate
+						// STATUS; only the CLIP word uses VIwrite ownership directly.
+						const bool upper_mac_status = intervening.add_upper_stalls &&
+							(intervening.upper_addsub_inline ||
+							 intervening.upper_mul_inline ||
+							 intervening.upper_maddmsub_inline ||
+							 intervening.upper_outer_inline);
+						mac_changed = mac_changed || upper_mac_status;
+						status_changed = status_changed || upper_mac_status ||
+							intervening.lower_fdiv_inline || intervening.lower_flag_inline;
+					}
+					if ((working_flag_writes & clip_write) == 0)
+					{
+						pair.reused_fmac_flag_suffix_words = 1;
+						if (!status_changed && (working_flag_writes & status_write) == 0)
 						{
-							clip_unchanged = false;
-							break;
+							pair.reused_fmac_flag_suffix_words = 2;
+							if (!mac_changed && (working_flag_writes & mac_write) == 0)
+								pair.reused_fmac_flag_suffix_words = 3;
 						}
 					}
-					pair.reuse_fmac_clip_snapshot = clip_unchanged;
 				}
 				previous_appends[slot] = pair_index;
 				canonical_appends++;
@@ -3188,6 +3212,24 @@ namespace VitaVU
 			{
 				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitCanonicalFmacClipSnapshotReuses))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1, 1) &&
+					m_code.EmitStrImm12(1, 0, 0);
+			}
+
+			bool EmitQemuCanonicalFmacStatusSnapshotReuseCounter()
+			{
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitCanonicalFmacStatusSnapshotReuses))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1, 1) &&
+					m_code.EmitStrImm12(1, 0, 0);
+			}
+
+			bool EmitQemuCanonicalFmacMacSnapshotReuseCounter()
+			{
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitCanonicalFmacMacSnapshotReuses))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
 					m_code.EmitAddImm8(1, 1, 1) &&
 					m_code.EmitStrImm12(1, 0, 0);
@@ -11194,9 +11236,9 @@ namespace VitaVU
 				// those registers and issue one writeback STMIA through LR when the
 				// header differs. Writeback advances LR to sCycle; an identical existing
 				// header advances LR by the same constant directly. The ascending STMIA
-				// then publishes the remaining live words. This preserves the implicit padding
-				// word cleared by _vuClearFMAC() and all field order while replacing six STRD stores
-				// with two Cortex-A9 store-multiple instructions.
+				// then publishes the remaining live words. This preserves the implicit
+				// padding word cleared by _vuClearFMAC() and all field order while
+				// replacing six STRD stores with two Cortex-A9 store-multiple instructions.
 				constexpr u16 FMAC_HEADER_REGS =
 					(1u << 0) | (1u << 1) | (1u << 2) |
 					(1u << 3) | (1u << 8) | (1u << 12);
@@ -11208,13 +11250,23 @@ namespace VitaVU
 					(1u << 3) | (1u << 8) | (1u << 12);
 				constexpr u16 FMAC_WORKING_MAC_STATUS_REGS =
 					(1u << 3) | (1u << 8);
+				constexpr u16 FMAC_WORKING_MAC_REG = 1u << 3;
 				constexpr u16 FMAC_RESULT_REGS_WITHOUT_CLIP =
 					(1u << 0) | (1u << 1) | (1u << 2) |
 					(1u << 3) | (1u << 8);
-				const u16 working_flag_regs = plan.reuse_fmac_clip_snapshot ?
-					FMAC_WORKING_MAC_STATUS_REGS : FMAC_WORKING_FLAG_REGS;
-				const u16 result_regs = plan.reuse_fmac_clip_snapshot ?
-					FMAC_RESULT_REGS_WITHOUT_CLIP : FMAC_HEADER_REGS;
+				constexpr u16 FMAC_RESULT_REGS_WITHOUT_STATUS_CLIP =
+					(1u << 0) | (1u << 1) | (1u << 2) | (1u << 3);
+				constexpr u16 FMAC_RESULT_REGS_WITHOUT_FLAGS =
+					(1u << 0) | (1u << 1) | (1u << 2);
+				const u8 reused_flag_words = plan.reused_fmac_flag_suffix_words;
+				const u16 working_flag_regs = reused_flag_words == 0 ?
+					FMAC_WORKING_FLAG_REGS :
+					(reused_flag_words == 1 ? FMAC_WORKING_MAC_STATUS_REGS :
+						FMAC_WORKING_MAC_REG);
+				const u16 result_regs = reused_flag_words == 0 ? FMAC_HEADER_REGS :
+					(reused_flag_words == 1 ? FMAC_RESULT_REGS_WITHOUT_CLIP :
+						(reused_flag_words == 2 ? FMAC_RESULT_REGS_WITHOUT_STATUS_CLIP :
+							FMAC_RESULT_REGS_WITHOUT_FLAGS));
 				bool emitted_body =
 					EmitComputeFmacWritePtr(14, 0) &&
 					// Normal pairs have no observer between canonical queue append and
@@ -11235,9 +11287,10 @@ namespace VitaVU
 						 m_code.EmitMovImm32(HOST_CLIP_OLD, xyzwlower) &&
 						 m_code.EmitMovImm8(HOST_CALL_SCRATCH, 0) &&
 						 m_code.EmitStmIa(14, FMAC_HEADER_REGS, true))) &&
-					m_code.EmitAddImm32(0, HOST_VU,
-						VuOffset(offsetof(VURegs, macflag))) &&
-					m_code.EmitLdmIa(0, working_flag_regs) &&
+					(reused_flag_words == 3 ||
+						(m_code.EmitAddImm32(0, HOST_VU,
+							 VuOffset(offsetof(VURegs, macflag))) &&
+						 m_code.EmitLdmIa(0, working_flag_regs))) &&
 					EmitLoadCurrentCycleLow(0) &&
 					EmitLoadCurrentCycleHigh(1) &&
 					m_code.EmitMovImm8(2, FMAC_PIPELINE_LATENCY_CYCLES) &&
@@ -11260,8 +11313,18 @@ namespace VitaVU
 					return false;
 				if (advance_writepos_early && !EmitQemuFmacWriteposLoadElisionCounter())
 					return false;
-				if (plan.reuse_fmac_clip_snapshot &&
+				if (reused_flag_words >= 1 &&
 					!EmitQemuCanonicalFmacClipSnapshotReuseCounter())
+				{
+					return false;
+				}
+				if (reused_flag_words >= 2 &&
+					!EmitQemuCanonicalFmacStatusSnapshotReuseCounter())
+				{
+					return false;
+				}
+				if (reused_flag_words >= 3 &&
+					!EmitQemuCanonicalFmacMacSnapshotReuseCounter())
 				{
 					return false;
 				}
@@ -14012,6 +14075,8 @@ namespace VitaVU
 		g_qemuVuJitLocalFmacCycleSnapshotElisions = 0;
 		g_qemuVuJitLocalFmacProducerSnapshotEntries = 0;
 		g_qemuVuJitCanonicalFmacClipSnapshotReuses = 0;
+		g_qemuVuJitCanonicalFmacStatusSnapshotReuses = 0;
+		g_qemuVuJitCanonicalFmacMacSnapshotReuses = 0;
 		g_qemuVuJitCanonicalFmacStaticHeaderReuses = 0;
 		g_qemuVuJitDeferredFmacFlagEntries = 0;
 		g_qemuVuJitDeferredFmacFlagRetirements = 0;
