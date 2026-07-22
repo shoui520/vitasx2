@@ -61,6 +61,7 @@ u32 g_qemuVuJitCanonicalFmacClipSnapshotReuses = 0;
 u32 g_qemuVuJitCanonicalFmacStatusSnapshotReuses = 0;
 u32 g_qemuVuJitCanonicalFmacMacSnapshotReuses = 0;
 u32 g_qemuVuJitCanonicalFmacStaticHeaderReuses = 0;
+u32 g_qemuVuJitIaluTimestampStrdOps = 0;
 u32 g_qemuVuJitResidentFmacCountAppendElisions = 0;
 u32 g_qemuVuJitCanonicalFmacStallTestRuntimeElisions = 0;
 u32 g_qemuVuJitUpperFmacStallTestInlineOps = 0;
@@ -159,6 +160,7 @@ namespace VitaVU
 		static_assert(offsetof(ialuPipe, reg) == 0);
 		static_assert(offsetof(ialuPipe, sCycle) == 8);
 		static_assert(offsetof(ialuPipe, Cycle) == 16);
+		static_assert(((offsetof(VURegs, ialu) + offsetof(ialuPipe, sCycle)) & 7) == 0);
 		static_assert(sizeof(fmacPipe) == 48);
 		static_assert(offsetof(fmacPipe, regupper) == 0);
 		static_assert(offsetof(fmacPipe, reglower) == 4);
@@ -3239,6 +3241,15 @@ namespace VitaVU
 			{
 				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
 						&g_qemuVuJitCanonicalFmacStaticHeaderReuses))) &&
+					m_code.EmitLdrImm12(1, 0, 0) &&
+					m_code.EmitAddImm8(1, 1, 1) &&
+					m_code.EmitStrImm12(1, 0, 0);
+			}
+
+			bool EmitQemuIaluTimestampStrdCounter()
+			{
+				return m_code.EmitMovImm32(0, static_cast<u32>(reinterpret_cast<uptr>(
+						&g_qemuVuJitIaluTimestampStrdOps))) &&
 					m_code.EmitLdrImm12(1, 0, 0) &&
 					m_code.EmitAddImm8(1, 1, 1) &&
 					m_code.EmitStrImm12(1, 0, 0);
@@ -10524,26 +10535,35 @@ namespace VitaVU
 
 				// PCSX2 owner: VUops.cpp::_vuAddIALUStalls(). Keep the same
 				// four-entry circular queue so branch ops still observe VI
-				// write visibility through _vuTestALUStalls().
+				// write visibility through _vuTestALUStalls(). No observer exists
+				// within this append, so publish the final write position before
+				// reusing r0/r1 as the aligned timestamp pair for one A32 STRD.
 				constexpr size_t base = offsetof(VURegs, ialu);
-				return m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, ialuwritepos))) &&
+				const bool emitted =
+					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, ialuwritepos))) &&
 					m_code.EmitAddImm32(3, HOST_VU, base) &&
 					m_code.EmitAddRegShiftImm(3, 3, 0, ShiftType::LSL, 4) &&
 					m_code.EmitAddRegShiftImm(3, 3, 0, ShiftType::LSL, 3) &&
-					m_code.EmitMovImm32(1, regs.VIwrite) &&
-					m_code.EmitStrImm12(1, 3, offsetof(ialuPipe, reg)) &&
-					EmitLoadCurrentCycleLow(1) &&
-					EmitLoadCurrentCycleHigh(2) &&
-					m_code.EmitStrImm12(1, 3, offsetof(ialuPipe, sCycle)) &&
-					m_code.EmitStrImm12(2, 3, offsetof(ialuPipe, sCycle) + 4) &&
-					m_code.EmitMovImm32(1, regs.cycles) &&
-					m_code.EmitStrImm12(1, 3, offsetof(ialuPipe, Cycle)) &&
 					m_code.EmitAddImm8(0, 0, 1) &&
 					m_code.EmitAndImm32(0, 0, 3) &&
 					m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, ialuwritepos))) &&
+					m_code.EmitMovImm32(2, regs.VIwrite) &&
+					m_code.EmitStrImm12(2, 3, offsetof(ialuPipe, reg)) &&
+					EmitLoadCurrentCycleLow(0) &&
+					EmitLoadCurrentCycleHigh(1) &&
+					m_code.EmitStrdImm8(0, 1, 3, offsetof(ialuPipe, sCycle)) &&
+					m_code.EmitMovImm32(0, regs.cycles) &&
+					m_code.EmitStrImm12(0, 3, offsetof(ialuPipe, Cycle)) &&
 					m_code.EmitLdrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, ialucount))) &&
 					m_code.EmitAddImm8(0, 0, 1) &&
 					m_code.EmitStrImm12(0, HOST_VU, VuOffset(offsetof(VURegs, ialucount)));
+				if (!emitted)
+					return false;
+#if defined(VITASX2_QEMU_VALIDATION)
+				return EmitQemuIaluTimestampStrdCounter();
+#else
+				return true;
+#endif
 			}
 
 			bool EmitComputeFmacWritePtr(unsigned ptr_reg, unsigned index_reg)
@@ -14085,6 +14105,7 @@ namespace VitaVU
 		g_qemuVuJitCanonicalFmacStatusSnapshotReuses = 0;
 		g_qemuVuJitCanonicalFmacMacSnapshotReuses = 0;
 		g_qemuVuJitCanonicalFmacStaticHeaderReuses = 0;
+		g_qemuVuJitIaluTimestampStrdOps = 0;
 		g_qemuVuJitDeferredFmacFlagEntries = 0;
 		g_qemuVuJitDeferredFmacFlagRetirements = 0;
 		g_qemuVuJitCanonicalDeferredFmacRetirements = 0;
