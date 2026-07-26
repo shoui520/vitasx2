@@ -2330,7 +2330,53 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 		return fail_registration("check generated VU1+TFX vertex program",
 			check_result);
 	}
-	if (stored.metadata.memory_inputs.size() > 16)
+	const bool flat_instances = stored.metadata.uses_flat_instance_inputs;
+	const bool valid_flat_metadata = flat_instances ?
+		((stored.metadata.flat_vertices_per_primitive == 2 ||
+			stored.metadata.flat_vertices_per_primitive == 3) &&
+			stored.metadata.flat_instance_vertex_step != 0 &&
+			(!stored.metadata.flat_strip_winding ||
+				stored.metadata.flat_vertices_per_primitive == 3)) :
+		(stored.metadata.flat_vertices_per_primitive == 0 &&
+			stored.metadata.flat_instance_vertex_step == 0 &&
+			!stored.metadata.flat_strip_winding);
+	if (!valid_flat_metadata)
+	{
+		return fail_registration("bind generated VU1+TFX vertex inputs",
+			SCE_GXM_ERROR_INVALID_VALUE);
+	}
+	const u8 full_flat_vertex_mask = flat_instances ?
+		static_cast<u8>(
+			(1u << stored.metadata.flat_vertices_per_primitive) - 1u) : 0;
+	const u8 provoking_flat_vertex_mask = flat_instances ?
+		static_cast<u8>(
+			1u << (stored.metadata.flat_vertices_per_primitive - 1u)) : 0;
+	u32 generated_attribute_count = 0;
+	bool valid_attribute_masks = true;
+	for (const VitaGpuVu::CgMemoryInput& input :
+		stored.metadata.memory_inputs)
+	{
+		if (!flat_instances)
+		{
+			valid_attribute_masks &=
+				input.flat_attribute_vertex_mask == 0;
+			generated_attribute_count++;
+			continue;
+		}
+		valid_attribute_masks &=
+			input.flat_attribute_vertex_mask == full_flat_vertex_mask ||
+			input.flat_attribute_vertex_mask == provoking_flat_vertex_mask;
+		for (u32 vertex = 0;
+			vertex < stored.metadata.flat_vertices_per_primitive; vertex++)
+		{
+			generated_attribute_count +=
+				(input.flat_attribute_vertex_mask & (1u << vertex)) != 0;
+		}
+	}
+	const u32 generated_stream_count =
+		static_cast<u32>(stored.metadata.memory_inputs.size());
+	if (!valid_attribute_masks || generated_attribute_count > 16 ||
+		generated_stream_count > 16)
 	{
 		return fail_registration("bind generated VU1+TFX vertex inputs",
 			SCE_GXM_ERROR_INVALID_VALUE);
@@ -2393,10 +2439,9 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 			SCE_GXM_ERROR_INVALID_VALUE);
 	}
 
-	std::vector<SceGxmVertexAttribute> attributes(
-		stored.metadata.memory_inputs.size());
-	std::vector<SceGxmVertexStream> streams(
-		stored.metadata.memory_inputs.size());
+	std::vector<SceGxmVertexAttribute> attributes;
+	attributes.reserve(generated_attribute_count);
+	std::vector<SceGxmVertexStream> streams(generated_stream_count);
 	for (u32 index = 0; index < stored.metadata.memory_inputs.size(); index++)
 	{
 		const VitaGpuVu::CgMemoryInput& input =
@@ -2407,42 +2452,70 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 			return fail_registration("validate generated VU1+TFX input layout",
 				SCE_GXM_ERROR_INVALID_VALUE);
 		}
-		const u64 stride =
+		const u64 vertex_stride =
 			static_cast<u64>(input.address.invocation_coefficient) * 16u;
-		if (stride > std::numeric_limits<u16>::max())
+		const u64 stream_stride = vertex_stride *
+			(flat_instances ?
+				stored.metadata.flat_instance_vertex_step : 1u);
+		const u64 maximum_attribute_offset = vertex_stride *
+			(flat_instances ?
+				stored.metadata.flat_vertices_per_primitive - 1u : 0u);
+		if (stream_stride > std::numeric_limits<u16>::max() ||
+			maximum_attribute_offset > std::numeric_limits<u16>::max())
 		{
 			return fail_registration("validate generated VU1+TFX input stride",
 				SCE_GXM_ERROR_INVALID_VALUE);
 		}
 
-		char parameter_name[24];
-		std::snprintf(parameter_name, sizeof(parameter_name), "VuMemory%u",
-			input.attribute_index);
-		const SceGxmProgramParameter* const parameter =
-			sceGxmProgramFindParameterByName(program, parameter_name);
-		if (!parameter ||
-			sceGxmProgramParameterGetCategory(parameter) !=
-				SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE)
+		const u32 vertex_attributes = flat_instances ?
+			stored.metadata.flat_vertices_per_primitive : 1u;
+		for (u32 vertex = 0; vertex < vertex_attributes; vertex++)
 		{
-			return fail_registration("find generated VU1+TFX input",
-				SCE_GXM_ERROR_INVALID_VALUE);
+			if (flat_instances &&
+				(input.flat_attribute_vertex_mask & (1u << vertex)) == 0)
+			{
+				continue;
+			}
+			char parameter_name[40];
+			if (flat_instances)
+			{
+				std::snprintf(parameter_name, sizeof(parameter_name),
+					"VuMemory%uVertex%u", input.attribute_index, vertex);
+			}
+			else
+			{
+				std::snprintf(parameter_name, sizeof(parameter_name),
+					"VuMemory%u", input.attribute_index);
+			}
+			const SceGxmProgramParameter* const parameter =
+				sceGxmProgramFindParameterByName(program, parameter_name);
+			if (!parameter ||
+				sceGxmProgramParameterGetCategory(parameter) !=
+					SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE)
+			{
+				return fail_registration("find generated VU1+TFX input",
+					SCE_GXM_ERROR_INVALID_VALUE);
+			}
+
+			SceGxmVertexAttribute attribute{};
+			attribute.streamIndex = static_cast<u16>(index);
+			attribute.offset = static_cast<u16>(vertex_stride * vertex);
+			// Shader_Compiler-Users_Guide::Offline Vertex Unpacking: a
+			// __regformat int4 attribute is four untyped 32-bit words.
+			attribute.format = SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED;
+			attribute.componentCount = 4;
+			attribute.regIndex =
+				sceGxmProgramParameterGetResourceIndex(parameter);
+			attributes.push_back(attribute);
 		}
-
-		SceGxmVertexAttribute& attribute = attributes[index];
-		attribute.streamIndex = static_cast<u16>(index);
-		attribute.offset = 0;
-		// Shader_Compiler-Users_Guide::Offline Vertex Unpacking: a
-		// __regformat int4 attribute is four untyped 32-bit words.
-		attribute.format = SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED;
-		attribute.componentCount = 4;
-		attribute.regIndex =
-			sceGxmProgramParameterGetResourceIndex(parameter);
-
 		SceGxmVertexStream& stream = streams[index];
-		stream.stride = static_cast<u16>(stride);
-		stream.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
+		stream.stride = static_cast<u16>(stream_stride);
+		// Sony api_libgxm/instancing: instance-indexed streams advance once
+		// per indexWrap group, independently of primitive-local indices.
+		stream.indexSource = flat_instances ?
+			SCE_GXM_INDEX_SOURCE_INSTANCE_16BIT :
+			SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
 	}
-
 	int patch_result = sceGxmShaderPatcherRegisterProgram(
 		patcher, program, &stored.id);
 	if (patch_result < 0 || !stored.id)
@@ -3928,10 +4001,9 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 	if (!draw->Validate(&validation_error))
 		return Reject(validation_error.c_str());
 	if (draw->lowering != VitaGpuVu::OutputLowering::DirectTfx ||
-		draw->execution != VitaGpuVu::ExecutionKind::GeneratedParallel ||
-		draw->primitive_boundary != VitaGpuVu::PrimitiveBoundary::Native)
+		draw->execution != VitaGpuVu::ExecutionKind::GeneratedParallel)
 	{
-		return Reject("GPU-VU draw is not a native generated direct-TFX job");
+		return Reject("GPU-VU draw is not a generated direct-TFX job");
 	}
 	if (draw->final_state.IsRequired())
 	{
@@ -3959,6 +4031,14 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		generated->metadata.memory_inputs.size() != draw->streams.size())
 	{
 		return Reject("generated VU1 program metadata differs from draw streams");
+	}
+	const bool flat_instances =
+		generated->metadata.uses_flat_instance_inputs;
+	if (draw->primitive_boundary != (flat_instances ?
+			VitaGpuVu::PrimitiveBoundary::InstanceIndexed :
+			VitaGpuVu::PrimitiveBoundary::Native))
+	{
+		return Reject("GPU-VU primitive boundary differs from generated ABI");
 	}
 
 	u32 vf_mask = 0;
@@ -4019,21 +4099,24 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 	{
 		return Reject("PCSX2 TFX selectors differ from the GPU-VU GIF contract");
 	}
-	if (!draw->direct_tfx.gouraud && prim.PRIM != GS_POINTLIST)
+	if (!draw->direct_tfx.gouraud && prim.PRIM != GS_POINTLIST &&
+		!flat_instances)
 	{
-		// PCSX2's GS uses the last vertex as the provoking vertex. Public GXM
-		// exposes neither a provoking-vertex selector nor flat interpolation;
-		// the exact instance-indexed lowering remains a separate boundary.
-		return Reject("native GPU-VU draw cannot preserve flat provoking color");
+		return Reject(
+			"flat GPU-VU primitive lacks exact instance-indexed provoking color");
 	}
 
 	SceGxmPrimitiveType primitive_type{};
 	GSHWDrawConfig::Topology topology{};
 	u32 indices_per_primitive = 0;
 	u32 primitive_count = 0;
+	u32 flat_vertex_step = 0;
+	bool flat_strip_winding = false;
 	switch (prim.PRIM)
 	{
 		case GS_POINTLIST:
+			if (flat_instances)
+				return Reject("point GPU-VU draw unexpectedly uses flat instances");
 			primitive_type = SCE_GXM_PRIMITIVE_POINTS;
 			topology = GSHWDrawConfig::Topology::Point;
 			indices_per_primitive = 1;
@@ -4046,6 +4129,16 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			topology = GSHWDrawConfig::Topology::Line;
 			indices_per_primitive = 2;
 			primitive_count = draw->vertex_count / 2;
+			flat_vertex_step = 2;
+			break;
+		case GS_LINESTRIP:
+			if (!flat_instances || draw->vertex_count < 2)
+				return Reject("line-strip GPU-VU draw lacks flat instances");
+			primitive_type = SCE_GXM_PRIMITIVE_LINES;
+			topology = GSHWDrawConfig::Topology::Line;
+			indices_per_primitive = 2;
+			primitive_count = draw->vertex_count - 1;
+			flat_vertex_step = 1;
 			break;
 		case GS_TRIANGLELIST:
 			if ((draw->vertex_count % 3u) != 0)
@@ -4054,16 +4147,26 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			topology = GSHWDrawConfig::Topology::Triangle;
 			indices_per_primitive = 3;
 			primitive_count = draw->vertex_count / 3;
+			flat_vertex_step = 3;
 			break;
 		case GS_TRIANGLESTRIP:
 			if (draw->vertex_count < 3)
 				return Reject("short native GPU-VU triangle strip");
-			primitive_type = SCE_GXM_PRIMITIVE_TRIANGLE_STRIP;
+			primitive_type = flat_instances ?
+				SCE_GXM_PRIMITIVE_TRIANGLES :
+				SCE_GXM_PRIMITIVE_TRIANGLE_STRIP;
 			topology = GSHWDrawConfig::Topology::Triangle;
 			indices_per_primitive = 3;
 			primitive_count = draw->vertex_count - 2;
+			flat_vertex_step = 1;
+			flat_strip_winding = true;
 			break;
 		case GS_TRIANGLEFAN:
+			if (flat_instances)
+			{
+				return Reject(
+					"flat triangle fan requires a GPU export output lowering");
+			}
 			if (draw->vertex_count < 3)
 				return Reject("short native GPU-VU triangle fan");
 			primitive_type = SCE_GXM_PRIMITIVE_TRIANGLE_FAN;
@@ -4071,13 +4174,29 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			indices_per_primitive = 3;
 			primitive_count = draw->vertex_count - 2;
 			break;
-		case GS_LINESTRIP:
 		case GS_SPRITE:
 		default:
 			return Reject("GPU-VU primitive requires a non-native output lowering");
 	}
-	if (draw->index_count != draw->vertex_count ||
-		draw->index_count > GPU_VU_SEQUENTIAL_INDEX_COUNT ||
+	if (flat_instances &&
+		(draw->direct_tfx.gouraud ||
+			generated->metadata.flat_vertices_per_primitive !=
+				indices_per_primitive ||
+			generated->metadata.flat_instance_vertex_step !=
+				flat_vertex_step ||
+			generated->metadata.flat_strip_winding != flat_strip_winding))
+	{
+		return Reject("GPU-VU flat instance metadata differs from GIF topology");
+	}
+	const u64 expected_index_count = flat_instances ?
+		static_cast<u64>(primitive_count) * indices_per_primitive :
+		draw->vertex_count;
+	if (expected_index_count > std::numeric_limits<u32>::max() ||
+		draw->index_count != expected_index_count ||
+		(!flat_instances &&
+			draw->index_count > GPU_VU_SEQUENTIAL_INDEX_COUNT) ||
+		(flat_instances &&
+			primitive_count > GPU_VU_SEQUENTIAL_INDEX_COUNT) ||
 		draw->primitive_count != primitive_count ||
 		config.topology != topology ||
 		config.indices_per_prim != indices_per_primitive ||
@@ -4142,7 +4261,6 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		if (stream_result < 0)
 			return Fail("bind generated VU1 raw VIF stream", stream_result);
 	}
-
 	VitaGXM::GSTextureGXM* bound_source = source ? source : white_texture.get();
 	if (!bound_source)
 		return false;
@@ -4219,15 +4337,26 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		sceGxmSetFrontPointLineWidth(context, 1);
 		sceGxmSetBackPointLineWidth(context, 1);
 	}
-	result = sceGxmDraw(context, primitive_type, SCE_GXM_INDEX_FORMAT_U16,
-		gpu_vu_sequential_indices, draw->index_count);
+	// Sony libGXM context.h: indexWrap resets the index-buffer position and
+	// primitive assembly for every instance. The persistent 0,1,2 identity
+	// prefix therefore selects one exact GS primitive per flat instance.
+	result = flat_instances ?
+		sceGxmDrawInstanced(context, primitive_type,
+			SCE_GXM_INDEX_FORMAT_U16, gpu_vu_sequential_indices,
+			draw->index_count, indices_per_primitive) :
+		sceGxmDraw(context, primitive_type, SCE_GXM_INDEX_FORMAT_U16,
+			gpu_vu_sequential_indices, draw->index_count);
 	if (point_topology || line_topology)
 	{
 		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
 		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
 	}
 	if (result < 0)
-		return Fail("sceGxmDraw(generated VU1+TFX)", result);
+	{
+		return Fail(flat_instances ?
+			"sceGxmDrawInstanced(generated VU1+TFX)" :
+			"sceGxmDraw(generated VU1+TFX)", result);
+	}
 
 	RecordGpuVuGxmDraw(draw->index_count);
 	if (rt)

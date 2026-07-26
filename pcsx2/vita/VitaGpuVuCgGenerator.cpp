@@ -3,6 +3,8 @@
 
 #include "vita/VitaGpuVuCgGenerator.h"
 
+#include "GS/GSRegs.h"
+
 #include <algorithm>
 #include <array>
 #include <map>
@@ -15,6 +17,7 @@ namespace {
 
 constexpr u32 InvalidNode = 0;
 constexpr u32 MaximumMemoryInputs = 16;
+constexpr u32 MaximumVertexAttributes = 16;
 constexpr u32 MaximumValidationStores = 8;
 constexpr size_t MaximumGeneratedSourceBytes = 512 * 1024;
 
@@ -68,7 +71,10 @@ public:
     }
 
     m_reachable.resize(m_kernel.expressions.size());
+    m_flat_color_reachable.resize(m_kernel.expressions.size());
     if (m_direct_contract) {
+      if (!ConfigureDirectInputLowering(error))
+        return false;
       if (!MarkDirectRoots(error))
         return false;
       m_program->uses_tfx_uniforms = true;
@@ -89,7 +95,24 @@ public:
     CollectResources();
     if (m_program->memory_inputs.size() > MaximumMemoryInputs)
       return Fail(error, "parallel Cg root exceeds GXM vertex input capacity");
+    u32 attribute_count = 0;
+    for (const CgMemoryInput &input : m_program->memory_inputs) {
+      if (!m_program->uses_flat_instance_inputs) {
+        attribute_count++;
+        continue;
+      }
+      for (u32 vertex = 0;
+           vertex < m_program->flat_vertices_per_primitive; vertex++) {
+        if ((input.flat_attribute_vertex_mask & (1u << vertex)) != 0)
+          attribute_count++;
+      }
+    }
+    if (attribute_count > MaximumVertexAttributes) {
+      return Fail(error,
+                  "parallel flat Cg root exceeds GXM attribute capacity");
+    }
 
+    AppendBindingContract();
     AppendHelpers();
     AppendEntrySignature();
     AppendExpressions(error);
@@ -107,9 +130,47 @@ public:
   }
 
 private:
-  bool MarkPacked(const PackedIntegerExpression &value, std::string *error) {
+  bool ConfigureDirectInputLowering(std::string *error) {
+    if (!m_direct_contract || m_direct_contract->gouraud ||
+        m_direct_contract->primitive == GS_POINTLIST) {
+      return true;
+    }
+
+    switch (m_direct_contract->primitive) {
+    case GS_LINELIST:
+      m_program->flat_vertices_per_primitive = 2;
+      m_program->flat_instance_vertex_step = 2;
+      break;
+    case GS_LINESTRIP:
+      m_program->flat_vertices_per_primitive = 2;
+      m_program->flat_instance_vertex_step = 1;
+      break;
+    case GS_TRIANGLELIST:
+      m_program->flat_vertices_per_primitive = 3;
+      m_program->flat_instance_vertex_step = 3;
+      break;
+    case GS_TRIANGLESTRIP:
+      m_program->flat_vertices_per_primitive = 3;
+      m_program->flat_instance_vertex_step = 1;
+      m_program->flat_strip_winding = true;
+      break;
+    default:
+      return Fail(error,
+                  "flat primitive requires a GPU export output lowering");
+    }
+    m_program->uses_flat_instance_inputs = true;
+    return true;
+  }
+
+  bool MarkPacked(const PackedIntegerExpression &value,
+                  std::vector<bool> *reachable, std::string *error) {
     return value.expression != InvalidNode &&
-           MarkReachable(value.expression, error);
+           MarkReachable(value.expression, reachable, error);
+  }
+
+  u8 FullFlatVertexMask() const {
+    return static_cast<u8>(
+        (1u << m_program->flat_vertices_per_primitive) - 1u);
   }
 
   bool MarkDirectRoots(std::string *error) {
@@ -118,46 +179,56 @@ private:
         !m_direct_contract->adc_always_clear) {
       return Fail(error, "direct TFX expression contract is incomplete");
     }
+    std::vector<bool> *const color_reachable =
+        m_program->uses_flat_instance_inputs ? &m_flat_color_reachable
+                                             : &m_reachable;
     for (const PackedIntegerExpression &color : m_direct_contract->color) {
-      if (!MarkPacked(color, error))
+      if (!MarkPacked(color, color_reachable, error))
         return false;
     }
     for (const PackedIntegerExpression &position :
          m_direct_contract->position) {
-      if (!MarkPacked(position, error))
+      if (!MarkPacked(position, &m_reachable, error))
         return false;
     }
-    if (!MarkPacked(m_direct_contract->depth, error))
+    if (!MarkPacked(m_direct_contract->depth, &m_reachable, error))
       return false;
 
     if (m_direct_contract->textured) {
       if (m_direct_contract->fixed_texture_coordinates) {
         for (const PackedIntegerExpression &uv : m_direct_contract->uv) {
-          if (!MarkPacked(uv, error))
+          if (!MarkPacked(uv, &m_reachable, error))
             return false;
         }
       } else {
-        if (!MarkReachable(m_direct_contract->st[0], error) ||
-            !MarkReachable(m_direct_contract->st[1], error) ||
-            !MarkReachable(m_direct_contract->q, error)) {
+        if (!MarkReachable(m_direct_contract->st[0], &m_reachable, error) ||
+            !MarkReachable(m_direct_contract->st[1], &m_reachable, error) ||
+            !MarkReachable(m_direct_contract->q, &m_reachable, error)) {
           return false;
         }
       }
     }
     return !m_direct_contract->fog_enabled ||
-           MarkPacked(m_direct_contract->fog, error);
+           MarkPacked(m_direct_contract->fog, &m_reachable, error);
   }
 
   bool MarkReachable(u32 node_id, std::string *error) {
+    return MarkReachable(node_id, &m_reachable, error);
+  }
+
+  bool MarkReachable(u32 node_id, std::vector<bool> *reachable,
+                     std::string *error) {
     if (node_id == InvalidNode || node_id >= m_kernel.expressions.size())
       return Fail(error, "parallel Cg root references an invalid expression");
-    if (m_reachable[node_id])
+    if ((*reachable)[node_id])
       return true;
-    m_reachable[node_id] = true;
+    (*reachable)[node_id] = true;
     const ExpressionNode &node = m_kernel.expressions[node_id];
     for (u32 operand : node.operands) {
-      if (operand != InvalidNode && !MarkReachable(operand, error))
+      if (operand != InvalidNode &&
+          !MarkReachable(operand, reachable, error)) {
         return false;
+      }
     }
     return true;
   }
@@ -165,7 +236,7 @@ private:
   void CollectResources() {
     std::map<MemoryKey, u32> memory_indices;
     for (u32 node_id = 1; node_id < m_kernel.expressions.size(); node_id++) {
-      if (!m_reachable[node_id])
+      if (!m_reachable[node_id] && !m_flat_color_reachable[node_id])
         continue;
       const ExpressionNode &node = m_kernel.expressions[node_id];
       switch (node.kind) {
@@ -178,6 +249,15 @@ private:
               {node.memory_address, it->second});
         }
         m_memory_node_input[node_id] = it->second;
+        if (m_program->uses_flat_instance_inputs) {
+          CgMemoryInput &input = m_program->memory_inputs[it->second];
+          if (m_reachable[node_id])
+            input.flat_attribute_vertex_mask |= FullFlatVertexMask();
+          if (m_flat_color_reachable[node_id]) {
+            input.flat_attribute_vertex_mask |= static_cast<u8>(
+                1u << (m_program->flat_vertices_per_primitive - 1u));
+          }
+        }
         break;
       }
       case ExpressionKind::InvariantVf:
@@ -203,12 +283,40 @@ private:
 
   bool Uses(ExpressionKind kind) const {
     for (u32 node_id = 1; node_id < m_kernel.expressions.size(); node_id++) {
-      if (m_reachable[node_id] &&
+      if ((m_reachable[node_id] || m_flat_color_reachable[node_id]) &&
           m_kernel.expressions[node_id].kind == kind) {
         return true;
       }
     }
     return false;
+  }
+
+  void AppendBindingContract() {
+    // The generated GXP is patched together with its vertex stream layout.
+    // Keep every patcher-relevant value in the content-keyed source so two
+    // otherwise identical arithmetic roots cannot reuse a registration with
+    // a different affine stride or flat primitive step.
+    m_source += "// GXM binding: coefficients=";
+    for (u32 index = 0; index < m_program->memory_inputs.size(); index++) {
+      if (index != 0)
+        m_source += ",";
+      m_source += std::to_string(
+          m_program->memory_inputs[index].address.invocation_coefficient);
+    }
+    m_source += " flatVertices=";
+    m_source += std::to_string(m_program->flat_vertices_per_primitive);
+    m_source += " flatStep=";
+    m_source += std::to_string(m_program->flat_instance_vertex_step);
+    m_source += " stripWinding=";
+    m_source += m_program->flat_strip_winding ? "1\n" : "0\n";
+    m_source += "// GXM flat attribute masks=";
+    for (u32 index = 0; index < m_program->memory_inputs.size(); index++) {
+      if (index != 0)
+        m_source += ",";
+      m_source += std::to_string(
+          m_program->memory_inputs[index].flat_attribute_vertex_mask);
+    }
+    m_source += "\n";
   }
 
   void AppendHelpers() {
@@ -243,22 +351,29 @@ private:
           "}\n\n";
     }
     if (Uses(ExpressionKind::Minimum) || Uses(ExpressionKind::Maximum)) {
+      // The PSP2 Cg compiler has no unambiguous integer min/max overload.
+      // Explicit signed bit comparisons preserve the existing PS2 raw-float
+      // ordering without converting the operands through host floating point.
       m_source +=
           "float VitaVuMinimum(float left, float right)\n"
           "{\n"
           "\tconst int leftBits = floatToRawIntBits(left);\n"
           "\tconst int rightBits = floatToRawIntBits(right);\n"
           "\tconst bool bothNegative = leftBits < 0 && rightBits < 0;\n"
-          "\treturn intBitsToFloat(bothNegative ? max(leftBits, rightBits) : "
-          "min(leftBits, rightBits));\n"
+          "\tconst int orderedBits = bothNegative ? "
+          "(leftBits > rightBits ? leftBits : rightBits) : "
+          "(leftBits < rightBits ? leftBits : rightBits);\n"
+          "\treturn intBitsToFloat(orderedBits);\n"
           "}\n\n"
           "float VitaVuMaximum(float left, float right)\n"
           "{\n"
           "\tconst int leftBits = floatToRawIntBits(left);\n"
           "\tconst int rightBits = floatToRawIntBits(right);\n"
           "\tconst bool bothNegative = leftBits < 0 && rightBits < 0;\n"
-          "\treturn intBitsToFloat(bothNegative ? min(leftBits, rightBits) : "
-          "max(leftBits, rightBits));\n"
+          "\tconst int orderedBits = bothNegative ? "
+          "(leftBits < rightBits ? leftBits : rightBits) : "
+          "(leftBits > rightBits ? leftBits : rightBits);\n"
+          "\treturn intBitsToFloat(orderedBits);\n"
           "}\n\n";
     }
     if (Uses(ExpressionKind::FloatToInt)) {
@@ -284,10 +399,31 @@ private:
 
   void AppendEntrySignature() {
     m_source += "void main(\n";
-    for (const CgMemoryInput &input : m_program->memory_inputs) {
-      AppendParameter("__regformat int4 VuMemory" +
-                      std::to_string(input.attribute_index) + " : TEXCOORD" +
-                      std::to_string(input.attribute_index));
+    u32 attribute_semantic = 0;
+    if (m_program->uses_flat_instance_inputs) {
+      for (const CgMemoryInput &input : m_program->memory_inputs) {
+        for (u32 vertex = 0;
+             vertex < m_program->flat_vertices_per_primitive; vertex++) {
+          if ((input.flat_attribute_vertex_mask & (1u << vertex)) == 0)
+            continue;
+          AppendParameter("__regformat int4 VuMemory" +
+                          std::to_string(input.attribute_index) + "Vertex" +
+                          std::to_string(vertex) + " : TEXCOORD" +
+                          std::to_string(attribute_semantic++));
+        }
+      }
+      // PSP2 Shader Compiler User's Guide: INDEX and INSTANCE are special
+      // vertex inputs allocated after ordinary parameters. They do not
+      // consume a SceGxmVertexAttribute or an additional stream.
+      AppendParameter("unsigned int VuLane : INDEX");
+      if (m_program->flat_strip_winding)
+        AppendParameter("unsigned int VuPrimitive : INSTANCE");
+    } else {
+      for (const CgMemoryInput &input : m_program->memory_inputs) {
+        AppendParameter("__regformat int4 VuMemory" +
+                        std::to_string(input.attribute_index) + " : TEXCOORD" +
+                        std::to_string(attribute_semantic++));
+      }
     }
     for (u32 reg = 1; reg < 32; reg++) {
       if ((m_program->vf_uniform_mask & (1u << reg)) != 0) {
@@ -322,10 +458,44 @@ private:
       }
     }
     m_source += ")\n{\n";
+    if (m_program->uses_flat_instance_inputs) {
+      m_source += "\tconst int VuInputLane = int(VuLane);\n";
+      if (m_program->flat_strip_winding) {
+        m_source +=
+            "\tconst bool VuSwapStripLane = ((VuPrimitive & 1u) != 0u) "
+            "&& VuInputLane < 2;\n"
+            "\tconst int VuSelectedLane = VuSwapStripLane ? "
+            "(1 - VuInputLane) : VuInputLane;\n";
+      } else {
+        m_source += "\tconst int VuSelectedLane = VuInputLane;\n";
+      }
+      for (const CgMemoryInput &input : m_program->memory_inputs) {
+        if (input.flat_attribute_vertex_mask != FullFlatVertexMask())
+          continue;
+        m_source += "\tint4 VuMemory";
+        m_source += std::to_string(input.attribute_index);
+        m_source += " = VuSelectedLane == 0 ? VuMemory";
+        m_source += std::to_string(input.attribute_index);
+        m_source += "Vertex0 : ";
+        if (m_program->flat_vertices_per_primitive == 3) {
+          m_source += "(VuSelectedLane == 1 ? VuMemory";
+          m_source += std::to_string(input.attribute_index);
+          m_source += "Vertex1 : VuMemory";
+          m_source += std::to_string(input.attribute_index);
+          m_source += "Vertex2)";
+        } else {
+          m_source += "VuMemory";
+          m_source += std::to_string(input.attribute_index);
+          m_source += "Vertex1";
+        }
+        m_source += ";\n";
+      }
+    }
   }
 
-  std::string Value(u32 node_id) const {
-    return "VuValue" + std::to_string(node_id);
+  std::string Value(u32 node_id, bool flat_color = false) const {
+    return flat_color ? "VuFlatValue" + std::to_string(node_id)
+                      : "VuValue" + std::to_string(node_id);
   }
 
   std::string FloatFromBits(std::string bits) const {
@@ -371,10 +541,11 @@ private:
     }
   }
 
-  std::string NodeExpression(u32 node_id, std::string *error) const {
+  std::string NodeExpression(u32 node_id, bool flat_color,
+                             std::string *error) const {
     const ExpressionNode &node = m_kernel.expressions[node_id];
-    const auto operand = [this, &node](u32 index) {
-      return Value(node.operands[index]);
+    const auto operand = [this, &node, flat_color](u32 index) {
+      return Value(node.operands[index], flat_color);
     };
     switch (node.kind) {
     case ExpressionKind::ConstantFloat:
@@ -405,8 +576,14 @@ private:
         Fail(error, "parallel Cg memory expression has no input binding");
         return {};
       }
-      const std::string raw = "VuMemory" + std::to_string(it->second) + "." +
-                              LaneName(node.lane);
+      const std::string raw =
+          "VuMemory" + std::to_string(it->second) +
+          (flat_color
+               ? "Vertex" +
+                     std::to_string(
+                         m_program->flat_vertices_per_primitive - 1u)
+               : std::string()) +
+          "." + LaneName(node.lane);
       if (node.domain == ScalarDomain::Float)
         return FloatFromBits(raw);
       if (node.domain == ScalarDomain::UnsignedInt)
@@ -449,21 +626,30 @@ private:
   }
 
   void AppendExpressions(std::string *error) {
-    for (u32 node_id = 1; node_id < m_kernel.expressions.size(); node_id++) {
-      if (!m_reachable[node_id])
-        continue;
-      const std::string expression = NodeExpression(node_id, error);
-      if (error && !error->empty())
-        return;
-      m_source += "\t";
-      m_source += ScalarType(m_kernel.expressions[node_id].domain);
-      m_source += " ";
-      m_source += Value(node_id);
-      m_source += " = ";
-      m_source += expression;
-      m_source += ";\n";
-      m_program->emitted_expression_count++;
-    }
+    const auto append_set =
+        [this, error](const std::vector<bool> &reachable, bool flat_color) {
+          for (u32 node_id = 1; node_id < m_kernel.expressions.size();
+               node_id++) {
+            if (!reachable[node_id])
+              continue;
+            const std::string expression =
+                NodeExpression(node_id, flat_color, error);
+            if (error && !error->empty())
+              return false;
+            m_source += "\t";
+            m_source += ScalarType(m_kernel.expressions[node_id].domain);
+            m_source += " ";
+            m_source += Value(node_id, flat_color);
+            m_source += " = ";
+            m_source += expression;
+            m_source += ";\n";
+            m_program->emitted_expression_count++;
+          }
+          return true;
+        };
+    if (!append_set(m_reachable, false))
+      return;
+    append_set(m_flat_color_reachable, true);
   }
 
   std::string OutputValue(u32 node_id) const {
@@ -480,8 +666,9 @@ private:
                : FloatFromBits(value);
   }
 
-  std::string PackedValue(const PackedIntegerExpression &field) const {
-    std::string value = Value(field.expression);
+  std::string PackedValue(const PackedIntegerExpression &field,
+                          bool flat_color = false) const {
+    std::string value = Value(field.expression, flat_color);
     if (m_kernel.expressions[field.expression].domain == ScalarDomain::Float)
       value = RawFromFloat(std::move(value));
     if (field.right_shift != 0) {
@@ -521,6 +708,7 @@ private:
     const std::string fog =
         contract.fog_enabled ? "(" + PackedValue(contract.fog) + " / 255.0f)"
                              : "0.0f";
+    const bool flat_color = m_program->uses_flat_instance_inputs;
 
     m_source +=
         "\tconst float2 vertexScale = VertexScaleOffset[0].xy;\n"
@@ -545,10 +733,11 @@ private:
         fog + ", " + q + ");\n"
         "\tvTexInt.xy = uv * textureScale;\n"
         "\tvTexInt.zw = uv;\n"
-        "\tvColor = float4(" + PackedValue(contract.color[0]) + ", " +
-        PackedValue(contract.color[1]) + ", " +
-        PackedValue(contract.color[2]) + ", " +
-        PackedValue(contract.color[3]) + ");\n";
+        "\tvColor = float4(" +
+        PackedValue(contract.color[0], flat_color) + ", " +
+        PackedValue(contract.color[1], flat_color) + ", " +
+        PackedValue(contract.color[2], flat_color) + ", " +
+        PackedValue(contract.color[3], flat_color) + ");\n";
   }
 
   void AppendOutputs() {
@@ -579,6 +768,7 @@ private:
   const DirectTfxContract *m_direct_contract;
   GeneratedCgProgram *m_program;
   std::vector<bool> m_reachable;
+  std::vector<bool> m_flat_color_reachable;
   std::map<u32, u32> m_memory_node_input;
   std::string m_source;
   bool m_first_parameter = true;
