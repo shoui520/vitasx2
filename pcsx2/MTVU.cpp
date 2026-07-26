@@ -10,6 +10,7 @@
 #include "vita/VitaVuBlockCompiler.h"
 
 #include <thread>
+#include <utility>
 
 VU_Thread vu1Thread;
 
@@ -29,6 +30,8 @@ enum MTVU_EVENT
 	MTVU_VIF_WRITE_COL,  // Write to Vif col reg
 	MTVU_VIF_WRITE_ROW,  // Write to Vif row reg
 	MTVU_VIF_UNPACK,     // Execute Vif Unpack
+	MTVU_VIF_UNPACK_CAPTURED, // Immutable raw VIF payload, deferred to Execute
+	MTVU_FLUSH_VIF_UNPACKS,   // Materialize before an external observer
 	MTVU_NULL_PACKET,    // Go back to beginning of buffer
 	MTVU_RESET
 };
@@ -147,13 +150,16 @@ void VU_Thread::Close()
 	if (!IsOpen())
 		return;
 
+	WaitVU();
 	m_shutdown_flag.store(true, std::memory_order_release);
 	semaEvent.NotifyOfWork();
 	m_thread.Join();
+	ReleaseDeferredVifUnpacks();
 }
 
 void VU_Thread::Reset()
 {
+	ReleaseDeferredVifUnpacks();
 	m_program_active = false;
 	m_dt_program_end = false;
 	m_pending_program_interrupts = 0;
@@ -167,6 +173,7 @@ void VU_Thread::Reset()
 	m_micro_write_pending = false;
 	m_micro_invalidate_start = 0;
 	m_micro_invalidate_end = 0;
+	m_vif_span_sequence = 0;
 	vuCycleIdx = 0;
 	m_ato_write_pos = 0;
 	m_write_pos = 0;
@@ -225,6 +232,7 @@ void VU_Thread::ExecuteRingBuffer()
 			{
 				case MTVU_VU_EXECUTE:
 				{
+					ReplayDeferredVifUnpacks();
 					VU1.cycle = 0;
 					s32 addr = Read();
 					vifRegs.top = Read();
@@ -250,6 +258,7 @@ void VU_Thread::ExecuteRingBuffer()
 				}
 				case MTVU_VU_WRITE_DATA:
 				{
+					ReplayDeferredVifUnpacks();
 					u32 vu_data_addr = Read();
 					u32 size = Read();
 					Read(&VU1.Mem[vu_data_addr], size);
@@ -269,6 +278,7 @@ void VU_Thread::ExecuteRingBuffer()
 					break;
 				case MTVU_VIF_UNPACK:
 				{
+					ReplayDeferredVifUnpacks();
 					u32 vif_copy_size = static_cast<u32>((uptr)&vif.StructEnd - (uptr)&vif.tag);
 					Read(&vif.tag, vif_copy_size);
 					ReadRegs(&vifRegs);
@@ -277,6 +287,27 @@ void VU_Thread::ExecuteRingBuffer()
 					m_read_pos += size_u32(size);
 					break;
 				}
+				case MTVU_VIF_UNPACK_CAPTURED:
+				{
+					VitaGpuVu::VifUnpackSpan span;
+					Read(&span, sizeof(span));
+					if (!VitaGpuVu::ResolveRawVifPayload(span.payload))
+					{
+						Console.Error(
+							"GPU-VU: immutable VIF payload became invalid before MTVU consumed it.");
+						VitaGpuVu::ReleaseRawVifPayload(&span.payload);
+						break;
+					}
+					m_deferred_vif_unpacks.push_back(std::move(span));
+					m_deferred_vif_unpack_count.store(
+						static_cast<u32>(m_deferred_vif_unpacks.size()),
+						std::memory_order_release);
+					VitaGpuVu::RecordDeferredVifUnpack();
+					break;
+				}
+				case MTVU_FLUSH_VIF_UNPACKS:
+					ReplayDeferredVifUnpacks();
+					break;
 				case MTVU_NULL_PACKET:
 					m_read_pos = 0;
 					break;
@@ -535,7 +566,14 @@ void VU_Thread::KickStart()
 
 bool VU_Thread::IsDone()
 {
-	return GetReadPos() == GetWritePos();
+	return GetReadPos() == GetWritePos() &&
+		m_deferred_vif_unpack_count.load(std::memory_order_acquire) == 0;
+}
+
+void VU_Thread::WaitForQueue()
+{
+	KickStart();
+	semaEvent.WaitForEmpty();
 }
 
 void VU_Thread::WaitVU()
@@ -543,7 +581,62 @@ void VU_Thread::WaitVU()
 	MTVU_LOG("MTVU - WaitVU!");
 	if (VitaPerformanceTelemetry::IsEnabled())
 		m_profile_wait_calls++;
-	semaEvent.WaitForEmpty();
+	if (!IsOpen())
+		return;
+
+	// Public waits are architectural observation boundaries. Queue one ordered
+	// materialization command even when the worker has not yet consumed the
+	// preceding capture event; checking only the current pending count would
+	// race that handoff.
+	ReserveSpace(1);
+	Write(MTVU_FLUSH_VIF_UNPACKS);
+	CommitWritePos();
+	WaitForQueue();
+}
+
+void VU_Thread::ReplayDeferredVifUnpacks()
+{
+	for (VitaGpuVu::VifUnpackSpan& span : m_deferred_vif_unpacks)
+	{
+		const u8* const source =
+			VitaGpuVu::ResolveRawVifPayload(span.payload);
+		if (!source)
+		{
+			Console.Error(
+				"GPU-VU: deferred VIF payload was unavailable at its observation boundary.");
+			VitaGpuVu::ReleaseRawVifPayload(&span.payload);
+			continue;
+		}
+
+		vif.tag.addr = static_cast<u32>(span.destination_qword) * 16u;
+		vif.tag.size = span.tag_size_words;
+		vif.tag.cmd = span.command;
+		vif.cmd = span.command;
+		vif.pass = 1;
+		vif.cl = 0;
+		vif.usn = span.unsigned_data;
+		vif.start_aligned = span.start_alignment;
+		vifRegs.cycle.cl = span.cycle_cl;
+		vifRegs.cycle.wl = span.cycle_wl;
+		vifRegs.mode = span.mode;
+		vifRegs.num = span.vector_count;
+		vifRegs.mask = span.mask;
+		vifRegs.top = span.vif_top;
+		vifRegs.itop = span.vif_itop;
+		MTVU_Unpack(const_cast<u8*>(source), vifRegs);
+		VitaGpuVu::RecordReplayedVifUnpack();
+		VitaGpuVu::ReleaseRawVifPayload(&span.payload);
+	}
+	m_deferred_vif_unpacks.clear();
+	m_deferred_vif_unpack_count.store(0, std::memory_order_release);
+}
+
+void VU_Thread::ReleaseDeferredVifUnpacks()
+{
+	for (VitaGpuVu::VifUnpackSpan& span : m_deferred_vif_unpacks)
+		VitaGpuVu::ReleaseRawVifPayload(&span.payload);
+	m_deferred_vif_unpacks.clear();
+	m_deferred_vif_unpack_count.store(0, std::memory_order_release);
 }
 
 void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
@@ -578,6 +671,32 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* data, u32 size)
 {
 	MTVU_LOG("MTVU - VifUnpack!");
+	VitaGpuVu::VifUnpackSpan span;
+	span.sequence = ++m_vif_span_sequence;
+	span.source_size = size;
+	span.tag_size_words = _vif.tag.size;
+	span.mask = _vifRegs.mask;
+	span.destination_qword = static_cast<u16>(_vif.tag.addr >> 4);
+	span.vector_count = static_cast<u16>(_vifRegs.num);
+	span.vif_top = static_cast<u16>(_vifRegs.top);
+	span.vif_itop = static_cast<u16>(_vifRegs.itop);
+	span.command = static_cast<u8>(_vif.tag.cmd);
+	span.cycle_cl = _vifRegs.cycle.cl;
+	span.cycle_wl = _vifRegs.cycle.wl;
+	span.mode = static_cast<u8>(_vifRegs.mode);
+	span.unsigned_data = _vif.usn;
+	span.start_alignment = _vif.start_aligned;
+	if (VitaGpuVu::IsDirectAffineV4_32Span(span) &&
+		VitaGpuVu::CaptureRawVifPayload(data, size, &span.payload))
+	{
+		ReserveSpace(1 + size_u32(sizeof(span)));
+		Write(MTVU_VIF_UNPACK_CAPTURED);
+		Write(&span, sizeof(span));
+		CommitWritePos();
+		KickStart();
+		return;
+	}
+
 	u32 vif_copy_size = (u32)((uptr)&_vif.StructEnd - (uptr)&_vif.tag);
 	ReserveSpace(1 + size_u32(vif_copy_size) + size_u32(sizeof(VIFregistersMTVU)) + 1 + size_u32(size));
 	Write(MTVU_VIF_UNPACK);
@@ -625,7 +744,7 @@ void VU_Thread::PrepareVuCodeForExecute(s32 vu_addr)
 	// PCSX2 x86 MTVU worker may compile at first use, but doing so on Vita races
 	// CPU0's executable EE cache. Drain pending micro writes, invalidate and
 	// compile on the EE-side C++ seam, then publish only executable code to CPU1.
-	WaitVU();
+	WaitForQueue();
 	if (VitaPerformanceTelemetry::IsEnabled())
 		m_profile_compile_barriers++;
 	if (m_micro_write_pending)

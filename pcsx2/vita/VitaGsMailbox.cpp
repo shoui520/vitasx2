@@ -26,6 +26,7 @@
 #endif
 #include "vita/VitaGsMailbox.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaGpuVuVifInput.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 #if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
@@ -374,6 +375,7 @@ namespace MTGS
 		GsProducerPerformanceTotals gs_producer;
 		GsWorkerPerformanceTotals gs_worker;
 		VitaGxmPerformanceCounters gxm;
+		VitaGpuVu::InputRingStatistics gpu_vu_input;
 	};
 
 	struct CorrelatedPerformanceProfile
@@ -430,6 +432,7 @@ namespace MTGS
 		snapshot.gs_worker = GetPublishedGsWorkerPerformance();
 		snapshot.completed_vsyncs = snapshot.gs_worker.completed_vsyncs;
 		snapshot.gxm = VitaGxmGetPublishedPerformanceCounters();
+		snapshot.gpu_vu_input = VitaGpuVu::GetInputRingStatistics();
 		return snapshot;
 	}
 
@@ -1093,6 +1096,40 @@ namespace MTGS
 				start.mtvu.ring_wait_spins)),
 			static_cast<unsigned long long>(CounterDelta(end.mtvu.compile_barriers,
 				start.mtvu.compile_barriers)));
+		output.WriteLn(
+			"Vita perf v=1 window=%llu kind=gpu_vu_input captures=%llu bytes=%llu "
+			"fallbacks=%llu slot_reuses=%llu ring_waits=%llu ring_spins=%llu "
+			"deferred=%llu replayed=%llu live_start=%llu live_end=%llu peak_live=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.captures, start.gpu_vu_input.captures)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.captured_bytes,
+				start.gpu_vu_input.captured_bytes)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.capture_fallbacks,
+				start.gpu_vu_input.capture_fallbacks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.slot_reuses,
+				start.gpu_vu_input.slot_reuses)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.ring_waits,
+				start.gpu_vu_input.ring_waits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.ring_wait_spins,
+				start.gpu_vu_input.ring_wait_spins)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.deferred_unpacks,
+				start.gpu_vu_input.deferred_unpacks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.replayed_unpacks,
+				start.gpu_vu_input.replayed_unpacks)),
+			static_cast<unsigned long long>(
+				start.gpu_vu_input.live_references),
+			static_cast<unsigned long long>(
+				end.gpu_vu_input.live_references),
+			static_cast<unsigned long long>(
+				end.gpu_vu_input.peak_live_references));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gs submitted=%llu submitted_words=%llu "
 			"processed=%llu packets=%llu packet_bytes=%llu mtvu_packets=%llu "

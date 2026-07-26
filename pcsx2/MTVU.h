@@ -6,8 +6,10 @@
 #include "Vif.h"
 #include "Vif_Dma.h"
 #include "VUmicro.h"
+#include "vita/VitaGpuVuVifInput.h"
 
 #include <thread>
+#include <vector>
 
 #define MTVU_LOG(...) do{} while(0)
 //#define MTVU_LOG DevCon.WriteLn
@@ -46,6 +48,9 @@ class VU_Thread final {
 	bool m_micro_write_pending = false;
 	u32 m_micro_invalidate_start = 0;
 	u32 m_micro_invalidate_end = 0;
+	std::vector<VitaGpuVu::VifUnpackSpan> m_deferred_vif_unpacks;
+	std::atomic<u32> m_deferred_vif_unpack_count{0};
+	u64 m_vif_span_sequence = 0;
 
 	Threading::Thread m_thread;
 
@@ -163,6 +168,9 @@ private:
 
 	u32 Get_vuCycles();
 	void PrepareVuCodeForExecute(s32 vu_addr);
+	void WaitForQueue();
+	void ReplayDeferredVifUnpacks();
+	void ReleaseDeferredVifUnpacks();
 };
 
 extern VU_Thread vu1Thread;

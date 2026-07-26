@@ -9,6 +9,7 @@
 #include "GS/Renderers/Common/GSVertex.h"
 #include "common/Console.h"
 #include "vita/VitaGpuVuShaderCompiler.h"
+#include "vita/VitaGpuVuVifInput.h"
 #include "vita/VitaGxmArena.h"
 #include "vita/VitaGxmDisplay.h"
 #include "vita/VitaGxmMemory.h"
@@ -1075,6 +1076,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	VitaGXM::Arena transfer_arena;
 	VitaGXM::Display display;
 	VitaGpuVu::ShaderCompiler gpu_vu_shader_compiler;
+	VitaGpuVu::InputRing gpu_vu_input_ring;
 
 	std::vector<RenderTargetEntry> render_targets;
 	SceGxmRenderTarget* display_render_target = nullptr;
@@ -1555,6 +1557,11 @@ bool GSDeviceGXM::Impl::Initialize()
 		return Fail("create fallback white texture",
 			texture_error < 0 ? texture_error : SCE_GXM_ERROR_INVALID_VALUE);
 	}
+	// Base-renderer allocations are mandatory. The optional raw-input ring is
+	// deliberately last so a constrained Vita falls back to inline MTVU
+	// payloads instead of starving the renderer during startup.
+	if (!gpu_vu_input_ring.Initialize())
+		Console.Warning("GPU-VU: immutable VIF input ring is unavailable.");
 	ready = true;
 	Console.WriteLn("GXM GS: direct GSRendererHW backend ready (960x544 display).");
 	return true;
@@ -4488,6 +4495,8 @@ void GSDeviceGXM::Impl::Shutdown()
 		completed_scene_serial = scene_serial;
 		completed_transfer_serial = transfer_serial;
 	}
+	if (!gpu_vu_input_ring.Shutdown())
+		return;
 	if (!succeeded("sceGxmDisplayQueueFinish(shutdown)", display.Finish()) ||
 		!succeeded("GXM display destroy", display.Destroy()))
 	{
