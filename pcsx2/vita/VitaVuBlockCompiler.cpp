@@ -1602,6 +1602,49 @@ namespace VitaVU
 			return true;
 		}
 
+		void ExportGpuPairPlan(const PairPlan& source, GpuPairPlan* output)
+		{
+			*output = {};
+			output->pc = source.pc;
+			output->upper = source.upper;
+			output->lower = source.lower;
+			output->upper_vi_read = source.uregs.VIread;
+			output->upper_vi_write = source.uregs.VIwrite;
+			output->lower_vi_read = source.lregs.VIread;
+			output->lower_vi_write = source.lregs.VIwrite;
+			output->upper_cycles = source.uregs.cycles;
+			output->lower_cycles = source.lregs.cycles;
+			output->upper_kind = source.upper_kind;
+			output->lower_kind = source.lower_kind;
+			output->upper_vf_write = source.uregs.VFwrite;
+			output->upper_vf_write_mask = source.uregs.VFwxyzw;
+			output->upper_vf_read0 = source.uregs.VFread0;
+			output->upper_vf_read0_mask = source.uregs.VFr0xyzw;
+			output->upper_vf_read1 = source.uregs.VFread1;
+			output->upper_vf_read1_mask = source.uregs.VFr1xyzw;
+			output->lower_vf_write = source.lregs.VFwrite;
+			output->lower_vf_write_mask = source.lregs.VFwxyzw;
+			output->lower_vf_read0 = source.lregs.VFread0;
+			output->lower_vf_read0_mask = source.lregs.VFr0xyzw;
+			output->lower_vf_read1 = source.lregs.VFread1;
+			output->lower_vf_read1_mask = source.lregs.VFr1xyzw;
+			output->vf_snapshot_reg = source.vf_backup_reg;
+			output->exec_upper = source.exec_upper;
+			output->exec_lower = source.exec_lower;
+			output->immediate_lower = source.shape == PairShape::IBit;
+			output->ebit = source.ebit;
+			output->mflag = source.mflag;
+			output->dflag = source.dflag;
+			output->tflag = source.tflag;
+			output->clip_snapshot = source.vi_clip_backup;
+			output->lower_discarded_by_upper = source.discard_lower;
+			output->status_result_demanded =
+				source.status_flag_result_required;
+			output->mac_result_demanded = source.mac_flag_result_required;
+			output->instant_qp_producer = source.instant_qp_producer;
+			output->instant_qp_wait = source.instant_qp_wait;
+		}
+
 		u8 ProbeMvuFlagReaders(const u8* micro, u32 vu_index, u32 prog_size,
 			u32 prog_mask, u32 pc, u32 remaining_pairs)
 		{
@@ -15459,6 +15502,18 @@ namespace VitaVU
 				return LookupVu1DirectLinkBlockCommon(vu, runtime_link, true, true, true);
 			}
 	} // anonymous namespace
+
+	bool AnalyzeGpuVu1Pair(u32 pc, u32 upper, u32 lower, GpuPairPlan* plan)
+	{
+		if (!plan)
+			return false;
+
+		PairPlan internal{};
+		if (!AnalyzePair(1, pc & VU1_PROGMASK, upper, lower, &internal))
+			return false;
+		ExportGpuPairPlan(internal, plan);
+		return true;
+	}
 
 	bool Vu1ProgramNeedsPreparation(s32 vu_addr)
 	{

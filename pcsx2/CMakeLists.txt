@@ -175,6 +175,7 @@ add_library(pcsx2core STATIC
 	vita/VitaDisabledDevices.cpp
 	vita/VitaEeBlockCompiler.cpp
 	vita/VitaEeExecutor.cpp
+	vita/VitaGpuVuShaderCompiler.cpp
 	vita/VitaIopBlockCompiler.cpp
 	vita/GSDeviceGXM.cpp
 	vita/VitaGxmArena.cpp
@@ -263,6 +264,11 @@ target_link_libraries(pcsx2core PUBLIC
 	SceAudio_stub
 	SceDisplay_stub
 	SceGxm_stub
+	SceKernelModulemgr_stub
+	SceShaccCg_stub
+	SceShaccCgExt
+	SceSysmodule_stub
+	taihen_stub
 )
 
 # Sony's api_libgxm/basic sample owns the shader pipeline used here: compile

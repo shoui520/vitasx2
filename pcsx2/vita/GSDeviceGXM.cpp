@@ -8,6 +8,7 @@
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSVertex.h"
 #include "common/Console.h"
+#include "vita/VitaGpuVuShaderCompiler.h"
 #include "vita/VitaGxmArena.h"
 #include "vita/VitaGxmDisplay.h"
 #include "vita/VitaGxmMemory.h"
@@ -1073,6 +1074,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	VitaGXM::Arena texture_arena;
 	VitaGXM::Arena transfer_arena;
 	VitaGXM::Display display;
+	VitaGpuVu::ShaderCompiler gpu_vu_shader_compiler;
 
 	std::vector<RenderTargetEntry> render_targets;
 	SceGxmRenderTarget* display_render_target = nullptr;
@@ -1517,6 +1519,8 @@ bool GSDeviceGXM::Impl::Initialize()
 	if (result < 0)
 		return Fail("sceGxmInitialize", result);
 	gxm_initialized = true;
+	if (!gpu_vu_shader_compiler.Start())
+		Console.Warning("GPU-VU: asynchronous compiler service did not start.");
 
 	result = texture_arena.Initialize(VitaGXM::ArenaMemory::Cdram,
 		"VitaSX2 GXM textures", 4 * 1024 * 1024, SCE_GXM_MEMORY_ATTRIB_RW);
@@ -4468,6 +4472,7 @@ void GSDeviceGXM::Impl::Shutdown()
 {
 	ready = false;
 	present_active = false;
+	gpu_vu_shader_compiler.Stop();
 	const auto succeeded = [this](const char* operation, int result) {
 		return result >= 0 ? true : Fail(operation, result);
 	};

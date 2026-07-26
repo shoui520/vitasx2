@@ -17,6 +17,55 @@
 // unsupported pairs.
 namespace VitaVU
 {
+	// Host-neutral pair semantics exported to the Vita GPU compiler. The A32
+	// block compiler remains the owner of opcode analysis: this is a compact
+	// immutable view of its PairPlan, not a second VU decoder.
+	struct GpuPairPlan
+	{
+		u32 pc = 0;
+		u32 upper = 0;
+		u32 lower = 0;
+		u32 upper_vi_read = 0;
+		u32 upper_vi_write = 0;
+		u32 lower_vi_read = 0;
+		u32 lower_vi_write = 0;
+		s32 upper_cycles = 0;
+		s32 lower_cycles = 0;
+		u8 upper_kind = 0;
+		u8 lower_kind = 0;
+		u8 upper_vf_write = 0;
+		u8 upper_vf_write_mask = 0;
+		u8 upper_vf_read0 = 0;
+		u8 upper_vf_read0_mask = 0;
+		u8 upper_vf_read1 = 0;
+		u8 upper_vf_read1_mask = 0;
+		u8 lower_vf_write = 0;
+		u8 lower_vf_write_mask = 0;
+		u8 lower_vf_read0 = 0;
+		u8 lower_vf_read0_mask = 0;
+		u8 lower_vf_read1 = 0;
+		u8 lower_vf_read1_mask = 0;
+		u8 vf_snapshot_reg = 0;
+		bool exec_upper = false;
+		bool exec_lower = false;
+		bool immediate_lower = false;
+		bool ebit = false;
+		bool mflag = false;
+		bool dflag = false;
+		bool tflag = false;
+		bool clip_snapshot = false;
+		bool lower_discarded_by_upper = false;
+		bool status_result_demanded = true;
+		bool mac_result_demanded = true;
+		bool instant_qp_producer = false;
+		bool instant_qp_wait = false;
+	};
+
+	// Analyze one VU1 pair through the same PairPlan mechanism used by the
+	// Maximum Cortex-A9 compiler. Returns false only when that owning mechanism
+	// cannot decode the pair.
+	bool AnalyzeGpuVu1Pair(u32 pc, u32 upper, u32 lower, GpuPairPlan* plan);
+
 	struct Vu1ProviderStats
 	{
 		u64 executed_blocks = 0;
