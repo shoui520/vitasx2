@@ -182,6 +182,7 @@ add_library(pcsx2core STATIC
 	vita/VitaGpuVuCgGenerator.cpp
 	vita/VitaGpuVuGifContract.cpp
 	vita/VitaGpuVuShaderCompiler.cpp
+	vita/VitaGpuVuProgramRegistry.cpp
 	vita/VitaIopBlockCompiler.cpp
 	vita/GSDeviceGXM.cpp
 	vita/VitaGxmArena.cpp

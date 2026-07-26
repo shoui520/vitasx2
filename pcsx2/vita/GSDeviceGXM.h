@@ -164,6 +164,10 @@ public:
 	void RenderHW(GSHWDrawConfig& config) override;
 	void ClearSamplerCache() override;
 
+	// GS-worker-only. Drains asynchronous ShaccCg results and performs every
+	// libGXM registration/patcher operation on the context-owning thread.
+	void PollGpuVuPrograms();
+
 protected:
 	using GSDevice::DoStretchRect;
 

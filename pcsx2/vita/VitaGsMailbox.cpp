@@ -1675,6 +1675,14 @@ namespace MTGS
 			if (!s_open_flag.load(std::memory_order_acquire))
 				break;
 
+#if defined(__vita__)
+			// Completed ShaccCg output is registered only here, on the thread
+			// which owns the immediate context and shader patcher. Compilation
+			// itself never blocks this worker.
+			if (g_gs_device)
+				static_cast<GSDeviceGXM*>(g_gs_device.get())->PollGpuVuPrograms();
+#endif
+
 			while (s_read_pos.load(std::memory_order_relaxed) !=
 				s_write_pos.load(std::memory_order_acquire))
 			{

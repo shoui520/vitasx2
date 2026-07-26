@@ -8,6 +8,7 @@
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSVertex.h"
 #include "common/Console.h"
+#include "vita/VitaGpuVuProgramRegistry.h"
 #include "vita/VitaGpuVuShaderCompiler.h"
 #include "vita/VitaGpuVuVifInput.h"
 #include "vita/VitaGxmArena.h"
@@ -28,6 +29,7 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -1021,6 +1023,15 @@ static void RecordGxmDraw(u64 vertices, size_t vertex_stride, u64 indices)
 
 struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 {
+	struct GeneratedVuProgram
+	{
+		VitaGpuVu::ShaderKey key;
+		VitaGpuVu::GeneratedCgProgram metadata;
+		std::vector<u8> gxp;
+		SceGxmShaderPatcherId id = nullptr;
+		SceGxmVertexProgram* vertex_program = nullptr;
+	};
+
 	struct RenderTargetEntry
 	{
 		u32 width = 0;
@@ -1173,6 +1184,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	std::map<u64, SceGxmFragmentProgram*> tfx_source_direct_modulate_programs;
 	std::map<u64, SceGxmFragmentProgram*> tfx_source_direct_modulate_af_programs;
 	std::map<u64, SceGxmFragmentProgram*> tfx_source_untextured_programs;
+	std::map<std::pair<u64, u64>, GeneratedVuProgram> generated_vu_programs;
 	bool tfx_patched_program_limit_logged = false;
 	bool tfx_zfloor_source_direct_decal_af_logged = false;
 	bool tfx_psm16_logged = false;
@@ -1189,6 +1201,9 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool CreateContext();
 	bool CreatePatcher();
 	bool CreatePrograms();
+	bool RegisterGeneratedVuProgram(VitaGpuVu::CompileResult result,
+		VitaGpuVu::GeneratedCgProgram metadata);
+	void PollGeneratedVuPrograms();
 	bool CreateGeometry();
 	bool CreateRenderTarget(u32 width, u32 height, u16 scenes_per_frame,
 		SceGxmRenderTarget** target, bool required = true);
@@ -1523,6 +1538,13 @@ bool GSDeviceGXM::Impl::Initialize()
 	gxm_initialized = true;
 	if (!gpu_vu_shader_compiler.Start())
 		Console.Warning("GPU-VU: asynchronous compiler service did not start.");
+	else if (!VitaGpuVu::AttachGeneratedProgramCompiler(
+		&gpu_vu_shader_compiler))
+	{
+		Console.Warning(
+			"GPU-VU: generated-program registry already has another compiler owner.");
+		gpu_vu_shader_compiler.Stop();
+	}
 
 	result = texture_arena.Initialize(VitaGXM::ArenaMemory::Cdram,
 		"VitaSX2 GXM textures", 4 * 1024 * 1024, SCE_GXM_MEMORY_ATTRIB_RW);
@@ -2105,6 +2127,182 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		&mask_update_program);
 	return (result >= 0 && mask_update_program) ? true :
 		Fail("create mask-update fragment program", result);
+}
+
+bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
+	VitaGpuVu::CompileResult result,
+	VitaGpuVu::GeneratedCgProgram metadata)
+{
+	const std::pair<u64, u64> map_key(result.key.high, result.key.low);
+	if (generated_vu_programs.find(map_key) != generated_vu_programs.end())
+	{
+		VitaGpuVu::CompleteGeneratedProgramRegistration(result.key, true);
+		return true;
+	}
+
+	if (!result.succeeded || result.gxp.empty())
+	{
+		for (const VitaGpuVu::CompileDiagnostic& diagnostic : result.diagnostics)
+		{
+			Console.Error(
+				"GPU-VU: generated shader compile %u at %u:%u: %s",
+				diagnostic.code, diagnostic.line, diagnostic.column,
+				diagnostic.message.c_str());
+		}
+		Console.Error(
+			"GPU-VU: generated shader compilation failed (%016llx%016llx).",
+			static_cast<unsigned long long>(result.key.high),
+			static_cast<unsigned long long>(result.key.low));
+		VitaGpuVu::CompleteGeneratedProgramRegistration(result.key, false);
+		return false;
+	}
+
+	GeneratedVuProgram entry;
+	entry.key = result.key;
+	entry.metadata = std::move(metadata);
+	entry.metadata.source.clear();
+	entry.gxp = std::move(result.gxp);
+	auto [it, inserted] =
+		generated_vu_programs.emplace(map_key, std::move(entry));
+	if (!inserted)
+	{
+		VitaGpuVu::CompleteGeneratedProgramRegistration(result.key, true);
+		return true;
+	}
+
+	GeneratedVuProgram& stored = it->second;
+	const SceGxmProgram* const program =
+		reinterpret_cast<const SceGxmProgram*>(stored.gxp.data());
+	const auto fail_registration = [this, &stored, &it, &result](
+		const char* operation, int error) {
+		Fail(operation, error);
+		bool may_erase = true;
+		if (stored.vertex_program)
+		{
+			if (sceGxmShaderPatcherReleaseVertexProgram(
+				patcher, stored.vertex_program) >= 0)
+			{
+				stored.vertex_program = nullptr;
+			}
+			else
+			{
+				may_erase = false;
+			}
+		}
+		if (stored.id)
+		{
+			if (sceGxmShaderPatcherUnregisterProgram(patcher, stored.id) >= 0)
+				stored.id = nullptr;
+			else
+				may_erase = false;
+		}
+		VitaGpuVu::CompleteGeneratedProgramRegistration(result.key, false);
+		if (may_erase)
+			generated_vu_programs.erase(it);
+		return false;
+	};
+
+	int check_result = sceGxmProgramCheck(program);
+	if (check_result < 0)
+	{
+		return fail_registration("check generated VU1+TFX vertex program",
+			check_result);
+	}
+	if (stored.metadata.memory_inputs.size() > 16)
+	{
+		return fail_registration("bind generated VU1+TFX vertex inputs",
+			SCE_GXM_ERROR_INVALID_VALUE);
+	}
+
+	std::vector<SceGxmVertexAttribute> attributes(
+		stored.metadata.memory_inputs.size());
+	std::vector<SceGxmVertexStream> streams(
+		stored.metadata.memory_inputs.size());
+	for (u32 index = 0; index < stored.metadata.memory_inputs.size(); index++)
+	{
+		const VitaGpuVu::CgMemoryInput& input =
+			stored.metadata.memory_inputs[index];
+		if (input.attribute_index != index ||
+			input.address.invocation_coefficient < 0)
+		{
+			return fail_registration("validate generated VU1+TFX input layout",
+				SCE_GXM_ERROR_INVALID_VALUE);
+		}
+		const u64 stride =
+			static_cast<u64>(input.address.invocation_coefficient) * 16u;
+		if (stride > std::numeric_limits<u16>::max())
+		{
+			return fail_registration("validate generated VU1+TFX input stride",
+				SCE_GXM_ERROR_INVALID_VALUE);
+		}
+
+		char parameter_name[24];
+		std::snprintf(parameter_name, sizeof(parameter_name), "VuMemory%u",
+			input.attribute_index);
+		const SceGxmProgramParameter* const parameter =
+			sceGxmProgramFindParameterByName(program, parameter_name);
+		if (!parameter ||
+			sceGxmProgramParameterGetCategory(parameter) !=
+				SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE)
+		{
+			return fail_registration("find generated VU1+TFX input",
+				SCE_GXM_ERROR_INVALID_VALUE);
+		}
+
+		SceGxmVertexAttribute& attribute = attributes[index];
+		attribute.streamIndex = static_cast<u16>(index);
+		attribute.offset = 0;
+		// Shader_Compiler-Users_Guide::Offline Vertex Unpacking: a
+		// __regformat int4 attribute is four untyped 32-bit words.
+		attribute.format = SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED;
+		attribute.componentCount = 4;
+		attribute.regIndex =
+			sceGxmProgramParameterGetResourceIndex(parameter);
+
+		SceGxmVertexStream& stream = streams[index];
+		stream.stride = static_cast<u16>(stride);
+		stream.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
+	}
+
+	int patch_result = sceGxmShaderPatcherRegisterProgram(
+		patcher, program, &stored.id);
+	if (patch_result < 0 || !stored.id)
+	{
+		return fail_registration("register generated VU1+TFX vertex program",
+			patch_result < 0 ? patch_result : SCE_GXM_ERROR_INVALID_POINTER);
+	}
+	patch_result = sceGxmShaderPatcherCreateVertexProgram(
+		patcher, stored.id,
+		attributes.empty() ? nullptr : attributes.data(), attributes.size(),
+		streams.empty() ? nullptr : streams.data(), streams.size(),
+		&stored.vertex_program);
+	if (patch_result < 0 || !stored.vertex_program)
+	{
+		return fail_registration("create generated VU1+TFX vertex program",
+			patch_result < 0 ? patch_result : SCE_GXM_ERROR_INVALID_POINTER);
+	}
+
+	VitaGpuVu::CompleteGeneratedProgramRegistration(result.key, true);
+	Console.WriteLn(
+		"GPU-VU: GS registered generated VU1+TFX program %016llx%016llx "
+		"(%u raw streams, %u expressions).",
+		static_cast<unsigned long long>(result.key.high),
+		static_cast<unsigned long long>(result.key.low),
+		static_cast<u32>(stored.metadata.memory_inputs.size()),
+		stored.metadata.emitted_expression_count);
+	return true;
+}
+
+void GSDeviceGXM::Impl::PollGeneratedVuPrograms()
+{
+	VitaGpuVu::CompileResult result;
+	VitaGpuVu::GeneratedCgProgram metadata;
+	while (VitaGpuVu::PollGeneratedProgramCompile(&result, &metadata))
+	{
+		RegisterGeneratedVuProgram(std::move(result), std::move(metadata));
+		result = {};
+		metadata = {};
+	}
 }
 
 bool GSDeviceGXM::Impl::EndScene(bool finish)
@@ -3373,6 +3571,12 @@ bool GSDeviceGXM::Impl::DrawQuad(VitaGXM::GSTextureGXM* source,
 	return true;
 }
 
+void GSDeviceGXM::PollGpuVuPrograms()
+{
+	if (m_impl && m_impl->ready)
+		m_impl->PollGeneratedVuPrograms();
+}
+
 void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 {
 	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
@@ -4479,6 +4683,7 @@ void GSDeviceGXM::Impl::Shutdown()
 {
 	ready = false;
 	present_active = false;
+	VitaGpuVu::DetachGeneratedProgramCompiler(&gpu_vu_shader_compiler);
 	gpu_vu_shader_compiler.Stop();
 	const auto succeeded = [this](const char* operation, int result) {
 		return result >= 0 ? true : Fail(operation, result);
@@ -4532,6 +4737,13 @@ void GSDeviceGXM::Impl::Shutdown()
 		else
 			group_ok = false;
 	};
+	for (auto& entry : generated_vu_programs)
+	{
+		release_vertex(entry.second.vertex_program,
+			"release generated VU1+TFX vertex program");
+	}
+	if (!group_ok)
+		return;
 	release_fragment(mask_update_program, "release mask-update fragment program");
 	release_fragment(color_fragment_program, "release color fragment program");
 	release_fragment(mad_reconstruct_program, "release MAD-reconstruct program");
@@ -4610,6 +4822,15 @@ void GSDeviceGXM::Impl::Shutdown()
 		else
 			group_ok = false;
 	};
+	for (auto& entry : generated_vu_programs)
+	{
+		unregister(entry.second.id,
+			"unregister generated VU1+TFX vertex program");
+	}
+	if (!group_ok)
+		return;
+	generated_vu_programs.clear();
+	VitaGpuVu::ClearGeneratedProgramRegistry();
 	unregister(mad_reconstruct_fragment_id, "unregister MAD-reconstruct fragment");
 	unregister(mad_buffer_fragment_id, "unregister MAD-buffer fragment");
 	unregister(color_fragment_id, "unregister color fragment");
