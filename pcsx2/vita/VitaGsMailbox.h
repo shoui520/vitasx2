@@ -6,8 +6,13 @@
 #include "common/Pcsx2Defs.h"
 
 #include <cstddef>
+#include <memory>
 
 class Error;
+namespace VitaGpuVu
+{
+	class GpuVuDraw;
+}
 
 namespace VitaGS
 {
@@ -17,6 +22,11 @@ namespace VitaGS
 	// VMManager::EntryPointCompilingOnCPUThread(). Performance windows after this
 	// call use the game ELF entry as their VSync origin.
 	void NotifyPerformanceElfEntry();
+
+	// Transfers one immutable PATH1 descriptor into the ordered MTGS ring.
+	// Ownership returns false by destruction; a successful call is consumed
+	// exactly once by the GS/GXM-owning thread.
+	bool QueueGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
 
 	const u8* GetLocalMemoryForTrace(size_t* size);
 

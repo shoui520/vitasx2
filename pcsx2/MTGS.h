@@ -31,6 +31,7 @@ namespace MTGS
 		SoftReset, // issues a soft reset for the GIF
 		GSPacket,
 		MTVUGSPacket,
+		GpuVuDraw,
 		InitAndReadFIFO,
 		AsyncCall,
 	};

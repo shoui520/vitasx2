@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "vita/VitaGxmGsState.h"
+#include "vita/VitaGpuVuDraw.h"
 
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 
@@ -157,3 +158,17 @@ bool VitaGxmGsState::IsNativePresenterReady() const
 }
 
 #endif
+
+void VitaGxmGsState::ConsumeGpuVuDraw(
+	std::unique_ptr<VitaGpuVu::GpuVuDraw> draw)
+{
+	if (!draw)
+		return;
+
+	// Admission remains disconnected until GSRendererHW can derive its target,
+	// texture, blend, depth, and fragment state without a CPU GSVertex array.
+	// Reaching this command early would lose PATH1 output, so fail loudly
+	// instead of silently treating a registered vertex root as executable.
+	VitaGpuVu::RecordGpuVuDrawRejected();
+	pxFailRel("GPU-VU draw reached GS before native geometry consumption");
+}

@@ -3,6 +3,13 @@
 
 #pragma once
 
+#include <memory>
+
+namespace VitaGpuVu
+{
+	class GpuVuDraw;
+}
+
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 
 #include "GS/Renderers/SW/GSRendererSW.h"
@@ -20,6 +27,7 @@ public:
 	bool IsIdleFrame() const;
 	void Present();
 	void VSync(u32 field);
+	void ConsumeGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
 
 	void Reset(bool hardware_reset) override;
 	void Draw() override;
@@ -50,6 +58,7 @@ public:
 	~VitaGxmGsState() override;
 
 	bool IsNativePresenterReady() const;
+	void ConsumeGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
 	void Reset(bool hardware_reset) override;
 	void VSync(u32 field, bool registers_written, bool idle_frame) override;
 };
@@ -68,6 +77,7 @@ public:
 	~VitaGxmGsState() override;
 
 	bool IsNativePresenterReady() const;
+	void ConsumeGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
 };
 
 #endif

@@ -7,6 +7,11 @@
 
 #include <memory>
 
+namespace VitaGpuVu
+{
+	class GpuVuDraw;
+}
+
 struct VitaGxmPerformanceCounters
 {
 	u64 draw_calls = 0;
@@ -167,6 +172,11 @@ public:
 	// GS-worker-only. Drains asynchronous ShaccCg results and performs every
 	// libGXM registration/patcher operation on the context-owning thread.
 	void PollGpuVuPrograms();
+
+	// GS-worker-only. Called immediately after a native GPU-VU draw has been
+	// encoded; ownership is held until its scene's vertex notification retires.
+	bool RetainGpuVuDrawForVertexCompletion(
+		std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
 
 protected:
 	using GSDevice::DoStretchRect;

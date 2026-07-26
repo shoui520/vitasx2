@@ -8,6 +8,7 @@
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSVertex.h"
 #include "common/Console.h"
+#include "vita/VitaGpuVuDraw.h"
 #include "vita/VitaGpuVuProgramRegistry.h"
 #include "vita/VitaGpuVuShaderCompiler.h"
 #include "vita/VitaGpuVuVifInput.h"
@@ -213,6 +214,7 @@ namespace
 	constexpr u32 MAX_STAGED_INDICES = 65532;
 	constexpr u32 MAX_RENDER_TARGETS = 48;
 	constexpr size_t MAX_TFX_PATCHED_PROGRAMS = 128;
+	constexpr size_t GPU_VU_RETIREMENT_SLOT_COUNT = 4;
 	// vitaGL's GXM owner records eight as libGXM's per-target maximum. Sony's
 	// macrotile_sync and tutorial_postprocessing samples raise scenesPerFrame
 	// for targets used by several ordered passes instead of leaving it at one.
@@ -1021,6 +1023,17 @@ static void RecordGxmDraw(u64 vertices, size_t vertex_stride, u64 indices)
 	s_gxm_worker_performance.index_upload_bytes += indices * sizeof(u16);
 }
 
+static bool GpuVuNotificationReached(
+	const SceGxmNotification& notification)
+{
+	if (!notification.address)
+		return false;
+	// PhyreRenderInterfaceGXM::isVertexCompleted() uses this signed modular
+	// comparison so a later completed value also retires an older resource.
+	return VitaGpuVu::HasCompletedNotificationValue(
+		*notification.address, notification.value);
+}
+
 struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 {
 	struct GeneratedVuProgram
@@ -1030,6 +1043,13 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 		std::vector<u8> gxp;
 		SceGxmShaderPatcherId id = nullptr;
 		SceGxmVertexProgram* vertex_program = nullptr;
+	};
+
+	struct GpuVuRetirementSlot
+	{
+		SceGxmNotification notification{};
+		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws;
+		bool submitted = false;
 	};
 
 	struct RenderTargetEntry
@@ -1088,6 +1108,12 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	VitaGXM::Display display;
 	VitaGpuVu::ShaderCompiler gpu_vu_shader_compiler;
 	VitaGpuVu::InputRing gpu_vu_input_ring;
+	std::array<GpuVuRetirementSlot, GPU_VU_RETIREMENT_SLOT_COUNT>
+		gpu_vu_retirement_slots;
+	std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>>
+		gpu_vu_scene_draws;
+	u32 next_gpu_vu_retirement_slot = 0;
+	bool gpu_vu_retirements_ready = false;
 
 	std::vector<RenderTargetEntry> render_targets;
 	SceGxmRenderTarget* display_render_target = nullptr;
@@ -1204,6 +1230,13 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool RegisterGeneratedVuProgram(VitaGpuVu::CompileResult result,
 		VitaGpuVu::GeneratedCgProgram metadata);
 	void PollGeneratedVuPrograms();
+	bool InitializeGpuVuRetirements();
+	bool RetainGpuVuDrawForScene(
+		std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
+	bool PrepareGpuVuRetirementNotification(
+		const SceGxmNotification** notification);
+	void RetireCompletedGpuVuDraws();
+	void ReleaseAllGpuVuDraws();
 	bool CreateGeometry();
 	bool CreateRenderTarget(u32 width, u32 height, u16 scenes_per_frame,
 		SceGxmRenderTarget** target, bool required = true);
@@ -1536,6 +1569,8 @@ bool GSDeviceGXM::Impl::Initialize()
 	if (result < 0)
 		return Fail("sceGxmInitialize", result);
 	gxm_initialized = true;
+	if (!InitializeGpuVuRetirements())
+		Console.Warning("GPU-VU: four-way vertex retirement ring is unavailable.");
 	if (!gpu_vu_shader_compiler.Start())
 		Console.Warning("GPU-VU: asynchronous compiler service did not start.");
 	else if (!VitaGpuVu::AttachGeneratedProgramCompiler(
@@ -2295,6 +2330,7 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 
 void GSDeviceGXM::Impl::PollGeneratedVuPrograms()
 {
+	RetireCompletedGpuVuDraws();
 	VitaGpuVu::CompileResult result;
 	VitaGpuVu::GeneratedCgProgram metadata;
 	while (VitaGpuVu::PollGeneratedProgramCompile(&result, &metadata))
@@ -2305,11 +2341,133 @@ void GSDeviceGXM::Impl::PollGeneratedVuPrograms()
 	}
 }
 
+bool GSDeviceGXM::Impl::InitializeGpuVuRetirements()
+{
+	volatile unsigned int* const notification_region =
+		sceGxmGetNotificationRegion();
+	if (!notification_region)
+		return false;
+
+	// No other VitaSX2 subsystem consumes notification words. Sony's
+	// precomputation and instancing samples allocate linearly from this region;
+	// reserve four distinct words so a submitted value is never overwritten
+	// before its slot is explicitly reused.
+	for (u32 i = 0; i < gpu_vu_retirement_slots.size(); i++)
+	{
+		GpuVuRetirementSlot& slot = gpu_vu_retirement_slots[i];
+		slot.notification.address = notification_region + i;
+		slot.notification.value = 0;
+		*slot.notification.address = 0;
+		slot.draws.clear();
+		slot.submitted = false;
+	}
+	next_gpu_vu_retirement_slot = 0;
+	gpu_vu_retirements_ready = true;
+	return true;
+}
+
+bool GSDeviceGXM::Impl::RetainGpuVuDrawForScene(
+	std::unique_ptr<VitaGpuVu::GpuVuDraw> draw)
+{
+	if (!draw || !scene_active || !gpu_vu_retirements_ready)
+		return false;
+	VitaGpuVu::RecordGpuVuDrawExecuted(*draw);
+	gpu_vu_scene_draws.push_back(std::move(draw));
+	return true;
+}
+
+void GSDeviceGXM::Impl::RetireCompletedGpuVuDraws()
+{
+	if (!gpu_vu_retirements_ready)
+		return;
+	for (GpuVuRetirementSlot& slot : gpu_vu_retirement_slots)
+	{
+		if (!slot.submitted ||
+			!GpuVuNotificationReached(slot.notification))
+		{
+			continue;
+		}
+		const u64 count = slot.draws.size();
+		slot.draws.clear();
+		slot.submitted = false;
+		if (count != 0)
+			VitaGpuVu::RecordGpuVuDrawsRetired(count);
+	}
+}
+
+bool GSDeviceGXM::Impl::PrepareGpuVuRetirementNotification(
+	const SceGxmNotification** notification)
+{
+	if (!notification)
+		return false;
+	*notification = nullptr;
+	if (gpu_vu_scene_draws.empty())
+		return true;
+	if (!gpu_vu_retirements_ready)
+		return false;
+
+	RetireCompletedGpuVuDraws();
+	GpuVuRetirementSlot& slot =
+		gpu_vu_retirement_slots[next_gpu_vu_retirement_slot];
+	if (slot.submitted)
+	{
+		// This is the only routine GPU-VU notification wait: four newer scene
+		// batches have already consumed the other slots and this older slot is
+		// now being reused. Never wait when the completion word is already
+		// visible.
+		VitaGpuVu::RecordGpuVuRetirementRingWait();
+		if (!GpuVuNotificationReached(slot.notification))
+		{
+			VitaGpuVu::RecordGpuVuNotificationWait();
+			const int wait_result =
+				sceGxmNotificationWait(&slot.notification);
+			if (wait_result < 0)
+				return Fail("wait for GPU-VU retirement slot", wait_result);
+		}
+		const u64 count = slot.draws.size();
+		slot.draws.clear();
+		slot.submitted = false;
+		if (count != 0)
+			VitaGpuVu::RecordGpuVuDrawsRetired(count);
+	}
+
+	u32 value = slot.notification.value + 1;
+	if (value == 0)
+		value = 1;
+	slot.notification.value = value;
+	slot.draws = std::move(gpu_vu_scene_draws);
+	gpu_vu_scene_draws.clear();
+	slot.submitted = true;
+	next_gpu_vu_retirement_slot =
+		(next_gpu_vu_retirement_slot + 1) %
+		gpu_vu_retirement_slots.size();
+	*notification = &slot.notification;
+	return true;
+}
+
+void GSDeviceGXM::Impl::ReleaseAllGpuVuDraws()
+{
+	u64 count = gpu_vu_scene_draws.size();
+	gpu_vu_scene_draws.clear();
+	for (GpuVuRetirementSlot& slot : gpu_vu_retirement_slots)
+	{
+		count += slot.draws.size();
+		slot.draws.clear();
+		slot.submitted = false;
+	}
+	if (count != 0)
+		VitaGpuVu::RecordGpuVuDrawsRetired(count);
+}
+
 bool GSDeviceGXM::Impl::EndScene(bool finish)
 {
 	if (!scene_active)
 		return true;
-	const int end_result = sceGxmEndScene(context, nullptr, nullptr);
+	const SceGxmNotification* vertex_notification = nullptr;
+	if (!PrepareGpuVuRetirementNotification(&vertex_notification))
+		return false;
+	const int end_result =
+		sceGxmEndScene(context, vertex_notification, nullptr);
 	if (end_result < 0)
 	{
 		ready = false;
@@ -2319,10 +2477,13 @@ bool GSDeviceGXM::Impl::EndScene(bool finish)
 	scene_is_display = false;
 	scene_rt = nullptr;
 	scene_ds = nullptr;
+	if (vertex_notification)
+		VitaGpuVu::RecordGpuVuRetirementBatch();
 	completed_scene_serial = finish ? scene_serial : completed_scene_serial;
 	if (!finish)
 		return true;
 	sceGxmFinish(context);
+	ReleaseAllGpuVuDraws();
 	completed_scene_serial = scene_serial;
 	vertex_offset = 0;
 	index_offset = 0;
@@ -2336,6 +2497,7 @@ bool GSDeviceGXM::Impl::Finish()
 	if (!context)
 		return true;
 	sceGxmFinish(context);
+	ReleaseAllGpuVuDraws();
 	completed_scene_serial = scene_serial;
 	completed_transfer_serial = transfer_serial;
 	vertex_offset = 0;
@@ -3577,6 +3739,13 @@ void GSDeviceGXM::PollGpuVuPrograms()
 		m_impl->PollGeneratedVuPrograms();
 }
 
+bool GSDeviceGXM::RetainGpuVuDrawForVertexCompletion(
+	std::unique_ptr<VitaGpuVu::GpuVuDraw> draw)
+{
+	return m_impl && m_impl->ready &&
+		m_impl->RetainGpuVuDrawForScene(std::move(draw));
+}
+
 void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 {
 	#if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
@@ -4700,6 +4869,7 @@ void GSDeviceGXM::Impl::Shutdown()
 		completed_scene_serial = scene_serial;
 		completed_transfer_serial = transfer_serial;
 	}
+	ReleaseAllGpuVuDraws();
 	if (!gpu_vu_input_ring.Shutdown())
 		return;
 	if (!succeeded("sceGxmDisplayQueueFinish(shutdown)", display.Finish()) ||
@@ -4962,6 +5132,9 @@ void GSDeviceGXM::Impl::Shutdown()
 			return;
 		gxm_initialized = false;
 	}
+	gpu_vu_retirements_ready = false;
+	for (GpuVuRetirementSlot& slot : gpu_vu_retirement_slots)
+		slot.notification = {};
 	scene_active = false;
 	scene_is_display = false;
 	scene_rt = nullptr;

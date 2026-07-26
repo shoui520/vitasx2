@@ -26,6 +26,7 @@
 #endif
 #include "vita/VitaGsMailbox.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaGpuVuDraw.h"
 #include "vita/VitaGpuVuVifInput.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
@@ -376,6 +377,7 @@ namespace MTGS
 		GsWorkerPerformanceTotals gs_worker;
 		VitaGxmPerformanceCounters gxm;
 		VitaGpuVu::InputRingStatistics gpu_vu_input;
+		VitaGpuVu::DrawStatistics gpu_vu_draw;
 	};
 
 	struct CorrelatedPerformanceProfile
@@ -433,6 +435,7 @@ namespace MTGS
 		snapshot.completed_vsyncs = snapshot.gs_worker.completed_vsyncs;
 		snapshot.gxm = VitaGxmGetPublishedPerformanceCounters();
 		snapshot.gpu_vu_input = VitaGpuVu::GetInputRingStatistics();
+		snapshot.gpu_vu_draw = VitaGpuVu::GetGpuVuDrawStatistics();
 		return snapshot;
 	}
 
@@ -1131,6 +1134,56 @@ namespace MTGS
 			static_cast<unsigned long long>(
 				end.gpu_vu_input.peak_live_references));
 		output.WriteLn(
+			"Vita perf v=1 window=%llu kind=gpu_vu_draw queued=%llu consumed=%llu "
+			"rejected=%llu parallel=%llu serial=%llu interpreter=%llu "
+			"fused_vertices=%llu fused_primitives=%llu tfx_exports=%llu "
+			"raw_exports=%llu retirement_batches=%llu retired=%llu "
+			"ring_waits=%llu notification_waits=%llu "
+			"live_start=%llu live_end=%llu peak_live=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.queued, start.gpu_vu_draw.queued)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.consumed, start.gpu_vu_draw.consumed)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.rejected, start.gpu_vu_draw.rejected)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.generated_parallel_invocations,
+				start.gpu_vu_draw.generated_parallel_invocations)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.generated_serial_invocations,
+				start.gpu_vu_draw.generated_serial_invocations)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.interpreter_invocations,
+				start.gpu_vu_draw.interpreter_invocations)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.fused_vertices,
+				start.gpu_vu_draw.fused_vertices)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.fused_primitives,
+				start.gpu_vu_draw.fused_primitives)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.tfx_vertex_exports,
+				start.gpu_vu_draw.tfx_vertex_exports)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.raw_path1_exports,
+				start.gpu_vu_draw.raw_path1_exports)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.retirement_batches,
+				start.gpu_vu_draw.retirement_batches)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.retired_draws,
+				start.gpu_vu_draw.retired_draws)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.retirement_ring_waits,
+				start.gpu_vu_draw.retirement_ring_waits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.notification_waits,
+				start.gpu_vu_draw.notification_waits)),
+			static_cast<unsigned long long>(start.gpu_vu_draw.live_draws),
+			static_cast<unsigned long long>(end.gpu_vu_draw.live_draws),
+			static_cast<unsigned long long>(end.gpu_vu_draw.peak_live_draws));
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gs submitted=%llu submitted_words=%llu "
 			"processed=%llu packets=%llu packet_bytes=%llu mtvu_packets=%llu "
 			"mtvu_packet_bytes=%llu waits=%llu wait_spins=%llu ring_spins=%llu "
@@ -1781,6 +1834,20 @@ namespace MTGS
 						break;
 					}
 
+					case Command::GpuVuDraw:
+					{
+						std::unique_ptr<VitaGpuVu::GpuVuDraw> draw(
+							reinterpret_cast<VitaGpuVu::GpuVuDraw*>(tag.pointer));
+						if (!draw)
+							break;
+						VitaGpuVu::RecordGpuVuDrawConsumed();
+						if (s_gs)
+							s_gs->ConsumeGpuVuDraw(std::move(draw));
+						else
+							VitaGpuVu::RecordGpuVuDrawRejected();
+						break;
+					}
+
 					case Command::VSync:
 					{
 						const u32 payload_size = tag.data[0];
@@ -2364,6 +2431,27 @@ void VitaGS::SetNativePresenterEnabled(bool enabled)
 bool VitaGS::IsNativePresenterEnabled()
 {
 	return MTGS::s_native_presenter_enabled;
+}
+
+bool VitaGS::QueueGpuVuDraw(
+	std::unique_ptr<VitaGpuVu::GpuVuDraw> draw)
+{
+	if (!draw || !MTGS::IsOpen())
+		return false;
+	if (draw->ordering_sequence == 0)
+		draw->ordering_sequence = VitaGpuVu::NextGpuVuOrderingSequence();
+	std::string error;
+	if (!draw->Validate(&error))
+	{
+		Console.Error("GPU-VU: refusing malformed draw descriptor: %s",
+			error.c_str());
+		return false;
+	}
+
+	VitaGpuVu::GpuVuDraw* const pointer = draw.release();
+	VitaGpuVu::RecordGpuVuDrawQueued();
+	MTGS::SendPointerPacket(MTGS::Command::GpuVuDraw, 0, pointer);
+	return true;
 }
 
 void VitaGS::NotifyPerformanceElfEntry()
