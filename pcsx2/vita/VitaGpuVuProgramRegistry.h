@@ -11,7 +11,7 @@ namespace VitaGpuVu {
 // Bump whenever generated source conventions or the GXM binding contract
 // change. The key is exclusively generated-program content; it never contains
 // a title, ELF, address, game, or known-program identity.
-constexpr u32 GeneratedProgramAbiVersion = 1;
+constexpr u32 GeneratedProgramAbiVersion = 2;
 
 enum class GeneratedProgramState : u8 {
   Missing,

@@ -5,6 +5,7 @@
 
 #if !defined(VITASX2_QEMU_VALIDATION)
 
+#include "GS/GSRegs.h"
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSVertex.h"
 #include "common/Console.h"
@@ -212,6 +213,9 @@ namespace
 	constexpr u32 GEOMETRY_VERTEX_BYTES = 6 * 1024 * 1024;
 	constexpr u32 GEOMETRY_INDEX_BYTES = 512 * 1024;
 	constexpr u32 MAX_STAGED_INDICES = 65532;
+	constexpr u32 GPU_VU_SEQUENTIAL_INDEX_COUNT = 65536;
+	constexpr u32 GPU_VU_SEQUENTIAL_INDEX_BYTES =
+		GPU_VU_SEQUENTIAL_INDEX_COUNT * sizeof(u16);
 	constexpr u32 MAX_RENDER_TARGETS = 48;
 	constexpr size_t MAX_TFX_PATCHED_PROGRAMS = 128;
 	constexpr size_t GPU_VU_RETIREMENT_SLOT_COUNT = 4;
@@ -1023,6 +1027,14 @@ static void RecordGxmDraw(u64 vertices, size_t vertex_stride, u64 indices)
 	s_gxm_worker_performance.index_upload_bytes += indices * sizeof(u16);
 }
 
+static void RecordGpuVuGxmDraw(u64 indices)
+{
+	if (!VitaPerformanceTelemetry::IsEnabled())
+		return;
+	s_gxm_worker_performance.draw_calls++;
+	s_gxm_worker_performance.draw_indices += indices;
+}
+
 static bool GpuVuNotificationReached(
 	const SceGxmNotification& notification)
 {
@@ -1038,11 +1050,27 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 {
 	struct GeneratedVuProgram
 	{
+		struct Uniforms
+		{
+			const SceGxmProgramParameter* vertex_scale_offset = nullptr;
+			const SceGxmProgramParameter* max_depth = nullptr;
+			std::array<const SceGxmProgramParameter*, 32> vf{};
+			const SceGxmProgramParameter* acc = nullptr;
+			const SceGxmProgramParameter* q = nullptr;
+			const SceGxmProgramParameter* p = nullptr;
+			const SceGxmProgramParameter* i = nullptr;
+			const SceGxmProgramParameter* gif_q = nullptr;
+		};
+
 		VitaGpuVu::ShaderKey key;
 		VitaGpuVu::GeneratedCgProgram metadata;
 		std::vector<u8> gxp;
 		SceGxmShaderPatcherId id = nullptr;
 		SceGxmVertexProgram* vertex_program = nullptr;
+		SceGxmFragmentProgram* general_fragment_program = nullptr;
+		SceGxmFragmentProgram* zfloor_fragment_program = nullptr;
+		SceGxmFragmentProgram* opaque_fragment_program = nullptr;
+		Uniforms uniforms;
 	};
 
 	struct GpuVuRetirementSlot
@@ -1126,6 +1154,9 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	u64 completed_transfer_serial = 0;
 	u32 vertex_offset = 0;
 	u32 index_offset = 0;
+	const u16* gpu_vu_sequential_indices = nullptr;
+	const VitaGpuVu::GpuVuDraw* active_gpu_vu_draw = nullptr;
+	bool active_gpu_vu_draw_encoded = false;
 
 	SceGxmShaderPatcherId tfx_vertex_id = nullptr;
 	SceGxmShaderPatcherId tfx_fragment_id = nullptr;
@@ -1230,6 +1261,11 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool RegisterGeneratedVuProgram(VitaGpuVu::CompileResult result,
 		VitaGpuVu::GeneratedCgProgram metadata);
 	void PollGeneratedVuPrograms();
+	GeneratedVuProgram* FindGeneratedVuProgram(
+		const VitaGpuVu::ShaderKey& key);
+	bool DrawGpuVu(const GSHWDrawConfig& config,
+		VitaGXM::GSTextureGXM* source, bool fast_fragment, bool psm16_fragment,
+		bool region_repeat_fragment, bool manual_lod_fragment);
 	bool InitializeGpuVuRetirements();
 	bool RetainGpuVuDrawForScene(
 		std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
@@ -1287,7 +1323,9 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 		bool source_direct_fragment,
 		bool source_direct_modulate_fragment,
 		bool source_direct_modulate_af_fragment,
-		bool untextured_fragment);
+		bool untextured_fragment,
+		const GeneratedVuProgram* generated_vu = nullptr,
+		const VitaGpuVu::GpuVuDraw* gpu_vu_draw = nullptr);
 	bool CanUseFastTfx(const GSHWDrawConfig& config) const;
 	bool CanUseGsSourceOnlyTfx(const GSHWDrawConfig& config) const;
 	bool CanUseSourceOnlyTfx(const GSHWDrawConfig& config) const;
@@ -1424,7 +1462,20 @@ bool GSDeviceGXM::Impl::CreateGeometry()
 	result = VitaGXM::AllocateMappedBlock("VitaSX2 GXM staged indices",
 		SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_NC_RW, GEOMETRY_INDEX_BYTES,
 		SCE_GXM_MEMORY_ATTRIB_READ, &geometry_indices);
-	return result >= 0 ? true : Fail("staged index allocation", result);
+	if (result < 0)
+		return Fail("staged index allocation", result);
+
+	// Direct VU+TFX draws must not construct one CPU index per generated
+	// vertex. Reserve the tail of the already mapped index block and build the
+	// identity sequence once. GIF NLOOP is 15 bits, but keeping the complete
+	// u16 domain also covers future coalesced direct batches.
+	u16* const indices = reinterpret_cast<u16*>(
+		static_cast<u8*>(geometry_indices.base) +
+		geometry_indices.size - GPU_VU_SEQUENTIAL_INDEX_BYTES);
+	for (u32 i = 0; i < GPU_VU_SEQUENTIAL_INDEX_COUNT; i++)
+		indices[i] = static_cast<u16>(i);
+	gpu_vu_sequential_indices = indices;
+	return true;
 }
 
 bool GSDeviceGXM::Impl::CreateRenderTarget(u32 width, u32 height,
@@ -2212,6 +2263,42 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 		const char* operation, int error) {
 		Fail(operation, error);
 		bool may_erase = true;
+		if (stored.opaque_fragment_program)
+		{
+			if (sceGxmShaderPatcherReleaseFragmentProgram(
+				patcher, stored.opaque_fragment_program) >= 0)
+			{
+				stored.opaque_fragment_program = nullptr;
+			}
+			else
+			{
+				may_erase = false;
+			}
+		}
+		if (stored.general_fragment_program)
+		{
+			if (sceGxmShaderPatcherReleaseFragmentProgram(
+				patcher, stored.general_fragment_program) >= 0)
+			{
+				stored.general_fragment_program = nullptr;
+			}
+			else
+			{
+				may_erase = false;
+			}
+		}
+		if (stored.zfloor_fragment_program)
+		{
+			if (sceGxmShaderPatcherReleaseFragmentProgram(
+				patcher, stored.zfloor_fragment_program) >= 0)
+			{
+				stored.zfloor_fragment_program = nullptr;
+			}
+			else
+			{
+				may_erase = false;
+			}
+		}
 		if (stored.vertex_program)
 		{
 			if (sceGxmShaderPatcherReleaseVertexProgram(
@@ -2246,6 +2333,63 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 	if (stored.metadata.memory_inputs.size() > 16)
 	{
 		return fail_registration("bind generated VU1+TFX vertex inputs",
+			SCE_GXM_ERROR_INVALID_VALUE);
+	}
+	if (!stored.metadata.uses_tfx_uniforms)
+	{
+		return fail_registration("validate generated VU1+TFX root",
+			SCE_GXM_ERROR_INVALID_VALUE);
+	}
+
+	const auto find_uniform = [program](const char* name) {
+		const SceGxmProgramParameter* const parameter =
+			sceGxmProgramFindParameterByName(program, name);
+		return (parameter &&
+			sceGxmProgramParameterGetCategory(parameter) ==
+				SCE_GXM_PARAMETER_CATEGORY_UNIFORM) ?
+			parameter : nullptr;
+	};
+	stored.uniforms.vertex_scale_offset =
+		find_uniform("VertexScaleOffset");
+	stored.uniforms.max_depth = find_uniform("MaxDepth");
+	if (!stored.uniforms.vertex_scale_offset || !stored.uniforms.max_depth)
+	{
+		return fail_registration("find generated VU1+TFX state uniforms",
+			SCE_GXM_ERROR_INVALID_VALUE);
+	}
+	for (u32 reg = 1; reg < stored.uniforms.vf.size(); reg++)
+	{
+		if ((stored.metadata.vf_uniform_mask & (1u << reg)) == 0)
+			continue;
+		char name[8];
+		std::snprintf(name, sizeof(name), "VF%02u", reg);
+		stored.uniforms.vf[reg] = find_uniform(name);
+		if (!stored.uniforms.vf[reg])
+		{
+			return fail_registration("find generated VU1+TFX VF uniform",
+				SCE_GXM_ERROR_INVALID_VALUE);
+		}
+	}
+	const auto require_uniform = [&find_uniform](
+		bool used, const char* name,
+		const SceGxmProgramParameter** destination) {
+		if (!used)
+			return true;
+		*destination = find_uniform(name);
+		return *destination != nullptr;
+	};
+	if (!require_uniform(stored.metadata.uses_acc_uniform, "ACC",
+			&stored.uniforms.acc) ||
+		!require_uniform(stored.metadata.uses_q_uniform, "Q",
+			&stored.uniforms.q) ||
+		!require_uniform(stored.metadata.uses_p_uniform, "P",
+			&stored.uniforms.p) ||
+		!require_uniform(stored.metadata.uses_i_uniform, "I",
+			&stored.uniforms.i) ||
+		!require_uniform(stored.metadata.uses_gif_q_uniform, "GifQ",
+			&stored.uniforms.gif_q))
+	{
+		return fail_registration("find generated VU1+TFX scalar uniform",
 			SCE_GXM_ERROR_INVALID_VALUE);
 	}
 
@@ -2316,11 +2460,41 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 		return fail_registration("create generated VU1+TFX vertex program",
 			patch_result < 0 ? patch_result : SCE_GXM_ERROR_INVALID_POINTER);
 	}
+	patch_result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
+		SCE_GXM_MULTISAMPLE_NONE, nullptr, program,
+		&stored.general_fragment_program);
+	if (patch_result < 0 || !stored.general_fragment_program)
+	{
+		return fail_registration(
+			"create generated VU1+TFX general fragment program",
+			patch_result < 0 ? patch_result : SCE_GXM_ERROR_INVALID_POINTER);
+	}
+	patch_result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_zfloor_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
+		SCE_GXM_MULTISAMPLE_NONE, nullptr, program,
+		&stored.zfloor_fragment_program);
+	if (patch_result < 0 || !stored.zfloor_fragment_program)
+	{
+		return fail_registration(
+			"create generated VU1+TFX Z-floor fragment program",
+			patch_result < 0 ? patch_result : SCE_GXM_ERROR_INVALID_POINTER);
+	}
+	patch_result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
+		tfx_fast_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
+		SCE_GXM_MULTISAMPLE_NONE, nullptr, program,
+		&stored.opaque_fragment_program);
+	if (patch_result < 0 || !stored.opaque_fragment_program)
+	{
+		return fail_registration(
+			"create generated VU1+TFX opaque fragment program",
+			patch_result < 0 ? patch_result : SCE_GXM_ERROR_INVALID_POINTER);
+	}
 
 	VitaGpuVu::CompleteGeneratedProgramRegistration(result.key, true);
 	Console.WriteLn(
 		"GPU-VU: GS registered generated VU1+TFX program %016llx%016llx "
-		"(%u raw streams, %u expressions).",
+		"(%u raw streams, %u expressions, general+Z-floor+opaque TFX links).",
 		static_cast<unsigned long long>(result.key.high),
 		static_cast<unsigned long long>(result.key.low),
 		static_cast<u32>(stored.metadata.memory_inputs.size()),
@@ -2339,6 +2513,14 @@ void GSDeviceGXM::Impl::PollGeneratedVuPrograms()
 		result = {};
 		metadata = {};
 	}
+}
+
+GSDeviceGXM::Impl::GeneratedVuProgram*
+GSDeviceGXM::Impl::FindGeneratedVuProgram(
+	const VitaGpuVu::ShaderKey& key)
+{
+	const auto it = generated_vu_programs.find({key.high, key.low});
+	return it != generated_vu_programs.end() ? &it->second : nullptr;
 }
 
 bool GSDeviceGXM::Impl::InitializeGpuVuRetirements()
@@ -2720,7 +2902,8 @@ bool GSDeviceGXM::Impl::HasGeometryCapacity(u32 vertices, u32 indices) const
 		std::max<u32>(sizeof(TfxVertex), sizeof(QuadVertex));
 	const u64 index_bytes = static_cast<u64>(indices) * sizeof(u16);
 	return aligned_vertex_offset + vertex_bytes <= geometry_vertices.size &&
-		aligned_index_offset + index_bytes <= geometry_indices.size;
+		aligned_index_offset + index_bytes <=
+			geometry_indices.size - GPU_VU_SEQUENTIAL_INDEX_BYTES;
 }
 
 bool GSDeviceGXM::Impl::DrawMaskRect(const GSVector4i& rect, u32 width,
@@ -3155,7 +3338,9 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	bool source_only_fragment, bool source_direct_fragment,
 	bool source_direct_modulate_fragment,
 	bool source_direct_modulate_af_fragment,
-	bool untextured_fragment)
+	bool untextured_fragment,
+	const GeneratedVuProgram* generated_vu,
+	const VitaGpuVu::GpuVuDraw* gpu_vu_draw)
 {
 	const ProgramUniforms* fragment_uniforms = &uniforms;
 	if (region_repeat_fragment)
@@ -3198,19 +3383,105 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	if (result < 0 || !vertex_buffer)
 		return Fail("reserve TFX vertex uniforms",
 			result < 0 ? result : SCE_GXM_ERROR_INVALID_POINTER);
-	// Keep PCSX2's point-size member in the same GXM uniform-array upload as the
-	// ordinary transform. A separate scalar upload would add a libGXM call to
-	// every triangle draw merely because the shared vertex program emits PSIZE.
-	const std::array<float, 12> vertex_values = {
-		config.cb_vs.vertex_scale.x, config.cb_vs.vertex_scale.y,
-		config.cb_vs.vertex_offset.x, config.cb_vs.vertex_offset.y,
-		config.cb_vs.texture_scale.x, config.cb_vs.texture_scale.y,
-		config.cb_vs.texture_offset.x, config.cb_vs.texture_offset.y,
-		config.cb_vs.point_size.x, config.cb_vs.point_size.y, 0.0f, 0.0f};
-	result = sceGxmSetUniformDataF(vertex_buffer, uniforms.vertex_scale_offset,
-		0, vertex_values.size(), vertex_values.data());
-	if (result < 0)
-		return Fail("upload TFX vertex uniforms", result);
+	if (generated_vu || gpu_vu_draw)
+	{
+		if (!generated_vu || !gpu_vu_draw)
+			return Reject("incomplete generated VU1 uniform contract");
+		const auto upload_vertex = [this, vertex_buffer](
+			const SceGxmProgramParameter* parameter, u32 count,
+			const float* values, const char* operation) {
+			if (!parameter || !values)
+				return false;
+			const int upload_result = sceGxmSetUniformDataF(
+				vertex_buffer, parameter, 0, count, values);
+			return upload_result >= 0 ? true : Fail(operation, upload_result);
+		};
+		if (!upload_vertex(generated_vu->uniforms.vertex_scale_offset, 12,
+				gpu_vu_draw->vertex_scale_offset[0].data(),
+				"upload generated VU1+TFX transform") ||
+			!upload_vertex(generated_vu->uniforms.max_depth, 1,
+				&gpu_vu_draw->max_depth,
+				"upload generated VU1+TFX maximum depth"))
+		{
+			return false;
+		}
+		for (const VitaGpuVu::VectorUniform& uniform :
+			gpu_vu_draw->vf_uniforms)
+		{
+			std::array<float, 4> values;
+			std::memcpy(values.data(), uniform.bits.data(), sizeof(values));
+			if (!upload_vertex(
+					generated_vu->uniforms.vf[uniform.register_index],
+					values.size(), values.data(),
+					"upload generated VU1 VF uniform"))
+			{
+				return false;
+			}
+		}
+		if (generated_vu->metadata.uses_acc_uniform)
+		{
+			std::array<float, 4> values;
+			std::memcpy(values.data(), gpu_vu_draw->acc_uniform.data(),
+				sizeof(values));
+			if (!upload_vertex(generated_vu->uniforms.acc, values.size(),
+					values.data(), "upload generated VU1 ACC uniform"))
+			{
+				return false;
+			}
+		}
+		const auto upload_scalar = [&upload_vertex](
+			bool used, const SceGxmProgramParameter* parameter, u32 bits,
+			const char* operation) {
+			if (!used)
+				return true;
+			float value;
+			std::memcpy(&value, &bits, sizeof(value));
+			return upload_vertex(parameter, 1, &value, operation);
+		};
+		const u32 scalar_mask = gpu_vu_draw->scalar_uniforms.present;
+		if (!upload_scalar(generated_vu->metadata.uses_q_uniform,
+				generated_vu->uniforms.q, gpu_vu_draw->scalar_uniforms.q,
+				"upload generated VU1 Q uniform") ||
+			!upload_scalar(generated_vu->metadata.uses_p_uniform,
+				generated_vu->uniforms.p, gpu_vu_draw->scalar_uniforms.p,
+				"upload generated VU1 P uniform") ||
+			!upload_scalar(generated_vu->metadata.uses_i_uniform,
+				generated_vu->uniforms.i, gpu_vu_draw->scalar_uniforms.i,
+				"upload generated VU1 I uniform") ||
+			!upload_scalar(generated_vu->metadata.uses_gif_q_uniform,
+				generated_vu->uniforms.gif_q,
+				gpu_vu_draw->scalar_uniforms.gif_q,
+				"upload generated GIF Q uniform") ||
+			((scalar_mask & VitaGpuVu::ScalarUniformQ) != 0) !=
+				generated_vu->metadata.uses_q_uniform ||
+			((scalar_mask & VitaGpuVu::ScalarUniformP) != 0) !=
+				generated_vu->metadata.uses_p_uniform ||
+			((scalar_mask & VitaGpuVu::ScalarUniformI) != 0) !=
+				generated_vu->metadata.uses_i_uniform ||
+			((scalar_mask & VitaGpuVu::ScalarUniformGifQ) != 0) !=
+				generated_vu->metadata.uses_gif_q_uniform)
+		{
+			return Reject("generated VU1 scalar-uniform mask mismatch");
+		}
+	}
+	else
+	{
+		// Keep PCSX2's point-size member in the same GXM uniform-array upload as
+		// the ordinary transform. A separate scalar upload would add a libGXM
+		// call to every triangle draw merely because the shared vertex program
+		// emits PSIZE.
+		const std::array<float, 12> vertex_values = {
+			config.cb_vs.vertex_scale.x, config.cb_vs.vertex_scale.y,
+			config.cb_vs.vertex_offset.x, config.cb_vs.vertex_offset.y,
+			config.cb_vs.texture_scale.x, config.cb_vs.texture_scale.y,
+			config.cb_vs.texture_offset.x, config.cb_vs.texture_offset.y,
+			config.cb_vs.point_size.x, config.cb_vs.point_size.y, 0.0f, 0.0f};
+		result = sceGxmSetUniformDataF(vertex_buffer,
+			uniforms.vertex_scale_offset, 0, vertex_values.size(),
+			vertex_values.data());
+		if (result < 0)
+			return Fail("upload TFX vertex uniforms", result);
+	}
 	void* fragment_buffer = nullptr;
 	result = sceGxmReserveFragmentDefaultUniformBuffer(context, &fragment_buffer);
 	if (result < 0 || !fragment_buffer)
@@ -3646,6 +3917,327 @@ bool GSDeviceGXM::Impl::StageAndDraw(const GSHWDrawConfig& config,
 	return true;
 }
 
+bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
+	VitaGXM::GSTextureGXM* source, bool fast_fragment, bool psm16_fragment,
+	bool region_repeat_fragment, bool manual_lod_fragment)
+{
+	const VitaGpuVu::GpuVuDraw* const draw = active_gpu_vu_draw;
+	if (!draw || active_gpu_vu_draw_encoded)
+		return Reject("missing or already encoded GPU-VU draw descriptor");
+	std::string validation_error;
+	if (!draw->Validate(&validation_error))
+		return Reject(validation_error.c_str());
+	if (draw->lowering != VitaGpuVu::OutputLowering::DirectTfx ||
+		draw->execution != VitaGpuVu::ExecutionKind::GeneratedParallel ||
+		draw->primitive_boundary != VitaGpuVu::PrimitiveBoundary::Native)
+	{
+		return Reject("GPU-VU draw is not a native generated direct-TFX job");
+	}
+	if (draw->final_state.IsRequired())
+	{
+		return Reject(
+			"native GPU-VU draw requires unimplemented final-state publication");
+	}
+	if (psm16_fragment || region_repeat_fragment || manual_lod_fragment)
+	{
+		return Reject(
+			"generated VU1 root lacks the selected specialized TFX fragment link");
+	}
+	if (!gpu_vu_retirements_ready || !gpu_vu_sequential_indices)
+		return Reject("GPU-VU draw retirement or identity indices unavailable");
+
+	GeneratedVuProgram* const generated =
+		FindGeneratedVuProgram(draw->program);
+	if (!generated || !generated->vertex_program ||
+		!generated->general_fragment_program ||
+		!generated->zfloor_fragment_program ||
+		!generated->opaque_fragment_program)
+	{
+		return Reject("generated VU1+TFX program is not GS-ready");
+	}
+	if (!generated->metadata.uses_tfx_uniforms ||
+		generated->metadata.memory_inputs.size() != draw->streams.size())
+	{
+		return Reject("generated VU1 program metadata differs from draw streams");
+	}
+
+	u32 vf_mask = 0;
+	for (const VitaGpuVu::VectorUniform& uniform : draw->vf_uniforms)
+		vf_mask |= 1u << uniform.register_index;
+	if (vf_mask != generated->metadata.vf_uniform_mask)
+		return Reject("generated VU1 VF-uniform mask mismatch");
+	const u32 expected_scalar_mask =
+		(generated->metadata.uses_q_uniform ?
+			VitaGpuVu::ScalarUniformQ : 0u) |
+		(generated->metadata.uses_p_uniform ?
+			VitaGpuVu::ScalarUniformP : 0u) |
+		(generated->metadata.uses_i_uniform ?
+			VitaGpuVu::ScalarUniformI : 0u) |
+		(generated->metadata.uses_gif_q_uniform ?
+			VitaGpuVu::ScalarUniformGifQ : 0u);
+	if (draw->scalar_uniforms.present != expected_scalar_mask)
+		return Reject("generated VU1 scalar-uniform mask mismatch");
+
+	for (u32 index = 0; index < draw->streams.size(); index++)
+	{
+		const VitaGpuVu::StreamBinding& binding = draw->streams[index];
+		const VitaGpuVu::CgMemoryInput& input =
+			generated->metadata.memory_inputs[index];
+		const u64 expected_stride =
+			static_cast<u64>(input.address.invocation_coefficient) * 16u;
+		if (binding.attribute_index != index ||
+			input.attribute_index != index ||
+			expected_stride != binding.byte_stride ||
+			(binding.payload_byte_offset & 3u) != 0)
+		{
+			return Reject("generated VU1 stream binding differs from GXP layout");
+		}
+	}
+
+	GIFTag tag{};
+	std::memcpy(&tag, draw->gif_tag.data(), sizeof(tag));
+	GIFRegPRIM prim{};
+	prim.U32[0] = tag.PRIM;
+	if (!tag.PRE || tag.FLG != GIF_FLG_PACKED ||
+		tag.NLOOP != draw->vertex_count ||
+		prim.PRIM != draw->direct_tfx.primitive ||
+		static_cast<bool>(prim.IIP) != draw->direct_tfx.gouraud ||
+		static_cast<bool>(prim.TME) != draw->direct_tfx.textured ||
+		static_cast<bool>(prim.FGE) != draw->direct_tfx.fog_enabled ||
+		static_cast<bool>(prim.FST) !=
+			draw->direct_tfx.fixed_texture_coordinates)
+	{
+		return Reject("GPU-VU static GIF tag differs from direct-TFX contract");
+	}
+	if (static_cast<bool>(config.vs.iip) != draw->direct_tfx.gouraud ||
+		static_cast<bool>(config.vs.tme) != draw->direct_tfx.textured ||
+		static_cast<bool>(config.vs.fst) !=
+			draw->direct_tfx.fixed_texture_coordinates ||
+		static_cast<bool>(config.ps.fst) !=
+			draw->direct_tfx.fixed_texture_coordinates ||
+		static_cast<bool>(config.ps.fog) != draw->direct_tfx.fog_enabled)
+	{
+		return Reject("PCSX2 TFX selectors differ from the GPU-VU GIF contract");
+	}
+	if (!draw->direct_tfx.gouraud && prim.PRIM != GS_POINTLIST)
+	{
+		// PCSX2's GS uses the last vertex as the provoking vertex. Public GXM
+		// exposes neither a provoking-vertex selector nor flat interpolation;
+		// the exact instance-indexed lowering remains a separate boundary.
+		return Reject("native GPU-VU draw cannot preserve flat provoking color");
+	}
+
+	SceGxmPrimitiveType primitive_type{};
+	GSHWDrawConfig::Topology topology{};
+	u32 indices_per_primitive = 0;
+	u32 primitive_count = 0;
+	switch (prim.PRIM)
+	{
+		case GS_POINTLIST:
+			primitive_type = SCE_GXM_PRIMITIVE_POINTS;
+			topology = GSHWDrawConfig::Topology::Point;
+			indices_per_primitive = 1;
+			primitive_count = draw->vertex_count;
+			break;
+		case GS_LINELIST:
+			if ((draw->vertex_count & 1u) != 0)
+				return Reject("odd native GPU-VU line-list vertex count");
+			primitive_type = SCE_GXM_PRIMITIVE_LINES;
+			topology = GSHWDrawConfig::Topology::Line;
+			indices_per_primitive = 2;
+			primitive_count = draw->vertex_count / 2;
+			break;
+		case GS_TRIANGLELIST:
+			if ((draw->vertex_count % 3u) != 0)
+				return Reject("non-integral native GPU-VU triangle-list count");
+			primitive_type = SCE_GXM_PRIMITIVE_TRIANGLES;
+			topology = GSHWDrawConfig::Topology::Triangle;
+			indices_per_primitive = 3;
+			primitive_count = draw->vertex_count / 3;
+			break;
+		case GS_TRIANGLESTRIP:
+			if (draw->vertex_count < 3)
+				return Reject("short native GPU-VU triangle strip");
+			primitive_type = SCE_GXM_PRIMITIVE_TRIANGLE_STRIP;
+			topology = GSHWDrawConfig::Topology::Triangle;
+			indices_per_primitive = 3;
+			primitive_count = draw->vertex_count - 2;
+			break;
+		case GS_TRIANGLEFAN:
+			if (draw->vertex_count < 3)
+				return Reject("short native GPU-VU triangle fan");
+			primitive_type = SCE_GXM_PRIMITIVE_TRIANGLE_FAN;
+			topology = GSHWDrawConfig::Topology::Triangle;
+			indices_per_primitive = 3;
+			primitive_count = draw->vertex_count - 2;
+			break;
+		case GS_LINESTRIP:
+		case GS_SPRITE:
+		default:
+			return Reject("GPU-VU primitive requires a non-native output lowering");
+	}
+	if (draw->index_count != draw->vertex_count ||
+		draw->index_count > GPU_VU_SEQUENTIAL_INDEX_COUNT ||
+		draw->primitive_count != primitive_count ||
+		config.topology != topology ||
+		config.indices_per_prim != indices_per_primitive ||
+		config.nverts != draw->vertex_count ||
+		config.nindices != draw->index_count)
+	{
+		return Reject("GPU-VU geometry dimensions differ from PCSX2 draw state");
+	}
+
+	const std::array<float, 12> expected_transform = {
+		config.cb_vs.vertex_scale.x, config.cb_vs.vertex_scale.y,
+		config.cb_vs.vertex_offset.x, config.cb_vs.vertex_offset.y,
+		config.cb_vs.texture_scale.x, config.cb_vs.texture_scale.y,
+		config.cb_vs.texture_offset.x, config.cb_vs.texture_offset.y,
+		config.cb_vs.point_size.x, config.cb_vs.point_size.y, 0.0f, 0.0f};
+	if (std::memcmp(draw->vertex_scale_offset[0].data(),
+			expected_transform.data(), sizeof(expected_transform)) != 0 ||
+		draw->max_depth != static_cast<float>(config.cb_vs.max_depth))
+	{
+		return Reject("GPU-VU transform uniforms differ from PCSX2 draw state");
+	}
+
+	VitaGXM::GSTextureGXM* const rt =
+		CheckedCast<VitaGXM::GSTextureGXM>(config.rt);
+	VitaGXM::GSTextureGXM* const ds =
+		CheckedCast<VitaGXM::GSTextureGXM>(config.ds);
+	VitaGXM::GSTextureGXM* draw_rt = rt;
+	VitaGXM::GSTextureGXM* draw_ds = ds;
+	if (scene_active && !scene_is_display)
+	{
+		if (!draw_rt && draw_ds && scene_rt && source != scene_rt &&
+			(config.ps.no_color || config.colormask.wrgba == 0) &&
+			scene_rt->GetSize() == draw_ds->GetSize())
+		{
+			draw_rt = scene_rt;
+		}
+		else if (!draw_ds && draw_rt && scene_ds && source != scene_ds &&
+			!config.depth.zwe && config.depth.ztst == ZTST_ALWAYS &&
+			scene_ds->GetSize() == draw_rt->GetSize())
+		{
+			draw_ds = scene_ds;
+		}
+	}
+	if (!EnsureScene(draw_rt, draw_ds, config.scissor))
+		return false;
+
+	sceGxmSetVertexProgram(context, generated->vertex_program);
+	sceGxmSetFragmentProgram(context, config.ps.zfloor ?
+		generated->zfloor_fragment_program : (fast_fragment ?
+			generated->opaque_fragment_program :
+			generated->general_fragment_program));
+	for (u32 index = 0; index < draw->streams.size(); index++)
+	{
+		const VitaGpuVu::StreamBinding& binding = draw->streams[index];
+		const VitaGpuVu::VifUnpackSpan& span =
+			draw->InputSpans()[binding.input_span];
+		const u8* const payload = VitaGpuVu::ResolveRawVifPayload(span.payload);
+		if (!payload)
+			return Reject("GPU-VU VIF input span retired before draw");
+		const int stream_result = sceGxmSetVertexStream(context, index,
+			payload + binding.payload_byte_offset);
+		if (stream_result < 0)
+			return Fail("bind generated VU1 raw VIF stream", stream_result);
+	}
+
+	VitaGXM::GSTextureGXM* bound_source = source ? source : white_texture.get();
+	if (!bound_source)
+		return false;
+	SceGxmTexture& native_texture = bound_source->Texture();
+	const bool linear_strided =
+		sceGxmTextureGetType(&native_texture) == SCE_GXM_TEXTURE_LINEAR_STRIDED;
+	if (linear_strided && (config.sampler.tau || config.sampler.tav))
+		return Reject("repeat addressing on a linear-strided GXM texture");
+	if (bound_source->GetMipmapLevels() > 1 &&
+		!config.ps.automatic_lod && !config.ps.manual_lod)
+	{
+		return Reject("multi-level texture without an explicit or implicit LOD contract");
+	}
+	if (bound_source->GetMipmapLevels() > 1 && config.sampler.lodclamp)
+		return Reject("LOD0 clamp on a multi-level GXM texture");
+	int result = sceGxmTextureSetUAddrMode(&native_texture,
+		config.sampler.tau ? SCE_GXM_TEXTURE_ADDR_REPEAT :
+			SCE_GXM_TEXTURE_ADDR_CLAMP);
+	if (result >= 0)
+	{
+		result = sceGxmTextureSetVAddrMode(&native_texture,
+			config.sampler.tav ? SCE_GXM_TEXTURE_ADDR_REPEAT :
+				SCE_GXM_TEXTURE_ADDR_CLAMP);
+	}
+	const SceGxmTextureFilter min_filter = (!config.ps.ltf &&
+		config.sampler.IsMinFilterLinear()) ? SCE_GXM_TEXTURE_FILTER_LINEAR :
+		SCE_GXM_TEXTURE_FILTER_POINT;
+	const SceGxmTextureFilter mag_filter = (!config.ps.ltf &&
+		config.sampler.IsMagFilterLinear()) ? SCE_GXM_TEXTURE_FILTER_LINEAR :
+		SCE_GXM_TEXTURE_FILTER_POINT;
+	if (result >= 0 && !linear_strided)
+		result = sceGxmTextureSetMinFilter(&native_texture, min_filter);
+	if (result >= 0)
+		result = sceGxmTextureSetMagFilter(&native_texture, mag_filter);
+	if (result >= 0 && !linear_strided)
+	{
+		result = sceGxmTextureSetMipFilter(&native_texture,
+			config.sampler.IsMipFilterLinear() ?
+				SCE_GXM_TEXTURE_MIP_FILTER_ENABLED :
+				SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+	}
+	if (result < 0)
+		return Fail("configure generated VU1+TFX sampler", result);
+	result = sceGxmSetFragmentTexture(context, 0, &native_texture);
+	if (result < 0)
+		return Fail("bind generated VU1+TFX source texture", result);
+	bound_source->MarkSceneUse(scene_serial);
+
+	const SceGxmDepthFunc depth_func = TranslateDepthFunc(config.depth.ztst);
+	sceGxmSetFrontDepthFunc(context, depth_func);
+	sceGxmSetBackDepthFunc(context, depth_func);
+	const SceGxmDepthWriteMode depth_write = config.depth.zwe ?
+		SCE_GXM_DEPTH_WRITE_ENABLED : SCE_GXM_DEPTH_WRITE_DISABLED;
+	sceGxmSetFrontDepthWriteEnable(context, depth_write);
+	sceGxmSetBackDepthWriteEnable(context, depth_write);
+	if (!UploadTfxUniforms(config, config.ps, source, false, false,
+			fast_fragment, false, false, false, false, false, false, false,
+			false, false, generated, draw))
+	{
+		return false;
+	}
+
+	const bool point_topology = topology == GSHWDrawConfig::Topology::Point;
+	const bool line_topology = topology == GSHWDrawConfig::Topology::Line;
+	if (point_topology)
+	{
+		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_POINT_01UV);
+		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_POINT_01UV);
+	}
+	else if (line_topology)
+	{
+		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_LINE);
+		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_LINE);
+		sceGxmSetFrontPointLineWidth(context, 1);
+		sceGxmSetBackPointLineWidth(context, 1);
+	}
+	result = sceGxmDraw(context, primitive_type, SCE_GXM_INDEX_FORMAT_U16,
+		gpu_vu_sequential_indices, draw->index_count);
+	if (point_topology || line_topology)
+	{
+		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+	}
+	if (result < 0)
+		return Fail("sceGxmDraw(generated VU1+TFX)", result);
+
+	RecordGpuVuGxmDraw(draw->index_count);
+	if (rt)
+		rt->SetState(GSTexture::State::Dirty);
+	if (ds && config.depth.zwe)
+		ds->SetState(GSTexture::State::Dirty);
+	active_gpu_vu_draw_encoded = true;
+	return true;
+}
+
 bool GSDeviceGXM::Impl::DrawQuad(VitaGXM::GSTextureGXM* source,
 	const GSVector4& source_rect, const GSVector4& destination_rect, u32 color,
 	Filter filter, SceGxmFragmentProgram* fragment,
@@ -3737,6 +4329,36 @@ void GSDeviceGXM::PollGpuVuPrograms()
 {
 	if (m_impl && m_impl->ready)
 		m_impl->PollGeneratedVuPrograms();
+}
+
+bool GSDeviceGXM::RenderGpuVuDraw(GSHWDrawConfig& config,
+	std::unique_ptr<VitaGpuVu::GpuVuDraw> draw)
+{
+	if (!m_impl || !m_impl->ready || !draw ||
+		m_impl->active_gpu_vu_draw)
+	{
+		return false;
+	}
+	std::string validation_error;
+	if (!draw->Validate(&validation_error))
+		return m_impl->Reject(validation_error.c_str());
+
+	m_impl->active_gpu_vu_draw = draw.get();
+	m_impl->active_gpu_vu_draw_encoded = false;
+	RenderHW(config);
+	const bool encoded = m_impl->active_gpu_vu_draw_encoded;
+	m_impl->active_gpu_vu_draw = nullptr;
+	m_impl->active_gpu_vu_draw_encoded = false;
+	if (!encoded)
+		return false;
+	if (m_impl->RetainGpuVuDrawForScene(std::move(draw)))
+		return true;
+
+	// This is an exceptional ownership failure after commands were encoded.
+	// Drain before releasing immutable VIF spans; the normal path retains them
+	// behind a four-scene vertex notification and never reaches this branch.
+	m_impl->Finish();
+	return false;
 }
 
 bool GSDeviceGXM::RetainGpuVuDrawForVertexCompletion(
@@ -3968,8 +4590,8 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		Console.WriteLn(
 			"GXM GS: source-direct Z-floor DECAL/RGB constant-blend path active.");
 	}
-	bool source_only_fragment = source_only_contract && !config.ps.zfloor &&
-		!region_repeat_fragment;
+	bool source_only_fragment = !m_impl->active_gpu_vu_draw &&
+		source_only_contract && !config.ps.zfloor && !region_repeat_fragment;
 	bool untextured_fragment = source_only_fragment && !config.vs.tme;
 	bool source_direct_fragment = source_only_fragment &&
 		m_impl->CanUseSourceDirectTfx(config);
@@ -4066,25 +4688,41 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		Console.WriteLn(
 			"GXM GS: PCSX2 PSMCT16 dither/quantization path active.");
 	}
-	const u32 primitive = config.indices_per_prim;
-	const u32 max_chunk = (MAX_STAGED_INDICES / primitive) * primitive;
-	for (u32 first = 0; first < config.nindices;)
+	if (m_impl->active_gpu_vu_draw)
 	{
-		const u32 count = std::min(max_chunk, config.nindices - first);
-		if (count == 0 || !m_impl->StageAndDraw(config, config.ps, first, count,
-			source, fragment, region_repeat_fragment, fast_fragment,
-			programmable_add_fragment,
-			programmable_add_direct_fragment,
-			programmable_over_fragment,
-			psm16_fragment,
-			source_only_fragment,
-			source_direct_fragment, source_direct_modulate_fragment,
-			source_direct_modulate_af_fragment,
-			untextured_fragment))
+		if (!m_impl->DrawGpuVu(config, source, fast_fragment, psm16_fragment,
+				region_repeat_fragment, manual_lod_fragment))
 		{
 			return;
 		}
-		first += count;
+	}
+	else
+	{
+		const u32 primitive = config.indices_per_prim;
+		if (primitive == 0)
+		{
+			m_impl->Reject("zero indices per primitive");
+			return;
+		}
+		const u32 max_chunk = (MAX_STAGED_INDICES / primitive) * primitive;
+		for (u32 first = 0; first < config.nindices;)
+		{
+			const u32 count = std::min(max_chunk, config.nindices - first);
+			if (count == 0 || !m_impl->StageAndDraw(config, config.ps, first,
+				count, source, fragment, region_repeat_fragment, fast_fragment,
+				programmable_add_fragment,
+				programmable_add_direct_fragment,
+				programmable_over_fragment,
+				psm16_fragment,
+				source_only_fragment,
+				source_direct_fragment, source_direct_modulate_fragment,
+				source_direct_modulate_af_fragment,
+				untextured_fragment))
+			{
+				return;
+			}
+			first += count;
+		}
 	}
 	if (psm24_fragment && VitaPerformanceTelemetry::IsEnabled())
 		s_gxm_worker_performance.psm24_draws++;
@@ -4909,6 +5547,12 @@ void GSDeviceGXM::Impl::Shutdown()
 	};
 	for (auto& entry : generated_vu_programs)
 	{
+		release_fragment(entry.second.opaque_fragment_program,
+			"release generated VU1+TFX opaque fragment program");
+		release_fragment(entry.second.zfloor_fragment_program,
+			"release generated VU1+TFX Z-floor fragment program");
+		release_fragment(entry.second.general_fragment_program,
+			"release generated VU1+TFX general fragment program");
 		release_vertex(entry.second.vertex_program,
 			"release generated VU1+TFX vertex program");
 	}
@@ -5141,6 +5785,9 @@ void GSDeviceGXM::Impl::Shutdown()
 	scene_ds = nullptr;
 	vertex_offset = 0;
 	index_offset = 0;
+	gpu_vu_sequential_indices = nullptr;
+	active_gpu_vu_draw = nullptr;
+	active_gpu_vu_draw_encoded = false;
 }
 
 #endif

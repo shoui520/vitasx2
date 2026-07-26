@@ -173,6 +173,11 @@ public:
 	// libGXM registration/patcher operation on the context-owning thread.
 	void PollGpuVuPrograms();
 
+	// GS-worker-only. Encodes one already-validated direct VU+TFX descriptor
+	// with the supplied PCSX2 draw state. No GSVertex/TfxVertex staging occurs.
+	bool RenderGpuVuDraw(GSHWDrawConfig& config,
+		std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
+
 	// GS-worker-only. Called immediately after a native GPU-VU draw has been
 	// encoded; ownership is held until its scene's vertex notification retires.
 	bool RetainGpuVuDrawForVertexCompletion(
