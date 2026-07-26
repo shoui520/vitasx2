@@ -387,7 +387,9 @@ namespace
 		// normalization, and Q/P visibility, while deliberately replacing the
 		// finite exact divide/square-root arithmetic. Accurate boot validation's
 		// DisableAll() below keeps the exact scalar VFP implementation.
-		EmuConfig.Speedhacks.vu1ApproximateQ = true;
+		// Approximate Q caused visible refmap corruption for negligible speed
+		// gain on real Vita hardware. Keep exact Q in the playable default.
+		EmuConfig.Speedhacks.vu1ApproximateQ = false;
 		EmuConfig.Speedhacks.vu1ApproximateP = true;
 		// PCSX2 owner: Pcsx2Config::SpeedhackOptions::MTVU and
 		// VMManager::SetEmuThreadAffinities(). Normal Vita execution overlaps
