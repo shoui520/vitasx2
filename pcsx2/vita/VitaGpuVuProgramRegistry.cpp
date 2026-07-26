@@ -3,6 +3,7 @@
 
 #include "vita/VitaGpuVuProgramRegistry.h"
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string_view>
@@ -26,6 +27,15 @@ struct RegistryEntry {
 std::mutex s_registry_mutex;
 std::map<ShaderKey, RegistryEntry, ShaderKeyLess> s_registry;
 ShaderCompiler *s_compiler = nullptr;
+std::atomic<u64> s_requests{0};
+std::atomic<u64> s_unavailable_requests{0};
+std::atomic<u64> s_cache_hits{0};
+std::atomic<u64> s_cache_misses{0};
+std::atomic<u64> s_compiler_queue_retries{0};
+std::atomic<u64> s_compile_successes{0};
+std::atomic<u64> s_compile_failures{0};
+std::atomic<u64> s_ready_programs{0};
+std::atomic<u64> s_failed_programs{0};
 
 constexpr u64 FnvPrime = 1099511628211ull;
 constexpr u64 LowOffset = 14695981039346656037ull;
@@ -83,6 +93,7 @@ void DetachGeneratedProgramCompiler(ShaderCompiler *compiler) {
 bool RequestGeneratedProgram(GeneratedCgProgram program, ShaderKey *key) {
   if (!key || program.source.empty())
     return false;
+  s_requests.fetch_add(1, std::memory_order_relaxed);
   *key = MakeGeneratedProgramKey(program);
   if (key->low == 0 && key->high == 0)
     return false;
@@ -92,17 +103,22 @@ bool RequestGeneratedProgram(GeneratedCgProgram program, ShaderKey *key) {
   // between lookup and queue insertion.
   std::lock_guard lock(s_registry_mutex);
   ShaderCompiler *const compiler = s_compiler;
-  if (!compiler)
+  if (!compiler) {
+    s_unavailable_requests.fetch_add(1, std::memory_order_relaxed);
     return false;
+  }
   const auto existing = s_registry.find(*key);
-  if (existing != s_registry.end())
+  if (existing != s_registry.end()) {
+    s_cache_hits.fetch_add(1, std::memory_order_relaxed);
     return existing->second.state != GeneratedProgramState::Failed;
+  }
 
   RegistryEntry entry;
   entry.state = GeneratedProgramState::Queued;
   entry.metadata = program;
   entry.metadata.source.clear();
   s_registry.emplace(*key, std::move(entry));
+  s_cache_misses.fetch_add(1, std::memory_order_relaxed);
 
   if (compiler->Submit(*key, std::move(program.source)))
     return true;
@@ -115,6 +131,7 @@ bool RequestGeneratedProgram(GeneratedCgProgram program, ShaderKey *key) {
       it->second.state == GeneratedProgramState::Queued) {
     s_registry.erase(it);
   }
+  s_compiler_queue_retries.fetch_add(1, std::memory_order_relaxed);
   return false;
 }
 
@@ -151,6 +168,8 @@ bool PollGeneratedProgramCompile(CompileResult *result,
   if (it == s_registry.end())
     return false;
   it->second.state = GeneratedProgramState::Compiled;
+  (result->succeeded ? s_compile_successes : s_compile_failures)
+      .fetch_add(1, std::memory_order_relaxed);
   *metadata = it->second.metadata;
   return true;
 }
@@ -163,6 +182,27 @@ void CompleteGeneratedProgramRegistration(const ShaderKey &key,
     return;
   it->second.state =
       succeeded ? GeneratedProgramState::Ready : GeneratedProgramState::Failed;
+  (succeeded ? s_ready_programs : s_failed_programs)
+      .fetch_add(1, std::memory_order_relaxed);
+}
+
+ProgramRegistryStatistics GetGeneratedProgramRegistryStatistics() {
+  ProgramRegistryStatistics stats;
+  stats.requests = s_requests.load(std::memory_order_relaxed);
+  stats.unavailable_requests =
+      s_unavailable_requests.load(std::memory_order_relaxed);
+  stats.cache_hits = s_cache_hits.load(std::memory_order_relaxed);
+  stats.cache_misses = s_cache_misses.load(std::memory_order_relaxed);
+  stats.compiler_queue_retries =
+      s_compiler_queue_retries.load(std::memory_order_relaxed);
+  stats.compile_successes = s_compile_successes.load(std::memory_order_relaxed);
+  stats.compile_failures = s_compile_failures.load(std::memory_order_relaxed);
+  stats.ready_programs = s_ready_programs.load(std::memory_order_relaxed);
+  stats.failed_programs = s_failed_programs.load(std::memory_order_relaxed);
+  std::lock_guard lock(s_registry_mutex);
+  if (s_compiler)
+    stats.compiler = s_compiler->GetStatistics();
+  return stats;
 }
 
 void ClearGeneratedProgramRegistry() {

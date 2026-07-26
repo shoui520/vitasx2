@@ -26,7 +26,9 @@
 #endif
 #include "vita/VitaGsMailbox.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaGpuVuDirectProgram.h"
 #include "vita/VitaGpuVuDraw.h"
+#include "vita/VitaGpuVuProgramRegistry.h"
 #include "vita/VitaGpuVuVifInput.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
@@ -139,6 +141,7 @@ namespace MTGS
 	static Threading::Thread s_thread;
 	static std::atomic_bool s_open_flag{false};
 	static std::atomic_bool s_shutdown_flag{false};
+	static std::atomic_bool s_gpu_vu_compiler_result_pending{false};
 	static bool s_native_presenter_enabled = false;
 	// On Vita g_gs_renderer owns this instance, matching PCSX2 GS.cpp. QEMU's
 	// software-only GSState keeps its existing mailbox-local owner instead.
@@ -376,6 +379,8 @@ namespace MTGS
 		GsProducerPerformanceTotals gs_producer;
 		GsWorkerPerformanceTotals gs_worker;
 		VitaGxmPerformanceCounters gxm;
+		VitaGpuVu::DirectProgramStatistics gpu_vu_direct;
+		VitaGpuVu::ProgramRegistryStatistics gpu_vu_programs;
 		VitaGpuVu::InputRingStatistics gpu_vu_input;
 		VitaGpuVu::DrawStatistics gpu_vu_draw;
 	};
@@ -434,6 +439,9 @@ namespace MTGS
 		snapshot.gs_worker = GetPublishedGsWorkerPerformance();
 		snapshot.completed_vsyncs = snapshot.gs_worker.completed_vsyncs;
 		snapshot.gxm = VitaGxmGetPublishedPerformanceCounters();
+		snapshot.gpu_vu_direct = VitaGpuVu::GetDirectProgramStatistics();
+		snapshot.gpu_vu_programs =
+			VitaGpuVu::GetGeneratedProgramRegistryStatistics();
 		snapshot.gpu_vu_input = VitaGpuVu::GetInputRingStatistics();
 		snapshot.gpu_vu_draw = VitaGpuVu::GetGpuVuDrawStatistics();
 		return snapshot;
@@ -1134,6 +1142,148 @@ namespace MTGS
 			static_cast<unsigned long long>(
 				end.gpu_vu_input.peak_live_references));
 		output.WriteLn(
+			"Vita perf v=1 window=%llu kind=gpu_vu_program prepared=%llu "
+			"prepare_hits=%llu evictions=%llu analysis_failures=%llu "
+			"without_parallel=%llu candidates=%llu prime_attempts=%llu "
+			"prime_hits=%llu stale_tokens=%llu gif_address_failures=%llu "
+			"gif_contract_rejections=%llu generated_roots=%llu "
+			"compiler_requests=%llu compiler_request_retries=%llu "
+			"registry_requests=%llu unavailable=%llu registry_hits=%llu "
+			"registry_misses=%llu queue_retries=%llu compile_successes=%llu "
+			"compile_failures=%llu ready=%llu failed=%llu "
+			"compiler_submit_attempts=%llu compiler_submitted=%llu "
+			"compiler_reject_state=%llu compiler_reject_source=%llu "
+			"compiler_reject_capacity=%llu compiler_reject_duplicate=%llu "
+			"compiler_dequeued=%llu compiler_starts=%llu "
+			"compiler_completions=%llu compiler_successes=%llu "
+			"compiler_failures=%llu compiler_polled=%llu "
+			"compiler_dropped=%llu compiler_time_us=%llu "
+			"compiler_longest_us=%llu compiler_pending_end=%llu "
+			"compiler_results_end=%llu compiler_in_flight_end=%llu "
+			"compiler_active_end=%llu",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.prepared_programs,
+				start.gpu_vu_direct.prepared_programs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.preparation_cache_hits,
+				start.gpu_vu_direct.preparation_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.preparation_evictions,
+				start.gpu_vu_direct.preparation_evictions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.analysis_failures,
+				start.gpu_vu_direct.analysis_failures)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.programs_without_parallel_candidate,
+				start.gpu_vu_direct.programs_without_parallel_candidate)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.parallel_candidates,
+				start.gpu_vu_direct.parallel_candidates)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.prime_attempts,
+				start.gpu_vu_direct.prime_attempts)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.prime_cache_hits,
+				start.gpu_vu_direct.prime_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.stale_tokens,
+				start.gpu_vu_direct.stale_tokens)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.gif_address_failures,
+				start.gpu_vu_direct.gif_address_failures)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.gif_contract_rejections,
+				start.gpu_vu_direct.gif_contract_rejections)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.generated_roots,
+				start.gpu_vu_direct.generated_roots)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.compiler_requests,
+				start.gpu_vu_direct.compiler_requests)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.compiler_request_retries,
+				start.gpu_vu_direct.compiler_request_retries)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.requests,
+				start.gpu_vu_programs.requests)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.unavailable_requests,
+				start.gpu_vu_programs.unavailable_requests)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.cache_hits,
+				start.gpu_vu_programs.cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.cache_misses,
+				start.gpu_vu_programs.cache_misses)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler_queue_retries,
+				start.gpu_vu_programs.compiler_queue_retries)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compile_successes,
+				start.gpu_vu_programs.compile_successes)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compile_failures,
+				start.gpu_vu_programs.compile_failures)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.ready_programs,
+				start.gpu_vu_programs.ready_programs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.failed_programs,
+				start.gpu_vu_programs.failed_programs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.submission_attempts,
+				start.gpu_vu_programs.compiler.submission_attempts)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.accepted_submissions,
+				start.gpu_vu_programs.compiler.accepted_submissions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.rejected_state,
+				start.gpu_vu_programs.compiler.rejected_state)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.rejected_source,
+				start.gpu_vu_programs.compiler.rejected_source)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.rejected_capacity,
+				start.gpu_vu_programs.compiler.rejected_capacity)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.rejected_duplicate,
+				start.gpu_vu_programs.compiler.rejected_duplicate)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.dequeued_requests,
+				start.gpu_vu_programs.compiler.dequeued_requests)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.compile_starts,
+				start.gpu_vu_programs.compiler.compile_starts)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.compile_completions,
+				start.gpu_vu_programs.compiler.compile_completions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.compile_successes,
+				start.gpu_vu_programs.compiler.compile_successes)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.compile_failures,
+				start.gpu_vu_programs.compiler.compile_failures)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.polled_results,
+				start.gpu_vu_programs.compiler.polled_results)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.dropped_results,
+				start.gpu_vu_programs.compiler.dropped_results)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.total_compile_us,
+				start.gpu_vu_programs.compiler.total_compile_us)),
+			static_cast<unsigned long long>(
+				end.gpu_vu_programs.compiler.longest_compile_us),
+			static_cast<unsigned long long>(
+				end.gpu_vu_programs.compiler.pending_requests),
+			static_cast<unsigned long long>(
+				end.gpu_vu_programs.compiler.completed_results),
+			static_cast<unsigned long long>(
+				end.gpu_vu_programs.compiler.in_flight_requests),
+			static_cast<unsigned long long>(
+				end.gpu_vu_programs.compiler.active_compiles));
+		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gpu_vu_draw queued=%llu consumed=%llu "
 			"rejected=%llu parallel=%llu serial=%llu interpreter=%llu "
 			"fused_vertices=%llu fused_primitives=%llu tfx_exports=%llu "
@@ -1676,6 +1826,8 @@ namespace MTGS
 		pxAssertRel(!IsOpen(), "GS worker should be closed when starting");
 		s_read_pos.store(0, std::memory_order_relaxed);
 		s_write_pos.store(0, std::memory_order_relaxed);
+		s_gpu_vu_compiler_result_pending.store(false,
+			std::memory_order_relaxed);
 		s_work_sema.Reset();
 		s_shutdown_flag.store(false, std::memory_order_release);
 		s_thread.SetStackSize(256 * 1024);
@@ -1712,6 +1864,22 @@ namespace MTGS
 		s_copy_data_tally = 0;
 	}
 
+#if defined(__vita__)
+	static void PollGpuVuProgramsOnOwner(bool force)
+	{
+		if (!g_gs_device)
+			return;
+		// The relaxed load is only a cheap hint on ordinary command boundaries;
+		// the exchange acquires the compiler's publication before Poll().
+		if (!force &&
+			!s_gpu_vu_compiler_result_pending.load(std::memory_order_relaxed))
+			return;
+		s_gpu_vu_compiler_result_pending.exchange(false,
+			std::memory_order_acquire);
+		static_cast<GSDeviceGXM*>(g_gs_device.get())->PollGpuVuPrograms();
+	}
+#endif
+
 	static void MainLoop()
 	{
 		std::unique_lock mtvu_lock(s_mtvu_wait_mutex);
@@ -1732,8 +1900,7 @@ namespace MTGS
 			// Completed ShaccCg output is registered only here, on the thread
 			// which owns the immediate context and shader patcher. Compilation
 			// itself never blocks this worker.
-			if (g_gs_device)
-				static_cast<GSDeviceGXM*>(g_gs_device.get())->PollGpuVuPrograms();
+			PollGpuVuProgramsOnOwner(true);
 #endif
 
 			while (s_read_pos.load(std::memory_order_relaxed) !=
@@ -1940,6 +2107,13 @@ namespace MTGS
 					s_signal_ring_enabled.store(false, std::memory_order_release);
 					s_ring_reset_sema.Post();
 				}
+#if defined(__vita__)
+				// A hot producer can keep this drain loop non-empty for seconds.
+				// The release/acquire pending bit avoids a compiler mutex probe
+				// on ordinary commands while still handing completed GXP to the
+				// GXM owner at the next command boundary.
+				PollGpuVuProgramsOnOwner(false);
+#endif
 			}
 
 			if (s_signal_ring_enabled.exchange(false, std::memory_order_acq_rel))
@@ -2452,6 +2626,13 @@ bool VitaGS::QueueGpuVuDraw(
 	VitaGpuVu::RecordGpuVuDrawQueued();
 	MTGS::SendPointerPacket(MTGS::Command::GpuVuDraw, 0, pointer);
 	return true;
+}
+
+void VitaGS::NotifyGpuVuCompilerResult()
+{
+	MTGS::s_gpu_vu_compiler_result_pending.store(true,
+		std::memory_order_release);
+	MTGS::s_work_sema.NotifyOfWork();
 }
 
 void VitaGS::NotifyPerformanceElfEntry()

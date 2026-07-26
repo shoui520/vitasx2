@@ -48,6 +48,9 @@ class VU_Thread final {
 	bool m_micro_write_pending = false;
 	u32 m_micro_invalidate_start = 0;
 	u32 m_micro_invalidate_end = 0;
+	u32 m_gpu_vu_direct_program_token = 0;
+	u32 m_gpu_vu_direct_program_start_pc = 0;
+	bool m_gpu_vu_direct_program_prepared = false;
 	std::vector<VitaGpuVu::VifUnpackSpan> m_deferred_vif_unpacks;
 	std::atomic<u32> m_deferred_vif_unpack_count{0};
 	u64 m_vif_span_sequence = 0;

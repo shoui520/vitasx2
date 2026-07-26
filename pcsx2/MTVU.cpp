@@ -6,9 +6,12 @@
 #include "MTVU.h"
 #include "VMManager.h"
 #include "Vif_Dynarec.h"
+#include "vita/VitaGpuVuDirectProgram.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 
+#include <array>
+#include <cstring>
 #include <thread>
 #include <utility>
 
@@ -45,6 +48,32 @@ static void MTVU_Unpack(void* data, VIFregisters& vifRegs)
 		dVifUnpack<1>((u8*)data, isFill);
 	else
 		_nVifUnpack(1, (u8*)data, vifRegs.mode, isFill);
+}
+
+static bool ReadGpuVuMemoryU16(void* user, u16 qword_address, u8 lane,
+	u16* value)
+{
+	if (!user || !value || lane >= 4)
+		return false;
+	const u8* const memory = static_cast<const u8*>(user);
+	const u32 byte_address =
+		((static_cast<u32>(qword_address) & 0x3ffu) * 16u) + lane * 4u;
+	u32 word = 0;
+	std::memcpy(&word, memory + byte_address, sizeof(word));
+	*value = static_cast<u16>(word);
+	return true;
+}
+
+static bool ReadGpuVuMemoryU32(void* user, u16 qword_address, u8 lane,
+	u32* value)
+{
+	if (!user || !value || lane >= 4)
+		return false;
+	const u8* const memory = static_cast<const u8*>(user);
+	const u32 byte_address =
+		((static_cast<u32>(qword_address) & 0x3ffu) * 16u) + lane * 4u;
+	std::memcpy(value, memory + byte_address, sizeof(*value));
+	return true;
 }
 
 // Called on Saving/Loading states...
@@ -173,6 +202,9 @@ void VU_Thread::Reset()
 	m_micro_write_pending = false;
 	m_micro_invalidate_start = 0;
 	m_micro_invalidate_end = 0;
+	m_gpu_vu_direct_program_token = 0;
+	m_gpu_vu_direct_program_start_pc = 0;
+	m_gpu_vu_direct_program_prepared = false;
 	m_vif_span_sequence = 0;
 	vuCycleIdx = 0;
 	m_ato_write_pos = 0;
@@ -218,6 +250,7 @@ void VU_Thread::EndProgram(u32 interrupt_flag)
 void VU_Thread::ExecuteRingBuffer()
 {
 	Threading::SetNameOfCurrentThread("MTVU");
+	u32 primed_direct_program_token = 0;
 
 	for (;;)
 	{
@@ -238,9 +271,39 @@ void VU_Thread::ExecuteRingBuffer()
 					vifRegs.top = Read();
 					vifRegs.itop = Read();
 					vuFBRST = Read();
+					const VitaGpuVu::DirectProgramToken direct_program{
+						Read()};
 					if (addr != -1)
 						VU1.VI[REG_TPC].UL = addr & 0x7FF;
 					CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
+					if (direct_program.IsValid() &&
+						direct_program.value != primed_direct_program_token)
+					{
+						std::array<u16, 16> initial_vi{};
+						std::array<u32, 32 * 4> initial_vf{};
+						for (u32 reg = 0; reg < initial_vi.size(); reg++)
+							initial_vi[reg] = VU1.VI[reg].US[0];
+						for (u32 reg = 0; reg < 32; reg++)
+						{
+							for (u32 lane = 0; lane < 4; lane++)
+								initial_vf[reg * 4 + lane] = VU1.VF[reg].UL[lane];
+						}
+
+						VitaGpuVu::InvocationEvaluationContext context;
+						context.vif_top = static_cast<u16>(vifRegs.top);
+						context.vif_itop = static_cast<u16>(vifRegs.itop);
+						context.initial_vi = initial_vi.data();
+						context.initial_vf_words = initial_vf.data();
+						context.memory_user = VU1.Mem;
+						context.read_memory_u16 = ReadGpuVuMemoryU16;
+						context.read_memory_u32 = ReadGpuVuMemoryU32;
+						if (VitaGpuVu::PrimeDirectProgram(
+								direct_program, context))
+						{
+							primed_direct_program_token =
+								direct_program.value;
+						}
+					}
 					BeginProgram();
 					CpuVU1->Execute(vu1RunCycles);
 					gifUnit.gifPath[GIF_PATH_1].FinishGSPacketMTVU();
@@ -254,6 +317,7 @@ void VU_Thread::ExecuteRingBuffer()
 					u32 vu_micro_addr = Read();
 					u32 size = Read();
 					Read(&VU1.Micro[vu_micro_addr], size);
+					primed_direct_program_token = 0;
 					break;
 				}
 				case MTVU_VU_WRITE_DATA:
@@ -644,12 +708,17 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 	MTVU_LOG("MTVU - ExecuteVU!");
 	PrepareVuCodeForExecute(static_cast<s32>(vu_addr));
 	Get_MTVUChanges(); // Clear any pending interrupts
-	ReserveSpace(5);
+	ReserveSpace(6);
 	Write(MTVU_VU_EXECUTE);
 	Write(vu_addr);
 	Write(vif_top);
 	Write(vif_itop);
 	Write(fbrst);
+	// MSCNT resumes from the MTVU-owned TPC, which is deliberately stale on
+	// CPU0. Dependent command-chain execution belongs to the universal GPU
+	// executor; never attach an explicit-entry direct token to that job.
+	Write(vu_addr == static_cast<u32>(-1) ?
+		0 : m_gpu_vu_direct_program_token);
 	CommitWritePos();
 	if (VitaPerformanceTelemetry::IsEnabled())
 		m_profile_execute_enqueues++;
@@ -713,6 +782,7 @@ void VU_Thread::WriteMicroMem(u32 vu_micro_addr, const void* data, u32 size)
 	MTVU_LOG("MTVU - WriteMicroMem!");
 	if (size != 0)
 	{
+		m_gpu_vu_direct_program_prepared = false;
 		const u32 end = std::min<u32>(vu_micro_addr + size, VU1_PROGSIZE);
 		if (!m_micro_write_pending)
 		{
@@ -737,7 +807,15 @@ void VU_Thread::WriteMicroMem(u32 vu_micro_addr, const void* data, u32 size)
 
 void VU_Thread::PrepareVuCodeForExecute(s32 vu_addr)
 {
-	if (!m_micro_write_pending && !VitaVU::Vu1ProgramNeedsPreparation(vu_addr))
+	const bool native_preparation_required =
+		m_micro_write_pending || VitaVU::Vu1ProgramNeedsPreparation(vu_addr);
+	const bool direct_start_known = (vu_addr != -1);
+	const u32 direct_start_pc = direct_start_known ?
+		((static_cast<u32>(vu_addr) & 0x7ffu) << 3) : 0;
+	if (!native_preparation_required &&
+		(!direct_start_known ||
+			(m_gpu_vu_direct_program_prepared &&
+				m_gpu_vu_direct_program_start_pc == direct_start_pc)))
 		return;
 
 	// Sony PSP2 VM-domain write mode applies to the process, not one core. The
@@ -755,7 +833,27 @@ void VU_Thread::PrepareVuCodeForExecute(s32 vu_addr)
 		m_micro_invalidate_start = 0;
 		m_micro_invalidate_end = 0;
 	}
-	VitaVU::PrepareVu1Program(vu_addr);
+	if (native_preparation_required)
+		VitaVU::PrepareVu1Program(vu_addr);
+
+	if (!direct_start_known)
+	{
+		m_gpu_vu_direct_program_token = 0;
+		m_gpu_vu_direct_program_prepared = false;
+		return;
+	}
+
+	const VitaGpuVu::DirectProgramToken prepared =
+		VitaGpuVu::PrepareDirectProgram(VU1.Micro, VU1_PROGSIZE,
+			direct_start_pc);
+	VitaGpuVu::DirectProgramInfo info;
+	m_gpu_vu_direct_program_token =
+		prepared.IsValid() &&
+			VitaGpuVu::GetDirectProgramInfo(prepared, &info) &&
+			info.parallel_candidates != 0 ?
+		prepared.value : 0;
+	m_gpu_vu_direct_program_start_pc = direct_start_pc;
+	m_gpu_vu_direct_program_prepared = true;
 }
 
 void VU_Thread::WriteDataMem(u32 vu_data_addr, const void* data, u32 size)

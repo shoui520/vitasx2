@@ -22,6 +22,19 @@ enum class GeneratedProgramState : u8 {
   Unavailable,
 };
 
+struct ProgramRegistryStatistics {
+  u64 requests = 0;
+  u64 unavailable_requests = 0;
+  u64 cache_hits = 0;
+  u64 cache_misses = 0;
+  u64 compiler_queue_retries = 0;
+  u64 compile_successes = 0;
+  u64 compile_failures = 0;
+  u64 ready_programs = 0;
+  u64 failed_programs = 0;
+  ShaderCompilerStatistics compiler;
+};
+
 // Stable 128-bit content key used only to coalesce/invalidate generated GXP.
 ShaderKey MakeGeneratedProgramKey(const GeneratedCgProgram &program);
 
@@ -41,6 +54,7 @@ GeneratedProgramState QueryGeneratedProgram(const ShaderKey &key);
 bool PollGeneratedProgramCompile(CompileResult *result,
                                  GeneratedCgProgram *metadata);
 void CompleteGeneratedProgramRegistration(const ShaderKey &key, bool succeeded);
+ProgramRegistryStatistics GetGeneratedProgramRegistryStatistics();
 
 // Called after the GS context has drained and generated programs are released.
 void ClearGeneratedProgramRegistry();

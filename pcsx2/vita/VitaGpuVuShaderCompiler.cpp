@@ -4,6 +4,8 @@
 #include "vita/VitaGpuVuShaderCompiler.h"
 
 #include "common/Console.h"
+#include "common/Timer.h"
+#include "vita/VitaGsMailbox.h"
 
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/threadmgr.h>
@@ -89,22 +91,32 @@ void ShaderCompiler::Stop() {
 }
 
 bool ShaderCompiler::Submit(const ShaderKey &key, std::string source) {
+  m_submission_attempts.fetch_add(1, std::memory_order_relaxed);
   const State state = m_state.load(std::memory_order_acquire);
-  if ((state != State::Starting && state != State::Ready) || source.empty() ||
-      source.size() > MaxGeneratedSourceBytes) {
+  if (state != State::Starting && state != State::Ready) {
+    m_rejected_state.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (source.empty() || source.size() > MaxGeneratedSourceBytes) {
+    m_rejected_source.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
   {
     std::lock_guard lock(m_mutex);
     if (m_requests.size() >= MaxPendingRequests ||
-        m_in_flight.size() >= MaxPendingRequests + MaxCompletedResults ||
-        HasKeyLocked(key)) {
+        m_in_flight.size() >= MaxPendingRequests + MaxCompletedResults) {
+      m_rejected_capacity.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    if (HasKeyLocked(key)) {
+      m_rejected_duplicate.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
     m_in_flight.push_back(key);
     m_requests.push_back({key, std::move(source)});
   }
+  m_accepted_submissions.fetch_add(1, std::memory_order_relaxed);
   m_work_sema.NotifyOfWork();
   return true;
 }
@@ -122,12 +134,47 @@ bool ShaderCompiler::Poll(CompileResult *result) {
       std::find(m_in_flight.begin(), m_in_flight.end(), result->key);
   if (it != m_in_flight.end())
     m_in_flight.erase(it);
+  m_polled_results.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
 std::string ShaderCompiler::GetCompilerVersion() const {
   std::lock_guard lock(m_mutex);
   return m_compiler_version;
+}
+
+ShaderCompilerStatistics ShaderCompiler::GetStatistics() const {
+  ShaderCompilerStatistics stats;
+  stats.submission_attempts =
+      m_submission_attempts.load(std::memory_order_relaxed);
+  stats.accepted_submissions =
+      m_accepted_submissions.load(std::memory_order_relaxed);
+  stats.rejected_state = m_rejected_state.load(std::memory_order_relaxed);
+  stats.rejected_source = m_rejected_source.load(std::memory_order_relaxed);
+  stats.rejected_capacity =
+      m_rejected_capacity.load(std::memory_order_relaxed);
+  stats.rejected_duplicate =
+      m_rejected_duplicate.load(std::memory_order_relaxed);
+  stats.dequeued_requests =
+      m_dequeued_requests.load(std::memory_order_relaxed);
+  stats.compile_starts = m_compile_starts.load(std::memory_order_relaxed);
+  stats.compile_completions =
+      m_compile_completions.load(std::memory_order_relaxed);
+  stats.compile_successes =
+      m_compile_successes.load(std::memory_order_relaxed);
+  stats.compile_failures = m_compile_failures.load(std::memory_order_relaxed);
+  stats.polled_results = m_polled_results.load(std::memory_order_relaxed);
+  stats.dropped_results = m_dropped_results.load(std::memory_order_relaxed);
+  stats.total_compile_us =
+      m_total_compile_us.load(std::memory_order_relaxed);
+  stats.longest_compile_us =
+      m_longest_compile_us.load(std::memory_order_relaxed);
+  stats.active_compiles = m_active_compiles.load(std::memory_order_relaxed);
+  std::lock_guard lock(m_mutex);
+  stats.pending_requests = m_requests.size();
+  stats.completed_results = m_results.size();
+  stats.in_flight_requests = m_in_flight.size();
+  return stats;
 }
 
 bool ShaderCompiler::HasKeyLocked(const ShaderKey &key) const {
@@ -293,16 +340,62 @@ void ShaderCompiler::WorkerMain() {
         m_requests.pop_front();
       }
 
+      m_dequeued_requests.fetch_add(1, std::memory_order_relaxed);
+      m_compile_starts.fetch_add(1, std::memory_order_relaxed);
+      m_active_compiles.fetch_add(1, std::memory_order_relaxed);
+      const Common::Timer::Value compile_start =
+          Common::Timer::GetCurrentValue();
+      Console.WriteLn(
+          "GPU-VU: ShaccCg compile started for %016llx%016llx (%u source "
+          "bytes).",
+          static_cast<unsigned long long>(request.key.high),
+          static_cast<unsigned long long>(request.key.low),
+          static_cast<u32>(request.source.size()));
       CompileResult result = Compile(request);
-      std::lock_guard lock(m_mutex);
-      if (m_results.size() < MaxCompletedResults) {
-        m_results.push_back(std::move(result));
-      } else {
-        const auto it =
-            std::find(m_in_flight.begin(), m_in_flight.end(), request.key);
-        if (it != m_in_flight.end())
-          m_in_flight.erase(it);
+      const Common::Timer::Value compile_end = Common::Timer::GetCurrentValue();
+      const u64 compile_us = static_cast<u64>(
+          Common::Timer::ConvertValueToSeconds(compile_end - compile_start) *
+          1000000.0);
+      m_active_compiles.fetch_sub(1, std::memory_order_relaxed);
+      m_compile_completions.fetch_add(1, std::memory_order_relaxed);
+      (result.succeeded ? m_compile_successes : m_compile_failures)
+          .fetch_add(1, std::memory_order_relaxed);
+      m_total_compile_us.fetch_add(compile_us, std::memory_order_relaxed);
+      u64 longest_compile_us =
+          m_longest_compile_us.load(std::memory_order_relaxed);
+      while (compile_us > longest_compile_us &&
+             !m_longest_compile_us.compare_exchange_weak(
+                 longest_compile_us, compile_us, std::memory_order_relaxed,
+                 std::memory_order_relaxed)) {
       }
+      Console.WriteLn(
+          "GPU-VU: ShaccCg compile %s for %016llx%016llx in %llu us "
+          "(%u GXP bytes, %u diagnostics).",
+          result.succeeded ? "completed" : "failed",
+          static_cast<unsigned long long>(request.key.high),
+          static_cast<unsigned long long>(request.key.low),
+          static_cast<unsigned long long>(compile_us),
+          static_cast<u32>(result.gxp.size()),
+          static_cast<u32>(result.diagnostics.size()));
+      bool result_published = false;
+      {
+        std::lock_guard lock(m_mutex);
+        if (m_results.size() < MaxCompletedResults) {
+          m_results.push_back(std::move(result));
+          result_published = true;
+        } else {
+          const auto it =
+              std::find(m_in_flight.begin(), m_in_flight.end(), request.key);
+          if (it != m_in_flight.end())
+            m_in_flight.erase(it);
+          m_dropped_results.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      // The GS mailbox may otherwise sleep indefinitely after a cold compile.
+      // Publish first, then issue a one-way CPU work notification; the GS
+      // owner remains the only thread which registers and patches the GXP.
+      if (result_published)
+        VitaGS::NotifyGpuVuCompilerResult();
     }
   }
 

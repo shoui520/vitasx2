@@ -37,6 +37,28 @@ struct CompileResult {
   std::vector<CompileDiagnostic> diagnostics;
 };
 
+struct ShaderCompilerStatistics {
+  u64 submission_attempts = 0;
+  u64 accepted_submissions = 0;
+  u64 rejected_state = 0;
+  u64 rejected_source = 0;
+  u64 rejected_capacity = 0;
+  u64 rejected_duplicate = 0;
+  u64 dequeued_requests = 0;
+  u64 compile_starts = 0;
+  u64 compile_completions = 0;
+  u64 compile_successes = 0;
+  u64 compile_failures = 0;
+  u64 polled_results = 0;
+  u64 dropped_results = 0;
+  u64 total_compile_us = 0;
+  u64 longest_compile_us = 0;
+  u64 pending_requests = 0;
+  u64 completed_results = 0;
+  u64 in_flight_requests = 0;
+  u64 active_compiles = 0;
+};
+
 // One bounded, serialized compiler for generated VU1+TFX vertex programs.
 // ShaccCg is deliberately never called by the GS worker. Completed GXP is
 // copied out of Shacc-owned storage and only registered/patched by the GS
@@ -69,6 +91,7 @@ public:
   State GetState() const { return m_state.load(std::memory_order_acquire); }
 
   std::string GetCompilerVersion() const;
+  ShaderCompilerStatistics GetStatistics() const;
 
 private:
   struct Request {
@@ -95,6 +118,22 @@ private:
   Threading::Thread m_thread;
   std::atomic<State> m_state{State::Stopped};
   std::atomic<bool> m_shutdown{false};
+  std::atomic<u64> m_submission_attempts{0};
+  std::atomic<u64> m_accepted_submissions{0};
+  std::atomic<u64> m_rejected_state{0};
+  std::atomic<u64> m_rejected_source{0};
+  std::atomic<u64> m_rejected_capacity{0};
+  std::atomic<u64> m_rejected_duplicate{0};
+  std::atomic<u64> m_dequeued_requests{0};
+  std::atomic<u64> m_compile_starts{0};
+  std::atomic<u64> m_compile_completions{0};
+  std::atomic<u64> m_compile_successes{0};
+  std::atomic<u64> m_compile_failures{0};
+  std::atomic<u64> m_polled_results{0};
+  std::atomic<u64> m_dropped_results{0};
+  std::atomic<u64> m_total_compile_us{0};
+  std::atomic<u64> m_longest_compile_us{0};
+  std::atomic<u64> m_active_compiles{0};
   s32 m_module_id = -1;
   bool m_system_module = false;
   bool m_extensions_enabled = false;

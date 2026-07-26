@@ -180,6 +180,7 @@ add_library(pcsx2core STATIC
 	vita/VitaGpuVuLoopKernel.cpp
 	vita/VitaGpuVuInvocationPlan.cpp
 	vita/VitaGpuVuCgGenerator.cpp
+	vita/VitaGpuVuDirectProgram.cpp
 	vita/VitaGpuVuDraw.cpp
 	vita/VitaGpuVuGifContract.cpp
 	vita/VitaGpuVuShaderCompiler.cpp

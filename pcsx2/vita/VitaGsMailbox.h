@@ -28,6 +28,11 @@ namespace VitaGS
 	// exactly once by the GS/GXM-owning thread.
 	bool QueueGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
 
+	// Wakes the GS owner after the asynchronous compiler publishes a completed
+	// GXP. This is a CPU work notification only: it never waits for or flushes
+	// GXM, and registration/patching still occurs exclusively on the GS thread.
+	void NotifyGpuVuCompilerResult();
+
 	const u8* GetLocalMemoryForTrace(size_t* size);
 
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
