@@ -133,6 +133,10 @@ std::shared_ptr<PreparedProgram> BuildPreparedProgram(const u8 *micro,
         !candidate.kernel.independent_store_values ||
         !BuildParallelInvocationPlan(prepared->analysis, candidate.kernel,
                                      &candidate.invocation, &error) ||
+        !InlineAcyclicEntrySlice(prepared->analysis, loop_index,
+                                &candidate.kernel, &error) ||
+        !candidate.kernel.acyclic_entry_inlined ||
+        candidate.kernel.requires_dynamic_entry_state ||
         !candidate.invocation.has_static_gif_source) {
       continue;
     }
@@ -183,7 +187,8 @@ bool RequestCandidate(DirectCandidate *candidate,
     if (!BuildDirectTfxContract(candidate->kernel, tag.data(), &contract,
                                 &error) ||
         !GenerateParallelTfxCg(candidate->kernel, contract, &generated,
-                               &error)) {
+                               &error) ||
+        generated.requires_dynamic_entry_state) {
       s_gif_contract_rejections.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
@@ -232,11 +237,14 @@ bool RequestCandidate(DirectCandidate *candidate,
 
   Console.WriteLn(
       "GPU-VU: requested generated direct VU1+TFX root "
-      "%016llx%016llx (%u vertices, primitive %u, %u streams, %u expressions).",
+      "%016llx%016llx (%u vertices, primitive %u, %u streams, "
+      "%u constants, VF mask %08x, %u expressions).",
       static_cast<unsigned long long>(candidate->key.high),
       static_cast<unsigned long long>(candidate->key.low),
       candidate->contract.vertex_count, candidate->contract.primitive,
       static_cast<u32>(candidate->generated.memory_inputs.size()),
+      static_cast<u32>(candidate->generated.constant_inputs.size()),
+      candidate->generated.vf_uniform_mask,
       candidate->generated.emitted_expression_count);
   return true;
 }
@@ -320,21 +328,24 @@ bool PrimeDirectProgram(DirectProgramToken token,
     return true;
   }
 
+  // Priming is a cold, bounded attempt. A semantic/source rejection or a
+  // temporarily unavailable compiler must never turn the VU execution stream
+  // into a retry loop on the 496 MHz MTVU core. Compiler-service retry and a
+  // lower GPU output selection are separate descriptor-level events.
+  prepared->primed = true;
   bool resolved_tag = false;
   for (DirectCandidate &candidate : prepared->candidates) {
     std::array<u32, 4> tag{};
     if (!ReadGifTag(candidate.invocation, context, &tag))
       continue;
     resolved_tag = true;
-    if (RequestCandidate(&candidate, tag)) {
-      prepared->primed = true;
+    if (RequestCandidate(&candidate, tag))
       return true;
-    }
   }
 
   if (!resolved_tag)
     s_gif_address_failures.fetch_add(1, std::memory_order_relaxed);
-  return false;
+  return true;
 }
 
 bool GetDirectProgramInfo(DirectProgramToken token, DirectProgramInfo *info) {

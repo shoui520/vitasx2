@@ -61,6 +61,11 @@ struct VectorUniform {
   u8 register_index = 0;
 };
 
+struct ConstantUniform {
+  std::array<u32, 4> bits{};
+  u8 input_index = 0;
+};
+
 enum ScalarUniformMask : u32 {
   ScalarUniformQ = 1u << 0,
   ScalarUniformP = 1u << 1,
@@ -111,6 +116,7 @@ public:
   DirectTfxContract direct_tfx;
   std::array<u32, 4> gif_tag{};
   std::vector<StreamBinding> streams;
+  std::vector<ConstantUniform> constant_uniforms;
   std::vector<VectorUniform> vf_uniforms;
   std::array<u32, 4> acc_uniform{};
   ScalarUniforms scalar_uniforms;
@@ -134,6 +140,12 @@ private:
 };
 
 u64 NextGpuVuOrderingSequence();
+
+// This becomes true only when CPU0 can retain the immutable VIF epoch, omit
+// CpuVU1->Execute(), and queue its GpuVuDraw at the matching PATH1 position.
+// Cold shader preparation must not consume MTVU time before that handoff
+// exists.
+bool IsDirectDrawAdmissionConnected();
 
 // PhyreEngine's GXM resource contract: notification values are monotonically
 // increasing modulo 2^32, and any later completed value retires an older one.

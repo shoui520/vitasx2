@@ -7,6 +7,7 @@
 #include "VMManager.h"
 #include "Vif_Dynarec.h"
 #include "vita/VitaGpuVuDirectProgram.h"
+#include "vita/VitaGpuVuDraw.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 
@@ -26,6 +27,7 @@ static __fi u32 size_u32(u32 x) { return (x + 3) >> 2; }
 enum MTVU_EVENT
 {
 	MTVU_VU_EXECUTE,     // Execute VU program
+	MTVU_VU_EXECUTE_DIRECT, // Execute with an admitted direct-program token
 	MTVU_VU_WRITE_MICRO, // Write to VU micro-mem
 	MTVU_VU_WRITE_DATA,  // Write to VU data-mem
 	MTVU_VU_WRITE_VIREGS,// Write to VU registers
@@ -264,7 +266,10 @@ void VU_Thread::ExecuteRingBuffer()
 			switch (tag)
 			{
 				case MTVU_VU_EXECUTE:
+				case MTVU_VU_EXECUTE_DIRECT:
 				{
+					const bool has_direct_program =
+						tag == MTVU_VU_EXECUTE_DIRECT;
 					ReplayDeferredVifUnpacks();
 					VU1.cycle = 0;
 					s32 addr = Read();
@@ -272,11 +277,12 @@ void VU_Thread::ExecuteRingBuffer()
 					vifRegs.itop = Read();
 					vuFBRST = Read();
 					const VitaGpuVu::DirectProgramToken direct_program{
-						Read()};
+						has_direct_program ? Read() : 0};
 					if (addr != -1)
 						VU1.VI[REG_TPC].UL = addr & 0x7FF;
 					CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
-					if (direct_program.IsValid() &&
+					if (VitaGpuVu::IsDirectDrawAdmissionConnected() &&
+						direct_program.IsValid() &&
 						direct_program.value != primed_direct_program_token)
 					{
 						std::array<u16, 16> initial_vi{};
@@ -708,8 +714,12 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 	MTVU_LOG("MTVU - ExecuteVU!");
 	PrepareVuCodeForExecute(static_cast<s32>(vu_addr));
 	Get_MTVUChanges(); // Clear any pending interrupts
-	ReserveSpace(6);
-	Write(MTVU_VU_EXECUTE);
+	const bool direct_program_job =
+		VitaGpuVu::IsDirectDrawAdmissionConnected() &&
+		vu_addr != static_cast<u32>(-1) &&
+		m_gpu_vu_direct_program_token != 0;
+	ReserveSpace(direct_program_job ? 6 : 5);
+	Write(direct_program_job ? MTVU_VU_EXECUTE_DIRECT : MTVU_VU_EXECUTE);
 	Write(vu_addr);
 	Write(vif_top);
 	Write(vif_itop);
@@ -717,8 +727,8 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 	// MSCNT resumes from the MTVU-owned TPC, which is deliberately stale on
 	// CPU0. Dependent command-chain execution belongs to the universal GPU
 	// executor; never attach an explicit-entry direct token to that job.
-	Write(vu_addr == static_cast<u32>(-1) ?
-		0 : m_gpu_vu_direct_program_token);
+	if (direct_program_job)
+		Write(m_gpu_vu_direct_program_token);
 	CommitWritePos();
 	if (VitaPerformanceTelemetry::IsEnabled())
 		m_profile_execute_enqueues++;
@@ -740,6 +750,7 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* data, u32 size)
 {
 	MTVU_LOG("MTVU - VifUnpack!");
+#if defined(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY)
 	VitaGpuVu::VifUnpackSpan span;
 	span.sequence = ++m_vif_span_sequence;
 	span.source_size = size;
@@ -757,7 +768,6 @@ void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* dat
 	span.start_alignment = _vif.start_aligned;
 	const bool direct_affine_span =
 		VitaGpuVu::IsDirectAffineV4_32Span(span);
-#if defined(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY)
 	if (direct_affine_span &&
 		VitaGpuVu::CaptureRawVifPayload(data, size, &span.payload))
 	{
@@ -768,14 +778,6 @@ void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* dat
 		KickStart();
 		return;
 	}
-#else
-	// Until an ordered GpuVuDraw can retain this payload, copying it to
-	// USER_MAIN_NC_RW and then immediately CPU-unpacking it is pure duplicate
-	// work. Keep PCSX2's cacheable MTVU-ring handoff authoritative. The
-	// opt-in control above reproduces the ownership boundary without making
-	// that temporary cost the playable default.
-	if (direct_affine_span)
-		VitaGpuVu::RecordDisconnectedCaptureBypass(size);
 #endif
 
 	u32 vif_copy_size = (u32)((uptr)&_vif.StructEnd - (uptr)&_vif.tag);
@@ -821,7 +823,8 @@ void VU_Thread::PrepareVuCodeForExecute(s32 vu_addr)
 {
 	const bool native_preparation_required =
 		m_micro_write_pending || VitaVU::Vu1ProgramNeedsPreparation(vu_addr);
-	const bool direct_start_known = (vu_addr != -1);
+	const bool direct_start_known =
+		VitaGpuVu::IsDirectDrawAdmissionConnected() && vu_addr != -1;
 	const u32 direct_start_pc = direct_start_known ?
 		((static_cast<u32>(vu_addr) & 0x7ffu) << 3) : 0;
 	if (!native_preparation_required &&

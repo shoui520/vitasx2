@@ -17,6 +17,7 @@ namespace {
 
 constexpr u32 InvalidNode = 0;
 constexpr u32 MaximumMemoryInputs = 16;
+constexpr u32 MaximumConstantInputs = 32;
 constexpr u32 MaximumVertexAttributes = 16;
 constexpr u32 MaximumValidationStores = 8;
 constexpr size_t MaximumGeneratedSourceBytes = 512 * 1024;
@@ -95,6 +96,8 @@ public:
     CollectResources();
     if (m_program->memory_inputs.size() > MaximumMemoryInputs)
       return Fail(error, "parallel Cg root exceeds GXM vertex input capacity");
+    if (m_program->constant_inputs.size() > MaximumConstantInputs)
+      return Fail(error, "parallel Cg root exceeds constant-input capacity");
     u32 attribute_count = 0;
     for (const CgMemoryInput &input : m_program->memory_inputs) {
       if (!m_program->uses_flat_instance_inputs) {
@@ -235,6 +238,7 @@ private:
 
   void CollectResources() {
     std::map<MemoryKey, u32> memory_indices;
+    std::map<MemoryKey, u32> constant_indices;
     for (u32 node_id = 1; node_id < m_kernel.expressions.size(); node_id++) {
       if (!m_reachable[node_id] && !m_flat_color_reachable[node_id])
         continue;
@@ -242,6 +246,16 @@ private:
       switch (node.kind) {
       case ExpressionKind::Memory: {
         const MemoryKey key = MakeMemoryKey(node.memory_address);
+        if (node.memory_address.invocation_coefficient == 0) {
+          auto [it, inserted] = constant_indices.emplace(
+              key, static_cast<u32>(constant_indices.size()));
+          if (inserted) {
+            m_program->constant_inputs.push_back(
+                {node.memory_address, it->second});
+          }
+          m_constant_node_input[node_id] = it->second;
+          break;
+        }
         auto [it, inserted] = memory_indices.emplace(
             key, static_cast<u32>(memory_indices.size()));
         if (inserted) {
@@ -260,20 +274,61 @@ private:
         }
         break;
       }
+      case ExpressionKind::InitialVf:
+        m_program->vf_uniform_mask |= 1u << node.reg;
+        m_program->stable_initial_vf_lanes[node.reg] |=
+            static_cast<u8>(0x8u >> node.lane);
+        if ((m_kernel.stable_initial_vf_lanes[node.reg] &
+             (0x8u >> node.lane)) == 0) {
+          m_program->requires_dynamic_entry_state = true;
+        }
+        break;
+      case ExpressionKind::InitialAcc:
+        m_program->uses_acc_uniform = true;
+        m_program->stable_initial_acc_lanes |=
+            static_cast<u8>(0x8u >> node.lane);
+        if ((m_kernel.stable_initial_acc_lanes &
+             (0x8u >> node.lane)) == 0) {
+          m_program->requires_dynamic_entry_state = true;
+        }
+        break;
+      case ExpressionKind::InitialQ:
+        m_program->uses_q_uniform = true;
+        m_program->stable_initial_q = true;
+        m_program->requires_dynamic_entry_state |=
+            !m_kernel.stable_initial_q;
+        break;
+      case ExpressionKind::InitialP:
+        m_program->uses_p_uniform = true;
+        m_program->stable_initial_p = true;
+        m_program->requires_dynamic_entry_state |=
+            !m_kernel.stable_initial_p;
+        break;
+      case ExpressionKind::InitialI:
+        m_program->uses_i_uniform = true;
+        m_program->stable_initial_i = true;
+        m_program->requires_dynamic_entry_state |=
+            !m_kernel.stable_initial_i;
+        break;
       case ExpressionKind::InvariantVf:
         m_program->vf_uniform_mask |= 1u << node.reg;
+        m_program->requires_dynamic_entry_state = true;
         break;
       case ExpressionKind::InvariantAcc:
         m_program->uses_acc_uniform = true;
+        m_program->requires_dynamic_entry_state = true;
         break;
       case ExpressionKind::InvariantQ:
         m_program->uses_q_uniform = true;
+        m_program->requires_dynamic_entry_state = true;
         break;
       case ExpressionKind::InvariantP:
         m_program->uses_p_uniform = true;
+        m_program->requires_dynamic_entry_state = true;
         break;
       case ExpressionKind::InvariantI:
         m_program->uses_i_uniform = true;
+        m_program->requires_dynamic_entry_state = true;
         break;
       default:
         break;
@@ -309,6 +364,17 @@ private:
     m_source += std::to_string(m_program->flat_instance_vertex_step);
     m_source += " stripWinding=";
     m_source += m_program->flat_strip_winding ? "1\n" : "0\n";
+    m_source += "// GXM constant qwords=";
+    for (u32 index = 0; index < m_program->constant_inputs.size(); index++) {
+      if (index != 0)
+        m_source += ",";
+      const AffineQwordAddress& address =
+          m_program->constant_inputs[index].address;
+      m_source += std::to_string(address.base_vi);
+      m_source += "/";
+      m_source += std::to_string(address.qword_offset);
+    }
+    m_source += "\n";
     m_source += "// GXM flat attribute masks=";
     for (u32 index = 0; index < m_program->memory_inputs.size(); index++) {
       if (index != 0)
@@ -424,6 +490,10 @@ private:
                         std::to_string(input.attribute_index) + " : TEXCOORD" +
                         std::to_string(attribute_semantic++));
       }
+    }
+    for (const CgConstantInput &input : m_program->constant_inputs) {
+      AppendParameter("uniform float4 VuConstant" +
+                      std::to_string(input.uniform_index));
     }
     for (u32 reg = 1; reg < 32; reg++) {
       if ((m_program->vf_uniform_mask & (1u << reg)) != 0) {
@@ -555,22 +625,39 @@ private:
       return std::to_string(static_cast<s32>(node.immediate));
     case ExpressionKind::ConstantUnsigned:
       return std::to_string(node.immediate) + "u";
+    case ExpressionKind::InitialVf:
     case ExpressionKind::InvariantVf: {
       const std::string name =
           "VF" + (node.reg < 10 ? std::string("0") : std::string()) +
           std::to_string(node.reg) + "." + LaneName(node.lane);
       return ReadFloatUniform(name, node.domain);
     }
+    case ExpressionKind::InitialAcc:
     case ExpressionKind::InvariantAcc:
       return ReadFloatUniform("ACC." + std::string(LaneName(node.lane)),
                               node.domain);
+    case ExpressionKind::InitialQ:
     case ExpressionKind::InvariantQ:
       return ReadFloatUniform("Q", node.domain);
+    case ExpressionKind::InitialP:
     case ExpressionKind::InvariantP:
       return ReadFloatUniform("P", node.domain);
+    case ExpressionKind::InitialI:
     case ExpressionKind::InvariantI:
       return ReadFloatUniform("I", node.domain);
     case ExpressionKind::Memory: {
+      const auto constant = m_constant_node_input.find(node_id);
+      if (constant != m_constant_node_input.end()) {
+        const std::string value =
+            "VuConstant" + std::to_string(constant->second) + "." +
+            LaneName(node.lane);
+        if (node.domain == ScalarDomain::Float)
+          return value;
+        const std::string raw = RawFromFloat(value);
+        return node.domain == ScalarDomain::UnsignedInt
+                   ? "unsigned int(" + raw + ")"
+                   : raw;
+      }
       const auto it = m_memory_node_input.find(node_id);
       if (it == m_memory_node_input.end()) {
         Fail(error, "parallel Cg memory expression has no input binding");
@@ -770,6 +857,7 @@ private:
   std::vector<bool> m_reachable;
   std::vector<bool> m_flat_color_reachable;
   std::map<u32, u32> m_memory_node_input;
+  std::map<u32, u32> m_constant_node_input;
   std::string m_source;
   bool m_first_parameter = true;
 };

@@ -23,6 +23,11 @@ enum class ExpressionKind : u8 {
   ConstantFloat,
   ConstantSigned,
   ConstantUnsigned,
+  InitialVf,
+  InitialAcc,
+  InitialQ,
+  InitialP,
+  InitialI,
   InvariantVf,
   InvariantAcc,
   InvariantQ,
@@ -95,6 +100,13 @@ struct ParallelLoopKernel {
   ViEvolution vi;
   std::vector<ExpressionNode> expressions;
   std::vector<LoopStore> stores;
+  std::array<u8, 32> stable_initial_vf_lanes{};
+  u8 stable_initial_acc_lanes = 0;
+  bool stable_initial_q = false;
+  bool stable_initial_p = false;
+  bool stable_initial_i = false;
+  bool acyclic_entry_inlined = false;
+  bool requires_dynamic_entry_state = false;
   bool has_true_recurrence = false;
   bool has_unsupported_expression = false;
   bool independent_store_values = false;
@@ -107,5 +119,16 @@ struct ParallelLoopKernel {
 // ShaccCg remains the whole-program SSA/register allocator.
 bool BuildParallelLoopKernel(const ProgramAnalysis &program, u32 loop_index,
                              ParallelLoopKernel *kernel, std::string *error);
+
+// Replaces loop-entry invariant leaves with the PairPlan-defined arithmetic
+// and fixed-address VU-memory loads in the acyclic region from the external
+// entry to the natural-loop header. Every pair reads one input snapshot and
+// commits lower then upper writes, preserving simultaneous-pair semantics and
+// upper priority. Values which genuinely originate outside the program remain
+// Initial* leaves; lanes written anywhere in the program are marked unstable
+// so direct admission cannot reuse a stale seed across invocations.
+bool InlineAcyclicEntrySlice(const ProgramAnalysis &program, u32 loop_index,
+                            ParallelLoopKernel *kernel,
+                            std::string *error);
 
 } // namespace VitaGpuVu

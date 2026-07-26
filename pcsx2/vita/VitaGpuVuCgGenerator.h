@@ -20,13 +20,28 @@ struct CgMemoryInput {
   u8 flat_attribute_vertex_mask = 0;
 };
 
+// One descriptor-scale VU-memory qword which is invariant across every
+// invocation in the draw. It is uploaded once through the vertex default
+// uniform buffer, never repeated as a per-vertex stream.
+struct CgConstantInput {
+  AffineQwordAddress address;
+  u32 uniform_index = 0;
+};
+
 struct GeneratedCgProgram {
   std::string source;
   std::vector<CgMemoryInput> memory_inputs;
+  std::vector<CgConstantInput> constant_inputs;
   u32 vf_uniform_mask = 0;
+  std::array<u8, 32> stable_initial_vf_lanes{};
+  u8 stable_initial_acc_lanes = 0;
   u32 emitted_expression_count = 0;
   u8 flat_vertices_per_primitive = 0;
   u8 flat_instance_vertex_step = 0;
+  bool stable_initial_q = false;
+  bool stable_initial_p = false;
+  bool stable_initial_i = false;
+  bool requires_dynamic_entry_state = false;
   bool uses_acc_uniform = false;
   bool uses_q_uniform = false;
   bool uses_p_uniform = false;

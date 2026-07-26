@@ -124,6 +124,16 @@ bool GpuVuDraw::Validate(std::string *error) const {
     }
     vf_mask |= 1u << uniform.register_index;
   }
+  if (constant_uniforms.size() > 32)
+    return Fail(error, "too many generated constant uniforms");
+  u32 constant_mask = 0;
+  for (const ConstantUniform &uniform : constant_uniforms) {
+    if (uniform.input_index >= 32 ||
+        (constant_mask & (1u << uniform.input_index)) != 0) {
+      return Fail(error, "duplicate or invalid generated constant uniform");
+    }
+    constant_mask |= 1u << uniform.input_index;
+  }
   if ((scalar_uniforms.present & ~(ScalarUniformQ | ScalarUniformP |
                                    ScalarUniformI | ScalarUniformGifQ)) != 0) {
     return Fail(error, "unknown scalar-uniform mask bit");
@@ -151,6 +161,13 @@ u64 NextGpuVuOrderingSequence() {
   if (sequence == 0)
     sequence = s_ordering_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
   return sequence;
+}
+
+bool IsDirectDrawAdmissionConnected() {
+  // GSRendererHW cannot yet derive a draw configuration for vertexless
+  // GpuVuDraw geometry. Keep the cold generated-root seam dormant until the
+  // producer can replace, rather than duplicate, the CPU VU/PATH1 work.
+  return false;
 }
 
 bool HasCompletedNotificationValue(u32 completed, u32 required) {

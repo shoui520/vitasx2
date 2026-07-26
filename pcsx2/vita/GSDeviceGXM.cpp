@@ -1054,6 +1054,7 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 		{
 			const SceGxmProgramParameter* vertex_scale_offset = nullptr;
 			const SceGxmProgramParameter* max_depth = nullptr;
+			std::vector<const SceGxmProgramParameter*> constants;
 			std::array<const SceGxmProgramParameter*, 32> vf{};
 			const SceGxmProgramParameter* acc = nullptr;
 			const SceGxmProgramParameter* q = nullptr;
@@ -2403,6 +2404,28 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 		return fail_registration("find generated VU1+TFX state uniforms",
 			SCE_GXM_ERROR_INVALID_VALUE);
 	}
+	stored.uniforms.constants.resize(stored.metadata.constant_inputs.size());
+	for (u32 index = 0; index < stored.metadata.constant_inputs.size(); index++)
+	{
+		const VitaGpuVu::CgConstantInput& input =
+			stored.metadata.constant_inputs[index];
+		if (!input.address.valid ||
+			input.address.invocation_coefficient != 0 ||
+			input.uniform_index != index)
+		{
+			return fail_registration(
+				"validate generated VU1 constant input layout",
+				SCE_GXM_ERROR_INVALID_VALUE);
+		}
+		char name[24];
+		std::snprintf(name, sizeof(name), "VuConstant%u", index);
+		stored.uniforms.constants[index] = find_uniform(name);
+		if (!stored.uniforms.constants[index])
+		{
+			return fail_registration("find generated VU1 constant uniform",
+				SCE_GXM_ERROR_INVALID_VALUE);
+		}
+	}
 	for (u32 reg = 1; reg < stored.uniforms.vf.size(); reg++)
 	{
 		if ((stored.metadata.vf_uniform_mask & (1u << reg)) == 0)
@@ -3478,6 +3501,20 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 		{
 			return false;
 		}
+		for (const VitaGpuVu::ConstantUniform& uniform :
+			gpu_vu_draw->constant_uniforms)
+		{
+			std::array<float, 4> values;
+			std::memcpy(values.data(), uniform.bits.data(), sizeof(values));
+			if (uniform.input_index >= generated_vu->uniforms.constants.size() ||
+				!upload_vertex(
+					generated_vu->uniforms.constants[uniform.input_index],
+					values.size(), values.data(),
+					"upload generated VU1 constant uniform"))
+			{
+				return false;
+			}
+		}
 		for (const VitaGpuVu::VectorUniform& uniform :
 			gpu_vu_draw->vf_uniforms)
 		{
@@ -4028,9 +4065,12 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		return Reject("generated VU1+TFX program is not GS-ready");
 	}
 	if (!generated->metadata.uses_tfx_uniforms ||
-		generated->metadata.memory_inputs.size() != draw->streams.size())
+		generated->metadata.memory_inputs.size() != draw->streams.size() ||
+		generated->metadata.constant_inputs.size() !=
+			draw->constant_uniforms.size())
 	{
-		return Reject("generated VU1 program metadata differs from draw streams");
+		return Reject(
+			"generated VU1 program metadata differs from draw inputs");
 	}
 	const bool flat_instances =
 		generated->metadata.uses_flat_instance_inputs;
@@ -4046,6 +4086,14 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		vf_mask |= 1u << uniform.register_index;
 	if (vf_mask != generated->metadata.vf_uniform_mask)
 		return Reject("generated VU1 VF-uniform mask mismatch");
+	for (u32 index = 0; index < draw->constant_uniforms.size(); index++)
+	{
+		if (draw->constant_uniforms[index].input_index != index ||
+			generated->metadata.constant_inputs[index].uniform_index != index)
+		{
+			return Reject("generated VU1 constant-uniform layout mismatch");
+		}
+	}
 	const u32 expected_scalar_mask =
 		(generated->metadata.uses_q_uniform ?
 			VitaGpuVu::ScalarUniformQ : 0u) |
