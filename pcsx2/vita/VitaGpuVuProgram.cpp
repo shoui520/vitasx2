@@ -26,6 +26,20 @@ struct PendingBlock {
   std::vector<std::pair<ControlEdgeKind, u32>> targets;
 };
 
+struct IndirectResolution {
+  std::set<u32> targets;
+  bool unresolved = false;
+};
+
+using IndirectResolutionMap = std::map<u32, IndirectResolution>;
+
+struct ViValue {
+  std::set<u16> values;
+  bool unknown = false;
+};
+
+using ViState = std::array<ViValue, 16>;
+
 bool Fail(std::string *error, std::string message) {
   if (error)
     *error = std::move(message);
@@ -89,8 +103,10 @@ u32 BranchTarget(u32 pc, u32 lower, u32 mask) {
 }
 
 bool ScanBlock(const u8 *micro, u32 mask, u32 start_pc,
-               const std::set<u32> &leaders, PendingBlock *pending,
-               std::set<u32> *discovered_leaders, std::string *error) {
+               const std::set<u32> &leaders,
+               const IndirectResolutionMap &indirect_resolutions,
+               PendingBlock *pending, std::set<u32> *discovered_leaders,
+               std::string *error) {
   pending->block = {};
   pending->targets.clear();
   pending->block.start_pc = start_pc;
@@ -146,7 +162,18 @@ bool ScanBlock(const u8 *micro, u32 mask, u32 start_pc,
     }
 
     if (IsIndirectBranch(kind)) {
-      pending->targets.emplace_back(ControlEdgeKind::ExternalExit, 0);
+      const auto resolution = indirect_resolutions.find(pc);
+      if (resolution != indirect_resolutions.end()) {
+        for (const u32 target : resolution->second.targets) {
+          discovered_leaders->insert(target);
+          pending->targets.emplace_back(ControlEdgeKind::ResolvedIndirect,
+                                        target);
+        }
+      }
+      if (resolution == indirect_resolutions.end() ||
+          resolution->second.targets.empty() || resolution->second.unresolved) {
+        pending->targets.emplace_back(ControlEdgeKind::ExternalExit, 0);
+      }
       return true;
     }
 
@@ -165,8 +192,10 @@ bool ScanBlock(const u8 *micro, u32 mask, u32 start_pc,
               "reachable VU1 block exceeded the complete micro-memory bound");
 }
 
-bool BuildBlocks(const u8 *micro, u32 mask, u32 start_pc,
-                 std::vector<BasicBlock> *blocks, std::string *error) {
+bool BuildBlocksForIndirectResolutions(
+    const u8 *micro, u32 mask, u32 start_pc,
+    const IndirectResolutionMap &indirect_resolutions,
+    std::vector<BasicBlock> *blocks, std::string *error) {
   std::set<u32> leaders{start_pc};
   std::map<u32, PendingBlock> pending_blocks;
 
@@ -177,8 +206,8 @@ bool BuildBlocks(const u8 *micro, u32 mask, u32 start_pc,
     for (const u32 leader : pass_leaders) {
       PendingBlock pending;
       std::set<u32> discovered;
-      if (!ScanBlock(micro, mask, leader, leaders, &pending, &discovered,
-                     error)) {
+      if (!ScanBlock(micro, mask, leader, leaders, indirect_resolutions,
+                     &pending, &discovered, error)) {
         return false;
       }
       pending_blocks.emplace(leader, std::move(pending));
@@ -197,8 +226,8 @@ bool BuildBlocks(const u8 *micro, u32 mask, u32 start_pc,
   for (const u32 leader : leaders) {
     PendingBlock pending;
     std::set<u32> discovered;
-    if (!ScanBlock(micro, mask, leader, leaders, &pending, &discovered,
-                   error)) {
+    if (!ScanBlock(micro, mask, leader, leaders, indirect_resolutions, &pending,
+                   &discovered, error)) {
       return false;
     }
     if (!std::includes(leaders.begin(), leaders.end(), discovered.begin(),
@@ -236,6 +265,192 @@ bool BuildBlocks(const u8 *micro, u32 mask, u32 start_pc,
     }
   }
   return true;
+}
+
+void SetKnownViValue(ViValue *value, u16 known) {
+  value->unknown = false;
+  value->values.clear();
+  value->values.insert(known);
+}
+
+// PCSX2 owner: VUops.cpp::_vuBAL()/_vuJALR() write the post-delay return
+// pair index, while _vuJR()/_vuJALR() snapshot Is before the delay pair.
+// PairPlan supplies the effective simultaneous-pair writes; every non-link
+// write deliberately becomes unknown instead of inventing integer semantics.
+void ApplyPairViWrites(const ProgramPair &pair, u32 mask, ViState *state) {
+  const VitaVU::GpuPairPlan &plan = pair.plan;
+  const u32 upper_writes = plan.exec_upper ? plan.upper_vi_write : 0;
+  const u32 lower_writes = plan.exec_lower ? plan.lower_vi_write : 0;
+  const u32 writes = upper_writes | lower_writes;
+  for (u32 reg = 1; reg < state->size(); reg++) {
+    if ((writes & (1u << reg)) == 0)
+      continue;
+    (*state)[reg].unknown = true;
+    (*state)[reg].values.clear();
+  }
+
+  const LowerKind kind = static_cast<LowerKind>(plan.lower_kind);
+  // A BAL/JALR in another branch's delay slot has PCSX2's branchpc-derived
+  // link behavior. The CFG already rejects that control shape, so retain an
+  // unknown value here rather than applying the ordinary static-PC rule.
+  if (!pair.delayed_pair && plan.exec_lower &&
+      (kind == LowerKind::BAL || kind == LowerKind::JALR)) {
+    const u32 link = VUInterpFast::It(plan.lower);
+    const u32 link_mask = 1u << link;
+    if (link != 0 && (lower_writes & link_mask) != 0 &&
+        (upper_writes & link_mask) == 0) {
+      const u32 return_pc = (plan.pc + 2 * PairBytes) & mask;
+      SetKnownViValue(&(*state)[link], static_cast<u16>(return_pc / PairBytes));
+    }
+  }
+
+  SetKnownViValue(&(*state)[0], 0);
+}
+
+bool JoinViValue(ViValue *destination, const ViValue &source) {
+  if (destination->unknown)
+    return false;
+  if (source.unknown) {
+    destination->unknown = true;
+    destination->values.clear();
+    return true;
+  }
+
+  bool changed = false;
+  for (const u16 value : source.values)
+    changed |= destination->values.insert(value).second;
+  return changed;
+}
+
+bool JoinViState(ViState *destination, const ViState &source) {
+  bool changed = false;
+  for (u32 reg = 0; reg < destination->size(); reg++)
+    changed |= JoinViValue(&(*destination)[reg], source[reg]);
+  return changed;
+}
+
+std::map<u32, IndirectResolution>
+InferIndirectResolutions(const std::vector<BasicBlock> &blocks, u32 mask,
+                         u32 start_pc) {
+  std::vector<ViState> input_states(blocks.size());
+  std::vector<bool> reachable(blocks.size(), false);
+  std::vector<bool> queued(blocks.size(), false);
+  std::vector<u32> work;
+
+  const auto entry_iterator =
+      std::find_if(blocks.begin(), blocks.end(), [start_pc](const auto &block) {
+        return block.start_pc == start_pc;
+      });
+  if (entry_iterator == blocks.end())
+    return {};
+  const u32 entry_block = static_cast<u32>(entry_iterator - blocks.begin());
+
+  ViState entry_state;
+  for (u32 reg = 1; reg < entry_state.size(); reg++)
+    entry_state[reg].unknown = true;
+  SetKnownViValue(&entry_state[0], 0);
+  input_states[entry_block] = std::move(entry_state);
+  reachable[entry_block] = true;
+  queued[entry_block] = true;
+  work.push_back(entry_block);
+
+  while (!work.empty()) {
+    const u32 block_index = work.back();
+    work.pop_back();
+    queued[block_index] = false;
+
+    ViState output = input_states[block_index];
+    for (const ProgramPair &pair : blocks[block_index].pairs)
+      ApplyPairViWrites(pair, mask, &output);
+
+    for (const ControlEdge &edge : blocks[block_index].successors) {
+      if (!edge.has_target)
+        continue;
+      bool changed = false;
+      if (!reachable[edge.target_block]) {
+        input_states[edge.target_block] = output;
+        reachable[edge.target_block] = true;
+        changed = true;
+      } else {
+        changed = JoinViState(&input_states[edge.target_block], output);
+      }
+      if (changed && !queued[edge.target_block]) {
+        queued[edge.target_block] = true;
+        work.push_back(edge.target_block);
+      }
+    }
+  }
+
+  std::map<u32, IndirectResolution> result;
+  for (u32 block_index = 0; block_index < blocks.size(); block_index++) {
+    const BasicBlock &block = blocks[block_index];
+    if (!reachable[block_index] || !block.indirect_branch ||
+        block.pairs.size() < 2) {
+      continue;
+    }
+
+    ViState before_branch = input_states[block_index];
+    for (size_t pair_index = 0; pair_index + 2 < block.pairs.size();
+         pair_index++) {
+      ApplyPairViWrites(block.pairs[pair_index], mask, &before_branch);
+    }
+
+    const ProgramPair &branch_pair = block.pairs[block.pairs.size() - 2];
+    const u32 source = VUInterpFast::Is(branch_pair.plan.lower);
+    const ViValue &target_value = before_branch[source];
+    IndirectResolution &resolution = result[block.branch_pc];
+    if (target_value.unknown || target_value.values.empty()) {
+      resolution.unresolved = true;
+      continue;
+    }
+    for (const u16 value : target_value.values) {
+      resolution.targets.insert((static_cast<u32>(value) * PairBytes) & mask);
+    }
+  }
+  return result;
+}
+
+bool UpdateIndirectResolutions(
+    const std::map<u32, IndirectResolution> &inferred,
+    IndirectResolutionMap *resolutions) {
+  bool changed = false;
+  for (const auto &[branch_pc, inference] : inferred) {
+    const auto current = resolutions->find(branch_pc);
+    if (current == resolutions->end()) {
+      resolutions->emplace(branch_pc, inference);
+      changed = true;
+      continue;
+    }
+
+    for (const u32 target : inference.targets)
+      changed |= current->second.targets.insert(target).second;
+    if (inference.unresolved && !current->second.unresolved) {
+      current->second.unresolved = true;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+bool BuildBlocks(const u8 *micro, u32 mask, u32 start_pc,
+                 std::vector<BasicBlock> *blocks, std::string *error) {
+  IndirectResolutionMap indirect_resolutions;
+  for (u32 resolution_pass = 0; resolution_pass <= MaxVu1Pairs;
+       resolution_pass++) {
+    if (!BuildBlocksForIndirectResolutions(
+            micro, mask, start_pc, indirect_resolutions, blocks, error)) {
+      return false;
+    }
+
+    const auto inferred = InferIndirectResolutions(*blocks, mask, start_pc);
+    if (!UpdateIndirectResolutions(inferred, &indirect_resolutions))
+      return true;
+    if (resolution_pass == MaxVu1Pairs) {
+      return Fail(error,
+                  "VU1 static indirect-control recovery did not converge");
+    }
+  }
+  return false;
 }
 
 std::vector<std::vector<bool>>
@@ -459,16 +674,21 @@ bool AnalyzeGpuVu1Program(const u8 *micro, u32 micro_size, u32 start_pc,
     const BasicBlock &block = analysis->blocks[i];
     if (block.start_pc == analysis->start_pc)
       entry_block = i;
-    analysis->has_indirect_control |= block.indirect_branch;
     analysis->has_branch_in_delay_slot |= block.branch_in_delay_slot;
     analysis->has_external_exit |= block.has_external_exit;
+    for (const ControlEdge &edge : block.successors) {
+      analysis->resolved_indirect_edges +=
+          edge.kind == ControlEdgeKind::ResolvedIndirect ? 1u : 0u;
+      analysis->has_unresolved_indirect_control |=
+          block.indirect_branch && edge.kind == ControlEdgeKind::ExternalExit;
+    }
   }
   if (entry_block == std::numeric_limits<u32>::max())
     return Fail(error, "VU1 CFG has no entry block");
 
   FindNaturalLoops(analysis, entry_block);
   AnalyzeExitReachability(analysis);
-  analysis->complete_cfg = !analysis->has_indirect_control &&
+  analysis->complete_cfg = !analysis->has_unresolved_indirect_control &&
                            !analysis->has_branch_in_delay_slot &&
                            !analysis->has_external_exit;
   if (error)

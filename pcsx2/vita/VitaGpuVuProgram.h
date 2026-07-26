@@ -14,6 +14,7 @@ enum class ControlEdgeKind : u8 {
   Fallthrough,
   BranchTaken,
   BranchNotTaken,
+  ResolvedIndirect,
   ProgramExit,
   ExternalExit,
 };
@@ -60,8 +61,9 @@ struct ProgramAnalysis {
   u32 start_pc = 0;
   std::vector<BasicBlock> blocks;
   std::vector<NaturalLoop> natural_loops;
+  u32 resolved_indirect_edges = 0;
   bool complete_cfg = false;
-  bool has_indirect_control = false;
+  bool has_unresolved_indirect_control = false;
   bool has_branch_in_delay_slot = false;
   bool has_external_exit = false;
   bool has_program_exit = false;
@@ -69,8 +71,9 @@ struct ProgramAnalysis {
 };
 
 // Reconstructs VU1 control flow from PairPlan-decoded pairs. Branch pairs
-// retain their architectural delay slot in the terminating block, and an E
-// pair retains the one following pair before ProgramExit.
+// retain their architectural delay slot in the terminating block, an E pair
+// retains the one following pair before ProgramExit, and finite PairPlan-proven
+// VI link values turn JR/JALR into ordinary target edges.
 bool AnalyzeGpuVu1Program(const u8 *micro, u32 micro_size, u32 start_pc,
                           ProgramAnalysis *analysis, std::string *error);
 } // namespace VitaGpuVu
