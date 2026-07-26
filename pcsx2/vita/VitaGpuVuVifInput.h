@@ -69,6 +69,8 @@ bool BindAffineRawQwords(const VifUnpackSpan& span,
 struct InputRingStatistics {
   u64 captures = 0;
   u64 captured_bytes = 0;
+  u64 disconnected_bypasses = 0;
+  u64 disconnected_bypass_bytes = 0;
   u64 capture_fallbacks = 0;
   u64 slot_reuses = 0;
   u64 ring_waits = 0;
@@ -114,6 +116,7 @@ void ReleaseRawVifPayload(RawVifPayloadRef* payload);
 
 void RecordDeferredVifUnpack();
 void RecordReplayedVifUnpack();
+void RecordDisconnectedCaptureBypass(u32 size);
 InputRingStatistics GetInputRingStatistics();
 
 } // namespace VitaGpuVu

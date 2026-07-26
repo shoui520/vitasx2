@@ -33,6 +33,8 @@ u32 NormalizedCycle(u8 value) {
 
 std::atomic<u64> s_captures{0};
 std::atomic<u64> s_captured_bytes{0};
+std::atomic<u64> s_disconnected_bypasses{0};
+std::atomic<u64> s_disconnected_bypass_bytes{0};
 std::atomic<u64> s_capture_fallbacks{0};
 std::atomic<u64> s_slot_reuses{0};
 std::atomic<u64> s_ring_waits{0};
@@ -56,6 +58,8 @@ void RecordReferenceCreated() {
 void ResetStatistics() {
   s_captures.store(0, std::memory_order_relaxed);
   s_captured_bytes.store(0, std::memory_order_relaxed);
+  s_disconnected_bypasses.store(0, std::memory_order_relaxed);
+  s_disconnected_bypass_bytes.store(0, std::memory_order_relaxed);
   s_capture_fallbacks.store(0, std::memory_order_relaxed);
   s_slot_reuses.store(0, std::memory_order_relaxed);
   s_ring_waits.store(0, std::memory_order_relaxed);
@@ -448,11 +452,20 @@ void RecordReplayedVifUnpack() {
   s_replayed_unpacks.fetch_add(1, std::memory_order_relaxed);
 }
 
+void RecordDisconnectedCaptureBypass(u32 size) {
+  s_disconnected_bypasses.fetch_add(1, std::memory_order_relaxed);
+  s_disconnected_bypass_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
 InputRingStatistics GetInputRingStatistics() {
   InputRingStatistics stats;
   stats.captures = s_captures.load(std::memory_order_relaxed);
   stats.captured_bytes =
       s_captured_bytes.load(std::memory_order_relaxed);
+  stats.disconnected_bypasses =
+      s_disconnected_bypasses.load(std::memory_order_relaxed);
+  stats.disconnected_bypass_bytes =
+      s_disconnected_bypass_bytes.load(std::memory_order_relaxed);
   stats.capture_fallbacks =
       s_capture_fallbacks.load(std::memory_order_relaxed);
   stats.slot_reuses = s_slot_reuses.load(std::memory_order_relaxed);

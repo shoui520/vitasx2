@@ -1109,6 +1109,7 @@ namespace MTGS
 				start.mtvu.compile_barriers)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gpu_vu_input captures=%llu bytes=%llu "
+			"disconnected_bypasses=%llu disconnected_bypass_bytes=%llu "
 			"fallbacks=%llu slot_reuses=%llu ring_waits=%llu ring_spins=%llu "
 			"deferred=%llu replayed=%llu live_start=%llu live_end=%llu peak_live=%llu",
 			static_cast<unsigned long long>(window),
@@ -1117,6 +1118,12 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_input.captured_bytes,
 				start.gpu_vu_input.captured_bytes)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.disconnected_bypasses,
+				start.gpu_vu_input.disconnected_bypasses)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.disconnected_bypass_bytes,
+				start.gpu_vu_input.disconnected_bypass_bytes)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_input.capture_fallbacks,
 				start.gpu_vu_input.capture_fallbacks)),

@@ -755,7 +755,10 @@ void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* dat
 	span.mode = static_cast<u8>(_vifRegs.mode);
 	span.unsigned_data = _vif.usn;
 	span.start_alignment = _vif.start_aligned;
-	if (VitaGpuVu::IsDirectAffineV4_32Span(span) &&
+	const bool direct_affine_span =
+		VitaGpuVu::IsDirectAffineV4_32Span(span);
+#if defined(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY)
+	if (direct_affine_span &&
 		VitaGpuVu::CaptureRawVifPayload(data, size, &span.payload))
 	{
 		ReserveSpace(1 + size_u32(sizeof(span)));
@@ -765,6 +768,15 @@ void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* dat
 		KickStart();
 		return;
 	}
+#else
+	// Until an ordered GpuVuDraw can retain this payload, copying it to
+	// USER_MAIN_NC_RW and then immediately CPU-unpacking it is pure duplicate
+	// work. Keep PCSX2's cacheable MTVU-ring handoff authoritative. The
+	// opt-in control above reproduces the ownership boundary without making
+	// that temporary cost the playable default.
+	if (direct_affine_span)
+		VitaGpuVu::RecordDisconnectedCaptureBypass(size);
+#endif
 
 	u32 vif_copy_size = (u32)((uptr)&_vif.StructEnd - (uptr)&_vif.tag);
 	ReserveSpace(1 + size_u32(vif_copy_size) + size_u32(sizeof(VIFregistersMTVU)) + 1 + size_u32(size));

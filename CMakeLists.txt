@@ -104,6 +104,16 @@ if(VITASX2_GS_DRAW_TRACE)
 	)
 endif()
 
+option(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY
+	"Diagnostic control: copy affine VIF payloads to non-cacheable GXM memory even though the disconnected GPU-VU path immediately replays them on MTVU."
+	OFF)
+if(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY)
+	# This reproduces the pre-admission ownership boundary for matched hardware
+	# controls. The product must not pay for a non-cacheable GPU copy until a
+	# GpuVuDraw can actually retain and consume it.
+	add_compile_definitions(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY=1)
+endif()
+
 # Target CPU contract: Cortex-A9 MPCore, VFPv3, NEON, hard-float.
 # NEON is mandatory (see docs/ps2-vita/GENERIC_CORTEX_A9_OPTIMIZATION.md).
 add_compile_options(
