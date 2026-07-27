@@ -414,6 +414,15 @@ bool GpuVuDraw::Validate(std::string *error) const {
   return true;
 }
 
+bool GpuVuDraw::ValidateForQueue(std::string *error) {
+  if (m_validated_for_queue)
+    return true;
+  if (!Validate(error))
+    return false;
+  m_validated_for_queue = true;
+  return true;
+}
+
 u64 NextGpuVuOrderingSequence() {
   u64 sequence =
       s_ordering_sequence.fetch_add(1, std::memory_order_relaxed) + 1;

@@ -4361,9 +4361,8 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		active_gpu_vu_draws->front().get();
 	if (!draw)
 		return Reject("GPU-VU batch starts with a null descriptor");
-	std::string validation_error;
-	if (!draw->Validate(&validation_error))
-		return Reject(validation_error.c_str());
+	if (!draw->WasValidatedForQueue())
+		return Reject("GPU-VU batch starts with an unvalidated descriptor");
 	if (draw->lowering != VitaGpuVu::OutputLowering::DirectTfx ||
 		draw->execution != VitaGpuVu::ExecutionKind::GeneratedParallel)
 	{
@@ -4445,55 +4444,10 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		const VitaGpuVu::GpuVuDraw* const candidate =
 			candidate_owner.get();
 		if (!candidate ||
-			!candidate->Validate(nullptr) ||
-			!(candidate->program == draw->program) ||
-			candidate->gif_tag != draw->gif_tag ||
-			candidate->invocation_count != draw->invocation_count ||
-			candidate->vertex_count != draw->vertex_count ||
-			candidate->primitive_count != draw->primitive_count ||
-			candidate->index_count != draw->index_count ||
-			candidate->lowering != draw->lowering ||
-			candidate->execution != draw->execution ||
-			candidate->primitive_boundary != draw->primitive_boundary ||
-			candidate->streams.size() != draw->streams.size() ||
-			candidate->VfUniforms().size() != draw->VfUniforms().size() ||
-			candidate->ConstantUniforms().size() !=
-				draw->ConstantUniforms().size() ||
-			candidate->acc_uniform != draw->acc_uniform ||
-			candidate->scalar_uniforms.present !=
-				draw->scalar_uniforms.present ||
-			candidate->scalar_uniforms.q != draw->scalar_uniforms.q ||
-			candidate->scalar_uniforms.p != draw->scalar_uniforms.p ||
-			candidate->scalar_uniforms.i != draw->scalar_uniforms.i ||
-			candidate->scalar_uniforms.gif_q !=
-				draw->scalar_uniforms.gif_q)
+			!candidate->WasValidatedForQueue() ||
+			candidate->streams.size() != draw->streams.size())
 		{
-			return Reject("GPU-VU descriptors do not share one batch ABI");
-		}
-		if (candidate->UniformBlock().Get() != draw->UniformBlock().Get())
-		{
-			for (u32 index = 0;
-				index < candidate->VfUniforms().size(); index++)
-			{
-				if (candidate->VfUniforms()[index].register_index !=
-						draw->VfUniforms()[index].register_index ||
-					candidate->VfUniforms()[index].bits !=
-						draw->VfUniforms()[index].bits)
-				{
-					return Reject("GPU-VU batch VF uniforms differ");
-				}
-			}
-			for (u32 index = 0;
-				index < candidate->ConstantUniforms().size(); index++)
-			{
-				if (candidate->ConstantUniforms()[index].input_index !=
-						draw->ConstantUniforms()[index].input_index ||
-					candidate->ConstantUniforms()[index].bits !=
-						draw->ConstantUniforms()[index].bits)
-				{
-					return Reject("GPU-VU batch constant uniforms differ");
-				}
-			}
+			return Reject("GPU-VU descriptor escaped its derived batch ABI");
 		}
 		for (u32 index = 0; index < candidate->streams.size(); index++)
 		{
@@ -5212,11 +5166,10 @@ bool GSDeviceGXM::RenderGpuVuDraws(GSHWDrawConfig& config,
 	}
 	for (const auto& draw : draws)
 	{
-		std::string validation_error;
-		if (!draw || !draw->Validate(&validation_error))
+		if (!draw || !draw->WasValidatedForQueue())
 		{
 			return m_impl->Reject(draw ?
-				validation_error.c_str() :
+				"unvalidated GPU-VU descriptor in batch" :
 				"null GPU-VU descriptor in batch");
 		}
 	}

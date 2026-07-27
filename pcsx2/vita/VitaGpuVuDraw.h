@@ -285,6 +285,12 @@ public:
 
   bool AddInputSpan(const VifUnpackSpan &span);
   bool Validate(std::string *error) const;
+  // The MTVU owner calls this once after assigning the ordering sequence and
+  // immediately before publishing the immutable descriptor. The GS owner may
+  // then trust all descriptor-wide bounds and layout checks without walking
+  // the same spans and uniforms again on the 496 MHz worker thread.
+  bool ValidateForQueue(std::string *error);
+  bool WasValidatedForQueue() const { return m_validated_for_queue; }
 
   const InlineDescriptorVector<VifUnpackSpan, 4>& InputSpans() const {
     return m_input_spans;
@@ -339,6 +345,7 @@ private:
   // promotion per IGA-style three-stream dispatch on the 496 MHz MTVU core.
   InlineDescriptorVector<VifUnpackSpan, 4> m_input_spans;
   GpuVuUniformBlockRef m_uniform_block;
+  bool m_validated_for_queue = false;
 };
 
 u64 NextGpuVuOrderingSequence();

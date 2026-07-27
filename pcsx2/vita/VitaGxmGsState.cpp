@@ -455,12 +455,11 @@ void VitaGxmGsState::ConsumeGpuVuDraws(
 			first++;
 			continue;
 		}
-		std::string validation_error;
-		if (!draws[first]->Validate(&validation_error))
+		if (!draws[first]->WasValidatedForQueue())
 		{
 			VitaGpuVu::RecordGpuVuDrawRejected();
-			Console.Error("GPU-VU: GS rejected descriptor: %s",
-				validation_error.c_str());
+			Console.Error(
+				"GPU-VU: GS received a descriptor outside the validated queue");
 			draws[first].reset();
 			first++;
 			continue;
@@ -468,7 +467,7 @@ void VitaGxmGsState::ConsumeGpuVuDraws(
 
 		u32 end = first + 1;
 		while (end < draws.size() && draws[end] &&
-			draws[end]->Validate(nullptr) &&
+			draws[end]->WasValidatedForQueue() &&
 			CanDeriveOneGpuVuState(*draws[first], *draws[end]))
 		{
 			end++;

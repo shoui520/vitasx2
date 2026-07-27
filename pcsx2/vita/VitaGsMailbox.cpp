@@ -3326,7 +3326,7 @@ bool VitaGS::QueueGpuVuDraw(
 	if (draw->ordering_sequence == 0)
 		draw->ordering_sequence = VitaGpuVu::NextGpuVuOrderingSequence();
 	std::string error;
-	if (!draw->Validate(&error))
+	if (!draw->ValidateForQueue(&error))
 	{
 		Console.Error("GPU-VU: refusing malformed draw descriptor: %s",
 			error.c_str());
