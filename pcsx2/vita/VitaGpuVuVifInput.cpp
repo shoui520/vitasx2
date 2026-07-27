@@ -3,7 +3,6 @@
 
 #include "vita/VitaGpuVuVifInput.h"
 
-#include "common/AlignedMalloc.h"
 #include "vita/VitaGpuVuDraw.h"
 
 #include <algorithm>
@@ -333,7 +332,6 @@ struct InputRing::Impl {
 #if !defined(VITASX2_QEMU_VALIDATION)
   struct Slot {
     VitaGXM::MappedBlock block;
-    u8* staging = nullptr;
     std::atomic<u32> generation{1};
     std::atomic<u32> references{0};
     std::atomic<u32> committed_offset{0};
@@ -342,7 +340,6 @@ struct InputRing::Impl {
   };
 
   std::array<Slot, InputRingSlotCount> slots;
-  u8* staging_backing = nullptr;
   // VU_Thread::VifUnpack() is the sole producer. Publish the exact slot it is
   // waiting to reuse before rechecking its reference count. The last owner
   // claims that token before signaling, which makes release-before-wait and
@@ -383,23 +380,16 @@ bool InputRing::Initialize() {
     return false;
   }
   m_impl->waiting_slot.store(-1, std::memory_order_relaxed);
-  constexpr size_t StagingSize =
-      static_cast<size_t>(InputRingSlotCount) * InputRingSlotSize;
-  m_impl->staging_backing =
-      static_cast<u8*>(_aligned_malloc(StagingSize, 64));
-  if (!m_impl->staging_backing) {
-    Console.Warning(
-        "GPU-VU: cacheable VIF input staging allocation failed; "
-        "retaining inline MTVU payloads.");
-    sceKernelDeleteSema(m_impl->slot_released_sema);
-    m_impl->slot_released_sema = -1;
-    return false;
-  }
   for (u32 slot = 0; slot < InputRingSlotCount; slot++) {
     char name[32];
     std::snprintf(name, sizeof(name), "VitaSX2 VIF input %u", slot);
+    // libGXM's memory contract makes USER_RW coherent between CPU caches and
+    // the GPU: an SGX cache miss snoops the Cortex-A9 caches. Capture directly
+    // into this mapped storage so each immutable VIF byte is copied once.
+    // Four independent generations and the existing retirement notification
+    // still prevent the producer from overwriting bytes the GPU can observe.
     const int result = VitaGXM::AllocateMappedBlock(
-        name, SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_NC_RW, InputRingSlotSize,
+        name, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, InputRingSlotSize,
         SCE_GXM_MEMORY_ATTRIB_READ, &m_impl->slots[slot].block);
     if (result < 0) {
       Console.Warning(
@@ -408,15 +398,10 @@ bool InputRing::Initialize() {
           slot, static_cast<u32>(result));
       for (u32 release = 0; release < slot; release++)
         VitaGXM::ReleaseMappedBlock(&m_impl->slots[release].block);
-      _aligned_free(m_impl->staging_backing);
-      m_impl->staging_backing = nullptr;
       sceKernelDeleteSema(m_impl->slot_released_sema);
       m_impl->slot_released_sema = -1;
       return false;
     }
-    m_impl->slots[slot].staging =
-        m_impl->staging_backing +
-        static_cast<size_t>(slot) * InputRingSlotSize;
     m_impl->slots[slot].generation.store(1, std::memory_order_relaxed);
     m_impl->slots[slot].references.store(0, std::memory_order_relaxed);
     m_impl->slots[slot].committed_offset.store(
@@ -435,8 +420,6 @@ bool InputRing::Initialize() {
     m_impl->accepting.store(false, std::memory_order_relaxed);
     for (auto& slot : m_impl->slots)
       VitaGXM::ReleaseMappedBlock(&slot.block);
-    _aligned_free(m_impl->staging_backing);
-    m_impl->staging_backing = nullptr;
     sceKernelDeleteSema(m_impl->slot_released_sema);
     m_impl->slot_released_sema = -1;
     return false;
@@ -444,7 +427,7 @@ bool InputRing::Initialize() {
   m_impl->initialized = true;
   Console.WriteLn(
       "GPU-VU: immutable VIF input ring ready "
-      "(8 MiB cacheable staging + 4 x 2 MiB mapped slots).");
+      "(4 x 2 MiB cacheable GPU-coherent slots, direct capture).");
   return true;
 #endif
 }
@@ -504,12 +487,9 @@ bool InputRing::Shutdown() {
       released = false;
     }
     slot.write_offset = 0;
-    slot.staging = nullptr;
   }
   if (!released)
     return false;
-  _aligned_free(m_impl->staging_backing);
-  m_impl->staging_backing = nullptr;
   m_impl->current_slot = 0;
   m_impl->initialized = false;
   return true;
@@ -674,7 +654,8 @@ bool CaptureRawVifPayload(const void* source, u32 size,
   }
 
   InputRing::Impl::Slot& slot = impl.slots[reserved_slot];
-  std::memcpy(slot.staging + reserved_offset, source, size);
+  std::memcpy(static_cast<u8*>(slot.block.base) + reserved_offset,
+              source, size);
   payload->owner = reinterpret_cast<uptr>(ring);
   payload->slot = reserved_slot;
   payload->generation = reserved_generation;
@@ -702,7 +683,7 @@ const u8* ResolveRawVifPayload(const RawVifPayloadRef& payload) {
   if (!ring || !ring->m_impl || payload.slot >= InputRingSlotCount)
     return nullptr;
   const auto& slot = ring->m_impl->slots[payload.slot];
-  if (!slot.staging ||
+  if (!slot.block.IsMapped() ||
       slot.generation.load(std::memory_order_acquire) !=
           payload.generation ||
       payload.offset > InputRingSlotSize ||
@@ -712,7 +693,7 @@ const u8* ResolveRawVifPayload(const RawVifPayloadRef& payload) {
       slot.references.load(std::memory_order_acquire) == 0) {
     return nullptr;
   }
-  return slot.staging + payload.offset;
+  return static_cast<const u8*>(slot.block.base) + payload.offset;
 #endif
 }
 
@@ -801,7 +782,7 @@ bool PublishPendingRawVifPayloads(const GpuVuDraw* first_draw,
     draw = draw->path1_next;
   }
 
-  u64 copied = 0;
+  u64 published_bytes = 0;
   for (u32 index = 0; index < generation_count; index++) {
     const RawVifPayloadRef& payload = generations[index];
     auto& slot = ring->m_impl->slots[payload.slot];
@@ -825,26 +806,26 @@ bool PublishPendingRawVifPayloads(const GpuVuDraw* first_draw,
         slot.published_offset.load(std::memory_order_relaxed);
     if (committed <= published)
       continue;
-    if (!slot.staging || !slot.block.IsMapped() ||
-        committed > slot.block.size) {
+    if (!slot.block.IsMapped() || committed > slot.block.size) {
       Console.Error(
           "GPU-VU: input publication rejected "
-          "(bad range slot=%u staged=%08x mapped=%u "
-          "committed=%u size=%u).",
-          payload.slot, static_cast<u32>(
-              reinterpret_cast<uptr>(slot.staging)),
+          "(bad range slot=%u mapped=%u committed=%u size=%u).",
+          payload.slot,
           slot.block.IsMapped() ? 1u : 0u, committed, slot.block.size);
       return false;
     }
 
-    std::memcpy(static_cast<u8*>(slot.block.base) + published,
-                slot.staging + published, committed - published);
+    // Capture wrote the cacheable GXM mapping itself. The producer's release
+    // publication makes those initialized bytes visible to this thread, and
+    // libGXM's documented CPU/GPU coherence makes them visible to SGX without
+    // a second copy or a cache-maintenance operation.
     slot.published_offset.store(committed, std::memory_order_release);
-    copied += committed - published;
+    published_bytes += committed - published;
   }
-  if (copied != 0) {
+  if (published_bytes != 0) {
     s_publication_batches.fetch_add(1, std::memory_order_relaxed);
-    s_published_bytes.fetch_add(copied, std::memory_order_relaxed);
+    s_published_bytes.fetch_add(published_bytes,
+                                std::memory_order_relaxed);
   }
   return true;
 #else

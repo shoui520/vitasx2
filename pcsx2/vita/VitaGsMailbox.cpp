@@ -1981,9 +1981,10 @@ namespace MTGS
 			pxAssertRel(false, "incomplete pending MTVU direct run");
 			return;
 		}
-		// The EE producer writes tiny UNPACK payloads into cacheable staging.
-		// Publish all committed prefixes to the non-cacheable GXM mapping once
-		// per descriptor run, before its release makes any draw visible.
+		// The EE producer writes UNPACK payloads directly into a cacheable,
+		// GPU-coherent GXM mapping. Publish all committed prefixes once per
+		// descriptor run before its release makes any draw visible. This is
+		// an ownership boundary, not another payload copy.
 		pxAssertRel(VitaGpuVu::PublishPendingRawVifPayloads(
 				s_pending_mtvu_direct_head, s_pending_mtvu_direct_count),
 			"failed to publish immutable GPU-VU inputs");

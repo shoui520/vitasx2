@@ -161,10 +161,11 @@ bool CaptureRawVifPayload(const void* source, u32 size,
 // mapped slot-generation and keep its dynamically indexed qword offsets in
 // the positive signed-16 address range emitted by psp2cgc.
 bool HasSingleAddressableRawInputWindow(const GpuVuDraw& draw);
-// CPU-side analysis and replay always read the cacheable staging copy.
+// CPU-side analysis and replay read the same immutable cacheable mapping SGX
+// consumes. USER_RW mappings are CPU/GPU coherent under libGXM.
 const u8* ResolveRawVifPayload(const RawVifPayloadRef& payload);
-// The GS owner may bind only bytes which the MTVU worker has copied into the
-// non-cacheable GXM mapping at an ordered direct-run publication boundary.
+// The GS owner may bind only bytes whose direct-capture range crossed the
+// ordered direct-run publication boundary.
 const u8* ResolveGpuRawVifPayload(const RawVifPayloadRef& payload);
 bool PublishPendingRawVifPayloads(const GpuVuDraw* first_draw,
                                  u32 draw_count);
