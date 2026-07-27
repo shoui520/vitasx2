@@ -1,0 +1,6 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#define VITASX2_TFX_UV_NO_FOG 1
+#define VITASX2_TFX_FAST 1
+#include "vitasx2_tfx_f.cg"

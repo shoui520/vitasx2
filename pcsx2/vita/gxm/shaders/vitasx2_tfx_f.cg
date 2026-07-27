@@ -207,9 +207,14 @@ __nativecolor __regformat unsigned char4 main(
 	 defined(VITASX2_TFX_PROGRAMMABLE_BLEND))
 	__regformat unsigned char4 fragColor : FRAGCOLOR,
 #endif
+#if defined(VITASX2_TFX_UV_NO_FOG)
+	float2 vTexInt : TEXCOORD0,
+	float4 vColor : TEXCOORD1,
+#else
 	float4 vTexFloat : TEXCOORD0,
 	float4 vTexInt : TEXCOORD1,
 	float4 vColor : TEXCOORD2,
+#endif
 	float4 windowPosition : WPOS,
 #if defined(VITASX2_TFX_ZFLOOR)
 	out float fragmentDepth : DEPTH,
@@ -267,20 +272,24 @@ __nativecolor __regformat unsigned char4 main(
 	// Selector5: date/no_color/blend_mix/blend_hw.
 	// Selector6: region_rect/wms/wmt/fixed_one_a.
 	// PCSX2's OGL owner carries unnormalized GL_UNSIGNED_BYTE vertex color in a
-	// generic varying. GXM COLOR0 saturates that 0..255 value, so TEXCOORD2 is
+	// generic varying. GXM COLOR0 saturates that 0..255 value, so a TEXCOORD is
 	// deliberately used as the unrestricted interpolant instead.
 	const float4 vertexColor = vColor;
 #if !defined(VITASX2_TFX_UNTEXTURED)
-#if defined(VITASX2_TFX_DIRECT_TEXTURE)
+#if defined(VITASX2_TFX_DIRECT_TEXTURE) || \
+	defined(VITASX2_TFX_UV_NO_FOG)
 	const bool textured = true;
 #else
 	const bool textured = Selector0.x > 0.5f;
 #endif
-	#if !defined(VITASX2_TFX_STQ)
+	#if !defined(VITASX2_TFX_STQ) && \
+		!defined(VITASX2_TFX_UV_NO_FOG)
 	const bool fixedTexture = Selector0.y > 0.5f;
 	#endif
+#if !defined(VITASX2_TFX_UV_NO_FOG)
 	const float safeQ = abs(vTexFloat.w) >= 1.0e-32f ? vTexFloat.w :
 		(vTexFloat.w < 0.0f ? -1.0e-32f : 1.0e-32f);
+#endif
 #if defined(VITASX2_TFX_MANUAL_LOD)
 	// PCSX2 tfx_fs.glsl::manual_lod(). LODParams are K/16, 1<<L, the
 	// uploaded-chain base level, and the maximum useful GS mip level.
@@ -289,7 +298,9 @@ __nativecolor __regformat unsigned char4 main(
 #else
 	const float sampleLod = 0.0f;
 #endif
-	#if defined(VITASX2_TFX_STQ)
+	#if defined(VITASX2_TFX_UV_NO_FOG)
+	float2 st = vTexInt;
+	#elif defined(VITASX2_TFX_STQ)
 	float2 st = vTexFloat.xy / safeQ;
 	#else
 	float2 st = fixedTexture ? vTexInt.xy : (vTexFloat.xy / safeQ);
@@ -308,7 +319,12 @@ __nativecolor __regformat unsigned char4 main(
 		float4 sampled = SampleTexture(sourceTexture, st, Selector2.z,
 			HalfTexel, TextureSize, Selector6.x, Selector6.yz,
 			STRange, NativeTextureSize, STScale.xy, Selector2.x,
-			Selector2.y, TextureAlpha, sampleLod, Selector0.y,
+			Selector2.y, TextureAlpha, sampleLod,
+#if defined(VITASX2_TFX_UV_NO_FOG)
+			1.0f,
+#else
+			Selector0.y,
+#endif
 #if defined(VITASX2_TFX_REGION_REPEAT)
 			RegionMaskFix);
 #else
@@ -365,9 +381,11 @@ __nativecolor __regformat unsigned char4 main(
 #endif
 
 #if !defined(VITASX2_TFX_NO_FOG_ALPHA_TEST)
+#if !defined(VITASX2_TFX_UV_NO_FOG)
 	if (Selector1.x > 0.5f)
 		color.rgb = trunc(lerp(FogColorAref.rgb, color.rgb,
 			(vTexFloat.z * 255.0f) / 256.0f));
+#endif
 
 	// PCSX2 tfx_fs.glsl applies fixed coverage alpha before ATST. Moving this
 	// below ATST changes both fragment survival and the alpha value visible to

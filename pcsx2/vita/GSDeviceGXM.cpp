@@ -65,6 +65,9 @@ extern "C"
 	extern const SceGxmProgram _binary_vitasx2_tfx_psm16_zfloor_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_zfloor_source_direct_decal_af_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_fast_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_uv_no_fog_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_uv_no_fog_fast_f_gxp_start;
+	extern const SceGxmProgram _binary_vitasx2_tfx_uv_no_fog_zfloor_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_region_repeat_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_region_repeat_fast_f_gxp_start;
 	extern const SceGxmProgram _binary_vitasx2_tfx_untextured_f_gxp_start;
@@ -1287,6 +1290,9 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmShaderPatcherId tfx_psm16_zfloor_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_zfloor_source_direct_decal_af_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_fast_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_uv_no_fog_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_uv_no_fog_fast_fragment_id = nullptr;
+	SceGxmShaderPatcherId tfx_uv_no_fog_zfloor_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_region_repeat_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_region_repeat_fast_fragment_id = nullptr;
 	SceGxmShaderPatcherId tfx_untextured_fragment_id = nullptr;
@@ -1343,6 +1349,9 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	ProgramUniforms psm16_zfloor_uniforms;
 	ProgramUniforms zfloor_source_direct_decal_af_uniforms;
 	ProgramUniforms fast_uniforms;
+	ProgramUniforms uv_no_fog_uniforms;
+	ProgramUniforms uv_no_fog_fast_uniforms;
+	ProgramUniforms uv_no_fog_zfloor_uniforms;
 	ProgramUniforms region_repeat_uniforms;
 	ProgramUniforms region_repeat_fast_uniforms;
 	ProgramUniforms untextured_uniforms;
@@ -1822,6 +1831,12 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		&_binary_vitasx2_tfx_zfloor_source_direct_decal_af_f_gxp_start;
 	const SceGxmProgram* const tfx_fast_f =
 		&_binary_vitasx2_tfx_fast_f_gxp_start;
+	const SceGxmProgram* const tfx_uv_no_fog_f =
+		&_binary_vitasx2_tfx_uv_no_fog_f_gxp_start;
+	const SceGxmProgram* const tfx_uv_no_fog_fast_f =
+		&_binary_vitasx2_tfx_uv_no_fog_fast_f_gxp_start;
+	const SceGxmProgram* const tfx_uv_no_fog_zfloor_f =
+		&_binary_vitasx2_tfx_uv_no_fog_zfloor_f_gxp_start;
 	const SceGxmProgram* const tfx_region_repeat_f =
 		&_binary_vitasx2_tfx_region_repeat_f_gxp_start;
 	const SceGxmProgram* const tfx_region_repeat_fast_f =
@@ -1862,7 +1877,9 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 		tfx_manual_lod_zfloor_f, tfx_zfloor_f,
 		tfx_psm16_f, tfx_psm16_zfloor_f,
 		tfx_zfloor_source_direct_decal_af_f,
-		tfx_fast_f, tfx_region_repeat_f, tfx_region_repeat_fast_f,
+		tfx_fast_f, tfx_uv_no_fog_f, tfx_uv_no_fog_fast_f,
+		tfx_uv_no_fog_zfloor_f,
+		tfx_region_repeat_f, tfx_region_repeat_fast_f,
 		tfx_untextured_f, tfx_source_f, tfx_programmable_add_f,
 		tfx_programmable_add_direct_f,
 		tfx_programmable_over_f,
@@ -1903,6 +1920,14 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 			"register Z-floor direct DECAL/RGB (Cs-0)*Af+0 TFX fragment program") ||
 		!register_program(tfx_fast_f, &tfx_fast_fragment_id,
 			"register fast TFX fragment program") ||
+		!register_program(tfx_uv_no_fog_f, &tfx_uv_no_fog_fragment_id,
+			"register fixed-UV/no-fog TFX fragment program") ||
+		!register_program(tfx_uv_no_fog_fast_f,
+			&tfx_uv_no_fog_fast_fragment_id,
+			"register fast fixed-UV/no-fog TFX fragment program") ||
+		!register_program(tfx_uv_no_fog_zfloor_f,
+			&tfx_uv_no_fog_zfloor_fragment_id,
+			"register Z-floor fixed-UV/no-fog TFX fragment program") ||
 		!register_program(tfx_region_repeat_f, &tfx_region_repeat_fragment_id,
 			"register REGION_REPEAT TFX fragment program") ||
 		!register_program(tfx_region_repeat_fast_f,
@@ -2034,6 +2059,11 @@ bool GSDeviceGXM::Impl::CreatePrograms()
 			SCE_GXM_ERROR_INVALID_VALUE);
 	}
 	load_variant_uniforms(tfx_fast_f, &fast_uniforms);
+	load_variant_uniforms(tfx_uv_no_fog_f, &uv_no_fog_uniforms);
+	load_variant_uniforms(tfx_uv_no_fog_fast_f,
+		&uv_no_fog_fast_uniforms);
+	load_variant_uniforms(tfx_uv_no_fog_zfloor_f,
+		&uv_no_fog_zfloor_uniforms);
 	load_variant_uniforms(tfx_region_repeat_f, &region_repeat_uniforms);
 	load_variant_uniforms(tfx_region_repeat_fast_f,
 		&region_repeat_fast_uniforms);
@@ -2695,8 +2725,18 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 		return fail_registration("create generated VU1+TFX vertex program",
 			patch_result < 0 ? patch_result : SCE_GXM_ERROR_INVALID_POINTER);
 	}
+	const bool uv_no_fog_interface =
+		stored.metadata.uses_tfx_uv_no_fog_interface;
+	const SceGxmShaderPatcherId general_fragment_id =
+		uv_no_fog_interface ? tfx_uv_no_fog_fragment_id : tfx_fragment_id;
+	const SceGxmShaderPatcherId zfloor_fragment_id =
+		uv_no_fog_interface ?
+			tfx_uv_no_fog_zfloor_fragment_id : tfx_zfloor_fragment_id;
+	const SceGxmShaderPatcherId opaque_fragment_id =
+		uv_no_fog_interface ?
+			tfx_uv_no_fog_fast_fragment_id : tfx_fast_fragment_id;
 	patch_result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
-		tfx_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
+		general_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
 		SCE_GXM_MULTISAMPLE_NONE, nullptr, program,
 		&stored.general_fragment_program);
 	if (patch_result < 0 || !stored.general_fragment_program)
@@ -2706,7 +2746,7 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 			patch_result < 0 ? patch_result : SCE_GXM_ERROR_INVALID_POINTER);
 	}
 	patch_result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
-		tfx_zfloor_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
+		zfloor_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
 		SCE_GXM_MULTISAMPLE_NONE, nullptr, program,
 		&stored.zfloor_fragment_program);
 	if (patch_result < 0 || !stored.zfloor_fragment_program)
@@ -2716,7 +2756,7 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 			patch_result < 0 ? patch_result : SCE_GXM_ERROR_INVALID_POINTER);
 	}
 	patch_result = sceGxmShaderPatcherCreateFragmentProgram(patcher,
-		tfx_fast_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
+		opaque_fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED,
 		SCE_GXM_MULTISAMPLE_NONE, nullptr, program,
 		&stored.opaque_fragment_program);
 	if (patch_result < 0 || !stored.opaque_fragment_program)
@@ -2730,12 +2770,13 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 	Console.WriteLn(
 		"GPU-VU: GS registered generated VU1+TFX program %016llx%016llx "
 		"(%u raw inputs%s, %u expressions, "
-		"general+Z-floor+opaque TFX links).",
+		"general+Z-floor+opaque %sTFX links).",
 		static_cast<unsigned long long>(result.key.high),
 		static_cast<unsigned long long>(result.key.low),
 		static_cast<u32>(stored.metadata.memory_inputs.size()),
 		buffered_batch ? " through two user buffers" : " as streams",
-		stored.metadata.emitted_expression_count);
+		stored.metadata.emitted_expression_count,
+		uv_no_fog_interface ? "fixed-UV/no-fog " : "");
 	return true;
 }
 
@@ -3754,7 +3795,14 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 	const VitaGpuVu::GpuVuDraw* gpu_vu_draw)
 {
 	const ProgramUniforms* fragment_uniforms = &uniforms;
-	if (region_repeat_fragment)
+	if (generated_vu &&
+		generated_vu->metadata.uses_tfx_uv_no_fog_interface)
+	{
+		fragment_uniforms = ps.zfloor ? &uv_no_fog_zfloor_uniforms :
+			(fast_fragment ? &uv_no_fog_fast_uniforms :
+				&uv_no_fog_uniforms);
+	}
+	else if (region_repeat_fragment)
 	{
 		fragment_uniforms = fast_fragment ? &region_repeat_fast_uniforms :
 			&region_repeat_uniforms;
@@ -3815,7 +3863,10 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 			config.cb_vs.point_size.x, config.cb_vs.point_size.y, 0.0f, 0.0f};
 		const float generated_max_depth =
 			static_cast<float>(config.cb_vs.max_depth);
-		if (!upload_vertex(generated_vu->uniforms.vertex_scale_offset, 12,
+		const u32 transform_float_count =
+			generated_vu->metadata.uses_tfx_point_size ? 12u : 8u;
+		if (!upload_vertex(generated_vu->uniforms.vertex_scale_offset,
+				transform_float_count,
 				generated_transform.data(),
 				"upload generated VU1+TFX transform") ||
 			!upload_vertex(generated_vu->uniforms.max_depth, 1,
@@ -4496,6 +4547,18 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		static_cast<bool>(config.ps.fog) != draw->direct_tfx.fog_enabled)
 	{
 		return Reject("PCSX2 TFX selectors differ from the GPU-VU GIF contract");
+	}
+	if (generated->metadata.uses_tfx_uv_no_fog_interface !=
+		(draw->direct_tfx.textured &&
+			draw->direct_tfx.fixed_texture_coordinates &&
+			!draw->direct_tfx.fog_enabled))
+	{
+		return Reject("generated VU1 TFX varying ABI differs from the GIF contract");
+	}
+	if (generated->metadata.uses_tfx_point_size !=
+		(prim.PRIM == GS_POINTLIST))
+	{
+		return Reject("generated VU1 point-size ABI differs from the GIF contract");
 	}
 	if (!draw->direct_tfx.gouraud && prim.PRIM != GS_POINTLIST &&
 		!flat_instances)
@@ -6553,6 +6616,12 @@ void GSDeviceGXM::Impl::Shutdown()
 		"unregister fast REGION_REPEAT TFX fragment");
 	unregister(tfx_region_repeat_fragment_id,
 		"unregister REGION_REPEAT TFX fragment");
+	unregister(tfx_uv_no_fog_zfloor_fragment_id,
+		"unregister Z-floor fixed-UV/no-fog TFX fragment");
+	unregister(tfx_uv_no_fog_fast_fragment_id,
+		"unregister fast fixed-UV/no-fog TFX fragment");
+	unregister(tfx_uv_no_fog_fragment_id,
+		"unregister fixed-UV/no-fog TFX fragment");
 	unregister(tfx_fast_fragment_id, "unregister fast TFX fragment");
 	unregister(tfx_zfloor_fragment_id, "unregister Z-floor TFX fragment");
 	unregister(tfx_manual_lod_zfloor_fragment_id,

@@ -1,0 +1,8 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2's TFX selector compiles FST and FOG into the fragment shader.
+// Generated VU1+TFX roots carry the same static GIF proof. For
+// TME=1/FST=1/FGE=0 this ABI consumes packed UV directly and omits STQ/fog.
+#define VITASX2_TFX_UV_NO_FOG 1
+#include "vitasx2_tfx_f.cg"

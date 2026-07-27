@@ -79,9 +79,16 @@ public:
       if (!MarkDirectRoots(error))
         return false;
       m_program->uses_tfx_uniforms = true;
+      m_program->uses_tfx_point_size =
+          m_direct_contract->primitive == GS_POINTLIST;
+      m_program->uses_tfx_uv_no_fog_interface =
+          m_direct_contract->textured &&
+          m_direct_contract->fixed_texture_coordinates &&
+          !m_direct_contract->fog_enabled;
       m_program->uses_gif_q_uniform =
           m_direct_contract->textured &&
-          m_direct_contract->fixed_texture_coordinates;
+          m_direct_contract->fixed_texture_coordinates &&
+          !m_program->uses_tfx_uv_no_fog_interface;
     } else {
       for (const LoopStore &store : m_kernel.stores) {
         for (u32 lane = 0; lane < 4; lane++) {
@@ -600,13 +607,22 @@ private:
     if (m_direct_contract) {
       if (m_program->uses_gif_q_uniform)
         AppendParameter("uniform float GifQ");
-      AppendParameter("uniform float4 VertexScaleOffset[3]");
+      AppendParameter(m_program->uses_tfx_point_size
+                          ? "uniform float4 VertexScaleOffset[3]"
+                          : "uniform float4 VertexScaleOffset[2]");
       AppendParameter("uniform float MaxDepth");
       AppendParameter("out float4 vPosition : POSITION");
-      AppendParameter("out float vPointSize : PSIZE");
-      AppendParameter("out float4 vTexFloat : TEXCOORD0");
-      AppendParameter("out float4 vTexInt : TEXCOORD1");
-      AppendParameter("out float4 vColor : TEXCOORD2");
+      if (m_program->uses_tfx_point_size)
+        AppendParameter("out float vPointSize : PSIZE");
+      if (!m_program->uses_tfx_uv_no_fog_interface)
+        AppendParameter("out float4 vTexFloat : TEXCOORD0");
+      if (m_program->uses_tfx_uv_no_fog_interface)
+        AppendParameter("out float2 vTexInt : TEXCOORD0");
+      else
+        AppendParameter("out float4 vTexInt : TEXCOORD1");
+      AppendParameter(m_program->uses_tfx_uv_no_fog_interface
+                          ? "out float4 vColor : TEXCOORD1"
+                          : "out float4 vColor : TEXCOORD2");
     } else {
       AppendParameter("out float4 VuPosition : POSITION");
       for (u32 i = 0; i < m_kernel.stores.size(); i++) {
@@ -1299,6 +1315,8 @@ private:
 
   void AppendDirectTfxOutputs() {
     const auto &contract = *m_direct_contract;
+    const bool uv_no_fog_interface =
+        m_program->uses_tfx_uv_no_fog_interface;
     const std::string st_x =
         contract.textured && !contract.fixed_texture_coordinates
             ? FloatValue(contract.st[0])
@@ -1328,13 +1346,6 @@ private:
     m_source +=
         "\tconst float2 vertexScale = VertexScaleOffset[0].xy;\n"
         "\tconst float2 vertexOffset = VertexScaleOffset[0].zw;\n"
-        "\tconst float2 textureScale = VertexScaleOffset[1].xy;\n"
-        "\tconst float2 textureOffset = VertexScaleOffset[1].zw;\n"
-        "\tconst float2 VuST = float2(" +
-        st_x + ", " + st_y + ");\n"
-        "\tconst float2 VuUV = float2(" + uv_x + ", " + uv_y + ");\n"
-        "\tconst float2 uv = VuUV - textureOffset;\n"
-        "\tconst float2 st = VuST - textureOffset;\n"
         "\tconst float2 VuXY = float2(" + PackedValue(contract.position[0]) +
         ", " + PackedValue(contract.position[1]) + ");\n"
         "\tconst float VuZ = min(" + PackedValue(contract.depth) +
@@ -1342,13 +1353,28 @@ private:
         "\tvPosition.xy = (VuXY - float2(0.05f, 0.05f)) * vertexScale - "
         "vertexOffset;\n"
         "\tvPosition.z = VuZ * (1.0f / 4294967296.0f);\n"
-        "\tvPosition.w = 1.0f;\n"
-        "\tvPointSize = VertexScaleOffset[2].x;\n"
-        "\tvTexFloat = float4(st.x, st.y, " +
-        fog + ", " + q + ");\n"
-        "\tvTexInt.xy = uv * textureScale;\n"
-        "\tvTexInt.zw = uv;\n"
-        "\tvColor = float4(" +
+        "\tvPosition.w = 1.0f;\n";
+    if (m_program->uses_tfx_point_size)
+      m_source += "\tvPointSize = VertexScaleOffset[2].x;\n";
+    m_source +=
+        "\tconst float2 textureOffset = VertexScaleOffset[1].zw;\n";
+    if (!uv_no_fog_interface) {
+      m_source +=
+          "\tconst float2 VuST = float2(" + st_x + ", " + st_y + ");\n"
+          "\tconst float2 st = VuST - textureOffset;\n"
+          "\tvTexFloat = float4(st.x, st.y, " + fog + ", " + q + ");\n";
+    }
+    m_source +=
+        "\tconst float2 textureScale = VertexScaleOffset[1].xy;\n"
+        "\tconst float2 VuUV = float2(" + uv_x + ", " + uv_y + ");\n"
+        "\tconst float2 uv = VuUV - textureOffset;\n";
+    if (uv_no_fog_interface)
+      m_source += "\tvTexInt = uv * textureScale;\n";
+    else
+      m_source +=
+          "\tvTexInt.xy = uv * textureScale;\n"
+          "\tvTexInt.zw = uv;\n";
+    m_source += "\tvColor = float4(" +
         PackedValue(contract.color[0], flat_color) + ", " +
         PackedValue(contract.color[1], flat_color) + ", " +
         PackedValue(contract.color[2], flat_color) + ", " +

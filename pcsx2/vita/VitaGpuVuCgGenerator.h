@@ -62,6 +62,11 @@ struct GeneratedCgProgram {
   bool uses_i_uniform = false;
   bool uses_gif_q_uniform = false;
   bool uses_tfx_uniforms = false;
+  bool uses_tfx_point_size = false;
+  // The direct GIF contract proves TME=1/FST=1/FGE=0, so the generated root
+  // and its linked fragment variants exchange packed UV only. This omits the
+  // dead STQ/fog TEXCOORD which the generic runtime-selector ABI must retain.
+  bool uses_tfx_uv_no_fog_interface = false;
   bool uses_flat_instance_inputs = false;
   bool uses_buffered_batch_inputs = false;
   bool flat_strip_winding = false;
