@@ -13,55 +13,68 @@ namespace Threading
 	// Sleeps one producer until a separately published progress value changes.
 	//
 	// The consumer calls NotifyOfProgress() after an ordinary progress
-	// publication and PublishQuiescence() before it can stop publishing. The
-	// latter performs an unconditional release RMW even when no waiter is
-	// armed. A producer which arms afterwards acquires that RMW before
-	// rechecking progress, closing the otherwise possible publish-before-arm
-	// lost-wakeup race without an atomic RMW on every consumer item.
+	// publication and PublishQuiescence() before it can stop publishing.
+	// Ordinary progress pays only a relaxed hint load when nobody is waiting.
+	// Arming and waking are serialized so a semaphore token can never be
+	// confused with a later arm generation. The quiescence lock closes the
+	// publish-before-arm lost-wakeup race without locking every consumer item.
 	class SingleWaiterProgressEvent final
 	{
 	public:
 		template <typename Progress, typename ReadProgress>
 		void WaitForChange(Progress observed, ReadProgress&& read_progress)
 		{
-			bool expected = false;
-			pxAssertRel(m_waiting.compare_exchange_strong(expected, true,
-							std::memory_order_acq_rel,
-							std::memory_order_relaxed),
-				"SingleWaiterProgressEvent has more than one waiter");
-
-			if (read_progress() != observed)
 			{
-				// If cancellation loses, the consumer already claimed this
-				// waiter and its semaphore post must be consumed.
-				if (m_waiting.exchange(false, std::memory_order_acq_rel))
+				std::lock_guard lock(m_mutex);
+				pxAssertRel(!m_waiting,
+					"SingleWaiterProgressEvent has more than one waiter");
+				if (read_progress() != observed)
 					return;
+				m_waiting = true;
+				m_waiting_hint.store(true, std::memory_order_release);
 			}
 			m_semaphore.Wait();
 		}
 
 		void NotifyOfProgress()
 		{
-			if (m_waiting.load(std::memory_order_relaxed) &&
-				m_waiting.exchange(false, std::memory_order_acq_rel))
-			{
-				m_semaphore.Post();
-			}
+			if (m_waiting_hint.load(std::memory_order_relaxed))
+				WakeWaiter();
 		}
 
 		void PublishQuiescence()
 		{
-			if (m_waiting.exchange(false, std::memory_order_acq_rel))
-				m_semaphore.Post();
+			// Always take the lock. If progress was published before the
+			// producer armed, this unlock/lock pair makes that publication
+			// visible to its protected recheck. If it armed first, wake it.
+			WakeWaiter();
 		}
 
 		bool IsWaitingForValidation() const
 		{
-			return m_waiting.load(std::memory_order_acquire);
+			return m_waiting_hint.load(std::memory_order_acquire);
 		}
 
 	private:
-		std::atomic_bool m_waiting{false};
-		UserspaceSemaphore m_semaphore;
+		void WakeWaiter()
+		{
+			bool post = false;
+			{
+				std::lock_guard lock(m_mutex);
+				if (m_waiting)
+				{
+					m_waiting = false;
+					m_waiting_hint.store(false, std::memory_order_release);
+					post = true;
+				}
+			}
+			if (post)
+				m_semaphore.Post();
+		}
+
+		std::atomic_bool m_waiting_hint{false};
+		mutable KernelMutex m_mutex;
+		bool m_waiting = false;
+		KernelSemaphore m_semaphore;
 	};
 } // namespace Threading
