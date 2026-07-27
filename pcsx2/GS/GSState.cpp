@@ -4261,13 +4261,9 @@ void GSState::GrowVertexBuffer()
 		u32 old_size;
 		u32 new_size;
 	};
-	const std::array<AllocDesc, 5> alloc_desc = {{
+	const std::array<AllocDesc, 2> alloc_desc = {{
 		{reinterpret_cast<void**>(&m_vertex->buff),      old_vertex_size, new_vertex_size},
-		// discard contents of buff_copy by setting old_size = 0
-		{reinterpret_cast<void**>(&m_vertex->buff_copy), 0,               new_vertex_size},
-		{reinterpret_cast<void**>(&m_draw_vertex.buff), old_vertex_size, new_vertex_size},
-		{reinterpret_cast<void**>(&m_index->buff),       old_index_size,  new_index_size},
-		{reinterpret_cast<void**>(&m_draw_index.buff),  old_index_size,  new_index_size}
+		{reinterpret_cast<void**>(&m_index->buff),       old_index_size,  new_index_size}
 	}};
 
 	// For logging
@@ -4296,6 +4292,70 @@ void GSState::GrowVertexBuffer()
 	}
 
 	m_vertex->maxcount = maxcount - 3; // -3 to have some space at the end of the buffer before DrawingKick can grow it
+}
+
+void GSState::EnsureVertexCopyBuffer()
+{
+	const u32 vertex_count = m_vertex->maxcount + 3;
+	if (m_vertex->buff_copy && m_vertex->copy_maxcount >= vertex_count)
+		return;
+
+	// The copy is scratch, so no contents survive a resize. Free it first to
+	// avoid holding both capacities in Vita's bounded newlib heap.
+	if (m_vertex->buff_copy)
+	{
+		_aligned_free(m_vertex->buff_copy);
+		m_vertex->buff_copy = nullptr;
+		m_vertex->copy_maxcount = 0;
+	}
+
+	m_vertex->buff_copy = static_cast<GSVertex*>(
+		_aligned_malloc(sizeof(GSVertex) * vertex_count, 32));
+	if (!m_vertex->buff_copy)
+	{
+		Console.Error("GS: failed to allocate %zu bytes for the vertex copy buffer.",
+			sizeof(GSVertex) * static_cast<size_t>(vertex_count));
+		pxFailRel("Memory allocation failed");
+	}
+	m_vertex->copy_maxcount = vertex_count;
+}
+
+void GSState::EnsureDrawGeometryBuffers()
+{
+	const u32 vertex_count = m_vertex->maxcount + 3;
+	const u32 index_count = vertex_count * 6;
+
+	if (!m_draw_vertex.buff || m_draw_vertex.maxcount < vertex_count)
+	{
+		if (m_draw_vertex.buff)
+			_aligned_free(m_draw_vertex.buff);
+		m_draw_vertex.buff = static_cast<GSVertex*>(
+			_aligned_malloc(sizeof(GSVertex) * vertex_count, 32));
+		if (!m_draw_vertex.buff)
+		{
+			m_draw_vertex.maxcount = 0;
+			Console.Error("GS: failed to allocate %zu bytes for the draw vertex buffer.",
+				sizeof(GSVertex) * static_cast<size_t>(vertex_count));
+			pxFailRel("Memory allocation failed");
+		}
+		m_draw_vertex.maxcount = vertex_count;
+	}
+
+	if (!m_draw_index.buff || m_draw_index.maxcount < index_count)
+	{
+		if (m_draw_index.buff)
+			_aligned_free(m_draw_index.buff);
+		m_draw_index.buff = static_cast<u16*>(
+			_aligned_malloc(sizeof(u16) * index_count, 32));
+		if (!m_draw_index.buff)
+		{
+			m_draw_index.maxcount = 0;
+			Console.Error("GS: failed to allocate %zu bytes for the draw index buffer.",
+				sizeof(u16) * static_cast<size_t>(index_count));
+			pxFailRel("Memory allocation failed");
+		}
+		m_draw_index.maxcount = index_count;
+	}
 }
 
 // For returning order of vertices to form a right triangle

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
+#include "common/SingleWaiterProgressEvent.h"
 #include "common/Threading.h"
 #include "Vif.h"
 #include "Vif_Dma.h"
@@ -28,6 +29,7 @@ class VU_Thread final {
 	alignas(__cachelinesize) int  m_read_pos; // temporary read pos (local to the VU thread)
 	int  m_write_pos; // temporary write pos (local to the EE thread)
 	Threading::WorkSema semaEvent;
+	Threading::SingleWaiterProgressEvent m_ring_space_progress;
 	std::atomic_bool m_shutdown_flag{false};
 	// Worker-private execution state. PCSX2's x86 microVU exits generated
 	// code directly and therefore never consults the EE-owned VPU_STAT busy

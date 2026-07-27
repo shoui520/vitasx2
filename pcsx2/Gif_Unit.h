@@ -527,6 +527,11 @@ struct Gif_Path
 	{
 		return (u32)mtvu.gsPackQueue.size();
 	}
+
+	size_t GetGSPacketConsumerPositionMTVU() const
+	{
+		return mtvu.gsPackQueue.consumer_position();
+	}
 };
 
 struct Gif_Unit

@@ -613,6 +613,11 @@ void VU_Thread::ExecuteRingBuffer()
 				VitaGS::FlushMtvuPath1Completions();
 			}
 		}
+		// Pair with a producer which arms after the final CommitReadPos().
+		// The unconditional release RMW makes that post-drain recheck observe
+		// all preceding read-position publications without adding an RMW to
+		// every ring record.
+		m_ring_space_progress.PublishQuiescence();
 
 		// A fast continuation builder can briefly catch the EE producer between
 		// VIF transfers thousands of times per frame. Queue-empty is therefore
@@ -627,6 +632,7 @@ void VU_Thread::ExecuteRingBuffer()
 	}
 
 	VitaGS::FlushMtvuPath1Completions();
+	m_ring_space_progress.PublishQuiescence();
 	semaEvent.Kill();
 }
 
@@ -664,13 +670,9 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 				counted_wait = true;
 			}
 			KickStart();
-			// Locking might trigger a full flush of the ring buffer. Yield
-			// will be more aggressive, and only flush the minimal size.
-			// Performance will be smoother but it will consume extra CPU cycle
-			// on the EE thread (not an issue on 4 cores).
-			std::this_thread::yield();
-			if (performance_telemetry_enabled)
-				m_profile_ring_wait_spins++;
+			m_ring_space_progress.WaitForChange(readPos, [this]() {
+				return GetReadPos();
+			});
 		}
 	}
 }
@@ -738,6 +740,7 @@ __fi void VU_Thread::CommitWritePos()
 __fi void VU_Thread::CommitReadPos()
 {
 	m_ato_read_pos.store(m_read_pos, std::memory_order_release);
+	m_ring_space_progress.NotifyOfProgress();
 }
 
 __fi u32 VU_Thread::Read()

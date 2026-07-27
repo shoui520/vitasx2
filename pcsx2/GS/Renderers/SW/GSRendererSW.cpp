@@ -376,6 +376,7 @@ void GSRendererSW::RewriteVerticesIfSTOverflow()
 			// Make sure the copy buffer is large enough.
 			while (m_vertex->maxcount < m_index->tail)
 				GrowVertexBuffer();
+			EnsureVertexCopyBuffer();
 
 			GSVertex* RESTRICT vertex = m_vertex->buff;
 			GSVertex* RESTRICT vertex_copy = m_vertex->buff_copy;

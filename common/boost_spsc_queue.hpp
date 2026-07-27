@@ -216,6 +216,15 @@ public:
         }
     }
 
+    // Consumer progress token for an external full-buffer wait. The value is
+    // opaque and may wrap; with one blocked producer, fewer than max_size
+    // consumer pops can occur before the queue becomes empty, so equality is
+    // sufficient to detect whether at least one protected item retired.
+    size_t consumer_position() const
+    {
+        return read_index_.load(std::memory_order_acquire);
+    }
+
 private:
     bool empty(size_t write_index, size_t read_index)
     {

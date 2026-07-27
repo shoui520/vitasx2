@@ -141,6 +141,7 @@ protected:
 		GSVertex* buff;
 		GSVertex* buff_copy; // same size buffer to copy/modify the original buffer
 		u32 head, tail, next, maxcount; // head: first vertex, tail: last vertex + 1, next: last indexed + 1
+		u32 copy_maxcount;
 		u32 xy_tail;
 		GSVector4i xy[4];
 		GSVector4i xyhead;
@@ -165,6 +166,7 @@ protected:
 	{
 		u16* buff;
 		u32 tail;
+		u32 maxcount;
 	} m_draw_index = {};
 
 	struct GSDrawBufferEnv
@@ -184,6 +186,8 @@ protected:
 	void UpdateVertexKick();
 
 	void GrowVertexBuffer();
+	void EnsureVertexCopyBuffer();
+	void EnsureDrawGeometryBuffers();
 	bool IsAutoFlushDraw(u32 prim, int& tex_layer);
 	template<u32 prim> void HandleAutoFlush();
 	bool EarlyDetectShuffle(u32 prim);

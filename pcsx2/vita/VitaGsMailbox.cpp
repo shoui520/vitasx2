@@ -19,6 +19,7 @@
 #include "common/Console.h"
 #include "common/Error.h"
 #include "common/FPControl.h"
+#include "common/SingleWaiterProgressEvent.h"
 #include "common/Timer.h"
 #include "common/WrappedMemCopy.h"
 #include "vita/VitaGxmGsState.h"
@@ -44,7 +45,6 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -134,7 +134,6 @@ namespace MTGS
 	static std::atomic<int> s_signal_ring_position{0};
 	static std::atomic<int> s_queued_frame_count{0};
 	static std::atomic<bool> s_vsync_signal_listener{false};
-	static Threading::KernelMutex s_mtvu_wait_mutex;
 	static Threading::WorkSema s_work_sema;
 	static Threading::UserspaceSemaphore s_ring_reset_sema;
 	static Threading::UserspaceSemaphore s_vsync_sema;
@@ -288,6 +287,8 @@ namespace MTGS
 	static std::atomic_bool s_mtvu_path1_completion_waiting{false};
 	static std::atomic_bool s_mtvu_path1_drain_waiter{false};
 	static Threading::UserspaceSemaphore s_mtvu_path1_drain_sema;
+	static Threading::SingleWaiterProgressEvent
+		s_mtvu_path1_buffer_progress;
 	// On Vita g_gs_renderer owns this instance, matching PCSX2 GS.cpp. QEMU's
 	// software-only GSState keeps its existing mailbox-local owner instead.
 	static VitaGxmGsState* s_gs = nullptr;
@@ -2279,6 +2280,8 @@ namespace MTGS
 		s_mtvu_path1_completion_waiting.store(
 			false, std::memory_order_relaxed);
 		s_mtvu_path1_drain_waiter.store(false, std::memory_order_relaxed);
+		pxAssertRel(!s_mtvu_path1_buffer_progress.IsWaitingForValidation(),
+			"MTVU PATH1 buffer waiter survived GS worker shutdown");
 		s_gpu_vu_compiler_result_pending.store(false,
 			std::memory_order_relaxed);
 		s_gpu_vu_input_retirement_pending.store(false,
@@ -2384,16 +2387,13 @@ namespace MTGS
 
 	static void MainLoop()
 	{
-		std::unique_lock mtvu_lock(s_mtvu_wait_mutex);
 #if defined(__vita__)
 		const bool performance_telemetry_enabled =
 			VitaPerformanceTelemetry::IsEnabled();
 #endif
 		while (true)
 		{
-			mtvu_lock.unlock();
 			s_work_sema.WaitForWork();
-			mtvu_lock.lock();
 
 			if (!s_open_flag.load(std::memory_order_acquire))
 				break;
@@ -2578,6 +2578,7 @@ namespace MTGS
 						path.readAmount.fetch_sub(packet.size + packet.readAmount,
 							std::memory_order_acq_rel);
 						path.PopGSPacketMTVU();
+						s_mtvu_path1_buffer_progress.NotifyOfProgress();
 						break;
 					}
 
@@ -2721,10 +2722,14 @@ namespace MTGS
 			}
 			if (s_vsync_signal_listener.exchange(false, std::memory_order_acq_rel))
 				s_vsync_sema.Post();
+			// This release RMW pairs with a waiter which arms after the final
+			// packet pop, so a drain-to-empty transition cannot lose its wake.
+			s_mtvu_path1_buffer_progress.PublishQuiescence();
 		}
 
 		s_read_pos.store(s_write_pos.load(std::memory_order_acquire),
 			std::memory_order_release);
+		s_mtvu_path1_buffer_progress.PublishQuiescence();
 		s_work_sema.Kill();
 	}
 
@@ -3004,20 +3009,15 @@ namespace MTGS
 		{
 			SetEvent();
 			Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
-			const u32 pending_packets = path.GetPendingGSPackets();
-			if (pending_packets)
-			{
-				while (true)
-				{
-					std::lock_guard lock(s_mtvu_wait_mutex);
-					if (path.GetPendingGSPackets() != pending_packets)
-						break;
-#if defined(__vita__)
-					if (performance_telemetry_enabled)
-						s_gs_producer_performance.wait_spins++;
-#endif
-				}
-			}
+			if (path.GetPendingGSPackets() == 0)
+				return;
+
+			const size_t consumer_position =
+				path.GetGSPacketConsumerPositionMTVU();
+			s_mtvu_path1_buffer_progress.WaitForChange(
+				consumer_position, [&path]() {
+					return path.GetGSPacketConsumerPositionMTVU();
+				});
 		}
 		else
 		{
@@ -3475,6 +3475,11 @@ u64 VitaGS::GetMtvuPath1CompletionDeferralsForValidation()
 {
 	return s_mtvu_path1_completion_deferrals_for_validation.load(
 		std::memory_order_relaxed);
+}
+
+bool VitaGS::IsMtvuPath1BufferWaiterArmedForValidation()
+{
+	return MTGS::s_mtvu_path1_buffer_progress.IsWaitingForValidation();
 }
 #endif
 

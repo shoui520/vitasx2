@@ -5368,6 +5368,7 @@ void GSRendererHW::HandleProvokingVertexFirst()
 	// De-index the vertices using the copy buffer
 	while (m_vertex->maxcount < m_index->tail)
 		GrowVertexBuffer();
+	EnsureVertexCopyBuffer();
 	for (int i = static_cast<int>(m_index->tail) - 1; i >= 0; i--)
 	{
 		m_vertex->buff_copy[i] = m_vertex->buff[m_index->buff[i]];
@@ -5501,6 +5502,7 @@ void GSRendererHW::SetupIA(float target_scale, float sx, float sy, bool req_vert
 
 					if (req_vert_backup)
 					{
+						EnsureDrawGeometryBuffers();
 						memcpy(m_draw_vertex.buff, m_vertex->buff, sizeof(GSVertex) * m_vertex->next);
 						memcpy(m_draw_index.buff, m_index->buff, sizeof(u16) * m_index->tail);
 
@@ -5565,6 +5567,7 @@ void GSRendererHW::SetupIA(float target_scale, float sx, float sy, bool req_vert
 
 	if (req_vert_backup)
 	{
+		EnsureDrawGeometryBuffers();
 		memcpy(m_draw_vertex.buff, m_vertex->buff, sizeof(GSVertex) * m_vertex->next);
 		memcpy(m_draw_index.buff, m_index->buff, sizeof(u16) * m_index->tail);
 
