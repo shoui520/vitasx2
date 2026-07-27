@@ -29,6 +29,10 @@ namespace VitaGpuVu {
 namespace {
 
 constexpr u32 Vu1MemoryQwords = 1024;
+constexpr u32 DirectInputEpochReservationBytes = Vu1MemoryQwords * 16u;
+constexpr u32 MaximumRawInputRelativeQword =
+    static_cast<u32>(std::numeric_limits<s16>::max());
+static_assert(DirectInputEpochReservationBytes == 16 * 1024);
 
 u32 NormalizedCycle(u8 value) {
   return value != 0 ? value : 256u;
@@ -211,6 +215,62 @@ bool MaterializeDirectAffineV4_32Span(const VifUnpackSpan& span,
     destination_offset = 0;
   }
   return true;
+}
+
+bool HasSingleAddressableRawInputWindow(const GpuVuDraw& draw) {
+  if (draw.invocation_count == 0 || draw.streams.empty())
+    return false;
+
+  uptr owner = 0;
+  u32 slot = 0;
+  u32 generation = 0;
+  u32 first_qword = std::numeric_limits<u32>::max();
+  u32 last_qword = 0;
+  for (const StreamBinding& binding : draw.streams) {
+    if (binding.input_span >= draw.InputSpans().size())
+      return false;
+    const RawVifPayloadRef& payload =
+        draw.InputSpans()[binding.input_span].payload;
+    if (!payload.IsValid() || payload.slot >= InputRingSlotCount ||
+        payload.offset > InputRingSlotSize ||
+        payload.size > InputRingSlotSize - payload.offset ||
+        binding.payload_byte_offset > payload.size) {
+      return false;
+    }
+    if (owner == 0) {
+      owner = payload.owner;
+      slot = payload.slot;
+      generation = payload.generation;
+    } else if (payload.owner != owner || payload.slot != slot ||
+               payload.generation != generation) {
+      return false;
+    }
+
+    const u64 relative_last =
+        static_cast<u64>(binding.payload_byte_offset) +
+        static_cast<u64>(draw.invocation_count - 1u) *
+            binding.byte_stride +
+        15u;
+    if ((binding.payload_byte_offset & 15u) != 0 ||
+        relative_last >= payload.size) {
+      return false;
+    }
+    const u64 absolute_first =
+        static_cast<u64>(payload.offset) + binding.payload_byte_offset;
+    const u64 absolute_last =
+        static_cast<u64>(payload.offset) + relative_last;
+    if ((absolute_first & 15u) != 0 ||
+        absolute_last >= InputRingSlotSize) {
+      return false;
+    }
+    first_qword =
+        std::min(first_qword, static_cast<u32>(absolute_first / 16u));
+    last_qword =
+        std::max(last_qword, static_cast<u32>(absolute_last / 16u));
+  }
+
+  return owner != 0 && first_qword != std::numeric_limits<u32>::max() &&
+         last_qword - first_qword <= MaximumRawInputRelativeQword;
 }
 
 struct InputRing::Impl {
@@ -410,6 +470,7 @@ bool InputRing::IsReady() const {
 }
 
 bool CaptureRawVifPayload(const void* source, u32 size,
+                          RawVifCaptureMode mode,
                           RawVifPayloadRef* payload) {
   if (!source || !payload || size == 0)
     return false;
@@ -451,9 +512,19 @@ bool CaptureRawVifPayload(const void* source, u32 size,
     InputRing::Impl::Slot& current =
         impl.slots[impl.current_slot];
     u32 aligned_offset = 0;
+    // The generated phase-one root binds one GXM raw-buffer base for every
+    // VU command epoch. VU1 data memory is 16 KiB, so reserving that much
+    // address space before the first captured UNPACK keeps the common affine
+    // epoch within one 2 MiB slot. An epoch containing more source data, or
+    // referring back to an older slot, is still rejected by
+    // HasSingleAddressableRawInputWindow() before CpuVU1 can be bypassed.
+    const u32 required_capacity =
+        mode == RawVifCaptureMode::BeginVuCommandEpoch
+            ? std::max(size, DirectInputEpochReservationBytes)
+            : size;
     if (AlignUp(current.write_offset, PayloadAlignment, &aligned_offset) &&
         aligned_offset <= current.block.size &&
-        size <= current.block.size - aligned_offset) {
+        required_capacity <= current.block.size - aligned_offset) {
       reserved_slot = impl.current_slot;
       reserved_offset = aligned_offset;
       reserved_generation =

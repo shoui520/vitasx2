@@ -14,6 +14,11 @@ class GpuVuDraw;
 inline constexpr u32 InputRingSlotCount = 4;
 inline constexpr u32 InputRingSlotSize = 2 * 1024 * 1024;
 
+enum class RawVifCaptureMode : u8 {
+  ContinueEpoch,
+  BeginVuCommandEpoch,
+};
+
 // Opaque ownership of one immutable byte range in the Vita GPU-readable VIF
 // ring. The owner remains alive until every copied reference is released.
 struct RawVifPayloadRef {
@@ -121,7 +126,8 @@ private:
   struct Impl;
   Impl* m_impl = nullptr;
 
-  friend bool CaptureRawVifPayload(const void*, u32, RawVifPayloadRef*);
+  friend bool CaptureRawVifPayload(const void*, u32, RawVifCaptureMode,
+                                   RawVifPayloadRef*);
   friend const u8* ResolveRawVifPayload(const RawVifPayloadRef&);
   friend const u8* ResolveGpuRawVifPayload(const RawVifPayloadRef&);
   friend bool PublishPendingRawVifPayloads(const GpuVuDraw*, u32);
@@ -134,7 +140,12 @@ private:
 // Producer capture, worker resolution, and explicit ownership transfer. A
 // retained reference may be handed from MTVU to an ordered GS descriptor.
 bool CaptureRawVifPayload(const void* source, u32 size,
+                          RawVifCaptureMode mode,
                           RawVifPayloadRef* payload);
+// Proves the current generated-shader ABI can bind every raw stream in one
+// mapped slot-generation and keep its dynamically indexed qword offsets in
+// the positive signed-16 address range emitted by psp2cgc.
+bool HasSingleAddressableRawInputWindow(const GpuVuDraw& draw);
 // CPU-side analysis and replay always read the cacheable staging copy.
 const u8* ResolveRawVifPayload(const RawVifPayloadRef& payload);
 // The GS owner may bind only bytes which the MTVU worker has copied into the

@@ -33,7 +33,6 @@ enum class DirectInputState : u8 {
   Unavailable,
   Pending,
   Ready,
-  LayoutRejected,
 };
 
 struct DirectProgramInfo {
@@ -108,11 +107,10 @@ bool PrimeDirectProgram(DirectProgramToken token,
 // copy/unpack path instead of paying capture plus CPU replay.
 bool IsDirectProgramReadyForInput(DirectProgramToken token);
 
-// Returns the complete producer state in one lookup. LayoutRejected is sticky
-// for the exact generation-tagged program: the current direct lowering has
-// proven that its invocation-indexed raw inputs cannot be covered by the
-// uploaded VIF spans, so subsequent epochs must retain the ordinary VIF/VU
-// fallback until microcode invalidation or a broader GPU lowering replaces it.
+// Returns the complete producer state in one lookup. A runtime epoch whose
+// spans cannot cover this invocation remains a transient descriptor failure:
+// it must replay on CPU without disabling capture for later representable
+// epochs of the same exact program.
 DirectInputState GetDirectProgramInputState(DirectProgramToken token);
 
 // GS-thread completion handoff. Registration is rare, so it may scan the

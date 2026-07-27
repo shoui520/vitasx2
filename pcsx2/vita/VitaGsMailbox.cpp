@@ -140,6 +140,28 @@ namespace MTGS
 	static Threading::UserspaceSemaphore s_vsync_sema;
 	static Threading::UserspaceSemaphore s_open_or_close_done;
 	static int s_copy_data_tally = 0;
+	// Gif_Path::ExecuteGSPacket() creates one logical PATH1 reservation for
+	// every VU1 dispatch. Adjacent reservations have no payload and therefore
+	// need only one physical MTGS command. The EE producer may extend an open
+	// command until the GS worker atomically claims it; a later non-PATH1
+	// command closes the run before publication, preserving exact ordering.
+	//
+	// Keep the run count outside PacketTag. PacketTag is ordinary ring storage,
+	// whereas this word is concurrently extended by the EE and claimed by the
+	// GS owner. The open bit makes that handoff race-free without a mutex.
+	static constexpr u32 MtvuReservationRunOpen = 0x80000000u;
+	static constexpr u32 MtvuReservationRunCountMask = 0x7fffffffu;
+	static constexpr u32 MaximumMtvuReservationRun = 256;
+	static constexpr u32 NoOpenMtvuReservationRun = RingBufferSize;
+	alignas(__cachelinesize)
+		static std::array<std::atomic<u32>, RingBufferSize>
+			s_mtvu_reservation_runs{};
+	// EE producer only.
+	static u32 s_open_mtvu_reservation_run = NoOpenMtvuReservationRun;
+	// GS worker only. A command can span several independently published MTVU
+	// completion records, so retain its unconsumed logical count at the ring
+	// head without modifying shared PacketTag storage.
+	static u32 s_mtvu_reservations_remaining = 0;
 	static Threading::Thread s_thread;
 	static std::atomic_bool s_open_flag{false};
 	static std::atomic_bool s_shutdown_flag{false};
@@ -156,12 +178,12 @@ namespace MTGS
 		u32 reservation_count = 0;
 	};
 
-	// PCSX2's EE thread reserves one MTVUGSPacket command for every VU1
+	// PCSX2's EE thread reserves one logical PATH1 ordering point for every VU1
 	// dispatch. Consecutive GPU executions have no intervening CPU PATH1
 	// packet, so the single MTVU producer links them and publishes one run
-	// completion. The GS consumer advances the same number of immutable EE
-	// reservations in one operation. This preserves every PATH1 ordering point
-	// without paying a cross-core SPSC publication for every 34-vertex chunk.
+	// completion. The physical MTGS command independently coalesces adjacent
+	// reservations; ConsumePrefix() reconciles either run boundary without
+	// weakening a single guest ordering point.
 	class MtvuPath1CompletionQueue
 	{
 	public:
@@ -2245,6 +2267,10 @@ namespace MTGS
 		pxAssertRel(!IsOpen(), "GS worker should be closed when starting");
 		s_read_pos.store(0, std::memory_order_relaxed);
 		s_write_pos.store(0, std::memory_order_relaxed);
+		for (std::atomic<u32>& run : s_mtvu_reservation_runs)
+			run.store(0, std::memory_order_relaxed);
+		s_open_mtvu_reservation_run = NoOpenMtvuReservationRun;
+		s_mtvu_reservations_remaining = 0;
 		s_mtvu_path1_completions.ResetAndDiscard();
 		s_mtvu_path1_completion_waiting.store(
 			false, std::memory_order_relaxed);
@@ -2381,8 +2407,14 @@ namespace MTGS
 				const u32 read_pos = s_read_pos.load(std::memory_order_relaxed);
 				const PacketTag& tag = reinterpret_cast<const PacketTag&>(s_ring[read_pos]);
 				u32 ring_advance = 1;
+				bool command_progress = false;
 #if defined(__vita__)
-				if (performance_telemetry_enabled)
+				const bool continuing_mtvu_reservation =
+					static_cast<Command>(tag.command) ==
+							Command::MTVUGSPacket &&
+						s_mtvu_reservations_remaining != 0;
+				if (performance_telemetry_enabled &&
+					!continuing_mtvu_reservation)
 					s_gs_worker_performance.commands++;
 #endif
 
@@ -2434,57 +2466,51 @@ namespace MTGS
 						if (completion.reservation_count == 0)
 							break;
 
-						// A completion run describes consecutive VU dispatches,
-						// not necessarily adjacent MTGS commands. PATH2/PATH3,
-						// VSync, register snapshots and other ordered GS work can
-						// be published between the EE reservations. Consume only
-						// the adjacent reservation prefix at this ordering point;
-						// the queue keeps the remainder at its front until the GS
-						// worker reaches the next MTVUGSPacket command.
-						const u32 write_pos =
-							s_write_pos.load(std::memory_order_acquire);
-						const u32 published_commands =
-							(write_pos - read_pos) & RingBufferMask;
-						u32 adjacent_reservations = 0;
-						while (adjacent_reservations <
-								completion.reservation_count &&
-							adjacent_reservations < published_commands)
+						// Claim the complete logical count once. If the MTVU
+						// completion boundary falls inside this command, keep the
+						// command at the ring head and consume the next completion
+						// before advancing to any interleaved GS work.
+						if (s_mtvu_reservations_remaining == 0)
 						{
-							const PacketTag& reservation =
-								reinterpret_cast<const PacketTag&>(
-									s_ring[(read_pos + adjacent_reservations) &
-										RingBufferMask]);
-							if (static_cast<Command>(reservation.command) !=
-								Command::MTVUGSPacket)
-							{
-								break;
-							}
-							adjacent_reservations++;
+							const u32 claimed =
+								s_mtvu_reservation_runs[read_pos].exchange(
+									0, std::memory_order_acq_rel);
+							s_mtvu_reservations_remaining =
+								claimed & MtvuReservationRunCountMask;
+							// A zero state can only come from an old diagnostic
+							// producer or corrupt ring publication. Retain the
+							// historical one-command/one-reservation behavior so
+							// release builds fail closed instead of losing order.
+							if (s_mtvu_reservations_remaining == 0)
+								s_mtvu_reservations_remaining = 1;
 						}
-						pxAssertRel(adjacent_reservations != 0,
-							"MTVU PATH1 completion did not begin at its "
-							"EE reservation");
-						if (adjacent_reservations == 0)
+						const u32 reservation_prefix = std::min(
+							completion.reservation_count,
+							s_mtvu_reservations_remaining);
+						pxAssertRel(reservation_prefix != 0,
+							"MTVU PATH1 command has no logical reservation");
+						if (reservation_prefix == 0)
 							break;
-						ring_advance = adjacent_reservations;
+						s_mtvu_reservations_remaining -= reservation_prefix;
+						ring_advance =
+							s_mtvu_reservations_remaining == 0 ? 1 : 0;
+						command_progress = true;
 #if defined(__vita__)
 						if (performance_telemetry_enabled)
 						{
-							s_gs_worker_performance.commands +=
-								adjacent_reservations - 1;
 							s_gs_worker_performance.mtvu_packets +=
-								adjacent_reservations;
+								reservation_prefix;
 						}
 #endif
 						if (completion.first_draw)
 						{
 							std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>>
 								draws;
-							draws.reserve(adjacent_reservations);
+							draws.reserve(reservation_prefix);
 							VitaGpuVu::GpuVuDraw* direct_draw =
 								completion.first_draw;
 							for (u32 index = 0;
-								index < adjacent_reservations; index++)
+								index < reservation_prefix; index++)
 							{
 								if (!direct_draw)
 									break;
@@ -2497,11 +2523,11 @@ namespace MTGS
 							}
 							pxAssertRel(
 								draws.size() ==
-										adjacent_reservations,
+										reservation_prefix,
 								"MTVU PATH1 direct prefix is shorter than "
-								"its adjacent reservations");
+								"its logical reservations");
 							s_mtvu_path1_completions.ConsumePrefix(
-								adjacent_reservations, direct_draw);
+								reservation_prefix, direct_draw);
 							if (s_gs)
 							{
 								s_gs->ConsumeGpuVuDraws(std::move(draws));
@@ -2516,8 +2542,9 @@ namespace MTGS
 
 						pxAssertRel(completion.reservation_count == 1,
 							"CPU PATH1 completion covered multiple dispatches");
-						pxAssertRel(adjacent_reservations == 1,
-							"CPU PATH1 completion consumed multiple reservations");
+						pxAssertRel(reservation_prefix == 1,
+							"CPU PATH1 completion consumed multiple logical "
+							"reservations");
 						s_mtvu_path1_completions.ConsumePrefix(1, nullptr);
 						Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
 						GS_Packet packet;
@@ -2648,7 +2675,16 @@ namespace MTGS
 				}
 
 				if (ring_advance == 0)
+				{
+					// A counted PATH1 command can make useful progress while a
+					// later completion for the same command is already queued.
+					// Recheck immediately; if it is not ready, the ordinary
+					// completion-wait path above leaves command_progress false
+					// and sleeps without spinning.
+					if (command_progress)
+						continue;
 					break;
+				}
 
 				const u32 new_read_pos = (read_pos + ring_advance) & RingBufferMask;
 				s_read_pos.store(new_read_pos, std::memory_order_release);
@@ -2746,8 +2782,28 @@ namespace MTGS
 		}
 	}
 
+	static void CloseOpenMtvuReservationRun()
+	{
+		const u32 slot = s_open_mtvu_reservation_run;
+		if (slot == NoOpenMtvuReservationRun)
+			return;
+
+		u32 state =
+			s_mtvu_reservation_runs[slot].load(std::memory_order_acquire);
+		while ((state & MtvuReservationRunOpen) != 0 &&
+			!s_mtvu_reservation_runs[slot].compare_exchange_weak(
+				state, state & MtvuReservationRunCountMask,
+				std::memory_order_release, std::memory_order_acquire))
+		{
+		}
+		s_open_mtvu_reservation_run = NoOpenMtvuReservationRun;
+	}
+
 	static void PrepareDataPacket(Command command, u32 size)
 	{
+		// A data-packet tag is itself an ordered MTGS command. Prevent a later
+		// VU dispatch from extending a PATH1 run across it.
+		CloseOpenMtvuReservationRun();
 		s_packet_size = size;
 		GenericStall(size + 1);
 		const u32 write_pos = s_write_pos.load(std::memory_order_relaxed);
@@ -2797,8 +2853,66 @@ namespace MTGS
 			++s_copy_data_tally;
 	}
 
+	static void QueueMtvuPath1Reservation()
+	{
+		u32 slot = s_open_mtvu_reservation_run;
+		if (slot != NoOpenMtvuReservationRun)
+		{
+			u32 state =
+				s_mtvu_reservation_runs[slot].load(std::memory_order_acquire);
+			while ((state & MtvuReservationRunOpen) != 0 &&
+				(state & MtvuReservationRunCountMask) <
+					MaximumMtvuReservationRun)
+			{
+				const u32 next = state + 1;
+				if (s_mtvu_reservation_runs[slot].compare_exchange_weak(
+						state, next, std::memory_order_release,
+						std::memory_order_acquire))
+				{
+#if defined(__vita__)
+					if (VitaPerformanceTelemetry::IsEnabled())
+						s_gs_producer_performance.mtvu_packets++;
+#endif
+					// Match the historical logical command tally so an idle GS
+					// worker is woken at the same guest-work cadence.
+					++s_copy_data_tally;
+					return;
+				}
+			}
+			s_open_mtvu_reservation_run = NoOpenMtvuReservationRun;
+		}
+
+		GenericStall(1);
+		slot = s_write_pos.load(std::memory_order_relaxed);
+		PacketTag& tag = reinterpret_cast<PacketTag&>(s_ring[slot]);
+		tag.command = static_cast<u32>(Command::MTVUGSPacket);
+		tag.data[0] = 1;
+		tag.data[1] = 0;
+		tag.data[2] = static_cast<u32>(GIF_PATH_1);
+		s_mtvu_reservation_runs[slot].store(
+			MtvuReservationRunOpen | 1u, std::memory_order_release);
+		s_open_mtvu_reservation_run = slot;
+#if defined(__vita__)
+		if (VitaPerformanceTelemetry::IsEnabled())
+		{
+			// submissions/ring_words are physical mailbox work; mtvu_packets
+			// remains the architectural logical-reservation count.
+			s_gs_producer_performance.submissions++;
+			s_gs_producer_performance.ring_words++;
+			s_gs_producer_performance.mtvu_packets++;
+		}
+#endif
+		FinishSimplePacket();
+	}
+
 	static void SendSimplePacket(Command command, u32 data0, u32 data1, u32 data2)
 	{
+		if (command == Command::MTVUGSPacket)
+		{
+			QueueMtvuPath1Reservation();
+			return;
+		}
+		CloseOpenMtvuReservationRun();
 		GenericStall(1);
 		PacketTag& tag = reinterpret_cast<PacketTag&>(
 			s_ring[s_write_pos.load(std::memory_order_relaxed)]);
@@ -2815,10 +2929,6 @@ namespace MTGS
 			{
 				s_gs_producer_performance.gs_packets++;
 				s_gs_producer_performance.gs_packet_bytes += data1;
-			}
-			else if (command == Command::MTVUGSPacket)
-			{
-				s_gs_producer_performance.mtvu_packets++;
 			}
 		}
 #endif
@@ -2839,6 +2949,7 @@ namespace MTGS
 
 	static void SendPointerPacket(Command command, u32 data0, void* pointer)
 	{
+		CloseOpenMtvuReservationRun();
 		GenericStall(1);
 		PacketTag& tag = reinterpret_cast<PacketTag&>(
 			s_ring[s_write_pos.load(std::memory_order_relaxed)]);

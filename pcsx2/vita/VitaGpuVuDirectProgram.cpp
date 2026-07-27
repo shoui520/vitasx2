@@ -57,11 +57,6 @@ struct PreparedProgram {
   // candidate metadata is immutable and the 496 MHz hot descriptor path
   // avoids both the compiler-registry mutex and this preparation mutex.
   std::atomic<u32> ready_candidate_plus_one{0};
-  // Set only after descriptor construction proves that the generated
-  // invocation schedule cannot be covered by this program's raw VIF layout.
-  // CPU0 observes it before deciding whether another immutable capture can
-  // replace any ARM work.
-  std::atomic<bool> raw_input_layout_rejected{false};
   u32 start_pc = 0;
   // Publication is monotonic for one exact generation. The worker's hot
   // MSCAL/MSCNT stream may revisit a registered entry thousands of times, so
@@ -968,8 +963,6 @@ DirectInputState GetDirectProgramInputState(DirectProgramToken token) {
   PreparedProgram *const prepared = LookupPinnedProgram(token);
   if (!prepared)
     return DirectInputState::Unavailable;
-  if (prepared->raw_input_layout_rejected.load(std::memory_order_acquire))
-    return DirectInputState::LayoutRejected;
   return prepared->ready_candidate_plus_one.load(std::memory_order_acquire) != 0
              ? DirectInputState::Ready
              : DirectInputState::Pending;
@@ -1071,16 +1064,6 @@ BuildDirectGpuVuDraw(DirectProgramToken token,
         FindInputSpan(spans, first_qword, input.address.invocation_coefficient,
                       draw->invocation_count, &raw);
     if (!span) {
-      bool expected = false;
-      if (prepared->raw_input_layout_rejected.compare_exchange_strong(
-              expected, true, std::memory_order_release,
-              std::memory_order_relaxed)) {
-        Console.WriteLn(
-            "GPU-VU: entry %04x raw input layout cannot cover the generated "
-            "invocation schedule; immutable capture is suspended until "
-            "program invalidation.",
-            prepared->start_pc);
-      }
       failed = true;
       break;
     }
@@ -1108,6 +1091,11 @@ BuildDirectGpuVuDraw(DirectProgramToken token,
                              0});
   }
   if (failed) {
+    RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
+    return {};
+  }
+  if (candidate.generated.uses_buffered_batch_inputs &&
+      !HasSingleAddressableRawInputWindow(*draw)) {
     RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
     return {};
   }
@@ -1375,8 +1363,6 @@ std::unique_ptr<GpuVuDraw> BuildDirectGpuVuContinuationDraw(
   if (!ConfigureGeometry(*entry_candidate, draw.get()))
     return {};
 
-  PreparedProgram *const entry_prepared =
-      LookupPinnedProgram(seed.entry_program);
   for (u32 index = 0;
        index < entry_candidate->generated.memory_inputs.size(); index++) {
     const CgMemoryInput &input =
@@ -1405,18 +1391,7 @@ std::unique_ptr<GpuVuDraw> BuildDirectGpuVuContinuationDraw(
         spans, first_qword,
         input.address.invocation_coefficient, draw->invocation_count, &raw);
     if (!span) {
-      if (entry_prepared) {
-        bool expected = false;
-        if (entry_prepared->raw_input_layout_rejected.compare_exchange_strong(
-                expected, true, std::memory_order_release,
-                std::memory_order_relaxed)) {
-          Console.WriteLn(
-              "GPU-VU: entry %04x continuation raw input layout cannot "
-              "cover the generated invocation schedule; immutable capture "
-              "is suspended until program invalidation.",
-              entry_prepared->start_pc);
-        }
-      }
+      RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
       return {};
     }
 
@@ -1443,6 +1418,11 @@ std::unique_ptr<GpuVuDraw> BuildDirectGpuVuContinuationDraw(
     draw->streams.push_back(
         {raw.payload_byte_offset, raw.byte_stride, span_index,
          static_cast<u8>(input.attribute_index), 0});
+  }
+  if (entry_candidate->generated.uses_buffered_batch_inputs &&
+      !HasSingleAddressableRawInputWindow(*draw)) {
+    RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
+    return {};
   }
 
   if (entry_candidate->generated.uses_acc_uniform)

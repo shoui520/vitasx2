@@ -1133,8 +1133,7 @@ void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* dat
 		{
 			retain_immutable_input = true;
 		}
-		else if (input_state == VitaGpuVu::DirectInputState::LayoutRejected ||
-			input_state == VitaGpuVu::DirectInputState::Unavailable)
+		else if (input_state == VitaGpuVu::DirectInputState::Unavailable)
 		{
 			VitaGpuVu::RecordCaptureBypass(size);
 			m_gpu_vu_direct_resume_token = 0;
@@ -1159,7 +1158,12 @@ void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* dat
 		span.unsigned_data = _vif.usn;
 		span.start_alignment = _vif.start_aligned;
 		if (VitaGpuVu::IsDirectAffineV4_32Span(span) &&
-			VitaGpuVu::CaptureRawVifPayload(data, size, &span.payload))
+			VitaGpuVu::CaptureRawVifPayload(
+				data, size,
+				m_pending_vif_batch ?
+					VitaGpuVu::RawVifCaptureMode::ContinueEpoch :
+					VitaGpuVu::RawVifCaptureMode::BeginVuCommandEpoch,
+				&span.payload))
 		{
 			ReserveSpace(1 + size_u32(sizeof(span)));
 			Write(MTVU_VIF_UNPACK_CAPTURED);
