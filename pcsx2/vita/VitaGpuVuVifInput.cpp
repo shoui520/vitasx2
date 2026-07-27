@@ -282,10 +282,10 @@ bool HasSingleAddressableRawInputWindow(const GpuVuDraw& draw) {
   u32 first_qword = std::numeric_limits<u32>::max();
   u32 last_qword = 0;
   for (const StreamBinding& binding : draw.streams) {
-    if (binding.input_span >= draw.InputSpans().size())
+    if (binding.input_span >= draw.InputPayloads().size())
       return false;
     const RawVifPayloadRef& payload =
-        draw.InputSpans()[binding.input_span].payload;
+        draw.InputPayloads()[binding.input_span];
     if (!payload.IsValid() || payload.slot >= InputRingSlotCount ||
         payload.offset > InputRingSlotSize ||
         payload.size > InputRingSlotSize - payload.offset ||
@@ -744,8 +744,7 @@ bool PublishPendingRawVifPayloads(const GpuVuDraw* first_draw,
           draw_index, draw_count);
       return false;
     }
-    for (const VifUnpackSpan& span : draw->InputSpans()) {
-      const RawVifPayloadRef& payload = span.payload;
+    for (const RawVifPayloadRef& payload : draw->InputPayloads()) {
       if (!payload.IsValid() ||
           payload.owner != reinterpret_cast<uptr>(ring) ||
           payload.slot >= InputRingSlotCount) {

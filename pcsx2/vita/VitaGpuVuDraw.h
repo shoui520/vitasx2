@@ -266,8 +266,9 @@ struct FinalStatePublication {
 };
 
 // Immutable, sequence-numbered handoff from the EE/VIF producer to the
-// GS/GXM-owning thread. Input span references are retained by AddInputSpan();
-// the underlying bytes remain owned until GPU vertex completion or rejection.
+// GS/GXM-owning thread. PairPlan consumes the full VIF UNPACK records before
+// construction; AddInputPayload() retains only the immutable raw byte owners
+// selected by the resulting stream bindings until GPU completion/rejection.
 class GpuVuDraw final {
 public:
   GpuVuDraw() = default;
@@ -283,7 +284,7 @@ public:
   static void operator delete(void* pointer, std::size_t size) noexcept;
 #endif
 
-  bool AddInputSpan(const VifUnpackSpan &span);
+  bool AddInputPayload(const RawVifPayloadRef &payload);
   bool Validate(std::string *error) const;
   // The MTVU owner calls this once after assigning the ordering sequence and
   // immediately before publishing the immutable descriptor. The GS owner may
@@ -292,8 +293,8 @@ public:
   bool ValidateForQueue(std::string *error);
   bool WasValidatedForQueue() const { return m_validated_for_queue; }
 
-  const InlineDescriptorVector<VifUnpackSpan, 4>& InputSpans() const {
-    return m_input_spans;
+  const InlineDescriptorVector<RawVifPayloadRef, 4>& InputPayloads() const {
+    return m_input_payloads;
   }
 
   ShaderKey program;
@@ -343,7 +344,7 @@ private:
   // Generic affine vertex programs commonly use position, normal, texture,
   // and one auxiliary stream. Keeping four references inline avoids one heap
   // promotion per IGA-style three-stream dispatch on the 496 MHz MTVU core.
-  InlineDescriptorVector<VifUnpackSpan, 4> m_input_spans;
+  InlineDescriptorVector<RawVifPayloadRef, 4> m_input_payloads;
   GpuVuUniformBlockRef m_uniform_block;
   bool m_validated_for_queue = false;
 };

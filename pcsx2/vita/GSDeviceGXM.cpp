@@ -1080,18 +1080,19 @@ static bool SameGpuVuInputSlots(
 	{
 		if (!draw)
 			return false;
-		for (const VitaGpuVu::VifUnpackSpan& span : draw->InputSpans())
+		for (const VitaGpuVu::RawVifPayloadRef& payload :
+			draw->InputPayloads())
 		{
-			if (!span.payload.IsValid())
+			if (!payload.IsValid())
 				return false;
 			if (ContainsGpuVuInputSlot(
-					incoming, incoming_count, span.payload))
+					incoming, incoming_count, payload))
 			{
 				continue;
 			}
 			if (incoming_count >= incoming.size())
 				return false;
-			incoming[incoming_count++] = span.payload;
+			incoming[incoming_count++] = payload;
 		}
 	}
 	if (incoming_count == 0 || incoming_count != retained_count)
@@ -2820,9 +2821,10 @@ bool GSDeviceGXM::Impl::RetainGpuVuDrawsForScene(
 				original_retention_count);
 			return false;
 		}
-		for (const VitaGpuVu::VifUnpackSpan& span : draw->InputSpans())
+		for (const VitaGpuVu::RawVifPayloadRef& payload :
+			draw->InputPayloads())
 		{
-			if (!RetainGpuVuInputSlot(span.payload,
+			if (!RetainGpuVuInputSlot(payload,
 					&gpu_vu_scene_input_retentions,
 					&gpu_vu_scene_input_retention_count))
 			{
@@ -4655,39 +4657,39 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 				for (const VitaGpuVu::StreamBinding& binding :
 					candidate.streams)
 				{
-					const VitaGpuVu::VifUnpackSpan& span =
-						candidate.InputSpans()[binding.input_span];
+					const VitaGpuVu::RawVifPayloadRef& payload_ref =
+						candidate.InputPayloads()[binding.input_span];
 					const u8* const payload =
-						VitaGpuVu::ResolveGpuRawVifPayload(span.payload);
+						VitaGpuVu::ResolveGpuRawVifPayload(payload_ref);
 					if (!payload ||
-						span.payload.offset >
+						payload_ref.offset >
 							VitaGpuVu::GeneratedCgProgram::
 								RawInputBufferQwords * 16u ||
-						span.payload.size >
+						payload_ref.size >
 							VitaGpuVu::GeneratedCgProgram::
 									RawInputBufferQwords * 16u -
-								span.payload.offset)
+								payload_ref.offset)
 					{
 						return false;
 					}
 					const u8* const base =
-						payload - span.payload.offset;
+						payload - payload_ref.offset;
 					if (!range->slot_base)
 					{
 						range->slot_base = base;
-						range->owner = span.payload.owner;
-						range->slot = span.payload.slot;
-						range->generation = span.payload.generation;
+						range->owner = payload_ref.owner;
+						range->slot = payload_ref.slot;
+						range->generation = payload_ref.generation;
 					}
 					else if (range->slot_base != base ||
-						range->owner != span.payload.owner ||
-						range->slot != span.payload.slot ||
-						range->generation != span.payload.generation)
+						range->owner != payload_ref.owner ||
+						range->slot != payload_ref.slot ||
+						range->generation != payload_ref.generation)
 					{
 						return false;
 					}
 					const u64 absolute_first_byte =
-						static_cast<u64>(span.payload.offset) +
+						static_cast<u64>(payload_ref.offset) +
 						binding.payload_byte_offset;
 					const u64 absolute_last_byte =
 						absolute_first_byte +
@@ -4786,10 +4788,10 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 				{
 					const VitaGpuVu::StreamBinding& binding =
 						candidate.streams[input];
-					const VitaGpuVu::VifUnpackSpan& span =
-						candidate.InputSpans()[binding.input_span];
+					const VitaGpuVu::RawVifPayloadRef& payload =
+						candidate.InputPayloads()[binding.input_span];
 					const u64 absolute_byte =
-						static_cast<u64>(span.payload.offset) +
+						static_cast<u64>(payload.offset) +
 						binding.payload_byte_offset;
 					if ((absolute_byte & 15u) != 0 ||
 						absolute_byte / 16u < window.first_qword ||
@@ -4988,10 +4990,10 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			{
 				const VitaGpuVu::StreamBinding& binding =
 					candidate.streams[index];
-				const VitaGpuVu::VifUnpackSpan& span =
-					candidate.InputSpans()[binding.input_span];
+				const VitaGpuVu::RawVifPayloadRef& payload_ref =
+					candidate.InputPayloads()[binding.input_span];
 				const u8* const payload =
-					VitaGpuVu::ResolveGpuRawVifPayload(span.payload);
+					VitaGpuVu::ResolveGpuRawVifPayload(payload_ref);
 				if (!payload)
 				{
 					if (encoded_any)

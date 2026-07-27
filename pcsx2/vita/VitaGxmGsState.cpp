@@ -296,9 +296,9 @@ namespace
 		if (!generations || !generation_count)
 			return false;
 		*generation_count = 0;
-		for (const VitaGpuVu::VifUnpackSpan& span : draw.InputSpans())
+		for (const VitaGpuVu::RawVifPayloadRef& payload :
+			draw.InputPayloads())
 		{
-			const VitaGpuVu::RawVifPayloadRef& payload = span.payload;
 			if (!payload.IsValid())
 				return false;
 			bool seen = false;

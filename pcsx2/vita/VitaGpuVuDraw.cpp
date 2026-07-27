@@ -240,8 +240,8 @@ bool FinalStatePublication::IsRequired() const {
 }
 
 GpuVuDraw::~GpuVuDraw() {
-  for (VifUnpackSpan &span : m_input_spans)
-    ReleaseRawVifPayload(&span.payload);
+  for (RawVifPayloadRef &payload : m_input_payloads)
+    ReleaseRawVifPayload(&payload);
 }
 
 #if defined(__vita__)
@@ -310,10 +310,10 @@ void GpuVuDraw::operator delete(
 }
 #endif
 
-bool GpuVuDraw::AddInputSpan(const VifUnpackSpan &span) {
-  if (!span.payload.IsValid() || !RetainRawVifPayload(span.payload))
+bool GpuVuDraw::AddInputPayload(const RawVifPayloadRef &payload) {
+  if (!payload.IsValid() || !RetainRawVifPayload(payload))
     return false;
-  m_input_spans.push_back(span);
+  m_input_payloads.push_back(payload);
   return true;
 }
 
@@ -355,18 +355,18 @@ bool GpuVuDraw::Validate(std::string *error) const {
       return Fail(error, "duplicate or invalid generated attribute index");
     }
     attribute_mask |= 1u << stream.attribute_index;
-    if (stream.input_span >= m_input_spans.size())
+    if (stream.input_span >= m_input_payloads.size())
       return Fail(error, "generated stream refers to a missing VIF span");
-    const VifUnpackSpan &span = m_input_spans[stream.input_span];
-    if (!span.payload.IsValid() ||
-        stream.payload_byte_offset > span.payload.size) {
+    const RawVifPayloadRef &payload = m_input_payloads[stream.input_span];
+    if (!payload.IsValid() ||
+        stream.payload_byte_offset > payload.size) {
       return Fail(error, "generated stream begins outside its VIF payload");
     }
     const u64 last_offset =
         static_cast<u64>(stream.payload_byte_offset) +
         static_cast<u64>(invocation_count - 1) * stream.byte_stride;
-    if (last_offset > span.payload.size ||
-        sizeof(u128) > span.payload.size - static_cast<u32>(last_offset)) {
+    if (last_offset > payload.size ||
+        sizeof(u128) > payload.size - static_cast<u32>(last_offset)) {
       return Fail(error, "generated stream extends outside its VIF payload");
     }
   }

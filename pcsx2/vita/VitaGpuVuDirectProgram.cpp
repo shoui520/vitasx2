@@ -1070,21 +1070,21 @@ BuildDirectGpuVuDraw(DirectProgramToken token,
 
     u16 span_index = 0;
     bool retained = false;
-    const auto& retained_spans = draw->InputSpans();
-    for (u32 index = 0; index < retained_spans.size(); index++) {
-      if (SamePayload(retained_spans[index].payload, span->payload)) {
+    const auto& retained_payloads = draw->InputPayloads();
+    for (u32 index = 0; index < retained_payloads.size(); index++) {
+      if (SamePayload(retained_payloads[index], span->payload)) {
         span_index = static_cast<u16>(index);
         retained = true;
         break;
       }
     }
     if (!retained) {
-      if (retained_spans.size() >= std::numeric_limits<u16>::max() ||
-          !draw->AddInputSpan(*span)) {
+      if (retained_payloads.size() >= std::numeric_limits<u16>::max() ||
+          !draw->AddInputPayload(span->payload)) {
         failed = true;
         break;
       }
-      span_index = static_cast<u16>(draw->InputSpans().size() - 1);
+      span_index = static_cast<u16>(draw->InputPayloads().size() - 1);
     }
     draw->streams.push_back({raw.payload_byte_offset, raw.byte_stride,
                              span_index, static_cast<u8>(input.attribute_index),
@@ -1398,8 +1398,8 @@ std::unique_ptr<GpuVuDraw> BuildDirectGpuVuContinuationDraw(
     u16 span_index = 0;
     bool retained = false;
     for (u32 retained_index = 0;
-         retained_index < draw->InputSpans().size(); retained_index++) {
-      if (SamePayload(draw->InputSpans()[retained_index].payload,
+         retained_index < draw->InputPayloads().size(); retained_index++) {
+      if (SamePayload(draw->InputPayloads()[retained_index],
                       span->payload)) {
         span_index = static_cast<u16>(retained_index);
         retained = true;
@@ -1407,13 +1407,13 @@ std::unique_ptr<GpuVuDraw> BuildDirectGpuVuContinuationDraw(
       }
     }
     if (!retained) {
-      if (draw->InputSpans().size() >=
+      if (draw->InputPayloads().size() >=
               std::numeric_limits<u16>::max() ||
-          !draw->AddInputSpan(*span)) {
+          !draw->AddInputPayload(span->payload)) {
         return {};
       }
       span_index =
-          static_cast<u16>(draw->InputSpans().size() - 1);
+          static_cast<u16>(draw->InputPayloads().size() - 1);
     }
     draw->streams.push_back(
         {raw.payload_byte_offset, raw.byte_stride, span_index,
