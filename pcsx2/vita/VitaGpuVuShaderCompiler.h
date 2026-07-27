@@ -154,7 +154,7 @@ private:
   void ReportServiceState();
   bool HasKeyLocked(const ShaderKey &key) const;
 
-  mutable std::mutex m_mutex;
+  mutable Threading::KernelMutex m_mutex;
   std::array<CompileSlot, MaxCompilerSlots> m_slots{};
   std::array<u8, MaxCompilerSlots> m_request_queue{};
   std::array<u8, MaxCompilerSlots> m_result_queue{};

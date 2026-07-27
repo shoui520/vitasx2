@@ -134,7 +134,7 @@ namespace MTGS
 	static std::atomic<int> s_signal_ring_position{0};
 	static std::atomic<int> s_queued_frame_count{0};
 	static std::atomic<bool> s_vsync_signal_listener{false};
-	static std::mutex s_mtvu_wait_mutex;
+	static Threading::KernelMutex s_mtvu_wait_mutex;
 	static Threading::WorkSema s_work_sema;
 	static Threading::UserspaceSemaphore s_ring_reset_sema;
 	static Threading::UserspaceSemaphore s_vsync_sema;
@@ -422,6 +422,31 @@ namespace MTGS
 					profile.vu_start.ring_waits),
 				static_cast<unsigned long long>(vu_now.compile_barriers -
 					profile.vu_start.compile_barriers));
+			const VitaGpuVu::DrawStatistics draw =
+				VitaGpuVu::GetGpuVuDrawStatistics();
+			const VitaGpuVu::DirectProgramStatistics direct =
+				VitaGpuVu::GetDirectProgramStatistics();
+			const VitaGpuVu::InputRingStatistics input =
+				VitaGpuVu::GetInputRingStatistics();
+			Console.WriteLn(
+				"GPU-VU hot profile: queued=%llu cpu_vu1=%llu "
+				"continuation_shared=%llu continuation_general=%llu "
+				"descriptor_size=%u descriptor_waits=%llu "
+				"uniform_size=%u uniform_waits=%llu "
+				"input_ring_waits=%llu encoded=%llu",
+				static_cast<unsigned long long>(draw.queued),
+				static_cast<unsigned long long>(draw.cpu_vu1_executions),
+				static_cast<unsigned long long>(
+					direct.shared_continuation_builds),
+				static_cast<unsigned long long>(
+					direct.general_continuation_builds),
+				draw.descriptor_size,
+				static_cast<unsigned long long>(
+					draw.descriptor_pool_waits),
+				draw.uniform_block_size,
+				static_cast<unsigned long long>(draw.uniform_pool_waits),
+				static_cast<unsigned long long>(input.ring_waits),
+				static_cast<unsigned long long>(draw.encoded_objects));
 		}
 	}
 
@@ -1289,6 +1314,7 @@ namespace MTGS
 			"prime_hits=%llu stale_tokens=%llu gif_address_failures=%llu "
 			"gif_contract_rejections=%llu generated_roots=%llu "
 			"compiler_requests=%llu compiler_request_retries=%llu "
+			"continuation_shared=%llu continuation_general=%llu "
 			"registry_requests=%llu unavailable=%llu registry_hits=%llu "
 			"registry_misses=%llu queue_retries=%llu compile_successes=%llu "
 			"compile_failures=%llu ready=%llu failed=%llu "
@@ -1348,6 +1374,12 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_direct.compiler_request_retries,
 				start.gpu_vu_direct.compiler_request_retries)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.shared_continuation_builds,
+				start.gpu_vu_direct.shared_continuation_builds)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_direct.general_continuation_builds,
+				start.gpu_vu_direct.general_continuation_builds)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_programs.requests,
 				start.gpu_vu_programs.requests)),
@@ -1450,7 +1482,10 @@ namespace MTGS
 			"ring_waits=%llu notification_waits=%llu "
 			"descriptor_pool_waits=%llu descriptor_pool_start=%llu "
 			"descriptor_pool_end=%llu descriptor_pool_peak=%llu "
-			"descriptor_pool_capacity=%u "
+			"descriptor_pool_capacity=%u descriptor_size=%u "
+			"uniform_pool_waits=%llu uniform_pool_start=%llu "
+			"uniform_pool_end=%llu uniform_pool_peak=%llu "
+			"uniform_pool_capacity=%u uniform_block_size=%u "
 			"live_start=%llu live_end=%llu peak_live=%llu "
 			"cpu_vu1=%llu cpu_path1_packets=%llu cpu_path1_bytes=%llu "
 			"encoded_objects=%llu reject_disconnected=%llu "
@@ -1507,6 +1542,18 @@ namespace MTGS
 			static_cast<unsigned long long>(
 				end.gpu_vu_draw.peak_descriptor_pool_in_use),
 			end.gpu_vu_draw.descriptor_pool_capacity,
+			end.gpu_vu_draw.descriptor_size,
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.uniform_pool_waits,
+				start.gpu_vu_draw.uniform_pool_waits)),
+			static_cast<unsigned long long>(
+				start.gpu_vu_draw.uniform_pool_in_use),
+			static_cast<unsigned long long>(
+				end.gpu_vu_draw.uniform_pool_in_use),
+			static_cast<unsigned long long>(
+				end.gpu_vu_draw.peak_uniform_pool_in_use),
+			end.gpu_vu_draw.uniform_pool_capacity,
+			end.gpu_vu_draw.uniform_block_size,
 			static_cast<unsigned long long>(start.gpu_vu_draw.live_draws),
 			static_cast<unsigned long long>(end.gpu_vu_draw.live_draws),
 			static_cast<unsigned long long>(end.gpu_vu_draw.peak_live_draws),
@@ -2970,6 +3017,11 @@ namespace MTGS
 		if (!IsOpen() && !WaitForOpen())
 			return;
 
+		// A VSync can make the EE wait for the GS worker. Publish any partial
+		// direct PATH1 run first so a frame with fewer than the size threshold
+		// cannot leave GS asleep at an earlier MTVUGSPacket reservation.
+		vu1Thread.RequestGpuVuPath1Flush();
+
 #if defined(__vita__)
 		const bool performance_telemetry_enabled =
 			VitaPerformanceTelemetry::IsEnabled();
@@ -3198,8 +3250,10 @@ void VitaGS::RequestGpuVuInputRetirement(
 #if defined(__vita__)
 	// A large VIF transfer can fill the immutable ring before returning to its
 	// ordinary publish boundary. Make any already-complete capture commands
-	// visible before asking the GS owner to retire their exact generation.
+	// visible, then publish the MTVU-owned descriptor run which retains that
+	// generation before asking the GS owner to retire it.
 	vu1Thread.PublishPendingVifBatch();
+	vu1Thread.RequestGpuVuPath1Flush();
 	MTGS::s_gpu_vu_input_retirement_owner.store(
 		blocked_generation.owner, std::memory_order_relaxed);
 	MTGS::s_gpu_vu_input_retirement_slot.store(

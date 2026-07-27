@@ -11,12 +11,14 @@
 // pte's semaphore.h uses mode_t without pulling in its definition.
 #include <sys/types.h>
 #include <semaphore.h>
+#include <psp2/kernel/threadmgr/lw_mutex.h>
 #elif !defined(_WIN32)
 #include <semaphore.h>
 #endif
 
 #include <atomic>
 #include <functional>
+#include <mutex>
 
 namespace Threading
 {
@@ -146,6 +148,33 @@ namespace Threading
 		void Post();
 		void Wait();
 		bool TryWait();
+	};
+
+	/// A real cross-thread mutex on every supported host.
+	///
+	/// VitaSDK's libstdc++ probes the weak pthread_cancel symbol to decide
+	/// whether threading is active. Static linking does not pull that symbol
+	/// merely for the weak probe, so std::mutex lock/unlock compile to no-ops
+	/// even though the pte pthread implementation is present. Use Sony's
+	/// lightweight kernel mutex directly for Vita cross-thread ownership.
+	class KernelMutex
+	{
+	public:
+		KernelMutex();
+		KernelMutex(const KernelMutex&) = delete;
+		KernelMutex& operator=(const KernelMutex&) = delete;
+		~KernelMutex();
+
+		void lock();
+		bool try_lock();
+		void unlock();
+
+	private:
+#if defined(__vita__)
+		alignas(8) SceKernelLwMutexWork m_mutex{};
+#else
+		std::mutex m_mutex;
+#endif
 	};
 
 	/// A semaphore for notifying a work-processing thread of new work in a (separate) queue

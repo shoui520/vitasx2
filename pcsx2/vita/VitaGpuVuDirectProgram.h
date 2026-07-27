@@ -4,13 +4,13 @@
 #pragma once
 
 #include "common/Pcsx2Types.h"
+#include "vita/VitaGpuVuDraw.h"
 #include "vita/VitaGpuVuInvocationPlan.h"
 
 #include <memory>
 #include <vector>
 
 namespace VitaGpuVu {
-class GpuVuDraw;
 struct ShaderKey;
 struct VifUnpackSpan;
 }
@@ -61,6 +61,8 @@ struct DirectProgramStatistics {
   u64 generated_roots = 0;
   u64 compiler_requests = 0;
   u64 compiler_request_retries = 0;
+  u64 shared_continuation_builds = 0;
+  u64 general_continuation_builds = 0;
 };
 
 // Immutable entry-state snapshot for a semantically paired MSCAL/MSCNT
@@ -75,6 +77,7 @@ struct DirectContinuationSeed {
   std::array<u32, 32 * 4> initial_vf{};
   std::array<u32, 4> initial_acc{};
   std::array<std::array<u32, 4>, 32> constant_values{};
+  GpuVuUniformBlockRef uniform_block;
   u32 constant_mask = 0;
   u32 initial_q = 0;
   u32 initial_p = 0;

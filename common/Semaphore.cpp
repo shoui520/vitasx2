@@ -17,6 +17,56 @@
 //  Semaphore Implementations
 // --------------------------------------------------------------------------------------
 
+Threading::KernelMutex::KernelMutex()
+{
+#if defined(__vita__)
+	// Sony's SDK ring-buffer and SampleUtil mutex owners use an unlocked
+	// SceKernelLwMutexWork (initCount 0). Priority ordering prevents a
+	// low-priority compiler publication from jumping an EE/GS waiter.
+	constexpr unsigned int priority_ordered = 0x00002000u;
+	const int result = sceKernelCreateLwMutex(&m_mutex, "VitaSX2RuntimeMutex",
+		priority_ordered, 0, nullptr);
+	pxAssertRel(result == 0, "sceKernelCreateLwMutex() failed");
+#endif
+}
+
+Threading::KernelMutex::~KernelMutex()
+{
+#if defined(__vita__)
+	const int result = sceKernelDeleteLwMutex(&m_mutex);
+	pxAssertRel(result == 0, "sceKernelDeleteLwMutex() failed");
+#endif
+}
+
+void Threading::KernelMutex::lock()
+{
+#if defined(__vita__)
+	const int result = sceKernelLockLwMutex(&m_mutex, 1, nullptr);
+	pxAssertRel(result == 0, "sceKernelLockLwMutex() failed");
+#else
+	m_mutex.lock();
+#endif
+}
+
+bool Threading::KernelMutex::try_lock()
+{
+#if defined(__vita__)
+	return sceKernelTryLockLwMutex(&m_mutex, 1) == 0;
+#else
+	return m_mutex.try_lock();
+#endif
+}
+
+void Threading::KernelMutex::unlock()
+{
+#if defined(__vita__)
+	const int result = sceKernelUnlockLwMutex(&m_mutex, 1);
+	pxAssertRel(result == 0, "sceKernelUnlockLwMutex() failed");
+#else
+	m_mutex.unlock();
+#endif
+}
+
 bool Threading::WorkSema::CheckForWork()
 {
 	s32 value = m_state.load(std::memory_order_relaxed);

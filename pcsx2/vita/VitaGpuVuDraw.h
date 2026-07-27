@@ -7,6 +7,7 @@
 #include "vita/VitaGpuVuProgramRegistry.h"
 #include "vita/VitaGpuVuVifInput.h"
 
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <memory>
@@ -173,6 +174,83 @@ struct ScalarUniforms {
   u32 gif_q = 0;
 };
 
+// Descriptor-scale register and constant inputs are immutable for one direct
+// MSCAL/MSCNT chain when the resume slice has no current-memory constant
+// inputs. Keep them in one allocation shared by every compact continuation
+// descriptor instead of copying roughly 700 bytes for every 34-vertex chunk.
+// A chain with dynamic resume-time constants receives a distinct block through
+// the general builder, preserving the same semantic contract.
+struct GpuVuUniformBlock final {
+#if defined(__vita__)
+  static void* operator new(std::size_t size);
+  static void operator delete(void* pointer) noexcept;
+  static void operator delete(void* pointer, std::size_t size) noexcept;
+#endif
+
+  void Retain() {
+    m_references.fetch_add(1, std::memory_order_relaxed);
+  }
+  void Release() {
+    if (m_references.fetch_sub(1, std::memory_order_acq_rel) == 1)
+      delete this;
+  }
+
+  InlineDescriptorVector<ConstantUniform, 16> constant_uniforms;
+  InlineDescriptorVector<VectorUniform, 16> vf_uniforms;
+
+private:
+  std::atomic<u32> m_references{1};
+};
+
+// Vita's libstdc++ may select non-atomic shared_ptr reference counts. This
+// explicit intrusive owner crosses MTVU and GS with an architectural atomic
+// count, matching PreparedProgramReference's ownership rule.
+class GpuVuUniformBlockRef final {
+public:
+  GpuVuUniformBlockRef() = default;
+  static GpuVuUniformBlockRef Adopt(GpuVuUniformBlock* block) {
+    GpuVuUniformBlockRef result;
+    result.m_block = block;
+    return result;
+  }
+  explicit GpuVuUniformBlockRef(GpuVuUniformBlock* block)
+      : m_block(block) {
+    if (m_block)
+      m_block->Retain();
+  }
+  GpuVuUniformBlockRef(const GpuVuUniformBlockRef& other)
+      : GpuVuUniformBlockRef(other.m_block) {}
+  GpuVuUniformBlockRef& operator=(const GpuVuUniformBlockRef& other) {
+    if (this == &other)
+      return *this;
+    GpuVuUniformBlockRef replacement(other);
+    Swap(replacement);
+    return *this;
+  }
+  GpuVuUniformBlockRef(GpuVuUniformBlockRef&& other) noexcept
+      : m_block(std::exchange(other.m_block, nullptr)) {}
+  GpuVuUniformBlockRef& operator=(GpuVuUniformBlockRef&& other) noexcept {
+    if (this == &other)
+      return *this;
+    GpuVuUniformBlockRef replacement(std::move(other));
+    Swap(replacement);
+    return *this;
+  }
+  ~GpuVuUniformBlockRef() {
+    if (m_block)
+      m_block->Release();
+  }
+
+  GpuVuUniformBlock* Get() const { return m_block; }
+  explicit operator bool() const { return m_block != nullptr; }
+  void Swap(GpuVuUniformBlockRef& other) noexcept {
+    std::swap(m_block, other.m_block);
+  }
+
+private:
+  GpuVuUniformBlock* m_block = nullptr;
+};
+
 struct FinalStatePublication {
   u32 vf_mask = 0;
   u32 vi_mask = 0;
@@ -188,10 +266,8 @@ struct FinalStatePublication {
 };
 
 // Immutable, sequence-numbered handoff from the EE/VIF producer to the
-// GS/GXM-owning thread. Input span references are retained exactly once by
-// AddInputSpan(). After encoding, the GS owner may coalesce them to one
-// reference per immutable input-ring slot; the underlying bytes remain owned
-// until GPU vertex completion or rejection.
+// GS/GXM-owning thread. Input span references are retained by AddInputSpan();
+// the underlying bytes remain owned until GPU vertex completion or rejection.
 class GpuVuDraw final {
 public:
   GpuVuDraw() = default;
@@ -222,8 +298,14 @@ public:
   // qwords. Keep that complete descriptor set inline: promoting every MSCNT
   // continuation through malloc would put allocator traffic back into the
   // 496 MHz worker hot path.
-  InlineDescriptorVector<ConstantUniform, 16> constant_uniforms;
-  InlineDescriptorVector<VectorUniform, 16> vf_uniforms;
+  const InlineDescriptorVector<ConstantUniform, 16>& ConstantUniforms() const;
+  const InlineDescriptorVector<VectorUniform, 16>& VfUniforms() const;
+  const GpuVuUniformBlockRef& UniformBlock() const {
+    return m_uniform_block;
+  }
+  void SetUniformBlock(GpuVuUniformBlockRef block) {
+    m_uniform_block = std::move(block);
+  }
   std::array<u32, 4> acc_uniform{};
   ScalarUniforms scalar_uniforms;
   std::array<std::array<float, 4>, 3> vertex_scale_offset{};
@@ -256,6 +338,7 @@ private:
   // and one auxiliary stream. Keeping four references inline avoids one heap
   // promotion per IGA-style three-stream dispatch on the 496 MHz MTVU core.
   InlineDescriptorVector<VifUnpackSpan, 4> m_input_spans;
+  GpuVuUniformBlockRef m_uniform_block;
 };
 
 u64 NextGpuVuOrderingSequence();
@@ -306,6 +389,12 @@ struct DrawStatistics {
   u64 descriptor_pool_in_use = 0;
   u64 peak_descriptor_pool_in_use = 0;
   u32 descriptor_pool_capacity = 0;
+  u32 descriptor_size = 0;
+  u64 uniform_pool_waits = 0;
+  u64 uniform_pool_in_use = 0;
+  u64 peak_uniform_pool_in_use = 0;
+  u32 uniform_pool_capacity = 0;
+  u32 uniform_block_size = 0;
   u64 live_draws = 0;
   u64 peak_live_draws = 0;
   // Phase accounting: what the CPU still executed and still had to publish.

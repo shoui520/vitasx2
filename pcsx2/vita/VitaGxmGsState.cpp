@@ -248,8 +248,12 @@ namespace
 	bool SameGpuVuUniforms(const VitaGpuVu::GpuVuDraw& left,
 		const VitaGpuVu::GpuVuDraw& right)
 	{
-		if (left.vf_uniforms.size() != right.vf_uniforms.size() ||
-			left.constant_uniforms.size() != right.constant_uniforms.size() ||
+		const auto& left_vf = left.VfUniforms();
+		const auto& right_vf = right.VfUniforms();
+		const auto& left_constants = left.ConstantUniforms();
+		const auto& right_constants = right.ConstantUniforms();
+		if (left_vf.size() != right_vf.size() ||
+			left_constants.size() != right_constants.size() ||
 			left.acc_uniform != right.acc_uniform ||
 			left.scalar_uniforms.present != right.scalar_uniforms.present ||
 			left.scalar_uniforms.q != right.scalar_uniforms.q ||
@@ -259,24 +263,100 @@ namespace
 		{
 			return false;
 		}
-		for (u32 index = 0; index < left.vf_uniforms.size(); index++)
+		if (left.UniformBlock().Get() == right.UniformBlock().Get())
+			return true;
+		for (u32 index = 0; index < left_vf.size(); index++)
 		{
-			if (left.vf_uniforms[index].register_index !=
-					right.vf_uniforms[index].register_index ||
-				left.vf_uniforms[index].bits != right.vf_uniforms[index].bits)
+			if (left_vf[index].register_index !=
+					right_vf[index].register_index ||
+				left_vf[index].bits != right_vf[index].bits)
 			{
 				return false;
 			}
 		}
-		for (u32 index = 0; index < left.constant_uniforms.size(); index++)
+		for (u32 index = 0; index < left_constants.size(); index++)
 		{
-			if (left.constant_uniforms[index].input_index !=
-					right.constant_uniforms[index].input_index ||
-				left.constant_uniforms[index].bits !=
-					right.constant_uniforms[index].bits)
+			if (left_constants[index].input_index !=
+					right_constants[index].input_index ||
+				left_constants[index].bits != right_constants[index].bits)
 			{
 				return false;
 			}
+		}
+		return true;
+	}
+
+	using GpuVuInputGenerations =
+		std::array<VitaGpuVu::RawVifPayloadRef,
+			VitaGpuVu::InputRingSlotCount>;
+
+	bool CollectGpuVuInputGenerations(const VitaGpuVu::GpuVuDraw& draw,
+		GpuVuInputGenerations* generations, u32* generation_count)
+	{
+		if (!generations || !generation_count)
+			return false;
+		*generation_count = 0;
+		for (const VitaGpuVu::VifUnpackSpan& span : draw.InputSpans())
+		{
+			const VitaGpuVu::RawVifPayloadRef& payload = span.payload;
+			if (!payload.IsValid())
+				return false;
+			bool seen = false;
+			for (u32 index = 0; index < *generation_count; index++)
+			{
+				const VitaGpuVu::RawVifPayloadRef& existing =
+					(*generations)[index];
+				if (existing.owner == payload.owner &&
+					existing.slot == payload.slot &&
+					existing.generation == payload.generation)
+				{
+					seen = true;
+					break;
+				}
+			}
+			if (seen)
+				continue;
+			if (*generation_count >= generations->size())
+				return false;
+			(*generations)[(*generation_count)++] = payload;
+		}
+		return *generation_count != 0;
+	}
+
+	bool SameGpuVuInputGenerations(const VitaGpuVu::GpuVuDraw& left,
+		const VitaGpuVu::GpuVuDraw& right)
+	{
+		GpuVuInputGenerations left_generations{};
+		GpuVuInputGenerations right_generations{};
+		u32 left_count = 0;
+		u32 right_count = 0;
+		if (!CollectGpuVuInputGenerations(
+				left, &left_generations, &left_count) ||
+			!CollectGpuVuInputGenerations(
+				right, &right_generations, &right_count) ||
+			left_count != right_count)
+		{
+			return false;
+		}
+		for (u32 left_index = 0; left_index < left_count; left_index++)
+		{
+			bool found = false;
+			for (u32 right_index = 0; right_index < right_count; right_index++)
+			{
+				const VitaGpuVu::RawVifPayloadRef& left_payload =
+					left_generations[left_index];
+				const VitaGpuVu::RawVifPayloadRef& right_payload =
+					right_generations[right_index];
+				if (left_payload.owner == right_payload.owner &&
+					left_payload.slot == right_payload.slot &&
+					left_payload.generation == right_payload.generation)
+				{
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				return false;
 		}
 		return true;
 	}
@@ -300,10 +380,11 @@ namespace
 			left.lowering == right.lowering &&
 			left.execution == right.execution &&
 			left.primitive_boundary == right.primitive_boundary &&
-			left.static_gs_writes.empty() && right.static_gs_writes.empty() &&
-			!left.final_state.IsRequired() &&
-			!right.final_state.IsRequired() &&
-			SameGpuVuUniforms(left, right);
+				left.static_gs_writes.empty() && right.static_gs_writes.empty() &&
+				!left.final_state.IsRequired() &&
+				!right.final_state.IsRequired() &&
+				SameGpuVuInputGenerations(left, right) &&
+				SameGpuVuUniforms(left, right);
 	}
 }
 

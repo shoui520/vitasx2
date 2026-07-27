@@ -1070,6 +1070,43 @@ static bool ContainsGpuVuInputSlot(const GpuVuInputRetentions& retentions,
 	return false;
 }
 
+static bool SameGpuVuInputSlots(
+	const GpuVuInputRetentions& retained, u32 retained_count,
+	const std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>>& draws)
+{
+	GpuVuInputRetentions incoming{};
+	u32 incoming_count = 0;
+	for (const auto& draw : draws)
+	{
+		if (!draw)
+			return false;
+		for (const VitaGpuVu::VifUnpackSpan& span : draw->InputSpans())
+		{
+			if (!span.payload.IsValid())
+				return false;
+			if (ContainsGpuVuInputSlot(
+					incoming, incoming_count, span.payload))
+			{
+				continue;
+			}
+			if (incoming_count >= incoming.size())
+				return false;
+			incoming[incoming_count++] = span.payload;
+		}
+	}
+	if (incoming_count == 0 || incoming_count != retained_count)
+		return false;
+	for (u32 index = 0; index < incoming_count; index++)
+	{
+		if (!ContainsGpuVuInputSlot(
+				retained, retained_count, incoming[index]))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool RetainGpuVuInputSlot(const VitaGpuVu::RawVifPayloadRef& payload,
 	GpuVuInputRetentions* retentions, u32* retention_count)
 {
@@ -3786,7 +3823,7 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 			return false;
 		}
 		for (const VitaGpuVu::ConstantUniform& uniform :
-			gpu_vu_draw->constant_uniforms)
+			gpu_vu_draw->ConstantUniforms())
 		{
 			std::array<float, 4> values;
 			std::memcpy(values.data(), uniform.bits.data(), sizeof(values));
@@ -3800,7 +3837,7 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 			}
 		}
 		for (const VitaGpuVu::VectorUniform& uniform :
-			gpu_vu_draw->vf_uniforms)
+			gpu_vu_draw->VfUniforms())
 		{
 			std::array<float, 4> values;
 			std::memcpy(values.data(), uniform.bits.data(), sizeof(values));
@@ -4357,7 +4394,7 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 	if (!generated->metadata.uses_tfx_uniforms ||
 		generated->metadata.memory_inputs.size() != draw->streams.size() ||
 		generated->metadata.constant_inputs.size() !=
-			draw->constant_uniforms.size())
+			draw->ConstantUniforms().size())
 	{
 		return Reject(
 			"generated VU1 program metadata differs from draw inputs");
@@ -4379,13 +4416,13 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 	}
 
 	u32 vf_mask = 0;
-	for (const VitaGpuVu::VectorUniform& uniform : draw->vf_uniforms)
+	for (const VitaGpuVu::VectorUniform& uniform : draw->VfUniforms())
 		vf_mask |= 1u << uniform.register_index;
 	if (vf_mask != generated->metadata.vf_uniform_mask)
 		return Reject("generated VU1 VF-uniform mask mismatch");
-	for (u32 index = 0; index < draw->constant_uniforms.size(); index++)
+	for (u32 index = 0; index < draw->ConstantUniforms().size(); index++)
 	{
-		if (draw->constant_uniforms[index].input_index != index ||
+		if (draw->ConstantUniforms()[index].input_index != index ||
 			generated->metadata.constant_inputs[index].uniform_index != index)
 		{
 			return Reject("generated VU1 constant-uniform layout mismatch");
@@ -4419,9 +4456,9 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			candidate->execution != draw->execution ||
 			candidate->primitive_boundary != draw->primitive_boundary ||
 			candidate->streams.size() != draw->streams.size() ||
-			candidate->vf_uniforms.size() != draw->vf_uniforms.size() ||
-			candidate->constant_uniforms.size() !=
-				draw->constant_uniforms.size() ||
+			candidate->VfUniforms().size() != draw->VfUniforms().size() ||
+			candidate->ConstantUniforms().size() !=
+				draw->ConstantUniforms().size() ||
 			candidate->acc_uniform != draw->acc_uniform ||
 			candidate->scalar_uniforms.present !=
 				draw->scalar_uniforms.present ||
@@ -4433,25 +4470,29 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		{
 			return Reject("GPU-VU descriptors do not share one batch ABI");
 		}
-		for (u32 index = 0; index < candidate->vf_uniforms.size(); index++)
+		if (candidate->UniformBlock().Get() != draw->UniformBlock().Get())
 		{
-			if (candidate->vf_uniforms[index].register_index !=
-					draw->vf_uniforms[index].register_index ||
-				candidate->vf_uniforms[index].bits !=
-					draw->vf_uniforms[index].bits)
+			for (u32 index = 0;
+				index < candidate->VfUniforms().size(); index++)
 			{
-				return Reject("GPU-VU batch VF uniforms differ");
+				if (candidate->VfUniforms()[index].register_index !=
+						draw->VfUniforms()[index].register_index ||
+					candidate->VfUniforms()[index].bits !=
+						draw->VfUniforms()[index].bits)
+				{
+					return Reject("GPU-VU batch VF uniforms differ");
+				}
 			}
-		}
-		for (u32 index = 0;
-			index < candidate->constant_uniforms.size(); index++)
-		{
-			if (candidate->constant_uniforms[index].input_index !=
-					draw->constant_uniforms[index].input_index ||
-				candidate->constant_uniforms[index].bits !=
-					draw->constant_uniforms[index].bits)
+			for (u32 index = 0;
+				index < candidate->ConstantUniforms().size(); index++)
 			{
-				return Reject("GPU-VU batch constant uniforms differ");
+				if (candidate->ConstantUniforms()[index].input_index !=
+						draw->ConstantUniforms()[index].input_index ||
+					candidate->ConstantUniforms()[index].bits !=
+						draw->ConstantUniforms()[index].bits)
+				{
+					return Reject("GPU-VU batch constant uniforms differ");
+				}
 			}
 		}
 		for (u32 index = 0; index < candidate->streams.size(); index++)
@@ -5178,6 +5219,21 @@ bool GSDeviceGXM::RenderGpuVuDraws(GSHWDrawConfig& config,
 				validation_error.c_str() :
 				"null GPU-VU descriptor in batch");
 		}
+	}
+
+	// Sony's skinning_reuse sample binds each reusable buffer lifetime to one
+	// scene notification, and PhyreEngine records one ring range against the
+	// scene sync value which consumed it. Keep that ownership granularity for
+	// immutable VIF input. A scene spanning two generations makes four-slot
+	// exhaustion wait for unrelated later draws in the oversized scene. Exact
+	// generation-set boundaries keep independent scenes in flight and retire
+	// only the storage which the producer is about to reuse.
+	if (m_impl->HasPendingGpuVuSceneDraws() &&
+		!SameGpuVuInputSlots(m_impl->gpu_vu_scene_input_retentions,
+			m_impl->gpu_vu_scene_input_retention_count, draws) &&
+		!m_impl->EndScene(false))
+	{
+		return false;
 	}
 
 	m_impl->active_gpu_vu_draws = &draws;

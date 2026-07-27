@@ -9,11 +9,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#include <mutex>
 #include <thread>
 
 #if !defined(VITASX2_QEMU_VALIDATION)
@@ -24,6 +22,7 @@
 #include <chrono>
 #include <psp2/gxm.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
 #endif
 
 namespace VitaGpuVu {
@@ -228,12 +227,13 @@ struct InputRing::Impl {
 
   std::array<Slot, InputRingSlotCount> slots;
   u8* staging_backing = nullptr;
-  // The producer owns current_slot and every write_offset. This mutex is used
-  // only when all four multi-frame slots are genuinely busy; the last
-  // reference holder takes it before notification so the condition-variable
-  // wake cannot be lost.
-  std::mutex slot_released_mutex;
-  std::condition_variable slot_released;
+  // VU_Thread::VifUnpack() is the sole producer. Publish the exact slot it is
+  // waiting to reuse before rechecking its reference count. The last owner
+  // claims that token before signaling, which makes release-before-wait and
+  // shutdown races lossless without putting VitaSDK's cancellation-polling
+  // pthread condition variable on this hot Cortex-A9 path.
+  SceUID slot_released_sema = -1;
+  std::atomic<s32> waiting_slot{-1};
   std::atomic<bool> accepting{false};
   u32 current_slot = 0;
   bool initialized = false;
@@ -256,6 +256,17 @@ bool InputRing::Initialize() {
     return false;
 
   ResetStatistics();
+  m_impl->slot_released_sema =
+      sceKernelCreateSema("VitaSX2 VIF slot", 0, 0, 1, nullptr);
+  if (m_impl->slot_released_sema < 0) {
+    Console.Warning(
+        "GPU-VU: VIF input slot semaphore creation failed (%08x); "
+        "retaining inline MTVU payloads.",
+        static_cast<u32>(m_impl->slot_released_sema));
+    m_impl->slot_released_sema = -1;
+    return false;
+  }
+  m_impl->waiting_slot.store(-1, std::memory_order_relaxed);
   constexpr size_t StagingSize =
       static_cast<size_t>(InputRingSlotCount) * InputRingSlotSize;
   m_impl->staging_backing =
@@ -264,6 +275,8 @@ bool InputRing::Initialize() {
     Console.Warning(
         "GPU-VU: cacheable VIF input staging allocation failed; "
         "retaining inline MTVU payloads.");
+    sceKernelDeleteSema(m_impl->slot_released_sema);
+    m_impl->slot_released_sema = -1;
     return false;
   }
   for (u32 slot = 0; slot < InputRingSlotCount; slot++) {
@@ -281,6 +294,8 @@ bool InputRing::Initialize() {
         VitaGXM::ReleaseMappedBlock(&m_impl->slots[release].block);
       _aligned_free(m_impl->staging_backing);
       m_impl->staging_backing = nullptr;
+      sceKernelDeleteSema(m_impl->slot_released_sema);
+      m_impl->slot_released_sema = -1;
       return false;
     }
     m_impl->slots[slot].staging =
@@ -306,6 +321,8 @@ bool InputRing::Initialize() {
       VitaGXM::ReleaseMappedBlock(&slot.block);
     _aligned_free(m_impl->staging_backing);
     m_impl->staging_backing = nullptr;
+    sceKernelDeleteSema(m_impl->slot_released_sema);
+    m_impl->slot_released_sema = -1;
     return false;
   }
   m_impl->initialized = true;
@@ -328,10 +345,11 @@ bool InputRing::Shutdown() {
       expected, nullptr, std::memory_order_acq_rel,
       std::memory_order_relaxed);
   m_impl->accepting.store(false, std::memory_order_release);
-  {
-    std::lock_guard lock(m_impl->slot_released_mutex);
+  if (m_impl->waiting_slot.exchange(
+          -1, std::memory_order_acq_rel) >= 0 &&
+      m_impl->slot_released_sema >= 0) {
+    sceKernelSignalSema(m_impl->slot_released_sema, 1);
   }
-  m_impl->slot_released.notify_all();
 
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -349,6 +367,18 @@ bool InputRing::Shutdown() {
       return false;
     }
     std::this_thread::yield();
+  }
+
+  if (m_impl->slot_released_sema >= 0) {
+    const int result =
+        sceKernelDeleteSema(m_impl->slot_released_sema);
+    if (result < 0) {
+      Console.Error(
+          "GPU-VU: VIF input slot semaphore deletion failed (%08x).",
+          static_cast<u32>(result));
+      return false;
+    }
+    m_impl->slot_released_sema = -1;
   }
 
   bool released = true;
@@ -463,15 +493,56 @@ bool CaptureRawVifPayload(const void* source, u32 size,
     // Give the request a nonzero sentinel size so it obeys the opaque
     // reference contract without claiming a byte range.
     blocked_generation.size = 1;
+    s32 expected_waiter = -1;
+    if (!impl.waiting_slot.compare_exchange_strong(
+            expected_waiter, static_cast<s32>(next),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+      Console.Error(
+          "GPU-VU: VIF input ring found a second slot waiter (%d).",
+          expected_waiter);
+      s_capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      leave();
+      return false;
+    }
+
+    // Publishing the waiter before this recheck closes both release-before-
+    // wait and shutdown-before-wait races. If the producer clears its own
+    // token there is nothing to consume. If another thread already claimed
+    // it, that thread has posted exactly one semaphore signal.
+    const bool should_wait =
+        impl.accepting.load(std::memory_order_acquire) &&
+        candidate.references.load(std::memory_order_acquire) != 0;
+    if (!should_wait) {
+      s32 owned_waiter = static_cast<s32>(next);
+      if (impl.waiting_slot.compare_exchange_strong(
+              owned_waiter, -1, std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        continue;
+      }
+    }
+
     VitaGS::RequestGpuVuInputRetirement(blocked_generation);
-    std::unique_lock slot_lock(impl.slot_released_mutex);
-    impl.slot_released.wait(slot_lock, [&impl, next]() {
-      return !impl.accepting.load(std::memory_order_acquire) ||
-             impl.slots[next].references.load(
-                 std::memory_order_acquire) == 0;
-    });
+    const int wait_result = sceKernelWaitSema(
+        impl.slot_released_sema, 1, nullptr);
+    const s32 waiter_after_wait =
+        impl.waiting_slot.load(std::memory_order_acquire);
+    s32 owned_waiter = static_cast<s32>(next);
+    impl.waiting_slot.compare_exchange_strong(
+        owned_waiter, -1, std::memory_order_acq_rel,
+        std::memory_order_acquire);
+    if (wait_result < 0) {
+      Console.Error(
+          "GPU-VU: VIF input slot wait failed (%08x, slot=%u refs=%u "
+          "waiter=%d).",
+          static_cast<u32>(wait_result), next,
+          candidate.references.load(std::memory_order_acquire),
+          waiter_after_wait);
+      s_capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      leave();
+      return false;
+    }
     // Retain the v=1 telemetry field name for comparable hardware logs. This
-    // now counts blocking condition-variable wakeups, never polling spins.
+    // now counts native semaphore wakeups, never polling spins.
     s_ring_wait_spins.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -658,8 +729,10 @@ bool PublishPendingRawVifPayloads(const GpuVuDraw* first_draw,
 
 bool RetainRawVifPayload(const RawVifPayloadRef& payload) {
 #if defined(VITASX2_QEMU_VALIDATION)
-  (void)payload;
-  return false;
+  // ARM validation descriptors use opaque fake owners: there is no GXM ring
+  // to retain, but preserving the payload lets semantic fixtures exercise the
+  // same descriptor construction and destruction paths as the Vita product.
+  return payload.IsValid();
 #else
   if (!ResolveRawVifPayload(payload))
     return false;
@@ -685,8 +758,18 @@ void ReleaseRawVifPayload(RawVifPayloadRef* payload) {
       if (previous != 0) {
         s_live_references.fetch_sub(1, std::memory_order_relaxed);
         if (previous == 1) {
-          std::lock_guard lock(ring->m_impl->slot_released_mutex);
-          ring->m_impl->slot_released.notify_one();
+          s32 expected_waiter = static_cast<s32>(payload->slot);
+          if (ring->m_impl->waiting_slot.compare_exchange_strong(
+                  expected_waiter, -1, std::memory_order_acq_rel,
+                  std::memory_order_acquire)) {
+            const int result = sceKernelSignalSema(
+                ring->m_impl->slot_released_sema, 1);
+            if (result < 0) {
+              Console.Error(
+                  "GPU-VU: VIF input slot signal failed (%08x).",
+                  static_cast<u32>(result));
+            }
+          }
         }
       } else {
         slot.references.fetch_add(1, std::memory_order_relaxed);

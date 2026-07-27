@@ -247,6 +247,7 @@ void VU_Thread::Reset()
 	m_gpu_vu_direct_resume_token = 0;
 	m_gpu_vu_direct_program_start_pc = 0;
 	m_gpu_vu_direct_program_prepared = false;
+	m_gpu_vu_path1_flush_requested.store(false, std::memory_order_relaxed);
 	m_vif_span_sequence = 0;
 	m_pending_vif_batch = false;
 	vuCycleIdx = 0;
@@ -296,6 +297,7 @@ void VU_Thread::ExecuteRingBuffer()
 	u32 primed_direct_entry_token = 0;
 	u32 primed_direct_resume_token = 0;
 	VitaGpuVu::DirectContinuationSeed active_direct_continuation;
+	VitaGpuVu::DirectContinuationSeed pending_direct_continuation;
 #if defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
 	bool reported_first_direct_job = false;
 	bool reported_first_queued_direct_draw = false;
@@ -401,7 +403,6 @@ void VU_Thread::ExecuteRingBuffer()
 							primed_direct_program_token =
 								direct_program.value;
 						}
-						VitaGpuVu::DirectContinuationSeed pending_continuation;
 						bool begins_continuation = false;
 						std::unique_ptr<VitaGpuVu::GpuVuDraw> draw;
 						if (allow_direct_draw && addr != -1 &&
@@ -409,13 +410,15 @@ void VU_Thread::ExecuteRingBuffer()
 							VitaGpuVu::IsDirectContinuationPair(
 								direct_program, continuation_program))
 						{
+							pending_direct_continuation = {};
 							draw = VitaGpuVu::BuildDirectGpuVuDraw(
 								direct_program, context,
 								m_deferred_vif_unpacks);
 							begins_continuation = draw &&
 								VitaGpuVu::CaptureDirectContinuationSeed(
 									direct_program, continuation_program,
-									context, *draw, &pending_continuation);
+									context, *draw,
+									&pending_direct_continuation);
 							if (!begins_continuation)
 								draw.reset();
 						}
@@ -498,7 +501,8 @@ void VU_Thread::ExecuteRingBuffer()
 							vuCycleIdx = (vuCycleIdx + 1) & 3;
 							if (begins_continuation)
 								active_direct_continuation =
-									std::move(pending_continuation);
+									std::move(
+										pending_direct_continuation);
 							queued_direct_draw = true;
 						}
 						else if (built)
@@ -602,17 +606,23 @@ void VU_Thread::ExecuteRingBuffer()
 			}
 
 			CommitReadPos();
+			if (m_gpu_vu_path1_flush_requested.exchange(
+					false, std::memory_order_acquire))
+			{
+				VitaGS::FlushMtvuPath1Completions();
+			}
 		}
 
-		// QueueGpuVuDraw() deliberately batches consecutive accepted
-		// dispatches, but the immutable VIF ring can fill before the batch
-		// reaches its size threshold. Publish a partial run whenever MTVU has
-		// drained its command queue. Otherwise the EE producer can wait for a
-		// VIF slot whose last references are owned by the unpublished run,
-		// while MTVU sleeps and the GS owner has no descriptor it can retire.
-		// This is an ordered queue-drain boundary, not a per-dispatch
-		// rendezvous.
-		VitaGS::FlushMtvuPath1Completions();
+		// A fast continuation builder can briefly catch the EE producer between
+		// VIF transfers thousands of times per frame. Queue-empty is therefore
+		// not an epoch boundary: publishing here fragmented cacheable-to-GXM
+		// copies and made CPU0 contend on every short producer burst. Explicit
+		// VSync, input-pressure and observation requests close partial runs.
+		if (m_gpu_vu_path1_flush_requested.exchange(
+				false, std::memory_order_acquire))
+		{
+			VitaGS::FlushMtvuPath1Completions();
+		}
 	}
 
 	VitaGS::FlushMtvuPath1Completions();
@@ -884,6 +894,14 @@ void VU_Thread::PublishPendingVifBatch()
 		return;
 	CommitWritePos();
 	KickStart();
+}
+
+void VU_Thread::RequestGpuVuPath1Flush()
+{
+#if defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
+	m_gpu_vu_path1_flush_requested.store(true, std::memory_order_release);
+	KickStart();
+#endif
 }
 
 void VU_Thread::WaitForQueue()

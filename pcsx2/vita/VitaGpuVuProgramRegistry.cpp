@@ -3,6 +3,7 @@
 
 #include "vita/VitaGpuVuProgramRegistry.h"
 
+#include "common/Threading.h"
 #include "vita/VitaGpuVuDirectProgram.h"
 
 #include <atomic>
@@ -26,7 +27,7 @@ struct RegistryEntry {
   GeneratedCgProgram metadata;
 };
 
-std::mutex s_registry_mutex;
+Threading::KernelMutex s_registry_mutex;
 std::map<ShaderKey, RegistryEntry, ShaderKeyLess> s_registry;
 ShaderCompiler *s_compiler = nullptr;
 std::atomic<u64> s_requests{0};

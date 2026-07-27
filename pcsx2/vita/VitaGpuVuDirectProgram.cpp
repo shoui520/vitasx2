@@ -6,6 +6,7 @@
 #include "GS/GSRegs.h"
 #include "VUmicro.h"
 #include "common/Console.h"
+#include "common/Threading.h"
 #include "vita/VitaGpuVuCgGenerator.h"
 #include "vita/VitaGpuVuDraw.h"
 #include "vita/VitaGpuVuGifContract.h"
@@ -51,7 +52,7 @@ struct PreparedProgram {
   std::array<u8, VU1_PROGSIZE> micro{};
   ProgramAnalysis analysis;
   std::vector<DirectCandidate> candidates;
-  std::mutex mutex;
+  Threading::KernelMutex mutex;
   // Zero until the worker observes one registered root. Afterwards all
   // candidate metadata is immutable and the 496 MHz hot descriptor path
   // avoids both the compiler-registry mutex and this preparation mutex.
@@ -129,7 +130,7 @@ struct CacheSlot {
   u32 generation = 0;
 };
 
-std::mutex s_cache_mutex;
+Threading::KernelMutex s_cache_mutex;
 std::array<CacheSlot, MaximumPreparedPrograms> s_cache;
 u64 s_cache_clock = 0;
 std::atomic<u64> s_cache_epoch{1};
@@ -148,6 +149,8 @@ std::atomic<u64> s_gif_contract_rejections{0};
 std::atomic<u64> s_generated_roots{0};
 std::atomic<u64> s_compiler_requests{0};
 std::atomic<u64> s_compiler_request_retries{0};
+std::atomic<u64> s_shared_continuation_builds{0};
+std::atomic<u64> s_general_continuation_builds{0};
 
 DirectProgramToken MakeToken(u32 slot, u32 generation) {
   return {((generation & TokenGenerationMask) << TokenSlotBits) |
@@ -170,20 +173,39 @@ bool Matches(const PreparedProgram &program, const u8 *micro, u32 start_pc) {
          std::memcmp(program.micro.data(), micro, VU1_PROGSIZE) == 0;
 }
 
-// The returned pointer remains valid until this thread performs another
-// successful lookup or exits. This gives the hot descriptor path a lock-free,
-// reference-count-free cache hit while an eviction on another thread can only
-// retire the cache's ownership, never the caller's thread-local pin.
+// The returned pointer remains pinned in this thread's two-entry working set
+// until a cache publication invalidates the epoch or a third token replaces
+// it. IGA alternates explicit MSCAL and resumed MSCNT entries, so one pin would
+// take a cross-core kernel mutex and churn two intrusive references on every
+// dispatch. Two pins keep that hot pair lock- and reference-count-free while
+// an eviction on another thread can only retire the cache's ownership.
 PreparedProgram *LookupPinnedProgram(DirectProgramToken token) {
-  struct LocalLookup {
+  struct LocalEntry {
     DirectProgramToken token{};
     PreparedProgramReference program;
-    u64 epoch = 0;
   };
-  thread_local LocalLookup local;
+  struct LocalLookups {
+    std::array<LocalEntry, 2> entries;
+    u64 epoch = 0;
+    u8 replacement = 0;
+  };
+  thread_local LocalLookups local;
   const u64 epoch = s_cache_epoch.load(std::memory_order_acquire);
-  if (local.epoch == epoch && local.token == token && local.program)
-    return local.program.Get();
+  if (local.epoch == epoch) {
+    for (const LocalEntry &entry : local.entries) {
+      if (entry.token == token && entry.program)
+        return entry.program.Get();
+    }
+  } else {
+    // Drop stale pins before taking the shared cache mutex. Their potentially
+    // large analyses are destroyed outside every cache critical section.
+    for (LocalEntry &entry : local.entries) {
+      entry.token = {};
+      entry.program = {};
+    }
+    local.epoch = epoch;
+    local.replacement = 0;
+  }
 
   u32 slot = 0;
   u32 generation = 0;
@@ -203,10 +225,12 @@ PreparedProgram *LookupPinnedProgram(DirectProgramToken token) {
     entry.last_use = ++s_cache_clock;
     replacement = PreparedProgramReference(entry.program.Get());
   }
-  local.token = token;
-  local.program = std::move(replacement);
-  local.epoch = epoch;
-  return local.program.Get();
+  LocalEntry &pinned = local.entries[local.replacement];
+  pinned.token = token;
+  pinned.program = std::move(replacement);
+  local.replacement =
+      static_cast<u8>((local.replacement + 1u) % local.entries.size());
+  return pinned.program.Get();
 }
 
 std::unique_ptr<PreparedProgram> BuildPreparedProgram(const u8 *micro,
@@ -701,9 +725,10 @@ private:
 };
 
 ConstantUniform *FindConstantUniform(GpuVuDraw *draw, u32 input_index) {
-  if (!draw)
+  if (!draw || !draw->UniformBlock())
     return nullptr;
-  for (ConstantUniform &uniform : draw->constant_uniforms) {
+  for (ConstantUniform &uniform :
+       draw->UniformBlock().Get()->constant_uniforms) {
     if (uniform.input_index == input_index)
       return &uniform;
   }
@@ -712,7 +737,7 @@ ConstantUniform *FindConstantUniform(GpuVuDraw *draw, u32 input_index) {
 
 const ConstantUniform *FindConstantUniform(const GpuVuDraw &draw,
                                            u32 input_index) {
-  for (const ConstantUniform &uniform : draw.constant_uniforms) {
+  for (const ConstantUniform &uniform : draw.ConstantUniforms()) {
     if (uniform.input_index == input_index)
       return &uniform;
   }
@@ -1015,6 +1040,9 @@ BuildDirectGpuVuDraw(DirectProgramToken token,
   }
 
   auto draw = std::make_unique<GpuVuDraw>();
+  draw->SetUniformBlock(
+      GpuVuUniformBlockRef::Adopt(new GpuVuUniformBlock()));
+  GpuVuUniformBlock *const uniforms = draw->UniformBlock().Get();
   draw->program = candidate.key;
   draw->direct_tfx = candidate.contract;
   draw->gif_tag = tag;
@@ -1098,7 +1126,7 @@ BuildDirectGpuVuDraw(DirectProgramToken token,
       ConstantUniform uniform{};
       uniform.input_index = static_cast<u8>(input.uniform_index);
       uniform.bits = override->seed->constant_values[input.uniform_index];
-      draw->constant_uniforms.push_back(std::move(uniform));
+      uniforms->constant_uniforms.push_back(std::move(uniform));
       continue;
     }
 
@@ -1125,7 +1153,7 @@ BuildDirectGpuVuDraw(DirectProgramToken token,
     }
     if (failed)
       break;
-    draw->constant_uniforms.push_back(uniform);
+    uniforms->constant_uniforms.push_back(uniform);
   }
   if (failed) {
     RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
@@ -1139,7 +1167,7 @@ BuildDirectGpuVuDraw(DirectProgramToken token,
     uniform.register_index = static_cast<u8>(reg);
     std::memcpy(uniform.bits.data(), context.initial_vf_words + reg * 4,
                 sizeof(uniform.bits));
-    draw->vf_uniforms.push_back(uniform);
+    uniforms->vf_uniforms.push_back(uniform);
   }
   if (candidate.generated.uses_acc_uniform) {
     if (!context.initial_acc_words)
@@ -1189,7 +1217,8 @@ bool CaptureDirectContinuationSeed(
   if (!seed || !entry_context.initial_vi ||
       !entry_context.initial_vf_words ||
       entry_draw.lowering != OutputLowering::DirectTfx ||
-      entry_draw.execution != ExecutionKind::GeneratedParallel) {
+      entry_draw.execution != ExecutionKind::GeneratedParallel ||
+      !entry_draw.UniformBlock()) {
     return false;
   }
 
@@ -1219,6 +1248,7 @@ bool CaptureDirectContinuationSeed(
   captured.initial_q = entry_context.initial_q;
   captured.initial_p = entry_context.initial_p;
   captured.initial_i = entry_context.initial_i;
+  captured.uniform_block = entry_draw.UniformBlock();
 
   for (const CgConstantInput &input :
        entry_candidate->generated.constant_inputs) {
@@ -1252,53 +1282,191 @@ std::unique_ptr<GpuVuDraw> BuildDirectGpuVuContinuationDraw(
     return {};
   }
 
-  InvocationEvaluationContext entry_context = resume_context;
-  entry_context.initial_vi = seed.initial_vi.data();
-  entry_context.initial_vf_words = seed.initial_vf.data();
-  entry_context.initial_acc_words = seed.initial_acc.data();
-  entry_context.initial_q = seed.initial_q;
-  entry_context.initial_p = seed.initial_p;
-  entry_context.initial_i = seed.initial_i;
-  ContinuationConstantOverride constant_override{
-      seed.entry_program, &seed, &resume_candidate->generated};
-  std::unique_ptr<GpuVuDraw> draw;
-  {
-    ScopedContinuationConstantOverride override_scope(&constant_override);
-    draw = BuildDirectGpuVuDraw(seed.entry_program, entry_context, spans);
-  }
-  if (!draw || draw->program != entry_candidate->key)
-    return {};
+  const bool has_dynamic_constants = std::any_of(
+      entry_candidate->generated.constant_inputs.begin(),
+      entry_candidate->generated.constant_inputs.end(),
+      [resume_candidate](const CgConstantInput &input) {
+        return HasConstantAddress(resume_candidate->generated,
+                                  input.address);
+      });
+  // A current-memory constant can legitimately differ at every MSCNT. Retain
+  // the general descriptor builder for that semantic shape; only chains whose
+  // complete uniform block is invariant use the compact shared path below.
+  if (!seed.uniform_block || has_dynamic_constants) {
+    s_general_continuation_builds.fetch_add(1,
+                                            std::memory_order_relaxed);
+    InvocationEvaluationContext entry_context = resume_context;
+    entry_context.initial_vi = seed.initial_vi.data();
+    entry_context.initial_vf_words = seed.initial_vf.data();
+    entry_context.initial_acc_words = seed.initial_acc.data();
+    entry_context.initial_q = seed.initial_q;
+    entry_context.initial_p = seed.initial_p;
+    entry_context.initial_i = seed.initial_i;
+    ContinuationConstantOverride constant_override{
+        seed.entry_program, &seed, &resume_candidate->generated};
+    std::unique_ptr<GpuVuDraw> draw;
+    {
+      ScopedContinuationConstantOverride override_scope(&constant_override);
+      draw =
+          BuildDirectGpuVuDraw(seed.entry_program, entry_context, spans);
+    }
+    if (!draw || draw->program != entry_candidate->key)
+      return {};
 
-  // Constants which only belong to the skipped MSCAL prologue are immutable
-  // chain inputs. A constant also demanded by the resume entry remains a
-  // current per-dispatch value and is deliberately left as built above.
-  for (const CgConstantInput &input :
-       entry_candidate->generated.constant_inputs) {
-    if (HasConstantAddress(resume_candidate->generated, input.address))
-      continue;
-    if (input.uniform_index >= seed.constant_values.size() ||
-        (seed.constant_mask & (1u << input.uniform_index)) == 0) {
+    // Constants which only belong to the skipped MSCAL prologue are immutable
+    // chain inputs. A constant also demanded by the resume entry remains a
+    // current per-dispatch value and is deliberately left as built above.
+    for (const CgConstantInput &input :
+         entry_candidate->generated.constant_inputs) {
+      if (HasConstantAddress(resume_candidate->generated, input.address))
+        continue;
+      if (input.uniform_index >= seed.constant_values.size() ||
+          (seed.constant_mask & (1u << input.uniform_index)) == 0) {
+        return {};
+      }
+      ConstantUniform *const uniform =
+          FindConstantUniform(draw.get(), input.uniform_index);
+      if (!uniform)
+        return {};
+      uniform->bits = seed.constant_values[input.uniform_index];
+    }
+
+    thread_local InvocationEvaluationWorkspace resume_workspace;
+    resume_workspace.Begin(resume_candidate->invocation.values.size());
+    std::array<u32, 4> resume_tag{};
+    if (!ReadGifTag(resume_candidate->invocation, resume_context,
+                    &resume_workspace, &resume_tag) ||
+        resume_tag != resume_candidate->gif_tag ||
+        resume_tag != draw->gif_tag ||
+        !EvaluateFinalViState(resume_candidate->invocation, resume_context,
+                              &resume_workspace, &draw->final_vi_values,
+                              &draw->final_vi_write_mask)) {
       return {};
     }
-    ConstantUniform *const uniform =
-        FindConstantUniform(draw.get(), input.uniform_index);
-    if (!uniform)
-      return {};
-    uniform->bits = seed.constant_values[input.uniform_index];
+    return draw;
+  }
+
+  if (spans.empty()) {
+    return {};
   }
 
   thread_local InvocationEvaluationWorkspace resume_workspace;
   resume_workspace.Begin(resume_candidate->invocation.values.size());
   std::array<u32, 4> resume_tag{};
+  std::array<u16, 16> final_vi_values{};
+  u32 final_vi_write_mask = 0;
   if (!ReadGifTag(resume_candidate->invocation, resume_context,
                   &resume_workspace, &resume_tag) ||
       resume_tag != resume_candidate->gif_tag ||
-      resume_tag != draw->gif_tag ||
+      resume_tag != entry_candidate->gif_tag ||
       !EvaluateFinalViState(resume_candidate->invocation, resume_context,
-                            &resume_workspace, &draw->final_vi_values,
-                            &draw->final_vi_write_mask)) {
+                            &resume_workspace, &final_vi_values,
+                            &final_vi_write_mask)) {
     return {};
   }
+
+  auto draw = std::make_unique<GpuVuDraw>();
+  draw->SetUniformBlock(seed.uniform_block);
+  draw->program = entry_candidate->key;
+  draw->direct_tfx = entry_candidate->contract;
+  draw->gif_tag = entry_candidate->gif_tag;
+  draw->lowering = OutputLowering::DirectTfx;
+  draw->execution = ExecutionKind::GeneratedParallel;
+  if (!ConfigureGeometry(*entry_candidate, draw.get()))
+    return {};
+
+  PreparedProgram *const entry_prepared =
+      LookupPinnedProgram(seed.entry_program);
+  for (u32 index = 0;
+       index < entry_candidate->generated.memory_inputs.size(); index++) {
+    const CgMemoryInput &input =
+        entry_candidate->generated.memory_inputs[index];
+    // MSCNT resumes through the entry at 0x0460, whose PairPlan-derived
+    // acyclic slice executes XTOP and rebuilds the affine input pointers for
+    // the current VIF double-buffer. The generated explicit-entry root has
+    // the same memory-input ABI, but its first dispatch's qword addresses are
+    // not stable chain state. Evaluate the resume plan against this command's
+    // VIF/VI snapshot so alternating TOP buffers bind their current payload
+    // instead of stale geometry retained from the initial MSCAL.
+    u32 base_qword = 0;
+    if (input.address.base_vi >=
+            resume_candidate->invocation.loop_entry_vi.size() ||
+        !EvaluateInvocationValue(
+            resume_candidate->invocation,
+            resume_candidate->invocation.loop_entry_vi[
+                input.address.base_vi],
+            resume_context, &resume_workspace, &base_qword)) {
+      return {};
+    }
+    const u16 first_qword = static_cast<u16>(
+        (base_qword + input.address.qword_offset) & 0x3ffu);
+    RawQwordBinding raw{};
+    const VifUnpackSpan *const span = FindInputSpan(
+        spans, first_qword,
+        input.address.invocation_coefficient, draw->invocation_count, &raw);
+    if (!span) {
+      if (entry_prepared) {
+        bool expected = false;
+        if (entry_prepared->raw_input_layout_rejected.compare_exchange_strong(
+                expected, true, std::memory_order_release,
+                std::memory_order_relaxed)) {
+          Console.WriteLn(
+              "GPU-VU: entry %04x continuation raw input layout cannot "
+              "cover the generated invocation schedule; immutable capture "
+              "is suspended until program invalidation.",
+              entry_prepared->start_pc);
+        }
+      }
+      return {};
+    }
+
+    u16 span_index = 0;
+    bool retained = false;
+    for (u32 retained_index = 0;
+         retained_index < draw->InputSpans().size(); retained_index++) {
+      if (SamePayload(draw->InputSpans()[retained_index].payload,
+                      span->payload)) {
+        span_index = static_cast<u16>(retained_index);
+        retained = true;
+        break;
+      }
+    }
+    if (!retained) {
+      if (draw->InputSpans().size() >=
+              std::numeric_limits<u16>::max() ||
+          !draw->AddInputSpan(*span)) {
+        return {};
+      }
+      span_index =
+          static_cast<u16>(draw->InputSpans().size() - 1);
+    }
+    draw->streams.push_back(
+        {raw.payload_byte_offset, raw.byte_stride, span_index,
+         static_cast<u8>(input.attribute_index), 0});
+  }
+
+  if (entry_candidate->generated.uses_acc_uniform)
+    draw->acc_uniform = seed.initial_acc;
+  if (entry_candidate->generated.uses_q_uniform) {
+    draw->scalar_uniforms.present |= ScalarUniformQ;
+    draw->scalar_uniforms.q = seed.initial_q;
+  }
+  if (entry_candidate->generated.uses_p_uniform) {
+    draw->scalar_uniforms.present |= ScalarUniformP;
+    draw->scalar_uniforms.p = seed.initial_p;
+  }
+  if (entry_candidate->generated.uses_i_uniform) {
+    draw->scalar_uniforms.present |= ScalarUniformI;
+    draw->scalar_uniforms.i = seed.initial_i;
+  }
+  if (entry_candidate->generated.uses_gif_q_uniform) {
+    draw->scalar_uniforms.present |= ScalarUniformGifQ;
+    draw->scalar_uniforms.gif_q = 0x3f800000u;
+  }
+  draw->final_vi_values = final_vi_values;
+  draw->final_vi_write_mask = final_vi_write_mask;
+  s_shared_continuation_builds.fetch_add(1,
+                                         std::memory_order_relaxed);
   return draw;
 }
 
@@ -1347,6 +1515,10 @@ DirectProgramStatistics GetDirectProgramStatistics() {
       s_compiler_requests.load(std::memory_order_relaxed);
   stats.compiler_request_retries =
       s_compiler_request_retries.load(std::memory_order_relaxed);
+  stats.shared_continuation_builds =
+      s_shared_continuation_builds.load(std::memory_order_relaxed);
+  stats.general_continuation_builds =
+      s_general_continuation_builds.load(std::memory_order_relaxed);
   return stats;
 }
 

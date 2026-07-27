@@ -147,6 +147,12 @@ public:
 	// architectural waits use the same seam before waiting on another owner.
 	void PublishPendingVifBatch();
 
+	// Requests publication of the worker-private direct PATH1 descriptor run.
+	// The request is asynchronous: its ordered EE reservations remain the
+	// authority, and the GS worker sleeps at the first missing completion until
+	// MTVU publishes the run.
+	void RequestGpuVuPath1Flush();
+
 	// Writes to VU's Micro Memory (size in bytes)
 	void WriteMicroMem(u32 vu_micro_addr, const void* data, u32 size);
 
@@ -189,6 +195,8 @@ private:
 	void AppendDeferredVifUnpack(VitaGpuVu::VifUnpackSpan span);
 	void ReplayDeferredVifUnpacks();
 	void ReleaseDeferredVifUnpacks();
+
+	std::atomic_bool m_gpu_vu_path1_flush_requested{false};
 };
 
 extern VU_Thread vu1Thread;
