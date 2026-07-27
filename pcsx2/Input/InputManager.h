@@ -48,6 +48,13 @@ namespace InputManager
 		VitaPadButton_Square = 1u << 11,
 	};
 
+	enum class VitaPadAutoFireButton : u8
+	{
+		None,
+		Cross,
+		Circle,
+	};
+
 	const char* InputSourceToString(InputSourceType type);
 	bool GetInputSourceDefaultEnabled(InputSourceType type);
 	GenericInputBindingMapping GetGenericBindingMapping(const std::string_view name);
@@ -60,6 +67,10 @@ namespace InputManager
 	void CloseSources();
 	void PollSources();
 	void InvalidateVitaPadStateCache();
+	bool ConfigureVitaPadAutoFire(VitaPadAutoFireButton button, u32 pressed_frames, u32 released_frames);
+	void NotifyVitaPadElfEntry();
+	void ResetVitaPadAutoFire();
+	void AdvanceVitaPadAutoFireFrame();
 	void PauseVibration();
 	void SetPadVibrationIntensity(u32 pad, float large_or_single_motor, float small_motor);
 

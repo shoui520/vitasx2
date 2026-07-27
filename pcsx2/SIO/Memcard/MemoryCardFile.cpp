@@ -18,6 +18,9 @@
 
 #include <array>
 #include <chrono>
+#if defined(VITASX2_VITA)
+#include <unistd.h>
+#endif
 
 #include "Config.h"
 #include "Host.h"
@@ -37,6 +40,17 @@ static constexpr int MC2_ERASE_SIZE = 528 * 16;
 static const char* s_folder_mem_card_id_file = "_pcsx2_superblock";
 
 bool FileMcd_Open = false;
+
+#if defined(VITASX2_VITA)
+static bool FlushFileMemoryCard(std::FILE* file)
+{
+	if (std::fflush(file) != 0)
+		return false;
+
+	const int fd = fileno(file);
+	return fd >= 0 && fsync(fd) == 0;
+}
+#endif
 
 // ECC code ported from mymc
 // https://sourceforge.net/p/mymc-opl/code/ci/master/tree/ps2mc_ecc.py
@@ -356,6 +370,10 @@ void FileMemoryCard::Close()
 		if (!m_ispsx[slot] && FileSystem::FSeek64(m_file[slot], m_chkaddr, SEEK_SET) == 0)
 			std::fwrite(&m_chksum[slot], sizeof(m_chksum[slot]), 1, m_file[slot]);
 
+#if defined(VITASX2_VITA)
+		if (!FlushFileMemoryCard(m_file[slot]))
+			Console.Error("(FileMcd) Failed to commit memory card slot %d before close.", slot);
+#endif
 		std::fclose(m_file[slot]);
 		m_file[slot] = nullptr;
 
@@ -492,6 +510,13 @@ s32 FileMemoryCard::Save(uint slot, const u8* src, u32 adr, int size)
 
 	if (std::fwrite(m_currentdata.data(), size, 1, mcfp) == 1)
 	{
+#if defined(VITASX2_VITA)
+		if (!FlushFileMemoryCard(mcfp))
+		{
+			Console.Error("(FileMcd) Failed to commit memory card slot %u write.", slot);
+			return 0;
+		}
+#endif
 		static auto last = std::chrono::time_point<std::chrono::system_clock>();
 
 		std::chrono::duration<float> elapsed = std::chrono::system_clock::now() - last;
@@ -523,7 +548,16 @@ s32 FileMemoryCard::EraseBlock(uint slot, u32 adr)
 
 	u8 buf[MC2_ERASE_SIZE];
 	std::memset(buf, 0xff, sizeof(buf));
-	return std::fwrite(buf, sizeof(buf), 1, mcfp) == 1;
+	if (std::fwrite(buf, sizeof(buf), 1, mcfp) != 1)
+		return 0;
+#if defined(VITASX2_VITA)
+	if (!FlushFileMemoryCard(mcfp))
+	{
+		Console.Error("(FileMcd) Failed to commit memory card slot %u erase.", slot);
+		return 0;
+	}
+#endif
+	return 1;
 }
 
 u64 FileMemoryCard::GetCRC(uint slot)

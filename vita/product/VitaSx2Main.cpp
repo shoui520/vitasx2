@@ -21,6 +21,7 @@
 #endif
 #include "Host.h"
 #include "INISettingsInterface.h"
+#include "Input/InputManager.h"
 #include "R3000A.h"
 #include "R5900.h"
 #include "SIO/Memcard/MemoryCardFile.h"
@@ -32,6 +33,7 @@
 #include "common/FPControl.h"
 #include "common/FileSystem.h"
 #include "common/MemorySettingsInterface.h"
+#include "common/StringUtil.h"
 #include "common/Threading.h"
 #include "vita/VitaCore.h"
 #include "vita/VitaGsMailbox.h"
@@ -399,15 +401,6 @@ namespace
 		EmuConfig.Speedhacks.vuThread = !VITASX2_PRODUCT_BOOT_VALIDATION;
 		EmuConfig.DEV9.EthEnable = false;
 		EmuConfig.DEV9.HddEnable = false;
-		if (!VITASX2_PRODUCT_BOOT_VALIDATION)
-		{
-			// Sony exposes a resume notification, but no documented pre-kill
-			// application callback. Until the Vita file-card owner commits each
-			// completed PS2 transaction durably, never expose a card whose stdio
-			// buffers could be stranded by a LiveArea close or remote destroy.
-			for (Pcsx2Config::McdOptions& card : EmuConfig.Mcd)
-				card.Enabled = false;
-		}
 
 		for (u32 port = 0; port < Pad::NUM_CONTROLLER_PORTS; port++)
 			EmuConfig.Pad.Ports[port].Type = Pad::ControllerType::NotConnected;
@@ -483,6 +476,93 @@ namespace
 		Console.WriteLn(
 			"VitaSX2 performance telemetry: enabled=%u source=%s.",
 			enabled ? 1u : 0u, source);
+	}
+
+	void ConfigureProductInputAutomation()
+	{
+		constexpr u32 DEFAULT_PRESSED_FRAMES = 2;
+		constexpr u32 DEFAULT_RELEASED_FRAMES = 6;
+		constexpr u32 MAX_CADENCE_FRAMES = 600;
+		InputManager::VitaPadAutoFireButton button =
+			InputManager::VitaPadAutoFireButton::None;
+		u32 pressed_frames = DEFAULT_PRESSED_FRAMES;
+		u32 released_frames = DEFAULT_RELEASED_FRAMES;
+		const char* button_name = "None";
+		const char* source = "default";
+
+		if (!VITASX2_PRODUCT_BOOT_VALIDATION &&
+			FileSystem::FileExists(PRODUCT_CONFIG_PATH))
+		{
+			INISettingsInterface settings(PRODUCT_CONFIG_PATH);
+			if (settings.Load())
+			{
+				constexpr const char* section = "InputAutomation";
+				const std::string configured_button =
+					settings.GetStringValue(section, "AutoFireButton", "None");
+				if (StringUtil::Strcasecmp(configured_button.c_str(), "Cross") == 0)
+				{
+					button = InputManager::VitaPadAutoFireButton::Cross;
+					button_name = "Cross";
+				}
+				else if (StringUtil::Strcasecmp(configured_button.c_str(), "Circle") == 0)
+				{
+					button = InputManager::VitaPadAutoFireButton::Circle;
+					button_name = "Circle";
+				}
+				else if (StringUtil::Strcasecmp(configured_button.c_str(), "None") != 0)
+				{
+					Console.Warning(
+						"VitaSX2 ignored unknown [InputAutomation] AutoFireButton '%s' in %s.",
+						configured_button.c_str(), PRODUCT_CONFIG_PATH);
+				}
+
+				bool cadence_valid = true;
+				if (button != InputManager::VitaPadAutoFireButton::None)
+				{
+					if (settings.ContainsValue(section, "AutoFirePressedFrames") &&
+						(!settings.GetUIntValue(section, "AutoFirePressedFrames", &pressed_frames) ||
+							pressed_frames == 0 || pressed_frames > MAX_CADENCE_FRAMES))
+					{
+						cadence_valid = false;
+					}
+					if (settings.ContainsValue(section, "AutoFireReleasedFrames") &&
+						(!settings.GetUIntValue(section, "AutoFireReleasedFrames", &released_frames) ||
+							released_frames == 0 || released_frames > MAX_CADENCE_FRAMES))
+					{
+						cadence_valid = false;
+					}
+				}
+				if (!cadence_valid)
+				{
+					Console.Warning(
+						"VitaSX2 disabled malformed [InputAutomation] autofire cadence in %s.",
+						PRODUCT_CONFIG_PATH);
+					button = InputManager::VitaPadAutoFireButton::None;
+					button_name = "None";
+					pressed_frames = DEFAULT_PRESSED_FRAMES;
+					released_frames = DEFAULT_RELEASED_FRAMES;
+				}
+				source = PRODUCT_CONFIG_PATH;
+			}
+			else
+			{
+				Console.Warning(
+					"VitaSX2 could not parse %s; input automation remains disabled.",
+					PRODUCT_CONFIG_PATH);
+			}
+		}
+
+		if (!InputManager::ConfigureVitaPadAutoFire(
+				button, pressed_frames, released_frames))
+		{
+			button = InputManager::VitaPadAutoFireButton::None;
+			button_name = "None";
+			InputManager::ConfigureVitaPadAutoFire(button, 1, 1);
+		}
+		Console.WriteLn(
+			"VitaSX2 input autofire: button=%s pressed_frames=%u released_frames=%u "
+			"start=game-elf source=%s.",
+			button_name, pressed_frames, released_frames, source);
 	}
 
 	bool NativeProvidersSelected()
@@ -909,6 +989,7 @@ int main()
 	EmuFolders::MemoryCards = VITASX2_PRODUCT_BOOT_VALIDATION ?
 		VALIDATION_MEMORY_CARD_DIR : PRODUCT_MEMORY_CARD_DIR;
 	ConfigureProductPerformanceTelemetry();
+	ConfigureProductInputAutomation();
 	ConfigureProductSettings();
 	// PCSX2's _DynGen_DispatcherEvent() calls the event owner and falls directly
 	// into register dispatch. Normal product execution can use the equivalent

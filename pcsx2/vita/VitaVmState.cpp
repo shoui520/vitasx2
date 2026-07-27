@@ -135,6 +135,7 @@ namespace VMManager
 		s_elf_executed = false;
 		s_elf_path = {};
 		s_elf_entry_point = 0xFFFFFFFFu;
+		InputManager::ResetVitaPadAutoFire();
 	}
 
 	static void ClearDiscInfo()
@@ -802,6 +803,7 @@ namespace VMManager
 			Pcsx2Trace::NotifySpu2ElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyVifElfEntry(s_elf_entry_point);
 			Pcsx2Trace::NotifyVuElfEntry(s_elf_entry_point);
+			InputManager::NotifyVitaPadElfEntry();
 			s_elf_executed = true;
 			// Mirrors VMManager.cpp::EntryPointCompilingOnCPUThread() -> HandleELFChange(true):
 			// the BIOS/EELOAD-only InstantDMAHack from ApplyGameFixes() is cleared once the game ELF owns execution.
@@ -838,6 +840,7 @@ namespace VMManager
 			// called by Counters.cpp::VSyncStart() after the frame push. Keep
 			// Vita controller sampling on that emulated-frame boundary so SIO2
 			// observes one coherent snapshot for the following frame.
+			InputManager::AdvanceVitaPadAutoFireFrame();
 			InputManager::PollSources();
 		}
 	} // namespace Internal

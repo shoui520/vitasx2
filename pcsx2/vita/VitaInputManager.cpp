@@ -8,6 +8,7 @@
 #include "SIO/Pad/PadDualshock2.h"
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <string_view>
 
@@ -31,6 +32,12 @@ namespace
 	VitaPadSnapshot s_last_applied_snapshot;
 	PadBase* s_last_applied_pad = nullptr;
 	bool s_last_applied_snapshot_valid = false;
+	InputManager::VitaPadAutoFireButton s_auto_fire_button =
+		InputManager::VitaPadAutoFireButton::None;
+	u32 s_auto_fire_pressed_frames = 1;
+	u32 s_auto_fire_released_frames = 1;
+	u32 s_auto_fire_phase = 0;
+	bool s_auto_fire_active = false;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	VitaPadSnapshot s_qemu_snapshot;
@@ -59,6 +66,22 @@ namespace
 	u8 DigitalPressure(bool pressed)
 	{
 		return pressed ? 0xff : 0x00;
+	}
+
+	u32 GetVitaPadAutoFireMask()
+	{
+		if (!s_auto_fire_active || s_auto_fire_phase >= s_auto_fire_pressed_frames)
+			return 0;
+
+		switch (s_auto_fire_button)
+		{
+			case InputManager::VitaPadAutoFireButton::Cross:
+				return InputManager::VitaPadButton_Cross;
+			case InputManager::VitaPadAutoFireButton::Circle:
+				return InputManager::VitaPadButton_Circle;
+			default:
+				return 0;
+		}
 	}
 
 	void SetPressureButton(PadBase* pad, u32 index, bool pressed, u8 pressure)
@@ -270,6 +293,7 @@ void InputManager::ReloadBindings(const SettingsInterface& si, const SettingsInt
 void InputManager::CloseSources()
 {
 	InvalidateVitaPadStateCache();
+	ResetVitaPadAutoFire();
 	PauseVibration();
 }
 
@@ -283,7 +307,8 @@ void InputManager::InvalidateVitaPadStateCache()
 void InputManager::PollSources()
 {
 #if defined(VITASX2_QEMU_VALIDATION)
-	ApplyVitaPadState(s_qemu_snapshot.buttons, s_qemu_snapshot.lx, s_qemu_snapshot.ly, s_qemu_snapshot.rx, s_qemu_snapshot.ry);
+	ApplyVitaPadState(s_qemu_snapshot.buttons | GetVitaPadAutoFireMask(),
+		s_qemu_snapshot.lx, s_qemu_snapshot.ly, s_qemu_snapshot.rx, s_qemu_snapshot.ry);
 #else
 	EnsureCtrlInitialized();
 
@@ -294,8 +319,52 @@ void InputManager::PollSources()
 			return;
 	}
 
-	ApplyVitaPadState(TranslateVitaButtons(pad), pad.lx, pad.ly, pad.rx, pad.ry);
+	ApplyVitaPadState(TranslateVitaButtons(pad) | GetVitaPadAutoFireMask(),
+		pad.lx, pad.ly, pad.rx, pad.ry);
 #endif
+}
+
+bool InputManager::ConfigureVitaPadAutoFire(
+	VitaPadAutoFireButton button, u32 pressed_frames, u32 released_frames)
+{
+	if (button != VitaPadAutoFireButton::None &&
+		(pressed_frames == 0 || released_frames == 0 ||
+			pressed_frames > std::numeric_limits<u32>::max() - released_frames))
+	{
+		return false;
+	}
+
+	s_auto_fire_button = button;
+	s_auto_fire_pressed_frames = std::max(pressed_frames, 1u);
+	s_auto_fire_released_frames = std::max(released_frames, 1u);
+	ResetVitaPadAutoFire();
+	return true;
+}
+
+void InputManager::NotifyVitaPadElfEntry()
+{
+	s_auto_fire_active = (s_auto_fire_button != VitaPadAutoFireButton::None);
+	s_auto_fire_phase = s_auto_fire_active ?
+		(s_auto_fire_pressed_frames + s_auto_fire_released_frames - 1) : 0;
+	InvalidateVitaPadStateCache();
+}
+
+void InputManager::ResetVitaPadAutoFire()
+{
+	s_auto_fire_phase = 0;
+	s_auto_fire_active = false;
+	InvalidateVitaPadStateCache();
+}
+
+void InputManager::AdvanceVitaPadAutoFireFrame()
+{
+	if (!s_auto_fire_active)
+		return;
+
+	const u32 period = s_auto_fire_pressed_frames + s_auto_fire_released_frames;
+	s_auto_fire_phase++;
+	if (s_auto_fire_phase == period)
+		s_auto_fire_phase = 0;
 }
 
 void InputManager::PauseVibration()
