@@ -3,6 +3,7 @@
 
 #include "Gif_Unit.h"
 #include "Config.h"
+#include "Counters.h"
 #include "DebugTools/GsTrace.h"
 #include "GS.h"
 #include "GS/GSPerfMon.h"
@@ -46,11 +47,12 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 namespace
 {
-	std::atomic<u64> s_mtvu_packet_token_resyncs_for_validation{0};
+	std::atomic<u64> s_mtvu_path1_completion_deferrals_for_validation{0};
 }
 #endif
 
@@ -142,10 +144,132 @@ namespace MTGS
 	static std::atomic_bool s_open_flag{false};
 	static std::atomic_bool s_shutdown_flag{false};
 	static std::atomic_bool s_gpu_vu_compiler_result_pending{false};
+	static std::atomic_bool s_gpu_vu_input_retirement_pending{false};
+	static std::atomic<uptr> s_gpu_vu_input_retirement_owner{0};
+	static std::atomic<u32> s_gpu_vu_input_retirement_slot{0};
+	static std::atomic<u32> s_gpu_vu_input_retirement_generation{0};
 	static bool s_native_presenter_enabled = false;
+
+	struct MtvuPath1Completion
+	{
+		VitaGpuVu::GpuVuDraw* first_draw = nullptr;
+		u32 reservation_count = 0;
+	};
+
+	// PCSX2's EE thread reserves one MTVUGSPacket command for every VU1
+	// dispatch. Consecutive GPU executions have no intervening CPU PATH1
+	// packet, so the single MTVU producer links them and publishes one run
+	// completion. The GS consumer advances the same number of immutable EE
+	// reservations in one operation. This preserves every PATH1 ordering point
+	// without paying a cross-core SPSC publication for every 34-vertex chunk.
+	class MtvuPath1CompletionQueue
+	{
+	public:
+		bool Push(const MtvuPath1Completion& completion)
+		{
+			const u32 write = m_write.load(std::memory_order_relaxed);
+			const u32 next = (write + 1) & RingBufferMask;
+			if (next == m_read.load(std::memory_order_acquire))
+				return false;
+			m_completions[write] = completion;
+			m_write.store(next, std::memory_order_release);
+			return true;
+		}
+
+		bool Pop(MtvuPath1Completion* completion)
+		{
+			const u32 read = m_read.load(std::memory_order_relaxed);
+			if (read == m_write.load(std::memory_order_acquire))
+				return false;
+			*completion = m_completions[read];
+			m_read.store((read + 1) & RingBufferMask,
+				std::memory_order_release);
+			return true;
+		}
+
+		bool Peek(MtvuPath1Completion* completion) const
+		{
+			const u32 read = m_read.load(std::memory_order_relaxed);
+			if (read == m_write.load(std::memory_order_acquire))
+				return false;
+			*completion = m_completions[read];
+			return true;
+		}
+
+		void ConsumePrefix(u32 count,
+			VitaGpuVu::GpuVuDraw* remaining_first_draw)
+		{
+			const u32 read = m_read.load(std::memory_order_relaxed);
+			pxAssertRel(read != m_write.load(std::memory_order_acquire),
+				"consumed an empty MTVU PATH1 completion queue");
+			MtvuPath1Completion& completion = m_completions[read];
+			pxAssertRel(count != 0 && count <= completion.reservation_count,
+				"consumed an invalid MTVU PATH1 completion prefix");
+			if (count == 0 || count > completion.reservation_count)
+				return;
+
+			completion.first_draw = remaining_first_draw;
+			completion.reservation_count -= count;
+			if (completion.reservation_count != 0)
+				return;
+
+			pxAssertRel(!remaining_first_draw,
+				"completed MTVU PATH1 run retained a direct draw");
+			m_read.store((read + 1) & RingBufferMask,
+				std::memory_order_release);
+		}
+
+		u32 ReadIndex() const { return m_read.load(std::memory_order_relaxed); }
+		u32 WriteIndex() const { return m_write.load(std::memory_order_relaxed); }
+		u32 PendingCount() const
+		{
+			return (WriteIndex() - ReadIndex()) & RingBufferMask;
+		}
+
+		void ResetAndDiscard()
+		{
+			MtvuPath1Completion completion;
+			while (Pop(&completion))
+			{
+				VitaGpuVu::GpuVuDraw* draw = completion.first_draw;
+				for (u32 index = 0;
+					index < completion.reservation_count && draw; index++)
+				{
+					VitaGpuVu::GpuVuDraw* const next = draw->path1_next;
+					draw->path1_next = nullptr;
+					VitaGpuVu::RecordGpuVuDrawRejected();
+					delete draw;
+					draw = next;
+				}
+				pxAssertRel(!draw,
+					"MTVU PATH1 run exceeded its reservation count");
+			}
+			m_read.store(0, std::memory_order_relaxed);
+			m_write.store(0, std::memory_order_relaxed);
+		}
+
+	private:
+		alignas(__cachelinesize)
+			std::array<MtvuPath1Completion, RingBufferSize> m_completions{};
+		alignas(__cachelinesize) std::atomic<u32> m_read{0};
+		alignas(__cachelinesize) std::atomic<u32> m_write{0};
+	};
+
+	static MtvuPath1CompletionQueue s_mtvu_path1_completions;
+	// These fields have exactly one owner: the MTVU worker. CPU-produced PATH1
+	// output and explicit drains publish the pending run before their own
+	// completion, so no lock or cross-core refcount is needed here.
+	static VitaGpuVu::GpuVuDraw* s_pending_mtvu_direct_head = nullptr;
+	static VitaGpuVu::GpuVuDraw* s_pending_mtvu_direct_tail = nullptr;
+	static u32 s_pending_mtvu_direct_count = 0;
+	static constexpr u32 MaximumPendingMtvuDirectRun = 256;
+	static std::atomic_bool s_mtvu_path1_completion_waiting{false};
+	static std::atomic_bool s_mtvu_path1_drain_waiter{false};
+	static Threading::UserspaceSemaphore s_mtvu_path1_drain_sema;
 	// On Vita g_gs_renderer owns this instance, matching PCSX2 GS.cpp. QEMU's
 	// software-only GSState keeps its existing mailbox-local owner instead.
 	static VitaGxmGsState* s_gs = nullptr;
+
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 	static std::unique_ptr<VitaGxmGsState> s_qemu_gs;
 #endif
@@ -163,7 +287,7 @@ namespace MTGS
 	static HardwareVsyncProfile s_worker_profile;
 	static std::atomic<u32> s_profile_ring_stalls{0};
 	static std::atomic<u32> s_profile_vsync_waits{0};
-	static std::atomic<u32> s_profile_mtvu_packet_token_resyncs{0};
+	static std::atomic<u32> s_profile_mtvu_path1_completion_deferrals{0};
 	static std::atomic<int> s_profile_max_queued_frames{0};
 
 	struct GsProducerPerformanceTotals
@@ -176,6 +300,7 @@ namespace MTGS
 		u64 wait_calls = 0;
 		u64 wait_spins = 0;
 		u64 ring_spins = 0;
+		u64 mtvu_path1_completion_ring_waits = 0;
 	};
 
 	struct GsWorkerPerformanceTotals
@@ -185,7 +310,7 @@ namespace MTGS
 		u64 gs_packet_bytes = 0;
 		u64 mtvu_packets = 0;
 		u64 mtvu_packet_bytes = 0;
-		u64 mtvu_packet_token_resyncs = 0;
+		u64 mtvu_path1_completion_deferrals = 0;
 		u64 completed_vsyncs = 0;
 	};
 
@@ -196,7 +321,7 @@ namespace MTGS
 	static std::atomic<u64> s_gs_published_packet_bytes{0};
 	static std::atomic<u64> s_gs_published_mtvu_packets{0};
 	static std::atomic<u64> s_gs_published_mtvu_packet_bytes{0};
-	static std::atomic<u64> s_gs_published_mtvu_packet_token_resyncs{0};
+	static std::atomic<u64> s_gs_published_mtvu_path1_completion_deferrals{0};
 	static std::atomic<u64> s_gs_published_completed_vsyncs{0};
 
 	static void PublishGsWorkerPerformance()
@@ -211,8 +336,8 @@ namespace MTGS
 			std::memory_order_relaxed);
 		s_gs_published_mtvu_packet_bytes.store(
 			s_gs_worker_performance.mtvu_packet_bytes, std::memory_order_relaxed);
-		s_gs_published_mtvu_packet_token_resyncs.store(
-			s_gs_worker_performance.mtvu_packet_token_resyncs,
+		s_gs_published_mtvu_path1_completion_deferrals.store(
+			s_gs_worker_performance.mtvu_path1_completion_deferrals,
 			std::memory_order_relaxed);
 		s_gs_published_completed_vsyncs.store(
 			s_gs_worker_performance.completed_vsyncs, std::memory_order_release);
@@ -265,14 +390,15 @@ namespace MTGS
 		const u64 cpu_us = cpu_now - profile.cpu_start;
 		const double utilization = wall_us ?
 			(static_cast<double>(cpu_us) * 100.0 / static_cast<double>(wall_us)) : 0.0;
-		Console.WriteLn("Vita MTGS %s profile: warmup_vsyncs=60 interval_vsyncs=120 wall_us=%llu cpu_us=%llu cpu_util=%.1f%% ring_stalls=%u vsync_waits=%u mtvu_packet_token_resyncs=%u max_queued=%d",
+		Console.WriteLn("Vita MTGS %s profile: warmup_vsyncs=60 interval_vsyncs=120 wall_us=%llu cpu_us=%llu cpu_util=%.1f%% ring_stalls=%u vsync_waits=%u mtvu_path1_completion_deferrals=%u max_queued=%d",
 			owner,
 			static_cast<unsigned long long>(wall_us),
 			static_cast<unsigned long long>(cpu_us),
 			utilization,
 			s_profile_ring_stalls.load(std::memory_order_relaxed),
 			s_profile_vsync_waits.load(std::memory_order_relaxed),
-			s_profile_mtvu_packet_token_resyncs.load(std::memory_order_relaxed),
+			s_profile_mtvu_path1_completion_deferrals.load(
+				std::memory_order_relaxed),
 			s_profile_max_queued_frames.load(std::memory_order_relaxed));
 		if (&profile == &s_producer_profile && THREAD_VU1 &&
 			vu1Thread.IsOpen())
@@ -412,8 +538,9 @@ namespace MTGS
 			s_gs_published_mtvu_packets.load(std::memory_order_relaxed);
 		stats.mtvu_packet_bytes =
 			s_gs_published_mtvu_packet_bytes.load(std::memory_order_relaxed);
-		stats.mtvu_packet_token_resyncs =
-			s_gs_published_mtvu_packet_token_resyncs.load(std::memory_order_relaxed);
+		stats.mtvu_path1_completion_deferrals =
+			s_gs_published_mtvu_path1_completion_deferrals.load(
+				std::memory_order_relaxed);
 		return stats;
 	}
 
@@ -1109,7 +1236,8 @@ namespace MTGS
 				start.mtvu.compile_barriers)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gpu_vu_input captures=%llu bytes=%llu "
-			"disconnected_bypasses=%llu disconnected_bypass_bytes=%llu "
+			"publish_batches=%llu published_bytes=%llu "
+			"capture_bypasses=%llu capture_bypass_bytes=%llu "
 			"fallbacks=%llu slot_reuses=%llu ring_waits=%llu ring_spins=%llu "
 			"deferred=%llu replayed=%llu live_start=%llu live_end=%llu peak_live=%llu",
 			static_cast<unsigned long long>(window),
@@ -1119,11 +1247,17 @@ namespace MTGS
 				end.gpu_vu_input.captured_bytes,
 				start.gpu_vu_input.captured_bytes)),
 			static_cast<unsigned long long>(CounterDelta(
-				end.gpu_vu_input.disconnected_bypasses,
-				start.gpu_vu_input.disconnected_bypasses)),
+				end.gpu_vu_input.publication_batches,
+				start.gpu_vu_input.publication_batches)),
 			static_cast<unsigned long long>(CounterDelta(
-				end.gpu_vu_input.disconnected_bypass_bytes,
-				start.gpu_vu_input.disconnected_bypass_bytes)),
+				end.gpu_vu_input.published_bytes,
+				start.gpu_vu_input.published_bytes)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.capture_bypasses,
+				start.gpu_vu_input.capture_bypasses)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.capture_bypass_bytes,
+				start.gpu_vu_input.capture_bypass_bytes)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_input.capture_fallbacks,
 				start.gpu_vu_input.capture_fallbacks)),
@@ -1167,7 +1301,10 @@ namespace MTGS
 			"compiler_dropped=%llu compiler_time_us=%llu "
 			"compiler_longest_us=%llu compiler_pending_end=%llu "
 			"compiler_results_end=%llu compiler_in_flight_end=%llu "
-			"compiler_active_end=%llu",
+			"compiler_active_end=%llu compiler_invalid_output=%llu "
+			"compiler_diag_truncated=%llu compiler_arena_capacity=%llu "
+			"compiler_arena_peak=%llu compiler_arena_current=%llu "
+			"compiler_arena_guard_failures=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_direct.prepared_programs,
@@ -1289,14 +1426,37 @@ namespace MTGS
 			static_cast<unsigned long long>(
 				end.gpu_vu_programs.compiler.in_flight_requests),
 			static_cast<unsigned long long>(
-				end.gpu_vu_programs.compiler.active_compiles));
+				end.gpu_vu_programs.compiler.active_compiles),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.invalid_outputs,
+				start.gpu_vu_programs.compiler.invalid_outputs)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.truncated_diagnostics,
+				start.gpu_vu_programs.compiler.truncated_diagnostics)),
+			static_cast<unsigned long long>(
+				end.gpu_vu_programs.compiler.private_arena_capacity),
+			static_cast<unsigned long long>(
+				end.gpu_vu_programs.compiler.private_arena_peak),
+			static_cast<unsigned long long>(
+				end.gpu_vu_programs.compiler.private_arena_current),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_programs.compiler.private_arena_guard_failures,
+				start.gpu_vu_programs.compiler.private_arena_guard_failures)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gpu_vu_draw queued=%llu consumed=%llu "
 			"rejected=%llu parallel=%llu serial=%llu interpreter=%llu "
 			"fused_vertices=%llu fused_primitives=%llu tfx_exports=%llu "
 			"raw_exports=%llu retirement_batches=%llu retired=%llu "
 			"ring_waits=%llu notification_waits=%llu "
-			"live_start=%llu live_end=%llu peak_live=%llu",
+			"descriptor_pool_waits=%llu descriptor_pool_start=%llu "
+			"descriptor_pool_end=%llu descriptor_pool_peak=%llu "
+			"descriptor_pool_capacity=%u "
+			"live_start=%llu live_end=%llu peak_live=%llu "
+			"cpu_vu1=%llu cpu_path1_packets=%llu cpu_path1_bytes=%llu "
+			"encoded_objects=%llu reject_disconnected=%llu "
+			"reject_no_token=%llu reject_build=%llu reject_queue=%llu "
+			"reject_spans=%llu reject_not_ready=%llu reject_tag=%llu "
+			"reject_seed=%llu reject_geometry=%llu reject_input=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_draw.queued, start.gpu_vu_draw.queued)),
@@ -1337,14 +1497,106 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_draw.notification_waits,
 				start.gpu_vu_draw.notification_waits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.descriptor_pool_waits,
+				start.gpu_vu_draw.descriptor_pool_waits)),
+			static_cast<unsigned long long>(
+				start.gpu_vu_draw.descriptor_pool_in_use),
+			static_cast<unsigned long long>(
+				end.gpu_vu_draw.descriptor_pool_in_use),
+			static_cast<unsigned long long>(
+				end.gpu_vu_draw.peak_descriptor_pool_in_use),
+			end.gpu_vu_draw.descriptor_pool_capacity,
 			static_cast<unsigned long long>(start.gpu_vu_draw.live_draws),
 			static_cast<unsigned long long>(end.gpu_vu_draw.live_draws),
-			static_cast<unsigned long long>(end.gpu_vu_draw.peak_live_draws));
+			static_cast<unsigned long long>(end.gpu_vu_draw.peak_live_draws),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.cpu_vu1_executions,
+				start.gpu_vu_draw.cpu_vu1_executions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.cpu_path1_packets,
+				start.gpu_vu_draw.cpu_path1_packets)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.cpu_path1_bytes,
+				start.gpu_vu_draw.cpu_path1_bytes)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.encoded_objects,
+				start.gpu_vu_draw.encoded_objects)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::Disconnected)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::Disconnected)])),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::NoProgramToken)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::NoProgramToken)])),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::BuildFailed)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::BuildFailed)])),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::QueueRejected)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::QueueRejected)])),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::NoInputSpans)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::NoInputSpans)])),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::NoReadyCandidate)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::NoReadyCandidate)])),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::TagMismatch)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::TagMismatch)])),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::SeedUnstable)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::SeedUnstable)])),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::GeometryFailed)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::GeometryFailed)])),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::InputResolveFailed)],
+				start.gpu_vu_draw.admission_failures[
+					static_cast<size_t>(
+						VitaGpuVu::AdmissionFailure::InputResolveFailed)])));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gs submitted=%llu submitted_words=%llu "
 			"processed=%llu packets=%llu packet_bytes=%llu mtvu_packets=%llu "
 			"mtvu_packet_bytes=%llu waits=%llu wait_spins=%llu ring_spins=%llu "
-			"token_resyncs=%llu",
+			"path1_completion_ring_waits=%llu path1_completion_deferrals=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(end.gs_producer.submissions,
 				start.gs_producer.submissions)),
@@ -1367,8 +1619,11 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(end.gs_producer.ring_spins,
 				start.gs_producer.ring_spins)),
 			static_cast<unsigned long long>(CounterDelta(
-				end.gs_worker.mtvu_packet_token_resyncs,
-				start.gs_worker.mtvu_packet_token_resyncs)));
+				end.gs_producer.mtvu_path1_completion_ring_waits,
+				start.gs_producer.mtvu_path1_completion_ring_waits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gs_worker.mtvu_path1_completion_deferrals,
+				start.gs_worker.mtvu_path1_completion_deferrals)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=gxm draws=%llu indices=%llu "
 			"vertex_bytes=%llu index_bytes=%llu texture_uploads=%llu "
@@ -1612,6 +1867,109 @@ namespace MTGS
 	static void SetEvent();
 	static void MainLoop();
 
+	static void PublishMtvuPath1Completion(
+		const MtvuPath1Completion& completion)
+	{
+		pxAssertRel(completion.reservation_count != 0,
+			"empty MTVU PATH1 completion run");
+		bool waited = false;
+		while (!s_mtvu_path1_completions.Push(completion))
+		{
+			waited = true;
+			s_work_sema.NotifyOfWork();
+			Threading::SpinWait();
+		}
+#if defined(__vita__)
+		if (waited && VitaPerformanceTelemetry::IsEnabled())
+			s_gs_producer_performance.mtvu_path1_completion_ring_waits++;
+#endif
+		// Publication normally races ahead of the GS reservation and needs no
+		// kernel wake. Notify only when the owner has actually observed a hole.
+		if (s_mtvu_path1_completion_waiting.exchange(
+				false, std::memory_order_acq_rel))
+		{
+			s_work_sema.NotifyOfWork();
+		}
+		if (s_mtvu_path1_drain_waiter.exchange(
+				false, std::memory_order_acq_rel))
+		{
+			s_mtvu_path1_drain_sema.Post();
+		}
+	}
+
+	static void FlushPendingMtvuDirectRun()
+	{
+		if (!s_pending_mtvu_direct_head)
+			return;
+		if (!s_pending_mtvu_direct_tail ||
+			s_pending_mtvu_direct_count == 0)
+		{
+			pxAssertRel(false, "incomplete pending MTVU direct run");
+			return;
+		}
+		// The EE producer writes tiny UNPACK payloads into cacheable staging.
+		// Publish all committed prefixes to the non-cacheable GXM mapping once
+		// per descriptor run, before its release makes any draw visible.
+		pxAssertRel(VitaGpuVu::PublishPendingRawVifPayloads(
+				s_pending_mtvu_direct_head, s_pending_mtvu_direct_count),
+			"failed to publish immutable GPU-VU inputs");
+		PublishMtvuPath1Completion({
+			s_pending_mtvu_direct_head,
+			s_pending_mtvu_direct_count,
+		});
+		s_pending_mtvu_direct_head = nullptr;
+		s_pending_mtvu_direct_tail = nullptr;
+		s_pending_mtvu_direct_count = 0;
+	}
+
+	static void AppendPendingMtvuDirectDraw(VitaGpuVu::GpuVuDraw* draw)
+	{
+		pxAssertRel(draw && !draw->path1_next,
+			"invalid direct draw appended to MTVU PATH1 run");
+		if (!draw)
+			return;
+		if (s_pending_mtvu_direct_tail)
+			s_pending_mtvu_direct_tail->path1_next = draw;
+		else
+			s_pending_mtvu_direct_head = draw;
+		s_pending_mtvu_direct_tail = draw;
+		s_pending_mtvu_direct_count++;
+		if (s_pending_mtvu_direct_count >= MaximumPendingMtvuDirectRun)
+			FlushPendingMtvuDirectRun();
+	}
+
+	static bool TryTakeMtvuPath1Completion(
+		MtvuPath1Completion* completion)
+	{
+		if (s_mtvu_path1_completions.Peek(completion))
+			return true;
+
+		// Publish the sleeping intent before retrying so a producer cannot place
+		// a completion between the empty observation and the sleep without also
+		// waking this worker.
+		s_mtvu_path1_completion_waiting.store(
+			true, std::memory_order_release);
+		if (s_mtvu_path1_completions.Peek(completion))
+		{
+			s_mtvu_path1_completion_waiting.store(
+				false, std::memory_order_release);
+			return true;
+		}
+#if defined(__vita__)
+		if (VitaPerformanceTelemetry::IsEnabled())
+		{
+			s_profile_mtvu_path1_completion_deferrals.fetch_add(
+				1, std::memory_order_relaxed);
+			s_gs_worker_performance.mtvu_path1_completion_deferrals++;
+		}
+#endif
+#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
+		s_mtvu_path1_completion_deferrals_for_validation.fetch_add(
+			1, std::memory_order_relaxed);
+#endif
+		return false;
+	}
+
 	static void ApplyVitaGsSettings(Pcsx2Config::GSOptions& options)
 	{
 #if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
@@ -1768,6 +2126,10 @@ namespace MTGS
 		s_gs->VSync(field, registers_written, idle_frame);
 #endif
 #if defined(__vita__)
+		// Close this guest frame's direct descriptor epoch before any later
+		// command can extend the scene which owns their inputs.
+		if (g_gs_device)
+			static_cast<GSDeviceGXM*>(g_gs_device.get())->EndGpuVuEpoch();
 		if (VitaPerformanceTelemetry::IsEnabled())
 		{
 			VitaGxmPublishPerformanceCounters();
@@ -1807,6 +2169,9 @@ namespace MTGS
 			MainLoop();
 			pxAssertRel(!s_open_flag.load(std::memory_order_relaxed),
 				"GS worker returned while still open");
+			s_mtvu_path1_completions.ResetAndDiscard();
+			s_mtvu_path1_completion_waiting.store(
+				false, std::memory_order_relaxed);
 			CloseGsOnWorker();
 			// MainLoop kills WorkSema to release any waiter. Reset it before the
 			// close acknowledgement so an immediate reopen cannot lose its wakeup.
@@ -1833,7 +2198,19 @@ namespace MTGS
 		pxAssertRel(!IsOpen(), "GS worker should be closed when starting");
 		s_read_pos.store(0, std::memory_order_relaxed);
 		s_write_pos.store(0, std::memory_order_relaxed);
+		s_mtvu_path1_completions.ResetAndDiscard();
+		s_mtvu_path1_completion_waiting.store(
+			false, std::memory_order_relaxed);
+		s_mtvu_path1_drain_waiter.store(false, std::memory_order_relaxed);
 		s_gpu_vu_compiler_result_pending.store(false,
+			std::memory_order_relaxed);
+		s_gpu_vu_input_retirement_pending.store(false,
+			std::memory_order_relaxed);
+		s_gpu_vu_input_retirement_owner.store(0,
+			std::memory_order_relaxed);
+		s_gpu_vu_input_retirement_slot.store(0,
+			std::memory_order_relaxed);
+		s_gpu_vu_input_retirement_generation.store(0,
 			std::memory_order_relaxed);
 		s_work_sema.Reset();
 		s_shutdown_flag.store(false, std::memory_order_release);
@@ -1884,6 +2261,47 @@ namespace MTGS
 		s_gpu_vu_compiler_result_pending.exchange(false,
 			std::memory_order_acquire);
 		static_cast<GSDeviceGXM*>(g_gs_device.get())->PollGpuVuPrograms();
+	}
+
+	static void ServiceGpuVuInputRetirementOnOwner()
+	{
+		if (!s_gpu_vu_input_retirement_pending.exchange(
+				false, std::memory_order_acquire))
+		{
+			return;
+		}
+		VitaGpuVu::RawVifPayloadRef blocked_generation;
+		blocked_generation.owner =
+			s_gpu_vu_input_retirement_owner.load(
+				std::memory_order_relaxed);
+		blocked_generation.slot =
+			s_gpu_vu_input_retirement_slot.load(
+				std::memory_order_relaxed);
+		blocked_generation.generation =
+			s_gpu_vu_input_retirement_generation.load(
+				std::memory_order_relaxed);
+		blocked_generation.size = 1;
+		const bool handled = g_gs_device &&
+			static_cast<GSDeviceGXM*>(g_gs_device.get())->
+				WaitForGpuVuInputRetirement(blocked_generation);
+		const u32 remaining =
+			VitaGpuVu::GetRawVifPayloadGenerationReferenceCount(
+				blocked_generation);
+		if (remaining != 0)
+		{
+			// Ordered work not yet consumed by this owner can still hold the
+			// requested generation. Keep the request armed; its completion
+			// publication wakes this worker, which retries after draining the
+			// newly visible descriptors. Never turn this into a polling loop.
+			s_gpu_vu_input_retirement_pending.store(
+				true, std::memory_order_release);
+		}
+		if (!handled && remaining != 0)
+		{
+			// This is expected only while a preceding MTVU completion is still
+			// in flight. The retained request above follows that ordered work.
+			return;
+		}
 	}
 #endif
 
@@ -1953,41 +2371,118 @@ namespace MTGS
 
 					case Command::MTVUGSPacket:
 					{
-						if (!vu1Thread.semaXGkick.TryWait())
+						MtvuPath1Completion completion;
+						if (!TryTakeMtvuPath1Completion(&completion))
 						{
-							mtvu_lock.unlock();
-							vu1Thread.semaXGkick.Wait();
-							mtvu_lock.lock();
+							// Retain the reservation at the head of the MTGS
+							// ring. The ordinary worker semaphore sleeps until
+							// the single MTVU producer publishes its immutable
+							// completion; no per-dispatch semaphore resource is
+							// consumed.
+							ring_advance = 0;
+							break;
 						}
+						pxAssertRel(completion.reservation_count != 0,
+							"MTVU PATH1 completion has no EE reservation");
+						if (completion.reservation_count == 0)
+							break;
+
+						// A completion run describes consecutive VU dispatches,
+						// not necessarily adjacent MTGS commands. PATH2/PATH3,
+						// VSync, register snapshots and other ordered GS work can
+						// be published between the EE reservations. Consume only
+						// the adjacent reservation prefix at this ordering point;
+						// the queue keeps the remainder at its front until the GS
+						// worker reaches the next MTVUGSPacket command.
+						const u32 write_pos =
+							s_write_pos.load(std::memory_order_acquire);
+						const u32 published_commands =
+							(write_pos - read_pos) & RingBufferMask;
+						u32 adjacent_reservations = 0;
+						while (adjacent_reservations <
+								completion.reservation_count &&
+							adjacent_reservations < published_commands)
+						{
+							const PacketTag& reservation =
+								reinterpret_cast<const PacketTag&>(
+									s_ring[(read_pos + adjacent_reservations) &
+										RingBufferMask]);
+							if (static_cast<Command>(reservation.command) !=
+								Command::MTVUGSPacket)
+							{
+								break;
+							}
+							adjacent_reservations++;
+						}
+						pxAssertRel(adjacent_reservations != 0,
+							"MTVU PATH1 completion did not begin at its "
+							"EE reservation");
+						if (adjacent_reservations == 0)
+							break;
+						ring_advance = adjacent_reservations;
+#if defined(__vita__)
+						if (performance_telemetry_enabled)
+						{
+							s_gs_worker_performance.commands +=
+								adjacent_reservations - 1;
+							s_gs_worker_performance.mtvu_packets +=
+								adjacent_reservations;
+						}
+#endif
+						if (completion.first_draw)
+						{
+							std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>>
+								draws;
+							draws.reserve(adjacent_reservations);
+							VitaGpuVu::GpuVuDraw* direct_draw =
+								completion.first_draw;
+							for (u32 index = 0;
+								index < adjacent_reservations; index++)
+							{
+								if (!direct_draw)
+									break;
+								VitaGpuVu::GpuVuDraw* const next =
+									direct_draw->path1_next;
+								direct_draw->path1_next = nullptr;
+								draws.emplace_back(direct_draw);
+								VitaGpuVu::RecordGpuVuDrawConsumed();
+								direct_draw = next;
+							}
+							pxAssertRel(
+								draws.size() ==
+										adjacent_reservations,
+								"MTVU PATH1 direct prefix is shorter than "
+								"its adjacent reservations");
+							s_mtvu_path1_completions.ConsumePrefix(
+								adjacent_reservations, direct_draw);
+							if (s_gs)
+							{
+								s_gs->ConsumeGpuVuDraws(std::move(draws));
+							}
+							else
+							{
+								for (const auto& draw : draws)
+									VitaGpuVu::RecordGpuVuDrawRejected();
+							}
+							break;
+						}
+
+						pxAssertRel(completion.reservation_count == 1,
+							"CPU PATH1 completion covered multiple dispatches");
+						pxAssertRel(adjacent_reservations == 1,
+							"CPU PATH1 completion consumed multiple reservations");
+						s_mtvu_path1_completions.ConsumePrefix(1, nullptr);
 						Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
 						GS_Packet packet;
-						while (!path.TryGetGSPacketMTVU(packet))
+						if (!path.TryGetGSPacketMTVU(packet))
 						{
-							// PCSX2's MTVU contract pairs each semaphore resource with one
-							// descriptor published by FinishGSPacketMTVU(). A lifecycle reset
-							// can discard an old descriptor while leaving its semaphore resource;
-							// consuming that orphan must not leave MTGS one packet ahead forever.
-							// Reacquire the resource for the descriptor instead of busy-waiting.
-						#if defined(__vita__)
-							if (performance_telemetry_enabled)
-							{
-								s_profile_mtvu_packet_token_resyncs.fetch_add(1,
-									std::memory_order_relaxed);
-								s_gs_worker_performance.mtvu_packet_token_resyncs++;
-							}
-						#endif
-						#if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
-							s_mtvu_packet_token_resyncs_for_validation.fetch_add(1,
-								std::memory_order_relaxed);
-						#endif
-							mtvu_lock.unlock();
-							vu1Thread.semaXGkick.Wait();
-							mtvu_lock.lock();
+							pxFailRel(
+								"MTVU PATH1 packet completion had no packet");
+							break;
 						}
 #if defined(__vita__)
 						if (performance_telemetry_enabled)
 						{
-							s_gs_worker_performance.mtvu_packets++;
 							s_gs_worker_performance.mtvu_packet_bytes += packet.size;
 						}
 #endif
@@ -2105,6 +2600,9 @@ namespace MTGS
 						break;
 				}
 
+				if (ring_advance == 0)
+					break;
+
 				const u32 new_read_pos = (read_pos + ring_advance) & RingBufferMask;
 				s_read_pos.store(new_read_pos, std::memory_order_release);
 				if (s_signal_ring_enabled.load(std::memory_order_acquire) &&
@@ -2123,6 +2621,12 @@ namespace MTGS
 #endif
 			}
 
+#if defined(__vita__)
+			// Process all already-published ordered GS work first. If its
+			// direct scene owns every immutable VIF slot, submit/retire that
+			// scene on this GXM-owning thread before the producer can continue.
+			ServiceGpuVuInputRetirementOnOwner();
+#endif
 			if (s_signal_ring_enabled.exchange(false, std::memory_order_acq_rel))
 			{
 				s_signal_ring_position.store(0, std::memory_order_release);
@@ -2334,9 +2838,9 @@ namespace MTGS
 			s_gs_producer_performance.wait_calls++;
 #endif
 
-		SetEvent();
 		if (weak_wait && is_mtvu)
 		{
+			SetEvent();
 			Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
 			const u32 pending_packets = path.GetPendingGSPackets();
 			if (pending_packets)
@@ -2353,9 +2857,41 @@ namespace MTGS
 				}
 			}
 		}
-		else if (!s_work_sema.WaitForEmpty())
+		else
 		{
-			pxFailRel("Vita GS worker died while waiting for an empty queue");
+			for (;;)
+			{
+				SetEvent();
+				if (!s_work_sema.WaitForEmpty())
+				{
+					pxFailRel(
+						"Vita GS worker died while waiting for an empty queue");
+					break;
+				}
+				if (s_read_pos.load(std::memory_order_acquire) ==
+					s_write_pos.load(std::memory_order_acquire))
+				{
+					break;
+				}
+
+				// WorkSema sees a deliberately deferred PATH1 reservation as
+				// idle. A strong lifecycle/observation wait sleeps for the next
+				// completion publication and then rechecks the actual MTGS ring.
+				s_mtvu_path1_drain_waiter.store(
+					true, std::memory_order_release);
+				if (s_mtvu_path1_completion_waiting.load(
+						std::memory_order_acquire))
+				{
+					s_mtvu_path1_drain_sema.Wait();
+				}
+				else if (!s_mtvu_path1_drain_waiter.exchange(
+							 false, std::memory_order_acq_rel))
+				{
+					// A producer claimed the waiter while the worker consumed
+					// its completion. Drain the paired post before rechecking.
+					s_mtvu_path1_drain_sema.Wait();
+				}
+			}
 		}
 
 		pxAssert(!(weak_wait && sync_regs));
@@ -2629,10 +3165,24 @@ bool VitaGS::QueueGpuVuDraw(
 		return false;
 	}
 
-	VitaGpuVu::GpuVuDraw* const pointer = draw.release();
 	VitaGpuVu::RecordGpuVuDrawQueued();
-	MTGS::SendPointerPacket(MTGS::Command::GpuVuDraw, 0, pointer);
+	MTGS::AppendPendingMtvuDirectDraw(draw.release());
 	return true;
+}
+
+void VitaGS::CompleteMtvuPath1Packet()
+{
+	if (MTGS::IsOpen())
+	{
+		MTGS::FlushPendingMtvuDirectRun();
+		MTGS::PublishMtvuPath1Completion({nullptr, 1});
+	}
+}
+
+void VitaGS::FlushMtvuPath1Completions()
+{
+	if (MTGS::IsOpen())
+		MTGS::FlushPendingMtvuDirectRun();
 }
 
 void VitaGS::NotifyGpuVuCompilerResult()
@@ -2640,6 +3190,28 @@ void VitaGS::NotifyGpuVuCompilerResult()
 	MTGS::s_gpu_vu_compiler_result_pending.store(true,
 		std::memory_order_release);
 	MTGS::s_work_sema.NotifyOfWork();
+}
+
+void VitaGS::RequestGpuVuInputRetirement(
+	const VitaGpuVu::RawVifPayloadRef& blocked_generation)
+{
+#if defined(__vita__)
+	// A large VIF transfer can fill the immutable ring before returning to its
+	// ordinary publish boundary. Make any already-complete capture commands
+	// visible before asking the GS owner to retire their exact generation.
+	vu1Thread.PublishPendingVifBatch();
+	MTGS::s_gpu_vu_input_retirement_owner.store(
+		blocked_generation.owner, std::memory_order_relaxed);
+	MTGS::s_gpu_vu_input_retirement_slot.store(
+		blocked_generation.slot, std::memory_order_relaxed);
+	MTGS::s_gpu_vu_input_retirement_generation.store(
+		blocked_generation.generation, std::memory_order_relaxed);
+	MTGS::s_gpu_vu_input_retirement_pending.store(
+		true, std::memory_order_release);
+	MTGS::s_work_sema.NotifyOfWork();
+#else
+	(void)blocked_generation;
+#endif
 }
 
 void VitaGS::NotifyPerformanceElfEntry()
@@ -2730,9 +3302,9 @@ bool VitaGS::CopyPrivilegedRegistersForValidation(u8* output, size_t size)
 	return true;
 }
 
-u64 VitaGS::GetMtvuPacketTokenResyncsForValidation()
+u64 VitaGS::GetMtvuPath1CompletionDeferralsForValidation()
 {
-	return s_mtvu_packet_token_resyncs_for_validation.load(
+	return s_mtvu_path1_completion_deferrals_for_validation.load(
 		std::memory_order_relaxed);
 }
 #endif

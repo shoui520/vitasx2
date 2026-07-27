@@ -3,6 +3,8 @@
 
 #include "vita/VitaGpuVuProgramRegistry.h"
 
+#include "vita/VitaGpuVuDirectProgram.h"
+
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -176,14 +178,21 @@ bool PollGeneratedProgramCompile(CompileResult *result,
 
 void CompleteGeneratedProgramRegistration(const ShaderKey &key,
                                           bool succeeded) {
-  std::lock_guard lock(s_registry_mutex);
-  const auto it = s_registry.find(key);
-  if (it == s_registry.end())
-    return;
-  it->second.state =
-      succeeded ? GeneratedProgramState::Ready : GeneratedProgramState::Failed;
-  (succeeded ? s_ready_programs : s_failed_programs)
-      .fetch_add(1, std::memory_order_relaxed);
+  bool completed = false;
+  {
+    std::lock_guard lock(s_registry_mutex);
+    const auto it = s_registry.find(key);
+    if (it == s_registry.end())
+      return;
+    it->second.state =
+        succeeded ? GeneratedProgramState::Ready
+                  : GeneratedProgramState::Failed;
+    (succeeded ? s_ready_programs : s_failed_programs)
+        .fetch_add(1, std::memory_order_relaxed);
+    completed = true;
+  }
+  if (completed)
+    PublishDirectProgramRegistration(key, succeeded);
 }
 
 ProgramRegistryStatistics GetGeneratedProgramRegistryStatistics() {

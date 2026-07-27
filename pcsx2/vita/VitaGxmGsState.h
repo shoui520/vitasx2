@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 namespace VitaGpuVu
 {
@@ -28,6 +29,8 @@ public:
 	void Present();
 	void VSync(u32 field);
 	void ConsumeGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
+	void ConsumeGpuVuDraws(
+		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws);
 
 	void Reset(bool hardware_reset) override;
 	void Draw() override;
@@ -59,6 +62,8 @@ public:
 
 	bool IsNativePresenterReady() const;
 	void ConsumeGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
+	void ConsumeGpuVuDraws(
+		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws);
 	void Reset(bool hardware_reset) override;
 	void VSync(u32 field, bool registers_written, bool idle_frame) override;
 };
@@ -78,6 +83,12 @@ public:
 
 	bool IsNativePresenterReady() const;
 	void ConsumeGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
+	void ConsumeGpuVuDraws(
+		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws);
+	void SubmitDrawConfig(GSHWDrawConfig& config) override;
+
+private:
+	std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> m_gpu_vu_draws;
 };
 
 #endif

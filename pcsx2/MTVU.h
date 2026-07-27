@@ -49,11 +49,20 @@ class VU_Thread final {
 	u32 m_micro_invalidate_start = 0;
 	u32 m_micro_invalidate_end = 0;
 	u32 m_gpu_vu_direct_program_token = 0;
+	u32 m_gpu_vu_direct_resume_token = 0;
+#if defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
+	u32 m_gpu_vu_direct_reported_program_token = 0;
+	u32 m_gpu_vu_direct_reported_resume_token = 0;
+#endif
 	u32 m_gpu_vu_direct_program_start_pc = 0;
 	bool m_gpu_vu_direct_program_prepared = false;
 	std::vector<VitaGpuVu::VifUnpackSpan> m_deferred_vif_unpacks;
 	std::atomic<u32> m_deferred_vif_unpack_count{0};
 	u64 m_vif_span_sequence = 0;
+	// EE-thread ownership. Direct affine UNPACK commands remain private until
+	// the following VU execute or the end of the current VIF transfer publishes
+	// the complete ordered group with one write-position update.
+	bool m_pending_vif_batch = false;
 
 	Threading::Thread m_thread;
 
@@ -133,6 +142,11 @@ public:
 
 	void VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* data, u32 size);
 
+	// Publishes captured UNPACK commands which have not yet been joined to a VU
+	// execute. VIF1 calls this at a transfer boundary; input-ring pressure and
+	// architectural waits use the same seam before waiting on another owner.
+	void PublishPendingVifBatch();
+
 	// Writes to VU's Micro Memory (size in bytes)
 	void WriteMicroMem(u32 vu_micro_addr, const void* data, u32 size);
 
@@ -172,6 +186,7 @@ private:
 	u32 Get_vuCycles();
 	void PrepareVuCodeForExecute(s32 vu_addr);
 	void WaitForQueue();
+	void AppendDeferredVifUnpack(VitaGpuVu::VifUnpackSpan span);
 	void ReplayDeferredVifUnpacks();
 	void ReleaseDeferredVifUnpacks();
 };

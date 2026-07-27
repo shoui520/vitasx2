@@ -3,8 +3,13 @@
 
 #include "vita/VitaGpuVuDraw.h"
 
+#include "common/Assertions.h"
+#include "common/Threading.h"
+
 #include <atomic>
+#include <cstddef>
 #include <limits>
+#include <new>
 
 namespace VitaGpuVu {
 namespace {
@@ -13,6 +18,15 @@ std::atomic<u64> s_ordering_sequence{0};
 std::atomic<u64> s_queued{0};
 std::atomic<u64> s_consumed{0};
 std::atomic<u64> s_rejected{0};
+// Phase accounting. These separate "the GPU root exists" from "every dispatch
+// which could use it actually does", which is the only way to tell a draining
+// CPU PATH1 backlog from one that is still being refilled.
+std::atomic<u64> s_cpu_vu1_executions{0};
+std::atomic<u64> s_cpu_path1_packets{0};
+std::atomic<u64> s_cpu_path1_bytes{0};
+std::array<std::atomic<u64>, VitaGpuVu::AdmissionFailureCount>
+    s_admission_failures{};
+std::atomic<u64> s_encoded_objects{0};
 std::atomic<u64> s_generated_parallel_invocations{0};
 std::atomic<u64> s_generated_serial_invocations{0};
 std::atomic<u64> s_interpreter_invocations{0};
@@ -24,8 +38,128 @@ std::atomic<u64> s_retirement_batches{0};
 std::atomic<u64> s_retired_draws{0};
 std::atomic<u64> s_retirement_ring_waits{0};
 std::atomic<u64> s_notification_waits{0};
+std::atomic<u64> s_descriptor_pool_waits{0};
+std::atomic<u64> s_descriptor_pool_in_use{0};
+std::atomic<u64> s_peak_descriptor_pool_in_use{0};
 std::atomic<u64> s_live_draws{0};
 std::atomic<u64> s_peak_live_draws{0};
+
+#if defined(__vita__) && defined(VITASX2_GPU_VU_DIRECT_ADMISSION) && \
+    VITASX2_GPU_VU_DIRECT_ADMISSION
+// The EE can have thousands of PATH1 reservations queued while the GS worker
+// is still draining CPU-generated packets. A heap object per admitted VU
+// dispatch therefore made descriptor ownership unbounded and exhausted
+// newlib before the first GPU descriptor reached the GS thread. Two complete
+// 256-draw mailbox runs are enough to keep producer and consumer concurrent;
+// reuse sleeps only when both older runs are still owned by the mailbox/GS.
+constexpr u32 GpuVuDrawPoolCapacity = 512;
+
+class GpuVuDrawPool final {
+public:
+  GpuVuDrawPool() {
+    for (u32 index = 0; index < GpuVuDrawPoolCapacity; index++) {
+      m_free_indices[index] = static_cast<u16>(index);
+      m_available.Post();
+    }
+  }
+
+  void* Acquire() {
+    if (!m_available.TryWait()) {
+      s_descriptor_pool_waits.fetch_add(1, std::memory_order_relaxed);
+      m_available.Wait();
+    }
+
+    Lock();
+    const bool has_free_slot = m_free_count != 0;
+    const u32 index =
+        has_free_slot ? m_free_indices[--m_free_count] : 0;
+    const bool slot_was_free =
+        has_free_slot && m_allocated[index] == 0;
+    if (slot_was_free)
+      m_allocated[index] = 1;
+    Unlock();
+
+    pxAssertRel(has_free_slot,
+                "GPU-VU descriptor semaphore/free-stack mismatch");
+    pxAssertRel(slot_was_free,
+                "GPU-VU descriptor acquired while still owned");
+    if (!has_free_slot || !slot_was_free)
+      return nullptr;
+
+    const u64 in_use =
+        s_descriptor_pool_in_use.fetch_add(
+            1, std::memory_order_relaxed) +
+        1;
+    u64 peak =
+        s_peak_descriptor_pool_in_use.load(std::memory_order_relaxed);
+    while (in_use > peak &&
+           !s_peak_descriptor_pool_in_use.compare_exchange_weak(
+               peak, in_use, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+    return m_storage.data() + sizeof(GpuVuDraw) * index;
+  }
+
+  void Release(void* pointer) {
+    const uptr first = reinterpret_cast<uptr>(m_storage.data());
+    const uptr address = reinterpret_cast<uptr>(pointer);
+    const uptr bytes = sizeof(GpuVuDraw) * GpuVuDrawPoolCapacity;
+    const bool valid =
+        address >= first && address < first + bytes &&
+        ((address - first) % sizeof(GpuVuDraw)) == 0;
+    pxAssertRel(valid, "foreign pointer returned to GPU-VU descriptor pool");
+    if (!valid)
+      return;
+
+    const u32 index =
+        static_cast<u32>((address - first) / sizeof(GpuVuDraw));
+
+    Lock();
+    const bool slot_was_owned = m_allocated[index] != 0;
+    const bool has_stack_space =
+        m_free_count < GpuVuDrawPoolCapacity;
+    if (slot_was_owned && has_stack_space) {
+      m_allocated[index] = 0;
+      m_free_indices[m_free_count++] = static_cast<u16>(index);
+    }
+    Unlock();
+
+    pxAssertRel(slot_was_owned,
+                "GPU-VU descriptor released more than once");
+    pxAssertRel(has_stack_space,
+                "GPU-VU descriptor free stack overflow");
+    if (!slot_was_owned || !has_stack_space)
+      return;
+
+    s_descriptor_pool_in_use.fetch_sub(1, std::memory_order_relaxed);
+    m_available.Post();
+  }
+
+private:
+  void Lock() {
+    while (m_lock.test_and_set(std::memory_order_acquire))
+      Threading::SpinWait();
+  }
+
+  void Unlock() {
+    m_lock.clear(std::memory_order_release);
+  }
+
+  alignas(GpuVuDraw)
+      std::array<std::byte,
+                 sizeof(GpuVuDraw) * GpuVuDrawPoolCapacity>
+          m_storage{};
+  std::array<u16, GpuVuDrawPoolCapacity> m_free_indices{};
+  std::array<u8, GpuVuDrawPoolCapacity> m_allocated{};
+  u32 m_free_count = GpuVuDrawPoolCapacity;
+  std::atomic_flag m_lock = ATOMIC_FLAG_INIT;
+  Threading::UserspaceSemaphore m_available;
+};
+
+GpuVuDrawPool s_gpu_vu_draw_pool;
+#else
+constexpr u32 GpuVuDrawPoolCapacity = 0;
+#endif
 
 bool Fail(std::string *error, const char *message) {
   if (error)
@@ -66,6 +200,40 @@ GpuVuDraw::~GpuVuDraw() {
   for (VifUnpackSpan &span : m_input_spans)
     ReleaseRawVifPayload(&span.payload);
 }
+
+#if defined(__vita__)
+void* GpuVuDraw::operator new(std::size_t size) {
+  pxAssertRel(size == sizeof(GpuVuDraw),
+              "invalid GPU-VU descriptor allocation size");
+#if defined(VITASX2_GPU_VU_DIRECT_ADMISSION) && \
+    VITASX2_GPU_VU_DIRECT_ADMISSION
+  void* const pointer = s_gpu_vu_draw_pool.Acquire();
+  if (pointer)
+    return pointer;
+  throw std::bad_alloc();
+#else
+  return ::operator new(size);
+#endif
+}
+
+void GpuVuDraw::operator delete(void* pointer) noexcept {
+  if (!pointer)
+    return;
+#if defined(VITASX2_GPU_VU_DIRECT_ADMISSION) && \
+    VITASX2_GPU_VU_DIRECT_ADMISSION
+  s_gpu_vu_draw_pool.Release(pointer);
+#else
+  ::operator delete(pointer);
+#endif
+}
+
+void GpuVuDraw::operator delete(
+    void* pointer, std::size_t size) noexcept {
+  pxAssertRel(size == sizeof(GpuVuDraw),
+              "invalid GPU-VU descriptor deletion size");
+  GpuVuDraw::operator delete(pointer);
+}
+#endif
 
 bool GpuVuDraw::AddInputSpan(const VifUnpackSpan &span) {
   if (!span.payload.IsValid() || !RetainRawVifPayload(span.payload))
@@ -138,6 +306,10 @@ bool GpuVuDraw::Validate(std::string *error) const {
                                    ScalarUniformI | ScalarUniformGifQ)) != 0) {
     return Fail(error, "unknown scalar-uniform mask bit");
   }
+  if ((final_vi_write_mask & ~0xfffeu) != 0)
+    return Fail(error, "invalid descriptor-scale final VI mask");
+  if (final_vi_values[0] != 0)
+    return Fail(error, "descriptor-scale final VI0 is not zero");
   if (target_bounds.valid && (target_bounds.right <= target_bounds.left ||
                               target_bounds.bottom <= target_bounds.top)) {
     return Fail(error, "empty target bounds");
@@ -164,10 +336,15 @@ u64 NextGpuVuOrderingSequence() {
 }
 
 bool IsDirectDrawAdmissionConnected() {
-  // GSRendererHW cannot yet derive a draw configuration for vertexless
-  // GpuVuDraw geometry. Keep the cold generated-root seam dormant until the
-  // producer can replace, rather than duplicate, the CPU VU/PATH1 work.
+#if defined(VITASX2_GPU_VU_DIRECT_ADMISSION) && \
+    VITASX2_GPU_VU_DIRECT_ADMISSION
+  return true;
+#else
+  // The disconnected product compiles out VIF capture and all hot-path
+  // preparation. Admission builds enable the MTVU/GS ownership contract as
+  // one process-wide boundary.
   return false;
+#endif
 }
 
 bool HasCompletedNotificationValue(u32 completed, u32 required) {
@@ -186,6 +363,24 @@ void RecordGpuVuDrawConsumed() {
 void RecordGpuVuDrawRejected() {
   s_rejected.fetch_add(1, std::memory_order_relaxed);
   ReleaseLiveDraws(1);
+}
+
+void RecordCpuVu1Execution(u32 path1_packet_bytes) {
+  s_cpu_vu1_executions.fetch_add(1, std::memory_order_relaxed);
+  if (path1_packet_bytes != 0) {
+    s_cpu_path1_packets.fetch_add(1, std::memory_order_relaxed);
+    s_cpu_path1_bytes.fetch_add(path1_packet_bytes, std::memory_order_relaxed);
+  }
+}
+
+void RecordDirectAdmissionFailure(AdmissionFailure reason) {
+  const size_t index = static_cast<size_t>(reason);
+  if (index < s_admission_failures.size())
+    s_admission_failures[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordGpuVuObjectsEncoded(u64 count) {
+  s_encoded_objects.fetch_add(count, std::memory_order_relaxed);
 }
 
 void RecordGpuVuDrawExecuted(const GpuVuDraw &draw) {
@@ -241,6 +436,15 @@ DrawStatistics GetGpuVuDrawStatistics() {
   stats.queued = s_queued.load(std::memory_order_relaxed);
   stats.consumed = s_consumed.load(std::memory_order_relaxed);
   stats.rejected = s_rejected.load(std::memory_order_relaxed);
+  stats.cpu_vu1_executions =
+      s_cpu_vu1_executions.load(std::memory_order_relaxed);
+  stats.cpu_path1_packets = s_cpu_path1_packets.load(std::memory_order_relaxed);
+  stats.cpu_path1_bytes = s_cpu_path1_bytes.load(std::memory_order_relaxed);
+  for (size_t index = 0; index < s_admission_failures.size(); index++) {
+    stats.admission_failures[index] =
+        s_admission_failures[index].load(std::memory_order_relaxed);
+  }
+  stats.encoded_objects = s_encoded_objects.load(std::memory_order_relaxed);
   stats.generated_parallel_invocations =
       s_generated_parallel_invocations.load(std::memory_order_relaxed);
   stats.generated_serial_invocations =
@@ -259,6 +463,13 @@ DrawStatistics GetGpuVuDrawStatistics() {
       s_retirement_ring_waits.load(std::memory_order_relaxed);
   stats.notification_waits =
       s_notification_waits.load(std::memory_order_relaxed);
+  stats.descriptor_pool_waits =
+      s_descriptor_pool_waits.load(std::memory_order_relaxed);
+  stats.descriptor_pool_in_use =
+      s_descriptor_pool_in_use.load(std::memory_order_relaxed);
+  stats.peak_descriptor_pool_in_use =
+      s_peak_descriptor_pool_in_use.load(std::memory_order_relaxed);
+  stats.descriptor_pool_capacity = GpuVuDrawPoolCapacity;
   stats.live_draws = s_live_draws.load(std::memory_order_relaxed);
   stats.peak_live_draws = s_peak_live_draws.load(std::memory_order_relaxed);
   return stats;

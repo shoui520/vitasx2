@@ -9510,12 +9510,17 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	}
 
 	if (!m_channel_shuffle_width)
-		g_gs_device->RenderHW(m_conf);
+		SubmitDrawConfig(m_conf);
 	else
 		m_last_rt = rt;
 
 	if (g_gs_device->IsDSInRTActive())
 		g_gs_device->EndDSAsRT();
+}
+
+void GSRendererHW::SubmitDrawConfig(GSHWDrawConfig& config)
+{
+	g_gs_device->RenderHW(config);
 }
 
 // If the EE uploaded a new CLUT since the last draw, use that.

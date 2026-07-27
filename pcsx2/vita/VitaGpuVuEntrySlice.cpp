@@ -239,33 +239,119 @@ private:
     return state;
   }
 
+  // A lane is a usable entry uniform only when nothing this entry can execute
+  // writes it. The invariant being protected is stale-seed reuse: once a draw
+  // is accepted the CPU's VU state is deliberately not advanced, so any lane
+  // the accepted region writes must never be re-read as an Initial* leaf on a
+  // later invocation. Blocks unreachable from this entry cannot run and so
+  // cannot invalidate the seed; an MSCNT resume which branches past its
+  // prologue legitimately inherits that prologue's registers from the CPU
+  // snapshot taken at the explicit MSCAL boundary.
+  // VF00 is architecturally hardwired to (0, 0, 0, 1).
+  static u32 Vf00LaneBits(u32 lane) {
+    return lane == 3 ? 0x3f800000u : 0u;
+  }
+
+  // Lane mask of writes by this pair which are idempotent self-clamps against
+  // a VF00 lane. `maxx.xyzw vfN, vfN, vf00x` is the canonical PS2 clamp: the
+  // destination is also the first source, so each written lane is
+  // `max(lane, constant)`. Broadcast forms still read the destination lane
+  // from Fs, so the per-lane mapping is preserved. The `i`/`q` forms are
+  // excluded because their bound is not a hardwired constant.
+  static u8 SelfClampLanes(const VitaVU::GpuPairPlan& plan, bool* minimum,
+                           u32* bound_lane) {
+    if (!plan.exec_upper || plan.upper_vf_write == 0)
+      return 0;
+    if ((plan.upper_vi_write & (1u << REG_ACC_FLAG)) != 0)
+      return 0;
+    const UpperKind kind = static_cast<UpperKind>(plan.upper_kind);
+    const bool is_minimum = IsMinimum(kind);
+    if (!is_minimum && !IsMaximum(kind))
+      return 0;
+    if (UsesI(kind) || UsesQ(kind))
+      return 0;
+    if (VUInterpFast::Fs(plan.upper) != plan.upper_vf_write)
+      return 0;
+    if (VUInterpFast::Ft(plan.upper) != 0)
+      return 0;
+    *minimum = is_minimum;
+    const s32 broadcast = BroadcastLane(kind);
+    *bound_lane = broadcast >= 0 ? static_cast<u32>(broadcast)
+                                 : std::numeric_limits<u32>::max();
+    return plan.upper_vf_write_mask;
+  }
+
   void ScanStableInitialState() {
     std::array<u8, 32> vf_writes{};
+    std::array<u8, 32> clamp_writes{};
+    std::array<u8, 32> other_writes{};
+    std::array<std::array<ClampStableLane, 4>, 32> clamps{};
     u8 acc_writes = 0;
     bool q_write = false;
     bool p_write = false;
     bool i_write = false;
     for (const BasicBlock& block : m_program.blocks) {
+      if (!block.reachable_from_entry)
+        continue;
       for (const ProgramPair& pair : block.pairs) {
         const VitaVU::GpuPairPlan& plan = pair.plan;
         if (plan.exec_upper) {
-          if (plan.upper_vf_write != 0)
+          if (plan.upper_vf_write != 0) {
             vf_writes[plan.upper_vf_write] |= plan.upper_vf_write_mask;
+            bool minimum = false;
+            u32 bound_lane = 0;
+            const u8 clamped = SelfClampLanes(plan, &minimum, &bound_lane);
+            other_writes[plan.upper_vf_write] |=
+                static_cast<u8>(plan.upper_vf_write_mask & ~clamped);
+            for (u32 lane = 0; lane < 4; lane++) {
+              if (!LaneEnabled(clamped, lane))
+                continue;
+              ClampStableLane candidate;
+              candidate.reg = static_cast<u8>(plan.upper_vf_write);
+              candidate.lane = static_cast<u8>(lane);
+              candidate.minimum = minimum;
+              candidate.bound_bits = Vf00LaneBits(
+                  bound_lane == std::numeric_limits<u32>::max() ? lane
+                                                                : bound_lane);
+              ClampStableLane& recorded = clamps[plan.upper_vf_write][lane];
+              // Repeated identical clamps stay idempotent; a differing clamp
+              // of the same lane does not, so drop the whole lane.
+              if (!LaneEnabled(clamp_writes[plan.upper_vf_write], lane))
+                recorded = candidate;
+              else if (!(recorded == candidate))
+                continue;
+              clamp_writes[plan.upper_vf_write] |=
+                  static_cast<u8>(0x8u >> lane);
+            }
+          }
           if ((plan.upper_vi_write & (1u << REG_ACC_FLAG)) != 0)
             acc_writes |= plan.upper_vf_write_mask;
         }
         if (plan.exec_lower && !plan.lower_discarded_by_upper) {
-          if (plan.lower_vf_write != 0)
+          if (plan.lower_vf_write != 0) {
             vf_writes[plan.lower_vf_write] |= plan.lower_vf_write_mask;
+            other_writes[plan.lower_vf_write] |= plan.lower_vf_write_mask;
+          }
           q_write |= (plan.lower_vi_write & (1u << REG_Q)) != 0;
           p_write |= (plan.lower_vi_write & (1u << REG_P)) != 0;
           i_write |= plan.immediate_lower;
         }
       }
     }
-    for (u32 reg = 1; reg < vf_writes.size(); reg++)
+    for (u32 reg = 1; reg < vf_writes.size(); reg++) {
+      // A lane is recoverable from the entry seed only when every write to it
+      // is an identical self-clamp. One ordinary write anywhere in the region
+      // makes the lane unstable regardless of how many clamps also touch it.
+      const u8 recoverable =
+          static_cast<u8>(clamp_writes[reg] & ~other_writes[reg]);
+      const u8 unrecoverable = static_cast<u8>(vf_writes[reg] & ~recoverable);
       m_kernel->stable_initial_vf_lanes[reg] =
-          static_cast<u8>((~vf_writes[reg]) & 0x0fu);
+          static_cast<u8>((~unrecoverable) & 0x0fu);
+      for (u32 lane = 0; lane < 4; lane++) {
+        if (LaneEnabled(recoverable, lane))
+          m_kernel->clamp_stable_lanes.push_back(clamps[reg][lane]);
+      }
+    }
     m_kernel->stable_initial_acc_lanes =
         static_cast<u8>((~acc_writes) & 0x0fu);
     m_kernel->stable_initial_q = !q_write;

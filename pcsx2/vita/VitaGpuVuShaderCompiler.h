@@ -6,8 +6,8 @@
 #include "common/Pcsx2Types.h"
 #include "common/Threading.h"
 
+#include <array>
 #include <atomic>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -57,6 +57,12 @@ struct ShaderCompilerStatistics {
   u64 completed_results = 0;
   u64 in_flight_requests = 0;
   u64 active_compiles = 0;
+  u64 invalid_outputs = 0;
+  u64 truncated_diagnostics = 0;
+  u64 private_arena_capacity = 0;
+  u64 private_arena_peak = 0;
+  u64 private_arena_current = 0;
+  u64 private_arena_guard_failures = 0;
 };
 
 // One bounded, serialized compiler for generated VU1+TFX vertex programs.
@@ -94,30 +100,83 @@ public:
   ShaderCompilerStatistics GetStatistics() const;
 
 private:
-  struct Request {
-    ShaderKey key;
-    std::string source;
+  static constexpr size_t MaxCompilerSlots = 8;
+  static constexpr size_t MaxGeneratedSourceBytes = 512 * 1024;
+  static constexpr size_t MaxGeneratedProgramBytes = 512 * 1024;
+  static constexpr size_t MaxCompileDiagnostics = 64;
+  static constexpr size_t MaxDiagnosticMessageBytes = 256;
+  static constexpr size_t PrivateArenaBytes = 8 * 1024 * 1024;
+
+  enum class SlotState : u8 {
+    Free,
+    Pending,
+    Compiling,
+    Completed,
   };
 
-  static constexpr size_t MaxPendingRequests = 8;
-  static constexpr size_t MaxCompletedResults = 8;
-  static constexpr size_t MaxGeneratedSourceBytes = 512 * 1024;
+  struct FixedDiagnostic {
+    u32 level = 0;
+    u32 code = 0;
+    u32 line = 0;
+    u32 column = 0;
+    std::array<char, MaxDiagnosticMessageBytes> message{};
+  };
+
+  struct CompileSlot {
+    SlotState state = SlotState::Free;
+    ShaderKey key;
+    char *source = nullptr;
+    u32 source_size = 0;
+    u8 *gxp = nullptr;
+    u32 gxp_size = 0;
+    std::array<FixedDiagnostic, MaxCompileDiagnostics> diagnostics{};
+    u32 diagnostic_count = 0;
+    u32 total_diagnostic_count = 0;
+    u64 compile_us = 0;
+    bool succeeded = false;
+    bool invalid_output = false;
+    bool diagnostics_truncated = false;
+  };
 
   void WorkerMain();
   bool LoadCompilerModule();
   void UnloadCompilerModule();
-  CompileResult Compile(const Request &request);
+  void Compile(CompileSlot *slot);
+  bool InitializePrivateArena();
+  void DestroyPrivateArena();
+  bool PrivateArenaGuardsHold() const;
+  void ResetSlotLocked(CompileSlot *slot);
+  u8 FindFreeSlotLocked() const;
+  u8 PopRequestLocked();
+  u8 PopResultLocked();
+  void PushRequestLocked(u8 slot);
+  void PushResultLocked(u8 slot);
+  void ReportServiceState();
   bool HasKeyLocked(const ShaderKey &key) const;
 
   mutable std::mutex m_mutex;
-  std::deque<Request> m_requests;
-  std::deque<CompileResult> m_results;
-  std::vector<ShaderKey> m_in_flight;
-  std::string m_compiler_version;
+  std::array<CompileSlot, MaxCompilerSlots> m_slots{};
+  std::array<u8, MaxCompilerSlots> m_request_queue{};
+  std::array<u8, MaxCompilerSlots> m_result_queue{};
+  u8 m_request_read = 0;
+  u8 m_request_write = 0;
+  u8 m_request_count = 0;
+  u8 m_result_read = 0;
+  u8 m_result_write = 0;
+  u8 m_result_count = 0;
+  std::array<char, 96> m_compiler_version{};
+  void *m_private_arena_backing = nullptr;
+  void *m_private_mspace = nullptr;
   Threading::WorkSema m_work_sema;
   Threading::Thread m_thread;
   std::atomic<State> m_state{State::Stopped};
   std::atomic<bool> m_shutdown{false};
+  std::atomic<bool> m_service_state_pending{false};
+  std::atomic<bool> m_service_state_reported{false};
+  std::atomic<s32> m_startup_system_result{0};
+  std::atomic<s32> m_startup_external_result{0};
+  std::atomic<s32> m_startup_extension_result{0};
+  std::atomic<s32> m_startup_allocator_result{0};
   std::atomic<u64> m_submission_attempts{0};
   std::atomic<u64> m_accepted_submissions{0};
   std::atomic<u64> m_rejected_state{0};
@@ -134,6 +193,11 @@ private:
   std::atomic<u64> m_total_compile_us{0};
   std::atomic<u64> m_longest_compile_us{0};
   std::atomic<u64> m_active_compiles{0};
+  std::atomic<u64> m_invalid_outputs{0};
+  std::atomic<u64> m_truncated_diagnostics{0};
+  std::atomic<u64> m_private_arena_peak{0};
+  std::atomic<u64> m_private_arena_current{0};
+  std::atomic<u64> m_private_arena_guard_failures{0};
   s32 m_module_id = -1;
   bool m_system_module = false;
   bool m_extensions_enabled = false;

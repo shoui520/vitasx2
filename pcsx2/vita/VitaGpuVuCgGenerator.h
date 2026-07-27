@@ -29,15 +29,29 @@ struct CgConstantInput {
 };
 
 struct GeneratedCgProgram {
+  static constexpr u32 RawInputBufferQwords = (2 * 1024 * 1024) / 16;
+  static constexpr u32 MaximumBatchDraws = 4096;
+  // Sony's gxm/memory.h explicitly permits a dynamically indexed user
+  // uniform buffer to access beyond its shader-declared size at runtime. Keep
+  // the declaration at the skinning sample's proven 64-vector scale: declaring
+  // the complete 2 MiB ring caused runtime ShaccCg to exhaust its work heap and
+  // return a fatal internal error even though offline psp2cgc accepted it.
+  static constexpr u32 DeclaredBufferVectors = 64;
+
   std::string source;
   std::vector<CgMemoryInput> memory_inputs;
   std::vector<CgConstantInput> constant_inputs;
   u32 vf_uniform_mask = 0;
   std::array<u8, 32> stable_initial_vf_lanes{};
+  // Demanded entry lanes which are stable only because the region's writes to
+  // them are idempotent self-clamps. The descriptor path must verify each
+  // runtime seed against its bound before accepting a draw.
+  std::vector<ClampStableLane> clamp_stable_lanes;
   u8 stable_initial_acc_lanes = 0;
   u32 emitted_expression_count = 0;
   u8 flat_vertices_per_primitive = 0;
   u8 flat_instance_vertex_step = 0;
+  u16 batch_primitives_per_draw = 0;
   bool stable_initial_q = false;
   bool stable_initial_p = false;
   bool stable_initial_i = false;
@@ -49,6 +63,7 @@ struct GeneratedCgProgram {
   bool uses_gif_q_uniform = false;
   bool uses_tfx_uniforms = false;
   bool uses_flat_instance_inputs = false;
+  bool uses_buffered_batch_inputs = false;
   bool flat_strip_winding = false;
 };
 

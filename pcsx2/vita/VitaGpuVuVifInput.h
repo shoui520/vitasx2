@@ -9,6 +9,11 @@
 
 namespace VitaGpuVu {
 
+class GpuVuDraw;
+
+inline constexpr u32 InputRingSlotCount = 4;
+inline constexpr u32 InputRingSlotSize = 2 * 1024 * 1024;
+
 // Opaque ownership of one immutable byte range in the Vita GPU-readable VIF
 // ring. The owner remains alive until every copied reference is released.
 struct RawVifPayloadRef {
@@ -57,6 +62,11 @@ struct RawQwordBinding {
 // they simply require a generated unpack expression or the universal executor.
 bool IsDirectAffineV4_32Span(const VifUnpackSpan& span);
 
+// Returns true when applying newer after older makes every VU-memory write
+// performed by older unobservable. Both ranges may wrap at qword 0x3ff.
+bool DirectAffineSpanFullyOverwrites(const VifUnpackSpan& newer,
+                                     const VifUnpackSpan& older);
+
 // Proves that an invocation-indexed VU-memory address range is backed by one
 // contiguous raw V4-32 span. VU memory wraps at 1024 qwords, while the source
 // byte range itself must remain in bounds.
@@ -66,11 +76,22 @@ bool BindAffineRawQwords(const VifUnpackSpan& span,
                         u32 invocation_count,
                         RawQwordBinding* binding);
 
+// Materializes the exact VU-memory effect proven by
+// IsDirectAffineV4_32Span(). This is the CPU fallback/observation seam for an
+// immutable raw span: one or two bulk copies replace reconstructing and
+// redispatching a general VIF UNPACK on the 496 MHz worker.
+bool MaterializeDirectAffineV4_32Span(const VifUnpackSpan& span,
+                                     const void* source,
+                                     void* vu_memory,
+                                     u32 vu_memory_size);
+
 struct InputRingStatistics {
   u64 captures = 0;
   u64 captured_bytes = 0;
-  u64 disconnected_bypasses = 0;
-  u64 disconnected_bypass_bytes = 0;
+  u64 publication_batches = 0;
+  u64 published_bytes = 0;
+  u64 capture_bypasses = 0;
+  u64 capture_bypass_bytes = 0;
   u64 capture_fallbacks = 0;
   u64 slot_reuses = 0;
   u64 ring_waits = 0;
@@ -102,21 +123,33 @@ private:
 
   friend bool CaptureRawVifPayload(const void*, u32, RawVifPayloadRef*);
   friend const u8* ResolveRawVifPayload(const RawVifPayloadRef&);
+  friend const u8* ResolveGpuRawVifPayload(const RawVifPayloadRef&);
+  friend bool PublishPendingRawVifPayloads(const GpuVuDraw*, u32);
   friend bool RetainRawVifPayload(const RawVifPayloadRef&);
   friend void ReleaseRawVifPayload(RawVifPayloadRef*);
+  friend u32 GetRawVifPayloadGenerationReferenceCount(
+      const RawVifPayloadRef&);
 };
 
 // Producer capture, worker resolution, and explicit ownership transfer. A
 // retained reference may be handed from MTVU to an ordered GS descriptor.
 bool CaptureRawVifPayload(const void* source, u32 size,
                           RawVifPayloadRef* payload);
+// CPU-side analysis and replay always read the cacheable staging copy.
 const u8* ResolveRawVifPayload(const RawVifPayloadRef& payload);
+// The GS owner may bind only bytes which the MTVU worker has copied into the
+// non-cacheable GXM mapping at an ordered direct-run publication boundary.
+const u8* ResolveGpuRawVifPayload(const RawVifPayloadRef& payload);
+bool PublishPendingRawVifPayloads(const GpuVuDraw* first_draw,
+                                 u32 draw_count);
 bool RetainRawVifPayload(const RawVifPayloadRef& payload);
 void ReleaseRawVifPayload(RawVifPayloadRef* payload);
+u32 GetRawVifPayloadGenerationReferenceCount(
+    const RawVifPayloadRef& payload);
 
 void RecordDeferredVifUnpack();
 void RecordReplayedVifUnpack();
-void RecordDisconnectedCaptureBypass(u32 size);
+void RecordCaptureBypass(u32 size);
 InputRingStatistics GetInputRingStatistics();
 
 } // namespace VitaGpuVu

@@ -380,6 +380,9 @@ public:
 	void InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut = false) override;
 	void Move() override;
 	void Draw() override;
+	// Vita's generated VU1 root reuses the complete PCSX2 HW state derivation
+	// above this seam while replacing only the final geometry submission.
+	virtual void SubmitDrawConfig(GSHWDrawConfig& config);
 
 	void PurgeTextureCache(bool sources, bool targets, bool hash_cache) override;
 	void ReadbackTextureCache() override;

@@ -8,11 +8,103 @@
 #include "vita/VitaGpuVuVifInput.h"
 
 #include <array>
+#include <cstddef>
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace VitaGpuVu {
+
+// Phase-one direct descriptors are produced thousands of times per frame on a
+// 496 MHz Cortex-A9. std::vector's empty object is cheap, but growing five
+// separate vectors for every VU dispatch made allocator traffic part of the
+// hot path. Keep the common generated-program shapes inline and retain a
+// vector fallback so semantic coverage is not limited by an inline capacity.
+template <typename T, size_t InlineCapacity>
+class InlineDescriptorVector final {
+  static_assert(InlineCapacity != 0);
+  static_assert(std::is_nothrow_move_constructible_v<T>);
+  static_assert(std::is_nothrow_move_assignable_v<T>);
+
+public:
+  InlineDescriptorVector() = default;
+  InlineDescriptorVector(const InlineDescriptorVector&) = delete;
+  InlineDescriptorVector& operator=(const InlineDescriptorVector&) = delete;
+  InlineDescriptorVector(InlineDescriptorVector&&) = delete;
+  InlineDescriptorVector& operator=(InlineDescriptorVector&&) = delete;
+
+  size_t size() const { return m_size; }
+  bool empty() const { return m_size == 0; }
+
+  T* data() { return m_using_heap ? m_heap.data() : m_inline.data(); }
+  const T* data() const {
+    return m_using_heap ? m_heap.data() : m_inline.data();
+  }
+  T* begin() { return data(); }
+  const T* begin() const { return data(); }
+  T* end() { return data() + m_size; }
+  const T* end() const { return data() + m_size; }
+
+  T& operator[](size_t index) { return data()[index]; }
+  const T& operator[](size_t index) const { return data()[index]; }
+  T& back() { return (*this)[m_size - 1]; }
+  const T& back() const { return (*this)[m_size - 1]; }
+
+  void reserve(size_t requested) {
+    if (requested > InlineCapacity)
+      UseHeap(requested);
+  }
+
+  void push_back(const T& value) {
+    EnsureSpaceForOne();
+    if (m_using_heap)
+      m_heap.push_back(value);
+    else
+      m_inline[m_size] = value;
+    m_size++;
+  }
+
+  void push_back(T&& value) {
+    EnsureSpaceForOne();
+    if (m_using_heap)
+      m_heap.push_back(std::move(value));
+    else
+      m_inline[m_size] = std::move(value);
+    m_size++;
+  }
+
+  void clear() {
+    if (m_using_heap)
+      m_heap.clear();
+    m_size = 0;
+  }
+
+private:
+  void EnsureSpaceForOne() {
+    if (!m_using_heap && m_size == InlineCapacity)
+      UseHeap(InlineCapacity * 2);
+  }
+
+  void UseHeap(size_t requested) {
+    if (m_using_heap) {
+      m_heap.reserve(requested);
+      return;
+    }
+    const size_t capacity =
+        requested > InlineCapacity * 2 ? requested : InlineCapacity * 2;
+    m_heap.reserve(capacity);
+    for (size_t index = 0; index < m_size; index++)
+      m_heap.push_back(std::move(m_inline[index]));
+    m_using_heap = true;
+  }
+
+  std::array<T, InlineCapacity> m_inline{};
+  std::vector<T> m_heap;
+  size_t m_size = 0;
+  bool m_using_heap = false;
+};
 
 enum class OutputLowering : u8 {
   DirectTfx,
@@ -97,7 +189,9 @@ struct FinalStatePublication {
 
 // Immutable, sequence-numbered handoff from the EE/VIF producer to the
 // GS/GXM-owning thread. Input span references are retained exactly once by
-// AddInputSpan() and released only after GPU vertex completion or rejection.
+// AddInputSpan(). After encoding, the GS owner may coalesce them to one
+// reference per immutable input-ring slot; the underlying bytes remain owned
+// until GPU vertex completion or rejection.
 class GpuVuDraw final {
 public:
   GpuVuDraw() = default;
@@ -107,24 +201,41 @@ public:
   GpuVuDraw &operator=(GpuVuDraw &&) = delete;
   ~GpuVuDraw();
 
+#if defined(__vita__)
+  static void* operator new(std::size_t size);
+  static void operator delete(void* pointer) noexcept;
+  static void operator delete(void* pointer, std::size_t size) noexcept;
+#endif
+
   bool AddInputSpan(const VifUnpackSpan &span);
   bool Validate(std::string *error) const;
 
-  const std::vector<VifUnpackSpan> &InputSpans() const { return m_input_spans; }
+  const InlineDescriptorVector<VifUnpackSpan, 4>& InputSpans() const {
+    return m_input_spans;
+  }
 
   ShaderKey program;
   DirectTfxContract direct_tfx;
   std::array<u32, 4> gif_tag{};
-  std::vector<StreamBinding> streams;
-  std::vector<ConstantUniform> constant_uniforms;
-  std::vector<VectorUniform> vf_uniforms;
+  InlineDescriptorVector<StreamBinding, 4> streams;
+  // Entry-slice roots commonly lift one 4x4 matrix from sixteen fixed VU
+  // qwords. Keep that complete descriptor set inline: promoting every MSCNT
+  // continuation through malloc would put allocator traffic back into the
+  // 496 MHz worker hot path.
+  InlineDescriptorVector<ConstantUniform, 16> constant_uniforms;
+  InlineDescriptorVector<VectorUniform, 16> vf_uniforms;
   std::array<u32, 4> acc_uniform{};
   ScalarUniforms scalar_uniforms;
   std::array<std::array<float, 4>, 3> vertex_scale_offset{};
   float max_depth = 0.0f;
-  std::vector<StaticGsWrite> static_gs_writes;
+  InlineDescriptorVector<StaticGsWrite, 4> static_gs_writes;
   IntegerRect target_bounds;
   IntegerRect texture_bounds;
+  // PairPlan-derived descriptor-scale exit state. MTVU publishes these VI
+  // values after the immutable draw handoff succeeds, before it releases the
+  // ordinary VU completion flag. They are not GPU readback requirements.
+  std::array<u16, 16> final_vi_values{};
+  u32 final_vi_write_mask = 0;
   FinalStatePublication final_state;
   u64 ordering_sequence = 0;
   u32 invocation_count = 0;
@@ -135,8 +246,16 @@ public:
   ExecutionKind execution = ExecutionKind::GeneratedParallel;
   PrimitiveBoundary primitive_boundary = PrimitiveBoundary::Native;
 
+  // VitaGsMailbox links consecutive direct PATH1 descriptors without a
+  // per-dispatch allocation. The GS owner clears this before normal descriptor
+  // validation and ownership transfer.
+  GpuVuDraw* path1_next = nullptr;
+
 private:
-  std::vector<VifUnpackSpan> m_input_spans;
+  // Generic affine vertex programs commonly use position, normal, texture,
+  // and one auxiliary stream. Keeping four references inline avoids one heap
+  // promotion per IGA-style three-stream dispatch on the 496 MHz MTVU core.
+  InlineDescriptorVector<VifUnpackSpan, 4> m_input_spans;
 };
 
 u64 NextGpuVuOrderingSequence();
@@ -150,6 +269,23 @@ bool IsDirectDrawAdmissionConnected();
 // PhyreEngine's GXM resource contract: notification values are monotonically
 // increasing modulo 2^32, and any later completed value retires an older one.
 bool HasCompletedNotificationValue(u32 completed, u32 required);
+
+// Why one VU1 dispatch could not become a direct GPU draw. These are semantic
+// groups derived from the analysis and the invocation's own state, never a
+// title, program, hash or instruction-sequence identity.
+enum class AdmissionFailure {
+  Disconnected,
+  NoProgramToken,
+  BuildFailed,
+  QueueRejected,
+  NoInputSpans,
+  NoReadyCandidate,
+  TagMismatch,
+  SeedUnstable,
+  GeometryFailed,
+  InputResolveFailed,
+};
+inline constexpr size_t AdmissionFailureCount = 10;
 
 struct DrawStatistics {
   u64 queued = 0;
@@ -166,13 +302,26 @@ struct DrawStatistics {
   u64 retired_draws = 0;
   u64 retirement_ring_waits = 0;
   u64 notification_waits = 0;
+  u64 descriptor_pool_waits = 0;
+  u64 descriptor_pool_in_use = 0;
+  u64 peak_descriptor_pool_in_use = 0;
+  u32 descriptor_pool_capacity = 0;
   u64 live_draws = 0;
   u64 peak_live_draws = 0;
+  // Phase accounting: what the CPU still executed and still had to publish.
+  u64 cpu_vu1_executions = 0;
+  u64 cpu_path1_packets = 0;
+  u64 cpu_path1_bytes = 0;
+  u64 encoded_objects = 0;
+  std::array<u64, 10> admission_failures{};
 };
 
 void RecordGpuVuDrawQueued();
 void RecordGpuVuDrawConsumed();
 void RecordGpuVuDrawRejected();
+void RecordCpuVu1Execution(u32 path1_packet_bytes);
+void RecordDirectAdmissionFailure(AdmissionFailure reason);
+void RecordGpuVuObjectsEncoded(u64 count);
 void RecordGpuVuDrawExecuted(const GpuVuDraw &draw);
 void RecordGpuVuRetirementBatch();
 void RecordGpuVuDrawsRetired(u64 count);

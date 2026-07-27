@@ -20,6 +20,7 @@ using LowerKind = VUInterpFast::LowerFastKind;
 
 constexpr u32 InvalidValue = 0;
 constexpr size_t MaximumAlternatives = 8;
+constexpr size_t MaximumFinalPaths = 8;
 
 bool Fail(std::string* error, std::string message) {
   if (error)
@@ -81,6 +82,24 @@ struct SymbolicState {
   std::array<std::array<InvocationValueSet, 4>, 32> vf;
 };
 
+struct FinalMemoryWrite {
+  u32 address = InvalidValue;
+  u32 value = InvalidValue;
+  u8 lane = 0;
+};
+
+struct FinalSymbolicState {
+  std::array<u32, 16> vi{};
+  std::vector<FinalMemoryWrite> memory_writes;
+};
+
+struct PendingFinalPath {
+  FinalSymbolicState state;
+  u32 block = 0;
+  u32 predicate = InvalidValue;
+  u32 depth = 0;
+};
+
 struct QwordCopy {
   InvocationValueSet destination;
   InvocationValueSet source;
@@ -130,6 +149,8 @@ public:
     m_plan->loop_counter = header.vi[loop.counter_reg];
 
     if (!FindGifTagSource(header, error))
+      return false;
+    if (!BuildFinalViState(entry_block, loop, error))
       return false;
     if (error)
       error->clear();
@@ -737,6 +758,451 @@ private:
           KnownValue(Constant(lane == 3 ? 0x3f800000u : 0u));
   }
 
+  FinalSymbolicState InitialFinalState() {
+    FinalSymbolicState state;
+    for (u32 reg = 0; reg < state.vi.size(); reg++)
+      state.vi[reg] = InitialVi(reg);
+    state.vi[0] = Constant(0);
+    return state;
+  }
+
+  u32 FinalAddress(const FinalSymbolicState& state, u32 base,
+                   s32 immediate) {
+    if (base >= state.vi.size() || state.vi[base] == InvalidValue)
+      return InvalidValue;
+    return AddConstant(state.vi[base], immediate);
+  }
+
+  u32 ReadFinalMemoryU16(const FinalSymbolicState& state, u32 address,
+                         u32 lane) {
+    if (address == InvalidValue || lane >= 4)
+      return InvalidValue;
+    for (auto write = state.memory_writes.rbegin();
+         write != state.memory_writes.rend(); ++write) {
+      if (write->address == address && write->lane == lane)
+        return write->value;
+    }
+    return Unary(InvocationValueKind::MemoryU16, address, 0,
+                 static_cast<u8>(lane));
+  }
+
+  void WriteFinalMemory(FinalSymbolicState* state, u32 address, u32 lane,
+                        u32 value) {
+    if (address == InvalidValue || value == InvalidValue || lane >= 4)
+      return;
+    state->memory_writes.push_back(
+        {address, value, static_cast<u8>(lane)});
+  }
+
+  void TransferFinalPair(const ProgramPair& pair,
+                         FinalSymbolicState* state) {
+    const VitaVU::GpuPairPlan& plan = pair.plan;
+    const FinalSymbolicState old = *state;
+    const bool execute_lower =
+        plan.exec_lower && !plan.lower_discarded_by_upper;
+    const u32 lower_writes =
+        execute_lower ? (plan.lower_vi_write & 0xffffu) : 0;
+    const u32 upper_writes =
+        plan.exec_upper ? (plan.upper_vi_write & 0xffffu) : 0;
+    m_plan->final_vi_write_mask |= lower_writes | upper_writes;
+    for (u32 reg = 1; reg < state->vi.size(); reg++) {
+      if ((lower_writes & (1u << reg)) != 0)
+        state->vi[reg] = InvalidValue;
+    }
+
+    if (execute_lower) {
+      const LowerKind kind =
+          static_cast<LowerKind>(plan.lower_kind);
+      const u32 code = plan.lower;
+      const u32 is = VUInterpFast::Is(code);
+      const u32 it = VUInterpFast::It(code);
+      const u32 id = VUInterpFast::Id(code);
+      switch (kind) {
+      case LowerKind::IADDIU:
+        if (it != 0)
+          state->vi[it] =
+              AddConstant(old.vi[is], VUInterpFast::Imm15(code));
+        break;
+      case LowerKind::ISUBIU:
+        if (it != 0)
+          state->vi[it] =
+              AddConstant(old.vi[is], -VUInterpFast::Imm15(code));
+        break;
+      case LowerKind::IADDI:
+        if (it != 0)
+          state->vi[it] =
+              AddConstant(old.vi[is], VUInterpFast::Imm5(code));
+        break;
+      case LowerKind::IADD:
+        if (id != 0)
+          state->vi[id] =
+              Binary(InvocationValueKind::AddU16, old.vi[is], old.vi[it]);
+        break;
+      case LowerKind::ISUB:
+        if (id != 0)
+          state->vi[id] = Binary(InvocationValueKind::SubtractU16,
+                                 old.vi[is], old.vi[it]);
+        break;
+      case LowerKind::IAND:
+        if (id != 0)
+          state->vi[id] =
+              Binary(InvocationValueKind::AndU16, old.vi[is], old.vi[it]);
+        break;
+      case LowerKind::IOR:
+        if (id != 0)
+          state->vi[id] =
+              Binary(InvocationValueKind::OrU16, old.vi[is], old.vi[it]);
+        break;
+      case LowerKind::ILW:
+      case LowerKind::ILWR: {
+        if (it == 0)
+          break;
+        const u32 address = FinalAddress(
+            old, is,
+            kind == LowerKind::ILW ? VUInterpFast::Imm11(code) : 0);
+        s32 selected_lane = -1;
+        for (u32 lane = 0; lane < 4; lane++) {
+          if (LaneEnabled(static_cast<u8>(VUInterpFast::XYZW(code)), lane))
+            selected_lane = static_cast<s32>(lane);
+        }
+        state->vi[it] =
+            selected_lane >= 0
+                ? ReadFinalMemoryU16(
+                      old, address, static_cast<u32>(selected_lane))
+                : old.vi[it];
+        break;
+      }
+      case LowerKind::ISW:
+      case LowerKind::ISWR: {
+        const u32 address = FinalAddress(
+            old, is,
+            kind == LowerKind::ISW ? VUInterpFast::Imm11(code) : 0);
+        for (u32 lane = 0; lane < 4; lane++) {
+          if (LaneEnabled(static_cast<u8>(VUInterpFast::XYZW(code)), lane))
+            WriteFinalMemory(state, address, lane, old.vi[it]);
+        }
+        break;
+      }
+      case LowerKind::LQI:
+        if (is != 0)
+          state->vi[is] = AddConstant(old.vi[is], 1);
+        break;
+      case LowerKind::LQD:
+        if (is != 0)
+          state->vi[is] = AddConstant(old.vi[is], -1);
+        break;
+      case LowerKind::SQI:
+        if (it != 0)
+          state->vi[it] = AddConstant(old.vi[it], 1);
+        break;
+      case LowerKind::SQD:
+        if (it != 0)
+          state->vi[it] = AddConstant(old.vi[it], -1);
+        break;
+      case LowerKind::XTOP:
+        if (it != 0)
+          state->vi[it] = VifTop();
+        break;
+      case LowerKind::XITOP:
+        if (it != 0)
+          state->vi[it] = VifItop();
+        break;
+      case LowerKind::BAL:
+      case LowerKind::JALR:
+        if (!pair.delayed_pair && it != 0) {
+          state->vi[it] =
+              Constant(static_cast<u16>((plan.pc + 16) / 8));
+        }
+        break;
+      default:
+        break;
+      }
+    }
+
+    for (u32 reg = 1; reg < state->vi.size(); reg++) {
+      if ((upper_writes & (1u << reg)) != 0)
+        state->vi[reg] = InvalidValue;
+    }
+    state->vi[0] = Constant(0);
+  }
+
+  u32 FinalBranchPredicate(const BasicBlock& block,
+                           const FinalSymbolicState& state) {
+    if (!block.conditional_branch || block.pairs.size() < 2)
+      return InvalidValue;
+    const VitaVU::GpuPairPlan& plan =
+        block.pairs[block.pairs.size() - 2].plan;
+    const LowerKind kind =
+        static_cast<LowerKind>(block.branch_kind);
+    const u32 code = plan.lower;
+    const u32 is = VUInterpFast::Is(code);
+    const u32 it = VUInterpFast::It(code);
+    switch (kind) {
+    case LowerKind::IBEQ:
+      return Binary(InvocationValueKind::EqualU16,
+                    state.vi[is], state.vi[it]);
+    case LowerKind::IBNE:
+      return Binary(InvocationValueKind::NotEqualU16,
+                    state.vi[is], state.vi[it]);
+    case LowerKind::IBLTZ:
+      return Unary(InvocationValueKind::LessThanZeroS16, state.vi[is]);
+    case LowerKind::IBGTZ:
+      return Unary(InvocationValueKind::GreaterThanZeroS16, state.vi[is]);
+    case LowerKind::IBLEZ:
+      return Unary(InvocationValueKind::LessEqualZeroS16, state.vi[is]);
+    case LowerKind::IBGEZ:
+      return Unary(InvocationValueKind::GreaterEqualZeroS16, state.vi[is]);
+    default:
+      return InvalidValue;
+    }
+  }
+
+  u32 CombinePredicate(u32 left, u32 right) {
+    if (left == InvalidValue || right == InvalidValue)
+      return InvalidValue;
+    return Binary(InvocationValueKind::BooleanAnd, left, right);
+  }
+
+  u32 NegatePredicate(u32 predicate) {
+    return Unary(InvocationValueKind::BooleanNot, predicate);
+  }
+
+  bool ApplyFinalLoop(const NaturalLoop& loop, FinalSymbolicState* state,
+                      u32* exit_block, std::string* error) {
+    if (loop.blocks.size() != 1 ||
+        loop.header_block != loop.latch_block ||
+        loop.header_block >= m_program.blocks.size()) {
+      return Fail(error,
+                  "final VI state requires one affine natural-loop block");
+    }
+    const BasicBlock& block = m_program.blocks[loop.header_block];
+    if (!loop.affine_counter || loop.counter_reg == 0 ||
+        loop.counter_reg >= state->vi.size() ||
+        block.pairs.size() < 2) {
+      return Fail(error,
+                  "final VI state requires a counted natural loop");
+    }
+
+    const LowerKind branch_kind =
+        static_cast<LowerKind>(block.branch_kind);
+    const bool repeats_while_nonzero =
+        (branch_kind == LowerKind::IBNE && loop.branch_taken_repeats) ||
+        (branch_kind == LowerKind::IBEQ && !loop.branch_taken_repeats);
+    if (!repeats_while_nonzero ||
+        (loop.counter_step != -1 && loop.counter_step != 1)) {
+      return Fail(error,
+                  "final VI state requires a unit-step count-to-zero loop");
+    }
+
+    const u32 branch_pair_index =
+        static_cast<u32>(block.pairs.size() - 2);
+    if (branch_pair_index >= m_kernel.vi.prefix[loop.counter_reg].size()) {
+      return Fail(error, "final VI loop branch prefix is missing");
+    }
+    const s32 branch_prefix =
+        m_kernel.vi.prefix[loop.counter_reg][branch_pair_index];
+    const u32 first_branch_value =
+        AddConstant(state->vi[loop.counter_reg], branch_prefix);
+    if (first_branch_value == InvalidValue)
+      return Fail(error, "final VI loop counter is unresolved");
+
+    InvocationValueNode iterations_node;
+    iterations_node.kind = InvocationValueKind::CountUntilZeroU16;
+    iterations_node.operands[0] = first_branch_value;
+    iterations_node.immediate =
+        static_cast<u32>(loop.counter_step);
+    const u32 iterations = AddNode(iterations_node);
+
+    u32 written = 0;
+    for (const ProgramPair& pair : block.pairs) {
+      if (pair.plan.exec_lower &&
+          !pair.plan.lower_discarded_by_upper) {
+        written |= pair.plan.lower_vi_write & 0xffffu;
+      }
+      if (pair.plan.exec_upper)
+        written |= pair.plan.upper_vi_write & 0xffffu;
+      const LowerKind kind =
+          static_cast<LowerKind>(pair.plan.lower_kind);
+      if (pair.plan.exec_lower &&
+          !pair.plan.lower_discarded_by_upper &&
+          (kind == LowerKind::ISW || kind == LowerKind::ISWR)) {
+        return Fail(error,
+                    "final VI state cannot fold a loop-carried VI store");
+      }
+    }
+    written &= 0xfffeu;
+    if ((written & ~m_kernel.vi.affine_mask) != 0) {
+      return Fail(error,
+                  "final VI state has a non-affine loop register");
+    }
+    m_plan->final_vi_write_mask |= written;
+    for (u32 reg = 1; reg < state->vi.size(); reg++) {
+      if ((written & (1u << reg)) == 0)
+        continue;
+      InvocationValueNode final_node;
+      final_node.kind = InvocationValueKind::ScaleAddU16;
+      final_node.operands = {state->vi[reg], iterations};
+      final_node.immediate =
+          static_cast<u32>(m_kernel.vi.step[reg]);
+      state->vi[reg] = AddNode(final_node);
+    }
+    state->vi[0] = Constant(0);
+
+    bool found_exit = false;
+    for (const ControlEdge& edge : block.successors) {
+      if (!edge.has_target ||
+          edge.target_block == loop.header_block)
+        continue;
+      if (found_exit)
+        return Fail(error, "final VI loop has multiple exit blocks");
+      *exit_block = edge.target_block;
+      found_exit = true;
+    }
+    return found_exit ||
+           Fail(error, "final VI loop has no internal exit block");
+  }
+
+  bool AppendFinalAlternative(const PendingFinalPath& path,
+                              std::string* error) {
+    if (m_plan->final_vi_alternatives.size() >= MaximumFinalPaths) {
+      return Fail(error, "final VI state has too many control paths");
+    }
+    FinalViAlternative alternative;
+    alternative.predicate = path.predicate;
+    alternative.values = path.state.vi;
+    for (u32 reg = 1; reg < alternative.values.size(); reg++) {
+      if ((m_plan->final_vi_write_mask & (1u << reg)) != 0 &&
+          alternative.values[reg] == InvalidValue) {
+        return Fail(error,
+                    "final VI state contains an unresolved written register");
+      }
+    }
+    m_plan->final_vi_alternatives.push_back(std::move(alternative));
+    return true;
+  }
+
+  bool BuildFinalViState(u32 entry_block, const NaturalLoop& loop,
+                         std::string* error) {
+    m_plan->final_vi_alternatives.clear();
+    m_plan->final_vi_write_mask = 0;
+    m_plan->has_final_vi_state = false;
+    if (entry_block >= m_program.blocks.size())
+      return Fail(error, "final VI state has no entry block");
+    if (loop.blocks.size() != 1 ||
+        loop.header_block != loop.latch_block) {
+      return Fail(error,
+                  "final VI state requires one affine natural loop");
+    }
+
+    std::vector<PendingFinalPath> work;
+    PendingFinalPath entry;
+    entry.block = entry_block;
+    entry.predicate = Constant(1);
+    entry.state = InitialFinalState();
+    work.push_back(std::move(entry));
+    u32 transfers = 0;
+    const u32 transfer_limit =
+        static_cast<u32>(m_program.blocks.size() * MaximumFinalPaths * 2);
+
+    while (!work.empty()) {
+      PendingFinalPath path = std::move(work.back());
+      work.pop_back();
+      if (path.block >= m_program.blocks.size() ||
+          ++transfers > transfer_limit ||
+          path.depth > m_program.blocks.size() * 2) {
+        return Fail(error,
+                    "final VI state control traversal did not converge");
+      }
+
+      const BasicBlock& block = m_program.blocks[path.block];
+      if (path.block == loop.header_block) {
+        u32 exit_block = 0;
+        if (!ApplyFinalLoop(loop, &path.state, &exit_block, error))
+          return false;
+        path.block = exit_block;
+        path.depth++;
+        work.push_back(std::move(path));
+        continue;
+      }
+      if (std::find(loop.blocks.begin(), loop.blocks.end(),
+                    path.block) != loop.blocks.end()) {
+        return Fail(error,
+                    "final VI state entered a natural loop below its header");
+      }
+
+      u32 branch_predicate = InvalidValue;
+      for (u32 pair_index = 0; pair_index < block.pairs.size();
+           pair_index++) {
+        if (block.conditional_branch &&
+            pair_index + 2 == block.pairs.size()) {
+          branch_predicate =
+              FinalBranchPredicate(block, path.state);
+          if (branch_predicate == InvalidValue) {
+            return Fail(error,
+                        "final VI branch predicate is unresolved");
+          }
+        }
+        TransferFinalPair(block.pairs[pair_index], &path.state);
+      }
+
+      if (block.ends_program) {
+        if (!AppendFinalAlternative(path, error))
+          return false;
+        continue;
+      }
+
+      u32 target_edges = 0;
+      for (const ControlEdge& edge : block.successors) {
+        if (edge.kind == ControlEdgeKind::ProgramExit) {
+          if (!AppendFinalAlternative(path, error))
+            return false;
+          continue;
+        }
+        if (!edge.has_target) {
+          return Fail(error,
+                      "final VI state reaches an external control exit");
+        }
+
+        PendingFinalPath next = path;
+        next.block = edge.target_block;
+        next.depth++;
+        if (block.conditional_branch &&
+            (edge.kind == ControlEdgeKind::BranchTaken ||
+             edge.kind == ControlEdgeKind::BranchNotTaken)) {
+          if (branch_predicate == InvalidValue) {
+            return Fail(error,
+                        "final VI conditional edge has no predicate");
+          }
+          const u32 edge_predicate =
+              edge.kind == ControlEdgeKind::BranchTaken
+                  ? branch_predicate
+                  : NegatePredicate(branch_predicate);
+          next.predicate =
+              CombinePredicate(path.predicate, edge_predicate);
+          if (next.predicate == InvalidValue)
+            return Fail(error, "final VI path predicate is unresolved");
+        } else {
+          target_edges++;
+        }
+        work.push_back(std::move(next));
+        if (work.size() +
+                m_plan->final_vi_alternatives.size() >
+            MaximumFinalPaths) {
+          return Fail(error, "final VI state has too many live paths");
+        }
+      }
+      if (!block.conditional_branch && target_edges > 1) {
+        return Fail(error,
+                    "final VI state has ambiguous indirect control");
+      }
+    }
+
+    if (m_plan->final_vi_alternatives.empty())
+      return Fail(error, "final VI state has no program exit");
+    m_plan->has_final_vi_state = true;
+    return true;
+  }
+
   bool FindGifTagSource(const SymbolicState& header,
                         std::string* error) {
     if (m_kernel.stores.empty())
@@ -786,24 +1252,23 @@ private:
 
 bool EvaluateNode(const ParallelInvocationPlan& plan, u32 id,
                   const InvocationEvaluationContext& context,
-                  std::map<u32, u32>* cache, std::set<u32>* active,
-                  u32* result) {
-  if (id == InvalidValue || id >= plan.values.size() ||
-      !result)
+                  InvocationEvaluationWorkspace* workspace, u32* result) {
+  if (id == InvalidValue || id >= plan.values.size() || !workspace ||
+      workspace->values.size() < plan.values.size() ||
+      workspace->states.size() < plan.values.size() || !result)
     return false;
-  const auto cached = cache->find(id);
-  if (cached != cache->end()) {
-    *result = cached->second;
+  if (workspace->states[id] == 2) {
+    *result = workspace->values[id];
     return true;
   }
-  if (!active->insert(id).second)
+  if (workspace->states[id] == 1)
     return false;
+  workspace->states[id] = 1;
   const InvocationValueNode& node = plan.values[id];
   u32 left = 0;
   u32 right = 0;
   const auto operand = [&](u32 index, u32* value) {
-    return EvaluateNode(plan, node.operands[index], context, cache,
-                        active, value);
+    return EvaluateNode(plan, node.operands[index], context, workspace, value);
   };
   bool ok = true;
   switch (node.kind) {
@@ -876,15 +1341,86 @@ bool EvaluateNode(const ParallelInvocationPlan& plan, u32 id,
           node.lane, result);
     }
     break;
+  case InvocationValueKind::EqualU16:
+    ok = operand(0, &left) && operand(1, &right);
+    if (ok)
+      *result = static_cast<u16>(left) == static_cast<u16>(right);
+    break;
+  case InvocationValueKind::NotEqualU16:
+    ok = operand(0, &left) && operand(1, &right);
+    if (ok)
+      *result = static_cast<u16>(left) != static_cast<u16>(right);
+    break;
+  case InvocationValueKind::LessThanZeroS16:
+    ok = operand(0, &left);
+    if (ok)
+      *result = static_cast<s16>(left) < 0;
+    break;
+  case InvocationValueKind::GreaterThanZeroS16:
+    ok = operand(0, &left);
+    if (ok)
+      *result = static_cast<s16>(left) > 0;
+    break;
+  case InvocationValueKind::LessEqualZeroS16:
+    ok = operand(0, &left);
+    if (ok)
+      *result = static_cast<s16>(left) <= 0;
+    break;
+  case InvocationValueKind::GreaterEqualZeroS16:
+    ok = operand(0, &left);
+    if (ok)
+      *result = static_cast<s16>(left) >= 0;
+    break;
+  case InvocationValueKind::BooleanAnd:
+    ok = operand(0, &left) && operand(1, &right);
+    if (ok)
+      *result = (left != 0) && (right != 0);
+    break;
+  case InvocationValueKind::BooleanNot:
+    ok = operand(0, &left);
+    if (ok)
+      *result = left == 0;
+    break;
+  case InvocationValueKind::CountUntilZeroU16:
+    ok = operand(0, &left);
+    if (ok) {
+      const u32 first = static_cast<u16>(left);
+      const s32 step = static_cast<s32>(node.immediate);
+      if (step == -1)
+        *result = first + 1u;
+      else if (step == 1)
+        *result = ((0x10000u - first) & 0xffffu) + 1u;
+      else
+        ok = false;
+    }
+    break;
+  case InvocationValueKind::ScaleAddU16:
+    ok = operand(0, &left) && operand(1, &right);
+    if (ok) {
+      const s64 scaled =
+          static_cast<s64>(static_cast<s32>(node.immediate)) *
+          static_cast<s64>(right);
+      *result = static_cast<u16>(
+          static_cast<s64>(static_cast<u16>(left)) + scaled);
+    }
+    break;
   }
-  active->erase(id);
-  if (!ok)
+  if (!ok) {
+    workspace->states[id] = 0;
     return false;
-  cache->emplace(id, *result);
+  }
+  workspace->values[id] = *result;
+  workspace->states[id] = 2;
   return true;
 }
 
 } // namespace
+
+void InvocationEvaluationWorkspace::Begin(size_t node_count) {
+  values.resize(node_count);
+  states.resize(node_count);
+  std::fill(states.begin(), states.end(), 0);
+}
 
 bool BuildParallelInvocationPlan(const ProgramAnalysis& program,
                                  const ParallelLoopKernel& kernel,
@@ -902,16 +1438,26 @@ bool EvaluateInvocationValue(const ParallelInvocationPlan& plan,
                              const InvocationValueSet& value,
                              const InvocationEvaluationContext& context,
                              u32* result) {
+  InvocationEvaluationWorkspace workspace;
+  workspace.Begin(plan.values.size());
+  return EvaluateInvocationValue(plan, value, context, &workspace, result);
+}
+
+bool EvaluateInvocationValue(const ParallelInvocationPlan& plan,
+                             const InvocationValueSet& value,
+                             const InvocationEvaluationContext& context,
+                             InvocationEvaluationWorkspace* workspace,
+                             u32* result) {
   if (!result || value.unknown || value.alternatives.empty())
     return false;
-  std::map<u32, u32> cache;
+  if (!workspace || workspace->values.size() < plan.values.size() ||
+      workspace->states.size() < plan.values.size())
+    return false;
   u32 common = 0;
   bool have_common = false;
   for (const u32 alternative : value.alternatives) {
-    std::set<u32> active;
     u32 evaluated = 0;
-    if (!EvaluateNode(plan, alternative, context, &cache, &active,
-                      &evaluated)) {
+    if (!EvaluateNode(plan, alternative, context, workspace, &evaluated)) {
       return false;
     }
     if (!have_common) {
@@ -923,6 +1469,59 @@ bool EvaluateInvocationValue(const ParallelInvocationPlan& plan,
   }
   *result = common;
   return have_common;
+}
+
+bool EvaluateFinalViState(const ParallelInvocationPlan& plan,
+                          const InvocationEvaluationContext& context,
+                          std::array<u16, 16>* values, u32* write_mask) {
+  InvocationEvaluationWorkspace workspace;
+  workspace.Begin(plan.values.size());
+  return EvaluateFinalViState(plan, context, &workspace, values, write_mask);
+}
+
+bool EvaluateFinalViState(const ParallelInvocationPlan& plan,
+                          const InvocationEvaluationContext& context,
+                          InvocationEvaluationWorkspace* workspace,
+                          std::array<u16, 16>* values, u32* write_mask) {
+  if (!values || !write_mask || !plan.has_final_vi_state ||
+      plan.final_vi_alternatives.empty() || !context.initial_vi ||
+      !workspace || workspace->values.size() < plan.values.size() ||
+      workspace->states.size() < plan.values.size()) {
+    return false;
+  }
+
+  const FinalViAlternative* selected = nullptr;
+  for (const FinalViAlternative& alternative :
+       plan.final_vi_alternatives) {
+    u32 predicate = 0;
+    if (!EvaluateNode(plan, alternative.predicate, context, workspace,
+                      &predicate)) {
+      return false;
+    }
+    if (predicate == 0)
+      continue;
+    if (selected)
+      return false;
+    selected = &alternative;
+  }
+  if (!selected)
+    return false;
+
+  for (u32 reg = 0; reg < values->size(); reg++)
+    (*values)[reg] = context.initial_vi[reg];
+  for (u32 reg = 1; reg < values->size(); reg++) {
+    if ((plan.final_vi_write_mask & (1u << reg)) == 0)
+      continue;
+    u32 value = 0;
+    if (!EvaluateNode(plan, selected->values[reg], context, workspace,
+                      &value)) {
+      return false;
+    }
+    (*values)[reg] = static_cast<u16>(value);
+  }
+  (*values)[0] = 0;
+  *write_mask = plan.final_vi_write_mask & 0xfffeu;
+  return true;
 }
 
 } // namespace VitaGpuVu

@@ -6,6 +6,7 @@
 #include "HostSys.h"
 #include "Threading.h"
 
+#include <cstring>
 #include <mutex>
 
 #ifdef _WIN32
@@ -17,7 +18,6 @@
 #ifdef __UNIX__
 #include <signal.h>
 #endif
-
 static std::mutex s_assertion_failed_mutex;
 
 static inline void FreezeThreads(void** handle)

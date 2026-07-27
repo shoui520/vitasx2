@@ -3,6 +3,7 @@
 
 #include "Common.h"
 #include "DebugTools/VifTrace.h"
+#include "MTVU.h"
 #include "Vif_Dma.h"
 #include "Vif_Dynarec.h"
 
@@ -122,5 +123,8 @@ bool VIF0transfer(u32 *data, int size, bool TTE) {
 	return vifTransfer<0>(data, size, TTE);
 }
 bool VIF1transfer(u32 *data, int size, bool TTE) {
-	return vifTransfer<1>(data, size, TTE);
+	const bool result = vifTransfer<1>(data, size, TTE);
+	if (THREAD_VU1)
+		vu1Thread.PublishPendingVifBatch();
+	return result;
 }

@@ -94,6 +94,11 @@ public:
     }
 
     CollectResources();
+    if (m_program->uses_buffered_batch_inputs &&
+        m_program->memory_inputs.empty()) {
+      return Fail(error,
+                  "parallel buffered Cg root has no raw VIF inputs");
+    }
     if (m_program->memory_inputs.size() > MaximumMemoryInputs)
       return Fail(error, "parallel Cg root exceeds GXM vertex input capacity");
     if (m_program->constant_inputs.size() > MaximumConstantInputs)
@@ -110,7 +115,8 @@ public:
           attribute_count++;
       }
     }
-    if (attribute_count > MaximumVertexAttributes) {
+    if (!m_program->uses_buffered_batch_inputs &&
+        attribute_count > MaximumVertexAttributes) {
       return Fail(error,
                   "parallel flat Cg root exceeds GXM attribute capacity");
     }
@@ -141,27 +147,50 @@ private:
 
     switch (m_direct_contract->primitive) {
     case GS_LINELIST:
+      if ((m_direct_contract->vertex_count & 1u) != 0)
+        return Fail(error, "flat line list has an odd vertex count");
       m_program->flat_vertices_per_primitive = 2;
       m_program->flat_instance_vertex_step = 2;
+      m_program->batch_primitives_per_draw =
+          static_cast<u16>(m_direct_contract->vertex_count / 2);
       break;
     case GS_LINESTRIP:
+      if (m_direct_contract->vertex_count < 2)
+        return Fail(error, "flat line strip is too short");
       m_program->flat_vertices_per_primitive = 2;
       m_program->flat_instance_vertex_step = 1;
+      m_program->batch_primitives_per_draw =
+          static_cast<u16>(m_direct_contract->vertex_count - 1);
       break;
     case GS_TRIANGLELIST:
+      if ((m_direct_contract->vertex_count % 3u) != 0)
+        return Fail(error, "flat triangle list has a partial primitive");
       m_program->flat_vertices_per_primitive = 3;
       m_program->flat_instance_vertex_step = 3;
+      m_program->batch_primitives_per_draw =
+          static_cast<u16>(m_direct_contract->vertex_count / 3);
       break;
     case GS_TRIANGLESTRIP:
+      if (m_direct_contract->vertex_count < 3)
+        return Fail(error, "flat triangle strip is too short");
       m_program->flat_vertices_per_primitive = 3;
       m_program->flat_instance_vertex_step = 1;
+      m_program->batch_primitives_per_draw =
+          static_cast<u16>(m_direct_contract->vertex_count - 2);
       m_program->flat_strip_winding = true;
       break;
     default:
       return Fail(error,
                   "flat primitive requires a GPU export output lowering");
     }
+    if (m_program->batch_primitives_per_draw == 0)
+      return Fail(error, "flat primitive batch is empty");
     m_program->uses_flat_instance_inputs = true;
+    // Sony's skinning sample establishes dynamically indexed vertex uniform
+    // buffers as the native way to read mapped arrays. One descriptor record
+    // per VU dispatch lets a single instance range cross immutable VIF payload
+    // boundaries without copying or CPU-unpacking any vertex.
+    m_program->uses_buffered_batch_inputs = true;
     return true;
   }
 
@@ -236,6 +265,22 @@ private:
     return true;
   }
 
+  // A stable lane which the region nonetheless clamps must be re-verified
+  // against its runtime seed by the descriptor path, so carry the bound into
+  // the generated program's contract.
+  void RecordClampStableLane(u8 reg, u8 lane) {
+    for (const ClampStableLane &clamp : m_kernel.clamp_stable_lanes) {
+      if (clamp.reg != reg || clamp.lane != lane)
+        continue;
+      for (const ClampStableLane &recorded : m_program->clamp_stable_lanes) {
+        if (recorded == clamp)
+          return;
+      }
+      m_program->clamp_stable_lanes.push_back(clamp);
+      return;
+    }
+  }
+
   void CollectResources() {
     std::map<MemoryKey, u32> memory_indices;
     std::map<MemoryKey, u32> constant_indices;
@@ -281,6 +326,8 @@ private:
         if ((m_kernel.stable_initial_vf_lanes[node.reg] &
              (0x8u >> node.lane)) == 0) {
           m_program->requires_dynamic_entry_state = true;
+        } else {
+          RecordClampStableLane(node.reg, node.lane);
         }
         break;
       case ExpressionKind::InitialAcc:
@@ -362,6 +409,10 @@ private:
     m_source += std::to_string(m_program->flat_vertices_per_primitive);
     m_source += " flatStep=";
     m_source += std::to_string(m_program->flat_instance_vertex_step);
+    m_source += " batchPrimitives=";
+    m_source += std::to_string(m_program->batch_primitives_per_draw);
+    m_source += " bufferedBatch=";
+    m_source += m_program->uses_buffered_batch_inputs ? "1" : "0";
     m_source += " stripWinding=";
     m_source += m_program->flat_strip_winding ? "1\n" : "0\n";
     m_source += "// GXM constant qwords=";
@@ -467,23 +518,33 @@ private:
     m_source += "void main(\n";
     u32 attribute_semantic = 0;
     if (m_program->uses_flat_instance_inputs) {
-      for (const CgMemoryInput &input : m_program->memory_inputs) {
-        for (u32 vertex = 0;
-             vertex < m_program->flat_vertices_per_primitive; vertex++) {
-          if ((input.flat_attribute_vertex_mask & (1u << vertex)) == 0)
-            continue;
-          AppendParameter("__regformat int4 VuMemory" +
-                          std::to_string(input.attribute_index) + "Vertex" +
-                          std::to_string(vertex) + " : TEXCOORD" +
-                          std::to_string(attribute_semantic++));
+      if (m_program->uses_buffered_batch_inputs) {
+        AppendParameter(
+            "uniform int4 VuRawQwords[" +
+            std::to_string(GeneratedCgProgram::DeclaredBufferVectors) +
+            "] : BUFFER[0]");
+        AppendParameter(
+            "uniform int4 VuBatchBindings[" +
+            std::to_string(GeneratedCgProgram::DeclaredBufferVectors) +
+            "] : BUFFER[1]");
+      } else {
+        for (const CgMemoryInput &input : m_program->memory_inputs) {
+          for (u32 vertex = 0;
+               vertex < m_program->flat_vertices_per_primitive; vertex++) {
+            if ((input.flat_attribute_vertex_mask & (1u << vertex)) == 0)
+              continue;
+            AppendParameter("__regformat int4 VuMemory" +
+                            std::to_string(input.attribute_index) + "Vertex" +
+                            std::to_string(vertex) + " : TEXCOORD" +
+                            std::to_string(attribute_semantic++));
+          }
         }
       }
       // PSP2 Shader Compiler User's Guide: INDEX and INSTANCE are special
       // vertex inputs allocated after ordinary parameters. They do not
       // consume a SceGxmVertexAttribute or an additional stream.
       AppendParameter("unsigned int VuLane : INDEX");
-      if (m_program->flat_strip_winding)
-        AppendParameter("unsigned int VuPrimitive : INSTANCE");
+      AppendParameter("unsigned int VuPrimitive : INSTANCE");
     } else {
       for (const CgMemoryInput &input : m_program->memory_inputs) {
         AppendParameter("__regformat int4 VuMemory" +
@@ -530,6 +591,70 @@ private:
     m_source += ")\n{\n";
     if (m_program->uses_flat_instance_inputs) {
       m_source += "\tconst int VuInputLane = int(VuLane);\n";
+      if (m_program->uses_buffered_batch_inputs) {
+        const u32 binding_vectors =
+            (static_cast<u32>(m_program->memory_inputs.size()) + 3u) / 4u;
+        static constexpr std::array<const char *, 4> components = {
+            "x", "y", "z", "w"};
+        const u32 primitives_per_draw =
+            m_program->batch_primitives_per_draw;
+        if ((primitives_per_draw & (primitives_per_draw - 1u)) == 0)
+        {
+          u32 shift = 0;
+          while ((1u << shift) != primitives_per_draw)
+            shift++;
+          // SGX543 has no general integer divide. Express the overwhelmingly
+          // common power-of-two case directly so the installed SDK 3.0
+          // runtime compiler does not have to discover this lowering across
+          // the complete generated VU expression graph.
+          m_source +=
+              "\tconst unsigned int VuBatchDraw = VuPrimitive >> ";
+          m_source += std::to_string(shift);
+          m_source += "u;\n\tconst unsigned int VuLocalPrimitive = "
+                      "VuPrimitive & ";
+          m_source += std::to_string(primitives_per_draw - 1u);
+          m_source += "u;\n";
+        }
+        else
+        {
+          m_source +=
+              "\tconst unsigned int VuBatchDraw = VuPrimitive / ";
+          m_source += std::to_string(primitives_per_draw);
+          m_source +=
+              "u;\n\tconst unsigned int VuLocalPrimitive = VuPrimitive - "
+              "VuBatchDraw * ";
+          m_source += std::to_string(primitives_per_draw);
+          m_source += "u;\n";
+        }
+        for (const CgMemoryInput &input : m_program->memory_inputs) {
+          const u32 binding_vector = input.attribute_index / 4u;
+          const u32 binding_component = input.attribute_index & 3u;
+          for (u32 vertex = 0;
+               vertex < m_program->flat_vertices_per_primitive; vertex++) {
+            if ((input.flat_attribute_vertex_mask & (1u << vertex)) == 0)
+              continue;
+            m_source += "\tconst int4 VuMemory";
+            m_source += std::to_string(input.attribute_index);
+            m_source += "Vertex";
+            m_source += std::to_string(vertex);
+            m_source += " = VuRawQwords[VuBatchBindings[VuBatchDraw * ";
+            m_source += std::to_string(binding_vectors);
+            m_source += " + ";
+            m_source += std::to_string(binding_vector);
+            m_source += "].";
+            m_source += components[binding_component];
+            m_source += " + (VuLocalPrimitive * ";
+            m_source +=
+                std::to_string(m_program->flat_instance_vertex_step);
+            m_source += " + ";
+            m_source += std::to_string(vertex);
+            m_source += ") * ";
+            m_source += std::to_string(
+                input.address.invocation_coefficient);
+            m_source += "];\n";
+          }
+        }
+      }
       if (m_program->flat_strip_winding) {
         m_source +=
             "\tconst bool VuSwapStripLane = ((VuPrimitive & 1u) != 0u) "
@@ -712,28 +837,55 @@ private:
     return {};
   }
 
+  // Emits one node after its operands. Node ids are not a valid ordering:
+  // InlineAcyclicEntrySlice appends entry-region nodes with higher ids than
+  // the loop nodes it then rewrites to consume them, so ascending-id emission
+  // produces forward references that Cg rejects as undeclared identifiers.
+  bool AppendNode(u32 node_id, const std::vector<bool> &reachable,
+                  bool flat_color, std::vector<bool> *visiting,
+                  std::vector<bool> *emitted, std::string *error) {
+    if (node_id == InvalidNode || !reachable[node_id] || (*emitted)[node_id])
+      return true;
+    if ((*visiting)[node_id]) {
+      return Fail(error, "parallel Cg root has a cyclic expression slice");
+    }
+    (*visiting)[node_id] = true;
+    for (const u32 operand : m_kernel.expressions[node_id].operands) {
+      if (!AppendNode(operand, reachable, flat_color, visiting, emitted,
+                      error)) {
+        return false;
+      }
+    }
+    (*visiting)[node_id] = false;
+
+    const std::string expression = NodeExpression(node_id, flat_color, error);
+    if (error && !error->empty())
+      return false;
+    m_source += "\t";
+    m_source += ScalarType(m_kernel.expressions[node_id].domain);
+    m_source += " ";
+    m_source += Value(node_id, flat_color);
+    m_source += " = ";
+    m_source += expression;
+    m_source += ";\n";
+    (*emitted)[node_id] = true;
+    m_program->emitted_expression_count++;
+    return true;
+  }
+
   void AppendExpressions(std::string *error) {
-    const auto append_set =
-        [this, error](const std::vector<bool> &reachable, bool flat_color) {
-          for (u32 node_id = 1; node_id < m_kernel.expressions.size();
-               node_id++) {
-            if (!reachable[node_id])
-              continue;
-            const std::string expression =
-                NodeExpression(node_id, flat_color, error);
-            if (error && !error->empty())
-              return false;
-            m_source += "\t";
-            m_source += ScalarType(m_kernel.expressions[node_id].domain);
-            m_source += " ";
-            m_source += Value(node_id, flat_color);
-            m_source += " = ";
-            m_source += expression;
-            m_source += ";\n";
-            m_program->emitted_expression_count++;
-          }
-          return true;
-        };
+    const auto append_set = [this, error](const std::vector<bool> &reachable,
+                                          bool flat_color) {
+      std::vector<bool> visiting(m_kernel.expressions.size(), false);
+      std::vector<bool> emitted(m_kernel.expressions.size(), false);
+      for (u32 node_id = 1; node_id < m_kernel.expressions.size(); node_id++) {
+        if (!AppendNode(node_id, reachable, flat_color, &visiting, &emitted,
+                        error)) {
+          return false;
+        }
+      }
+      return true;
+    };
     if (!append_set(m_reachable, false))
       return;
     append_set(m_flat_color_reachable, true);

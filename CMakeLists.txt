@@ -114,6 +114,16 @@ if(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY)
 	add_compile_definitions(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY=1)
 endif()
 
+option(VITASX2_GPU_VU_DIRECT_ADMISSION
+	"Enable the generated affine VU1+TFX command-chain hardware milestone."
+	OFF)
+if(VITASX2_GPU_VU_DIRECT_ADMISSION)
+	# Keep this process-wide: VIF capture, MTVU ownership, the GS mailbox, and
+	# GSDeviceGXM must agree whether immutable input spans can replace CPU VU
+	# execution. The normal disconnected product compiles out all capture work.
+	add_compile_definitions(VITASX2_GPU_VU_DIRECT_ADMISSION=1)
+endif()
+
 # Target CPU contract: Cortex-A9 MPCore, VFPv3, NEON, hard-float.
 # NEON is mandatory (see docs/ps2-vita/GENERIC_CORTEX_A9_OPTIMIZATION.md).
 add_compile_options(

@@ -6,10 +6,12 @@
 #include "GS/Renderers/Common/GSDevice.h"
 
 #include <memory>
+#include <vector>
 
 namespace VitaGpuVu
 {
 	class GpuVuDraw;
+	struct RawVifPayloadRef;
 }
 
 struct VitaGxmPerformanceCounters
@@ -173,10 +175,22 @@ public:
 	// libGXM registration/patcher operation on the context-owning thread.
 	void PollGpuVuPrograms();
 
+	// Submits any direct GPU-VU descriptors accumulated during this guest frame
+	// so a skipped presentation cannot merge many frames into one GXM scene.
+	void EndGpuVuEpoch();
+
+	// GS-worker-only. On immutable-input ring pressure, submits any current
+	// direct scene and retires the oldest scene which still owns raw VIF input.
+	// This may wait only because the producer is reusing exhausted ring storage.
+	bool WaitForGpuVuInputRetirement(
+		const VitaGpuVu::RawVifPayloadRef& blocked_generation);
+
 	// GS-worker-only. Encodes one already-validated direct VU+TFX descriptor
 	// with the supplied PCSX2 draw state. No GSVertex/TfxVertex staging occurs.
 	bool RenderGpuVuDraw(GSHWDrawConfig& config,
 		std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
+	bool RenderGpuVuDraws(GSHWDrawConfig& config,
+		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws);
 
 	// GS-worker-only. Called immediately after a native GPU-VU draw has been
 	// encoded; ownership is held until its scene's vertex notification retires.

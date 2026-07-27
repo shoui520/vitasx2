@@ -9,10 +9,12 @@
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSVertex.h"
 #include "common/Console.h"
+#include "common/Timer.h"
 #include "vita/VitaGpuVuDraw.h"
 #include "vita/VitaGpuVuProgramRegistry.h"
 #include "vita/VitaGpuVuShaderCompiler.h"
 #include "vita/VitaGpuVuVifInput.h"
+#include "vita/VitaGsMailbox.h"
 #include "vita/VitaGxmArena.h"
 #include "vita/VitaGxmDisplay.h"
 #include "vita/VitaGxmMemory.h"
@@ -1046,6 +1048,76 @@ static bool GpuVuNotificationReached(
 		*notification.address, notification.value);
 }
 
+using GpuVuInputRetentions =
+	std::array<VitaGpuVu::RawVifPayloadRef, VitaGpuVu::InputRingSlotCount>;
+
+static bool SameGpuVuInputSlot(const VitaGpuVu::RawVifPayloadRef& left,
+	const VitaGpuVu::RawVifPayloadRef& right)
+{
+	return left.owner == right.owner && left.slot == right.slot &&
+		left.generation == right.generation;
+}
+
+static bool ContainsGpuVuInputSlot(const GpuVuInputRetentions& retentions,
+	u32 retention_count,
+	const VitaGpuVu::RawVifPayloadRef& payload)
+{
+	for (u32 index = 0; index < retention_count; index++)
+	{
+		if (SameGpuVuInputSlot(retentions[index], payload))
+			return true;
+	}
+	return false;
+}
+
+static bool RetainGpuVuInputSlot(const VitaGpuVu::RawVifPayloadRef& payload,
+	GpuVuInputRetentions* retentions, u32* retention_count)
+{
+	if (!retentions || !retention_count || !payload.IsValid())
+		return false;
+	for (u32 index = 0; index < *retention_count; index++)
+	{
+		if (SameGpuVuInputSlot((*retentions)[index], payload))
+			return true;
+	}
+	if (*retention_count >= retentions->size() ||
+		!VitaGpuVu::RetainRawVifPayload(payload))
+	{
+		return false;
+	}
+	(*retentions)[*retention_count] = payload;
+	(*retention_count)++;
+	return true;
+}
+
+static void ReleaseGpuVuInputSlots(GpuVuInputRetentions* retentions,
+	u32* retention_count, u32 keep_count = 0)
+{
+	if (!retentions || !retention_count)
+		return;
+	while (*retention_count > keep_count)
+	{
+		(*retention_count)--;
+		VitaGpuVu::ReleaseRawVifPayload(
+			&(*retentions)[*retention_count]);
+	}
+}
+
+static void MoveGpuVuInputSlots(GpuVuInputRetentions* destination,
+	u32* destination_count, GpuVuInputRetentions* source,
+	u32* source_count)
+{
+	pxAssert(destination && destination_count && source && source_count);
+	pxAssert(*destination_count == 0);
+	for (u32 index = 0; index < *source_count; index++)
+	{
+		(*destination)[index] = (*source)[index];
+		(*source)[index] = {};
+	}
+	*destination_count = *source_count;
+	*source_count = 0;
+}
+
 struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 {
 	struct GeneratedVuProgram
@@ -1077,7 +1149,11 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	struct GpuVuRetirementSlot
 	{
 		SceGxmNotification notification{};
-		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws;
+		SceGxmNotification fragment_notification{};
+		GpuVuInputRetentions input_retentions{};
+		u32 input_retention_count = 0;
+		u64 draw_count = 0;
+		std::vector<VitaGXM::ArenaAllocation> batch_allocations;
 		bool submitted = false;
 	};
 
@@ -1139,10 +1215,14 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	VitaGpuVu::InputRing gpu_vu_input_ring;
 	std::array<GpuVuRetirementSlot, GPU_VU_RETIREMENT_SLOT_COUNT>
 		gpu_vu_retirement_slots;
-	std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>>
-		gpu_vu_scene_draws;
+	GpuVuInputRetentions gpu_vu_scene_input_retentions{};
+	u32 gpu_vu_scene_input_retention_count = 0;
+	u64 gpu_vu_scene_draw_count = 0;
+	std::vector<VitaGXM::ArenaAllocation>
+		gpu_vu_scene_batch_allocations;
 	u32 next_gpu_vu_retirement_slot = 0;
 	bool gpu_vu_retirements_ready = false;
+	bool reported_first_gpu_vu_draw = false;
 
 	std::vector<RenderTargetEntry> render_targets;
 	SceGxmRenderTarget* display_render_target = nullptr;
@@ -1156,7 +1236,8 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	u32 vertex_offset = 0;
 	u32 index_offset = 0;
 	const u16* gpu_vu_sequential_indices = nullptr;
-	const VitaGpuVu::GpuVuDraw* active_gpu_vu_draw = nullptr;
+	const std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>>*
+		active_gpu_vu_draws = nullptr;
 	bool active_gpu_vu_draw_encoded = false;
 
 	SceGxmShaderPatcherId tfx_vertex_id = nullptr;
@@ -1270,9 +1351,14 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	bool InitializeGpuVuRetirements();
 	bool RetainGpuVuDrawForScene(
 		std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
+	bool RetainGpuVuDrawsForScene(
+		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws);
 	bool PrepareGpuVuRetirementNotification(
-		const SceGxmNotification** notification);
-	void RetireCompletedGpuVuDraws();
+		const SceGxmNotification** vertex_notification,
+		const SceGxmNotification** fragment_notification);
+	bool RetireCompletedGpuVuDraws();
+	bool WaitForGpuVuInputRetirement(
+		const VitaGpuVu::RawVifPayloadRef& blocked_generation);
 	void ReleaseAllGpuVuDraws();
 	bool CreateGeometry();
 	bool CreateRenderTarget(u32 width, u32 height, u16 scenes_per_frame,
@@ -1280,6 +1366,10 @@ struct GSDeviceGXM::Impl final : public VitaGXM::TextureOwner
 	SceGxmRenderTarget* GetRenderTarget(u32 width, u32 height);
 	void RetuneRenderTargets();
 	bool EndScene(bool finish);
+	bool HasPendingGpuVuSceneDraws() const
+	{
+		return gpu_vu_scene_draw_count != 0;
+	}
 	bool Finish();
 	bool CommitClear(VitaGXM::GSTextureGXM& texture);
 	bool DrawTargetClear(u32 color, bool write_color, float depth,
@@ -2332,14 +2422,20 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 			check_result);
 	}
 	const bool flat_instances = stored.metadata.uses_flat_instance_inputs;
+	const bool buffered_batch =
+		stored.metadata.uses_buffered_batch_inputs;
 	const bool valid_flat_metadata = flat_instances ?
 		((stored.metadata.flat_vertices_per_primitive == 2 ||
 			stored.metadata.flat_vertices_per_primitive == 3) &&
 			stored.metadata.flat_instance_vertex_step != 0 &&
+			(!buffered_batch ||
+				stored.metadata.batch_primitives_per_draw != 0) &&
 			(!stored.metadata.flat_strip_winding ||
 				stored.metadata.flat_vertices_per_primitive == 3)) :
 		(stored.metadata.flat_vertices_per_primitive == 0 &&
 			stored.metadata.flat_instance_vertex_step == 0 &&
+			stored.metadata.batch_primitives_per_draw == 0 &&
+			!buffered_batch &&
 			!stored.metadata.flat_strip_winding);
 	if (!valid_flat_metadata)
 	{
@@ -2376,8 +2472,10 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 	}
 	const u32 generated_stream_count =
 		static_cast<u32>(stored.metadata.memory_inputs.size());
-	if (!valid_attribute_masks || generated_attribute_count > 16 ||
-		generated_stream_count > 16)
+	if (!valid_attribute_masks ||
+		(!buffered_batch && generated_attribute_count > 16) ||
+		(!buffered_batch && generated_stream_count > 16) ||
+		(buffered_batch && stored.metadata.memory_inputs.empty()))
 	{
 		return fail_registration("bind generated VU1+TFX vertex inputs",
 			SCE_GXM_ERROR_INVALID_VALUE);
@@ -2463,8 +2561,9 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 	}
 
 	std::vector<SceGxmVertexAttribute> attributes;
-	attributes.reserve(generated_attribute_count);
-	std::vector<SceGxmVertexStream> streams(generated_stream_count);
+	attributes.reserve(buffered_batch ? 0 : generated_attribute_count);
+	std::vector<SceGxmVertexStream> streams(
+		buffered_batch ? 0 : generated_stream_count);
 	for (u32 index = 0; index < stored.metadata.memory_inputs.size(); index++)
 	{
 		const VitaGpuVu::CgMemoryInput& input =
@@ -2475,6 +2574,8 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 			return fail_registration("validate generated VU1+TFX input layout",
 				SCE_GXM_ERROR_INVALID_VALUE);
 		}
+		if (buffered_batch)
+			continue;
 		const u64 vertex_stride =
 			static_cast<u64>(input.address.invocation_coefficient) * 16u;
 		const u64 stream_stride = vertex_stride *
@@ -2590,10 +2691,12 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 	VitaGpuVu::CompleteGeneratedProgramRegistration(result.key, true);
 	Console.WriteLn(
 		"GPU-VU: GS registered generated VU1+TFX program %016llx%016llx "
-		"(%u raw streams, %u expressions, general+Z-floor+opaque TFX links).",
+		"(%u raw inputs%s, %u expressions, "
+		"general+Z-floor+opaque TFX links).",
 		static_cast<unsigned long long>(result.key.high),
 		static_cast<unsigned long long>(result.key.low),
 		static_cast<u32>(stored.metadata.memory_inputs.size()),
+		buffered_batch ? " through two user buffers" : " as streams",
 		stored.metadata.emitted_expression_count);
 	return true;
 }
@@ -2628,17 +2731,27 @@ bool GSDeviceGXM::Impl::InitializeGpuVuRetirements()
 
 	// No other VitaSX2 subsystem consumes notification words. Sony's
 	// precomputation and instancing samples allocate linearly from this region;
-	// reserve four distinct words so a submitted value is never overwritten
-	// before its slot is explicitly reused.
+	// reserve four vertex and four fragment words so a submitted value is never
+	// overwritten before its slot is explicitly reused.
 	for (u32 i = 0; i < gpu_vu_retirement_slots.size(); i++)
 	{
 		GpuVuRetirementSlot& slot = gpu_vu_retirement_slots[i];
 		slot.notification.address = notification_region + i;
 		slot.notification.value = 0;
+		slot.fragment_notification.address =
+			notification_region + GPU_VU_RETIREMENT_SLOT_COUNT + i;
+		slot.fragment_notification.value = 0;
 		*slot.notification.address = 0;
-		slot.draws.clear();
+		*slot.fragment_notification.address = 0;
+		ReleaseGpuVuInputSlots(
+			&slot.input_retentions, &slot.input_retention_count);
+		slot.draw_count = 0;
+		slot.batch_allocations.clear();
 		slot.submitted = false;
 	}
+	ReleaseGpuVuInputSlots(&gpu_vu_scene_input_retentions,
+		&gpu_vu_scene_input_retention_count);
+	gpu_vu_scene_draw_count = 0;
 	next_gpu_vu_retirement_slot = 0;
 	gpu_vu_retirements_ready = true;
 	return true;
@@ -2647,17 +2760,69 @@ bool GSDeviceGXM::Impl::InitializeGpuVuRetirements()
 bool GSDeviceGXM::Impl::RetainGpuVuDrawForScene(
 	std::unique_ptr<VitaGpuVu::GpuVuDraw> draw)
 {
-	if (!draw || !scene_active || !gpu_vu_retirements_ready)
+	if (!draw)
 		return false;
-	VitaGpuVu::RecordGpuVuDrawExecuted(*draw);
-	gpu_vu_scene_draws.push_back(std::move(draw));
+	std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws;
+	draws.push_back(std::move(draw));
+	return RetainGpuVuDrawsForScene(std::move(draws));
+}
+
+bool GSDeviceGXM::Impl::RetainGpuVuDrawsForScene(
+	std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws)
+{
+	if (draws.empty() || !scene_active || !gpu_vu_retirements_ready)
+		return false;
+	const u32 original_retention_count =
+		gpu_vu_scene_input_retention_count;
+	for (const auto& draw : draws)
+	{
+		if (!draw)
+		{
+			ReleaseGpuVuInputSlots(&gpu_vu_scene_input_retentions,
+				&gpu_vu_scene_input_retention_count,
+				original_retention_count);
+			return false;
+		}
+		for (const VitaGpuVu::VifUnpackSpan& span : draw->InputSpans())
+		{
+			if (!RetainGpuVuInputSlot(span.payload,
+					&gpu_vu_scene_input_retentions,
+					&gpu_vu_scene_input_retention_count))
+			{
+				ReleaseGpuVuInputSlots(&gpu_vu_scene_input_retentions,
+					&gpu_vu_scene_input_retention_count,
+					original_retention_count);
+				return false;
+			}
+		}
+	}
+	for (const auto& draw : draws)
+	{
+		VitaGpuVu::RecordGpuVuDrawExecuted(*draw);
+		if (!reported_first_gpu_vu_draw)
+		{
+			reported_first_gpu_vu_draw = true;
+			Console.WriteLn(
+				"GPU-VU: first direct VU1+TFX batch encoded "
+				"(%u vertices and %u primitives per object); "
+				"no producer pass or readback.",
+				draw->vertex_count, draw->primitive_count);
+		}
+	}
+	VitaGpuVu::RecordGpuVuObjectsEncoded(draws.size());
+	gpu_vu_scene_draw_count += draws.size();
+	// GXM has consumed every descriptor field at this point. Preserve one
+	// reference per immutable ring slot until the scene's vertex notification,
+	// then release the thousands of per-dispatch CPU objects immediately.
+	draws.clear();
 	return true;
 }
 
-void GSDeviceGXM::Impl::RetireCompletedGpuVuDraws()
+bool GSDeviceGXM::Impl::RetireCompletedGpuVuDraws()
 {
 	if (!gpu_vu_retirements_ready)
-		return;
+		return false;
+	bool retired = false;
 	for (GpuVuRetirementSlot& slot : gpu_vu_retirement_slots)
 	{
 		if (!slot.submitted ||
@@ -2665,26 +2830,117 @@ void GSDeviceGXM::Impl::RetireCompletedGpuVuDraws()
 		{
 			continue;
 		}
-		const u64 count = slot.draws.size();
-		slot.draws.clear();
+		const u64 count = slot.draw_count;
+		ReleaseGpuVuInputSlots(
+			&slot.input_retentions, &slot.input_retention_count);
+		slot.draw_count = 0;
+		slot.batch_allocations.clear();
+		slot.submitted = false;
+		retired = true;
+		if (count != 0)
+			VitaGpuVu::RecordGpuVuDrawsRetired(count);
+	}
+	return retired;
+}
+
+bool GSDeviceGXM::Impl::WaitForGpuVuInputRetirement(
+	const VitaGpuVu::RawVifPayloadRef& blocked_generation)
+{
+	if (!gpu_vu_retirements_ready ||
+		!blocked_generation.IsValid())
+		return false;
+
+	bool owned = ContainsGpuVuInputSlot(
+		gpu_vu_scene_input_retentions,
+		gpu_vu_scene_input_retention_count, blocked_generation);
+	for (const GpuVuRetirementSlot& slot : gpu_vu_retirement_slots)
+	{
+		owned |= slot.submitted &&
+			ContainsGpuVuInputSlot(slot.input_retentions,
+				slot.input_retention_count, blocked_generation);
+	}
+
+	// Release every completion already visible, but do not mistake an
+	// unrelated slot's completion for progress on the exact input generation
+	// the producer is blocked on.
+	RetireCompletedGpuVuDraws();
+
+	// Input pressure can stop the producer before it reaches VSync. Submit the
+	// already encoded final draws now so their vertex notification can release
+	// the immutable source slots. This is not a producer pass and does not wait
+	// unless all four input slots are genuinely exhausted.
+	if (ContainsGpuVuInputSlot(gpu_vu_scene_input_retentions,
+			gpu_vu_scene_input_retention_count, blocked_generation))
+	{
+		owned = true;
+		if (gpu_vu_scene_draw_count == 0 || !EndScene(false))
+			return false;
+		RetireCompletedGpuVuDraws();
+	}
+
+	for (GpuVuRetirementSlot& slot : gpu_vu_retirement_slots)
+	{
+		if (!slot.submitted ||
+			!ContainsGpuVuInputSlot(slot.input_retentions,
+				slot.input_retention_count, blocked_generation))
+		{
+			continue;
+		}
+
+		owned = true;
+		VitaGpuVu::RecordGpuVuRetirementRingWait();
+		if (!GpuVuNotificationReached(slot.notification))
+		{
+			VitaGpuVu::RecordGpuVuNotificationWait();
+			const int wait_result =
+				sceGxmNotificationWait(&slot.notification);
+			if (wait_result < 0)
+				return Fail(
+					"wait for GPU-VU input retirement", wait_result);
+		}
+
+		const u64 count = slot.draw_count;
+		ReleaseGpuVuInputSlots(
+			&slot.input_retentions, &slot.input_retention_count);
+		slot.draw_count = 0;
+		slot.batch_allocations.clear();
 		slot.submitted = false;
 		if (count != 0)
 			VitaGpuVu::RecordGpuVuDrawsRetired(count);
 	}
+	return owned;
 }
 
 bool GSDeviceGXM::Impl::PrepareGpuVuRetirementNotification(
-	const SceGxmNotification** notification)
+	const SceGxmNotification** vertex_notification,
+	const SceGxmNotification** fragment_notification)
 {
-	if (!notification)
+	if (!vertex_notification || !fragment_notification)
 		return false;
-	*notification = nullptr;
-	if (gpu_vu_scene_draws.empty())
+	*vertex_notification = nullptr;
+	*fragment_notification = nullptr;
+	// Retire before deciding whether this scene submits new work. A scene which
+	// carries no direct descriptors is still the point at which the GPU's
+	// completion of an older batch becomes visible, and it is the common case:
+	// the guest keeps issuing ordinary GS work after the last direct object.
+	// Retiring only on the submitting path stranded the final batch forever,
+	// holding its draws, batch bindings and immutable VIF ring slots. That
+	// starved raw capture, which emptied the input spans every later dispatch
+	// needs, which stopped direct admission, which meant no later scene ever
+	// reached the retirement path again.
+	if (gpu_vu_retirements_ready)
+		RetireCompletedGpuVuDraws();
+	if (gpu_vu_scene_draw_count == 0)
+	{
+		pxAssertRel(gpu_vu_scene_input_retention_count == 0,
+			"GPU-VU input retention survived without its descriptors");
+		pxAssertRel(gpu_vu_scene_batch_allocations.empty(),
+			"GPU-VU batch input survived without its descriptors");
 		return true;
+	}
 	if (!gpu_vu_retirements_ready)
 		return false;
 
-	RetireCompletedGpuVuDraws();
 	GpuVuRetirementSlot& slot =
 		gpu_vu_retirement_slots[next_gpu_vu_retirement_slot];
 	if (slot.submitted)
@@ -2702,8 +2958,11 @@ bool GSDeviceGXM::Impl::PrepareGpuVuRetirementNotification(
 			if (wait_result < 0)
 				return Fail("wait for GPU-VU retirement slot", wait_result);
 		}
-		const u64 count = slot.draws.size();
-		slot.draws.clear();
+		const u64 count = slot.draw_count;
+		ReleaseGpuVuInputSlots(
+			&slot.input_retentions, &slot.input_retention_count);
+		slot.draw_count = 0;
+		slot.batch_allocations.clear();
 		slot.submitted = false;
 		if (count != 0)
 			VitaGpuVu::RecordGpuVuDrawsRetired(count);
@@ -2713,24 +2972,38 @@ bool GSDeviceGXM::Impl::PrepareGpuVuRetirementNotification(
 	if (value == 0)
 		value = 1;
 	slot.notification.value = value;
-	slot.draws = std::move(gpu_vu_scene_draws);
-	gpu_vu_scene_draws.clear();
+	slot.fragment_notification.value = value;
+	MoveGpuVuInputSlots(&slot.input_retentions,
+		&slot.input_retention_count, &gpu_vu_scene_input_retentions,
+		&gpu_vu_scene_input_retention_count);
+	slot.draw_count = gpu_vu_scene_draw_count;
+	gpu_vu_scene_draw_count = 0;
+	slot.batch_allocations =
+		std::move(gpu_vu_scene_batch_allocations);
+	gpu_vu_scene_batch_allocations.clear();
 	slot.submitted = true;
 	next_gpu_vu_retirement_slot =
 		(next_gpu_vu_retirement_slot + 1) %
 		gpu_vu_retirement_slots.size();
-	*notification = &slot.notification;
+	*vertex_notification = &slot.notification;
+	*fragment_notification = &slot.fragment_notification;
 	return true;
 }
 
 void GSDeviceGXM::Impl::ReleaseAllGpuVuDraws()
 {
-	u64 count = gpu_vu_scene_draws.size();
-	gpu_vu_scene_draws.clear();
+	u64 count = gpu_vu_scene_draw_count;
+	gpu_vu_scene_draw_count = 0;
+	ReleaseGpuVuInputSlots(&gpu_vu_scene_input_retentions,
+		&gpu_vu_scene_input_retention_count);
+	gpu_vu_scene_batch_allocations.clear();
 	for (GpuVuRetirementSlot& slot : gpu_vu_retirement_slots)
 	{
-		count += slot.draws.size();
-		slot.draws.clear();
+		count += slot.draw_count;
+		slot.draw_count = 0;
+		ReleaseGpuVuInputSlots(
+			&slot.input_retentions, &slot.input_retention_count);
+		slot.batch_allocations.clear();
 		slot.submitted = false;
 	}
 	if (count != 0)
@@ -2742,10 +3015,13 @@ bool GSDeviceGXM::Impl::EndScene(bool finish)
 	if (!scene_active)
 		return true;
 	const SceGxmNotification* vertex_notification = nullptr;
-	if (!PrepareGpuVuRetirementNotification(&vertex_notification))
+	const SceGxmNotification* fragment_notification = nullptr;
+	if (!PrepareGpuVuRetirementNotification(
+			&vertex_notification, &fragment_notification))
 		return false;
 	const int end_result =
-		sceGxmEndScene(context, vertex_notification, nullptr);
+		sceGxmEndScene(
+			context, vertex_notification, fragment_notification);
 	if (end_result < 0)
 	{
 		ready = false;
@@ -3492,11 +3768,19 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 				vertex_buffer, parameter, 0, count, values);
 			return upload_result >= 0 ? true : Fail(operation, upload_result);
 		};
+		const std::array<float, 12> generated_transform = {
+			config.cb_vs.vertex_scale.x, config.cb_vs.vertex_scale.y,
+			config.cb_vs.vertex_offset.x, config.cb_vs.vertex_offset.y,
+			config.cb_vs.texture_scale.x, config.cb_vs.texture_scale.y,
+			config.cb_vs.texture_offset.x, config.cb_vs.texture_offset.y,
+			config.cb_vs.point_size.x, config.cb_vs.point_size.y, 0.0f, 0.0f};
+		const float generated_max_depth =
+			static_cast<float>(config.cb_vs.max_depth);
 		if (!upload_vertex(generated_vu->uniforms.vertex_scale_offset, 12,
-				gpu_vu_draw->vertex_scale_offset[0].data(),
+				generated_transform.data(),
 				"upload generated VU1+TFX transform") ||
 			!upload_vertex(generated_vu->uniforms.max_depth, 1,
-				&gpu_vu_draw->max_depth,
+				&generated_max_depth,
 				"upload generated VU1+TFX maximum depth"))
 		{
 			return false;
@@ -4031,9 +4315,15 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 	VitaGXM::GSTextureGXM* source, bool fast_fragment, bool psm16_fragment,
 	bool region_repeat_fragment, bool manual_lod_fragment)
 {
-	const VitaGpuVu::GpuVuDraw* const draw = active_gpu_vu_draw;
-	if (!draw || active_gpu_vu_draw_encoded)
+	if (!active_gpu_vu_draws || active_gpu_vu_draws->empty() ||
+		active_gpu_vu_draw_encoded)
+	{
 		return Reject("missing or already encoded GPU-VU draw descriptor");
+	}
+	const VitaGpuVu::GpuVuDraw* const draw =
+		active_gpu_vu_draws->front().get();
+	if (!draw)
+		return Reject("GPU-VU batch starts with a null descriptor");
 	std::string validation_error;
 	if (!draw->Validate(&validation_error))
 		return Reject(validation_error.c_str());
@@ -4074,6 +4364,13 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 	}
 	const bool flat_instances =
 		generated->metadata.uses_flat_instance_inputs;
+	const bool buffered_batch =
+		generated->metadata.uses_buffered_batch_inputs;
+	if (buffered_batch && !flat_instances)
+	{
+		return Reject(
+			"GPU-VU buffered input root is not instance indexed");
+	}
 	if (draw->primitive_boundary != (flat_instances ?
 			VitaGpuVu::PrimitiveBoundary::InstanceIndexed :
 			VitaGpuVu::PrimitiveBoundary::Native))
@@ -4106,19 +4403,75 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 	if (draw->scalar_uniforms.present != expected_scalar_mask)
 		return Reject("generated VU1 scalar-uniform mask mismatch");
 
-	for (u32 index = 0; index < draw->streams.size(); index++)
+	for (const auto& candidate_owner : *active_gpu_vu_draws)
 	{
-		const VitaGpuVu::StreamBinding& binding = draw->streams[index];
-		const VitaGpuVu::CgMemoryInput& input =
-			generated->metadata.memory_inputs[index];
-		const u64 expected_stride =
-			static_cast<u64>(input.address.invocation_coefficient) * 16u;
-		if (binding.attribute_index != index ||
-			input.attribute_index != index ||
-			expected_stride != binding.byte_stride ||
-			(binding.payload_byte_offset & 3u) != 0)
+		const VitaGpuVu::GpuVuDraw* const candidate =
+			candidate_owner.get();
+		if (!candidate ||
+			!candidate->Validate(nullptr) ||
+			!(candidate->program == draw->program) ||
+			candidate->gif_tag != draw->gif_tag ||
+			candidate->invocation_count != draw->invocation_count ||
+			candidate->vertex_count != draw->vertex_count ||
+			candidate->primitive_count != draw->primitive_count ||
+			candidate->index_count != draw->index_count ||
+			candidate->lowering != draw->lowering ||
+			candidate->execution != draw->execution ||
+			candidate->primitive_boundary != draw->primitive_boundary ||
+			candidate->streams.size() != draw->streams.size() ||
+			candidate->vf_uniforms.size() != draw->vf_uniforms.size() ||
+			candidate->constant_uniforms.size() !=
+				draw->constant_uniforms.size() ||
+			candidate->acc_uniform != draw->acc_uniform ||
+			candidate->scalar_uniforms.present !=
+				draw->scalar_uniforms.present ||
+			candidate->scalar_uniforms.q != draw->scalar_uniforms.q ||
+			candidate->scalar_uniforms.p != draw->scalar_uniforms.p ||
+			candidate->scalar_uniforms.i != draw->scalar_uniforms.i ||
+			candidate->scalar_uniforms.gif_q !=
+				draw->scalar_uniforms.gif_q)
 		{
-			return Reject("generated VU1 stream binding differs from GXP layout");
+			return Reject("GPU-VU descriptors do not share one batch ABI");
+		}
+		for (u32 index = 0; index < candidate->vf_uniforms.size(); index++)
+		{
+			if (candidate->vf_uniforms[index].register_index !=
+					draw->vf_uniforms[index].register_index ||
+				candidate->vf_uniforms[index].bits !=
+					draw->vf_uniforms[index].bits)
+			{
+				return Reject("GPU-VU batch VF uniforms differ");
+			}
+		}
+		for (u32 index = 0;
+			index < candidate->constant_uniforms.size(); index++)
+		{
+			if (candidate->constant_uniforms[index].input_index !=
+					draw->constant_uniforms[index].input_index ||
+				candidate->constant_uniforms[index].bits !=
+					draw->constant_uniforms[index].bits)
+			{
+				return Reject("GPU-VU batch constant uniforms differ");
+			}
+		}
+		for (u32 index = 0; index < candidate->streams.size(); index++)
+		{
+			const VitaGpuVu::StreamBinding& binding =
+				candidate->streams[index];
+			const VitaGpuVu::CgMemoryInput& input =
+				generated->metadata.memory_inputs[index];
+			const u64 expected_stride =
+				static_cast<u64>(
+					input.address.invocation_coefficient) * 16u;
+			if (binding.attribute_index != index ||
+				input.attribute_index != index ||
+				expected_stride != binding.byte_stride ||
+				(binding.payload_byte_offset &
+					(buffered_batch ? 15u : 3u)) != 0)
+			{
+				return Reject(
+					"generated VU1 input binding differs from GXP layout");
+			}
 		}
 	}
 
@@ -4232,7 +4585,10 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 				indices_per_primitive ||
 			generated->metadata.flat_instance_vertex_step !=
 				flat_vertex_step ||
-			generated->metadata.flat_strip_winding != flat_strip_winding))
+			generated->metadata.flat_strip_winding != flat_strip_winding ||
+			(buffered_batch &&
+				generated->metadata.batch_primitives_per_draw !=
+					primitive_count)))
 	{
 		return Reject("GPU-VU flat instance metadata differs from GIF topology");
 	}
@@ -4247,24 +4603,228 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			primitive_count > GPU_VU_SEQUENTIAL_INDEX_COUNT) ||
 		draw->primitive_count != primitive_count ||
 		config.topology != topology ||
-		config.indices_per_prim != indices_per_primitive ||
-		config.nverts != draw->vertex_count ||
-		config.nindices != draw->index_count)
+		config.indices_per_prim != indices_per_primitive)
 	{
 		return Reject("GPU-VU geometry dimensions differ from PCSX2 draw state");
 	}
 
-	const std::array<float, 12> expected_transform = {
-		config.cb_vs.vertex_scale.x, config.cb_vs.vertex_scale.y,
-		config.cb_vs.vertex_offset.x, config.cb_vs.vertex_offset.y,
-		config.cb_vs.texture_scale.x, config.cb_vs.texture_scale.y,
-		config.cb_vs.texture_offset.x, config.cb_vs.texture_offset.y,
-		config.cb_vs.point_size.x, config.cb_vs.point_size.y, 0.0f, 0.0f};
-	if (std::memcmp(draw->vertex_scale_offset[0].data(),
-			expected_transform.data(), sizeof(expected_transform)) != 0 ||
-		draw->max_depth != static_cast<float>(config.cb_vs.max_depth))
+	struct BatchInputGroup
 	{
-		return Reject("GPU-VU transform uniforms differ from PCSX2 draw state");
+		const u8* raw_buffer_base = nullptr;
+		uptr owner = 0;
+		u32 slot = 0;
+		u32 generation = 0;
+		u32 first_qword = 0;
+		u32 last_qword = 0;
+		u32 first_draw = 0;
+		u32 draw_count = 0;
+		VitaGXM::ArenaAllocation bindings;
+	};
+	std::vector<BatchInputGroup> batch_input_groups;
+	if (buffered_batch)
+	{
+		const u32 binding_vectors =
+			(static_cast<u32>(generated->metadata.memory_inputs.size()) +
+				3u) / 4u;
+		if (binding_vectors == 0)
+			return Reject("GPU-VU buffered root has no binding vectors");
+
+		// The installed PSP2 compiler lowers the dynamically indexed int4
+		// loads in this root through signed 16-bit address arithmetic when the
+		// shader keeps Sony's proven 64-vector declaration. psp2shaderperf
+		// shows the binding value consumed by mad.i16 and then r*.lo16. The
+		// capture ring is 2 MiB, so passing a slot-absolute qword index can
+		// silently discard its upper bits. Bind a sub-range of the mapped slot
+		// for each draw group and keep every final qword index in the positive
+		// signed-16 range. gxm/memory.h explicitly permits one mapped capture
+		// buffer to supply independently based uniform-buffer sub-ranges.
+		constexpr u32 maximum_relative_qword =
+			static_cast<u32>(std::numeric_limits<s16>::max());
+		struct ResolvedInputRange
+		{
+			const u8* slot_base = nullptr;
+			uptr owner = 0;
+			u32 slot = 0;
+			u32 generation = 0;
+			u32 first_qword = 0;
+			u32 last_qword = 0;
+		};
+		const auto resolve_input_range =
+			[](const VitaGpuVu::GpuVuDraw& candidate,
+				ResolvedInputRange* range) {
+				if (!range)
+					return false;
+				*range = {};
+				u32 first_qword = std::numeric_limits<u32>::max();
+				u32 last_qword = 0;
+				for (const VitaGpuVu::StreamBinding& binding :
+					candidate.streams)
+				{
+					const VitaGpuVu::VifUnpackSpan& span =
+						candidate.InputSpans()[binding.input_span];
+					const u8* const payload =
+						VitaGpuVu::ResolveGpuRawVifPayload(span.payload);
+					if (!payload ||
+						span.payload.offset >
+							VitaGpuVu::GeneratedCgProgram::
+								RawInputBufferQwords * 16u ||
+						span.payload.size >
+							VitaGpuVu::GeneratedCgProgram::
+									RawInputBufferQwords * 16u -
+								span.payload.offset)
+					{
+						return false;
+					}
+					const u8* const base =
+						payload - span.payload.offset;
+					if (!range->slot_base)
+					{
+						range->slot_base = base;
+						range->owner = span.payload.owner;
+						range->slot = span.payload.slot;
+						range->generation = span.payload.generation;
+					}
+					else if (range->slot_base != base ||
+						range->owner != span.payload.owner ||
+						range->slot != span.payload.slot ||
+						range->generation != span.payload.generation)
+					{
+						return false;
+					}
+					const u64 absolute_first_byte =
+						static_cast<u64>(span.payload.offset) +
+						binding.payload_byte_offset;
+					const u64 absolute_last_byte =
+						absolute_first_byte +
+						static_cast<u64>(candidate.invocation_count - 1u) *
+							binding.byte_stride +
+						15u;
+					constexpr u64 raw_buffer_bytes =
+						static_cast<u64>(
+							VitaGpuVu::GeneratedCgProgram::
+								RawInputBufferQwords) * 16u;
+					if ((absolute_first_byte & 15u) != 0 ||
+						absolute_last_byte >= raw_buffer_bytes)
+					{
+						return false;
+					}
+					first_qword = std::min(first_qword,
+						static_cast<u32>(absolute_first_byte / 16u));
+					last_qword = std::max(last_qword,
+						static_cast<u32>(absolute_last_byte / 16u));
+				}
+				if (!range->slot_base ||
+					first_qword == std::numeric_limits<u32>::max())
+				{
+					return false;
+				}
+				range->first_qword = first_qword;
+				range->last_qword = last_qword;
+				return true;
+			};
+
+		for (u32 first = 0; first < active_gpu_vu_draws->size();)
+		{
+			ResolvedInputRange window;
+			if (!resolve_input_range(*(*active_gpu_vu_draws)[first],
+					&window) ||
+				window.last_qword - window.first_qword >
+					maximum_relative_qword)
+			{
+				return Reject(
+					"GPU-VU object exceeds one addressable raw-input window");
+			}
+
+			u32 end = first + 1;
+			while (end < active_gpu_vu_draws->size() &&
+				end - first <
+					VitaGpuVu::GeneratedCgProgram::MaximumBatchDraws)
+			{
+				ResolvedInputRange next;
+				if (!resolve_input_range(*(*active_gpu_vu_draws)[end],
+						&next) ||
+					next.slot_base != window.slot_base ||
+					next.owner != window.owner ||
+					next.slot != window.slot ||
+					next.generation != window.generation)
+				{
+					break;
+				}
+				const u32 combined_first =
+					std::min(window.first_qword, next.first_qword);
+				const u32 combined_last =
+					std::max(window.last_qword, next.last_qword);
+				if (combined_last - combined_first >
+					maximum_relative_qword)
+				{
+					break;
+				}
+				window.first_qword = combined_first;
+				window.last_qword = combined_last;
+				end++;
+			}
+
+			const u32 draw_count = end - first;
+			const u64 binding_bytes =
+				static_cast<u64>(draw_count) * binding_vectors *
+				sizeof(std::array<u32, 4>);
+			if (binding_bytes > std::numeric_limits<u32>::max())
+				return Reject("GPU-VU batch binding table is too large");
+			VitaGXM::ArenaAllocation allocation;
+			const int allocation_result = transfer_arena.Allocate(
+				static_cast<u32>(binding_bytes), 16, &allocation);
+			if (allocation_result < 0 || !allocation)
+			{
+				return Fail("allocate generated VU1 batch bindings",
+					allocation_result < 0 ? allocation_result :
+						SCE_GXM_ERROR_OUT_OF_MEMORY);
+			}
+			std::memset(allocation.Data(), 0, allocation.Size());
+			u32* const bindings =
+				static_cast<u32*>(allocation.Data());
+			for (u32 object = 0; object < draw_count; object++)
+			{
+				const VitaGpuVu::GpuVuDraw& candidate =
+					*(*active_gpu_vu_draws)[first + object];
+				for (u32 input = 0;
+					input < candidate.streams.size(); input++)
+				{
+					const VitaGpuVu::StreamBinding& binding =
+						candidate.streams[input];
+					const VitaGpuVu::VifUnpackSpan& span =
+						candidate.InputSpans()[binding.input_span];
+					const u64 absolute_byte =
+						static_cast<u64>(span.payload.offset) +
+						binding.payload_byte_offset;
+					if ((absolute_byte & 15u) != 0 ||
+						absolute_byte / 16u < window.first_qword ||
+						absolute_byte / 16u - window.first_qword >
+							maximum_relative_qword)
+					{
+						return Reject(
+							"GPU-VU raw binding is outside its input window");
+					}
+					bindings[
+						(object * binding_vectors * 4u) + input] =
+						static_cast<u32>(
+							absolute_byte / 16u - window.first_qword);
+				}
+			}
+
+			BatchInputGroup group;
+			group.raw_buffer_base =
+				window.slot_base + window.first_qword * 16u;
+			group.owner = window.owner;
+			group.slot = window.slot;
+			group.generation = window.generation;
+			group.first_qword = window.first_qword;
+			group.last_qword = window.last_qword;
+			group.first_draw = first;
+			group.draw_count = draw_count;
+			group.bindings = std::move(allocation);
+			batch_input_groups.push_back(std::move(group));
+			first = end;
+		}
 	}
 
 	VitaGXM::GSTextureGXM* const rt =
@@ -4296,19 +4856,6 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		generated->zfloor_fragment_program : (fast_fragment ?
 			generated->opaque_fragment_program :
 			generated->general_fragment_program));
-	for (u32 index = 0; index < draw->streams.size(); index++)
-	{
-		const VitaGpuVu::StreamBinding& binding = draw->streams[index];
-		const VitaGpuVu::VifUnpackSpan& span =
-			draw->InputSpans()[binding.input_span];
-		const u8* const payload = VitaGpuVu::ResolveRawVifPayload(span.payload);
-		if (!payload)
-			return Reject("GPU-VU VIF input span retired before draw");
-		const int stream_result = sceGxmSetVertexStream(context, index,
-			payload + binding.payload_byte_offset);
-		if (stream_result < 0)
-			return Fail("bind generated VU1 raw VIF stream", stream_result);
-	}
 	VitaGXM::GSTextureGXM* bound_source = source ? source : white_texture.get();
 	if (!bound_source)
 		return false;
@@ -4385,28 +4932,124 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		sceGxmSetFrontPointLineWidth(context, 1);
 		sceGxmSetBackPointLineWidth(context, 1);
 	}
-	// Sony libGXM context.h: indexWrap resets the index-buffer position and
-	// primitive assembly for every instance. The persistent 0,1,2 identity
-	// prefix therefore selects one exact GS primitive per flat instance.
-	result = flat_instances ?
-		sceGxmDrawInstanced(context, primitive_type,
-			SCE_GXM_INDEX_FORMAT_U16, gpu_vu_sequential_indices,
-			draw->index_count, indices_per_primitive) :
-		sceGxmDraw(context, primitive_type, SCE_GXM_INDEX_FORMAT_U16,
-			gpu_vu_sequential_indices, draw->index_count);
+	bool encoded_any = false;
+	if (buffered_batch)
+	{
+		// Sony's skinning sample establishes dynamically indexed BUFFER user
+		// uniforms, and the instancing sample establishes that indexWrap restarts
+		// both the index position and primitive assembly. The generated INSTANCE
+		// arithmetic selects one immutable object record, so all primitives from
+		// every object in one raw-ring slot are one GXM draw.
+		for (BatchInputGroup& group : batch_input_groups)
+		{
+			result = sceGxmSetVertexUniformBuffer(
+				context, 0, group.raw_buffer_base);
+			if (result >= 0)
+			{
+				result = sceGxmSetVertexUniformBuffer(
+					context, 1, group.bindings.Data());
+			}
+			if (result < 0)
+			{
+				if (encoded_any)
+					Finish();
+				return Fail("bind generated VU1 batch buffers", result);
+			}
+			const u64 group_indices =
+				static_cast<u64>(draw->index_count) *
+				group.draw_count;
+			if (group_indices > std::numeric_limits<u32>::max())
+			{
+				if (encoded_any)
+					Finish();
+				return Reject("generated VU1 batch index count overflow");
+			}
+			result = sceGxmDrawInstanced(context, primitive_type,
+				SCE_GXM_INDEX_FORMAT_U16, gpu_vu_sequential_indices,
+				static_cast<u32>(group_indices),
+				indices_per_primitive);
+			if (result < 0)
+			{
+				if (encoded_any)
+					Finish();
+				return Fail(
+					"sceGxmDrawInstanced(batched generated VU1+TFX)",
+					result);
+			}
+			encoded_any = true;
+			RecordGpuVuGxmDraw(group_indices);
+		}
+	}
+	else
+	{
+		// Non-buffered roots retain their exact legacy stream ABI. They may
+		// share GS state derivation but each immutable payload still needs its
+		// own stream bindings and draw.
+		for (const auto& candidate_owner : *active_gpu_vu_draws)
+		{
+			const VitaGpuVu::GpuVuDraw& candidate =
+				*candidate_owner;
+			for (u32 index = 0; index < candidate.streams.size(); index++)
+			{
+				const VitaGpuVu::StreamBinding& binding =
+					candidate.streams[index];
+				const VitaGpuVu::VifUnpackSpan& span =
+					candidate.InputSpans()[binding.input_span];
+				const u8* const payload =
+					VitaGpuVu::ResolveGpuRawVifPayload(span.payload);
+				if (!payload)
+				{
+					if (encoded_any)
+						Finish();
+					return Reject(
+						"GPU-VU VIF input span retired before draw");
+				}
+				const int stream_result = sceGxmSetVertexStream(
+					context, index,
+					payload + binding.payload_byte_offset);
+				if (stream_result < 0)
+				{
+					if (encoded_any)
+						Finish();
+					return Fail(
+						"bind generated VU1 raw VIF stream",
+						stream_result);
+				}
+			}
+			result = flat_instances ?
+				sceGxmDrawInstanced(context, primitive_type,
+					SCE_GXM_INDEX_FORMAT_U16,
+					gpu_vu_sequential_indices,
+					candidate.index_count,
+					indices_per_primitive) :
+				sceGxmDraw(context, primitive_type,
+					SCE_GXM_INDEX_FORMAT_U16,
+					gpu_vu_sequential_indices,
+					candidate.index_count);
+			if (result < 0)
+			{
+				if (encoded_any)
+					Finish();
+				return Fail(flat_instances ?
+					"sceGxmDrawInstanced(generated VU1+TFX)" :
+					"sceGxmDraw(generated VU1+TFX)", result);
+			}
+			encoded_any = true;
+			RecordGpuVuGxmDraw(candidate.index_count);
+		}
+	}
 	if (point_topology || line_topology)
 	{
 		sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
 		sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
 	}
-	if (result < 0)
+	if (!encoded_any)
+		return Reject("GPU-VU batch encoded no GXM work");
+	for (BatchInputGroup& group : batch_input_groups)
 	{
-		return Fail(flat_instances ?
-			"sceGxmDrawInstanced(generated VU1+TFX)" :
-			"sceGxmDraw(generated VU1+TFX)", result);
+		gpu_vu_scene_batch_allocations.push_back(
+			std::move(group.bindings));
 	}
-
-	RecordGpuVuGxmDraw(draw->index_count);
 	if (rt)
 		rt->SetState(GSTexture::State::Dirty);
 	if (ds && config.depth.zwe)
@@ -4511,24 +5154,41 @@ void GSDeviceGXM::PollGpuVuPrograms()
 bool GSDeviceGXM::RenderGpuVuDraw(GSHWDrawConfig& config,
 	std::unique_ptr<VitaGpuVu::GpuVuDraw> draw)
 {
-	if (!m_impl || !m_impl->ready || !draw ||
-		m_impl->active_gpu_vu_draw)
+	if (!draw)
+		return false;
+	std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws;
+	draws.push_back(std::move(draw));
+	return RenderGpuVuDraws(config, std::move(draws));
+}
+
+bool GSDeviceGXM::RenderGpuVuDraws(GSHWDrawConfig& config,
+	std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws)
+{
+	if (!m_impl || !m_impl->ready || draws.empty() ||
+		m_impl->active_gpu_vu_draws)
 	{
 		return false;
 	}
-	std::string validation_error;
-	if (!draw->Validate(&validation_error))
-		return m_impl->Reject(validation_error.c_str());
+	for (const auto& draw : draws)
+	{
+		std::string validation_error;
+		if (!draw || !draw->Validate(&validation_error))
+		{
+			return m_impl->Reject(draw ?
+				validation_error.c_str() :
+				"null GPU-VU descriptor in batch");
+		}
+	}
 
-	m_impl->active_gpu_vu_draw = draw.get();
+	m_impl->active_gpu_vu_draws = &draws;
 	m_impl->active_gpu_vu_draw_encoded = false;
 	RenderHW(config);
 	const bool encoded = m_impl->active_gpu_vu_draw_encoded;
-	m_impl->active_gpu_vu_draw = nullptr;
+	m_impl->active_gpu_vu_draws = nullptr;
 	m_impl->active_gpu_vu_draw_encoded = false;
 	if (!encoded)
 		return false;
-	if (m_impl->RetainGpuVuDrawForScene(std::move(draw)))
+	if (m_impl->RetainGpuVuDrawsForScene(std::move(draws)))
 		return true;
 
 	// This is an exceptional ownership failure after commands were encoded.
@@ -4767,7 +5427,7 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		Console.WriteLn(
 			"GXM GS: source-direct Z-floor DECAL/RGB constant-blend path active.");
 	}
-	bool source_only_fragment = !m_impl->active_gpu_vu_draw &&
+	bool source_only_fragment = !m_impl->active_gpu_vu_draws &&
 		source_only_contract && !config.ps.zfloor && !region_repeat_fragment;
 	bool untextured_fragment = source_only_fragment && !config.vs.tme;
 	bool source_direct_fragment = source_only_fragment &&
@@ -4865,7 +5525,7 @@ void GSDeviceGXM::RenderHW(GSHWDrawConfig& config)
 		Console.WriteLn(
 			"GXM GS: PCSX2 PSMCT16 dither/quantization path active.");
 	}
-	if (m_impl->active_gpu_vu_draw)
+	if (m_impl->active_gpu_vu_draws)
 	{
 		if (!m_impl->DrawGpuVu(config, source, fast_fragment, psm16_fragment,
 				region_repeat_fragment, manual_lod_fragment))
@@ -5186,6 +5846,26 @@ void GSDeviceGXM::ResizeWindow(u32 new_width, u32 new_height, float scale)
 bool GSDeviceGXM::SupportsExclusiveFullscreen() const
 {
 	return false;
+}
+
+void GSDeviceGXM::EndGpuVuEpoch()
+{
+	if (!m_impl || !m_impl->ready || m_impl->present_active)
+		return;
+	// One ordered GS command epoch. Direct descriptors and their mapped input
+	// storage belong to the guest frame that produced them, so the owning GXM
+	// scene is submitted at the epoch boundary even when presentation is
+	// skipped. Retention stays with the four-way notification ring; nothing
+	// waits here.
+	if (m_impl->HasPendingGpuVuSceneDraws())
+		m_impl->EndScene(false);
+}
+
+bool GSDeviceGXM::WaitForGpuVuInputRetirement(
+	const VitaGpuVu::RawVifPayloadRef& blocked_generation)
+{
+	return m_impl && m_impl->ready &&
+		m_impl->WaitForGpuVuInputRetirement(blocked_generation);
 }
 
 GSDevice::PresentResult GSDeviceGXM::BeginPresent(bool frame_skip)
@@ -5963,7 +6643,7 @@ void GSDeviceGXM::Impl::Shutdown()
 	vertex_offset = 0;
 	index_offset = 0;
 	gpu_vu_sequential_indices = nullptr;
-	active_gpu_vu_draw = nullptr;
+	active_gpu_vu_draws = nullptr;
 	active_gpu_vu_draw_encoded = false;
 }
 

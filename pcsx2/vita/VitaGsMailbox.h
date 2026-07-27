@@ -12,6 +12,7 @@ class Error;
 namespace VitaGpuVu
 {
 	class GpuVuDraw;
+	struct RawVifPayloadRef;
 }
 
 namespace VitaGS
@@ -23,21 +24,36 @@ namespace VitaGS
 	// call use the game ELF entry as their VSync origin.
 	void NotifyPerformanceElfEntry();
 
-	// Transfers one immutable PATH1 descriptor into the ordered MTGS ring.
-	// Ownership returns false by destruction; a successful call is consumed
-	// exactly once by the GS/GXM-owning thread.
+	// Completes the next EE-reserved MTVU PATH1 ordering point with an immutable
+	// direct draw. Ownership returns false by destruction; a successful call is
+	// consumed exactly once by the GS/GXM-owning thread.
 	bool QueueGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
+
+	// Completes the next EE-reserved MTVU PATH1 ordering point with the packet
+	// already published by Gif_Path::FinishGSPacketMTVU(). This replaces the
+	// desktop per-dispatch semaXGkick lifecycle on the Vita mailbox.
+	void CompleteMtvuPath1Packet();
+
+	// Publishes a trailing run of direct descriptors before a strong MTVU
+	// observation/drain which may have no following CPU PATH1 packet.
+	void FlushMtvuPath1Completions();
 
 	// Wakes the GS owner after the asynchronous compiler publishes a completed
 	// GXP. This is a CPU work notification only: it never waits for or flushes
 	// GXM, and registration/patching still occurs exclusively on the GS thread.
 	void NotifyGpuVuCompilerResult();
 
+	// Wakes the GS owner when immutable VIF capture has exhausted all four
+	// mapped slots. The owner alone may submit/wait for GXM retirement; the
+	// capture producer sleeps until descriptor destruction releases a slot.
+	void RequestGpuVuInputRetirement(
+		const VitaGpuVu::RawVifPayloadRef& blocked_generation);
+
 	const u8* GetLocalMemoryForTrace(size_t* size);
 
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 	bool CopyPrivilegedRegistersForValidation(u8* output, size_t size);
-	u64 GetMtvuPacketTokenResyncsForValidation();
+	u64 GetMtvuPath1CompletionDeferralsForValidation();
 #endif
 
 #if defined(VITASX2_PRODUCT_BOOT_VALIDATION) && VITASX2_PRODUCT_BOOT_VALIDATION

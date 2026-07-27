@@ -90,6 +90,25 @@ struct ViEvolution {
   u32 affine_mask = 0xffff;
 };
 
+// One VF lane whose every write in the reachable region is an idempotent
+// self-clamp against a hardwired VF00 lane, i.e. `vfN.l = max(vfN.l, c)` or
+// `mini`. Such a lane is a usable entry uniform exactly when the runtime seed
+// already satisfies the clamp: the region is then a no-op on that lane, so the
+// CPU snapshot can never become stale behind an accepted GPU draw. The
+// descriptor path verifies the seed once per draw; nothing is assumed about
+// the program's identity.
+struct ClampStableLane {
+  u8 reg = 0;
+  u8 lane = 0;
+  u32 bound_bits = 0;
+  bool minimum = false;
+
+  bool operator==(const ClampStableLane &other) const {
+    return reg == other.reg && lane == other.lane &&
+           bound_bits == other.bound_bits && minimum == other.minimum;
+  }
+};
+
 struct ParallelLoopKernel {
   u32 loop_index = 0;
   u32 header_pc = 0;
@@ -101,6 +120,7 @@ struct ParallelLoopKernel {
   std::vector<ExpressionNode> expressions;
   std::vector<LoopStore> stores;
   std::array<u8, 32> stable_initial_vf_lanes{};
+  std::vector<ClampStableLane> clamp_stable_lanes;
   u8 stable_initial_acc_lanes = 0;
   bool stable_initial_q = false;
   bool stable_initial_p = false;

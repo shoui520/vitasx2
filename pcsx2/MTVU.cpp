@@ -8,6 +8,7 @@
 #include "Vif_Dynarec.h"
 #include "vita/VitaGpuVuDirectProgram.h"
 #include "vita/VitaGpuVuDraw.h"
+#include "vita/VitaGsMailbox.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 
@@ -21,6 +22,11 @@ VU_Thread vu1Thread;
 #define MTVU_ALWAYS_KICK 0
 #define MTVU_SYNC_MODE 0
 
+// A direct affine journal normally collapses to the latest few VU-memory
+// ranges. Keep its storage fixed after construction and materialize only when
+// an adversarial partial-overlap stream exceeds this bounded first lowering.
+static constexpr size_t MaximumDeferredAffineSpans = 64;
+
 // Rounds up a size in bytes for size in u32's
 static __fi u32 size_u32(u32 x) { return (x + 3) >> 2; }
 
@@ -28,6 +34,9 @@ enum MTVU_EVENT
 {
 	MTVU_VU_EXECUTE,     // Execute VU program
 	MTVU_VU_EXECUTE_DIRECT, // Execute with an admitted direct-program token
+	// Cold-compiles an explicit-entry root on the worker, but deliberately
+	// retains CpuVU1 execution until its MSCNT continuation state is owned.
+	MTVU_VU_EXECUTE_DIRECT_PRIME,
 	MTVU_VU_WRITE_MICRO, // Write to VU micro-mem
 	MTVU_VU_WRITE_DATA,  // Write to VU data-mem
 	MTVU_VU_WRITE_VIREGS,// Write to VU registers
@@ -52,29 +61,58 @@ static void MTVU_Unpack(void* data, VIFregisters& vifRegs)
 		_nVifUnpack(1, (u8*)data, vifRegs.mode, isFill);
 }
 
-static bool ReadGpuVuMemoryU16(void* user, u16 qword_address, u8 lane,
-	u16* value)
+struct GpuVuMemoryView
 {
-	if (!user || !value || lane >= 4)
-		return false;
-	const u8* const memory = static_cast<const u8*>(user);
-	const u32 byte_address =
-		((static_cast<u32>(qword_address) & 0x3ffu) * 16u) + lane * 4u;
-	u32 word = 0;
-	std::memcpy(&word, memory + byte_address, sizeof(word));
-	*value = static_cast<u16>(word);
-	return true;
-}
+	const u8* canonical = nullptr;
+	const std::vector<VitaGpuVu::VifUnpackSpan>* spans = nullptr;
+};
 
 static bool ReadGpuVuMemoryU32(void* user, u16 qword_address, u8 lane,
 	u32* value)
 {
 	if (!user || !value || lane >= 4)
 		return false;
-	const u8* const memory = static_cast<const u8*>(user);
-	const u32 byte_address =
-		((static_cast<u32>(qword_address) & 0x3ffu) * 16u) + lane * 4u;
-	std::memcpy(value, memory + byte_address, sizeof(*value));
+	const GpuVuMemoryView& view =
+		*static_cast<const GpuVuMemoryView*>(user);
+	const u32 address = static_cast<u32>(qword_address) & 0x3ffu;
+	if (view.spans)
+	{
+		for (auto it = view.spans->rbegin(); it != view.spans->rend(); ++it)
+		{
+			if (!VitaGpuVu::IsDirectAffineV4_32Span(*it))
+				continue;
+			const u32 vector =
+				(address - static_cast<u32>(it->destination_qword)) & 0x3ffu;
+			if (vector >= it->vector_count)
+				continue;
+			const u8* const payload =
+				VitaGpuVu::ResolveRawVifPayload(it->payload);
+			const u32 byte_offset = vector * 16u + lane * sizeof(u32);
+			if (!payload || byte_offset > it->payload.size ||
+				sizeof(u32) > it->payload.size - byte_offset)
+			{
+				return false;
+			}
+			std::memcpy(value, payload + byte_offset, sizeof(*value));
+			return true;
+		}
+	}
+	if (!view.canonical)
+		return false;
+	const u32 byte_address = address * 16u + lane * sizeof(u32);
+	std::memcpy(value, view.canonical + byte_address, sizeof(*value));
+	return true;
+}
+
+static bool ReadGpuVuMemoryU16(void* user, u16 qword_address, u8 lane,
+	u16* value)
+{
+	if (!value)
+		return false;
+	u32 word = 0;
+	if (!ReadGpuVuMemoryU32(user, qword_address, lane, &word))
+		return false;
+	*value = static_cast<u16>(word);
 	return true;
 }
 
@@ -149,6 +187,7 @@ bool SaveStateBase::mtvuFreeze()
 
 VU_Thread::VU_Thread()
 {
+	m_deferred_vif_unpacks.reserve(MaximumDeferredAffineSpans);
 	Reset();
 }
 
@@ -205,9 +244,11 @@ void VU_Thread::Reset()
 	m_micro_invalidate_start = 0;
 	m_micro_invalidate_end = 0;
 	m_gpu_vu_direct_program_token = 0;
+	m_gpu_vu_direct_resume_token = 0;
 	m_gpu_vu_direct_program_start_pc = 0;
 	m_gpu_vu_direct_program_prepared = false;
 	m_vif_span_sequence = 0;
+	m_pending_vif_batch = false;
 	vuCycleIdx = 0;
 	m_ato_write_pos = 0;
 	m_write_pos = 0;
@@ -252,7 +293,13 @@ void VU_Thread::EndProgram(u32 interrupt_flag)
 void VU_Thread::ExecuteRingBuffer()
 {
 	Threading::SetNameOfCurrentThread("MTVU");
-	u32 primed_direct_program_token = 0;
+	u32 primed_direct_entry_token = 0;
+	u32 primed_direct_resume_token = 0;
+	VitaGpuVu::DirectContinuationSeed active_direct_continuation;
+#if defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
+	bool reported_first_direct_job = false;
+	bool reported_first_queued_direct_draw = false;
+#endif
 
 	for (;;)
 	{
@@ -267,53 +314,219 @@ void VU_Thread::ExecuteRingBuffer()
 			{
 				case MTVU_VU_EXECUTE:
 				case MTVU_VU_EXECUTE_DIRECT:
+				case MTVU_VU_EXECUTE_DIRECT_PRIME:
 				{
 					const bool has_direct_program =
+						tag == MTVU_VU_EXECUTE_DIRECT ||
+						tag == MTVU_VU_EXECUTE_DIRECT_PRIME;
+					const bool allow_direct_draw =
 						tag == MTVU_VU_EXECUTE_DIRECT;
-					ReplayDeferredVifUnpacks();
 					VU1.cycle = 0;
 					s32 addr = Read();
 					vifRegs.top = Read();
 					vifRegs.itop = Read();
+					const u32 execution_vif_top = vifRegs.top;
+					const u32 execution_vif_itop = vifRegs.itop;
 					vuFBRST = Read();
 					const VitaGpuVu::DirectProgramToken direct_program{
 						has_direct_program ? Read() : 0};
+					const VitaGpuVu::DirectProgramToken continuation_program{
+						has_direct_program ? Read() : 0};
+					if (addr != -1)
+						active_direct_continuation = {};
 					if (addr != -1)
 						VU1.VI[REG_TPC].UL = addr & 0x7FF;
 					CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
+#if defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
+					// Bounded arrival evidence for the first direct job only.
+					if (has_direct_program && !reported_first_direct_job)
+					{
+						reported_first_direct_job = true;
+						Console.WriteLn(
+							"GPU-VU: first direct VU1 job token %08x, TPC "
+							"%04x, TOP %04x, ITOP %04x, %u deferred spans, "
+							"connected %u.",
+							direct_program.value, VU1.VI[REG_TPC].UL << 3,
+							vifRegs.top, vifRegs.itop,
+							static_cast<u32>(m_deferred_vif_unpacks.size()),
+							VitaGpuVu::IsDirectDrawAdmissionConnected() ? 1u :
+																		  0u);
+					}
+#endif
+					bool queued_direct_draw = false;
+					if (!allow_direct_draw)
+					{
+						// Prime-only jobs are an intentional CPU execution, not
+						// a rejected admission attempt.
+					}
+					else if (!VitaGpuVu::IsDirectDrawAdmissionConnected())
+					{
+						VitaGpuVu::RecordDirectAdmissionFailure(
+							VitaGpuVu::AdmissionFailure::Disconnected);
+					}
+					else if (!direct_program.IsValid())
+					{
+						VitaGpuVu::RecordDirectAdmissionFailure(
+							VitaGpuVu::AdmissionFailure::NoProgramToken);
+					}
 					if (VitaGpuVu::IsDirectDrawAdmissionConnected() &&
-						direct_program.IsValid() &&
-						direct_program.value != primed_direct_program_token)
+						direct_program.IsValid())
 					{
 						std::array<u16, 16> initial_vi{};
-						std::array<u32, 32 * 4> initial_vf{};
 						for (u32 reg = 0; reg < initial_vi.size(); reg++)
 							initial_vi[reg] = VU1.VI[reg].US[0];
-						for (u32 reg = 0; reg < 32; reg++)
-						{
-							for (u32 lane = 0; lane < 4; lane++)
-								initial_vf[reg * 4 + lane] = VU1.VF[reg].UL[lane];
-						}
 
+						GpuVuMemoryView memory_view{
+							VU1.Mem, &m_deferred_vif_unpacks};
 						VitaGpuVu::InvocationEvaluationContext context;
 						context.vif_top = static_cast<u16>(vifRegs.top);
 						context.vif_itop = static_cast<u16>(vifRegs.itop);
 						context.initial_vi = initial_vi.data();
-						context.initial_vf_words = initial_vf.data();
-						context.memory_user = VU1.Mem;
+						context.initial_vf_words = &VU1.VF[0].UL[0];
+						context.initial_acc_words = &VU1.ACC.UL[0];
+						context.initial_q = VU1.VI[REG_Q].UL;
+						context.initial_p = VU1.VI[REG_P].UL;
+						context.initial_i = VU1.VI[REG_I].UL;
+						context.memory_user = &memory_view;
 						context.read_memory_u16 = ReadGpuVuMemoryU16;
 						context.read_memory_u32 = ReadGpuVuMemoryU32;
-						if (VitaGpuVu::PrimeDirectProgram(
+						u32& primed_direct_program_token =
+							addr == -1 ? primed_direct_resume_token :
+								primed_direct_entry_token;
+						if (direct_program.value !=
+								primed_direct_program_token &&
+							VitaGpuVu::PrimeDirectProgram(
 								direct_program, context))
 						{
 							primed_direct_program_token =
 								direct_program.value;
 						}
+						VitaGpuVu::DirectContinuationSeed pending_continuation;
+						bool begins_continuation = false;
+						std::unique_ptr<VitaGpuVu::GpuVuDraw> draw;
+						if (allow_direct_draw && addr != -1 &&
+							continuation_program.IsValid() &&
+							VitaGpuVu::IsDirectContinuationPair(
+								direct_program, continuation_program))
+						{
+							draw = VitaGpuVu::BuildDirectGpuVuDraw(
+								direct_program, context,
+								m_deferred_vif_unpacks);
+							begins_continuation = draw &&
+								VitaGpuVu::CaptureDirectContinuationSeed(
+									direct_program, continuation_program,
+									context, *draw, &pending_continuation);
+							if (!begins_continuation)
+								draw.reset();
+						}
+						else if (allow_direct_draw && addr == -1 &&
+							active_direct_continuation.IsValid() &&
+							active_direct_continuation.entry_program ==
+								continuation_program &&
+							active_direct_continuation.resume_program ==
+								direct_program)
+						{
+							draw =
+								VitaGpuVu::BuildDirectGpuVuContinuationDraw(
+									active_direct_continuation, context,
+									m_deferred_vif_unpacks);
+						}
+						else if (allow_direct_draw)
+						{
+							draw = VitaGpuVu::BuildDirectGpuVuDraw(
+								direct_program, context,
+								m_deferred_vif_unpacks);
+						}
+						const u32 direct_vertices =
+							draw ? draw->vertex_count : 0;
+						const u32 direct_primitives =
+							draw ? draw->primitive_count : 0;
+						const u32 direct_streams =
+							draw ? static_cast<u32>(draw->streams.size()) : 0;
+						const std::array<u16, 16> direct_final_vi =
+							draw ? draw->final_vi_values :
+								   std::array<u16, 16>{};
+						const u32 direct_final_vi_mask =
+							draw ? draw->final_vi_write_mask : 0;
+						const bool built = static_cast<bool>(draw);
+						if (allow_direct_draw && !built)
+						{
+							VitaGpuVu::RecordDirectAdmissionFailure(
+								VitaGpuVu::AdmissionFailure::BuildFailed);
+						}
+						if (built &&
+							VitaGS::QueueGpuVuDraw(std::move(draw)))
+						{
+#if defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
+							if (!reported_first_queued_direct_draw)
+							{
+								reported_first_queued_direct_draw = true;
+								Console.WriteLn(
+									"GPU-VU: first direct draw queued from MTVU "
+									"(%u vertices, %u primitives, %u raw streams); "
+									"CpuVU1->Execute bypassed.",
+									direct_vertices, direct_primitives,
+									direct_streams);
+							}
+#endif
+							VitaGpuVu::DirectProgramInfo info;
+							if (VitaGpuVu::GetDirectProgramInfo(
+									direct_program, &info) &&
+								info.resume_pc_count == 1)
+							{
+								VU1.VI[REG_TPC].UL =
+									info.unique_resume_pc >> 3;
+							}
+							// Keep VIF writes in the immutable overlay. The draw
+							// retained each payload it references, and a later CPU
+							// fallback or architectural observer materializes the
+							// remaining journal before reading VU memory.
+							for (u32 reg = 1;
+								 reg < direct_final_vi.size(); reg++)
+							{
+								if ((direct_final_vi_mask &
+										(1u << reg)) != 0)
+								{
+									VU1.VI[reg].US[0] =
+										direct_final_vi[reg];
+								}
+							}
+							BeginProgram();
+							EndProgram(InterruptFlagVUEBit);
+							vuCycles[vuCycleIdx].store(
+								4, std::memory_order_release);
+							vuCycleIdx = (vuCycleIdx + 1) & 3;
+							if (begins_continuation)
+								active_direct_continuation =
+									std::move(pending_continuation);
+							queued_direct_draw = true;
+						}
+						else if (built)
+						{
+							VitaGpuVu::RecordDirectAdmissionFailure(
+								VitaGpuVu::AdmissionFailure::QueueRejected);
+						}
 					}
+					if (queued_direct_draw)
+						break;
+
+					ReplayDeferredVifUnpacks();
+					// PCSX2 Vif_Codes.cpp::vuExecMicro() publishes TOP/ITOP
+					// for this exact MSCAL/MSCNT before it advances the VIF1
+					// double buffer. Replaying an earlier UNPACK reconstructs
+					// that command's VIF registers as an implementation detail;
+					// it must not replace the execution snapshot observed by
+					// XTOP/XITOP in the VU program.
+					vifRegs.top = execution_vif_top;
+					vifRegs.itop = execution_vif_itop;
 					BeginProgram();
 					CpuVU1->Execute(vu1RunCycles);
+					// gsPack accumulates this dispatch's XGKICK bytes and is reset
+					// by FinishGSPacketMTVU, so sample it first.
+					VitaGpuVu::RecordCpuVu1Execution(
+						gifUnit.gifPath[GIF_PATH_1].gsPack.size);
 					gifUnit.gifPath[GIF_PATH_1].FinishGSPacketMTVU();
-					semaXGkick.Post(); // Tell MTGS a path1 packet is complete
+					VitaGS::CompleteMtvuPath1Packet();
 					vuCycles[vuCycleIdx].store(VU1.cycle, std::memory_order_release);
 					vuCycleIdx = (vuCycleIdx + 1) & 3;
 					break;
@@ -322,23 +535,28 @@ void VU_Thread::ExecuteRingBuffer()
 				{
 					u32 vu_micro_addr = Read();
 					u32 size = Read();
-					Read(&VU1.Micro[vu_micro_addr], size);
-					primed_direct_program_token = 0;
-					break;
-				}
-				case MTVU_VU_WRITE_DATA:
-				{
-					ReplayDeferredVifUnpacks();
+						Read(&VU1.Micro[vu_micro_addr], size);
+						primed_direct_entry_token = 0;
+						primed_direct_resume_token = 0;
+						active_direct_continuation = {};
+						break;
+					}
+					case MTVU_VU_WRITE_DATA:
+					{
+						active_direct_continuation = {};
+						ReplayDeferredVifUnpacks();
 					u32 vu_data_addr = Read();
 					u32 size = Read();
 					Read(&VU1.Mem[vu_data_addr], size);
 					break;
-				}
-				case MTVU_VU_WRITE_VIREGS:
-					Read(&VU1.VI, size_u32(32));
-					break;
-				case MTVU_VU_WRITE_VFREGS:
-					Read(&VU1.VF, size_u32(4*32));
+					}
+					case MTVU_VU_WRITE_VIREGS:
+						active_direct_continuation = {};
+						Read(&VU1.VI, size_u32(32));
+						break;
+					case MTVU_VU_WRITE_VFREGS:
+						active_direct_continuation = {};
+						Read(&VU1.VF, size_u32(4*32));
 					break;
 				case MTVU_VIF_WRITE_COL:
 					Read(&vif.MaskCol, sizeof(vif.MaskCol));
@@ -346,9 +564,10 @@ void VU_Thread::ExecuteRingBuffer()
 				case MTVU_VIF_WRITE_ROW:
 					Read(&vif.MaskRow, sizeof(vif.MaskRow));
 					break;
-				case MTVU_VIF_UNPACK:
-				{
-					ReplayDeferredVifUnpacks();
+					case MTVU_VIF_UNPACK:
+					{
+						active_direct_continuation = {};
+						ReplayDeferredVifUnpacks();
 					u32 vif_copy_size = static_cast<u32>((uptr)&vif.StructEnd - (uptr)&vif.tag);
 					Read(&vif.tag, vif_copy_size);
 					ReadRegs(&vifRegs);
@@ -368,15 +587,13 @@ void VU_Thread::ExecuteRingBuffer()
 						VitaGpuVu::ReleaseRawVifPayload(&span.payload);
 						break;
 					}
-					m_deferred_vif_unpacks.push_back(std::move(span));
-					m_deferred_vif_unpack_count.store(
-						static_cast<u32>(m_deferred_vif_unpacks.size()),
-						std::memory_order_release);
-					VitaGpuVu::RecordDeferredVifUnpack();
+					AppendDeferredVifUnpack(std::move(span));
 					break;
 				}
-				case MTVU_FLUSH_VIF_UNPACKS:
-					ReplayDeferredVifUnpacks();
+					case MTVU_FLUSH_VIF_UNPACKS:
+						active_direct_continuation = {};
+						ReplayDeferredVifUnpacks();
+					VitaGS::FlushMtvuPath1Completions();
 					break;
 				case MTVU_NULL_PACKET:
 					m_read_pos = 0;
@@ -386,8 +603,19 @@ void VU_Thread::ExecuteRingBuffer()
 
 			CommitReadPos();
 		}
+
+		// QueueGpuVuDraw() deliberately batches consecutive accepted
+		// dispatches, but the immutable VIF ring can fill before the batch
+		// reaches its size threshold. Publish a partial run whenever MTVU has
+		// drained its command queue. Otherwise the EE producer can wait for a
+		// VIF slot whose last references are owned by the unpublished run,
+		// while MTVU sleeps and the GS owner has no descriptor it can retire.
+		// This is an ordered queue-drain boundary, not a per-dispatch
+		// rendezvous.
+		VitaGS::FlushMtvuPath1Completions();
 	}
 
+	VitaGS::FlushMtvuPath1Completions();
 	semaEvent.Kill();
 }
 
@@ -410,6 +638,14 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 		// Note: a wait lock instead of a yield also helps to avoid the bug.
 		if (readPos > m_write_pos + size + _4kb)
 			break; // Enough free front space
+		if (m_pending_vif_batch)
+		{
+			// A transfer larger than the producer ring must expose its earlier
+			// complete UNPACK commands before waiting for the worker to make
+			// room. This is a pressure escape, not the ordinary hot path.
+			PublishPendingVifBatch();
+			continue;
+		}
 		{          // Let MTVU run to free up buffer space
 			if (performance_telemetry_enabled && !counted_wait)
 			{
@@ -479,6 +715,7 @@ __fi void VU_Thread::CommitWritePos()
 		m_profile_queue_words += queued_words;
 	}
 	m_ato_write_pos.store(m_write_pos, std::memory_order_release);
+	m_pending_vif_batch = false;
 
 	if (MTVU_ALWAYS_KICK)
 		KickStart();
@@ -637,11 +874,21 @@ void VU_Thread::KickStart()
 bool VU_Thread::IsDone()
 {
 	return GetReadPos() == GetWritePos() &&
+		!m_pending_vif_batch &&
 		m_deferred_vif_unpack_count.load(std::memory_order_acquire) == 0;
+}
+
+void VU_Thread::PublishPendingVifBatch()
+{
+	if (!m_pending_vif_batch)
+		return;
+	CommitWritePos();
+	KickStart();
 }
 
 void VU_Thread::WaitForQueue()
 {
+	PublishPendingVifBatch();
 	KickStart();
 	semaEvent.WaitForEmpty();
 }
@@ -664,6 +911,40 @@ void VU_Thread::WaitVU()
 	WaitForQueue();
 }
 
+void VU_Thread::AppendDeferredVifUnpack(
+	VitaGpuVu::VifUnpackSpan span)
+{
+	// PCSX2 owner: Vif_Unpack.cpp::_nVifUnpackLoop(). Mode-zero V4-32 with
+	// CL==WL has no side effect beyond one sequential, wrapping VU-memory
+	// write per source vector. A later span which covers that complete modular
+	// range therefore makes the older payload unreachable.
+	for (auto it = m_deferred_vif_unpacks.begin();
+		 it != m_deferred_vif_unpacks.end();)
+	{
+		if (VitaGpuVu::DirectAffineSpanFullyOverwrites(span, *it))
+		{
+			VitaGpuVu::ReleaseRawVifPayload(&it->payload);
+			it = m_deferred_vif_unpacks.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+
+	// Partial overlaps require segment splitting to compact further. Preserve
+	// exact behavior by materializing the bounded journal instead of allowing
+	// unbounded storage or search work on the 496 MHz VU worker.
+	if (m_deferred_vif_unpacks.size() >= MaximumDeferredAffineSpans)
+		ReplayDeferredVifUnpacks();
+
+	m_deferred_vif_unpacks.push_back(std::move(span));
+	m_deferred_vif_unpack_count.store(
+		static_cast<u32>(m_deferred_vif_unpacks.size()),
+		std::memory_order_release);
+	VitaGpuVu::RecordDeferredVifUnpack();
+}
+
 void VU_Thread::ReplayDeferredVifUnpacks()
 {
 	for (VitaGpuVu::VifUnpackSpan& span : m_deferred_vif_unpacks)
@@ -678,6 +959,17 @@ void VU_Thread::ReplayDeferredVifUnpacks()
 			continue;
 		}
 
+		if (VitaGpuVu::MaterializeDirectAffineV4_32Span(
+				span, source, VU1.Mem, VU1_MEMSIZE))
+		{
+			VitaGpuVu::RecordReplayedVifUnpack();
+			VitaGpuVu::ReleaseRawVifPayload(&span.payload);
+			continue;
+		}
+
+		// Captured spans are admitted only by IsDirectAffineV4_32Span(), so this
+		// is a defensive semantic fallback for corrupted or future descriptor
+		// forms rather than the ordinary replay path.
 		vif.tag.addr = static_cast<u32>(span.destination_qword) * 16u;
 		vif.tag.size = span.tag_size_words;
 		vif.tag.cmd = span.command;
@@ -714,21 +1006,79 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 	MTVU_LOG("MTVU - ExecuteVU!");
 	PrepareVuCodeForExecute(static_cast<s32>(vu_addr));
 	Get_MTVUChanges(); // Clear any pending interrupts
-	const bool direct_program_job =
-		VitaGpuVu::IsDirectDrawAdmissionConnected() &&
+	bool direct_program_job = false;
+	bool prime_program_job = false;
+	VitaGpuVu::DirectProgramToken execution_direct_program{};
+	VitaGpuVu::DirectProgramToken continuation_direct_program{};
+	if (VitaGpuVu::IsDirectDrawAdmissionConnected() &&
+		vu_addr == static_cast<u32>(-1) &&
+		m_gpu_vu_direct_resume_token != 0)
+	{
+		const VitaGpuVu::DirectInputState input_state =
+			VitaGpuVu::GetDirectProgramInputState(
+				{m_gpu_vu_direct_resume_token});
+		if (input_state == VitaGpuVu::DirectInputState::Pending ||
+			input_state == VitaGpuVu::DirectInputState::Ready)
+		{
+			direct_program_job = true;
+			execution_direct_program = {m_gpu_vu_direct_resume_token};
+			continuation_direct_program = {m_gpu_vu_direct_program_token};
+		}
+		else
+		{
+			m_gpu_vu_direct_resume_token = 0;
+		}
+	}
+	else if (VitaGpuVu::IsDirectDrawAdmissionConnected() &&
 		vu_addr != static_cast<u32>(-1) &&
-		m_gpu_vu_direct_program_token != 0;
-	ReserveSpace(direct_program_job ? 6 : 5);
-	Write(direct_program_job ? MTVU_VU_EXECUTE_DIRECT : MTVU_VU_EXECUTE);
+		m_gpu_vu_direct_program_token != 0)
+	{
+		const VitaGpuVu::DirectInputState input_state =
+			VitaGpuVu::GetDirectProgramInputState(
+				{m_gpu_vu_direct_program_token});
+			if (input_state == VitaGpuVu::DirectInputState::Pending)
+			{
+				// The explicit root contains the skipped MSCAL prologue and is the
+				// eventual GPU-owned continuation seed. Compile it now, but keep the
+				// CPU execution authoritative until its live VF/VI state can be
+				// carried across following MSCNT commands without a stale snapshot.
+				prime_program_job = true;
+				execution_direct_program = {m_gpu_vu_direct_program_token};
+			}
+			else if (input_state == VitaGpuVu::DirectInputState::Ready &&
+				m_gpu_vu_direct_resume_token != 0 &&
+				VitaGpuVu::GetDirectProgramInputState(
+					{m_gpu_vu_direct_resume_token}) ==
+						VitaGpuVu::DirectInputState::Ready)
+			{
+				// Both exact-image entries are registered. The worker performs
+				// the semantic same-loop continuation proof before it may replace
+				// this explicit MSCAL with the generated entry root.
+				direct_program_job = true;
+				execution_direct_program = {m_gpu_vu_direct_program_token};
+				continuation_direct_program = {
+					m_gpu_vu_direct_resume_token};
+			}
+		}
+	const bool tagged_program_job =
+		direct_program_job || prime_program_job;
+	ReserveSpace(tagged_program_job ? 7 : 5);
+	Write(direct_program_job ? MTVU_VU_EXECUTE_DIRECT :
+		(prime_program_job ? MTVU_VU_EXECUTE_DIRECT_PRIME :
+			MTVU_VU_EXECUTE));
 	Write(vu_addr);
 	Write(vif_top);
 	Write(vif_itop);
 	Write(fbrst);
-	// MSCNT resumes from the MTVU-owned TPC, which is deliberately stale on
-	// CPU0. Dependent command-chain execution belongs to the universal GPU
-	// executor; never attach an explicit-entry direct token to that job.
-	if (direct_program_job)
-		Write(m_gpu_vu_direct_program_token);
+	// MSCNT resumes from the MTVU-owned TPC. The token is prepared from the
+	// exact post-E PC, never guessed from CPU0's deliberately stale TPC. An
+	// explicit MSCAL carries both exact entry and continuation tokens so the
+	// worker can prove and seed a GPU-owned chain before bypassing ARM work.
+	if (tagged_program_job)
+	{
+		Write(execution_direct_program.value);
+		Write(continuation_direct_program.value);
+	}
 	CommitWritePos();
 	if (VitaPerformanceTelemetry::IsEnabled())
 		m_profile_execute_enqueues++;
@@ -750,33 +1100,60 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
 void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* data, u32 size)
 {
 	MTVU_LOG("MTVU - VifUnpack!");
+#if defined(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY) || \
+	defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
+	bool retain_immutable_input = false;
 #if defined(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY)
-	VitaGpuVu::VifUnpackSpan span;
-	span.sequence = ++m_vif_span_sequence;
-	span.source_size = size;
-	span.tag_size_words = _vif.tag.size;
-	span.mask = _vifRegs.mask;
-	span.destination_qword = static_cast<u16>(_vif.tag.addr >> 4);
-	span.vector_count = static_cast<u16>(_vifRegs.num);
-	span.vif_top = static_cast<u16>(_vifRegs.top);
-	span.vif_itop = static_cast<u16>(_vifRegs.itop);
-	span.command = static_cast<u8>(_vif.tag.cmd);
-	span.cycle_cl = _vifRegs.cycle.cl;
-	span.cycle_wl = _vifRegs.cycle.wl;
-	span.mode = static_cast<u8>(_vifRegs.mode);
-	span.unsigned_data = _vif.usn;
-	span.start_alignment = _vif.start_aligned;
-	const bool direct_affine_span =
-		VitaGpuVu::IsDirectAffineV4_32Span(span);
-	if (direct_affine_span &&
-		VitaGpuVu::CaptureRawVifPayload(data, size, &span.payload))
+	retain_immutable_input = true;
+#elif defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
+	if (m_gpu_vu_direct_resume_token != 0)
 	{
-		ReserveSpace(1 + size_u32(sizeof(span)));
-		Write(MTVU_VIF_UNPACK_CAPTURED);
-		Write(&span, sizeof(span));
-		CommitWritePos();
-		KickStart();
-		return;
+		const VitaGpuVu::DirectInputState input_state =
+			VitaGpuVu::GetDirectProgramInputState(
+				{m_gpu_vu_direct_resume_token});
+		if (input_state == VitaGpuVu::DirectInputState::Ready)
+		{
+			retain_immutable_input = true;
+		}
+		else if (input_state == VitaGpuVu::DirectInputState::LayoutRejected ||
+			input_state == VitaGpuVu::DirectInputState::Unavailable)
+		{
+			VitaGpuVu::RecordCaptureBypass(size);
+			m_gpu_vu_direct_resume_token = 0;
+		}
+	}
+#endif
+	if (retain_immutable_input)
+	{
+		VitaGpuVu::VifUnpackSpan span;
+		span.sequence = ++m_vif_span_sequence;
+		span.source_size = size;
+		span.tag_size_words = _vif.tag.size;
+		span.mask = _vifRegs.mask;
+		span.destination_qword = static_cast<u16>(_vif.tag.addr >> 4);
+		span.vector_count = static_cast<u16>(_vifRegs.num);
+		span.vif_top = static_cast<u16>(_vifRegs.top);
+		span.vif_itop = static_cast<u16>(_vifRegs.itop);
+		span.command = static_cast<u8>(_vif.tag.cmd);
+		span.cycle_cl = _vifRegs.cycle.cl;
+		span.cycle_wl = _vifRegs.cycle.wl;
+		span.mode = static_cast<u8>(_vifRegs.mode);
+		span.unsigned_data = _vif.usn;
+		span.start_alignment = _vif.start_aligned;
+		if (VitaGpuVu::IsDirectAffineV4_32Span(span) &&
+			VitaGpuVu::CaptureRawVifPayload(data, size, &span.payload))
+		{
+			ReserveSpace(1 + size_u32(sizeof(span)));
+			Write(MTVU_VIF_UNPACK_CAPTURED);
+			Write(&span, sizeof(span));
+			// The common VIF packet immediately follows its affine UNPACKs
+			// with MSCNT. ExecuteVU() publishes the whole group with one
+			// release store and one worker wake. VIF1transfer() publishes at
+			// return when no execute follows, preserving ordinary MTVU
+			// visibility and every observation boundary.
+			m_pending_vif_batch = true;
+			return;
+		}
 	}
 #endif
 
@@ -797,6 +1174,8 @@ void VU_Thread::WriteMicroMem(u32 vu_micro_addr, const void* data, u32 size)
 	if (size != 0)
 	{
 		m_gpu_vu_direct_program_prepared = false;
+		m_gpu_vu_direct_program_token = 0;
+		m_gpu_vu_direct_resume_token = 0;
 		const u32 end = std::min<u32>(vu_micro_addr + size, VU1_PROGSIZE);
 		if (!m_micro_write_pending)
 		{
@@ -823,8 +1202,10 @@ void VU_Thread::PrepareVuCodeForExecute(s32 vu_addr)
 {
 	const bool native_preparation_required =
 		m_micro_write_pending || VitaVU::Vu1ProgramNeedsPreparation(vu_addr);
+	const bool direct_admission_connected =
+		VitaGpuVu::IsDirectDrawAdmissionConnected();
 	const bool direct_start_known =
-		VitaGpuVu::IsDirectDrawAdmissionConnected() && vu_addr != -1;
+		direct_admission_connected && vu_addr != -1;
 	const u32 direct_start_pc = direct_start_known ?
 		((static_cast<u32>(vu_addr) & 0x7ffu) << 3) : 0;
 	if (!native_preparation_required &&
@@ -853,8 +1234,16 @@ void VU_Thread::PrepareVuCodeForExecute(s32 vu_addr)
 
 	if (!direct_start_known)
 	{
-		m_gpu_vu_direct_program_token = 0;
-		m_gpu_vu_direct_program_prepared = false;
+		// MSCNT has no explicit VIF address, but the exact post-E token was
+		// proven from the preceding explicit program and remains valid across
+		// preparation of the native fallback's live resume map. Micro writes,
+		// Reset(), and a later explicit MSCAL own invalidation/replacement.
+		if (!direct_admission_connected)
+		{
+			m_gpu_vu_direct_program_token = 0;
+			m_gpu_vu_direct_resume_token = 0;
+			m_gpu_vu_direct_program_prepared = false;
+		}
 		return;
 	}
 
@@ -867,6 +1256,41 @@ void VU_Thread::PrepareVuCodeForExecute(s32 vu_addr)
 			VitaGpuVu::GetDirectProgramInfo(prepared, &info) &&
 			info.parallel_candidates != 0 ?
 		prepared.value : 0;
+	m_gpu_vu_direct_resume_token = 0;
+	VitaGpuVu::DirectProgramInfo resume_info;
+	VitaGpuVu::DirectProgramToken resume{0};
+	if (prepared.IsValid() && info.resume_pc_count == 1)
+	{
+		resume = VitaGpuVu::PrepareDirectProgram(VU1.Micro, VU1_PROGSIZE,
+			info.unique_resume_pc);
+		if (resume.IsValid() &&
+			VitaGpuVu::GetDirectProgramInfo(resume, &resume_info) &&
+			resume_info.parallel_candidates != 0 &&
+			resume_info.resume_pc_count == 1 &&
+			resume_info.unique_resume_pc == info.unique_resume_pc)
+		{
+			m_gpu_vu_direct_resume_token = resume.value;
+		}
+	}
+#if defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
+	// Bounded publication evidence: preparation only reaches here on a real
+	// derivation, and the report is further limited to observed changes.
+	if (m_gpu_vu_direct_program_token != m_gpu_vu_direct_reported_program_token ||
+		m_gpu_vu_direct_resume_token != m_gpu_vu_direct_reported_resume_token)
+	{
+		m_gpu_vu_direct_reported_program_token = m_gpu_vu_direct_program_token;
+		m_gpu_vu_direct_reported_resume_token = m_gpu_vu_direct_resume_token;
+		Console.WriteLn(
+			"GPU-VU: prepare entry %04x token %08x (%u candidates, %u resume "
+			"pcs, resume pc %04x) -> resume token %08x (raw %08x, %u "
+			"candidates, %u resume pcs, resume pc %04x).",
+			direct_start_pc, m_gpu_vu_direct_program_token,
+			info.parallel_candidates, info.resume_pc_count,
+			info.unique_resume_pc, m_gpu_vu_direct_resume_token, resume.value,
+			resume_info.parallel_candidates, resume_info.resume_pc_count,
+			resume_info.unique_resume_pc);
+	}
+#endif
 	m_gpu_vu_direct_program_start_pc = direct_start_pc;
 	m_gpu_vu_direct_program_prepared = true;
 }

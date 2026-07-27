@@ -157,6 +157,8 @@ bool ScanBlock(const u8 *micro, u32 mask, u32 start_pc,
 
     if (ends_after_delay) {
       pending->block.ends_program = true;
+      pending->block.resume_pc = (delay_pc + PairBytes) & mask;
+      pending->block.has_resume_pc = true;
       pending->targets.emplace_back(ControlEdgeKind::ProgramExit, 0);
       return true;
     }
@@ -618,6 +620,28 @@ void FindNaturalLoops(ProgramAnalysis *analysis, u32 entry_block) {
   }
 }
 
+// Forward reachability from the external entry. BuildBlocks decodes the whole
+// image, so an MSCNT resume entry which branches past its prologue still owns
+// the prologue's blocks. Only this marking distinguishes the pairs the entry
+// can execute from the pairs it cannot.
+void MarkEntryReachability(ProgramAnalysis *analysis, u32 entry_block) {
+  std::vector<u32> work{entry_block};
+  analysis->blocks[entry_block].reachable_from_entry = true;
+  while (!work.empty()) {
+    const u32 block_index = work.back();
+    work.pop_back();
+    for (const ControlEdge &edge : analysis->blocks[block_index].successors) {
+      if (!edge.has_target ||
+          edge.target_block >= analysis->blocks.size() ||
+          analysis->blocks[edge.target_block].reachable_from_entry) {
+        continue;
+      }
+      analysis->blocks[edge.target_block].reachable_from_entry = true;
+      work.push_back(edge.target_block);
+    }
+  }
+}
+
 void AnalyzeExitReachability(ProgramAnalysis *analysis) {
   std::vector<bool> can_reach_exit(analysis->blocks.size(), false);
   std::vector<u32> work;
@@ -676,6 +700,8 @@ bool AnalyzeGpuVu1Program(const u8 *micro, u32 micro_size, u32 start_pc,
       entry_block = i;
     analysis->has_branch_in_delay_slot |= block.branch_in_delay_slot;
     analysis->has_external_exit |= block.has_external_exit;
+    if (block.has_resume_pc)
+      analysis->resume_pcs.push_back(block.resume_pc);
     for (const ControlEdge &edge : block.successors) {
       analysis->resolved_indirect_edges +=
           edge.kind == ControlEdgeKind::ResolvedIndirect ? 1u : 0u;
@@ -686,6 +712,11 @@ bool AnalyzeGpuVu1Program(const u8 *micro, u32 micro_size, u32 start_pc,
   if (entry_block == std::numeric_limits<u32>::max())
     return Fail(error, "VU1 CFG has no entry block");
 
+  std::sort(analysis->resume_pcs.begin(), analysis->resume_pcs.end());
+  analysis->resume_pcs.erase(
+      std::unique(analysis->resume_pcs.begin(), analysis->resume_pcs.end()),
+      analysis->resume_pcs.end());
+  MarkEntryReachability(analysis, entry_block);
   FindNaturalLoops(analysis, entry_block);
   AnalyzeExitReachability(analysis);
   analysis->complete_cfg = !analysis->has_unresolved_indirect_control &&

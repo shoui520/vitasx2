@@ -3,6 +3,9 @@
 
 #include "vita/VitaGpuVuVifInput.h"
 
+#include "common/AlignedMalloc.h"
+#include "vita/VitaGpuVuDraw.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -16,6 +19,7 @@
 #if !defined(VITASX2_QEMU_VALIDATION)
 #include "common/Console.h"
 #include "vita/VitaGxmMemory.h"
+#include "vita/VitaGsMailbox.h"
 
 #include <chrono>
 #include <psp2/gxm.h>
@@ -33,8 +37,10 @@ u32 NormalizedCycle(u8 value) {
 
 std::atomic<u64> s_captures{0};
 std::atomic<u64> s_captured_bytes{0};
-std::atomic<u64> s_disconnected_bypasses{0};
-std::atomic<u64> s_disconnected_bypass_bytes{0};
+std::atomic<u64> s_publication_batches{0};
+std::atomic<u64> s_published_bytes{0};
+std::atomic<u64> s_capture_bypasses{0};
+std::atomic<u64> s_capture_bypass_bytes{0};
 std::atomic<u64> s_capture_fallbacks{0};
 std::atomic<u64> s_slot_reuses{0};
 std::atomic<u64> s_ring_waits{0};
@@ -58,8 +64,10 @@ void RecordReferenceCreated() {
 void ResetStatistics() {
   s_captures.store(0, std::memory_order_relaxed);
   s_captured_bytes.store(0, std::memory_order_relaxed);
-  s_disconnected_bypasses.store(0, std::memory_order_relaxed);
-  s_disconnected_bypass_bytes.store(0, std::memory_order_relaxed);
+  s_publication_batches.store(0, std::memory_order_relaxed);
+  s_published_bytes.store(0, std::memory_order_relaxed);
+  s_capture_bypasses.store(0, std::memory_order_relaxed);
+  s_capture_bypass_bytes.store(0, std::memory_order_relaxed);
   s_capture_fallbacks.store(0, std::memory_order_relaxed);
   s_slot_reuses.store(0, std::memory_order_relaxed);
   s_ring_waits.store(0, std::memory_order_relaxed);
@@ -72,12 +80,16 @@ void ResetStatistics() {
 
 #if !defined(VITASX2_QEMU_VALIDATION)
 
-constexpr u32 SlotCount = 4;
-constexpr u32 SlotSize = 2 * 1024 * 1024;
 constexpr u32 PayloadAlignment = 16;
 
-std::mutex s_active_ring_mutex;
-InputRing* s_active_ring = nullptr;
+// VU_Thread::VifUnpack() is the only payload producer. Keep registration
+// atomic so that the per-UNPACK path does not enter a process mutex merely to
+// rediscover the same lifetime-stable ring. The process-wide capture count is
+// incremented before loading the pointer: Shutdown() first unpublishes the
+// pointer and then waits for this count, so a producer can never retain a
+// pointer across unmapping.
+std::atomic<InputRing*> s_active_ring{nullptr};
+std::atomic<u32> s_active_capture_calls{0};
 
 bool AlignUp(u32 value, u32 alignment, u32* aligned) {
   if (!aligned || alignment == 0 || (alignment & (alignment - 1)) != 0 ||
@@ -105,6 +117,25 @@ bool IsDirectAffineV4_32Span(const VifUnpackSpan& span) {
   const u64 required_bytes =
       static_cast<u64>(span.vector_count) * 16u;
   return span.source_size >= required_bytes;
+}
+
+bool DirectAffineSpanFullyOverwrites(const VifUnpackSpan& newer,
+                                     const VifUnpackSpan& older) {
+  if (!IsDirectAffineV4_32Span(newer) ||
+      !IsDirectAffineV4_32Span(older)) {
+    return false;
+  }
+
+  const u32 newer_start =
+      static_cast<u32>(newer.destination_qword) &
+      (Vu1MemoryQwords - 1);
+  const u32 older_start =
+      static_cast<u32>(older.destination_qword) &
+      (Vu1MemoryQwords - 1);
+  const u32 older_offset =
+      (older_start - newer_start) & (Vu1MemoryQwords - 1);
+  return older_offset < newer.vector_count &&
+         older.vector_count <= newer.vector_count - older_offset;
 }
 
 bool BindAffineRawQwords(const VifUnpackSpan& span,
@@ -148,19 +179,61 @@ bool BindAffineRawQwords(const VifUnpackSpan& span,
   return true;
 }
 
+bool MaterializeDirectAffineV4_32Span(const VifUnpackSpan& span,
+                                     const void* source,
+                                     void* vu_memory,
+                                     u32 vu_memory_size) {
+  if (!source || !vu_memory || !IsDirectAffineV4_32Span(span) ||
+      vu_memory_size == 0 || (vu_memory_size & 0x0fu) != 0) {
+    return false;
+  }
+
+  const u64 required_bytes =
+      static_cast<u64>(span.vector_count) * 16u;
+  if (required_bytes > span.source_size ||
+      required_bytes > std::numeric_limits<u32>::max()) {
+    return false;
+  }
+
+  const u8* source_bytes = static_cast<const u8*>(source);
+  u8* memory_bytes = static_cast<u8*>(vu_memory);
+  u32 remaining = static_cast<u32>(required_bytes);
+  u32 source_offset = 0;
+  u32 destination_offset =
+      (static_cast<u32>(span.destination_qword) * 16u) %
+      vu_memory_size;
+  while (remaining != 0) {
+    const u32 chunk =
+        std::min(remaining, vu_memory_size - destination_offset);
+    std::memcpy(memory_bytes + destination_offset,
+                source_bytes + source_offset, chunk);
+    remaining -= chunk;
+    source_offset += chunk;
+    destination_offset = 0;
+  }
+  return true;
+}
+
 struct InputRing::Impl {
 #if !defined(VITASX2_QEMU_VALIDATION)
   struct Slot {
     VitaGXM::MappedBlock block;
+    u8* staging = nullptr;
     std::atomic<u32> generation{1};
     std::atomic<u32> references{0};
+    std::atomic<u32> committed_offset{0};
+    std::atomic<u32> published_offset{0};
     u32 write_offset = 0;
   };
 
-  std::array<Slot, SlotCount> slots;
-  std::mutex allocation_mutex;
+  std::array<Slot, InputRingSlotCount> slots;
+  u8* staging_backing = nullptr;
+  // The producer owns current_slot and every write_offset. This mutex is used
+  // only when all four multi-frame slots are genuinely busy; the last
+  // reference holder takes it before notification so the condition-variable
+  // wake cannot be lost.
+  std::mutex slot_released_mutex;
   std::condition_variable slot_released;
-  std::atomic<u32> active_capture_calls{0};
   std::atomic<bool> accepting{false};
   u32 current_slot = 0;
   bool initialized = false;
@@ -183,11 +256,21 @@ bool InputRing::Initialize() {
     return false;
 
   ResetStatistics();
-  for (u32 slot = 0; slot < SlotCount; slot++) {
+  constexpr size_t StagingSize =
+      static_cast<size_t>(InputRingSlotCount) * InputRingSlotSize;
+  m_impl->staging_backing =
+      static_cast<u8*>(_aligned_malloc(StagingSize, 64));
+  if (!m_impl->staging_backing) {
+    Console.Warning(
+        "GPU-VU: cacheable VIF input staging allocation failed; "
+        "retaining inline MTVU payloads.");
+    return false;
+  }
+  for (u32 slot = 0; slot < InputRingSlotCount; slot++) {
     char name[32];
     std::snprintf(name, sizeof(name), "VitaSX2 VIF input %u", slot);
     const int result = VitaGXM::AllocateMappedBlock(
-        name, SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_NC_RW, SlotSize,
+        name, SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_NC_RW, InputRingSlotSize,
         SCE_GXM_MEMORY_ATTRIB_READ, &m_impl->slots[slot].block);
     if (result < 0) {
       Console.Warning(
@@ -196,27 +279,39 @@ bool InputRing::Initialize() {
           slot, static_cast<u32>(result));
       for (u32 release = 0; release < slot; release++)
         VitaGXM::ReleaseMappedBlock(&m_impl->slots[release].block);
+      _aligned_free(m_impl->staging_backing);
+      m_impl->staging_backing = nullptr;
       return false;
     }
+    m_impl->slots[slot].staging =
+        m_impl->staging_backing +
+        static_cast<size_t>(slot) * InputRingSlotSize;
     m_impl->slots[slot].generation.store(1, std::memory_order_relaxed);
     m_impl->slots[slot].references.store(0, std::memory_order_relaxed);
+    m_impl->slots[slot].committed_offset.store(
+        0, std::memory_order_relaxed);
+    m_impl->slots[slot].published_offset.store(
+        0, std::memory_order_relaxed);
     m_impl->slots[slot].write_offset = 0;
   }
 
-  {
-    std::lock_guard lock(s_active_ring_mutex);
-    if (s_active_ring) {
-      for (auto& slot : m_impl->slots)
-        VitaGXM::ReleaseMappedBlock(&slot.block);
-      return false;
-    }
-    m_impl->accepting.store(true, std::memory_order_release);
-    s_active_ring = this;
-  }
   m_impl->current_slot = 0;
+  m_impl->accepting.store(true, std::memory_order_release);
+  InputRing* expected = nullptr;
+  if (!s_active_ring.compare_exchange_strong(
+          expected, this, std::memory_order_release,
+          std::memory_order_relaxed)) {
+    m_impl->accepting.store(false, std::memory_order_relaxed);
+    for (auto& slot : m_impl->slots)
+      VitaGXM::ReleaseMappedBlock(&slot.block);
+    _aligned_free(m_impl->staging_backing);
+    m_impl->staging_backing = nullptr;
+    return false;
+  }
   m_impl->initialized = true;
   Console.WriteLn(
-      "GPU-VU: immutable VIF input ring ready (4 x 2 MiB mapped slots).");
+      "GPU-VU: immutable VIF input ring ready "
+      "(8 MiB cacheable staging + 4 x 2 MiB mapped slots).");
   return true;
 #endif
 }
@@ -228,11 +323,13 @@ bool InputRing::Shutdown() {
   if (!m_impl || !m_impl->initialized)
     return true;
 
+  InputRing* expected = this;
+  s_active_ring.compare_exchange_strong(
+      expected, nullptr, std::memory_order_acq_rel,
+      std::memory_order_relaxed);
+  m_impl->accepting.store(false, std::memory_order_release);
   {
-    std::lock_guard lock(s_active_ring_mutex);
-    if (s_active_ring == this)
-      s_active_ring = nullptr;
-    m_impl->accepting.store(false, std::memory_order_release);
+    std::lock_guard lock(m_impl->slot_released_mutex);
   }
   m_impl->slot_released.notify_all();
 
@@ -240,7 +337,7 @@ bool InputRing::Shutdown() {
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
   for (;;) {
     bool busy =
-        m_impl->active_capture_calls.load(std::memory_order_acquire) != 0;
+        s_active_capture_calls.load(std::memory_order_acquire) != 0;
     for (const auto& slot : m_impl->slots) {
       busy |= slot.references.load(std::memory_order_acquire) != 0;
     }
@@ -261,9 +358,12 @@ bool InputRing::Shutdown() {
       released = false;
     }
     slot.write_offset = 0;
+    slot.staging = nullptr;
   }
   if (!released)
     return false;
+  _aligned_free(m_impl->staging_backing);
+  m_impl->staging_backing = nullptr;
   m_impl->current_slot = 0;
   m_impl->initialized = false;
   return true;
@@ -287,23 +387,20 @@ bool CaptureRawVifPayload(const void* source, u32 size,
 #if defined(VITASX2_QEMU_VALIDATION)
   return false;
 #else
-  InputRing* ring = nullptr;
-  {
-    std::lock_guard lock(s_active_ring_mutex);
-    ring = s_active_ring;
-    if (!ring || !ring->m_impl ||
-        !ring->m_impl->accepting.load(std::memory_order_acquire)) {
-      return false;
-    }
-    ring->m_impl->active_capture_calls.fetch_add(
-        1, std::memory_order_acq_rel);
+  s_active_capture_calls.fetch_add(1, std::memory_order_acq_rel);
+  InputRing* const ring =
+      s_active_ring.load(std::memory_order_acquire);
+  if (!ring || !ring->m_impl ||
+      !ring->m_impl->accepting.load(std::memory_order_acquire)) {
+    s_active_capture_calls.fetch_sub(1, std::memory_order_acq_rel);
+    return false;
   }
 
   InputRing::Impl& impl = *ring->m_impl;
-  const auto leave = [&impl]() {
-    impl.active_capture_calls.fetch_sub(1, std::memory_order_acq_rel);
+  const auto leave = []() {
+    s_active_capture_calls.fetch_sub(1, std::memory_order_acq_rel);
   };
-  if (size > SlotSize ||
+  if (size > InputRingSlotSize ||
       !impl.accepting.load(std::memory_order_acquire)) {
     s_capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
     leave();
@@ -314,11 +411,9 @@ bool CaptureRawVifPayload(const void* source, u32 size,
   u32 reserved_offset = 0;
   u32 reserved_generation = 0;
   bool counted_wait = false;
-  std::unique_lock allocation_lock(impl.allocation_mutex);
   for (;;) {
     if (!impl.accepting.load(std::memory_order_acquire)) {
       s_capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
-      allocation_lock.unlock();
       leave();
       return false;
     }
@@ -339,15 +434,17 @@ bool CaptureRawVifPayload(const void* source, u32 size,
       break;
     }
 
-    const u32 next = (impl.current_slot + 1) % SlotCount;
+    const u32 next = (impl.current_slot + 1) % InputRingSlotCount;
     InputRing::Impl::Slot& candidate = impl.slots[next];
     if (candidate.references.load(std::memory_order_acquire) == 0) {
       u32 generation =
           candidate.generation.load(std::memory_order_relaxed) + 1;
       if (generation == 0)
         generation = 1;
-      candidate.generation.store(generation, std::memory_order_release);
       candidate.write_offset = 0;
+      candidate.committed_offset.store(0, std::memory_order_relaxed);
+      candidate.published_offset.store(0, std::memory_order_relaxed);
+      candidate.generation.store(generation, std::memory_order_release);
       impl.current_slot = next;
       s_slot_reuses.fetch_add(1, std::memory_order_relaxed);
       continue;
@@ -357,7 +454,18 @@ bool CaptureRawVifPayload(const void* source, u32 size,
       s_ring_waits.fetch_add(1, std::memory_order_relaxed);
       counted_wait = true;
     }
-    impl.slot_released.wait(allocation_lock, [&impl, next]() {
+    RawVifPayloadRef blocked_generation;
+    blocked_generation.owner = reinterpret_cast<uptr>(ring);
+    blocked_generation.slot = next;
+    blocked_generation.generation =
+        candidate.generation.load(std::memory_order_acquire);
+    // Only the slot generation identifies the storage being reused here.
+    // Give the request a nonzero sentinel size so it obeys the opaque
+    // reference contract without claiming a byte range.
+    blocked_generation.size = 1;
+    VitaGS::RequestGpuVuInputRetirement(blocked_generation);
+    std::unique_lock slot_lock(impl.slot_released_mutex);
+    impl.slot_released.wait(slot_lock, [&impl, next]() {
       return !impl.accepting.load(std::memory_order_acquire) ||
              impl.slots[next].references.load(
                  std::memory_order_acquire) == 0;
@@ -366,16 +474,19 @@ bool CaptureRawVifPayload(const void* source, u32 size,
     // now counts blocking condition-variable wakeups, never polling spins.
     s_ring_wait_spins.fetch_add(1, std::memory_order_relaxed);
   }
-  allocation_lock.unlock();
 
   InputRing::Impl::Slot& slot = impl.slots[reserved_slot];
-  std::memcpy(static_cast<u8*>(slot.block.base) + reserved_offset,
-              source, size);
+  std::memcpy(slot.staging + reserved_offset, source, size);
   payload->owner = reinterpret_cast<uptr>(ring);
   payload->slot = reserved_slot;
   payload->generation = reserved_generation;
   payload->offset = reserved_offset;
   payload->size = size;
+  // This is the sole producer. Publishing the contiguous prefix after its
+  // bytes are initialized lets the MTVU worker copy many tiny UNPACK payloads
+  // to the GXM mapping in one large sequential operation.
+  slot.committed_offset.store(
+      reserved_offset + size, std::memory_order_release);
   s_captures.fetch_add(1, std::memory_order_relaxed);
   s_captured_bytes.fetch_add(size, std::memory_order_relaxed);
   leave();
@@ -390,7 +501,31 @@ const u8* ResolveRawVifPayload(const RawVifPayloadRef& payload) {
   return nullptr;
 #else
   auto* ring = reinterpret_cast<InputRing*>(payload.owner);
-  if (!ring || !ring->m_impl || payload.slot >= SlotCount)
+  if (!ring || !ring->m_impl || payload.slot >= InputRingSlotCount)
+    return nullptr;
+  const auto& slot = ring->m_impl->slots[payload.slot];
+  if (!slot.staging ||
+      slot.generation.load(std::memory_order_acquire) !=
+          payload.generation ||
+      payload.offset > InputRingSlotSize ||
+      payload.size > InputRingSlotSize - payload.offset ||
+      slot.committed_offset.load(std::memory_order_acquire) <
+          payload.offset + payload.size ||
+      slot.references.load(std::memory_order_acquire) == 0) {
+    return nullptr;
+  }
+  return slot.staging + payload.offset;
+#endif
+}
+
+const u8* ResolveGpuRawVifPayload(const RawVifPayloadRef& payload) {
+  if (!payload.IsValid())
+    return nullptr;
+#if defined(VITASX2_QEMU_VALIDATION)
+  return nullptr;
+#else
+  auto* ring = reinterpret_cast<InputRing*>(payload.owner);
+  if (!ring || !ring->m_impl || payload.slot >= InputRingSlotCount)
     return nullptr;
   const auto& slot = ring->m_impl->slots[payload.slot];
   if (!slot.block.IsMapped() ||
@@ -398,10 +533,126 @@ const u8* ResolveRawVifPayload(const RawVifPayloadRef& payload) {
           payload.generation ||
       payload.offset > slot.block.size ||
       payload.size > slot.block.size - payload.offset ||
+      slot.published_offset.load(std::memory_order_acquire) <
+          payload.offset + payload.size ||
       slot.references.load(std::memory_order_acquire) == 0) {
     return nullptr;
   }
   return static_cast<const u8*>(slot.block.base) + payload.offset;
+#endif
+}
+
+bool PublishPendingRawVifPayloads(const GpuVuDraw* first_draw,
+                                 u32 draw_count) {
+#if !defined(VITASX2_QEMU_VALIDATION)
+  InputRing* const ring = s_active_ring.load(std::memory_order_acquire);
+  if (!ring || !ring->m_impl ||
+      !ring->m_impl->accepting.load(std::memory_order_acquire)) {
+    Console.Error(
+        "GPU-VU: input publication rejected (ring unavailable, draws=%u).",
+        draw_count);
+    return false;
+  }
+
+  std::array<RawVifPayloadRef, InputRingSlotCount> generations{};
+  u32 generation_count = 0;
+  const GpuVuDraw* draw = first_draw;
+  for (u32 draw_index = 0; draw_index < draw_count; draw_index++) {
+    if (!draw) {
+      Console.Error(
+          "GPU-VU: input publication rejected "
+          "(short direct run at %u/%u).",
+          draw_index, draw_count);
+      return false;
+    }
+    for (const VifUnpackSpan& span : draw->InputSpans()) {
+      const RawVifPayloadRef& payload = span.payload;
+      if (!payload.IsValid() ||
+          payload.owner != reinterpret_cast<uptr>(ring) ||
+          payload.slot >= InputRingSlotCount) {
+        Console.Error(
+            "GPU-VU: input publication rejected "
+            "(bad payload at draw %u: owner=%08x expected=%08x "
+            "slot=%u generation=%u size=%u).",
+            draw_index, static_cast<u32>(payload.owner),
+            static_cast<u32>(reinterpret_cast<uptr>(ring)),
+            payload.slot, payload.generation, payload.size);
+        return false;
+      }
+      bool seen = false;
+      for (u32 index = 0; index < generation_count; index++) {
+        if (generations[index].slot == payload.slot &&
+            generations[index].generation == payload.generation) {
+          seen = true;
+          break;
+        }
+      }
+      if (!seen) {
+        if (generation_count >= generations.size()) {
+          Console.Error(
+              "GPU-VU: input publication rejected "
+              "(more than %u live slot generations at draw %u, "
+              "slot=%u generation=%u).",
+              InputRingSlotCount, draw_index, payload.slot,
+              payload.generation);
+          return false;
+        }
+        generations[generation_count++] = payload;
+      }
+    }
+    draw = draw->path1_next;
+  }
+
+  u64 copied = 0;
+  for (u32 index = 0; index < generation_count; index++) {
+    const RawVifPayloadRef& payload = generations[index];
+    auto& slot = ring->m_impl->slots[payload.slot];
+    // The pending draw owns a reference to this exact generation. Therefore
+    // the producer cannot enter the references==0 reuse transition while its
+    // contiguous committed prefix is copied.
+    if (slot.generation.load(std::memory_order_acquire) !=
+            payload.generation ||
+        slot.references.load(std::memory_order_acquire) == 0) {
+      Console.Error(
+          "GPU-VU: input publication rejected "
+          "(retired generation slot=%u wanted=%u actual=%u refs=%u).",
+          payload.slot, payload.generation,
+          slot.generation.load(std::memory_order_relaxed),
+          slot.references.load(std::memory_order_relaxed));
+      return false;
+    }
+    const u32 committed =
+        slot.committed_offset.load(std::memory_order_acquire);
+    const u32 published =
+        slot.published_offset.load(std::memory_order_relaxed);
+    if (committed <= published)
+      continue;
+    if (!slot.staging || !slot.block.IsMapped() ||
+        committed > slot.block.size) {
+      Console.Error(
+          "GPU-VU: input publication rejected "
+          "(bad range slot=%u staged=%08x mapped=%u "
+          "committed=%u size=%u).",
+          payload.slot, static_cast<u32>(
+              reinterpret_cast<uptr>(slot.staging)),
+          slot.block.IsMapped() ? 1u : 0u, committed, slot.block.size);
+      return false;
+    }
+
+    std::memcpy(static_cast<u8*>(slot.block.base) + published,
+                slot.staging + published, committed - published);
+    slot.published_offset.store(committed, std::memory_order_release);
+    copied += committed - published;
+  }
+  if (copied != 0) {
+    s_publication_batches.fetch_add(1, std::memory_order_relaxed);
+    s_published_bytes.fetch_add(copied, std::memory_order_relaxed);
+  }
+  return true;
+#else
+  (void)first_draw;
+  (void)draw_count;
+  return true;
 #endif
 }
 
@@ -425,7 +676,7 @@ void ReleaseRawVifPayload(RawVifPayloadRef* payload) {
     return;
 #if !defined(VITASX2_QEMU_VALIDATION)
   auto* ring = reinterpret_cast<InputRing*>(payload->owner);
-  if (ring && ring->m_impl && payload->slot < SlotCount) {
+  if (ring && ring->m_impl && payload->slot < InputRingSlotCount) {
     auto& slot = ring->m_impl->slots[payload->slot];
     if (slot.generation.load(std::memory_order_acquire) ==
         payload->generation) {
@@ -433,8 +684,10 @@ void ReleaseRawVifPayload(RawVifPayloadRef* payload) {
           slot.references.fetch_sub(1, std::memory_order_acq_rel);
       if (previous != 0) {
         s_live_references.fetch_sub(1, std::memory_order_relaxed);
-        if (previous == 1)
+        if (previous == 1) {
+          std::lock_guard lock(ring->m_impl->slot_released_mutex);
           ring->m_impl->slot_released.notify_one();
+        }
       } else {
         slot.references.fetch_add(1, std::memory_order_relaxed);
       }
@@ -442,6 +695,26 @@ void ReleaseRawVifPayload(RawVifPayloadRef* payload) {
   }
 #endif
   *payload = {};
+}
+
+u32 GetRawVifPayloadGenerationReferenceCount(
+    const RawVifPayloadRef& payload) {
+#if defined(VITASX2_QEMU_VALIDATION)
+  (void)payload;
+  return 0;
+#else
+  if (!payload.IsValid() || payload.slot >= InputRingSlotCount)
+    return 0;
+  auto* ring = reinterpret_cast<InputRing*>(payload.owner);
+  if (!ring || !ring->m_impl)
+    return 0;
+  const auto& slot = ring->m_impl->slots[payload.slot];
+  if (slot.generation.load(std::memory_order_acquire) !=
+      payload.generation) {
+    return 0;
+  }
+  return slot.references.load(std::memory_order_acquire);
+#endif
 }
 
 void RecordDeferredVifUnpack() {
@@ -452,9 +725,9 @@ void RecordReplayedVifUnpack() {
   s_replayed_unpacks.fetch_add(1, std::memory_order_relaxed);
 }
 
-void RecordDisconnectedCaptureBypass(u32 size) {
-  s_disconnected_bypasses.fetch_add(1, std::memory_order_relaxed);
-  s_disconnected_bypass_bytes.fetch_add(size, std::memory_order_relaxed);
+void RecordCaptureBypass(u32 size) {
+  s_capture_bypasses.fetch_add(1, std::memory_order_relaxed);
+  s_capture_bypass_bytes.fetch_add(size, std::memory_order_relaxed);
 }
 
 InputRingStatistics GetInputRingStatistics() {
@@ -462,10 +735,14 @@ InputRingStatistics GetInputRingStatistics() {
   stats.captures = s_captures.load(std::memory_order_relaxed);
   stats.captured_bytes =
       s_captured_bytes.load(std::memory_order_relaxed);
-  stats.disconnected_bypasses =
-      s_disconnected_bypasses.load(std::memory_order_relaxed);
-  stats.disconnected_bypass_bytes =
-      s_disconnected_bypass_bytes.load(std::memory_order_relaxed);
+  stats.publication_batches =
+      s_publication_batches.load(std::memory_order_relaxed);
+  stats.published_bytes =
+      s_published_bytes.load(std::memory_order_relaxed);
+  stats.capture_bypasses =
+      s_capture_bypasses.load(std::memory_order_relaxed);
+  stats.capture_bypass_bytes =
+      s_capture_bypass_bytes.load(std::memory_order_relaxed);
   stats.capture_fallbacks =
       s_capture_fallbacks.load(std::memory_order_relaxed);
   stats.slot_reuses = s_slot_reuses.load(std::memory_order_relaxed);

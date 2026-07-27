@@ -43,7 +43,18 @@ struct BasicBlock {
   bool indirect_branch = false;
   bool branch_in_delay_slot = false;
   bool ends_program = false;
+  // PCSX2/VU owner: an E-bit retires one architectural delay pair and
+  // publishes the byte PC immediately after it for a later VIF MSCNT.
+  u32 resume_pc = 0;
+  bool has_resume_pc = false;
   bool has_external_exit = false;
+  // True only when control can arrive here from this analysis' external entry.
+  // BuildBlocks decodes the whole 16 KiB image, so one image analyzed at an
+  // explicit MSCAL address and at a later MSCNT resume address shares block
+  // storage but not reachability. Consumers which reason about what this entry
+  // actually executes must filter on this; a VU1 image routinely contains
+  // prologue blocks a resume entry deliberately branches past.
+  bool reachable_from_entry = false;
 };
 
 struct NaturalLoop {
@@ -68,6 +79,8 @@ struct ProgramAnalysis {
   bool has_external_exit = false;
   bool has_program_exit = false;
   bool every_block_can_reach_program_exit = false;
+  // Unique, sorted post-E TPCs reachable from this external entry.
+  std::vector<u32> resume_pcs;
 };
 
 // Reconstructs VU1 control flow from PairPlan-decoded pairs. Branch pairs
