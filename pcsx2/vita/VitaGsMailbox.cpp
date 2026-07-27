@@ -1286,7 +1286,8 @@ namespace MTGS
 			"publish_batches=%llu published_bytes=%llu "
 			"capture_bypasses=%llu capture_bypass_bytes=%llu "
 			"fallbacks=%llu slot_reuses=%llu ring_waits=%llu ring_spins=%llu "
-			"deferred=%llu replayed=%llu live_start=%llu live_end=%llu peak_live=%llu",
+			"deferred=%llu affine_merges=%llu replayed=%llu "
+			"live_start=%llu live_end=%llu peak_live=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_input.captures, start.gpu_vu_input.captures)),
@@ -1320,6 +1321,9 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_input.deferred_unpacks,
 				start.gpu_vu_input.deferred_unpacks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.gpu_vu_input.affine_span_merges,
+				start.gpu_vu_input.affine_span_merges)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.gpu_vu_input.replayed_unpacks,
 				start.gpu_vu_input.replayed_unpacks)),

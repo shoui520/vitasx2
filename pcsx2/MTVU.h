@@ -63,6 +63,10 @@ class VU_Thread final {
 	// the following VU execute or the end of the current VIF transfer publishes
 	// the complete ordered group with one write-position update.
 	bool m_pending_vif_batch = false;
+	// EE-thread position of the last unpublished captured-span record. Exact
+	// adjacent V4-32 commands can extend it in place because the worker cannot
+	// observe any record before CommitWritePos() publishes the batch.
+	s32 m_pending_captured_vif_span_pos = -1;
 
 	Threading::Thread m_thread;
 

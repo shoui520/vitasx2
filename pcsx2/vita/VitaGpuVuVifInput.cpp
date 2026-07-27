@@ -51,6 +51,7 @@ std::atomic<u64> s_ring_wait_spins{0};
 std::atomic<u64> s_live_references{0};
 std::atomic<u64> s_peak_live_references{0};
 std::atomic<u64> s_deferred_unpacks{0};
+std::atomic<u64> s_affine_span_merges{0};
 std::atomic<u64> s_replayed_unpacks{0};
 
 void RecordReferenceCreated() {
@@ -78,6 +79,7 @@ void ResetStatistics() {
   s_live_references.store(0, std::memory_order_relaxed);
   s_peak_live_references.store(0, std::memory_order_relaxed);
   s_deferred_unpacks.store(0, std::memory_order_relaxed);
+  s_affine_span_merges.store(0, std::memory_order_relaxed);
   s_replayed_unpacks.store(0, std::memory_order_relaxed);
 }
 
@@ -122,6 +124,14 @@ bool IsDirectAffineV4_32Span(const VifUnpackSpan& span) {
   return span.source_size >= required_bytes;
 }
 
+bool GetDirectAffineV4_32PayloadSize(const VifUnpackSpan& span,
+                                     u32* payload_size) {
+  if (!payload_size || !IsDirectAffineV4_32Span(span))
+    return false;
+  *payload_size = static_cast<u32>(span.vector_count) * sizeof(u128);
+  return true;
+}
+
 bool DirectAffineSpanFullyOverwrites(const VifUnpackSpan& newer,
                                      const VifUnpackSpan& older) {
   if (!IsDirectAffineV4_32Span(newer) ||
@@ -139,6 +149,52 @@ bool DirectAffineSpanFullyOverwrites(const VifUnpackSpan& newer,
       (older_start - newer_start) & (Vu1MemoryQwords - 1);
   return older_offset < newer.vector_count &&
          older.vector_count <= newer.vector_count - older_offset;
+}
+
+bool MergeAdjacentDirectAffineV4_32Spans(VifUnpackSpan* earlier,
+                                         VifUnpackSpan* later) {
+  if (!earlier || !later || earlier == later ||
+      !IsDirectAffineV4_32Span(*earlier) ||
+      !IsDirectAffineV4_32Span(*later)) {
+    return false;
+  }
+
+  // This compact representation is intentionally limited to a single
+  // non-overlapping VU-memory revolution. Beyond 1024 qwords, one destination
+  // would have multiple ordered source producers and BindAffineRawQwords()
+  // could no longer identify it with one affine source offset.
+  const u32 combined_vectors =
+      static_cast<u32>(earlier->vector_count) + later->vector_count;
+  const u64 earlier_bytes =
+      static_cast<u64>(earlier->vector_count) * sizeof(u128);
+  const u64 later_bytes =
+      static_cast<u64>(later->vector_count) * sizeof(u128);
+  const u64 combined_bytes = earlier_bytes + later_bytes;
+  if (combined_vectors > Vu1MemoryQwords ||
+      earlier->source_size != earlier_bytes ||
+      later->source_size != later_bytes ||
+      earlier->payload.size != earlier_bytes ||
+      later->payload.size != later_bytes ||
+      earlier->payload.owner != later->payload.owner ||
+      earlier->payload.slot != later->payload.slot ||
+      earlier->payload.generation != later->payload.generation ||
+      static_cast<u64>(earlier->payload.offset) + earlier_bytes !=
+          later->payload.offset ||
+      static_cast<u64>(earlier->payload.offset) + combined_bytes >
+          InputRingSlotSize ||
+      ((static_cast<u32>(earlier->destination_qword) +
+        earlier->vector_count) &
+       (Vu1MemoryQwords - 1u)) != later->destination_qword) {
+    return false;
+  }
+
+  earlier->payload.size = static_cast<u32>(combined_bytes);
+  earlier->source_size = static_cast<u32>(combined_bytes);
+  earlier->tag_size_words = static_cast<u32>(combined_bytes / sizeof(u32));
+  earlier->vector_count = static_cast<u16>(combined_vectors);
+  ReleaseRawVifPayload(&later->payload);
+  s_affine_span_merges.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 bool BindAffineRawQwords(const VifUnpackSpan& span,
@@ -909,6 +965,8 @@ InputRingStatistics GetInputRingStatistics() {
       s_peak_live_references.load(std::memory_order_relaxed);
   stats.deferred_unpacks =
       s_deferred_unpacks.load(std::memory_order_relaxed);
+  stats.affine_span_merges =
+      s_affine_span_merges.load(std::memory_order_relaxed);
   stats.replayed_unpacks =
       s_replayed_unpacks.load(std::memory_order_relaxed);
   return stats;

@@ -250,6 +250,7 @@ void VU_Thread::Reset()
 	m_gpu_vu_path1_flush_requested.store(false, std::memory_order_relaxed);
 	m_vif_span_sequence = 0;
 	m_pending_vif_batch = false;
+	m_pending_captured_vif_span_pos = -1;
 	vuCycleIdx = 0;
 	m_ato_write_pos = 0;
 	m_write_pos = 0;
@@ -726,6 +727,7 @@ __fi void VU_Thread::CommitWritePos()
 	}
 	m_ato_write_pos.store(m_write_pos, std::memory_order_release);
 	m_pending_vif_batch = false;
+	m_pending_captured_vif_span_pos = -1;
 
 	if (MTVU_ALWAYS_KICK)
 		KickStart();
@@ -1157,24 +1159,58 @@ void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* dat
 		span.mode = static_cast<u8>(_vifRegs.mode);
 		span.unsigned_data = _vif.usn;
 		span.start_alignment = _vif.start_aligned;
-		if (VitaGpuVu::IsDirectAffineV4_32Span(span) &&
-			VitaGpuVu::CaptureRawVifPayload(
-				data, size,
+		u32 affine_payload_size = 0;
+		if (VitaGpuVu::GetDirectAffineV4_32PayloadSize(
+				span, &affine_payload_size))
+		{
+			// nVifUnpack() passes MTVU (size + 4) bytes for the general unpack
+			// implementation. Once the direct V4-32, mode-zero, CL==WL
+			// contract is proven, _nVifUnpackLoop<1>() consumes exactly one
+			// 16-byte source vector per NUM. The trailing safety word is not
+			// PS2-visible input; excluding it avoids a 16-byte ring-alignment
+			// gap between consecutive affine commands. Every unproven or
+			// failed-capture path below retains the original size and owner.
+			span.source_size = affine_payload_size;
+			if (VitaGpuVu::CaptureRawVifPayload(
+				data, affine_payload_size,
 				m_pending_vif_batch ?
 					VitaGpuVu::RawVifCaptureMode::ContinueEpoch :
 					VitaGpuVu::RawVifCaptureMode::BeginVuCommandEpoch,
 				&span.payload))
-		{
-			ReserveSpace(1 + size_u32(sizeof(span)));
-			Write(MTVU_VIF_UNPACK_CAPTURED);
-			Write(&span, sizeof(span));
-			// The common VIF packet immediately follows its affine UNPACKs
-			// with MSCNT. ExecuteVU() publishes the whole group with one
-			// release store and one worker wake. VIF1transfer() publishes at
-			// return when no execute follows, preserving ordinary MTVU
-			// visibility and every observation boundary.
-			m_pending_vif_batch = true;
-			return;
+			{
+				// The record is still EE-private until CommitWritePos().
+				// Adjacent source and destination ranges therefore have the
+				// exact effect of one larger affine journal span. The generated
+				// shader continues to derive each attribute offset from it.
+				if (m_pending_vif_batch &&
+					m_pending_captured_vif_span_pos >= 0)
+				{
+					VitaGpuVu::VifUnpackSpan previous;
+					std::memcpy(&previous,
+						&buffer[m_pending_captured_vif_span_pos],
+						sizeof(previous));
+					if (VitaGpuVu::MergeAdjacentDirectAffineV4_32Spans(
+							&previous, &span))
+					{
+						std::memcpy(
+							&buffer[m_pending_captured_vif_span_pos],
+							&previous, sizeof(previous));
+						return;
+					}
+				}
+
+				ReserveSpace(1 + size_u32(sizeof(span)));
+				Write(MTVU_VIF_UNPACK_CAPTURED);
+				m_pending_captured_vif_span_pos = m_write_pos;
+				Write(&span, sizeof(span));
+				// The common VIF packet immediately follows its affine UNPACKs
+				// with MSCNT. ExecuteVU() publishes the whole group with one
+				// release store and one worker wake. VIF1transfer() publishes at
+				// return when no execute follows, preserving ordinary MTVU
+				// visibility and every observation boundary.
+				m_pending_vif_batch = true;
+				return;
+			}
 		}
 	}
 #endif

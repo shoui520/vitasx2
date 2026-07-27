@@ -67,10 +67,24 @@ struct RawQwordBinding {
 // they simply require a generated unpack expression or the universal executor.
 bool IsDirectAffineV4_32Span(const VifUnpackSpan& span);
 
+// Returns the exact source extent consumed by PCSX2's mode-zero V4-32 unpack
+// loop. nVifUnpack() gives MTVU one trailing safety word beyond a completed
+// tag; that word is not part of this proven command's source vectors.
+bool GetDirectAffineV4_32PayloadSize(const VifUnpackSpan& span,
+                                    u32* payload_size);
+
 // Returns true when applying newer after older makes every VU-memory write
 // performed by older unobservable. Both ranges may wrap at qword 0x3ff.
 bool DirectAffineSpanFullyOverwrites(const VifUnpackSpan& newer,
                                      const VifUnpackSpan& older);
+
+// Coalesces two completed, adjacent V4-32 commands when both their immutable
+// source bytes and wrapping VU-memory destinations are contiguous. On success
+// earlier owns the combined range and later's generation reference is
+// released. This is an exact journal representation change: PCSX2's
+// _nVifUnpackLoop<1>() would perform the same ordered qword writes.
+bool MergeAdjacentDirectAffineV4_32Spans(VifUnpackSpan* earlier,
+                                         VifUnpackSpan* later);
 
 // Proves that an invocation-indexed VU-memory address range is backed by one
 // contiguous raw V4-32 span. VU memory wraps at 1024 qwords, while the source
@@ -104,6 +118,7 @@ struct InputRingStatistics {
   u64 live_references = 0;
   u64 peak_live_references = 0;
   u64 deferred_unpacks = 0;
+  u64 affine_span_merges = 0;
   u64 replayed_unpacks = 0;
 };
 
