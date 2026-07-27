@@ -70,6 +70,24 @@ struct GeneratedCgProgram {
   bool uses_flat_instance_inputs = false;
   bool uses_buffered_batch_inputs = false;
   bool flat_strip_winding = false;
+
+  u32 BatchBindingVectorCount() const {
+    return (static_cast<u32>(memory_inputs.size()) + 3u) / 4u;
+  }
+  u32 BatchUniformVectorCount() const {
+    u32 vectors = static_cast<u32>(constant_inputs.size());
+    for (u32 reg = 1; reg < 32; reg++)
+      vectors += (vf_uniform_mask & (1u << reg)) != 0;
+    vectors += uses_acc_uniform ? 1u : 0u;
+    vectors += (uses_q_uniform || uses_p_uniform || uses_i_uniform ||
+                uses_gif_q_uniform)
+                   ? 1u
+                   : 0u;
+    return vectors;
+  }
+  u32 BatchRecordVectorCount() const {
+    return BatchBindingVectorCount() + BatchUniformVectorCount();
+  }
 };
 
 // Emits a vertex program which evaluates the proven parallel semantic slice

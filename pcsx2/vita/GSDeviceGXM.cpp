@@ -2585,8 +2585,9 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 		}
 		char name[24];
 		std::snprintf(name, sizeof(name), "VuConstant%u", index);
-		stored.uniforms.constants[index] = find_uniform(name);
-		if (!stored.uniforms.constants[index])
+		if (!buffered_batch)
+			stored.uniforms.constants[index] = find_uniform(name);
+		if (!buffered_batch && !stored.uniforms.constants[index])
 		{
 			return fail_registration("find generated VU1 constant uniform",
 				SCE_GXM_ERROR_INVALID_VALUE);
@@ -2598,8 +2599,9 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 			continue;
 		char name[8];
 		std::snprintf(name, sizeof(name), "VF%02u", reg);
-		stored.uniforms.vf[reg] = find_uniform(name);
-		if (!stored.uniforms.vf[reg])
+		if (!buffered_batch)
+			stored.uniforms.vf[reg] = find_uniform(name);
+		if (!buffered_batch && !stored.uniforms.vf[reg])
 		{
 			return fail_registration("find generated VU1+TFX VF uniform",
 				SCE_GXM_ERROR_INVALID_VALUE);
@@ -2613,16 +2615,17 @@ bool GSDeviceGXM::Impl::RegisterGeneratedVuProgram(
 		*destination = find_uniform(name);
 		return *destination != nullptr;
 	};
-	if (!require_uniform(stored.metadata.uses_acc_uniform, "ACC",
-			&stored.uniforms.acc) ||
-		!require_uniform(stored.metadata.uses_q_uniform, "Q",
-			&stored.uniforms.q) ||
-		!require_uniform(stored.metadata.uses_p_uniform, "P",
-			&stored.uniforms.p) ||
-		!require_uniform(stored.metadata.uses_i_uniform, "I",
-			&stored.uniforms.i) ||
-		!require_uniform(stored.metadata.uses_gif_q_uniform, "GifQ",
-			&stored.uniforms.gif_q))
+	if (!buffered_batch &&
+		(!require_uniform(stored.metadata.uses_acc_uniform, "ACC",
+				&stored.uniforms.acc) ||
+			!require_uniform(stored.metadata.uses_q_uniform, "Q",
+				&stored.uniforms.q) ||
+			!require_uniform(stored.metadata.uses_p_uniform, "P",
+				&stored.uniforms.p) ||
+			!require_uniform(stored.metadata.uses_i_uniform, "I",
+				&stored.uniforms.i) ||
+			!require_uniform(stored.metadata.uses_gif_q_uniform, "GifQ",
+				&stored.uniforms.gif_q)))
 	{
 		return fail_registration("find generated VU1+TFX scalar uniform",
 			SCE_GXM_ERROR_INVALID_VALUE);
@@ -3875,77 +3878,81 @@ bool GSDeviceGXM::Impl::UploadTfxUniforms(const GSHWDrawConfig& config,
 		{
 			return false;
 		}
-		for (const VitaGpuVu::ConstantUniform& uniform :
-			gpu_vu_draw->ConstantUniforms())
+		if (!generated_vu->metadata.uses_buffered_batch_inputs)
 		{
-			std::array<float, 4> values;
-			std::memcpy(values.data(), uniform.bits.data(), sizeof(values));
-			if (uniform.input_index >= generated_vu->uniforms.constants.size() ||
-				!upload_vertex(
-					generated_vu->uniforms.constants[uniform.input_index],
-					values.size(), values.data(),
-					"upload generated VU1 constant uniform"))
+			for (const VitaGpuVu::ConstantUniform& uniform :
+				gpu_vu_draw->ConstantUniforms())
 			{
-				return false;
+				std::array<float, 4> values;
+				std::memcpy(values.data(), uniform.bits.data(), sizeof(values));
+				if (uniform.input_index >=
+						generated_vu->uniforms.constants.size() ||
+					!upload_vertex(
+						generated_vu->uniforms.constants[uniform.input_index],
+						values.size(), values.data(),
+						"upload generated VU1 constant uniform"))
+				{
+					return false;
+				}
 			}
-		}
-		for (const VitaGpuVu::VectorUniform& uniform :
-			gpu_vu_draw->VfUniforms())
-		{
-			std::array<float, 4> values;
-			std::memcpy(values.data(), uniform.bits.data(), sizeof(values));
-			if (!upload_vertex(
-					generated_vu->uniforms.vf[uniform.register_index],
-					values.size(), values.data(),
-					"upload generated VU1 VF uniform"))
+			for (const VitaGpuVu::VectorUniform& uniform :
+				gpu_vu_draw->VfUniforms())
 			{
-				return false;
+				std::array<float, 4> values;
+				std::memcpy(values.data(), uniform.bits.data(), sizeof(values));
+				if (!upload_vertex(
+						generated_vu->uniforms.vf[uniform.register_index],
+						values.size(), values.data(),
+						"upload generated VU1 VF uniform"))
+				{
+					return false;
+				}
 			}
-		}
-		if (generated_vu->metadata.uses_acc_uniform)
-		{
-			std::array<float, 4> values;
-			std::memcpy(values.data(), gpu_vu_draw->acc_uniform.data(),
-				sizeof(values));
-			if (!upload_vertex(generated_vu->uniforms.acc, values.size(),
-					values.data(), "upload generated VU1 ACC uniform"))
+			if (generated_vu->metadata.uses_acc_uniform)
 			{
-				return false;
+				std::array<float, 4> values;
+				std::memcpy(values.data(), gpu_vu_draw->acc_uniform.data(),
+					sizeof(values));
+				if (!upload_vertex(generated_vu->uniforms.acc, values.size(),
+						values.data(), "upload generated VU1 ACC uniform"))
+				{
+					return false;
+				}
 			}
-		}
-		const auto upload_scalar = [&upload_vertex](
-			bool used, const SceGxmProgramParameter* parameter, u32 bits,
-			const char* operation) {
-			if (!used)
-				return true;
-			float value;
-			std::memcpy(&value, &bits, sizeof(value));
-			return upload_vertex(parameter, 1, &value, operation);
-		};
-		const u32 scalar_mask = gpu_vu_draw->scalar_uniforms.present;
-		if (!upload_scalar(generated_vu->metadata.uses_q_uniform,
-				generated_vu->uniforms.q, gpu_vu_draw->scalar_uniforms.q,
-				"upload generated VU1 Q uniform") ||
-			!upload_scalar(generated_vu->metadata.uses_p_uniform,
-				generated_vu->uniforms.p, gpu_vu_draw->scalar_uniforms.p,
-				"upload generated VU1 P uniform") ||
-			!upload_scalar(generated_vu->metadata.uses_i_uniform,
-				generated_vu->uniforms.i, gpu_vu_draw->scalar_uniforms.i,
-				"upload generated VU1 I uniform") ||
-			!upload_scalar(generated_vu->metadata.uses_gif_q_uniform,
-				generated_vu->uniforms.gif_q,
-				gpu_vu_draw->scalar_uniforms.gif_q,
-				"upload generated GIF Q uniform") ||
-			((scalar_mask & VitaGpuVu::ScalarUniformQ) != 0) !=
-				generated_vu->metadata.uses_q_uniform ||
-			((scalar_mask & VitaGpuVu::ScalarUniformP) != 0) !=
-				generated_vu->metadata.uses_p_uniform ||
-			((scalar_mask & VitaGpuVu::ScalarUniformI) != 0) !=
-				generated_vu->metadata.uses_i_uniform ||
-			((scalar_mask & VitaGpuVu::ScalarUniformGifQ) != 0) !=
-				generated_vu->metadata.uses_gif_q_uniform)
-		{
-			return Reject("generated VU1 scalar-uniform mask mismatch");
+			const auto upload_scalar = [&upload_vertex](
+				bool used, const SceGxmProgramParameter* parameter, u32 bits,
+				const char* operation) {
+				if (!used)
+					return true;
+				float value;
+				std::memcpy(&value, &bits, sizeof(value));
+				return upload_vertex(parameter, 1, &value, operation);
+			};
+			const u32 scalar_mask = gpu_vu_draw->scalar_uniforms.present;
+			if (!upload_scalar(generated_vu->metadata.uses_q_uniform,
+					generated_vu->uniforms.q, gpu_vu_draw->scalar_uniforms.q,
+					"upload generated VU1 Q uniform") ||
+				!upload_scalar(generated_vu->metadata.uses_p_uniform,
+					generated_vu->uniforms.p, gpu_vu_draw->scalar_uniforms.p,
+					"upload generated VU1 P uniform") ||
+				!upload_scalar(generated_vu->metadata.uses_i_uniform,
+					generated_vu->uniforms.i, gpu_vu_draw->scalar_uniforms.i,
+					"upload generated VU1 I uniform") ||
+				!upload_scalar(generated_vu->metadata.uses_gif_q_uniform,
+					generated_vu->uniforms.gif_q,
+					gpu_vu_draw->scalar_uniforms.gif_q,
+					"upload generated GIF Q uniform") ||
+				((scalar_mask & VitaGpuVu::ScalarUniformQ) != 0) !=
+					generated_vu->metadata.uses_q_uniform ||
+				((scalar_mask & VitaGpuVu::ScalarUniformP) != 0) !=
+					generated_vu->metadata.uses_p_uniform ||
+				((scalar_mask & VitaGpuVu::ScalarUniformI) != 0) !=
+					generated_vu->metadata.uses_i_uniform ||
+				((scalar_mask & VitaGpuVu::ScalarUniformGifQ) != 0) !=
+					generated_vu->metadata.uses_gif_q_uniform)
+			{
+				return Reject("generated VU1 scalar-uniform mask mismatch");
+			}
 		}
 	}
 	else
@@ -4678,16 +4685,27 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 		u32 last_qword = 0;
 		u32 first_draw = 0;
 		u32 draw_count = 0;
-		VitaGXM::ArenaAllocation bindings;
+		VitaGXM::ArenaAllocation batch_data;
 	};
 	std::vector<BatchInputGroup> batch_input_groups;
 	if (buffered_batch)
 	{
 		const u32 binding_vectors =
-			(static_cast<u32>(generated->metadata.memory_inputs.size()) +
-				3u) / 4u;
-		if (binding_vectors == 0)
+			generated->metadata.BatchBindingVectorCount();
+		const u32 record_vectors =
+			generated->metadata.BatchRecordVectorCount();
+		if (binding_vectors == 0 || record_vectors < binding_vectors)
 			return Reject("GPU-VU buffered root has no binding vectors");
+		// psp2shaderperf shows the installed compiler consuming dynamic buffer
+		// indices through a signed 16-bit path. Keep the last int4 record index
+		// positive just as the raw VIF window below keeps its qword index
+		// positive.
+		constexpr u32 maximum_batch_data_vector =
+			static_cast<u32>(std::numeric_limits<s16>::max());
+		const u32 maximum_record_draws =
+			(maximum_batch_data_vector + 1u) / record_vectors;
+		if (maximum_record_draws == 0)
+			return Reject("GPU-VU batch record exceeds its addressable buffer");
 
 		// The installed PSP2 compiler lowers the dynamically indexed int4
 		// loads in this root through signed 16-bit address arithmetic when the
@@ -4798,7 +4816,9 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			u32 end = first + 1;
 			while (end < active_gpu_vu_draws->size() &&
 				end - first <
-					VitaGpuVu::GeneratedCgProgram::MaximumBatchDraws)
+					std::min(
+						VitaGpuVu::GeneratedCgProgram::MaximumBatchDraws,
+						maximum_record_draws))
 			{
 				ResolvedInputRange next;
 				if (!resolve_input_range(*(*active_gpu_vu_draws)[end],
@@ -4825,27 +4845,29 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			}
 
 			const u32 draw_count = end - first;
-			const u64 binding_bytes =
-				static_cast<u64>(draw_count) * binding_vectors *
+			const u64 batch_data_bytes =
+				static_cast<u64>(draw_count) * record_vectors *
 				sizeof(std::array<u32, 4>);
-			if (binding_bytes > std::numeric_limits<u32>::max())
-				return Reject("GPU-VU batch binding table is too large");
+			if (batch_data_bytes > std::numeric_limits<u32>::max())
+				return Reject("GPU-VU batch data table is too large");
 			VitaGXM::ArenaAllocation allocation;
 			const int allocation_result = transfer_arena.Allocate(
-				static_cast<u32>(binding_bytes), 16, &allocation);
+				static_cast<u32>(batch_data_bytes), 16, &allocation);
 			if (allocation_result < 0 || !allocation)
 			{
-				return Fail("allocate generated VU1 batch bindings",
+				return Fail("allocate generated VU1 batch data",
 					allocation_result < 0 ? allocation_result :
 						SCE_GXM_ERROR_OUT_OF_MEMORY);
 			}
 			std::memset(allocation.Data(), 0, allocation.Size());
-			u32* const bindings =
+			u32* const batch_data =
 				static_cast<u32*>(allocation.Data());
 			for (u32 object = 0; object < draw_count; object++)
 			{
 				const VitaGpuVu::GpuVuDraw& candidate =
 					*(*active_gpu_vu_draws)[first + object];
+				u32* const record =
+					batch_data + object * record_vectors * 4u;
 				for (u32 input = 0;
 					input < candidate.streams.size(); input++)
 				{
@@ -4864,11 +4886,46 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 						return Reject(
 							"GPU-VU raw binding is outside its input window");
 					}
-					bindings[
-						(object * binding_vectors * 4u) + input] =
+					record[input] =
 						static_cast<u32>(
 							absolute_byte / 16u - window.first_qword);
 				}
+				u32 uniform_vector = binding_vectors;
+				for (const VitaGpuVu::ConstantUniform& uniform :
+					candidate.ConstantUniforms())
+				{
+					std::memcpy(record + uniform_vector * 4u,
+						uniform.bits.data(), sizeof(uniform.bits));
+					uniform_vector++;
+				}
+				for (const VitaGpuVu::VectorUniform& uniform :
+					candidate.VfUniforms())
+				{
+					std::memcpy(record + uniform_vector * 4u,
+						uniform.bits.data(), sizeof(uniform.bits));
+					uniform_vector++;
+				}
+				if (generated->metadata.uses_acc_uniform)
+				{
+					std::memcpy(record + uniform_vector * 4u,
+						candidate.acc_uniform.data(),
+						sizeof(candidate.acc_uniform));
+					uniform_vector++;
+				}
+				if (generated->metadata.uses_q_uniform ||
+					generated->metadata.uses_p_uniform ||
+					generated->metadata.uses_i_uniform ||
+					generated->metadata.uses_gif_q_uniform)
+				{
+					u32* const scalars = record + uniform_vector * 4u;
+					scalars[0] = candidate.scalar_uniforms.q;
+					scalars[1] = candidate.scalar_uniforms.p;
+					scalars[2] = candidate.scalar_uniforms.i;
+					scalars[3] = candidate.scalar_uniforms.gif_q;
+					uniform_vector++;
+				}
+				if (uniform_vector != record_vectors)
+					return Reject("GPU-VU batch record layout mismatch");
 			}
 
 			BatchInputGroup group;
@@ -4881,7 +4938,7 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			group.last_qword = window.last_qword;
 			group.first_draw = first;
 			group.draw_count = draw_count;
-			group.bindings = std::move(allocation);
+			group.batch_data = std::move(allocation);
 			batch_input_groups.push_back(std::move(group));
 			first = end;
 		}
@@ -5007,7 +5064,7 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 			if (result >= 0)
 			{
 				result = sceGxmSetVertexUniformBuffer(
-					context, 1, group.bindings.Data());
+					context, 1, group.batch_data.Data());
 			}
 			if (result < 0)
 			{
@@ -5108,7 +5165,7 @@ bool GSDeviceGXM::Impl::DrawGpuVu(const GSHWDrawConfig& config,
 	for (BatchInputGroup& group : batch_input_groups)
 	{
 		gpu_vu_scene_batch_allocations.push_back(
-			std::move(group.bindings));
+			std::move(group.batch_data));
 	}
 	if (rt)
 		rt->SetState(GSTexture::State::Dirty);

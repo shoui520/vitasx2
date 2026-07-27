@@ -420,6 +420,8 @@ private:
     m_source += std::to_string(m_program->batch_primitives_per_draw);
     m_source += " bufferedBatch=";
     m_source += m_program->uses_buffered_batch_inputs ? "1" : "0";
+    m_source += " batchRecordVectors=";
+    m_source += std::to_string(m_program->BatchRecordVectorCount());
     m_source += " stripWinding=";
     m_source += m_program->flat_strip_winding ? "1\n" : "0\n";
     m_source += "// GXM constant qwords=";
@@ -447,6 +449,24 @@ private:
     m_source +=
         "// Generated from PairPlan semantics; ShaccCg owns SSA, allocation, "
         "and scheduling.\n";
+    if (m_program->uses_buffered_batch_inputs) {
+      // PSP2 Cg scalarizes a dynamically indexed int4.w at the following
+      // vector: the exact IGA resume shader loaded record dword 0x3c instead
+      // of 0x3b.  Keep raw binding indices integer, but use float4 for VU
+      // seeds so psp2cgc emits an aligned fetch4 and selects w correctly.
+      m_source +=
+          "struct VitaVuBatchRecord\n"
+          "{\n"
+          "\tint4 bindings[";
+      m_source += std::to_string(m_program->BatchBindingVectorCount());
+      m_source += "];\n";
+      if (m_program->BatchUniformVectorCount() != 0) {
+        m_source += "\tfloat4 uniforms[";
+        m_source += std::to_string(m_program->BatchUniformVectorCount());
+        m_source += "];\n";
+      }
+      m_source += "};\n\n";
+    }
     if (Uses(ExpressionKind::Normalize) || Uses(ExpressionKind::Divide)) {
       m_source +=
           "float VitaVuNormalize(float value)\n"
@@ -557,9 +577,7 @@ private:
             std::to_string(GeneratedCgProgram::DeclaredBufferVectors) +
             "] : BUFFER[0]");
         AppendParameter(
-            "uniform int4 VuBatchBindings[" +
-            std::to_string(GeneratedCgProgram::DeclaredBufferVectors) +
-            "] : BUFFER[1]");
+            "uniform VitaVuBatchRecord VuBatchData[1] : BUFFER[1]");
       } else {
         for (const CgMemoryInput &input : m_program->memory_inputs) {
           for (u32 vertex = 0;
@@ -585,28 +603,30 @@ private:
                         std::to_string(attribute_semantic++));
       }
     }
-    for (const CgConstantInput &input : m_program->constant_inputs) {
-      AppendParameter("uniform float4 VuConstant" +
-                      std::to_string(input.uniform_index));
-    }
-    for (u32 reg = 1; reg < 32; reg++) {
-      if ((m_program->vf_uniform_mask & (1u << reg)) != 0) {
-        AppendParameter("uniform float4 VF" +
-                        (reg < 10 ? std::string("0") : std::string()) +
-                        std::to_string(reg));
+    if (!m_program->uses_buffered_batch_inputs) {
+      for (const CgConstantInput &input : m_program->constant_inputs) {
+        AppendParameter("uniform float4 VuConstant" +
+                        std::to_string(input.uniform_index));
       }
-    }
-    if (m_program->uses_acc_uniform)
-      AppendParameter("uniform float4 ACC");
-    if (m_program->uses_q_uniform)
-      AppendParameter("uniform float Q");
-    if (m_program->uses_p_uniform)
-      AppendParameter("uniform float P");
-    if (m_program->uses_i_uniform)
-      AppendParameter("uniform float I");
-    if (m_direct_contract) {
-      if (m_program->uses_gif_q_uniform)
+      for (u32 reg = 1; reg < 32; reg++) {
+        if ((m_program->vf_uniform_mask & (1u << reg)) != 0) {
+          AppendParameter("uniform float4 VF" +
+                          (reg < 10 ? std::string("0") : std::string()) +
+                          std::to_string(reg));
+        }
+      }
+      if (m_program->uses_acc_uniform)
+        AppendParameter("uniform float4 ACC");
+      if (m_program->uses_q_uniform)
+        AppendParameter("uniform float Q");
+      if (m_program->uses_p_uniform)
+        AppendParameter("uniform float P");
+      if (m_program->uses_i_uniform)
+        AppendParameter("uniform float I");
+      if (m_direct_contract && m_program->uses_gif_q_uniform)
         AppendParameter("uniform float GifQ");
+    }
+    if (m_direct_contract) {
       AppendParameter(m_program->uses_tfx_point_size
                           ? "uniform float4 VertexScaleOffset[3]"
                           : "uniform float4 VertexScaleOffset[2]");
@@ -643,8 +663,6 @@ private:
         m_source += "\tconst int VuSelectedLane = VuInputLane;\n";
       }
       if (m_program->uses_buffered_batch_inputs) {
-        const u32 binding_vectors =
-            (static_cast<u32>(m_program->memory_inputs.size()) + 3u) / 4u;
         static constexpr std::array<const char *, 4> components = {
             "x", "y", "z", "w"};
         const u32 primitives_per_draw =
@@ -677,19 +695,56 @@ private:
           m_source += std::to_string(primitives_per_draw);
           m_source += "u;\n";
         }
+        u32 uniform_vector = 0;
+        for (const CgConstantInput &input : m_program->constant_inputs) {
+          m_source += "\tconst float4 VuConstant";
+          m_source += std::to_string(input.uniform_index);
+          m_source += " = VuBatchData[VuBatchDraw].uniforms[";
+          m_source += std::to_string(uniform_vector++);
+          m_source += "];\n";
+        }
+        for (u32 reg = 1; reg < 32; reg++) {
+          if ((m_program->vf_uniform_mask & (1u << reg)) == 0)
+            continue;
+          m_source += "\tconst float4 VF";
+          if (reg < 10)
+            m_source += "0";
+          m_source += std::to_string(reg);
+          m_source += " = VuBatchData[VuBatchDraw].uniforms[";
+          m_source += std::to_string(uniform_vector++);
+          m_source += "];\n";
+        }
+        if (m_program->uses_acc_uniform) {
+          m_source += "\tconst float4 ACC = "
+                      "VuBatchData[VuBatchDraw].uniforms[";
+          m_source += std::to_string(uniform_vector++);
+          m_source += "];\n";
+        }
+        if (m_program->uses_q_uniform || m_program->uses_p_uniform ||
+            m_program->uses_i_uniform || m_program->uses_gif_q_uniform) {
+          m_source += "\tconst float4 VuBatchScalars = "
+                      "VuBatchData[VuBatchDraw].uniforms[";
+          m_source += std::to_string(uniform_vector++);
+          m_source += "];\n";
+          if (m_program->uses_q_uniform)
+            m_source += "\tconst float Q = VuBatchScalars.x;\n";
+          if (m_program->uses_p_uniform)
+            m_source += "\tconst float P = VuBatchScalars.y;\n";
+          if (m_program->uses_i_uniform)
+            m_source += "\tconst float I = VuBatchScalars.z;\n";
+          if (m_program->uses_gif_q_uniform)
+            m_source += "\tconst float GifQ = VuBatchScalars.w;\n";
+        }
         for (const CgMemoryInput &input : m_program->memory_inputs) {
           const u32 binding_vector = input.attribute_index / 4u;
           const u32 binding_component = input.attribute_index & 3u;
           const auto append_load =
-              [this, binding_vectors, binding_vector, binding_component,
-               &input](const std::string &suffix,
-                       const std::string &vertex) {
+              [this, binding_vector, binding_component, &input](
+                  const std::string &suffix, const std::string &vertex) {
             m_source += "\tconst int4 VuMemory";
             m_source += std::to_string(input.attribute_index);
             m_source += suffix;
-            m_source += " = VuRawQwords[VuBatchBindings[VuBatchDraw * ";
-            m_source += std::to_string(binding_vectors);
-            m_source += " + ";
+            m_source += " = VuRawQwords[VuBatchData[VuBatchDraw].bindings[";
             m_source += std::to_string(binding_vector);
             m_source += "].";
             m_source += components[binding_component];

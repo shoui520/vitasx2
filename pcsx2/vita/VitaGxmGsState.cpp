@@ -245,7 +245,7 @@ namespace
 		return true;
 	}
 
-	bool SameGpuVuUniforms(const VitaGpuVu::GpuVuDraw& left,
+	bool SameGpuVuUniformLayout(const VitaGpuVu::GpuVuDraw& left,
 		const VitaGpuVu::GpuVuDraw& right)
 	{
 		const auto& left_vf = left.VfUniforms();
@@ -254,8 +254,34 @@ namespace
 		const auto& right_constants = right.ConstantUniforms();
 		if (left_vf.size() != right_vf.size() ||
 			left_constants.size() != right_constants.size() ||
+			left.scalar_uniforms.present != right.scalar_uniforms.present)
+		{
+			return false;
+		}
+		for (u32 index = 0; index < left_vf.size(); index++)
+		{
+			if (left_vf[index].register_index !=
+				right_vf[index].register_index)
+			{
+				return false;
+			}
+		}
+		for (u32 index = 0; index < left_constants.size(); index++)
+		{
+			if (left_constants[index].input_index !=
+				right_constants[index].input_index)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool SameGpuVuUniforms(const VitaGpuVu::GpuVuDraw& left,
+		const VitaGpuVu::GpuVuDraw& right)
+	{
+		if (!SameGpuVuUniformLayout(left, right) ||
 			left.acc_uniform != right.acc_uniform ||
-			left.scalar_uniforms.present != right.scalar_uniforms.present ||
 			left.scalar_uniforms.q != right.scalar_uniforms.q ||
 			left.scalar_uniforms.p != right.scalar_uniforms.p ||
 			left.scalar_uniforms.i != right.scalar_uniforms.i ||
@@ -265,23 +291,19 @@ namespace
 		}
 		if (left.UniformBlock().Get() == right.UniformBlock().Get())
 			return true;
+		const auto& left_vf = left.VfUniforms();
+		const auto& right_vf = right.VfUniforms();
+		const auto& left_constants = left.ConstantUniforms();
+		const auto& right_constants = right.ConstantUniforms();
 		for (u32 index = 0; index < left_vf.size(); index++)
 		{
-			if (left_vf[index].register_index !=
-					right_vf[index].register_index ||
-				left_vf[index].bits != right_vf[index].bits)
-			{
+			if (left_vf[index].bits != right_vf[index].bits)
 				return false;
-			}
 		}
 		for (u32 index = 0; index < left_constants.size(); index++)
 		{
-			if (left_constants[index].input_index !=
-					right_constants[index].input_index ||
-				left_constants[index].bits != right_constants[index].bits)
-			{
+			if (left_constants[index].bits != right_constants[index].bits)
 				return false;
-			}
 		}
 		return true;
 	}
@@ -364,6 +386,9 @@ namespace
 	bool CanDeriveOneGpuVuState(const VitaGpuVu::GpuVuDraw& left,
 		const VitaGpuVu::GpuVuDraw& right)
 	{
+		// Instance-indexed roots fetch each object's immutable VU seeds from
+		// their batch record. Native roots still expose those seeds through the
+		// one-draw default uniform buffer and therefore require exact equality.
 		return left.program == right.program &&
 			left.gif_tag == right.gif_tag &&
 			left.direct_tfx.vertex_count == right.direct_tfx.vertex_count &&
@@ -380,11 +405,14 @@ namespace
 			left.lowering == right.lowering &&
 			left.execution == right.execution &&
 			left.primitive_boundary == right.primitive_boundary &&
-				left.static_gs_writes.empty() && right.static_gs_writes.empty() &&
+			left.static_gs_writes.empty() && right.static_gs_writes.empty() &&
 				!left.final_state.IsRequired() &&
 				!right.final_state.IsRequired() &&
 				SameGpuVuInputGenerations(left, right) &&
-				SameGpuVuUniforms(left, right);
+				(left.primitive_boundary ==
+						VitaGpuVu::PrimitiveBoundary::InstanceIndexed ?
+					SameGpuVuUniformLayout(left, right) :
+					SameGpuVuUniforms(left, right));
 	}
 }
 
