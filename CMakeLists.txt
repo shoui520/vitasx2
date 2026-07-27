@@ -115,13 +115,21 @@ if(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY)
 endif()
 
 option(VITASX2_GPU_VU_DIRECT_ADMISSION
-	"Enable the generated affine VU1+TFX command-chain hardware milestone."
-	OFF)
+	"Use generated affine VU1+TFX draws; disable only for the Maximum Cortex-A9 fallback/control."
+	ON)
 if(VITASX2_GPU_VU_DIRECT_ADMISSION)
 	# Keep this process-wide: VIF capture, MTVU ownership, the GS mailbox, and
 	# GSDeviceGXM must agree whether immutable input spans can replace CPU VU
-	# execution. The normal disconnected product compiles out all capture work.
+	# execution. Phase 1 hardware and SDK-sweep evidence makes this the playable
+	# Vita default; an explicit OFF build retains the Maximum Cortex-A9 control
+	# and compiles all disconnected capture work out.
 	add_compile_definitions(VITASX2_GPU_VU_DIRECT_ADMISSION=1)
+endif()
+if(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY AND
+	VITASX2_GPU_VU_DIRECT_ADMISSION)
+	message(FATAL_ERROR
+		"VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY is a disconnected control; "
+		"configure VITASX2_GPU_VU_DIRECT_ADMISSION=OFF with it.")
 endif()
 
 # Target CPU contract: Cortex-A9 MPCore, VFPv3, NEON, hard-float.
