@@ -9,3 +9,4 @@ build-*/
 compile_commands.json
 .cache/
 __pycache__/
+docs/ps2-core/All PS2 Docs/PS1 CPU IOP/psx-spx.github.io
