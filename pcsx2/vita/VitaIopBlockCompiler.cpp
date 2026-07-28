@@ -5940,156 +5940,19 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitIopEventTestFastPath()
 	{
+		// PCSX2 owner: x86/iR3000A.cpp::iPsxBranchTest() calls the one
+		// R3000A.cpp::iopEventTest() owner only after the generated signed
+		// 64-bit deadline check says work is due. Duplicating a second, partial
+		// copy of that rare body in every branch block made two-instruction IOP
+		// blocks exceed 130 A32 words and scattered their not-due continuation
+		// across several Cortex-A9 I-cache lines. Keep the common deadline test
+		// inline and put the due body behind its single authoritative function.
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!EmitQemuCounterIncrement(&s_qemuIopBranchEventTestsEntered))
 			return false;
 #endif
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-		if (!m_code.EmitCallAbsolute(
-				reinterpret_cast<const void*>(&VitaIopA32RunTracedEventTest),
-				HOST_CALL_SCRATCH) ||
-			!m_code.EmitCmpImm32(HOST_TMP0, 0))
-		{
-			return false;
-		}
-		const size_t traced_event_done =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::NE);
-		if (traced_event_done == static_cast<size_t>(-1))
-			return false;
-#endif
-		struct HelperBranch
-		{
-			size_t offset;
-			VitaA32::Condition condition;
-		};
-		std::vector<HelperBranch> helper_branches;
-		helper_branches.reserve(5);
-
-		const auto emit_add_wait_cycles = [this]() {
-			if (m_code.EmitAddImm32(HOST_TMP2, HOST_TMP0, IOP_WAIT_CYCLES, true))
-				return true;
-
-			return m_code.EmitMovImm32(HOST_TMP2, IOP_WAIT_CYCLES) &&
-				   m_code.EmitAddReg(HOST_TMP2, HOST_TMP0, HOST_TMP2, true);
-		};
-		const auto emit_schedule_next_event_from_cycle_base =
-			[this, &emit_add_wait_cycles](unsigned cycle_base_reg) {
-			return m_code.EmitLdrdImm8(HOST_TMP0, HOST_TMP1, cycle_base_reg, 0) &&
-				   emit_add_wait_cycles() &&
-				   m_code.EmitAdcImm8(HOST_TMP3, HOST_TMP1, 0) &&
-			           m_code.EmitStrdImm8(
-						   HOST_TMP2, HOST_TMP3, cycle_base_reg,
-					   static_cast<u8>(IOP_NEXT_EVENT_CYCLE_FROM_CYCLE_OFFSET));
-		};
-
-		// PCSX2 owner: R3000A.cpp::iopEventTest() writes
-		// psxRegs.iopNextEventCycle = psxRegs.cycle + iopWaitCycles. Keep the
-		// 64-bit fields paired so Cortex-A9 can issue one load/store each.
-		const bool emitted_schedule =
-			m_iop_cycle_base_register_available ? emit_schedule_next_event_from_cycle_base(HOST_CYCLE_BASE) : ((m_code.EmitAddImm32(HOST_CALL_SCRATCH, HOST_PSX_REGS, static_cast<u32>(CYCLE_OFFSET)) || (m_code.EmitMovImm32(HOST_CALL_SCRATCH, static_cast<u32>(CYCLE_OFFSET)) && m_code.EmitAddReg(HOST_CALL_SCRATCH, HOST_PSX_REGS, HOST_CALL_SCRATCH))) && emit_schedule_next_event_from_cycle_base(HOST_CALL_SCRATCH));
-		if (!emitted_schedule)
-		{
-			return false;
-		}
-
-		// PCSX2 owner: R3000A.cpp::iopEventTest(). The generated path handles
-		// only the no-work case; due/near counters, scheduled interrupts, and
-		// pending IOP INTC all branch to the owner function.
-		if (!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(
-												&psxNextStartCounter))) ||
-			!m_code.EmitLdrImm12(HOST_SAVED0, HOST_TMP3, 0) ||
-			!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(
-												&psxNextDeltaCounter))) ||
-			!m_code.EmitLdrImm12(HOST_CALL_SCRATCH, HOST_TMP3, 0) ||
-			!m_code.EmitSubReg(HOST_TMP3, HOST_TMP0, HOST_SAVED0) ||
-			!m_code.EmitCmpReg(HOST_TMP3, HOST_CALL_SCRATCH))
-		{
-			return false;
-		}
-		helper_branches.push_back(
-			{m_code.EmitBranchPlaceholder(VitaA32::Condition::GE),
-			VitaA32::Condition::GE});
-
-		// HOST_TMP2 still holds iopNextEventCycle.low, while r5/r12 keep
-		// psxNextStartCounter.low and psxNextDeltaCounter for the second
-		// no-work test.
-		if (!m_code.EmitSubReg(HOST_TMP2, HOST_TMP2, HOST_SAVED0) ||
-			!m_code.EmitCmpReg(HOST_CALL_SCRATCH, HOST_TMP2))
-		{
-			return false;
-		}
-		helper_branches.push_back(
-			{m_code.EmitBranchPlaceholder(VitaA32::Condition::LT),
-			VitaA32::Condition::LT});
-
-		if (!m_code.EmitLdrImm12(HOST_TMP2, HOST_PSX_REGS,
-				static_cast<u16>(INTERRUPT_OFFSET)) ||
-			!m_code.EmitCmpImm32(HOST_TMP2, 0))
-		{
-			return false;
-		}
-		helper_branches.push_back(
-			{m_code.EmitBranchPlaceholder(VitaA32::Condition::NE),
-			VitaA32::Condition::NE});
-
-		if (!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(
-												&iopHw[HW_ICTRL & 0xffff]))) ||
-			!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP3, 0) ||
-			!m_code.EmitCmpImm32(HOST_TMP2, 0))
-		{
-			return false;
-		}
-		const size_t skip_intc = m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-
-		if (!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(
-												&iopHw[HW_ISTAT & 0xffff]))) ||
-			!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP3, 0) ||
-			!m_code.EmitMovImm32(HOST_TMP3, static_cast<u32>(reinterpret_cast<uptr>(
-												&iopHw[HW_IMASK & 0xffff]))) ||
-			!m_code.EmitLdrImm12(HOST_TMP3, HOST_TMP3, 0) ||
-			!m_code.EmitAndReg(HOST_TMP2, HOST_TMP2, HOST_TMP3, true))
-		{
-			return false;
-		}
-		helper_branches.push_back(
-			{m_code.EmitBranchPlaceholder(VitaA32::Condition::NE),
-			VitaA32::Condition::NE});
-
-		const size_t skip_helper = m_code.EmitBranchPlaceholder();
-		if (skip_intc == static_cast<size_t>(-1) ||
-			skip_helper == static_cast<size_t>(-1))
-			return false;
-
-		const size_t helper_target = m_code.Size();
-		// R3000A.cpp::iopEventTest() reads timing, CP0, interrupt, and device
-		// state but never observes or mutates GPR words. AAPCS preserves the r6/r8
-		// pin hosts through it (including counter/device callbacks), so this
-		// operation-specific seam needs neither publication nor reload.
-		if (!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(&iopEventTest),
-				HOST_CALL_SCRATCH))
-			return false;
-
-		const size_t done_target = m_code.Size();
-		if (!m_code.PatchBranch(skip_intc, done_target, VitaA32::Condition::EQ))
-			return false;
-
-		for (const HelperBranch& branch : helper_branches)
-		{
-			if (branch.offset == static_cast<size_t>(-1))
-				return false;
-
-			if (!m_code.PatchBranch(branch.offset, helper_target, branch.condition))
-				return false;
-		}
-
-		if (!m_code.PatchBranch(skip_helper, done_target))
-			return false;
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-		return m_code.PatchBranch(
-			traced_event_done, done_target, VitaA32::Condition::NE);
-#else
-		return true;
-#endif
+		return m_code.EmitCallAbsolute(
+			reinterpret_cast<const void*>(&iopEventTest), HOST_CALL_SCRATCH);
 	}
 
 	bool BlockCompiler::EmitCop0TransferOp(u32 op, bool to_cop0)
