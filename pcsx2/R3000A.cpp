@@ -19,6 +19,7 @@
 #include "CDVD/Ps1CD.h"
 #include "CDVD/CDVD.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaPerformanceTelemetry.h"
 
 using namespace R3000A;
 
@@ -295,7 +296,10 @@ __ri void iopEventTest()
 
 	if (psxTestCycle(psxNextStartCounter, psxNextDeltaCounter))
 	{
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::IopCounters);
 		psxRcntUpdate();
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 		iopEventAction = true;
 	}
 	else
@@ -306,21 +310,27 @@ __ri void iopEventTest()
 			psxRegs.iopNextEventCycle = psxNextStartCounter + psxNextDeltaCounter;
 	}
 
-	if (psxRegs.interrupt)
 	{
-		iopEventTestIsActive = true;
-		_psxTestInterrupts();
-		iopEventTestIsActive = false;
-	}
-
-	if ((psxHu32(HW_ICTRL) != 0) && ((psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0))
-	{
-		if ((psxRegs.CP0.n.Status & 0xFE01) >= 0x401)
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::IopInterrupts);
+		if (psxRegs.interrupt)
 		{
-			PSXCPU_LOG("Interrupt: %x  %x", psxHu32(HW_ISTAT), psxHu32(HW_IMASK));
-			psxException(0, 0);
-			iopEventAction = true;
+			iopEventTestIsActive = true;
+			_psxTestInterrupts();
+			iopEventTestIsActive = false;
 		}
+
+		if ((psxHu32(HW_ICTRL) != 0) &&
+			((psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0))
+		{
+			if ((psxRegs.CP0.n.Status & 0xFE01) >= 0x401)
+			{
+				PSXCPU_LOG("Interrupt: %x  %x", psxHu32(HW_ISTAT), psxHu32(HW_IMASK));
+				psxException(0, 0);
+				iopEventAction = true;
+			}
+		}
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 	}
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	// An event above may have changed PC or invalidated the retained block.

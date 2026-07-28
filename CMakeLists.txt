@@ -58,6 +58,16 @@ if(VITASX2_PRODUCT_BOOT_VALIDATION)
 	add_compile_definitions(VITASX2_PRODUCT_BOOT_VALIDATION=1)
 endif()
 
+option(VITASX2_CPU_PROFILER
+	"Compile the opt-in sparse exclusive CPU0 stage profiler."
+	OFF)
+if(VITASX2_CPU_PROFILER)
+	# Scheduler stage markers are compiled completely out of the playable
+	# product. Profile builds use the CEX-supported process clock only on a
+	# sparse subset of scheduler entries.
+	add_compile_definitions(VITASX2_CPU_PROFILER=1)
+endif()
+
 option(VITASX2_VITA_SOFTWARE_GS_CONTROL
 	"Use PCSX2's software GS renderer with the current Vita core and GXM presenter."
 	OFF)

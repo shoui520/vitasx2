@@ -546,6 +546,7 @@ namespace MTGS
 		u64 iop_cycle = 0;
 		u32 ee_pc = 0;
 		u32 iop_pc = 0;
+		VitaPerformanceTelemetry::CpuStageProfilerSnapshot cpu_stage_profiler;
 		VitaA32EeProviderStats ee;
 		VitaVU::Vu0TelemetryStats vu0;
 		VitaVU::Vu1TelemetryStats vu1;
@@ -606,6 +607,8 @@ namespace MTGS
 		snapshot.iop_cycle = psxRegs.cycle;
 		snapshot.ee_pc = cpuRegs.pc;
 		snapshot.iop_pc = psxRegs.pc;
+		snapshot.cpu_stage_profiler =
+			VitaPerformanceTelemetry::GetCpuStageProfilerSnapshot();
 		snapshot.ee = VitaGetA32EeProviderStats();
 		snapshot.vu0 = VitaVU::GetVu0TelemetryStats();
 		snapshot.vu1 = VitaVU::GetVu1TelemetryStats();
@@ -693,6 +696,87 @@ namespace MTGS
 			static_cast<unsigned long long>(ee_cpu_us), utilization(ee_cpu_us),
 			static_cast<unsigned long long>(vu_cpu_us), utilization(vu_cpu_us),
 			static_cast<unsigned long long>(gs_cpu_us), utilization(gs_cpu_us));
+		if (start.cpu_stage_profiler.valid &&
+			end.cpu_stage_profiler.valid)
+		{
+			const u64 scheduler_entries = CounterDelta(
+				end.cpu_stage_profiler.scheduler_entries,
+				start.cpu_stage_profiler.scheduler_entries);
+			const u64 stage_samples = CounterDelta(
+				end.cpu_stage_profiler.stage_samples,
+				start.cpu_stage_profiler.stage_samples);
+			const u64 unbalanced_samples = CounterDelta(
+				end.cpu_stage_profiler.unbalanced_samples,
+				start.cpu_stage_profiler.unbalanced_samples);
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_stage_summary "
+				"sample_period=%u scheduler_entries=%llu samples=%llu "
+				"unbalanced=%llu",
+				static_cast<unsigned long long>(window),
+				VitaPerformanceTelemetry::CPU_STAGE_SAMPLE_PERIOD,
+				static_cast<unsigned long long>(scheduler_entries),
+				static_cast<unsigned long long>(stage_samples),
+				static_cast<unsigned long long>(unbalanced_samples));
+			std::array<u64,
+				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_time_us{};
+			std::array<u64,
+				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_entries{};
+			u64 sampled_time_us = 0;
+			for (size_t i = 0; i < stage_time_us.size(); i++)
+			{
+				stage_time_us[i] = CounterDelta(
+					end.cpu_stage_profiler.stage_time_us[i],
+					start.cpu_stage_profiler.stage_time_us[i]);
+				stage_entries[i] = CounterDelta(
+					end.cpu_stage_profiler.stage_entries[i],
+					start.cpu_stage_profiler.stage_entries[i]);
+				sampled_time_us += stage_time_us[i];
+			}
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_stage samples=%llu "
+				"unbalanced=%llu sampled_time_us=%llu "
+				"scheduler=%llu ee_exceptions=%llu iop_guest=%llu "
+				"iop_event=%llu iop_counters=%llu iop_interrupts=%llu "
+				"spu2=%llu dev9=%llu usb=%llu ee_counters=%llu "
+				"ee_interrupts=%llu vu_sync=%llu deadline=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(stage_samples),
+				static_cast<unsigned long long>(unbalanced_samples),
+				static_cast<unsigned long long>(sampled_time_us),
+				static_cast<unsigned long long>(stage_time_us[0]),
+				static_cast<unsigned long long>(stage_time_us[1]),
+				static_cast<unsigned long long>(stage_time_us[2]),
+				static_cast<unsigned long long>(stage_time_us[3]),
+				static_cast<unsigned long long>(stage_time_us[4]),
+				static_cast<unsigned long long>(stage_time_us[5]),
+				static_cast<unsigned long long>(stage_time_us[6]),
+				static_cast<unsigned long long>(stage_time_us[7]),
+				static_cast<unsigned long long>(stage_time_us[8]),
+				static_cast<unsigned long long>(stage_time_us[9]),
+				static_cast<unsigned long long>(stage_time_us[10]),
+				static_cast<unsigned long long>(stage_time_us[11]),
+				static_cast<unsigned long long>(stage_time_us[12]));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_stage_entries "
+				"scheduler=%llu ee_exceptions=%llu iop_guest=%llu "
+				"iop_event=%llu iop_counters=%llu iop_interrupts=%llu "
+				"spu2=%llu dev9=%llu usb=%llu ee_counters=%llu "
+				"ee_interrupts=%llu vu_sync=%llu deadline=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(stage_entries[0]),
+				static_cast<unsigned long long>(stage_entries[1]),
+				static_cast<unsigned long long>(stage_entries[2]),
+				static_cast<unsigned long long>(stage_entries[3]),
+				static_cast<unsigned long long>(stage_entries[4]),
+				static_cast<unsigned long long>(stage_entries[5]),
+				static_cast<unsigned long long>(stage_entries[6]),
+				static_cast<unsigned long long>(stage_entries[7]),
+				static_cast<unsigned long long>(stage_entries[8]),
+				static_cast<unsigned long long>(stage_entries[9]),
+				static_cast<unsigned long long>(stage_entries[10]),
+				static_cast<unsigned long long>(stage_entries[11]),
+				static_cast<unsigned long long>(stage_entries[12]));
+		}
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee generated_blocks=%llu host_instructions=%llu "
 			"host_loads=%llu host_stores=%llu helper_calls_generated=%llu "

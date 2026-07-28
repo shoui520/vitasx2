@@ -14,6 +14,7 @@
 #include "IopHw.h"
 #include "IopDma.h"
 #include "CDVD/CDVD.h"
+#include "vita/VitaPerformanceTelemetry.h"
 
 #include <math.h>
 
@@ -482,16 +483,31 @@ void psxRcntUpdate()
 	const u32 spu2_delta = (psxRegs.cycle - lClocks) % 768;
 	psxCounters[6].startCycle = psxRegs.cycle - spu2_delta;
 	psxCounters[6].deltaCycles = psxCounters[6].rate;
-	SPU2async();
+	{
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::Spu2);
+		SPU2async();
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+	}
 	psxNextDeltaCounter = psxCounters[6].deltaCycles;
 
-	DEV9async(1);    
+	{
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::Dev9);
+		DEV9async(1);
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+	}
 	const s32 diffusb = psxRegs.cycle - psxCounters[7].startCycle;
 	s32 cusb = psxCounters[7].deltaCycles;
 
 	if (diffusb >= psxCounters[7].deltaCycles)
 	{
-		USBasync(diffusb);
+		{
+			VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+				VitaPerformanceTelemetry::CpuStage::Usb);
+			USBasync(diffusb);
+			VitaPerformanceTelemetry::EndCpuStageIfSampling();
+		}
 		psxCounters[7].startCycle += psxCounters[7].rate * (diffusb / psxCounters[7].rate);
 		psxCounters[7].deltaCycles = psxCounters[7].rate;
 	}

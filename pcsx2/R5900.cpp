@@ -14,6 +14,7 @@
 #include "VMManager.h"
 #if defined(VITASX2_VITA)
 #include "vita/VitaCore.h"
+#include "vita/VitaPerformanceTelemetry.h"
 #endif
 
 #include "Hardware.h"
@@ -518,6 +519,9 @@ __fi void _cpuEventTest_Shared()
 	// Its alternative AAPCS adapter below executes this save normally.
 	asm volatile("" ::: "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "lr");
 #endif
+#if defined(VITASX2_VITA)
+	VitaPerformanceTelemetry::OnEeSchedulerEntry();
+#endif
 	eeEventTestIsActive = true;
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	cpuRegs.nextEventCycle = cpuRegs.cycle +
@@ -539,9 +543,18 @@ __fi void _cpuEventTest_Shared()
 	// cycles (fixes Grandia II [PAL], which does a spin loop on a vsync and expects to
 	// be able to read the value before the exception handler clears it).
 
-	uint mask = intcInterrupt() | dmacInterrupt();
-	if (cpuIntsEnabled(mask))
-		cpuException(mask, cpuRegs.branch);
+	{
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::EeExceptions);
+#endif
+		uint mask = intcInterrupt() | dmacInterrupt();
+		if (cpuIntsEnabled(mask))
+			cpuException(mask, cpuRegs.branch);
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+#endif
+	}
 
 	// ---- IOP -------------
 	// * It's important to run a iopEventTest before calling ExecuteBlock. This
@@ -561,6 +574,10 @@ __fi void _cpuEventTest_Shared()
 
 	if (iopEventAction)
 	{
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::IopGuest);
+#endif
 		//if( EEsCycle < -450 )
 		//	Console.WriteLn( " IOP ahead by: %d cycles", -EEsCycle );
 
@@ -598,40 +615,66 @@ __fi void _cpuEventTest_Shared()
 #endif
 
 		iopEventAction = false;
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+#endif
 	}
 
 #if defined(VITASX2_VITA) && !defined(VITASX2_QEMU_VALIDATION) && \
 	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-	VitaIopEventTestFromEe();
+	{
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::IopEvent);
+		VitaIopEventTestFromEe();
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+	}
 #else
 	iopEventTest();
 #endif
 
-	if (cpuTestCycle(nextStartCounter, nextDeltaCounter))
 	{
-		rcntUpdate();
-		_cpuTestPERF();
-	}
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::EeCounters);
+#endif
+		if (cpuTestCycle(nextStartCounter, nextDeltaCounter))
+		{
+			rcntUpdate();
+			_cpuTestPERF();
+		}
 
-	_cpuTestTIMR();
+		_cpuTestTIMR();
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+#endif
+	}
 
 	// ---- Interrupts -------------
 	// These are basically just DMAC-related events, which also piggy-back the same bits as
 	// the PS2's own DMA channel IRQs and IRQ Masks.
 
-	if (cpuRegs.interrupt)
 	{
-		// This is a BIOS hack because the coding in the BIOS is terrible but the bug is masked by Data Cache
-		// where a DMA buffer is overwritten without waiting for the transfer to end, which causes the fonts to get all messed up
-		// so to fix it, we run all the DMA's instantly when in the BIOS.
-		// Only use the lower 17 bits of the cpuRegs.interrupt as the upper bits are for VU0/1 sync which can't be done in a tight loop
-		if (CHECK_INSTANTDMAHACK && dmacRegs.ctrl.DMAE && !(psHu8(DMAC_ENABLER + 2) & 1) && (cpuRegs.interrupt & 0x1FFFF))
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::EeInterrupts);
+#endif
+		if (cpuRegs.interrupt)
 		{
-			while ((cpuRegs.interrupt & 0x1FFFF) && _cpuTestInterrupts())
-				;
+			// This is a BIOS hack because the coding in the BIOS is terrible but the bug is masked by Data Cache
+			// where a DMA buffer is overwritten without waiting for the transfer to end, which causes the fonts to get all messed up
+			// so to fix it, we run all the DMA's instantly when in the BIOS.
+			// Only use the lower 17 bits of the cpuRegs.interrupt as the upper bits are for VU0/1 sync which can't be done in a tight loop
+			if (CHECK_INSTANTDMAHACK && dmacRegs.ctrl.DMAE && !(psHu8(DMAC_ENABLER + 2) & 1) && (cpuRegs.interrupt & 0x1FFFF))
+			{
+				while ((cpuRegs.interrupt & 0x1FFFF) && _cpuTestInterrupts())
+					;
+			}
+			else
+				_cpuTestInterrupts();
 		}
-		else
-			_cpuTestInterrupts();
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+#endif
 	}
 
 	// ---- VU Sync -------------
@@ -641,49 +684,67 @@ __fi void _cpuEventTest_Shared()
 	// exact running-bit contract, but reject the two inactive virtual calls in
 	// the shared scheduler TU. Threaded VU1 must still collect MTVU changes even
 	// when VPU_STAT is clear.
-	const u32 vu_running = VU0.VI[REG_VPU_STAT].UL;
-	if (vu_running & 1)
-		CpuVU0->ExecuteBlock();
-	if (THREAD_VU1 || (vu_running & 0x100))
-		CpuVU1->ExecuteBlock();
+	{
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::VuSync);
+#endif
+		const u32 vu_running = VU0.VI[REG_VPU_STAT].UL;
+		if (vu_running & 1)
+			CpuVU0->ExecuteBlock();
+		if (THREAD_VU1 || (vu_running & 0x100))
+			CpuVU1->ExecuteBlock();
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+#endif
+	}
 
 	// ---- Schedule Next Event Test --------------
-#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-	const int nextIopEventDelta =
-		VitaScaleIopEventDeltaToEe(psxRegs.iopNextEventCycle - psxRegs.cycle);
-#else
-	const float mutiplier = static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
-	const int nextIopEventDelta =
-		((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier);
-#endif
-	// 8 or more cycles behind and there's an event scheduled
-	if (EEsCycle >= nextIopEventDelta)
 	{
-		// EE's running way ahead of the IOP still, so we should branch quickly to give the
-		// IOP extra timeslices in short order.
-
-		cpuSetNextEventDelta(48);
-		//Console.Warning( "EE ahead of the IOP -- Rapid Event!  %d", EEsCycle );
-	}
-	else
-	{
-		// Otherwise IOP is caught up/not doing anything so we can wait for the next event.
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::Deadline);
+#endif
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-		cpuSetNextEventDelta(nextIopEventDelta - EEsCycle);
+		const int nextIopEventDelta =
+			VitaScaleIopEventDeltaToEe(psxRegs.iopNextEventCycle - psxRegs.cycle);
 #else
-		cpuSetNextEventDelta(((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier) - EEsCycle);
+		const float mutiplier = static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
+		const int nextIopEventDelta =
+			((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier);
+#endif
+		// 8 or more cycles behind and there's an event scheduled
+		if (EEsCycle >= nextIopEventDelta)
+		{
+			// EE's running way ahead of the IOP still, so we should branch quickly to give the
+			// IOP extra timeslices in short order.
+
+			cpuSetNextEventDelta(48);
+			//Console.Warning( "EE ahead of the IOP -- Rapid Event!  %d", EEsCycle );
+		}
+		else
+		{
+			// Otherwise IOP is caught up/not doing anything so we can wait for the next event.
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+			cpuSetNextEventDelta(nextIopEventDelta - EEsCycle);
+#else
+			cpuSetNextEventDelta(((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier) - EEsCycle);
+#endif
+		}
+
+		// Apply vsync and other counter nextCycles
+		cpuSetNextEvent(nextStartCounter, nextDeltaCounter);
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		// IOP callbacks, interrupts, or source invalidation above may revoke the
+		// retained wait. Do not carry a coalesced arbitrary EE seam into ordinary
+		// execution (or across an enabled CP0 timer compare).
+		if (!VitaCanCoalesceRetainedIopWait())
+			cpuSetNextEventDelta(eeWaitCycles);
+#endif
+#if defined(VITASX2_VITA)
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 #endif
 	}
-
-	// Apply vsync and other counter nextCycles
-	cpuSetNextEvent(nextStartCounter, nextDeltaCounter);
-#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-	// IOP callbacks, interrupts, or source invalidation above may revoke the
-	// retained wait. Do not carry a coalesced arbitrary EE seam into ordinary
-	// execution (or across an enabled CP0 timer compare).
-	if (!VitaCanCoalesceRetainedIopWait())
-		cpuSetNextEventDelta(eeWaitCycles);
-#endif
 
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
@@ -696,6 +757,9 @@ __fi void _cpuEventTest_Shared()
 	Pcsx2Trace::RecordPendingMachineCheckpointAtEventTest();
 #endif
 	eeEventTestIsActive = false;
+#if defined(VITASX2_VITA)
+	VitaPerformanceTelemetry::OnEeSchedulerExit();
+#endif
 #if defined(__arm__)
 	ReturnFromPrivateCpuEventTestShared();
 #endif

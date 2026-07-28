@@ -441,6 +441,7 @@ namespace
 	void ConfigureProductPerformanceTelemetry()
 	{
 		bool enabled = VITASX2_PRODUCT_BOOT_VALIDATION;
+		bool cpu_stage_profiler_enabled = false;
 		const char* source = VITASX2_PRODUCT_BOOT_VALIDATION ?
 			"boot-validation" : "default";
 		if (!VITASX2_PRODUCT_BOOT_VALIDATION &&
@@ -459,6 +460,25 @@ namespace
 						"VitaSX2 ignored malformed [%s] %s in %s; performance telemetry remains disabled.",
 						section, key, PRODUCT_CONFIG_PATH);
 				}
+				constexpr const char* profiler_key =
+					"EnableCpuStageProfiler";
+				if (settings.ContainsValue(section, profiler_key) &&
+					!settings.GetBoolValue(section, profiler_key,
+						&cpu_stage_profiler_enabled))
+				{
+					cpu_stage_profiler_enabled = false;
+					Console.Warning(
+						"VitaSX2 ignored malformed [%s] %s in %s.",
+						section, profiler_key, PRODUCT_CONFIG_PATH);
+				}
+#if !defined(VITASX2_CPU_PROFILER)
+				if (cpu_stage_profiler_enabled)
+				{
+					Console.Warning(
+						"VitaSX2 ignored [Diagnostics] EnableCpuStageProfiler because this product was built without VITASX2_CPU_PROFILER.");
+					cpu_stage_profiler_enabled = false;
+				}
+#endif
 				source = PRODUCT_CONFIG_PATH;
 			}
 			else
@@ -473,9 +493,15 @@ namespace
 		// created later by CPUThreadInitialize()/OpenGS(), so their plain reads
 		// observe this startup configuration without hot-path atomic traffic.
 		VitaPerformanceTelemetry::SetEnabledBeforeVmStart(enabled);
+		if (!enabled)
+			cpu_stage_profiler_enabled = false;
+		VitaPerformanceTelemetry::ConfigureCpuStageProfilerBeforeVmStart(
+			cpu_stage_profiler_enabled);
 		Console.WriteLn(
-			"VitaSX2 performance telemetry: enabled=%u source=%s.",
-			enabled ? 1u : 0u, source);
+			"VitaSX2 performance telemetry: enabled=%u cpu_stage_profiler=%u source=%s.",
+			enabled ? 1u : 0u,
+			cpu_stage_profiler_enabled ? 1u : 0u,
+			source);
 	}
 
 	void ConfigureProductInputAutomation()
