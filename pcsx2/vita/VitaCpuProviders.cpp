@@ -843,7 +843,9 @@ static bool recCanResumeGeneratedEeAfterEvent()
 	return resume;
 }
 
-static __attribute__((noinline)) u32 recRunEeEventForGeneratedResume(
+template <bool PrivateSchedulerEntry>
+static inline __attribute__((always_inline)) u32
+recRunEeEventForGeneratedResumeCore(
 	u32 event_token)
 {
 	// PCSX2 owner: x86/ix86-32/iR5900.cpp::recEventTest() runs the complete
@@ -862,7 +864,14 @@ static __attribute__((noinline)) u32 recRunEeEventForGeneratedResume(
 	for (;;)
 	{
 		event_tests++;
+#if defined(__arm__)
+		if constexpr (PrivateSchedulerEntry)
+			VitaRunCpuEventTestSharedFromOwnedEeFrame();
+		else
+			_cpuEventTest_Shared();
+#else
 		_cpuEventTest_Shared();
+#endif
 		resume = recCanResumeGeneratedEeAfterEvent();
 		if (!resume || !retain_unconditional_wait || wait_cycles == 0 ||
 			cpuRegs.pc != wait_pc)
@@ -895,6 +904,14 @@ static __attribute__((noinline)) u32 recRunEeEventForGeneratedResume(
 	if (resume)
 		VitaEE::RefreshRawGpr0KnownZero();
 	return resume ? 1u : 0u;
+}
+
+template <bool PrivateSchedulerEntry>
+static __attribute__((noinline)) u32
+recRunEeEventForGeneratedResumeAapcs(u32 event_token)
+{
+	return recRunEeEventForGeneratedResumeCore<PrivateSchedulerEntry>(
+		event_token);
 }
 
 static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& result)
@@ -1046,11 +1063,24 @@ static void recExecute()
 		{
 			VitaEE::BlockExecutionResult result;
 			s_ee_a32_running_compiled_block = true;
+#if defined(__arm__)
+			const bool private_scheduler =
+				VitaCpuEventTestSharedPrivateSupported();
+			const VitaEE::BlockExecutor::PersistentEventCallback event_callback =
+				s_ee_a32_in_frame_event_resume_enabled ?
+				(private_scheduler ?
+					&recRunEeEventForGeneratedResumeAapcs<true> :
+					&recRunEeEventForGeneratedResumeAapcs<false>) :
+				nullptr;
+#else
+			const VitaEE::BlockExecutor::PersistentEventCallback event_callback =
+				s_ee_a32_in_frame_event_resume_enabled ?
+					&recRunEeEventForGeneratedResumeAapcs<false> : nullptr;
+#endif
 			const bool executed = fast_dispatch ?
 				s_ee_a32_executor.ExecutePersistentAtPc(pc, true,
 					&recPersistentEeBoundary, nullptr, &result,
-					s_ee_a32_in_frame_event_resume_enabled ?
-						&recRunEeEventForGeneratedResume : nullptr) :
+					event_callback) :
 				s_ee_a32_executor.ExecuteCompiledBlockAtPc(pc, true, &result);
 			s_ee_a32_running_compiled_block = false;
 			if (executed)

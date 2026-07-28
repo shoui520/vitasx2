@@ -69,6 +69,28 @@ EE_intProcessStatus eeRunInterruptScan = INT_NOT_RUNNING;
 
 u32 g_eeloadMain = 0, g_eeloadExec = 0, g_osdsys_str = 0;
 
+#if defined(__arm__)
+namespace
+{
+	[[noreturn]] inline __attribute__((always_inline))
+	void ReturnFromPrivateCpuEventTestShared()
+	{
+		register void* caller_cfa asm("r0") = __builtin_dwarf_cfa();
+		asm volatile(
+			// The private entry reserved the body's ordinary nine-word save
+			// area, but only LR belongs to it. The persistent EE event bridge
+			// already owns r4-r11 for the complete generated-code run.
+			"ldr lr, [r0, #-4]\n"
+			"mov sp, r0\n"
+			"bx lr\n"
+			:
+			: "r"(caller_cfa)
+			: "lr", "memory");
+		__builtin_unreachable();
+	}
+}
+#endif
+
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 static __fi Pcsx2Trace::CoreEventId GetEeSifCoreEventId(u8 event)
@@ -454,8 +476,18 @@ static __fi void VitaIopEventTestFromEe()
 
 // Shared portion of the branch test, called from both the Interpreter
 // and the recompiler.  (moved here to help alleviate redundant code)
+#if defined(__arm__)
+extern "C" __attribute__((noinline, target("arm")))
+void VitaCpuEventTestSharedPrivateBody()
+#else
 __fi void _cpuEventTest_Shared()
+#endif
 {
+#if defined(__arm__)
+	// Force a stable first A32 instruction for the verified private entry.
+	// Its alternative AAPCS adapter below executes this save normally.
+	asm volatile("" ::: "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "lr");
+#endif
 	eeEventTestIsActive = true;
 	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
 	cpuRegs.lastEventCycle = cpuRegs.cycle;
@@ -610,7 +642,45 @@ __fi void _cpuEventTest_Shared()
 	Pcsx2Trace::RecordPendingMachineCheckpointAtEventTest();
 #endif
 	eeEventTestIsActive = false;
+#if defined(__arm__)
+	ReturnFromPrivateCpuEventTestShared();
+#endif
 }
+
+#if defined(__arm__)
+__attribute__((naked, noinline, target("arm"))) void _cpuEventTest_Shared()
+{
+	asm volatile(
+		// Cold AAPCS adapter for the interpreter, diagnostics, and callable EE
+		// paths which do not already own a full private frame.
+		"push {r4-r11, lr}\n"
+		"sub sp, sp, #4\n"
+		"bl VitaCpuEventTestSharedPrivate\n"
+		"add sp, sp, #4\n"
+		"pop {r4-r11, pc}\n");
+}
+
+extern "C" __attribute__((naked, noinline, target("arm")))
+void VitaCpuEventTestSharedPrivate()
+{
+	asm volatile(
+		// Match the compiler body's nine-word CFA without transferring the
+		// caller-owned register bank. Body+4 skips its verified A32 PUSH.
+		"sub sp, sp, #36\n"
+		"str lr, [sp, #32]\n"
+		"b VitaCpuEventTestSharedPrivateBody + 4\n");
+}
+
+bool VitaCpuEventTestSharedPrivateSupported()
+{
+	extern void VitaCpuEventTestSharedPrivateBodySymbol() __asm__(
+		"VitaCpuEventTestSharedPrivateBody");
+	constexpr u32 EXPECTED_PUSH_R4_R11_LR = 0xe92d4ff0u;
+	return *reinterpret_cast<const u32*>(
+		reinterpret_cast<uptr>(&VitaCpuEventTestSharedPrivateBodySymbol)) ==
+		EXPECTED_PUSH_R4_R11_LR;
+}
+#endif
 
 __ri void cpuTestINTCInts()
 {

@@ -21,6 +21,8 @@ extern bool g_vita_a32_iop_private_scheduler_resume_entry_available;
 extern bool g_vita_a32_iop_private_scheduler_prediction_entry_available;
 extern bool g_vita_a32_iop_private_scheduler_dispatch_cache_entry_available;
 #if defined(__arm__)
+extern "C" void VitaCpuEventTestSharedPrivate();
+bool VitaCpuEventTestSharedPrivateSupported();
 extern "C" s32 VitaIopA32ExecuteProviderTimeslicePrivate(
 	void* context, s32 ee_cycles);
 extern "C" s32 VitaIopA32ExecuteProviderSchedulerDirectResumePrivate(
@@ -92,6 +94,18 @@ inline __attribute__((always_inline)) s32 VitaExecuteA32IopTimesliceFromEeEvent(
 		  "lr", "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
 		  "cc", "memory");
 	return static_cast<s32>(context_and_result);
+}
+
+inline __attribute__((always_inline)) void
+VitaRunCpuEventTestSharedFromOwnedEeFrame()
+{
+	asm volatile(
+		"bl VitaCpuEventTestSharedPrivate"
+		:
+		:
+		: "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
+		  "r10", "r11", "r12", "lr", "d0", "d1", "d2", "d3", "d4", "d5",
+		  "d6", "d7", "cc", "memory");
 }
 #endif
 
