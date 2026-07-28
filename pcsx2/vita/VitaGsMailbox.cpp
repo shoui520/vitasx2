@@ -648,6 +648,8 @@ namespace MTGS
 		if (boundary - s_correlated_profile.boundaries_at_start < WINDOW_VSYNCS)
 			return;
 
+		const VitaPerformanceTelemetry::ScopedCpuStage diagnostic_stage(
+			VitaPerformanceTelemetry::CpuStage::Diagnostics);
 		const CorrelatedPerformanceSnapshot end =
 			CaptureCorrelatedPerformanceSnapshot(producer_vsync);
 		const CorrelatedPerformanceSnapshot& start = s_correlated_profile.start;
@@ -708,15 +710,23 @@ namespace MTGS
 			const u64 unbalanced_samples = CounterDelta(
 				end.cpu_stage_profiler.unbalanced_samples,
 				start.cpu_stage_profiler.unbalanced_samples);
+			const u64 interval_records = CounterDelta(
+				end.cpu_stage_profiler.interval_records,
+				start.cpu_stage_profiler.interval_records);
+			const u64 overwritten_interval_records = CounterDelta(
+				end.cpu_stage_profiler.overwritten_interval_records,
+				start.cpu_stage_profiler.overwritten_interval_records);
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_summary "
 				"sample_period=%u scheduler_entries=%llu samples=%llu "
-				"unbalanced=%llu",
+				"unbalanced=%llu interval_records=%llu interval_overwrites=%llu",
 				static_cast<unsigned long long>(window),
 				VitaPerformanceTelemetry::CPU_STAGE_SAMPLE_PERIOD,
 				static_cast<unsigned long long>(scheduler_entries),
 				static_cast<unsigned long long>(stage_samples),
-				static_cast<unsigned long long>(unbalanced_samples));
+				static_cast<unsigned long long>(unbalanced_samples),
+				static_cast<unsigned long long>(interval_records),
+				static_cast<unsigned long long>(overwritten_interval_records));
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_time_us{};
 			std::array<u64,
@@ -776,6 +786,132 @@ namespace MTGS
 				static_cast<unsigned long long>(stage_entries[10]),
 				static_cast<unsigned long long>(stage_entries[11]),
 				static_cast<unsigned long long>(stage_entries[12]));
+			const auto stage_time = [&stage_time_us](
+				VitaPerformanceTelemetry::CpuStage stage) {
+				return stage_time_us[static_cast<size_t>(stage)];
+			};
+			const auto stage_entry = [&stage_entries](
+				VitaPerformanceTelemetry::CpuStage stage) {
+				return stage_entries[static_cast<size_t>(stage)];
+			};
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_stage_extended "
+				"ee_generated=%llu ee_provider=%llu ee_interpreter=%llu iop_interpreter=%llu "
+				"cop1=%llu cop2_vu0=%llu ee_helper=%llu ee_memory_slow=%llu "
+				"iop_helper=%llu iop_memory_slow=%llu ipu=%llu vif_gif=%llu "
+				"sif=%llu cdvd=%llu dma=%llu other_device=%llu diagnostics=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::EeGenerated)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::EeProvider)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::EeInterpreter)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IopInterpreter)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::Cop1)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::Cop2Vu0)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::EeHelper)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::EeMemorySlowPath)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IopHelper)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IopMemorySlowPath)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::Ipu)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::VifGif)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::Sif)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::Cdvd)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::Dma)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::OtherDevice)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::Diagnostics)));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_stage_extended_entries "
+				"ee_generated=%llu ee_provider=%llu ee_interpreter=%llu iop_interpreter=%llu "
+				"cop1=%llu cop2_vu0=%llu ee_helper=%llu ee_memory_slow=%llu "
+				"iop_helper=%llu iop_memory_slow=%llu ipu=%llu vif_gif=%llu "
+				"sif=%llu cdvd=%llu dma=%llu other_device=%llu diagnostics=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::EeGenerated)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::EeProvider)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::EeInterpreter)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::IopInterpreter)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::Cop1)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::Cop2Vu0)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::EeHelper)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::EeMemorySlowPath)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::IopHelper)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::IopMemorySlowPath)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::Ipu)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::VifGif)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::Sif)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::Cdvd)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::Dma)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::OtherDevice)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::Diagnostics)));
+			const VitaPerformanceTelemetry::CpuProfileHotEdgeSnapshot hot_edges =
+				VitaPerformanceTelemetry::GetCpuProfileHotEdgeSnapshot(
+					start.cpu_stage_profiler.interval_records + 1,
+					end.cpu_stage_profiler.interval_records + 1);
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_hot_edge_summary "
+				"first_sequence=%llu next_sequence=%llu dropped=%llu invalid=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(hot_edges.first_sequence),
+				static_cast<unsigned long long>(hot_edges.next_sequence),
+				static_cast<unsigned long long>(hot_edges.dropped_records),
+				static_cast<unsigned long long>(hot_edges.invalid_records));
+			for (size_t i = 0;
+				i < VitaPerformanceTelemetry::CPU_PROFILE_HOT_EDGE_COUNT; i++)
+			{
+				const VitaPerformanceTelemetry::CpuProfileHotEdge& ee_edge =
+					hot_edges.ee[i];
+				const VitaPerformanceTelemetry::CpuProfileHotEdge& iop_edge =
+					hot_edges.iop[i];
+				if (ee_edge.samples == 0 && iop_edge.samples == 0)
+					break;
+				output.WriteLn(
+					"Vita perf v=1 window=%llu kind=cpu_hot_edge rank=%u "
+					"ee_start=0x%08x ee_end=0x%08x ee_samples=%u "
+					"ee_us=%llu ee_cycles=%llu "
+					"iop_start=0x%08x iop_end=0x%08x iop_samples=%u "
+					"iop_us=%llu iop_cycles=%llu",
+					static_cast<unsigned long long>(window),
+					static_cast<unsigned>(i + 1),
+					ee_edge.start_pc, ee_edge.end_pc, ee_edge.samples,
+					static_cast<unsigned long long>(ee_edge.host_time_us),
+					static_cast<unsigned long long>(ee_edge.guest_cycles),
+					iop_edge.start_pc, iop_edge.end_pc, iop_edge.samples,
+					static_cast<unsigned long long>(iop_edge.host_time_us),
+					static_cast<unsigned long long>(iop_edge.guest_cycles));
+			}
 		}
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee generated_blocks=%llu host_instructions=%llu "

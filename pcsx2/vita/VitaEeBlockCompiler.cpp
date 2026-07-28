@@ -25,6 +25,7 @@
 #endif
 #include "pcsx2/vita/A32Emitter.h"
 #include "pcsx2/vita/VitaFpRounding.h"
+#include "pcsx2/vita/VitaPerformanceTelemetry.h"
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 #include "pcsx2/vita/VitaCore.h"
 #include "pcsx2/DebugTools/GsTrace.h"
@@ -542,6 +543,8 @@ namespace VitaEE
 		__noinline u32 VitaEeAdvancePollCallWaitToEvent(u32 packed_cycles,
 			u32 leaf_pc, u32 return_pc, u32 call_pc)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// A static call and JR are separate PCSX2 BaseBlocks, and each owns
 			// iBranchTest(). Do not turn the multi-block loop into the subtly
 			// different inline-wait contract (cycle == nextEventCycle, PC at the
@@ -596,6 +599,8 @@ namespace VitaEE
 		__noinline u32 VitaEeAdvanceTwoPredicateWaitToEvent(
 			u32 prefix_cycles, u32 tail_cycles, u32 loop_pc, u32 tail_pc)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owner: x86/ix86-32/iR5900.cpp::{recRecompile,
 			// iBranchTest}. Unlike a one-block s_nBlockFF loop, this proven
 			// polling shape has one scheduler seam after its forward-exit
@@ -643,6 +648,8 @@ namespace VitaEE
 		__noinline u32 VitaEeExecuteSignedCountdownLoop(u32 start_pc, u32 fallthrough_pc,
 			u32 block_cycles, u32 packed_guests)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owner: x86/ix86-32/iR5900.cpp::recSkipTimeoutLoop(). This
 			// signed-BGEZ adaptation retains whole compiled iterations at an event
 			// seam and publishes R5900OpcodeImpl.cpp::ADDIU()'s delay-slot result
@@ -692,6 +699,8 @@ namespace VitaEE
 		__noinline u32 VitaEeExecuteGsCsrVsintPoll(u32 start_pc, u32 fallthrough_pc,
 			u32 block_cycles, u32 packed_guests)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owners: GS.cpp::gsRead64() exposes GS_CSR, while
 			// Counters.cpp::GSVSync() sets VSINT at a scheduler event and x86
 			// iR5900.cpp::iBranchTest() advances a proven wait loop to that event.
@@ -2489,6 +2498,8 @@ namespace VitaEE
 
 		__noinline void VitaEeRaiseAddressError(u32 addr, bool store)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owner: R5900OpcodeImpl.cpp::RaiseAddressError().
 			const std::string message(
 				fmt::format("Address Error, addr=0x{:x} [{}]", addr, store ? "store" : "load"));
@@ -2506,6 +2517,8 @@ namespace VitaEE
 
 		__noinline void VitaEeMemReadCop1Word(u32 addr, u32 guest_reg)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeMemorySlowPath);
 			// PCSX2 owner: FPU.cpp::LWC1().
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuCop1MemoryHelperCalls;
@@ -2521,6 +2534,8 @@ namespace VitaEE
 
 		__noinline void VitaEeMemWriteCop1Word(u32 addr, u32 guest_reg)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeMemorySlowPath);
 			// PCSX2 owner: FPU.cpp::SWC1().
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuCop1MemoryHelperCalls;
@@ -2536,6 +2551,8 @@ namespace VitaEE
 
 		__noinline void VitaEeDivSigned(u32 rs, u32 rt)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owner: R5900OpcodeImpl.cpp::DIV(). Cortex-A9 has no integer
 			// divide instruction, so arbitrary division falls back here.
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -2560,6 +2577,8 @@ namespace VitaEE
 
 		__noinline void VitaEeDivUnsigned(u32 rs, u32 rt)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owner: R5900OpcodeImpl.cpp::DIVU().
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuDivUnsignedHelperCalls;
@@ -2578,6 +2597,8 @@ namespace VitaEE
 
 		__noinline void VitaEeDivSigned1(u32 rs, u32 rt)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owners: MMI.cpp::DIV1() and
 			// x86/ix86-32/iR5900MultDiv.cpp::recDIV1().
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -2602,6 +2623,8 @@ namespace VitaEE
 
 		__noinline void VitaEeDivUnsigned1(u32 rs, u32 rt)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owners: MMI.cpp::DIVU1() and
 			// x86/ix86-32/iR5900MultDiv.cpp::recDIVU1().
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -2621,6 +2644,8 @@ namespace VitaEE
 
 		__noinline void VitaEePackedDivSignedWords(u32 rs0, u32 rt0, u32 rs2, u32 rt2)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owners: MMI.cpp::PDIVW() and x86/iMMI.cpp::recPDIVW().
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuPackedDivSignedWordHelperCalls;
@@ -2649,6 +2674,8 @@ namespace VitaEE
 
 		__noinline void VitaEePackedDivUnsignedWords(u32 rs0, u32 rt0, u32 rs2, u32 rt2)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owners: MMI.cpp::PDIVUW() and x86/iMMI.cpp::recPDIVUW().
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuPackedDivUnsignedWordHelperCalls;
@@ -2672,6 +2699,8 @@ namespace VitaEE
 
 		__noinline void VitaEePackedDivSignedWordsByHalfword(u32 op)
 		{
+			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
 			// PCSX2 owner: MMI.cpp::PDIVBW().
 #if defined(VITASX2_QEMU_VALIDATION)
 			++g_qemuPackedDivWordByHalfwordHelperCalls;

@@ -218,6 +218,34 @@ static __fi void IopTestEvent( IopEventId n, void (*callback)() )
 		}
 #endif
 		psxRegs.interrupt &= ~(1 << n);
+#if defined(VITASX2_CPU_PROFILER)
+		const auto profile_owner = [n]() {
+			switch (n)
+			{
+				case IopEvt_SIF0:
+				case IopEvt_SIF1:
+				case IopEvt_SIF2:
+					return VitaPerformanceTelemetry::CpuStage::Sif;
+				case IopEvt_CdvdSectorReady:
+				case IopEvt_CdvdRead:
+				case IopEvt_Cdvd:
+				case IopEvt_Cdrom:
+				case IopEvt_CdromRead:
+					return VitaPerformanceTelemetry::CpuStage::Cdvd;
+				case IopEvt_Dma11:
+				case IopEvt_Dma12:
+					return VitaPerformanceTelemetry::CpuStage::Dma;
+				case IopEvt_DEV9:
+					return VitaPerformanceTelemetry::CpuStage::Dev9;
+				case IopEvt_USB:
+					return VitaPerformanceTelemetry::CpuStage::Usb;
+				default:
+					return VitaPerformanceTelemetry::CpuStage::OtherDevice;
+			}
+		}();
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+			profile_owner);
+#endif
 		callback();
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
@@ -243,6 +271,10 @@ static __fi void Sio0TestEvent(IopEventId n)
 	if (psxTestCycle(psxRegs.sCycle[n], psxRegs.eCycle[n]))
 	{
 		psxRegs.interrupt &= ~(1 << n);
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::OtherDevice);
+#endif
 		g_Sio0.Interrupt(Sio0Interrupt::TEST_EVENT);
 	}
 	else

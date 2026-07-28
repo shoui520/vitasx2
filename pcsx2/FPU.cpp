@@ -3,6 +3,15 @@
 
 #include "Common.h"
 
+#if defined(VITASX2_VITA)
+#include "vita/VitaPerformanceTelemetry.h"
+#define VITA_PROFILE_COP1() \
+	VitaPerformanceTelemetry::CountCpuStageEntryIfSampling( \
+		VitaPerformanceTelemetry::CpuStage::Cop1)
+#else
+#define VITA_PROFILE_COP1() ((void)0)
+#endif
+
 #include <cmath>
 
 // Helper Macros
@@ -183,55 +192,67 @@ float fpuDouble(u32 f)
 }
 
 void ABS_S() {
+	VITA_PROFILE_COP1();
 	_FdValUl_ = _FsValUl_ & 0x7fffffff;
 	clearFPUFlags( FPUflagO | FPUflagU );
 }
 
 void ADD_S() {
+	VITA_PROFILE_COP1();
 	_FdValf_  = fpuDouble( _FsValUl_ ) + fpuDouble( _FtValUl_ );
 	if (checkOverflow( _FdValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FdValUl_, FPUflagU | FPUflagSU);
 }
 
 void ADDA_S() {
+	VITA_PROFILE_COP1();
 	_FAValf_  = fpuDouble( _FsValUl_ ) + fpuDouble( _FtValUl_ );
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
 }
 
 void BC1F() {
+	VITA_PROFILE_COP1();
 	BC1(==);
 }
 
 void BC1FL() {
+	VITA_PROFILE_COP1();
 	BC1L(==); // Equal to 0
 }
 
 void BC1T() {
+	VITA_PROFILE_COP1();
 	BC1(!=);
 }
 
 void BC1TL() {
+	VITA_PROFILE_COP1();
 	BC1L(!=); // different from 0
 }
 
 void C_EQ() {
+	VITA_PROFILE_COP1();
 	C_cond_S(==);
 }
 
 void C_F() {
+	VITA_PROFILE_COP1();
 	clearFPUFlags( FPUflagC ); //clears C regardless
 }
 
 void C_LE() {
+	VITA_PROFILE_COP1();
 	C_cond_S(<=);
 }
 
 void C_LT() {
+	VITA_PROFILE_COP1();
 	C_cond_S(<);
 }
 
 void CFC1() {
+	VITA_PROFILE_COP1();
 	if (!_Rt_) return;
 
 	if (_Fs_ == 31)
@@ -243,21 +264,25 @@ void CFC1() {
 }
 
 void CTC1() {
+	VITA_PROFILE_COP1();
 	if ( _Fs_ != 31 ) return;
 	fpuRegs.fprc[_Fs_] = cpuRegs.GPR.r[_Rt_].UL[0];
 }
 
 void CVT_S() {
+	VITA_PROFILE_COP1();
 	_FdValf_ = (float)_FsValSl_;
 }
 
 void CVT_W() {
+	VITA_PROFILE_COP1();
 	if ( ( _FsValUl_ & 0x7F800000 ) <= 0x4E800000 ) { _FdValSl_ = (s32)_FsValf_; }
 	else if ( ( _FsValUl_ & 0x80000000 ) == 0 ) { _FdValUl_ = 0x7fffffff; }
 	else { _FdValUl_ = 0x80000000; }
 }
 
 void DIV_S() {
+	VITA_PROFILE_COP1();
 	if (checkDivideByZero( _FdValUl_, _FtValUl_, _FsValUl_, FPUflagD | FPUflagSD, FPUflagI | FPUflagSI)) return;
 	_FdValf_ = fpuDouble( _FsValUl_ ) / fpuDouble( _FtValUl_ );
 	if (checkOverflow( _FdValUl_, 0)) return;
@@ -269,6 +294,7 @@ void DIV_S() {
 	method provides a similar outcome and is faster. (cottonvibes)
 */
 void MADD_S() {
+	VITA_PROFILE_COP1();
 	FPRreg temp;
 	temp.f = fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
 	_FdValf_  = fpuDouble( _FAValUl_ ) + fpuDouble( temp.UL );
@@ -277,31 +303,37 @@ void MADD_S() {
 }
 
 void MADDA_S() {
+	VITA_PROFILE_COP1();
 	_FAValf_ += fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
 }
 
 void MAX_S() {
+	VITA_PROFILE_COP1();
 	_FdValUl_  = fp_max( _FsValUl_, _FtValUl_ );
 	clearFPUFlags( FPUflagO | FPUflagU );
 }
 
 void MFC1() {
+	VITA_PROFILE_COP1();
 	if ( !_Rt_ ) return;
 	cpuRegs.GPR.r[_Rt_].SD[0] = _FsValSl_;		// sign extension into 64bit
 }
 
 void MIN_S() {
+	VITA_PROFILE_COP1();
 	_FdValUl_ = fp_min(_FsValUl_, _FtValUl_);
 	clearFPUFlags( FPUflagO | FPUflagU );
 }
 
 void MOV_S() {
+	VITA_PROFILE_COP1();
 	_FdValUl_ = _FsValUl_;
 }
 
 void MSUB_S() {
+	VITA_PROFILE_COP1();
 	FPRreg temp;
 	temp.f = fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
 	_FdValf_  = fpuDouble( _FAValUl_ ) - fpuDouble( temp.UL );
@@ -310,33 +342,39 @@ void MSUB_S() {
 }
 
 void MSUBA_S() {
+	VITA_PROFILE_COP1();
 	_FAValf_ -= fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
 }
 
 void MTC1() {
+	VITA_PROFILE_COP1();
 	_FsValUl_ = cpuRegs.GPR.r[_Rt_].UL[0];
 }
 
 void MUL_S() {
+	VITA_PROFILE_COP1();
 	_FdValf_  = fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
 	if (checkOverflow( _FdValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FdValUl_, FPUflagU | FPUflagSU);
 }
 
 void MULA_S() {
+	VITA_PROFILE_COP1();
 	_FAValf_  = fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
 }
 
 void NEG_S() {
+	VITA_PROFILE_COP1();
 	_FdValUl_  = (_FsValUl_ ^ 0x80000000);
 	clearFPUFlags( FPUflagO | FPUflagU );
 }
 
 void RSQRT_S() {
+	VITA_PROFILE_COP1();
 	FPRreg temp;
 	clearFPUFlags(FPUflagD | FPUflagI);
 
@@ -357,6 +395,7 @@ void RSQRT_S() {
 }
 
 void SQRT_S() {
+	VITA_PROFILE_COP1();
 	clearFPUFlags(FPUflagI | FPUflagD);
 
 	if ( ( _FtValUl_ & 0x7F800000 ) == 0 ) // If Ft = +/-0
@@ -369,12 +408,14 @@ void SQRT_S() {
 }
 
 void SUB_S() {
+	VITA_PROFILE_COP1();
 	_FdValf_  = fpuDouble( _FsValUl_ ) - fpuDouble( _FtValUl_ );
 	if (checkOverflow( _FdValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FdValUl_, FPUflagU | FPUflagSU);
 }
 
 void SUBA_S() {
+	VITA_PROFILE_COP1();
 	_FAValf_  = fpuDouble( _FsValUl_ ) - fpuDouble( _FtValUl_ );
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
@@ -389,6 +430,7 @@ void SUBA_S() {
 // seem more appropriately located here.
 
 void LWC1() {
+	VITA_PROFILE_COP1();
 	u32 addr;
 	addr = cpuRegs.GPR.r[_Rs_].UL[0] + (s16)(cpuRegs.code & 0xffff);	// force sign extension to 32bit
 	if (addr & 0x00000003) { Console.Error( "FPU (LWC1 Opcode): Invalid Unaligned Memory Address" ); return; }  // Should signal an exception?
@@ -396,6 +438,7 @@ void LWC1() {
 }
 
 void SWC1() {
+	VITA_PROFILE_COP1();
 	u32 addr;
 	addr = cpuRegs.GPR.r[_Rs_].UL[0] + (s16)(cpuRegs.code & 0xffff);	// force sign extension to 32bit
 	if (addr & 0x00000003) { Console.Error( "FPU (SWC1 Opcode): Invalid Unaligned Memory Address" ); return; }  // Should signal an exception?
@@ -403,3 +446,5 @@ void SWC1() {
 }
 
 } } }
+
+#undef VITA_PROFILE_COP1

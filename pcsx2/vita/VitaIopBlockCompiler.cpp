@@ -21,6 +21,7 @@
 #include "pcsx2/R5900.h"
 #include "pcsx2/VMManager.h"
 #include "pcsx2/vita/VitaCore.h"
+#include "pcsx2/vita/VitaPerformanceTelemetry.h"
 
 #include <algorithm>
 #include <cstring>
@@ -12711,6 +12712,8 @@ namespace VitaIOP
 
 	s32 BlockExecutor::ExecuteInterpreterFallbackTimeslice(s32 ee_cycles)
 	{
+		VitaPerformanceTelemetry::ScopedCpuStage stage(
+			VitaPerformanceTelemetry::CpuStage::IopInterpreter);
 #if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
 	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 		if (m_portable_validation_stats.interpreter_fallback_entries != UINT32_MAX)
@@ -12739,6 +12742,8 @@ namespace VitaIOP
 	s32 BlockExecutor::ExecuteInterpreterRecompilerBlock(
 		s32 ee_cycles, bool* logical_continuation, bool* execution_terminated)
 	{
+		VitaPerformanceTelemetry::ScopedCpuStage stage(
+			VitaPerformanceTelemetry::CpuStage::IopInterpreter);
 #if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
 	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 		if (m_portable_validation_stats.interpreter_fallback_entries != UINT32_MAX)

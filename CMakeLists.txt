@@ -59,12 +59,12 @@ if(VITASX2_PRODUCT_BOOT_VALIDATION)
 endif()
 
 option(VITASX2_CPU_PROFILER
-	"Compile the opt-in sparse exclusive CPU0 stage profiler."
+	"Compile the opt-in full-interval CPU0 stage and hot-edge profiler."
 	OFF)
 if(VITASX2_CPU_PROFILER)
-	# Scheduler stage markers are compiled completely out of the playable
-	# product. Profile builds use the CEX-supported process clock only on a
-	# sparse subset of scheduler entries.
+	# The interval ring, edge analyzer, and all stage markers are compiled
+	# completely out of the playable product. Profile builds use the
+	# CEX-supported process clock only on a sparse subset of scheduler spans.
 	add_compile_definitions(VITASX2_CPU_PROFILER=1)
 endif()
 

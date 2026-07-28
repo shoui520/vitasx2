@@ -401,7 +401,11 @@ static void recInterpreterStepWithoutProviderTrace()
 	const VitaEePreInstructionTraceCallback callback = s_ee_pre_instruction_trace_callback;
 	s_ee_pre_instruction_trace_callback = nullptr;
 	s_ee_provider_trace_suppressed = true;
-	intCpu.Step();
+	{
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::EeInterpreter);
+		intCpu.Step();
+	}
 	s_ee_provider_trace_suppressed = false;
 	s_ee_pre_instruction_trace_callback = callback;
 	VitaEE::RefreshRawGpr0KnownZero();
@@ -926,6 +930,8 @@ recRunEeEventForGeneratedResumeAapcs(u32 event_token)
 
 static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& result)
 {
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::EeProvider);
 	recAccountEeBlockExecution(result, cpuRegs.pc);
 	if (!recProcessEeLifecycleBoundary(cpuRegs.pc))
 	{
@@ -1014,6 +1020,8 @@ static void recReset()
 
 static void recStep()
 {
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::EeInterpreter);
 	intCpu.Step();
 	VitaEE::RefreshRawGpr0KnownZero();
 }
@@ -1122,7 +1130,11 @@ static void recExecute()
 				// callable blocks cannot run in the persistent exit ABI.
 				const u32 fallback_pc = cpuRegs.pc;
 				const u32 fallback_opcode = memRead32(fallback_pc);
-				intCpu.Step();
+				{
+					const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+						VitaPerformanceTelemetry::CpuStage::EeInterpreter);
+					intCpu.Step();
+				}
 				VitaEE::RefreshRawGpr0KnownZero();
 				recRecordInterpreterFallback(fallback_pc, fallback_opcode,
 					VitaA32EeFallbackReason::ExecuteFailed);
@@ -1141,7 +1153,11 @@ static void recExecute()
 			// intDoBranch() — the same record stream the interpreter provider
 			// produces. A stop request exits through Cpu->ExitExecution().
 			const u32 opcode = memRead32(pc);
-			intCpu.Step();
+			{
+				const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+					VitaPerformanceTelemetry::CpuStage::EeInterpreter);
+				intCpu.Step();
+			}
 			VitaEE::RefreshRawGpr0KnownZero();
 			recRecordInterpreterFallback(pc, opcode, recFallbackReasonForScanStop(scan.stop));
 			continue;
@@ -1544,6 +1560,8 @@ void recMicroVU0::Reset()
 
 void recMicroVU0::Step()
 {
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::Cop2Vu0);
 	CpuIntVU0.Step();
 }
 
@@ -1556,6 +1574,8 @@ void recMicroVU0::Execute(u32 cycles)
 {
 	// PCSX2 owner: InterpVU0::Execute()'s loop, with scan-proven windows
 	// routed through the A32 block provider in pcsx2/vita/VitaVuBlockCompiler.cpp.
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::Cop2Vu0);
 	VitaVU::ExecuteVu0Blocks(cycles);
 }
 

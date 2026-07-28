@@ -334,6 +334,37 @@ __fi void cpuClearInt( uint i )
 	cpuRegs.dmastall &= ~(1 << i);
 }
 
+#if defined(VITASX2_CPU_PROFILER)
+static __fi VitaPerformanceTelemetry::CpuStage VitaEeEventProfileStage(u8 event)
+{
+	switch (event)
+	{
+		case VU_MTVU_BUSY:
+		case VIF_VU0_FINISH:
+		case VIF_VU1_FINISH:
+			return VitaPerformanceTelemetry::CpuStage::VuSync;
+		case DMAC_VIF0:
+		case DMAC_VIF1:
+		case DMAC_GIF:
+		case DMAC_MFIFO_VIF:
+		case DMAC_MFIFO_GIF:
+			return VitaPerformanceTelemetry::CpuStage::VifGif;
+		case DMAC_SIF0:
+		case DMAC_SIF1:
+			return VitaPerformanceTelemetry::CpuStage::Sif;
+		case DMAC_FROM_IPU:
+		case DMAC_TO_IPU:
+		case IPU_PROCESS:
+			return VitaPerformanceTelemetry::CpuStage::Ipu;
+		case DMAC_FROM_SPR:
+		case DMAC_TO_SPR:
+			return VitaPerformanceTelemetry::CpuStage::Dma;
+		default:
+			return VitaPerformanceTelemetry::CpuStage::OtherDevice;
+	}
+}
+#endif
+
 static __fi void TESTINT( u8 n, void (*callback)() )
 {
 	if( !(cpuRegs.interrupt & (1 << n)) ) return;
@@ -351,6 +382,10 @@ static __fi void TESTINT( u8 n, void (*callback)() )
 		}
 #endif
 		cpuClearInt( n );
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+			VitaEeEventProfileStage(n));
+#endif
 		callback();
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
@@ -520,7 +555,8 @@ __fi void _cpuEventTest_Shared()
 	asm volatile("" ::: "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "lr");
 #endif
 #if defined(VITASX2_VITA)
-	VitaPerformanceTelemetry::OnEeSchedulerEntry();
+	VitaPerformanceTelemetry::OnEeSchedulerEntry(
+		cpuRegs.pc, cpuRegs.cycle, psxRegs.pc, psxRegs.cycle);
 #endif
 	eeEventTestIsActive = true;
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
