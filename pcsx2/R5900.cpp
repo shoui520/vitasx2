@@ -74,6 +74,20 @@ static __fi bool VitaCanCoalesceRetainedIopWait()
 	return VitaA32IopRetainedWaitCoalescingActive() &&
 		(cpuRegs.CP0.n.Status.val & 0x8000u) == 0;
 }
+
+static __fi s32 VitaScaleIopEventDeltaToEe(u64 iop_cycles)
+{
+	// PCSX2 owner: R3000AInterpreter.cpp::intExecuteBlock() and
+	// x86/iR3000A.cpp::iPsxAddEECycles(). Ordinary PS2 mode is exactly 8:1;
+	// avoid converting through float and issuing a VFP divide at every EE
+	// event seam. PS1 mode keeps the existing R5900 scheduler calculation.
+	if (PSXCLK == (PS2CLK / 8u)) [[likely]]
+		return static_cast<s32>(iop_cycles * 8u);
+
+	const float multiplier =
+		static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
+	return static_cast<s32>(static_cast<float>(iop_cycles) * multiplier);
+}
 #endif
 
 bool eeEventTestIsActive = false;
@@ -634,10 +648,16 @@ __fi void _cpuEventTest_Shared()
 		CpuVU1->ExecuteBlock();
 
 	// ---- Schedule Next Event Test --------------
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	const int nextIopEventDelta =
+		VitaScaleIopEventDeltaToEe(psxRegs.iopNextEventCycle - psxRegs.cycle);
+#else
 	const float mutiplier = static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
-	const int nextIopEventDeta = ((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier);
+	const int nextIopEventDelta =
+		((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier);
+#endif
 	// 8 or more cycles behind and there's an event scheduled
-	if (EEsCycle >= nextIopEventDeta)
+	if (EEsCycle >= nextIopEventDelta)
 	{
 		// EE's running way ahead of the IOP still, so we should branch quickly to give the
 		// IOP extra timeslices in short order.
@@ -648,7 +668,11 @@ __fi void _cpuEventTest_Shared()
 	else
 	{
 		// Otherwise IOP is caught up/not doing anything so we can wait for the next event.
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		cpuSetNextEventDelta(nextIopEventDelta - EEsCycle);
+#else
 		cpuSetNextEventDelta(((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier) - EEsCycle);
+#endif
 	}
 
 	// Apply vsync and other counter nextCycles
