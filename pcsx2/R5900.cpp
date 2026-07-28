@@ -63,6 +63,18 @@ cachedTlbs_t cachedTlbs;
 R5900cpu *Cpu = NULL;
 
 static constexpr uint eeWaitCycles = 3072;
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+static constexpr uint eeRetainedIopWaitCycles = eeWaitCycles * 2;
+
+static __fi bool VitaCanCoalesceRetainedIopWait()
+{
+	// CP0 Count is updated lazily when read, but its compare interrupt is
+	// polled by _cpuTestTIMR(). Retain PCSX2's ordinary cadence whenever that
+	// interrupt is enabled.
+	return VitaA32IopRetainedWaitCoalescingActive() &&
+		(cpuRegs.CP0.n.Status.val & 0x8000u) == 0;
+}
+#endif
 
 bool eeEventTestIsActive = false;
 EE_intProcessStatus eeRunInterruptScan = INT_NOT_RUNNING;
@@ -450,7 +462,11 @@ static __fi void VitaIopEventTestFromEe()
 	// Cortex-A9 does not cross an out-of-line C++ call and repeat its global
 	// address setup. Every state-changing case still enters the owning function.
 	constexpr u32 IOP_WAIT_CYCLES = 384;
-	psxRegs.iopNextEventCycle = psxRegs.cycle + IOP_WAIT_CYCLES;
+	constexpr u32 IOP_RETAINED_WAIT_CYCLES = IOP_WAIT_CYCLES * 2;
+	psxRegs.iopNextEventCycle = psxRegs.cycle +
+		(VitaA32IopRetainedWaitCoalescingActive() ?
+				IOP_RETAINED_WAIT_CYCLES :
+				IOP_WAIT_CYCLES);
 
 	if (static_cast<s32>(static_cast<u32>(psxRegs.cycle - psxNextStartCounter)) >=
 		psxNextDeltaCounter)
@@ -489,7 +505,14 @@ __fi void _cpuEventTest_Shared()
 	asm volatile("" ::: "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "lr");
 #endif
 	eeEventTestIsActive = true;
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	cpuRegs.nextEventCycle = cpuRegs.cycle +
+		(VitaCanCoalesceRetainedIopWait() ?
+				eeRetainedIopWaitCycles :
+				eeWaitCycles);
+#else
 	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
+#endif
 	cpuRegs.lastEventCycle = cpuRegs.cycle;
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
@@ -630,6 +653,13 @@ __fi void _cpuEventTest_Shared()
 
 	// Apply vsync and other counter nextCycles
 	cpuSetNextEvent(nextStartCounter, nextDeltaCounter);
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	// IOP callbacks, interrupts, or source invalidation above may revoke the
+	// retained wait. Do not carry a coalesced arbitrary EE seam into ordinary
+	// execution (or across an enabled CP0 timer compare).
+	if (!VitaCanCoalesceRetainedIopWait())
+		cpuSetNextEventDelta(eeWaitCycles);
+#endif
 
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)

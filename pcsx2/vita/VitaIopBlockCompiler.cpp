@@ -7826,8 +7826,13 @@ namespace VitaIOP
 					}
 				}
 			}
+			const bool retained_unconditional_normal_wait =
+				m_wait_resume_event_context.kind == WaitResumeKind::Unconditional &&
+				!block->wait_loop_descriptor.writes_link &&
+				(psxHu32(HW_ICFG) & (1u << 3)) == 0;
 			VitaSetA32IopWaitResumeEventEntry(
-				reinterpret_cast<uptr>(&m_wait_resume_event_context), target);
+				reinterpret_cast<uptr>(&m_wait_resume_event_context), target,
+				retained_unconditional_normal_wait);
 		}
 #endif
 	}
@@ -7846,7 +7851,7 @@ namespace VitaIOP
 #if defined(VITASX2_QEMU_VALIDATION)
 			m_wait_resume_event_clears++;
 #endif
-			VitaSetA32IopWaitResumeEventEntry(0, 0);
+			VitaSetA32IopWaitResumeEventEntry(0, 0, false);
 		}
 #endif
 	}

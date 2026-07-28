@@ -34,6 +34,12 @@ u32 g_psxHasConstReg, g_psxFlushedConstReg;
 bool iopEventAction = false;
 
 static constexpr uint iopWaitCycles = 384; // Keep inline with EE wait cycle max.
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+// A retained unconditional wait has no guest work before a real IOP event.
+// Keep every real deadline below, but do not manufacture the intervening
+// event test solely to preserve PCSX2's desktop-oriented polling cadence.
+static constexpr uint iopRetainedWaitCycles = iopWaitCycles * 2;
+#endif
 
 bool iopEventTestIsActive = false;
 
@@ -272,7 +278,14 @@ static __fi void _psxTestInterrupts()
 
 __ri void iopEventTest()
 {
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	psxRegs.iopNextEventCycle = psxRegs.cycle +
+		(VitaA32IopRetainedWaitCoalescingActive() ?
+				iopRetainedWaitCycles :
+				iopWaitCycles);
+#else
 	psxRegs.iopNextEventCycle = psxRegs.cycle + iopWaitCycles;
+#endif
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,
@@ -309,6 +322,16 @@ __ri void iopEventTest()
 			iopEventAction = true;
 		}
 	}
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	// An event above may have changed PC or invalidated the retained block.
+	// Never let its extended arbitrary seam escape after ownership is lost.
+	const u64 ordinary_wait_deadline = psxRegs.cycle + iopWaitCycles;
+	if (!VitaA32IopRetainedWaitCoalescingActive() &&
+		psxRegs.iopNextEventCycle > ordinary_wait_deadline)
+	{
+		psxRegs.iopNextEventCycle = ordinary_wait_deadline;
+	}
+#endif
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	TraceIopCoreEvent(Pcsx2Trace::CoreEventKind::Scheduler,

@@ -53,6 +53,13 @@ static VitaIOP::BlockExecutor s_iop_a32_executor{true};
 static uptr s_iop_wait_resume_event_context = 0;
 static uptr s_iop_wait_resume_event_target = 0;
 static uptr s_iop_scheduler_resume_event_context = 0;
+bool g_vita_a32_iop_retained_unconditional_normal_wait = false;
+#if defined(VITASX2_QEMU_VALIDATION)
+// Routine oracle fixtures retain PCSX2's original scheduler cadence. The
+// retained-wait fixture enables the Vita product cadence around its bounded
+// deadline cases so those cases execute the exact product branch.
+bool g_vita_a32_iop_retained_wait_coalescing_validation_enabled = false;
+#endif
 bool g_vita_a32_iop_private_event_entry_available =
 	VitaIOP::VitaIopA32PrivateTimesliceEntrySupported();
 bool g_vita_a32_iop_private_wait_resume_entry_available =
@@ -214,10 +221,13 @@ static void UpdateIopEventEntry()
 	}
 }
 
-void VitaSetA32IopWaitResumeEventEntry(uptr context, uptr target)
+void VitaSetA32IopWaitResumeEventEntry(uptr context, uptr target,
+	bool retained_unconditional_normal_wait)
 {
 	s_iop_wait_resume_event_context = context;
 	s_iop_wait_resume_event_target = target;
+	g_vita_a32_iop_retained_unconditional_normal_wait =
+		context != 0 && target != 0 && retained_unconditional_normal_wait;
 	UpdateIopEventEntry();
 }
 

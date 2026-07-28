@@ -55,8 +55,23 @@ extern "C" s32 VitaIopA32ExecuteProviderWaitResumeConditionalNormalPrivate(
 	void* context, s32 ee_cycles);
 extern "C" s32 VitaIopA32ExecuteProviderWaitResumeConditionalPs1Private(
 	void* context, s32 ee_cycles);
-void VitaSetA32IopWaitResumeEventEntry(uptr context, uptr target);
+void VitaSetA32IopWaitResumeEventEntry(uptr context, uptr target,
+	bool retained_unconditional_normal_wait);
 void VitaSetA32IopSchedulerDirectEventContext(uptr context);
+extern bool g_vita_a32_iop_retained_unconditional_normal_wait;
+#if defined(VITASX2_QEMU_VALIDATION)
+extern bool g_vita_a32_iop_retained_wait_coalescing_validation_enabled;
+#endif
+inline __attribute__((always_inline))
+bool VitaA32IopRetainedWaitCoalescingActive()
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	return g_vita_a32_iop_retained_wait_coalescing_validation_enabled &&
+		g_vita_a32_iop_retained_unconditional_normal_wait;
+#else
+	return g_vita_a32_iop_retained_unconditional_normal_wait;
+#endif
+}
 namespace VitaIOP
 {
 	bool VitaIopA32PrivateTimesliceEntrySupported();
