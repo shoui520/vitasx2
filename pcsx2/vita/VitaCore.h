@@ -160,6 +160,8 @@ struct VitaA32EeProviderStats
 	u64 generated_cop2_instructions = 0;
 	u64 generated_other_instructions = 0;
 	u32 generated_poll_call_wait_blocks = 0;
+	u32 generated_two_predicate_wait_blocks = 0;
+	u32 two_predicate_wait_fast_forwards = 0;
 	u32 largest_generated_block_pc = 0;
 	u32 largest_generated_block_guest_instructions = 0;
 	u32 largest_generated_block_host_instructions = 0;
@@ -262,7 +264,9 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	const VitaA32EeGeneratedGuestMix& guest_mix, u64 host_instructions,
 	u64 host_load_instructions, u64 host_store_instructions,
 	u64 helper_call_instructions, u64 state_load_instructions,
-	u64 state_store_instructions, bool poll_call_wait_loop);
+	u64 state_store_instructions, bool poll_call_wait_loop,
+	bool two_predicate_wait_loop);
+void VitaRecordA32EeTwoPredicateWaitLoopFastForward();
 void VitaRequestA32EeCacheReset();
 // Normal product execution enables PCSX2-style DispatcherEvent fallthrough.
 // Validation modes leave it disabled unless they explicitly own the event

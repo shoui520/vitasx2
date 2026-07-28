@@ -267,6 +267,8 @@ namespace VitaEE
 			u32 dependency_instruction_count = 0;
 			u32 dependency_charged_cycles_before = 0;
 			PollCallWaitLoopSourceProof poll_call_wait_loop_source_proof{};
+			TwoPredicateWaitLoopSourceProof
+				two_predicate_wait_loop_source_proof{};
 			std::array<RamSourceFragment, MAX_RAM_SOURCE_FRAGMENTS>
 				ram_source_fragments{};
 			u32 source_serial = 0;

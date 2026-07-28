@@ -578,6 +578,19 @@ namespace VitaEE
 			block.ram_source_fragment_count = 0;
 			return false;
 		}
+		if (block.two_predicate_wait_loop_source_proof.valid &&
+			!capture_span(
+				block.two_predicate_wait_loop_source_proof.loop_pc,
+				block.two_predicate_wait_loop_source_proof.instruction_count *
+					sizeof(u32),
+				true))
+		{
+			// The tail depends on the earlier forward-exit block. Only ordinary
+			// EE RAM can publish the complete contiguous source lifetime.
+			block.ram_source_fragments = {};
+			block.ram_source_fragment_count = 0;
+			return false;
+		}
 		return true;
 	}
 
@@ -866,6 +879,7 @@ namespace VitaEE
 		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
 		block.poll_call_wait_loop_source_proof = {};
+		block.two_predicate_wait_loop_source_proof = {};
 		block.ram_source_fragments = {};
 		block.ram_source_fragment_count = 0;
 		block.source_serial = 0;
@@ -994,6 +1008,7 @@ namespace VitaEE
 			block.dependency_instruction_count = 0;
 			block.dependency_charged_cycles_before = 0;
 			block.poll_call_wait_loop_source_proof = {};
+			block.two_predicate_wait_loop_source_proof = {};
 			block.ram_source_fragments = {};
 			block.ram_source_fragment_count = 0;
 			block.source_serial = 0;
@@ -2429,6 +2444,45 @@ namespace VitaEE
 		};
 		if (!poll_call_source_matches())
 			return false;
+		const auto two_predicate_source_matches = [&]() {
+			const TwoPredicateWaitLoopSourceProof& proof =
+				block.two_predicate_wait_loop_source_proof;
+			if (!proof.valid)
+				return true;
+			if (proof.instruction_count == 0 ||
+				proof.instruction_count > proof.opcodes.size())
+			{
+				return false;
+			}
+			const u32 opcode_bytes =
+				proof.instruction_count * static_cast<u32>(sizeof(u32));
+			const u32 page_remaining =
+				vtlb_private::VTLB_PAGE_SIZE -
+				(proof.loop_pc & vtlb_private::VTLB_PAGE_MASK);
+			if (vtlb_private::vtlbdata.vmap && opcode_bytes <= page_remaining)
+			{
+				const vtlb_private::VTLBVirtual vmv =
+					vtlb_private::vtlbdata.vmap[
+						proof.loop_pc >> vtlb_private::VTLB_PAGE_BITS];
+				if (!vmv.isHandler(proof.loop_pc))
+				{
+					return std::memcmp(proof.opcodes.data(),
+						reinterpret_cast<const void*>(
+							vmv.assumePtr(proof.loop_pc)), opcode_bytes) == 0;
+				}
+			}
+			for (u32 i = 0; i < proof.instruction_count; i++)
+			{
+				if (proof.opcodes[i] !=
+					memRead32(proof.loop_pc + i * sizeof(u32)))
+				{
+					return false;
+				}
+			}
+			return true;
+		};
+		if (!two_predicate_source_matches())
+			return false;
 
 		const u32 dependency_start_pc = block.dependency_instruction_count != 0 ?
 			block.dependency_start_pc : block.start_pc;
@@ -2880,6 +2934,8 @@ namespace VitaEE
 		u8 compiled_compatible_link_entry_loads = 0;
 		CompatibleVtlbFastEntryOffsets compiled_compatible_vtlb_fast_entries{};
 		PollCallWaitLoopSourceProof compiled_poll_call_wait_loop_source_proof{};
+		TwoPredicateWaitLoopSourceProof
+			compiled_two_predicate_wait_loop_source_proof{};
 		DirectContinuationKind compiled_direct_continuation_kind =
 			DirectContinuationKind::SchedulerTestedTail;
 		DirectLinkSlots direct_links;
@@ -2947,6 +3003,8 @@ namespace VitaEE
 				CompatibleVtlbFastEntryOffsets attempt_compatible_vtlb_fast_entries{};
 				PollCallWaitLoopSourceProof
 					attempt_poll_call_wait_loop_source_proof{};
+				TwoPredicateWaitLoopSourceProof
+					attempt_two_predicate_wait_loop_source_proof{};
 				DirectLinkSlots attempt_direct_links;
 				// A PCSX2-created <=6-instruction split omits iBranchTest(). A32 may
 				// additionally need several host-code fragments for one PCSX2 logical
@@ -2974,7 +3032,8 @@ namespace VitaEE
 						m_persistent_scheduler_elided_direct_exit : direct_exit,
 					m_persistent_dispatch_enabled ?
 						m_persistent_retained_wait_event_exit : nullptr,
-					&attempt_poll_call_wait_loop_source_proof);
+					&attempt_poll_call_wait_loop_source_proof,
+					&attempt_two_predicate_wait_loop_source_proof);
 				u32 calculated_prefix_cycles = 0;
 				const bool cycle_contract_matches =
 					candidate_instruction_count == instruction_count ||
@@ -3009,6 +3068,8 @@ namespace VitaEE
 						attempt_compatible_vtlb_fast_entries;
 					compiled_poll_call_wait_loop_source_proof =
 						attempt_poll_call_wait_loop_source_proof;
+					compiled_two_predicate_wait_loop_source_proof =
+						attempt_two_predicate_wait_loop_source_proof;
 					compiled_direct_continuation_kind =
 						attempt_scheduler_test_elided_continuation_emitted ?
 							attempt_direct_continuation_kind :
@@ -3118,6 +3179,8 @@ namespace VitaEE
 			dependency_charged_cycles_before;
 		block.poll_call_wait_loop_source_proof =
 			compiled_poll_call_wait_loop_source_proof;
+		block.two_predicate_wait_loop_source_proof =
+			compiled_two_predicate_wait_loop_source_proof;
 		block.scaled_cycles = compiled_scaled_cycles;
 		block.ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
@@ -3271,6 +3334,7 @@ namespace VitaEE
 		if (!CaptureRamSourceFragments(block))
 		{
 			block.opcodes.reset();
+			block.two_predicate_wait_loop_source_proof = {};
 			block.code.Release();
 			RewindCodeCache(block_code_slice_offset);
 			return false;
@@ -3286,6 +3350,7 @@ namespace VitaEE
 			block.ram_source_fragment_count = 0;
 			block.source_serial = 0;
 			block.opcodes.reset();
+			block.two_predicate_wait_loop_source_proof = {};
 			block.code.Release();
 			RewindCodeCache(block_code_slice_offset);
 			return false;
@@ -3307,7 +3372,8 @@ namespace VitaEE
 				generated.host_load_instructions, generated.host_store_instructions,
 				generated.helper_call_instructions, generated.state_load_instructions,
 				generated.state_store_instructions,
-				block.poll_call_wait_loop_source_proof.valid);
+				block.poll_call_wait_loop_source_proof.valid,
+				block.two_predicate_wait_loop_source_proof.valid);
 		}
 #endif
 

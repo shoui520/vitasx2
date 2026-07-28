@@ -42,6 +42,29 @@ namespace VitaEE
 		std::array<u32, 2> leaf_opcodes{};
 	};
 
+	// A two-stage RAM predicate loop can contain an early forward exit before
+	// its final backward branch:
+	//
+	//   lw predicate_a,...       lw predicate_b,...
+	//   [andi predicate_a,...]   beq predicate_b,zero,loop
+	//   bne predicate_a,zero,out nop
+	//   nop
+	//
+	// Reaching the backward edge proves both predicate results are zero, so
+	// those are also the exact architectural values at either PCSX2 block
+	// scheduler seam. Keep the complete contiguous source range attached to the
+	// generated tail because it depends on the earlier forward-exit block too.
+	struct TwoPredicateWaitLoopSourceProof
+	{
+		bool valid = false;
+		u32 loop_pc = 0;
+		u32 tail_pc = 0;
+		u32 instruction_count = 0;
+		u32 prefix_scaled_cycles = 0;
+		u32 tail_scaled_cycles = 0;
+		std::array<u32, 7> opcodes{};
+	};
+
 	template <typename T, size_t Capacity>
 	class FixedCompileBuffer
 	{
@@ -689,7 +712,8 @@ namespace VitaEE
 			bool* scheduler_test_elided_continuation_emitted = nullptr,
 			const void* scheduler_test_elided_direct_exit = nullptr,
 			const void* retained_wait_event_exit = nullptr,
-			PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof = nullptr);
+			PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof = nullptr,
+			TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false,
 			u32 branch_delay_selected_pc = UINT32_MAX,
@@ -702,7 +726,8 @@ namespace VitaEE
 			u32 direct_pc = 0, u32 taken_pc = 0, bool conditional_pc = false,
 			bool indirect_pc_writeback = false, bool preserve_dirty_direct_link = false,
 			bool preserve_dirty_taken_link = false,
-			const PollCallWaitLoopSourceProof* poll_call_wait_loop = nullptr);
+			const PollCallWaitLoopSourceProof* poll_call_wait_loop = nullptr,
+			const TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop = nullptr);
 		bool EndBlockWithSchedulerElidedDirectContinuation(u32 block_cycles,
 			const void* scheduler_test_elided_direct_exit, DirectLinkSlot* direct_link,
 			bool defer_pc_writeback, u32 direct_pc);
@@ -784,11 +809,13 @@ namespace VitaEE
 		bool EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc, u32 taken_pc,
 			bool conditional_pc, bool indirect_pc_writeback = false);
 		static bool IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc,
-			PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof = nullptr);
+			PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof = nullptr,
+			TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof = nullptr);
 		bool EmitWaitLoopFastForwardTail(const void* event_exit,
 			bool defer_pc_writeback = false, u32 pc = 0,
 			u32 persistent_event_token = 0xe7u,
 			const PollCallWaitLoopSourceProof* poll_call_wait_loop = nullptr,
+			const TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop = nullptr,
 			u32 tail_scaled_cycles = 0);
 		bool EndBlockWithWaitLoopFastForward(u32 block_cycles,
 			const void* event_exit, bool retain_across_events = false);

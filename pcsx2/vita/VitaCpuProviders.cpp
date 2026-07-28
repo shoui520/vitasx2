@@ -1738,7 +1738,8 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	const VitaA32EeGeneratedGuestMix& guest_mix, u64 host_instructions,
 	u64 host_load_instructions, u64 host_store_instructions,
 	u64 helper_call_instructions, u64 state_load_instructions,
-	u64 state_store_instructions, bool poll_call_wait_loop)
+	u64 state_store_instructions, bool poll_call_wait_loop,
+	bool two_predicate_wait_loop)
 {
 	s_ee_a32_stats.generated_blocks++;
 	s_ee_a32_stats.generated_host_instructions += host_instructions;
@@ -1759,6 +1760,8 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	s_ee_a32_stats.generated_other_instructions += guest_mix.other;
 	s_ee_a32_stats.generated_poll_call_wait_blocks +=
 		poll_call_wait_loop ? 1u : 0u;
+	s_ee_a32_stats.generated_two_predicate_wait_blocks +=
+		two_predicate_wait_loop ? 1u : 0u;
 	if (host_instructions > s_ee_a32_stats.largest_generated_block_host_instructions)
 	{
 		s_ee_a32_stats.largest_generated_block_pc = start_pc;
@@ -1776,6 +1779,13 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 			static_cast<u32>(state_store_instructions > UINT32_MAX ?
 				UINT32_MAX : state_store_instructions);
 	}
+}
+
+void VitaRecordA32EeTwoPredicateWaitLoopFastForward()
+{
+	// This runs only at the original PCSX2 event seam after one generated
+	// helper call has replaced an arbitrary number of completed poll blocks.
+	s_ee_a32_stats.two_predicate_wait_fast_forwards++;
 }
 
 void VitaSetA32EeInFrameEventResumeEnabled(bool enabled)

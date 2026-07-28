@@ -743,11 +743,13 @@ namespace MTGS
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_codegen integer=%llu branch=%llu "
 			"gpr_load=%llu gpr_store=%llu mmi=%llu cop0=%llu cop1=%llu cop2=%llu "
-			"other=%llu poll_call_wait=%llu largest_pc=0x%08x largest_guest=%u largest_host=%u "
+			"other=%llu poll_call_wait=%llu two_predicate_wait=%llu "
+			"largest_pc=0x%08x largest_guest=%u largest_host=%u "
 			"largest_helpers=%u largest_state_loads=%u largest_state_stores=%u "
 			"origin_integer=%llu origin_branch=%llu origin_gpr_load=%llu "
 			"origin_gpr_store=%llu origin_mmi=%llu origin_cop0=%llu origin_cop1=%llu "
-			"origin_cop2=%llu origin_other=%llu origin_poll_call_wait=%llu",
+			"origin_cop2=%llu origin_other=%llu origin_poll_call_wait=%llu "
+			"origin_two_predicate_wait=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_integer_instructions,
@@ -774,6 +776,9 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_poll_call_wait_blocks,
 				start.ee.generated_poll_call_wait_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_two_predicate_wait_blocks,
+				start.ee.generated_two_predicate_wait_blocks)),
 			end.ee.largest_generated_block_pc,
 			end.ee.largest_generated_block_guest_instructions,
 			end.ee.largest_generated_block_host_instructions,
@@ -809,13 +814,16 @@ namespace MTGS
 				origin.ee.generated_other_instructions)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_poll_call_wait_blocks,
-				origin.ee.generated_poll_call_wait_blocks)));
+				origin.ee.generated_poll_call_wait_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_two_predicate_wait_blocks,
+				origin.ee.generated_two_predicate_wait_blocks)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_dispatch provider_boundaries=%llu "
 			"boundary_guest_instructions=%llu direct_exits=%llu event_exits=%llu "
 			"cache_hits=%llu cache_misses=%llu lookup_hits=%llu fast_dispatch_hits=%llu "
 			"event_tests=%llu event_resumes=%llu event_refusals=%llu retained_wait_events=%llu "
-			"invalidated_blocks=%llu failed_blocks=%llu",
+			"two_predicate_wait_ff=%llu invalidated_blocks=%llu failed_blocks=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(end.ee.compiled_blocks,
 				start.ee.compiled_blocks)),
@@ -844,6 +852,9 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.retained_unconditional_wait_events,
 				start.ee.retained_unconditional_wait_events)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.two_predicate_wait_fast_forwards,
+				start.ee.two_predicate_wait_fast_forwards)),
 			static_cast<unsigned long long>(CounterDelta(end.ee.invalidated_blocks,
 				start.ee.invalidated_blocks)),
 			static_cast<unsigned long long>(CounterDelta(end.ee.failed_blocks,
