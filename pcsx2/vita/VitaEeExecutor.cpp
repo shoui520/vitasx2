@@ -483,57 +483,100 @@ namespace VitaEE
 		const u32 exposed_ram = std::min(Ps2MemSize::ExposedRam,
 			Ps2MemSize::MainRam);
 		const uptr ram_end = ram_begin + exposed_ram;
-		u32 source_pc = dependency_start_pc;
-		u32 remaining = dependency_instruction_count * sizeof(u32);
-		while (remaining != 0)
-		{
-			const u32 page_remaining = vtlb_private::VTLB_PAGE_SIZE -
-				(source_pc & vtlb_private::VTLB_PAGE_MASK);
-			const u32 chunk = std::min(remaining, page_remaining);
-			const vtlb_private::VTLBVirtual vmv =
-				vtlb_private::vtlbdata.vmap[
-					source_pc >> vtlb_private::VTLB_PAGE_BITS];
-			if (!vmv.isHandler(source_pc))
+
+		const auto append_fragment = [&](u32 backing_start, u32 size) {
+			u32 merged_start = backing_start;
+			u32 merged_end = backing_start + size;
+			for (u32 i = 0; i < block.ram_source_fragment_count;)
 			{
-				const uptr host_start = vmv.assumePtr(source_pc);
-				if (host_start >= ram_begin && host_start < ram_end)
+				const RamSourceFragment& existing = block.ram_source_fragments[i];
+				const u32 existing_end = existing.start + existing.size;
+				if (merged_end < existing.start || existing_end < merged_start)
 				{
-					const u32 ram_chunk = static_cast<u32>(std::min<uptr>(
-						chunk, ram_end - host_start));
-					const u32 backing_start =
-						static_cast<u32>(host_start - ram_begin);
-					RamSourceFragment* previous =
-						block.ram_source_fragment_count != 0 ?
-							&block.ram_source_fragments[
-								block.ram_source_fragment_count - 1] : nullptr;
-					if (previous && previous->start + previous->size == backing_start)
+					i++;
+					continue;
+				}
+
+				merged_start = std::min(merged_start, existing.start);
+				merged_end = std::max(merged_end, existing_end);
+				block.ram_source_fragment_count--;
+				block.ram_source_fragments[i] =
+					block.ram_source_fragments[block.ram_source_fragment_count];
+			}
+
+			if (block.ram_source_fragment_count >= MAX_RAM_SOURCE_FRAGMENTS)
+				return false;
+			block.ram_source_fragments[block.ram_source_fragment_count++] =
+				{merged_start, merged_end - merged_start};
+			return true;
+		};
+
+		const auto capture_span = [&](u32 first_pc, u32 byte_count,
+									  bool require_complete_ram) {
+			bool complete_ram = true;
+			u32 source_pc = first_pc;
+			u32 remaining = byte_count;
+			while (remaining != 0)
+			{
+				const u32 page_remaining = vtlb_private::VTLB_PAGE_SIZE -
+					(source_pc & vtlb_private::VTLB_PAGE_MASK);
+				const u32 chunk = std::min(remaining, page_remaining);
+				const vtlb_private::VTLBVirtual vmv =
+					vtlb_private::vtlbdata.vmap[
+						source_pc >> vtlb_private::VTLB_PAGE_BITS];
+				if (vmv.isHandler(source_pc))
+				{
+					complete_ram = false;
+				}
+				else
+				{
+					const uptr host_start = vmv.assumePtr(source_pc);
+					if (host_start < ram_begin || host_start >= ram_end)
 					{
-						previous->size += ram_chunk;
+						complete_ram = false;
 					}
 					else
 					{
-						if (block.ram_source_fragment_count <
-							MAX_RAM_SOURCE_FRAGMENTS)
+						const u32 ram_chunk = static_cast<u32>(std::min<uptr>(
+							chunk, ram_end - host_start));
+						if (ram_chunk != chunk)
+							complete_ram = false;
+						if (!append_fragment(
+								static_cast<u32>(host_start - ram_begin),
+								ram_chunk))
 						{
-							block.ram_source_fragments[
-								block.ram_source_fragment_count++] =
-								{backing_start, ram_chunk};
-						}
-						else
-						{
-							// The aligned 1025-word scanner bound proves this cannot
-							// occur today. Refuse publication if that contract grows;
-							// a partial owner map would make linked SMC unsafe.
-							block.ram_source_fragments = {};
-							block.ram_source_fragment_count = 0;
 							return false;
 						}
 					}
 				}
-			}
 
-			source_pc += chunk;
-			remaining -= chunk;
+				source_pc += chunk;
+				remaining -= chunk;
+			}
+			return !require_complete_ram || complete_ram;
+		};
+
+		if (!capture_span(dependency_start_pc,
+				dependency_instruction_count * sizeof(u32), false))
+		{
+			block.ram_source_fragments = {};
+			block.ram_source_fragment_count = 0;
+			return false;
+		}
+
+		if (block.poll_call_wait_loop_source_proof.valid &&
+			(!capture_span(block.poll_call_wait_loop_source_proof.call_pc,
+					2 * sizeof(u32), true) ||
+			 !capture_span(block.poll_call_wait_loop_source_proof.leaf_pc,
+					2 * sizeof(u32), true)))
+		{
+			// The call-through proof is novel only for ordinary EE RAM. Handler,
+			// ROM, or partially mapped code retains the normal generated loop.
+			// Failing publication here prevents a linked block from outliving
+			// either disjoint proof range.
+			block.ram_source_fragments = {};
+			block.ram_source_fragment_count = 0;
+			return false;
 		}
 		return true;
 	}
@@ -822,6 +865,7 @@ namespace VitaEE
 		block.compatible_vtlb_fast_entries = {};
 		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
+		block.poll_call_wait_loop_source_proof = {};
 		block.ram_source_fragments = {};
 		block.ram_source_fragment_count = 0;
 		block.source_serial = 0;
@@ -949,6 +993,7 @@ namespace VitaEE
 			block.dependency_start_pc = 0;
 			block.dependency_instruction_count = 0;
 			block.dependency_charged_cycles_before = 0;
+			block.poll_call_wait_loop_source_proof = {};
 			block.ram_source_fragments = {};
 			block.ram_source_fragment_count = 0;
 			block.source_serial = 0;
@@ -2362,6 +2407,29 @@ namespace VitaEE
 		if (!block.opcodes)
 			return false;
 
+		const auto poll_call_source_matches = [&]() {
+			const PollCallWaitLoopSourceProof& proof =
+				block.poll_call_wait_loop_source_proof;
+			if (!proof.valid)
+				return true;
+			for (u32 i = 0; i < proof.call_opcodes.size(); i++)
+			{
+				if (memRead32(proof.call_pc + i * sizeof(u32)) !=
+					proof.call_opcodes[i])
+				{
+					return false;
+				}
+				if (memRead32(proof.leaf_pc + i * sizeof(u32)) !=
+					proof.leaf_opcodes[i])
+				{
+					return false;
+				}
+			}
+			return true;
+		};
+		if (!poll_call_source_matches())
+			return false;
+
 		const u32 dependency_start_pc = block.dependency_instruction_count != 0 ?
 			block.dependency_start_pc : block.start_pc;
 		const u32 dependency_instruction_count = block.dependency_instruction_count != 0 ?
@@ -2811,6 +2879,7 @@ namespace VitaEE
 		size_t compiled_compatible_link_entry_offset = static_cast<size_t>(-1);
 		u8 compiled_compatible_link_entry_loads = 0;
 		CompatibleVtlbFastEntryOffsets compiled_compatible_vtlb_fast_entries{};
+		PollCallWaitLoopSourceProof compiled_poll_call_wait_loop_source_proof{};
 		DirectContinuationKind compiled_direct_continuation_kind =
 			DirectContinuationKind::SchedulerTestedTail;
 		DirectLinkSlots direct_links;
@@ -2876,6 +2945,8 @@ namespace VitaEE
 				size_t attempt_compatible_link_entry_offset = static_cast<size_t>(-1);
 				u8 attempt_compatible_link_entry_loads = 0;
 				CompatibleVtlbFastEntryOffsets attempt_compatible_vtlb_fast_entries{};
+				PollCallWaitLoopSourceProof
+					attempt_poll_call_wait_loop_source_proof{};
 				DirectLinkSlots attempt_direct_links;
 				// A PCSX2-created <=6-instruction split omits iBranchTest(). A32 may
 				// additionally need several host-code fragments for one PCSX2 logical
@@ -2902,7 +2973,8 @@ namespace VitaEE
 					m_persistent_dispatch_enabled ?
 						m_persistent_scheduler_elided_direct_exit : direct_exit,
 					m_persistent_dispatch_enabled ?
-						m_persistent_retained_wait_event_exit : nullptr);
+						m_persistent_retained_wait_event_exit : nullptr,
+					&attempt_poll_call_wait_loop_source_proof);
 				u32 calculated_prefix_cycles = 0;
 				const bool cycle_contract_matches =
 					candidate_instruction_count == instruction_count ||
@@ -2935,6 +3007,8 @@ namespace VitaEE
 						attempt_compatible_link_entry_loads;
 					compiled_compatible_vtlb_fast_entries =
 						attempt_compatible_vtlb_fast_entries;
+					compiled_poll_call_wait_loop_source_proof =
+						attempt_poll_call_wait_loop_source_proof;
 					compiled_direct_continuation_kind =
 						attempt_scheduler_test_elided_continuation_emitted ?
 							attempt_direct_continuation_kind :
@@ -3042,6 +3116,8 @@ namespace VitaEE
 		block.dependency_instruction_count = dependency_instruction_count;
 		block.dependency_charged_cycles_before =
 			dependency_charged_cycles_before;
+		block.poll_call_wait_loop_source_proof =
+			compiled_poll_call_wait_loop_source_proof;
 		block.scaled_cycles = compiled_scaled_cycles;
 		block.ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
@@ -3230,7 +3306,8 @@ namespace VitaEE
 				generated.host_instructions,
 				generated.host_load_instructions, generated.host_store_instructions,
 				generated.helper_call_instructions, generated.state_load_instructions,
-				generated.state_store_instructions);
+				generated.state_store_instructions,
+				block.poll_call_wait_loop_source_proof.valid);
 		}
 #endif
 

@@ -240,7 +240,10 @@ namespace VitaEE
 		// A maximum-size aligned EE block covers at most the tail of one vTLB
 		// page and the complete following page. Keep one spare fragment so this
 		// invariant remains robust if the scanner's atomic follower grows.
-		static constexpr u32 MAX_RAM_SOURCE_FRAGMENTS = 3;
+		// A page-straddling ordinary block needs at most three fragments. A
+		// poll-call wait additionally owns its call pair and disjoint leaf; each
+		// two-word range can itself straddle a page.
+		static constexpr u32 MAX_RAM_SOURCE_FRAGMENTS = 7;
 
 		struct RamSourceFragment
 		{
@@ -263,6 +266,7 @@ namespace VitaEE
 			u32 dependency_start_pc = 0;
 			u32 dependency_instruction_count = 0;
 			u32 dependency_charged_cycles_before = 0;
+			PollCallWaitLoopSourceProof poll_call_wait_loop_source_proof{};
 			std::array<RamSourceFragment, MAX_RAM_SOURCE_FRAGMENTS>
 				ram_source_fragments{};
 			u32 source_serial = 0;

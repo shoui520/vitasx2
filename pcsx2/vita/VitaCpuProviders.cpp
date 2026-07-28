@@ -1698,7 +1698,7 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	const VitaA32EeGeneratedGuestMix& guest_mix, u64 host_instructions,
 	u64 host_load_instructions, u64 host_store_instructions,
 	u64 helper_call_instructions, u64 state_load_instructions,
-	u64 state_store_instructions)
+	u64 state_store_instructions, bool poll_call_wait_loop)
 {
 	s_ee_a32_stats.generated_blocks++;
 	s_ee_a32_stats.generated_host_instructions += host_instructions;
@@ -1717,6 +1717,8 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	s_ee_a32_stats.generated_cop1_instructions += guest_mix.cop1;
 	s_ee_a32_stats.generated_cop2_instructions += guest_mix.cop2;
 	s_ee_a32_stats.generated_other_instructions += guest_mix.other;
+	s_ee_a32_stats.generated_poll_call_wait_blocks +=
+		poll_call_wait_loop ? 1u : 0u;
 	if (host_instructions > s_ee_a32_stats.largest_generated_block_host_instructions)
 	{
 		s_ee_a32_stats.largest_generated_block_pc = start_pc;

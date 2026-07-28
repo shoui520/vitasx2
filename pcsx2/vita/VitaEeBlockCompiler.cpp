@@ -523,6 +523,9 @@ namespace VitaEE
 		constexpr u32 FLUSH_CACHE_RAW_CYCLE_CHARGE = 5650;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_COMPLETE = 0;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_EVENT = 1;
+		constexpr u32 POLL_CALL_CYCLE_BITS = 10;
+		constexpr u32 POLL_CALL_CYCLE_MASK =
+			(1u << POLL_CALL_CYCLE_BITS) - 1;
 
 		constexpr unsigned HOST_CPU_REGS = 4;
 		constexpr unsigned HOST_BRANCH_STATE = 5;
@@ -535,6 +538,60 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP2 = 2;
 		constexpr unsigned HOST_TMP3 = 3;
 		constexpr unsigned HOST_TMP4 = 12;
+
+		__noinline u32 VitaEeAdvancePollCallWaitToEvent(u32 packed_cycles,
+			u32 leaf_pc, u32 return_pc, u32 call_pc)
+		{
+			// A static call and JR are separate PCSX2 BaseBlocks, and each owns
+			// iBranchTest(). Do not turn the multi-block loop into the subtly
+			// different inline-wait contract (cycle == nextEventCycle, PC at the
+			// loop head). Advance instead to the first ordinary call, return-leaf,
+			// or loop-branch scheduler seam whose charged cycle reaches the event.
+			const u32 call_cycles = packed_cycles & POLL_CALL_CYCLE_MASK;
+			const u32 leaf_cycles =
+				(packed_cycles >> POLL_CALL_CYCLE_BITS) &
+				POLL_CALL_CYCLE_MASK;
+			const u32 tail_cycles =
+				(packed_cycles >> (2 * POLL_CALL_CYCLE_BITS)) &
+				POLL_CALL_CYCLE_MASK;
+			const u32 loop_cycles = call_cycles + leaf_cycles + tail_cycles;
+			const u64 current = cpuRegs.cycle;
+			const u64 next = cpuRegs.nextEventCycle;
+			if (loop_cycles == 0 || current >= next)
+				return call_pc;
+
+			// cpuSetNextEvent()/cpuTestCycle() bound the active scheduler window
+			// to signed-low-word distance. Retain a fail-closed exact-deadline
+			// fallback for corrupted diagnostic state rather than overflowing the
+			// phase arithmetic.
+			const u64 delta64 = next - current;
+			if (delta64 > 0x7fffffffu)
+			{
+				cpuRegs.cycle = next;
+				return call_pc;
+			}
+
+			const u32 delta = static_cast<u32>(delta64);
+			const u32 complete_loops = (delta - 1) / loop_cycles;
+			const u32 phase = delta - complete_loops * loop_cycles;
+			u32 boundary_cycles = call_cycles;
+			u32 event_pc = leaf_pc;
+			if (phase > call_cycles)
+			{
+				boundary_cycles += leaf_cycles;
+				event_pc = return_pc;
+				if (phase > call_cycles + leaf_cycles)
+				{
+					boundary_cycles += tail_cycles;
+					event_pc = call_pc;
+				}
+			}
+
+			cpuRegs.cycle = current +
+				static_cast<u64>(complete_loops) * loop_cycles +
+				boundary_cycles;
+			return event_pc;
+		}
 
 		__noinline u32 VitaEeExecuteSignedCountdownLoop(u32 start_pc, u32 fallthrough_pc,
 			u32 block_cycles, u32 packed_guests)
@@ -10954,10 +11011,13 @@ namespace VitaEE
 		DirectContinuationKind direct_continuation_kind,
 		bool* scheduler_test_elided_continuation_emitted,
 		const void* scheduler_test_elided_direct_exit,
-		const void* retained_wait_event_exit)
+		const void* retained_wait_event_exit,
+		PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof)
 	{
 		if (scheduler_test_elided_continuation_emitted)
 			*scheduler_test_elided_continuation_emitted = false;
+		if (poll_call_wait_loop_source_proof)
+			*poll_call_wait_loop_source_proof = {};
 		if (instruction_count == 0 || instruction_count > MAX_COMPILE_INSTRUCTIONS ||
 			instruction_count > ((UINT32_MAX - start_pc) / 4))
 			return false;
@@ -12007,6 +12067,7 @@ namespace VitaEE
 		// targets are excluded so the virtual target compare stays exact. Known
 		// register targets still direct-link, but stay out of this J/JAL/branch
 		// fast-forward path unless PCSX2's SetBranchReg timing is proven equal.
+		PollCallWaitLoopSourceProof wait_loop_source_proof;
 		const bool wait_loop_body = range_loop_dispatch_enabled &&
 			!device_trace_enabled && EmuConfig.Speedhacks.WaitLoop &&
 			!EmuConfig.Gamefixes.GoemonTlbHack &&
@@ -12016,7 +12077,15 @@ namespace VitaEE
 			branch_instruction_index + 2 == instruction_count &&
 			branch_target_pc <= start_pc &&
 			IsWaitLoopBody(branch_target_pc, next_pc,
-				start_pc + branch_instruction_index * 4);
+				start_pc + branch_instruction_index * 4,
+				&wait_loop_source_proof) &&
+			(!wait_loop_source_proof.valid ||
+				(start_pc == wait_loop_source_proof.call_pc +
+					 2 * sizeof(u32) &&
+				 block_cycles != 0 &&
+				 block_cycles <= POLL_CALL_CYCLE_MASK));
+		if (wait_loop_body && poll_call_wait_loop_source_proof)
+			*poll_call_wait_loop_source_proof = wait_loop_source_proof;
 		const bool whole_wait_loop_fast_forward = has_branch &&
 			has_static_direct_link_target &&
 			static_direct_link_target_pc == branch_target_pc && wait_loop_body;
@@ -12113,7 +12182,9 @@ namespace VitaEE
 						branch_likely_not_taken_cycles, direct_exit, event_exit,
 						not_taken_link, taken_link, wait_loop_taken,
 						defer_pc_writeback, next_pc, branch_target_pc,
-						preserve_dirty_not_taken_link, preserve_dirty_taken_link);
+						preserve_dirty_not_taken_link, preserve_dirty_taken_link,
+						wait_loop_source_proof.valid ?
+							&wait_loop_source_proof : nullptr);
 			}
 			if (!likely_tail_ok)
 			{
@@ -12193,7 +12264,9 @@ namespace VitaEE
 				wait_loop_taken, defer_pc_writeback,
 				direct_pc, branch_target_pc, has_static_conditional_direct_links,
 				defer_indirect_pc_writeback, preserve_dirty_direct_link,
-				preserve_dirty_taken_link);
+				preserve_dirty_taken_link,
+				wait_loop_source_proof.valid ?
+					&wait_loop_source_proof : nullptr);
 		if (!tail_ok)
 		{
 			return false;
@@ -13124,7 +13197,9 @@ namespace VitaEE
 			   EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN);
 	}
 
-	bool BlockCompiler::IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc)
+	bool BlockCompiler::IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc,
+		u32 branch_pc,
+		PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof)
 	{
 		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile() StartRecomp scan
 		// for s_nBlockFF. A self-branching loop whose body never writes a
@@ -13140,9 +13215,43 @@ namespace VitaEE
 		{
 			return false;
 		}
+		if (poll_call_wait_loop_source_proof)
+			*poll_call_wait_loop_source_proof = {};
+
+		const auto is_direct_main_ram_span = [](u32 first_pc, u32 byte_count) {
+			if (!eeMem || !vtlb_private::vtlbdata.vmap || byte_count == 0)
+				return false;
+
+			const uptr ram_begin = reinterpret_cast<uptr>(eeMem->Main);
+			const uptr ram_end = ram_begin +
+				std::min(Ps2MemSize::ExposedRam, Ps2MemSize::MainRam);
+			u32 pc = first_pc;
+			u32 remaining = byte_count;
+			while (remaining != 0)
+			{
+				const u32 page_remaining = vtlb_private::VTLB_PAGE_SIZE -
+					(pc & vtlb_private::VTLB_PAGE_MASK);
+				const u32 chunk = std::min(remaining, page_remaining);
+				const vtlb_private::VTLBVirtual vmv =
+					vtlb_private::vtlbdata.vmap[
+						pc >> vtlb_private::VTLB_PAGE_BITS];
+				if (vmv.isHandler(pc))
+					return false;
+				const uptr host = vmv.assumePtr(pc);
+				if (host < ram_begin || host > ram_end ||
+					static_cast<uptr>(chunk) > ram_end - host)
+				{
+					return false;
+				}
+				pc += chunk;
+				remaining -= chunk;
+			}
+			return true;
+		};
 
 		u32 reads = 0;
 		u32 loads = 1;
+		PollCallWaitLoopSourceProof poll_call_proof;
 		for (u32 i = loop_start_pc; i < loop_end_pc; i += 4)
 		{
 			if (i == branch_pc)
@@ -13157,6 +13266,104 @@ namespace VitaEE
 
 			if (code == 0)
 				continue;
+
+			if (opcode == 0x03 && i == loop_start_pc)
+			{
+				// PCSX2's load-aware s_nBlockFF proof treats a value refreshed
+				// by a load on every iteration as loop-stable. Extend that same
+				// mechanism across the compiler boundary introduced by a static
+				// JAL only when the complete callee is the pure two-instruction
+				// `jr ra; lw result,offset(base)` leaf. The call delay must be
+				// inert. Normal generated execution still performs one complete
+				// call/load/return/branch iteration before this proof reaches the
+				// existing iBranchTest() fast-forward tail.
+				if (i + sizeof(u32) >= loop_end_pc ||
+					memRead32(i + sizeof(u32)) != 0)
+				{
+					return false;
+				}
+
+				const u32 leaf_pc =
+					((i + sizeof(u32)) & 0xf0000000u) |
+					((code & 0x03ffffffu) << 2);
+				if ((leaf_pc & 3u) != 0 || leaf_pc == i ||
+					leaf_pc > UINT32_MAX - sizeof(u32))
+					return false;
+
+				const u32 leaf_return = memRead32(leaf_pc);
+				const u32 leaf_load = memRead32(leaf_pc + sizeof(u32));
+				if (leaf_return != 0x03e00008u ||
+					(leaf_load >> 26) != 0x23 ||
+					!is_direct_main_ram_span(i, 2 * sizeof(u32)) ||
+					!is_direct_main_ram_span(leaf_pc, 2 * sizeof(u32)))
+				{
+					return false;
+				}
+
+				const u32 load_base = (leaf_load >> 21) & 0x1f;
+				const u32 load_result = (leaf_load >> 16) & 0x1f;
+				if (load_result == 0)
+					return false;
+				const u32 branch = memRead32(branch_pc);
+				const u32 branch_opcode = branch >> 26;
+				const u32 branch_rs = (branch >> 21) & 0x1f;
+				const u32 branch_rt = (branch >> 16) & 0x1f;
+				if ((branch_opcode != 0x04 && branch_opcode != 0x05 &&
+					 branch_opcode != 0x14 && branch_opcode != 0x15) ||
+					((branch_rs == load_result) ==
+						(branch_rt == load_result)))
+				{
+					return false;
+				}
+
+				u32 call_scaled_cycles = 0;
+				u32 leaf_scaled_cycles = 0;
+				if (!CalculateScaledCyclesForRange(i, 2, false,
+						&call_scaled_cycles) ||
+					!CalculateScaledCyclesForRange(leaf_pc, 2, false,
+						&leaf_scaled_cycles) ||
+					call_scaled_cycles == 0 || leaf_scaled_cycles == 0 ||
+					call_scaled_cycles > POLL_CALL_CYCLE_MASK ||
+					leaf_scaled_cycles > POLL_CALL_CYCLE_MASK)
+				{
+					return false;
+				}
+
+				// JAL refreshes ra before the callee. The leaf's LW follows the
+				// same dependency rules as an inline load: a base derived from a
+				// per-iteration constant/load remains refreshed; otherwise it is
+				// an invariant read, and loading back into that already-read base
+				// would make the next iteration different.
+				loads |= 1u << 31;
+				if (loads & (1u << load_base))
+				{
+					loads |= 1u << load_result;
+				}
+				else
+				{
+					reads |= 1u << load_base;
+					if (reads & (1u << load_result))
+						return false;
+					loads |= 1u << load_result;
+				}
+
+				poll_call_proof.valid = true;
+				poll_call_proof.call_pc = i;
+				poll_call_proof.leaf_pc = leaf_pc;
+				poll_call_proof.call_scaled_cycles = call_scaled_cycles;
+				poll_call_proof.leaf_scaled_cycles = leaf_scaled_cycles;
+				poll_call_proof.call_opcodes = {
+					code, memRead32(i + sizeof(u32))};
+				poll_call_proof.leaf_opcodes = {leaf_return, leaf_load};
+				continue;
+			}
+
+			// Crossing a real JAL/JR boundary is novel only for the common pure
+			// accessor loop. Keeping the return-to-branch body NOP-only makes the
+			// skipped architectural state and the three PCSX2 scheduler seams
+			// exactly derivable. Richer bodies retain ordinary generated execution.
+			if (poll_call_proof.valid)
+				return false;
 
 			if (opcode == 0x2f || (opcode == 0 && funct == 0x0f))
 				continue; // x86 wait-loop analysis ignores CACHE and SYNC.
@@ -13207,12 +13414,51 @@ namespace VitaEE
 			}
 		}
 
+		if (poll_call_wait_loop_source_proof)
+			*poll_call_wait_loop_source_proof = poll_call_proof;
 		return true;
 	}
 
 	bool BlockCompiler::EmitWaitLoopFastForwardTail(const void* event_exit,
-		bool defer_pc_writeback, u32 pc, u32 persistent_event_token)
+		bool defer_pc_writeback, u32 pc, u32 persistent_event_token,
+		const PollCallWaitLoopSourceProof* poll_call_wait_loop,
+		u32 tail_scaled_cycles)
 	{
+		if (poll_call_wait_loop && poll_call_wait_loop->valid)
+		{
+			if (poll_call_wait_loop->call_scaled_cycles == 0 ||
+				poll_call_wait_loop->leaf_scaled_cycles == 0 ||
+				tail_scaled_cycles == 0 ||
+				poll_call_wait_loop->call_scaled_cycles >
+					POLL_CALL_CYCLE_MASK ||
+				poll_call_wait_loop->leaf_scaled_cycles >
+					POLL_CALL_CYCLE_MASK ||
+				tail_scaled_cycles > POLL_CALL_CYCLE_MASK)
+			{
+				return false;
+			}
+			const u32 packed_cycles =
+				poll_call_wait_loop->call_scaled_cycles |
+				(poll_call_wait_loop->leaf_scaled_cycles <<
+					POLL_CALL_CYCLE_BITS) |
+				(tail_scaled_cycles << (2 * POLL_CALL_CYCLE_BITS));
+			const u32 return_pc =
+				poll_call_wait_loop->call_pc + 2 * sizeof(u32);
+			if (!m_code.EmitMovImm32(HOST_TMP0, packed_cycles) ||
+				!m_code.EmitMovImm32(HOST_TMP1,
+					poll_call_wait_loop->leaf_pc) ||
+				!m_code.EmitMovImm32(HOST_TMP2, return_pc) ||
+				!m_code.EmitMovImm32(HOST_TMP3,
+					poll_call_wait_loop->call_pc) ||
+				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
+					&VitaEeAdvancePollCallWaitToEvent)) ||
+				!EmitStorePcFromHostReg(HOST_TMP0))
+			{
+				return false;
+			}
+			return EmitEventExitReturn(event_exit, persistent_event_token);
+		}
+
 		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest() WaitLoop form:
 		// cycle = max(cycle + block cycles, nextEventCycle), then dispatch
 		// through the event path. Callers reach this tail with HOST_TMP0
@@ -13316,7 +13562,8 @@ namespace VitaEE
 		const void* indirect_lookup_pages_slot, const void* direct_linking_enabled_flag,
 		bool wait_loop_taken, bool defer_pc_writeback,
 		u32 direct_pc, u32 taken_pc, bool conditional_pc, bool indirect_pc_writeback,
-		bool preserve_dirty_direct_link, bool preserve_dirty_taken_link)
+		bool preserve_dirty_direct_link, bool preserve_dirty_taken_link,
+		const PollCallWaitLoopSourceProof* poll_call_wait_loop)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
@@ -13671,7 +13918,10 @@ namespace VitaEE
 				const size_t taken_tail_target = m_code.Size();
 				taken_tail_ok = m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) &&
 					(!sync_private_exit || EmitSyncGprPinsToBacking()) &&
-					EmitWaitLoopFastForwardTail(event_exit, defer_pc_writeback, taken_pc);
+					EmitWaitLoopFastForwardTail(event_exit,
+						defer_pc_writeback, taken_pc,
+						static_cast<u32>(EE_EVENT_EXIT_TOKEN),
+						poll_call_wait_loop, block_cycles);
 			}
 			else
 			{
@@ -13911,7 +14161,8 @@ namespace VitaEE
 		const void* direct_exit, const void* event_exit, DirectLinkSlot* not_taken_link,
 		DirectLinkSlot* taken_link, bool wait_loop_taken,
 		bool defer_pc_writeback, u32 not_taken_pc, u32 taken_pc,
-		bool preserve_dirty_not_taken_link, bool preserve_dirty_taken_link)
+		bool preserve_dirty_not_taken_link, bool preserve_dirty_taken_link,
+		const PollCallWaitLoopSourceProof* poll_call_wait_loop)
 	{
 		if (!direct_exit || !event_exit)
 			return false;
@@ -14221,7 +14472,10 @@ namespace VitaEE
 				const size_t taken_tail_target = m_code.Size();
 				taken_tail_ok = m_code.PatchBranch(taken_tail, taken_tail_target, VitaA32::Condition::NE) &&
 					(!sync_private_exit || EmitSyncGprPinsToBacking()) &&
-					EmitWaitLoopFastForwardTail(event_exit, defer_pc_writeback, taken_pc);
+					EmitWaitLoopFastForwardTail(event_exit,
+						defer_pc_writeback, taken_pc,
+						static_cast<u32>(EE_EVENT_EXIT_TOKEN),
+						poll_call_wait_loop, taken_cycles);
 			}
 			else
 			{

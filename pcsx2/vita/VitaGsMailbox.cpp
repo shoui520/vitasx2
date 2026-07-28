@@ -743,11 +743,11 @@ namespace MTGS
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_codegen integer=%llu branch=%llu "
 			"gpr_load=%llu gpr_store=%llu mmi=%llu cop0=%llu cop1=%llu cop2=%llu "
-			"other=%llu largest_pc=0x%08x largest_guest=%u largest_host=%u "
+			"other=%llu poll_call_wait=%llu largest_pc=0x%08x largest_guest=%u largest_host=%u "
 			"largest_helpers=%u largest_state_loads=%u largest_state_stores=%u "
 			"origin_integer=%llu origin_branch=%llu origin_gpr_load=%llu "
 			"origin_gpr_store=%llu origin_mmi=%llu origin_cop0=%llu origin_cop1=%llu "
-			"origin_cop2=%llu origin_other=%llu",
+			"origin_cop2=%llu origin_other=%llu origin_poll_call_wait=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_integer_instructions,
@@ -771,6 +771,9 @@ namespace MTGS
 				start.ee.generated_cop2_instructions)),
 			static_cast<unsigned long long>(CounterDelta(end.ee.generated_other_instructions,
 				start.ee.generated_other_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_poll_call_wait_blocks,
+				start.ee.generated_poll_call_wait_blocks)),
 			end.ee.largest_generated_block_pc,
 			end.ee.largest_generated_block_guest_instructions,
 			end.ee.largest_generated_block_host_instructions,
@@ -803,7 +806,10 @@ namespace MTGS
 				origin.ee.generated_cop2_instructions)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_other_instructions,
-				origin.ee.generated_other_instructions)));
+				origin.ee.generated_other_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_poll_call_wait_blocks,
+				origin.ee.generated_poll_call_wait_blocks)));
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_dispatch provider_boundaries=%llu "
 			"boundary_guest_instructions=%llu direct_exits=%llu event_exits=%llu "

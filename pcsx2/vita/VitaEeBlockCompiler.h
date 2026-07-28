@@ -27,6 +27,21 @@ namespace VitaEE
 	inline constexpr u32 RETAINED_UNCONDITIONAL_WAIT_EVENT_MASK = 0x80000000u;
 	inline constexpr u32 RETAINED_UNCONDITIONAL_WAIT_MAX_CYCLES = 0x7fffffffu;
 
+	// Immutable code ranges consumed when a backward EE wait proof follows a
+	// static JAL into a pure load leaf. The loop block already owns its branch
+	// range; the executor attaches these disjoint ranges to the same recClear()
+	// and RAM-source invalidation lifetime.
+	struct PollCallWaitLoopSourceProof
+	{
+		bool valid = false;
+		u32 call_pc = 0;
+		u32 leaf_pc = 0;
+		u32 call_scaled_cycles = 0;
+		u32 leaf_scaled_cycles = 0;
+		std::array<u32, 2> call_opcodes{};
+		std::array<u32, 2> leaf_opcodes{};
+	};
+
 	template <typename T, size_t Capacity>
 	class FixedCompileBuffer
 	{
@@ -673,7 +688,8 @@ namespace VitaEE
 				DirectContinuationKind::SchedulerTestedTail,
 			bool* scheduler_test_elided_continuation_emitted = nullptr,
 			const void* scheduler_test_elided_direct_exit = nullptr,
-			const void* retained_wait_event_exit = nullptr);
+			const void* retained_wait_event_exit = nullptr,
+			PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false,
 			u32 branch_delay_selected_pc = UINT32_MAX,
@@ -685,7 +701,8 @@ namespace VitaEE
 			bool wait_loop_taken = false, bool defer_pc_writeback = false,
 			u32 direct_pc = 0, u32 taken_pc = 0, bool conditional_pc = false,
 			bool indirect_pc_writeback = false, bool preserve_dirty_direct_link = false,
-			bool preserve_dirty_taken_link = false);
+			bool preserve_dirty_taken_link = false,
+			const PollCallWaitLoopSourceProof* poll_call_wait_loop = nullptr);
 		bool EndBlockWithSchedulerElidedDirectContinuation(u32 block_cycles,
 			const void* scheduler_test_elided_direct_exit, DirectLinkSlot* direct_link,
 			bool defer_pc_writeback, u32 direct_pc);
@@ -694,7 +711,8 @@ namespace VitaEE
 			DirectLinkSlot* taken_link = nullptr, bool wait_loop_taken = false,
 			bool defer_pc_writeback = false, u32 not_taken_pc = 0, u32 taken_pc = 0,
 			bool preserve_dirty_not_taken_link = false,
-			bool preserve_dirty_taken_link = false);
+			bool preserve_dirty_taken_link = false,
+			const PollCallWaitLoopSourceProof* poll_call_wait_loop = nullptr);
 		static bool RequiresBlockEndAfterOpcode(u32 op);
 		static bool RequiresFollowingInstructionInBlock(u32 op);
 		static bool RequiresTraceWindowEndAfterOpcode(u32 op);
@@ -765,10 +783,13 @@ namespace VitaEE
 			bool allow_generated_lookup);
 		bool EmitDeferredPcWriteback(bool defer_pc_writeback, u32 direct_pc, u32 taken_pc,
 			bool conditional_pc, bool indirect_pc_writeback = false);
-		static bool IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc);
+		static bool IsWaitLoopBody(u32 loop_start_pc, u32 loop_end_pc, u32 branch_pc,
+			PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof = nullptr);
 		bool EmitWaitLoopFastForwardTail(const void* event_exit,
 			bool defer_pc_writeback = false, u32 pc = 0,
-			u32 persistent_event_token = 0xe7u);
+			u32 persistent_event_token = 0xe7u,
+			const PollCallWaitLoopSourceProof* poll_call_wait_loop = nullptr,
+			u32 tail_scaled_cycles = 0);
 		bool EndBlockWithWaitLoopFastForward(u32 block_cycles,
 			const void* event_exit, bool retain_across_events = false);
 		static bool IsRetainableUnconditionalWaitBlock(u32 start_pc,
