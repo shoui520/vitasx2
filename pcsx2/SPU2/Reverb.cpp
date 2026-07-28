@@ -8,6 +8,113 @@
 
 #include <array>
 
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 g_qemuSpu2ReciprocalModuloIndexes = 0;
+#endif
+
+namespace
+{
+	static constexpr u8 DIVIDER_ADD_MARKER = 0x40;
+	static constexpr u8 DIVIDER_SHIFT_MASK = 0x1f;
+
+	// Cortex-A9 has no integer divide instruction. RevbGetIndexer() otherwise
+	// reaches __aeabi_uidivmod fourteen times per active core and sample. Cache
+	// the exact unsigned reciprocal for each core's work area and use the
+	// libdivide branchfull quotient construction in the sample-rate hot path.
+	struct ReverbDivider
+	{
+		u32 start = 0;
+		u32 divisor = 0;
+		u32 magic = 0;
+		u8 more = 0;
+	};
+
+	std::array<ReverbDivider, 2> s_reverb_dividers;
+
+	static ReverbDivider MakeReverbDivider(u32 start, u32 divisor)
+	{
+		ReverbDivider result;
+		result.start = start;
+		result.divisor = divisor;
+
+		const u32 floor_log_2_divisor =
+			31u - static_cast<u32>(__builtin_clz(divisor));
+		if ((divisor & (divisor - 1)) == 0)
+		{
+			result.more = static_cast<u8>(floor_log_2_divisor);
+			return result;
+		}
+
+		const u64 numerator = 1ull << (32u + floor_log_2_divisor);
+		u32 proposed_magic = static_cast<u32>(numerator / divisor);
+		const u32 remainder = static_cast<u32>(
+			numerator - static_cast<u64>(proposed_magic) * divisor);
+		const u32 error = divisor - remainder;
+
+		if (error < (1u << floor_log_2_divisor))
+		{
+			result.more = static_cast<u8>(floor_log_2_divisor);
+		}
+		else
+		{
+			proposed_magic += proposed_magic;
+			const u32 twice_remainder = remainder + remainder;
+			if (twice_remainder >= divisor ||
+				twice_remainder < remainder)
+			{
+				proposed_magic++;
+			}
+			result.more = static_cast<u8>(
+				floor_log_2_divisor | DIVIDER_ADD_MARKER);
+		}
+
+		result.magic = proposed_magic + 1;
+		return result;
+	}
+
+	static __forceinline u32 DivideWithReverbDivider(
+		u32 numerator, const ReverbDivider& divider)
+	{
+		if (divider.magic == 0)
+			return numerator >> divider.more;
+
+		u32 quotient = static_cast<u32>(
+			(static_cast<u64>(divider.magic) * numerator) >> 32);
+		if (divider.more & DIVIDER_ADD_MARKER)
+		{
+			const u32 adjusted = ((numerator - quotient) >> 1) + quotient;
+			return adjusted >> (divider.more & DIVIDER_SHIFT_MASK);
+		}
+		return quotient >> divider.more;
+	}
+
+	static __attribute__((noinline)) u32 RevbGetReciprocalIndexer(
+		u32 phase, u32 offset, const ReverbDivider& divider)
+	{
+		const u32 numerator = phase + offset;
+		const u32 quotient = DivideWithReverbDivider(numerator, divider);
+		const u32 remainder = numerator - quotient * divider.divisor;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSpu2ReciprocalModuloIndexes++;
+#endif
+		return (remainder + divider.start) & 0xf'ffff;
+	}
+
+	static const ReverbDivider& GetReverbDivider(const V_Core& core)
+	{
+		// Effects registers can change at any sample boundary, so derived
+		// reciprocal state is reused only while both operands of PCSX2's
+		// original modulo expression remain identical.
+		const u32 start = core.EffectsStartA & 0x3f'ffff;
+		const u32 end = (core.EffectsEndA & 0x3f'ffff) | 0xffff;
+		const u32 divisor = (end - start) + 1;
+		ReverbDivider& divider = s_reverb_dividers[core.Index & 1u];
+		if (divider.start != start || divider.divisor != divisor)
+			divider = MakeReverbDivider(start, divisor);
+		return divider;
+	}
+} // namespace
+
 void V_Core::AnalyzeReverbPreset()
 {
 	Console.WriteLn("Reverb Parameter Update for Core %d:", Index);
@@ -55,6 +162,15 @@ __forceinline s32 V_Core::RevbGetIndexer(s32 offset)
 	return x & 0xf'ffff;
 }
 
+#if defined(VITASX2_QEMU_VALIDATION)
+u32 Spu2ReverbReciprocalIndexForValidation(
+	u32 start, u32 divisor, u32 phase, u32 offset)
+{
+	const ReverbDivider divider = MakeReverbDivider(start, divisor);
+	return RevbGetReciprocalIndexer(phase, offset, divider);
+}
+#endif
+
 StereoOut32 V_Core::DoReverb(StereoOut32 Input)
 {
 	if (EffectsStartA >= EffectsEndA)
@@ -70,26 +186,44 @@ StereoOut32 V_Core::DoReverb(StereoOut32 Input)
 	RevbDownBuf[1][RevbSampleBufPos | 64] = Input.Right;
 
 	bool R = Cycles & 1;
+	const ReverbDivider& divider = GetReverbDivider(*this);
+	const u32 phase = Cycles >> 1;
 
 	// Calculate the read/write addresses we'll be needing for this session of reverb.
 
-	const u32 same_src = RevbGetIndexer(R ? Revb.SAME_R_SRC : Revb.SAME_L_SRC);
-	const u32 same_dst = RevbGetIndexer(R ? Revb.SAME_R_DST : Revb.SAME_L_DST);
-	const u32 same_prv = RevbGetIndexer(R ? Revb.SAME_R_DST - 1 : Revb.SAME_L_DST - 1);
+	const u32 same_src = RevbGetReciprocalIndexer(
+		phase, R ? Revb.SAME_R_SRC : Revb.SAME_L_SRC, divider);
+	const u32 same_dst = RevbGetReciprocalIndexer(
+		phase, R ? Revb.SAME_R_DST : Revb.SAME_L_DST, divider);
+	const u32 same_prv = RevbGetReciprocalIndexer(
+		phase, R ? Revb.SAME_R_DST - 1 : Revb.SAME_L_DST - 1, divider);
 
-	const u32 diff_src = RevbGetIndexer(R ? Revb.DIFF_L_SRC : Revb.DIFF_R_SRC);
-	const u32 diff_dst = RevbGetIndexer(R ? Revb.DIFF_R_DST : Revb.DIFF_L_DST);
-	const u32 diff_prv = RevbGetIndexer(R ? Revb.DIFF_R_DST - 1 : Revb.DIFF_L_DST - 1);
+	const u32 diff_src = RevbGetReciprocalIndexer(
+		phase, R ? Revb.DIFF_L_SRC : Revb.DIFF_R_SRC, divider);
+	const u32 diff_dst = RevbGetReciprocalIndexer(
+		phase, R ? Revb.DIFF_R_DST : Revb.DIFF_L_DST, divider);
+	const u32 diff_prv = RevbGetReciprocalIndexer(
+		phase, R ? Revb.DIFF_R_DST - 1 : Revb.DIFF_L_DST - 1, divider);
 
-	const u32 comb1_src = RevbGetIndexer(R ? Revb.COMB1_R_SRC : Revb.COMB1_L_SRC);
-	const u32 comb2_src = RevbGetIndexer(R ? Revb.COMB2_R_SRC : Revb.COMB2_L_SRC);
-	const u32 comb3_src = RevbGetIndexer(R ? Revb.COMB3_R_SRC : Revb.COMB3_L_SRC);
-	const u32 comb4_src = RevbGetIndexer(R ? Revb.COMB4_R_SRC : Revb.COMB4_L_SRC);
+	const u32 comb1_src = RevbGetReciprocalIndexer(
+		phase, R ? Revb.COMB1_R_SRC : Revb.COMB1_L_SRC, divider);
+	const u32 comb2_src = RevbGetReciprocalIndexer(
+		phase, R ? Revb.COMB2_R_SRC : Revb.COMB2_L_SRC, divider);
+	const u32 comb3_src = RevbGetReciprocalIndexer(
+		phase, R ? Revb.COMB3_R_SRC : Revb.COMB3_L_SRC, divider);
+	const u32 comb4_src = RevbGetReciprocalIndexer(
+		phase, R ? Revb.COMB4_R_SRC : Revb.COMB4_L_SRC, divider);
 
-	const u32 apf1_src = RevbGetIndexer(R ? (Revb.APF1_R_DST - Revb.APF1_SIZE) : (Revb.APF1_L_DST - Revb.APF1_SIZE));
-	const u32 apf1_dst = RevbGetIndexer(R ? Revb.APF1_R_DST : Revb.APF1_L_DST);
-	const u32 apf2_src = RevbGetIndexer(R ? (Revb.APF2_R_DST - Revb.APF2_SIZE) : (Revb.APF2_L_DST - Revb.APF2_SIZE));
-	const u32 apf2_dst = RevbGetIndexer(R ? Revb.APF2_R_DST : Revb.APF2_L_DST);
+	const u32 apf1_src = RevbGetReciprocalIndexer(
+		phase, R ? (Revb.APF1_R_DST - Revb.APF1_SIZE) :
+			(Revb.APF1_L_DST - Revb.APF1_SIZE), divider);
+	const u32 apf1_dst = RevbGetReciprocalIndexer(
+		phase, R ? Revb.APF1_R_DST : Revb.APF1_L_DST, divider);
+	const u32 apf2_src = RevbGetReciprocalIndexer(
+		phase, R ? (Revb.APF2_R_DST - Revb.APF2_SIZE) :
+			(Revb.APF2_L_DST - Revb.APF2_SIZE), divider);
+	const u32 apf2_dst = RevbGetReciprocalIndexer(
+		phase, R ? Revb.APF2_R_DST : Revb.APF2_L_DST, divider);
 
 	// -----------------------------------------
 	//          Optimized IRQ Testing !
