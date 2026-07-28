@@ -19,6 +19,10 @@
 
 namespace VitaIOP
 {
+// Marker for private bodies whose VFP contract is enforced by the d8-d15
+// translation-unit reservations in VitaIopBlockCompiler.cpp.
+#define VITASX2_IOP_PRIVATE_VFP_ABI
+
 	enum class BlockExitKind : u32
 	{
 		Direct = 0x10300a32u,
@@ -1118,23 +1122,26 @@ namespace VitaIOP
 		inline __attribute__((always_inline)) s32 ExecuteProviderTimesliceLoop();
 		__attribute__((noinline, cold)) s32 ExecuteProviderTimesliceRemainder();
 #if defined(__arm__)
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector)) __attribute__((noinline)) s32
 		ExecuteProviderTimeslicePrivateBody(s32 ee_cycles) __asm__(
 			"VitaIopA32ProviderTimesliceBody");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector)) __attribute__((noinline)) s32
 		ExecuteProviderSchedulerDirectResumePrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderSchedulerDirectResumeBody");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector)) __attribute__((noinline)) s32
 		ExecuteProviderSchedulerPredictedResumePrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderSchedulerPredictedResumeBody");
-		__attribute__((noinline)) s32
+		VITASX2_IOP_PRIVATE_VFP_ABI __attribute__((noinline)) s32
 		ExecuteProviderSchedulerDispatchCachedResumePrivateBody(
 			s32 ee_cycles,
 			CachedBlock*
 				block) __asm__("VitaIopA32ProviderSchedulerDispatchCachedResumeBody");
-		inline __attribute__((always_inline)) s32
+		VITASX2_IOP_PRIVATE_VFP_ABI inline __attribute__((always_inline)) s32
 		ExecuteProviderWaitResumePrivateBodyCore(s32 ee_cycles, CachedBlock* block,
 			WaitResumeKind kind,
 			bool kind_specific,
@@ -1142,6 +1149,7 @@ namespace VitaIOP
 				bool no_link_specific);
 #if defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_IOP_WAIT_RESUME_KIND_ENTRY_CONTROL)
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumePrivateBody(
 			s32 ee_cycles, CachedBlock* block,
@@ -1149,49 +1157,60 @@ namespace VitaIOP
 #endif
 #if defined(VITASX2_QEMU_VALIDATION) || \
 	defined(VITASX2_IOP_WAIT_RESUME_CLOCK_ENTRY_CONTROL)
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalPrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeUnconditionalBody");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumePollPrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumePollBody");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeConditionalPrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeConditionalBody");
 #endif
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalNormalPrivateBody(
 			s32 ee_cycles,
 			CachedBlock*
 				block) __asm__("VitaIopA32ProviderWaitResumeUnconditionalNormalBody");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalPs1PrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeUnconditionalPs1Body");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalNoLinkNormalPrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeUnconditionalNoL"
 										"inkNormalBody");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeUnconditionalNoLinkPs1PrivateBody(
 			s32 ee_cycles, CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeU"
 													   "nconditionalNoLinkPs1Body");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumePollNormalPrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumePollNormalBody");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumePollPs1PrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumePollPs1Body");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeConditionalNormalPrivateBody(
 			s32 ee_cycles,
 			CachedBlock* block) __asm__("VitaIopA32ProviderWaitResumeConditionalNormalBody");
+		VITASX2_IOP_PRIVATE_VFP_ABI
 		__attribute__((no_stack_protector, noinline)) s32
 			ExecuteProviderWaitResumeConditionalPs1PrivateBody(
 			s32 ee_cycles,

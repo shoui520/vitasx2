@@ -27,6 +27,22 @@
 #include <new>
 #include <utility>
 
+#if defined(__arm__) && defined(__GNUC__)
+// ReturnFromPrivateProviderTimeslice() restores SP directly to the private
+// caller's CFA, bypassing any compiler-generated VFP epilogue. Reserve only
+// the AAPCS callee-saved VFP bank throughout this translation unit: private
+// bodies then preserve d8-d15 structurally while GCC remains free to use the
+// caller-clobbered banks, including d16 for paired IOP-state stores.
+register double g_vita_iop_reserved_d8 asm("d8");
+register double g_vita_iop_reserved_d9 asm("d9");
+register double g_vita_iop_reserved_d10 asm("d10");
+register double g_vita_iop_reserved_d11 asm("d11");
+register double g_vita_iop_reserved_d12 asm("d12");
+register double g_vita_iop_reserved_d13 asm("d13");
+register double g_vita_iop_reserved_d14 asm("d14");
+register double g_vita_iop_reserved_d15 asm("d15");
+#endif
+
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuIopDivSignedHelperCalls = 0;
 u32 g_qemuIopDivUnsignedHelperCalls = 0;
@@ -112,6 +128,9 @@ namespace
 		register const void* target asm("r12") = entry;
 		// A fixed private slot makes every linked body ABI-compatible, including
 		// transitions from blocks whose own analysis needed no cycle scratch.
+		// The IOP emitter's only vector temporary is q0. Declare it explicitly;
+		// the private dispatcher reserves d8-d15 throughout this translation
+		// unit, while this keeps the callable helper correct if that changes.
 		asm volatile("sub sp, sp, #8\n\t"
 			"adr r9, 1f\n\t"
 			"bx %[target]\n\t"
@@ -120,7 +139,7 @@ namespace
 			: "=r"(result), [target] "+r"(target)
 			:
 			: "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10",
-			  "r11", "lr", "cc", "memory");
+			  "r11", "lr", "d0", "d1", "cc", "memory");
 		return result;
 	}
 
@@ -13229,14 +13248,13 @@ namespace VitaIOP
 	{
 		asm volatile(
 			// Cold AAPCS adapter for diagnostics and non-private callers.
-			// The private CFA exit treats d8-d15 as scheduler-owned, so preserve
-			// that callee-save bank here for generic AAPCS callers.
+			// This translation unit reserves d8-d15, generated IOP code uses q0,
+			// and nested helpers obey AAPCS. The target therefore preserves the
+			// callee-saved bank without an adapter-local 128-byte stack transfer.
 			"push {r4-r11, lr}\n"
-			"vpush {d8-d15}\n"
 			"sub sp, sp, #4\n"
 			"bl VitaIopA32ExecuteProviderTimeslicePrivate\n"
 			"add sp, sp, #4\n"
-			"vpop {d8-d15}\n"
 			"pop {r4-r11, pc}\n");
 	}
 
@@ -14006,8 +14024,8 @@ namespace VitaIOP
 
 	bool VitaIopA32PrivateWaitResumeEntrySupported()
 	{
-		// Product and validation register allocation differ after the core save.
-		// Skip only the stable PUSH and execute any compiler-selected VFP save.
+		// Skip only the stable core PUSH. The translation-unit reservation makes
+		// product and validation bodies preserve d8-d15 without a VFP prologue.
 		constexpr u32 EXPECTED_PUSH_R4_R11_LR = 0xe92d4ff0u;
 		const auto has_private_push = [&](const void* body) {
 			return *reinterpret_cast<const u32*>(body) == EXPECTED_PUSH_R4_R11_LR;

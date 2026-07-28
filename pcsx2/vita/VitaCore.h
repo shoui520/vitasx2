@@ -85,7 +85,11 @@ inline __attribute__((always_inline)) s32 VitaExecuteA32IopTimesliceFromEeEvent(
 		: "=r"(context_and_result), "+r"(cycles), [entry] "+r"(entry)
 		:
 		: "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12",
-		  "lr", "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15",
+		  // The private-body translation unit reserves d8-d15, generated IOP
+		  // code uses only q0, and nested AAPCS helpers preserve d8-d15.
+		  // Describe the ordinary caller-clobbered VFP bank rather than forcing
+		  // _cpuEventTest_Shared() to save 128 bytes at every scheduler seam.
+		  "lr", "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
 		  "cc", "memory");
 	return static_cast<s32>(context_and_result);
 }
