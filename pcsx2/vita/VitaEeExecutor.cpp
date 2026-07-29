@@ -2827,12 +2827,13 @@ namespace VitaEE
 		if (m_code_cache)
 			return true;
 
-		// PES 2014 reached 8,080,096/8,388,608 bytes and
-		// 15,697/16,384 entries before its title screen. Upstream kuBridge and
+		// PES 2014 reached 8,301,888 bytes and 15,697 entries without an EE
+		// reset, while its 1 MiB IOP slice reset repeatedly. Upstream kuBridge and
 		// gtasa_vita/loader/so_util.c own the retail-Vita mechanism used here:
 		// allocate RX, publish through the unrestricted-copy syscall, then flush
-		// the exact range. IOP/VU share that arena; keep the old official
-		// VM-domain slice as the fail-closed fallback.
+		// the exact range. The exact 22 MiB arena therefore assigns 14 MiB to EE,
+		// 3 MiB to IOP, and keeps both VU slices unchanged. Keep the old official
+		// VM-domain EE slice as the fail-closed fallback.
 		// PCSX2 owner: x86/ix86-32/iR5900.cpp owns one EE code cache and
 		// BaseblockEx tracks block entries inside that cache; do the same here
 		// instead of allocating a VM block per translated guest block.

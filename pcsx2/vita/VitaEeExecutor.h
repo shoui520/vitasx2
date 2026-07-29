@@ -241,7 +241,7 @@ namespace VitaEE
 		// into two normal directly-linkable blocks instead of admitting a single
 		// pathological body into the Cortex-A9 instruction cache.
 		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 32 * 1024;
-		static constexpr size_t EE_CODE_CACHE_CAPACITY = 16 * 1024 * 1024;
+		static constexpr size_t EE_CODE_CACHE_CAPACITY = 14 * 1024 * 1024;
 		static constexpr size_t EE_FALLBACK_CODE_CACHE_CAPACITY =
 			HostMemoryMap::EErecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;

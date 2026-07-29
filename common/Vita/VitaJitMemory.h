@@ -39,7 +39,7 @@ namespace VitaVM
 	bool ReserveJitMemory();
 	void* AllocJitMemory(size_t size, SceUID* out_uid = nullptr);
 	// Large code-cache requests are admitted only by the kuBridge-backed arena.
-	// This lets EE select 16 MiB while IOP/VU share the same 22 MiB backing
+	// This lets EE select 14 MiB while IOP/VU share the same 22 MiB backing
 	// block. The caller can retry AllocJitMemory() to use the official 16 MiB
 	// VM-domain fallback. Native validation has no PSP2 permission split.
 #if defined(VITASX2_QEMU_VALIDATION)

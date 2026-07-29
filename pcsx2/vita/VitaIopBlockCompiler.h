@@ -753,7 +753,9 @@ namespace VitaIOP
 		static constexpr size_t MAX_CACHE_CAPACITY = 0x4000;
 		static constexpr size_t STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 4096;
 		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 16 * 1024;
-		static constexpr size_t IOP_CODE_CACHE_CAPACITY = HostMemoryMap::IOPrecSize;
+		static constexpr size_t IOP_CODE_CACHE_CAPACITY = 3 * 1024 * 1024;
+		static constexpr size_t IOP_FALLBACK_CODE_CACHE_CAPACITY =
+			HostMemoryMap::IOPrecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
 		static constexpr u32 SCHEDULER_DIRECT_RESUME_TAG = 1u;

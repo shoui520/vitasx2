@@ -11067,14 +11067,38 @@ namespace VitaIOP
 
 		// PCSX2 owner: x86/iR3000A.cpp::recReserve()/recResetIOP() use one IOP
 		// recompiler arena and BASEBLOCK records inside it. Vita mirrors that
-		// with one ARM code arena for cached R3000A blocks.
+		// with one ARM code arena for cached R3000A blocks. PES proved that the
+		// former 1 MiB slice repeatedly discarded live work while EE still had
+		// over 5 MiB of measured headroom, so the preferred exact 22 MiB
+		// kuBridge layout assigns IOP 3 MiB and EE 14 MiB. The official VM
+		// backend retains the prior 1 MiB IOP slice.
 		size_t capacity = IOP_CODE_CACHE_CAPACITY;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (s_qemuIopCodeCacheCapacityLimit != 0)
 			capacity = std::min(capacity, s_qemuIopCodeCacheCapacityLimit);
 #endif
-		m_code_cache = static_cast<u8*>(VitaVM::AllocJitMemory(capacity));
-		m_code_cache_capacity = m_code_cache ? capacity : 0;
+		m_code_cache =
+			static_cast<u8*>(VitaVM::AllocLargeJitMemory(capacity));
+		if (m_code_cache)
+		{
+			m_code_cache_capacity = capacity;
+		}
+		else
+		{
+			size_t fallback_capacity = IOP_FALLBACK_CODE_CACHE_CAPACITY;
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (s_qemuIopCodeCacheCapacityLimit != 0)
+			{
+				fallback_capacity =
+					std::min(fallback_capacity,
+						s_qemuIopCodeCacheCapacityLimit);
+			}
+#endif
+			m_code_cache = static_cast<u8*>(
+				VitaVM::AllocJitMemory(fallback_capacity));
+			m_code_cache_capacity =
+				m_code_cache ? fallback_capacity : 0;
+		}
 		m_code_cache_used = 0;
 		return (m_code_cache != nullptr);
 	}

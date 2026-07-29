@@ -47,11 +47,13 @@ extern "C"
 	// VitaSDK's newlib_heapsize_ctrl sample documents a 128 MiB default and
 	// explicitly permits applications which own independent memblocks to reduce
 	// it. HostMemoryMap's permanent 65 MiB data arena is now such a memblock.
-	// A matched six-window PES run with the final 16 MiB EE cache, 64 KiB Vita
+	// A matched six-window PES run with a 16 MiB EE cache, 64 KiB Vita
 	// translation cache, native-resolution 4 MiB GS scratch, and lazy ShaccCg
 	// arena reached 64,833,032 bytes in use and retained 15,907,320 bytes of
-	// aggregate heap headroom. Keep the 77 MiB ceiling measured by that boundary;
-	// allocator headroom is not a largest-contiguous-allocation guarantee.
+	// aggregate heap headroom. The final exact 14 MiB EE / 3 MiB IOP split
+	// retained 14,823,144 bytes after an additional fourth 120-VSync window.
+	// Keep the 77 MiB ceiling measured by those boundaries; allocator headroom
+	// is not a largest-contiguous-allocation guarantee.
 	unsigned int _newlib_heap_size_user = 77u * 1024u * 1024u;
 }
 
@@ -70,7 +72,7 @@ namespace VitaSharedMemory
 namespace VitaVM
 {
 	// VitaSDK's user VM-domain API is capped at 16 MiB. The selected product
-	// layout needs EE 16 MiB + IOP 1 MiB + VU0 1 MiB + VU1 4 MiB, so one
+	// layout needs EE 14 MiB + IOP 3 MiB + VU0 1 MiB + VU1 4 MiB, so one
 	// kuBridge-backed 22 MiB arena provides exactly those fixed slices. A 24 MiB
 	// reservation starved the fourth 2 MiB immutable GPU-VU input slot on real
 	// hardware, so executable memory must not carry unused spare capacity.
