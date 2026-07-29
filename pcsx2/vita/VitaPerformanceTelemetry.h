@@ -47,6 +47,11 @@ namespace VitaPerformanceTelemetry
 		EeProvider,
 		EeCompile,
 		EeInterpreter,
+#if defined(VITASX2_CPU_PROFILER)
+		IopGenerated,
+		IopProvider,
+		IopCompile,
+#endif
 		IopInterpreter,
 		Cop1,
 		Cop2Vu0,
@@ -62,6 +67,13 @@ namespace VitaPerformanceTelemetry
 		OtherDevice,
 		Diagnostics,
 		Count,
+#if !defined(VITASX2_CPU_PROFILER)
+		// Keep diagnostic call sites source-identical while preserving the
+		// normal product's original enum geometry and telemetry record size.
+		IopGenerated = IopGuest,
+		IopProvider = IopGuest,
+		IopCompile = IopGuest,
+#endif
 	};
 
 	static constexpr size_t CPU_STAGE_COUNT =
@@ -69,11 +81,11 @@ namespace VitaPerformanceTelemetry
 	static constexpr u32 CPU_STAGE_SAMPLE_PERIOD = 1024;
 	static constexpr size_t CPU_PROFILE_CODE_WORD_COUNT = 8;
 	// PES currently produces roughly 390 samples per 120-VSync measurement
-	// window at the 1/1024 cadence. 432 records retain a complete ordinary
-	// window after adding its bounded EE code sample while remaining below
-	// 96 KiB.
-	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 432;
+	// window at the 1/1024 cadence. 408 records retain a complete ordinary
+	// window after the generated IOP owner split while remaining below 96 KiB.
+	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 408;
 	static constexpr size_t CPU_PROFILE_HOT_EDGE_COUNT = 8;
+	static constexpr size_t CPU_PROFILE_HOT_IOP_PC_COUNT = 8;
 
 	enum class EeDeadlineOwner : u8
 	{
@@ -211,6 +223,8 @@ namespace VitaPerformanceTelemetry
 		u64 ee_compile_observations = 0;
 		u64 ee_compile_time_us = 0;
 #if defined(VITASX2_CPU_PROFILER)
+		u64 iop_compile_observations = 0;
+		u64 iop_compile_time_us = 0;
 		// The statistical sampler runs on a non-EE Vita thread. CPU0 publishes
 		// only its current stage with a relaxed word store; the observer samples
 		// that marker at a decorrelated cadence. This attributes short helpers
@@ -218,6 +232,7 @@ namespace VitaPerformanceTelemetry
 		u64 statistical_samples = 0;
 		u64 statistical_invalid_samples = 0;
 		u64 statistical_sampler_cpu_us = 0;
+		u64 statistical_iop_pc_sequence = 0;
 		std::array<u64, CPU_STAGE_COUNT> statistical_stage_samples{};
 #endif
 		std::array<u64, CPU_STAGE_COUNT> stage_time_us{};
@@ -245,6 +260,23 @@ namespace VitaPerformanceTelemetry
 		std::array<CpuProfileHotEdge, CPU_PROFILE_HOT_EDGE_COUNT> iop{};
 	};
 
+	struct CpuProfileHotIopPc
+	{
+		u32 pc = 0;
+		u32 samples = 0;
+	};
+
+	struct CpuProfileHotIopPcSnapshot
+	{
+		bool valid = false;
+		u64 first_sequence = 0;
+		u64 next_sequence = 0;
+		u64 dropped_samples = 0;
+		u64 invalid_samples = 0;
+		std::array<CpuProfileHotIopPc,
+			CPU_PROFILE_HOT_IOP_PC_COUNT> pcs{};
+	};
+
 	// SCE_SYSMODULE_PERF is devkit-only and is rejected on retail hardware.
 	// The CEX profiler therefore uses the documented process-time clock on a
 	// sparse subset of EE scheduler entries. It is diagnostic-only and excluded
@@ -260,6 +292,18 @@ namespace VitaPerformanceTelemetry
 	CpuStageProfilerSnapshot GetCpuStageProfilerSnapshot();
 	CpuProfileHotEdgeSnapshot GetCpuProfileHotEdgeSnapshot(
 		u64 first_sequence, u64 next_sequence);
+#if defined(VITASX2_CPU_PROFILER)
+	CpuProfileHotIopPcSnapshot GetCpuProfileHotIopPcSnapshot(
+		u64 first_sequence, u64 next_sequence);
+#else
+	inline CpuProfileHotIopPcSnapshot GetCpuProfileHotIopPcSnapshot(
+		u64 first_sequence, u64 next_sequence)
+	{
+		(void)first_sequence;
+		(void)next_sequence;
+		return {};
+	}
+#endif
 
 	// These are deliberately plain CPU-thread-owned values. Configuration is
 	// immutable before execution starts, and no other thread enters the EE
@@ -268,6 +312,7 @@ namespace VitaPerformanceTelemetry
 	extern bool g_cpu_stage_profiler_enabled;
 	extern bool g_cpu_stage_sample_active;
 	extern std::atomic<u32> g_cpu_stage_statistical_marker;
+	extern std::atomic<u32> g_cpu_iop_statistical_pc;
 #endif
 
 	void OnEeSchedulerEntryEnabled(u32 ee_pc, u64 ee_cycle,
@@ -277,6 +322,8 @@ namespace VitaPerformanceTelemetry
 	void EndCpuStage();
 	u32 BeginExactEeCompileMeasurement();
 	void EndExactEeCompileMeasurement(u32 start_us);
+	u32 BeginExactIopCompileMeasurement();
+	void EndExactIopCompileMeasurement(u32 start_us);
 	void CountCpuStageEntry(CpuStage stage);
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
@@ -346,6 +393,16 @@ namespace VitaPerformanceTelemetry
 			CountCpuStageEntry(stage);
 #else
 		(void)stage;
+#endif
+	}
+
+	inline void PublishIopGeneratedPcIfProfiling(u32 pc)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			g_cpu_iop_statistical_pc.store(pc, std::memory_order_relaxed);
+#else
+		(void)pc;
 #endif
 	}
 
@@ -578,6 +635,38 @@ namespace VitaPerformanceTelemetry
 			const ScopedExactEeCompileMeasurement&) = delete;
 		ScopedExactEeCompileMeasurement& operator=(
 			const ScopedExactEeCompileMeasurement&) = delete;
+
+	private:
+#if defined(VITASX2_CPU_PROFILER)
+		u32 m_start_us = 0;
+		bool m_enabled = false;
+#endif
+	};
+
+	class ScopedExactIopCompileMeasurement
+	{
+	public:
+		ScopedExactIopCompileMeasurement()
+		{
+#if defined(VITASX2_CPU_PROFILER)
+			m_enabled = g_cpu_stage_profiler_enabled;
+			if (m_enabled)
+				m_start_us = BeginExactIopCompileMeasurement();
+#endif
+		}
+
+		~ScopedExactIopCompileMeasurement()
+		{
+#if defined(VITASX2_CPU_PROFILER)
+			if (m_enabled)
+				EndExactIopCompileMeasurement(m_start_us);
+#endif
+		}
+
+		ScopedExactIopCompileMeasurement(
+			const ScopedExactIopCompileMeasurement&) = delete;
+		ScopedExactIopCompileMeasurement& operator=(
+			const ScopedExactIopCompileMeasurement&) = delete;
 
 	private:
 #if defined(VITASX2_CPU_PROFILER)

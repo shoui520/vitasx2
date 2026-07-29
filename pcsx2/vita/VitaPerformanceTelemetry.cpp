@@ -28,6 +28,7 @@ namespace VitaPerformanceTelemetry
 	bool g_cpu_stage_sample_active = false;
 	std::atomic<u32> g_cpu_stage_statistical_marker{
 		static_cast<u32>(CpuStage::Count)};
+	std::atomic<u32> g_cpu_iop_statistical_pc{UINT32_MAX};
 
 	namespace
 	{
@@ -57,6 +58,15 @@ namespace VitaPerformanceTelemetry
 			s_statistical_stage_samples{};
 		std::atomic<u32> s_statistical_samples{0};
 		std::atomic<u32> s_statistical_invalid_samples{0};
+		constexpr size_t STATISTICAL_IOP_PC_RING_SIZE = 4096;
+		struct StatisticalIopPcSample
+		{
+			std::atomic<u64> sequence{0};
+			std::atomic<u32> pc{UINT32_MAX};
+		};
+		std::array<StatisticalIopPcSample,
+			STATISTICAL_IOP_PC_RING_SIZE> s_statistical_iop_pc_ring{};
+		std::atomic<u64> s_statistical_iop_pc_sequence{0};
 
 #if defined(__vita__)
 		Threading::Thread s_statistical_sampler_thread;
@@ -89,6 +99,23 @@ namespace VitaPerformanceTelemetry
 				{
 					s_statistical_invalid_samples.fetch_add(
 						1, std::memory_order_relaxed);
+				}
+				if (stage == static_cast<u32>(CpuStage::IopGenerated))
+				{
+					const u32 pc = g_cpu_iop_statistical_pc.load(
+						std::memory_order_relaxed);
+					if (pc != UINT32_MAX)
+					{
+						const u64 sequence =
+							s_statistical_iop_pc_sequence.fetch_add(
+								1, std::memory_order_relaxed) + 1;
+						StatisticalIopPcSample& sample =
+							s_statistical_iop_pc_ring[
+								sequence % STATISTICAL_IOP_PC_RING_SIZE];
+						sample.pc.store(pc, std::memory_order_relaxed);
+						sample.sequence.store(sequence,
+							std::memory_order_release);
+					}
 				}
 
 				// A fixed millisecond cadence aliases against periodic device
@@ -199,8 +226,16 @@ namespace VitaPerformanceTelemetry
 		g_cpu_stage_statistical_marker.store(
 			static_cast<u32>(CpuStage::Count),
 			std::memory_order_relaxed);
+		g_cpu_iop_statistical_pc.store(UINT32_MAX,
+			std::memory_order_relaxed);
 		s_statistical_samples.store(0, std::memory_order_relaxed);
 		s_statistical_invalid_samples.store(0, std::memory_order_relaxed);
+		s_statistical_iop_pc_sequence.store(0, std::memory_order_relaxed);
+		for (StatisticalIopPcSample& sample : s_statistical_iop_pc_ring)
+		{
+			sample.pc.store(UINT32_MAX, std::memory_order_relaxed);
+			sample.sequence.store(0, std::memory_order_relaxed);
+		}
 		for (std::atomic<u32>& samples : s_statistical_stage_samples)
 			samples.store(0, std::memory_order_relaxed);
 #if defined(__vita__)
@@ -236,6 +271,8 @@ namespace VitaPerformanceTelemetry
 		snapshot.statistical_invalid_samples =
 			s_statistical_invalid_samples.load(
 				std::memory_order_relaxed);
+		snapshot.statistical_iop_pc_sequence =
+			s_statistical_iop_pc_sequence.load(std::memory_order_relaxed);
 		for (size_t i = 0; i < CPU_STAGE_COUNT; i++)
 		{
 			snapshot.statistical_stage_samples[i] =
@@ -370,6 +407,9 @@ namespace VitaPerformanceTelemetry
 						stage_time(CpuStage::EeMemorySlowPath);
 				}
 				return stage_time(CpuStage::IopGuest) +
+					stage_time(CpuStage::IopGenerated) +
+					stage_time(CpuStage::IopProvider) +
+					stage_time(CpuStage::IopCompile) +
 					stage_time(CpuStage::IopInterpreter) +
 					stage_time(CpuStage::IopHelper) +
 					stage_time(CpuStage::IopMemorySlowPath);
@@ -442,6 +482,119 @@ namespace VitaPerformanceTelemetry
 		return {};
 #endif
 	}
+
+#if defined(VITASX2_CPU_PROFILER)
+	CpuProfileHotIopPcSnapshot GetCpuProfileHotIopPcSnapshot(
+		u64 first_sequence, u64 next_sequence)
+	{
+		CpuProfileHotIopPcSnapshot snapshot;
+		snapshot.valid = s_cpu_stage_profiler.totals.valid;
+		snapshot.first_sequence = first_sequence;
+		snapshot.next_sequence = next_sequence;
+		if (!snapshot.valid || first_sequence >= next_sequence)
+			return snapshot;
+
+		const u64 published =
+			s_statistical_iop_pc_sequence.load(std::memory_order_acquire);
+		next_sequence = std::min(next_sequence, published + 1);
+		const u64 retained_first =
+			published >= STATISTICAL_IOP_PC_RING_SIZE ?
+				published - STATISTICAL_IOP_PC_RING_SIZE + 1 : 1;
+		if (first_sequence < retained_first)
+		{
+			snapshot.dropped_samples = retained_first - first_sequence;
+			first_sequence = retained_first;
+		}
+
+		constexpr size_t CANDIDATE_COUNT = 32;
+		struct Candidate
+		{
+			u32 pc = 0;
+			u32 estimate = 0;
+			bool valid = false;
+		};
+		std::array<Candidate, CANDIDATE_COUNT> candidates{};
+		const auto read_pc = [&snapshot](u64 sequence, u32* pc) {
+			const StatisticalIopPcSample& sample =
+				s_statistical_iop_pc_ring[
+					sequence % STATISTICAL_IOP_PC_RING_SIZE];
+			const u64 before =
+				sample.sequence.load(std::memory_order_acquire);
+			const u32 value = sample.pc.load(std::memory_order_relaxed);
+			const u64 after =
+				sample.sequence.load(std::memory_order_acquire);
+			if (before != sequence || after != sequence ||
+				value == UINT32_MAX)
+			{
+				snapshot.invalid_samples++;
+				return false;
+			}
+			*pc = value;
+			return true;
+		};
+		for (u64 sequence = first_sequence;
+			sequence < next_sequence; sequence++)
+		{
+			u32 pc = 0;
+			if (!read_pc(sequence, &pc))
+				continue;
+			Candidate* empty = nullptr;
+			Candidate* least = &candidates[0];
+			bool matched = false;
+			for (Candidate& candidate : candidates)
+			{
+				if (candidate.valid && candidate.pc == pc)
+				{
+					candidate.estimate++;
+					matched = true;
+					break;
+				}
+				if (!candidate.valid && !empty)
+					empty = &candidate;
+				if (candidate.estimate < least->estimate)
+					least = &candidate;
+			}
+			if (matched)
+				continue;
+			Candidate* const target = empty ? empty : least;
+			const u32 inherited =
+				target->valid ? target->estimate : 0;
+			target->pc = pc;
+			target->estimate = inherited + 1;
+			target->valid = true;
+		}
+
+		std::array<CpuProfileHotIopPc, CANDIDATE_COUNT> exact{};
+		for (size_t i = 0; i < candidates.size(); i++)
+		{
+			if (candidates[i].valid)
+				exact[i].pc = candidates[i].pc;
+		}
+		for (u64 sequence = first_sequence;
+			sequence < next_sequence; sequence++)
+		{
+			u32 pc = 0;
+			if (!read_pc(sequence, &pc))
+				continue;
+			for (size_t i = 0; i < candidates.size(); i++)
+			{
+				if (candidates[i].valid && exact[i].pc == pc)
+				{
+					exact[i].samples++;
+					break;
+				}
+			}
+		}
+		std::sort(exact.begin(), exact.end(),
+			[](const CpuProfileHotIopPc& left,
+				const CpuProfileHotIopPc& right) {
+				return left.samples > right.samples;
+			});
+		std::copy_n(exact.begin(), snapshot.pcs.size(),
+			snapshot.pcs.begin());
+		return snapshot;
+	}
+#endif
 
 #if defined(VITASX2_CPU_PROFILER)
 	void OnEeSchedulerEntryEnabled(u32 ee_pc, u64 ee_cycle,
@@ -558,6 +711,19 @@ namespace VitaPerformanceTelemetry
 		const u32 now = ReadProcessTimeLow();
 		s_cpu_stage_profiler.totals.ee_compile_observations++;
 		s_cpu_stage_profiler.totals.ee_compile_time_us +=
+			static_cast<u32>(now - start_us);
+	}
+
+	u32 BeginExactIopCompileMeasurement()
+	{
+		return ReadProcessTimeLow();
+	}
+
+	void EndExactIopCompileMeasurement(u32 start_us)
+	{
+		const u32 now = ReadProcessTimeLow();
+		s_cpu_stage_profiler.totals.iop_compile_observations++;
+		s_cpu_stage_profiler.totals.iop_compile_time_us +=
 			static_cast<u32>(now - start_us);
 	}
 

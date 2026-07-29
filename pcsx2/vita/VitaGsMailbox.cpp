@@ -559,6 +559,9 @@ namespace MTGS
 		u32 iop_pc = 0;
 		VitaPerformanceTelemetry::CpuStageProfilerSnapshot cpu_stage_profiler;
 		VitaA32EeProviderStats ee;
+#if defined(VITASX2_CPU_PROFILER)
+		VitaA32IopProviderStats iop;
+#endif
 		VitaVU::Vu0TelemetryStats vu0;
 		VitaVU::Vu1TelemetryStats vu1;
 		VU_Thread::ProducerProfileStats mtvu{};
@@ -621,6 +624,9 @@ namespace MTGS
 		snapshot.cpu_stage_profiler =
 			VitaPerformanceTelemetry::GetCpuStageProfilerSnapshot();
 		snapshot.ee = VitaGetA32EeProviderStats();
+#if defined(VITASX2_CPU_PROFILER)
+		snapshot.iop = VitaGetA32IopProviderStats();
+#endif
 		snapshot.vu0 = VitaVU::GetVu0TelemetryStats();
 		snapshot.vu1 = VitaVU::GetVu1TelemetryStats();
 		snapshot.mtvu = vu1Thread.GetProducerProfileStats();
@@ -1161,6 +1167,23 @@ namespace MTGS
 				static_cast<unsigned long long>(stage_entry(
 					VitaPerformanceTelemetry::CpuStage::Diagnostics)));
 #if defined(VITASX2_CPU_PROFILER)
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_stage_iop "
+				"generated=%llu provider=%llu compile=%llu "
+				"interpreter=%llu helper=%llu memory_slow=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IopGenerated)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IopProvider)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IopCompile)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IopInterpreter)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IopHelper)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IopMemorySlowPath)));
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT>
 				statistical_stage_samples{};
@@ -1266,7 +1289,23 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::OtherDevice)),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::Diagnostics)));
-#endif
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_stage_statistical_iop "
+				"generated=%llu provider=%llu compile=%llu "
+				"interpreter=%llu helper=%llu memory_slow=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IopGenerated)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IopProvider)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IopCompile)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IopInterpreter)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IopHelper)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IopMemorySlowPath)));
 			const u64 ee_compile_observations = CounterDelta(
 				end.cpu_stage_profiler.ee_compile_observations,
 				start.cpu_stage_profiler.ee_compile_observations);
@@ -1282,6 +1321,61 @@ namespace MTGS
 				static_cast<unsigned long long>(ee_compile_observations ?
 					(ee_compile_time_us * 1000u) /
 						ee_compile_observations : 0));
+			const u64 iop_compile_observations = CounterDelta(
+				end.cpu_stage_profiler.iop_compile_observations,
+				start.cpu_stage_profiler.iop_compile_observations);
+			const u64 iop_compile_time_us = CounterDelta(
+				end.cpu_stage_profiler.iop_compile_time_us,
+				start.cpu_stage_profiler.iop_compile_time_us);
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=iop_compile_exact "
+				"observations=%llu time_us=%llu average_ns=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(iop_compile_observations),
+				static_cast<unsigned long long>(iop_compile_time_us),
+				static_cast<unsigned long long>(iop_compile_observations ?
+					(iop_compile_time_us * 1000u) /
+						iop_compile_observations : 0));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=iop_cache "
+				"resets_delta=%llu resets=%u used=%llu capacity=%llu "
+				"block_records=%u cache_slots=%u descriptors=%u",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(CounterDelta(
+					end.iop.code_cache_resets,
+					start.iop.code_cache_resets)),
+				end.iop.code_cache_resets,
+				static_cast<unsigned long long>(end.iop.code_cache_used),
+				static_cast<unsigned long long>(end.iop.code_cache_capacity),
+				end.iop.code_cache_block_records,
+				end.iop.code_cache_slots,
+				end.iop.semantic_block_descriptors);
+			const VitaPerformanceTelemetry::CpuProfileHotIopPcSnapshot
+				hot_iop_pcs =
+					VitaPerformanceTelemetry::GetCpuProfileHotIopPcSnapshot(
+						start.cpu_stage_profiler.statistical_iop_pc_sequence + 1,
+						end.cpu_stage_profiler.statistical_iop_pc_sequence + 1);
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_hot_iop_pc_summary "
+				"first_sequence=%llu next_sequence=%llu dropped=%llu invalid=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(hot_iop_pcs.first_sequence),
+				static_cast<unsigned long long>(hot_iop_pcs.next_sequence),
+				static_cast<unsigned long long>(hot_iop_pcs.dropped_samples),
+				static_cast<unsigned long long>(hot_iop_pcs.invalid_samples));
+			for (size_t i = 0; i < hot_iop_pcs.pcs.size(); i++)
+			{
+				const VitaPerformanceTelemetry::CpuProfileHotIopPc& hot_pc =
+					hot_iop_pcs.pcs[i];
+				if (hot_pc.samples == 0)
+					break;
+				output.WriteLn(
+					"Vita perf v=1 window=%llu kind=cpu_hot_iop_pc "
+					"rank=%u pc=0x%08x samples=%u",
+					static_cast<unsigned long long>(window),
+					static_cast<unsigned>(i + 1), hot_pc.pc,
+					hot_pc.samples);
+			}
 			const VitaPerformanceTelemetry::CpuProfileHotEdgeSnapshot hot_edges =
 				VitaPerformanceTelemetry::GetCpuProfileHotEdgeSnapshot(
 					start.cpu_stage_profiler.interval_records + 1,
@@ -1323,6 +1417,7 @@ namespace MTGS
 					static_cast<unsigned long long>(iop_edge.host_time_us),
 					static_cast<unsigned long long>(iop_edge.guest_cycles));
 			}
+#endif
 		}
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee generated_blocks=%llu host_instructions=%llu "

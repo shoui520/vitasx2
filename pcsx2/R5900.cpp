@@ -1008,7 +1008,7 @@ __fi void _cpuEventTest_Shared()
 	{
 #if defined(VITASX2_VITA)
 		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
-			VitaPerformanceTelemetry::CpuStage::IopGuest);
+			VitaPerformanceTelemetry::CpuStage::IopGenerated);
 #endif
 		//if( EEsCycle < -450 )
 		//	Console.WriteLn( " IOP ahead by: %d cycles", -EEsCycle );

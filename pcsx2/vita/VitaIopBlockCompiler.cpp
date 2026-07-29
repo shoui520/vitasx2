@@ -9505,7 +9505,16 @@ namespace VitaIOP
 		if (!block.valid || block.rec_lookup_identity == UINT32_MAX)
 			return false;
 
-		UnregisterBlockRecord(block);
+		// CompileIntoCacheEntry() retires the CachedBlock before generating its
+		// replacement. Registration has one caller, so repeating the sorted
+		// lookup/erase here only searches for a record which cannot exist.
+#if defined(VITASX2_QEMU_VALIDATION)
+		for (const BlockRecord& record : m_block_records)
+		{
+			pxAssertRel(record.block != &block,
+				"IOP block registration retained its previous record");
+		}
+#endif
 		if (m_block_records.size() >= MAX_CACHE_CAPACITY)
 			return false;
 
@@ -9525,13 +9534,7 @@ namespace VitaIOP
 
 		m_block_records.insert(
 			m_block_records.begin() + insert_index,
-			{
-			&block,
-				block.HasFragments() ? block.Fragment(0).code.EntryPoint() : nullptr,
-				block.rec_lookup_identity,
-			block.instruction_count,
-				TotalCodeSize(block),
-		});
+			{&block, block.rec_lookup_identity});
 		return true;
 	}
 
@@ -9814,45 +9817,72 @@ namespace VitaIOP
 
 	void BlockExecutor::ClearIncomingLinks() { m_incoming_links.clear(); }
 
-	void BlockExecutor::RegisterIncomingLink(CachedBlock& block, u8 slot_index,
-		const DirectLinkSlot& link)
-	{
-		const u32 target_lookup_identity = RecLookupIdentity(link.target_pc);
-		const u32 target_link_identity = RecLinkIdentity(link.target_pc);
-		if (!link.valid || target_lookup_identity == UINT32_MAX ||
-			target_link_identity == UINT32_MAX ||
-			m_incoming_links.size() >= MAX_INCOMING_LINKS)
-			return;
-
-		u32 insert_index = 0;
-		u32 insert_limit = static_cast<u32>(m_incoming_links.size());
-		while (insert_index < insert_limit)
-		{
-			const u32 mid = (insert_index + insert_limit) >> 1;
-			if (m_incoming_links[mid].target_lookup_identity <= target_lookup_identity)
-				insert_index = mid + 1;
-			else
-				insert_limit = mid;
-		}
-		m_incoming_links.insert(
-			m_incoming_links.begin() + insert_index,
-			{&block, target_lookup_identity, target_link_identity, slot_index});
-	}
-
 	void BlockExecutor::RegisterIncomingLinks(CachedBlock& block)
 	{
-		UnregisterIncomingLinks(block);
+		// The common compile seam already retired all records owned by this
+		// metadata object. Avoid a second full traversal of the incoming-link
+		// table on every cold compile.
+#if defined(VITASX2_QEMU_VALIDATION)
+		for (const IncomingLinkRecord& record : m_incoming_links)
+		{
+			pxAssertRel(record.source != &block,
+				"IOP link registration retained its previous source record");
+		}
+#endif
 
 		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Link(). Keep target-PC
 		// -> source patch-site records so invalidating a block only repairs its
 		// incoming edges. recLUT identity owns scanner/topology dependencies;
 		// HWADDR identity owns BaseBlocks::Link patching. They differ for retail
-		// 2 MiB RAM mirrors, so retain both while sorting by the former.
+		// 2 MiB RAM mirrors, so retain both while sorting by the former. Gather
+		// the bounded zero-to-two edges and merge them into the sorted table in
+		// one backwards pass instead of shifting the table once per edge.
+		std::array<IncomingLinkRecord, DIRECT_LINK_SLOT_COUNT> pending;
+		size_t pending_count = 0;
 		for (u8 i = 0; i < DIRECT_LINK_SLOT_COUNT; i++)
 		{
 			const DirectLinkSlot& link = block.direct_links.slots[i];
-			RegisterIncomingLink(block, i, link);
+			const u32 target_lookup_identity = RecLookupIdentity(link.target_pc);
+			const u32 target_link_identity = RecLinkIdentity(link.target_pc);
+			if (!link.valid || target_lookup_identity == UINT32_MAX ||
+				target_link_identity == UINT32_MAX ||
+				m_incoming_links.size() + pending_count >= MAX_INCOMING_LINKS)
+			{
+				continue;
+			}
+			pending[pending_count++] = {
+				&block, target_lookup_identity, target_link_identity, i};
 		}
+		if (pending_count == 0)
+			return;
+		if (pending_count == 2 &&
+			pending[1].target_lookup_identity <
+				pending[0].target_lookup_identity)
+		{
+			std::swap(pending[0], pending[1]);
+		}
+
+		const size_t old_size = m_incoming_links.size();
+		size_t old_index = old_size;
+		size_t pending_index = pending_count;
+		size_t write_index = old_size + pending_count;
+		m_incoming_links.resize(write_index);
+		while (old_index != 0 && pending_index != 0)
+		{
+			if (m_incoming_links[old_index - 1].target_lookup_identity >
+				pending[pending_index - 1].target_lookup_identity)
+			{
+				m_incoming_links[--write_index] =
+					m_incoming_links[--old_index];
+			}
+			else
+			{
+				m_incoming_links[--write_index] =
+					pending[--pending_index];
+			}
+		}
+		while (pending_index != 0)
+			m_incoming_links[--write_index] = pending[--pending_index];
 	}
 
 	void BlockExecutor::UnregisterIncomingLinks(CachedBlock& block)
@@ -9995,7 +10025,8 @@ namespace VitaIOP
 				continue;
 			}
 			for (u32 j = i + 1; j < m_scheduler_prediction_shadow.size(); j++)
-				m_scheduler_prediction_shadow[j - 1] = m_scheduler_prediction_shadow[j];
+				m_scheduler_prediction_shadow[j - 1] =
+					m_scheduler_prediction_shadow[j];
 			m_scheduler_prediction_shadow.back() = nullptr;
 		}
 #endif
@@ -10052,7 +10083,6 @@ namespace VitaIOP
 		block.ClearFragments();
 		block.ClearOpcodes();
 		RememberFreeCacheEntry(block);
-
 	}
 
 	bool BlockExecutor::MayInvalidateRange(u32 start_pc,
@@ -12091,6 +12121,8 @@ namespace VitaIOP
 	{
 		if (!block.valid)
 			return 0;
+		VitaPerformanceTelemetry::PublishIopGeneratedPcIfProfiling(
+			block.start_pc);
 
 		// PCSX2 owner: x86/iR3000A.cpp::_DynGen_EnterRecompiledCode() enters
 		// the selected BaseBlock directly and returns only dispatcher control.
@@ -12537,6 +12569,8 @@ namespace VitaIOP
 		ProviderCompileResult* compile_result,
 		u32* dispatch_flags)
 	{
+		const VitaPerformanceTelemetry::ScopedCpuStage provider_profile(
+			VitaPerformanceTelemetry::CpuStage::IopProvider);
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto publish_profile_metadata = [compile_result](
 												  const CachedBlock& block) {
@@ -12583,6 +12617,10 @@ namespace VitaIOP
 			executable_bytes < sizeof(u32))
 			return nullptr;
 
+		const VitaPerformanceTelemetry::ScopedCpuStage compile_profile(
+			VitaPerformanceTelemetry::CpuStage::IopCompile);
+		const VitaPerformanceTelemetry::ScopedExactIopCompileMeasurement
+			exact_compile_profile;
 		ApplyIopRecompilerEntrySideEffects(start_pc);
 		CachedBlock* block = AllocateCacheEntry();
 		if (!block)

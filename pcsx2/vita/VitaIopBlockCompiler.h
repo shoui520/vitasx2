@@ -679,6 +679,16 @@ namespace VitaIOP
 		{
 			return static_cast<u32>(m_semantic_block_descriptors.size());
 		}
+		u32 GetCodeCacheBlockRecordCount() const
+		{
+			return static_cast<u32>(m_block_records.size());
+		}
+		u32 GetCodeCacheSlotCount() const
+		{
+			return static_cast<u32>(m_cache.size());
+		}
+		size_t GetCodeCacheUsed() const { return m_code_cache_used; }
+		size_t GetCodeCacheCapacity() const { return m_code_cache_capacity; }
 #if defined(VITASX2_QEMU_VALIDATION)
 		void SnapshotInstrumentation(BlockExecutionResult* result) const;
 #endif
@@ -959,11 +969,11 @@ namespace VitaIOP
 		struct BlockRecord
 		{
 			CachedBlock* block = nullptr;
-			const void* entry_point = nullptr;
 			u32 rec_lookup_identity = UINT32_MAX;
-			u32 instruction_count = 0;
-			size_t code_size = 0;
 		};
+#if defined(__arm__)
+		static_assert(sizeof(BlockRecord) == 8);
+#endif
 
 		// PCSX2's recLUT entry is both a code pointer and the semantic fact that a
 		// BaseBlock starts at this guest word. Vita's much smaller physical code
@@ -1030,8 +1040,6 @@ namespace VitaIOP
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
 		s32 LastIncomingLinkIndex(u32 target_lookup_identity) const;
 		void ClearIncomingLinks();
-		void RegisterIncomingLink(CachedBlock& block, u8 slot_index,
-			const DirectLinkSlot& link);
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
 		CachedBlock* FindLookupBlockByStartPc(u32 start_pc,

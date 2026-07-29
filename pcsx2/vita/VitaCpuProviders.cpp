@@ -2112,6 +2112,16 @@ void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled)
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
 {
 	s_iop_a32_stats.code_cache_resets = s_iop_a32_executor.GetCodeCacheResetCount();
+	s_iop_a32_stats.code_cache_block_records =
+		s_iop_a32_executor.GetCodeCacheBlockRecordCount();
+	s_iop_a32_stats.code_cache_slots =
+		s_iop_a32_executor.GetCodeCacheSlotCount();
+	s_iop_a32_stats.semantic_block_descriptors =
+		s_iop_a32_executor.GetSemanticBlockDescriptorCount();
+	s_iop_a32_stats.code_cache_used =
+		s_iop_a32_executor.GetCodeCacheUsed();
+	s_iop_a32_stats.code_cache_capacity =
+		s_iop_a32_executor.GetCodeCacheCapacity();
 #if defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
 	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
 	// Product execution uses BlockExecutor::ExecuteProviderTimeslice(), bypassing
