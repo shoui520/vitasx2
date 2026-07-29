@@ -129,6 +129,10 @@ public:
 	void WaitVU();
 
 	void Get_MTVUChanges();
+	__fi bool HasPendingChanges() const
+	{
+		return mtvuInterrupts.load(std::memory_order_acquire) != 0;
+	}
 	__fi ProducerProfileStats GetProducerProfileStats() const
 	{
 		return {m_profile_execute_enqueues, m_profile_wait_calls,

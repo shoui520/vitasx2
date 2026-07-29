@@ -704,6 +704,12 @@ namespace MTGS
 			const u64 scheduler_entries = CounterDelta(
 				end.cpu_stage_profiler.scheduler_entries,
 				start.cpu_stage_profiler.scheduler_entries);
+			const u64 ee_full_scheduler_entries = CounterDelta(
+				end.cpu_stage_profiler.ee_full_scheduler_entries,
+				start.cpu_stage_profiler.ee_full_scheduler_entries);
+			const u64 ee_iop_only_scheduler_entries = CounterDelta(
+				end.cpu_stage_profiler.ee_iop_only_scheduler_entries,
+				start.cpu_stage_profiler.ee_iop_only_scheduler_entries);
 			const u64 stage_samples = CounterDelta(
 				end.cpu_stage_profiler.stage_samples,
 				start.cpu_stage_profiler.stage_samples);
@@ -776,6 +782,13 @@ namespace MTGS
 				static_cast<unsigned long long>(unbalanced_samples),
 				static_cast<unsigned long long>(interval_records),
 				static_cast<unsigned long long>(overwritten_interval_records));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=ee_scheduler_split "
+				"full=%llu iop_only=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(ee_full_scheduler_entries),
+				static_cast<unsigned long long>(
+					ee_iop_only_scheduler_entries));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_deadline_shadow "
 				"iop_checks=%llu iop_skips=%llu iop_dispatches=%llu "

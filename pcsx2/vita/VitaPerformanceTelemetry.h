@@ -109,6 +109,8 @@ namespace VitaPerformanceTelemetry
 	{
 		bool valid = false;
 		u64 scheduler_entries = 0;
+		u64 ee_full_scheduler_entries = 0;
+		u64 ee_iop_only_scheduler_entries = 0;
 		u64 stage_samples = 0;
 		u64 unbalanced_samples = 0;
 		u64 interval_records = 0;
@@ -191,6 +193,7 @@ namespace VitaPerformanceTelemetry
 	void RecordEeDeadlineHorizon(s64 owner_horizon_delta,
 		EeDeadlineOwner owner, s32 ee_iop_balance, bool timer_enabled,
 		u32 timer_delta, bool iop_rapid);
+	void RecordEeSchedulerPath(bool iop_only);
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
 		u32 iop_pc, u64 iop_cycle)
@@ -279,6 +282,16 @@ namespace VitaPerformanceTelemetry
 		(void)timer_enabled;
 		(void)timer_delta;
 		(void)iop_rapid;
+#endif
+	}
+
+	inline void RecordEeSchedulerPathIfProfiling(bool iop_only)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordEeSchedulerPath(iop_only);
+#else
+		(void)iop_only;
 #endif
 	}
 

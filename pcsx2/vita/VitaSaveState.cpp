@@ -20,6 +20,7 @@
 #include "MTVU.h"
 #include "Memory.h"
 #include "R3000A.h"
+#include "R5900.h"
 #include "SIO/Multitap/MultitapProtocol.h"
 #include "SIO/Pad/Pad.h"
 #include "SIO/Sio.h"
@@ -821,6 +822,13 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	Freeze(nextStartCounter);
 	Freeze(psxNextStartCounter);
 	Freeze(psxNextDeltaCounter);
+	if (!IsSaving())
+	{
+		// The split EE architectural/interleave deadlines are a host scheduling
+		// cache, not PS2 state. Force one ordinary scheduler pass after load so
+		// every owner is reconstructed from the restored PCSX2 state.
+		cpuSetEvent();
+	}
 
 	if (!FreezeTag("EE-Subsystems"))
 		return false;

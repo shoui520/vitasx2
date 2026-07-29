@@ -42,6 +42,8 @@
 
 #include "fmt/format.h"
 
+#include <limits>
+
 using namespace R5900;	// for R5900 disasm tools
 
 static __fi void NotifyEeRamHostWrite(const void* address, u32 size)
@@ -64,8 +66,26 @@ cachedTlbs_t cachedTlbs;
 R5900cpu *Cpu = NULL;
 
 static constexpr uint eeWaitCycles = 3072;
+static bool cpuIntsEnabled(int Interrupt);
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 static constexpr uint eeRetainedIopWaitCycles = eeWaitCycles * 2;
+static u64 s_vita_ee_owner_event_cycle;
+static bool s_vita_next_event_iop_only;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+bool g_vita_ee_interleave_scheduler_validation_enabled = false;
+u64 g_vita_ee_full_scheduler_validation_entries = 0;
+u64 g_vita_ee_iop_only_scheduler_validation_entries = 0;
+#endif
+
+static __fi bool VitaEeInterleaveSchedulerActive()
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	return g_vita_ee_interleave_scheduler_validation_enabled;
+#else
+	return true;
+#endif
+}
 
 static __fi bool VitaCanCoalesceRetainedIopWait()
 {
@@ -74,6 +94,120 @@ static __fi bool VitaCanCoalesceRetainedIopWait()
 	// interrupt is enabled.
 	return VitaA32IopRetainedWaitCoalescingActive() &&
 		(cpuRegs.CP0.n.Status.val & 0x8000u) == 0;
+}
+
+static __fi u32 VitaEeInterleaveCycles()
+{
+	return VitaCanCoalesceRetainedIopWait() ?
+		eeRetainedIopWaitCycles : eeWaitCycles;
+}
+
+static __fi void VitaResetEeDeadlineState(u64 deadline)
+{
+	s_vita_ee_owner_event_cycle = deadline;
+	s_vita_next_event_iop_only = false;
+}
+
+static __fi void VitaBeginFullEeDeadlineCollection()
+{
+	// PCSX2's scheduler reconstructs its next owner from the callbacks and
+	// counters it services below. Keep that owner separately from the bounded
+	// EE/IOP execution seam so an ordinary IOP slice need not poll every EE
+	// owner.
+	s_vita_ee_owner_event_cycle =
+		cpuRegs.cycle + static_cast<u32>(std::numeric_limits<s32>::max());
+	s_vita_next_event_iop_only = false;
+	cpuRegs.nextEventCycle = cpuRegs.cycle + VitaEeInterleaveCycles();
+}
+
+static __fi void VitaRefreshEeCounterOwner()
+{
+	// Counters.cpp owns this canonical absolute deadline. Counter register and
+	// video-timing changes normally publish it through cpuSetNextEvent(), but
+	// the representation can also be rebuilt while an older event deadline is
+	// already due. Treat the canonical pair as an explicit calendar slot at
+	// every scheduler boundary so a missed narrowing can cause one extra full
+	// pass, never suppress HSync/VSync behind an IOP-only seam.
+	if (static_cast<s32>(
+			s_vita_ee_owner_event_cycle - nextStartCounter) >
+		nextDeltaCounter)
+	{
+		s_vita_ee_owner_event_cycle =
+			nextStartCounter + nextDeltaCounter;
+	}
+
+	if (static_cast<s32>(
+			s_vita_ee_owner_event_cycle - cpuRegs.nextEventCycle) <= 0)
+	{
+		s_vita_next_event_iop_only = false;
+	}
+}
+
+static __fi void VitaScheduleEeAndIopDeadlines(s32 iop_owner_delta)
+{
+	const s32 iop_delta = std::min(
+		iop_owner_delta, static_cast<s32>(VitaEeInterleaveCycles()));
+	cpuRegs.nextEventCycle = s_vita_ee_owner_event_cycle;
+	if (static_cast<s32>(
+			s_vita_ee_owner_event_cycle - cpuRegs.cycle) > iop_delta)
+	{
+		cpuRegs.nextEventCycle = cpuRegs.cycle + iop_delta;
+		// Only an IOP-owned boundary strictly before every retained EE owner
+		// may use the narrow scheduler. Equal deadlines belong to the EE owner.
+		s_vita_next_event_iop_only =
+			(cpuRegs.CP0.n.Status.val & 0x8000u) == 0;
+	}
+	else
+	{
+		s_vita_next_event_iop_only = false;
+	}
+}
+
+static __fi bool VitaCanSkipEeOwnersAtInterleave()
+{
+	// The Counters.cpp start/delta pair is the semantic authority. A producer
+	// ordinarily narrows the cached slot, and VitaRefreshEeCounterOwner()
+	// repairs a rebuilt future slot. Still fail closed when the canonical
+	// counter is already due: initialization and a past-target rebuild can
+	// occur while an older branch deadline is also due, where a narrowing-only
+	// publication is intentionally ignored by PCSX2's cpuSetNextEvent().
+	if (cpuTestCycle(nextStartCounter, nextDeltaCounter) ||
+		(cpuRegs.CP0.n.Status.val & 0x8000u) != 0 ||
+		static_cast<s32>(
+			s_vita_ee_owner_event_cycle - cpuRegs.cycle) <= 0 ||
+		!VitaEeInterleaveSchedulerActive())
+	{
+		return false;
+	}
+
+	const u32 vu_running = VU0.VI[REG_VPU_STAT].UL;
+	if ((vu_running & 1u) != 0 ||
+		(!THREAD_VU1 && (vu_running & 0x100u) != 0) ||
+		(THREAD_VU1 && vu1Thread.HasPendingChanges()))
+	{
+		return false;
+	}
+
+	// A visible CPU exception is not an interleave-only owner, even if a
+	// producer failed to narrow the cached deadline. Likewise, the BIOS
+	// instant-DMA compatibility path intentionally services pending work
+	// without waiting for its nominal deadline.
+	const uint exception_mask = intcInterrupt() | dmacInterrupt();
+	if (cpuIntsEnabled(exception_mask) ||
+		(CHECK_INSTANTDMAHACK && (cpuRegs.interrupt & 0x1ffffu) != 0))
+	{
+		return false;
+	}
+
+	return true;
+}
+
+static __fi bool VitaCanRunIopOnlyEeInterleave()
+{
+	return s_vita_next_event_iop_only &&
+		static_cast<s32>(
+			cpuRegs.cycle - cpuRegs.nextEventCycle) >= 0 &&
+		VitaCanSkipEeOwnersAtInterleave();
 }
 
 static __attribute__((noinline, cold))
@@ -96,6 +230,15 @@ static __fi s32 VitaScaleIopEventDeltaToEe(u64 iop_cycles)
 		return static_cast<s32>(iop_cycles * 8u);
 
 	return VitaScaleNonstandardIopEventDeltaToEe(iop_cycles);
+}
+
+static __fi s32 VitaNextIopOwnerDelta()
+{
+	const s32 next_iop_event_delta =
+		VitaScaleIopEventDeltaToEe(
+			psxRegs.iopNextEventCycle - psxRegs.cycle);
+	return EEsCycle >= next_iop_event_delta ?
+		48 : next_iop_event_delta - EEsCycle;
 }
 #endif
 
@@ -173,6 +316,9 @@ void cpuReset()
 	fpuRegs.fprc[31]		= 0x01000001; // fpu Status/Control
 
 	cpuRegs.nextEventCycle = cpuRegs.cycle + 4;
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	VitaResetEeDeadlineState(cpuRegs.nextEventCycle);
+#endif
 	EEsCycle = 0;
 	EEoCycle = cpuRegs.cycle;
 
@@ -301,6 +447,20 @@ __fi void cpuSetNextEvent( u64 startCycle, s32 delta )
 	{
 		cpuRegs.nextEventCycle = startCycle + delta;
 	}
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	if (VitaEeInterleaveSchedulerActive() &&
+		static_cast<s32>(
+			s_vita_ee_owner_event_cycle - startCycle) > delta)
+	{
+		s_vita_ee_owner_event_cycle = startCycle + delta;
+	}
+	if (VitaEeInterleaveSchedulerActive() &&
+		static_cast<s32>(
+			s_vita_ee_owner_event_cycle - cpuRegs.nextEventCycle) <= 0)
+	{
+		s_vita_next_event_iop_only = false;
+	}
+#endif
 }
 
 // sets a branch to occur some time from the current cycle
@@ -335,6 +495,10 @@ __fi int cpuTestCycle( u64 startCycle, s32 delta )
 __fi void cpuSetEvent()
 {
 	cpuRegs.nextEventCycle = cpuRegs.cycle;
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	if (VitaEeInterleaveSchedulerActive())
+		VitaResetEeDeadlineState(cpuRegs.cycle);
+#endif
 }
 
 __fi void cpuClearInt( uint i )
@@ -647,10 +811,28 @@ __fi void _cpuEventTest_Shared()
 #endif
 	eeEventTestIsActive = true;
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-	cpuRegs.nextEventCycle = cpuRegs.cycle +
-		(VitaCanCoalesceRetainedIopWait() ?
-				eeRetainedIopWaitCycles :
-				eeWaitCycles);
+	VitaRefreshEeCounterOwner();
+	const bool vita_iop_only_interleave =
+		VitaCanRunIopOnlyEeInterleave();
+	VitaPerformanceTelemetry::RecordEeSchedulerPathIfProfiling(
+		vita_iop_only_interleave);
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (VitaEeInterleaveSchedulerActive())
+	{
+		if (vita_iop_only_interleave)
+			g_vita_ee_iop_only_scheduler_validation_entries++;
+		else
+			g_vita_ee_full_scheduler_validation_entries++;
+	}
+#endif
+	if (!vita_iop_only_interleave)
+	{
+		if (VitaEeInterleaveSchedulerActive())
+			VitaBeginFullEeDeadlineCollection();
+		else
+			cpuRegs.nextEventCycle =
+				cpuRegs.cycle + VitaEeInterleaveCycles();
+	}
 #else
 	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
 #endif
@@ -666,6 +848,9 @@ __fi void _cpuEventTest_Shared()
 	// cycles (fixes Grandia II [PAL], which does a spin loop on a vsync and expects to
 	// be able to read the value before the exception handler clears it).
 
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	if (!vita_iop_only_interleave)
+#endif
 	{
 #if defined(VITASX2_VITA)
 		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
@@ -754,6 +939,38 @@ __fi void _cpuEventTest_Shared()
 	iopEventTest();
 #endif
 
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	if (vita_iop_only_interleave)
+	{
+		if (VitaCanSkipEeOwnersAtInterleave())
+		{
+			// Recompute the PCSX2 IOP owner after its guest slice and due-owner
+			// gate, then retain unrelated EE owners until their exact deadline.
+			// The active-IOP cadence remains a bounded IOP-owned seam.
+			VitaScheduleEeAndIopDeadlines(VitaNextIopOwnerDelta());
+		}
+		else
+		{
+			// IOP work can make an EE exception or compatibility owner visible.
+			// Re-enter the complete scheduler immediately, before another guest
+			// EE instruction can execute, rather than continuing after the
+			// exception scan which this narrow entry deliberately skipped.
+			cpuSetEvent();
+		}
+#if defined(VITASX2_QEMU_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+		Pcsx2Trace::RecordPendingMachineCheckpointAtEventTest();
+#endif
+		eeEventTestIsActive = false;
+		VitaPerformanceTelemetry::OnEeSchedulerExit();
+#if defined(__arm__)
+		ReturnFromPrivateCpuEventTestShared();
+#else
+		return;
+#endif
+	}
+#endif
+
 	{
 #if defined(VITASX2_VITA)
 		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
@@ -828,13 +1045,11 @@ __fi void _cpuEventTest_Shared()
 			VitaPerformanceTelemetry::CpuStage::Deadline);
 #endif
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-		const int nextIopEventDelta =
-			VitaScaleIopEventDeltaToEe(psxRegs.iopNextEventCycle - psxRegs.cycle);
+		const s32 iop_owner_delta = VitaNextIopOwnerDelta();
 #else
 		const float mutiplier = static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
 		const int nextIopEventDelta =
 			((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier);
-#endif
 		// 8 or more cycles behind and there's an event scheduled
 		if (EEsCycle >= nextIopEventDelta)
 		{
@@ -847,28 +1062,40 @@ __fi void _cpuEventTest_Shared()
 		else
 		{
 			// Otherwise IOP is caught up/not doing anything so we can wait for the next event.
-#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-			cpuSetNextEventDelta(nextIopEventDelta - EEsCycle);
-#else
 			cpuSetNextEventDelta(((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier) - EEsCycle);
-#endif
 		}
+#endif
 
 #if defined(VITASX2_CPU_PROFILER)
 		VitaRecordEeDeadlineHorizon(
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+			iop_owner_delta,
+			iop_owner_delta == 48);
+#else
 			EEsCycle >= nextIopEventDelta ?
 				48 : nextIopEventDelta - EEsCycle,
 			EEsCycle >= nextIopEventDelta);
+#endif
 #endif
 
 		// Apply vsync and other counter nextCycles
 		cpuSetNextEvent(nextStartCounter, nextDeltaCounter);
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-		// IOP callbacks, interrupts, or source invalidation above may revoke the
-		// retained wait. Do not carry a coalesced arbitrary EE seam into ordinary
-		// execution (or across an enabled CP0 timer compare).
-		if (!VitaCanCoalesceRetainedIopWait())
-			cpuSetNextEventDelta(eeWaitCycles);
+		if (VitaEeInterleaveSchedulerActive())
+		{
+			// CPU_INT(), INTC/DMAC tests and counters publish EE owners through
+			// cpuSetNextEvent(). The IOP deadline is deliberately kept separate,
+			// so an IOP-owned boundary can avoid rebuilding unrelated EE owners.
+			VitaScheduleEeAndIopDeadlines(iop_owner_delta);
+		}
+		else
+		{
+			// Focused validation can disable the split calendar while retaining
+			// the pre-existing Vita scheduler contract as its matched control.
+			cpuSetNextEventDelta(iop_owner_delta);
+			if (!VitaCanCoalesceRetainedIopWait())
+				cpuSetNextEventDelta(eeWaitCycles);
+		}
 #endif
 #if defined(VITASX2_VITA)
 		VitaPerformanceTelemetry::EndCpuStageIfSampling();

@@ -499,5 +499,13 @@ namespace VitaPerformanceTelemetry
 				totals.ee_iop_ahead_gt_3072++;
 		}
 	}
+
+	void RecordEeSchedulerPath(bool iop_only)
+	{
+		if (iop_only)
+			s_cpu_stage_profiler.totals.ee_iop_only_scheduler_entries++;
+		else
+			s_cpu_stage_profiler.totals.ee_full_scheduler_entries++;
+	}
 #endif
 }
