@@ -842,6 +842,8 @@ namespace MTGS
 				spu2_mixer_silent_reverb_range_rejects);
 			EE_DEADLINE_DELTA(
 				spu2_mixer_silent_reverb_state_rejects);
+			EE_DEADLINE_DELTA(spu2_stopped_voice_batch_calls);
+			EE_DEADLINE_DELTA(spu2_stopped_voice_batch_samples);
 #endif
 #undef EE_DEADLINE_DELTA
 			output.WriteLn(
@@ -1002,7 +1004,9 @@ namespace MTGS
 				" silent_reverb_input_rejects=%llu" \
 				" silent_reverb_irq_rejects=%llu" \
 				" silent_reverb_range_rejects=%llu" \
-				" silent_reverb_state_rejects=%llu"
+				" silent_reverb_state_rejects=%llu" \
+				" stopped_voice_batch_calls=%llu" \
+				" stopped_voice_batch_samples=%llu"
 #define SPU2_SILENT_REVERB_ARGUMENTS \
 				, static_cast<unsigned long long>( \
 					spu2_mixer_silent_reverb_samples) \
@@ -1013,7 +1017,11 @@ namespace MTGS
 				, static_cast<unsigned long long>( \
 					spu2_mixer_silent_reverb_range_rejects) \
 				, static_cast<unsigned long long>( \
-					spu2_mixer_silent_reverb_state_rejects)
+					spu2_mixer_silent_reverb_state_rejects) \
+				, static_cast<unsigned long long>( \
+					spu2_stopped_voice_batch_calls) \
+				, static_cast<unsigned long long>( \
+					spu2_stopped_voice_batch_samples)
 #else
 #define SPU2_SILENT_REVERB_FORMAT
 #define SPU2_SILENT_REVERB_ARGUMENTS

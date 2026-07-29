@@ -1015,5 +1015,12 @@ namespace VitaPerformanceTelemetry
 		totals.spu2_mixer_silent_reverb_state_rejects +=
 			silent_reverb_state_rejects;
 	}
+
+	void RecordSpu2StoppedVoiceBatch(u32 samples)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.spu2_stopped_voice_batch_calls++;
+		totals.spu2_stopped_voice_batch_samples += samples;
+	}
 #endif
 }

@@ -1524,6 +1524,179 @@ static void ProbeSpu2MixerState()
 }
 #endif
 
+bool TryMixStoppedVoiceBatch(u32 sample_count)
+{
+	if (sample_count < 16 ||
+		!g_spu2AllVoicesStoppedWithoutSlides ||
+		Cores[0].IRQEnable || Cores[1].IRQEnable)
+	{
+		return false;
+	}
+
+	VitaPerformanceTelemetry::RecordSpu2StoppedVoiceBatchIfProfiling(
+		sample_count);
+
+	for (u32 sample = 0; sample < sample_count; ++sample)
+	{
+		if (sample != 0)
+			Cycles++;
+
+#if defined(VITASX2_CPU_PROFILER)
+		ProbeSpu2MixerState();
+		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+			VitaPerformanceTelemetry::CpuStage::Spu2Input);
+#endif
+		const StereoOut32 input0 =
+			ApplyVolume(Cores[0].ReadInput(), Cores[0].InpVol);
+		const StereoOut32 input1 = (PlayMode & 8) ?
+			StereoOut32::Empty :
+			ApplyVolume(Cores[1].ReadInput(), Cores[1].InpVol);
+
+#if defined(VITASX2_CPU_PROFILER)
+		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+			VitaPerformanceTelemetry::CpuStage::Spu2Voices);
+#endif
+		for (u32 coreidx = 0; coreidx < 2; ++coreidx)
+		{
+			if (s_fully_equivalent_stopped_voice_core_mask &
+				(1u << coreidx))
+			{
+				AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
+					coreidx);
+			}
+			else if (s_equivalent_stopped_voice_core_mask &
+					 (1u << coreidx))
+			{
+				AdvanceGroupedStoppedCoreVoicesWithoutIrq(coreidx);
+			}
+			else
+			{
+				AdvanceStoppedCoreVoicesWithoutIrq(coreidx);
+			}
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSpu2StoppedVoiceFastSamples++;
+#endif
+
+#if defined(VITASX2_CPU_PROFILER)
+		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+			VitaPerformanceTelemetry::CpuStage::Spu2Core);
+#endif
+		V_Core& core0 = Cores[0];
+		if (core0.MasterVol.HasActiveSlide())
+		{
+			core0.MasterVol.Update();
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSpu2MasterVolumeSlideUpdated++;
+#endif
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		else
+		{
+			g_qemuSpu2MasterVolumeSlideSkipped++;
+		}
+#endif
+		UpdateNoise(core0);
+
+		// PCSX2 MixCore() publishes the clamped dry/wet voice sums even when
+		// they are zero. IRQs are proven disabled, so these mixer-owned RAM
+		// windows need neither address tests nor cache invalidation.
+		_spu2mem[0x1000 + OutPos] = 0;
+		_spu2mem[0x1200 + OutPos] = 0;
+		_spu2mem[0x1400 + OutPos] = 0;
+		_spu2mem[0x1600 + OutPos] = 0;
+
+		const StereoOut32 core0_dry(
+			input0.Left & core0.DryGate.InpL,
+			input0.Right & core0.DryGate.InpR);
+		const StereoOut32 core0_wet(
+			input0.Left & core0.WetGate.InpL,
+			input0.Right & core0.WetGate.InpR);
+#if defined(VITASX2_CPU_PROFILER)
+		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+			VitaPerformanceTelemetry::CpuStage::Spu2Reverb);
+#endif
+		const StereoOut32 core0_reverb = core0.DoReverb(core0_wet);
+#if defined(VITASX2_CPU_PROFILER)
+		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+			VitaPerformanceTelemetry::CpuStage::Spu2Core);
+#endif
+		StereoOut32 ext =
+			core0_dry + ApplyVolume(core0_reverb, core0.FxVol);
+		if ((PlayMode & 4) || core0.Mute != 0)
+			ext = StereoOut32::Empty;
+		else
+			ext = ApplyVolume(clamp_mix(ext), core0.MasterVol);
+
+		_spu2mem[0x800 + OutPos] = static_cast<s16>(ext.Left);
+		_spu2mem[0xa00 + OutPos] = static_cast<s16>(ext.Right);
+
+		V_Core& core1 = Cores[1];
+		const StereoOut32 core1_ext = ApplyVolume(ext, core1.ExtVol);
+		if (core1.MasterVol.HasActiveSlide())
+		{
+			core1.MasterVol.Update();
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSpu2MasterVolumeSlideUpdated++;
+#endif
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		else
+		{
+			g_qemuSpu2MasterVolumeSlideSkipped++;
+		}
+#endif
+		UpdateNoise(core1);
+		_spu2mem[0x1800 + OutPos] = 0;
+		_spu2mem[0x1a00 + OutPos] = 0;
+		_spu2mem[0x1c00 + OutPos] = 0;
+		_spu2mem[0x1e00 + OutPos] = 0;
+
+		const StereoOut32 core1_dry(
+			(input1.Left & core1.DryGate.InpL) +
+				(core1_ext.Left & core1.DryGate.ExtL),
+			(input1.Right & core1.DryGate.InpR) +
+				(core1_ext.Right & core1.DryGate.ExtR));
+		const StereoOut32 core1_wet(
+			(input1.Left & core1.WetGate.InpL) +
+				(core1_ext.Left & core1.WetGate.ExtL),
+			(input1.Right & core1.WetGate.InpR) +
+				(core1_ext.Right & core1.WetGate.ExtR));
+#if defined(VITASX2_CPU_PROFILER)
+		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+			VitaPerformanceTelemetry::CpuStage::Spu2Reverb);
+#endif
+		const StereoOut32 core1_reverb = core1.DoReverb(core1_wet);
+#if defined(VITASX2_CPU_PROFILER)
+		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+			VitaPerformanceTelemetry::CpuStage::Spu2Core);
+#endif
+		StereoOut32 out =
+			core1_dry + ApplyVolume(core1_reverb, core1.FxVol);
+		if (PlayMode & 8)
+			out = core1.ReadInput_HiFi();
+		else
+			out = ApplyVolume(clamp_mix(out), core1.MasterVol);
+
+#if defined(VITASX2_CPU_PROFILER)
+		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+			VitaPerformanceTelemetry::CpuStage::Spu2Output);
+#endif
+		Pcsx2Trace::RecordSpu2OutputSample(Cycles, ext, out, out);
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSpu2OutputHash ^= static_cast<u32>(out.Left);
+		g_qemuSpu2OutputHash *= 1099511628211ull;
+		g_qemuSpu2OutputHash ^= static_cast<u32>(out.Right);
+		g_qemuSpu2OutputHash *= 1099511628211ull;
+		g_qemuSpu2OutputSamples++;
+#endif
+		spu2Output(out);
+		OutPos = (OutPos + 1u) & 0x1ffu;
+	}
+
+	return true;
+}
+
 void spu2Mix()
 {
 #if defined(VITASX2_CPU_PROFILER)

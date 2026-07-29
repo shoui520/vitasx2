@@ -441,6 +441,23 @@ __forceinline void TimeUpdate(u32 cClocks)
 #endif
 		g_spu2AllVoicesStoppedWithoutSlides =
 			all_voices_stopped_without_slides;
+		if (equivalent_stopped_voice_batch_started &&
+			all_voices_stopped_without_slides)
+		{
+			const u32 batch_sample_count =
+				(dClocks / TickInterval) + 1u;
+			if (MULTI_ISA_SELECT(TryMixStoppedVoiceBatch)(
+					batch_sample_count))
+			{
+				const u32 future_samples =
+					batch_sample_count - 1u;
+				const u32 future_clocks =
+					future_samples * TickInterval;
+				dClocks -= future_clocks;
+				lClocks += future_clocks;
+				break;
+			}
+		}
 		spu2Mix();
 	}
 	if (equivalent_stopped_voice_batch_started)
