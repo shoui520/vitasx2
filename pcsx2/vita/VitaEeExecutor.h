@@ -399,7 +399,6 @@ namespace VitaEE
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
 		s32 LastIncomingLinkIndex(u32 target_pc) const;
 		void ClearIncomingLinks();
-		void RegisterIncomingLink(CachedBlock& block, u8 slot_index, const DirectLinkSlot& link);
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
 		bool CachedBlockHasDirectSourceSpan(const CachedBlock& block) const;

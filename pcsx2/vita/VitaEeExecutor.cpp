@@ -235,7 +235,7 @@ namespace VitaEE
 	BlockExecutor::BlockExecutor()
 	{
 		// These bounds are already enforced by AllocateCacheEntry() and
-		// RegisterIncomingLink(). Reserve the complete process-lifetime metadata
+		// RegisterIncomingLinks(). Reserve the complete process-lifetime metadata
 		// topology before guest execution so ordinary cold compilation never grows
 		// these vectors from a fragmented game-time heap.
 		m_cache.reserve(MAX_CACHE_CAPACITY);
@@ -924,39 +924,61 @@ namespace VitaEE
 		m_incoming_links.clear();
 	}
 
-	void BlockExecutor::RegisterIncomingLink(CachedBlock& block, u8 slot_index, const DirectLinkSlot& link)
-	{
-		if (!link.valid || (link.target_pc & u32{3}) != 0 ||
-			slot_index >= DIRECT_LINK_SLOT_COUNT ||
-			m_incoming_links.size() >= MAX_INCOMING_LINKS)
-			return;
-
-		u32 insert_index = 0;
-		u32 insert_limit = static_cast<u32>(m_incoming_links.size());
-		while (insert_index < insert_limit)
-		{
-			const u32 mid = (insert_index + insert_limit) >> 1;
-			if (m_incoming_links[mid].TargetPc() <= link.target_pc)
-				insert_index = mid + 1;
-			else
-				insert_limit = mid;
-		}
-		m_incoming_links.insert(m_incoming_links.begin() + insert_index, {&block, link.target_pc, slot_index});
-	}
-
 	void BlockExecutor::RegisterIncomingLinks(CachedBlock& block)
 	{
-		UnregisterIncomingLinks(block);
-
 		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Link(). The x86
 		// provider stores target-PC -> patch-site records so New()/Remove()
 		// only touch incoming edges for the affected block. Keep Vita's vector
 		// sorted by target PC so the common patch/unlink path does the same.
+		//
+		// CompileIntoCacheEntry() invalidates a reused entry before rebuilding it,
+		// which already unregisters all of its old records. Registration is only
+		// called after that rebuild succeeds, so another whole-vector removal scan
+		// here made every cold compile progressively more expensive. Gather the
+		// block's bounded two edges and merge them into the sorted table in one
+		// backwards pass instead of shifting the table once per edge.
+		std::array<IncomingLinkRecord, DIRECT_LINK_SLOT_COUNT> pending;
+		size_t pending_count = 0;
 		for (u8 i = 0; i < DIRECT_LINK_SLOT_COUNT; i++)
 		{
 			const DirectLinkSlot& link = block.direct_links.slots[i];
-			RegisterIncomingLink(block, i, link);
+			if (!link.valid || (link.target_pc & u32{3}) != 0)
+				continue;
+			if (m_incoming_links.size() + pending_count >= MAX_INCOMING_LINKS)
+				break;
+			pending[pending_count++] = {&block, link.target_pc, i};
 		}
+
+		if (pending_count == 0)
+			return;
+		if (pending_count == 2 &&
+			pending[1].TargetPc() < pending[0].TargetPc())
+		{
+			std::swap(pending[0], pending[1]);
+		}
+
+		const size_t old_size = m_incoming_links.size();
+		size_t old_index = old_size;
+		size_t pending_index = pending_count;
+		size_t write_index = old_size + pending_count;
+		m_incoming_links.resize(write_index);
+
+		while (old_index != 0 && pending_index != 0)
+		{
+			if (m_incoming_links[old_index - 1].TargetPc() >
+				pending[pending_index - 1].TargetPc())
+			{
+				m_incoming_links[--write_index] =
+					m_incoming_links[--old_index];
+			}
+			else
+			{
+				m_incoming_links[--write_index] =
+					pending[--pending_index];
+			}
+		}
+		while (pending_index != 0)
+			m_incoming_links[--write_index] = pending[--pending_index];
 	}
 
 	void BlockExecutor::UnregisterIncomingLinks(CachedBlock& block)
