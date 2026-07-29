@@ -547,8 +547,21 @@ static __fi void VitaIopEventTestFromEe()
 		intc_visible;
 
 #if defined(VITASX2_CPU_PROFILER)
+	bool callback_due = false;
+	for (u32 event = IopEvt_SIF2; event <= IopEvt_USB; event++)
+	{
+		if ((psxRegs.interrupt & (1u << event)) != 0 &&
+			static_cast<s64>(
+				psxRegs.cycle -
+				(psxRegs.sCycle[event] + psxRegs.eCycle[event])) >= 0)
+		{
+			callback_due = true;
+			break;
+		}
+	}
 	VitaPerformanceTelemetry::RecordIopDeadlineGateIfProfiling(
-		dispatch, counter_precedes_published);
+		dispatch, deadline_due, counter_due, counter_precedes_published,
+		intc_visible, callback_due);
 #endif
 	if (dispatch)
 		iopEventTest();

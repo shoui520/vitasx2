@@ -109,6 +109,11 @@ namespace VitaPerformanceTelemetry
 		u64 iop_deadline_gate_skips = 0;
 		u64 iop_deadline_gate_dispatches = 0;
 		u64 iop_deadline_shadow_late = 0;
+		u64 iop_deadline_due = 0;
+		u64 iop_counter_due = 0;
+		u64 iop_intc_visible = 0;
+		u64 iop_callback_due = 0;
+		u64 iop_manufactured_only = 0;
 		std::array<u64, CPU_STAGE_COUNT> stage_time_us{};
 		std::array<u64, CPU_STAGE_COUNT> stage_entries{};
 	};
@@ -156,7 +161,9 @@ namespace VitaPerformanceTelemetry
 	void BeginCpuStage(CpuStage stage);
 	void EndCpuStage();
 	void CountCpuStageEntry(CpuStage stage);
-	void RecordIopDeadlineGate(bool dispatched, bool shadow_late);
+	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
+		bool counter_due, bool counter_precedes_published, bool intc_visible,
+		bool callback_due);
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
 		u32 iop_pc, u64 iop_cycle)
@@ -209,14 +216,22 @@ namespace VitaPerformanceTelemetry
 	}
 
 	inline void RecordIopDeadlineGateIfProfiling(
-		bool dispatched, bool shadow_late)
+		bool dispatched, bool deadline_due, bool counter_due,
+		bool counter_precedes_published, bool intc_visible, bool callback_due)
 	{
 #if defined(VITASX2_CPU_PROFILER)
 		if (g_cpu_stage_profiler_enabled)
-			RecordIopDeadlineGate(dispatched, shadow_late);
+		{
+			RecordIopDeadlineGate(dispatched, deadline_due, counter_due,
+				counter_precedes_published, intc_visible, callback_due);
+		}
 #else
 		(void)dispatched;
-		(void)shadow_late;
+		(void)deadline_due;
+		(void)counter_due;
+		(void)counter_precedes_published;
+		(void)intc_visible;
+		(void)callback_due;
 #endif
 	}
 

@@ -417,15 +417,30 @@ namespace VitaPerformanceTelemetry
 			static_cast<size_t>(stage)]++;
 	}
 
-	void RecordIopDeadlineGate(bool dispatched, bool shadow_late)
+	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
+		bool counter_due, bool counter_precedes_published, bool intc_visible,
+		bool callback_due)
 	{
 		s_cpu_stage_profiler.totals.iop_deadline_gate_checks++;
 		if (dispatched)
 			s_cpu_stage_profiler.totals.iop_deadline_gate_dispatches++;
 		else
 			s_cpu_stage_profiler.totals.iop_deadline_gate_skips++;
-		if (shadow_late)
+		if (counter_precedes_published)
 			s_cpu_stage_profiler.totals.iop_deadline_shadow_late++;
+		if (deadline_due)
+			s_cpu_stage_profiler.totals.iop_deadline_due++;
+		if (counter_due)
+			s_cpu_stage_profiler.totals.iop_counter_due++;
+		if (intc_visible)
+			s_cpu_stage_profiler.totals.iop_intc_visible++;
+		if (callback_due)
+			s_cpu_stage_profiler.totals.iop_callback_due++;
+		if (deadline_due && !counter_due && !counter_precedes_published &&
+			!intc_visible && !callback_due)
+		{
+			s_cpu_stage_profiler.totals.iop_manufactured_only++;
+		}
 	}
 #endif
 }

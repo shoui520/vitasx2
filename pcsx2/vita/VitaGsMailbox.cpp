@@ -728,6 +728,21 @@ namespace MTGS
 			const u64 iop_deadline_shadow_late = CounterDelta(
 				end.cpu_stage_profiler.iop_deadline_shadow_late,
 				start.cpu_stage_profiler.iop_deadline_shadow_late);
+			const u64 iop_deadline_due = CounterDelta(
+				end.cpu_stage_profiler.iop_deadline_due,
+				start.cpu_stage_profiler.iop_deadline_due);
+			const u64 iop_counter_due = CounterDelta(
+				end.cpu_stage_profiler.iop_counter_due,
+				start.cpu_stage_profiler.iop_counter_due);
+			const u64 iop_intc_visible = CounterDelta(
+				end.cpu_stage_profiler.iop_intc_visible,
+				start.cpu_stage_profiler.iop_intc_visible);
+			const u64 iop_callback_due = CounterDelta(
+				end.cpu_stage_profiler.iop_callback_due,
+				start.cpu_stage_profiler.iop_callback_due);
+			const u64 iop_manufactured_only = CounterDelta(
+				end.cpu_stage_profiler.iop_manufactured_only,
+				start.cpu_stage_profiler.iop_manufactured_only);
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_summary "
 				"sample_period=%u scheduler_entries=%llu samples=%llu "
@@ -742,12 +757,19 @@ namespace MTGS
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_deadline_shadow "
 				"iop_checks=%llu iop_skips=%llu iop_dispatches=%llu "
-				"iop_late=%llu",
+				"iop_late=%llu deadline_due=%llu counter_due=%llu "
+				"intc_visible=%llu callback_due=%llu "
+				"manufactured_only=%llu",
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(iop_deadline_gate_checks),
 				static_cast<unsigned long long>(iop_deadline_gate_skips),
 				static_cast<unsigned long long>(iop_deadline_gate_dispatches),
-				static_cast<unsigned long long>(iop_deadline_shadow_late));
+				static_cast<unsigned long long>(iop_deadline_shadow_late),
+				static_cast<unsigned long long>(iop_deadline_due),
+				static_cast<unsigned long long>(iop_counter_due),
+				static_cast<unsigned long long>(iop_intc_visible),
+				static_cast<unsigned long long>(iop_callback_due),
+				static_cast<unsigned long long>(iop_manufactured_only));
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_time_us{};
 			std::array<u64,
