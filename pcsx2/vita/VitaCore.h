@@ -65,6 +65,7 @@ extern bool g_vita_a32_iop_deadline_gate_validation_enabled;
 extern bool g_vita_ee_interleave_scheduler_validation_enabled;
 extern u64 g_vita_ee_full_scheduler_validation_entries;
 extern u64 g_vita_ee_iop_only_scheduler_validation_entries;
+extern bool g_vita_joint_wait_horizon_validation_enabled;
 #endif
 inline __attribute__((always_inline))
 bool VitaA32IopRetainedWaitCoalescingActive()
@@ -215,6 +216,43 @@ struct VitaA32EeGeneratedGuestMix
 	u32 cop2 = 0;
 	u32 other = 0;
 };
+
+// Provenance for the PCSX2-proven EE wait which entered the shared scheduler.
+// RAM ranges use physical offsets into eeMem->Main so aliases compare equal.
+// A zero range count deliberately fails closed for RAM-poll wait kinds.
+enum class VitaA32EeWaitSchedulerOrigin : u32
+{
+	None = 0,
+	GenericRamLoop = 1,
+	PollCallRamLoop = 2,
+	TwoPredicateRamLoop = 3,
+	RetainedUnconditionalLoop = 4,
+	GsCsrVsintLoop = 5,
+};
+
+struct VitaA32EeWaitSchedulerCertificate
+{
+	VitaA32EeWaitSchedulerOrigin origin =
+		VitaA32EeWaitSchedulerOrigin::None;
+	u8 ram_range_count = 0;
+	u8 ram_write_observed = 0;
+	u8 reserved[2]{};
+	u32 ram_offset[2]{};
+	u32 ram_size[2]{};
+};
+static_assert(sizeof(VitaA32EeWaitSchedulerCertificate) == 24);
+
+void VitaPublishA32EeWaitSchedulerOrigin(
+	VitaA32EeWaitSchedulerOrigin origin);
+void VitaPublishA32EeRamWaitSchedulerCertificate(
+	VitaA32EeWaitSchedulerOrigin origin,
+	u32 guest_address_0, u32 size_0,
+	u32 guest_address_1 = 0, u32 size_1 = 0);
+void VitaRepublishA32EeWaitSchedulerCertificate(
+	const VitaA32EeWaitSchedulerCertificate& certificate);
+const VitaA32EeWaitSchedulerCertificate*
+VitaConsumeA32EeWaitSchedulerCertificate();
+void VitaFinishA32EeWaitSchedulerCertificate();
 
 #if defined(VITASX2_QEMU_VALIDATION)
 static constexpr u32 VITA_A32_EE_LINK_REJECTION_EDGE_COUNT = 16;

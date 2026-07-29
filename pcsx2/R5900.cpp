@@ -76,6 +76,7 @@ static bool s_vita_next_event_iop_only;
 bool g_vita_ee_interleave_scheduler_validation_enabled = false;
 u64 g_vita_ee_full_scheduler_validation_entries = 0;
 u64 g_vita_ee_iop_only_scheduler_validation_entries = 0;
+bool g_vita_joint_wait_horizon_validation_enabled = false;
 #endif
 
 static __fi bool VitaEeInterleaveSchedulerActive()
@@ -143,10 +144,12 @@ static __fi void VitaRefreshEeCounterOwner()
 	}
 }
 
-static __fi void VitaScheduleEeAndIopDeadlines(s32 iop_owner_delta)
+static __fi void VitaScheduleEeAndIopDeadlineDelta(s64 iop_owner_delta)
 {
-	const s32 iop_delta = std::min(
-		iop_owner_delta, static_cast<s32>(VitaEeInterleaveCycles()));
+	const s32 iop_delta = iop_owner_delta <= 0 ? 0 :
+		iop_owner_delta >= std::numeric_limits<s32>::max() ?
+			std::numeric_limits<s32>::max() :
+			static_cast<s32>(iop_owner_delta);
 	cpuRegs.nextEventCycle = s_vita_ee_owner_event_cycle;
 	if (static_cast<s32>(
 			s_vita_ee_owner_event_cycle - cpuRegs.cycle) > iop_delta)
@@ -161,6 +164,12 @@ static __fi void VitaScheduleEeAndIopDeadlines(s32 iop_owner_delta)
 	{
 		s_vita_next_event_iop_only = false;
 	}
+}
+
+static __fi void VitaScheduleEeAndIopDeadlines(s32 iop_owner_delta)
+{
+	VitaScheduleEeAndIopDeadlineDelta(std::min(
+		iop_owner_delta, static_cast<s32>(VitaEeInterleaveCycles())));
 }
 
 static __fi bool VitaCanSkipEeOwnersAtInterleave()
@@ -240,6 +249,120 @@ static __fi s32 VitaNextIopOwnerDelta()
 	return EEsCycle >= next_iop_event_delta ?
 		48 : next_iop_event_delta - EEsCycle;
 }
+
+static __fi s64 VitaNextIopExternalOwnerDelta(u64 external_cycle)
+{
+	const u64 iop_cycles = external_cycle > psxRegs.cycle ?
+		external_cycle - psxRegs.cycle : 0;
+	const s64 scaled_iop_cycles = static_cast<s64>(iop_cycles) * 8;
+	return scaled_iop_cycles - static_cast<s64>(EEsCycle);
+}
+
+static __fi bool VitaJointWaitHorizonActive()
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	return g_vita_joint_wait_horizon_validation_enabled;
+#else
+	return true;
+#endif
+}
+
+static __fi bool VitaEeWaitCertificateHasExactWakeContract(
+	const VitaA32EeWaitSchedulerCertificate& certificate)
+{
+	if (certificate.ram_write_observed != 0)
+		return false;
+
+	switch (certificate.origin)
+	{
+		case VitaA32EeWaitSchedulerOrigin::PollCallRamLoop:
+			return certificate.ram_range_count == 1;
+		case VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop:
+			return certificate.ram_range_count == 2;
+		case VitaA32EeWaitSchedulerOrigin::RetainedUnconditionalLoop:
+		case VitaA32EeWaitSchedulerOrigin::GsCsrVsintLoop:
+			return certificate.ram_range_count == 0;
+		case VitaA32EeWaitSchedulerOrigin::None:
+		case VitaA32EeWaitSchedulerOrigin::GenericRamLoop:
+		default:
+			return false;
+	}
+}
+
+static __fi bool VitaTryScheduleJointWaitHorizon(
+	const VitaA32EeWaitSchedulerCertificate& wait_certificate,
+	u32 wait_pc)
+{
+	// PCSX2 owners: the EE wait-loop max(cycle,nextEventCycle) lowering and
+	// R3000A.cpp::iopEventTest(). The EE certificate proves that another loop
+	// iteration can observe only its watched RAM (or the exact GSVSync owner);
+	// the retained IOP descriptor proves that the IOP has no guest work before
+	// its next counter/callback/interrupt owner. Every uncertain state keeps the
+	// existing bounded 3072/6144-cycle seam.
+	if (!VitaJointWaitHorizonActive() ||
+		PSXCLK != (PS2CLK / 8u) ||
+		!VitaA32IopRetainedWaitCoalescingActive() ||
+		!VitaEeWaitCertificateHasExactWakeContract(wait_certificate) ||
+		cpuRegs.pc != wait_pc || iopEventAction ||
+		!VitaCanSkipEeOwnersAtInterleave())
+	{
+		return false;
+	}
+
+	const u64 external_cycle = VitaGetIopExternalEventCycle();
+	if (external_cycle <= psxRegs.cycle)
+		return false;
+	const s64 iop_owner_delta =
+		VitaNextIopExternalOwnerDelta(external_cycle);
+	if (iop_owner_delta <= 0)
+		return false;
+
+	// Replace iopEventTest()'s manufactured polling seed only after both wait
+	// proofs hold. A later PSX_INT()/counter write still narrows this canonical
+	// slot through PCSX2's ordinary psxSetNextBranch() mechanism.
+	psxRegs.iopNextEventCycle = external_cycle;
+	VitaScheduleEeAndIopDeadlineDelta(iop_owner_delta);
+	VitaPerformanceTelemetry::RecordJointWaitActivationIfProfiling(
+		static_cast<u32>(cpuRegs.nextEventCycle - cpuRegs.cycle));
+	return true;
+}
+
+#if defined(VITASX2_CPU_PROFILER)
+static __fi void VitaRecordJointWaitShadowAtDeadline(
+	const VitaA32EeWaitSchedulerCertificate& wait_certificate,
+	u32 wait_pc)
+{
+	const bool iop_retained =
+		VitaA32IopRetainedWaitCoalescingActive();
+	const s64 ee_owner_delta = static_cast<s64>(
+		s_vita_ee_owner_event_cycle - cpuRegs.cycle);
+	const s64 iop_owner_delta = VitaNextIopExternalOwnerDelta(
+		VitaGetIopExternalEventCycle());
+	const s64 horizon_delta =
+		std::min(ee_owner_delta, iop_owner_delta);
+	const bool ram_poll =
+		wait_certificate.origin ==
+			VitaA32EeWaitSchedulerOrigin::GenericRamLoop ||
+		wait_certificate.origin ==
+			VitaA32EeWaitSchedulerOrigin::PollCallRamLoop ||
+		wait_certificate.origin ==
+			VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop;
+	const bool unknown_writer =
+		ram_poll && wait_certificate.ram_range_count == 0;
+	const bool blocked =
+		wait_certificate.ram_write_observed != 0 ||
+		cpuRegs.pc != wait_pc || iopEventAction ||
+		(cpuRegs.CP0.n.Status.val & 0x8000u) != 0 ||
+		!VitaCanSkipEeOwnersAtInterleave();
+	VitaPerformanceTelemetry::RecordJointWaitShadowIfProfiling(
+		static_cast<u32>(wait_certificate.origin), iop_retained,
+		horizon_delta, unknown_writer, blocked,
+		wait_certificate.ram_range_count != 0 ?
+			wait_certificate.ram_offset[0] : UINT32_MAX,
+		wait_certificate.ram_range_count != 0 ?
+			wait_certificate.ram_size[0] : 0);
+}
+#endif
 #endif
 
 bool eeEventTestIsActive = false;
@@ -808,6 +931,9 @@ __fi void _cpuEventTest_Shared()
 #if defined(VITASX2_VITA)
 	VitaPerformanceTelemetry::OnEeSchedulerEntry(
 		cpuRegs.pc, cpuRegs.cycle, psxRegs.pc, psxRegs.cycle);
+	const VitaA32EeWaitSchedulerCertificate* vita_ee_wait_certificate =
+		VitaConsumeA32EeWaitSchedulerCertificate();
+	const u32 vita_ee_wait_pc = cpuRegs.pc;
 #endif
 	eeEventTestIsActive = true;
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
@@ -948,7 +1074,15 @@ __fi void _cpuEventTest_Shared()
 			// Recompute the PCSX2 IOP owner after its guest slice and due-owner
 			// gate, then retain unrelated EE owners until their exact deadline.
 			// The active-IOP cadence remains a bounded IOP-owned seam.
-			VitaScheduleEeAndIopDeadlines(VitaNextIopOwnerDelta());
+			if (!VitaTryScheduleJointWaitHorizon(
+					*vita_ee_wait_certificate, vita_ee_wait_pc))
+			{
+				VitaScheduleEeAndIopDeadlines(VitaNextIopOwnerDelta());
+			}
+#if defined(VITASX2_CPU_PROFILER)
+			VitaRecordJointWaitShadowAtDeadline(
+				*vita_ee_wait_certificate, vita_ee_wait_pc);
+#endif
 		}
 		else
 		{
@@ -963,6 +1097,9 @@ __fi void _cpuEventTest_Shared()
 		Pcsx2Trace::RecordPendingMachineCheckpointAtEventTest();
 #endif
 		eeEventTestIsActive = false;
+#if defined(VITASX2_VITA)
+		VitaFinishA32EeWaitSchedulerCertificate();
+#endif
 		VitaPerformanceTelemetry::OnEeSchedulerExit();
 #if defined(__arm__)
 		ReturnFromPrivateCpuEventTestShared();
@@ -1087,7 +1224,15 @@ __fi void _cpuEventTest_Shared()
 			// CPU_INT(), INTC/DMAC tests and counters publish EE owners through
 			// cpuSetNextEvent(). The IOP deadline is deliberately kept separate,
 			// so an IOP-owned boundary can avoid rebuilding unrelated EE owners.
-			VitaScheduleEeAndIopDeadlines(iop_owner_delta);
+			if (!VitaTryScheduleJointWaitHorizon(
+					*vita_ee_wait_certificate, vita_ee_wait_pc))
+			{
+				VitaScheduleEeAndIopDeadlines(iop_owner_delta);
+			}
+#if defined(VITASX2_CPU_PROFILER)
+			VitaRecordJointWaitShadowAtDeadline(
+				*vita_ee_wait_certificate, vita_ee_wait_pc);
+#endif
 		}
 		else
 		{
@@ -1115,6 +1260,7 @@ __fi void _cpuEventTest_Shared()
 #endif
 	eeEventTestIsActive = false;
 #if defined(VITASX2_VITA)
+	VitaFinishA32EeWaitSchedulerCertificate();
 	VitaPerformanceTelemetry::OnEeSchedulerExit();
 #endif
 #if defined(__arm__)

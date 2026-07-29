@@ -49,6 +49,9 @@ static VitaEePreInstructionTraceWindowSkipCallback s_ee_pre_instruction_trace_wi
 static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback = nullptr;
 static VitaEE::BlockExecutor s_ee_a32_executor;
 static VitaIOP::BlockExecutor s_iop_a32_executor{true};
+static VitaA32EeWaitSchedulerCertificate s_ee_wait_scheduler_certificate;
+static VitaA32EeWaitSchedulerCertificate
+	s_active_ee_wait_scheduler_certificate;
 #if defined(__arm__)
 static uptr s_iop_wait_resume_event_context = 0;
 static uptr s_iop_wait_resume_event_target = 0;
@@ -158,6 +161,26 @@ u32 VitaNotifyA32EeRamWrite(const void* host_address, u32 size)
 
 	const uptr remaining = Ps2MemSize::MainRam - backing_start;
 	const u32 bounded_size = static_cast<u32>(size < remaining ? size : remaining);
+	for (u32 i = 0;
+		i < s_active_ee_wait_scheduler_certificate.ram_range_count;
+		i++)
+	{
+		const u64 write_end =
+			static_cast<u64>(backing_start) + bounded_size;
+		const u64 watch_start =
+			s_active_ee_wait_scheduler_certificate.ram_offset[i];
+		const u64 watch_end = watch_start +
+			s_active_ee_wait_scheduler_certificate.ram_size[i];
+		if (static_cast<u64>(backing_start) < watch_end &&
+			watch_start < write_end)
+		{
+			s_active_ee_wait_scheduler_certificate.ram_write_observed = 1;
+			VitaPerformanceTelemetry::
+				RecordJointWaitRamWriteOverlapIfProfiling(
+					eeEventTestIsActive);
+			break;
+		}
+	}
 	const u32 invalidated = s_ee_a32_executor.InvalidateRamSourceRange(
 		static_cast<u32>(backing_start), bounded_size);
 	if (VitaPerformanceTelemetry::IsEnabled())
@@ -873,12 +896,24 @@ recRunEeEventForGeneratedResumeCore(
 		(event_token & VitaEE::RETAINED_UNCONDITIONAL_WAIT_EVENT_MASK) != 0;
 	const u32 wait_cycles = 0u - event_token;
 	const u32 wait_pc = cpuRegs.pc;
+	VitaA32EeWaitSchedulerCertificate wait_certificate{};
+	if (retain_unconditional_wait)
+	{
+		wait_certificate.origin =
+			VitaA32EeWaitSchedulerOrigin::RetainedUnconditionalLoop;
+	}
+	else
+	{
+		wait_certificate =
+			*VitaConsumeA32EeWaitSchedulerCertificate();
+	}
 	u32 event_tests = 0;
 	u32 retained_events = 0;
 	bool resume = false;
 	for (;;)
 	{
 		event_tests++;
+		VitaRepublishA32EeWaitSchedulerCertificate(wait_certificate);
 #if defined(__arm__)
 		if constexpr (PrivateSchedulerEntry)
 			VitaRunCpuEventTestSharedFromOwnedEeFrame();
@@ -1740,11 +1775,92 @@ void VitaSelectConfiguredCpuProviders()
 void VitaResetA32EeProviderStats()
 {
 	s_ee_a32_stats = {};
+	s_ee_wait_scheduler_certificate = {};
+	s_active_ee_wait_scheduler_certificate = {};
 #if defined(VITASX2_QEMU_VALIDATION)
 	s_ee_a32_executor.ResetDirectLinkRejectionProfile();
 	s_ee_a32_persistent_boundaries = 0;
 	s_ee_a32_persistent_boundary_hit_limit = false;
 #endif
+}
+
+void VitaPublishA32EeWaitSchedulerOrigin(
+	VitaA32EeWaitSchedulerOrigin origin)
+{
+	s_ee_wait_scheduler_certificate = {};
+	s_ee_wait_scheduler_certificate.origin = origin;
+}
+
+void VitaPublishA32EeRamWaitSchedulerCertificate(
+	VitaA32EeWaitSchedulerOrigin origin,
+	u32 guest_address_0, u32 size_0,
+	u32 guest_address_1, u32 size_1)
+{
+	s_ee_wait_scheduler_certificate = {};
+	s_ee_wait_scheduler_certificate.origin = origin;
+	if (!eeMem || !vtlb_private::vtlbdata.vmap)
+		return;
+
+	const u32 guest_addresses[2] = {
+		guest_address_0, guest_address_1};
+	const u32 sizes[2] = {size_0, size_1};
+	const uptr ram_start = reinterpret_cast<uptr>(eeMem->Main);
+	const uptr ram_end = ram_start + Ps2MemSize::ExposedRam;
+	for (u32 i = 0; i < 2 && sizes[i] != 0; i++)
+	{
+		const u32 address = guest_addresses[i];
+		const u32 size = sizes[i];
+		const u32 page_remaining =
+			vtlb_private::VTLB_PAGE_SIZE -
+			(address & vtlb_private::VTLB_PAGE_MASK);
+		if (size > page_remaining)
+		{
+			s_ee_wait_scheduler_certificate.ram_range_count = 0;
+			return;
+		}
+
+		const vtlb_private::VTLBVirtual mapping =
+			vtlb_private::vtlbdata.vmap[
+				address >> vtlb_private::VTLB_PAGE_BITS];
+		if (mapping.isHandler(address))
+		{
+			s_ee_wait_scheduler_certificate.ram_range_count = 0;
+			return;
+		}
+		const uptr host = mapping.assumePtr(address);
+		if (host < ram_start || host >= ram_end ||
+			static_cast<uptr>(size) > ram_end - host)
+		{
+			s_ee_wait_scheduler_certificate.ram_range_count = 0;
+			return;
+		}
+
+		const u32 range =
+			s_ee_wait_scheduler_certificate.ram_range_count++;
+		s_ee_wait_scheduler_certificate.ram_offset[range] =
+			static_cast<u32>(host - ram_start);
+		s_ee_wait_scheduler_certificate.ram_size[range] = size;
+	}
+}
+
+void VitaRepublishA32EeWaitSchedulerCertificate(
+	const VitaA32EeWaitSchedulerCertificate& certificate)
+{
+	s_ee_wait_scheduler_certificate = certificate;
+}
+
+const VitaA32EeWaitSchedulerCertificate*
+VitaConsumeA32EeWaitSchedulerCertificate()
+{
+	s_active_ee_wait_scheduler_certificate =
+		s_ee_wait_scheduler_certificate;
+	s_ee_wait_scheduler_certificate = {};
+	return &s_active_ee_wait_scheduler_certificate;
+}
+
+void VitaFinishA32EeWaitSchedulerCertificate()
+{
+	s_active_ee_wait_scheduler_certificate = {};
 }
 
 VitaA32EeProviderStats VitaGetA32EeProviderStats()

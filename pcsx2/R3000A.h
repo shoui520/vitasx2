@@ -171,6 +171,12 @@ extern u64 psxNextStartCounter;
 extern bool iopEventAction;
 extern bool iopEventTestIsActive;
 
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+// Earliest semantic IOP device/counter/callback observation, excluding the
+// scheduler's manufactured 384/768-cycle polling seam.
+u64 VitaGetIopExternalEventCycle();
+#endif
+
 // Branching status used when throwing exceptions.
 extern bool iopIsDelaySlot;
 

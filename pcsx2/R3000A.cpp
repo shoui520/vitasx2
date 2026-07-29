@@ -382,6 +382,54 @@ __ri void iopEventTest()
 #endif
 }
 
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+u64 VitaGetIopExternalEventCycle()
+{
+	// Reconstruct the same semantic owners consumed by iopEventTest(), but
+	// deliberately omit its fixed desktop polling seed. A joint EE/IOP wait
+	// certificate may use this calendar only while both processors are proven
+	// unable to observe state before one of these owners becomes due.
+	u64 deadline = ~static_cast<u64>(0);
+	if (psxNextDeltaCounter <= 0)
+	{
+		deadline = psxRegs.cycle;
+	}
+	else
+	{
+		deadline = psxNextStartCounter +
+			static_cast<u32>(psxNextDeltaCounter);
+	}
+
+	constexpr u32 IOP_EVENT_COUNT =
+		static_cast<u32>(IopEvt_USB) + 1;
+	u32 pending = psxRegs.interrupt &
+		((1u << IOP_EVENT_COUNT) - 1u);
+	while (pending != 0)
+	{
+		const u32 event = static_cast<u32>(std::countr_zero(pending));
+		pending &= pending - 1;
+		const s64 event_delta = static_cast<s64>(
+			psxRegs.sCycle[event] +
+			static_cast<s64>(psxRegs.eCycle[event]) -
+			psxRegs.cycle);
+		const u64 event_deadline = event_delta <= 0 ?
+			psxRegs.cycle :
+			psxRegs.cycle + static_cast<u64>(event_delta);
+		if (event_deadline < deadline)
+			deadline = event_deadline;
+	}
+
+	// A visible interrupt is already an IOP execution owner, regardless of
+	// whether the current CP0 mask will turn it into an exception.
+	if (psxHu32(HW_ICTRL) != 0 &&
+		(psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0)
+	{
+		deadline = psxRegs.cycle;
+	}
+	return deadline;
+}
+#endif
+
 void iopTestIntc()
 {
 	if( psxHu32(HW_ICTRL) == 0 ) return;

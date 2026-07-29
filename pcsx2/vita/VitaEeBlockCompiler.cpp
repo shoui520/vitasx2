@@ -545,6 +545,16 @@ namespace VitaEE
 		{
 			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
 				VitaPerformanceTelemetry::CpuStage::EeHelper);
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+			const u32 leaf_load = memRead32(leaf_pc + sizeof(u32));
+			const u32 load_base = (leaf_load >> 21) & 0x1f;
+			const u32 load_address =
+				cpuRegs.GPR.r[load_base].UL[0] +
+				static_cast<s16>(leaf_load & 0xffffu);
+			VitaPublishA32EeRamWaitSchedulerCertificate(
+				VitaA32EeWaitSchedulerOrigin::PollCallRamLoop,
+				load_address, sizeof(u32));
+#endif
 			// A static call and JR are separate PCSX2 BaseBlocks, and each owns
 			// iBranchTest(). Do not turn the multi-block loop into the subtly
 			// different inline-wait contract (cycle == nextEventCycle, PC at the
@@ -601,6 +611,25 @@ namespace VitaEE
 		{
 			VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
 				VitaPerformanceTelemetry::CpuStage::EeHelper);
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+			const u32 prefix_load = memRead32(loop_pc);
+			const bool masked_prefix =
+				(prefix_load >> 26) == 0x23 &&
+				(memRead32(loop_pc + sizeof(u32)) >> 26) == 0x0c;
+			const u32 tail_load_pc =
+				loop_pc + (masked_prefix ? 4u : 3u) * sizeof(u32);
+			const u32 tail_load = memRead32(tail_load_pc);
+			const u32 prefix_address =
+				cpuRegs.GPR.r[(prefix_load >> 21) & 0x1f].UL[0] +
+				static_cast<s16>(prefix_load & 0xffffu);
+			const u32 tail_address =
+				cpuRegs.GPR.r[(tail_load >> 21) & 0x1f].UL[0] +
+				static_cast<s16>(tail_load & 0xffffu);
+			VitaPublishA32EeRamWaitSchedulerCertificate(
+				VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop,
+				prefix_address, sizeof(u32),
+				tail_address, sizeof(u32));
+#endif
 			// PCSX2 owner: x86/ix86-32/iR5900.cpp::{recRecompile,
 			// iBranchTest}. Unlike a one-block s_nBlockFF loop, this proven
 			// polling shape has one scheduler seam after its forward-exit
@@ -725,6 +754,10 @@ namespace VitaEE
 				// executed once, then cycle=max(cycle,nextEventCycle) and the event
 				// dispatcher runs. The next block invocation re-reads GS_CSR.
 				cpuRegs.cycle = std::max(cpuRegs.cycle, cpuRegs.nextEventCycle);
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+				VitaPublishA32EeWaitSchedulerOrigin(
+					VitaA32EeWaitSchedulerOrigin::GsCsrVsintLoop);
+#endif
 #if defined(VITASX2_QEMU_VALIDATION)
 				g_qemuGsCsrVsintPollFastForwards++;
 #endif
@@ -13710,6 +13743,16 @@ namespace VitaEE
 			return false;
 		}
 
+#if defined(VITASX2_CPU_PROFILER) && \
+	!defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+		if (!m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+				VitaA32EeWaitSchedulerOrigin::GenericRamLoop)) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
+				&VitaPublishA32EeWaitSchedulerOrigin)))
+		{
+			return false;
+		}
+#endif
 		return (!defer_pc_writeback || EmitStorePc(pc)) &&
 			EmitEventExitReturn(event_exit, persistent_event_token);
 	}

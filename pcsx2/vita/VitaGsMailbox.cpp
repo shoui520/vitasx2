@@ -773,6 +773,25 @@ namespace MTGS
 			EE_DEADLINE_DELTA(ee_iop_balance_positive);
 			EE_DEADLINE_DELTA(ee_iop_balance_nonpositive);
 			EE_DEADLINE_DELTA(ee_iop_ahead_gt_3072);
+			EE_DEADLINE_DELTA(ee_wait_shadow_entries);
+			EE_DEADLINE_DELTA(ee_wait_generic_ram);
+			EE_DEADLINE_DELTA(ee_wait_poll_call_ram);
+			EE_DEADLINE_DELTA(ee_wait_two_predicate_ram);
+			EE_DEADLINE_DELTA(ee_wait_retained_unconditional);
+			EE_DEADLINE_DELTA(ee_wait_gs_csr_vsint);
+			EE_DEADLINE_DELTA(joint_wait_shadow_entries);
+			EE_DEADLINE_DELTA(joint_wait_unknown_writer);
+			EE_DEADLINE_DELTA(joint_wait_blocked);
+			EE_DEADLINE_DELTA(joint_wait_qualified);
+			EE_DEADLINE_DELTA(joint_wait_horizon_gt_6144);
+			EE_DEADLINE_DELTA(joint_wait_horizon_gt_12288);
+			EE_DEADLINE_DELTA(joint_wait_horizon_gt_24576);
+			EE_DEADLINE_DELTA(joint_wait_ram_certified);
+			EE_DEADLINE_DELTA(joint_wait_ram_write_overlaps);
+			EE_DEADLINE_DELTA(
+				joint_wait_ram_write_overlaps_outside_scheduler);
+			EE_DEADLINE_DELTA(joint_wait_activations);
+			EE_DEADLINE_DELTA(joint_wait_scheduled_ee_cycles);
 #undef EE_DEADLINE_DELTA
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_summary "
@@ -861,6 +880,46 @@ namespace MTGS
 				static_cast<unsigned long long>(ee_iop_balance_positive),
 				static_cast<unsigned long long>(ee_iop_balance_nonpositive),
 				static_cast<unsigned long long>(ee_iop_ahead_gt_3072));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=joint_wait_shadow "
+				"ee_wait=%llu generic_ram=%llu poll_call_ram=%llu "
+				"two_predicate_ram=%llu unconditional=%llu gs_csr=%llu "
+				"joint=%llu unknown_writer=%llu blocked=%llu qualified=%llu "
+				"horizon_gt_6144=%llu horizon_gt_12288=%llu "
+				"horizon_gt_24576=%llu ram_certified=%llu "
+				"ram_write_overlaps=%llu ram_write_outside=%llu "
+				"activations=%llu scheduled_ee_cycles=%llu "
+				"last_ram_offset=0x%08x last_ram_size=%u",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(ee_wait_shadow_entries),
+				static_cast<unsigned long long>(ee_wait_generic_ram),
+				static_cast<unsigned long long>(ee_wait_poll_call_ram),
+				static_cast<unsigned long long>(
+					ee_wait_two_predicate_ram),
+				static_cast<unsigned long long>(
+					ee_wait_retained_unconditional),
+				static_cast<unsigned long long>(ee_wait_gs_csr_vsint),
+				static_cast<unsigned long long>(joint_wait_shadow_entries),
+				static_cast<unsigned long long>(joint_wait_unknown_writer),
+				static_cast<unsigned long long>(joint_wait_blocked),
+				static_cast<unsigned long long>(joint_wait_qualified),
+				static_cast<unsigned long long>(
+					joint_wait_horizon_gt_6144),
+				static_cast<unsigned long long>(
+					joint_wait_horizon_gt_12288),
+				static_cast<unsigned long long>(
+					joint_wait_horizon_gt_24576),
+				static_cast<unsigned long long>(
+					joint_wait_ram_certified),
+				static_cast<unsigned long long>(
+					joint_wait_ram_write_overlaps),
+				static_cast<unsigned long long>(
+					joint_wait_ram_write_overlaps_outside_scheduler),
+				static_cast<unsigned long long>(joint_wait_activations),
+				static_cast<unsigned long long>(
+					joint_wait_scheduled_ee_cycles),
+				end.cpu_stage_profiler.joint_wait_last_ram_offset,
+				end.cpu_stage_profiler.joint_wait_last_ram_size);
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_time_us{};
 			std::array<u64,

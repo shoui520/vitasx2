@@ -564,5 +564,80 @@ namespace VitaPerformanceTelemetry
 				.iop_retained_wait_scheduler_entries++;
 		}
 	}
+
+	void RecordJointWaitShadow(u32 ee_wait_origin, bool iop_retained_wait,
+		s64 horizon_delta, bool unknown_writer, bool blocked,
+		u32 ram_offset, u32 ram_size)
+	{
+		if (ee_wait_origin == 0)
+			return;
+
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.ee_wait_shadow_entries++;
+		switch (ee_wait_origin)
+		{
+			case 1:
+				totals.ee_wait_generic_ram++;
+				break;
+			case 2:
+				totals.ee_wait_poll_call_ram++;
+				break;
+			case 3:
+				totals.ee_wait_two_predicate_ram++;
+				break;
+			case 4:
+				totals.ee_wait_retained_unconditional++;
+				break;
+			case 5:
+				totals.ee_wait_gs_csr_vsint++;
+				break;
+			default:
+				blocked = true;
+				break;
+		}
+
+		if (!iop_retained_wait)
+			return;
+
+		totals.joint_wait_shadow_entries++;
+		if (ram_offset != UINT32_MAX && ram_size != 0)
+		{
+			totals.joint_wait_ram_certified++;
+			totals.joint_wait_last_ram_offset = ram_offset;
+			totals.joint_wait_last_ram_size = ram_size;
+		}
+		if (unknown_writer)
+			totals.joint_wait_unknown_writer++;
+		if (blocked || horizon_delta <= 0)
+			totals.joint_wait_blocked++;
+		else if (!unknown_writer)
+			totals.joint_wait_qualified++;
+
+		if (horizon_delta > 6144)
+		{
+			totals.joint_wait_horizon_gt_6144++;
+			if (horizon_delta > 12288)
+			{
+				totals.joint_wait_horizon_gt_12288++;
+				if (horizon_delta > 24576)
+					totals.joint_wait_horizon_gt_24576++;
+			}
+		}
+	}
+
+	void RecordJointWaitRamWriteOverlap(bool scheduler_active)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.joint_wait_ram_write_overlaps++;
+		if (!scheduler_active)
+			totals.joint_wait_ram_write_overlaps_outside_scheduler++;
+	}
+
+	void RecordJointWaitActivation(u32 scheduled_ee_cycles)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.joint_wait_activations++;
+		totals.joint_wait_scheduled_ee_cycles += scheduled_ee_cycles;
+	}
 #endif
 }

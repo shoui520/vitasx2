@@ -150,6 +150,26 @@ namespace VitaPerformanceTelemetry
 		u64 ee_iop_balance_positive = 0;
 		u64 ee_iop_balance_nonpositive = 0;
 		u64 ee_iop_ahead_gt_3072 = 0;
+		u64 ee_wait_shadow_entries = 0;
+		u64 ee_wait_generic_ram = 0;
+		u64 ee_wait_poll_call_ram = 0;
+		u64 ee_wait_two_predicate_ram = 0;
+		u64 ee_wait_retained_unconditional = 0;
+		u64 ee_wait_gs_csr_vsint = 0;
+		u64 joint_wait_shadow_entries = 0;
+		u64 joint_wait_unknown_writer = 0;
+		u64 joint_wait_blocked = 0;
+		u64 joint_wait_qualified = 0;
+		u64 joint_wait_horizon_gt_6144 = 0;
+		u64 joint_wait_horizon_gt_12288 = 0;
+		u64 joint_wait_horizon_gt_24576 = 0;
+		u64 joint_wait_ram_certified = 0;
+		u64 joint_wait_ram_write_overlaps = 0;
+		u64 joint_wait_ram_write_overlaps_outside_scheduler = 0;
+		u64 joint_wait_activations = 0;
+		u64 joint_wait_scheduled_ee_cycles = 0;
+		u32 joint_wait_last_ram_offset = UINT32_MAX;
+		u32 joint_wait_last_ram_size = 0;
 		std::array<u64, CPU_STAGE_COUNT> stage_time_us{};
 		std::array<u64, CPU_STAGE_COUNT> stage_entries{};
 	};
@@ -207,6 +227,11 @@ namespace VitaPerformanceTelemetry
 		EeDeadlineOwner owner, s32 ee_iop_balance, bool timer_enabled,
 		u32 timer_delta, bool iop_rapid);
 	void RecordEeSchedulerPath(bool iop_only, bool iop_retained_wait);
+	void RecordJointWaitShadow(u32 ee_wait_origin, bool iop_retained_wait,
+		s64 horizon_delta, bool unknown_writer, bool blocked,
+		u32 ram_offset, u32 ram_size);
+	void RecordJointWaitRamWriteOverlap(bool scheduler_active);
+	void RecordJointWaitActivation(u32 scheduled_ee_cycles);
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
 		u32 iop_pc, u64 iop_cycle)
@@ -319,6 +344,50 @@ namespace VitaPerformanceTelemetry
 #else
 		(void)iop_only;
 		(void)iop_retained_wait;
+#endif
+	}
+
+	inline void RecordJointWaitShadowIfProfiling(u32 ee_wait_origin,
+		bool iop_retained_wait, s64 horizon_delta, bool unknown_writer,
+		bool blocked, u32 ram_offset, u32 ram_size)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+		{
+			RecordJointWaitShadow(ee_wait_origin, iop_retained_wait,
+				horizon_delta, unknown_writer, blocked,
+				ram_offset, ram_size);
+		}
+#else
+		(void)ee_wait_origin;
+		(void)iop_retained_wait;
+		(void)horizon_delta;
+		(void)unknown_writer;
+		(void)blocked;
+		(void)ram_offset;
+		(void)ram_size;
+#endif
+	}
+
+	inline void RecordJointWaitRamWriteOverlapIfProfiling(
+		bool scheduler_active)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordJointWaitRamWriteOverlap(scheduler_active);
+#else
+		(void)scheduler_active;
+#endif
+	}
+
+	inline void RecordJointWaitActivationIfProfiling(
+		u32 scheduled_ee_cycles)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordJointWaitActivation(scheduled_ee_cycles);
+#else
+		(void)scheduled_ee_cycles;
 #endif
 	}
 
