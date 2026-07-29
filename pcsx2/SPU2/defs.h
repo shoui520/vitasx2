@@ -601,6 +601,19 @@ extern s16 spu2regs[0x010000 / sizeof(s16)];
 extern s16 _spu2mem[0x200000 / sizeof(s16)];
 extern int PlayMode;
 
+// Reverb.cpp derives a zero-state proof from SPU2 RAM. Guest-visible writes
+// must invalidate that proof before the next mixer sample.
+extern void NotifyReverbRamWrite(u32 address, u32 words);
+extern void InvalidateAllReverbZeroState();
+
+#if defined(VITASX2_CPU_PROFILER)
+extern u64 g_vitaSpu2SilentReverbSamples;
+extern u64 g_vitaSpu2SilentReverbInputRejects;
+extern u64 g_vitaSpu2SilentReverbIrqRejects;
+extern u64 g_vitaSpu2SilentReverbRangeRejects;
+extern u64 g_vitaSpu2SilentReverbStateRejects;
+#endif
+
 extern void SetIrqCall(int core);
 extern void SetIrqCallDMA(int core);
 extern void StartVoices(int core, u32 value);

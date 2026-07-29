@@ -514,6 +514,7 @@ void V_Core::FinishDMAwrite()
 
 	const u32 buff1size = (buff1end - ActiveTSA);
 	Spu2DmaCopyBytes(GetMemPtr(ActiveTSA), DMAPtr, buff1size * 2);
+	NotifyReverbRamWrite(ActiveTSA, buff1size);
 
 	u32 TDA;
 
@@ -535,6 +536,7 @@ void V_Core::FinishDMAwrite()
 		// Emulation Grayarea: Should addresses wrap around to zero, or wrap around to
 		// 0x2800?  Hard to know for sure (almost no games depend on this)
 		Spu2DmaCopyBytes(GetMemPtr(0), DMAPtr, buff2end * 2);
+		NotifyReverbRamWrite(0, buff2end);
 		TDA = (buff2end) & 0xfffff;
 
 		// Flag interrupt?  If IRQA occurs between start and dest, flag it.

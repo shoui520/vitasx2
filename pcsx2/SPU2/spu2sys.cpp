@@ -91,6 +91,7 @@ __forceinline void spu2M_Write(u32 addr, s16 value)
 			SPU2::ConLog("* SPU2: PcmCache Block Clear at 0x%x (cacheIdx=0x%x)\n", addr, cacheIdx);
 	}
 	*GetMemPtr(addr) = value;
+	NotifyReverbRamWrite(addr, 1);
 }
 
 // writes an unsigned value to the SPU2 ram

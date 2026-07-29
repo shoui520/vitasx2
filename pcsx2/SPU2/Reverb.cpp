@@ -10,12 +10,158 @@
 
 #if defined(VITASX2_QEMU_VALIDATION)
 u32 g_qemuSpu2ReciprocalModuloIndexes = 0;
+u32 g_qemuSpu2SilentReverbSamples = 0;
+#endif
+
+#if defined(VITASX2_CPU_PROFILER)
+u64 g_vitaSpu2SilentReverbSamples = 0;
+u64 g_vitaSpu2SilentReverbInputRejects = 0;
+u64 g_vitaSpu2SilentReverbIrqRejects = 0;
+u64 g_vitaSpu2SilentReverbRangeRejects = 0;
+u64 g_vitaSpu2SilentReverbStateRejects = 0;
 #endif
 
 namespace
 {
 	static constexpr u8 DIVIDER_ADD_MARKER = 0x40;
 	static constexpr u8 DIVIDER_SHIFT_MASK = 0x1f;
+	static constexpr u32 MIXER_OWNED_RAM_END = 0x27ff;
+
+	struct ReverbZeroState
+	{
+		u32 start = 0;
+		u32 end = 0;
+		bool range_valid = false;
+		bool checked = false;
+		bool proven = false;
+	};
+
+	std::array<ReverbZeroState, 2> s_reverb_zero_states;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	bool s_silent_reverb_fast_path_enabled = true;
+#endif
+
+	static __attribute__((noinline)) bool SamplesAreZero(
+		const s16* samples, u32 count)
+	{
+		for (u32 i = 0; i < count; i++)
+		{
+			if (samples[i] != 0)
+				return false;
+		}
+		return true;
+	}
+
+	static __attribute__((noinline)) bool ReverbBuffersAreZero(
+		const V_Core& core)
+	{
+		return SamplesAreZero(
+				   &core.RevbDownBuf[0][0],
+				   sizeof(core.RevbDownBuf) / sizeof(s16)) &&
+			   SamplesAreZero(
+				   &core.RevbUpBuf[0][0],
+				   sizeof(core.RevbUpBuf) / sizeof(s16));
+	}
+
+	static __attribute__((noinline)) bool ReverbRamRangeIsZero(
+		u32 start, u32 end)
+	{
+		return SamplesAreZero(
+			&_spu2mem[start], (end - start) + 1u);
+	}
+
+	static __attribute__((noinline)) bool TryAdvanceSilentReverb(
+		V_Core& core, const StereoOut32& input)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!s_silent_reverb_fast_path_enabled)
+			return false;
+#endif
+
+		ReverbZeroState& state =
+			s_reverb_zero_states[core.Index & 1u];
+		const u32 start = core.EffectsStartA & 0x3f'ffffu;
+		const u32 end =
+			(core.EffectsEndA & 0x3f'ffffu) | 0xffffu;
+		if (!state.range_valid || state.start != start ||
+			state.end != end)
+		{
+			state.start = start;
+			state.end = end;
+			state.range_valid = true;
+			state.checked = false;
+			state.proven = false;
+		}
+
+		// A nonzero wet input makes the FIR history and usually the effects
+		// work area nonzero. Do not repeatedly scan for a naturally decayed
+		// state; a later guest RAM write or work-area change can re-arm the
+		// exact proof.
+		if ((input.Left | input.Right) != 0)
+		{
+			state.checked = true;
+			state.proven = false;
+#if defined(VITASX2_CPU_PROFILER)
+			g_vitaSpu2SilentReverbInputRejects++;
+#endif
+			return false;
+		}
+
+		// Either SPU2 core can observe this core's reverb addresses through
+		// IRQA. The zero lowering omits those address visits, so both observers
+		// must be disabled.
+		if (Cores[0].IRQEnable || Cores[1].IRQEnable)
+		{
+#if defined(VITASX2_CPU_PROFILER)
+			g_vitaSpu2SilentReverbIrqRejects++;
+#endif
+			return false;
+		}
+
+		if (start <= MIXER_OWNED_RAM_END ||
+			end >= 0x10'0000u)
+		{
+			state.checked = true;
+			state.proven = false;
+#if defined(VITASX2_CPU_PROFILER)
+			g_vitaSpu2SilentReverbRangeRejects++;
+#endif
+			return false;
+		}
+
+		if (!state.checked)
+		{
+			// Mixer output and AutoDMA own 0x0000..0x27ff and write through
+			// deliberately lightweight paths. Restrict this proof to a
+			// contiguous, non-aliasing work area above those windows; all
+			// remaining guest RAM writers notify the proof explicitly.
+			state.proven =
+				ReverbBuffersAreZero(core) &&
+				ReverbRamRangeIsZero(start, end);
+			state.checked = true;
+		}
+
+		if (!state.proven)
+		{
+#if defined(VITASX2_CPU_PROFILER)
+			g_vitaSpu2SilentReverbStateRejects++;
+#endif
+			return false;
+		}
+
+		// PCSX2's full zero-input step writes only zeros to already-zero
+		// history/RAM, advances this cursor once, and returns stereo zero.
+		core.RevbSampleBufPos =
+			(core.RevbSampleBufPos + 1u) & 63u;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSpu2SilentReverbSamples++;
+#endif
+#if defined(VITASX2_CPU_PROFILER)
+		g_vitaSpu2SilentReverbSamples++;
+#endif
+		return true;
+	}
 
 	// Cortex-A9 has no integer divide instruction. RevbGetIndexer() otherwise
 	// reaches __aeabi_uidivmod fourteen times per active core and sample. Cache
@@ -115,6 +261,43 @@ namespace
 	}
 } // namespace
 
+void NotifyReverbRamWrite(u32 address, u32 words)
+{
+	if (words == 0)
+		return;
+
+	address &= 0xf'ffffu;
+	const u32 first_words =
+		std::min(words, 0x10'0000u - address);
+	const u32 end = address + first_words - 1u;
+	for (ReverbZeroState& state : s_reverb_zero_states)
+	{
+		if (state.range_valid && address <= state.end &&
+			end >= state.start)
+		{
+			state.checked = false;
+			state.proven = false;
+		}
+	}
+
+	if (first_words != words)
+		NotifyReverbRamWrite(0, words - first_words);
+}
+
+void InvalidateAllReverbZeroState()
+{
+	for (ReverbZeroState& state : s_reverb_zero_states)
+		state = {};
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void SetSilentReverbFastPathForValidation(bool enabled)
+{
+	s_silent_reverb_fast_path_enabled = enabled;
+	InvalidateAllReverbZeroState();
+}
+#endif
+
 void V_Core::AnalyzeReverbPreset()
 {
 	Console.WriteLn("Reverb Parameter Update for Core %d:", Index);
@@ -179,6 +362,8 @@ StereoOut32 V_Core::DoReverb(StereoOut32 Input)
 	}
 
 	Input = clamp_mix(Input);
+	if (TryAdvanceSilentReverb(*this, Input))
+		return StereoOut32::Empty;
 
 	RevbDownBuf[0][RevbSampleBufPos] = Input.Left;
 	RevbDownBuf[1][RevbSampleBufPos] = Input.Right;

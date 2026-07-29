@@ -218,6 +218,13 @@ namespace VitaPerformanceTelemetry
 		u64 spu2_mixer_reverb_range_cores = 0;
 		u64 spu2_mixer_auto_dma_cores = 0;
 		u64 spu2_mixer_equivalent_stopped_cores = 0;
+#if defined(VITASX2_CPU_PROFILER)
+		u64 spu2_mixer_silent_reverb_samples = 0;
+		u64 spu2_mixer_silent_reverb_input_rejects = 0;
+		u64 spu2_mixer_silent_reverb_irq_rejects = 0;
+		u64 spu2_mixer_silent_reverb_range_rejects = 0;
+		u64 spu2_mixer_silent_reverb_state_rejects = 0;
+#endif
 		// Unlike the sparse stage sampler, these diagnostic-only totals observe
 		// every cold EE compilation. This prevents a compiler burst from
 		// aliasing against the fixed scheduler sample cadence.
@@ -346,7 +353,11 @@ namespace VitaPerformanceTelemetry
 		u32 sliding_voices, u32 noise_voices, u32 modulated_voices,
 		u32 fx_enabled_cores, u32 irq_enabled_cores,
 		u32 reverb_range_cores, u32 auto_dma_cores,
-		u32 equivalent_stopped_cores);
+		u32 equivalent_stopped_cores, u32 silent_reverb_samples,
+		u32 silent_reverb_input_rejects,
+		u32 silent_reverb_irq_rejects,
+		u32 silent_reverb_range_rejects,
+		u32 silent_reverb_state_rejects);
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
 		u32 iop_pc, u64 iop_cycle)
@@ -540,7 +551,11 @@ namespace VitaPerformanceTelemetry
 		u32 active_voices, u32 stopped_voices, u32 sliding_voices,
 		u32 noise_voices, u32 modulated_voices, u32 fx_enabled_cores,
 		u32 irq_enabled_cores, u32 reverb_range_cores,
-		u32 auto_dma_cores, u32 equivalent_stopped_cores)
+		u32 auto_dma_cores, u32 equivalent_stopped_cores,
+		u32 silent_reverb_samples, u32 silent_reverb_input_rejects,
+		u32 silent_reverb_irq_rejects,
+		u32 silent_reverb_range_rejects,
+		u32 silent_reverb_state_rejects)
 	{
 #if defined(VITASX2_CPU_PROFILER)
 		if (g_cpu_stage_profiler_enabled)
@@ -549,7 +564,11 @@ namespace VitaPerformanceTelemetry
 				sliding_voices, noise_voices, modulated_voices,
 				fx_enabled_cores, irq_enabled_cores,
 				reverb_range_cores, auto_dma_cores,
-				equivalent_stopped_cores);
+				equivalent_stopped_cores, silent_reverb_samples,
+				silent_reverb_input_rejects,
+				silent_reverb_irq_rejects,
+				silent_reverb_range_rejects,
+				silent_reverb_state_rejects);
 		}
 #else
 		(void)active_voices;
@@ -562,6 +581,11 @@ namespace VitaPerformanceTelemetry
 		(void)reverb_range_cores;
 		(void)auto_dma_cores;
 		(void)equivalent_stopped_cores;
+		(void)silent_reverb_samples;
+		(void)silent_reverb_input_rejects;
+		(void)silent_reverb_irq_rejects;
+		(void)silent_reverb_range_rejects;
+		(void)silent_reverb_state_rejects;
 #endif
 	}
 

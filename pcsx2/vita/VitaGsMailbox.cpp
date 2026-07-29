@@ -832,6 +832,17 @@ namespace MTGS
 			EE_DEADLINE_DELTA(spu2_mixer_reverb_range_cores);
 			EE_DEADLINE_DELTA(spu2_mixer_auto_dma_cores);
 			EE_DEADLINE_DELTA(spu2_mixer_equivalent_stopped_cores);
+#if defined(VITASX2_CPU_PROFILER)
+			EE_DEADLINE_DELTA(spu2_mixer_silent_reverb_samples);
+			EE_DEADLINE_DELTA(
+				spu2_mixer_silent_reverb_input_rejects);
+			EE_DEADLINE_DELTA(
+				spu2_mixer_silent_reverb_irq_rejects);
+			EE_DEADLINE_DELTA(
+				spu2_mixer_silent_reverb_range_rejects);
+			EE_DEADLINE_DELTA(
+				spu2_mixer_silent_reverb_state_rejects);
+#endif
 #undef EE_DEADLINE_DELTA
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_summary "
@@ -985,13 +996,36 @@ namespace MTGS
 					spu2_sync_register_writes),
 				static_cast<unsigned long long>(spu2_sync_dma),
 				static_cast<unsigned long long>(spu2_sync_observers));
+#if defined(VITASX2_CPU_PROFILER)
+#define SPU2_SILENT_REVERB_FORMAT \
+				" silent_reverb_samples=%llu" \
+				" silent_reverb_input_rejects=%llu" \
+				" silent_reverb_irq_rejects=%llu" \
+				" silent_reverb_range_rejects=%llu" \
+				" silent_reverb_state_rejects=%llu"
+#define SPU2_SILENT_REVERB_ARGUMENTS \
+				, static_cast<unsigned long long>( \
+					spu2_mixer_silent_reverb_samples) \
+				, static_cast<unsigned long long>( \
+					spu2_mixer_silent_reverb_input_rejects) \
+				, static_cast<unsigned long long>( \
+					spu2_mixer_silent_reverb_irq_rejects) \
+				, static_cast<unsigned long long>( \
+					spu2_mixer_silent_reverb_range_rejects) \
+				, static_cast<unsigned long long>( \
+					spu2_mixer_silent_reverb_state_rejects)
+#else
+#define SPU2_SILENT_REVERB_FORMAT
+#define SPU2_SILENT_REVERB_ARGUMENTS
+#endif
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=spu2_mixer "
 				"probes=%llu active_voices=%llu stopped_voices=%llu "
 				"sliding_voices=%llu noise_voices=%llu "
 				"modulated_voices=%llu fx_enabled_cores=%llu "
 				"irq_enabled_cores=%llu reverb_range_cores=%llu "
-				"auto_dma_cores=%llu equivalent_stopped_cores=%llu",
+				"auto_dma_cores=%llu equivalent_stopped_cores=%llu"
+				SPU2_SILENT_REVERB_FORMAT,
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(spu2_mixer_probes),
 				static_cast<unsigned long long>(
@@ -1013,7 +1047,10 @@ namespace MTGS
 				static_cast<unsigned long long>(
 					spu2_mixer_auto_dma_cores),
 				static_cast<unsigned long long>(
-					spu2_mixer_equivalent_stopped_cores));
+					spu2_mixer_equivalent_stopped_cores)
+				SPU2_SILENT_REVERB_ARGUMENTS);
+#undef SPU2_SILENT_REVERB_ARGUMENTS
+#undef SPU2_SILENT_REVERB_FORMAT
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_time_us{};
 			std::array<u64,

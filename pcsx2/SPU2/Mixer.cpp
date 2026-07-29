@@ -1151,6 +1151,11 @@ static __forceinline StereoOut32 MixCore(const uint coreidx, const VoiceMixSet& 
 static void ProbeSpu2MixerState()
 {
 	static u32 s_sample_counter = 0;
+	static u64 s_last_silent_reverb_samples = 0;
+	static u64 s_last_silent_reverb_input_rejects = 0;
+	static u64 s_last_silent_reverb_irq_rejects = 0;
+	static u64 s_last_silent_reverb_range_rejects = 0;
+	static u64 s_last_silent_reverb_state_rejects = 0;
 	if (!VitaPerformanceTelemetry::g_cpu_stage_profiler_enabled ||
 		(++s_sample_counter & 1023u) != 0)
 	{
@@ -1194,7 +1199,27 @@ static void ProbeSpu2MixerState()
 		modulated_voices, fx_enabled_cores, irq_enabled_cores,
 		reverb_range_cores, auto_dma_cores,
 		static_cast<u32>(__builtin_popcount(
-			s_equivalent_stopped_voice_core_mask)));
+			s_equivalent_stopped_voice_core_mask)),
+		static_cast<u32>(g_vitaSpu2SilentReverbSamples -
+			s_last_silent_reverb_samples),
+		static_cast<u32>(g_vitaSpu2SilentReverbInputRejects -
+			s_last_silent_reverb_input_rejects),
+		static_cast<u32>(g_vitaSpu2SilentReverbIrqRejects -
+			s_last_silent_reverb_irq_rejects),
+		static_cast<u32>(g_vitaSpu2SilentReverbRangeRejects -
+			s_last_silent_reverb_range_rejects),
+		static_cast<u32>(g_vitaSpu2SilentReverbStateRejects -
+			s_last_silent_reverb_state_rejects));
+	s_last_silent_reverb_samples =
+		g_vitaSpu2SilentReverbSamples;
+	s_last_silent_reverb_input_rejects =
+		g_vitaSpu2SilentReverbInputRejects;
+	s_last_silent_reverb_irq_rejects =
+		g_vitaSpu2SilentReverbIrqRejects;
+	s_last_silent_reverb_range_rejects =
+		g_vitaSpu2SilentReverbRangeRejects;
+	s_last_silent_reverb_state_rejects =
+		g_vitaSpu2SilentReverbStateRejects;
 }
 #endif
 

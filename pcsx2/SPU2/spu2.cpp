@@ -269,6 +269,7 @@ void SPU2::InternalReset(bool psxmode)
 		Cores[0].Init(0);
 		Cores[1].Init(1);
 	}
+	InvalidateAllReverbZeroState();
 }
 
 void SPU2::Reset(bool psxmode)

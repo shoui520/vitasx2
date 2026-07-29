@@ -985,7 +985,11 @@ namespace VitaPerformanceTelemetry
 		u32 sliding_voices, u32 noise_voices, u32 modulated_voices,
 		u32 fx_enabled_cores, u32 irq_enabled_cores,
 		u32 reverb_range_cores, u32 auto_dma_cores,
-		u32 equivalent_stopped_cores)
+		u32 equivalent_stopped_cores, u32 silent_reverb_samples,
+		u32 silent_reverb_input_rejects,
+		u32 silent_reverb_irq_rejects,
+		u32 silent_reverb_range_rejects,
+		u32 silent_reverb_state_rejects)
 	{
 		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
 		totals.spu2_mixer_probes++;
@@ -1000,6 +1004,16 @@ namespace VitaPerformanceTelemetry
 		totals.spu2_mixer_auto_dma_cores += auto_dma_cores;
 		totals.spu2_mixer_equivalent_stopped_cores +=
 			equivalent_stopped_cores;
+		totals.spu2_mixer_silent_reverb_samples +=
+			silent_reverb_samples;
+		totals.spu2_mixer_silent_reverb_input_rejects +=
+			silent_reverb_input_rejects;
+		totals.spu2_mixer_silent_reverb_irq_rejects +=
+			silent_reverb_irq_rejects;
+		totals.spu2_mixer_silent_reverb_range_rejects +=
+			silent_reverb_range_rejects;
+		totals.spu2_mixer_silent_reverb_state_rejects +=
+			silent_reverb_state_rejects;
 	}
 #endif
 }

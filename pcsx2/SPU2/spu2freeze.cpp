@@ -476,6 +476,8 @@ bool SPU2::DoPortableState(StateWrapper& sw)
 	// spans avoids imposing a host integer representation on their contents.
 	sw.DoBytes(spu2regs, sizeof(spu2regs));
 	sw.DoBytes(_spu2mem, sizeof(_spu2mem));
+	if (sw.IsReading())
+		InvalidateAllReverbZeroState();
 	for (u32 i = 0; i < std::size(Cores); i++)
 	{
 		if (!DoCore(sw, Cores[i], dma_offsets[i], dma_read_offsets[i]))
@@ -615,6 +617,7 @@ s32 SPU2Savestate::ThawIt(DataBlock& spud)
 	{
 		memcpy(spu2regs, spud.unkregs, sizeof(spud.unkregs));
 		memcpy(_spu2mem, spud.mem, sizeof(spud.mem));
+		InvalidateAllReverbZeroState();
 
 		memcpy(Cores, spud.Cores, sizeof(Cores));
 		memcpy(&Spdif, &spud.Spdif, sizeof(Spdif));
