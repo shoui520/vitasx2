@@ -746,7 +746,7 @@ static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx)
 	return voiceOut;
 }
 
-static __forceinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
+static __noinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
 {
 	V_Core& thiscore(Cores[coreidx]);
 
@@ -840,26 +840,36 @@ static __forceinline void DecodeStoppedSamplesWithoutIrq(
 	}
 }
 
+static __forceinline void WriteStoppedVoiceOutputWithoutIrq(
+	const uint coreidx, const uint voiceidx)
+{
+	if (voiceidx == 1)
+	{
+		*GetMemPtr(((coreidx == 0) ? 0x400 : 0xc00) + OutPos) = 0;
+	}
+	else if (voiceidx == 3)
+	{
+		*GetMemPtr(((coreidx == 0) ? 0x600 : 0xe00) + OutPos) = 0;
+	}
+}
+
+static __forceinline void AdvanceStoppedVoiceWithoutIrq(
+	const uint coreidx, const uint voiceidx, const u32 endx_mask)
+{
+	V_Core& core = Cores[coreidx];
+	DecodeStoppedSamplesWithoutIrq(core, voiceidx, endx_mask);
+	UpdatePitch(coreidx, voiceidx);
+	ConsumeSamples(core, voiceidx);
+	WriteStoppedVoiceOutputWithoutIrq(coreidx, voiceidx);
+}
+
 static __forceinline void AdvanceStoppedCoreVoicesWithoutIrq(
 	const uint coreidx)
 {
-	V_Core& core = Cores[coreidx];
-
 	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
 	{
-		DecodeStoppedSamplesWithoutIrq(
-			core, voiceidx, 1u << voiceidx);
-		UpdatePitch(coreidx, voiceidx);
-		ConsumeSamples(core, voiceidx);
-
-		if (voiceidx == 1)
-		{
-			*GetMemPtr(((coreidx == 0) ? 0x400 : 0xc00) + OutPos) = 0;
-		}
-		else if (voiceidx == 3)
-		{
-			*GetMemPtr(((coreidx == 0) ? 0x600 : 0xe00) + OutPos) = 0;
-		}
+		AdvanceStoppedVoiceWithoutIrq(
+			coreidx, voiceidx, 1u << voiceidx);
 	}
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -1138,16 +1148,12 @@ void FinishEquivalentStoppedVoiceBatchWithoutIrq()
 static __forceinline void AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
 	const uint coreidx)
 {
-	V_Core& core = Cores[coreidx];
-	DecodeStoppedSamplesWithoutIrq(
-		core, 0, AllCoreVoiceBits);
-	UpdatePitch(coreidx, 0);
-	ConsumeSamples(core, 0);
+	AdvanceStoppedVoiceWithoutIrq(coreidx, 0, AllCoreVoiceBits);
 
 	// Stopped voices 1 and 3 still publish zero to their architectural output
 	// areas every sample. IRQs are proven disabled for this entire batch.
-	*GetMemPtr(((coreidx == 0) ? 0x400 : 0xc00) + OutPos) = 0;
-	*GetMemPtr(((coreidx == 0) ? 0x600 : 0xe00) + OutPos) = 0;
+	WriteStoppedVoiceOutputWithoutIrq(coreidx, 1);
+	WriteStoppedVoiceOutputWithoutIrq(coreidx, 3);
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuSpu2VoiceVolumeSlideSkipped += V_Core::NumVoices;
@@ -1159,7 +1165,6 @@ static __forceinline void AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
 static __forceinline void AdvanceGroupedStoppedCoreVoicesWithoutIrq(
 	const uint coreidx)
 {
-	V_Core& core = Cores[coreidx];
 	const u32 member_mask =
 		s_equivalent_stopped_voice_member_masks[coreidx];
 
@@ -1169,28 +1174,17 @@ static __forceinline void AdvanceGroupedStoppedCoreVoicesWithoutIrq(
 			s_equivalent_stopped_voice_group_masks[coreidx][voiceidx];
 		if (group_mask != 0)
 		{
-			DecodeStoppedSamplesWithoutIrq(
-				core, voiceidx, group_mask);
-			UpdatePitch(coreidx, voiceidx);
-			ConsumeSamples(core, voiceidx);
+			AdvanceStoppedVoiceWithoutIrq(
+				coreidx, voiceidx, group_mask);
 		}
 		else if (!(member_mask & (1u << voiceidx)))
 		{
-			DecodeStoppedSamplesWithoutIrq(
-				core, voiceidx, 1u << voiceidx);
-			UpdatePitch(coreidx, voiceidx);
-			ConsumeSamples(core, voiceidx);
+			AdvanceStoppedVoiceWithoutIrq(
+				coreidx, voiceidx, 1u << voiceidx);
 		}
-
-		if (voiceidx == 1)
+		else
 		{
-			*GetMemPtr(((coreidx == 0) ? 0x400 : 0xc00) +
-				OutPos) = 0;
-		}
-		else if (voiceidx == 3)
-		{
-			*GetMemPtr(((coreidx == 0) ? 0x600 : 0xe00) +
-				OutPos) = 0;
+			WriteStoppedVoiceOutputWithoutIrq(coreidx, voiceidx);
 		}
 	}
 
@@ -1199,6 +1193,80 @@ static __forceinline void AdvanceGroupedStoppedCoreVoicesWithoutIrq(
 	g_qemuSpu2ZeroVoiceGateSkipped += V_Core::NumVoices;
 	g_qemuSpu2EquivalentStoppedCoreSamples++;
 #endif
+}
+
+static __forceinline void MixVoiceOutput(
+	VoiceMixSet& dest, const V_Core& core, const uint voiceidx,
+	const StereoOut32& value)
+{
+	if ((value.Left | value.Right) == 0)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSpu2ZeroVoiceGateSkipped++;
+#endif
+		return;
+	}
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2NonzeroVoiceGateMixed++;
+#endif
+
+	dest.Dry.Left += value.Left & core.VoiceGates[voiceidx].DryL;
+	dest.Dry.Right += value.Right & core.VoiceGates[voiceidx].DryR;
+	dest.Wet.Left += value.Left & core.VoiceGates[voiceidx].WetL;
+	dest.Wet.Right += value.Right & core.VoiceGates[voiceidx].WetR;
+}
+
+static __noinline void MixCoreVoicesWithStoppedFastPath(
+	VoiceMixSet& dest, const uint coreidx)
+{
+	if (Cores[0].IRQEnable || Cores[1].IRQEnable)
+	{
+		MixCoreVoices(dest, coreidx);
+		return;
+	}
+
+	V_Core& core = Cores[coreidx];
+	const u32 member_mask =
+		s_equivalent_stopped_voice_member_masks[coreidx];
+
+	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
+	{
+		const u32 voice_mask = 1u << voiceidx;
+		const u32 group_mask =
+			s_equivalent_stopped_voice_group_masks[coreidx][voiceidx];
+		if (group_mask != 0)
+		{
+			AdvanceStoppedVoiceWithoutIrq(
+				coreidx, voiceidx, group_mask);
+#if defined(VITASX2_QEMU_VALIDATION)
+			const u32 members = __builtin_popcount(group_mask);
+			g_qemuSpu2VoiceVolumeSlideSkipped += members;
+			g_qemuSpu2ZeroVoiceGateSkipped += members;
+#endif
+			continue;
+		}
+		if (member_mask & voice_mask)
+		{
+			WriteStoppedVoiceOutputWithoutIrq(coreidx, voiceidx);
+			continue;
+		}
+
+		V_Voice& voice = core.Voices[voiceidx];
+		if (voice.ADSR.Phase == V_ADSR::PHASE_STOPPED &&
+			!voice.Volume.HasActiveSlide())
+		{
+			AdvanceStoppedVoiceWithoutIrq(
+				coreidx, voiceidx, voice_mask);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSpu2VoiceVolumeSlideSkipped++;
+			g_qemuSpu2ZeroVoiceGateSkipped++;
+#endif
+			continue;
+		}
+
+		MixVoiceOutput(
+			dest, core, voiceidx, MixVoice(coreidx, voiceidx));
+	}
 }
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -1214,6 +1282,18 @@ void Spu2MixStoppedCoreVoicesSelectedForValidation(uint coreidx)
 		AdvanceStoppedCoreVoices(coreidx);
 	else
 		AdvanceStoppedCoreVoicesWithoutIrq(coreidx);
+}
+
+void Spu2MixCoreVoicesReferenceForValidation(
+	VoiceMixSet& dest, uint coreidx)
+{
+	MixCoreVoices(dest, coreidx);
+}
+
+void Spu2MixCoreVoicesSelectedForValidation(
+	VoiceMixSet& dest, uint coreidx)
+{
+	MixCoreVoicesWithStoppedFastPath(dest, coreidx);
 }
 
 void Spu2MixEquivalentStoppedVoicesBatchForValidation(u32 samples)
@@ -1494,8 +1574,8 @@ void spu2Mix()
 	}
 	else
 	{
-		MixCoreVoices(VoiceData[0], 0);
-		MixCoreVoices(VoiceData[1], 1);
+		MixCoreVoicesWithStoppedFastPath(VoiceData[0], 0);
+		MixCoreVoicesWithStoppedFastPath(VoiceData[1], 1);
 	}
 
 	StereoOut32 Ext(MixCore(0, VoiceData[0], InputData[0], StereoOut32::Empty));

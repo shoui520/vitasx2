@@ -394,6 +394,28 @@ __forceinline void TimeUpdate(u32 cClocks)
 			}
 		}
 
+		if (!equivalent_stopped_voice_batch_started &&
+			!Cores[0].IRQEnable && !Cores[1].IRQEnable)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			const bool equivalent_stopped_voice_batch_enabled =
+				s_vita_spu2_equivalent_stopped_voice_batch_enabled;
+#else
+			constexpr bool equivalent_stopped_voice_batch_enabled = true;
+#endif
+			if (equivalent_stopped_voice_batch_enabled)
+			{
+				// No guest register or DMA observer can intervene before this
+				// TimeUpdate() returns. Build stopped-voice equivalence groups
+				// after applying the pending key state, even when another
+				// voice remains active in the same core.
+				MULTI_ISA_SELECT(
+					BeginEquivalentStoppedVoiceBatchWithoutIrq)(
+					(dClocks / TickInterval) + 1u);
+				equivalent_stopped_voice_batch_started = true;
+			}
+		}
+
 		if (!all_voices_stopped_without_slides)
 		{
 			all_voices_stopped_without_slides =
@@ -401,24 +423,7 @@ __forceinline void TimeUpdate(u32 cClocks)
 #if defined(VITASX2_QEMU_VALIDATION)
 			all_voices_stopped_without_slides &=
 				s_vita_spu2_stopped_voice_fast_path_enabled;
-			const bool equivalent_stopped_voice_batch_enabled =
-				s_vita_spu2_equivalent_stopped_voice_batch_enabled;
-#else
-			constexpr bool equivalent_stopped_voice_batch_enabled = true;
 #endif
-			if (all_voices_stopped_without_slides &&
-				!Cores[0].IRQEnable && !Cores[1].IRQEnable &&
-				equivalent_stopped_voice_batch_enabled)
-			{
-				// No guest register or DMA observer can intervene before this
-				// TimeUpdate() returns. Let the selected mixer coalesce only
-				// equivalent stopped voices for the current sample and every
-				// remaining complete sample in this exact batch.
-				MULTI_ISA_SELECT(
-					BeginEquivalentStoppedVoiceBatchWithoutIrq)(
-					(dClocks / TickInterval) + 1u);
-				equivalent_stopped_voice_batch_started = true;
-			}
 		}
 		g_spu2AllVoicesStoppedWithoutSlides =
 			all_voices_stopped_without_slides;
