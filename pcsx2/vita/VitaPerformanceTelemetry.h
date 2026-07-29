@@ -217,6 +217,7 @@ namespace VitaPerformanceTelemetry
 		u64 spu2_mixer_irq_enabled_cores = 0;
 		u64 spu2_mixer_reverb_range_cores = 0;
 		u64 spu2_mixer_auto_dma_cores = 0;
+		u64 spu2_mixer_equivalent_stopped_cores = 0;
 		// Unlike the sparse stage sampler, these diagnostic-only totals observe
 		// every cold EE compilation. This prevents a compiler burst from
 		// aliasing against the fixed scheduler sample cadence.
@@ -344,7 +345,8 @@ namespace VitaPerformanceTelemetry
 	void RecordSpu2MixerProbe(u32 active_voices, u32 stopped_voices,
 		u32 sliding_voices, u32 noise_voices, u32 modulated_voices,
 		u32 fx_enabled_cores, u32 irq_enabled_cores,
-		u32 reverb_range_cores, u32 auto_dma_cores);
+		u32 reverb_range_cores, u32 auto_dma_cores,
+		u32 equivalent_stopped_cores);
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
 		u32 iop_pc, u64 iop_cycle)
@@ -538,7 +540,7 @@ namespace VitaPerformanceTelemetry
 		u32 active_voices, u32 stopped_voices, u32 sliding_voices,
 		u32 noise_voices, u32 modulated_voices, u32 fx_enabled_cores,
 		u32 irq_enabled_cores, u32 reverb_range_cores,
-		u32 auto_dma_cores)
+		u32 auto_dma_cores, u32 equivalent_stopped_cores)
 	{
 #if defined(VITASX2_CPU_PROFILER)
 		if (g_cpu_stage_profiler_enabled)
@@ -546,7 +548,8 @@ namespace VitaPerformanceTelemetry
 			RecordSpu2MixerProbe(active_voices, stopped_voices,
 				sliding_voices, noise_voices, modulated_voices,
 				fx_enabled_cores, irq_enabled_cores,
-				reverb_range_cores, auto_dma_cores);
+				reverb_range_cores, auto_dma_cores,
+				equivalent_stopped_cores);
 		}
 #else
 		(void)active_voices;
@@ -558,6 +561,7 @@ namespace VitaPerformanceTelemetry
 		(void)irq_enabled_cores;
 		(void)reverb_range_cores;
 		(void)auto_dma_cores;
+		(void)equivalent_stopped_cores;
 #endif
 	}
 

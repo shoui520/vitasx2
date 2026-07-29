@@ -49,6 +49,7 @@ u32 g_qemuSpu2AdpcmSsatClamps = 0;
 u32 g_qemuSpu2MixerIrqDisabledChecksSkipped = 0;
 u32 g_qemuSpu2PitchClampUsat = 0;
 u32 g_qemuSpu2StoppedVoiceFastSamples = 0;
+u32 g_qemuSpu2EquivalentStoppedCoreSamples = 0;
 u64 g_qemuSpu2OutputHash = 1469598103934665603ull;
 u32 g_qemuSpu2OutputSamples = 0;
 #endif
@@ -806,7 +807,7 @@ static __forceinline void IncrementStoppedNextAWithoutIrq(V_Voice& voice)
 }
 
 static __forceinline void DecodeStoppedSamplesWithoutIrq(
-	V_Core& core, uint voiceidx)
+	V_Core& core, uint voiceidx, u32 endx_mask)
 {
 	V_Voice& voice = core.Voices[voiceidx];
 
@@ -826,7 +827,7 @@ static __forceinline void DecodeStoppedSamplesWithoutIrq(
 	{
 		if (voice.LoopFlags & XAFLAG_LOOP_END)
 		{
-			core.Regs.ENDX |= 1u << voiceidx;
+			core.Regs.ENDX |= endx_mask;
 			voice.NextA = voice.LoopStartA;
 			if (!(voice.LoopFlags & XAFLAG_LOOP))
 				voice.Stop();
@@ -844,7 +845,8 @@ static __forceinline void AdvanceStoppedCoreVoicesWithoutIrq(
 
 	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
 	{
-		DecodeStoppedSamplesWithoutIrq(core, voiceidx);
+		DecodeStoppedSamplesWithoutIrq(
+			core, voiceidx, 1u << voiceidx);
 		UpdatePitch(coreidx, voiceidx);
 		ConsumeSamples(core, voiceidx);
 
@@ -864,6 +866,154 @@ static __forceinline void AdvanceStoppedCoreVoicesWithoutIrq(
 #endif
 }
 
+static constexpr u32 AllCoreVoiceBits =
+	(1u << V_Core::NumVoices) - 1u;
+static u32 s_equivalent_stopped_voice_core_mask = 0;
+
+static bool MixerWritesMayTouchBlock(u32 block)
+{
+	const u32 block_end = block + 7u;
+
+	// MixVoice(), MixCore(), and the core-0 external feed write the complete
+	// fixed sound-output window over an OutPos cycle.
+	if (block <= 0x1fffu && block_end >= 0x400u)
+		return true;
+
+	// AutoDMA owns the two MEMIN windows. Its refill can occur between the
+	// input and voice stages of any sample.
+	if (block <= 0x27ffu && block_end >= 0x2000u)
+		return true;
+
+	for (const V_Core& core : Cores)
+	{
+		if (!core.FxEnable || core.EffectsStartA >= core.EffectsEndA)
+			continue;
+
+		const u32 start = core.EffectsStartA & 0x3f'ffffu;
+		const u32 end =
+			(core.EffectsEndA & 0x3f'ffffu) | 0xffffu;
+
+		// Reverb addresses are masked to the 20-bit SPU2 RAM address after
+		// selecting a point in the possibly extended work-area interval.
+		for (u32 alias = block; alias <= 0x3f'ffffu;
+			 alias += 0x10'0000u)
+		{
+			if (alias <= end && alias + 7u >= start)
+				return true;
+			if (alias > 0x2f'ffffu)
+				break;
+		}
+	}
+
+	return false;
+}
+
+static bool CoreHasEquivalentStableStoppedVoices(const V_Core& core)
+{
+	const V_Voice& reference = core.Voices[0];
+	if (reference.ADSR.Phase != V_ADSR::PHASE_STOPPED ||
+		reference.Volume.HasActiveSlide() || reference.Modulated)
+	{
+		return false;
+	}
+
+	const u32 block = reference.NextA & 0xffff8u;
+	const u32 loop_flags =
+		static_cast<u16>(*GetMemPtr(block)) >> 8;
+	if ((loop_flags &
+			(XAFLAG_LOOP_END | XAFLAG_LOOP | XAFLAG_LOOP_START)) !=
+		(XAFLAG_LOOP_END | XAFLAG_LOOP | XAFLAG_LOOP_START) ||
+		MixerWritesMayTouchBlock(block))
+	{
+		return false;
+	}
+
+	if (reference.LoopMode && reference.LoopStartA != block)
+		return false;
+
+	for (uint voiceidx = 1; voiceidx < V_Core::NumVoices; ++voiceidx)
+	{
+		const V_Voice& voice = core.Voices[voiceidx];
+		if (voice.ADSR.Phase != V_ADSR::PHASE_STOPPED ||
+			voice.Volume.HasActiveSlide() || voice.Modulated ||
+			voice.Pitch != reference.Pitch ||
+			voice.LoopStartA != reference.LoopStartA ||
+			voice.NextA != reference.NextA ||
+			voice.LoopMode != reference.LoopMode ||
+			voice.SP != reference.SP ||
+			voice.SBuffer != reference.SBuffer ||
+			voice.DecPosWrite != reference.DecPosWrite ||
+			voice.DecPosRead != reference.DecPosRead)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void BeginEquivalentStoppedVoiceBatchWithoutIrq(u32 sample_count)
+{
+	s_equivalent_stopped_voice_core_mask = 0;
+
+	// A one-sample call cannot amortize the proof and publication scans.
+	if (sample_count < 2 || Cores[0].IRQEnable || Cores[1].IRQEnable)
+		return;
+
+	for (u32 coreidx = 0; coreidx < 2; ++coreidx)
+	{
+		if (CoreHasEquivalentStableStoppedVoices(Cores[coreidx]))
+			s_equivalent_stopped_voice_core_mask |= 1u << coreidx;
+	}
+}
+
+void FinishEquivalentStoppedVoiceBatchWithoutIrq()
+{
+	for (u32 coreidx = 0; coreidx < 2; ++coreidx)
+	{
+		if (!(s_equivalent_stopped_voice_core_mask & (1u << coreidx)))
+			continue;
+
+		V_Core& core = Cores[coreidx];
+		const V_Voice& reference = core.Voices[0];
+		for (uint voiceidx = 1; voiceidx < V_Core::NumVoices;
+			 voiceidx++)
+		{
+			V_Voice& voice = core.Voices[voiceidx];
+			voice.LoopStartA = reference.LoopStartA;
+			voice.NextA = reference.NextA;
+			voice.LoopFlags = reference.LoopFlags;
+			voice.SP = reference.SP;
+			voice.SBuffer = reference.SBuffer;
+			voice.DecPosWrite = reference.DecPosWrite;
+			voice.DecPosRead = reference.DecPosRead;
+		}
+	}
+
+	s_equivalent_stopped_voice_core_mask = 0;
+}
+
+static __forceinline void AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
+	const uint coreidx)
+{
+	V_Core& core = Cores[coreidx];
+	DecodeStoppedSamplesWithoutIrq(
+		core, 0, AllCoreVoiceBits);
+	UpdatePitch(coreidx, 0);
+	ConsumeSamples(core, 0);
+
+	// Stopped voices 1 and 3 still publish zero to their architectural output
+	// areas every sample. IRQs are proven disabled for this entire batch.
+	*GetMemPtr(((coreidx == 0) ? 0x400 : 0xc00) + OutPos) = 0;
+	*GetMemPtr(((coreidx == 0) ? 0x600 : 0xe00) + OutPos) = 0;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2VoiceVolumeSlideSkipped += V_Core::NumVoices;
+	g_qemuSpu2ZeroVoiceGateSkipped += V_Core::NumVoices;
+	g_qemuSpu2EquivalentStoppedCoreSamples++;
+#endif
+}
+
 #if defined(VITASX2_QEMU_VALIDATION)
 void Spu2MixStoppedCoreVoicesReferenceForValidation(uint coreidx)
 {
@@ -877,6 +1027,28 @@ void Spu2MixStoppedCoreVoicesSelectedForValidation(uint coreidx)
 		AdvanceStoppedCoreVoices(coreidx);
 	else
 		AdvanceStoppedCoreVoicesWithoutIrq(coreidx);
+}
+
+void Spu2MixEquivalentStoppedVoicesBatchForValidation(u32 samples)
+{
+	BeginEquivalentStoppedVoiceBatchWithoutIrq(samples);
+	for (u32 sample = 0; sample < samples; ++sample)
+	{
+		for (u32 coreidx = 0; coreidx < 2; ++coreidx)
+		{
+			if (s_equivalent_stopped_voice_core_mask &
+				(1u << coreidx))
+			{
+				AdvanceEquivalentStoppedCoreVoicesWithoutIrq(coreidx);
+			}
+			else
+			{
+				AdvanceStoppedCoreVoicesWithoutIrq(coreidx);
+			}
+		}
+		OutPos = (OutPos + 1u) & 0x1ffu;
+	}
+	FinishEquivalentStoppedVoiceBatchWithoutIrq();
 }
 #endif
 
@@ -1020,7 +1192,9 @@ static void ProbeSpu2MixerState()
 	VitaPerformanceTelemetry::RecordSpu2MixerProbeIfProfiling(
 		active_voices, stopped_voices, sliding_voices, noise_voices,
 		modulated_voices, fx_enabled_cores, irq_enabled_cores,
-		reverb_range_cores, auto_dma_cores);
+		reverb_range_cores, auto_dma_cores,
+		static_cast<u32>(__builtin_popcount(
+			s_equivalent_stopped_voice_core_mask)));
 }
 #endif
 
@@ -1059,8 +1233,19 @@ void spu2Mix()
 		}
 		else
 		{
-			AdvanceStoppedCoreVoicesWithoutIrq(0);
-			AdvanceStoppedCoreVoicesWithoutIrq(1);
+			for (u32 coreidx = 0; coreidx < 2; ++coreidx)
+			{
+				if (s_equivalent_stopped_voice_core_mask &
+					(1u << coreidx))
+				{
+					AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
+						coreidx);
+				}
+				else
+				{
+					AdvanceStoppedCoreVoicesWithoutIrq(coreidx);
+				}
+			}
 		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuSpu2StoppedVoiceFastSamples++;

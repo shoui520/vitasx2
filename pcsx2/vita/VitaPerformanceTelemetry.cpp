@@ -984,7 +984,8 @@ namespace VitaPerformanceTelemetry
 	void RecordSpu2MixerProbe(u32 active_voices, u32 stopped_voices,
 		u32 sliding_voices, u32 noise_voices, u32 modulated_voices,
 		u32 fx_enabled_cores, u32 irq_enabled_cores,
-		u32 reverb_range_cores, u32 auto_dma_cores)
+		u32 reverb_range_cores, u32 auto_dma_cores,
+		u32 equivalent_stopped_cores)
 	{
 		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
 		totals.spu2_mixer_probes++;
@@ -997,6 +998,8 @@ namespace VitaPerformanceTelemetry
 		totals.spu2_mixer_irq_enabled_cores += irq_enabled_cores;
 		totals.spu2_mixer_reverb_range_cores += reverb_range_cores;
 		totals.spu2_mixer_auto_dma_cores += auto_dma_cores;
+		totals.spu2_mixer_equivalent_stopped_cores +=
+			equivalent_stopped_cores;
 	}
 #endif
 }

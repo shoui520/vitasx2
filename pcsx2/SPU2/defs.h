@@ -69,7 +69,10 @@ extern s16* GetMemPtr(u32 addr);
 extern s16 spu2M_Read(u32 addr);
 extern void spu2M_Write(u32 addr, s16 value);
 extern void spu2M_Write(u32 addr, u16 value);
-MULTI_ISA_DEF(void spu2Mix();)
+MULTI_ISA_DEF(
+	void spu2Mix();
+	void BeginEquivalentStoppedVoiceBatchWithoutIrq(u32 sample_count);
+	void FinishEquivalentStoppedVoiceBatchWithoutIrq();)
 extern void spu2Output(StereoOut32 out);
 
 static __forceinline s16 SignExtend16(u16 v)

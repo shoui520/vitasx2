@@ -831,6 +831,7 @@ namespace MTGS
 			EE_DEADLINE_DELTA(spu2_mixer_irq_enabled_cores);
 			EE_DEADLINE_DELTA(spu2_mixer_reverb_range_cores);
 			EE_DEADLINE_DELTA(spu2_mixer_auto_dma_cores);
+			EE_DEADLINE_DELTA(spu2_mixer_equivalent_stopped_cores);
 #undef EE_DEADLINE_DELTA
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_summary "
@@ -990,7 +991,7 @@ namespace MTGS
 				"sliding_voices=%llu noise_voices=%llu "
 				"modulated_voices=%llu fx_enabled_cores=%llu "
 				"irq_enabled_cores=%llu reverb_range_cores=%llu "
-				"auto_dma_cores=%llu",
+				"auto_dma_cores=%llu equivalent_stopped_cores=%llu",
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(spu2_mixer_probes),
 				static_cast<unsigned long long>(
@@ -1010,7 +1011,9 @@ namespace MTGS
 				static_cast<unsigned long long>(
 					spu2_mixer_reverb_range_cores),
 				static_cast<unsigned long long>(
-					spu2_mixer_auto_dma_cores));
+					spu2_mixer_auto_dma_cores),
+				static_cast<unsigned long long>(
+					spu2_mixer_equivalent_stopped_cores));
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_time_us{};
 			std::array<u64,

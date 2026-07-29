@@ -319,6 +319,7 @@ static constexpr u32 VitaPeriodicBatchSamples = 64;
 #if defined(VITASX2_QEMU_VALIDATION)
 static bool s_vita_spu2_periodic_batch_enabled = true;
 static bool s_vita_spu2_stopped_voice_fast_path_enabled = true;
+static bool s_vita_spu2_equivalent_stopped_voice_batch_enabled = true;
 #endif
 
 bool g_spu2AllVoicesStoppedWithoutSlides = false;
@@ -370,6 +371,7 @@ __forceinline void TimeUpdate(u32 cClocks)
 
 	//Update Mixing Progress
 	bool all_voices_stopped_without_slides = false;
+	bool equivalent_stopped_voice_batch_started = false;
 	while (dClocks >= TickInterval)
 	{
 		dClocks -= TickInterval;
@@ -398,11 +400,33 @@ __forceinline void TimeUpdate(u32 cClocks)
 #if defined(VITASX2_QEMU_VALIDATION)
 			all_voices_stopped_without_slides &=
 				s_vita_spu2_stopped_voice_fast_path_enabled;
+			const bool equivalent_stopped_voice_batch_enabled =
+				s_vita_spu2_equivalent_stopped_voice_batch_enabled;
+#else
+			constexpr bool equivalent_stopped_voice_batch_enabled = true;
 #endif
+			if (all_voices_stopped_without_slides &&
+				!Cores[0].IRQEnable && !Cores[1].IRQEnable &&
+				equivalent_stopped_voice_batch_enabled)
+			{
+				// No guest register or DMA observer can intervene before this
+				// TimeUpdate() returns. Let the selected mixer coalesce only
+				// equivalent stopped voices for the current sample and every
+				// remaining complete sample in this exact batch.
+				MULTI_ISA_SELECT(
+					BeginEquivalentStoppedVoiceBatchWithoutIrq)(
+					(dClocks / TickInterval) + 1u);
+				equivalent_stopped_voice_batch_started = true;
+			}
 		}
 		g_spu2AllVoicesStoppedWithoutSlides =
 			all_voices_stopped_without_slides;
 		spu2Mix();
+	}
+	if (equivalent_stopped_voice_batch_started)
+	{
+		MULTI_ISA_SELECT(
+			FinishEquivalentStoppedVoiceBatchWithoutIrq)();
 	}
 	g_spu2AllVoicesStoppedWithoutSlides = false;
 
@@ -503,6 +527,12 @@ void SPU2::VitaSetSpu2PeriodicBatchEnabledForValidation(bool enabled)
 void SPU2::VitaSetSpu2StoppedVoiceFastPathEnabledForValidation(bool enabled)
 {
 	s_vita_spu2_stopped_voice_fast_path_enabled = enabled;
+}
+
+void SPU2::VitaSetSpu2EquivalentStoppedVoiceBatchEnabledForValidation(
+	bool enabled)
+{
+	s_vita_spu2_equivalent_stopped_voice_batch_enabled = enabled;
 }
 #endif
 
