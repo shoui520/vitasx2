@@ -16,6 +16,7 @@
 #include "SPU2/Dma.h"
 #include "SPU2/regs.h"
 #include "SPU2/spu2.h"
+#include "vita/VitaPerformanceTelemetry.h"
 
 #include "common/Console.h"
 
@@ -317,7 +318,26 @@ static constexpr u32 VitaPeriodicBatchSamples = 64;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 static bool s_vita_spu2_periodic_batch_enabled = true;
+static bool s_vita_spu2_stopped_voice_fast_path_enabled = true;
 #endif
+
+bool g_spu2AllVoicesStoppedWithoutSlides = false;
+
+static __forceinline bool AllVoicesStoppedWithoutSlides()
+{
+	for (const V_Core& core : Cores)
+	{
+		for (const V_Voice& voice : core.Voices)
+		{
+			if (voice.ADSR.Phase != V_ADSR::PHASE_STOPPED ||
+				voice.Volume.HasActiveSlide())
+			{
+				return false;
+			}
+		}
+	}
+	return true;
+}
 
 __forceinline void TimeUpdate(u32 cClocks)
 {
@@ -328,7 +348,10 @@ __forceinline void TimeUpdate(u32 cClocks)
 	//  such cases we just want to ignore the TimeUpdate call.
 
 	if (dClocks > (u32)-15)
+	{
+		VitaPerformanceTelemetry::RecordSpu2TimeUpdateIfProfiling(0);
 		return;
+	}
 
 	//  But if for some reason our clock value seems way off base (typically due to bad dma
 	//  timings from PCSX2), just mix out a little bit, skip the rest, and hope the ship
@@ -342,7 +365,11 @@ __forceinline void TimeUpdate(u32 cClocks)
 		lClocks = cClocks - dClocks;
 	}
 
+	VitaPerformanceTelemetry::RecordSpu2TimeUpdateIfProfiling(
+		dClocks / TickInterval);
+
 	//Update Mixing Progress
+	bool all_voices_stopped_without_slides = false;
 	while (dClocks >= TickInterval)
 	{
 		dClocks -= TickInterval;
@@ -364,8 +391,20 @@ __forceinline void TimeUpdate(u32 cClocks)
 			}
 		}
 
+		if (!all_voices_stopped_without_slides)
+		{
+			all_voices_stopped_without_slides =
+				AllVoicesStoppedWithoutSlides();
+#if defined(VITASX2_QEMU_VALIDATION)
+			all_voices_stopped_without_slides &=
+				s_vita_spu2_stopped_voice_fast_path_enabled;
+#endif
+		}
+		g_spu2AllVoicesStoppedWithoutSlides =
+			all_voices_stopped_without_slides;
 		spu2Mix();
 	}
+	g_spu2AllVoicesStoppedWithoutSlides = false;
 
 	CheckDMAProgress(0);
 	CheckDMAProgress(1);
@@ -445,6 +484,8 @@ u32 SPU2::GetNextPeriodicUpdateDelta()
 
 void SPU2::SynchronizeToIopCycle()
 {
+	VitaPerformanceTelemetry::RecordSpu2SyncReasonIfProfiling(
+		VitaPerformanceTelemetry::Spu2SyncReason::Observer);
 	TimeUpdate(psxRegs.cycle);
 }
 
@@ -457,6 +498,11 @@ void SPU2::ReschedulePeriodicUpdate()
 void SPU2::VitaSetSpu2PeriodicBatchEnabledForValidation(bool enabled)
 {
 	s_vita_spu2_periodic_batch_enabled = enabled;
+}
+
+void SPU2::VitaSetSpu2StoppedVoiceFastPathEnabledForValidation(bool enabled)
+{
+	s_vita_spu2_stopped_voice_fast_path_enabled = enabled;
 }
 #endif
 

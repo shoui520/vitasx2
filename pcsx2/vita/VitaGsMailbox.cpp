@@ -792,6 +792,28 @@ namespace MTGS
 				joint_wait_ram_write_overlaps_outside_scheduler);
 			EE_DEADLINE_DELTA(joint_wait_activations);
 			EE_DEADLINE_DELTA(joint_wait_scheduled_ee_cycles);
+			EE_DEADLINE_DELTA(spu2_time_update_calls);
+			EE_DEADLINE_DELTA(spu2_time_update_samples);
+			EE_DEADLINE_DELTA(spu2_time_update_zero_samples);
+			EE_DEADLINE_DELTA(spu2_time_update_one_sample);
+			EE_DEADLINE_DELTA(spu2_time_update_2_to_15_samples);
+			EE_DEADLINE_DELTA(spu2_time_update_16_to_63_samples);
+			EE_DEADLINE_DELTA(spu2_time_update_64_plus_samples);
+			EE_DEADLINE_DELTA(spu2_sync_periodic);
+			EE_DEADLINE_DELTA(spu2_sync_register_reads);
+			EE_DEADLINE_DELTA(spu2_sync_register_writes);
+			EE_DEADLINE_DELTA(spu2_sync_dma);
+			EE_DEADLINE_DELTA(spu2_sync_observers);
+			EE_DEADLINE_DELTA(spu2_mixer_probes);
+			EE_DEADLINE_DELTA(spu2_mixer_active_voices);
+			EE_DEADLINE_DELTA(spu2_mixer_stopped_voices);
+			EE_DEADLINE_DELTA(spu2_mixer_sliding_voices);
+			EE_DEADLINE_DELTA(spu2_mixer_noise_voices);
+			EE_DEADLINE_DELTA(spu2_mixer_modulated_voices);
+			EE_DEADLINE_DELTA(spu2_mixer_fx_enabled_cores);
+			EE_DEADLINE_DELTA(spu2_mixer_irq_enabled_cores);
+			EE_DEADLINE_DELTA(spu2_mixer_reverb_range_cores);
+			EE_DEADLINE_DELTA(spu2_mixer_auto_dma_cores);
 #undef EE_DEADLINE_DELTA
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_summary "
@@ -920,6 +942,58 @@ namespace MTGS
 					joint_wait_scheduled_ee_cycles),
 				end.cpu_stage_profiler.joint_wait_last_ram_offset,
 				end.cpu_stage_profiler.joint_wait_last_ram_size);
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=spu2_sync "
+				"time_updates=%llu samples=%llu zero=%llu one=%llu "
+				"samples_2_15=%llu samples_16_63=%llu samples_64_plus=%llu "
+				"periodic=%llu reads=%llu writes=%llu dma=%llu observers=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(spu2_time_update_calls),
+				static_cast<unsigned long long>(spu2_time_update_samples),
+				static_cast<unsigned long long>(
+					spu2_time_update_zero_samples),
+				static_cast<unsigned long long>(
+					spu2_time_update_one_sample),
+				static_cast<unsigned long long>(
+					spu2_time_update_2_to_15_samples),
+				static_cast<unsigned long long>(
+					spu2_time_update_16_to_63_samples),
+				static_cast<unsigned long long>(
+					spu2_time_update_64_plus_samples),
+				static_cast<unsigned long long>(spu2_sync_periodic),
+				static_cast<unsigned long long>(
+					spu2_sync_register_reads),
+				static_cast<unsigned long long>(
+					spu2_sync_register_writes),
+				static_cast<unsigned long long>(spu2_sync_dma),
+				static_cast<unsigned long long>(spu2_sync_observers));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=spu2_mixer "
+				"probes=%llu active_voices=%llu stopped_voices=%llu "
+				"sliding_voices=%llu noise_voices=%llu "
+				"modulated_voices=%llu fx_enabled_cores=%llu "
+				"irq_enabled_cores=%llu reverb_range_cores=%llu "
+				"auto_dma_cores=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(spu2_mixer_probes),
+				static_cast<unsigned long long>(
+					spu2_mixer_active_voices),
+				static_cast<unsigned long long>(
+					spu2_mixer_stopped_voices),
+				static_cast<unsigned long long>(
+					spu2_mixer_sliding_voices),
+				static_cast<unsigned long long>(
+					spu2_mixer_noise_voices),
+				static_cast<unsigned long long>(
+					spu2_mixer_modulated_voices),
+				static_cast<unsigned long long>(
+					spu2_mixer_fx_enabled_cores),
+				static_cast<unsigned long long>(
+					spu2_mixer_irq_enabled_cores),
+				static_cast<unsigned long long>(
+					spu2_mixer_reverb_range_cores),
+				static_cast<unsigned long long>(
+					spu2_mixer_auto_dma_cores));
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_time_us{};
 			std::array<u64,

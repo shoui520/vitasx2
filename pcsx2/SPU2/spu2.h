@@ -67,6 +67,7 @@ void ReschedulePeriodicUpdate();
 
 #if defined(VITASX2_QEMU_VALIDATION)
 void VitaSetSpu2PeriodicBatchEnabledForValidation(bool enabled);
+void VitaSetSpu2StoppedVoiceFastPathEnabledForValidation(bool enabled);
 #endif
 
 /// Directly updates the output volume without going through the configuration.
@@ -131,6 +132,7 @@ extern u32 g_qemuSpu2DecodeFifoNeonStores;
 extern u32 g_qemuSpu2DecodeFifoWrappedStores;
 extern u32 g_qemuSpu2MixerIrqDisabledChecksSkipped;
 extern u32 g_qemuSpu2PitchClampUsat;
+extern u32 g_qemuSpu2StoppedVoiceFastSamples;
 extern u64 g_qemuSpu2OutputHash;
 extern u32 g_qemuSpu2OutputSamples;
 extern u32 g_qemuSpu2DmaCopyNeonQwords;

@@ -64,6 +64,7 @@ struct StereoOut32
 };
 
 extern void (*spu2Mix)();
+extern bool g_spu2AllVoicesStoppedWithoutSlides;
 extern s16* GetMemPtr(u32 addr);
 extern s16 spu2M_Read(u32 addr);
 extern void spu2M_Write(u32 addr, s16 value);

@@ -79,6 +79,15 @@ namespace VitaPerformanceTelemetry
 		None,
 	};
 
+	enum class Spu2SyncReason : u8
+	{
+		Periodic,
+		RegisterRead,
+		RegisterWrite,
+		Dma,
+		Observer,
+	};
+
 	enum CpuProfileIntervalFlags : u16
 	{
 		CpuProfileIntervalBalanced = 1u << 0,
@@ -170,6 +179,28 @@ namespace VitaPerformanceTelemetry
 		u64 joint_wait_scheduled_ee_cycles = 0;
 		u32 joint_wait_last_ram_offset = UINT32_MAX;
 		u32 joint_wait_last_ram_size = 0;
+		u64 spu2_time_update_calls = 0;
+		u64 spu2_time_update_samples = 0;
+		u64 spu2_time_update_zero_samples = 0;
+		u64 spu2_time_update_one_sample = 0;
+		u64 spu2_time_update_2_to_15_samples = 0;
+		u64 spu2_time_update_16_to_63_samples = 0;
+		u64 spu2_time_update_64_plus_samples = 0;
+		u64 spu2_sync_periodic = 0;
+		u64 spu2_sync_register_reads = 0;
+		u64 spu2_sync_register_writes = 0;
+		u64 spu2_sync_dma = 0;
+		u64 spu2_sync_observers = 0;
+		u64 spu2_mixer_probes = 0;
+		u64 spu2_mixer_active_voices = 0;
+		u64 spu2_mixer_stopped_voices = 0;
+		u64 spu2_mixer_sliding_voices = 0;
+		u64 spu2_mixer_noise_voices = 0;
+		u64 spu2_mixer_modulated_voices = 0;
+		u64 spu2_mixer_fx_enabled_cores = 0;
+		u64 spu2_mixer_irq_enabled_cores = 0;
+		u64 spu2_mixer_reverb_range_cores = 0;
+		u64 spu2_mixer_auto_dma_cores = 0;
 		std::array<u64, CPU_STAGE_COUNT> stage_time_us{};
 		std::array<u64, CPU_STAGE_COUNT> stage_entries{};
 	};
@@ -232,6 +263,12 @@ namespace VitaPerformanceTelemetry
 		u32 ram_offset, u32 ram_size);
 	void RecordJointWaitRamWriteOverlap(bool scheduler_active);
 	void RecordJointWaitActivation(u32 scheduled_ee_cycles);
+	void RecordSpu2TimeUpdate(u32 samples);
+	void RecordSpu2SyncReason(Spu2SyncReason reason);
+	void RecordSpu2MixerProbe(u32 active_voices, u32 stopped_voices,
+		u32 sliding_voices, u32 noise_voices, u32 modulated_voices,
+		u32 fx_enabled_cores, u32 irq_enabled_cores,
+		u32 reverb_range_cores, u32 auto_dma_cores);
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
 		u32 iop_pc, u64 iop_cycle)
@@ -388,6 +425,53 @@ namespace VitaPerformanceTelemetry
 			RecordJointWaitActivation(scheduled_ee_cycles);
 #else
 		(void)scheduled_ee_cycles;
+#endif
+	}
+
+	inline void RecordSpu2TimeUpdateIfProfiling(u32 samples)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordSpu2TimeUpdate(samples);
+#else
+		(void)samples;
+#endif
+	}
+
+	inline void RecordSpu2SyncReasonIfProfiling(Spu2SyncReason reason)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordSpu2SyncReason(reason);
+#else
+		(void)reason;
+#endif
+	}
+
+	inline void RecordSpu2MixerProbeIfProfiling(
+		u32 active_voices, u32 stopped_voices, u32 sliding_voices,
+		u32 noise_voices, u32 modulated_voices, u32 fx_enabled_cores,
+		u32 irq_enabled_cores, u32 reverb_range_cores,
+		u32 auto_dma_cores)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+		{
+			RecordSpu2MixerProbe(active_voices, stopped_voices,
+				sliding_voices, noise_voices, modulated_voices,
+				fx_enabled_cores, irq_enabled_cores,
+				reverb_range_cores, auto_dma_cores);
+		}
+#else
+		(void)active_voices;
+		(void)stopped_voices;
+		(void)sliding_voices;
+		(void)noise_voices;
+		(void)modulated_voices;
+		(void)fx_enabled_cores;
+		(void)irq_enabled_cores;
+		(void)reverb_range_cores;
+		(void)auto_dma_cores;
 #endif
 	}
 

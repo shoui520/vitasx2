@@ -639,5 +639,63 @@ namespace VitaPerformanceTelemetry
 		totals.joint_wait_activations++;
 		totals.joint_wait_scheduled_ee_cycles += scheduled_ee_cycles;
 	}
+
+	void RecordSpu2TimeUpdate(u32 samples)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.spu2_time_update_calls++;
+		totals.spu2_time_update_samples += samples;
+		if (samples == 0)
+			totals.spu2_time_update_zero_samples++;
+		else if (samples == 1)
+			totals.spu2_time_update_one_sample++;
+		else if (samples < 16)
+			totals.spu2_time_update_2_to_15_samples++;
+		else if (samples < 64)
+			totals.spu2_time_update_16_to_63_samples++;
+		else
+			totals.spu2_time_update_64_plus_samples++;
+	}
+
+	void RecordSpu2SyncReason(Spu2SyncReason reason)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		switch (reason)
+		{
+			case Spu2SyncReason::Periodic:
+				totals.spu2_sync_periodic++;
+				break;
+			case Spu2SyncReason::RegisterRead:
+				totals.spu2_sync_register_reads++;
+				break;
+			case Spu2SyncReason::RegisterWrite:
+				totals.spu2_sync_register_writes++;
+				break;
+			case Spu2SyncReason::Dma:
+				totals.spu2_sync_dma++;
+				break;
+			case Spu2SyncReason::Observer:
+				totals.spu2_sync_observers++;
+				break;
+		}
+	}
+
+	void RecordSpu2MixerProbe(u32 active_voices, u32 stopped_voices,
+		u32 sliding_voices, u32 noise_voices, u32 modulated_voices,
+		u32 fx_enabled_cores, u32 irq_enabled_cores,
+		u32 reverb_range_cores, u32 auto_dma_cores)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.spu2_mixer_probes++;
+		totals.spu2_mixer_active_voices += active_voices;
+		totals.spu2_mixer_stopped_voices += stopped_voices;
+		totals.spu2_mixer_sliding_voices += sliding_voices;
+		totals.spu2_mixer_noise_voices += noise_voices;
+		totals.spu2_mixer_modulated_voices += modulated_voices;
+		totals.spu2_mixer_fx_enabled_cores += fx_enabled_cores;
+		totals.spu2_mixer_irq_enabled_cores += irq_enabled_cores;
+		totals.spu2_mixer_reverb_range_cores += reverb_range_cores;
+		totals.spu2_mixer_auto_dma_cores += auto_dma_cores;
+	}
 #endif
 }

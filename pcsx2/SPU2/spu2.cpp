@@ -10,6 +10,7 @@
 #include "GS/GSCapture.h"
 #include "MTGS.h"
 #include "R3000A.h"
+#include "vita/VitaPerformanceTelemetry.h"
 #include "VMManager.h"
 
 #include "common/Error.h"
@@ -50,6 +51,8 @@ u32 SPU2::GetConsoleSampleRate()
 
 void SPU2readDMA4Mem(u16* pMem, u32 size) // size now in 16bit units
 {
+	VitaPerformanceTelemetry::RecordSpu2SyncReasonIfProfiling(
+		VitaPerformanceTelemetry::Spu2SyncReason::Dma);
 	TimeUpdate(psxRegs.cycle);
 
 	SPU2::FileLog("[%10d] SPU2 readDMA4Mem size %x\n", Cycles, size << 1);
@@ -61,6 +64,8 @@ void SPU2readDMA4Mem(u16* pMem, u32 size) // size now in 16bit units
 
 void SPU2writeDMA4Mem(u16* pMem, u32 size) // size now in 16bit units
 {
+	VitaPerformanceTelemetry::RecordSpu2SyncReasonIfProfiling(
+		VitaPerformanceTelemetry::Spu2SyncReason::Dma);
 	TimeUpdate(psxRegs.cycle);
 
 	SPU2::FileLog("[%10d] SPU2 writeDMA4Mem size %x at address %x\n", Cycles, size << 1, Cores[0].TSA);
@@ -91,6 +96,8 @@ void SPU2interruptDMA7()
 
 void SPU2readDMA7Mem(u16* pMem, u32 size)
 {
+	VitaPerformanceTelemetry::RecordSpu2SyncReasonIfProfiling(
+		VitaPerformanceTelemetry::Spu2SyncReason::Dma);
 	TimeUpdate(psxRegs.cycle);
 
 	SPU2::FileLog("[%10d] SPU2 readDMA7Mem size %x\n", Cycles, size << 1);
@@ -102,6 +109,8 @@ void SPU2readDMA7Mem(u16* pMem, u32 size)
 
 void SPU2writeDMA7Mem(u16* pMem, u32 size)
 {
+	VitaPerformanceTelemetry::RecordSpu2SyncReasonIfProfiling(
+		VitaPerformanceTelemetry::Spu2SyncReason::Dma);
 	TimeUpdate(psxRegs.cycle);
 
 	SPU2::FileLog("[%10d] SPU2 writeDMA7Mem size %x at address %x\n", Cycles, size << 1, Cores[1].TSA);
@@ -394,6 +403,8 @@ void SPU2::CheckForConfigChanges(const Pcsx2Config& old_config)
 
 void SPU2async()
 {
+	VitaPerformanceTelemetry::RecordSpu2SyncReasonIfProfiling(
+		VitaPerformanceTelemetry::Spu2SyncReason::Periodic);
 	TimeUpdate(psxRegs.cycle);
 }
 
@@ -404,6 +415,8 @@ u16 SPU2read(u32 rmem)
 	const u32 mem = rmem & 0xFFFF;
 	u32 omem = mem;
 
+	VitaPerformanceTelemetry::RecordSpu2SyncReasonIfProfiling(
+		VitaPerformanceTelemetry::Spu2SyncReason::RegisterRead);
 	TimeUpdate(psxRegs.cycle);
 
 	if (mem & 0x400)
@@ -458,6 +471,8 @@ void SPU2write(u32 rmem, u16 value)
 	// If the SPU2 isn't in in sync with the IOP, samples can end up playing at rather
 	// incorrect pitches and loop lengths.
 
+	VitaPerformanceTelemetry::RecordSpu2SyncReasonIfProfiling(
+		VitaPerformanceTelemetry::Spu2SyncReason::RegisterWrite);
 	TimeUpdate(psxRegs.cycle);
 
 	if (rmem >> 16 == 0x1f80)

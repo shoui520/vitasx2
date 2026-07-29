@@ -7,6 +7,7 @@
 #include "SPU2/defs.h"
 #include "SPU2/spu2.h"
 #include "SPU2/interpolate_table.h"
+#include "vita/VitaPerformanceTelemetry.h"
 
 #include "common/Assertions.h"
 
@@ -47,6 +48,7 @@ u32 g_qemuSpu2DecodeFifoWrappedStores = 0;
 u32 g_qemuSpu2AdpcmSsatClamps = 0;
 u32 g_qemuSpu2MixerIrqDisabledChecksSkipped = 0;
 u32 g_qemuSpu2PitchClampUsat = 0;
+u32 g_qemuSpu2StoppedVoiceFastSamples = 0;
 u64 g_qemuSpu2OutputHash = 1469598103934665603ull;
 u32 g_qemuSpu2OutputSamples = 0;
 #endif
@@ -772,6 +774,45 @@ static __forceinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
 	}
 }
 
+static __forceinline void AdvanceStoppedCoreVoices(const uint coreidx)
+{
+	V_Core& thiscore(Cores[coreidx]);
+
+	// TimeUpdate() proves that every voice is stopped and has no active
+	// volume slide for the remainder of its uninterrupted sample batch.
+	// Preserve MixVoice()'s architectural side effects and their voice order,
+	// while omitting only branches and arithmetic whose result is known zero.
+	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
+	{
+		DecodeSamples(coreidx, voiceidx);
+		UpdatePitch(coreidx, voiceidx);
+		ConsumeSamples(thiscore, voiceidx);
+
+		if (voiceidx == 1)
+			spu2M_WriteFast(((0 == coreidx) ? 0x400 : 0xc00) + OutPos, 0);
+		else if (voiceidx == 3)
+			spu2M_WriteFast(((0 == coreidx) ? 0x600 : 0xe00) + OutPos, 0);
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2VoiceVolumeSlideSkipped += V_Core::NumVoices;
+	g_qemuSpu2ZeroVoiceGateSkipped += V_Core::NumVoices;
+#endif
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void Spu2MixStoppedCoreVoicesReferenceForValidation(uint coreidx)
+{
+	VoiceMixSet output = {StereoOut32(), StereoOut32()};
+	MixCoreVoices(output, coreidx);
+}
+
+void Spu2MixStoppedCoreVoicesSelectedForValidation(uint coreidx)
+{
+	AdvanceStoppedCoreVoices(coreidx);
+}
+#endif
+
 static __forceinline StereoOut32 MixCore(const uint coreidx, const VoiceMixSet& inVoices, const StereoOut32& Input, const StereoOut32& Ext)
 {
 	V_Core& thiscore(Cores[coreidx]);
@@ -867,8 +908,61 @@ static __forceinline StereoOut32 MixCore(const uint coreidx, const VoiceMixSet& 
 	return TD + ApplyVolume(RV, thiscore.FxVol);
 }
 
+#if defined(VITASX2_CPU_PROFILER)
+static void ProbeSpu2MixerState()
+{
+	static u32 s_sample_counter = 0;
+	if (!VitaPerformanceTelemetry::g_cpu_stage_profiler_enabled ||
+		(++s_sample_counter & 1023u) != 0)
+	{
+		return;
+	}
+
+	u32 active_voices = 0;
+	u32 stopped_voices = 0;
+	u32 sliding_voices = 0;
+	u32 noise_voices = 0;
+	u32 modulated_voices = 0;
+	u32 fx_enabled_cores = 0;
+	u32 irq_enabled_cores = 0;
+	u32 reverb_range_cores = 0;
+	u32 auto_dma_cores = 0;
+	for (const V_Core& core : Cores)
+	{
+		fx_enabled_cores += core.FxEnable ? 1u : 0u;
+		irq_enabled_cores += core.IRQEnable ? 1u : 0u;
+		reverb_range_cores +=
+			core.EffectsStartA < core.EffectsEndA ? 1u : 0u;
+		auto_dma_cores +=
+			(core.AdmaInProgress || core.InputDataLeft != 0 ||
+				core.InputDataTransferred != 0) ?
+				1u :
+				0u;
+		for (const V_Voice& voice : core.Voices)
+		{
+			const bool active =
+				voice.ADSR.Phase > V_ADSR::PHASE_STOPPED;
+			active_voices += active ? 1u : 0u;
+			stopped_voices += active ? 0u : 1u;
+			sliding_voices += voice.Volume.HasActiveSlide() ? 1u : 0u;
+			noise_voices += active && voice.Noise ? 1u : 0u;
+			modulated_voices += active && voice.Modulated ? 1u : 0u;
+		}
+	}
+
+	VitaPerformanceTelemetry::RecordSpu2MixerProbeIfProfiling(
+		active_voices, stopped_voices, sliding_voices, noise_voices,
+		modulated_voices, fx_enabled_cores, irq_enabled_cores,
+		reverb_range_cores, auto_dma_cores);
+}
+#endif
+
 void spu2Mix()
 {
+#if defined(VITASX2_CPU_PROFILER)
+	ProbeSpu2MixerState();
+#endif
+
 	// Note: Playmode 4 is SPDIF, which overrides other inputs.
 	StereoOut32 InputData[2] =
 		{
@@ -889,8 +983,19 @@ void spu2Mix()
 	// Todo: Replace me with memzero initializer!
 	VoiceMixSet VoiceData[2] = {{StereoOut32(), StereoOut32()}, {StereoOut32(), StereoOut32()}}; // mixed voice data for each core.
 
-	MixCoreVoices(VoiceData[0], 0);
-	MixCoreVoices(VoiceData[1], 1);
+	if (g_spu2AllVoicesStoppedWithoutSlides)
+	{
+		AdvanceStoppedCoreVoices(0);
+		AdvanceStoppedCoreVoices(1);
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSpu2StoppedVoiceFastSamples++;
+#endif
+	}
+	else
+	{
+		MixCoreVoices(VoiceData[0], 0);
+		MixCoreVoices(VoiceData[1], 1);
+	}
 
 	StereoOut32 Ext(MixCore(0, VoiceData[0], InputData[0], StereoOut32::Empty));
 
