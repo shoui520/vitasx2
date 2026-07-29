@@ -1730,9 +1730,50 @@ bool TryMixStoppedVoiceBatch(u32 sample_count)
 		return false;
 	}
 
+	u32 zero_input_reverb_batch_mask = 0;
+	if ((Cores[0].WetGate.InpL | Cores[0].WetGate.InpR |
+			Cores[1].WetGate.InpL | Cores[1].WetGate.InpR |
+			Cores[1].WetGate.ExtL | Cores[1].WetGate.ExtR) == 0)
+	{
+		const u32 core0_position = Cores[0].RevbSampleBufPos;
+		const u32 core1_position = Cores[1].RevbSampleBufPos;
+#if defined(VITASX2_QEMU_VALIDATION)
+		const u32 qemu_silent_reverb_samples =
+			g_qemuSpu2SilentReverbSamples;
+#endif
+#if defined(VITASX2_CPU_PROFILER)
+		const u64 profiled_silent_reverb_samples =
+			g_vitaSpu2SilentReverbSamples;
+#endif
+		const bool core0_advanced =
+			Cores[0].TryAdvanceZeroInputReverbBatch(sample_count);
+		const bool core1_advanced =
+			Cores[1].TryAdvanceZeroInputReverbBatch(sample_count);
+		if (core0_advanced && core1_advanced)
+		{
+			zero_input_reverb_batch_mask = 3u;
+		}
+		else
+		{
+			// Reverb work areas can alias across cores. Commit the closed
+			// recurrence only when both cores prove zero and therefore neither
+			// can write into the other's proven-zero range during this epoch.
+			Cores[0].RevbSampleBufPos = core0_position;
+			Cores[1].RevbSampleBufPos = core1_position;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSpu2SilentReverbSamples =
+				qemu_silent_reverb_samples;
+#endif
+#if defined(VITASX2_CPU_PROFILER)
+			g_vitaSpu2SilentReverbSamples =
+				profiled_silent_reverb_samples;
+#endif
+		}
+	}
 	VitaPerformanceTelemetry::RecordSpu2StoppedVoiceBatchIfProfiling(
 		sample_count, s_stable_stopped_voice_masks[0],
-		s_stable_stopped_voice_masks[1]);
+		s_stable_stopped_voice_masks[1],
+		zero_input_reverb_batch_mask);
 
 	for (u32 sample = 0; sample < sample_count; ++sample)
 	{
@@ -1814,7 +1855,10 @@ bool TryMixStoppedVoiceBatch(u32 sample_count)
 		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
 			VitaPerformanceTelemetry::CpuStage::Spu2Reverb);
 #endif
-		const StereoOut32 core0_reverb = core0.DoReverb(core0_wet);
+		const StereoOut32 core0_reverb =
+			(zero_input_reverb_batch_mask & 1u) ?
+				StereoOut32::Empty :
+				core0.DoReverb(core0_wet);
 #if defined(VITASX2_CPU_PROFILER)
 		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
 			VitaPerformanceTelemetry::CpuStage::Spu2Core);
@@ -1864,7 +1908,10 @@ bool TryMixStoppedVoiceBatch(u32 sample_count)
 		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
 			VitaPerformanceTelemetry::CpuStage::Spu2Reverb);
 #endif
-		const StereoOut32 core1_reverb = core1.DoReverb(core1_wet);
+		const StereoOut32 core1_reverb =
+			(zero_input_reverb_batch_mask & 2u) ?
+				StereoOut32::Empty :
+				core1.DoReverb(core1_wet);
 #if defined(VITASX2_CPU_PROFILER)
 		VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
 			VitaPerformanceTelemetry::CpuStage::Spu2Core);

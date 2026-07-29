@@ -1017,7 +1017,8 @@ namespace VitaPerformanceTelemetry
 	}
 
 	void RecordSpu2StoppedVoiceBatch(
-		u32 samples, u32 stable_core0_mask, u32 stable_core1_mask)
+		u32 samples, u32 stable_core0_mask, u32 stable_core1_mask,
+		u32 zero_input_reverb_core_mask)
 	{
 		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
 		totals.spu2_stopped_voice_batch_calls++;
@@ -1026,6 +1027,11 @@ namespace VitaPerformanceTelemetry
 			samples * static_cast<u32>(
 				__builtin_popcount(stable_core0_mask) +
 				__builtin_popcount(stable_core1_mask));
+		if (zero_input_reverb_core_mask != 0)
+			totals.spu2_zero_input_reverb_batch_calls++;
+		totals.spu2_zero_input_reverb_batch_core_samples +=
+			samples * static_cast<u32>(
+				__builtin_popcount(zero_input_reverb_core_mask));
 	}
 #endif
 }

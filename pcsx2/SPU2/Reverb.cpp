@@ -478,3 +478,32 @@ StereoOut32 V_Core::DoReverb(StereoOut32 Input)
 
 	return ReverbUpsample(*this);
 }
+
+bool V_Core::TryAdvanceZeroInputReverbBatch(const u32 sample_count)
+{
+	if (sample_count == 0)
+		return false;
+
+	// DoReverb() performs no work and advances no state for an invalid effects
+	// range. The caller proves that every wet input in this uninterrupted
+	// TimeUpdate() epoch is zero.
+	if (EffectsStartA >= EffectsEndA)
+		return true;
+
+	// One ordinary zero-input step establishes the existing RAM/history/IRQ
+	// proof and performs the first cursor update. With no guest observation or
+	// possible writer inside the epoch, the remaining identical zero steps
+	// only advance the same six-bit cursor.
+	if (!TryAdvanceSilentReverb(*this, StereoOut32::Empty))
+		return false;
+
+	RevbSampleBufPos =
+		(RevbSampleBufPos + sample_count - 1u) & 63u;
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2SilentReverbSamples += sample_count - 1u;
+#endif
+#if defined(VITASX2_CPU_PROFILER)
+	g_vitaSpu2SilentReverbSamples += sample_count - 1u;
+#endif
+	return true;
+}

@@ -531,6 +531,7 @@ struct V_Core
 	// --------------------------------------------------------------------------------------
 
 	StereoOut32 DoReverb(StereoOut32 Input);
+	bool TryAdvanceZeroInputReverbBatch(u32 sample_count);
 	s32 RevbGetIndexer(s32 offset);
 
 	StereoOut32 ReadInput();
@@ -608,6 +609,9 @@ extern int PlayMode;
 extern void NotifyReverbRamWrite(u32 address, u32 words);
 extern void InvalidateAllReverbZeroState();
 
+#if defined(VITASX2_QEMU_VALIDATION)
+extern u32 g_qemuSpu2SilentReverbSamples;
+#endif
 #if defined(VITASX2_CPU_PROFILER)
 extern u64 g_vitaSpu2SilentReverbSamples;
 extern u64 g_vitaSpu2SilentReverbInputRejects;
