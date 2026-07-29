@@ -442,5 +442,62 @@ namespace VitaPerformanceTelemetry
 			s_cpu_stage_profiler.totals.iop_manufactured_only++;
 		}
 	}
+
+	void RecordEeDeadlineHorizon(s64 owner_horizon_delta,
+		EeDeadlineOwner owner, s32 ee_iop_balance, bool timer_enabled,
+		u32 timer_delta, bool iop_rapid)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.ee_deadline_shadow_entries++;
+		switch (owner)
+		{
+			case EeDeadlineOwner::Iop:
+				totals.ee_deadline_owner_iop++;
+				break;
+			case EeDeadlineOwner::EeCounter:
+				totals.ee_deadline_owner_counter++;
+				break;
+			case EeDeadlineOwner::EeEvent:
+				totals.ee_deadline_owner_event++;
+				break;
+			case EeDeadlineOwner::None:
+				totals.ee_deadline_owner_none++;
+				break;
+		}
+
+		if (owner_horizon_delta <= 3072)
+		{
+			totals.ee_deadline_horizon_le_3072++;
+		}
+		else
+		{
+			totals.ee_deadline_horizon_gt_3072++;
+			if (owner_horizon_delta > 6144)
+				totals.ee_deadline_horizon_gt_6144++;
+			if (owner_horizon_delta > 12288)
+				totals.ee_deadline_horizon_gt_12288++;
+			if (!timer_enabled)
+				totals.ee_deadline_owner_beyond_3072_timer_off++;
+		}
+
+		if (timer_enabled)
+		{
+			totals.ee_deadline_timer_enabled++;
+			if (timer_delta <= 3072)
+				totals.ee_deadline_timer_within_3072++;
+		}
+		if (iop_rapid)
+			totals.ee_deadline_iop_rapid++;
+		if (ee_iop_balance > 0)
+		{
+			totals.ee_iop_balance_positive++;
+		}
+		else
+		{
+			totals.ee_iop_balance_nonpositive++;
+			if (ee_iop_balance < -3072)
+				totals.ee_iop_ahead_gt_3072++;
+		}
+	}
 #endif
 }

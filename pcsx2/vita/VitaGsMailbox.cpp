@@ -743,6 +743,28 @@ namespace MTGS
 			const u64 iop_manufactured_only = CounterDelta(
 				end.cpu_stage_profiler.iop_manufactured_only,
 				start.cpu_stage_profiler.iop_manufactured_only);
+			const u64 ee_deadline_shadow_entries = CounterDelta(
+				end.cpu_stage_profiler.ee_deadline_shadow_entries,
+				start.cpu_stage_profiler.ee_deadline_shadow_entries);
+#define EE_DEADLINE_DELTA(name) \
+			const u64 name = CounterDelta( \
+				end.cpu_stage_profiler.name, start.cpu_stage_profiler.name)
+			EE_DEADLINE_DELTA(ee_deadline_owner_iop);
+			EE_DEADLINE_DELTA(ee_deadline_owner_counter);
+			EE_DEADLINE_DELTA(ee_deadline_owner_event);
+			EE_DEADLINE_DELTA(ee_deadline_owner_none);
+			EE_DEADLINE_DELTA(ee_deadline_horizon_le_3072);
+			EE_DEADLINE_DELTA(ee_deadline_horizon_gt_3072);
+			EE_DEADLINE_DELTA(ee_deadline_horizon_gt_6144);
+			EE_DEADLINE_DELTA(ee_deadline_horizon_gt_12288);
+			EE_DEADLINE_DELTA(ee_deadline_timer_enabled);
+			EE_DEADLINE_DELTA(ee_deadline_timer_within_3072);
+			EE_DEADLINE_DELTA(ee_deadline_owner_beyond_3072_timer_off);
+			EE_DEADLINE_DELTA(ee_deadline_iop_rapid);
+			EE_DEADLINE_DELTA(ee_iop_balance_positive);
+			EE_DEADLINE_DELTA(ee_iop_balance_nonpositive);
+			EE_DEADLINE_DELTA(ee_iop_ahead_gt_3072);
+#undef EE_DEADLINE_DELTA
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_summary "
 				"sample_period=%u scheduler_entries=%llu samples=%llu "
@@ -770,6 +792,33 @@ namespace MTGS
 				static_cast<unsigned long long>(iop_intc_visible),
 				static_cast<unsigned long long>(iop_callback_due),
 				static_cast<unsigned long long>(iop_manufactured_only));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=ee_deadline_shadow "
+				"entries=%llu owner_iop=%llu owner_counter=%llu "
+				"owner_event=%llu owner_none=%llu horizon_le_3072=%llu "
+				"horizon_gt_3072=%llu horizon_gt_6144=%llu "
+				"horizon_gt_12288=%llu timer_enabled=%llu "
+				"timer_within_3072=%llu owner_beyond_3072_timer_off=%llu "
+				"iop_rapid=%llu balance_positive=%llu "
+				"balance_nonpositive=%llu iop_ahead_gt_3072=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(ee_deadline_shadow_entries),
+				static_cast<unsigned long long>(ee_deadline_owner_iop),
+				static_cast<unsigned long long>(ee_deadline_owner_counter),
+				static_cast<unsigned long long>(ee_deadline_owner_event),
+				static_cast<unsigned long long>(ee_deadline_owner_none),
+				static_cast<unsigned long long>(ee_deadline_horizon_le_3072),
+				static_cast<unsigned long long>(ee_deadline_horizon_gt_3072),
+				static_cast<unsigned long long>(ee_deadline_horizon_gt_6144),
+				static_cast<unsigned long long>(ee_deadline_horizon_gt_12288),
+				static_cast<unsigned long long>(ee_deadline_timer_enabled),
+				static_cast<unsigned long long>(ee_deadline_timer_within_3072),
+				static_cast<unsigned long long>(
+					ee_deadline_owner_beyond_3072_timer_off),
+				static_cast<unsigned long long>(ee_deadline_iop_rapid),
+				static_cast<unsigned long long>(ee_iop_balance_positive),
+				static_cast<unsigned long long>(ee_iop_balance_nonpositive),
+				static_cast<unsigned long long>(ee_iop_ahead_gt_3072));
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_time_us{};
 			std::array<u64,

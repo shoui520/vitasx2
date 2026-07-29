@@ -69,6 +69,14 @@ namespace VitaPerformanceTelemetry
 	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 512;
 	static constexpr size_t CPU_PROFILE_HOT_EDGE_COUNT = 8;
 
+	enum class EeDeadlineOwner : u8
+	{
+		Iop,
+		EeCounter,
+		EeEvent,
+		None,
+	};
+
 	enum CpuProfileIntervalFlags : u16
 	{
 		CpuProfileIntervalBalanced = 1u << 0,
@@ -114,6 +122,22 @@ namespace VitaPerformanceTelemetry
 		u64 iop_intc_visible = 0;
 		u64 iop_callback_due = 0;
 		u64 iop_manufactured_only = 0;
+		u64 ee_deadline_shadow_entries = 0;
+		u64 ee_deadline_owner_iop = 0;
+		u64 ee_deadline_owner_counter = 0;
+		u64 ee_deadline_owner_event = 0;
+		u64 ee_deadline_owner_none = 0;
+		u64 ee_deadline_horizon_le_3072 = 0;
+		u64 ee_deadline_horizon_gt_3072 = 0;
+		u64 ee_deadline_horizon_gt_6144 = 0;
+		u64 ee_deadline_horizon_gt_12288 = 0;
+		u64 ee_deadline_timer_enabled = 0;
+		u64 ee_deadline_timer_within_3072 = 0;
+		u64 ee_deadline_owner_beyond_3072_timer_off = 0;
+		u64 ee_deadline_iop_rapid = 0;
+		u64 ee_iop_balance_positive = 0;
+		u64 ee_iop_balance_nonpositive = 0;
+		u64 ee_iop_ahead_gt_3072 = 0;
 		std::array<u64, CPU_STAGE_COUNT> stage_time_us{};
 		std::array<u64, CPU_STAGE_COUNT> stage_entries{};
 	};
@@ -164,6 +188,9 @@ namespace VitaPerformanceTelemetry
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
 		bool callback_due);
+	void RecordEeDeadlineHorizon(s64 owner_horizon_delta,
+		EeDeadlineOwner owner, s32 ee_iop_balance, bool timer_enabled,
+		u32 timer_delta, bool iop_rapid);
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
 		u32 iop_pc, u64 iop_cycle)
@@ -232,6 +259,26 @@ namespace VitaPerformanceTelemetry
 		(void)counter_precedes_published;
 		(void)intc_visible;
 		(void)callback_due;
+#endif
+	}
+
+	inline void RecordEeDeadlineHorizonIfProfiling(
+		s64 owner_horizon_delta, EeDeadlineOwner owner, s32 ee_iop_balance,
+		bool timer_enabled, u32 timer_delta, bool iop_rapid)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+		{
+			RecordEeDeadlineHorizon(owner_horizon_delta, owner,
+				ee_iop_balance, timer_enabled, timer_delta, iop_rapid);
+		}
+#else
+		(void)owner_horizon_delta;
+		(void)owner;
+		(void)ee_iop_balance;
+		(void)timer_enabled;
+		(void)timer_delta;
+		(void)iop_rapid;
 #endif
 	}
 

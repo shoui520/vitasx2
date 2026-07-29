@@ -566,6 +566,65 @@ static __fi void VitaIopEventTestFromEe()
 	if (dispatch)
 		iopEventTest();
 }
+
+#if defined(VITASX2_CPU_PROFILER)
+static __fi void VitaRecordEeDeadlineHorizon(
+	s32 iop_delta, bool iop_rapid)
+{
+	// Reconstruct a deadline-owner horizon beside the retained PCSX2
+	// scheduler. The real nextEventCycle is seeded with eeWaitCycles on entry,
+	// so inspecting it cannot reveal which later owner would permit a longer
+	// run. This profiler-only scan is observational and never changes the
+	// product deadline.
+	s64 owner_delta = iop_delta;
+	auto owner = VitaPerformanceTelemetry::EeDeadlineOwner::Iop;
+
+	const s64 counter_delta = static_cast<s64>(
+		nextStartCounter + static_cast<s64>(nextDeltaCounter) -
+		cpuRegs.cycle);
+	if (counter_delta < owner_delta)
+	{
+		owner_delta = counter_delta;
+		owner = VitaPerformanceTelemetry::EeDeadlineOwner::EeCounter;
+	}
+
+	if (dmacRegs.ctrl.DMAE && !(psHu8(DMAC_ENABLER + 2) & 1))
+	{
+		constexpr u32 tested_events =
+			(1u << VU_MTVU_BUSY) |
+			(1u << DMAC_VIF1) | (1u << DMAC_GIF) |
+			(1u << DMAC_SIF0) | (1u << DMAC_SIF1) |
+			(1u << DMAC_VIF0) |
+			(1u << DMAC_FROM_IPU) | (1u << DMAC_TO_IPU) |
+			(1u << IPU_PROCESS) |
+			(1u << DMAC_FROM_SPR) | (1u << DMAC_TO_SPR) |
+			(1u << DMAC_MFIFO_VIF) | (1u << DMAC_MFIFO_GIF) |
+			(1u << VIF_VU0_FINISH) | (1u << VIF_VU1_FINISH);
+		u32 pending = cpuRegs.interrupt & tested_events;
+		while (pending != 0)
+		{
+			const u32 event = static_cast<u32>(std::countr_zero(pending));
+			pending &= pending - 1;
+			const s64 event_delta = static_cast<s64>(
+				cpuRegs.sCycle[event] +
+				static_cast<s64>(cpuRegs.eCycle[event]) -
+				cpuRegs.cycle);
+			if (event_delta < owner_delta)
+			{
+				owner_delta = event_delta;
+				owner = VitaPerformanceTelemetry::EeDeadlineOwner::EeEvent;
+			}
+		}
+	}
+
+	const bool timer_enabled =
+		(cpuRegs.CP0.n.Status.val & 0x8000u) != 0;
+	const u32 timer_delta =
+		cpuRegs.CP0.n.Compare - cpuRegs.CP0.n.Count;
+	VitaPerformanceTelemetry::RecordEeDeadlineHorizonIfProfiling(
+		owner_delta, owner, EEsCycle, timer_enabled, timer_delta, iop_rapid);
+}
+#endif
 #endif
 
 // Shared portion of the branch test, called from both the Interpreter
@@ -794,6 +853,13 @@ __fi void _cpuEventTest_Shared()
 			cpuSetNextEventDelta(((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier) - EEsCycle);
 #endif
 		}
+
+#if defined(VITASX2_CPU_PROFILER)
+		VitaRecordEeDeadlineHorizon(
+			EEsCycle >= nextIopEventDelta ?
+				48 : nextIopEventDelta - EEsCycle,
+			EEsCycle >= nextIopEventDelta);
+#endif
 
 		// Apply vsync and other counter nextCycles
 		cpuSetNextEvent(nextStartCounter, nextDeltaCounter);
