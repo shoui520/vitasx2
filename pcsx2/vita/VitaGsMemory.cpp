@@ -90,6 +90,15 @@ void VitaGS::FillPsmct32Rect(GSLocalMemory& memory, const GSOffset& offset,
 static void* s_vita_gs_mapping = nullptr;
 static size_t s_vita_gs_mapping_size = 0;
 
+bool VitaGS::ReserveCanonicalLocalMemory()
+{
+	return true;
+}
+
+void VitaGS::ReleaseUnclaimedCanonicalLocalMemory()
+{
+}
+
 void* GSAllocateWrappedMemory(size_t size, size_t repeat)
 {
 	pxAssert(s_vita_gs_mapping == nullptr);
@@ -134,14 +143,14 @@ void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
 
 static SceUID s_vita_gs_memblock = -1;
 static void* s_vita_gs_memblock_base = nullptr;
+static size_t s_vita_gs_memblock_size = 0;
+static bool s_vita_gs_memblock_claimed = false;
 
-void* GSAllocateWrappedMemory(size_t size, size_t repeat)
+bool VitaGS::ReserveCanonicalLocalMemory()
 {
-	pxAssertRel(s_vita_gs_memblock < 0, "GS memory has no existing Vita memblock");
-	if (s_vita_gs_memblock >= 0 || size == 0 || repeat == 0)
-	{
-		return nullptr;
-	}
+	if (s_vita_gs_memblock >= 0)
+		return s_vita_gs_memblock_base &&
+			s_vita_gs_memblock_size == CanonicalLocalMemoryBytes;
 
 	// PCSX2 owns the wrapped-storage contract in GS.cpp by repeating one mapping.
 	// The documented PSP2 user API exposes no fixed-alias operation. Vita instead
@@ -150,9 +159,9 @@ void* GSAllocateWrappedMemory(size_t size, size_t repeat)
 	// that long-lived store directly from cached LPDDR instead of newlib's heap.
 	// Sony's sysmem contract requires an LPDDR memblock size rounded to 4 KiB.
 	constexpr size_t MEMBLOCK_ALIGNMENT = 4096;
-	const size_t requested_size = size;
+	const size_t requested_size = CanonicalLocalMemoryBytes;
 	if (requested_size > (std::numeric_limits<SceSize>::max() - (MEMBLOCK_ALIGNMENT - 1)))
-		return nullptr;
+		return false;
 	const SceSize allocation_size = static_cast<SceSize>(
 		(requested_size + (MEMBLOCK_ALIGNMENT - 1)) & ~(MEMBLOCK_ALIGNMENT - 1));
 
@@ -162,7 +171,7 @@ void* GSAllocateWrappedMemory(size_t size, size_t repeat)
 	{
 		Console.Error("sceKernelAllocMemBlock(GS, %u) failed: %08x",
 			allocation_size, s_vita_gs_memblock);
-		return nullptr;
+		return false;
 	}
 
 	const int result = sceKernelGetMemBlockBase(s_vita_gs_memblock, &s_vita_gs_memblock_base);
@@ -174,13 +183,47 @@ void* GSAllocateWrappedMemory(size_t size, size_t repeat)
 		{
 			Console.Error("sceKernelFreeMemBlock(GS cleanup) failed: %08x", free_result);
 			s_vita_gs_memblock_base = nullptr;
-			return nullptr;
+			return false;
 		}
 		s_vita_gs_memblock = -1;
 		s_vita_gs_memblock_base = nullptr;
+		return false;
+	}
+
+	s_vita_gs_memblock_size = allocation_size;
+	s_vita_gs_memblock_claimed = false;
+	return true;
+}
+
+void VitaGS::ReleaseUnclaimedCanonicalLocalMemory()
+{
+	if (s_vita_gs_memblock < 0 || s_vita_gs_memblock_claimed)
+		return;
+
+	const int result = sceKernelFreeMemBlock(s_vita_gs_memblock);
+	if (result < 0)
+	{
+		Console.Error("sceKernelFreeMemBlock(unclaimed GS) failed: %08x",
+			result);
+		return;
+	}
+	s_vita_gs_memblock = -1;
+	s_vita_gs_memblock_base = nullptr;
+	s_vita_gs_memblock_size = 0;
+}
+
+void* GSAllocateWrappedMemory(size_t size, size_t repeat)
+{
+	pxAssertRel(!s_vita_gs_memblock_claimed,
+		"GS memory has no existing Vita owner");
+	if (s_vita_gs_memblock_claimed ||
+		size != VitaGS::CanonicalLocalMemoryBytes || repeat == 0 ||
+		!VitaGS::ReserveCanonicalLocalMemory())
+	{
 		return nullptr;
 	}
 
+	s_vita_gs_memblock_claimed = true;
 	return s_vita_gs_memblock_base;
 }
 
@@ -188,7 +231,10 @@ void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
 {
 	pxAssertRel(s_vita_gs_memblock >= 0, "GS memory has a Vita memblock");
 	pxAssertRel(ptr == s_vita_gs_memblock_base, "GS memory owns the Vita memblock base");
-	(void)size;
+	pxAssertRel(s_vita_gs_memblock_claimed,
+		"GS memory owns a claimed Vita memblock");
+	pxAssertRel(size == s_vita_gs_memblock_size,
+		"GS memory frees its complete canonical Vita memblock");
 	(void)repeat;
 	if (s_vita_gs_memblock >= 0)
 	{
@@ -201,6 +247,8 @@ void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
 	}
 	s_vita_gs_memblock = -1;
 	s_vita_gs_memblock_base = nullptr;
+	s_vita_gs_memblock_size = 0;
+	s_vita_gs_memblock_claimed = false;
 }
 
 #endif

@@ -1868,6 +1868,12 @@ VitaA32EeProviderStats VitaGetA32EeProviderStats()
 	VitaA32EeProviderStats result = s_ee_a32_stats;
 	result.in_frame_event_resume_candidates =
 		result.in_frame_event_tests - result.in_frame_event_resume_refusals;
+	result.code_cache_resets = s_ee_a32_executor.GetCodeCacheResetCount();
+	result.code_cache_block_records =
+		s_ee_a32_executor.GetCodeCacheBlockRecordCount();
+	result.code_cache_slots = s_ee_a32_executor.GetCodeCacheSlotCount();
+	result.code_cache_used = s_ee_a32_executor.GetCodeCacheUsed();
+	result.code_cache_capacity = s_ee_a32_executor.GetCodeCacheCapacity();
 	return result;
 }
 

@@ -216,13 +216,24 @@ namespace VitaEE
 			PersistentEventCallback event_callback = nullptr);
 		bool ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,
 			bool run_event_test_on_event_exit, BlockExecutionResult* result);
+		u32 GetCodeCacheResetCount() const { return m_code_cache_resets; }
+		size_t GetCodeCacheUsed() const { return m_code_cache_used; }
+		size_t GetCodeCacheCapacity() const { return m_code_cache_capacity; }
+		u32 GetCodeCacheBlockRecordCount() const
+		{
+			return static_cast<u32>(m_block_records.size());
+		}
+		u32 GetCodeCacheSlotCount() const
+		{
+			return static_cast<u32>(m_cache.size());
+		}
 
 	private:
 		// PCSX2 owner: x86/BaseblockEx.h::BaseBlocks() starts at 0x4000
 		// BASEBLOCKEX records and grows from there. Vita keeps the same
 		// game-scale order while bounding metadata for the smaller memory budget.
 		static constexpr size_t INITIAL_CACHE_CAPACITY = 512;
-		static constexpr size_t MAX_CACHE_CAPACITY = 0x4000;
+		static constexpr size_t MAX_CACHE_CAPACITY = 0x8000;
 		static constexpr size_t STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 4096;
 		// PCSX2 x86/ix86-32/iR5900.cpp::recRecompile() uses its split-block
 		// continuation when a block must remain manageable.  A32 first grows the
@@ -230,7 +241,9 @@ namespace VitaEE
 		// into two normal directly-linkable blocks instead of admitting a single
 		// pathological body into the Cortex-A9 instruction cache.
 		static constexpr size_t MAX_STRAIGHT_LINE_BLOCK_CODE_CAPACITY = 32 * 1024;
-		static constexpr size_t EE_CODE_CACHE_CAPACITY = HostMemoryMap::EErecSize;
+		static constexpr size_t EE_CODE_CACHE_CAPACITY = 16 * 1024 * 1024;
+		static constexpr size_t EE_FALLBACK_CODE_CACHE_CAPACITY =
+			HostMemoryMap::EErecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
@@ -316,18 +329,36 @@ namespace VitaEE
 		struct IncomingLinkRecord
 		{
 			CachedBlock* source = nullptr;
-			u32 target_pc = 0;
-			u8 slot_index = 0;
+			// EE instructions and every direct-link target are word aligned.
+			// Store the two-slot index in those otherwise-zero low bits instead
+			// of charging each of the 65,536 bounded records four bytes of A32
+			// padding.
+			u32 target_pc_and_slot = 0;
+
+			IncomingLinkRecord() = default;
+			IncomingLinkRecord(CachedBlock* source_, u32 target_pc_,
+				u8 slot_index_)
+				: source(source_)
+				, target_pc_and_slot(
+					(target_pc_ & ~u32{3}) | (slot_index_ & u8{3}))
+			{
+			}
+			u32 TargetPc() const { return target_pc_and_slot & ~u32{3}; }
+			u8 SlotIndex() const
+			{
+				return static_cast<u8>(target_pc_and_slot & u32{3});
+			}
 		};
 
 		struct BlockRecord
 		{
 			CachedBlock* block = nullptr;
-			const void* entry_point = nullptr;
 			u32 start_pc = 0;
-			u32 instruction_count = 0;
-			size_t code_size = 0;
 		};
+#if UINTPTR_MAX == UINT32_MAX
+		static_assert(sizeof(IncomingLinkRecord) == 8);
+		static_assert(sizeof(BlockRecord) == 8);
+#endif
 
 		struct RamSourceRecord
 		{

@@ -28,7 +28,18 @@ namespace Host
 	static std::mutex s_secrets_settings_mutex;
 	static LayeredSettingsInterface s_layered_settings_interface;
 
+#if defined(__vita__)
+	// VitaHostSurface's fixed frontend has no translation catalogue:
+	// GetTranslatedStringImpl() copies the English source text unchanged. The
+	// only Vita call sites are the bounded pad, audio, and SPU2 display-name
+	// tables, so retaining PCSX2's 4 MiB desktop UI cache would permanently
+	// reserve almost entirely unused Cortex-A9 heap/LPDDR. Keep one 64 KiB page
+	// so TranslateToCString() retains its stable, null-terminated pointer
+	// contract without carrying the desktop frontend's memory budget.
+	static constexpr u32 TRANSLATION_STRING_CACHE_SIZE = 64 * 1024;
+#else
 	static constexpr u32 TRANSLATION_STRING_CACHE_SIZE = 4 * 1024 * 1024;
+#endif
 	using TranslationStringMap = UnorderedStringMap<std::pair<u32, u32>>;
 	using TranslationStringContextMap = UnorderedStringMap<TranslationStringMap>;
 	static std::shared_mutex s_translation_string_mutex;

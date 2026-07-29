@@ -418,7 +418,9 @@ namespace VitaA32
 
 	CodeBuffer::CodeBuffer(CodeBuffer&& other) noexcept
 		: m_base(std::exchange(other.m_base, nullptr))
+		, m_write_base(std::exchange(other.m_write_base, nullptr))
 		, m_capacity(std::exchange(other.m_capacity, 0))
+		, m_write_capacity(std::exchange(other.m_write_capacity, 0))
 		, m_offset(std::exchange(other.m_offset, 0))
 		, m_dirty_begin(std::exchange(other.m_dirty_begin, 0))
 		, m_dirty_end(std::exchange(other.m_dirty_end, 0))
@@ -437,7 +439,9 @@ namespace VitaA32
 		{
 			Release();
 			m_base = std::exchange(other.m_base, nullptr);
+			m_write_base = std::exchange(other.m_write_base, nullptr);
 			m_capacity = std::exchange(other.m_capacity, 0);
+			m_write_capacity = std::exchange(other.m_write_capacity, 0);
 			m_offset = std::exchange(other.m_offset, 0);
 			m_dirty_begin = std::exchange(other.m_dirty_begin, 0);
 			m_dirty_end = std::exchange(other.m_dirty_end, 0);
@@ -470,7 +474,9 @@ namespace VitaA32
 			return false;
 
 		m_base = static_cast<u8*>(mapping);
+		m_write_base = nullptr;
 		m_capacity = aligned_capacity;
+		m_write_capacity = 0;
 		m_offset = 0;
 		m_dirty_begin = 0;
 		m_dirty_end = 0;
@@ -480,7 +486,9 @@ namespace VitaA32
 		return true;
 #else
 		m_base = static_cast<u8*>(VitaVM::AllocJitMemory(capacity));
+		m_write_base = nullptr;
 		m_capacity = m_base ? capacity : 0;
+		m_write_capacity = 0;
 		m_offset = 0;
 		m_dirty_begin = 0;
 		m_dirty_end = 0;
@@ -498,7 +506,9 @@ namespace VitaA32
 			return false;
 
 		m_base = data;
+		m_write_base = nullptr;
 		m_capacity = capacity;
+		m_write_capacity = 0;
 		m_offset = 0;
 		m_dirty_begin = 0;
 		m_dirty_end = 0;
@@ -570,7 +580,9 @@ namespace VitaA32
 			m_base = nullptr;
 		}
 
+		m_write_base = nullptr;
 		m_capacity = 0;
+		m_write_capacity = 0;
 		m_offset = 0;
 		m_dirty_begin = 0;
 		m_dirty_end = 0;
@@ -589,11 +601,11 @@ namespace VitaA32
 			m_out_of_space = true;
 			return false;
 		}
-		if (!EnsureWritable())
+		if (!EnsureWritable(m_offset + sizeof(instruction)))
 			return false;
 
 		const size_t instruction_offset = m_offset;
-		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		std::memcpy(m_write_base + instruction_offset, &instruction, sizeof(instruction));
 		m_offset += sizeof(instruction);
 		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
@@ -2444,10 +2456,10 @@ namespace VitaA32
 		u32 instruction = 0;
 		if (!EncodeBranch(m_base + instruction_offset, m_base + target_offset, &instruction, condition))
 			return false;
-		if (!EnsureWritable())
+		if (!EnsureWritable(m_offset))
 			return false;
 
-		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		std::memcpy(m_write_base + instruction_offset, &instruction, sizeof(instruction));
 		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
@@ -2468,10 +2480,10 @@ namespace VitaA32
 			return false;
 		}
 		instruction |= 1u << 24;
-		if (!EnsureWritable())
+		if (!EnsureWritable(m_offset))
 			return false;
 
-		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		std::memcpy(m_write_base + instruction_offset, &instruction, sizeof(instruction));
 		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
@@ -2490,10 +2502,10 @@ namespace VitaA32
 		{
 			return false;
 		}
-		if (!EnsureWritable())
+		if (!EnsureWritable(m_offset))
 			return false;
 
-		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		std::memcpy(m_write_base + instruction_offset, &instruction, sizeof(instruction));
 		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
@@ -2504,9 +2516,9 @@ namespace VitaA32
 			return false;
 
 		const u32 instruction = CondBits(Condition::AL) | NOP;
-		if (!EnsureWritable())
+		if (!EnsureWritable(m_offset))
 			return false;
-		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		std::memcpy(m_write_base + instruction_offset, &instruction, sizeof(instruction));
 		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
@@ -2519,7 +2531,8 @@ namespace VitaA32
 			return false;
 		}
 
-		std::memcpy(instruction, m_base + instruction_offset, sizeof(*instruction));
+		std::memcpy(instruction, ReadBase() + instruction_offset,
+			sizeof(*instruction));
 		return true;
 	}
 
@@ -2531,9 +2544,9 @@ namespace VitaA32
 			return false;
 		}
 
-		if (!EnsureWritable())
+		if (!EnsureWritable(m_offset))
 			return false;
-		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		std::memcpy(m_write_base + instruction_offset, &instruction, sizeof(instruction));
 		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
@@ -2549,7 +2562,8 @@ namespace VitaA32
 		}
 
 		u32 placeholder = 0;
-		std::memcpy(&placeholder, m_base + instruction_offset, sizeof(placeholder));
+		std::memcpy(&placeholder, ReadBase() + instruction_offset,
+			sizeof(placeholder));
 		if ((placeholder & 0x0f7f0000u) != 0x051f0000u)
 			return false;
 		const unsigned rd = (placeholder >> 12) & 0xf;
@@ -2563,9 +2577,9 @@ namespace VitaA32
 		const u32 magnitude = static_cast<u32>(displacement < 0 ? -displacement : displacement);
 		const u32 add = displacement >= 0 ? (1u << 23) : 0;
 		const u32 instruction = CondBits(condition) | 0x051f0000u | add | (rd << 12) | magnitude;
-		if (!EnsureWritable())
+		if (!EnsureWritable(m_offset))
 			return false;
-		std::memcpy(m_base + instruction_offset, &instruction, sizeof(instruction));
+		std::memcpy(m_write_base + instruction_offset, &instruction, sizeof(instruction));
 		MarkDirty(instruction_offset, sizeof(instruction));
 		return true;
 	}
@@ -2669,7 +2683,7 @@ namespace VitaA32
 		for (size_t offset = 0; offset < m_offset; offset += sizeof(u32))
 		{
 			u32 instruction = 0;
-			std::memcpy(&instruction, m_base + offset, sizeof(instruction));
+			std::memcpy(&instruction, ReadBase() + offset, sizeof(instruction));
 
 			// A32 BL/BLX are the calls emitted by the EE/VU compilers for
 			// PCSX2-owned helpers and block-local helper thunks. Direct JIT links
@@ -2749,10 +2763,11 @@ namespace VitaA32
 
 		const u32 movw = EncodeMovw(rd, static_cast<u16>(value));
 		const u32 movt = EncodeMovt(rd, static_cast<u16>(value >> 16));
-		if (!EnsureWritable())
+		if (!EnsureWritable(m_offset))
 			return false;
-		std::memcpy(m_base + instruction_offset, &movw, sizeof(movw));
-		std::memcpy(m_base + instruction_offset + sizeof(movw), &movt, sizeof(movt));
+		std::memcpy(m_write_base + instruction_offset, &movw, sizeof(movw));
+		std::memcpy(m_write_base + instruction_offset + sizeof(movw), &movt,
+			sizeof(movt));
 		MarkDirty(instruction_offset, sizeof(movw) + sizeof(movt));
 		return true;
 	}
@@ -2767,19 +2782,39 @@ namespace VitaA32
 		if (!m_write_domain_open)
 			return false;
 		m_write_domain_open = false;
-		if (!VitaVM::EndJitWriteAndSync(
-			m_base + m_dirty_begin, m_dirty_end - m_dirty_begin))
+		const bool published = VitaVM::EndJitWriteAndSync(
+			m_base + m_dirty_begin, m_dirty_end - m_dirty_begin);
+		m_write_base = nullptr;
+		m_write_capacity = 0;
+		if (!published)
 			return false;
 		m_dirty_begin = 0;
 		m_dirty_end = 0;
 		return true;
 	}
 
-	bool CodeBuffer::EnsureWritable()
+	bool CodeBuffer::EnsureWritable(size_t required_capacity)
 	{
 		if (m_write_domain_open)
+		{
+			if (required_capacity <= m_write_capacity)
+				return true;
+			void* write_base = m_write_base;
+			if (!VitaVM::ExpandJitWrite(m_offset, required_capacity,
+					&write_base, &m_write_capacity))
+			{
+				return false;
+			}
+			m_write_base = static_cast<u8*>(write_base);
 			return true;
-		m_write_domain_open = VitaVM::BeginJitWrite();
+		}
+		if (!m_base || required_capacity > m_capacity)
+			return false;
+		void* write_base = nullptr;
+		m_write_domain_open = VitaVM::BeginJitWrite(m_base, m_offset, m_capacity,
+			&write_base, &m_write_capacity);
+		m_write_base = m_write_domain_open ?
+			static_cast<u8*>(write_base) : nullptr;
 		return m_write_domain_open;
 	}
 
@@ -2788,7 +2823,10 @@ namespace VitaA32
 		if (!m_write_domain_open)
 			return true;
 		m_write_domain_open = false;
-		return VitaVM::EndJitWrite();
+		const bool ended = VitaVM::EndJitWrite();
+		m_write_base = nullptr;
+		m_write_capacity = 0;
+		return ended;
 	}
 
 	void CodeBuffer::MarkDirty(size_t offset, size_t size)

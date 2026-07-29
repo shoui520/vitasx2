@@ -279,13 +279,27 @@ u8 ShaderCompiler::PopResultLocked() {
 
 bool ShaderCompiler::Submit(const ShaderKey &key, std::string source) {
   m_submission_attempts.fetch_add(1, std::memory_order_relaxed);
-  const State state = m_state.load(std::memory_order_acquire);
-  if (state != State::Starting && state != State::Ready) {
-    m_rejected_state.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
   if (source.empty() || source.size() > MaxGeneratedSourceBytes) {
     m_rejected_source.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  // Most retail windows never request a generated GPU-VU shader. Keep the
+  // compiler's 8 MiB private arena and worker stack out of their permanent
+  // LPDDR/heap footprint. RequestGeneratedProgram() is serialized by the
+  // registry mutex, and Start() publishes the arena before it returns, so the
+  // first cold miss can queue immediately while module loading continues on
+  // the low-priority worker.
+  State state = m_state.load(std::memory_order_acquire);
+  if (state == State::Stopped) {
+    if (!Start()) {
+      m_rejected_state.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    state = m_state.load(std::memory_order_acquire);
+  }
+  if (state != State::Starting && state != State::Ready) {
+    m_rejected_state.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
@@ -459,7 +473,6 @@ ShaderCompilerStatistics ShaderCompiler::GetStatistics() const {
   stats.invalid_outputs = m_invalid_outputs.load(std::memory_order_relaxed);
   stats.truncated_diagnostics =
       m_truncated_diagnostics.load(std::memory_order_relaxed);
-  stats.private_arena_capacity = PrivateArenaBytes;
   stats.private_arena_peak =
       m_private_arena_peak.load(std::memory_order_relaxed);
   stats.private_arena_current =
@@ -467,6 +480,8 @@ ShaderCompilerStatistics ShaderCompiler::GetStatistics() const {
   stats.private_arena_guard_failures =
       m_private_arena_guard_failures.load(std::memory_order_relaxed);
   std::lock_guard lock(m_mutex);
+  stats.private_arena_capacity =
+      m_private_mspace ? PrivateArenaBytes : 0;
   stats.pending_requests = m_request_count;
   stats.completed_results = m_result_count;
   for (const CompileSlot &slot : m_slots)

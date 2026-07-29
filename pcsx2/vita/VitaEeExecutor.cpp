@@ -426,13 +426,8 @@ namespace VitaEE
 				insert_limit = mid;
 		}
 
-		m_block_records.insert(m_block_records.begin() + insert_index, {
-			&block,
-			block.code.EntryPoint(),
-			block.start_pc,
-			block.instruction_count,
-			block.code.Size(),
-		});
+		m_block_records.insert(m_block_records.begin() + insert_index,
+			{&block, block.start_pc});
 		return true;
 	}
 
@@ -893,11 +888,13 @@ namespace VitaEE
 
 	DirectLinkSlot* BlockExecutor::GetRecordedDirectLink(IncomingLinkRecord& record)
 	{
-		if (!record.source || !record.source->valid || record.slot_index >= DIRECT_LINK_SLOT_COUNT)
+		const u8 slot_index = record.SlotIndex();
+		if (!record.source || !record.source->valid ||
+			slot_index >= DIRECT_LINK_SLOT_COUNT)
 			return nullptr;
 
-		DirectLinkSlot& link = record.source->direct_links.slots[record.slot_index];
-		if (!link.valid || link.target_pc != record.target_pc)
+		DirectLinkSlot& link = record.source->direct_links.slots[slot_index];
+		if (!link.valid || link.target_pc != record.TargetPc())
 			return nullptr;
 
 		return &link;
@@ -913,7 +910,7 @@ namespace VitaEE
 		while (min != max)
 		{
 			const s32 mid = (min + max + 1) >> 1;
-			if (m_incoming_links[mid].target_pc > target_pc)
+			if (m_incoming_links[mid].TargetPc() > target_pc)
 				max = mid - 1;
 			else
 				min = mid;
@@ -929,7 +926,9 @@ namespace VitaEE
 
 	void BlockExecutor::RegisterIncomingLink(CachedBlock& block, u8 slot_index, const DirectLinkSlot& link)
 	{
-		if (!link.valid || m_incoming_links.size() >= MAX_INCOMING_LINKS)
+		if (!link.valid || (link.target_pc & u32{3}) != 0 ||
+			slot_index >= DIRECT_LINK_SLOT_COUNT ||
+			m_incoming_links.size() >= MAX_INCOMING_LINKS)
 			return;
 
 		u32 insert_index = 0;
@@ -937,7 +936,7 @@ namespace VitaEE
 		while (insert_index < insert_limit)
 		{
 			const u32 mid = (insert_index + insert_limit) >> 1;
-			if (m_incoming_links[mid].target_pc <= link.target_pc)
+			if (m_incoming_links[mid].TargetPc() <= link.target_pc)
 				insert_index = mid + 1;
 			else
 				insert_limit = mid;
@@ -2806,12 +2805,28 @@ namespace VitaEE
 		if (m_code_cache)
 			return true;
 
-		// Vita VM-domain allocations are rounded to 1 MiB by VitaVM::AllocJitMemory().
+		// PES 2014 reached 8,080,096/8,388,608 bytes and
+		// 15,697/16,384 entries before its title screen. Upstream kuBridge and
+		// gtasa_vita/loader/so_util.c own the retail-Vita mechanism used here:
+		// allocate RX, publish through the unrestricted-copy syscall, then flush
+		// the exact range. IOP/VU share that arena; keep the old official
+		// VM-domain slice as the fail-closed fallback.
 		// PCSX2 owner: x86/ix86-32/iR5900.cpp owns one EE code cache and
 		// BaseblockEx tracks block entries inside that cache; do the same here
 		// instead of allocating a VM block per translated guest block.
-		m_code_cache = static_cast<u8*>(VitaVM::AllocJitMemory(EE_CODE_CACHE_CAPACITY));
-		m_code_cache_capacity = m_code_cache ? EE_CODE_CACHE_CAPACITY : 0;
+		m_code_cache =
+			static_cast<u8*>(VitaVM::AllocLargeJitMemory(EE_CODE_CACHE_CAPACITY));
+		if (m_code_cache)
+		{
+			m_code_cache_capacity = EE_CODE_CACHE_CAPACITY;
+		}
+		else
+		{
+			m_code_cache = static_cast<u8*>(
+				VitaVM::AllocJitMemory(EE_FALLBACK_CODE_CACHE_CAPACITY));
+			m_code_cache_capacity =
+				m_code_cache ? EE_FALLBACK_CODE_CACHE_CAPACITY : 0;
+		}
 		m_code_cache_used = 0;
 		return (m_code_cache != nullptr);
 	}
@@ -3593,7 +3608,8 @@ namespace VitaEE
 			return;
 
 		s32 index = LastIncomingLinkIndex(target.start_pc);
-		while (index >= 0 && m_incoming_links[index].target_pc == target.start_pc)
+		while (index >= 0 &&
+			m_incoming_links[index].TargetPc() == target.start_pc)
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
 			if (record.source &&
@@ -3621,7 +3637,8 @@ namespace VitaEE
 		}
 
 		s32 index = LastIncomingLinkIndex(target_pc);
-		while (index >= 0 && m_incoming_links[index].target_pc == target_pc)
+		while (index >= 0 &&
+			m_incoming_links[index].TargetPc() == target_pc)
 		{
 			IncomingLinkRecord& record = m_incoming_links[index--];
 			if (discovered_topology && (!record.source ||
@@ -3644,7 +3661,7 @@ namespace VitaEE
 			if (!link)
 				continue;
 
-			CachedBlock* target = FindLinkTargetByStartPc(record.target_pc,
+			CachedBlock* target = FindLinkTargetByStartPc(record.TargetPc(),
 				record.source->discovered_topology, false);
 			PatchDirectLink(*record.source, *link, target);
 		}
@@ -3888,6 +3905,10 @@ namespace VitaEE
 			return finish(entry, false, true, true);
 		}
 
+		const VitaPerformanceTelemetry::ScopedCpuStage compile_profile(
+			VitaPerformanceTelemetry::CpuStage::EeCompile);
+		const VitaPerformanceTelemetry::ScopedExactEeCompileMeasurement
+			exact_compile_profile;
 		BlockScanResult scan;
 		if (!ScanStraightLineBlock(start_pc, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
 			scan.instruction_count == 0)
@@ -4066,10 +4087,15 @@ namespace VitaEE
 
 		BlockExecutionResult next_result;
 		CachedBlock* next_block = nullptr;
-		if (!context->executor->PrepareCompiledBlockAtPc(cpuRegs.pc, &next_block, &next_result))
 		{
-			context->failed = true;
-			return nullptr;
+			const VitaPerformanceTelemetry::ScopedCpuStage provider_profile(
+				VitaPerformanceTelemetry::CpuStage::EeProvider);
+			if (!context->executor->PrepareCompiledBlockAtPc(
+					cpuRegs.pc, &next_block, &next_result))
+			{
+				context->failed = true;
+				return nullptr;
+			}
 		}
 
 		context->current_block = next_block;
@@ -4088,8 +4114,12 @@ namespace VitaEE
 
 		CachedBlock* block = nullptr;
 		BlockExecutionResult initial_result;
-		if (!PrepareCompiledBlockAtPc(start_pc, &block, &initial_result))
-			return false;
+		{
+			const VitaPerformanceTelemetry::ScopedCpuStage provider_profile(
+				VitaPerformanceTelemetry::CpuStage::EeProvider);
+			if (!PrepareCompiledBlockAtPc(start_pc, &block, &initial_result))
+				return false;
+		}
 
 		PersistentRunContext context;
 		context.executor = this;

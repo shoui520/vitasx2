@@ -52,6 +52,7 @@
 #include "common/Console.h"
 #include "common/Path.h"
 #include "common/StringUtil.h"
+#include "common/Vita/VitaJitMemory.h"
 
 #include <utility>
 
@@ -255,6 +256,16 @@ namespace VMManager
 		// PCSX2 initializes the host FP environment before allocating the VM.
 		// Initialize() installs the configured EE FPCR after provider selection.
 		FPControlRegister::SetCurrent(FPControlRegister::GetDefault());
+		// The bythos14 kuBridge allocation succeeds before the permanent 65 MiB
+		// PS2 data map and GXM arenas exist, but can fail with fragmented LPDDR
+		// when first requested lazily by EE compilation. Reserve only the
+		// process backing here; the provider owners below still allocate every
+		// logical EE/IOP/VU slice.
+		if (!VitaVM::ReserveJitMemory())
+		{
+			Console.Error("Vita VM lifecycle failed to reserve executable memory.");
+			return false;
+		}
 		if (!SysMemory::Allocate())
 		{
 			Console.Error("Vita VM lifecycle failed to allocate PS2 memory.");
@@ -263,8 +274,9 @@ namespace VMManager
 		s_lifecycle.memory_allocated = true;
 
 		// PCSX2 owner: VMManager.cpp::InitializeCPUProviders().  All four Vita
-		// Reserve() implementations are allocation-free today, but retaining the
-		// owner boundary keeps future cache reservations before VM reset.
+		// Reserve() owns provider-local setup. The process executable arena was
+		// reserved above so these owners cannot lose it to later LPDDR
+		// fragmentation.
 		recCpu.Reserve();
 		psxRec.Reserve();
 		CpuMicroVU0.Reserve();

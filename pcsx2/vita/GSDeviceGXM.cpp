@@ -1760,14 +1760,11 @@ bool GSDeviceGXM::Impl::Initialize()
 	gxm_initialized = true;
 	if (!InitializeGpuVuRetirements())
 		Console.Warning("GPU-VU: four-way vertex retirement ring is unavailable.");
-	if (!gpu_vu_shader_compiler.Start())
-		Console.Warning("GPU-VU: asynchronous compiler service did not start.");
-	else if (!VitaGpuVu::AttachGeneratedProgramCompiler(
+	if (!VitaGpuVu::AttachGeneratedProgramCompiler(
 		&gpu_vu_shader_compiler))
 	{
 		Console.Warning(
 			"GPU-VU: generated-program registry already has another compiler owner.");
-		gpu_vu_shader_compiler.Stop();
 	}
 
 	result = texture_arena.Initialize(VitaGXM::ArenaMemory::Cdram,

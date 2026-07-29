@@ -278,7 +278,9 @@ target_link_libraries(pcsx2core PUBLIC
 	SceShaccCg_stub
 	SceShaccCgExt
 	SceSysmodule_stub
+	SceVshBridge_stub
 	taihen_stub
+	kubridge_stub_weak
 )
 
 # Sony's api_libgxm/basic sample owns the shader pipeline used here: compile

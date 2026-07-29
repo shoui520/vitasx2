@@ -42,6 +42,7 @@ namespace VitaPerformanceTelemetry
 		// through the generated EE span which follows it.
 		EeGenerated,
 		EeProvider,
+		EeCompile,
 		EeInterpreter,
 		IopInterpreter,
 		Cop1,
@@ -201,6 +202,11 @@ namespace VitaPerformanceTelemetry
 		u64 spu2_mixer_irq_enabled_cores = 0;
 		u64 spu2_mixer_reverb_range_cores = 0;
 		u64 spu2_mixer_auto_dma_cores = 0;
+		// Unlike the sparse stage sampler, these diagnostic-only totals observe
+		// every cold EE compilation. This prevents a compiler burst from
+		// aliasing against the fixed scheduler sample cadence.
+		u64 ee_compile_observations = 0;
+		u64 ee_compile_time_us = 0;
 		std::array<u64, CPU_STAGE_COUNT> stage_time_us{};
 		std::array<u64, CPU_STAGE_COUNT> stage_entries{};
 	};
@@ -248,6 +254,8 @@ namespace VitaPerformanceTelemetry
 	void OnEeSchedulerExitEnabled();
 	void BeginCpuStage(CpuStage stage);
 	void EndCpuStage();
+	u32 BeginExactEeCompileMeasurement();
+	void EndExactEeCompileMeasurement(u32 start_us);
 	void CountCpuStageEntry(CpuStage stage);
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
@@ -503,6 +511,38 @@ namespace VitaPerformanceTelemetry
 	private:
 #if defined(VITASX2_CPU_PROFILER)
 		bool m_entered = false;
+#endif
+	};
+
+	class ScopedExactEeCompileMeasurement
+	{
+	public:
+		ScopedExactEeCompileMeasurement()
+		{
+#if defined(VITASX2_CPU_PROFILER)
+			m_enabled = g_cpu_stage_profiler_enabled;
+			if (m_enabled)
+				m_start_us = BeginExactEeCompileMeasurement();
+#endif
+		}
+
+		~ScopedExactEeCompileMeasurement()
+		{
+#if defined(VITASX2_CPU_PROFILER)
+			if (m_enabled)
+				EndExactEeCompileMeasurement(m_start_us);
+#endif
+		}
+
+		ScopedExactEeCompileMeasurement(
+			const ScopedExactEeCompileMeasurement&) = delete;
+		ScopedExactEeCompileMeasurement& operator=(
+			const ScopedExactEeCompileMeasurement&) = delete;
+
+	private:
+#if defined(VITASX2_CPU_PROFILER)
+		u32 m_start_us = 0;
+		bool m_enabled = false;
 #endif
 	};
 }

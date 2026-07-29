@@ -242,6 +242,7 @@ namespace VitaPerformanceTelemetry
 				{
 					return stage_time(CpuStage::EeGenerated) +
 						stage_time(CpuStage::EeProvider) +
+						stage_time(CpuStage::EeCompile) +
 						stage_time(CpuStage::EeInterpreter) +
 						stage_time(CpuStage::Cop1) +
 						stage_time(CpuStage::EeHelper) +
@@ -424,6 +425,19 @@ namespace VitaPerformanceTelemetry
 		s_cpu_stage_profiler.current_stage =
 			s_cpu_stage_profiler.stage_stack[
 				--s_cpu_stage_profiler.stage_depth];
+	}
+
+	u32 BeginExactEeCompileMeasurement()
+	{
+		return ReadProcessTimeLow();
+	}
+
+	void EndExactEeCompileMeasurement(u32 start_us)
+	{
+		const u32 now = ReadProcessTimeLow();
+		s_cpu_stage_profiler.totals.ee_compile_observations++;
+		s_cpu_stage_profiler.totals.ee_compile_time_us +=
+			static_cast<u32>(now - start_us);
 	}
 
 	void CountCpuStageEntry(CpuStage stage)

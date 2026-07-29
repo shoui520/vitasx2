@@ -184,6 +184,14 @@ struct VitaA32EeProviderStats
 	u32 lookup_hits = 0;
 	u32 fast_dispatch_hits = 0;
 	u32 invalidated_blocks = 0;
+	// Snapshot-only cache-pressure evidence. VitaGetA32EeProviderStats() reads
+	// these gauges at the existing correlated-performance boundary; generated
+	// execution and block publication perform no additional telemetry work.
+	u32 code_cache_resets = 0;
+	u32 code_cache_block_records = 0;
+	u32 code_cache_slots = 0;
+	u64 code_cache_used = 0;
+	u64 code_cache_capacity = 0;
 	// Bounded product telemetry. Candidates are derived from tests-refusals so
 	// the hot accepted path performs only one 32-bit increment on ARMv7.
 	u32 in_frame_event_tests = 0;

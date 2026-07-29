@@ -27,6 +27,7 @@
 #include "vita/VitaGsDrawTrace.h"
 #endif
 #include "vita/VitaGsMailbox.h"
+#include "vita/VitaGsMemory.h"
 #include "vita/VitaCore.h"
 #include "vita/VitaGpuVuDirectProgram.h"
 #include "vita/VitaGpuVuDraw.h"
@@ -48,6 +49,16 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
+#include <malloc.h>
+#include <psp2/kernel/sysmem.h>
+
+extern "C"
+{
+	extern unsigned int _newlib_heap_size_user;
+}
+#endif
 
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
 namespace
@@ -1063,7 +1074,8 @@ namespace MTGS
 			};
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_extended "
-				"ee_generated=%llu ee_provider=%llu ee_interpreter=%llu iop_interpreter=%llu "
+				"ee_generated=%llu ee_provider=%llu ee_compile=%llu "
+				"ee_interpreter=%llu iop_interpreter=%llu "
 				"cop1=%llu cop2_vu0=%llu ee_helper=%llu ee_memory_slow=%llu "
 				"iop_helper=%llu iop_memory_slow=%llu ipu=%llu vif_gif=%llu "
 				"sif=%llu cdvd=%llu dma=%llu other_device=%llu diagnostics=%llu",
@@ -1072,6 +1084,8 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::EeGenerated)),
 				static_cast<unsigned long long>(stage_time(
 					VitaPerformanceTelemetry::CpuStage::EeProvider)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::EeCompile)),
 				static_cast<unsigned long long>(stage_time(
 					VitaPerformanceTelemetry::CpuStage::EeInterpreter)),
 				static_cast<unsigned long long>(stage_time(
@@ -1104,7 +1118,8 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::Diagnostics)));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_extended_entries "
-				"ee_generated=%llu ee_provider=%llu ee_interpreter=%llu iop_interpreter=%llu "
+				"ee_generated=%llu ee_provider=%llu ee_compile=%llu "
+				"ee_interpreter=%llu iop_interpreter=%llu "
 				"cop1=%llu cop2_vu0=%llu ee_helper=%llu ee_memory_slow=%llu "
 				"iop_helper=%llu iop_memory_slow=%llu ipu=%llu vif_gif=%llu "
 				"sif=%llu cdvd=%llu dma=%llu other_device=%llu diagnostics=%llu",
@@ -1113,6 +1128,8 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::EeGenerated)),
 				static_cast<unsigned long long>(stage_entry(
 					VitaPerformanceTelemetry::CpuStage::EeProvider)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::EeCompile)),
 				static_cast<unsigned long long>(stage_entry(
 					VitaPerformanceTelemetry::CpuStage::EeInterpreter)),
 				static_cast<unsigned long long>(stage_entry(
@@ -1143,6 +1160,21 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::OtherDevice)),
 				static_cast<unsigned long long>(stage_entry(
 					VitaPerformanceTelemetry::CpuStage::Diagnostics)));
+			const u64 ee_compile_observations = CounterDelta(
+				end.cpu_stage_profiler.ee_compile_observations,
+				start.cpu_stage_profiler.ee_compile_observations);
+			const u64 ee_compile_time_us = CounterDelta(
+				end.cpu_stage_profiler.ee_compile_time_us,
+				start.cpu_stage_profiler.ee_compile_time_us);
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=ee_compile_exact "
+				"observations=%llu time_us=%llu average_ns=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(ee_compile_observations),
+				static_cast<unsigned long long>(ee_compile_time_us),
+				static_cast<unsigned long long>(ee_compile_observations ?
+					(ee_compile_time_us * 1000u) /
+						ee_compile_observations : 0));
 			const VitaPerformanceTelemetry::CpuProfileHotEdgeSnapshot hot_edges =
 				VitaPerformanceTelemetry::GetCpuProfileHotEdgeSnapshot(
 					start.cpu_stage_profiler.interval_records + 1,
@@ -1351,6 +1383,41 @@ namespace MTGS
 				start.ee.invalidated_blocks)),
 			static_cast<unsigned long long>(CounterDelta(end.ee.failed_blocks,
 				start.ee.failed_blocks)));
+		output.WriteLn(
+			"Vita perf v=1 window=%llu kind=ee_cache resets_delta=%llu resets=%u "
+			"used=%llu capacity=%llu block_records=%u cache_slots=%u",
+			static_cast<unsigned long long>(window),
+			static_cast<unsigned long long>(CounterDelta(end.ee.code_cache_resets,
+				start.ee.code_cache_resets)),
+			end.ee.code_cache_resets,
+			static_cast<unsigned long long>(end.ee.code_cache_used),
+			static_cast<unsigned long long>(end.ee.code_cache_capacity),
+			end.ee.code_cache_block_records, end.ee.code_cache_slots);
+#if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
+		// Sample the process allocator only at the existing cold 120-VSync
+		// reporting boundary. This is diagnostic-only telemetry: it must never
+		// add mallinfo()/sysmem calls to the normal CPU0 or GS hot paths.
+		const struct mallinfo heap = mallinfo();
+		const u32 heap_limit = _newlib_heap_size_user;
+		const u32 heap_arena = static_cast<u32>(heap.arena);
+		const u32 heap_used = static_cast<u32>(heap.uordblks);
+		const u32 heap_free = static_cast<u32>(heap.fordblks);
+		const u32 heap_sbrk_remaining =
+			heap_limit > heap_arena ? heap_limit - heap_arena : 0;
+		SceKernelFreeMemorySizeInfo free_memory{};
+		free_memory.size = sizeof(free_memory);
+		const s32 free_memory_result =
+			sceKernelGetFreeMemorySize(&free_memory);
+		output.WriteLn(
+			"Vita perf v=1 window=%llu kind=memory heap_limit=%u "
+			"heap_arena=%u heap_used=%u heap_free=%u heap_headroom=%u "
+			"lpddr_free=%u lpddr_result=%08x",
+			static_cast<unsigned long long>(window), heap_limit, heap_arena,
+			heap_used, heap_free, heap_sbrk_remaining + heap_free,
+			free_memory_result >= 0 ?
+				static_cast<u32>(free_memory.size_user) : 0,
+			static_cast<u32>(free_memory_result));
+#endif
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_fallback interpreter_steps=%llu "
 			"fallbacks=%llu unsupported=%llu scan_boundary=%llu branch_likely=%llu "
@@ -2638,6 +2705,13 @@ namespace MTGS
 		GSVertexSW::InitStatic();
 
 #if !defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION
+		// GSLocalMemory is constructed after GSDeviceGXM by PCSX2's renderer
+		// lifecycle, but its canonical 4 MiB store is mandatory. Reserve that
+		// store first so GXM's optional GPU-VU ring cannot consume or fragment
+		// the final range it needs.
+		if (!VitaGS::ReserveCanonicalLocalMemory())
+			return false;
+
 		// PCSX2 owner: GS.cpp::OpenGSDevice(). GSDeviceGXM owns the process's
 		// only immediate GXM context and must precede GSRendererHW/GSTextureCache.
 		g_gs_device = std::make_unique<GSDeviceGXM>();
@@ -2646,6 +2720,7 @@ namespace MTGS
 		{
 			g_gs_device->Destroy();
 			g_gs_device.reset();
+			VitaGS::ReleaseUnclaimedCanonicalLocalMemory();
 			return false;
 		}
 #endif
@@ -2661,6 +2736,7 @@ namespace MTGS
 		if (!s_gs->IsNativePresenterReady())
 		{
 			CloseGsOnWorker();
+			VitaGS::ReleaseUnclaimedCanonicalLocalMemory();
 			return false;
 		}
 #endif
