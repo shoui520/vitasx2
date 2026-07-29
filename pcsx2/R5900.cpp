@@ -76,18 +76,26 @@ static __fi bool VitaCanCoalesceRetainedIopWait()
 		(cpuRegs.CP0.n.Status.val & 0x8000u) == 0;
 }
 
+static __attribute__((noinline, cold))
+s32 VitaScaleNonstandardIopEventDeltaToEe(u64 iop_cycles)
+{
+	const float multiplier =
+		static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
+	return static_cast<s32>(static_cast<float>(iop_cycles) * multiplier);
+}
+
 static __fi s32 VitaScaleIopEventDeltaToEe(u64 iop_cycles)
 {
 	// PCSX2 owner: R3000AInterpreter.cpp::intExecuteBlock() and
 	// x86/iR3000A.cpp::iPsxAddEECycles(). Ordinary PS2 mode is exactly 8:1;
 	// avoid converting through float and issuing a VFP divide at every EE
-	// event seam. PS1 mode keeps the existing R5900 scheduler calculation.
+	// event seam. Keep the PS1 calculation out of the hot scheduler body so
+	// its private A32 entry does not spill an otherwise-unused callee-saved
+	// VFP register.
 	if (PSXCLK == (PS2CLK / 8u)) [[likely]]
 		return static_cast<s32>(iop_cycles * 8u);
 
-	const float multiplier =
-		static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
-	return static_cast<s32>(static_cast<float>(iop_cycles) * multiplier);
+	return VitaScaleNonstandardIopEventDeltaToEe(iop_cycles);
 }
 #endif
 
@@ -106,7 +114,9 @@ namespace
 		asm volatile(
 			// The private entry reserved the body's ordinary nine-word save
 			// area, but only LR belongs to it. The persistent EE event bridge
-			// already owns r4-r11 for the complete generated-code run.
+			// already owns r4-r11 for the complete generated-code run. Keep
+			// floating-point work in AAPCS callees so the body itself never
+			// acquires a callee-saved VFP frame.
 			"ldr lr, [r0, #-4]\n"
 			"mov sp, r0\n"
 			"bx lr\n"
@@ -502,48 +512,53 @@ static bool cpuIntsEnabled(int Interrupt)
 		!cpuRegs.CP0.n.Status.b.EXL && (cpuRegs.CP0.n.Status.b.ERL == 0);
 }
 
-#if defined(VITASX2_VITA) && !defined(VITASX2_QEMU_VALIDATION) && \
-	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 static __fi void VitaIopEventTestFromEe()
 {
-	// PCSX2 owner: R3000A.cpp::iopEventTest(). The EE scheduler calls this at
-	// every 384-IOP-cycle interleave seam, while the overwhelmingly common path
-	// only publishes the next deadline. Keep that negative path in this TU so
-	// Cortex-A9 does not cross an out-of-line C++ call and repeat its global
-	// address setup. Every state-changing case still enters the owning function.
-	constexpr u32 IOP_WAIT_CYCLES = 384;
-	constexpr u32 IOP_RETAINED_WAIT_CYCLES = IOP_WAIT_CYCLES * 2;
-	psxRegs.iopNextEventCycle = psxRegs.cycle +
-		(VitaA32IopRetainedWaitCoalescingActive() ?
-				IOP_RETAINED_WAIT_CYCLES :
-				IOP_WAIT_CYCLES);
-
-	if (static_cast<s32>(static_cast<u32>(psxRegs.cycle - psxNextStartCounter)) >=
-		psxNextDeltaCounter)
+	// PCSX2 owner: R3000A.cpp::iopEventTest(). PSX_INT(), counter writes, and
+	// the prior iopEventTest() publish iopNextEventCycle. If every published
+	// owner is still in the future, rebuilding the same 384/768-cycle horizon
+	// cannot expose new guest state. PSX_INT() publishes the earliest pending
+	// callback through psxSetNextBranchDelta(), and iopEventTest() republishes
+	// every not-yet-due callback through psxSetNextBranch(). A pending callback
+	// therefore does not require dispatch before its published deadline. Keep
+	// due/earlier counters and already-visible INTC state on the complete owner.
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (!g_vita_a32_iop_deadline_gate_validation_enabled)
 	{
 		iopEventTest();
 		return;
 	}
+#endif
+	const bool deadline_due =
+		static_cast<s64>(psxRegs.cycle - psxRegs.iopNextEventCycle) >= 0;
+	const bool counter_due =
+		static_cast<s32>(static_cast<u32>(
+			psxRegs.cycle - psxNextStartCounter)) >= psxNextDeltaCounter;
+	const bool counter_precedes_published =
+		psxNextDeltaCounter <
+			static_cast<s32>(
+				psxRegs.iopNextEventCycle - psxNextStartCounter);
+	const bool intc_visible =
+		psxHu32(HW_ICTRL) != 0 &&
+		(psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0;
+	const bool dispatch =
+		deadline_due || counter_due || counter_precedes_published ||
+		intc_visible;
 
-	if (psxNextDeltaCounter <
-		static_cast<s32>(psxRegs.iopNextEventCycle - psxNextStartCounter))
-	{
-		psxRegs.iopNextEventCycle = psxNextStartCounter + psxNextDeltaCounter;
-	}
-
-	if (psxRegs.interrupt != 0 ||
-		(psxHu32(HW_ICTRL) != 0 &&
-			(psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0))
-	{
+#if defined(VITASX2_CPU_PROFILER)
+	VitaPerformanceTelemetry::RecordIopDeadlineGateIfProfiling(
+		dispatch, counter_precedes_published);
+#endif
+	if (dispatch)
 		iopEventTest();
-	}
 }
 #endif
 
 // Shared portion of the branch test, called from both the Interpreter
 // and the recompiler.  (moved here to help alleviate redundant code)
 #if defined(__arm__)
-extern "C" __attribute__((noinline, target("arm")))
+extern "C" __attribute__((noinline, target("arm,general-regs-only")))
 void VitaCpuEventTestSharedPrivateBody()
 #else
 __fi void _cpuEventTest_Shared()
@@ -656,8 +671,7 @@ __fi void _cpuEventTest_Shared()
 #endif
 	}
 
-#if defined(VITASX2_VITA) && !defined(VITASX2_QEMU_VALIDATION) && \
-	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	{
 		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
 			VitaPerformanceTelemetry::CpuStage::IopEvent);

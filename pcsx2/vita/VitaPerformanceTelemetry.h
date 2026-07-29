@@ -105,6 +105,10 @@ namespace VitaPerformanceTelemetry
 		u64 unbalanced_samples = 0;
 		u64 interval_records = 0;
 		u64 overwritten_interval_records = 0;
+		u64 iop_deadline_gate_checks = 0;
+		u64 iop_deadline_gate_skips = 0;
+		u64 iop_deadline_gate_dispatches = 0;
+		u64 iop_deadline_shadow_late = 0;
 		std::array<u64, CPU_STAGE_COUNT> stage_time_us{};
 		std::array<u64, CPU_STAGE_COUNT> stage_entries{};
 	};
@@ -152,6 +156,7 @@ namespace VitaPerformanceTelemetry
 	void BeginCpuStage(CpuStage stage);
 	void EndCpuStage();
 	void CountCpuStageEntry(CpuStage stage);
+	void RecordIopDeadlineGate(bool dispatched, bool shadow_late);
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
 		u32 iop_pc, u64 iop_cycle)
@@ -200,6 +205,18 @@ namespace VitaPerformanceTelemetry
 			CountCpuStageEntry(stage);
 #else
 		(void)stage;
+#endif
+	}
+
+	inline void RecordIopDeadlineGateIfProfiling(
+		bool dispatched, bool shadow_late)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordIopDeadlineGate(dispatched, shadow_late);
+#else
+		(void)dispatched;
+		(void)shadow_late;
 #endif
 	}
 

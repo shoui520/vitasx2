@@ -61,6 +61,7 @@ void VitaSetA32IopSchedulerDirectEventContext(uptr context);
 extern bool g_vita_a32_iop_retained_unconditional_normal_wait;
 #if defined(VITASX2_QEMU_VALIDATION)
 extern bool g_vita_a32_iop_retained_wait_coalescing_validation_enabled;
+extern bool g_vita_a32_iop_deadline_gate_validation_enabled;
 #endif
 inline __attribute__((always_inline))
 bool VitaA32IopRetainedWaitCoalescingActive()

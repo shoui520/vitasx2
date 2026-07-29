@@ -716,6 +716,18 @@ namespace MTGS
 			const u64 overwritten_interval_records = CounterDelta(
 				end.cpu_stage_profiler.overwritten_interval_records,
 				start.cpu_stage_profiler.overwritten_interval_records);
+			const u64 iop_deadline_gate_checks = CounterDelta(
+				end.cpu_stage_profiler.iop_deadline_gate_checks,
+				start.cpu_stage_profiler.iop_deadline_gate_checks);
+			const u64 iop_deadline_gate_skips = CounterDelta(
+				end.cpu_stage_profiler.iop_deadline_gate_skips,
+				start.cpu_stage_profiler.iop_deadline_gate_skips);
+			const u64 iop_deadline_gate_dispatches = CounterDelta(
+				end.cpu_stage_profiler.iop_deadline_gate_dispatches,
+				start.cpu_stage_profiler.iop_deadline_gate_dispatches);
+			const u64 iop_deadline_shadow_late = CounterDelta(
+				end.cpu_stage_profiler.iop_deadline_shadow_late,
+				start.cpu_stage_profiler.iop_deadline_shadow_late);
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_summary "
 				"sample_period=%u scheduler_entries=%llu samples=%llu "
@@ -727,6 +739,15 @@ namespace MTGS
 				static_cast<unsigned long long>(unbalanced_samples),
 				static_cast<unsigned long long>(interval_records),
 				static_cast<unsigned long long>(overwritten_interval_records));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_deadline_shadow "
+				"iop_checks=%llu iop_skips=%llu iop_dispatches=%llu "
+				"iop_late=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(iop_deadline_gate_checks),
+				static_cast<unsigned long long>(iop_deadline_gate_skips),
+				static_cast<unsigned long long>(iop_deadline_gate_dispatches),
+				static_cast<unsigned long long>(iop_deadline_shadow_late));
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT> stage_time_us{};
 			std::array<u64,

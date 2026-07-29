@@ -416,5 +416,16 @@ namespace VitaPerformanceTelemetry
 		s_cpu_stage_profiler.totals.stage_entries[
 			static_cast<size_t>(stage)]++;
 	}
+
+	void RecordIopDeadlineGate(bool dispatched, bool shadow_late)
+	{
+		s_cpu_stage_profiler.totals.iop_deadline_gate_checks++;
+		if (dispatched)
+			s_cpu_stage_profiler.totals.iop_deadline_gate_dispatches++;
+		else
+			s_cpu_stage_profiler.totals.iop_deadline_gate_skips++;
+		if (shadow_late)
+			s_cpu_stage_profiler.totals.iop_deadline_shadow_late++;
+	}
 #endif
 }
