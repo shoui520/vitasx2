@@ -800,6 +800,70 @@ static __forceinline void AdvanceStoppedCoreVoices(const uint coreidx)
 #endif
 }
 
+static __forceinline void IncrementStoppedNextAWithoutIrq(V_Voice& voice)
+{
+	voice.NextA = (voice.NextA + 1u) & 0xfffffu;
+}
+
+static __forceinline void DecodeStoppedSamplesWithoutIrq(
+	V_Core& core, uint voiceidx)
+{
+	V_Voice& voice = core.Voices[voiceidx];
+
+	// This is DecodeSamples() with its cross-core IRQ observations removed.
+	// spu2Mix() selects it only while both IRQ-enable bits are false, and no
+	// IOP register write can intervene inside TimeUpdate()'s sample batch.
+	voice.LoopFlags = *GetMemPtr(voice.NextA & 0xffff8u) >> 8;
+	if ((voice.LoopFlags & XAFLAG_LOOP_START) && !voice.LoopMode)
+		voice.LoopStartA = voice.NextA & 0xffff8u;
+
+	if (static_cast<int>(voice.DecPosWrite - voice.DecPosRead) > 12)
+		return;
+
+	voice.DecPosWrite += 4;
+	IncrementStoppedNextAWithoutIrq(voice);
+	if ((voice.NextA & 7u) == 0)
+	{
+		if (voice.LoopFlags & XAFLAG_LOOP_END)
+		{
+			core.Regs.ENDX |= 1u << voiceidx;
+			voice.NextA = voice.LoopStartA;
+			if (!(voice.LoopFlags & XAFLAG_LOOP))
+				voice.Stop();
+		}
+
+		IncrementStoppedNextAWithoutIrq(voice);
+		voice.SBuffer = nullptr;
+	}
+}
+
+static __forceinline void AdvanceStoppedCoreVoicesWithoutIrq(
+	const uint coreidx)
+{
+	V_Core& core = Cores[coreidx];
+
+	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
+	{
+		DecodeStoppedSamplesWithoutIrq(core, voiceidx);
+		UpdatePitch(coreidx, voiceidx);
+		ConsumeSamples(core, voiceidx);
+
+		if (voiceidx == 1)
+		{
+			*GetMemPtr(((coreidx == 0) ? 0x400 : 0xc00) + OutPos) = 0;
+		}
+		else if (voiceidx == 3)
+		{
+			*GetMemPtr(((coreidx == 0) ? 0x600 : 0xe00) + OutPos) = 0;
+		}
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2VoiceVolumeSlideSkipped += V_Core::NumVoices;
+	g_qemuSpu2ZeroVoiceGateSkipped += V_Core::NumVoices;
+#endif
+}
+
 #if defined(VITASX2_QEMU_VALIDATION)
 void Spu2MixStoppedCoreVoicesReferenceForValidation(uint coreidx)
 {
@@ -809,7 +873,10 @@ void Spu2MixStoppedCoreVoicesReferenceForValidation(uint coreidx)
 
 void Spu2MixStoppedCoreVoicesSelectedForValidation(uint coreidx)
 {
-	AdvanceStoppedCoreVoices(coreidx);
+	if (Cores[0].IRQEnable || Cores[1].IRQEnable)
+		AdvanceStoppedCoreVoices(coreidx);
+	else
+		AdvanceStoppedCoreVoicesWithoutIrq(coreidx);
 }
 #endif
 
@@ -985,8 +1052,16 @@ void spu2Mix()
 
 	if (g_spu2AllVoicesStoppedWithoutSlides)
 	{
-		AdvanceStoppedCoreVoices(0);
-		AdvanceStoppedCoreVoices(1);
+		if (Cores[0].IRQEnable || Cores[1].IRQEnable)
+		{
+			AdvanceStoppedCoreVoices(0);
+			AdvanceStoppedCoreVoices(1);
+		}
+		else
+		{
+			AdvanceStoppedCoreVoicesWithoutIrq(0);
+			AdvanceStoppedCoreVoicesWithoutIrq(1);
+		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuSpu2StoppedVoiceFastSamples++;
 #endif
