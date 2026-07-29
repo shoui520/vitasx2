@@ -716,10 +716,9 @@ static bool VitaTrySpu2OnlyCounterUpdate()
 	psxNextStartCounter = psxRegs.cycle;
 
 	{
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::Spu2);
 		AdvanceAndScheduleSpu2();
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 	}
 	psxNextDeltaCounter = psxCounters[6].deltaCycles;
 
@@ -786,18 +785,16 @@ void psxRcntUpdate()
 	}
 
 	{
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::Spu2);
 		AdvanceAndScheduleSpu2();
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 	}
 	psxNextDeltaCounter = psxCounters[6].deltaCycles;
 
 	{
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::Dev9);
 		DEV9async(1);
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 	}
 	const s32 diffusb = psxRegs.cycle - psxCounters[7].startCycle;
 	s32 cusb = psxCounters[7].deltaCycles;
@@ -805,10 +802,9 @@ void psxRcntUpdate()
 	if (diffusb >= psxCounters[7].deltaCycles)
 	{
 		{
-			VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 				VitaPerformanceTelemetry::CpuStage::Usb);
 			USBasync(diffusb);
-			VitaPerformanceTelemetry::EndCpuStageIfSampling();
 		}
 		psxCounters[7].startCycle += psxCounters[7].rate * (diffusb / psxCounters[7].rate);
 		psxCounters[7].deltaCycles = psxCounters[7].rate;

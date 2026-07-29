@@ -1254,6 +1254,7 @@ int main()
 			goto fail;
 		}
 		Console.WriteLn("VitaSX2 all-native reset-to-later SOTC milestone passed.");
+		VitaPerformanceTelemetry::ShutdownCpuStageProfiler();
 		VMManager::Shutdown(false);
 		vm_initialized = false;
 		VMManager::Internal::CPUThreadShutdown();
@@ -1275,6 +1276,7 @@ int main()
 fail:
 	VitaSetEePreInstructionTraceCallback(nullptr);
 	VitaSetEeExactTraceStreams(false);
+	VitaPerformanceTelemetry::ShutdownCpuStageProfiler();
 #if VITASX2_PRODUCT_BOOT_VALIDATION
 	StopValidationProgress();
 	VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition::None);

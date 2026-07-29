@@ -7,6 +7,9 @@
 
 #include <array>
 #include <cstddef>
+#if defined(VITASX2_CPU_PROFILER)
+#include <atomic>
+#endif
 
 namespace VitaPerformanceTelemetry
 {
@@ -207,6 +210,16 @@ namespace VitaPerformanceTelemetry
 		// aliasing against the fixed scheduler sample cadence.
 		u64 ee_compile_observations = 0;
 		u64 ee_compile_time_us = 0;
+#if defined(VITASX2_CPU_PROFILER)
+		// The statistical sampler runs on a non-EE Vita thread. CPU0 publishes
+		// only its current stage with a relaxed word store; the observer samples
+		// that marker at a decorrelated cadence. This attributes short helpers
+		// without putting two process-clock syscalls around each guest operation.
+		u64 statistical_samples = 0;
+		u64 statistical_invalid_samples = 0;
+		u64 statistical_sampler_cpu_us = 0;
+		std::array<u64, CPU_STAGE_COUNT> statistical_stage_samples{};
+#endif
 		std::array<u64, CPU_STAGE_COUNT> stage_time_us{};
 		std::array<u64, CPU_STAGE_COUNT> stage_entries{};
 	};
@@ -237,6 +250,13 @@ namespace VitaPerformanceTelemetry
 	// sparse subset of EE scheduler entries. It is diagnostic-only and excluded
 	// from normal builds.
 	void ConfigureCpuStageProfilerBeforeVmStart(bool enabled);
+#if defined(VITASX2_CPU_PROFILER)
+	void ShutdownCpuStageProfiler();
+#else
+	inline void ShutdownCpuStageProfiler()
+	{
+	}
+#endif
 	CpuStageProfilerSnapshot GetCpuStageProfilerSnapshot();
 	CpuProfileHotEdgeSnapshot GetCpuProfileHotEdgeSnapshot(
 		u64 first_sequence, u64 next_sequence);
@@ -247,6 +267,7 @@ namespace VitaPerformanceTelemetry
 #if defined(VITASX2_CPU_PROFILER)
 	extern bool g_cpu_stage_profiler_enabled;
 	extern bool g_cpu_stage_sample_active;
+	extern std::atomic<u32> g_cpu_stage_statistical_marker;
 #endif
 
 	void OnEeSchedulerEntryEnabled(u32 ee_pc, u64 ee_cycle,
@@ -489,9 +510,19 @@ namespace VitaPerformanceTelemetry
 		explicit ScopedCpuStage(CpuStage stage)
 		{
 #if defined(VITASX2_CPU_PROFILER)
-			m_entered = g_cpu_stage_sample_active;
+			m_entered = g_cpu_stage_profiler_enabled;
 			if (m_entered)
-				BeginCpuStage(stage);
+			{
+				m_previous_statistical_stage =
+					g_cpu_stage_statistical_marker.load(
+						std::memory_order_relaxed);
+				g_cpu_stage_statistical_marker.store(
+					static_cast<u32>(stage),
+					std::memory_order_relaxed);
+				m_sampled = g_cpu_stage_sample_active;
+				if (m_sampled)
+					BeginCpuStage(stage);
+			}
 #else
 			(void)stage;
 #endif
@@ -500,8 +531,14 @@ namespace VitaPerformanceTelemetry
 		~ScopedCpuStage()
 		{
 #if defined(VITASX2_CPU_PROFILER)
-			if (m_entered && g_cpu_stage_sample_active)
+			if (m_sampled && g_cpu_stage_sample_active)
 				EndCpuStage();
+			if (m_entered)
+			{
+				g_cpu_stage_statistical_marker.store(
+					m_previous_statistical_stage,
+					std::memory_order_relaxed);
+			}
 #endif
 		}
 
@@ -511,6 +548,9 @@ namespace VitaPerformanceTelemetry
 	private:
 #if defined(VITASX2_CPU_PROFILER)
 		bool m_entered = false;
+		bool m_sampled = false;
+		u32 m_previous_statistical_stage =
+			static_cast<u32>(CpuStage::Count);
 #endif
 	};
 

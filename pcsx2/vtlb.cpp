@@ -371,7 +371,7 @@ static bool VitaEeGetDirectRamProtection(const VTLBVirtual& mapping,
 u32 VitaEeExecutePreincrementByteZeroFill(u32 start_pc, u32 fallthrough_pc,
 	u32 block_cycles, u32 packed_guests)
 {
-	VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 		VitaPerformanceTelemetry::CpuStage::EeHelper);
 	// PCSX2 owners: R5900OpcodeImpl.cpp::ADDIU()/SB(), vtlb_memWrite<u8>(),
 	// x86 recVTLB.cpp::DynGen_DirectWrite(), and iR5900.cpp::iBranchTest().
@@ -505,7 +505,7 @@ u32 VitaEeExecutePreincrementByteZeroFill(u32 start_pc, u32 fallthrough_pc,
 u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 	u32 block_cycles, u32 packed_guests)
 {
-	VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 		VitaPerformanceTelemetry::CpuStage::EeHelper);
 	// PCSX2 owners: x86/ix86-32/iR5900LoadStore.cpp::recSW(),
 	// iR5900AritImm.cpp::recADDIU(), iR5900Branch.cpp::recBNE(),
@@ -660,7 +660,7 @@ u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 u32 VitaEeExecutePreincrementWordFill(u32 start_pc, u32 fallthrough_pc,
 	u32 packed_cycles, u32 packed_guests)
 {
-	VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 		VitaPerformanceTelemetry::CpuStage::EeHelper);
 	// PCSX2 owners: x86/ix86-32/iR5900AritImm.cpp::recADDIU()/recSLTIU_(),
 	// iR5900LoadStore.cpp::recSW(), iR5900Arit.cpp::recSUBU(),
@@ -851,7 +851,7 @@ u32 VitaEeExecutePreincrementWordFill(u32 start_pc, u32 fallthrough_pc,
 u32 VitaEeExecuteSelfAddressPairScan(u32 start_pc, u32 packed_guests,
 	u32 packed_cycles, u32 load_cycles)
 {
-	VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 		VitaPerformanceTelemetry::CpuStage::EeHelper);
 	// PCSX2 owners: x86/ix86-32/iR5900LoadStore.cpp::recLW(),
 	// iR5900Branch.cpp::recBNE()/recBEQL(), iR5900AritImm.cpp::recADDIU(),
@@ -1013,7 +1013,7 @@ u32 VitaEeExecuteSelfAddressPairScan(u32 start_pc, u32 packed_guests,
 u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
 	u32 packed_cycles, u32 packed_guests)
 {
-	VitaPerformanceTelemetry::CountCpuStageEntryIfSampling(
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 		VitaPerformanceTelemetry::CpuStage::EeHelper);
 	// PCSX2 owners: x86/ix86-32/iR5900LoadStore.cpp::recLW()/recSW(),
 	// iR5900AritImm.cpp::recADDIU(), iR5900Branch.cpp::recBNE(),

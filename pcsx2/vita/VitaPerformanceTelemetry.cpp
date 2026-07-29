@@ -4,17 +4,20 @@
 #include "vita/VitaPerformanceTelemetry.h"
 
 #if defined(VITASX2_CPU_PROFILER)
+#include "common/Threading.h"
 #include "Memory.h"
 #include "SPU2/spu2.h"
 #endif
 
 #if defined(__vita__) && defined(VITASX2_CPU_PROFILER)
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
 #endif
 
 #if defined(VITASX2_CPU_PROFILER)
 #include <algorithm>
 #include <array>
+#include <atomic>
 #endif
 
 namespace VitaPerformanceTelemetry
@@ -23,6 +26,8 @@ namespace VitaPerformanceTelemetry
 #if defined(VITASX2_CPU_PROFILER)
 	bool g_cpu_stage_profiler_enabled = false;
 	bool g_cpu_stage_sample_active = false;
+	std::atomic<u32> g_cpu_stage_statistical_marker{
+		static_cast<u32>(CpuStage::Count)};
 
 	namespace
 	{
@@ -48,6 +53,71 @@ namespace VitaPerformanceTelemetry
 				CPU_PROFILE_INTERVAL_RING_SIZE <= 96 * 1024,
 			"CPU0 profile interval ring must remain below 96 KiB");
 		CpuStageProfilerState s_cpu_stage_profiler;
+		std::array<std::atomic<u32>, CPU_STAGE_COUNT>
+			s_statistical_stage_samples{};
+		std::atomic<u32> s_statistical_samples{0};
+		std::atomic<u32> s_statistical_invalid_samples{0};
+
+#if defined(__vita__)
+		Threading::Thread s_statistical_sampler_thread;
+		std::atomic<bool> s_statistical_sampler_shutdown{false};
+
+		void StatisticalSamplerThread()
+		{
+			// CPU0 owns emulation. MTVU and GS own USER_1/USER_2, but both
+			// routinely sleep at ordered producer/consumer boundaries. Keep
+			// this diagnostic observer off USER_0 and asleep for >99% of its
+			// lifetime. Its exact CPU cost is published with every snapshot.
+			const Threading::ThreadHandle self =
+				Threading::ThreadHandle::GetForCallingThread();
+			(void)self.SetAffinity(1u << 2);
+
+			u32 random_state = 0x6d2b79f5u;
+			while (!s_statistical_sampler_shutdown.load(
+				std::memory_order_acquire))
+			{
+				const u32 stage = g_cpu_stage_statistical_marker.load(
+					std::memory_order_relaxed);
+				s_statistical_samples.fetch_add(1,
+					std::memory_order_relaxed);
+				if (stage < CPU_STAGE_COUNT)
+				{
+					s_statistical_stage_samples[stage].fetch_add(
+						1, std::memory_order_relaxed);
+				}
+				else
+				{
+					s_statistical_invalid_samples.fetch_add(
+						1, std::memory_order_relaxed);
+				}
+
+				// A fixed millisecond cadence aliases against periodic device
+				// work. Xorshift32 gives a deterministic 1750..3797 us delay,
+				// decorrelating samples without allocating or reading a clock.
+				random_state ^= random_state << 13;
+				random_state ^= random_state >> 17;
+				random_state ^= random_state << 5;
+				const SceUInt delay_us =
+					1750u + (random_state & 2047u);
+				sceKernelDelayThread(delay_us);
+			}
+		}
+
+		void StartStatisticalSampler()
+		{
+			if (s_statistical_sampler_thread.Joinable())
+				return;
+			s_statistical_sampler_shutdown.store(
+				false, std::memory_order_relaxed);
+			s_statistical_sampler_thread.SetStackSize(32 * 1024);
+			if (!s_statistical_sampler_thread.Start(
+					&StatisticalSamplerThread))
+			{
+				s_statistical_invalid_samples.fetch_add(
+					1, std::memory_order_relaxed);
+			}
+		}
+#endif
 
 		inline u32 ReadProcessTimeLow()
 		{
@@ -103,6 +173,12 @@ namespace VitaPerformanceTelemetry
 			s_cpu_stage_profiler.stage_depth = 0;
 			g_cpu_stage_sample_active = false;
 		}
+
+		void PublishStatisticalStage(CpuStage stage)
+		{
+			g_cpu_stage_statistical_marker.store(
+				static_cast<u32>(stage), std::memory_order_relaxed);
+		}
 	} // namespace
 #endif
 
@@ -120,15 +196,60 @@ namespace VitaPerformanceTelemetry
 		s_cpu_stage_profiler.scheduler_until_sample =
 			CPU_STAGE_SAMPLE_PERIOD;
 		s_cpu_stage_profiler.totals.valid = enabled;
+		g_cpu_stage_statistical_marker.store(
+			static_cast<u32>(CpuStage::Count),
+			std::memory_order_relaxed);
+		s_statistical_samples.store(0, std::memory_order_relaxed);
+		s_statistical_invalid_samples.store(0, std::memory_order_relaxed);
+		for (std::atomic<u32>& samples : s_statistical_stage_samples)
+			samples.store(0, std::memory_order_relaxed);
+#if defined(__vita__)
+		if (enabled)
+			StartStatisticalSampler();
+#endif
 #else
 		(void)enabled;
 #endif
 	}
 
+#if defined(VITASX2_CPU_PROFILER)
+	void ShutdownCpuStageProfiler()
+	{
+#if defined(__vita__)
+		if (s_statistical_sampler_thread.Joinable())
+		{
+			s_statistical_sampler_shutdown.store(
+				true, std::memory_order_release);
+			s_statistical_sampler_thread.Join();
+		}
+#endif
+	}
+#endif
+
 	CpuStageProfilerSnapshot GetCpuStageProfilerSnapshot()
 	{
 #if defined(VITASX2_CPU_PROFILER)
-		return s_cpu_stage_profiler.totals;
+		CpuStageProfilerSnapshot snapshot =
+			s_cpu_stage_profiler.totals;
+		snapshot.statistical_samples =
+			s_statistical_samples.load(std::memory_order_relaxed);
+		snapshot.statistical_invalid_samples =
+			s_statistical_invalid_samples.load(
+				std::memory_order_relaxed);
+		for (size_t i = 0; i < CPU_STAGE_COUNT; i++)
+		{
+			snapshot.statistical_stage_samples[i] =
+				s_statistical_stage_samples[i].load(
+					std::memory_order_relaxed);
+		}
+#if defined(__vita__)
+		if (s_statistical_sampler_thread.Joinable())
+		{
+			snapshot.statistical_sampler_cpu_us =
+				s_statistical_sampler_thread.GetCPUTime();
+		}
+#endif
+		return snapshot;
 #else
 		return {};
 #endif
@@ -339,6 +460,7 @@ namespace VitaPerformanceTelemetry
 				balanced);
 		}
 
+		PublishStatisticalStage(CpuStage::Scheduler);
 		s_cpu_stage_profiler.totals.scheduler_entries++;
 		if (--s_cpu_stage_profiler.scheduler_until_sample != 0)
 			return;
@@ -370,6 +492,7 @@ namespace VitaPerformanceTelemetry
 
 	void OnEeSchedulerExitEnabled()
 	{
+		PublishStatisticalStage(CpuStage::EeGenerated);
 		if (!g_cpu_stage_sample_active)
 			return;
 
@@ -392,7 +515,6 @@ namespace VitaPerformanceTelemetry
 	{
 		if (!g_cpu_stage_sample_active)
 			return;
-
 		const u32 now = ReadProcessTimeLow();
 		AccumulateCurrentStage(now);
 		if (s_cpu_stage_profiler.stage_depth >= STAGE_STACK_DEPTH)
@@ -413,7 +535,6 @@ namespace VitaPerformanceTelemetry
 	{
 		if (!g_cpu_stage_sample_active)
 			return;
-
 		const u32 now = ReadProcessTimeLow();
 		AccumulateCurrentStage(now);
 		if (s_cpu_stage_profiler.stage_depth == 0)

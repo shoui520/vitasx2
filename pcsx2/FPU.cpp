@@ -3,10 +3,10 @@
 
 #include "Common.h"
 
-#if defined(VITASX2_VITA)
+#if defined(VITASX2_VITA) && defined(VITASX2_CPU_PROFILER)
 #include "vita/VitaPerformanceTelemetry.h"
 #define VITA_PROFILE_COP1() \
-	VitaPerformanceTelemetry::CountCpuStageEntryIfSampling( \
+	const VitaPerformanceTelemetry::ScopedCpuStage vita_profile_cop1_stage( \
 		VitaPerformanceTelemetry::CpuStage::Cop1)
 #else
 #define VITA_PROFILE_COP1() ((void)0)

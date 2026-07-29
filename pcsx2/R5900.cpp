@@ -980,15 +980,12 @@ __fi void _cpuEventTest_Shared()
 #endif
 	{
 #if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::EeExceptions);
 #endif
 		uint mask = intcInterrupt() | dmacInterrupt();
 		if (cpuIntsEnabled(mask))
 			cpuException(mask, cpuRegs.branch);
-#if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
-#endif
 	}
 
 	// ---- IOP -------------
@@ -1010,7 +1007,7 @@ __fi void _cpuEventTest_Shared()
 	if (iopEventAction)
 	{
 #if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::IopGuest);
 #endif
 		//if( EEsCycle < -450 )
@@ -1050,17 +1047,13 @@ __fi void _cpuEventTest_Shared()
 #endif
 
 		iopEventAction = false;
-#if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
-#endif
 	}
 
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	{
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::IopEvent);
 		VitaIopEventTestFromEe();
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 	}
 #else
 	iopEventTest();
@@ -1111,7 +1104,7 @@ __fi void _cpuEventTest_Shared()
 
 	{
 #if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::EeCounters);
 #endif
 		if (cpuTestCycle(nextStartCounter, nextDeltaCounter))
@@ -1121,9 +1114,6 @@ __fi void _cpuEventTest_Shared()
 		}
 
 		_cpuTestTIMR();
-#if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
-#endif
 	}
 
 	// ---- Interrupts -------------
@@ -1132,7 +1122,7 @@ __fi void _cpuEventTest_Shared()
 
 	{
 #if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::EeInterrupts);
 #endif
 		if (cpuRegs.interrupt)
@@ -1149,9 +1139,6 @@ __fi void _cpuEventTest_Shared()
 			else
 				_cpuTestInterrupts();
 		}
-#if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
-#endif
 	}
 
 	// ---- VU Sync -------------
@@ -1163,7 +1150,7 @@ __fi void _cpuEventTest_Shared()
 	// when VPU_STAT is clear.
 	{
 #if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::VuSync);
 #endif
 		const u32 vu_running = VU0.VI[REG_VPU_STAT].UL;
@@ -1171,15 +1158,12 @@ __fi void _cpuEventTest_Shared()
 			CpuVU0->ExecuteBlock();
 		if (THREAD_VU1 || (vu_running & 0x100))
 			CpuVU1->ExecuteBlock();
-#if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
-#endif
 	}
 
 	// ---- Schedule Next Event Test --------------
 	{
 #if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::Deadline);
 #endif
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
@@ -1242,9 +1226,6 @@ __fi void _cpuEventTest_Shared()
 			if (!VitaCanCoalesceRetainedIopWait())
 				cpuSetNextEventDelta(eeWaitCycles);
 		}
-#endif
-#if defined(VITASX2_VITA)
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 #endif
 	}
 

@@ -328,10 +328,11 @@ __ri void iopEventTest()
 
 	if (psxTestCycle(psxNextStartCounter, psxNextDeltaCounter))
 	{
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
-			VitaPerformanceTelemetry::CpuStage::IopCounters);
-		psxRcntUpdate();
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+		{
+			const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+				VitaPerformanceTelemetry::CpuStage::IopCounters);
+			psxRcntUpdate();
+		}
 		iopEventAction = true;
 	}
 	else
@@ -343,7 +344,7 @@ __ri void iopEventTest()
 	}
 
 	{
-		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+		const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 			VitaPerformanceTelemetry::CpuStage::IopInterrupts);
 		if (psxRegs.interrupt)
 		{
@@ -362,7 +363,6 @@ __ri void iopEventTest()
 				iopEventAction = true;
 			}
 		}
-		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 	}
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	// An event above may have changed PC or invalidated the retained block.
