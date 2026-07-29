@@ -56,6 +56,8 @@ u64 g_qemuSpu2OutputHash = 1469598103934665603ull;
 u32 g_qemuSpu2OutputSamples = 0;
 #endif
 
+u32 g_spu2OrdinaryVoiceMasks[2] = {};
+
 MULTI_ISA_UNSHARED_START
 
 static const s32 tbl_XA_Factor[16][2] =
@@ -749,10 +751,17 @@ static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx)
 static __noinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
 {
 	V_Core& thiscore(Cores[coreidx]);
+	u32 ordinary_voice_mask = 0;
 
 	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
 	{
 		StereoOut32 VVal(MixVoice(coreidx, voiceidx));
+		const V_Voice& voice = thiscore.Voices[voiceidx];
+		if (voice.ADSR.Phase != V_ADSR::PHASE_STOPPED ||
+			voice.Volume.HasActiveSlide())
+		{
+			ordinary_voice_mask |= 1u << voiceidx;
+		}
 
 		// Note: Results from MixVoice are ranged at 16 bits.
 		if ((VVal.Left | VVal.Right) == 0)
@@ -775,6 +784,7 @@ static __noinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
 		dest.Wet.Left += VVal.Left & thiscore.VoiceGates[voiceidx].WetL;
 		dest.Wet.Right += VVal.Right & thiscore.VoiceGates[voiceidx].WetR;
 	}
+	g_spu2OrdinaryVoiceMasks[coreidx] = ordinary_voice_mask;
 }
 
 static __forceinline void AdvanceStoppedCoreVoices(const uint coreidx)
@@ -1228,6 +1238,7 @@ static __noinline void MixCoreVoicesWithStoppedFastPath(
 	V_Core& core = Cores[coreidx];
 	const u32 member_mask =
 		s_equivalent_stopped_voice_member_masks[coreidx];
+	u32 ordinary_voice_mask = 0;
 
 	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
 	{
@@ -1266,7 +1277,13 @@ static __noinline void MixCoreVoicesWithStoppedFastPath(
 
 		MixVoiceOutput(
 			dest, core, voiceidx, MixVoice(coreidx, voiceidx));
+		if (voice.ADSR.Phase != V_ADSR::PHASE_STOPPED ||
+			voice.Volume.HasActiveSlide())
+		{
+			ordinary_voice_mask |= voice_mask;
+		}
 	}
+	g_spu2OrdinaryVoiceMasks[coreidx] = ordinary_voice_mask;
 }
 
 #if defined(VITASX2_QEMU_VALIDATION)

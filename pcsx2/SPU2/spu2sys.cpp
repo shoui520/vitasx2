@@ -327,18 +327,24 @@ bool g_spu2AllVoicesStoppedWithoutSlides = false;
 
 static __forceinline bool AllVoicesStoppedWithoutSlides()
 {
-	for (const V_Core& core : Cores)
+	for (u32 coreidx = 0; coreidx < 2; ++coreidx)
 	{
-		for (const V_Voice& voice : core.Voices)
+		u32 ordinary_voice_mask = 0;
+		for (u32 voiceidx = 0; voiceidx < V_Core::NumVoices;
+			 ++voiceidx)
 		{
+			const V_Voice& voice =
+				Cores[coreidx].Voices[voiceidx];
 			if (voice.ADSR.Phase != V_ADSR::PHASE_STOPPED ||
 				voice.Volume.HasActiveSlide())
 			{
-				return false;
+				ordinary_voice_mask |= 1u << voiceidx;
 			}
 		}
+		g_spu2OrdinaryVoiceMasks[coreidx] = ordinary_voice_mask;
 	}
-	return true;
+	return (g_spu2OrdinaryVoiceMasks[0] |
+			   g_spu2OrdinaryVoiceMasks[1]) == 0;
 }
 
 __forceinline void TimeUpdate(u32 cClocks)
@@ -372,6 +378,7 @@ __forceinline void TimeUpdate(u32 cClocks)
 
 	//Update Mixing Progress
 	bool all_voices_stopped_without_slides = false;
+	bool ordinary_voice_masks_initialized = false;
 	bool equivalent_stopped_voice_batch_started = false;
 	while (dClocks >= TickInterval)
 	{
@@ -416,15 +423,22 @@ __forceinline void TimeUpdate(u32 cClocks)
 			}
 		}
 
-		if (!all_voices_stopped_without_slides)
+		if (!ordinary_voice_masks_initialized)
 		{
 			all_voices_stopped_without_slides =
 				AllVoicesStoppedWithoutSlides();
-#if defined(VITASX2_QEMU_VALIDATION)
-			all_voices_stopped_without_slides &=
-				s_vita_spu2_stopped_voice_fast_path_enabled;
-#endif
+			ordinary_voice_masks_initialized = true;
 		}
+		else
+		{
+			all_voices_stopped_without_slides =
+				(g_spu2OrdinaryVoiceMasks[0] |
+					g_spu2OrdinaryVoiceMasks[1]) == 0;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		all_voices_stopped_without_slides &=
+			s_vita_spu2_stopped_voice_fast_path_enabled;
+#endif
 		g_spu2AllVoicesStoppedWithoutSlides =
 			all_voices_stopped_without_slides;
 		spu2Mix();
