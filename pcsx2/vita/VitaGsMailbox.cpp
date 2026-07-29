@@ -806,6 +806,16 @@ namespace MTGS
 				static_cast<unsigned long long>(iop_callback_due),
 				static_cast<unsigned long long>(iop_manufactured_only));
 			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=iop_counter_split "
+				"full=%llu spu2_only=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.iop_counter_full_updates,
+					start.cpu_stage_profiler.iop_counter_full_updates)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.iop_counter_spu2_only_updates,
+					start.cpu_stage_profiler.iop_counter_spu2_only_updates)));
+			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=ee_deadline_shadow "
 				"entries=%llu owner_iop=%llu owner_counter=%llu "
 				"owner_event=%llu owner_none=%llu horizon_le_3072=%llu "
@@ -1006,6 +1016,7 @@ namespace MTGS
 					"Vita perf v=1 window=%llu kind=cpu_hot_edge rank=%u "
 					"ee_start=0x%08x ee_end=0x%08x ee_samples=%u "
 					"ee_us=%llu ee_cycles=%llu "
+					"ee_code=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x "
 					"iop_start=0x%08x iop_end=0x%08x iop_samples=%u "
 					"iop_us=%llu iop_cycles=%llu",
 					static_cast<unsigned long long>(window),
@@ -1013,6 +1024,10 @@ namespace MTGS
 					ee_edge.start_pc, ee_edge.end_pc, ee_edge.samples,
 					static_cast<unsigned long long>(ee_edge.host_time_us),
 					static_cast<unsigned long long>(ee_edge.guest_cycles),
+					ee_edge.code_start[0], ee_edge.code_start[1],
+					ee_edge.code_start[2], ee_edge.code_start[3],
+					ee_edge.code_start[4], ee_edge.code_start[5],
+					ee_edge.code_start[6], ee_edge.code_start[7],
 					iop_edge.start_pc, iop_edge.end_pc, iop_edge.samples,
 					static_cast<unsigned long long>(iop_edge.host_time_us),
 					static_cast<unsigned long long>(iop_edge.guest_cycles));

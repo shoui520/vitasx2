@@ -3,6 +3,10 @@
 
 #include "vita/VitaPerformanceTelemetry.h"
 
+#if defined(VITASX2_CPU_PROFILER)
+#include "Memory.h"
+#endif
+
 #if defined(__vita__) && defined(VITASX2_CPU_PROFILER)
 #include <psp2/kernel/processmgr.h>
 #endif
@@ -158,6 +162,7 @@ namespace VitaPerformanceTelemetry
 			u32 end_pc = 0;
 			u32 estimate = 0;
 			bool valid = false;
+			std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> code_start{};
 		};
 
 		const auto record_at_sequence = [](u64 sequence)
@@ -214,7 +219,12 @@ namespace VitaPerformanceTelemetry
 				Candidate* const target = empty ? empty : least;
 				const u32 inherited = target->valid ?
 					target->estimate : 0;
-				*target = {start_pc, end_pc, inherited + 1, true};
+				target->start_pc = start_pc;
+				target->end_pc = end_pc;
+				target->estimate = inherited + 1;
+				target->valid = true;
+				if (ee)
+					target->code_start = record.ee_code_start;
 			}
 			return candidates;
 		};
@@ -248,6 +258,7 @@ namespace VitaPerformanceTelemetry
 					continue;
 				edges[i].start_pc = candidates[i].start_pc;
 				edges[i].end_pc = candidates[i].end_pc;
+				edges[i].code_start = candidates[i].code_start;
 			}
 			for (u64 sequence = first_sequence;
 				sequence < next_sequence; sequence++)
@@ -346,6 +357,11 @@ namespace VitaPerformanceTelemetry
 		s_cpu_stage_profiler.current_interval.ee_cycle_start = ee_cycle;
 		s_cpu_stage_profiler.current_interval.iop_pc_start = iop_pc;
 		s_cpu_stage_profiler.current_interval.iop_cycle_start = iop_cycle;
+		for (size_t i = 0; i < CPU_PROFILE_CODE_WORD_COUNT; i++)
+		{
+			s_cpu_stage_profiler.current_interval.ee_code_start[i] =
+				memRead32(ee_pc + static_cast<u32>(i * sizeof(u32)));
+		}
 		s_cpu_stage_profiler.totals.stage_entries[
 			static_cast<size_t>(CpuStage::Scheduler)]++;
 	}
@@ -441,6 +457,14 @@ namespace VitaPerformanceTelemetry
 		{
 			s_cpu_stage_profiler.totals.iop_manufactured_only++;
 		}
+	}
+
+	void RecordIopCounterUpdate(bool spu2_only)
+	{
+		if (spu2_only)
+			s_cpu_stage_profiler.totals.iop_counter_spu2_only_updates++;
+		else
+			s_cpu_stage_profiler.totals.iop_counter_full_updates++;
 	}
 
 	void RecordEeDeadlineHorizon(s64 owner_horizon_delta,

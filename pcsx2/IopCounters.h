@@ -68,3 +68,24 @@ extern void psxHBlankStart();
 extern void psxHBlankEnd();
 extern void psxVBlankStart();
 extern void psxVBlankEnd();
+
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+// Host-only deadline proof state is never part of the PS2 savestate.
+extern void VitaInvalidateIopCounterDeadlineCache();
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+struct VitaIopCounterDeadlineValidationStats
+{
+	u64 full_updates = 0;
+	u64 spu2_only_updates = 0;
+};
+
+// The native Cortex-A9 fixture uses this reversible gate to compare the
+// optimized deadline owner against PCSX2's canonical full update.
+extern void VitaSetIopCounterDeadlineSplitEnabledForValidation(bool enabled);
+extern void VitaResetIopCounterDeadlineValidationStats();
+extern VitaIopCounterDeadlineValidationStats
+	VitaGetIopCounterDeadlineValidationStats();
+#endif

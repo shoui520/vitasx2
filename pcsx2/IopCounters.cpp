@@ -52,6 +52,78 @@ bool vBlanking = false;
 #define IOPCNT_GATE_CNT_HIGH_ZERO_OFF 2 // Starts at beginning of next BLANK, counts only during BLANK, returns zero any other time.
 #define IOPCNT_GATE_START_AT_END 3      // Starts at end of next BLANK, continuous count, no clear.
 
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+namespace
+{
+	// PCSX2's aggregate IOP-counter owner mixes one SPU2 sample, advances the
+	// disabled Vita DEV9 device, tests USB, synchronizes all six guest counters,
+	// and reconstructs their deadlines every 768 IOP cycles. A canonical full
+	// pass is the only authority which seeds this host cache. Any counter or
+	// gate mutation invalidates it, so an uncertain boundary fails closed to
+	// psxRcntUpdate()'s original ordering.
+	constexpr u64 VITA_IOP_COUNTER_NO_DEADLINE = ~static_cast<u64>(0);
+	bool s_vita_iop_counter_deadline_collecting = false;
+	bool s_vita_iop_counter_deadline_valid = false;
+	bool s_vita_iop_spu2_is_strict_next_owner = false;
+	u64 s_vita_iop_guest_counter_deadline =
+		VITA_IOP_COUNTER_NO_DEADLINE;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	bool s_vita_iop_counter_deadline_split_enabled = true;
+	VitaIopCounterDeadlineValidationStats
+		s_vita_iop_counter_deadline_validation_stats;
+#endif
+
+	inline void VitaInvalidateIopGuestCounterDeadline()
+	{
+		s_vita_iop_counter_deadline_valid = false;
+		s_vita_iop_spu2_is_strict_next_owner = false;
+	}
+
+	inline void VitaBeginIopGuestCounterDeadlineCollection()
+	{
+		s_vita_iop_counter_deadline_collecting = true;
+		s_vita_iop_counter_deadline_valid = false;
+		s_vita_iop_guest_counter_deadline =
+			VITA_IOP_COUNTER_NO_DEADLINE;
+	}
+
+	inline void VitaPublishIopGuestCounterDelta(u64 delta)
+	{
+		if (!s_vita_iop_counter_deadline_collecting)
+			return;
+
+		const u64 deadline = psxNextStartCounter + delta;
+		if (deadline < s_vita_iop_guest_counter_deadline)
+			s_vita_iop_guest_counter_deadline = deadline;
+	}
+
+	inline void VitaFinishIopGuestCounterDeadlineCollection()
+	{
+		s_vita_iop_counter_deadline_collecting = false;
+		s_vita_iop_counter_deadline_valid = true;
+	}
+
+	inline void VitaRecordIopCounterUpdate(bool spu2_only)
+	{
+		VitaPerformanceTelemetry::RecordIopCounterUpdateIfProfiling(
+			spu2_only);
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (spu2_only)
+		{
+			s_vita_iop_counter_deadline_validation_stats
+				.spu2_only_updates++;
+		}
+		else
+		{
+			s_vita_iop_counter_deadline_validation_stats.full_updates++;
+		}
+#endif
+	}
+} // namespace
+#endif
+
 // Use an arbitrary value to flag HBLANK counters.
 // These counters will be counted by the hblank gates coming from the EE,
 // which ensures they stay 100% in sync with the EE's hblank counters.
@@ -112,6 +184,12 @@ static void psxRcntSync(int cntidx)
 
 static void _rcntSet(int cntidx)
 {
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	if (!s_vita_iop_counter_deadline_collecting)
+		VitaInvalidateIopGuestCounterDeadline();
+#endif
+
 	u64 overflowCap = (cntidx >= 3) ? 0x100000000ULL : 0x10000;
 	u64 c;
 
@@ -130,6 +208,10 @@ static void _rcntSet(int cntidx)
 	if (counter.count > overflowCap || counter.count > counter.target)
 	{
 		psxNextDeltaCounter = 4;
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		VitaPublishIopGuestCounterDelta(4);
+#endif
 		return;
 	}
 
@@ -137,6 +219,10 @@ static void _rcntSet(int cntidx)
 	c = (u64)((overflowCap - counter.count) * counter.rate) - ((u32)psxRegs.cycle - (u32)counter.startCycle);
 	c += psxRegs.cycle - psxNextStartCounter; // adjust for time passed since last rcntUpdate();
 
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	VitaPublishIopGuestCounterDelta(c);
+#endif
 	if (c < (u64)psxNextDeltaCounter)
 	{
 		psxNextDeltaCounter = (u32)c;
@@ -149,6 +235,10 @@ static void _rcntSet(int cntidx)
 	c = (s64)((counter.target - counter.count) * counter.rate) - ((u32)psxRegs.cycle - (u32)counter.startCycle);
 	c += psxRegs.cycle - psxNextStartCounter; // adjust for time passed since last rcntUpdate();
 
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	VitaPublishIopGuestCounterDelta(c);
+#endif
 	if (c < (u64)psxNextDeltaCounter)
 	{
 		psxNextDeltaCounter = (u32)c;
@@ -203,7 +293,21 @@ void psxRcntInit()
 	// configured properly.
 	psxNextDeltaCounter = 1;
 	psxNextStartCounter = psxRegs.cycle;
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	s_vita_iop_counter_deadline_collecting = false;
+	VitaInvalidateIopGuestCounterDeadline();
+#endif
 }
+
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+void VitaInvalidateIopCounterDeadlineCache()
+{
+	s_vita_iop_counter_deadline_collecting = false;
+	VitaInvalidateIopGuestCounterDeadline();
+}
+#endif
 
 static void _rcntFireInterrupt(int i, bool isOverflow)
 {
@@ -455,9 +559,95 @@ void psxVBlankEnd()
 	_rcntSet(3);
 }
 
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+static bool VitaTrySpu2OnlyCounterUpdate()
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (!s_vita_iop_counter_deadline_split_enabled)
+		return false;
+#endif
+	if (!s_vita_iop_counter_deadline_valid ||
+		!s_vita_iop_spu2_is_strict_next_owner)
+	{
+		return false;
+	}
+
+	// psxRcntUpdate() is also called directly while loading ordinary states.
+	// Only split an aggregate boundary which is actually due.
+	if (static_cast<s32>(psxRegs.cycle - psxNextStartCounter) <
+		psxNextDeltaCounter)
+	{
+		return false;
+	}
+
+	// An IOP block may overshoot the published SPU2 seam. If it also crossed a
+	// guest-counter or USB boundary, the canonical full path must preserve
+	// PCSX2's counter -> SPU2 -> DEV9 -> USB ordering at this same cycle.
+	if (psxRegs.cycle >= s_vita_iop_guest_counter_deadline)
+		return false;
+
+	const s32 diffusb =
+		psxRegs.cycle - psxCounters[7].startCycle;
+	if (diffusb >= psxCounters[7].deltaCycles)
+		return false;
+	const s32 usb_remaining =
+		psxCounters[7].deltaCycles - diffusb;
+
+	psxNextDeltaCounter = 0x7fffffff;
+	psxNextStartCounter = psxRegs.cycle;
+
+	const u32 spu2_delta = (psxRegs.cycle - lClocks) % 768;
+	psxCounters[6].startCycle = psxRegs.cycle - spu2_delta;
+	psxCounters[6].deltaCycles = psxCounters[6].rate;
+	{
+		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
+			VitaPerformanceTelemetry::CpuStage::Spu2);
+		SPU2async();
+		VitaPerformanceTelemetry::EndCpuStageIfSampling();
+	}
+	psxNextDeltaCounter = psxCounters[6].deltaCycles;
+
+	// VitaDisabledDevices.cpp owns DEV9 on this target and DEV9async() is
+	// intentionally empty. USB has already been proven not due above.
+	if (usb_remaining < psxNextDeltaCounter)
+		psxNextDeltaCounter = usb_remaining;
+
+	if (s_vita_iop_guest_counter_deadline !=
+		VITA_IOP_COUNTER_NO_DEADLINE)
+	{
+		const u64 counter_remaining =
+			s_vita_iop_guest_counter_deadline - psxRegs.cycle;
+		if (counter_remaining < static_cast<u64>(psxNextDeltaCounter))
+		{
+			psxNextDeltaCounter = static_cast<u32>(counter_remaining);
+			psxSetNextBranch(psxNextStartCounter, psxNextDeltaCounter);
+		}
+	}
+
+	const u64 spu2_deadline =
+		psxRegs.cycle + psxCounters[6].deltaCycles;
+	const u64 usb_deadline =
+		psxRegs.cycle + static_cast<u32>(usb_remaining);
+	s_vita_iop_spu2_is_strict_next_owner =
+		psxCounters[6].deltaCycles >= 0 &&
+		spu2_deadline < usb_deadline &&
+		spu2_deadline < s_vita_iop_guest_counter_deadline;
+	VitaRecordIopCounterUpdate(true);
+	return true;
+}
+#endif
+
 void psxRcntUpdate()
 {
 	int i;
+
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	if (VitaTrySpu2OnlyCounterUpdate())
+		return;
+	VitaRecordIopCounterUpdate(false);
+#endif
 
 	psxNextDeltaCounter = 0x7fffffff;
 	psxNextStartCounter = psxRegs.cycle;
@@ -517,9 +707,45 @@ void psxRcntUpdate()
 	if (cusb < psxNextDeltaCounter)
 		psxNextDeltaCounter = cusb;
 
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	VitaBeginIopGuestCounterDeadlineCollection();
+#endif
 	for (i = 0; i < 6; i++)
 		_rcntSet(i);
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	VitaFinishIopGuestCounterDeadlineCollection();
+	const u64 spu2_deadline =
+		psxRegs.cycle + psxCounters[6].deltaCycles;
+	const u64 usb_deadline =
+		psxRegs.cycle + static_cast<u32>(cusb);
+	s_vita_iop_spu2_is_strict_next_owner =
+		psxCounters[6].deltaCycles >= 0 && cusb >= 0 &&
+		spu2_deadline < usb_deadline &&
+		spu2_deadline < s_vita_iop_guest_counter_deadline;
+#endif
 }
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void VitaSetIopCounterDeadlineSplitEnabledForValidation(bool enabled)
+{
+	s_vita_iop_counter_deadline_split_enabled = enabled;
+	if (!enabled)
+		s_vita_iop_spu2_is_strict_next_owner = false;
+}
+
+void VitaResetIopCounterDeadlineValidationStats()
+{
+	s_vita_iop_counter_deadline_validation_stats = {};
+}
+
+VitaIopCounterDeadlineValidationStats
+VitaGetIopCounterDeadlineValidationStats()
+{
+	return s_vita_iop_counter_deadline_validation_stats;
+}
+#endif
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -819,6 +1045,12 @@ bool SaveStateBase::psxRcntFreeze()
 
 	if (!IsOkay())
 		return false;
+
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	if (IsLoading())
+		VitaInvalidateIopCounterDeadlineCache();
+#endif
 
 	// Normal .p2s loading repairs its configuration-tolerant timer schedule.
 	// Portable replay already restores the exact IOP counter/deadline and device

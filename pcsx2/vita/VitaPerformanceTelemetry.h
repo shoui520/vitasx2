@@ -63,10 +63,12 @@ namespace VitaPerformanceTelemetry
 	static constexpr size_t CPU_STAGE_COUNT =
 		static_cast<size_t>(CpuStage::Count);
 	static constexpr u32 CPU_STAGE_SAMPLE_PERIOD = 1024;
+	static constexpr size_t CPU_PROFILE_CODE_WORD_COUNT = 8;
 	// PES currently produces roughly 390 samples per 120-VSync measurement
-	// window at the 1/1024 cadence.  512 records retain a complete ordinary
-	// window while remaining below 96 KiB.
-	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 512;
+	// window at the 1/1024 cadence. 432 records retain a complete ordinary
+	// window after adding its bounded EE code sample while remaining below
+	// 96 KiB.
+	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 432;
 	static constexpr size_t CPU_PROFILE_HOT_EDGE_COUNT = 8;
 
 	enum class EeDeadlineOwner : u8
@@ -100,6 +102,7 @@ namespace VitaPerformanceTelemetry
 		u32 ee_pc_end = 0;
 		u32 iop_pc_start = 0;
 		u32 iop_pc_end = 0;
+		std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> ee_code_start{};
 		u16 flags = 0;
 		u16 stage_count = 0;
 		std::array<u32, CPU_STAGE_COUNT> stage_time_us{};
@@ -124,6 +127,8 @@ namespace VitaPerformanceTelemetry
 		u64 iop_intc_visible = 0;
 		u64 iop_callback_due = 0;
 		u64 iop_manufactured_only = 0;
+		u64 iop_counter_full_updates = 0;
+		u64 iop_counter_spu2_only_updates = 0;
 		u64 ee_deadline_shadow_entries = 0;
 		u64 ee_deadline_owner_iop = 0;
 		u64 ee_deadline_owner_counter = 0;
@@ -151,6 +156,7 @@ namespace VitaPerformanceTelemetry
 		u32 samples = 0;
 		u64 host_time_us = 0;
 		u64 guest_cycles = 0;
+		std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> code_start{};
 	};
 
 	struct CpuProfileHotEdgeSnapshot
@@ -190,6 +196,7 @@ namespace VitaPerformanceTelemetry
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
 		bool callback_due);
+	void RecordIopCounterUpdate(bool spu2_only);
 	void RecordEeDeadlineHorizon(s64 owner_horizon_delta,
 		EeDeadlineOwner owner, s32 ee_iop_balance, bool timer_enabled,
 		u32 timer_delta, bool iop_rapid);
@@ -282,6 +289,16 @@ namespace VitaPerformanceTelemetry
 		(void)timer_enabled;
 		(void)timer_delta;
 		(void)iop_rapid;
+#endif
+	}
+
+	inline void RecordIopCounterUpdateIfProfiling(bool spu2_only)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordIopCounterUpdate(spu2_only);
+#else
+		(void)spu2_only;
 #endif
 	}
 
