@@ -231,6 +231,7 @@ namespace VitaPerformanceTelemetry
 		u64 spu2_mixer_silent_reverb_state_rejects = 0;
 		u64 spu2_stopped_voice_batch_calls = 0;
 		u64 spu2_stopped_voice_batch_samples = 0;
+		u64 spu2_stopped_voice_bulk_voice_samples = 0;
 #endif
 		// Unlike the sparse stage sampler, these diagnostic-only totals observe
 		// every cold EE compilation. This prevents a compiler burst from
@@ -366,7 +367,8 @@ namespace VitaPerformanceTelemetry
 		u32 silent_reverb_range_rejects,
 		u32 silent_reverb_state_rejects);
 #if defined(VITASX2_CPU_PROFILER)
-	void RecordSpu2StoppedVoiceBatch(u32 samples);
+	void RecordSpu2StoppedVoiceBatch(
+		u32 samples, u32 stable_core0_mask, u32 stable_core1_mask);
 #endif
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
@@ -610,13 +612,19 @@ namespace VitaPerformanceTelemetry
 #endif
 	}
 
-	inline void RecordSpu2StoppedVoiceBatchIfProfiling(u32 samples)
+	inline void RecordSpu2StoppedVoiceBatchIfProfiling(
+		u32 samples, u32 stable_core0_mask, u32 stable_core1_mask)
 	{
 #if defined(VITASX2_CPU_PROFILER)
 		if (g_cpu_stage_profiler_enabled)
-			RecordSpu2StoppedVoiceBatch(samples);
+		{
+			RecordSpu2StoppedVoiceBatch(
+				samples, stable_core0_mask, stable_core1_mask);
+		}
 #else
 		(void)samples;
+		(void)stable_core0_mask;
+		(void)stable_core1_mask;
 #endif
 	}
 

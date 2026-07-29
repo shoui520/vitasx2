@@ -895,6 +895,7 @@ static constexpr u8 NoEquivalentVoiceRepresentative = 0xff;
 static u32 s_equivalent_stopped_voice_core_mask = 0;
 static u32 s_fully_equivalent_stopped_voice_core_mask = 0;
 static u32 s_equivalent_stopped_voice_member_masks[2] = {};
+static u32 s_stable_stopped_voice_masks[2] = {};
 static u32
 	s_equivalent_stopped_voice_group_masks[2][V_Core::NumVoices] = {};
 
@@ -1015,6 +1016,8 @@ void BeginEquivalentStoppedVoiceBatchWithoutIrq(u32 sample_count)
 	s_fully_equivalent_stopped_voice_core_mask = 0;
 	s_equivalent_stopped_voice_member_masks[0] = 0;
 	s_equivalent_stopped_voice_member_masks[1] = 0;
+	s_stable_stopped_voice_masks[0] = 0;
+	s_stable_stopped_voice_masks[1] = 0;
 	std::memset(s_equivalent_stopped_voice_group_masks, 0,
 		sizeof(s_equivalent_stopped_voice_group_masks));
 
@@ -1030,6 +1033,8 @@ void BeginEquivalentStoppedVoiceBatchWithoutIrq(u32 sample_count)
 			s_equivalent_stopped_voice_group_masks[coreidx][0] =
 				AllCoreVoiceBits;
 			s_equivalent_stopped_voice_member_masks[coreidx] =
+				AllCoreVoiceBits;
+			s_stable_stopped_voice_masks[coreidx] =
 				AllCoreVoiceBits;
 			s_equivalent_stopped_voice_core_mask |= 1u << coreidx;
 			s_fully_equivalent_stopped_voice_core_mask |=
@@ -1051,8 +1056,13 @@ void BeginEquivalentStoppedVoiceBatchWithoutIrq(u32 sample_count)
 			 voiceidx++)
 		{
 			const V_Voice& voice = core.Voices[voiceidx];
-			if (!StoppedVoiceCanEnterEquivalenceProof(voice))
+			if (!StoppedVoiceCanEnterEquivalenceProof(voice) ||
+				!StoppedVoiceBlockIsStable(voice))
+			{
 				continue;
+			}
+			s_stable_stopped_voice_masks[coreidx] |=
+				1u << voiceidx;
 
 			const u32 hash = HashStoppedVoiceEvolution(voice);
 			const u32 slot = hash &
@@ -1082,11 +1092,7 @@ void BeginEquivalentStoppedVoiceBatchWithoutIrq(u32 sample_count)
 				s_equivalent_stopped_voice_group_masks[coreidx]
 					[representative];
 			if (group_mask == 0)
-			{
-				if (!StoppedVoiceBlockIsStable(reference))
-					continue;
 				group_mask = 1u << representative;
-			}
 			group_mask |= 1u << voiceidx;
 		}
 
@@ -1153,6 +1159,8 @@ void FinishEquivalentStoppedVoiceBatchWithoutIrq()
 	s_fully_equivalent_stopped_voice_core_mask = 0;
 	s_equivalent_stopped_voice_member_masks[0] = 0;
 	s_equivalent_stopped_voice_member_masks[1] = 0;
+	s_stable_stopped_voice_masks[0] = 0;
+	s_stable_stopped_voice_masks[1] = 0;
 }
 
 static __forceinline void AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
@@ -1170,6 +1178,186 @@ static __forceinline void AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
 	g_qemuSpu2ZeroVoiceGateSkipped += V_Core::NumVoices;
 	g_qemuSpu2EquivalentStoppedCoreSamples++;
 #endif
+}
+
+static __forceinline void
+PublishFullyEquivalentStoppedCoreOutputsWithoutIrq(const uint coreidx)
+{
+	WriteStoppedVoiceOutputWithoutIrq(coreidx, 1);
+	WriteStoppedVoiceOutputWithoutIrq(coreidx, 3);
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2VoiceVolumeSlideSkipped += V_Core::NumVoices;
+	g_qemuSpu2ZeroVoiceGateSkipped += V_Core::NumVoices;
+	g_qemuSpu2EquivalentStoppedCoreSamples++;
+#endif
+}
+
+static __noinline void AdvanceStableStoppedVoiceBatchWithoutIrq(
+	const uint coreidx, const uint voiceidx, const u32 endx_mask,
+	const u32 sample_count)
+{
+	V_Core& core = Cores[coreidx];
+	V_Voice& voice = core.Voices[voiceidx];
+
+	// StoppedVoiceBlockIsStable() proves that the loop header cannot be
+	// changed by any mixer, AutoDMA, or reverb write in this uninterrupted
+	// TimeUpdate() epoch. StoppedVoiceCanEnterEquivalenceProof() proves that
+	// modulation and volume slides are disabled. Keep the recurrence in
+	// registers and publish this voice or group representative once.
+	const u32 block = voice.NextA & 0xffff8u;
+	const s8 loop_flags = *GetMemPtr(block) >> 8;
+	voice.LoopFlags = loop_flags;
+	if ((loop_flags & XAFLAG_LOOP_START) && !voice.LoopMode)
+		voice.LoopStartA = block;
+
+	const s32 pitch = std::min<s32>(voice.Pitch, 0x3fff);
+	const u32 loop_start = voice.LoopStartA;
+	u32 next_address = voice.NextA;
+	u32 decode_write = voice.DecPosWrite;
+	u32 decode_read = voice.DecPosRead;
+	s32 sample_position = voice.SP;
+	bool crossed_block_boundary = false;
+
+	if (sample_position >= 0 && sample_position <= 0xfff)
+	{
+		// ConsumeSamples() has a constant non-modulated pitch, so cumulative
+		// consumption after k samples is floor((SP + k * pitch) / 4096).
+		// DecodeStoppedSamplesWithoutIrq() produces once before a sample iff
+		//
+		//   initial_distance + 4 * prior_productions
+		//       - prior_consumption <= 12.
+		//
+		// Prior consumption is monotonic and rises by at most four per
+		// sample. Therefore production count at the end of the epoch is the
+		// last reachable threshold plus one, capped by the sample count.
+		const u64 total_before_last =
+			static_cast<u32>(sample_position) +
+			static_cast<u64>(sample_count - 1u) *
+				static_cast<u32>(pitch);
+		const s64 consumed_before_last =
+			static_cast<s64>(total_before_last >> 12);
+		const s64 producer_threshold =
+			12ll -
+			static_cast<s32>(decode_write - decode_read) +
+			consumed_before_last;
+		const u32 producer_count = producer_threshold < 0 ?
+			0u :
+			std::min<u32>(
+				sample_count,
+				static_cast<u32>(producer_threshold / 4ll) + 1u);
+
+		decode_write += producer_count * 4u;
+		if (producer_count != 0)
+		{
+			const u32 next_offset = next_address & 7u;
+			const u32 productions_to_boundary =
+				next_offset == 0 ? 8u : 8u - next_offset;
+			if (producer_count < productions_to_boundary)
+			{
+				next_address += producer_count;
+			}
+			else
+			{
+				const u32 productions_after_boundary =
+					producer_count - productions_to_boundary;
+				next_address =
+					(loop_start + 1u +
+						productions_after_boundary % 7u) &
+					0xfffffu;
+				crossed_block_boundary = true;
+			}
+		}
+
+		const u64 total =
+			static_cast<u32>(sample_position) +
+			static_cast<u64>(sample_count) *
+				static_cast<u32>(pitch);
+		decode_read += static_cast<u32>(total >> 12);
+		sample_position = static_cast<s32>(total & 0xfffu);
+	}
+	else
+	{
+		// Fail closed for malformed or old savestate state which has not yet
+		// passed through ConsumeSamples()'s canonical 12-bit remainder.
+		for (u32 sample = 0; sample < sample_count; sample++)
+		{
+			if (static_cast<int>(decode_write - decode_read) <= 12)
+			{
+				decode_write += 4;
+				next_address = (next_address + 1u) & 0xfffffu;
+				if ((next_address & 7u) == 0)
+				{
+					core.Regs.ENDX |= endx_mask;
+					next_address = (loop_start + 1u) & 0xfffffu;
+					crossed_block_boundary = true;
+				}
+			}
+
+			sample_position += pitch;
+			decode_read += sample_position >> 12;
+			sample_position &= 0xfff;
+		}
+	}
+
+	if (crossed_block_boundary)
+		core.Regs.ENDX |= endx_mask;
+	voice.NextA = next_address;
+	voice.DecPosWrite = decode_write;
+	voice.DecPosRead = decode_read;
+	voice.SP = sample_position;
+	if (crossed_block_boundary)
+		voice.SBuffer = nullptr;
+}
+
+static __forceinline void
+AdvanceNonStableStoppedCoreVoicesWithoutIrq(const uint coreidx)
+{
+	const u32 stable_mask = s_stable_stopped_voice_masks[coreidx];
+	for (u32 voiceidx = 0; voiceidx < V_Core::NumVoices; voiceidx++)
+	{
+		if (stable_mask & (1u << voiceidx))
+			WriteStoppedVoiceOutputWithoutIrq(coreidx, voiceidx);
+		else
+			AdvanceStoppedVoiceWithoutIrq(
+				coreidx, voiceidx, 1u << voiceidx);
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2VoiceVolumeSlideSkipped += V_Core::NumVoices;
+	g_qemuSpu2ZeroVoiceGateSkipped += V_Core::NumVoices;
+	g_qemuSpu2EquivalentStoppedCoreSamples++;
+#endif
+}
+
+static void AdvanceStableStoppedCoreBatchWithoutIrq(
+	const uint coreidx, const u32 sample_count)
+{
+	u32 published_mask = 0;
+	for (u32 representative = 0;
+		 representative < V_Core::NumVoices; representative++)
+	{
+		const u32 group_mask =
+			s_equivalent_stopped_voice_group_masks[coreidx]
+				[representative];
+		if (group_mask == 0)
+			continue;
+
+		AdvanceStableStoppedVoiceBatchWithoutIrq(
+			coreidx, representative, group_mask, sample_count);
+		published_mask |= group_mask;
+	}
+
+	u32 singleton_mask =
+		s_stable_stopped_voice_masks[coreidx] & ~published_mask;
+	while (singleton_mask != 0)
+	{
+		const u32 voiceidx = __builtin_ctz(singleton_mask);
+		const u32 voice_mask = 1u << voiceidx;
+		AdvanceStableStoppedVoiceBatchWithoutIrq(
+			coreidx, voiceidx, voice_mask, sample_count);
+		singleton_mask &= ~voice_mask;
+	}
 }
 
 static __forceinline void AdvanceGroupedStoppedCoreVoicesWithoutIrq(
@@ -1323,12 +1511,13 @@ void Spu2MixEquivalentStoppedVoicesBatchForValidation(u32 samples)
 			if (s_fully_equivalent_stopped_voice_core_mask &
 				(1u << coreidx))
 			{
-				AdvanceEquivalentStoppedCoreVoicesWithoutIrq(coreidx);
+				PublishFullyEquivalentStoppedCoreOutputsWithoutIrq(
+					coreidx);
 			}
-			else if (s_equivalent_stopped_voice_core_mask &
-				(1u << coreidx))
+			else if (s_stable_stopped_voice_masks[coreidx] != 0)
 			{
-				AdvanceGroupedStoppedCoreVoicesWithoutIrq(coreidx);
+				AdvanceNonStableStoppedCoreVoicesWithoutIrq(
+					coreidx);
 			}
 			else
 			{
@@ -1336,6 +1525,14 @@ void Spu2MixEquivalentStoppedVoicesBatchForValidation(u32 samples)
 			}
 		}
 		OutPos = (OutPos + 1u) & 0x1ffu;
+	}
+	for (u32 coreidx = 0; coreidx < 2; coreidx++)
+	{
+		if (s_stable_stopped_voice_masks[coreidx] != 0)
+		{
+			AdvanceStableStoppedCoreBatchWithoutIrq(
+				coreidx, samples);
+		}
 	}
 	FinishEquivalentStoppedVoiceBatchWithoutIrq();
 }
@@ -1534,7 +1731,8 @@ bool TryMixStoppedVoiceBatch(u32 sample_count)
 	}
 
 	VitaPerformanceTelemetry::RecordSpu2StoppedVoiceBatchIfProfiling(
-		sample_count);
+		sample_count, s_stable_stopped_voice_masks[0],
+		s_stable_stopped_voice_masks[1]);
 
 	for (u32 sample = 0; sample < sample_count; ++sample)
 	{
@@ -1561,13 +1759,13 @@ bool TryMixStoppedVoiceBatch(u32 sample_count)
 			if (s_fully_equivalent_stopped_voice_core_mask &
 				(1u << coreidx))
 			{
-				AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
+				PublishFullyEquivalentStoppedCoreOutputsWithoutIrq(
 					coreidx);
 			}
-			else if (s_equivalent_stopped_voice_core_mask &
-					 (1u << coreidx))
+			else if (s_stable_stopped_voice_masks[coreidx] != 0)
 			{
-				AdvanceGroupedStoppedCoreVoicesWithoutIrq(coreidx);
+				AdvanceNonStableStoppedCoreVoicesWithoutIrq(
+					coreidx);
 			}
 			else
 			{
@@ -1692,6 +1890,19 @@ bool TryMixStoppedVoiceBatch(u32 sample_count)
 #endif
 		spu2Output(out);
 		OutPos = (OutPos + 1u) & 0x1ffu;
+	}
+
+#if defined(VITASX2_CPU_PROFILER)
+	VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+		VitaPerformanceTelemetry::CpuStage::Spu2Voices);
+#endif
+	for (u32 coreidx = 0; coreidx < 2; coreidx++)
+	{
+		if (s_stable_stopped_voice_masks[coreidx] != 0)
+		{
+			AdvanceStableStoppedCoreBatchWithoutIrq(
+				coreidx, sample_count);
+		}
 	}
 
 	return true;
