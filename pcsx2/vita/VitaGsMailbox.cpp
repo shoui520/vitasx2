@@ -710,6 +710,9 @@ namespace MTGS
 			const u64 ee_iop_only_scheduler_entries = CounterDelta(
 				end.cpu_stage_profiler.ee_iop_only_scheduler_entries,
 				start.cpu_stage_profiler.ee_iop_only_scheduler_entries);
+			const u64 iop_retained_wait_scheduler_entries = CounterDelta(
+				end.cpu_stage_profiler.iop_retained_wait_scheduler_entries,
+				start.cpu_stage_profiler.iop_retained_wait_scheduler_entries);
 			const u64 stage_samples = CounterDelta(
 				end.cpu_stage_profiler.stage_samples,
 				start.cpu_stage_profiler.stage_samples);
@@ -784,11 +787,13 @@ namespace MTGS
 				static_cast<unsigned long long>(overwritten_interval_records));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=ee_scheduler_split "
-				"full=%llu iop_only=%llu",
+				"full=%llu iop_only=%llu iop_retained_wait=%llu",
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(ee_full_scheduler_entries),
 				static_cast<unsigned long long>(
-					ee_iop_only_scheduler_entries));
+					ee_iop_only_scheduler_entries),
+				static_cast<unsigned long long>(
+					iop_retained_wait_scheduler_entries));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_deadline_shadow "
 				"iop_checks=%llu iop_skips=%llu iop_dispatches=%llu "
@@ -807,14 +812,28 @@ namespace MTGS
 				static_cast<unsigned long long>(iop_manufactured_only));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=iop_counter_split "
-				"full=%llu spu2_only=%llu",
+				"full=%llu spu2_only=%llu unconstrained=%llu "
+				"irq_limited=%llu dma_limited=%llu "
+				"auto_dma_active=%llu",
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(CounterDelta(
 					end.cpu_stage_profiler.iop_counter_full_updates,
 					start.cpu_stage_profiler.iop_counter_full_updates)),
 				static_cast<unsigned long long>(CounterDelta(
 					end.cpu_stage_profiler.iop_counter_spu2_only_updates,
-					start.cpu_stage_profiler.iop_counter_spu2_only_updates)));
+					start.cpu_stage_profiler.iop_counter_spu2_only_updates)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.iop_spu2_unconstrained_updates,
+					start.cpu_stage_profiler.iop_spu2_unconstrained_updates)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.iop_spu2_irq_limited_updates,
+					start.cpu_stage_profiler.iop_spu2_irq_limited_updates)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.iop_spu2_dma_limited_updates,
+					start.cpu_stage_profiler.iop_spu2_dma_limited_updates)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.iop_spu2_auto_dma_active_updates,
+					start.cpu_stage_profiler.iop_spu2_auto_dma_active_updates)));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=ee_deadline_shadow "
 				"entries=%llu owner_iop=%llu owner_counter=%llu "

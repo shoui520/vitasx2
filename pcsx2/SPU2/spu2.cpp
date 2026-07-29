@@ -54,6 +54,9 @@ void SPU2readDMA4Mem(u16* pMem, u32 size) // size now in 16bit units
 
 	SPU2::FileLog("[%10d] SPU2 readDMA4Mem size %x\n", Cycles, size << 1);
 	Cores[0].DoDMAread(pMem, size);
+#if defined(VITASX2_VITA)
+	SPU2::ReschedulePeriodicUpdate();
+#endif
 }
 
 void SPU2writeDMA4Mem(u16* pMem, u32 size) // size now in 16bit units
@@ -63,6 +66,9 @@ void SPU2writeDMA4Mem(u16* pMem, u32 size) // size now in 16bit units
 	SPU2::FileLog("[%10d] SPU2 writeDMA4Mem size %x at address %x\n", Cycles, size << 1, Cores[0].TSA);
 
 	Cores[0].DoDMAwrite(pMem, size);
+#if defined(VITASX2_VITA)
+	SPU2::ReschedulePeriodicUpdate();
+#endif
 }
 
 void SPU2interruptDMA4()
@@ -89,6 +95,9 @@ void SPU2readDMA7Mem(u16* pMem, u32 size)
 
 	SPU2::FileLog("[%10d] SPU2 readDMA7Mem size %x\n", Cycles, size << 1);
 	Cores[1].DoDMAread(pMem, size);
+#if defined(VITASX2_VITA)
+	SPU2::ReschedulePeriodicUpdate();
+#endif
 }
 
 void SPU2writeDMA7Mem(u16* pMem, u32 size)
@@ -98,6 +107,9 @@ void SPU2writeDMA7Mem(u16* pMem, u32 size)
 	SPU2::FileLog("[%10d] SPU2 writeDMA7Mem size %x at address %x\n", Cycles, size << 1, Cores[1].TSA);
 
 	Cores[1].DoDMAwrite(pMem, size);
+#if defined(VITASX2_VITA)
+	SPU2::ReschedulePeriodicUpdate();
+#endif
 }
 
 void SPU2::CreateOutputStream()
@@ -392,6 +404,8 @@ u16 SPU2read(u32 rmem)
 	const u32 mem = rmem & 0xFFFF;
 	u32 omem = mem;
 
+	TimeUpdate(psxRegs.cycle);
+
 	if (mem & 0x400)
 	{
 		omem ^= 0x400;
@@ -412,8 +426,6 @@ u16 SPU2read(u32 rmem)
 	}
 	else
 	{
-		TimeUpdate(psxRegs.cycle);
-
 		if (rmem >> 16 == 0x1f80)
 		{
 			ret = Cores[0].ReadRegPS1(rmem);
@@ -434,6 +446,9 @@ u16 SPU2read(u32 rmem)
 		}
 	}
 
+#if defined(VITASX2_VITA)
+	SPU2::ReschedulePeriodicUpdate();
+#endif
 	return ret;
 }
 
@@ -454,6 +469,9 @@ void SPU2write(u32 rmem, u16 value)
 #endif
 		SPU2_FastWrite(rmem, value);
 	}
+#if defined(VITASX2_VITA)
+	SPU2::ReschedulePeriodicUpdate();
+#endif
 }
 
 s32 SPU2freeze(FreezeAction mode, freezeData* data)
@@ -486,6 +504,9 @@ s32 SPU2freeze(FreezeAction mode, freezeData* data)
 		case FreezeAction::Load:
 			return SPU2Savestate::ThawIt(spud);
 		case FreezeAction::Save:
+#if defined(VITASX2_VITA)
+			SPU2::SynchronizeToIopCycle();
+#endif
 			return SPU2Savestate::FreezeIt(spud);
 
 			jNO_DEFAULT;

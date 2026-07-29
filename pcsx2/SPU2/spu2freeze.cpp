@@ -444,6 +444,11 @@ bool SPU2::DoPortableState(StateWrapper& sw)
 {
 	using namespace SPU2Savestate;
 
+#if defined(VITASX2_VITA)
+	if (sw.IsWriting())
+		SPU2::SynchronizeToIopCycle();
+#endif
+
 	std::array<s32, 2> dma_offsets = {{PORTABLE_NULL_IOP_OFFSET, PORTABLE_NULL_IOP_OFFSET}};
 	std::array<s32, 2> dma_read_offsets = {{PORTABLE_NULL_IOP_OFFSET, PORTABLE_NULL_IOP_OFFSET}};
 	if (sw.IsWriting())

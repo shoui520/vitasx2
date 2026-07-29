@@ -313,6 +313,11 @@ __forceinline void CheckDMAProgress(int cid)
 
 static constexpr uint TickInterval = 768;
 static constexpr int SanityInterval = 4800;
+static constexpr u32 VitaPeriodicBatchSamples = 64;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+static bool s_vita_spu2_periodic_batch_enabled = true;
+#endif
 
 __forceinline void TimeUpdate(u32 cClocks)
 {
@@ -365,6 +370,95 @@ __forceinline void TimeUpdate(u32 cClocks)
 	CheckDMAProgress(0);
 	CheckDMAProgress(1);
 }
+
+u32 SPU2::GetPeriodicDeadlineConstraints()
+{
+	u32 constraints = PeriodicDeadlineConstraintNone;
+	for (int core = 0; core < 2; core++)
+	{
+		const V_Core& state = Cores[core];
+		if (state.IRQEnable)
+			constraints |= PeriodicDeadlineConstraintIrq;
+		if (state.DMAICounter > 0 || has_to_call_irq_dma[core])
+			constraints |= PeriodicDeadlineConstraintDma;
+		if (state.AdmaInProgress || state.InputDataLeft != 0 ||
+			state.InputDataTransferred != 0)
+		{
+			constraints |= PeriodicDeadlineConstraintAutoDma;
+		}
+	}
+	return constraints;
+}
+
+u32 SPU2::GetNextPeriodicUpdateDelta()
+{
+	const u32 elapsed = (psxRegs.cycle - lClocks) % TickInterval;
+	const u32 next_sample_delta = TickInterval - elapsed;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (!s_vita_spu2_periodic_batch_enabled)
+		return next_sample_delta;
+#endif
+
+	u32 delta = VitaPeriodicBatchSamples * TickInterval - elapsed;
+	for (int core = 0; core < 2; core++)
+	{
+		const V_Core& state = Cores[core];
+		if (state.IRQEnable || has_to_call_irq_dma[core])
+			delta = std::min(delta, next_sample_delta);
+		if (state.DMAICounter > 0)
+			delta = std::min(delta, static_cast<u32>(state.DMAICounter));
+
+		// AutoDMA advances MADR every mixed sample, but ordinary DMA register
+		// reads synchronize first. Its asynchronous IOP-visible edge is the
+		// completion IRQ after the final buffered span drains.
+		if (state.InputDataLeft == 0 &&
+			state.InputDataTransferred != 0)
+		{
+			const u32 samples_to_completion =
+				(state.InputDataTransferred + 0x17fu) / 0x180u;
+			delta = std::min(
+				delta, samples_to_completion * TickInterval - elapsed);
+		}
+
+		// Refills consume IOP RAM, so they are memory-observation boundaries:
+		// do not defer one past intervening IOP writes. ReadInput() refills on
+		// each 0x80 position boundary; bitstream/HiFi input advances twice as
+		// quickly and therefore reaches one every 64 samples.
+		if (state.InputDataLeft >= 0x100)
+		{
+			const u32 refill_period =
+				((core == 0 && PlayMode == 2) ||
+				 (core == 1 && (PlayMode & 8) != 0)) ?
+					64u :
+					128u;
+			const u32 phase = OutPos % refill_period;
+			const u32 samples_to_refill =
+				((refill_period - phase) % refill_period) + 1u;
+			delta = std::min(
+				delta, samples_to_refill * TickInterval - elapsed);
+		}
+	}
+
+	return std::max(delta, 1u);
+}
+
+void SPU2::SynchronizeToIopCycle()
+{
+	TimeUpdate(psxRegs.cycle);
+}
+
+void SPU2::ReschedulePeriodicUpdate()
+{
+	CounterUpdate(GetNextPeriodicUpdateDelta());
+}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void SPU2::VitaSetSpu2PeriodicBatchEnabledForValidation(bool enabled)
+{
+	s_vita_spu2_periodic_batch_enabled = enabled;
+}
+#endif
 
 __forceinline void UpdateSpdifMode()
 {

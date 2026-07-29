@@ -5,6 +5,7 @@
 
 #if defined(VITASX2_CPU_PROFILER)
 #include "Memory.h"
+#include "SPU2/spu2.h"
 #endif
 
 #if defined(__vita__) && defined(VITASX2_CPU_PROFILER)
@@ -459,10 +460,37 @@ namespace VitaPerformanceTelemetry
 		}
 	}
 
-	void RecordIopCounterUpdate(bool spu2_only)
+	void RecordIopCounterUpdate(
+		bool spu2_only, u32 spu2_deadline_constraints)
 	{
 		if (spu2_only)
+		{
 			s_cpu_stage_profiler.totals.iop_counter_spu2_only_updates++;
+			if (spu2_deadline_constraints ==
+				SPU2::PeriodicDeadlineConstraintNone)
+			{
+				s_cpu_stage_profiler.totals
+					.iop_spu2_unconstrained_updates++;
+			}
+			if (spu2_deadline_constraints &
+				SPU2::PeriodicDeadlineConstraintIrq)
+			{
+				s_cpu_stage_profiler.totals
+					.iop_spu2_irq_limited_updates++;
+			}
+			if (spu2_deadline_constraints &
+				SPU2::PeriodicDeadlineConstraintDma)
+			{
+				s_cpu_stage_profiler.totals
+					.iop_spu2_dma_limited_updates++;
+			}
+			if (spu2_deadline_constraints &
+				SPU2::PeriodicDeadlineConstraintAutoDma)
+			{
+				s_cpu_stage_profiler.totals
+					.iop_spu2_auto_dma_active_updates++;
+			}
+		}
 		else
 			s_cpu_stage_profiler.totals.iop_counter_full_updates++;
 	}
@@ -524,12 +552,17 @@ namespace VitaPerformanceTelemetry
 		}
 	}
 
-	void RecordEeSchedulerPath(bool iop_only)
+	void RecordEeSchedulerPath(bool iop_only, bool iop_retained_wait)
 	{
 		if (iop_only)
 			s_cpu_stage_profiler.totals.ee_iop_only_scheduler_entries++;
 		else
 			s_cpu_stage_profiler.totals.ee_full_scheduler_entries++;
+		if (iop_retained_wait)
+		{
+			s_cpu_stage_profiler.totals
+				.iop_retained_wait_scheduler_entries++;
+		}
 	}
 #endif
 }

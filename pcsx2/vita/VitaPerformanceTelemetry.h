@@ -114,6 +114,7 @@ namespace VitaPerformanceTelemetry
 		u64 scheduler_entries = 0;
 		u64 ee_full_scheduler_entries = 0;
 		u64 ee_iop_only_scheduler_entries = 0;
+		u64 iop_retained_wait_scheduler_entries = 0;
 		u64 stage_samples = 0;
 		u64 unbalanced_samples = 0;
 		u64 interval_records = 0;
@@ -129,6 +130,10 @@ namespace VitaPerformanceTelemetry
 		u64 iop_manufactured_only = 0;
 		u64 iop_counter_full_updates = 0;
 		u64 iop_counter_spu2_only_updates = 0;
+		u64 iop_spu2_unconstrained_updates = 0;
+		u64 iop_spu2_irq_limited_updates = 0;
+		u64 iop_spu2_dma_limited_updates = 0;
+		u64 iop_spu2_auto_dma_active_updates = 0;
 		u64 ee_deadline_shadow_entries = 0;
 		u64 ee_deadline_owner_iop = 0;
 		u64 ee_deadline_owner_counter = 0;
@@ -196,11 +201,12 @@ namespace VitaPerformanceTelemetry
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
 		bool callback_due);
-	void RecordIopCounterUpdate(bool spu2_only);
+	void RecordIopCounterUpdate(
+		bool spu2_only, u32 spu2_deadline_constraints);
 	void RecordEeDeadlineHorizon(s64 owner_horizon_delta,
 		EeDeadlineOwner owner, s32 ee_iop_balance, bool timer_enabled,
 		u32 timer_delta, bool iop_rapid);
-	void RecordEeSchedulerPath(bool iop_only);
+	void RecordEeSchedulerPath(bool iop_only, bool iop_retained_wait);
 
 	inline void OnEeSchedulerEntry(u32 ee_pc, u64 ee_cycle,
 		u32 iop_pc, u64 iop_cycle)
@@ -292,23 +298,27 @@ namespace VitaPerformanceTelemetry
 #endif
 	}
 
-	inline void RecordIopCounterUpdateIfProfiling(bool spu2_only)
+	inline void RecordIopCounterUpdateIfProfiling(bool spu2_only,
+		u32 spu2_deadline_constraints)
 	{
 #if defined(VITASX2_CPU_PROFILER)
 		if (g_cpu_stage_profiler_enabled)
-			RecordIopCounterUpdate(spu2_only);
+			RecordIopCounterUpdate(spu2_only, spu2_deadline_constraints);
 #else
 		(void)spu2_only;
+		(void)spu2_deadline_constraints;
 #endif
 	}
 
-	inline void RecordEeSchedulerPathIfProfiling(bool iop_only)
+	inline void RecordEeSchedulerPathIfProfiling(bool iop_only,
+		bool iop_retained_wait)
 	{
 #if defined(VITASX2_CPU_PROFILER)
 		if (g_cpu_stage_profiler_enabled)
-			RecordEeSchedulerPath(iop_only);
+			RecordEeSchedulerPath(iop_only, iop_retained_wait);
 #else
 		(void)iop_only;
+		(void)iop_retained_wait;
 #endif
 	}
 

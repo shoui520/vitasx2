@@ -188,8 +188,14 @@ namespace
 
 	inline void VitaRecordIopCounterUpdate(bool spu2_only)
 	{
+		u32 spu2_deadline_constraints = 0;
+#if defined(VITASX2_CPU_PROFILER)
+		if (spu2_only)
+			spu2_deadline_constraints =
+				SPU2::GetPeriodicDeadlineConstraints();
+#endif
 		VitaPerformanceTelemetry::RecordIopCounterUpdateIfProfiling(
-			spu2_only);
+			spu2_only, spu2_deadline_constraints);
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (spu2_only)
 		{
@@ -654,6 +660,22 @@ void psxVBlankEnd()
 	_rcntSet(3);
 }
 
+static __fi void AdvanceAndScheduleSpu2()
+{
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	SPU2async();
+	psxCounters[6].startCycle = psxRegs.cycle;
+	psxCounters[6].deltaCycles =
+		static_cast<s32>(SPU2::GetNextPeriodicUpdateDelta());
+#else
+	const u32 spu2_delta = (psxRegs.cycle - lClocks) % 768;
+	psxCounters[6].startCycle = psxRegs.cycle - spu2_delta;
+	psxCounters[6].deltaCycles = psxCounters[6].rate;
+	SPU2async();
+#endif
+}
+
 #if defined(VITASX2_VITA) && \
 	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 static bool VitaTrySpu2OnlyCounterUpdate()
@@ -693,13 +715,10 @@ static bool VitaTrySpu2OnlyCounterUpdate()
 	psxNextDeltaCounter = 0x7fffffff;
 	psxNextStartCounter = psxRegs.cycle;
 
-	const u32 spu2_delta = (psxRegs.cycle - lClocks) % 768;
-	psxCounters[6].startCycle = psxRegs.cycle - spu2_delta;
-	psxCounters[6].deltaCycles = psxCounters[6].rate;
 	{
 		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
 			VitaPerformanceTelemetry::CpuStage::Spu2);
-		SPU2async();
+		AdvanceAndScheduleSpu2();
 		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 	}
 	psxNextDeltaCounter = psxCounters[6].deltaCycles;
@@ -766,13 +785,10 @@ void psxRcntUpdate()
 		_rcntTestTarget(i);
 	}
 
-	const u32 spu2_delta = (psxRegs.cycle - lClocks) % 768;
-	psxCounters[6].startCycle = psxRegs.cycle - spu2_delta;
-	psxCounters[6].deltaCycles = psxCounters[6].rate;
 	{
 		VitaPerformanceTelemetry::BeginCpuStageIfSampling(
 			VitaPerformanceTelemetry::CpuStage::Spu2);
-		SPU2async();
+		AdvanceAndScheduleSpu2();
 		VitaPerformanceTelemetry::EndCpuStageIfSampling();
 	}
 	psxNextDeltaCounter = psxCounters[6].deltaCycles;

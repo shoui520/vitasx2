@@ -40,6 +40,35 @@ void CheckForConfigChanges(const Pcsx2Config& old_config);
 /// Returns the current output volume, irrespective of the configuration.
 u32 GetOutputVolume();
 
+enum PeriodicDeadlineConstraint : u32
+{
+	PeriodicDeadlineConstraintNone = 0,
+	PeriodicDeadlineConstraintIrq = 1u << 0,
+	PeriodicDeadlineConstraintDma = 1u << 1,
+	PeriodicDeadlineConstraintAutoDma = 1u << 2,
+};
+
+/// Reports SPU2-owned effects which constrain the next semantic deadline.
+/// AutoDMA can still batch, but refill and completion edges bound its horizon.
+/// IRQ observation requires the next exact sample.
+u32 GetPeriodicDeadlineConstraints();
+
+/// Returns the exact IOP-cycle distance to the next periodic SPU2 observation
+/// required by the current IRQ/DMA state. Ordinary register and DMA accesses
+/// remain synchronous observers.
+u32 GetNextPeriodicUpdateDelta();
+
+/// Materializes SPU2 state through the current IOP cycle.
+void SynchronizeToIopCycle();
+
+/// Shortens an already-published periodic deadline after a write or DMA start
+/// introduces an earlier SPU2 observer.
+void ReschedulePeriodicUpdate();
+
+#if defined(VITASX2_QEMU_VALIDATION)
+void VitaSetSpu2PeriodicBatchEnabledForValidation(bool enabled);
+#endif
+
 /// Directly updates the output volume without going through the configuration.
 void SetOutputVolume(u32 volume);
 
@@ -102,6 +131,8 @@ extern u32 g_qemuSpu2DecodeFifoNeonStores;
 extern u32 g_qemuSpu2DecodeFifoWrappedStores;
 extern u32 g_qemuSpu2MixerIrqDisabledChecksSkipped;
 extern u32 g_qemuSpu2PitchClampUsat;
+extern u64 g_qemuSpu2OutputHash;
+extern u32 g_qemuSpu2OutputSamples;
 extern u32 g_qemuSpu2DmaCopyNeonQwords;
 extern u32 g_qemuSpu2DmaCopyNeon64ByteGroups;
 extern u32 g_qemuSpu2DmaCopyNeon128ByteGroups;

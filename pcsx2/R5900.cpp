@@ -815,7 +815,8 @@ __fi void _cpuEventTest_Shared()
 	const bool vita_iop_only_interleave =
 		VitaCanRunIopOnlyEeInterleave();
 	VitaPerformanceTelemetry::RecordEeSchedulerPathIfProfiling(
-		vita_iop_only_interleave);
+		vita_iop_only_interleave,
+		VitaA32IopRetainedWaitCoalescingActive());
 #if defined(VITASX2_QEMU_VALIDATION)
 	if (VitaEeInterleaveSchedulerActive())
 	{

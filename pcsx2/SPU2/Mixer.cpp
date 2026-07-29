@@ -47,6 +47,8 @@ u32 g_qemuSpu2DecodeFifoWrappedStores = 0;
 u32 g_qemuSpu2AdpcmSsatClamps = 0;
 u32 g_qemuSpu2MixerIrqDisabledChecksSkipped = 0;
 u32 g_qemuSpu2PitchClampUsat = 0;
+u64 g_qemuSpu2OutputHash = 1469598103934665603ull;
+u32 g_qemuSpu2OutputSamples = 0;
 #endif
 
 MULTI_ISA_UNSHARED_START
@@ -929,6 +931,16 @@ void spu2Mix()
 #endif
 
 	Pcsx2Trace::RecordSpu2OutputSample(Cycles, Ext, Out, Out);
+#if defined(VITASX2_QEMU_VALIDATION)
+	// Hash the integer mixer output before the host-only DC filter and stream
+	// buffering. This lets the native A9 oracle prove that changing only SPU2's
+	// scheduler horizons preserves every emulated output sample.
+	g_qemuSpu2OutputHash ^= static_cast<u32>(Out.Left);
+	g_qemuSpu2OutputHash *= 1099511628211ull;
+	g_qemuSpu2OutputHash ^= static_cast<u32>(Out.Right);
+	g_qemuSpu2OutputHash *= 1099511628211ull;
+	g_qemuSpu2OutputSamples++;
+#endif
 	spu2Output(Out);
 
 	// Update AutoDMA output positioning

@@ -71,6 +71,14 @@ void iopHwWrite8_Page1( u32 addr, mem8_t val )
 
 	u32 masked_addr = pgmsk( addr );
 
+#if defined(VITASX2_VITA)
+	const bool spu2_dma_observer =
+		(masked_addr >= 0x0c0 && masked_addr < 0x0d0) ||
+		(masked_addr >= 0x500 && masked_addr < 0x510);
+	if (spu2_dma_observer) [[unlikely]]
+		SPU2::SynchronizeToIopCycle();
+#endif
+
 	switch( masked_addr )
 	{
 		case (HW_SIO_DATA & 0x0fff):
@@ -120,6 +128,10 @@ void iopHwWrite8_Page1( u32 addr, mem8_t val )
 		break;
 	}
 
+#if defined(VITASX2_VITA)
+	if (spu2_dma_observer) [[unlikely]]
+		SPU2::ReschedulePeriodicUpdate();
+#endif
 	IopHwTraceLog<mem8_t>( addr, val, false );
 }
 
@@ -190,6 +202,14 @@ static __fi void _HwWrite_16or32_Page1( u32 addr, T val )
 	);
 
 	u32 masked_addr = addr & 0x0fff;
+
+#if defined(VITASX2_VITA)
+	const bool spu2_dma_observer =
+		(masked_addr >= 0x0c0 && masked_addr < 0x0d0) ||
+		(masked_addr >= 0x500 && masked_addr < 0x510);
+	if (spu2_dma_observer) [[unlikely]]
+		SPU2::SynchronizeToIopCycle();
+#endif
 
 	// ------------------------------------------------------------------------
 	// Counters, 16-bit varieties!
@@ -542,6 +562,10 @@ static __fi void _HwWrite_16or32_Page1( u32 addr, T val )
 		}
 	}
 
+#if defined(VITASX2_VITA)
+	if (spu2_dma_observer) [[unlikely]]
+		SPU2::ReschedulePeriodicUpdate();
+#endif
 	IopHwTraceLog<T>( addr, val, false );
 }
 

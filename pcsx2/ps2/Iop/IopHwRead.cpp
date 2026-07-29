@@ -35,6 +35,17 @@ mem8_t iopHwRead8_Page1( u32 addr )
 
 	const u32 masked_addr = addr & 0x0fff;
 
+#if defined(VITASX2_VITA)
+	const bool spu2_dma_observer =
+		(masked_addr >= 0x0c0 && masked_addr < 0x0d0) ||
+		(masked_addr >= 0x500 && masked_addr < 0x510);
+	if (spu2_dma_observer) [[unlikely]]
+	{
+		SPU2::SynchronizeToIopCycle();
+		SPU2::ReschedulePeriodicUpdate();
+	}
+#endif
+
 	mem8_t ret = 0; // using a return var can be helpful in debugging.
 	switch( masked_addr )
 	{
@@ -156,6 +167,18 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 
 	u32 masked_addr = pgmsk( addr );
 	T ret = 0;
+
+#if defined(VITASX2_VITA)
+	// AutoDMA advances these registers while SPU2 samples are mixed. Periodic
+	// mixing may be coalesced on Vita, so a guest read is an exact observation
+	// boundary just as SPU2 register reads already are.
+	if ((masked_addr >= 0x0c0 && masked_addr < 0x0d0) ||
+		(masked_addr >= 0x500 && masked_addr < 0x510)) [[unlikely]]
+	{
+		SPU2::SynchronizeToIopCycle();
+		SPU2::ReschedulePeriodicUpdate();
+	}
+#endif
 
 	// ------------------------------------------------------------------------
 	// Counters, 16-bit varieties!
@@ -494,4 +517,3 @@ mem32_t iopHwRead32_Page8( u32 addr )
 }
 
 }
-
