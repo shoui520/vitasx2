@@ -1240,6 +1240,22 @@ namespace MTGS
 					return statistical_stage_samples[
 						static_cast<size_t>(stage)];
 				};
+			const u64 statistical_spu2_residual = statistical_stage(
+				VitaPerformanceTelemetry::CpuStage::Spu2);
+			const u64 statistical_spu2_input = statistical_stage(
+				VitaPerformanceTelemetry::CpuStage::Spu2Input);
+			const u64 statistical_spu2_voices = statistical_stage(
+				VitaPerformanceTelemetry::CpuStage::Spu2Voices);
+			const u64 statistical_spu2_core = statistical_stage(
+				VitaPerformanceTelemetry::CpuStage::Spu2Core);
+			const u64 statistical_spu2_reverb = statistical_stage(
+				VitaPerformanceTelemetry::CpuStage::Spu2Reverb);
+			const u64 statistical_spu2_output = statistical_stage(
+				VitaPerformanceTelemetry::CpuStage::Spu2Output);
+			const u64 statistical_spu2_total =
+				statistical_spu2_residual + statistical_spu2_input +
+				statistical_spu2_voices + statistical_spu2_core +
+				statistical_spu2_reverb + statistical_spu2_output;
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_statistical "
 				"samples=%llu invalid=%llu sampler_cpu_us=%llu "
@@ -1270,8 +1286,7 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::IopCounters)),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::IopInterrupts)),
-				static_cast<unsigned long long>(statistical_stage(
-					VitaPerformanceTelemetry::CpuStage::Spu2)),
+				static_cast<unsigned long long>(statistical_spu2_total),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::Dev9)),
 				static_cast<unsigned long long>(statistical_stage(
@@ -1284,6 +1299,18 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::VuSync)),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::Deadline)));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu "
+				"kind=cpu_stage_statistical_spu2 "
+				"input=%llu voices=%llu core=%llu reverb=%llu "
+				"output=%llu residual=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(statistical_spu2_input),
+				static_cast<unsigned long long>(statistical_spu2_voices),
+				static_cast<unsigned long long>(statistical_spu2_core),
+				static_cast<unsigned long long>(statistical_spu2_reverb),
+				static_cast<unsigned long long>(statistical_spu2_output),
+				static_cast<unsigned long long>(statistical_spu2_residual));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_statistical_extended "
 				"ee_generated=%llu ee_provider=%llu ee_compile=%llu "

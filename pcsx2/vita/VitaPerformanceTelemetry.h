@@ -51,6 +51,11 @@ namespace VitaPerformanceTelemetry
 		IopGenerated,
 		IopProvider,
 		IopCompile,
+		Spu2Input,
+		Spu2Voices,
+		Spu2Core,
+		Spu2Reverb,
+		Spu2Output,
 #endif
 		IopInterpreter,
 		Cop1,
@@ -80,10 +85,10 @@ namespace VitaPerformanceTelemetry
 		static_cast<size_t>(CpuStage::Count);
 	static constexpr u32 CPU_STAGE_SAMPLE_PERIOD = 1024;
 	static constexpr size_t CPU_PROFILE_CODE_WORD_COUNT = 8;
-	// PES currently produces roughly 390 samples per 120-VSync measurement
-	// window at the 1/1024 cadence. 408 records retain a complete ordinary
-	// window after the generated IOP owner split while remaining below 96 KiB.
-	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 408;
+	// PES currently produces about 214 records per 120-VSync measurement
+	// window at the 1/1024 cadence. 384 widened records retain a complete
+	// ordinary window while keeping fixed interval storage at 96 KiB.
+	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 384;
 	static constexpr size_t CPU_PROFILE_HOT_EDGE_COUNT = 8;
 	static constexpr size_t CPU_PROFILE_HOT_IOP_PC_COUNT = 8;
 
@@ -418,6 +423,17 @@ namespace VitaPerformanceTelemetry
 		(void)pc;
 #endif
 	}
+
+#if defined(VITASX2_CPU_PROFILER)
+	inline void PublishCpuStatisticalStageIfProfiling(CpuStage stage)
+	{
+		if (g_cpu_stage_profiler_enabled)
+		{
+			g_cpu_stage_statistical_marker.store(
+				static_cast<u32>(stage), std::memory_order_relaxed);
+		}
+	}
+#endif
 
 	inline void RecordIopDeadlineGateIfProfiling(
 		bool dispatched, bool deadline_due, bool counter_due,

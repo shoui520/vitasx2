@@ -11,6 +11,8 @@
 
 #include "common/Assertions.h"
 
+#include <cstring>
+
 #if defined(ARCH_ARM32)
 #include <arm_neon.h>
 #endif
@@ -868,7 +870,13 @@ static __forceinline void AdvanceStoppedCoreVoicesWithoutIrq(
 
 static constexpr u32 AllCoreVoiceBits =
 	(1u << V_Core::NumVoices) - 1u;
+static constexpr u32 EquivalentVoiceGroupSlotCount = 32;
+static constexpr u8 NoEquivalentVoiceRepresentative = 0xff;
 static u32 s_equivalent_stopped_voice_core_mask = 0;
+static u32 s_fully_equivalent_stopped_voice_core_mask = 0;
+static u32 s_equivalent_stopped_voice_member_masks[2] = {};
+static u32
+	s_equivalent_stopped_voice_group_masks[2][V_Core::NumVoices] = {};
 
 static bool MixerWritesMayTouchBlock(u32 block)
 {
@@ -908,16 +916,15 @@ static bool MixerWritesMayTouchBlock(u32 block)
 	return false;
 }
 
-static bool CoreHasEquivalentStableStoppedVoices(const V_Core& core)
+static bool StoppedVoiceCanEnterEquivalenceProof(const V_Voice& voice)
 {
-	const V_Voice& reference = core.Voices[0];
-	if (reference.ADSR.Phase != V_ADSR::PHASE_STOPPED ||
-		reference.Volume.HasActiveSlide() || reference.Modulated)
-	{
-		return false;
-	}
+	return voice.ADSR.Phase == V_ADSR::PHASE_STOPPED &&
+		!voice.Volume.HasActiveSlide() && !voice.Modulated;
+}
 
-	const u32 block = reference.NextA & 0xffff8u;
+static bool StoppedVoiceBlockIsStable(const V_Voice& voice)
+{
+	const u32 block = voice.NextA & 0xffff8u;
 	const u32 loop_flags =
 		static_cast<u16>(*GetMemPtr(block)) >> 8;
 	if ((loop_flags &
@@ -928,33 +935,68 @@ static bool CoreHasEquivalentStableStoppedVoices(const V_Core& core)
 		return false;
 	}
 
-	if (reference.LoopMode && reference.LoopStartA != block)
-		return false;
+	return !voice.LoopMode || voice.LoopStartA == block;
+}
 
-	for (uint voiceidx = 1; voiceidx < V_Core::NumVoices; ++voiceidx)
+static bool StoppedVoicesHaveEquivalentEvolution(
+	const V_Voice& left, const V_Voice& right)
+{
+	return right.Pitch == left.Pitch &&
+		right.LoopStartA == left.LoopStartA &&
+		right.NextA == left.NextA &&
+		right.LoopMode == left.LoopMode &&
+		right.SP == left.SP &&
+		right.SBuffer == left.SBuffer &&
+		right.DecPosWrite == left.DecPosWrite &&
+		right.DecPosRead == left.DecPosRead;
+}
+
+static bool CoreHasFullyEquivalentStableStoppedVoices(
+	const V_Core& core)
+{
+	const V_Voice& reference = core.Voices[0];
+	if (!StoppedVoiceCanEnterEquivalenceProof(reference) ||
+		!StoppedVoiceBlockIsStable(reference))
+	{
+		return false;
+	}
+
+	for (u32 voiceidx = 1; voiceidx < V_Core::NumVoices;
+		 voiceidx++)
 	{
 		const V_Voice& voice = core.Voices[voiceidx];
-		if (voice.ADSR.Phase != V_ADSR::PHASE_STOPPED ||
-			voice.Volume.HasActiveSlide() || voice.Modulated ||
-			voice.Pitch != reference.Pitch ||
-			voice.LoopStartA != reference.LoopStartA ||
-			voice.NextA != reference.NextA ||
-			voice.LoopMode != reference.LoopMode ||
-			voice.SP != reference.SP ||
-			voice.SBuffer != reference.SBuffer ||
-			voice.DecPosWrite != reference.DecPosWrite ||
-			voice.DecPosRead != reference.DecPosRead)
+		if (!StoppedVoiceCanEnterEquivalenceProof(voice) ||
+			!StoppedVoicesHaveEquivalentEvolution(
+				reference, voice))
 		{
 			return false;
 		}
 	}
-
 	return true;
+}
+
+static u32 HashStoppedVoiceEvolution(const V_Voice& voice)
+{
+	u32 hash = voice.NextA * 0x9e3779b1u;
+	hash ^= voice.LoopStartA * 0x85ebca6bu;
+	hash ^= static_cast<u32>(voice.SP) * 0xc2b2ae35u;
+	hash ^= static_cast<u32>(voice.Pitch) << 16;
+	hash ^= voice.DecPosWrite * 0x27d4eb2du;
+	hash ^= voice.DecPosRead * 0x165667b1u;
+	hash ^= static_cast<u32>(
+		reinterpret_cast<uintptr_t>(voice.SBuffer));
+	hash ^= static_cast<u32>(voice.LoopMode) << 24;
+	return hash ^ (hash >> 16);
 }
 
 void BeginEquivalentStoppedVoiceBatchWithoutIrq(u32 sample_count)
 {
 	s_equivalent_stopped_voice_core_mask = 0;
+	s_fully_equivalent_stopped_voice_core_mask = 0;
+	s_equivalent_stopped_voice_member_masks[0] = 0;
+	s_equivalent_stopped_voice_member_masks[1] = 0;
+	std::memset(s_equivalent_stopped_voice_group_masks, 0,
+		sizeof(s_equivalent_stopped_voice_group_masks));
 
 	// A one-sample call cannot amortize the proof and publication scans.
 	if (sample_count < 2 || Cores[0].IRQEnable || Cores[1].IRQEnable)
@@ -962,8 +1004,90 @@ void BeginEquivalentStoppedVoiceBatchWithoutIrq(u32 sample_count)
 
 	for (u32 coreidx = 0; coreidx < 2; ++coreidx)
 	{
-		if (CoreHasEquivalentStableStoppedVoices(Cores[coreidx]))
+		const V_Core& core = Cores[coreidx];
+		if (CoreHasFullyEquivalentStableStoppedVoices(core))
+		{
+			s_equivalent_stopped_voice_group_masks[coreidx][0] =
+				AllCoreVoiceBits;
+			s_equivalent_stopped_voice_member_masks[coreidx] =
+				AllCoreVoiceBits;
 			s_equivalent_stopped_voice_core_mask |= 1u << coreidx;
+			s_fully_equivalent_stopped_voice_core_mask |=
+				1u << coreidx;
+			continue;
+		}
+
+		// The physical Cortex-A9 fixture establishes that the partition
+		// proof amortizes only at 16 or more samples. Short differentiated
+		// batches retain the compact per-voice path.
+		if (sample_count < 16)
+			continue;
+
+		std::array<u8, EquivalentVoiceGroupSlotCount> representatives;
+		std::array<u32, EquivalentVoiceGroupSlotCount> hashes{};
+		representatives.fill(NoEquivalentVoiceRepresentative);
+
+		for (u32 voiceidx = 0; voiceidx < V_Core::NumVoices;
+			 voiceidx++)
+		{
+			const V_Voice& voice = core.Voices[voiceidx];
+			if (!StoppedVoiceCanEnterEquivalenceProof(voice))
+				continue;
+
+			const u32 hash = HashStoppedVoiceEvolution(voice);
+			const u32 slot = hash &
+				(EquivalentVoiceGroupSlotCount - 1u);
+			const u8 representative = representatives[slot];
+			if (representative ==
+				NoEquivalentVoiceRepresentative)
+			{
+				representatives[slot] =
+					static_cast<u8>(voiceidx);
+				hashes[slot] = hash;
+				continue;
+			}
+
+			const V_Voice& reference =
+				core.Voices[representative];
+			if (hashes[slot] != hash ||
+				!StoppedVoicesHaveEquivalentEvolution(
+					reference, voice))
+			{
+				// A direct-mapped collision only declines optimization.
+				// It can never merge different architectural states.
+				continue;
+			}
+
+			u32& group_mask =
+				s_equivalent_stopped_voice_group_masks[coreidx]
+					[representative];
+			if (group_mask == 0)
+			{
+				if (!StoppedVoiceBlockIsStable(reference))
+					continue;
+				group_mask = 1u << representative;
+			}
+			group_mask |= 1u << voiceidx;
+		}
+
+		u32 member_mask = 0;
+		for (u32 voiceidx = 0; voiceidx < V_Core::NumVoices;
+			 voiceidx++)
+		{
+			member_mask |=
+				s_equivalent_stopped_voice_group_masks[coreidx]
+					[voiceidx];
+		}
+		s_equivalent_stopped_voice_member_masks[coreidx] =
+			member_mask;
+		if (member_mask != 0)
+			s_equivalent_stopped_voice_core_mask |= 1u << coreidx;
+		if (s_equivalent_stopped_voice_group_masks[coreidx][0] ==
+			AllCoreVoiceBits)
+		{
+			s_fully_equivalent_stopped_voice_core_mask |=
+				1u << coreidx;
+		}
 	}
 }
 
@@ -975,22 +1099,40 @@ void FinishEquivalentStoppedVoiceBatchWithoutIrq()
 			continue;
 
 		V_Core& core = Cores[coreidx];
-		const V_Voice& reference = core.Voices[0];
-		for (uint voiceidx = 1; voiceidx < V_Core::NumVoices;
-			 voiceidx++)
+		for (u32 representative = 0;
+			 representative < V_Core::NumVoices;
+			 representative++)
 		{
-			V_Voice& voice = core.Voices[voiceidx];
-			voice.LoopStartA = reference.LoopStartA;
-			voice.NextA = reference.NextA;
-			voice.LoopFlags = reference.LoopFlags;
-			voice.SP = reference.SP;
-			voice.SBuffer = reference.SBuffer;
-			voice.DecPosWrite = reference.DecPosWrite;
-			voice.DecPosRead = reference.DecPosRead;
+			const u32 group_mask =
+				s_equivalent_stopped_voice_group_masks[coreidx]
+					[representative];
+			if (group_mask == 0)
+				continue;
+
+			const V_Voice& reference =
+				core.Voices[representative];
+			for (u32 voiceidx = representative + 1u;
+				 voiceidx < V_Core::NumVoices; voiceidx++)
+			{
+				if (!(group_mask & (1u << voiceidx)))
+					continue;
+
+				V_Voice& voice = core.Voices[voiceidx];
+				voice.LoopStartA = reference.LoopStartA;
+				voice.NextA = reference.NextA;
+				voice.LoopFlags = reference.LoopFlags;
+				voice.SP = reference.SP;
+				voice.SBuffer = reference.SBuffer;
+				voice.DecPosWrite = reference.DecPosWrite;
+				voice.DecPosRead = reference.DecPosRead;
+			}
 		}
 	}
 
 	s_equivalent_stopped_voice_core_mask = 0;
+	s_fully_equivalent_stopped_voice_core_mask = 0;
+	s_equivalent_stopped_voice_member_masks[0] = 0;
+	s_equivalent_stopped_voice_member_masks[1] = 0;
 }
 
 static __forceinline void AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
@@ -1006,6 +1148,51 @@ static __forceinline void AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
 	// areas every sample. IRQs are proven disabled for this entire batch.
 	*GetMemPtr(((coreidx == 0) ? 0x400 : 0xc00) + OutPos) = 0;
 	*GetMemPtr(((coreidx == 0) ? 0x600 : 0xe00) + OutPos) = 0;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	g_qemuSpu2VoiceVolumeSlideSkipped += V_Core::NumVoices;
+	g_qemuSpu2ZeroVoiceGateSkipped += V_Core::NumVoices;
+	g_qemuSpu2EquivalentStoppedCoreSamples++;
+#endif
+}
+
+static __forceinline void AdvanceGroupedStoppedCoreVoicesWithoutIrq(
+	const uint coreidx)
+{
+	V_Core& core = Cores[coreidx];
+	const u32 member_mask =
+		s_equivalent_stopped_voice_member_masks[coreidx];
+
+	for (u32 voiceidx = 0; voiceidx < V_Core::NumVoices; voiceidx++)
+	{
+		const u32 group_mask =
+			s_equivalent_stopped_voice_group_masks[coreidx][voiceidx];
+		if (group_mask != 0)
+		{
+			DecodeStoppedSamplesWithoutIrq(
+				core, voiceidx, group_mask);
+			UpdatePitch(coreidx, voiceidx);
+			ConsumeSamples(core, voiceidx);
+		}
+		else if (!(member_mask & (1u << voiceidx)))
+		{
+			DecodeStoppedSamplesWithoutIrq(
+				core, voiceidx, 1u << voiceidx);
+			UpdatePitch(coreidx, voiceidx);
+			ConsumeSamples(core, voiceidx);
+		}
+
+		if (voiceidx == 1)
+		{
+			*GetMemPtr(((coreidx == 0) ? 0x400 : 0xc00) +
+				OutPos) = 0;
+		}
+		else if (voiceidx == 3)
+		{
+			*GetMemPtr(((coreidx == 0) ? 0x600 : 0xe00) +
+				OutPos) = 0;
+		}
+	}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	g_qemuSpu2VoiceVolumeSlideSkipped += V_Core::NumVoices;
@@ -1036,10 +1223,15 @@ void Spu2MixEquivalentStoppedVoicesBatchForValidation(u32 samples)
 	{
 		for (u32 coreidx = 0; coreidx < 2; ++coreidx)
 		{
-			if (s_equivalent_stopped_voice_core_mask &
+			if (s_fully_equivalent_stopped_voice_core_mask &
 				(1u << coreidx))
 			{
 				AdvanceEquivalentStoppedCoreVoicesWithoutIrq(coreidx);
+			}
+			else if (s_equivalent_stopped_voice_core_mask &
+				(1u << coreidx))
+			{
+				AdvanceGroupedStoppedCoreVoicesWithoutIrq(coreidx);
 			}
 			else
 			{
@@ -1054,6 +1246,10 @@ void Spu2MixEquivalentStoppedVoicesBatchForValidation(u32 samples)
 
 static __forceinline StereoOut32 MixCore(const uint coreidx, const VoiceMixSet& inVoices, const StereoOut32& Input, const StereoOut32& Ext)
 {
+#if defined(VITASX2_CPU_PROFILER)
+	VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+		VitaPerformanceTelemetry::CpuStage::Spu2Core);
+#endif
 	V_Core& thiscore(Cores[coreidx]);
 
 	// Same disabled-slide fast path for core master volume.
@@ -1136,7 +1332,15 @@ static __forceinline StereoOut32 MixCore(const uint coreidx, const VoiceMixSet& 
 	WaveDump::WriteCore(thiscore.Index, CoreSrc_PreReverb, TW);
 #endif
 
+#if defined(VITASX2_CPU_PROFILER)
+	VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+		VitaPerformanceTelemetry::CpuStage::Spu2Reverb);
+#endif
 	StereoOut32 RV = thiscore.DoReverb(TW);
+#if defined(VITASX2_CPU_PROFILER)
+	VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+		VitaPerformanceTelemetry::CpuStage::Spu2Core);
+#endif
 
 #ifdef PCSX2_DEVBUILD
 	WaveDump::WriteCore(thiscore.Index, CoreSrc_PostReverb, RV);
@@ -1227,6 +1431,8 @@ void spu2Mix()
 {
 #if defined(VITASX2_CPU_PROFILER)
 	ProbeSpu2MixerState();
+	VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+		VitaPerformanceTelemetry::CpuStage::Spu2Input);
 #endif
 
 	// Note: Playmode 4 is SPDIF, which overrides other inputs.
@@ -1249,6 +1455,10 @@ void spu2Mix()
 	// Todo: Replace me with memzero initializer!
 	VoiceMixSet VoiceData[2] = {{StereoOut32(), StereoOut32()}, {StereoOut32(), StereoOut32()}}; // mixed voice data for each core.
 
+#if defined(VITASX2_CPU_PROFILER)
+	VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+		VitaPerformanceTelemetry::CpuStage::Spu2Voices);
+#endif
 	if (g_spu2AllVoicesStoppedWithoutSlides)
 	{
 		if (Cores[0].IRQEnable || Cores[1].IRQEnable)
@@ -1260,10 +1470,16 @@ void spu2Mix()
 		{
 			for (u32 coreidx = 0; coreidx < 2; ++coreidx)
 			{
-				if (s_equivalent_stopped_voice_core_mask &
+				if (s_fully_equivalent_stopped_voice_core_mask &
 					(1u << coreidx))
 				{
 					AdvanceEquivalentStoppedCoreVoicesWithoutIrq(
+						coreidx);
+				}
+				else if (s_equivalent_stopped_voice_core_mask &
+					(1u << coreidx))
+				{
+					AdvanceGroupedStoppedCoreVoicesWithoutIrq(
 						coreidx);
 				}
 				else
@@ -1320,6 +1536,10 @@ void spu2Mix()
 	WaveDump::WriteCore(1, CoreSrc_External, Out);
 #endif
 
+#if defined(VITASX2_CPU_PROFILER)
+	VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+		VitaPerformanceTelemetry::CpuStage::Spu2Output);
+#endif
 	Pcsx2Trace::RecordSpu2OutputSample(Cycles, Ext, Out, Out);
 #if defined(VITASX2_QEMU_VALIDATION)
 	// Hash the integer mixer output before the host-only DC filter and stream
@@ -1360,6 +1580,11 @@ void spu2Mix()
 					g_counter_cache_ignores = 0;
 		}
 	}
+
+#if defined(VITASX2_CPU_PROFILER)
+	VitaPerformanceTelemetry::PublishCpuStatisticalStageIfProfiling(
+		VitaPerformanceTelemetry::CpuStage::Spu2);
+#endif
 }
 
 MULTI_ISA_UNSHARED_END
