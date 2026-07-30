@@ -484,6 +484,14 @@ u32 g_qemuWordCopyScalarIterations = 0;
 u32 g_qemuWordCopyPageReturns = 0;
 u32 g_qemuWordCopyRedispatches = 0;
 bool g_qemuWordCopyForceRedispatch = false;
+u32 g_qemuSignedHalfwordBytePackBlocks = 0;
+u32 g_qemuSignedHalfwordBytePackHelperCalls = 0;
+u32 g_qemuSignedHalfwordBytePackBulkChunks = 0;
+u32 g_qemuSignedHalfwordBytePackBulkIterations = 0;
+u32 g_qemuSignedHalfwordBytePackScalarIterations = 0;
+u32 g_qemuSignedHalfwordBytePackPageReturns = 0;
+u32 g_qemuSignedHalfwordBytePackRedispatches = 0;
+bool g_qemuSignedHalfwordBytePackForceRedispatch = false;
 u32 g_qemuGsCsrVsintPollBlocks = 0;
 u32 g_qemuGsCsrVsintPollHelperCalls = 0;
 u32 g_qemuGsCsrVsintPollFastForwards = 0;
@@ -3177,6 +3185,132 @@ namespace VitaEE
 			*destination_guest = destination;
 		if (end_guest)
 			*end_guest = end;
+		return true;
+	}
+
+	bool BlockCompiler::IsExactSignedHalfwordBytePackLoop(u32 start_pc,
+		u32 instruction_count, unsigned* counter_guest, unsigned* source_guest,
+		unsigned* previous_source_guest, unsigned* destination_guest,
+		unsigned* clamp_guest, unsigned* data_guests)
+	{
+		constexpr u32 INSTRUCTION_COUNT = 37;
+		if (instruction_count != INSTRUCTION_COUNT ||
+			start_pc > UINT32_MAX - INSTRUCTION_COUNT * sizeof(u32))
+		{
+			return false;
+		}
+
+		u32 ops[INSTRUCTION_COUNT]{};
+		for (u32 i = 0; i < instruction_count; i++)
+			ops[i] = memRead32(start_pc + i * sizeof(u32));
+
+		const unsigned source = RS(ops[0]);
+		const unsigned counter = RT(ops[1]);
+		const unsigned previous_source = RD(ops[2]);
+		const unsigned destination = RS(ops[31]);
+		const unsigned clamp = RT(ops[11]);
+		unsigned data[8]{};
+		data[0] = RT(ops[0]);
+		for (unsigned i = 1; i < 8; i++)
+			data[i] = RT(ops[3 + i]);
+
+		unsigned guests[13] = {
+			counter, source, previous_source, destination, clamp,
+			data[0], data[1], data[2], data[3],
+			data[4], data[5], data[6], data[7],
+		};
+		for (unsigned i = 0; i < std::size(guests); i++)
+		{
+			if (guests[i] == 0)
+				return false;
+			for (unsigned j = 0; j < i; j++)
+			{
+				if (guests[i] == guests[j])
+					return false;
+			}
+		}
+
+		const auto is_lq = [](u32 op, unsigned rt, unsigned rs, s16 offset) {
+			return (op >> 26) == 0x1e && RT(op) == rt && RS(op) == rs &&
+				IMM_S(op) == offset;
+		};
+		const auto is_mmi = [](u32 op, u32 function, u32 subfunction,
+			unsigned rd, unsigned rs, unsigned rt) {
+			return (op >> 26) == 0x1c && (op & 0x3f) == function &&
+				((op >> 6) & 0x1f) == subfunction && RD(op) == rd &&
+				RS(op) == rs && RT(op) == rt;
+		};
+
+		if (!is_lq(ops[0], data[0], source, 0) ||
+			(ops[1] >> 26) != 0x08 || RS(ops[1]) != counter ||
+			RT(ops[1]) != counter || IMM_S(ops[1]) != -4 ||
+			(ops[2] >> 26) != 0 || (ops[2] & 0x7ff) != 0x02d ||
+			RS(ops[2]) != source || RT(ops[2]) != 0 ||
+			RD(ops[2]) != previous_source ||
+			(ops[3] >> 26) != 0x09 || RS(ops[3]) != source ||
+			RT(ops[3]) != source || IMM_S(ops[3]) != 128)
+		{
+			return false;
+		}
+		for (unsigned i = 1; i < 8; i++)
+		{
+			if (!is_lq(ops[3 + i], data[i], previous_source,
+					static_cast<s16>(i * 16)))
+			{
+				return false;
+			}
+		}
+
+		u32 op_index = 11;
+		for (unsigned pair = 0; pair < 4; pair++)
+		{
+			const unsigned even = data[pair * 2];
+			const unsigned odd = data[pair * 2 + 1];
+			if (!is_mmi(ops[op_index++], 0x28, 0x07,
+					even, even, clamp) ||
+				!is_mmi(ops[op_index++], 0x08, 0x07,
+					even, even, 0) ||
+				!is_mmi(ops[op_index++], 0x28, 0x07,
+					odd, odd, clamp) ||
+				!is_mmi(ops[op_index++], 0x08, 0x07,
+					odd, odd, 0) ||
+				!is_mmi(ops[op_index++], 0x08, 0x1b,
+					odd, odd, even))
+			{
+				return false;
+			}
+		}
+		for (unsigned pair = 0; pair < 4; pair++)
+		{
+			const u32 op = ops[31 + pair];
+			if ((op >> 26) != 0x1f || RS(op) != destination ||
+				RT(op) != data[pair * 2 + 1] ||
+				IMM_S(op) != static_cast<s16>(pair * 16))
+			{
+				return false;
+			}
+		}
+		if ((ops[35] >> 26) != 0x05 || RS(ops[35]) != counter ||
+			RT(ops[35]) != 0 ||
+			BranchTarget(start_pc + 35 * sizeof(u32), ops[35]) != start_pc ||
+			(ops[36] >> 26) != 0x09 || RS(ops[36]) != destination ||
+			RT(ops[36]) != destination || IMM_S(ops[36]) != 64)
+		{
+			return false;
+		}
+
+		if (counter_guest)
+			*counter_guest = counter;
+		if (source_guest)
+			*source_guest = source;
+		if (previous_source_guest)
+			*previous_source_guest = previous_source;
+		if (destination_guest)
+			*destination_guest = destination;
+		if (clamp_guest)
+			*clamp_guest = clamp;
+		if (data_guests)
+			std::copy(std::begin(data), std::end(data), data_guests);
 		return true;
 	}
 
@@ -11225,6 +11359,119 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::CompileSignedHalfwordBytePackLoop(u32 start_pc,
+		u32 instruction_count, const void* direct_exit, const void* event_exit,
+		u32* scaled_cycles, DirectLinkSlots* direct_links,
+		size_t* linked_entry_offset)
+	{
+		unsigned counter_guest = 0;
+		unsigned source_guest = 0;
+		unsigned previous_source_guest = 0;
+		unsigned destination_guest = 0;
+		unsigned clamp_guest = 0;
+		unsigned data_guests[8]{};
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactSignedHalfwordBytePackLoop(start_pc, instruction_count,
+				&counter_guest, &source_guest, &previous_source_guest,
+				&destination_guest, &clamp_guest, data_guests))
+		{
+			return false;
+		}
+
+		u32 raw_cycles = 0;
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		for (u32 i = 0; i < instruction_count; i++)
+		{
+			const u32 op = memRead32(start_pc + i * sizeof(u32));
+			raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) *
+				cycle_factor;
+		}
+		const u32 block_cycles = ScaleBlockCycles(raw_cycles);
+		if (block_cycles == 0 || block_cycles > 0xffff)
+			return false;
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
+		const u32 packed_control = block_cycles | (counter_guest << 16) |
+			(source_guest << 21) | (previous_source_guest << 26);
+		const u32 packed_guests0 = destination_guest | (clamp_guest << 5) |
+			(data_guests[0] << 10) | (data_guests[1] << 15) |
+			(data_guests[2] << 20) | (data_guests[3] << 25);
+		const u32 packed_guests1 = data_guests[4] | (data_guests[5] << 5) |
+			(data_guests[6] << 10) | (data_guests[7] << 15);
+		if (!BeginBlock(false, false, false, linked_entry_offset) ||
+			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1, packed_control) ||
+			!m_code.EmitMovImm32(HOST_TMP2, packed_guests0) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_guests1) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
+				&VitaEeExecuteSignedHalfwordBytePack)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0,
+				VITA_EE_SIGNED_HALFWORD_BYTE_PACK_EVENT))
+		{
+			return false;
+		}
+
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0,
+				VITA_EE_SIGNED_HALFWORD_BYTE_PACK_REDISPATCH))
+		{
+			return false;
+		}
+		const size_t redispatch_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (redispatch_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0,
+				VITA_EE_SIGNED_HALFWORD_BYTE_PACK_SELF))
+		{
+			return false;
+		}
+		const size_t self_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (self_branch == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+
+		const size_t self_target = m_code.Size();
+		if (!m_code.PatchBranch(self_branch, self_target,
+				VitaA32::Condition::EQ) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
+		{
+			return false;
+		}
+		const size_t redispatch_target = m_code.Size();
+		if (!m_code.PatchBranch(redispatch_branch, redispatch_target,
+				VitaA32::Condition::EQ) ||
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
+		{
+			return false;
+		}
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target,
+				VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = fallthrough_pc;
+		direct_links->slots[0].valid = true;
+		direct_links->slots[1].target_pc = start_pc;
+		direct_links->slots[1].valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuSignedHalfwordBytePackBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompileSignedCountdownLoop(u32 start_pc, u32 instruction_count,
 		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -11543,6 +11790,13 @@ namespace VitaEE
 			return CompileDmacChcrStrPollLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links,
 				linked_entry_offset);
+		}
+		if (memory_range_loop_batch_enabled && direct_links &&
+			IsExactSignedHalfwordBytePackLoop(start_pc, instruction_count))
+		{
+			return CompileSignedHalfwordBytePackLoop(start_pc,
+				instruction_count, direct_exit, event_exit, scaled_cycles,
+				direct_links, linked_entry_offset);
 		}
 		if (memory_range_loop_batch_enabled && direct_links &&
 			IsExactWordCopyLoop(start_pc, instruction_count))

@@ -683,6 +683,11 @@ namespace VitaEE
 		static bool IsExactWordCopyLoop(u32 start_pc, u32 instruction_count,
 			unsigned* value_guest = nullptr, unsigned* source_guest = nullptr,
 			unsigned* destination_guest = nullptr, unsigned* end_guest = nullptr);
+		static bool IsExactSignedHalfwordBytePackLoop(u32 start_pc,
+			u32 instruction_count, unsigned* counter_guest = nullptr,
+			unsigned* source_guest = nullptr, unsigned* previous_source_guest = nullptr,
+			unsigned* destination_guest = nullptr, unsigned* clamp_guest = nullptr,
+			unsigned* data_guests = nullptr);
 		static bool IsExactGsCsrVsintPollLoop(u32 start_pc, u32 instruction_count,
 			unsigned* base_guest = nullptr, unsigned* result_guest = nullptr);
 		static bool IsExactDmacChcrStrPollLoop(u32 start_pc,
@@ -844,6 +849,10 @@ namespace VitaEE
 		bool CompileWordCopyLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
+		bool CompileSignedHalfwordBytePackLoop(u32 start_pc,
+			u32 instruction_count, const void* direct_exit, const void* event_exit,
+			u32* scaled_cycles, DirectLinkSlots* direct_links,
+			size_t* linked_entry_offset);
 		bool CompileGsCsrVsintPollLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
