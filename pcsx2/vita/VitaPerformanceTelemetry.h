@@ -197,6 +197,7 @@ namespace VitaPerformanceTelemetry
 		u64 ee_wait_two_predicate_ram = 0;
 		u64 ee_wait_retained_unconditional = 0;
 		u64 ee_wait_gs_csr_vsint = 0;
+		u64 ee_wait_dmac_chcr_str = 0;
 		u64 joint_wait_shadow_entries = 0;
 		u64 joint_wait_unknown_writer = 0;
 		u64 joint_wait_blocked = 0;

@@ -281,6 +281,7 @@ static __fi bool VitaEeWaitCertificateHasExactWakeContract(
 			return certificate.ram_range_count == 2;
 		case VitaA32EeWaitSchedulerOrigin::RetainedUnconditionalLoop:
 		case VitaA32EeWaitSchedulerOrigin::GsCsrVsintLoop:
+		case VitaA32EeWaitSchedulerOrigin::DmacChcrStrPollLoop:
 			return certificate.ram_range_count == 0;
 		case VitaA32EeWaitSchedulerOrigin::None:
 		case VitaA32EeWaitSchedulerOrigin::GenericRamLoop:
@@ -295,10 +296,11 @@ static __fi bool VitaTryScheduleJointWaitHorizon(
 {
 	// PCSX2 owners: the EE wait-loop max(cycle,nextEventCycle) lowering and
 	// R3000A.cpp::iopEventTest(). The EE certificate proves that another loop
-	// iteration can observe only its watched RAM (or the exact GSVSync owner);
-	// the retained IOP descriptor proves that the IOP has no guest work before
-	// its next counter/callback/interrupt owner. Every uncertain state keeps the
-	// existing bounded 3072/6144-cycle seam.
+	// iteration can observe only its watched RAM, the exact GSVSync owner, or an
+	// enumerated DMAC CHCR.STR whose completion is deadline-owned; the retained
+	// IOP descriptor proves that the IOP has no guest work before its next
+	// counter/callback/interrupt owner. Every uncertain state keeps the existing
+	// bounded 3072/6144-cycle seam.
 	if (!VitaJointWaitHorizonActive() ||
 		PSXCLK != (PS2CLK / 8u) ||
 		!VitaA32IopRetainedWaitCoalescingActive() ||

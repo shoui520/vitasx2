@@ -28,6 +28,7 @@
 #include "VUmicro.h"
 #include "vita/VitaCore.h"
 #include "vita/VitaEeBlockCompiler.h"
+#include "vita/VitaEeDmacWait.h"
 #include "vita/VitaEeExecutor.h"
 #include "vita/VitaIopBlockCompiler.h"
 #include "vita/VitaPerformanceTelemetry.h"
@@ -37,8 +38,8 @@
 #include "common/Assertions.h"
 #include "common/Console.h"
 
-#if defined(VITASX2_QEMU_VALIDATION)
 #include <algorithm>
+#if defined(VITASX2_QEMU_VALIDATION)
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -881,6 +882,53 @@ static bool recCanResumeGeneratedEeAfterEvent()
 	return resume;
 }
 
+enum class DmacChcrPollResumeResult : u32
+{
+	Direct,
+	RepeatEvent,
+	UncertifiedEvent,
+};
+
+static inline DmacChcrPollResumeResult
+recRunDmacChcrPollIterationAfterEvent(
+	u32 loop_pc, const VitaA32EeWaitSchedulerCertificate& certificate)
+{
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::EeHelper);
+	const u32 packed_poll = certificate.mmio_packed_poll;
+	const unsigned base_guest = packed_poll & 0x1f;
+	const unsigned result_guest = (packed_poll >> 5) & 0x1f;
+	const unsigned shift = (packed_poll >> 10) & 0x1f;
+	const u32 mask = packed_poll >> 16;
+	const u32 block_cycles = certificate.mmio_block_cycles;
+	const u32 fallthrough_pc = certificate.mmio_fallthrough_pc;
+	if (base_guest == 0 || result_guest == 0 || mask == 0 ||
+		block_cycles == 0)
+	{
+		return DmacChcrPollResumeResult::Direct;
+	}
+
+	const u32 address = cpuRegs.GPR.r[base_guest].UL[0];
+	const u32 result = (memRead32(address) >> shift) & mask;
+	cpuRegs.GPR.r[result_guest].UD[0] = result;
+	cpuRegs.cycle += block_cycles;
+	const bool repeat = result != 0;
+	cpuRegs.pc = repeat ? loop_pc : fallthrough_pc;
+
+	if (repeat && VitaIsEeDmacChcrAddress(address))
+	{
+		cpuRegs.cycle = std::max(cpuRegs.cycle, cpuRegs.nextEventCycle);
+		return DmacChcrPollResumeResult::RepeatEvent;
+	}
+	if (static_cast<s32>(
+			static_cast<u32>(cpuRegs.cycle) -
+			static_cast<u32>(cpuRegs.nextEventCycle)) >= 0)
+	{
+		return DmacChcrPollResumeResult::UncertifiedEvent;
+	}
+	return DmacChcrPollResumeResult::Direct;
+}
+
 template <bool PrivateSchedulerEntry>
 static inline __attribute__((always_inline)) u32
 recRunEeEventForGeneratedResumeCore(
@@ -909,6 +957,7 @@ recRunEeEventForGeneratedResumeCore(
 	}
 	u32 event_tests = 0;
 	u32 retained_events = 0;
+	u32 retained_dmac_chcr_poll_events = 0;
 	bool resume = false;
 	for (;;)
 	{
@@ -923,31 +972,60 @@ recRunEeEventForGeneratedResumeCore(
 		_cpuEventTest_Shared();
 #endif
 		resume = recCanResumeGeneratedEeAfterEvent();
-		if (!resume || !retain_unconditional_wait || wait_cycles == 0 ||
-			cpuRegs.pc != wait_pc)
+		if (!resume)
 		{
 			break;
 		}
 
-		// PCSX2 iBranchTest() would re-enter this proven empty self-loop,
-		// charge one iteration, then set cycle=max(cycle,nextEventCycle) and
-		// dispatch the same event owner. When the new deadline is at least one
-		// iteration away, publish that identical maximum here and retain the C++
-		// event frame. Device work, interrupts, IOP execution, and every exact
-		// deadline still run; only generated block/lookup redispatch is omitted.
-		const s32 deadline_delta = static_cast<s32>(
-			static_cast<u32>(cpuRegs.nextEventCycle) -
-			static_cast<u32>(cpuRegs.cycle));
-		if (deadline_delta < static_cast<s32>(wait_cycles))
-			break;
+		if (retain_unconditional_wait && wait_cycles != 0 &&
+			cpuRegs.pc == wait_pc)
+		{
+			// PCSX2 iBranchTest() would re-enter this proven empty self-loop,
+			// charge one iteration, then set cycle=max(cycle,nextEventCycle) and
+			// dispatch the same event owner. When the new deadline is at least one
+			// iteration away, publish that identical maximum here and retain the C++
+			// event frame. Device work, interrupts, IOP execution, and every exact
+			// deadline still run; only generated block/lookup redispatch is omitted.
+			const s32 deadline_delta = static_cast<s32>(
+				static_cast<u32>(cpuRegs.nextEventCycle) -
+				static_cast<u32>(cpuRegs.cycle));
+			if (deadline_delta < static_cast<s32>(wait_cycles))
+				break;
 
-		cpuRegs.cycle = cpuRegs.nextEventCycle;
-		retained_events++;
+			cpuRegs.cycle = cpuRegs.nextEventCycle;
+			retained_events++;
+			continue;
+		}
+
+		if (wait_certificate.origin ==
+				VitaA32EeWaitSchedulerOrigin::DmacChcrStrPollLoop &&
+			cpuRegs.pc == wait_pc)
+		{
+			const DmacChcrPollResumeResult poll_result =
+				recRunDmacChcrPollIterationAfterEvent(
+					wait_pc, wait_certificate);
+			if (poll_result == DmacChcrPollResumeResult::RepeatEvent)
+			{
+				retained_dmac_chcr_poll_events++;
+				continue;
+			}
+			if (poll_result == DmacChcrPollResumeResult::UncertifiedEvent)
+			{
+				// The loop completed or its runtime address guard failed on an
+				// iteration which also crossed a scheduler deadline. Service that
+				// deadline without republishing the now-invalid MMIO certificate.
+				wait_certificate = {};
+				continue;
+			}
+		}
+		break;
 	}
 	if (VitaPerformanceTelemetry::IsEnabled())
 	{
 		s_ee_a32_stats.in_frame_event_tests += event_tests;
 		s_ee_a32_stats.retained_unconditional_wait_events += retained_events;
+		s_ee_a32_stats.retained_dmac_chcr_poll_events +=
+			retained_dmac_chcr_poll_events;
 		if (!resume)
 			s_ee_a32_stats.in_frame_event_resume_refusals++;
 	}
@@ -1843,6 +1921,17 @@ void VitaPublishA32EeRamWaitSchedulerCertificate(
 	}
 }
 
+void VitaPublishA32EeDmacChcrWaitSchedulerCertificate(
+	u32 fallthrough_pc, u32 block_cycles, u32 packed_poll)
+{
+	s_ee_wait_scheduler_certificate = {};
+	s_ee_wait_scheduler_certificate.origin =
+		VitaA32EeWaitSchedulerOrigin::DmacChcrStrPollLoop;
+	s_ee_wait_scheduler_certificate.mmio_fallthrough_pc = fallthrough_pc;
+	s_ee_wait_scheduler_certificate.mmio_block_cycles = block_cycles;
+	s_ee_wait_scheduler_certificate.mmio_packed_poll = packed_poll;
+}
+
 void VitaRepublishA32EeWaitSchedulerCertificate(
 	const VitaA32EeWaitSchedulerCertificate& certificate)
 {
@@ -1953,6 +2042,13 @@ VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats()
 #endif
 
 #if defined(VITASX2_QEMU_VALIDATION)
+u32 VitaRunA32EeDmacChcrPollIterationAfterEventForValidation(
+	u32 loop_pc, const VitaA32EeWaitSchedulerCertificate& certificate)
+{
+	return static_cast<u32>(
+		recRunDmacChcrPollIterationAfterEvent(loop_pc, certificate));
+}
+
 void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled)
 {
 	s_ee_a32_link_rejection_profile_enabled = enabled;

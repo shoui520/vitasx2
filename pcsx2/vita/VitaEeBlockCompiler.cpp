@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
+#include "pcsx2/vita/VitaEeDmacWait.h"
 #include "pcsx2/COP0.h"
 #include "pcsx2/HostMemoryMap.h"
 #include "pcsx2/MemoryTypes.h"
@@ -487,6 +488,10 @@ u32 g_qemuGsCsrVsintPollBlocks = 0;
 u32 g_qemuGsCsrVsintPollHelperCalls = 0;
 u32 g_qemuGsCsrVsintPollFastForwards = 0;
 u32 g_qemuGsCsrVsintPollGuardFallbacks = 0;
+u32 g_qemuDmacChcrStrPollBlocks = 0;
+u32 g_qemuDmacChcrStrPollHelperCalls = 0;
+u32 g_qemuDmacChcrStrPollFastForwards = 0;
+u32 g_qemuDmacChcrStrPollGuardFallbacks = 0;
 u32 g_qemuSignedCountdownLoopBlocks = 0;
 u32 g_qemuSignedCountdownLoopHelperCalls = 0;
 u32 g_qemuSignedCountdownLoopBatchedIterations = 0;
@@ -774,6 +779,65 @@ namespace VitaEE
 				return GS_CSR_VSINT_POLL_EVENT;
 			}
 			return repeat ? GS_CSR_VSINT_POLL_SELF : GS_CSR_VSINT_POLL_COMPLETE;
+		}
+
+		enum DmacChcrStrPollResult : u32
+		{
+			DMAC_CHCR_STR_POLL_COMPLETE = 0,
+			DMAC_CHCR_STR_POLL_SELF = 1,
+			DMAC_CHCR_STR_POLL_EVENT = 2,
+		};
+
+		__noinline u32 VitaEeExecuteDmacChcrStrPoll(u32 start_pc,
+			u32 fallthrough_pc, u32 block_cycles, u32 packed_poll)
+		{
+			const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+				VitaPerformanceTelemetry::CpuStage::EeHelper);
+			// PCSX2 owners: Hw.h D0_CHCR..D9_CHCR name the architectural
+			// channels, their DMA completion handlers clear tDMA_CHCR::STR, and
+			// x86/ix86-32/iR5900.cpp's s_nBlockFF/iBranchTest contract advances a
+			// repeatable wait to the next exact event. Preserve the complete
+			// LW/SRL/ANDI/BNE result, cycle charge, branch, and MMIO observation.
+			const unsigned base_guest = packed_poll & 0x1f;
+			const unsigned result_guest = (packed_poll >> 5) & 0x1f;
+			const unsigned shift = (packed_poll >> 10) & 0x1f;
+			const u32 mask = packed_poll >> 16;
+			const u32 address = cpuRegs.GPR.r[base_guest].UL[0];
+			const u32 result = (memRead32(address) >> shift) & mask;
+			cpuRegs.GPR.r[result_guest].UD[0] = result;
+			cpuRegs.cycle += block_cycles;
+			const bool repeat = result != 0;
+			cpuRegs.pc = repeat ? start_pc : fallthrough_pc;
+			const bool fast_forward =
+				repeat && VitaIsEeDmacChcrAddress(address);
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuDmacChcrStrPollHelperCalls++;
+#endif
+
+			if (fast_forward)
+			{
+				cpuRegs.cycle = std::max(cpuRegs.cycle, cpuRegs.nextEventCycle);
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+				VitaPublishA32EeDmacChcrWaitSchedulerCertificate(
+					fallthrough_pc, block_cycles, packed_poll);
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuDmacChcrStrPollFastForwards++;
+#endif
+				return DMAC_CHCR_STR_POLL_EVENT;
+			}
+#if defined(VITASX2_QEMU_VALIDATION)
+			if (!VitaIsEeDmacChcrAddress(address))
+				g_qemuDmacChcrStrPollGuardFallbacks++;
+#endif
+
+			if (static_cast<s32>(static_cast<u32>(cpuRegs.cycle) -
+					static_cast<u32>(cpuRegs.nextEventCycle)) >= 0)
+			{
+				return DMAC_CHCR_STR_POLL_EVENT;
+			}
+			return repeat ? DMAC_CHCR_STR_POLL_SELF :
+				DMAC_CHCR_STR_POLL_COMPLETE;
 		}
 		constexpr unsigned HOST_CALLER_SAVED_BRANCH_FLAG = HOST_TMP4;
 		constexpr unsigned HOST_TMP5 = 6;
@@ -3142,6 +3206,71 @@ namespace VitaEE
 			*base_guest = base;
 		if (result_guest)
 			*result_guest = result;
+		return true;
+	}
+
+	bool BlockCompiler::IsExactDmacChcrStrPollLoop(u32 start_pc,
+		u32 instruction_count, unsigned* base_guest, unsigned* result_guest,
+		unsigned* shift, u16* mask)
+	{
+		// Structural DMAC channel-completion wait:
+		//
+		//   lw    result,0(base)
+		//   srl   result,result,shift
+		//   andi  result,result,mask
+		//   nop
+		//   nop
+		//   bne   result,zero,loop
+		//   nop
+		//
+		// Runtime admission separately proves that base is one of D0_CHCR through
+		// D9_CHCR. Keeping
+		// that dynamic guard out of this source recognizer avoids any title,
+		// address-in-code, or fixed-PC dependency.
+		if (instruction_count != 7 ||
+			start_pc > UINT32_MAX - 7 * sizeof(u32))
+		{
+			return false;
+		}
+
+		const u32 load = memRead32(start_pc);
+		const u32 right_shift = memRead32(start_pc + sizeof(u32));
+		const u32 bit_mask = memRead32(start_pc + 2 * sizeof(u32));
+		const u32 nop0 = memRead32(start_pc + 3 * sizeof(u32));
+		const u32 nop1 = memRead32(start_pc + 4 * sizeof(u32));
+		const u32 branch = memRead32(start_pc + 5 * sizeof(u32));
+		const u32 delay = memRead32(start_pc + 6 * sizeof(u32));
+		const unsigned base = RS(load);
+		const unsigned result = RT(load);
+		const unsigned shift_amount = (right_shift >> 6) & 0x1f;
+		const u16 immediate_mask = IMM_U(bit_mask);
+		const unsigned branch_rs = RS(branch);
+		const unsigned branch_rt = RT(branch);
+		if ((load >> 26) != 0x23 || base == 0 || result == 0 ||
+			base == result || IMM_S(load) != 0 ||
+			(right_shift >> 26) != 0 || RS(right_shift) != 0 ||
+			RT(right_shift) != result || RD(right_shift) != result ||
+			(right_shift & 0x3f) != 0x02 || shift_amount != 8 ||
+			(bit_mask >> 26) != 0x0c || RS(bit_mask) != result ||
+			RT(bit_mask) != result || immediate_mask != 1 ||
+			nop0 != 0 || nop1 != 0 ||
+			(branch >> 26) != 0x05 ||
+			!((branch_rs == result && branch_rt == 0) ||
+			  (branch_rs == 0 && branch_rt == result)) ||
+			BranchTarget(start_pc + 5 * sizeof(u32), branch) != start_pc ||
+			delay != 0)
+		{
+			return false;
+		}
+
+		if (base_guest)
+			*base_guest = base;
+		if (result_guest)
+			*result_guest = result;
+		if (shift)
+			*shift = shift_amount;
+		if (mask)
+			*mask = immediate_mask;
 		return true;
 	}
 
@@ -10461,6 +10590,94 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::CompileDmacChcrStrPollLoop(u32 start_pc,
+		u32 instruction_count, const void* direct_exit, const void* event_exit,
+		u32* scaled_cycles, DirectLinkSlots* direct_links,
+		size_t* linked_entry_offset)
+	{
+		unsigned base_guest = 0;
+		unsigned result_guest = 0;
+		unsigned shift = 0;
+		u16 mask = 0;
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactDmacChcrStrPollLoop(start_pc, instruction_count,
+				&base_guest, &result_guest, &shift, &mask))
+		{
+			return false;
+		}
+
+		u32 block_cycles = 0;
+		if (!CalculateScaledCyclesForRange(start_pc, instruction_count, false,
+				&block_cycles) ||
+			block_cycles == 0)
+		{
+			return false;
+		}
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		const u32 fallthrough_pc =
+			start_pc + instruction_count * sizeof(u32);
+		const u32 packed_poll = base_guest |
+			(result_guest << 5) | (shift << 10) |
+			(static_cast<u32>(mask) << 16);
+		if (!BeginBlock(false, false, false, linked_entry_offset) ||
+			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_poll) ||
+			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
+				&VitaEeExecuteDmacChcrStrPoll)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0,
+				DMAC_CHCR_STR_POLL_EVENT))
+		{
+			return false;
+		}
+
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0,
+				DMAC_CHCR_STR_POLL_SELF))
+		{
+			return false;
+		}
+		const size_t self_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (self_branch == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+
+		const size_t self_target = m_code.Size();
+		if (!m_code.PatchBranch(self_branch, self_target,
+				VitaA32::Condition::EQ) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
+		{
+			return false;
+		}
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target,
+				VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = fallthrough_pc;
+		direct_links->slots[0].valid = true;
+		direct_links->slots[1].target_pc = start_pc;
+		direct_links->slots[1].valid = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuDmacChcrStrPollBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompilePreincrementByteZeroFillLoop(u32 start_pc,
 		u32 instruction_count, const void* direct_exit, const void* event_exit,
 		u32* scaled_cycles, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -11261,6 +11478,9 @@ namespace VitaEE
 		const bool gs_csr_poll_fast_forward_enabled = range_loop_dispatch_enabled &&
 			EmuConfig.Speedhacks.WaitLoop && !device_trace_enabled &&
 			!EmuConfig.Gamefixes.GoemonTlbHack;
+		const bool dmac_chcr_poll_fast_forward_enabled =
+			range_loop_dispatch_enabled && EmuConfig.Speedhacks.WaitLoop &&
+			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack;
 		const bool signed_countdown_loop_batch_enabled =
 			range_loop_dispatch_enabled && EmuConfig.Speedhacks.WaitLoop && !device_trace_enabled &&
 			!EmuConfig.Gamefixes.GoemonTlbHack;
@@ -11281,6 +11501,13 @@ namespace VitaEE
 		{
 			return CompileGsCsrVsintPollLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
+		}
+		if (dmac_chcr_poll_fast_forward_enabled && direct_links &&
+			IsExactDmacChcrStrPollLoop(start_pc, instruction_count))
+		{
+			return CompileDmacChcrStrPollLoop(start_pc, instruction_count,
+				direct_exit, event_exit, scaled_cycles, direct_links,
+				linked_entry_offset);
 		}
 		if (memory_range_loop_batch_enabled && direct_links &&
 			IsExactWordCopyLoop(start_pc, instruction_count))

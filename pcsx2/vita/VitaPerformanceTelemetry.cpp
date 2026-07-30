@@ -898,6 +898,9 @@ namespace VitaPerformanceTelemetry
 			case 5:
 				totals.ee_wait_gs_csr_vsint++;
 				break;
+			case 6:
+				totals.ee_wait_dmac_chcr_str++;
+				break;
 			default:
 				blocked = true;
 				break;

@@ -198,6 +198,7 @@ struct VitaA32EeProviderStats
 	u32 in_frame_event_resume_candidates = 0;
 	u32 in_frame_event_resume_refusals = 0;
 	u32 retained_unconditional_wait_events = 0;
+	u32 retained_dmac_chcr_poll_events = 0;
 	u32 first_interpreter_pc = 0;
 	u32 first_interpreter_opcode = 0;
 	u32 first_interpreter_reason = 0;
@@ -236,6 +237,7 @@ enum class VitaA32EeWaitSchedulerOrigin : u32
 	TwoPredicateRamLoop = 3,
 	RetainedUnconditionalLoop = 4,
 	GsCsrVsintLoop = 5,
+	DmacChcrStrPollLoop = 6,
 };
 
 struct VitaA32EeWaitSchedulerCertificate
@@ -245,8 +247,24 @@ struct VitaA32EeWaitSchedulerCertificate
 	u8 ram_range_count = 0;
 	u8 ram_write_observed = 0;
 	u8 reserved[2]{};
-	u32 ram_offset[2]{};
-	u32 ram_size[2]{};
+	union
+	{
+		struct
+		{
+			u32 ram_offset[2];
+			u32 ram_size[2];
+		};
+		// DMAC CHCR.STR polls do not watch EE RAM. These fields retain the
+		// complete structural loop contract across scheduler events without
+		// increasing this hot certificate's size.
+		struct
+		{
+			u32 mmio_fallthrough_pc;
+			u32 mmio_block_cycles;
+			u32 mmio_packed_poll;
+			u32 mmio_reserved;
+		};
+	};
 };
 static_assert(sizeof(VitaA32EeWaitSchedulerCertificate) == 24);
 
@@ -256,6 +274,8 @@ void VitaPublishA32EeRamWaitSchedulerCertificate(
 	VitaA32EeWaitSchedulerOrigin origin,
 	u32 guest_address_0, u32 size_0,
 	u32 guest_address_1 = 0, u32 size_1 = 0);
+void VitaPublishA32EeDmacChcrWaitSchedulerCertificate(
+	u32 fallthrough_pc, u32 block_cycles, u32 packed_poll);
 void VitaRepublishA32EeWaitSchedulerCertificate(
 	const VitaA32EeWaitSchedulerCertificate& certificate);
 const VitaA32EeWaitSchedulerCertificate*
@@ -358,6 +378,11 @@ VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats();
 #endif
 
 #if defined(VITASX2_QEMU_VALIDATION)
+// Exercise the product post-scheduler DMAC CHCR poll iteration without synthesizing
+// a complete persistent-dispatch frame. Return values match the internal
+// Direct/RepeatEvent/UncertifiedEvent decision in VitaCpuProviders.cpp.
+u32 VitaRunA32EeDmacChcrPollIterationAfterEventForValidation(
+	u32 loop_pc, const VitaA32EeWaitSchedulerCertificate& certificate);
 void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled);
 void VitaSetA32EePersistentBoundaryLimit(u64 limit);
 bool VitaDidA32EePersistentBoundaryHitLimit();

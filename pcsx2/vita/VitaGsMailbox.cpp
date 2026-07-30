@@ -810,6 +810,7 @@ namespace MTGS
 			EE_DEADLINE_DELTA(ee_wait_two_predicate_ram);
 			EE_DEADLINE_DELTA(ee_wait_retained_unconditional);
 			EE_DEADLINE_DELTA(ee_wait_gs_csr_vsint);
+			EE_DEADLINE_DELTA(ee_wait_dmac_chcr_str);
 			EE_DEADLINE_DELTA(joint_wait_shadow_entries);
 			EE_DEADLINE_DELTA(joint_wait_unknown_writer);
 			EE_DEADLINE_DELTA(joint_wait_blocked);
@@ -998,6 +999,7 @@ namespace MTGS
 				"Vita perf v=1 window=%llu kind=joint_wait_shadow "
 				"ee_wait=%llu generic_ram=%llu poll_call_ram=%llu "
 				"two_predicate_ram=%llu unconditional=%llu gs_csr=%llu "
+				"dmac_chcr_str=%llu "
 				"joint=%llu unknown_writer=%llu blocked=%llu qualified=%llu "
 				"horizon_gt_6144=%llu horizon_gt_12288=%llu "
 				"horizon_gt_24576=%llu ram_certified=%llu "
@@ -1013,6 +1015,8 @@ namespace MTGS
 				static_cast<unsigned long long>(
 					ee_wait_retained_unconditional),
 				static_cast<unsigned long long>(ee_wait_gs_csr_vsint),
+				static_cast<unsigned long long>(
+					ee_wait_dmac_chcr_str),
 				static_cast<unsigned long long>(joint_wait_shadow_entries),
 				static_cast<unsigned long long>(joint_wait_unknown_writer),
 				static_cast<unsigned long long>(joint_wait_blocked),
@@ -1723,6 +1727,7 @@ namespace MTGS
 			"boundary_guest_instructions=%llu direct_exits=%llu event_exits=%llu "
 			"cache_hits=%llu cache_misses=%llu lookup_hits=%llu fast_dispatch_hits=%llu "
 			"event_tests=%llu event_resumes=%llu event_refusals=%llu retained_wait_events=%llu "
+			"retained_dmac_chcr_poll_events=%llu "
 			"two_predicate_wait_ff=%llu invalidated_blocks=%llu failed_blocks=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(end.ee.compiled_blocks,
@@ -1752,6 +1757,9 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.retained_unconditional_wait_events,
 				start.ee.retained_unconditional_wait_events)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.retained_dmac_chcr_poll_events,
+				start.ee.retained_dmac_chcr_poll_events)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.two_predicate_wait_fast_forwards,
 				start.ee.two_predicate_wait_fast_forwards)),
