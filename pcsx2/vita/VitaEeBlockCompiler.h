@@ -27,6 +27,15 @@ namespace VitaEE
 	inline constexpr u32 RETAINED_UNCONDITIONAL_WAIT_EVENT_MASK = 0x80000000u;
 	inline constexpr u32 RETAINED_UNCONDITIONAL_WAIT_MAX_CYCLES = 0x7fffffffu;
 
+	// These preserve PCSX2's exact multi-block wait-loop phase at a scheduler
+	// boundary. The generated tail and the retained CPU0 event bridge share the
+	// same implementation so skipped redispatches cannot drift in PC/cycle
+	// placement.
+	u32 AdvancePollCallWaitFromPcToEvent(u32 start_pc, u32 packed_cycles,
+		u32 leaf_pc, u32 return_pc, u32 call_pc);
+	u32 AdvanceTwoPredicateWaitFromPcToEvent(u32 start_pc,
+		u32 prefix_cycles, u32 tail_cycles, u32 loop_pc, u32 tail_pc);
+
 	// Immutable code ranges consumed when a backward EE wait proof follows a
 	// static JAL into a pure load leaf. The loop block already owns its branch
 	// range; the executor attaches these disjoint ranges to the same recClear()

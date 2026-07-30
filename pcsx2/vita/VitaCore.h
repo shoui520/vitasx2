@@ -199,6 +199,8 @@ struct VitaA32EeProviderStats
 	u32 in_frame_event_resume_refusals = 0;
 	u32 retained_unconditional_wait_events = 0;
 	u32 retained_dmac_chcr_poll_events = 0;
+	u32 retained_ram_wait_events = 0;
+	u32 retained_ram_wait_write_exits = 0;
 	u32 first_interpreter_pc = 0;
 	u32 first_interpreter_opcode = 0;
 	u32 first_interpreter_reason = 0;
@@ -265,8 +267,25 @@ struct VitaA32EeWaitSchedulerCertificate
 			u32 mmio_reserved;
 		};
 	};
+	union
+	{
+		struct
+		{
+			u32 poll_packed_cycles;
+			u32 poll_leaf_pc;
+			u32 poll_return_pc;
+			u32 poll_call_pc;
+		};
+		struct
+		{
+			u32 predicate_prefix_cycles;
+			u32 predicate_tail_cycles;
+			u32 predicate_loop_pc;
+			u32 predicate_tail_pc;
+		};
+	};
 };
-static_assert(sizeof(VitaA32EeWaitSchedulerCertificate) == 24);
+static_assert(sizeof(VitaA32EeWaitSchedulerCertificate) == 40);
 
 void VitaPublishA32EeWaitSchedulerOrigin(
 	VitaA32EeWaitSchedulerOrigin origin);
@@ -274,6 +293,13 @@ void VitaPublishA32EeRamWaitSchedulerCertificate(
 	VitaA32EeWaitSchedulerOrigin origin,
 	u32 guest_address_0, u32 size_0,
 	u32 guest_address_1 = 0, u32 size_1 = 0);
+void VitaPublishA32EePollCallWaitSchedulerCertificate(
+	u32 guest_address, u32 packed_cycles,
+	u32 leaf_pc, u32 return_pc, u32 call_pc);
+void VitaPublishA32EeTwoPredicateWaitSchedulerCertificate(
+	u32 guest_address_0, u32 guest_address_1,
+	u32 prefix_cycles, u32 tail_cycles,
+	u32 loop_pc, u32 tail_pc);
 void VitaPublishA32EeDmacChcrWaitSchedulerCertificate(
 	u32 fallthrough_pc, u32 block_cycles, u32 packed_poll);
 void VitaRepublishA32EeWaitSchedulerCertificate(
@@ -281,6 +307,7 @@ void VitaRepublishA32EeWaitSchedulerCertificate(
 const VitaA32EeWaitSchedulerCertificate*
 VitaConsumeA32EeWaitSchedulerCertificate();
 void VitaFinishA32EeWaitSchedulerCertificate();
+bool VitaWasA32EeWaitSchedulerRamWriteObserved();
 
 #if defined(VITASX2_QEMU_VALIDATION)
 static constexpr u32 VITA_A32_EE_LINK_REJECTION_EDGE_COUNT = 16;
@@ -383,6 +410,9 @@ VitaA32EeProviderStats VitaGetA32EeSessionFallbackStats();
 // Direct/RepeatEvent/UncertifiedEvent decision in VitaCpuProviders.cpp.
 u32 VitaRunA32EeDmacChcrPollIterationAfterEventForValidation(
 	u32 loop_pc, const VitaA32EeWaitSchedulerCertificate& certificate);
+u32 VitaRunA32EeRamWaitIterationAfterEventForValidation(
+	u32 wait_pc, const VitaA32EeWaitSchedulerCertificate& certificate,
+	bool write_observed);
 void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled);
 void VitaSetA32EePersistentBoundaryLimit(u64 limit);
 bool VitaDidA32EePersistentBoundaryHitLimit();

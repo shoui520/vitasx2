@@ -545,20 +545,24 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP3 = 3;
 		constexpr unsigned HOST_TMP4 = 12;
 
-		__noinline u32 VitaEeAdvancePollCallWaitToEvent(u32 packed_cycles,
-			u32 leaf_pc, u32 return_pc, u32 call_pc)
+		u32 VitaEeAdvancePollCallWaitToEventCore(u32 start_pc,
+			u32 packed_cycles, u32 leaf_pc, u32 return_pc, u32 call_pc,
+			bool publish_certificate)
 		{
 			const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 				VitaPerformanceTelemetry::CpuStage::EeHelper);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-			const u32 leaf_load = memRead32(leaf_pc + sizeof(u32));
-			const u32 load_base = (leaf_load >> 21) & 0x1f;
-			const u32 load_address =
-				cpuRegs.GPR.r[load_base].UL[0] +
-				static_cast<s16>(leaf_load & 0xffffu);
-			VitaPublishA32EeRamWaitSchedulerCertificate(
-				VitaA32EeWaitSchedulerOrigin::PollCallRamLoop,
-				load_address, sizeof(u32));
+			if (publish_certificate)
+			{
+				const u32 leaf_load = memRead32(leaf_pc + sizeof(u32));
+				const u32 load_base = (leaf_load >> 21) & 0x1f;
+				const u32 load_address =
+					cpuRegs.GPR.r[load_base].UL[0] +
+					static_cast<s16>(leaf_load & 0xffffu);
+				VitaPublishA32EePollCallWaitSchedulerCertificate(
+					load_address, packed_cycles,
+					leaf_pc, return_pc, call_pc);
+			}
 #endif
 			// A static call and JR are separate PCSX2 BaseBlocks, and each owns
 			// iBranchTest(). Do not turn the multi-block loop into the subtly
@@ -573,10 +577,36 @@ namespace VitaEE
 				(packed_cycles >> (2 * POLL_CALL_CYCLE_BITS)) &
 				POLL_CALL_CYCLE_MASK;
 			const u32 loop_cycles = call_cycles + leaf_cycles + tail_cycles;
-			const u64 current = cpuRegs.cycle;
+			u64 current = cpuRegs.cycle;
 			const u64 next = cpuRegs.nextEventCycle;
 			if (loop_cycles == 0 || current >= next)
-				return call_pc;
+				return start_pc;
+
+			// A retained event can resume at any PCSX2 BaseBlock seam in this
+			// three-block loop. Consume the partial suffix first, then use the
+			// ordinary full-loop phase calculation from call_pc.
+			if (start_pc == leaf_pc)
+			{
+				current += leaf_cycles;
+				if (current >= next)
+				{
+					cpuRegs.cycle = current;
+					return return_pc;
+				}
+				start_pc = return_pc;
+			}
+			if (start_pc == return_pc)
+			{
+				current += tail_cycles;
+				if (current >= next)
+				{
+					cpuRegs.cycle = current;
+					return call_pc;
+				}
+				start_pc = call_pc;
+			}
+			if (start_pc != call_pc)
+				return start_pc;
 
 			// cpuSetNextEvent()/cpuTestCycle() bound the active scheduler window
 			// to signed-low-word distance. Retain a fail-closed exact-deadline
@@ -611,29 +641,39 @@ namespace VitaEE
 			return event_pc;
 		}
 
-		__noinline u32 VitaEeAdvanceTwoPredicateWaitToEvent(
-			u32 prefix_cycles, u32 tail_cycles, u32 loop_pc, u32 tail_pc)
+		__noinline u32 VitaEeAdvancePollCallWaitToEvent(u32 packed_cycles,
+			u32 leaf_pc, u32 return_pc, u32 call_pc)
+		{
+			return VitaEeAdvancePollCallWaitToEventCore(
+				call_pc, packed_cycles, leaf_pc, return_pc, call_pc, true);
+		}
+
+		u32 VitaEeAdvanceTwoPredicateWaitToEventCore(u32 start_pc,
+			u32 prefix_cycles, u32 tail_cycles, u32 loop_pc, u32 tail_pc,
+			bool publish_certificate)
 		{
 			const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 				VitaPerformanceTelemetry::CpuStage::EeHelper);
 #if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-			const u32 prefix_load = memRead32(loop_pc);
-			const bool masked_prefix =
-				(prefix_load >> 26) == 0x23 &&
-				(memRead32(loop_pc + sizeof(u32)) >> 26) == 0x0c;
-			const u32 tail_load_pc =
-				loop_pc + (masked_prefix ? 4u : 3u) * sizeof(u32);
-			const u32 tail_load = memRead32(tail_load_pc);
-			const u32 prefix_address =
-				cpuRegs.GPR.r[(prefix_load >> 21) & 0x1f].UL[0] +
-				static_cast<s16>(prefix_load & 0xffffu);
-			const u32 tail_address =
-				cpuRegs.GPR.r[(tail_load >> 21) & 0x1f].UL[0] +
-				static_cast<s16>(tail_load & 0xffffu);
-			VitaPublishA32EeRamWaitSchedulerCertificate(
-				VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop,
-				prefix_address, sizeof(u32),
-				tail_address, sizeof(u32));
+			if (publish_certificate)
+			{
+				const u32 prefix_load = memRead32(loop_pc);
+				const bool masked_prefix =
+					(prefix_load >> 26) == 0x23 &&
+					(memRead32(loop_pc + sizeof(u32)) >> 26) == 0x0c;
+				const u32 tail_load_pc =
+					loop_pc + (masked_prefix ? 4u : 3u) * sizeof(u32);
+				const u32 tail_load = memRead32(tail_load_pc);
+				const u32 prefix_address =
+					cpuRegs.GPR.r[(prefix_load >> 21) & 0x1f].UL[0] +
+					static_cast<s16>(prefix_load & 0xffffu);
+				const u32 tail_address =
+					cpuRegs.GPR.r[(tail_load >> 21) & 0x1f].UL[0] +
+					static_cast<s16>(tail_load & 0xffffu);
+				VitaPublishA32EeTwoPredicateWaitSchedulerCertificate(
+					prefix_address, tail_address,
+					prefix_cycles, tail_cycles, loop_pc, tail_pc);
+			}
 #endif
 			// PCSX2 owner: x86/ix86-32/iR5900.cpp::{recRecompile,
 			// iBranchTest}. Unlike a one-block s_nBlockFF loop, this proven
@@ -642,13 +682,26 @@ namespace VitaEE
 			// first seam which reaches nextEventCycle, preserving both the
 			// ordinary cycle overshoot and the PC which PCSX2 would publish.
 			const u32 loop_cycles = prefix_cycles + tail_cycles;
-			const u64 current = cpuRegs.cycle;
+			u64 current = cpuRegs.cycle;
 			const u64 next = cpuRegs.nextEventCycle;
 			if (prefix_cycles == 0 || tail_cycles == 0 ||
 				loop_cycles < prefix_cycles || current >= next)
 			{
-				return loop_pc;
+				return start_pc;
 			}
+
+			if (start_pc == tail_pc)
+			{
+				current += tail_cycles;
+				if (current >= next)
+				{
+					cpuRegs.cycle = current;
+					return loop_pc;
+				}
+				start_pc = loop_pc;
+			}
+			if (start_pc != loop_pc)
+				return start_pc;
 
 			const u64 delta64 = next - current;
 			// cpuSetNextEvent()/cpuTestCycle() bound the scheduler window to a
@@ -677,6 +730,14 @@ namespace VitaEE
 			cpuRegs.cycle =
 				current + static_cast<u64>(complete_loops + 1) * loop_cycles;
 			return loop_pc;
+		}
+
+		__noinline u32 VitaEeAdvanceTwoPredicateWaitToEvent(
+			u32 prefix_cycles, u32 tail_cycles, u32 loop_pc, u32 tail_pc)
+		{
+			return VitaEeAdvanceTwoPredicateWaitToEventCore(
+				loop_pc, prefix_cycles, tail_cycles,
+				loop_pc, tail_pc, true);
 		}
 
 		__noinline u32 VitaEeExecuteSignedCountdownLoop(u32 start_pc, u32 fallthrough_pc,
@@ -2877,6 +2938,21 @@ namespace VitaEE
 		}
 
 	} // namespace
+
+	u32 AdvancePollCallWaitFromPcToEvent(u32 start_pc, u32 packed_cycles,
+		u32 leaf_pc, u32 return_pc, u32 call_pc)
+	{
+		return VitaEeAdvancePollCallWaitToEventCore(
+			start_pc, packed_cycles, leaf_pc, return_pc, call_pc, false);
+	}
+
+	u32 AdvanceTwoPredicateWaitFromPcToEvent(u32 start_pc,
+		u32 prefix_cycles, u32 tail_cycles, u32 loop_pc, u32 tail_pc)
+	{
+		return VitaEeAdvanceTwoPredicateWaitToEventCore(
+			start_pc, prefix_cycles, tail_cycles,
+			loop_pc, tail_pc, false);
+	}
 
 	static_assert(GprOffset(31) + sizeof(GPR_reg) <= 0x0fff);
 	static_assert((GprOffset(0) % 16) == 0);

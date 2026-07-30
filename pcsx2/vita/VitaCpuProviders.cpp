@@ -53,6 +53,7 @@ static VitaIOP::BlockExecutor s_iop_a32_executor{true};
 static VitaA32EeWaitSchedulerCertificate s_ee_wait_scheduler_certificate;
 static VitaA32EeWaitSchedulerCertificate
 	s_active_ee_wait_scheduler_certificate;
+static bool s_last_ee_wait_scheduler_ram_write_observed = false;
 #if defined(__arm__)
 static uptr s_iop_wait_resume_event_context = 0;
 static uptr s_iop_wait_resume_event_target = 0;
@@ -889,6 +890,60 @@ enum class DmacChcrPollResumeResult : u32
 	UncertifiedEvent,
 };
 
+enum class RamWaitResumeResult : u32
+{
+	Direct,
+	RepeatEvent,
+	ObservedWrite,
+};
+
+static inline RamWaitResumeResult recRunRamWaitIterationAfterEvent(
+	u32 wait_pc, const VitaA32EeWaitSchedulerCertificate& certificate,
+	bool write_observed)
+{
+	const bool poll_call =
+		certificate.origin ==
+			VitaA32EeWaitSchedulerOrigin::PollCallRamLoop &&
+		certificate.ram_range_count == 1;
+	const bool two_predicate =
+		certificate.origin ==
+			VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop &&
+		certificate.ram_range_count == 2;
+	if ((!poll_call && !two_predicate) || cpuRegs.pc != wait_pc)
+		return RamWaitResumeResult::Direct;
+	if (write_observed || certificate.ram_write_observed != 0)
+		return RamWaitResumeResult::ObservedWrite;
+
+	const u64 cycle_before = cpuRegs.cycle;
+	u32 event_pc = wait_pc;
+	if (poll_call)
+	{
+		event_pc = VitaEE::AdvancePollCallWaitFromPcToEvent(
+			wait_pc,
+			certificate.poll_packed_cycles,
+			certificate.poll_leaf_pc,
+			certificate.poll_return_pc,
+			certificate.poll_call_pc);
+	}
+	else
+	{
+		event_pc = VitaEE::AdvanceTwoPredicateWaitFromPcToEvent(
+			wait_pc,
+			certificate.predicate_prefix_cycles,
+			certificate.predicate_tail_cycles,
+			certificate.predicate_loop_pc,
+			certificate.predicate_tail_pc);
+	}
+
+	// A valid retained iteration must reach a later scheduler seam. If a
+	// malformed recipe or already-due deadline makes no progress, return to
+	// generated code instead of spinning in the CPU0 event bridge.
+	if (cpuRegs.cycle <= cycle_before)
+		return RamWaitResumeResult::Direct;
+	cpuRegs.pc = event_pc;
+	return RamWaitResumeResult::RepeatEvent;
+}
+
 static inline DmacChcrPollResumeResult
 recRunDmacChcrPollIterationAfterEvent(
 	u32 loop_pc, const VitaA32EeWaitSchedulerCertificate& certificate)
@@ -943,7 +998,7 @@ recRunEeEventForGeneratedResumeCore(
 	const bool retain_unconditional_wait =
 		(event_token & VitaEE::RETAINED_UNCONDITIONAL_WAIT_EVENT_MASK) != 0;
 	const u32 wait_cycles = 0u - event_token;
-	const u32 wait_pc = cpuRegs.pc;
+	u32 wait_pc = cpuRegs.pc;
 	VitaA32EeWaitSchedulerCertificate wait_certificate{};
 	if (retain_unconditional_wait)
 	{
@@ -958,6 +1013,8 @@ recRunEeEventForGeneratedResumeCore(
 	u32 event_tests = 0;
 	u32 retained_events = 0;
 	u32 retained_dmac_chcr_poll_events = 0;
+	u32 retained_ram_wait_events = 0;
+	u32 retained_ram_wait_write_exits = 0;
 	bool resume = false;
 	for (;;)
 	{
@@ -984,6 +1041,22 @@ recRunEeEventForGeneratedResumeCore(
 		resume = recCanResumeGeneratedEeAfterEvent();
 		if (!resume)
 		{
+			break;
+		}
+
+		const RamWaitResumeResult ram_wait_result =
+			recRunRamWaitIterationAfterEvent(
+				wait_pc, wait_certificate,
+				VitaWasA32EeWaitSchedulerRamWriteObserved());
+		if (ram_wait_result == RamWaitResumeResult::RepeatEvent)
+		{
+			wait_pc = cpuRegs.pc;
+			retained_ram_wait_events++;
+			continue;
+		}
+		if (ram_wait_result == RamWaitResumeResult::ObservedWrite)
+		{
+			retained_ram_wait_write_exits++;
 			break;
 		}
 
@@ -1036,6 +1109,10 @@ recRunEeEventForGeneratedResumeCore(
 		s_ee_a32_stats.retained_unconditional_wait_events += retained_events;
 		s_ee_a32_stats.retained_dmac_chcr_poll_events +=
 			retained_dmac_chcr_poll_events;
+		s_ee_a32_stats.retained_ram_wait_events +=
+			retained_ram_wait_events;
+		s_ee_a32_stats.retained_ram_wait_write_exits +=
+			retained_ram_wait_write_exits;
 		if (!resume)
 			s_ee_a32_stats.in_frame_event_resume_refusals++;
 	}
@@ -1865,6 +1942,7 @@ void VitaResetA32EeProviderStats()
 	s_ee_a32_stats = {};
 	s_ee_wait_scheduler_certificate = {};
 	s_active_ee_wait_scheduler_certificate = {};
+	s_last_ee_wait_scheduler_ram_write_observed = false;
 #if defined(VITASX2_QEMU_VALIDATION)
 	s_ee_a32_executor.ResetDirectLinkRejectionProfile();
 	s_ee_a32_persistent_boundaries = 0;
@@ -1879,7 +1957,7 @@ void VitaPublishA32EeWaitSchedulerOrigin(
 	s_ee_wait_scheduler_certificate.origin = origin;
 }
 
-void VitaPublishA32EeRamWaitSchedulerCertificate(
+static void PublishA32EeRamWaitSchedulerCertificate(
 	VitaA32EeWaitSchedulerOrigin origin,
 	u32 guest_address_0, u32 size_0,
 	u32 guest_address_1, u32 size_1)
@@ -1931,6 +2009,44 @@ void VitaPublishA32EeRamWaitSchedulerCertificate(
 	}
 }
 
+void VitaPublishA32EeRamWaitSchedulerCertificate(
+	VitaA32EeWaitSchedulerOrigin origin,
+	u32 guest_address_0, u32 size_0,
+	u32 guest_address_1, u32 size_1)
+{
+	PublishA32EeRamWaitSchedulerCertificate(
+		origin, guest_address_0, size_0, guest_address_1, size_1);
+}
+
+void VitaPublishA32EePollCallWaitSchedulerCertificate(
+	u32 guest_address, u32 packed_cycles,
+	u32 leaf_pc, u32 return_pc, u32 call_pc)
+{
+	PublishA32EeRamWaitSchedulerCertificate(
+		VitaA32EeWaitSchedulerOrigin::PollCallRamLoop,
+		guest_address, sizeof(u32), 0, 0);
+	s_ee_wait_scheduler_certificate.poll_packed_cycles = packed_cycles;
+	s_ee_wait_scheduler_certificate.poll_leaf_pc = leaf_pc;
+	s_ee_wait_scheduler_certificate.poll_return_pc = return_pc;
+	s_ee_wait_scheduler_certificate.poll_call_pc = call_pc;
+}
+
+void VitaPublishA32EeTwoPredicateWaitSchedulerCertificate(
+	u32 guest_address_0, u32 guest_address_1,
+	u32 prefix_cycles, u32 tail_cycles,
+	u32 loop_pc, u32 tail_pc)
+{
+	PublishA32EeRamWaitSchedulerCertificate(
+		VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop,
+		guest_address_0, sizeof(u32),
+		guest_address_1, sizeof(u32));
+	s_ee_wait_scheduler_certificate.predicate_prefix_cycles =
+		prefix_cycles;
+	s_ee_wait_scheduler_certificate.predicate_tail_cycles = tail_cycles;
+	s_ee_wait_scheduler_certificate.predicate_loop_pc = loop_pc;
+	s_ee_wait_scheduler_certificate.predicate_tail_pc = tail_pc;
+}
+
 void VitaPublishA32EeDmacChcrWaitSchedulerCertificate(
 	u32 fallthrough_pc, u32 block_cycles, u32 packed_poll)
 {
@@ -1951,6 +2067,7 @@ void VitaRepublishA32EeWaitSchedulerCertificate(
 const VitaA32EeWaitSchedulerCertificate*
 VitaConsumeA32EeWaitSchedulerCertificate()
 {
+	s_last_ee_wait_scheduler_ram_write_observed = false;
 	s_active_ee_wait_scheduler_certificate =
 		s_ee_wait_scheduler_certificate;
 	s_ee_wait_scheduler_certificate = {};
@@ -1959,7 +2076,14 @@ VitaConsumeA32EeWaitSchedulerCertificate()
 
 void VitaFinishA32EeWaitSchedulerCertificate()
 {
+	s_last_ee_wait_scheduler_ram_write_observed =
+		s_active_ee_wait_scheduler_certificate.ram_write_observed != 0;
 	s_active_ee_wait_scheduler_certificate = {};
+}
+
+bool VitaWasA32EeWaitSchedulerRamWriteObserved()
+{
+	return s_last_ee_wait_scheduler_ram_write_observed;
 }
 
 VitaA32EeProviderStats VitaGetA32EeProviderStats()
@@ -2057,6 +2181,15 @@ u32 VitaRunA32EeDmacChcrPollIterationAfterEventForValidation(
 {
 	return static_cast<u32>(
 		recRunDmacChcrPollIterationAfterEvent(loop_pc, certificate));
+}
+
+u32 VitaRunA32EeRamWaitIterationAfterEventForValidation(
+	u32 wait_pc, const VitaA32EeWaitSchedulerCertificate& certificate,
+	bool write_observed)
+{
+	return static_cast<u32>(
+		recRunRamWaitIterationAfterEvent(
+			wait_pc, certificate, write_observed));
 }
 
 void VitaSetA32EeLinkRejectionProfileEnabled(bool enabled)

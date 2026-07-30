@@ -1860,6 +1860,7 @@ namespace MTGS
 			"cache_hits=%llu cache_misses=%llu lookup_hits=%llu fast_dispatch_hits=%llu "
 			"event_tests=%llu event_resumes=%llu event_refusals=%llu retained_wait_events=%llu "
 			"retained_dmac_chcr_poll_events=%llu "
+			"retained_ram_wait_events=%llu retained_ram_wait_write_exits=%llu "
 			"two_predicate_wait_ff=%llu invalidated_blocks=%llu failed_blocks=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(end.ee.compiled_blocks,
@@ -1892,6 +1893,12 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.retained_dmac_chcr_poll_events,
 				start.ee.retained_dmac_chcr_poll_events)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.retained_ram_wait_events,
+				start.ee.retained_ram_wait_events)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.retained_ram_wait_write_exits,
+				start.ee.retained_ram_wait_write_exits)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.two_predicate_wait_fast_forwards,
 				start.ee.two_predicate_wait_fast_forwards)),
