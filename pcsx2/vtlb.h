@@ -334,22 +334,6 @@ enum VitaEeWordCopyResult : u32
 u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
 	u32 packed_cycles, u32 packed_guests);
 
-enum VitaEeSignedHalfwordBytePackResult : u32
-{
-	VITA_EE_SIGNED_HALFWORD_BYTE_PACK_COMPLETE = 0,
-	VITA_EE_SIGNED_HALFWORD_BYTE_PACK_SELF = 1,
-	VITA_EE_SIGNED_HALFWORD_BYTE_PACK_EVENT = 2,
-	VITA_EE_SIGNED_HALFWORD_BYTE_PACK_REDISPATCH = 3,
-};
-
-// Executes the exact one- or two-source signed-halfword clamp,
-// four-PPACB/four-SQ conversion loops recognized by VitaEE::BlockCompiler.
-// The two-source form performs wrapping PADDH before the clamp. Direct pages
-// batch to the counter, page, or event seam. Observable mappings execute one
-// complete, architecturally ordered iteration.
-u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
-	u32 packed_guests0, u32 packed_guests1);
-
 // --------------------------------------------------------------------------------------
 //  Goemon game fix
 // --------------------------------------------------------------------------------------
