@@ -783,6 +783,14 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	if (!vmFreeze() || !FreezeTag("cpuRegs"))
 		return false;
 
+	if (IsSaving())
+	{
+		// Count stays affine while Status.IM7 is clear. A savestate is a real
+		// architectural observer, so materialize it at the current EE cycle
+		// before serializing cpuRegs.
+		COP0_UpdateCount();
+	}
+
 	if (IsPortableReplay() && IsSaving())
 	{
 		// MachineCheckpointTrace.cpp::CaptureRecord() owns this cross-provider

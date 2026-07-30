@@ -809,16 +809,17 @@ static __fi bool _cpuTestInterrupts()
 
 static __fi void _cpuTestTIMR()
 {
-	cpuRegs.CP0.n.Count += cpuRegs.cycle - cpuRegs.lastCOP0Cycle;
-	cpuRegs.lastCOP0Cycle = cpuRegs.cycle;
-
 	// fixme: this looks like a hack to make up for the fact that the TIMR
 	// doesn't yet have a proper mechanism for setting itself up on a nextEventCycle.
 	// A proper fix would schedule the TIMR to trigger at a specific cycle anytime
 	// the Count or Compare registers are modified.
 
-	if ( (cpuRegs.CP0.n.Status.val & 0x8000) &&
-		cpuRegs.CP0.n.Count >= cpuRegs.CP0.n.Compare && cpuRegs.CP0.n.Count < cpuRegs.CP0.n.Compare+1000 )
+	if (!(cpuRegs.CP0.n.Status.val & 0x8000))
+		return;
+
+	COP0_UpdateCount();
+	if (cpuRegs.CP0.n.Count >= cpuRegs.CP0.n.Compare &&
+		cpuRegs.CP0.n.Count < cpuRegs.CP0.n.Compare + 1000)
 	{
 		Console.WriteLn( Color_Magenta, "timr intr: %x, %x", cpuRegs.CP0.n.Count, cpuRegs.CP0.n.Compare);
 		cpuException(0x808000, cpuRegs.branch);

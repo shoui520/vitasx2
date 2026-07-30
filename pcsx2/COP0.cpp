@@ -34,6 +34,13 @@ void WriteCP0Config(u32 value)
 	cpuRegs.CP0.n.Config |= 0x440;
 }
 
+void COP0_UpdateCount()
+{
+	cpuRegs.CP0.n.Count +=
+		static_cast<u32>(cpuRegs.cycle - cpuRegs.lastCOP0Cycle);
+	cpuRegs.lastCOP0Cycle = cpuRegs.cycle;
+}
+
 //////////////////////////////////////////////////////////////////////////////////////////
 // Performance Counters Update Stuff!
 //

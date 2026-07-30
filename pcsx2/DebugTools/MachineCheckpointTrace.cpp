@@ -4,6 +4,7 @@
 #include "DebugTools/MachineCheckpointTrace.h"
 
 #include "Common.h"
+#include "COP0.h"
 #include "Counters.h"
 #include "DebugTools/CoreEventTrace.h"
 #include "DebugTools/GsTrace.h"
@@ -835,6 +836,12 @@ namespace Pcsx2Trace
 
 		void CaptureRecord(MachineCheckpointTraceRecord& record, u32 trigger)
 		{
+#if defined(VITASX2_VITA)
+			// Vita leaves Count affine while the timer mask is clear.
+			// Checkpoints are architectural observations and must project the
+			// same materialized CP0 state as the PCSX2 oracle.
+			COP0_UpdateCount();
+#endif
 			record = {};
 			record.index = s_records_written;
 			record.vu1_completion_ordinal = s_last_completion_ordinal;
