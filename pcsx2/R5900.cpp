@@ -975,7 +975,8 @@ static __fi void VitaRecordEeDeadlineHorizon(
 // Shared portion of the branch test, called from both the Interpreter
 // and the recompiler.  (moved here to help alleviate redundant code)
 #if defined(__arm__)
-extern "C" __attribute__((noinline, target("arm,general-regs-only")))
+extern "C" __attribute__((noinline, no_stack_protector,
+	target("arm,general-regs-only")))
 void VitaCpuEventTestSharedPrivateBody()
 #else
 __fi void _cpuEventTest_Shared()
@@ -1324,10 +1325,12 @@ __attribute__((naked, noinline, target("arm"))) void _cpuEventTest_Shared()
 {
 	asm volatile(
 		// Cold AAPCS adapter for the interpreter, diagnostics, and callable EE
-		// paths which do not already own a full private frame.
+		// paths which do not already own a full private frame. Enter the body
+		// normally here so a future compiler-prologue change cannot make this
+		// fallback depend on the private entry's verified PUSH shape.
 		"push {r4-r11, lr}\n"
 		"sub sp, sp, #4\n"
-		"bl VitaCpuEventTestSharedPrivate\n"
+		"bl VitaCpuEventTestSharedPrivateBody\n"
 		"add sp, sp, #4\n"
 		"pop {r4-r11, pc}\n");
 }
