@@ -56,6 +56,10 @@ namespace VitaPerformanceTelemetry
 		Spu2Core,
 		Spu2Reverb,
 		Spu2Output,
+		IpuDecode,
+		IpuIdct,
+		IpuCsc,
+		IpuDma,
 #endif
 		IopInterpreter,
 		Cop1,
@@ -89,9 +93,9 @@ namespace VitaPerformanceTelemetry
 	// this profiler-only storage tied to that owning enum with a static assert.
 	static constexpr size_t EE_DEADLINE_EVENT_SLOT_COUNT = 21;
 	// PES currently produces about 214 records per 120-VSync measurement
-	// window at the 1/1024 cadence. 384 widened records retain a complete
-	// ordinary window while keeping fixed interval storage at 96 KiB.
-	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 384;
+	// window at the 1/1024 cadence. 352 widened records retain a complete
+	// ordinary window while keeping fixed interval storage below 96 KiB.
+	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 352;
 	static constexpr size_t CPU_PROFILE_HOT_EDGE_COUNT = 8;
 	static constexpr size_t CPU_PROFILE_HOT_IOP_PC_COUNT = 8;
 

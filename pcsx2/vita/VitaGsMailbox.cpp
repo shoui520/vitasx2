@@ -1302,6 +1302,20 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::IopHelper)),
 				static_cast<unsigned long long>(stage_time(
 					VitaPerformanceTelemetry::CpuStage::IopMemorySlowPath)));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_stage_ipu "
+				"decode=%llu idct=%llu csc=%llu dma=%llu residual=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IpuDecode)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IpuIdct)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IpuCsc)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::IpuDma)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::Ipu)));
 			std::array<u64,
 				VitaPerformanceTelemetry::CPU_STAGE_COUNT>
 				statistical_stage_samples{};
@@ -1451,6 +1465,21 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::IopHelper)),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::IopMemorySlowPath)));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu "
+				"kind=cpu_stage_statistical_ipu "
+				"decode=%llu idct=%llu csc=%llu dma=%llu residual=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IpuDecode)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IpuIdct)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IpuCsc)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::IpuDma)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::Ipu)));
 			const u64 ee_compile_observations = CounterDelta(
 				end.cpu_stage_profiler.ee_compile_observations,
 				start.cpu_stage_profiler.ee_compile_observations);

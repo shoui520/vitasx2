@@ -651,6 +651,7 @@ static __fi VitaPerformanceTelemetry::CpuStage VitaEeEventProfileStage(u8 event)
 			return VitaPerformanceTelemetry::CpuStage::Sif;
 		case DMAC_FROM_IPU:
 		case DMAC_TO_IPU:
+			return VitaPerformanceTelemetry::CpuStage::IpuDma;
 		case IPU_PROCESS:
 			return VitaPerformanceTelemetry::CpuStage::Ipu;
 		case DMAC_FROM_SPR:
