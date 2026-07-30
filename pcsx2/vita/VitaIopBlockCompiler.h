@@ -623,6 +623,10 @@ namespace VitaIOP
 		u32 m_source_page_literal_instructions_removed = 0;
 		u32 m_isolate_cache_guard_instructions_removed = 0;
 		u32 m_pinned_gpr_min_exit_savings = UINT32_MAX;
+		// A dynamic MULT/MULTU result can remain in caller-clobbered r3 until a
+		// lowering which may overwrite it. Architectural LO is still published
+		// immediately, so every helper, exception and linked exit remains exact.
+		bool m_retained_lo_host_valid = false;
 		std::vector<size_t>* m_direct_exit_branches = nullptr;
 		std::vector<size_t>* m_budget_exit_branches = nullptr;
 		std::vector<size_t>* m_unflushed_budget_exit_branches = nullptr;
@@ -727,6 +731,7 @@ namespace VitaIOP
 #endif
 		static void SetTrustedSourceAuditEnabled(bool enabled);
 		static void SetPinnedGprResidencyEnabled(bool enabled);
+		static void SetRetainedLoForwardingEnabled(bool enabled);
 		static void SetPinnedBranchDirectCompareEnabled(bool enabled);
 		static void SetConditionCodeBranchEnabled(bool enabled);
 		static void SetProducerBranchFlagsEnabled(bool enabled);

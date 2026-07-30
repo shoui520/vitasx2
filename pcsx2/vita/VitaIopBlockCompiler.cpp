@@ -75,6 +75,7 @@ u32 g_qemuIopConstDivideOperandFastPaths = 0;
 u32 g_qemuIopConstRegisterJumpFastPaths = 0;
 u32 g_qemuIopConstCop0WriteFastPaths = 0;
 u32 g_qemuIopConstCop2WriteFastPaths = 0;
+u32 g_qemuIopRetainedLoReadFastPaths = 0;
 struct QemuIopLinkedFrameEvidence
 {
 	u32 entries = 0;
@@ -88,6 +89,7 @@ static u32 s_qemuIopBranchEventBudgetPositive = 0;
 static u32 s_qemuIopBranchEventTestsEntered = 0;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
 static bool s_qemuIopPinnedGprResidencyEnabled = true;
+static bool s_qemuIopRetainedLoForwardingEnabled = true;
 static bool s_qemuIopPinnedBranchDirectCompareEnabled = true;
 static bool s_qemuIopConditionCodeBranchEnabled = true;
 static bool s_qemuIopProducerBranchFlagsEnabled = true;
@@ -278,6 +280,66 @@ namespace
 		// mode on the interpreter's one-cycle timeline while product execution uses
 		// the x86 recompiler timing model above.
 		return interpreter_trace ? 1u : IopRecompilerInstructionCycles(op);
+	}
+
+	constexpr bool IopInstructionPreservesRetainedLoHost(u32 op)
+	{
+		// r3 is caller-clobbered, but these native scalar templates use only
+		// r0-r2. Keeping a just-produced LO there is therefore exact until an
+		// instruction outside this deliberately narrow set is reached. Memory,
+		// control, COP and helper paths fail closed because their cold arms or
+		// lowering details can overwrite r3.
+		switch (op >> 26)
+		{
+			case 0x00:
+				switch (op & 0x3f)
+				{
+					case 0x00: // SLL (including NOP)
+					case 0x02: // SRL
+					case 0x03: // SRA
+					case 0x04: // SLLV
+					case 0x06: // SRLV
+					case 0x07: // SRAV
+					case 0x10: // MFHI
+					case 0x11: // MTHI
+					case 0x12: // MFLO
+					case 0x20: // ADD
+					case 0x21: // ADDU
+					case 0x22: // SUB
+					case 0x23: // SUBU
+					case 0x24: // AND
+					case 0x25: // OR
+					case 0x26: // XOR
+					case 0x27: // NOR
+					case 0x2a: // SLT
+					case 0x2b: // SLTU
+						return true;
+					default:
+						return false;
+				}
+			case 0x08: // ADDI
+			case 0x09: // ADDIU
+			case 0x0a: // SLTI
+			case 0x0b: // SLTIU
+			case 0x0c: // ANDI
+			case 0x0d: // ORI
+			case 0x0e: // XORI
+			case 0x0f: // LUI
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	bool RetainedLoForwardingEnabled()
+	{
+#if defined(VITASX2_IOP_RETAINED_LO_CONTROL)
+		return false;
+#elif defined(VITASX2_QEMU_VALIDATION)
+		return s_qemuIopRetainedLoForwardingEnabled;
+#else
+		return true;
+#endif
 	}
 
 	enum class IopRecSourceKind : u8
@@ -3775,6 +3837,7 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitMultiplyOp(u32 op, bool is_signed)
 	{
+		m_retained_lo_host_valid = false;
 		u32 known_rs = 0;
 		u32 known_rt = 0;
 		if (TryGetKnownGpr(RS(op), &known_rs) && TryGetKnownGpr(RT(op), &known_rt))
@@ -3808,11 +3871,16 @@ namespace VitaIOP
 #endif
 			if (known_value == 0)
 			{
-				return m_code.EmitMovImm8(HOST_TMP2, 0) &&
-				       m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS,
-						   static_cast<u16>(LO_OFFSET)) &&
-				       m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS,
-						   static_cast<u16>(HI_OFFSET));
+				const bool retain_lo = RetainedLoForwardingEnabled();
+				const unsigned zero_host = retain_lo ? HOST_TMP3 : HOST_TMP2;
+				const bool emitted =
+					m_code.EmitMovImm8(zero_host, 0) &&
+					m_code.EmitStrImm12(zero_host, HOST_PSX_REGS,
+						static_cast<u16>(LO_OFFSET)) &&
+					m_code.EmitStrImm12(zero_host, HOST_PSX_REGS,
+						static_cast<u16>(HI_OFFSET));
+				m_retained_lo_host_valid = emitted && retain_lo;
+				return emitted;
 			}
 
 			if (!EmitLoadGpr(dynamic_reg, HOST_TMP0) ||
@@ -3821,21 +3889,27 @@ namespace VitaIOP
 				return false;
 			}
 
+			const bool retain_lo = RetainedLoForwardingEnabled();
+			const unsigned lo_host = retain_lo ? HOST_TMP3 : HOST_TMP2;
+			const unsigned hi_host = retain_lo ? HOST_TMP2 : HOST_TMP3;
 			if (is_signed)
 			{
-				if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+				if (!m_code.EmitSmull(lo_host, hi_host, HOST_TMP0, HOST_TMP1))
 					return false;
 			}
 			else
 			{
-				if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+				if (!m_code.EmitUmull(lo_host, hi_host, HOST_TMP0, HOST_TMP1))
 					return false;
 			}
 
-			return m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS,
-					   static_cast<u16>(LO_OFFSET)) &&
-			       m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS,
-					   static_cast<u16>(HI_OFFSET));
+			const bool emitted =
+				m_code.EmitStrImm12(lo_host, HOST_PSX_REGS,
+					static_cast<u16>(LO_OFFSET)) &&
+				m_code.EmitStrImm12(hi_host, HOST_PSX_REGS,
+					static_cast<u16>(HI_OFFSET));
+			m_retained_lo_host_valid = emitted && retain_lo;
+			return emitted;
 		}
 
 		if (!EmitLoadGpr(RS(op), HOST_TMP0) || !EmitLoadGpr(RT(op), HOST_TMP1))
@@ -3843,21 +3917,27 @@ namespace VitaIOP
 			return false;
 		}
 
+		const bool retain_lo = RetainedLoForwardingEnabled();
+		const unsigned lo_host = retain_lo ? HOST_TMP3 : HOST_TMP2;
+		const unsigned hi_host = retain_lo ? HOST_TMP2 : HOST_TMP3;
 		if (is_signed)
 		{
-			if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+			if (!m_code.EmitSmull(lo_host, hi_host, HOST_TMP0, HOST_TMP1))
 				return false;
 		}
 		else
 		{
-			if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
+			if (!m_code.EmitUmull(lo_host, hi_host, HOST_TMP0, HOST_TMP1))
 				return false;
 		}
 
-		return m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS,
-				   static_cast<u16>(LO_OFFSET)) &&
-		       m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS,
-				   static_cast<u16>(HI_OFFSET));
+		const bool emitted =
+			m_code.EmitStrImm12(lo_host, HOST_PSX_REGS,
+				static_cast<u16>(LO_OFFSET)) &&
+			m_code.EmitStrImm12(hi_host, HOST_PSX_REGS,
+				static_cast<u16>(HI_OFFSET));
+		m_retained_lo_host_valid = emitted && retain_lo;
+		return emitted;
 	}
 
 	bool BlockCompiler::EmitDivideOp(u32 op, bool is_signed)
@@ -6703,6 +6783,13 @@ namespace VitaIOP
 					return m_code.EmitMovImm32(HOST_TMP0, known_lo) &&
 						   EmitStoreGpr(RD(op), HOST_TMP0);
 				}
+				if (RD(op) != 0 && m_retained_lo_host_valid)
+				{
+#if defined(VITASX2_QEMU_VALIDATION)
+					++g_qemuIopRetainedLoReadFastPaths;
+#endif
+					return EmitStoreGpr(RD(op), HOST_TMP3);
+				}
 				return EmitMoveGpr(RD(op), 33);
 			}
 			case 0x13: // MTLO
@@ -7306,6 +7393,7 @@ namespace VitaIOP
 		m_branch_predicate_producer_true_condition = VitaA32::Condition::AL;
 		m_register_jump_target_known = false;
 		m_register_jump_target = 0;
+		m_retained_lo_host_valid = false;
 		bool sequential_qword_copy_enabled =
 			!VitaIsIopPreInstructionTraceEnabled() &&
 			m_isolate_cache_specialization && m_isolate_cache_guard_stable &&
@@ -7457,6 +7545,16 @@ namespace VitaIOP
 		{
 			const u32 pc = start_pc + i * 4;
 			const u32 op = iopMemRead32(pc);
+			// A nondeferred instruction first calls EmitAddCycles(), whose
+			// large-offset form may use r3 even when the opcode's own native
+			// template does not. Trace callbacks are calls and therefore also
+			// terminate the caller-clobbered lifetime.
+			if (m_retained_lo_host_valid &&
+				(!m_defer_cycle_updates || m_emit_trace_checks ||
+					!IopInstructionPreservesRetainedLoHost(op)))
+			{
+				m_retained_lo_host_valid = false;
+			}
 			const u32 delay_op = (i + 1 < instruction_count) ? iopMemRead32(pc + 4) : 0;
 			const u32 following_op =
 				(i + 2 < instruction_count) ? iopMemRead32(pc + 8) : 0;
@@ -8328,6 +8426,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopPinnedGprResidencyEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetRetainedLoForwardingEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopRetainedLoForwardingEnabled = enabled;
 #else
 		(void)enabled;
 #endif

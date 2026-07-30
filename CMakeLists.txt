@@ -80,6 +80,10 @@ option(VITASX2_IOP_RESIDENT_GPR_CONTROL
 	"Diagnostic control: publish and reload pinned IOP GPRs at every linked block edge."
 	OFF)
 
+option(VITASX2_IOP_RETAINED_LO_CONTROL
+	"Diagnostic control: reload IOP LO for MFLO instead of forwarding a live multiply result."
+	OFF)
+
 option(VITASX2_SILENT_HSYNC_FOLD_CONTROL
 	"Diagnostic control: retain every HSync scheduler boundary while both processors hold exact wait certificates."
 	OFF)
