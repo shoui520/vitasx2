@@ -7,6 +7,7 @@
 #include "pcsx2/HostMemoryMap.h"
 #include "pcsx2/MemoryTypes.h"
 #include "pcsx2/vita/A32Emitter.h"
+#include "pcsx2/vita/VitaRegionContract.h"
 
 #include <array>
 #include <bitset>
@@ -172,6 +173,8 @@ namespace VitaIOP
 		u64 linked_frame_bypass_entries;
 		u64 linked_frame_instructions_removed;
 		u64 linked_frame_stack_words_removed;
+		u64 resident_prelude_links;
+		u64 resident_prelude_setup_instructions_removed;
 		u64 sequential_qword_copy_fast_paths;
 		u64 sequential_qword_copy_instructions_removed;
 		u64 private_dispatcher_calls;
@@ -282,6 +285,8 @@ namespace VitaIOP
 		u16 fragment_index = 0;
 		bool valid = false;
 		bool logical_continuation = false;
+		bool resident_entry_active = false;
+		u8 resident_setup_instructions_removed = 0;
 	};
 
 	struct DirectLinkSlots
@@ -308,7 +313,10 @@ namespace VitaIOP
 			bool test_fallthrough_budget = true, bool allow_entry_gate = true,
 			bool inherited_isolate_write = false, u32 logical_cycle_prefix = 0,
 			u32 logical_cycle_total = 0, bool fragmented_logical_block = false,
-			bool logical_continuation_tail = false);
+			bool logical_continuation_tail = false,
+			size_t* resident_entry_offset = nullptr,
+			VitaRegion::EntryContract* resident_entry_contract = nullptr,
+			u8* resident_setup_instruction_count = nullptr);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 		bool UsesCompiledPs1BiosGate() const { return m_compiled_ps1_bios_gate; }
@@ -340,6 +348,10 @@ namespace VitaIOP
 			return m_batched_cycle_stack_words_removed;
 		}
 		bool UsesExpandedCycleBatching() const { return m_expanded_cycle_batching; }
+		const VitaRegion::EntryContract& ResidentEntryContract() const
+		{
+			return m_resident_entry_contract;
+		}
 		u16 SavedRegisters() const { return m_saved_registers; }
 		u8 StackFrameSize() const { return m_stack_frame_size; }
 		u32 PinnedGprMemoryOpsSaved() const { return m_pinned_gpr_memory_ops_saved; }
@@ -378,7 +390,8 @@ namespace VitaIOP
 
 	private:
 		bool BeginBlock(u32 start_pc, size_t* linked_entry_offset,
-			size_t* provider_entry_offset);
+			size_t* provider_entry_offset, size_t* resident_entry_offset,
+			u8* resident_setup_instruction_count);
 		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true,
 			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockIsolateModeWriteReturn(bool charge_budget = true,
@@ -610,6 +623,7 @@ namespace VitaIOP
 		u32 m_current_cycle_count = 0;
 		u32 m_logical_cycle_prefix = 0;
 		u32 m_budget_cycle_count = 0;
+		VitaRegion::EntryContract m_resident_entry_contract{};
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
@@ -705,6 +719,7 @@ namespace VitaIOP
 		static void SetSavedRegisterNarrowingEnabled(bool enabled);
 		static void SetBlockCycleBatchingEnabled(bool enabled);
 		static void SetLinkedFrameBypassEnabled(bool enabled);
+		static void SetResidentPreludeLinksEnabled(bool enabled);
 		static void SetSequentialQwordCopyEnabled(bool enabled);
 		static void SetBranchTestSchedulingEnabled(bool enabled);
 		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
@@ -802,12 +817,15 @@ namespace VitaIOP
 		{
 			CachedBlock* next_free = nullptr;
 			struct CodeFragment
-		{
-			VitaA32::CodeBuffer code;
+			{
+				VitaA32::CodeBuffer code;
 				u32 start_pc = 0;
 				u32 instruction_count = 0;
 				size_t linked_entry_offset = 0;
 				size_t provider_entry_offset = 0;
+				size_t resident_entry_offset = 0;
+				VitaRegion::EntryContract resident_entry_contract{};
+				u8 resident_setup_instruction_count = 0;
 			};
 
 			// Keep the overwhelmingly common <=64-opcode/single-fragment block
@@ -1238,6 +1256,7 @@ namespace VitaIOP
 		inline __attribute__((always_inline)) CachedBlock*
 		FindSchedulerDirectResumeBlock(u32* dispatch_flags);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
+		const void* ResidentEntryPoint(const CachedBlock& block) const;
 		const void* ProviderEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link,
 			CachedBlock* target);

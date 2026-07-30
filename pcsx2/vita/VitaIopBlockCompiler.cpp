@@ -98,6 +98,7 @@ static bool s_qemuIopClockModeSpecializationEnabled = true;
 static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
 static bool s_qemuIopLinkedFrameBypassEnabled = true;
+static bool s_qemuIopResidentPreludeLinksEnabled = true;
 static bool s_qemuIopSequentialQwordCopyEnabled = true;
 static bool s_qemuIopBranchTestSchedulingEnabled = true;
 static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
@@ -1364,12 +1365,17 @@ namespace VitaIOP
 	}
 
 	bool BlockCompiler::BeginBlock(u32 start_pc, size_t* linked_entry_offset,
-		size_t* provider_entry_offset)
+		size_t* provider_entry_offset, size_t* resident_entry_offset,
+		u8* resident_setup_instruction_count)
 	{
 		if (linked_entry_offset)
 			*linked_entry_offset = 0;
 		if (provider_entry_offset)
 			*provider_entry_offset = 0;
+		if (resident_entry_offset)
+			*resident_entry_offset = 0;
+		if (resident_setup_instruction_count)
+			*resident_setup_instruction_count = 0;
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
 		m_unaligned_read_cold_tails.clear();
@@ -1382,6 +1388,29 @@ namespace VitaIOP
 		m_iop_cycle_base_register_available = !m_iop_ram_mask_register_available &&
 		                                      !m_emit_trace_checks &&
 		                                      !m_defer_cycle_updates;
+		m_resident_entry_contract = {};
+		// Nondeferred validation controls snapshot the target's entry cycle at
+		// [sp, #0]. That value is block-local and cannot be inherited from a
+		// predecessor, so they deliberately have no resident entry contract.
+		m_resident_entry_contract.domain = m_defer_cycle_updates ?
+			VitaRegion::GuestDomain::Iop : VitaRegion::GuestDomain::None;
+		m_resident_entry_contract.Bind(HOST_PSX_REGS,
+			VitaRegion::ResidentValue::CoreStateBase);
+		if (m_iop_cycle_base_register_available)
+		{
+			m_resident_entry_contract.Bind(HOST_CYCLE_BASE,
+				VitaRegion::ResidentValue::CycleStateBase);
+		}
+		else if (m_iop_ram_mask_register_available)
+		{
+			m_resident_entry_contract.Bind(HOST_IOP_RAM_MASK,
+				VitaRegion::ResidentValue::MainMemoryMask);
+		}
+		if (m_iop_ram_registers_available)
+		{
+			m_resident_entry_contract.Bind(HOST_IOP_RAM_BASE,
+				VitaRegion::ResidentValue::MainMemoryBase);
+		}
 		const u16 baseline_saved_registers =
 			REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 |
 			((m_iop_cycle_base_register_available ||
@@ -1453,6 +1482,62 @@ namespace VitaIOP
 			return false;
 		}
 
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_CPU_PROFILER)
+		// The ordinary linked entry publishes its diagnostic evidence before
+		// rebuilding private bases. A resident predecessor skips those loads, so
+		// give it a parallel diagnostic-only marker and branch into the common
+		// body. Normal product code points resident links directly at that body
+		// and emits no extra instruction.
+		size_t resident_body_branch = static_cast<size_t>(-1);
+		if (resident_entry_offset)
+		{
+			*resident_entry_offset = m_code.Size();
+#if defined(VITASX2_QEMU_VALIDATION)
+			const u32 frame_instructions =
+				2u + (m_stack_frame_size != 0 ? 2u : 0u);
+			const u32 stack_words =
+				2u * static_cast<u32>(__builtin_popcount(
+						 static_cast<unsigned>(m_saved_registers | REG_LR)));
+			if (!m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+					static_cast<u32>(reinterpret_cast<uptr>(
+						&s_qemuIopLinkedFrameEvidence))) ||
+				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
+				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1) ||
+				!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
+				!m_code.EmitLdrImm12(
+					HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
+				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0,
+					static_cast<u8>(frame_instructions)) ||
+				!m_code.EmitStrImm12(
+					HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
+				!m_code.EmitLdrImm12(
+					HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)) ||
+				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0,
+					static_cast<u8>(stack_words)) ||
+				!m_code.EmitStrImm12(
+					HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)))
+			{
+				return false;
+			}
+#endif
+#if defined(VITASX2_CPU_PROFILER)
+			static_assert(sizeof(std::atomic<u32>) == sizeof(u32));
+			static_assert(alignof(std::atomic<u32>) >= alignof(u32));
+			if (!m_code.EmitMovImm32(HOST_TMP0,
+					static_cast<u32>(reinterpret_cast<uptr>(
+						&VitaPerformanceTelemetry::g_cpu_iop_statistical_pc))) ||
+				!m_code.EmitMovImm32(HOST_TMP1, start_pc) ||
+				!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+			{
+				return false;
+			}
+#endif
+			resident_body_branch = m_code.EmitBranchPlaceholder();
+			if (resident_body_branch == static_cast<size_t>(-1))
+				return false;
+		}
+#endif
+
 		// PCSX2's _DynGen_EnterRecompiledCode() owns one private frame around a
 		// linked chain. Vita keeps narrow callable frames, but an exact frame
 		// signature can enter here after the PUSH/SUB and unwind only once at the
@@ -1515,6 +1600,7 @@ namespace VitaIOP
 			!m_code.PatchBranch(callable_body, m_code.Size()))
 			return false;
 
+		const size_t setup_start = m_code.Size();
 		if (!m_code.EmitMovImm32(HOST_PSX_REGS,
 				static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
 			return false;
@@ -1544,6 +1630,25 @@ namespace VitaIOP
 				static_cast<u32>(reinterpret_cast<uptr>(iopMem->Main))))
 		{
 			return false;
+		}
+		const size_t resident_body = m_code.Size();
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_CPU_PROFILER)
+		if (resident_body_branch != static_cast<size_t>(-1) &&
+			!m_code.PatchBranch(resident_body_branch, resident_body))
+		{
+			return false;
+		}
+#else
+		if (resident_entry_offset)
+			*resident_entry_offset = resident_body;
+#endif
+		const size_t setup_bytes = resident_body - setup_start;
+		if ((setup_bytes & 3u) != 0 || setup_bytes / sizeof(u32) > UINT8_MAX)
+			return false;
+		if (resident_setup_instruction_count)
+		{
+			*resident_setup_instruction_count =
+				static_cast<u8>(setup_bytes / sizeof(u32));
 		}
 		for (u8 i = 0; i < m_pinned_gpr_count; i++)
 		{
@@ -7012,7 +7117,10 @@ namespace VitaIOP
 		size_t* provider_entry_offset, bool test_fallthrough_budget,
 		bool allow_entry_gate, bool inherited_isolate_write,
 		u32 logical_cycle_prefix, u32 logical_cycle_total,
-		bool fragmented_logical_block, bool logical_continuation_tail)
+		bool fragmented_logical_block, bool logical_continuation_tail,
+		size_t* resident_entry_offset,
+		VitaRegion::EntryContract* resident_entry_contract,
+		u8* resident_setup_instruction_count)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -7243,8 +7351,11 @@ namespace VitaIOP
 		AnalyzePinnedGprs(start_pc, instruction_count);
 		AnalyzeSavedRegisters(start_pc, instruction_count);
 
-		if (!BeginBlock(start_pc, linked_entry_offset, provider_entry_offset))
+		if (!BeginBlock(start_pc, linked_entry_offset, provider_entry_offset,
+				resident_entry_offset, resident_setup_instruction_count))
 			return false;
+		if (resident_entry_contract)
+			*resident_entry_contract = m_resident_entry_contract;
 		if (m_compiled_ps1_bios_gate && !EmitCompiledPs1BiosGate())
 			return false;
 
@@ -8241,6 +8352,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopLinkedFrameBypassEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetResidentPreludeLinksEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopResidentPreludeLinksEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -11420,6 +11540,9 @@ namespace VitaIOP
 			DirectLinkSlots attempt_direct_links;
 			size_t attempt_linked_entry_offset = 0;
 			size_t attempt_provider_entry_offset = 0;
+			size_t attempt_resident_entry_offset = 0;
+			VitaRegion::EntryContract attempt_resident_entry_contract{};
+			u8 attempt_resident_setup_instruction_count = 0;
 				const bool compiled = compiler.CompileStraightLineBlock(
 					fragment_start_pc, fragment_instruction_count,
 					reinterpret_cast<const void*>(&VitaIopA32DirectExit),
@@ -11429,7 +11552,10 @@ namespace VitaIOP
 					fragment_index == 0,
 					logical_writes_isolate_mode, logical_cycle_prefix,
 					logical_cycle_total, fragmented_logical_block,
-					logical_continuation && !continuation_fragment);
+					logical_continuation && !continuation_fragment,
+					&attempt_resident_entry_offset,
+					&attempt_resident_entry_contract,
+					&attempt_resident_setup_instruction_count);
 				const bool out_of_block_space =
 					!compiled && fragment.code.Size() >= fragment.code.Capacity();
 				const bool source_page_literal_out_of_range =
@@ -11445,6 +11571,11 @@ namespace VitaIOP
 					CommitCodeSlice(code_slice_offset, fragment.code.Size());
 					fragment.linked_entry_offset = attempt_linked_entry_offset;
 					fragment.provider_entry_offset = attempt_provider_entry_offset;
+					fragment.resident_entry_offset = attempt_resident_entry_offset;
+					fragment.resident_entry_contract =
+						attempt_resident_entry_contract;
+					fragment.resident_setup_instruction_count =
+						attempt_resident_setup_instruction_count;
 					native_instruction_count += compiler.NativeInstructionCount();
 					helper_instruction_count += compiler.HelperInstructionCount();
 					compiled_ps1_bios_gate =
@@ -11678,6 +11809,22 @@ namespace VitaIOP
 		       fragment.linked_entry_offset;
 	}
 
+	const void* BlockExecutor::ResidentEntryPoint(const CachedBlock& block) const
+	{
+		if (!block.HasFragments())
+			return nullptr;
+		const CachedBlock::CodeFragment& fragment = block.Fragment(0);
+		if (!fragment.code.EntryPoint() ||
+			fragment.resident_setup_instruction_count == 0 ||
+			fragment.resident_entry_offset >= fragment.code.Size())
+		{
+			return nullptr;
+		}
+
+		return static_cast<const u8*>(fragment.code.EntryPoint()) +
+		       fragment.resident_entry_offset;
+	}
+
 	const void* BlockExecutor::ProviderEntryPoint(const CachedBlock& block) const
 	{
 		if (!block.HasFragments())
@@ -11728,10 +11875,37 @@ namespace VitaIOP
 		VitaA32::CodeBuffer* const link_code = DirectLinkCode(block, link);
 		if (!link_code)
 			return false;
+		bool use_resident_entry = false;
+		const void* target_entry = nullptr;
+		if (use_chain)
+		{
+			const CachedBlock::CodeFragment& source_fragment =
+				block.Fragment(link.fragment_index);
+			const CachedBlock::CodeFragment& target_fragment =
+				target->Fragment(0);
+			use_resident_entry =
+				source_fragment.resident_entry_contract.Provides(
+					target_fragment.resident_entry_contract) &&
+				ResidentEntryPoint(*target) != nullptr;
+#if defined(VITASX2_IOP_RESIDENT_PRELUDE_CONTROL)
+			use_resident_entry = false;
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+			use_resident_entry =
+				use_resident_entry && s_qemuIopResidentPreludeLinksEnabled;
+#endif
+			target_entry = use_resident_entry ?
+				ResidentEntryPoint(*target) : LinkedEntryPoint(*target);
+		}
 		const bool target_patched =
 			use_chain ? link_code->PatchBranchToAddress(link.target_offset,
-							LinkedEntryPoint(*target)) :
+							target_entry) :
 						link_code->PatchBranch(link.target_offset, link.fallback_offset);
+		link.resident_entry_active = use_resident_entry;
+		link.resident_setup_instructions_removed =
+			use_resident_entry ?
+				target->Fragment(0).resident_setup_instruction_count :
+				0;
 		if (link.logical_continuation)
 			return target_patched && link_code->Flush();
 
@@ -12039,6 +12213,21 @@ namespace VitaIOP
 			s_qemuIopLinkedFrameEvidence.instructions_removed;
 		result->linked_frame_stack_words_removed =
 			s_qemuIopLinkedFrameEvidence.stack_words_removed;
+		result->resident_prelude_links = 0;
+		result->resident_prelude_setup_instructions_removed = 0;
+		for (const std::unique_ptr<CachedBlock>& cached : m_cache)
+		{
+			if (!cached || !cached->valid)
+				continue;
+			for (const DirectLinkSlot& link : cached->direct_links.slots)
+			{
+				if (!link.valid || !link.resident_entry_active)
+					continue;
+				result->resident_prelude_links++;
+				result->resident_prelude_setup_instructions_removed +=
+					link.resident_setup_instructions_removed;
+			}
+		}
 		result->sequential_qword_copy_fast_paths =
 			s_qemuIopSequentialQwordCopyFastPaths;
 		// The focused control is 62 product A32 instructions larger even though

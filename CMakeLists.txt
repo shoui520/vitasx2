@@ -72,6 +72,10 @@ option(VITASX2_IOP_SCHEDULER_PRE_EVENT_WAIT_ADVANCE_CONTROL
 	"Diagnostic control: restore the complete IOP wait-resume body even when the retained normal-clock wait cannot reach its next event."
 	OFF)
 
+option(VITASX2_IOP_RESIDENT_PRELUDE_CONTROL
+	"Diagnostic control: rebuild fixed IOP bases at every linked block entry."
+	OFF)
+
 option(VITASX2_SILENT_HSYNC_FOLD_CONTROL
 	"Diagnostic control: retain every HSync scheduler boundary while both processors hold exact wait certificates."
 	OFF)
