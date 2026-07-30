@@ -16,6 +16,8 @@ alignas(__pagealignsize) u8 iopHw[Ps2MemSize::IopHardware];
 #if defined(VITASX2_QEMU_VALIDATION)
 u64 g_qemuIopWriteNotifications = 0;
 u64 g_qemuIopWriteNotificationBytes = 0;
+u32 g_qemuSio2DmaChcrDirectWrites = 0;
+bool g_qemuSio2DmaChcrDirectRouteEnabled = true;
 #endif
 
 void iopMemAlloc()
@@ -331,6 +333,28 @@ void iopMemWrite32(u32 mem, u32 value)
 
 	if (t == 0x1f80)
 	{
+#if defined(VITASX2_VITA)
+		// PCSX2 owner: IopMemory::_HwWrite_16or32_Page1() starts SIO2
+		// DMA11/12 when their CHCR is written. Retail pad polling reaches these
+		// registers through a runtime-loaded pointer, so the IOP compiler cannot
+		// prove a constant MMIO address. Route the two exact registers before
+		// entering the large Page1 dispatcher while retaining its shared
+		// register, PCR2, DMA and trace implementation.
+		const u32 page1_offset = mem & 0x0fffu;
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (g_qemuSio2DmaChcrDirectRouteEnabled &&
+#else
+		if (
+#endif
+			(page1_offset & ~0x10u) == 0x548u)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuSio2DmaChcrDirectWrites++;
+#endif
+			IopMemory::iopHwWrite32_Sio2DmaChcr(mem, value);
+			return;
+		}
+#endif
 		switch( mem & 0xf000 )
 		{
 			case 0x1000: IopMemory::iopHwWrite32_Page1(mem,value); break;

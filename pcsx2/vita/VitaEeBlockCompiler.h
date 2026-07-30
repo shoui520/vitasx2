@@ -35,6 +35,11 @@ namespace VitaEE
 		u32 leaf_pc, u32 return_pc, u32 call_pc);
 	u32 AdvanceTwoPredicateWaitFromPcToEvent(u32 start_pc,
 		u32 prefix_cycles, u32 tail_cycles, u32 loop_pc, u32 tail_pc);
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+	void PublishTwoPredicateWaitSchedulerCertificateForValidation(
+		u32 prefix_cycles, u32 tail_cycles, u32 loop_pc, u32 tail_pc);
+#endif
 
 	// Immutable code ranges consumed when a backward EE wait proof follows a
 	// static JAL into a pure load leaf. The loop block already owns its branch

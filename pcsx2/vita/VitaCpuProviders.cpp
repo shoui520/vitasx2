@@ -909,6 +909,10 @@ static inline RamWaitResumeResult recRunRamWaitIterationAfterEvent(
 		certificate.origin ==
 			VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop &&
 		certificate.ram_range_count == 2;
+	// IntcVblankStartAndRamLoop deliberately does not enter this retained
+	// shortcut. A scheduler event can set INTC_VBLANK_S without touching the
+	// RAM watch, so generated EE code must re-read both architectural
+	// predicates after every event.
 	if ((!poll_call && !two_predicate) || cpuRegs.pc != wait_pc)
 		return RamWaitResumeResult::Direct;
 	if (write_observed || certificate.ram_write_observed != 0)
@@ -2040,6 +2044,24 @@ void VitaPublishA32EeTwoPredicateWaitSchedulerCertificate(
 		VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop,
 		guest_address_0, sizeof(u32),
 		guest_address_1, sizeof(u32));
+	s_ee_wait_scheduler_certificate.predicate_prefix_cycles =
+		prefix_cycles;
+	s_ee_wait_scheduler_certificate.predicate_tail_cycles = tail_cycles;
+	s_ee_wait_scheduler_certificate.predicate_loop_pc = loop_pc;
+	s_ee_wait_scheduler_certificate.predicate_tail_pc = tail_pc;
+}
+
+void VitaPublishA32EeIntcVblankStartAndRamWaitSchedulerCertificate(
+	u32 ram_address, u32 prefix_cycles, u32 tail_cycles,
+	u32 loop_pc, u32 tail_pc)
+{
+	// PCSX2 owners: Counters.cpp::VSyncStart() is the producer of
+	// INTC_VBLANK_S, while direct EE-RAM writers retire the physical watch
+	// through VitaNotifyA32EeRamWrite(). The MMIO predicate is intentionally
+	// not represented as a fake RAM range.
+	PublishA32EeRamWaitSchedulerCertificate(
+		VitaA32EeWaitSchedulerOrigin::IntcVblankStartAndRamLoop,
+		ram_address, sizeof(u32), 0, 0);
 	s_ee_wait_scheduler_certificate.predicate_prefix_cycles =
 		prefix_cycles;
 	s_ee_wait_scheduler_certificate.predicate_tail_cycles = tail_cycles;

@@ -128,6 +128,9 @@ namespace IopMemory
 	extern void iopHwWrite32_Page1( u32 iopaddr, mem32_t data );
 	extern void iopHwWrite32_Page3( u32 iopaddr, mem32_t data );
 	extern void iopHwWrite32_Page8( u32 iopaddr, mem32_t data );
+#if defined(VITASX2_VITA)
+	extern void iopHwWrite32_Sio2DmaChcr( u32 iopaddr, mem32_t data );
+#endif
 }
 
 class IOPMemoryInterface final : public MemoryInterface

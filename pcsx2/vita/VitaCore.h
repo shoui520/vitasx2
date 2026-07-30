@@ -240,6 +240,7 @@ enum class VitaA32EeWaitSchedulerOrigin : u32
 	RetainedUnconditionalLoop = 4,
 	GsCsrVsintLoop = 5,
 	DmacChcrStrPollLoop = 6,
+	IntcVblankStartAndRamLoop = 7,
 };
 
 struct VitaA32EeWaitSchedulerCertificate
@@ -299,6 +300,9 @@ void VitaPublishA32EePollCallWaitSchedulerCertificate(
 void VitaPublishA32EeTwoPredicateWaitSchedulerCertificate(
 	u32 guest_address_0, u32 guest_address_1,
 	u32 prefix_cycles, u32 tail_cycles,
+	u32 loop_pc, u32 tail_pc);
+void VitaPublishA32EeIntcVblankStartAndRamWaitSchedulerCertificate(
+	u32 ram_address, u32 prefix_cycles, u32 tail_cycles,
 	u32 loop_pc, u32 tail_pc);
 void VitaPublishA32EeDmacChcrWaitSchedulerCertificate(
 	u32 fallthrough_pc, u32 block_cycles, u32 packed_poll);

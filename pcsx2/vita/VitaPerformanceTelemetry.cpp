@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #endif
 
 namespace VitaPerformanceTelemetry
@@ -74,6 +75,59 @@ namespace VitaPerformanceTelemetry
 			STATISTICAL_GUEST_PC_RING_SIZE> s_statistical_iop_pc_ring{};
 		std::atomic<u64> s_statistical_ee_pc_sequence{0};
 		std::atomic<u64> s_statistical_iop_pc_sequence{0};
+		// Capturing source words on the sparse sampler thread would race guest
+		// memory mutation and could invoke a handler-backed read from a foreign
+		// thread. Instead, the IOP compiler publishes the already-decoded words
+		// at its cold, source-generation-owned commit seam. A direct-mapped
+		// profiler registry can lose a colliding diagnostic, but cannot affect
+		// execution or turn stale source into semantic authority.
+		constexpr size_t IOP_CODE_SNAPSHOT_REGISTRY_SIZE = 4096;
+		static_assert(
+			std::has_single_bit(IOP_CODE_SNAPSHOT_REGISTRY_SIZE));
+		struct IopCodeSnapshot
+		{
+			std::atomic<u32> sequence{0};
+			std::atomic<u32> pc{UINT32_MAX};
+			std::atomic<u32> code_words{0};
+			std::array<std::atomic<u32>,
+				CPU_PROFILE_CODE_WORD_COUNT> code{};
+		};
+		std::array<IopCodeSnapshot,
+			IOP_CODE_SNAPSHOT_REGISTRY_SIZE> s_iop_code_snapshots{};
+
+		constexpr size_t IopCodeSnapshotIndex(u32 pc)
+		{
+			return ((pc >> 2) * 2654435761u) &
+				(IOP_CODE_SNAPSHOT_REGISTRY_SIZE - 1);
+		}
+
+		bool ReadIopCodeSnapshot(u32 pc, u32* code_words,
+			std::array<u32, CPU_PROFILE_CODE_WORD_COUNT>* code)
+		{
+			const IopCodeSnapshot& slot =
+				s_iop_code_snapshots[IopCodeSnapshotIndex(pc)];
+			const u32 before =
+				slot.sequence.load(std::memory_order_acquire);
+			if ((before & 1u) != 0)
+				return false;
+			const u32 stored_pc = slot.pc.load(std::memory_order_relaxed);
+			const u32 stored_words =
+				slot.code_words.load(std::memory_order_relaxed);
+			std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> stored_code{};
+			for (size_t i = 0; i < stored_code.size(); i++)
+			{
+				stored_code[i] =
+					slot.code[i].load(std::memory_order_relaxed);
+			}
+			std::atomic_thread_fence(std::memory_order_acquire);
+			const u32 after =
+				slot.sequence.load(std::memory_order_relaxed);
+			if (before != after || stored_pc != pc)
+				return false;
+			*code_words = stored_words;
+			*code = stored_code;
+			return true;
+		}
 
 #if defined(__vita__)
 		Threading::Thread s_statistical_sampler_thread;
@@ -225,6 +279,28 @@ namespace VitaPerformanceTelemetry
 				static_cast<u32>(stage), std::memory_order_relaxed);
 		}
 	} // namespace
+
+	void RegisterIopGeneratedBlockCode(
+		u32 pc, const u32* code, u32 code_words)
+	{
+		if (!g_cpu_stage_profiler_enabled || !code)
+			return;
+		IopCodeSnapshot& slot =
+			s_iop_code_snapshots[IopCodeSnapshotIndex(pc)];
+		const u32 sequence =
+			slot.sequence.fetch_add(1, std::memory_order_acq_rel);
+		slot.pc.store(pc, std::memory_order_relaxed);
+		const u32 retained_words = std::min<u32>(
+			code_words, CPU_PROFILE_CODE_WORD_COUNT);
+		slot.code_words.store(retained_words, std::memory_order_relaxed);
+		for (size_t i = 0; i < CPU_PROFILE_CODE_WORD_COUNT; i++)
+		{
+			slot.code[i].store(
+				i < retained_words ? code[i] : 0,
+				std::memory_order_relaxed);
+		}
+		slot.sequence.store(sequence + 2, std::memory_order_release);
+	}
 #endif
 
 	void SetEnabledBeforeVmStart(bool enabled)
@@ -261,6 +337,14 @@ namespace VitaPerformanceTelemetry
 		{
 			sample.pc.store(UINT32_MAX, std::memory_order_relaxed);
 			sample.sequence.store(0, std::memory_order_relaxed);
+		}
+		for (IopCodeSnapshot& slot : s_iop_code_snapshots)
+		{
+			slot.pc.store(UINT32_MAX, std::memory_order_relaxed);
+			slot.code_words.store(0, std::memory_order_relaxed);
+			for (std::atomic<u32>& word : slot.code)
+				word.store(0, std::memory_order_relaxed);
+			slot.sequence.store(0, std::memory_order_relaxed);
 		}
 		for (std::atomic<u32>& samples : s_statistical_stage_samples)
 			samples.store(0, std::memory_order_relaxed);
@@ -615,6 +699,16 @@ namespace VitaPerformanceTelemetry
 				}
 			}
 		}
+		if (&ring == &s_statistical_iop_pc_ring)
+		{
+			for (CpuProfileHotPc& hot_pc : exact)
+			{
+				if (hot_pc.samples == 0)
+					continue;
+				ReadIopCodeSnapshot(hot_pc.pc, &hot_pc.code_words,
+					&hot_pc.code);
+			}
+		}
 		std::sort(exact.begin(), exact.end(),
 			[](const CpuProfileHotPc& left,
 				const CpuProfileHotPc& right) {
@@ -952,6 +1046,9 @@ namespace VitaPerformanceTelemetry
 				break;
 			case 6:
 				totals.ee_wait_dmac_chcr_str++;
+				break;
+			case 7:
+				totals.ee_wait_intc_vblank_start_and_ram++;
 				break;
 			default:
 				blocked = true;

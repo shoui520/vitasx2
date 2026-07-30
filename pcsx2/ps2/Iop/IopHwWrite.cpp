@@ -13,6 +13,9 @@
 #include "IopCounters.h"
 #include "IopDma.h"
 #include "R3000A.h"
+#if defined(VITASX2_CPU_PROFILER)
+#include "vita/VitaPerformanceTelemetry.h"
+#endif
 
 #include "ps2/pgif.h"
 #include "Mdec.h"
@@ -210,6 +213,18 @@ static __fi void _HwWrite_16or32_Page1( u32 addr, T val )
 	if (spu2_dma_observer) [[unlikely]]
 		SPU2::SynchronizeToIopCycle();
 #endif
+
+	const auto write_sio2_dma_chcr = [addr, val](u32 channel) {
+		psxHu(addr) = val;
+		if (channel == 11)
+		{
+			DmaExec2(11);
+		}
+		else
+		{
+			DmaExec2(12);
+		}
+	};
 
 	// ------------------------------------------------------------------------
 	// Counters, 16-bit varieties!
@@ -442,13 +457,11 @@ static __fi void _HwWrite_16or32_Page1( u32 addr, T val )
 
 
 			mcase(0x1f801548):	// DMA11 CHCR -- SIO2 IN
-				psxHu(addr) = val;
-				DmaExec2(11);
+				write_sio2_dma_chcr(11);
 			break;
 
 			mcase(0x1f801558):	// DMA12 CHCR -- SIO2 OUT
-				psxHu(addr) = val;
-				DmaExec2(12);
+				write_sio2_dma_chcr(12);
 			break;
 
 			// ------------------------------------------------------------------------
@@ -599,6 +612,27 @@ void iopHwWrite32_Page1( u32 addr, mem32_t val )
 {
 	_HwWrite_16or32_Page1<mem32_t >( addr, val );
 }
+
+#if defined(VITASX2_VITA)
+void iopHwWrite32_Sio2DmaChcr( u32 addr, mem32_t val )
+{
+#if defined(VITASX2_CPU_PROFILER)
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::Dma);
+#endif
+	pxAssert( addr == 0x1f801548u || addr == 0x1f801558u );
+	psxHu(addr) = val;
+	if (addr == 0x1f801548u)
+	{
+		DmaExec2(11);
+	}
+	else
+	{
+		DmaExec2(12);
+	}
+	IopHwTraceLog<mem32_t>( addr, val, false );
+}
+#endif
 
 void iopHwWrite32_Page3( u32 addr, mem32_t val )
 {

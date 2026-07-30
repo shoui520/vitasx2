@@ -219,6 +219,7 @@ namespace VitaPerformanceTelemetry
 		u64 ee_wait_retained_unconditional = 0;
 		u64 ee_wait_gs_csr_vsint = 0;
 		u64 ee_wait_dmac_chcr_str = 0;
+		u64 ee_wait_intc_vblank_start_and_ram = 0;
 		u64 joint_wait_shadow_entries = 0;
 		u64 joint_wait_unknown_writer = 0;
 		u64 joint_wait_blocked = 0;
@@ -353,6 +354,10 @@ namespace VitaPerformanceTelemetry
 	{
 		u32 pc = 0;
 		u32 samples = 0;
+#if defined(VITASX2_CPU_PROFILER)
+		u32 code_words = 0;
+		std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> code{};
+#endif
 	};
 
 	struct CpuProfileHotPcSnapshot
@@ -382,11 +387,20 @@ namespace VitaPerformanceTelemetry
 	CpuProfileHotEdgeSnapshot GetCpuProfileHotEdgeSnapshot(
 		u64 first_sequence, u64 next_sequence);
 #if defined(VITASX2_CPU_PROFILER)
+	void RegisterIopGeneratedBlockCode(
+		u32 pc, const u32* code, u32 code_words);
 	CpuProfileHotPcSnapshot GetCpuProfileHotEePcSnapshot(
 		u64 first_sequence, u64 next_sequence);
 	CpuProfileHotPcSnapshot GetCpuProfileHotIopPcSnapshot(
 		u64 first_sequence, u64 next_sequence);
 #else
+	inline void RegisterIopGeneratedBlockCode(
+		u32 pc, const u32* code, u32 code_words)
+	{
+		(void)pc;
+		(void)code;
+		(void)code_words;
+	}
 	inline CpuProfileHotPcSnapshot GetCpuProfileHotEePcSnapshot(
 		u64 first_sequence, u64 next_sequence)
 	{

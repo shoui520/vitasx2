@@ -811,6 +811,7 @@ namespace MTGS
 			EE_DEADLINE_DELTA(ee_wait_retained_unconditional);
 			EE_DEADLINE_DELTA(ee_wait_gs_csr_vsint);
 			EE_DEADLINE_DELTA(ee_wait_dmac_chcr_str);
+			EE_DEADLINE_DELTA(ee_wait_intc_vblank_start_and_ram);
 			EE_DEADLINE_DELTA(joint_wait_shadow_entries);
 			EE_DEADLINE_DELTA(joint_wait_unknown_writer);
 			EE_DEADLINE_DELTA(joint_wait_blocked);
@@ -1034,7 +1035,7 @@ namespace MTGS
 				"Vita perf v=1 window=%llu kind=joint_wait_shadow "
 				"ee_wait=%llu generic_ram=%llu poll_call_ram=%llu "
 				"two_predicate_ram=%llu unconditional=%llu gs_csr=%llu "
-				"dmac_chcr_str=%llu "
+				"dmac_chcr_str=%llu intc_vblank_start_ram=%llu "
 				"joint=%llu unknown_writer=%llu blocked=%llu qualified=%llu "
 				"horizon_gt_6144=%llu horizon_gt_12288=%llu "
 				"horizon_gt_24576=%llu ram_certified=%llu "
@@ -1058,6 +1059,8 @@ namespace MTGS
 				static_cast<unsigned long long>(ee_wait_gs_csr_vsint),
 				static_cast<unsigned long long>(
 					ee_wait_dmac_chcr_str),
+				static_cast<unsigned long long>(
+					ee_wait_intc_vblank_start_and_ram),
 				static_cast<unsigned long long>(joint_wait_shadow_entries),
 				static_cast<unsigned long long>(joint_wait_unknown_writer),
 				static_cast<unsigned long long>(joint_wait_blocked),
@@ -1699,7 +1702,11 @@ namespace MTGS
 						start.cpu_stage_profiler.statistical_iop_pc_sequence + 1,
 						end.cpu_stage_profiler.statistical_iop_pc_sequence + 1);
 			output.WriteLn(
+#if defined(VITASX2_CPU_PROFILER)
+				"Vita perf v=1 window=%llu kind=cpu_hot_iop_block_summary "
+#else
 				"Vita perf v=1 window=%llu kind=cpu_hot_iop_pc_summary "
+#endif
 				"first_sequence=%llu next_sequence=%llu dropped=%llu invalid=%llu",
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(hot_iop_pcs.first_sequence),
@@ -1712,12 +1719,26 @@ namespace MTGS
 					hot_iop_pcs.pcs[i];
 				if (hot_pc.samples == 0)
 					break;
+#if defined(VITASX2_CPU_PROFILER)
+				output.WriteLn(
+					"Vita perf v=1 window=%llu kind=cpu_hot_iop_block "
+					"rank=%u pc=0x%08x samples=%u words=%u "
+					"code=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+					static_cast<unsigned long long>(window),
+					static_cast<unsigned>(i + 1), hot_pc.pc,
+					hot_pc.samples, hot_pc.code_words,
+					hot_pc.code[0], hot_pc.code[1],
+					hot_pc.code[2], hot_pc.code[3],
+					hot_pc.code[4], hot_pc.code[5],
+					hot_pc.code[6], hot_pc.code[7]);
+#else
 				output.WriteLn(
 					"Vita perf v=1 window=%llu kind=cpu_hot_iop_pc "
 					"rank=%u pc=0x%08x samples=%u",
 					static_cast<unsigned long long>(window),
 					static_cast<unsigned>(i + 1), hot_pc.pc,
 					hot_pc.samples);
+#endif
 			}
 			const VitaPerformanceTelemetry::CpuProfileHotEdgeSnapshot hot_edges =
 				VitaPerformanceTelemetry::GetCpuProfileHotEdgeSnapshot(

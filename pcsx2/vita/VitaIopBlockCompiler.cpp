@@ -1363,7 +1363,7 @@ namespace VitaIOP
 		return true;
 	}
 
-	bool BlockCompiler::BeginBlock(size_t* linked_entry_offset,
+	bool BlockCompiler::BeginBlock(u32 start_pc, size_t* linked_entry_offset,
 		size_t* provider_entry_offset)
 	{
 		if (linked_entry_offset)
@@ -1486,6 +1486,28 @@ namespace VitaIOP
 #else
 		if (linked_entry_offset)
 			*linked_entry_offset = m_code.Size();
+#endif
+#if defined(VITASX2_CPU_PROFILER)
+		if (linked_entry_offset)
+		{
+			// RunProviderBlockInline() publishes ordinary provider entries in
+			// C++, but a patched A32 edge enters here without returning to it.
+			// Mirror std::atomic<u32>::store(relaxed) exactly as the EE compiler
+			// does, before provider_entry_offset, so only direct links pay for
+			// this diagnostic marker. Normal product builds emit nothing.
+			static_assert(sizeof(std::atomic<u32>) == sizeof(u32));
+			static_assert(alignof(std::atomic<u32>) >= alignof(u32));
+			if (!m_code.EmitMovImm32(HOST_TMP0,
+					static_cast<u32>(reinterpret_cast<uptr>(
+						&VitaPerformanceTelemetry::g_cpu_iop_statistical_pc))) ||
+				!m_code.EmitMovImm32(HOST_TMP1, start_pc) ||
+				!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+			{
+				return false;
+			}
+		}
+#else
+		(void)start_pc;
 #endif
 		if (provider_entry_offset)
 			*provider_entry_offset = m_code.Size();
@@ -7221,7 +7243,7 @@ namespace VitaIOP
 		AnalyzePinnedGprs(start_pc, instruction_count);
 		AnalyzeSavedRegisters(start_pc, instruction_count);
 
-		if (!BeginBlock(linked_entry_offset, provider_entry_offset))
+		if (!BeginBlock(start_pc, linked_entry_offset, provider_entry_offset))
 			return false;
 		if (m_compiled_ps1_bios_gate && !EmitCompiledPs1BiosGate())
 			return false;
@@ -11613,6 +11635,8 @@ namespace VitaIOP
 				}
 			}
 		}
+		VitaPerformanceTelemetry::RegisterIopGeneratedBlockCode(
+			block.start_pc, block.opcodes.data(), block.instruction_count);
 
 		return true;
 	}

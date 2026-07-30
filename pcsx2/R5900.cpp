@@ -289,6 +289,8 @@ static __fi bool VitaEeWaitCertificateHasExactWakeContract(
 			return certificate.ram_range_count == 1;
 		case VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop:
 			return certificate.ram_range_count == 2;
+		case VitaA32EeWaitSchedulerOrigin::IntcVblankStartAndRamLoop:
+			return certificate.ram_range_count == 1;
 		case VitaA32EeWaitSchedulerOrigin::RetainedUnconditionalLoop:
 		case VitaA32EeWaitSchedulerOrigin::GsCsrVsintLoop:
 		case VitaA32EeWaitSchedulerOrigin::DmacChcrStrPollLoop:
@@ -376,7 +378,9 @@ static __fi void VitaRecordJointWaitShadowAtDeadline(
 		wait_certificate.origin ==
 			VitaA32EeWaitSchedulerOrigin::PollCallRamLoop ||
 		wait_certificate.origin ==
-			VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop;
+			VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop ||
+		wait_certificate.origin ==
+			VitaA32EeWaitSchedulerOrigin::IntcVblankStartAndRamLoop;
 	const bool unknown_writer =
 		ram_poll && wait_certificate.ram_range_count == 0;
 	const bool blocked =

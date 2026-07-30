@@ -19,6 +19,8 @@
 #include "pcsx2/DebugTools/CoreEventTrace.h"
 #include "pcsx2/DebugTools/GsTrace.h"
 #include "pcsx2/DebugTools/VuTrace.h"
+#include "pcsx2/Hw.h"
+#include "pcsx2/Dmac.h"
 #include "pcsx2/Memory.h"
 #include "pcsx2/R5900.h"
 #include "pcsx2/R5900OpcodeTables.h"
@@ -658,9 +660,13 @@ namespace VitaEE
 			if (publish_certificate)
 			{
 				const u32 prefix_load = memRead32(loop_pc);
+				const bool prefix_is_lw = (prefix_load >> 26) == 0x23;
+				const u32 prefix_operation =
+					prefix_is_lw ?
+						memRead32(loop_pc + sizeof(u32)) : 0;
 				const bool masked_prefix =
-					(prefix_load >> 26) == 0x23 &&
-					(memRead32(loop_pc + sizeof(u32)) >> 26) == 0x0c;
+					prefix_is_lw &&
+					(prefix_operation >> 26) == 0x0c;
 				const u32 tail_load_pc =
 					loop_pc + (masked_prefix ? 4u : 3u) * sizeof(u32);
 				const u32 tail_load = memRead32(tail_load_pc);
@@ -670,9 +676,30 @@ namespace VitaEE
 				const u32 tail_address =
 					cpuRegs.GPR.r[(tail_load >> 21) & 0x1f].UL[0] +
 					static_cast<s16>(tail_load & 0xffffu);
-				VitaPublishA32EeTwoPredicateWaitSchedulerCertificate(
-					prefix_address, tail_address,
-					prefix_cycles, tail_cycles, loop_pc, tail_pc);
+				bool intc_vblank_start_and_ram = false;
+#if !defined(VITASX2_EE_INTC_VBLANK_RAM_WAIT_CONTROL)
+				const u32 prefix_result = (prefix_load >> 16) & 0x1f;
+				const u32 prefix_mask =
+					masked_prefix ? prefix_operation : 0;
+				intc_vblank_start_and_ram =
+					masked_prefix && prefix_address == INTC_STAT &&
+					(prefix_mask >> 26) == 0x0c &&
+					((prefix_mask >> 21) & 0x1f) == prefix_result &&
+					((prefix_mask >> 16) & 0x1f) == prefix_result &&
+					(prefix_mask & 0xffffu) == (1u << INTC_VBLANK_S);
+#endif
+				if (intc_vblank_start_and_ram)
+				{
+					VitaPublishA32EeIntcVblankStartAndRamWaitSchedulerCertificate(
+						tail_address, prefix_cycles, tail_cycles,
+						loop_pc, tail_pc);
+				}
+				else
+				{
+					VitaPublishA32EeTwoPredicateWaitSchedulerCertificate(
+						prefix_address, tail_address,
+						prefix_cycles, tail_cycles, loop_pc, tail_pc);
+				}
 			}
 #endif
 			// PCSX2 owner: x86/ix86-32/iR5900.cpp::{recRecompile,
@@ -2953,6 +2980,17 @@ namespace VitaEE
 			start_pc, prefix_cycles, tail_cycles,
 			loop_pc, tail_pc, false);
 	}
+
+#if defined(VITASX2_QEMU_VALIDATION) && \
+	!defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+	void PublishTwoPredicateWaitSchedulerCertificateForValidation(
+		u32 prefix_cycles, u32 tail_cycles, u32 loop_pc, u32 tail_pc)
+	{
+		(void)VitaEeAdvanceTwoPredicateWaitToEventCore(
+			loop_pc, prefix_cycles, tail_cycles,
+			loop_pc, tail_pc, true);
+	}
+#endif
 
 	static_assert(GprOffset(31) + sizeof(GPR_reg) <= 0x0fff);
 	static_assert((GprOffset(0) % 16) == 0);

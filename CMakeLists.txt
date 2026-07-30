@@ -76,6 +76,10 @@ option(VITASX2_SILENT_HSYNC_FOLD_CONTROL
 	"Diagnostic control: retain every HSync scheduler boundary while both processors hold exact wait certificates."
 	OFF)
 
+option(VITASX2_EE_INTC_VBLANK_RAM_WAIT_CONTROL
+	"Diagnostic control: leave mixed INTC-VBlank/RAM two-predicate EE waits on the generic bounded scheduler path."
+	OFF)
+
 option(VITASX2_VITA_SOFTWARE_GS_CONTROL
 	"Use PCSX2's software GS renderer with the current Vita core and GXM presenter."
 	OFF)

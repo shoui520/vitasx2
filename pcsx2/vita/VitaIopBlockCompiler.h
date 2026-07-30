@@ -377,7 +377,8 @@ namespace VitaIOP
 		}
 
 	private:
-		bool BeginBlock(size_t* linked_entry_offset, size_t* provider_entry_offset);
+		bool BeginBlock(u32 start_pc, size_t* linked_entry_offset,
+			size_t* provider_entry_offset);
 		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true,
 			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockIsolateModeWriteReturn(bool charge_budget = true,
