@@ -14,6 +14,7 @@
 #include "VMManager.h"
 #if defined(VITASX2_VITA)
 #include "vita/VitaCore.h"
+#include "vita/VitaEeDmacWait.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #endif
 
@@ -910,6 +911,92 @@ static __fi void VitaIopEventTestFromEe()
 static_assert(VitaPerformanceTelemetry::EE_DEADLINE_EVENT_SLOT_COUNT ==
 	static_cast<size_t>(VU_MTVU_BUSY) + 1);
 
+static __fi void VitaRecordIpuEpochOpportunityAtEntry(
+	const VitaA32EeWaitSchedulerCertificate& wait_certificate,
+	u32 wait_pc)
+{
+	const u32 packed_poll = wait_certificate.mmio_packed_poll;
+	const u32 base_guest = packed_poll & 0x1fu;
+	const bool from_ipu_wait =
+		wait_certificate.origin ==
+			VitaA32EeWaitSchedulerOrigin::DmacChcrStrPollLoop &&
+		base_guest != 0 &&
+		cpuRegs.GPR.r[base_guest].UL[0] == fromIPU_CHCR;
+
+	if (!from_ipu_wait)
+	{
+		VitaPerformanceTelemetry::RecordIpuEpochOpportunityIfProfiling(
+			false, wait_pc, 0, 0);
+		return;
+	}
+
+	constexpr u32 ipu_events =
+		(1u << DMAC_FROM_IPU) |
+		(1u << DMAC_TO_IPU) |
+		(1u << IPU_PROCESS);
+	constexpr u32 tested_events =
+		(1u << VU_MTVU_BUSY) |
+		(1u << DMAC_VIF1) | (1u << DMAC_GIF) |
+		(1u << DMAC_SIF0) | (1u << DMAC_SIF1) |
+		(1u << DMAC_VIF0) | ipu_events |
+		(1u << DMAC_FROM_SPR) | (1u << DMAC_TO_SPR) |
+		(1u << DMAC_MFIFO_VIF) | (1u << DMAC_MFIFO_GIF) |
+		(1u << VIF_VU0_FINISH) | (1u << VIF_VU1_FINISH);
+	u32 due_events = 0;
+	u32 pending = cpuRegs.interrupt & tested_events;
+	while (pending != 0)
+	{
+		const u32 event = static_cast<u32>(std::countr_zero(pending));
+		const u32 bit = 1u << event;
+		pending &= pending - 1;
+		if (CHECK_INSTANTDMAHACK ||
+			cpuTestCycle(cpuRegs.sCycle[event], cpuRegs.eCycle[event]))
+		{
+			due_events |= bit;
+		}
+	}
+
+	u32 blockers = 0;
+	if (!VitaA32IopRetainedWaitCoalescingActive())
+		blockers |= VitaPerformanceTelemetry::IpuEpochBlockerIopActive;
+	if ((due_events & ipu_events) == 0)
+		blockers |= VitaPerformanceTelemetry::IpuEpochBlockerNoDueIpu;
+	if ((due_events & ~ipu_events) != 0)
+		blockers |= VitaPerformanceTelemetry::IpuEpochBlockerDueNonIpu;
+	if (cpuTestCycle(nextStartCounter, nextDeltaCounter))
+		blockers |= VitaPerformanceTelemetry::IpuEpochBlockerEeCounter;
+	// The complete scheduler updates Count lazily immediately before testing
+	// Compare. Conservatively treat any enabled timer as an epoch fence until
+	// Phase 1 gives it an explicit deadline slot.
+	if ((cpuRegs.CP0.n.Status.val & 0x8000u) != 0)
+		blockers |= VitaPerformanceTelemetry::IpuEpochBlockerCp0Timer;
+	if (cpuIntsEnabled(intcInterrupt() | dmacInterrupt()))
+		blockers |=
+			VitaPerformanceTelemetry::IpuEpochBlockerVisibleException;
+
+	const u32 vu_running = VU0.VI[REG_VPU_STAT].UL;
+	if ((vu_running & 1u) != 0 ||
+		(!THREAD_VU1 && (vu_running & 0x100u) != 0) ||
+		(THREAD_VU1 && vu1Thread.HasPendingChanges()))
+	{
+		blockers |= VitaPerformanceTelemetry::IpuEpochBlockerVu;
+	}
+	if (!dmacRegs.ctrl.DMAE || (psHu8(DMAC_ENABLER + 2) & 1))
+		blockers |= VitaPerformanceTelemetry::IpuEpochBlockerDmacSuspended;
+	if (CHECK_INSTANTDMAHACK &&
+		(cpuRegs.interrupt & 0x1ffffu) != 0)
+	{
+		blockers |= VitaPerformanceTelemetry::IpuEpochBlockerInstantDma;
+	}
+
+	const u32 compact_due_ipu =
+		((due_events >> DMAC_FROM_IPU) & 1u) |
+		(((due_events >> DMAC_TO_IPU) & 1u) << 1) |
+		(((due_events >> IPU_PROCESS) & 1u) << 2);
+	VitaPerformanceTelemetry::RecordIpuEpochOpportunityIfProfiling(
+		true, wait_pc, compact_due_ipu, blockers);
+}
+
 static __fi void VitaRecordEeDeadlineHorizon(
 	s32 iop_delta, bool iop_rapid)
 {
@@ -970,6 +1057,7 @@ static __fi void VitaRecordEeDeadlineHorizon(
 		timer_delta, iop_rapid);
 }
 #endif
+
 #endif
 
 // Shared portion of the branch test, called from both the Interpreter
@@ -993,6 +1081,14 @@ __fi void _cpuEventTest_Shared()
 	const VitaA32EeWaitSchedulerCertificate* vita_ee_wait_certificate =
 		VitaConsumeA32EeWaitSchedulerCertificate();
 	const u32 vita_ee_wait_pc = cpuRegs.pc;
+#if defined(VITASX2_CPU_PROFILER)
+	{
+		const VitaPerformanceTelemetry::ScopedCpuStage diagnostics_stage(
+			VitaPerformanceTelemetry::CpuStage::Diagnostics);
+		VitaRecordIpuEpochOpportunityAtEntry(
+			*vita_ee_wait_certificate, vita_ee_wait_pc);
+	}
+#endif
 #endif
 	eeEventTestIsActive = true;
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)

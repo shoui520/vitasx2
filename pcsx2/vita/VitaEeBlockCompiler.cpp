@@ -10421,13 +10421,48 @@ namespace VitaEE
 		if (use_vtlb_registers && m_persistent_dispatch_exits)
 			g_qemuPersistentVtlbResidentBlocks++;
 #endif
-		return !use_vtlb_registers || m_persistent_dispatch_exits ||
-			   (m_code.EmitMovImm32(HOST_VTLB_VMAP,
-				   static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.vmap))) &&
-			   m_code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_VTLB_VMAP, 0) &&
-			   m_code.EmitMovImm32(HOST_VTLB_HOST_MEMORY_BASE,
-				   static_cast<u32>(reinterpret_cast<uptr>(&vtlb_private::vtlbdata.host_memory_base))) &&
-			   m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_VTLB_HOST_MEMORY_BASE, 0));
+		if (use_vtlb_registers && !m_persistent_dispatch_exits &&
+			(!m_code.EmitMovImm32(HOST_VTLB_VMAP,
+				 static_cast<u32>(reinterpret_cast<uptr>(
+					 &vtlb_private::vtlbdata.vmap))) ||
+			 !m_code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_VTLB_VMAP, 0) ||
+			 !m_code.EmitMovImm32(HOST_VTLB_HOST_MEMORY_BASE,
+				 static_cast<u32>(reinterpret_cast<uptr>(
+					 &vtlb_private::vtlbdata.host_memory_base))) ||
+			 !m_code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE,
+				 HOST_VTLB_HOST_MEMORY_BASE, 0)))
+		{
+			return false;
+		}
+		return EmitCpuProfilerBlockPc(m_current_block_start_pc);
+	}
+
+	bool BlockCompiler::EmitCpuProfilerBlockPc(u32 start_pc,
+		bool preserve_temporaries)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		// The profiler build mirrors std::atomic<u32>::store(relaxed) with the
+		// aligned A32 word store used by the Vita toolchain. Direct compatible
+		// and resident entries skip the canonical prelude, so their common marker
+		// executes after private scheduler and translation state has been staged.
+		// Preserve r0/r1 there: resident scheduling owns r0 across the block.
+		// The diagnostic-only two-word stack spill keeps that private ABI exact;
+		// normal product builds emit nothing.
+		static_assert(sizeof(std::atomic<u32>) == sizeof(u32));
+		static_assert(alignof(std::atomic<u32>) >= alignof(u32));
+		const u16 temporaries = REG_R0 | REG_R1;
+		return (!preserve_temporaries || m_code.EmitPush(temporaries)) &&
+			m_code.EmitMovImm32(HOST_TMP0,
+				static_cast<u32>(reinterpret_cast<uptr>(
+					&VitaPerformanceTelemetry::g_cpu_ee_statistical_pc))) &&
+			m_code.EmitMovImm32(HOST_TMP1, start_pc) &&
+			m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) &&
+			(!preserve_temporaries || m_code.EmitPop(temporaries));
+#else
+		(void)start_pc;
+		(void)preserve_temporaries;
+		return true;
+#endif
 	}
 
 	bool BlockCompiler::IsRetainableUnconditionalWaitBlock(u32 start_pc,
@@ -11833,6 +11868,9 @@ namespace VitaEE
 		if (!EmitGprQCacheEntryLoads())
 			return false;
 		if (!EmitGoemonBlockStartHook(start_pc))
+			return false;
+
+		if (!EmitCpuProfilerBlockPc(start_pc, true))
 			return false;
 
 		u32 raw_cycles = 0;

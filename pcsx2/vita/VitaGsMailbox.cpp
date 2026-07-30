@@ -824,6 +824,31 @@ namespace MTGS
 				joint_wait_ram_write_overlaps_outside_scheduler);
 			EE_DEADLINE_DELTA(joint_wait_activations);
 			EE_DEADLINE_DELTA(joint_wait_scheduled_ee_cycles);
+#if defined(VITASX2_CPU_PROFILER)
+			EE_DEADLINE_DELTA(ipu_epoch_from_ipu_wait_entries);
+			EE_DEADLINE_DELTA(ipu_epoch_candidate_entries);
+			EE_DEADLINE_DELTA(ipu_epoch_candidate_chains);
+			EE_DEADLINE_DELTA(ipu_epoch_candidate_continuations);
+			EE_DEADLINE_DELTA(ipu_epoch_due_from_ipu);
+			EE_DEADLINE_DELTA(ipu_epoch_due_to_ipu);
+			EE_DEADLINE_DELTA(ipu_epoch_due_process);
+			EE_DEADLINE_DELTA(ipu_epoch_blocked_iop_active);
+			EE_DEADLINE_DELTA(ipu_epoch_blocked_no_due_ipu);
+			EE_DEADLINE_DELTA(ipu_epoch_blocked_due_non_ipu);
+			EE_DEADLINE_DELTA(ipu_epoch_blocked_ee_counter);
+			EE_DEADLINE_DELTA(ipu_epoch_blocked_cp0_timer);
+			EE_DEADLINE_DELTA(ipu_epoch_blocked_visible_exception);
+			EE_DEADLINE_DELTA(ipu_epoch_blocked_vu);
+			EE_DEADLINE_DELTA(ipu_epoch_blocked_dmac_suspended);
+			EE_DEADLINE_DELTA(ipu_epoch_blocked_instant_dma);
+			EE_DEADLINE_DELTA(ipu_epoch_chain_length_1);
+			EE_DEADLINE_DELTA(ipu_epoch_chain_length_2_3);
+			EE_DEADLINE_DELTA(ipu_epoch_chain_length_4_7);
+			EE_DEADLINE_DELTA(ipu_epoch_chain_length_8_15);
+			EE_DEADLINE_DELTA(ipu_epoch_chain_length_16_31);
+			EE_DEADLINE_DELTA(ipu_epoch_chain_length_32_63);
+			EE_DEADLINE_DELTA(ipu_epoch_chain_length_64_plus);
+#endif
 			EE_DEADLINE_DELTA(spu2_time_update_calls);
 			EE_DEADLINE_DELTA(spu2_time_update_samples);
 			EE_DEADLINE_DELTA(spu2_time_update_zero_samples);
@@ -1038,6 +1063,65 @@ namespace MTGS
 					joint_wait_scheduled_ee_cycles),
 				end.cpu_stage_profiler.joint_wait_last_ram_offset,
 				end.cpu_stage_profiler.joint_wait_last_ram_size);
+#if defined(VITASX2_CPU_PROFILER)
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=ipu_epoch_opportunity "
+				"from_ipu_wait=%llu candidates=%llu chains=%llu "
+				"continuations=%llu due_from=%llu due_to=%llu "
+				"due_process=%llu blocked_iop_active=%llu "
+				"blocked_no_due_ipu=%llu blocked_due_non_ipu=%llu "
+				"blocked_ee_counter=%llu blocked_cp0_timer=%llu "
+				"blocked_visible_exception=%llu blocked_vu=%llu "
+				"blocked_dmac_suspended=%llu blocked_instant_dma=%llu "
+				"chains_1=%llu chains_2_3=%llu chains_4_7=%llu "
+				"chains_8_15=%llu chains_16_31=%llu chains_32_63=%llu "
+				"chains_64_plus=%llu longest=%u",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(
+					ipu_epoch_from_ipu_wait_entries),
+				static_cast<unsigned long long>(
+					ipu_epoch_candidate_entries),
+				static_cast<unsigned long long>(
+					ipu_epoch_candidate_chains),
+				static_cast<unsigned long long>(
+					ipu_epoch_candidate_continuations),
+				static_cast<unsigned long long>(ipu_epoch_due_from_ipu),
+				static_cast<unsigned long long>(ipu_epoch_due_to_ipu),
+				static_cast<unsigned long long>(ipu_epoch_due_process),
+				static_cast<unsigned long long>(
+					ipu_epoch_blocked_iop_active),
+				static_cast<unsigned long long>(
+					ipu_epoch_blocked_no_due_ipu),
+				static_cast<unsigned long long>(
+					ipu_epoch_blocked_due_non_ipu),
+				static_cast<unsigned long long>(
+					ipu_epoch_blocked_ee_counter),
+				static_cast<unsigned long long>(
+					ipu_epoch_blocked_cp0_timer),
+				static_cast<unsigned long long>(
+					ipu_epoch_blocked_visible_exception),
+				static_cast<unsigned long long>(
+					ipu_epoch_blocked_vu),
+				static_cast<unsigned long long>(
+					ipu_epoch_blocked_dmac_suspended),
+				static_cast<unsigned long long>(
+					ipu_epoch_blocked_instant_dma),
+				static_cast<unsigned long long>(
+					ipu_epoch_chain_length_1),
+				static_cast<unsigned long long>(
+					ipu_epoch_chain_length_2_3),
+				static_cast<unsigned long long>(
+					ipu_epoch_chain_length_4_7),
+				static_cast<unsigned long long>(
+					ipu_epoch_chain_length_8_15),
+				static_cast<unsigned long long>(
+					ipu_epoch_chain_length_16_31),
+				static_cast<unsigned long long>(
+					ipu_epoch_chain_length_32_63),
+				static_cast<unsigned long long>(
+					ipu_epoch_chain_length_64_plus),
+				end.cpu_stage_profiler.ipu_epoch_longest_chain);
+#endif
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=spu2_sync "
 				"time_updates=%llu samples=%llu zero=%llu one=%llu "
@@ -1545,7 +1629,33 @@ namespace MTGS
 				end.iop.code_cache_block_records,
 				end.iop.code_cache_slots,
 				end.iop.semantic_block_descriptors);
-			const VitaPerformanceTelemetry::CpuProfileHotIopPcSnapshot
+			const VitaPerformanceTelemetry::CpuProfileHotPcSnapshot
+				hot_ee_pcs =
+					VitaPerformanceTelemetry::GetCpuProfileHotEePcSnapshot(
+						start.cpu_stage_profiler.statistical_ee_pc_sequence + 1,
+						end.cpu_stage_profiler.statistical_ee_pc_sequence + 1);
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_hot_ee_pc_summary "
+				"first_sequence=%llu next_sequence=%llu dropped=%llu invalid=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(hot_ee_pcs.first_sequence),
+				static_cast<unsigned long long>(hot_ee_pcs.next_sequence),
+				static_cast<unsigned long long>(hot_ee_pcs.dropped_samples),
+				static_cast<unsigned long long>(hot_ee_pcs.invalid_samples));
+			for (size_t i = 0; i < hot_ee_pcs.pcs.size(); i++)
+			{
+				const VitaPerformanceTelemetry::CpuProfileHotPc& hot_pc =
+					hot_ee_pcs.pcs[i];
+				if (hot_pc.samples == 0)
+					break;
+				output.WriteLn(
+					"Vita perf v=1 window=%llu kind=cpu_hot_ee_pc "
+					"rank=%u pc=0x%08x samples=%u",
+					static_cast<unsigned long long>(window),
+					static_cast<unsigned>(i + 1), hot_pc.pc,
+					hot_pc.samples);
+			}
+			const VitaPerformanceTelemetry::CpuProfileHotPcSnapshot
 				hot_iop_pcs =
 					VitaPerformanceTelemetry::GetCpuProfileHotIopPcSnapshot(
 						start.cpu_stage_profiler.statistical_iop_pc_sequence + 1,
@@ -1560,7 +1670,7 @@ namespace MTGS
 				static_cast<unsigned long long>(hot_iop_pcs.invalid_samples));
 			for (size_t i = 0; i < hot_iop_pcs.pcs.size(); i++)
 			{
-				const VitaPerformanceTelemetry::CpuProfileHotIopPc& hot_pc =
+				const VitaPerformanceTelemetry::CpuProfileHotPc& hot_pc =
 					hot_iop_pcs.pcs[i];
 				if (hot_pc.samples == 0)
 					break;

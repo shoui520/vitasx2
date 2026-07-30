@@ -112,6 +112,21 @@ namespace VitaPerformanceTelemetry
 		None,
 	};
 
+#if defined(VITASX2_CPU_PROFILER)
+	enum IpuEpochOpportunityBlocker : u32
+	{
+		IpuEpochBlockerIopActive = 1u << 0,
+		IpuEpochBlockerNoDueIpu = 1u << 1,
+		IpuEpochBlockerDueNonIpu = 1u << 2,
+		IpuEpochBlockerEeCounter = 1u << 3,
+		IpuEpochBlockerCp0Timer = 1u << 4,
+		IpuEpochBlockerVisibleException = 1u << 5,
+		IpuEpochBlockerVu = 1u << 6,
+		IpuEpochBlockerDmacSuspended = 1u << 7,
+		IpuEpochBlockerInstantDma = 1u << 8,
+	};
+#endif
+
 	enum class Spu2SyncReason : u8
 	{
 		Periodic,
@@ -217,6 +232,32 @@ namespace VitaPerformanceTelemetry
 		u64 joint_wait_scheduled_ee_cycles = 0;
 		u32 joint_wait_last_ram_offset = UINT32_MAX;
 		u32 joint_wait_last_ram_size = 0;
+#if defined(VITASX2_CPU_PROFILER)
+		u64 ipu_epoch_from_ipu_wait_entries = 0;
+		u64 ipu_epoch_candidate_entries = 0;
+		u64 ipu_epoch_candidate_chains = 0;
+		u64 ipu_epoch_candidate_continuations = 0;
+		u64 ipu_epoch_due_from_ipu = 0;
+		u64 ipu_epoch_due_to_ipu = 0;
+		u64 ipu_epoch_due_process = 0;
+		u64 ipu_epoch_blocked_iop_active = 0;
+		u64 ipu_epoch_blocked_no_due_ipu = 0;
+		u64 ipu_epoch_blocked_due_non_ipu = 0;
+		u64 ipu_epoch_blocked_ee_counter = 0;
+		u64 ipu_epoch_blocked_cp0_timer = 0;
+		u64 ipu_epoch_blocked_visible_exception = 0;
+		u64 ipu_epoch_blocked_vu = 0;
+		u64 ipu_epoch_blocked_dmac_suspended = 0;
+		u64 ipu_epoch_blocked_instant_dma = 0;
+		u64 ipu_epoch_chain_length_1 = 0;
+		u64 ipu_epoch_chain_length_2_3 = 0;
+		u64 ipu_epoch_chain_length_4_7 = 0;
+		u64 ipu_epoch_chain_length_8_15 = 0;
+		u64 ipu_epoch_chain_length_16_31 = 0;
+		u64 ipu_epoch_chain_length_32_63 = 0;
+		u64 ipu_epoch_chain_length_64_plus = 0;
+		u32 ipu_epoch_longest_chain = 0;
+#endif
 		u64 spu2_time_update_calls = 0;
 		u64 spu2_time_update_samples = 0;
 		u64 spu2_time_update_zero_samples = 0;
@@ -267,6 +308,7 @@ namespace VitaPerformanceTelemetry
 		u64 statistical_samples = 0;
 		u64 statistical_invalid_samples = 0;
 		u64 statistical_sampler_cpu_us = 0;
+		u64 statistical_ee_pc_sequence = 0;
 		u64 statistical_iop_pc_sequence = 0;
 		std::array<u64, CPU_STAGE_COUNT> statistical_stage_samples{};
 #endif
@@ -295,20 +337,20 @@ namespace VitaPerformanceTelemetry
 		std::array<CpuProfileHotEdge, CPU_PROFILE_HOT_EDGE_COUNT> iop{};
 	};
 
-	struct CpuProfileHotIopPc
+	struct CpuProfileHotPc
 	{
 		u32 pc = 0;
 		u32 samples = 0;
 	};
 
-	struct CpuProfileHotIopPcSnapshot
+	struct CpuProfileHotPcSnapshot
 	{
 		bool valid = false;
 		u64 first_sequence = 0;
 		u64 next_sequence = 0;
 		u64 dropped_samples = 0;
 		u64 invalid_samples = 0;
-		std::array<CpuProfileHotIopPc,
+		std::array<CpuProfileHotPc,
 			CPU_PROFILE_HOT_IOP_PC_COUNT> pcs{};
 	};
 
@@ -328,10 +370,19 @@ namespace VitaPerformanceTelemetry
 	CpuProfileHotEdgeSnapshot GetCpuProfileHotEdgeSnapshot(
 		u64 first_sequence, u64 next_sequence);
 #if defined(VITASX2_CPU_PROFILER)
-	CpuProfileHotIopPcSnapshot GetCpuProfileHotIopPcSnapshot(
+	CpuProfileHotPcSnapshot GetCpuProfileHotEePcSnapshot(
+		u64 first_sequence, u64 next_sequence);
+	CpuProfileHotPcSnapshot GetCpuProfileHotIopPcSnapshot(
 		u64 first_sequence, u64 next_sequence);
 #else
-	inline CpuProfileHotIopPcSnapshot GetCpuProfileHotIopPcSnapshot(
+	inline CpuProfileHotPcSnapshot GetCpuProfileHotEePcSnapshot(
+		u64 first_sequence, u64 next_sequence)
+	{
+		(void)first_sequence;
+		(void)next_sequence;
+		return {};
+	}
+	inline CpuProfileHotPcSnapshot GetCpuProfileHotIopPcSnapshot(
 		u64 first_sequence, u64 next_sequence)
 	{
 		(void)first_sequence;
@@ -347,6 +398,7 @@ namespace VitaPerformanceTelemetry
 	extern bool g_cpu_stage_profiler_enabled;
 	extern bool g_cpu_stage_sample_active;
 	extern std::atomic<u32> g_cpu_stage_statistical_marker;
+	extern std::atomic<u32> g_cpu_ee_statistical_pc;
 	extern std::atomic<u32> g_cpu_iop_statistical_pc;
 #endif
 
@@ -374,6 +426,10 @@ namespace VitaPerformanceTelemetry
 		u32 ram_offset, u32 ram_size);
 	void RecordJointWaitRamWriteOverlap(bool scheduler_active);
 	void RecordJointWaitActivation(u32 scheduled_ee_cycles);
+#if defined(VITASX2_CPU_PROFILER)
+	void RecordIpuEpochOpportunity(bool from_ipu_wait, u32 wait_pc,
+		u32 due_ipu_mask, u32 blocker_mask);
+#endif
 	void RecordSpu2TimeUpdate(u32 samples);
 	void RecordSpu2SyncReason(Spu2SyncReason reason);
 	void RecordSpu2MixerProbe(u32 active_voices, u32 stopped_voices,
@@ -572,6 +628,19 @@ namespace VitaPerformanceTelemetry
 		(void)scheduled_ee_cycles;
 #endif
 	}
+
+#if defined(VITASX2_CPU_PROFILER)
+	inline void RecordIpuEpochOpportunityIfProfiling(bool from_ipu_wait,
+		u32 wait_pc, u32 due_ipu_mask, u32 blocker_mask)
+	{
+		if (g_cpu_stage_profiler_enabled)
+		{
+			RecordIpuEpochOpportunity(from_ipu_wait, wait_pc,
+				due_ipu_mask, blocker_mask);
+		}
+	}
+
+#endif
 
 	inline void RecordSpu2TimeUpdateIfProfiling(u32 samples)
 	{

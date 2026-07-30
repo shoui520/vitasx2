@@ -701,6 +701,7 @@ namespace VitaEE
 		bool BeginBlock(bool use_vtlb_registers = false, bool use_cop1_exponent_mask_register = false,
 			bool use_vu0_base_register = false, size_t* linked_entry_offset = nullptr,
 			u32 linked_entry_pc = 0, bool linked_entry_needs_pc_sync = false);
+		bool EmitCpuProfilerBlockPc(u32 start_pc, bool preserve_temporaries = false);
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr,
 			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,

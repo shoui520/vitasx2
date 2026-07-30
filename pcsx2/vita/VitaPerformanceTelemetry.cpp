@@ -28,6 +28,7 @@ namespace VitaPerformanceTelemetry
 	bool g_cpu_stage_sample_active = false;
 	std::atomic<u32> g_cpu_stage_statistical_marker{
 		static_cast<u32>(CpuStage::Count)};
+	std::atomic<u32> g_cpu_ee_statistical_pc{UINT32_MAX};
 	std::atomic<u32> g_cpu_iop_statistical_pc{UINT32_MAX};
 
 	namespace
@@ -48,6 +49,8 @@ namespace VitaPerformanceTelemetry
 			u64 next_interval_sequence = 1;
 			size_t interval_write_index = 0;
 			size_t interval_record_count = 0;
+			u32 ipu_epoch_run_pc = UINT32_MAX;
+			u32 ipu_epoch_run_length = 0;
 		};
 		static_assert(
 			sizeof(CpuProfileIntervalRecord) *
@@ -58,14 +61,17 @@ namespace VitaPerformanceTelemetry
 			s_statistical_stage_samples{};
 		std::atomic<u32> s_statistical_samples{0};
 		std::atomic<u32> s_statistical_invalid_samples{0};
-		constexpr size_t STATISTICAL_IOP_PC_RING_SIZE = 4096;
-		struct StatisticalIopPcSample
+		constexpr size_t STATISTICAL_GUEST_PC_RING_SIZE = 4096;
+		struct StatisticalGuestPcSample
 		{
 			std::atomic<u64> sequence{0};
 			std::atomic<u32> pc{UINT32_MAX};
 		};
-		std::array<StatisticalIopPcSample,
-			STATISTICAL_IOP_PC_RING_SIZE> s_statistical_iop_pc_ring{};
+		std::array<StatisticalGuestPcSample,
+			STATISTICAL_GUEST_PC_RING_SIZE> s_statistical_ee_pc_ring{};
+		std::array<StatisticalGuestPcSample,
+			STATISTICAL_GUEST_PC_RING_SIZE> s_statistical_iop_pc_ring{};
+		std::atomic<u64> s_statistical_ee_pc_sequence{0};
 		std::atomic<u64> s_statistical_iop_pc_sequence{0};
 
 #if defined(__vita__)
@@ -100,18 +106,29 @@ namespace VitaPerformanceTelemetry
 					s_statistical_invalid_samples.fetch_add(
 						1, std::memory_order_relaxed);
 				}
-				if (stage == static_cast<u32>(CpuStage::IopGenerated))
+				const bool sample_ee =
+					stage == static_cast<u32>(CpuStage::EeGenerated);
+				const bool sample_iop =
+					stage == static_cast<u32>(CpuStage::IopGenerated);
+				if (sample_ee || sample_iop)
 				{
-					const u32 pc = g_cpu_iop_statistical_pc.load(
-						std::memory_order_relaxed);
+					std::atomic<u32>& published_pc = sample_ee ?
+						g_cpu_ee_statistical_pc :
+						g_cpu_iop_statistical_pc;
+					std::atomic<u64>& published_sequence = sample_ee ?
+						s_statistical_ee_pc_sequence :
+						s_statistical_iop_pc_sequence;
+					auto& ring = sample_ee ?
+						s_statistical_ee_pc_ring :
+						s_statistical_iop_pc_ring;
+					const u32 pc =
+						published_pc.load(std::memory_order_relaxed);
 					if (pc != UINT32_MAX)
 					{
-						const u64 sequence =
-							s_statistical_iop_pc_sequence.fetch_add(
-								1, std::memory_order_relaxed) + 1;
-						StatisticalIopPcSample& sample =
-							s_statistical_iop_pc_ring[
-								sequence % STATISTICAL_IOP_PC_RING_SIZE];
+						const u64 sequence = published_sequence.fetch_add(
+							1, std::memory_order_relaxed) + 1;
+						StatisticalGuestPcSample& sample =
+							ring[sequence % STATISTICAL_GUEST_PC_RING_SIZE];
 						sample.pc.store(pc, std::memory_order_relaxed);
 						sample.sequence.store(sequence,
 							std::memory_order_release);
@@ -226,12 +243,20 @@ namespace VitaPerformanceTelemetry
 		g_cpu_stage_statistical_marker.store(
 			static_cast<u32>(CpuStage::Count),
 			std::memory_order_relaxed);
+		g_cpu_ee_statistical_pc.store(UINT32_MAX,
+			std::memory_order_relaxed);
 		g_cpu_iop_statistical_pc.store(UINT32_MAX,
 			std::memory_order_relaxed);
 		s_statistical_samples.store(0, std::memory_order_relaxed);
 		s_statistical_invalid_samples.store(0, std::memory_order_relaxed);
+		s_statistical_ee_pc_sequence.store(0, std::memory_order_relaxed);
 		s_statistical_iop_pc_sequence.store(0, std::memory_order_relaxed);
-		for (StatisticalIopPcSample& sample : s_statistical_iop_pc_ring)
+		for (StatisticalGuestPcSample& sample : s_statistical_ee_pc_ring)
+		{
+			sample.pc.store(UINT32_MAX, std::memory_order_relaxed);
+			sample.sequence.store(0, std::memory_order_relaxed);
+		}
+		for (StatisticalGuestPcSample& sample : s_statistical_iop_pc_ring)
 		{
 			sample.pc.store(UINT32_MAX, std::memory_order_relaxed);
 			sample.sequence.store(0, std::memory_order_relaxed);
@@ -271,6 +296,8 @@ namespace VitaPerformanceTelemetry
 		snapshot.statistical_invalid_samples =
 			s_statistical_invalid_samples.load(
 				std::memory_order_relaxed);
+		snapshot.statistical_ee_pc_sequence =
+			s_statistical_ee_pc_sequence.load(std::memory_order_relaxed);
 		snapshot.statistical_iop_pc_sequence =
 			s_statistical_iop_pc_sequence.load(std::memory_order_relaxed);
 		for (size_t i = 0; i < CPU_STAGE_COUNT; i++)
@@ -484,10 +511,13 @@ namespace VitaPerformanceTelemetry
 	}
 
 #if defined(VITASX2_CPU_PROFILER)
-	CpuProfileHotIopPcSnapshot GetCpuProfileHotIopPcSnapshot(
-		u64 first_sequence, u64 next_sequence)
+	static CpuProfileHotPcSnapshot GetCpuProfileHotGuestPcSnapshot(
+		u64 first_sequence, u64 next_sequence,
+		const std::array<StatisticalGuestPcSample,
+			STATISTICAL_GUEST_PC_RING_SIZE>& ring,
+		const std::atomic<u64>& sequence_source)
 	{
-		CpuProfileHotIopPcSnapshot snapshot;
+		CpuProfileHotPcSnapshot snapshot;
 		snapshot.valid = s_cpu_stage_profiler.totals.valid;
 		snapshot.first_sequence = first_sequence;
 		snapshot.next_sequence = next_sequence;
@@ -495,11 +525,11 @@ namespace VitaPerformanceTelemetry
 			return snapshot;
 
 		const u64 published =
-			s_statistical_iop_pc_sequence.load(std::memory_order_acquire);
+			sequence_source.load(std::memory_order_acquire);
 		next_sequence = std::min(next_sequence, published + 1);
 		const u64 retained_first =
-			published >= STATISTICAL_IOP_PC_RING_SIZE ?
-				published - STATISTICAL_IOP_PC_RING_SIZE + 1 : 1;
+			published >= STATISTICAL_GUEST_PC_RING_SIZE ?
+				published - STATISTICAL_GUEST_PC_RING_SIZE + 1 : 1;
 		if (first_sequence < retained_first)
 		{
 			snapshot.dropped_samples = retained_first - first_sequence;
@@ -514,10 +544,9 @@ namespace VitaPerformanceTelemetry
 			bool valid = false;
 		};
 		std::array<Candidate, CANDIDATE_COUNT> candidates{};
-		const auto read_pc = [&snapshot](u64 sequence, u32* pc) {
-			const StatisticalIopPcSample& sample =
-				s_statistical_iop_pc_ring[
-					sequence % STATISTICAL_IOP_PC_RING_SIZE];
+		const auto read_pc = [&snapshot, &ring](u64 sequence, u32* pc) {
+			const StatisticalGuestPcSample& sample =
+				ring[sequence % STATISTICAL_GUEST_PC_RING_SIZE];
 			const u64 before =
 				sample.sequence.load(std::memory_order_acquire);
 			const u32 value = sample.pc.load(std::memory_order_relaxed);
@@ -564,7 +593,7 @@ namespace VitaPerformanceTelemetry
 			target->valid = true;
 		}
 
-		std::array<CpuProfileHotIopPc, CANDIDATE_COUNT> exact{};
+		std::array<CpuProfileHotPc, CANDIDATE_COUNT> exact{};
 		for (size_t i = 0; i < candidates.size(); i++)
 		{
 			if (candidates[i].valid)
@@ -586,13 +615,27 @@ namespace VitaPerformanceTelemetry
 			}
 		}
 		std::sort(exact.begin(), exact.end(),
-			[](const CpuProfileHotIopPc& left,
-				const CpuProfileHotIopPc& right) {
+			[](const CpuProfileHotPc& left,
+				const CpuProfileHotPc& right) {
 				return left.samples > right.samples;
 			});
 		std::copy_n(exact.begin(), snapshot.pcs.size(),
 			snapshot.pcs.begin());
 		return snapshot;
+	}
+
+	CpuProfileHotPcSnapshot GetCpuProfileHotEePcSnapshot(
+		u64 first_sequence, u64 next_sequence)
+	{
+		return GetCpuProfileHotGuestPcSnapshot(first_sequence, next_sequence,
+			s_statistical_ee_pc_ring, s_statistical_ee_pc_sequence);
+	}
+
+	CpuProfileHotPcSnapshot GetCpuProfileHotIopPcSnapshot(
+		u64 first_sequence, u64 next_sequence)
+	{
+		return GetCpuProfileHotGuestPcSnapshot(first_sequence, next_sequence,
+			s_statistical_iop_pc_ring, s_statistical_iop_pc_sequence);
 	}
 #endif
 
@@ -948,6 +991,104 @@ namespace VitaPerformanceTelemetry
 		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
 		totals.joint_wait_activations++;
 		totals.joint_wait_scheduled_ee_cycles += scheduled_ee_cycles;
+	}
+
+	static void FinishIpuEpochOpportunityRun()
+	{
+		const u32 length = s_cpu_stage_profiler.ipu_epoch_run_length;
+		if (length == 0)
+			return;
+
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.ipu_epoch_longest_chain =
+			std::max(totals.ipu_epoch_longest_chain, length);
+		if (length == 1)
+			totals.ipu_epoch_chain_length_1++;
+		else if (length < 4)
+			totals.ipu_epoch_chain_length_2_3++;
+		else if (length < 8)
+			totals.ipu_epoch_chain_length_4_7++;
+		else if (length < 16)
+			totals.ipu_epoch_chain_length_8_15++;
+		else if (length < 32)
+			totals.ipu_epoch_chain_length_16_31++;
+		else if (length < 64)
+			totals.ipu_epoch_chain_length_32_63++;
+		else
+			totals.ipu_epoch_chain_length_64_plus++;
+		s_cpu_stage_profiler.ipu_epoch_run_pc = UINT32_MAX;
+		s_cpu_stage_profiler.ipu_epoch_run_length = 0;
+	}
+
+	void RecordIpuEpochOpportunity(bool from_ipu_wait, u32 wait_pc,
+		u32 due_ipu_mask, u32 blocker_mask)
+	{
+		// This is an observational census, not admission. A candidate is one
+		// complete scheduler boundary at which the exact EE from-IPU CHCR.STR
+		// poll and retained IOP wait are still valid, at least one IPU callback
+		// is due, and no other currently visible owner must run. Consecutive
+		// candidates at the same EE wait PC are the scheduler passes an exact
+		// IPU command epoch could replace while still checking every fence
+		// before advancing to the next callback deadline.
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		if (!from_ipu_wait)
+		{
+			FinishIpuEpochOpportunityRun();
+			return;
+		}
+
+		totals.ipu_epoch_from_ipu_wait_entries++;
+		if (due_ipu_mask & 1u)
+			totals.ipu_epoch_due_from_ipu++;
+		if (due_ipu_mask & 2u)
+			totals.ipu_epoch_due_to_ipu++;
+		if (due_ipu_mask & 4u)
+			totals.ipu_epoch_due_process++;
+
+#define IPU_EPOCH_BLOCKER_COUNTER(flag, counter) \
+		if (blocker_mask & (flag)) \
+			totals.counter++
+		IPU_EPOCH_BLOCKER_COUNTER(
+			IpuEpochBlockerIopActive, ipu_epoch_blocked_iop_active);
+		IPU_EPOCH_BLOCKER_COUNTER(
+			IpuEpochBlockerNoDueIpu, ipu_epoch_blocked_no_due_ipu);
+		IPU_EPOCH_BLOCKER_COUNTER(
+			IpuEpochBlockerDueNonIpu, ipu_epoch_blocked_due_non_ipu);
+		IPU_EPOCH_BLOCKER_COUNTER(
+			IpuEpochBlockerEeCounter, ipu_epoch_blocked_ee_counter);
+		IPU_EPOCH_BLOCKER_COUNTER(
+			IpuEpochBlockerCp0Timer, ipu_epoch_blocked_cp0_timer);
+		IPU_EPOCH_BLOCKER_COUNTER(
+			IpuEpochBlockerVisibleException,
+			ipu_epoch_blocked_visible_exception);
+		IPU_EPOCH_BLOCKER_COUNTER(
+			IpuEpochBlockerVu, ipu_epoch_blocked_vu);
+		IPU_EPOCH_BLOCKER_COUNTER(
+			IpuEpochBlockerDmacSuspended,
+			ipu_epoch_blocked_dmac_suspended);
+		IPU_EPOCH_BLOCKER_COUNTER(
+			IpuEpochBlockerInstantDma, ipu_epoch_blocked_instant_dma);
+#undef IPU_EPOCH_BLOCKER_COUNTER
+
+		if (blocker_mask != 0)
+		{
+			FinishIpuEpochOpportunityRun();
+			return;
+		}
+
+		totals.ipu_epoch_candidate_entries++;
+		if (s_cpu_stage_profiler.ipu_epoch_run_length != 0 &&
+			s_cpu_stage_profiler.ipu_epoch_run_pc == wait_pc)
+		{
+			s_cpu_stage_profiler.ipu_epoch_run_length++;
+			totals.ipu_epoch_candidate_continuations++;
+			return;
+		}
+
+		FinishIpuEpochOpportunityRun();
+		totals.ipu_epoch_candidate_chains++;
+		s_cpu_stage_profiler.ipu_epoch_run_pc = wait_pc;
+		s_cpu_stage_profiler.ipu_epoch_run_length = 1;
 	}
 
 	void RecordSpu2TimeUpdate(u32 samples)
