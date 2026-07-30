@@ -797,8 +797,8 @@ namespace VitaPerformanceTelemetry
 	}
 
 	void RecordEeDeadlineHorizon(s64 owner_horizon_delta,
-		EeDeadlineOwner owner, s32 ee_iop_balance, bool timer_enabled,
-		u32 timer_delta, bool iop_rapid)
+		EeDeadlineOwner owner, u32 ee_event_owner, s32 ee_iop_balance,
+		bool timer_enabled, u32 timer_delta, bool iop_rapid)
 	{
 		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
 		totals.ee_deadline_shadow_entries++;
@@ -812,6 +812,12 @@ namespace VitaPerformanceTelemetry
 				break;
 			case EeDeadlineOwner::EeEvent:
 				totals.ee_deadline_owner_event++;
+				if (ee_event_owner <
+					totals.ee_deadline_event_owners.size())
+				{
+					totals.ee_deadline_event_owners[
+						ee_event_owner]++;
+				}
 				break;
 			case EeDeadlineOwner::None:
 				totals.ee_deadline_owner_none++;

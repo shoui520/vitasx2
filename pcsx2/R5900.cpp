@@ -855,6 +855,9 @@ static __fi void VitaIopEventTestFromEe()
 }
 
 #if defined(VITASX2_CPU_PROFILER)
+static_assert(VitaPerformanceTelemetry::EE_DEADLINE_EVENT_SLOT_COUNT ==
+	static_cast<size_t>(VU_MTVU_BUSY) + 1);
+
 static __fi void VitaRecordEeDeadlineHorizon(
 	s32 iop_delta, bool iop_rapid)
 {
@@ -865,6 +868,7 @@ static __fi void VitaRecordEeDeadlineHorizon(
 	// product deadline.
 	s64 owner_delta = iop_delta;
 	auto owner = VitaPerformanceTelemetry::EeDeadlineOwner::Iop;
+	u32 ee_event_owner = UINT32_MAX;
 
 	const s64 counter_delta = static_cast<s64>(
 		nextStartCounter + static_cast<s64>(nextDeltaCounter) -
@@ -900,6 +904,7 @@ static __fi void VitaRecordEeDeadlineHorizon(
 			{
 				owner_delta = event_delta;
 				owner = VitaPerformanceTelemetry::EeDeadlineOwner::EeEvent;
+				ee_event_owner = event;
 			}
 		}
 	}
@@ -909,7 +914,8 @@ static __fi void VitaRecordEeDeadlineHorizon(
 	const u32 timer_delta =
 		cpuRegs.CP0.n.Compare - cpuRegs.CP0.n.Count;
 	VitaPerformanceTelemetry::RecordEeDeadlineHorizonIfProfiling(
-		owner_delta, owner, EEsCycle, timer_enabled, timer_delta, iop_rapid);
+		owner_delta, owner, ee_event_owner, EEsCycle, timer_enabled,
+		timer_delta, iop_rapid);
 }
 #endif
 #endif

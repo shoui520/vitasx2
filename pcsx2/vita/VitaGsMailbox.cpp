@@ -779,6 +779,20 @@ namespace MTGS
 			EE_DEADLINE_DELTA(ee_deadline_owner_counter);
 			EE_DEADLINE_DELTA(ee_deadline_owner_event);
 			EE_DEADLINE_DELTA(ee_deadline_owner_none);
+#if defined(VITASX2_CPU_PROFILER)
+			std::array<u64,
+				VitaPerformanceTelemetry::EE_DEADLINE_EVENT_SLOT_COUNT>
+				ee_deadline_event_owners{};
+			for (size_t event = 0;
+				event < ee_deadline_event_owners.size(); event++)
+			{
+				ee_deadline_event_owners[event] = CounterDelta(
+					end.cpu_stage_profiler
+						.ee_deadline_event_owners[event],
+					start.cpu_stage_profiler
+						.ee_deadline_event_owners[event]);
+			}
+#endif
 			EE_DEADLINE_DELTA(ee_deadline_horizon_le_3072);
 			EE_DEADLINE_DELTA(ee_deadline_horizon_gt_3072);
 			EE_DEADLINE_DELTA(ee_deadline_horizon_gt_6144);
@@ -939,6 +953,47 @@ namespace MTGS
 				static_cast<unsigned long long>(ee_iop_balance_positive),
 				static_cast<unsigned long long>(ee_iop_balance_nonpositive),
 				static_cast<unsigned long long>(ee_iop_ahead_gt_3072));
+#if defined(VITASX2_CPU_PROFILER)
+			output.WriteLn(
+				"Vita perf v=1 window=%llu "
+				"kind=ee_deadline_event_owners "
+				"vif0=%llu vif1=%llu gif=%llu from_ipu=%llu "
+				"to_ipu=%llu sif0=%llu sif1=%llu from_spr=%llu "
+				"to_spr=%llu mfifo_vif=%llu mfifo_gif=%llu "
+				"vu0_finish=%llu vu1_finish=%llu ipu_process=%llu "
+				"mtvu_busy=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_VIF0]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_VIF1]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_GIF]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_FROM_IPU]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_TO_IPU]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_SIF0]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_SIF1]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_FROM_SPR]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_TO_SPR]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_MFIFO_VIF]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[DMAC_MFIFO_GIF]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[VIF_VU0_FINISH]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[VIF_VU1_FINISH]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[IPU_PROCESS]),
+				static_cast<unsigned long long>(
+					ee_deadline_event_owners[VU_MTVU_BUSY]));
+#endif
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=joint_wait_shadow "
 				"ee_wait=%llu generic_ram=%llu poll_call_ram=%llu "

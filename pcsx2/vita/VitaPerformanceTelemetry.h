@@ -85,6 +85,9 @@ namespace VitaPerformanceTelemetry
 		static_cast<size_t>(CpuStage::Count);
 	static constexpr u32 CPU_STAGE_SAMPLE_PERIOD = 1024;
 	static constexpr size_t CPU_PROFILE_CODE_WORD_COUNT = 8;
+	// R5900.h::EE_EventType is dense through VU_MTVU_BUSY. R5900.cpp keeps
+	// this profiler-only storage tied to that owning enum with a static assert.
+	static constexpr size_t EE_DEADLINE_EVENT_SLOT_COUNT = 21;
 	// PES currently produces about 214 records per 120-VSync measurement
 	// window at the 1/1024 cadence. 384 widened records retain a complete
 	// ordinary window while keeping fixed interval storage at 96 KiB.
@@ -169,6 +172,10 @@ namespace VitaPerformanceTelemetry
 		u64 ee_deadline_owner_counter = 0;
 		u64 ee_deadline_owner_event = 0;
 		u64 ee_deadline_owner_none = 0;
+#if defined(VITASX2_CPU_PROFILER)
+		std::array<u64, EE_DEADLINE_EVENT_SLOT_COUNT>
+			ee_deadline_event_owners{};
+#endif
 		u64 ee_deadline_horizon_le_3072 = 0;
 		u64 ee_deadline_horizon_gt_3072 = 0;
 		u64 ee_deadline_horizon_gt_6144 = 0;
@@ -349,8 +356,8 @@ namespace VitaPerformanceTelemetry
 	void RecordIopCounterUpdate(
 		bool spu2_only, u32 spu2_deadline_constraints);
 	void RecordEeDeadlineHorizon(s64 owner_horizon_delta,
-		EeDeadlineOwner owner, s32 ee_iop_balance, bool timer_enabled,
-		u32 timer_delta, bool iop_rapid);
+		EeDeadlineOwner owner, u32 ee_event_owner, s32 ee_iop_balance,
+		bool timer_enabled, u32 timer_delta, bool iop_rapid);
 	void RecordEeSchedulerPath(bool iop_only, bool iop_retained_wait);
 	void RecordJointWaitShadow(u32 ee_wait_origin, bool iop_retained_wait,
 		s64 horizon_delta, bool unknown_writer, bool blocked,
@@ -466,18 +473,21 @@ namespace VitaPerformanceTelemetry
 	}
 
 	inline void RecordEeDeadlineHorizonIfProfiling(
-		s64 owner_horizon_delta, EeDeadlineOwner owner, s32 ee_iop_balance,
-		bool timer_enabled, u32 timer_delta, bool iop_rapid)
+		s64 owner_horizon_delta, EeDeadlineOwner owner, u32 ee_event_owner,
+		s32 ee_iop_balance, bool timer_enabled, u32 timer_delta,
+		bool iop_rapid)
 	{
 #if defined(VITASX2_CPU_PROFILER)
 		if (g_cpu_stage_profiler_enabled)
 		{
 			RecordEeDeadlineHorizon(owner_horizon_delta, owner,
-				ee_iop_balance, timer_enabled, timer_delta, iop_rapid);
+				ee_event_owner, ee_iop_balance, timer_enabled,
+				timer_delta, iop_rapid);
 		}
 #else
 		(void)owner_horizon_delta;
 		(void)owner;
+		(void)ee_event_owner;
 		(void)ee_iop_balance;
 		(void)timer_enabled;
 		(void)timer_delta;
