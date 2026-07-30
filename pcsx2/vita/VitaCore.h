@@ -646,6 +646,7 @@ void VitaSetA32IopWaitResumeKindEntryEnabled(bool enabled);
 void VitaSetA32IopWaitResumeClockEntryEnabled(bool enabled);
 void VitaSetA32IopWaitResumeNoLinkEntryEnabled(bool enabled);
 void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled);
+void VitaSetA32IopSchedulerPreEventWaitAdvanceEnabled(bool enabled);
 VitaA32IopDispatchProfile VitaGetA32IopDispatchProfile();
 void VitaRecordA32IopWaitLoopFastForward(u64 iop_cycles, u32 block_cycles);
 void VitaRecordA32IopWaitLoopDispatchElision();

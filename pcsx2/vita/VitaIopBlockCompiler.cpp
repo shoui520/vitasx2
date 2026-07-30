@@ -115,6 +115,10 @@ static bool s_qemuIopSchedulerDirectResumeEnabled = true;
 static bool s_qemuIopNullOpcodeCompilationEnabled = true;
 static size_t s_qemuIopCodeCacheCapacityLimit = 0;
 static u64 s_qemuIopInlineWaitFastForwards = 0;
+extern "C"
+{
+	u32 g_vita_a32_iop_scheduler_pre_event_wait_advance_enabled = 1;
+}
 #endif
 
 namespace
@@ -212,6 +216,7 @@ namespace
 	constexpr size_t IOP_CYCLE_EE_OFFSET = offsetof(psxRegisters, iopCycleEE);
 	constexpr size_t IOP_CYCLE_EE_CARRY_OFFSET =
 		offsetof(psxRegisters, iopCycleEECarry);
+	constexpr size_t IOP_BREAK_OFFSET = offsetof(psxRegisters, iopBreak);
 	constexpr u32 IOP_WAIT_CYCLES = 384;
 
 	constexpr unsigned RS(u32 op) { return (op >> 21) & 0x1f; }
@@ -14164,9 +14169,87 @@ namespace VitaIOP
 	VITA_IOP_DEFINE_CLOCK_WAIT_RESUME_THUNK(
 		VitaIopA32ExecuteProviderWaitResumeUnconditionalPs1Private,
 		"VitaIopA32ProviderWaitResumeUnconditionalPs1Body")
+
+#if defined(VITASX2_IOP_SCHEDULER_PRE_EVENT_WAIT_ADVANCE_CONTROL)
 	VITA_IOP_DEFINE_CLOCK_WAIT_RESUME_THUNK(
 		VitaIopA32ExecuteProviderWaitResumeUnconditionalNoLinkNormalPrivate,
 		"VitaIopA32ProviderWaitResumeUnconditionalNoLinkNormalBody")
+#else
+#if defined(VITASX2_QEMU_VALIDATION)
+#define VITA_IOP_PRE_EVENT_WAIT_VALIDATION_GATE \
+			"movw r12, #:lower16:g_vita_a32_iop_scheduler_pre_event_wait_advance_enabled\n" \
+			"movt r12, #:upper16:g_vita_a32_iop_scheduler_pre_event_wait_advance_enabled\n" \
+			"ldr r12, [r12]\n" \
+			"cmp r12, #0\n" \
+			"beq 1f\n"
+#else
+#define VITA_IOP_PRE_EVENT_WAIT_VALIDATION_GATE
+#endif
+
+	extern "C" __attribute__((naked, noinline, aligned(32))) s32
+	VitaIopA32ExecuteProviderWaitResumeUnconditionalNoLinkNormalPrivate(
+		void*, s32)
+	{
+		static_assert(CYCLE_OFFSET + sizeof(u64) <= 4095);
+		static_assert(IOP_NEXT_EVENT_CYCLE_OFFSET + sizeof(u64) <= 4095);
+		static_assert(IOP_CYCLE_EE_OFFSET <= 4095);
+		static_assert(IOP_BREAK_OFFSET <= 4095);
+		asm volatile(
+			// PCSX2 owner: x86/iR3000A.cpp::iPsxBranchTest(). A retained
+			// unconditional no-link wait has no architectural work before the
+			// next IOP event. When this EE budget ends no later than that event,
+			// advance the exact 8:1 clock and return directly from the scheduler
+			// seam. Event crossings retain the complete provider body below,
+			// including iopEventTest() and post-event source/PC identity checks.
+			VITA_IOP_PRE_EVENT_WAIT_VALIDATION_GATE
+			"cmp r1, #0\n"
+			"ble 1f\n"
+			"movw r12, #:lower16:psxRegs\n"
+			"movt r12, #:upper16:psxRegs\n"
+			"ldr r2, [r12, #%c0]\n"
+			"ldr r3, [r12, #%c1]\n"
+			"add r3, r1, #7\n"
+			"mov r3, r3, lsr #3\n"
+			"adds r2, r2, r3\n"
+			"ldr r3, [r12, #%c1]\n"
+			"adc r3, r3, #0\n"
+			"ldr r12, [r12, #%c3]\n"
+			"cmp r3, r12\n"
+			"blo 2f\n"
+			"bhi 1f\n"
+			"movw r12, #:lower16:psxRegs\n"
+			"movt r12, #:upper16:psxRegs\n"
+			"ldr r12, [r12, #%c2]\n"
+			"cmp r2, r12\n"
+			"bls 2f\n"
+			"1:\n"
+			"ldr r2, [r0, #4]\n"
+			"ldr r0, [r0, #0]\n"
+			"sub sp, sp, #36\n"
+			"str lr, [sp, #32]\n"
+			"b VitaIopA32ProviderWaitResumeUnconditionalNoLinkNormalBody + 4\n"
+			"2:\n"
+			"movw r12, #:lower16:psxRegs\n"
+			"movt r12, #:upper16:psxRegs\n"
+			"str r2, [r12, #%c0]\n"
+			"str r3, [r12, #%c1]\n"
+			"add r3, r1, #7\n"
+			"mov r3, r3, lsr #3\n"
+			"sub r0, r1, r3, lsl #3\n"
+			"mov r2, #0\n"
+			"str r2, [r12, #%c4]\n"
+			"str r0, [r12, #%c5]\n"
+			"bx lr\n"
+			:
+			: "i"(CYCLE_OFFSET), "i"(CYCLE_OFFSET + sizeof(u32)),
+			  "i"(IOP_NEXT_EVENT_CYCLE_OFFSET),
+			  "i"(IOP_NEXT_EVENT_CYCLE_OFFSET + sizeof(u32)),
+			  "i"(IOP_BREAK_OFFSET), "i"(IOP_CYCLE_EE_OFFSET)
+			: "memory", "cc");
+	}
+
+#undef VITA_IOP_PRE_EVENT_WAIT_VALIDATION_GATE
+#endif
 	VITA_IOP_DEFINE_CLOCK_WAIT_RESUME_THUNK(
 		VitaIopA32ExecuteProviderWaitResumeUnconditionalNoLinkPs1Private,
 		"VitaIopA32ProviderWaitResumeUnconditionalNoLinkPs1Body")

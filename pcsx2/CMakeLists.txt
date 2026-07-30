@@ -218,6 +218,12 @@ add_library(pcsx2core STATIC
 set_source_files_properties(vita/VitaIopBlockCompiler.cpp PROPERTIES
 	COMPILE_OPTIONS "-fno-pie;-marm"
 )
+if(VITASX2_IOP_SCHEDULER_PRE_EVENT_WAIT_ADVANCE_CONTROL)
+	set_property(SOURCE vita/VitaIopBlockCompiler.cpp APPEND PROPERTY
+		COMPILE_DEFINITIONS
+			VITASX2_IOP_SCHEDULER_PRE_EVENT_WAIT_ADVANCE_CONTROL=1
+	)
+endif()
 
 # The VU1 generated-code ABI owns Q4-Q7 for VF/ACC residency.  Its outer
 # execution wrapper preserves D8-D15 once for AAPCS; prevent the C++ control

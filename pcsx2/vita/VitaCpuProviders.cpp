@@ -2346,6 +2346,14 @@ void VitaSetA32IopWaitResumeDescriptorSpecializationEnabled(bool enabled)
 {
 	VitaIOP::BlockExecutor::SetWaitResumeDescriptorSpecializationEnabled(enabled);
 }
+
+extern "C" u32 g_vita_a32_iop_scheduler_pre_event_wait_advance_enabled;
+
+void VitaSetA32IopSchedulerPreEventWaitAdvanceEnabled(bool enabled)
+{
+	g_vita_a32_iop_scheduler_pre_event_wait_advance_enabled =
+		enabled ? 1u : 0u;
+}
 #endif
 
 VitaA32IopProviderStats VitaGetA32IopProviderStats()
