@@ -61,6 +61,7 @@ void VitaSetA32IopSchedulerDirectEventContext(uptr context);
 extern bool g_vita_a32_iop_retained_unconditional_normal_wait;
 #if defined(VITASX2_QEMU_VALIDATION)
 extern bool g_vita_a32_iop_retained_wait_coalescing_validation_enabled;
+extern bool g_vita_a32_iop_retained_external_horizon_validation_enabled;
 extern bool g_vita_a32_iop_deadline_gate_validation_enabled;
 extern bool g_vita_ee_interleave_scheduler_validation_enabled;
 extern u64 g_vita_ee_full_scheduler_validation_entries;
@@ -75,6 +76,17 @@ bool VitaA32IopRetainedWaitCoalescingActive()
 		g_vita_a32_iop_retained_unconditional_normal_wait;
 #else
 	return g_vita_a32_iop_retained_unconditional_normal_wait;
+#endif
+}
+
+inline __attribute__((always_inline))
+bool VitaA32IopRetainedExternalHorizonActive()
+{
+#if defined(VITASX2_QEMU_VALIDATION)
+	return g_vita_a32_iop_retained_external_horizon_validation_enabled &&
+		VitaA32IopRetainedWaitCoalescingActive();
+#else
+	return VitaA32IopRetainedWaitCoalescingActive();
 #endif
 }
 namespace VitaIOP

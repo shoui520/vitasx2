@@ -5,6 +5,7 @@
 
 #if defined(VITASX2_CPU_PROFILER)
 #include "common/Threading.h"
+#include "IopMem.h"
 #include "Memory.h"
 #include "SPU2/spu2.h"
 #endif
@@ -409,8 +410,8 @@ namespace VitaPerformanceTelemetry
 				target->end_pc = end_pc;
 				target->estimate = inherited + 1;
 				target->valid = true;
-				if (ee)
-					target->code_start = record.ee_code_start;
+				target->code_start = ee ?
+					record.ee_code_start : record.iop_code_start;
 			}
 			return candidates;
 		};
@@ -682,6 +683,14 @@ namespace VitaPerformanceTelemetry
 			s_cpu_stage_profiler.current_interval.ee_code_start[i] =
 				memRead32(ee_pc + static_cast<u32>(i * sizeof(u32)));
 		}
+		// Capture code on CPU0 at the same sparse boundary as the EE words.
+		// The safe accessor has no MMIO side effects, so hot IOP regions can
+		// be classified structurally without reading guest state on the
+		// observer or GS thread.
+		(void)iopMemSafeReadBytes(iop_pc,
+			s_cpu_stage_profiler.current_interval.iop_code_start.data(),
+			static_cast<u32>(
+				sizeof(s_cpu_stage_profiler.current_interval.iop_code_start)));
 		s_cpu_stage_profiler.totals.stage_entries[
 			static_cast<size_t>(CpuStage::Scheduler)]++;
 	}

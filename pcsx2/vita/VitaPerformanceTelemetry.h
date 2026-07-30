@@ -98,9 +98,9 @@ namespace VitaPerformanceTelemetry
 	// this profiler-only storage tied to that owning enum with a static assert.
 	static constexpr size_t EE_DEADLINE_EVENT_SLOT_COUNT = 21;
 	// PES currently produces about 214 records per 120-VSync measurement
-	// window at the 1/1024 cadence. 350 widened records retain a complete
+	// window at the 1/1024 cadence. 310 widened records retain a complete
 	// ordinary window while keeping fixed interval storage below 96 KiB.
-	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 350;
+	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 310;
 	static constexpr size_t CPU_PROFILE_HOT_EDGE_COUNT = 8;
 	static constexpr size_t CPU_PROFILE_HOT_IOP_PC_COUNT = 8;
 
@@ -160,6 +160,7 @@ namespace VitaPerformanceTelemetry
 		u32 iop_pc_start = 0;
 		u32 iop_pc_end = 0;
 		std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> ee_code_start{};
+		std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> iop_code_start{};
 		u16 flags = 0;
 		u16 stage_count = 0;
 		std::array<u32, CPU_STAGE_COUNT> stage_time_us{};
