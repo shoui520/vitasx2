@@ -14,6 +14,9 @@
 #include "IPU/yuv2rgb.h"
 #include "IPU/IPU_MultiISA.h"
 #include "DebugTools/IpuTrace.h"
+#if defined(VITASX2_CPU_PROFILER)
+#include "vita/VitaPerformanceTelemetry.h"
+#endif
 
 #if defined(ARCH_ARM32)
 #include <arm_neon.h>
@@ -658,6 +661,10 @@ static __forceinline void IDCT_CopyDcOnlySelected(s16* block, u8* dest, const in
 
 __ri static void IDCT_Copy(s16* block, u8* dest, const int stride, bool dc_only)
 {
+#if defined(VITASX2_CPU_PROFILER)
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::IpuIdct);
+#endif
 	if (dc_only && ((block[0] & 7) != 4))
 	{
 		IDCT_CopyDcOnlySelected(block, dest, stride);
@@ -694,6 +701,10 @@ void IpuIdctCopySelectedForValidation(s16* block, u8* dest, int stride, bool dc_
 // stride = increment for dest in 16-bit units (typically either 8 [128 bits] or 16 [256 bits]).
 __ri static void IDCT_Add(const int last, s16* block, s16* dest, const int stride)
 {
+#if defined(VITASX2_CPU_PROFILER)
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::IpuIdct);
+#endif
 	// on the IPU, stride is always assured to be multiples of QWC (bottom 3 bits are 0).
 
 	if (last != 129 || (block[0] & 7) == 4)
@@ -1292,6 +1303,10 @@ __fi static void finishmpeg2sliceIDEC()
 
 __ri static bool mpeg2sliceIDEC()
 {
+#if defined(VITASX2_CPU_PROFILER)
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::IpuDecode);
+#endif
 	u16 code;
 	static bool ready_to_decode = true;
 	switch (ipu_cmd.pos[0])
@@ -1587,6 +1602,10 @@ finish_idec:
 
 __fi static bool mpeg2_slice()
 {
+#if defined(VITASX2_CPU_PROFILER)
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::IpuDecode);
+#endif
 	int DCT_offset, DCT_stride;
 	static bool ready_to_decode = true;
 
@@ -2168,6 +2187,10 @@ __ri static bool ipuPACK(tIPU_CMD_CSC csc)
 
 __fi static void ipu_csc(macroblock_8& mb8, macroblock_rgb32& rgb32, int sgn)
 {
+#if defined(VITASX2_CPU_PROFILER)
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::IpuCsc);
+#endif
 	yuv2rgb();
 	ipu_csc_postprocess(rgb32, sgn);
 }

@@ -148,25 +148,16 @@ __ri void yuv2rgb_sse2()
 #include <arm_neon.h>
 #endif
 
-static __forceinline int8x16_t LoadChromaSignedShifted(const u8* chroma)
+static __forceinline int16x8_t LoadChromaSignedShifted(const u8* chroma)
 {
-	const int8x8_t c_bias = vdup_n_s8(s8(IPU_C_BIAS));
-	int8x8_t bytes = vld1_s8(reinterpret_cast<const s8*>(chroma));
-	bytes = veor_s8(bytes, c_bias);
-	const int8x8x2_t shifted = vzip_s8(vdup_n_s8(0), bytes);
-	return vcombine_s8(shifted.val[0], shifted.val[1]);
+	const uint16x8_t centered = vsubl_u8(
+		vld1_u8(chroma), vdup_n_u8(IPU_C_BIAS));
+	return vshlq_n_s16(vreinterpretq_s16_u16(centered), 8);
 }
 
 static __forceinline int16x8_t MulHiS16(int16x8_t a, int16x8_t b)
 {
 	return vshrq_n_s16(vqdmulhq_s16(a, b), 1);
-}
-
-static __forceinline int16x8_t MulHiU16(uint16x8_t a, uint16x8_t b)
-{
-	const uint32x4_t lo = vmull_u16(vget_low_u16(a), vget_low_u16(b));
-	const uint32x4_t hi = vmull_u16(vget_high_u16(a), vget_high_u16(b));
-	return vreinterpretq_s16_u16(vcombine_u16(vshrn_n_u32(lo, 16), vshrn_n_u32(hi, 16)));
 }
 
 static __forceinline uint8x16_t InterleaveEvenOdd(uint8x8_t even, uint8x8_t odd)
@@ -178,16 +169,16 @@ static __forceinline uint8x16_t InterleaveEvenOdd(uint8x8_t even, uint8x8_t odd)
 __ri void yuv2rgb_neon()
 {
 	const uint8x16_t y_bias = vdupq_n_u8(IPU_Y_BIAS);
-	const uint16x8_t y_mask = vdupq_n_u16(0xFF00);
-	// Specifying round off instead of round down as everywhere else
-	// implies that this is right
-	const int16x8_t round_1bit = vdupq_n_s16(0x0001);
 
-	const uint16x8_t y_coefficient = vdupq_n_u16(IPU_Y_COEFF << 2);
-	const int16x8_t gcr_coefficient = vdupq_n_s16(s16(u16(IPU_GCR_COEFF) << 2));
-	const int16x8_t gcb_coefficient = vdupq_n_s16(s16(u16(IPU_GCB_COEFF) << 2));
-	const int16x8_t rcr_coefficient = vdupq_n_s16(s16(IPU_RCR_COEFF << 2));
-	const int16x8_t bcb_coefficient = vdupq_n_s16(s16(IPU_BCB_COEFF << 2));
+	const uint8x8_t y_coefficient = vdup_n_u8(IPU_Y_COEFF);
+	const int16x8_t gcr_coefficient =
+		vdupq_n_s16(s16(u16(IPU_GCR_COEFF) << 2));
+	const int16x8_t gcb_coefficient =
+		vdupq_n_s16(s16(u16(IPU_GCB_COEFF) << 2));
+	const int16x8_t rcr_coefficient =
+		vdupq_n_s16(s16(IPU_RCR_COEFF << 2));
+	const int16x8_t bcb_coefficient =
+		vdupq_n_s16(s16(IPU_BCB_COEFF << 2));
 
 	// Alpha set to 0x80 here. The threshold stuff is done later.
 	const uint8x16_t alpha = vdupq_n_u8(IPU_C_BIAS);
@@ -196,41 +187,47 @@ __ri void yuv2rgb_neon()
 	{
 		// could skip the loadl_epi64 but most SSE instructions require 128-bit
 		// alignment so two versions would be needed.
-		const int8x16_t cb = LoadChromaSignedShifted(&decoder.mb8.Cb[n][0]);
-		const int8x16_t cr = LoadChromaSignedShifted(&decoder.mb8.Cr[n][0]);
+		const int16x8_t cb = LoadChromaSignedShifted(&decoder.mb8.Cb[n][0]);
+		const int16x8_t cr = LoadChromaSignedShifted(&decoder.mb8.Cr[n][0]);
 
-		const int16x8_t rc = MulHiS16(vreinterpretq_s16_s8(cr), rcr_coefficient);
-		const int16x8_t gc = vqaddq_s16(MulHiS16(vreinterpretq_s16_s8(cr), gcr_coefficient), MulHiS16(vreinterpretq_s16_s8(cb), gcb_coefficient));
-		const int16x8_t bc = MulHiS16(vreinterpretq_s16_s8(cb), bcb_coefficient);
+		const int16x8_t rc = MulHiS16(cr, rcr_coefficient);
+		const int16x8_t gc = vqaddq_s16(
+			MulHiS16(cr, gcr_coefficient),
+			MulHiS16(cb, gcb_coefficient));
+		const int16x8_t bc = MulHiS16(cb, bcb_coefficient);
 
 		for (int m = 0; m < 2; ++m)
 		{
 			uint8x16_t y = vld1q_u8(&decoder.mb8.Y[n * 2 + m][0]);
 			y = vqsubq_u8(y, y_bias);
-			// Y << 8 for pixels 0, 2, 4, 6, 8, 10, 12, 14
-			uint16x8_t y_even = vshlq_n_u16(vreinterpretq_u16_u8(y), 8);
-			// Y << 8 for pixels 1, 3, 5, 7 ,9, 11, 13, 15
-			uint16x8_t y_odd = vandq_u16(vreinterpretq_u16_u8(y), y_mask);
+			const uint8x8x2_t y_even_odd =
+				vuzp_u8(vget_low_u8(y), vget_high_u8(y));
+			// PCSX2's unsigned multiply-high expression is exactly
+			// ((Y << 8) * (149 << 2)) >> 16 == (Y * 149) >> 6.
+			// Keep the same truncation while avoiding four 16x16-to-32
+			// multiplies and four narrows per row on Cortex-A9.
+			const int16x8_t y_even_mul = vreinterpretq_s16_u16(
+				vshrq_n_u16(
+					vmull_u8(y_even_odd.val[0], y_coefficient), 6));
+			const int16x8_t y_odd_mul = vreinterpretq_s16_u16(
+				vshrq_n_u16(
+					vmull_u8(y_even_odd.val[1], y_coefficient), 6));
 
-			// y_even = _mm_mulhi_epu16(y_even, y_coefficient);
-			// y_odd = _mm_mulhi_epu16(y_odd, y_coefficient);
-			const int16x8_t y_even_mul = MulHiU16(y_even, y_coefficient);
-			const int16x8_t y_odd_mul = MulHiU16(y_odd, y_coefficient);
-
-			int16x8_t r_even = vqaddq_s16(rc, y_even_mul);
-			int16x8_t r_odd = vqaddq_s16(rc, y_odd_mul);
-			int16x8_t g_even = vqaddq_s16(gc, y_even_mul);
-			int16x8_t g_odd = vqaddq_s16(gc, y_odd_mul);
-			int16x8_t b_even = vqaddq_s16(bc, y_even_mul);
-			int16x8_t b_odd = vqaddq_s16(bc, y_odd_mul);
-
-			// round
-			r_even = vshrq_n_s16(vaddq_s16(r_even, round_1bit), 1);
-			r_odd = vshrq_n_s16(vaddq_s16(r_odd, round_1bit), 1);
-			g_even = vshrq_n_s16(vaddq_s16(g_even, round_1bit), 1);
-			g_odd = vshrq_n_s16(vaddq_s16(g_odd, round_1bit), 1);
-			b_even = vshrq_n_s16(vaddq_s16(b_even, round_1bit), 1);
-			b_odd = vshrq_n_s16(vaddq_s16(b_odd, round_1bit), 1);
+			// All IPU component sums fit s16. NEON's signed rounding
+			// halving add is therefore exactly PCSX2's
+			// (component + luminance + 1) >> 1 expression.
+			const int16x8_t r_even =
+				vrhaddq_s16(rc, y_even_mul);
+			const int16x8_t r_odd =
+				vrhaddq_s16(rc, y_odd_mul);
+			const int16x8_t g_even =
+				vrhaddq_s16(gc, y_even_mul);
+			const int16x8_t g_odd =
+				vrhaddq_s16(gc, y_odd_mul);
+			const int16x8_t b_even =
+				vrhaddq_s16(bc, y_even_mul);
+			const int16x8_t b_odd =
+				vrhaddq_s16(bc, y_odd_mul);
 
 			// combine even and odd bytes in original order
 			const uint8x16_t r = InterleaveEvenOdd(vqmovun_s16(r_even), vqmovun_s16(r_odd));

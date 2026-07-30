@@ -169,16 +169,8 @@ static __fi void VitaScheduleEeAndIopDeadlineDelta(s64 iop_owner_delta)
 
 static __fi void VitaScheduleEeAndIopDeadlines(s32 iop_owner_delta)
 {
-	// The manufactured 3,072/6,144-cycle seam remains the fail-closed bound
-	// for active or conditional IOP code. A retained unconditional IOP loop,
-	// however, has an exact external owner published by iopEventTest(); cap it
-	// only at the independently maintained EE-owner deadline.
-	const s32 scheduled_delta =
-		VitaA32IopRetainedExternalHorizonActive() ?
-			iop_owner_delta :
-			std::min(iop_owner_delta,
-				static_cast<s32>(VitaEeInterleaveCycles()));
-	VitaScheduleEeAndIopDeadlineDelta(scheduled_delta);
+	VitaScheduleEeAndIopDeadlineDelta(std::min(
+		iop_owner_delta, static_cast<s32>(VitaEeInterleaveCycles())));
 }
 
 static __fi bool VitaCanSkipEeOwnersAtInterleave()
@@ -662,6 +654,7 @@ static __fi VitaPerformanceTelemetry::CpuStage VitaEeEventProfileStage(u8 event)
 			return VitaPerformanceTelemetry::CpuStage::Sif;
 		case DMAC_FROM_IPU:
 		case DMAC_TO_IPU:
+			return VitaPerformanceTelemetry::CpuStage::IpuDma;
 		case IPU_PROCESS:
 			return VitaPerformanceTelemetry::CpuStage::Ipu;
 		case DMAC_FROM_SPR:

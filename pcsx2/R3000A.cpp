@@ -366,24 +366,12 @@ __ri void iopEventTest()
 	}
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	// An event above may have changed PC or invalidated the retained block.
-	// A retained unconditional self-loop has no IOP guest observation before
-	// its next counter, callback, or visible interrupt. Publish that semantic
-	// owner directly instead of manufacturing another 768-cycle poll. Every
-	// PSX_INT(), counter write, and visible INTC transition retains PCSX2's
-	// ordinary deadline-narrowing path, so an active EE can wake the IOP early.
-	// Conditional/unknown waits keep the bounded desktop-compatible cadence.
-	if (VitaA32IopRetainedExternalHorizonActive())
+	// Never let its extended arbitrary seam escape after ownership is lost.
+	const u64 ordinary_wait_deadline = psxRegs.cycle + iopWaitCycles;
+	if (!VitaA32IopRetainedWaitCoalescingActive() &&
+		psxRegs.iopNextEventCycle > ordinary_wait_deadline)
 	{
-		psxRegs.iopNextEventCycle = VitaGetIopExternalEventCycle();
-	}
-	else
-	{
-		const u64 ordinary_wait_deadline = psxRegs.cycle + iopWaitCycles;
-		if (!VitaA32IopRetainedWaitCoalescingActive() &&
-			psxRegs.iopNextEventCycle > ordinary_wait_deadline)
-		{
-			psxRegs.iopNextEventCycle = ordinary_wait_deadline;
-		}
+		psxRegs.iopNextEventCycle = ordinary_wait_deadline;
 	}
 #endif
 #if !defined(VITASX2_VITA) || defined(VITASX2_QEMU_VALIDATION) || \
@@ -398,9 +386,9 @@ __ri void iopEventTest()
 u64 VitaGetIopExternalEventCycle()
 {
 	// Reconstruct the same semantic owners consumed by iopEventTest(), but
-	// deliberately omit its fixed desktop polling seed. A source-validated
-	// retained IOP self-loop may use this calendar while the EE remains active;
-	// a joint EE/IOP wait may additionally skip the EE to the same owner.
+	// deliberately omit its fixed desktop polling seed. A joint EE/IOP wait
+	// certificate may use this calendar only while both processors are proven
+	// unable to observe state before one of these owners becomes due.
 	u64 deadline = ~static_cast<u64>(0);
 	if (psxNextDeltaCounter <= 0)
 	{

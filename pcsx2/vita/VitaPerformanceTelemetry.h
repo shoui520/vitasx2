@@ -61,6 +61,10 @@ namespace VitaPerformanceTelemetry
 		Spu2Core,
 		Spu2Reverb,
 		Spu2Output,
+		IpuDecode,
+		IpuIdct,
+		IpuCsc,
+		IpuDma,
 #endif
 		IopInterpreter,
 		Cop1,
