@@ -1260,8 +1260,10 @@ static void VitaEeClampSignedHalfwordsAndPack(const GPR_reg& clamp,
 #endif
 }
 
+template <bool AddSource>
 static void VitaEeClampSignedHalfwordsAndPackDirect(const GPR_reg& clamp,
-	const u8* source, u8* destination, GPR_reg* final_values)
+	const u8* source, const u8* add_source, u8* destination,
+	GPR_reg* final_values, GPR_reg* final_temporary)
 {
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 	const int16x8_t upper = vld1q_s16(clamp.SS);
@@ -1274,6 +1276,28 @@ static void VitaEeClampSignedHalfwordsAndPackDirect(const GPR_reg& clamp,
 	int16x8_t v5 = vld1q_s16(reinterpret_cast<const s16*>(source + 80));
 	int16x8_t v6 = vld1q_s16(reinterpret_cast<const s16*>(source + 96));
 	int16x8_t v7 = vld1q_s16(reinterpret_cast<const s16*>(source + 112));
+	if constexpr (AddSource)
+	{
+		v0 = vaddq_s16(v0,
+			vld1q_s16(reinterpret_cast<const s16*>(add_source + 0)));
+		v1 = vaddq_s16(v1,
+			vld1q_s16(reinterpret_cast<const s16*>(add_source + 16)));
+		v2 = vaddq_s16(v2,
+			vld1q_s16(reinterpret_cast<const s16*>(add_source + 32)));
+		v3 = vaddq_s16(v3,
+			vld1q_s16(reinterpret_cast<const s16*>(add_source + 48)));
+		v4 = vaddq_s16(v4,
+			vld1q_s16(reinterpret_cast<const s16*>(add_source + 64)));
+		v5 = vaddq_s16(v5,
+			vld1q_s16(reinterpret_cast<const s16*>(add_source + 80)));
+		v6 = vaddq_s16(v6,
+			vld1q_s16(reinterpret_cast<const s16*>(add_source + 96)));
+		const int16x8_t temporary =
+			vld1q_s16(reinterpret_cast<const s16*>(add_source + 112));
+		v7 = vaddq_s16(v7, temporary);
+		if (final_temporary)
+			vst1q_s16(final_temporary->SS, temporary);
+	}
 	v0 = vmaxq_s16(vminq_s16(v0, upper), zero);
 	v1 = vmaxq_s16(vminq_s16(v1, upper), zero);
 	v2 = vmaxq_s16(vminq_s16(v2, upper), zero);
@@ -1311,11 +1335,25 @@ static void VitaEeClampSignedHalfwordsAndPackDirect(const GPR_reg& clamp,
 	}
 #else
 	GPR_reg values[8]{};
+	GPR_reg add_values[8]{};
 	for (unsigned i = 0; i < 8; i++)
+	{
 		std::memcpy(values[i].UC, source + i * 16, 16);
+		if constexpr (AddSource)
+		{
+			std::memcpy(add_values[i].UC, add_source + i * 16, 16);
+			for (unsigned lane = 0; lane < 8; lane++)
+				values[i].US[lane] += add_values[i].US[lane];
+		}
+	}
 	VitaEeClampSignedHalfwordsAndPack(clamp, values, destination);
 	if (final_values)
 		std::copy(std::begin(values), std::end(values), final_values);
+	if constexpr (AddSource)
+	{
+		if (final_temporary)
+			*final_temporary = add_values[7];
+	}
 #endif
 }
 
@@ -1325,14 +1363,17 @@ u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
 	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 		VitaPerformanceTelemetry::CpuStage::EeHelper);
 	// PCSX2 owners: R5900OpcodeImpl.cpp::LQ()/SQ()/ADDI()/ADDIU(),
-	// MMI.cpp::PMINH()/PMAXH()/PPACB(), x86 recVTLB.cpp direct memory
-	// paths, x86 iR5900Branch.cpp::recBNE(), and iR5900.cpp::iBranchTest().
+	// MMI.cpp::PADDH()/PMINH()/PMAXH()/PPACB(), x86 recVTLB.cpp
+	// direct memory paths, x86 iR5900Branch.cpp::recBNE(), and
+	// iR5900.cpp::iBranchTest().
 	const u32 block_cycles = packed_control & 0xffff;
 	const unsigned counter_guest = (packed_control >> 16) & 0x1f;
 	const unsigned source_guest = (packed_control >> 21) & 0x1f;
-	const unsigned previous_source_guest = (packed_control >> 26) & 0x1f;
+	const unsigned secondary_guest = (packed_control >> 26) & 0x1f;
 	const unsigned destination_guest = packed_guests0 & 0x1f;
 	const unsigned clamp_guest = (packed_guests0 >> 5) & 0x1f;
+	const unsigned temporary_guest = (packed_guests1 >> 20) & 0x1f;
+	const bool additive = (packed_guests1 >> 31) != 0;
 	unsigned data_guests[8] = {
 		(packed_guests0 >> 10) & 0x1f,
 		(packed_guests0 >> 15) & 0x1f,
@@ -1344,8 +1385,10 @@ u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
 		(packed_guests1 >> 15) & 0x1f,
 	};
 	const u32 source_address = cpuRegs.GPR.r[source_guest].UL[0];
+	const u32 secondary_address = cpuRegs.GPR.r[secondary_guest].UL[0];
 	const u32 destination_address = cpuRegs.GPR.r[destination_guest].UL[0];
 	const u32 aligned_source = source_address & ~0x0fu;
+	const u32 aligned_secondary = secondary_address & ~0x0fu;
 	const u32 aligned_destination = destination_address & ~0x0fu;
 	const u32 initial_counter = cpuRegs.GPR.r[counter_guest].UL[0];
 	const u64 initial_source = cpuRegs.GPR.r[source_guest].UD[0];
@@ -1368,6 +1411,8 @@ u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
 
 	const VTLBVirtual source_mapping =
 		vtlbdata.vmap[aligned_source >> VTLB_PAGE_BITS];
+	const VTLBVirtual secondary_mapping = vtlbdata.vmap[
+		(additive ? aligned_secondary : aligned_source) >> VTLB_PAGE_BITS];
 	const VTLBVirtual destination_mapping =
 		vtlbdata.vmap[aligned_destination >> VTLB_PAGE_BITS];
 	u32 destination_physical = 0;
@@ -1382,18 +1427,27 @@ u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
 	}
 	const u32 source_bytes_to_page =
 		VTLB_PAGE_SIZE - (aligned_source & VTLB_PAGE_MASK);
+	const u32 secondary_bytes_to_page = additive ?
+		VTLB_PAGE_SIZE - (aligned_secondary & VTLB_PAGE_MASK) :
+		UINT32_MAX;
 	const u32 destination_bytes_to_page =
 		VTLB_PAGE_SIZE - (aligned_destination & VTLB_PAGE_MASK);
 	const bool batchable = !source_mapping.isHandler(aligned_source) &&
+		(!additive || !secondary_mapping.isHandler(aligned_secondary)) &&
 		!destination_mapping.isHandler(aligned_destination) &&
 		!destination_protected && source_bytes_to_page >= 128 &&
+		secondary_bytes_to_page >= 128 &&
 		destination_bytes_to_page >= 64 &&
 		(aligned_source & 0xffffe000u) != 0x10000000u &&
+		(!additive ||
+			(aligned_secondary & 0xffffe000u) != 0x10000000u) &&
 		block_cycles != 0;
 	if (batchable)
 	{
 		iterations = std::min(source_bytes_to_page / 128,
 			destination_bytes_to_page / 64);
+		if (additive)
+			iterations = std::min(iterations, secondary_bytes_to_page / 128);
 		if (initial_counter != 0 && (initial_counter & 3u) == 0)
 			iterations = std::min(iterations, initial_counter >> 2);
 
@@ -1407,15 +1461,38 @@ u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
 
 		const u8* const source_host =
 			reinterpret_cast<const u8*>(source_mapping.assumePtr(aligned_source));
+		const u8* const secondary_host = additive ?
+			reinterpret_cast<const u8*>(
+				secondary_mapping.assumePtr(aligned_secondary)) :
+			nullptr;
 		u8* const destination_host =
 			reinterpret_cast<u8*>(destination_mapping.assumePtr(
 				aligned_destination));
-		for (u32 iteration = 0; iteration < iterations; iteration++)
+		GPR_reg final_temporary{};
+		if (additive)
 		{
-			const u8* const iteration_source = source_host + iteration * 128;
-			VitaEeClampSignedHalfwordsAndPackDirect(clamp, iteration_source,
-				destination_host + iteration * 64,
-				iteration + 1 == iterations ? final_values : nullptr);
+			for (u32 iteration = 0; iteration < iterations; iteration++)
+			{
+				const bool final = iteration + 1 == iterations;
+				VitaEeClampSignedHalfwordsAndPackDirect<true>(clamp,
+					source_host + iteration * 128,
+					secondary_host + iteration * 128,
+					destination_host + iteration * 64,
+					final ? final_values : nullptr,
+					final ? &final_temporary : nullptr);
+			}
+			cpuRegs.GPR.r[temporary_guest] = final_temporary;
+		}
+		else
+		{
+			for (u32 iteration = 0; iteration < iterations; iteration++)
+			{
+				VitaEeClampSignedHalfwordsAndPackDirect<false>(clamp,
+					source_host + iteration * 128, nullptr,
+					destination_host + iteration * 64,
+					iteration + 1 == iterations ? final_values : nullptr,
+					nullptr);
+			}
 		}
 		force_redispatch |= NotifyVitaEeRamWrite(destination_host,
 			iterations * 64) != 0;
@@ -1427,55 +1504,184 @@ u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
 	}
 	else
 	{
-		// LQ/SQ silently align each effective address. Publish the three scalar
-		// induction writes at their original points so handler callbacks observe
-		// the same architectural state as PCSX2.
+		// LQ/SQ silently align each effective address. Publish every load,
+		// arithmetic result, and induction write at its original point so
+		// handler callbacks observe the same architectural state as PCSX2.
 		final_values[0].UQ = r128_to_u128(vtlb_memRead128(aligned_source));
 		cpuRegs.GPR.r[data_guests[0]] = final_values[0];
 		const u32 updated_counter = initial_counter - 4;
 		cpuRegs.GPR.r[counter_guest].UD[0] = static_cast<u64>(
 			static_cast<s64>(static_cast<s32>(updated_counter)));
-		cpuRegs.GPR.r[previous_source_guest].UD[0] = initial_source;
-		cpuRegs.GPR.r[source_guest].UD[0] = static_cast<u64>(
-			static_cast<s64>(static_cast<s32>(source_address + 128)));
-		for (unsigned i = 1; i < 8; i++)
+		if (additive)
 		{
-			final_values[i].UQ = r128_to_u128(vtlb_memRead128(
-				(aligned_source + i * 16) & ~0x0fu));
-			cpuRegs.GPR.r[data_guests[i]] = final_values[i];
-		}
-		VitaEeClampSignedHalfwordsAndPack(
-			cpuRegs.GPR.r[clamp_guest], final_values, nullptr);
-		for (unsigned i = 0; i < 8; i++)
-			cpuRegs.GPR.r[data_guests[i]] = final_values[i];
-		for (unsigned pair = 0; pair < 4; pair++)
-		{
-			const u32 store_address =
-				(aligned_destination + pair * 16) & ~0x0fu;
-			const VTLBVirtual store_mapping =
-				vtlbdata.vmap[store_address >> VTLB_PAGE_BITS];
-			u32 store_physical = 0;
-			bool store_protected = false;
-			if (!store_mapping.isHandler(store_address))
+			for (unsigned i = 1; i < 8; i++)
 			{
-				store_protected = VitaEeGetDirectRamProtection(
-					store_mapping, store_address, &store_physical);
+				final_values[i].UQ = r128_to_u128(vtlb_memRead128(
+					(aligned_source + i * 16) & ~0x0fu));
+				cpuRegs.GPR.r[data_guests[i]] = final_values[i];
+			}
+
+			GPR_reg temporary{};
+			const auto load_addend = [&](unsigned vector) {
+				temporary.UQ = r128_to_u128(vtlb_memRead128(
+					(aligned_secondary + vector * 16) & ~0x0fu));
+				cpuRegs.GPR.r[temporary_guest] = temporary;
+			};
+			const auto add = [&](unsigned vector) {
+				for (unsigned lane = 0; lane < 8; lane++)
+					final_values[vector].US[lane] += temporary.US[lane];
+				cpuRegs.GPR.r[data_guests[vector]] = final_values[vector];
+			};
+			const auto minimum = [&](unsigned vector) {
+				for (unsigned lane = 0; lane < 8; lane++)
+				{
+					if (final_values[vector].SS[lane] > clamp.SS[lane])
+						final_values[vector].SS[lane] = clamp.SS[lane];
+				}
+				cpuRegs.GPR.r[data_guests[vector]] = final_values[vector];
+			};
+			const auto maximum = [&](unsigned vector) {
+				for (unsigned lane = 0; lane < 8; lane++)
+				{
+					if (final_values[vector].SS[lane] < 0)
+						final_values[vector].SS[lane] = 0;
+				}
+				cpuRegs.GPR.r[data_guests[vector]] = final_values[vector];
+			};
+			const auto pack = [&](unsigned pair) {
+				const unsigned even = pair * 2;
+				const unsigned odd = even + 1;
+				GPR_reg packed{};
+				for (unsigned lane = 0; lane < 8; lane++)
+				{
+					packed.UC[lane] = final_values[even].UC[lane * 2];
+					packed.UC[lane + 8] =
+						final_values[odd].UC[lane * 2];
+				}
+				final_values[odd] = packed;
+				cpuRegs.GPR.r[data_guests[odd]] = packed;
+			};
+			const auto store = [&](unsigned pair) {
+				const u32 store_address =
+					(aligned_destination + pair * 16) & ~0x0fu;
+				const VTLBVirtual store_mapping =
+					vtlbdata.vmap[store_address >> VTLB_PAGE_BITS];
+				u32 store_physical = 0;
+				bool store_protected = false;
+				if (!store_mapping.isHandler(store_address))
+				{
+					store_protected = VitaEeGetDirectRamProtection(
+						store_mapping, store_address, &store_physical);
 #if defined(VITASX2_QEMU_VALIDATION)
-				store_protected |=
-					g_qemuSignedHalfwordBytePackForceRedispatch;
+					store_protected |=
+						g_qemuSignedHalfwordBytePackForceRedispatch;
 #endif
-			}
-			vtlb_memWrite128(store_address,
-				r128_from_u128(final_values[pair * 2 + 1].UQ));
-			if (store_protected)
-			{
-				force_redispatch = true;
-				if (Cpu && Cpu->Clear)
-					Cpu->Clear(store_physical & ~3u, 4);
-			}
+				}
+				vtlb_memWrite128(store_address,
+					r128_from_u128(final_values[pair * 2 + 1].UQ));
+				if (store_protected)
+				{
+					force_redispatch = true;
+					if (Cpu && Cpu->Clear)
+						Cpu->Clear(store_physical & ~3u, 4);
+				}
+			};
+
+			load_addend(0);
+			add(0);
+			load_addend(1);
+			minimum(0);
+			maximum(0);
+			add(1);
+			load_addend(2);
+			minimum(1);
+			maximum(1);
+			pack(0);
+			add(2);
+			minimum(2);
+			load_addend(3);
+			maximum(2);
+			add(3);
+			load_addend(4);
+			minimum(3);
+			maximum(3);
+			pack(1);
+			add(4);
+			load_addend(5);
+			minimum(4);
+			maximum(4);
+			add(5);
+			load_addend(6);
+			minimum(5);
+			maximum(5);
+			pack(2);
+			add(6);
+			load_addend(7);
+			minimum(6);
+			maximum(6);
+			store(0);
+			add(7);
+			minimum(7);
+			maximum(7);
+			pack(3);
+			store(1);
+			store(2);
+			store(3);
+
+			cpuRegs.GPR.r[secondary_guest].UD[0] = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(
+					secondary_address + 128)));
+			cpuRegs.GPR.r[destination_guest].UD[0] = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(
+					destination_address + 64)));
+			cpuRegs.GPR.r[source_guest].UD[0] = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(source_address + 128)));
 		}
-		cpuRegs.GPR.r[destination_guest].UD[0] = static_cast<u64>(
-			static_cast<s64>(static_cast<s32>(destination_address + 64)));
+		else
+		{
+			cpuRegs.GPR.r[secondary_guest].UD[0] = initial_source;
+			cpuRegs.GPR.r[source_guest].UD[0] = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(source_address + 128)));
+			for (unsigned i = 1; i < 8; i++)
+			{
+				final_values[i].UQ = r128_to_u128(vtlb_memRead128(
+					(aligned_source + i * 16) & ~0x0fu));
+				cpuRegs.GPR.r[data_guests[i]] = final_values[i];
+			}
+			VitaEeClampSignedHalfwordsAndPack(
+				cpuRegs.GPR.r[clamp_guest], final_values, nullptr);
+			for (unsigned i = 0; i < 8; i++)
+				cpuRegs.GPR.r[data_guests[i]] = final_values[i];
+			for (unsigned pair = 0; pair < 4; pair++)
+			{
+				const u32 store_address =
+					(aligned_destination + pair * 16) & ~0x0fu;
+				const VTLBVirtual store_mapping =
+					vtlbdata.vmap[store_address >> VTLB_PAGE_BITS];
+				u32 store_physical = 0;
+				bool store_protected = false;
+				if (!store_mapping.isHandler(store_address))
+				{
+					store_protected = VitaEeGetDirectRamProtection(
+						store_mapping, store_address, &store_physical);
+#if defined(VITASX2_QEMU_VALIDATION)
+					store_protected |=
+						g_qemuSignedHalfwordBytePackForceRedispatch;
+#endif
+				}
+				vtlb_memWrite128(store_address,
+					r128_from_u128(final_values[pair * 2 + 1].UQ));
+				if (store_protected)
+				{
+					force_redispatch = true;
+					if (Cpu && Cpu->Clear)
+						Cpu->Clear(store_physical & ~3u, 4);
+				}
+			}
+			cpuRegs.GPR.r[destination_guest].UD[0] = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(
+					destination_address + 64)));
+		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		g_qemuSignedHalfwordBytePackScalarIterations++;
 #endif
@@ -1489,10 +1695,20 @@ u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
 		const u32 final_source = source_address + iterations * 128;
 		cpuRegs.GPR.r[source_guest].UD[0] = static_cast<u64>(
 			static_cast<s64>(static_cast<s32>(final_source)));
-		const u64 final_previous_source = iterations == 1 ? initial_source :
-			static_cast<u64>(static_cast<s64>(static_cast<s32>(
-				source_address + (iterations - 1) * 128)));
-		cpuRegs.GPR.r[previous_source_guest].UD[0] = final_previous_source;
+		if (additive)
+		{
+			cpuRegs.GPR.r[secondary_guest].UD[0] = static_cast<u64>(
+				static_cast<s64>(static_cast<s32>(
+					secondary_address + iterations * 128)));
+		}
+		else
+		{
+			const u64 final_previous_source =
+				iterations == 1 ? initial_source :
+				static_cast<u64>(static_cast<s64>(static_cast<s32>(
+					source_address + (iterations - 1) * 128)));
+			cpuRegs.GPR.r[secondary_guest].UD[0] = final_previous_source;
+		}
 		cpuRegs.GPR.r[destination_guest].UD[0] = static_cast<u64>(
 			static_cast<s64>(static_cast<s32>(
 				destination_address + iterations * 64)));
@@ -1502,7 +1718,7 @@ u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
 
 	cpuRegs.cycle += static_cast<u64>(iterations) * block_cycles;
 	const bool repeat = cpuRegs.GPR.r[counter_guest].UD[0] != 0;
-	const u32 fallthrough_pc = start_pc + 37 * sizeof(u32);
+	const u32 fallthrough_pc = start_pc + (additive ? 53 : 37) * sizeof(u32);
 	cpuRegs.pc = repeat ? start_pc : fallthrough_pc;
 	const bool event_due = static_cast<s32>(
 		static_cast<u32>(cpuRegs.cycle) -

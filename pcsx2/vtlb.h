@@ -342,10 +342,11 @@ enum VitaEeSignedHalfwordBytePackResult : u32
 	VITA_EE_SIGNED_HALFWORD_BYTE_PACK_REDISPATCH = 3,
 };
 
-// Executes the exact eight-LQ signed-halfword clamp, four-PPACB/four-SQ
-// conversion loop recognized by VitaEE::BlockCompiler. Direct source and
-// destination pages batch to the counter, page, or event seam. Observable
-// mappings execute one complete, architecturally ordered iteration.
+// Executes the exact one- or two-source signed-halfword clamp,
+// four-PPACB/four-SQ conversion loops recognized by VitaEE::BlockCompiler.
+// The two-source form performs wrapping PADDH before the clamp. Direct pages
+// batch to the counter, page, or event seam. Observable mappings execute one
+// complete, architecturally ordered iteration.
 u32 VitaEeExecuteSignedHalfwordBytePack(u32 start_pc, u32 packed_control,
 	u32 packed_guests0, u32 packed_guests1);
 

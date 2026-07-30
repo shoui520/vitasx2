@@ -3190,36 +3190,50 @@ namespace VitaEE
 
 	bool BlockCompiler::IsExactSignedHalfwordBytePackLoop(u32 start_pc,
 		u32 instruction_count, unsigned* counter_guest, unsigned* source_guest,
-		unsigned* previous_source_guest, unsigned* destination_guest,
-		unsigned* clamp_guest, unsigned* data_guests)
+		unsigned* secondary_guest, unsigned* destination_guest,
+		unsigned* clamp_guest, unsigned* data_guests, unsigned* temporary_guest,
+		bool* additive)
 	{
-		constexpr u32 INSTRUCTION_COUNT = 37;
-		if (instruction_count != INSTRUCTION_COUNT ||
-			start_pc > UINT32_MAX - INSTRUCTION_COUNT * sizeof(u32))
+		constexpr u32 CLAMP_INSTRUCTION_COUNT = 37;
+		constexpr u32 ADD_CLAMP_INSTRUCTION_COUNT = 53;
+		const bool has_addend = instruction_count == ADD_CLAMP_INSTRUCTION_COUNT;
+		if ((!has_addend && instruction_count != CLAMP_INSTRUCTION_COUNT) ||
+			start_pc > UINT32_MAX - instruction_count * sizeof(u32))
 		{
 			return false;
 		}
 
-		u32 ops[INSTRUCTION_COUNT]{};
+		u32 ops[ADD_CLAMP_INSTRUCTION_COUNT]{};
 		for (u32 i = 0; i < instruction_count; i++)
 			ops[i] = memRead32(start_pc + i * sizeof(u32));
 
 		const unsigned source = RS(ops[0]);
 		const unsigned counter = RT(ops[1]);
-		const unsigned previous_source = RD(ops[2]);
-		const unsigned destination = RS(ops[31]);
-		const unsigned clamp = RT(ops[11]);
+		const unsigned secondary = has_addend ? RS(ops[9]) : RD(ops[2]);
+		const unsigned destination = RS(ops[has_addend ? 41 : 31]);
+		const unsigned clamp = RT(ops[has_addend ? 12 : 11]);
+		const unsigned temporary = has_addend ? RT(ops[9]) : 0;
 		unsigned data[8]{};
 		data[0] = RT(ops[0]);
-		for (unsigned i = 1; i < 8; i++)
-			data[i] = RT(ops[3 + i]);
+		if (has_addend)
+		{
+			for (unsigned i = 1; i < 8; i++)
+				data[i] = RT(ops[1 + i]);
+		}
+		else
+		{
+			for (unsigned i = 1; i < 8; i++)
+				data[i] = RT(ops[3 + i]);
+		}
 
-		unsigned guests[13] = {
-			counter, source, previous_source, destination, clamp,
+		unsigned guests[14] = {
+			counter, source, secondary, destination, clamp,
 			data[0], data[1], data[2], data[3],
-			data[4], data[5], data[6], data[7],
+			data[4], data[5], data[6], data[7], temporary,
 		};
-		for (unsigned i = 0; i < std::size(guests); i++)
+		const unsigned guest_count = has_addend ? std::size(guests) :
+			std::size(guests) - 1;
+		for (unsigned i = 0; i < guest_count; i++)
 		{
 			if (guests[i] == 0)
 				return false;
@@ -3240,77 +3254,143 @@ namespace VitaEE
 				((op >> 6) & 0x1f) == subfunction && RD(op) == rd &&
 				RS(op) == rs && RT(op) == rt;
 		};
+		const auto is_addiu = [](u32 op, unsigned reg, s16 immediate) {
+			return (op >> 26) == 0x09 && RS(op) == reg && RT(op) == reg &&
+				IMM_S(op) == immediate;
+		};
+		const auto is_sq = [](u32 op, unsigned rt, unsigned rs, s16 offset) {
+			return (op >> 26) == 0x1f && RT(op) == rt && RS(op) == rs &&
+				IMM_S(op) == offset;
+		};
 
 		if (!is_lq(ops[0], data[0], source, 0) ||
 			(ops[1] >> 26) != 0x08 || RS(ops[1]) != counter ||
-			RT(ops[1]) != counter || IMM_S(ops[1]) != -4 ||
-			(ops[2] >> 26) != 0 || (ops[2] & 0x7ff) != 0x02d ||
-			RS(ops[2]) != source || RT(ops[2]) != 0 ||
-			RD(ops[2]) != previous_source ||
-			(ops[3] >> 26) != 0x09 || RS(ops[3]) != source ||
-			RT(ops[3]) != source || IMM_S(ops[3]) != 128)
+			RT(ops[1]) != counter || IMM_S(ops[1]) != -4)
 		{
 			return false;
-		}
-		for (unsigned i = 1; i < 8; i++)
-		{
-			if (!is_lq(ops[3 + i], data[i], previous_source,
-					static_cast<s16>(i * 16)))
-			{
-				return false;
-			}
 		}
 
-		u32 op_index = 11;
-		for (unsigned pair = 0; pair < 4; pair++)
+		if (has_addend)
 		{
-			const unsigned even = data[pair * 2];
-			const unsigned odd = data[pair * 2 + 1];
-			if (!is_mmi(ops[op_index++], 0x28, 0x07,
-					even, even, clamp) ||
-				!is_mmi(ops[op_index++], 0x08, 0x07,
-					even, even, 0) ||
-				!is_mmi(ops[op_index++], 0x28, 0x07,
-					odd, odd, clamp) ||
-				!is_mmi(ops[op_index++], 0x08, 0x07,
-					odd, odd, 0) ||
-				!is_mmi(ops[op_index++], 0x08, 0x1b,
-					odd, odd, even))
+			constexpr u32 ADD_LOADS[8] = {9, 11, 15, 21, 24, 29, 33, 38};
+			constexpr u32 ADDS[8] = {10, 14, 19, 23, 28, 32, 37, 42};
+			constexpr u32 MINS[8] = {12, 16, 20, 25, 30, 34, 39, 43};
+			constexpr u32 MAXES[8] = {13, 17, 22, 26, 31, 35, 40, 44};
+			constexpr u32 PACKS[4] = {18, 27, 36, 45};
+			constexpr u32 STORES[4] = {41, 46, 47, 48};
+			for (unsigned i = 1; i < 8; i++)
+			{
+				if (!is_lq(ops[1 + i], data[i], source,
+						static_cast<s16>(i * 16)))
+				{
+					return false;
+				}
+			}
+			for (unsigned i = 0; i < 8; i++)
+			{
+				if (!is_lq(ops[ADD_LOADS[i]], temporary, secondary,
+						static_cast<s16>(i * 16)) ||
+					!is_mmi(ops[ADDS[i]], 0x08, 0x04,
+						data[i], data[i], temporary) ||
+					!is_mmi(ops[MINS[i]], 0x28, 0x07,
+						data[i], data[i], clamp) ||
+					!is_mmi(ops[MAXES[i]], 0x08, 0x07,
+						data[i], data[i], 0))
+				{
+					return false;
+				}
+			}
+			for (unsigned pair = 0; pair < 4; pair++)
+			{
+				const unsigned even = data[pair * 2];
+				const unsigned odd = data[pair * 2 + 1];
+				if (!is_mmi(ops[PACKS[pair]], 0x08, 0x1b,
+						odd, odd, even) ||
+					!is_sq(ops[STORES[pair]], odd, destination,
+						static_cast<s16>(pair * 16)))
+				{
+					return false;
+				}
+			}
+			if (!is_addiu(ops[49], secondary, 128) ||
+				!is_addiu(ops[50], destination, 64) ||
+				(ops[51] >> 26) != 0x05 || RS(ops[51]) != counter ||
+				RT(ops[51]) != 0 ||
+				BranchTarget(start_pc + 51 * sizeof(u32), ops[51]) != start_pc ||
+				!is_addiu(ops[52], source, 128))
 			{
 				return false;
 			}
 		}
-		for (unsigned pair = 0; pair < 4; pair++)
+		else
 		{
-			const u32 op = ops[31 + pair];
-			if ((op >> 26) != 0x1f || RS(op) != destination ||
-				RT(op) != data[pair * 2 + 1] ||
-				IMM_S(op) != static_cast<s16>(pair * 16))
+			if ((ops[2] >> 26) != 0 || (ops[2] & 0x7ff) != 0x02d ||
+				RS(ops[2]) != source || RT(ops[2]) != 0 ||
+				RD(ops[2]) != secondary || !is_addiu(ops[3], source, 128))
 			{
 				return false;
 			}
-		}
-		if ((ops[35] >> 26) != 0x05 || RS(ops[35]) != counter ||
-			RT(ops[35]) != 0 ||
-			BranchTarget(start_pc + 35 * sizeof(u32), ops[35]) != start_pc ||
-			(ops[36] >> 26) != 0x09 || RS(ops[36]) != destination ||
-			RT(ops[36]) != destination || IMM_S(ops[36]) != 64)
-		{
-			return false;
+			for (unsigned i = 1; i < 8; i++)
+			{
+				if (!is_lq(ops[3 + i], data[i], secondary,
+						static_cast<s16>(i * 16)))
+				{
+					return false;
+				}
+			}
+
+			u32 op_index = 11;
+			for (unsigned pair = 0; pair < 4; pair++)
+			{
+				const unsigned even = data[pair * 2];
+				const unsigned odd = data[pair * 2 + 1];
+				if (!is_mmi(ops[op_index++], 0x28, 0x07,
+						even, even, clamp) ||
+					!is_mmi(ops[op_index++], 0x08, 0x07,
+						even, even, 0) ||
+					!is_mmi(ops[op_index++], 0x28, 0x07,
+						odd, odd, clamp) ||
+					!is_mmi(ops[op_index++], 0x08, 0x07,
+						odd, odd, 0) ||
+					!is_mmi(ops[op_index++], 0x08, 0x1b,
+						odd, odd, even))
+				{
+					return false;
+				}
+			}
+			for (unsigned pair = 0; pair < 4; pair++)
+			{
+				if (!is_sq(ops[31 + pair], data[pair * 2 + 1],
+						destination, static_cast<s16>(pair * 16)))
+				{
+					return false;
+				}
+			}
+			if ((ops[35] >> 26) != 0x05 || RS(ops[35]) != counter ||
+				RT(ops[35]) != 0 ||
+				BranchTarget(start_pc + 35 * sizeof(u32), ops[35]) != start_pc ||
+				!is_addiu(ops[36], destination, 64))
+			{
+				return false;
+			}
 		}
 
 		if (counter_guest)
 			*counter_guest = counter;
 		if (source_guest)
 			*source_guest = source;
-		if (previous_source_guest)
-			*previous_source_guest = previous_source;
+		if (secondary_guest)
+			*secondary_guest = secondary;
 		if (destination_guest)
 			*destination_guest = destination;
 		if (clamp_guest)
 			*clamp_guest = clamp;
 		if (data_guests)
 			std::copy(std::begin(data), std::end(data), data_guests);
+		if (temporary_guest)
+			*temporary_guest = temporary;
+		if (additive)
+			*additive = has_addend;
 		return true;
 	}
 
@@ -11366,14 +11446,17 @@ namespace VitaEE
 	{
 		unsigned counter_guest = 0;
 		unsigned source_guest = 0;
-		unsigned previous_source_guest = 0;
+		unsigned secondary_guest = 0;
 		unsigned destination_guest = 0;
 		unsigned clamp_guest = 0;
+		unsigned temporary_guest = 0;
 		unsigned data_guests[8]{};
+		bool additive = false;
 		if (!direct_exit || !event_exit || !direct_links ||
 			!IsExactSignedHalfwordBytePackLoop(start_pc, instruction_count,
-				&counter_guest, &source_guest, &previous_source_guest,
-				&destination_guest, &clamp_guest, data_guests))
+				&counter_guest, &source_guest, &secondary_guest,
+				&destination_guest, &clamp_guest, data_guests,
+				&temporary_guest, &additive))
 		{
 			return false;
 		}
@@ -11397,12 +11480,13 @@ namespace VitaEE
 		m_gpr_link_signature = GprLinkSignature{};
 		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
 		const u32 packed_control = block_cycles | (counter_guest << 16) |
-			(source_guest << 21) | (previous_source_guest << 26);
+			(source_guest << 21) | (secondary_guest << 26);
 		const u32 packed_guests0 = destination_guest | (clamp_guest << 5) |
 			(data_guests[0] << 10) | (data_guests[1] << 15) |
 			(data_guests[2] << 20) | (data_guests[3] << 25);
 		const u32 packed_guests1 = data_guests[4] | (data_guests[5] << 5) |
-			(data_guests[6] << 10) | (data_guests[7] << 15);
+			(data_guests[6] << 10) | (data_guests[7] << 15) |
+			(temporary_guest << 20) | (static_cast<u32>(additive) << 31);
 		if (!BeginBlock(false, false, false, linked_entry_offset) ||
 			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
 			!m_code.EmitMovImm32(HOST_TMP1, packed_control) ||
