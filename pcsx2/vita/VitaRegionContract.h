@@ -26,6 +26,19 @@ namespace VitaRegion
 		CycleStateBase,
 		MainMemoryBase,
 		MainMemoryMask,
+		GuestGprLow32,
+	};
+
+	struct ResidentBinding
+	{
+		ResidentValue value = ResidentValue::None;
+		u8 guest = 0;
+
+		[[nodiscard]] constexpr bool operator==(const ResidentBinding& rhs) const
+		{
+			return value == rhs.value &&
+				(value != ResidentValue::GuestGprLow32 || guest == rhs.guest);
+		}
 	};
 
 	struct EntryContract
@@ -33,12 +46,12 @@ namespace VitaRegion
 		static constexpr unsigned HostRegisterCount = 13;
 
 		GuestDomain domain = GuestDomain::None;
-		std::array<ResidentValue, HostRegisterCount> host_values{};
+		std::array<ResidentBinding, HostRegisterCount> host_values{};
 
-		constexpr void Bind(unsigned host, ResidentValue value)
+		constexpr void Bind(unsigned host, ResidentValue value, u8 guest = 0)
 		{
 			if (host < host_values.size())
-				host_values[host] = value;
+				host_values[host] = {value, guest};
 		}
 
 		[[nodiscard]] constexpr bool Provides(const EntryContract& required) const
@@ -48,8 +61,8 @@ namespace VitaRegion
 
 			for (unsigned host = 0; host < host_values.size(); host++)
 			{
-				if (required.host_values[host] != ResidentValue::None &&
-					host_values[host] != required.host_values[host])
+				if (required.host_values[host].value != ResidentValue::None &&
+					!(host_values[host] == required.host_values[host]))
 				{
 					return false;
 				}

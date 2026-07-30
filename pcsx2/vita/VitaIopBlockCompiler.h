@@ -175,6 +175,9 @@ namespace VitaIOP
 		u64 linked_frame_stack_words_removed;
 		u64 resident_prelude_links;
 		u64 resident_prelude_setup_instructions_removed;
+		u64 resident_gpr_links;
+		u64 resident_gpr_stores_removed;
+		u64 resident_gpr_loads_removed;
 		u64 sequential_qword_copy_fast_paths;
 		u64 sequential_qword_copy_instructions_removed;
 		u64 private_dispatcher_calls;
@@ -282,16 +285,36 @@ namespace VitaIOP
 		size_t target_offset = static_cast<size_t>(-1);
 		size_t fallback_offset = static_cast<size_t>(-1);
 		size_t scheduler_resume_offset = static_cast<size_t>(-1);
+		size_t resident_gpr_bypass_offset = static_cast<size_t>(-1);
+		u32 resident_gpr_bypass_instruction = 0;
 		u16 fragment_index = 0;
 		bool valid = false;
 		bool logical_continuation = false;
 		bool resident_entry_active = false;
+		bool resident_gpr_entry_active = false;
 		u8 resident_setup_instructions_removed = 0;
+		u8 resident_gpr_stores_removed = 0;
+		u8 resident_gpr_loads_removed = 0;
 	};
 
 	struct DirectLinkSlots
 	{
 		DirectLinkSlot slots[2]{};
+	};
+
+	// Shared region metadata describing the values at internal entries and at
+	// the fragment's normal linked exits. The contracts are consumed while
+	// patching code; no runtime object or matching logic enters the A9 hot path.
+	struct ResidentFragmentContract
+	{
+		size_t base_entry_offset = 0;
+		size_t gpr_entry_offset = 0;
+		VitaRegion::EntryContract base_entry{};
+		VitaRegion::EntryContract gpr_entry{};
+		VitaRegion::EntryContract exit{};
+		u16 dirty_gpr_host_mask = 0;
+		u8 base_setup_instruction_count = 0;
+		u8 gpr_entry_load_instruction_count = 0;
 	};
 
 	class BlockCompiler
@@ -314,9 +337,7 @@ namespace VitaIOP
 			bool inherited_isolate_write = false, u32 logical_cycle_prefix = 0,
 			u32 logical_cycle_total = 0, bool fragmented_logical_block = false,
 			bool logical_continuation_tail = false,
-			size_t* resident_entry_offset = nullptr,
-			VitaRegion::EntryContract* resident_entry_contract = nullptr,
-			u8* resident_setup_instruction_count = nullptr);
+			ResidentFragmentContract* resident_contract = nullptr);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 		bool UsesCompiledPs1BiosGate() const { return m_compiled_ps1_bios_gate; }
@@ -348,10 +369,6 @@ namespace VitaIOP
 			return m_batched_cycle_stack_words_removed;
 		}
 		bool UsesExpandedCycleBatching() const { return m_expanded_cycle_batching; }
-		const VitaRegion::EntryContract& ResidentEntryContract() const
-		{
-			return m_resident_entry_contract;
-		}
 		u16 SavedRegisters() const { return m_saved_registers; }
 		u8 StackFrameSize() const { return m_stack_frame_size; }
 		u32 PinnedGprMemoryOpsSaved() const { return m_pinned_gpr_memory_ops_saved; }
@@ -390,8 +407,8 @@ namespace VitaIOP
 
 	private:
 		bool BeginBlock(u32 start_pc, size_t* linked_entry_offset,
-			size_t* provider_entry_offset, size_t* resident_entry_offset,
-			u8* resident_setup_instruction_count);
+			size_t* provider_entry_offset);
+		void FinalizeResidentExitContract();
 		bool EndBlockReturn(BlockExitKind exit, bool charge_budget = true,
 			bool flush_pins = true, u32 known_cycle_count = 0);
 		bool EndBlockIsolateModeWriteReturn(bool charge_budget = true,
@@ -623,7 +640,8 @@ namespace VitaIOP
 		u32 m_current_cycle_count = 0;
 		u32 m_logical_cycle_prefix = 0;
 		u32 m_budget_cycle_count = 0;
-		VitaRegion::EntryContract m_resident_entry_contract{};
+		ResidentFragmentContract m_resident_contract{};
+		bool m_resident_gpr_contract_safe = false;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
@@ -720,6 +738,7 @@ namespace VitaIOP
 		static void SetBlockCycleBatchingEnabled(bool enabled);
 		static void SetLinkedFrameBypassEnabled(bool enabled);
 		static void SetResidentPreludeLinksEnabled(bool enabled);
+		static void SetResidentGprLinksEnabled(bool enabled);
 		static void SetSequentialQwordCopyEnabled(bool enabled);
 		static void SetBranchTestSchedulingEnabled(bool enabled);
 		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
@@ -823,9 +842,7 @@ namespace VitaIOP
 				u32 instruction_count = 0;
 				size_t linked_entry_offset = 0;
 				size_t provider_entry_offset = 0;
-				size_t resident_entry_offset = 0;
-				VitaRegion::EntryContract resident_entry_contract{};
-				u8 resident_setup_instruction_count = 0;
+				ResidentFragmentContract resident{};
 			};
 
 			// Keep the overwhelmingly common <=64-opcode/single-fragment block
@@ -1257,6 +1274,7 @@ namespace VitaIOP
 		FindSchedulerDirectResumeBlock(u32* dispatch_flags);
 		const void* LinkedEntryPoint(const CachedBlock& block) const;
 		const void* ResidentEntryPoint(const CachedBlock& block) const;
+		const void* ResidentGprEntryPoint(const CachedBlock& block) const;
 		const void* ProviderEntryPoint(const CachedBlock& block) const;
 		bool PatchDirectLink(CachedBlock& block, DirectLinkSlot& link,
 			CachedBlock* target);

@@ -99,6 +99,7 @@ static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
 static bool s_qemuIopLinkedFrameBypassEnabled = true;
 static bool s_qemuIopResidentPreludeLinksEnabled = true;
+static bool s_qemuIopResidentGprLinksEnabled = true;
 static bool s_qemuIopSequentialQwordCopyEnabled = true;
 static bool s_qemuIopBranchTestSchedulingEnabled = true;
 static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
@@ -1365,17 +1366,13 @@ namespace VitaIOP
 	}
 
 	bool BlockCompiler::BeginBlock(u32 start_pc, size_t* linked_entry_offset,
-		size_t* provider_entry_offset, size_t* resident_entry_offset,
-		u8* resident_setup_instruction_count)
+		size_t* provider_entry_offset)
 	{
 		if (linked_entry_offset)
 			*linked_entry_offset = 0;
 		if (provider_entry_offset)
 			*provider_entry_offset = 0;
-		if (resident_entry_offset)
-			*resident_entry_offset = 0;
-		if (resident_setup_instruction_count)
-			*resident_setup_instruction_count = 0;
+		m_resident_contract = {};
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
 		m_unaligned_read_cold_tails.clear();
@@ -1388,28 +1385,46 @@ namespace VitaIOP
 		m_iop_cycle_base_register_available = !m_iop_ram_mask_register_available &&
 		                                      !m_emit_trace_checks &&
 		                                      !m_defer_cycle_updates;
-		m_resident_entry_contract = {};
 		// Nondeferred validation controls snapshot the target's entry cycle at
 		// [sp, #0]. That value is block-local and cannot be inherited from a
 		// predecessor, so they deliberately have no resident entry contract.
-		m_resident_entry_contract.domain = m_defer_cycle_updates ?
+		m_resident_contract.base_entry.domain = m_defer_cycle_updates ?
 			VitaRegion::GuestDomain::Iop : VitaRegion::GuestDomain::None;
-		m_resident_entry_contract.Bind(HOST_PSX_REGS,
+		m_resident_contract.base_entry.Bind(HOST_PSX_REGS,
 			VitaRegion::ResidentValue::CoreStateBase);
 		if (m_iop_cycle_base_register_available)
 		{
-			m_resident_entry_contract.Bind(HOST_CYCLE_BASE,
+			m_resident_contract.base_entry.Bind(HOST_CYCLE_BASE,
 				VitaRegion::ResidentValue::CycleStateBase);
 		}
 		else if (m_iop_ram_mask_register_available)
 		{
-			m_resident_entry_contract.Bind(HOST_IOP_RAM_MASK,
+			m_resident_contract.base_entry.Bind(HOST_IOP_RAM_MASK,
 				VitaRegion::ResidentValue::MainMemoryMask);
 		}
 		if (m_iop_ram_registers_available)
 		{
-			m_resident_entry_contract.Bind(HOST_IOP_RAM_BASE,
+			m_resident_contract.base_entry.Bind(HOST_IOP_RAM_BASE,
 				VitaRegion::ResidentValue::MainMemoryBase);
+		}
+		m_resident_gpr_contract_safe =
+			m_resident_contract.base_entry.domain != VitaRegion::GuestDomain::None &&
+			!m_compiled_ps1_bios_gate &&
+			!(m_irx_import_hle || m_irx_import_debug ||
+				(m_irx_import_log && m_irx_import_funcname));
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_resident_gpr_contract_safe =
+			m_resident_gpr_contract_safe && s_qemuIopResidentGprLinksEnabled;
+#endif
+		if (m_resident_gpr_contract_safe)
+		{
+			m_resident_contract.gpr_entry = m_resident_contract.base_entry;
+			for (u8 i = 0; i < m_pinned_gpr_count; i++)
+			{
+				const PinnedGpr& pin = m_pinned_gprs[i];
+				m_resident_contract.gpr_entry.Bind(pin.host,
+					VitaRegion::ResidentValue::GuestGprLow32, pin.guest);
+			}
 		}
 		const u16 baseline_saved_registers =
 			REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 |
@@ -1483,58 +1498,66 @@ namespace VitaIOP
 		}
 
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_CPU_PROFILER)
-		// The ordinary linked entry publishes its diagnostic evidence before
-		// rebuilding private bases. A resident predecessor skips those loads, so
-		// give it a parallel diagnostic-only marker and branch into the common
-		// body. Normal product code points resident links directly at that body
-		// and emits no extra instruction.
+		// Internal entries need parallel diagnostic-only markers because their
+		// link bypasses the ordinary entry. Product code points directly at each
+		// body and emits none of this instrumentation.
 		size_t resident_body_branch = static_cast<size_t>(-1);
-		if (resident_entry_offset)
-		{
-			*resident_entry_offset = m_code.Size();
+		size_t resident_gpr_body_branch = static_cast<size_t>(-1);
+		const auto emit_resident_marker =
+			[&](size_t* entry_offset, size_t* body_branch) {
+				*entry_offset = m_code.Size();
 #if defined(VITASX2_QEMU_VALIDATION)
-			const u32 frame_instructions =
-				2u + (m_stack_frame_size != 0 ? 2u : 0u);
-			const u32 stack_words =
-				2u * static_cast<u32>(__builtin_popcount(
-						 static_cast<unsigned>(m_saved_registers | REG_LR)));
-			if (!m_code.EmitMovImm32(HOST_CALL_SCRATCH,
-					static_cast<u32>(reinterpret_cast<uptr>(
-						&s_qemuIopLinkedFrameEvidence))) ||
-				!m_code.EmitLdrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
-				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1) ||
-				!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
-				!m_code.EmitLdrImm12(
-					HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
-				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0,
-					static_cast<u8>(frame_instructions)) ||
-				!m_code.EmitStrImm12(
-					HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
-				!m_code.EmitLdrImm12(
-					HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)) ||
-				!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0,
-					static_cast<u8>(stack_words)) ||
-				!m_code.EmitStrImm12(
-					HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)))
-			{
-				return false;
-			}
+				const u32 frame_instructions =
+					2u + (m_stack_frame_size != 0 ? 2u : 0u);
+				const u32 stack_words =
+					2u * static_cast<u32>(__builtin_popcount(
+							 static_cast<unsigned>(m_saved_registers | REG_LR)));
+				if (!m_code.EmitMovImm32(HOST_CALL_SCRATCH,
+						static_cast<u32>(reinterpret_cast<uptr>(
+							&s_qemuIopLinkedFrameEvidence))) ||
+					!m_code.EmitLdrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
+					!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1) ||
+					!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
+					!m_code.EmitLdrImm12(
+						HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
+					!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0,
+						static_cast<u8>(frame_instructions)) ||
+					!m_code.EmitStrImm12(
+						HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
+					!m_code.EmitLdrImm12(
+						HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)) ||
+					!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0,
+						static_cast<u8>(stack_words)) ||
+					!m_code.EmitStrImm12(
+						HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)))
+				{
+					return false;
+				}
 #endif
 #if defined(VITASX2_CPU_PROFILER)
-			static_assert(sizeof(std::atomic<u32>) == sizeof(u32));
-			static_assert(alignof(std::atomic<u32>) >= alignof(u32));
-			if (!m_code.EmitMovImm32(HOST_TMP0,
-					static_cast<u32>(reinterpret_cast<uptr>(
-						&VitaPerformanceTelemetry::g_cpu_iop_statistical_pc))) ||
-				!m_code.EmitMovImm32(HOST_TMP1, start_pc) ||
-				!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
-			{
-				return false;
-			}
+				static_assert(sizeof(std::atomic<u32>) == sizeof(u32));
+				static_assert(alignof(std::atomic<u32>) >= alignof(u32));
+				if (!m_code.EmitMovImm32(HOST_TMP0,
+						static_cast<u32>(reinterpret_cast<uptr>(
+							&VitaPerformanceTelemetry::g_cpu_iop_statistical_pc))) ||
+					!m_code.EmitMovImm32(HOST_TMP1, start_pc) ||
+					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
+				{
+					return false;
+				}
 #endif
-			resident_body_branch = m_code.EmitBranchPlaceholder();
-			if (resident_body_branch == static_cast<size_t>(-1))
-				return false;
+				*body_branch = m_code.EmitBranchPlaceholder();
+				return *body_branch != static_cast<size_t>(-1);
+			};
+		if (!emit_resident_marker(
+				&m_resident_contract.base_entry_offset,
+				&resident_body_branch) ||
+			(m_resident_gpr_contract_safe && m_pinned_gpr_count != 0 &&
+				!emit_resident_marker(
+					&m_resident_contract.gpr_entry_offset,
+					&resident_gpr_body_branch)))
+		{
+			return false;
 		}
 #endif
 
@@ -1639,17 +1662,13 @@ namespace VitaIOP
 			return false;
 		}
 #else
-		if (resident_entry_offset)
-			*resident_entry_offset = resident_body;
+		m_resident_contract.base_entry_offset = resident_body;
 #endif
 		const size_t setup_bytes = resident_body - setup_start;
 		if ((setup_bytes & 3u) != 0 || setup_bytes / sizeof(u32) > UINT8_MAX)
 			return false;
-		if (resident_setup_instruction_count)
-		{
-			*resident_setup_instruction_count =
-				static_cast<u8>(setup_bytes / sizeof(u32));
-		}
+		m_resident_contract.base_setup_instruction_count =
+			static_cast<u8>(setup_bytes / sizeof(u32));
 		for (u8 i = 0; i < m_pinned_gpr_count; i++)
 		{
 			const PinnedGpr& pin = m_pinned_gprs[i];
@@ -1664,9 +1683,39 @@ namespace VitaIOP
 					return false;
 				}
 				m_pinned_gpr_initial_loads++;
+				m_resident_contract.gpr_entry_load_instruction_count++;
 			}
 		}
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_CPU_PROFILER)
+		if (resident_gpr_body_branch != static_cast<size_t>(-1) &&
+			!m_code.PatchBranch(resident_gpr_body_branch, m_code.Size()))
+		{
+			return false;
+		}
+#else
+		if (m_resident_gpr_contract_safe && m_pinned_gpr_count != 0)
+			m_resident_contract.gpr_entry_offset = m_code.Size();
+#endif
 		return true;
+	}
+
+	void BlockCompiler::FinalizeResidentExitContract()
+	{
+		m_resident_contract.exit = {};
+		m_resident_contract.dirty_gpr_host_mask = 0;
+		if (!m_resident_gpr_contract_safe)
+			return;
+
+		m_resident_contract.exit = m_resident_contract.base_entry;
+		for (u8 i = 0; i < m_pinned_gpr_count; i++)
+		{
+			const PinnedGpr& pin = m_pinned_gprs[i];
+			m_resident_contract.exit.Bind(pin.host,
+				VitaRegion::ResidentValue::GuestGprLow32, pin.guest);
+			if (pin.written)
+				m_resident_contract.dirty_gpr_host_mask |=
+					static_cast<u16>(1u << pin.host);
+		}
 	}
 
 	bool BlockCompiler::EndBlockReturn(BlockExitKind exit, bool charge_budget,
@@ -1792,11 +1841,25 @@ namespace VitaIOP
 		if (!direct_exit || direct_link_slot_index >= 2)
 			return false;
 
-		if (!EmitFlushPinnedGprs() ||
-			(charge_budget &&
-				!EmitChargeEeBudget(0, true,
+		// Preserve dirty pins until the signed budget test. Its cold LE exit owns
+		// the canonical flush, while a compatible linked edge can replace the
+		// first ordinary STR with a direct branch and skip every source store.
+		if (charge_budget &&
+				!EmitChargeEeBudget(0, false,
 					test_budget ? direct_link_slot_index : UINT8_MAX,
-					test_budget)))
+					test_budget))
+		{
+			return false;
+		}
+
+		const size_t flush_offset = m_code.Size();
+		if (!EmitFlushPinnedGprs())
+			return false;
+		const u8 flush_count = static_cast<u8>(
+			(m_code.Size() - flush_offset) / sizeof(u32));
+		u32 flush_instruction = 0;
+		if (flush_count != 0 &&
+			!m_code.ReadInstruction(flush_offset, &flush_instruction))
 		{
 			return false;
 		}
@@ -1821,6 +1884,11 @@ namespace VitaIOP
 			direct_link_slot->fallback_offset = fallback_offset;
 			direct_link_slot->logical_continuation =
 				fallback_exit == BlockExitKind::LogicalContinuation;
+			direct_link_slot->resident_gpr_bypass_offset =
+				flush_count != 0 ? flush_offset : static_cast<size_t>(-1);
+			direct_link_slot->resident_gpr_bypass_instruction =
+				flush_instruction;
+			direct_link_slot->resident_gpr_stores_removed = flush_count;
 		}
 		return true;
 	}
@@ -7118,9 +7186,7 @@ namespace VitaIOP
 		bool allow_entry_gate, bool inherited_isolate_write,
 		u32 logical_cycle_prefix, u32 logical_cycle_total,
 		bool fragmented_logical_block, bool logical_continuation_tail,
-		size_t* resident_entry_offset,
-		VitaRegion::EntryContract* resident_entry_contract,
-		u8* resident_setup_instruction_count)
+		ResidentFragmentContract* resident_contract)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -7351,11 +7417,8 @@ namespace VitaIOP
 		AnalyzePinnedGprs(start_pc, instruction_count);
 		AnalyzeSavedRegisters(start_pc, instruction_count);
 
-		if (!BeginBlock(start_pc, linked_entry_offset, provider_entry_offset,
-				resident_entry_offset, resident_setup_instruction_count))
+		if (!BeginBlock(start_pc, linked_entry_offset, provider_entry_offset))
 			return false;
-		if (resident_entry_contract)
-			*resident_entry_contract = m_resident_entry_contract;
 		if (m_compiled_ps1_bios_gate && !EmitCompiledPs1BiosGate())
 			return false;
 
@@ -7486,6 +7549,7 @@ namespace VitaIOP
 			return false;
 		if (m_expanded_cycle_batching)
 			RecordBatchedCycleExitSavings(instruction_count, false);
+		FinalizeResidentExitContract();
 
 		const auto end_completion_return = [&](bool charge_budget = true,
 			bool flush_pins = true) -> bool {
@@ -7826,6 +7890,8 @@ namespace VitaIOP
 		m_unflushed_budget_exit_branches = nullptr;
 		m_scheduler_budget_exit_branches = {};
 		m_unflushed_scheduler_budget_exit_branches = {};
+		if (resident_contract)
+			*resident_contract = m_resident_contract;
 		return true;
 	}
 
@@ -8361,6 +8427,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopResidentPreludeLinksEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetResidentGprLinksEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopResidentGprLinksEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -11540,9 +11615,7 @@ namespace VitaIOP
 			DirectLinkSlots attempt_direct_links;
 			size_t attempt_linked_entry_offset = 0;
 			size_t attempt_provider_entry_offset = 0;
-			size_t attempt_resident_entry_offset = 0;
-			VitaRegion::EntryContract attempt_resident_entry_contract{};
-			u8 attempt_resident_setup_instruction_count = 0;
+			ResidentFragmentContract attempt_resident_contract{};
 				const bool compiled = compiler.CompileStraightLineBlock(
 					fragment_start_pc, fragment_instruction_count,
 					reinterpret_cast<const void*>(&VitaIopA32DirectExit),
@@ -11553,9 +11626,7 @@ namespace VitaIOP
 					logical_writes_isolate_mode, logical_cycle_prefix,
 					logical_cycle_total, fragmented_logical_block,
 					logical_continuation && !continuation_fragment,
-					&attempt_resident_entry_offset,
-					&attempt_resident_entry_contract,
-					&attempt_resident_setup_instruction_count);
+					&attempt_resident_contract);
 				const bool out_of_block_space =
 					!compiled && fragment.code.Size() >= fragment.code.Capacity();
 				const bool source_page_literal_out_of_range =
@@ -11571,11 +11642,7 @@ namespace VitaIOP
 					CommitCodeSlice(code_slice_offset, fragment.code.Size());
 					fragment.linked_entry_offset = attempt_linked_entry_offset;
 					fragment.provider_entry_offset = attempt_provider_entry_offset;
-					fragment.resident_entry_offset = attempt_resident_entry_offset;
-					fragment.resident_entry_contract =
-						attempt_resident_entry_contract;
-					fragment.resident_setup_instruction_count =
-						attempt_resident_setup_instruction_count;
+					fragment.resident = attempt_resident_contract;
 					native_instruction_count += compiler.NativeInstructionCount();
 					helper_instruction_count += compiler.HelperInstructionCount();
 					compiled_ps1_bios_gate =
@@ -11815,14 +11882,31 @@ namespace VitaIOP
 			return nullptr;
 		const CachedBlock::CodeFragment& fragment = block.Fragment(0);
 		if (!fragment.code.EntryPoint() ||
-			fragment.resident_setup_instruction_count == 0 ||
-			fragment.resident_entry_offset >= fragment.code.Size())
+			fragment.resident.base_setup_instruction_count == 0 ||
+			fragment.resident.base_entry_offset >= fragment.code.Size())
 		{
 			return nullptr;
 		}
 
 		return static_cast<const u8*>(fragment.code.EntryPoint()) +
-		       fragment.resident_entry_offset;
+		       fragment.resident.base_entry_offset;
+	}
+
+	const void* BlockExecutor::ResidentGprEntryPoint(
+		const CachedBlock& block) const
+	{
+		if (!block.HasFragments())
+			return nullptr;
+		const CachedBlock::CodeFragment& fragment = block.Fragment(0);
+		if (!fragment.code.EntryPoint() ||
+			fragment.resident.gpr_entry.domain == VitaRegion::GuestDomain::None ||
+			fragment.resident.gpr_entry_offset >= fragment.code.Size())
+		{
+			return nullptr;
+		}
+
+		return static_cast<const u8*>(fragment.code.EntryPoint()) +
+		       fragment.resident.gpr_entry_offset;
 	}
 
 	const void* BlockExecutor::ProviderEntryPoint(const CachedBlock& block) const
@@ -11876,6 +11960,7 @@ namespace VitaIOP
 		if (!link_code)
 			return false;
 		bool use_resident_entry = false;
+		bool use_resident_gpr_entry = false;
 		const void* target_entry = nullptr;
 		if (use_chain)
 		{
@@ -11884,36 +11969,79 @@ namespace VitaIOP
 			const CachedBlock::CodeFragment& target_fragment =
 				target->Fragment(0);
 			use_resident_entry =
-				source_fragment.resident_entry_contract.Provides(
-					target_fragment.resident_entry_contract) &&
+				source_fragment.resident.base_entry.Provides(
+					target_fragment.resident.base_entry) &&
 				ResidentEntryPoint(*target) != nullptr;
+			use_resident_gpr_entry =
+				source_fragment.resident.exit.Provides(
+					target_fragment.resident.gpr_entry) &&
+				ResidentGprEntryPoint(*target) != nullptr;
+			for (unsigned host = 0;
+				use_resident_gpr_entry &&
+					host < VitaRegion::EntryContract::HostRegisterCount;
+				host++)
+			{
+				if ((source_fragment.resident.dirty_gpr_host_mask &
+						(1u << host)) != 0 &&
+					!(source_fragment.resident.exit.host_values[host] ==
+						target_fragment.resident.gpr_entry.host_values[host]))
+				{
+					use_resident_gpr_entry = false;
+				}
+			}
 #if defined(VITASX2_IOP_RESIDENT_PRELUDE_CONTROL)
 			use_resident_entry = false;
+			use_resident_gpr_entry = false;
+#endif
+#if defined(VITASX2_IOP_RESIDENT_GPR_CONTROL)
+			use_resident_gpr_entry = false;
 #endif
 #if defined(VITASX2_QEMU_VALIDATION)
 			use_resident_entry =
 				use_resident_entry && s_qemuIopResidentPreludeLinksEnabled;
+			use_resident_gpr_entry = use_resident_gpr_entry &&
+				s_qemuIopResidentPreludeLinksEnabled &&
+				s_qemuIopResidentGprLinksEnabled;
 #endif
-			target_entry = use_resident_entry ?
-				ResidentEntryPoint(*target) : LinkedEntryPoint(*target);
+			const bool bypasses_source_stores =
+				link.resident_gpr_bypass_offset != static_cast<size_t>(-1);
+			target_entry = use_resident_gpr_entry && !bypasses_source_stores ?
+				ResidentGprEntryPoint(*target) : (use_resident_entry ?
+				ResidentEntryPoint(*target) : LinkedEntryPoint(*target));
 		}
+		const bool has_gpr_bypass =
+			link.resident_gpr_bypass_offset != static_cast<size_t>(-1);
+		const bool bypass_restored = !has_gpr_bypass ||
+			link_code->PatchInstruction(link.resident_gpr_bypass_offset,
+				link.resident_gpr_bypass_instruction);
 		const bool target_patched =
 			use_chain ? link_code->PatchBranchToAddress(link.target_offset,
 							target_entry) :
 						link_code->PatchBranch(link.target_offset, link.fallback_offset);
-		link.resident_entry_active = use_resident_entry;
+		const bool gpr_bypass_patched =
+			!use_resident_gpr_entry || !has_gpr_bypass ||
+			link_code->PatchBranchToAddress(link.resident_gpr_bypass_offset,
+				ResidentGprEntryPoint(*target));
+		link.resident_entry_active =
+			use_resident_entry || use_resident_gpr_entry;
+		link.resident_gpr_entry_active = use_resident_gpr_entry;
 		link.resident_setup_instructions_removed =
-			use_resident_entry ?
-				target->Fragment(0).resident_setup_instruction_count :
+			(use_resident_entry || use_resident_gpr_entry) ?
+				target->Fragment(0).resident.base_setup_instruction_count :
+				0;
+		link.resident_gpr_loads_removed =
+			use_resident_gpr_entry ?
+				target->Fragment(0).resident.gpr_entry_load_instruction_count :
 				0;
 		if (link.logical_continuation)
-			return target_patched && link_code->Flush();
+			return bypass_restored && target_patched && gpr_bypass_patched &&
+				link_code->Flush();
 
 		const u32 scheduler_resume =
 			use_chain ? (static_cast<u32>(reinterpret_cast<uptr>(target)) |
 				SCHEDULER_DIRECT_RESUME_TAG) :
 			static_cast<u32>(BlockExitKind::Direct);
-		if (!target_patched ||
+		if (!bypass_restored || !target_patched || !gpr_bypass_patched ||
 			!link_code->PatchMovImm32(link.scheduler_resume_offset, HOST_TMP0,
 				scheduler_resume) ||
 			!link_code->Flush())
@@ -12215,6 +12343,9 @@ namespace VitaIOP
 			s_qemuIopLinkedFrameEvidence.stack_words_removed;
 		result->resident_prelude_links = 0;
 		result->resident_prelude_setup_instructions_removed = 0;
+		result->resident_gpr_links = 0;
+		result->resident_gpr_stores_removed = 0;
+		result->resident_gpr_loads_removed = 0;
 		for (const std::unique_ptr<CachedBlock>& cached : m_cache)
 		{
 			if (!cached || !cached->valid)
@@ -12226,6 +12357,14 @@ namespace VitaIOP
 				result->resident_prelude_links++;
 				result->resident_prelude_setup_instructions_removed +=
 					link.resident_setup_instructions_removed;
+				if (link.resident_gpr_entry_active)
+				{
+					result->resident_gpr_links++;
+					result->resident_gpr_stores_removed +=
+						link.resident_gpr_stores_removed;
+					result->resident_gpr_loads_removed +=
+						link.resident_gpr_loads_removed;
+				}
 			}
 		}
 		result->sequential_qword_copy_fast_paths =

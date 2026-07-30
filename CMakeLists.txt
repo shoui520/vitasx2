@@ -76,6 +76,10 @@ option(VITASX2_IOP_RESIDENT_PRELUDE_CONTROL
 	"Diagnostic control: rebuild fixed IOP bases at every linked block entry."
 	OFF)
 
+option(VITASX2_IOP_RESIDENT_GPR_CONTROL
+	"Diagnostic control: publish and reload pinned IOP GPRs at every linked block edge."
+	OFF)
+
 option(VITASX2_SILENT_HSYNC_FOLD_CONTROL
 	"Diagnostic control: retain every HSync scheduler boundary while both processors hold exact wait certificates."
 	OFF)
