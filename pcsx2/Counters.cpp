@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include <time.h>
+#include <array>
 #include <cmath>
 
 #include "Common.h"
@@ -43,6 +44,8 @@ static void rcntWcount(int index, u32 value);
 static void rcntWmode(int index, u32 value);
 static void rcntWtarget(int index, u32 value);
 static void rcntWhold(int index, u32 value);
+static void _cpuTestTarget(int index);
+static void _cpuTestOverflow(int index);
 
 // For Analog/Double Strike and Interlace modes
 static bool IsInterlacedVideoMode()
@@ -99,7 +102,11 @@ static __fi void _rcntSet(int cntidx)
 	{
 		nextDeltaCounter = c;
 
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		cpuSetNextCounterEvent(nextStartCounter, nextDeltaCounter);
+#else
 		cpuSetNextEvent(nextStartCounter, nextDeltaCounter); // Need to update on counter resets/target changes
+#endif
 	}
 
 	// Ignore target diff if target is currently disabled.
@@ -119,7 +126,11 @@ static __fi void _rcntSet(int cntidx)
 		if (c < nextDeltaCounter)
 		{
 			nextDeltaCounter = c;
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+			cpuSetNextCounterEvent(nextStartCounter, nextDeltaCounter);
+#else
 			cpuSetNextEvent(nextStartCounter, nextDeltaCounter); // Need to update on counter resets/target changes
+#endif
 		}
 	}
 }
@@ -145,7 +156,11 @@ static __fi void cpuRcntSet()
 	if (nextDeltaCounter < 0)
 		nextDeltaCounter = 0;
 
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	cpuSetNextCounterEvent(nextStartCounter, nextDeltaCounter);
+#else
 	cpuSetNextEvent(nextStartCounter, nextDeltaCounter); // Need to update on counter resets/target changes
+#endif
 }
 
 
@@ -165,6 +180,357 @@ struct vSyncTimingInfo
 };
 
 static vSyncTimingInfo vSyncInfo;
+
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+static bool VitaPrepareEeHsyncFold(
+	u32* external_clock_mask, u32* stop_detail)
+{
+	for (int i = 0; i < 4; i++)
+	{
+		const Counter& counter = counters[i];
+		if (counter.mode.EnableGate && counter.mode.GateSource == 0)
+		{
+			*stop_detail = static_cast<u32>(i) |
+				((counter.modeval & 0x0fffu) << 8);
+			return false;
+		}
+		if (counter.mode.ClockSource != 3 || !rcntCanCount(i))
+			continue;
+
+		// PCSX2 owner: rcntStartGate(false). A non-interrupting external
+		// counter has no per-edge observer while both processors wait. Its
+		// count, future-target bit, zero return and wrapping can be advanced
+		// exactly in the fold. Interrupt-capable counters keep the ordinary
+		// edge which establishes their precise INTC wake cycle.
+		if (counter.mode.TargetInterrupt ||
+			counter.mode.OverflowInterrupt)
+		{
+			*stop_detail = static_cast<u32>(i) |
+				((counter.modeval & 0x0fffu) << 8);
+			return false;
+		}
+		*external_clock_mask |= 1u << i;
+	}
+	return true;
+}
+
+u64 VitaGetNextNonHsyncCounterCycle()
+{
+	u64 deadline = vsyncCounter.startCycle +
+		static_cast<u32>(vsyncCounter.deltaCycles);
+	for (int i = 0; i < 4; i++)
+	{
+		const Counter& counter = counters[i];
+		if (!rcntCanCount(i) || counter.mode.ClockSource == 3 ||
+			(!counter.mode.TargetInterrupt &&
+				!counter.mode.OverflowInterrupt &&
+				!counter.mode.ZeroReturn))
+		{
+			continue;
+		}
+
+		if (counter.count > 0x10000 || counter.count > counter.target)
+		{
+			deadline = std::min(deadline, cpuRegs.cycle + 4);
+			continue;
+		}
+
+		const s64 elapsed = static_cast<s64>(
+			cpuRegs.cycle - counter.startCycle);
+		const s64 overflow_delta =
+			static_cast<s64>(0x10000 - counter.count) * counter.rate -
+			elapsed;
+		deadline = std::min(deadline,
+			cpuRegs.cycle + static_cast<u64>(
+				std::max<s64>(0, overflow_delta)));
+
+		if ((counter.target & EECNT_FUTURE_TARGET) == 0)
+		{
+			const s64 target_delta =
+				static_cast<s64>(counter.target - counter.count) *
+					counter.rate -
+				elapsed;
+			deadline = std::min(deadline,
+				cpuRegs.cycle + static_cast<u64>(
+					std::max<s64>(0, target_delta)));
+		}
+	}
+	return deadline;
+}
+
+VitaSilentHsyncFoldResult VitaFoldSilentHsyncBefore(u64 exclusive_cycle)
+{
+#if defined(VITASX2_SILENT_HSYNC_FOLD_CONTROL)
+	(void)exclusive_cycle;
+	return {0, VitaSilentHsyncFoldStop::Control, 0};
+#else
+	// PCSX2 owner: rcntUpdate_hScanline(). Never fold a due edge, a VSync
+	// edge, an EE/IOP counter gate, or a GS interrupt which can wake the EE.
+	// The caller additionally bounds exclusive_cycle by every non-HSync
+	// EE/IOP owner while both processors carry exact wait certificates.
+	if (exclusive_cycle <= cpuRegs.cycle)
+		return {0, VitaSilentHsyncFoldStop::HorizonDue, 0};
+
+	const bool sync_suppressed = GSSMODE1reg.SINT;
+	u32 external_clock_mask = 0;
+	u32 ee_counter_stop_detail = 0;
+	if (!sync_suppressed &&
+		!VitaPrepareEeHsyncFold(
+			&external_clock_mask, &ee_counter_stop_detail))
+	{
+		return {0, VitaSilentHsyncFoldStop::EeCounterOrGate,
+			ee_counter_stop_detail};
+	}
+	if (!sync_suppressed && !VitaIopHsyncCountersAreSilent())
+		return {0, VitaSilentHsyncFoldStop::IopCounterOrGate, 0};
+
+	u32 folded = 0;
+	VitaSilentHsyncFoldStop stop =
+		VitaSilentHsyncFoldStop::ExclusiveLimit;
+	for (;;)
+	{
+		const u64 edge_cycle = hsyncCounter.startCycle +
+			static_cast<u32>(hsyncCounter.deltaCycles);
+		if (edge_cycle <= cpuRegs.cycle)
+		{
+			stop = VitaSilentHsyncFoldStop::HsyncDue;
+			break;
+		}
+		if (edge_cycle >= exclusive_cycle)
+			break;
+
+		if (hsyncCounter.Mode == MODE_HBLANK)
+		{
+			hsyncCounter.startCycle += vSyncInfo.hBlank;
+			hsyncCounter.deltaCycles = vSyncInfo.hRender;
+			if (!sync_suppressed)
+				hBlanking = false;
+			hsyncCounter.Mode = MODE_HRENDER;
+		}
+		else
+		{
+			// An unmasked first HSINT is an exact EE wake owner. Leave that
+			// edge for rcntUpdate_hScanline() and the ordinary scheduler.
+			if (!sync_suppressed && !CSRreg.HSINT && !GSIMR.HSMSK)
+			{
+				stop = VitaSilentHsyncFoldStop::UnmaskedHsint;
+				break;
+			}
+
+			hsyncCounter.startCycle += vSyncInfo.hRender;
+			hsyncCounter.deltaCycles = vSyncInfo.hBlank;
+			if (!sync_suppressed)
+			{
+				CSRreg.HSINT = true;
+				for (int i = 0; i < 4; i++)
+				{
+					if ((external_clock_mask & (1u << i)) == 0)
+						continue;
+					counters[i].count += HBLANK_COUNTER_SPEED;
+					_cpuTestOverflow(i);
+					_cpuTestTarget(i);
+				}
+				hBlanking = true;
+			}
+			hsyncCounter.Mode = MODE_HBLANK;
+		}
+		folded++;
+	}
+
+	if (folded != 0)
+		cpuRcntSet();
+	return {folded, stop, 0};
+#endif
+}
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+bool VitaValidateSilentHsyncFolding()
+{
+	const cpuRegistersPack saved_cpu = _cpuRegistersPack;
+	const psxRegisters saved_iop = psxRegs;
+	const std::array<Counter, 4> saved_counters = {
+		counters[0], counters[1], counters[2], counters[3]};
+	const std::array<psxCounter, NUM_COUNTERS> saved_iop_counters = {
+		psxCounters[0], psxCounters[1], psxCounters[2], psxCounters[3],
+		psxCounters[4], psxCounters[5], psxCounters[6], psxCounters[7]};
+	const SyncCounter saved_hsync = hsyncCounter;
+	const SyncCounter saved_vsync = vsyncCounter;
+	const vSyncTimingInfo saved_timing = vSyncInfo;
+	const u64 saved_next_start = nextStartCounter;
+	const s32 saved_next_delta = nextDeltaCounter;
+	const bool saved_hblanking = hBlanking;
+	const u64 saved_smode1 =
+		*reinterpret_cast<const u64*>(PS2MEM_GS + 0x10);
+	const u64 saved_csr =
+		*reinterpret_cast<const u64*>(PS2MEM_GS + 0x1000);
+	const u32 saved_imr =
+		*reinterpret_cast<const u32*>(PS2MEM_GS + 0x1010);
+
+	auto configure = []() {
+		std::memset(&_cpuRegistersPack, 0, sizeof(_cpuRegistersPack));
+		std::memset(&psxRegs, 0, sizeof(psxRegs));
+		std::memset(counters, 0, sizeof(counters));
+		std::memset(psxCounters, 0, sizeof(psxCounters));
+		for (Counter& counter : counters)
+		{
+			counter.rate = 2;
+			counter.target = 0xffff;
+		}
+		cpuRegs.cycle = 100;
+		cpuRegs.nextEventCycle = 100000;
+		hsyncCounter = {MODE_HRENDER, 100, 80};
+		vsyncCounter = {MODE_VRENDER, 100, 10000};
+		vSyncInfo.hRender = 80;
+		vSyncInfo.hBlank = 20;
+		hBlanking = false;
+		GSSMODE1reg.SINT = true;
+		CSRreg.HSINT = false;
+		GSIMR.HSMSK = true;
+		nextStartCounter = 100;
+		nextDeltaCounter = 80;
+	};
+
+	configure();
+	for (u32 i = 0; i < 6; i++)
+	{
+		cpuRegs.cycle = hsyncCounter.startCycle +
+			static_cast<u32>(hsyncCounter.deltaCycles);
+		rcntUpdate_hScanline();
+	}
+	const SyncCounter reference_hsync = hsyncCounter;
+	const u64 reference_next_edge =
+		reference_hsync.startCycle +
+		static_cast<u32>(reference_hsync.deltaCycles);
+
+	configure();
+	const VitaSilentHsyncFoldResult folded =
+		VitaFoldSilentHsyncBefore(reference_next_edge);
+	bool ok = folded.folded_edges == 6 &&
+		hsyncCounter.Mode == reference_hsync.Mode &&
+		hsyncCounter.startCycle == reference_hsync.startCycle &&
+		hsyncCounter.deltaCycles == reference_hsync.deltaCycles;
+
+	configure();
+	ok = ok && VitaFoldSilentHsyncBefore(
+		hsyncCounter.startCycle +
+			static_cast<u32>(hsyncCounter.deltaCycles)).folded_edges == 0;
+
+	configure();
+	GSSMODE1reg.SINT = false;
+	GSIMR.HSMSK = false;
+	CSRreg.HSINT = false;
+	ok = ok && VitaFoldSilentHsyncBefore(1000).folded_edges == 0 &&
+		hsyncCounter.Mode == MODE_HRENDER;
+
+	configure();
+	GSSMODE1reg.SINT = false;
+	GSIMR.HSMSK = true;
+	CSRreg.HSINT = false;
+	const VitaSilentHsyncFoldResult masked_folded =
+		VitaFoldSilentHsyncBefore(1000);
+	ok = ok && masked_folded.folded_edges != 0 && CSRreg.HSINT;
+
+	configure();
+	GSSMODE1reg.SINT = false;
+	GSIMR.HSMSK = true;
+	CSRreg.HSINT = true;
+	counters[0].mode.ClockSource = 3;
+	counters[0].mode.IsCounting = 1;
+	counters[0].mode.ZeroReturn = 1;
+	counters[0].target = 3;
+	for (u32 i = 0; i < 10; i++)
+	{
+		cpuRegs.cycle = hsyncCounter.startCycle +
+			static_cast<u32>(hsyncCounter.deltaCycles);
+		rcntUpdate_hScanline();
+	}
+	const Counter reference_external_counter = counters[0];
+	const SyncCounter reference_external_hsync = hsyncCounter;
+	const bool reference_external_hblanking = hBlanking;
+	const u64 reference_external_next_edge =
+		reference_external_hsync.startCycle +
+		static_cast<u32>(reference_external_hsync.deltaCycles);
+
+	configure();
+	GSSMODE1reg.SINT = false;
+	GSIMR.HSMSK = true;
+	CSRreg.HSINT = true;
+	counters[0].mode.ClockSource = 3;
+	counters[0].mode.IsCounting = 1;
+	counters[0].mode.ZeroReturn = 1;
+	counters[0].target = 3;
+	const VitaSilentHsyncFoldResult external_folded =
+		VitaFoldSilentHsyncBefore(reference_external_next_edge);
+	ok = ok && external_folded.folded_edges == 10 &&
+		counters[0].count == reference_external_counter.count &&
+		counters[0].modeval == reference_external_counter.modeval &&
+		counters[0].target == reference_external_counter.target &&
+		counters[0].startCycle ==
+			reference_external_counter.startCycle &&
+		hsyncCounter.Mode == reference_external_hsync.Mode &&
+		hsyncCounter.startCycle == reference_external_hsync.startCycle &&
+		hsyncCounter.deltaCycles ==
+			reference_external_hsync.deltaCycles &&
+		hBlanking == reference_external_hblanking;
+
+	configure();
+	GSSMODE1reg.SINT = false;
+	CSRreg.HSINT = true;
+	counters[0].mode.ClockSource = 3;
+	counters[0].mode.IsCounting = 1;
+	counters[0].mode.TargetInterrupt = 1;
+	ok = ok && VitaFoldSilentHsyncBefore(1000).folded_edges == 0;
+
+	configure();
+	GSSMODE1reg.SINT = false;
+	CSRreg.HSINT = true;
+	counters[0].mode.ClockSource = 3;
+	counters[0].mode.IsCounting = 1;
+	counters[0].mode.OverflowInterrupt = 1;
+	ok = ok && VitaFoldSilentHsyncBefore(1000).folded_edges == 0;
+
+	configure();
+	GSSMODE1reg.SINT = false;
+	CSRreg.HSINT = true;
+	counters[0].mode.IsCounting = 1;
+	counters[0].mode.EnableGate = 1;
+	counters[0].mode.GateSource = 0;
+	ok = ok && VitaFoldSilentHsyncBefore(1000).folded_edges == 0;
+
+	configure();
+	GSSMODE1reg.SINT = false;
+	CSRreg.HSINT = true;
+	psxCounters[0].mode.gateEnable = true;
+	ok = ok && VitaFoldSilentHsyncBefore(1000).folded_edges == 0;
+
+	configure();
+	counters[0].mode.IsCounting = 1;
+	counters[0].mode.TargetInterrupt = 1;
+	counters[0].count = 0;
+	counters[0].target = 25;
+	counters[0].rate = 2;
+	counters[0].startCycle = cpuRegs.cycle;
+	ok = ok && VitaGetNextNonHsyncCounterCycle() == 150;
+
+	_cpuRegistersPack = saved_cpu;
+	psxRegs = saved_iop;
+	for (size_t i = 0; i < saved_counters.size(); i++)
+		counters[i] = saved_counters[i];
+	for (size_t i = 0; i < saved_iop_counters.size(); i++)
+		psxCounters[i] = saved_iop_counters[i];
+	hsyncCounter = saved_hsync;
+	vsyncCounter = saved_vsync;
+	vSyncInfo = saved_timing;
+	nextStartCounter = saved_next_start;
+	nextDeltaCounter = saved_next_delta;
+	hBlanking = saved_hblanking;
+	*reinterpret_cast<u64*>(PS2MEM_GS + 0x10) = saved_smode1;
+	*reinterpret_cast<u64*>(PS2MEM_GS + 0x1000) = saved_csr;
+	*reinterpret_cast<u32*>(PS2MEM_GS + 0x1010) = saved_imr;
+	return ok;
+}
+#endif
 
 void rcntInit()
 {

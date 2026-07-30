@@ -824,6 +824,16 @@ namespace MTGS
 				joint_wait_ram_write_overlaps_outside_scheduler);
 			EE_DEADLINE_DELTA(joint_wait_activations);
 			EE_DEADLINE_DELTA(joint_wait_scheduled_ee_cycles);
+			EE_DEADLINE_DELTA(silent_hsync_fold_attempts);
+			EE_DEADLINE_DELTA(silent_hsync_fold_activations);
+			EE_DEADLINE_DELTA(silent_hsync_folded_edges);
+			EE_DEADLINE_DELTA(silent_hsync_fold_blocked_control);
+			EE_DEADLINE_DELTA(silent_hsync_fold_blocked_horizon_due);
+			EE_DEADLINE_DELTA(silent_hsync_fold_blocked_ee_counter);
+			EE_DEADLINE_DELTA(silent_hsync_fold_blocked_iop_counter);
+			EE_DEADLINE_DELTA(silent_hsync_fold_blocked_hsync_due);
+			EE_DEADLINE_DELTA(silent_hsync_fold_blocked_limit);
+			EE_DEADLINE_DELTA(silent_hsync_fold_blocked_hsint);
 #if defined(VITASX2_CPU_PROFILER)
 			EE_DEADLINE_DELTA(ipu_epoch_from_ipu_wait_entries);
 			EE_DEADLINE_DELTA(ipu_epoch_candidate_entries);
@@ -1030,6 +1040,12 @@ namespace MTGS
 				"horizon_gt_24576=%llu ram_certified=%llu "
 				"ram_write_overlaps=%llu ram_write_outside=%llu "
 				"activations=%llu scheduled_ee_cycles=%llu "
+				"hsync_fold_attempts=%llu hsync_fold_activations=%llu "
+				"hsync_folded_edges=%llu "
+				"hsync_block_control=%llu hsync_block_horizon=%llu "
+				"hsync_block_ee_counter=%llu hsync_block_iop_counter=%llu "
+				"hsync_block_due=%llu hsync_block_limit=%llu "
+				"hsync_block_hsint=%llu hsync_stop_detail=0x%08x "
 				"last_ram_offset=0x%08x last_ram_size=%u",
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(ee_wait_shadow_entries),
@@ -1061,6 +1077,28 @@ namespace MTGS
 				static_cast<unsigned long long>(joint_wait_activations),
 				static_cast<unsigned long long>(
 					joint_wait_scheduled_ee_cycles),
+				static_cast<unsigned long long>(
+					silent_hsync_fold_attempts),
+				static_cast<unsigned long long>(
+					silent_hsync_fold_activations),
+				static_cast<unsigned long long>(
+					silent_hsync_folded_edges),
+				static_cast<unsigned long long>(
+					silent_hsync_fold_blocked_control),
+				static_cast<unsigned long long>(
+					silent_hsync_fold_blocked_horizon_due),
+				static_cast<unsigned long long>(
+					silent_hsync_fold_blocked_ee_counter),
+				static_cast<unsigned long long>(
+					silent_hsync_fold_blocked_iop_counter),
+				static_cast<unsigned long long>(
+					silent_hsync_fold_blocked_hsync_due),
+				static_cast<unsigned long long>(
+					silent_hsync_fold_blocked_limit),
+				static_cast<unsigned long long>(
+					silent_hsync_fold_blocked_hsint),
+				end.cpu_stage_profiler
+					.silent_hsync_fold_last_stop_detail,
 				end.cpu_stage_profiler.joint_wait_last_ram_offset,
 				end.cpu_stage_profiler.joint_wait_last_ram_size);
 #if defined(VITASX2_CPU_PROFILER)

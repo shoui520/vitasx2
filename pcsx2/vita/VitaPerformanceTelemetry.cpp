@@ -1002,6 +1002,45 @@ namespace VitaPerformanceTelemetry
 		totals.joint_wait_scheduled_ee_cycles += scheduled_ee_cycles;
 	}
 
+	void RecordSilentHsyncFold(
+		u32 folded_edges, u32 stop_reason, u32 stop_detail)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.silent_hsync_fold_attempts++;
+		totals.silent_hsync_fold_last_stop_detail = stop_detail;
+		if (folded_edges != 0)
+		{
+			totals.silent_hsync_fold_activations++;
+			totals.silent_hsync_folded_edges += folded_edges;
+			return;
+		}
+
+		switch (stop_reason)
+		{
+			case 0:
+				totals.silent_hsync_fold_blocked_control++;
+				break;
+			case 1:
+				totals.silent_hsync_fold_blocked_horizon_due++;
+				break;
+			case 2:
+				totals.silent_hsync_fold_blocked_ee_counter++;
+				break;
+			case 3:
+				totals.silent_hsync_fold_blocked_iop_counter++;
+				break;
+			case 4:
+				totals.silent_hsync_fold_blocked_hsync_due++;
+				break;
+			case 5:
+				totals.silent_hsync_fold_blocked_limit++;
+				break;
+			case 6:
+				totals.silent_hsync_fold_blocked_hsint++;
+				break;
+		}
+	}
+
 	static void FinishIpuEpochOpportunityRun()
 	{
 		const u32 length = s_cpu_stage_profiler.ipu_epoch_run_length;

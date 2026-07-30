@@ -71,6 +71,8 @@ static bool cpuIntsEnabled(int Interrupt);
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 static constexpr uint eeRetainedIopWaitCycles = eeWaitCycles * 2;
 static u64 s_vita_ee_owner_event_cycle;
+static u64 s_vita_ee_non_counter_owner_event_cycle;
+static u64 s_vita_ee_counter_owner_event_cycle;
 static bool s_vita_next_event_iop_only;
 
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -107,7 +109,21 @@ static __fi u32 VitaEeInterleaveCycles()
 static __fi void VitaResetEeDeadlineState(u64 deadline)
 {
 	s_vita_ee_owner_event_cycle = deadline;
+	s_vita_ee_non_counter_owner_event_cycle = deadline;
+	s_vita_ee_counter_owner_event_cycle = deadline;
 	s_vita_next_event_iop_only = false;
+}
+
+static __fi void VitaRefreshCombinedEeOwner()
+{
+	s_vita_ee_owner_event_cycle = std::min(
+		s_vita_ee_non_counter_owner_event_cycle,
+		s_vita_ee_counter_owner_event_cycle);
+	if (static_cast<s32>(
+		s_vita_ee_owner_event_cycle - cpuRegs.nextEventCycle) <= 0)
+	{
+		s_vita_next_event_iop_only = false;
+	}
 }
 
 static __fi void VitaBeginFullEeDeadlineCollection()
@@ -116,8 +132,11 @@ static __fi void VitaBeginFullEeDeadlineCollection()
 	// counters it services below. Keep that owner separately from the bounded
 	// EE/IOP execution seam so an ordinary IOP slice need not poll every EE
 	// owner.
-	s_vita_ee_owner_event_cycle =
+	const u64 no_owner =
 		cpuRegs.cycle + static_cast<u32>(std::numeric_limits<s32>::max());
+	s_vita_ee_non_counter_owner_event_cycle = no_owner;
+	s_vita_ee_counter_owner_event_cycle = no_owner;
+	s_vita_ee_owner_event_cycle = no_owner;
 	s_vita_next_event_iop_only = false;
 	cpuRegs.nextEventCycle = cpuRegs.cycle + VitaEeInterleaveCycles();
 }
@@ -130,19 +149,9 @@ static __fi void VitaRefreshEeCounterOwner()
 	// already due. Treat the canonical pair as an explicit calendar slot at
 	// every scheduler boundary so a missed narrowing can cause one extra full
 	// pass, never suppress HSync/VSync behind an IOP-only seam.
-	if (static_cast<s32>(
-			s_vita_ee_owner_event_cycle - nextStartCounter) >
-		nextDeltaCounter)
-	{
-		s_vita_ee_owner_event_cycle =
-			nextStartCounter + nextDeltaCounter;
-	}
-
-	if (static_cast<s32>(
-			s_vita_ee_owner_event_cycle - cpuRegs.nextEventCycle) <= 0)
-	{
-		s_vita_next_event_iop_only = false;
-	}
+	s_vita_ee_counter_owner_event_cycle =
+		nextStartCounter + static_cast<s32>(nextDeltaCounter);
+	VitaRefreshCombinedEeOwner();
 }
 
 static __fi void VitaScheduleEeAndIopDeadlineDelta(s64 iop_owner_delta)
@@ -319,6 +328,24 @@ static __fi bool VitaTryScheduleJointWaitHorizon(
 		VitaNextIopExternalOwnerDelta(external_cycle);
 	if (iop_owner_delta <= 0)
 		return false;
+
+	// HSync is normally the dominant EE calendar owner, but many games leave
+	// every HBlank-counted/gated timer disabled and HSINT masked or already
+	// latched while both processors wait. In that state its intermediate edges
+	// change only the final HBlank level. Fold only edges strictly before the
+	// first non-HSync EE counter, asynchronous EE event, or exact IOP owner.
+	// Counters.cpp stops before VSync and before any unmasked first HSINT.
+	const u64 iop_owner_cycle =
+		cpuRegs.cycle + static_cast<u64>(iop_owner_delta);
+	const u64 silent_hsync_limit = std::min({
+		iop_owner_cycle,
+		s_vita_ee_non_counter_owner_event_cycle,
+		VitaGetNextNonHsyncCounterCycle()});
+	const VitaSilentHsyncFoldResult hsync_fold =
+		VitaFoldSilentHsyncBefore(silent_hsync_limit);
+	VitaPerformanceTelemetry::RecordSilentHsyncFoldIfProfiling(
+		hsync_fold.folded_edges,
+		static_cast<u32>(hsync_fold.stop), hsync_fold.stop_detail);
 
 	// Replace iopEventTest()'s manufactured polling seed only after both wait
 	// proofs hold. A later PSX_INT()/counter write still narrows this canonical
@@ -576,18 +603,27 @@ __fi void cpuSetNextEvent( u64 startCycle, s32 delta )
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 	if (VitaEeInterleaveSchedulerActive() &&
 		static_cast<s32>(
-			s_vita_ee_owner_event_cycle - startCycle) > delta)
+			s_vita_ee_non_counter_owner_event_cycle - startCycle) > delta)
 	{
-		s_vita_ee_owner_event_cycle = startCycle + delta;
-	}
-	if (VitaEeInterleaveSchedulerActive() &&
-		static_cast<s32>(
-			s_vita_ee_owner_event_cycle - cpuRegs.nextEventCycle) <= 0)
-	{
-		s_vita_next_event_iop_only = false;
+		s_vita_ee_non_counter_owner_event_cycle = startCycle + delta;
+		VitaRefreshCombinedEeOwner();
 	}
 #endif
 }
+
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+void cpuSetNextCounterEvent(u64 startCycle, s32 delta)
+{
+	if ((int)(cpuRegs.nextEventCycle - startCycle) > delta)
+		cpuRegs.nextEventCycle = startCycle + delta;
+
+	if (VitaEeInterleaveSchedulerActive())
+	{
+		s_vita_ee_counter_owner_event_cycle = startCycle + delta;
+		VitaRefreshCombinedEeOwner();
+	}
+}
+#endif
 
 // sets a branch to occur some time from the current cycle
 __fi void cpuSetNextEventDelta( s32 delta )
@@ -1320,7 +1356,11 @@ __fi void _cpuEventTest_Shared()
 #endif
 
 		// Apply vsync and other counter nextCycles
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+		cpuSetNextCounterEvent(nextStartCounter, nextDeltaCounter);
+#else
 		cpuSetNextEvent(nextStartCounter, nextDeltaCounter);
+#endif
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 		if (VitaEeInterleaveSchedulerActive())
 		{

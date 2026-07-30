@@ -406,6 +406,13 @@ extern void GoemonPreloadTlb();
 extern void GoemonUnloadTlb(u32 key);
 
 extern void cpuSetNextEvent( u64 startCycle, s32 delta );
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+// Counters.cpp owns a distinct exact-deadline slot on Vita. Keep its
+// publication separate from asynchronous EE event owners so a certified
+// joint wait can reason about silent HSync boundaries without losing the
+// ordinary PCSX2 nextEventCycle contract.
+extern void cpuSetNextCounterEvent(u64 startCycle, s32 delta);
+#endif
 extern void cpuSetNextEventDelta( s32 delta );
 extern int  cpuTestCycle( u64 startCycle, s32 delta );
 extern void cpuSetEvent();

@@ -242,6 +242,20 @@ static bool psxRcntCanCount(int cntidx)
 	return true;
 }
 
+#if defined(VITASX2_VITA) && \
+	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+bool VitaIopHsyncCountersAreSilent()
+{
+	// PCSX2 owners: psxHBlankStart()/psxHBlankEnd(). Counter 0 is gated by
+	// HBlank, while counters 1 and 3 may consume HBlank as their clock.
+	// Without those three cases, the callbacks only republish an unchanged
+	// counter-0 deadline and the hBlanking level itself.
+	return !psxCounters[0].mode.gateEnable &&
+		!(psxCounters[1].rate == PSXHBLANK && psxRcntCanCount(1)) &&
+		!(psxCounters[3].rate == PSXHBLANK && psxRcntCanCount(3));
+}
+#endif
+
 static void psxRcntSync(int cntidx)
 {
 	if ((psxCounters[cntidx].currentIrqMode.repeatInterrupt) && !(psxCounters[cntidx].currentIrqMode.toggleInterrupt))

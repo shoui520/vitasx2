@@ -224,6 +224,11 @@ if(VITASX2_IOP_SCHEDULER_PRE_EVENT_WAIT_ADVANCE_CONTROL)
 			VITASX2_IOP_SCHEDULER_PRE_EVENT_WAIT_ADVANCE_CONTROL=1
 	)
 endif()
+if(VITASX2_SILENT_HSYNC_FOLD_CONTROL)
+	set_property(SOURCE Counters.cpp APPEND PROPERTY
+		COMPILE_DEFINITIONS VITASX2_SILENT_HSYNC_FOLD_CONTROL=1
+	)
+endif()
 
 # The VU1 generated-code ABI owns Q4-Q7 for VF/ACC residency.  Its outer
 # execution wrapper preserves D8-D15 once for AAPCS; prevent the C++ control

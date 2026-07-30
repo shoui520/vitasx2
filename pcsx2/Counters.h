@@ -132,5 +132,38 @@ extern u32	rcntRcount(int index);
 template< uint page > extern bool rcntWrite32( u32 mem, mem32_t& value );
 template< uint page > extern u16 rcntRead32( u32 mem );		// returns u16 by design! (see implementation for details)
 
-extern void UpdateVSyncRate(bool force);
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+enum class VitaSilentHsyncFoldStop : u32
+{
+	Control,
+	HorizonDue,
+	EeCounterOrGate,
+	IopCounterOrGate,
+	HsyncDue,
+	ExclusiveLimit,
+	UnmaskedHsint,
+};
 
+struct VitaSilentHsyncFoldResult
+{
+	u32 folded_edges = 0;
+	VitaSilentHsyncFoldStop stop = VitaSilentHsyncFoldStop::ExclusiveLimit;
+	// For an EE counter/gate stop: bits 1:0 are the counter index and bits
+	// 31:8 are its EECNT_MODE value. Zero for every other stop.
+	u32 stop_detail = 0;
+};
+
+// Return the first EE counter deadline which is not the HSync edge.
+extern u64 VitaGetNextNonHsyncCounterCycle();
+// Pre-apply semantically silent HSync edges strictly before exclusive_cycle.
+// The caller must own exact EE/IOP wait certificates through that horizon.
+extern VitaSilentHsyncFoldResult VitaFoldSilentHsyncBefore(
+	u64 exclusive_cycle);
+#endif
+
+#if defined(VITASX2_QEMU_VALIDATION)
+// Adversarial physical-A9 fixture for the private video-timing state.
+extern bool VitaValidateSilentHsyncFolding();
+#endif
+
+extern void UpdateVSyncRate(bool force);

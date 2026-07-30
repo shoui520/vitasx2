@@ -231,6 +231,17 @@ namespace VitaPerformanceTelemetry
 		u64 joint_wait_ram_write_overlaps_outside_scheduler = 0;
 		u64 joint_wait_activations = 0;
 		u64 joint_wait_scheduled_ee_cycles = 0;
+		u64 silent_hsync_fold_attempts = 0;
+		u64 silent_hsync_fold_activations = 0;
+		u64 silent_hsync_folded_edges = 0;
+		u64 silent_hsync_fold_blocked_control = 0;
+		u64 silent_hsync_fold_blocked_horizon_due = 0;
+		u64 silent_hsync_fold_blocked_ee_counter = 0;
+		u64 silent_hsync_fold_blocked_iop_counter = 0;
+		u64 silent_hsync_fold_blocked_hsync_due = 0;
+		u64 silent_hsync_fold_blocked_limit = 0;
+		u64 silent_hsync_fold_blocked_hsint = 0;
+		u32 silent_hsync_fold_last_stop_detail = 0;
 		u32 joint_wait_last_ram_offset = UINT32_MAX;
 		u32 joint_wait_last_ram_size = 0;
 #if defined(VITASX2_CPU_PROFILER)
@@ -427,6 +438,8 @@ namespace VitaPerformanceTelemetry
 		u32 ram_offset, u32 ram_size);
 	void RecordJointWaitRamWriteOverlap(bool scheduler_active);
 	void RecordJointWaitActivation(u32 scheduled_ee_cycles);
+	void RecordSilentHsyncFold(
+		u32 folded_edges, u32 stop_reason, u32 stop_detail);
 #if defined(VITASX2_CPU_PROFILER)
 	void RecordIpuEpochOpportunity(bool from_ipu_wait, u32 wait_pc,
 		u32 due_ipu_mask, u32 blocker_mask);
@@ -627,6 +640,20 @@ namespace VitaPerformanceTelemetry
 			RecordJointWaitActivation(scheduled_ee_cycles);
 #else
 		(void)scheduled_ee_cycles;
+#endif
+	}
+
+	inline void RecordSilentHsyncFoldIfProfiling(
+		u32 folded_edges, u32 stop_reason, u32 stop_detail)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordSilentHsyncFold(
+				folded_edges, stop_reason, stop_detail);
+#else
+		(void)folded_edges;
+		(void)stop_reason;
+		(void)stop_detail;
 #endif
 	}
 

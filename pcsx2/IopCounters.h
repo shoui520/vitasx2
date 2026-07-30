@@ -73,6 +73,9 @@ extern void psxVBlankEnd();
 	!defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
 // Host-only deadline proof state is never part of the PS2 savestate.
 extern void VitaInvalidateIopCounterDeadlineCache();
+// True only when an EE HSync edge cannot count or gate an IOP counter.
+// Callers must still account for EE counters and GS HSINT separately.
+extern bool VitaIopHsyncCountersAreSilent();
 #endif
 
 #if defined(VITASX2_QEMU_VALIDATION)
