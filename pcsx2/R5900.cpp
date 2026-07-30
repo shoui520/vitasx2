@@ -701,8 +701,53 @@ static __fi void TESTINT( u8 n, void (*callback)() )
 
 // [TODO] move this function to Dmac.cpp, and remove most of the DMAC-related headers from
 // being included into R5900.cpp.
+#if defined(VITASX2_VITA)
+static __fi bool VitaTryTestIpuInterruptsOnly(bool& handled)
+{
+	// FMV decode repeatedly schedules just the two IPU DMA owners and the IPU
+	// worker. PCSX2's general scan tests its five common owners and seven other
+	// rare owners around these three on every visit. Preserve the exact
+	// from-IPU -> to-IPU -> worker order and same-cycle rescan contract, but
+	// avoid touching unrelated owner code when no unrelated bit is pending.
+	constexpr u32 ipu_events =
+		(1u << DMAC_FROM_IPU) |
+		(1u << DMAC_TO_IPU) |
+		(1u << IPU_PROCESS);
+	if ((cpuRegs.interrupt & ~ipu_events) != 0)
+	{
+		handled = false;
+		return false;
+	}
+
+	handled = true;
+	if (!dmacRegs.ctrl.DMAE || (psHu8(DMAC_ENABLER + 2) & 1))
+		return false;
+
+	eeRunInterruptScan = INT_RUNNING;
+	while (eeRunInterruptScan == INT_RUNNING)
+	{
+		TESTINT(DMAC_FROM_IPU, ipu0Interrupt);
+		TESTINT(DMAC_TO_IPU, ipu1Interrupt);
+		TESTINT(IPU_PROCESS, ipuCMDProcess);
+
+		if (eeRunInterruptScan == INT_REQ_LOOP)
+			eeRunInterruptScan = INT_RUNNING;
+		else
+			break;
+	}
+	eeRunInterruptScan = INT_NOT_RUNNING;
+	return ((cpuRegs.interrupt & 0x1FFFF) & ~cpuRegs.dmastall) != 0;
+}
+#endif
+
 static __fi bool _cpuTestInterrupts()
 {
+#if defined(VITASX2_VITA)
+	bool handled = false;
+	const bool ipu_result = VitaTryTestIpuInterruptsOnly(handled);
+	if (handled)
+		return ipu_result;
+#endif
 
 	if (!dmacRegs.ctrl.DMAE || (psHu8(DMAC_ENABLER+2) & 1))
 	{
