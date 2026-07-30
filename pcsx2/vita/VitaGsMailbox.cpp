@@ -1202,7 +1202,8 @@ namespace MTGS
 			};
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_extended "
-				"ee_generated=%llu ee_provider=%llu ee_compile=%llu "
+				"ee_generated=%llu ee_wait_resume=%llu "
+				"ee_provider=%llu ee_compile=%llu "
 				"ee_interpreter=%llu iop_interpreter=%llu "
 				"cop1=%llu cop2_vu0=%llu ee_helper=%llu ee_memory_slow=%llu "
 				"iop_helper=%llu iop_memory_slow=%llu ipu=%llu vif_gif=%llu "
@@ -1210,6 +1211,12 @@ namespace MTGS
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(stage_time(
 					VitaPerformanceTelemetry::CpuStage::EeGenerated)),
+#if defined(VITASX2_CPU_PROFILER)
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::EeWaitResume)),
+#else
+				0ull,
+#endif
 				static_cast<unsigned long long>(stage_time(
 					VitaPerformanceTelemetry::CpuStage::EeProvider)),
 				static_cast<unsigned long long>(stage_time(
@@ -1246,7 +1253,8 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::Diagnostics)));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_extended_entries "
-				"ee_generated=%llu ee_provider=%llu ee_compile=%llu "
+				"ee_generated=%llu ee_wait_resume=%llu "
+				"ee_provider=%llu ee_compile=%llu "
 				"ee_interpreter=%llu iop_interpreter=%llu "
 				"cop1=%llu cop2_vu0=%llu ee_helper=%llu ee_memory_slow=%llu "
 				"iop_helper=%llu iop_memory_slow=%llu ipu=%llu vif_gif=%llu "
@@ -1254,6 +1262,12 @@ namespace MTGS
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(stage_entry(
 					VitaPerformanceTelemetry::CpuStage::EeGenerated)),
+#if defined(VITASX2_CPU_PROFILER)
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::EeWaitResume)),
+#else
+				0ull,
+#endif
 				static_cast<unsigned long long>(stage_entry(
 					VitaPerformanceTelemetry::CpuStage::EeProvider)),
 				static_cast<unsigned long long>(stage_entry(
@@ -1409,7 +1423,8 @@ namespace MTGS
 				static_cast<unsigned long long>(statistical_spu2_residual));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_statistical_extended "
-				"ee_generated=%llu ee_provider=%llu ee_compile=%llu "
+				"ee_generated=%llu ee_wait_resume=%llu "
+				"ee_provider=%llu ee_compile=%llu "
 				"ee_interpreter=%llu iop_interpreter=%llu cop1=%llu "
 				"cop2_vu0=%llu ee_helper=%llu ee_memory_slow=%llu "
 				"iop_helper=%llu iop_memory_slow=%llu ipu=%llu "
@@ -1418,6 +1433,8 @@ namespace MTGS
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::EeGenerated)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::EeWaitResume)),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::EeProvider)),
 				static_cast<unsigned long long>(statistical_stage(

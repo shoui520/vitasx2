@@ -971,6 +971,16 @@ recRunEeEventForGeneratedResumeCore(
 #else
 		_cpuEventTest_Shared();
 #endif
+#if defined(VITASX2_CPU_PROFILER)
+		// The scheduler publishes EeGenerated on exit because its ordinary
+		// caller is native EE code. Retained waits remain in this C++ bridge,
+		// however, and can loop here hundreds of thousands of times without
+		// executing another generated instruction. Attribute that host work
+		// separately so the statistical stage profile does not mistake the
+		// retained poll PC for generated A32 execution.
+		const VitaPerformanceTelemetry::ScopedCpuStage wait_resume_stage(
+			VitaPerformanceTelemetry::CpuStage::EeWaitResume);
+#endif
 		resume = recCanResumeGeneratedEeAfterEvent();
 		if (!resume)
 		{

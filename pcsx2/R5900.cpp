@@ -882,21 +882,25 @@ static __fi void VitaIopEventTestFromEe()
 		intc_visible;
 
 #if defined(VITASX2_CPU_PROFILER)
-	bool callback_due = false;
-	for (u32 event = IopEvt_SIF2; event <= IopEvt_USB; event++)
 	{
-		if ((psxRegs.interrupt & (1u << event)) != 0 &&
-			static_cast<s64>(
-				psxRegs.cycle -
-				(psxRegs.sCycle[event] + psxRegs.eCycle[event])) >= 0)
+		const VitaPerformanceTelemetry::ScopedCpuStage diagnostics_stage(
+			VitaPerformanceTelemetry::CpuStage::Diagnostics);
+		bool callback_due = false;
+		for (u32 event = IopEvt_SIF2; event <= IopEvt_USB; event++)
 		{
-			callback_due = true;
-			break;
+			if ((psxRegs.interrupt & (1u << event)) != 0 &&
+				static_cast<s64>(
+					psxRegs.cycle -
+						(psxRegs.sCycle[event] + psxRegs.eCycle[event])) >= 0)
+			{
+				callback_due = true;
+				break;
+			}
 		}
+		VitaPerformanceTelemetry::RecordIopDeadlineGateIfProfiling(
+			dispatch, deadline_due, counter_due, counter_precedes_published,
+			intc_visible, callback_due);
 	}
-	VitaPerformanceTelemetry::RecordIopDeadlineGateIfProfiling(
-		dispatch, deadline_due, counter_due, counter_precedes_published,
-		intc_visible, callback_due);
 #endif
 	if (dispatch)
 		iopEventTest();
@@ -1127,8 +1131,12 @@ __fi void _cpuEventTest_Shared()
 				VitaScheduleEeAndIopDeadlines(VitaNextIopOwnerDelta());
 			}
 #if defined(VITASX2_CPU_PROFILER)
-			VitaRecordJointWaitShadowAtDeadline(
-				*vita_ee_wait_certificate, vita_ee_wait_pc);
+			{
+				const VitaPerformanceTelemetry::ScopedCpuStage diagnostics_stage(
+					VitaPerformanceTelemetry::CpuStage::Diagnostics);
+				VitaRecordJointWaitShadowAtDeadline(
+					*vita_ee_wait_certificate, vita_ee_wait_pc);
+			}
 #endif
 		}
 		else
@@ -1243,15 +1251,19 @@ __fi void _cpuEventTest_Shared()
 #endif
 
 #if defined(VITASX2_CPU_PROFILER)
-		VitaRecordEeDeadlineHorizon(
+		{
+			const VitaPerformanceTelemetry::ScopedCpuStage diagnostics_stage(
+				VitaPerformanceTelemetry::CpuStage::Diagnostics);
+			VitaRecordEeDeadlineHorizon(
 #if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
-			iop_owner_delta,
-			iop_owner_delta == 48);
+				iop_owner_delta,
+				iop_owner_delta == 48);
 #else
-			EEsCycle >= nextIopEventDelta ?
-				48 : nextIopEventDelta - EEsCycle,
-			EEsCycle >= nextIopEventDelta);
+				EEsCycle >= nextIopEventDelta ?
+					48 : nextIopEventDelta - EEsCycle,
+				EEsCycle >= nextIopEventDelta);
 #endif
+		}
 #endif
 
 		// Apply vsync and other counter nextCycles
@@ -1268,8 +1280,12 @@ __fi void _cpuEventTest_Shared()
 				VitaScheduleEeAndIopDeadlines(iop_owner_delta);
 			}
 #if defined(VITASX2_CPU_PROFILER)
-			VitaRecordJointWaitShadowAtDeadline(
-				*vita_ee_wait_certificate, vita_ee_wait_pc);
+			{
+				const VitaPerformanceTelemetry::ScopedCpuStage diagnostics_stage(
+					VitaPerformanceTelemetry::CpuStage::Diagnostics);
+				VitaRecordJointWaitShadowAtDeadline(
+					*vita_ee_wait_certificate, vita_ee_wait_pc);
+			}
 #endif
 		}
 		else
