@@ -12587,11 +12587,19 @@ namespace VitaIOP
 						static_cast<const u8*>(
 							target.code.EntryPoint()) +
 						target.resident.gpr_entry_offset;
-					const bool bypasses_source_stores =
+					const bool has_source_stores =
 						link.resident_gpr_bypass_offset !=
 							static_cast<size_t>(-1);
-					target_entry = bypasses_source_stores ?
-						target_base_entry : target_gpr_entry;
+					// A target which writes every dirty inherited host will
+					// publish those values at its own canonical exit. Only that
+					// case may skip the source stores. A read-only successor can
+					// still consume the live host and skip its reload, but the
+					// source must first publish the dirty architectural value.
+					const bool bypasses_source_stores =
+						has_source_stores &&
+						(source.resident.dirty_gpr_host_mask &
+							~target.resident.dirty_gpr_host_mask) == 0;
+					target_entry = target_gpr_entry;
 					budget_target_entry = target_gpr_entry;
 					if ((bypasses_source_stores &&
 							!source.code.PatchBranchToAddress(
@@ -12601,8 +12609,11 @@ namespace VitaIOP
 						return abandon_compilation();
 					}
 					block.hot_region_resident_gpr_links++;
-					block.hot_region_resident_gpr_stores_removed +=
-						link.resident_gpr_stores_removed;
+					if (bypasses_source_stores)
+					{
+						block.hot_region_resident_gpr_stores_removed +=
+							link.resident_gpr_stores_removed;
+					}
 					block.hot_region_resident_gpr_loads_removed +=
 						target.resident.
 							gpr_entry_load_instruction_count;
