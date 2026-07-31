@@ -314,6 +314,12 @@ namespace VitaPerformanceTelemetry
 #if defined(VITASX2_CPU_PROFILER)
 		u64 iop_compile_observations = 0;
 		u64 iop_compile_time_us = 0;
+		u64 iop_hot_region_provider_samples = 0;
+		u64 iop_hot_region_selections = 0;
+		u64 iop_hot_region_attempts = 0;
+		u64 iop_hot_region_promotions = 0;
+		u64 iop_hot_region_source_cycles = 0;
+		u64 iop_hot_region_successor_cycles = 0;
 		// The statistical sampler runs on a non-EE Vita thread. CPU0 publishes
 		// only its current stage with a relaxed word store; the observer samples
 		// that marker at a decorrelated cadence. This attributes short helpers
@@ -438,6 +444,11 @@ namespace VitaPerformanceTelemetry
 	u32 BeginExactIopCompileMeasurement();
 	void EndExactIopCompileMeasurement(u32 start_us);
 	void CountCpuStageEntry(CpuStage stage);
+	void RecordIopHotRegionProviderSample();
+	void RecordIopHotRegionSelection();
+	void RecordIopHotRegionAttempt();
+	void RecordIopHotRegionPromotion(
+		u32 source_cycles, u32 successor_cycles);
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
 		bool callback_due);
@@ -563,6 +574,45 @@ namespace VitaPerformanceTelemetry
 		(void)counter_precedes_published;
 		(void)intc_visible;
 		(void)callback_due;
+#endif
+	}
+
+	inline void RecordIopHotRegionProviderSampleIfProfiling()
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordIopHotRegionProviderSample();
+#endif
+	}
+
+	inline void RecordIopHotRegionSelectionIfProfiling()
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordIopHotRegionSelection();
+#endif
+	}
+
+	inline void RecordIopHotRegionAttemptIfProfiling()
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordIopHotRegionAttempt();
+#endif
+	}
+
+	inline void RecordIopHotRegionPromotionIfProfiling(
+		u32 source_cycles, u32 successor_cycles)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+		{
+			RecordIopHotRegionPromotion(
+				source_cycles, successor_cycles);
+		}
+#else
+		(void)source_cycles;
+		(void)successor_cycles;
 #endif
 	}
 

@@ -308,6 +308,14 @@ namespace VitaIOP
 		DirectLinkSlot slots[2]{};
 	};
 
+	struct HotRegionGuardPatch
+	{
+		size_t budget = static_cast<size_t>(-1);
+		size_t event_sentinel = static_cast<size_t>(-1);
+		size_t event_horizon = static_cast<size_t>(-1);
+		size_t fallback_target = static_cast<size_t>(-1);
+	};
+
 	// Shared region metadata describing the values at internal entries and at
 	// the fragment's normal linked exits. The contracts are consumed while
 	// patching code; no runtime object or matching logic enters the A9 hot path.
@@ -343,7 +351,10 @@ namespace VitaIOP
 			bool inherited_isolate_write = false, u32 logical_cycle_prefix = 0,
 			u32 logical_cycle_total = 0, bool fragmented_logical_block = false,
 			bool logical_continuation_tail = false,
-			ResidentFragmentContract* resident_contract = nullptr);
+			ResidentFragmentContract* resident_contract = nullptr,
+			bool hot_region_internal_static_jump = false,
+			u32 hot_region_guard_cycles = 0,
+			HotRegionGuardPatch* hot_region_guard = nullptr);
 		u32 NativeInstructionCount() const { return m_native_instruction_count; }
 		u32 HelperInstructionCount() const { return m_helper_instruction_count; }
 		bool UsesCompiledPs1BiosGate() const { return m_compiled_ps1_bios_gate; }
@@ -482,6 +493,8 @@ namespace VitaIOP
 		bool EmitConsumePublishedEventCountdown();
 		bool EmitReloadPublishedEventCountdown();
 		bool EmitPublishResidentEeBudget();
+		bool EmitHotRegionHorizonGuard(u32 source_cycles,
+			HotRegionGuardPatch* patch);
 		bool EmitQemuCounterIncrement(u32* counter);
 		bool EmitChargeEeBudgetPs1(u32 known_block_cycles);
 		bool EmitPcChangedExitCheck(u32 expected_pc,
@@ -758,6 +771,7 @@ namespace VitaIOP
 		static void SetPublishedEventDeadlineResidencyEnabled(bool enabled);
 		static void SetEeBudgetResidencyEnabled(bool enabled);
 		static void SetGeneratedInstrumentationEnabled(bool enabled);
+		static void SetHotRegionPromotionEnabled(bool enabled);
 		static void SetSequentialQwordCopyEnabled(bool enabled);
 		static void SetBranchTestSchedulingEnabled(bool enabled);
 		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
@@ -812,6 +826,16 @@ namespace VitaIOP
 			HostMemoryMap::IOPrecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
+		// A region compiles both BaseBlocks again and retains the canonical
+		// source as its exact guard fallback. Observe provider re-entry heat in
+		// batches, then promote at most the hottest recurrent candidate. This
+		// keeps selection off generated A32 edges and spreads cold compilation
+		// over enough real execution to amortize it on Cortex-A9.
+		static constexpr u16 HOT_REGION_MIN_PROVIDER_SAMPLES = 16;
+		static constexpr u8 HOT_REGION_PROVIDER_SAMPLE_INTERVAL = 64;
+		static constexpr u32 HOT_REGION_SELECTION_EPOCH = 4096;
+		static constexpr u8 HOT_REGION_MAX_PROMOTIONS_PER_CACHE = 8;
+		static constexpr u8 HOT_REGION_MAX_REFUSALS_PER_SELECTION = 64;
 		static constexpr u32 SCHEDULER_DIRECT_RESUME_TAG = 1u;
 		static constexpr size_t MAX_INCOMING_LINKS =
 			MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
@@ -854,6 +878,15 @@ namespace VitaIOP
 		struct CachedBlock
 		{
 			CachedBlock* next_free = nullptr;
+			struct RegionSourceDependency
+			{
+				std::array<u32, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS> expected{};
+				const u32* raw_opcodes = nullptr;
+				u32 start_pc = 0;
+				u32 ram_source_start = INVALID_RAM_SOURCE;
+				u32 instruction_count = 0;
+			};
+
 			struct CodeFragment
 			{
 				VitaA32::CodeBuffer code;
@@ -913,13 +946,23 @@ namespace VitaIOP
 				return index < opcodes.size() ? opcodes[index] : overflow_opcodes[index - opcodes.size()];
 			}
 			void ClearOpcodes() { overflow_opcodes.clear(); }
+			void ClearRegionDependency()
+			{
+				region_source_dependency.reset();
+				retained_fallback_code_size = 0;
+				retained_fallback_footprint = 0;
+				hot_region_state = 0;
+				hot_region_provider_samples = 0;
+			}
 			void ReleaseOversizedMetadata()
 			{
 				if (overflow_fragments.capacity() > 8)
 					std::vector<CodeFragment>().swap(overflow_fragments);
 				if (overflow_opcodes.capacity() > 512)
 					std::vector<u32>().swap(overflow_opcodes);
+				region_source_dependency.reset();
 			}
+			std::unique_ptr<RegionSourceDependency> region_source_dependency;
 			const u32* raw_opcodes = nullptr;
 			u32 ram_source_start = INVALID_RAM_SOURCE;
 			const u32* poll_branch_opcodes = nullptr;
@@ -966,6 +1009,11 @@ namespace VitaIOP
 			bool logical_continuation = false;
 			bool discovered_topology = false;
 			bool trusted_source = false;
+			size_t retained_fallback_code_size = 0;
+			size_t retained_fallback_footprint = 0;
+			// 0=cold candidate, 1=promotion refused, 2=two-block region.
+			u8 hot_region_state = 0;
+			u16 hot_region_provider_samples = 0;
 			u8 poll_result_register = 0;
 			u8 poll_load_opcode = 0;
 			bool valid = false;
@@ -1027,6 +1075,16 @@ namespace VitaIOP
 		{
 			CachedBlock* block = nullptr;
 			u32 rec_lookup_identity = UINT32_MAX;
+		};
+
+		struct HotRegionPlan
+		{
+			u32 successor_pc = 0;
+			u32 successor_instruction_count = 0;
+			bool successor_logical_continuation = false;
+			const void* source_fallback_entry = nullptr;
+			size_t source_fallback_code_size = 0;
+			size_t source_fallback_footprint = 0;
 		};
 #if defined(__arm__)
 		static_assert(sizeof(BlockRecord) == 8);
@@ -1149,7 +1207,11 @@ namespace VitaIOP
 			bool entry_effects_already_applied = false,
 			bool allow_cache_pressure_retry = true,
 			bool logical_continuation = false,
-			bool discovered_topology = false);
+			bool discovered_topology = false,
+			const HotRegionPlan* hot_region = nullptr);
+		bool ObserveHotRegionProviderSample(CachedBlock& block);
+		__attribute__((noinline, cold)) bool TryPromoteHotRegion(
+			CachedBlock& block);
 		BlockScanStatus ScanProviderLogicalBlock(u32 start_pc,
 			BlockScanResult* result);
 		static size_t TotalCodeSize(const CachedBlock& block);
@@ -1362,6 +1424,14 @@ namespace VitaIOP
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
+		u32 m_hot_region_provider_epoch_samples = 0;
+#if defined(VITASX2_QEMU_VALIDATION)
+		u8 m_hot_region_provider_sample_countdown = 1;
+#else
+		u8 m_hot_region_provider_sample_countdown =
+			HOT_REGION_PROVIDER_SAMPLE_INTERVAL;
+#endif
+		u8 m_hot_region_promotions = 0;
 #if defined(VITASX2_QEMU_VALIDATION)
 		u64 m_hot_dispatch_cache_hits = 0;
 		u64 m_hot_dispatch_cache_misses = 0;

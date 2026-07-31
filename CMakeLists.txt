@@ -92,6 +92,10 @@ option(VITASX2_IOP_RESIDENT_EE_BUDGET_CONTROL
 	"Diagnostic control: publish and reload the IOP EE-timeslice budget at every linked block edge."
 	OFF)
 
+option(VITASX2_IOP_HOT_REGION_CONTROL
+	"Diagnostic control: retain one PCSX2 IOP BaseBlock event/budget seam per generated block."
+	OFF)
+
 option(VITASX2_SILENT_HSYNC_FOLD_CONTROL
 	"Diagnostic control: retain every HSync scheduler boundary while both processors hold exact wait certificates."
 	OFF)
