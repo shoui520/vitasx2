@@ -889,12 +889,18 @@ namespace VitaPerformanceTelemetry
 	}
 
 	void RecordIopHotRegionPromotion(
-		u32 source_cycles, u32 successor_cycles)
+		u32 source_cycles, u32 successor_cycles, u32 resident_gpr_links,
+		u32 resident_gpr_stores_removed, u32 resident_gpr_loads_removed)
 	{
 		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
 		totals.iop_hot_region_promotions++;
 		totals.iop_hot_region_source_cycles += source_cycles;
 		totals.iop_hot_region_successor_cycles += successor_cycles;
+		totals.iop_hot_region_resident_gpr_links += resident_gpr_links;
+		totals.iop_hot_region_resident_gpr_stores_removed +=
+			resident_gpr_stores_removed;
+		totals.iop_hot_region_resident_gpr_loads_removed +=
+			resident_gpr_loads_removed;
 	}
 
 	void RecordEeHotRegionRequest()

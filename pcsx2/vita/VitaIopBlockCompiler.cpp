@@ -12044,7 +12044,10 @@ namespace VitaIOP
 					IopCompilerBlockCycles(source_pc,
 						source_instruction_count, false),
 					IopCompilerBlockCycles(plan.successor_pc,
-						plan.successor_instruction_count, false));
+						plan.successor_instruction_count, false),
+					block.hot_region_resident_gpr_links,
+					block.hot_region_resident_gpr_stores_removed,
+					block.hot_region_resident_gpr_loads_removed);
 			return true;
 		}
 
@@ -12543,9 +12546,11 @@ namespace VitaIOP
 			CachedBlock::CodeFragment& source = block.Fragment(i);
 			const CachedBlock::CodeFragment& target = block.Fragment(i + 1);
 			const DirectLinkSlot& link = continuation_links[i];
-			const void* target_entry =
+			const void* target_base_entry =
 				static_cast<const u8*>(target.code.EntryPoint()) +
 					target.provider_entry_offset;
+			const void* target_entry = target_base_entry;
+			const void* budget_target_entry = target_base_entry;
 			if (compiling_hot_region)
 			{
 				if (!source.resident.exit.Provides(target.resident.base_entry) ||
@@ -12556,15 +12561,59 @@ namespace VitaIOP
 				{
 					return abandon_compilation();
 				}
-				target_entry =
+				target_base_entry =
 					static_cast<const u8*>(target.code.EntryPoint()) +
 					target.resident.base_entry_offset;
+				target_entry = target_base_entry;
+				budget_target_entry = target_base_entry;
+
+				// The fragment contracts are the generated-code ABI for values
+				// which remain live across an internal region edge. When both
+				// independently compiled bodies assign the same guest GPR to the
+				// same callee-saved host, enter after the successor's canonical
+				// reloads and bypass the source's canonical stores. A mismatch
+				// retains the base-only region path above.
+				const bool carries_gprs =
+					target.resident.gpr_entry.domain !=
+						VitaRegion::GuestDomain::None &&
+					target.resident.gpr_entry_load_instruction_count != 0 &&
+					target.resident.gpr_entry_offset <
+						target.code.Size() &&
+					source.resident.exit.Provides(
+						target.resident.gpr_entry);
+				if (carries_gprs)
+				{
+					const void* const target_gpr_entry =
+						static_cast<const u8*>(
+							target.code.EntryPoint()) +
+						target.resident.gpr_entry_offset;
+					const bool bypasses_source_stores =
+						link.resident_gpr_bypass_offset !=
+							static_cast<size_t>(-1);
+					target_entry = bypasses_source_stores ?
+						target_base_entry : target_gpr_entry;
+					budget_target_entry = target_gpr_entry;
+					if ((bypasses_source_stores &&
+							!source.code.PatchBranchToAddress(
+								link.resident_gpr_bypass_offset,
+								target_gpr_entry)))
+					{
+						return abandon_compilation();
+					}
+					block.hot_region_resident_gpr_links++;
+					block.hot_region_resident_gpr_stores_removed +=
+						link.resident_gpr_stores_removed;
+					block.hot_region_resident_gpr_loads_removed +=
+						target.resident.
+							gpr_entry_load_instruction_count;
+				}
 			}
 			if (!source.code.PatchBranchToAddress(
 					link.target_offset, target_entry) ||
 				(compiling_hot_region &&
 					(!source.code.PatchBranchToAddress(
-						 link.resident_budget_bypass_offset, target_entry) ||
+						 link.resident_budget_bypass_offset,
+						 budget_target_entry) ||
 					 !source.code.PatchBranchToAddress(
 						 hot_region_guard.fallback_target,
 						 hot_region->source_fallback_entry))))
@@ -13241,6 +13290,9 @@ namespace VitaIOP
 		result->resident_gpr_links = 0;
 		result->resident_gpr_stores_removed = 0;
 		result->resident_gpr_loads_removed = 0;
+		result->hot_region_resident_gpr_links = 0;
+		result->hot_region_resident_gpr_stores_removed = 0;
+		result->hot_region_resident_gpr_loads_removed = 0;
 		result->resident_ee_budget_links = 0;
 		result->resident_ee_budget_stores_removed = 0;
 		result->resident_ee_budget_loads_removed = 0;
@@ -13248,6 +13300,12 @@ namespace VitaIOP
 		{
 			if (!cached || !cached->valid)
 				continue;
+			result->hot_region_resident_gpr_links +=
+				cached->hot_region_resident_gpr_links;
+			result->hot_region_resident_gpr_stores_removed +=
+				cached->hot_region_resident_gpr_stores_removed;
+			result->hot_region_resident_gpr_loads_removed +=
+				cached->hot_region_resident_gpr_loads_removed;
 			for (const DirectLinkSlot& link : cached->direct_links.slots)
 			{
 				if (!link.valid || !link.resident_entry_active)

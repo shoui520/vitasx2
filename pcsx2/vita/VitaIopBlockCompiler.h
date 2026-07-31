@@ -178,6 +178,9 @@ namespace VitaIOP
 		u64 resident_gpr_links;
 		u64 resident_gpr_stores_removed;
 		u64 resident_gpr_loads_removed;
+		u64 hot_region_resident_gpr_links;
+		u64 hot_region_resident_gpr_stores_removed;
+		u64 hot_region_resident_gpr_loads_removed;
 		u64 resident_ee_budget_links;
 		u64 resident_ee_budget_stores_removed;
 		u64 resident_ee_budget_loads_removed;
@@ -952,6 +955,9 @@ namespace VitaIOP
 				retained_fallback_code_size = 0;
 				retained_fallback_footprint = 0;
 				hot_region_state = 0;
+				hot_region_resident_gpr_links = 0;
+				hot_region_resident_gpr_stores_removed = 0;
+				hot_region_resident_gpr_loads_removed = 0;
 				hot_region_provider_samples = 0;
 			}
 			void ReleaseOversizedMetadata()
@@ -1013,6 +1019,9 @@ namespace VitaIOP
 			size_t retained_fallback_footprint = 0;
 			// 0=cold candidate, 1=promotion refused, 2=two-block region.
 			u8 hot_region_state = 0;
+			u8 hot_region_resident_gpr_links = 0;
+			u8 hot_region_resident_gpr_stores_removed = 0;
+			u8 hot_region_resident_gpr_loads_removed = 0;
 			u16 hot_region_provider_samples = 0;
 			u8 poll_result_register = 0;
 			u8 poll_load_opcode = 0;

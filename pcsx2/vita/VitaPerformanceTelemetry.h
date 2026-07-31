@@ -334,6 +334,9 @@ namespace VitaPerformanceTelemetry
 		u64 iop_hot_region_promotions = 0;
 		u64 iop_hot_region_source_cycles = 0;
 		u64 iop_hot_region_successor_cycles = 0;
+		u64 iop_hot_region_resident_gpr_links = 0;
+		u64 iop_hot_region_resident_gpr_stores_removed = 0;
+		u64 iop_hot_region_resident_gpr_loads_removed = 0;
 		// The statistical sampler runs on a non-EE Vita thread. CPU0 publishes
 		// only its current stage with a relaxed word store; the observer samples
 		// that marker at a decorrelated cadence. This attributes short helpers
@@ -462,7 +465,8 @@ namespace VitaPerformanceTelemetry
 	void RecordIopHotRegionSelection();
 	void RecordIopHotRegionAttempt();
 	void RecordIopHotRegionPromotion(
-		u32 source_cycles, u32 successor_cycles);
+		u32 source_cycles, u32 successor_cycles, u32 resident_gpr_links,
+		u32 resident_gpr_stores_removed, u32 resident_gpr_loads_removed);
 	void RecordEeHotRegionRequest();
 	void RecordEeHotRegionAttempt();
 	void RecordEeHotRegionPromotion(
@@ -624,17 +628,22 @@ namespace VitaPerformanceTelemetry
 	}
 
 	inline void RecordIopHotRegionPromotionIfProfiling(
-		u32 source_cycles, u32 successor_cycles)
+		u32 source_cycles, u32 successor_cycles, u32 resident_gpr_links,
+		u32 resident_gpr_stores_removed, u32 resident_gpr_loads_removed)
 	{
 #if defined(VITASX2_CPU_PROFILER)
 		if (g_cpu_stage_profiler_enabled)
 		{
-			RecordIopHotRegionPromotion(
-				source_cycles, successor_cycles);
+			RecordIopHotRegionPromotion(source_cycles, successor_cycles,
+				resident_gpr_links, resident_gpr_stores_removed,
+				resident_gpr_loads_removed);
 		}
 #else
 		(void)source_cycles;
 		(void)successor_cycles;
+		(void)resident_gpr_links;
+		(void)resident_gpr_stores_removed;
+		(void)resident_gpr_loads_removed;
 #endif
 	}
 

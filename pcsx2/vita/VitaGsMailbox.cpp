@@ -1723,7 +1723,9 @@ namespace MTGS
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=iop_hot_regions "
 				"provider_samples=%llu selections=%llu attempts=%llu "
-				"promotions=%llu source_cycles=%llu successor_cycles=%llu",
+				"promotions=%llu source_cycles=%llu successor_cycles=%llu "
+				"gpr_links=%llu gpr_stores_removed=%llu "
+				"gpr_loads_removed=%llu",
 				static_cast<unsigned long long>(window),
 				static_cast<unsigned long long>(CounterDelta(
 					end.cpu_stage_profiler.iop_hot_region_provider_samples,
@@ -1742,7 +1744,22 @@ namespace MTGS
 					start.cpu_stage_profiler.iop_hot_region_source_cycles)),
 				static_cast<unsigned long long>(CounterDelta(
 					end.cpu_stage_profiler.iop_hot_region_successor_cycles,
-					start.cpu_stage_profiler.iop_hot_region_successor_cycles)));
+					start.cpu_stage_profiler.iop_hot_region_successor_cycles)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.
+						iop_hot_region_resident_gpr_links,
+					start.cpu_stage_profiler.
+						iop_hot_region_resident_gpr_links)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.
+						iop_hot_region_resident_gpr_stores_removed,
+					start.cpu_stage_profiler.
+						iop_hot_region_resident_gpr_stores_removed)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.
+						iop_hot_region_resident_gpr_loads_removed,
+					start.cpu_stage_profiler.
+						iop_hot_region_resident_gpr_loads_removed)));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=iop_cache "
 				"resets_delta=%llu resets=%u used=%llu capacity=%llu "
