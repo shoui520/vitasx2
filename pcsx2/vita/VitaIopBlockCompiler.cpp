@@ -103,6 +103,8 @@ static bool s_qemuIopLinkedFrameBypassEnabled = true;
 static bool s_qemuIopResidentPreludeLinksEnabled = true;
 static bool s_qemuIopResidentGprLinksEnabled = true;
 static bool s_qemuIopPublishedEventDeadlineResidencyEnabled = true;
+static bool s_qemuIopEeBudgetResidencyEnabled = true;
+static bool s_qemuIopGeneratedInstrumentationEnabled = true;
 static bool s_qemuIopSequentialQwordCopyEnabled = true;
 static bool s_qemuIopBranchTestSchedulingEnabled = true;
 static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
@@ -1493,6 +1495,11 @@ namespace VitaIOP
 				HOST_REGISTER_JUMP_TARGET,
 				VitaRegion::ResidentValue::IopPublishedEventCountdown);
 		}
+		if (m_resident_ee_budget)
+		{
+			m_resident_contract.base_entry.Bind(
+				HOST_SAVED0, VitaRegion::ResidentValue::IopEeBudget);
+		}
 		if (m_iop_cycle_base_register_available)
 		{
 			m_resident_contract.base_entry.Bind(HOST_CYCLE_BASE,
@@ -1763,6 +1770,12 @@ namespace VitaIOP
 		}
 		if (m_resident_event_deadline && !EmitReloadPublishedEventCountdown())
 			return false;
+		if (m_resident_ee_budget &&
+			!m_code.EmitLdrImm12(HOST_SAVED0, HOST_PSX_REGS,
+				static_cast<u16>(IOP_CYCLE_EE_OFFSET)))
+		{
+			return false;
+		}
 		const size_t resident_body = m_code.Size();
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_CPU_PROFILER)
 		if (resident_body_branch != static_cast<size_t>(-1) &&
@@ -1835,7 +1848,8 @@ namespace VitaIOP
 		bool flush_pins, u32 known_cycle_count)
 	{
 		if ((flush_pins && !EmitFlushPinnedGprs()) ||
-			(charge_budget && !EmitChargeEeBudget(known_cycle_count)))
+			(charge_budget && !EmitChargeEeBudget(known_cycle_count)) ||
+			!EmitPublishResidentEeBudget())
 			return false;
 
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
@@ -1977,6 +1991,17 @@ namespace VitaIOP
 			return false;
 		}
 
+		const size_t budget_publish_offset = m_code.Size();
+		if (!EmitPublishResidentEeBudget())
+			return false;
+		u32 budget_publish_instruction = 0;
+		if (m_resident_ee_budget &&
+			!m_code.ReadInstruction(
+				budget_publish_offset, &budget_publish_instruction))
+		{
+			return false;
+		}
+
 		const size_t target_offset = m_code.Size();
 		const size_t target_branch = m_code.EmitBranchPlaceholder();
 		if (target_branch == static_cast<size_t>(-1))
@@ -2002,6 +2027,11 @@ namespace VitaIOP
 			direct_link_slot->resident_gpr_bypass_instruction =
 				flush_instruction;
 			direct_link_slot->resident_gpr_stores_removed = flush_count;
+			direct_link_slot->resident_budget_bypass_offset =
+				m_resident_ee_budget ? budget_publish_offset :
+					static_cast<size_t>(-1);
+			direct_link_slot->resident_budget_bypass_instruction =
+				budget_publish_instruction;
 		}
 		return true;
 	}
@@ -2305,6 +2335,8 @@ namespace VitaIOP
 			m_required_saved_registers |= REG_R11;
 		if (m_resident_event_deadline)
 			m_required_saved_registers |= REG_R8;
+		if (m_resident_ee_budget)
+			m_required_saved_registers |= REG_R5;
 		for (u8 i = 0; i < m_pinned_gpr_count; i++)
 			m_required_saved_registers |= static_cast<u16>(1u << m_pinned_gprs[i].host);
 
@@ -3006,6 +3038,19 @@ namespace VitaIOP
 				       finish_ps1_budget_test();
 			}
 
+			if (m_resident_ee_budget)
+			{
+				const u32 ee_cycles = known_block_cycles * 8u;
+				const bool subtracted =
+					m_code.EmitSubImm32(
+						HOST_SAVED0, HOST_SAVED0, ee_cycles, true) ||
+					(m_code.EmitMovImm32(HOST_TMP2, ee_cycles) &&
+					 m_code.EmitSubReg(
+						 HOST_SAVED0, HOST_SAVED0, HOST_TMP2, true));
+				return subtracted &&
+				       (!test_budget || emit_budget_exit_from_signed_flags());
+			}
+
 			const bool emitted_ee_cycles =
 				known_block_cycles != 0 ? m_code.EmitMovImm32(HOST_TMP2, known_block_cycles * 8) : m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 3);
 			return emitted_ee_cycles &&
@@ -3056,6 +3101,18 @@ namespace VitaIOP
 		}
 
 		return m_code.PatchBranch(done, m_code.Size());
+	}
+
+	bool BlockCompiler::EmitPublishResidentEeBudget()
+	{
+		// PCSX2 owner: x86/iR3000A.cpp::iPsxAddEECycles() keeps this value
+		// canonical because the desktop dispatcher has no cross-block host
+		// contract. Vita's private generated chain owns callee-saved r5 until a
+		// real provider/observer exit. Compatible internal edges consume r5;
+		// every generated fallback and exit publishes it exactly once.
+		return !m_resident_ee_budget ||
+		       m_code.EmitStrImm12(HOST_SAVED0, HOST_PSX_REGS,
+				   static_cast<u16>(IOP_CYCLE_EE_OFFSET));
 	}
 
 	bool BlockCompiler::EmitPcChangedExitCheck(
@@ -6256,6 +6313,8 @@ namespace VitaIOP
 	bool BlockCompiler::EmitQemuCounterIncrement(u32* counter)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
+		if (!s_qemuIopGeneratedInstrumentationEnabled)
+			return true;
 		return counter &&
 		       m_code.EmitMovImm32(
 				   HOST_TMP2, static_cast<u32>(reinterpret_cast<uptr>(counter))) &&
@@ -7637,6 +7696,22 @@ namespace VitaIOP
 		m_resident_event_deadline = m_resident_event_deadline &&
 			s_qemuIopPublishedEventDeadlineResidencyEnabled;
 #endif
+		bool specialize_clock_mode = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		specialize_clock_mode = s_qemuIopClockModeSpecializationEnabled;
+#endif
+		m_resident_ee_budget = m_defer_cycle_updates &&
+			legacy_cycle_deferral && !active_irx_import &&
+			BranchTestSchedulingEnabled() && specialize_clock_mode &&
+			(psxHu32(HW_ICFG) & (1u << 3)) == 0;
+#if defined(VITASX2_IOP_RESIDENT_EE_BUDGET_CONTROL)
+		m_resident_ee_budget = false;
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_resident_ee_budget =
+			m_resident_ee_budget && s_qemuIopEeBudgetResidencyEnabled &&
+			s_qemuIopResidentPreludeLinksEnabled;
+#endif
 		if (active_irx_import && !m_defer_cycle_updates)
 		{
 			// The x86 owner can leave the complete block-cycle delta private when
@@ -8122,6 +8197,8 @@ namespace VitaIOP
 			if (!unflushed_exits.empty() && !EmitFlushPinnedGprs())
 				return false;
 			const size_t resume_return_target = m_code.Size();
+			if (!EmitPublishResidentEeBudget())
+				return false;
 			DirectLinkSlot& link = direct_links->slots[slot];
 			link.scheduler_resume_offset = m_code.Size();
 			if (!m_code.EmitMovImm32Patchable(
@@ -8717,6 +8794,24 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopPublishedEventDeadlineResidencyEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetEeBudgetResidencyEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopEeBudgetResidencyEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetGeneratedInstrumentationEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopGeneratedInstrumentationEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -12270,7 +12365,9 @@ namespace VitaIOP
 			// deliberately scoped to countdown contracts; existing immutable
 			// base/GPR links remain unchanged.
 			if (target_fragment.resident.gpr_entry.Contains(
-					VitaRegion::ResidentValue::IopPublishedEventCountdown))
+					VitaRegion::ResidentValue::IopPublishedEventCountdown) ||
+				target_fragment.resident.gpr_entry.Contains(
+					VitaRegion::ResidentValue::IopEeBudget))
 			{
 				use_resident_gpr_entry = false;
 			}
@@ -12312,6 +12409,11 @@ namespace VitaIOP
 		const bool bypass_restored = !has_gpr_bypass ||
 			link_code->PatchInstruction(link.resident_gpr_bypass_offset,
 				link.resident_gpr_bypass_instruction);
+		const bool has_budget_bypass =
+			link.resident_budget_bypass_offset != static_cast<size_t>(-1);
+		const bool budget_bypass_restored = !has_budget_bypass ||
+			link_code->PatchInstruction(link.resident_budget_bypass_offset,
+				link.resident_budget_bypass_instruction);
 		const bool target_patched =
 			use_chain ? link_code->PatchBranchToAddress(link.target_offset,
 							target_entry) :
@@ -12320,9 +12422,20 @@ namespace VitaIOP
 			!use_resident_gpr_entry || !has_gpr_bypass ||
 			link_code->PatchBranchToAddress(link.resident_gpr_bypass_offset,
 				ResidentGprEntryPoint(*target));
+		const bool budget_bypass_patched =
+			!(use_resident_entry || use_resident_gpr_entry) ||
+			!has_budget_bypass ||
+			link_code->PatchBranchToAddress(link.resident_budget_bypass_offset,
+				use_resident_gpr_entry ? ResidentGprEntryPoint(*target) :
+					ResidentEntryPoint(*target));
 		link.resident_entry_active =
 			use_resident_entry || use_resident_gpr_entry;
 		link.resident_gpr_entry_active = use_resident_gpr_entry;
+		link.resident_ee_budget_entry_active =
+			(use_resident_entry || use_resident_gpr_entry) &&
+			has_budget_bypass &&
+			target->Fragment(0).resident.base_entry.Contains(
+				VitaRegion::ResidentValue::IopEeBudget);
 		link.resident_setup_instructions_removed =
 			(use_resident_entry || use_resident_gpr_entry) ?
 				target->Fragment(0).resident.base_setup_instruction_count :
@@ -12332,14 +12445,16 @@ namespace VitaIOP
 				target->Fragment(0).resident.gpr_entry_load_instruction_count :
 				0;
 		if (link.logical_continuation)
-			return bypass_restored && target_patched && gpr_bypass_patched &&
-				link_code->Flush();
+			return bypass_restored && budget_bypass_restored &&
+				target_patched && gpr_bypass_patched &&
+				budget_bypass_patched && link_code->Flush();
 
 		const u32 scheduler_resume =
 			use_chain ? (static_cast<u32>(reinterpret_cast<uptr>(target)) |
 				SCHEDULER_DIRECT_RESUME_TAG) :
 			static_cast<u32>(BlockExitKind::Direct);
-		if (!bypass_restored || !target_patched || !gpr_bypass_patched ||
+		if (!bypass_restored || !budget_bypass_restored || !target_patched ||
+			!gpr_bypass_patched || !budget_bypass_patched ||
 			!link_code->PatchMovImm32(link.scheduler_resume_offset, HOST_TMP0,
 				scheduler_resume) ||
 			!link_code->Flush())
@@ -12644,6 +12759,9 @@ namespace VitaIOP
 		result->resident_gpr_links = 0;
 		result->resident_gpr_stores_removed = 0;
 		result->resident_gpr_loads_removed = 0;
+		result->resident_ee_budget_links = 0;
+		result->resident_ee_budget_stores_removed = 0;
+		result->resident_ee_budget_loads_removed = 0;
 		for (const std::unique_ptr<CachedBlock>& cached : m_cache)
 		{
 			if (!cached || !cached->valid)
@@ -12662,6 +12780,12 @@ namespace VitaIOP
 						link.resident_gpr_stores_removed;
 					result->resident_gpr_loads_removed +=
 						link.resident_gpr_loads_removed;
+				}
+				if (link.resident_ee_budget_entry_active)
+				{
+					result->resident_ee_budget_links++;
+					result->resident_ee_budget_stores_removed++;
+					result->resident_ee_budget_loads_removed++;
 				}
 			}
 		}

@@ -88,6 +88,10 @@ option(VITASX2_IOP_PUBLISHED_EVENT_DEADLINE_CONTROL
 	"Diagnostic control: reload the complete IOP event deadline at every helper-free linked block seam."
 	OFF)
 
+option(VITASX2_IOP_RESIDENT_EE_BUDGET_CONTROL
+	"Diagnostic control: publish and reload the IOP EE-timeslice budget at every linked block edge."
+	OFF)
+
 option(VITASX2_SILENT_HSYNC_FOLD_CONTROL
 	"Diagnostic control: retain every HSync scheduler boundary while both processors hold exact wait certificates."
 	OFF)

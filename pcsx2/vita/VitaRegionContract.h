@@ -28,6 +28,7 @@ namespace VitaRegion
 		MainMemoryMask,
 		GuestGprLow32,
 		IopPublishedEventCountdown,
+		IopEeBudget,
 	};
 
 	struct ResidentBinding

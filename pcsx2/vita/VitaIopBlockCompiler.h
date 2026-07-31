@@ -178,6 +178,9 @@ namespace VitaIOP
 		u64 resident_gpr_links;
 		u64 resident_gpr_stores_removed;
 		u64 resident_gpr_loads_removed;
+		u64 resident_ee_budget_links;
+		u64 resident_ee_budget_stores_removed;
+		u64 resident_ee_budget_loads_removed;
 		u64 sequential_qword_copy_fast_paths;
 		u64 sequential_qword_copy_instructions_removed;
 		u64 private_dispatcher_calls;
@@ -287,11 +290,14 @@ namespace VitaIOP
 		size_t scheduler_resume_offset = static_cast<size_t>(-1);
 		size_t resident_gpr_bypass_offset = static_cast<size_t>(-1);
 		u32 resident_gpr_bypass_instruction = 0;
+		size_t resident_budget_bypass_offset = static_cast<size_t>(-1);
+		u32 resident_budget_bypass_instruction = 0;
 		u16 fragment_index = 0;
 		bool valid = false;
 		bool logical_continuation = false;
 		bool resident_entry_active = false;
 		bool resident_gpr_entry_active = false;
+		bool resident_ee_budget_entry_active = false;
 		u8 resident_setup_instructions_removed = 0;
 		u8 resident_gpr_stores_removed = 0;
 		u8 resident_gpr_loads_removed = 0;
@@ -475,6 +481,7 @@ namespace VitaIOP
 		bool EmitBranchEventTest(u8 scheduler_resume_slot = UINT8_MAX);
 		bool EmitConsumePublishedEventCountdown();
 		bool EmitReloadPublishedEventCountdown();
+		bool EmitPublishResidentEeBudget();
 		bool EmitQemuCounterIncrement(u32* counter);
 		bool EmitChargeEeBudgetPs1(u32 known_block_cycles);
 		bool EmitPcChangedExitCheck(u32 expected_pc,
@@ -649,6 +656,7 @@ namespace VitaIOP
 		ResidentFragmentContract m_resident_contract{};
 		bool m_resident_gpr_contract_safe = false;
 		bool m_resident_event_deadline = false;
+		bool m_resident_ee_budget = false;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
@@ -748,6 +756,8 @@ namespace VitaIOP
 		static void SetResidentPreludeLinksEnabled(bool enabled);
 		static void SetResidentGprLinksEnabled(bool enabled);
 		static void SetPublishedEventDeadlineResidencyEnabled(bool enabled);
+		static void SetEeBudgetResidencyEnabled(bool enabled);
+		static void SetGeneratedInstrumentationEnabled(bool enabled);
 		static void SetSequentialQwordCopyEnabled(bool enabled);
 		static void SetBranchTestSchedulingEnabled(bool enabled);
 		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
