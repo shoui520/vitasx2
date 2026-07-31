@@ -314,6 +314,8 @@ namespace VitaEE
 		// these vectors from a fragmented game-time heap.
 		m_cache.reserve(MAX_CACHE_CAPACITY);
 		m_block_records.reserve(MAX_CACHE_CAPACITY);
+		m_block_record_bucket_heads.fill(INVALID_BLOCK_RECORD_INDEX);
+		m_block_record_query_scratch.reserve(MAX_CACHE_CAPACITY);
 		m_incoming_links.reserve(MAX_INCOMING_LINKS);
 		m_incoming_link_bucket_heads.fill(INVALID_INCOMING_LINK_INDEX);
 	}
@@ -459,23 +461,50 @@ namespace VitaEE
 		m_active_generated_lookup_pages = nullptr;
 	}
 
-	s32 BlockExecutor::LastBlockRecordIndex(u32 pc) const
+	u32 BlockExecutor::BlockRecordBucketIndex(u32 pc)
 	{
-		if (m_block_records.empty())
-			return -1;
+		// Nearby EE code stays in nearby 256-byte buckets, keeping range walks
+		// cache-friendly. The fixed table aliases only every 4 MiB; each record's
+		// full page number disambiguates those aliases.
+		return (pc >> BLOCK_RECORD_BUCKET_SHIFT) &
+			(BLOCK_RECORD_BUCKET_COUNT - 1);
+	}
 
-		s32 min = 0;
-		s32 max = static_cast<s32>(m_block_records.size() - 1);
-		while (min != max)
+	bool BlockExecutor::RemoveBlockRecord(u32 record_index)
+	{
+		if (record_index >= m_block_records.size())
+			return false;
+		BlockRecord& removed = m_block_records[record_index];
+		if (!removed.block ||
+			removed.block->block_record_index != record_index)
 		{
-			const s32 mid = (min + max + 1) >> 1;
-			if (m_block_records[mid].start_pc > pc)
-				max = mid - 1;
-			else
-				min = mid;
+			return false;
 		}
 
-		return min;
+		const u32 bucket = BlockRecordBucketIndex(removed.start_pc);
+		if (removed.previous_index != INVALID_BLOCK_RECORD_INDEX)
+		{
+			m_block_records[removed.previous_index].next_index =
+				removed.next_index;
+		}
+		else
+		{
+			m_block_record_bucket_heads[bucket] = removed.next_index;
+		}
+		if (removed.next_index != INVALID_BLOCK_RECORD_INDEX)
+		{
+			m_block_records[removed.next_index].previous_index =
+				removed.previous_index;
+		}
+
+		removed.block->block_record_index = INVALID_BLOCK_RECORD_INDEX;
+		removed.block = nullptr;
+		removed.start_pc = 0;
+		removed.previous_index = INVALID_BLOCK_RECORD_INDEX;
+		removed.next_index = m_block_record_free_head;
+		m_block_record_free_head = record_index;
+		m_block_record_count--;
+		return true;
 	}
 
 	bool BlockExecutor::RegisterBlockRecord(CachedBlock& block)
@@ -484,53 +513,54 @@ namespace VitaEE
 			return false;
 
 		UnregisterBlockRecord(block);
-		if (m_block_records.size() >= MAX_CACHE_CAPACITY)
+		if (m_block_record_count >= MAX_CACHE_CAPACITY)
 			return false;
 
-		// PCSX2 owner: x86/BaseblockEx.h::BaseBlockArray::insert().
-		// Keep translated blocks sorted by guest start PC so invalidation and
-		// target lookup do not depend on a linear walk of the cache storage.
-		u32 insert_index = 0;
-		u32 insert_limit = static_cast<u32>(m_block_records.size());
-		while (insert_index < insert_limit)
+		// PCSX2 owner: x86/BaseblockEx.h::BaseBlockArray::insert(). Preserve
+		// start-PC ownership without shifting the process-wide record set for
+		// every cold compile. Range users visit only the bounded 256-byte buckets
+		// which can overlap their query.
+		const u32 bucket = BlockRecordBucketIndex(block.start_pc);
+		u32 record_index = m_block_record_free_head;
+		if (record_index != INVALID_BLOCK_RECORD_INDEX)
 		{
-			const u32 mid = (insert_index + insert_limit) >> 1;
-			if (m_block_records[mid].start_pc <= block.start_pc)
-				insert_index = mid + 1;
-			else
-				insert_limit = mid;
+			m_block_record_free_head =
+				m_block_records[record_index].next_index;
+			m_block_records[record_index] = {&block, block.start_pc,
+				m_block_record_bucket_heads[bucket],
+				INVALID_BLOCK_RECORD_INDEX};
 		}
-
-		m_block_records.insert(m_block_records.begin() + insert_index,
-			{&block, block.start_pc});
+		else
+		{
+			record_index = static_cast<u32>(m_block_records.size());
+			m_block_records.push_back({&block, block.start_pc,
+				m_block_record_bucket_heads[bucket],
+				INVALID_BLOCK_RECORD_INDEX});
+		}
+		if (m_block_record_bucket_heads[bucket] != INVALID_BLOCK_RECORD_INDEX)
+		{
+			m_block_records[m_block_record_bucket_heads[bucket]].previous_index =
+				record_index;
+		}
+		m_block_record_bucket_heads[bucket] = record_index;
+		block.block_record_index = record_index;
+		m_block_record_count++;
 		return true;
 	}
 
 	void BlockExecutor::UnregisterBlockRecord(CachedBlock& block)
 	{
-		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::LastIndex() plus
-		// BaseBlocks::Remove(). Records are sorted by start PC, so only the
-		// same-PC run can contain this block.
-		s32 index = LastBlockRecordIndex(block.start_pc);
-		while (index >= 0 && m_block_records[index].start_pc == block.start_pc)
-			index--;
-		index++;
-
-		for (; index >= 0 && static_cast<u32>(index) < m_block_records.size() &&
-			   m_block_records[index].start_pc == block.start_pc;
-			 index++)
-		{
-			if (m_block_records[index].block == &block)
-			{
-				m_block_records.erase(m_block_records.begin() + index);
-				return;
-			}
-		}
+		if (block.block_record_index != INVALID_BLOCK_RECORD_INDEX)
+			RemoveBlockRecord(block.block_record_index);
 	}
 
 	void BlockExecutor::ClearBlockRecords()
 	{
 		m_block_records.clear();
+		m_block_record_bucket_heads.fill(INVALID_BLOCK_RECORD_INDEX);
+		m_block_record_free_head = INVALID_BLOCK_RECORD_INDEX;
+		m_block_record_count = 0;
+		m_block_record_query_scratch.clear();
 	}
 
 	bool BlockExecutor::CaptureRamSourceFragments(CachedBlock& block)
@@ -870,10 +900,16 @@ namespace VitaEE
 		u32 start_pc, u32 instruction_count, bool match_instruction_count,
 		bool discovered_topology, bool validate_source_words)
 	{
-		s32 index = LastBlockRecordIndex(start_pc);
-		while (index >= 0 && m_block_records[index].start_pc == start_pc)
+		u32 index = m_block_record_bucket_heads[
+			BlockRecordBucketIndex(start_pc)];
+		while (index != INVALID_BLOCK_RECORD_INDEX)
 		{
-			CachedBlock* block = m_block_records[index].block;
+			const BlockRecord& record = m_block_records[index];
+			index = record.next_index;
+			if (record.start_pc != start_pc)
+				continue;
+
+			CachedBlock* block = record.block;
 			if (block && block->valid &&
 				block->discovered_topology == discovered_topology &&
 				(!match_instruction_count || block->instruction_count == instruction_count))
@@ -883,8 +919,6 @@ namespace VitaEE
 
 				break;
 			}
-
-			index--;
 		}
 
 		return nullptr;
@@ -959,6 +993,7 @@ namespace VitaEE
 		UnregisterIncomingLinks(block);
 		UnregisterBlockLookup(block);
 		UnregisterBlockRecord(block);
+		block.block_record_index = INVALID_BLOCK_RECORD_INDEX;
 		block.valid = false;
 		block.linked_entry_offset = 0;
 		block.resident_self_link_entry_offset = static_cast<size_t>(-1);
@@ -1119,6 +1154,7 @@ namespace VitaEE
 			block.valid = false;
 			block.queued_free = false;
 			block.next_free = nullptr;
+			block.block_record_index = INVALID_BLOCK_RECORD_INDEX;
 			block.source_instruction_count = 0;
 			block.dependency_start_pc = 0;
 			block.dependency_instruction_count = 0;
@@ -1294,40 +1330,29 @@ namespace VitaEE
 		const u32 first_candidate_pc = (start_pc > max_block_bytes) ? (start_pc - max_block_bytes) : 0;
 		const u32 last_candidate_pc =
 			end_pc > UINT32_MAX - max_block_bytes ? UINT32_MAX : end_pc + max_block_bytes;
-		// PCSX2 keeps BaseBlocks sorted by guest start PC. Since Vita blocks are
-		// bounded, entries before this lower bound cannot overlap the cleared
-		// word range.
-		u32 i = 0;
-		u32 limit = static_cast<u32>(m_block_records.size());
-		while (i < limit)
-		{
-			const u32 mid = (i + limit) >> 1;
-			if (m_block_records[mid].start_pc < first_candidate_pc)
-				i = mid + 1;
-			else
-				limit = mid;
-		}
+		// Vita blocks are bounded, so only the small page-bucket interval around
+		// the cleared words can overlap. Snapshot its stable CachedBlock pointers
+		// before retiring proof groups; retiring one group can unlink several
+		// records from the same bucket.
+		m_block_record_query_scratch.clear();
+		VisitBlockRecordsInRange(first_candidate_pc, last_candidate_pc,
+			[this](const BlockRecord& record) {
+				m_block_record_query_scratch.push_back(record.block);
+				return true;
+			});
 
-		for (; i < m_block_records.size();)
+		for (CachedBlock* block : m_block_record_query_scratch)
 		{
-			CachedBlock* block = m_block_records[i].block;
 			if (!block || !block->valid)
 			{
 				if (block)
 					UnregisterBlockRecord(*block);
-				else
-					i++;
 				continue;
 			}
 
-			if (block->start_pc >= last_candidate_pc)
-				break;
 			if (discovered_topology &&
 				block->discovered_topology != *discovered_topology)
-			{
-				i++;
 				continue;
-			}
 
 			// Every physical part of a code-budget split shares one proof group.
 			// The chosen seams depend on all of the group's opcodes, so a write to
@@ -1342,10 +1367,7 @@ namespace VitaEE
 			{
 				InvalidateCachedBlock(*block);
 				invalidated++;
-				continue;
 			}
-
-			i++;
 		}
 
 		return invalidated;
@@ -2660,38 +2682,40 @@ namespace VitaEE
 			MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS * sizeof(u32);
 		const u32 first_candidate_pc =
 			start_pc > max_block_bytes ? start_pc - max_block_bytes : 0;
-		auto candidate = std::lower_bound(m_block_records.begin(),
-			m_block_records.end(), first_candidate_pc,
-			[](const BlockRecord& record, u32 pc) {
-				return record.start_pc < pc;
+		bool stale_overlap = false;
+		VisitBlockRecordsInRange(first_candidate_pc, end_pc,
+			[&](const BlockRecord& record) {
+				CachedBlock* old_block = record.block;
+				if (!old_block || !old_block->valid ||
+					old_block->discovered_topology != discovered_topology)
+				{
+					return true;
+				}
+
+				const u32 old_end_pc = old_block->start_pc +
+					old_block->instruction_count * sizeof(u32);
+				// PCSX2 avoids handler reads by bounding recRAMCopy overlap checks to
+				// RAM. A32 may also prove ROM or scratchpad through a non-handler direct
+				// source span, but compilation must not add observable handler reads.
+				if (old_end_pc <= start_pc ||
+					!CachedBlockHasDirectSourceSpan(*old_block) ||
+					CachedBlockSourceMatches(*old_block))
+				{
+					return true;
+				}
+
+				// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile(). After
+				// compiling a new BaseBlock, PCSX2 compares recRAMCopy for every
+				// overlapping old block. One stale snapshot invokes recClear() for
+				// the complete new span before its entry is published. Besides SMC
+				// correctness, this retires stale outer topology so rediscovery sees
+				// an already-published interior entry and preserves PCSX2's per-block
+				// fixed-point cycle rounding.
+				stale_overlap = true;
+				return false;
 			});
-		for (; candidate != m_block_records.end() &&
-			candidate->start_pc < end_pc; ++candidate)
+		if (stale_overlap)
 		{
-			CachedBlock* old_block = candidate->block;
-			if (!old_block || !old_block->valid ||
-				old_block->discovered_topology != discovered_topology)
-			{
-				continue;
-			}
-
-			const u32 old_end_pc = old_block->start_pc +
-				old_block->instruction_count * sizeof(u32);
-			// PCSX2 avoids handler reads by bounding recRAMCopy overlap checks to
-			// RAM. A32 may also prove ROM or scratchpad through a non-handler direct
-			// source span, but compilation must not add observable handler reads.
-			if (old_end_pc <= start_pc ||
-				!CachedBlockHasDirectSourceSpan(*old_block) ||
-				CachedBlockSourceMatches(*old_block))
-				continue;
-
-			// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile(). After
-			// compiling a new BaseBlock, PCSX2 compares recRAMCopy for every
-			// overlapping old block. One stale snapshot invokes recClear() for
-			// the complete new span before its entry is published. Besides SMC
-			// correctness, this retires stale outer topology so rediscovery sees
-			// an already-published interior entry and preserves PCSX2's per-block
-			// fixed-point cycle rounding.
 			return InvalidateRangeInternal(start_pc, instruction_count,
 				&discovered_topology);
 		}
@@ -2825,10 +2849,16 @@ namespace VitaEE
 				return entry;
 		}
 
-		s32 index = LastBlockRecordIndex(start_pc);
-		while (index >= 0 && m_block_records[index].start_pc == start_pc)
+		u32 index = m_block_record_bucket_heads[
+			BlockRecordBucketIndex(start_pc)];
+		while (index != INVALID_BLOCK_RECORD_INDEX)
 		{
-			CachedBlock* entry = m_block_records[index--].block;
+			const BlockRecord& record = m_block_records[index];
+			index = record.next_index;
+			if (record.start_pc != start_pc)
+				continue;
+
+			CachedBlock* entry = record.block;
 			if (!entry || !entry->valid ||
 				entry->discovered_topology != discovered_topology)
 			{
@@ -2859,36 +2889,40 @@ namespace VitaEE
 		*dependency_instruction_count = instruction_count;
 		*dependency_charged_cycles_before = 0;
 		const u32 source_end_pc = start_pc + instruction_count * sizeof(u32);
-		const auto predecessor_end = std::lower_bound(m_block_records.begin(),
-			m_block_records.end(), start_pc,
-			[](const BlockRecord& record, u32 pc) { return record.start_pc < pc; });
 		constexpr u32 max_dependency_bytes =
 			MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS * sizeof(u32);
-		for (auto predecessor = predecessor_end;
-			predecessor != m_block_records.begin();)
+		const u32 first_predecessor_pc = start_pc > max_dependency_bytes ?
+			start_pc - max_dependency_bytes : 0;
+		CachedBlock* predecessor_block = nullptr;
+		VisitBlockRecordsInRange(first_predecessor_pc, start_pc,
+			[&](const BlockRecord& record) {
+				CachedBlock* candidate = record.block;
+				if (predecessor_block &&
+					record.start_pc <= predecessor_block->start_pc)
+				{
+					return true;
+				}
+
+				if (!candidate || !candidate->valid ||
+					candidate->discovered_topology != discovered_topology)
+					return true;
+				const u32 predecessor_physical_end = candidate->start_pc +
+					candidate->instruction_count * sizeof(u32);
+				if (predecessor_physical_end != start_pc ||
+					candidate->instruction_count >= candidate->source_instruction_count ||
+					candidate->dependency_instruction_count == 0 ||
+					(candidate->dependency_start_pc == candidate->start_pc &&
+						candidate->dependency_instruction_count ==
+							candidate->instruction_count))
+				{
+					return true;
+				}
+				predecessor_block = candidate;
+				return true;
+			});
+
+		if (predecessor_block)
 		{
-			--predecessor;
-			if (start_pc - predecessor->start_pc > max_dependency_bytes)
-				break;
-
-			CachedBlock* predecessor_block = predecessor->block;
-			if (!predecessor_block || !predecessor_block->valid ||
-				predecessor_block->discovered_topology != discovered_topology)
-				continue;
-			const u32 predecessor_physical_end = predecessor_block->start_pc +
-				predecessor_block->instruction_count * sizeof(u32);
-			if (predecessor_physical_end != start_pc ||
-				predecessor_block->instruction_count >=
-					predecessor_block->source_instruction_count ||
-				predecessor_block->dependency_instruction_count == 0 ||
-				(predecessor_block->dependency_start_pc ==
-						predecessor_block->start_pc &&
-					predecessor_block->dependency_instruction_count ==
-						predecessor_block->instruction_count))
-			{
-				continue;
-			}
-
 			const u32 predecessor_dependency_end =
 				predecessor_block->dependency_start_pc +
 				predecessor_block->dependency_instruction_count * sizeof(u32);
@@ -2901,7 +2935,6 @@ namespace VitaEE
 					predecessor_block->dependency_charged_cycles_before +
 					predecessor_block->scaled_cycles;
 			}
-			break;
 		}
 	}
 
@@ -3713,35 +3746,30 @@ namespace VitaEE
 				// observe a seam which that group's timeline proof never considered.
 				// PCSX2's BaseBlocks::Remove()/New() gives a continuation topology one
 				// owning compilation context; retire the older proof group likewise.
-				auto converging = std::lower_bound(m_block_records.begin(),
-					m_block_records.end(), first_converging_start,
-					[](const BlockRecord& record, u32 pc) {
-						return record.start_pc < pc;
-					});
 				CachedBlock* conflict = nullptr;
-				for (; converging != m_block_records.end() &&
-					converging->start_pc < continuation_pc; ++converging)
-				{
-					CachedBlock* candidate = converging->block;
-					if (!candidate || !candidate->valid ||
-						candidate->discovered_topology != discovered_topology ||
-						candidate->instruction_count >= candidate->source_instruction_count)
-					{
-						continue;
-					}
+				VisitBlockRecordsInRange(first_converging_start, continuation_pc,
+					[&](const BlockRecord& record) {
+						CachedBlock* candidate = record.block;
+						if (!candidate || !candidate->valid ||
+							candidate->discovered_topology != discovered_topology ||
+							candidate->instruction_count >= candidate->source_instruction_count)
+						{
+							return true;
+						}
 
-					const u32 candidate_end_pc = candidate->start_pc +
-						candidate->instruction_count * sizeof(u32);
-					const bool same_proof_group =
-						candidate->dependency_start_pc == dependency_start_pc &&
-						candidate->dependency_instruction_count ==
-							dependency_instruction_count;
-					if (candidate_end_pc == continuation_pc && !same_proof_group)
-					{
-						conflict = candidate;
-						break;
-					}
-				}
+						const u32 candidate_end_pc = candidate->start_pc +
+							candidate->instruction_count * sizeof(u32);
+						const bool same_proof_group =
+							candidate->dependency_start_pc == dependency_start_pc &&
+							candidate->dependency_instruction_count ==
+								dependency_instruction_count;
+						if (candidate_end_pc == continuation_pc && !same_proof_group)
+						{
+							conflict = candidate;
+							return false;
+						}
+						return true;
+					});
 
 				if (!conflict)
 					break;
@@ -3764,42 +3792,23 @@ namespace VitaEE
 				dependency_instruction_count * sizeof(u32);
 			for (;;)
 			{
-				const auto interior_record = std::lower_bound(m_block_records.begin(),
-					m_block_records.end(), start_pc,
-					[](const BlockRecord& record, u32 pc) {
-						return record.start_pc < pc;
-					});
-				if (interior_record == m_block_records.end() ||
-					interior_record->start_pc >= dependency_end_pc)
-				{
-					break;
-				}
-
 				CachedBlock* interior = nullptr;
-				auto matching_interior = interior_record;
-				while (matching_interior != m_block_records.end() &&
-					matching_interior->start_pc < dependency_end_pc)
-				{
-					CachedBlock* candidate = matching_interior->block;
-					if (!candidate || !candidate->valid ||
-						candidate->discovered_topology == discovered_topology)
-					{
-						interior = candidate;
-						break;
-					}
-					++matching_interior;
-				}
-				if (matching_interior == m_block_records.end() ||
-					matching_interior->start_pc >= dependency_end_pc)
-				{
+				VisitBlockRecordsInRange(start_pc, dependency_end_pc,
+					[&](const BlockRecord& record) {
+						CachedBlock* candidate = record.block;
+						if (!candidate || !candidate->valid ||
+							candidate->discovered_topology == discovered_topology)
+						{
+							interior = candidate;
+							return false;
+						}
+						return true;
+					});
+				if (!interior)
 					break;
-				}
-				if (!interior || !interior->valid)
+				if (!interior->valid)
 				{
-					if (interior)
-						UnregisterBlockRecord(*interior);
-					else
-						m_block_records.erase(matching_interior);
+					UnregisterBlockRecord(*interior);
 					continue;
 				}
 
@@ -4205,7 +4214,7 @@ namespace VitaEE
 		result->source_instruction_count = block.source_instruction_count;
 		result->scaled_cycles = block.scaled_cycles;
 		result->code_size = block.code.Size();
-		result->block_records = static_cast<u32>(m_block_records.size());
+		result->block_records = m_block_record_count;
 		result->link_records = m_incoming_link_count;
 		result->cache_slots = static_cast<u32>(m_cache.size());
 		result->code_cache_resets = m_code_cache_resets;
@@ -4334,7 +4343,7 @@ namespace VitaEE
 			result->source_instruction_count = entry->source_instruction_count;
 			result->scaled_cycles = entry->scaled_cycles;
 			result->code_size = entry->code.Size();
-			result->block_records = static_cast<u32>(m_block_records.size());
+			result->block_records = m_block_record_count;
 			result->link_records = m_incoming_link_count;
 			result->cache_slots = static_cast<u32>(m_cache.size());
 			result->code_cache_resets = m_code_cache_resets;
@@ -4448,25 +4457,28 @@ namespace VitaEE
 		// complete shared proof group, so an opcode change can never preserve a
 		// stale artificial seam through this truncation.
 		const u32 natural_stop_pc = scan.stop_pc;
-		auto next_record = std::upper_bound(m_block_records.begin(),
-			m_block_records.end(), start_pc,
-			[](u32 pc, const BlockRecord& record) { return pc < record.start_pc; });
-		while (next_record != m_block_records.end() &&
-			(!next_record->block || !next_record->block->valid ||
-			 !next_record->block->discovered_topology))
-		{
-			++next_record;
-		}
-		if (next_record != m_block_records.end() &&
-			next_record->start_pc < natural_stop_pc)
+		CachedBlock* next_block = nullptr;
+		VisitBlockRecordsInRange(start_pc, natural_stop_pc,
+			[&](const BlockRecord& record) {
+				CachedBlock* candidate = record.block;
+				if (record.start_pc <= start_pc || !candidate || !candidate->valid ||
+					!candidate->discovered_topology)
+				{
+					return true;
+				}
+				if (!next_block || candidate->start_pc < next_block->start_pc)
+					next_block = candidate;
+				return true;
+			});
+		if (next_block)
 		{
 			const u32 boundary_instructions =
-				(next_record->start_pc - start_pc) / sizeof(u32);
+				(next_block->start_pc - start_pc) / sizeof(u32);
 			BlockScanResult bounded_scan;
 			if (boundary_instructions != 0 &&
 				ScanStraightLineBlock(start_pc, boundary_instructions, &bounded_scan) &&
 				bounded_scan.instruction_count == boundary_instructions &&
-				bounded_scan.stop_pc == next_record->start_pc)
+				bounded_scan.stop_pc == next_block->start_pc)
 			{
 				bounded_scan.stop = BlockScanStop::ExistingBlockBoundary;
 				scan = bounded_scan;
@@ -4479,13 +4491,13 @@ namespace VitaEE
 				// its delay slot. If an existing target names that required follower,
 				// overlap exactly the atomic pair instead of ignoring the target and
 				// rediscovering the entire natural region.
-				const u32 preceding_op = memRead32(next_record->start_pc - sizeof(u32));
+				const u32 preceding_op = memRead32(next_block->start_pc - sizeof(u32));
 				BlockScanResult atomic_scan;
 				if ((BlockCompiler::RequiresFollowingInstructionInBlock(preceding_op) ||
 						BlockCompiler::IsSupportedBranchOpcode(preceding_op)) &&
 					ScanStraightLineBlock(start_pc, boundary_instructions + 1, &atomic_scan) &&
 					atomic_scan.instruction_count == boundary_instructions + 1 &&
-					atomic_scan.stop_pc == next_record->start_pc + sizeof(u32))
+					atomic_scan.stop_pc == next_block->start_pc + sizeof(u32))
 				{
 					atomic_scan.stop = BlockScanStop::ExistingBlockBoundary;
 					scan = atomic_scan;

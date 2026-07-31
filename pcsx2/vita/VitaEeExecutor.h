@@ -225,7 +225,7 @@ namespace VitaEE
 		size_t GetCodeCacheCapacity() const { return m_code_cache_capacity; }
 		u32 GetCodeCacheBlockRecordCount() const
 		{
-			return static_cast<u32>(m_block_records.size());
+			return m_block_record_count;
 		}
 		u32 GetCodeCacheSlotCount() const
 		{
@@ -256,6 +256,11 @@ namespace VitaEE
 		// counter-free block.
 		static constexpr u32 HOT_REGION_ENTRY_PROMOTION_THRESHOLD = 256;
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
+		static constexpr u32 BLOCK_RECORD_BUCKET_SHIFT = 8;
+		static constexpr u32 BLOCK_RECORD_BUCKET_COUNT = 0x4000;
+		static constexpr u32 INVALID_BLOCK_RECORD_INDEX = UINT32_MAX;
+		static_assert((BLOCK_RECORD_BUCKET_COUNT &
+			(BLOCK_RECORD_BUCKET_COUNT - 1)) == 0);
 		static constexpr u32 INCOMING_LINK_BUCKET_COUNT = 0x4000;
 		static constexpr u32 INVALID_INCOMING_LINK_INDEX = UINT32_MAX;
 		static_assert((INCOMING_LINK_BUCKET_COUNT &
@@ -325,6 +330,7 @@ namespace VitaEE
 			bool discovered_topology = false;
 			bool valid = false;
 			bool queued_free = false;
+			u32 block_record_index = INVALID_BLOCK_RECORD_INDEX;
 		};
 
 		struct PersistentRunContext
@@ -379,10 +385,12 @@ namespace VitaEE
 		{
 			CachedBlock* block = nullptr;
 			u32 start_pc = 0;
+			u32 next_index = INVALID_BLOCK_RECORD_INDEX;
+			u32 previous_index = INVALID_BLOCK_RECORD_INDEX;
 		};
 #if UINTPTR_MAX == UINT32_MAX
 		static_assert(sizeof(IncomingLinkRecord) == 12);
-		static_assert(sizeof(BlockRecord) == 8);
+		static_assert(sizeof(BlockRecord) == 16);
 #endif
 
 		struct RamSourceRecord
@@ -408,10 +416,44 @@ namespace VitaEE
 		void UnregisterBlockLookup(CachedBlock& block);
 		void ReleaseLookupPages();
 		void ReleaseGeneratedLookupPages();
-		s32 LastBlockRecordIndex(u32 pc) const;
+		static u32 BlockRecordBucketIndex(u32 pc);
+		bool RemoveBlockRecord(u32 record_index);
 		bool RegisterBlockRecord(CachedBlock& block);
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
+		template <typename Callback>
+		void VisitBlockRecordsInRange(u32 first_pc, u32 end_pc,
+			Callback&& callback) const
+		{
+			// Callbacks must not mutate the block-record topology. Mutation paths
+			// first snapshot CachedBlock pointers into m_block_record_query_scratch.
+			if (first_pc >= end_pc)
+				return;
+
+			const u32 first_page = first_pc >> BLOCK_RECORD_BUCKET_SHIFT;
+			const u32 last_page =
+				(end_pc - 1) >> BLOCK_RECORD_BUCKET_SHIFT;
+			for (u32 page = first_page;; page++)
+			{
+				u32 index = m_block_record_bucket_heads[
+					page & (BLOCK_RECORD_BUCKET_COUNT - 1)];
+				while (index != INVALID_BLOCK_RECORD_INDEX)
+				{
+					const BlockRecord& record = m_block_records[index];
+					index = record.next_index;
+					if (record.block &&
+						(record.start_pc >> BLOCK_RECORD_BUCKET_SHIFT) == page &&
+						record.start_pc >= first_pc && record.start_pc < end_pc &&
+						!callback(record))
+					{
+						return;
+					}
+				}
+
+				if (page == last_page)
+					break;
+			}
+		}
 		bool CaptureRamSourceFragments(CachedBlock& block);
 		void RegisterRamSource(CachedBlock& block);
 		void UnregisterRamSource(const CachedBlock& block);
@@ -495,6 +537,11 @@ namespace VitaEE
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
 		CachedBlock* m_free_cache_head = nullptr;
 		std::vector<BlockRecord> m_block_records;
+		std::array<u32, BLOCK_RECORD_BUCKET_COUNT>
+			m_block_record_bucket_heads{};
+		u32 m_block_record_free_head = INVALID_BLOCK_RECORD_INDEX;
+		u32 m_block_record_count = 0;
+		std::vector<CachedBlock*> m_block_record_query_scratch;
 		std::vector<IncomingLinkRecord> m_incoming_links;
 		std::array<u32, INCOMING_LINK_BUCKET_COUNT>
 			m_incoming_link_bucket_heads{};
