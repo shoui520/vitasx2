@@ -3361,6 +3361,9 @@ namespace VitaEE
 		u32 compiled_vu0_acc_cache_writes = 0;
 		u32 compiled_vu0_acc_cache_hits = 0;
 		u32 compiled_vu0_acc_cache_flushes = 0;
+		u32 compiled_vu0_vf_cache_writes = 0;
+		u32 compiled_vu0_vf_cache_hits = 0;
+		u32 compiled_vu0_vf_cache_flushes = 0;
 		DirectLinkSlots direct_links;
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
@@ -3531,6 +3534,12 @@ namespace VitaEE
 						compiler.GetVu0AccCacheHits();
 					compiled_vu0_acc_cache_flushes =
 						compiler.GetVu0AccCacheFlushes();
+					compiled_vu0_vf_cache_writes =
+						compiler.GetVu0VfCacheWrites();
+					compiled_vu0_vf_cache_hits =
+						compiler.GetVu0VfCacheHits();
+					compiled_vu0_vf_cache_flushes =
+						compiler.GetVu0VfCacheFlushes();
 					direct_links = attempt_direct_links;
 					break;
 				}
@@ -3843,7 +3852,10 @@ namespace VitaEE
 				block.two_predicate_wait_loop_source_proof.valid,
 				compiled_vu0_acc_cache_writes,
 				compiled_vu0_acc_cache_hits,
-				compiled_vu0_acc_cache_flushes);
+				compiled_vu0_acc_cache_flushes,
+				compiled_vu0_vf_cache_writes,
+				compiled_vu0_vf_cache_hits,
+				compiled_vu0_vf_cache_flushes);
 		}
 #endif
 

@@ -690,6 +690,10 @@ namespace VitaEE
 		{
 			m_vu0_acc_cache_enabled = enabled;
 		}
+		void SetVu0VfCacheEnabled(bool enabled)
+		{
+			m_vu0_vf_cache_enabled = enabled;
+		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -700,6 +704,9 @@ namespace VitaEE
 		u32 GetVu0AccCacheWrites() const { return m_vu0_acc_cache_writes; }
 		u32 GetVu0AccCacheHits() const { return m_vu0_acc_cache_hits; }
 		u32 GetVu0AccCacheFlushes() const { return m_vu0_acc_cache_flushes; }
+		u32 GetVu0VfCacheWrites() const { return m_vu0_vf_cache_writes; }
+		u32 GetVu0VfCacheHits() const { return m_vu0_vf_cache_hits; }
+		u32 GetVu0VfCacheFlushes() const { return m_vu0_vf_cache_flushes; }
 		static bool IsExactPreincrementByteZeroFillLoop(u32 start_pc, u32 instruction_count,
 			unsigned* pointer_guest = nullptr, unsigned* end_guest = nullptr);
 		static bool IsExactFourWordFillLoop(u32 start_pc, u32 instruction_count,
@@ -962,6 +969,8 @@ namespace VitaEE
 			unsigned address_reg);
 		bool CanKeepVu0AccCacheAcrossOpcode(u32 op) const;
 		bool EmitFlushVu0AccCache();
+		bool CanKeepVu0VfCacheAcrossOpcode(u32 op) const;
+		bool EmitFlushVu0VfCache();
 		bool EmitCOP2MacroBody(u32 op);
 		bool EmitCOP2MacroArithmeticBody(u32 op);
 		bool EmitCOP2MacroViBody(u32 op);
@@ -1691,6 +1700,16 @@ namespace VitaEE
 		u32 m_vu0_acc_cache_writes = 0;
 		u32 m_vu0_acc_cache_hits = 0;
 		u32 m_vu0_acc_cache_flushes = 0;
+		// One complete normalized VF result can remain in Q3 until the next
+		// compatible macro consumer. Q3 is the arithmetic result quad already,
+		// so result-only operations retain it for free. Flag-producing operations
+		// build it from their four normalized scalar results.
+		bool m_vu0_vf_cache_valid = false;
+		bool m_vu0_vf_cache_current_opcode = false;
+		u8 m_vu0_vf_cache_reg = 0;
+		u32 m_vu0_vf_cache_writes = 0;
+		u32 m_vu0_vf_cache_hits = 0;
+		u32 m_vu0_vf_cache_flushes = 0;
 		// Once an in-block TLB write has executed, suffix memory operations must
 		// not embed a compile-time vmv.assumePtr() from the preceding mapping.
 		bool m_runtime_tlb_mapping_may_have_changed = false;
@@ -1707,6 +1726,7 @@ namespace VitaEE
 		bool m_compatible_vtlb_read_guard_hoist_enabled = true;
 		bool m_direct_link_rejection_profiling_enabled = false;
 		bool m_vu0_acc_cache_enabled = true;
+		bool m_vu0_vf_cache_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;

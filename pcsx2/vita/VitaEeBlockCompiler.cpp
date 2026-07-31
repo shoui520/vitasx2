@@ -239,6 +239,9 @@ u32 g_qemuCop2RuntimeNoOpsElided = 0;
 u32 g_qemuCop2AccCacheWrites = 0;
 u32 g_qemuCop2AccCacheHits = 0;
 u32 g_qemuCop2AccCacheFlushes = 0;
+u32 g_qemuCop2VfCacheWrites = 0;
+u32 g_qemuCop2VfCacheHits = 0;
+u32 g_qemuCop2VfCacheFlushes = 0;
 u32 g_qemuCop2RawGpr0Qmtc2ZeroFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheDirectStores = 0;
@@ -545,6 +548,9 @@ namespace VitaEE
 		// blocks cannot also enable the GPR qword cache, and the vuDouble()
 		// lowering below deliberately leaves physical Q14 unused.
 		constexpr unsigned COP2_ACC_CACHE_Q = 6;
+		// Q3 is the existing COP2 arithmetic result quad. Retaining the latest
+		// complete normalized VF destination there adds no register pressure.
+		constexpr unsigned COP2_VF_CACHE_Q = 3;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_COMPLETE = 0;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_EVENT = 1;
 		constexpr u32 POLL_CALL_CYCLE_BITS = 10;
@@ -10701,6 +10707,12 @@ namespace VitaEE
 		m_vu0_acc_cache_writes = 0;
 		m_vu0_acc_cache_hits = 0;
 		m_vu0_acc_cache_flushes = 0;
+		m_vu0_vf_cache_valid = false;
+		m_vu0_vf_cache_current_opcode = false;
+		m_vu0_vf_cache_reg = 0;
+		m_vu0_vf_cache_writes = 0;
+		m_vu0_vf_cache_hits = 0;
+		m_vu0_vf_cache_flushes = 0;
 		m_runtime_tlb_mapping_may_have_changed = false;
 		for (unsigned i = 0; i < MAX_GPR_PINS; i++)
 		{
@@ -12612,6 +12624,8 @@ namespace VitaEE
 				// vector register.
 				if (!EmitFlushVu0AccCache())
 					return false;
+				if (!EmitFlushVu0VfCache())
+					return false;
 				add_raw_cycles(op);
 				if (!EmitDeviceTracePreInstruction(pc))
 					return false;
@@ -12922,6 +12936,8 @@ namespace VitaEE
 			// across compatible macro arithmetic.
 			if (device_trace_enabled && !EmitFlushVu0AccCache())
 				return false;
+			if (device_trace_enabled && !EmitFlushVu0VfCache())
+				return false;
 			if (!EmitDeviceTracePreInstruction(pc))
 				return false;
 			if (IsDI(op))
@@ -13071,6 +13087,8 @@ namespace VitaEE
 		if (pending_di_clear)
 			return false;
 		if (!EmitFlushVu0AccCache())
+			return false;
+		if (!EmitFlushVu0VfCache())
 			return false;
 
 		const u32 next_pc = start_pc + instruction_count * 4;
@@ -13373,12 +13391,26 @@ namespace VitaEE
 		const u32 previous_opcode = m_current_opcode;
 		const bool previous_vu0_acc_cache_current_opcode =
 			m_vu0_acc_cache_current_opcode;
+		const bool previous_vu0_vf_cache_current_opcode =
+			m_vu0_vf_cache_current_opcode;
 		m_vu0_acc_cache_current_opcode =
 			!branch_delay_slot && CanKeepVu0AccCacheAcrossOpcode(op);
+		m_vu0_vf_cache_current_opcode =
+			!branch_delay_slot && CanKeepVu0VfCacheAcrossOpcode(op);
 		if (!m_vu0_acc_cache_current_opcode && !EmitFlushVu0AccCache())
 		{
 			m_vu0_acc_cache_current_opcode =
 				previous_vu0_acc_cache_current_opcode;
+			m_vu0_vf_cache_current_opcode =
+				previous_vu0_vf_cache_current_opcode;
+			return false;
+		}
+		if (!m_vu0_vf_cache_current_opcode && !EmitFlushVu0VfCache())
+		{
+			m_vu0_acc_cache_current_opcode =
+				previous_vu0_acc_cache_current_opcode;
+			m_vu0_vf_cache_current_opcode =
+				previous_vu0_vf_cache_current_opcode;
 			return false;
 		}
 		m_current_opcode = op;
@@ -13387,14 +13419,18 @@ namespace VitaEE
 			BlockCompiler& compiler;
 			u32 previous;
 			bool previous_vu0_acc_cache_current_opcode;
+			bool previous_vu0_vf_cache_current_opcode;
 			~CurrentOpcodeScope()
 			{
 				compiler.m_current_opcode = previous;
 				compiler.m_vu0_acc_cache_current_opcode =
 					previous_vu0_acc_cache_current_opcode;
+				compiler.m_vu0_vf_cache_current_opcode =
+					previous_vu0_vf_cache_current_opcode;
 			}
 		} current_opcode_scope{
-			*this, previous_opcode, previous_vu0_acc_cache_current_opcode};
+			*this, previous_opcode, previous_vu0_acc_cache_current_opcode,
+			previous_vu0_vf_cache_current_opcode};
 
 		switch (op >> 26)
 		{
@@ -17439,6 +17475,41 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::CanKeepVu0VfCacheAcrossOpcode(u32 op) const
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!m_vu0_vf_cache_enabled)
+			return false;
+#endif
+		if (IsCop2MacroRuntimeNoOp(op) || IsCop2MacroClip(op))
+			return true;
+
+		const Cop2MacroArithmeticOp arithmetic =
+			DecodeCop2MacroArithmetic(op);
+		return arithmetic.valid &&
+			arithmetic.kind != Cop2MacroArithmeticKind::OpMula &&
+			arithmetic.kind != Cop2MacroArithmeticKind::OpMSub &&
+			!(arithmetic.addi_triace_hack && CHECK_VUADDSUBHACK);
+	}
+
+	bool BlockCompiler::EmitFlushVu0VfCache()
+	{
+		if (!m_vu0_vf_cache_valid)
+			return true;
+
+		if (!EmitVu0VfAddress(HOST_TMP0, m_vu0_vf_cache_reg) ||
+			!m_code.EmitVst1Q32Aligned(COP2_VF_CACHE_Q, HOST_TMP0))
+		{
+			return false;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCop2VfCacheFlushes++;
+#endif
+		m_vu0_vf_cache_flushes++;
+		m_vu0_vf_cache_valid = false;
+		return true;
+	}
+
 	bool BlockCompiler::EmitCOP2MacroBody(u32 op)
 	{
 		// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp macro helpers, and
@@ -17550,6 +17621,16 @@ namespace VitaEE
 			uses_acc_source && m_vu0_acc_cache_valid;
 		const bool cache_acc_destination = m_vu0_acc_cache_current_opcode &&
 			arithmetic.acc_destination && mask == 0x0f;
+		const bool cached_vf_fs = m_vu0_vf_cache_current_opcode &&
+			m_vu0_vf_cache_valid && m_vu0_vf_cache_reg == fs;
+		const bool uses_vf_ft =
+			arithmetic.operand == Cop2MacroArithmeticOperand::Vector ||
+			arithmetic.operand == Cop2MacroArithmeticOperand::BroadcastLane;
+		const bool cached_vf_ft = m_vu0_vf_cache_current_opcode &&
+			uses_vf_ft && m_vu0_vf_cache_valid &&
+			m_vu0_vf_cache_reg == ft;
+		const bool cache_vf_destination = m_vu0_vf_cache_current_opcode &&
+			!arithmetic.acc_destination && fd != 0 && mask == 0x0f;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!flag_needs.status)
 			g_qemuCop2DeadStatusFlagOps++;
@@ -17789,6 +17870,9 @@ namespace VitaEE
 
 			if (fd == 0)
 				return true;
+			if (cache_vf_destination)
+				return EmitMoveCoreToQWordLane(
+					COP2_VF_CACHE_Q, lane, HOST_TMP0);
 
 			return EmitVu0VfAddress(HOST_TMP2, fd) &&
 				   m_code.EmitStrImm12(HOST_TMP0, HOST_TMP2, static_cast<u16>(lane * sizeof(u32)));
@@ -17859,6 +17943,24 @@ namespace VitaEE
 #endif
 		};
 
+		const auto record_vf_cache_hit = [&]() {
+			m_vu0_vf_cache_hits++;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCop2VfCacheHits++;
+#endif
+		};
+
+		const auto emit_prepare_fs_quad = [&]() {
+			if (cached_vf_fs)
+			{
+				record_vf_cache_hit();
+				return m_code.EmitVorrQ(
+					QUAD_FS, COP2_VF_CACHE_Q, COP2_VF_CACHE_Q);
+			}
+			return EmitVu0VfAddress(HOST_TMP0, fs) &&
+				   m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0);
+		};
+
 		// Preloads the operand quad (Q2 / S8-S11) for the NEON-quad path. Mirrors
 		// emit_prepare_broadcast_operand(): vector forms load all four lanes, the
 		// broadcast/immediate forms replicate a single word across the quad.
@@ -17866,9 +17968,22 @@ namespace VitaEE
 			switch (arithmetic.operand)
 			{
 				case Cop2MacroArithmeticOperand::Vector:
+					if (cached_vf_ft)
+					{
+						record_vf_cache_hit();
+						return m_code.EmitVorrQ(
+							QUAD_FT, COP2_VF_CACHE_Q, COP2_VF_CACHE_Q);
+					}
 					return EmitVu0VfAddress(HOST_TMP0, ft) &&
 						   m_code.EmitVld1Q32Aligned(QUAD_FT, HOST_TMP0);
 				case Cop2MacroArithmeticOperand::BroadcastLane:
+					if (cached_vf_ft)
+					{
+						record_vf_cache_hit();
+						return m_code.EmitVdupI32QFromQlane(
+							QUAD_FT, COP2_VF_CACHE_Q,
+							static_cast<u8>(arithmetic.broadcast_lane));
+					}
 					return emit_load_vf_lane(HOST_TMP1, ft, arithmetic.broadcast_lane) &&
 						   m_code.EmitVdupI32QFromCore(QUAD_FT, HOST_TMP1);
 				case Cop2MacroArithmeticOperand::ImmediateI:
@@ -17881,6 +17996,29 @@ namespace VitaEE
 						   m_code.EmitVdupI32QFromCore(QUAD_FT, HOST_TMP1);
 			}
 			return false;
+		};
+
+		const auto emit_retire_vf_cache_for_result = [&]() {
+			if (!m_vu0_vf_cache_valid)
+				return true;
+			if (cache_vf_destination &&
+				fd == m_vu0_vf_cache_reg)
+			{
+				// The current full-mask destination kills the old value after
+				// both source snapshots have already been captured.
+				m_vu0_vf_cache_valid = false;
+				return true;
+			}
+			return EmitFlushVu0VfCache();
+		};
+
+		const auto mark_vf_cache_write = [&]() {
+			m_vu0_vf_cache_valid = true;
+			m_vu0_vf_cache_reg = static_cast<u8>(fd);
+			m_vu0_vf_cache_writes++;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCop2VfCacheWrites++;
+#endif
 		};
 
 		// Materializes the vuDouble() bit-select constants into Q8-Q11. Clobbers
@@ -17956,15 +18094,15 @@ namespace VitaEE
 				return true;
 
 			constexpr unsigned QUAD_RESULT = 3; // Q3 -> S12-S15
-			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
-				!m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0) ||
+			if (!emit_prepare_fs_quad() ||
 				!emit_prepare_operand_quad() ||
 				!emit_prepare_acc_quad() ||
 				!emit_ensure_norm_consts() ||
-				!emit_normalize_quad(QUAD_FS) ||
-				!emit_normalize_quad(QUAD_FT) ||
+				(!cached_vf_fs && !emit_normalize_quad(QUAD_FS)) ||
+				(!cached_vf_ft && !emit_normalize_quad(QUAD_FT)) ||
 				(uses_acc_source && !cached_acc_source &&
-					!emit_normalize_quad(QUAD_ACC)))
+					!emit_normalize_quad(QUAD_ACC)) ||
+				!emit_retire_vf_cache_for_result())
 			{
 				return false;
 			}
@@ -18029,6 +18167,11 @@ namespace VitaEE
 				return EmitVu0RegisterAddress(HOST_TMP1, VU0_ACC_OFFSET) &&
 					   EmitCOP2MacroStoreSelectedLanes(mask, QUAD_RESULT, HOST_TMP1);
 			}
+			if (cache_vf_destination)
+			{
+				mark_vf_cache_write();
+				return true;
+			}
 			return EmitCOP2MacroStoreVfSelectedLanes(
 				fd, mask, QUAD_RESULT, HOST_TMP1);
 		}
@@ -18050,15 +18193,15 @@ namespace VitaEE
 
 		if (use_quad)
 		{
-			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
-				!m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0) ||
+			if (!emit_prepare_fs_quad() ||
 				!emit_prepare_operand_quad() ||
 				!emit_prepare_acc_quad() ||
 				!emit_ensure_norm_consts() ||
-				!emit_normalize_quad(QUAD_FS) ||
-				!emit_normalize_quad(QUAD_FT) ||
+				(!cached_vf_fs && !emit_normalize_quad(QUAD_FS)) ||
+				(!cached_vf_ft && !emit_normalize_quad(QUAD_FT)) ||
 				(uses_acc_source && !cached_acc_source &&
-					!emit_normalize_quad(QUAD_ACC)))
+					!emit_normalize_quad(QUAD_ACC)) ||
+				!emit_retire_vf_cache_for_result())
 			{
 				return false;
 			}
@@ -18076,39 +18219,42 @@ namespace VitaEE
 				const unsigned fs_s = QUAD_FS * 4 + lane;
 				const unsigned ft_s = QUAD_FT * 4 + lane;
 				const unsigned acc_s = QUAD_ACC * 4 + lane;
+				const unsigned result_s = cache_vf_destination ?
+					COP2_VF_CACHE_Q * 4 + lane :
+					VFP_QUAD_RESULT_S12;
 				switch (arithmetic.kind)
 	{
 					case Cop2MacroArithmeticKind::Add:
-						if (!m_code.EmitVaddF32(VFP_QUAD_RESULT_S12, fs_s, ft_s))
+						if (!m_code.EmitVaddF32(result_s, fs_s, ft_s))
 							return false;
 						break;
 					case Cop2MacroArithmeticKind::Sub:
-						if (!m_code.EmitVsubF32(VFP_QUAD_RESULT_S12, fs_s, ft_s))
+						if (!m_code.EmitVsubF32(result_s, fs_s, ft_s))
 							return false;
 						break;
 					case Cop2MacroArithmeticKind::Mul:
 					case Cop2MacroArithmeticKind::OpMula:
-						if (!m_code.EmitVmulF32(VFP_QUAD_RESULT_S12, fs_s, ft_s))
+						if (!m_code.EmitVmulF32(result_s, fs_s, ft_s))
 							return false;
 						break;
 					case Cop2MacroArithmeticKind::MAdd:
-						if (!m_code.EmitVmulF32(VFP_QUAD_RESULT_S12, fs_s, ft_s) ||
-							!m_code.EmitVaddF32(VFP_QUAD_RESULT_S12, acc_s, VFP_QUAD_RESULT_S12))
+						if (!m_code.EmitVmulF32(result_s, fs_s, ft_s) ||
+							!m_code.EmitVaddF32(result_s, acc_s, result_s))
 						{
 							return false;
 						}
 						break;
 					case Cop2MacroArithmeticKind::MSub:
 					case Cop2MacroArithmeticKind::OpMSub:
-						if (!m_code.EmitVmulF32(VFP_QUAD_RESULT_S12, fs_s, ft_s) ||
-							!m_code.EmitVsubF32(VFP_QUAD_RESULT_S12, acc_s, VFP_QUAD_RESULT_S12))
+						if (!m_code.EmitVmulF32(result_s, fs_s, ft_s) ||
+							!m_code.EmitVsubF32(result_s, acc_s, result_s))
 						{
 							return false;
 						}
 						break;
 	}
 
-				if (!m_code.EmitVmovSToCore(HOST_TMP0, VFP_QUAD_RESULT_S12) ||
+				if (!m_code.EmitVmovSToCore(HOST_TMP0, result_s) ||
 					!emit_update_mac_lane(lane) ||
 					!emit_store_result(lane))
 	{
@@ -18120,6 +18266,8 @@ namespace VitaEE
 				return false;
 			if (cache_acc_destination)
 				mark_acc_cache_write();
+			if (cache_vf_destination)
+				mark_vf_cache_write();
 			return true;
 		}
 
@@ -18722,9 +18870,25 @@ namespace VitaEE
 
 		const unsigned ft = RT(op);
 		const unsigned fs = RD(op);
+		const bool cached_ft = m_vu0_vf_cache_current_opcode &&
+			m_vu0_vf_cache_valid && m_vu0_vf_cache_reg == ft;
+		const bool cached_fs = m_vu0_vf_cache_current_opcode &&
+			m_vu0_vf_cache_valid && m_vu0_vf_cache_reg == fs;
+		const auto record_vf_cache_hit = [&]() {
+			m_vu0_vf_cache_hits++;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCop2VfCacheHits++;
+#endif
+		};
 
-		if (!EmitVu0VfAddress(HOST_TMP0, ft) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(3 * sizeof(u32))) ||
+		const bool ft_loaded = cached_ft ?
+			(record_vf_cache_hit(),
+				m_code.EmitVmovSToCore(
+					HOST_TMP1, COP2_VF_CACHE_Q * 4 + 3)) :
+			(EmitVu0VfAddress(HOST_TMP0, ft) &&
+				m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0,
+					static_cast<u16>(3 * sizeof(u32))));
+		if (!ft_loaded ||
 			!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP1, FPU_FLOAT_EXPONENT_MASK, HOST_TMP3, true))
 		{
 			return false;
@@ -18753,8 +18917,14 @@ namespace VitaEE
 		constexpr unsigned NEON_FS_NEG = 1;
 		constexpr unsigned NEON_LIMIT = 2;
 		constexpr unsigned NEON_SIGN = 3;
-		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
-			!m_code.EmitVld1Q32Aligned(NEON_FS_POS, HOST_TMP0) ||
+		const bool fs_loaded = cached_fs ?
+			(record_vf_cache_hit(),
+				m_code.EmitVorrQ(
+					NEON_FS_POS, COP2_VF_CACHE_Q, COP2_VF_CACHE_Q)) :
+			(EmitVu0VfAddress(HOST_TMP0, fs) &&
+				m_code.EmitVld1Q32Aligned(NEON_FS_POS, HOST_TMP0));
+		if (!fs_loaded ||
+			!EmitFlushVu0VfCache() ||
 			!m_code.EmitVdupI32QFromCore(NEON_LIMIT, HOST_TMP2) ||
 			!m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_SIGN_MASK) ||
 			!m_code.EmitVdupI32QFromCore(NEON_SIGN, HOST_TMP3) ||
