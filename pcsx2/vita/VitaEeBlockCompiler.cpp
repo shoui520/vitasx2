@@ -486,6 +486,14 @@ u32 g_qemuWordCopyScalarIterations = 0;
 u32 g_qemuWordCopyPageReturns = 0;
 u32 g_qemuWordCopyRedispatches = 0;
 bool g_qemuWordCopyForceRedispatch = false;
+u32 g_qemuByteCopyCountdownBlocks = 0;
+u32 g_qemuByteCopyCountdownHelperCalls = 0;
+u32 g_qemuByteCopyCountdownBulkChunks = 0;
+u32 g_qemuByteCopyCountdownBulkBytes = 0;
+u32 g_qemuByteCopyCountdownScalarIterations = 0;
+u32 g_qemuByteCopyCountdownPageReturns = 0;
+u32 g_qemuByteCopyCountdownRedispatches = 0;
+bool g_qemuByteCopyCountdownForceRedispatch = false;
 u32 g_qemuGsCsrVsintPollBlocks = 0;
 u32 g_qemuGsCsrVsintPollHelperCalls = 0;
 u32 g_qemuGsCsrVsintPollFastForwards = 0;
@@ -3505,6 +3513,52 @@ namespace VitaEE
 			*destination_guest = destination;
 		if (end_guest)
 			*end_guest = end;
+		return true;
+	}
+
+	bool BlockCompiler::IsExactByteCopyCountdownLoop(u32 start_pc,
+		u32 instruction_count, unsigned* value_guest, unsigned* source_guest,
+		unsigned* destination_guest, unsigned* countdown_guest)
+	{
+		if (instruction_count != 7 || start_pc > UINT32_MAX - 7 * sizeof(u32))
+			return false;
+
+		u32 ops[7]{};
+		for (u32 i = 0; i < instruction_count; i++)
+			ops[i] = memRead32(start_pc + i * sizeof(u32));
+		const unsigned value = RT(ops[0]);
+		const unsigned source = RS(ops[0]);
+		const unsigned countdown = RT(ops[1]);
+		const unsigned destination = RS(ops[2]);
+		const u32 guest_mask = (1u << value) | (1u << source) |
+			(1u << destination) | (1u << countdown);
+		if (value == 0 || source == 0 || destination == 0 || countdown == 0 ||
+			std::popcount(guest_mask) != 4 ||
+			(ops[0] >> 26) != 0x24 || IMM_S(ops[0]) != 0 ||
+			(ops[1] >> 26) != 0x09 || RS(ops[1]) != countdown ||
+			RT(ops[1]) != countdown || IMM_S(ops[1]) != -1 ||
+			(ops[2] >> 26) != 0x28 || RT(ops[2]) != value ||
+			IMM_S(ops[2]) != 0 ||
+			(ops[3] >> 26) != 0x09 || RS(ops[3]) != source ||
+			RT(ops[3]) != source || IMM_S(ops[3]) != 1 ||
+			(ops[4] >> 26) != 0x09 || RS(ops[4]) != destination ||
+			RT(ops[4]) != destination || IMM_S(ops[4]) != 1 ||
+			(ops[5] >> 26) != 0x05 || RS(ops[5]) != countdown ||
+			RT(ops[5]) != 0 ||
+			BranchTarget(start_pc + 5 * sizeof(u32), ops[5]) != start_pc ||
+			ops[6] != 0)
+		{
+			return false;
+		}
+
+		if (value_guest)
+			*value_guest = value;
+		if (source_guest)
+			*source_guest = source;
+		if (destination_guest)
+			*destination_guest = destination;
+		if (countdown_guest)
+			*countdown_guest = countdown;
 		return true;
 	}
 
@@ -11615,6 +11669,117 @@ namespace VitaEE
 		return true;
 	}
 
+	bool BlockCompiler::CompileByteCopyCountdownLoop(u32 start_pc,
+		u32 instruction_count, const void* direct_exit, const void* event_exit,
+		u32* scaled_cycles, DirectLinkSlots* direct_links,
+		size_t* linked_entry_offset)
+	{
+		unsigned value_guest = 0;
+		unsigned source_guest = 0;
+		unsigned destination_guest = 0;
+		unsigned countdown_guest = 0;
+		if (!direct_exit || !event_exit || !direct_links ||
+			!IsExactByteCopyCountdownLoop(start_pc, instruction_count,
+				&value_guest, &source_guest, &destination_guest,
+				&countdown_guest))
+		{
+			return false;
+		}
+
+		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
+		const auto range_cycles = [&](u32 count) {
+			u32 raw_cycles = 0;
+			for (u32 i = 0; i < count; i++)
+			{
+				const u32 op = memRead32(start_pc + i * sizeof(u32));
+				raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) *
+					cycle_factor;
+			}
+			return ScaleBlockCycles(raw_cycles);
+		};
+		const u32 block_cycles = range_cycles(instruction_count);
+		const u32 load_cycles = range_cycles(1);
+		if (block_cycles == 0 || block_cycles > 0xffff || load_cycles > 0xffff)
+			return false;
+		if (scaled_cycles)
+			*scaled_cycles = block_cycles;
+
+		m_gpr_q_cache_enabled = false;
+		m_staged_pin_count = 0;
+		m_gpr_link_signature = GprLinkSignature{};
+		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
+		const u32 packed_cycles = block_cycles | (load_cycles << 16);
+		const u32 packed_guests = value_guest | (source_guest << 5) |
+			(destination_guest << 10) | (countdown_guest << 15);
+		if (!BeginBlock(false, false, false, linked_entry_offset) ||
+			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
+			!m_code.EmitMovImm32(HOST_TMP2, packed_cycles) ||
+			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
+			!m_code.EmitCallAbsolute(
+				reinterpret_cast<const void*>(&VitaEeExecuteByteCopyCountdown)) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, VITA_EE_BYTE_COPY_COUNTDOWN_EVENT))
+		{
+			return false;
+		}
+
+		const size_t event_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (event_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0,
+				VITA_EE_BYTE_COPY_COUNTDOWN_REDISPATCH))
+		{
+			return false;
+		}
+		const size_t redispatch_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (redispatch_branch == static_cast<size_t>(-1) ||
+			!m_code.EmitCmpImm32(HOST_TMP0, VITA_EE_BYTE_COPY_COUNTDOWN_SELF))
+		{
+			return false;
+		}
+		const size_t self_branch =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (self_branch == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
+		{
+			return false;
+		}
+
+		const size_t self_target = m_code.Size();
+		if (!m_code.PatchBranch(self_branch, self_target,
+				VitaA32::Condition::EQ) ||
+			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
+		{
+			return false;
+		}
+		const size_t redispatch_target = m_code.Size();
+		if (!m_code.PatchBranch(redispatch_branch, redispatch_target,
+				VitaA32::Condition::EQ) ||
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
+		{
+			return false;
+		}
+		const size_t event_target = m_code.Size();
+		if (!m_code.PatchBranch(event_branch, event_target,
+				VitaA32::Condition::EQ) ||
+			!EmitEventExitReturn(event_exit))
+		{
+			return false;
+		}
+
+		direct_links->slots[0].target_pc = fallthrough_pc;
+		direct_links->slots[0].valid = true;
+		direct_links->slots[1].target_pc = start_pc;
+		direct_links->slots[1].valid = true;
+		VitaPerformanceTelemetry::
+			RecordEeByteCopyCountdownCompileIfProfiling();
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuByteCopyCountdownBlocks++;
+#endif
+		return true;
+	}
+
 	bool BlockCompiler::CompileSignedCountdownLoop(u32 start_pc, u32 instruction_count,
 		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -11966,6 +12131,13 @@ namespace VitaEE
 		{
 			return CompileWordCopyLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
+		}
+		if (memory_range_loop_batch_enabled && direct_links &&
+			IsExactByteCopyCountdownLoop(start_pc, instruction_count))
+		{
+			return CompileByteCopyCountdownLoop(start_pc, instruction_count,
+				direct_exit, event_exit, scaled_cycles, direct_links,
+				linked_entry_offset);
 		}
 		if (memory_range_loop_batch_enabled && direct_links &&
 			IsExactSelfAddressPairScan(start_pc, instruction_count))

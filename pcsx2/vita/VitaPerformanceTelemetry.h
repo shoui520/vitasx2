@@ -318,6 +318,14 @@ namespace VitaPerformanceTelemetry
 		u64 ee_hot_region_conditional_promotions = 0;
 		u64 ee_hot_region_source_cycles = 0;
 		u64 ee_hot_region_successor_cycles = 0;
+		u64 ee_byte_copy_countdown_blocks = 0;
+		u64 ee_byte_copy_countdown_helper_calls = 0;
+		u64 ee_byte_copy_countdown_bulk_chunks = 0;
+		u64 ee_byte_copy_countdown_bulk_bytes = 0;
+		u64 ee_byte_copy_countdown_scalar_iterations = 0;
+		u64 ee_byte_copy_countdown_page_returns = 0;
+		u64 ee_byte_copy_countdown_redispatches = 0;
+		u64 ee_byte_copy_countdown_counter_exits = 0;
 		u64 iop_compile_observations = 0;
 		u64 iop_compile_time_us = 0;
 		u64 iop_hot_region_provider_samples = 0;
@@ -459,6 +467,10 @@ namespace VitaPerformanceTelemetry
 	void RecordEeHotRegionAttempt();
 	void RecordEeHotRegionPromotion(
 		u32 source_cycles, u32 successor_cycles, bool conditional);
+	void RecordEeByteCopyCountdownCompile();
+	void RecordEeByteCopyCountdownExecution(u32 bulk_bytes,
+		bool scalar_iteration, bool page_return, bool redispatch,
+		bool counter_exit);
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
 		bool callback_due);
@@ -653,6 +665,33 @@ namespace VitaPerformanceTelemetry
 		(void)source_cycles;
 		(void)successor_cycles;
 		(void)conditional;
+#endif
+	}
+
+	inline void RecordEeByteCopyCountdownCompileIfProfiling()
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordEeByteCopyCountdownCompile();
+#endif
+	}
+
+	inline void RecordEeByteCopyCountdownExecutionIfProfiling(u32 bulk_bytes,
+		bool scalar_iteration, bool page_return, bool redispatch,
+		bool counter_exit)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+		{
+			RecordEeByteCopyCountdownExecution(bulk_bytes,
+				scalar_iteration, page_return, redispatch, counter_exit);
+		}
+#else
+		(void)bulk_bytes;
+		(void)scalar_iteration;
+		(void)page_return;
+		(void)redispatch;
+		(void)counter_exit;
 #endif
 	}
 

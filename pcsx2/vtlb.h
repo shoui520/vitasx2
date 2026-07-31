@@ -334,6 +334,21 @@ enum VitaEeWordCopyResult : u32
 u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
 	u32 packed_cycles, u32 packed_guests);
 
+enum VitaEeByteCopyCountdownResult : u32
+{
+	VITA_EE_BYTE_COPY_COUNTDOWN_COMPLETE = 0,
+	VITA_EE_BYTE_COPY_COUNTDOWN_SELF = 1,
+	VITA_EE_BYTE_COPY_COUNTDOWN_EVENT = 2,
+	VITA_EE_BYTE_COPY_COUNTDOWN_REDISPATCH = 3,
+};
+
+// Executes the exact LBU/ADDIU-count/SB/ADDIU-source/ADDIU-destination/
+// BNE/NOP forward byte-copy loop. Direct source/destination pages batch to
+// count completion, either page, or event; observable mappings execute one
+// architecturally ordered iteration.
+u32 VitaEeExecuteByteCopyCountdown(u32 start_pc, u32 fallthrough_pc,
+	u32 packed_cycles, u32 packed_guests);
+
 // --------------------------------------------------------------------------------------
 //  Goemon game fix
 // --------------------------------------------------------------------------------------

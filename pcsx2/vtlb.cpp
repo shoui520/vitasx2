@@ -1202,6 +1202,189 @@ u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
 	return VITA_EE_WORD_COPY_SELF;
 }
 
+u32 VitaEeExecuteByteCopyCountdown(u32 start_pc, u32 fallthrough_pc,
+	u32 packed_cycles, u32 packed_guests)
+{
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::EeHelper);
+	// PCSX2 owners: x86/ix86-32/iR5900LoadStore.cpp::recLBU()/recSB(),
+	// iR5900AritImm.cpp::recADDIU(), iR5900Branch.cpp::recBNE(),
+	// recVTLB.cpp::DynGen_DirectRead()/DynGen_DirectWrite(), and
+	// iR5900.cpp::iBranchTest().
+	const unsigned value_guest = packed_guests & 0x1f;
+	const unsigned source_guest = (packed_guests >> 5) & 0x1f;
+	const unsigned destination_guest = (packed_guests >> 10) & 0x1f;
+	const unsigned countdown_guest = (packed_guests >> 15) & 0x1f;
+	const u32 block_cycles = packed_cycles & 0xffff;
+	const u32 load_cycles = packed_cycles >> 16;
+	const u32 source_address = cpuRegs.GPR.r[source_guest].UL[0];
+	const u32 destination_address = cpuRegs.GPR.r[destination_guest].UL[0];
+	const u32 countdown_low = cpuRegs.GPR.r[countdown_guest].UL[0];
+	u32 iterations = 1;
+	bool state_published = false;
+	bool force_redispatch = false;
+	bool direct_bulk = false;
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	extern u32 g_qemuByteCopyCountdownHelperCalls;
+	extern u32 g_qemuByteCopyCountdownBulkChunks;
+	extern u32 g_qemuByteCopyCountdownBulkBytes;
+	extern u32 g_qemuByteCopyCountdownScalarIterations;
+	extern u32 g_qemuByteCopyCountdownPageReturns;
+	extern u32 g_qemuByteCopyCountdownRedispatches;
+	extern bool g_qemuByteCopyCountdownForceRedispatch;
+	g_qemuByteCopyCountdownHelperCalls++;
+#endif
+
+	const VTLBVirtual source_mapping =
+		vtlbdata.vmap[source_address >> VTLB_PAGE_BITS];
+	const VTLBVirtual destination_mapping =
+		vtlbdata.vmap[destination_address >> VTLB_PAGE_BITS];
+	bool destination_protected = false;
+	u32 destination_physical = 0;
+	if (!destination_mapping.isHandler(destination_address))
+	{
+		destination_protected = VitaEeGetDirectRamProtection(
+			destination_mapping, destination_address, &destination_physical);
+#if defined(VITASX2_QEMU_VALIDATION)
+		destination_protected |= g_qemuByteCopyCountdownForceRedispatch;
+#endif
+	}
+	const u32 source_bytes_to_page =
+		VTLB_PAGE_SIZE - (source_address & VTLB_PAGE_MASK);
+	const u32 destination_bytes_to_page =
+		VTLB_PAGE_SIZE - (destination_address & VTLB_PAGE_MASK);
+	const bool batchable = !source_mapping.isHandler(source_address) &&
+		!destination_mapping.isHandler(destination_address) &&
+		!destination_protected &&
+		(source_address & 0xffffe000u) != 0x10000000u &&
+		block_cycles != 0;
+	if (batchable)
+	{
+		iterations = std::min(source_bytes_to_page, destination_bytes_to_page);
+		if (countdown_low != 0)
+			iterations = std::min(iterations, countdown_low);
+
+		const s32 cycle_delta = static_cast<s32>(
+			static_cast<u32>(cpuRegs.cycle) -
+			static_cast<u32>(cpuRegs.nextEventCycle));
+		const u32 to_event = cycle_delta >= 0 ? 1u : static_cast<u32>(
+			(-static_cast<s64>(cycle_delta) + block_cycles - 1) /
+			block_cycles);
+		iterations = std::min(iterations, to_event);
+
+		const u8* const source_host =
+			reinterpret_cast<const u8*>(source_mapping.assumePtr(source_address));
+		u8* const destination_host =
+			reinterpret_cast<u8*>(destination_mapping.assumePtr(
+				destination_address));
+		u8 last_value = 0;
+		const uptr source_begin = reinterpret_cast<uptr>(source_host);
+		const uptr destination_begin = reinterpret_cast<uptr>(destination_host);
+		const bool disjoint =
+			source_begin + iterations <= destination_begin ||
+			destination_begin + iterations <= source_begin;
+		if (disjoint)
+		{
+			last_value = source_host[iterations - 1];
+			std::memcpy(destination_host, source_host, iterations);
+		}
+		else
+		{
+			// The guest is a forward load-then-store recurrence. A destination
+			// ahead of the source can overwrite bytes consumed by later
+			// iterations, which neither memcpy nor memmove is required to model.
+			for (u32 i = 0; i < iterations; i++)
+			{
+				last_value = source_host[i];
+				destination_host[i] = last_value;
+			}
+		}
+		force_redispatch |=
+			NotifyVitaEeRamWrite(destination_host, iterations) != 0;
+		cpuRegs.GPR.r[value_guest].UD[0] = last_value;
+		direct_bulk = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuByteCopyCountdownBulkChunks++;
+		g_qemuByteCopyCountdownBulkBytes += iterations;
+#endif
+	}
+	else
+	{
+		const u8 value = vtlb_memRead<mem8_t>(source_address);
+		cpuRegs.GPR.r[value_guest].UD[0] = value;
+		if ((source_address & 0xffffe000u) == 0x10000000u)
+		{
+			// EmitCounterReadEventExit() publishes the post-LBU seam before the
+			// countdown ADDIU, store, pointer advances, and branch.
+			cpuRegs.pc = start_pc + sizeof(u32);
+			cpuRegs.cycle += load_cycles;
+			VitaPerformanceTelemetry::
+				RecordEeByteCopyCountdownExecutionIfProfiling(
+					0, false, false, false, true);
+			return VITA_EE_BYTE_COPY_COUNTDOWN_EVENT;
+		}
+
+		const u32 updated_countdown = countdown_low - 1;
+		cpuRegs.GPR.r[countdown_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(updated_countdown)));
+		vtlb_memWrite<mem8_t>(destination_address, value);
+		if (destination_protected)
+		{
+			force_redispatch = true;
+			if (Cpu && Cpu->Clear)
+				Cpu->Clear(destination_physical & ~3u, 1);
+		}
+		cpuRegs.GPR.r[source_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(source_address + 1)));
+		cpuRegs.GPR.r[destination_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(destination_address + 1)));
+		state_published = true;
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuByteCopyCountdownScalarIterations++;
+#endif
+	}
+
+	if (!state_published)
+	{
+		cpuRegs.GPR.r[countdown_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(countdown_low - iterations)));
+		cpuRegs.GPR.r[source_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(source_address + iterations)));
+		cpuRegs.GPR.r[destination_guest].UD[0] = static_cast<u64>(
+			static_cast<s64>(static_cast<s32>(
+				destination_address + iterations)));
+	}
+	cpuRegs.cycle += static_cast<u64>(iterations) * block_cycles;
+	const bool repeat = cpuRegs.GPR.r[countdown_guest].UD[0] != 0;
+	cpuRegs.pc = repeat ? start_pc : fallthrough_pc;
+	const bool event_due = static_cast<s32>(
+		static_cast<u32>(cpuRegs.cycle) -
+		static_cast<u32>(cpuRegs.nextEventCycle)) >= 0;
+	const bool page_return = direct_bulk && repeat && !event_due &&
+		!force_redispatch;
+	VitaPerformanceTelemetry::
+		RecordEeByteCopyCountdownExecutionIfProfiling(
+			direct_bulk ? iterations : 0, !direct_bulk, page_return,
+			force_redispatch, false);
+	if (event_due)
+		return VITA_EE_BYTE_COPY_COUNTDOWN_EVENT;
+	if (force_redispatch)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuByteCopyCountdownRedispatches++;
+#endif
+		return VITA_EE_BYTE_COPY_COUNTDOWN_REDISPATCH;
+	}
+	if (!repeat)
+		return VITA_EE_BYTE_COPY_COUNTDOWN_COMPLETE;
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (direct_bulk)
+		g_qemuByteCopyCountdownPageReturns++;
+#endif
+	return VITA_EE_BYTE_COPY_COUNTDOWN_SELF;
+}
+
 template <typename DataType>
 DataType vtlb_ramRead(u32 addr, bool* result)
 {

@@ -1683,6 +1683,44 @@ namespace MTGS
 					end.cpu_stage_profiler.ee_hot_region_successor_cycles,
 					start.cpu_stage_profiler.ee_hot_region_successor_cycles)));
 			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=ee_byte_copy_countdown "
+				"blocks=%llu helper_calls=%llu bulk_chunks=%llu "
+				"bulk_bytes=%llu scalar_iterations=%llu page_returns=%llu "
+				"redispatches=%llu counter_exits=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_byte_copy_countdown_blocks,
+					start.cpu_stage_profiler.ee_byte_copy_countdown_blocks)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler
+						.ee_byte_copy_countdown_helper_calls,
+					start.cpu_stage_profiler
+						.ee_byte_copy_countdown_helper_calls)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_byte_copy_countdown_bulk_chunks,
+					start.cpu_stage_profiler
+						.ee_byte_copy_countdown_bulk_chunks)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_byte_copy_countdown_bulk_bytes,
+					start.cpu_stage_profiler.ee_byte_copy_countdown_bulk_bytes)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler
+						.ee_byte_copy_countdown_scalar_iterations,
+					start.cpu_stage_profiler
+						.ee_byte_copy_countdown_scalar_iterations)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_byte_copy_countdown_page_returns,
+					start.cpu_stage_profiler
+						.ee_byte_copy_countdown_page_returns)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_byte_copy_countdown_redispatches,
+					start.cpu_stage_profiler
+						.ee_byte_copy_countdown_redispatches)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_byte_copy_countdown_counter_exits,
+					start.cpu_stage_profiler
+						.ee_byte_copy_countdown_counter_exits)));
+			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=iop_hot_regions "
 				"provider_samples=%llu selections=%llu attempts=%llu "
 				"promotions=%llu source_cycles=%llu successor_cycles=%llu",
