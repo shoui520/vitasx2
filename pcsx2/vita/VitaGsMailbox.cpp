@@ -1925,7 +1925,8 @@ namespace MTGS
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_codegen integer=%llu branch=%llu "
 			"gpr_load=%llu gpr_store=%llu mmi=%llu cop0=%llu cop1=%llu cop2=%llu "
-			"cop2_runtime_noop=%llu other=%llu poll_call_wait=%llu "
+			"cop2_runtime_noop=%llu vu0_acc_cache=%llu:%llu:%llu "
+			"other=%llu poll_call_wait=%llu "
 			"multi_range_poll_call_wait=%llu "
 			"poll_call_additional_watches=%llu two_predicate_wait=%llu "
 			"largest_pc=0x%08x largest_guest=%u largest_host=%u "
@@ -1961,6 +1962,15 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_cop2_runtime_noop_instructions,
 				start.ee.generated_cop2_runtime_noop_instructions)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_vu0_acc_cache_writes,
+				start.ee.generated_vu0_acc_cache_writes)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_vu0_acc_cache_hits,
+				start.ee.generated_vu0_acc_cache_hits)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_vu0_acc_cache_flushes,
+				start.ee.generated_vu0_acc_cache_flushes)),
 			static_cast<unsigned long long>(CounterDelta(end.ee.generated_other_instructions,
 				start.ee.generated_other_instructions)),
 			static_cast<unsigned long long>(CounterDelta(

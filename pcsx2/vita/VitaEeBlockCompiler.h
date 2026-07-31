@@ -686,6 +686,10 @@ namespace VitaEE
 		{
 			m_direct_link_rejection_profiling_enabled = enabled;
 		}
+		void SetVu0AccCacheEnabled(bool enabled)
+		{
+			m_vu0_acc_cache_enabled = enabled;
+		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -693,6 +697,9 @@ namespace VitaEE
 		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 branch_op, u32 delay_op);
+		u32 GetVu0AccCacheWrites() const { return m_vu0_acc_cache_writes; }
+		u32 GetVu0AccCacheHits() const { return m_vu0_acc_cache_hits; }
+		u32 GetVu0AccCacheFlushes() const { return m_vu0_acc_cache_flushes; }
 		static bool IsExactPreincrementByteZeroFillLoop(u32 start_pc, u32 instruction_count,
 			unsigned* pointer_guest = nullptr, unsigned* end_guest = nullptr);
 		static bool IsExactFourWordFillLoop(u32 start_pc, u32 instruction_count,
@@ -953,6 +960,8 @@ namespace VitaEE
 		bool EmitCOP2MacroStoreSelectedLanes(unsigned mask, unsigned value_qreg, unsigned address_reg);
 		bool EmitCOP2MacroStoreVfSelectedLanes(unsigned vf_reg, unsigned mask, unsigned value_qreg,
 			unsigned address_reg);
+		bool CanKeepVu0AccCacheAcrossOpcode(u32 op) const;
+		bool EmitFlushVu0AccCache();
 		bool EmitCOP2MacroBody(u32 op);
 		bool EmitCOP2MacroArithmeticBody(u32 op);
 		bool EmitCOP2MacroViBody(u32 op);
@@ -1667,11 +1676,21 @@ namespace VitaEE
 		bool m_cop1_fpr_normalized[32]{};
 		bool m_cop1_acc_normalized = false;
 		// True once the vuDouble() bit-select constant quads (physical Q8-Q11)
-		// have been materialized in this block. Physical Q12-Q15 are ephemeral
-		// normalize scratch in COP2 macro blocks and back the private ABI's logical
-		// Q4-Q7 bank in qcache blocks; the block classifier makes those roles
-		// mutually exclusive. Reset per block in BeginBlock().
+		// have been materialized in this block. Physical Q12/Q13/Q15 are
+		// ephemeral normalize scratch; Q14 is the ACC cache below. Q12-Q15 also
+		// back the private ABI's logical Q4-Q7 bank in qcache blocks; the block
+		// classifier makes those roles mutually exclusive. Reset in BeginBlock().
 		bool m_cop2_norm_consts_ready = false;
+		// A complete normalized ACC value produced by a full-mask macro
+		// arithmetic instruction. Logical Q6 maps to physical Q14, which is
+		// caller-clobbered under the existing private vector ABI and is not used
+		// by the GPR qcache in COP2 arithmetic blocks. The value never crosses a
+		// block, helper, branch, trace, or architectural observer.
+		bool m_vu0_acc_cache_valid = false;
+		bool m_vu0_acc_cache_current_opcode = false;
+		u32 m_vu0_acc_cache_writes = 0;
+		u32 m_vu0_acc_cache_hits = 0;
+		u32 m_vu0_acc_cache_flushes = 0;
 		// Once an in-block TLB write has executed, suffix memory operations must
 		// not embed a compile-time vmv.assumePtr() from the preceding mapping.
 		bool m_runtime_tlb_mapping_may_have_changed = false;
@@ -1687,6 +1706,7 @@ namespace VitaEE
 		bool m_compatible_vtlb_write_guard_hoist_enabled = true;
 		bool m_compatible_vtlb_read_guard_hoist_enabled = true;
 		bool m_direct_link_rejection_profiling_enabled = false;
+		bool m_vu0_acc_cache_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;

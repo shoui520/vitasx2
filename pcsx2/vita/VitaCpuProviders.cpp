@@ -2137,7 +2137,8 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	u64 helper_call_instructions, u64 state_load_instructions,
 	u64 state_store_instructions, bool poll_call_wait_loop,
 	u32 poll_call_wait_additional_ram_watches,
-	bool two_predicate_wait_loop)
+	bool two_predicate_wait_loop, u32 vu0_acc_cache_writes,
+	u32 vu0_acc_cache_hits, u32 vu0_acc_cache_flushes)
 {
 	s_ee_a32_stats.generated_blocks++;
 	s_ee_a32_stats.generated_host_instructions += host_instructions;
@@ -2157,6 +2158,11 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	s_ee_a32_stats.generated_cop2_instructions += guest_mix.cop2;
 	s_ee_a32_stats.generated_cop2_runtime_noop_instructions +=
 		guest_mix.cop2_runtime_noop;
+	s_ee_a32_stats.generated_vu0_acc_cache_writes +=
+		vu0_acc_cache_writes;
+	s_ee_a32_stats.generated_vu0_acc_cache_hits += vu0_acc_cache_hits;
+	s_ee_a32_stats.generated_vu0_acc_cache_flushes +=
+		vu0_acc_cache_flushes;
 	s_ee_a32_stats.generated_other_instructions += guest_mix.other;
 	s_ee_a32_stats.generated_poll_call_wait_blocks +=
 		poll_call_wait_loop ? 1u : 0u;

@@ -236,6 +236,9 @@ u32 g_qemuCop2DeadStatusFlagOps = 0;
 u32 g_qemuCop2DeadMacFlagOps = 0;
 u32 g_qemuCop2ResultOnlyQuadOps = 0;
 u32 g_qemuCop2RuntimeNoOpsElided = 0;
+u32 g_qemuCop2AccCacheWrites = 0;
+u32 g_qemuCop2AccCacheHits = 0;
+u32 g_qemuCop2AccCacheFlushes = 0;
 u32 g_qemuCop2RawGpr0Qmtc2ZeroFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheDirectStores = 0;
@@ -538,6 +541,10 @@ namespace VitaEE
 		// measured handler replacement in the raw fixed-point cycle domain and
 		// use one value for generated execution and code-budget split analysis.
 		constexpr u32 FLUSH_CACHE_RAW_CYCLE_CHARGE = 5650;
+		// Logical Q6 maps to caller-clobbered physical Q14. COP2 arithmetic
+		// blocks cannot also enable the GPR qword cache, and the vuDouble()
+		// lowering below deliberately leaves physical Q14 unused.
+		constexpr unsigned COP2_ACC_CACHE_Q = 6;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_COMPLETE = 0;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_EVENT = 1;
 		constexpr u32 POLL_CALL_CYCLE_BITS = 10;
@@ -10689,6 +10696,11 @@ namespace VitaEE
 		ClearSaConstState();
 		ClearCop1NormalizedState();
 		m_cop2_norm_consts_ready = false;
+		m_vu0_acc_cache_valid = false;
+		m_vu0_acc_cache_current_opcode = false;
+		m_vu0_acc_cache_writes = 0;
+		m_vu0_acc_cache_hits = 0;
+		m_vu0_acc_cache_flushes = 0;
 		m_runtime_tlb_mapping_may_have_changed = false;
 		for (unsigned i = 0; i < MAX_GPR_PINS; i++)
 		{
@@ -12594,6 +12606,12 @@ namespace VitaEE
 					!CanCompileDelaySlotOpcode(delay_op) &&
 					CanCompileDelaySlotOpcode(op, delay_op);
 
+				// A block-local VU0 ACC value cannot cross either branch arm.
+				// Materialize it before producing the predicate so likely
+				// not-taken paths cannot reach a shared flush with an undefined
+				// vector register.
+				if (!EmitFlushVu0AccCache())
+					return false;
 				add_raw_cycles(op);
 				if (!EmitDeviceTracePreInstruction(pc))
 					return false;
@@ -12899,6 +12917,11 @@ namespace VitaEE
 			{
 				return false;
 			}
+			// Trace callbacks are architectural observers before the current
+			// instruction. Product builds emit no trace call and retain ACC
+			// across compatible macro arithmetic.
+			if (device_trace_enabled && !EmitFlushVu0AccCache())
+				return false;
 			if (!EmitDeviceTracePreInstruction(pc))
 				return false;
 			if (IsDI(op))
@@ -13046,6 +13069,8 @@ namespace VitaEE
 		}
 
 		if (pending_di_clear)
+			return false;
+		if (!EmitFlushVu0AccCache())
 			return false;
 
 		const u32 next_pc = start_pc + instruction_count * 4;
@@ -13346,16 +13371,30 @@ namespace VitaEE
 		u32 branch_delay_fallthrough_pc)
 	{
 		const u32 previous_opcode = m_current_opcode;
+		const bool previous_vu0_acc_cache_current_opcode =
+			m_vu0_acc_cache_current_opcode;
+		m_vu0_acc_cache_current_opcode =
+			!branch_delay_slot && CanKeepVu0AccCacheAcrossOpcode(op);
+		if (!m_vu0_acc_cache_current_opcode && !EmitFlushVu0AccCache())
+		{
+			m_vu0_acc_cache_current_opcode =
+				previous_vu0_acc_cache_current_opcode;
+			return false;
+		}
 		m_current_opcode = op;
 		struct CurrentOpcodeScope
 		{
 			BlockCompiler& compiler;
 			u32 previous;
+			bool previous_vu0_acc_cache_current_opcode;
 			~CurrentOpcodeScope()
 			{
 				compiler.m_current_opcode = previous;
+				compiler.m_vu0_acc_cache_current_opcode =
+					previous_vu0_acc_cache_current_opcode;
 			}
-		} current_opcode_scope{*this, previous_opcode};
+		} current_opcode_scope{
+			*this, previous_opcode, previous_vu0_acc_cache_current_opcode};
 
 		switch (op >> 26)
 		{
@@ -17352,6 +17391,54 @@ namespace VitaEE
 			   EmitCOP2MacroStoreSelectedLanes(mask, value_qreg, address_reg);
 	}
 
+	bool BlockCompiler::CanKeepVu0AccCacheAcrossOpcode(u32 op) const
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!m_vu0_acc_cache_enabled)
+			return false;
+#endif
+		if (IsCop2MacroRuntimeNoOp(op))
+			return true;
+
+		const Cop2MacroArithmeticOp arithmetic =
+			DecodeCop2MacroArithmetic(op);
+		if (!arithmetic.valid ||
+			arithmetic.kind == Cop2MacroArithmeticKind::OpMula ||
+			arithmetic.kind == Cop2MacroArithmeticKind::OpMSub ||
+			(arithmetic.addi_triace_hack && CHECK_VUADDSUBHACK))
+		{
+			return false;
+		}
+
+		// A full ACC cache value can absorb a full-mask write. Partial writes
+		// must merge with architectural backing and therefore terminate this
+		// first exact cache tier.
+		const unsigned mask = (op >> 21) & 0x0f;
+		return !arithmetic.acc_destination || mask == 0x0f;
+	}
+
+	bool BlockCompiler::EmitFlushVu0AccCache()
+	{
+		if (!m_vu0_acc_cache_valid)
+			return true;
+
+		// PCSX2 owner: VUops.cpp macro arithmetic leaves the latest ACC visible
+		// to every later macro/helper/observation. Q6 contains all four already
+		// normalized lanes, so one aligned qword store materializes that exact
+		// state at the boundary.
+		if (!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
+			!m_code.EmitVst1Q32Aligned(COP2_ACC_CACHE_Q, HOST_TMP0))
+		{
+			return false;
+		}
+#if defined(VITASX2_QEMU_VALIDATION)
+		g_qemuCop2AccCacheFlushes++;
+#endif
+		m_vu0_acc_cache_flushes++;
+		m_vu0_acc_cache_valid = false;
+		return true;
+	}
+
 	bool BlockCompiler::EmitCOP2MacroBody(u32 op)
 	{
 		// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp macro helpers, and
@@ -17451,7 +17538,6 @@ namespace VitaEE
 		constexpr unsigned NQ_ZERO = 11;
 		constexpr unsigned NQ_EXPV = 12;
 		constexpr unsigned NQ_SIGNV = 13;
-		constexpr unsigned NQ_TMP = 14;
 		constexpr unsigned NQ_MASK = 15;
 		const bool is_outer_product = arithmetic.kind == Cop2MacroArithmeticKind::OpMula ||
 									  arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
@@ -17460,6 +17546,10 @@ namespace VitaEE
 									 arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
 		const bool use_addi_triace_hack = arithmetic.addi_triace_hack && CHECK_VUADDSUBHACK;
 		const Cop2ArithmeticFlagNeeds flag_needs = CurrentCop2ArithmeticFlagNeeds(op);
+		const bool cached_acc_source = m_vu0_acc_cache_current_opcode &&
+			uses_acc_source && m_vu0_acc_cache_valid;
+		const bool cache_acc_destination = m_vu0_acc_cache_current_opcode &&
+			arithmetic.acc_destination && mask == 0x0f;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!flag_needs.status)
 			g_qemuCop2DeadStatusFlagOps++;
@@ -17690,6 +17780,9 @@ namespace VitaEE
 		const auto emit_store_result = [&](unsigned lane) {
 			if (arithmetic.acc_destination)
 			{
+				if (cache_acc_destination)
+				return EmitMoveCoreToQWordLane(
+					COP2_ACC_CACHE_Q, lane, HOST_TMP0);
 				return EmitVu0RegisterAddress(HOST_TMP2, VU0_ACC_OFFSET) &&
 					   m_code.EmitStrImm12(HOST_TMP0, HOST_TMP2, static_cast<u16>(lane * sizeof(u32)));
 			}
@@ -17742,6 +17835,30 @@ namespace VitaEE
 			return true;
 		};
 
+		const auto emit_prepare_acc_quad = [&]() {
+			if (!uses_acc_source)
+				return true;
+			if (cached_acc_source)
+			{
+#if defined(VITASX2_QEMU_VALIDATION)
+				g_qemuCop2AccCacheHits++;
+#endif
+				m_vu0_acc_cache_hits++;
+				return m_code.EmitVorrQ(
+					QUAD_ACC, COP2_ACC_CACHE_Q, COP2_ACC_CACHE_Q);
+			}
+			return EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) &&
+				   m_code.EmitVld1Q32Aligned(QUAD_ACC, HOST_TMP0);
+		};
+
+		const auto mark_acc_cache_write = [&]() {
+			m_vu0_acc_cache_valid = true;
+			m_vu0_acc_cache_writes++;
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCop2AccCacheWrites++;
+#endif
+		};
+
 		// Preloads the operand quad (Q2 / S8-S11) for the NEON-quad path. Mirrors
 		// emit_prepare_broadcast_operand(): vector forms load all four lanes, the
 		// broadcast/immediate forms replicate a single word across the quad.
@@ -17784,9 +17901,10 @@ namespace VitaEE
 		};
 
 		// Materializes the constants once per block. Physical Q8-Q11 are exclusive
-		// to these persistent constants. Physical Q12-Q15 are normalize scratch in
-		// COP2 macro blocks and back logical Q4-Q7 in qcache blocks; the qcache
-		// classifier excludes macro arithmetic, so those roles never overlap.
+		// to these persistent constants. Physical Q12/Q13/Q15 are normalize
+		// scratch, while Q14 backs the block-local ACC cache through logical Q6.
+		// Q12-Q15 back logical Q4-Q7 in qcache blocks; the qcache classifier
+		// excludes macro arithmetic, so those roles never overlap.
 		// m_cop2_norm_consts_ready is reset in BeginBlock(), so the first COP2 op
 		// in every block always materializes.
 		const auto emit_ensure_norm_consts = [&]() {
@@ -17813,8 +17931,8 @@ namespace VitaEE
 			if (!vu0_overflow_clamp)
 				return true;
 			return m_code.EmitVceqI32Q(NQ_MASK, NQ_EXPV, NQ_EXP) &&
-				   m_code.EmitVorrQ(NQ_TMP, NQ_SIGNV, NQ_MAXF) &&
-				   m_code.EmitVbitQ(vq, NQ_TMP, NQ_MASK);
+				   m_code.EmitVorrQ(NQ_SIGNV, NQ_SIGNV, NQ_MAXF) &&
+				   m_code.EmitVbitQ(vq, NQ_SIGNV, NQ_MASK);
 		};
 
 		// The TriAce add hack does a per-lane exponent compare that resists
@@ -17841,13 +17959,12 @@ namespace VitaEE
 			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
 				!m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0) ||
 				!emit_prepare_operand_quad() ||
-				(uses_acc_source &&
-					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
-					 !m_code.EmitVld1Q32Aligned(QUAD_ACC, HOST_TMP0))) ||
+				!emit_prepare_acc_quad() ||
 				!emit_ensure_norm_consts() ||
 				!emit_normalize_quad(QUAD_FS) ||
 				!emit_normalize_quad(QUAD_FT) ||
-				(uses_acc_source && !emit_normalize_quad(QUAD_ACC)))
+				(uses_acc_source && !cached_acc_source &&
+					!emit_normalize_quad(QUAD_ACC)))
 			{
 				return false;
 			}
@@ -17899,6 +18016,16 @@ namespace VitaEE
 				return false;
 			if (arithmetic.acc_destination)
 			{
+				if (cache_acc_destination)
+				{
+					if (!m_code.EmitVorrQ(
+							COP2_ACC_CACHE_Q, QUAD_RESULT, QUAD_RESULT))
+					{
+						return false;
+					}
+					mark_acc_cache_write();
+					return true;
+				}
 				return EmitVu0RegisterAddress(HOST_TMP1, VU0_ACC_OFFSET) &&
 					   EmitCOP2MacroStoreSelectedLanes(mask, QUAD_RESULT, HOST_TMP1);
 			}
@@ -17926,13 +18053,12 @@ namespace VitaEE
 			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
 				!m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0) ||
 				!emit_prepare_operand_quad() ||
-				(uses_acc_source &&
-					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
-						!m_code.EmitVld1Q32Aligned(QUAD_ACC, HOST_TMP0))) ||
+				!emit_prepare_acc_quad() ||
 				!emit_ensure_norm_consts() ||
 				!emit_normalize_quad(QUAD_FS) ||
 				!emit_normalize_quad(QUAD_FT) ||
-				(uses_acc_source && !emit_normalize_quad(QUAD_ACC)))
+				(uses_acc_source && !cached_acc_source &&
+					!emit_normalize_quad(QUAD_ACC)))
 			{
 				return false;
 			}
@@ -17990,7 +18116,11 @@ namespace VitaEE
 	}
 			}
 
-			return emit_sync_msflags();
+			if (!emit_sync_msflags())
+				return false;
+			if (cache_acc_destination)
+				mark_acc_cache_write();
+			return true;
 		}
 
 		if (is_outer_product)
