@@ -194,27 +194,78 @@ void Pad::SetControllerState(u32 controller, u32 bind, float value)
 	EnsurePad(static_cast<u8>(controller))->Set(bind, value);
 }
 
+namespace Pad
+{
+	static bool FreezeImpl(StateWrapper& sw, bool preserve_configured_pads)
+	{
+		if (sw.IsPortableReplay() && !preserve_configured_pads)
+		{
+			for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
+			{
+				if (EnsurePad(i)->GetType() != ControllerType::NotConnected)
+				{
+					sw.SetError();
+					return false;
+				}
+			}
+		}
+
+		if (!sw.DoMarker("PAD"))
+			return false;
+
+		const bool reading = sw.IsReading();
+		if (reading)
+			InputManager::InvalidateVitaPadStateCache();
+
+		for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
+		{
+			const ControllerType current_type = EnsurePad(i)->GetType();
+			ControllerType type = current_type;
+			sw.Do(&type);
+			if (sw.HasError() ||
+				(sw.IsPortableReplay() && type != ControllerType::NotConnected))
+			{
+				sw.SetError();
+				return false;
+			}
+
+			if (sw.IsReading() && preserve_configured_pads && type != current_type)
+			{
+				s_controllers[i] = CreatePad(type, i);
+				if (!EnsurePad(i)->Freeze(sw))
+					return false;
+				// Portable replay deliberately remaps the source host's disconnected
+				// controller to the Vita's configured controller.  This is not a guest
+				// hot-plug: an ejection interval would make games pause or open their
+				// controller-disconnected UI immediately after loading the capsule.
+				s_controllers[i] = CreatePad(current_type, i);
+			}
+			else
+			{
+				if (sw.IsReading())
+					s_controllers[i] = CreatePad(type, i);
+				if (!EnsurePad(i)->Freeze(sw))
+					return false;
+			}
+		}
+
+		return !sw.HasError();
+	}
+} // namespace Pad
+
 bool Pad::Freeze(StateWrapper& sw)
 {
-	if (!sw.DoMarker("PAD"))
-		return false;
+	return FreezeImpl(sw, false);
+}
 
-	const bool reading = sw.IsReading();
-	if (reading)
-		InputManager::InvalidateVitaPadStateCache();
-
-	for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
+bool Pad::FreezePortableReplayWithConfiguredPads(StateWrapper& sw)
+{
+	if (!sw.IsPortableReplay() || !sw.IsReading())
 	{
-		ControllerType type = EnsurePad(i)->GetType();
-		sw.Do(&type);
-		if (sw.IsReading())
-			s_controllers[i] = CreatePad(type, i);
-
-		if (!EnsurePad(i)->Freeze(sw))
-			return false;
+		sw.SetError();
+		return false;
 	}
-
-	return !sw.HasError();
+	return FreezeImpl(sw, true);
 }
 
 void Pad::SetMacroButtonState(InputBindingKey& key, u32 pad, u32 index, bool state)

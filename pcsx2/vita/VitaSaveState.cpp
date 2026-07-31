@@ -55,6 +55,12 @@ using namespace R5900;
 
 namespace
 {
+	enum class PortableLoadContext : u8
+	{
+		StrictValidation,
+		ProductWorkloadReplay,
+	};
+
 	static tlbs s_tlb_backup[std::size(tlb)];
 
 	bool GetPortableTlbCacheMask(const tlbs& entry, u32* cache_mask)
@@ -170,7 +176,8 @@ namespace
 			R5900SymbolImporter.OnElfLoadedInMemory();
 	}
 
-	bool PortableReplayMachineIsQuiescent(Error* error, std::string_view operation)
+	bool PortableReplayMachineIsQuiescent(Error* error, std::string_view operation,
+		PortableLoadContext context = PortableLoadContext::StrictValidation)
 	{
 		// Cache.cpp owns the EE data cache. PostLoadPrep() deliberately clears it,
 		// so portable replay must not accept a state whose PS2-visible cache
@@ -182,25 +189,77 @@ namespace
 				operation);
 			return false;
 		}
-		if (THREAD_VU1 || (VU0.VI[REG_VPU_STAT].UL & 0x101u) != 0)
+		const bool product_workload =
+			context == PortableLoadContext::ProductWorkloadReplay;
+		if (product_workload && VMManager::GetState() != VMState::Paused)
 		{
 			Error::SetStringFmt(error,
-				"Portable replay {} requires MTVU disabled and both VUs idle.", operation);
+				"Portable replay {} requires the initialized Vita VM to remain paused.",
+				operation);
 			return false;
 		}
-		if (!EmuConfig.GS.SynchronousMTGS)
+		if ((VU0.VI[REG_VPU_STAT].UL & 0x101u) != 0)
+		{
+			Error::SetStringFmt(error,
+				"Portable replay {} requires both VUs idle.", operation);
+			return false;
+		}
+		if (!product_workload && THREAD_VU1)
+		{
+			Error::SetStringFmt(error,
+				"Portable replay {} requires MTVU disabled.", operation);
+			return false;
+		}
+		if (product_workload && THREAD_VU1)
+		{
+			if (!vu1Thread.IsOpen())
+			{
+				Error::SetString(error,
+					"Portable replay workload load requires the configured MTVU worker.");
+				return false;
+			}
+			vu1Thread.WaitVU();
+			if (!vu1Thread.IsDone() ||
+				(VU0.VI[REG_VPU_STAT].UL & 0x100u) != 0)
+			{
+				Error::SetString(error,
+					"Portable replay workload load could not drain MTVU to an idle VU1 boundary.");
+				return false;
+			}
+		}
+		if (!product_workload && !EmuConfig.GS.SynchronousMTGS)
 		{
 			Error::SetStringFmt(error,
 				"Portable replay {} requires synchronous MTGS.", operation);
 			return false;
 		}
+		if (product_workload)
+		{
+			if (!MTGS::IsOpen())
+			{
+				Error::SetString(error,
+					"Portable replay workload load requires the configured MTGS worker.");
+				return false;
+			}
+			MTGS::WaitGS(false);
+		}
 		for (u32 port = 0; port < Pad::NUM_CONTROLLER_PORTS; port++)
 		{
-			if (Pad::HasConnectedPad(static_cast<u8>(port)))
+			const bool connected = Pad::HasConnectedPad(static_cast<u8>(port));
+			if (!product_workload && connected)
 			{
 				Error::SetStringFmt(error,
 					"Portable replay {} currently requires every pad port disconnected.",
 					operation);
+				return false;
+			}
+			if (product_workload &&
+				((port == 0 && !connected) || (port != 0 && connected) ||
+					(port == 0 && EmuConfig.Pad.Ports[0].Type !=
+						Pad::ControllerType::DualShock2)))
+			{
+				Error::SetString(error,
+					"Portable replay workload load requires one configured DualShock 2 in port 1 only.");
 				return false;
 			}
 		}
@@ -534,9 +593,11 @@ namespace
 	}
 
 	PortableStateLoadResult LoadPortableStateFromSource(PortableEntrySource& source,
-		Error* error, bool quiescence_already_validated)
+		Error* error, bool quiescence_already_validated,
+		PortableLoadContext context = PortableLoadContext::StrictValidation)
 	{
-		if (!quiescence_already_validated && !PortableReplayMachineIsQuiescent(error, "load"))
+		if (!quiescence_already_validated &&
+			!PortableReplayMachineIsQuiescent(error, "load", context))
 			return PortableStateLoadResult::RejectedBeforeMutation;
 		if (source.GetEntryCount() != PORTABLE_ENTRY_NAMES.size())
 		{
@@ -659,9 +720,12 @@ namespace
 			scratch.resize(static_cast<size_t>(source.GetEntrySize(index)));
 			return source.ReadEntry(index, scratch, error);
 		};
+		bool (*const pad_loader)(StateWrapper&) =
+			context == PortableLoadContext::ProductWorkloadReplay ?
+				&Pad::FreezePortableReplayWithConfiguredPads : &Pad::Freeze;
 		if (!read_device(11) || !LoadStateWrapperEntry(scratch, &SPU2::DoPortableState) ||
 			!read_device(12) || !LoadStateWrapperEntry(scratch, &USB::DoState) ||
-			!read_device(13) || !LoadStateWrapperEntry(scratch, &Pad::Freeze) ||
+			!read_device(13) || !LoadStateWrapperEntry(scratch, pad_loader) ||
 			!read_device(14) || !LoadLegacyComponent(scratch, GS_COMPONENT))
 		{
 			SetDefaultError(error, "Portable replay device state is corrupt or under-consumed.");
@@ -675,6 +739,8 @@ namespace
 		}
 
 		PostLoadPrep(false);
+		if (context == PortableLoadContext::ProductWorkloadReplay && THREAD_VU1)
+			vu1Thread.RebuildFromCanonicalStateAfterPortableLoad();
 		if (!ValidatePortableCachedTlbs())
 		{
 			Error::SetString(error,
@@ -830,13 +896,6 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	Freeze(nextStartCounter);
 	Freeze(psxNextStartCounter);
 	Freeze(psxNextDeltaCounter);
-	if (!IsSaving())
-	{
-		// The split EE architectural/interleave deadlines are a host scheduling
-		// cache, not PS2 state. Force one ordinary scheduler pass after load so
-		// every owner is reconstructed from the restored PCSX2 state.
-		cpuSetEvent();
-	}
 
 	if (!FreezeTag("EE-Subsystems"))
 		return false;
@@ -905,6 +964,11 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	okay = okay && deci2Freeze();
 	okay = okay && InputRecordingFreeze();
 	okay = okay && handleFreeze();
+
+#if defined(VITASX2_VITA) && !defined(VITASX2_PORTABLE_REPLAY_VALIDATION)
+	if (okay && !IsSaving())
+		VitaRestoreEeDeadlineCacheAfterStateLoad();
+#endif
 	return okay;
 }
 
@@ -1223,4 +1287,21 @@ PortableStateLoadResult SaveState_LoadPortableStateFile(
 
 	RawFilePortableEntrySource source(std::move(reader));
 	return LoadPortableStateFromSource(source, error, true);
+}
+
+PortableStateLoadResult SaveState_LoadPortableStateFileForVitaWorkloadReplay(
+	const char* filename, Error* error)
+{
+	constexpr PortableLoadContext context =
+		PortableLoadContext::ProductWorkloadReplay;
+	if (!PortableReplayMachineIsQuiescent(error, "workload load", context))
+		return PortableStateLoadResult::RejectedBeforeMutation;
+
+	std::unique_ptr<SaveStateRaw::FileReader> reader =
+		SaveStateRaw::FileReader::Open(filename, error);
+	if (!reader)
+		return PortableStateLoadResult::RejectedBeforeMutation;
+
+	RawFilePortableEntrySource source(std::move(reader));
+	return LoadPortableStateFromSource(source, error, true, context);
 }

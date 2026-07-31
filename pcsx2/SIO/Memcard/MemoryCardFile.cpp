@@ -917,6 +917,11 @@ static MemoryCardFileType GetMemoryCardFileTypeFromSize(s64 size)
 		return MemoryCardFileType::Unknown;
 }
 
+bool FileMcd_IsSupportedCardFileSize(s64 size)
+{
+	return GetMemoryCardFileTypeFromSize(size) != MemoryCardFileType::Unknown;
+}
+
 static bool FileMcd_IsFolder(const std::string& path)
 {
 #if defined(VITASX2_VITA)

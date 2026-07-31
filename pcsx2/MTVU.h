@@ -119,6 +119,11 @@ public:
 
 	void Reset();
 
+	// Rebuilds the drained worker's host-private mirror after portable replay
+	// restores the canonical VIF/VU1 state. This is exactly the publication
+	// sequence used by native SaveStateBase::mtvuFreeze() on load.
+	void RebuildFromCanonicalStateAfterPortableLoad();
+
 	// Get MTVU to start processing its packets if it isn't already
 	void KickStart();
 

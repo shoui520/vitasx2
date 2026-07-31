@@ -67,6 +67,12 @@ namespace Pad
 	void SetControllerState(u32 controller, u32 bind, float value);
 
 	bool Freeze(StateWrapper& sw);
+#if defined(VITASX2_VITA)
+	// Consumes the canonical disconnected-PAD payload used by portable replay,
+	// while preserving and freshly recreating the product's configured pads.
+	// SaveState's workload-replay context is the only caller.
+	bool FreezePortableReplayWithConfiguredPads(StateWrapper& sw);
+#endif
 
 	// Sets the state of the specified macro button.
 	void SetMacroButtonState(InputBindingKey& key, u32 pad, u32 index, bool state);

@@ -43,6 +43,20 @@ bool PortableIpuDmaSpanIsValid(u32 address, u32 bytes)
 
 	return false;
 }
+
+bool ReportInvalidPortableIpuDmaState(const char* reason)
+{
+	Console.Error(
+		"Portable IPU DMA state is invalid (%s): status=%u/%u "
+		"ipu0(chcr=%08x madr=%08x qwc=%08x tadr=%08x) "
+		"ipu1(chcr=%08x madr=%08x qwc=%08x tadr=%08x) ifc=%u ofc=%u.",
+		reason, IPU1Status.InProgress ? 1u : 0u,
+		IPU1Status.DMAFinished ? 1u : 0u, ipu0ch.chcr._u32, ipu0ch.madr,
+		ipu0ch.qwc, ipu0ch.tadr, ipu1ch.chcr._u32, ipu1ch.madr,
+		ipu1ch.qwc, ipu1ch.tadr, static_cast<u32>(g_BP.IFC),
+		static_cast<u32>(ipuRegs.ctrl.OFC));
+	return false;
+}
 } // namespace
 
 bool ipuValidatePortableDmaState()
@@ -52,20 +66,24 @@ bool ipuValidatePortableDmaState()
 		ipu0ch.qwc > 0x10000u || ipu1ch.qwc > 0x10000u ||
 		ipu0ch.chcr.MOD > 2 || ipu1ch.chcr.MOD > 2)
 	{
-		return false;
+		return ReportInvalidPortableIpuDmaState("noncanonical field");
 	}
 
-	if (IPU1Status.InProgress && ipu1ch.qwc == 0)
-		return false;
+	// PCSX2's native savestate can retain the last IPU1 progress latch after
+	// CHCR.STR has been cleared.  The dormant value is serialized and remains
+	// semantically inert; dmaIPU1() replaces it when the guest starts the next
+	// transfer.  Only the same combination on an active channel is inconsistent.
+	if (ipu1ch.chcr.STR && IPU1Status.InProgress && ipu1ch.qwc == 0)
+		return ReportInvalidPortableIpuDmaState("IPU1 in progress with zero QWC");
 
 	if (ipu0ch.chcr.STR && ipu0ch.qwc != 0)
 	{
 		if (ipu0ch.chcr.MOD != NORMAL_MODE || ipu0ch.chcr.TTE)
-			return false;
+			return ReportInvalidPortableIpuDmaState("unsupported IPU0 transfer mode");
 
 		const u32 transfer_qwc = std::min(ipu0ch.qwc, static_cast<u32>(ipuRegs.ctrl.OFC));
 		if (!PortableIpuDmaSpanIsValid(ipu0ch.madr, transfer_qwc << 4))
-			return false;
+			return ReportInvalidPortableIpuDmaState("IPU0 transfer span");
 	}
 
 	if (ipu1ch.chcr.STR)
@@ -74,12 +92,12 @@ bool ipuValidatePortableDmaState()
 		{
 			const u32 transfer_qwc = std::min(ipu1ch.qwc, 8u - g_BP.IFC);
 			if (!PortableIpuDmaSpanIsValid(ipu1ch.madr, transfer_qwc << 4))
-				return false;
+				return ReportInvalidPortableIpuDmaState("IPU1 transfer span");
 		}
 		else if (!IPU1Status.DMAFinished &&
 			!PortableIpuDmaSpanIsValid(ipu1ch.tadr, sizeof(tDMA_TAG) * 2))
 		{
-			return false;
+			return ReportInvalidPortableIpuDmaState("IPU1 chain-tag span");
 		}
 	}
 

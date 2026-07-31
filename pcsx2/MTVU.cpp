@@ -263,6 +263,19 @@ void VU_Thread::Reset()
 	vu1Thread.mtvuInterrupts = 0;
 }
 
+void VU_Thread::RebuildFromCanonicalStateAfterPortableLoad()
+{
+	pxAssert(IsOpen());
+	pxAssert(IsDone());
+	Reset();
+	WriteCol(vif1);
+	WriteRow(vif1);
+	WriteMicroMem(0, VU1.Micro, VU1_PROGSIZE);
+	WriteDataMem(0, VU1.Mem, VU1_MEMSIZE);
+	WriteVIRegs(&VU1.VI[0]);
+	WriteVFRegs(&VU1.VF[0]);
+}
+
 void VU_Thread::BeginProgram()
 {
 	m_program_active = true;

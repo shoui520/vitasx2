@@ -576,17 +576,38 @@ namespace MTGS
 
 	struct CorrelatedPerformanceProfile
 	{
+		enum class Origin : u8
+		{
+			Boot,
+			Elf,
+			WorkloadReplay,
+		};
+
 		u64 producer_vsyncs = 0;
 		u64 producer_vsync_origin = 0;
 		u32 sampling_boundaries = 0;
 		u32 boundaries_at_start = 0;
 		u64 window = 0;
 		bool started = false;
-		bool elf_origin = false;
+		Origin origin_kind = Origin::Boot;
 		CorrelatedPerformanceSnapshot origin;
 		CorrelatedPerformanceSnapshot start;
 	};
 	static CorrelatedPerformanceProfile s_correlated_profile;
+
+	static const char* CorrelatedPerformanceOriginName(
+		CorrelatedPerformanceProfile::Origin origin)
+	{
+		switch (origin)
+		{
+			case CorrelatedPerformanceProfile::Origin::Elf:
+				return "elf";
+			case CorrelatedPerformanceProfile::Origin::WorkloadReplay:
+				return "workload-replay";
+			default:
+				return "boot";
+		}
+	}
 
 	static GsWorkerPerformanceTotals GetPublishedGsWorkerPerformance()
 	{
@@ -696,7 +717,7 @@ namespace MTGS
 			"ee_cycle_start=%llu ee_cycle_end=%llu ee_pc_start=%08x ee_pc_end=%08x "
 			"iop_cycle_start=%llu iop_cycle_end=%llu iop_pc_start=%08x iop_pc_end=%08x",
 			static_cast<unsigned long long>(window),
-			s_correlated_profile.elf_origin ? "elf" : "boot",
+			CorrelatedPerformanceOriginName(s_correlated_profile.origin_kind),
 			static_cast<unsigned long long>(
 				s_correlated_profile.producer_vsync_origin),
 			static_cast<unsigned long long>(start.producer_vsyncs),
@@ -4567,7 +4588,26 @@ void VitaGS::NotifyPerformanceElfEntry()
 	MTGS::s_correlated_profile.sampling_boundaries = 0;
 	MTGS::s_correlated_profile.boundaries_at_start = 0;
 	MTGS::s_correlated_profile.started = false;
-	MTGS::s_correlated_profile.elf_origin = true;
+	MTGS::s_correlated_profile.origin_kind =
+		MTGS::CorrelatedPerformanceProfile::Origin::Elf;
+	MTGS::s_correlated_profile.origin =
+		MTGS::CaptureCorrelatedPerformanceSnapshot(
+			MTGS::s_correlated_profile.producer_vsyncs);
+#endif
+}
+
+void VitaGS::NotifyPerformanceWorkloadReplayLoaded()
+{
+#if defined(__vita__)
+	if (!VitaPerformanceTelemetry::IsEnabled())
+		return;
+	MTGS::s_correlated_profile.producer_vsync_origin =
+		MTGS::s_correlated_profile.producer_vsyncs;
+	MTGS::s_correlated_profile.sampling_boundaries = 0;
+	MTGS::s_correlated_profile.boundaries_at_start = 0;
+	MTGS::s_correlated_profile.started = false;
+	MTGS::s_correlated_profile.origin_kind =
+		MTGS::CorrelatedPerformanceProfile::Origin::WorkloadReplay;
 	MTGS::s_correlated_profile.origin =
 		MTGS::CaptureCorrelatedPerformanceSnapshot(
 			MTGS::s_correlated_profile.producer_vsyncs);

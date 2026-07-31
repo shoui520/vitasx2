@@ -75,6 +75,15 @@ extern PortableStateLoadResult SaveState_LoadPortableState(
 // save path emits canonical bytes entry-by-entry and deletes partial output.
 extern PortableStateLoadResult SaveState_LoadPortableStateFile(
 	const char* filename, Error* error);
+#if defined(VITASX2_VITA)
+// Product-only diagnostic workload entry. Unlike the strict oracle loader,
+// this permits PCSX2's normal asynchronous MTGS/MTVU topology and configured
+// Vita DualShock 2 after proving both workers are drained. The VM must already
+// be fully initialized and paused; failure retains the non-transactional
+// contract above and the caller must destroy the VM before any resume.
+extern PortableStateLoadResult SaveState_LoadPortableStateFileForVitaWorkloadReplay(
+	const char* filename, Error* error);
+#endif
 extern bool SaveState_SavePortableStateFile(const char* filename, Error* error);
 extern std::unique_ptr<SaveStateScreenshotData> SaveState_SaveScreenshot();
 extern bool SaveState_ZipToDisk(

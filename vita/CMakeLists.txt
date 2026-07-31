@@ -26,6 +26,7 @@ add_executable(vitasx2
 )
 target_link_libraries(vitasx2
 	pcsx2core
+	LZMA::LZMA
 )
 
 vita_create_self(vitasx2.self vitasx2 UNSAFE)

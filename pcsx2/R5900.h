@@ -412,6 +412,10 @@ extern void cpuSetNextEvent( u64 startCycle, s32 delta );
 // joint wait can reason about silent HSync boundaries without losing the
 // ordinary PCSX2 nextEventCycle contract.
 extern void cpuSetNextCounterEvent(u64 startCycle, s32 delta);
+// A portable-state load restores PCSX2's canonical nextEventCycle directly.
+// Re-seed the Vita-only owner cache from that deadline without scheduling an
+// earlier, host-invented event boundary.
+extern void VitaRestoreEeDeadlineCacheAfterStateLoad();
 #endif
 extern void cpuSetNextEventDelta( s32 delta );
 extern int  cpuTestCycle( u64 startCycle, s32 delta );

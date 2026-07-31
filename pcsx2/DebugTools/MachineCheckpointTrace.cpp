@@ -18,6 +18,7 @@
 #include "R3000A.h"
 #include "R5900.h"
 #include "SPU2/defs.h"
+#include "SPU2/spu2.h"
 #include "Sif.h"
 #include "VUmicro.h"
 #include "Vif.h"
@@ -836,6 +837,10 @@ namespace Pcsx2Trace
 
 		void CaptureRecord(MachineCheckpointTraceRecord& record, u32 trigger)
 		{
+			// SPU2 sample RAM and engine state are part of this architectural
+			// projection. Materialize every sample due at the captured IOP cycle
+			// before hashing either one.
+			TimeUpdate(psxRegs.cycle);
 #if defined(VITASX2_VITA)
 			// Vita leaves Count affine while the timer mask is clear.
 			// Checkpoints are architectural observations and must project the

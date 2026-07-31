@@ -23,6 +23,9 @@ namespace VitaGS
 	// VMManager::EntryPointCompilingOnCPUThread(). Performance windows after this
 	// call use the game ELF entry as their VSync origin.
 	void NotifyPerformanceElfEntry();
+	// Starts the same warm-up/window cadence at a successfully loaded product
+	// workload state, without mislabelling the resulting receipt as ELF entry.
+	void NotifyPerformanceWorkloadReplayLoaded();
 
 	// Completes the next EE-reserved MTVU PATH1 ordering point with an immutable
 	// direct draw. Ownership returns false by destruction; a successful call is

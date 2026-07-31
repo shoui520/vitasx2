@@ -22,8 +22,10 @@
 #include "Host.h"
 #include "INISettingsInterface.h"
 #include "Input/InputManager.h"
+#include "MemoryTypes.h"
 #include "R3000A.h"
 #include "R5900.h"
+#include "SaveState.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Pad/Pad.h"
 #include "VMManager.h"
@@ -33,22 +35,30 @@
 #include "common/FPControl.h"
 #include "common/FileSystem.h"
 #include "common/MemorySettingsInterface.h"
+#include "common/Path.h"
 #include "common/StringUtil.h"
 #include "common/Threading.h"
+#include "ps2/BiosTools.h"
 #include "vita/VitaCore.h"
 #include "vita/VitaGsMailbox.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
 
 #include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 
+#include <Sha256.h>
+
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <malloc.h>
+#include <memory>
+#include <new>
 #include <string>
 #include <string_view>
 
@@ -59,7 +69,18 @@ namespace
 	constexpr const char* NAME = "VitaSX2";
 	constexpr const char* DATA_DIR = "ux0:data/vitasx2";
 	constexpr const char* BIOS_DIR = "ux0:data/vitasx2/bios";
-	constexpr const char* BIOS_FILE = "SCPH-30000 JP 150-010118.BIN";
+	constexpr const char* BIOS_FILE = "SCPH-90000 JP 230-080220.bin";
+	constexpr const char* BIOS_NVM_FILE = "SCPH-90000 JP 230-080220.nvm";
+	constexpr const char* BIOS_MEC_FILE = "SCPH-90000 JP 230-080220.mec";
+	constexpr const char* BIOS_SHA256 =
+		"9e9540f7ace6651a029942c1d29b6694a9b55a80becf40b92e2033d00da9de3b";
+	constexpr const char* BIOS_NVM_SHA256 =
+		"94368cb696078410c77739ff5216d1db0dd03c75efe734e7bd67e502c3adeab6";
+	constexpr const char* BIOS_MEC_SHA256 =
+		"fbbfc6c156266ac7e9afb37f0cc53fb78fadf2f09f580e56b2da57e6539e463b";
+	constexpr u64 BIOS_BYTES = 4194304;
+	constexpr u64 BIOS_NVM_BYTES = 1024;
+	constexpr u64 BIOS_MEC_BYTES = 4;
 	constexpr const char* DISC_DIR = "ux0:data/vitasx2/disc";
 	constexpr const char* ELF_DIR = "ux0:data/vitasx2/elf";
 	constexpr const char* VALIDATION_DISC_PATH =
@@ -75,6 +96,9 @@ namespace
 	constexpr const char* PRODUCT_INITIALIZED_PATH =
 		"ux0:data/vitasx2/vitasx2.initialized";
 	constexpr const char* PRODUCT_FAILED_PATH = "ux0:data/vitasx2/vitasx2.failed";
+	constexpr const char* WORKLOAD_ACTIVE_PATH =
+		"ux0:data/vitasx2/workloads/active.txt";
+	constexpr const char* WORKLOAD_ROOT = "ux0:data/vitasx2/workloads";
 
 	constexpr const char* VALIDATION_DIR = "ux0:data/vitasx2/product-validation";
 	constexpr const char* VALIDATION_BIOS_DIR =
@@ -120,6 +144,541 @@ namespace
 	// layers preserve all caller defaults and make base-only getters safe.
 	MemorySettingsInterface s_base_settings;
 	MemorySettingsInterface s_secrets_settings;
+
+	struct WorkloadReplaySelection
+	{
+		bool enabled = false;
+		std::string slug;
+		std::string manifest_path;
+		std::string disc_basename;
+		std::string state_basename;
+		std::string card1_basename;
+		std::string card2_basename;
+		std::string disc_path;
+		std::string state_path;
+		std::string card1_input_path;
+		std::string card2_input_path;
+		std::string private_card_dir;
+		bool card1_provisioned = false;
+		bool card2_provisioned = false;
+	};
+
+	void DigestToHex(const std::array<Byte, SHA256_DIGEST_SIZE>& digest,
+		char (&hex)[SHA256_DIGEST_SIZE * 2 + 1])
+	{
+		static constexpr char digits[] = "0123456789abcdef";
+		for (size_t i = 0; i < digest.size(); i++)
+		{
+			hex[i * 2] = digits[digest[i] >> 4];
+			hex[i * 2 + 1] = digits[digest[i] & 0xf];
+		}
+		hex[SHA256_DIGEST_SIZE * 2] = '\0';
+	}
+
+	bool VerifyConfiguredBiosAsset(const char* label, const std::string& path,
+		const u64 expected_size, const char* expected_sha256, Error* error)
+	{
+		const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+		if (fd < 0)
+		{
+			Error::SetStringFmt(error,
+				"Configured {} could not be opened at '{}' (0x{:08x}).",
+				label, path, static_cast<u32>(fd));
+			return false;
+		}
+
+		const SceOff size = sceIoLseek(fd, 0, SCE_SEEK_END);
+		if (size < 0 || sceIoLseek(fd, 0, SCE_SEEK_SET) < 0)
+		{
+			sceIoClose(fd);
+			Error::SetStringFmt(error,
+				"Configured {} size/seek failed at '{}'.", label, path);
+			return false;
+		}
+		if (static_cast<u64>(size) != expected_size)
+		{
+			sceIoClose(fd);
+			Error::SetStringFmt(error,
+				"Configured {} has {} bytes, expected {} at '{}'.", label,
+				static_cast<u64>(size), expected_size, path);
+			return false;
+		}
+
+		if (!expected_sha256)
+		{
+			const int close_result = sceIoClose(fd);
+			if (close_result < 0)
+			{
+				Error::SetStringFmt(error,
+					"Configured {} close failed at '{}'.", label, path);
+				return false;
+			}
+			return true;
+		}
+
+		constexpr size_t HASH_BUFFER_SIZE = 64 * 1024;
+		std::unique_ptr<Byte[]> buffer(new (std::nothrow) Byte[HASH_BUFFER_SIZE]);
+		if (!buffer)
+		{
+			sceIoClose(fd);
+			Error::SetStringFmt(error,
+				"Configured {} could not allocate its SHA-256 buffer.", label);
+			return false;
+		}
+
+		CSha256 sha;
+		Sha256_Init(&sha);
+		u64 completed = 0;
+		while (completed != expected_size)
+		{
+			const u64 remaining = expected_size - completed;
+			const SceSize request = static_cast<SceSize>(
+				std::min<u64>(remaining, HASH_BUFFER_SIZE));
+			const SceSSize read = sceIoRead(fd, buffer.get(), request);
+			if (read <= 0)
+			{
+				sceIoClose(fd);
+				Error::SetStringFmt(error,
+					"Configured {} stopped at {}/{} bytes (0x{:08x}).", label,
+					completed, expected_size, static_cast<u32>(read));
+				return false;
+			}
+			Sha256_Update(&sha, buffer.get(), static_cast<size_t>(read));
+			completed += static_cast<u64>(read);
+		}
+
+		const int close_result = sceIoClose(fd);
+		std::array<Byte, SHA256_DIGEST_SIZE> digest = {};
+		Sha256_Final(&sha, digest.data());
+		char actual_sha256[SHA256_DIGEST_SIZE * 2 + 1];
+		DigestToHex(digest, actual_sha256);
+		if (close_result < 0 || std::strcmp(actual_sha256, expected_sha256) != 0)
+		{
+			Error::SetStringFmt(error,
+				"Configured {} SHA-256 mismatch: expected {}, got {} at '{}'.",
+				label, expected_sha256, actual_sha256, path);
+			return false;
+		}
+
+		Console.WriteLn("VitaSX2 BIOS asset authenticated: %s bytes=%llu sha256=%s path=%s.",
+			label, static_cast<unsigned long long>(expected_size), actual_sha256,
+			path.c_str());
+		return true;
+	}
+
+	bool VerifyConfiguredBiosBundle(const bool exact_sidecars, Error* error)
+	{
+		const std::string bios_path = Path::Combine(EmuFolders::Bios, BIOS_FILE);
+		const std::string nvm_path = Path::Combine(EmuFolders::Bios, BIOS_NVM_FILE);
+		const std::string mec_path = Path::Combine(EmuFolders::Bios, BIOS_MEC_FILE);
+		return
+			// The primary image is immutable product code input. Authenticate it for
+			// every boot so PCSX2's FindBiosImage() fallback can never substitute a
+			// different console while the frontend receipts the requested basename.
+			VerifyConfiguredBiosAsset("BIOS", bios_path, BIOS_BYTES,
+				BIOS_SHA256, error) &&
+			// NVM is intentionally persistent during ordinary product use. A loaded
+			// workload, however, must begin with the same guest-visible seed as its
+			// PCSX2 capture; fail closed if either companion has changed.
+			VerifyConfiguredBiosAsset("BIOS NVM", nvm_path, BIOS_NVM_BYTES,
+				exact_sidecars ? BIOS_NVM_SHA256 : nullptr, error) &&
+			VerifyConfiguredBiosAsset("BIOS MEC", mec_path, BIOS_MEC_BYTES,
+				exact_sidecars ? BIOS_MEC_SHA256 : nullptr, error);
+	}
+
+	bool ReadBoundedWorkloadText(const char* path, size_t maximum_size,
+		std::string* contents, Error* error)
+	{
+		constexpr size_t BUFFER_SIZE = 4097;
+		if (maximum_size + 1 > BUFFER_SIZE)
+		{
+			Error::SetString(error, "Internal workload text bound is invalid.");
+			return false;
+		}
+		std::FILE* file = FileSystem::OpenCFile(path, "rb");
+		if (!file)
+		{
+			Error::SetStringFmt(error, "Failed to open workload file '{}'.", path);
+			return false;
+		}
+		std::array<char, BUFFER_SIZE> buffer = {};
+		const size_t read = std::fread(buffer.data(), 1, maximum_size + 1, file);
+		const bool read_okay = std::ferror(file) == 0;
+		const bool close_okay = std::fclose(file) == 0;
+		const bool okay = read_okay && close_okay;
+		if (!okay || read > maximum_size)
+		{
+			Error::SetStringFmt(error,
+				"Workload file '{}' is unreadable or exceeds {} bytes.", path,
+				maximum_size);
+			return false;
+		}
+		if (std::find(buffer.begin(), buffer.begin() + read, '\0') !=
+			buffer.begin() + read)
+		{
+			Error::SetStringFmt(error, "Workload file '{}' contains a NUL byte.", path);
+			return false;
+		}
+		contents->assign(buffer.data(), read);
+		return true;
+	}
+
+	bool IsWorkloadSlug(std::string_view slug)
+	{
+		if (slug.empty() || slug.size() > 63)
+			return false;
+		const auto is_lower_alnum = [](char ch) {
+			return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+		};
+		if (!is_lower_alnum(slug.front()) || !is_lower_alnum(slug.back()))
+			return false;
+		for (const char ch : slug)
+		{
+			if (!is_lower_alnum(ch) && ch != '-' && ch != '_')
+				return false;
+		}
+		return true;
+	}
+
+	bool IsWorkloadBasename(std::string_view name)
+	{
+		if (name.empty() || name.size() > 240 || name == "." || name == ".." ||
+			name.front() == ' ' || name.back() == ' ')
+		{
+			return false;
+		}
+		for (const unsigned char ch : name)
+		{
+			if (ch < 0x20 || ch > 0x7e || ch == '/' || ch == '\\' || ch == ':')
+				return false;
+		}
+		return true;
+	}
+
+	bool ReadOptionalWorkloadReplay(WorkloadReplaySelection* selection,
+		Error* error)
+	{
+		*selection = {};
+		if (VITASX2_PRODUCT_BOOT_VALIDATION ||
+			!FileSystem::FileExists(WORKLOAD_ACTIVE_PATH))
+		{
+			return true;
+		}
+
+		std::string slug;
+		if (!ReadBoundedWorkloadText(WORKLOAD_ACTIVE_PATH, 65, &slug, error))
+			return false;
+		if (slug.ends_with("\n"))
+		{
+			slug.pop_back();
+			if (slug.ends_with("\r"))
+				slug.pop_back();
+		}
+		// The deployment harness does not delete persistent Vita data. Replacing
+		// the selector with this exact sentinel restores the ordinary boot path.
+		if (slug == "none")
+			return true;
+		if (!IsWorkloadSlug(slug))
+		{
+			Error::SetString(error,
+				"Workload selector must be one lowercase 1-63 byte slug with only alphanumeric, '-' or '_' characters.");
+			return false;
+		}
+
+		const std::string input_dir =
+			std::string(WORKLOAD_ROOT) + "/" + slug + "/input";
+		const std::string manifest_path = input_dir + "/workload.ini";
+		std::string manifest;
+		if (!ReadBoundedWorkloadText(manifest_path.c_str(), 1024,
+				&manifest, error))
+		{
+			return false;
+		}
+		std::string normalized_manifest;
+		normalized_manifest.reserve(manifest.size());
+		for (size_t i = 0; i < manifest.size(); i++)
+		{
+			if (manifest[i] == '\r')
+			{
+				if (i + 1 >= manifest.size() || manifest[i + 1] != '\n')
+				{
+					Error::SetString(error,
+						"Workload manifest contains a non-CRLF carriage return.");
+					return false;
+				}
+				continue;
+			}
+			normalized_manifest.push_back(manifest[i]);
+		}
+		manifest = std::move(normalized_manifest);
+		if (manifest.ends_with("\n"))
+			manifest.pop_back();
+		std::array<std::string_view, 5> lines;
+		size_t line_begin = 0;
+		for (size_t i = 0; i < lines.size(); i++)
+		{
+			const size_t line_end = manifest.find('\n', line_begin);
+			if ((i + 1 < lines.size() && line_end == std::string::npos) ||
+				(i + 1 == lines.size() && line_end != std::string::npos))
+			{
+				Error::SetString(error,
+					"Workload manifest must contain exactly five ordered lines.");
+				return false;
+			}
+			const size_t end = line_end == std::string::npos ?
+				manifest.size() : line_end;
+			lines[i] = std::string_view(manifest).substr(line_begin, end - line_begin);
+			line_begin = end + 1;
+		}
+		if (lines[0] != "[Workload]")
+		{
+			Error::SetString(error,
+				"Workload manifest must begin with [Workload].");
+			return false;
+		}
+		constexpr std::string_view DISC_KEY = "DiscBasename=";
+		constexpr std::string_view STATE_KEY = "PortableState=";
+		constexpr std::string_view CARD1_KEY = "MemoryCard1=";
+		constexpr std::string_view CARD2_KEY = "MemoryCard2=";
+		if (!lines[1].starts_with(DISC_KEY) ||
+			!lines[2].starts_with(STATE_KEY) ||
+			!lines[3].starts_with(CARD1_KEY) ||
+			!lines[4].starts_with(CARD2_KEY))
+		{
+			Error::SetString(error,
+				"Workload manifest keys or ordering are invalid.");
+			return false;
+		}
+		const std::string disc_basename(lines[1].substr(DISC_KEY.size()));
+		const std::string state_basename(lines[2].substr(STATE_KEY.size()));
+		const std::string card1_basename(lines[3].substr(CARD1_KEY.size()));
+		const std::string card2_basename(lines[4].substr(CARD2_KEY.size()));
+		if (!IsWorkloadBasename(disc_basename) ||
+			!StringUtil::EndsWithNoCase(disc_basename, ".iso") ||
+			!IsWorkloadBasename(state_basename) ||
+			!StringUtil::EndsWithNoCase(state_basename, ".pcsx2raw") ||
+			!IsWorkloadBasename(card1_basename) ||
+			!StringUtil::EndsWithNoCase(card1_basename, ".ps2") ||
+			!IsWorkloadBasename(card2_basename) ||
+			!StringUtil::EndsWithNoCase(card2_basename, ".ps2") ||
+			StringUtil::Strcasecmp(card1_basename.c_str(),
+				card2_basename.c_str()) == 0)
+		{
+			Error::SetString(error,
+				"Workload manifest must name one flat ISO, one PCSX2RAW state, and two distinct flat PS2 memory-card inputs.");
+			return false;
+		}
+
+		// The large immutable disc remains in VitaSX2's existing disc store. Only
+		// the basename crosses the workload manifest, so this cannot broaden the
+		// unsafe-homebrew frontend into an arbitrary device path.
+		const std::string disc_path =
+			std::string(DISC_DIR) + "/" + disc_basename;
+		const std::string state_path = input_dir + "/" + state_basename;
+		const std::string card1_input_path = input_dir + "/" + card1_basename;
+		const std::string card2_input_path = input_dir + "/" + card2_basename;
+		if (!FileSystem::FileExists(disc_path.c_str()) ||
+			!FileSystem::FileExists(state_path.c_str()) ||
+			!FileSystem::FileExists(card1_input_path.c_str()) ||
+			!FileSystem::FileExists(card2_input_path.c_str()))
+		{
+			Error::SetStringFmt(error,
+				"Workload '{}' is missing its disc, portable state, or private memory-card inputs.",
+				slug);
+			return false;
+		}
+
+		selection->enabled = true;
+		selection->slug = std::move(slug);
+		selection->manifest_path = manifest_path;
+		selection->disc_basename = disc_basename;
+		selection->state_basename = state_basename;
+		selection->card1_basename = card1_basename;
+		selection->card2_basename = card2_basename;
+		selection->disc_path = disc_path;
+		selection->state_path = state_path;
+		selection->card1_input_path = card1_input_path;
+		selection->card2_input_path = card2_input_path;
+		selection->private_card_dir =
+			std::string(WORKLOAD_ROOT) + "/" + selection->slug +
+			"/runtime/memcards";
+		Console.WriteLn(
+			"VitaSX2 workload selector validated: slug=%s manifest=%s disc=%s state=%s card1=%s card2=%s.",
+			selection->slug.c_str(), selection->manifest_path.c_str(),
+			selection->disc_basename.c_str(), selection->state_basename.c_str(),
+			selection->card1_basename.c_str(), selection->card2_basename.c_str());
+		return true;
+	}
+
+	bool ProvisionPrivateWorkloadCard(const std::string& source,
+		const std::string& destination, bool* provisioned, Error* error)
+	{
+		*provisioned = false;
+		const auto get_supported_size = [](const std::string& path,
+			u64* size, Error* local_error) {
+			SceIoStat stat = {};
+			const int result = sceIoGetstat(path.c_str(), &stat);
+			if (result < 0 || !SCE_S_ISREG(stat.st_mode) || stat.st_size < 0 ||
+				!FileMcd_IsSupportedCardFileSize(static_cast<s64>(stat.st_size)))
+			{
+				Error::SetStringFmt(local_error,
+					"Workload memory card '{}' is not a regular PCSX2-supported card file (result=0x{:08x}, bytes={}).",
+					path, static_cast<u32>(result),
+					stat.st_size < 0 ? 0ull : static_cast<u64>(stat.st_size));
+				return false;
+			}
+			*size = static_cast<u64>(stat.st_size);
+			return true;
+		};
+
+		u64 source_size = 0;
+		if (!get_supported_size(source, &source_size, error))
+			return false;
+		if (FileSystem::FileExists(destination.c_str()))
+		{
+			u64 destination_size = 0;
+			if (!get_supported_size(destination, &destination_size, error))
+				return false;
+			if (destination_size != source_size)
+			{
+				Error::SetStringFmt(error,
+					"Existing private workload memory card '{}' has {} bytes, expected {}. It will not be overwritten.",
+					destination, destination_size, source_size);
+				return false;
+			}
+			return true;
+		}
+
+		const std::string temporary = destination + ".provisioning";
+		FileSystem::DeleteFilePath(temporary.c_str());
+		const SceUID source_fd = sceIoOpen(source.c_str(), SCE_O_RDONLY, 0);
+		if (source_fd < 0)
+		{
+			Error::SetStringFmt(error,
+				"Failed to open workload memory-card input '{}' (0x{:08x}).",
+				source, static_cast<u32>(source_fd));
+			return false;
+		}
+		SceIoStat opened_source = {};
+		if (sceIoGetstatByFd(source_fd, &opened_source) < 0 ||
+			!SCE_S_ISREG(opened_source.st_mode) || opened_source.st_size < 0 ||
+			static_cast<u64>(opened_source.st_size) != source_size)
+		{
+			sceIoClose(source_fd);
+			Error::SetStringFmt(error,
+				"Workload memory-card input '{}' changed before provisioning.", source);
+			return false;
+		}
+
+		const SceUID destination_fd = sceIoOpen(temporary.c_str(),
+			SCE_O_WRONLY | SCE_O_CREAT | SCE_O_EXCL, 0666);
+		if (destination_fd < 0)
+		{
+			sceIoClose(source_fd);
+			Error::SetStringFmt(error,
+				"Failed to create private workload memory card '{}' (0x{:08x}).",
+				temporary, static_cast<u32>(destination_fd));
+			return false;
+		}
+
+		constexpr size_t COPY_BUFFER_SIZE = 64 * 1024;
+		std::unique_ptr<u8[]> buffer(new (std::nothrow) u8[COPY_BUFFER_SIZE]);
+		u64 copied = 0;
+		bool copy_okay = buffer != nullptr;
+		while (copy_okay && copied < source_size)
+		{
+			const SceSize request = static_cast<SceSize>(
+				std::min<u64>(source_size - copied, COPY_BUFFER_SIZE));
+			const SceSSize read = sceIoRead(source_fd, buffer.get(), request);
+			if (read <= 0)
+			{
+				copy_okay = false;
+				break;
+			}
+			size_t written = 0;
+			while (written < static_cast<size_t>(read))
+			{
+				const SceSSize result = sceIoWrite(destination_fd,
+					buffer.get() + written,
+					static_cast<SceSize>(static_cast<size_t>(read) - written));
+				if (result <= 0)
+				{
+					copy_okay = false;
+					break;
+				}
+				written += static_cast<size_t>(result);
+			}
+			copied += static_cast<u64>(read);
+		}
+		u8 trailing = 0;
+		if (copy_okay && sceIoRead(source_fd, &trailing, 1) != 0)
+			copy_okay = false;
+		if (copy_okay && sceIoSyncByFd(destination_fd, 0) < 0)
+			copy_okay = false;
+		const int source_close = sceIoClose(source_fd);
+		const int destination_close = sceIoClose(destination_fd);
+		if (!copy_okay || copied != source_size || source_close < 0 ||
+			destination_close < 0)
+		{
+			FileSystem::DeleteFilePath(temporary.c_str());
+			Error::SetStringFmt(error,
+				"Failed bounded provisioning of private workload memory card '{}' ({}/{} bytes).",
+				destination, copied, source_size);
+			return false;
+		}
+
+		// A second launcher must never replace an already-existing private card.
+		if (FileSystem::FileExists(destination.c_str()))
+		{
+			FileSystem::DeleteFilePath(temporary.c_str());
+			return true;
+		}
+		if (sceIoRename(temporary.c_str(), destination.c_str()) < 0)
+		{
+			FileSystem::DeleteFilePath(temporary.c_str());
+			Error::SetStringFmt(error,
+				"Failed to publish private workload memory card '{}'.", destination);
+			return false;
+		}
+		*provisioned = true;
+		return true;
+	}
+
+	bool ConfigurePrivateWorkloadCards(WorkloadReplaySelection* workload,
+		Error* error)
+	{
+		if (!workload->enabled)
+			return true;
+		if (!FileSystem::EnsureDirectoryExists(workload->private_card_dir.c_str(),
+				true, error))
+		{
+			return false;
+		}
+
+		const std::string card1 = workload->private_card_dir + "/Mcd001.ps2";
+		const std::string card2 = workload->private_card_dir + "/Mcd002.ps2";
+		if (!ProvisionPrivateWorkloadCard(workload->card1_input_path, card1,
+				&workload->card1_provisioned, error) ||
+			!ProvisionPrivateWorkloadCard(workload->card2_input_path, card2,
+				&workload->card2_provisioned, error))
+		{
+			return false;
+		}
+
+		EmuFolders::MemoryCards = workload->private_card_dir;
+		EmuConfig.Mcd[0].Enabled = true;
+		EmuConfig.Mcd[0].Filename = "Mcd001.ps2";
+		EmuConfig.Mcd[0].Type = MemoryCardType::File;
+		EmuConfig.Mcd[1].Enabled = true;
+		EmuConfig.Mcd[1].Filename = "Mcd002.ps2";
+		EmuConfig.Mcd[1].Type = MemoryCardType::File;
+		Console.WriteLn(
+			"VitaSX2 workload private cards: directory=%s card1_provisioned=%u card2_provisioned=%u.",
+			workload->private_card_dir.c_str(),
+			workload->card1_provisioned ? 1u : 0u,
+			workload->card2_provisioned ? 1u : 0u);
+		return true;
+	}
 
 	bool WriteAll(SceUID fd, const void* data, size_t size)
 	{
@@ -960,6 +1519,7 @@ int main()
 	bool cpu_thread_initialized = false;
 	bool trace_started = false;
 	bool vm_initialized = false;
+	WorkloadReplaySelection workload;
 #if VITASX2_PRODUCT_BOOT_VALIDATION
 	bool entry_trace_complete = false;
 	bool checkpoint_started = false;
@@ -1017,6 +1577,15 @@ int main()
 	ConfigureProductPerformanceTelemetry();
 	ConfigureProductInputAutomation();
 	ConfigureProductSettings();
+	if (!ReadOptionalWorkloadReplay(&workload, &error))
+		goto fail;
+	if (!VerifyConfiguredBiosBundle(
+			workload.enabled || VITASX2_PRODUCT_BOOT_VALIDATION, &error))
+	{
+		goto fail;
+	}
+	if (!ConfigurePrivateWorkloadCards(&workload, &error))
+		goto fail;
 	// PCSX2's _DynGen_DispatcherEvent() calls the event owner and falls directly
 	// into register dispatch. Normal product execution can use the equivalent
 	// persistent A32 path; bounded validation keeps its natural event callbacks.
@@ -1046,8 +1615,17 @@ int main()
 		VMBootParameters boot;
 		std::string boot_path;
 		ConfiguredBootKind boot_kind = ConfiguredBootKind::Disc;
-		if (!ReadConfiguredBootPath(&boot_path, &boot_kind, &error))
+		if (workload.enabled)
+		{
+			boot_path = workload.disc_path;
+			boot_kind = ConfiguredBootKind::Disc;
+			Console.WriteLn("VitaSX2 diagnostic workload boot disc: %s",
+				boot_path.c_str());
+		}
+		else if (!ReadConfiguredBootPath(&boot_path, &boot_kind, &error))
+		{
 			goto fail;
+		}
 		if (boot_kind == ConfiguredBootKind::Bios)
 		{
 			// Exact PCSX2 Start BIOS contract: MainWindow::
@@ -1075,6 +1653,64 @@ int main()
 			goto fail;
 	}
 	vm_initialized = true;
+	{
+		const std::string configured_bios_path =
+			Path::Combine(EmuFolders::Bios, BIOS_FILE);
+		if (BiosPath != configured_bios_path)
+		{
+			Error::SetStringFmt(&error,
+				"PCSX2 loaded BIOS '{}' instead of the configured exact image '{}'.",
+				BiosPath, configured_bios_path);
+			goto fail;
+		}
+		// PCSX2's LoadBIOS() also probes for optional .rom1/.rom2 files beside
+		// the selected image. This product uses one complete, authenticated
+		// 4 MiB retail image, so accepting an unauthenticated companion would
+		// make the guest machine differ from both the workload metadata and the
+		// receipt even though the primary-image SHA-256 still matched.
+		if (BiosRom.size() != Ps2MemSize::Rom)
+		{
+			Error::SetStringFmt(&error,
+				"PCSX2 composed {} BIOS bytes, expected only the authenticated {}-byte image; remove or authenticate adjacent ROM1/ROM2 companions.",
+				BiosRom.size(), static_cast<size_t>(Ps2MemSize::Rom));
+			goto fail;
+		}
+		Console.WriteLn(
+			"VitaSX2 BIOS loaded: path=%s bytes=%u checksum=%08x description=%s.",
+			BiosPath.c_str(), static_cast<u32>(BiosRom.size()), BiosChecksum,
+			BiosDescription.c_str());
+	}
+	if (workload.enabled)
+	{
+		const PortableStateLoadResult load_result =
+			SaveState_LoadPortableStateFileForVitaWorkloadReplay(
+				workload.state_path.c_str(), &error);
+		if (load_result != PortableStateLoadResult::Loaded)
+		{
+			if (!error.IsValid())
+			{
+				Error::SetStringFmt(&error,
+					"Workload '{}' portable state load failed (result={}).",
+					workload.slug, static_cast<u32>(load_result));
+			}
+			goto fail;
+		}
+
+		// The portable payload owns emulated PAD/SIO state, while the product's
+		// frame-driven autofire phase and correlated profiler origin are host
+		// state. Re-arm both only after every load owner has succeeded.
+		InputManager::ResetVitaPadAutoFire();
+		if (VMManager::Internal::HasBootedELF())
+			InputManager::NotifyVitaPadElfEntry();
+		VitaGS::NotifyPerformanceWorkloadReplayLoaded();
+		Console.WriteLn(
+			"VitaSX2 workload loaded: slug=%s disc=%s state=%s card1=%s card2=%s frame=%u ee_pc=%08x iop_pc=%08x ee_cycle=%llu iop_cycle=%llu.",
+			workload.slug.c_str(), workload.disc_basename.c_str(),
+			workload.state_basename.c_str(), workload.card1_basename.c_str(),
+			workload.card2_basename.c_str(), g_FrameCount, cpuRegs.pc, psxRegs.pc,
+			static_cast<unsigned long long>(cpuRegs.cycle),
+			static_cast<unsigned long long>(psxRegs.cycle));
+	}
 
 	if (!NativeProvidersSelected())
 	{
@@ -1102,15 +1738,32 @@ int main()
 #endif
 
 	{
-		char initialized[1024];
+		char initialized[2048];
 		const int length = std::snprintf(initialized, sizeof(initialized),
-			"status=initialized\nserial=%s\nelf=%s\ncrc=%08x\nfpcr=%08x\n"
-			"providers=ee-a32,iop-a32,vu0-a32,vu1-a32\ncard0=%u\ncard1=%u\n",
+			"status=initialized\nbios=%s\nbios_checksum=%08x\nbios_description=%s\n"
+			"serial=%s\nelf=%s\ncrc=%08x\nfpcr=%08x\n"
+			"providers=ee-a32,iop-a32,vu0-a32,vu1-a32\ncard0=%u\ncard1=%u\n"
+			"workload_replay=%u\nworkload_slug=%s\nworkload_manifest=%s\n"
+			"workload_disc=%s\nworkload_state=%s\nworkload_card1=%s\n"
+			"workload_card2=%s\nworkload_card1_provisioned=%u\n"
+			"workload_card2_provisioned=%u\nworkload_frame=%u\nworkload_ee_pc=%08x\n"
+			"workload_iop_pc=%08x\n",
+			BiosPath.c_str(), BiosChecksum, BiosDescription.c_str(),
 			VMManager::GetDiscSerial().c_str(), VMManager::GetDiscELF().c_str(),
 			VMManager::GetDiscCRC(),
 			static_cast<u32>(FPControlRegister::GetCurrent().bitmask),
 			FileMcd_IsPresent(0, 0) != 0 ? 1u : 0u,
-			FileMcd_IsPresent(1, 0) != 0 ? 1u : 0u);
+			FileMcd_IsPresent(1, 0) != 0 ? 1u : 0u,
+			workload.enabled ? 1u : 0u,
+			workload.enabled ? workload.slug.c_str() : "none",
+			workload.enabled ? "workload.ini" : "none",
+			workload.enabled ? workload.disc_basename.c_str() : "none",
+			workload.enabled ? workload.state_basename.c_str() : "none",
+			workload.enabled ? workload.card1_basename.c_str() : "none",
+			workload.enabled ? workload.card2_basename.c_str() : "none",
+			workload.enabled && workload.card1_provisioned ? 1u : 0u,
+			workload.enabled && workload.card2_provisioned ? 1u : 0u,
+			g_FrameCount, cpuRegs.pc, psxRegs.pc);
 		if (length <= 0 || static_cast<size_t>(length) >= sizeof(initialized) ||
 			!PublishStatus(initialized_path,
 				std::string_view(initialized, static_cast<size_t>(length))))

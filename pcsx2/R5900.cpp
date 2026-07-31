@@ -114,6 +114,16 @@ static __fi void VitaResetEeDeadlineState(u64 deadline)
 	s_vita_next_event_iop_only = false;
 }
 
+void VitaRestoreEeDeadlineCacheAfterStateLoad()
+{
+	// SaveStateBase::FreezeInternals() has restored the complete PCSX2 event
+	// schedule. The identity of the owner which published nextEventCycle is not
+	// serialized, so conservatively make every private slot due at that exact
+	// boundary. The first boundary therefore takes the full scheduler and
+	// reconstructs precise owners without changing guest-visible timing.
+	VitaResetEeDeadlineState(cpuRegs.nextEventCycle);
+}
+
 static __fi void VitaRefreshCombinedEeOwner()
 {
 	s_vita_ee_owner_event_cycle = std::min(
