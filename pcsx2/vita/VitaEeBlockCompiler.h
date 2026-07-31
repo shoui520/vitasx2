@@ -45,15 +45,24 @@ namespace VitaEE
 	// static JAL into a pure load leaf. The loop block already owns its branch
 	// range; the executor attaches these disjoint ranges to the same recClear()
 	// and RAM-source invalidation lifetime.
+	inline constexpr u32 POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY = 2;
 	struct PollCallWaitLoopSourceProof
 	{
 		bool valid = false;
+		u8 additional_ram_watch_count = 0;
+		u8 reserved[2]{};
 		u32 call_pc = 0;
 		u32 leaf_pc = 0;
+		u32 branch_pc = 0;
+		u32 loop_end_pc = 0;
 		u32 call_scaled_cycles = 0;
 		u32 leaf_scaled_cycles = 0;
 		std::array<u32, 2> call_opcodes{};
 		std::array<u32, 2> leaf_opcodes{};
+		std::array<u32, POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY>
+			additional_ram_watch_address{};
+		std::array<u8, POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY>
+			additional_ram_watch_size{};
 	};
 
 	// A two-stage RAM predicate loop can contain an early forward exit before

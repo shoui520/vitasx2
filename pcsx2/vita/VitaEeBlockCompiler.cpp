@@ -535,6 +535,208 @@ namespace VitaEE
 		constexpr u32 POLL_CALL_CYCLE_MASK =
 			(1u << POLL_CALL_CYCLE_BITS) - 1;
 
+		struct PollCallAdditionalRamWatches
+		{
+			u8 count = 0;
+			std::array<u32, POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY>
+				address{};
+			std::array<u8, POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY>
+				size{};
+		};
+
+		bool IsDirectEeMainRamSpan(u32 guest_address, u32 byte_count)
+		{
+			if (!eeMem || !vtlb_private::vtlbdata.vmap || byte_count == 0)
+				return false;
+
+			const u32 page_remaining =
+				vtlb_private::VTLB_PAGE_SIZE -
+				(guest_address & vtlb_private::VTLB_PAGE_MASK);
+			if (byte_count > page_remaining)
+				return false;
+
+			const vtlb_private::VTLBVirtual mapping =
+				vtlb_private::vtlbdata.vmap[
+					guest_address >> vtlb_private::VTLB_PAGE_BITS];
+			if (mapping.isHandler(guest_address))
+				return false;
+
+			const uptr ram_begin = reinterpret_cast<uptr>(eeMem->Main);
+			const uptr ram_end = ram_begin +
+				std::min(Ps2MemSize::ExposedRam, Ps2MemSize::MainRam);
+			const uptr host = mapping.assumePtr(guest_address);
+			return host >= ram_begin && host < ram_end &&
+				static_cast<uptr>(byte_count) <= ram_end - host;
+		}
+
+		bool AnalyzePollCallAdditionalRamWatches(
+			u32 body_start_pc, u32 loop_end_pc, u32 branch_pc,
+			PollCallAdditionalRamWatches* result)
+		{
+			// The ordinary PCSX2 wait-loop dataflow proves that every accepted
+			// destination is refreshed before reuse. Retaining that loop across
+			// scheduler events additionally requires the address of every body
+			// load. Start narrowly with exact constants constructed inside the
+			// repeated body; invariant or dynamically derived bases keep the
+			// canonical generated path.
+			if (!result || body_start_pc > branch_pc ||
+				branch_pc > UINT32_MAX - 2 * sizeof(u32) ||
+				loop_end_pc != branch_pc + 2 * sizeof(u32) ||
+				loop_end_pc - body_start_pc > 128 * sizeof(u32))
+			{
+				return false;
+			}
+
+			*result = {};
+			std::array<u32, 32> known_value{};
+			u32 known = 1u;
+			const auto clear_known = [&](u32 reg) {
+				if (reg != 0)
+					known &= ~(1u << reg);
+			};
+			const auto set_known = [&](u32 reg, u32 value) {
+				if (reg != 0)
+				{
+					known_value[reg] = value;
+					known |= 1u << reg;
+				}
+			};
+			const auto add_watch = [&](u32 address, u8 size) {
+				for (u32 i = 0; i < result->count; i++)
+				{
+					if (result->address[i] == address &&
+						result->size[i] == size)
+					{
+						return true;
+					}
+				}
+				if (result->count >=
+					POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY)
+				{
+					return false;
+				}
+				const u32 index = result->count++;
+				result->address[index] = address;
+				result->size[index] = size;
+				return true;
+			};
+
+			for (u32 pc = body_start_pc; pc < loop_end_pc; pc += sizeof(u32))
+			{
+				if (pc == branch_pc)
+					continue;
+
+				const u32 code = memRead32(pc);
+				if (code == 0)
+					continue;
+				const u32 opcode = code >> 26;
+				const u32 rs = (code >> 21) & 0x1f;
+				const u32 rt = (code >> 16) & 0x1f;
+				const u32 rd = (code >> 11) & 0x1f;
+				const u32 funct = code & 0x3f;
+
+				if (opcode == 0x2f || (opcode == 0 && funct == 0x0f))
+					continue;
+
+				if (opcode == 0x0f)
+				{
+					set_known(rt, (code & 0xffffu) << 16);
+					continue;
+				}
+				if (opcode >= 0x08 && opcode <= 0x0e)
+				{
+					if ((known & (1u << rs)) != 0)
+					{
+						switch (opcode)
+						{
+							case 0x08:
+							case 0x09:
+								set_known(rt, known_value[rs] +
+									static_cast<s16>(code & 0xffffu));
+								break;
+							case 0x0c:
+								set_known(rt,
+									known_value[rs] & (code & 0xffffu));
+								break;
+							case 0x0d:
+								set_known(rt,
+									known_value[rs] | (code & 0xffffu));
+								break;
+							case 0x0e:
+								set_known(rt,
+									known_value[rs] ^ (code & 0xffffu));
+								break;
+							default:
+								clear_known(rt);
+								break;
+						}
+					}
+					else
+					{
+						clear_known(rt);
+					}
+					continue;
+				}
+				if (opcode == 0x18 || opcode == 0x19)
+				{
+					clear_known(rt);
+					continue;
+				}
+				if (opcode == 0 &&
+					(funct & 0x30) == 0x20 &&
+					(funct & 0x3e) != 0x28)
+				{
+					clear_known(rd);
+					continue;
+				}
+
+				u8 load_size = 0;
+				switch (opcode)
+				{
+					case 0x20:
+					case 0x24:
+						load_size = 1;
+						break;
+					case 0x21:
+					case 0x25:
+						load_size = 2;
+						break;
+					case 0x23:
+					case 0x27:
+						load_size = 4;
+						break;
+					case 0x37:
+						load_size = 8;
+						break;
+					default:
+						break;
+				}
+				if (load_size != 0)
+				{
+					if ((known & (1u << rs)) == 0)
+						return false;
+					const u32 address = known_value[rs] +
+						static_cast<s16>(code & 0xffffu);
+					if ((address & (load_size - 1u)) != 0 ||
+						!IsDirectEeMainRamSpan(address, load_size) ||
+						!add_watch(address, load_size))
+					{
+						return false;
+					}
+					clear_known(rt);
+					continue;
+				}
+
+				if ((opcode & 0x3c) == 0x10 && rs < 4)
+				{
+					clear_known(rt);
+					continue;
+				}
+				return false;
+			}
+			return true;
+		}
+
 		constexpr unsigned HOST_CPU_REGS = 4;
 		constexpr unsigned HOST_BRANCH_STATE = 5;
 		constexpr unsigned HOST_BRANCH_FLAG = HOST_BRANCH_STATE;
@@ -548,24 +750,10 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP4 = 12;
 
 		u32 VitaEeAdvancePollCallWaitToEventCore(u32 start_pc,
-			u32 packed_cycles, u32 leaf_pc, u32 return_pc, u32 call_pc,
-			bool publish_certificate)
+			u32 packed_cycles, u32 leaf_pc, u32 return_pc, u32 call_pc)
 		{
 			const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 				VitaPerformanceTelemetry::CpuStage::EeHelper);
-#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-			if (publish_certificate)
-			{
-				const u32 leaf_load = memRead32(leaf_pc + sizeof(u32));
-				const u32 load_base = (leaf_load >> 21) & 0x1f;
-				const u32 load_address =
-					cpuRegs.GPR.r[load_base].UL[0] +
-					static_cast<s16>(leaf_load & 0xffffu);
-				VitaPublishA32EePollCallWaitSchedulerCertificate(
-					load_address, packed_cycles,
-					leaf_pc, return_pc, call_pc);
-			}
-#endif
 			// A static call and JR are separate PCSX2 BaseBlocks, and each owns
 			// iBranchTest(). Do not turn the multi-block loop into the subtly
 			// different inline-wait contract (cycle == nextEventCycle, PC at the
@@ -644,10 +832,36 @@ namespace VitaEE
 		}
 
 		__noinline u32 VitaEeAdvancePollCallWaitToEvent(u32 packed_cycles,
-			u32 leaf_pc, u32 return_pc, u32 call_pc)
+			u32 leaf_pc, u32 loop_end_pc, u32 call_pc)
 		{
+			const u32 return_pc = call_pc + 2 * sizeof(u32);
+			const u32 branch_pc = loop_end_pc - 2 * sizeof(u32);
+			PollCallAdditionalRamWatches additional_watches;
+			if (!AnalyzePollCallAdditionalRamWatches(
+					return_pc, loop_end_pc, branch_pc,
+					&additional_watches))
+			{
+				return call_pc;
+			}
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+			const u32 leaf_load = memRead32(leaf_pc + sizeof(u32));
+			const u32 load_base = (leaf_load >> 21) & 0x1f;
+			const u32 load_address =
+				cpuRegs.GPR.r[load_base].UL[0] +
+				static_cast<s16>(leaf_load & 0xffffu);
+			VitaPublishA32EePollCallWaitSchedulerCertificate(
+				load_address, packed_cycles, leaf_pc, return_pc, call_pc,
+				additional_watches.count >= 1 ?
+					additional_watches.address[0] : 0,
+				additional_watches.count >= 1 ?
+					additional_watches.size[0] : 0,
+				additional_watches.count >= 2 ?
+					additional_watches.address[1] : 0,
+				additional_watches.count >= 2 ?
+					additional_watches.size[1] : 0);
+#endif
 			return VitaEeAdvancePollCallWaitToEventCore(
-				call_pc, packed_cycles, leaf_pc, return_pc, call_pc, true);
+				call_pc, packed_cycles, leaf_pc, return_pc, call_pc);
 		}
 
 		u32 VitaEeAdvanceTwoPredicateWaitToEventCore(u32 start_pc,
@@ -2970,7 +3184,7 @@ namespace VitaEE
 		u32 leaf_pc, u32 return_pc, u32 call_pc)
 	{
 		return VitaEeAdvancePollCallWaitToEventCore(
-			start_pc, packed_cycles, leaf_pc, return_pc, call_pc, false);
+			start_pc, packed_cycles, leaf_pc, return_pc, call_pc);
 	}
 
 	u32 AdvanceTwoPredicateWaitFromPcToEvent(u32 start_pc,
@@ -14093,6 +14307,8 @@ namespace VitaEE
 				poll_call_proof.valid = true;
 				poll_call_proof.call_pc = i;
 				poll_call_proof.leaf_pc = leaf_pc;
+				poll_call_proof.branch_pc = branch_pc;
+				poll_call_proof.loop_end_pc = loop_end_pc;
 				poll_call_proof.call_scaled_cycles = call_scaled_cycles;
 				poll_call_proof.leaf_scaled_cycles = leaf_scaled_cycles;
 				poll_call_proof.call_opcodes = {
@@ -14100,13 +14316,6 @@ namespace VitaEE
 				poll_call_proof.leaf_opcodes = {leaf_return, leaf_load};
 				continue;
 			}
-
-			// Crossing a real JAL/JR boundary is novel only for the common pure
-			// accessor loop. Keeping the return-to-branch body NOP-only makes the
-			// skipped architectural state and the three PCSX2 scheduler seams
-			// exactly derivable. Richer bodies retain ordinary generated execution.
-			if (poll_call_proof.valid)
-				return false;
 
 			if (opcode == 0x2f || (opcode == 0 && funct == 0x0f))
 				continue; // x86 wait-loop analysis ignores CACHE and SYNC.
@@ -14157,6 +14366,23 @@ namespace VitaEE
 			}
 		}
 
+		if (poll_call_proof.valid)
+		{
+			PollCallAdditionalRamWatches additional_watches;
+			if (!AnalyzePollCallAdditionalRamWatches(
+					poll_call_proof.call_pc + 2 * sizeof(u32),
+					loop_end_pc, branch_pc, &additional_watches))
+			{
+				return false;
+			}
+			poll_call_proof.additional_ram_watch_count =
+				additional_watches.count;
+			poll_call_proof.additional_ram_watch_address =
+				additional_watches.address;
+			poll_call_proof.additional_ram_watch_size =
+				additional_watches.size;
+		}
+
 		if (poll_call_wait_loop_source_proof)
 			*poll_call_wait_loop_source_proof = poll_call_proof;
 		return true;
@@ -14186,12 +14412,11 @@ namespace VitaEE
 				(poll_call_wait_loop->leaf_scaled_cycles <<
 					POLL_CALL_CYCLE_BITS) |
 				(tail_scaled_cycles << (2 * POLL_CALL_CYCLE_BITS));
-			const u32 return_pc =
-				poll_call_wait_loop->call_pc + 2 * sizeof(u32);
 			if (!m_code.EmitMovImm32(HOST_TMP0, packed_cycles) ||
 				!m_code.EmitMovImm32(HOST_TMP1,
 					poll_call_wait_loop->leaf_pc) ||
-				!m_code.EmitMovImm32(HOST_TMP2, return_pc) ||
+				!m_code.EmitMovImm32(HOST_TMP2,
+					poll_call_wait_loop->loop_end_pc) ||
 				!m_code.EmitMovImm32(HOST_TMP3,
 					poll_call_wait_loop->call_pc) ||
 				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(

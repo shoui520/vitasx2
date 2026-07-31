@@ -1887,12 +1887,15 @@ namespace MTGS
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_codegen integer=%llu branch=%llu "
 			"gpr_load=%llu gpr_store=%llu mmi=%llu cop0=%llu cop1=%llu cop2=%llu "
-			"other=%llu poll_call_wait=%llu two_predicate_wait=%llu "
+			"other=%llu poll_call_wait=%llu multi_range_poll_call_wait=%llu "
+			"poll_call_additional_watches=%llu two_predicate_wait=%llu "
 			"largest_pc=0x%08x largest_guest=%u largest_host=%u "
 			"largest_helpers=%u largest_state_loads=%u largest_state_stores=%u "
 			"origin_integer=%llu origin_branch=%llu origin_gpr_load=%llu "
 			"origin_gpr_store=%llu origin_mmi=%llu origin_cop0=%llu origin_cop1=%llu "
 			"origin_cop2=%llu origin_other=%llu origin_poll_call_wait=%llu "
+			"origin_multi_range_poll_call_wait=%llu "
+			"origin_poll_call_additional_watches=%llu "
 			"origin_two_predicate_wait=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(
@@ -1920,6 +1923,12 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_poll_call_wait_blocks,
 				start.ee.generated_poll_call_wait_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_multi_range_poll_call_wait_blocks,
+				start.ee.generated_multi_range_poll_call_wait_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_poll_call_wait_additional_ram_watches,
+				start.ee.generated_poll_call_wait_additional_ram_watches)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_two_predicate_wait_blocks,
 				start.ee.generated_two_predicate_wait_blocks)),
@@ -1959,6 +1968,12 @@ namespace MTGS
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_poll_call_wait_blocks,
 				origin.ee.generated_poll_call_wait_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_multi_range_poll_call_wait_blocks,
+				origin.ee.generated_multi_range_poll_call_wait_blocks)),
+			static_cast<unsigned long long>(CounterDelta(
+				end.ee.generated_poll_call_wait_additional_ram_watches,
+				origin.ee.generated_poll_call_wait_additional_ram_watches)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_two_predicate_wait_blocks,
 				origin.ee.generated_two_predicate_wait_blocks)));

@@ -3812,12 +3812,15 @@ namespace VitaEE
 				block.code.AnalyzeGeneratedCode();
 			const VitaA32EeGeneratedGuestMix guest_mix =
 				AnalyzeGeneratedEeGuestMix(start_pc, compiled_instruction_count);
+			const u32 poll_call_additional_ram_watches =
+				block.poll_call_wait_loop_source_proof.additional_ram_watch_count;
 			VitaRecordA32EeGeneratedCode(start_pc, guest_mix,
 				generated.host_instructions,
 				generated.host_load_instructions, generated.host_store_instructions,
 				generated.helper_call_instructions, generated.state_load_instructions,
 				generated.state_store_instructions,
 				block.poll_call_wait_loop_source_proof.valid,
+				poll_call_additional_ram_watches,
 				block.two_predicate_wait_loop_source_proof.valid);
 		}
 #endif
