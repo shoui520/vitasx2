@@ -712,6 +712,9 @@ namespace VitaEE
 		static bool IsExactFourWordFillLoop(u32 start_pc, u32 instruction_count,
 			unsigned* pointer_guest = nullptr, unsigned* end_guest = nullptr,
 			unsigned* value_guest = nullptr);
+		static bool IsExactPairQwordFillLoop(u32 start_pc, u32 instruction_count,
+			unsigned* pointer_guest = nullptr, unsigned* count_guest = nullptr,
+			unsigned* value_guest = nullptr, unsigned* result_guest = nullptr);
 		static bool IsExactPreincrementWordFillLoop(u32 start_pc, u32 instruction_count,
 			unsigned* pointer_guest = nullptr, unsigned* end_guest = nullptr,
 			unsigned* value_guest = nullptr, unsigned* result_guest = nullptr);
@@ -894,6 +897,9 @@ namespace VitaEE
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompileFourWordFillLoop(u32 start_pc, u32 instruction_count,
+			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
+			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
+		bool CompilePairQwordFillLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompilePreincrementWordFillLoop(u32 start_pc, u32 instruction_count,

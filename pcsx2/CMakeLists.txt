@@ -270,6 +270,11 @@ if(VITASX2_EE_INTC_VBLANK_RAM_WAIT_CONTROL)
 			VITASX2_EE_INTC_VBLANK_RAM_WAIT_CONTROL=1
 	)
 endif()
+if(VITASX2_EE_PAIR_QWORD_FILL_CONTROL)
+	set_property(SOURCE vita/VitaEeBlockCompiler.cpp APPEND PROPERTY
+		COMPILE_DEFINITIONS VITASX2_EE_PAIR_QWORD_FILL_CONTROL=1
+	)
+endif()
 
 # The VU1 generated-code ABI owns Q4-Q7 for VF/ACC residency.  Its outer
 # execution wrapper preserves D8-D15 once for AAPCS; prevent the C++ control

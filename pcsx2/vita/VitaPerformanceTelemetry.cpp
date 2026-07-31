@@ -963,6 +963,32 @@ namespace VitaPerformanceTelemetry
 		totals.ee_byte_copy_countdown_counter_exits += counter_exit ? 1u : 0u;
 	}
 
+	void RecordEePairQwordFillCompile()
+	{
+		s_cpu_stage_profiler.totals.ee_pair_qword_fill_blocks++;
+	}
+
+	void RecordEePairQwordFillExecution(u32 bulk_bytes, bool zero_bulk,
+		bool scalar_iteration, bool page_return, bool redispatch)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.ee_pair_qword_fill_helper_calls++;
+		if (bulk_bytes != 0)
+		{
+			totals.ee_pair_qword_fill_bulk_chunks++;
+			totals.ee_pair_qword_fill_bulk_bytes += bulk_bytes;
+			if (zero_bulk)
+			{
+				totals.ee_pair_qword_fill_zero_bulk_chunks++;
+				totals.ee_pair_qword_fill_zero_bulk_bytes += bulk_bytes;
+			}
+		}
+		totals.ee_pair_qword_fill_scalar_iterations +=
+			scalar_iteration ? 1u : 0u;
+		totals.ee_pair_qword_fill_page_returns += page_return ? 1u : 0u;
+		totals.ee_pair_qword_fill_redispatches += redispatch ? 1u : 0u;
+	}
+
 	void CountCpuStageEntry(CpuStage stage)
 	{
 		if (!g_cpu_stage_sample_active)

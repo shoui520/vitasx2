@@ -348,6 +348,15 @@ namespace VitaPerformanceTelemetry
 		u64 ee_byte_copy_countdown_page_returns = 0;
 		u64 ee_byte_copy_countdown_redispatches = 0;
 		u64 ee_byte_copy_countdown_counter_exits = 0;
+		u64 ee_pair_qword_fill_blocks = 0;
+		u64 ee_pair_qword_fill_helper_calls = 0;
+		u64 ee_pair_qword_fill_bulk_chunks = 0;
+		u64 ee_pair_qword_fill_bulk_bytes = 0;
+		u64 ee_pair_qword_fill_zero_bulk_chunks = 0;
+		u64 ee_pair_qword_fill_zero_bulk_bytes = 0;
+		u64 ee_pair_qword_fill_scalar_iterations = 0;
+		u64 ee_pair_qword_fill_page_returns = 0;
+		u64 ee_pair_qword_fill_redispatches = 0;
 		u64 iop_compile_observations = 0;
 		u64 iop_compile_time_us = 0;
 		u64 iop_hot_region_provider_samples = 0;
@@ -500,6 +509,9 @@ namespace VitaPerformanceTelemetry
 	void RecordEeByteCopyCountdownExecution(u32 bulk_bytes,
 		bool scalar_iteration, bool page_return, bool redispatch,
 		bool counter_exit);
+	void RecordEePairQwordFillCompile();
+	void RecordEePairQwordFillExecution(u32 bulk_bytes, bool zero_bulk,
+		bool scalar_iteration, bool page_return, bool redispatch);
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
 		bool callback_due);
@@ -726,6 +738,32 @@ namespace VitaPerformanceTelemetry
 		(void)page_return;
 		(void)redispatch;
 		(void)counter_exit;
+#endif
+	}
+
+	inline void RecordEePairQwordFillCompileIfProfiling()
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordEePairQwordFillCompile();
+#endif
+	}
+
+	inline void RecordEePairQwordFillExecutionIfProfiling(u32 bulk_bytes,
+		bool zero_bulk, bool scalar_iteration, bool page_return, bool redispatch)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+		{
+			RecordEePairQwordFillExecution(
+				bulk_bytes, zero_bulk, scalar_iteration, page_return, redispatch);
+		}
+#else
+		(void)bulk_bytes;
+		(void)zero_bulk;
+		(void)scalar_iteration;
+		(void)page_return;
+		(void)redispatch;
 #endif
 	}
 

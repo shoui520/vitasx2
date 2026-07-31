@@ -108,6 +108,10 @@ option(VITASX2_EE_INTC_VBLANK_RAM_WAIT_CONTROL
 	"Diagnostic control: leave mixed INTC-VBlank/RAM two-predicate EE waits on the generic bounded scheduler path."
 	OFF)
 
+option(VITASX2_EE_PAIR_QWORD_FILL_CONTROL
+	"Diagnostic control: leave exact two-SQ countdown fills on the ordinary generated EE loop."
+	OFF)
+
 option(VITASX2_VITA_SOFTWARE_GS_CONTROL
 	"Use PCSX2's software GS renderer with the current Vita core and GXM presenter."
 	OFF)
