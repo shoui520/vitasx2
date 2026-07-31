@@ -102,6 +102,7 @@ static bool s_qemuIopBlockCycleBatchingEnabled = true;
 static bool s_qemuIopLinkedFrameBypassEnabled = true;
 static bool s_qemuIopResidentPreludeLinksEnabled = true;
 static bool s_qemuIopResidentGprLinksEnabled = true;
+static bool s_qemuIopPublishedEventDeadlineResidencyEnabled = true;
 static bool s_qemuIopSequentialQwordCopyEnabled = true;
 static bool s_qemuIopBranchTestSchedulingEnabled = true;
 static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
@@ -1216,6 +1217,38 @@ namespace
 	}
 #endif
 
+	inline __attribute__((always_inline)) u32 GetPublishedIopEventCountdown()
+	{
+		const u64 cycle = psxRegs.cycle;
+		const u64 deadline = psxRegs.iopNextEventCycle;
+		// PCSX2's x86 owner uses SUB/JS, so even an arbitrary restored 64-bit
+		// horizon is ordered by the sign of this wrapping difference rather
+		// than by an unsigned <= comparison.
+		if (static_cast<s64>(cycle - deadline) >= 0)
+			return 0;
+		const u64 distance = deadline - cycle;
+		return distance <= INT32_MAX ? static_cast<u32>(distance) : UINT32_MAX;
+	}
+
+	extern "C" __attribute__((noinline)) u32
+	VitaIopA32LoadPublishedEventCountdown()
+	{
+		return GetPublishedIopEventCountdown();
+	}
+
+	extern "C" __attribute__((noinline)) u32
+	VitaIopA32TestEventAndLoadPublishedCountdown()
+	{
+		if (static_cast<s64>(psxRegs.cycle - psxRegs.iopNextEventCycle) >= 0)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			s_qemuIopBranchEventTestsEntered++;
+#endif
+			iopEventTest();
+		}
+		return GetPublishedIopEventCountdown();
+	}
+
 	extern "C" __attribute__((noinline)) bool
 	VitaIopA32TraceInstruction(u32 pc, u32 opcode)
 	{
@@ -1454,6 +1487,12 @@ namespace VitaIOP
 			VitaRegion::GuestDomain::Iop : VitaRegion::GuestDomain::None;
 		m_resident_contract.base_entry.Bind(HOST_PSX_REGS,
 			VitaRegion::ResidentValue::CoreStateBase);
+		if (m_resident_event_deadline)
+		{
+			m_resident_contract.base_entry.Bind(
+				HOST_REGISTER_JUMP_TARGET,
+				VitaRegion::ResidentValue::IopPublishedEventCountdown);
+		}
 		if (m_iop_cycle_base_register_available)
 		{
 			m_resident_contract.base_entry.Bind(HOST_CYCLE_BASE,
@@ -1478,7 +1517,13 @@ namespace VitaIOP
 		m_resident_gpr_contract_safe =
 			m_resident_gpr_contract_safe && s_qemuIopResidentGprLinksEnabled;
 #endif
-		if (m_resident_gpr_contract_safe)
+		// A GPR entry exists only when there is a guest value to inherit.
+		// Publishing the base-only contract as a GPR entry leaves its offset at
+		// zero, which is the callable adapter rather than the post-load body.
+		// A dirty predecessor could then patch its first canonical store straight
+		// into a second PUSH/SUB frame and bypass the store. This became common
+		// when the published-event countdown reserved r8 and reduced the pin set.
+		if (m_resident_gpr_contract_safe && m_pinned_gpr_count != 0)
 		{
 			m_resident_contract.gpr_entry = m_resident_contract.base_entry;
 			for (u8 i = 0; i < m_pinned_gpr_count; i++)
@@ -1716,6 +1761,8 @@ namespace VitaIOP
 		{
 			return false;
 		}
+		if (m_resident_event_deadline && !EmitReloadPublishedEventCountdown())
+			return false;
 		const size_t resident_body = m_code.Size();
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_CPU_PROFILER)
 		if (resident_body_branch != static_cast<size_t>(-1) &&
@@ -1763,12 +1810,16 @@ namespace VitaIOP
 
 	void BlockCompiler::FinalizeResidentExitContract()
 	{
-		m_resident_contract.exit = {};
+		// Callee-saved core/RAM bases, and the countdown after its exact
+		// block-cycle rebase, are valid at every ordinary linked exit whether or
+		// not this block can also carry guest GPRs. Keep the base proof
+		// independent from the stricter pinned-GPR proof so disabling or
+		// rejecting GPR residency does not also disable safe prelude links.
+		m_resident_contract.exit = m_resident_contract.base_entry;
 		m_resident_contract.dirty_gpr_host_mask = 0;
 		if (!m_resident_gpr_contract_safe)
 			return;
 
-		m_resident_contract.exit = m_resident_contract.base_entry;
 		for (u8 i = 0; i < m_pinned_gpr_count; i++)
 		{
 			const PinnedGpr& pin = m_pinned_gprs[i];
@@ -2209,7 +2260,8 @@ namespace VitaIOP
 		constexpr std::array<u8, 2> pin_hosts = {HOST_SAVED1,
 			HOST_REGISTER_JUMP_TARGET};
 		const u8 pin_host_count =
-			reserves_register_jump_host ? 1 : static_cast<u8>(pin_hosts.size());
+			(reserves_register_jump_host || m_resident_event_deadline) ?
+				1 : static_cast<u8>(pin_hosts.size());
 		for (u8 host_index = 0; host_index < pin_host_count; host_index++)
 		{
 			const u8 host = pin_hosts[host_index];
@@ -2251,6 +2303,8 @@ namespace VitaIOP
 			m_required_saved_registers |= REG_R10;
 		if (m_iop_ram_registers_available)
 			m_required_saved_registers |= REG_R11;
+		if (m_resident_event_deadline)
+			m_required_saved_registers |= REG_R8;
 		for (u8 i = 0; i < m_pinned_gpr_count; i++)
 			m_required_saved_registers |= static_cast<u16>(1u << m_pinned_gprs[i].host);
 
@@ -6160,6 +6214,45 @@ namespace VitaIOP
 #endif
 	}
 
+	bool BlockCompiler::EmitReloadPublishedEventCountdown()
+	{
+		// The normal Vita owner publishes a near deadline, but savestates and
+		// diagnostic fixtures may legally restore an arbitrary 64-bit value.
+		// Represent only a non-negative distance <= INT32_MAX in r8. UINT32_MAX
+		// is the fail-closed marker which selects the complete 64-bit comparison
+		// at the next branch seam. This entry calculation runs once per linked
+		// chain and remains out of every region backedge.
+		return m_code.EmitCallAbsolute(
+				   reinterpret_cast<const void*>(&VitaIopA32LoadPublishedEventCountdown),
+				   HOST_CALL_SCRATCH) &&
+		       m_code.EmitMovRegShiftImm(HOST_REGISTER_JUMP_TARGET, HOST_TMP0,
+				   VitaA32::ShiftType::LSL, 0);
+	}
+
+	bool BlockCompiler::EmitConsumePublishedEventCountdown()
+	{
+		// A logical BaseBlock can end at an artificial fallthrough seam rather
+		// than iPsxBranchTest(). It still publishes its accumulated IOP cycles
+		// before a direct link, so carry the resident distance forward by the
+		// same exact amount without dispatching an event at a seam PCSX2 does
+		// not own. Preserve UINT32_MAX as the complete-comparison sentinel.
+		if (!m_code.EmitCmpImm32(HOST_REGISTER_JUMP_TARGET, UINT32_MAX))
+			return false;
+		const size_t done =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (done == static_cast<size_t>(-1))
+			return false;
+
+		const bool subtracted =
+			m_code.EmitSubImm32(HOST_REGISTER_JUMP_TARGET,
+				HOST_REGISTER_JUMP_TARGET, m_budget_cycle_count) ||
+			(m_code.EmitMovImm32(HOST_TMP0, m_budget_cycle_count) &&
+			 m_code.EmitSubReg(HOST_REGISTER_JUMP_TARGET,
+				 HOST_REGISTER_JUMP_TARGET, HOST_TMP0));
+		return subtracted &&
+		       m_code.PatchBranch(done, m_code.Size(), VitaA32::Condition::EQ);
+	}
+
 	bool BlockCompiler::EmitQemuCounterIncrement(u32* counter)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -6196,9 +6289,60 @@ namespace VitaIOP
 		if (!BranchTestSchedulingEnabled())
 			return EmitIopEventTestFastPath();
 
-		// PCSX2's next iPsxBranchTest() seam compares the completed 64-bit IOP
-		// cycle against iopNextEventCycle and enters iopEventTest() only when
-		// due. SUBS/SBCS plus MI reproduces x86's signed 64-bit SUB/JS test.
+		// PCSX2's next iPsxBranchTest() seam compares the completed IOP cycle
+		// against iopNextEventCycle and enters iopEventTest() only when due.
+		// Helper-free scalar regions retain a bounded distance to the published
+		// deadline in callee-saved r8. Each linked BaseBlock consumes its exact
+		// private cycle total. UINT32_MAX marks an arbitrary restored horizon and
+		// selects the complete PCSX2 comparison.
+		if (m_resident_event_deadline)
+		{
+			if (!m_code.EmitCmpImm32(HOST_REGISTER_JUMP_TARGET, UINT32_MAX))
+				return false;
+			const size_t full_compare =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+			if (full_compare == static_cast<size_t>(-1))
+				return false;
+
+			const bool subtracted =
+				m_code.EmitSubImm32(HOST_REGISTER_JUMP_TARGET,
+					HOST_REGISTER_JUMP_TARGET, m_budget_cycle_count, true) ||
+				(m_code.EmitMovImm32(HOST_TMP0, m_budget_cycle_count) &&
+				 m_code.EmitSubReg(HOST_REGISTER_JUMP_TARGET,
+					 HOST_REGISTER_JUMP_TARGET, HOST_TMP0, true));
+			if (!subtracted)
+				return false;
+			const size_t not_due =
+				m_code.EmitBranchPlaceholder(VitaA32::Condition::GT);
+			if (not_due == static_cast<size_t>(-1) ||
+				!EmitIopEventTestFastPath() ||
+				!EmitReloadPublishedEventCountdown())
+			{
+				return false;
+			}
+			const size_t skip_full = m_code.EmitBranchPlaceholder();
+			const size_t full = m_code.Size();
+			if (skip_full == static_cast<size_t>(-1) ||
+				!m_code.PatchBranch(full_compare, full, VitaA32::Condition::EQ))
+			{
+				return false;
+			}
+
+			if (!m_code.EmitCallAbsolute(
+					reinterpret_cast<const void*>(
+						&VitaIopA32TestEventAndLoadPublishedCountdown),
+					HOST_CALL_SCRATCH) ||
+				!m_code.EmitMovRegShiftImm(HOST_REGISTER_JUMP_TARGET, HOST_TMP0,
+					VitaA32::ShiftType::LSL, 0))
+			{
+				return false;
+			}
+			const size_t done = m_code.Size();
+			return m_code.PatchBranch(not_due, done, VitaA32::Condition::GT) &&
+			       m_code.PatchBranch(skip_full, done);
+		}
+
+		// SUBS/SBCS plus MI reproduces x86's signed 64-bit SUB/JS test.
 		if (!(m_code.EmitAddImm32(HOST_CALL_SCRATCH, HOST_PSX_REGS,
 				static_cast<u32>(CYCLE_OFFSET)) ||
 				(m_code.EmitMovImm32(HOST_CALL_SCRATCH,
@@ -7483,6 +7627,16 @@ namespace VitaIOP
 		// an architectural early exit commits it exactly once.
 		const bool active_irx_import = m_irx_import_hle || m_irx_import_debug ||
 			(m_irx_import_log && m_irx_import_funcname);
+		m_resident_event_deadline = m_defer_cycle_updates &&
+			legacy_cycle_deferral && !active_irx_import &&
+			BranchTestSchedulingEnabled();
+#if defined(VITASX2_IOP_PUBLISHED_EVENT_DEADLINE_CONTROL)
+		m_resident_event_deadline = false;
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+		m_resident_event_deadline = m_resident_event_deadline &&
+			s_qemuIopPublishedEventDeadlineResidencyEnabled;
+#endif
 		if (active_irx_import && !m_defer_cycle_updates)
 		{
 			// The x86 owner can leave the complete block-cycle delta private when
@@ -7645,6 +7799,17 @@ namespace VitaIOP
 			!m_static_branch_flags_live &&
 			!EmitPublishCyclePrefix(m_block_cycle_count))
 			return false;
+		// The ordinary branch/jump paths below consume this logical block's
+		// cycles as part of their event test. A pure fallthrough has no PCSX2
+		// event seam, but a resident direct link still needs its countdown
+		// rebased to the cycle value just published above.
+		if (!physical_continuation && m_resident_event_deadline &&
+			!has_native_static_branch && !has_native_static_jump &&
+			!has_native_register_jump &&
+			!EmitConsumePublishedEventCountdown())
+		{
+			return false;
+		}
 		if (m_expanded_cycle_batching)
 			RecordBatchedCycleExitSavings(instruction_count, false);
 		FinalizeResidentExitContract();
@@ -8543,6 +8708,15 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopResidentGprLinksEnabled = enabled;
+#else
+		(void)enabled;
+#endif
+	}
+
+	void BlockExecutor::SetPublishedEventDeadlineResidencyEnabled(bool enabled)
+	{
+#if defined(VITASX2_QEMU_VALIDATION)
+		s_qemuIopPublishedEventDeadlineResidencyEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -12075,14 +12249,31 @@ namespace VitaIOP
 				block.Fragment(link.fragment_index);
 			const CachedBlock::CodeFragment& target_fragment =
 				target->Fragment(0);
+			// Entry contracts describe what a body may consume, not what every
+			// path through that body preserves. Mutable residents such as the
+			// published event countdown must be admitted from the source's
+			// proven normal-exit contract.
 			use_resident_entry =
-				source_fragment.resident.base_entry.Provides(
+				source_fragment.resident.exit.Provides(
 					target_fragment.resident.base_entry) &&
 				ResidentEntryPoint(*target) != nullptr;
 			use_resident_gpr_entry =
 				source_fragment.resident.exit.Provides(
 					target_fragment.resident.gpr_entry) &&
 				ResidentGprEntryPoint(*target) != nullptr;
+			// The published event horizon is mutable cross-block state, while
+			// the current GPR bypass rewrites an earlier canonical guest-store
+			// seam after the ordinary target branch has already been selected.
+			// Keep the proven base/countdown entry, but do not compose that
+			// mutation with pinned-GPR store/load elision until the combined
+			// exit proof has its own adversarial retail-oracle gate. This is
+			// deliberately scoped to countdown contracts; existing immutable
+			// base/GPR links remain unchanged.
+			if (target_fragment.resident.gpr_entry.Contains(
+					VitaRegion::ResidentValue::IopPublishedEventCountdown))
+			{
+				use_resident_gpr_entry = false;
+			}
 			for (unsigned host = 0;
 				use_resident_gpr_entry &&
 					host < VitaRegion::EntryContract::HostRegisterCount;

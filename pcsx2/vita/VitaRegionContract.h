@@ -27,6 +27,7 @@ namespace VitaRegion
 		MainMemoryBase,
 		MainMemoryMask,
 		GuestGprLow32,
+		IopPublishedEventCountdown,
 	};
 
 	struct ResidentBinding
@@ -68,6 +69,16 @@ namespace VitaRegion
 				}
 			}
 			return true;
+		}
+
+		[[nodiscard]] constexpr bool Contains(ResidentValue value) const
+		{
+			for (const ResidentBinding& binding : host_values)
+			{
+				if (binding.value == value)
+					return true;
+			}
+			return false;
 		}
 	};
 } // namespace VitaRegion

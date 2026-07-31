@@ -473,6 +473,8 @@ namespace VitaIOP
 			bool test_budget = true);
 		bool BranchTestSchedulingEnabled() const;
 		bool EmitBranchEventTest(u8 scheduler_resume_slot = UINT8_MAX);
+		bool EmitConsumePublishedEventCountdown();
+		bool EmitReloadPublishedEventCountdown();
 		bool EmitQemuCounterIncrement(u32* counter);
 		bool EmitChargeEeBudgetPs1(u32 known_block_cycles);
 		bool EmitPcChangedExitCheck(u32 expected_pc,
@@ -646,6 +648,7 @@ namespace VitaIOP
 		u32 m_budget_cycle_count = 0;
 		ResidentFragmentContract m_resident_contract{};
 		bool m_resident_gpr_contract_safe = false;
+		bool m_resident_event_deadline = false;
 		bool m_iop_ram_registers_available = false;
 		bool m_iop_ram_mask_register_available = false;
 		bool m_iop_cycle_base_register_available = false;
@@ -744,6 +747,7 @@ namespace VitaIOP
 		static void SetLinkedFrameBypassEnabled(bool enabled);
 		static void SetResidentPreludeLinksEnabled(bool enabled);
 		static void SetResidentGprLinksEnabled(bool enabled);
+		static void SetPublishedEventDeadlineResidencyEnabled(bool enabled);
 		static void SetSequentialQwordCopyEnabled(bool enabled);
 		static void SetBranchTestSchedulingEnabled(bool enabled);
 		static void SetPrivateDispatcherHotPathEnabled(bool enabled);
