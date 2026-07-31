@@ -96,6 +96,10 @@ option(VITASX2_IOP_HOT_REGION_CONTROL
 	"Diagnostic control: retain one PCSX2 IOP BaseBlock event/budget seam per generated block."
 	OFF)
 
+option(VITASX2_EE_HOT_REGION_CONTROL
+	"Diagnostic control: retain the source iBranchTest seam while the bounded EE region experiment has not passed its Vita CPU0 performance gate."
+	ON)
+
 option(VITASX2_SILENT_HSYNC_FOLD_CONTROL
 	"Diagnostic control: retain every HSync scheduler boundary while both processors hold exact wait certificates."
 	OFF)

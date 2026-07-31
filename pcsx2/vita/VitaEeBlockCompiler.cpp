@@ -10579,6 +10579,68 @@ namespace VitaEE
 #endif
 	}
 
+	bool BlockCompiler::EmitHotRegionEntryCounter(u32* counter,
+		void* request_slot, const void* request_value, u32 request_threshold,
+		size_t* counter_offset, u8* counter_instruction_count)
+	{
+		if (counter_offset)
+			*counter_offset = static_cast<size_t>(-1);
+		if (counter_instruction_count)
+			*counter_instruction_count = 0;
+		if (!counter && !request_slot && !request_value &&
+			request_threshold == 0)
+		{
+			return true;
+		}
+		if (!counter || !request_slot || !request_value ||
+			request_threshold == 0)
+		{
+			return false;
+		}
+
+		// This is a bounded tier-zero counter, not permanent profiling. Only
+		// structurally eligible direct-jump or backward conditional sources
+		// receive it. The generated EE thread increments its own stable
+		// CachedBlock word and publishes a promotion request after the threshold;
+		// the C++ provider consumes that request at its next existing boundary.
+		// Promotion removes this sequence, while refusal rebuilds the canonical
+		// block without it.
+		const size_t start = m_code.Size();
+		const u16 temporaries = REG_R0 | REG_R1;
+		if (!m_code.EmitPush(temporaries) ||
+			!m_code.EmitMovImm32(HOST_TMP0,
+				static_cast<u32>(reinterpret_cast<uptr>(counter))) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!m_code.EmitAddImm8(HOST_TMP1, HOST_TMP1, 1) ||
+			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!m_code.EmitCmpImm32(HOST_TMP1, request_threshold) ||
+			!m_code.EmitMovImm32(HOST_TMP0,
+				static_cast<u32>(reinterpret_cast<uptr>(request_slot)),
+				VitaA32::Condition::CS) ||
+			!m_code.EmitMovImm32(HOST_TMP1,
+				static_cast<u32>(reinterpret_cast<uptr>(request_value)),
+				VitaA32::Condition::CS) ||
+			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0,
+				VitaA32::Condition::CS) ||
+			!m_code.EmitPop(temporaries))
+		{
+			return false;
+		}
+
+		const size_t bytes = m_code.Size() - start;
+		if ((bytes & (sizeof(u32) - 1)) != 0 ||
+			bytes / sizeof(u32) > UINT8_MAX)
+		{
+			return false;
+		}
+		if (counter_offset)
+			*counter_offset = start;
+		if (counter_instruction_count)
+			*counter_instruction_count =
+				static_cast<u8>(bytes / sizeof(u32));
+		return true;
+	}
+
 	bool BlockCompiler::IsRetainableUnconditionalWaitBlock(u32 start_pc,
 		u32 instruction_count)
 	{
@@ -11488,8 +11550,18 @@ namespace VitaEE
 		const void* scheduler_test_elided_direct_exit,
 		const void* retained_wait_event_exit,
 		PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof,
-		TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof)
+		TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof,
+		u32 hot_region_guard_cycles,
+		const void* hot_region_fallback_entry,
+		u32* hot_region_entry_counter, void* hot_region_request_slot,
+		const void* hot_region_request_value, u32 hot_region_request_threshold,
+		size_t* hot_region_counter_offset,
+		u8* hot_region_counter_instruction_count)
 	{
+		if (hot_region_counter_offset)
+			*hot_region_counter_offset = static_cast<size_t>(-1);
+		if (hot_region_counter_instruction_count)
+			*hot_region_counter_instruction_count = 0;
 		if (scheduler_test_elided_continuation_emitted)
 			*scheduler_test_elided_continuation_emitted = false;
 		if (poll_call_wait_loop_source_proof)
@@ -11502,6 +11574,23 @@ namespace VitaEE
 		if (direct_continuation_kind == DirectContinuationKind::Pcsx2ShortSplit &&
 			instruction_count > 6)
 			return false;
+		if ((direct_continuation_kind ==
+				 DirectContinuationKind::HotRegionInternalStaticBranch) !=
+			(hot_region_guard_cycles != 0 && hot_region_fallback_entry != nullptr))
+		{
+			return false;
+		}
+		const bool has_hot_region_counter =
+			hot_region_entry_counter || hot_region_request_slot ||
+			hot_region_request_value || hot_region_request_threshold != 0;
+		if (has_hot_region_counter &&
+			(!hot_region_entry_counter || !hot_region_request_slot ||
+			 !hot_region_request_value || hot_region_request_threshold == 0 ||
+			 direct_continuation_kind ==
+				 DirectContinuationKind::HotRegionInternalStaticBranch))
+		{
+			return false;
+		}
 
 		if (direct_links)
 			*direct_links = {};
@@ -11878,6 +11967,13 @@ namespace VitaEE
 		{
 			return false;
 		}
+		if (direct_continuation_kind ==
+				DirectContinuationKind::HotRegionInternalStaticBranch &&
+			!EmitHotRegionEntryHorizonGuard(
+				hot_region_guard_cycles, hot_region_fallback_entry))
+		{
+			return false;
+		}
 		if (m_gpr_link_signature.IsValid() && m_pin_count != m_gpr_link_signature.count)
 			return false;
 		m_dirty_pins_enabled = dirty_pins_candidate &&
@@ -11984,7 +12080,11 @@ namespace VitaEE
 		if (!EmitGoemonBlockStartHook(start_pc))
 			return false;
 
-		if (!EmitCpuProfilerBlockPc(start_pc, true))
+		if (!EmitCpuProfilerBlockPc(start_pc, true) ||
+			!EmitHotRegionEntryCounter(hot_region_entry_counter,
+				hot_region_request_slot, hot_region_request_value,
+				hot_region_request_threshold, hot_region_counter_offset,
+				hot_region_counter_instruction_count))
 			return false;
 
 		u32 raw_cycles = 0;
@@ -12739,10 +12839,20 @@ namespace VitaEE
 		const bool scheduler_test_elided_continuation_requested =
 			direct_continuation_kind !=
 				DirectContinuationKind::SchedulerTestedTail;
+		const bool hot_region_internal_static_branch =
+			direct_continuation_kind ==
+				DirectContinuationKind::HotRegionInternalStaticBranch &&
+			!has_register_branch_target && !branch_is_likely &&
+			!wait_loop_body && has_branch && direct_link &&
+			((has_static_direct_link_target &&
+				 !has_static_conditional_direct_links) ||
+				(has_static_conditional_direct_links && taken_link));
 		const bool emit_scheduler_test_elided_continuation =
-			scheduler_test_elided_continuation_requested && !has_branch &&
-			(direct_link || direct_continuation_kind ==
-				DirectContinuationKind::A32PhysicalFragment);
+			scheduler_test_elided_continuation_requested &&
+			((!has_branch &&
+				 (direct_link || direct_continuation_kind ==
+					DirectContinuationKind::A32PhysicalFragment)) ||
+			 hot_region_internal_static_branch);
 		// A physical host-code fragment is not a PCSX2 scheduler boundary. If a
 		// helper or invalidation seam suppresses its outgoing link, fail closed so
 		// the executor can use the architectural fallback instead of observing a
@@ -12754,11 +12864,24 @@ namespace VitaEE
 		{
 			return false;
 		}
+		if (direct_continuation_kind ==
+				DirectContinuationKind::HotRegionInternalStaticBranch &&
+			!emit_scheduler_test_elided_continuation)
+		{
+			return false;
+		}
+		const void* const scheduler_elided_exit =
+			scheduler_test_elided_direct_exit ?
+				scheduler_test_elided_direct_exit : direct_exit;
 		const bool tail_ok = emit_scheduler_test_elided_continuation ?
-			EndBlockWithSchedulerElidedDirectContinuation(block_cycles,
-				scheduler_test_elided_direct_exit ?
-					scheduler_test_elided_direct_exit : direct_exit,
-				direct_link, defer_pc_writeback, direct_pc) :
+			(has_static_conditional_direct_links ?
+				EndBlockWithSchedulerElidedConditionalContinuation(
+					block_cycles, scheduler_elided_exit, direct_link,
+					taken_link, defer_pc_writeback, direct_pc,
+					branch_target_pc) :
+				EndBlockWithSchedulerElidedDirectContinuation(block_cycles,
+					scheduler_elided_exit, direct_link,
+					defer_pc_writeback, direct_pc)) :
 			EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
 				direct_link, taken_link,
 				has_register_branch_target ? indirect_lookup_pages_slot : nullptr,
@@ -13406,7 +13529,7 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 		DirectLinkSlot* direct_link, bool defer_pc_writeback, u32 pc,
-		bool sync_private_fallback)
+		bool sync_private_fallback, bool scheduler_test_elided_fallback)
 	{
 		if (!direct_exit || target_branch == static_cast<size_t>(-1))
 			return false;
@@ -13454,7 +13577,8 @@ namespace VitaEE
 					!EmitReclaimedVtlbCanonicalEdge() :
 					!EmitSyncGprPinsToBacking())) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
-			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN,
+			!EmitExitToTarget(direct_exit, scheduler_test_elided_fallback ?
+					EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN : EE_DIRECT_EXIT_TOKEN,
 				requires_compatible_entry && direct_link ?
 					&direct_link->canonical_target_offset : nullptr,
 				requires_compatible_entry && direct_link ?
@@ -14211,6 +14335,101 @@ namespace VitaEE
 		const size_t carry_branches[] = {carry_branch};
 		return EmitCycleCarryFixup(
 			carry_branches, 1, direct_tail, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EndBlockWithSchedulerElidedConditionalContinuation(
+		u32 block_cycles, const void* scheduler_test_elided_direct_exit,
+		DirectLinkSlot* not_taken_link, DirectLinkSlot* taken_link,
+		bool defer_pc_writeback, u32 not_taken_pc, u32 taken_pc)
+	{
+		if (!scheduler_test_elided_direct_exit || !not_taken_link ||
+			!taken_link || block_cycles == 0)
+		{
+			return false;
+		}
+
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile() and
+		// iBranchTest(). A hot-region entry guard has already proved that this
+		// complete source block ends strictly before nextEventCycle. Preserve the
+		// ordinary non-likely branch predicate and delay-slot ordering, but let
+		// either selected BaseBlock edge enter its successor without repeating
+		// iBranchTest() at the source seam.
+		if (!EmitFlushDirtyGprPins())
+			return false;
+
+		size_t carry_branch = static_cast<size_t>(-1);
+		if (!EmitAddScaledCyclesToCpuLowWord(
+				block_cycles, HOST_TMP0, HOST_TMP2, &carry_branch))
+		{
+			return false;
+		}
+
+		const size_t direct_tail = m_code.Size();
+		if (m_deferred_resident_unsigned_branch_suffix)
+		{
+			if (!EmitDeferredResidentUnsignedBranchSuffix())
+				return false;
+		}
+		else if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
+		{
+			return false;
+		}
+
+		const VitaA32::Condition taken_condition =
+			m_deferred_resident_unsigned_branch_suffix ?
+				VitaA32::Condition::CC : VitaA32::Condition::NE;
+		const size_t taken_tail =
+			m_code.EmitBranchPlaceholder(taken_condition);
+		if (taken_tail == static_cast<size_t>(-1) ||
+			!EmitDirectLinkTail(scheduler_test_elided_direct_exit,
+				not_taken_link, defer_pc_writeback, not_taken_pc, false, true) ||
+			!EmitTakenDirectLinkTail(scheduler_test_elided_direct_exit,
+				taken_tail, taken_link, defer_pc_writeback, taken_pc,
+				false, true))
+		{
+			return false;
+		}
+
+		const size_t carry_branches[] = {carry_branch};
+		return EmitCycleCarryFixup(
+			carry_branches, 1, direct_tail, HOST_TMP1);
+	}
+
+	bool BlockCompiler::EmitHotRegionEntryHorizonGuard(
+		u32 source_cycles, const void* fallback_entry)
+	{
+		if (source_cycles == 0 || source_cycles > INT32_MAX || !fallback_entry)
+			return false;
+
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest(). A promoted source
+		// may cross its normal BaseBlock seam only when the source's complete
+		// charge remains strictly before nextEventCycle. The scheduler guarantees
+		// a signed-32-bit event horizon, so the same wrapping low-word predicate
+		// used by EndBlockWithCycleTest() is exact here. Guard failure re-enters
+		// the retained canonical source, which still owns the ordinary event test.
+		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS,
+				static_cast<u16>(CYCLE_OFFSET)))
+		{
+			return false;
+		}
+		if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, source_cycles) &&
+			(!m_code.EmitMovImm32(HOST_TMP2, source_cycles) ||
+			 !m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2)))
+		{
+			return false;
+		}
+		if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS,
+				static_cast<u16>(NEXT_EVENT_OFFSET)) ||
+			!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP1, true))
+		{
+			return false;
+		}
+
+		const size_t event_reaches_source =
+			m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
+		return event_reaches_source != static_cast<size_t>(-1) &&
+			m_code.PatchBranchToAddress(
+				event_reaches_source, fallback_entry, VitaA32::Condition::PL);
 	}
 
 	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,

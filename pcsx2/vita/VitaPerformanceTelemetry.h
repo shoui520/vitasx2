@@ -312,6 +312,12 @@ namespace VitaPerformanceTelemetry
 		u64 ee_compile_observations = 0;
 		u64 ee_compile_time_us = 0;
 #if defined(VITASX2_CPU_PROFILER)
+		u64 ee_hot_region_requests = 0;
+		u64 ee_hot_region_attempts = 0;
+		u64 ee_hot_region_promotions = 0;
+		u64 ee_hot_region_conditional_promotions = 0;
+		u64 ee_hot_region_source_cycles = 0;
+		u64 ee_hot_region_successor_cycles = 0;
 		u64 iop_compile_observations = 0;
 		u64 iop_compile_time_us = 0;
 		u64 iop_hot_region_provider_samples = 0;
@@ -449,6 +455,10 @@ namespace VitaPerformanceTelemetry
 	void RecordIopHotRegionAttempt();
 	void RecordIopHotRegionPromotion(
 		u32 source_cycles, u32 successor_cycles);
+	void RecordEeHotRegionRequest();
+	void RecordEeHotRegionAttempt();
+	void RecordEeHotRegionPromotion(
+		u32 source_cycles, u32 successor_cycles, bool conditional);
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
 		bool callback_due);
@@ -613,6 +623,36 @@ namespace VitaPerformanceTelemetry
 #else
 		(void)source_cycles;
 		(void)successor_cycles;
+#endif
+	}
+
+	inline void RecordEeHotRegionRequestIfProfiling()
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordEeHotRegionRequest();
+#endif
+	}
+
+	inline void RecordEeHotRegionAttemptIfProfiling()
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordEeHotRegionAttempt();
+#endif
+	}
+
+	inline void RecordEeHotRegionPromotionIfProfiling(
+		u32 source_cycles, u32 successor_cycles, bool conditional)
+	{
+#if defined(VITASX2_CPU_PROFILER)
+		if (g_cpu_stage_profiler_enabled)
+			RecordEeHotRegionPromotion(
+				source_cycles, successor_cycles, conditional);
+#else
+		(void)source_cycles;
+		(void)successor_cycles;
+		(void)conditional;
 #endif
 	}
 

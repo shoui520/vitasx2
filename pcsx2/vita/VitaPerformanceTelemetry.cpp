@@ -897,6 +897,26 @@ namespace VitaPerformanceTelemetry
 		totals.iop_hot_region_successor_cycles += successor_cycles;
 	}
 
+	void RecordEeHotRegionRequest()
+	{
+		s_cpu_stage_profiler.totals.ee_hot_region_requests++;
+	}
+
+	void RecordEeHotRegionAttempt()
+	{
+		s_cpu_stage_profiler.totals.ee_hot_region_attempts++;
+	}
+
+	void RecordEeHotRegionPromotion(
+		u32 source_cycles, u32 successor_cycles, bool conditional)
+	{
+		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
+		totals.ee_hot_region_promotions++;
+		totals.ee_hot_region_conditional_promotions += conditional ? 1u : 0u;
+		totals.ee_hot_region_source_cycles += source_cycles;
+		totals.ee_hot_region_successor_cycles += successor_cycles;
+	}
+
 	void CountCpuStageEntry(CpuStage stage)
 	{
 		if (!g_cpu_stage_sample_active)

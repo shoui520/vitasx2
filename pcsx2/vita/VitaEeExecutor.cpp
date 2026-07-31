@@ -11,6 +11,7 @@
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
 #include "pcsx2/vita/VitaPerformanceTelemetry.h"
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
+#include "pcsx2/DebugTools/CoreEventTrace.h"
 #include "pcsx2/DebugTools/GsTrace.h"
 #include "pcsx2/DebugTools/VuTrace.h"
 #include "pcsx2/vita/VitaCore.h"
@@ -66,6 +67,69 @@ namespace
 	constexpr size_t PERSISTENT_DISPATCH_CODE_CAPACITY = 4096;
 	constexpr u32 EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN = 0xc1;
 	constexpr u32 EE_EVENT_HANDLED_EXIT_TOKEN = 0xe8;
+
+	enum class EeHotRegionSourceKind : u8
+	{
+		None,
+		UnconditionalJump,
+		BackwardConditionalBranch,
+	};
+
+	struct EeHotRegionSourceShape
+	{
+		EeHotRegionSourceKind kind = EeHotRegionSourceKind::None;
+		u32 not_taken_pc = 0;
+		u32 taken_pc = 0;
+	};
+
+	EeHotRegionSourceShape AnalyzeEeHotRegionSource(
+		u32 start_pc, u32 instruction_count)
+	{
+		EeHotRegionSourceShape shape;
+		if (instruction_count < 2 ||
+			instruction_count > ((UINT32_MAX - start_pc) / sizeof(u32)))
+		{
+			return shape;
+		}
+
+		const u32 branch_pc =
+			start_pc + (instruction_count - 2) * sizeof(u32);
+		const u32 branch = memRead32(branch_pc);
+		if (memRead32(branch_pc + sizeof(u32)) != 0)
+			return shape;
+
+		const u32 primary = branch >> 26;
+		if (instruction_count == 2 && (primary == 0x02 || primary == 0x03))
+		{
+			shape.kind = EeHotRegionSourceKind::UnconditionalJump;
+			shape.taken_pc = ((branch_pc + sizeof(u32)) & 0xf0000000u) |
+				((branch & 0x03ffffffu) << 2);
+			return shape;
+		}
+
+		// First conditional tier: ordinary integer branches whose delay slot is
+		// always executed. Restrict activation to a backwards edge, which is the
+		// natural-loop shape Phase 5 is intended to amortize. The compiler still
+		// revalidates the complete branch/direct-link contract before emission.
+		if (primary < 0x04 || primary > 0x07 ||
+			!VitaEE::BlockCompiler::IsSupportedBranchOpcode(branch) ||
+			VitaEE::BlockCompiler::IsBranchLikely(branch))
+		{
+			return shape;
+		}
+
+		const s32 displacement =
+			static_cast<s32>(static_cast<s16>(branch & 0xffffu)) * 4;
+		const u32 taken_pc =
+			branch_pc + sizeof(u32) + static_cast<u32>(displacement);
+		if (taken_pc >= start_pc)
+			return shape;
+
+		shape.kind = EeHotRegionSourceKind::BackwardConditionalBranch;
+		shape.not_taken_pc = branch_pc + 2 * sizeof(u32);
+		shape.taken_pc = taken_pc;
+		return shape;
+	}
 
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
 	VitaA32EeGeneratedGuestMix AnalyzeGeneratedEeGuestMix(u32 start_pc,
@@ -828,6 +892,24 @@ namespace VitaEE
 		m_free_cache_head = &block;
 	}
 
+	void BlockExecutor::RemoveFreeCacheEntry(CachedBlock& block)
+	{
+		CachedBlock** link = &m_free_cache_head;
+		while (*link)
+		{
+			if (*link == &block)
+			{
+				*link = block.next_free;
+				block.next_free = nullptr;
+				block.queued_free = false;
+				return;
+			}
+			link = &(*link)->next_free;
+		}
+		block.next_free = nullptr;
+		block.queued_free = false;
+	}
+
 	BlockExecutor::CachedBlock* BlockExecutor::TakeFreeCacheEntry()
 	{
 		while (m_free_cache_head)
@@ -847,6 +929,8 @@ namespace VitaEE
 	{
 		if (!block.valid)
 			return;
+		if (m_hot_region_requested_block == &block)
+			m_hot_region_requested_block = nullptr;
 
 		// A generated store can invalidate the block which is currently running.
 		// Restore every outgoing patch site before removing any metadata so its
@@ -880,6 +964,10 @@ namespace VitaEE
 		block.source_serial = 0;
 		block.direct_continuation_kind =
 			DirectContinuationKind::SchedulerTestedTail;
+		block.hot_region_entry_count = 0;
+		block.hot_region_counter_offset = static_cast<size_t>(-1);
+		block.hot_region_state = 0;
+		block.hot_region_counter_instruction_count = 0;
 		block.discovered_topology = false;
 		block.opcodes.reset();
 		block.code.Release();
@@ -1043,6 +1131,10 @@ namespace VitaEE
 			block.direct_links = {};
 			block.direct_continuation_kind =
 				DirectContinuationKind::SchedulerTestedTail;
+			block.hot_region_entry_count = 0;
+			block.hot_region_counter_offset = static_cast<size_t>(-1);
+			block.hot_region_state = 0;
+			block.hot_region_counter_instruction_count = 0;
 			block.discovered_topology = false;
 			block.opcodes.reset();
 			RememberFreeCacheEntry(block);
@@ -1060,6 +1152,7 @@ namespace VitaEE
 		// the base while resettable block code starts after it.
 		m_code_cache_used = m_persistent_dispatch_entry ?
 			PERSISTENT_DISPATCH_CODE_CAPACITY : 0;
+		m_hot_region_requested_block = nullptr;
 		return invalidated;
 	}
 
@@ -1635,6 +1728,15 @@ namespace VitaEE
 		Reset();
 		m_direct_link_rejection_profile_enabled = enabled;
 		ResetDirectLinkRejectionProfile();
+	}
+
+	void BlockExecutor::SetHotRegionPromotionEnabled(bool enabled)
+	{
+		if (m_hot_region_promotion_enabled == enabled)
+			return;
+
+		Reset();
+		m_hot_region_promotion_enabled = enabled;
 	}
 
 	void BlockExecutor::ResetDirectLinkRejectionProfile()
@@ -2907,11 +3009,238 @@ namespace VitaEE
 		return invalidated;
 	}
 
+	bool BlockExecutor::TryPromoteHotRegion(CachedBlock& block)
+	{
+#if defined(VITASX2_EE_HOT_REGION_CONTROL)
+		(void)block;
+		return false;
+#else
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!m_hot_region_promotion_enabled)
+			return false;
+#endif
+		if (!block.valid || block.hot_region_state != 0)
+			return false;
+
+		// Refusal is sticky for this source generation. A RAM write or cache
+		// reset creates a fresh BaseBlock and therefore a fresh admission chance.
+		block.hot_region_state = 1;
+		VitaPerformanceTelemetry::RecordEeHotRegionAttemptIfProfiling();
+		if (!DisableHotRegionEntryCounter(block))
+			return false;
+		if (!m_persistent_dispatch_enabled || !m_direct_linking_enabled ||
+			!block.discovered_topology || block.instruction_count < 2 ||
+			block.source_instruction_count != block.instruction_count ||
+			block.dependency_start_pc != block.start_pc ||
+			block.dependency_instruction_count != block.instruction_count ||
+			block.direct_continuation_kind !=
+				DirectContinuationKind::SchedulerTestedTail ||
+			block.scaled_cycles == 0 ||
+			block.poll_call_wait_loop_source_proof.valid ||
+			block.two_predicate_wait_loop_source_proof.valid ||
+			EmuConfig.Gamefixes.GoemonTlbHack)
+		{
+			return false;
+		}
+#if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
+		if (VitaIsEePreInstructionTraceEnabled() ||
+			Pcsx2Trace::IsCoreEventTraceEnabled() ||
+			Pcsx2Trace::IsGsTraceEnabled() ||
+			Pcsx2Trace::IsVuTraceEnabled())
+		{
+			return false;
+		}
+#endif
+
+		const EeHotRegionSourceShape shape =
+			AnalyzeEeHotRegionSource(block.start_pc, block.instruction_count);
+		if (shape.kind == EeHotRegionSourceKind::None)
+			return false;
+		if (shape.taken_pc == block.start_pc ||
+			IsPersistentDispatchBarrier(shape.taken_pc) ||
+			(shape.kind == EeHotRegionSourceKind::BackwardConditionalBranch &&
+			 IsPersistentDispatchBarrier(shape.not_taken_pc)))
+		{
+			return false;
+		}
+
+		DirectLinkSlot* taken_link = nullptr;
+		DirectLinkSlot* not_taken_link = nullptr;
+		for (DirectLinkSlot& link : block.direct_links.slots)
+		{
+			if (!link.valid)
+				continue;
+			if (link.target_pc == shape.taken_pc && !taken_link)
+				taken_link = &link;
+			else if (shape.kind ==
+					EeHotRegionSourceKind::BackwardConditionalBranch &&
+				link.target_pc == shape.not_taken_pc && !not_taken_link)
+			{
+				not_taken_link = &link;
+			}
+			else
+			{
+				return false;
+			}
+		}
+		if (!taken_link ||
+			(shape.kind == EeHotRegionSourceKind::BackwardConditionalBranch &&
+			 !not_taken_link))
+		{
+			return false;
+		}
+
+		CachedBlock* const taken_successor =
+			FindLinkTargetByStartPc(shape.taken_pc, true, true);
+		CachedBlock* const not_taken_successor =
+			shape.kind == EeHotRegionSourceKind::BackwardConditionalBranch ?
+				FindLinkTargetByStartPc(shape.not_taken_pc, true, true) :
+				nullptr;
+		const auto valid_successor = [this, &block](const CachedBlock* successor) {
+			if (!successor || successor == &block || !successor->valid ||
+				!successor->discovered_topology ||
+				IsPersistentDispatchBarrier(successor->start_pc))
+			{
+				return false;
+			}
+			return successor->direct_continuation_kind ==
+					DirectContinuationKind::SchedulerTestedTail ||
+				successor->direct_continuation_kind ==
+					DirectContinuationKind::Pcsx2ShortSplit;
+		};
+		if (!valid_successor(taken_successor) ||
+			(shape.kind == EeHotRegionSourceKind::BackwardConditionalBranch &&
+			 !valid_successor(not_taken_successor)))
+		{
+			return false;
+		}
+
+		const size_t aligned_used =
+			AlignUp(m_code_cache_used, CODE_CACHE_ALIGNMENT);
+		if (aligned_used > m_code_cache_capacity ||
+			STRAIGHT_LINE_BLOCK_CODE_CAPACITY >
+				m_code_cache_capacity - aligned_used)
+		{
+			return false;
+		}
+
+		const u32 source_pc = block.start_pc;
+		const u32 source_cycles = block.scaled_cycles;
+		const u32 successor_cycles = not_taken_successor ?
+			std::max(taken_successor->scaled_cycles,
+				not_taken_successor->scaled_cycles) :
+			taken_successor->scaled_cycles;
+		const u32 source_instruction_count = block.instruction_count;
+		const HotRegionPlan plan{
+			LinkedEntryPoint(block),
+			source_cycles,
+		};
+		const VitaPerformanceTelemetry::ScopedCpuStage compile_profile(
+			VitaPerformanceTelemetry::CpuStage::EeCompile);
+		const VitaPerformanceTelemetry::ScopedExactEeCompileMeasurement
+			exact_compile_profile;
+		if (CompileIntoCacheEntry(block, source_pc, source_instruction_count,
+				nullptr, false, source_pc, source_instruction_count, 0,
+				false, true, &plan))
+		{
+			VitaPerformanceTelemetry::RecordEeHotRegionPromotionIfProfiling(
+				source_cycles, successor_cycles,
+				shape.kind ==
+					EeHotRegionSourceKind::BackwardConditionalBranch);
+			return true;
+		}
+		return false;
+#endif
+	}
+
+	bool BlockExecutor::DisableHotRegionEntryCounter(CachedBlock& block)
+	{
+		if (block.hot_region_counter_offset == static_cast<size_t>(-1) ||
+			block.hot_region_counter_instruction_count == 0)
+		{
+			block.hot_region_entry_count = 0;
+			block.hot_region_counter_offset = static_cast<size_t>(-1);
+			block.hot_region_counter_instruction_count = 0;
+			return true;
+		}
+
+		for (u8 i = 0; i < block.hot_region_counter_instruction_count; i++)
+		{
+			if (!block.code.PatchNop(block.hot_region_counter_offset +
+					static_cast<size_t>(i) * sizeof(u32)))
+			{
+				return false;
+			}
+		}
+		if (!block.code.Flush())
+			return false;
+
+		block.hot_region_entry_count = 0;
+		block.hot_region_counter_offset = static_cast<size_t>(-1);
+		block.hot_region_counter_instruction_count = 0;
+		return true;
+	}
+
+	bool BlockExecutor::ServiceHotRegionRequest()
+	{
+#if defined(VITASX2_EE_HOT_REGION_CONTROL)
+		m_hot_region_requested_block = nullptr;
+		return true;
+#else
+#if defined(VITASX2_QEMU_VALIDATION)
+		if (!m_hot_region_promotion_enabled)
+		{
+			m_hot_region_requested_block = nullptr;
+			return true;
+		}
+#endif
+		CachedBlock* const requested = m_hot_region_requested_block;
+		m_hot_region_requested_block = nullptr;
+		if (!requested || !requested->valid ||
+			requested->hot_region_state != 0 ||
+			requested->hot_region_entry_count <
+				HOT_REGION_ENTRY_PROMOTION_THRESHOLD)
+		{
+			return true;
+		}
+
+		VitaPerformanceTelemetry::RecordEeHotRegionRequestIfProfiling();
+		const u32 source_pc = requested->start_pc;
+		const u32 source_instructions = requested->source_instruction_count;
+		const u32 dependency_pc = requested->dependency_start_pc;
+		const u32 dependency_instructions =
+			requested->dependency_instruction_count;
+		const u32 charged_before =
+			requested->dependency_charged_cycles_before;
+		const bool pcsx2_short_split =
+			requested->direct_continuation_kind ==
+				DirectContinuationKind::Pcsx2ShortSplit;
+		const bool discovered = requested->discovered_topology;
+		if (TryPromoteHotRegion(*requested))
+			return true;
+
+		// A rejected source has already paid for a real generated-execution
+		// sample. Rebuild its ordinary PCSX2 BaseBlock once without the tier-zero
+		// counter so refusal cannot leave permanent work on a 496 MHz core.
+		if (!CompileIntoCacheEntry(*requested, source_pc,
+				source_instructions, nullptr, false, dependency_pc,
+				dependency_instructions, charged_before, pcsx2_short_split,
+				discovered, nullptr, false))
+		{
+			RememberFreeCacheEntry(*requested);
+			return false;
+		}
+		requested->hot_region_state = 1;
+		return true;
+#endif
+	}
+
 	bool BlockExecutor::CompileIntoCacheEntry(CachedBlock& block, u32 start_pc,
 		u32 instruction_count, u32* scaled_cycles, bool allow_code_budget_split,
 		u32 dependency_start_pc, u32 dependency_instruction_count,
 		u32 dependency_charged_cycles_before, bool pcsx2_short_split,
-		bool discovered_topology)
+		bool discovered_topology, const HotRegionPlan* hot_region,
+		bool allow_hot_region_counter)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -2944,6 +3273,11 @@ namespace VitaEE
 			m_persistent_event_exit : reinterpret_cast<const void*>(&VitaEeA32EventExit);
 
 		InvalidateCachedBlock(block);
+		// Ordinary compilation preserves the existing O(1) lazy free-list
+		// cleanup. Promotion is the exceptional in-place rebuild: it must keep
+		// this now-live metadata object out of the reusable list.
+		if (hot_region)
+			RemoveFreeCacheEntry(block);
 		std::unique_ptr<u32[]> source_opcodes(
 			new (std::nothrow) u32[dependency_instruction_count]);
 		if (!source_opcodes)
@@ -2961,6 +3295,41 @@ namespace VitaEE
 			}
 		}
 
+		bool instrument_hot_region_entry =
+			allow_hot_region_counter && !hot_region &&
+			m_persistent_dispatch_enabled && m_direct_linking_enabled &&
+			discovered_topology && !pcsx2_short_split &&
+			instruction_count >= 2 && dependency_start_pc == start_pc &&
+			dependency_instruction_count == instruction_count &&
+			dependency_charged_cycles_before == 0 &&
+			!EmuConfig.Gamefixes.GoemonTlbHack;
+#if defined(VITASX2_EE_HOT_REGION_CONTROL)
+		instrument_hot_region_entry = false;
+#endif
+#if defined(VITASX2_QEMU_VALIDATION)
+		instrument_hot_region_entry =
+			instrument_hot_region_entry &&
+			m_hot_region_promotion_enabled;
+#else
+		if (instrument_hot_region_entry &&
+			(VitaIsEePreInstructionTraceEnabled() ||
+			 Pcsx2Trace::IsCoreEventTraceEnabled() ||
+			 Pcsx2Trace::IsGsTraceEnabled() ||
+			 Pcsx2Trace::IsVuTraceEnabled()))
+		{
+			instrument_hot_region_entry = false;
+		}
+#endif
+		if (instrument_hot_region_entry)
+		{
+			instrument_hot_region_entry =
+				AnalyzeEeHotRegionSource(start_pc, instruction_count).kind !=
+					EeHotRegionSourceKind::None;
+		}
+		block.hot_region_entry_count = 0;
+		block.hot_region_counter_offset = static_cast<size_t>(-1);
+		block.hot_region_counter_instruction_count = 0;
+
 		size_t block_code_slice_offset = 0;
 		u32 compiled_scaled_cycles = 0;
 		u32 compiled_instruction_count = instruction_count;
@@ -2976,6 +3345,9 @@ namespace VitaEE
 			compiled_two_predicate_wait_loop_source_proof{};
 		DirectContinuationKind compiled_direct_continuation_kind =
 			DirectContinuationKind::SchedulerTestedTail;
+		size_t compiled_hot_region_counter_offset =
+			static_cast<size_t>(-1);
+		u8 compiled_hot_region_counter_instruction_count = 0;
 		DirectLinkSlots direct_links;
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
@@ -2987,8 +3359,11 @@ namespace VitaEE
 		for (;;)
 		{
 			compiled_gpr_link_signature = GprLinkSignature{};
-			AnalyzeGprLinkSignature(start_pc, candidate_instruction_count,
-				&compiled_gpr_link_signature);
+			if (!hot_region)
+			{
+				AnalyzeGprLinkSignature(start_pc, candidate_instruction_count,
+					&compiled_gpr_link_signature);
+			}
 			size_t block_code_capacity = STRAIGHT_LINE_BLOCK_CODE_CAPACITY;
 			bool split_candidate = false;
 			for (;;)
@@ -2997,6 +3372,8 @@ namespace VitaEE
 				u8* code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
 				if (!code_slice)
 				{
+					if (hot_region)
+						return false;
 					ResetForCachePressure();
 					code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
 					if (!code_slice)
@@ -3049,11 +3426,16 @@ namespace VitaEE
 				// block. Those fragments must not expose host code capacity as a new
 				// scheduler boundary: only the final logical tail owns the event test.
 				const DirectContinuationKind attempt_direct_continuation_kind =
+					hot_region ?
+						DirectContinuationKind::HotRegionInternalStaticBranch :
 					pcsx2_short_split ? DirectContinuationKind::Pcsx2ShortSplit :
 					(candidate_instruction_count < instruction_count ?
 						DirectContinuationKind::A32PhysicalFragment :
 						DirectContinuationKind::SchedulerTestedTail);
 				bool attempt_scheduler_test_elided_continuation_emitted = false;
+				size_t attempt_hot_region_counter_offset =
+					static_cast<size_t>(-1);
+				u8 attempt_hot_region_counter_instruction_count = 0;
 				const bool compiled = compiler.CompileStraightLineBlock(start_pc,
 					candidate_instruction_count, direct_exit, event_exit,
 					&attempt_scaled_cycles, &attempt_direct_links,
@@ -3071,7 +3453,19 @@ namespace VitaEE
 					m_persistent_dispatch_enabled ?
 						m_persistent_retained_wait_event_exit : nullptr,
 					&attempt_poll_call_wait_loop_source_proof,
-					&attempt_two_predicate_wait_loop_source_proof);
+					&attempt_two_predicate_wait_loop_source_proof,
+					hot_region ? hot_region->source_cycles : 0,
+					hot_region ? hot_region->source_fallback_entry : nullptr,
+					instrument_hot_region_entry ?
+						&block.hot_region_entry_count : nullptr,
+					instrument_hot_region_entry ?
+						static_cast<void*>(&m_hot_region_requested_block) :
+						nullptr,
+					instrument_hot_region_entry ? &block : nullptr,
+					instrument_hot_region_entry ?
+						HOT_REGION_ENTRY_PROMOTION_THRESHOLD : 0,
+					&attempt_hot_region_counter_offset,
+					&attempt_hot_region_counter_instruction_count);
 				u32 calculated_prefix_cycles = 0;
 				const bool cycle_contract_matches =
 					candidate_instruction_count == instruction_count ||
@@ -3079,8 +3473,10 @@ namespace VitaEE
 						candidate_instruction_count, false, &calculated_prefix_cycles) &&
 					 attempt_scaled_cycles == calculated_prefix_cycles);
 				const bool continuation_contract_matches =
-					attempt_direct_continuation_kind !=
-						DirectContinuationKind::A32PhysicalFragment ||
+					(attempt_direct_continuation_kind !=
+						 DirectContinuationKind::A32PhysicalFragment &&
+					 attempt_direct_continuation_kind !=
+						 DirectContinuationKind::HotRegionInternalStaticBranch) ||
 					attempt_scheduler_test_elided_continuation_emitted;
 				const bool flushed = compiled && cycle_contract_matches &&
 					continuation_contract_matches && block.code.Flush();
@@ -3112,6 +3508,10 @@ namespace VitaEE
 						attempt_scheduler_test_elided_continuation_emitted ?
 							attempt_direct_continuation_kind :
 							DirectContinuationKind::SchedulerTestedTail;
+					compiled_hot_region_counter_offset =
+						attempt_hot_region_counter_offset;
+					compiled_hot_region_counter_instruction_count =
+						attempt_hot_region_counter_instruction_count;
 					direct_links = attempt_direct_links;
 					break;
 				}
@@ -3138,7 +3538,8 @@ namespace VitaEE
 					continue;
 				}
 
-				if (!allow_code_budget_split || candidate_instruction_count <= 1)
+				if (hot_region || !allow_code_budget_split ||
+					candidate_instruction_count <= 1)
 				{
 #if defined(VITASX2_QEMU_VALIDATION)
 					report_compile_failure(failure_code_size, failure_code_capacity);
@@ -3231,6 +3632,12 @@ namespace VitaEE
 		block.compatible_vtlb_fast_entries = compiled_compatible_vtlb_fast_entries;
 		block.direct_links = direct_links;
 		block.direct_continuation_kind = compiled_direct_continuation_kind;
+		block.hot_region_counter_offset =
+			compiled_hot_region_counter_offset;
+		block.hot_region_counter_instruction_count =
+			compiled_hot_region_counter_instruction_count;
+		if (hot_region)
+			block.hot_region_state = 2;
 		block.discovered_topology = discovered_topology;
 
 		RetireStaleOverlappingBlocks(start_pc, compiled_instruction_count,
@@ -3733,6 +4140,8 @@ namespace VitaEE
 			DirectContinuationKind::Pcsx2ShortSplit;
 		const bool code_budget_continuation = block.direct_continuation_kind ==
 			DirectContinuationKind::A32PhysicalFragment;
+		const bool hot_region = block.direct_continuation_kind ==
+			DirectContinuationKind::HotRegionInternalStaticBranch;
 		result->concatenated_short_blocks = pcsx2_short_split ? 1u : 0u;
 		result->concatenated_short_scheduler_tests_elided =
 			pcsx2_short_split ? 1u : 0u;
@@ -3744,6 +4153,10 @@ namespace VitaEE
 			code_budget_continuation ? 1u : 0u;
 		result->code_budget_continuation_hot_instructions_elided =
 			code_budget_continuation ? 2u : 0u;
+		result->hot_region_blocks = hot_region ? 1u : 0u;
+		result->hot_region_scheduler_tests_elided = hot_region ? 1u : 0u;
+		result->hot_region_source_cycles =
+			hot_region ? block.scaled_cycles : 0u;
 		PopulateFrameEvidence(block.code, m_persistent_dispatch_code, result);
 		for (const DirectLinkSlot& link : block.direct_links.slots)
 		{
@@ -3835,6 +4248,10 @@ namespace VitaEE
 		*result = {};
 		const auto finish = [&](CachedBlock* entry, bool lookup_hit, bool fast_dispatch_hit,
 			bool cache_hit) {
+#if !defined(VITASX2_EE_HOT_REGION_CONTROL)
+			if (!ServiceHotRegionRequest())
+				return false;
+#endif
 			*block = entry;
 			result->path = BlockExecutionPath::Compiled;
 			result->instruction_count = entry->instruction_count;
@@ -3856,6 +4273,8 @@ namespace VitaEE
 			const bool code_budget_continuation =
 				entry->direct_continuation_kind ==
 					DirectContinuationKind::A32PhysicalFragment;
+			const bool hot_region = entry->direct_continuation_kind ==
+				DirectContinuationKind::HotRegionInternalStaticBranch;
 			result->concatenated_short_blocks = pcsx2_short_split ? 1u : 0u;
 			result->concatenated_short_scheduler_tests_elided =
 				pcsx2_short_split ? 1u : 0u;
@@ -3867,6 +4286,10 @@ namespace VitaEE
 				code_budget_continuation ? 1u : 0u;
 			result->code_budget_continuation_hot_instructions_elided =
 				code_budget_continuation ? 2u : 0u;
+			result->hot_region_blocks = hot_region ? 1u : 0u;
+			result->hot_region_scheduler_tests_elided = hot_region ? 1u : 0u;
+			result->hot_region_source_cycles =
+				hot_region ? entry->scaled_cycles : 0u;
 			PopulateFrameEvidence(entry->code, m_persistent_dispatch_code, result);
 			for (const DirectLinkSlot& link : entry->direct_links.slots)
 			{

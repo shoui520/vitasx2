@@ -135,6 +135,7 @@ namespace VitaEE
 		SchedulerTestedTail,
 		Pcsx2ShortSplit,
 		A32PhysicalFragment,
+		HotRegionInternalStaticBranch,
 	};
 
 	enum class CompatibleVtlbGuardKind : u8
@@ -716,6 +717,9 @@ namespace VitaEE
 			bool use_vu0_base_register = false, size_t* linked_entry_offset = nullptr,
 			u32 linked_entry_pc = 0, bool linked_entry_needs_pc_sync = false);
 		bool EmitCpuProfilerBlockPc(u32 start_pc, bool preserve_temporaries = false);
+		bool EmitHotRegionEntryCounter(u32* counter, void* request_slot,
+			const void* request_value, u32 request_threshold,
+			size_t* counter_offset, u8* counter_instruction_count);
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr,
 			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
@@ -732,7 +736,15 @@ namespace VitaEE
 			const void* scheduler_test_elided_direct_exit = nullptr,
 			const void* retained_wait_event_exit = nullptr,
 			PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof = nullptr,
-			TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof = nullptr);
+			TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof = nullptr,
+			u32 hot_region_guard_cycles = 0,
+			const void* hot_region_fallback_entry = nullptr,
+			u32* hot_region_entry_counter = nullptr,
+			void* hot_region_request_slot = nullptr,
+			const void* hot_region_request_value = nullptr,
+			u32 hot_region_request_threshold = 0,
+			size_t* hot_region_counter_offset = nullptr,
+			u8* hot_region_counter_instruction_count = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false,
 			u32 branch_delay_selected_pc = UINT32_MAX,
@@ -750,6 +762,12 @@ namespace VitaEE
 		bool EndBlockWithSchedulerElidedDirectContinuation(u32 block_cycles,
 			const void* scheduler_test_elided_direct_exit, DirectLinkSlot* direct_link,
 			bool defer_pc_writeback, u32 direct_pc);
+		bool EndBlockWithSchedulerElidedConditionalContinuation(u32 block_cycles,
+			const void* scheduler_test_elided_direct_exit,
+			DirectLinkSlot* not_taken_link, DirectLinkSlot* taken_link,
+			bool defer_pc_writeback, u32 not_taken_pc, u32 taken_pc);
+		bool EmitHotRegionEntryHorizonGuard(
+			u32 source_cycles, const void* fallback_entry);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
 			const void* event_exit, DirectLinkSlot* not_taken_link = nullptr,
 			DirectLinkSlot* taken_link = nullptr, bool wait_loop_taken = false,
@@ -815,7 +833,8 @@ namespace VitaEE
 			bool scheduler_test_elided_fallback = false);
 		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0,
-			bool sync_private_fallback = false);
+			bool sync_private_fallback = false,
+			bool scheduler_test_elided_fallback = false);
 		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag,
 			const void* direct_exit, bool defer_pc_writeback = false);
 		bool EmitGeneratedDispatchLookup(const void* lookup_pages_slot,

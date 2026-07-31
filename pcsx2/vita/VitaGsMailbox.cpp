@@ -1657,6 +1657,32 @@ namespace MTGS
 					(iop_compile_time_us * 1000u) /
 						iop_compile_observations : 0));
 			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=ee_hot_regions "
+				"requests=%llu attempts=%llu "
+				"promotions=%llu conditional_promotions=%llu "
+				"source_cycles=%llu successor_cycles=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_hot_region_requests,
+					start.cpu_stage_profiler.ee_hot_region_requests)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_hot_region_attempts,
+					start.cpu_stage_profiler.ee_hot_region_attempts)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_hot_region_promotions,
+					start.cpu_stage_profiler.ee_hot_region_promotions)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler
+						.ee_hot_region_conditional_promotions,
+					start.cpu_stage_profiler
+						.ee_hot_region_conditional_promotions)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_hot_region_source_cycles,
+					start.cpu_stage_profiler.ee_hot_region_source_cycles)),
+				static_cast<unsigned long long>(CounterDelta(
+					end.cpu_stage_profiler.ee_hot_region_successor_cycles,
+					start.cpu_stage_profiler.ee_hot_region_successor_cycles)));
+			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=iop_hot_regions "
 				"provider_samples=%llu selections=%llu attempts=%llu "
 				"promotions=%llu source_cycles=%llu successor_cycles=%llu",

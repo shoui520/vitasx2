@@ -89,6 +89,9 @@ namespace VitaEE
 		u32 code_budget_continuation_blocks = 0;
 		u32 code_budget_continuation_scheduler_tests_elided = 0;
 		u32 code_budget_continuation_hot_instructions_elided = 0;
+		u32 hot_region_blocks = 0;
+		u32 hot_region_scheduler_tests_elided = 0;
+		u32 hot_region_source_cycles = 0;
 		u32 generated_frame_pushes = 0;
 		u32 generated_frame_pops = 0;
 		u32 dispatcher_frame_pushes = 0;
@@ -201,6 +204,7 @@ namespace VitaEE
 		void SetThreeBlockGprLinkEnabled(bool enabled);
 		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled);
 		void SetDirectLinkRejectionProfileEnabled(bool enabled);
+		void SetHotRegionPromotionEnabled(bool enabled);
 		void ResetDirectLinkRejectionProfile();
 		VitaA32EeLinkRejectionProfile GetDirectLinkRejectionProfile() const;
 #endif
@@ -246,6 +250,11 @@ namespace VitaEE
 			HostMemoryMap::EErecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
+		// Tier-zero counters exist only on structurally eligible direct-jump or
+		// backward conditional sources. A source pays this bounded warm-up cost,
+		// then either becomes a guarded region or is rebuilt as an ordinary
+		// counter-free block.
+		static constexpr u32 HOT_REGION_ENTRY_PROMOTION_THRESHOLD = 256;
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
@@ -299,6 +308,12 @@ namespace VitaEE
 			DirectLinkSlots direct_links{};
 			DirectContinuationKind direct_continuation_kind =
 				DirectContinuationKind::SchedulerTestedTail;
+			// 0=cold candidate, 1=promotion refused,
+			// 2=guarded scheduler-elided source seam.
+			u32 hot_region_entry_count = 0;
+			size_t hot_region_counter_offset = static_cast<size_t>(-1);
+			u8 hot_region_state = 0;
+			u8 hot_region_counter_instruction_count = 0;
 			bool discovered_topology = false;
 			bool valid = false;
 			bool queued_free = false;
@@ -366,6 +381,12 @@ namespace VitaEE
 			u32 serial = 0;
 		};
 
+		struct HotRegionPlan
+		{
+			const void* source_fallback_entry = nullptr;
+			u32 source_cycles = 0;
+		};
+
 		static u32 LookupPageIndex(u32 start_pc);
 		static u32 LookupEntryIndex(u32 start_pc);
 		bool EnsureLookupDirectory(bool discovered_topology);
@@ -394,6 +415,7 @@ namespace VitaEE
 			u32 instruction_count, bool match_instruction_count,
 			bool discovered_topology, bool validate_source_words = true);
 		void RememberFreeCacheEntry(CachedBlock& block);
+		void RemoveFreeCacheEntry(CachedBlock& block);
 		CachedBlock* TakeFreeCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
@@ -430,7 +452,13 @@ namespace VitaEE
 			u32 dependency_start_pc = 0, u32 dependency_instruction_count = 0,
 			u32 dependency_charged_cycles_before = 0,
 			bool pcsx2_short_split = false,
-			bool discovered_topology = false);
+			bool discovered_topology = false,
+			const HotRegionPlan* hot_region = nullptr,
+			bool allow_hot_region_counter = true);
+		bool ServiceHotRegionRequest();
+		bool DisableHotRegionEntryCounter(CachedBlock& block);
+		__attribute__((noinline, cold)) bool TryPromoteHotRegion(
+			CachedBlock& block);
 		bool AnalyzeGprLinkSignature(u32 start_pc, u32 instruction_count,
 			GprLinkSignature* signature) const;
 		bool PrepareCompiledBlockAtPc(u32 start_pc, CachedBlock** block, BlockExecutionResult* result);
@@ -485,6 +513,10 @@ namespace VitaEE
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
+#if defined(VITASX2_QEMU_VALIDATION)
+		bool m_hot_region_promotion_enabled = false;
+#endif
+		CachedBlock* m_hot_region_requested_block = nullptr;
 		bool m_direct_linking_enabled = true;
 		bool m_persistent_dispatch_enabled = false;
 #if defined(VITASX2_QEMU_VALIDATION)
