@@ -235,6 +235,7 @@ u32 g_qemuCop2Vf0ConstantTransferFastPaths = 0;
 u32 g_qemuCop2DeadStatusFlagOps = 0;
 u32 g_qemuCop2DeadMacFlagOps = 0;
 u32 g_qemuCop2ResultOnlyQuadOps = 0;
+u32 g_qemuCop2RuntimeNoOpsElided = 0;
 u32 g_qemuCop2RawGpr0Qmtc2ZeroFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheDirectStores = 0;
@@ -1633,6 +1634,23 @@ namespace VitaEE
 			}
 		}
 
+		constexpr bool IsCop2MacroRuntimeNoOp(u32 op)
+		{
+			// PCSX2 owner: x86/microVU_Macro.inl::recVNOP()/recVWAITQ().
+			// Macro-mode VNOP and VWAITQ emit no runtime instruction at all in
+			// the canonical recompiler. They neither finish a running VU0
+			// microprogram nor publish interpreter decoder scratch state.
+			if ((op >> 26) != 0x12 || ((op >> 21) & 0x10) == 0 ||
+				(op & 0x3c) != 0x3c)
+			{
+				return false;
+			}
+
+			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
+			return special2_index == 0x2f || // VNOP
+				   special2_index == 0x3b;   // VWAITQ
+		}
+
 		constexpr Cop2MacroArithmeticOp DecodeCop2MacroArithmetic(u32 op)
 		{
 			const u32 function = op & 0x3f;
@@ -2444,6 +2462,9 @@ namespace VitaEE
 
 		unsigned FastVu0AddressUses(u32 op)
 		{
+			if (IsCop2MacroRuntimeNoOp(op))
+				return 0;
+
 			if (IsCOP2BranchOpcode(op))
 				return 1;
 
@@ -2511,7 +2532,7 @@ namespace VitaEE
 					return 5; // code + source VF(s) + Q/status mirrors.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
-				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
+				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF.
 			}
 
 			switch (op >> 26)
@@ -16618,6 +16639,13 @@ namespace VitaEE
 			return EmitCOP2ControlReadFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
 		if (IsFastCOP2ControlWrite(op))
 			return EmitCOP2ControlWriteFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
+		if (IsCop2MacroRuntimeNoOp(op))
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			g_qemuCop2RuntimeNoOpsElided++;
+#endif
+			return true;
+		}
 		if (IsFastCOP2MacroInBlock(op))
 		{
 			if (branch_delay_slot && branch_delay_selected_pc == UINT32_MAX)
@@ -16680,6 +16708,13 @@ namespace VitaEE
 			const unsigned rs = RS(op);
 			Vu0SyncMode mode = Vu0SyncMode::None;
 
+			if (IsCop2MacroRuntimeNoOp(op))
+			{
+				if (i == m_current_instruction_index)
+					return mode;
+				continue;
+			}
+
 			// PCSX2 treats ordinary scalar stores as possible DMA -> VIF0 -> VU0
 			// starts. VCALLMS/VCALLMSR are explicit starts. Either seam invalidates
 			// the preceding chain-wide proof before a later COP2 consumer.
@@ -16713,6 +16748,8 @@ namespace VitaEE
 						continue;
 
 					const unsigned following_rs = RS(following);
+					if (IsCop2MacroRuntimeNoOp(following))
+						continue;
 					if (following_rs >= 0x10 &&
 						((following & 0x3fu) == 0x38 ||
 						 (following & 0x3fu) == 0x39))

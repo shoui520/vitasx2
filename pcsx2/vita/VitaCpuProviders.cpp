@@ -2155,6 +2155,8 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	s_ee_a32_stats.generated_cop0_instructions += guest_mix.cop0;
 	s_ee_a32_stats.generated_cop1_instructions += guest_mix.cop1;
 	s_ee_a32_stats.generated_cop2_instructions += guest_mix.cop2;
+	s_ee_a32_stats.generated_cop2_runtime_noop_instructions +=
+		guest_mix.cop2_runtime_noop;
 	s_ee_a32_stats.generated_other_instructions += guest_mix.other;
 	s_ee_a32_stats.generated_poll_call_wait_blocks +=
 		poll_call_wait_loop ? 1u : 0u;

@@ -163,6 +163,7 @@ struct VitaA32EeProviderStats
 	u64 generated_cop0_instructions = 0;
 	u64 generated_cop1_instructions = 0;
 	u64 generated_cop2_instructions = 0;
+	u64 generated_cop2_runtime_noop_instructions = 0;
 	u64 generated_other_instructions = 0;
 	u32 generated_poll_call_wait_blocks = 0;
 	u32 generated_multi_range_poll_call_wait_blocks = 0;
@@ -227,6 +228,7 @@ struct VitaA32EeGeneratedGuestMix
 	u32 cop0 = 0;
 	u32 cop1 = 0;
 	u32 cop2 = 0;
+	u32 cop2_runtime_noop = 0;
 	u32 other = 0;
 };
 

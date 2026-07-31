@@ -165,6 +165,16 @@ namespace
 				case 0x36: // LQC2
 				case 0x3e: // SQC2
 					mix.cop2++;
+					if (primary == 0x12 && ((op >> 21) & 0x10) != 0 &&
+						(op & 0x3c) == 0x3c)
+					{
+						const u32 special2_index =
+							(op & 0x3) | ((op >> 4) & 0x7c);
+						// PCSX2 owner:
+						// x86/microVU_Macro.inl::recVNOP()/recVWAITQ().
+						mix.cop2_runtime_noop +=
+							special2_index == 0x2f || special2_index == 0x3b;
+					}
 					break;
 				case 0x1c:
 					mix.mmi++;
