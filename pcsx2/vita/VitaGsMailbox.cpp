@@ -1641,30 +1641,6 @@ namespace MTGS
 				static_cast<unsigned long long>(ee_compile_observations ?
 					(ee_compile_time_us * 1000u) /
 						ee_compile_observations : 0));
-			constexpr std::array<const char*,
-				VitaPerformanceTelemetry::EE_COMPILE_SUBSTAGE_COUNT>
-				ee_compile_substage_names{
-					"discovery", "source_snapshot", "emission",
-					"publication", "retirement", "registration",
-					"diagnostics", "linking"};
-			for (size_t i = 0; i < ee_compile_substage_names.size(); i++)
-			{
-				const u64 observations = CounterDelta(
-					end.cpu_stage_profiler.ee_compile_substage_observations[i],
-					start.cpu_stage_profiler.ee_compile_substage_observations[i]);
-				const u64 time_us = CounterDelta(
-					end.cpu_stage_profiler.ee_compile_substage_time_us[i],
-					start.cpu_stage_profiler.ee_compile_substage_time_us[i]);
-				output.WriteLn(
-					"Vita perf v=1 window=%llu kind=ee_compile_substage "
-					"stage=%s observations=%llu time_us=%llu average_ns=%llu",
-					static_cast<unsigned long long>(window),
-					ee_compile_substage_names[i],
-					static_cast<unsigned long long>(observations),
-					static_cast<unsigned long long>(time_us),
-					static_cast<unsigned long long>(observations ?
-						(time_us * 1000u) / observations : 0));
-			}
 			const u64 iop_compile_observations = CounterDelta(
 				end.cpu_stage_profiler.iop_compile_observations,
 				start.cpu_stage_profiler.iop_compile_observations);
@@ -1680,148 +1656,6 @@ namespace MTGS
 				static_cast<unsigned long long>(iop_compile_observations ?
 					(iop_compile_time_us * 1000u) /
 						iop_compile_observations : 0));
-			output.WriteLn(
-				"Vita perf v=1 window=%llu kind=ee_hot_regions "
-				"requests=%llu attempts=%llu "
-				"promotions=%llu conditional_promotions=%llu "
-				"source_cycles=%llu successor_cycles=%llu",
-				static_cast<unsigned long long>(window),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_hot_region_requests,
-					start.cpu_stage_profiler.ee_hot_region_requests)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_hot_region_attempts,
-					start.cpu_stage_profiler.ee_hot_region_attempts)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_hot_region_promotions,
-					start.cpu_stage_profiler.ee_hot_region_promotions)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler
-						.ee_hot_region_conditional_promotions,
-					start.cpu_stage_profiler
-						.ee_hot_region_conditional_promotions)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_hot_region_source_cycles,
-					start.cpu_stage_profiler.ee_hot_region_source_cycles)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_hot_region_successor_cycles,
-					start.cpu_stage_profiler.ee_hot_region_successor_cycles)));
-			output.WriteLn(
-				"Vita perf v=1 window=%llu kind=ee_byte_copy_countdown "
-				"blocks=%llu helper_calls=%llu bulk_chunks=%llu "
-				"bulk_bytes=%llu scalar_iterations=%llu page_returns=%llu "
-				"redispatches=%llu counter_exits=%llu",
-				static_cast<unsigned long long>(window),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_byte_copy_countdown_blocks,
-					start.cpu_stage_profiler.ee_byte_copy_countdown_blocks)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler
-						.ee_byte_copy_countdown_helper_calls,
-					start.cpu_stage_profiler
-						.ee_byte_copy_countdown_helper_calls)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_byte_copy_countdown_bulk_chunks,
-					start.cpu_stage_profiler
-						.ee_byte_copy_countdown_bulk_chunks)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_byte_copy_countdown_bulk_bytes,
-					start.cpu_stage_profiler.ee_byte_copy_countdown_bulk_bytes)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler
-						.ee_byte_copy_countdown_scalar_iterations,
-					start.cpu_stage_profiler
-						.ee_byte_copy_countdown_scalar_iterations)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_byte_copy_countdown_page_returns,
-					start.cpu_stage_profiler
-						.ee_byte_copy_countdown_page_returns)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_byte_copy_countdown_redispatches,
-					start.cpu_stage_profiler
-						.ee_byte_copy_countdown_redispatches)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_byte_copy_countdown_counter_exits,
-					start.cpu_stage_profiler
-						.ee_byte_copy_countdown_counter_exits)));
-			output.WriteLn(
-				"Vita perf v=1 window=%llu kind=ee_pair_qword_fill "
-				"blocks=%llu helper_calls=%llu bulk_chunks=%llu "
-				"bulk_bytes=%llu zero_bulk_chunks=%llu zero_bulk_bytes=%llu "
-				"scalar_iterations=%llu page_returns=%llu "
-				"redispatches=%llu",
-				static_cast<unsigned long long>(window),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_pair_qword_fill_blocks,
-					start.cpu_stage_profiler.ee_pair_qword_fill_blocks)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_pair_qword_fill_helper_calls,
-					start.cpu_stage_profiler.ee_pair_qword_fill_helper_calls)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_pair_qword_fill_bulk_chunks,
-					start.cpu_stage_profiler.ee_pair_qword_fill_bulk_chunks)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_pair_qword_fill_bulk_bytes,
-					start.cpu_stage_profiler.ee_pair_qword_fill_bulk_bytes)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler
-						.ee_pair_qword_fill_zero_bulk_chunks,
-					start.cpu_stage_profiler
-						.ee_pair_qword_fill_zero_bulk_chunks)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_pair_qword_fill_zero_bulk_bytes,
-					start.cpu_stage_profiler.ee_pair_qword_fill_zero_bulk_bytes)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler
-						.ee_pair_qword_fill_scalar_iterations,
-					start.cpu_stage_profiler
-						.ee_pair_qword_fill_scalar_iterations)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_pair_qword_fill_page_returns,
-					start.cpu_stage_profiler.ee_pair_qword_fill_page_returns)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.ee_pair_qword_fill_redispatches,
-					start.cpu_stage_profiler.ee_pair_qword_fill_redispatches)));
-			output.WriteLn(
-				"Vita perf v=1 window=%llu kind=iop_hot_regions "
-				"provider_samples=%llu selections=%llu attempts=%llu "
-				"promotions=%llu source_cycles=%llu successor_cycles=%llu "
-				"gpr_links=%llu gpr_stores_removed=%llu "
-				"gpr_loads_removed=%llu",
-				static_cast<unsigned long long>(window),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.iop_hot_region_provider_samples,
-					start.cpu_stage_profiler.iop_hot_region_provider_samples)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.iop_hot_region_selections,
-					start.cpu_stage_profiler.iop_hot_region_selections)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.iop_hot_region_attempts,
-					start.cpu_stage_profiler.iop_hot_region_attempts)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.iop_hot_region_promotions,
-					start.cpu_stage_profiler.iop_hot_region_promotions)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.iop_hot_region_source_cycles,
-					start.cpu_stage_profiler.iop_hot_region_source_cycles)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.iop_hot_region_successor_cycles,
-					start.cpu_stage_profiler.iop_hot_region_successor_cycles)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.
-						iop_hot_region_resident_gpr_links,
-					start.cpu_stage_profiler.
-						iop_hot_region_resident_gpr_links)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.
-						iop_hot_region_resident_gpr_stores_removed,
-					start.cpu_stage_profiler.
-						iop_hot_region_resident_gpr_stores_removed)),
-				static_cast<unsigned long long>(CounterDelta(
-					end.cpu_stage_profiler.
-						iop_hot_region_resident_gpr_loads_removed,
-					start.cpu_stage_profiler.
-						iop_hot_region_resident_gpr_loads_removed)));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=iop_cache "
 				"resets_delta=%llu resets=%u used=%llu capacity=%llu "
@@ -2004,19 +1838,12 @@ namespace MTGS
 		output.WriteLn(
 			"Vita perf v=1 window=%llu kind=ee_codegen integer=%llu branch=%llu "
 			"gpr_load=%llu gpr_store=%llu mmi=%llu cop0=%llu cop1=%llu cop2=%llu "
-			"cop2_runtime_noop=%llu vu0_acc_cache=%llu:%llu:%llu "
-			"vu0_vf_cache=%llu:%llu:%llu "
-			"other=%llu poll_call_wait=%llu "
-			"multi_range_poll_call_wait=%llu "
-			"poll_call_additional_watches=%llu two_predicate_wait=%llu "
+			"other=%llu poll_call_wait=%llu two_predicate_wait=%llu "
 			"largest_pc=0x%08x largest_guest=%u largest_host=%u "
 			"largest_helpers=%u largest_state_loads=%u largest_state_stores=%u "
 			"origin_integer=%llu origin_branch=%llu origin_gpr_load=%llu "
 			"origin_gpr_store=%llu origin_mmi=%llu origin_cop0=%llu origin_cop1=%llu "
-			"origin_cop2=%llu origin_cop2_runtime_noop=%llu origin_other=%llu "
-			"origin_poll_call_wait=%llu "
-			"origin_multi_range_poll_call_wait=%llu "
-			"origin_poll_call_additional_watches=%llu "
+			"origin_cop2=%llu origin_other=%llu origin_poll_call_wait=%llu "
 			"origin_two_predicate_wait=%llu",
 			static_cast<unsigned long long>(window),
 			static_cast<unsigned long long>(CounterDelta(
@@ -2039,38 +1866,11 @@ namespace MTGS
 				start.ee.generated_cop1_instructions)),
 			static_cast<unsigned long long>(CounterDelta(end.ee.generated_cop2_instructions,
 				start.ee.generated_cop2_instructions)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_cop2_runtime_noop_instructions,
-				start.ee.generated_cop2_runtime_noop_instructions)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_vu0_acc_cache_writes,
-				start.ee.generated_vu0_acc_cache_writes)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_vu0_acc_cache_hits,
-				start.ee.generated_vu0_acc_cache_hits)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_vu0_acc_cache_flushes,
-				start.ee.generated_vu0_acc_cache_flushes)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_vu0_vf_cache_writes,
-				start.ee.generated_vu0_vf_cache_writes)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_vu0_vf_cache_hits,
-				start.ee.generated_vu0_vf_cache_hits)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_vu0_vf_cache_flushes,
-				start.ee.generated_vu0_vf_cache_flushes)),
 			static_cast<unsigned long long>(CounterDelta(end.ee.generated_other_instructions,
 				start.ee.generated_other_instructions)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_poll_call_wait_blocks,
 				start.ee.generated_poll_call_wait_blocks)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_multi_range_poll_call_wait_blocks,
-				start.ee.generated_multi_range_poll_call_wait_blocks)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_poll_call_wait_additional_ram_watches,
-				start.ee.generated_poll_call_wait_additional_ram_watches)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_two_predicate_wait_blocks,
 				start.ee.generated_two_predicate_wait_blocks)),
@@ -2105,20 +1905,11 @@ namespace MTGS
 				end.ee.generated_cop2_instructions,
 				origin.ee.generated_cop2_instructions)),
 			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_cop2_runtime_noop_instructions,
-				origin.ee.generated_cop2_runtime_noop_instructions)),
-			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_other_instructions,
 				origin.ee.generated_other_instructions)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_poll_call_wait_blocks,
 				origin.ee.generated_poll_call_wait_blocks)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_multi_range_poll_call_wait_blocks,
-				origin.ee.generated_multi_range_poll_call_wait_blocks)),
-			static_cast<unsigned long long>(CounterDelta(
-				end.ee.generated_poll_call_wait_additional_ram_watches,
-				origin.ee.generated_poll_call_wait_additional_ram_watches)),
 			static_cast<unsigned long long>(CounterDelta(
 				end.ee.generated_two_predicate_wait_blocks,
 				origin.ee.generated_two_predicate_wait_blocks)));

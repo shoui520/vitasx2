@@ -11,7 +11,6 @@
 #include "pcsx2/vita/VitaEeBlockCompiler.h"
 #include "pcsx2/vita/VitaPerformanceTelemetry.h"
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
-#include "pcsx2/DebugTools/CoreEventTrace.h"
 #include "pcsx2/DebugTools/GsTrace.h"
 #include "pcsx2/DebugTools/VuTrace.h"
 #include "pcsx2/vita/VitaCore.h"
@@ -68,69 +67,6 @@ namespace
 	constexpr u32 EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN = 0xc1;
 	constexpr u32 EE_EVENT_HANDLED_EXIT_TOKEN = 0xe8;
 
-	enum class EeHotRegionSourceKind : u8
-	{
-		None,
-		UnconditionalJump,
-		BackwardConditionalBranch,
-	};
-
-	struct EeHotRegionSourceShape
-	{
-		EeHotRegionSourceKind kind = EeHotRegionSourceKind::None;
-		u32 not_taken_pc = 0;
-		u32 taken_pc = 0;
-	};
-
-	EeHotRegionSourceShape AnalyzeEeHotRegionSource(
-		u32 start_pc, u32 instruction_count)
-	{
-		EeHotRegionSourceShape shape;
-		if (instruction_count < 2 ||
-			instruction_count > ((UINT32_MAX - start_pc) / sizeof(u32)))
-		{
-			return shape;
-		}
-
-		const u32 branch_pc =
-			start_pc + (instruction_count - 2) * sizeof(u32);
-		const u32 branch = memRead32(branch_pc);
-		if (memRead32(branch_pc + sizeof(u32)) != 0)
-			return shape;
-
-		const u32 primary = branch >> 26;
-		if (instruction_count == 2 && (primary == 0x02 || primary == 0x03))
-		{
-			shape.kind = EeHotRegionSourceKind::UnconditionalJump;
-			shape.taken_pc = ((branch_pc + sizeof(u32)) & 0xf0000000u) |
-				((branch & 0x03ffffffu) << 2);
-			return shape;
-		}
-
-		// First conditional tier: ordinary integer branches whose delay slot is
-		// always executed. Restrict activation to a backwards edge, which is the
-		// natural-loop shape Phase 5 is intended to amortize. The compiler still
-		// revalidates the complete branch/direct-link contract before emission.
-		if (primary < 0x04 || primary > 0x07 ||
-			!VitaEE::BlockCompiler::IsSupportedBranchOpcode(branch) ||
-			VitaEE::BlockCompiler::IsBranchLikely(branch))
-		{
-			return shape;
-		}
-
-		const s32 displacement =
-			static_cast<s32>(static_cast<s16>(branch & 0xffffu)) * 4;
-		const u32 taken_pc =
-			branch_pc + sizeof(u32) + static_cast<u32>(displacement);
-		if (taken_pc >= start_pc)
-			return shape;
-
-		shape.kind = EeHotRegionSourceKind::BackwardConditionalBranch;
-		shape.not_taken_pc = branch_pc + 2 * sizeof(u32);
-		shape.taken_pc = taken_pc;
-		return shape;
-	}
-
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
 	VitaA32EeGeneratedGuestMix AnalyzeGeneratedEeGuestMix(u32 start_pc,
 		u32 instruction_count)
@@ -165,16 +101,6 @@ namespace
 				case 0x36: // LQC2
 				case 0x3e: // SQC2
 					mix.cop2++;
-					if (primary == 0x12 && ((op >> 21) & 0x10) != 0 &&
-						(op & 0x3c) == 0x3c)
-					{
-						const u32 special2_index =
-							(op & 0x3) | ((op >> 4) & 0x7c);
-						// PCSX2 owner:
-						// x86/microVU_Macro.inl::recVNOP()/recVWAITQ().
-						mix.cop2_runtime_noop +=
-							special2_index == 0x2f || special2_index == 0x3b;
-					}
 					break;
 				case 0x1c:
 					mix.mmi++;
@@ -314,10 +240,7 @@ namespace VitaEE
 		// these vectors from a fragmented game-time heap.
 		m_cache.reserve(MAX_CACHE_CAPACITY);
 		m_block_records.reserve(MAX_CACHE_CAPACITY);
-		m_block_record_bucket_heads.fill(INVALID_BLOCK_RECORD_INDEX);
-		m_block_record_query_scratch.reserve(MAX_CACHE_CAPACITY);
 		m_incoming_links.reserve(MAX_INCOMING_LINKS);
-		m_incoming_link_bucket_heads.fill(INVALID_INCOMING_LINK_INDEX);
 	}
 
 	BlockExecutor::~BlockExecutor()
@@ -461,50 +384,23 @@ namespace VitaEE
 		m_active_generated_lookup_pages = nullptr;
 	}
 
-	u32 BlockExecutor::BlockRecordBucketIndex(u32 pc)
+	s32 BlockExecutor::LastBlockRecordIndex(u32 pc) const
 	{
-		// Nearby EE code stays in nearby 256-byte buckets, keeping range walks
-		// cache-friendly. The fixed table aliases only every 4 MiB; each record's
-		// full page number disambiguates those aliases.
-		return (pc >> BLOCK_RECORD_BUCKET_SHIFT) &
-			(BLOCK_RECORD_BUCKET_COUNT - 1);
-	}
+		if (m_block_records.empty())
+			return -1;
 
-	bool BlockExecutor::RemoveBlockRecord(u32 record_index)
-	{
-		if (record_index >= m_block_records.size())
-			return false;
-		BlockRecord& removed = m_block_records[record_index];
-		if (!removed.block ||
-			removed.block->block_record_index != record_index)
+		s32 min = 0;
+		s32 max = static_cast<s32>(m_block_records.size() - 1);
+		while (min != max)
 		{
-			return false;
+			const s32 mid = (min + max + 1) >> 1;
+			if (m_block_records[mid].start_pc > pc)
+				max = mid - 1;
+			else
+				min = mid;
 		}
 
-		const u32 bucket = BlockRecordBucketIndex(removed.start_pc);
-		if (removed.previous_index != INVALID_BLOCK_RECORD_INDEX)
-		{
-			m_block_records[removed.previous_index].next_index =
-				removed.next_index;
-		}
-		else
-		{
-			m_block_record_bucket_heads[bucket] = removed.next_index;
-		}
-		if (removed.next_index != INVALID_BLOCK_RECORD_INDEX)
-		{
-			m_block_records[removed.next_index].previous_index =
-				removed.previous_index;
-		}
-
-		removed.block->block_record_index = INVALID_BLOCK_RECORD_INDEX;
-		removed.block = nullptr;
-		removed.start_pc = 0;
-		removed.previous_index = INVALID_BLOCK_RECORD_INDEX;
-		removed.next_index = m_block_record_free_head;
-		m_block_record_free_head = record_index;
-		m_block_record_count--;
-		return true;
+		return min;
 	}
 
 	bool BlockExecutor::RegisterBlockRecord(CachedBlock& block)
@@ -513,54 +409,53 @@ namespace VitaEE
 			return false;
 
 		UnregisterBlockRecord(block);
-		if (m_block_record_count >= MAX_CACHE_CAPACITY)
+		if (m_block_records.size() >= MAX_CACHE_CAPACITY)
 			return false;
 
-		// PCSX2 owner: x86/BaseblockEx.h::BaseBlockArray::insert(). Preserve
-		// start-PC ownership without shifting the process-wide record set for
-		// every cold compile. Range users visit only the bounded 256-byte buckets
-		// which can overlap their query.
-		const u32 bucket = BlockRecordBucketIndex(block.start_pc);
-		u32 record_index = m_block_record_free_head;
-		if (record_index != INVALID_BLOCK_RECORD_INDEX)
+		// PCSX2 owner: x86/BaseblockEx.h::BaseBlockArray::insert().
+		// Keep translated blocks sorted by guest start PC so invalidation and
+		// target lookup do not depend on a linear walk of the cache storage.
+		u32 insert_index = 0;
+		u32 insert_limit = static_cast<u32>(m_block_records.size());
+		while (insert_index < insert_limit)
 		{
-			m_block_record_free_head =
-				m_block_records[record_index].next_index;
-			m_block_records[record_index] = {&block, block.start_pc,
-				m_block_record_bucket_heads[bucket],
-				INVALID_BLOCK_RECORD_INDEX};
+			const u32 mid = (insert_index + insert_limit) >> 1;
+			if (m_block_records[mid].start_pc <= block.start_pc)
+				insert_index = mid + 1;
+			else
+				insert_limit = mid;
 		}
-		else
-		{
-			record_index = static_cast<u32>(m_block_records.size());
-			m_block_records.push_back({&block, block.start_pc,
-				m_block_record_bucket_heads[bucket],
-				INVALID_BLOCK_RECORD_INDEX});
-		}
-		if (m_block_record_bucket_heads[bucket] != INVALID_BLOCK_RECORD_INDEX)
-		{
-			m_block_records[m_block_record_bucket_heads[bucket]].previous_index =
-				record_index;
-		}
-		m_block_record_bucket_heads[bucket] = record_index;
-		block.block_record_index = record_index;
-		m_block_record_count++;
+
+		m_block_records.insert(m_block_records.begin() + insert_index,
+			{&block, block.start_pc});
 		return true;
 	}
 
 	void BlockExecutor::UnregisterBlockRecord(CachedBlock& block)
 	{
-		if (block.block_record_index != INVALID_BLOCK_RECORD_INDEX)
-			RemoveBlockRecord(block.block_record_index);
+		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::LastIndex() plus
+		// BaseBlocks::Remove(). Records are sorted by start PC, so only the
+		// same-PC run can contain this block.
+		s32 index = LastBlockRecordIndex(block.start_pc);
+		while (index >= 0 && m_block_records[index].start_pc == block.start_pc)
+			index--;
+		index++;
+
+		for (; index >= 0 && static_cast<u32>(index) < m_block_records.size() &&
+			   m_block_records[index].start_pc == block.start_pc;
+			 index++)
+		{
+			if (m_block_records[index].block == &block)
+			{
+				m_block_records.erase(m_block_records.begin() + index);
+				return;
+			}
+		}
 	}
 
 	void BlockExecutor::ClearBlockRecords()
 	{
 		m_block_records.clear();
-		m_block_record_bucket_heads.fill(INVALID_BLOCK_RECORD_INDEX);
-		m_block_record_free_head = INVALID_BLOCK_RECORD_INDEX;
-		m_block_record_count = 0;
-		m_block_record_query_scratch.clear();
 	}
 
 	bool BlockExecutor::CaptureRamSourceFragments(CachedBlock& block)
@@ -900,16 +795,10 @@ namespace VitaEE
 		u32 start_pc, u32 instruction_count, bool match_instruction_count,
 		bool discovered_topology, bool validate_source_words)
 	{
-		u32 index = m_block_record_bucket_heads[
-			BlockRecordBucketIndex(start_pc)];
-		while (index != INVALID_BLOCK_RECORD_INDEX)
+		s32 index = LastBlockRecordIndex(start_pc);
+		while (index >= 0 && m_block_records[index].start_pc == start_pc)
 		{
-			const BlockRecord& record = m_block_records[index];
-			index = record.next_index;
-			if (record.start_pc != start_pc)
-				continue;
-
-			CachedBlock* block = record.block;
+			CachedBlock* block = m_block_records[index].block;
 			if (block && block->valid &&
 				block->discovered_topology == discovered_topology &&
 				(!match_instruction_count || block->instruction_count == instruction_count))
@@ -919,6 +808,8 @@ namespace VitaEE
 
 				break;
 			}
+
+			index--;
 		}
 
 		return nullptr;
@@ -935,24 +826,6 @@ namespace VitaEE
 		block.queued_free = true;
 		block.next_free = m_free_cache_head;
 		m_free_cache_head = &block;
-	}
-
-	void BlockExecutor::RemoveFreeCacheEntry(CachedBlock& block)
-	{
-		CachedBlock** link = &m_free_cache_head;
-		while (*link)
-		{
-			if (*link == &block)
-			{
-				*link = block.next_free;
-				block.next_free = nullptr;
-				block.queued_free = false;
-				return;
-			}
-			link = &(*link)->next_free;
-		}
-		block.next_free = nullptr;
-		block.queued_free = false;
 	}
 
 	BlockExecutor::CachedBlock* BlockExecutor::TakeFreeCacheEntry()
@@ -974,8 +847,6 @@ namespace VitaEE
 	{
 		if (!block.valid)
 			return;
-		if (m_hot_region_requested_block == &block)
-			m_hot_region_requested_block = nullptr;
 
 		// A generated store can invalidate the block which is currently running.
 		// Restore every outgoing patch site before removing any metadata so its
@@ -993,7 +864,6 @@ namespace VitaEE
 		UnregisterIncomingLinks(block);
 		UnregisterBlockLookup(block);
 		UnregisterBlockRecord(block);
-		block.block_record_index = INVALID_BLOCK_RECORD_INDEX;
 		block.valid = false;
 		block.linked_entry_offset = 0;
 		block.resident_self_link_entry_offset = static_cast<size_t>(-1);
@@ -1003,8 +873,6 @@ namespace VitaEE
 		block.compatible_vtlb_fast_entries = {};
 		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
-		block.incoming_link_record_indices.fill(
-			INVALID_INCOMING_LINK_INDEX);
 		block.poll_call_wait_loop_source_proof = {};
 		block.two_predicate_wait_loop_source_proof = {};
 		block.ram_source_fragments = {};
@@ -1012,10 +880,6 @@ namespace VitaEE
 		block.source_serial = 0;
 		block.direct_continuation_kind =
 			DirectContinuationKind::SchedulerTestedTail;
-		block.hot_region_entry_count = 0;
-		block.hot_region_counter_offset = static_cast<size_t>(-1);
-		block.hot_region_state = 0;
-		block.hot_region_counter_instruction_count = 0;
 		block.discovered_topology = false;
 		block.opcodes.reset();
 		block.code.Release();
@@ -1036,95 +900,101 @@ namespace VitaEE
 		return &link;
 	}
 
-	u32 BlockExecutor::IncomingLinkBucketIndex(u32 target_pc)
+	s32 BlockExecutor::LastIncomingLinkIndex(u32 target_pc) const
 	{
-		// Word-aligned EE PCs have weak low-bit entropy. A multiplicative hash
-		// spreads adjacent and regularly-strided branch targets across the fixed
-		// table without a division on Cortex-A9.
-		return (((target_pc >> 2) * 2654435761u) >> 18) &
-			(INCOMING_LINK_BUCKET_COUNT - 1);
-	}
+		if (m_incoming_links.empty())
+			return -1;
 
-	bool BlockExecutor::RemoveIncomingLinkRecord(u32 record_index)
-	{
-		if (record_index >= m_incoming_links.size())
-			return false;
-		IncomingLinkRecord& removed = m_incoming_links[record_index];
-		if (!removed.source)
-			return false;
-
-		u32* cursor = &m_incoming_link_bucket_heads[
-			IncomingLinkBucketIndex(removed.TargetPc())];
-		while (*cursor != INVALID_INCOMING_LINK_INDEX)
+		s32 min = 0;
+		s32 max = static_cast<s32>(m_incoming_links.size() - 1);
+		while (min != max)
 		{
-			if (*cursor == record_index)
-			{
-				*cursor = removed.next_index;
-				removed.source = nullptr;
-				removed.target_pc_and_slot = 0;
-				removed.next_index = m_incoming_link_free_head;
-				m_incoming_link_free_head = record_index;
-				m_incoming_link_count--;
-				return true;
-			}
-			cursor = &m_incoming_links[*cursor].next_index;
+			const s32 mid = (min + max + 1) >> 1;
+			if (m_incoming_links[mid].TargetPc() > target_pc)
+				max = mid - 1;
+			else
+				min = mid;
 		}
-		return false;
+
+		return min;
 	}
 
 	void BlockExecutor::ClearIncomingLinks()
 	{
 		m_incoming_links.clear();
-		m_incoming_link_bucket_heads.fill(INVALID_INCOMING_LINK_INDEX);
-		m_incoming_link_free_head = INVALID_INCOMING_LINK_INDEX;
-		m_incoming_link_count = 0;
 	}
 
 	void BlockExecutor::RegisterIncomingLinks(CachedBlock& block)
 	{
-		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Link(). Preserve its
-		// target-PC -> patch-site ownership, but do not copy a process-wide sorted
-		// vector for every cold block. Each of the block's bounded two edges is
-		// inserted into a fixed hash bucket and carries its reusable record index.
-		block.incoming_link_record_indices.fill(
-			INVALID_INCOMING_LINK_INDEX);
+		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Link(). The x86
+		// provider stores target-PC -> patch-site records so New()/Remove()
+		// only touch incoming edges for the affected block. Keep Vita's vector
+		// sorted by target PC so the common patch/unlink path does the same.
+		//
+		// CompileIntoCacheEntry() invalidates a reused entry before rebuilding it,
+		// which already unregisters all of its old records. Registration is only
+		// called after that rebuild succeeds, so another whole-vector removal scan
+		// here made every cold compile progressively more expensive. Gather the
+		// block's bounded two edges and merge them into the sorted table in one
+		// backwards pass instead of shifting the table once per edge.
+		std::array<IncomingLinkRecord, DIRECT_LINK_SLOT_COUNT> pending;
+		size_t pending_count = 0;
 		for (u8 i = 0; i < DIRECT_LINK_SLOT_COUNT; i++)
 		{
 			const DirectLinkSlot& link = block.direct_links.slots[i];
 			if (!link.valid || (link.target_pc & u32{3}) != 0)
 				continue;
-			if (m_incoming_link_count >= MAX_INCOMING_LINKS)
+			if (m_incoming_links.size() + pending_count >= MAX_INCOMING_LINKS)
 				break;
+			pending[pending_count++] = {&block, link.target_pc, i};
+		}
 
-			const u32 bucket = IncomingLinkBucketIndex(link.target_pc);
-			u32 record_index = m_incoming_link_free_head;
-			if (record_index != INVALID_INCOMING_LINK_INDEX)
+		if (pending_count == 0)
+			return;
+		if (pending_count == 2 &&
+			pending[1].TargetPc() < pending[0].TargetPc())
+		{
+			std::swap(pending[0], pending[1]);
+		}
+
+		const size_t old_size = m_incoming_links.size();
+		size_t old_index = old_size;
+		size_t pending_index = pending_count;
+		size_t write_index = old_size + pending_count;
+		m_incoming_links.resize(write_index);
+
+		while (old_index != 0 && pending_index != 0)
+		{
+			if (m_incoming_links[old_index - 1].TargetPc() >
+				pending[pending_index - 1].TargetPc())
 			{
-				m_incoming_link_free_head =
-					m_incoming_links[record_index].next_index;
-				m_incoming_links[record_index] = {&block, link.target_pc, i,
-					m_incoming_link_bucket_heads[bucket]};
+				m_incoming_links[--write_index] =
+					m_incoming_links[--old_index];
 			}
 			else
 			{
-				record_index = static_cast<u32>(m_incoming_links.size());
-				m_incoming_links.emplace_back(&block, link.target_pc, i,
-					m_incoming_link_bucket_heads[bucket]);
+				m_incoming_links[--write_index] =
+					pending[--pending_index];
 			}
-			m_incoming_link_bucket_heads[bucket] = record_index;
-			block.incoming_link_record_indices[i] = record_index;
-			m_incoming_link_count++;
 		}
+		while (pending_index != 0)
+			m_incoming_links[--write_index] = pending[--pending_index];
 	}
 
 	void BlockExecutor::UnregisterIncomingLinks(CachedBlock& block)
 	{
-		for (u32& record_index : block.incoming_link_record_indices)
+		u32 write_index = 0;
+		for (u32 read_index = 0; read_index < m_incoming_links.size(); read_index++)
 		{
-			if (record_index != INVALID_INCOMING_LINK_INDEX)
-				RemoveIncomingLinkRecord(record_index);
-			record_index = INVALID_INCOMING_LINK_INDEX;
+			if (m_incoming_links[read_index].source == &block)
+				continue;
+
+			if (write_index != read_index)
+				m_incoming_links[write_index] = m_incoming_links[read_index];
+			write_index++;
 		}
+
+		m_incoming_links.resize(write_index);
 	}
 
 	u32 BlockExecutor::Shutdown()
@@ -1154,7 +1024,6 @@ namespace VitaEE
 			block.valid = false;
 			block.queued_free = false;
 			block.next_free = nullptr;
-			block.block_record_index = INVALID_BLOCK_RECORD_INDEX;
 			block.source_instruction_count = 0;
 			block.dependency_start_pc = 0;
 			block.dependency_instruction_count = 0;
@@ -1172,14 +1041,8 @@ namespace VitaEE
 			block.compatible_vtlb_fast_entries = {};
 			block.compatible_link_entry_loads = 0;
 			block.direct_links = {};
-			block.incoming_link_record_indices.fill(
-				INVALID_INCOMING_LINK_INDEX);
 			block.direct_continuation_kind =
 				DirectContinuationKind::SchedulerTestedTail;
-			block.hot_region_entry_count = 0;
-			block.hot_region_counter_offset = static_cast<size_t>(-1);
-			block.hot_region_state = 0;
-			block.hot_region_counter_instruction_count = 0;
 			block.discovered_topology = false;
 			block.opcodes.reset();
 			RememberFreeCacheEntry(block);
@@ -1197,7 +1060,6 @@ namespace VitaEE
 		// the base while resettable block code starts after it.
 		m_code_cache_used = m_persistent_dispatch_entry ?
 			PERSISTENT_DISPATCH_CODE_CAPACITY : 0;
-		m_hot_region_requested_block = nullptr;
 		return invalidated;
 	}
 
@@ -1330,29 +1192,40 @@ namespace VitaEE
 		const u32 first_candidate_pc = (start_pc > max_block_bytes) ? (start_pc - max_block_bytes) : 0;
 		const u32 last_candidate_pc =
 			end_pc > UINT32_MAX - max_block_bytes ? UINT32_MAX : end_pc + max_block_bytes;
-		// Vita blocks are bounded, so only the small page-bucket interval around
-		// the cleared words can overlap. Snapshot its stable CachedBlock pointers
-		// before retiring proof groups; retiring one group can unlink several
-		// records from the same bucket.
-		m_block_record_query_scratch.clear();
-		VisitBlockRecordsInRange(first_candidate_pc, last_candidate_pc,
-			[this](const BlockRecord& record) {
-				m_block_record_query_scratch.push_back(record.block);
-				return true;
-			});
-
-		for (CachedBlock* block : m_block_record_query_scratch)
+		// PCSX2 keeps BaseBlocks sorted by guest start PC. Since Vita blocks are
+		// bounded, entries before this lower bound cannot overlap the cleared
+		// word range.
+		u32 i = 0;
+		u32 limit = static_cast<u32>(m_block_records.size());
+		while (i < limit)
 		{
+			const u32 mid = (i + limit) >> 1;
+			if (m_block_records[mid].start_pc < first_candidate_pc)
+				i = mid + 1;
+			else
+				limit = mid;
+		}
+
+		for (; i < m_block_records.size();)
+		{
+			CachedBlock* block = m_block_records[i].block;
 			if (!block || !block->valid)
 			{
 				if (block)
 					UnregisterBlockRecord(*block);
+				else
+					i++;
 				continue;
 			}
 
+			if (block->start_pc >= last_candidate_pc)
+				break;
 			if (discovered_topology &&
 				block->discovered_topology != *discovered_topology)
+			{
+				i++;
 				continue;
+			}
 
 			// Every physical part of a code-budget split shares one proof group.
 			// The chosen seams depend on all of the group's opcodes, so a write to
@@ -1367,7 +1240,10 @@ namespace VitaEE
 			{
 				InvalidateCachedBlock(*block);
 				invalidated++;
+				continue;
 			}
+
+			i++;
 		}
 
 		return invalidated;
@@ -1759,15 +1635,6 @@ namespace VitaEE
 		Reset();
 		m_direct_link_rejection_profile_enabled = enabled;
 		ResetDirectLinkRejectionProfile();
-	}
-
-	void BlockExecutor::SetHotRegionPromotionEnabled(bool enabled)
-	{
-		if (m_hot_region_promotion_enabled == enabled)
-			return;
-
-		Reset();
-		m_hot_region_promotion_enabled = enabled;
 	}
 
 	void BlockExecutor::ResetDirectLinkRejectionProfile()
@@ -2682,40 +2549,38 @@ namespace VitaEE
 			MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS * sizeof(u32);
 		const u32 first_candidate_pc =
 			start_pc > max_block_bytes ? start_pc - max_block_bytes : 0;
-		bool stale_overlap = false;
-		VisitBlockRecordsInRange(first_candidate_pc, end_pc,
-			[&](const BlockRecord& record) {
-				CachedBlock* old_block = record.block;
-				if (!old_block || !old_block->valid ||
-					old_block->discovered_topology != discovered_topology)
-				{
-					return true;
-				}
-
-				const u32 old_end_pc = old_block->start_pc +
-					old_block->instruction_count * sizeof(u32);
-				// PCSX2 avoids handler reads by bounding recRAMCopy overlap checks to
-				// RAM. A32 may also prove ROM or scratchpad through a non-handler direct
-				// source span, but compilation must not add observable handler reads.
-				if (old_end_pc <= start_pc ||
-					!CachedBlockHasDirectSourceSpan(*old_block) ||
-					CachedBlockSourceMatches(*old_block))
-				{
-					return true;
-				}
-
-				// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile(). After
-				// compiling a new BaseBlock, PCSX2 compares recRAMCopy for every
-				// overlapping old block. One stale snapshot invokes recClear() for
-				// the complete new span before its entry is published. Besides SMC
-				// correctness, this retires stale outer topology so rediscovery sees
-				// an already-published interior entry and preserves PCSX2's per-block
-				// fixed-point cycle rounding.
-				stale_overlap = true;
-				return false;
+		auto candidate = std::lower_bound(m_block_records.begin(),
+			m_block_records.end(), first_candidate_pc,
+			[](const BlockRecord& record, u32 pc) {
+				return record.start_pc < pc;
 			});
-		if (stale_overlap)
+		for (; candidate != m_block_records.end() &&
+			candidate->start_pc < end_pc; ++candidate)
 		{
+			CachedBlock* old_block = candidate->block;
+			if (!old_block || !old_block->valid ||
+				old_block->discovered_topology != discovered_topology)
+			{
+				continue;
+			}
+
+			const u32 old_end_pc = old_block->start_pc +
+				old_block->instruction_count * sizeof(u32);
+			// PCSX2 avoids handler reads by bounding recRAMCopy overlap checks to
+			// RAM. A32 may also prove ROM or scratchpad through a non-handler direct
+			// source span, but compilation must not add observable handler reads.
+			if (old_end_pc <= start_pc ||
+				!CachedBlockHasDirectSourceSpan(*old_block) ||
+				CachedBlockSourceMatches(*old_block))
+				continue;
+
+			// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile(). After
+			// compiling a new BaseBlock, PCSX2 compares recRAMCopy for every
+			// overlapping old block. One stale snapshot invokes recClear() for
+			// the complete new span before its entry is published. Besides SMC
+			// correctness, this retires stale outer topology so rediscovery sees
+			// an already-published interior entry and preserves PCSX2's per-block
+			// fixed-point cycle rounding.
 			return InvalidateRangeInternal(start_pc, instruction_count,
 				&discovered_topology);
 		}
@@ -2849,16 +2714,10 @@ namespace VitaEE
 				return entry;
 		}
 
-		u32 index = m_block_record_bucket_heads[
-			BlockRecordBucketIndex(start_pc)];
-		while (index != INVALID_BLOCK_RECORD_INDEX)
+		s32 index = LastBlockRecordIndex(start_pc);
+		while (index >= 0 && m_block_records[index].start_pc == start_pc)
 		{
-			const BlockRecord& record = m_block_records[index];
-			index = record.next_index;
-			if (record.start_pc != start_pc)
-				continue;
-
-			CachedBlock* entry = record.block;
+			CachedBlock* entry = m_block_records[index--].block;
 			if (!entry || !entry->valid ||
 				entry->discovered_topology != discovered_topology)
 			{
@@ -2889,40 +2748,36 @@ namespace VitaEE
 		*dependency_instruction_count = instruction_count;
 		*dependency_charged_cycles_before = 0;
 		const u32 source_end_pc = start_pc + instruction_count * sizeof(u32);
+		const auto predecessor_end = std::lower_bound(m_block_records.begin(),
+			m_block_records.end(), start_pc,
+			[](const BlockRecord& record, u32 pc) { return record.start_pc < pc; });
 		constexpr u32 max_dependency_bytes =
 			MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS * sizeof(u32);
-		const u32 first_predecessor_pc = start_pc > max_dependency_bytes ?
-			start_pc - max_dependency_bytes : 0;
-		CachedBlock* predecessor_block = nullptr;
-		VisitBlockRecordsInRange(first_predecessor_pc, start_pc,
-			[&](const BlockRecord& record) {
-				CachedBlock* candidate = record.block;
-				if (predecessor_block &&
-					record.start_pc <= predecessor_block->start_pc)
-				{
-					return true;
-				}
-
-				if (!candidate || !candidate->valid ||
-					candidate->discovered_topology != discovered_topology)
-					return true;
-				const u32 predecessor_physical_end = candidate->start_pc +
-					candidate->instruction_count * sizeof(u32);
-				if (predecessor_physical_end != start_pc ||
-					candidate->instruction_count >= candidate->source_instruction_count ||
-					candidate->dependency_instruction_count == 0 ||
-					(candidate->dependency_start_pc == candidate->start_pc &&
-						candidate->dependency_instruction_count ==
-							candidate->instruction_count))
-				{
-					return true;
-				}
-				predecessor_block = candidate;
-				return true;
-			});
-
-		if (predecessor_block)
+		for (auto predecessor = predecessor_end;
+			predecessor != m_block_records.begin();)
 		{
+			--predecessor;
+			if (start_pc - predecessor->start_pc > max_dependency_bytes)
+				break;
+
+			CachedBlock* predecessor_block = predecessor->block;
+			if (!predecessor_block || !predecessor_block->valid ||
+				predecessor_block->discovered_topology != discovered_topology)
+				continue;
+			const u32 predecessor_physical_end = predecessor_block->start_pc +
+				predecessor_block->instruction_count * sizeof(u32);
+			if (predecessor_physical_end != start_pc ||
+				predecessor_block->instruction_count >=
+					predecessor_block->source_instruction_count ||
+				predecessor_block->dependency_instruction_count == 0 ||
+				(predecessor_block->dependency_start_pc ==
+						predecessor_block->start_pc &&
+					predecessor_block->dependency_instruction_count ==
+						predecessor_block->instruction_count))
+			{
+				continue;
+			}
+
 			const u32 predecessor_dependency_end =
 				predecessor_block->dependency_start_pc +
 				predecessor_block->dependency_instruction_count * sizeof(u32);
@@ -2935,6 +2790,7 @@ namespace VitaEE
 					predecessor_block->dependency_charged_cycles_before +
 					predecessor_block->scaled_cycles;
 			}
+			break;
 		}
 	}
 
@@ -3051,238 +2907,11 @@ namespace VitaEE
 		return invalidated;
 	}
 
-	bool BlockExecutor::TryPromoteHotRegion(CachedBlock& block)
-	{
-#if defined(VITASX2_EE_HOT_REGION_CONTROL)
-		(void)block;
-		return false;
-#else
-#if defined(VITASX2_QEMU_VALIDATION)
-		if (!m_hot_region_promotion_enabled)
-			return false;
-#endif
-		if (!block.valid || block.hot_region_state != 0)
-			return false;
-
-		// Refusal is sticky for this source generation. A RAM write or cache
-		// reset creates a fresh BaseBlock and therefore a fresh admission chance.
-		block.hot_region_state = 1;
-		VitaPerformanceTelemetry::RecordEeHotRegionAttemptIfProfiling();
-		if (!DisableHotRegionEntryCounter(block))
-			return false;
-		if (!m_persistent_dispatch_enabled || !m_direct_linking_enabled ||
-			!block.discovered_topology || block.instruction_count < 2 ||
-			block.source_instruction_count != block.instruction_count ||
-			block.dependency_start_pc != block.start_pc ||
-			block.dependency_instruction_count != block.instruction_count ||
-			block.direct_continuation_kind !=
-				DirectContinuationKind::SchedulerTestedTail ||
-			block.scaled_cycles == 0 ||
-			block.poll_call_wait_loop_source_proof.valid ||
-			block.two_predicate_wait_loop_source_proof.valid ||
-			EmuConfig.Gamefixes.GoemonTlbHack)
-		{
-			return false;
-		}
-#if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
-		if (VitaIsEePreInstructionTraceEnabled() ||
-			Pcsx2Trace::IsCoreEventTraceEnabled() ||
-			Pcsx2Trace::IsGsTraceEnabled() ||
-			Pcsx2Trace::IsVuTraceEnabled())
-		{
-			return false;
-		}
-#endif
-
-		const EeHotRegionSourceShape shape =
-			AnalyzeEeHotRegionSource(block.start_pc, block.instruction_count);
-		if (shape.kind == EeHotRegionSourceKind::None)
-			return false;
-		if (shape.taken_pc == block.start_pc ||
-			IsPersistentDispatchBarrier(shape.taken_pc) ||
-			(shape.kind == EeHotRegionSourceKind::BackwardConditionalBranch &&
-			 IsPersistentDispatchBarrier(shape.not_taken_pc)))
-		{
-			return false;
-		}
-
-		DirectLinkSlot* taken_link = nullptr;
-		DirectLinkSlot* not_taken_link = nullptr;
-		for (DirectLinkSlot& link : block.direct_links.slots)
-		{
-			if (!link.valid)
-				continue;
-			if (link.target_pc == shape.taken_pc && !taken_link)
-				taken_link = &link;
-			else if (shape.kind ==
-					EeHotRegionSourceKind::BackwardConditionalBranch &&
-				link.target_pc == shape.not_taken_pc && !not_taken_link)
-			{
-				not_taken_link = &link;
-			}
-			else
-			{
-				return false;
-			}
-		}
-		if (!taken_link ||
-			(shape.kind == EeHotRegionSourceKind::BackwardConditionalBranch &&
-			 !not_taken_link))
-		{
-			return false;
-		}
-
-		CachedBlock* const taken_successor =
-			FindLinkTargetByStartPc(shape.taken_pc, true, true);
-		CachedBlock* const not_taken_successor =
-			shape.kind == EeHotRegionSourceKind::BackwardConditionalBranch ?
-				FindLinkTargetByStartPc(shape.not_taken_pc, true, true) :
-				nullptr;
-		const auto valid_successor = [this, &block](const CachedBlock* successor) {
-			if (!successor || successor == &block || !successor->valid ||
-				!successor->discovered_topology ||
-				IsPersistentDispatchBarrier(successor->start_pc))
-			{
-				return false;
-			}
-			return successor->direct_continuation_kind ==
-					DirectContinuationKind::SchedulerTestedTail ||
-				successor->direct_continuation_kind ==
-					DirectContinuationKind::Pcsx2ShortSplit;
-		};
-		if (!valid_successor(taken_successor) ||
-			(shape.kind == EeHotRegionSourceKind::BackwardConditionalBranch &&
-			 !valid_successor(not_taken_successor)))
-		{
-			return false;
-		}
-
-		const size_t aligned_used =
-			AlignUp(m_code_cache_used, CODE_CACHE_ALIGNMENT);
-		if (aligned_used > m_code_cache_capacity ||
-			STRAIGHT_LINE_BLOCK_CODE_CAPACITY >
-				m_code_cache_capacity - aligned_used)
-		{
-			return false;
-		}
-
-		const u32 source_pc = block.start_pc;
-		const u32 source_cycles = block.scaled_cycles;
-		const u32 successor_cycles = not_taken_successor ?
-			std::max(taken_successor->scaled_cycles,
-				not_taken_successor->scaled_cycles) :
-			taken_successor->scaled_cycles;
-		const u32 source_instruction_count = block.instruction_count;
-		const HotRegionPlan plan{
-			LinkedEntryPoint(block),
-			source_cycles,
-		};
-		const VitaPerformanceTelemetry::ScopedCpuStage compile_profile(
-			VitaPerformanceTelemetry::CpuStage::EeCompile);
-		const VitaPerformanceTelemetry::ScopedExactEeCompileMeasurement
-			exact_compile_profile;
-		if (CompileIntoCacheEntry(block, source_pc, source_instruction_count,
-				nullptr, false, source_pc, source_instruction_count, 0,
-				false, true, &plan))
-		{
-			VitaPerformanceTelemetry::RecordEeHotRegionPromotionIfProfiling(
-				source_cycles, successor_cycles,
-				shape.kind ==
-					EeHotRegionSourceKind::BackwardConditionalBranch);
-			return true;
-		}
-		return false;
-#endif
-	}
-
-	bool BlockExecutor::DisableHotRegionEntryCounter(CachedBlock& block)
-	{
-		if (block.hot_region_counter_offset == static_cast<size_t>(-1) ||
-			block.hot_region_counter_instruction_count == 0)
-		{
-			block.hot_region_entry_count = 0;
-			block.hot_region_counter_offset = static_cast<size_t>(-1);
-			block.hot_region_counter_instruction_count = 0;
-			return true;
-		}
-
-		for (u8 i = 0; i < block.hot_region_counter_instruction_count; i++)
-		{
-			if (!block.code.PatchNop(block.hot_region_counter_offset +
-					static_cast<size_t>(i) * sizeof(u32)))
-			{
-				return false;
-			}
-		}
-		if (!block.code.Flush())
-			return false;
-
-		block.hot_region_entry_count = 0;
-		block.hot_region_counter_offset = static_cast<size_t>(-1);
-		block.hot_region_counter_instruction_count = 0;
-		return true;
-	}
-
-	bool BlockExecutor::ServiceHotRegionRequest()
-	{
-#if defined(VITASX2_EE_HOT_REGION_CONTROL)
-		m_hot_region_requested_block = nullptr;
-		return true;
-#else
-#if defined(VITASX2_QEMU_VALIDATION)
-		if (!m_hot_region_promotion_enabled)
-		{
-			m_hot_region_requested_block = nullptr;
-			return true;
-		}
-#endif
-		CachedBlock* const requested = m_hot_region_requested_block;
-		m_hot_region_requested_block = nullptr;
-		if (!requested || !requested->valid ||
-			requested->hot_region_state != 0 ||
-			requested->hot_region_entry_count <
-				HOT_REGION_ENTRY_PROMOTION_THRESHOLD)
-		{
-			return true;
-		}
-
-		VitaPerformanceTelemetry::RecordEeHotRegionRequestIfProfiling();
-		const u32 source_pc = requested->start_pc;
-		const u32 source_instructions = requested->source_instruction_count;
-		const u32 dependency_pc = requested->dependency_start_pc;
-		const u32 dependency_instructions =
-			requested->dependency_instruction_count;
-		const u32 charged_before =
-			requested->dependency_charged_cycles_before;
-		const bool pcsx2_short_split =
-			requested->direct_continuation_kind ==
-				DirectContinuationKind::Pcsx2ShortSplit;
-		const bool discovered = requested->discovered_topology;
-		if (TryPromoteHotRegion(*requested))
-			return true;
-
-		// A rejected source has already paid for a real generated-execution
-		// sample. Rebuild its ordinary PCSX2 BaseBlock once without the tier-zero
-		// counter so refusal cannot leave permanent work on a 496 MHz core.
-		if (!CompileIntoCacheEntry(*requested, source_pc,
-				source_instructions, nullptr, false, dependency_pc,
-				dependency_instructions, charged_before, pcsx2_short_split,
-				discovered, nullptr, false))
-		{
-			RememberFreeCacheEntry(*requested);
-			return false;
-		}
-		requested->hot_region_state = 1;
-		return true;
-#endif
-	}
-
 	bool BlockExecutor::CompileIntoCacheEntry(CachedBlock& block, u32 start_pc,
 		u32 instruction_count, u32* scaled_cycles, bool allow_code_budget_split,
 		u32 dependency_start_pc, u32 dependency_instruction_count,
 		u32 dependency_charged_cycles_before, bool pcsx2_short_split,
-		bool discovered_topology, const HotRegionPlan* hot_region,
-		bool allow_hot_region_counter)
+		bool discovered_topology)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -3315,14 +2944,6 @@ namespace VitaEE
 			m_persistent_event_exit : reinterpret_cast<const void*>(&VitaEeA32EventExit);
 
 		InvalidateCachedBlock(block);
-		// Ordinary compilation preserves the existing O(1) lazy free-list
-		// cleanup. Promotion is the exceptional in-place rebuild: it must keep
-		// this now-live metadata object out of the reusable list.
-		if (hot_region)
-			RemoveFreeCacheEntry(block);
-		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
-			source_profile(
-				VitaPerformanceTelemetry::EeCompileSubstage::SourceSnapshot);
 		std::unique_ptr<u32[]> source_opcodes(
 			new (std::nothrow) u32[dependency_instruction_count]);
 		if (!source_opcodes)
@@ -3339,42 +2960,6 @@ namespace VitaEE
 				return false;
 			}
 		}
-		source_profile.Finish();
-
-		bool instrument_hot_region_entry =
-			allow_hot_region_counter && !hot_region &&
-			m_persistent_dispatch_enabled && m_direct_linking_enabled &&
-			discovered_topology && !pcsx2_short_split &&
-			instruction_count >= 2 && dependency_start_pc == start_pc &&
-			dependency_instruction_count == instruction_count &&
-			dependency_charged_cycles_before == 0 &&
-			!EmuConfig.Gamefixes.GoemonTlbHack;
-#if defined(VITASX2_EE_HOT_REGION_CONTROL)
-		instrument_hot_region_entry = false;
-#endif
-#if defined(VITASX2_QEMU_VALIDATION)
-		instrument_hot_region_entry =
-			instrument_hot_region_entry &&
-			m_hot_region_promotion_enabled;
-#else
-		if (instrument_hot_region_entry &&
-			(VitaIsEePreInstructionTraceEnabled() ||
-			 Pcsx2Trace::IsCoreEventTraceEnabled() ||
-			 Pcsx2Trace::IsGsTraceEnabled() ||
-			 Pcsx2Trace::IsVuTraceEnabled()))
-		{
-			instrument_hot_region_entry = false;
-		}
-#endif
-		if (instrument_hot_region_entry)
-		{
-			instrument_hot_region_entry =
-				AnalyzeEeHotRegionSource(start_pc, instruction_count).kind !=
-					EeHotRegionSourceKind::None;
-		}
-		block.hot_region_entry_count = 0;
-		block.hot_region_counter_offset = static_cast<size_t>(-1);
-		block.hot_region_counter_instruction_count = 0;
 
 		size_t block_code_slice_offset = 0;
 		u32 compiled_scaled_cycles = 0;
@@ -3391,15 +2976,6 @@ namespace VitaEE
 			compiled_two_predicate_wait_loop_source_proof{};
 		DirectContinuationKind compiled_direct_continuation_kind =
 			DirectContinuationKind::SchedulerTestedTail;
-		size_t compiled_hot_region_counter_offset =
-			static_cast<size_t>(-1);
-		u8 compiled_hot_region_counter_instruction_count = 0;
-		u32 compiled_vu0_acc_cache_writes = 0;
-		u32 compiled_vu0_acc_cache_hits = 0;
-		u32 compiled_vu0_acc_cache_flushes = 0;
-		u32 compiled_vu0_vf_cache_writes = 0;
-		u32 compiled_vu0_vf_cache_hits = 0;
-		u32 compiled_vu0_vf_cache_flushes = 0;
 		DirectLinkSlots direct_links;
 #if defined(VITASX2_QEMU_VALIDATION)
 		const auto report_compile_failure = [start_pc, instruction_count](size_t code_size, size_t code_capacity) {
@@ -3411,11 +2987,8 @@ namespace VitaEE
 		for (;;)
 		{
 			compiled_gpr_link_signature = GprLinkSignature{};
-			if (!hot_region)
-			{
-				AnalyzeGprLinkSignature(start_pc, candidate_instruction_count,
-					&compiled_gpr_link_signature);
-			}
+			AnalyzeGprLinkSignature(start_pc, candidate_instruction_count,
+				&compiled_gpr_link_signature);
 			size_t block_code_capacity = STRAIGHT_LINE_BLOCK_CODE_CAPACITY;
 			bool split_candidate = false;
 			for (;;)
@@ -3424,8 +2997,6 @@ namespace VitaEE
 				u8* code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
 				if (!code_slice)
 				{
-					if (hot_region)
-						return false;
 					ResetForCachePressure();
 					code_slice = AllocateCodeSlice(block_code_capacity, &code_slice_offset);
 					if (!code_slice)
@@ -3478,19 +3049,11 @@ namespace VitaEE
 				// block. Those fragments must not expose host code capacity as a new
 				// scheduler boundary: only the final logical tail owns the event test.
 				const DirectContinuationKind attempt_direct_continuation_kind =
-					hot_region ?
-						DirectContinuationKind::HotRegionInternalStaticBranch :
 					pcsx2_short_split ? DirectContinuationKind::Pcsx2ShortSplit :
 					(candidate_instruction_count < instruction_count ?
 						DirectContinuationKind::A32PhysicalFragment :
 						DirectContinuationKind::SchedulerTestedTail);
 				bool attempt_scheduler_test_elided_continuation_emitted = false;
-				size_t attempt_hot_region_counter_offset =
-					static_cast<size_t>(-1);
-				u8 attempt_hot_region_counter_instruction_count = 0;
-				VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
-					emission_profile(
-						VitaPerformanceTelemetry::EeCompileSubstage::Emission);
 				const bool compiled = compiler.CompileStraightLineBlock(start_pc,
 					candidate_instruction_count, direct_exit, event_exit,
 					&attempt_scaled_cycles, &attempt_direct_links,
@@ -3508,20 +3071,7 @@ namespace VitaEE
 					m_persistent_dispatch_enabled ?
 						m_persistent_retained_wait_event_exit : nullptr,
 					&attempt_poll_call_wait_loop_source_proof,
-					&attempt_two_predicate_wait_loop_source_proof,
-					hot_region ? hot_region->source_cycles : 0,
-					hot_region ? hot_region->source_fallback_entry : nullptr,
-					instrument_hot_region_entry ?
-						&block.hot_region_entry_count : nullptr,
-					instrument_hot_region_entry ?
-						static_cast<void*>(&m_hot_region_requested_block) :
-						nullptr,
-					instrument_hot_region_entry ? &block : nullptr,
-					instrument_hot_region_entry ?
-						HOT_REGION_ENTRY_PROMOTION_THRESHOLD : 0,
-					&attempt_hot_region_counter_offset,
-					&attempt_hot_region_counter_instruction_count);
-				emission_profile.Finish();
+					&attempt_two_predicate_wait_loop_source_proof);
 				u32 calculated_prefix_cycles = 0;
 				const bool cycle_contract_matches =
 					candidate_instruction_count == instruction_count ||
@@ -3529,20 +3079,11 @@ namespace VitaEE
 						candidate_instruction_count, false, &calculated_prefix_cycles) &&
 					 attempt_scaled_cycles == calculated_prefix_cycles);
 				const bool continuation_contract_matches =
-					(attempt_direct_continuation_kind !=
-						 DirectContinuationKind::A32PhysicalFragment &&
-					 attempt_direct_continuation_kind !=
-						 DirectContinuationKind::HotRegionInternalStaticBranch) ||
+					attempt_direct_continuation_kind !=
+						DirectContinuationKind::A32PhysicalFragment ||
 					attempt_scheduler_test_elided_continuation_emitted;
-				bool flushed = false;
-				if (compiled && cycle_contract_matches &&
-					continuation_contract_matches)
-				{
-					const VitaPerformanceTelemetry::
-						ScopedExactEeCompileSubstageMeasurement publication_profile(
-							VitaPerformanceTelemetry::EeCompileSubstage::Publication);
-					flushed = block.code.Flush();
-				}
+				const bool flushed = compiled && cycle_contract_matches &&
+					continuation_contract_matches && block.code.Flush();
 				const bool out_of_block_space = !flushed && block.code.OutOfSpace();
 				const size_t failure_code_size = block.code.Size();
 				const size_t failure_code_capacity = block.code.Capacity();
@@ -3571,22 +3112,6 @@ namespace VitaEE
 						attempt_scheduler_test_elided_continuation_emitted ?
 							attempt_direct_continuation_kind :
 							DirectContinuationKind::SchedulerTestedTail;
-					compiled_hot_region_counter_offset =
-						attempt_hot_region_counter_offset;
-					compiled_hot_region_counter_instruction_count =
-						attempt_hot_region_counter_instruction_count;
-					compiled_vu0_acc_cache_writes =
-						compiler.GetVu0AccCacheWrites();
-					compiled_vu0_acc_cache_hits =
-						compiler.GetVu0AccCacheHits();
-					compiled_vu0_acc_cache_flushes =
-						compiler.GetVu0AccCacheFlushes();
-					compiled_vu0_vf_cache_writes =
-						compiler.GetVu0VfCacheWrites();
-					compiled_vu0_vf_cache_hits =
-						compiler.GetVu0VfCacheHits();
-					compiled_vu0_vf_cache_flushes =
-						compiler.GetVu0VfCacheFlushes();
 					direct_links = attempt_direct_links;
 					break;
 				}
@@ -3613,8 +3138,7 @@ namespace VitaEE
 					continue;
 				}
 
-				if (hot_region || !allow_code_budget_split ||
-					candidate_instruction_count <= 1)
+				if (!allow_code_budget_split || candidate_instruction_count <= 1)
 				{
 #if defined(VITASX2_QEMU_VALIDATION)
 					report_compile_failure(failure_code_size, failure_code_capacity);
@@ -3707,17 +3231,8 @@ namespace VitaEE
 		block.compatible_vtlb_fast_entries = compiled_compatible_vtlb_fast_entries;
 		block.direct_links = direct_links;
 		block.direct_continuation_kind = compiled_direct_continuation_kind;
-		block.hot_region_counter_offset =
-			compiled_hot_region_counter_offset;
-		block.hot_region_counter_instruction_count =
-			compiled_hot_region_counter_instruction_count;
-		if (hot_region)
-			block.hot_region_state = 2;
 		block.discovered_topology = discovered_topology;
 
-		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
-			retirement_profile(
-				VitaPerformanceTelemetry::EeCompileSubstage::Retirement);
 		RetireStaleOverlappingBlocks(start_pc, compiled_instruction_count,
 			discovered_topology);
 
@@ -3746,30 +3261,35 @@ namespace VitaEE
 				// observe a seam which that group's timeline proof never considered.
 				// PCSX2's BaseBlocks::Remove()/New() gives a continuation topology one
 				// owning compilation context; retire the older proof group likewise.
-				CachedBlock* conflict = nullptr;
-				VisitBlockRecordsInRange(first_converging_start, continuation_pc,
-					[&](const BlockRecord& record) {
-						CachedBlock* candidate = record.block;
-						if (!candidate || !candidate->valid ||
-							candidate->discovered_topology != discovered_topology ||
-							candidate->instruction_count >= candidate->source_instruction_count)
-						{
-							return true;
-						}
-
-						const u32 candidate_end_pc = candidate->start_pc +
-							candidate->instruction_count * sizeof(u32);
-						const bool same_proof_group =
-							candidate->dependency_start_pc == dependency_start_pc &&
-							candidate->dependency_instruction_count ==
-								dependency_instruction_count;
-						if (candidate_end_pc == continuation_pc && !same_proof_group)
-						{
-							conflict = candidate;
-							return false;
-						}
-						return true;
+				auto converging = std::lower_bound(m_block_records.begin(),
+					m_block_records.end(), first_converging_start,
+					[](const BlockRecord& record, u32 pc) {
+						return record.start_pc < pc;
 					});
+				CachedBlock* conflict = nullptr;
+				for (; converging != m_block_records.end() &&
+					converging->start_pc < continuation_pc; ++converging)
+				{
+					CachedBlock* candidate = converging->block;
+					if (!candidate || !candidate->valid ||
+						candidate->discovered_topology != discovered_topology ||
+						candidate->instruction_count >= candidate->source_instruction_count)
+					{
+						continue;
+					}
+
+					const u32 candidate_end_pc = candidate->start_pc +
+						candidate->instruction_count * sizeof(u32);
+					const bool same_proof_group =
+						candidate->dependency_start_pc == dependency_start_pc &&
+						candidate->dependency_instruction_count ==
+							dependency_instruction_count;
+					if (candidate_end_pc == continuation_pc && !same_proof_group)
+					{
+						conflict = candidate;
+						break;
+					}
+				}
 
 				if (!conflict)
 					break;
@@ -3792,23 +3312,42 @@ namespace VitaEE
 				dependency_instruction_count * sizeof(u32);
 			for (;;)
 			{
-				CachedBlock* interior = nullptr;
-				VisitBlockRecordsInRange(start_pc, dependency_end_pc,
-					[&](const BlockRecord& record) {
-						CachedBlock* candidate = record.block;
-						if (!candidate || !candidate->valid ||
-							candidate->discovered_topology == discovered_topology)
-						{
-							interior = candidate;
-							return false;
-						}
-						return true;
+				const auto interior_record = std::lower_bound(m_block_records.begin(),
+					m_block_records.end(), start_pc,
+					[](const BlockRecord& record, u32 pc) {
+						return record.start_pc < pc;
 					});
-				if (!interior)
-					break;
-				if (!interior->valid)
+				if (interior_record == m_block_records.end() ||
+					interior_record->start_pc >= dependency_end_pc)
 				{
-					UnregisterBlockRecord(*interior);
+					break;
+				}
+
+				CachedBlock* interior = nullptr;
+				auto matching_interior = interior_record;
+				while (matching_interior != m_block_records.end() &&
+					matching_interior->start_pc < dependency_end_pc)
+				{
+					CachedBlock* candidate = matching_interior->block;
+					if (!candidate || !candidate->valid ||
+						candidate->discovered_topology == discovered_topology)
+					{
+						interior = candidate;
+						break;
+					}
+					++matching_interior;
+				}
+				if (matching_interior == m_block_records.end() ||
+					matching_interior->start_pc >= dependency_end_pc)
+				{
+					break;
+				}
+				if (!interior || !interior->valid)
+				{
+					if (interior)
+						UnregisterBlockRecord(*interior);
+					else
+						m_block_records.erase(matching_interior);
 					continue;
 				}
 
@@ -3829,11 +3368,6 @@ namespace VitaEE
 				}
 			}
 		}
-		retirement_profile.Finish();
-
-		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
-			registration_profile(
-				VitaPerformanceTelemetry::EeCompileSubstage::Registration);
 		block.opcodes = std::move(source_opcodes);
 		if (!CaptureRamSourceFragments(block))
 		{
@@ -3863,41 +3397,24 @@ namespace VitaEE
 		// only PCSX2-discovered BaseBlocks publish generated dispatch entries.
 		RegisterBlockLookup(block);
 		RegisterIncomingLinks(block);
-		registration_profile.Finish();
 
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
-		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
-			diagnostics_profile(
-				VitaPerformanceTelemetry::EeCompileSubstage::Diagnostics);
 		if (VitaPerformanceTelemetry::IsEnabled())
 		{
 			const VitaA32::CodeBuffer::GeneratedCodeStats generated =
 				block.code.AnalyzeGeneratedCode();
 			const VitaA32EeGeneratedGuestMix guest_mix =
 				AnalyzeGeneratedEeGuestMix(start_pc, compiled_instruction_count);
-			const u32 poll_call_additional_ram_watches =
-				block.poll_call_wait_loop_source_proof.additional_ram_watch_count;
 			VitaRecordA32EeGeneratedCode(start_pc, guest_mix,
 				generated.host_instructions,
 				generated.host_load_instructions, generated.host_store_instructions,
 				generated.helper_call_instructions, generated.state_load_instructions,
 				generated.state_store_instructions,
 				block.poll_call_wait_loop_source_proof.valid,
-				poll_call_additional_ram_watches,
-				block.two_predicate_wait_loop_source_proof.valid,
-				compiled_vu0_acc_cache_writes,
-				compiled_vu0_acc_cache_hits,
-				compiled_vu0_acc_cache_flushes,
-				compiled_vu0_vf_cache_writes,
-				compiled_vu0_vf_cache_hits,
-				compiled_vu0_vf_cache_flushes);
+				block.two_predicate_wait_loop_source_proof.valid);
 		}
-		diagnostics_profile.Finish();
 #endif
 
-		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
-			linking_profile(
-				VitaPerformanceTelemetry::EeCompileSubstage::Linking);
 		if (m_direct_linking_enabled)
 		{
 			PatchIncomingLinks(block);
@@ -3911,7 +3428,6 @@ namespace VitaEE
 				}
 			}
 		}
-		linking_profile.Finish();
 
 		if (scaled_cycles)
 			*scaled_cycles = compiled_scaled_cycles;
@@ -4114,13 +3630,12 @@ namespace VitaEE
 		if (!m_direct_linking_enabled || !target.valid)
 			return;
 
-		u32 index = m_incoming_link_bucket_heads[
-			IncomingLinkBucketIndex(target.start_pc)];
-		while (index != INVALID_INCOMING_LINK_INDEX)
+		s32 index = LastIncomingLinkIndex(target.start_pc);
+		while (index >= 0 &&
+			m_incoming_links[index].TargetPc() == target.start_pc)
 		{
-			IncomingLinkRecord& record = m_incoming_links[index];
-			index = record.next_index;
-			if (record.source && record.TargetPc() == target.start_pc &&
+			IncomingLinkRecord& record = m_incoming_links[index--];
+			if (record.source &&
 				record.source->discovered_topology == target.discovered_topology)
 			{
 				if (DirectLinkSlot* link = GetRecordedDirectLink(record))
@@ -4138,22 +3653,17 @@ namespace VitaEE
 			for (u32 i = 0; i < m_incoming_links.size(); i++)
 			{
 				IncomingLinkRecord& record = m_incoming_links[i];
-				if (!record.source)
-					continue;
 				if (DirectLinkSlot* link = GetRecordedDirectLink(record))
 					unlinked &= PatchDirectLink(*record.source, *link, nullptr);
 			}
 			return unlinked;
 		}
 
-		u32 index = m_incoming_link_bucket_heads[
-			IncomingLinkBucketIndex(target_pc)];
-		while (index != INVALID_INCOMING_LINK_INDEX)
+		s32 index = LastIncomingLinkIndex(target_pc);
+		while (index >= 0 &&
+			m_incoming_links[index].TargetPc() == target_pc)
 		{
-			IncomingLinkRecord& record = m_incoming_links[index];
-			index = record.next_index;
-			if (!record.source || record.TargetPc() != target_pc)
-				continue;
+			IncomingLinkRecord& record = m_incoming_links[index--];
 			if (discovered_topology && (!record.source ||
 				record.source->discovered_topology != *discovered_topology))
 			{
@@ -4170,8 +3680,6 @@ namespace VitaEE
 		for (u32 i = 0; i < m_incoming_links.size(); i++)
 		{
 			IncomingLinkRecord& record = m_incoming_links[i];
-			if (!record.source)
-				continue;
 			DirectLinkSlot* link = GetRecordedDirectLink(record);
 			if (!link)
 				continue;
@@ -4214,8 +3722,8 @@ namespace VitaEE
 		result->source_instruction_count = block.source_instruction_count;
 		result->scaled_cycles = block.scaled_cycles;
 		result->code_size = block.code.Size();
-		result->block_records = m_block_record_count;
-		result->link_records = m_incoming_link_count;
+		result->block_records = static_cast<u32>(m_block_records.size());
+		result->link_records = static_cast<u32>(m_incoming_links.size());
 		result->cache_slots = static_cast<u32>(m_cache.size());
 		result->code_cache_resets = m_code_cache_resets;
 		result->code_cache_used = m_code_cache_used;
@@ -4225,8 +3733,6 @@ namespace VitaEE
 			DirectContinuationKind::Pcsx2ShortSplit;
 		const bool code_budget_continuation = block.direct_continuation_kind ==
 			DirectContinuationKind::A32PhysicalFragment;
-		const bool hot_region = block.direct_continuation_kind ==
-			DirectContinuationKind::HotRegionInternalStaticBranch;
 		result->concatenated_short_blocks = pcsx2_short_split ? 1u : 0u;
 		result->concatenated_short_scheduler_tests_elided =
 			pcsx2_short_split ? 1u : 0u;
@@ -4238,10 +3744,6 @@ namespace VitaEE
 			code_budget_continuation ? 1u : 0u;
 		result->code_budget_continuation_hot_instructions_elided =
 			code_budget_continuation ? 2u : 0u;
-		result->hot_region_blocks = hot_region ? 1u : 0u;
-		result->hot_region_scheduler_tests_elided = hot_region ? 1u : 0u;
-		result->hot_region_source_cycles =
-			hot_region ? block.scaled_cycles : 0u;
 		PopulateFrameEvidence(block.code, m_persistent_dispatch_code, result);
 		for (const DirectLinkSlot& link : block.direct_links.slots)
 		{
@@ -4333,18 +3835,14 @@ namespace VitaEE
 		*result = {};
 		const auto finish = [&](CachedBlock* entry, bool lookup_hit, bool fast_dispatch_hit,
 			bool cache_hit) {
-#if !defined(VITASX2_EE_HOT_REGION_CONTROL)
-			if (!ServiceHotRegionRequest())
-				return false;
-#endif
 			*block = entry;
 			result->path = BlockExecutionPath::Compiled;
 			result->instruction_count = entry->instruction_count;
 			result->source_instruction_count = entry->source_instruction_count;
 			result->scaled_cycles = entry->scaled_cycles;
 			result->code_size = entry->code.Size();
-			result->block_records = m_block_record_count;
-			result->link_records = m_incoming_link_count;
+			result->block_records = static_cast<u32>(m_block_records.size());
+			result->link_records = static_cast<u32>(m_incoming_links.size());
 			result->cache_slots = static_cast<u32>(m_cache.size());
 			result->code_cache_resets = m_code_cache_resets;
 			result->code_cache_used = m_code_cache_used;
@@ -4358,8 +3856,6 @@ namespace VitaEE
 			const bool code_budget_continuation =
 				entry->direct_continuation_kind ==
 					DirectContinuationKind::A32PhysicalFragment;
-			const bool hot_region = entry->direct_continuation_kind ==
-				DirectContinuationKind::HotRegionInternalStaticBranch;
 			result->concatenated_short_blocks = pcsx2_short_split ? 1u : 0u;
 			result->concatenated_short_scheduler_tests_elided =
 				pcsx2_short_split ? 1u : 0u;
@@ -4371,10 +3867,6 @@ namespace VitaEE
 				code_budget_continuation ? 1u : 0u;
 			result->code_budget_continuation_hot_instructions_elided =
 				code_budget_continuation ? 2u : 0u;
-			result->hot_region_blocks = hot_region ? 1u : 0u;
-			result->hot_region_scheduler_tests_elided = hot_region ? 1u : 0u;
-			result->hot_region_source_cycles =
-				hot_region ? entry->scaled_cycles : 0u;
 			PopulateFrameEvidence(entry->code, m_persistent_dispatch_code, result);
 			for (const DirectLinkSlot& link : entry->direct_links.slots)
 			{
@@ -4441,9 +3933,6 @@ namespace VitaEE
 		const VitaPerformanceTelemetry::ScopedExactEeCompileMeasurement
 			exact_compile_profile;
 		BlockScanResult scan;
-		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
-			discovery_profile(
-				VitaPerformanceTelemetry::EeCompileSubstage::Discovery);
 		if (!ScanStraightLineBlock(start_pc, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
 			scan.instruction_count == 0)
 		{
@@ -4457,28 +3946,25 @@ namespace VitaEE
 		// complete shared proof group, so an opcode change can never preserve a
 		// stale artificial seam through this truncation.
 		const u32 natural_stop_pc = scan.stop_pc;
-		CachedBlock* next_block = nullptr;
-		VisitBlockRecordsInRange(start_pc, natural_stop_pc,
-			[&](const BlockRecord& record) {
-				CachedBlock* candidate = record.block;
-				if (record.start_pc <= start_pc || !candidate || !candidate->valid ||
-					!candidate->discovered_topology)
-				{
-					return true;
-				}
-				if (!next_block || candidate->start_pc < next_block->start_pc)
-					next_block = candidate;
-				return true;
-			});
-		if (next_block)
+		auto next_record = std::upper_bound(m_block_records.begin(),
+			m_block_records.end(), start_pc,
+			[](u32 pc, const BlockRecord& record) { return pc < record.start_pc; });
+		while (next_record != m_block_records.end() &&
+			(!next_record->block || !next_record->block->valid ||
+			 !next_record->block->discovered_topology))
+		{
+			++next_record;
+		}
+		if (next_record != m_block_records.end() &&
+			next_record->start_pc < natural_stop_pc)
 		{
 			const u32 boundary_instructions =
-				(next_block->start_pc - start_pc) / sizeof(u32);
+				(next_record->start_pc - start_pc) / sizeof(u32);
 			BlockScanResult bounded_scan;
 			if (boundary_instructions != 0 &&
 				ScanStraightLineBlock(start_pc, boundary_instructions, &bounded_scan) &&
 				bounded_scan.instruction_count == boundary_instructions &&
-				bounded_scan.stop_pc == next_block->start_pc)
+				bounded_scan.stop_pc == next_record->start_pc)
 			{
 				bounded_scan.stop = BlockScanStop::ExistingBlockBoundary;
 				scan = bounded_scan;
@@ -4491,21 +3977,19 @@ namespace VitaEE
 				// its delay slot. If an existing target names that required follower,
 				// overlap exactly the atomic pair instead of ignoring the target and
 				// rediscovering the entire natural region.
-				const u32 preceding_op = memRead32(next_block->start_pc - sizeof(u32));
+				const u32 preceding_op = memRead32(next_record->start_pc - sizeof(u32));
 				BlockScanResult atomic_scan;
 				if ((BlockCompiler::RequiresFollowingInstructionInBlock(preceding_op) ||
 						BlockCompiler::IsSupportedBranchOpcode(preceding_op)) &&
 					ScanStraightLineBlock(start_pc, boundary_instructions + 1, &atomic_scan) &&
 					atomic_scan.instruction_count == boundary_instructions + 1 &&
-					atomic_scan.stop_pc == next_block->start_pc + sizeof(u32))
+					atomic_scan.stop_pc == next_record->start_pc + sizeof(u32))
 				{
 					atomic_scan.stop = BlockScanStop::ExistingBlockBoundary;
 					scan = atomic_scan;
 				}
 			}
 		}
-
-		discovery_profile.Finish();
 
 		// A continuation created by the A32 code budget inherits the original
 		// source span from its immediately adjacent predecessor.  All later split

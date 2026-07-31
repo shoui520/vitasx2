@@ -860,23 +860,6 @@ namespace VitaPerformanceTelemetry
 			static_cast<u32>(now - start_us);
 	}
 
-	u32 BeginExactEeCompileSubstageMeasurement()
-	{
-		return ReadProcessTimeLow();
-	}
-
-	void EndExactEeCompileSubstageMeasurement(
-		EeCompileSubstage stage, u32 start_us)
-	{
-		const size_t index = static_cast<size_t>(stage);
-		if (index >= EE_COMPILE_SUBSTAGE_COUNT)
-			return;
-		const u32 now = ReadProcessTimeLow();
-		s_cpu_stage_profiler.totals.ee_compile_substage_observations[index]++;
-		s_cpu_stage_profiler.totals.ee_compile_substage_time_us[index] +=
-			static_cast<u32>(now - start_us);
-	}
-
 	u32 BeginExactIopCompileMeasurement()
 	{
 		return ReadProcessTimeLow();
@@ -888,105 +871,6 @@ namespace VitaPerformanceTelemetry
 		s_cpu_stage_profiler.totals.iop_compile_observations++;
 		s_cpu_stage_profiler.totals.iop_compile_time_us +=
 			static_cast<u32>(now - start_us);
-	}
-
-	void RecordIopHotRegionProviderSample()
-	{
-		s_cpu_stage_profiler.totals.iop_hot_region_provider_samples++;
-	}
-
-	void RecordIopHotRegionSelection()
-	{
-		s_cpu_stage_profiler.totals.iop_hot_region_selections++;
-	}
-
-	void RecordIopHotRegionAttempt()
-	{
-		s_cpu_stage_profiler.totals.iop_hot_region_attempts++;
-	}
-
-	void RecordIopHotRegionPromotion(
-		u32 source_cycles, u32 successor_cycles, u32 resident_gpr_links,
-		u32 resident_gpr_stores_removed, u32 resident_gpr_loads_removed)
-	{
-		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
-		totals.iop_hot_region_promotions++;
-		totals.iop_hot_region_source_cycles += source_cycles;
-		totals.iop_hot_region_successor_cycles += successor_cycles;
-		totals.iop_hot_region_resident_gpr_links += resident_gpr_links;
-		totals.iop_hot_region_resident_gpr_stores_removed +=
-			resident_gpr_stores_removed;
-		totals.iop_hot_region_resident_gpr_loads_removed +=
-			resident_gpr_loads_removed;
-	}
-
-	void RecordEeHotRegionRequest()
-	{
-		s_cpu_stage_profiler.totals.ee_hot_region_requests++;
-	}
-
-	void RecordEeHotRegionAttempt()
-	{
-		s_cpu_stage_profiler.totals.ee_hot_region_attempts++;
-	}
-
-	void RecordEeHotRegionPromotion(
-		u32 source_cycles, u32 successor_cycles, bool conditional)
-	{
-		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
-		totals.ee_hot_region_promotions++;
-		totals.ee_hot_region_conditional_promotions += conditional ? 1u : 0u;
-		totals.ee_hot_region_source_cycles += source_cycles;
-		totals.ee_hot_region_successor_cycles += successor_cycles;
-	}
-
-	void RecordEeByteCopyCountdownCompile()
-	{
-		s_cpu_stage_profiler.totals.ee_byte_copy_countdown_blocks++;
-	}
-
-	void RecordEeByteCopyCountdownExecution(u32 bulk_bytes,
-		bool scalar_iteration, bool page_return, bool redispatch,
-		bool counter_exit)
-	{
-		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
-		totals.ee_byte_copy_countdown_helper_calls++;
-		if (bulk_bytes != 0)
-		{
-			totals.ee_byte_copy_countdown_bulk_chunks++;
-			totals.ee_byte_copy_countdown_bulk_bytes += bulk_bytes;
-		}
-		totals.ee_byte_copy_countdown_scalar_iterations +=
-			scalar_iteration ? 1u : 0u;
-		totals.ee_byte_copy_countdown_page_returns += page_return ? 1u : 0u;
-		totals.ee_byte_copy_countdown_redispatches += redispatch ? 1u : 0u;
-		totals.ee_byte_copy_countdown_counter_exits += counter_exit ? 1u : 0u;
-	}
-
-	void RecordEePairQwordFillCompile()
-	{
-		s_cpu_stage_profiler.totals.ee_pair_qword_fill_blocks++;
-	}
-
-	void RecordEePairQwordFillExecution(u32 bulk_bytes, bool zero_bulk,
-		bool scalar_iteration, bool page_return, bool redispatch)
-	{
-		CpuStageProfilerSnapshot& totals = s_cpu_stage_profiler.totals;
-		totals.ee_pair_qword_fill_helper_calls++;
-		if (bulk_bytes != 0)
-		{
-			totals.ee_pair_qword_fill_bulk_chunks++;
-			totals.ee_pair_qword_fill_bulk_bytes += bulk_bytes;
-			if (zero_bulk)
-			{
-				totals.ee_pair_qword_fill_zero_bulk_chunks++;
-				totals.ee_pair_qword_fill_zero_bulk_bytes += bulk_bytes;
-			}
-		}
-		totals.ee_pair_qword_fill_scalar_iterations +=
-			scalar_iteration ? 1u : 0u;
-		totals.ee_pair_qword_fill_page_returns += page_return ? 1u : 0u;
-		totals.ee_pair_qword_fill_redispatches += redispatch ? 1u : 0u;
 	}
 
 	void CountCpuStageEntry(CpuStage stage)

@@ -235,13 +235,6 @@ u32 g_qemuCop2Vf0ConstantTransferFastPaths = 0;
 u32 g_qemuCop2DeadStatusFlagOps = 0;
 u32 g_qemuCop2DeadMacFlagOps = 0;
 u32 g_qemuCop2ResultOnlyQuadOps = 0;
-u32 g_qemuCop2RuntimeNoOpsElided = 0;
-u32 g_qemuCop2AccCacheWrites = 0;
-u32 g_qemuCop2AccCacheHits = 0;
-u32 g_qemuCop2AccCacheFlushes = 0;
-u32 g_qemuCop2VfCacheWrites = 0;
-u32 g_qemuCop2VfCacheHits = 0;
-u32 g_qemuCop2VfCacheFlushes = 0;
 u32 g_qemuCop2RawGpr0Qmtc2ZeroFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheFastPaths = 0;
 u32 g_qemuCop2Qmtc2QCacheDirectStores = 0;
@@ -470,14 +463,6 @@ u32 g_qemuFourWordFillScalarIterations = 0;
 u32 g_qemuFourWordFillPageReturns = 0;
 u32 g_qemuFourWordFillRedispatches = 0;
 bool g_qemuFourWordFillForceRedispatch = false;
-u32 g_qemuPairQwordFillBlocks = 0;
-u32 g_qemuPairQwordFillHelperCalls = 0;
-u32 g_qemuPairQwordFillBulkChunks = 0;
-u32 g_qemuPairQwordFillBulkQwords = 0;
-u32 g_qemuPairQwordFillScalarIterations = 0;
-u32 g_qemuPairQwordFillPageReturns = 0;
-u32 g_qemuPairQwordFillRedispatches = 0;
-bool g_qemuPairQwordFillForceRedispatch = false;
 u32 g_qemuPreincrementWordFillBlocks = 0;
 u32 g_qemuPreincrementWordFillHelperCalls = 0;
 u32 g_qemuPreincrementWordFillBulkChunks = 0;
@@ -501,14 +486,6 @@ u32 g_qemuWordCopyScalarIterations = 0;
 u32 g_qemuWordCopyPageReturns = 0;
 u32 g_qemuWordCopyRedispatches = 0;
 bool g_qemuWordCopyForceRedispatch = false;
-u32 g_qemuByteCopyCountdownBlocks = 0;
-u32 g_qemuByteCopyCountdownHelperCalls = 0;
-u32 g_qemuByteCopyCountdownBulkChunks = 0;
-u32 g_qemuByteCopyCountdownBulkBytes = 0;
-u32 g_qemuByteCopyCountdownScalarIterations = 0;
-u32 g_qemuByteCopyCountdownPageReturns = 0;
-u32 g_qemuByteCopyCountdownRedispatches = 0;
-bool g_qemuByteCopyCountdownForceRedispatch = false;
 u32 g_qemuGsCsrVsintPollBlocks = 0;
 u32 g_qemuGsCsrVsintPollHelperCalls = 0;
 u32 g_qemuGsCsrVsintPollFastForwards = 0;
@@ -552,220 +529,11 @@ namespace VitaEE
 		// measured handler replacement in the raw fixed-point cycle domain and
 		// use one value for generated execution and code-budget split analysis.
 		constexpr u32 FLUSH_CACHE_RAW_CYCLE_CHARGE = 5650;
-		// Logical Q6 maps to caller-clobbered physical Q14. COP2 arithmetic
-		// blocks cannot also enable the GPR qword cache, and the vuDouble()
-		// lowering below deliberately leaves physical Q14 unused.
-		constexpr unsigned COP2_ACC_CACHE_Q = 6;
-		// Q3 is the existing COP2 arithmetic result quad. Retaining the latest
-		// complete normalized VF destination there adds no register pressure.
-		constexpr unsigned COP2_VF_CACHE_Q = 3;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_COMPLETE = 0;
 		constexpr u32 SIGNED_COUNTDOWN_LOOP_EVENT = 1;
 		constexpr u32 POLL_CALL_CYCLE_BITS = 10;
 		constexpr u32 POLL_CALL_CYCLE_MASK =
 			(1u << POLL_CALL_CYCLE_BITS) - 1;
-
-		struct PollCallAdditionalRamWatches
-		{
-			u8 count = 0;
-			std::array<u32, POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY>
-				address{};
-			std::array<u8, POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY>
-				size{};
-		};
-
-		bool IsDirectEeMainRamSpan(u32 guest_address, u32 byte_count)
-		{
-			if (!eeMem || !vtlb_private::vtlbdata.vmap || byte_count == 0)
-				return false;
-
-			const u32 page_remaining =
-				vtlb_private::VTLB_PAGE_SIZE -
-				(guest_address & vtlb_private::VTLB_PAGE_MASK);
-			if (byte_count > page_remaining)
-				return false;
-
-			const vtlb_private::VTLBVirtual mapping =
-				vtlb_private::vtlbdata.vmap[
-					guest_address >> vtlb_private::VTLB_PAGE_BITS];
-			if (mapping.isHandler(guest_address))
-				return false;
-
-			const uptr ram_begin = reinterpret_cast<uptr>(eeMem->Main);
-			const uptr ram_end = ram_begin +
-				std::min(Ps2MemSize::ExposedRam, Ps2MemSize::MainRam);
-			const uptr host = mapping.assumePtr(guest_address);
-			return host >= ram_begin && host < ram_end &&
-				static_cast<uptr>(byte_count) <= ram_end - host;
-		}
-
-		bool AnalyzePollCallAdditionalRamWatches(
-			u32 body_start_pc, u32 loop_end_pc, u32 branch_pc,
-			PollCallAdditionalRamWatches* result)
-		{
-			// The ordinary PCSX2 wait-loop dataflow proves that every accepted
-			// destination is refreshed before reuse. Retaining that loop across
-			// scheduler events additionally requires the address of every body
-			// load. Start narrowly with exact constants constructed inside the
-			// repeated body; invariant or dynamically derived bases keep the
-			// canonical generated path.
-			if (!result || body_start_pc > branch_pc ||
-				branch_pc > UINT32_MAX - 2 * sizeof(u32) ||
-				loop_end_pc != branch_pc + 2 * sizeof(u32) ||
-				loop_end_pc - body_start_pc > 128 * sizeof(u32))
-			{
-				return false;
-			}
-
-			*result = {};
-			std::array<u32, 32> known_value{};
-			u32 known = 1u;
-			const auto clear_known = [&](u32 reg) {
-				if (reg != 0)
-					known &= ~(1u << reg);
-			};
-			const auto set_known = [&](u32 reg, u32 value) {
-				if (reg != 0)
-				{
-					known_value[reg] = value;
-					known |= 1u << reg;
-				}
-			};
-			const auto add_watch = [&](u32 address, u8 size) {
-				for (u32 i = 0; i < result->count; i++)
-				{
-					if (result->address[i] == address &&
-						result->size[i] == size)
-					{
-						return true;
-					}
-				}
-				if (result->count >=
-					POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY)
-				{
-					return false;
-				}
-				const u32 index = result->count++;
-				result->address[index] = address;
-				result->size[index] = size;
-				return true;
-			};
-
-			for (u32 pc = body_start_pc; pc < loop_end_pc; pc += sizeof(u32))
-			{
-				if (pc == branch_pc)
-					continue;
-
-				const u32 code = memRead32(pc);
-				if (code == 0)
-					continue;
-				const u32 opcode = code >> 26;
-				const u32 rs = (code >> 21) & 0x1f;
-				const u32 rt = (code >> 16) & 0x1f;
-				const u32 rd = (code >> 11) & 0x1f;
-				const u32 funct = code & 0x3f;
-
-				if (opcode == 0x2f || (opcode == 0 && funct == 0x0f))
-					continue;
-
-				if (opcode == 0x0f)
-				{
-					set_known(rt, (code & 0xffffu) << 16);
-					continue;
-				}
-				if (opcode >= 0x08 && opcode <= 0x0e)
-				{
-					if ((known & (1u << rs)) != 0)
-					{
-						switch (opcode)
-						{
-							case 0x08:
-							case 0x09:
-								set_known(rt, known_value[rs] +
-									static_cast<s16>(code & 0xffffu));
-								break;
-							case 0x0c:
-								set_known(rt,
-									known_value[rs] & (code & 0xffffu));
-								break;
-							case 0x0d:
-								set_known(rt,
-									known_value[rs] | (code & 0xffffu));
-								break;
-							case 0x0e:
-								set_known(rt,
-									known_value[rs] ^ (code & 0xffffu));
-								break;
-							default:
-								clear_known(rt);
-								break;
-						}
-					}
-					else
-					{
-						clear_known(rt);
-					}
-					continue;
-				}
-				if (opcode == 0x18 || opcode == 0x19)
-				{
-					clear_known(rt);
-					continue;
-				}
-				if (opcode == 0 &&
-					(funct & 0x30) == 0x20 &&
-					(funct & 0x3e) != 0x28)
-				{
-					clear_known(rd);
-					continue;
-				}
-
-				u8 load_size = 0;
-				switch (opcode)
-				{
-					case 0x20:
-					case 0x24:
-						load_size = 1;
-						break;
-					case 0x21:
-					case 0x25:
-						load_size = 2;
-						break;
-					case 0x23:
-					case 0x27:
-						load_size = 4;
-						break;
-					case 0x37:
-						load_size = 8;
-						break;
-					default:
-						break;
-				}
-				if (load_size != 0)
-				{
-					if ((known & (1u << rs)) == 0)
-						return false;
-					const u32 address = known_value[rs] +
-						static_cast<s16>(code & 0xffffu);
-					if ((address & (load_size - 1u)) != 0 ||
-						!IsDirectEeMainRamSpan(address, load_size) ||
-						!add_watch(address, load_size))
-					{
-						return false;
-					}
-					clear_known(rt);
-					continue;
-				}
-
-				if ((opcode & 0x3c) == 0x10 && rs < 4)
-				{
-					clear_known(rt);
-					continue;
-				}
-				return false;
-			}
-			return true;
-		}
 
 		constexpr unsigned HOST_CPU_REGS = 4;
 		constexpr unsigned HOST_BRANCH_STATE = 5;
@@ -780,10 +548,24 @@ namespace VitaEE
 		constexpr unsigned HOST_TMP4 = 12;
 
 		u32 VitaEeAdvancePollCallWaitToEventCore(u32 start_pc,
-			u32 packed_cycles, u32 leaf_pc, u32 return_pc, u32 call_pc)
+			u32 packed_cycles, u32 leaf_pc, u32 return_pc, u32 call_pc,
+			bool publish_certificate)
 		{
 			const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 				VitaPerformanceTelemetry::CpuStage::EeHelper);
+#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
+			if (publish_certificate)
+			{
+				const u32 leaf_load = memRead32(leaf_pc + sizeof(u32));
+				const u32 load_base = (leaf_load >> 21) & 0x1f;
+				const u32 load_address =
+					cpuRegs.GPR.r[load_base].UL[0] +
+					static_cast<s16>(leaf_load & 0xffffu);
+				VitaPublishA32EePollCallWaitSchedulerCertificate(
+					load_address, packed_cycles,
+					leaf_pc, return_pc, call_pc);
+			}
+#endif
 			// A static call and JR are separate PCSX2 BaseBlocks, and each owns
 			// iBranchTest(). Do not turn the multi-block loop into the subtly
 			// different inline-wait contract (cycle == nextEventCycle, PC at the
@@ -862,36 +644,10 @@ namespace VitaEE
 		}
 
 		__noinline u32 VitaEeAdvancePollCallWaitToEvent(u32 packed_cycles,
-			u32 leaf_pc, u32 loop_end_pc, u32 call_pc)
+			u32 leaf_pc, u32 return_pc, u32 call_pc)
 		{
-			const u32 return_pc = call_pc + 2 * sizeof(u32);
-			const u32 branch_pc = loop_end_pc - 2 * sizeof(u32);
-			PollCallAdditionalRamWatches additional_watches;
-			if (!AnalyzePollCallAdditionalRamWatches(
-					return_pc, loop_end_pc, branch_pc,
-					&additional_watches))
-			{
-				return call_pc;
-			}
-#if !defined(VITASX2_QEMU_PROVIDER_FIXTURE)
-			const u32 leaf_load = memRead32(leaf_pc + sizeof(u32));
-			const u32 load_base = (leaf_load >> 21) & 0x1f;
-			const u32 load_address =
-				cpuRegs.GPR.r[load_base].UL[0] +
-				static_cast<s16>(leaf_load & 0xffffu);
-			VitaPublishA32EePollCallWaitSchedulerCertificate(
-				load_address, packed_cycles, leaf_pc, return_pc, call_pc,
-				additional_watches.count >= 1 ?
-					additional_watches.address[0] : 0,
-				additional_watches.count >= 1 ?
-					additional_watches.size[0] : 0,
-				additional_watches.count >= 2 ?
-					additional_watches.address[1] : 0,
-				additional_watches.count >= 2 ?
-					additional_watches.size[1] : 0);
-#endif
 			return VitaEeAdvancePollCallWaitToEventCore(
-				call_pc, packed_cycles, leaf_pc, return_pc, call_pc);
+				call_pc, packed_cycles, leaf_pc, return_pc, call_pc, true);
 		}
 
 		u32 VitaEeAdvanceTwoPredicateWaitToEventCore(u32 start_pc,
@@ -1653,23 +1409,6 @@ namespace VitaEE
 				default:
 					return {};
 			}
-		}
-
-		constexpr bool IsCop2MacroRuntimeNoOp(u32 op)
-		{
-			// PCSX2 owner: x86/microVU_Macro.inl::recVNOP()/recVWAITQ().
-			// Macro-mode VNOP and VWAITQ emit no runtime instruction at all in
-			// the canonical recompiler. They neither finish a running VU0
-			// microprogram nor publish interpreter decoder scratch state.
-			if ((op >> 26) != 0x12 || ((op >> 21) & 0x10) == 0 ||
-				(op & 0x3c) != 0x3c)
-			{
-				return false;
-			}
-
-			const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
-			return special2_index == 0x2f || // VNOP
-				   special2_index == 0x3b;   // VWAITQ
 		}
 
 		constexpr Cop2MacroArithmeticOp DecodeCop2MacroArithmetic(u32 op)
@@ -2483,9 +2222,6 @@ namespace VitaEE
 
 		unsigned FastVu0AddressUses(u32 op)
 		{
-			if (IsCop2MacroRuntimeNoOp(op))
-				return 0;
-
 			if (IsCOP2BranchOpcode(op))
 				return 1;
 
@@ -2553,7 +2289,7 @@ namespace VitaEE
 					return 5; // code + source VF(s) + Q/status mirrors.
 
 				const u32 special2_index = (op & 0x3) | ((op >> 4) & 0x7c);
-				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF.
+				return special2_index == 0x1d ? 3 : 1; // VABS uses code + source/dest VF; VNOP uses code only.
 			}
 
 			switch (op >> 26)
@@ -3234,7 +2970,7 @@ namespace VitaEE
 		u32 leaf_pc, u32 return_pc, u32 call_pc)
 	{
 		return VitaEeAdvancePollCallWaitToEventCore(
-			start_pc, packed_cycles, leaf_pc, return_pc, call_pc);
+			start_pc, packed_cycles, leaf_pc, return_pc, call_pc, false);
 	}
 
 	u32 AdvanceTwoPredicateWaitFromPcToEvent(u32 start_pc,
@@ -3431,55 +3167,6 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::IsExactPairQwordFillLoop(u32 start_pc,
-		u32 instruction_count, unsigned* pointer_guest, unsigned* count_guest,
-		unsigned* value_guest, unsigned* result_guest)
-	{
-		if (instruction_count != 7 || start_pc > UINT32_MAX - 7 * sizeof(u32))
-			return false;
-
-		u32 ops[7]{};
-		for (u32 i = 0; i < instruction_count; i++)
-			ops[i] = memRead32(start_pc + i * sizeof(u32));
-		const unsigned pointer = RS(ops[0]);
-		const unsigned value = RT(ops[0]);
-		const unsigned count = RT(ops[1]);
-		const unsigned result = RT(ops[3]);
-		const u32 guest_mask = (1u << pointer) | (1u << count) |
-			(1u << value) | (1u << result);
-		const bool result_branch =
-			(RS(ops[5]) == result && RT(ops[5]) == 0) ||
-			(RT(ops[5]) == result && RS(ops[5]) == 0);
-		if (pointer == 0 || count == 0 || result == 0 ||
-			std::popcount(guest_mask) != 4 ||
-			(ops[0] >> 26) != 0x1f || IMM_S(ops[0]) != 0 ||
-			(ops[1] >> 26) != 0x09 || RS(ops[1]) != count ||
-			IMM_S(ops[1]) != -32 ||
-			(ops[2] >> 26) != 0x09 || RS(ops[2]) != pointer ||
-			RT(ops[2]) != pointer || IMM_S(ops[2]) != 16 ||
-			(ops[3] >> 26) != 0x0b || RS(ops[3]) != count ||
-			IMM_S(ops[3]) != 32 ||
-			(ops[4] >> 26) != 0x1f || RS(ops[4]) != pointer ||
-			RT(ops[4]) != value || IMM_S(ops[4]) != 0 ||
-			(ops[5] >> 26) != 0x04 || !result_branch ||
-			BranchTarget(start_pc + 5 * sizeof(u32), ops[5]) != start_pc ||
-			(ops[6] >> 26) != 0x09 || RS(ops[6]) != pointer ||
-			RT(ops[6]) != pointer || IMM_S(ops[6]) != 16)
-		{
-			return false;
-		}
-
-		if (pointer_guest)
-			*pointer_guest = pointer;
-		if (count_guest)
-			*count_guest = count;
-		if (value_guest)
-			*value_guest = value;
-		if (result_guest)
-			*result_guest = result;
-		return true;
-	}
-
 	bool BlockCompiler::IsExactPreincrementWordFillLoop(u32 start_pc,
 		u32 instruction_count, unsigned* pointer_guest, unsigned* end_guest,
 		unsigned* value_guest, unsigned* result_guest)
@@ -3604,52 +3291,6 @@ namespace VitaEE
 			*destination_guest = destination;
 		if (end_guest)
 			*end_guest = end;
-		return true;
-	}
-
-	bool BlockCompiler::IsExactByteCopyCountdownLoop(u32 start_pc,
-		u32 instruction_count, unsigned* value_guest, unsigned* source_guest,
-		unsigned* destination_guest, unsigned* countdown_guest)
-	{
-		if (instruction_count != 7 || start_pc > UINT32_MAX - 7 * sizeof(u32))
-			return false;
-
-		u32 ops[7]{};
-		for (u32 i = 0; i < instruction_count; i++)
-			ops[i] = memRead32(start_pc + i * sizeof(u32));
-		const unsigned value = RT(ops[0]);
-		const unsigned source = RS(ops[0]);
-		const unsigned countdown = RT(ops[1]);
-		const unsigned destination = RS(ops[2]);
-		const u32 guest_mask = (1u << value) | (1u << source) |
-			(1u << destination) | (1u << countdown);
-		if (value == 0 || source == 0 || destination == 0 || countdown == 0 ||
-			std::popcount(guest_mask) != 4 ||
-			(ops[0] >> 26) != 0x24 || IMM_S(ops[0]) != 0 ||
-			(ops[1] >> 26) != 0x09 || RS(ops[1]) != countdown ||
-			RT(ops[1]) != countdown || IMM_S(ops[1]) != -1 ||
-			(ops[2] >> 26) != 0x28 || RT(ops[2]) != value ||
-			IMM_S(ops[2]) != 0 ||
-			(ops[3] >> 26) != 0x09 || RS(ops[3]) != source ||
-			RT(ops[3]) != source || IMM_S(ops[3]) != 1 ||
-			(ops[4] >> 26) != 0x09 || RS(ops[4]) != destination ||
-			RT(ops[4]) != destination || IMM_S(ops[4]) != 1 ||
-			(ops[5] >> 26) != 0x05 || RS(ops[5]) != countdown ||
-			RT(ops[5]) != 0 ||
-			BranchTarget(start_pc + 5 * sizeof(u32), ops[5]) != start_pc ||
-			ops[6] != 0)
-		{
-			return false;
-		}
-
-		if (value_guest)
-			*value_guest = value;
-		if (source_guest)
-			*source_guest = source;
-		if (destination_guest)
-			*destination_guest = destination;
-		if (countdown_guest)
-			*countdown_guest = countdown;
 		return true;
 	}
 
@@ -10759,17 +10400,6 @@ namespace VitaEE
 		ClearSaConstState();
 		ClearCop1NormalizedState();
 		m_cop2_norm_consts_ready = false;
-		m_vu0_acc_cache_valid = false;
-		m_vu0_acc_cache_current_opcode = false;
-		m_vu0_acc_cache_writes = 0;
-		m_vu0_acc_cache_hits = 0;
-		m_vu0_acc_cache_flushes = 0;
-		m_vu0_vf_cache_valid = false;
-		m_vu0_vf_cache_current_opcode = false;
-		m_vu0_vf_cache_reg = 0;
-		m_vu0_vf_cache_writes = 0;
-		m_vu0_vf_cache_hits = 0;
-		m_vu0_vf_cache_flushes = 0;
 		m_runtime_tlb_mapping_may_have_changed = false;
 		for (unsigned i = 0; i < MAX_GPR_PINS; i++)
 		{
@@ -10947,68 +10577,6 @@ namespace VitaEE
 		(void)preserve_temporaries;
 		return true;
 #endif
-	}
-
-	bool BlockCompiler::EmitHotRegionEntryCounter(u32* counter,
-		void* request_slot, const void* request_value, u32 request_threshold,
-		size_t* counter_offset, u8* counter_instruction_count)
-	{
-		if (counter_offset)
-			*counter_offset = static_cast<size_t>(-1);
-		if (counter_instruction_count)
-			*counter_instruction_count = 0;
-		if (!counter && !request_slot && !request_value &&
-			request_threshold == 0)
-		{
-			return true;
-		}
-		if (!counter || !request_slot || !request_value ||
-			request_threshold == 0)
-		{
-			return false;
-		}
-
-		// This is a bounded tier-zero counter, not permanent profiling. Only
-		// structurally eligible direct-jump or backward conditional sources
-		// receive it. The generated EE thread increments its own stable
-		// CachedBlock word and publishes a promotion request after the threshold;
-		// the C++ provider consumes that request at its next existing boundary.
-		// Promotion removes this sequence, while refusal rebuilds the canonical
-		// block without it.
-		const size_t start = m_code.Size();
-		const u16 temporaries = REG_R0 | REG_R1;
-		if (!m_code.EmitPush(temporaries) ||
-			!m_code.EmitMovImm32(HOST_TMP0,
-				static_cast<u32>(reinterpret_cast<uptr>(counter))) ||
-			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
-			!m_code.EmitAddImm8(HOST_TMP1, HOST_TMP1, 1) ||
-			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
-			!m_code.EmitCmpImm32(HOST_TMP1, request_threshold) ||
-			!m_code.EmitMovImm32(HOST_TMP0,
-				static_cast<u32>(reinterpret_cast<uptr>(request_slot)),
-				VitaA32::Condition::CS) ||
-			!m_code.EmitMovImm32(HOST_TMP1,
-				static_cast<u32>(reinterpret_cast<uptr>(request_value)),
-				VitaA32::Condition::CS) ||
-			!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0,
-				VitaA32::Condition::CS) ||
-			!m_code.EmitPop(temporaries))
-		{
-			return false;
-		}
-
-		const size_t bytes = m_code.Size() - start;
-		if ((bytes & (sizeof(u32) - 1)) != 0 ||
-			bytes / sizeof(u32) > UINT8_MAX)
-		{
-			return false;
-		}
-		if (counter_offset)
-			*counter_offset = start;
-		if (counter_instruction_count)
-			*counter_instruction_count =
-				static_cast<u8>(bytes / sizeof(u32));
-		return true;
 	}
 
 	bool BlockCompiler::IsRetainableUnconditionalWaitBlock(u32 start_pc,
@@ -11454,110 +11022,6 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::CompilePairQwordFillLoop(u32 start_pc,
-		u32 instruction_count, const void* direct_exit, const void* event_exit,
-		u32* scaled_cycles, DirectLinkSlots* direct_links,
-		size_t* linked_entry_offset)
-	{
-		unsigned pointer_guest = 0;
-		unsigned count_guest = 0;
-		unsigned value_guest = 0;
-		unsigned result_guest = 0;
-		if (!direct_exit || !event_exit || !direct_links ||
-			!IsExactPairQwordFillLoop(start_pc, instruction_count,
-				&pointer_guest, &count_guest, &value_guest, &result_guest))
-		{
-			return false;
-		}
-
-		u32 raw_cycles = 0;
-		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
-		for (u32 i = 0; i < instruction_count; i++)
-		{
-			const u32 op = memRead32(start_pc + i * sizeof(u32));
-			raw_cycles +=
-				(op == 0 ? 9 : R5900::GetInstruction(op).cycles) * cycle_factor;
-		}
-		const u32 block_cycles = ScaleBlockCycles(raw_cycles);
-		if (block_cycles == 0)
-			return false;
-		if (scaled_cycles)
-			*scaled_cycles = block_cycles;
-
-		m_gpr_q_cache_enabled = false;
-		m_staged_pin_count = 0;
-		m_gpr_link_signature = GprLinkSignature{};
-		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
-		const u32 packed_guests = pointer_guest | (count_guest << 5) |
-			(value_guest << 10) | (result_guest << 15);
-		if (!BeginBlock(false, false, false, linked_entry_offset) ||
-			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
-			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
-			!m_code.EmitMovImm32(HOST_TMP2, block_cycles) ||
-			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
-			!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
-				&VitaEeExecutePairQwordFill)) ||
-			!m_code.EmitCmpImm32(HOST_TMP0, VITA_EE_PAIR_QWORD_FILL_EVENT))
-		{
-			return false;
-		}
-
-		const size_t event_branch =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (event_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitCmpImm32(HOST_TMP0,
-				VITA_EE_PAIR_QWORD_FILL_REDISPATCH))
-		{
-			return false;
-		}
-		const size_t redispatch_branch =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (redispatch_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitCmpImm32(HOST_TMP0, VITA_EE_PAIR_QWORD_FILL_SELF))
-		{
-			return false;
-		}
-		const size_t self_branch =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (self_branch == static_cast<size_t>(-1) ||
-			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
-		{
-			return false;
-		}
-
-		const size_t self_target = m_code.Size();
-		if (!m_code.PatchBranch(self_branch, self_target,
-				VitaA32::Condition::EQ) ||
-			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
-		{
-			return false;
-		}
-		const size_t redispatch_target = m_code.Size();
-		if (!m_code.PatchBranch(redispatch_branch, redispatch_target,
-				VitaA32::Condition::EQ) ||
-			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
-		{
-			return false;
-		}
-		const size_t event_target = m_code.Size();
-		if (!m_code.PatchBranch(event_branch, event_target,
-				VitaA32::Condition::EQ) ||
-			!EmitEventExitReturn(event_exit))
-		{
-			return false;
-		}
-
-		direct_links->slots[0].target_pc = fallthrough_pc;
-		direct_links->slots[0].valid = true;
-		direct_links->slots[1].target_pc = start_pc;
-		direct_links->slots[1].valid = true;
-		VitaPerformanceTelemetry::RecordEePairQwordFillCompileIfProfiling();
-#if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuPairQwordFillBlocks++;
-#endif
-		return true;
-	}
-
 	bool BlockCompiler::CompilePreincrementWordFillLoop(u32 start_pc,
 		u32 instruction_count, const void* direct_exit, const void* event_exit,
 		u32* scaled_cycles, DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -11875,117 +11339,6 @@ namespace VitaEE
 		return true;
 	}
 
-	bool BlockCompiler::CompileByteCopyCountdownLoop(u32 start_pc,
-		u32 instruction_count, const void* direct_exit, const void* event_exit,
-		u32* scaled_cycles, DirectLinkSlots* direct_links,
-		size_t* linked_entry_offset)
-	{
-		unsigned value_guest = 0;
-		unsigned source_guest = 0;
-		unsigned destination_guest = 0;
-		unsigned countdown_guest = 0;
-		if (!direct_exit || !event_exit || !direct_links ||
-			!IsExactByteCopyCountdownLoop(start_pc, instruction_count,
-				&value_guest, &source_guest, &destination_guest,
-				&countdown_guest))
-		{
-			return false;
-		}
-
-		const u32 cycle_factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1);
-		const auto range_cycles = [&](u32 count) {
-			u32 raw_cycles = 0;
-			for (u32 i = 0; i < count; i++)
-			{
-				const u32 op = memRead32(start_pc + i * sizeof(u32));
-				raw_cycles += (op == 0 ? 9 : R5900::GetInstruction(op).cycles) *
-					cycle_factor;
-			}
-			return ScaleBlockCycles(raw_cycles);
-		};
-		const u32 block_cycles = range_cycles(instruction_count);
-		const u32 load_cycles = range_cycles(1);
-		if (block_cycles == 0 || block_cycles > 0xffff || load_cycles > 0xffff)
-			return false;
-		if (scaled_cycles)
-			*scaled_cycles = block_cycles;
-
-		m_gpr_q_cache_enabled = false;
-		m_staged_pin_count = 0;
-		m_gpr_link_signature = GprLinkSignature{};
-		const u32 fallthrough_pc = start_pc + instruction_count * sizeof(u32);
-		const u32 packed_cycles = block_cycles | (load_cycles << 16);
-		const u32 packed_guests = value_guest | (source_guest << 5) |
-			(destination_guest << 10) | (countdown_guest << 15);
-		if (!BeginBlock(false, false, false, linked_entry_offset) ||
-			!m_code.EmitMovImm32(HOST_TMP0, start_pc) ||
-			!m_code.EmitMovImm32(HOST_TMP1, fallthrough_pc) ||
-			!m_code.EmitMovImm32(HOST_TMP2, packed_cycles) ||
-			!m_code.EmitMovImm32(HOST_TMP3, packed_guests) ||
-			!m_code.EmitCallAbsolute(
-				reinterpret_cast<const void*>(&VitaEeExecuteByteCopyCountdown)) ||
-			!m_code.EmitCmpImm32(HOST_TMP0, VITA_EE_BYTE_COPY_COUNTDOWN_EVENT))
-		{
-			return false;
-		}
-
-		const size_t event_branch =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (event_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitCmpImm32(HOST_TMP0,
-				VITA_EE_BYTE_COPY_COUNTDOWN_REDISPATCH))
-		{
-			return false;
-		}
-		const size_t redispatch_branch =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (redispatch_branch == static_cast<size_t>(-1) ||
-			!m_code.EmitCmpImm32(HOST_TMP0, VITA_EE_BYTE_COPY_COUNTDOWN_SELF))
-		{
-			return false;
-		}
-		const size_t self_branch =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (self_branch == static_cast<size_t>(-1) ||
-			!EmitDirectLinkTail(direct_exit, &direct_links->slots[0]))
-		{
-			return false;
-		}
-
-		const size_t self_target = m_code.Size();
-		if (!m_code.PatchBranch(self_branch, self_target,
-				VitaA32::Condition::EQ) ||
-			!EmitDirectLinkTail(direct_exit, &direct_links->slots[1]))
-		{
-			return false;
-		}
-		const size_t redispatch_target = m_code.Size();
-		if (!m_code.PatchBranch(redispatch_branch, redispatch_target,
-				VitaA32::Condition::EQ) ||
-			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN))
-		{
-			return false;
-		}
-		const size_t event_target = m_code.Size();
-		if (!m_code.PatchBranch(event_branch, event_target,
-				VitaA32::Condition::EQ) ||
-			!EmitEventExitReturn(event_exit))
-		{
-			return false;
-		}
-
-		direct_links->slots[0].target_pc = fallthrough_pc;
-		direct_links->slots[0].valid = true;
-		direct_links->slots[1].target_pc = start_pc;
-		direct_links->slots[1].valid = true;
-		VitaPerformanceTelemetry::
-			RecordEeByteCopyCountdownCompileIfProfiling();
-#if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuByteCopyCountdownBlocks++;
-#endif
-		return true;
-	}
-
 	bool BlockCompiler::CompileSignedCountdownLoop(u32 start_pc, u32 instruction_count,
 		const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 		DirectLinkSlots* direct_links, size_t* linked_entry_offset)
@@ -12135,18 +11488,8 @@ namespace VitaEE
 		const void* scheduler_test_elided_direct_exit,
 		const void* retained_wait_event_exit,
 		PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof,
-		TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof,
-		u32 hot_region_guard_cycles,
-		const void* hot_region_fallback_entry,
-		u32* hot_region_entry_counter, void* hot_region_request_slot,
-		const void* hot_region_request_value, u32 hot_region_request_threshold,
-		size_t* hot_region_counter_offset,
-		u8* hot_region_counter_instruction_count)
+		TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof)
 	{
-		if (hot_region_counter_offset)
-			*hot_region_counter_offset = static_cast<size_t>(-1);
-		if (hot_region_counter_instruction_count)
-			*hot_region_counter_instruction_count = 0;
 		if (scheduler_test_elided_continuation_emitted)
 			*scheduler_test_elided_continuation_emitted = false;
 		if (poll_call_wait_loop_source_proof)
@@ -12159,23 +11502,6 @@ namespace VitaEE
 		if (direct_continuation_kind == DirectContinuationKind::Pcsx2ShortSplit &&
 			instruction_count > 6)
 			return false;
-		if ((direct_continuation_kind ==
-				 DirectContinuationKind::HotRegionInternalStaticBranch) !=
-			(hot_region_guard_cycles != 0 && hot_region_fallback_entry != nullptr))
-		{
-			return false;
-		}
-		const bool has_hot_region_counter =
-			hot_region_entry_counter || hot_region_request_slot ||
-			hot_region_request_value || hot_region_request_threshold != 0;
-		if (has_hot_region_counter &&
-			(!hot_region_entry_counter || !hot_region_request_slot ||
-			 !hot_region_request_value || hot_region_request_threshold == 0 ||
-			 direct_continuation_kind ==
-				 DirectContinuationKind::HotRegionInternalStaticBranch))
-		{
-			return false;
-		}
 
 		if (direct_links)
 			*direct_links = {};
@@ -12339,27 +11665,11 @@ namespace VitaEE
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
 		if (memory_range_loop_batch_enabled && direct_links &&
-			IsExactByteCopyCountdownLoop(start_pc, instruction_count))
-		{
-			return CompileByteCopyCountdownLoop(start_pc, instruction_count,
-				direct_exit, event_exit, scaled_cycles, direct_links,
-				linked_entry_offset);
-		}
-		if (memory_range_loop_batch_enabled && direct_links &&
 			IsExactSelfAddressPairScan(start_pc, instruction_count))
 		{
 			return CompileSelfAddressPairScan(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
-#if !defined(VITASX2_EE_PAIR_QWORD_FILL_CONTROL)
-		if (memory_range_loop_batch_enabled && direct_links &&
-			IsExactPairQwordFillLoop(start_pc, instruction_count))
-		{
-			return CompilePairQwordFillLoop(start_pc, instruction_count,
-				direct_exit, event_exit, scaled_cycles, direct_links,
-				linked_entry_offset);
-		}
-#endif
 		if (memory_range_loop_batch_enabled && direct_links &&
 			IsExactFourWordFillLoop(start_pc, instruction_count))
 		{
@@ -12568,13 +11878,6 @@ namespace VitaEE
 		{
 			return false;
 		}
-		if (direct_continuation_kind ==
-				DirectContinuationKind::HotRegionInternalStaticBranch &&
-			!EmitHotRegionEntryHorizonGuard(
-				hot_region_guard_cycles, hot_region_fallback_entry))
-		{
-			return false;
-		}
 		if (m_gpr_link_signature.IsValid() && m_pin_count != m_gpr_link_signature.count)
 			return false;
 		m_dirty_pins_enabled = dirty_pins_candidate &&
@@ -12681,11 +11984,7 @@ namespace VitaEE
 		if (!EmitGoemonBlockStartHook(start_pc))
 			return false;
 
-		if (!EmitCpuProfilerBlockPc(start_pc, true) ||
-			!EmitHotRegionEntryCounter(hot_region_entry_counter,
-				hot_region_request_slot, hot_region_request_value,
-				hot_region_request_threshold, hot_region_counter_offset,
-				hot_region_counter_instruction_count))
+		if (!EmitCpuProfilerBlockPc(start_pc, true))
 			return false;
 
 		u32 raw_cycles = 0;
@@ -12788,14 +12087,6 @@ namespace VitaEE
 					!CanCompileDelaySlotOpcode(delay_op) &&
 					CanCompileDelaySlotOpcode(op, delay_op);
 
-				// A block-local VU0 ACC value cannot cross either branch arm.
-				// Materialize it before producing the predicate so likely
-				// not-taken paths cannot reach a shared flush with an undefined
-				// vector register.
-				if (!EmitFlushVu0AccCache())
-					return false;
-				if (!EmitFlushVu0VfCache())
-					return false;
 				add_raw_cycles(op);
 				if (!EmitDeviceTracePreInstruction(pc))
 					return false;
@@ -13101,13 +12392,6 @@ namespace VitaEE
 			{
 				return false;
 			}
-			// Trace callbacks are architectural observers before the current
-			// instruction. Product builds emit no trace call and retain ACC
-			// across compatible macro arithmetic.
-			if (device_trace_enabled && !EmitFlushVu0AccCache())
-				return false;
-			if (device_trace_enabled && !EmitFlushVu0VfCache())
-				return false;
 			if (!EmitDeviceTracePreInstruction(pc))
 				return false;
 			if (IsDI(op))
@@ -13255,10 +12539,6 @@ namespace VitaEE
 		}
 
 		if (pending_di_clear)
-			return false;
-		if (!EmitFlushVu0AccCache())
-			return false;
-		if (!EmitFlushVu0VfCache())
 			return false;
 
 		const u32 next_pc = start_pc + instruction_count * 4;
@@ -13459,20 +12739,10 @@ namespace VitaEE
 		const bool scheduler_test_elided_continuation_requested =
 			direct_continuation_kind !=
 				DirectContinuationKind::SchedulerTestedTail;
-		const bool hot_region_internal_static_branch =
-			direct_continuation_kind ==
-				DirectContinuationKind::HotRegionInternalStaticBranch &&
-			!has_register_branch_target && !branch_is_likely &&
-			!wait_loop_body && has_branch && direct_link &&
-			((has_static_direct_link_target &&
-				 !has_static_conditional_direct_links) ||
-				(has_static_conditional_direct_links && taken_link));
 		const bool emit_scheduler_test_elided_continuation =
-			scheduler_test_elided_continuation_requested &&
-			((!has_branch &&
-				 (direct_link || direct_continuation_kind ==
-					DirectContinuationKind::A32PhysicalFragment)) ||
-			 hot_region_internal_static_branch);
+			scheduler_test_elided_continuation_requested && !has_branch &&
+			(direct_link || direct_continuation_kind ==
+				DirectContinuationKind::A32PhysicalFragment);
 		// A physical host-code fragment is not a PCSX2 scheduler boundary. If a
 		// helper or invalidation seam suppresses its outgoing link, fail closed so
 		// the executor can use the architectural fallback instead of observing a
@@ -13484,24 +12754,11 @@ namespace VitaEE
 		{
 			return false;
 		}
-		if (direct_continuation_kind ==
-				DirectContinuationKind::HotRegionInternalStaticBranch &&
-			!emit_scheduler_test_elided_continuation)
-		{
-			return false;
-		}
-		const void* const scheduler_elided_exit =
-			scheduler_test_elided_direct_exit ?
-				scheduler_test_elided_direct_exit : direct_exit;
 		const bool tail_ok = emit_scheduler_test_elided_continuation ?
-			(has_static_conditional_direct_links ?
-				EndBlockWithSchedulerElidedConditionalContinuation(
-					block_cycles, scheduler_elided_exit, direct_link,
-					taken_link, defer_pc_writeback, direct_pc,
-					branch_target_pc) :
-				EndBlockWithSchedulerElidedDirectContinuation(block_cycles,
-					scheduler_elided_exit, direct_link,
-					defer_pc_writeback, direct_pc)) :
+			EndBlockWithSchedulerElidedDirectContinuation(block_cycles,
+				scheduler_test_elided_direct_exit ?
+					scheduler_test_elided_direct_exit : direct_exit,
+				direct_link, defer_pc_writeback, direct_pc) :
 			EndBlockWithCycleTest(block_cycles, direct_exit, event_exit,
 				direct_link, taken_link,
 				has_register_branch_target ? indirect_lookup_pages_slot : nullptr,
@@ -13559,48 +12816,16 @@ namespace VitaEE
 		u32 branch_delay_fallthrough_pc)
 	{
 		const u32 previous_opcode = m_current_opcode;
-		const bool previous_vu0_acc_cache_current_opcode =
-			m_vu0_acc_cache_current_opcode;
-		const bool previous_vu0_vf_cache_current_opcode =
-			m_vu0_vf_cache_current_opcode;
-		m_vu0_acc_cache_current_opcode =
-			!branch_delay_slot && CanKeepVu0AccCacheAcrossOpcode(op);
-		m_vu0_vf_cache_current_opcode =
-			!branch_delay_slot && CanKeepVu0VfCacheAcrossOpcode(op);
-		if (!m_vu0_acc_cache_current_opcode && !EmitFlushVu0AccCache())
-		{
-			m_vu0_acc_cache_current_opcode =
-				previous_vu0_acc_cache_current_opcode;
-			m_vu0_vf_cache_current_opcode =
-				previous_vu0_vf_cache_current_opcode;
-			return false;
-		}
-		if (!m_vu0_vf_cache_current_opcode && !EmitFlushVu0VfCache())
-		{
-			m_vu0_acc_cache_current_opcode =
-				previous_vu0_acc_cache_current_opcode;
-			m_vu0_vf_cache_current_opcode =
-				previous_vu0_vf_cache_current_opcode;
-			return false;
-		}
 		m_current_opcode = op;
 		struct CurrentOpcodeScope
 		{
 			BlockCompiler& compiler;
 			u32 previous;
-			bool previous_vu0_acc_cache_current_opcode;
-			bool previous_vu0_vf_cache_current_opcode;
 			~CurrentOpcodeScope()
 			{
 				compiler.m_current_opcode = previous;
-				compiler.m_vu0_acc_cache_current_opcode =
-					previous_vu0_acc_cache_current_opcode;
-				compiler.m_vu0_vf_cache_current_opcode =
-					previous_vu0_vf_cache_current_opcode;
 			}
-		} current_opcode_scope{
-			*this, previous_opcode, previous_vu0_acc_cache_current_opcode,
-			previous_vu0_vf_cache_current_opcode};
+		} current_opcode_scope{*this, previous_opcode};
 
 		switch (op >> 26)
 		{
@@ -14181,7 +13406,7 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 		DirectLinkSlot* direct_link, bool defer_pc_writeback, u32 pc,
-		bool sync_private_fallback, bool scheduler_test_elided_fallback)
+		bool sync_private_fallback)
 	{
 		if (!direct_exit || target_branch == static_cast<size_t>(-1))
 			return false;
@@ -14229,8 +13454,7 @@ namespace VitaEE
 					!EmitReclaimedVtlbCanonicalEdge() :
 					!EmitSyncGprPinsToBacking())) ||
 			(defer_pc_writeback && !EmitStorePc(pc)) ||
-			!EmitExitToTarget(direct_exit, scheduler_test_elided_fallback ?
-					EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN : EE_DIRECT_EXIT_TOKEN,
+			!EmitExitToTarget(direct_exit, EE_DIRECT_EXIT_TOKEN,
 				requires_compatible_entry && direct_link ?
 					&direct_link->canonical_target_offset : nullptr,
 				requires_compatible_entry && direct_link ?
@@ -14745,8 +13969,6 @@ namespace VitaEE
 				poll_call_proof.valid = true;
 				poll_call_proof.call_pc = i;
 				poll_call_proof.leaf_pc = leaf_pc;
-				poll_call_proof.branch_pc = branch_pc;
-				poll_call_proof.loop_end_pc = loop_end_pc;
 				poll_call_proof.call_scaled_cycles = call_scaled_cycles;
 				poll_call_proof.leaf_scaled_cycles = leaf_scaled_cycles;
 				poll_call_proof.call_opcodes = {
@@ -14754,6 +13976,13 @@ namespace VitaEE
 				poll_call_proof.leaf_opcodes = {leaf_return, leaf_load};
 				continue;
 			}
+
+			// Crossing a real JAL/JR boundary is novel only for the common pure
+			// accessor loop. Keeping the return-to-branch body NOP-only makes the
+			// skipped architectural state and the three PCSX2 scheduler seams
+			// exactly derivable. Richer bodies retain ordinary generated execution.
+			if (poll_call_proof.valid)
+				return false;
 
 			if (opcode == 0x2f || (opcode == 0 && funct == 0x0f))
 				continue; // x86 wait-loop analysis ignores CACHE and SYNC.
@@ -14804,23 +14033,6 @@ namespace VitaEE
 			}
 		}
 
-		if (poll_call_proof.valid)
-		{
-			PollCallAdditionalRamWatches additional_watches;
-			if (!AnalyzePollCallAdditionalRamWatches(
-					poll_call_proof.call_pc + 2 * sizeof(u32),
-					loop_end_pc, branch_pc, &additional_watches))
-			{
-				return false;
-			}
-			poll_call_proof.additional_ram_watch_count =
-				additional_watches.count;
-			poll_call_proof.additional_ram_watch_address =
-				additional_watches.address;
-			poll_call_proof.additional_ram_watch_size =
-				additional_watches.size;
-		}
-
 		if (poll_call_wait_loop_source_proof)
 			*poll_call_wait_loop_source_proof = poll_call_proof;
 		return true;
@@ -14850,11 +14062,12 @@ namespace VitaEE
 				(poll_call_wait_loop->leaf_scaled_cycles <<
 					POLL_CALL_CYCLE_BITS) |
 				(tail_scaled_cycles << (2 * POLL_CALL_CYCLE_BITS));
+			const u32 return_pc =
+				poll_call_wait_loop->call_pc + 2 * sizeof(u32);
 			if (!m_code.EmitMovImm32(HOST_TMP0, packed_cycles) ||
 				!m_code.EmitMovImm32(HOST_TMP1,
 					poll_call_wait_loop->leaf_pc) ||
-				!m_code.EmitMovImm32(HOST_TMP2,
-					poll_call_wait_loop->loop_end_pc) ||
+				!m_code.EmitMovImm32(HOST_TMP2, return_pc) ||
 				!m_code.EmitMovImm32(HOST_TMP3,
 					poll_call_wait_loop->call_pc) ||
 				!m_code.EmitCallAbsolute(reinterpret_cast<const void*>(
@@ -14998,101 +14211,6 @@ namespace VitaEE
 		const size_t carry_branches[] = {carry_branch};
 		return EmitCycleCarryFixup(
 			carry_branches, 1, direct_tail, HOST_TMP1);
-	}
-
-	bool BlockCompiler::EndBlockWithSchedulerElidedConditionalContinuation(
-		u32 block_cycles, const void* scheduler_test_elided_direct_exit,
-		DirectLinkSlot* not_taken_link, DirectLinkSlot* taken_link,
-		bool defer_pc_writeback, u32 not_taken_pc, u32 taken_pc)
-	{
-		if (!scheduler_test_elided_direct_exit || !not_taken_link ||
-			!taken_link || block_cycles == 0)
-		{
-			return false;
-		}
-
-		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recRecompile() and
-		// iBranchTest(). A hot-region entry guard has already proved that this
-		// complete source block ends strictly before nextEventCycle. Preserve the
-		// ordinary non-likely branch predicate and delay-slot ordering, but let
-		// either selected BaseBlock edge enter its successor without repeating
-		// iBranchTest() at the source seam.
-		if (!EmitFlushDirtyGprPins())
-			return false;
-
-		size_t carry_branch = static_cast<size_t>(-1);
-		if (!EmitAddScaledCyclesToCpuLowWord(
-				block_cycles, HOST_TMP0, HOST_TMP2, &carry_branch))
-		{
-			return false;
-		}
-
-		const size_t direct_tail = m_code.Size();
-		if (m_deferred_resident_unsigned_branch_suffix)
-		{
-			if (!EmitDeferredResidentUnsignedBranchSuffix())
-				return false;
-		}
-		else if (!m_code.EmitCmpImm32(m_branch_flag_host, 0))
-		{
-			return false;
-		}
-
-		const VitaA32::Condition taken_condition =
-			m_deferred_resident_unsigned_branch_suffix ?
-				VitaA32::Condition::CC : VitaA32::Condition::NE;
-		const size_t taken_tail =
-			m_code.EmitBranchPlaceholder(taken_condition);
-		if (taken_tail == static_cast<size_t>(-1) ||
-			!EmitDirectLinkTail(scheduler_test_elided_direct_exit,
-				not_taken_link, defer_pc_writeback, not_taken_pc, false, true) ||
-			!EmitTakenDirectLinkTail(scheduler_test_elided_direct_exit,
-				taken_tail, taken_link, defer_pc_writeback, taken_pc,
-				false, true))
-		{
-			return false;
-		}
-
-		const size_t carry_branches[] = {carry_branch};
-		return EmitCycleCarryFixup(
-			carry_branches, 1, direct_tail, HOST_TMP1);
-	}
-
-	bool BlockCompiler::EmitHotRegionEntryHorizonGuard(
-		u32 source_cycles, const void* fallback_entry)
-	{
-		if (source_cycles == 0 || source_cycles > INT32_MAX || !fallback_entry)
-			return false;
-
-		// PCSX2 owner: x86/ix86-32/iR5900.cpp::iBranchTest(). A promoted source
-		// may cross its normal BaseBlock seam only when the source's complete
-		// charge remains strictly before nextEventCycle. The scheduler guarantees
-		// a signed-32-bit event horizon, so the same wrapping low-word predicate
-		// used by EndBlockWithCycleTest() is exact here. Guard failure re-enters
-		// the retained canonical source, which still owns the ordinary event test.
-		if (!m_code.EmitLdrImm12(HOST_TMP0, HOST_CPU_REGS,
-				static_cast<u16>(CYCLE_OFFSET)))
-		{
-			return false;
-		}
-		if (!m_code.EmitAddImm32(HOST_TMP0, HOST_TMP0, source_cycles) &&
-			(!m_code.EmitMovImm32(HOST_TMP2, source_cycles) ||
-			 !m_code.EmitAddReg(HOST_TMP0, HOST_TMP0, HOST_TMP2)))
-		{
-			return false;
-		}
-		if (!m_code.EmitLdrImm12(HOST_TMP1, HOST_CPU_REGS,
-				static_cast<u16>(NEXT_EVENT_OFFSET)) ||
-			!m_code.EmitSubReg(HOST_TMP0, HOST_TMP0, HOST_TMP1, true))
-		{
-			return false;
-		}
-
-		const size_t event_reaches_source =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::PL);
-		return event_reaches_source != static_cast<size_t>(-1) &&
-			m_code.PatchBranchToAddress(
-				event_reaches_source, fallback_entry, VitaA32::Condition::PL);
 	}
 
 	bool BlockCompiler::EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
@@ -16884,13 +16002,6 @@ namespace VitaEE
 			return EmitCOP2ControlReadFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
 		if (IsFastCOP2ControlWrite(op))
 			return EmitCOP2ControlWriteFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
-		if (IsCop2MacroRuntimeNoOp(op))
-		{
-#if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuCop2RuntimeNoOpsElided++;
-#endif
-			return true;
-		}
 		if (IsFastCOP2MacroInBlock(op))
 		{
 			if (branch_delay_slot && branch_delay_selected_pc == UINT32_MAX)
@@ -16953,13 +16064,6 @@ namespace VitaEE
 			const unsigned rs = RS(op);
 			Vu0SyncMode mode = Vu0SyncMode::None;
 
-			if (IsCop2MacroRuntimeNoOp(op))
-			{
-				if (i == m_current_instruction_index)
-					return mode;
-				continue;
-			}
-
 			// PCSX2 treats ordinary scalar stores as possible DMA -> VIF0 -> VU0
 			// starts. VCALLMS/VCALLMSR are explicit starts. Either seam invalidates
 			// the preceding chain-wide proof before a later COP2 consumer.
@@ -16993,8 +16097,6 @@ namespace VitaEE
 						continue;
 
 					const unsigned following_rs = RS(following);
-					if (IsCop2MacroRuntimeNoOp(following))
-						continue;
 					if (following_rs >= 0x10 &&
 						((following & 0x3fu) == 0x38 ||
 						 (following & 0x3fu) == 0x39))
@@ -17597,89 +16699,6 @@ namespace VitaEE
 			   EmitCOP2MacroStoreSelectedLanes(mask, value_qreg, address_reg);
 	}
 
-	bool BlockCompiler::CanKeepVu0AccCacheAcrossOpcode(u32 op) const
-	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		if (!m_vu0_acc_cache_enabled)
-			return false;
-#endif
-		if (IsCop2MacroRuntimeNoOp(op))
-			return true;
-
-		const Cop2MacroArithmeticOp arithmetic =
-			DecodeCop2MacroArithmetic(op);
-		if (!arithmetic.valid ||
-			arithmetic.kind == Cop2MacroArithmeticKind::OpMula ||
-			arithmetic.kind == Cop2MacroArithmeticKind::OpMSub ||
-			(arithmetic.addi_triace_hack && CHECK_VUADDSUBHACK))
-		{
-			return false;
-		}
-
-		// A full ACC cache value can absorb a full-mask write. Partial writes
-		// must merge with architectural backing and therefore terminate this
-		// first exact cache tier.
-		const unsigned mask = (op >> 21) & 0x0f;
-		return !arithmetic.acc_destination || mask == 0x0f;
-	}
-
-	bool BlockCompiler::EmitFlushVu0AccCache()
-	{
-		if (!m_vu0_acc_cache_valid)
-			return true;
-
-		// PCSX2 owner: VUops.cpp macro arithmetic leaves the latest ACC visible
-		// to every later macro/helper/observation. Q6 contains all four already
-		// normalized lanes, so one aligned qword store materializes that exact
-		// state at the boundary.
-		if (!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
-			!m_code.EmitVst1Q32Aligned(COP2_ACC_CACHE_Q, HOST_TMP0))
-		{
-			return false;
-		}
-#if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuCop2AccCacheFlushes++;
-#endif
-		m_vu0_acc_cache_flushes++;
-		m_vu0_acc_cache_valid = false;
-		return true;
-	}
-
-	bool BlockCompiler::CanKeepVu0VfCacheAcrossOpcode(u32 op) const
-	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		if (!m_vu0_vf_cache_enabled)
-			return false;
-#endif
-		if (IsCop2MacroRuntimeNoOp(op) || IsCop2MacroClip(op))
-			return true;
-
-		const Cop2MacroArithmeticOp arithmetic =
-			DecodeCop2MacroArithmetic(op);
-		return arithmetic.valid &&
-			arithmetic.kind != Cop2MacroArithmeticKind::OpMula &&
-			arithmetic.kind != Cop2MacroArithmeticKind::OpMSub &&
-			!(arithmetic.addi_triace_hack && CHECK_VUADDSUBHACK);
-	}
-
-	bool BlockCompiler::EmitFlushVu0VfCache()
-	{
-		if (!m_vu0_vf_cache_valid)
-			return true;
-
-		if (!EmitVu0VfAddress(HOST_TMP0, m_vu0_vf_cache_reg) ||
-			!m_code.EmitVst1Q32Aligned(COP2_VF_CACHE_Q, HOST_TMP0))
-		{
-			return false;
-		}
-#if defined(VITASX2_QEMU_VALIDATION)
-		g_qemuCop2VfCacheFlushes++;
-#endif
-		m_vu0_vf_cache_flushes++;
-		m_vu0_vf_cache_valid = false;
-		return true;
-	}
-
 	bool BlockCompiler::EmitCOP2MacroBody(u32 op)
 	{
 		// PCSX2 owners: VU0.cpp::COP2_SPECIAL(), VUops.cpp macro helpers, and
@@ -17779,6 +16798,7 @@ namespace VitaEE
 		constexpr unsigned NQ_ZERO = 11;
 		constexpr unsigned NQ_EXPV = 12;
 		constexpr unsigned NQ_SIGNV = 13;
+		constexpr unsigned NQ_TMP = 14;
 		constexpr unsigned NQ_MASK = 15;
 		const bool is_outer_product = arithmetic.kind == Cop2MacroArithmeticKind::OpMula ||
 									  arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
@@ -17787,20 +16807,6 @@ namespace VitaEE
 									 arithmetic.kind == Cop2MacroArithmeticKind::OpMSub;
 		const bool use_addi_triace_hack = arithmetic.addi_triace_hack && CHECK_VUADDSUBHACK;
 		const Cop2ArithmeticFlagNeeds flag_needs = CurrentCop2ArithmeticFlagNeeds(op);
-		const bool cached_acc_source = m_vu0_acc_cache_current_opcode &&
-			uses_acc_source && m_vu0_acc_cache_valid;
-		const bool cache_acc_destination = m_vu0_acc_cache_current_opcode &&
-			arithmetic.acc_destination && mask == 0x0f;
-		const bool cached_vf_fs = m_vu0_vf_cache_current_opcode &&
-			m_vu0_vf_cache_valid && m_vu0_vf_cache_reg == fs;
-		const bool uses_vf_ft =
-			arithmetic.operand == Cop2MacroArithmeticOperand::Vector ||
-			arithmetic.operand == Cop2MacroArithmeticOperand::BroadcastLane;
-		const bool cached_vf_ft = m_vu0_vf_cache_current_opcode &&
-			uses_vf_ft && m_vu0_vf_cache_valid &&
-			m_vu0_vf_cache_reg == ft;
-		const bool cache_vf_destination = m_vu0_vf_cache_current_opcode &&
-			!arithmetic.acc_destination && fd != 0 && mask == 0x0f;
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!flag_needs.status)
 			g_qemuCop2DeadStatusFlagOps++;
@@ -18031,18 +17037,12 @@ namespace VitaEE
 		const auto emit_store_result = [&](unsigned lane) {
 			if (arithmetic.acc_destination)
 			{
-				if (cache_acc_destination)
-				return EmitMoveCoreToQWordLane(
-					COP2_ACC_CACHE_Q, lane, HOST_TMP0);
 				return EmitVu0RegisterAddress(HOST_TMP2, VU0_ACC_OFFSET) &&
 					   m_code.EmitStrImm12(HOST_TMP0, HOST_TMP2, static_cast<u16>(lane * sizeof(u32)));
 			}
 
 			if (fd == 0)
 				return true;
-			if (cache_vf_destination)
-				return EmitMoveCoreToQWordLane(
-					COP2_VF_CACHE_Q, lane, HOST_TMP0);
 
 			return EmitVu0VfAddress(HOST_TMP2, fd) &&
 				   m_code.EmitStrImm12(HOST_TMP0, HOST_TMP2, static_cast<u16>(lane * sizeof(u32)));
@@ -18089,48 +17089,6 @@ namespace VitaEE
 			return true;
 		};
 
-		const auto emit_prepare_acc_quad = [&]() {
-			if (!uses_acc_source)
-				return true;
-			if (cached_acc_source)
-			{
-#if defined(VITASX2_QEMU_VALIDATION)
-				g_qemuCop2AccCacheHits++;
-#endif
-				m_vu0_acc_cache_hits++;
-				return m_code.EmitVorrQ(
-					QUAD_ACC, COP2_ACC_CACHE_Q, COP2_ACC_CACHE_Q);
-			}
-			return EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) &&
-				   m_code.EmitVld1Q32Aligned(QUAD_ACC, HOST_TMP0);
-		};
-
-		const auto mark_acc_cache_write = [&]() {
-			m_vu0_acc_cache_valid = true;
-			m_vu0_acc_cache_writes++;
-#if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuCop2AccCacheWrites++;
-#endif
-		};
-
-		const auto record_vf_cache_hit = [&]() {
-			m_vu0_vf_cache_hits++;
-#if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuCop2VfCacheHits++;
-#endif
-		};
-
-		const auto emit_prepare_fs_quad = [&]() {
-			if (cached_vf_fs)
-			{
-				record_vf_cache_hit();
-				return m_code.EmitVorrQ(
-					QUAD_FS, COP2_VF_CACHE_Q, COP2_VF_CACHE_Q);
-			}
-			return EmitVu0VfAddress(HOST_TMP0, fs) &&
-				   m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0);
-		};
-
 		// Preloads the operand quad (Q2 / S8-S11) for the NEON-quad path. Mirrors
 		// emit_prepare_broadcast_operand(): vector forms load all four lanes, the
 		// broadcast/immediate forms replicate a single word across the quad.
@@ -18138,22 +17096,9 @@ namespace VitaEE
 			switch (arithmetic.operand)
 			{
 				case Cop2MacroArithmeticOperand::Vector:
-					if (cached_vf_ft)
-					{
-						record_vf_cache_hit();
-						return m_code.EmitVorrQ(
-							QUAD_FT, COP2_VF_CACHE_Q, COP2_VF_CACHE_Q);
-					}
 					return EmitVu0VfAddress(HOST_TMP0, ft) &&
 						   m_code.EmitVld1Q32Aligned(QUAD_FT, HOST_TMP0);
 				case Cop2MacroArithmeticOperand::BroadcastLane:
-					if (cached_vf_ft)
-					{
-						record_vf_cache_hit();
-						return m_code.EmitVdupI32QFromQlane(
-							QUAD_FT, COP2_VF_CACHE_Q,
-							static_cast<u8>(arithmetic.broadcast_lane));
-					}
 					return emit_load_vf_lane(HOST_TMP1, ft, arithmetic.broadcast_lane) &&
 						   m_code.EmitVdupI32QFromCore(QUAD_FT, HOST_TMP1);
 				case Cop2MacroArithmeticOperand::ImmediateI:
@@ -18166,29 +17111,6 @@ namespace VitaEE
 						   m_code.EmitVdupI32QFromCore(QUAD_FT, HOST_TMP1);
 			}
 			return false;
-		};
-
-		const auto emit_retire_vf_cache_for_result = [&]() {
-			if (!m_vu0_vf_cache_valid)
-				return true;
-			if (cache_vf_destination &&
-				fd == m_vu0_vf_cache_reg)
-			{
-				// The current full-mask destination kills the old value after
-				// both source snapshots have already been captured.
-				m_vu0_vf_cache_valid = false;
-				return true;
-			}
-			return EmitFlushVu0VfCache();
-		};
-
-		const auto mark_vf_cache_write = [&]() {
-			m_vu0_vf_cache_valid = true;
-			m_vu0_vf_cache_reg = static_cast<u8>(fd);
-			m_vu0_vf_cache_writes++;
-#if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuCop2VfCacheWrites++;
-#endif
 		};
 
 		// Materializes the vuDouble() bit-select constants into Q8-Q11. Clobbers
@@ -18209,10 +17131,9 @@ namespace VitaEE
 		};
 
 		// Materializes the constants once per block. Physical Q8-Q11 are exclusive
-		// to these persistent constants. Physical Q12/Q13/Q15 are normalize
-		// scratch, while Q14 backs the block-local ACC cache through logical Q6.
-		// Q12-Q15 back logical Q4-Q7 in qcache blocks; the qcache classifier
-		// excludes macro arithmetic, so those roles never overlap.
+		// to these persistent constants. Physical Q12-Q15 are normalize scratch in
+		// COP2 macro blocks and back logical Q4-Q7 in qcache blocks; the qcache
+		// classifier excludes macro arithmetic, so those roles never overlap.
 		// m_cop2_norm_consts_ready is reset in BeginBlock(), so the first COP2 op
 		// in every block always materializes.
 		const auto emit_ensure_norm_consts = [&]() {
@@ -18239,8 +17160,8 @@ namespace VitaEE
 			if (!vu0_overflow_clamp)
 				return true;
 			return m_code.EmitVceqI32Q(NQ_MASK, NQ_EXPV, NQ_EXP) &&
-				   m_code.EmitVorrQ(NQ_SIGNV, NQ_SIGNV, NQ_MAXF) &&
-				   m_code.EmitVbitQ(vq, NQ_SIGNV, NQ_MASK);
+				   m_code.EmitVorrQ(NQ_TMP, NQ_SIGNV, NQ_MAXF) &&
+				   m_code.EmitVbitQ(vq, NQ_TMP, NQ_MASK);
 		};
 
 		// The TriAce add hack does a per-lane exponent compare that resists
@@ -18264,15 +17185,16 @@ namespace VitaEE
 				return true;
 
 			constexpr unsigned QUAD_RESULT = 3; // Q3 -> S12-S15
-			if (!emit_prepare_fs_quad() ||
+			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+				!m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0) ||
 				!emit_prepare_operand_quad() ||
-				!emit_prepare_acc_quad() ||
+				(uses_acc_source &&
+					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
+					 !m_code.EmitVld1Q32Aligned(QUAD_ACC, HOST_TMP0))) ||
 				!emit_ensure_norm_consts() ||
-				(!cached_vf_fs && !emit_normalize_quad(QUAD_FS)) ||
-				(!cached_vf_ft && !emit_normalize_quad(QUAD_FT)) ||
-				(uses_acc_source && !cached_acc_source &&
-					!emit_normalize_quad(QUAD_ACC)) ||
-				!emit_retire_vf_cache_for_result())
+				!emit_normalize_quad(QUAD_FS) ||
+				!emit_normalize_quad(QUAD_FT) ||
+				(uses_acc_source && !emit_normalize_quad(QUAD_ACC)))
 			{
 				return false;
 			}
@@ -18324,23 +17246,8 @@ namespace VitaEE
 				return false;
 			if (arithmetic.acc_destination)
 			{
-				if (cache_acc_destination)
-				{
-					if (!m_code.EmitVorrQ(
-							COP2_ACC_CACHE_Q, QUAD_RESULT, QUAD_RESULT))
-					{
-						return false;
-					}
-					mark_acc_cache_write();
-					return true;
-				}
 				return EmitVu0RegisterAddress(HOST_TMP1, VU0_ACC_OFFSET) &&
 					   EmitCOP2MacroStoreSelectedLanes(mask, QUAD_RESULT, HOST_TMP1);
-			}
-			if (cache_vf_destination)
-			{
-				mark_vf_cache_write();
-				return true;
 			}
 			return EmitCOP2MacroStoreVfSelectedLanes(
 				fd, mask, QUAD_RESULT, HOST_TMP1);
@@ -18363,15 +17270,16 @@ namespace VitaEE
 
 		if (use_quad)
 		{
-			if (!emit_prepare_fs_quad() ||
+			if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+				!m_code.EmitVld1Q32Aligned(QUAD_FS, HOST_TMP0) ||
 				!emit_prepare_operand_quad() ||
-				!emit_prepare_acc_quad() ||
+				(uses_acc_source &&
+					(!EmitVu0RegisterAddress(HOST_TMP0, VU0_ACC_OFFSET) ||
+						!m_code.EmitVld1Q32Aligned(QUAD_ACC, HOST_TMP0))) ||
 				!emit_ensure_norm_consts() ||
-				(!cached_vf_fs && !emit_normalize_quad(QUAD_FS)) ||
-				(!cached_vf_ft && !emit_normalize_quad(QUAD_FT)) ||
-				(uses_acc_source && !cached_acc_source &&
-					!emit_normalize_quad(QUAD_ACC)) ||
-				!emit_retire_vf_cache_for_result())
+				!emit_normalize_quad(QUAD_FS) ||
+				!emit_normalize_quad(QUAD_FT) ||
+				(uses_acc_source && !emit_normalize_quad(QUAD_ACC)))
 			{
 				return false;
 			}
@@ -18389,42 +17297,39 @@ namespace VitaEE
 				const unsigned fs_s = QUAD_FS * 4 + lane;
 				const unsigned ft_s = QUAD_FT * 4 + lane;
 				const unsigned acc_s = QUAD_ACC * 4 + lane;
-				const unsigned result_s = cache_vf_destination ?
-					COP2_VF_CACHE_Q * 4 + lane :
-					VFP_QUAD_RESULT_S12;
 				switch (arithmetic.kind)
 	{
 					case Cop2MacroArithmeticKind::Add:
-						if (!m_code.EmitVaddF32(result_s, fs_s, ft_s))
+						if (!m_code.EmitVaddF32(VFP_QUAD_RESULT_S12, fs_s, ft_s))
 							return false;
 						break;
 					case Cop2MacroArithmeticKind::Sub:
-						if (!m_code.EmitVsubF32(result_s, fs_s, ft_s))
+						if (!m_code.EmitVsubF32(VFP_QUAD_RESULT_S12, fs_s, ft_s))
 							return false;
 						break;
 					case Cop2MacroArithmeticKind::Mul:
 					case Cop2MacroArithmeticKind::OpMula:
-						if (!m_code.EmitVmulF32(result_s, fs_s, ft_s))
+						if (!m_code.EmitVmulF32(VFP_QUAD_RESULT_S12, fs_s, ft_s))
 							return false;
 						break;
 					case Cop2MacroArithmeticKind::MAdd:
-						if (!m_code.EmitVmulF32(result_s, fs_s, ft_s) ||
-							!m_code.EmitVaddF32(result_s, acc_s, result_s))
+						if (!m_code.EmitVmulF32(VFP_QUAD_RESULT_S12, fs_s, ft_s) ||
+							!m_code.EmitVaddF32(VFP_QUAD_RESULT_S12, acc_s, VFP_QUAD_RESULT_S12))
 						{
 							return false;
 						}
 						break;
 					case Cop2MacroArithmeticKind::MSub:
 					case Cop2MacroArithmeticKind::OpMSub:
-						if (!m_code.EmitVmulF32(result_s, fs_s, ft_s) ||
-							!m_code.EmitVsubF32(result_s, acc_s, result_s))
+						if (!m_code.EmitVmulF32(VFP_QUAD_RESULT_S12, fs_s, ft_s) ||
+							!m_code.EmitVsubF32(VFP_QUAD_RESULT_S12, acc_s, VFP_QUAD_RESULT_S12))
 						{
 							return false;
 						}
 						break;
 	}
 
-				if (!m_code.EmitVmovSToCore(HOST_TMP0, result_s) ||
+				if (!m_code.EmitVmovSToCore(HOST_TMP0, VFP_QUAD_RESULT_S12) ||
 					!emit_update_mac_lane(lane) ||
 					!emit_store_result(lane))
 	{
@@ -18432,13 +17337,7 @@ namespace VitaEE
 	}
 			}
 
-			if (!emit_sync_msflags())
-				return false;
-			if (cache_acc_destination)
-				mark_acc_cache_write();
-			if (cache_vf_destination)
-				mark_vf_cache_write();
-			return true;
+			return emit_sync_msflags();
 		}
 
 		if (is_outer_product)
@@ -19040,25 +17939,9 @@ namespace VitaEE
 
 		const unsigned ft = RT(op);
 		const unsigned fs = RD(op);
-		const bool cached_ft = m_vu0_vf_cache_current_opcode &&
-			m_vu0_vf_cache_valid && m_vu0_vf_cache_reg == ft;
-		const bool cached_fs = m_vu0_vf_cache_current_opcode &&
-			m_vu0_vf_cache_valid && m_vu0_vf_cache_reg == fs;
-		const auto record_vf_cache_hit = [&]() {
-			m_vu0_vf_cache_hits++;
-#if defined(VITASX2_QEMU_VALIDATION)
-			g_qemuCop2VfCacheHits++;
-#endif
-		};
 
-		const bool ft_loaded = cached_ft ?
-			(record_vf_cache_hit(),
-				m_code.EmitVmovSToCore(
-					HOST_TMP1, COP2_VF_CACHE_Q * 4 + 3)) :
-			(EmitVu0VfAddress(HOST_TMP0, ft) &&
-				m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0,
-					static_cast<u16>(3 * sizeof(u32))));
-		if (!ft_loaded ||
+		if (!EmitVu0VfAddress(HOST_TMP0, ft) ||
+			!m_code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, static_cast<u16>(3 * sizeof(u32))) ||
 			!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP1, FPU_FLOAT_EXPONENT_MASK, HOST_TMP3, true))
 		{
 			return false;
@@ -19087,14 +17970,8 @@ namespace VitaEE
 		constexpr unsigned NEON_FS_NEG = 1;
 		constexpr unsigned NEON_LIMIT = 2;
 		constexpr unsigned NEON_SIGN = 3;
-		const bool fs_loaded = cached_fs ?
-			(record_vf_cache_hit(),
-				m_code.EmitVorrQ(
-					NEON_FS_POS, COP2_VF_CACHE_Q, COP2_VF_CACHE_Q)) :
-			(EmitVu0VfAddress(HOST_TMP0, fs) &&
-				m_code.EmitVld1Q32Aligned(NEON_FS_POS, HOST_TMP0));
-		if (!fs_loaded ||
-			!EmitFlushVu0VfCache() ||
+		if (!EmitVu0VfAddress(HOST_TMP0, fs) ||
+			!m_code.EmitVld1Q32Aligned(NEON_FS_POS, HOST_TMP0) ||
 			!m_code.EmitVdupI32QFromCore(NEON_LIMIT, HOST_TMP2) ||
 			!m_code.EmitMovImm32(HOST_TMP3, FPU_FLOAT_SIGN_MASK) ||
 			!m_code.EmitVdupI32QFromCore(NEON_SIGN, HOST_TMP3) ||

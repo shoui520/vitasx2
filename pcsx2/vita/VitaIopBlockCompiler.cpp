@@ -75,7 +75,6 @@ u32 g_qemuIopConstDivideOperandFastPaths = 0;
 u32 g_qemuIopConstRegisterJumpFastPaths = 0;
 u32 g_qemuIopConstCop0WriteFastPaths = 0;
 u32 g_qemuIopConstCop2WriteFastPaths = 0;
-u32 g_qemuIopRetainedLoReadFastPaths = 0;
 struct QemuIopLinkedFrameEvidence
 {
 	u32 entries = 0;
@@ -89,7 +88,6 @@ static u32 s_qemuIopBranchEventBudgetPositive = 0;
 static u32 s_qemuIopBranchEventTestsEntered = 0;
 static bool s_qemuIopTrustedSourceAuditEnabled = true;
 static bool s_qemuIopPinnedGprResidencyEnabled = true;
-static bool s_qemuIopRetainedLoForwardingEnabled = true;
 static bool s_qemuIopPinnedBranchDirectCompareEnabled = true;
 static bool s_qemuIopConditionCodeBranchEnabled = true;
 static bool s_qemuIopProducerBranchFlagsEnabled = true;
@@ -100,12 +98,6 @@ static bool s_qemuIopClockModeSpecializationEnabled = true;
 static bool s_qemuIopSavedRegisterNarrowingEnabled = true;
 static bool s_qemuIopBlockCycleBatchingEnabled = true;
 static bool s_qemuIopLinkedFrameBypassEnabled = true;
-static bool s_qemuIopResidentPreludeLinksEnabled = true;
-static bool s_qemuIopResidentGprLinksEnabled = true;
-static bool s_qemuIopPublishedEventDeadlineResidencyEnabled = true;
-static bool s_qemuIopEeBudgetResidencyEnabled = true;
-static bool s_qemuIopGeneratedInstrumentationEnabled = true;
-static bool s_qemuIopHotRegionPromotionEnabled = true;
 static bool s_qemuIopSequentialQwordCopyEnabled = true;
 static bool s_qemuIopBranchTestSchedulingEnabled = true;
 static bool s_qemuIopPrivateDispatcherHotPathEnabled = true;
@@ -284,66 +276,6 @@ namespace
 		// mode on the interpreter's one-cycle timeline while product execution uses
 		// the x86 recompiler timing model above.
 		return interpreter_trace ? 1u : IopRecompilerInstructionCycles(op);
-	}
-
-	constexpr bool IopInstructionPreservesRetainedLoHost(u32 op)
-	{
-		// r3 is caller-clobbered, but these native scalar templates use only
-		// r0-r2. Keeping a just-produced LO there is therefore exact until an
-		// instruction outside this deliberately narrow set is reached. Memory,
-		// control, COP and helper paths fail closed because their cold arms or
-		// lowering details can overwrite r3.
-		switch (op >> 26)
-		{
-			case 0x00:
-				switch (op & 0x3f)
-				{
-					case 0x00: // SLL (including NOP)
-					case 0x02: // SRL
-					case 0x03: // SRA
-					case 0x04: // SLLV
-					case 0x06: // SRLV
-					case 0x07: // SRAV
-					case 0x10: // MFHI
-					case 0x11: // MTHI
-					case 0x12: // MFLO
-					case 0x20: // ADD
-					case 0x21: // ADDU
-					case 0x22: // SUB
-					case 0x23: // SUBU
-					case 0x24: // AND
-					case 0x25: // OR
-					case 0x26: // XOR
-					case 0x27: // NOR
-					case 0x2a: // SLT
-					case 0x2b: // SLTU
-						return true;
-					default:
-						return false;
-				}
-			case 0x08: // ADDI
-			case 0x09: // ADDIU
-			case 0x0a: // SLTI
-			case 0x0b: // SLTIU
-			case 0x0c: // ANDI
-			case 0x0d: // ORI
-			case 0x0e: // XORI
-			case 0x0f: // LUI
-				return true;
-			default:
-				return false;
-		}
-	}
-
-	bool RetainedLoForwardingEnabled()
-	{
-#if defined(VITASX2_IOP_RETAINED_LO_CONTROL)
-		return false;
-#elif defined(VITASX2_QEMU_VALIDATION)
-		return s_qemuIopRetainedLoForwardingEnabled;
-#else
-		return true;
-#endif
 	}
 
 	enum class IopRecSourceKind : u8
@@ -1220,38 +1152,6 @@ namespace
 	}
 #endif
 
-	inline __attribute__((always_inline)) u32 GetPublishedIopEventCountdown()
-	{
-		const u64 cycle = psxRegs.cycle;
-		const u64 deadline = psxRegs.iopNextEventCycle;
-		// PCSX2's x86 owner uses SUB/JS, so even an arbitrary restored 64-bit
-		// horizon is ordered by the sign of this wrapping difference rather
-		// than by an unsigned <= comparison.
-		if (static_cast<s64>(cycle - deadline) >= 0)
-			return 0;
-		const u64 distance = deadline - cycle;
-		return distance <= INT32_MAX ? static_cast<u32>(distance) : UINT32_MAX;
-	}
-
-	extern "C" __attribute__((noinline)) u32
-	VitaIopA32LoadPublishedEventCountdown()
-	{
-		return GetPublishedIopEventCountdown();
-	}
-
-	extern "C" __attribute__((noinline)) u32
-	VitaIopA32TestEventAndLoadPublishedCountdown()
-	{
-		if (static_cast<s64>(psxRegs.cycle - psxRegs.iopNextEventCycle) >= 0)
-		{
-#if defined(VITASX2_QEMU_VALIDATION)
-			s_qemuIopBranchEventTestsEntered++;
-#endif
-			iopEventTest();
-		}
-		return GetPublishedIopEventCountdown();
-	}
-
 	extern "C" __attribute__((noinline)) bool
 	VitaIopA32TraceInstruction(u32 pc, u32 opcode)
 	{
@@ -1470,7 +1370,6 @@ namespace VitaIOP
 			*linked_entry_offset = 0;
 		if (provider_entry_offset)
 			*provider_entry_offset = 0;
-		m_resident_contract = {};
 		m_scalar_load_cold_tails.clear();
 		m_scalar_store_cold_tails.clear();
 		m_unaligned_read_cold_tails.clear();
@@ -1483,64 +1382,6 @@ namespace VitaIOP
 		m_iop_cycle_base_register_available = !m_iop_ram_mask_register_available &&
 		                                      !m_emit_trace_checks &&
 		                                      !m_defer_cycle_updates;
-		// Nondeferred validation controls snapshot the target's entry cycle at
-		// [sp, #0]. That value is block-local and cannot be inherited from a
-		// predecessor, so they deliberately have no resident entry contract.
-		m_resident_contract.base_entry.domain = m_defer_cycle_updates ?
-			VitaRegion::GuestDomain::Iop : VitaRegion::GuestDomain::None;
-		m_resident_contract.base_entry.Bind(HOST_PSX_REGS,
-			VitaRegion::ResidentValue::CoreStateBase);
-		if (m_resident_event_deadline)
-		{
-			m_resident_contract.base_entry.Bind(
-				HOST_REGISTER_JUMP_TARGET,
-				VitaRegion::ResidentValue::IopPublishedEventCountdown);
-		}
-		if (m_resident_ee_budget)
-		{
-			m_resident_contract.base_entry.Bind(
-				HOST_SAVED0, VitaRegion::ResidentValue::IopEeBudget);
-		}
-		if (m_iop_cycle_base_register_available)
-		{
-			m_resident_contract.base_entry.Bind(HOST_CYCLE_BASE,
-				VitaRegion::ResidentValue::CycleStateBase);
-		}
-		else if (m_iop_ram_mask_register_available)
-		{
-			m_resident_contract.base_entry.Bind(HOST_IOP_RAM_MASK,
-				VitaRegion::ResidentValue::MainMemoryMask);
-		}
-		if (m_iop_ram_registers_available)
-		{
-			m_resident_contract.base_entry.Bind(HOST_IOP_RAM_BASE,
-				VitaRegion::ResidentValue::MainMemoryBase);
-		}
-		m_resident_gpr_contract_safe =
-			m_resident_contract.base_entry.domain != VitaRegion::GuestDomain::None &&
-			!m_compiled_ps1_bios_gate &&
-			!(m_irx_import_hle || m_irx_import_debug ||
-				(m_irx_import_log && m_irx_import_funcname));
-#if defined(VITASX2_QEMU_VALIDATION)
-		m_resident_gpr_contract_safe =
-			m_resident_gpr_contract_safe && s_qemuIopResidentGprLinksEnabled;
-#endif
-		// A GPR entry exists only when there is a guest value to inherit.
-		// Publishing the base-only contract as a GPR entry leaves its offset at
-		// zero, which is the callable adapter rather than the post-load body.
-		// A dirty predecessor could then patch its first canonical store straight
-		// into a second PUSH/SUB frame and bypass the store. This became common
-		// when the published-event countdown reserved r8 and reduced the pin set.
-		if (m_resident_gpr_contract_safe && m_pinned_gpr_count != 0)
-		{
-			m_resident_contract.gpr_entry = m_resident_contract.base_entry;
-			for (u8 i = 0; i < m_pinned_gpr_count; i++)
-			{
-				const PinnedGpr& pin = m_pinned_gprs[i];
-				m_resident_contract.gpr_entry.Bind(pin.host,
-					VitaRegion::ResidentValue::GuestGprLow32, pin.guest);
-			}
-		}
 		const u16 baseline_saved_registers =
 			REG_R4 | REG_R5 | REG_R6 | REG_R7 | REG_R8 |
 			((m_iop_cycle_base_register_available ||
@@ -1612,70 +1453,6 @@ namespace VitaIOP
 			return false;
 		}
 
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_CPU_PROFILER)
-		// Internal entries need parallel diagnostic-only markers because their
-		// link bypasses the ordinary entry. Product code points directly at each
-		// body and emits none of this instrumentation.
-		size_t resident_body_branch = static_cast<size_t>(-1);
-		size_t resident_gpr_body_branch = static_cast<size_t>(-1);
-		const auto emit_resident_marker =
-			[&](size_t* entry_offset, size_t* body_branch) {
-				*entry_offset = m_code.Size();
-#if defined(VITASX2_QEMU_VALIDATION)
-				const u32 frame_instructions =
-					2u + (m_stack_frame_size != 0 ? 2u : 0u);
-				const u32 stack_words =
-					2u * static_cast<u32>(__builtin_popcount(
-							 static_cast<unsigned>(m_saved_registers | REG_LR)));
-				if (!m_code.EmitMovImm32(HOST_CALL_SCRATCH,
-						static_cast<u32>(reinterpret_cast<uptr>(
-							&s_qemuIopLinkedFrameEvidence))) ||
-					!m_code.EmitLdrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
-					!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0, 1) ||
-					!m_code.EmitStrImm12(HOST_TMP0, HOST_CALL_SCRATCH, 0) ||
-					!m_code.EmitLdrImm12(
-						HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
-					!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0,
-						static_cast<u8>(frame_instructions)) ||
-					!m_code.EmitStrImm12(
-						HOST_TMP0, HOST_CALL_SCRATCH, sizeof(u32)) ||
-					!m_code.EmitLdrImm12(
-						HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)) ||
-					!m_code.EmitAddImm8(HOST_TMP0, HOST_TMP0,
-						static_cast<u8>(stack_words)) ||
-					!m_code.EmitStrImm12(
-						HOST_TMP0, HOST_CALL_SCRATCH, 2 * sizeof(u32)))
-				{
-					return false;
-				}
-#endif
-#if defined(VITASX2_CPU_PROFILER)
-				static_assert(sizeof(std::atomic<u32>) == sizeof(u32));
-				static_assert(alignof(std::atomic<u32>) >= alignof(u32));
-				if (!m_code.EmitMovImm32(HOST_TMP0,
-						static_cast<u32>(reinterpret_cast<uptr>(
-							&VitaPerformanceTelemetry::g_cpu_iop_statistical_pc))) ||
-					!m_code.EmitMovImm32(HOST_TMP1, start_pc) ||
-					!m_code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0))
-				{
-					return false;
-				}
-#endif
-				*body_branch = m_code.EmitBranchPlaceholder();
-				return *body_branch != static_cast<size_t>(-1);
-			};
-		if (!emit_resident_marker(
-				&m_resident_contract.base_entry_offset,
-				&resident_body_branch) ||
-			(m_resident_gpr_contract_safe && m_pinned_gpr_count != 0 &&
-				!emit_resident_marker(
-					&m_resident_contract.gpr_entry_offset,
-					&resident_gpr_body_branch)))
-		{
-			return false;
-		}
-#endif
-
 		// PCSX2's _DynGen_EnterRecompiledCode() owns one private frame around a
 		// linked chain. Vita keeps narrow callable frames, but an exact frame
 		// signature can enter here after the PUSH/SUB and unwind only once at the
@@ -1738,7 +1515,6 @@ namespace VitaIOP
 			!m_code.PatchBranch(callable_body, m_code.Size()))
 			return false;
 
-		const size_t setup_start = m_code.Size();
 		if (!m_code.EmitMovImm32(HOST_PSX_REGS,
 				static_cast<u32>(reinterpret_cast<uptr>(&psxRegs))))
 			return false;
@@ -1769,29 +1545,6 @@ namespace VitaIOP
 		{
 			return false;
 		}
-		if (m_resident_event_deadline && !EmitReloadPublishedEventCountdown())
-			return false;
-		if (m_resident_ee_budget &&
-			!m_code.EmitLdrImm12(HOST_SAVED0, HOST_PSX_REGS,
-				static_cast<u16>(IOP_CYCLE_EE_OFFSET)))
-		{
-			return false;
-		}
-		const size_t resident_body = m_code.Size();
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_CPU_PROFILER)
-		if (resident_body_branch != static_cast<size_t>(-1) &&
-			!m_code.PatchBranch(resident_body_branch, resident_body))
-		{
-			return false;
-		}
-#else
-		m_resident_contract.base_entry_offset = resident_body;
-#endif
-		const size_t setup_bytes = resident_body - setup_start;
-		if ((setup_bytes & 3u) != 0 || setup_bytes / sizeof(u32) > UINT8_MAX)
-			return false;
-		m_resident_contract.base_setup_instruction_count =
-			static_cast<u8>(setup_bytes / sizeof(u32));
 		for (u8 i = 0; i < m_pinned_gpr_count; i++)
 		{
 			const PinnedGpr& pin = m_pinned_gprs[i];
@@ -1806,51 +1559,16 @@ namespace VitaIOP
 					return false;
 				}
 				m_pinned_gpr_initial_loads++;
-				m_resident_contract.gpr_entry_load_instruction_count++;
 			}
 		}
-#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_CPU_PROFILER)
-		if (resident_gpr_body_branch != static_cast<size_t>(-1) &&
-			!m_code.PatchBranch(resident_gpr_body_branch, m_code.Size()))
-		{
-			return false;
-		}
-#else
-		if (m_resident_gpr_contract_safe && m_pinned_gpr_count != 0)
-			m_resident_contract.gpr_entry_offset = m_code.Size();
-#endif
 		return true;
-	}
-
-	void BlockCompiler::FinalizeResidentExitContract()
-	{
-		// Callee-saved core/RAM bases, and the countdown after its exact
-		// block-cycle rebase, are valid at every ordinary linked exit whether or
-		// not this block can also carry guest GPRs. Keep the base proof
-		// independent from the stricter pinned-GPR proof so disabling or
-		// rejecting GPR residency does not also disable safe prelude links.
-		m_resident_contract.exit = m_resident_contract.base_entry;
-		m_resident_contract.dirty_gpr_host_mask = 0;
-		if (!m_resident_gpr_contract_safe)
-			return;
-
-		for (u8 i = 0; i < m_pinned_gpr_count; i++)
-		{
-			const PinnedGpr& pin = m_pinned_gprs[i];
-			m_resident_contract.exit.Bind(pin.host,
-				VitaRegion::ResidentValue::GuestGprLow32, pin.guest);
-			if (pin.written)
-				m_resident_contract.dirty_gpr_host_mask |=
-					static_cast<u16>(1u << pin.host);
-		}
 	}
 
 	bool BlockCompiler::EndBlockReturn(BlockExitKind exit, bool charge_budget,
 		bool flush_pins, u32 known_cycle_count)
 	{
 		if ((flush_pins && !EmitFlushPinnedGprs()) ||
-			(charge_budget && !EmitChargeEeBudget(known_cycle_count)) ||
-			!EmitPublishResidentEeBudget())
+			(charge_budget && !EmitChargeEeBudget(known_cycle_count)))
 			return false;
 
 		return m_code.EmitMovImm32(HOST_TMP0, static_cast<u32>(exit)) &&
@@ -1969,36 +1687,11 @@ namespace VitaIOP
 		if (!direct_exit || direct_link_slot_index >= 2)
 			return false;
 
-		// Preserve dirty pins until the signed budget test. Its cold LE exit owns
-		// the canonical flush, while a compatible linked edge can replace the
-		// first ordinary STR with a direct branch and skip every source store.
-		if (charge_budget &&
-				!EmitChargeEeBudget(0, false,
+		if (!EmitFlushPinnedGprs() ||
+			(charge_budget &&
+				!EmitChargeEeBudget(0, true,
 					test_budget ? direct_link_slot_index : UINT8_MAX,
-					test_budget))
-		{
-			return false;
-		}
-
-		const size_t flush_offset = m_code.Size();
-		if (!EmitFlushPinnedGprs())
-			return false;
-		const u8 flush_count = static_cast<u8>(
-			(m_code.Size() - flush_offset) / sizeof(u32));
-		u32 flush_instruction = 0;
-		if (flush_count != 0 &&
-			!m_code.ReadInstruction(flush_offset, &flush_instruction))
-		{
-			return false;
-		}
-
-		const size_t budget_publish_offset = m_code.Size();
-		if (!EmitPublishResidentEeBudget())
-			return false;
-		u32 budget_publish_instruction = 0;
-		if (m_resident_ee_budget &&
-			!m_code.ReadInstruction(
-				budget_publish_offset, &budget_publish_instruction))
+					test_budget)))
 		{
 			return false;
 		}
@@ -2023,16 +1716,6 @@ namespace VitaIOP
 			direct_link_slot->fallback_offset = fallback_offset;
 			direct_link_slot->logical_continuation =
 				fallback_exit == BlockExitKind::LogicalContinuation;
-			direct_link_slot->resident_gpr_bypass_offset =
-				flush_count != 0 ? flush_offset : static_cast<size_t>(-1);
-			direct_link_slot->resident_gpr_bypass_instruction =
-				flush_instruction;
-			direct_link_slot->resident_gpr_stores_removed = flush_count;
-			direct_link_slot->resident_budget_bypass_offset =
-				m_resident_ee_budget ? budget_publish_offset :
-					static_cast<size_t>(-1);
-			direct_link_slot->resident_budget_bypass_instruction =
-				budget_publish_instruction;
 		}
 		return true;
 	}
@@ -2291,8 +1974,7 @@ namespace VitaIOP
 		constexpr std::array<u8, 2> pin_hosts = {HOST_SAVED1,
 			HOST_REGISTER_JUMP_TARGET};
 		const u8 pin_host_count =
-			(reserves_register_jump_host || m_resident_event_deadline) ?
-				1 : static_cast<u8>(pin_hosts.size());
+			reserves_register_jump_host ? 1 : static_cast<u8>(pin_hosts.size());
 		for (u8 host_index = 0; host_index < pin_host_count; host_index++)
 		{
 			const u8 host = pin_hosts[host_index];
@@ -2334,10 +2016,6 @@ namespace VitaIOP
 			m_required_saved_registers |= REG_R10;
 		if (m_iop_ram_registers_available)
 			m_required_saved_registers |= REG_R11;
-		if (m_resident_event_deadline)
-			m_required_saved_registers |= REG_R8;
-		if (m_resident_ee_budget)
-			m_required_saved_registers |= REG_R5;
 		for (u8 i = 0; i < m_pinned_gpr_count; i++)
 			m_required_saved_registers |= static_cast<u16>(1u << m_pinned_gprs[i].host);
 
@@ -3039,19 +2717,6 @@ namespace VitaIOP
 				       finish_ps1_budget_test();
 			}
 
-			if (m_resident_ee_budget)
-			{
-				const u32 ee_cycles = known_block_cycles * 8u;
-				const bool subtracted =
-					m_code.EmitSubImm32(
-						HOST_SAVED0, HOST_SAVED0, ee_cycles, true) ||
-					(m_code.EmitMovImm32(HOST_TMP2, ee_cycles) &&
-					 m_code.EmitSubReg(
-						 HOST_SAVED0, HOST_SAVED0, HOST_TMP2, true));
-				return subtracted &&
-				       (!test_budget || emit_budget_exit_from_signed_flags());
-			}
-
 			const bool emitted_ee_cycles =
 				known_block_cycles != 0 ? m_code.EmitMovImm32(HOST_TMP2, known_block_cycles * 8) : m_code.EmitMovRegShiftImm(HOST_TMP2, HOST_TMP0, VitaA32::ShiftType::LSL, 3);
 			return emitted_ee_cycles &&
@@ -3102,51 +2767,6 @@ namespace VitaIOP
 		}
 
 		return m_code.PatchBranch(done, m_code.Size());
-	}
-
-	bool BlockCompiler::EmitPublishResidentEeBudget()
-	{
-		// PCSX2 owner: x86/iR3000A.cpp::iPsxAddEECycles() keeps this value
-		// canonical because the desktop dispatcher has no cross-block host
-		// contract. Vita's private generated chain owns callee-saved r5 until a
-		// real provider/observer exit. Compatible internal edges consume r5;
-		// every generated fallback and exit publishes it exactly once.
-		return !m_resident_ee_budget ||
-		       m_code.EmitStrImm12(HOST_SAVED0, HOST_PSX_REGS,
-				   static_cast<u16>(IOP_CYCLE_EE_OFFSET));
-	}
-
-	bool BlockCompiler::EmitHotRegionHorizonGuard(u32 source_cycles,
-		HotRegionGuardPatch* patch)
-	{
-		if (!patch || source_cycles == 0 || !m_resident_ee_budget ||
-			!m_resident_event_deadline ||
-			source_cycles > UINT32_MAX / 8u)
-		{
-			return false;
-		}
-
-		// PCSX2 owner: iPsxBranchTest() must run after the source BaseBlock
-		// whenever its signed EE budget or event deadline is reached there.
-		if (!m_code.EmitCmpImm32(HOST_SAVED0, source_cycles * 8u))
-			return false;
-		patch->budget =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::LE);
-		if (patch->budget == static_cast<size_t>(-1) ||
-			!m_code.EmitCmpImm32(HOST_REGISTER_JUMP_TARGET, UINT32_MAX))
-		{
-			return false;
-		}
-		patch->event_sentinel =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (patch->event_sentinel == static_cast<size_t>(-1) ||
-			!m_code.EmitCmpImm32(HOST_REGISTER_JUMP_TARGET, source_cycles))
-		{
-			return false;
-		}
-		patch->event_horizon =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::LE);
-		return patch->event_horizon != static_cast<size_t>(-1);
 	}
 
 	bool BlockCompiler::EmitPcChangedExitCheck(
@@ -3982,7 +3602,6 @@ namespace VitaIOP
 
 	bool BlockCompiler::EmitMultiplyOp(u32 op, bool is_signed)
 	{
-		m_retained_lo_host_valid = false;
 		u32 known_rs = 0;
 		u32 known_rt = 0;
 		if (TryGetKnownGpr(RS(op), &known_rs) && TryGetKnownGpr(RT(op), &known_rt))
@@ -4016,16 +3635,11 @@ namespace VitaIOP
 #endif
 			if (known_value == 0)
 			{
-				const bool retain_lo = RetainedLoForwardingEnabled();
-				const unsigned zero_host = retain_lo ? HOST_TMP3 : HOST_TMP2;
-				const bool emitted =
-					m_code.EmitMovImm8(zero_host, 0) &&
-					m_code.EmitStrImm12(zero_host, HOST_PSX_REGS,
-						static_cast<u16>(LO_OFFSET)) &&
-					m_code.EmitStrImm12(zero_host, HOST_PSX_REGS,
-						static_cast<u16>(HI_OFFSET));
-				m_retained_lo_host_valid = emitted && retain_lo;
-				return emitted;
+				return m_code.EmitMovImm8(HOST_TMP2, 0) &&
+				       m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS,
+						   static_cast<u16>(LO_OFFSET)) &&
+				       m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS,
+						   static_cast<u16>(HI_OFFSET));
 			}
 
 			if (!EmitLoadGpr(dynamic_reg, HOST_TMP0) ||
@@ -4034,27 +3648,21 @@ namespace VitaIOP
 				return false;
 			}
 
-			const bool retain_lo = RetainedLoForwardingEnabled();
-			const unsigned lo_host = retain_lo ? HOST_TMP3 : HOST_TMP2;
-			const unsigned hi_host = retain_lo ? HOST_TMP2 : HOST_TMP3;
 			if (is_signed)
 			{
-				if (!m_code.EmitSmull(lo_host, hi_host, HOST_TMP0, HOST_TMP1))
+				if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
 					return false;
 			}
 			else
 			{
-				if (!m_code.EmitUmull(lo_host, hi_host, HOST_TMP0, HOST_TMP1))
+				if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
 					return false;
 			}
 
-			const bool emitted =
-				m_code.EmitStrImm12(lo_host, HOST_PSX_REGS,
-					static_cast<u16>(LO_OFFSET)) &&
-				m_code.EmitStrImm12(hi_host, HOST_PSX_REGS,
-					static_cast<u16>(HI_OFFSET));
-			m_retained_lo_host_valid = emitted && retain_lo;
-			return emitted;
+			return m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS,
+					   static_cast<u16>(LO_OFFSET)) &&
+			       m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS,
+					   static_cast<u16>(HI_OFFSET));
 		}
 
 		if (!EmitLoadGpr(RS(op), HOST_TMP0) || !EmitLoadGpr(RT(op), HOST_TMP1))
@@ -4062,27 +3670,21 @@ namespace VitaIOP
 			return false;
 		}
 
-		const bool retain_lo = RetainedLoForwardingEnabled();
-		const unsigned lo_host = retain_lo ? HOST_TMP3 : HOST_TMP2;
-		const unsigned hi_host = retain_lo ? HOST_TMP2 : HOST_TMP3;
 		if (is_signed)
 		{
-			if (!m_code.EmitSmull(lo_host, hi_host, HOST_TMP0, HOST_TMP1))
+			if (!m_code.EmitSmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
 				return false;
 		}
 		else
 		{
-			if (!m_code.EmitUmull(lo_host, hi_host, HOST_TMP0, HOST_TMP1))
+			if (!m_code.EmitUmull(HOST_TMP2, HOST_TMP3, HOST_TMP0, HOST_TMP1))
 				return false;
 		}
 
-		const bool emitted =
-			m_code.EmitStrImm12(lo_host, HOST_PSX_REGS,
-				static_cast<u16>(LO_OFFSET)) &&
-			m_code.EmitStrImm12(hi_host, HOST_PSX_REGS,
-				static_cast<u16>(HI_OFFSET));
-		m_retained_lo_host_valid = emitted && retain_lo;
-		return emitted;
+		return m_code.EmitStrImm12(HOST_TMP2, HOST_PSX_REGS,
+				   static_cast<u16>(LO_OFFSET)) &&
+		       m_code.EmitStrImm12(HOST_TMP3, HOST_PSX_REGS,
+				   static_cast<u16>(HI_OFFSET));
 	}
 
 	bool BlockCompiler::EmitDivideOp(u32 op, bool is_signed)
@@ -6305,50 +5907,9 @@ namespace VitaIOP
 #endif
 	}
 
-	bool BlockCompiler::EmitReloadPublishedEventCountdown()
-	{
-		// The normal Vita owner publishes a near deadline, but savestates and
-		// diagnostic fixtures may legally restore an arbitrary 64-bit value.
-		// Represent only a non-negative distance <= INT32_MAX in r8. UINT32_MAX
-		// is the fail-closed marker which selects the complete 64-bit comparison
-		// at the next branch seam. This entry calculation runs once per linked
-		// chain and remains out of every region backedge.
-		return m_code.EmitCallAbsolute(
-				   reinterpret_cast<const void*>(&VitaIopA32LoadPublishedEventCountdown),
-				   HOST_CALL_SCRATCH) &&
-		       m_code.EmitMovRegShiftImm(HOST_REGISTER_JUMP_TARGET, HOST_TMP0,
-				   VitaA32::ShiftType::LSL, 0);
-	}
-
-	bool BlockCompiler::EmitConsumePublishedEventCountdown()
-	{
-		// A logical BaseBlock can end at an artificial fallthrough seam rather
-		// than iPsxBranchTest(). It still publishes its accumulated IOP cycles
-		// before a direct link, so carry the resident distance forward by the
-		// same exact amount without dispatching an event at a seam PCSX2 does
-		// not own. Preserve UINT32_MAX as the complete-comparison sentinel.
-		if (!m_code.EmitCmpImm32(HOST_REGISTER_JUMP_TARGET, UINT32_MAX))
-			return false;
-		const size_t done =
-			m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-		if (done == static_cast<size_t>(-1))
-			return false;
-
-		const bool subtracted =
-			m_code.EmitSubImm32(HOST_REGISTER_JUMP_TARGET,
-				HOST_REGISTER_JUMP_TARGET, m_budget_cycle_count) ||
-			(m_code.EmitMovImm32(HOST_TMP0, m_budget_cycle_count) &&
-			 m_code.EmitSubReg(HOST_REGISTER_JUMP_TARGET,
-				 HOST_REGISTER_JUMP_TARGET, HOST_TMP0));
-		return subtracted &&
-		       m_code.PatchBranch(done, m_code.Size(), VitaA32::Condition::EQ);
-	}
-
 	bool BlockCompiler::EmitQemuCounterIncrement(u32* counter)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
-		if (!s_qemuIopGeneratedInstrumentationEnabled)
-			return true;
 		return counter &&
 		       m_code.EmitMovImm32(
 				   HOST_TMP2, static_cast<u32>(reinterpret_cast<uptr>(counter))) &&
@@ -6382,60 +5943,9 @@ namespace VitaIOP
 		if (!BranchTestSchedulingEnabled())
 			return EmitIopEventTestFastPath();
 
-		// PCSX2's next iPsxBranchTest() seam compares the completed IOP cycle
-		// against iopNextEventCycle and enters iopEventTest() only when due.
-		// Helper-free scalar regions retain a bounded distance to the published
-		// deadline in callee-saved r8. Each linked BaseBlock consumes its exact
-		// private cycle total. UINT32_MAX marks an arbitrary restored horizon and
-		// selects the complete PCSX2 comparison.
-		if (m_resident_event_deadline)
-		{
-			if (!m_code.EmitCmpImm32(HOST_REGISTER_JUMP_TARGET, UINT32_MAX))
-				return false;
-			const size_t full_compare =
-				m_code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
-			if (full_compare == static_cast<size_t>(-1))
-				return false;
-
-			const bool subtracted =
-				m_code.EmitSubImm32(HOST_REGISTER_JUMP_TARGET,
-					HOST_REGISTER_JUMP_TARGET, m_budget_cycle_count, true) ||
-				(m_code.EmitMovImm32(HOST_TMP0, m_budget_cycle_count) &&
-				 m_code.EmitSubReg(HOST_REGISTER_JUMP_TARGET,
-					 HOST_REGISTER_JUMP_TARGET, HOST_TMP0, true));
-			if (!subtracted)
-				return false;
-			const size_t not_due =
-				m_code.EmitBranchPlaceholder(VitaA32::Condition::GT);
-			if (not_due == static_cast<size_t>(-1) ||
-				!EmitIopEventTestFastPath() ||
-				!EmitReloadPublishedEventCountdown())
-			{
-				return false;
-			}
-			const size_t skip_full = m_code.EmitBranchPlaceholder();
-			const size_t full = m_code.Size();
-			if (skip_full == static_cast<size_t>(-1) ||
-				!m_code.PatchBranch(full_compare, full, VitaA32::Condition::EQ))
-			{
-				return false;
-			}
-
-			if (!m_code.EmitCallAbsolute(
-					reinterpret_cast<const void*>(
-						&VitaIopA32TestEventAndLoadPublishedCountdown),
-					HOST_CALL_SCRATCH) ||
-				!m_code.EmitMovRegShiftImm(HOST_REGISTER_JUMP_TARGET, HOST_TMP0,
-					VitaA32::ShiftType::LSL, 0))
-			{
-				return false;
-			}
-			const size_t done = m_code.Size();
-			return m_code.PatchBranch(not_due, done, VitaA32::Condition::GT) &&
-			       m_code.PatchBranch(skip_full, done);
-		}
-
-		// SUBS/SBCS plus MI reproduces x86's signed 64-bit SUB/JS test.
+		// PCSX2's next iPsxBranchTest() seam compares the completed 64-bit IOP
+		// cycle against iopNextEventCycle and enters iopEventTest() only when
+		// due. SUBS/SBCS plus MI reproduces x86's signed 64-bit SUB/JS test.
 		if (!(m_code.EmitAddImm32(HOST_CALL_SCRATCH, HOST_PSX_REGS,
 				static_cast<u32>(CYCLE_OFFSET)) ||
 				(m_code.EmitMovImm32(HOST_CALL_SCRATCH,
@@ -7020,13 +6530,6 @@ namespace VitaIOP
 					return m_code.EmitMovImm32(HOST_TMP0, known_lo) &&
 						   EmitStoreGpr(RD(op), HOST_TMP0);
 				}
-				if (RD(op) != 0 && m_retained_lo_host_valid)
-				{
-#if defined(VITASX2_QEMU_VALIDATION)
-					++g_qemuIopRetainedLoReadFastPaths;
-#endif
-					return EmitStoreGpr(RD(op), HOST_TMP3);
-				}
 				return EmitMoveGpr(RD(op), 33);
 			}
 			case 0x13: // MTLO
@@ -7509,11 +7012,7 @@ namespace VitaIOP
 		size_t* provider_entry_offset, bool test_fallthrough_budget,
 		bool allow_entry_gate, bool inherited_isolate_write,
 		u32 logical_cycle_prefix, u32 logical_cycle_total,
-		bool fragmented_logical_block, bool logical_continuation_tail,
-		ResidentFragmentContract* resident_contract,
-		bool hot_region_internal_static_jump,
-		u32 hot_region_guard_cycles,
-		HotRegionGuardPatch* hot_region_guard)
+		bool fragmented_logical_block, bool logical_continuation_tail)
 	{
 		if (instruction_count == 0 ||
 			instruction_count > BlockExecutor::MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
@@ -7633,7 +7132,6 @@ namespace VitaIOP
 		m_branch_predicate_producer_true_condition = VitaA32::Condition::AL;
 		m_register_jump_target_known = false;
 		m_register_jump_target = 0;
-		m_retained_lo_host_valid = false;
 		bool sequential_qword_copy_enabled =
 			!VitaIsIopPreInstructionTraceEnabled() &&
 			m_isolate_cache_specialization && m_isolate_cache_guard_stable &&
@@ -7723,32 +7221,6 @@ namespace VitaIOP
 		// an architectural early exit commits it exactly once.
 		const bool active_irx_import = m_irx_import_hle || m_irx_import_debug ||
 			(m_irx_import_log && m_irx_import_funcname);
-		m_resident_event_deadline = m_defer_cycle_updates &&
-			legacy_cycle_deferral && !active_irx_import &&
-			BranchTestSchedulingEnabled();
-#if defined(VITASX2_IOP_PUBLISHED_EVENT_DEADLINE_CONTROL)
-		m_resident_event_deadline = false;
-#endif
-#if defined(VITASX2_QEMU_VALIDATION)
-		m_resident_event_deadline = m_resident_event_deadline &&
-			s_qemuIopPublishedEventDeadlineResidencyEnabled;
-#endif
-		bool specialize_clock_mode = true;
-#if defined(VITASX2_QEMU_VALIDATION)
-		specialize_clock_mode = s_qemuIopClockModeSpecializationEnabled;
-#endif
-		m_resident_ee_budget = m_defer_cycle_updates &&
-			legacy_cycle_deferral && !active_irx_import &&
-			BranchTestSchedulingEnabled() && specialize_clock_mode &&
-			(psxHu32(HW_ICFG) & (1u << 3)) == 0;
-#if defined(VITASX2_IOP_RESIDENT_EE_BUDGET_CONTROL)
-		m_resident_ee_budget = false;
-#endif
-#if defined(VITASX2_QEMU_VALIDATION)
-		m_resident_ee_budget =
-			m_resident_ee_budget && s_qemuIopEeBudgetResidencyEnabled &&
-			s_qemuIopResidentPreludeLinksEnabled;
-#endif
 		if (active_irx_import && !m_defer_cycle_updates)
 		{
 			// The x86 owner can leave the complete block-cycle delta private when
@@ -7773,12 +7245,6 @@ namespace VitaIOP
 
 		if (!BeginBlock(start_pc, linked_entry_offset, provider_entry_offset))
 			return false;
-		if (hot_region_internal_static_jump &&
-			!EmitHotRegionHorizonGuard(
-				hot_region_guard_cycles, hot_region_guard))
-		{
-			return false;
-		}
 		if (m_compiled_ps1_bios_gate && !EmitCompiledPs1BiosGate())
 			return false;
 
@@ -7812,22 +7278,11 @@ namespace VitaIOP
 		u32 static_branch_fallthrough_pc = 0;
 		u32 static_jump_target_pc = 0;
 		const bool physical_continuation =
-			hot_region_internal_static_jump ||
-			(!test_fallthrough_budget && !logical_continuation_tail);
+			!test_fallthrough_budget && !logical_continuation_tail;
 		for (u32 i = 0; i < instruction_count; i++)
 		{
 			const u32 pc = start_pc + i * 4;
 			const u32 op = iopMemRead32(pc);
-			// A nondeferred instruction first calls EmitAddCycles(), whose
-			// large-offset form may use r3 even when the opcode's own native
-			// template does not. Trace callbacks are calls and therefore also
-			// terminate the caller-clobbered lifetime.
-			if (m_retained_lo_host_valid &&
-				(!m_defer_cycle_updates || m_emit_trace_checks ||
-					!IopInstructionPreservesRetainedLoHost(op)))
-			{
-				m_retained_lo_host_valid = false;
-			}
 			const u32 delay_op = (i + 1 < instruction_count) ? iopMemRead32(pc + 4) : 0;
 			const u32 following_op =
 				(i + 2 < instruction_count) ? iopMemRead32(pc + 8) : 0;
@@ -7918,20 +7373,8 @@ namespace VitaIOP
 			!m_static_branch_flags_live &&
 			!EmitPublishCyclePrefix(m_block_cycle_count))
 			return false;
-		// The ordinary branch/jump paths below consume this logical block's
-		// cycles as part of their event test. A pure fallthrough has no PCSX2
-		// event seam, but a resident direct link still needs its countdown
-		// rebased to the cycle value just published above.
-		if (!physical_continuation && m_resident_event_deadline &&
-			!has_native_static_branch && !has_native_static_jump &&
-			!has_native_register_jump &&
-			!EmitConsumePublishedEventCountdown())
-		{
-			return false;
-		}
 		if (m_expanded_cycle_batching)
 			RecordBatchedCycleExitSavings(instruction_count, false);
-		FinalizeResidentExitContract();
 
 		const auto end_completion_return = [&](bool charge_budget = true,
 			bool flush_pins = true) -> bool {
@@ -8048,46 +7491,27 @@ namespace VitaIOP
 		}
 		else if (has_native_static_jump)
 		{
-			if (hot_region_internal_static_jump)
+			const bool can_link_static_jump =
+				direct_exit && direct_links && !m_writes_isolate_mode;
+			if (!EmitStorePc(static_jump_target_pc) ||
+				!EmitBranchEventTest(can_link_static_jump ? 0 : UINT8_MAX) ||
+				!EmitPcChangedExitCheck(static_jump_target_pc, direct_exit_branches))
 			{
-				if (!direct_exit || !direct_links || m_writes_isolate_mode)
-					return false;
+				return false;
+			}
+
+			if (can_link_static_jump)
+			{
 				DirectLinkSlot& link = direct_links->slots[0];
-				if (!EndBlockDirectTail(
-						direct_exit, &link, 0, false, false))
+				if (!EndBlockDirectTail(direct_exit, &link, 0, !branch_test_scheduling))
 					return false;
 
 				link.target_pc = static_jump_target_pc;
 				link.valid = true;
 			}
-			else
+			else if (!end_completion_return(!branch_test_scheduling))
 			{
-				const bool can_link_static_jump =
-					direct_exit && direct_links && !m_writes_isolate_mode;
-				if (!EmitStorePc(static_jump_target_pc) ||
-					!EmitBranchEventTest(can_link_static_jump ? 0 : UINT8_MAX) ||
-					!EmitPcChangedExitCheck(static_jump_target_pc,
-						direct_exit_branches))
-				{
-					return false;
-				}
-
-				if (can_link_static_jump)
-				{
-					DirectLinkSlot& link = direct_links->slots[0];
-					if (!EndBlockDirectTail(
-							direct_exit, &link, 0,
-							!branch_test_scheduling))
-					{
-						return false;
-					}
-					link.target_pc = static_jump_target_pc;
-					link.valid = true;
-				}
-				else if (!end_completion_return(!branch_test_scheduling))
-				{
-					return false;
-				}
+				return false;
 			}
 
 			direct_exit_offset = m_code.Size();
@@ -8260,8 +7684,6 @@ namespace VitaIOP
 			if (!unflushed_exits.empty() && !EmitFlushPinnedGprs())
 				return false;
 			const size_t resume_return_target = m_code.Size();
-			if (!EmitPublishResidentEeBudget())
-				return false;
 			DirectLinkSlot& link = direct_links->slots[slot];
 			link.scheduler_resume_offset = m_code.Size();
 			if (!m_code.EmitMovImm32Patchable(
@@ -8293,8 +7715,6 @@ namespace VitaIOP
 		m_unflushed_budget_exit_branches = nullptr;
 		m_scheduler_budget_exit_branches = {};
 		m_unflushed_scheduler_budget_exit_branches = {};
-		if (resident_contract)
-			*resident_contract = m_resident_contract;
 		return true;
 	}
 
@@ -8736,15 +8156,6 @@ namespace VitaIOP
 #endif
 	}
 
-	void BlockExecutor::SetRetainedLoForwardingEnabled(bool enabled)
-	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		s_qemuIopRetainedLoForwardingEnabled = enabled;
-#else
-		(void)enabled;
-#endif
-	}
-
 	void BlockExecutor::SetPinnedBranchDirectCompareEnabled(bool enabled)
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
@@ -8830,60 +8241,6 @@ namespace VitaIOP
 	{
 #if defined(VITASX2_QEMU_VALIDATION)
 		s_qemuIopLinkedFrameBypassEnabled = enabled;
-#else
-		(void)enabled;
-#endif
-	}
-
-	void BlockExecutor::SetResidentPreludeLinksEnabled(bool enabled)
-	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		s_qemuIopResidentPreludeLinksEnabled = enabled;
-#else
-		(void)enabled;
-#endif
-	}
-
-	void BlockExecutor::SetResidentGprLinksEnabled(bool enabled)
-	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		s_qemuIopResidentGprLinksEnabled = enabled;
-#else
-		(void)enabled;
-#endif
-	}
-
-	void BlockExecutor::SetPublishedEventDeadlineResidencyEnabled(bool enabled)
-	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		s_qemuIopPublishedEventDeadlineResidencyEnabled = enabled;
-#else
-		(void)enabled;
-#endif
-	}
-
-	void BlockExecutor::SetEeBudgetResidencyEnabled(bool enabled)
-	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		s_qemuIopEeBudgetResidencyEnabled = enabled;
-#else
-		(void)enabled;
-#endif
-	}
-
-	void BlockExecutor::SetGeneratedInstrumentationEnabled(bool enabled)
-	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		s_qemuIopGeneratedInstrumentationEnabled = enabled;
-#else
-		(void)enabled;
-#endif
-	}
-
-	void BlockExecutor::SetHotRegionPromotionEnabled(bool enabled)
-	{
-#if defined(VITASX2_QEMU_VALIDATION)
-		s_qemuIopHotRegionPromotionEnabled = enabled;
 #else
 		(void)enabled;
 #endif
@@ -9440,13 +8797,7 @@ namespace VitaIOP
 
 	void BlockExecutor::RegisterRamSource(CachedBlock& block)
 	{
-		const bool has_region_source =
-			block.region_source_dependency &&
-			block.region_source_dependency->ram_source_start !=
-				INVALID_RAM_SOURCE;
-		if (!block.valid ||
-			(block.ram_source_start == INVALID_RAM_SOURCE &&
-				!has_region_source))
+		if (!block.valid || block.ram_source_start == INVALID_RAM_SOURCE)
 			return;
 
 		block.source_serial = m_next_source_serial++;
@@ -9484,11 +8835,6 @@ namespace VitaIOP
 		};
 
 		register_range(block.ram_source_start, block.instruction_count * sizeof(u32));
-		if (block.region_source_dependency)
-		{
-			register_range(block.region_source_dependency->ram_source_start,
-				block.region_source_dependency->instruction_count * sizeof(u32));
-		}
 		if (block.poll_call_wait_loop)
 		{
 			register_range(block.poll_branch_source_start, 2 * sizeof(u32));
@@ -9498,13 +8844,7 @@ namespace VitaIOP
 
 	void BlockExecutor::UnregisterRamSource(const CachedBlock& block)
 	{
-		const bool has_region_source =
-			block.region_source_dependency &&
-			block.region_source_dependency->ram_source_start !=
-				INVALID_RAM_SOURCE;
-		if (!block.valid ||
-			(block.ram_source_start == INVALID_RAM_SOURCE &&
-				!has_region_source))
+		if (!block.valid || block.ram_source_start == INVALID_RAM_SOURCE)
 			return;
 
 		std::bitset<RAM_SOURCE_PAGE_COUNT> unregistered_pages;
@@ -9539,12 +8879,6 @@ namespace VitaIOP
 
 		unregister_range(block.ram_source_start,
 			block.instruction_count * sizeof(u32));
-		if (block.region_source_dependency)
-		{
-			unregister_range(block.region_source_dependency->ram_source_start,
-				block.region_source_dependency->instruction_count *
-					sizeof(u32));
-		}
 		if (block.poll_call_wait_loop)
 		{
 			unregister_range(block.poll_branch_source_start, 2 * sizeof(u32));
@@ -10018,28 +9352,19 @@ namespace VitaIOP
 					InterpreterFallbackBlock* fallback = record.fallback;
 					const bool cached_owner = block && block->valid &&
 						block->source_serial == record.serial &&
-						(block->ram_source_start != INVALID_RAM_SOURCE ||
-							(block->region_source_dependency &&
-								block->region_source_dependency->ram_source_start !=
-									INVALID_RAM_SOURCE));
+						block->ram_source_start != INVALID_RAM_SOURCE;
 					const bool fallback_owner = fallback && fallback->valid &&
 						fallback->source_serial == record.serial &&
 						fallback->ram_source_start != INVALID_RAM_SOURCE;
 					if (!cached_owner && !fallback_owner)
 						continue;
 
+					const u32 owner_source_start = cached_owner ?
+						block->ram_source_start : fallback->ram_source_start;
+					const u32 owner_source_size = (cached_owner ?
+						block->instruction_count : fallback->instruction_count) * sizeof(u32);
 					const bool overlaps =
-						(cached_owner &&
-							range_overlaps(block->ram_source_start,
-								block->instruction_count * sizeof(u32))) ||
-						(fallback_owner &&
-							range_overlaps(fallback->ram_source_start,
-								fallback->instruction_count * sizeof(u32))) ||
-						(cached_owner && block->region_source_dependency &&
-							range_overlaps(
-								block->region_source_dependency->ram_source_start,
-								block->region_source_dependency->instruction_count *
-									sizeof(u32))) ||
+						range_overlaps(owner_source_start, owner_source_size) ||
 						(cached_owner && block->poll_call_wait_loop &&
 							(range_overlaps(block->poll_branch_source_start, 2 * sizeof(u32)) ||
 							 range_overlaps(block->poll_leaf_source_start, 5 * sizeof(u32))));
@@ -10628,7 +9953,6 @@ namespace VitaIOP
 			entry->direct_links = {};
 			entry->ClearFragments();
 			entry->ClearOpcodes();
-			entry->ClearRegionDependency();
 			entry->ReleaseOversizedMetadata();
 			RememberFreeCacheEntry(*entry);
 		}
@@ -10651,14 +9975,6 @@ namespace VitaIOP
 		// freeing and reallocating it at ordinary cache pressure both changes
 		// that ownership and can fail after VM-domain publication has begun.
 		m_code_cache_used = 0;
-		m_hot_region_provider_epoch_samples = 0;
-#if defined(VITASX2_QEMU_VALIDATION)
-		m_hot_region_provider_sample_countdown = 1;
-#else
-		m_hot_region_provider_sample_countdown =
-			HOT_REGION_PROVIDER_SAMPLE_INTERVAL;
-#endif
-		m_hot_region_promotions = 0;
 		bool isolate_variants_enabled = true;
 #if defined(VITASX2_QEMU_VALIDATION)
 		isolate_variants_enabled = s_qemuIopIsolateCacheSpecializationEnabled;
@@ -10793,7 +10109,6 @@ namespace VitaIOP
 		block.direct_links = {};
 		block.ClearFragments();
 		block.ClearOpcodes();
-		block.ClearRegionDependency();
 		RememberFreeCacheEntry(block);
 	}
 
@@ -11538,32 +10853,6 @@ namespace VitaIOP
 					source_mismatch_pc = block.start_pc + i * sizeof(u32);
 			}
 		}
-		if (matches && block.region_source_dependency)
-		{
-			const CachedBlock::RegionSourceDependency& dependency =
-				*block.region_source_dependency;
-			for (u32 i = 0; matches && i < dependency.instruction_count; i++)
-			{
-				const u32* opcode = dependency.raw_opcodes ?
-					&dependency.raw_opcodes[i] :
-					ResolveIopRecOpcode(
-						dependency.start_pc + i * sizeof(u32));
-#if defined(VITASX2_QEMU_VALIDATION)
-				m_validation_words++;
-				m_trusted_source_audit_words++;
-				if (dependency.raw_opcodes)
-					m_raw_validation_words++;
-				else
-					m_translated_validation_words++;
-#endif
-				matches = opcode && dependency.expected[i] == *opcode;
-				if (!matches)
-				{
-					source_mismatch_pc =
-						dependency.start_pc + i * sizeof(u32);
-				}
-			}
-		}
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (!matches && block.trusted_source)
 			m_trusted_source_audit_failures++;
@@ -11913,228 +11202,12 @@ namespace VitaIOP
 		return invalidated;
 	}
 
-	bool BlockExecutor::TryPromoteHotRegion(CachedBlock& block)
-	{
-#if defined(VITASX2_IOP_HOT_REGION_CONTROL)
-		(void)block;
-		return false;
-#else
-#if defined(VITASX2_QEMU_VALIDATION)
-		if (!s_qemuIopHotRegionPromotionEnabled)
-			return false;
-#endif
-		if (!block.valid || block.hot_region_state != 0)
-			return false;
-
-		// Refusal is sticky for this code generation. PCSX2's psxRecClearMem()
-		// or whole-cache reset creates a new generation and clears it.
-		block.hot_region_state = 1;
-		VitaPerformanceTelemetry::RecordIopHotRegionAttemptIfProfiling();
-		if (!block.discovered_topology || block.logical_continuation ||
-			block.fragment_count != 1 || block.instruction_count < 2 ||
-			block.instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
-			block.compiled_ps1_bios_gate || block.wait_loop_shape ||
-			!block.constant_cycle_budget || block.region_source_dependency)
-		{
-			return false;
-		}
-
-		const u32 jump = block.Opcode(block.instruction_count - 2);
-		const u32 delay = block.Opcode(block.instruction_count - 1);
-		if (!IsIopStaticJumpOpcode(jump) ||
-			IsIopBranchOrJumpOpcode(delay) || IsIopExceptionOpcode(delay))
-		{
-			return false;
-		}
-		DirectLinkSlot* source_link = nullptr;
-		for (DirectLinkSlot& link : block.direct_links.slots)
-		{
-			if (!link.valid)
-				continue;
-			if (source_link)
-				return false;
-			source_link = &link;
-		}
-		const u32 successor_pc =
-			JumpTarget(block.start_pc +
-					(block.instruction_count - 2) * sizeof(u32),
-				jump);
-		if (!source_link || source_link->target_pc != successor_pc ||
-			successor_pc == block.start_pc)
-		{
-			return false;
-		}
-
-		CachedBlock* successor = FindCachedBlockByStartPc(
-			successor_pc, block.isolate_cache_active);
-		if (!successor || successor == &block || !successor->valid ||
-			!successor->discovered_topology ||
-			successor->fragment_count != 1 ||
-			successor->instruction_count == 0 ||
-			successor->instruction_count >
-				MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
-			successor->compiled_ps1_bios_gate || successor->wait_loop_shape ||
-			!successor->constant_cycle_budget ||
-			successor->region_source_dependency ||
-			successor->isolate_cache_active != block.isolate_cache_active)
-		{
-			return false;
-		}
-
-		const CachedBlock::CodeFragment& source_fragment = block.Fragment(0);
-		const CachedBlock::CodeFragment& successor_fragment =
-			successor->Fragment(0);
-		const auto has_region_horizon =
-			[](const CachedBlock::CodeFragment& fragment) {
-				return fragment.resident.base_entry.Contains(
-						   VitaRegion::ResidentValue::
-							   IopPublishedEventCountdown) &&
-					fragment.resident.base_entry.Contains(
-						VitaRegion::ResidentValue::IopEeBudget);
-			};
-		if (!has_region_horizon(source_fragment) ||
-			!has_region_horizon(successor_fragment) ||
-			source_fragment.code.Size() >
-				STRAIGHT_LINE_BLOCK_CODE_CAPACITY ||
-			successor_fragment.code.Size() >
-				STRAIGHT_LINE_BLOCK_CODE_CAPACITY)
-		{
-			return false;
-		}
-
-		const size_t aligned_used =
-			AlignUp(m_code_cache_used, CODE_CACHE_ALIGNMENT);
-		if (aligned_used > m_code_cache_capacity ||
-			2 * STRAIGHT_LINE_BLOCK_CODE_CAPACITY >
-				m_code_cache_capacity - aligned_used)
-		{
-			return false;
-		}
-
-		const u32 source_pc = block.start_pc;
-		const u32 source_instruction_count = block.instruction_count;
-		const bool source_logical_continuation =
-			block.logical_continuation;
-		const bool source_discovered_topology =
-			block.discovered_topology;
-		HotRegionPlan plan;
-		plan.successor_pc = successor_pc;
-		plan.successor_instruction_count =
-			successor->instruction_count;
-		plan.successor_logical_continuation =
-			successor->logical_continuation;
-		plan.source_fallback_entry = static_cast<const u8*>(
-			source_fragment.code.EntryPoint()) +
-			source_fragment.provider_entry_offset;
-		plan.source_fallback_code_size = TotalCodeSize(block);
-		plan.source_fallback_footprint =
-			TotalCodeCacheFootprint(block);
-
-		const VitaPerformanceTelemetry::ScopedCpuStage compile_profile(
-			VitaPerformanceTelemetry::CpuStage::IopCompile);
-		const VitaPerformanceTelemetry::ScopedExactIopCompileMeasurement
-			exact_compile_profile;
-		if (CompileIntoCacheEntry(block, source_pc,
-				source_instruction_count, true, false,
-				source_logical_continuation,
-				source_discovered_topology, &plan))
-		{
-			VitaPerformanceTelemetry::
-				RecordIopHotRegionPromotionIfProfiling(
-					IopCompilerBlockCycles(source_pc,
-						source_instruction_count, false),
-					IopCompilerBlockCycles(plan.successor_pc,
-						plan.successor_instruction_count, false),
-					block.hot_region_resident_gpr_links,
-					block.hot_region_resident_gpr_stores_removed,
-					block.hot_region_resident_gpr_loads_removed);
-			return true;
-		}
-
-		// Promotion is optional. Restore the exact canonical source block before
-		// returning so allocation pressure or a rejected contract cannot remove
-		// executable IOP coverage.
-		RemoveFreeCacheEntry(block);
-		if (!CompileIntoCacheEntry(block, source_pc,
-				source_instruction_count, true, true,
-				source_logical_continuation,
-				source_discovered_topology))
-		{
-			return false;
-		}
-		block.hot_region_state = 1;
-		return false;
-#endif
-	}
-
-	bool BlockExecutor::ObserveHotRegionProviderSample(CachedBlock& block)
-	{
-#if defined(VITASX2_IOP_HOT_REGION_CONTROL)
-		(void)block;
-		return true;
-#else
-#if defined(VITASX2_QEMU_VALIDATION)
-		if (!s_qemuIopHotRegionPromotionEnabled)
-			return true;
-#endif
-		VitaPerformanceTelemetry::
-			RecordIopHotRegionProviderSampleIfProfiling();
-		if (block.hot_region_state == 0 &&
-			block.hot_region_provider_samples != UINT16_MAX)
-		{
-			block.hot_region_provider_samples++;
-		}
-
-		if (m_hot_region_promotions >=
-				HOT_REGION_MAX_PROMOTIONS_PER_CACHE ||
-			++m_hot_region_provider_epoch_samples <
-				HOT_REGION_SELECTION_EPOCH)
-		{
-			return block.valid;
-		}
-
-		m_hot_region_provider_epoch_samples = 0;
-		VitaPerformanceTelemetry::
-			RecordIopHotRegionSelectionIfProfiling();
-		for (u8 refusal = 0;
-			refusal < HOT_REGION_MAX_REFUSALS_PER_SELECTION;
-			refusal++)
-		{
-			CachedBlock* hottest = nullptr;
-			u16 hottest_samples =
-				HOT_REGION_MIN_PROVIDER_SAMPLES - 1;
-			for (const std::unique_ptr<CachedBlock>& candidate : m_cache)
-			{
-				if (!candidate->valid ||
-					candidate->hot_region_state != 0 ||
-					candidate->hot_region_provider_samples <=
-						hottest_samples)
-				{
-					continue;
-				}
-				hottest = candidate.get();
-				hottest_samples =
-					candidate->hot_region_provider_samples;
-			}
-			if (!hottest)
-				break;
-			if (TryPromoteHotRegion(*hottest))
-			{
-				m_hot_region_promotions++;
-				break;
-			}
-		}
-		return block.valid;
-#endif
-	}
-
 	bool BlockExecutor::CompileIntoCacheEntry(CachedBlock& block, u32 start_pc,
 		u32 instruction_count,
 		bool entry_effects_already_applied,
 		bool allow_cache_pressure_retry,
 		bool logical_continuation,
-		bool discovered_topology,
-		const HotRegionPlan* hot_region)
+		bool discovered_topology)
 	{
 		const auto reject_unowned_entry = [&]() {
 			if (!block.valid)
@@ -12161,23 +11234,6 @@ namespace VitaIOP
 			// publish an unowned block which a warm link could execute after a write.
 			return reject_unowned_entry();
 		}
-		u32 successor_executable_bytes = 0;
-		if (hot_region &&
-			(hot_region->successor_instruction_count == 0 ||
-				hot_region->successor_instruction_count >
-					MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
-				hot_region->successor_instruction_count >
-					((UINT32_MAX - hot_region->successor_pc) / 4) ||
-				!hot_region->source_fallback_entry ||
-				hot_region->source_fallback_code_size == 0 ||
-				hot_region->source_fallback_footprint == 0 ||
-				!GetIopRecExecutableSpan(
-					hot_region->successor_pc, &successor_executable_bytes) ||
-				hot_region->successor_instruction_count * sizeof(u32) >
-					successor_executable_bytes))
-		{
-			return reject_unowned_entry();
-		}
 
 		// This is the one genuine cache-miss compilation seam. Keep PCSX2's
 		// iopRecRecompile() entry effects outside code-generation retries and off
@@ -12185,11 +11241,6 @@ namespace VitaIOP
 		if (!entry_effects_already_applied)
 			ApplyIopRecompilerEntrySideEffects(start_pc);
 		InvalidateCachedBlock(block);
-		// In-place promotion intentionally retires this metadata through the
-		// ordinary PCSX2 invalidation seam. It is immediately reclaimed by this
-		// compilation transaction, so it must not remain in the free list.
-		RemoveFreeCacheEntry(block);
-		block.ClearRegionDependency();
 		bool isolate_variants_enabled = true;
 #if defined(VITASX2_QEMU_VALIDATION)
 		isolate_variants_enabled = s_qemuIopIsolateCacheSpecializationEnabled;
@@ -12264,21 +11315,12 @@ namespace VitaIOP
 		bool constant_cycle_budget = true;
 		DirectLinkSlots direct_links;
 		std::vector<DirectLinkSlot> continuation_links;
-		const bool compiling_hot_region = hot_region != nullptr;
-		const u32 source_cycle_total =
-			IopCompilerBlockCycles(start_pc, instruction_count, false);
-		const u32 successor_cycle_total = compiling_hot_region ?
-			IopCompilerBlockCycles(hot_region->successor_pc,
-				hot_region->successor_instruction_count, false) :
-			0;
-		const u32 reserved_fragment_count = compiling_hot_region ? 2 :
+		const u32 reserved_fragment_count =
 			(instruction_count + MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS - 1) /
-				MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS;
-		const bool fragmented_logical_block =
-			compiling_hot_region || reserved_fragment_count > 1;
+			MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS;
+		const bool fragmented_logical_block = reserved_fragment_count > 1;
 		const u32 logical_cycle_total =
-			source_cycle_total + successor_cycle_total;
-		HotRegionGuardPatch hot_region_guard{};
+			IopCompilerBlockCycles(start_pc, instruction_count, false);
 		block.ClearFragments();
 		block.ReserveFragments(reserved_fragment_count);
 		continuation_links.reserve(
@@ -12289,29 +11331,20 @@ namespace VitaIOP
 			block.ClearFragments();
 			block.direct_links = {};
 			block.ClearOpcodes();
-			block.ClearRegionDependency();
 			RewindCodeCache(logical_code_slice_offset);
 			RememberFreeCacheEntry(block);
 			return false;
 		};
 
 		for (u32 fragment_index = 0, compiled_instructions = 0,
-				 ordinary_cycle_prefix = 0;
-			 fragment_index < reserved_fragment_count; fragment_index++)
+				 logical_cycle_prefix = 0;
+			 compiled_instructions < instruction_count; fragment_index++)
 		{
-			u32 fragment_instruction_count = compiling_hot_region ?
-				(fragment_index == 0 ? instruction_count :
-					hot_region->successor_instruction_count) :
+			u32 fragment_instruction_count =
 				std::min(MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS,
 					instruction_count - compiled_instructions);
-			const u32 fragment_start_pc = compiling_hot_region ?
-				(fragment_index == 0 ? start_pc : hot_region->successor_pc) :
-				start_pc + compiled_instructions * 4;
-			const u32 logical_cycle_prefix = compiling_hot_region ?
-				(fragment_index == 0 ? 0 : source_cycle_total) :
-				ordinary_cycle_prefix;
-			while (!compiling_hot_region &&
-				fragment_instruction_count != 0 &&
+			const u32 fragment_start_pc = start_pc + compiled_instructions * 4;
+			while (fragment_instruction_count != 0 &&
 				compiled_instructions + fragment_instruction_count <
 					instruction_count &&
 				IsIopBranchOrJumpOpcode(
@@ -12330,14 +11363,8 @@ namespace VitaIOP
 				// PCSX2 BaseBlock and is handled by the exact retained fallback.
 				return abandon_compilation();
 			}
-			const bool continuation_fragment = compiling_hot_region ?
-				fragment_index == 0 :
-				compiled_instructions + fragment_instruction_count <
-					instruction_count;
-			const bool fragment_logical_continuation =
-				compiling_hot_region ?
-					hot_region->successor_logical_continuation :
-					logical_continuation;
+			const bool continuation_fragment =
+				compiled_instructions + fragment_instruction_count < instruction_count;
 			CachedBlock::CodeFragment& fragment = block.AddFragment();
 			fragment.start_pc = fragment_start_pc;
 			fragment.instruction_count = fragment_instruction_count;
@@ -12353,8 +11380,7 @@ namespace VitaIOP
 			if (!code_slice)
 			{
 					const bool retry_from_clean_cache =
-						!compiling_hot_region && allow_cache_pressure_retry &&
-						logical_code_slice_offset != 0;
+						allow_cache_pressure_retry && logical_code_slice_offset != 0;
 					abandon_compilation();
 					if (!retry_from_clean_cache)
 					return false;
@@ -12394,45 +11420,16 @@ namespace VitaIOP
 			DirectLinkSlots attempt_direct_links;
 			size_t attempt_linked_entry_offset = 0;
 			size_t attempt_provider_entry_offset = 0;
-			ResidentFragmentContract attempt_resident_contract{};
-				bool compiled = compiler.CompileStraightLineBlock(
+				const bool compiled = compiler.CompileStraightLineBlock(
 					fragment_start_pc, fragment_instruction_count,
 					reinterpret_cast<const void*>(&VitaIopA32DirectExit),
 					&attempt_direct_links, &attempt_linked_entry_offset,
 					&attempt_provider_entry_offset,
-					!continuation_fragment && !fragment_logical_continuation,
+					!continuation_fragment && !logical_continuation,
 					fragment_index == 0,
 					logical_writes_isolate_mode, logical_cycle_prefix,
 					logical_cycle_total, fragmented_logical_block,
-					fragment_logical_continuation && !continuation_fragment,
-					&attempt_resident_contract,
-					compiling_hot_region && fragment_index == 0,
-					source_cycle_total,
-					compiling_hot_region && fragment_index == 0 ?
-						&hot_region_guard : nullptr);
-				if (compiled && compiling_hot_region &&
-					fragment_index == 0)
-				{
-					// Guard failure re-enters the retained canonical source
-					// provider. Publish the r5 budget first: an earlier region
-					// edge deliberately bypassed its canonical STR.
-					const size_t guard_fallback = fragment.code.Size();
-					compiled =
-						fragment.code.EmitStrImm12(HOST_SAVED0,
-							HOST_PSX_REGS,
-							static_cast<u16>(IOP_CYCLE_EE_OFFSET)) &&
-						(hot_region_guard.fallback_target =
-							fragment.code.EmitBranchPlaceholder()) !=
-							static_cast<size_t>(-1) &&
-						fragment.code.PatchBranch(hot_region_guard.budget,
-							guard_fallback, VitaA32::Condition::LE) &&
-						fragment.code.PatchBranch(
-							hot_region_guard.event_sentinel,
-							guard_fallback, VitaA32::Condition::EQ) &&
-						fragment.code.PatchBranch(
-							hot_region_guard.event_horizon,
-							guard_fallback, VitaA32::Condition::LE);
-				}
+					logical_continuation && !continuation_fragment);
 				const bool out_of_block_space =
 					!compiled && fragment.code.Size() >= fragment.code.Capacity();
 				const bool source_page_literal_out_of_range =
@@ -12448,7 +11445,6 @@ namespace VitaIOP
 					CommitCodeSlice(code_slice_offset, fragment.code.Size());
 					fragment.linked_entry_offset = attempt_linked_entry_offset;
 					fragment.provider_entry_offset = attempt_provider_entry_offset;
-					fragment.resident = attempt_resident_contract;
 					native_instruction_count += compiler.NativeInstructionCount();
 					helper_instruction_count += compiler.HelperInstructionCount();
 					compiled_ps1_bios_gate =
@@ -12495,10 +11491,7 @@ namespace VitaIOP
 						DirectLinkSlot continuation = attempt_direct_links.slots[0];
 						if (!continuation.valid ||
 							continuation.target_pc !=
-								(compiling_hot_region ?
-									hot_region->successor_pc :
-									fragment_start_pc +
-										fragment_instruction_count * 4))
+								fragment_start_pc + fragment_instruction_count * 4)
 						{
 							return abandon_compilation();
 						}
@@ -12533,12 +11526,9 @@ namespace VitaIOP
 
 			if (!fragment_compiled)
 				return abandon_compilation();
-			if (!compiling_hot_region)
-			{
-				ordinary_cycle_prefix += IopCompilerBlockCycles(
-					fragment_start_pc, fragment_instruction_count, false);
-				compiled_instructions += fragment_instruction_count;
-			}
+			logical_cycle_prefix += IopCompilerBlockCycles(
+				fragment_start_pc, fragment_instruction_count, false);
+			compiled_instructions += fragment_instruction_count;
 		}
 
 		for (u32 i = 0; i < continuation_links.size(); i++)
@@ -12546,94 +11536,16 @@ namespace VitaIOP
 			CachedBlock::CodeFragment& source = block.Fragment(i);
 			const CachedBlock::CodeFragment& target = block.Fragment(i + 1);
 			const DirectLinkSlot& link = continuation_links[i];
-			const void* target_base_entry =
+			const void* const target_entry =
 				static_cast<const u8*>(target.code.EntryPoint()) +
-					target.provider_entry_offset;
-			const void* target_entry = target_base_entry;
-			const void* budget_target_entry = target_base_entry;
-			if (compiling_hot_region)
-			{
-				if (!source.resident.exit.Provides(target.resident.base_entry) ||
-					target.resident.base_setup_instruction_count == 0 ||
-					target.resident.base_entry_offset >= target.code.Size() ||
-					link.resident_budget_bypass_offset ==
-						static_cast<size_t>(-1))
-				{
-					return abandon_compilation();
-				}
-				target_base_entry =
-					static_cast<const u8*>(target.code.EntryPoint()) +
-					target.resident.base_entry_offset;
-				target_entry = target_base_entry;
-				budget_target_entry = target_base_entry;
-
-				// The fragment contracts are the generated-code ABI for values
-				// which remain live across an internal region edge. When both
-				// independently compiled bodies assign the same guest GPR to the
-				// same callee-saved host, enter after the successor's canonical
-				// reloads and bypass the source's canonical stores. A mismatch
-				// retains the base-only region path above.
-				const bool carries_gprs =
-					target.resident.gpr_entry.domain !=
-						VitaRegion::GuestDomain::None &&
-					target.resident.gpr_entry_load_instruction_count != 0 &&
-					target.resident.gpr_entry_offset <
-						target.code.Size() &&
-					source.resident.exit.Provides(
-						target.resident.gpr_entry);
-				if (carries_gprs)
-				{
-					const void* const target_gpr_entry =
-						static_cast<const u8*>(
-							target.code.EntryPoint()) +
-						target.resident.gpr_entry_offset;
-					const bool has_source_stores =
-						link.resident_gpr_bypass_offset !=
-							static_cast<size_t>(-1);
-					// A target which writes every dirty inherited host will
-					// publish those values at its own canonical exit. Only that
-					// case may skip the source stores. A read-only successor can
-					// still consume the live host and skip its reload, but the
-					// source must first publish the dirty architectural value.
-					const bool bypasses_source_stores =
-						has_source_stores &&
-						(source.resident.dirty_gpr_host_mask &
-							~target.resident.dirty_gpr_host_mask) == 0;
-					target_entry = target_gpr_entry;
-					budget_target_entry = target_gpr_entry;
-					if ((bypasses_source_stores &&
-							!source.code.PatchBranchToAddress(
-								link.resident_gpr_bypass_offset,
-								target_gpr_entry)))
-					{
-						return abandon_compilation();
-					}
-					block.hot_region_resident_gpr_links++;
-					if (bypasses_source_stores)
-					{
-						block.hot_region_resident_gpr_stores_removed +=
-							link.resident_gpr_stores_removed;
-					}
-					block.hot_region_resident_gpr_loads_removed +=
-						target.resident.
-							gpr_entry_load_instruction_count;
-				}
-			}
-			if (!source.code.PatchBranchToAddress(
-					link.target_offset, target_entry) ||
-				(compiling_hot_region &&
-					(!source.code.PatchBranchToAddress(
-						 link.resident_budget_bypass_offset,
-						 budget_target_entry) ||
-					 !source.code.PatchBranchToAddress(
-						 hot_region_guard.fallback_target,
-						 hot_region->source_fallback_entry))))
+				target.provider_entry_offset;
+			if (!source.code.PatchBranchToAddress(link.target_offset, target_entry))
 			{
 				return abandon_compilation();
 			}
 			// The source was already published to release the process-global
 			// write lease before compiling its successor.  Republish only the
-			// patched continuation/guard words now that their addresses are known.
+			// patched continuation word now that the target address is known.
 			if (!source.code.Flush())
 				return abandon_compilation();
 		}
@@ -12686,35 +11598,9 @@ namespace VitaIOP
 		block.direct_budget_exit = direct_budget_exit;
 		block.constant_cycle_budget = constant_cycle_budget;
 		block.direct_links = direct_links;
-		block.logical_continuation = compiling_hot_region ?
-			hot_region->successor_logical_continuation :
-			logical_continuation;
+		block.logical_continuation = logical_continuation;
 		block.discovered_topology = discovered_topology;
 		block.trusted_source = true;
-		if (compiling_hot_region)
-		{
-			std::unique_ptr<CachedBlock::RegionSourceDependency> dependency(
-				new (std::nothrow) CachedBlock::RegionSourceDependency());
-			if (!dependency)
-				return abandon_compilation();
-			dependency->start_pc = hot_region->successor_pc;
-			dependency->instruction_count =
-				hot_region->successor_instruction_count;
-			dependency->raw_opcodes = ResolveRawOpcodeSpan(
-				dependency->start_pc, dependency->instruction_count,
-				&dependency->ram_source_start);
-			for (u32 i = 0; i < dependency->instruction_count; i++)
-			{
-				dependency->expected[i] =
-					iopMemRead32(dependency->start_pc + i * sizeof(u32));
-			}
-			block.region_source_dependency = std::move(dependency);
-			block.retained_fallback_code_size =
-				hot_region->source_fallback_code_size;
-			block.retained_fallback_footprint =
-				hot_region->source_fallback_footprint;
-			block.hot_region_state = 2;
-		}
 		block.valid = true;
 		if (!RegisterBlockRecord(block))
 		{
@@ -12722,7 +11608,6 @@ namespace VitaIOP
 			block.direct_links = {};
 			block.ClearFragments();
 			block.ClearOpcodes();
-			block.ClearRegionDependency();
 			RewindCodeCache(logical_code_slice_offset);
 			RememberFreeCacheEntry(block);
 			return false;
@@ -12733,8 +11618,7 @@ namespace VitaIOP
 		{
 			RememberSemanticBlockDescriptor(block.rec_lookup_identity,
 				block.ram_source_start, block.instruction_count,
-				compiling_hot_region ? logical_continuation :
-					block.logical_continuation);
+				block.logical_continuation);
 		}
 		RegisterIncomingLinks(block);
 
@@ -12759,7 +11643,7 @@ namespace VitaIOP
 
 	size_t BlockExecutor::TotalCodeSize(const CachedBlock& block)
 	{
-		size_t total = block.retained_fallback_code_size;
+		size_t total = 0;
 		for (u32 i = 0; i < block.fragment_count; i++)
 			total += block.Fragment(i).code.Size();
 		return total;
@@ -12767,7 +11651,7 @@ namespace VitaIOP
 
 	size_t BlockExecutor::TotalCodeCacheFootprint(const CachedBlock& block)
 	{
-		size_t total = block.retained_fallback_footprint;
+		size_t total = 0;
 		for (u32 i = 0; i < block.fragment_count; i++)
 			total += AlignUp(block.Fragment(i).code.Size(), CODE_CACHE_ALIGNMENT);
 		return total;
@@ -12792,39 +11676,6 @@ namespace VitaIOP
 
 		return static_cast<const u8*>(fragment.code.EntryPoint()) +
 		       fragment.linked_entry_offset;
-	}
-
-	const void* BlockExecutor::ResidentEntryPoint(const CachedBlock& block) const
-	{
-		if (!block.HasFragments())
-			return nullptr;
-		const CachedBlock::CodeFragment& fragment = block.Fragment(0);
-		if (!fragment.code.EntryPoint() ||
-			fragment.resident.base_setup_instruction_count == 0 ||
-			fragment.resident.base_entry_offset >= fragment.code.Size())
-		{
-			return nullptr;
-		}
-
-		return static_cast<const u8*>(fragment.code.EntryPoint()) +
-		       fragment.resident.base_entry_offset;
-	}
-
-	const void* BlockExecutor::ResidentGprEntryPoint(
-		const CachedBlock& block) const
-	{
-		if (!block.HasFragments())
-			return nullptr;
-		const CachedBlock::CodeFragment& fragment = block.Fragment(0);
-		if (!fragment.code.EntryPoint() ||
-			fragment.resident.gpr_entry.domain == VitaRegion::GuestDomain::None ||
-			fragment.resident.gpr_entry_offset >= fragment.code.Size())
-		{
-			return nullptr;
-		}
-
-		return static_cast<const u8*>(fragment.code.EntryPoint()) +
-		       fragment.resident.gpr_entry_offset;
 	}
 
 	const void* BlockExecutor::ProviderEntryPoint(const CachedBlock& block) const
@@ -12877,126 +11728,18 @@ namespace VitaIOP
 		VitaA32::CodeBuffer* const link_code = DirectLinkCode(block, link);
 		if (!link_code)
 			return false;
-		bool use_resident_entry = false;
-		bool use_resident_gpr_entry = false;
-		const void* target_entry = nullptr;
-		if (use_chain)
-		{
-			const CachedBlock::CodeFragment& source_fragment =
-				block.Fragment(link.fragment_index);
-			const CachedBlock::CodeFragment& target_fragment =
-				target->Fragment(0);
-			// Entry contracts describe what a body may consume, not what every
-			// path through that body preserves. Mutable residents such as the
-			// published event countdown must be admitted from the source's
-			// proven normal-exit contract.
-			use_resident_entry =
-				source_fragment.resident.exit.Provides(
-					target_fragment.resident.base_entry) &&
-				ResidentEntryPoint(*target) != nullptr;
-			use_resident_gpr_entry =
-				source_fragment.resident.exit.Provides(
-					target_fragment.resident.gpr_entry) &&
-				ResidentGprEntryPoint(*target) != nullptr;
-			// The published event horizon is mutable cross-block state, while
-			// the current GPR bypass rewrites an earlier canonical guest-store
-			// seam after the ordinary target branch has already been selected.
-			// Keep the proven base/countdown entry, but do not compose that
-			// mutation with pinned-GPR store/load elision until the combined
-			// exit proof has its own adversarial retail-oracle gate. This is
-			// deliberately scoped to countdown contracts; existing immutable
-			// base/GPR links remain unchanged.
-			if (target_fragment.resident.gpr_entry.Contains(
-					VitaRegion::ResidentValue::IopPublishedEventCountdown) ||
-				target_fragment.resident.gpr_entry.Contains(
-					VitaRegion::ResidentValue::IopEeBudget))
-			{
-				use_resident_gpr_entry = false;
-			}
-			for (unsigned host = 0;
-				use_resident_gpr_entry &&
-					host < VitaRegion::EntryContract::HostRegisterCount;
-				host++)
-			{
-				if ((source_fragment.resident.dirty_gpr_host_mask &
-						(1u << host)) != 0 &&
-					!(source_fragment.resident.exit.host_values[host] ==
-						target_fragment.resident.gpr_entry.host_values[host]))
-				{
-					use_resident_gpr_entry = false;
-				}
-			}
-#if defined(VITASX2_IOP_RESIDENT_PRELUDE_CONTROL)
-			use_resident_entry = false;
-			use_resident_gpr_entry = false;
-#endif
-#if defined(VITASX2_IOP_RESIDENT_GPR_CONTROL)
-			use_resident_gpr_entry = false;
-#endif
-#if defined(VITASX2_QEMU_VALIDATION)
-			use_resident_entry =
-				use_resident_entry && s_qemuIopResidentPreludeLinksEnabled;
-			use_resident_gpr_entry = use_resident_gpr_entry &&
-				s_qemuIopResidentPreludeLinksEnabled &&
-				s_qemuIopResidentGprLinksEnabled;
-#endif
-			const bool bypasses_source_stores =
-				link.resident_gpr_bypass_offset != static_cast<size_t>(-1);
-			target_entry = use_resident_gpr_entry && !bypasses_source_stores ?
-				ResidentGprEntryPoint(*target) : (use_resident_entry ?
-				ResidentEntryPoint(*target) : LinkedEntryPoint(*target));
-		}
-		const bool has_gpr_bypass =
-			link.resident_gpr_bypass_offset != static_cast<size_t>(-1);
-		const bool bypass_restored = !has_gpr_bypass ||
-			link_code->PatchInstruction(link.resident_gpr_bypass_offset,
-				link.resident_gpr_bypass_instruction);
-		const bool has_budget_bypass =
-			link.resident_budget_bypass_offset != static_cast<size_t>(-1);
-		const bool budget_bypass_restored = !has_budget_bypass ||
-			link_code->PatchInstruction(link.resident_budget_bypass_offset,
-				link.resident_budget_bypass_instruction);
 		const bool target_patched =
 			use_chain ? link_code->PatchBranchToAddress(link.target_offset,
-							target_entry) :
+							LinkedEntryPoint(*target)) :
 						link_code->PatchBranch(link.target_offset, link.fallback_offset);
-		const bool gpr_bypass_patched =
-			!use_resident_gpr_entry || !has_gpr_bypass ||
-			link_code->PatchBranchToAddress(link.resident_gpr_bypass_offset,
-				ResidentGprEntryPoint(*target));
-		const bool budget_bypass_patched =
-			!(use_resident_entry || use_resident_gpr_entry) ||
-			!has_budget_bypass ||
-			link_code->PatchBranchToAddress(link.resident_budget_bypass_offset,
-				use_resident_gpr_entry ? ResidentGprEntryPoint(*target) :
-					ResidentEntryPoint(*target));
-		link.resident_entry_active =
-			use_resident_entry || use_resident_gpr_entry;
-		link.resident_gpr_entry_active = use_resident_gpr_entry;
-		link.resident_ee_budget_entry_active =
-			(use_resident_entry || use_resident_gpr_entry) &&
-			has_budget_bypass &&
-			target->Fragment(0).resident.base_entry.Contains(
-				VitaRegion::ResidentValue::IopEeBudget);
-		link.resident_setup_instructions_removed =
-			(use_resident_entry || use_resident_gpr_entry) ?
-				target->Fragment(0).resident.base_setup_instruction_count :
-				0;
-		link.resident_gpr_loads_removed =
-			use_resident_gpr_entry ?
-				target->Fragment(0).resident.gpr_entry_load_instruction_count :
-				0;
 		if (link.logical_continuation)
-			return bypass_restored && budget_bypass_restored &&
-				target_patched && gpr_bypass_patched &&
-				budget_bypass_patched && link_code->Flush();
+			return target_patched && link_code->Flush();
 
 		const u32 scheduler_resume =
 			use_chain ? (static_cast<u32>(reinterpret_cast<uptr>(target)) |
 				SCHEDULER_DIRECT_RESUME_TAG) :
 			static_cast<u32>(BlockExitKind::Direct);
-		if (!bypass_restored || !budget_bypass_restored || !target_patched ||
-			!gpr_bypass_patched || !budget_bypass_patched ||
+		if (!target_patched ||
 			!link_code->PatchMovImm32(link.scheduler_resume_offset, HOST_TMP0,
 				scheduler_resume) ||
 			!link_code->Flush())
@@ -13296,50 +12039,6 @@ namespace VitaIOP
 			s_qemuIopLinkedFrameEvidence.instructions_removed;
 		result->linked_frame_stack_words_removed =
 			s_qemuIopLinkedFrameEvidence.stack_words_removed;
-		result->resident_prelude_links = 0;
-		result->resident_prelude_setup_instructions_removed = 0;
-		result->resident_gpr_links = 0;
-		result->resident_gpr_stores_removed = 0;
-		result->resident_gpr_loads_removed = 0;
-		result->hot_region_resident_gpr_links = 0;
-		result->hot_region_resident_gpr_stores_removed = 0;
-		result->hot_region_resident_gpr_loads_removed = 0;
-		result->resident_ee_budget_links = 0;
-		result->resident_ee_budget_stores_removed = 0;
-		result->resident_ee_budget_loads_removed = 0;
-		for (const std::unique_ptr<CachedBlock>& cached : m_cache)
-		{
-			if (!cached || !cached->valid)
-				continue;
-			result->hot_region_resident_gpr_links +=
-				cached->hot_region_resident_gpr_links;
-			result->hot_region_resident_gpr_stores_removed +=
-				cached->hot_region_resident_gpr_stores_removed;
-			result->hot_region_resident_gpr_loads_removed +=
-				cached->hot_region_resident_gpr_loads_removed;
-			for (const DirectLinkSlot& link : cached->direct_links.slots)
-			{
-				if (!link.valid || !link.resident_entry_active)
-					continue;
-				result->resident_prelude_links++;
-				result->resident_prelude_setup_instructions_removed +=
-					link.resident_setup_instructions_removed;
-				if (link.resident_gpr_entry_active)
-				{
-					result->resident_gpr_links++;
-					result->resident_gpr_stores_removed +=
-						link.resident_gpr_stores_removed;
-					result->resident_gpr_loads_removed +=
-						link.resident_gpr_loads_removed;
-				}
-				if (link.resident_ee_budget_entry_active)
-				{
-					result->resident_ee_budget_links++;
-					result->resident_ee_budget_stores_removed++;
-					result->resident_ee_budget_loads_removed++;
-				}
-			}
-		}
 		result->sequential_qword_copy_fast_paths =
 			s_qemuIopSequentialQwordCopyFastPaths;
 		// The focused control is 62 product A32 instructions larger even though
@@ -13543,25 +12242,6 @@ namespace VitaIOP
 		}
 		if (m_wait_resume_block == &block)
 			ClearWaitResumeBlock();
-
-#if !defined(VITASX2_IOP_HOT_REGION_CONTROL)
-#if defined(VITASX2_QEMU_VALIDATION)
-		if (s_qemuIopHotRegionPromotionEnabled &&
-#else
-		if (
-#endif
-			--m_hot_region_provider_sample_countdown == 0)
-		{
-#if defined(VITASX2_QEMU_VALIDATION)
-			m_hot_region_provider_sample_countdown = 1;
-#else
-			m_hot_region_provider_sample_countdown =
-				HOT_REGION_PROVIDER_SAMPLE_INTERVAL;
-#endif
-			if (!ObserveHotRegionProviderSample(block))
-				return 0;
-		}
-#endif
 
 #if defined(VITASX2_QEMU_VALIDATION)
 		if (block.compiled_ps1_bios_gate)

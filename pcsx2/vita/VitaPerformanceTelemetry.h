@@ -136,24 +136,6 @@ namespace VitaPerformanceTelemetry
 		Observer,
 	};
 
-	// Diagnostic-only wall-clock attribution within a cold EE compilation.
-	// These stages intentionally describe host work rather than guest semantics;
-	// normal product builds compile every measurement away.
-	enum class EeCompileSubstage : u8
-	{
-		Discovery,
-		SourceSnapshot,
-		Emission,
-		Publication,
-		Retirement,
-		Registration,
-		Diagnostics,
-		Linking,
-		Count,
-	};
-	static constexpr size_t EE_COMPILE_SUBSTAGE_COUNT =
-		static_cast<size_t>(EeCompileSubstage::Count);
-
 	enum CpuProfileIntervalFlags : u16
 	{
 		CpuProfileIntervalBalanced = 1u << 0,
@@ -330,44 +312,8 @@ namespace VitaPerformanceTelemetry
 		u64 ee_compile_observations = 0;
 		u64 ee_compile_time_us = 0;
 #if defined(VITASX2_CPU_PROFILER)
-		std::array<u64, EE_COMPILE_SUBSTAGE_COUNT>
-			ee_compile_substage_observations{};
-		std::array<u64, EE_COMPILE_SUBSTAGE_COUNT>
-			ee_compile_substage_time_us{};
-		u64 ee_hot_region_requests = 0;
-		u64 ee_hot_region_attempts = 0;
-		u64 ee_hot_region_promotions = 0;
-		u64 ee_hot_region_conditional_promotions = 0;
-		u64 ee_hot_region_source_cycles = 0;
-		u64 ee_hot_region_successor_cycles = 0;
-		u64 ee_byte_copy_countdown_blocks = 0;
-		u64 ee_byte_copy_countdown_helper_calls = 0;
-		u64 ee_byte_copy_countdown_bulk_chunks = 0;
-		u64 ee_byte_copy_countdown_bulk_bytes = 0;
-		u64 ee_byte_copy_countdown_scalar_iterations = 0;
-		u64 ee_byte_copy_countdown_page_returns = 0;
-		u64 ee_byte_copy_countdown_redispatches = 0;
-		u64 ee_byte_copy_countdown_counter_exits = 0;
-		u64 ee_pair_qword_fill_blocks = 0;
-		u64 ee_pair_qword_fill_helper_calls = 0;
-		u64 ee_pair_qword_fill_bulk_chunks = 0;
-		u64 ee_pair_qword_fill_bulk_bytes = 0;
-		u64 ee_pair_qword_fill_zero_bulk_chunks = 0;
-		u64 ee_pair_qword_fill_zero_bulk_bytes = 0;
-		u64 ee_pair_qword_fill_scalar_iterations = 0;
-		u64 ee_pair_qword_fill_page_returns = 0;
-		u64 ee_pair_qword_fill_redispatches = 0;
 		u64 iop_compile_observations = 0;
 		u64 iop_compile_time_us = 0;
-		u64 iop_hot_region_provider_samples = 0;
-		u64 iop_hot_region_selections = 0;
-		u64 iop_hot_region_attempts = 0;
-		u64 iop_hot_region_promotions = 0;
-		u64 iop_hot_region_source_cycles = 0;
-		u64 iop_hot_region_successor_cycles = 0;
-		u64 iop_hot_region_resident_gpr_links = 0;
-		u64 iop_hot_region_resident_gpr_stores_removed = 0;
-		u64 iop_hot_region_resident_gpr_loads_removed = 0;
 		// The statistical sampler runs on a non-EE Vita thread. CPU0 publishes
 		// only its current stage with a relaxed word store; the observer samples
 		// that marker at a decorrelated cadence. This attributes short helpers
@@ -489,29 +435,9 @@ namespace VitaPerformanceTelemetry
 	void EndCpuStage();
 	u32 BeginExactEeCompileMeasurement();
 	void EndExactEeCompileMeasurement(u32 start_us);
-	u32 BeginExactEeCompileSubstageMeasurement();
-	void EndExactEeCompileSubstageMeasurement(
-		EeCompileSubstage stage, u32 start_us);
 	u32 BeginExactIopCompileMeasurement();
 	void EndExactIopCompileMeasurement(u32 start_us);
 	void CountCpuStageEntry(CpuStage stage);
-	void RecordIopHotRegionProviderSample();
-	void RecordIopHotRegionSelection();
-	void RecordIopHotRegionAttempt();
-	void RecordIopHotRegionPromotion(
-		u32 source_cycles, u32 successor_cycles, u32 resident_gpr_links,
-		u32 resident_gpr_stores_removed, u32 resident_gpr_loads_removed);
-	void RecordEeHotRegionRequest();
-	void RecordEeHotRegionAttempt();
-	void RecordEeHotRegionPromotion(
-		u32 source_cycles, u32 successor_cycles, bool conditional);
-	void RecordEeByteCopyCountdownCompile();
-	void RecordEeByteCopyCountdownExecution(u32 bulk_bytes,
-		bool scalar_iteration, bool page_return, bool redispatch,
-		bool counter_exit);
-	void RecordEePairQwordFillCompile();
-	void RecordEePairQwordFillExecution(u32 bulk_bytes, bool zero_bulk,
-		bool scalar_iteration, bool page_return, bool redispatch);
 	void RecordIopDeadlineGate(bool dispatched, bool deadline_due,
 		bool counter_due, bool counter_precedes_published, bool intc_visible,
 		bool callback_due);
@@ -637,133 +563,6 @@ namespace VitaPerformanceTelemetry
 		(void)counter_precedes_published;
 		(void)intc_visible;
 		(void)callback_due;
-#endif
-	}
-
-	inline void RecordIopHotRegionProviderSampleIfProfiling()
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-			RecordIopHotRegionProviderSample();
-#endif
-	}
-
-	inline void RecordIopHotRegionSelectionIfProfiling()
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-			RecordIopHotRegionSelection();
-#endif
-	}
-
-	inline void RecordIopHotRegionAttemptIfProfiling()
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-			RecordIopHotRegionAttempt();
-#endif
-	}
-
-	inline void RecordIopHotRegionPromotionIfProfiling(
-		u32 source_cycles, u32 successor_cycles, u32 resident_gpr_links,
-		u32 resident_gpr_stores_removed, u32 resident_gpr_loads_removed)
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-		{
-			RecordIopHotRegionPromotion(source_cycles, successor_cycles,
-				resident_gpr_links, resident_gpr_stores_removed,
-				resident_gpr_loads_removed);
-		}
-#else
-		(void)source_cycles;
-		(void)successor_cycles;
-		(void)resident_gpr_links;
-		(void)resident_gpr_stores_removed;
-		(void)resident_gpr_loads_removed;
-#endif
-	}
-
-	inline void RecordEeHotRegionRequestIfProfiling()
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-			RecordEeHotRegionRequest();
-#endif
-	}
-
-	inline void RecordEeHotRegionAttemptIfProfiling()
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-			RecordEeHotRegionAttempt();
-#endif
-	}
-
-	inline void RecordEeHotRegionPromotionIfProfiling(
-		u32 source_cycles, u32 successor_cycles, bool conditional)
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-			RecordEeHotRegionPromotion(
-				source_cycles, successor_cycles, conditional);
-#else
-		(void)source_cycles;
-		(void)successor_cycles;
-		(void)conditional;
-#endif
-	}
-
-	inline void RecordEeByteCopyCountdownCompileIfProfiling()
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-			RecordEeByteCopyCountdownCompile();
-#endif
-	}
-
-	inline void RecordEeByteCopyCountdownExecutionIfProfiling(u32 bulk_bytes,
-		bool scalar_iteration, bool page_return, bool redispatch,
-		bool counter_exit)
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-		{
-			RecordEeByteCopyCountdownExecution(bulk_bytes,
-				scalar_iteration, page_return, redispatch, counter_exit);
-		}
-#else
-		(void)bulk_bytes;
-		(void)scalar_iteration;
-		(void)page_return;
-		(void)redispatch;
-		(void)counter_exit;
-#endif
-	}
-
-	inline void RecordEePairQwordFillCompileIfProfiling()
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-			RecordEePairQwordFillCompile();
-#endif
-	}
-
-	inline void RecordEePairQwordFillExecutionIfProfiling(u32 bulk_bytes,
-		bool zero_bulk, bool scalar_iteration, bool page_return, bool redispatch)
-	{
-#if defined(VITASX2_CPU_PROFILER)
-		if (g_cpu_stage_profiler_enabled)
-		{
-			RecordEePairQwordFillExecution(
-				bulk_bytes, zero_bulk, scalar_iteration, page_return, redispatch);
-		}
-#else
-		(void)bulk_bytes;
-		(void)zero_bulk;
-		(void)scalar_iteration;
-		(void)page_return;
-		(void)redispatch;
 #endif
 	}
 
@@ -1043,50 +842,6 @@ namespace VitaPerformanceTelemetry
 
 	private:
 #if defined(VITASX2_CPU_PROFILER)
-		u32 m_start_us = 0;
-		bool m_enabled = false;
-#endif
-	};
-
-	class ScopedExactEeCompileSubstageMeasurement
-	{
-	public:
-		explicit ScopedExactEeCompileSubstageMeasurement(EeCompileSubstage stage)
-		{
-#if defined(VITASX2_CPU_PROFILER)
-			m_stage = stage;
-			m_enabled = g_cpu_stage_profiler_enabled;
-			if (m_enabled)
-				m_start_us = BeginExactEeCompileSubstageMeasurement();
-#else
-			(void)stage;
-#endif
-		}
-
-		~ScopedExactEeCompileSubstageMeasurement()
-		{
-			Finish();
-		}
-
-		void Finish()
-		{
-#if defined(VITASX2_CPU_PROFILER)
-			if (m_enabled)
-			{
-				EndExactEeCompileSubstageMeasurement(m_stage, m_start_us);
-				m_enabled = false;
-			}
-#endif
-		}
-
-		ScopedExactEeCompileSubstageMeasurement(
-			const ScopedExactEeCompileSubstageMeasurement&) = delete;
-		ScopedExactEeCompileSubstageMeasurement& operator=(
-			const ScopedExactEeCompileSubstageMeasurement&) = delete;
-
-	private:
-#if defined(VITASX2_CPU_PROFILER)
-		EeCompileSubstage m_stage = EeCompileSubstage::Discovery;
 		u32 m_start_us = 0;
 		bool m_enabled = false;
 #endif

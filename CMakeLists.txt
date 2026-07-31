@@ -72,44 +72,12 @@ option(VITASX2_IOP_SCHEDULER_PRE_EVENT_WAIT_ADVANCE_CONTROL
 	"Diagnostic control: restore the complete IOP wait-resume body even when the retained normal-clock wait cannot reach its next event."
 	OFF)
 
-option(VITASX2_IOP_RESIDENT_PRELUDE_CONTROL
-	"Diagnostic control: rebuild fixed IOP bases at every linked block entry."
-	OFF)
-
-option(VITASX2_IOP_RESIDENT_GPR_CONTROL
-	"Diagnostic control: publish and reload pinned IOP GPRs at every linked block edge."
-	OFF)
-
-option(VITASX2_IOP_RETAINED_LO_CONTROL
-	"Diagnostic control: reload IOP LO for MFLO instead of forwarding a live multiply result."
-	OFF)
-
-option(VITASX2_IOP_PUBLISHED_EVENT_DEADLINE_CONTROL
-	"Diagnostic control: reload the complete IOP event deadline at every helper-free linked block seam."
-	OFF)
-
-option(VITASX2_IOP_RESIDENT_EE_BUDGET_CONTROL
-	"Diagnostic control: publish and reload the IOP EE-timeslice budget at every linked block edge."
-	OFF)
-
-option(VITASX2_IOP_HOT_REGION_CONTROL
-	"Diagnostic control: retain one PCSX2 IOP BaseBlock event/budget seam per generated block."
-	OFF)
-
-option(VITASX2_EE_HOT_REGION_CONTROL
-	"Diagnostic control: retain the source iBranchTest seam while the bounded EE region experiment has not passed its Vita CPU0 performance gate."
-	ON)
-
 option(VITASX2_SILENT_HSYNC_FOLD_CONTROL
 	"Diagnostic control: retain every HSync scheduler boundary while both processors hold exact wait certificates."
 	OFF)
 
 option(VITASX2_EE_INTC_VBLANK_RAM_WAIT_CONTROL
 	"Diagnostic control: leave mixed INTC-VBlank/RAM two-predicate EE waits on the generic bounded scheduler path."
-	OFF)
-
-option(VITASX2_EE_PAIR_QWORD_FILL_CONTROL
-	"Diagnostic control: leave exact two-SQ countdown fills on the ordinary generated EE loop."
 	OFF)
 
 option(VITASX2_VITA_SOFTWARE_GS_CONTROL

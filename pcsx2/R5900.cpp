@@ -286,9 +286,7 @@ static __fi bool VitaEeWaitCertificateHasExactWakeContract(
 	switch (certificate.origin)
 	{
 		case VitaA32EeWaitSchedulerOrigin::PollCallRamLoop:
-			return certificate.ram_range_count >= 1 &&
-				certificate.ram_range_count <=
-					VITA_A32_EE_WAIT_RAM_RANGE_CAPACITY;
+			return certificate.ram_range_count == 1;
 		case VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop:
 			return certificate.ram_range_count == 2;
 		case VitaA32EeWaitSchedulerOrigin::IntcVblankStartAndRamLoop:

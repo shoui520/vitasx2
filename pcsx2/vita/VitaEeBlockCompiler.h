@@ -45,24 +45,15 @@ namespace VitaEE
 	// static JAL into a pure load leaf. The loop block already owns its branch
 	// range; the executor attaches these disjoint ranges to the same recClear()
 	// and RAM-source invalidation lifetime.
-	inline constexpr u32 POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY = 2;
 	struct PollCallWaitLoopSourceProof
 	{
 		bool valid = false;
-		u8 additional_ram_watch_count = 0;
-		u8 reserved[2]{};
 		u32 call_pc = 0;
 		u32 leaf_pc = 0;
-		u32 branch_pc = 0;
-		u32 loop_end_pc = 0;
 		u32 call_scaled_cycles = 0;
 		u32 leaf_scaled_cycles = 0;
 		std::array<u32, 2> call_opcodes{};
 		std::array<u32, 2> leaf_opcodes{};
-		std::array<u32, POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY>
-			additional_ram_watch_address{};
-		std::array<u8, POLL_CALL_ADDITIONAL_RAM_WATCH_CAPACITY>
-			additional_ram_watch_size{};
 	};
 
 	// A two-stage RAM predicate loop can contain an early forward exit before
@@ -144,7 +135,6 @@ namespace VitaEE
 		SchedulerTestedTail,
 		Pcsx2ShortSplit,
 		A32PhysicalFragment,
-		HotRegionInternalStaticBranch,
 	};
 
 	enum class CompatibleVtlbGuardKind : u8
@@ -686,14 +676,6 @@ namespace VitaEE
 		{
 			m_direct_link_rejection_profiling_enabled = enabled;
 		}
-		void SetVu0AccCacheEnabled(bool enabled)
-		{
-			m_vu0_acc_cache_enabled = enabled;
-		}
-		void SetVu0VfCacheEnabled(bool enabled)
-		{
-			m_vu0_vf_cache_enabled = enabled;
-		}
 #endif
 
 		static bool CanCompileOpcode(u32 op);
@@ -701,20 +683,11 @@ namespace VitaEE
 		static bool IsBranchLikely(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 op);
 		static bool CanCompileDelaySlotOpcode(u32 branch_op, u32 delay_op);
-		u32 GetVu0AccCacheWrites() const { return m_vu0_acc_cache_writes; }
-		u32 GetVu0AccCacheHits() const { return m_vu0_acc_cache_hits; }
-		u32 GetVu0AccCacheFlushes() const { return m_vu0_acc_cache_flushes; }
-		u32 GetVu0VfCacheWrites() const { return m_vu0_vf_cache_writes; }
-		u32 GetVu0VfCacheHits() const { return m_vu0_vf_cache_hits; }
-		u32 GetVu0VfCacheFlushes() const { return m_vu0_vf_cache_flushes; }
 		static bool IsExactPreincrementByteZeroFillLoop(u32 start_pc, u32 instruction_count,
 			unsigned* pointer_guest = nullptr, unsigned* end_guest = nullptr);
 		static bool IsExactFourWordFillLoop(u32 start_pc, u32 instruction_count,
 			unsigned* pointer_guest = nullptr, unsigned* end_guest = nullptr,
 			unsigned* value_guest = nullptr);
-		static bool IsExactPairQwordFillLoop(u32 start_pc, u32 instruction_count,
-			unsigned* pointer_guest = nullptr, unsigned* count_guest = nullptr,
-			unsigned* value_guest = nullptr, unsigned* result_guest = nullptr);
 		static bool IsExactPreincrementWordFillLoop(u32 start_pc, u32 instruction_count,
 			unsigned* pointer_guest = nullptr, unsigned* end_guest = nullptr,
 			unsigned* value_guest = nullptr, unsigned* result_guest = nullptr);
@@ -724,11 +697,6 @@ namespace VitaEE
 		static bool IsExactWordCopyLoop(u32 start_pc, u32 instruction_count,
 			unsigned* value_guest = nullptr, unsigned* source_guest = nullptr,
 			unsigned* destination_guest = nullptr, unsigned* end_guest = nullptr);
-		static bool IsExactByteCopyCountdownLoop(u32 start_pc,
-			u32 instruction_count, unsigned* value_guest = nullptr,
-			unsigned* source_guest = nullptr,
-			unsigned* destination_guest = nullptr,
-			unsigned* countdown_guest = nullptr);
 		static bool IsExactGsCsrVsintPollLoop(u32 start_pc, u32 instruction_count,
 			unsigned* base_guest = nullptr, unsigned* result_guest = nullptr);
 		static bool IsExactDmacChcrStrPollLoop(u32 start_pc,
@@ -748,9 +716,6 @@ namespace VitaEE
 			bool use_vu0_base_register = false, size_t* linked_entry_offset = nullptr,
 			u32 linked_entry_pc = 0, bool linked_entry_needs_pc_sync = false);
 		bool EmitCpuProfilerBlockPc(u32 start_pc, bool preserve_temporaries = false);
-		bool EmitHotRegionEntryCounter(u32* counter, void* request_slot,
-			const void* request_value, u32 request_threshold,
-			size_t* counter_offset, u8* counter_instruction_count);
 		bool CompileStraightLineBlock(u32 start_pc, u32 instruction_count, const void* direct_exit, const void* event_exit,
 			u32* scaled_cycles = nullptr, DirectLinkSlots* direct_links = nullptr,
 			const void* indirect_lookup_pages_slot = nullptr, const void* direct_linking_enabled_flag = nullptr,
@@ -767,15 +732,7 @@ namespace VitaEE
 			const void* scheduler_test_elided_direct_exit = nullptr,
 			const void* retained_wait_event_exit = nullptr,
 			PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof = nullptr,
-			TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof = nullptr,
-			u32 hot_region_guard_cycles = 0,
-			const void* hot_region_fallback_entry = nullptr,
-			u32* hot_region_entry_counter = nullptr,
-			void* hot_region_request_slot = nullptr,
-			const void* hot_region_request_value = nullptr,
-			u32 hot_region_request_threshold = 0,
-			size_t* hot_region_counter_offset = nullptr,
-			u8* hot_region_counter_instruction_count = nullptr);
+			TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof = nullptr);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false,
 			u32 branch_delay_selected_pc = UINT32_MAX,
@@ -793,12 +750,6 @@ namespace VitaEE
 		bool EndBlockWithSchedulerElidedDirectContinuation(u32 block_cycles,
 			const void* scheduler_test_elided_direct_exit, DirectLinkSlot* direct_link,
 			bool defer_pc_writeback, u32 direct_pc);
-		bool EndBlockWithSchedulerElidedConditionalContinuation(u32 block_cycles,
-			const void* scheduler_test_elided_direct_exit,
-			DirectLinkSlot* not_taken_link, DirectLinkSlot* taken_link,
-			bool defer_pc_writeback, u32 not_taken_pc, u32 taken_pc);
-		bool EmitHotRegionEntryHorizonGuard(
-			u32 source_cycles, const void* fallback_entry);
 		bool EndBlockWithLikelyCycleTest(u32 taken_cycles, u32 not_taken_cycles, const void* direct_exit,
 			const void* event_exit, DirectLinkSlot* not_taken_link = nullptr,
 			DirectLinkSlot* taken_link = nullptr, bool wait_loop_taken = false,
@@ -864,8 +815,7 @@ namespace VitaEE
 			bool scheduler_test_elided_fallback = false);
 		bool EmitTakenDirectLinkTail(const void* direct_exit, size_t target_branch,
 			DirectLinkSlot* direct_link, bool defer_pc_writeback = false, u32 pc = 0,
-			bool sync_private_fallback = false,
-			bool scheduler_test_elided_fallback = false);
+			bool sync_private_fallback = false);
 		bool EmitIndirectDispatchTail(const void* lookup_pages_slot, const void* direct_linking_enabled_flag,
 			const void* direct_exit, bool defer_pc_writeback = false);
 		bool EmitGeneratedDispatchLookup(const void* lookup_pages_slot,
@@ -899,9 +849,6 @@ namespace VitaEE
 		bool CompileFourWordFillLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
-		bool CompilePairQwordFillLoop(u32 start_pc, u32 instruction_count,
-			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
-			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompilePreincrementWordFillLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
@@ -909,9 +856,6 @@ namespace VitaEE
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompileWordCopyLoop(u32 start_pc, u32 instruction_count,
-			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
-			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
-		bool CompileByteCopyCountdownLoop(u32 start_pc, u32 instruction_count,
 			const void* direct_exit, const void* event_exit, u32* scaled_cycles,
 			DirectLinkSlots* direct_links, size_t* linked_entry_offset);
 		bool CompileGsCsrVsintPollLoop(u32 start_pc, u32 instruction_count,
@@ -973,10 +917,6 @@ namespace VitaEE
 		bool EmitCOP2MacroStoreSelectedLanes(unsigned mask, unsigned value_qreg, unsigned address_reg);
 		bool EmitCOP2MacroStoreVfSelectedLanes(unsigned vf_reg, unsigned mask, unsigned value_qreg,
 			unsigned address_reg);
-		bool CanKeepVu0AccCacheAcrossOpcode(u32 op) const;
-		bool EmitFlushVu0AccCache();
-		bool CanKeepVu0VfCacheAcrossOpcode(u32 op) const;
-		bool EmitFlushVu0VfCache();
 		bool EmitCOP2MacroBody(u32 op);
 		bool EmitCOP2MacroArithmeticBody(u32 op);
 		bool EmitCOP2MacroViBody(u32 op);
@@ -1691,31 +1631,11 @@ namespace VitaEE
 		bool m_cop1_fpr_normalized[32]{};
 		bool m_cop1_acc_normalized = false;
 		// True once the vuDouble() bit-select constant quads (physical Q8-Q11)
-		// have been materialized in this block. Physical Q12/Q13/Q15 are
-		// ephemeral normalize scratch; Q14 is the ACC cache below. Q12-Q15 also
-		// back the private ABI's logical Q4-Q7 bank in qcache blocks; the block
-		// classifier makes those roles mutually exclusive. Reset in BeginBlock().
+		// have been materialized in this block. Physical Q12-Q15 are ephemeral
+		// normalize scratch in COP2 macro blocks and back the private ABI's logical
+		// Q4-Q7 bank in qcache blocks; the block classifier makes those roles
+		// mutually exclusive. Reset per block in BeginBlock().
 		bool m_cop2_norm_consts_ready = false;
-		// A complete normalized ACC value produced by a full-mask macro
-		// arithmetic instruction. Logical Q6 maps to physical Q14, which is
-		// caller-clobbered under the existing private vector ABI and is not used
-		// by the GPR qcache in COP2 arithmetic blocks. The value never crosses a
-		// block, helper, branch, trace, or architectural observer.
-		bool m_vu0_acc_cache_valid = false;
-		bool m_vu0_acc_cache_current_opcode = false;
-		u32 m_vu0_acc_cache_writes = 0;
-		u32 m_vu0_acc_cache_hits = 0;
-		u32 m_vu0_acc_cache_flushes = 0;
-		// One complete normalized VF result can remain in Q3 until the next
-		// compatible macro consumer. Q3 is the arithmetic result quad already,
-		// so result-only operations retain it for free. Flag-producing operations
-		// build it from their four normalized scalar results.
-		bool m_vu0_vf_cache_valid = false;
-		bool m_vu0_vf_cache_current_opcode = false;
-		u8 m_vu0_vf_cache_reg = 0;
-		u32 m_vu0_vf_cache_writes = 0;
-		u32 m_vu0_vf_cache_hits = 0;
-		u32 m_vu0_vf_cache_flushes = 0;
 		// Once an in-block TLB write has executed, suffix memory operations must
 		// not embed a compile-time vmv.assumePtr() from the preceding mapping.
 		bool m_runtime_tlb_mapping_may_have_changed = false;
@@ -1731,8 +1651,6 @@ namespace VitaEE
 		bool m_compatible_vtlb_write_guard_hoist_enabled = true;
 		bool m_compatible_vtlb_read_guard_hoist_enabled = true;
 		bool m_direct_link_rejection_profiling_enabled = false;
-		bool m_vu0_acc_cache_enabled = true;
-		bool m_vu0_vf_cache_enabled = true;
 #endif
 		GprLinkSignature m_gpr_link_signature{};
 		u8 m_branch_flag_host = 0;

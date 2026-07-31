@@ -293,20 +293,6 @@ enum VitaEeFourWordFillResult : u32
 u32 VitaEeExecuteFourWordFill(u32 start_pc, u32 fallthrough_pc,
 	u32 block_cycles, u32 packed_guests);
 
-enum VitaEePairQwordFillResult : u32
-{
-	VITA_EE_PAIR_QWORD_FILL_COMPLETE = 0,
-	VITA_EE_PAIR_QWORD_FILL_SELF = 1,
-	VITA_EE_PAIR_QWORD_FILL_EVENT = 2,
-	VITA_EE_PAIR_QWORD_FILL_REDISPATCH = 3,
-};
-
-// Executes the exact SQ/ADDIU-count/ADDIU-pointer/SLTIU/SQ/BEQ/ADDIU-pointer
-// loop. Direct pages batch only complete two-store iterations to a page,
-// completion, or event seam; handler and SMC pages execute one ordered pair.
-u32 VitaEeExecutePairQwordFill(u32 start_pc, u32 fallthrough_pc,
-	u32 block_cycles, u32 packed_guests);
-
 enum VitaEePreincrementWordFillResult : u32
 {
 	VITA_EE_PREINCREMENT_WORD_FILL_COMPLETE = 0,
@@ -346,21 +332,6 @@ enum VitaEeWordCopyResult : u32
 // Direct source/destination pages batch to completion, either page, or event;
 // handler and protected mappings execute one architecturally ordered iteration.
 u32 VitaEeExecuteWordCopy(u32 start_pc, u32 fallthrough_pc,
-	u32 packed_cycles, u32 packed_guests);
-
-enum VitaEeByteCopyCountdownResult : u32
-{
-	VITA_EE_BYTE_COPY_COUNTDOWN_COMPLETE = 0,
-	VITA_EE_BYTE_COPY_COUNTDOWN_SELF = 1,
-	VITA_EE_BYTE_COPY_COUNTDOWN_EVENT = 2,
-	VITA_EE_BYTE_COPY_COUNTDOWN_REDISPATCH = 3,
-};
-
-// Executes the exact LBU/ADDIU-count/SB/ADDIU-source/ADDIU-destination/
-// BNE/NOP forward byte-copy loop. Direct source/destination pages batch to
-// count completion, either page, or event; observable mappings execute one
-// architecturally ordered iteration.
-u32 VitaEeExecuteByteCopyCountdown(u32 start_pc, u32 fallthrough_pc,
 	u32 packed_cycles, u32 packed_guests);
 
 // --------------------------------------------------------------------------------------

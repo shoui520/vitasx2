@@ -904,9 +904,7 @@ static inline RamWaitResumeResult recRunRamWaitIterationAfterEvent(
 	const bool poll_call =
 		certificate.origin ==
 			VitaA32EeWaitSchedulerOrigin::PollCallRamLoop &&
-		certificate.ram_range_count >= 1 &&
-		certificate.ram_range_count <=
-			VITA_A32_EE_WAIT_RAM_RANGE_CAPACITY;
+		certificate.ram_range_count == 1;
 	const bool two_predicate =
 		certificate.origin ==
 			VitaA32EeWaitSchedulerOrigin::TwoPredicateRamLoop &&
@@ -1966,22 +1964,19 @@ void VitaPublishA32EeWaitSchedulerOrigin(
 static void PublishA32EeRamWaitSchedulerCertificate(
 	VitaA32EeWaitSchedulerOrigin origin,
 	u32 guest_address_0, u32 size_0,
-	u32 guest_address_1, u32 size_1,
-	u32 guest_address_2 = 0, u32 size_2 = 0)
+	u32 guest_address_1, u32 size_1)
 {
 	s_ee_wait_scheduler_certificate = {};
 	s_ee_wait_scheduler_certificate.origin = origin;
 	if (!eeMem || !vtlb_private::vtlbdata.vmap)
 		return;
 
-	const u32 guest_addresses[VITA_A32_EE_WAIT_RAM_RANGE_CAPACITY] = {
-		guest_address_0, guest_address_1, guest_address_2};
-	const u32 sizes[VITA_A32_EE_WAIT_RAM_RANGE_CAPACITY] = {
-		size_0, size_1, size_2};
+	const u32 guest_addresses[2] = {
+		guest_address_0, guest_address_1};
+	const u32 sizes[2] = {size_0, size_1};
 	const uptr ram_start = reinterpret_cast<uptr>(eeMem->Main);
 	const uptr ram_end = ram_start + Ps2MemSize::ExposedRam;
-	for (u32 i = 0;
-		i < VITA_A32_EE_WAIT_RAM_RANGE_CAPACITY && sizes[i] != 0; i++)
+	for (u32 i = 0; i < 2 && sizes[i] != 0; i++)
 	{
 		const u32 address = guest_addresses[i];
 		const u32 size = sizes[i];
@@ -2029,15 +2024,11 @@ void VitaPublishA32EeRamWaitSchedulerCertificate(
 
 void VitaPublishA32EePollCallWaitSchedulerCertificate(
 	u32 guest_address, u32 packed_cycles,
-	u32 leaf_pc, u32 return_pc, u32 call_pc,
-	u32 guest_address_1, u32 size_1,
-	u32 guest_address_2, u32 size_2)
+	u32 leaf_pc, u32 return_pc, u32 call_pc)
 {
 	PublishA32EeRamWaitSchedulerCertificate(
 		VitaA32EeWaitSchedulerOrigin::PollCallRamLoop,
-		guest_address, sizeof(u32),
-		guest_address_1, size_1,
-		guest_address_2, size_2);
+		guest_address, sizeof(u32), 0, 0);
 	s_ee_wait_scheduler_certificate.poll_packed_cycles = packed_cycles;
 	s_ee_wait_scheduler_certificate.poll_leaf_pc = leaf_pc;
 	s_ee_wait_scheduler_certificate.poll_return_pc = return_pc;
@@ -2136,11 +2127,7 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	u64 host_load_instructions, u64 host_store_instructions,
 	u64 helper_call_instructions, u64 state_load_instructions,
 	u64 state_store_instructions, bool poll_call_wait_loop,
-	u32 poll_call_wait_additional_ram_watches,
-	bool two_predicate_wait_loop, u32 vu0_acc_cache_writes,
-	u32 vu0_acc_cache_hits, u32 vu0_acc_cache_flushes,
-	u32 vu0_vf_cache_writes, u32 vu0_vf_cache_hits,
-	u32 vu0_vf_cache_flushes)
+	bool two_predicate_wait_loop)
 {
 	s_ee_a32_stats.generated_blocks++;
 	s_ee_a32_stats.generated_host_instructions += host_instructions;
@@ -2158,23 +2145,9 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	s_ee_a32_stats.generated_cop0_instructions += guest_mix.cop0;
 	s_ee_a32_stats.generated_cop1_instructions += guest_mix.cop1;
 	s_ee_a32_stats.generated_cop2_instructions += guest_mix.cop2;
-	s_ee_a32_stats.generated_cop2_runtime_noop_instructions +=
-		guest_mix.cop2_runtime_noop;
-	s_ee_a32_stats.generated_vu0_acc_cache_writes +=
-		vu0_acc_cache_writes;
-	s_ee_a32_stats.generated_vu0_acc_cache_hits += vu0_acc_cache_hits;
-	s_ee_a32_stats.generated_vu0_acc_cache_flushes +=
-		vu0_acc_cache_flushes;
-	s_ee_a32_stats.generated_vu0_vf_cache_writes += vu0_vf_cache_writes;
-	s_ee_a32_stats.generated_vu0_vf_cache_hits += vu0_vf_cache_hits;
-	s_ee_a32_stats.generated_vu0_vf_cache_flushes += vu0_vf_cache_flushes;
 	s_ee_a32_stats.generated_other_instructions += guest_mix.other;
 	s_ee_a32_stats.generated_poll_call_wait_blocks +=
 		poll_call_wait_loop ? 1u : 0u;
-	s_ee_a32_stats.generated_multi_range_poll_call_wait_blocks +=
-		poll_call_wait_additional_ram_watches != 0 ? 1u : 0u;
-	s_ee_a32_stats.generated_poll_call_wait_additional_ram_watches +=
-		poll_call_wait_additional_ram_watches;
 	s_ee_a32_stats.generated_two_predicate_wait_blocks +=
 		two_predicate_wait_loop ? 1u : 0u;
 	if (host_instructions > s_ee_a32_stats.largest_generated_block_host_instructions)

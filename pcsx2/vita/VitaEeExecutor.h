@@ -89,9 +89,6 @@ namespace VitaEE
 		u32 code_budget_continuation_blocks = 0;
 		u32 code_budget_continuation_scheduler_tests_elided = 0;
 		u32 code_budget_continuation_hot_instructions_elided = 0;
-		u32 hot_region_blocks = 0;
-		u32 hot_region_scheduler_tests_elided = 0;
-		u32 hot_region_source_cycles = 0;
 		u32 generated_frame_pushes = 0;
 		u32 generated_frame_pops = 0;
 		u32 dispatcher_frame_pushes = 0;
@@ -204,7 +201,6 @@ namespace VitaEE
 		void SetThreeBlockGprLinkEnabled(bool enabled);
 		void SetVtlbLinkedEntryPcPublicationEnabled(bool enabled);
 		void SetDirectLinkRejectionProfileEnabled(bool enabled);
-		void SetHotRegionPromotionEnabled(bool enabled);
 		void ResetDirectLinkRejectionProfile();
 		VitaA32EeLinkRejectionProfile GetDirectLinkRejectionProfile() const;
 #endif
@@ -225,7 +221,7 @@ namespace VitaEE
 		size_t GetCodeCacheCapacity() const { return m_code_cache_capacity; }
 		u32 GetCodeCacheBlockRecordCount() const
 		{
-			return m_block_record_count;
+			return static_cast<u32>(m_block_records.size());
 		}
 		u32 GetCodeCacheSlotCount() const
 		{
@@ -250,21 +246,7 @@ namespace VitaEE
 			HostMemoryMap::EErecSize;
 		static constexpr size_t CODE_CACHE_ALIGNMENT = 32;
 		static constexpr size_t DIRECT_LINK_SLOT_COUNT = 2;
-		// Tier-zero counters exist only on structurally eligible direct-jump or
-		// backward conditional sources. A source pays this bounded warm-up cost,
-		// then either becomes a guarded region or is rebuilt as an ordinary
-		// counter-free block.
-		static constexpr u32 HOT_REGION_ENTRY_PROMOTION_THRESHOLD = 256;
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
-		static constexpr u32 BLOCK_RECORD_BUCKET_SHIFT = 8;
-		static constexpr u32 BLOCK_RECORD_BUCKET_COUNT = 0x4000;
-		static constexpr u32 INVALID_BLOCK_RECORD_INDEX = UINT32_MAX;
-		static_assert((BLOCK_RECORD_BUCKET_COUNT &
-			(BLOCK_RECORD_BUCKET_COUNT - 1)) == 0);
-		static constexpr u32 INCOMING_LINK_BUCKET_COUNT = 0x4000;
-		static constexpr u32 INVALID_INCOMING_LINK_INDEX = UINT32_MAX;
-		static_assert((INCOMING_LINK_BUCKET_COUNT &
-			(INCOMING_LINK_BUCKET_COUNT - 1)) == 0);
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
 		static constexpr u32 INVALID_RAM_SOURCE = UINT32_MAX;
@@ -315,22 +297,11 @@ namespace VitaEE
 			CompatibleVtlbFastEntryOffsets compatible_vtlb_fast_entries{};
 			u8 compatible_link_entry_loads = 0;
 			DirectLinkSlots direct_links{};
-			std::array<u32, DIRECT_LINK_SLOT_COUNT>
-				incoming_link_record_indices{
-					INVALID_INCOMING_LINK_INDEX,
-					INVALID_INCOMING_LINK_INDEX};
 			DirectContinuationKind direct_continuation_kind =
 				DirectContinuationKind::SchedulerTestedTail;
-			// 0=cold candidate, 1=promotion refused,
-			// 2=guarded scheduler-elided source seam.
-			u32 hot_region_entry_count = 0;
-			size_t hot_region_counter_offset = static_cast<size_t>(-1);
-			u8 hot_region_state = 0;
-			u8 hot_region_counter_instruction_count = 0;
 			bool discovered_topology = false;
 			bool valid = false;
 			bool queued_free = false;
-			u32 block_record_index = INVALID_BLOCK_RECORD_INDEX;
 		};
 
 		struct PersistentRunContext
@@ -363,15 +334,13 @@ namespace VitaEE
 			// of charging each of the 65,536 bounded records four bytes of A32
 			// padding.
 			u32 target_pc_and_slot = 0;
-			u32 next_index = INVALID_INCOMING_LINK_INDEX;
 
 			IncomingLinkRecord() = default;
 			IncomingLinkRecord(CachedBlock* source_, u32 target_pc_,
-				u8 slot_index_, u32 next_index_)
+				u8 slot_index_)
 				: source(source_)
 				, target_pc_and_slot(
 					(target_pc_ & ~u32{3}) | (slot_index_ & u8{3}))
-				, next_index(next_index_)
 			{
 			}
 			u32 TargetPc() const { return target_pc_and_slot & ~u32{3}; }
@@ -385,24 +354,16 @@ namespace VitaEE
 		{
 			CachedBlock* block = nullptr;
 			u32 start_pc = 0;
-			u32 next_index = INVALID_BLOCK_RECORD_INDEX;
-			u32 previous_index = INVALID_BLOCK_RECORD_INDEX;
 		};
 #if UINTPTR_MAX == UINT32_MAX
-		static_assert(sizeof(IncomingLinkRecord) == 12);
-		static_assert(sizeof(BlockRecord) == 16);
+		static_assert(sizeof(IncomingLinkRecord) == 8);
+		static_assert(sizeof(BlockRecord) == 8);
 #endif
 
 		struct RamSourceRecord
 		{
 			CachedBlock* block = nullptr;
 			u32 serial = 0;
-		};
-
-		struct HotRegionPlan
-		{
-			const void* source_fallback_entry = nullptr;
-			u32 source_cycles = 0;
 		};
 
 		static u32 LookupPageIndex(u32 start_pc);
@@ -416,44 +377,10 @@ namespace VitaEE
 		void UnregisterBlockLookup(CachedBlock& block);
 		void ReleaseLookupPages();
 		void ReleaseGeneratedLookupPages();
-		static u32 BlockRecordBucketIndex(u32 pc);
-		bool RemoveBlockRecord(u32 record_index);
+		s32 LastBlockRecordIndex(u32 pc) const;
 		bool RegisterBlockRecord(CachedBlock& block);
 		void UnregisterBlockRecord(CachedBlock& block);
 		void ClearBlockRecords();
-		template <typename Callback>
-		void VisitBlockRecordsInRange(u32 first_pc, u32 end_pc,
-			Callback&& callback) const
-		{
-			// Callbacks must not mutate the block-record topology. Mutation paths
-			// first snapshot CachedBlock pointers into m_block_record_query_scratch.
-			if (first_pc >= end_pc)
-				return;
-
-			const u32 first_page = first_pc >> BLOCK_RECORD_BUCKET_SHIFT;
-			const u32 last_page =
-				(end_pc - 1) >> BLOCK_RECORD_BUCKET_SHIFT;
-			for (u32 page = first_page;; page++)
-			{
-				u32 index = m_block_record_bucket_heads[
-					page & (BLOCK_RECORD_BUCKET_COUNT - 1)];
-				while (index != INVALID_BLOCK_RECORD_INDEX)
-				{
-					const BlockRecord& record = m_block_records[index];
-					index = record.next_index;
-					if (record.block &&
-						(record.start_pc >> BLOCK_RECORD_BUCKET_SHIFT) == page &&
-						record.start_pc >= first_pc && record.start_pc < end_pc &&
-						!callback(record))
-					{
-						return;
-					}
-				}
-
-				if (page == last_page)
-					break;
-			}
-		}
 		bool CaptureRamSourceFragments(CachedBlock& block);
 		void RegisterRamSource(CachedBlock& block);
 		void UnregisterRamSource(const CachedBlock& block);
@@ -467,12 +394,10 @@ namespace VitaEE
 			u32 instruction_count, bool match_instruction_count,
 			bool discovered_topology, bool validate_source_words = true);
 		void RememberFreeCacheEntry(CachedBlock& block);
-		void RemoveFreeCacheEntry(CachedBlock& block);
 		CachedBlock* TakeFreeCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
-		static u32 IncomingLinkBucketIndex(u32 target_pc);
-		bool RemoveIncomingLinkRecord(u32 record_index);
+		s32 LastIncomingLinkIndex(u32 target_pc) const;
 		void ClearIncomingLinks();
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
@@ -505,13 +430,7 @@ namespace VitaEE
 			u32 dependency_start_pc = 0, u32 dependency_instruction_count = 0,
 			u32 dependency_charged_cycles_before = 0,
 			bool pcsx2_short_split = false,
-			bool discovered_topology = false,
-			const HotRegionPlan* hot_region = nullptr,
-			bool allow_hot_region_counter = true);
-		bool ServiceHotRegionRequest();
-		bool DisableHotRegionEntryCounter(CachedBlock& block);
-		__attribute__((noinline, cold)) bool TryPromoteHotRegion(
-			CachedBlock& block);
+			bool discovered_topology = false);
 		bool AnalyzeGprLinkSignature(u32 start_pc, u32 instruction_count,
 			GprLinkSignature* signature) const;
 		bool PrepareCompiledBlockAtPc(u32 start_pc, CachedBlock** block, BlockExecutionResult* result);
@@ -537,16 +456,7 @@ namespace VitaEE
 		std::vector<std::unique_ptr<CachedBlock>> m_cache;
 		CachedBlock* m_free_cache_head = nullptr;
 		std::vector<BlockRecord> m_block_records;
-		std::array<u32, BLOCK_RECORD_BUCKET_COUNT>
-			m_block_record_bucket_heads{};
-		u32 m_block_record_free_head = INVALID_BLOCK_RECORD_INDEX;
-		u32 m_block_record_count = 0;
-		std::vector<CachedBlock*> m_block_record_query_scratch;
 		std::vector<IncomingLinkRecord> m_incoming_links;
-		std::array<u32, INCOMING_LINK_BUCKET_COUNT>
-			m_incoming_link_bucket_heads{};
-		u32 m_incoming_link_free_head = INVALID_INCOMING_LINK_INDEX;
-		u32 m_incoming_link_count = 0;
 		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT>
 			m_ram_source_pages;
 		std::array<u32, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};
@@ -575,10 +485,6 @@ namespace VitaEE
 		size_t m_code_cache_capacity = 0;
 		size_t m_code_cache_used = 0;
 		u32 m_code_cache_resets = 0;
-#if defined(VITASX2_QEMU_VALIDATION)
-		bool m_hot_region_promotion_enabled = false;
-#endif
-		CachedBlock* m_hot_region_requested_block = nullptr;
 		bool m_direct_linking_enabled = true;
 		bool m_persistent_dispatch_enabled = false;
 #if defined(VITASX2_QEMU_VALIDATION)

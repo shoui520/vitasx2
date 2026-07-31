@@ -163,17 +163,8 @@ struct VitaA32EeProviderStats
 	u64 generated_cop0_instructions = 0;
 	u64 generated_cop1_instructions = 0;
 	u64 generated_cop2_instructions = 0;
-	u64 generated_cop2_runtime_noop_instructions = 0;
-	u64 generated_vu0_acc_cache_writes = 0;
-	u64 generated_vu0_acc_cache_hits = 0;
-	u64 generated_vu0_acc_cache_flushes = 0;
-	u64 generated_vu0_vf_cache_writes = 0;
-	u64 generated_vu0_vf_cache_hits = 0;
-	u64 generated_vu0_vf_cache_flushes = 0;
 	u64 generated_other_instructions = 0;
 	u32 generated_poll_call_wait_blocks = 0;
-	u32 generated_multi_range_poll_call_wait_blocks = 0;
-	u32 generated_poll_call_wait_additional_ram_watches = 0;
 	u32 generated_two_predicate_wait_blocks = 0;
 	u32 two_predicate_wait_fast_forwards = 0;
 	u32 largest_generated_block_pc = 0;
@@ -234,7 +225,6 @@ struct VitaA32EeGeneratedGuestMix
 	u32 cop0 = 0;
 	u32 cop1 = 0;
 	u32 cop2 = 0;
-	u32 cop2_runtime_noop = 0;
 	u32 other = 0;
 };
 
@@ -253,8 +243,6 @@ enum class VitaA32EeWaitSchedulerOrigin : u32
 	IntcVblankStartAndRamLoop = 7,
 };
 
-inline constexpr u32 VITA_A32_EE_WAIT_RAM_RANGE_CAPACITY = 3;
-
 struct VitaA32EeWaitSchedulerCertificate
 {
 	VitaA32EeWaitSchedulerOrigin origin =
@@ -266,8 +254,8 @@ struct VitaA32EeWaitSchedulerCertificate
 	{
 		struct
 		{
-			u32 ram_offset[VITA_A32_EE_WAIT_RAM_RANGE_CAPACITY];
-			u32 ram_size[VITA_A32_EE_WAIT_RAM_RANGE_CAPACITY];
+			u32 ram_offset[2];
+			u32 ram_size[2];
 		};
 		// DMAC CHCR.STR polls do not watch EE RAM. These fields retain the
 		// complete structural loop contract across scheduler events without
@@ -298,7 +286,7 @@ struct VitaA32EeWaitSchedulerCertificate
 		};
 	};
 };
-static_assert(sizeof(VitaA32EeWaitSchedulerCertificate) == 48);
+static_assert(sizeof(VitaA32EeWaitSchedulerCertificate) == 40);
 
 void VitaPublishA32EeWaitSchedulerOrigin(
 	VitaA32EeWaitSchedulerOrigin origin);
@@ -308,9 +296,7 @@ void VitaPublishA32EeRamWaitSchedulerCertificate(
 	u32 guest_address_1 = 0, u32 size_1 = 0);
 void VitaPublishA32EePollCallWaitSchedulerCertificate(
 	u32 guest_address, u32 packed_cycles,
-	u32 leaf_pc, u32 return_pc, u32 call_pc,
-	u32 guest_address_1 = 0, u32 size_1 = 0,
-	u32 guest_address_2 = 0, u32 size_2 = 0);
+	u32 leaf_pc, u32 return_pc, u32 call_pc);
 void VitaPublishA32EeTwoPredicateWaitSchedulerCertificate(
 	u32 guest_address_0, u32 guest_address_1,
 	u32 prefix_cycles, u32 tail_cycles,
@@ -380,11 +366,7 @@ void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	u64 host_load_instructions, u64 host_store_instructions,
 	u64 helper_call_instructions, u64 state_load_instructions,
 	u64 state_store_instructions, bool poll_call_wait_loop,
-	u32 poll_call_wait_additional_ram_watches,
-	bool two_predicate_wait_loop, u32 vu0_acc_cache_writes,
-	u32 vu0_acc_cache_hits, u32 vu0_acc_cache_flushes,
-	u32 vu0_vf_cache_writes, u32 vu0_vf_cache_hits,
-	u32 vu0_vf_cache_flushes);
+	bool two_predicate_wait_loop);
 void VitaRecordA32EeTwoPredicateWaitLoopFastForward();
 void VitaRequestA32EeCacheReset();
 // Normal product execution enables PCSX2-style DispatcherEvent fallthrough.
