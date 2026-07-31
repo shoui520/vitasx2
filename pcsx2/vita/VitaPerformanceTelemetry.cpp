@@ -860,6 +860,23 @@ namespace VitaPerformanceTelemetry
 			static_cast<u32>(now - start_us);
 	}
 
+	u32 BeginExactEeCompileSubstageMeasurement()
+	{
+		return ReadProcessTimeLow();
+	}
+
+	void EndExactEeCompileSubstageMeasurement(
+		EeCompileSubstage stage, u32 start_us)
+	{
+		const size_t index = static_cast<size_t>(stage);
+		if (index >= EE_COMPILE_SUBSTAGE_COUNT)
+			return;
+		const u32 now = ReadProcessTimeLow();
+		s_cpu_stage_profiler.totals.ee_compile_substage_observations[index]++;
+		s_cpu_stage_profiler.totals.ee_compile_substage_time_us[index] +=
+			static_cast<u32>(now - start_us);
+	}
+
 	u32 BeginExactIopCompileMeasurement()
 	{
 		return ReadProcessTimeLow();

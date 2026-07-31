@@ -256,6 +256,10 @@ namespace VitaEE
 		// counter-free block.
 		static constexpr u32 HOT_REGION_ENTRY_PROMOTION_THRESHOLD = 256;
 		static constexpr size_t MAX_INCOMING_LINKS = MAX_CACHE_CAPACITY * DIRECT_LINK_SLOT_COUNT;
+		static constexpr u32 INCOMING_LINK_BUCKET_COUNT = 0x4000;
+		static constexpr u32 INVALID_INCOMING_LINK_INDEX = UINT32_MAX;
+		static_assert((INCOMING_LINK_BUCKET_COUNT &
+			(INCOMING_LINK_BUCKET_COUNT - 1)) == 0);
 		static constexpr u32 LOOKUP_DIRECTORY_ENTRY_COUNT = 0x10000;
 		static constexpr u32 LOOKUP_PAGE_ENTRY_COUNT = 0x4000;
 		static constexpr u32 INVALID_RAM_SOURCE = UINT32_MAX;
@@ -306,6 +310,10 @@ namespace VitaEE
 			CompatibleVtlbFastEntryOffsets compatible_vtlb_fast_entries{};
 			u8 compatible_link_entry_loads = 0;
 			DirectLinkSlots direct_links{};
+			std::array<u32, DIRECT_LINK_SLOT_COUNT>
+				incoming_link_record_indices{
+					INVALID_INCOMING_LINK_INDEX,
+					INVALID_INCOMING_LINK_INDEX};
 			DirectContinuationKind direct_continuation_kind =
 				DirectContinuationKind::SchedulerTestedTail;
 			// 0=cold candidate, 1=promotion refused,
@@ -349,13 +357,15 @@ namespace VitaEE
 			// of charging each of the 65,536 bounded records four bytes of A32
 			// padding.
 			u32 target_pc_and_slot = 0;
+			u32 next_index = INVALID_INCOMING_LINK_INDEX;
 
 			IncomingLinkRecord() = default;
 			IncomingLinkRecord(CachedBlock* source_, u32 target_pc_,
-				u8 slot_index_)
+				u8 slot_index_, u32 next_index_)
 				: source(source_)
 				, target_pc_and_slot(
 					(target_pc_ & ~u32{3}) | (slot_index_ & u8{3}))
+				, next_index(next_index_)
 			{
 			}
 			u32 TargetPc() const { return target_pc_and_slot & ~u32{3}; }
@@ -371,7 +381,7 @@ namespace VitaEE
 			u32 start_pc = 0;
 		};
 #if UINTPTR_MAX == UINT32_MAX
-		static_assert(sizeof(IncomingLinkRecord) == 8);
+		static_assert(sizeof(IncomingLinkRecord) == 12);
 		static_assert(sizeof(BlockRecord) == 8);
 #endif
 
@@ -419,7 +429,8 @@ namespace VitaEE
 		CachedBlock* TakeFreeCacheEntry();
 		void InvalidateCachedBlock(CachedBlock& block);
 		DirectLinkSlot* GetRecordedDirectLink(IncomingLinkRecord& record);
-		s32 LastIncomingLinkIndex(u32 target_pc) const;
+		static u32 IncomingLinkBucketIndex(u32 target_pc);
+		bool RemoveIncomingLinkRecord(u32 record_index);
 		void ClearIncomingLinks();
 		void RegisterIncomingLinks(CachedBlock& block);
 		void UnregisterIncomingLinks(CachedBlock& block);
@@ -485,6 +496,10 @@ namespace VitaEE
 		CachedBlock* m_free_cache_head = nullptr;
 		std::vector<BlockRecord> m_block_records;
 		std::vector<IncomingLinkRecord> m_incoming_links;
+		std::array<u32, INCOMING_LINK_BUCKET_COUNT>
+			m_incoming_link_bucket_heads{};
+		u32 m_incoming_link_free_head = INVALID_INCOMING_LINK_INDEX;
+		u32 m_incoming_link_count = 0;
 		std::array<std::vector<RamSourceRecord>, RAM_SOURCE_PAGE_COUNT>
 			m_ram_source_pages;
 		std::array<u32, RAM_SOURCE_PAGE_COUNT> m_ram_source_page_live_counts{};

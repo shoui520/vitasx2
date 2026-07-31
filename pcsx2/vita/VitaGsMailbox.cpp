@@ -1641,6 +1641,30 @@ namespace MTGS
 				static_cast<unsigned long long>(ee_compile_observations ?
 					(ee_compile_time_us * 1000u) /
 						ee_compile_observations : 0));
+			constexpr std::array<const char*,
+				VitaPerformanceTelemetry::EE_COMPILE_SUBSTAGE_COUNT>
+				ee_compile_substage_names{
+					"discovery", "source_snapshot", "emission",
+					"publication", "retirement", "registration",
+					"diagnostics", "linking"};
+			for (size_t i = 0; i < ee_compile_substage_names.size(); i++)
+			{
+				const u64 observations = CounterDelta(
+					end.cpu_stage_profiler.ee_compile_substage_observations[i],
+					start.cpu_stage_profiler.ee_compile_substage_observations[i]);
+				const u64 time_us = CounterDelta(
+					end.cpu_stage_profiler.ee_compile_substage_time_us[i],
+					start.cpu_stage_profiler.ee_compile_substage_time_us[i]);
+				output.WriteLn(
+					"Vita perf v=1 window=%llu kind=ee_compile_substage "
+					"stage=%s observations=%llu time_us=%llu average_ns=%llu",
+					static_cast<unsigned long long>(window),
+					ee_compile_substage_names[i],
+					static_cast<unsigned long long>(observations),
+					static_cast<unsigned long long>(time_us),
+					static_cast<unsigned long long>(observations ?
+						(time_us * 1000u) / observations : 0));
+			}
 			const u64 iop_compile_observations = CounterDelta(
 				end.cpu_stage_profiler.iop_compile_observations,
 				start.cpu_stage_profiler.iop_compile_observations);

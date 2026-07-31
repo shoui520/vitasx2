@@ -315,6 +315,7 @@ namespace VitaEE
 		m_cache.reserve(MAX_CACHE_CAPACITY);
 		m_block_records.reserve(MAX_CACHE_CAPACITY);
 		m_incoming_links.reserve(MAX_INCOMING_LINKS);
+		m_incoming_link_bucket_heads.fill(INVALID_INCOMING_LINK_INDEX);
 	}
 
 	BlockExecutor::~BlockExecutor()
@@ -967,6 +968,8 @@ namespace VitaEE
 		block.compatible_vtlb_fast_entries = {};
 		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
+		block.incoming_link_record_indices.fill(
+			INVALID_INCOMING_LINK_INDEX);
 		block.poll_call_wait_loop_source_proof = {};
 		block.two_predicate_wait_loop_source_proof = {};
 		block.ram_source_fragments = {};
@@ -998,101 +1001,95 @@ namespace VitaEE
 		return &link;
 	}
 
-	s32 BlockExecutor::LastIncomingLinkIndex(u32 target_pc) const
+	u32 BlockExecutor::IncomingLinkBucketIndex(u32 target_pc)
 	{
-		if (m_incoming_links.empty())
-			return -1;
+		// Word-aligned EE PCs have weak low-bit entropy. A multiplicative hash
+		// spreads adjacent and regularly-strided branch targets across the fixed
+		// table without a division on Cortex-A9.
+		return (((target_pc >> 2) * 2654435761u) >> 18) &
+			(INCOMING_LINK_BUCKET_COUNT - 1);
+	}
 
-		s32 min = 0;
-		s32 max = static_cast<s32>(m_incoming_links.size() - 1);
-		while (min != max)
+	bool BlockExecutor::RemoveIncomingLinkRecord(u32 record_index)
+	{
+		if (record_index >= m_incoming_links.size())
+			return false;
+		IncomingLinkRecord& removed = m_incoming_links[record_index];
+		if (!removed.source)
+			return false;
+
+		u32* cursor = &m_incoming_link_bucket_heads[
+			IncomingLinkBucketIndex(removed.TargetPc())];
+		while (*cursor != INVALID_INCOMING_LINK_INDEX)
 		{
-			const s32 mid = (min + max + 1) >> 1;
-			if (m_incoming_links[mid].TargetPc() > target_pc)
-				max = mid - 1;
-			else
-				min = mid;
+			if (*cursor == record_index)
+			{
+				*cursor = removed.next_index;
+				removed.source = nullptr;
+				removed.target_pc_and_slot = 0;
+				removed.next_index = m_incoming_link_free_head;
+				m_incoming_link_free_head = record_index;
+				m_incoming_link_count--;
+				return true;
+			}
+			cursor = &m_incoming_links[*cursor].next_index;
 		}
-
-		return min;
+		return false;
 	}
 
 	void BlockExecutor::ClearIncomingLinks()
 	{
 		m_incoming_links.clear();
+		m_incoming_link_bucket_heads.fill(INVALID_INCOMING_LINK_INDEX);
+		m_incoming_link_free_head = INVALID_INCOMING_LINK_INDEX;
+		m_incoming_link_count = 0;
 	}
 
 	void BlockExecutor::RegisterIncomingLinks(CachedBlock& block)
 	{
-		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Link(). The x86
-		// provider stores target-PC -> patch-site records so New()/Remove()
-		// only touch incoming edges for the affected block. Keep Vita's vector
-		// sorted by target PC so the common patch/unlink path does the same.
-		//
-		// CompileIntoCacheEntry() invalidates a reused entry before rebuilding it,
-		// which already unregisters all of its old records. Registration is only
-		// called after that rebuild succeeds, so another whole-vector removal scan
-		// here made every cold compile progressively more expensive. Gather the
-		// block's bounded two edges and merge them into the sorted table in one
-		// backwards pass instead of shifting the table once per edge.
-		std::array<IncomingLinkRecord, DIRECT_LINK_SLOT_COUNT> pending;
-		size_t pending_count = 0;
+		// PCSX2 owner: x86/BaseblockEx.cpp::BaseBlocks::Link(). Preserve its
+		// target-PC -> patch-site ownership, but do not copy a process-wide sorted
+		// vector for every cold block. Each of the block's bounded two edges is
+		// inserted into a fixed hash bucket and carries its reusable record index.
+		block.incoming_link_record_indices.fill(
+			INVALID_INCOMING_LINK_INDEX);
 		for (u8 i = 0; i < DIRECT_LINK_SLOT_COUNT; i++)
 		{
 			const DirectLinkSlot& link = block.direct_links.slots[i];
 			if (!link.valid || (link.target_pc & u32{3}) != 0)
 				continue;
-			if (m_incoming_links.size() + pending_count >= MAX_INCOMING_LINKS)
+			if (m_incoming_link_count >= MAX_INCOMING_LINKS)
 				break;
-			pending[pending_count++] = {&block, link.target_pc, i};
-		}
 
-		if (pending_count == 0)
-			return;
-		if (pending_count == 2 &&
-			pending[1].TargetPc() < pending[0].TargetPc())
-		{
-			std::swap(pending[0], pending[1]);
-		}
-
-		const size_t old_size = m_incoming_links.size();
-		size_t old_index = old_size;
-		size_t pending_index = pending_count;
-		size_t write_index = old_size + pending_count;
-		m_incoming_links.resize(write_index);
-
-		while (old_index != 0 && pending_index != 0)
-		{
-			if (m_incoming_links[old_index - 1].TargetPc() >
-				pending[pending_index - 1].TargetPc())
+			const u32 bucket = IncomingLinkBucketIndex(link.target_pc);
+			u32 record_index = m_incoming_link_free_head;
+			if (record_index != INVALID_INCOMING_LINK_INDEX)
 			{
-				m_incoming_links[--write_index] =
-					m_incoming_links[--old_index];
+				m_incoming_link_free_head =
+					m_incoming_links[record_index].next_index;
+				m_incoming_links[record_index] = {&block, link.target_pc, i,
+					m_incoming_link_bucket_heads[bucket]};
 			}
 			else
 			{
-				m_incoming_links[--write_index] =
-					pending[--pending_index];
+				record_index = static_cast<u32>(m_incoming_links.size());
+				m_incoming_links.emplace_back(&block, link.target_pc, i,
+					m_incoming_link_bucket_heads[bucket]);
 			}
+			m_incoming_link_bucket_heads[bucket] = record_index;
+			block.incoming_link_record_indices[i] = record_index;
+			m_incoming_link_count++;
 		}
-		while (pending_index != 0)
-			m_incoming_links[--write_index] = pending[--pending_index];
 	}
 
 	void BlockExecutor::UnregisterIncomingLinks(CachedBlock& block)
 	{
-		u32 write_index = 0;
-		for (u32 read_index = 0; read_index < m_incoming_links.size(); read_index++)
+		for (u32& record_index : block.incoming_link_record_indices)
 		{
-			if (m_incoming_links[read_index].source == &block)
-				continue;
-
-			if (write_index != read_index)
-				m_incoming_links[write_index] = m_incoming_links[read_index];
-			write_index++;
+			if (record_index != INVALID_INCOMING_LINK_INDEX)
+				RemoveIncomingLinkRecord(record_index);
+			record_index = INVALID_INCOMING_LINK_INDEX;
 		}
-
-		m_incoming_links.resize(write_index);
 	}
 
 	u32 BlockExecutor::Shutdown()
@@ -1139,6 +1136,8 @@ namespace VitaEE
 			block.compatible_vtlb_fast_entries = {};
 			block.compatible_link_entry_loads = 0;
 			block.direct_links = {};
+			block.incoming_link_record_indices.fill(
+				INVALID_INCOMING_LINK_INDEX);
 			block.direct_continuation_kind =
 				DirectContinuationKind::SchedulerTestedTail;
 			block.hot_region_entry_count = 0;
@@ -3288,6 +3287,9 @@ namespace VitaEE
 		// this now-live metadata object out of the reusable list.
 		if (hot_region)
 			RemoveFreeCacheEntry(block);
+		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
+			source_profile(
+				VitaPerformanceTelemetry::EeCompileSubstage::SourceSnapshot);
 		std::unique_ptr<u32[]> source_opcodes(
 			new (std::nothrow) u32[dependency_instruction_count]);
 		if (!source_opcodes)
@@ -3304,6 +3306,7 @@ namespace VitaEE
 				return false;
 			}
 		}
+		source_profile.Finish();
 
 		bool instrument_hot_region_entry =
 			allow_hot_region_counter && !hot_region &&
@@ -3452,6 +3455,9 @@ namespace VitaEE
 				size_t attempt_hot_region_counter_offset =
 					static_cast<size_t>(-1);
 				u8 attempt_hot_region_counter_instruction_count = 0;
+				VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
+					emission_profile(
+						VitaPerformanceTelemetry::EeCompileSubstage::Emission);
 				const bool compiled = compiler.CompileStraightLineBlock(start_pc,
 					candidate_instruction_count, direct_exit, event_exit,
 					&attempt_scaled_cycles, &attempt_direct_links,
@@ -3482,6 +3488,7 @@ namespace VitaEE
 						HOT_REGION_ENTRY_PROMOTION_THRESHOLD : 0,
 					&attempt_hot_region_counter_offset,
 					&attempt_hot_region_counter_instruction_count);
+				emission_profile.Finish();
 				u32 calculated_prefix_cycles = 0;
 				const bool cycle_contract_matches =
 					candidate_instruction_count == instruction_count ||
@@ -3494,8 +3501,15 @@ namespace VitaEE
 					 attempt_direct_continuation_kind !=
 						 DirectContinuationKind::HotRegionInternalStaticBranch) ||
 					attempt_scheduler_test_elided_continuation_emitted;
-				const bool flushed = compiled && cycle_contract_matches &&
-					continuation_contract_matches && block.code.Flush();
+				bool flushed = false;
+				if (compiled && cycle_contract_matches &&
+					continuation_contract_matches)
+				{
+					const VitaPerformanceTelemetry::
+						ScopedExactEeCompileSubstageMeasurement publication_profile(
+							VitaPerformanceTelemetry::EeCompileSubstage::Publication);
+					flushed = block.code.Flush();
+				}
 				const bool out_of_block_space = !flushed && block.code.OutOfSpace();
 				const size_t failure_code_size = block.code.Size();
 				const size_t failure_code_capacity = block.code.Capacity();
@@ -3668,6 +3682,9 @@ namespace VitaEE
 			block.hot_region_state = 2;
 		block.discovered_topology = discovered_topology;
 
+		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
+			retirement_profile(
+				VitaPerformanceTelemetry::EeCompileSubstage::Retirement);
 		RetireStaleOverlappingBlocks(start_pc, compiled_instruction_count,
 			discovered_topology);
 
@@ -3803,6 +3820,11 @@ namespace VitaEE
 				}
 			}
 		}
+		retirement_profile.Finish();
+
+		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
+			registration_profile(
+				VitaPerformanceTelemetry::EeCompileSubstage::Registration);
 		block.opcodes = std::move(source_opcodes);
 		if (!CaptureRamSourceFragments(block))
 		{
@@ -3832,8 +3854,12 @@ namespace VitaEE
 		// only PCSX2-discovered BaseBlocks publish generated dispatch entries.
 		RegisterBlockLookup(block);
 		RegisterIncomingLinks(block);
+		registration_profile.Finish();
 
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
+		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
+			diagnostics_profile(
+				VitaPerformanceTelemetry::EeCompileSubstage::Diagnostics);
 		if (VitaPerformanceTelemetry::IsEnabled())
 		{
 			const VitaA32::CodeBuffer::GeneratedCodeStats generated =
@@ -3857,8 +3883,12 @@ namespace VitaEE
 				compiled_vu0_vf_cache_hits,
 				compiled_vu0_vf_cache_flushes);
 		}
+		diagnostics_profile.Finish();
 #endif
 
+		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
+			linking_profile(
+				VitaPerformanceTelemetry::EeCompileSubstage::Linking);
 		if (m_direct_linking_enabled)
 		{
 			PatchIncomingLinks(block);
@@ -3872,6 +3902,7 @@ namespace VitaEE
 				}
 			}
 		}
+		linking_profile.Finish();
 
 		if (scaled_cycles)
 			*scaled_cycles = compiled_scaled_cycles;
@@ -4074,12 +4105,13 @@ namespace VitaEE
 		if (!m_direct_linking_enabled || !target.valid)
 			return;
 
-		s32 index = LastIncomingLinkIndex(target.start_pc);
-		while (index >= 0 &&
-			m_incoming_links[index].TargetPc() == target.start_pc)
+		u32 index = m_incoming_link_bucket_heads[
+			IncomingLinkBucketIndex(target.start_pc)];
+		while (index != INVALID_INCOMING_LINK_INDEX)
 		{
-			IncomingLinkRecord& record = m_incoming_links[index--];
-			if (record.source &&
+			IncomingLinkRecord& record = m_incoming_links[index];
+			index = record.next_index;
+			if (record.source && record.TargetPc() == target.start_pc &&
 				record.source->discovered_topology == target.discovered_topology)
 			{
 				if (DirectLinkSlot* link = GetRecordedDirectLink(record))
@@ -4097,17 +4129,22 @@ namespace VitaEE
 			for (u32 i = 0; i < m_incoming_links.size(); i++)
 			{
 				IncomingLinkRecord& record = m_incoming_links[i];
+				if (!record.source)
+					continue;
 				if (DirectLinkSlot* link = GetRecordedDirectLink(record))
 					unlinked &= PatchDirectLink(*record.source, *link, nullptr);
 			}
 			return unlinked;
 		}
 
-		s32 index = LastIncomingLinkIndex(target_pc);
-		while (index >= 0 &&
-			m_incoming_links[index].TargetPc() == target_pc)
+		u32 index = m_incoming_link_bucket_heads[
+			IncomingLinkBucketIndex(target_pc)];
+		while (index != INVALID_INCOMING_LINK_INDEX)
 		{
-			IncomingLinkRecord& record = m_incoming_links[index--];
+			IncomingLinkRecord& record = m_incoming_links[index];
+			index = record.next_index;
+			if (!record.source || record.TargetPc() != target_pc)
+				continue;
 			if (discovered_topology && (!record.source ||
 				record.source->discovered_topology != *discovered_topology))
 			{
@@ -4124,6 +4161,8 @@ namespace VitaEE
 		for (u32 i = 0; i < m_incoming_links.size(); i++)
 		{
 			IncomingLinkRecord& record = m_incoming_links[i];
+			if (!record.source)
+				continue;
 			DirectLinkSlot* link = GetRecordedDirectLink(record);
 			if (!link)
 				continue;
@@ -4167,7 +4206,7 @@ namespace VitaEE
 		result->scaled_cycles = block.scaled_cycles;
 		result->code_size = block.code.Size();
 		result->block_records = static_cast<u32>(m_block_records.size());
-		result->link_records = static_cast<u32>(m_incoming_links.size());
+		result->link_records = m_incoming_link_count;
 		result->cache_slots = static_cast<u32>(m_cache.size());
 		result->code_cache_resets = m_code_cache_resets;
 		result->code_cache_used = m_code_cache_used;
@@ -4296,7 +4335,7 @@ namespace VitaEE
 			result->scaled_cycles = entry->scaled_cycles;
 			result->code_size = entry->code.Size();
 			result->block_records = static_cast<u32>(m_block_records.size());
-			result->link_records = static_cast<u32>(m_incoming_links.size());
+			result->link_records = m_incoming_link_count;
 			result->cache_slots = static_cast<u32>(m_cache.size());
 			result->code_cache_resets = m_code_cache_resets;
 			result->code_cache_used = m_code_cache_used;
@@ -4393,6 +4432,9 @@ namespace VitaEE
 		const VitaPerformanceTelemetry::ScopedExactEeCompileMeasurement
 			exact_compile_profile;
 		BlockScanResult scan;
+		VitaPerformanceTelemetry::ScopedExactEeCompileSubstageMeasurement
+			discovery_profile(
+				VitaPerformanceTelemetry::EeCompileSubstage::Discovery);
 		if (!ScanStraightLineBlock(start_pc, MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS, &scan) ||
 			scan.instruction_count == 0)
 		{
@@ -4450,6 +4492,8 @@ namespace VitaEE
 				}
 			}
 		}
+
+		discovery_profile.Finish();
 
 		// A continuation created by the A32 code budget inherits the original
 		// source span from its immediately adjacent predecessor.  All later split
