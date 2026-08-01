@@ -1995,6 +1995,7 @@ namespace VitaEE::RegionIR
 		auto exit_before_memory = [&](const Block& block, const Node& node,
 									  u32 address, ExitReason reason) {
 			u32 pending_raw_cycles = 0;
+			u32 source_instructions_executed = 0;
 			for (const SourceInstruction& source : block.source)
 			{
 				if (source.pc == node.source_pc)
@@ -2002,7 +2003,10 @@ namespace VitaEE::RegionIR
 				pending_raw_cycles +=
 					R5900::GetInstruction(source.opcode).cycles *
 					program.options.cycle_factor;
+				source_instructions_executed++;
 			}
+			result.source_instructions_executed +=
+				source_instructions_executed;
 			current.gpr[0] = {};
 			current.pc = node.source_pc;
 			*output = current;
@@ -2258,6 +2262,15 @@ namespace VitaEE::RegionIR
 			{
 				transfer = &block.terminator.not_taken;
 			}
+			u32 block_source_instructions =
+				static_cast<u32>(block.source.size());
+			if (block.terminator.kind == TerminatorKind::Branch &&
+				block.terminator.likely &&
+				transfer == &block.terminator.not_taken)
+			{
+				block_source_instructions--;
+			}
+			result.source_instructions_executed += block_source_instructions;
 			const RuntimeValue outgoing_memory_effect =
 				values[transfer->state.memory_effect];
 			current = materialize(*transfer);

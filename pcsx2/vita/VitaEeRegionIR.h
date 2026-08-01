@@ -317,6 +317,9 @@ namespace VitaEE::RegionIR
 		bool completed = false;
 		ExitReason reason = ExitReason::RegionBoundary;
 		u32 blocks_executed = 0;
+		// Dynamic guest instructions whose complete architectural effects were
+		// committed. An observer instruction at a side exit is not included.
+		u32 source_instructions_executed = 0;
 		// When execution stops before a memory observer, canonical cycle remains
 		// at the original PCSX2 block entry. This is the exact fixed-point opcode
 		// cost already executed in that block. A product continuation must append
