@@ -56,6 +56,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <malloc.h>
 #include <memory>
 #include <new>
@@ -93,12 +94,15 @@ namespace
 		"ux0:data/vitasx2/vitasx2.launch-request";
 	constexpr const char* PRODUCT_LAUNCH_RECEIPT_PATH =
 		"ux0:data/vitasx2/vitasx2.launch-receipt";
+	constexpr const char* PRODUCT_SELF_PATH = "ux0:app/VSX200001/eboot.bin";
 	constexpr const char* PRODUCT_INITIALIZED_PATH =
 		"ux0:data/vitasx2/vitasx2.initialized";
 	constexpr const char* PRODUCT_FAILED_PATH = "ux0:data/vitasx2/vitasx2.failed";
 	constexpr const char* WORKLOAD_ACTIVE_PATH =
 		"ux0:data/vitasx2/workloads/active.txt";
 	constexpr const char* WORKLOAD_ROOT = "ux0:data/vitasx2/workloads";
+	constexpr u32 WORKLOAD_MANIFEST_VERSION = 3;
+	constexpr size_t WORKLOAD_MANIFEST_MAX_BYTES = 2048;
 
 	constexpr const char* VALIDATION_DIR = "ux0:data/vitasx2/product-validation";
 	constexpr const char* VALIDATION_BIOS_DIR =
@@ -147,6 +151,12 @@ namespace
 
 	struct WorkloadReplaySelection
 	{
+		struct FileIdentity
+		{
+			u64 bytes = 0;
+			std::string sha256;
+		};
+
 		bool enabled = false;
 		std::string slug;
 		std::string manifest_path;
@@ -159,6 +169,11 @@ namespace
 		std::string card1_input_path;
 		std::string card2_input_path;
 		std::string private_card_dir;
+		FileIdentity disc_identity;
+		FileIdentity state_identity;
+		FileIdentity card1_identity;
+		FileIdentity card2_identity;
+		bool disc_attestation_cached = false;
 		bool card1_provisioned = false;
 		bool card2_provisioned = false;
 	};
@@ -175,8 +190,17 @@ namespace
 		hex[SHA256_DIGEST_SIZE * 2] = '\0';
 	}
 
-	bool VerifyConfiguredBiosAsset(const char* label, const std::string& path,
-		const u64 expected_size, const char* expected_sha256, Error* error)
+	bool SameDateTime(const SceDateTime& left, const SceDateTime& right)
+	{
+		return left.year == right.year && left.month == right.month &&
+			left.day == right.day && left.hour == right.hour &&
+			left.minute == right.minute && left.second == right.second &&
+			left.microsecond == right.microsecond;
+	}
+
+	bool VerifyFileIdentity(const char* label, const std::string& path,
+		const u64 expected_size, const char* expected_sha256, Error* error,
+		SceIoStat* verified_stat = nullptr)
 	{
 		const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
 		if (fd < 0)
@@ -187,20 +211,22 @@ namespace
 			return false;
 		}
 
-		const SceOff size = sceIoLseek(fd, 0, SCE_SEEK_END);
-		if (size < 0 || sceIoLseek(fd, 0, SCE_SEEK_SET) < 0)
+		SceIoStat opened_stat = {};
+		if (sceIoGetstatByFd(fd, &opened_stat) < 0 ||
+			!SCE_S_ISREG(opened_stat.st_mode) || opened_stat.st_size < 0)
 		{
 			sceIoClose(fd);
 			Error::SetStringFmt(error,
-				"Configured {} size/seek failed at '{}'.", label, path);
+				"Configured {} is not a readable regular file at '{}'.", label,
+				path);
 			return false;
 		}
-		if (static_cast<u64>(size) != expected_size)
+		if (static_cast<u64>(opened_stat.st_size) != expected_size)
 		{
 			sceIoClose(fd);
 			Error::SetStringFmt(error,
 				"Configured {} has {} bytes, expected {} at '{}'.", label,
-				static_cast<u64>(size), expected_size, path);
+				static_cast<u64>(opened_stat.st_size), expected_size, path);
 			return false;
 		}
 
@@ -213,6 +239,8 @@ namespace
 					"Configured {} close failed at '{}'.", label, path);
 				return false;
 			}
+			if (verified_stat)
+				*verified_stat = opened_stat;
 			return true;
 		}
 
@@ -247,22 +275,32 @@ namespace
 			completed += static_cast<u64>(read);
 		}
 
+		SceIoStat completed_stat = {};
+		const int completed_stat_result = sceIoGetstatByFd(fd, &completed_stat);
 		const int close_result = sceIoClose(fd);
 		std::array<Byte, SHA256_DIGEST_SIZE> digest = {};
 		Sha256_Final(&sha, digest.data());
 		char actual_sha256[SHA256_DIGEST_SIZE * 2 + 1];
 		DigestToHex(digest, actual_sha256);
-		if (close_result < 0 || std::strcmp(actual_sha256, expected_sha256) != 0)
+		const bool stable = completed_stat_result >= 0 &&
+			completed_stat.st_mode == opened_stat.st_mode &&
+			completed_stat.st_size == opened_stat.st_size &&
+			SameDateTime(completed_stat.st_ctime, opened_stat.st_ctime) &&
+			SameDateTime(completed_stat.st_mtime, opened_stat.st_mtime);
+		if (close_result < 0 || !stable ||
+			std::strcmp(actual_sha256, expected_sha256) != 0)
 		{
 			Error::SetStringFmt(error,
-				"Configured {} SHA-256 mismatch: expected {}, got {} at '{}'.",
+				"Configured {} changed while hashing or has a SHA-256 mismatch: expected {}, got {} at '{}'.",
 				label, expected_sha256, actual_sha256, path);
 			return false;
 		}
 
-		Console.WriteLn("VitaSX2 BIOS asset authenticated: %s bytes=%llu sha256=%s path=%s.",
+		Console.WriteLn("VitaSX2 file authenticated: %s bytes=%llu sha256=%s path=%s.",
 			label, static_cast<unsigned long long>(expected_size), actual_sha256,
 			path.c_str());
+		if (verified_stat)
+			*verified_stat = completed_stat;
 		return true;
 	}
 
@@ -275,16 +313,47 @@ namespace
 			// The primary image is immutable product code input. Authenticate it for
 			// every boot so PCSX2's FindBiosImage() fallback can never substitute a
 			// different console while the frontend receipts the requested basename.
-			VerifyConfiguredBiosAsset("BIOS", bios_path, BIOS_BYTES,
+			VerifyFileIdentity("BIOS", bios_path, BIOS_BYTES,
 				BIOS_SHA256, error) &&
 			// NVM is intentionally persistent during ordinary product use. A loaded
 			// workload, however, must begin with the same guest-visible seed as its
 			// PCSX2 capture; fail closed if either companion has changed.
-			VerifyConfiguredBiosAsset("BIOS NVM", nvm_path, BIOS_NVM_BYTES,
+			VerifyFileIdentity("BIOS NVM", nvm_path, BIOS_NVM_BYTES,
 				exact_sidecars ? BIOS_NVM_SHA256 : nullptr, error) &&
-			VerifyConfiguredBiosAsset("BIOS MEC", mec_path, BIOS_MEC_BYTES,
+			VerifyFileIdentity("BIOS MEC", mec_path, BIOS_MEC_BYTES,
 				exact_sidecars ? BIOS_MEC_SHA256 : nullptr, error);
 	}
+
+	bool IsLowerHexSha256(std::string_view value)
+	{
+		if (value.size() != SHA256_DIGEST_SIZE * 2)
+			return false;
+		return std::all_of(value.begin(), value.end(), [](const char ch) {
+			return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+		});
+	}
+
+	bool ParsePositiveU64(std::string_view value, u64* result)
+	{
+		if (value.empty())
+			return false;
+		u64 parsed = 0;
+		for (const char ch : value)
+		{
+			if (ch < '0' || ch > '9')
+				return false;
+			const u64 digit = static_cast<u64>(ch - '0');
+			if (parsed > (std::numeric_limits<u64>::max() - digit) / 10)
+				return false;
+			parsed = parsed * 10 + digit;
+		}
+		if (parsed == 0)
+			return false;
+		*result = parsed;
+		return true;
+	}
+
+	bool PublishStatus(const char* path, std::string_view contents);
 
 	bool ReadBoundedWorkloadText(const char* path, size_t maximum_size,
 		std::string* contents, Error* error)
@@ -355,6 +424,101 @@ namespace
 		return true;
 	}
 
+	bool BuildDiscAttestationRecord(const std::string& basename,
+		const WorkloadReplaySelection::FileIdentity& identity,
+		const SceIoStat& stat, std::string* record, Error* error)
+	{
+		char buffer[1024];
+		const int length = std::snprintf(buffer, sizeof(buffer),
+			"[VitaSX2DiscAttestationV1]\nDiscBasename=%s\nBytes=%llu\n"
+			"SHA256=%s\nCTime=%u,%u,%u,%u,%u,%u,%u\n"
+			"MTime=%u,%u,%u,%u,%u,%u,%u\n",
+			basename.c_str(), static_cast<unsigned long long>(identity.bytes),
+			identity.sha256.c_str(), stat.st_ctime.year, stat.st_ctime.month,
+			stat.st_ctime.day, stat.st_ctime.hour, stat.st_ctime.minute,
+			stat.st_ctime.second, stat.st_ctime.microsecond, stat.st_mtime.year,
+			stat.st_mtime.month, stat.st_mtime.day, stat.st_mtime.hour,
+			stat.st_mtime.minute, stat.st_mtime.second,
+			stat.st_mtime.microsecond);
+		if (length <= 0 || static_cast<size_t>(length) >= sizeof(buffer))
+		{
+			Error::SetString(error,
+				"Workload disc attestation record exceeded its fixed bound.");
+			return false;
+		}
+		record->assign(buffer, static_cast<size_t>(length));
+		return true;
+	}
+
+	bool VerifyWorkloadDiscIdentity(const std::string& slug,
+		const std::string& basename, const std::string& path,
+		const WorkloadReplaySelection::FileIdentity& identity,
+		bool* used_cache, Error* error)
+	{
+		*used_cache = false;
+		SceIoStat stat = {};
+		if (sceIoGetstat(path.c_str(), &stat) < 0 ||
+			!SCE_S_ISREG(stat.st_mode) || stat.st_size < 0 ||
+			static_cast<u64>(stat.st_size) != identity.bytes)
+		{
+			Error::SetStringFmt(error,
+				"Workload disc '{}' is not the expected regular {}-byte file.",
+				path, identity.bytes);
+			return false;
+		}
+
+		const std::string runtime_dir =
+			std::string(WORKLOAD_ROOT) + "/" + slug + "/runtime";
+		const std::string cache_path =
+			runtime_dir + "/disc-attestation-v1.txt";
+		std::string expected_record;
+		if (!BuildDiscAttestationRecord(basename, identity, stat,
+				&expected_record, error))
+		{
+			return false;
+		}
+
+		if (FileSystem::FileExists(cache_path.c_str()))
+		{
+			Error cache_error;
+			std::string cached_record;
+			if (ReadBoundedWorkloadText(cache_path.c_str(), 1023,
+					&cached_record, &cache_error) &&
+				cached_record == expected_record)
+			{
+				*used_cache = true;
+				Console.WriteLn(
+					"VitaSX2 workload disc attestation cache hit: bytes=%llu sha256=%s path=%s.",
+					static_cast<unsigned long long>(identity.bytes),
+					identity.sha256.c_str(), path.c_str());
+				return true;
+			}
+			Console.Warning(
+				"VitaSX2 workload disc attestation cache is stale; rehashing %s.",
+				path.c_str());
+		}
+
+		SceIoStat verified_stat = {};
+		if (!VerifyFileIdentity("workload disc", path, identity.bytes,
+				identity.sha256.c_str(), error, &verified_stat))
+		{
+			return false;
+		}
+		if (!BuildDiscAttestationRecord(basename, identity, verified_stat,
+				&expected_record, error) ||
+			!FileSystem::EnsureDirectoryExists(runtime_dir.c_str(), true, error) ||
+			!PublishStatus(cache_path.c_str(), expected_record))
+		{
+			if (!error->IsValid())
+			{
+				Error::SetString(error,
+					"Failed to publish the workload disc attestation cache.");
+			}
+			return false;
+		}
+		return true;
+	}
+
 	bool ReadOptionalWorkloadReplay(WorkloadReplaySelection* selection,
 		Error* error)
 	{
@@ -389,7 +553,8 @@ namespace
 			std::string(WORKLOAD_ROOT) + "/" + slug + "/input";
 		const std::string manifest_path = input_dir + "/workload.ini";
 		std::string manifest;
-		if (!ReadBoundedWorkloadText(manifest_path.c_str(), 1024,
+		if (!ReadBoundedWorkloadText(manifest_path.c_str(),
+				WORKLOAD_MANIFEST_MAX_BYTES,
 				&manifest, error))
 		{
 			return false;
@@ -413,7 +578,7 @@ namespace
 		manifest = std::move(normalized_manifest);
 		if (manifest.ends_with("\n"))
 			manifest.pop_back();
-		std::array<std::string_view, 5> lines;
+		std::array<std::string_view, 14> lines;
 		size_t line_begin = 0;
 		for (size_t i = 0; i < lines.size(); i++)
 		{
@@ -422,7 +587,7 @@ namespace
 				(i + 1 == lines.size() && line_end != std::string::npos))
 			{
 				Error::SetString(error,
-					"Workload manifest must contain exactly five ordered lines.");
+					"Workload manifest must contain exactly fourteen ordered lines.");
 				return false;
 			}
 			const size_t end = line_end == std::string::npos ?
@@ -436,23 +601,39 @@ namespace
 				"Workload manifest must begin with [Workload].");
 			return false;
 		}
-		constexpr std::string_view DISC_KEY = "DiscBasename=";
-		constexpr std::string_view STATE_KEY = "PortableState=";
-		constexpr std::string_view CARD1_KEY = "MemoryCard1=";
-		constexpr std::string_view CARD2_KEY = "MemoryCard2=";
-		if (!lines[1].starts_with(DISC_KEY) ||
-			!lines[2].starts_with(STATE_KEY) ||
-			!lines[3].starts_with(CARD1_KEY) ||
-			!lines[4].starts_with(CARD2_KEY))
+		constexpr std::array<std::string_view, 14> KEYS = {
+			"[Workload]",
+			"Version=",
+			"DiscBasename=",
+			"DiscBytes=",
+			"DiscSHA256=",
+			"PortableState=",
+			"PortableStateBytes=",
+			"PortableStateSHA256=",
+			"MemoryCard1=",
+			"MemoryCard1Bytes=",
+			"MemoryCard1SHA256=",
+			"MemoryCard2=",
+			"MemoryCard2Bytes=",
+			"MemoryCard2SHA256=",
+		};
+		bool keys_valid = lines[0] == KEYS[0];
+		for (size_t i = 1; keys_valid && i < KEYS.size(); i++)
+			keys_valid = lines[i].starts_with(KEYS[i]);
+		u64 manifest_version = 0;
+		if (!keys_valid ||
+			!ParsePositiveU64(lines[1].substr(KEYS[1].size()),
+				&manifest_version) ||
+			manifest_version != WORKLOAD_MANIFEST_VERSION)
 		{
 			Error::SetString(error,
-				"Workload manifest keys or ordering are invalid.");
+				"Workload manifest keys, version, or ordering are invalid.");
 			return false;
 		}
-		const std::string disc_basename(lines[1].substr(DISC_KEY.size()));
-		const std::string state_basename(lines[2].substr(STATE_KEY.size()));
-		const std::string card1_basename(lines[3].substr(CARD1_KEY.size()));
-		const std::string card2_basename(lines[4].substr(CARD2_KEY.size()));
+		const std::string disc_basename(lines[2].substr(KEYS[2].size()));
+		const std::string state_basename(lines[5].substr(KEYS[5].size()));
+		const std::string card1_basename(lines[8].substr(KEYS[8].size()));
+		const std::string card2_basename(lines[11].substr(KEYS[11].size()));
 		if (!IsWorkloadBasename(disc_basename) ||
 			!StringUtil::EndsWithNoCase(disc_basename, ".iso") ||
 			!IsWorkloadBasename(state_basename) ||
@@ -466,6 +647,34 @@ namespace
 		{
 			Error::SetString(error,
 				"Workload manifest must name one flat ISO, one PCSX2RAW state, and two distinct flat PS2 memory-card inputs.");
+			return false;
+		}
+		WorkloadReplaySelection::FileIdentity disc_identity;
+		WorkloadReplaySelection::FileIdentity state_identity;
+		WorkloadReplaySelection::FileIdentity card1_identity;
+		WorkloadReplaySelection::FileIdentity card2_identity;
+		const auto parse_identity = [&](const size_t bytes_index,
+			const size_t sha_index, const char* label,
+			WorkloadReplaySelection::FileIdentity* identity) {
+			const std::string_view bytes =
+				lines[bytes_index].substr(KEYS[bytes_index].size());
+			const std::string_view sha256 =
+				lines[sha_index].substr(KEYS[sha_index].size());
+			if (!ParsePositiveU64(bytes, &identity->bytes) ||
+				!IsLowerHexSha256(sha256))
+			{
+				Error::SetStringFmt(error,
+					"Workload manifest {} identity is malformed.", label);
+				return false;
+			}
+			identity->sha256.assign(sha256);
+			return true;
+		};
+		if (!parse_identity(3, 4, "disc", &disc_identity) ||
+			!parse_identity(6, 7, "portable state", &state_identity) ||
+			!parse_identity(9, 10, "memory card 1", &card1_identity) ||
+			!parse_identity(12, 13, "memory card 2", &card2_identity))
+		{
 			return false;
 		}
 
@@ -487,6 +696,18 @@ namespace
 				slug);
 			return false;
 		}
+		bool disc_attestation_cached = false;
+		if (!VerifyWorkloadDiscIdentity(slug, disc_basename, disc_path,
+				disc_identity, &disc_attestation_cached, error) ||
+			!VerifyFileIdentity("workload portable state", state_path,
+				state_identity.bytes, state_identity.sha256.c_str(), error) ||
+			!VerifyFileIdentity("workload memory card 1", card1_input_path,
+				card1_identity.bytes, card1_identity.sha256.c_str(), error) ||
+			!VerifyFileIdentity("workload memory card 2", card2_input_path,
+				card2_identity.bytes, card2_identity.sha256.c_str(), error))
+		{
+			return false;
+		}
 
 		selection->enabled = true;
 		selection->slug = std::move(slug);
@@ -499,6 +720,11 @@ namespace
 		selection->state_path = state_path;
 		selection->card1_input_path = card1_input_path;
 		selection->card2_input_path = card2_input_path;
+		selection->disc_identity = std::move(disc_identity);
+		selection->state_identity = std::move(state_identity);
+		selection->card1_identity = std::move(card1_identity);
+		selection->card2_identity = std::move(card2_identity);
+		selection->disc_attestation_cached = disc_attestation_cached;
 		selection->private_card_dir =
 			std::string(WORKLOAD_ROOT) + "/" + selection->slug +
 			"/runtime/memcards";
@@ -724,36 +950,60 @@ namespace
 
 	bool PublishHarnessLaunchReceipt(Error* error)
 	{
-		// tools/run_vita_target.sh writes one unpredictable 64-hex-byte request
-		// only after it has closed the foreground application and deployed the
-		// selected SELF. Reading it once at process startup and atomically echoing
-		// it back proves that this process began after that exact request. An
-		// already-running VitaSX2 instance never polls this file and therefore
-		// cannot satisfy a later harness invocation accidentally.
-		const SceUID fd = sceIoOpen(PRODUCT_LAUNCH_REQUEST_PATH, SCE_O_RDONLY, 0);
-		if (fd == PSP2_ERROR_ERRNO_ENOENT)
+		// The harness publishes this request only after closing the foreground
+		// application and freezing the exact SELF. Acknowledgement requires both
+		// the fresh nonce and a byte-for-byte SHA-256 match against the installed
+		// eboot.bin, so a truncated or same-size stale FTP replacement cannot be
+		// mistaken for the requested product build.
+		if (!FileSystem::FileExists(PRODUCT_LAUNCH_REQUEST_PATH))
 			return true;
-		if (fd < 0)
+		std::string request;
+		if (!ReadBoundedWorkloadText(PRODUCT_LAUNCH_REQUEST_PATH, 512,
+				&request, error))
 		{
-			Error::SetStringFmt(error, "Failed to open Vita launch request (error={:08x}).",
-				static_cast<u32>(fd));
 			return false;
 		}
-
-		char request[66] = {};
-		const SceSSize read = sceIoRead(fd, request, sizeof(request));
-		const bool closed = sceIoClose(fd) >= 0;
-		bool valid = read == 65 && request[64] == '\n';
-		for (u32 i = 0; valid && i < 64; i++)
-			valid = (request[i] >= '0' && request[i] <= '9') ||
-				(request[i] >= 'a' && request[i] <= 'f');
-		if (!closed || !valid)
+		if (!request.ends_with("\n") || request.find('\r') != std::string::npos ||
+			std::count(request.begin(), request.end(), '\n') != 4)
 		{
 			Error::SetString(error, "Malformed Vita harness launch request.");
 			return false;
 		}
+		request.pop_back();
+		std::array<std::string_view, 4> lines;
+		size_t line_begin = 0;
+		for (size_t i = 0; i < lines.size(); i++)
+		{
+			const size_t line_end = request.find('\n', line_begin);
+			const size_t end = line_end == std::string::npos ?
+				request.size() : line_end;
+			lines[i] = std::string_view(request).substr(line_begin, end - line_begin);
+			line_begin = end + 1;
+		}
+		constexpr std::string_view NONCE_KEY = "Nonce=";
+		constexpr std::string_view SELF_BYTES_KEY = "SelfBytes=";
+		constexpr std::string_view SELF_SHA256_KEY = "SelfSHA256=";
+		u64 self_bytes = 0;
+		if (lines[0] != "[VitaSX2LaunchV2]" ||
+			!lines[1].starts_with(NONCE_KEY) ||
+			!lines[2].starts_with(SELF_BYTES_KEY) ||
+			!lines[3].starts_with(SELF_SHA256_KEY) ||
+			!IsLowerHexSha256(lines[1].substr(NONCE_KEY.size())) ||
+			!ParsePositiveU64(lines[2].substr(SELF_BYTES_KEY.size()), &self_bytes) ||
+			!IsLowerHexSha256(lines[3].substr(SELF_SHA256_KEY.size())))
+		{
+			Error::SetString(error, "Malformed Vita harness launch request.");
+			return false;
+		}
+		const std::string self_sha256(lines[3].substr(SELF_SHA256_KEY.size()));
+		if (!VerifyFileIdentity("deployed SELF", PRODUCT_SELF_PATH, self_bytes,
+				self_sha256.c_str(), error))
+		{
+			return false;
+		}
+		request.push_back('\n');
 		if (!PublishStatus(PRODUCT_LAUNCH_RECEIPT_PATH,
-				std::string_view(request, static_cast<size_t>(read))))
+				request))
 		{
 			Error::SetString(error, "Failed to publish the Vita harness launch receipt.");
 			return false;
@@ -1745,7 +1995,13 @@ int main()
 			"providers=ee-a32,iop-a32,vu0-a32,vu1-a32\ncard0=%u\ncard1=%u\n"
 			"workload_replay=%u\nworkload_slug=%s\nworkload_manifest=%s\n"
 			"workload_disc=%s\nworkload_state=%s\nworkload_card1=%s\n"
-			"workload_card2=%s\nworkload_card1_provisioned=%u\n"
+			"workload_card2=%s\nworkload_manifest_version=%u\n"
+			"workload_disc_bytes=%llu\nworkload_disc_sha256=%s\n"
+			"workload_state_bytes=%llu\nworkload_state_sha256=%s\n"
+			"workload_card1_bytes=%llu\nworkload_card1_sha256=%s\n"
+			"workload_card2_bytes=%llu\nworkload_card2_sha256=%s\n"
+			"workload_disc_attestation_cached=%u\n"
+			"workload_card1_provisioned=%u\n"
 			"workload_card2_provisioned=%u\nworkload_frame=%u\nworkload_ee_pc=%08x\n"
 			"workload_iop_pc=%08x\n",
 			BiosPath.c_str(), BiosChecksum, BiosDescription.c_str(),
@@ -1761,6 +2017,16 @@ int main()
 			workload.enabled ? workload.state_basename.c_str() : "none",
 			workload.enabled ? workload.card1_basename.c_str() : "none",
 			workload.enabled ? workload.card2_basename.c_str() : "none",
+			workload.enabled ? WORKLOAD_MANIFEST_VERSION : 0u,
+			static_cast<unsigned long long>(workload.disc_identity.bytes),
+			workload.enabled ? workload.disc_identity.sha256.c_str() : "none",
+			static_cast<unsigned long long>(workload.state_identity.bytes),
+			workload.enabled ? workload.state_identity.sha256.c_str() : "none",
+			static_cast<unsigned long long>(workload.card1_identity.bytes),
+			workload.enabled ? workload.card1_identity.sha256.c_str() : "none",
+			static_cast<unsigned long long>(workload.card2_identity.bytes),
+			workload.enabled ? workload.card2_identity.sha256.c_str() : "none",
+			workload.enabled && workload.disc_attestation_cached ? 1u : 0u,
 			workload.enabled && workload.card1_provisioned ? 1u : 0u,
 			workload.enabled && workload.card2_provisioned ? 1u : 0u,
 			g_FrameCount, cpuRegs.pc, psxRegs.pc);
