@@ -208,6 +208,7 @@ namespace VitaEE::RegionIR
 		SourceMismatch,
 		SourceOverlap,
 		CycleMismatch,
+		ExitContractMismatch,
 		ControlFlowMismatch,
 		UnreachableBlock,
 	};

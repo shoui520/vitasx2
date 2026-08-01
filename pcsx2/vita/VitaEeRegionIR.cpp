@@ -135,6 +135,30 @@ namespace VitaEE::RegionIR
 			return words[(pc - base) / sizeof(u32)];
 		}
 
+		ExitReason ClassifyExternalResume(u32 source_base_pc,
+			const std::vector<u32>& source_words, u32 pc)
+		{
+			if (!ContainsPc(source_base_pc, static_cast<u32>(source_words.size()), pc))
+				return ExitReason::RegionBoundary;
+
+			const u32 op = ReadSourceWord(source_base_pc, source_words, pc);
+			if (IsConditionalBranch(op))
+			{
+				const u32 delay_pc = pc + sizeof(u32);
+				if (pc <= UINT32_MAX - sizeof(u32) &&
+					ContainsPc(source_base_pc, static_cast<u32>(source_words.size()), delay_pc))
+				{
+					const u32 delay = ReadSourceWord(source_base_pc, source_words, delay_pc);
+					if (!IsAnyControlFlow(delay) && CanLowerNonBranch(delay))
+						return ExitReason::RegionBoundary;
+				}
+				return ExitReason::UnsupportedControlFlow;
+			}
+			if (CanLowerNonBranch(op))
+				return ExitReason::RegionBoundary;
+			return ClassifyExit(op);
+		}
+
 		struct RawBlock
 		{
 			u32 pc = 0;
@@ -196,7 +220,10 @@ namespace VitaEE::RegionIR
 					if (!CanLowerNonBranch(delay))
 					{
 						raw.transfer_pc = pc;
-						raw.transfer_reason = ClassifyExit(delay);
+						// The existing provider must execute the branch and its
+						// unsupported delay slot as one unit. The observer at this
+						// boundary is therefore the branch, not the delay opcode.
+						raw.transfer_reason = ExitReason::UnsupportedControlFlow;
 						break;
 					}
 
@@ -524,14 +551,14 @@ namespace VitaEE::RegionIR
 			Transfer MakeTransfer(Block& block, const StateMap& state, u32 target_pc,
 				ExitReason reason,
 				const std::map<u32, u32>& block_indices,
-				u32 source_pc)
+				u32 source_pc, bool link_internal = true)
 			{
 				Transfer transfer{};
 				transfer.state = state;
 				transfer.pc = ConstantAddress(block, target_pc, source_pc);
 				transfer.external_reason = reason;
 				const auto found = block_indices.find(target_pc);
-				if (found != block_indices.end())
+				if (link_internal && found != block_indices.end())
 					transfer.target_block = found->second;
 				return transfer;
 			}
@@ -804,7 +831,8 @@ namespace VitaEE::RegionIR
 				block.terminator.kind = TerminatorKind::Transfer;
 				block.terminator.taken = builder.MakeTransfer(
 					block, state, raw.transfer_pc, raw.transfer_reason, block_indices,
-					block.source.empty() ? block.pc : block.source.back().pc);
+					block.source.empty() ? block.pc : block.source.back().pc,
+					raw.transfer_reason == ExitReason::RegionBoundary);
 			}
 		}
 
@@ -1178,7 +1206,10 @@ namespace VitaEE::RegionIR
 				const u32 static_pc = static_cast<u32>(pc_node.literal);
 				const auto target = pc_to_block.find(static_pc);
 				const u32 expected_target =
-					target == pc_to_block.end() ? INVALID_BLOCK : target->second;
+					transfer.external_reason == ExitReason::RegionBoundary &&
+							target != pc_to_block.end() ?
+						target->second :
+						INVALID_BLOCK;
 				if (transfer.target_block != expected_target)
 				{
 					return Fail(
@@ -1192,6 +1223,17 @@ namespace VitaEE::RegionIR
 					{
 						return Fail(VerifyFailure::ControlFlowMismatch, block_index,
 							UINT32_MAX, "internal edge PC and target block disagree");
+					}
+				}
+				else
+				{
+					const ExitReason expected_reason = ClassifyExternalResume(
+						program.source_base_pc, program.source_words, static_pc);
+					if (transfer.external_reason != expected_reason)
+					{
+						return Fail(VerifyFailure::ExitContractMismatch, block_index,
+							UINT32_MAX,
+							"external edge reason does not match its byte-exact resume opcode");
 					}
 				}
 				return {};
