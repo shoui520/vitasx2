@@ -145,11 +145,16 @@ namespace VitaEE::RegionIR
 		LoadU16,
 		LoadS32,
 		LoadU32,
+		// LWC1/SWC1 transfer one raw architectural FPR word. They remain
+		// distinct from integer word accesses so the verifier cannot bind a
+		// memory result to the wrong register file.
+		LoadF32Bits,
 		Load64,
 		Load128,
 		Store8,
 		Store16,
 		Store32,
+		StoreF32Bits,
 		Store64,
 		Store128,
 	};

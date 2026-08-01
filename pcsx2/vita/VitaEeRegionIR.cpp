@@ -449,6 +449,9 @@ namespace VitaEE::RegionIR
 				case 0x27:
 					decoded = MemoryAccessKind::LoadU32;
 					break;
+				case 0x31: // LWC1
+					decoded = MemoryAccessKind::LoadF32Bits;
+					break;
 				case 0x37:
 					decoded = MemoryAccessKind::Load64;
 					break;
@@ -463,6 +466,9 @@ namespace VitaEE::RegionIR
 					break;
 				case 0x2b:
 					decoded = MemoryAccessKind::Store32;
+					break;
+				case 0x39: // SWC1
+					decoded = MemoryAccessKind::StoreF32Bits;
 					break;
 				case 0x3f:
 					decoded = MemoryAccessKind::Store64;
@@ -483,6 +489,12 @@ namespace VitaEE::RegionIR
 			return kind <= MemoryAccessKind::Load128;
 		}
 
+		bool IsFprMemoryAccess(MemoryAccessKind kind)
+		{
+			return kind == MemoryAccessKind::LoadF32Bits ||
+			       kind == MemoryAccessKind::StoreF32Bits;
+		}
+
 		u32 MemoryAlignmentMask(MemoryAccessKind kind)
 		{
 			switch (kind)
@@ -493,7 +505,9 @@ namespace VitaEE::RegionIR
 					return 1;
 				case MemoryAccessKind::LoadS32:
 				case MemoryAccessKind::LoadU32:
+				case MemoryAccessKind::LoadF32Bits:
 				case MemoryAccessKind::Store32:
+				case MemoryAccessKind::StoreF32Bits:
 					return 3;
 				case MemoryAccessKind::Load64:
 				case MemoryAccessKind::Store64:
@@ -1137,6 +1151,10 @@ namespace VitaEE::RegionIR
 			bool LowerMemory(Block& block, StateMap* state, u32 op, u32 pc,
 				MemoryAccessKind kind)
 			{
+				const bool fpr_access = IsFprMemoryAccess(kind);
+				const u32 destination = RT(op);
+				const ValueId architectural_value = fpr_access ?
+					state->fpr[destination] : state->gpr[destination];
 				const ValueId base = Low32(block, *state, RS(op), pc);
 				const ValueId offset =
 					Constant32(block, static_cast<u32>(static_cast<s32>(IMM_S(op))), pc);
@@ -1151,29 +1169,32 @@ namespace VitaEE::RegionIR
 				{
 					const ValueId effect = AddNode(block, Opcode::MemoryLoad,
 						ValueType::MemoryEffect,
-						{state->memory_effect, address, state->gpr[RT(op)]}, 3,
+						{state->memory_effect, address, architectural_value}, 3,
 						encoded_kind, 0, pc);
 					if (effect == INVALID_VALUE)
 						return false;
 					state->memory_effect = effect;
-					if (RT(op) == 0)
+					if (!fpr_access && destination == 0)
 						return true;
 					const ValueId value = Unary(block, Opcode::MemoryLoadValue,
-						ValueType::I128, effect, pc);
+						fpr_access ? ValueType::F32Bits : ValueType::I128,
+						effect, pc);
+					if (fpr_access)
+						return WriteFpr(block, state, destination, value, pc);
 					if (value == INVALID_VALUE ||
 						AddNode(block, Opcode::BindGpr, ValueType::Void,
-							{value, INVALID_VALUE, INVALID_VALUE}, 1, RT(op), 0,
+							{value, INVALID_VALUE, INVALID_VALUE}, 1, destination, 0,
 							pc) == INVALID_VALUE)
 					{
 						return false;
 					}
-					state->gpr[RT(op)] = value;
+					state->gpr[destination] = value;
 					return true;
 				}
 
 				const ValueId effect = AddNode(block, Opcode::MemoryStore,
 					ValueType::MemoryEffect,
-					{state->memory_effect, address, state->gpr[RT(op)]}, 3,
+					{state->memory_effect, address, architectural_value}, 3,
 					encoded_kind, 0, pc);
 				if (effect == INVALID_VALUE)
 					return false;
@@ -2835,9 +2856,6 @@ namespace VitaEE::RegionIR
 						if (checked)
 							checked = require_operand(node, node_index, 1,
 								ValueType::Address);
-						if (checked)
-							checked = require_operand(node, node_index, 2,
-								ValueType::I128);
 						if (!checked)
 							break;
 
@@ -2846,13 +2864,27 @@ namespace VitaEE::RegionIR
 						if (!source_opcode_at(node.source_pc, &source_opcode) ||
 							!DecodeMemoryAccess(source_opcode, &expected_kind) ||
 							load != IsMemoryLoad(expected_kind) ||
-							node.immediate != static_cast<u32>(expected_kind) ||
-							node.operands[0] != expected.memory_effect ||
-							node.operands[2] != expected.gpr[RT(source_opcode)])
+							node.immediate != static_cast<u32>(expected_kind))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
-								"memory kind, effect chain, or decoded GPR does not match source");
+								"memory kind does not match source");
+							break;
+						}
+						const bool fpr_access = IsFprMemoryAccess(expected_kind);
+						checked = require_operand(node, node_index, 2,
+							fpr_access ? ValueType::F32Bits : ValueType::I128);
+						if (!checked)
+							break;
+						const ValueId expected_value = fpr_access ?
+							expected.fpr[RT(source_opcode)] :
+							expected.gpr[RT(source_opcode)];
+						if (node.operands[0] != expected.memory_effect ||
+							node.operands[2] != expected_value)
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"memory effect chain or decoded register does not match source");
 							break;
 						}
 
@@ -2891,7 +2923,15 @@ namespace VitaEE::RegionIR
 					}
 					case Opcode::MemoryLoadValue:
 					{
-						checked = unary(ValueType::MemoryEffect, ValueType::I128);
+						if (node.operand_count != 1 ||
+							node.operands[0] >= program.value_count)
+						{
+							checked = Fail(VerifyFailure::ResultType, block_index,
+								node_index, "memory load value has the wrong arity");
+							break;
+						}
+						checked = require_operand(node, node_index, 0,
+							ValueType::MemoryEffect);
 						if (!checked)
 							break;
 						const Node& memory =
@@ -2902,11 +2942,14 @@ namespace VitaEE::RegionIR
 							memory.source_pc != node.source_pc ||
 							!source_opcode_at(node.source_pc, &source_opcode) ||
 							!DecodeMemoryAccess(source_opcode, &kind) ||
-							!IsMemoryLoad(kind) || RT(source_opcode) == 0)
+							!IsMemoryLoad(kind) ||
+							(!IsFprMemoryAccess(kind) && RT(source_opcode) == 0) ||
+							node.type != (IsFprMemoryAccess(kind) ?
+								ValueType::F32Bits : ValueType::I128))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
-								"memory load value does not match a decoded nonzero destination");
+								"memory load value does not match its decoded register file");
 							break;
 						}
 						memory_value_count[node.source_pc]++;
@@ -3099,8 +3142,33 @@ namespace VitaEE::RegionIR
 						if (checked)
 						{
 							u32 source_opcode = 0;
-							if (!source_opcode_at(node.source_pc, &source_opcode) ||
-								!exact_pure_cop1_fpr_bind(node, source_opcode, expected))
+							if (!source_opcode_at(node.source_pc, &source_opcode))
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"FPR binding has no owning source instruction");
+								break;
+							}
+							MemoryAccessKind memory_kind{};
+							const bool memory_load =
+								DecodeMemoryAccess(source_opcode, &memory_kind) &&
+								memory_kind == MemoryAccessKind::LoadF32Bits;
+							if (memory_load)
+							{
+								const Node* value = local_node(node.operands[0]);
+								if (node.immediate != RT(source_opcode) || !value ||
+									value->opcode != Opcode::MemoryLoadValue ||
+									value->source_pc != node.source_pc)
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"loaded FPR binding does not match decoded ft");
+									break;
+								}
+								memory_bind_count[node.source_pc]++;
+							}
+							else if (!exact_pure_cop1_fpr_bind(node, source_opcode,
+								expected))
 							{
 								checked = Fail(VerifyFailure::SourceMismatch,
 									block_index, node_index,
@@ -3269,11 +3337,14 @@ namespace VitaEE::RegionIR
 				MemoryAccessKind kind{};
 				if (!DecodeMemoryAccess(source.opcode, &kind))
 					continue;
+				const bool fpr_access = IsFprMemoryAccess(kind);
 				const u32 expected_values =
-					IsMemoryLoad(kind) && RT(source.opcode) != 0 ? 1u : 0u;
+					IsMemoryLoad(kind) && (fpr_access || RT(source.opcode) != 0) ? 1u : 0u;
 				if (memory_operation_count[source.pc] != 1 ||
 					memory_value_count[source.pc] != expected_values ||
-					memory_bind_count[source.pc] != expected_values)
+					memory_bind_count[source.pc] != expected_values ||
+					fpr_bind_count[source.pc] !=
+						(fpr_access && IsMemoryLoad(kind) ? 1u : 0u))
 				{
 					return Fail(VerifyFailure::SourceMismatch, block_index, UINT32_MAX,
 						"decoded memory instruction lacks one exact ordered effect/value/bind");
@@ -3972,6 +4043,9 @@ namespace VitaEE::RegionIR
 										static_cast<s32>(raw.lo)));
 									break;
 								case MemoryAccessKind::LoadU32:
+									bits.lo = static_cast<u32>(raw.lo);
+									break;
+								case MemoryAccessKind::LoadF32Bits:
 									bits.lo = static_cast<u32>(raw.lo);
 									break;
 								case MemoryAccessKind::Load64:

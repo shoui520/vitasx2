@@ -35,7 +35,9 @@ namespace VitaEE::RegionIR
 					return 2;
 				case MemoryAccessKind::LoadS32:
 				case MemoryAccessKind::LoadU32:
+				case MemoryAccessKind::LoadF32Bits:
 				case MemoryAccessKind::Store32:
+				case MemoryAccessKind::StoreF32Bits:
 					return 4;
 				case MemoryAccessKind::Load64:
 				case MemoryAccessKind::Store64:
