@@ -690,15 +690,17 @@ static __fi VitaPerformanceTelemetry::CpuStage VitaEeEventProfileStage(u8 event)
 	switch (event)
 	{
 		case VU_MTVU_BUSY:
+			return VitaPerformanceTelemetry::CpuStage::VuSync;
 		case VIF_VU0_FINISH:
 		case VIF_VU1_FINISH:
-			return VitaPerformanceTelemetry::CpuStage::VuSync;
+			return VitaPerformanceTelemetry::CpuStage::VifVuFinish;
 		case DMAC_VIF0:
 		case DMAC_VIF1:
-		case DMAC_GIF:
 		case DMAC_MFIFO_VIF:
+			return VitaPerformanceTelemetry::CpuStage::VifDma;
+		case DMAC_GIF:
 		case DMAC_MFIFO_GIF:
-			return VitaPerformanceTelemetry::CpuStage::VifGif;
+			return VitaPerformanceTelemetry::CpuStage::GifDma;
 		case DMAC_SIF0:
 		case DMAC_SIF1:
 			return VitaPerformanceTelemetry::CpuStage::Sif;

@@ -1346,6 +1346,20 @@ namespace MTGS
 				VitaPerformanceTelemetry::CpuStage stage) {
 				return stage_entries[static_cast<size_t>(stage)];
 			};
+			u64 vif_gif_time = stage_time(
+				VitaPerformanceTelemetry::CpuStage::VifGif);
+			u64 vif_gif_entries = stage_entry(
+				VitaPerformanceTelemetry::CpuStage::VifGif);
+#if defined(VITASX2_CPU_PROFILER)
+			vif_gif_time += stage_time(
+				VitaPerformanceTelemetry::CpuStage::VifDma) +
+				stage_time(VitaPerformanceTelemetry::CpuStage::GifDma) +
+				stage_time(VitaPerformanceTelemetry::CpuStage::VifVuFinish);
+			vif_gif_entries += stage_entry(
+				VitaPerformanceTelemetry::CpuStage::VifDma) +
+				stage_entry(VitaPerformanceTelemetry::CpuStage::GifDma) +
+				stage_entry(VitaPerformanceTelemetry::CpuStage::VifVuFinish);
+#endif
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_extended "
 				"ee_generated=%llu ee_wait_resume=%llu "
@@ -1385,8 +1399,7 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::IopMemorySlowPath)),
 				static_cast<unsigned long long>(stage_time(
 					VitaPerformanceTelemetry::CpuStage::Ipu)),
-				static_cast<unsigned long long>(stage_time(
-					VitaPerformanceTelemetry::CpuStage::VifGif)),
+				static_cast<unsigned long long>(vif_gif_time),
 				static_cast<unsigned long long>(stage_time(
 					VitaPerformanceTelemetry::CpuStage::Sif)),
 				static_cast<unsigned long long>(stage_time(
@@ -1436,8 +1449,7 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::IopMemorySlowPath)),
 				static_cast<unsigned long long>(stage_entry(
 					VitaPerformanceTelemetry::CpuStage::Ipu)),
-				static_cast<unsigned long long>(stage_entry(
-					VitaPerformanceTelemetry::CpuStage::VifGif)),
+				static_cast<unsigned long long>(vif_gif_entries),
 				static_cast<unsigned long long>(stage_entry(
 					VitaPerformanceTelemetry::CpuStage::Sif)),
 				static_cast<unsigned long long>(stage_entry(
@@ -1449,6 +1461,29 @@ namespace MTGS
 				static_cast<unsigned long long>(stage_entry(
 					VitaPerformanceTelemetry::CpuStage::Diagnostics)));
 #if defined(VITASX2_CPU_PROFILER)
+			output.WriteLn(
+				"Vita perf v=1 window=%llu kind=cpu_stage_vif_gif "
+				"vif_dma_us=%llu vif_dma_entries=%llu "
+				"gif_dma_us=%llu gif_dma_entries=%llu "
+				"vif_vu_finish_us=%llu vif_vu_finish_entries=%llu "
+				"residual_us=%llu residual_entries=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::VifDma)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::VifDma)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::GifDma)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::GifDma)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::VifVuFinish)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::VifVuFinish)),
+				static_cast<unsigned long long>(stage_time(
+					VitaPerformanceTelemetry::CpuStage::VifGif)),
+				static_cast<unsigned long long>(stage_entry(
+					VitaPerformanceTelemetry::CpuStage::VifGif)));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_iop "
 				"generated=%llu provider=%llu compile=%llu "
@@ -1496,6 +1531,12 @@ namespace MTGS
 					return statistical_stage_samples[
 						static_cast<size_t>(stage)];
 				};
+			const u64 statistical_vif_gif = statistical_stage(
+				VitaPerformanceTelemetry::CpuStage::VifGif) +
+				statistical_stage(VitaPerformanceTelemetry::CpuStage::VifDma) +
+				statistical_stage(VitaPerformanceTelemetry::CpuStage::GifDma) +
+				statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::VifVuFinish);
 			const u64 statistical_spu2_residual = statistical_stage(
 				VitaPerformanceTelemetry::CpuStage::Spu2);
 			const u64 statistical_spu2_input = statistical_stage(
@@ -1603,8 +1644,7 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::IopMemorySlowPath)),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::Ipu)),
-				static_cast<unsigned long long>(statistical_stage(
-					VitaPerformanceTelemetry::CpuStage::VifGif)),
+				static_cast<unsigned long long>(statistical_vif_gif),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::Sif)),
 				static_cast<unsigned long long>(statistical_stage(
@@ -1615,6 +1655,19 @@ namespace MTGS
 					VitaPerformanceTelemetry::CpuStage::OtherDevice)),
 				static_cast<unsigned long long>(statistical_stage(
 					VitaPerformanceTelemetry::CpuStage::Diagnostics)));
+			output.WriteLn(
+				"Vita perf v=1 window=%llu "
+				"kind=cpu_stage_statistical_vif_gif "
+				"vif_dma=%llu gif_dma=%llu vif_vu_finish=%llu residual=%llu",
+				static_cast<unsigned long long>(window),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::VifDma)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::GifDma)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::VifVuFinish)),
+				static_cast<unsigned long long>(statistical_stage(
+					VitaPerformanceTelemetry::CpuStage::VifGif)));
 			output.WriteLn(
 				"Vita perf v=1 window=%llu kind=cpu_stage_statistical_iop "
 				"generated=%llu provider=%llu compile=%llu "

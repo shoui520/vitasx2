@@ -65,6 +65,12 @@ namespace VitaPerformanceTelemetry
 		IpuIdct,
 		IpuCsc,
 		IpuDma,
+		// R5900.cpp::TESTINT() owns these mutually exclusive EE event
+		// callbacks. Keep them separate so Phase 1 profiles do not treat VIF
+		// feeding, GIF feeding, and VU completion publication as one owner.
+		VifDma,
+		GifDma,
+		VifVuFinish,
 #endif
 		IopInterpreter,
 		Cop1,
@@ -98,9 +104,9 @@ namespace VitaPerformanceTelemetry
 	// this profiler-only storage tied to that owning enum with a static assert.
 	static constexpr size_t EE_DEADLINE_EVENT_SLOT_COUNT = 21;
 	// PES currently produces about 214 records per 120-VSync measurement
-	// window at the 1/1024 cadence. 310 widened records retain a complete
+	// window at the 1/1024 cadence. 307 widened records retain a complete
 	// ordinary window while keeping fixed interval storage below 96 KiB.
-	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 310;
+	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 307;
 	static constexpr size_t CPU_PROFILE_HOT_EDGE_COUNT = 8;
 	static constexpr size_t CPU_PROFILE_HOT_IOP_PC_COUNT = 8;
 
