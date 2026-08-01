@@ -63,6 +63,7 @@ namespace VitaEE::RegionIR
 		CompareSignedGreaterZero64,
 		CompareSignedLessZero64,
 		CompareSignedGreaterEqualZero64,
+		AddressFromI32,
 		EffectiveAddress32,
 		MemoryLoad,
 		MemoryLoadValue,
@@ -185,6 +186,7 @@ namespace VitaEE::RegionIR
 		Transfer,
 		Branch,
 		Jump,
+		RegisterJump,
 	};
 
 	struct Terminator
