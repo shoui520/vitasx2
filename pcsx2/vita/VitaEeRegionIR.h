@@ -179,6 +179,14 @@ namespace VitaEE::RegionIR
 		ValueId pc = INVALID_VALUE;
 		StateMap state{};
 		ExitReason external_reason = ExitReason::RegionBoundary;
+		// A side exit before an observer remains inside the original PCSX2
+		// recompiler block. Its architectural cycle is therefore still the block-
+		// entry value and the fallback must append this fixed-point raw prefix,
+		// execute the observer/remainder, then scale once at the real block edge.
+		// Such an exit must not perform an event-horizon test first, including
+		// when the prefix is empty and pending_raw_cycles is zero.
+		bool cycle_commit_deferred = false;
+		u32 pending_raw_cycles = 0;
 	};
 
 	enum class TerminatorKind : u8
@@ -327,10 +335,11 @@ namespace VitaEE::RegionIR
 		// Dynamic guest instructions whose complete architectural effects were
 		// committed. An observer instruction at a side exit is not included.
 		u32 source_instructions_executed = 0;
-		// When execution stops before a memory observer, canonical cycle remains
-		// at the original PCSX2 block entry. This is the exact fixed-point opcode
-		// cost already executed in that block. A product continuation must append
-		// the remaining source cost and scale once at the original block edge.
+		// When execution stops before an observer, canonical cycle remains at the
+		// original PCSX2 block entry. This is the exact fixed-point recompiler cost
+		// already executed in that block. A product continuation must append the
+		// remaining source cost and scale once at the original block edge.
+		bool cycle_commit_deferred = false;
 		u32 pending_raw_cycles = 0;
 		u32 memory_address = 0;
 		std::string error;
@@ -338,6 +347,7 @@ namespace VitaEE::RegionIR
 
 	// Pure PCSX2 cycle scaling contract, parameterized so product-disabled
 	// validation does not need to read global configuration.
+	u32 RawRecompilerCycles(u32 opcode, u32 cycle_factor);
 	u32 ScaleBlockCycles(u32 raw_cycles, s8 ee_cycle_rate);
 
 	LiftResult Lift(u32 source_base_pc, const u32* source_words,

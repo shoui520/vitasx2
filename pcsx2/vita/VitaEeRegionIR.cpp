@@ -854,6 +854,19 @@ namespace VitaEE::RegionIR
 				return transfer;
 			}
 
+			Transfer MakeDeferredObserverTransfer(Block& block,
+				const StateMap& state, u32 target_pc, ExitReason reason,
+				u32 source_pc, u32 pending_raw_cycles)
+			{
+				Transfer transfer{};
+				transfer.state = state;
+				transfer.pc = ConstantAddress(block, target_pc, source_pc);
+				transfer.external_reason = reason;
+				transfer.cycle_commit_deferred = true;
+				transfer.pending_raw_cycles = pending_raw_cycles;
+				return transfer;
+			}
+
 			u32 Finish() const { return m_next_value; }
 
 		private:
@@ -908,6 +921,18 @@ namespace VitaEE::RegionIR
 		else
 			scaled = ((5 + (-2 * (ee_cycle_rate + 1))) * raw_cycles) >> 5;
 		return std::max(1u, scaled);
+	}
+
+	u32 RawRecompilerCycles(u32 opcode, u32 cycle_factor)
+	{
+		// PCSX2 owner: x86/ix86-32/iR5900.cpp::recompileNextInstruction().
+		// The selected recompiler timing contract gives the architectural NOP a
+		// deliberately measured raw cost of nine; every other instruction uses
+		// the opcode table. VitaEeBlockCompiler.cpp::CompileBlock() preserves the
+		// same distinction. cycle_factor is CP0.Config.DIE-derived and is already
+		// constrained to one or two by Lift().
+		return (opcode == 0 ? 9u : R5900::GetInstruction(opcode).cycles) *
+		       cycle_factor;
 	}
 
 	LiftResult Lift(u32 source_base_pc, const u32* source_words,
@@ -1153,15 +1178,13 @@ namespace VitaEE::RegionIR
 			}
 
 			for (const SourceInstruction& instruction : block.source)
-			{
-				const u32 cycles = R5900::GetInstruction(instruction.opcode).cycles;
-				block.raw_cycle_cost += cycles * options.cycle_factor;
-			}
+				block.raw_cycle_cost +=
+					RawRecompilerCycles(instruction.opcode, options.cycle_factor);
 			block.not_taken_raw_cycle_cost = block.raw_cycle_cost;
 			if (likely_branch)
 			{
-				const u32 delay_cycles =
-					R5900::GetInstruction(raw.delay.opcode).cycles * options.cycle_factor;
+				const u32 delay_cycles = RawRecompilerCycles(raw.delay.opcode,
+					options.cycle_factor);
 				block.not_taken_raw_cycle_cost -= delay_cycles;
 			}
 			if (!block.source.empty())
@@ -1171,10 +1194,14 @@ namespace VitaEE::RegionIR
 				block.not_taken_scaled_cycle_cost = ScaleBlockCycles(
 					block.not_taken_raw_cycle_cost, options.ee_cycle_rate);
 			}
+			const bool deferred_observer =
+				raw.control_kind == RawControlKind::None &&
+				raw.transfer_reason != ExitReason::RegionBoundary;
 			const u32 primary_cycle_pc =
 				block.source.empty() ? block.pc : block.source.back().pc;
-			if (!builder.AdvanceCycles(block, &state, block.scaled_cycle_cost,
-					primary_cycle_pc) ||
+			if ((!deferred_observer &&
+					!builder.AdvanceCycles(block, &state, block.scaled_cycle_cost,
+						primary_cycle_pc)) ||
 				(likely_branch &&
 					!builder.AdvanceCycles(block, &not_taken_state,
 						block.not_taken_scaled_cycle_cost, raw.branch_pc)))
@@ -1222,10 +1249,20 @@ namespace VitaEE::RegionIR
 			else
 			{
 				block.terminator.kind = TerminatorKind::Transfer;
-				block.terminator.taken = builder.MakeTransfer(
-					block, state, raw.transfer_pc, raw.transfer_reason, block_indices,
-					block.source.empty() ? block.pc : block.source.back().pc,
-					raw.transfer_reason == ExitReason::RegionBoundary);
+				if (deferred_observer)
+				{
+					block.terminator.taken = builder.MakeDeferredObserverTransfer(
+						block, state, raw.transfer_pc, raw.transfer_reason,
+						block.source.empty() ? block.pc : block.source.back().pc,
+						block.raw_cycle_cost);
+				}
+				else
+				{
+					block.terminator.taken = builder.MakeTransfer(
+						block, state, raw.transfer_pc, raw.transfer_reason, block_indices,
+						block.source.empty() ? block.pc : block.source.back().pc,
+						true);
+				}
 			}
 		}
 
@@ -1403,8 +1440,8 @@ namespace VitaEE::RegionIR
 							VerifyFailure::SourceMismatch, block_index, i,
 							"source instruction is outside the represented semantic surface");
 				}
-				const u32 cycles = R5900::GetInstruction(source.opcode).cycles;
-				raw_cycles += cycles * program.options.cycle_factor;
+				raw_cycles += RawRecompilerCycles(source.opcode,
+					program.options.cycle_factor);
 			}
 			const bool likely_branch =
 				block.terminator.kind == TerminatorKind::Branch &&
@@ -1413,10 +1450,13 @@ namespace VitaEE::RegionIR
 			u32 not_taken_raw_cycles = raw_cycles;
 			if (likely_branch)
 			{
-				not_taken_raw_cycles -=
-					R5900::GetInstruction(block.source.back().opcode).cycles *
-					program.options.cycle_factor;
+				not_taken_raw_cycles -= RawRecompilerCycles(
+					block.source.back().opcode, program.options.cycle_factor);
 			}
+			const bool deferred_observer =
+				block.terminator.kind == TerminatorKind::Transfer &&
+				block.terminator.taken.target_block == INVALID_BLOCK &&
+				block.terminator.taken.external_reason != ExitReason::RegionBoundary;
 			const u32 scaled_cycles = block.source.empty() ?
 			                              0 :
 			                              ScaleBlockCycles(raw_cycles,
@@ -1831,7 +1871,8 @@ namespace VitaEE::RegionIR
 			if (link_bind_count != expected_link_binds)
 				return Fail(VerifyFailure::SourceMismatch, block_index, UINT32_MAX,
 					"control link binding does not match its decoded source");
-			if ((primary_cycle_advance != INVALID_VALUE) != !block.source.empty() ||
+			if ((primary_cycle_advance != INVALID_VALUE) !=
+					(!block.source.empty() && !deferred_observer) ||
 				(likely_branch ? not_taken_cycle_advance == INVALID_VALUE :
 				                 not_taken_cycle_advance != INVALID_VALUE))
 				return Fail(VerifyFailure::CycleMismatch, block_index, UINT32_MAX,
@@ -1845,11 +1886,18 @@ namespace VitaEE::RegionIR
 				not_taken_expected.cycle = not_taken_cycle_advance;
 
 			auto verify_transfer = [&](const Transfer& transfer,
-				const StateMap& expected_state) -> VerifyResult {
+				const StateMap& expected_state, bool expected_deferred,
+				u32 expected_pending_raw_cycles) -> VerifyResult {
 				if (!StateMapsEqual(transfer.state, expected_state))
 					return Fail(
 						VerifyFailure::StateMapMismatch, block_index, UINT32_MAX,
 						"edge does not publish the mechanically derived canonical state");
+				if (transfer.cycle_commit_deferred != expected_deferred ||
+					transfer.pending_raw_cycles != expected_pending_raw_cycles)
+				{
+					return Fail(VerifyFailure::CycleMismatch, block_index, UINT32_MAX,
+						"edge deferred-cycle contract does not match its source prefix");
+				}
 				if (!type_is(transfer.pc, ValueType::Address) ||
 					defining_block[transfer.pc] != block_index)
 				{
@@ -1923,8 +1971,9 @@ namespace VitaEE::RegionIR
 				return {};
 			};
 
-			VerifyResult transfer_check =
-				verify_transfer(block.terminator.taken, primary_expected);
+			VerifyResult transfer_check = verify_transfer(block.terminator.taken,
+				primary_expected, deferred_observer,
+				deferred_observer ? raw_cycles : 0);
 			if (!transfer_check)
 				return transfer_check;
 			if (block.terminator.kind == TerminatorKind::Branch)
@@ -2017,8 +2066,8 @@ namespace VitaEE::RegionIR
 						"branch predicate does not read the decoded pre-delay operands");
 				}
 
-				transfer_check = verify_transfer(
-					block.terminator.not_taken, not_taken_expected);
+				transfer_check = verify_transfer(block.terminator.not_taken,
+					not_taken_expected, false, 0);
 				if (!transfer_check)
 					return transfer_check;
 
@@ -2179,9 +2228,8 @@ namespace VitaEE::RegionIR
 			{
 				if (source.pc == node.source_pc)
 					break;
-				pending_raw_cycles +=
-					R5900::GetInstruction(source.opcode).cycles *
-					program.options.cycle_factor;
+				pending_raw_cycles += RawRecompilerCycles(source.opcode,
+					program.options.cycle_factor);
 				source_instructions_executed++;
 			}
 			result.source_instructions_executed +=
@@ -2191,6 +2239,7 @@ namespace VitaEE::RegionIR
 			*output = current;
 			result.completed = true;
 			result.reason = reason;
+			result.cycle_commit_deferred = true;
 			result.pending_raw_cycles = pending_raw_cycles;
 			result.memory_address = address;
 		};
@@ -2456,7 +2505,7 @@ namespace VitaEE::RegionIR
 			const RuntimeValue outgoing_memory_effect =
 				values[transfer->state.memory_effect];
 			current = materialize(*transfer);
-			if (event_due(current.cycle))
+			if (!transfer->cycle_commit_deferred && event_due(current.cycle))
 			{
 				*output = current;
 				result.completed = true;
@@ -2468,6 +2517,9 @@ namespace VitaEE::RegionIR
 				*output = current;
 				result.completed = true;
 				result.reason = transfer->external_reason;
+				result.cycle_commit_deferred =
+					transfer->cycle_commit_deferred;
+				result.pending_raw_cycles = transfer->pending_raw_cycles;
 				return result;
 			}
 			block_index = transfer->target_block;
