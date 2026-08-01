@@ -23,6 +23,10 @@ namespace VitaEE::RegionIR
 		Void,
 		I1,
 		I32,
+		// Raw architectural FPR word. Keeping this distinct from I32 prevents
+		// integer dataflow from becoming floating-point data without an explicit
+		// bit-preserving COP1 transfer.
+		F32Bits,
 		I64,
 		I128,
 		Address,
@@ -44,6 +48,8 @@ namespace VitaEE::RegionIR
 		ExtractHigh64,
 		ReplaceLow64,
 		ReplaceHigh64,
+		BitcastI32ToF32Bits,
+		BitcastF32BitsToI32,
 		SignExtend32To64,
 		ZeroExtend32To64,
 		Add32,
@@ -93,6 +99,7 @@ namespace VitaEE::RegionIR
 		BindHi,
 		BindLo,
 		BindSa,
+		BindFpr,
 		AdvanceCycles,
 	};
 
@@ -122,6 +129,7 @@ namespace VitaEE::RegionIR
 		ValueId lo = INVALID_VALUE;
 		// Internal byte-offset representation of the EE funnel-shift amount.
 		ValueId sa = INVALID_VALUE;
+		std::array<ValueId, 32> fpr{};
 		ValueId cycle = INVALID_VALUE;
 		// Ordered, non-architectural memory state. It prevents loads and stores
 		// from being reordered across each other while remaining absent from the
@@ -370,6 +378,7 @@ namespace VitaEE::RegionIR
 		u128 hi{};
 		u128 lo{};
 		u32 sa = 0;
+		std::array<u32, 32> fpr{};
 		u32 pc = 0;
 		u64 cycle = 0;
 	};

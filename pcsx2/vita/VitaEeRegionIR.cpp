@@ -22,9 +22,11 @@ namespace VitaEE::RegionIR
 		constexpr u32 HI_PARAMETER = 32;
 		constexpr u32 LO_PARAMETER = 33;
 		constexpr u32 SA_PARAMETER = 34;
-		constexpr u32 CYCLE_PARAMETER = 35;
-		constexpr u32 MEMORY_EFFECT_PARAMETER = 36;
-		constexpr u32 PARAMETER_COUNT = 37;
+		constexpr u32 FPR_PARAMETER_BASE = 35;
+		constexpr u32 FPR_COUNT = 32;
+		constexpr u32 CYCLE_PARAMETER = FPR_PARAMETER_BASE + FPR_COUNT;
+		constexpr u32 MEMORY_EFFECT_PARAMETER = CYCLE_PARAMETER + 1;
+		constexpr u32 PARAMETER_COUNT = MEMORY_EFFECT_PARAMETER + 1;
 		enum class NoEffectKind : u32
 		{
 			Sync,
@@ -49,12 +51,20 @@ namespace VitaEE::RegionIR
 			CopyUpperDoubleword,
 			CopyHalfword,
 		};
+		enum class PureCop1StateKind : u8
+		{
+			MoveFromFpr,
+			MoveToFpr,
+			MoveFpr,
+		};
 
 		constexpr u32 RS(u32 op) { return (op >> 21) & 0x1fu; }
 		constexpr u32 RT(u32 op) { return (op >> 16) & 0x1fu; }
 		constexpr u32 RD(u32 op) { return (op >> 11) & 0x1fu; }
 		constexpr u32 SA(u32 op) { return (op >> 6) & 0x1fu; }
 		constexpr u32 FUNCT(u32 op) { return op & 0x3fu; }
+		constexpr u32 FS(u32 op) { return RD(op); }
+		constexpr u32 FD(u32 op) { return SA(op); }
 		constexpr s16 IMM_S(u32 op) { return static_cast<s16>(op); }
 		constexpr u16 IMM_U(u32 op) { return static_cast<u16>(op); }
 
@@ -348,6 +358,37 @@ namespace VitaEE::RegionIR
 			       kind == PureMmiKind::MoveToLo;
 		}
 
+		bool DecodePureCop1State(u32 op, PureCop1StateKind* kind)
+		{
+			if ((op >> 26) != 0x11)
+				return false;
+
+			PureCop1StateKind decoded{};
+			switch (RS(op))
+			{
+				case 0x00: // MFC1 rt, fs
+					if ((op & 0x7ffu) != 0)
+						return false;
+					decoded = PureCop1StateKind::MoveFromFpr;
+					break;
+				case 0x04: // MTC1 rt, fs
+					if ((op & 0x7ffu) != 0)
+						return false;
+					decoded = PureCop1StateKind::MoveToFpr;
+					break;
+				case 0x10: // MOV.S fd, fs
+					if (RT(op) != 0 || FUNCT(op) != 0x06)
+						return false;
+					decoded = PureCop1StateKind::MoveFpr;
+					break;
+				default:
+					return false;
+			}
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
 		bool IsExtendedScalarGprWrite(u32 op)
 		{
 			return IsVariableShift(op) || IsConditionalMove(op) ||
@@ -378,6 +419,8 @@ namespace VitaEE::RegionIR
 					return true;
 				case 0x1c: // Pure, non-multiplying MMI moves/logical/copies.
 					return DecodePureMmi(op, nullptr);
+				case 0x11: // Raw-bit COP1 register transfers and MOV.S.
+					return DecodePureCop1State(op, nullptr);
 				default:
 					return false;
 			}
@@ -883,6 +926,14 @@ namespace VitaEE::RegionIR
 						{}, 0, LO_PARAMETER, 0, block.pc);
 					block.parameters.sa = AddNode(block, Opcode::Parameter, ValueType::I32,
 						{}, 0, SA_PARAMETER, 0, block.pc);
+					for (u32 fpr = 0; fpr < FPR_COUNT; fpr++)
+					{
+						block.parameters.fpr[fpr] = AddNode(block, Opcode::Parameter,
+							ValueType::F32Bits, {}, 0, FPR_PARAMETER_BASE + fpr, 0,
+							block.pc);
+						if (block.parameters.fpr[fpr] == INVALID_VALUE)
+							return false;
+					}
 					block.parameters.cycle =
 						AddNode(block, Opcode::Parameter, ValueType::Cycle, {}, 0,
 							CYCLE_PARAMETER, 0, block.pc);
@@ -1069,6 +1120,20 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
+			bool WriteFpr(Block& block, StateMap* state, u32 reg, ValueId value,
+				u32 source_pc)
+			{
+				if (value == INVALID_VALUE ||
+					AddNode(block, Opcode::BindFpr, ValueType::Void,
+						{value, INVALID_VALUE, INVALID_VALUE}, 1, reg, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				state->fpr[reg] = value;
+				return true;
+			}
+
 			bool LowerMemory(Block& block, StateMap* state, u32 op, u32 pc,
 				MemoryAccessKind kind)
 			{
@@ -1130,6 +1195,29 @@ namespace VitaEE::RegionIR
 					return LowerMemory(block, state, op, pc, memory_kind);
 
 				const u32 primary = op >> 26;
+				if (primary == 0x11)
+				{
+					PureCop1StateKind kind{};
+					if (!DecodePureCop1State(op, &kind))
+						return false;
+					ValueId value = INVALID_VALUE;
+					switch (kind)
+					{
+						case PureCop1StateKind::MoveFromFpr:
+							value = Unary(block, Opcode::BitcastF32BitsToI32,
+								ValueType::I32, state->fpr[FS(op)], pc);
+							value = Unary(block, Opcode::SignExtend32To64,
+								ValueType::I64, value, pc);
+							return WriteLow64(block, state, RT(op), value, pc);
+						case PureCop1StateKind::MoveToFpr:
+							value = Low32(block, *state, RT(op), pc);
+							value = Unary(block, Opcode::BitcastI32ToF32Bits,
+								ValueType::F32Bits, value, pc);
+							return WriteFpr(block, state, FS(op), value, pc);
+						case PureCop1StateKind::MoveFpr:
+							return WriteFpr(block, state, FD(op), state->fpr[FS(op)], pc);
+					}
+				}
 				if (primary == 0x1c)
 				{
 					PureMmiKind kind{};
@@ -1500,7 +1588,8 @@ namespace VitaEE::RegionIR
 		bool StateMapsEqual(const StateMap& left, const StateMap& right)
 		{
 			return left.gpr == right.gpr && left.hi == right.hi && left.lo == right.lo &&
-			       left.sa == right.sa && left.cycle == right.cycle &&
+			       left.sa == right.sa && left.fpr == right.fpr &&
+			       left.cycle == right.cycle &&
 			       left.memory_effect == right.memory_effect;
 		}
 
@@ -2050,7 +2139,10 @@ namespace VitaEE::RegionIR
 			for (u32 slot = 0; slot < PARAMETER_COUNT; slot++)
 			{
 				const Node& parameter = block.nodes[slot];
+				const bool fpr_parameter = slot >= FPR_PARAMETER_BASE &&
+				                           slot < FPR_PARAMETER_BASE + FPR_COUNT;
 				const ValueType expected_type = slot == SA_PARAMETER ? ValueType::I32 :
+					fpr_parameter ? ValueType::F32Bits :
 					slot == CYCLE_PARAMETER ? ValueType::Cycle :
 					slot == MEMORY_EFFECT_PARAMETER ? ValueType::MemoryEffect :
 					                                    ValueType::I128;
@@ -2069,6 +2161,8 @@ namespace VitaEE::RegionIR
 					expected.lo = parameter.id;
 				else if (slot == SA_PARAMETER)
 					expected.sa = parameter.id;
+				else if (fpr_parameter)
+					expected.fpr[slot - FPR_PARAMETER_BASE] = parameter.id;
 				else if (slot == CYCLE_PARAMETER)
 					expected.cycle = parameter.id;
 				else
@@ -2197,6 +2291,8 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> no_effect_count;
 			std::map<u32, u32> extended_gpr_bind_count;
 			std::map<u32, u32> pure_mmi_gpr_bind_count;
+			std::map<u32, u32> pure_cop1_gpr_bind_count;
+			std::map<u32, u32> fpr_bind_count;
 			std::map<u32, u32> hi_bind_count;
 			std::map<u32, u32> lo_bind_count;
 			std::map<u32, u32> sa_bind_count;
@@ -2465,6 +2561,55 @@ namespace VitaEE::RegionIR
 					input.gpr[RS(source_opcode)], input.gpr[RT(source_opcode)],
 					bind.source_pc);
 			};
+			auto exact_pure_cop1_gpr_bind = [&](const Node& bind, u32 source_opcode,
+				const StateMap& input) {
+				PureCop1StateKind kind{};
+				const u32 destination = RT(source_opcode);
+				if (!DecodePureCop1State(source_opcode, &kind) ||
+					kind != PureCop1StateKind::MoveFromFpr || destination == 0 ||
+					bind.immediate != destination)
+				{
+					return false;
+				}
+				const Node* replace = local_node(bind.operands[0]);
+				if (!replace || replace->opcode != Opcode::ReplaceLow64 ||
+					replace->operand_count != 2 ||
+					replace->operands[0] != input.gpr[destination] ||
+					replace->source_pc != bind.source_pc)
+				{
+					return false;
+				}
+				const Node* sign_extend = local_node(replace->operands[1]);
+				return sign_extend &&
+				       sign_extend->opcode == Opcode::SignExtend32To64 &&
+				       sign_extend->operand_count == 1 &&
+				       sign_extend->source_pc == bind.source_pc &&
+				       exact_unary(sign_extend->operands[0],
+						Opcode::BitcastF32BitsToI32, input.fpr[FS(source_opcode)],
+						bind.source_pc);
+			};
+			auto exact_pure_cop1_fpr_bind = [&](const Node& bind, u32 source_opcode,
+				const StateMap& input) {
+				PureCop1StateKind kind{};
+				if (!DecodePureCop1State(source_opcode, &kind) ||
+					kind == PureCop1StateKind::MoveFromFpr)
+				{
+					return false;
+				}
+				if (kind == PureCop1StateKind::MoveFpr)
+				{
+					return bind.immediate == FD(source_opcode) &&
+					       bind.operands[0] == input.fpr[FS(source_opcode)];
+				}
+				if (bind.immediate != FS(source_opcode))
+					return false;
+				const Node* bitcast = local_node(bind.operands[0]);
+				return bitcast && bitcast->opcode == Opcode::BitcastI32ToF32Bits &&
+				       bitcast->operand_count == 1 &&
+				       bitcast->source_pc == bind.source_pc &&
+				       exact_unary(bitcast->operands[0], Opcode::ExtractLow32,
+						input.gpr[RT(source_opcode)], bind.source_pc);
+			};
 			auto require_operand = [&](const Node& node, u32 node_index, u32 operand,
 									   ValueType required) -> VerifyResult {
 				if (operand >= node.operand_count ||
@@ -2562,6 +2707,12 @@ namespace VitaEE::RegionIR
 					case Opcode::ReplaceLow64:
 					case Opcode::ReplaceHigh64:
 						checked = binary(ValueType::I128, ValueType::I64, ValueType::I128);
+						break;
+					case Opcode::BitcastI32ToF32Bits:
+						checked = unary(ValueType::I32, ValueType::F32Bits);
+						break;
+					case Opcode::BitcastF32BitsToI32:
+						checked = unary(ValueType::F32Bits, ValueType::I32);
 						break;
 					case Opcode::SignExtend32To64:
 						checked = unary(ValueType::I32, ValueType::I64);
@@ -2782,6 +2933,9 @@ namespace VitaEE::RegionIR
 							PureMmiKind pure_mmi_kind{};
 							const bool pure_mmi =
 								DecodePureMmi(source_opcode, &pure_mmi_kind);
+							PureCop1StateKind pure_cop1_kind{};
+							const bool pure_cop1 =
+								DecodePureCop1State(source_opcode, &pure_cop1_kind);
 							if (IsExtendedScalarGprWrite(source_opcode))
 							{
 								if (!exact_extended_gpr_bind(node, source_opcode,
@@ -2806,9 +2960,23 @@ namespace VitaEE::RegionIR
 								}
 								pure_mmi_gpr_bind_count[node.source_pc]++;
 							}
+							else if (pure_cop1 &&
+								pure_cop1_kind == PureCop1StateKind::MoveFromFpr)
+							{
+								if (!exact_pure_cop1_gpr_bind(node, source_opcode,
+										expected))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"COP1-to-GPR binding does not match source");
+									break;
+								}
+								pure_cop1_gpr_bind_count[node.source_pc]++;
+							}
 							else if (IsMoveToHiLo(source_opcode) ||
 								IsMoveToSa(source_opcode) ||
 								pure_mmi ||
+								pure_cop1 ||
 								DecodeNoEffect(source_opcode, program.options,
 									&no_effect_kind))
 							{
@@ -2920,6 +3088,29 @@ namespace VitaEE::RegionIR
 							expected.sa = node.operands[0];
 						}
 						break;
+					case Opcode::BindFpr:
+						checked = unary(ValueType::F32Bits, ValueType::Void);
+						if (checked && node.immediate >= FPR_COUNT)
+						{
+							checked = Fail(VerifyFailure::OperandOutOfRange,
+								block_index, node_index,
+								"FPR binding targets an invalid slot");
+						}
+						if (checked)
+						{
+							u32 source_opcode = 0;
+							if (!source_opcode_at(node.source_pc, &source_opcode) ||
+								!exact_pure_cop1_fpr_bind(node, source_opcode, expected))
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"FPR binding does not match raw COP1 source");
+								break;
+							}
+							fpr_bind_count[node.source_pc]++;
+							expected.fpr[node.immediate] = node.operands[0];
+						}
+						break;
 					case Opcode::AdvanceCycles:
 					{
 						checked = unary(ValueType::Cycle, ValueType::Cycle);
@@ -2971,6 +3162,8 @@ namespace VitaEE::RegionIR
 					if (no_effect_count[source.pc] != 1 ||
 						extended_gpr_bind_count[source.pc] != 0 ||
 						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
 						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0 ||
 						sa_bind_count[source.pc] != 0)
 					{
@@ -2984,6 +3177,8 @@ namespace VitaEE::RegionIR
 					const u32 expected_binds = RD(source.opcode) == 0 ? 0u : 1u;
 					if (extended_gpr_bind_count[source.pc] != expected_binds ||
 						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
 						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0 ||
 						sa_bind_count[source.pc] != 0)
 					{
@@ -2999,6 +3194,8 @@ namespace VitaEE::RegionIR
 						lo_bind_count[source.pc] != (hi ? 0u : 1u) ||
 						extended_gpr_bind_count[source.pc] != 0 ||
 						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
 						sa_bind_count[source.pc] != 0)
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
@@ -3011,6 +3208,8 @@ namespace VitaEE::RegionIR
 					if (sa_bind_count[source.pc] != 1 ||
 						extended_gpr_bind_count[source.pc] != 0 ||
 						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
 						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0)
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
@@ -3032,11 +3231,37 @@ namespace VitaEE::RegionIR
 							hi_bind_count[source.pc] != expected_hi ||
 							lo_bind_count[source.pc] != expected_lo ||
 							extended_gpr_bind_count[source.pc] != 0 ||
+							pure_cop1_gpr_bind_count[source.pc] != 0 ||
+							fpr_bind_count[source.pc] != 0 ||
 							sa_bind_count[source.pc] != 0)
 						{
 							return Fail(VerifyFailure::SourceMismatch, block_index,
 								UINT32_MAX,
 								"pure MMI source has the wrong architectural binding");
+						}
+					}
+					else
+					{
+						PureCop1StateKind pure_cop1_kind{};
+						if (DecodePureCop1State(source.opcode, &pure_cop1_kind))
+						{
+							const u32 expected_gpr =
+								pure_cop1_kind == PureCop1StateKind::MoveFromFpr &&
+									RT(source.opcode) != 0 ? 1u : 0u;
+							const u32 expected_fpr =
+								pure_cop1_kind == PureCop1StateKind::MoveFromFpr ? 0u : 1u;
+							if (pure_cop1_gpr_bind_count[source.pc] != expected_gpr ||
+								fpr_bind_count[source.pc] != expected_fpr ||
+								pure_mmi_gpr_bind_count[source.pc] != 0 ||
+								extended_gpr_bind_count[source.pc] != 0 ||
+								hi_bind_count[source.pc] != 0 ||
+								lo_bind_count[source.pc] != 0 ||
+								sa_bind_count[source.pc] != 0)
+							{
+								return Fail(VerifyFailure::SourceMismatch, block_index,
+									UINT32_MAX,
+									"raw COP1 source has the wrong architectural binding");
+							}
 						}
 					}
 				}
@@ -3418,6 +3643,9 @@ namespace VitaEE::RegionIR
 			values[block.parameters.hi] = {ValueType::I128, state.hi};
 			values[block.parameters.lo] = {ValueType::I128, state.lo};
 			values[block.parameters.sa] = {ValueType::I32, Bits(state.sa)};
+			for (u32 fpr = 0; fpr < FPR_COUNT; fpr++)
+				values[block.parameters.fpr[fpr]] =
+					{ValueType::F32Bits, Bits(state.fpr[fpr])};
 			values[block.parameters.cycle] = {ValueType::Cycle, Bits(state.cycle)};
 			values[block.parameters.memory_effect] = memory_effect;
 		};
@@ -3429,6 +3657,9 @@ namespace VitaEE::RegionIR
 			state.hi = values[transfer.state.hi].bits;
 			state.lo = values[transfer.state.lo].bits;
 			state.sa = static_cast<u32>(values[transfer.state.sa].bits.lo);
+			for (u32 fpr = 0; fpr < FPR_COUNT; fpr++)
+				state.fpr[fpr] =
+					static_cast<u32>(values[transfer.state.fpr[fpr]].bits.lo);
 			state.cycle = values[transfer.state.cycle].bits.lo;
 			state.pc = static_cast<u32>(values[transfer.pc].bits.lo);
 			return state;
@@ -3507,6 +3738,10 @@ namespace VitaEE::RegionIR
 					case Opcode::ReplaceHigh64:
 						bits = values[node.operands[0]].bits;
 						bits.hi = right;
+						break;
+					case Opcode::BitcastI32ToF32Bits:
+					case Opcode::BitcastF32BitsToI32:
+						bits = Bits(static_cast<u32>(left));
 						break;
 					case Opcode::SignExtend32To64:
 						bits = Bits(static_cast<u64>(
@@ -3782,6 +4017,10 @@ namespace VitaEE::RegionIR
 						break;
 					case Opcode::BindSa:
 						current.sa = static_cast<u32>(values[node.operands[0]].bits.lo);
+						break;
+					case Opcode::BindFpr:
+						current.fpr[node.immediate] =
+							static_cast<u32>(values[node.operands[0]].bits.lo);
 						break;
 					case Opcode::AdvanceCycles:
 						bits = Bits(left + node.immediate);
