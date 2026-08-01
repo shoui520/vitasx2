@@ -179,6 +179,7 @@ namespace VitaEE::RegionIR
 	{
 		Transfer,
 		Branch,
+		Jump,
 	};
 
 	struct Terminator
@@ -190,6 +191,8 @@ namespace VitaEE::RegionIR
 		ValueId condition = INVALID_VALUE;
 		Transfer taken{};
 		Transfer not_taken{};
+		// For Branch and Jump these identify the indivisible control/delay
+		// source pair. Transfer has neither.
 		u32 branch_pc = 0;
 		u32 delay_slot_pc = 0;
 	};
@@ -222,6 +225,9 @@ namespace VitaEE::RegionIR
 		// derived from CP0.Config bit 18. Valid EE values are one and two.
 		u32 cycle_factor = 2;
 		s8 ee_cycle_rate = 0;
+		// PCSX2's Goemon TLB gamefix adds observable jump/JR behavior. Static
+		// jumps fail closed while it is active until that helper contract is IR.
+		bool goemon_tlb_hack = false;
 		u32 max_blocks = 8;
 		u32 max_source_instructions = 64;
 	};

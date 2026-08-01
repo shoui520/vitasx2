@@ -38,12 +38,25 @@ namespace VitaEE::RegionIR
 			return pc + 4 + static_cast<s32>(IMM_S(op)) * 4;
 		}
 
+		constexpr u32 JumpTarget(u32 pc, u32 op)
+		{
+			return ((pc + sizeof(u32)) & 0xf0000000u) |
+			       ((op & 0x03ffffffu) << 2);
+		}
+
 		bool IsConditionalBranch(u32 op)
 		{
 			switch (op >> 26)
 			{
 				case 0x01:
-					return RT(op) <= 0x03; // BLTZ/BGEZ and likely forms.
+				{
+					const u32 rt = RT(op);
+					const bool supported = rt <= 0x03 ||
+					                       (rt >= 0x10 && rt <= 0x13);
+					// SCE defines a linked REGIMM using r31 as its source as
+					// undefined. Leave that pair to the tier-zero provider.
+					return supported && !(rt >= 0x10 && RS(op) == 31);
+				}
 				case 0x04: // BEQ
 				case 0x05: // BNE
 				case 0x06: // BLEZ
@@ -56,6 +69,22 @@ namespace VitaEE::RegionIR
 				default:
 					return false;
 			}
+		}
+
+		bool IsStaticJump(u32 op)
+		{
+			const u32 primary = op >> 26;
+			return primary == 0x02 || primary == 0x03;
+		}
+
+		bool CanLowerStaticJump(u32 op, const LiftOptions& options)
+		{
+			return IsStaticJump(op) && !options.goemon_tlb_hack;
+		}
+
+		bool IsLinkedControl(u32 op)
+		{
+			return (R5900::GetInstruction(op).flags & IS_LINKED) != 0;
 		}
 
 		bool IsLikelyBranch(u32 op)
@@ -235,13 +264,14 @@ namespace VitaEE::RegionIR
 		}
 
 		ExitReason ClassifyExternalResume(u32 source_base_pc,
-			const std::vector<u32>& source_words, u32 pc)
+			const std::vector<u32>& source_words, u32 pc,
+			const LiftOptions& options)
 		{
 			if (!ContainsPc(source_base_pc, static_cast<u32>(source_words.size()), pc))
 				return ExitReason::RegionBoundary;
 
 			const u32 op = ReadSourceWord(source_base_pc, source_words, pc);
-			if (IsConditionalBranch(op))
+			if (IsConditionalBranch(op) || CanLowerStaticJump(op, options))
 			{
 				const u32 delay_pc = pc + sizeof(u32);
 				if (pc <= UINT32_MAX - sizeof(u32) &&
@@ -258,11 +288,18 @@ namespace VitaEE::RegionIR
 			return ClassifyExit(op);
 		}
 
+		enum class RawControlKind : u8
+		{
+			None,
+			ConditionalBranch,
+			StaticJump,
+		};
+
 		struct RawBlock
 		{
 			u32 pc = 0;
 			std::vector<SourceInstruction> body;
-			bool has_branch = false;
+			RawControlKind control_kind = RawControlKind::None;
 			u32 branch_pc = 0;
 			u32 branch_opcode = 0;
 			SourceInstruction delay{};
@@ -271,7 +308,8 @@ namespace VitaEE::RegionIR
 		};
 
 		bool ScanRawBlock(u32 source_base_pc, const std::vector<u32>& source_words,
-			const std::set<u32>& leaders, u32 start_pc, RawBlock* output,
+			const std::set<u32>& leaders, u32 start_pc, const LiftOptions& options,
+			RawBlock* output,
 			LiftFailure* failure, u32* failure_pc)
 		{
 			RawBlock raw{};
@@ -294,7 +332,9 @@ namespace VitaEE::RegionIR
 				}
 
 				const u32 op = ReadSourceWord(source_base_pc, source_words, pc);
-				if (IsConditionalBranch(op))
+				const bool conditional_branch = IsConditionalBranch(op);
+				const bool static_jump = CanLowerStaticJump(op, options);
+				if (conditional_branch || static_jump)
 				{
 					const u32 delay_pc = pc + sizeof(u32);
 					if (!ContainsPc(source_base_pc, static_cast<u32>(source_words.size()),
@@ -326,7 +366,9 @@ namespace VitaEE::RegionIR
 						break;
 					}
 
-					raw.has_branch = true;
+					raw.control_kind = conditional_branch ?
+					                       RawControlKind::ConditionalBranch :
+					                       RawControlKind::StaticJump;
 					raw.branch_pc = pc;
 					raw.branch_opcode = op;
 					raw.delay = {delay_pc, delay, true};
@@ -834,12 +876,12 @@ namespace VitaEE::RegionIR
 
 				RawBlock raw{};
 				if (!ScanRawBlock(source_base_pc, result.program.source_words, leaders,
-						pc, &raw, &result.failure, &result.failure_pc))
+						pc, options, &raw, &result.failure, &result.failure_pc))
 				{
 					return result;
 				}
 
-				if (raw.has_branch)
+				if (raw.control_kind == RawControlKind::ConditionalBranch)
 				{
 					const std::array<u32, 2> targets = {
 						BranchTarget(raw.branch_pc, raw.branch_opcode),
@@ -852,6 +894,15 @@ namespace VitaEE::RegionIR
 							pending.push_back(target);
 						}
 					}
+				}
+				else if (raw.control_kind == RawControlKind::StaticJump)
+				{
+					// Static jumps are complete Region IR control units, but do not
+					// recursively pull a call/jump target into this first bounded CFG.
+					// They may still link to a target already owned through conditional
+					// control. Wider call/return construction belongs to the profiled
+					// reducible-CFG phase and must not turn a useful prefix into a whole-
+					// region block/overlap failure.
 				}
 				else if (leaders.contains(raw.transfer_pc) &&
 						 ContainsPc(source_base_pc, source_word_count,
@@ -892,7 +943,7 @@ namespace VitaEE::RegionIR
 					return result;
 				}
 			}
-			if (raw.has_branch &&
+			if (raw.control_kind != RawControlKind::None &&
 				(!source_owners.insert(raw.branch_pc).second ||
 					!source_owners.insert(raw.delay.pc).second))
 			{
@@ -939,17 +990,43 @@ namespace VitaEE::RegionIR
 			}
 
 			ValueId condition = INVALID_VALUE;
+			const bool has_control = raw.control_kind != RawControlKind::None;
+			const bool conditional_branch =
+				raw.control_kind == RawControlKind::ConditionalBranch;
 			const bool likely_branch =
-				raw.has_branch && IsLikelyBranch(raw.branch_opcode);
-			if (raw.has_branch)
+				conditional_branch && IsLikelyBranch(raw.branch_opcode);
+			const bool linked_control =
+				has_control && IsLinkedControl(raw.branch_opcode);
+			if (has_control)
 			{
 				block.source.push_back({raw.branch_pc, raw.branch_opcode, false});
 				block.source.push_back(raw.delay);
+				if (conditional_branch)
+				{
+					condition = builder.LowerBranchCondition(block, state,
+						raw.branch_opcode, raw.branch_pc);
+					if (condition == INVALID_VALUE)
+					{
+						result.failure = LiftFailure::InternalError;
+						result.failure_pc = raw.branch_pc;
+						return result;
+					}
+				}
+				if (linked_control)
+				{
+					const ValueId link =
+						builder.Constant64(block, raw.branch_pc + 2 * sizeof(u32),
+							raw.branch_pc);
+					if (link == INVALID_VALUE ||
+						!builder.WriteLow64(block, &state, 31, link, raw.branch_pc))
+					{
+						result.failure = LiftFailure::ValueLimit;
+						result.failure_pc = raw.branch_pc;
+						return result;
+					}
+				}
 				not_taken_state = state;
-				condition = builder.LowerBranchCondition(block, state, raw.branch_opcode,
-					raw.branch_pc);
-				if (condition == INVALID_VALUE ||
-					!builder.LowerNonBranch(block, &state, raw.delay.opcode,
+				if (!builder.LowerNonBranch(block, &state, raw.delay.opcode,
 						raw.delay.pc))
 				{
 					result.failure = LiftFailure::InternalError;
@@ -990,7 +1067,7 @@ namespace VitaEE::RegionIR
 				return result;
 			}
 
-			if (raw.has_branch)
+			if (conditional_branch)
 			{
 				if (!likely_branch)
 					not_taken_state = state;
@@ -1007,6 +1084,15 @@ namespace VitaEE::RegionIR
 				block.terminator.not_taken = builder.MakeTransfer(
 					block, not_taken_state, not_taken_pc, ExitReason::RegionBoundary,
 					block_indices, likely_branch ? raw.branch_pc : raw.delay.pc);
+			}
+			else if (raw.control_kind == RawControlKind::StaticJump)
+			{
+				block.terminator.kind = TerminatorKind::Jump;
+				block.terminator.branch_pc = raw.branch_pc;
+				block.terminator.delay_slot_pc = raw.delay.pc;
+				block.terminator.taken = builder.MakeTransfer(
+					block, state, JumpTarget(raw.branch_pc, raw.branch_opcode),
+					ExitReason::RegionBoundary, block_indices, raw.delay.pc);
 			}
 			else
 			{
@@ -1100,7 +1186,8 @@ namespace VitaEE::RegionIR
 					"block entry is outside the immutable source image");
 			}
 			if (block.terminator.kind != TerminatorKind::Transfer &&
-				block.terminator.kind != TerminatorKind::Branch)
+				block.terminator.kind != TerminatorKind::Branch &&
+				block.terminator.kind != TerminatorKind::Jump)
 			{
 				return Fail(VerifyFailure::ControlFlowMismatch, block_index, UINT32_MAX,
 					"block has an invalid terminator kind");
@@ -1139,13 +1226,15 @@ namespace VitaEE::RegionIR
 				return Fail(VerifyFailure::ParameterContract, block_index, UINT32_MAX,
 					"published parameter map differs from parameter nodes");
 
+			const bool has_delayed_control =
+				block.terminator.kind == TerminatorKind::Branch ||
+				block.terminator.kind == TerminatorKind::Jump;
 			u32 raw_cycles = 0;
 			for (u32 i = 0; i < block.source.size(); i++)
 			{
 				const SourceInstruction& source = block.source[i];
-				const bool is_branch_instruction =
-					block.terminator.kind == TerminatorKind::Branch &&
-					i + 2 == block.source.size();
+				const bool is_control_instruction =
+					has_delayed_control && i + 2 == block.source.size();
 				if (!source_word_matches(source) ||
 					(i == 0 ? source.pc != block.pc : source.pc != block.source[i - 1].pc + sizeof(u32)))
 				{
@@ -1159,18 +1248,21 @@ namespace VitaEE::RegionIR
 						"one immutable source instruction is owned by multiple blocks");
 				}
 				if (source.delay_slot !=
-					(block.terminator.kind == TerminatorKind::Branch &&
-						i + 1 == block.source.size()))
+					(has_delayed_control && i + 1 == block.source.size()))
 				{
 					return Fail(VerifyFailure::SourceMismatch, block_index, i,
 						"delay-slot marker does not match the block terminator");
 				}
-				if (is_branch_instruction)
+				if (is_control_instruction)
 				{
-					if (!IsConditionalBranch(source.opcode))
+					const bool matches_kind =
+						block.terminator.kind == TerminatorKind::Branch ?
+							IsConditionalBranch(source.opcode) :
+							CanLowerStaticJump(source.opcode, program.options);
+					if (!matches_kind)
 						return Fail(
 							VerifyFailure::ControlFlowMismatch, block_index, i,
-							"branch source slot is not a supported conditional branch");
+							"control source slot does not match its terminator kind");
 				}
 				else
 				{
@@ -1215,8 +1307,16 @@ namespace VitaEE::RegionIR
 
 			ValueId primary_cycle_advance = INVALID_VALUE;
 			ValueId not_taken_cycle_advance = INVALID_VALUE;
-			bool captured_branch_input = false;
-			StateMap branch_input{};
+			bool captured_control_input = false;
+			bool captured_delay_input = false;
+			StateMap control_input{};
+			StateMap delay_input{};
+			const u32 control_opcode = has_delayed_control && block.source.size() >= 2 ?
+			                               block.source[block.source.size() - 2].opcode :
+			                               0;
+			const bool linked_control =
+				has_delayed_control && IsLinkedControl(control_opcode);
+			u32 link_bind_count = 0;
 			std::map<u32, u32> memory_operation_count;
 			std::map<u32, u32> memory_value_count;
 			std::map<u32, u32> memory_bind_count;
@@ -1250,12 +1350,17 @@ namespace VitaEE::RegionIR
 				 node_index++)
 			{
 				const Node& node = block.nodes[node_index];
-				if (!captured_branch_input &&
-					block.terminator.kind == TerminatorKind::Branch &&
+				if (!captured_control_input && has_delayed_control &&
 					node.source_pc == block.terminator.branch_pc)
 				{
-					branch_input = expected;
-					captured_branch_input = true;
+					control_input = expected;
+					captured_control_input = true;
+				}
+				if (!captured_delay_input && has_delayed_control &&
+					node.source_pc == block.terminator.delay_slot_pc)
+				{
+					delay_input = expected;
+					captured_delay_input = true;
 				}
 				auto unary = [&](ValueType input, ValueType output) -> VerifyResult {
 					if (node.operand_count != 1 || node.type != output)
@@ -1466,6 +1571,37 @@ namespace VitaEE::RegionIR
 						{
 							const Node& value =
 								block.nodes[defining_node[node.operands[0]]];
+							if (has_delayed_control &&
+								node.source_pc == block.terminator.branch_pc)
+							{
+								if (!linked_control || node.immediate != 31 ||
+									value.opcode != Opcode::ReplaceLow64 ||
+									value.source_pc != block.terminator.branch_pc ||
+									value.operand_count != 2 ||
+									value.operands[0] != expected.gpr[31] ||
+									value.operands[1] >= program.value_count ||
+									defining_block[value.operands[1]] != block_index)
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"linked control does not replace r31 low64 exactly");
+									break;
+								}
+								const Node& link =
+									block.nodes[defining_node[value.operands[1]]];
+								if (link.opcode != Opcode::ConstantI64 ||
+									link.source_pc != block.terminator.branch_pc ||
+									link.literal !=
+										static_cast<u64>(block.terminator.branch_pc) +
+											2 * sizeof(u32))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"linked control publishes the wrong return address");
+									break;
+								}
+								link_bind_count++;
+							}
 							if (value.opcode == Opcode::MemoryLoadValue)
 							{
 								u32 source_opcode = 0;
@@ -1551,6 +1687,12 @@ namespace VitaEE::RegionIR
 						"decoded memory instruction lacks one exact ordered effect/value/bind");
 				}
 			}
+			if (has_delayed_control && !captured_delay_input)
+				return Fail(VerifyFailure::ControlFlowMismatch, block_index, UINT32_MAX,
+					"delayed control has no mechanically derived pre-delay state");
+			if (linked_control ? link_bind_count != 1 : link_bind_count != 0)
+				return Fail(VerifyFailure::SourceMismatch, block_index, UINT32_MAX,
+					"control link binding does not match its decoded source");
 			if ((primary_cycle_advance != INVALID_VALUE) != !block.source.empty() ||
 				(likely_branch ? not_taken_cycle_advance == INVALID_VALUE :
 				                 not_taken_cycle_advance != INVALID_VALUE))
@@ -1560,7 +1702,7 @@ namespace VitaEE::RegionIR
 			StateMap primary_expected = expected;
 			if (primary_cycle_advance != INVALID_VALUE)
 				primary_expected.cycle = primary_cycle_advance;
-			StateMap not_taken_expected = likely_branch ? branch_input : primary_expected;
+			StateMap not_taken_expected = likely_branch ? delay_input : primary_expected;
 			if (likely_branch)
 				not_taken_expected.cycle = not_taken_cycle_advance;
 
@@ -1605,7 +1747,8 @@ namespace VitaEE::RegionIR
 				else
 				{
 					const ExitReason expected_reason = ClassifyExternalResume(
-						program.source_base_pc, program.source_words, static_pc);
+						program.source_base_pc, program.source_words, static_pc,
+						program.options);
 					if (transfer.external_reason != expected_reason)
 					{
 						return Fail(VerifyFailure::ExitContractMismatch, block_index,
@@ -1622,7 +1765,7 @@ namespace VitaEE::RegionIR
 				return transfer_check;
 			if (block.terminator.kind == TerminatorKind::Branch)
 			{
-				if (block.source.size() < 2 || !captured_branch_input ||
+				if (block.source.size() < 2 || !captured_control_input ||
 					block.terminator.likely != likely_branch ||
 					block.terminator.condition >= program.value_count ||
 					!type_is(block.terminator.condition, ValueType::I1) ||
@@ -1658,7 +1801,7 @@ namespace VitaEE::RegionIR
 					const Node& extract = block.nodes[defining_node[value]];
 					return extract.opcode == Opcode::ExtractLow64 &&
 					       extract.operand_count == 1 &&
-					       extract.operands[0] == branch_input.gpr[gpr] &&
+					       extract.operands[0] == control_input.gpr[gpr] &&
 					       extract.source_pc == block.terminator.branch_pc;
 				};
 				const u32 branch_opcode = block.source[block.source.size() - 2].opcode;
@@ -1729,18 +1872,35 @@ namespace VitaEE::RegionIR
 						"branch edges do not match the decoded target and fallthrough PCs");
 				}
 			}
-			else if (block.terminator.condition != INVALID_VALUE)
-			{
-				return Fail(VerifyFailure::ControlFlowMismatch, block_index, UINT32_MAX,
-					"unconditional transfer carries a predicate");
-			}
 			else
 			{
+				if (block.terminator.condition != INVALID_VALUE)
+					return Fail(VerifyFailure::ControlFlowMismatch, block_index,
+						UINT32_MAX, "unconditional transfer carries a predicate");
 				if (block.terminator.likely)
 					return Fail(VerifyFailure::ControlFlowMismatch, block_index,
 						UINT32_MAX, "unconditional transfer is marked branch-likely");
 				const Node& next_pc =
 					block.nodes[defining_node[block.terminator.taken.pc]];
+				if (block.terminator.kind == TerminatorKind::Jump)
+				{
+					if (block.source.size() < 2 ||
+						block.source[block.source.size() - 2].pc !=
+							block.terminator.branch_pc ||
+						block.source.back().pc != block.terminator.delay_slot_pc ||
+						!CanLowerStaticJump(control_opcode, program.options) ||
+						static_cast<u32>(next_pc.literal) !=
+							JumpTarget(block.terminator.branch_pc, control_opcode))
+					{
+						return Fail(VerifyFailure::ControlFlowMismatch, block_index,
+							UINT32_MAX,
+							"static jump does not match its source pair and target");
+					}
+					continue;
+				}
+				if (block.terminator.kind != TerminatorKind::Transfer)
+					return Fail(VerifyFailure::ControlFlowMismatch, block_index,
+						UINT32_MAX, "terminator kind is not represented");
 				const u32 expected_pc = block.source.empty() ? block.pc : block.source.back().pc + sizeof(u32);
 				if (static_cast<u32>(next_pc.literal) != expected_pc)
 				{
