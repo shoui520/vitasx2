@@ -3996,13 +3996,22 @@ namespace VitaEE
 			return true;
 		}
 
-		// PCSX2 owners: x86/ix86-32/iR5900Jump.cpp::recJR() snapshots the
+		// PCSX2 owners: x86/ix86-32/iR5900Jump.cpp::{recJR,recJALR} snapshot the
 		// register target in a callee-saved PCWRITEBACK register before compiling
-		// the delay slot, while x86/microVU_Macro.inl::recQMTC2() owns the VU0
-		// sync and transfer. Admit the measured non-interlocked JR/QMTC2 pair only;
-		// other COP2 delay slots need their own selected-PC and helper-clobber
-		// contracts before they can leave the exact interpreter fallback.
+		// the delay slot. The A32 register-jump path does the same in r5. Its COP2
+		// running arm publishes that captured target before calling the PCSX2 helper,
+		// while its idle arm keeps r5 intact through the native macro body. This is
+		// sufficient for every already-supported fast macro instruction, including
+		// the common VMOVE return slot. Vector transfers retain the narrower proven
+		// non-interlocked JR/QMTC2 admission below.
 		const bool jr = (branch_op >> 26) == 0x00 && (branch_op & 0x3f) == 0x08;
+		const bool jalr = (branch_op >> 26) == 0x00 && (branch_op & 0x3f) == 0x09;
+		if ((jr || jalr) && IsFastCOP2MacroInBlock(delay_op) &&
+			CanCompileOpcode(delay_op))
+		{
+			return true;
+		}
+
 		const bool noninterlocked_qmtc2 =
 			(delay_op >> 26) == 0x12 && RS(delay_op) == 0x05 &&
 			(delay_op & 1u) == 0;
@@ -12117,7 +12126,8 @@ namespace VitaEE
 							case 0x09:
 							{
 								bool handled = false;
-								if (!try_emit_static_register_branch(op, pc, true, &handled))
+								if (!register_jump_cop2_delay &&
+									!try_emit_static_register_branch(op, pc, true, &handled))
 									return false;
 								if (handled)
 									break;
@@ -12457,13 +12467,17 @@ namespace VitaEE
 							branch_delay_fallthrough_pc = pc + sizeof(u32);
 						}
 					}
+					const bool register_branch_delay_slot =
+						branch_delay_slot && has_register_branch_target;
 					if (branch_delay_slot && IsFastCOP2MacroInBlock(op) &&
-						branch_delay_selected_pc == UINT32_MAX)
+						branch_delay_selected_pc == UINT32_MAX &&
+						!register_branch_delay_slot)
 					{
 						return false;
 					}
 					if (!EmitOpcode(op, pc, raw_cycles, event_exit, branch_delay_slot,
-							branch_delay_selected_pc, branch_delay_fallthrough_pc))
+							branch_delay_selected_pc, branch_delay_fallthrough_pc,
+							register_branch_delay_slot))
 					{
 						return false;
 					}
@@ -12813,7 +12827,7 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitOpcode(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 		const void* event_exit, bool branch_delay_slot, u32 branch_delay_selected_pc,
-		u32 branch_delay_fallthrough_pc)
+		u32 branch_delay_fallthrough_pc, bool register_branch_delay_slot)
 	{
 		const u32 previous_opcode = m_current_opcode;
 		m_current_opcode = op;
@@ -12860,7 +12874,7 @@ namespace VitaEE
 			case 0x12: // COP2/VU0 macro interface, owned by COP2.cpp, VU0.cpp, and x86/microVU_Macro.inl.
 				return EmitCOP2(op, pc, raw_cycles_through_instruction, event_exit,
 					branch_delay_slot, branch_delay_selected_pc,
-					branch_delay_fallthrough_pc);
+					branch_delay_fallthrough_pc, register_branch_delay_slot);
 			case 0x18: // DADDI, owned by R5900OpcodeImpl.cpp::DADDI(); overflow trap
 				// dropped by x86/ix86-32/iR5900AritImm.cpp::recDADDI(), compiled as DADDIU.
 				return EmitDADDIU(op);
@@ -15992,7 +16006,7 @@ namespace VitaEE
 	bool BlockCompiler::EmitCOP2(u32 op, u32 pc,
 		u32 raw_cycles_through_instruction, const void* event_exit,
 		bool branch_delay_slot, u32 branch_delay_selected_pc,
-		u32 branch_delay_fallthrough_pc)
+		u32 branch_delay_fallthrough_pc, bool register_branch_delay_slot)
 	{
 		if (IsFastCOP2VectorTransfer(op))
 			return EmitCOP2VectorTransferFast(op, pc + 4,
@@ -16004,11 +16018,13 @@ namespace VitaEE
 			return EmitCOP2ControlWriteFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
 		if (IsFastCOP2MacroInBlock(op))
 		{
-			if (branch_delay_slot && branch_delay_selected_pc == UINT32_MAX)
+			if (branch_delay_slot && branch_delay_selected_pc == UINT32_MAX &&
+				!register_branch_delay_slot)
 				return false;
 			return EmitCOP2MacroFast(op, pc + 4, raw_cycles_through_instruction,
 				event_exit, branch_delay_slot ? branch_delay_selected_pc : pc + 4,
-				branch_delay_slot ? branch_delay_fallthrough_pc : UINT32_MAX);
+				branch_delay_slot ? branch_delay_fallthrough_pc : UINT32_MAX,
+				register_branch_delay_slot);
 		}
 
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
@@ -18513,7 +18529,8 @@ namespace VitaEE
 
 	bool BlockCompiler::EmitCOP2MacroFast(u32 op, u32 next_pc,
 		u32 raw_cycles_through_instruction, const void* event_exit,
-		u32 running_exit_pc, u32 running_fallthrough_pc)
+		u32 running_exit_pc, u32 running_fallthrough_pc,
+		bool running_exit_from_register_branch)
 	{
 #if defined(VITASX2_QEMU_PROVIDER_FIXTURE)
 		return false;
@@ -18529,7 +18546,8 @@ namespace VitaEE
 			(!EmitSystemHelperEventExit(op, running_exit_pc,
 				raw_cycles_through_instruction,
 				reinterpret_cast<const void*>(&R5900::Interpreter::OpcodeImpl::COP2),
-				event_exit, running_fallthrough_pc) ||
+				event_exit, running_fallthrough_pc,
+				running_exit_from_register_branch) ||
 			 !m_code.PatchBranch(vu0_idle, m_code.Size(), VitaA32::Condition::EQ)))
 		{
 			return false;
@@ -32883,17 +32901,21 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
-		const void* helper, const void* event_exit, u32 branch_fallthrough_pc)
+		const void* helper, const void* event_exit, u32 branch_fallthrough_pc,
+		bool pc_from_register_branch_target)
 	{
-		if (!helper || !event_exit || raw_cycles_through_instruction == 0)
+		if (!helper || !event_exit || raw_cycles_through_instruction == 0 ||
+			(pc_from_register_branch_target && branch_fallthrough_pc != UINT32_MAX))
 			return false;
 
 		const u32 cycles = ScaleBlockCycles(raw_cycles_through_instruction);
 		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
 			!EmitSyncGprPinsToBacking() ||
-			!(branch_fallthrough_pc == UINT32_MAX ?
-				EmitStorePc(next_pc) : EmitStoreBranchPc(next_pc, branch_fallthrough_pc)) ||
+			!(pc_from_register_branch_target ?
+				EmitStorePcFromHostReg(HOST_BRANCH_TARGET) :
+				(branch_fallthrough_pc == UINT32_MAX ?
+					EmitStorePc(next_pc) : EmitStoreBranchPc(next_pc, branch_fallthrough_pc))) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
 			!m_code.EmitCallAbsolute(helper))
 		{

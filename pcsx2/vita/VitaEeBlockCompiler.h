@@ -736,7 +736,8 @@ namespace VitaEE
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false,
 			u32 branch_delay_selected_pc = UINT32_MAX,
-			u32 branch_delay_fallthrough_pc = UINT32_MAX);
+			u32 branch_delay_fallthrough_pc = UINT32_MAX,
+			bool register_branch_delay_slot = false);
 		bool EndBlockReturn(u8 value);
 		bool EndBlockWithCycleTest(u32 block_cycles, const void* direct_exit, const void* event_exit,
 			DirectLinkSlot* direct_link = nullptr, DirectLinkSlot* taken_link = nullptr,
@@ -893,7 +894,8 @@ namespace VitaEE
 		bool EmitCOP1ConvertSingleFast(u32 op);
 		bool EmitCOP2(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, bool branch_delay_slot,
-			u32 branch_delay_selected_pc, u32 branch_delay_fallthrough_pc);
+			u32 branch_delay_selected_pc, u32 branch_delay_fallthrough_pc,
+			bool register_branch_delay_slot);
 		enum class Vu0SyncMode : u8
 		{
 			None,
@@ -935,7 +937,7 @@ namespace VitaEE
 		bool EmitCOP2MacroMinMaxBody(u32 op);
 		bool EmitCOP2MacroFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, u32 running_exit_pc,
-			u32 running_fallthrough_pc);
+			u32 running_fallthrough_pc, bool running_exit_from_register_branch);
 		bool EmitCOP2InterlockCall(u32 op, bool wait_for_mbit);
 		bool EmitCOP2VectorTransferFast(u32 op, u32 next_pc,
 			u32 raw_cycles_through_instruction, const void* event_exit,
@@ -1219,7 +1221,8 @@ namespace VitaEE
 			const void* event_exit, bool store, const GprPinDirtyMasks& dirty_pins);
 		bool EmitSystemHelperEventExit(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* helper, const void* event_exit,
-			u32 branch_fallthrough_pc = UINT32_MAX);
+			u32 branch_fallthrough_pc = UINT32_MAX,
+			bool pc_from_register_branch_target = false);
 		bool FlushColdTails();
 		void ClearGprConstState();
 		void ClearSaConstState();
