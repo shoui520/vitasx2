@@ -335,6 +335,139 @@ namespace VitaEE::RegionIR
 			return words[(pc - base) / sizeof(u32)];
 		}
 
+		const SourceBlockContract* FindSourceBlockContract(
+			const std::vector<SourceBlockContract>& contracts, u32 start_pc)
+		{
+			const auto found = std::lower_bound(contracts.begin(), contracts.end(),
+				start_pc, [](const SourceBlockContract& contract, u32 pc) {
+					return contract.start_pc < pc;
+				});
+			return found != contracts.end() && found->start_pc == start_pc ?
+				&*found : nullptr;
+		}
+
+		bool ValidateSourceBlockContracts(u32 source_base_pc,
+			const std::vector<u32>& source_words,
+			const std::vector<SourceBlockContract>& contracts, u32 entry_pc,
+			const LiftOptions& options, u32* failure_pc, std::string* detail)
+		{
+			const auto fail = [&](u32 pc, const char* message) {
+				if (failure_pc)
+					*failure_pc = pc;
+				if (detail)
+					*detail = message;
+				return false;
+			};
+			if (contracts.empty())
+				return true;
+
+			const u64 source_end = static_cast<u64>(source_base_pc) +
+				static_cast<u64>(source_words.size()) * sizeof(u32);
+			u64 previous_end = 0;
+			for (u32 index = 0; index < contracts.size(); index++)
+			{
+				const SourceBlockContract& contract = contracts[index];
+				if ((contract.start_pc & 3u) != 0 || contract.instruction_count == 0 ||
+					(contract.dependency_start_pc & 3u) != 0 ||
+					contract.dependency_instruction_count == 0)
+				{
+					return fail(contract.start_pc,
+						"source-block range is empty or unaligned");
+				}
+				const u64 end = static_cast<u64>(contract.start_pc) +
+					static_cast<u64>(contract.instruction_count) * sizeof(u32);
+				const u64 dependency_end =
+					static_cast<u64>(contract.dependency_start_pc) +
+					static_cast<u64>(contract.dependency_instruction_count) * sizeof(u32);
+				if (end > static_cast<u64>(UINT32_MAX) ||
+					dependency_end > static_cast<u64>(UINT32_MAX) ||
+					contract.start_pc < source_base_pc || end > source_end ||
+					contract.dependency_start_pc < source_base_pc ||
+					dependency_end > source_end ||
+					contract.start_pc < contract.dependency_start_pc || end > dependency_end)
+				{
+					return fail(contract.start_pc,
+						"source-block or dependency range leaves the immutable image");
+				}
+				if (index != 0 && contract.start_pc < previous_end)
+					return fail(contract.start_pc, "source-block contracts overlap");
+				previous_end = end;
+			}
+
+			const auto entry_contract = std::lower_bound(contracts.begin(), contracts.end(),
+				entry_pc, [](const SourceBlockContract& contract, u32 pc) {
+					return contract.start_pc < pc;
+				});
+			if (entry_contract == contracts.end() || entry_contract->start_pc != entry_pc)
+				return fail(entry_pc, "entry is not an attested source-block start");
+			if (entry_contract->charged_scaled_cycles_before != 0)
+				return fail(entry_pc,
+					"entry begins inside a charged A32 split dependency");
+			if (entry_contract != contracts.begin())
+			{
+				const SourceBlockContract& predecessor = *std::prev(entry_contract);
+				const u32 predecessor_end = predecessor.start_pc +
+					predecessor.instruction_count * sizeof(u32);
+				if (predecessor_end == entry_pc && !predecessor.scheduler_test_at_end)
+					return fail(entry_pc,
+						"entry follows an untested scheduler continuation");
+			}
+
+			for (const SourceBlockContract& contract : contracts)
+			{
+				const u32 end = contract.start_pc +
+					contract.instruction_count * sizeof(u32);
+				if (!contract.scheduler_test_at_end &&
+					!FindSourceBlockContract(contracts, end))
+				{
+					return fail(contract.start_pc,
+						"scheduler-elided fragment has no owned continuation");
+				}
+			}
+
+			std::set<std::pair<u32, u32>> verified_dependencies;
+			for (const SourceBlockContract& owner : contracts)
+			{
+				const std::pair<u32, u32> dependency = {
+					owner.dependency_start_pc, owner.dependency_instruction_count};
+				if (!verified_dependencies.insert(dependency).second)
+					continue;
+
+				const u32 dependency_end = owner.dependency_start_pc +
+					owner.dependency_instruction_count * sizeof(u32);
+				u32 next_pc = owner.dependency_start_pc;
+				u32 charged_cycles = 0;
+				for (const SourceBlockContract& fragment : contracts)
+				{
+					if (fragment.dependency_start_pc != owner.dependency_start_pc ||
+						fragment.dependency_instruction_count != owner.dependency_instruction_count)
+					{
+						continue;
+					}
+					if (fragment.start_pc != next_pc ||
+						fragment.charged_scaled_cycles_before != charged_cycles)
+					{
+						return fail(fragment.start_pc,
+							"split dependency is not a complete charged-cycle chain");
+					}
+					u32 raw_cycles = 0;
+					for (u32 instruction = 0;
+						instruction < fragment.instruction_count; instruction++)
+					{
+						raw_cycles += RawRecompilerCycles(ReadSourceWord(source_base_pc,
+							source_words, fragment.start_pc + instruction * sizeof(u32)),
+							options.cycle_factor);
+					}
+					next_pc += fragment.instruction_count * sizeof(u32);
+					charged_cycles += ScaleBlockCycles(raw_cycles, options.ee_cycle_rate);
+				}
+				if (next_pc != dependency_end)
+					return fail(owner.dependency_start_pc,
+						"split dependency is not fully represented by source blocks");
+			}
+			return true;
+		}
+
 		ExitReason ClassifyExternalResume(u32 source_base_pc,
 			const std::vector<u32>& source_words, u32 pc,
 			const LiftOptions& options)
@@ -382,6 +515,7 @@ namespace VitaEE::RegionIR
 		};
 
 		bool ScanRawBlock(u32 source_base_pc, const std::vector<u32>& source_words,
+			const std::vector<SourceBlockContract>& source_blocks,
 			const std::set<u32>& leaders, u32 start_pc, const LiftOptions& options,
 			RawBlock* output,
 			LiftFailure* failure, u32* failure_pc)
@@ -389,11 +523,43 @@ namespace VitaEE::RegionIR
 			RawBlock raw{};
 			raw.pc = start_pc;
 			u32 pc = start_pc;
+			u32 contract_end_pc = 0;
+			if (!source_blocks.empty())
+			{
+				const SourceBlockContract* contract =
+					FindSourceBlockContract(source_blocks, start_pc);
+				if (!contract || contract->instruction_count >
+						(UINT32_MAX - contract->start_pc) / sizeof(u32))
+				{
+					*failure = LiftFailure::SourceBlockContract;
+					*failure_pc = start_pc;
+					return false;
+				}
+				contract_end_pc = contract->start_pc +
+					contract->instruction_count * sizeof(u32);
+			}
 
 			for (;;)
 			{
+				if (!source_blocks.empty() && pc == contract_end_pc)
+				{
+					raw.transfer_pc = pc;
+					break;
+				}
+				if (!source_blocks.empty() && pc > contract_end_pc)
+				{
+					*failure = LiftFailure::SourceBlockContract;
+					*failure_pc = pc;
+					return false;
+				}
 				if (pc != start_pc && leaders.contains(pc))
 				{
+					if (!source_blocks.empty())
+					{
+						*failure = LiftFailure::SourceBlockContract;
+						*failure_pc = pc;
+						return false;
+					}
 					raw.transfer_pc = pc;
 					break;
 				}
@@ -425,6 +591,12 @@ namespace VitaEE::RegionIR
 					{
 						*failure = LiftFailure::BranchInDelaySlot;
 						*failure_pc = delay_pc;
+						return false;
+					}
+					if (!source_blocks.empty() && delay_pc + sizeof(u32) != contract_end_pc)
+					{
+						*failure = LiftFailure::SourceBlockContract;
+						*failure_pc = pc;
 						return false;
 					}
 
@@ -832,7 +1004,8 @@ namespace VitaEE::RegionIR
 			Transfer MakeTransfer(Block& block, const StateMap& state, u32 target_pc,
 				ExitReason reason,
 				const std::map<u32, u32>& block_indices,
-				u32 source_pc, bool link_internal = true)
+				u32 source_pc, bool link_internal = true,
+				bool event_horizon_check = true)
 			{
 				Transfer transfer{};
 				transfer.state = state;
@@ -841,16 +1014,19 @@ namespace VitaEE::RegionIR
 				const auto found = block_indices.find(target_pc);
 				if (link_internal && found != block_indices.end())
 					transfer.target_block = found->second;
+				transfer.event_horizon_check = event_horizon_check;
 				return transfer;
 			}
 
 			Transfer MakeRegisterTransfer(
-				const StateMap& state, ValueId target, ExitReason reason)
+				const StateMap& state, ValueId target, ExitReason reason,
+				bool event_horizon_check = true)
 			{
 				Transfer transfer{};
 				transfer.state = state;
 				transfer.pc = target;
 				transfer.external_reason = reason;
+				transfer.event_horizon_check = event_horizon_check;
 				return transfer;
 			}
 
@@ -864,6 +1040,7 @@ namespace VitaEE::RegionIR
 				transfer.external_reason = reason;
 				transfer.cycle_commit_deferred = true;
 				transfer.pending_raw_cycles = pending_raw_cycles;
+				transfer.event_horizon_check = false;
 				return transfer;
 			}
 
@@ -935,9 +1112,9 @@ namespace VitaEE::RegionIR
 		       cycle_factor;
 	}
 
-	LiftResult Lift(u32 source_base_pc, const u32* source_words,
-		u32 source_word_count, u32 entry_pc,
-		const LiftOptions& options)
+	static LiftResult LiftInternal(u32 source_base_pc, const u32* source_words,
+		u32 source_word_count, const SourceBlockContract* source_blocks,
+		u32 source_block_count, u32 entry_pc, const LiftOptions& options)
 	{
 		LiftResult result{};
 		if (!source_words || source_word_count == 0 || (source_base_pc & 3u) != 0 ||
@@ -967,7 +1144,24 @@ namespace VitaEE::RegionIR
 		result.program.source_base_pc = source_base_pc;
 		result.program.source_words.assign(source_words,
 			source_words + source_word_count);
+		if (source_blocks && source_block_count != 0)
+			result.program.source_blocks.assign(source_blocks,
+				source_blocks + source_block_count);
 		result.program.options = options;
+		if ((source_blocks == nullptr) != (source_block_count == 0))
+		{
+			result.failure = LiftFailure::SourceBlockContract;
+			result.failure_pc = entry_pc;
+			return result;
+		}
+		std::string source_contract_detail;
+		if (!ValidateSourceBlockContracts(source_base_pc,
+				result.program.source_words, result.program.source_blocks, entry_pc,
+				options, &result.failure_pc, &source_contract_detail))
+		{
+			result.failure = LiftFailure::SourceBlockContract;
+			return result;
+		}
 
 		std::set<u32> leaders = {entry_pc};
 		std::map<u32, RawBlock> raw_blocks;
@@ -992,8 +1186,9 @@ namespace VitaEE::RegionIR
 				}
 
 				RawBlock raw{};
-				if (!ScanRawBlock(source_base_pc, result.program.source_words, leaders,
-						pc, options, &raw, &result.failure, &result.failure_pc))
+				if (!ScanRawBlock(source_base_pc, result.program.source_words,
+						result.program.source_blocks, leaders, pc, options, &raw,
+						&result.failure, &result.failure_pc))
 				{
 					return result;
 				}
@@ -1023,10 +1218,13 @@ namespace VitaEE::RegionIR
 					// phase and must not turn a useful prefix into a whole-region
 					// block/overlap failure.
 				}
-				else if (leaders.contains(raw.transfer_pc) &&
+				else if ((leaders.contains(raw.transfer_pc) ||
+							 FindSourceBlockContract(result.program.source_blocks,
+								raw.transfer_pc)) &&
 						 ContainsPc(source_base_pc, source_word_count,
 							 raw.transfer_pc))
 				{
+					leaders.insert(raw.transfer_pc);
 					pending.push_back(raw.transfer_pc);
 				}
 				raw_blocks.emplace(pc, std::move(raw));
@@ -1093,6 +1291,10 @@ namespace VitaEE::RegionIR
 		for (const auto& [pc, raw] : raw_blocks)
 		{
 			Block& block = result.program.blocks[block_indices.at(pc)];
+			const SourceBlockContract* source_contract =
+				FindSourceBlockContract(result.program.source_blocks, block.pc);
+			const bool event_horizon_check = !source_contract ||
+				source_contract->scheduler_test_at_end;
 			StateMap state = block.parameters;
 			StateMap not_taken_state = state;
 			block.source = raw.body;
@@ -1224,10 +1426,11 @@ namespace VitaEE::RegionIR
 				block.terminator.delay_slot_pc = raw.delay.pc;
 				block.terminator.taken = builder.MakeTransfer(
 					block, state, taken_pc, ExitReason::RegionBoundary, block_indices,
-					raw.delay.pc);
+					raw.delay.pc, true, event_horizon_check);
 				block.terminator.not_taken = builder.MakeTransfer(
 					block, not_taken_state, not_taken_pc, ExitReason::RegionBoundary,
-					block_indices, likely_branch ? raw.branch_pc : raw.delay.pc);
+					block_indices, likely_branch ? raw.branch_pc : raw.delay.pc, true,
+					event_horizon_check);
 			}
 			else if (raw.control_kind == RawControlKind::StaticJump)
 			{
@@ -1236,7 +1439,8 @@ namespace VitaEE::RegionIR
 				block.terminator.delay_slot_pc = raw.delay.pc;
 				block.terminator.taken = builder.MakeTransfer(
 					block, state, JumpTarget(raw.branch_pc, raw.branch_opcode),
-					ExitReason::RegionBoundary, block_indices, raw.delay.pc);
+					ExitReason::RegionBoundary, block_indices, raw.delay.pc, true,
+					event_horizon_check);
 			}
 			else if (raw.control_kind == RawControlKind::RegisterJump)
 			{
@@ -1244,7 +1448,8 @@ namespace VitaEE::RegionIR
 				block.terminator.branch_pc = raw.branch_pc;
 				block.terminator.delay_slot_pc = raw.delay.pc;
 				block.terminator.taken = builder.MakeRegisterTransfer(
-					state, register_target, ExitReason::RegionBoundary);
+					state, register_target, ExitReason::RegionBoundary,
+					event_horizon_check);
 			}
 			else
 			{
@@ -1261,7 +1466,7 @@ namespace VitaEE::RegionIR
 					block.terminator.taken = builder.MakeTransfer(
 						block, state, raw.transfer_pc, raw.transfer_reason, block_indices,
 						block.source.empty() ? block.pc : block.source.back().pc,
-						true);
+						true, event_horizon_check);
 				}
 			}
 		}
@@ -1274,6 +1479,30 @@ namespace VitaEE::RegionIR
 			result.failure_pc = verified.block < result.program.blocks.size() ? result.program.blocks[verified.block].pc : entry_pc;
 		}
 		return result;
+	}
+
+	LiftResult Lift(u32 source_base_pc, const u32* source_words,
+		u32 source_word_count, u32 entry_pc, const LiftOptions& options)
+	{
+		// Semantic/adversarial and source-coverage fixtures may remain unattested.
+		// This overload cannot authorize future product execution.
+		return LiftInternal(source_base_pc, source_words, source_word_count,
+			nullptr, 0, entry_pc, options);
+	}
+
+	LiftResult LiftWithSourceBlocks(u32 source_base_pc, const u32* source_words,
+		u32 source_word_count, const SourceBlockContract* source_blocks,
+		u32 source_block_count, u32 entry_pc, const LiftOptions& options)
+	{
+		if (!source_blocks || source_block_count == 0)
+		{
+			LiftResult result{};
+			result.failure = LiftFailure::SourceBlockContract;
+			result.failure_pc = entry_pc;
+			return result;
+		}
+		return LiftInternal(source_base_pc, source_words, source_word_count,
+			source_blocks, source_block_count, entry_pc, options);
 	}
 
 	VerifyResult Verify(const Program& program)
@@ -1296,6 +1525,15 @@ namespace VitaEE::RegionIR
 		if (program.entry_block >= program.blocks.size())
 			return Fail(VerifyFailure::InvalidEntry, program.entry_block, UINT32_MAX,
 				"entry block is outside the CFG");
+		std::string source_contract_detail;
+		if (!ValidateSourceBlockContracts(program.source_base_pc,
+				program.source_words, program.source_blocks,
+				program.blocks[program.entry_block].pc, program.options,
+				nullptr, &source_contract_detail))
+		{
+			return Fail(VerifyFailure::SourceBlockContract, program.entry_block,
+				UINT32_MAX, std::move(source_contract_detail));
+		}
 
 		std::map<u32, u32> pc_to_block;
 		std::vector<ValueType> types(program.value_count, ValueType::Void);
@@ -1307,6 +1545,13 @@ namespace VitaEE::RegionIR
 			 block_index++)
 		{
 			const Block& block = program.blocks[block_index];
+			const SourceBlockContract* source_contract =
+				FindSourceBlockContract(program.source_blocks, block.pc);
+			if (!program.source_blocks.empty() && !source_contract)
+			{
+				return Fail(VerifyFailure::SourceBlockContract, block_index,
+					UINT32_MAX, "IR block does not begin at an attested source block");
+			}
 			if (!pc_to_block.emplace(block.pc, block_index).second)
 				return Fail(VerifyFailure::DuplicateBlockPc, block_index, UINT32_MAX,
 					"two blocks own the same guest PC");
@@ -1341,6 +1586,8 @@ namespace VitaEE::RegionIR
 			 block_index++)
 		{
 			const Block& block = program.blocks[block_index];
+			const SourceBlockContract* source_contract =
+				FindSourceBlockContract(program.source_blocks, block.pc);
 			if (!ContainsPc(program.source_base_pc,
 					static_cast<u32>(program.source_words.size()), block.pc))
 			{
@@ -1457,6 +1704,20 @@ namespace VitaEE::RegionIR
 				block.terminator.kind == TerminatorKind::Transfer &&
 				block.terminator.taken.target_block == INVALID_BLOCK &&
 				block.terminator.taken.external_reason != ExitReason::RegionBoundary;
+			if (source_contract)
+			{
+				const u32 represented_end = block.source.empty() ? block.pc :
+					block.source.back().pc + sizeof(u32);
+				const u32 contract_end = source_contract->start_pc +
+					source_contract->instruction_count * sizeof(u32);
+				if (represented_end > contract_end ||
+					(!deferred_observer && represented_end != contract_end))
+				{
+					return Fail(VerifyFailure::SourceBlockContract, block_index,
+						UINT32_MAX,
+						"represented source does not reach its attested timing boundary");
+				}
+			}
 			const u32 scaled_cycles = block.source.empty() ?
 			                              0 :
 			                              ScaleBlockCycles(raw_cycles,
@@ -1887,7 +2148,8 @@ namespace VitaEE::RegionIR
 
 			auto verify_transfer = [&](const Transfer& transfer,
 				const StateMap& expected_state, bool expected_deferred,
-				u32 expected_pending_raw_cycles) -> VerifyResult {
+				u32 expected_pending_raw_cycles,
+				bool expected_event_horizon_check) -> VerifyResult {
 				if (!StateMapsEqual(transfer.state, expected_state))
 					return Fail(
 						VerifyFailure::StateMapMismatch, block_index, UINT32_MAX,
@@ -1897,6 +2159,18 @@ namespace VitaEE::RegionIR
 				{
 					return Fail(VerifyFailure::CycleMismatch, block_index, UINT32_MAX,
 						"edge deferred-cycle contract does not match its source prefix");
+				}
+				if (transfer.event_horizon_check != expected_event_horizon_check)
+				{
+					return Fail(VerifyFailure::CycleMismatch, block_index, UINT32_MAX,
+						"edge scheduler test does not match its attested source boundary");
+				}
+				if (!expected_deferred && !expected_event_horizon_check &&
+					transfer.target_block == INVALID_BLOCK)
+				{
+					return Fail(VerifyFailure::SourceBlockContract, block_index,
+						UINT32_MAX,
+						"scheduler-elided source fragment leaves the owned region");
 				}
 				if (!type_is(transfer.pc, ValueType::Address) ||
 					defining_block[transfer.pc] != block_index)
@@ -1971,11 +2245,22 @@ namespace VitaEE::RegionIR
 				return {};
 			};
 
+			const bool expected_event_horizon_check = !deferred_observer &&
+				(!source_contract || source_contract->scheduler_test_at_end);
 			VerifyResult transfer_check = verify_transfer(block.terminator.taken,
 				primary_expected, deferred_observer,
-				deferred_observer ? raw_cycles : 0);
+				deferred_observer ? raw_cycles : 0,
+				expected_event_horizon_check);
 			if (!transfer_check)
 				return transfer_check;
+			if (source_contract && !source_contract->scheduler_test_at_end &&
+				!deferred_observer &&
+				block.terminator.kind != TerminatorKind::Transfer)
+			{
+				return Fail(VerifyFailure::SourceBlockContract, block_index,
+					UINT32_MAX,
+					"scheduler-elided source fragment is not a straight continuation");
+			}
 			if (block.terminator.kind == TerminatorKind::Branch)
 			{
 				if (block.source.size() < 2 || !captured_control_input ||
@@ -2067,7 +2352,7 @@ namespace VitaEE::RegionIR
 				}
 
 				transfer_check = verify_transfer(block.terminator.not_taken,
-					not_taken_expected, false, 0);
+					not_taken_expected, false, 0, expected_event_horizon_check);
 				if (!transfer_check)
 					return transfer_check;
 
@@ -2505,7 +2790,7 @@ namespace VitaEE::RegionIR
 			const RuntimeValue outgoing_memory_effect =
 				values[transfer->state.memory_effect];
 			current = materialize(*transfer);
-			if (!transfer->cycle_commit_deferred && event_due(current.cycle))
+			if (transfer->event_horizon_check && event_due(current.cycle))
 			{
 				*output = current;
 				result.completed = true;

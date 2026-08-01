@@ -187,6 +187,9 @@ namespace VitaEE::RegionIR
 		// when the prefix is empty and pending_raw_cycles is zero.
 		bool cycle_commit_deferred = false;
 		u32 pending_raw_cycles = 0;
+		// True only at a real PCSX2 scheduler boundary. A cycle-publishing A32
+		// physical continuation may deliberately leave this false.
+		bool event_horizon_check = true;
 	};
 
 	enum class TerminatorKind : u8
@@ -234,6 +237,23 @@ namespace VitaEE::RegionIR
 		Terminator terminator{};
 	};
 
+	// One immutable timing fragment from the existing Vita EE provider. A
+	// PCSX2 source block can be emitted as several A32 fragments when the host
+	// code budget is exhausted; all such fragments share dependency_start_pc /
+	// dependency_instruction_count. charged_scaled_cycles_before is the exact
+	// architectural cycle charge already published by preceding fragments.
+	// scheduler_test_at_end is separate because PCSX2 short splits and Vita's
+	// cycle-proven A32 continuations publish cycles without polling at that seam.
+	struct SourceBlockContract
+	{
+		u32 start_pc = 0;
+		u32 instruction_count = 0;
+		u32 dependency_start_pc = 0;
+		u32 dependency_instruction_count = 0;
+		u32 charged_scaled_cycles_before = 0;
+		bool scheduler_test_at_end = true;
+	};
+
 	struct LiftOptions
 	{
 		// Interpreter.cpp::execI() multiplies each opcode cost by this value,
@@ -251,6 +271,9 @@ namespace VitaEE::RegionIR
 	{
 		u32 source_base_pc = 0;
 		std::vector<u32> source_words;
+		// Empty only for the explicitly unattested validation overload of Lift().
+		// Product compilation must use LiftWithSourceBlocks().
+		std::vector<SourceBlockContract> source_blocks;
 		LiftOptions options{};
 		u32 entry_block = INVALID_BLOCK;
 		u32 value_count = 0;
@@ -267,6 +290,7 @@ namespace VitaEE::RegionIR
 		MissingDelaySlot,
 		BranchInDelaySlot,
 		OverlappingSource,
+		SourceBlockContract,
 		ValueLimit,
 		InternalError,
 	};
@@ -295,6 +319,7 @@ namespace VitaEE::RegionIR
 		StateMapMismatch,
 		SourceMismatch,
 		SourceOverlap,
+		SourceBlockContract,
 		CycleMismatch,
 		ExitContractMismatch,
 		ControlFlowMismatch,
@@ -352,6 +377,10 @@ namespace VitaEE::RegionIR
 
 	LiftResult Lift(u32 source_base_pc, const u32* source_words,
 		u32 source_word_count, u32 entry_pc,
+		const LiftOptions& options = {});
+	LiftResult LiftWithSourceBlocks(u32 source_base_pc, const u32* source_words,
+		u32 source_word_count, const SourceBlockContract* source_blocks,
+		u32 source_block_count, u32 entry_pc,
 		const LiftOptions& options = {});
 	VerifyResult Verify(const Program& program);
 	InterpretResult Interpret(const Program& program, const CanonicalState& input,
