@@ -60,6 +60,9 @@ namespace VitaEE::RegionIR
 		Cop1MulRaw,
 		Cop1ClampOuResult,
 		Cop1UpdateOuFlags,
+		// SCE CVT.W.S writes the truncated/saturated signed word as raw FPR
+		// bits and leaves FCR31 untouched.
+		Cop1ConvertWord,
 		SignExtend32To64,
 		ZeroExtend32To64,
 		Add32,
