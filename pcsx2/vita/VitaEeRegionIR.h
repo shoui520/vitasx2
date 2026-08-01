@@ -119,11 +119,18 @@ namespace VitaEE::RegionIR
 		MemoryLoad,
 		MemoryLoadValue,
 		MemoryStore,
+		// LQC2/SQC2 are direct only while VU0 is idle. The node consumes the
+		// current VPU_STAT and exact VF value, exits before the source instruction
+		// when bit zero says micro mode is running, and otherwise forwards the VF
+		// value. Making the transfer depend on this result prevents a backend from
+		// moving the memory effect ahead of the synchronization observer.
+		Vu0RequireIdle,
 		BindGpr,
 		BindHi,
 		BindLo,
 		BindSa,
 		BindFpr,
+		BindVu0Vf,
 		BindFcr31,
 		BindAcc,
 		AdvanceCycles,
@@ -163,6 +170,11 @@ namespace VitaEE::RegionIR
 		ValueId fcr31 = INVALID_VALUE;
 		ValueId acc = INVALID_VALUE;
 		ValueId acc_flag = INVALID_VALUE;
+		// The first VU0 Region IR boundary owns vector transfers only. VI state
+		// remains outside the admitted instruction surface except for the VPU_STAT
+		// busy observer required by PCSX2 VU0.cpp::vu0Sync().
+		std::array<ValueId, 32> vu0_vf{};
+		ValueId vu0_vpu_stat = INVALID_VALUE;
 		ValueId cycle = INVALID_VALUE;
 		// Ordered, non-architectural memory state. It prevents loads and stores
 		// from being reordered across each other while remaining absent from the
@@ -184,12 +196,16 @@ namespace VitaEE::RegionIR
 		LoadF32Bits,
 		Load64,
 		Load128,
+		// LQC2 has the same 128-bit memory width as LQ, but names the VU0 VF
+		// register file and therefore carries a distinct verifier domain.
+		LoadVu0Vector,
 		Store8,
 		Store16,
 		Store32,
 		StoreF32Bits,
 		Store64,
 		Store128,
+		StoreVu0Vector,
 	};
 
 	enum class MemoryProbeResult : u8
@@ -421,6 +437,8 @@ namespace VitaEE::RegionIR
 		u32 fcr31 = 0;
 		u32 acc = 0;
 		u32 acc_flag = 0;
+		std::array<u128, 32> vu0_vf{};
+		u32 vu0_vpu_stat = 0;
 		u32 pc = 0;
 		u64 cycle = 0;
 	};

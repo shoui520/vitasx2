@@ -28,7 +28,11 @@ namespace VitaEE::RegionIR
 		constexpr u32 FCR31_PARAMETER = FCR0_PARAMETER + 1;
 		constexpr u32 ACC_PARAMETER = FCR31_PARAMETER + 1;
 		constexpr u32 ACC_FLAG_PARAMETER = ACC_PARAMETER + 1;
-		constexpr u32 CYCLE_PARAMETER = ACC_FLAG_PARAMETER + 1;
+		constexpr u32 VU0_VF_PARAMETER_BASE = ACC_FLAG_PARAMETER + 1;
+		constexpr u32 VU0_VF_COUNT = 32;
+		constexpr u32 VU0_VPU_STAT_PARAMETER =
+			VU0_VF_PARAMETER_BASE + VU0_VF_COUNT;
+		constexpr u32 CYCLE_PARAMETER = VU0_VPU_STAT_PARAMETER + 1;
 		constexpr u32 MEMORY_EFFECT_PARAMETER = CYCLE_PARAMETER + 1;
 		constexpr u32 PARAMETER_COUNT = MEMORY_EFFECT_PARAMETER + 1;
 		enum class NoEffectKind : u32
@@ -768,6 +772,9 @@ namespace VitaEE::RegionIR
 				case 0x1e:
 					decoded = MemoryAccessKind::Load128;
 					break;
+				case 0x36: // LQC2
+					decoded = MemoryAccessKind::LoadVu0Vector;
+					break;
 				case 0x28:
 					decoded = MemoryAccessKind::Store8;
 					break;
@@ -786,6 +793,9 @@ namespace VitaEE::RegionIR
 				case 0x1f:
 					decoded = MemoryAccessKind::Store128;
 					break;
+				case 0x3e: // SQC2
+					decoded = MemoryAccessKind::StoreVu0Vector;
+					break;
 				default:
 					return false;
 			}
@@ -796,13 +806,19 @@ namespace VitaEE::RegionIR
 
 		bool IsMemoryLoad(MemoryAccessKind kind)
 		{
-			return kind <= MemoryAccessKind::Load128;
+			return kind <= MemoryAccessKind::LoadVu0Vector;
 		}
 
 		bool IsFprMemoryAccess(MemoryAccessKind kind)
 		{
 			return kind == MemoryAccessKind::LoadF32Bits ||
 			       kind == MemoryAccessKind::StoreF32Bits;
+		}
+
+		bool IsVu0MemoryAccess(MemoryAccessKind kind)
+		{
+			return kind == MemoryAccessKind::LoadVu0Vector ||
+			       kind == MemoryAccessKind::StoreVu0Vector;
 		}
 
 		u32 MemoryAlignmentMask(MemoryAccessKind kind)
@@ -822,6 +838,11 @@ namespace VitaEE::RegionIR
 				case MemoryAccessKind::Load64:
 				case MemoryAccessKind::Store64:
 					return 7;
+				// Unlike EE LQ/SQ's masked address contract, the SCE COP2 transfer
+				// contract requires a 128-bit-aligned effective address.
+				case MemoryAccessKind::LoadVu0Vector:
+				case MemoryAccessKind::StoreVu0Vector:
+					return 15;
 				default:
 					return 0;
 			}
@@ -830,7 +851,8 @@ namespace VitaEE::RegionIR
 		bool IsQuadMemoryAccess(MemoryAccessKind kind)
 		{
 			return kind == MemoryAccessKind::Load128 ||
-			       kind == MemoryAccessKind::Store128;
+			       kind == MemoryAccessKind::Store128 ||
+			       IsVu0MemoryAccess(kind);
 		}
 
 		bool CanLowerNonBranch(u32 op, const LiftOptions& options)
@@ -1266,6 +1288,17 @@ namespace VitaEE::RegionIR
 						ValueType::F32Bits, {}, 0, ACC_PARAMETER, 0, block.pc);
 					block.parameters.acc_flag = AddNode(block, Opcode::Parameter,
 						ValueType::I32, {}, 0, ACC_FLAG_PARAMETER, 0, block.pc);
+					for (u32 vf = 0; vf < VU0_VF_COUNT; vf++)
+					{
+						block.parameters.vu0_vf[vf] = AddNode(block,
+							Opcode::Parameter, ValueType::I128, {}, 0,
+							VU0_VF_PARAMETER_BASE + vf, 0, block.pc);
+						if (block.parameters.vu0_vf[vf] == INVALID_VALUE)
+							return false;
+					}
+					block.parameters.vu0_vpu_stat = AddNode(block,
+						Opcode::Parameter, ValueType::I32, {}, 0,
+						VU0_VPU_STAT_PARAMETER, 0, block.pc);
 					block.parameters.cycle =
 						AddNode(block, Opcode::Parameter, ValueType::Cycle, {}, 0,
 							CYCLE_PARAMETER, 0, block.pc);
@@ -1279,6 +1312,7 @@ namespace VitaEE::RegionIR
 						block.parameters.fcr31 == INVALID_VALUE ||
 						block.parameters.acc == INVALID_VALUE ||
 						block.parameters.acc_flag == INVALID_VALUE ||
+						block.parameters.vu0_vpu_stat == INVALID_VALUE ||
 						block.parameters.cycle == INVALID_VALUE ||
 						block.parameters.memory_effect == INVALID_VALUE)
 					{
@@ -1476,6 +1510,24 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
+			bool WriteVu0Vf(Block& block, StateMap* state, u32 reg, ValueId value,
+				u32 source_pc)
+			{
+				// VF0 is the architectural (0,0,0,1) constant. LQC2 still performs
+				// its memory read, but discards the loaded value.
+				if (reg == 0)
+					return true;
+				if (value == INVALID_VALUE ||
+					AddNode(block, Opcode::BindVu0Vf, ValueType::Void,
+						{value, INVALID_VALUE, INVALID_VALUE}, 1, reg, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				state->vu0_vf[reg] = value;
+				return true;
+			}
+
 			bool WriteFcr31(Block& block, StateMap* state, ValueId value,
 				u32 source_pc)
 			{
@@ -1616,9 +1668,18 @@ namespace VitaEE::RegionIR
 				MemoryAccessKind kind)
 			{
 				const bool fpr_access = IsFprMemoryAccess(kind);
+				const bool vu0_access = IsVu0MemoryAccess(kind);
 				const u32 destination = RT(op);
-				const ValueId architectural_value = fpr_access ?
-					state->fpr[destination] : state->gpr[destination];
+				ValueId architectural_value = fpr_access ? state->fpr[destination] :
+					(vu0_access ? state->vu0_vf[destination] :
+					              state->gpr[destination]);
+				if (vu0_access)
+				{
+					architectural_value = Binary(block, Opcode::Vu0RequireIdle,
+						ValueType::I128, state->vu0_vpu_stat, architectural_value, pc);
+					if (architectural_value == INVALID_VALUE)
+						return false;
+				}
 				const ValueId base = Low32(block, *state, RS(op), pc);
 				const ValueId offset =
 					Constant32(block, static_cast<u32>(static_cast<s32>(IMM_S(op))), pc);
@@ -1645,6 +1706,8 @@ namespace VitaEE::RegionIR
 						effect, pc);
 					if (fpr_access)
 						return WriteFpr(block, state, destination, value, pc);
+					if (vu0_access)
+						return WriteVu0Vf(block, state, destination, value, pc);
 					if (value == INVALID_VALUE ||
 						AddNode(block, Opcode::BindGpr, ValueType::Void,
 							{value, INVALID_VALUE, INVALID_VALUE}, 1, destination, 0,
@@ -2110,6 +2173,8 @@ namespace VitaEE::RegionIR
 			       left.sa == right.sa && left.fpr == right.fpr &&
 			       left.fcr0 == right.fcr0 && left.fcr31 == right.fcr31 &&
 			       left.acc == right.acc && left.acc_flag == right.acc_flag &&
+			       left.vu0_vf == right.vu0_vf &&
+			       left.vu0_vpu_stat == right.vu0_vpu_stat &&
 			       left.cycle == right.cycle &&
 			       left.memory_effect == right.memory_effect;
 		}
@@ -2662,10 +2727,13 @@ namespace VitaEE::RegionIR
 				const Node& parameter = block.nodes[slot];
 				const bool fpr_parameter = slot >= FPR_PARAMETER_BASE &&
 				                           slot < FPR_PARAMETER_BASE + FPR_COUNT;
+				const bool vu0_vf_parameter = slot >= VU0_VF_PARAMETER_BASE &&
+				                              slot < VU0_VF_PARAMETER_BASE + VU0_VF_COUNT;
 				const bool i32_parameter = slot == SA_PARAMETER ||
 				                           slot == FCR0_PARAMETER ||
 				                           slot == FCR31_PARAMETER ||
-				                           slot == ACC_FLAG_PARAMETER;
+				                           slot == ACC_FLAG_PARAMETER ||
+				                           slot == VU0_VPU_STAT_PARAMETER;
 				const ValueType expected_type = i32_parameter ? ValueType::I32 :
 					fpr_parameter ? ValueType::F32Bits :
 					slot == ACC_PARAMETER ? ValueType::F32Bits :
@@ -2697,6 +2765,10 @@ namespace VitaEE::RegionIR
 					expected.acc = parameter.id;
 				else if (slot == ACC_FLAG_PARAMETER)
 					expected.acc_flag = parameter.id;
+				else if (vu0_vf_parameter)
+					expected.vu0_vf[slot - VU0_VF_PARAMETER_BASE] = parameter.id;
+				else if (slot == VU0_VPU_STAT_PARAMETER)
+					expected.vu0_vpu_stat = parameter.id;
 				else if (slot == CYCLE_PARAMETER)
 					expected.cycle = parameter.id;
 				else
@@ -2827,6 +2899,9 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> pure_mmi_gpr_bind_count;
 			std::map<u32, u32> pure_cop1_gpr_bind_count;
 			std::map<u32, u32> fpr_bind_count;
+			std::map<u32, u32> vu0_idle_guard_count;
+			std::map<u32, ValueId> vu0_idle_guard_value;
+			std::map<u32, u32> vu0_vf_bind_count;
 			std::map<u32, u32> fcr31_bind_count;
 			std::map<u32, u32> acc_bind_count;
 			std::map<u32, ValueId> cop1_ou_raw_result;
@@ -3579,6 +3654,30 @@ namespace VitaEE::RegionIR
 						checked = binary(ValueType::I32, ValueType::I32,
 							ValueType::Address);
 						break;
+					case Opcode::Vu0RequireIdle:
+					{
+						checked = binary(ValueType::I32, ValueType::I128,
+							ValueType::I128);
+						if (!checked)
+							break;
+						u32 source_opcode = 0;
+						MemoryAccessKind kind{};
+						if (!source_opcode_at(node.source_pc, &source_opcode) ||
+							!DecodeMemoryAccess(source_opcode, &kind) ||
+							!IsVu0MemoryAccess(kind) || node.immediate != 0 ||
+							node.literal != 0 ||
+							node.operands[0] != expected.vu0_vpu_stat ||
+							node.operands[1] != expected.vu0_vf[RT(source_opcode)] ||
+							!vu0_idle_guard_value.emplace(node.source_pc, node.id).second)
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 idle guard does not consume the decoded live state exactly once");
+							break;
+						}
+						vu0_idle_guard_count[node.source_pc]++;
+						break;
+					}
 					case Opcode::MemoryLoad:
 					case Opcode::MemoryStore:
 					{
@@ -3612,13 +3711,27 @@ namespace VitaEE::RegionIR
 							break;
 						}
 						const bool fpr_access = IsFprMemoryAccess(expected_kind);
+						const bool vu0_access = IsVu0MemoryAccess(expected_kind);
 						checked = require_operand(node, node_index, 2,
 							fpr_access ? ValueType::F32Bits : ValueType::I128);
 						if (!checked)
 							break;
-						const ValueId expected_value = fpr_access ?
+						ValueId expected_value = fpr_access ?
 							expected.fpr[RT(source_opcode)] :
-							expected.gpr[RT(source_opcode)];
+							(vu0_access ? expected.vu0_vf[RT(source_opcode)] :
+							              expected.gpr[RT(source_opcode)]);
+						if (vu0_access)
+						{
+							const auto guard = vu0_idle_guard_value.find(node.source_pc);
+							if (guard == vu0_idle_guard_value.end())
+							{
+								checked = Fail(VerifyFailure::SourceMismatch, block_index,
+									node_index,
+									"VU0 vector memory effect precedes its idle observer");
+								break;
+							}
+							expected_value = guard->second;
+						}
 						if (node.operands[0] != expected.memory_effect ||
 							node.operands[2] != expected_value)
 						{
@@ -3965,6 +4078,37 @@ namespace VitaEE::RegionIR
 							expected.fpr[node.immediate] = node.operands[0];
 						}
 						break;
+					case Opcode::BindVu0Vf:
+						checked = unary(ValueType::I128, ValueType::Void);
+						if (checked &&
+							(node.immediate == 0 || node.immediate >= VU0_VF_COUNT))
+						{
+							checked = Fail(VerifyFailure::OperandOutOfRange,
+								block_index, node_index,
+								"VU0 VF binding targets immutable VF0 or an invalid slot");
+						}
+						if (checked)
+						{
+							u32 source_opcode = 0;
+							MemoryAccessKind kind{};
+							const Node* value = local_node(node.operands[0]);
+							if (!source_opcode_at(node.source_pc, &source_opcode) ||
+								!DecodeMemoryAccess(source_opcode, &kind) ||
+								kind != MemoryAccessKind::LoadVu0Vector ||
+								node.immediate != RT(source_opcode) || !value ||
+								value->opcode != Opcode::MemoryLoadValue ||
+								value->source_pc != node.source_pc)
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"loaded VU0 VF binding does not match decoded ft");
+								break;
+							}
+							memory_bind_count[node.source_pc]++;
+							vu0_vf_bind_count[node.source_pc]++;
+							expected.vu0_vf[node.immediate] = node.operands[0];
+						}
+						break;
 					case Opcode::BindFcr31:
 						checked = unary(ValueType::I32, ValueType::Void);
 						if (checked)
@@ -4306,13 +4450,18 @@ namespace VitaEE::RegionIR
 				if (!DecodeMemoryAccess(source.opcode, &kind))
 					continue;
 				const bool fpr_access = IsFprMemoryAccess(kind);
+				const bool vu0_access = IsVu0MemoryAccess(kind);
 				const u32 expected_values =
 					IsMemoryLoad(kind) && (fpr_access || RT(source.opcode) != 0) ? 1u : 0u;
 				if (memory_operation_count[source.pc] != 1 ||
 					memory_value_count[source.pc] != expected_values ||
 					memory_bind_count[source.pc] != expected_values ||
 					fpr_bind_count[source.pc] !=
-						(fpr_access && IsMemoryLoad(kind) ? 1u : 0u))
+						(fpr_access && IsMemoryLoad(kind) ? 1u : 0u) ||
+					vu0_idle_guard_count[source.pc] != (vu0_access ? 1u : 0u) ||
+					vu0_vf_bind_count[source.pc] !=
+						(vu0_access && IsMemoryLoad(kind) && RT(source.opcode) != 0 ?
+							1u : 0u))
 				{
 					return Fail(VerifyFailure::SourceMismatch, block_index, UINT32_MAX,
 						"decoded memory instruction lacks one exact ordered effect/value/bind");
@@ -4663,6 +4812,7 @@ namespace VitaEE::RegionIR
 		std::vector<RuntimeValue> values(program.value_count);
 		CanonicalState current = input;
 		current.gpr[0] = {};
+		current.vu0_vf[0] = Bits(0, 0x3f80000000000000ull);
 		auto event_due = [&](u64 cycle) {
 			return options.next_event_cycle != UINT64_MAX &&
 			       cycle >= options.next_event_cycle;
@@ -4690,6 +4840,11 @@ namespace VitaEE::RegionIR
 			values[block.parameters.acc] = {ValueType::F32Bits, Bits(state.acc)};
 			values[block.parameters.acc_flag] =
 				{ValueType::I32, Bits(state.acc_flag)};
+			for (u32 vf = 0; vf < VU0_VF_COUNT; vf++)
+				values[block.parameters.vu0_vf[vf]] =
+					{ValueType::I128, state.vu0_vf[vf]};
+			values[block.parameters.vu0_vpu_stat] =
+				{ValueType::I32, Bits(state.vu0_vpu_stat)};
 			values[block.parameters.cycle] = {ValueType::Cycle, Bits(state.cycle)};
 			values[block.parameters.memory_effect] = memory_effect;
 		};
@@ -4709,6 +4864,11 @@ namespace VitaEE::RegionIR
 			state.acc = static_cast<u32>(values[transfer.state.acc].bits.lo);
 			state.acc_flag =
 				static_cast<u32>(values[transfer.state.acc_flag].bits.lo);
+			for (u32 vf = 0; vf < VU0_VF_COUNT; vf++)
+				state.vu0_vf[vf] = values[transfer.state.vu0_vf[vf]].bits;
+			state.vu0_vf[0] = Bits(0, 0x3f80000000000000ull);
+			state.vu0_vpu_stat = static_cast<u32>(
+				values[transfer.state.vu0_vpu_stat].bits.lo);
 			state.cycle = values[transfer.state.cycle].bits.lo;
 			state.pc = static_cast<u32>(values[transfer.pc].bits.lo);
 			return state;
@@ -4717,8 +4877,8 @@ namespace VitaEE::RegionIR
 		u32 block_index = program.entry_block;
 		assign_parameters(program.blocks[block_index], current,
 			{ValueType::MemoryEffect, Bits(0)});
-		auto exit_before_memory = [&](const Block& block, const Node& node,
-									  u32 address, ExitReason reason) {
+		auto exit_before_source = [&](const Block& block, const Node& node,
+									 ExitReason reason) {
 			u32 pending_raw_cycles = 0;
 			u32 source_instructions_executed = 0;
 			for (const SourceInstruction& source : block.source)
@@ -4738,6 +4898,10 @@ namespace VitaEE::RegionIR
 			result.reason = reason;
 			result.cycle_commit_deferred = true;
 			result.pending_raw_cycles = pending_raw_cycles;
+		};
+		auto exit_before_memory = [&](const Block& block, const Node& node,
+									  u32 address, ExitReason reason) {
+			exit_before_source(block, node, reason);
 			result.memory_address = address;
 		};
 		for (;;)
@@ -4980,6 +5144,15 @@ namespace VitaEE::RegionIR
 						bits = Bits(static_cast<u32>(left) +
 									static_cast<u32>(right));
 						break;
+					case Opcode::Vu0RequireIdle:
+						if ((static_cast<u32>(left) & 1u) != 0)
+						{
+							exit_before_source(block, node,
+								ExitReason::HelperObserver);
+							return result;
+						}
+						bits = values[node.operands[1]].bits;
+						break;
 					case Opcode::MemoryLoad:
 					case Opcode::MemoryStore:
 					{
@@ -5063,6 +5236,7 @@ namespace VitaEE::RegionIR
 									bits.lo = raw.lo;
 									break;
 								case MemoryAccessKind::Load128:
+								case MemoryAccessKind::LoadVu0Vector:
 									bits = raw;
 									break;
 								default:
@@ -5106,6 +5280,10 @@ namespace VitaEE::RegionIR
 					case Opcode::BindFpr:
 						current.fpr[node.immediate] =
 							static_cast<u32>(values[node.operands[0]].bits.lo);
+						break;
+					case Opcode::BindVu0Vf:
+						current.vu0_vf[node.immediate] =
+							values[node.operands[0]].bits;
 						break;
 					case Opcode::BindFcr31:
 						current.fcr31 =

@@ -43,7 +43,9 @@ namespace VitaEE::RegionIR
 				case MemoryAccessKind::Store64:
 					return 8;
 				case MemoryAccessKind::Load128:
+				case MemoryAccessKind::LoadVu0Vector:
 				case MemoryAccessKind::Store128:
+				case MemoryAccessKind::StoreVu0Vector:
 					return 16;
 			}
 			return 0;
