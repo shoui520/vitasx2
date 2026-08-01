@@ -184,6 +184,9 @@ namespace VitaEE::RegionIR
 	struct Terminator
 	{
 		TerminatorKind kind = TerminatorKind::Transfer;
+		// Likely branches execute the represented delay slot only on the taken
+		// edge. Their two transfers therefore own distinct state/cycle maps.
+		bool likely = false;
 		ValueId condition = INVALID_VALUE;
 		Transfer taken{};
 		Transfer not_taken{};
@@ -206,6 +209,10 @@ namespace VitaEE::RegionIR
 		std::vector<SourceInstruction> source;
 		u32 raw_cycle_cost = 0;
 		u32 scaled_cycle_cost = 0;
+		// Equal to the primary cost except for a likely branch, where this
+		// excludes the annulled delay slot.
+		u32 not_taken_raw_cycle_cost = 0;
+		u32 not_taken_scaled_cycle_cost = 0;
 		Terminator terminator{};
 	};
 

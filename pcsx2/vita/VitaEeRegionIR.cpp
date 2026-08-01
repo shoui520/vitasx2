@@ -43,15 +43,25 @@ namespace VitaEE::RegionIR
 			switch (op >> 26)
 			{
 				case 0x01:
-					return RT(op) == 0x00 || RT(op) == 0x01; // BLTZ/BGEZ
+					return RT(op) <= 0x03; // BLTZ/BGEZ and likely forms.
 				case 0x04: // BEQ
 				case 0x05: // BNE
 				case 0x06: // BLEZ
 				case 0x07: // BGTZ
+				case 0x14: // BEQL
+				case 0x15: // BNEL
+				case 0x16: // BLEZL
+				case 0x17: // BGTZL
 					return true;
 				default:
 					return false;
 			}
+		}
+
+		bool IsLikelyBranch(u32 op)
+		{
+			return IsConditionalBranch(op) &&
+			       (R5900::GetInstruction(op).flags & IS_LIKELY) != 0;
 		}
 
 		bool IsAnyControlFlow(u32 op)
@@ -651,13 +661,16 @@ namespace VitaEE::RegionIR
 			ValueId LowerBranchCondition(Block& block, const StateMap& state, u32 op,
 				u32 pc)
 			{
-				const u32 primary = op >> 26;
+				const u32 encoded_primary = op >> 26;
+				const u32 primary = encoded_primary >= 0x14 && encoded_primary <= 0x17 ?
+				                        encoded_primary - 0x10 :
+				                        encoded_primary;
 				const ValueId rs = Low64(block, state, RS(op), pc);
 				switch (primary)
 				{
 					case 0x01:
 						return Unary(block,
-							RT(op) == 0 ? Opcode::CompareSignedLessZero64 : Opcode::CompareSignedGreaterEqualZero64,
+							(RT(op) & 1u) == 0 ? Opcode::CompareSignedLessZero64 : Opcode::CompareSignedGreaterEqualZero64,
 							ValueType::I1, rs, pc);
 					case 0x04:
 					case 0x05:
@@ -678,14 +691,14 @@ namespace VitaEE::RegionIR
 				}
 			}
 
-			bool AdvanceCycles(Block& block, StateMap* state)
+			bool AdvanceCycles(Block& block, StateMap* state, u32 scaled_cycles,
+				u32 source_pc)
 			{
-				if (block.scaled_cycle_cost == 0)
+				if (scaled_cycles == 0)
 					return true;
 				const ValueId advanced =
 					Unary(block, Opcode::AdvanceCycles, ValueType::Cycle, state->cycle,
-						block.source.empty() ? block.pc : block.source.back().pc,
-						block.scaled_cycle_cost);
+						source_pc, scaled_cycles);
 				if (advanced == INVALID_VALUE)
 					return false;
 				state->cycle = advanced;
@@ -911,6 +924,7 @@ namespace VitaEE::RegionIR
 		{
 			Block& block = result.program.blocks[block_indices.at(pc)];
 			StateMap state = block.parameters;
+			StateMap not_taken_state = state;
 			block.source = raw.body;
 
 			for (const SourceInstruction& instruction : raw.body)
@@ -925,10 +939,13 @@ namespace VitaEE::RegionIR
 			}
 
 			ValueId condition = INVALID_VALUE;
+			const bool likely_branch =
+				raw.has_branch && IsLikelyBranch(raw.branch_opcode);
 			if (raw.has_branch)
 			{
 				block.source.push_back({raw.branch_pc, raw.branch_opcode, false});
 				block.source.push_back(raw.delay);
+				not_taken_state = state;
 				condition = builder.LowerBranchCondition(block, state, raw.branch_opcode,
 					raw.branch_pc);
 				if (condition == INVALID_VALUE ||
@@ -946,10 +963,27 @@ namespace VitaEE::RegionIR
 				const u32 cycles = R5900::GetInstruction(instruction.opcode).cycles;
 				block.raw_cycle_cost += cycles * options.cycle_factor;
 			}
+			block.not_taken_raw_cycle_cost = block.raw_cycle_cost;
+			if (likely_branch)
+			{
+				const u32 delay_cycles =
+					R5900::GetInstruction(raw.delay.opcode).cycles * options.cycle_factor;
+				block.not_taken_raw_cycle_cost -= delay_cycles;
+			}
 			if (!block.source.empty())
+			{
 				block.scaled_cycle_cost =
 					ScaleBlockCycles(block.raw_cycle_cost, options.ee_cycle_rate);
-			if (!builder.AdvanceCycles(block, &state))
+				block.not_taken_scaled_cycle_cost = ScaleBlockCycles(
+					block.not_taken_raw_cycle_cost, options.ee_cycle_rate);
+			}
+			const u32 primary_cycle_pc =
+				block.source.empty() ? block.pc : block.source.back().pc;
+			if (!builder.AdvanceCycles(block, &state, block.scaled_cycle_cost,
+					primary_cycle_pc) ||
+				(likely_branch &&
+					!builder.AdvanceCycles(block, &not_taken_state,
+						block.not_taken_scaled_cycle_cost, raw.branch_pc)))
 			{
 				result.failure = LiftFailure::ValueLimit;
 				result.failure_pc = pc;
@@ -958,9 +992,12 @@ namespace VitaEE::RegionIR
 
 			if (raw.has_branch)
 			{
+				if (!likely_branch)
+					not_taken_state = state;
 				const u32 taken_pc = BranchTarget(raw.branch_pc, raw.branch_opcode);
 				const u32 not_taken_pc = raw.branch_pc + 2 * sizeof(u32);
 				block.terminator.kind = TerminatorKind::Branch;
+				block.terminator.likely = likely_branch;
 				block.terminator.condition = condition;
 				block.terminator.branch_pc = raw.branch_pc;
 				block.terminator.delay_slot_pc = raw.delay.pc;
@@ -968,8 +1005,8 @@ namespace VitaEE::RegionIR
 					block, state, taken_pc, ExitReason::RegionBoundary, block_indices,
 					raw.delay.pc);
 				block.terminator.not_taken = builder.MakeTransfer(
-					block, state, not_taken_pc, ExitReason::RegionBoundary, block_indices,
-					raw.delay.pc);
+					block, not_taken_state, not_taken_pc, ExitReason::RegionBoundary,
+					block_indices, likely_branch ? raw.branch_pc : raw.delay.pc);
 			}
 			else
 			{
@@ -1148,16 +1185,36 @@ namespace VitaEE::RegionIR
 				const u32 cycles = R5900::GetInstruction(source.opcode).cycles;
 				raw_cycles += cycles * program.options.cycle_factor;
 			}
-			const u32 scaled_cycles =
-				block.source.empty() ? 0 : ScaleBlockCycles(raw_cycles, program.options.ee_cycle_rate);
+			const bool likely_branch =
+				block.terminator.kind == TerminatorKind::Branch &&
+				block.source.size() >= 2 &&
+				IsLikelyBranch(block.source[block.source.size() - 2].opcode);
+			u32 not_taken_raw_cycles = raw_cycles;
+			if (likely_branch)
+			{
+				not_taken_raw_cycles -=
+					R5900::GetInstruction(block.source.back().opcode).cycles *
+					program.options.cycle_factor;
+			}
+			const u32 scaled_cycles = block.source.empty() ?
+			                              0 :
+			                              ScaleBlockCycles(raw_cycles,
+								  program.options.ee_cycle_rate);
+			const u32 not_taken_scaled_cycles = block.source.empty() ?
+			                                        0 :
+			                                        ScaleBlockCycles(not_taken_raw_cycles,
+										program.options.ee_cycle_rate);
 			if (raw_cycles != block.raw_cycle_cost ||
-				scaled_cycles != block.scaled_cycle_cost)
+				scaled_cycles != block.scaled_cycle_cost ||
+				not_taken_raw_cycles != block.not_taken_raw_cycle_cost ||
+				not_taken_scaled_cycles != block.not_taken_scaled_cycle_cost)
 			{
 				return Fail(VerifyFailure::CycleMismatch, block_index, UINT32_MAX,
 					"block cost differs from PCSX2 opcode-cycle scaling");
 			}
 
-			bool saw_cycle_advance = false;
+			ValueId primary_cycle_advance = INVALID_VALUE;
+			ValueId not_taken_cycle_advance = INVALID_VALUE;
 			bool captured_branch_input = false;
 			StateMap branch_input{};
 			std::map<u32, u32> memory_operation_count;
@@ -1437,21 +1494,40 @@ namespace VitaEE::RegionIR
 							expected.lo = node.operands[0];
 						break;
 					case Opcode::AdvanceCycles:
+					{
 						checked = unary(ValueType::Cycle, ValueType::Cycle);
-						if (checked &&
-							(saw_cycle_advance || node.operands[0] != expected.cycle ||
-								node.immediate != block.scaled_cycle_cost))
+						if (!checked)
+							break;
+						if (node.operands[0] != block.parameters.cycle)
 						{
 							checked = Fail(VerifyFailure::CycleMismatch, block_index, node_index,
-								"cycle value is advanced more than once or by the "
-								"wrong block cost");
+								"cycle advance does not consume the block-entry cycle");
+							break;
 						}
-						if (checked)
+						const u32 primary_source_pc = block.source.empty() ?
+							block.pc :
+							block.source.back().pc;
+						if (node.source_pc == primary_source_pc &&
+							node.immediate == block.scaled_cycle_cost &&
+							primary_cycle_advance == INVALID_VALUE)
 						{
-							saw_cycle_advance = true;
-							expected.cycle = node.id;
+							primary_cycle_advance = node.id;
+						}
+						else if (likely_branch &&
+							node.source_pc == block.terminator.branch_pc &&
+							node.immediate == block.not_taken_scaled_cycle_cost &&
+							not_taken_cycle_advance == INVALID_VALUE)
+						{
+							not_taken_cycle_advance = node.id;
+						}
+						else
+						{
+							checked = Fail(VerifyFailure::CycleMismatch, block_index,
+								node_index,
+								"cycle advance has the wrong edge, source PC, or cost");
 						}
 						break;
+					}
 					default:
 						checked = Fail(VerifyFailure::ResultType, block_index, node_index,
 							"node uses an unknown Region IR opcode");
@@ -1475,12 +1551,22 @@ namespace VitaEE::RegionIR
 						"decoded memory instruction lacks one exact ordered effect/value/bind");
 				}
 			}
-			if (saw_cycle_advance != !block.source.empty())
+			if ((primary_cycle_advance != INVALID_VALUE) != !block.source.empty() ||
+				(likely_branch ? not_taken_cycle_advance == INVALID_VALUE :
+				                 not_taken_cycle_advance != INVALID_VALUE))
 				return Fail(VerifyFailure::CycleMismatch, block_index, UINT32_MAX,
-					"cycle advance does not match the source block");
+					"cycle advances do not match the source block edges");
 
-			auto verify_transfer = [&](const Transfer& transfer) -> VerifyResult {
-				if (!StateMapsEqual(transfer.state, expected))
+			StateMap primary_expected = expected;
+			if (primary_cycle_advance != INVALID_VALUE)
+				primary_expected.cycle = primary_cycle_advance;
+			StateMap not_taken_expected = likely_branch ? branch_input : primary_expected;
+			if (likely_branch)
+				not_taken_expected.cycle = not_taken_cycle_advance;
+
+			auto verify_transfer = [&](const Transfer& transfer,
+				const StateMap& expected_state) -> VerifyResult {
+				if (!StateMapsEqual(transfer.state, expected_state))
 					return Fail(
 						VerifyFailure::StateMapMismatch, block_index, UINT32_MAX,
 						"edge does not publish the mechanically derived canonical state");
@@ -1530,12 +1616,14 @@ namespace VitaEE::RegionIR
 				return {};
 			};
 
-			VerifyResult transfer_check = verify_transfer(block.terminator.taken);
+			VerifyResult transfer_check =
+				verify_transfer(block.terminator.taken, primary_expected);
 			if (!transfer_check)
 				return transfer_check;
 			if (block.terminator.kind == TerminatorKind::Branch)
 			{
 				if (block.source.size() < 2 || !captured_branch_input ||
+					block.terminator.likely != likely_branch ||
 					block.terminator.condition >= program.value_count ||
 					!type_is(block.terminator.condition, ValueType::I1) ||
 					defining_block[block.terminator.condition] != block_index ||
@@ -1574,13 +1662,17 @@ namespace VitaEE::RegionIR
 					       extract.source_pc == block.terminator.branch_pc;
 				};
 				const u32 branch_opcode = block.source[block.source.size() - 2].opcode;
-				const u32 primary = branch_opcode >> 26;
+				const u32 encoded_primary = branch_opcode >> 26;
+				const u32 primary =
+					encoded_primary >= 0x14 && encoded_primary <= 0x17 ?
+						encoded_primary - 0x10 :
+						encoded_primary;
 				Opcode expected_condition = Opcode::CompareEqual64;
 				bool predicate_matches = false;
 				switch (primary)
 				{
 					case 0x01:
-						expected_condition = RT(branch_opcode) == 0 ? Opcode::CompareSignedLessZero64 : Opcode::CompareSignedGreaterEqualZero64;
+						expected_condition = (RT(branch_opcode) & 1u) == 0 ? Opcode::CompareSignedLessZero64 : Opcode::CompareSignedGreaterEqualZero64;
 						predicate_matches =
 							condition.opcode == expected_condition &&
 							condition.operand_count == 1 &&
@@ -1618,7 +1710,8 @@ namespace VitaEE::RegionIR
 						"branch predicate does not read the decoded pre-delay operands");
 				}
 
-				transfer_check = verify_transfer(block.terminator.not_taken);
+				transfer_check = verify_transfer(
+					block.terminator.not_taken, not_taken_expected);
 				if (!transfer_check)
 					return transfer_check;
 
@@ -1643,6 +1736,9 @@ namespace VitaEE::RegionIR
 			}
 			else
 			{
+				if (block.terminator.likely)
+					return Fail(VerifyFailure::ControlFlowMismatch, block_index,
+						UINT32_MAX, "unconditional transfer is marked branch-likely");
 				const Node& next_pc =
 					block.nodes[defining_node[block.terminator.taken.pc]];
 				const u32 expected_pc = block.source.empty() ? block.pc : block.source.back().pc + sizeof(u32);
