@@ -22,7 +22,8 @@ namespace VitaEE::RegionIR
 		constexpr u32 HI_PARAMETER = 32;
 		constexpr u32 LO_PARAMETER = 33;
 		constexpr u32 CYCLE_PARAMETER = 34;
-		constexpr u32 PARAMETER_COUNT = 35;
+		constexpr u32 MEMORY_EFFECT_PARAMETER = 35;
+		constexpr u32 PARAMETER_COUNT = 36;
 
 		constexpr u32 RS(u32 op) { return (op >> 21) & 0x1fu; }
 		constexpr u32 RT(u32 op) { return (op >> 16) & 0x1fu; }
@@ -87,7 +88,7 @@ namespace VitaEE::RegionIR
 			}
 		}
 
-		bool CanLowerNonBranch(u32 op)
+		bool CanLowerPureNonBranch(u32 op)
 		{
 			if (IsAnyControlFlow(op))
 				return false;
@@ -108,6 +109,94 @@ namespace VitaEE::RegionIR
 				default:
 					return false;
 			}
+		}
+
+		bool DecodeMemoryAccess(u32 op, MemoryAccessKind* kind)
+		{
+			MemoryAccessKind decoded{};
+			switch (op >> 26)
+			{
+				case 0x20:
+					decoded = MemoryAccessKind::LoadS8;
+					break;
+				case 0x24:
+					decoded = MemoryAccessKind::LoadU8;
+					break;
+				case 0x21:
+					decoded = MemoryAccessKind::LoadS16;
+					break;
+				case 0x25:
+					decoded = MemoryAccessKind::LoadU16;
+					break;
+				case 0x23:
+					decoded = MemoryAccessKind::LoadS32;
+					break;
+				case 0x27:
+					decoded = MemoryAccessKind::LoadU32;
+					break;
+				case 0x37:
+					decoded = MemoryAccessKind::Load64;
+					break;
+				case 0x1e:
+					decoded = MemoryAccessKind::Load128;
+					break;
+				case 0x28:
+					decoded = MemoryAccessKind::Store8;
+					break;
+				case 0x29:
+					decoded = MemoryAccessKind::Store16;
+					break;
+				case 0x2b:
+					decoded = MemoryAccessKind::Store32;
+					break;
+				case 0x3f:
+					decoded = MemoryAccessKind::Store64;
+					break;
+				case 0x1f:
+					decoded = MemoryAccessKind::Store128;
+					break;
+				default:
+					return false;
+			}
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
+		bool IsMemoryLoad(MemoryAccessKind kind)
+		{
+			return kind <= MemoryAccessKind::Load128;
+		}
+
+		u32 MemoryAlignmentMask(MemoryAccessKind kind)
+		{
+			switch (kind)
+			{
+				case MemoryAccessKind::LoadS16:
+				case MemoryAccessKind::LoadU16:
+				case MemoryAccessKind::Store16:
+					return 1;
+				case MemoryAccessKind::LoadS32:
+				case MemoryAccessKind::LoadU32:
+				case MemoryAccessKind::Store32:
+					return 3;
+				case MemoryAccessKind::Load64:
+				case MemoryAccessKind::Store64:
+					return 7;
+				default:
+					return 0;
+			}
+		}
+
+		bool IsQuadMemoryAccess(MemoryAccessKind kind)
+		{
+			return kind == MemoryAccessKind::Load128 ||
+			       kind == MemoryAccessKind::Store128;
+		}
+
+		bool CanLowerNonBranch(u32 op)
+		{
+			return CanLowerPureNonBranch(op) || DecodeMemoryAccess(op, nullptr);
 		}
 
 		ExitReason ClassifyExit(u32 op)
@@ -149,7 +238,7 @@ namespace VitaEE::RegionIR
 					ContainsPc(source_base_pc, static_cast<u32>(source_words.size()), delay_pc))
 				{
 					const u32 delay = ReadSourceWord(source_base_pc, source_words, delay_pc);
-					if (!IsAnyControlFlow(delay) && CanLowerNonBranch(delay))
+					if (!IsAnyControlFlow(delay) && CanLowerPureNonBranch(delay))
 						return ExitReason::RegionBoundary;
 				}
 				return ExitReason::UnsupportedControlFlow;
@@ -217,7 +306,7 @@ namespace VitaEE::RegionIR
 					// A branch and its delay slot are one architectural unit. If the
 					// delay slot is not yet expressible, leave both to the existing
 					// compiler/interpreter at a canonical side exit.
-					if (!CanLowerNonBranch(delay))
+					if (!CanLowerPureNonBranch(delay))
 					{
 						raw.transfer_pc = pc;
 						// The existing provider must execute the branch and its
@@ -281,9 +370,13 @@ namespace VitaEE::RegionIR
 					block.parameters.cycle =
 						AddNode(block, Opcode::Parameter, ValueType::Cycle, {}, 0,
 							CYCLE_PARAMETER, 0, block.pc);
+					block.parameters.memory_effect =
+						AddNode(block, Opcode::Parameter, ValueType::MemoryEffect, {}, 0,
+							MEMORY_EFFECT_PARAMETER, 0, block.pc);
 					if (block.parameters.hi == INVALID_VALUE ||
 						block.parameters.lo == INVALID_VALUE ||
-						block.parameters.cycle == INVALID_VALUE)
+						block.parameters.cycle == INVALID_VALUE ||
+						block.parameters.memory_effect == INVALID_VALUE)
 					{
 						return false;
 					}
@@ -366,8 +459,59 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
+			bool LowerMemory(Block& block, StateMap* state, u32 op, u32 pc,
+				MemoryAccessKind kind)
+			{
+				const ValueId base = Low32(block, *state, RS(op), pc);
+				const ValueId offset =
+					Constant32(block, static_cast<u32>(static_cast<s32>(IMM_S(op))), pc);
+				const ValueId address =
+					Binary(block, Opcode::EffectiveAddress32, ValueType::Address, base,
+						offset, pc);
+				if (address == INVALID_VALUE)
+					return false;
+
+				const u32 encoded_kind = static_cast<u32>(kind);
+				if (IsMemoryLoad(kind))
+				{
+					const ValueId effect = AddNode(block, Opcode::MemoryLoad,
+						ValueType::MemoryEffect,
+						{state->memory_effect, address, state->gpr[RT(op)]}, 3,
+						encoded_kind, 0, pc);
+					if (effect == INVALID_VALUE)
+						return false;
+					state->memory_effect = effect;
+					if (RT(op) == 0)
+						return true;
+					const ValueId value = Unary(block, Opcode::MemoryLoadValue,
+						ValueType::I128, effect, pc);
+					if (value == INVALID_VALUE ||
+						AddNode(block, Opcode::BindGpr, ValueType::Void,
+							{value, INVALID_VALUE, INVALID_VALUE}, 1, RT(op), 0,
+							pc) == INVALID_VALUE)
+					{
+						return false;
+					}
+					state->gpr[RT(op)] = value;
+					return true;
+				}
+
+				const ValueId effect = AddNode(block, Opcode::MemoryStore,
+					ValueType::MemoryEffect,
+					{state->memory_effect, address, state->gpr[RT(op)]}, 3,
+					encoded_kind, 0, pc);
+				if (effect == INVALID_VALUE)
+					return false;
+				state->memory_effect = effect;
+				return true;
+			}
+
 			bool LowerNonBranch(Block& block, StateMap* state, u32 op, u32 pc)
 			{
+				MemoryAccessKind memory_kind{};
+				if (DecodeMemoryAccess(op, &memory_kind))
+					return LowerMemory(block, state, op, pc, memory_kind);
+
 				const u32 primary = op >> 26;
 				if (primary == 0x00)
 				{
@@ -579,7 +723,8 @@ namespace VitaEE::RegionIR
 		bool StateMapsEqual(const StateMap& left, const StateMap& right)
 		{
 			return left.gpr == right.gpr && left.hi == right.hi && left.lo == right.lo &&
-			       left.cycle == right.cycle;
+			       left.cycle == right.cycle &&
+			       left.memory_effect == right.memory_effect;
 		}
 
 		struct RuntimeValue
@@ -931,8 +1076,10 @@ namespace VitaEE::RegionIR
 			for (u32 slot = 0; slot < PARAMETER_COUNT; slot++)
 			{
 				const Node& parameter = block.nodes[slot];
-				const ValueType expected_type =
-					slot == CYCLE_PARAMETER ? ValueType::Cycle : ValueType::I128;
+				const ValueType expected_type = slot == CYCLE_PARAMETER ?
+				                                    ValueType::Cycle :
+				                                    (slot == MEMORY_EFFECT_PARAMETER ? ValueType::MemoryEffect :
+																					   ValueType::I128);
 				if (parameter.opcode != Opcode::Parameter ||
 					parameter.type != expected_type || parameter.operand_count != 0 ||
 					parameter.immediate != slot)
@@ -946,8 +1093,10 @@ namespace VitaEE::RegionIR
 					expected.hi = parameter.id;
 				else if (slot == LO_PARAMETER)
 					expected.lo = parameter.id;
-				else
+				else if (slot == CYCLE_PARAMETER)
 					expected.cycle = parameter.id;
+				else
+					expected.memory_effect = parameter.id;
 			}
 			if (!StateMapsEqual(expected, block.parameters))
 				return Fail(VerifyFailure::ParameterContract, block_index, UINT32_MAX,
@@ -1011,6 +1160,17 @@ namespace VitaEE::RegionIR
 			bool saw_cycle_advance = false;
 			bool captured_branch_input = false;
 			StateMap branch_input{};
+			std::map<u32, u32> memory_operation_count;
+			std::map<u32, u32> memory_value_count;
+			std::map<u32, u32> memory_bind_count;
+			auto source_opcode_at = [&](u32 pc, u32* opcode) {
+				const auto found = std::find_if(block.source.begin(), block.source.end(),
+					[pc](const SourceInstruction& source) { return source.pc == pc; });
+				if (found == block.source.end())
+					return false;
+				*opcode = found->opcode;
+				return true;
+			};
 			auto require_operand = [&](const Node& node, u32 node_index, u32 operand,
 									   ValueType required) -> VerifyResult {
 				if (operand >= node.operand_count ||
@@ -1140,6 +1300,104 @@ namespace VitaEE::RegionIR
 					case Opcode::CompareSignedGreaterEqualZero64:
 						checked = unary(ValueType::I64, ValueType::I1);
 						break;
+					case Opcode::EffectiveAddress32:
+						checked = binary(ValueType::I32, ValueType::I32,
+							ValueType::Address);
+						break;
+					case Opcode::MemoryLoad:
+					case Opcode::MemoryStore:
+					{
+						const bool load = node.opcode == Opcode::MemoryLoad;
+						if (node.operand_count != 3 ||
+							node.type != ValueType::MemoryEffect)
+						{
+							checked = Fail(VerifyFailure::ResultType, block_index,
+								node_index,
+								"memory operation has the wrong arity or result type");
+							break;
+						}
+						checked = require_operand(node, node_index, 0,
+							ValueType::MemoryEffect);
+						if (checked)
+							checked = require_operand(node, node_index, 1,
+								ValueType::Address);
+						if (checked)
+							checked = require_operand(node, node_index, 2,
+								ValueType::I128);
+						if (!checked)
+							break;
+
+						u32 source_opcode = 0;
+						MemoryAccessKind expected_kind{};
+						if (!source_opcode_at(node.source_pc, &source_opcode) ||
+							!DecodeMemoryAccess(source_opcode, &expected_kind) ||
+							load != IsMemoryLoad(expected_kind) ||
+							node.immediate != static_cast<u32>(expected_kind) ||
+							node.operands[0] != expected.memory_effect ||
+							node.operands[2] != expected.gpr[RT(source_opcode)])
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"memory kind, effect chain, or decoded GPR does not match source");
+							break;
+						}
+
+						const Node& address =
+							block.nodes[defining_node[node.operands[1]]];
+						if (address.opcode != Opcode::EffectiveAddress32 ||
+							address.source_pc != node.source_pc ||
+							address.operand_count != 2)
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"memory address is not its decoded I32 base-plus-offset");
+							break;
+						}
+						const Node& base =
+							block.nodes[defining_node[address.operands[0]]];
+						const Node& offset =
+							block.nodes[defining_node[address.operands[1]]];
+						if (base.opcode != Opcode::ExtractLow32 ||
+							base.source_pc != node.source_pc ||
+							base.operand_count != 1 ||
+							base.operands[0] != expected.gpr[RS(source_opcode)] ||
+							offset.opcode != Opcode::ConstantI32 ||
+							offset.source_pc != node.source_pc ||
+							static_cast<u32>(offset.literal) !=
+								static_cast<u32>(static_cast<s32>(IMM_S(source_opcode))))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"memory effective address operands do not match decoded source");
+							break;
+						}
+						expected.memory_effect = node.id;
+						memory_operation_count[node.source_pc]++;
+						break;
+					}
+					case Opcode::MemoryLoadValue:
+					{
+						checked = unary(ValueType::MemoryEffect, ValueType::I128);
+						if (!checked)
+							break;
+						const Node& memory =
+							block.nodes[defining_node[node.operands[0]]];
+						u32 source_opcode = 0;
+						MemoryAccessKind kind{};
+						if (memory.opcode != Opcode::MemoryLoad ||
+							memory.source_pc != node.source_pc ||
+							!source_opcode_at(node.source_pc, &source_opcode) ||
+							!DecodeMemoryAccess(source_opcode, &kind) ||
+							!IsMemoryLoad(kind) || RT(source_opcode) == 0)
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"memory load value does not match a decoded nonzero destination");
+							break;
+						}
+						memory_value_count[node.source_pc]++;
+						break;
+					}
 					case Opcode::BindGpr:
 						checked = unary(ValueType::I128, ValueType::Void);
 						if (checked && (node.immediate == 0 || node.immediate >= GPR_COUNT))
@@ -1148,7 +1406,25 @@ namespace VitaEE::RegionIR
 									"GPR binding targets the immutable zero register or an "
 									"invalid slot");
 						if (checked)
+						{
+							const Node& value =
+								block.nodes[defining_node[node.operands[0]]];
+							if (value.opcode == Opcode::MemoryLoadValue)
+							{
+								u32 source_opcode = 0;
+								if (!source_opcode_at(node.source_pc, &source_opcode) ||
+									value.source_pc != node.source_pc ||
+									node.immediate != RT(source_opcode))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"loaded value binds a GPR other than decoded rt");
+									break;
+								}
+								memory_bind_count[node.source_pc]++;
+							}
 							expected.gpr[node.immediate] = node.operands[0];
+						}
 						break;
 					case Opcode::BindHi:
 						checked = unary(ValueType::I128, ValueType::Void);
@@ -1183,6 +1459,21 @@ namespace VitaEE::RegionIR
 				}
 				if (!checked)
 					return checked;
+			}
+			for (const SourceInstruction& source : block.source)
+			{
+				MemoryAccessKind kind{};
+				if (!DecodeMemoryAccess(source.opcode, &kind))
+					continue;
+				const u32 expected_values =
+					IsMemoryLoad(kind) && RT(source.opcode) != 0 ? 1u : 0u;
+				if (memory_operation_count[source.pc] != 1 ||
+					memory_value_count[source.pc] != expected_values ||
+					memory_bind_count[source.pc] != expected_values)
+				{
+					return Fail(VerifyFailure::SourceMismatch, block_index, UINT32_MAX,
+						"decoded memory instruction lacks one exact ordered effect/value/bind");
+				}
 			}
 			if (saw_cycle_advance != !block.source.empty())
 				return Fail(VerifyFailure::CycleMismatch, block_index, UINT32_MAX,
@@ -1421,12 +1712,14 @@ namespace VitaEE::RegionIR
 			return result;
 		}
 		auto assign_parameters = [&](const Block& block,
-									 const CanonicalState& state) {
+									 const CanonicalState& state,
+									 const RuntimeValue& memory_effect) {
 			for (u32 gpr = 0; gpr < GPR_COUNT; gpr++)
 				values[block.parameters.gpr[gpr]] = {ValueType::I128, state.gpr[gpr]};
 			values[block.parameters.hi] = {ValueType::I128, state.hi};
 			values[block.parameters.lo] = {ValueType::I128, state.lo};
 			values[block.parameters.cycle] = {ValueType::Cycle, Bits(state.cycle)};
+			values[block.parameters.memory_effect] = memory_effect;
 		};
 		auto materialize = [&](const Transfer& transfer) {
 			CanonicalState state{};
@@ -1441,7 +1734,27 @@ namespace VitaEE::RegionIR
 		};
 
 		u32 block_index = program.entry_block;
-		assign_parameters(program.blocks[block_index], current);
+		assign_parameters(program.blocks[block_index], current,
+			{ValueType::MemoryEffect, Bits(0)});
+		auto exit_before_memory = [&](const Block& block, const Node& node,
+									  u32 address, ExitReason reason) {
+			u32 pending_raw_cycles = 0;
+			for (const SourceInstruction& source : block.source)
+			{
+				if (source.pc == node.source_pc)
+					break;
+				pending_raw_cycles +=
+					R5900::GetInstruction(source.opcode).cycles *
+					program.options.cycle_factor;
+			}
+			current.gpr[0] = {};
+			current.pc = node.source_pc;
+			*output = current;
+			result.completed = true;
+			result.reason = reason;
+			result.pending_raw_cycles = pending_raw_cycles;
+			result.memory_address = address;
+		};
 		for (;;)
 		{
 			if (result.blocks_executed >= options.max_block_executions)
@@ -1554,12 +1867,130 @@ namespace VitaEE::RegionIR
 					case Opcode::CompareSignedGreaterEqualZero64:
 						bits = Bits(std::bit_cast<s64>(left) >= 0);
 						break;
+					case Opcode::EffectiveAddress32:
+						bits = Bits(static_cast<u32>(left) +
+									static_cast<u32>(right));
+						break;
+					case Opcode::MemoryLoad:
+					case Opcode::MemoryStore:
+					{
+						const MemoryAccessKind kind =
+							static_cast<MemoryAccessKind>(node.immediate);
+						const u32 unaligned_address =
+							static_cast<u32>(values[node.operands[1]].bits.lo);
+						const u32 alignment_mask = MemoryAlignmentMask(kind);
+						if ((unaligned_address & alignment_mask) != 0)
+						{
+							exit_before_memory(block, node, unaligned_address,
+								ExitReason::MemoryAlignment);
+							return result;
+						}
+						const u32 address = IsQuadMemoryAccess(kind) ?
+						                        (unaligned_address & ~0xfu) :
+						                        unaligned_address;
+						MemoryRequest request{node.source_pc, address, kind};
+						if (!options.memory || !options.memory->probe)
+						{
+							exit_before_memory(block, node, address,
+								ExitReason::MemoryObserver);
+							return result;
+						}
+						const MemoryProbeResult probe =
+							options.memory->probe(options.memory->context, request);
+						if (probe != MemoryProbeResult::Direct)
+						{
+							const ExitReason reason =
+								probe == MemoryProbeResult::Handler ?
+									ExitReason::MemoryHandler :
+									(probe == MemoryProbeResult::Translation ?
+											ExitReason::MemoryTranslation :
+											ExitReason::SelfModifyingCode);
+							exit_before_memory(block, node, address, reason);
+							return result;
+						}
+
+						if (node.opcode == Opcode::MemoryLoad)
+						{
+							if (!options.memory->read)
+							{
+								result.error = "direct memory load lacks a read callback";
+								return result;
+							}
+							u128 raw{};
+							if (!options.memory->read(options.memory->context, request,
+									&raw))
+							{
+								result.error = "direct memory load callback failed";
+								return result;
+							}
+							bits = values[node.operands[2]].bits;
+							switch (kind)
+							{
+								case MemoryAccessKind::LoadS8:
+									bits.lo = static_cast<u64>(static_cast<s64>(
+										static_cast<s8>(raw.lo)));
+									break;
+								case MemoryAccessKind::LoadU8:
+									bits.lo = static_cast<u8>(raw.lo);
+									break;
+								case MemoryAccessKind::LoadS16:
+									bits.lo = static_cast<u64>(static_cast<s64>(
+										static_cast<s16>(raw.lo)));
+									break;
+								case MemoryAccessKind::LoadU16:
+									bits.lo = static_cast<u16>(raw.lo);
+									break;
+								case MemoryAccessKind::LoadS32:
+									bits.lo = static_cast<u64>(static_cast<s64>(
+										static_cast<s32>(raw.lo)));
+									break;
+								case MemoryAccessKind::LoadU32:
+									bits.lo = static_cast<u32>(raw.lo);
+									break;
+								case MemoryAccessKind::Load64:
+									bits.lo = raw.lo;
+									break;
+								case MemoryAccessKind::Load128:
+									bits = raw;
+									break;
+								default:
+									result.error = "load node carries a store kind";
+									return result;
+							}
+						}
+						else
+						{
+							if (!options.memory->write)
+							{
+								result.error = "direct memory store lacks a write callback";
+								return result;
+							}
+							if (!options.memory->write(options.memory->context, request,
+									values[node.operands[2]].bits))
+							{
+								result.error = "direct memory store callback failed";
+								return result;
+							}
+							bits = Bits(0);
+						}
+						break;
+					}
+					case Opcode::MemoryLoadValue:
+						bits = values[node.operands[0]].bits;
+						break;
 					case Opcode::BindGpr:
+						current.gpr[node.immediate] =
+							values[node.operands[0]].bits;
+						break;
 					case Opcode::BindHi:
+						current.hi = values[node.operands[0]].bits;
+						break;
 					case Opcode::BindLo:
+						current.lo = values[node.operands[0]].bits;
 						break;
 					case Opcode::AdvanceCycles:
 						bits = Bits(left + node.immediate);
+						current.cycle = bits.lo;
 						break;
 				}
 				values[node.id] = {node.type, bits};
@@ -1571,6 +2002,8 @@ namespace VitaEE::RegionIR
 			{
 				transfer = &block.terminator.not_taken;
 			}
+			const RuntimeValue outgoing_memory_effect =
+				values[transfer->state.memory_effect];
 			current = materialize(*transfer);
 			if (event_due(current.cycle))
 			{
@@ -1587,7 +2020,8 @@ namespace VitaEE::RegionIR
 				return result;
 			}
 			block_index = transfer->target_block;
-			assign_parameters(program.blocks[block_index], current);
+			assign_parameters(program.blocks[block_index], current,
+				outgoing_memory_effect);
 		}
 	}
 } // namespace VitaEE::RegionIR

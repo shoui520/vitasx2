@@ -27,6 +27,7 @@ namespace VitaEE::RegionIR
 		I128,
 		Address,
 		Cycle,
+		MemoryEffect,
 	};
 
 	enum class Opcode : u8
@@ -62,6 +63,10 @@ namespace VitaEE::RegionIR
 		CompareSignedGreaterZero64,
 		CompareSignedLessZero64,
 		CompareSignedGreaterEqualZero64,
+		EffectiveAddress32,
+		MemoryLoad,
+		MemoryLoadValue,
+		MemoryStore,
 		BindGpr,
 		BindHi,
 		BindLo,
@@ -92,6 +97,57 @@ namespace VitaEE::RegionIR
 		ValueId hi = INVALID_VALUE;
 		ValueId lo = INVALID_VALUE;
 		ValueId cycle = INVALID_VALUE;
+		// Ordered, non-architectural memory state. It prevents loads and stores
+		// from being reordered across each other while remaining absent from the
+		// canonical EE register image.
+		ValueId memory_effect = INVALID_VALUE;
+	};
+
+	enum class MemoryAccessKind : u8
+	{
+		LoadS8,
+		LoadU8,
+		LoadS16,
+		LoadU16,
+		LoadS32,
+		LoadU32,
+		Load64,
+		Load128,
+		Store8,
+		Store16,
+		Store32,
+		Store64,
+		Store128,
+	};
+
+	enum class MemoryProbeResult : u8
+	{
+		Direct,
+		Handler,
+		Translation,
+		SelfModifyingCode,
+	};
+
+	struct MemoryRequest
+	{
+		u32 source_pc = 0;
+		u32 address = 0;
+		MemoryAccessKind kind = MemoryAccessKind::LoadS8;
+	};
+
+	// The Region IR interpreter is product-disabled, but its memory contract is
+	// also the contract the A32 backend must implement. Probe must be free of
+	// guest-visible effects. Read/write are called only after Direct and must
+	// perform exactly one access of the requested width.
+	struct RegionMemoryInterface
+	{
+		void* context = nullptr;
+		MemoryProbeResult (*probe)(void* context,
+			const MemoryRequest& request) = nullptr;
+		bool (*read)(void* context, const MemoryRequest& request,
+			u128* value) = nullptr;
+		bool (*write)(void* context, const MemoryRequest& request,
+			const u128& value) = nullptr;
 	};
 
 	enum class ExitReason : u8
@@ -99,6 +155,10 @@ namespace VitaEE::RegionIR
 		RegionBoundary,
 		UnsupportedOpcode,
 		MemoryObserver,
+		MemoryAlignment,
+		MemoryHandler,
+		MemoryTranslation,
+		SelfModifyingCode,
 		HelperObserver,
 		UnsupportedControlFlow,
 		EventHorizon,
@@ -236,6 +296,7 @@ namespace VitaEE::RegionIR
 	{
 		u64 next_event_cycle = UINT64_MAX;
 		u32 max_block_executions = 4096;
+		const RegionMemoryInterface* memory = nullptr;
 	};
 
 	struct InterpretResult
@@ -243,6 +304,12 @@ namespace VitaEE::RegionIR
 		bool completed = false;
 		ExitReason reason = ExitReason::RegionBoundary;
 		u32 blocks_executed = 0;
+		// When execution stops before a memory observer, canonical cycle remains
+		// at the original PCSX2 block entry. This is the exact fixed-point opcode
+		// cost already executed in that block. A product continuation must append
+		// the remaining source cost and scale once at the original block edge.
+		u32 pending_raw_cycles = 0;
+		u32 memory_address = 0;
 		std::string error;
 	};
 
