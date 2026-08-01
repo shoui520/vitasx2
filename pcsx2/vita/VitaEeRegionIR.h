@@ -50,6 +50,16 @@ namespace VitaEE::RegionIR
 		ReplaceHigh64,
 		BitcastI32ToF32Bits,
 		BitcastF32BitsToI32,
+		// PCSX2 FPU.cpp::fpuDouble() operand normalization, followed by one
+		// uncontracted single-precision operation and its architectural O/U
+		// result/flag normalization. Keeping the raw result shared prevents the
+		// value and FCR31 paths from silently evaluating different operations.
+		Cop1NormalizeInput,
+		Cop1AddRaw,
+		Cop1SubRaw,
+		Cop1MulRaw,
+		Cop1ClampOuResult,
+		Cop1UpdateOuFlags,
 		SignExtend32To64,
 		ZeroExtend32To64,
 		Add32,
@@ -101,6 +111,7 @@ namespace VitaEE::RegionIR
 		BindSa,
 		BindFpr,
 		BindFcr31,
+		BindAcc,
 		AdvanceCycles,
 	};
 

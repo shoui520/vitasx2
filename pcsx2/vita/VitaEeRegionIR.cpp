@@ -61,6 +61,24 @@ namespace VitaEE::RegionIR
 			MoveToFpr,
 			MoveFpr,
 		};
+		enum class BasicCop1ArithmeticKind : u8
+		{
+			Add,
+			Subtract,
+			Multiply,
+			AddAccumulator,
+			SubtractAccumulator,
+			MultiplyAccumulator,
+		};
+
+		constexpr u32 COP1_SIGN = 0x80000000u;
+		constexpr u32 COP1_EXPONENT = 0x7f800000u;
+		constexpr u32 COP1_FRACTION = 0x007fffffu;
+		constexpr u32 COP1_MAX_FINITE = 0x7f7fffffu;
+		constexpr u32 FCR31_O = 0x00008000u;
+		constexpr u32 FCR31_U = 0x00004000u;
+		constexpr u32 FCR31_SO = 0x00000010u;
+		constexpr u32 FCR31_SU = 0x00000008u;
 
 		constexpr u32 RS(u32 op) { return (op >> 21) & 0x1fu; }
 		constexpr u32 RT(u32 op) { return (op >> 16) & 0x1fu; }
@@ -393,6 +411,122 @@ namespace VitaEE::RegionIR
 			return true;
 		}
 
+		bool DecodeBasicCop1Arithmetic(u32 op, BasicCop1ArithmeticKind* kind)
+		{
+			if ((op >> 26) != 0x11 || RS(op) != 0x10)
+				return false;
+
+			BasicCop1ArithmeticKind decoded{};
+			switch (FUNCT(op))
+			{
+				case 0x00:
+					decoded = BasicCop1ArithmeticKind::Add;
+					break;
+				case 0x01:
+					decoded = BasicCop1ArithmeticKind::Subtract;
+					break;
+				case 0x02:
+					decoded = BasicCop1ArithmeticKind::Multiply;
+					break;
+				case 0x18:
+					decoded = BasicCop1ArithmeticKind::AddAccumulator;
+					break;
+				case 0x19:
+					decoded = BasicCop1ArithmeticKind::SubtractAccumulator;
+					break;
+				case 0x1a:
+					decoded = BasicCop1ArithmeticKind::MultiplyAccumulator;
+					break;
+				default:
+					return false;
+			}
+
+			// SCE reserves fd as zero for the accumulator-destination forms.
+			if (FUNCT(op) >= 0x18 && FD(op) != 0)
+				return false;
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
+		bool IsBasicCop1Accumulator(BasicCop1ArithmeticKind kind)
+		{
+			return kind == BasicCop1ArithmeticKind::AddAccumulator ||
+			       kind == BasicCop1ArithmeticKind::SubtractAccumulator ||
+			       kind == BasicCop1ArithmeticKind::MultiplyAccumulator;
+		}
+
+		Opcode BasicCop1RawOpcode(BasicCop1ArithmeticKind kind)
+		{
+			switch (kind)
+			{
+				case BasicCop1ArithmeticKind::Add:
+				case BasicCop1ArithmeticKind::AddAccumulator:
+					return Opcode::Cop1AddRaw;
+				case BasicCop1ArithmeticKind::Subtract:
+				case BasicCop1ArithmeticKind::SubtractAccumulator:
+					return Opcode::Cop1SubRaw;
+				case BasicCop1ArithmeticKind::Multiply:
+				case BasicCop1ArithmeticKind::MultiplyAccumulator:
+					return Opcode::Cop1MulRaw;
+			}
+			return Opcode::Parameter;
+		}
+
+		u32 NormalizeCop1Input(u32 value)
+		{
+			const u32 exponent = value & COP1_EXPONENT;
+			if (exponent == 0)
+				return value & COP1_SIGN;
+			if (exponent == COP1_EXPONENT)
+				return (value & COP1_SIGN) | COP1_MAX_FINITE;
+			return value;
+		}
+
+		u32 EvaluateBasicCop1Raw(Opcode opcode, u32 left_bits, u32 right_bits)
+		{
+			const float left = std::bit_cast<float>(left_bits);
+			const float right = std::bit_cast<float>(right_bits);
+			float result = 0.0f;
+			switch (opcode)
+			{
+				case Opcode::Cop1AddRaw:
+					result = left + right;
+					break;
+				case Opcode::Cop1SubRaw:
+					result = left - right;
+					break;
+				case Opcode::Cop1MulRaw:
+					result = left * right;
+					break;
+				default:
+					break;
+			}
+			return std::bit_cast<u32>(result);
+		}
+
+		u32 ClampBasicCop1Result(u32 raw)
+		{
+			if ((raw & ~COP1_SIGN) == COP1_EXPONENT)
+				return (raw & COP1_SIGN) | COP1_MAX_FINITE;
+			if ((raw & COP1_EXPONENT) == 0 && (raw & COP1_FRACTION) != 0)
+				return raw & COP1_SIGN;
+			return raw;
+		}
+
+		u32 UpdateBasicCop1OuFlags(u32 fcr31, u32 raw)
+		{
+			// FPU.cpp::checkOverflow() returns before checkUnderflow(), so an
+			// overflow leaves the previous U cause untouched while setting O/SO.
+			if ((raw & ~COP1_SIGN) == COP1_EXPONENT)
+				return fcr31 | FCR31_O | FCR31_SO;
+
+			fcr31 &= ~FCR31_O;
+			if ((raw & COP1_EXPONENT) == 0 && (raw & COP1_FRACTION) != 0)
+				return fcr31 | FCR31_U | FCR31_SU;
+			return fcr31 & ~FCR31_U;
+		}
+
 		bool IsCop1ControlWrite(u32 op)
 		{
 			// CTC1 is defined only for FCR31. Reserved control registers remain
@@ -431,8 +565,9 @@ namespace VitaEE::RegionIR
 					return true;
 				case 0x1c: // Pure, non-multiplying MMI moves/logical/copies.
 					return DecodePureMmi(op, nullptr);
-				case 0x11: // Raw-bit COP1 state and the defined FCR31 write.
-					return DecodePureCop1State(op, nullptr) || IsCop1ControlWrite(op);
+				case 0x11: // Raw COP1 state plus exact basic S-format arithmetic.
+					return DecodePureCop1State(op, nullptr) || IsCop1ControlWrite(op) ||
+					       DecodeBasicCop1Arithmetic(op, nullptr);
 				default:
 					return false;
 			}
@@ -1186,6 +1321,53 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
+			bool WriteAcc(Block& block, StateMap* state, ValueId value,
+				u32 source_pc)
+			{
+				if (value == INVALID_VALUE ||
+					AddNode(block, Opcode::BindAcc, ValueType::Void,
+						{value, INVALID_VALUE, INVALID_VALUE}, 1, 0, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				state->acc = value;
+				return true;
+			}
+
+			bool LowerBasicCop1Arithmetic(Block& block, StateMap* state, u32 op,
+				u32 pc, BasicCop1ArithmeticKind kind)
+			{
+				const u32 fs = FS(op);
+				const u32 ft = RT(op);
+				const ValueId left = Unary(block, Opcode::Cop1NormalizeInput,
+					ValueType::F32Bits, state->fpr[fs], pc);
+				if (left == INVALID_VALUE)
+					return false;
+				const ValueId right = fs == ft ? left :
+					Unary(block, Opcode::Cop1NormalizeInput, ValueType::F32Bits,
+						state->fpr[ft], pc);
+				if (right == INVALID_VALUE)
+					return false;
+				const ValueId raw = Binary(block, BasicCop1RawOpcode(kind),
+					ValueType::F32Bits, left, right, pc);
+				if (raw == INVALID_VALUE)
+					return false;
+				const ValueId result = Unary(block, Opcode::Cop1ClampOuResult,
+					ValueType::F32Bits, raw, pc);
+				if (result == INVALID_VALUE)
+					return false;
+				const ValueId flags = Binary(block, Opcode::Cop1UpdateOuFlags,
+					ValueType::I32, state->fcr31, raw, pc);
+				if (flags == INVALID_VALUE || !WriteFcr31(block, state, flags, pc))
+				{
+					return false;
+				}
+				return IsBasicCop1Accumulator(kind) ?
+					WriteAcc(block, state, result, pc) :
+					WriteFpr(block, state, FD(op), result, pc);
+			}
+
 			bool LowerMemory(Block& block, StateMap* state, u32 op, u32 pc,
 				MemoryAccessKind kind)
 			{
@@ -1259,10 +1441,15 @@ namespace VitaEE::RegionIR
 					PureCop1StateKind kind{};
 					if (!DecodePureCop1State(op, &kind))
 					{
-						if (!IsCop1ControlWrite(op))
-							return false;
-						return WriteFcr31(block, state,
-							Low32(block, *state, RT(op), pc), pc);
+						if (IsCop1ControlWrite(op))
+						{
+							return WriteFcr31(block, state,
+								Low32(block, *state, RT(op), pc), pc);
+						}
+						BasicCop1ArithmeticKind arithmetic{};
+						return DecodeBasicCop1Arithmetic(op, &arithmetic) &&
+						       LowerBasicCop1Arithmetic(block, state, op, pc,
+							   arithmetic);
 					}
 					ValueId value = INVALID_VALUE;
 					switch (kind)
@@ -2373,6 +2560,8 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> pure_cop1_gpr_bind_count;
 			std::map<u32, u32> fpr_bind_count;
 			std::map<u32, u32> fcr31_bind_count;
+			std::map<u32, u32> acc_bind_count;
+			std::map<u32, ValueId> basic_cop1_raw_result;
 			std::map<u32, u32> hi_bind_count;
 			std::map<u32, u32> lo_bind_count;
 			std::map<u32, u32> sa_bind_count;
@@ -2690,6 +2879,33 @@ namespace VitaEE::RegionIR
 				       exact_unary(bitcast->operands[0], Opcode::ExtractLow32,
 						input.gpr[RT(source_opcode)], bind.source_pc);
 			};
+			auto exact_basic_cop1_raw = [&](ValueId value, u32 source_opcode,
+				u32 source_pc, const StateMap& input) {
+				BasicCop1ArithmeticKind kind{};
+				if (!DecodeBasicCop1Arithmetic(source_opcode, &kind))
+					return false;
+				const Node* raw = local_node(value);
+				if (!raw || raw->opcode != BasicCop1RawOpcode(kind) ||
+					raw->operand_count != 2 || raw->source_pc != source_pc)
+				{
+					return false;
+				}
+				const u32 fs = FS(source_opcode);
+				const u32 ft = RT(source_opcode);
+				if (!exact_unary(raw->operands[0], Opcode::Cop1NormalizeInput,
+						input.fpr[fs], raw->source_pc))
+				{
+					return false;
+				}
+				if (fs == ft)
+					return raw->operands[1] == raw->operands[0];
+				return exact_unary(raw->operands[1], Opcode::Cop1NormalizeInput,
+					input.fpr[ft], raw->source_pc);
+			};
+			auto exact_basic_cop1_result = [&](ValueId value, ValueId raw,
+				u32 source_pc) {
+				return exact_unary(value, Opcode::Cop1ClampOuResult, raw, source_pc);
+			};
 			auto require_operand = [&](const Node& node, u32 node_index, u32 operand,
 									   ValueType required) -> VerifyResult {
 				if (operand >= node.operand_count ||
@@ -2794,6 +3010,55 @@ namespace VitaEE::RegionIR
 					case Opcode::BitcastF32BitsToI32:
 						checked = unary(ValueType::F32Bits, ValueType::I32);
 						break;
+					case Opcode::Cop1NormalizeInput:
+					case Opcode::Cop1ClampOuResult:
+					{
+						checked = unary(ValueType::F32Bits, ValueType::F32Bits);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeBasicCop1Arithmetic(source_opcode, nullptr)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 normalization node has no basic arithmetic source");
+						}
+						break;
+					}
+					case Opcode::Cop1AddRaw:
+					case Opcode::Cop1SubRaw:
+					case Opcode::Cop1MulRaw:
+					{
+						checked = binary(ValueType::F32Bits, ValueType::F32Bits,
+							ValueType::F32Bits);
+						u32 source_opcode = 0;
+						BasicCop1ArithmeticKind kind{};
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeBasicCop1Arithmetic(source_opcode, &kind) ||
+							 node.opcode != BasicCop1RawOpcode(kind)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 raw arithmetic node does not match source");
+						}
+						break;
+					}
+					case Opcode::Cop1UpdateOuFlags:
+					{
+						checked = binary(ValueType::I32, ValueType::F32Bits,
+							ValueType::I32);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeBasicCop1Arithmetic(source_opcode, nullptr)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 O/U flag node has no basic arithmetic source");
+						}
+						break;
+					}
 					case Opcode::SignExtend32To64:
 						checked = unary(ValueType::I32, ValueType::I64);
 						break;
@@ -3212,6 +3477,10 @@ namespace VitaEE::RegionIR
 							const bool memory_load =
 								DecodeMemoryAccess(source_opcode, &memory_kind) &&
 								memory_kind == MemoryAccessKind::LoadF32Bits;
+							BasicCop1ArithmeticKind arithmetic_kind{};
+							const bool basic_arithmetic =
+								DecodeBasicCop1Arithmetic(source_opcode, &arithmetic_kind) &&
+								!IsBasicCop1Accumulator(arithmetic_kind);
 							if (memory_load)
 							{
 								const Node* value = local_node(node.operands[0]);
@@ -3225,6 +3494,20 @@ namespace VitaEE::RegionIR
 									break;
 								}
 								memory_bind_count[node.source_pc]++;
+							}
+							else if (basic_arithmetic)
+							{
+								const auto raw = basic_cop1_raw_result.find(node.source_pc);
+								if (node.immediate != FD(source_opcode) ||
+									raw == basic_cop1_raw_result.end() ||
+									!exact_basic_cop1_result(node.operands[0], raw->second,
+										node.source_pc))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"basic COP1 result does not bind decoded fd");
+									break;
+								}
 							}
 							else if (!exact_pure_cop1_fpr_bind(node, source_opcode,
 								expected))
@@ -3244,21 +3527,73 @@ namespace VitaEE::RegionIR
 						{
 							u32 source_opcode = 0;
 							const Node* value = local_node(node.operands[0]);
-							if (node.immediate != 31 ||
-								!source_opcode_at(node.source_pc, &source_opcode) ||
-								!IsCop1ControlWrite(source_opcode) || !value ||
-								value->opcode != Opcode::ExtractLow32 ||
-								value->operand_count != 1 ||
-								value->source_pc != node.source_pc ||
-								value->operands[0] != expected.gpr[RT(source_opcode)])
+							if (node.immediate != 31 || !value ||
+								!source_opcode_at(node.source_pc, &source_opcode))
 							{
 								checked = Fail(VerifyFailure::SourceMismatch,
 									block_index, node_index,
-									"FCR31 binding does not match decoded CTC1 source");
+									"FCR31 binding has no decoded COP1 owner");
 								break;
+							}
+							if (IsCop1ControlWrite(source_opcode))
+							{
+								if (value->opcode != Opcode::ExtractLow32 ||
+									value->operand_count != 1 ||
+									value->source_pc != node.source_pc ||
+									value->operands[0] != expected.gpr[RT(source_opcode)])
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"FCR31 binding does not match decoded CTC1 source");
+									break;
+								}
+							}
+							else
+							{
+								BasicCop1ArithmeticKind arithmetic_kind{};
+								if (!DecodeBasicCop1Arithmetic(source_opcode,
+										&arithmetic_kind) ||
+									value->opcode != Opcode::Cop1UpdateOuFlags ||
+									value->operand_count != 2 ||
+									value->source_pc != node.source_pc ||
+									value->operands[0] != expected.fcr31 ||
+									!exact_basic_cop1_raw(value->operands[1],
+										source_opcode, node.source_pc, expected) ||
+									!basic_cop1_raw_result.emplace(node.source_pc,
+										value->operands[1]).second)
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"FCR31 O/U binding does not share exact COP1 raw result");
+									break;
+								}
 							}
 							fcr31_bind_count[node.source_pc]++;
 							expected.fcr31 = node.operands[0];
+						}
+						break;
+					case Opcode::BindAcc:
+						checked = unary(ValueType::F32Bits, ValueType::Void);
+						if (checked)
+						{
+							u32 source_opcode = 0;
+							BasicCop1ArithmeticKind kind{};
+							const auto raw = basic_cop1_raw_result.find(node.source_pc);
+							if (node.immediate != 0 ||
+								!source_opcode_at(node.source_pc, &source_opcode) ||
+								!DecodeBasicCop1Arithmetic(source_opcode, &kind) ||
+								!IsBasicCop1Accumulator(kind) ||
+								raw == basic_cop1_raw_result.end() ||
+								!exact_basic_cop1_result(node.operands[0], raw->second,
+									node.source_pc))
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"basic COP1 accumulator result has the wrong owner");
+								break;
+							}
+							acc_bind_count[node.source_pc]++;
+							expected.acc = node.operands[0];
 						}
 						break;
 					case Opcode::AdvanceCycles:
@@ -3381,6 +3716,26 @@ namespace VitaEE::RegionIR
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
 							"CTC1 source lacks one exact FCR31 binding");
+					}
+				}
+				else if (BasicCop1ArithmeticKind arithmetic_kind{};
+					DecodeBasicCop1Arithmetic(source.opcode, &arithmetic_kind))
+				{
+					const bool accumulator =
+						IsBasicCop1Accumulator(arithmetic_kind);
+					if (fcr31_bind_count[source.pc] != 1 ||
+						fpr_bind_count[source.pc] != (accumulator ? 0u : 1u) ||
+						acc_bind_count[source.pc] != (accumulator ? 1u : 0u) ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"basic COP1 arithmetic lacks exact result and FCR31 bindings");
 					}
 				}
 				else
@@ -3922,6 +4277,22 @@ namespace VitaEE::RegionIR
 					case Opcode::BitcastF32BitsToI32:
 						bits = Bits(static_cast<u32>(left));
 						break;
+					case Opcode::Cop1NormalizeInput:
+						bits = Bits(NormalizeCop1Input(static_cast<u32>(left)));
+						break;
+					case Opcode::Cop1AddRaw:
+					case Opcode::Cop1SubRaw:
+					case Opcode::Cop1MulRaw:
+						bits = Bits(EvaluateBasicCop1Raw(node.opcode,
+							static_cast<u32>(left), static_cast<u32>(right)));
+						break;
+					case Opcode::Cop1ClampOuResult:
+						bits = Bits(ClampBasicCop1Result(static_cast<u32>(left)));
+						break;
+					case Opcode::Cop1UpdateOuFlags:
+						bits = Bits(UpdateBasicCop1OuFlags(static_cast<u32>(left),
+							static_cast<u32>(right)));
+						break;
 					case Opcode::SignExtend32To64:
 						bits = Bits(static_cast<u64>(
 							static_cast<s64>(std::bit_cast<s32>(static_cast<u32>(left)))));
@@ -4206,6 +4577,10 @@ namespace VitaEE::RegionIR
 						break;
 					case Opcode::BindFcr31:
 						current.fcr31 =
+							static_cast<u32>(values[node.operands[0]].bits.lo);
+						break;
+					case Opcode::BindAcc:
+						current.acc =
 							static_cast<u32>(values[node.operands[0]].bits.lo);
 						break;
 					case Opcode::AdvanceCycles:
