@@ -161,6 +161,11 @@ namespace VitaEE::RegionIR
 		SelfModifyingCode,
 		HelperObserver,
 		UnsupportedControlFlow,
+		// The represented state is immediately before an instruction which can
+		// raise an EE architectural exception. The fallback owns both the
+		// exceptional and non-exceptional outcomes; it may not use a generic
+		// returning-helper continuation.
+		ExceptionObserver,
 		EventHorizon,
 	};
 

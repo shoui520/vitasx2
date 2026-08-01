@@ -238,9 +238,60 @@ namespace VitaEE::RegionIR
 			return CanLowerPureNonBranch(op) || DecodeMemoryAccess(op, nullptr);
 		}
 
+		bool IsExceptionCapableInstruction(u32 op)
+		{
+			// SCE EE Core Instruction Set Manual sections 6.3.4 and the
+			// per-instruction exception lists define this surface. PCSX2's
+			// executable owners are R5900OpcodeImpl.cpp::{_add32_Overflow,
+			// _add64_Overflow,SYSCALL,BREAK,trap}. Memory exceptions remain under
+			// the separate typed memory contract.
+			switch (op >> 26)
+			{
+				case 0x00: // SPECIAL
+					switch (FUNCT(op))
+					{
+						case 0x0c: // SYSCALL
+						case 0x0d: // BREAK
+						case 0x20: // ADD
+						case 0x22: // SUB
+						case 0x2c: // DADD
+						case 0x2e: // DSUB
+						case 0x30: // TGE
+						case 0x31: // TGEU
+						case 0x32: // TLT
+						case 0x33: // TLTU
+						case 0x34: // TEQ
+						case 0x36: // TNE
+							return true;
+						default:
+							return false;
+					}
+				case 0x01: // REGIMM trap-immediate family
+					switch (RT(op))
+					{
+						case 0x08: // TGEI
+						case 0x09: // TGEIU
+						case 0x0a: // TLTI
+						case 0x0b: // TLTIU
+						case 0x0c: // TEQI
+						case 0x0e: // TNEI
+							return true;
+						default:
+							return false;
+					}
+				case 0x08: // ADDI
+				case 0x18: // DADDI
+					return true;
+				default:
+					return false;
+			}
+		}
+
 		ExitReason ClassifyExit(u32 op)
 		{
 			const u32 flags = R5900::GetInstruction(op).flags;
+			if (IsExceptionCapableInstruction(op))
+				return ExitReason::ExceptionObserver;
 			if ((flags & IS_BRANCH) != 0)
 				return ExitReason::UnsupportedControlFlow;
 			if ((flags & IS_MEMORY) != 0)
