@@ -27,6 +27,10 @@ namespace VitaEE::RegionIR
 		// integer dataflow from becoming floating-point data without an explicit
 		// bit-preserving COP1 transfer.
 		F32Bits,
+		// Four raw VU floating-point words. This is deliberately distinct from
+		// an EE I128 value: a bit-identical qword cannot silently cross between
+		// the EE GPR/MMI and VU0 FMAC register files.
+		VuF32x4Bits,
 		I64,
 		I128,
 		Address,
@@ -125,12 +129,29 @@ namespace VitaEE::RegionIR
 		// value. Making the transfer depend on this result prevents a backend from
 		// moving the memory effect ahead of the synchronization observer.
 		Vu0RequireIdle,
+		// VU0 FMAC arithmetic remains decomposed into uncontracted multiply/add,
+		// one shared raw result, architectural result normalization, and explicit
+		// flag publication. The lane/mask lives in immediate where applicable.
+		Vu0NormalizeVector,
+		Vu0BroadcastLane,
+		Vu0MulRaw,
+		Vu0AddRaw,
+		Vu0ClampFmacResult,
+		Vu0MacFlagsFromRaw,
+		Vu0StatusFlagsFromMac,
+		Vu0MergeMasked,
+		Vu0SyncStatusControl,
 		BindGpr,
 		BindHi,
 		BindLo,
 		BindSa,
 		BindFpr,
 		BindVu0Vf,
+		BindVu0Acc,
+		BindVu0MacFlag,
+		BindVu0StatusFlag,
+		BindVu0ViMac,
+		BindVu0ViStatus,
 		BindFcr31,
 		BindAcc,
 		AdvanceCycles,
@@ -170,10 +191,15 @@ namespace VitaEE::RegionIR
 		ValueId fcr31 = INVALID_VALUE;
 		ValueId acc = INVALID_VALUE;
 		ValueId acc_flag = INVALID_VALUE;
-		// The first VU0 Region IR boundary owns vector transfers only. VI state
-		// remains outside the admitted instruction surface except for the VPU_STAT
-		// busy observer required by PCSX2 VU0.cpp::vu0Sync().
+		// VU0 vector/ACC state and the FMAC flag mirrors are explicit. Remaining
+		// VI state stays outside the admitted surface except for VPU_STAT, which
+		// is the PCSX2 VU0.cpp::vu0Sync() busy observer.
 		std::array<ValueId, 32> vu0_vf{};
+		ValueId vu0_acc = INVALID_VALUE;
+		ValueId vu0_macflag = INVALID_VALUE;
+		ValueId vu0_statusflag = INVALID_VALUE;
+		ValueId vu0_vi_mac = INVALID_VALUE;
+		ValueId vu0_vi_status = INVALID_VALUE;
 		ValueId vu0_vpu_stat = INVALID_VALUE;
 		ValueId cycle = INVALID_VALUE;
 		// Ordered, non-architectural memory state. It prevents loads and stores
@@ -353,6 +379,9 @@ namespace VitaEE::RegionIR
 		// Vita's playable product fixes this false. CACHE is a no-op only under
 		// PCSX2's recompiler contract; cache-emulation validation must fail closed.
 		bool ee_cache_enabled = false;
+		// PCSX2 CHECK_VU_OVERFLOW(0). This is part of the selected VU numeric
+		// contract and therefore cannot be read implicitly by disconnected IR.
+		bool vu0_overflow_clamp = true;
 		u32 max_blocks = 8;
 		u32 max_source_instructions = 64;
 	};
@@ -438,6 +467,11 @@ namespace VitaEE::RegionIR
 		u32 acc = 0;
 		u32 acc_flag = 0;
 		std::array<u128, 32> vu0_vf{};
+		u128 vu0_acc{};
+		u32 vu0_macflag = 0;
+		u32 vu0_statusflag = 0;
+		u32 vu0_vi_mac = 0;
+		u32 vu0_vi_status = 0;
 		u32 vu0_vpu_stat = 0;
 		u32 pc = 0;
 		u64 cycle = 0;

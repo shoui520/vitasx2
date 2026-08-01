@@ -30,8 +30,13 @@ namespace VitaEE::RegionIR
 		constexpr u32 ACC_FLAG_PARAMETER = ACC_PARAMETER + 1;
 		constexpr u32 VU0_VF_PARAMETER_BASE = ACC_FLAG_PARAMETER + 1;
 		constexpr u32 VU0_VF_COUNT = 32;
-		constexpr u32 VU0_VPU_STAT_PARAMETER =
+		constexpr u32 VU0_ACC_PARAMETER =
 			VU0_VF_PARAMETER_BASE + VU0_VF_COUNT;
+		constexpr u32 VU0_MACFLAG_PARAMETER = VU0_ACC_PARAMETER + 1;
+		constexpr u32 VU0_STATUSFLAG_PARAMETER = VU0_MACFLAG_PARAMETER + 1;
+		constexpr u32 VU0_VI_MAC_PARAMETER = VU0_STATUSFLAG_PARAMETER + 1;
+		constexpr u32 VU0_VI_STATUS_PARAMETER = VU0_VI_MAC_PARAMETER + 1;
+		constexpr u32 VU0_VPU_STAT_PARAMETER = VU0_VI_STATUS_PARAMETER + 1;
 		constexpr u32 CYCLE_PARAMETER = VU0_VPU_STAT_PARAMETER + 1;
 		constexpr u32 MEMORY_EFFECT_PARAMETER = CYCLE_PARAMETER + 1;
 		constexpr u32 PARAMETER_COUNT = MEMORY_EFFECT_PARAMETER + 1;
@@ -86,6 +91,20 @@ namespace VitaEE::RegionIR
 			Less,
 			LessEqual,
 		};
+		enum class Vu0BroadcastFmacKind : u8
+		{
+			MultiplyAccumulator,
+			MultiplyAddAccumulator,
+			MultiplyAddVector,
+		};
+
+		struct Vu0BroadcastFmacOp
+		{
+			bool valid = false;
+			Vu0BroadcastFmacKind kind =
+				Vu0BroadcastFmacKind::MultiplyAccumulator;
+			u32 lane = 0;
+		};
 
 		constexpr u32 COP1_SIGN = 0x80000000u;
 		constexpr u32 COP1_EXPONENT = 0x7f800000u;
@@ -100,6 +119,9 @@ namespace VitaEE::RegionIR
 		constexpr u32 FCR31_SO = 0x00000010u;
 		constexpr u32 FCR31_SU = 0x00000008u;
 		constexpr u32 FCR31_C = 0x00800000u;
+		constexpr u32 VU_FLOAT_SIGN = 0x80000000u;
+		constexpr u32 VU_FLOAT_EXPONENT = 0x7f800000u;
+		constexpr u32 VU_FLOAT_MAX_FINITE = 0x7f7fffffu;
 
 		constexpr u32 RS(u32 op) { return (op >> 21) & 0x1fu; }
 		constexpr u32 RT(u32 op) { return (op >> 16) & 0x1fu; }
@@ -571,6 +593,34 @@ namespace VitaEE::RegionIR
 			       FUNCT(op) == 0x20;
 		}
 
+		Vu0BroadcastFmacOp DecodeVu0BroadcastFmac(u32 op)
+		{
+			if ((op >> 26) != 0x12 || (RS(op) & 0x10u) == 0)
+				return {};
+
+			const u32 function = FUNCT(op);
+			if (function >= 0x08 && function <= 0x0b)
+			{
+				return {true, Vu0BroadcastFmacKind::MultiplyAddVector,
+					function - 0x08};
+			}
+			if (function < 0x3c)
+				return {};
+
+			const u32 special2 = (op & 0x3u) | ((op >> 4) & 0x7cu);
+			if (special2 >= 0x08 && special2 <= 0x0b)
+			{
+				return {true, Vu0BroadcastFmacKind::MultiplyAddAccumulator,
+					special2 - 0x08};
+			}
+			if (special2 >= 0x18 && special2 <= 0x1b)
+			{
+				return {true, Vu0BroadcastFmacKind::MultiplyAccumulator,
+					special2 - 0x18};
+			}
+			return {};
+		}
+
 		Opcode BasicCop1RawOpcode(BasicCop1ArithmeticKind kind)
 		{
 			switch (kind)
@@ -691,6 +741,128 @@ namespace VitaEE::RegionIR
 			return condition ? (fcr31 | FCR31_C) : (fcr31 & ~FCR31_C);
 		}
 
+		u32 VuVectorLane(const u128& value, u32 lane)
+		{
+			const u64 half = lane < 2 ? value.lo : value.hi;
+			return static_cast<u32>(half >> ((lane & 1u) * 32u));
+		}
+
+		void SetVuVectorLane(u128* value, u32 lane, u32 word)
+		{
+			u64& half = lane < 2 ? value->lo : value->hi;
+			const u32 shift = (lane & 1u) * 32u;
+			half = (half & ~(UINT64_C(0xffffffff) << shift)) |
+			       (static_cast<u64>(word) << shift);
+		}
+
+		u32 NormalizeVuFloat(u32 value, bool overflow_clamp)
+		{
+			const u32 exponent = value & VU_FLOAT_EXPONENT;
+			if (exponent == 0)
+				return value & VU_FLOAT_SIGN;
+			if (overflow_clamp && exponent == VU_FLOAT_EXPONENT)
+				return (value & VU_FLOAT_SIGN) | VU_FLOAT_MAX_FINITE;
+			return value;
+		}
+
+		u128 NormalizeVuVector(const u128& value, bool overflow_clamp)
+		{
+			u128 result{};
+			for (u32 lane = 0; lane < 4; lane++)
+				SetVuVectorLane(&result, lane,
+					NormalizeVuFloat(VuVectorLane(value, lane), overflow_clamp));
+			return result;
+		}
+
+		u128 BroadcastVuLane(const u128& value, u32 lane)
+		{
+			u128 result{};
+			const u32 word = VuVectorLane(value, lane);
+			for (u32 output_lane = 0; output_lane < 4; output_lane++)
+				SetVuVectorLane(&result, output_lane, word);
+			return result;
+		}
+
+		u128 EvaluateVuRawBinary(Opcode opcode, const u128& left,
+			const u128& right)
+		{
+			u128 result{};
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				const float left_value =
+					std::bit_cast<float>(VuVectorLane(left, lane));
+				const float right_value =
+					std::bit_cast<float>(VuVectorLane(right, lane));
+				const float raw = opcode == Opcode::Vu0MulRaw ?
+					left_value * right_value : left_value + right_value;
+				SetVuVectorLane(&result, lane, std::bit_cast<u32>(raw));
+			}
+			return result;
+		}
+
+		u128 ClampVuFmacResult(const u128& raw, u32 mask, bool overflow_clamp)
+		{
+			u128 result = raw;
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				if ((mask & (1u << (3u - lane))) == 0)
+					continue;
+				const u32 value = VuVectorLane(raw, lane);
+				const u32 exponent = value & VU_FLOAT_EXPONENT;
+				u32 clamped = value;
+				if ((value & ~VU_FLOAT_SIGN) == 0)
+					clamped = value;
+				else if (exponent == 0)
+					clamped = value & VU_FLOAT_SIGN;
+				else if (overflow_clamp && exponent == VU_FLOAT_EXPONENT)
+					clamped = (value & VU_FLOAT_SIGN) | VU_FLOAT_MAX_FINITE;
+				SetVuVectorLane(&result, lane, clamped);
+			}
+			return result;
+		}
+
+		u32 VuMacFlagsFromRaw(const u128& raw, u32 mask)
+		{
+			u32 flags = 0;
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				const u32 lane_bit = 1u << (3u - lane);
+				if ((mask & lane_bit) == 0)
+					continue;
+				const u32 value = VuVectorLane(raw, lane);
+				const u32 shift = 3u - lane;
+				if ((value & VU_FLOAT_SIGN) != 0)
+					flags |= 0x0010u << shift;
+				if ((value & ~VU_FLOAT_SIGN) == 0)
+					flags |= 0x0001u << shift;
+				else if ((value & VU_FLOAT_EXPONENT) == 0)
+					flags |= 0x0101u << shift;
+				else if ((value & VU_FLOAT_EXPONENT) == VU_FLOAT_EXPONENT)
+					flags |= 0x1000u << shift;
+			}
+			return flags;
+		}
+
+		u32 VuStatusFlagsFromMac(u32 mac)
+		{
+			return ((mac & 0x000fu) != 0 ? 0x1u : 0u) |
+			       ((mac & 0x00f0u) != 0 ? 0x2u : 0u) |
+			       ((mac & 0x0f00u) != 0 ? 0x4u : 0u) |
+			       ((mac & 0xf000u) != 0 ? 0x8u : 0u);
+		}
+
+		u128 MergeVuMasked(const u128& old_value, const u128& new_value,
+			u32 mask)
+		{
+			u128 result = old_value;
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				if ((mask & (1u << (3u - lane))) != 0)
+					SetVuVectorLane(&result, lane, VuVectorLane(new_value, lane));
+			}
+			return result;
+		}
+
 		bool IsCop1ControlWrite(u32 op)
 		{
 			// CTC1 is defined only for FCR31. Reserved control registers remain
@@ -735,6 +907,8 @@ namespace VitaEE::RegionIR
 					       DecodeCompoundCop1Arithmetic(op, nullptr) ||
 					       DecodeCop1Compare(op, nullptr) ||
 					       IsCop1ConvertWord(op) || IsCop1ConvertSingle(op);
+				case 0x12: // Guarded VU0 macro FMAC broadcast chains.
+					return DecodeVu0BroadcastFmac(op).valid;
 				default:
 					return false;
 			}
@@ -1291,11 +1465,26 @@ namespace VitaEE::RegionIR
 					for (u32 vf = 0; vf < VU0_VF_COUNT; vf++)
 					{
 						block.parameters.vu0_vf[vf] = AddNode(block,
-							Opcode::Parameter, ValueType::I128, {}, 0,
+							Opcode::Parameter, ValueType::VuF32x4Bits, {}, 0,
 							VU0_VF_PARAMETER_BASE + vf, 0, block.pc);
 						if (block.parameters.vu0_vf[vf] == INVALID_VALUE)
 							return false;
 					}
+					block.parameters.vu0_acc = AddNode(block,
+						Opcode::Parameter, ValueType::VuF32x4Bits, {}, 0,
+						VU0_ACC_PARAMETER, 0, block.pc);
+					block.parameters.vu0_macflag = AddNode(block,
+						Opcode::Parameter, ValueType::I32, {}, 0,
+						VU0_MACFLAG_PARAMETER, 0, block.pc);
+					block.parameters.vu0_statusflag = AddNode(block,
+						Opcode::Parameter, ValueType::I32, {}, 0,
+						VU0_STATUSFLAG_PARAMETER, 0, block.pc);
+					block.parameters.vu0_vi_mac = AddNode(block,
+						Opcode::Parameter, ValueType::I32, {}, 0,
+						VU0_VI_MAC_PARAMETER, 0, block.pc);
+					block.parameters.vu0_vi_status = AddNode(block,
+						Opcode::Parameter, ValueType::I32, {}, 0,
+						VU0_VI_STATUS_PARAMETER, 0, block.pc);
 					block.parameters.vu0_vpu_stat = AddNode(block,
 						Opcode::Parameter, ValueType::I32, {}, 0,
 						VU0_VPU_STAT_PARAMETER, 0, block.pc);
@@ -1312,6 +1501,11 @@ namespace VitaEE::RegionIR
 						block.parameters.fcr31 == INVALID_VALUE ||
 						block.parameters.acc == INVALID_VALUE ||
 						block.parameters.acc_flag == INVALID_VALUE ||
+						block.parameters.vu0_acc == INVALID_VALUE ||
+						block.parameters.vu0_macflag == INVALID_VALUE ||
+						block.parameters.vu0_statusflag == INVALID_VALUE ||
+						block.parameters.vu0_vi_mac == INVALID_VALUE ||
+						block.parameters.vu0_vi_status == INVALID_VALUE ||
 						block.parameters.vu0_vpu_stat == INVALID_VALUE ||
 						block.parameters.cycle == INVALID_VALUE ||
 						block.parameters.memory_effect == INVALID_VALUE)
@@ -1528,6 +1722,102 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
+			bool WriteVu0State(Block& block, ValueId* destination, Opcode bind,
+				ValueId value, u32 source_pc)
+			{
+				if (!destination || value == INVALID_VALUE ||
+					AddNode(block, bind, ValueType::Void,
+						{value, INVALID_VALUE, INVALID_VALUE}, 1, 0, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				*destination = value;
+				return true;
+			}
+
+			bool LowerVu0BroadcastFmac(Block& block, StateMap* state, u32 op,
+				u32 pc)
+			{
+				const Vu0BroadcastFmacOp fmac = DecodeVu0BroadcastFmac(op);
+				if (!fmac.valid)
+					return false;
+
+				const u32 mask = RS(op) & 0x0fu;
+				const u32 ft = RT(op);
+				const u32 fs = RD(op);
+				const u32 fd = SA(op);
+				const ValueId guarded_fs = Binary(block, Opcode::Vu0RequireIdle,
+					ValueType::VuF32x4Bits, state->vu0_vpu_stat,
+					state->vu0_vf[fs], pc);
+				const ValueId normalized_fs = Unary(block, Opcode::Vu0NormalizeVector,
+					ValueType::VuF32x4Bits, guarded_fs, pc);
+				const ValueId normalized_ft = Unary(block, Opcode::Vu0NormalizeVector,
+					ValueType::VuF32x4Bits, state->vu0_vf[ft], pc);
+				const ValueId broadcast = Unary(block, Opcode::Vu0BroadcastLane,
+					ValueType::VuF32x4Bits, normalized_ft, pc, fmac.lane);
+				const ValueId product = Binary(block, Opcode::Vu0MulRaw,
+					ValueType::VuF32x4Bits, normalized_fs, broadcast, pc);
+				if (guarded_fs == INVALID_VALUE || normalized_fs == INVALID_VALUE ||
+					normalized_ft == INVALID_VALUE || broadcast == INVALID_VALUE ||
+					product == INVALID_VALUE)
+				{
+					return false;
+				}
+
+				ValueId raw = product;
+				if (fmac.kind != Vu0BroadcastFmacKind::MultiplyAccumulator)
+				{
+					const ValueId normalized_acc = Unary(block,
+						Opcode::Vu0NormalizeVector, ValueType::VuF32x4Bits,
+						state->vu0_acc, pc);
+					raw = Binary(block, Opcode::Vu0AddRaw,
+						ValueType::VuF32x4Bits, normalized_acc, product, pc);
+					if (normalized_acc == INVALID_VALUE || raw == INVALID_VALUE)
+						return false;
+				}
+
+				const ValueId result = Unary(block, Opcode::Vu0ClampFmacResult,
+					ValueType::VuF32x4Bits, raw, pc, mask);
+				const ValueId mac = Unary(block, Opcode::Vu0MacFlagsFromRaw,
+					ValueType::I32, raw, pc, mask);
+				const ValueId status = Unary(block, Opcode::Vu0StatusFlagsFromMac,
+					ValueType::I32, mac, pc);
+				const ValueId vi_status = Binary(block, Opcode::Vu0SyncStatusControl,
+					ValueType::I32, state->vu0_vi_status, status, pc);
+				if (result == INVALID_VALUE || mac == INVALID_VALUE ||
+					status == INVALID_VALUE || vi_status == INVALID_VALUE ||
+					!WriteVu0State(block, &state->vu0_macflag,
+						Opcode::BindVu0MacFlag, mac, pc) ||
+					!WriteVu0State(block, &state->vu0_statusflag,
+						Opcode::BindVu0StatusFlag, status, pc) ||
+					!WriteVu0State(block, &state->vu0_vi_mac,
+						Opcode::BindVu0ViMac, mac, pc) ||
+					!WriteVu0State(block, &state->vu0_vi_status,
+						Opcode::BindVu0ViStatus, vi_status, pc))
+				{
+					return false;
+				}
+
+				if (mask == 0)
+					return true;
+				const bool acc_destination =
+					fmac.kind != Vu0BroadcastFmacKind::MultiplyAddVector;
+				ValueId& old_destination = acc_destination ?
+					state->vu0_acc : state->vu0_vf[fd];
+				const ValueId merged = AddNode(block, Opcode::Vu0MergeMasked,
+					ValueType::VuF32x4Bits,
+					{old_destination, result, INVALID_VALUE}, 2, mask, 0, pc);
+				if (merged == INVALID_VALUE)
+					return false;
+				if (acc_destination)
+				{
+					return WriteVu0State(block, &state->vu0_acc,
+						Opcode::BindVu0Acc, merged, pc);
+				}
+				return fd == 0 || WriteVu0Vf(block, state, fd, merged, pc);
+			}
+
 			bool WriteFcr31(Block& block, StateMap* state, ValueId value,
 				u32 source_pc)
 			{
@@ -1676,7 +1966,8 @@ namespace VitaEE::RegionIR
 				if (vu0_access)
 				{
 					architectural_value = Binary(block, Opcode::Vu0RequireIdle,
-						ValueType::I128, state->vu0_vpu_stat, architectural_value, pc);
+						ValueType::VuF32x4Bits, state->vu0_vpu_stat,
+						architectural_value, pc);
 					if (architectural_value == INVALID_VALUE)
 						return false;
 				}
@@ -1702,7 +1993,8 @@ namespace VitaEE::RegionIR
 					if (!fpr_access && destination == 0)
 						return true;
 					const ValueId value = Unary(block, Opcode::MemoryLoadValue,
-						fpr_access ? ValueType::F32Bits : ValueType::I128,
+						fpr_access ? ValueType::F32Bits :
+							(vu0_access ? ValueType::VuF32x4Bits : ValueType::I128),
 						effect, pc);
 					if (fpr_access)
 						return WriteFpr(block, state, destination, value, pc);
@@ -1743,6 +2035,8 @@ namespace VitaEE::RegionIR
 					return LowerMemory(block, state, op, pc, memory_kind);
 
 				const u32 primary = op >> 26;
+				if (primary == 0x12)
+					return LowerVu0BroadcastFmac(block, state, op, pc);
 				if (primary == 0x11)
 				{
 					PureCop1StateKind kind{};
@@ -2174,6 +2468,11 @@ namespace VitaEE::RegionIR
 			       left.fcr0 == right.fcr0 && left.fcr31 == right.fcr31 &&
 			       left.acc == right.acc && left.acc_flag == right.acc_flag &&
 			       left.vu0_vf == right.vu0_vf &&
+			       left.vu0_acc == right.vu0_acc &&
+			       left.vu0_macflag == right.vu0_macflag &&
+			       left.vu0_statusflag == right.vu0_statusflag &&
+			       left.vu0_vi_mac == right.vu0_vi_mac &&
+			       left.vu0_vi_status == right.vu0_vi_status &&
 			       left.vu0_vpu_stat == right.vu0_vpu_stat &&
 			       left.cycle == right.cycle &&
 			       left.memory_effect == right.memory_effect;
@@ -2733,10 +3032,16 @@ namespace VitaEE::RegionIR
 				                           slot == FCR0_PARAMETER ||
 				                           slot == FCR31_PARAMETER ||
 				                           slot == ACC_FLAG_PARAMETER ||
+				                           slot == VU0_MACFLAG_PARAMETER ||
+				                           slot == VU0_STATUSFLAG_PARAMETER ||
+				                           slot == VU0_VI_MAC_PARAMETER ||
+				                           slot == VU0_VI_STATUS_PARAMETER ||
 				                           slot == VU0_VPU_STAT_PARAMETER;
 				const ValueType expected_type = i32_parameter ? ValueType::I32 :
 					fpr_parameter ? ValueType::F32Bits :
 					slot == ACC_PARAMETER ? ValueType::F32Bits :
+					(vu0_vf_parameter || slot == VU0_ACC_PARAMETER) ?
+						ValueType::VuF32x4Bits :
 					slot == CYCLE_PARAMETER ? ValueType::Cycle :
 					slot == MEMORY_EFFECT_PARAMETER ? ValueType::MemoryEffect :
 					                                    ValueType::I128;
@@ -2767,6 +3072,16 @@ namespace VitaEE::RegionIR
 					expected.acc_flag = parameter.id;
 				else if (vu0_vf_parameter)
 					expected.vu0_vf[slot - VU0_VF_PARAMETER_BASE] = parameter.id;
+				else if (slot == VU0_ACC_PARAMETER)
+					expected.vu0_acc = parameter.id;
+				else if (slot == VU0_MACFLAG_PARAMETER)
+					expected.vu0_macflag = parameter.id;
+				else if (slot == VU0_STATUSFLAG_PARAMETER)
+					expected.vu0_statusflag = parameter.id;
+				else if (slot == VU0_VI_MAC_PARAMETER)
+					expected.vu0_vi_mac = parameter.id;
+				else if (slot == VU0_VI_STATUS_PARAMETER)
+					expected.vu0_vi_status = parameter.id;
 				else if (slot == VU0_VPU_STAT_PARAMETER)
 					expected.vu0_vpu_stat = parameter.id;
 				else if (slot == CYCLE_PARAMETER)
@@ -2902,6 +3217,12 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> vu0_idle_guard_count;
 			std::map<u32, ValueId> vu0_idle_guard_value;
 			std::map<u32, u32> vu0_vf_bind_count;
+			std::map<u32, u32> vu0_acc_bind_count;
+			std::map<u32, u32> vu0_macflag_bind_count;
+			std::map<u32, u32> vu0_statusflag_bind_count;
+			std::map<u32, u32> vu0_vi_mac_bind_count;
+			std::map<u32, u32> vu0_vi_status_bind_count;
+			std::map<u32, ValueId> vu0_fmac_raw_result;
 			std::map<u32, u32> fcr31_bind_count;
 			std::map<u32, u32> acc_bind_count;
 			std::map<u32, ValueId> cop1_ou_raw_result;
@@ -3320,6 +3641,52 @@ namespace VitaEE::RegionIR
 				return exact_unary(compare->operands[1], Opcode::Cop1NormalizeInput,
 					input.fpr[ft], source_pc);
 			};
+			auto exact_vu0_fmac_raw = [&](ValueId value, u32 source_opcode,
+				u32 source_pc, const StateMap& input) {
+				const Vu0BroadcastFmacOp fmac =
+					DecodeVu0BroadcastFmac(source_opcode);
+				const auto guard = vu0_idle_guard_value.find(source_pc);
+				if (!fmac.valid || guard == vu0_idle_guard_value.end())
+					return false;
+
+				const Node* final_raw = local_node(value);
+				const Node* product = final_raw;
+				if (fmac.kind != Vu0BroadcastFmacKind::MultiplyAccumulator)
+				{
+					if (!final_raw || final_raw->opcode != Opcode::Vu0AddRaw ||
+						final_raw->operand_count != 2 ||
+						final_raw->source_pc != source_pc ||
+						!exact_unary(final_raw->operands[0],
+							Opcode::Vu0NormalizeVector, input.vu0_acc, source_pc))
+					{
+						return false;
+					}
+					product = local_node(final_raw->operands[1]);
+				}
+				if (!product || product->opcode != Opcode::Vu0MulRaw ||
+					product->operand_count != 2 || product->source_pc != source_pc ||
+					!exact_unary(product->operands[0], Opcode::Vu0NormalizeVector,
+						guard->second, source_pc))
+				{
+					return false;
+				}
+				const Node* broadcast = local_node(product->operands[1]);
+				return broadcast && broadcast->opcode == Opcode::Vu0BroadcastLane &&
+				       broadcast->operand_count == 1 &&
+				       broadcast->immediate == fmac.lane &&
+				       broadcast->source_pc == source_pc &&
+				       exact_unary(broadcast->operands[0],
+						Opcode::Vu0NormalizeVector, input.vu0_vf[RT(source_opcode)],
+						source_pc);
+			};
+			auto exact_vu0_fmac_clamp = [&](ValueId value, ValueId raw,
+				u32 source_opcode, u32 source_pc) {
+				const Node* clamp = local_node(value);
+				return clamp && clamp->opcode == Opcode::Vu0ClampFmacResult &&
+				       clamp->operand_count == 1 && clamp->operands[0] == raw &&
+				       clamp->immediate == (RS(source_opcode) & 0x0fu) &&
+				       clamp->source_pc == source_pc;
+			};
 			auto require_operand = [&](const Node& node, u32 node_index, u32 operand,
 									   ValueType required) -> VerifyResult {
 				if (operand >= node.operand_count ||
@@ -3656,18 +4023,27 @@ namespace VitaEE::RegionIR
 						break;
 					case Opcode::Vu0RequireIdle:
 					{
-						checked = binary(ValueType::I32, ValueType::I128,
-							ValueType::I128);
+						checked = binary(ValueType::I32, ValueType::VuF32x4Bits,
+							ValueType::VuF32x4Bits);
 						if (!checked)
 							break;
 						u32 source_opcode = 0;
 						MemoryAccessKind kind{};
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const bool vector_memory = have_source &&
+							DecodeMemoryAccess(source_opcode, &kind) &&
+							IsVu0MemoryAccess(kind);
+						const Vu0BroadcastFmacOp fmac = have_source ?
+							DecodeVu0BroadcastFmac(source_opcode) :
+							Vu0BroadcastFmacOp{};
+						const u32 source_vf = vector_memory ? RT(source_opcode) :
+							RD(source_opcode);
 						if (!source_opcode_at(node.source_pc, &source_opcode) ||
-							!DecodeMemoryAccess(source_opcode, &kind) ||
-							!IsVu0MemoryAccess(kind) || node.immediate != 0 ||
+							(!vector_memory && !fmac.valid) || node.immediate != 0 ||
 							node.literal != 0 ||
 							node.operands[0] != expected.vu0_vpu_stat ||
-							node.operands[1] != expected.vu0_vf[RT(source_opcode)] ||
+							node.operands[1] != expected.vu0_vf[source_vf] ||
 							!vu0_idle_guard_value.emplace(node.source_pc, node.id).second)
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
@@ -3676,6 +4052,131 @@ namespace VitaEE::RegionIR
 							break;
 						}
 						vu0_idle_guard_count[node.source_pc]++;
+						break;
+					}
+					case Opcode::Vu0NormalizeVector:
+					{
+						checked = unary(ValueType::VuF32x4Bits,
+							ValueType::VuF32x4Bits);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 node.immediate != 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 normalization has no broadcast FMAC owner");
+						}
+						break;
+					}
+					case Opcode::Vu0BroadcastLane:
+					{
+						checked = unary(ValueType::VuF32x4Bits,
+							ValueType::VuF32x4Bits);
+						u32 source_opcode = 0;
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const Vu0BroadcastFmacOp fmac = have_source ?
+							DecodeVu0BroadcastFmac(source_opcode) :
+							Vu0BroadcastFmacOp{};
+						if (checked && (!fmac.valid || node.immediate != fmac.lane ||
+							node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 broadcast lane does not match its FMAC source");
+						}
+						break;
+					}
+					case Opcode::Vu0MulRaw:
+					case Opcode::Vu0AddRaw:
+					{
+						checked = binary(ValueType::VuF32x4Bits,
+							ValueType::VuF32x4Bits, ValueType::VuF32x4Bits);
+						u32 source_opcode = 0;
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const Vu0BroadcastFmacOp fmac = have_source ?
+							DecodeVu0BroadcastFmac(source_opcode) :
+							Vu0BroadcastFmacOp{};
+						const bool add_allowed = fmac.valid &&
+							fmac.kind != Vu0BroadcastFmacKind::MultiplyAccumulator;
+						if (checked && (!fmac.valid || node.immediate != 0 ||
+							node.literal != 0 ||
+							(node.opcode == Opcode::Vu0AddRaw && !add_allowed)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 raw FMAC operation does not match its source");
+						}
+						break;
+					}
+					case Opcode::Vu0ClampFmacResult:
+					case Opcode::Vu0MacFlagsFromRaw:
+					{
+						checked = unary(ValueType::VuF32x4Bits,
+							node.opcode == Opcode::Vu0ClampFmacResult ?
+								ValueType::VuF32x4Bits : ValueType::I32);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 node.immediate != (RS(source_opcode) & 0x0fu) ||
+							 node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 result/flag mask does not match its FMAC source");
+						}
+						break;
+					}
+					case Opcode::Vu0StatusFlagsFromMac:
+					{
+						checked = unary(ValueType::I32, ValueType::I32);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 node.immediate != 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 status reduction has no FMAC source");
+						}
+						break;
+					}
+					case Opcode::Vu0MergeMasked:
+					{
+						checked = binary(ValueType::VuF32x4Bits,
+							ValueType::VuF32x4Bits, ValueType::VuF32x4Bits);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 node.immediate != (RS(source_opcode) & 0x0fu) ||
+							 node.immediate == 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 masked merge does not match its FMAC source");
+						}
+						break;
+					}
+					case Opcode::Vu0SyncStatusControl:
+					{
+						checked = binary(ValueType::I32, ValueType::I32,
+							ValueType::I32);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 node.immediate != 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 status mirror has no FMAC source");
+						}
 						break;
 					}
 					case Opcode::MemoryLoad:
@@ -3713,7 +4214,9 @@ namespace VitaEE::RegionIR
 						const bool fpr_access = IsFprMemoryAccess(expected_kind);
 						const bool vu0_access = IsVu0MemoryAccess(expected_kind);
 						checked = require_operand(node, node_index, 2,
-							fpr_access ? ValueType::F32Bits : ValueType::I128);
+							fpr_access ? ValueType::F32Bits :
+								(vu0_access ? ValueType::VuF32x4Bits :
+								              ValueType::I128));
 						if (!checked)
 							break;
 						ValueId expected_value = fpr_access ?
@@ -3798,7 +4301,9 @@ namespace VitaEE::RegionIR
 							!IsMemoryLoad(kind) ||
 							(!IsFprMemoryAccess(kind) && RT(source_opcode) == 0) ||
 							node.type != (IsFprMemoryAccess(kind) ?
-								ValueType::F32Bits : ValueType::I128))
+								ValueType::F32Bits :
+								(IsVu0MemoryAccess(kind) ? ValueType::VuF32x4Bits :
+								                            ValueType::I128)))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
@@ -4079,7 +4584,7 @@ namespace VitaEE::RegionIR
 						}
 						break;
 					case Opcode::BindVu0Vf:
-						checked = unary(ValueType::I128, ValueType::Void);
+						checked = unary(ValueType::VuF32x4Bits, ValueType::Void);
 						if (checked &&
 							(node.immediate == 0 || node.immediate >= VU0_VF_COUNT))
 						{
@@ -4092,23 +4597,177 @@ namespace VitaEE::RegionIR
 							u32 source_opcode = 0;
 							MemoryAccessKind kind{};
 							const Node* value = local_node(node.operands[0]);
-							if (!source_opcode_at(node.source_pc, &source_opcode) ||
-								!DecodeMemoryAccess(source_opcode, &kind) ||
-								kind != MemoryAccessKind::LoadVu0Vector ||
-								node.immediate != RT(source_opcode) || !value ||
-								value->opcode != Opcode::MemoryLoadValue ||
-								value->source_pc != node.source_pc)
+							if (!source_opcode_at(node.source_pc, &source_opcode))
 							{
 								checked = Fail(VerifyFailure::SourceMismatch,
 									block_index, node_index,
-									"loaded VU0 VF binding does not match decoded ft");
+									"VU0 VF binding has no owning source");
 								break;
 							}
-							memory_bind_count[node.source_pc]++;
+							const bool vector_load =
+								DecodeMemoryAccess(source_opcode, &kind) &&
+								kind == MemoryAccessKind::LoadVu0Vector;
+							const Vu0BroadcastFmacOp fmac =
+								DecodeVu0BroadcastFmac(source_opcode);
+							if (vector_load)
+							{
+								if (node.immediate != RT(source_opcode) || !value ||
+									value->opcode != Opcode::MemoryLoadValue ||
+									value->source_pc != node.source_pc)
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"loaded VU0 VF binding does not match decoded ft");
+									break;
+								}
+								memory_bind_count[node.source_pc]++;
+							}
+							else
+							{
+								const auto raw = vu0_fmac_raw_result.find(node.source_pc);
+								const u32 mask = RS(source_opcode) & 0x0fu;
+								if (!fmac.valid ||
+									fmac.kind != Vu0BroadcastFmacKind::MultiplyAddVector ||
+									mask == 0 || node.immediate != SA(source_opcode) ||
+									raw == vu0_fmac_raw_result.end() || !value ||
+									value->opcode != Opcode::Vu0MergeMasked ||
+									value->operand_count != 2 || value->immediate != mask ||
+									value->operands[0] != expected.vu0_vf[node.immediate] ||
+									!exact_vu0_fmac_clamp(value->operands[1], raw->second,
+										source_opcode, node.source_pc))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"VU0 FMAC result does not bind decoded fd exactly");
+									break;
+								}
+							}
 							vu0_vf_bind_count[node.source_pc]++;
 							expected.vu0_vf[node.immediate] = node.operands[0];
 						}
 						break;
+					case Opcode::BindVu0MacFlag:
+					{
+						checked = unary(ValueType::I32, ValueType::Void);
+						u32 source_opcode = 0;
+						const Node* value = local_node(node.operands[0]);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 node.immediate != 0 || !value ||
+							 value->opcode != Opcode::Vu0MacFlagsFromRaw ||
+							 value->operand_count != 1 ||
+							 value->immediate != (RS(source_opcode) & 0x0fu) ||
+							 !exact_vu0_fmac_raw(value->operands[0], source_opcode,
+								node.source_pc, expected) ||
+							 !vu0_fmac_raw_result.emplace(node.source_pc,
+								value->operands[0]).second))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 MAC binding does not share the exact FMAC raw result");
+							break;
+						}
+						vu0_macflag_bind_count[node.source_pc]++;
+						expected.vu0_macflag = node.operands[0];
+						break;
+					}
+					case Opcode::BindVu0StatusFlag:
+					{
+						checked = unary(ValueType::I32, ValueType::Void);
+						u32 source_opcode = 0;
+						const Node* value = local_node(node.operands[0]);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 node.immediate != 0 || !value ||
+							 value->opcode != Opcode::Vu0StatusFlagsFromMac ||
+							 value->operand_count != 1 ||
+							 value->operands[0] != expected.vu0_macflag))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 status binding does not reduce the current MAC flags");
+							break;
+						}
+						vu0_statusflag_bind_count[node.source_pc]++;
+						expected.vu0_statusflag = node.operands[0];
+						break;
+					}
+					case Opcode::BindVu0ViMac:
+					{
+						checked = unary(ValueType::I32, ValueType::Void);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 node.immediate != 0 ||
+							 node.operands[0] != expected.vu0_macflag))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 VI MAC mirror does not publish the current MAC flags");
+							break;
+						}
+						vu0_vi_mac_bind_count[node.source_pc]++;
+						expected.vu0_vi_mac = node.operands[0];
+						break;
+					}
+					case Opcode::BindVu0ViStatus:
+					{
+						checked = unary(ValueType::I32, ValueType::Void);
+						u32 source_opcode = 0;
+						const Node* value = local_node(node.operands[0]);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 node.immediate != 0 || !value ||
+							 value->opcode != Opcode::Vu0SyncStatusControl ||
+							 value->operand_count != 2 ||
+							 value->operands[0] != expected.vu0_vi_status ||
+							 value->operands[1] != expected.vu0_statusflag))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 VI status mirror loses current or sticky flags");
+							break;
+						}
+						vu0_vi_status_bind_count[node.source_pc]++;
+						expected.vu0_vi_status = node.operands[0];
+						break;
+					}
+					case Opcode::BindVu0Acc:
+					{
+						checked = unary(ValueType::VuF32x4Bits, ValueType::Void);
+						u32 source_opcode = 0;
+						const Node* value = local_node(node.operands[0]);
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const Vu0BroadcastFmacOp fmac = have_source ?
+							DecodeVu0BroadcastFmac(source_opcode) :
+							Vu0BroadcastFmacOp{};
+						const auto raw = vu0_fmac_raw_result.find(node.source_pc);
+						const u32 mask = RS(source_opcode) & 0x0fu;
+						if (checked &&
+							(!fmac.valid ||
+							 fmac.kind == Vu0BroadcastFmacKind::MultiplyAddVector ||
+							 mask == 0 || node.immediate != 0 ||
+							 raw == vu0_fmac_raw_result.end() || !value ||
+							 value->opcode != Opcode::Vu0MergeMasked ||
+							 value->operand_count != 2 || value->immediate != mask ||
+							 value->operands[0] != expected.vu0_acc ||
+							 !exact_vu0_fmac_clamp(value->operands[1], raw->second,
+								source_opcode, node.source_pc)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 FMAC accumulator binding is not an exact masked result");
+							break;
+						}
+						vu0_acc_bind_count[node.source_pc]++;
+						expected.vu0_acc = node.operands[0];
+						break;
+					}
 					case Opcode::BindFcr31:
 						checked = unary(ValueType::I32, ValueType::Void);
 						if (checked)
@@ -4248,8 +4907,44 @@ namespace VitaEE::RegionIR
 			}
 			for (const SourceInstruction& source : block.source)
 			{
+				const Vu0BroadcastFmacOp vu0_fmac =
+					DecodeVu0BroadcastFmac(source.opcode);
 				NoEffectKind no_effect_kind{};
-				if (DecodeNoEffect(source.opcode, program.options, &no_effect_kind))
+				if (vu0_fmac.valid)
+				{
+					const u32 mask = RS(source.opcode) & 0x0fu;
+					const bool vector_destination = vu0_fmac.kind ==
+						Vu0BroadcastFmacKind::MultiplyAddVector;
+					const u32 expected_vf =
+						vector_destination && mask != 0 && SA(source.opcode) != 0 ?
+							1u : 0u;
+					const u32 expected_acc =
+						!vector_destination && mask != 0 ? 1u : 0u;
+					if (vu0_idle_guard_count[source.pc] != 1 ||
+						vu0_macflag_bind_count[source.pc] != 1 ||
+						vu0_statusflag_bind_count[source.pc] != 1 ||
+						vu0_vi_mac_bind_count[source.pc] != 1 ||
+						vu0_vi_status_bind_count[source.pc] != 1 ||
+						vu0_vf_bind_count[source.pc] != expected_vf ||
+						vu0_acc_bind_count[source.pc] != expected_acc ||
+						!vu0_fmac_raw_result.contains(source.pc) ||
+						memory_operation_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
+						fcr31_bind_count[source.pc] != 0 ||
+						acc_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"VU0 broadcast FMAC lacks its exact guard, flags, or destination");
+					}
+				}
+				else if (DecodeNoEffect(source.opcode, program.options, &no_effect_kind))
 				{
 					if (no_effect_count[source.pc] != 1 ||
 						extended_gpr_bind_count[source.pc] != 0 ||
@@ -4842,7 +5537,17 @@ namespace VitaEE::RegionIR
 				{ValueType::I32, Bits(state.acc_flag)};
 			for (u32 vf = 0; vf < VU0_VF_COUNT; vf++)
 				values[block.parameters.vu0_vf[vf]] =
-					{ValueType::I128, state.vu0_vf[vf]};
+					{ValueType::VuF32x4Bits, state.vu0_vf[vf]};
+			values[block.parameters.vu0_acc] =
+				{ValueType::VuF32x4Bits, state.vu0_acc};
+			values[block.parameters.vu0_macflag] =
+				{ValueType::I32, Bits(state.vu0_macflag)};
+			values[block.parameters.vu0_statusflag] =
+				{ValueType::I32, Bits(state.vu0_statusflag)};
+			values[block.parameters.vu0_vi_mac] =
+				{ValueType::I32, Bits(state.vu0_vi_mac)};
+			values[block.parameters.vu0_vi_status] =
+				{ValueType::I32, Bits(state.vu0_vi_status)};
 			values[block.parameters.vu0_vpu_stat] =
 				{ValueType::I32, Bits(state.vu0_vpu_stat)};
 			values[block.parameters.cycle] = {ValueType::Cycle, Bits(state.cycle)};
@@ -4867,6 +5572,15 @@ namespace VitaEE::RegionIR
 			for (u32 vf = 0; vf < VU0_VF_COUNT; vf++)
 				state.vu0_vf[vf] = values[transfer.state.vu0_vf[vf]].bits;
 			state.vu0_vf[0] = Bits(0, 0x3f80000000000000ull);
+			state.vu0_acc = values[transfer.state.vu0_acc].bits;
+			state.vu0_macflag = static_cast<u32>(
+				values[transfer.state.vu0_macflag].bits.lo);
+			state.vu0_statusflag = static_cast<u32>(
+				values[transfer.state.vu0_statusflag].bits.lo);
+			state.vu0_vi_mac = static_cast<u32>(
+				values[transfer.state.vu0_vi_mac].bits.lo);
+			state.vu0_vi_status = static_cast<u32>(
+				values[transfer.state.vu0_vi_status].bits.lo);
 			state.vu0_vpu_stat = static_cast<u32>(
 				values[transfer.state.vu0_vpu_stat].bits.lo);
 			state.cycle = values[transfer.state.cycle].bits.lo;
@@ -5153,6 +5867,40 @@ namespace VitaEE::RegionIR
 						}
 						bits = values[node.operands[1]].bits;
 						break;
+					case Opcode::Vu0NormalizeVector:
+						bits = NormalizeVuVector(values[node.operands[0]].bits,
+							program.options.vu0_overflow_clamp);
+						break;
+					case Opcode::Vu0BroadcastLane:
+						bits = BroadcastVuLane(values[node.operands[0]].bits,
+							node.immediate);
+						break;
+					case Opcode::Vu0MulRaw:
+					case Opcode::Vu0AddRaw:
+						bits = EvaluateVuRawBinary(node.opcode,
+							values[node.operands[0]].bits,
+							values[node.operands[1]].bits);
+						break;
+					case Opcode::Vu0ClampFmacResult:
+						bits = ClampVuFmacResult(values[node.operands[0]].bits,
+							node.immediate, program.options.vu0_overflow_clamp);
+						break;
+					case Opcode::Vu0MacFlagsFromRaw:
+						bits = Bits(VuMacFlagsFromRaw(values[node.operands[0]].bits,
+							node.immediate));
+						break;
+					case Opcode::Vu0StatusFlagsFromMac:
+						bits = Bits(VuStatusFlagsFromMac(static_cast<u32>(left)));
+						break;
+					case Opcode::Vu0MergeMasked:
+						bits = MergeVuMasked(values[node.operands[0]].bits,
+							values[node.operands[1]].bits, node.immediate);
+						break;
+					case Opcode::Vu0SyncStatusControl:
+						bits = Bits((static_cast<u32>(left) & 0x0fc0u) |
+							static_cast<u32>(right) |
+							(static_cast<u32>(right) << 6));
+						break;
 					case Opcode::MemoryLoad:
 					case Opcode::MemoryStore:
 					{
@@ -5284,6 +6032,21 @@ namespace VitaEE::RegionIR
 					case Opcode::BindVu0Vf:
 						current.vu0_vf[node.immediate] =
 							values[node.operands[0]].bits;
+						break;
+					case Opcode::BindVu0Acc:
+						current.vu0_acc = values[node.operands[0]].bits;
+						break;
+					case Opcode::BindVu0MacFlag:
+						current.vu0_macflag = static_cast<u32>(left);
+						break;
+					case Opcode::BindVu0StatusFlag:
+						current.vu0_statusflag = static_cast<u32>(left);
+						break;
+					case Opcode::BindVu0ViMac:
+						current.vu0_vi_mac = static_cast<u32>(left);
+						break;
+					case Opcode::BindVu0ViStatus:
+						current.vu0_vi_status = static_cast<u32>(left);
 						break;
 					case Opcode::BindFcr31:
 						current.fcr31 =
