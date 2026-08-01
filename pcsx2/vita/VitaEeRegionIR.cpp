@@ -70,6 +70,11 @@ namespace VitaEE::RegionIR
 			SubtractAccumulator,
 			MultiplyAccumulator,
 		};
+		enum class CompoundCop1ArithmeticKind : u8
+		{
+			MultiplyAdd,
+			MultiplySubtract,
+		};
 
 		constexpr u32 COP1_SIGN = 0x80000000u;
 		constexpr u32 COP1_EXPONENT = 0x7f800000u;
@@ -460,6 +465,41 @@ namespace VitaEE::RegionIR
 			       kind == BasicCop1ArithmeticKind::MultiplyAccumulator;
 		}
 
+		bool DecodeCompoundCop1Arithmetic(u32 op,
+			CompoundCop1ArithmeticKind* kind)
+		{
+			if ((op >> 26) != 0x11 || RS(op) != 0x10)
+				return false;
+
+			CompoundCop1ArithmeticKind decoded{};
+			switch (FUNCT(op))
+			{
+				case 0x1c:
+					decoded = CompoundCop1ArithmeticKind::MultiplyAdd;
+					break;
+				case 0x1d:
+					decoded = CompoundCop1ArithmeticKind::MultiplySubtract;
+					break;
+				default:
+					return false;
+			}
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
+		Opcode CompoundCop1FinalRawOpcode(CompoundCop1ArithmeticKind kind)
+		{
+			return kind == CompoundCop1ArithmeticKind::MultiplyAdd ?
+				Opcode::Cop1AddRaw : Opcode::Cop1SubRaw;
+		}
+
+		bool IsCop1OuArithmetic(u32 op)
+		{
+			return DecodeBasicCop1Arithmetic(op, nullptr) ||
+			       DecodeCompoundCop1Arithmetic(op, nullptr);
+		}
+
 		bool IsCop1ConvertWord(u32 op)
 		{
 			// The SCE encoding reserves ft as zero. Undefined encodings remain on
@@ -598,6 +638,7 @@ namespace VitaEE::RegionIR
 				case 0x11: // Raw COP1 state plus exact S-format numerics.
 					return DecodePureCop1State(op, nullptr) || IsCop1ControlWrite(op) ||
 					       DecodeBasicCop1Arithmetic(op, nullptr) ||
+					       DecodeCompoundCop1Arithmetic(op, nullptr) ||
 					       IsCop1ConvertWord(op);
 				default:
 					return false;
@@ -1399,6 +1440,52 @@ namespace VitaEE::RegionIR
 					WriteFpr(block, state, FD(op), result, pc);
 			}
 
+			bool LowerCompoundCop1Arithmetic(Block& block, StateMap* state, u32 op,
+				u32 pc, CompoundCop1ArithmeticKind kind)
+			{
+				// PCSX2 FPU.cpp::MADD_S()/MSUB_S() intentionally perform two
+				// single-precision operations. The temporary product is written as
+				// raw F32 bits, normalized through fpuDouble(), and only then combined
+				// with the independently normalized ACC. Keeping both stages explicit
+				// prevents a later backend from contracting this into a host FMA.
+				const u32 fs = FS(op);
+				const u32 ft = RT(op);
+				const ValueId left = Unary(block, Opcode::Cop1NormalizeInput,
+					ValueType::F32Bits, state->fpr[fs], pc);
+				if (left == INVALID_VALUE)
+					return false;
+				const ValueId right = fs == ft ? left :
+					Unary(block, Opcode::Cop1NormalizeInput, ValueType::F32Bits,
+						state->fpr[ft], pc);
+				if (right == INVALID_VALUE)
+					return false;
+				const ValueId product = Binary(block, Opcode::Cop1MulRaw,
+					ValueType::F32Bits, left, right, pc);
+				if (product == INVALID_VALUE)
+					return false;
+				const ValueId normalized_product = Unary(block,
+					Opcode::Cop1NormalizeInput, ValueType::F32Bits, product, pc);
+				const ValueId normalized_acc = Unary(block, Opcode::Cop1NormalizeInput,
+					ValueType::F32Bits, state->acc, pc);
+				if (normalized_product == INVALID_VALUE ||
+					normalized_acc == INVALID_VALUE)
+				{
+					return false;
+				}
+				const ValueId raw = Binary(block, CompoundCop1FinalRawOpcode(kind),
+					ValueType::F32Bits, normalized_acc, normalized_product, pc);
+				const ValueId result = Unary(block, Opcode::Cop1ClampOuResult,
+					ValueType::F32Bits, raw, pc);
+				const ValueId flags = Binary(block, Opcode::Cop1UpdateOuFlags,
+					ValueType::I32, state->fcr31, raw, pc);
+				if (raw == INVALID_VALUE || result == INVALID_VALUE ||
+					flags == INVALID_VALUE || !WriteFcr31(block, state, flags, pc))
+				{
+					return false;
+				}
+				return WriteFpr(block, state, FD(op), result, pc);
+			}
+
 			bool LowerMemory(Block& block, StateMap* state, u32 op, u32 pc,
 				MemoryAccessKind kind)
 			{
@@ -1482,6 +1569,12 @@ namespace VitaEE::RegionIR
 						{
 							return LowerBasicCop1Arithmetic(block, state, op, pc,
 								arithmetic);
+						}
+						CompoundCop1ArithmeticKind compound{};
+						if (DecodeCompoundCop1Arithmetic(op, &compound))
+						{
+							return LowerCompoundCop1Arithmetic(block, state, op, pc,
+								compound);
 						}
 						if (!IsCop1ConvertWord(op))
 							return false;
@@ -2599,7 +2692,7 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> fpr_bind_count;
 			std::map<u32, u32> fcr31_bind_count;
 			std::map<u32, u32> acc_bind_count;
-			std::map<u32, ValueId> basic_cop1_raw_result;
+			std::map<u32, ValueId> cop1_ou_raw_result;
 			std::map<u32, u32> hi_bind_count;
 			std::map<u32, u32> lo_bind_count;
 			std::map<u32, u32> sa_bind_count;
@@ -2917,28 +3010,66 @@ namespace VitaEE::RegionIR
 				       exact_unary(bitcast->operands[0], Opcode::ExtractLow32,
 						input.gpr[RT(source_opcode)], bind.source_pc);
 			};
-			auto exact_basic_cop1_raw = [&](ValueId value, u32 source_opcode,
+			auto exact_cop1_ou_raw = [&](ValueId value, u32 source_opcode,
 				u32 source_pc, const StateMap& input) {
 				BasicCop1ArithmeticKind kind{};
-				if (!DecodeBasicCop1Arithmetic(source_opcode, &kind))
+				if (DecodeBasicCop1Arithmetic(source_opcode, &kind))
+				{
+					const Node* raw = local_node(value);
+					if (!raw || raw->opcode != BasicCop1RawOpcode(kind) ||
+						raw->operand_count != 2 || raw->source_pc != source_pc)
+					{
+						return false;
+					}
+					const u32 fs = FS(source_opcode);
+					const u32 ft = RT(source_opcode);
+					if (!exact_unary(raw->operands[0], Opcode::Cop1NormalizeInput,
+							input.fpr[fs], raw->source_pc))
+					{
+						return false;
+					}
+					if (fs == ft)
+						return raw->operands[1] == raw->operands[0];
+					return exact_unary(raw->operands[1], Opcode::Cop1NormalizeInput,
+						input.fpr[ft], raw->source_pc);
+				}
+
+				CompoundCop1ArithmeticKind compound{};
+				if (!DecodeCompoundCop1Arithmetic(source_opcode, &compound))
 					return false;
 				const Node* raw = local_node(value);
-				if (!raw || raw->opcode != BasicCop1RawOpcode(kind) ||
-					raw->operand_count != 2 || raw->source_pc != source_pc)
+				if (!raw || raw->opcode != CompoundCop1FinalRawOpcode(compound) ||
+					raw->operand_count != 2 || raw->source_pc != source_pc ||
+					!exact_unary(raw->operands[0], Opcode::Cop1NormalizeInput,
+						input.acc, source_pc))
+				{
+					return false;
+				}
+				const Node* normalized_product = local_node(raw->operands[1]);
+				if (!normalized_product ||
+					normalized_product->opcode != Opcode::Cop1NormalizeInput ||
+					normalized_product->operand_count != 1 ||
+					normalized_product->source_pc != source_pc)
+				{
+					return false;
+				}
+				const Node* product = local_node(normalized_product->operands[0]);
+				if (!product || product->opcode != Opcode::Cop1MulRaw ||
+					product->operand_count != 2 || product->source_pc != source_pc)
 				{
 					return false;
 				}
 				const u32 fs = FS(source_opcode);
 				const u32 ft = RT(source_opcode);
-				if (!exact_unary(raw->operands[0], Opcode::Cop1NormalizeInput,
-						input.fpr[fs], raw->source_pc))
+				if (!exact_unary(product->operands[0], Opcode::Cop1NormalizeInput,
+						input.fpr[fs], source_pc))
 				{
 					return false;
 				}
 				if (fs == ft)
-					return raw->operands[1] == raw->operands[0];
-				return exact_unary(raw->operands[1], Opcode::Cop1NormalizeInput,
-					input.fpr[ft], raw->source_pc);
+					return product->operands[1] == product->operands[0];
+				return exact_unary(product->operands[1], Opcode::Cop1NormalizeInput,
+					input.fpr[ft], source_pc);
 			};
 			auto exact_basic_cop1_result = [&](ValueId value, ValueId raw,
 				u32 source_pc) {
@@ -3055,11 +3186,11 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeBasicCop1Arithmetic(source_opcode, nullptr)))
+							 !IsCop1OuArithmetic(source_opcode)))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
-								"COP1 normalization node has no basic arithmetic source");
+								"COP1 normalization node has no O/U arithmetic source");
 						}
 						break;
 					}
@@ -3070,11 +3201,20 @@ namespace VitaEE::RegionIR
 						checked = binary(ValueType::F32Bits, ValueType::F32Bits,
 							ValueType::F32Bits);
 						u32 source_opcode = 0;
-						BasicCop1ArithmeticKind kind{};
-						if (checked &&
-							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeBasicCop1Arithmetic(source_opcode, &kind) ||
-							 node.opcode != BasicCop1RawOpcode(kind)))
+						BasicCop1ArithmeticKind basic{};
+						CompoundCop1ArithmeticKind compound{};
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const bool basic_source = have_source &&
+							DecodeBasicCop1Arithmetic(source_opcode, &basic);
+						const bool compound_source = have_source && !basic_source &&
+							DecodeCompoundCop1Arithmetic(source_opcode, &compound);
+						const bool matching_basic = basic_source &&
+							node.opcode == BasicCop1RawOpcode(basic);
+						const bool matching_compound = compound_source &&
+							(node.opcode == Opcode::Cop1MulRaw ||
+							 node.opcode == CompoundCop1FinalRawOpcode(compound));
+						if (checked && !matching_basic && !matching_compound)
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
@@ -3089,11 +3229,11 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeBasicCop1Arithmetic(source_opcode, nullptr)))
+							 !IsCop1OuArithmetic(source_opcode)))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
-								"COP1 O/U flag node has no basic arithmetic source");
+								"COP1 O/U flag node has no arithmetic source");
 						}
 						break;
 					}
@@ -3533,6 +3673,8 @@ namespace VitaEE::RegionIR
 							const bool basic_arithmetic =
 								DecodeBasicCop1Arithmetic(source_opcode, &arithmetic_kind) &&
 								!IsBasicCop1Accumulator(arithmetic_kind);
+							const bool compound_arithmetic =
+								DecodeCompoundCop1Arithmetic(source_opcode, nullptr);
 							const bool convert_word = IsCop1ConvertWord(source_opcode);
 							if (memory_load)
 							{
@@ -3548,11 +3690,11 @@ namespace VitaEE::RegionIR
 								}
 								memory_bind_count[node.source_pc]++;
 							}
-							else if (basic_arithmetic)
+							else if (basic_arithmetic || compound_arithmetic)
 							{
-								const auto raw = basic_cop1_raw_result.find(node.source_pc);
+								const auto raw = cop1_ou_raw_result.find(node.source_pc);
 								if (node.immediate != FD(source_opcode) ||
-									raw == basic_cop1_raw_result.end() ||
+									raw == cop1_ou_raw_result.end() ||
 									!exact_basic_cop1_result(node.operands[0], raw->second,
 										node.source_pc))
 								{
@@ -3615,16 +3757,14 @@ namespace VitaEE::RegionIR
 							}
 							else
 							{
-								BasicCop1ArithmeticKind arithmetic_kind{};
-								if (!DecodeBasicCop1Arithmetic(source_opcode,
-										&arithmetic_kind) ||
+								if (!IsCop1OuArithmetic(source_opcode) ||
 									value->opcode != Opcode::Cop1UpdateOuFlags ||
 									value->operand_count != 2 ||
 									value->source_pc != node.source_pc ||
 									value->operands[0] != expected.fcr31 ||
-									!exact_basic_cop1_raw(value->operands[1],
+									!exact_cop1_ou_raw(value->operands[1],
 										source_opcode, node.source_pc, expected) ||
-									!basic_cop1_raw_result.emplace(node.source_pc,
+									!cop1_ou_raw_result.emplace(node.source_pc,
 										value->operands[1]).second)
 								{
 									checked = Fail(VerifyFailure::SourceMismatch,
@@ -3643,12 +3783,12 @@ namespace VitaEE::RegionIR
 						{
 							u32 source_opcode = 0;
 							BasicCop1ArithmeticKind kind{};
-							const auto raw = basic_cop1_raw_result.find(node.source_pc);
+							const auto raw = cop1_ou_raw_result.find(node.source_pc);
 							if (node.immediate != 0 ||
 								!source_opcode_at(node.source_pc, &source_opcode) ||
 								!DecodeBasicCop1Arithmetic(source_opcode, &kind) ||
 								!IsBasicCop1Accumulator(kind) ||
-								raw == basic_cop1_raw_result.end() ||
+								raw == cop1_ou_raw_result.end() ||
 								!exact_basic_cop1_result(node.operands[0], raw->second,
 									node.source_pc))
 							{
@@ -3801,6 +3941,23 @@ namespace VitaEE::RegionIR
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
 							"basic COP1 arithmetic lacks exact result and FCR31 bindings");
+					}
+				}
+				else if (DecodeCompoundCop1Arithmetic(source.opcode, nullptr))
+				{
+					if (fcr31_bind_count[source.pc] != 1 ||
+						fpr_bind_count[source.pc] != 1 ||
+						acc_bind_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"MADD.S/MSUB.S lacks exact FPR and FCR31 bindings");
 					}
 				}
 				else if (IsCop1ConvertWord(source.opcode))
