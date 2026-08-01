@@ -37,6 +37,7 @@ namespace VitaEE::RegionIR
 	enum class Opcode : u8
 	{
 		Parameter,
+		ConstantI1,
 		ConstantI32,
 		ConstantI64,
 		ConstantAddress,
@@ -60,6 +61,12 @@ namespace VitaEE::RegionIR
 		Cop1MulRaw,
 		Cop1ClampOuResult,
 		Cop1UpdateOuFlags,
+		// Comparisons consume PCSX2 fpuDouble()-normalized raw FPR words and
+		// update only FCR31.C through an explicit old-state dependency.
+		Cop1CompareEqual,
+		Cop1CompareLess,
+		Cop1CompareLessEqual,
+		Cop1UpdateConditionFlag,
 		// SCE CVT.W.S writes the truncated/saturated signed word as raw FPR
 		// bits and leaves FCR31 untouched.
 		Cop1ConvertWord,

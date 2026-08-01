@@ -75,6 +75,13 @@ namespace VitaEE::RegionIR
 			MultiplyAdd,
 			MultiplySubtract,
 		};
+		enum class Cop1CompareKind : u8
+		{
+			False,
+			Equal,
+			Less,
+			LessEqual,
+		};
 
 		constexpr u32 COP1_SIGN = 0x80000000u;
 		constexpr u32 COP1_EXPONENT = 0x7f800000u;
@@ -88,6 +95,7 @@ namespace VitaEE::RegionIR
 		constexpr u32 FCR31_U = 0x00004000u;
 		constexpr u32 FCR31_SO = 0x00000010u;
 		constexpr u32 FCR31_SU = 0x00000008u;
+		constexpr u32 FCR31_C = 0x00800000u;
 
 		constexpr u32 RS(u32 op) { return (op >> 21) & 0x1fu; }
 		constexpr u32 RT(u32 op) { return (op >> 16) & 0x1fu; }
@@ -500,6 +508,50 @@ namespace VitaEE::RegionIR
 			       DecodeCompoundCop1Arithmetic(op, nullptr);
 		}
 
+		bool DecodeCop1Compare(u32 op, Cop1CompareKind* kind)
+		{
+			if ((op >> 26) != 0x11 || RS(op) != 0x10 || FD(op) != 0)
+				return false;
+
+			Cop1CompareKind decoded{};
+			switch (FUNCT(op))
+			{
+				case 0x30:
+					decoded = Cop1CompareKind::False;
+					break;
+				case 0x32:
+					decoded = Cop1CompareKind::Equal;
+					break;
+				case 0x34:
+					decoded = Cop1CompareKind::Less;
+					break;
+				case 0x36:
+					decoded = Cop1CompareKind::LessEqual;
+					break;
+				default:
+					return false;
+			}
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
+		Opcode Cop1CompareOpcode(Cop1CompareKind kind)
+		{
+			switch (kind)
+			{
+				case Cop1CompareKind::Equal:
+					return Opcode::Cop1CompareEqual;
+				case Cop1CompareKind::Less:
+					return Opcode::Cop1CompareLess;
+				case Cop1CompareKind::LessEqual:
+					return Opcode::Cop1CompareLessEqual;
+				case Cop1CompareKind::False:
+					break;
+			}
+			return Opcode::Parameter;
+		}
+
 		bool IsCop1ConvertWord(u32 op)
 		{
 			// The SCE encoding reserves ft as zero. Undefined encodings remain on
@@ -613,6 +665,28 @@ namespace VitaEE::RegionIR
 			return std::bit_cast<u32>(converted);
 		}
 
+		bool EvaluateCop1Compare(Opcode opcode, u32 left_bits, u32 right_bits)
+		{
+			const float left = std::bit_cast<float>(left_bits);
+			const float right = std::bit_cast<float>(right_bits);
+			switch (opcode)
+			{
+				case Opcode::Cop1CompareEqual:
+					return left == right;
+				case Opcode::Cop1CompareLess:
+					return left < right;
+				case Opcode::Cop1CompareLessEqual:
+					return left <= right;
+				default:
+					return false;
+			}
+		}
+
+		u32 UpdateCop1ConditionFlag(u32 fcr31, bool condition)
+		{
+			return condition ? (fcr31 | FCR31_C) : (fcr31 & ~FCR31_C);
+		}
+
 		bool IsCop1ControlWrite(u32 op)
 		{
 			// CTC1 is defined only for FCR31. Reserved control registers remain
@@ -655,6 +729,7 @@ namespace VitaEE::RegionIR
 					return DecodePureCop1State(op, nullptr) || IsCop1ControlWrite(op) ||
 					       DecodeBasicCop1Arithmetic(op, nullptr) ||
 					       DecodeCompoundCop1Arithmetic(op, nullptr) ||
+					       DecodeCop1Compare(op, nullptr) ||
 					       IsCop1ConvertWord(op) || IsCop1ConvertSingle(op);
 				default:
 					return false;
@@ -1252,6 +1327,12 @@ namespace VitaEE::RegionIR
 					source_pc);
 			}
 
+			ValueId ConstantBool(Block& block, bool value, u32 source_pc)
+			{
+				return AddNode(block, Opcode::ConstantI1, ValueType::I1, {}, 0, 0,
+					value ? 1u : 0u, source_pc);
+			}
+
 			ValueId Constant64(Block& block, u64 value, u32 source_pc)
 			{
 				return AddNode(block, Opcode::ConstantI64, ValueType::I64, {}, 0, 0, value,
@@ -1456,6 +1537,35 @@ namespace VitaEE::RegionIR
 					WriteFpr(block, state, FD(op), result, pc);
 			}
 
+			bool LowerCop1Compare(Block& block, StateMap* state, u32 op, u32 pc,
+				Cop1CompareKind kind)
+			{
+				ValueId condition = INVALID_VALUE;
+				if (kind == Cop1CompareKind::False)
+				{
+					condition = ConstantBool(block, false, pc);
+				}
+				else
+				{
+					const u32 fs = FS(op);
+					const u32 ft = RT(op);
+					const ValueId left = Unary(block, Opcode::Cop1NormalizeInput,
+						ValueType::F32Bits, state->fpr[fs], pc);
+					if (left == INVALID_VALUE)
+						return false;
+					const ValueId right = fs == ft ? left :
+						Unary(block, Opcode::Cop1NormalizeInput, ValueType::F32Bits,
+							state->fpr[ft], pc);
+					if (right == INVALID_VALUE)
+						return false;
+					condition = Binary(block, Cop1CompareOpcode(kind), ValueType::I1,
+						left, right, pc);
+				}
+				const ValueId flags = Binary(block, Opcode::Cop1UpdateConditionFlag,
+					ValueType::I32, state->fcr31, condition, pc);
+				return flags != INVALID_VALUE && WriteFcr31(block, state, flags, pc);
+			}
+
 			bool LowerCompoundCop1Arithmetic(Block& block, StateMap* state, u32 op,
 				u32 pc, CompoundCop1ArithmeticKind kind)
 			{
@@ -1592,6 +1702,9 @@ namespace VitaEE::RegionIR
 							return LowerCompoundCop1Arithmetic(block, state, op, pc,
 								compound);
 						}
+						Cop1CompareKind compare{};
+						if (DecodeCop1Compare(op, &compare))
+							return LowerCop1Compare(block, state, op, pc, compare);
 						if (IsCop1ConvertWord(op))
 						{
 							return WriteFpr(block, state, FD(op),
@@ -2762,6 +2875,13 @@ namespace VitaEE::RegionIR
 				       node->operand_count == 0 && node->literal == literal &&
 				       node->source_pc == source_pc;
 			};
+			auto exact_constant_bool = [&](ValueId value, bool literal,
+				u32 source_pc) {
+				const Node* node = local_node(value);
+				return node && node->opcode == Opcode::ConstantI1 &&
+				       node->operand_count == 0 && node->literal == (literal ? 1u : 0u) &&
+				       node->source_pc == source_pc;
+			};
 			auto exact_extended_gpr_bind = [&](const Node& bind, u32 source_opcode,
 				const StateMap& input) {
 				const u32 destination = RD(source_opcode);
@@ -3099,6 +3219,32 @@ namespace VitaEE::RegionIR
 				u32 source_pc) {
 				return exact_unary(value, Opcode::Cop1ClampOuResult, raw, source_pc);
 			};
+			auto exact_cop1_compare_condition = [&](ValueId value, u32 source_opcode,
+				u32 source_pc, const StateMap& input) {
+				Cop1CompareKind kind{};
+				if (!DecodeCop1Compare(source_opcode, &kind))
+					return false;
+				if (kind == Cop1CompareKind::False)
+					return exact_constant_bool(value, false, source_pc);
+
+				const Node* compare = local_node(value);
+				if (!compare || compare->opcode != Cop1CompareOpcode(kind) ||
+					compare->operand_count != 2 || compare->source_pc != source_pc)
+				{
+					return false;
+				}
+				const u32 fs = FS(source_opcode);
+				const u32 ft = RT(source_opcode);
+				if (!exact_unary(compare->operands[0], Opcode::Cop1NormalizeInput,
+						input.fpr[fs], source_pc))
+				{
+					return false;
+				}
+				if (fs == ft)
+					return compare->operands[1] == compare->operands[0];
+				return exact_unary(compare->operands[1], Opcode::Cop1NormalizeInput,
+					input.fpr[ft], source_pc);
+			};
 			auto require_operand = [&](const Node& node, u32 node_index, u32 operand,
 									   ValueType required) -> VerifyResult {
 				if (operand >= node.operand_count ||
@@ -3154,15 +3300,20 @@ namespace VitaEE::RegionIR
 					case Opcode::Parameter:
 						return Fail(VerifyFailure::ParameterContract, block_index, node_index,
 							"parameter appears after executable nodes");
+					case Opcode::ConstantI1:
 					case Opcode::ConstantI32:
 					case Opcode::ConstantI64:
 					case Opcode::ConstantAddress:
 					{
 						const ValueType expected_type =
-							node.opcode == Opcode::ConstantI32 ? ValueType::I32 : (node.opcode == Opcode::ConstantI64 ? ValueType::I64 : ValueType::Address);
+							node.opcode == Opcode::ConstantI1 ? ValueType::I1 :
+							node.opcode == Opcode::ConstantI32 ? ValueType::I32 :
+							node.opcode == Opcode::ConstantI64 ? ValueType::I64 : ValueType::Address;
 						if (node.operand_count != 0 || node.type != expected_type ||
 							node.immediate != 0 ||
-							(node.opcode != Opcode::ConstantI64 && node.literal > UINT32_MAX))
+							(node.opcode == Opcode::ConstantI1 && node.literal > 1) ||
+							(node.opcode != Opcode::ConstantI1 &&
+							 node.opcode != Opcode::ConstantI64 && node.literal > UINT32_MAX))
 							checked = Fail(VerifyFailure::ResultType, block_index, node_index,
 								"constant has the wrong arity, type, immediate, or width");
 						break;
@@ -3210,7 +3361,8 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !IsCop1OuArithmetic(source_opcode)))
+							 (!IsCop1OuArithmetic(source_opcode) &&
+							  !DecodeCop1Compare(source_opcode, nullptr))))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
@@ -3258,6 +3410,40 @@ namespace VitaEE::RegionIR
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
 								"COP1 O/U flag node has no arithmetic source");
+						}
+						break;
+					}
+					case Opcode::Cop1CompareEqual:
+					case Opcode::Cop1CompareLess:
+					case Opcode::Cop1CompareLessEqual:
+					{
+						checked = binary(ValueType::F32Bits, ValueType::F32Bits,
+							ValueType::I1);
+						u32 source_opcode = 0;
+						Cop1CompareKind kind{};
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeCop1Compare(source_opcode, &kind) ||
+							 kind == Cop1CompareKind::False ||
+							 node.opcode != Cop1CompareOpcode(kind)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 comparison node does not match its source");
+						}
+						break;
+					}
+					case Opcode::Cop1UpdateConditionFlag:
+					{
+						checked = binary(ValueType::I32, ValueType::I1, ValueType::I32);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeCop1Compare(source_opcode, nullptr)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 condition update has no comparison source");
 						}
 						break;
 					}
@@ -3806,10 +3992,9 @@ namespace VitaEE::RegionIR
 									break;
 								}
 							}
-							else
+							else if (IsCop1OuArithmetic(source_opcode))
 							{
-								if (!IsCop1OuArithmetic(source_opcode) ||
-									value->opcode != Opcode::Cop1UpdateOuFlags ||
+								if (value->opcode != Opcode::Cop1UpdateOuFlags ||
 									value->operand_count != 2 ||
 									value->source_pc != node.source_pc ||
 									value->operands[0] != expected.fcr31 ||
@@ -3823,6 +4008,28 @@ namespace VitaEE::RegionIR
 										"FCR31 O/U binding does not share exact COP1 raw result");
 									break;
 								}
+							}
+							else if (DecodeCop1Compare(source_opcode, nullptr))
+							{
+								if (value->opcode != Opcode::Cop1UpdateConditionFlag ||
+									value->operand_count != 2 ||
+									value->source_pc != node.source_pc ||
+									value->operands[0] != expected.fcr31 ||
+									!exact_cop1_compare_condition(value->operands[1],
+										source_opcode, node.source_pc, expected))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"FCR31.C binding does not match exact COP1 comparison");
+									break;
+								}
+							}
+							else
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"FCR31 binding has an unsupported COP1 owner");
+								break;
 							}
 							fcr31_bind_count[node.source_pc]++;
 							expected.fcr31 = node.operands[0];
@@ -4009,6 +4216,23 @@ namespace VitaEE::RegionIR
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
 							"MADD.S/MSUB.S lacks exact FPR and FCR31 bindings");
+					}
+				}
+				else if (DecodeCop1Compare(source.opcode, nullptr))
+				{
+					if (fcr31_bind_count[source.pc] != 1 ||
+						fpr_bind_count[source.pc] != 0 ||
+						acc_bind_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"COP1 comparison lacks one exact FCR31.C binding");
 					}
 				}
 				else if (IsCop1ConvertWord(source.opcode) ||
@@ -4540,6 +4764,7 @@ namespace VitaEE::RegionIR
 				{
 					case Opcode::Parameter:
 						break;
+					case Opcode::ConstantI1:
 					case Opcode::ConstantI32:
 					case Opcode::ConstantI64:
 					case Opcode::ConstantAddress:
@@ -4583,6 +4808,16 @@ namespace VitaEE::RegionIR
 					case Opcode::Cop1UpdateOuFlags:
 						bits = Bits(UpdateBasicCop1OuFlags(static_cast<u32>(left),
 							static_cast<u32>(right)));
+						break;
+					case Opcode::Cop1CompareEqual:
+					case Opcode::Cop1CompareLess:
+					case Opcode::Cop1CompareLessEqual:
+						bits = Bits(EvaluateCop1Compare(node.opcode,
+							static_cast<u32>(left), static_cast<u32>(right)) ? 1u : 0u);
+						break;
+					case Opcode::Cop1UpdateConditionFlag:
+						bits = Bits(UpdateCop1ConditionFlag(static_cast<u32>(left),
+							right != 0));
 						break;
 					case Opcode::Cop1ConvertWord:
 						bits = Bits(ConvertCop1Word(static_cast<u32>(left)));
