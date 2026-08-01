@@ -6,6 +6,11 @@
 #include "MTVU.h"
 #include "VMManager.h"
 #include "Vif_Dynarec.h"
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION) || \
+	defined(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
+#include "DebugTools/MachineCheckpointTrace.h"
+#endif
 #include "vita/VitaGpuVuDirectProgram.h"
 #include "vita/VitaGpuVuDraw.h"
 #include "vita/VitaGsMailbox.h"
@@ -353,6 +358,15 @@ void VU_Thread::ExecuteRingBuffer()
 					if (addr != -1)
 						VU1.VI[REG_TPC].UL = addr & 0x7FF;
 					CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION) || \
+	defined(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
+					// Under MTVU this worker, not vu1ExecMicro() on CPU0, owns the
+					// architectural start/completion pair. Keep both notifications on
+					// this side of the queue so multiple pending MSCAL/MSCNT jobs cannot
+					// collapse into one armed boolean.
+					Pcsx2Trace::NotifyMachineCheckpointVu1ProgramStarted();
+#endif
 #if defined(VITASX2_GPU_VU_DIRECT_ADMISSION)
 					// Bounded arrival evidence for the first direct job only.
 					if (has_direct_program && !reported_first_direct_job)
@@ -510,6 +524,11 @@ void VU_Thread::ExecuteRingBuffer()
 							}
 							BeginProgram();
 							EndProgram(InterruptFlagVUEBit);
+#if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION) || \
+	defined(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
+							Pcsx2Trace::NotifyMachineCheckpointVu1ExecutionCompleted();
+#endif
 							vuCycles[vuCycleIdx].store(
 								4, std::memory_order_release);
 							vuCycleIdx = (vuCycleIdx + 1) & 3;

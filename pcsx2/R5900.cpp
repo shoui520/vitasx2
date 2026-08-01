@@ -34,7 +34,8 @@
 #include "DebugTools/CoreEventTrace.h"
 #endif
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
-	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION) || \
+	defined(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
 #include "DebugTools/MIPSAnalyst.h"
@@ -1253,7 +1254,8 @@ __fi void _cpuEventTest_Shared()
 			cpuSetEvent();
 		}
 #if defined(VITASX2_QEMU_VALIDATION) || \
-	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION) || \
+	defined(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
 		Pcsx2Trace::RecordPendingMachineCheckpointAtEventTest();
 #endif
 		eeEventTestIsActive = false;
@@ -1415,7 +1417,8 @@ __fi void _cpuEventTest_Shared()
 		cpuRegs.nextEventCycle);
 #endif
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
-	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION) || \
+	defined(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
 	Pcsx2Trace::RecordPendingMachineCheckpointAtEventTest();
 #endif
 	eeEventTestIsActive = false;

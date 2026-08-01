@@ -9,7 +9,8 @@
 #include "VUmicro.h"
 #include "MTVU.h"
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
-	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION) || \
+	defined(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
 
@@ -78,7 +79,8 @@ void vu1ExecMicro(u32 addr)
 	CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
 	_vuExecMicroDebug(VU1);
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
-	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION) || \
+	defined(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
 	Pcsx2Trace::NotifyMachineCheckpointVu1ProgramStarted();
 #endif
 	if(!INSTANT_VU1)

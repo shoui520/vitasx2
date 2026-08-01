@@ -38,6 +38,7 @@ namespace
 	u32 s_auto_fire_released_frames = 1;
 	u32 s_auto_fire_phase = 0;
 	bool s_auto_fire_active = false;
+	bool s_accept_physical_input = true;
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	VitaPadSnapshot s_qemu_snapshot;
@@ -306,8 +307,16 @@ void InputManager::InvalidateVitaPadStateCache()
 
 void InputManager::PollSources()
 {
+	const u32 automation_buttons = GetVitaPadAutoFireMask();
+	if (!s_accept_physical_input)
+	{
+		ApplyVitaPadState(automation_buttons,
+			Pad::ANALOG_NEUTRAL_POSITION, Pad::ANALOG_NEUTRAL_POSITION,
+			Pad::ANALOG_NEUTRAL_POSITION, Pad::ANALOG_NEUTRAL_POSITION);
+		return;
+	}
 #if defined(VITASX2_QEMU_VALIDATION)
-	ApplyVitaPadState(s_qemu_snapshot.buttons | GetVitaPadAutoFireMask(),
+	ApplyVitaPadState(s_qemu_snapshot.buttons | automation_buttons,
 		s_qemu_snapshot.lx, s_qemu_snapshot.ly, s_qemu_snapshot.rx, s_qemu_snapshot.ry);
 #else
 	EnsureCtrlInitialized();
@@ -319,13 +328,14 @@ void InputManager::PollSources()
 			return;
 	}
 
-	ApplyVitaPadState(TranslateVitaButtons(pad) | GetVitaPadAutoFireMask(),
+	ApplyVitaPadState(TranslateVitaButtons(pad) | automation_buttons,
 		pad.lx, pad.ly, pad.rx, pad.ry);
 #endif
 }
 
 bool InputManager::ConfigureVitaPadAutoFire(
-	VitaPadAutoFireButton button, u32 pressed_frames, u32 released_frames)
+	VitaPadAutoFireButton button, u32 pressed_frames, u32 released_frames,
+	bool accept_physical_input)
 {
 	if (button != VitaPadAutoFireButton::None &&
 		(pressed_frames == 0 || released_frames == 0 ||
@@ -337,6 +347,7 @@ bool InputManager::ConfigureVitaPadAutoFire(
 	s_auto_fire_button = button;
 	s_auto_fire_pressed_frames = std::max(pressed_frames, 1u);
 	s_auto_fire_released_frames = std::max(released_frames, 1u);
+	s_accept_physical_input = accept_physical_input;
 	ResetVitaPadAutoFire();
 	return true;
 }
@@ -347,6 +358,17 @@ void InputManager::NotifyVitaPadElfEntry()
 	s_auto_fire_phase = s_auto_fire_active ?
 		(s_auto_fire_pressed_frames + s_auto_fire_released_frames - 1) : 0;
 	InvalidateVitaPadStateCache();
+}
+
+void InputManager::BeginVitaPadDeterministicReplay()
+{
+	// PCSX2's trace input owner presents phase zero before the first restored
+	// guest instruction. Do the same at the Vita workload seam, rather than
+	// waiting for a host controller poll or the following VSync.
+	s_auto_fire_active = (s_auto_fire_button != VitaPadAutoFireButton::None);
+	s_auto_fire_phase = 0;
+	InvalidateVitaPadStateCache();
+	PollSources();
 }
 
 void InputManager::ResetVitaPadAutoFire()

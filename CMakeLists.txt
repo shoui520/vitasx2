@@ -58,6 +58,15 @@ if(VITASX2_PRODUCT_BOOT_VALIDATION)
 	add_compile_definitions(VITASX2_PRODUCT_BOOT_VALIDATION=1)
 endif()
 
+option(VITASX2_WORKLOAD_REPLAY_CHECKPOINT
+	"Compile the diagnostic workload terminal-checkpoint owner into the Vita product."
+	OFF)
+if(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
+	# This adds trace notifications at VU1 and EE scheduler seams. Keep them out
+	# of the playable product; matched Phase 1 replay builds enable them explicitly.
+	add_compile_definitions(VITASX2_WORKLOAD_REPLAY_CHECKPOINT=1)
+endif()
+
 option(VITASX2_CPU_PROFILER
 	"Compile the opt-in full-interval CPU0 stage and hot-edge profiler."
 	OFF)

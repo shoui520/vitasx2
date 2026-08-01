@@ -378,7 +378,8 @@ void VitaSetA32EeInFrameEventResumeEnabled(bool enabled);
 // translations retired by the write.
 u32 VitaNotifyA32EeRamWrite(const void* host_address, u32 size);
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
-	defined(VITASX2_PRODUCT_BOOT_VALIDATION)
+	defined(VITASX2_PRODUCT_BOOT_VALIDATION) || \
+	defined(VITASX2_WORKLOAD_REPLAY_CHECKPOINT)
 enum class VitaA32EeTraceLimitStopCondition : u32
 {
 	None = 0,

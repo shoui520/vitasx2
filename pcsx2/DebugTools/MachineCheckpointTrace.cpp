@@ -15,6 +15,8 @@
 #include "IopCounters.h"
 #include "IopMem.h"
 #include "Memory.h"
+#include "MTGS.h"
+#include "MTVU.h"
 #include "R3000A.h"
 #include "R5900.h"
 #include "SPU2/defs.h"
@@ -30,6 +32,7 @@
 #include "common/Path.h"
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -48,6 +51,7 @@ namespace Pcsx2Trace
 		static constexpr u32 TRACE_FLAG_GATED_ON_VSYNC_FRAMES = 1u << 3;
 		static constexpr u32 CHECKPOINT_TRIGGER_VU1_COMPLETED_EVENT_TEST = 1;
 		static constexpr u32 CHECKPOINT_TRIGGER_PORTABLE_REPLAY_START = 2;
+		static constexpr u32 CHECKPOINT_TRIGGER_VSYNC_EVENT_TEST = 3;
 		static constexpr u64 FNV1A64_OFFSET = 14695981039346656037ull;
 		static constexpr u64 FNV1A64_PRIME = 1099511628211ull;
 
@@ -189,7 +193,7 @@ namespace Pcsx2Trace
 
 		FILE* s_trace_file = nullptr;
 		MachineCheckpointTraceConfig s_config;
-		u64 s_vu1_completions_seen = 0;
+		std::atomic<u64> s_vu1_completions_seen{0};
 		u64 s_eligible_completions_seen = 0;
 		u64 s_records_written = 0;
 		u64 s_last_completion_ordinal = 0;
@@ -197,9 +201,9 @@ namespace Pcsx2Trace
 		u32 s_trace_start_vsync_frame = 0;
 		u32 s_trigger_vsync_frame = 0;
 		bool s_started = false;
-		bool s_hit_limit = false;
+		std::atomic<bool> s_hit_limit{false};
 		bool s_vu1_program_armed = false;
-		bool s_pending_checkpoint = false;
+		std::atomic<bool> s_pending_checkpoint{false};
 		u32 s_entry_pc = 0;
 		std::string s_error;
 		PortableReplayExternalDeviceAccessCounts s_external_device_access_counts;
@@ -1097,9 +1101,15 @@ namespace Pcsx2Trace
 			return;
 		}
 		s_vu1_program_armed = false;
-		const u64 completion_ordinal = s_vu1_completions_seen++;
+		const u64 completion_ordinal =
+			s_vu1_completions_seen.fetch_add(1, std::memory_order_relaxed);
 		const u64 completed_vsync_frames =
 			static_cast<u32>(g_FrameCount - s_trace_start_vsync_frame);
+		// A completion gate is host-scheduling dependent under MTVU: its worker
+		// can publish one completion or a batch before CPU0 reaches an event test.
+		// VSync-gated workload capsules use the CPU0-owned event seam below.
+		if (s_config.after_vsync_frames != 0)
+			return;
 		if (GetSifTraceRecordsWritten() < s_config.after_sif_records ||
 			GetVifTraceRecordsWritten() < s_config.after_vif_records ||
 			completed_vsync_frames < s_config.after_vsync_frames)
@@ -1125,16 +1135,45 @@ namespace Pcsx2Trace
 
 	bool RecordPendingMachineCheckpointAtEventTest()
 	{
-		if (!IsMachineCheckpointTraceEnabled() || !s_pending_checkpoint)
+		if (!IsMachineCheckpointTraceEnabled())
 			return s_hit_limit;
+		const u64 completed_vsync_frames =
+			static_cast<u32>(g_FrameCount - s_trace_start_vsync_frame);
+		const bool vsync_checkpoint = s_config.after_vsync_frames != 0 &&
+			completed_vsync_frames >= s_config.after_vsync_frames &&
+			GetSifTraceRecordsWritten() >= s_config.after_sif_records &&
+			GetVifTraceRecordsWritten() >= s_config.after_vif_records;
+		if (!vsync_checkpoint &&
+			!s_pending_checkpoint.load(std::memory_order_acquire))
+		{
+			return false;
+		}
+		// MTVU publishes the pending flag from its worker after a complete VU1
+		// program. For a VSync endpoint, drain every job CPU0 dispatched before
+		// this event seam. CPU0 cannot enqueue more work until capture completes.
+		if (THREAD_VU1)
+			vu1Thread.WaitVU();
 		// A completed VU1 program can overlap an active VU0 program or be followed
 		// by another MSCAL in the same EE event test. Preserve the pending marker
 		// and emit only at the first shared event seam where both VUs are idle.
 		// Provider-private branch/backup state is then non-continuation residue.
 		if ((VU0.VI[REG_VPU_STAT].UL & 0x101) != 0)
 			return false;
-		const bool wrote = WriteCurrentRecord(CHECKPOINT_TRIGGER_VU1_COMPLETED_EVENT_TEST);
-		s_pending_checkpoint = false;
+		// GS local memory is part of projection v5. Consume every command already
+		// published by this producer seam before hashing it. This observer exists
+		// only in validation builds, never in the normal product.
+		MTGS::WaitGS(false);
+		if (vsync_checkpoint)
+		{
+			s_last_completion_ordinal =
+				s_vu1_completions_seen.load(std::memory_order_acquire);
+			s_pending_completion_count = 0;
+			s_trigger_vsync_frame = g_FrameCount;
+		}
+		const bool wrote = WriteCurrentRecord(vsync_checkpoint ?
+			CHECKPOINT_TRIGGER_VSYNC_EVENT_TEST :
+			CHECKPOINT_TRIGGER_VU1_COMPLETED_EVENT_TEST);
+		s_pending_checkpoint.store(false, std::memory_order_release);
 		s_pending_completion_count = 0;
 		if (!wrote)
 			return true;
@@ -1153,7 +1192,8 @@ namespace Pcsx2Trace
 			SetError("Replay-start checkpoint requires both VUs to be idle.");
 			return false;
 		}
-		if (s_records_written != 0 || s_pending_checkpoint)
+		if (s_records_written != 0 ||
+			s_pending_checkpoint.load(std::memory_order_acquire))
 		{
 			SetError("Replay-start checkpoint must be the first trace record.");
 			return false;
@@ -1166,6 +1206,9 @@ namespace Pcsx2Trace
 	}
 
 	u64 GetMachineCheckpointTraceRecordsWritten() { return s_records_written; }
-	bool DidMachineCheckpointTraceHitLimit() { return s_hit_limit; }
+	bool DidMachineCheckpointTraceHitLimit()
+	{
+		return s_hit_limit.load(std::memory_order_acquire);
+	}
 	const std::string& GetMachineCheckpointTraceError() { return s_error; }
 } // namespace Pcsx2Trace

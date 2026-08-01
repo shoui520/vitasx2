@@ -67,8 +67,10 @@ namespace InputManager
 	void CloseSources();
 	void PollSources();
 	void InvalidateVitaPadStateCache();
-	bool ConfigureVitaPadAutoFire(VitaPadAutoFireButton button, u32 pressed_frames, u32 released_frames);
+	bool ConfigureVitaPadAutoFire(VitaPadAutoFireButton button, u32 pressed_frames,
+		u32 released_frames, bool accept_physical_input = true);
 	void NotifyVitaPadElfEntry();
+	void BeginVitaPadDeterministicReplay();
 	void ResetVitaPadAutoFire();
 	void AdvanceVitaPadAutoFireFrame();
 	void PauseVibration();

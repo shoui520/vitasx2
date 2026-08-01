@@ -11,12 +11,16 @@
 #define VITASX2_PRODUCT_BOOT_VALIDATION 0
 #endif
 
+#ifndef VITASX2_WORKLOAD_REPLAY_CHECKPOINT
+#define VITASX2_WORKLOAD_REPLAY_CHECKPOINT 0
+#endif
+
 #include "CDVD/CDVD.h"
 #include "CDVD/CDVDcommon.h"
 #include "Config.h"
 #include "Counters.h"
 #include "DebugTools/EeTrace.h"
-#if VITASX2_PRODUCT_BOOT_VALIDATION
+#if VITASX2_PRODUCT_BOOT_VALIDATION || VITASX2_WORKLOAD_REPLAY_CHECKPOINT
 #include "DebugTools/MachineCheckpointTrace.h"
 #endif
 #include "Host.h"
@@ -101,7 +105,7 @@ namespace
 	constexpr const char* WORKLOAD_ACTIVE_PATH =
 		"ux0:data/vitasx2/workloads/active.txt";
 	constexpr const char* WORKLOAD_ROOT = "ux0:data/vitasx2/workloads";
-	constexpr u32 WORKLOAD_MANIFEST_VERSION = 3;
+	constexpr u32 WORKLOAD_MANIFEST_VERSION = 4;
 	constexpr size_t WORKLOAD_MANIFEST_MAX_BYTES = 2048;
 
 	constexpr const char* VALIDATION_DIR = "ux0:data/vitasx2/product-validation";
@@ -173,6 +177,13 @@ namespace
 		FileIdentity state_identity;
 		FileIdentity card1_identity;
 		FileIdentity card2_identity;
+		InputManager::VitaPadAutoFireButton input_button =
+			InputManager::VitaPadAutoFireButton::None;
+		u32 input_pressed_frames = 2;
+		u32 input_released_frames = 6;
+		u32 terminal_vsync_frames = 0;
+		std::string terminal_checkpoint_path;
+		std::string terminal_done_path;
 		bool disc_attestation_cached = false;
 		bool card1_provisioned = false;
 		bool card2_provisioned = false;
@@ -450,8 +461,8 @@ namespace
 		return true;
 	}
 
-	bool VerifyWorkloadDiscIdentity(const std::string& slug,
-		const std::string& basename, const std::string& path,
+	bool VerifyWorkloadDiscIdentity(const std::string& basename,
+		const std::string& path,
 		const WorkloadReplaySelection::FileIdentity& identity,
 		bool* used_cache, Error* error)
 	{
@@ -467,10 +478,15 @@ namespace
 			return false;
 		}
 
-		const std::string runtime_dir =
-			std::string(WORKLOAD_ROOT) + "/" + slug + "/runtime";
+		// The disc is an immutable product asset shared by many replay capsules.
+		// Key its verified stat/content record by that asset identity, not by the
+		// capsule slug (whose private cards and input schedule are independent).
+		// The record still includes the current basename, size, SHA-256, ctime, and
+		// mtime, so any changed or substituted remote file forces a full rehash.
+		const std::string cache_dir = std::string(DATA_DIR) +
+			"/attestations/discs";
 		const std::string cache_path =
-			runtime_dir + "/disc-attestation-v1.txt";
+			cache_dir + "/" + identity.sha256 + ".v1.txt";
 		std::string expected_record;
 		if (!BuildDiscAttestationRecord(basename, identity, stat,
 				&expected_record, error))
@@ -506,7 +522,7 @@ namespace
 		}
 		if (!BuildDiscAttestationRecord(basename, identity, verified_stat,
 				&expected_record, error) ||
-			!FileSystem::EnsureDirectoryExists(runtime_dir.c_str(), true, error) ||
+			!FileSystem::EnsureDirectoryExists(cache_dir.c_str(), true, error) ||
 			!PublishStatus(cache_path.c_str(), expected_record))
 		{
 			if (!error->IsValid())
@@ -578,7 +594,7 @@ namespace
 		manifest = std::move(normalized_manifest);
 		if (manifest.ends_with("\n"))
 			manifest.pop_back();
-		std::array<std::string_view, 14> lines;
+		std::array<std::string_view, 19> lines;
 		size_t line_begin = 0;
 		for (size_t i = 0; i < lines.size(); i++)
 		{
@@ -587,7 +603,7 @@ namespace
 				(i + 1 == lines.size() && line_end != std::string::npos))
 			{
 				Error::SetString(error,
-					"Workload manifest must contain exactly fourteen ordered lines.");
+					"Workload manifest must contain exactly nineteen ordered lines.");
 				return false;
 			}
 			const size_t end = line_end == std::string::npos ?
@@ -601,7 +617,7 @@ namespace
 				"Workload manifest must begin with [Workload].");
 			return false;
 		}
-		constexpr std::array<std::string_view, 14> KEYS = {
+		constexpr std::array<std::string_view, 19> KEYS = {
 			"[Workload]",
 			"Version=",
 			"DiscBasename=",
@@ -616,6 +632,11 @@ namespace
 			"MemoryCard2=",
 			"MemoryCard2Bytes=",
 			"MemoryCard2SHA256=",
+			"InputSource=",
+			"InputButton=",
+			"InputPressedFrames=",
+			"InputReleasedFrames=",
+			"TerminalVSyncFrames=",
 		};
 		bool keys_valid = lines[0] == KEYS[0];
 		for (size_t i = 1; keys_valid && i < KEYS.size(); i++)
@@ -677,6 +698,42 @@ namespace
 		{
 			return false;
 		}
+		if (lines[14] != "InputSource=DeterministicVSyncV1")
+		{
+			Error::SetString(error,
+				"Workload manifest input source is unsupported.");
+			return false;
+		}
+		InputManager::VitaPadAutoFireButton input_button =
+			InputManager::VitaPadAutoFireButton::None;
+		const std::string_view input_button_name =
+			lines[15].substr(KEYS[15].size());
+		if (input_button_name == "Cross")
+			input_button = InputManager::VitaPadAutoFireButton::Cross;
+		else if (input_button_name == "Circle")
+			input_button = InputManager::VitaPadAutoFireButton::Circle;
+		else if (input_button_name != "None")
+		{
+			Error::SetString(error,
+				"Workload manifest input button is unsupported.");
+			return false;
+		}
+		u64 input_pressed_frames = 0;
+		u64 input_released_frames = 0;
+		u64 terminal_vsync_frames = 0;
+		if (!ParsePositiveU64(lines[16].substr(KEYS[16].size()),
+				&input_pressed_frames) ||
+			!ParsePositiveU64(lines[17].substr(KEYS[17].size()),
+				&input_released_frames) ||
+			input_pressed_frames > 600 || input_released_frames > 600 ||
+			!ParsePositiveU64(lines[18].substr(KEYS[18].size()),
+				&terminal_vsync_frames) ||
+			terminal_vsync_frames > 36000)
+		{
+			Error::SetString(error,
+				"Workload manifest input cadence or terminal VSync frame is malformed.");
+			return false;
+		}
 
 		// The large immutable disc remains in VitaSX2's existing disc store. Only
 		// the basename crosses the workload manifest, so this cannot broaden the
@@ -697,7 +754,7 @@ namespace
 			return false;
 		}
 		bool disc_attestation_cached = false;
-		if (!VerifyWorkloadDiscIdentity(slug, disc_basename, disc_path,
+		if (!VerifyWorkloadDiscIdentity(disc_basename, disc_path,
 				disc_identity, &disc_attestation_cached, error) ||
 			!VerifyFileIdentity("workload portable state", state_path,
 				state_identity.bytes, state_identity.sha256.c_str(), error) ||
@@ -724,10 +781,20 @@ namespace
 		selection->state_identity = std::move(state_identity);
 		selection->card1_identity = std::move(card1_identity);
 		selection->card2_identity = std::move(card2_identity);
+		selection->input_button = input_button;
+		selection->input_pressed_frames = static_cast<u32>(input_pressed_frames);
+		selection->input_released_frames = static_cast<u32>(input_released_frames);
+		selection->terminal_vsync_frames = static_cast<u32>(terminal_vsync_frames);
 		selection->disc_attestation_cached = disc_attestation_cached;
 		selection->private_card_dir =
 			std::string(WORKLOAD_ROOT) + "/" + selection->slug +
 			"/runtime/memcards";
+		selection->terminal_checkpoint_path =
+			std::string(WORKLOAD_ROOT) + "/" + selection->slug +
+			"/runtime/terminal.machine-checkpoint.bin";
+		selection->terminal_done_path =
+			std::string(WORKLOAD_ROOT) + "/" + selection->slug +
+			"/runtime/terminal.done";
 		Console.WriteLn(
 			"VitaSX2 workload selector validated: slug=%s manifest=%s disc=%s state=%s card1=%s card2=%s.",
 			selection->slug.c_str(), selection->manifest_path.c_str(),
@@ -886,7 +953,13 @@ namespace
 		if (!ProvisionPrivateWorkloadCard(workload->card1_input_path, card1,
 				&workload->card1_provisioned, error) ||
 			!ProvisionPrivateWorkloadCard(workload->card2_input_path, card2,
-				&workload->card2_provisioned, error))
+				&workload->card2_provisioned, error) ||
+			!VerifyFileIdentity("private workload memory card 1", card1,
+				workload->card1_identity.bytes,
+				workload->card1_identity.sha256.c_str(), error) ||
+			!VerifyFileIdentity("private workload memory card 2", card2,
+				workload->card2_identity.bytes,
+				workload->card2_identity.sha256.c_str(), error))
 		{
 			return false;
 		}
@@ -947,6 +1020,50 @@ namespace
 		}
 		return true;
 	}
+
+#if VITASX2_WORKLOAD_REPLAY_CHECKPOINT
+	bool PublishWorkloadTerminal(
+		const WorkloadReplaySelection& workload,
+		const Pcsx2Trace::PortableReplayExternalDeviceAccessCounts& accesses,
+		Error* error)
+	{
+		char marker[1024];
+		const int length = std::snprintf(marker, sizeof(marker),
+			"status=ok\nformat=vitasx2-workload-terminal-v1\nslug=%s\n"
+			"checkpoint_projection=machine-checkpoint-v5\n"
+			"configured_vsync_frames=%u\ncapture_vsync_frame=%u\n"
+			"checkpoint_records=%llu\nee_pc=%08x\niop_pc=%08x\n"
+			"ee_cycle=%llu\niop_cycle=%llu\n"
+			"external_dev9_reads=%llu\nexternal_dev9_writes=%llu\n"
+			"external_dev9_dma=%llu\nexternal_dev9_irq_scheduled=%llu\n"
+			"external_dev9_irq_delivered=%llu\n"
+			"external_firewire_reads=%llu\nexternal_firewire_writes=%llu\n"
+			"external_firewire_irq=%llu\n",
+			workload.slug.c_str(), workload.terminal_vsync_frames, g_FrameCount,
+			static_cast<unsigned long long>(
+				Pcsx2Trace::GetMachineCheckpointTraceRecordsWritten()),
+			cpuRegs.pc, psxRegs.pc,
+			static_cast<unsigned long long>(cpuRegs.cycle),
+			static_cast<unsigned long long>(psxRegs.cycle),
+			static_cast<unsigned long long>(accesses.dev9_reads),
+			static_cast<unsigned long long>(accesses.dev9_writes),
+			static_cast<unsigned long long>(accesses.dev9_dma),
+			static_cast<unsigned long long>(accesses.dev9_irq_scheduled),
+			static_cast<unsigned long long>(accesses.dev9_irq_delivered),
+			static_cast<unsigned long long>(accesses.firewire_reads),
+			static_cast<unsigned long long>(accesses.firewire_writes),
+			static_cast<unsigned long long>(accesses.firewire_irq));
+		if (length <= 0 || static_cast<size_t>(length) >= sizeof(marker) ||
+			!PublishStatus(workload.terminal_done_path.c_str(),
+				std::string_view(marker, static_cast<size_t>(length))))
+		{
+			Error::SetString(error,
+				"Failed to publish the workload terminal checkpoint receipt.");
+			return false;
+		}
+		return true;
+	}
+#endif
 
 	bool PublishHarnessLaunchReceipt(Error* error)
 	{
@@ -1313,7 +1430,7 @@ namespace
 			source);
 	}
 
-	void ConfigureProductInputAutomation()
+	void ConfigureProductInputAutomation(const WorkloadReplaySelection& workload)
 	{
 		constexpr u32 DEFAULT_PRESSED_FRAMES = 2;
 		constexpr u32 DEFAULT_RELEASED_FRAMES = 6;
@@ -1324,8 +1441,20 @@ namespace
 		u32 released_frames = DEFAULT_RELEASED_FRAMES;
 		const char* button_name = "None";
 		const char* source = "default";
+		bool accept_physical_input = true;
 
-		if (!VITASX2_PRODUCT_BOOT_VALIDATION &&
+		if (workload.enabled)
+		{
+			button = workload.input_button;
+			pressed_frames = workload.input_pressed_frames;
+			released_frames = workload.input_released_frames;
+			button_name = button == InputManager::VitaPadAutoFireButton::Cross ?
+				"Cross" : (button == InputManager::VitaPadAutoFireButton::Circle ?
+					"Circle" : "None");
+			source = workload.manifest_path.c_str();
+			accept_physical_input = false;
+		}
+		else if (!VITASX2_PRODUCT_BOOT_VALIDATION &&
 			FileSystem::FileExists(PRODUCT_CONFIG_PATH))
 		{
 			INISettingsInterface settings(PRODUCT_CONFIG_PATH);
@@ -1388,16 +1517,19 @@ namespace
 		}
 
 		if (!InputManager::ConfigureVitaPadAutoFire(
-				button, pressed_frames, released_frames))
+				button, pressed_frames, released_frames, accept_physical_input))
 		{
 			button = InputManager::VitaPadAutoFireButton::None;
 			button_name = "None";
-			InputManager::ConfigureVitaPadAutoFire(button, 1, 1);
+			InputManager::ConfigureVitaPadAutoFire(button, 1, 1,
+				accept_physical_input);
 		}
 		Console.WriteLn(
 			"VitaSX2 input autofire: button=%s pressed_frames=%u released_frames=%u "
-			"start=game-elf source=%s.",
-			button_name, pressed_frames, released_frames, source);
+			"start=%s physical_input=%u source=%s.",
+			button_name, pressed_frames, released_frames,
+			workload.enabled ? "workload-replay" : "game-elf",
+			accept_physical_input ? 1u : 0u, source);
 	}
 
 	bool NativeProvidersSelected()
@@ -1770,6 +1902,11 @@ int main()
 	bool trace_started = false;
 	bool vm_initialized = false;
 	WorkloadReplaySelection workload;
+#if VITASX2_WORKLOAD_REPLAY_CHECKPOINT
+	bool workload_checkpoint_started = false;
+	bool workload_checkpoint_complete = false;
+	bool workload_external_window = false;
+#endif
 #if VITASX2_PRODUCT_BOOT_VALIDATION
 	bool entry_trace_complete = false;
 	bool checkpoint_started = false;
@@ -1825,10 +1962,18 @@ int main()
 	EmuFolders::MemoryCards = VITASX2_PRODUCT_BOOT_VALIDATION ?
 		VALIDATION_MEMORY_CARD_DIR : PRODUCT_MEMORY_CARD_DIR;
 	ConfigureProductPerformanceTelemetry();
-	ConfigureProductInputAutomation();
 	ConfigureProductSettings();
 	if (!ReadOptionalWorkloadReplay(&workload, &error))
 		goto fail;
+#if VITASX2_WORKLOAD_REPLAY_CHECKPOINT
+	if (!workload.enabled)
+	{
+		Error::SetString(&error,
+			"The workload checkpoint build requires an authenticated active workload.");
+		goto fail;
+	}
+#endif
+	ConfigureProductInputAutomation(workload);
 	if (!VerifyConfiguredBiosBundle(
 			workload.enabled || VITASX2_PRODUCT_BOOT_VALIDATION, &error))
 	{
@@ -1930,6 +2075,20 @@ int main()
 			BiosPath.c_str(), static_cast<u32>(BiosRom.size()), BiosChecksum,
 			BiosDescription.c_str());
 	}
+#if VITASX2_WORKLOAD_REPLAY_CHECKPOINT
+	RemoveOutput(workload.terminal_checkpoint_path.c_str());
+	RemoveOutput(workload.terminal_done_path.c_str());
+	{
+		Pcsx2Trace::MachineCheckpointTraceConfig checkpoint;
+		checkpoint.output_path = workload.terminal_checkpoint_path;
+		checkpoint.max_records = 1;
+		checkpoint.after_vsync_frames = workload.terminal_vsync_frames;
+		checkpoint.wait_for_elf_entry = true;
+		if (!Pcsx2Trace::StartMachineCheckpointTrace(checkpoint, &error))
+			goto fail;
+		workload_checkpoint_started = true;
+	}
+#endif
 	if (workload.enabled)
 	{
 		const PortableStateLoadResult load_result =
@@ -1950,9 +2109,15 @@ int main()
 		// frame-driven autofire phase and correlated profiler origin are host
 		// state. Re-arm both only after every load owner has succeeded.
 		InputManager::ResetVitaPadAutoFire();
-		if (VMManager::Internal::HasBootedELF())
-			InputManager::NotifyVitaPadElfEntry();
+		InputManager::BeginVitaPadDeterministicReplay();
 		VitaGS::NotifyPerformanceWorkloadReplayLoaded();
+#if VITASX2_WORKLOAD_REPLAY_CHECKPOINT
+		Pcsx2Trace::BeginPortableReplayExternalDeviceAccessWindow();
+		workload_external_window = true;
+		Pcsx2Trace::NotifyMachineCheckpointElfEntry(cpuRegs.pc);
+		VitaSetA32EeTraceLimitStopCondition(
+			VitaA32EeTraceLimitStopCondition::MachineCheckpointTrace);
+#endif
 		Console.WriteLn(
 			"VitaSX2 workload loaded: slug=%s disc=%s state=%s card1=%s card2=%s frame=%u ee_pc=%08x iop_pc=%08x ee_cycle=%llu iop_cycle=%llu.",
 			workload.slug.c_str(), workload.disc_basename.c_str(),
@@ -1988,7 +2153,7 @@ int main()
 #endif
 
 	{
-		char initialized[2048];
+		char initialized[3072];
 		const int length = std::snprintf(initialized, sizeof(initialized),
 			"status=initialized\nbios=%s\nbios_checksum=%08x\nbios_description=%s\n"
 			"serial=%s\nelf=%s\ncrc=%08x\nfpcr=%08x\n"
@@ -2000,6 +2165,12 @@ int main()
 			"workload_state_bytes=%llu\nworkload_state_sha256=%s\n"
 			"workload_card1_bytes=%llu\nworkload_card1_sha256=%s\n"
 			"workload_card2_bytes=%llu\nworkload_card2_sha256=%s\n"
+			"workload_input_source=%s\nworkload_input_button=%s\n"
+			"workload_input_pressed_frames=%u\n"
+			"workload_input_released_frames=%u\n"
+			"workload_input_physical=%u\n"
+			"workload_terminal_vsync_frames=%u\n"
+			"workload_terminal_projection=%s\n"
 			"workload_disc_attestation_cached=%u\n"
 			"workload_card1_provisioned=%u\n"
 			"workload_card2_provisioned=%u\nworkload_frame=%u\nworkload_ee_pc=%08x\n"
@@ -2026,6 +2197,18 @@ int main()
 			workload.enabled ? workload.card1_identity.sha256.c_str() : "none",
 			static_cast<unsigned long long>(workload.card2_identity.bytes),
 			workload.enabled ? workload.card2_identity.sha256.c_str() : "none",
+			workload.enabled ? "deterministic-vsync-v1" : "none",
+			workload.enabled ?
+				(workload.input_button == InputManager::VitaPadAutoFireButton::Cross ?
+					"Cross" :
+					(workload.input_button == InputManager::VitaPadAutoFireButton::Circle ?
+						"Circle" : "None")) :
+				"none",
+			workload.enabled ? workload.input_pressed_frames : 0u,
+			workload.enabled ? workload.input_released_frames : 0u,
+			0u,
+			workload.enabled ? workload.terminal_vsync_frames : 0u,
+			workload.enabled ? "machine-checkpoint-v5" : "none",
 			workload.enabled && workload.disc_attestation_cached ? 1u : 0u,
 			workload.enabled && workload.card1_provisioned ? 1u : 0u,
 			workload.enabled && workload.card2_provisioned ? 1u : 0u,
@@ -2074,6 +2257,50 @@ int main()
 		if (state == VMState::Running)
 		{
 			VMManager::Execute();
+#if VITASX2_WORKLOAD_REPLAY_CHECKPOINT
+			if (!workload_checkpoint_complete &&
+				Pcsx2Trace::DidMachineCheckpointTraceHitLimit())
+			{
+				VitaSetA32EeTraceLimitStopCondition(
+					VitaA32EeTraceLimitStopCondition::None);
+				if (Pcsx2Trace::GetMachineCheckpointTraceRecordsWritten() != 1 ||
+					!Pcsx2Trace::GetMachineCheckpointTraceError().empty())
+				{
+					Error::SetStringFmt(&error,
+						"Workload checkpoint failed (records={}, error='{}').",
+						Pcsx2Trace::GetMachineCheckpointTraceRecordsWritten(),
+						Pcsx2Trace::GetMachineCheckpointTraceError());
+					goto fail;
+				}
+
+				const Pcsx2Trace::PortableReplayExternalDeviceAccessCounts accesses =
+					Pcsx2Trace::GetPortableReplayExternalDeviceAccessCounts();
+				Pcsx2Trace::EndPortableReplayExternalDeviceAccessWindow();
+				workload_external_window = false;
+				if (!accesses.IsZero())
+				{
+					Error::SetStringFmt(&error,
+						"Workload replay touched unserialized devices (DEV9 r/w/dma/irq={}/{}/{}/{}/{}, FW r/w/irq={}/{}/{}).",
+						accesses.dev9_reads, accesses.dev9_writes,
+						accesses.dev9_dma, accesses.dev9_irq_scheduled,
+						accesses.dev9_irq_delivered, accesses.firewire_reads,
+						accesses.firewire_writes, accesses.firewire_irq);
+					goto fail;
+				}
+
+				// Seal the binary before publishing terminal.done. The runner treats
+				// that atomic marker as authority that the checkpoint is complete.
+				Pcsx2Trace::StopMachineCheckpointTrace();
+				workload_checkpoint_started = false;
+				if (!PublishWorkloadTerminal(workload, accesses, &error))
+					goto fail;
+				workload_checkpoint_complete = true;
+				Console.WriteLn(
+					"VitaSX2 workload terminal checkpoint sealed: slug=%s frame=%u ee_pc=%08x iop_pc=%08x.",
+					workload.slug.c_str(), g_FrameCount, cpuRegs.pc, psxRegs.pc);
+				continue;
+			}
+#endif
 #if VITASX2_PRODUCT_BOOT_VALIDATION
 			if (!entry_trace_complete && Pcsx2Trace::DidEeTraceHitLimit())
 			{
@@ -2196,6 +2423,13 @@ fail:
 	VitaSetEePreInstructionTraceCallback(nullptr);
 	VitaSetEeExactTraceStreams(false);
 	VitaPerformanceTelemetry::ShutdownCpuStageProfiler();
+#if VITASX2_WORKLOAD_REPLAY_CHECKPOINT
+	VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition::None);
+	if (workload_external_window)
+		Pcsx2Trace::EndPortableReplayExternalDeviceAccessWindow();
+	if (workload_checkpoint_started)
+		Pcsx2Trace::StopMachineCheckpointTrace();
+#endif
 #if VITASX2_PRODUCT_BOOT_VALIDATION
 	StopValidationProgress();
 	VitaSetA32EeTraceLimitStopCondition(VitaA32EeTraceLimitStopCondition::None);
