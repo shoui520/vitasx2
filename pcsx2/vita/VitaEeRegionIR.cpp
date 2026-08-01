@@ -31,6 +31,24 @@ namespace VitaEE::RegionIR
 			Prefetch,
 			Cache,
 		};
+		enum class PureMmiKind : u8
+		{
+			MoveFromHi1,
+			MoveToHi1,
+			MoveFromLo1,
+			MoveToLo1,
+			MoveFromHi,
+			MoveFromLo,
+			MoveToHi,
+			MoveToLo,
+			And,
+			Xor,
+			Or,
+			Nor,
+			CopyLowDoubleword,
+			CopyUpperDoubleword,
+			CopyHalfword,
+		};
 
 		constexpr u32 RS(u32 op) { return (op >> 21) & 0x1fu; }
 		constexpr u32 RT(u32 op) { return (op >> 16) & 0x1fu; }
@@ -235,6 +253,101 @@ namespace VitaEE::RegionIR
 			       (RT(op) == 0x18 || RT(op) == 0x19);
 		}
 
+		bool DecodePureMmi(u32 op, PureMmiKind* kind)
+		{
+			if ((op >> 26) != 0x1c)
+				return false;
+
+			PureMmiKind decoded{};
+			switch (FUNCT(op))
+			{
+				case 0x10:
+					decoded = PureMmiKind::MoveFromHi1;
+					break;
+				case 0x11:
+					decoded = PureMmiKind::MoveToHi1;
+					break;
+				case 0x12:
+					decoded = PureMmiKind::MoveFromLo1;
+					break;
+				case 0x13:
+					decoded = PureMmiKind::MoveToLo1;
+					break;
+				case 0x09: // MMI2
+					switch (SA(op))
+					{
+						case 0x08:
+							decoded = PureMmiKind::MoveFromHi;
+							break;
+						case 0x09:
+							decoded = PureMmiKind::MoveFromLo;
+							break;
+						case 0x0e:
+							decoded = PureMmiKind::CopyLowDoubleword;
+							break;
+						case 0x12:
+							decoded = PureMmiKind::And;
+							break;
+						case 0x13:
+							decoded = PureMmiKind::Xor;
+							break;
+						default:
+							return false;
+					}
+					break;
+				case 0x29: // MMI3
+					switch (SA(op))
+					{
+						case 0x08:
+							decoded = PureMmiKind::MoveToHi;
+							break;
+						case 0x09:
+							decoded = PureMmiKind::MoveToLo;
+							break;
+						case 0x0e:
+							decoded = PureMmiKind::CopyUpperDoubleword;
+							break;
+						case 0x12:
+							decoded = PureMmiKind::Or;
+							break;
+						case 0x13:
+							decoded = PureMmiKind::Nor;
+							break;
+						case 0x1b:
+							decoded = PureMmiKind::CopyHalfword;
+							break;
+						default:
+							return false;
+					}
+					break;
+				default:
+					return false;
+			}
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
+		bool IsPureMmiGprWrite(PureMmiKind kind)
+		{
+			return kind != PureMmiKind::MoveToHi1 &&
+			       kind != PureMmiKind::MoveToLo1 &&
+			       kind != PureMmiKind::MoveToHi &&
+			       kind != PureMmiKind::MoveToLo;
+		}
+
+		bool IsPureMmiHiWrite(PureMmiKind kind)
+		{
+			return kind == PureMmiKind::MoveToHi1 ||
+			       kind == PureMmiKind::MoveToHi;
+		}
+
+		bool IsPureMmiLoWrite(PureMmiKind kind)
+		{
+			return kind == PureMmiKind::MoveToLo1 ||
+			       kind == PureMmiKind::MoveToLo;
+		}
+
 		bool IsExtendedScalarGprWrite(u32 op)
 		{
 			return IsVariableShift(op) || IsConditionalMove(op) ||
@@ -263,6 +376,8 @@ namespace VitaEE::RegionIR
 				case 0x0f: // LUI
 				case 0x19: // DADDIU
 					return true;
+				case 0x1c: // Pure, non-multiplying MMI moves/logical/copies.
+					return DecodePureMmi(op, nullptr);
 				default:
 					return false;
 			}
@@ -874,6 +989,22 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
+			bool WriteFullGpr(Block& block, StateMap* state, u32 reg, ValueId value,
+				u32 source_pc)
+			{
+				if (reg == 0)
+					return true;
+				if (value == INVALID_VALUE ||
+					AddNode(block, Opcode::BindGpr, ValueType::Void,
+						{value, INVALID_VALUE, INVALID_VALUE}, 1, reg, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				state->gpr[reg] = value;
+				return true;
+			}
+
 			bool WriteHiLoLow64(Block& block, StateMap* state, bool hi, ValueId low,
 				u32 source_pc)
 			{
@@ -889,6 +1020,39 @@ namespace VitaEE::RegionIR
 					return false;
 				}
 				destination = complete;
+				return true;
+			}
+
+			bool WriteHiLoHigh64(Block& block, StateMap* state, bool hi, ValueId high,
+				u32 source_pc)
+			{
+				ValueId& destination = hi ? state->hi : state->lo;
+				const ValueId complete = Binary(block, Opcode::ReplaceHigh64,
+					ValueType::I128, destination, high, source_pc);
+				const Opcode bind = hi ? Opcode::BindHi : Opcode::BindLo;
+				if (complete == INVALID_VALUE ||
+					AddNode(block, bind, ValueType::Void,
+						{complete, INVALID_VALUE, INVALID_VALUE}, 1, 0, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				destination = complete;
+				return true;
+			}
+
+			bool WriteFullHiLo(Block& block, StateMap* state, bool hi, ValueId value,
+				u32 source_pc)
+			{
+				const Opcode bind = hi ? Opcode::BindHi : Opcode::BindLo;
+				if (value == INVALID_VALUE ||
+					AddNode(block, bind, ValueType::Void,
+						{value, INVALID_VALUE, INVALID_VALUE}, 1, 0, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				(hi ? state->hi : state->lo) = value;
 				return true;
 			}
 
@@ -966,6 +1130,64 @@ namespace VitaEE::RegionIR
 					return LowerMemory(block, state, op, pc, memory_kind);
 
 				const u32 primary = op >> 26;
+				if (primary == 0x1c)
+				{
+					PureMmiKind kind{};
+					if (!DecodePureMmi(op, &kind))
+						return false;
+					const u32 rd = RD(op);
+					const u32 rs = RS(op);
+					const u32 rt = RT(op);
+					ValueId value = INVALID_VALUE;
+					switch (kind)
+					{
+						case PureMmiKind::MoveFromHi1:
+						case PureMmiKind::MoveFromLo1:
+							value = Unary(block, Opcode::ExtractHigh64,
+								ValueType::I64,
+								kind == PureMmiKind::MoveFromHi1 ? state->hi : state->lo,
+								pc);
+							return WriteLow64(block, state, rd, value, pc);
+						case PureMmiKind::MoveToHi1:
+						case PureMmiKind::MoveToLo1:
+							value = Low64(block, *state, rs, pc);
+							return WriteHiLoHigh64(block, state,
+								kind == PureMmiKind::MoveToHi1, value, pc);
+						case PureMmiKind::MoveFromHi:
+							return WriteFullGpr(block, state, rd, state->hi, pc);
+						case PureMmiKind::MoveFromLo:
+							return WriteFullGpr(block, state, rd, state->lo, pc);
+						case PureMmiKind::MoveToHi:
+							return WriteFullHiLo(block, state, true, state->gpr[rs], pc);
+						case PureMmiKind::MoveToLo:
+							return WriteFullHiLo(block, state, false, state->gpr[rs], pc);
+						case PureMmiKind::And:
+						case PureMmiKind::Xor:
+						case PureMmiKind::Or:
+						case PureMmiKind::Nor:
+						{
+							const Opcode logical =
+								kind == PureMmiKind::And ? Opcode::And128 :
+								kind == PureMmiKind::Xor ? Opcode::Xor128 :
+								kind == PureMmiKind::Or ? Opcode::Or128 : Opcode::Nor128;
+							value = Binary(block, logical, ValueType::I128,
+								state->gpr[rs], state->gpr[rt], pc);
+							return WriteFullGpr(block, state, rd, value, pc);
+						}
+						case PureMmiKind::CopyLowDoubleword:
+							value = Binary(block, Opcode::PackLow64, ValueType::I128,
+								state->gpr[rs], state->gpr[rt], pc);
+							return WriteFullGpr(block, state, rd, value, pc);
+						case PureMmiKind::CopyUpperDoubleword:
+							value = Binary(block, Opcode::PackHigh64, ValueType::I128,
+								state->gpr[rs], state->gpr[rt], pc);
+							return WriteFullGpr(block, state, rd, value, pc);
+						case PureMmiKind::CopyHalfword:
+							value = Unary(block, Opcode::BroadcastLowHalfwordPer64,
+								ValueType::I128, state->gpr[rt], pc);
+							return WriteFullGpr(block, state, rd, value, pc);
+					}
+				}
 				if (primary == 0x00)
 				{
 					const u32 function = FUNCT(op);
@@ -1974,6 +2196,7 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> memory_bind_count;
 			std::map<u32, u32> no_effect_count;
 			std::map<u32, u32> extended_gpr_bind_count;
+			std::map<u32, u32> pure_mmi_gpr_bind_count;
 			std::map<u32, u32> hi_bind_count;
 			std::map<u32, u32> lo_bind_count;
 			std::map<u32, u32> sa_bind_count;
@@ -1999,6 +2222,13 @@ namespace VitaEE::RegionIR
 				const Node* node = local_node(value);
 				return node && node->opcode == opcode && node->operand_count == 1 &&
 				       node->operands[0] == operand && node->source_pc == source_pc;
+			};
+			auto exact_binary = [&](ValueId value, Opcode opcode, ValueId left,
+				ValueId right, u32 source_pc) {
+				const Node* node = local_node(value);
+				return node && node->opcode == opcode && node->operand_count == 2 &&
+				       node->operands[0] == left && node->operands[1] == right &&
+				       node->source_pc == source_pc;
 			};
 			auto exact_constant64 = [&](ValueId value, u64 literal, u32 source_pc) {
 				const Node* node = local_node(value);
@@ -2099,13 +2329,34 @@ namespace VitaEE::RegionIR
 				}
 				return false;
 			};
-			auto exact_move_to_hilo = [&](const Node& bind, u32 source_opcode,
+			auto exact_hilo_bind = [&](const Node& bind, u32 source_opcode,
 				const StateMap& input, bool hi) {
-				const Node* replace = local_node(bind.operands[0]);
 				const ValueId destination = hi ? input.hi : input.lo;
-				return IsMoveToHiLo(source_opcode) &&
-				       (FUNCT(source_opcode) == 0x11) == hi && replace &&
-				       replace->opcode == Opcode::ReplaceLow64 &&
+				if (IsMoveToHiLo(source_opcode))
+				{
+					const Node* replace = local_node(bind.operands[0]);
+					return (FUNCT(source_opcode) == 0x11) == hi && replace &&
+					       replace->opcode == Opcode::ReplaceLow64 &&
+					       replace->operand_count == 2 &&
+					       replace->operands[0] == destination &&
+					       replace->source_pc == bind.source_pc &&
+					       exact_unary(replace->operands[1], Opcode::ExtractLow64,
+							input.gpr[RS(source_opcode)], bind.source_pc);
+				}
+
+				PureMmiKind kind{};
+				if (!DecodePureMmi(source_opcode, &kind) ||
+					(hi ? !IsPureMmiHiWrite(kind) : !IsPureMmiLoWrite(kind)))
+				{
+					return false;
+				}
+				if (kind == PureMmiKind::MoveToHi ||
+					kind == PureMmiKind::MoveToLo)
+				{
+					return bind.operands[0] == input.gpr[RS(source_opcode)];
+				}
+				const Node* replace = local_node(bind.operands[0]);
+				return replace && replace->opcode == Opcode::ReplaceHigh64 &&
 				       replace->operand_count == 2 &&
 				       replace->operands[0] == destination &&
 				       replace->source_pc == bind.source_pc &&
@@ -2151,6 +2402,68 @@ namespace VitaEE::RegionIR
 				       exact_constant32(masked->operands[1], mask, bind.source_pc) &&
 				       exact_constant32(xored->operands[1], IMM_U(source_opcode) & mask,
 						bind.source_pc);
+			};
+			auto exact_pure_mmi_gpr_bind = [&](const Node& bind, u32 source_opcode,
+				const StateMap& input) {
+				PureMmiKind kind{};
+				const u32 destination = RD(source_opcode);
+				if (!DecodePureMmi(source_opcode, &kind) ||
+					!IsPureMmiGprWrite(kind) || destination == 0 ||
+					bind.immediate != destination)
+				{
+					return false;
+				}
+
+				if (kind == PureMmiKind::MoveFromHi ||
+					kind == PureMmiKind::MoveFromLo)
+				{
+					return bind.operands[0] ==
+						(kind == PureMmiKind::MoveFromHi ? input.hi : input.lo);
+				}
+				if (kind == PureMmiKind::MoveFromHi1 ||
+					kind == PureMmiKind::MoveFromLo1)
+				{
+					const Node* replace = local_node(bind.operands[0]);
+					return replace && replace->opcode == Opcode::ReplaceLow64 &&
+					       replace->operand_count == 2 &&
+					       replace->operands[0] == input.gpr[destination] &&
+					       replace->source_pc == bind.source_pc &&
+					       exact_unary(replace->operands[1], Opcode::ExtractHigh64,
+							kind == PureMmiKind::MoveFromHi1 ? input.hi : input.lo,
+							bind.source_pc);
+				}
+
+				Opcode operation{};
+				switch (kind)
+				{
+					case PureMmiKind::And:
+						operation = Opcode::And128;
+						break;
+					case PureMmiKind::Xor:
+						operation = Opcode::Xor128;
+						break;
+					case PureMmiKind::Or:
+						operation = Opcode::Or128;
+						break;
+					case PureMmiKind::Nor:
+						operation = Opcode::Nor128;
+						break;
+					case PureMmiKind::CopyLowDoubleword:
+						operation = Opcode::PackLow64;
+						break;
+					case PureMmiKind::CopyUpperDoubleword:
+						operation = Opcode::PackHigh64;
+						break;
+					case PureMmiKind::CopyHalfword:
+						return exact_unary(bind.operands[0],
+							Opcode::BroadcastLowHalfwordPer64,
+							input.gpr[RT(source_opcode)], bind.source_pc);
+					default:
+						return false;
+				}
+				return exact_binary(bind.operands[0], operation,
+					input.gpr[RS(source_opcode)], input.gpr[RT(source_opcode)],
+					bind.source_pc);
 			};
 			auto require_operand = [&](const Node& node, u32 node_index, u32 operand,
 									   ValueType required) -> VerifyResult {
@@ -2243,9 +2556,11 @@ namespace VitaEE::RegionIR
 						checked = unary(ValueType::I128, ValueType::I32);
 						break;
 					case Opcode::ExtractLow64:
+					case Opcode::ExtractHigh64:
 						checked = unary(ValueType::I128, ValueType::I64);
 						break;
 					case Opcode::ReplaceLow64:
+					case Opcode::ReplaceHigh64:
 						checked = binary(ValueType::I128, ValueType::I64, ValueType::I128);
 						break;
 					case Opcode::SignExtend32To64:
@@ -2278,6 +2593,18 @@ namespace VitaEE::RegionIR
 					case Opcode::Xor64:
 					case Opcode::Nor64:
 						checked = binary(ValueType::I64, ValueType::I64, ValueType::I64);
+						break;
+					case Opcode::And128:
+					case Opcode::Or128:
+					case Opcode::Xor128:
+					case Opcode::Nor128:
+					case Opcode::PackLow64:
+					case Opcode::PackHigh64:
+						checked = binary(ValueType::I128, ValueType::I128,
+							ValueType::I128);
+						break;
+					case Opcode::BroadcastLowHalfwordPer64:
+						checked = unary(ValueType::I128, ValueType::I128);
 						break;
 					case Opcode::ShiftLeft32:
 					case Opcode::ShiftRightLogical32:
@@ -2452,6 +2779,9 @@ namespace VitaEE::RegionIR
 									"GPR binding has no owning source instruction");
 								break;
 							}
+							PureMmiKind pure_mmi_kind{};
+							const bool pure_mmi =
+								DecodePureMmi(source_opcode, &pure_mmi_kind);
 							if (IsExtendedScalarGprWrite(source_opcode))
 							{
 								if (!exact_extended_gpr_bind(node, source_opcode,
@@ -2464,8 +2794,21 @@ namespace VitaEE::RegionIR
 								}
 								extended_gpr_bind_count[node.source_pc]++;
 							}
+							else if (pure_mmi && IsPureMmiGprWrite(pure_mmi_kind))
+							{
+								if (!exact_pure_mmi_gpr_bind(node, source_opcode,
+										expected))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"pure MMI GPR binding does not match source");
+									break;
+								}
+								pure_mmi_gpr_bind_count[node.source_pc]++;
+							}
 							else if (IsMoveToHiLo(source_opcode) ||
 								IsMoveToSa(source_opcode) ||
+								pure_mmi ||
 								DecodeNoEffect(source_opcode, program.options,
 									&no_effect_kind))
 							{
@@ -2532,11 +2875,11 @@ namespace VitaEE::RegionIR
 						{
 							u32 source_opcode = 0;
 							if (!source_opcode_at(node.source_pc, &source_opcode) ||
-								!exact_move_to_hilo(node, source_opcode, expected, true))
+								!exact_hilo_bind(node, source_opcode, expected, true))
 							{
 								checked = Fail(VerifyFailure::SourceMismatch,
 									block_index, node_index,
-									"HI binding does not match decoded MTHI");
+									"HI binding does not match decoded move");
 								break;
 							}
 							hi_bind_count[node.source_pc]++;
@@ -2549,11 +2892,11 @@ namespace VitaEE::RegionIR
 						{
 							u32 source_opcode = 0;
 							if (!source_opcode_at(node.source_pc, &source_opcode) ||
-								!exact_move_to_hilo(node, source_opcode, expected, false))
+								!exact_hilo_bind(node, source_opcode, expected, false))
 							{
 								checked = Fail(VerifyFailure::SourceMismatch,
 									block_index, node_index,
-									"LO binding does not match decoded MTLO");
+									"LO binding does not match decoded move");
 								break;
 							}
 							lo_bind_count[node.source_pc]++;
@@ -2627,6 +2970,7 @@ namespace VitaEE::RegionIR
 				{
 					if (no_effect_count[source.pc] != 1 ||
 						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
 						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0 ||
 						sa_bind_count[source.pc] != 0)
 					{
@@ -2639,6 +2983,7 @@ namespace VitaEE::RegionIR
 				{
 					const u32 expected_binds = RD(source.opcode) == 0 ? 0u : 1u;
 					if (extended_gpr_bind_count[source.pc] != expected_binds ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
 						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0 ||
 						sa_bind_count[source.pc] != 0)
 					{
@@ -2653,6 +2998,7 @@ namespace VitaEE::RegionIR
 					if (hi_bind_count[source.pc] != (hi ? 1u : 0u) ||
 						lo_bind_count[source.pc] != (hi ? 0u : 1u) ||
 						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
 						sa_bind_count[source.pc] != 0)
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
@@ -2664,11 +3010,34 @@ namespace VitaEE::RegionIR
 				{
 					if (sa_bind_count[source.pc] != 1 ||
 						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
 						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0)
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
 							"MTSA/MTSAB/MTSAH source has the wrong SA binding");
+					}
+				}
+				else
+				{
+					PureMmiKind pure_mmi_kind{};
+					if (DecodePureMmi(source.opcode, &pure_mmi_kind))
+					{
+						const u32 expected_gpr =
+							IsPureMmiGprWrite(pure_mmi_kind) && RD(source.opcode) != 0 ?
+								1u : 0u;
+						const u32 expected_hi = IsPureMmiHiWrite(pure_mmi_kind) ? 1u : 0u;
+						const u32 expected_lo = IsPureMmiLoWrite(pure_mmi_kind) ? 1u : 0u;
+						if (pure_mmi_gpr_bind_count[source.pc] != expected_gpr ||
+							hi_bind_count[source.pc] != expected_hi ||
+							lo_bind_count[source.pc] != expected_lo ||
+							extended_gpr_bind_count[source.pc] != 0 ||
+							sa_bind_count[source.pc] != 0)
+						{
+							return Fail(VerifyFailure::SourceMismatch, block_index,
+								UINT32_MAX,
+								"pure MMI source has the wrong architectural binding");
+						}
 					}
 				}
 
@@ -3128,9 +3497,16 @@ namespace VitaEE::RegionIR
 					case Opcode::ExtractLow64:
 						bits = Bits(left);
 						break;
+					case Opcode::ExtractHigh64:
+						bits = Bits(values[node.operands[0]].bits.hi);
+						break;
 					case Opcode::ReplaceLow64:
 						bits = values[node.operands[0]].bits;
 						bits.lo = right;
+						break;
+					case Opcode::ReplaceHigh64:
+						bits = values[node.operands[0]].bits;
+						bits.hi = right;
 						break;
 					case Opcode::SignExtend32To64:
 						bits = Bits(static_cast<u64>(
@@ -3169,6 +3545,50 @@ namespace VitaEE::RegionIR
 					case Opcode::Nor64:
 						bits = Bits(~(left | right));
 						break;
+					case Opcode::And128:
+						bits = {
+							values[node.operands[0]].bits.lo &
+								values[node.operands[1]].bits.lo,
+							values[node.operands[0]].bits.hi &
+								values[node.operands[1]].bits.hi};
+						break;
+					case Opcode::Or128:
+						bits = {
+							values[node.operands[0]].bits.lo |
+								values[node.operands[1]].bits.lo,
+							values[node.operands[0]].bits.hi |
+								values[node.operands[1]].bits.hi};
+						break;
+					case Opcode::Xor128:
+						bits = {
+							values[node.operands[0]].bits.lo ^
+								values[node.operands[1]].bits.lo,
+							values[node.operands[0]].bits.hi ^
+								values[node.operands[1]].bits.hi};
+						break;
+					case Opcode::Nor128:
+						bits = {
+							~(values[node.operands[0]].bits.lo |
+								values[node.operands[1]].bits.lo),
+							~(values[node.operands[0]].bits.hi |
+								values[node.operands[1]].bits.hi)};
+						break;
+					case Opcode::PackLow64:
+						bits = {values[node.operands[1]].bits.lo,
+							values[node.operands[0]].bits.lo};
+						break;
+					case Opcode::PackHigh64:
+						bits = {values[node.operands[0]].bits.hi,
+							values[node.operands[1]].bits.hi};
+						break;
+					case Opcode::BroadcastLowHalfwordPer64:
+					{
+						constexpr u64 REPEAT_HALFWORD = 0x0001000100010001ull;
+						const u128 source = values[node.operands[0]].bits;
+						bits = {(source.lo & 0xffffu) * REPEAT_HALFWORD,
+							(source.hi & 0xffffu) * REPEAT_HALFWORD};
+						break;
+					}
 					case Opcode::ShiftLeft32:
 						bits = Bits(static_cast<u32>(left) << node.immediate);
 						break;
