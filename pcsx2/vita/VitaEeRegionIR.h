@@ -100,6 +100,7 @@ namespace VitaEE::RegionIR
 		BindLo,
 		BindSa,
 		BindFpr,
+		BindFcr31,
 		AdvanceCycles,
 	};
 
@@ -130,6 +131,13 @@ namespace VitaEE::RegionIR
 		// Internal byte-offset representation of the EE funnel-shift amount.
 		ValueId sa = INVALID_VALUE;
 		std::array<ValueId, 32> fpr{};
+		// The EE implements FCR0 and FCR31 plus one scalar accumulator. ACCflag
+		// is PCSX2's internal accumulator-overflow state and must cross every
+		// exact fallback even before arithmetic is admitted.
+		ValueId fcr0 = INVALID_VALUE;
+		ValueId fcr31 = INVALID_VALUE;
+		ValueId acc = INVALID_VALUE;
+		ValueId acc_flag = INVALID_VALUE;
 		ValueId cycle = INVALID_VALUE;
 		// Ordered, non-architectural memory state. It prevents loads and stores
 		// from being reordered across each other while remaining absent from the
@@ -384,6 +392,10 @@ namespace VitaEE::RegionIR
 		u128 lo{};
 		u32 sa = 0;
 		std::array<u32, 32> fpr{};
+		u32 fcr0 = 0;
+		u32 fcr31 = 0;
+		u32 acc = 0;
+		u32 acc_flag = 0;
 		u32 pc = 0;
 		u64 cycle = 0;
 	};

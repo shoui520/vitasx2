@@ -24,7 +24,11 @@ namespace VitaEE::RegionIR
 		constexpr u32 SA_PARAMETER = 34;
 		constexpr u32 FPR_PARAMETER_BASE = 35;
 		constexpr u32 FPR_COUNT = 32;
-		constexpr u32 CYCLE_PARAMETER = FPR_PARAMETER_BASE + FPR_COUNT;
+		constexpr u32 FCR0_PARAMETER = FPR_PARAMETER_BASE + FPR_COUNT;
+		constexpr u32 FCR31_PARAMETER = FCR0_PARAMETER + 1;
+		constexpr u32 ACC_PARAMETER = FCR31_PARAMETER + 1;
+		constexpr u32 ACC_FLAG_PARAMETER = ACC_PARAMETER + 1;
+		constexpr u32 CYCLE_PARAMETER = ACC_FLAG_PARAMETER + 1;
 		constexpr u32 MEMORY_EFFECT_PARAMETER = CYCLE_PARAMETER + 1;
 		constexpr u32 PARAMETER_COUNT = MEMORY_EFFECT_PARAMETER + 1;
 		enum class NoEffectKind : u32
@@ -389,6 +393,14 @@ namespace VitaEE::RegionIR
 			return true;
 		}
 
+		bool IsCop1ControlWrite(u32 op)
+		{
+			// CTC1 is defined only for FCR31. Reserved control registers remain
+			// with tier zero rather than inheriting a host-specific no-op.
+			return (op >> 26) == 0x11 && RS(op) == 0x06 && FS(op) == 31 &&
+			       (op & 0x7ffu) == 0;
+		}
+
 		bool IsExtendedScalarGprWrite(u32 op)
 		{
 			return IsVariableShift(op) || IsConditionalMove(op) ||
@@ -419,8 +431,8 @@ namespace VitaEE::RegionIR
 					return true;
 				case 0x1c: // Pure, non-multiplying MMI moves/logical/copies.
 					return DecodePureMmi(op, nullptr);
-				case 0x11: // Raw-bit COP1 register transfers and MOV.S.
-					return DecodePureCop1State(op, nullptr);
+				case 0x11: // Raw-bit COP1 state and the defined FCR31 write.
+					return DecodePureCop1State(op, nullptr) || IsCop1ControlWrite(op);
 				default:
 					return false;
 			}
@@ -948,6 +960,14 @@ namespace VitaEE::RegionIR
 						if (block.parameters.fpr[fpr] == INVALID_VALUE)
 							return false;
 					}
+					block.parameters.fcr0 = AddNode(block, Opcode::Parameter,
+						ValueType::I32, {}, 0, FCR0_PARAMETER, 0, block.pc);
+					block.parameters.fcr31 = AddNode(block, Opcode::Parameter,
+						ValueType::I32, {}, 0, FCR31_PARAMETER, 0, block.pc);
+					block.parameters.acc = AddNode(block, Opcode::Parameter,
+						ValueType::F32Bits, {}, 0, ACC_PARAMETER, 0, block.pc);
+					block.parameters.acc_flag = AddNode(block, Opcode::Parameter,
+						ValueType::I32, {}, 0, ACC_FLAG_PARAMETER, 0, block.pc);
 					block.parameters.cycle =
 						AddNode(block, Opcode::Parameter, ValueType::Cycle, {}, 0,
 							CYCLE_PARAMETER, 0, block.pc);
@@ -957,6 +977,10 @@ namespace VitaEE::RegionIR
 					if (block.parameters.hi == INVALID_VALUE ||
 						block.parameters.lo == INVALID_VALUE ||
 						block.parameters.sa == INVALID_VALUE ||
+						block.parameters.fcr0 == INVALID_VALUE ||
+						block.parameters.fcr31 == INVALID_VALUE ||
+						block.parameters.acc == INVALID_VALUE ||
+						block.parameters.acc_flag == INVALID_VALUE ||
 						block.parameters.cycle == INVALID_VALUE ||
 						block.parameters.memory_effect == INVALID_VALUE)
 					{
@@ -1148,6 +1172,20 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
+			bool WriteFcr31(Block& block, StateMap* state, ValueId value,
+				u32 source_pc)
+			{
+				if (value == INVALID_VALUE ||
+					AddNode(block, Opcode::BindFcr31, ValueType::Void,
+						{value, INVALID_VALUE, INVALID_VALUE}, 1, 31, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				state->fcr31 = value;
+				return true;
+			}
+
 			bool LowerMemory(Block& block, StateMap* state, u32 op, u32 pc,
 				MemoryAccessKind kind)
 			{
@@ -1220,7 +1258,12 @@ namespace VitaEE::RegionIR
 				{
 					PureCop1StateKind kind{};
 					if (!DecodePureCop1State(op, &kind))
-						return false;
+					{
+						if (!IsCop1ControlWrite(op))
+							return false;
+						return WriteFcr31(block, state,
+							Low32(block, *state, RT(op), pc), pc);
+					}
 					ValueId value = INVALID_VALUE;
 					switch (kind)
 					{
@@ -1610,6 +1653,8 @@ namespace VitaEE::RegionIR
 		{
 			return left.gpr == right.gpr && left.hi == right.hi && left.lo == right.lo &&
 			       left.sa == right.sa && left.fpr == right.fpr &&
+			       left.fcr0 == right.fcr0 && left.fcr31 == right.fcr31 &&
+			       left.acc == right.acc && left.acc_flag == right.acc_flag &&
 			       left.cycle == right.cycle &&
 			       left.memory_effect == right.memory_effect;
 		}
@@ -2162,8 +2207,13 @@ namespace VitaEE::RegionIR
 				const Node& parameter = block.nodes[slot];
 				const bool fpr_parameter = slot >= FPR_PARAMETER_BASE &&
 				                           slot < FPR_PARAMETER_BASE + FPR_COUNT;
-				const ValueType expected_type = slot == SA_PARAMETER ? ValueType::I32 :
+				const bool i32_parameter = slot == SA_PARAMETER ||
+				                           slot == FCR0_PARAMETER ||
+				                           slot == FCR31_PARAMETER ||
+				                           slot == ACC_FLAG_PARAMETER;
+				const ValueType expected_type = i32_parameter ? ValueType::I32 :
 					fpr_parameter ? ValueType::F32Bits :
+					slot == ACC_PARAMETER ? ValueType::F32Bits :
 					slot == CYCLE_PARAMETER ? ValueType::Cycle :
 					slot == MEMORY_EFFECT_PARAMETER ? ValueType::MemoryEffect :
 					                                    ValueType::I128;
@@ -2184,6 +2234,14 @@ namespace VitaEE::RegionIR
 					expected.sa = parameter.id;
 				else if (fpr_parameter)
 					expected.fpr[slot - FPR_PARAMETER_BASE] = parameter.id;
+				else if (slot == FCR0_PARAMETER)
+					expected.fcr0 = parameter.id;
+				else if (slot == FCR31_PARAMETER)
+					expected.fcr31 = parameter.id;
+				else if (slot == ACC_PARAMETER)
+					expected.acc = parameter.id;
+				else if (slot == ACC_FLAG_PARAMETER)
+					expected.acc_flag = parameter.id;
 				else if (slot == CYCLE_PARAMETER)
 					expected.cycle = parameter.id;
 				else
@@ -2314,6 +2372,7 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> pure_mmi_gpr_bind_count;
 			std::map<u32, u32> pure_cop1_gpr_bind_count;
 			std::map<u32, u32> fpr_bind_count;
+			std::map<u32, u32> fcr31_bind_count;
 			std::map<u32, u32> hi_bind_count;
 			std::map<u32, u32> lo_bind_count;
 			std::map<u32, u32> sa_bind_count;
@@ -3179,6 +3238,29 @@ namespace VitaEE::RegionIR
 							expected.fpr[node.immediate] = node.operands[0];
 						}
 						break;
+					case Opcode::BindFcr31:
+						checked = unary(ValueType::I32, ValueType::Void);
+						if (checked)
+						{
+							u32 source_opcode = 0;
+							const Node* value = local_node(node.operands[0]);
+							if (node.immediate != 31 ||
+								!source_opcode_at(node.source_pc, &source_opcode) ||
+								!IsCop1ControlWrite(source_opcode) || !value ||
+								value->opcode != Opcode::ExtractLow32 ||
+								value->operand_count != 1 ||
+								value->source_pc != node.source_pc ||
+								value->operands[0] != expected.gpr[RT(source_opcode)])
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"FCR31 binding does not match decoded CTC1 source");
+								break;
+							}
+							fcr31_bind_count[node.source_pc]++;
+							expected.fcr31 = node.operands[0];
+						}
+						break;
 					case Opcode::AdvanceCycles:
 					{
 						checked = unary(ValueType::Cycle, ValueType::Cycle);
@@ -3283,6 +3365,22 @@ namespace VitaEE::RegionIR
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
 							"MTSA/MTSAB/MTSAH source has the wrong SA binding");
+					}
+				}
+				else if (IsCop1ControlWrite(source.opcode))
+				{
+					if (fcr31_bind_count[source.pc] != 1 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"CTC1 source lacks one exact FCR31 binding");
 					}
 				}
 				else
@@ -3717,6 +3815,11 @@ namespace VitaEE::RegionIR
 			for (u32 fpr = 0; fpr < FPR_COUNT; fpr++)
 				values[block.parameters.fpr[fpr]] =
 					{ValueType::F32Bits, Bits(state.fpr[fpr])};
+			values[block.parameters.fcr0] = {ValueType::I32, Bits(state.fcr0)};
+			values[block.parameters.fcr31] = {ValueType::I32, Bits(state.fcr31)};
+			values[block.parameters.acc] = {ValueType::F32Bits, Bits(state.acc)};
+			values[block.parameters.acc_flag] =
+				{ValueType::I32, Bits(state.acc_flag)};
 			values[block.parameters.cycle] = {ValueType::Cycle, Bits(state.cycle)};
 			values[block.parameters.memory_effect] = memory_effect;
 		};
@@ -3731,6 +3834,11 @@ namespace VitaEE::RegionIR
 			for (u32 fpr = 0; fpr < FPR_COUNT; fpr++)
 				state.fpr[fpr] =
 					static_cast<u32>(values[transfer.state.fpr[fpr]].bits.lo);
+			state.fcr0 = static_cast<u32>(values[transfer.state.fcr0].bits.lo);
+			state.fcr31 = static_cast<u32>(values[transfer.state.fcr31].bits.lo);
+			state.acc = static_cast<u32>(values[transfer.state.acc].bits.lo);
+			state.acc_flag =
+				static_cast<u32>(values[transfer.state.acc_flag].bits.lo);
 			state.cycle = values[transfer.state.cycle].bits.lo;
 			state.pc = static_cast<u32>(values[transfer.pc].bits.lo);
 			return state;
@@ -4094,6 +4202,10 @@ namespace VitaEE::RegionIR
 						break;
 					case Opcode::BindFpr:
 						current.fpr[node.immediate] =
+							static_cast<u32>(values[node.operands[0]].bits.lo);
+						break;
+					case Opcode::BindFcr31:
+						current.fcr31 =
 							static_cast<u32>(values[node.operands[0]].bits.lo);
 						break;
 					case Opcode::AdvanceCycles:
