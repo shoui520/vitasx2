@@ -36,6 +36,9 @@ namespace VitaEE::RegionIR
 		ConstantI32,
 		ConstantI64,
 		ConstantAddress,
+		// A source-backed instruction which has no observable effect under the
+		// selected PCSX2 recompiler contract (SYNC, PREF, or cache-disabled CACHE).
+		NoEffect,
 		ExtractLow32,
 		ExtractLow64,
 		ReplaceLow64,
@@ -55,6 +58,13 @@ namespace VitaEE::RegionIR
 		ShiftLeft64,
 		ShiftRightLogical64,
 		ShiftRightArithmetic64,
+		ShiftLeft32Variable,
+		ShiftRightLogical32Variable,
+		ShiftRightArithmetic32Variable,
+		ShiftLeft64Variable,
+		ShiftRightLogical64Variable,
+		ShiftRightArithmetic64Variable,
+		Select64,
 		CompareEqual64,
 		CompareNotEqual64,
 		CompareSignedLess64,
@@ -82,7 +92,8 @@ namespace VitaEE::RegionIR
 		std::array<ValueId, 3> operands = {INVALID_VALUE, INVALID_VALUE,
 			INVALID_VALUE};
 		u8 operand_count = 0;
-		// Parameter/BindGpr slot, shift amount, or immediate cycle delta.
+		// Parameter/BindGpr slot, no-effect kind, shift amount, or immediate
+		// cycle delta.
 		u32 immediate = 0;
 		// Constants use the complete 64-bit payload. Address constants consume
 		// its low word.
@@ -263,6 +274,9 @@ namespace VitaEE::RegionIR
 		// PCSX2's Goemon TLB gamefix adds observable jump/JR behavior. Static
 		// jumps fail closed while it is active until that helper contract is IR.
 		bool goemon_tlb_hack = false;
+		// Vita's playable product fixes this false. CACHE is a no-op only under
+		// PCSX2's recompiler contract; cache-emulation validation must fail closed.
+		bool ee_cache_enabled = false;
 		u32 max_blocks = 8;
 		u32 max_source_instructions = 64;
 	};

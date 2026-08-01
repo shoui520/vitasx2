@@ -24,6 +24,12 @@ namespace VitaEE::RegionIR
 		constexpr u32 CYCLE_PARAMETER = 34;
 		constexpr u32 MEMORY_EFFECT_PARAMETER = 35;
 		constexpr u32 PARAMETER_COUNT = 36;
+		enum class NoEffectKind : u32
+		{
+			Sync,
+			Prefetch,
+			Cache,
+		};
 
 		constexpr u32 RS(u32 op) { return (op >> 21) & 0x1fu; }
 		constexpr u32 RT(u32 op) { return (op >> 16) & 0x1fu; }
@@ -126,6 +132,19 @@ namespace VitaEE::RegionIR
 				case 0x00: // SLL
 				case 0x02: // SRL
 				case 0x03: // SRA
+				case 0x04: // SLLV
+				case 0x06: // SRLV
+				case 0x07: // SRAV
+				case 0x0a: // MOVZ
+				case 0x0b: // MOVN
+				case 0x0f: // SYNC
+				case 0x10: // MFHI
+				case 0x11: // MTHI
+				case 0x12: // MFLO
+				case 0x13: // MTLO
+				case 0x14: // DSLLV
+				case 0x16: // DSRLV
+				case 0x17: // DSRAV
 				case 0x21: // ADDU
 				case 0x23: // SUBU
 				case 0x24: // AND
@@ -148,10 +167,70 @@ namespace VitaEE::RegionIR
 			}
 		}
 
-		bool CanLowerPureNonBranch(u32 op)
+		bool DecodeNoEffect(u32 op, const LiftOptions& options, NoEffectKind* kind)
+		{
+			NoEffectKind decoded{};
+			if ((op >> 26) == 0x00 && FUNCT(op) == 0x0f)
+				decoded = NoEffectKind::Sync;
+			else if ((op >> 26) == 0x33)
+				decoded = NoEffectKind::Prefetch;
+			else if ((op >> 26) == 0x2f && !options.ee_cache_enabled)
+				decoded = NoEffectKind::Cache;
+			else
+				return false;
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
+		bool IsVariableShift(u32 op)
+		{
+			if ((op >> 26) != 0x00)
+				return false;
+			switch (FUNCT(op))
+			{
+				case 0x04: // SLLV
+				case 0x06: // SRLV
+				case 0x07: // SRAV
+				case 0x14: // DSLLV
+				case 0x16: // DSRLV
+				case 0x17: // DSRAV
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		bool IsConditionalMove(u32 op)
+		{
+			return (op >> 26) == 0x00 &&
+			       (FUNCT(op) == 0x0a || FUNCT(op) == 0x0b);
+		}
+
+		bool IsMoveFromHiLo(u32 op)
+		{
+			return (op >> 26) == 0x00 &&
+			       (FUNCT(op) == 0x10 || FUNCT(op) == 0x12);
+		}
+
+		bool IsMoveToHiLo(u32 op)
+		{
+			return (op >> 26) == 0x00 &&
+			       (FUNCT(op) == 0x11 || FUNCT(op) == 0x13);
+		}
+
+		bool IsExtendedScalarGprWrite(u32 op)
+		{
+			return IsVariableShift(op) || IsConditionalMove(op) ||
+			       IsMoveFromHiLo(op);
+		}
+
+		bool CanLowerPureNonBranch(u32 op, const LiftOptions& options)
 		{
 			if (IsAnyControlFlow(op))
 				return false;
+			if (DecodeNoEffect(op, options, nullptr))
+				return true;
 
 			switch (op >> 26)
 			{
@@ -254,9 +333,10 @@ namespace VitaEE::RegionIR
 			       kind == MemoryAccessKind::Store128;
 		}
 
-		bool CanLowerNonBranch(u32 op)
+		bool CanLowerNonBranch(u32 op, const LiftOptions& options)
 		{
-			return CanLowerPureNonBranch(op) || DecodeMemoryAccess(op, nullptr);
+			return CanLowerPureNonBranch(op, options) ||
+			       DecodeMemoryAccess(op, nullptr);
 		}
 
 		bool IsExceptionCapableInstruction(u32 op)
@@ -484,12 +564,13 @@ namespace VitaEE::RegionIR
 					ContainsPc(source_base_pc, static_cast<u32>(source_words.size()), delay_pc))
 				{
 					const u32 delay = ReadSourceWord(source_base_pc, source_words, delay_pc);
-					if (!IsAnyControlFlow(delay) && CanLowerPureNonBranch(delay))
+					if (!IsAnyControlFlow(delay) &&
+						CanLowerPureNonBranch(delay, options))
 						return ExitReason::RegionBoundary;
 				}
 				return ExitReason::UnsupportedControlFlow;
 			}
-			if (CanLowerNonBranch(op))
+			if (CanLowerNonBranch(op, options))
 				return ExitReason::RegionBoundary;
 			return ClassifyExit(op);
 		}
@@ -603,7 +684,7 @@ namespace VitaEE::RegionIR
 					// A branch and its delay slot are one architectural unit. If the
 					// delay slot is not yet expressible, leave both to the existing
 					// compiler/interpreter at a canonical side exit.
-					if (!CanLowerPureNonBranch(delay))
+					if (!CanLowerPureNonBranch(delay, options))
 					{
 						raw.transfer_pc = pc;
 						// The existing provider must execute the branch and its
@@ -623,7 +704,7 @@ namespace VitaEE::RegionIR
 					break;
 				}
 
-				if (!CanLowerNonBranch(op))
+				if (!CanLowerNonBranch(op, options))
 				{
 					raw.transfer_pc = pc;
 					raw.transfer_reason = ClassifyExit(op);
@@ -710,6 +791,13 @@ namespace VitaEE::RegionIR
 					source_pc);
 			}
 
+			ValueId Ternary(Block& block, Opcode opcode, ValueType type, ValueId first,
+				ValueId second, ValueId third, u32 source_pc)
+			{
+				return AddNode(block, opcode, type, {first, second, third}, 3, 0, 0,
+					source_pc);
+			}
+
 			ValueId Constant32(Block& block, u32 value, u32 source_pc)
 			{
 				return AddNode(block, Opcode::ConstantI32, ValueType::I32, {}, 0, 0, value,
@@ -765,6 +853,24 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
+			bool WriteHiLoLow64(Block& block, StateMap* state, bool hi, ValueId low,
+				u32 source_pc)
+			{
+				ValueId& destination = hi ? state->hi : state->lo;
+				const ValueId complete = Binary(block, Opcode::ReplaceLow64,
+					ValueType::I128, destination, low, source_pc);
+				const Opcode bind = hi ? Opcode::BindHi : Opcode::BindLo;
+				if (complete == INVALID_VALUE ||
+					AddNode(block, bind, ValueType::Void,
+						{complete, INVALID_VALUE, INVALID_VALUE}, 1, 0, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				destination = complete;
+				return true;
+			}
+
 			bool LowerMemory(Block& block, StateMap* state, u32 op, u32 pc,
 				MemoryAccessKind kind)
 			{
@@ -814,6 +920,13 @@ namespace VitaEE::RegionIR
 
 			bool LowerNonBranch(Block& block, StateMap* state, u32 op, u32 pc)
 			{
+				NoEffectKind no_effect{};
+				if (DecodeNoEffect(op, m_program->options, &no_effect))
+				{
+					return AddNode(block, Opcode::NoEffect, ValueType::Void, {}, 0,
+						static_cast<u32>(no_effect), 0, pc) != INVALID_VALUE;
+				}
+
 				MemoryAccessKind memory_kind{};
 				if (DecodeMemoryAccess(op, &memory_kind))
 					return LowerMemory(block, state, op, pc, memory_kind);
@@ -843,6 +956,57 @@ namespace VitaEE::RegionIR
 								Unary(block, Opcode::SignExtend32To64, ValueType::I64, value, pc);
 							return WriteLow64(block, state, rd, value, pc);
 						}
+						case 0x04: // SLLV
+						case 0x06: // SRLV
+						case 0x07: // SRAV
+						case 0x14: // DSLLV
+						case 0x16: // DSRLV
+						case 0x17: // DSRAV
+						{
+							const bool doubleword = function >= 0x14;
+							value = doubleword ? Low64(block, *state, rt, pc) :
+								Low32(block, *state, rt, pc);
+							const ValueId shift = Low32(block, *state, rs, pc);
+							const Opcode shift_opcode =
+								function == 0x04 ? Opcode::ShiftLeft32Variable :
+								function == 0x06 ? Opcode::ShiftRightLogical32Variable :
+								function == 0x07 ? Opcode::ShiftRightArithmetic32Variable :
+								function == 0x14 ? Opcode::ShiftLeft64Variable :
+								function == 0x16 ? Opcode::ShiftRightLogical64Variable :
+								                   Opcode::ShiftRightArithmetic64Variable;
+							value = Binary(block, shift_opcode,
+								doubleword ? ValueType::I64 : ValueType::I32, value,
+								shift, pc);
+							if (!doubleword)
+								value = Unary(block, Opcode::SignExtend32To64,
+									ValueType::I64, value, pc);
+							return WriteLow64(block, state, rd, value, pc);
+						}
+						case 0x0a: // MOVZ
+						case 0x0b: // MOVN
+						{
+							const ValueId condition_value = Low64(block, *state, rt, pc);
+							const ValueId zero = Constant64(block, 0, pc);
+							const ValueId condition = Binary(block,
+								function == 0x0a ? Opcode::CompareEqual64 :
+								                   Opcode::CompareNotEqual64,
+								ValueType::I1, condition_value, zero, pc);
+							const ValueId source = Low64(block, *state, rs, pc);
+							const ValueId old = Low64(block, *state, rd, pc);
+							value = Ternary(block, Opcode::Select64, ValueType::I64,
+								condition, source, old, pc);
+							return WriteLow64(block, state, rd, value, pc);
+						}
+						case 0x10: // MFHI
+						case 0x12: // MFLO
+							value = Unary(block, Opcode::ExtractLow64, ValueType::I64,
+								function == 0x10 ? state->hi : state->lo, pc);
+							return WriteLow64(block, state, rd, value, pc);
+						case 0x11: // MTHI
+						case 0x13: // MTLO
+							value = Low64(block, *state, rs, pc);
+							return WriteHiLoLow64(block, state, function == 0x11,
+								value, pc);
 						case 0x21: // ADDU
 						case 0x23: // SUBU
 						{
@@ -1682,7 +1846,7 @@ namespace VitaEE::RegionIR
 					if (IsAnyControlFlow(source.opcode))
 						return Fail(VerifyFailure::ControlFlowMismatch, block_index, i,
 							"control flow appears outside the branch source slot");
-					if (!CanLowerNonBranch(source.opcode))
+					if (!CanLowerNonBranch(source.opcode, program.options))
 						return Fail(
 							VerifyFailure::SourceMismatch, block_index, i,
 							"source instruction is outside the represented semantic surface");
@@ -1752,6 +1916,10 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> memory_operation_count;
 			std::map<u32, u32> memory_value_count;
 			std::map<u32, u32> memory_bind_count;
+			std::map<u32, u32> no_effect_count;
+			std::map<u32, u32> extended_gpr_bind_count;
+			std::map<u32, u32> hi_bind_count;
+			std::map<u32, u32> lo_bind_count;
 			auto source_opcode_at = [&](u32 pc, u32* opcode) {
 				const auto found = std::find_if(block.source.begin(), block.source.end(),
 					[pc](const SourceInstruction& source) { return source.pc == pc; });
@@ -1759,6 +1927,122 @@ namespace VitaEE::RegionIR
 					return false;
 				*opcode = found->opcode;
 				return true;
+			};
+			auto local_node = [&](ValueId value) -> const Node* {
+				if (value >= program.value_count ||
+					defining_block[value] != block_index ||
+					defining_node[value] >= block.nodes.size())
+				{
+					return nullptr;
+				}
+				return &block.nodes[defining_node[value]];
+			};
+			auto exact_unary = [&](ValueId value, Opcode opcode, ValueId operand,
+				u32 source_pc) {
+				const Node* node = local_node(value);
+				return node && node->opcode == opcode && node->operand_count == 1 &&
+				       node->operands[0] == operand && node->source_pc == source_pc;
+			};
+			auto exact_constant64 = [&](ValueId value, u64 literal, u32 source_pc) {
+				const Node* node = local_node(value);
+				return node && node->opcode == Opcode::ConstantI64 &&
+				       node->operand_count == 0 && node->literal == literal &&
+				       node->source_pc == source_pc;
+			};
+			auto exact_extended_gpr_bind = [&](const Node& bind, u32 source_opcode,
+				const StateMap& input) {
+				const u32 destination = RD(source_opcode);
+				if (destination == 0 || bind.immediate != destination)
+					return false;
+				const Node* replace = local_node(bind.operands[0]);
+				if (!replace || replace->opcode != Opcode::ReplaceLow64 ||
+					replace->operand_count != 2 ||
+					replace->operands[0] != input.gpr[destination] ||
+					replace->source_pc != bind.source_pc)
+				{
+					return false;
+				}
+
+				ValueId low = replace->operands[1];
+				if (IsVariableShift(source_opcode))
+				{
+					const u32 function = FUNCT(source_opcode);
+					const bool doubleword = function >= 0x14;
+					if (!doubleword)
+					{
+						const Node* sign_extend = local_node(low);
+						if (!sign_extend ||
+							sign_extend->opcode != Opcode::SignExtend32To64 ||
+							sign_extend->operand_count != 1 ||
+							sign_extend->source_pc != bind.source_pc)
+						{
+							return false;
+						}
+						low = sign_extend->operands[0];
+					}
+					const Node* shift = local_node(low);
+					const Opcode expected_shift =
+						function == 0x04 ? Opcode::ShiftLeft32Variable :
+						function == 0x06 ? Opcode::ShiftRightLogical32Variable :
+						function == 0x07 ? Opcode::ShiftRightArithmetic32Variable :
+						function == 0x14 ? Opcode::ShiftLeft64Variable :
+						function == 0x16 ? Opcode::ShiftRightLogical64Variable :
+						                   Opcode::ShiftRightArithmetic64Variable;
+					if (!shift || shift->opcode != expected_shift ||
+						shift->operand_count != 2 || shift->source_pc != bind.source_pc)
+					{
+						return false;
+					}
+					return exact_unary(shift->operands[0],
+						doubleword ? Opcode::ExtractLow64 : Opcode::ExtractLow32,
+						input.gpr[RT(source_opcode)], bind.source_pc) &&
+					       exact_unary(shift->operands[1], Opcode::ExtractLow32,
+						input.gpr[RS(source_opcode)], bind.source_pc);
+				}
+
+				if (IsConditionalMove(source_opcode))
+				{
+					const Node* select = local_node(low);
+					if (!select || select->opcode != Opcode::Select64 ||
+						select->operand_count != 3 || select->source_pc != bind.source_pc)
+					{
+						return false;
+					}
+					const Node* condition = local_node(select->operands[0]);
+					const Opcode expected_compare = FUNCT(source_opcode) == 0x0a ?
+						Opcode::CompareEqual64 : Opcode::CompareNotEqual64;
+					return condition && condition->opcode == expected_compare &&
+					       condition->operand_count == 2 &&
+					       condition->source_pc == bind.source_pc &&
+					       exact_unary(condition->operands[0], Opcode::ExtractLow64,
+						input.gpr[RT(source_opcode)], bind.source_pc) &&
+					       exact_constant64(condition->operands[1], 0, bind.source_pc) &&
+					       exact_unary(select->operands[1], Opcode::ExtractLow64,
+						input.gpr[RS(source_opcode)], bind.source_pc) &&
+					       exact_unary(select->operands[2], Opcode::ExtractLow64,
+						input.gpr[destination], bind.source_pc);
+				}
+
+				if (IsMoveFromHiLo(source_opcode))
+				{
+					return exact_unary(low, Opcode::ExtractLow64,
+						FUNCT(source_opcode) == 0x10 ? input.hi : input.lo,
+						bind.source_pc);
+				}
+				return false;
+			};
+			auto exact_move_to_hilo = [&](const Node& bind, u32 source_opcode,
+				const StateMap& input, bool hi) {
+				const Node* replace = local_node(bind.operands[0]);
+				const ValueId destination = hi ? input.hi : input.lo;
+				return IsMoveToHiLo(source_opcode) &&
+				       (FUNCT(source_opcode) == 0x11) == hi && replace &&
+				       replace->opcode == Opcode::ReplaceLow64 &&
+				       replace->operand_count == 2 &&
+				       replace->operands[0] == destination &&
+				       replace->source_pc == bind.source_pc &&
+				       exact_unary(replace->operands[1], Opcode::ExtractLow64,
+						input.gpr[RS(source_opcode)], bind.source_pc);
 			};
 			auto require_operand = [&](const Node& node, u32 node_index, u32 operand,
 									   ValueType required) -> VerifyResult {
@@ -1828,6 +2112,25 @@ namespace VitaEE::RegionIR
 								"constant has the wrong arity, type, immediate, or width");
 						break;
 					}
+					case Opcode::NoEffect:
+					{
+						u32 source_opcode = 0;
+						NoEffectKind expected_kind{};
+						if (node.operand_count != 0 || node.type != ValueType::Void ||
+							node.literal != 0 ||
+							!source_opcode_at(node.source_pc, &source_opcode) ||
+							!DecodeNoEffect(source_opcode, program.options,
+								&expected_kind) ||
+							node.immediate != static_cast<u32>(expected_kind))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"no-effect node does not match SYNC/PREF/CACHE source");
+							break;
+						}
+						no_effect_count[node.source_pc]++;
+						break;
+					}
 					case Opcode::ExtractLow32:
 						checked = unary(ValueType::I128, ValueType::I32);
 						break;
@@ -1881,6 +2184,32 @@ namespace VitaEE::RegionIR
 						if (checked && node.immediate >= 64)
 							checked = Fail(VerifyFailure::OperandOutOfRange, block_index,
 								node_index, "I64 shift amount is out of range");
+						break;
+					case Opcode::ShiftLeft32Variable:
+					case Opcode::ShiftRightLogical32Variable:
+					case Opcode::ShiftRightArithmetic32Variable:
+						checked = binary(ValueType::I32, ValueType::I32,
+							ValueType::I32);
+						break;
+					case Opcode::ShiftLeft64Variable:
+					case Opcode::ShiftRightLogical64Variable:
+					case Opcode::ShiftRightArithmetic64Variable:
+						checked = binary(ValueType::I64, ValueType::I32,
+							ValueType::I64);
+						break;
+					case Opcode::Select64:
+						if (node.operand_count != 3 || node.type != ValueType::I64)
+						{
+							checked = Fail(VerifyFailure::ResultType, block_index,
+								node_index,
+								"I64 select has the wrong arity or result type");
+							break;
+						}
+						checked = require_operand(node, node_index, 0, ValueType::I1);
+						if (checked)
+							checked = require_operand(node, node_index, 1, ValueType::I64);
+						if (checked)
+							checked = require_operand(node, node_index, 2, ValueType::I64);
 						break;
 					case Opcode::CompareEqual64:
 					case Opcode::CompareNotEqual64:
@@ -2004,6 +2333,36 @@ namespace VitaEE::RegionIR
 									"invalid slot");
 						if (checked)
 						{
+							u32 source_opcode = 0;
+							NoEffectKind no_effect_kind{};
+							if (!source_opcode_at(node.source_pc, &source_opcode))
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"GPR binding has no owning source instruction");
+								break;
+							}
+							if (IsExtendedScalarGprWrite(source_opcode))
+							{
+								if (!exact_extended_gpr_bind(node, source_opcode,
+										expected))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"extended scalar GPR binding does not match source");
+									break;
+								}
+								extended_gpr_bind_count[node.source_pc]++;
+							}
+							else if (IsMoveToHiLo(source_opcode) ||
+								DecodeNoEffect(source_opcode, program.options,
+									&no_effect_kind))
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"source instruction cannot bind a GPR");
+								break;
+							}
 							const Node& value =
 								block.nodes[defining_node[node.operands[0]]];
 							if (has_delayed_control &&
@@ -2059,12 +2418,36 @@ namespace VitaEE::RegionIR
 					case Opcode::BindHi:
 						checked = unary(ValueType::I128, ValueType::Void);
 						if (checked)
+						{
+							u32 source_opcode = 0;
+							if (!source_opcode_at(node.source_pc, &source_opcode) ||
+								!exact_move_to_hilo(node, source_opcode, expected, true))
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"HI binding does not match decoded MTHI");
+								break;
+							}
+							hi_bind_count[node.source_pc]++;
 							expected.hi = node.operands[0];
+						}
 						break;
 					case Opcode::BindLo:
 						checked = unary(ValueType::I128, ValueType::Void);
 						if (checked)
+						{
+							u32 source_opcode = 0;
+							if (!source_opcode_at(node.source_pc, &source_opcode) ||
+								!exact_move_to_hilo(node, source_opcode, expected, false))
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"LO binding does not match decoded MTLO");
+								break;
+							}
+							lo_bind_count[node.source_pc]++;
 							expected.lo = node.operands[0];
+						}
 						break;
 					case Opcode::AdvanceCycles:
 					{
@@ -2111,6 +2494,42 @@ namespace VitaEE::RegionIR
 			}
 			for (const SourceInstruction& source : block.source)
 			{
+				NoEffectKind no_effect_kind{};
+				if (DecodeNoEffect(source.opcode, program.options, &no_effect_kind))
+				{
+					if (no_effect_count[source.pc] != 1 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"no-effect source lacks one exact witness or changes state");
+					}
+				}
+				else if (IsExtendedScalarGprWrite(source.opcode))
+				{
+					const u32 expected_binds = RD(source.opcode) == 0 ? 0u : 1u;
+					if (extended_gpr_bind_count[source.pc] != expected_binds ||
+						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"extended scalar source has the wrong architectural binding");
+					}
+				}
+				else if (IsMoveToHiLo(source.opcode))
+				{
+					const bool hi = FUNCT(source.opcode) == 0x11;
+					if (hi_bind_count[source.pc] != (hi ? 1u : 0u) ||
+						lo_bind_count[source.pc] != (hi ? 0u : 1u) ||
+						extended_gpr_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"MTHI/MTLO source has the wrong architectural binding");
+					}
+				}
+
 				MemoryAccessKind kind{};
 				if (!DecodeMemoryAccess(source.opcode, &kind))
 					continue;
@@ -2545,6 +2964,8 @@ namespace VitaEE::RegionIR
 					node.operand_count > 0 ? values[node.operands[0]].bits.lo : 0;
 				const u64 right =
 					node.operand_count > 1 ? values[node.operands[1]].bits.lo : 0;
+				const u64 third =
+					node.operand_count > 2 ? values[node.operands[2]].bits.lo : 0;
 				u128 bits{};
 				switch (node.opcode)
 				{
@@ -2554,6 +2975,8 @@ namespace VitaEE::RegionIR
 					case Opcode::ConstantI64:
 					case Opcode::ConstantAddress:
 						bits = Bits(node.literal);
+						break;
+					case Opcode::NoEffect:
 						break;
 					case Opcode::ExtractLow32:
 						bits = Bits(static_cast<u32>(left));
@@ -2615,6 +3038,29 @@ namespace VitaEE::RegionIR
 					case Opcode::ShiftRightArithmetic64:
 						bits = Bits(
 							std::bit_cast<u64>(std::bit_cast<s64>(left) >> node.immediate));
+						break;
+					case Opcode::ShiftLeft32Variable:
+						bits = Bits(static_cast<u32>(left) << (static_cast<u32>(right) & 31u));
+						break;
+					case Opcode::ShiftRightLogical32Variable:
+						bits = Bits(static_cast<u32>(left) >> (static_cast<u32>(right) & 31u));
+						break;
+					case Opcode::ShiftRightArithmetic32Variable:
+						bits = Bits(static_cast<u32>(std::bit_cast<s32>(
+							static_cast<u32>(left)) >> (static_cast<u32>(right) & 31u)));
+						break;
+					case Opcode::ShiftLeft64Variable:
+						bits = Bits(left << (static_cast<u32>(right) & 63u));
+						break;
+					case Opcode::ShiftRightLogical64Variable:
+						bits = Bits(left >> (static_cast<u32>(right) & 63u));
+						break;
+					case Opcode::ShiftRightArithmetic64Variable:
+						bits = Bits(std::bit_cast<u64>(std::bit_cast<s64>(left) >>
+							(static_cast<u32>(right) & 63u)));
+						break;
+					case Opcode::Select64:
+						bits = Bits(left != 0 ? right : third);
 						break;
 					case Opcode::CompareEqual64:
 						bits = Bits(left == right);
