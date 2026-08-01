@@ -81,6 +81,11 @@ namespace VitaEE::RegionIR
 		SignExtend32To64,
 		ZeroExtend32To64,
 		Add32,
+		// Signed ADD/ADDI overflow is an architectural condition, not host UB.
+		// The first admitted use is ADDI; keeping the predicate separate from
+		// the wrapping value lets a backend branch to an exact canonical exit
+		// before the result is bound.
+		SignedAddOverflow32,
 		Add64,
 		Sub32,
 		Sub64,
@@ -154,6 +159,10 @@ namespace VitaEE::RegionIR
 		BindVu0ViStatus,
 		BindFcr31,
 		BindAcc,
+		// Operand zero is an I1 condition. immediate indexes Block::guarded_exits;
+		// a true condition materializes that complete transfer before any later
+		// node from the owning source instruction can publish state.
+		ExitIfTrue,
 		AdvanceCycles,
 	};
 
@@ -347,6 +356,10 @@ namespace VitaEE::RegionIR
 		// excludes the annulled delay slot.
 		u32 not_taken_raw_cycle_cost = 0;
 		u32 not_taken_scaled_cycle_cost = 0;
+		// Conditional exceptional/observer exits are explicit executable IR
+		// nodes. Each ExitIfTrue owns exactly one entry here, and the verifier
+		// derives its complete state, resume PC, and cycle debt from source.
+		std::vector<Transfer> guarded_exits;
 		Terminator terminator{};
 	};
 

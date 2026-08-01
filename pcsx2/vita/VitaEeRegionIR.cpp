@@ -877,6 +877,15 @@ namespace VitaEE::RegionIR
 			       IsMoveFromHiLo(op) || IsMoveFromSa(op);
 		}
 
+		bool IsGuardedExceptionInstruction(u32 op)
+		{
+			// ADDI is the first exception-capable instruction represented inside a
+			// region. Its wrapping value and signed-overflow predicate are both IR;
+			// overflow transfers to the existing PCSX2 provider before ADDI (or,
+			// when it is a delay instruction, before the whole branch/delay pair).
+			return (op >> 26) == 0x08;
+		}
+
 		bool CanLowerPureNonBranch(u32 op, const LiftOptions& options)
 		{
 			if (IsAnyControlFlow(op))
@@ -890,6 +899,7 @@ namespace VitaEE::RegionIR
 					return CanLowerSpecial(op);
 				case 0x01:
 					return IsMoveToSa(op);
+				case 0x08: // ADDI, with an explicit guarded exceptional transfer.
 				case 0x09: // ADDIU
 				case 0x0a: // SLTI
 				case 0x0b: // SLTIU
@@ -1261,7 +1271,9 @@ namespace VitaEE::RegionIR
 				{
 					const u32 delay = ReadSourceWord(source_base_pc, source_words, delay_pc);
 					if (!IsAnyControlFlow(delay) &&
-						CanLowerPureNonBranch(delay, options))
+						CanLowerPureNonBranch(delay, options) &&
+						!(IsLikelyBranch(op) &&
+						  IsGuardedExceptionInstruction(delay)))
 						return ExitReason::RegionBoundary;
 				}
 				return ExitReason::UnsupportedControlFlow;
@@ -1378,9 +1390,10 @@ namespace VitaEE::RegionIR
 					}
 
 					// A branch and its delay slot are one architectural unit. If the
-					// delay slot is not yet expressible, leave both to the existing
-					// compiler/interpreter at a canonical side exit.
-					if (!CanLowerPureNonBranch(delay, options))
+					// delay is not expressible, or its guard would execute on an
+					// annulled likely edge, leave both to the existing provider.
+					if (!CanLowerPureNonBranch(delay, options) ||
+						(IsLikelyBranch(op) && IsGuardedExceptionInstruction(delay)))
 					{
 						raw.transfer_pc = pc;
 						// The existing provider must execute the branch and its
@@ -2021,7 +2034,9 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
-			bool LowerNonBranch(Block& block, StateMap* state, u32 op, u32 pc)
+			bool LowerNonBranch(Block& block, StateMap* state, u32 op, u32 pc,
+				const StateMap& exceptional_state, u32 exceptional_resume_pc,
+				u32 pending_raw_cycles)
 			{
 				NoEffectKind no_effect{};
 				if (DecodeNoEffect(op, m_program->options, &no_effect))
@@ -2317,6 +2332,26 @@ namespace VitaEE::RegionIR
 							value = Unary(block, Opcode::ShiftLeft32,
 								ValueType::I32, value, pc, 1);
 						return WriteSa(block, state, value, pc);
+					case 0x08: // ADDI
+						left = Low32(block, *state, rs, pc);
+						right = Constant32(block,
+							static_cast<u32>(static_cast<s32>(IMM_S(op))), pc);
+						value = Binary(block, Opcode::Add32, ValueType::I32, left,
+							right, pc);
+						{
+							const ValueId overflow = Binary(block,
+								Opcode::SignedAddOverflow32, ValueType::I1, left, right,
+								pc);
+							if (value == INVALID_VALUE || overflow == INVALID_VALUE ||
+								!AddGuardedExit(block, overflow, exceptional_state,
+									exceptional_resume_pc, pc, pending_raw_cycles))
+							{
+								return false;
+							}
+						}
+						value = Unary(block, Opcode::SignExtend32To64,
+							ValueType::I64, value, pc);
+						return WriteLow64(block, state, rt, value, pc);
 					case 0x09: // ADDIU
 						left = Low32(block, *state, rs, pc);
 						right =
@@ -2446,6 +2481,25 @@ namespace VitaEE::RegionIR
 				transfer.pending_raw_cycles = pending_raw_cycles;
 				transfer.event_horizon_check = false;
 				return transfer;
+			}
+
+			bool AddGuardedExit(Block& block, ValueId condition,
+				const StateMap& state, u32 resume_pc, u32 source_pc,
+				u32 pending_raw_cycles)
+			{
+				Transfer transfer = MakeDeferredObserverTransfer(block, state,
+					resume_pc, ExitReason::ExceptionObserver, source_pc,
+					pending_raw_cycles);
+				if (transfer.pc == INVALID_VALUE ||
+					block.guarded_exits.size() >= UINT32_MAX)
+				{
+					return false;
+				}
+				const u32 index = static_cast<u32>(block.guarded_exits.size());
+				block.guarded_exits.push_back(std::move(transfer));
+				return AddNode(block, Opcode::ExitIfTrue, ValueType::Void,
+					{condition, INVALID_VALUE, INVALID_VALUE}, 1, index, 0,
+					source_pc) != INVALID_VALUE;
 			}
 
 			u32 Finish() const { return m_next_value; }
@@ -2713,15 +2767,20 @@ namespace VitaEE::RegionIR
 			StateMap not_taken_state = state;
 			block.source = raw.body;
 
+			u32 body_raw_cycles = 0;
 			for (const SourceInstruction& instruction : raw.body)
 			{
+				const StateMap exceptional_state = state;
 				if (!builder.LowerNonBranch(block, &state, instruction.opcode,
-						instruction.pc))
+						instruction.pc, exceptional_state, instruction.pc,
+						body_raw_cycles))
 				{
 					result.failure = LiftFailure::InternalError;
 					result.failure_pc = instruction.pc;
 					return result;
 				}
+				body_raw_cycles += RawRecompilerCycles(instruction.opcode,
+					options.cycle_factor);
 			}
 
 			ValueId condition = INVALID_VALUE;
@@ -2735,6 +2794,7 @@ namespace VitaEE::RegionIR
 				conditional_branch && IsLikelyBranch(raw.branch_opcode);
 			const bool linked_control =
 				has_control && IsLinkedControl(raw.branch_opcode);
+			const StateMap pre_control_state = state;
 			if (has_control)
 			{
 				block.source.push_back({raw.branch_pc, raw.branch_opcode, false});
@@ -2785,7 +2845,8 @@ namespace VitaEE::RegionIR
 				}
 				not_taken_state = state;
 				if (!builder.LowerNonBranch(block, &state, raw.delay.opcode,
-						raw.delay.pc))
+						raw.delay.pc, pre_control_state, raw.branch_pc,
+						body_raw_cycles))
 				{
 					result.failure = LiftFailure::InternalError;
 					result.failure_pc = raw.branch_pc;
@@ -3098,9 +3159,11 @@ namespace VitaEE::RegionIR
 				block.terminator.kind == TerminatorKind::Jump ||
 				block.terminator.kind == TerminatorKind::RegisterJump;
 			u32 raw_cycles = 0;
+			std::map<u32, u32> raw_cycles_before_source;
 			for (u32 i = 0; i < block.source.size(); i++)
 			{
 				const SourceInstruction& source = block.source[i];
+				raw_cycles_before_source.emplace(source.pc, raw_cycles);
 				const bool is_control_instruction =
 					has_delayed_control && i + 2 == block.source.size();
 				if (!source_word_matches(source) ||
@@ -3210,6 +3273,12 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> memory_value_count;
 			std::map<u32, u32> memory_bind_count;
 			std::map<u32, u32> no_effect_count;
+			std::map<u32, StateMap> source_input_state;
+			std::map<u32, u32> addi_overflow_count;
+			std::map<u32, ValueId> addi_overflow_condition;
+			std::map<u32, u32> addi_guard_count;
+			std::map<u32, u32> addi_gpr_bind_count;
+			std::vector<bool> guarded_exit_seen(block.guarded_exits.size(), false);
 			std::map<u32, u32> extended_gpr_bind_count;
 			std::map<u32, u32> pure_mmi_gpr_bind_count;
 			std::map<u32, u32> pure_cop1_gpr_bind_count;
@@ -3528,6 +3597,45 @@ namespace VitaEE::RegionIR
 						Opcode::BitcastF32BitsToI32, input.fpr[FS(source_opcode)],
 						bind.source_pc);
 			};
+			auto exact_addi_gpr_bind = [&](const Node& bind, u32 source_opcode,
+				const StateMap& input) {
+				const u32 destination = RT(source_opcode);
+				if (!IsGuardedExceptionInstruction(source_opcode) || destination == 0 ||
+					bind.immediate != destination)
+				{
+					return false;
+				}
+				const Node* replace = local_node(bind.operands[0]);
+				if (!replace || replace->opcode != Opcode::ReplaceLow64 ||
+					replace->operand_count != 2 ||
+					replace->operands[0] != input.gpr[destination] ||
+					replace->source_pc != bind.source_pc)
+				{
+					return false;
+				}
+				const Node* sign_extend = local_node(replace->operands[1]);
+				if (!sign_extend || sign_extend->opcode != Opcode::SignExtend32To64 ||
+					sign_extend->operand_count != 1 ||
+					sign_extend->source_pc != bind.source_pc)
+				{
+					return false;
+				}
+				const Node* sum = local_node(sign_extend->operands[0]);
+				const auto condition = addi_overflow_condition.find(bind.source_pc);
+				const Node* overflow = condition == addi_overflow_condition.end() ?
+					nullptr : local_node(condition->second);
+				return sum && sum->opcode == Opcode::Add32 && sum->operand_count == 2 &&
+				       sum->source_pc == bind.source_pc && overflow &&
+				       overflow->opcode == Opcode::SignedAddOverflow32 &&
+				       overflow->operand_count == 2 &&
+				       overflow->operands[0] == sum->operands[0] &&
+				       overflow->operands[1] == sum->operands[1] &&
+				       exact_unary(sum->operands[0], Opcode::ExtractLow32,
+						input.gpr[RS(source_opcode)], bind.source_pc) &&
+				       exact_constant32(sum->operands[1],
+						static_cast<u32>(static_cast<s32>(IMM_S(source_opcode))),
+						bind.source_pc);
+			};
 			auto exact_pure_cop1_fpr_bind = [&](const Node& bind, u32 source_opcode,
 				const StateMap& input) {
 				PureCop1StateKind kind{};
@@ -3709,6 +3817,12 @@ namespace VitaEE::RegionIR
 				 node_index++)
 			{
 				const Node& node = block.nodes[node_index];
+				u32 owning_source_opcode = 0;
+				if (source_opcode_at(node.source_pc, &owning_source_opcode) &&
+					!source_input_state.contains(node.source_pc))
+				{
+					source_input_state.emplace(node.source_pc, expected);
+				}
 				if (!captured_control_input && has_delayed_control &&
 					node.source_pc == block.terminator.branch_pc)
 				{
@@ -3940,6 +4054,36 @@ namespace VitaEE::RegionIR
 					case Opcode::Xor32:
 						checked = binary(ValueType::I32, ValueType::I32, ValueType::I32);
 						break;
+					case Opcode::SignedAddOverflow32:
+					{
+						checked = binary(ValueType::I32, ValueType::I32, ValueType::I1);
+						u32 source_opcode = 0;
+						const auto source_state = source_input_state.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !IsGuardedExceptionInstruction(source_opcode) ||
+							 source_state == source_input_state.end() ||
+							 !exact_unary(node.operands[0], Opcode::ExtractLow32,
+								source_state->second.gpr[RS(source_opcode)], node.source_pc) ||
+							 !exact_constant32(node.operands[1],
+								static_cast<u32>(static_cast<s32>(IMM_S(source_opcode))),
+								node.source_pc)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"signed-overflow predicate does not match decoded ADDI operands");
+							break;
+						}
+						if (addi_overflow_count[node.source_pc]++ != 0)
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"ADDI owns more than one signed-overflow predicate");
+							break;
+						}
+						addi_overflow_condition[node.source_pc] = node.id;
+						break;
+					}
 					case Opcode::Add64:
 					case Opcode::Sub64:
 					case Opcode::And64:
@@ -4337,7 +4481,22 @@ namespace VitaEE::RegionIR
 							PureCop1StateKind pure_cop1_kind{};
 							const bool pure_cop1 =
 								DecodePureCop1State(source_opcode, &pure_cop1_kind);
-							if (IsExtendedScalarGprWrite(source_opcode))
+							if (IsGuardedExceptionInstruction(source_opcode))
+							{
+								const auto input =
+									source_input_state.find(node.source_pc);
+								if (input == source_input_state.end() ||
+									!exact_addi_gpr_bind(node, source_opcode,
+										input->second))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"ADDI GPR binding is not the guarded exact sum");
+									break;
+								}
+								addi_gpr_bind_count[node.source_pc]++;
+							}
+							else if (IsExtendedScalarGprWrite(source_opcode))
 							{
 								if (!exact_extended_gpr_bind(node, source_opcode,
 										expected))
@@ -4862,6 +5021,70 @@ namespace VitaEE::RegionIR
 							expected.acc = node.operands[0];
 						}
 						break;
+					case Opcode::ExitIfTrue:
+					{
+						checked = unary(ValueType::I1, ValueType::Void);
+						const auto condition =
+							addi_overflow_condition.find(node.source_pc);
+						const auto source = std::find_if(block.source.begin(),
+							block.source.end(), [&](const SourceInstruction& candidate) {
+								return candidate.pc == node.source_pc;
+							});
+						if (checked &&
+							(condition == addi_overflow_condition.end() ||
+							 condition->second != node.operands[0] ||
+							 source == block.source.end() ||
+							 !IsGuardedExceptionInstruction(source->opcode) ||
+							 node.immediate >= block.guarded_exits.size() ||
+							 guarded_exit_seen[node.immediate]))
+						{
+							checked = Fail(VerifyFailure::ExitContractMismatch,
+								block_index, node_index,
+								"conditional exit is not the unique guard for decoded ADDI");
+							break;
+						}
+
+						const bool delay_slot = source->delay_slot;
+						const auto input = source_input_state.find(node.source_pc);
+						if ((delay_slot && (!has_delayed_control ||
+								!captured_control_input || likely_branch)) ||
+							(!delay_slot && input == source_input_state.end()))
+						{
+							checked = Fail(VerifyFailure::ExitContractMismatch,
+								block_index, node_index,
+								"ADDI guard has no exact restartable source state");
+							break;
+						}
+						const StateMap& exceptional_state =
+							delay_slot ? control_input : input->second;
+						const u32 resume_pc = delay_slot ?
+							block.terminator.branch_pc : node.source_pc;
+						const auto prefix = raw_cycles_before_source.find(resume_pc);
+						const Transfer& transfer = block.guarded_exits[node.immediate];
+						const Node* transfer_pc = local_node(transfer.pc);
+						if (prefix == raw_cycles_before_source.end() ||
+							!StateMapsEqual(transfer.state, exceptional_state) ||
+							transfer.target_block != INVALID_BLOCK ||
+							transfer.external_reason != ExitReason::ExceptionObserver ||
+							!transfer.cycle_commit_deferred ||
+							transfer.pending_raw_cycles != prefix->second ||
+							transfer.event_horizon_check || !transfer_pc ||
+							transfer_pc->opcode != Opcode::ConstantAddress ||
+							transfer_pc->type != ValueType::Address ||
+							transfer_pc->operand_count != 0 ||
+							transfer_pc->source_pc != node.source_pc ||
+							static_cast<u32>(transfer_pc->literal) != resume_pc ||
+							defining_node[transfer.pc] >= node_index)
+						{
+							checked = Fail(VerifyFailure::ExitContractMismatch,
+								block_index, node_index,
+								"ADDI guard loses its pre-instruction/pair state, PC, or cycle debt");
+							break;
+						}
+						guarded_exit_seen[node.immediate] = true;
+						addi_guard_count[node.source_pc]++;
+						break;
+					}
 					case Opcode::AdvanceCycles:
 					{
 						checked = unary(ValueType::Cycle, ValueType::Cycle);
@@ -4905,12 +5128,39 @@ namespace VitaEE::RegionIR
 				if (!checked)
 					return checked;
 			}
+			if (std::find(guarded_exit_seen.begin(), guarded_exit_seen.end(), false) !=
+				guarded_exit_seen.end())
+			{
+				return Fail(VerifyFailure::ExitContractMismatch, block_index,
+					UINT32_MAX,
+					"guarded transfer has no unique executable condition node");
+			}
 			for (const SourceInstruction& source : block.source)
 			{
 				const Vu0BroadcastFmacOp vu0_fmac =
 					DecodeVu0BroadcastFmac(source.opcode);
 				NoEffectKind no_effect_kind{};
-				if (vu0_fmac.valid)
+				if (IsGuardedExceptionInstruction(source.opcode))
+				{
+					const u32 expected_gpr = RT(source.opcode) != 0 ? 1u : 0u;
+					if (addi_overflow_count[source.pc] != 1 ||
+						addi_guard_count[source.pc] != 1 ||
+						addi_gpr_bind_count[source.pc] != expected_gpr ||
+						memory_operation_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"ADDI lacks one exact overflow guard and normal result binding");
+					}
+				}
+				else if (vu0_fmac.valid)
 				{
 					const u32 mask = RS(source.opcode) & 0x0fu;
 					const bool vector_destination = vu0_fmac.kind ==
@@ -5713,6 +5963,14 @@ namespace VitaEE::RegionIR
 					case Opcode::Add32:
 						bits = Bits(static_cast<u32>(left) + static_cast<u32>(right));
 						break;
+					case Opcode::SignedAddOverflow32:
+					{
+						const u32 lhs = static_cast<u32>(left);
+						const u32 rhs = static_cast<u32>(right);
+						const u32 sum = lhs + rhs;
+						bits = Bits(((~(lhs ^ rhs) & (lhs ^ sum)) >> 31) & 1u);
+						break;
+					}
 					case Opcode::Add64:
 						bits = Bits(left + right);
 						break;
@@ -6055,6 +6313,27 @@ namespace VitaEE::RegionIR
 					case Opcode::BindAcc:
 						current.acc =
 							static_cast<u32>(values[node.operands[0]].bits.lo);
+						break;
+					case Opcode::ExitIfTrue:
+						if (left != 0)
+						{
+							const Transfer& transfer =
+								block.guarded_exits[node.immediate];
+							current = materialize(transfer);
+							for (const SourceInstruction& source : block.source)
+							{
+								if (source.pc == current.pc)
+									break;
+								result.source_instructions_executed++;
+							}
+							*output = current;
+							result.completed = true;
+							result.reason = transfer.external_reason;
+							result.cycle_commit_deferred =
+								transfer.cycle_commit_deferred;
+							result.pending_raw_cycles = transfer.pending_raw_cycles;
+							return result;
+						}
 						break;
 					case Opcode::AdvanceCycles:
 						bits = Bits(left + node.immediate);
