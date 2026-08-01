@@ -48,8 +48,10 @@ namespace VitaEE::RegionIR
 		Add64,
 		Sub32,
 		Sub64,
+		And32,
 		And64,
 		Or64,
+		Xor32,
 		Xor64,
 		Nor64,
 		ShiftLeft32,
@@ -81,6 +83,7 @@ namespace VitaEE::RegionIR
 		BindGpr,
 		BindHi,
 		BindLo,
+		BindSa,
 		AdvanceCycles,
 	};
 
@@ -108,6 +111,8 @@ namespace VitaEE::RegionIR
 		std::array<ValueId, 32> gpr{};
 		ValueId hi = INVALID_VALUE;
 		ValueId lo = INVALID_VALUE;
+		// Internal byte-offset representation of the EE funnel-shift amount.
+		ValueId sa = INVALID_VALUE;
 		ValueId cycle = INVALID_VALUE;
 		// Ordered, non-architectural memory state. It prevents loads and stores
 		// from being reordered across each other while remaining absent from the
@@ -355,6 +360,7 @@ namespace VitaEE::RegionIR
 		std::array<u128, 32> gpr{};
 		u128 hi{};
 		u128 lo{};
+		u32 sa = 0;
 		u32 pc = 0;
 		u64 cycle = 0;
 	};

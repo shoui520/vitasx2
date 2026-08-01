@@ -21,9 +21,10 @@ namespace VitaEE::RegionIR
 		constexpr u32 GPR_COUNT = 32;
 		constexpr u32 HI_PARAMETER = 32;
 		constexpr u32 LO_PARAMETER = 33;
-		constexpr u32 CYCLE_PARAMETER = 34;
-		constexpr u32 MEMORY_EFFECT_PARAMETER = 35;
-		constexpr u32 PARAMETER_COUNT = 36;
+		constexpr u32 SA_PARAMETER = 34;
+		constexpr u32 CYCLE_PARAMETER = 35;
+		constexpr u32 MEMORY_EFFECT_PARAMETER = 36;
+		constexpr u32 PARAMETER_COUNT = 37;
 		enum class NoEffectKind : u32
 		{
 			Sync,
@@ -151,6 +152,8 @@ namespace VitaEE::RegionIR
 				case 0x25: // OR
 				case 0x26: // XOR
 				case 0x27: // NOR
+				case 0x28: // MFSA
+				case 0x29: // MTSA
 				case 0x2a: // SLT
 				case 0x2b: // SLTU
 				case 0x2d: // DADDU
@@ -219,10 +222,23 @@ namespace VitaEE::RegionIR
 			       (FUNCT(op) == 0x11 || FUNCT(op) == 0x13);
 		}
 
+		bool IsMoveFromSa(u32 op)
+		{
+			return (op >> 26) == 0x00 && FUNCT(op) == 0x28;
+		}
+
+		bool IsMoveToSa(u32 op)
+		{
+			if ((op >> 26) == 0x00)
+				return FUNCT(op) == 0x29;
+			return (op >> 26) == 0x01 &&
+			       (RT(op) == 0x18 || RT(op) == 0x19);
+		}
+
 		bool IsExtendedScalarGprWrite(u32 op)
 		{
 			return IsVariableShift(op) || IsConditionalMove(op) ||
-			       IsMoveFromHiLo(op);
+			       IsMoveFromHiLo(op) || IsMoveFromSa(op);
 		}
 
 		bool CanLowerPureNonBranch(u32 op, const LiftOptions& options)
@@ -236,6 +252,8 @@ namespace VitaEE::RegionIR
 			{
 				case 0x00:
 					return CanLowerSpecial(op);
+				case 0x01:
+					return IsMoveToSa(op);
 				case 0x09: // ADDIU
 				case 0x0a: // SLTI
 				case 0x0b: // SLTIU
@@ -748,6 +766,8 @@ namespace VitaEE::RegionIR
 						{}, 0, HI_PARAMETER, 0, block.pc);
 					block.parameters.lo = AddNode(block, Opcode::Parameter, ValueType::I128,
 						{}, 0, LO_PARAMETER, 0, block.pc);
+					block.parameters.sa = AddNode(block, Opcode::Parameter, ValueType::I32,
+						{}, 0, SA_PARAMETER, 0, block.pc);
 					block.parameters.cycle =
 						AddNode(block, Opcode::Parameter, ValueType::Cycle, {}, 0,
 							CYCLE_PARAMETER, 0, block.pc);
@@ -756,6 +776,7 @@ namespace VitaEE::RegionIR
 							MEMORY_EFFECT_PARAMETER, 0, block.pc);
 					if (block.parameters.hi == INVALID_VALUE ||
 						block.parameters.lo == INVALID_VALUE ||
+						block.parameters.sa == INVALID_VALUE ||
 						block.parameters.cycle == INVALID_VALUE ||
 						block.parameters.memory_effect == INVALID_VALUE)
 					{
@@ -868,6 +889,19 @@ namespace VitaEE::RegionIR
 					return false;
 				}
 				destination = complete;
+				return true;
+			}
+
+			bool WriteSa(Block& block, StateMap* state, ValueId value, u32 source_pc)
+			{
+				if (value == INVALID_VALUE ||
+					AddNode(block, Opcode::BindSa, ValueType::Void,
+						{value, INVALID_VALUE, INVALID_VALUE}, 1, 0, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				state->sa = value;
 				return true;
 			}
 
@@ -1007,6 +1041,13 @@ namespace VitaEE::RegionIR
 							value = Low64(block, *state, rs, pc);
 							return WriteHiLoLow64(block, state, function == 0x11,
 								value, pc);
+						case 0x28: // MFSA
+							value = Unary(block, Opcode::ZeroExtend32To64,
+								ValueType::I64, state->sa, pc);
+							return WriteLow64(block, state, rd, value, pc);
+						case 0x29: // MTSA
+							value = Low32(block, *state, rs, pc);
+							return WriteSa(block, state, value, pc);
 						case 0x21: // ADDU
 						case 0x23: // SUBU
 						{
@@ -1077,6 +1118,19 @@ namespace VitaEE::RegionIR
 				ValueId value = INVALID_VALUE;
 				switch (primary)
 				{
+					case 0x01: // MTSAB / MTSAH
+						left = Low32(block, *state, rs, pc);
+						right = Constant32(block, RT(op) == 0x18 ? 0x0fu : 0x07u, pc);
+						value = Binary(block, Opcode::And32, ValueType::I32,
+							left, right, pc);
+						right = Constant32(block,
+							IMM_U(op) & (RT(op) == 0x18 ? 0x0fu : 0x07u), pc);
+						value = Binary(block, Opcode::Xor32, ValueType::I32,
+							value, right, pc);
+						if (RT(op) == 0x19)
+							value = Unary(block, Opcode::ShiftLeft32,
+								ValueType::I32, value, pc, 1);
+						return WriteSa(block, state, value, pc);
 					case 0x09: // ADDIU
 						left = Low32(block, *state, rs, pc);
 						right =
@@ -1224,7 +1278,7 @@ namespace VitaEE::RegionIR
 		bool StateMapsEqual(const StateMap& left, const StateMap& right)
 		{
 			return left.gpr == right.gpr && left.hi == right.hi && left.lo == right.lo &&
-			       left.cycle == right.cycle &&
+			       left.sa == right.sa && left.cycle == right.cycle &&
 			       left.memory_effect == right.memory_effect;
 		}
 
@@ -1774,10 +1828,10 @@ namespace VitaEE::RegionIR
 			for (u32 slot = 0; slot < PARAMETER_COUNT; slot++)
 			{
 				const Node& parameter = block.nodes[slot];
-				const ValueType expected_type = slot == CYCLE_PARAMETER ?
-				                                    ValueType::Cycle :
-				                                    (slot == MEMORY_EFFECT_PARAMETER ? ValueType::MemoryEffect :
-																					   ValueType::I128);
+				const ValueType expected_type = slot == SA_PARAMETER ? ValueType::I32 :
+					slot == CYCLE_PARAMETER ? ValueType::Cycle :
+					slot == MEMORY_EFFECT_PARAMETER ? ValueType::MemoryEffect :
+					                                    ValueType::I128;
 				if (parameter.opcode != Opcode::Parameter ||
 					parameter.type != expected_type || parameter.operand_count != 0 ||
 					parameter.immediate != slot)
@@ -1791,6 +1845,8 @@ namespace VitaEE::RegionIR
 					expected.hi = parameter.id;
 				else if (slot == LO_PARAMETER)
 					expected.lo = parameter.id;
+				else if (slot == SA_PARAMETER)
+					expected.sa = parameter.id;
 				else if (slot == CYCLE_PARAMETER)
 					expected.cycle = parameter.id;
 				else
@@ -1920,6 +1976,7 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> extended_gpr_bind_count;
 			std::map<u32, u32> hi_bind_count;
 			std::map<u32, u32> lo_bind_count;
+			std::map<u32, u32> sa_bind_count;
 			auto source_opcode_at = [&](u32 pc, u32* opcode) {
 				const auto found = std::find_if(block.source.begin(), block.source.end(),
 					[pc](const SourceInstruction& source) { return source.pc == pc; });
@@ -1946,6 +2003,12 @@ namespace VitaEE::RegionIR
 			auto exact_constant64 = [&](ValueId value, u64 literal, u32 source_pc) {
 				const Node* node = local_node(value);
 				return node && node->opcode == Opcode::ConstantI64 &&
+				       node->operand_count == 0 && node->literal == literal &&
+				       node->source_pc == source_pc;
+			};
+			auto exact_constant32 = [&](ValueId value, u32 literal, u32 source_pc) {
+				const Node* node = local_node(value);
+				return node && node->opcode == Opcode::ConstantI32 &&
 				       node->operand_count == 0 && node->literal == literal &&
 				       node->source_pc == source_pc;
 			};
@@ -2029,6 +2092,11 @@ namespace VitaEE::RegionIR
 						FUNCT(source_opcode) == 0x10 ? input.hi : input.lo,
 						bind.source_pc);
 				}
+				if (IsMoveFromSa(source_opcode))
+				{
+					return exact_unary(low, Opcode::ZeroExtend32To64, input.sa,
+						bind.source_pc);
+				}
 				return false;
 			};
 			auto exact_move_to_hilo = [&](const Node& bind, u32 source_opcode,
@@ -2043,6 +2111,46 @@ namespace VitaEE::RegionIR
 				       replace->source_pc == bind.source_pc &&
 				       exact_unary(replace->operands[1], Opcode::ExtractLow64,
 						input.gpr[RS(source_opcode)], bind.source_pc);
+			};
+			auto exact_move_to_sa = [&](const Node& bind, u32 source_opcode,
+				const StateMap& input) {
+				if (!IsMoveToSa(source_opcode))
+					return false;
+				if ((source_opcode >> 26) == 0x00)
+				{
+					return exact_unary(bind.operands[0], Opcode::ExtractLow32,
+						input.gpr[RS(source_opcode)], bind.source_pc);
+				}
+
+				ValueId value = bind.operands[0];
+				const bool halfword = RT(source_opcode) == 0x19;
+				if (halfword)
+				{
+					const Node* shift = local_node(value);
+					if (!shift || shift->opcode != Opcode::ShiftLeft32 ||
+						shift->operand_count != 1 || shift->immediate != 1 ||
+						shift->source_pc != bind.source_pc)
+					{
+						return false;
+					}
+					value = shift->operands[0];
+				}
+				const Node* xored = local_node(value);
+				if (!xored || xored->opcode != Opcode::Xor32 ||
+					xored->operand_count != 2 || xored->source_pc != bind.source_pc)
+				{
+					return false;
+				}
+				const Node* masked = local_node(xored->operands[0]);
+				const u32 mask = halfword ? 0x07u : 0x0fu;
+				return masked && masked->opcode == Opcode::And32 &&
+				       masked->operand_count == 2 &&
+				       masked->source_pc == bind.source_pc &&
+				       exact_unary(masked->operands[0], Opcode::ExtractLow32,
+						input.gpr[RS(source_opcode)], bind.source_pc) &&
+				       exact_constant32(masked->operands[1], mask, bind.source_pc) &&
+				       exact_constant32(xored->operands[1], IMM_U(source_opcode) & mask,
+						bind.source_pc);
 			};
 			auto require_operand = [&](const Node& node, u32 node_index, u32 operand,
 									   ValueType required) -> VerifyResult {
@@ -2159,6 +2267,8 @@ namespace VitaEE::RegionIR
 						break;
 					case Opcode::Add32:
 					case Opcode::Sub32:
+					case Opcode::And32:
+					case Opcode::Xor32:
 						checked = binary(ValueType::I32, ValueType::I32, ValueType::I32);
 						break;
 					case Opcode::Add64:
@@ -2355,6 +2465,7 @@ namespace VitaEE::RegionIR
 								extended_gpr_bind_count[node.source_pc]++;
 							}
 							else if (IsMoveToHiLo(source_opcode) ||
+								IsMoveToSa(source_opcode) ||
 								DecodeNoEffect(source_opcode, program.options,
 									&no_effect_kind))
 							{
@@ -2449,6 +2560,23 @@ namespace VitaEE::RegionIR
 							expected.lo = node.operands[0];
 						}
 						break;
+					case Opcode::BindSa:
+						checked = unary(ValueType::I32, ValueType::Void);
+						if (checked)
+						{
+							u32 source_opcode = 0;
+							if (!source_opcode_at(node.source_pc, &source_opcode) ||
+								!exact_move_to_sa(node, source_opcode, expected))
+							{
+								checked = Fail(VerifyFailure::SourceMismatch,
+									block_index, node_index,
+									"SA binding does not match decoded MTSA/MTSAB/MTSAH");
+								break;
+							}
+							sa_bind_count[node.source_pc]++;
+							expected.sa = node.operands[0];
+						}
+						break;
 					case Opcode::AdvanceCycles:
 					{
 						checked = unary(ValueType::Cycle, ValueType::Cycle);
@@ -2499,7 +2627,8 @@ namespace VitaEE::RegionIR
 				{
 					if (no_effect_count[source.pc] != 1 ||
 						extended_gpr_bind_count[source.pc] != 0 ||
-						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0)
+						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
@@ -2510,7 +2639,8 @@ namespace VitaEE::RegionIR
 				{
 					const u32 expected_binds = RD(source.opcode) == 0 ? 0u : 1u;
 					if (extended_gpr_bind_count[source.pc] != expected_binds ||
-						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0)
+						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
@@ -2522,11 +2652,23 @@ namespace VitaEE::RegionIR
 					const bool hi = FUNCT(source.opcode) == 0x11;
 					if (hi_bind_count[source.pc] != (hi ? 1u : 0u) ||
 						lo_bind_count[source.pc] != (hi ? 0u : 1u) ||
-						extended_gpr_bind_count[source.pc] != 0)
+						extended_gpr_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
 							"MTHI/MTLO source has the wrong architectural binding");
+					}
+				}
+				else if (IsMoveToSa(source.opcode))
+				{
+					if (sa_bind_count[source.pc] != 1 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"MTSA/MTSAB/MTSAH source has the wrong SA binding");
 					}
 				}
 
@@ -2906,6 +3048,7 @@ namespace VitaEE::RegionIR
 				values[block.parameters.gpr[gpr]] = {ValueType::I128, state.gpr[gpr]};
 			values[block.parameters.hi] = {ValueType::I128, state.hi};
 			values[block.parameters.lo] = {ValueType::I128, state.lo};
+			values[block.parameters.sa] = {ValueType::I32, Bits(state.sa)};
 			values[block.parameters.cycle] = {ValueType::Cycle, Bits(state.cycle)};
 			values[block.parameters.memory_effect] = memory_effect;
 		};
@@ -2916,6 +3059,7 @@ namespace VitaEE::RegionIR
 			state.gpr[0] = {};
 			state.hi = values[transfer.state.hi].bits;
 			state.lo = values[transfer.state.lo].bits;
+			state.sa = static_cast<u32>(values[transfer.state.sa].bits.lo);
 			state.cycle = values[transfer.state.cycle].bits.lo;
 			state.pc = static_cast<u32>(values[transfer.pc].bits.lo);
 			return state;
@@ -3007,11 +3151,17 @@ namespace VitaEE::RegionIR
 					case Opcode::Sub64:
 						bits = Bits(left - right);
 						break;
+					case Opcode::And32:
+						bits = Bits(static_cast<u32>(left) & static_cast<u32>(right));
+						break;
 					case Opcode::And64:
 						bits = Bits(left & right);
 						break;
 					case Opcode::Or64:
 						bits = Bits(left | right);
+						break;
+					case Opcode::Xor32:
+						bits = Bits(static_cast<u32>(left) ^ static_cast<u32>(right));
 						break;
 					case Opcode::Xor64:
 						bits = Bits(left ^ right);
@@ -3209,6 +3359,9 @@ namespace VitaEE::RegionIR
 						break;
 					case Opcode::BindLo:
 						current.lo = values[node.operands[0]].bits;
+						break;
+					case Opcode::BindSa:
+						current.sa = static_cast<u32>(values[node.operands[0]].bits.lo);
 						break;
 					case Opcode::AdvanceCycles:
 						bits = Bits(left + node.immediate);
