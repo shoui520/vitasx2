@@ -56,6 +56,21 @@ namespace VitaEE
 		BlockScanStop stop = BlockScanStop::UnsupportedOpcode;
 	};
 
+	// Immutable description of one already-generated PCSX2/Vita tier-zero
+	// source fragment. Region formation consumes this instead of reconstructing
+	// scheduler seams from raw opcodes: host code-budget splits and PCSX2 short
+	// concatenations are execution contracts, not ISA properties.
+	struct RegionSourceBlockContract
+	{
+		u32 start_pc = 0;
+		u32 instruction_count = 0;
+		u32 dependency_start_pc = 0;
+		u32 dependency_instruction_count = 0;
+		u32 charged_scaled_cycles_before = 0;
+		bool scheduler_test_at_end = true;
+		bool specialized_wait = false;
+	};
+
 	struct BlockExecutionResult
 	{
 		BlockExecutionPath path = BlockExecutionPath::Compiled;
@@ -178,6 +193,12 @@ namespace VitaEE
 		// target block executes, without disabling linking for the rest of boot.
 		static u32 CanonicalizeRamBackedPc(u32 pc);
 		bool SetPersistentDispatchBarrier(u32 pc, bool enabled);
+		// Read-only with respect to generated code: succeeds only for a live,
+		// PCSX2-discovered tier-zero block already present in this executor.
+		// The caller must retry at a later natural boundary when a CFG member has
+		// not executed yet; this method never compiles speculative blocks.
+		bool GetRegionSourceBlockContract(
+			u32 start_pc, RegionSourceBlockContract* contract);
 		// Reconcile the complete set of lifecycle owners as one unique union.
 		// Required barriers are installed before stale barriers are removed, so a
 		// failed code patch leaves dispatch conservatively on provider boundaries.

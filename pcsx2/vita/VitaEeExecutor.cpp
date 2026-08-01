@@ -1336,6 +1336,35 @@ namespace VitaEE
 			CanonicalizeRamBackedPc(pc), enabled);
 	}
 
+	bool BlockExecutor::GetRegionSourceBlockContract(
+		u32 start_pc, RegionSourceBlockContract* contract)
+	{
+		if (!contract || (start_pc & 3u) != 0)
+			return false;
+
+		CachedBlock* block = FindLookupBlockByStartPc(start_pc, true);
+		if (!block || !block->valid || !block->discovered_topology ||
+			!ValidateCachedBlock(*block, true))
+		{
+			return false;
+		}
+
+		contract->start_pc = block->start_pc;
+		contract->instruction_count = block->instruction_count;
+		contract->dependency_start_pc = block->dependency_start_pc;
+		contract->dependency_instruction_count =
+			block->dependency_instruction_count;
+		contract->charged_scaled_cycles_before =
+			block->dependency_charged_cycles_before;
+		contract->scheduler_test_at_end =
+			block->direct_continuation_kind ==
+			DirectContinuationKind::SchedulerTestedTail;
+		contract->specialized_wait =
+			block->poll_call_wait_loop_source_proof.valid ||
+			block->two_predicate_wait_loop_source_proof.valid;
+		return true;
+	}
+
 	bool BlockExecutor::SetCanonicalPersistentDispatchBarrier(
 		u32 canonical_pc, bool enabled)
 	{

@@ -175,6 +175,7 @@ add_library(pcsx2core STATIC
 	vita/VitaDisabledDevices.cpp
 	vita/VitaEeBlockCompiler.cpp
 	vita/VitaEeExecutor.cpp
+	vita/VitaEeRegionA32.cpp
 	vita/VitaEeRegionIR.cpp
 	vita/VitaEeRegionMemory.cpp
 	vita/VitaGpuVuProgram.cpp
