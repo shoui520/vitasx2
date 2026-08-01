@@ -508,6 +508,13 @@ namespace VitaEE::RegionIR
 			       FUNCT(op) == 0x24;
 		}
 
+		bool IsCop1ConvertSingle(u32 op)
+		{
+			// CVT.S.W uses the W format and reserves ft as zero.
+			return (op >> 26) == 0x11 && RS(op) == 0x14 && RT(op) == 0 &&
+			       FUNCT(op) == 0x20;
+		}
+
 		Opcode BasicCop1RawOpcode(BasicCop1ArithmeticKind kind)
 		{
 			switch (kind)
@@ -597,6 +604,15 @@ namespace VitaEE::RegionIR
 			return (raw & COP1_SIGN) != 0 ? 0u - magnitude : magnitude;
 		}
 
+		u32 ConvertCop1Single(u32 raw)
+		{
+			// PCSX2 FPU.cpp::CVT_S() interprets the source word as signed I32.
+			// The cast uses the active FPUFPCR (ChopZero by default), matching
+			// the Cortex-A9 VCVT lowering in VitaEeBlockCompiler.
+			const float converted = static_cast<float>(static_cast<s32>(raw));
+			return std::bit_cast<u32>(converted);
+		}
+
 		bool IsCop1ControlWrite(u32 op)
 		{
 			// CTC1 is defined only for FCR31. Reserved control registers remain
@@ -635,11 +651,11 @@ namespace VitaEE::RegionIR
 					return true;
 				case 0x1c: // Pure, non-multiplying MMI moves/logical/copies.
 					return DecodePureMmi(op, nullptr);
-				case 0x11: // Raw COP1 state plus exact S-format numerics.
+				case 0x11: // Raw COP1 state plus exact S/W-format numerics.
 					return DecodePureCop1State(op, nullptr) || IsCop1ControlWrite(op) ||
 					       DecodeBasicCop1Arithmetic(op, nullptr) ||
 					       DecodeCompoundCop1Arithmetic(op, nullptr) ||
-					       IsCop1ConvertWord(op);
+					       IsCop1ConvertWord(op) || IsCop1ConvertSingle(op);
 				default:
 					return false;
 			}
@@ -1576,11 +1592,19 @@ namespace VitaEE::RegionIR
 							return LowerCompoundCop1Arithmetic(block, state, op, pc,
 								compound);
 						}
-						if (!IsCop1ConvertWord(op))
-							return false;
-						return WriteFpr(block, state, FD(op),
-							Unary(block, Opcode::Cop1ConvertWord, ValueType::F32Bits,
-								state->fpr[FS(op)], pc), pc);
+						if (IsCop1ConvertWord(op))
+						{
+							return WriteFpr(block, state, FD(op),
+								Unary(block, Opcode::Cop1ConvertWord, ValueType::F32Bits,
+									state->fpr[FS(op)], pc), pc);
+						}
+						if (IsCop1ConvertSingle(op))
+						{
+							return WriteFpr(block, state, FD(op),
+								Unary(block, Opcode::Cop1ConvertSingle,
+									ValueType::F32Bits, state->fpr[FS(op)], pc), pc);
+						}
+						return false;
 					}
 					ValueId value = INVALID_VALUE;
 					switch (kind)
@@ -3251,6 +3275,20 @@ namespace VitaEE::RegionIR
 						}
 						break;
 					}
+					case Opcode::Cop1ConvertSingle:
+					{
+						checked = unary(ValueType::F32Bits, ValueType::F32Bits);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !IsCop1ConvertSingle(source_opcode)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 single conversion has no CVT.S.W source");
+						}
+						break;
+					}
 					case Opcode::SignExtend32To64:
 						checked = unary(ValueType::I32, ValueType::I64);
 						break;
@@ -3676,6 +3714,7 @@ namespace VitaEE::RegionIR
 							const bool compound_arithmetic =
 								DecodeCompoundCop1Arithmetic(source_opcode, nullptr);
 							const bool convert_word = IsCop1ConvertWord(source_opcode);
+							const bool convert_single = IsCop1ConvertSingle(source_opcode);
 							if (memory_load)
 							{
 								const Node* value = local_node(node.operands[0]);
@@ -3713,6 +3752,18 @@ namespace VitaEE::RegionIR
 									checked = Fail(VerifyFailure::SourceMismatch,
 										block_index, node_index,
 										"CVT.W.S result does not bind decoded fd");
+									break;
+								}
+							}
+							else if (convert_single)
+							{
+								if (node.immediate != FD(source_opcode) ||
+									!exact_unary(node.operands[0], Opcode::Cop1ConvertSingle,
+										expected.fpr[FS(source_opcode)], node.source_pc))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"CVT.S.W result does not bind decoded fd");
 									break;
 								}
 							}
@@ -3960,7 +4011,8 @@ namespace VitaEE::RegionIR
 							"MADD.S/MSUB.S lacks exact FPR and FCR31 bindings");
 					}
 				}
-				else if (IsCop1ConvertWord(source.opcode))
+				else if (IsCop1ConvertWord(source.opcode) ||
+					IsCop1ConvertSingle(source.opcode))
 				{
 					if (fpr_bind_count[source.pc] != 1 ||
 						fcr31_bind_count[source.pc] != 0 ||
@@ -3974,7 +4026,7 @@ namespace VitaEE::RegionIR
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
-							"CVT.W.S source lacks one exact raw-FPR binding");
+							"COP1 conversion source lacks one exact raw-FPR binding");
 					}
 				}
 				else
@@ -4534,6 +4586,9 @@ namespace VitaEE::RegionIR
 						break;
 					case Opcode::Cop1ConvertWord:
 						bits = Bits(ConvertCop1Word(static_cast<u32>(left)));
+						break;
+					case Opcode::Cop1ConvertSingle:
+						bits = Bits(ConvertCop1Single(static_cast<u32>(left)));
 						break;
 					case Opcode::SignExtend32To64:
 						bits = Bits(static_cast<u64>(

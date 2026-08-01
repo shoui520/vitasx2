@@ -63,6 +63,10 @@ namespace VitaEE::RegionIR
 		// SCE CVT.W.S writes the truncated/saturated signed word as raw FPR
 		// bits and leaves FCR31 untouched.
 		Cop1ConvertWord,
+		// SCE CVT.S.W interprets the raw source FPR word as signed I32 and
+		// writes its single-precision representation using the active EE FPU
+		// rounding mode without changing flags.
+		Cop1ConvertSingle,
 		SignExtend32To64,
 		ZeroExtend32To64,
 		Add32,
