@@ -10464,8 +10464,9 @@ bool GSDeviceGXM::Impl::InitializeGpuVuRetirements()
 	// No other VitaSX2 subsystem consumes notification words. Sony's
 	// precomputation and instancing samples allocate linearly from this region;
 	// reserve four vertex and four fragment words so a submitted value is never
-	// overwritten before its slot is explicitly reused. Universal-product
-	// validation owns the following two words. The next word is a Phyre-style
+	// overwritten before its slot is explicitly reused. When compiled,
+	// universal-product validation owns the following two words. The next word
+	// is a Phyre-style
 	// process-lifetime fragment progress notification: reusing one monotonically
 	// increasing address is safe because one immediate context submits fragment
 	// jobs in order, and it exposes fragment backlog without retaining another
@@ -10492,9 +10493,16 @@ bool GSDeviceGXM::Impl::InitializeGpuVuRetirements()
 		slot.private_store_outputs.clear();
 		slot.submitted = false;
 	}
+	constexpr u32 universal_product_notification_count =
+#if defined(VITASX2_GPU_VU_UNIVERSAL_VALIDATION) && \
+	VITASX2_GPU_VU_UNIVERSAL_VALIDATION
+		GPU_VU_UNIVERSAL_PRODUCT_SLOT_COUNT;
+#else
+		0u;
+#endif
 	constexpr u32 fragment_progress_notification_index =
 		2u * GPU_VU_RETIREMENT_SLOT_COUNT +
-		GPU_VU_UNIVERSAL_PRODUCT_SLOT_COUNT;
+		universal_product_notification_count;
 	// Sony's libGXM overview defines the notification region as 512 u32
 	// entries.  The VitaSDK compatibility headers used by this target expose
 	// sceGxmGetNotificationRegion() but omit SCE_GXM_NOTIFICATION_COUNT.
