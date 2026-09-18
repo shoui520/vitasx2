@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <utility>
 
@@ -261,6 +262,8 @@ namespace VitaGXM
 			if (!slab.block.IsMapped())
 				continue;
 			stats.mapped_capacity += slab.block.size;
+			stats.logical_capacity += slab.logical_size;
+			stats.fetch_guard_bytes += slab.block.size - slab.logical_size;
 			for (const auto& [offset, size] : slab.free_ranges)
 			{
 				(void)offset;
@@ -283,8 +286,17 @@ namespace VitaGXM
 		std::snprintf(block_name, sizeof(block_name), "%.22s-%u", m_name.c_str(),
 			static_cast<unsigned>(m_slabs.size()));
 
-		const std::size_t requested_size =
+		const std::size_t logical_request =
 			std::max(m_preferred_slab_size, minimum_size);
+		const std::size_t fetch_guard =
+			m_memory == ArenaMemory::MainNonCached ?
+				GpuMappedFetchGuardSize : 0;
+		if (logical_request >
+			std::numeric_limits<std::size_t>::max() - fetch_guard)
+		{
+			return SCE_GXM_ERROR_INVALID_VALUE;
+		}
+		const std::size_t requested_size = logical_request + fetch_guard;
 		const SceKernelMemBlockType block_type =
 			(m_memory == ArenaMemory::Cdram) ? SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW : SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_NC_RW;
 		const int result = AllocateMappedBlock(block_name, block_type, requested_size,
@@ -292,7 +304,19 @@ namespace VitaGXM
 		if (result < 0)
 			return result;
 
-		slab.free_ranges.emplace(0, slab.block.size);
+		if (slab.block.size < fetch_guard ||
+			slab.block.size - fetch_guard < minimum_size)
+		{
+			ReleaseMappedBlock(&slab.block);
+			return SCE_GXM_ERROR_OUT_OF_MEMORY;
+		}
+		slab.logical_size = slab.block.size - fetch_guard;
+		if (fetch_guard != 0)
+		{
+			std::memset(static_cast<std::uint8_t*>(slab.block.base) +
+				slab.logical_size, 0, fetch_guard);
+		}
+		slab.free_ranges.emplace(0, slab.logical_size);
 		m_slabs.emplace_back(std::move(slab));
 		*slab_index = static_cast<std::uint32_t>(m_slabs.size() - 1);
 		return 0;

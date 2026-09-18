@@ -1,0 +1,2704 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// Fixed serial GPU-VU1 feasibility executor. PCSX2's VU interpreter and
+// VitaVU::GpuPairPlan remain the semantic authorities. This validation shader
+// intentionally covers representative dependent FMAC, VI, LSU, and branch
+// families before product wiring; it is not ExactSupport and is compiled only
+// by VITASX2_GPU_VU_UNIVERSAL_VALIDATION.
+
+// The fixed sidecar leaves every family enabled. The asynchronous general
+// generated tier prepends exact-source family defines before compiling this
+// same semantic core, allowing ShaccCg to remove operation bodies absent from
+// an uploaded microprogram without changing admission semantics.
+#ifndef VITASX2_GPU_VU_COMPACT_CONTINUATION
+#define VITASX2_GPU_VU_COMPACT_CONTINUATION 0
+#endif
+#ifndef VITASX2_GPU_VU_INLINE_UNPACK
+#define VITASX2_GPU_VU_INLINE_UNPACK 0
+#endif
+#ifndef VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION
+#define VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION 0
+#endif
+#ifndef VITASX2_GPU_VU_DUAL_PRIVATE_GENERATION
+#define VITASX2_GPU_VU_DUAL_PRIVATE_GENERATION 0
+#endif
+
+#ifndef VITASX2_UNIVERSAL_PAIR_SLICE
+#define VITASX2_UNIVERSAL_PAIR_SLICE 128
+#endif
+
+#ifndef VITASX2_GPU_VU_UPPER_NOP
+#define VITASX2_GPU_VU_UPPER_NOP 1
+#define VITASX2_GPU_VU_UPPER_ABS 1
+#define VITASX2_GPU_VU_UPPER_FTOI 1
+#define VITASX2_GPU_VU_UPPER_ITOF 1
+#define VITASX2_GPU_VU_UPPER_FMAC 1
+#define VITASX2_GPU_VU_UPPER_CLIP 1
+#define VITASX2_GPU_VU_UPPER_OPMULA 1
+#define VITASX2_GPU_VU_UPPER_OPMSUB 1
+#define VITASX2_GPU_VU_LOWER_LQ 1
+#define VITASX2_GPU_VU_LOWER_SQ 1
+#define VITASX2_GPU_VU_LOWER_ILW 1
+#define VITASX2_GPU_VU_LOWER_ISW 1
+#define VITASX2_GPU_VU_LOWER_IADDI 1
+#define VITASX2_GPU_VU_LOWER_FSAND 1
+#define VITASX2_GPU_VU_LOWER_IALU 1
+#define VITASX2_GPU_VU_LOWER_MOVE 1
+#define VITASX2_GPU_VU_LOWER_MFIR 1
+#define VITASX2_GPU_VU_LOWER_MTIR 1
+#define VITASX2_GPU_VU_LOWER_BRANCH 1
+#define VITASX2_GPU_VU_LOWER_MFP 1
+#define VITASX2_GPU_VU_LOWER_WAIT 1
+#define VITASX2_GPU_VU_LOWER_XITOP 1
+#define VITASX2_GPU_VU_LOWER_XTOP 1
+#define VITASX2_GPU_VU_LOWER_FDIV 1
+#define VITASX2_GPU_VU_LOWER_XGKICK 1
+#define VITASX2_GPU_VU_LOWER_ESADD 1
+#define VITASX2_GPU_VU_LOWER_ERSADD 1
+#define VITASX2_GPU_VU_LOWER_ESQRT 1
+#endif
+
+#pragma readwrite_buffer BUFFER6
+#pragma readwrite_buffer BUFFER8
+#pragma readwrite_buffer BUFFER9
+#pragma readwrite_buffer BUFFER10
+#if VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION
+#pragma readwrite_buffer BUFFER1
+#pragma readwrite_buffer BUFFER2
+#pragma readwrite_buffer BUFFER3
+#else
+#pragma readwrite_buffer BUFFER11
+#pragma readwrite_buffer BUFFER12
+#pragma readwrite_buffer BUFFER13
+#endif
+
+// PCSX2 VUops.cpp::intToFloat<Offset>() converts a signed 32-bit lane with
+// round-to-nearest-even and then applies an exact binary scale. SGX floating
+// add/conversion does not provide that conversion contract for the complete
+// signed range, so construct the IEEE-754 result with integer operations.
+#if VITASX2_GPU_VU_UPPER_ITOF
+unsigned int VuSignedIntToFloatBits(
+	unsigned int sourceBits, unsigned int scaleShift)
+{
+	const unsigned int signLane = sourceBits >> 31u;
+	const unsigned int magnitude =
+		(sourceBits ^ (0u - signLane)) + signLane;
+	if (magnitude == 0u)
+		return 0u;
+
+	unsigned int exponent = 0u;
+	unsigned int leading = magnitude;
+	if (leading >= 0x10000u)
+	{
+		leading >>= 16u;
+		exponent += 16u;
+	}
+	if (leading >= 0x100u)
+	{
+		leading >>= 8u;
+		exponent += 8u;
+	}
+	if (leading >= 0x10u)
+	{
+		leading >>= 4u;
+		exponent += 4u;
+	}
+	if (leading >= 0x4u)
+	{
+		leading >>= 2u;
+		exponent += 2u;
+	}
+	if (leading >= 0x2u)
+		exponent += 1u;
+
+	unsigned int significand;
+	if (exponent <= 23u)
+	{
+		significand = magnitude << (23u - exponent);
+	}
+	else
+	{
+		const unsigned int discardedBits = exponent - 23u;
+		const unsigned int discardedMask =
+			(1u << discardedBits) - 1u;
+		const unsigned int remainder = magnitude & discardedMask;
+		const unsigned int halfway = 1u << (discardedBits - 1u);
+		significand = magnitude >> discardedBits;
+		if (remainder > halfway ||
+			(remainder == halfway && (significand & 1u) != 0u))
+		{
+			significand += 1u;
+			if (significand == 0x1000000u)
+			{
+				significand >>= 1u;
+				exponent += 1u;
+			}
+		}
+	}
+
+	return (signLane << 31u) |
+		((127u + exponent - scaleShift) << 23u) |
+		(significand & 0x7fffffu);
+}
+#endif
+
+// PCSX2 VUops.cpp::floatToInt<Offset>() first multiplies by the selected
+// binary fixed-point scale, saturates any result with magnitude >= 2^31
+// according to its sign bit, and otherwise truncates toward zero. Native SGX
+// float-to-int conversion is not used: its complete-range and NaN behavior is
+// not the PS2 contract. For normal inputs, the power-of-two scale changes only
+// the exponent; subnormal inputs remain below one even at FTOI15.
+#if VITASX2_GPU_VU_UPPER_FTOI
+unsigned int VuFloatToSignedIntBits(
+	unsigned int sourceBits, unsigned int scaleShift)
+{
+	const unsigned int signLane = sourceBits >> 31u;
+	const unsigned int exponentField = (sourceBits >> 23u) & 0xffu;
+	const unsigned int mantissa = sourceBits & 0x7fffffu;
+	if (exponentField == 0u)
+		return 0u;
+	if (exponentField == 0xffu)
+		return signLane != 0u ? 0x80000000u : 0x7fffffffu;
+
+	const int scaledExponent =
+		(int)exponentField - 127 + (int)scaleShift;
+	if (scaledExponent < 0)
+		return 0u;
+	if (scaledExponent >= 31)
+		return signLane != 0u ? 0x80000000u : 0x7fffffffu;
+
+	const unsigned int significand = 0x800000u | mantissa;
+	unsigned int magnitude;
+	if (scaledExponent >= 23)
+		magnitude = significand << (unsigned int)(scaledExponent - 23);
+	else
+		magnitude = significand >> (unsigned int)(23 - scaledExponent);
+	return signLane != 0u ? 0u - magnitude : magnitude;
+}
+#endif
+
+// PCSX2 owner: VUops.cpp::vuDouble().  The validation executor currently
+// admits only VitaSX2's standard VU1 numeric tier (nearest, DAZ/FZ, standard
+// overflow clamp), checked before the first command mutates state below.
+#if VITASX2_GPU_VU_UPPER_FMAC || VITASX2_GPU_VU_UPPER_OPMULA || \
+	VITASX2_GPU_VU_UPPER_OPMSUB || VITASX2_GPU_VU_LOWER_FDIV || \
+	VITASX2_GPU_VU_LOWER_ESADD || VITASX2_GPU_VU_LOWER_ERSADD || \
+	VITASX2_GPU_VU_LOWER_ESQRT
+unsigned int VuNormalizeOperandBits(unsigned int bits)
+{
+	const unsigned int exponent = bits & 0x7f800000u;
+	if (exponent == 0u)
+		return bits & 0x80000000u;
+	if (exponent == 0x7f800000u)
+		return (bits & 0x80000000u) | 0x7f7fffffu;
+	return bits;
+}
+
+unsigned int4 VuNormalizeOperandBits4(unsigned int4 bits)
+{
+	return unsigned int4(
+		VuNormalizeOperandBits(bits.x),
+		VuNormalizeOperandBits(bits.y),
+		VuNormalizeOperandBits(bits.z),
+		VuNormalizeOperandBits(bits.w));
+}
+#endif
+
+// PCSX2 owner: VUflags.cpp::VU_MAC_UPDATE().  MAC stores zero/sign/
+// underflow/overflow in four lane-shaped nibbles.  Result clamping and flag
+// publication are one operation; inactive ordinary FMAC lanes are cleared by
+// VuClearMacLane(), while OPMULA/OPMSUB deliberately preserve W.
+#if VITASX2_GPU_VU_UPPER_FMAC || VITASX2_GPU_VU_UPPER_OPMULA || \
+	VITASX2_GPU_VU_UPPER_OPMSUB
+unsigned int VuMacUpdate(
+	unsigned int bits, unsigned int laneShift, inout unsigned int macFlag)
+{
+	const unsigned int laneMask = 0x1111u << laneShift;
+	macFlag &= ~laneMask;
+	if ((bits & 0x80000000u) != 0u)
+		macFlag |= 0x0010u << laneShift;
+
+	const unsigned int magnitude = bits & 0x7fffffffu;
+	if (magnitude == 0u)
+	{
+		macFlag |= 0x0001u << laneShift;
+		return bits;
+	}
+
+	const unsigned int exponent = bits & 0x7f800000u;
+	if (exponent == 0u)
+	{
+		macFlag |= 0x0101u << laneShift;
+		return bits & 0x80000000u;
+	}
+	if (exponent == 0x7f800000u)
+	{
+		macFlag |= 0x1000u << laneShift;
+		return (bits & 0x80000000u) | 0x7f7fffffu;
+	}
+	return bits;
+}
+
+void VuClearMacLane(unsigned int laneShift, inout unsigned int macFlag)
+{
+	macFlag &= ~(0x1111u << laneShift);
+}
+
+unsigned int VuStatusFromMac(unsigned int macFlag)
+{
+	unsigned int status = 0u;
+	if ((macFlag & 0x000fu) != 0u) status |= 1u;
+	if ((macFlag & 0x00f0u) != 0u) status |= 2u;
+	if ((macFlag & 0x0f00u) != 0u) status |= 4u;
+	if ((macFlag & 0xf000u) != 0u) status |= 8u;
+	return status;
+}
+#endif
+
+// PCSX2 owner: VUops.cpp::_vuCLIP().  This is signed ordering of the raw
+// float words, not an SGX floating-point comparison.  The threshold sign is
+// ignored; exponent-zero values select the largest denormal, and the six-bit
+// result shifts through the architected 24-bit working history.
+#if VITASX2_GPU_VU_UPPER_CLIP
+unsigned int VuClipUpdate(
+	unsigned int4 sourceBits, unsigned int thresholdBits,
+	unsigned int clipFlag)
+{
+	const unsigned int threshold =
+		(thresholdBits & 0x7f800000u) != 0u ?
+		thresholdBits & 0x7fffffffu : 0x007fffffu;
+	unsigned int result = (clipFlag << 6u) & 0x00ffffffu;
+	const unsigned int3 magnitude = sourceBits.xyz & 0x7fffffffu;
+	const bool3 exceeds = magnitude > threshold.xxx;
+	const unsigned int3 weights =
+		unsigned int3(0x01u, 0x04u, 0x10u) << (sourceBits.xyz >> 31u);
+	const unsigned int3 selected = exceeds ? weights : 0u;
+	result |= selected.x | selected.y | selected.z;
+	return result;
+}
+#endif
+
+#if VITASX2_GPU_VU_UPPER_FMAC
+unsigned int VuMaxBits(unsigned int left, unsigned int right)
+{
+	const int signedLeft = (int)left;
+	const int signedRight = (int)right;
+	if (signedLeft < 0 && signedRight < 0)
+		return signedLeft < signedRight ? left : right;
+	return signedLeft < signedRight ? right : left;
+}
+
+unsigned int VuMinBits(unsigned int left, unsigned int right)
+{
+	const int signedLeft = (int)left;
+	const int signedRight = (int)right;
+	if (signedLeft < 0 && signedRight < 0)
+		return signedLeft < signedRight ? right : left;
+	return signedLeft < signedRight ? left : right;
+}
+#endif
+
+bool VuWriterOverlaps(
+	unsigned int writer, unsigned int readRegister, unsigned int readMask)
+{
+	return (writer & 0xffu) != 0u && (writer & 0xffu) == readRegister &&
+		(((writer >> 8u) & 0xffu) & readMask) != 0u;
+}
+
+unsigned int VuMaxU(unsigned int left, unsigned int right)
+{
+	return left < right ? right : left;
+}
+
+unsigned int VuFmacDependencyReady(
+	unsigned int upperWriter, unsigned int lowerWriter,
+	unsigned int readyCycle, unsigned int read0, unsigned int read0Mask,
+	unsigned int read1, unsigned int read1Mask)
+{
+	const bool read0Blocked = read0 != 0u &&
+		(VuWriterOverlaps(upperWriter, read0, read0Mask) ||
+		 VuWriterOverlaps(lowerWriter, read0, read0Mask));
+	const bool read1Blocked = read1 != 0u &&
+		(VuWriterOverlaps(upperWriter, read1, read1Mask) ||
+		 VuWriterOverlaps(lowerWriter, read1, read1Mask));
+	return read0Blocked || read1Blocked ? readyCycle : 0u;
+}
+
+#if VITASX2_GPU_VU_LOWER_MTIR || VITASX2_GPU_VU_LOWER_FDIV || \
+	VITASX2_GPU_VU_LOWER_ESQRT
+unsigned int VuSelectLaneBits(unsigned int4 bits, unsigned int lane)
+{
+	if (lane == 0u) return bits.x;
+	if (lane == 1u) return bits.y;
+	if (lane == 2u) return bits.z;
+	return bits.w;
+}
+#endif
+
+#if VITASX2_GPU_VU_LOWER_FDIV
+float VuFloatFromBits(unsigned int bits)
+{
+	return bit_cast<float4>(unsigned int4(
+		VuNormalizeOperandBits(bits), 0u, 0u, 0u)).x;
+}
+
+unsigned int VuBitsFromFloat(float value)
+{
+	return VuNormalizeOperandBits(
+		bit_cast<unsigned int4>(float4(value, 0.0f, 0.0f, 0.0f)).x);
+}
+#endif
+
+#if VITASX2_GPU_VU_LOWER_ESADD || VITASX2_GPU_VU_LOWER_ERSADD || \
+	VITASX2_GPU_VU_LOWER_ESQRT
+float VuRawFloatFromBits(unsigned int bits)
+{
+	return bit_cast<float4>(unsigned int4(bits, 0u, 0u, 0u)).x;
+}
+
+unsigned int VuRawBitsFromFloat(float value)
+{
+	return bit_cast<unsigned int4>(float4(value, 0.0f, 0.0f, 0.0f)).x;
+}
+#endif
+
+// ARM ARM A8.6.371/A8.6.378 define the 8-bit VRECPE/VRSQRTE estimate
+// algorithms.  The fixed 640-word BUFFER7 table contains the exact eight-bit
+// estimate fields for reciprocal scaled inputs 256..511 followed by reciprocal-
+// square-root scaled inputs 128..511.  These helpers apply the same AArch32
+// non-fused VRECPS/VRSQRTS refinement sequence used by
+// VitaVU::ApproximateReciprocal()/ApproximateSqrt() on Cortex-A9.  Raw
+// float/integer crossings retain each architecturally rounded intermediate and
+// prevent the shader compiler from contracting the multiply/subtract steps.
+#if VITASX2_GPU_VU_LOWER_ERSADD
+unsigned int VuArmApproximateReciprocalBits(
+	unsigned int valueBits, unsigned int estimateField)
+{
+	const unsigned int signBits = valueBits & 0x80000000u;
+	const unsigned int exponent = (valueBits >> 23u) & 0xffu;
+	if (exponent == 0u)
+		return valueBits;
+	if (exponent == 0xffu || exponent >= 253u)
+		return signBits;
+
+	const unsigned int seedBits = signBits |
+		((253u - exponent) << 23u) | (estimateField << 15u);
+	const float value = VuRawFloatFromBits(valueBits);
+	const float seed = VuRawFloatFromBits(seedBits);
+	const float product = VuRawFloatFromBits(
+		VuRawBitsFromFloat(value * seed));
+	const float refinementStep = VuRawFloatFromBits(
+		VuRawBitsFromFloat(2.0f - product));
+	return VuRawBitsFromFloat(seed * refinementStep);
+}
+#endif
+
+#if VITASX2_GPU_VU_LOWER_ESQRT
+unsigned int VuArmApproximateSqrtBits(
+	unsigned int valueBits, unsigned int estimateField)
+{
+	const unsigned int exponent = (valueBits >> 23u) & 0xffu;
+	if ((valueBits & 0x7fffffffu) == 0u || exponent == 0xffu)
+		return valueBits;
+
+	const unsigned int seedBits =
+		(((380u - exponent) >> 1u) << 23u) |
+		(estimateField << 15u);
+	const float value = VuRawFloatFromBits(valueBits);
+	const float seed = VuRawFloatFromBits(seedBits);
+	const float seedSquare = VuRawFloatFromBits(
+		VuRawBitsFromFloat(seed * seed));
+	const float product = VuRawFloatFromBits(
+		VuRawBitsFromFloat(value * seedSquare));
+	const float difference = VuRawFloatFromBits(
+		VuRawBitsFromFloat(3.0f - product));
+	const float refinementStep = VuRawFloatFromBits(
+		VuRawBitsFromFloat(difference * 0.5f));
+	const float refined = VuRawFloatFromBits(
+		VuRawBitsFromFloat(seed * refinementStep));
+	return VuRawBitsFromFloat(value * refined);
+}
+#endif
+
+#if VITASX2_GPU_VU_LOWER_ESADD || VITASX2_GPU_VU_LOWER_ERSADD
+unsigned int VuEfuSumXyzSquaresBits(unsigned int4 sourceBits)
+{
+	const unsigned int4 normalized = VuNormalizeOperandBits4(sourceBits);
+	const float x = VuRawFloatFromBits(normalized.x);
+	const float y = VuRawFloatFromBits(normalized.y);
+	const float z = VuRawFloatFromBits(normalized.z);
+	const float xSquare = VuRawFloatFromBits(VuRawBitsFromFloat(x * x));
+	const float ySquare = VuRawFloatFromBits(VuRawBitsFromFloat(y * y));
+	const float zSquare = VuRawFloatFromBits(VuRawBitsFromFloat(z * z));
+	const float xy = VuRawFloatFromBits(
+		VuRawBitsFromFloat(xSquare + ySquare));
+	return VuRawBitsFromFloat(xy + zSquare);
+}
+#endif
+
+#if VITASX2_GPU_VU_LOWER_FDIV
+unsigned int VuAbsBits(unsigned int bits)
+{
+	return bits & 0x7fffffffu;
+}
+#endif
+
+unsigned int VuMergeFdivStatus(unsigned int statusFlag, unsigned int fdivStatus)
+{
+	return (statusFlag & 0x0fcfu) | (fdivStatus & 0x0c30u);
+}
+
+// UniversalPairMicroOp is eleven words. Keeping the source as a flat word
+// buffer prevents Cg structure padding from changing the 44-byte CPU format.
+// Words 3..10 are PCSX2 PairPlan dependency/pipeline metadata. The execution
+// body consumes them for FMAC/IALU stall timing and the VI branch-visibility
+// window. Delayed flag queues remain the next ExactSupport boundary. The
+// complete VU1 image is
+// 2048 records / 22528 words / 88 KiB.
+// Sony's api_libgxm/skinning_reuse export vertex program uses this same
+// writable uniform-parameter form. psp2cgc emits warning D6300 for the official
+// sample as well; changing these resources to `static` is incorrect because it
+// turns them into uninitialized per-instance temporary arrays.
+
+unsigned int4 VuReadJournaledMemory(
+	unsigned int address,
+	unsigned int4 memoryInput[1024],
+	unsigned int writeCount,
+	unsigned int writeAddress[128],
+	unsigned int4 writeValue[128])
+{
+	const unsigned int wrappedAddress = address & 0x3ffu;
+	unsigned int4 value = memoryInput[wrappedAddress];
+	// PCSX2's VU-memory owner requires the newest same-invocation store to
+	// forward. Search only the live journal and search it backwards so the
+	// first match is authoritative. The old fixed 128-iteration walk charged
+	// every LQ/ILW/XGKICK read for 128 comparisons even when writeCount was
+	// zero, which made memory-heavy universal programs pathologically slow.
+	#pragma loop (unroll: never)
+	for (unsigned int remaining = writeCount; remaining != 0u; remaining--)
+	{
+		const unsigned int index = remaining - 1u;
+		if (writeAddress[index] == wrappedAddress)
+		{
+			value = writeValue[index];
+			break;
+		}
+	}
+	return value;
+}
+
+unsigned int VuPayloadU8(unsigned int payloadWords[4096],
+	unsigned int byteAddress)
+{
+	return (payloadWords[byteAddress >> 2u] >>
+		((byteAddress & 3u) * 8u)) & 0xffu;
+}
+
+unsigned int VuPayloadU16(unsigned int payloadWords[4096],
+	unsigned int byteAddress)
+{
+	return VuPayloadU8(payloadWords, byteAddress) |
+		(VuPayloadU8(payloadWords, byteAddress + 1u) << 8u);
+}
+
+unsigned int VuPayloadU32(unsigned int payloadWords[4096],
+	unsigned int byteAddress)
+{
+	return VuPayloadU16(payloadWords, byteAddress) |
+		(VuPayloadU16(payloadWords, byteAddress + 2u) << 16u);
+}
+
+unsigned int VuSignExtend8(unsigned int value, bool unsignedData)
+{
+	return unsignedData ? value : ((value ^ 0x80u) - 0x80u);
+}
+
+unsigned int VuSignExtend16(unsigned int value, bool unsignedData)
+{
+	return unsignedData ? value : ((value ^ 0x8000u) - 0x8000u);
+}
+
+void main(
+	unsigned int aIndex : INDEX,
+	uniform unsigned int microWords[22528] : BUFFER0,
+	uniform float4 vfInput[33] : BUFFER1,
+	uniform unsigned int stateInput[112] : BUFFER2,
+	uniform unsigned int4 vuMemoryInput[1024] : BUFFER3,
+	uniform unsigned int epochWords[512] : BUFFER4,
+	uniform unsigned int vifPayloadWords[4096] : BUFFER5,
+	uniform unsigned int path1Words[16384] : BUFFER6,
+	uniform unsigned int armEstimateWords[640] : BUFFER7,
+	uniform unsigned int path1Page1Words[16384] : BUFFER8,
+	uniform unsigned int path1Page2Words[16384] : BUFFER9,
+	uniform unsigned int path1Page3Words[16384] : BUFFER10,
+	uniform float4 vfOutput[33] : BUFFER11,
+	uniform unsigned int stateOutput[112] : BUFFER12,
+	uniform unsigned int4 vuMemoryOutput[1024] : BUFFER13,
+	out float4 vPosition : POSITION,
+	out float vPointSize : PSIZE,
+	out float4 vResult : TEXCOORD0)
+{
+	vPointSize = 1.0f;
+	// The host may prequeue more watchdog-bounded jobs than the data-dependent
+	// path ultimately needs. Stage two keeps trailing jobs on the ordinary
+	// publication tail with execution disabled, preventing an early E-bit from
+	// restarting the epoch before the one terminal notification.
+	const unsigned int validBit = 1u << 14;
+	const unsigned int executeUpperBit = 1u << 15;
+	const unsigned int executeLowerBit = 1u << 16;
+	const unsigned int immediateLowerBit = 1u << 17;
+	const unsigned int eBit = 1u << 18;
+	const unsigned int dBit = 1u << 20;
+	const unsigned int tBit = 1u << 21;
+	const unsigned int lowerDiscardedBit = 1u << 23;
+	const unsigned int viBackupWriteBit = 1u << 31;
+
+	unsigned int pc = stateInput[0] & 0x3fffu;
+	const bool internalContinuation = stateInput[59] != 0u;
+	const unsigned int submissionPairLimit = stateInput[63] != 0u ?
+		stateInput[63] : 16384u;
+	// A dependency job never stores through its source bindings. The complete
+	// source generation is copied to a distinct output generation before sparse
+	// architectural writes are applied; only that output may feed a later job.
+	// A persistent dirty journal can reduce this copy after physical exactness is
+	// established without reintroducing writable-uniform alias dependence.
+#if VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION
+#define VU_PUBLISH_STATE(index, value) { stateInput[(index)] = (value); }
+#define VU_PUBLISH_VF(index, value) { vfInput[(index)] = (value); }
+#define VU_PUBLISH_MEMORY(index, value) { vuMemoryInput[(index)] = (value); }
+#else
+#define VU_PUBLISH_STATE(index, value) { stateOutput[(index)] = (value); }
+#define VU_PUBLISH_VF(index, value) { vfOutput[(index)] = (value); }
+#define VU_PUBLISH_MEMORY(index, value) { vuMemoryOutput[(index)] = (value); }
+#endif
+	unsigned int pairBudget = internalContinuation ? stateInput[61] : 0u;
+	unsigned int stopReason = stateInput[59] == 2u ? stateInput[2] : 0u;
+	unsigned int branch = stateInput[3];
+	unsigned int branchPc = stateInput[4] & 0x3fffu;
+	unsigned int delayBranchPc = stateInput[5] & 0x3fffu;
+	unsigned int takeDelayBranch = stateInput[6] & 1u;
+	unsigned int ebitCountdown = stateInput[7];
+	unsigned int executed = internalContinuation ? stateInput[27] : 0u;
+	const unsigned int submissionExecutedStart = executed;
+	unsigned int fbrst = internalContinuation ? stateInput[28] : 0u;
+	unsigned int pendingXgkick = stateInput[33] & 1u;
+	unsigned int pendingXgkickAddress = stateInput[34] & 0x3ff0u;
+	unsigned int path1PacketCount = path1Words[1];
+	unsigned int path1DataQwords = path1Words[2];
+	unsigned int path1Error = path1Words[3];
+	unsigned int macFlag = stateInput[42] & 0xffffu;
+	unsigned int statusFlag = stateInput[43] & 0x0fffu;
+	unsigned int clipFlag = stateInput[45] & 0x00ffffffu;
+	unsigned int vuCycle = stateInput[46];
+	const unsigned int configurationBits = stateInput[47];
+	const bool assumeScheduled = (configurationBits & 1u) != 0u;
+	const bool instantQp = (configurationBits & 2u) != 0u;
+	const bool approximateQ = (configurationBits & 0x1000u) != 0u;
+	const bool approximateP = (configurationBits & 0x2000u) != 0u;
+	unsigned int viBackupCycles = internalContinuation ? stateInput[64] : 0u;
+	unsigned int viBackupRegister = internalContinuation ? stateInput[65] : 0u;
+	unsigned int viBackupOldValue = internalContinuation ? stateInput[66] : 0u;
+	unsigned int qValue = stateInput[25];
+	unsigned int pValue = stateInput[26];
+	// PCSX2 VUops.cpp owns a four-entry FMAC dependency ring. The fixed
+	// executor needs only writer identity and readiness while its admitted
+	// lower subset has no architectural flag reader; working MAC/STATUS/CLIP
+	// stay local and are published after the terminal drain.
+	unsigned int4 fmacReady = internalContinuation ?
+		unsigned int4(stateInput[68], stateInput[69], stateInput[70],
+			stateInput[71]) : 0u;
+	unsigned int4 fmacUpperWriter = internalContinuation ?
+		unsigned int4(stateInput[72], stateInput[73], stateInput[74],
+			stateInput[75]) : 0u;
+	unsigned int4 fmacLowerWriter = internalContinuation ?
+		unsigned int4(stateInput[76], stateInput[77], stateInput[78],
+			stateInput[79]) : 0u;
+	unsigned int fmacCount = internalContinuation ? stateInput[67] : 0u;
+	unsigned int4 ialuReady = internalContinuation ?
+		unsigned int4(stateInput[81], stateInput[82], stateInput[83],
+			stateInput[84]) : 0u;
+	unsigned int4 ialuWriterMask = internalContinuation ?
+		unsigned int4(stateInput[85], stateInput[86], stateInput[87],
+			stateInput[88]) : 0u;
+	unsigned int ialuCount = internalContinuation ? stateInput[80] : 0u;
+	unsigned int fdivReady = internalContinuation ? stateInput[89] : 0u;
+	unsigned int fdivValue = internalContinuation ? stateInput[90] : 0u;
+	unsigned int fdivStatus = internalContinuation ? stateInput[91] : 0u;
+	unsigned int fdivEnabled = internalContinuation ? stateInput[92] : 0u;
+	unsigned int efuReady = internalContinuation ? stateInput[93] : 0u;
+	unsigned int efuValue = internalContinuation ? stateInput[94] : 0u;
+	unsigned int efuEnabled = internalContinuation ? stateInput[95] : 0u;
+	// SGX writable uniform buffers do not provide intra-invocation store-to-load
+	// forwarding. VF/VI/ACC remain local and VU memory uses a bounded local write
+	// journal. Product jobs publish that journal into their private backing for
+	// the next flushed invocation; the differential fixture can still request a
+	// distinct copied output generation.
+	float4 vf[33];
+	unsigned int vi[16];
+	unsigned int memoryWriteAddress[128];
+	unsigned int4 memoryWriteValue[128];
+	unsigned int memoryWriteCount = 0u;
+	#pragma loop (unroll: never)
+	for (unsigned int loadVf = 0u; loadVf < 33u; loadVf++)
+		vf[loadVf] = vfInput[loadVf];
+	#if !VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION
+		#pragma loop (unroll: never)
+		for (unsigned int copyMemory = 0u; copyMemory < 1024u; copyMemory++)
+			vuMemoryOutput[copyMemory] = vuMemoryInput[copyMemory];
+		#pragma loop (unroll: never)
+		for (unsigned int copyState = 0u; copyState < 112u; copyState++)
+			stateOutput[copyState] = stateInput[copyState];
+	#endif
+	#pragma loop (unroll: never)
+	for (unsigned int loadVi = 0u; loadVi < 16u; loadVi++)
+		vi[loadVi] = loadVi == 0u ? 0u : stateInput[8u + loadVi] & 0xffffu;
+	unsigned int iValue = stateInput[24];
+	unsigned int vifTop = stateInput[40] & 0xffffu;
+	unsigned int vifItop = stateInput[41] & 0xffffu;
+#if VITASX2_GPU_VU_INLINE_UNPACK
+	unsigned int4 vifRow = unsigned int4(stateInput[96], stateInput[97],
+		stateInput[98], stateInput[99]);
+	unsigned int4 vifColumn = unsigned int4(stateInput[100], stateInput[101],
+		stateInput[102], stateInput[103]);
+	unsigned int unpackVectorCursor = internalContinuation ? stateInput[104] : 0u;
+	unsigned int unpackSourceCursor = internalContinuation ? stateInput[105] : 0u;
+	unsigned int unpackDestinationCursor = internalContinuation ? stateInput[106] : 0u;
+	unsigned int unpackCycleCursor = internalContinuation ? stateInput[107] : 0u;
+	unsigned int unpackGeneratedCursor = internalContinuation ? stateInput[108] : 0u;
+	unsigned int unpackCommandMarker = internalContinuation ? stateInput[109] : 0u;
+#endif
+	unsigned int commandCount = stateInput[31];
+	unsigned int unpackVectorCount = stateInput[32];
+	// ACC is a true execution-local VU register.  Do not use BUFFER1 as an
+	// intra-invocation recurrence: SGX writable-buffer stores are output
+	// publication, not a guaranteed store-to-load forwarding mechanism.  Load
+	// ACC once, keep every dependent FMAC operation local, and publish once at
+	// the observation boundary below.
+	float4 accumulator = vfInput[32];
+	bool unpackPublished = false;
+	bool executeReady = internalContinuation && stateInput[62] != 0u &&
+		pairBudget != 0u;
+	bool epochEnded = stateInput[59] == 2u;
+	bool sawExecute = stateInput[62] != 0u;
+	unsigned int commandCursor = internalContinuation ? stateInput[60] : 0u;
+	const unsigned int epochCommandCount =
+		stateInput[29] < 64u ? stateInput[29] : 64u;
+	const unsigned int payloadBytes =
+		stateInput[30] < 16384u ? stateInput[30] : 16384u;
+	if (path1Words[0] != 1u || path1PacketCount > 256u ||
+		path1DataQwords > 16120u)
+	{
+		stopReason = 9u;
+		path1Error = 1u;
+	}
+	else if (path1Error != 0u)
+	{
+		// Dependency-ordered jobs share one private PATH1 generation. Preserve
+		// the first job's exact failure code so trailing prequeued jobs cannot
+		// collapse a malformed packet/capacity diagnosis into InvalidState.
+		stopReason = 9u;
+	}
+	// Numeric mode word: standard overflow clamp, nearest rounding, DAZ, FZ.
+	// Other modes are exact-support boundaries until separately compiled and
+	// differentially proven; reject them before the first VIF write.
+	// VitaGpuVuMicroProgram.h owns this flat configuration ABI. The fixed
+	// arithmetic below currently supports standard overflow clamping, nearest
+	// rounding, DAZ/FZ, both scheduling/QP visibility policies, exact Q, and
+	// ESADD (whose result is independent of the approximate-P option). Unknown
+	// bits or a different numeric contract reject before the first VIF write.
+	#pragma branch (flatten: never)
+	if (stateInput[44] != 0x000000c1u ||
+		(configurationBits & ~0x7fffu) != 0u ||
+		(configurationBits & 0x0ff0u) != 0x0c10u)
+		stopReason = 11u;
+
+	// UniversalEpochMicroOp is eight flat words. Consume an ordered sequence of
+	// UNPACK/Execute segments until the single terminal End record.  Each
+	// Execute drains its architectural E-bit boundary, then the next command
+	// resumes from the resulting TPC and persistent VU state without a CPU
+	// notification or state copy. Unsupported command forms fail before their
+	// first write. The CPU reference owns the full format and is
+	// differentially checked against PCSX2 before a form is added here.
+#if VITASX2_GPU_VU_COMPACT_CONTINUATION
+	// The first fixed job has already applied every UNPACK and entered the sole
+	// Execute command. This generated tier continues that private generation;
+	// it never reparses commands and is valid only for the scheduled product
+	// configuration proven by the host before compilation.
+	if (!internalContinuation || !assumeScheduled)
+		stopReason = 11u;
+	VU_PUBLISH_STATE(1u, pairBudget);
+	VU_PUBLISH_STATE(28u, fbrst);
+	{
+	{
+	{
+#else
+	#pragma loop (unroll: never)
+	for (unsigned int dispatchStep = 0u; dispatchStep < 64u; dispatchStep++)
+	{
+		#pragma branch (flatten: never)
+		if (!epochEnded && stopReason == 0u)
+		{
+			const bool resumesInternalExecution = executeReady;
+			#pragma branch (flatten: never)
+			if (!resumesInternalExecution)
+			{
+				executeReady = false;
+				pairBudget = 0u;
+			#pragma loop (unroll: never)
+			for (unsigned int commandScan = 0u; commandScan < 64u; commandScan++)
+			{
+			const unsigned int commandStep = commandCursor + commandScan;
+			#pragma branch (flatten: never)
+			if (commandStep < epochCommandCount && !epochEnded && !executeReady &&
+				stopReason == 0u)
+			{
+			const unsigned int commandBase = commandStep * 8u;
+			const unsigned int kind = epochWords[commandBase + 0u];
+			const unsigned int controlWord = epochWords[commandBase + 1u];
+			const unsigned int argument0 = epochWords[commandBase + 2u];
+			const unsigned int argument1 = epochWords[commandBase + 3u];
+			const unsigned int argument2 = epochWords[commandBase + 4u];
+			const unsigned int argument3 = epochWords[commandBase + 5u];
+			const unsigned int argument4 = epochWords[commandBase + 6u];
+			const unsigned int argument5 = epochWords[commandBase + 7u];
+			#pragma branch (flatten: never)
+			if (kind == 0u)
+			{
+				const bool cleanEnd = controlWord == 0u && argument0 == 0u &&
+					argument1 == 0u && argument2 == 0u && argument3 == 0u &&
+					argument4 == 0u && argument5 == 0u && sawExecute &&
+					commandStep + 1u == epochCommandCount;
+				if (!cleanEnd) stopReason = 8u;
+				epochEnded = true;
+				commandCursor = commandStep + 1u;
+			}
+#if VITASX2_GPU_VU_INLINE_UNPACK
+			else if (kind == 1u)
+			{
+				const unsigned int vifCommand = controlWord & 0xffu;
+				const unsigned int cycleCl = (controlWord >> 8) & 0xffu;
+				unsigned int cycleWl = (controlWord >> 16) & 0xffu;
+				if (cycleWl == 0u) cycleWl = 256u;
+				const unsigned int mode = (controlWord >> 24) & 3u;
+				const bool unsignedData = (controlWord & (1u << 26u)) != 0u;
+				const unsigned int startAlignment =
+					(controlWord >> 27u) & 7u;
+				const unsigned int payloadOffset = argument0;
+				const unsigned int sourceSize = argument1;
+				const unsigned int destinationQword = argument3 & 0xffffu;
+				const unsigned int vectorCount = argument3 >> 16;
+				const unsigned int format = vifCommand & 0x0fu;
+				unsigned int vectorBytes = 0u;
+				unsigned int readBytes = 0u;
+				if (format == 0x00u) vectorBytes = 4u;
+				else if (format == 0x01u) vectorBytes = 2u;
+				else if (format == 0x02u) vectorBytes = 1u;
+				else if (format == 0x04u) vectorBytes = 8u;
+				else if (format == 0x05u) vectorBytes = 4u;
+				else if (format == 0x06u) vectorBytes = 2u;
+				else if (format == 0x08u) vectorBytes = 12u;
+				else if (format == 0x09u) vectorBytes = 6u;
+				else if (format == 0x0au) vectorBytes = 3u;
+				else if (format == 0x0cu) vectorBytes = 16u;
+				else if (format == 0x0du) vectorBytes = 8u;
+				else if (format == 0x0eu) vectorBytes = 4u;
+				else if (format == 0x0fu) vectorBytes = 2u;
+				readBytes = vectorBytes;
+				if (format == 0x08u) readBytes = 16u;
+				else if (format == 0x09u) readBytes = 8u;
+				else if (format == 0x0au) readBytes = 4u;
+				unsigned int requiredBytes = 0u;
+				unsigned int requiredSourceOffset = 0u;
+				unsigned int requiredCycle = 0u;
+				const bool fillCycle = cycleCl < cycleWl;
+				#pragma loop (unroll: never)
+				for (unsigned int requiredIndex = 0u;
+					requiredIndex < 256u; requiredIndex++)
+				{
+					if (requiredIndex < vectorCount)
+					{
+						const unsigned int end = requiredSourceOffset + readBytes;
+						if (end > requiredBytes) requiredBytes = end;
+						requiredCycle++;
+						if (fillCycle)
+						{
+							if (requiredCycle <= cycleCl)
+								requiredSourceOffset += vectorBytes;
+							else if (requiredCycle == cycleWl)
+								requiredCycle = 0u;
+						}
+						else
+						{
+							requiredSourceOffset += vectorBytes;
+							if (requiredCycle >= cycleWl)
+								requiredCycle = 0u;
+						}
+					}
+				}
+				const bool payloadRange = payloadOffset <= payloadBytes &&
+					sourceSize <= payloadBytes - payloadOffset &&
+					requiredBytes <= sourceSize;
+				const bool resumesUnpack = unpackVectorCursor != 0u;
+				const unsigned int maximumCycle = cycleCl > cycleWl ?
+					cycleCl : cycleWl;
+				const bool continuationState = !resumesUnpack ||
+					(unpackCommandMarker == commandStep + 1u &&
+					 unpackVectorCursor < vectorCount &&
+					 unpackSourceCursor <= sourceSize &&
+					 unpackCycleCursor < maximumCycle);
+				const bool supported = (vifCommand & 0x80u) == 0u &&
+					(vifCommand & 0x60u) == 0x60u && vectorBytes != 0u &&
+					(controlWord & 0xc0000000u) == 0u &&
+					vectorCount != 0u &&
+					vectorCount <= 256u && destinationQword < 1024u &&
+					argument5 == 0u && payloadRange && continuationState;
+				if (!supported)
+				{
+					stopReason = 8u;
+				}
+				else
+				{
+					unsigned int sourceOffset = resumesUnpack ?
+						unpackSourceCursor : 0u;
+					unsigned int outputQword = resumesUnpack ?
+						unpackDestinationCursor : destinationQword;
+					unsigned int unpackCycle = resumesUnpack ?
+						unpackCycleCursor : 0u;
+					unsigned int generatedIteration = resumesUnpack ?
+						unpackGeneratedCursor : 0u;
+					const unsigned int firstVector = resumesUnpack ?
+						unpackVectorCursor : 0u;
+					const unsigned int generatedAlignment = format == 0x09u ?
+						startAlignment : (startAlignment & 1u);
+					#pragma loop (unroll: never)
+					for (unsigned int vectorSlice = 0u; vectorSlice < 128u; vectorSlice++)
+					{
+						const unsigned int vectorIndex = firstVector + vectorSlice;
+						if (vectorIndex < vectorCount)
+						{
+							unsigned int vectorIteration = generatedIteration;
+							if (format == 0x09u || format == 0x0au)
+								vectorIteration = ++generatedIteration;
+							const unsigned int source = payloadOffset + sourceOffset;
+							unsigned int4 unpacked = 0u;
+							if (format == 0x00u)
+								unpacked = VuPayloadU32(vifPayloadWords, source);
+							else if (format == 0x01u)
+								unpacked = VuSignExtend16(
+									VuPayloadU16(vifPayloadWords, source), unsignedData);
+							else if (format == 0x02u)
+								unpacked = VuSignExtend8(
+									VuPayloadU8(vifPayloadWords, source), unsignedData);
+							else if (format == 0x04u)
+							{
+								const unsigned int x = VuPayloadU32(vifPayloadWords, source);
+								const unsigned int y = VuPayloadU32(vifPayloadWords, source + 4u);
+								unpacked = unsigned int4(x, y, x, y);
+							}
+							else if (format == 0x05u)
+							{
+								const unsigned int x = VuSignExtend16(VuPayloadU16(
+									vifPayloadWords, source), unsignedData);
+								const unsigned int y = VuSignExtend16(VuPayloadU16(
+									vifPayloadWords, source + 2u), unsignedData);
+								unpacked = unsigned int4(x, y, x, y);
+							}
+							else if (format == 0x06u)
+							{
+								const unsigned int x = VuSignExtend8(VuPayloadU8(
+									vifPayloadWords, source), unsignedData);
+								const unsigned int y = VuSignExtend8(VuPayloadU8(
+									vifPayloadWords, source + 1u), unsignedData);
+								unpacked = unsigned int4(x, y, x, y);
+							}
+							else if (format == 0x08u || format == 0x0cu)
+							{
+								unpacked = unsigned int4(
+									VuPayloadU32(vifPayloadWords, source),
+									VuPayloadU32(vifPayloadWords, source + 4u),
+									VuPayloadU32(vifPayloadWords, source + 8u),
+									VuPayloadU32(vifPayloadWords, source + 12u));
+								if (format == 0x08u &&
+									vectorIteration != generatedAlignment)
+									unpacked.w = 0u;
+							}
+							else if (format == 0x09u || format == 0x0du)
+							{
+								unpacked = unsigned int4(
+									VuSignExtend16(VuPayloadU16(vifPayloadWords, source), unsignedData),
+									VuSignExtend16(VuPayloadU16(vifPayloadWords, source + 2u), unsignedData),
+									VuSignExtend16(VuPayloadU16(vifPayloadWords, source + 4u), unsignedData),
+									VuSignExtend16(VuPayloadU16(vifPayloadWords, source + 6u), unsignedData));
+								if (format == 0x09u && (vectorIteration & 1u) == 0u &&
+									(((vectorIteration / 4u) + 1u +
+									(4u - generatedAlignment)) & 3u) == 0u)
+									unpacked.w = 0u;
+							}
+							else if (format == 0x0au || format == 0x0eu)
+							{
+								unpacked = unsigned int4(
+									VuSignExtend8(VuPayloadU8(vifPayloadWords, source), unsignedData),
+									VuSignExtend8(VuPayloadU8(vifPayloadWords, source + 1u), unsignedData),
+									VuSignExtend8(VuPayloadU8(vifPayloadWords, source + 2u), unsignedData),
+									VuSignExtend8(VuPayloadU8(vifPayloadWords, source + 3u), unsignedData));
+								if (format == 0x0au &&
+									vectorIteration != generatedAlignment)
+									unpacked.w = 0u;
+							}
+							else
+							{
+								const unsigned int packedValue =
+									VuPayloadU16(vifPayloadWords, source);
+								unpacked = unsigned int4((packedValue & 0x001fu) << 3u,
+									(packedValue & 0x03e0u) >> 2u,
+									(packedValue & 0x7c00u) >> 7u,
+									(packedValue & 0x8000u) >> 8u);
+							}
+
+							const unsigned int wrappedOutput = outputQword & 0x3ffu;
+							unsigned int4 stored = VuReadJournaledMemory(
+								wrappedOutput, vuMemoryInput, memoryWriteCount,
+								memoryWriteAddress, memoryWriteValue);
+							const unsigned int maskCycle = unpackCycle < 4u ? unpackCycle : 3u;
+							const unsigned int cycleMask = (vifCommand & 0x10u) != 0u ?
+								(argument2 >> (maskCycle * 8u)) & 0xffu : 0u;
+							const unsigned int effectiveMode = format == 0x0fu ? 0u : mode;
+							for (unsigned int lane = 0u; lane < 4u; lane++)
+							{
+								const unsigned int selector =
+									(cycleMask >> (lane * 2u)) & 3u;
+								if (selector == 0u)
+								{
+									if (effectiveMode == 1u)
+										stored[lane] = unpacked[lane] + vifRow[lane];
+									else if (effectiveMode == 2u)
+									{
+										vifRow[lane] += unpacked[lane];
+										stored[lane] = vifRow[lane];
+									}
+									else if (effectiveMode == 3u)
+									{
+										vifRow[lane] = unpacked[lane];
+										stored[lane] = unpacked[lane];
+									}
+									else stored[lane] = unpacked[lane];
+								}
+								else if (selector == 1u)
+									stored[lane] = vifRow[lane];
+								else if (selector == 2u)
+									stored[lane] = vifColumn[maskCycle];
+							}
+							memoryWriteAddress[memoryWriteCount] = wrappedOutput;
+							memoryWriteValue[memoryWriteCount] = stored;
+							memoryWriteCount++;
+							if (format == 0x08u)
+								generatedIteration = (generatedIteration + 1u) & 1u;
+							outputQword++;
+							unpackCycle++;
+							if (fillCycle)
+							{
+								if (unpackCycle <= cycleCl) sourceOffset += vectorBytes;
+								else if (unpackCycle == cycleWl) unpackCycle = 0u;
+							}
+							else
+							{
+								sourceOffset += vectorBytes;
+								if (unpackCycle >= cycleWl)
+								{
+									outputQword += cycleCl - cycleWl;
+									unpackCycle = 0u;
+								}
+							}
+						}
+					}
+					vifTop = argument4 & 0xffffu;
+					vifItop = argument4 >> 16;
+					if (firstVector == 0u) commandCount++;
+					unpackVectorCount +=
+						(vectorCount - firstVector < 128u ?
+						 vectorCount - firstVector : 128u);
+					unpackPublished = true;
+					unpackVectorCursor = firstVector + 128u < vectorCount ?
+						firstVector + 128u : vectorCount;
+					if (unpackVectorCursor < vectorCount)
+					{
+						unpackSourceCursor = sourceOffset;
+						unpackDestinationCursor = outputQword;
+						unpackCycleCursor = unpackCycle;
+						unpackGeneratedCursor = generatedIteration;
+						unpackCommandMarker = commandStep + 1u;
+						commandCursor = commandStep;
+					}
+					else
+					{
+						unpackVectorCursor = 0u;
+						unpackSourceCursor = 0u;
+						unpackDestinationCursor = 0u;
+						unpackCycleCursor = 0u;
+						unpackGeneratedCursor = 0u;
+						unpackCommandMarker = 0u;
+						commandCursor = commandStep + 1u;
+					}
+					// Writable buffers publish at a draw boundary. Stop after exactly
+					// one UNPACK so the next fixed job observes its memory and row state.
+					stopReason = 13u;
+				}
+			}
+#else
+			else if (kind == 1u)
+			{
+				// The dedicated all-format VIF kernel must consume and publish every
+				// UNPACK before this VU core is selected. Reaching one here is a
+				// transactional scheduling/descriptor failure, before any VU effect.
+				stopReason = 8u;
+			}
+#endif
+			else if (kind == 2u)
+			{
+				const unsigned int startPc = argument1;
+				const unsigned int maximumPairs = argument2;
+				const bool resume = controlWord == 1u;
+				const bool supported = controlWord <= 1u && argument0 == 0u &&
+					((resume && startPc == 0u) ||
+					 (!resume && (startPc & 7u) == 0u && startPc <= 0x3ff8u)) &&
+					maximumPairs != 0u && maximumPairs <= 16384u &&
+					argument5 == 0u;
+				if (!supported)
+				{
+					stopReason = 8u;
+				}
+				else
+				{
+					if (!resume) pc = startPc;
+					pairBudget = maximumPairs;
+					fbrst = argument4;
+					vifTop = argument3 & 0xffffu;
+					vifItop = argument3 >> 16;
+						executeReady = !unpackPublished;
+						sawExecute = true;
+						commandCursor = commandStep + 1u;
+						commandCount++;
+						// BUFFER13 stores become visible only to a later draw. End this
+						// slice after an UNPACK so the next generation consumes those
+						// writes before executing the command.
+						if (unpackPublished)
+							stopReason = 13u;
+				}
+			}
+			else
+			{
+				stopReason = 8u;
+			}
+			}
+			}
+			}
+			if (epochEnded && !executeReady && stopReason == 0u)
+				stopReason = 1u;
+			else if (!executeReady && stopReason == 0u)
+				stopReason = 8u;
+			if (executeReady)
+			{
+			executeReady = false;
+			// PCSX2's MTVU provider resets the execution-local cycle owner at
+			// every MSCAL/MSCNT while architectural values persist.
+			if (!resumesInternalExecution)
+			{
+				vuCycle = 0u;
+				branch = 0u;
+				branchPc = 0u;
+				delayBranchPc = 0u;
+				takeDelayBranch = 0u;
+				ebitCountdown = 0u;
+				viBackupCycles = 0u;
+				viBackupRegister = 0u;
+				viBackupOldValue = 0u;
+			}
+		VU_PUBLISH_STATE(1u, pairBudget);
+		VU_PUBLISH_STATE(28u, fbrst);
+#endif
+
+	// Sony psp2cgc owns this dynamic-flow implementation. Never unroll the
+	// bounded interpreter body into thousands of copies: the experiment is whether one
+	// fixed SISD program fits and remains usable on SGX543.
+		#pragma loop (unroll: never)
+		for (unsigned int pairStep = 0u;
+			pairStep < VITASX2_UNIVERSAL_PAIR_SLICE; pairStep++)
+	{
+		#pragma branch (flatten: never)
+		if (pairBudget != 0u && stopReason == 0u &&
+			executed - submissionExecutedStart < submissionPairLimit &&
+			!(stateInput[38] != 0u && pc == stateInput[37] &&
+			  branch == 0u && ebitCountdown == 0u))
+		{
+			const unsigned int pairIndex = (pc >> 3) & 0x7ffu;
+			const unsigned int wordIndex = pairIndex * 11u;
+			const unsigned int upper = microWords[wordIndex + 0u];
+			const unsigned int lower = microWords[wordIndex + 1u];
+			const unsigned int control = microWords[wordIndex + 2u];
+			const unsigned int upperKind = control & 0x7fu;
+			const unsigned int lowerKind = (control >> 7) & 0x7fu;
+			const unsigned int upperAccess0 = microWords[wordIndex + 7u];
+			const unsigned int upperAccess1 = microWords[wordIndex + 8u];
+			const unsigned int lowerAccess0 = microWords[wordIndex + 9u];
+			const unsigned int lowerAccess1 = microWords[wordIndex + 10u];
+			const unsigned int lowerViRead = microWords[wordIndex + 5u];
+			const unsigned int lowerViWrite = microWords[wordIndex + 6u];
+			const unsigned int upperPipe = (upperAccess1 >> 16u) & 7u;
+			const unsigned int lowerPipe = (lowerAccess1 >> 16u) & 7u;
+			const bool lowerFdivPipe = lowerPipe == 2u;
+			const bool lowerEfuPipe = lowerPipe == 3u;
+			const bool lowerQpPipe = lowerFdivPipe || lowerEfuPipe;
+			const unsigned int viBackupRegisterForPair =
+				(lowerAccess1 >> 19u) & 31u;
+			const int lowerLatency = (int)lowerAccess1 >> 24;
+			const bool viBackupWrite =
+				(control & viBackupWriteBit) != 0u;
+			const bool fdivProducer =
+				lowerFdivPipe && (lowerViWrite & (1u << 22u)) != 0u;
+			const bool efuProducer =
+				lowerEfuPipe && (lowerViWrite & (1u << 23u)) != 0u;
+			const bool explicitWaitQ = lowerFdivPipe && lowerKind == 49u;
+			const bool explicitWaitP = lowerEfuPipe && lowerKind == 50u;
+			const bool validFdivMetadata = !lowerFdivPipe ||
+				((lowerViWrite & ~(1u << 22u)) == 0u &&
+				 ((fdivProducer && lowerLatency > 0) ||
+				  (explicitWaitQ && lowerLatency == 0)));
+			const bool validEfuMetadata = !lowerEfuPipe ||
+				((lowerViWrite & ~(1u << 23u)) == 0u &&
+				 ((efuProducer && lowerLatency > 0) ||
+				  (explicitWaitP && lowerLatency == 0)));
+			const bool valid = (control & validBit) != 0u &&
+				((upperAccess1 >> 19u) & 31u) == 0u &&
+				upperPipe <= 1u && lowerPipe <= 6u &&
+				viBackupRegisterForPair < 16u &&
+				(viBackupWrite || viBackupRegisterForPair == 0u) &&
+				(lowerPipe != 4u || lowerLatency >= 0) &&
+				(!lowerQpPipe || lowerLatency >= 0) &&
+				validFdivMetadata && validEfuMetadata;
+			const bool executeUpper = (control & executeUpperBit) != 0u;
+			const bool executeLower = (control & executeLowerBit) != 0u;
+			const bool immediateLower =
+				(control & immediateLowerBit) != 0u;
+			const bool lowerDiscarded =
+				(control & lowerDiscardedBit) != 0u;
+			const bool supportedQArithmetic = !approximateQ ||
+				(lowerKind != 53u && lowerKind != 55u);
+			const bool supportedPArithmetic = approximateP ||
+				(lowerKind != 58u && lowerKind != 65u);
+			const bool supportedLower = immediateLower || !executeLower ||
+				lowerDiscarded || lowerKind == 1u || lowerKind == 2u ||
+				lowerKind == 3u || lowerKind == 4u ||
+				lowerKind == 5u || lowerKind == 6u ||
+				lowerKind == 13u ||
+				(lowerKind >= 19u && lowerKind <= 27u) ||
+				(lowerKind >= 28u && lowerKind <= 33u) ||
+				(lowerKind >= 38u && lowerKind <= 50u) ||
+				lowerKind == 51u || lowerKind == 52u ||
+				((lowerKind >= 53u && lowerKind <= 57u) &&
+					supportedQArithmetic) ||
+				((lowerKind == 58u || lowerKind == 65u) &&
+					supportedPArithmetic);
+
+			// D/T remain CPU observation boundaries. XGKICK is admitted only by
+			// the bounded raw-PATH1 route below, which retains the one-following-
+			// pair delay used by PCSX2's normal microVU provider.
+			#pragma branch (flatten: never)
+			if (!valid)
+			{
+				stopReason = 2u;
+			}
+			else if (((control & dBit) != 0u && (fbrst & 0x400u) != 0u) ||
+				((control & tBit) != 0u && (fbrst & 0x800u) != 0u))
+			{
+				stopReason = 3u;
+			}
+			else if (!supportedLower)
+			{
+				stopReason = 6u;
+			}
+			else
+			{
+				const unsigned int cyclesBeforePair = vuCycle;
+				vuCycle++;
+#if VITASX2_GPU_VU_COMPACT_CONTINUATION
+					if (!instantQp && lowerFdivPipe && fdivEnabled != 0u &&
+						explicitWaitQ)
+						vuCycle = VuMaxU(vuCycle, fdivReady);
+					if (!instantQp && lowerEfuPipe && efuEnabled != 0u &&
+						explicitWaitP)
+					{
+						if (efuReady != 0u) efuReady--;
+						vuCycle = VuMaxU(vuCycle, efuReady);
+					}
+#else
+					#pragma branch (flatten: never)
+					if (!assumeScheduled)
+				{
+					const unsigned int upperRead0 = (upperAccess0 >> 16u) & 0xffu;
+					const unsigned int upperRead0Mask = upperAccess0 >> 24u;
+					const unsigned int upperRead1 = upperAccess1 & 0xffu;
+					const unsigned int upperRead1Mask = (upperAccess1 >> 8u) & 0xffu;
+					const unsigned int lowerRead0 = (lowerAccess0 >> 16u) & 0xffu;
+					const unsigned int lowerRead0Mask = lowerAccess0 >> 24u;
+					const unsigned int lowerRead1 = lowerAccess1 & 0xffu;
+					const unsigned int lowerRead1Mask = (lowerAccess1 >> 8u) & 0xffu;
+
+					unsigned int dependencyCycle = 0u;
+					if (upperPipe == 1u)
+					{
+						dependencyCycle = VuMaxU(dependencyCycle,
+							VuFmacDependencyReady(fmacUpperWriter.x,
+								fmacLowerWriter.x, fmacReady.x, upperRead0,
+								upperRead0Mask, upperRead1, upperRead1Mask));
+						dependencyCycle = VuMaxU(dependencyCycle,
+							VuFmacDependencyReady(fmacUpperWriter.y,
+								fmacLowerWriter.y, fmacReady.y, upperRead0,
+								upperRead0Mask, upperRead1, upperRead1Mask));
+						dependencyCycle = VuMaxU(dependencyCycle,
+							VuFmacDependencyReady(fmacUpperWriter.z,
+								fmacLowerWriter.z, fmacReady.z, upperRead0,
+								upperRead0Mask, upperRead1, upperRead1Mask));
+						dependencyCycle = VuMaxU(dependencyCycle,
+							VuFmacDependencyReady(fmacUpperWriter.w,
+								fmacLowerWriter.w, fmacReady.w, upperRead0,
+								upperRead0Mask, upperRead1, upperRead1Mask));
+					}
+					if (lowerPipe == 1u || lowerQpPipe)
+					{
+						dependencyCycle = VuMaxU(dependencyCycle,
+							VuFmacDependencyReady(fmacUpperWriter.x,
+								fmacLowerWriter.x, fmacReady.x, lowerRead0,
+								lowerRead0Mask, lowerRead1, lowerRead1Mask));
+						dependencyCycle = VuMaxU(dependencyCycle,
+							VuFmacDependencyReady(fmacUpperWriter.y,
+								fmacLowerWriter.y, fmacReady.y, lowerRead0,
+								lowerRead0Mask, lowerRead1, lowerRead1Mask));
+						dependencyCycle = VuMaxU(dependencyCycle,
+							VuFmacDependencyReady(fmacUpperWriter.z,
+								fmacLowerWriter.z, fmacReady.z, lowerRead0,
+								lowerRead0Mask, lowerRead1, lowerRead1Mask));
+						dependencyCycle = VuMaxU(dependencyCycle,
+							VuFmacDependencyReady(fmacUpperWriter.w,
+								fmacLowerWriter.w, fmacReady.w, lowerRead0,
+								lowerRead0Mask, lowerRead1, lowerRead1Mask));
+					}
+					if (lowerPipe == 5u)
+					{
+						if ((ialuWriterMask.x & lowerViRead) != 0u)
+							dependencyCycle = VuMaxU(dependencyCycle, ialuReady.x);
+						if ((ialuWriterMask.y & lowerViRead) != 0u)
+							dependencyCycle = VuMaxU(dependencyCycle, ialuReady.y);
+						if ((ialuWriterMask.z & lowerViRead) != 0u)
+							dependencyCycle = VuMaxU(dependencyCycle, ialuReady.z);
+						if ((ialuWriterMask.w & lowerViRead) != 0u)
+							dependencyCycle = VuMaxU(dependencyCycle, ialuReady.w);
+						}
+						vuCycle = VuMaxU(vuCycle, dependencyCycle);
+					}
+					if (!instantQp && lowerFdivPipe && fdivEnabled != 0u &&
+						(!assumeScheduled || explicitWaitQ))
+						vuCycle = VuMaxU(vuCycle, fdivReady);
+					if (!instantQp && lowerEfuPipe && efuEnabled != 0u &&
+						(!assumeScheduled || explicitWaitP))
+					{
+						if (efuReady != 0u)
+							efuReady--;
+							vuCycle = VuMaxU(vuCycle, efuReady);
+						}
+#endif
+
+					// _vuTestPipes() retires every now-visible queue head after all
+				// source/resource stalls. Entries are issue ordered, so four bounded
+				// shifts exactly reproduce the canonical rings.
+				if (fmacCount > 0u && fmacReady.x <= vuCycle)
+				{
+					fmacReady = fmacReady.yzww;
+					fmacUpperWriter = fmacUpperWriter.yzww;
+					fmacLowerWriter = fmacLowerWriter.yzww;
+					fmacCount--;
+				}
+				if (fmacCount > 0u && fmacReady.x <= vuCycle)
+				{
+					fmacReady = fmacReady.yzww;
+					fmacUpperWriter = fmacUpperWriter.yzww;
+					fmacLowerWriter = fmacLowerWriter.yzww;
+					fmacCount--;
+				}
+				if (fmacCount > 0u && fmacReady.x <= vuCycle)
+				{
+					fmacReady = fmacReady.yzww;
+					fmacUpperWriter = fmacUpperWriter.yzww;
+					fmacLowerWriter = fmacLowerWriter.yzww;
+					fmacCount--;
+				}
+				if (fmacCount > 0u && fmacReady.x <= vuCycle)
+				{
+					fmacReady = fmacReady.yzww;
+					fmacUpperWriter = fmacUpperWriter.yzww;
+					fmacLowerWriter = fmacLowerWriter.yzww;
+					fmacCount--;
+				}
+				if (ialuCount > 0u && ialuReady.x <= vuCycle)
+				{
+					ialuReady = ialuReady.yzww;
+					ialuWriterMask = ialuWriterMask.yzww;
+					ialuCount--;
+				}
+				if (ialuCount > 0u && ialuReady.x <= vuCycle)
+				{
+					ialuReady = ialuReady.yzww;
+					ialuWriterMask = ialuWriterMask.yzww;
+					ialuCount--;
+				}
+				if (ialuCount > 0u && ialuReady.x <= vuCycle)
+				{
+					ialuReady = ialuReady.yzww;
+					ialuWriterMask = ialuWriterMask.yzww;
+					ialuCount--;
+				}
+					if (ialuCount > 0u && ialuReady.x <= vuCycle)
+					{
+						ialuReady = ialuReady.yzww;
+						ialuWriterMask = ialuWriterMask.yzww;
+						ialuCount--;
+					}
+					if (fdivEnabled != 0u && (instantQp || fdivReady <= vuCycle))
+					{
+						qValue = fdivValue;
+						statusFlag = VuMergeFdivStatus(statusFlag, fdivStatus);
+						fdivEnabled = 0u;
+					}
+					if (efuEnabled != 0u && (instantQp || efuReady <= vuCycle))
+					{
+						pValue = efuValue;
+						efuEnabled = 0u;
+					}
+					if (viBackupCycles > 0u)
+					{
+					const unsigned int elapsed = vuCycle - cyclesBeforePair;
+					viBackupCycles = elapsed >= viBackupCycles ?
+						0u : viBackupCycles - elapsed;
+				}
+
+				pc = (pc + 8u) & 0x3fffu;
+				if ((control & eBit) != 0u)
+					ebitCountdown = 2u;
+
+				const unsigned int ft = (upper >> 16) & 31u;
+				const unsigned int fs = (upper >> 11) & 31u;
+				const unsigned int fd = (upper >> 6) & 31u;
+				const unsigned int writeMask = (upper >> 21) & 15u;
+				const unsigned int snapshotReg = (control >> 24) & 31u;
+				const float4 snapshot = vf[snapshotReg];
+				const bool exportPath1 = pendingXgkick != 0u;
+				const unsigned int exportPath1Address = pendingXgkickAddress;
+				pendingXgkick = 0u;
+				pendingXgkickAddress = 0u;
+
+				#pragma branch (flatten: never)
+				if (executeUpper)
+				{
+					const float4 source = vf[fs];
+					float4 operand = vf[ft];
+					float4 result = vf[fd];
+					unsigned int destination = fd;
+					unsigned int upperWriteMask = writeMask;
+					bool writeUpper = true;
+					bool updateMac = false;
+					bool preserveMacW = false;
+					#pragma branch (flatten: never)
+					if (upperKind == 1u)
+					{
+						// PCSX2 VUops.cpp::_vuNOP().
+						writeUpper = false;
+					}
+#if VITASX2_GPU_VU_UPPER_ABS
+					else if (upperKind == 2u)
+					{
+						result = abs(source);
+						destination = ft;
+					}
+#endif
+#if VITASX2_GPU_VU_UPPER_FTOI
+					else if (
+						upperKind >= 3u && upperKind <= 6u)
+					{
+						// PCSX2 VUops.cpp::floatToInt<Offset>(). Convert from
+						// the raw source representation so signed zero,
+						// subnormal, infinity, NaN, saturation, and chop are
+						// independent of native SGX conversion behavior.
+						const unsigned int4 sourceBits =
+							bit_cast<unsigned int4>(source);
+						unsigned int scaleShift = 0u;
+						if (upperKind == 4u) scaleShift = 4u;
+						else if (upperKind == 5u) scaleShift = 12u;
+						else if (upperKind == 6u) scaleShift = 15u;
+						const unsigned int4 resultBits = unsigned int4(
+							VuFloatToSignedIntBits(sourceBits.x, scaleShift),
+							VuFloatToSignedIntBits(sourceBits.y, scaleShift),
+							VuFloatToSignedIntBits(sourceBits.z, scaleShift),
+							VuFloatToSignedIntBits(sourceBits.w, scaleShift));
+						result = bit_cast<float4>(resultBits);
+						destination = ft;
+					}
+#endif
+#if VITASX2_GPU_VU_UPPER_ITOF
+					else if (
+						upperKind >= 7u && upperKind <= 10u)
+					{
+						// PCSX2 VUops.cpp::intToFloat<Offset>(). The source
+						// lanes are signed fixed-point integers held in VF bit
+						// patterns. Construct their exact round-to-nearest-even
+						// IEEE-754 bits before applying the encoded power-of-two
+						// scale in the exponent field.
+						const unsigned int4 sourceBits =
+							bit_cast<unsigned int4>(source);
+						unsigned int scaleShift = 0u;
+						if (upperKind == 8u) scaleShift = 4u;
+						else if (upperKind == 9u) scaleShift = 12u;
+						else if (upperKind == 10u) scaleShift = 15u;
+						const unsigned int4 resultBits = unsigned int4(
+							VuSignedIntToFloatBits(sourceBits.x, scaleShift),
+							VuSignedIntToFloatBits(sourceBits.y, scaleShift),
+							VuSignedIntToFloatBits(sourceBits.z, scaleShift),
+							VuSignedIntToFloatBits(sourceBits.w, scaleShift));
+						result = bit_cast<float4>(resultBits);
+						destination = ft;
+					}
+#endif
+#if VITASX2_GPU_VU_UPPER_OPMULA
+					else if (upperKind == 94u)
+					{
+						// PCSX2 VUops.cpp::_vuOPMULA().  The encoded mask is
+						// ignored: XYZ are produced and ACC.W/MAC.W survive.
+						const float4 normalizedSource = bit_cast<float4>(
+							VuNormalizeOperandBits4(bit_cast<unsigned int4>(source)));
+						const float4 normalizedOperand = bit_cast<float4>(
+							VuNormalizeOperandBits4(bit_cast<unsigned int4>(operand)));
+						result = accumulator;
+						result.x = normalizedSource.y * normalizedOperand.z;
+						result.y = normalizedSource.z * normalizedOperand.x;
+						result.z = normalizedSource.x * normalizedOperand.y;
+						destination = 32u;
+						upperWriteMask = 14u;
+						updateMac = true;
+						preserveMacW = true;
+					}
+#endif
+#if VITASX2_GPU_VU_UPPER_OPMSUB
+					else if (upperKind == 95u)
+					{
+						// PCSX2 VUops.cpp::_vuOPMSUB().  Preserve the explicit
+						// multiply-then-subtract boundary via a bit round trip.
+						const float4 normalizedSource = bit_cast<float4>(
+							VuNormalizeOperandBits4(bit_cast<unsigned int4>(source)));
+						const float4 normalizedOperand = bit_cast<float4>(
+							VuNormalizeOperandBits4(bit_cast<unsigned int4>(operand)));
+						const float4 normalizedAcc = bit_cast<float4>(
+								VuNormalizeOperandBits4(bit_cast<unsigned int4>(accumulator)));
+						const float3 product = float3(
+							normalizedSource.y * normalizedOperand.z,
+							normalizedSource.z * normalizedOperand.x,
+							normalizedSource.x * normalizedOperand.y);
+						const unsigned int3 productBits =
+							bit_cast<unsigned int3>(product);
+						const float3 roundedProduct = bit_cast<float3>(productBits);
+						result = vf[fd];
+						result.xyz = normalizedAcc.xyz - roundedProduct;
+						upperWriteMask = 14u;
+						updateMac = true;
+						preserveMacW = true;
+					}
+#endif
+#if VITASX2_GPU_VU_UPPER_CLIP
+					else if (upperKind == 51u)
+					{
+						clipFlag = VuClipUpdate(bit_cast<unsigned int4>(source),
+							bit_cast<unsigned int4>(operand).w, clipFlag);
+						writeUpper = false;
+					}
+#endif
+#if VITASX2_GPU_VU_UPPER_FMAC
+					else
+					{
+						// Complete VF/ACC arithmetic families encode vector/I/Q/
+						// xyzw variants in contiguous PairPlan kind ranges.
+						unsigned int familyBase = 0u;
+						if (upperKind >= 11u && upperKind <= 17u)
+							familyBase = 11u; // ADD
+						else if (upperKind >= 18u && upperKind <= 24u)
+							familyBase = 18u; // ADDA
+						else if (upperKind >= 25u && upperKind <= 31u)
+							familyBase = 25u; // SUB
+						else if (upperKind >= 32u && upperKind <= 38u)
+							familyBase = 32u; // SUBA
+						else if (upperKind >= 39u && upperKind <= 44u)
+							familyBase = 39u; // MAX
+						else if (upperKind >= 45u && upperKind <= 50u)
+							familyBase = 45u; // MINI
+						else if (upperKind >= 52u && upperKind <= 58u)
+							familyBase = 52u; // MUL
+						else if (upperKind >= 59u && upperKind <= 65u)
+							familyBase = 59u; // MULA
+						else if (upperKind >= 66u && upperKind <= 72u)
+							familyBase = 66u; // MADD
+						else if (upperKind >= 73u && upperKind <= 79u)
+							familyBase = 73u; // MADDA
+						else if (upperKind >= 80u && upperKind <= 86u)
+							familyBase = 80u; // MSUB
+						else if (upperKind >= 87u && upperKind <= 93u)
+							familyBase = 87u; // MSUBA
+
+						if (familyBase != 0u)
+						{
+							const unsigned int variant = upperKind - familyBase;
+							const bool componentFamily =
+								familyBase == 39u || familyBase == 45u;
+							if (variant == 1u)
+								operand = bit_cast<float4>(iValue.xxxx);
+							else if (!componentFamily && variant == 2u)
+								operand = bit_cast<float4>(qValue.xxxx);
+							else if (componentFamily && variant >= 2u)
+								operand = vf[ft][variant - 2u].xxxx;
+							else if (!componentFamily && variant >= 3u)
+								operand = vf[ft][variant - 3u].xxxx;
+
+							if (componentFamily)
+							{
+								// PCSX2 VUops.cpp::{fp_max,fp_min} compare raw
+								// signed encodings and never touch MAC/STATUS.
+								const unsigned int4 sourceBits =
+									bit_cast<unsigned int4>(source);
+								const unsigned int4 operandBits =
+									bit_cast<unsigned int4>(operand);
+								unsigned int4 resultBits;
+								if (familyBase == 39u)
+								{
+									resultBits = unsigned int4(
+										VuMaxBits(sourceBits.x, operandBits.x),
+										VuMaxBits(sourceBits.y, operandBits.y),
+										VuMaxBits(sourceBits.z, operandBits.z),
+										VuMaxBits(sourceBits.w, operandBits.w));
+								}
+								else
+								{
+									resultBits = unsigned int4(
+										VuMinBits(sourceBits.x, operandBits.x),
+										VuMinBits(sourceBits.y, operandBits.y),
+										VuMinBits(sourceBits.z, operandBits.z),
+										VuMinBits(sourceBits.w, operandBits.w));
+								}
+								result = bit_cast<float4>(resultBits);
+							}
+							else
+							{
+								const float4 normalizedSource = bit_cast<float4>(
+									VuNormalizeOperandBits4(
+										bit_cast<unsigned int4>(source)));
+								const float4 normalizedOperand = bit_cast<float4>(
+									VuNormalizeOperandBits4(
+										bit_cast<unsigned int4>(operand)));
+								const bool writesAccumulator = familyBase == 18u ||
+									familyBase == 32u || familyBase == 59u ||
+									familyBase == 73u || familyBase == 87u;
+								if (writesAccumulator)
+									destination = 32u;
+
+								if (familyBase == 11u || familyBase == 18u)
+									result = normalizedSource + normalizedOperand;
+								else if (familyBase == 25u || familyBase == 32u)
+									result = normalizedSource - normalizedOperand;
+								else if (familyBase == 52u || familyBase == 59u)
+									result = normalizedSource * normalizedOperand;
+								else
+								{
+									const float4 normalizedAcc = bit_cast<float4>(
+										VuNormalizeOperandBits4(
+											bit_cast<unsigned int4>(accumulator)));
+									const float4 product =
+										normalizedSource * normalizedOperand;
+									const unsigned int4 productBits =
+										bit_cast<unsigned int4>(product);
+									const float4 roundedProduct =
+										bit_cast<float4>(productBits);
+									result = (familyBase == 80u || familyBase == 87u) ?
+										normalizedAcc - roundedProduct :
+										normalizedAcc + roundedProduct;
+								}
+								updateMac = true;
+							}
+						}
+						else
+						{
+							stopReason = 5u;
+						}
+					}
+#else
+					else
+					{
+						stopReason = 5u;
+					}
+#endif
+
+#if VITASX2_GPU_VU_UPPER_FMAC || VITASX2_GPU_VU_UPPER_OPMULA || \
+	VITASX2_GPU_VU_UPPER_OPMSUB
+					if (stopReason == 0u && updateMac)
+					{
+						unsigned int4 resultBits = bit_cast<unsigned int4>(result);
+						if ((upperWriteMask & 8u) != 0u)
+							resultBits.x = VuMacUpdate(resultBits.x, 3u, macFlag);
+						else VuClearMacLane(3u, macFlag);
+						if ((upperWriteMask & 4u) != 0u)
+							resultBits.y = VuMacUpdate(resultBits.y, 2u, macFlag);
+						else VuClearMacLane(2u, macFlag);
+						if ((upperWriteMask & 2u) != 0u)
+							resultBits.z = VuMacUpdate(resultBits.z, 1u, macFlag);
+						else VuClearMacLane(1u, macFlag);
+						if ((upperWriteMask & 1u) != 0u)
+							resultBits.w = VuMacUpdate(resultBits.w, 0u, macFlag);
+						else if (!preserveMacW) VuClearMacLane(0u, macFlag);
+						result = bit_cast<float4>(resultBits);
+						statusFlag = (statusFlag & 0x30u) |
+							VuStatusFromMac(macFlag);
+					}
+#endif
+
+					if (stopReason == 0u && writeUpper && destination != 0u)
+					{
+							float4 previous = destination == 32u ?
+								accumulator : vf[destination];
+							if ((upperWriteMask & 8u) != 0u) previous.x = result.x;
+							if ((upperWriteMask & 4u) != 0u) previous.y = result.y;
+							if ((upperWriteMask & 2u) != 0u) previous.z = result.z;
+							if ((upperWriteMask & 1u) != 0u) previous.w = result.w;
+							if (destination == 32u)
+								accumulator = previous;
+							else
+								vf[destination] = previous;
+					}
+				}
+
+				#pragma branch (flatten: never)
+				if (immediateLower)
+				{
+					iValue = lower;
+				}
+				else if (executeLower && !lowerDiscarded && stopReason == 0u)
+				{
+					const unsigned int lowerIt = (lower >> 16) & 15u;
+					const unsigned int lis = (lower >> 11) & 15u;
+					const unsigned int lid = (lower >> 6) & 15u;
+					const unsigned int lowerVfFt = (lower >> 16) & 31u;
+					const unsigned int lowerVfFs = (lower >> 11) & 31u;
+					const unsigned int lowerMask = (lower >> 21) & 15u;
+					int imm11 = (int)(lower & 0x7ffu);
+					if ((imm11 & 0x400) != 0) imm11 -= 0x800;
+					const int imm15 = (int)((lower & 0x7ffu) |
+						((lower >> 10) & 0x7800u));
+					int imm5 = (int)((lower >> 6) & 0x1fu);
+					if ((imm5 & 0x10) != 0) imm5 -= 0x20;
+					const unsigned int isValue = vi[lis] & 0xffffu;
+					const unsigned int itValue = vi[lowerIt] & 0xffffu;
+#if VITASX2_GPU_VU_COMPACT_CONTINUATION
+					const unsigned int branchIsValue = isValue;
+					const unsigned int branchItValue = itValue;
+#else
+					const unsigned int branchIsValue = viBackupCycles > 0u &&
+						viBackupRegister == lis ? viBackupOldValue : isValue;
+					const unsigned int branchItValue = viBackupCycles > 0u &&
+						viBackupRegister == lowerIt ? viBackupOldValue : itValue;
+
+					if (viBackupWrite)
+					{
+						if (viBackupCycles == 0u ||
+							viBackupRegister != viBackupRegisterForPair)
+						{
+							viBackupOldValue =
+								vi[viBackupRegisterForPair] & 0xffffu;
+							viBackupRegister = viBackupRegisterForPair;
+						}
+						viBackupCycles = 2u;
+					}
+#endif
+
+					#pragma branch (flatten: never)
+					if (lowerKind == 1u || lowerKind == 24u || lowerKind == 25u)
+					{
+							// PCSX2 VUops.cpp::_vuLQ/_vuLQI/_vuLQD. Only LQ
+							// has an immediate. LQI uses Is and post-increments;
+							// LQD pre-decrements Is before loading. The table-3
+							// opcode bits in LQI/LQD are not an address field.
+							int address = (int)(short)isValue;
+							if (lowerKind == 1u) address += imm11;
+							// LQD decrements only when Is is nonzero. Ft is a full
+							// five-bit VF index; its low four bits are merely the It
+							// alias used by integer instructions.
+							if (lowerKind == 25u && lis != 0u) address--;
+							const float4 loaded = bit_cast<float4>(
+								VuReadJournaledMemory((unsigned int)address,
+									vuMemoryInput, memoryWriteCount,
+									memoryWriteAddress, memoryWriteValue));
+						if (lowerVfFt != 0u)
+						{
+							float4 previous = vf[lowerVfFt];
+							if ((lowerMask & 8u) != 0u) previous.x = loaded.x;
+							if ((lowerMask & 4u) != 0u) previous.y = loaded.y;
+							if ((lowerMask & 2u) != 0u) previous.z = loaded.z;
+							if ((lowerMask & 1u) != 0u) previous.w = loaded.w;
+							vf[lowerVfFt] = previous;
+						}
+						if (lowerKind == 24u && lowerVfFs != 0u)
+							vi[lis] = (address + 1) & 0xffffu;
+						else if (lowerKind == 25u && lis != 0u)
+							vi[lis] = address & 0xffffu;
+					}
+#if VITASX2_GPU_VU_LOWER_SQ
+					else if (
+						(lowerKind == 2u || lowerKind == 26u || lowerKind == 27u))
+					{
+						// PCSX2 VUops.cpp::_vuSQ/_vuSQI/_vuSQD. SQ alone
+						// owns the signed immediate; SQI/SQD use the unmodified
+						// It address before their post/pre update respectively.
+						int address = (int)(short)itValue;
+						if (lowerKind == 2u) address += imm11;
+						if (lowerKind == 27u && lowerVfFt != 0u) address--;
+						float4 source = vf[(lower >> 11) & 31u];
+							if (snapshotReg != 0u &&
+							((lower >> 11) & 31u) == snapshotReg)
+							source = snapshot;
+							unsigned int4 stored =
+								VuReadJournaledMemory((unsigned int)address,
+									vuMemoryInput, memoryWriteCount,
+									memoryWriteAddress, memoryWriteValue);
+						const unsigned int4 sourceBits = bit_cast<unsigned int4>(source);
+						if ((lowerMask & 8u) != 0u) stored.x = sourceBits.x;
+						if ((lowerMask & 4u) != 0u) stored.y = sourceBits.y;
+						if ((lowerMask & 2u) != 0u) stored.z = sourceBits.z;
+						if ((lowerMask & 1u) != 0u) stored.w = sourceBits.w;
+							if (memoryWriteCount < 128u)
+							{
+								memoryWriteAddress[memoryWriteCount] =
+									(unsigned int)address & 0x3ffu;
+								memoryWriteValue[memoryWriteCount] = stored;
+								memoryWriteCount++;
+							}
+							else stopReason = 12u;
+						if (lowerKind == 26u && lowerVfFt != 0u)
+							vi[lowerIt] = (address + 1) & 0xffffu;
+						else if (lowerKind == 27u && lowerVfFt != 0u)
+							vi[lowerIt] = address & 0xffffu;
+					}
+#endif
+#if VITASX2_GPU_VU_LOWER_ILW
+					else if (
+						(lowerKind == 3u || lowerKind == 28u))
+					{
+						// PCSX2 VUops.cpp::_vuILW/_vuILWR(). VU memory is
+						// addressed in qwords and wraps at the VU1 16 KiB
+						// boundary. Multiple enabled lanes write VI It in
+						// architectural x/y/z/w order, so the last lane wins.
+							const int address = (int)(short)isValue +
+								(lowerKind == 3u ? imm11 : 0);
+							const unsigned int4 loaded =
+								VuReadJournaledMemory((unsigned int)address,
+									vuMemoryInput, memoryWriteCount,
+									memoryWriteAddress, memoryWriteValue);
+						if (lowerIt != 0u)
+						{
+							unsigned int value = vi[lowerIt] & 0xffffu;
+							if ((lowerMask & 8u) != 0u) value = loaded.x & 0xffffu;
+							if ((lowerMask & 4u) != 0u) value = loaded.y & 0xffffu;
+							if ((lowerMask & 2u) != 0u) value = loaded.z & 0xffffu;
+							if ((lowerMask & 1u) != 0u) value = loaded.w & 0xffffu;
+							vi[lowerIt] = value;
+						}
+					}
+#endif
+#if VITASX2_GPU_VU_LOWER_ISW
+					else if (
+						(lowerKind == 4u || lowerKind == 29u))
+					{
+						// PCSX2 VUops.cpp::_vuISW/_vuISWR(). Each selected
+						// lane receives the zero-extended low halfword of VI It.
+							const int address = (int)(short)isValue +
+								(lowerKind == 4u ? imm11 : 0);
+							unsigned int4 stored =
+								VuReadJournaledMemory((unsigned int)address,
+									vuMemoryInput, memoryWriteCount,
+									memoryWriteAddress, memoryWriteValue);
+						const unsigned int value = itValue & 0xffffu;
+						if ((lowerMask & 8u) != 0u) stored.x = value;
+						if ((lowerMask & 4u) != 0u) stored.y = value;
+						if ((lowerMask & 2u) != 0u) stored.z = value;
+						if ((lowerMask & 1u) != 0u) stored.w = value;
+							if (memoryWriteCount < 128u)
+							{
+								memoryWriteAddress[memoryWriteCount] =
+									(unsigned int)address & 0x3ffu;
+								memoryWriteValue[memoryWriteCount] = stored;
+								memoryWriteCount++;
+							}
+							else stopReason = 12u;
+					}
+#endif
+#if VITASX2_GPU_VU_LOWER_IADDI
+					else if (
+						(lowerKind == 5u || lowerKind == 6u || lowerKind == 21u))
+					{
+						if (lowerIt != 0u)
+							vi[lowerIt] = (isValue +
+								(lowerKind == 6u ? -imm15 :
+								 lowerKind == 21u ? imm5 : imm15)) & 0xffffu;
+					}
+#endif
+#if VITASX2_GPU_VU_LOWER_FSAND
+					else if (lowerKind == 13u)
+					{
+						// PCSX2 VUops.cpp::_vuFSAND(). Snapshot the
+						// architectural STATUS register through the exact
+						// 12-bit immediate mask. This validation-only lower
+						// flag reader lets Q/P edge fixtures prove D/I bits
+						// without introducing a CPU observer.
+						if (lowerIt != 0u)
+						{
+							const unsigned int flagImm =
+								(((lower >> 21u) & 1u) << 11u) |
+								(lower & 0x07ffu);
+							vi[lowerIt] =
+								(statusFlag & 0x0fffu) & flagImm;
+							}
+						}
+#endif
+#if VITASX2_GPU_VU_LOWER_IALU
+					else if (
+						lowerKind >= 19u && lowerKind <= 23u)
+					{
+						unsigned int value = 0u;
+						if (lowerKind == 19u) value = isValue + itValue;
+						else if (lowerKind == 20u) value = isValue - itValue;
+						else if (lowerKind == 22u) value = isValue & itValue;
+						else if (lowerKind == 23u) value = isValue | itValue;
+						if (lid != 0u) vi[lid] = value & 0xffffu;
+					}
+#endif
+#if VITASX2_GPU_VU_LOWER_MOVE
+					else if (
+						(lowerKind == 30u || lowerKind == 31u))
+					{
+						if (lowerVfFt != 0u)
+						{
+							float4 source = snapshotReg != 0u &&
+								((lower >> 11) & 31u) == snapshotReg ?
+								snapshot : vf[(lower >> 11) & 31u];
+							if (lowerKind == 31u) source = source.yzwx;
+							float4 previous = vf[lowerVfFt];
+							if ((lowerMask & 8u) != 0u) previous.x = source.x;
+							if ((lowerMask & 4u) != 0u) previous.y = source.y;
+							if ((lowerMask & 2u) != 0u) previous.z = source.z;
+							if ((lowerMask & 1u) != 0u) previous.w = source.w;
+							vf[lowerVfFt] = previous;
+						}
+					}
+#endif
+#if VITASX2_GPU_VU_LOWER_MFIR
+					else if (lowerKind == 32u)
+					{
+						// PCSX2 VUops.cpp::_vuMFIR(). The signed VI halfword is
+						// copied as a raw sign-extended 32-bit value.
+						if (lowerVfFt != 0u)
+						{
+							unsigned int scalarBits = isValue & 0xffffu;
+							// psp2cgc folds the C-style unsigned->short->int cast
+							// above as an unsigned halfword conversion. Spell out
+							// PCSX2's signed s16 extension in raw bits so SGX and
+							// the VUops.cpp::_vuMFIR oracle agree for bit 15.
+							if ((scalarBits & 0x8000u) != 0u)
+								scalarBits |= 0xffff0000u;
+							const float scalar = bit_cast<float4>(unsigned int4(
+								scalarBits, scalarBits, scalarBits, scalarBits)).x;
+							float4 previous = vf[lowerVfFt];
+							if ((lowerMask & 8u) != 0u) previous.x = scalar;
+							if ((lowerMask & 4u) != 0u) previous.y = scalar;
+							if ((lowerMask & 2u) != 0u) previous.z = scalar;
+							if ((lowerMask & 1u) != 0u) previous.w = scalar;
+							vf[lowerVfFt] = previous;
+						}
+					}
+#endif
+#if VITASX2_GPU_VU_LOWER_MTIR
+					else if (lowerKind == 33u)
+					{
+						// PCSX2 VUops.cpp::_vuMTIR(). PairPlan's snapshot
+						// preserves the lower source when the upper instruction
+						// writes the same VF in this pair.
+						if (lowerIt != 0u)
+						{
+							const unsigned int fsLane = (lower >> 21) & 3u;
+							const float4 source = snapshotReg != 0u &&
+								lowerVfFs == snapshotReg ? snapshot : vf[lowerVfFs];
+							vi[lowerIt] =
+								VuSelectLaneBits(bit_cast<unsigned int4>(source), fsLane) &
+									0xffffu;
+						}
+					}
+#endif
+#if VITASX2_GPU_VU_LOWER_BRANCH
+					else if (
+						lowerKind >= 38u && lowerKind <= 47u)
+					{
+						bool take = false;
+						const int signedIs = (int)(short)branchIsValue;
+						if (lowerKind == 38u) take = branchIsValue == branchItValue;
+						else if (lowerKind == 39u) take = branchIsValue != branchItValue;
+						else if (lowerKind == 40u) take = signedIs < 0;
+						else if (lowerKind == 41u) take = signedIs > 0;
+						else if (lowerKind == 42u) take = signedIs <= 0;
+						else if (lowerKind == 43u) take = signedIs >= 0;
+						else if (lowerKind == 44u || lowerKind == 45u) take = true;
+						else take = true;
+						if (take)
+						{
+							const unsigned int target = lowerKind >= 46u ?
+								((isValue & 0x7ffu) << 3) :
+								(unsigned int)((int)pc + imm11 * 8) & 0x3fffu;
+							if ((lowerKind == 45u || lowerKind == 47u) &&
+								lowerIt != 0u)
+							{
+								vi[lowerIt] = branch == 1u ?
+									((branchPc + 8u) >> 3u) : ((pc + 8u) >> 3u);
+							}
+							if (branch == 1u)
+							{
+								delayBranchPc = target;
+								takeDelayBranch = 1u;
+							}
+							else
+							{
+								branch = 2u;
+								branchPc = target;
+							}
+							}
+						}
+#endif
+#if VITASX2_GPU_VU_LOWER_MFP
+						else if (lowerKind == 48u)
+						{
+							// PCSX2 VUops.cpp::_vuMFP(). P is a raw scalar bit
+							// pattern copied into every selected VF lane.
+							if (lowerVfFt != 0u)
+							{
+								const float pScalar = bit_cast<float4>(
+									unsigned int4(pValue, pValue, pValue, pValue)).x;
+								float4 previous = vf[lowerVfFt];
+								if ((lowerMask & 8u) != 0u) previous.x = pScalar;
+								if ((lowerMask & 4u) != 0u) previous.y = pScalar;
+								if ((lowerMask & 2u) != 0u) previous.z = pScalar;
+								if ((lowerMask & 1u) != 0u) previous.w = pScalar;
+								vf[lowerVfFt] = previous;
+							}
+						}
+#endif
+#if VITASX2_GPU_VU_LOWER_WAIT
+						else if (
+							(lowerKind == 49u || lowerKind == 50u))
+						{
+							// PCSX2 VUops.cpp::_vuWAITQ/_vuWAITP(). The visible
+							// work is the pipeline flush already performed before
+							// this lower body executes.
+						}
+#endif
+#if VITASX2_GPU_VU_LOWER_XITOP
+						else if (lowerKind == 51u)
+						{
+							// PCSX2 VUops.cpp::_vuXITOP(). ITOP is retained by the
+							// command epoch and published in state word 41.
+							if (lowerIt != 0u)
+								vi[lowerIt] = vifItop;
+						}
+#endif
+#if VITASX2_GPU_VU_LOWER_XTOP
+						else if (lowerKind == 52u)
+						{
+							// PCSX2 VUops.cpp::_vuXTOP().  TOP is retained by every
+							// serialized UNPACK/Execute descriptor and published in
+							// state word 40 before VU execution starts.
+							if (lowerIt != 0u)
+								vi[lowerIt] = vifTop;
+						}
+#endif
+#if VITASX2_GPU_VU_LOWER_FDIV
+						else if (lowerKind == 53u)
+						{
+							// PCSX2 VUops.cpp::_vuDIV().  This validation tier
+							// covers finite hardware-aligned values and the exact
+							// zero-divisor STATUS/Q edge.
+							const unsigned int fsLane = (lower >> 21) & 3u;
+							const unsigned int ftLane = (lower >> 23) & 3u;
+							const unsigned int4 fsVector =
+								bit_cast<unsigned int4>(vf[lowerVfFs]);
+							const unsigned int4 ftVector =
+								bit_cast<unsigned int4>(vf[lowerVfFt]);
+							const unsigned int fsBits =
+								VuNormalizeOperandBits(VuSelectLaneBits(fsVector, fsLane));
+							const unsigned int ftBits =
+								VuNormalizeOperandBits(VuSelectLaneBits(ftVector, ftLane));
+							unsigned int nextStatus = statusFlag & ~0x30u;
+							unsigned int nextQ = 0u;
+							if ((ftBits & 0x7fffffffu) == 0u)
+							{
+								nextStatus |= (fsBits & 0x7fffffffu) == 0u ?
+									0x10u : 0x20u;
+								nextQ = ((fsBits ^ ftBits) & 0x80000000u) != 0u ?
+									0xff7fffffu : 0x7f7fffffu;
+							}
+							else
+							{
+								nextQ = VuBitsFromFloat(
+									VuFloatFromBits(fsBits) / VuFloatFromBits(ftBits));
+							}
+							if (instantQp)
+							{
+								qValue = nextQ;
+								statusFlag = VuMergeFdivStatus(statusFlag, nextStatus);
+							}
+							else
+							{
+								fdivReady = vuCycle + (unsigned int)lowerLatency;
+								fdivValue = nextQ;
+								fdivStatus = nextStatus;
+								fdivEnabled = 1u;
+							}
+						}
+						else if (lowerKind == 54u)
+						{
+							// PCSX2 VUops.cpp::_vuSQRT().  Negative finite input
+							// sets the current I bit and square-roots the absolute
+							// value; the validation fixture uses exact finite roots.
+							const unsigned int ftLane = (lower >> 23) & 3u;
+							const unsigned int4 ftVector =
+								bit_cast<unsigned int4>(vf[lowerVfFt]);
+							const unsigned int ftBits =
+								VuNormalizeOperandBits(
+									VuSelectLaneBits(ftVector, ftLane));
+							unsigned int nextStatus = statusFlag & ~0x30u;
+							if ((ftBits & 0x80000000u) != 0u &&
+								VuAbsBits(ftBits) != 0u)
+							{
+								nextStatus |= 0x10u;
+							}
+							const unsigned int nextQ = VuBitsFromFloat(
+								sqrt(VuFloatFromBits(VuAbsBits(ftBits))));
+							if (instantQp)
+							{
+								qValue = nextQ;
+								statusFlag = VuMergeFdivStatus(statusFlag, nextStatus);
+							}
+							else
+							{
+								fdivReady = vuCycle + (unsigned int)lowerLatency;
+								fdivValue = nextQ;
+								fdivStatus = nextStatus;
+								fdivEnabled = 1u;
+							}
+						}
+						else if (lowerKind == 55u)
+						{
+							// PCSX2 VUops.cpp::_vuRSQRT().  This keeps the
+							// zero-divisor and negative-radicand D/I status edges
+							// while the v11 physical fixture checks a finite exact
+							// result through a following MULq consumer.
+							const unsigned int fsLane = (lower >> 21) & 3u;
+							const unsigned int ftLane = (lower >> 23) & 3u;
+							const unsigned int4 fsVector =
+								bit_cast<unsigned int4>(vf[lowerVfFs]);
+							const unsigned int4 ftVector =
+								bit_cast<unsigned int4>(vf[lowerVfFt]);
+							const unsigned int fsBits =
+								VuNormalizeOperandBits(
+									VuSelectLaneBits(fsVector, fsLane));
+							const unsigned int ftBits =
+								VuNormalizeOperandBits(
+									VuSelectLaneBits(ftVector, ftLane));
+							const unsigned int fsAbs = VuAbsBits(fsBits);
+							const unsigned int ftAbs = VuAbsBits(ftBits);
+							unsigned int nextStatus = statusFlag & ~0x30u;
+							unsigned int nextQ;
+							if (ftAbs == 0u)
+							{
+								nextStatus |= 0x20u;
+								const bool negative =
+									((fsBits ^ ftBits) & 0x80000000u) != 0u;
+								if (fsAbs != 0u)
+								{
+									nextQ = negative ? 0xff7fffffu : 0x7f7fffffu;
+								}
+								else
+								{
+									nextQ = negative ? 0x80000000u : 0u;
+									nextStatus |= 0x10u;
+								}
+							}
+							else
+							{
+								if ((ftBits & 0x80000000u) != 0u)
+									nextStatus |= 0x10u;
+								const float root =
+									sqrt(VuFloatFromBits(ftAbs));
+								nextQ = VuBitsFromFloat(
+									VuFloatFromBits(fsBits) / root);
+							}
+							if (instantQp)
+							{
+								qValue = nextQ;
+								statusFlag = VuMergeFdivStatus(statusFlag, nextStatus);
+							}
+							else
+							{
+								fdivReady = vuCycle + (unsigned int)lowerLatency;
+								fdivValue = nextQ;
+								fdivStatus = nextStatus;
+									fdivEnabled = 1u;
+								}
+							}
+#endif
+#if VITASX2_GPU_VU_LOWER_XGKICK
+						else if (lowerKind == 56u)
+						{
+							pendingXgkickAddress = (isValue & 0x3ffu) << 4;
+							pendingXgkick = 1u;
+						}
+#endif
+#if VITASX2_GPU_VU_LOWER_ESADD
+						else if (lowerKind == 57u)
+						{
+							// PCSX2 VUops.cpp::_vuESADD().
+							const unsigned int4 sourceBits =
+								bit_cast<unsigned int4>(vf[lowerVfFs]);
+							const unsigned int nextP =
+								VuEfuSumXyzSquaresBits(sourceBits);
+							if (instantQp)
+							{
+								pValue = nextP;
+							}
+							else
+							{
+								efuReady = vuCycle + (unsigned int)lowerLatency;
+								efuValue = nextP;
+									efuEnabled = 1u;
+								}
+							}
+#endif
+#if VITASX2_GPU_VU_LOWER_ERSADD
+						else if (lowerKind == 58u)
+						{
+							// PCSX2 VUops.cpp::_vuERSADD() under the product's
+							// Cortex-A9 approximate-P contract.
+							const unsigned int4 sourceBits =
+								bit_cast<unsigned int4>(vf[lowerVfFs]);
+							const unsigned int sumBits =
+								VuEfuSumXyzSquaresBits(sourceBits);
+							unsigned int nextP = sumBits;
+							if ((sumBits & 0x7fffffffu) != 0u)
+							{
+								const unsigned int estimateIndex =
+									(sumBits >> 15u) & 0xffu;
+								const unsigned int estimateField =
+									armEstimateWords[estimateIndex];
+								const unsigned int exponent =
+									(sumBits >> 23u) & 0xffu;
+								const unsigned int seedBits =
+									((253u - exponent) << 23u) |
+									(estimateField << 15u);
+								const float diagnosticValue =
+									VuRawFloatFromBits(sumBits);
+								const float diagnosticSeed =
+									VuRawFloatFromBits(seedBits);
+								const unsigned int productBits = VuRawBitsFromFloat(
+									diagnosticValue * diagnosticSeed);
+								const unsigned int stepBits = VuRawBitsFromFloat(
+									2.0f - VuRawFloatFromBits(productBits));
+								nextP = VuArmApproximateReciprocalBits(
+									sumBits, estimateField);
+								// Words 48..58 are outside the architectural state ABI and
+								// belong only to this one-shot physical semantic owner.
+								VU_PUBLISH_STATE(48u, lowerVfFs);
+								VU_PUBLISH_STATE(49u, sourceBits.x);
+								VU_PUBLISH_STATE(50u, sourceBits.y);
+								VU_PUBLISH_STATE(51u, sourceBits.z);
+								VU_PUBLISH_STATE(52u, sumBits);
+								VU_PUBLISH_STATE(53u, estimateIndex);
+								VU_PUBLISH_STATE(54u, estimateField);
+								VU_PUBLISH_STATE(55u, seedBits);
+								VU_PUBLISH_STATE(56u, productBits);
+								VU_PUBLISH_STATE(57u, stepBits);
+								VU_PUBLISH_STATE(58u, nextP);
+							}
+							if (instantQp)
+								pValue = nextP;
+							else
+							{
+								efuReady = vuCycle + (unsigned int)lowerLatency;
+								efuValue = nextP;
+								efuEnabled = 1u;
+							}
+						}
+#endif
+#if VITASX2_GPU_VU_LOWER_ESQRT
+						else if (lowerKind == 65u)
+						{
+							// PCSX2 VUops.cpp::_vuESQRT() under the same immutable
+							// approximate-P configuration identity.
+							const unsigned int fsLane = (lower >> 21u) & 3u;
+							const unsigned int inputBits = VuNormalizeOperandBits(
+								VuSelectLaneBits(
+									bit_cast<unsigned int4>(vf[lowerVfFs]), fsLane));
+							unsigned int nextP = inputBits;
+							if ((inputBits & 0x80000000u) == 0u)
+							{
+								if ((inputBits & 0x7fffffffu) != 0u &&
+									(inputBits & 0x7f800000u) != 0x7f800000u)
+								{
+									const unsigned int exponent =
+										(inputBits >> 23u) & 0xffu;
+									const unsigned int scaled = (exponent & 1u) != 0u ?
+										(0x80u | ((inputBits >> 16u) & 0x7fu)) :
+										(0x100u | ((inputBits >> 15u) & 0xffu));
+									nextP = VuArmApproximateSqrtBits(inputBits,
+										armEstimateWords[256u + scaled - 128u]);
+								}
+							}
+							if (instantQp)
+								pValue = nextP;
+							else
+							{
+								efuReady = vuCycle + (unsigned int)lowerLatency;
+								efuValue = nextP;
+								efuEnabled = 1u;
+							}
+						}
+#endif
+						else
+						{
+							stopReason = 6u;
+					}
+				}
+
+				const bool addsFmac = upperPipe == 1u || lowerPipe == 1u;
+				if (addsFmac && stopReason == 0u)
+				{
+					const unsigned int upperWriter = upperPipe == 1u ?
+						(upperAccess0 & 0xffffu) : 0u;
+					const unsigned int lowerWriter = lowerPipe == 1u ?
+						(lowerAccess0 & 0xffffu) : 0u;
+					if (fmacCount == 0u)
+					{
+						fmacReady.x = vuCycle + 4u;
+						fmacUpperWriter.x = upperWriter;
+						fmacLowerWriter.x = lowerWriter;
+					}
+					else if (fmacCount == 1u)
+					{
+						fmacReady.y = vuCycle + 4u;
+						fmacUpperWriter.y = upperWriter;
+						fmacLowerWriter.y = lowerWriter;
+					}
+					else if (fmacCount == 2u)
+					{
+						fmacReady.z = vuCycle + 4u;
+						fmacUpperWriter.z = upperWriter;
+						fmacLowerWriter.z = lowerWriter;
+					}
+					else if (fmacCount == 3u)
+					{
+						fmacReady.w = vuCycle + 4u;
+						fmacUpperWriter.w = upperWriter;
+						fmacLowerWriter.w = lowerWriter;
+					}
+					else stopReason = 12u;
+					if (stopReason == 0u) fmacCount++;
+				}
+#if VITASX2_GPU_VU_COMPACT_CONTINUATION
+				// PairPlan scheduling has already made every IALU consumer legal.
+#else
+				if (!assumeScheduled && lowerPipe == 4u && lowerLatency > 0 &&
+					stopReason == 0u)
+				{
+					const unsigned int ready = vuCycle + (unsigned int)lowerLatency;
+					const unsigned int writerMask = microWords[wordIndex + 6u];
+					if (ialuCount == 0u)
+					{
+						ialuReady.x = ready;
+						ialuWriterMask.x = writerMask;
+					}
+					else if (ialuCount == 1u)
+					{
+						ialuReady.y = ready;
+						ialuWriterMask.y = writerMask;
+					}
+					else if (ialuCount == 2u)
+					{
+						ialuReady.z = ready;
+						ialuWriterMask.z = writerMask;
+					}
+					else if (ialuCount == 3u)
+					{
+						ialuReady.w = ready;
+						ialuWriterMask.w = writerMask;
+					}
+					else stopReason = 12u;
+					if (stopReason == 0u) ialuCount++;
+				}
+#endif
+
+				// PCSX2 normal microVU publishes the packet after the complete pair
+				// following XGKICK. Scan every tag before the first output write, then
+				// append one EOP-bounded raw packet. BUFFER6 owns the descriptor
+					// page and data tail; BUFFER8..10 extend that tail into one mapped
+				// transactional generation. Exhaustion fails closed and never
+				// publishes a prefix.
+				#pragma branch (flatten: never)
+				if (exportPath1 && stopReason == 0u)
+				{
+					unsigned int packetQwords = 0u;
+					unsigned int packetTags = 0u;
+					bool packetEop = false;
+					bool packetValid = true;
+					#pragma loop (unroll: never)
+					for (unsigned int tagStep = 0u; tagStep < 1024u; tagStep++)
+					{
+						if (!packetEop && packetValid)
+						{
+							const unsigned int tagQword =
+								((exportPath1Address >> 4) + packetQwords) & 0x3ffu;
+								const unsigned int4 tag = VuReadJournaledMemory(
+									tagQword, vuMemoryInput, memoryWriteCount,
+									memoryWriteAddress, memoryWriteValue);
+							const unsigned int nloop = tag.x & 0x7fffu;
+							unsigned int nreg = (tag.y >> 28) & 15u;
+							if (nreg == 0u) nreg = 16u;
+							const unsigned int flg = (tag.y >> 26) & 3u;
+							unsigned int payloadQwords = nloop;
+							if (flg == 0u) payloadQwords = nloop * nreg;
+							else if (flg == 1u)
+								payloadQwords = (nloop * nreg + 1u) >> 1;
+							const unsigned int nextQwords =
+								packetQwords + 1u + payloadQwords;
+							if (nextQwords >= 1024u)
+							{
+								packetValid = false;
+							}
+							else
+							{
+								packetQwords = nextQwords;
+								packetTags++;
+								packetEop = (tag.x & 0x8000u) != 0u;
+							}
+						}
+					}
+					if (!packetValid || !packetEop)
+					{
+						// PCSX2 owner: VUops.cpp::_vuXGKICKTransferMicroVU().
+						// GetGSPacketSize() returning zero cancels this XGKICK in
+						// PCSX2. The universal product cannot yet prove that a
+						// malformed GPU packet matches canonical VU memory, so keep
+						// the generation private and retain bounded diagnostics for
+						// the CPU replay comparison.
+							const unsigned int4 rejectedTag =
+								VuReadJournaledMemory(exportPath1Address >> 4,
+									vuMemoryInput, memoryWriteCount,
+									memoryWriteAddress, memoryWriteValue);
+						path1Words[4] = path1Words[4] + 1u;
+						path1Words[5] = exportPath1Address;
+						path1Words[6] = rejectedTag.x;
+						path1Words[7] = rejectedTag.y;
+						path1Words[8] = rejectedTag.z;
+						path1Words[9] = rejectedTag.w;
+						path1Words[10] = packetQwords;
+						path1Words[11] = packetTags;
+						stopReason = 9u;
+						path1Error = 3u;
+					}
+					else if (path1PacketCount >= 256u)
+					{
+						stopReason = 9u;
+						path1Error = 5u;
+					}
+						else if (packetQwords > 16120u - path1DataQwords)
+					{
+						stopReason = 9u;
+						path1Error = 4u;
+					}
+					else
+					{
+						#pragma loop (unroll: never)
+						for (unsigned int copyQword = 0u;
+							copyQword < 1024u; copyQword++)
+						{
+							if (copyQword < packetQwords)
+							{
+									const unsigned int4 source =
+										VuReadJournaledMemory(
+											(exportPath1Address >> 4) + copyQword,
+											vuMemoryInput, memoryWriteCount,
+											memoryWriteAddress, memoryWriteValue);
+								const unsigned int outputQword =
+									path1DataQwords + copyQword;
+								if (outputQword < 3832u)
+								{
+									const unsigned int outputWord =
+										1056u + outputQword * 4u;
+									path1Words[outputWord + 0u] = source.x;
+									path1Words[outputWord + 1u] = source.y;
+									path1Words[outputWord + 2u] = source.z;
+									path1Words[outputWord + 3u] = source.w;
+								}
+								else
+								{
+									const unsigned int pagedQword =
+										outputQword - 3832u;
+									const unsigned int page = pagedQword >> 12u;
+									const unsigned int outputWord =
+										(pagedQword & 4095u) * 4u;
+									if (page == 0u)
+									{
+										path1Page1Words[outputWord + 0u] = source.x;
+										path1Page1Words[outputWord + 1u] = source.y;
+										path1Page1Words[outputWord + 2u] = source.z;
+										path1Page1Words[outputWord + 3u] = source.w;
+									}
+									else if (page == 1u)
+									{
+										path1Page2Words[outputWord + 0u] = source.x;
+										path1Page2Words[outputWord + 1u] = source.y;
+										path1Page2Words[outputWord + 2u] = source.z;
+										path1Page2Words[outputWord + 3u] = source.w;
+									}
+									else if (page == 2u)
+									{
+										path1Page3Words[outputWord + 0u] = source.x;
+										path1Page3Words[outputWord + 1u] = source.y;
+										path1Page3Words[outputWord + 2u] = source.z;
+										path1Page3Words[outputWord + 3u] = source.w;
+									}
+								}
+							}
+						}
+						const unsigned int descriptor =
+							16u + path1PacketCount * 4u;
+						path1Words[descriptor + 0u] = exportPath1Address;
+						path1Words[descriptor + 1u] = path1DataQwords;
+						path1Words[descriptor + 2u] = packetQwords;
+						path1Words[descriptor + 3u] = packetTags;
+						path1PacketCount++;
+						path1DataQwords += packetQwords;
+					}
+				}
+
+				if (branch > 0u)
+				{
+					if (branch == 1u)
+					{
+						pc = branchPc;
+						if (takeDelayBranch != 0u)
+						{
+							branch = 1u;
+							branchPc = delayBranchPc;
+							takeDelayBranch = 0u;
+						}
+						else branch = 0u;
+					}
+					else branch--;
+				}
+				if (ebitCountdown > 0u)
+				{
+					if (ebitCountdown == 1u)
+					{
+						ebitCountdown = 0u;
+						stopReason = 1u;
+					}
+					else ebitCountdown--;
+				}
+				executed++;
+				pairBudget--;
+			}
+		}
+	}
+	if (stopReason == 0u && stateInput[38] != 0u &&
+		pc == stateInput[37] && branch == 0u && ebitCountdown == 0u)
+		stopReason = 13u;
+	else if (stopReason == 0u && pairBudget == 0u)
+		stopReason = 7u;
+	else if (stopReason == 0u &&
+		executed - submissionExecutedStart >= submissionPairLimit)
+		stopReason = 13u;
+	// A packet queued by the terminal E-bit delay slot is flushed by the narrow
+	// fixed PATH1 commit kernel. Stop this core after draining every VU pipeline
+	// and publish phase 3; the dependency job appends the packet before either
+	// command parsing resumes or the terminal End generation is committed.
+	if (stopReason == 1u && pendingXgkick != 0u)
+		stopReason = 10u;
+	if (stopReason == 1u || stopReason == 10u)
+		{
+			// PCSX2 VU1microInterp.cpp::_vu1FinishProgram() drains every pending
+			// dependency pipe and clears the branch-visibility compatibility window.
+			if (fdivEnabled != 0u)
+			{
+				vuCycle = VuMaxU(vuCycle, fdivReady);
+				qValue = fdivValue;
+				statusFlag = VuMergeFdivStatus(statusFlag, fdivStatus);
+			}
+			if (efuEnabled != 0u)
+			{
+				vuCycle = VuMaxU(vuCycle, efuReady);
+				pValue = efuValue;
+			}
+			if (fmacCount > 0u) vuCycle = VuMaxU(vuCycle, fmacReady.x);
+			if (fmacCount > 1u) vuCycle = VuMaxU(vuCycle, fmacReady.y);
+			if (fmacCount > 2u) vuCycle = VuMaxU(vuCycle, fmacReady.z);
+		if (fmacCount > 3u) vuCycle = VuMaxU(vuCycle, fmacReady.w);
+		if (ialuCount > 0u) vuCycle = VuMaxU(vuCycle, ialuReady.x);
+		if (ialuCount > 1u) vuCycle = VuMaxU(vuCycle, ialuReady.y);
+			if (ialuCount > 2u) vuCycle = VuMaxU(vuCycle, ialuReady.z);
+			if (ialuCount > 3u) vuCycle = VuMaxU(vuCycle, ialuReady.w);
+			fmacCount = 0u;
+			ialuCount = 0u;
+			fdivEnabled = 0u;
+			efuEnabled = 0u;
+			viBackupCycles = 0u;
+		}
+#if VITASX2_GPU_VU_COMPACT_CONTINUATION
+			if (stopReason == 1u)
+				epochEnded = true;
+#else
+			if (stopReason == 1u && !epochEnded)
+				stopReason = 0u;
+#endif
+		}
+		}
+	}
+	if (!epochEnded && stopReason == 0u)
+		stopReason = 8u;
+
+	VU_PUBLISH_STATE(0u, pc);
+	VU_PUBLISH_STATE(2u, stopReason == 0u ? 7u : stopReason);
+	VU_PUBLISH_STATE(3u, branch);
+	VU_PUBLISH_STATE(4u, branchPc);
+	VU_PUBLISH_STATE(5u, delayBranchPc);
+	VU_PUBLISH_STATE(6u, takeDelayBranch);
+	VU_PUBLISH_STATE(7u, ebitCountdown);
+	VU_PUBLISH_STATE(27u, executed);
+	#pragma loop (unroll: never)
+	for (unsigned int publishVi = 1u; publishVi < 16u; publishVi++)
+		VU_PUBLISH_STATE(8u + publishVi, vi[publishVi] & 0xffffu);
+	VU_PUBLISH_STATE(24u, iValue);
+	VU_PUBLISH_STATE(31u, commandCount);
+	VU_PUBLISH_STATE(32u, unpackVectorCount);
+	VU_PUBLISH_STATE(40u, vifTop);
+	VU_PUBLISH_STATE(41u, vifItop);
+	VU_PUBLISH_STATE(33u, pendingXgkick);
+	VU_PUBLISH_STATE(34u, pendingXgkickAddress);
+	VU_PUBLISH_STATE(25u, qValue);
+	VU_PUBLISH_STATE(26u, pValue);
+	VU_PUBLISH_STATE(42u, macFlag);
+	VU_PUBLISH_STATE(43u, statusFlag);
+	VU_PUBLISH_STATE(45u, clipFlag);
+	VU_PUBLISH_STATE(46u, vuCycle);
+	VU_PUBLISH_STATE(47u, configurationBits);
+	const bool publishContinuation = stopReason == 13u;
+	const bool publishPath1Commit = stopReason == 10u;
+	VU_PUBLISH_STATE(59u, publishPath1Commit ? 3u :
+		(publishContinuation ? 1u :
+		(stopReason != 0u ? 2u : 0u)));
+	VU_PUBLISH_STATE(60u,
+		publishContinuation || publishPath1Commit ? commandCursor : 0u);
+	VU_PUBLISH_STATE(61u, publishContinuation ? pairBudget : 0u);
+	VU_PUBLISH_STATE(62u, publishContinuation && sawExecute ? 1u : 0u);
+	// The full fixed core owns the first command/UNPACK transition with its
+	// conservative slice, then publishes the separately attested compact limit
+	// from word 36 for dependency-ordered continuation jobs. Validation leaves
+	// word 36 zero and retains its original one-shot limit.
+#if VITASX2_GPU_VU_COMPACT_CONTINUATION
+	VU_PUBLISH_STATE(63u, submissionPairLimit);
+#else
+	VU_PUBLISH_STATE(63u,
+		publishContinuation && sawExecute && stateInput[36] != 0u ?
+			stateInput[36] : submissionPairLimit);
+#endif
+	VU_PUBLISH_STATE(64u, publishContinuation ? viBackupCycles : 0u);
+	VU_PUBLISH_STATE(65u, publishContinuation ? viBackupRegister : 0u);
+	VU_PUBLISH_STATE(66u, publishContinuation ? viBackupOldValue : 0u);
+	VU_PUBLISH_STATE(67u, publishContinuation ? fmacCount : 0u);
+	VU_PUBLISH_STATE(68u, publishContinuation ? fmacReady.x : 0u);
+	VU_PUBLISH_STATE(69u, publishContinuation ? fmacReady.y : 0u);
+	VU_PUBLISH_STATE(70u, publishContinuation ? fmacReady.z : 0u);
+	VU_PUBLISH_STATE(71u, publishContinuation ? fmacReady.w : 0u);
+	VU_PUBLISH_STATE(72u, publishContinuation ? fmacUpperWriter.x : 0u);
+	VU_PUBLISH_STATE(73u, publishContinuation ? fmacUpperWriter.y : 0u);
+	VU_PUBLISH_STATE(74u, publishContinuation ? fmacUpperWriter.z : 0u);
+	VU_PUBLISH_STATE(75u, publishContinuation ? fmacUpperWriter.w : 0u);
+	VU_PUBLISH_STATE(76u, publishContinuation ? fmacLowerWriter.x : 0u);
+	VU_PUBLISH_STATE(77u, publishContinuation ? fmacLowerWriter.y : 0u);
+	VU_PUBLISH_STATE(78u, publishContinuation ? fmacLowerWriter.z : 0u);
+	VU_PUBLISH_STATE(79u, publishContinuation ? fmacLowerWriter.w : 0u);
+	VU_PUBLISH_STATE(80u, publishContinuation ? ialuCount : 0u);
+	VU_PUBLISH_STATE(81u, publishContinuation ? ialuReady.x : 0u);
+	VU_PUBLISH_STATE(82u, publishContinuation ? ialuReady.y : 0u);
+	VU_PUBLISH_STATE(83u, publishContinuation ? ialuReady.z : 0u);
+	VU_PUBLISH_STATE(84u, publishContinuation ? ialuReady.w : 0u);
+	VU_PUBLISH_STATE(85u, publishContinuation ? ialuWriterMask.x : 0u);
+	VU_PUBLISH_STATE(86u, publishContinuation ? ialuWriterMask.y : 0u);
+	VU_PUBLISH_STATE(87u, publishContinuation ? ialuWriterMask.z : 0u);
+	VU_PUBLISH_STATE(88u, publishContinuation ? ialuWriterMask.w : 0u);
+	VU_PUBLISH_STATE(89u, publishContinuation ? fdivReady : 0u);
+	VU_PUBLISH_STATE(90u, publishContinuation ? fdivValue : 0u);
+	VU_PUBLISH_STATE(91u, publishContinuation ? fdivStatus : 0u);
+	VU_PUBLISH_STATE(92u, publishContinuation ? fdivEnabled : 0u);
+	VU_PUBLISH_STATE(93u, publishContinuation ? efuReady : 0u);
+	VU_PUBLISH_STATE(94u, publishContinuation ? efuValue : 0u);
+	VU_PUBLISH_STATE(95u, publishContinuation ? efuEnabled : 0u);
+#if VITASX2_GPU_VU_INLINE_UNPACK
+	VU_PUBLISH_STATE(96u, vifRow.x);
+	VU_PUBLISH_STATE(97u, vifRow.y);
+	VU_PUBLISH_STATE(98u, vifRow.z);
+	VU_PUBLISH_STATE(99u, vifRow.w);
+	VU_PUBLISH_STATE(100u, vifColumn.x);
+	VU_PUBLISH_STATE(101u, vifColumn.y);
+	VU_PUBLISH_STATE(102u, vifColumn.z);
+	VU_PUBLISH_STATE(103u, vifColumn.w);
+	VU_PUBLISH_STATE(104u, publishContinuation ? unpackVectorCursor : 0u);
+	VU_PUBLISH_STATE(105u, publishContinuation ? unpackSourceCursor : 0u);
+	VU_PUBLISH_STATE(106u, publishContinuation ? unpackDestinationCursor : 0u);
+	VU_PUBLISH_STATE(107u, publishContinuation ? unpackCycleCursor : 0u);
+	VU_PUBLISH_STATE(108u, publishContinuation ? unpackGeneratedCursor : 0u);
+	VU_PUBLISH_STATE(109u, publishContinuation ? unpackCommandMarker : 0u);
+	VU_PUBLISH_STATE(110u, 0u);
+	VU_PUBLISH_STATE(111u, 0u);
+#endif
+	vf[32] = accumulator;
+	#pragma loop (unroll: never)
+	for (unsigned int publishVf = 0u; publishVf < 33u; publishVf++)
+		VU_PUBLISH_VF(publishVf, vf[publishVf]);
+	#pragma loop (unroll: never)
+	for (unsigned int publishMemory = 0u;
+		publishMemory < memoryWriteCount; publishMemory++)
+	{
+		VU_PUBLISH_MEMORY(memoryWriteAddress[publishMemory],
+			memoryWriteValue[publishMemory]);
+	}
+	path1Words[0] = 1u;
+	path1Words[1] = path1PacketCount;
+	path1Words[2] = path1DataQwords;
+	path1Words[3] = path1Error;
+
+	// One invocation executes one dependent chain. Rendering is deliberately a
+	// dummy point; complete raw PATH1 output remains in BUFFER6 for one coarse
+	// command-epoch consumer rather than forcing a wait at each XGKICK.
+	vPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	vResult = float4((float)executed,
+		(float)(stopReason == 0u ? 7u : stopReason),
+		(float)(pc >> 3), (float)aIndex);
+#undef VU_PUBLISH_MEMORY
+#undef VU_PUBLISH_VF
+#undef VU_PUBLISH_STATE
+}

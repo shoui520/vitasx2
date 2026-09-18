@@ -102,7 +102,8 @@ struct PendingFinalPath {
 
 struct QwordCopy {
   InvocationValueSet destination;
-  InvocationValueSet source;
+  std::array<InvocationValueSet, 4> source_words;
+  InvocationValueSet source_address;
 };
 
 class InvocationPlanBuilder {
@@ -724,13 +725,15 @@ private:
       return;
     }
     const u32 source = VUInterpFast::Fs(plan.lower);
-    InvocationValueSet source_address;
-    if (!ExtractQwordSource(old.vf[source], &source_address))
-      return;
+    for (const InvocationValueSet& word : old.vf[source]) {
+      if (word.unknown)
+        return;
+    }
     QwordCopy copy;
     copy.destination = StoreAddress(plan, old);
-    copy.source = std::move(source_address);
-    if (!copy.destination.unknown && !copy.source.unknown)
+    copy.source_words = old.vf[source];
+    ExtractQwordSource(old.vf[source], &copy.source_address);
+    if (!copy.destination.unknown)
       m_qword_copies.push_back(std::move(copy));
   }
 
@@ -996,11 +999,11 @@ private:
 
     const u32 branch_pair_index =
         static_cast<u32>(block.pairs.size() - 2);
-    if (branch_pair_index >= m_kernel.vi.prefix[loop.counter_reg].size()) {
+    if (branch_pair_index >= m_kernel.vi.PrefixForRegister(loop.counter_reg).size()) {
       return Fail(error, "final VI loop branch prefix is missing");
     }
     const s32 branch_prefix =
-        m_kernel.vi.prefix[loop.counter_reg][branch_pair_index];
+        m_kernel.vi.PrefixForRegister(loop.counter_reg)[branch_pair_index];
     const u32 first_branch_value =
         AddConstant(state->vi[loop.counter_reg], branch_prefix);
     if (first_branch_value == InvalidValue)
@@ -1207,38 +1210,54 @@ private:
                         std::string* error) {
     if (m_kernel.stores.empty())
       return Fail(error, "invocation plan has no loop stores");
-    const LoopStore* first = &m_kernel.stores.front();
-    for (const LoopStore& store : m_kernel.stores) {
-      if (store.address.qword_offset < first->address.qword_offset)
-        first = &store;
-    }
-    if (!first->address.valid ||
-        first->address.base_vi >= header.vi.size()) {
-      return Fail(error, "invocation output base is not affine");
-    }
-    const InvocationValueSet tag_destination =
-        AddConstant(header.vi[first->address.base_vi],
-                    first->address.qword_offset - 1);
-    if (tag_destination.unknown)
-      return Fail(error, "invocation output tag address is unknown");
-
-    InvocationValueSet source;
+    // Store qword_offset values are relative to each store's own VI base.
+    // Comparing those integers directly selected BSpline's ST stream (VI9)
+    // ahead of its earlier RGBA stream (VI4), then looked for a GIF tag at
+    // output+0 instead of output-1. Resolve every store through the symbolic
+    // header VI state and accept the unique preceding qword which is actually
+    // populated by a complete four-lane SQ copy. This is the same title-neutral
+    // proof for arbitrary interleaved output streams; no PC or source shape
+    // participates.
+    std::array<InvocationValueSet, 4> source_words;
+    InvocationValueSet source_address;
+    InvocationValueSet found_destination;
     bool found = false;
-    for (const QwordCopy& copy : m_qword_copies) {
-      if (!(copy.destination == tag_destination))
+    for (const LoopStore& store : m_kernel.stores) {
+      if (!store.address.valid ||
+          store.address.base_vi >= header.vi.size()) {
+        return Fail(error, "invocation output base is not affine");
+      }
+      const InvocationValueSet store_destination =
+          AddConstant(header.vi[store.address.base_vi],
+                      store.address.qword_offset);
+      const InvocationValueSet tag_destination =
+          AddConstant(store_destination, -1);
+      if (tag_destination.unknown)
         continue;
-      if (!found) {
-        source = copy.source;
-        found = true;
-      } else if (!(source == copy.source)) {
-        return Fail(error,
-                    "invocation output tag has conflicting memory sources");
+      for (const QwordCopy& copy : m_qword_copies) {
+        if (!(copy.destination == tag_destination))
+          continue;
+        if (!found) {
+          source_words = copy.source_words;
+          source_address = copy.source_address;
+          found_destination = tag_destination;
+          found = true;
+        } else if (!(found_destination == tag_destination) ||
+                   !(source_words == copy.source_words)) {
+          return Fail(error,
+                      "invocation output tag has conflicting memory sources");
+        }
       }
     }
-    if (!found || source.unknown)
+    if (!found || std::any_of(source_words.begin(), source_words.end(),
+                              [](const InvocationValueSet& word) {
+                                return word.unknown;
+                              })) {
       return Fail(error,
                   "invocation cannot prove the copied packed GIF tag source");
-    m_plan->gif_tag_qword_address = std::move(source);
+    }
+    m_plan->gif_tag_words = std::move(source_words);
+    m_plan->gif_tag_qword_address = std::move(source_address);
     m_plan->has_static_gif_source = true;
     return true;
   }
@@ -1281,7 +1300,8 @@ bool EvaluateNode(const ParallelInvocationPlan& plan, u32 id,
       *result = context.initial_vi[node.reg];
     break;
   case InvocationValueKind::InitialVfWord:
-    ok = context.initial_vf_words != nullptr;
+    ok = context.initial_vf_words != nullptr &&
+         context.InitialVfLaneAvailable(node.reg, node.lane);
     if (ok)
       *result = context.initial_vf_words[node.reg * 4 + node.lane];
     break;

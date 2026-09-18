@@ -1,0 +1,93 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// Title-neutral playable-profile FMAC batch for generated structured VU1
+// roots. This is deliberately a separate GXP from the nearest-even software
+// implementation: SGX native ADD/SUB/MUL stays small enough for parallel
+// Series5XT execution and exact-mode helper code cannot occupy its instruction
+// or temporary-register budget. PCSX2's VU normalization remains explicit.
+
+#pragma warning (default:7203)
+#pragma readwrite_buffer BUFFER10
+
+#define VITASX2_STRUCTURED_FMAC_FORMAT 2u
+#define VITASX2_STRUCTURED_FMAC_MAX_OPERATIONS 32u
+#define VITASX2_STRUCTURED_FMAC_ADD 1u
+#define VITASX2_STRUCTURED_FMAC_SUBTRACT 2u
+#define VITASX2_STRUCTURED_FMAC_MULTIPLY 3u
+#define VITASX2_STRUCTURED_FMAC_IMMEDIATE 2u
+#define VITASX2_STRUCTURED_SCRATCH_SLOTS 128u
+#define VITASX2_STRUCTURED_MAX_INVOCATIONS 4096u
+#define VITASX2_STRUCTURED_NUMERIC_MASK 4080u
+#define VITASX2_STRUCTURED_NUMERIC_PROFILE 3088u
+#define VITASX2_STRUCTURED_APPROXIMATE_FMAC 16384u
+#define VITASX2_STRUCTURED_CONFIGURATION_KNOWN_MASK 32767u
+
+unsigned int VitaVuF32NormalizeBits(unsigned int bits)
+{
+	const unsigned int exponent = bits & 2139095040u;
+	if (exponent == 0u) return bits & 2147483648u;
+	if (exponent == 2139095040u)
+		return (bits & 2147483648u) | 2139095039u;
+	return bits;
+}
+
+unsigned int VitaVuNativeF32(
+	unsigned int operation, unsigned int leftBits, unsigned int rightBits)
+{
+	const float left = intBitsToFloat(int(VitaVuF32NormalizeBits(leftBits)));
+	const float right = intBitsToFloat(int(VitaVuF32NormalizeBits(rightBits)));
+	const float result = operation == VITASX2_STRUCTURED_FMAC_MULTIPLY ?
+		left * right : operation == VITASX2_STRUCTURED_FMAC_SUBTRACT ?
+		left - right : left + right;
+	return VitaVuF32NormalizeBits(
+		unsigned int(floatToRawIntBits(result)));
+}
+
+void main(
+	uniform unsigned int4 VuDescriptor[66] : BUFFER0,
+	uniform unsigned int VuScratchWords[1] : BUFFER10,
+	unsigned int VuInvocation : INDEX,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPointSize = 1.0f;
+	const unsigned int format = VuDescriptor[0].x;
+	const unsigned int operationCount = VuDescriptor[0].y;
+	const unsigned int configuration = VuDescriptor[0].z;
+	const bool valid = format == VITASX2_STRUCTURED_FMAC_FORMAT &&
+		operationCount != 0u &&
+		operationCount <= VITASX2_STRUCTURED_FMAC_MAX_OPERATIONS &&
+		(configuration & ~VITASX2_STRUCTURED_CONFIGURATION_KNOWN_MASK) == 0u &&
+		(configuration & VITASX2_STRUCTURED_NUMERIC_MASK) ==
+			VITASX2_STRUCTURED_NUMERIC_PROFILE &&
+		(configuration & VITASX2_STRUCTURED_APPROXIMATE_FMAC) != 0u &&
+		VuDescriptor[1].w == 0u &&
+		VuInvocation < VITASX2_STRUCTURED_MAX_INVOCATIONS;
+	// VitaGpuVuGeneratedUniversal.cpp validates the complete cache-owned
+	// descriptor before copying it into this immutable transaction slot.
+	#pragma branch (flatten: never)
+	if (valid)
+	{
+		const unsigned int base =
+			VuInvocation * VITASX2_STRUCTURED_SCRATCH_SLOTS;
+		#pragma loop (unroll: never)
+		for (unsigned int index = 0u; index < operationCount; index++)
+		{
+			const unsigned int4 first = VuDescriptor[2u + index * 2u];
+			const unsigned int4 second = VuDescriptor[3u + index * 2u];
+			const unsigned int left =
+				first.z == VITASX2_STRUCTURED_FMAC_IMMEDIATE ?
+				first.w : VuScratchWords[base + first.w];
+			const unsigned int right =
+				second.x == VITASX2_STRUCTURED_FMAC_IMMEDIATE ?
+				second.y : VuScratchWords[base + second.y];
+			VuScratchWords[base + first.y] =
+				VitaVuNativeF32(first.x, left, right);
+		}
+	}
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuResult = float4(float(operationCount), float(VuInvocation),
+		valid ? 1.0f : 0.0f, 1.0f);
+}

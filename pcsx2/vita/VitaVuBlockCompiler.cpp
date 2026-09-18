@@ -28,6 +28,9 @@
 #include "vita/VitaFpRounding.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
+#if defined(VITASX2_GPU_VU_OPPORTUNITY_CENSUS)
+#include "vita/VitaGpuVuOpportunityCensus.h"
+#endif
 
 #include "common/Vita/VitaJitMemory.h"
 
@@ -135,6 +138,57 @@ namespace VitaVU
 		// reduce the exact six-bit result without scalar lane extraction.
 		alignas(16) constexpr std::array<u32, 4> VU_CLIP_POSITIVE_WEIGHTS = {
 			0x01u, 0x04u, 0x10u, 0x00u};
+
+		struct ActiveVu1StructuredBoundaryTrace
+		{
+			bool active = false;
+			bool awaiting_child_entry = false;
+			Vu1StructuredBoundaryTrace trace;
+		};
+
+		ActiveVu1StructuredBoundaryTrace s_vu1_structured_boundary_trace;
+
+		void ObserveVu1StructuredBoundaryPair()
+		{
+			ActiveVu1StructuredBoundaryTrace& active =
+				s_vu1_structured_boundary_trace;
+			if (!active.active)
+				return;
+
+			Vu1StructuredBoundaryTrace& trace = active.trace;
+			trace.executed_pairs++;
+			const u32 pc = VU1.VI[REG_TPC].UL & VU1_PROGMASK;
+			if (pc == trace.parent_entry_pc)
+			{
+				trace.parent_observations++;
+				active.awaiting_child_entry = true;
+			}
+			if (!active.awaiting_child_entry || pc != trace.child_entry_pc)
+				return;
+
+			active.awaiting_child_entry = false;
+			if (trace.snapshots.size() >=
+				Vu1StructuredBoundaryMaximumSnapshots)
+			{
+				trace.dropped_snapshots++;
+				return;
+			}
+
+			Vu1StructuredBoundarySnapshot snapshot;
+			snapshot.outer_iteration = trace.parent_observations != 0 ?
+				trace.parent_observations - 1u : 0u;
+			snapshot.cycle = VU1.cycle;
+			std::memcpy(snapshot.vf.data(), &VU1.VF[0].UL[0],
+				32u * 4u * sizeof(u32));
+			std::memcpy(snapshot.vf.data() + 32u * 4u, &VU1.ACC.UL[0],
+				4u * sizeof(u32));
+			for (u32 reg = 0; reg < snapshot.vi.size(); reg++)
+				snapshot.vi[reg] = VU1.VI[reg].UL & 0xffffu;
+			snapshot.q = VU1.VI[REG_Q].UL;
+			snapshot.p = VU1.VI[REG_P].UL;
+			snapshot.i = VU1.VI[REG_I].UL;
+			trace.snapshots.push_back(std::move(snapshot));
+		}
 
 		bool Vu1ProgramActive()
 		{
@@ -1352,7 +1406,8 @@ namespace VitaVU
 
 		// Mirrors the analysis+path-selection half of _vu0Exec()/_vu1Exec() for one pair.
 		// Returns false when the interpreter must own this pair (non-fast op).
-		bool AnalyzePair(u32 vu_index, u32 pc, u32 upper, u32 lower, PairPlan* plan)
+		bool AnalyzePairForConfiguration(u32 vu_index, u32 pc, u32 upper,
+			u32 lower, bool assume_scheduled, bool instant_qp, PairPlan* plan)
 		{
 			plan->pc = pc;
 			plan->upper = upper;
@@ -1542,7 +1597,7 @@ namespace VitaVU
 			// Producer queues with architectural results or delayed flags also stay
 			// exact. The IALU queue is the sole exception: PCSX2 VUops.cpp only reads
 			// it from _vuTestALUStalls(), which this contract makes unreachable.
-			if (vu_index == 1 && EmuConfig.Speedhacks.vu1AssumeScheduled)
+			if (vu_index == 1 && assume_scheduled)
 			{
 				const auto lower_kind =
 					static_cast<VUInterpFast::LowerFastKind>(plan->lower_kind);
@@ -1569,7 +1624,7 @@ namespace VitaVU
 			// pending resource to test, wait for, snapshot, or append afterward.
 			// Sony VU User Manual 3.4.5/3.4.6 defines the intentionally relaxed
 			// behavior: an ordinary early Q/P read would otherwise see the old value.
-			if (vu_index == 1 && EmuConfig.Speedhacks.vu1InstantQP &&
+			if (vu_index == 1 && instant_qp &&
 				(plan->lregs.pipe == VUPIPE_FDIV || plan->lregs.pipe == VUPIPE_EFU))
 			{
 				plan->instant_qp_producer = plan->add_lower_stalls;
@@ -1595,11 +1650,19 @@ namespace VitaVU
 
 			plan->fmac_pipe = (plan->uregs.pipe == VUPIPE_FMAC) || (plan->lregs.pipe == VUPIPE_FMAC);
 			plan->scheduled_fmac_hazard_metadata_elided =
-				vu_index == 1 && EmuConfig.Speedhacks.vu1AssumeScheduled && plan->fmac_pipe;
+				vu_index == 1 && assume_scheduled && plan->fmac_pipe;
 			// _vuTestPipes() can be skipped whenever the runtime pipe-ready
 			// guard proves every PCSX2 flush arm would be side-effect-free.
 			plan->test_pipes_fast_guard = true;
 			return true;
+		}
+
+		bool AnalyzePair(u32 vu_index, u32 pc, u32 upper, u32 lower,
+			PairPlan* plan)
+		{
+			return AnalyzePairForConfiguration(vu_index, pc, upper, lower,
+				vu_index == 1 && EmuConfig.Speedhacks.vu1AssumeScheduled,
+				vu_index == 1 && EmuConfig.Speedhacks.vu1InstantQP, plan);
 		}
 
 		void ExportGpuPairPlan(const PairPlan& source, GpuPairPlan* output)
@@ -1614,6 +1677,12 @@ namespace VitaVU
 			output->lower_vi_write = source.lregs.VIwrite;
 			output->upper_cycles = source.uregs.cycles;
 			output->lower_cycles = source.lregs.cycles;
+			output->upper_pipe = source.uregs.pipe;
+			output->lower_pipe = source.lregs.pipe;
+			output->vi_backup_write = source.vi_backup_write &&
+				!source.discard_lower;
+			output->vi_backup_reg = output->vi_backup_write ?
+				source.vi_backup_reg : 0;
 			output->upper_kind = source.upper_kind;
 			output->lower_kind = source.lower_kind;
 			output->upper_vf_write = source.uregs.VFwrite;
@@ -2198,6 +2267,17 @@ namespace VitaVU
 					 (!block->continues_logical_block_if_busy &&
 					  !last.dflag && !last.tflag &&
 					  !(last.ebit_tail && last.ebit_store == 0)));
+#if defined(VITASX2_GPU_VU_OPPORTUNITY_CENSUS)
+				// A census build classifies exact dynamically executed PairPlans.
+				// Returning at the existing natural block seam makes the returned
+				// pair count attributable without inserting a helper inside generated
+				// code. Timing evidence is collected with this option disabled.
+				if (!conservative_vu0 &&
+					VitaGpuVuOpportunityCensus::IsEnabled())
+				{
+					block->direct_link_tail = false;
+				}
+#endif
 				if (block->direct_link_tail)
 				{
 					const bool target_ebit_tail = last.ebit_tail && last.ebit_store != 0;
@@ -15503,6 +15583,38 @@ namespace VitaVU
 			}
 	} // anonymous namespace
 
+	bool BeginVu1StructuredBoundaryTrace(u32 parent_entry_pc,
+		u32 child_entry_pc)
+	{
+		if (s_vu1_structured_boundary_trace.active ||
+			(parent_entry_pc & 7u) != 0 || (child_entry_pc & 7u) != 0 ||
+			parent_entry_pc > VU1_PROGMASK || child_entry_pc > VU1_PROGMASK)
+		{
+			return false;
+		}
+
+		ActiveVu1StructuredBoundaryTrace& active =
+			s_vu1_structured_boundary_trace;
+		active = {};
+		active.active = true;
+		active.trace.parent_entry_pc = parent_entry_pc;
+		active.trace.child_entry_pc = child_entry_pc;
+		active.trace.snapshots.reserve(
+			Vu1StructuredBoundaryMaximumSnapshots);
+		return true;
+	}
+
+	bool EndVu1StructuredBoundaryTrace(Vu1StructuredBoundaryTrace* trace)
+	{
+		ActiveVu1StructuredBoundaryTrace& active =
+			s_vu1_structured_boundary_trace;
+		if (!active.active || !trace)
+			return false;
+		*trace = std::move(active.trace);
+		active = {};
+		return true;
+	}
+
 	bool AnalyzeGpuVu1Pair(u32 pc, u32 upper, u32 lower, GpuPairPlan* plan)
 	{
 		if (!plan)
@@ -15511,6 +15623,22 @@ namespace VitaVU
 		PairPlan internal{};
 		if (!AnalyzePair(1, pc & VU1_PROGMASK, upper, lower, &internal))
 			return false;
+		ExportGpuPairPlan(internal, plan);
+		return true;
+	}
+
+	bool AnalyzeGpuVu1PairForConfiguration(u32 pc, u32 upper, u32 lower,
+		bool assume_scheduled, bool instant_qp, GpuPairPlan* plan)
+	{
+		if (!plan)
+			return false;
+
+		PairPlan internal{};
+		if (!AnalyzePairForConfiguration(1, pc & VU1_PROGMASK, upper, lower,
+				assume_scheduled, instant_qp, &internal))
+		{
+			return false;
+		}
 		ExportGpuPairPlan(internal, plan);
 		return true;
 	}
@@ -15960,7 +16088,8 @@ namespace VitaVU
 			s_vu1_empty_external_entry_pending;
 		s_vu1_empty_external_entry_pending = false;
 		// Micro-step tracing must go through vu1Exec() so every step records.
-		const bool blocks_eligible = !Pcsx2Trace::IsVuTraceEnabled()
+		const bool blocks_eligible = !Pcsx2Trace::IsVuTraceEnabled() &&
+			!s_vu1_structured_boundary_trace.active
 #if defined(VITASX2_QEMU_VALIDATION)
 			&& !g_qemuVuJitForceInterpreterFallback
 #endif
@@ -16008,6 +16137,15 @@ namespace VitaVU
 					const u32 executed = result & ~EXECUTED_PAIRS_LOGICAL_CONTINUATION;
 					if (executed != 0)
 					{
+#if defined(VITASX2_GPU_VU_OPPORTUNITY_CENSUS)
+						if (VitaGpuVuOpportunityCensus::IsEnabled())
+						{
+							VitaGpuVuOpportunityCensus::RecordExecutedBlock(
+								executed <= block->pair_count ?
+									block->micro_bytes.get() : nullptr,
+								block->start_pc, executed, false);
+						}
+#endif
 						if (performance_telemetry_enabled)
 						{
 							s_vu1.stats.executed_blocks++;
@@ -16024,7 +16162,18 @@ namespace VitaVU
 			}
 
 			const bool resolving_admitted_branch = VU1.branch != 0;
+			ObserveVu1StructuredBoundaryPair();
+#if defined(VITASX2_GPU_VU_OPPORTUNITY_CENSUS)
+			const u32 interpreted_pc = VU1.VI[REG_TPC].UL;
+#endif
 			CpuIntVU1.Step();
+#if defined(VITASX2_GPU_VU_OPPORTUNITY_CENSUS)
+			if (VitaGpuVuOpportunityCensus::IsEnabled())
+			{
+				VitaGpuVuOpportunityCensus::RecordExecutedBlock(
+					VU1.Micro + interpreted_pc, interpreted_pc, 1, true);
+			}
+#endif
 			if (performance_telemetry_enabled)
 				s_vu1.stats.interpreter_steps++;
 			if (blocks_eligible)

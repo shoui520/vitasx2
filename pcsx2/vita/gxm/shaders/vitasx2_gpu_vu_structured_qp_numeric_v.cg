@@ -1,0 +1,243 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// Title-neutral fixed numeric partition for generated structured VU1 roots.
+// PCSX2 owners: VUops.cpp::_vuERSADD()/_vuESQRT(), with the Vita product's
+// explicit approximate-P profile. Runtime-generated modules stage operands in
+// BUFFER10; this offline-compiled root applies the exact software-F32
+// boundaries and Cortex-A9 estimate table, then publishes one scratch result.
+// No title, source PC, program hash, or instruction sequence is embedded here.
+
+#pragma warning (default:7203)
+#pragma readwrite_buffer BUFFER10
+
+#define VITASX2_STRUCTURED_QP_FORMAT 1u
+#define VITASX2_STRUCTURED_QP_RECIPROCAL 1u
+#define VITASX2_STRUCTURED_QP_SQRT 2u
+#define VITASX2_STRUCTURED_SCRATCH_SLOTS 128u
+#define VITASX2_STRUCTURED_MAX_INVOCATIONS 4096u
+
+unsigned int VitaVuF32NormalizeInputBits(unsigned int bits)
+{
+	const unsigned int exponent = bits & 2139095040u;
+	if (exponent == 0u) return bits & 2147483648u;
+	if (exponent == 2139095040u)
+		return (bits & 2147483648u) | 2139095039u;
+	return bits;
+}
+
+unsigned int VitaVuF32ShiftRightJam(unsigned int value, unsigned int distance)
+{
+	if (distance == 0u) return value;
+	if (distance < 32u)
+	{
+		const unsigned int mask = (1u << distance) - 1u;
+		return (value >> distance) | ((value & mask) != 0u ? 1u : 0u);
+	}
+	return value != 0u ? 1u : 0u;
+}
+
+unsigned int VitaVuF32AddBits(unsigned int leftInput, unsigned int rightInput)
+{
+	unsigned int left = VitaVuF32NormalizeInputBits(leftInput);
+	unsigned int right = VitaVuF32NormalizeInputBits(rightInput);
+	unsigned int leftMagnitude = left & 2147483647u;
+	unsigned int rightMagnitude = right & 2147483647u;
+	const unsigned int leftSign = left >> 31u;
+	const unsigned int rightSign = right >> 31u;
+	if (leftMagnitude == 0u && rightMagnitude == 0u)
+		return leftSign == rightSign ? leftSign << 31u : 0u;
+	if (leftMagnitude == 0u) return right;
+	if (rightMagnitude == 0u) return left;
+	if (leftMagnitude < rightMagnitude)
+	{
+		const unsigned int swapBits = left;
+		left = right;
+		right = swapBits;
+		const unsigned int swapMagnitude = leftMagnitude;
+		leftMagnitude = rightMagnitude;
+		rightMagnitude = swapMagnitude;
+	}
+	const unsigned int sign = left & 2147483648u;
+	int exponent = int((left >> 23u) & 255u);
+	const unsigned int rightExponent = (right >> 23u) & 255u;
+	const unsigned int leftSignificand =
+		((left & 8388607u) | 8388608u) << 3u;
+	unsigned int rightSignificand =
+		((right & 8388607u) | 8388608u) << 3u;
+	rightSignificand = VitaVuF32ShiftRightJam(
+		rightSignificand, unsigned int(exponent) - rightExponent);
+	unsigned int significand;
+	if (((left ^ right) & 2147483648u) == 0u)
+	{
+		significand = leftSignificand + rightSignificand;
+		if ((significand & 134217728u) != 0u)
+		{
+			significand = VitaVuF32ShiftRightJam(significand, 1u);
+			exponent++;
+		}
+	}
+	else
+	{
+		significand = leftSignificand - rightSignificand;
+		if (significand == 0u) return 0u;
+		#pragma loop (unroll: never)
+		while ((significand & 67108864u) == 0u)
+		{
+			significand <<= 1u;
+			exponent--;
+		}
+	}
+	if (exponent <= 0) return sign;
+	unsigned int rounded = significand >> 3u;
+	const unsigned int roundBits = significand & 7u;
+	if (roundBits > 4u ||
+		(roundBits == 4u && (rounded & 1u) != 0u)) rounded++;
+	if ((rounded & 16777216u) != 0u)
+	{
+		rounded >>= 1u;
+		exponent++;
+	}
+	if (exponent >= 255) return sign | 2139095039u;
+	return sign | (unsigned int(exponent) << 23u) | (rounded & 8388607u);
+}
+
+unsigned int VitaVuF32MulBits(unsigned int leftInput, unsigned int rightInput)
+{
+	const unsigned int left = VitaVuF32NormalizeInputBits(leftInput);
+	const unsigned int right = VitaVuF32NormalizeInputBits(rightInput);
+	const unsigned int sign = (left ^ right) & 2147483648u;
+	if ((left & 2147483647u) == 0u ||
+		(right & 2147483647u) == 0u) return sign;
+	int exponent = int((left >> 23u) & 255u) +
+		int((right >> 23u) & 255u) - 127;
+	const unsigned int leftSignificand = (left & 8388607u) | 8388608u;
+	const unsigned int rightSignificand = (right & 8388607u) | 8388608u;
+	const unsigned int leftLow = leftSignificand & 65535u;
+	const unsigned int leftHigh = leftSignificand >> 16u;
+	const unsigned int rightLow = rightSignificand & 65535u;
+	const unsigned int rightHigh = rightSignificand >> 16u;
+	const unsigned int lowProduct = leftLow * rightLow;
+	const unsigned int crossProduct =
+		leftHigh * rightLow + leftLow * rightHigh;
+	const unsigned int productLow = lowProduct + (crossProduct << 16u);
+	const unsigned int carry = productLow < lowProduct ? 1u : 0u;
+	const unsigned int productHigh =
+		leftHigh * rightHigh + (crossProduct >> 16u) + carry;
+	unsigned int rounded;
+	unsigned int remainder;
+	unsigned int halfway;
+	if ((productHigh & 32768u) != 0u)
+	{
+		rounded = (productHigh << 8u) | (productLow >> 24u);
+		remainder = productLow & 16777215u;
+		halfway = 8388608u;
+		exponent++;
+	}
+	else
+	{
+		rounded = (productHigh << 9u) | (productLow >> 23u);
+		remainder = productLow & 8388607u;
+		halfway = 4194304u;
+	}
+	if (remainder > halfway ||
+		(remainder == halfway && (rounded & 1u) != 0u)) rounded++;
+	if ((rounded & 16777216u) != 0u)
+	{
+		rounded >>= 1u;
+		exponent++;
+	}
+	if (exponent <= 0) return sign;
+	if (exponent >= 255) return sign | 2139095039u;
+	return sign | (unsigned int(exponent) << 23u) | (rounded & 8388607u);
+}
+
+unsigned int VitaVuArmApproximateReciprocalBits(
+	unsigned int inputBits, unsigned int estimateField)
+{
+	const unsigned int valueBits = VitaVuF32NormalizeInputBits(inputBits);
+	const unsigned int signBits = valueBits & 2147483648u;
+	const unsigned int exponent = (valueBits >> 23u) & 255u;
+	if (exponent == 0u) return valueBits;
+	if (exponent == 255u || exponent >= 253u) return signBits;
+	const unsigned int seedBits = signBits |
+		((253u - exponent) << 23u) | (estimateField << 15u);
+	const unsigned int product = VitaVuF32MulBits(valueBits, seedBits);
+	const unsigned int refinementStep =
+		VitaVuF32AddBits(1073741824u, product ^ 2147483648u);
+	return VitaVuF32MulBits(seedBits, refinementStep);
+}
+
+unsigned int VitaVuArmApproximateSqrtBits(
+	unsigned int inputBits, unsigned int estimateField)
+{
+	const unsigned int valueBits = VitaVuF32NormalizeInputBits(inputBits);
+	const unsigned int exponent = (valueBits >> 23u) & 255u;
+	if ((valueBits & 2147483648u) != 0u ||
+		(valueBits & 2147483647u) == 0u || exponent == 255u) return valueBits;
+	const unsigned int seedBits =
+		(((380u - exponent) >> 1u) << 23u) | (estimateField << 15u);
+	const unsigned int seedSquare = VitaVuF32MulBits(seedBits, seedBits);
+	const unsigned int product = VitaVuF32MulBits(valueBits, seedSquare);
+	const unsigned int difference =
+		VitaVuF32AddBits(1077936128u, product ^ 2147483648u);
+	const unsigned int refinementStep =
+		VitaVuF32MulBits(difference, 1056964608u);
+	const unsigned int refined =
+		VitaVuF32MulBits(seedBits, refinementStep);
+	return VitaVuF32MulBits(valueBits, refined);
+}
+
+void main(
+	uniform unsigned int4 VuDescriptor[1] : BUFFER0,
+	uniform unsigned int VuArmEstimateWords[640] : BUFFER7,
+	uniform unsigned int VuScratchWords[1] : BUFFER10,
+	unsigned int VuInvocation : INDEX,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPointSize = 1.0f;
+	const unsigned int format = VuDescriptor[0].x;
+	const unsigned int operation = VuDescriptor[0].y;
+	const unsigned int inputSlot = VuDescriptor[0].z;
+	const unsigned int outputSlot = VuDescriptor[0].w;
+	const bool valid = format == VITASX2_STRUCTURED_QP_FORMAT &&
+		(operation == VITASX2_STRUCTURED_QP_RECIPROCAL ||
+		 operation == VITASX2_STRUCTURED_QP_SQRT) &&
+		inputSlot < VITASX2_STRUCTURED_SCRATCH_SLOTS &&
+		outputSlot < VITASX2_STRUCTURED_SCRATCH_SLOTS &&
+		inputSlot != outputSlot &&
+		VuInvocation < VITASX2_STRUCTURED_MAX_INVOCATIONS;
+	if (valid)
+	{
+		const unsigned int base =
+			VuInvocation * VITASX2_STRUCTURED_SCRATCH_SLOTS;
+		const unsigned int inputBits = VuScratchWords[base + inputSlot];
+		unsigned int resultBits = inputBits;
+		if (operation == VITASX2_STRUCTURED_QP_RECIPROCAL)
+		{
+			const unsigned int normalized =
+				VitaVuF32NormalizeInputBits(inputBits);
+			const unsigned int estimateIndex = (normalized >> 15u) & 255u;
+			resultBits = VitaVuArmApproximateReciprocalBits(
+				normalized, VuArmEstimateWords[estimateIndex]);
+		}
+		else
+		{
+			const unsigned int normalized =
+				VitaVuF32NormalizeInputBits(inputBits);
+			const unsigned int exponent = (normalized >> 23u) & 255u;
+			const unsigned int scaled = (exponent & 1u) != 0u ?
+				(128u | ((normalized >> 16u) & 127u)) :
+				(256u | ((normalized >> 15u) & 255u));
+			resultBits = VitaVuArmApproximateSqrtBits(
+				normalized,
+				VuArmEstimateWords[256u + scaled - 128u]);
+		}
+		VuScratchWords[base + outputSlot] = resultBits;
+	}
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuResult = float4(float(operation), float(VuInvocation),
+		valid ? 1.0f : 0.0f, 0.0f);
+}

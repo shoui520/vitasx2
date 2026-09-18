@@ -1,0 +1,110 @@
+// VitaSX2 title-neutral exact generated-VU arithmetic stage.
+//
+// PCSX2 owner: VUops.cpp::_vuOpADD/_vuOpSUB and vuDouble().  Series5XT's
+// native binary32 result is the normalized round-toward-zero candidate.  The
+// integer remainder below moves that candidate by at most one ULP to implement
+// the nearest-even product profile without embedding this helper in every
+// runtime-generated root.
+#pragma warning (default:7203)
+#pragma readwrite_buffer BUFFER1
+
+unsigned int VitaVuF32NormalizeInputBits(unsigned int bits)
+{
+	const unsigned int exponent = bits & 2139095040u;
+	if (exponent == 0u) return bits & 2147483648u;
+	if (exponent == 2139095040u)
+		return (bits & 2147483648u) | 2139095039u;
+	return bits;
+}
+
+unsigned int VitaVuF32ShiftRightJam(unsigned int value,
+	unsigned int distance)
+{
+	if (distance == 0u) return value;
+	if (distance < 32u)
+	{
+		const unsigned int mask = (1u << distance) - 1u;
+		return (value >> distance) |
+			((value & mask) != 0u ? 1u : 0u);
+	}
+	return value != 0u ? 1u : 0u;
+}
+
+unsigned int VitaVuF32AddBits(unsigned int leftInput,
+	unsigned int rightInput)
+{
+	unsigned int left = VitaVuF32NormalizeInputBits(leftInput);
+	unsigned int right = VitaVuF32NormalizeInputBits(rightInput);
+	unsigned int leftMagnitude = left & 2147483647u;
+	unsigned int rightMagnitude = right & 2147483647u;
+	const unsigned int leftSign = left >> 31u;
+	const unsigned int rightSign = right >> 31u;
+	if (leftMagnitude == 0u && rightMagnitude == 0u)
+		return leftSign == rightSign ? leftSign << 31u : 0u;
+	if (leftMagnitude == 0u) return right;
+	if (rightMagnitude == 0u) return left;
+	if (leftMagnitude < rightMagnitude)
+	{
+		const unsigned int swapBits = left;
+		left = right;
+		right = swapBits;
+		const unsigned int swapMagnitude = leftMagnitude;
+		leftMagnitude = rightMagnitude;
+		rightMagnitude = swapMagnitude;
+	}
+	const unsigned int resultSignBits = left & 2147483648u;
+	const unsigned int leftExponent = (left >> 23u) & 255u;
+	const unsigned int rightExponent = (right >> 23u) & 255u;
+	const unsigned int leftSignificand =
+		((left & 8388607u) | 8388608u) << 3u;
+	unsigned int rightSignificand =
+		((right & 8388607u) | 8388608u) << 3u;
+	rightSignificand = VitaVuF32ShiftRightJam(rightSignificand,
+		leftExponent - rightExponent);
+	unsigned int exactSignificand;
+	if (((left ^ right) & 2147483648u) == 0u)
+		exactSignificand = leftSignificand + rightSignificand;
+	else
+		exactSignificand = leftSignificand - rightSignificand;
+	if (exactSignificand == 0u) return 0u;
+	const float nativeLeft = intBitsToFloat(int(left));
+	const float nativeRight = intBitsToFloat(int(right));
+	const unsigned int nativeBits =
+		unsigned int(floatToRawIntBits(nativeLeft + nativeRight));
+	const unsigned int nativeMagnitude = nativeBits & 2147483647u;
+	const unsigned int nativeExponent = nativeMagnitude >> 23u;
+	if (nativeExponent == 0u) return resultSignBits;
+	if (nativeExponent >= 255u)
+		return resultSignBits | 2139095039u;
+	const int exponentShift = int(leftExponent) - int(nativeExponent);
+	const unsigned int normalized = exponentShift >= 0 ?
+		(exactSignificand << unsigned int(exponentShift)) :
+		VitaVuF32ShiftRightJam(exactSignificand,
+			unsigned int(-exponentShift));
+	const unsigned int roundBits = normalized & 7u;
+	const bool increment = roundBits > 4u ||
+		(roundBits == 4u && (nativeMagnitude & 1u) != 0u);
+	const unsigned int correctedMagnitude = nativeMagnitude +
+		(increment ? 1u : 0u);
+	return correctedMagnitude >= 2139095040u ?
+		(resultSignBits | 2139095039u) :
+		(resultSignBits | correctedMagnitude);
+}
+
+void main(
+	unsigned int aIndex : INDEX,
+	uniform unsigned int4 VuExactJobs[1] : BUFFER0,
+	uniform unsigned int VuExactResults[1] : BUFFER1,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPointSize = 1.0f;
+	const unsigned int4 job = VuExactJobs[aIndex];
+	const unsigned int right = job.z == 0u ? job.y :
+		(job.y ^ 2147483648u);
+	const unsigned int result = VitaVuF32AddBits(job.x, right);
+	VuExactResults[job.w] = result;
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuResult = float4(float(result), float(aIndex), 0.0f, 0.0f);
+}

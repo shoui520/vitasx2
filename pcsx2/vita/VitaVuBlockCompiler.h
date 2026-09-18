@@ -5,6 +5,9 @@
 
 #include "common/Pcsx2Defs.h"
 
+#include <array>
+#include <vector>
+
 // Vita VU micro-mode block providers. VU1 compiles straight-line upper/lower
 // instruction pairs from VU1 micro memory into A32 code that reproduces
 // PCSX2's VU1microInterp.cpp::_vu1Exec() step semantics exactly: per-step
@@ -31,6 +34,9 @@ namespace VitaVU
 		u32 lower_vi_write = 0;
 		s32 upper_cycles = 0;
 		s32 lower_cycles = 0;
+		u8 upper_pipe = 0;
+		u8 lower_pipe = 0;
+		u8 vi_backup_reg = 0;
 		u8 upper_kind = 0;
 		u8 lower_kind = 0;
 		u8 upper_vf_write = 0;
@@ -55,6 +61,7 @@ namespace VitaVU
 		bool tflag = false;
 		bool clip_snapshot = false;
 		bool lower_discarded_by_upper = false;
+		bool vi_backup_write = false;
 		bool status_result_demanded = true;
 		bool mac_result_demanded = true;
 		bool instant_qp_producer = false;
@@ -65,6 +72,14 @@ namespace VitaVU
 	// Maximum Cortex-A9 compiler. Returns false only when that owning mechanism
 	// cannot decode the pair.
 	bool AnalyzeGpuVu1Pair(u32 pc, u32 upper, u32 lower, GpuPairPlan* plan);
+
+	// Analyze against an immutable execution contract instead of consulting
+	// live speedhack globals. Universal command epochs use this form when their
+	// source/configuration identity must be attested before submission; it also
+	// lets validation encode Accurate and Performance records without mutating
+	// configuration observed by a running MTVU worker.
+	bool AnalyzeGpuVu1PairForConfiguration(u32 pc, u32 upper, u32 lower,
+		bool assume_scheduled, bool instant_qp, GpuPairPlan* plan);
 
 	struct Vu1ProviderStats
 	{
@@ -324,6 +339,37 @@ namespace VitaVU
 		u64 scan_rejects = 0;
 		u64 compile_failures = 0;
 	};
+
+	// One-shot development oracle for a generated structured transaction. The
+	// normal Vita VU provider is forced through PCSX2's InterpVU1::Step() only
+	// while this trace is active. Each parent-loop header arms one capture and
+	// the next child-loop header records the exact architectural child-entry
+	// state, so repeated child backedges do not consume extra snapshots.
+	inline constexpr u32 Vu1StructuredBoundaryMaximumSnapshots = 64;
+	struct Vu1StructuredBoundarySnapshot
+	{
+		u32 outer_iteration = 0;
+		u64 cycle = 0;
+		std::array<u32, 33u * 4u> vf{};
+		std::array<u32, 16> vi{};
+		u32 q = 0;
+		u32 p = 0;
+		u32 i = 0;
+	};
+
+	struct Vu1StructuredBoundaryTrace
+	{
+		u32 parent_entry_pc = 0;
+		u32 child_entry_pc = 0;
+		u32 parent_observations = 0;
+		u32 dropped_snapshots = 0;
+		u32 executed_pairs = 0;
+		std::vector<Vu1StructuredBoundarySnapshot> snapshots;
+	};
+
+	bool BeginVu1StructuredBoundaryTrace(u32 parent_entry_pc,
+		u32 child_entry_pc);
+	bool EndVu1StructuredBoundaryTrace(Vu1StructuredBoundaryTrace* trace);
 
 	// recMicroVU1::Execute() body: mirrors InterpVU1::Execute()'s loop while
 	// routing eligible windows through compiled blocks.

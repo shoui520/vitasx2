@@ -1,0 +1,96 @@
+// VitaSX2 title-neutral structured-memory preflight transactional finalizer.
+// Earlier parallel stages write only private workspace; this sole invocation
+// publishes one complete scalar/private-state successor generation.
+#pragma readwrite_buffer BUFFER6
+#pragma readwrite_buffer BUFFER8
+
+#define VITASX2_STRUCTURED_STATE_FORMAT 2u
+#define VITASX2_STRUCTURED_STATE_SLICES 4u
+#define VITASX2_STRUCTURED_STATE_SCRATCH_OFFSET 2624u
+#define VITASX2_STRUCTURED_STATE_SCRATCH_WORDS 129u
+#define VITASX2_STRUCTURED_STATE_PROGRESS_WORD 128u
+
+void main(
+	uniform unsigned int VuStateProgram[32768] : BUFFER0,
+	uniform unsigned int VuPrivateState[112] : BUFFER2,
+	uniform unsigned int VuOuterStateOutput[16] : BUFFER6,
+	uniform unsigned int VuPrivateStateOutput[112] : BUFFER8,
+	uniform unsigned int VuAuxiliary[7010] : BUFFER9,
+	uniform unsigned int VuOuterState[16] : BUFFER12,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuPointSize = 1.0f;
+	VuResult = float4(0.0f);
+	#pragma loop (unroll: never)
+	for (unsigned int VuWord = 0u; VuWord < 112u; VuWord++)
+		VuPrivateStateOutput[VuWord] = VuPrivateState[VuWord];
+	#pragma loop (unroll: never)
+	for (unsigned int VuWord = 0u; VuWord < 16u; VuWord++)
+		VuOuterStateOutput[VuWord] = VuOuterState[VuWord];
+
+	const unsigned int VuTransactionGate = VuOuterState[15];
+	if (VuTransactionGate == 0u)
+	{
+		VuOuterStateOutput[11] = 0u;
+		VuOuterStateOutput[12] = 0u;
+		VuOuterStateOutput[13] = 0u;
+		VuOuterStateOutput[14] = 0u;
+		return;
+	}
+	unsigned int VuFailure = VuOuterState[3];
+	const unsigned int VuOuterCount = VuOuterState[0];
+	const unsigned int VuModuleCount = VuStateProgram[2];
+	const unsigned int VuStateSlices = VuStateProgram[23];
+	if (VuFailure == 0u && (VuTransactionGate != 1u ||
+		VuStateProgram[0] != VITASX2_STRUCTURED_STATE_FORMAT ||
+		VuStateSlices != VITASX2_STRUCTURED_STATE_SLICES ||
+		VuOuterCount == 0u || VuOuterCount > 64u ||
+		VuModuleCount == 0u || VuModuleCount > 34u))
+	{
+		VuFailure = 9u;
+	}
+	#pragma loop (unroll: never)
+	for (unsigned int VuModule = 0u;
+		 VuModule < VuModuleCount && VuFailure == 0u; VuModule++)
+	{
+		VuFailure = VuAuxiliary[1152u + VuModule];
+		if (VuFailure == 0u &&
+			VuAuxiliary[VITASX2_STRUCTURED_STATE_SCRATCH_OFFSET +
+				VuModule * VITASX2_STRUCTURED_STATE_SCRATCH_WORDS +
+				VITASX2_STRUCTURED_STATE_PROGRESS_WORD] !=
+				VuStateSlices)
+		{
+			VuFailure = 9u;
+		}
+	}
+	#pragma loop (unroll: never)
+	for (unsigned int VuOuter = 0u;
+		 VuOuter < VuOuterCount && VuFailure == 0u; VuOuter++)
+	{
+		VuFailure = VuAuxiliary[0u + VuOuter];
+	}
+	#pragma loop (unroll: never)
+	for (unsigned int VuAddress = 0u;
+		 VuAddress < 1024u && VuFailure == 0u; VuAddress++)
+	{
+		VuFailure = VuAuxiliary[128u + VuAddress];
+	}
+	const unsigned int VuFinalTrip = VuOuterCount != 0u && VuOuterCount <= 64u ?
+		VuAuxiliary[64u + VuOuterCount - 1u] : 0u;
+	if (VuFailure == 0u && VuFinalTrip != VuOuterState[10])
+		VuFailure = 9u;
+	VuOuterStateOutput[11] = VuFailure;
+	VuOuterStateOutput[12] = VuFailure == 0u ? 1u : 2u;
+	VuOuterStateOutput[13] = VuFailure;
+	VuOuterStateOutput[14] = VuFinalTrip;
+	if (VuFailure != 0u)
+	{
+		VuPrivateStateOutput[2] = 14u;
+		VuPrivateStateOutput[59] = 2u;
+	}
+	VuResult = float4(float(VuOuterCount), VuFailure == 0u ? 0.0f : 1.0f,
+		float(VuFailure), float(VuFinalTrip));
+}

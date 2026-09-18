@@ -13,6 +13,16 @@
 
 namespace VitaGXM
 {
+	// Series5 PDS/VDM fetches operate in cache-line/burst units and may read
+	// beyond the final logically consumed word. PVR_PSP2's buffer-object owner
+	// therefore overallocates vertex buffers, and retained Vita GPUCRASH dumps
+	// show a PDS data-cache fault at the first unmapped page after an otherwise
+	// valid GPU-VU input slot. Keep one mapped, zeroed LPDDR page after any
+	// logical allocation arena or standalone stream which can end at a mapping
+	// boundary. This is physical fetch padding, never usable payload capacity.
+	inline constexpr std::size_t GpuMappedFetchGuardSize = 4 * 1024;
+	static_assert((GpuMappedFetchGuardSize & (GpuMappedFetchGuardSize - 1)) == 0);
+
 	enum class MemoryMapping : std::uint8_t
 	{
 		None,

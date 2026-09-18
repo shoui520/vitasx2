@@ -1,0 +1,204 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// Fixed title-neutral terminal PATH1 commit kernel.  The universal VU core
+// copies ordinary delayed XGKICK packets after their following guest pair.  An
+// XGKICK in the terminal E-bit delay slot has no following pair, so PCSX2's
+// VU1microInterp.cpp::_vu1FinishProgram() flushes it at the architectural
+// program boundary.  Keeping that packet scanner in this narrow dependency
+// job avoids forcing the complete VIF/VU interpreter over SGX's register limit.
+//
+// The predecessor has already drained VU pipelines and published one private
+// state/memory generation.  This kernel appends at most one complete EOP-
+// bounded packet to the same private PATH1 generation.  It neither notifies
+// ARM nor commits output; the product owner publishes only after the complete
+// command epoch reaches End.
+
+void main(
+	unsigned int aIndex : INDEX,
+	uniform unsigned int stateWords[112] : BUFFER0,
+	uniform unsigned int4 vuMemoryWords[1024] : BUFFER1,
+	uniform unsigned int path1Words[16384] : BUFFER2,
+	uniform unsigned int path1Page1Words[16384] : BUFFER3,
+	uniform unsigned int path1Page2Words[16384] : BUFFER4,
+	uniform unsigned int path1Page3Words[16384] : BUFFER5,
+	out float4 vPosition : POSITION,
+	out float vPointSize : PSIZE,
+	out float4 vResult : TEXCOORD0)
+{
+	vPointSize = 1.0f;
+	unsigned int stopReason = stateWords[2];
+	unsigned int packetCount = path1Words[1];
+	unsigned int dataQwords = path1Words[2];
+	unsigned int path1Error = path1Words[3];
+	const bool terminalCommit = stopReason == 10u;
+
+	#pragma branch (flatten: never)
+	if (terminalCommit)
+	{
+		const unsigned int sourceAddress = stateWords[34];
+		const bool validState = stateWords[59] == 3u &&
+			stateWords[33] == 1u && (sourceAddress & 15u) == 0u &&
+			sourceAddress < 16384u && path1Words[0] == 1u &&
+			path1Error == 0u && packetCount <= 256u &&
+			dataQwords <= 16120u;
+		if (!validState)
+		{
+			stopReason = 9u;
+			path1Error = 1u;
+		}
+		else
+		{
+			unsigned int packetQwords = 0u;
+			unsigned int packetTags = 0u;
+			bool packetEop = false;
+			bool packetValid = true;
+			#pragma loop (unroll: never)
+			for (unsigned int tagStep = 0u; tagStep < 1024u; tagStep++)
+			{
+				if (!packetEop && packetValid)
+				{
+					const unsigned int tagQword =
+						((sourceAddress >> 4u) + packetQwords) & 0x3ffu;
+					const unsigned int4 tag = vuMemoryWords[tagQword];
+					const unsigned int nloop = tag.x & 0x7fffu;
+					unsigned int nreg = (tag.y >> 28u) & 15u;
+					if (nreg == 0u) nreg = 16u;
+					const unsigned int flg = (tag.y >> 26u) & 3u;
+					unsigned int payloadQwords = nloop;
+					if (flg == 0u) payloadQwords = nloop * nreg;
+					else if (flg == 1u)
+						payloadQwords = (nloop * nreg + 1u) >> 1u;
+					const unsigned int nextQwords =
+						packetQwords + 1u + payloadQwords;
+					if (nextQwords >= 1024u)
+					{
+						packetValid = false;
+					}
+					else
+					{
+						packetQwords = nextQwords;
+						packetTags++;
+						packetEop = (tag.x & 0x8000u) != 0u;
+					}
+				}
+			}
+
+			if (!packetValid || !packetEop)
+			{
+				const unsigned int4 rejectedTag =
+					vuMemoryWords[sourceAddress >> 4u];
+				path1Words[4] = path1Words[4] + 1u;
+				path1Words[5] = sourceAddress;
+				path1Words[6] = rejectedTag.x;
+				path1Words[7] = rejectedTag.y;
+				path1Words[8] = rejectedTag.z;
+				path1Words[9] = rejectedTag.w;
+				path1Words[10] = packetQwords;
+				path1Words[11] = packetTags;
+				stopReason = 9u;
+				path1Error = 3u;
+			}
+			else if (packetCount >= 256u)
+			{
+				stopReason = 9u;
+				path1Error = 5u;
+			}
+			else if (packetQwords > 16120u - dataQwords)
+			{
+				stopReason = 9u;
+				path1Error = 4u;
+			}
+			else
+			{
+				#pragma loop (unroll: never)
+				for (unsigned int copyQword = 0u;
+					copyQword < 1024u; copyQword++)
+				{
+					if (copyQword < packetQwords)
+					{
+						const unsigned int4 source = vuMemoryWords[
+							((sourceAddress >> 4u) + copyQword) & 0x3ffu];
+						const unsigned int outputQword =
+							dataQwords + copyQword;
+						if (outputQword < 3832u)
+						{
+							const unsigned int outputWord =
+								1056u + outputQword * 4u;
+							path1Words[outputWord + 0u] = source.x;
+							path1Words[outputWord + 1u] = source.y;
+							path1Words[outputWord + 2u] = source.z;
+							path1Words[outputWord + 3u] = source.w;
+						}
+						else
+						{
+							const unsigned int pagedQword =
+								outputQword - 3832u;
+							const unsigned int page = pagedQword >> 12u;
+							const unsigned int outputWord =
+								(pagedQword & 4095u) * 4u;
+							if (page == 0u)
+							{
+								path1Page1Words[outputWord + 0u] = source.x;
+								path1Page1Words[outputWord + 1u] = source.y;
+								path1Page1Words[outputWord + 2u] = source.z;
+								path1Page1Words[outputWord + 3u] = source.w;
+							}
+							else if (page == 1u)
+							{
+								path1Page2Words[outputWord + 0u] = source.x;
+								path1Page2Words[outputWord + 1u] = source.y;
+								path1Page2Words[outputWord + 2u] = source.z;
+								path1Page2Words[outputWord + 3u] = source.w;
+							}
+							else if (page == 2u)
+							{
+								path1Page3Words[outputWord + 0u] = source.x;
+								path1Page3Words[outputWord + 1u] = source.y;
+								path1Page3Words[outputWord + 2u] = source.z;
+								path1Page3Words[outputWord + 3u] = source.w;
+							}
+						}
+					}
+				}
+
+				const unsigned int descriptor = 16u + packetCount * 4u;
+				path1Words[descriptor + 0u] = sourceAddress;
+				path1Words[descriptor + 1u] = dataQwords;
+				path1Words[descriptor + 2u] = packetQwords;
+				path1Words[descriptor + 3u] = packetTags;
+				packetCount++;
+				dataQwords += packetQwords;
+				stateWords[33] = 0u;
+				stateWords[34] = 0u;
+
+				// commandCursor points at the command after the completed Execute.
+				// If only the preflight-proven terminal End remains, consume it here;
+				// otherwise publish a command-parser continuation for the next fixed
+				// core job. No canonical state or output is visible yet.
+				if (stateWords[60] + 1u == stateWords[29])
+				{
+					stopReason = 1u;
+					stateWords[59] = 2u;
+					stateWords[60] = stateWords[29];
+				}
+				else
+				{
+					stopReason = 0u;
+					stateWords[59] = 1u;
+				}
+				stateWords[61] = 0u;
+				stateWords[62] = 0u;
+			}
+		}
+	}
+
+	stateWords[2] = stopReason;
+	path1Words[0] = 1u;
+	path1Words[1] = packetCount;
+	path1Words[2] = dataQwords;
+	path1Words[3] = path1Error;
+	vPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	vResult = float4((float)packetCount, (float)dataQwords,
+		(float)stopReason, (float)aIndex);
+}

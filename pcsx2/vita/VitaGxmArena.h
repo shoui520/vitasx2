@@ -69,6 +69,8 @@ namespace VitaGXM
 		struct Statistics
 		{
 			std::size_t mapped_capacity = 0;
+			std::size_t logical_capacity = 0;
+			std::size_t fetch_guard_bytes = 0;
 			std::size_t allocated_bytes = 0;
 			std::size_t peak_allocated_bytes = 0;
 			std::size_t free_bytes = 0;
@@ -108,6 +110,7 @@ namespace VitaGXM
 		struct Slab
 		{
 			MappedBlock block;
+			std::size_t logical_size = 0;
 			std::map<std::size_t, std::size_t> free_ranges;
 			std::map<std::size_t, LiveRange> live_ranges;
 		};

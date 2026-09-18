@@ -8,6 +8,7 @@
 #include "vita/VitaGpuVuInvocationPlan.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace VitaGpuVu {
@@ -16,6 +17,12 @@ struct VifUnpackSpan;
 }
 
 namespace VitaGpuVu {
+
+// Increment whenever the cached PairPlan/CFG/loop/output interpretation
+// changes without a corresponding source or execution-configuration change.
+// A content hash remains only a lookup key; exact source bytes are compared
+// before a cached analysis is reused.
+inline constexpr u32 GeneratedLoopAnalysisAbiVersion = 1;
 
 // Generation-tagged handle to one exact VU1 micro-memory image and external
 // entry point. It is safe to copy through the MTVU ring: eviction makes an old
@@ -37,6 +44,9 @@ enum class DirectInputState : u8 {
 
 struct DirectProgramInfo {
   u32 start_pc = 0;
+  u32 configuration_bits = 0;
+  u32 semantic_profile_key = 0;
+  u32 analysis_abi_version = 0;
   u32 basic_blocks = 0;
   u32 natural_loops = 0;
   u32 parallel_candidates = 0;
@@ -46,9 +56,20 @@ struct DirectProgramInfo {
 };
 
 struct DirectProgramStatistics {
+  u64 preparation_requests = 0;
   u64 prepared_programs = 0;
   u64 preparation_cache_hits = 0;
   u64 preparation_evictions = 0;
+  u64 preparation_wall_us = 0;
+  u64 preparation_wall_us_max = 0;
+  u64 source_hash_bytes = 0;
+  u64 source_compare_bytes = 0;
+  u64 source_copy_bytes = 0;
+  u64 analysis_builds = 0;
+  u64 analysis_wall_us = 0;
+  u64 analysis_wall_us_max = 0;
+  u64 candidate_proof_wall_us = 0;
+  u64 candidate_proof_wall_us_max = 0;
   u64 analysis_failures = 0;
   u64 programs_without_parallel_candidate = 0;
   u64 parallel_candidates = 0;
@@ -62,6 +83,16 @@ struct DirectProgramStatistics {
   u64 compiler_request_retries = 0;
   u64 shared_continuation_builds = 0;
   u64 general_continuation_builds = 0;
+  u64 hybrid_input_attempts = 0;
+  u64 hybrid_input_hits = 0;
+  u64 hybrid_input_fallbacks = 0;
+  u64 hybrid_raw_bytes_retained = 0;
+  u64 hybrid_derived_bytes = 0;
+  u64 hybrid_copy_bytes_avoided = 0;
+  u64 canonical_input_bindings = 0;
+  u64 canonical_input_bytes = 0;
+  u64 persistent_raw_input_bindings = 0;
+  u64 persistent_raw_input_bytes = 0;
 };
 
 // Immutable entry-state snapshot for a semantically paired MSCAL/MSCNT
@@ -94,6 +125,12 @@ struct DirectContinuationSeed {
 DirectProgramToken PrepareDirectProgram(const u8 *micro, u32 micro_size,
                                         u32 start_pc);
 
+// Immutable-configuration form used by the product preparation owner and
+// differential tests. The complete cache identity is exact source bytes,
+// entry PC, semantic configuration/profile, and the analysis ABI version.
+DirectProgramToken PrepareDirectProgramForConfiguration(
+    const u8* micro, u32 micro_size, u32 start_pc, u32 configuration_bits);
+
 // MTVU worker cold-miss seam. Resolves only descriptor-scale provenance
 // against the initial architectural state, proves the static GIF contract,
 // generates Cg, and submits it to the asynchronous compiler. It never changes
@@ -124,6 +161,35 @@ void PublishDirectProgramRegistration(const ShaderKey &key, bool succeeded);
 std::unique_ptr<GpuVuDraw> BuildDirectGpuVuDraw(
     DirectProgramToken token, const InvocationEvaluationContext &context,
     const std::vector<VifUnpackSpan> &spans);
+
+// Shared descriptor-only lowering for a ready, PairPlan-derived affine loop
+// root.  It evaluates only address/GIF/final-VI formulas, retains immutable
+// input spans, and performs zero VU semantic pairs.  The hardware-driven
+// loop-kernel cache uses this seam instead of duplicating the proven direct
+// descriptor ABI or materializing a VU snapshot.
+std::unique_ptr<GpuVuDraw> BuildGeneratedAffineGpuVuDraw(
+    const ShaderKey& key, const DirectTfxContract& contract,
+    const std::array<u32, 4>& gif_tag,
+    const ParallelInvocationPlan& invocation,
+    const GeneratedCgProgram& generated,
+    const InvocationEvaluationContext& context,
+    const std::vector<VifUnpackSpan>& spans,
+    std::string* error = nullptr);
+
+// Closed-form enclosing-loop kernels resolve their child-entry VI bases and
+// complete post-E VI state directly from the PairPlan CFG.  Reuse the same
+// immutable-span descriptor ABI without fabricating a legacy one-loop
+// InvocationPlan for the transformed full-entry kernel.
+std::unique_ptr<GpuVuDraw> BuildGeneratedResolvedGridGpuVuDraw(
+    const ShaderKey& key, const DirectTfxContract& contract,
+    const std::array<u32, 4>& attested_gif_tag,
+    const GeneratedCgProgram& generated,
+    const std::array<u16, 16>& resolved_entry_vi,
+    const std::array<u16, 16>& final_vi, u32 final_vi_write_mask,
+    u32 active_nested_outer_iterations,
+    const InvocationEvaluationContext& context,
+    const std::vector<VifUnpackSpan>& spans,
+    std::string* error = nullptr);
 
 // Proves that two exact-image entries reach the same parallel loop and that
 // replaying the explicit entry slice can supply the resume root's live state.

@@ -1,0 +1,461 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// Architectural VIF1 UNPACK kernel.  PCSX2's Vif_Unpack.cpp owns every
+// format, CL/WL, mask, MODE and generated-V3 rule reproduced here.  Splitting
+// this command-stage kernel from the VU interpreter is an architectural
+// boundary: it avoids forcing both complete machines through SGX's register
+// allocator while retaining one sequence-owned private state generation.
+
+#ifndef VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION
+#define VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION 0
+#endif
+#ifndef VITASX2_GPU_VU_DUAL_PRIVATE_GENERATION
+#define VITASX2_GPU_VU_DUAL_PRIVATE_GENERATION 0
+#endif
+#ifndef VITASX2_GPU_VU_MIRRORED_PRIVATE_GENERATION
+#define VITASX2_GPU_VU_MIRRORED_PRIVATE_GENERATION 0
+#endif
+#ifndef VITASX2_GPU_VU_INDEPENDENT_UNPACK
+#define VITASX2_GPU_VU_INDEPENDENT_UNPACK 0
+#endif
+
+#if VITASX2_GPU_VU_MIRRORED_PRIVATE_GENERATION
+#pragma readwrite_buffer BUFFER2
+#pragma readwrite_buffer BUFFER3
+#pragma readwrite_buffer BUFFER12
+#pragma readwrite_buffer BUFFER13
+#elif VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION
+#pragma readwrite_buffer BUFFER2
+#pragma readwrite_buffer BUFFER3
+#else
+#pragma readwrite_buffer BUFFER12
+#pragma readwrite_buffer BUFFER13
+#endif
+
+unsigned int PayloadU8(unsigned int payload[4096], unsigned int address)
+{
+	return (payload[address >> 2u] >> ((address & 3u) * 8u)) & 0xffu;
+}
+
+unsigned int PayloadU16(unsigned int payload[4096], unsigned int address)
+{
+	return PayloadU8(payload, address) |
+		(PayloadU8(payload, address + 1u) << 8u);
+}
+
+unsigned int PayloadU32(unsigned int payload[4096], unsigned int address)
+{
+	return PayloadU16(payload, address) |
+		(PayloadU16(payload, address + 2u) << 16u);
+}
+
+unsigned int Extend8(unsigned int value, bool unsignedData)
+{
+	return unsignedData ? value : ((value ^ 0x80u) - 0x80u);
+}
+
+unsigned int Extend16(unsigned int value, bool unsignedData)
+{
+	return unsignedData ? value : ((value ^ 0x8000u) - 0x8000u);
+}
+
+#if !VITASX2_GPU_VU_INDEPENDENT_UNPACK
+unsigned int4 ReadJournaledMemory(unsigned int address,
+	unsigned int4 memoryInput[1024], unsigned int writeCount,
+	unsigned int writeAddress[128], unsigned int4 writeValue[128])
+{
+	const unsigned int wrapped = address & 0x3ffu;
+	unsigned int4 value = memoryInput[wrapped];
+	#pragma loop (unroll: never)
+	for (unsigned int remaining = writeCount; remaining != 0u; remaining--)
+	{
+		const unsigned int index = remaining - 1u;
+		if (writeAddress[index] == wrapped)
+		{
+			value = writeValue[index];
+			break;
+		}
+	}
+	return value;
+}
+#endif
+
+void main(
+	unsigned int aIndex : INDEX,
+	uniform unsigned int stateInput[112] : BUFFER2,
+	uniform unsigned int4 vuMemoryInput[1024] : BUFFER3,
+	uniform unsigned int epochWords[512] : BUFFER4,
+	uniform unsigned int vifPayloadWords[4096] : BUFFER5,
+	uniform unsigned int stateOutput[112] : BUFFER12,
+	uniform unsigned int4 vuMemoryOutput[1024] : BUFFER13,
+	out float4 vPosition : POSITION,
+	out float vPointSize : PSIZE,
+	out float4 vResult : TEXCOORD0)
+{
+	vPointSize = 1.0f;
+	unsigned int stopReason = 0u;
+	const bool continuation = stateInput[59] == 1u;
+	unsigned int commandCursor = continuation ? stateInput[60] : 0u;
+	const unsigned int commandCount = stateInput[29] < 64u ? stateInput[29] : 64u;
+	const unsigned int payloadBytes = stateInput[30] < 16384u ?
+		stateInput[30] : 16384u;
+	unsigned int commandsExecuted = stateInput[31];
+	unsigned int vectorsExecuted = stateInput[32];
+	unsigned int4 vifRowState = unsigned int4(stateInput[96], stateInput[97],
+		stateInput[98], stateInput[99]);
+	const unsigned int4 vifColumnState = unsigned int4(stateInput[100], stateInput[101],
+		stateInput[102], stateInput[103]);
+	unsigned int vectorCursor = continuation ? stateInput[104] : 0u;
+	unsigned int sourceCursor = continuation ? stateInput[105] : 0u;
+	unsigned int destinationCursor = continuation ? stateInput[106] : 0u;
+	unsigned int cycleCursor = continuation ? stateInput[107] : 0u;
+	unsigned int generatedCursor = continuation ? stateInput[108] : 0u;
+	unsigned int commandMarker = continuation ? stateInput[109] : 0u;
+	unsigned int vifTop = stateInput[40] & 0xffffu;
+	unsigned int vifItop = stateInput[41] & 0xffffu;
+#if !VITASX2_GPU_VU_INDEPENDENT_UNPACK
+	unsigned int writeAddress[128];
+	unsigned int4 writeValue[128];
+	unsigned int writeCount = 0u;
+#endif
+#if VITASX2_GPU_VU_MIRRORED_PRIVATE_GENERATION
+#define VIF_PUBLISH_STATE(index, value) { stateInput[(index)] = (value); stateOutput[(index)] = (value); }
+#define VIF_PUBLISH_MEMORY(index, value) { vuMemoryInput[(index)] = (value); vuMemoryOutput[(index)] = (value); }
+#elif VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION
+#define VIF_PUBLISH_STATE(index, value) { stateInput[(index)] = (value); }
+#define VIF_PUBLISH_MEMORY(index, value) { vuMemoryInput[(index)] = (value); }
+#else
+#define VIF_PUBLISH_STATE(index, value) { stateOutput[(index)] = (value); }
+#define VIF_PUBLISH_MEMORY(index, value) { vuMemoryOutput[(index)] = (value); }
+#endif
+	#if !VITASX2_GPU_VU_IN_PLACE_PRIVATE_GENERATION && !VITASX2_GPU_VU_MIRRORED_PRIVATE_GENERATION
+		#pragma loop (unroll: never)
+		for (unsigned int copyState = 0u; copyState < 112u; copyState++)
+			stateOutput[copyState] = stateInput[copyState];
+		#pragma loop (unroll: never)
+		for (unsigned int copyMemory = 0u; copyMemory < 1024u; copyMemory++)
+			vuMemoryOutput[copyMemory] = vuMemoryInput[copyMemory];
+	#endif
+
+	// This kernel is selected only before the first Execute command. Any stale
+	// pipeline/terminal marker fails before a VU-memory or VIF-row write.
+	if (stateInput[35] != 0x47565531u || stateInput[59] == 2u ||
+		stateInput[61] != 0u || stateInput[62] != 0u ||
+		commandCursor >= commandCount)
+	{
+		stopReason = 8u;
+	}
+
+	unsigned int commandStep = commandCursor;
+	unsigned int controlWord = 0u;
+	unsigned int payloadOffset = 0u;
+	unsigned int sourceSize = 0u;
+	unsigned int mask = 0u;
+	unsigned int destinationQword = 0u;
+	unsigned int vectorCount = 0u;
+	unsigned int packedTop = 0u;
+	unsigned int vifCommand = 0u;
+	unsigned int cycleCl = 0u;
+	unsigned int cycleWl = 0u;
+	unsigned int mode = 0u;
+	unsigned int startAlignment = 0u;
+	unsigned int format = 0u;
+	unsigned int vectorBytes = 0u;
+	unsigned int readBytes = 0u;
+	bool unsignedData = false;
+
+	if (stopReason == 0u)
+	{
+		const unsigned int base = commandStep * 8u;
+		const unsigned int kind = epochWords[base];
+		controlWord = epochWords[base + 1u];
+		payloadOffset = epochWords[base + 2u];
+		sourceSize = epochWords[base + 3u];
+		mask = epochWords[base + 4u];
+		const unsigned int packedExtent = epochWords[base + 5u];
+		packedTop = epochWords[base + 6u];
+		const unsigned int reserved = epochWords[base + 7u];
+		destinationQword = packedExtent & 0xffffu;
+		vectorCount = packedExtent >> 16u;
+		vifCommand = controlWord & 0xffu;
+		cycleCl = (controlWord >> 8u) & 0xffu;
+		cycleWl = (controlWord >> 16u) & 0xffu;
+		if (cycleWl == 0u) cycleWl = 256u;
+		mode = (controlWord >> 24u) & 3u;
+		unsignedData = (controlWord & (1u << 26u)) != 0u;
+		startAlignment = (controlWord >> 27u) & 7u;
+		format = vifCommand & 0x0fu;
+		if (format == 0x00u) vectorBytes = 4u;
+		else if (format == 0x01u) vectorBytes = 2u;
+		else if (format == 0x02u) vectorBytes = 1u;
+		else if (format == 0x04u) vectorBytes = 8u;
+		else if (format == 0x05u) vectorBytes = 4u;
+		else if (format == 0x06u) vectorBytes = 2u;
+		else if (format == 0x08u) vectorBytes = 12u;
+		else if (format == 0x09u) vectorBytes = 6u;
+		else if (format == 0x0au) vectorBytes = 3u;
+		else if (format == 0x0cu) vectorBytes = 16u;
+		else if (format == 0x0du) vectorBytes = 8u;
+		else if (format == 0x0eu) vectorBytes = 4u;
+		else if (format == 0x0fu) vectorBytes = 2u;
+		readBytes = vectorBytes;
+		if (format == 0x08u) readBytes = 16u;
+		else if (format == 0x09u) readBytes = 8u;
+		else if (format == 0x0au) readBytes = 4u;
+
+		unsigned int requiredBytes = 0u;
+		unsigned int requiredSource = 0u;
+		unsigned int requiredCycle = 0u;
+		const bool fill = cycleCl < cycleWl;
+		#pragma loop (unroll: never)
+		for (unsigned int index = 0u; index < 256u; index++)
+		{
+			if (index < vectorCount)
+			{
+				const unsigned int end = requiredSource + readBytes;
+				if (end > requiredBytes) requiredBytes = end;
+				requiredCycle++;
+				if (fill)
+				{
+					if (requiredCycle <= cycleCl) requiredSource += vectorBytes;
+					else if (requiredCycle == cycleWl) requiredCycle = 0u;
+				}
+				else
+				{
+					requiredSource += vectorBytes;
+					if (requiredCycle >= cycleWl) requiredCycle = 0u;
+				}
+			}
+		}
+		const bool resumes = vectorCursor != 0u;
+		const unsigned int maximumCycle = cycleCl > cycleWl ? cycleCl : cycleWl;
+		const bool continuationValid = !resumes ||
+			(commandMarker == commandStep + 1u && vectorCursor < vectorCount &&
+			 sourceCursor <= sourceSize && cycleCursor < maximumCycle);
+		const bool rangeValid = payloadOffset <= payloadBytes &&
+			sourceSize <= payloadBytes - payloadOffset &&
+			requiredBytes <= sourceSize;
+		if (kind != 1u || reserved != 0u ||
+			(vifCommand & 0x80u) != 0u || (vifCommand & 0x60u) != 0x60u ||
+			(controlWord & 0xc0000000u) != 0u || vectorBytes == 0u ||
+			vectorCount == 0u ||
+			vectorCount > 256u || destinationQword >= 1024u ||
+			!rangeValid || !continuationValid)
+		{
+			stopReason = 8u;
+		}
+#if VITASX2_GPU_VU_INDEPENDENT_UNPACK
+		// MODE 2/3 carry row values between vectors. CL>WL can revisit a
+		// wrapped destination within one 128-vector slice. Those commands use
+		// the serial journaled sibling; this root admits only independent writes
+		// so mapped buffers can be updated sparsely without indexable locals.
+		const unsigned int effectiveMode = format == 0x0fu ? 0u : mode;
+		if (effectiveMode > 1u || cycleCl > cycleWl)
+			stopReason = 8u;
+#endif
+	}
+
+	if (stopReason == 0u)
+	{
+		const bool resumes = vectorCursor != 0u;
+		unsigned int source = resumes ? sourceCursor : 0u;
+		unsigned int destination = resumes ? destinationCursor : destinationQword;
+		unsigned int cycle = resumes ? cycleCursor : 0u;
+		unsigned int generated = resumes ? generatedCursor : 0u;
+		const unsigned int firstVector = resumes ? vectorCursor : 0u;
+		const unsigned int generatedAlignment = format == 0x09u ?
+			startAlignment : (startAlignment & 1u);
+		const bool fill = cycleCl < cycleWl;
+		#pragma loop (unroll: never)
+		for (unsigned int slice = 0u; slice < 128u; slice++)
+		{
+			const unsigned int vectorIndex = firstVector + slice;
+			if (vectorIndex < vectorCount)
+			{
+				unsigned int iteration = generated;
+				if (format == 0x09u || format == 0x0au) iteration = ++generated;
+				const unsigned int input = payloadOffset + source;
+				unsigned int4 unpacked = 0u;
+				if (format == 0x00u) unpacked = PayloadU32(vifPayloadWords, input);
+				else if (format == 0x01u) unpacked = Extend16(
+					PayloadU16(vifPayloadWords, input), unsignedData);
+				else if (format == 0x02u) unpacked = Extend8(
+					PayloadU8(vifPayloadWords, input), unsignedData);
+				else if (format == 0x04u)
+				{
+					const unsigned int x = PayloadU32(vifPayloadWords, input);
+					const unsigned int y = PayloadU32(vifPayloadWords, input + 4u);
+					unpacked = unsigned int4(x, y, x, y);
+				}
+				else if (format == 0x05u)
+				{
+					const unsigned int x = Extend16(PayloadU16(vifPayloadWords, input), unsignedData);
+					const unsigned int y = Extend16(PayloadU16(vifPayloadWords, input + 2u), unsignedData);
+					unpacked = unsigned int4(x, y, x, y);
+				}
+				else if (format == 0x06u)
+				{
+					const unsigned int x = Extend8(PayloadU8(vifPayloadWords, input), unsignedData);
+					const unsigned int y = Extend8(PayloadU8(vifPayloadWords, input + 1u), unsignedData);
+					unpacked = unsigned int4(x, y, x, y);
+				}
+				else if (format == 0x08u || format == 0x0cu)
+				{
+					unpacked = unsigned int4(PayloadU32(vifPayloadWords, input),
+						PayloadU32(vifPayloadWords, input + 4u),
+						PayloadU32(vifPayloadWords, input + 8u),
+						PayloadU32(vifPayloadWords, input + 12u));
+					if (format == 0x08u && iteration != generatedAlignment) unpacked.w = 0u;
+				}
+				else if (format == 0x09u || format == 0x0du)
+				{
+					unpacked = unsigned int4(
+						Extend16(PayloadU16(vifPayloadWords, input), unsignedData),
+						Extend16(PayloadU16(vifPayloadWords, input + 2u), unsignedData),
+						Extend16(PayloadU16(vifPayloadWords, input + 4u), unsignedData),
+						Extend16(PayloadU16(vifPayloadWords, input + 6u), unsignedData));
+					if (format == 0x09u && (iteration & 1u) == 0u &&
+						(((iteration / 4u) + 1u + (4u - generatedAlignment)) & 3u) == 0u)
+						unpacked.w = 0u;
+				}
+				else if (format == 0x0au || format == 0x0eu)
+				{
+					unpacked = unsigned int4(
+						Extend8(PayloadU8(vifPayloadWords, input), unsignedData),
+						Extend8(PayloadU8(vifPayloadWords, input + 1u), unsignedData),
+						Extend8(PayloadU8(vifPayloadWords, input + 2u), unsignedData),
+						Extend8(PayloadU8(vifPayloadWords, input + 3u), unsignedData));
+					if (format == 0x0au && iteration != generatedAlignment) unpacked.w = 0u;
+				}
+				else
+				{
+					const unsigned int packedValue = PayloadU16(vifPayloadWords, input);
+					unpacked = unsigned int4((packedValue & 0x001fu) << 3u,
+						(packedValue & 0x03e0u) >> 2u,
+						(packedValue & 0x7c00u) >> 7u,
+						(packedValue & 0x8000u) >> 8u);
+				}
+
+				const unsigned int output = destination & 0x3ffu;
+#if VITASX2_GPU_VU_INDEPENDENT_UNPACK
+				unsigned int4 stored = vuMemoryInput[output];
+#else
+				unsigned int4 stored = ReadJournaledMemory(output, vuMemoryInput,
+					writeCount, writeAddress, writeValue);
+#endif
+				const unsigned int maskCycle = cycle < 4u ? cycle : 3u;
+				const unsigned int cycleMask = (vifCommand & 0x10u) != 0u ?
+					(mask >> (maskCycle * 8u)) & 0xffu : 0u;
+				const unsigned int effectiveMode = format == 0x0fu ? 0u : mode;
+				for (unsigned int lane = 0u; lane < 4u; lane++)
+				{
+					const unsigned int selector = (cycleMask >> (lane * 2u)) & 3u;
+					if (selector == 0u)
+					{
+						if (effectiveMode == 1u) stored[lane] = unpacked[lane] + vifRowState[lane];
+						else if (effectiveMode == 2u)
+						{
+							vifRowState[lane] += unpacked[lane];
+							stored[lane] = vifRowState[lane];
+						}
+						else if (effectiveMode == 3u)
+						{
+							vifRowState[lane] = unpacked[lane];
+							stored[lane] = unpacked[lane];
+						}
+						else stored[lane] = unpacked[lane];
+					}
+					else if (selector == 1u) stored[lane] = vifRowState[lane];
+					else if (selector == 2u) stored[lane] = vifColumnState[maskCycle];
+				}
+#if VITASX2_GPU_VU_INDEPENDENT_UNPACK
+				VIF_PUBLISH_MEMORY(output, stored);
+#else
+				writeAddress[writeCount] = output;
+				writeValue[writeCount++] = stored;
+#endif
+				if (format == 0x08u) generated = (generated + 1u) & 1u;
+				destination++;
+				cycle++;
+				if (fill)
+				{
+					if (cycle <= cycleCl) source += vectorBytes;
+					else if (cycle == cycleWl) cycle = 0u;
+				}
+				else
+				{
+					source += vectorBytes;
+					if (cycle >= cycleWl)
+					{
+						destination += cycleCl - cycleWl;
+						cycle = 0u;
+					}
+				}
+			}
+		}
+		vifTop = packedTop & 0xffffu;
+		vifItop = packedTop >> 16u;
+		if (firstVector == 0u) commandsExecuted++;
+		vectorsExecuted += (vectorCount - firstVector < 128u ?
+			vectorCount - firstVector : 128u);
+		vectorCursor = firstVector + 128u < vectorCount ?
+			firstVector + 128u : vectorCount;
+		if (vectorCursor < vectorCount)
+		{
+			sourceCursor = source;
+			destinationCursor = destination;
+			cycleCursor = cycle;
+			generatedCursor = generated;
+			commandMarker = commandStep + 1u;
+		}
+		else
+		{
+			vectorCursor = 0u;
+			sourceCursor = 0u;
+			destinationCursor = 0u;
+			cycleCursor = 0u;
+			generatedCursor = 0u;
+			commandMarker = 0u;
+			commandCursor = commandStep + 1u;
+		}
+		stopReason = 13u;
+	}
+
+	VIF_PUBLISH_STATE(2u, stopReason);
+	VIF_PUBLISH_STATE(31u, commandsExecuted);
+	VIF_PUBLISH_STATE(32u, vectorsExecuted);
+	VIF_PUBLISH_STATE(40u, vifTop);
+	VIF_PUBLISH_STATE(41u, vifItop);
+	VIF_PUBLISH_STATE(59u, stopReason == 13u ? 1u : 2u);
+	VIF_PUBLISH_STATE(60u, stopReason == 13u ? commandCursor : 0u);
+	VIF_PUBLISH_STATE(61u, 0u);
+	VIF_PUBLISH_STATE(62u, 0u);
+	VIF_PUBLISH_STATE(96u, vifRowState.x);
+	VIF_PUBLISH_STATE(97u, vifRowState.y);
+	VIF_PUBLISH_STATE(98u, vifRowState.z);
+	VIF_PUBLISH_STATE(99u, vifRowState.w);
+	VIF_PUBLISH_STATE(100u, vifColumnState.x);
+	VIF_PUBLISH_STATE(101u, vifColumnState.y);
+	VIF_PUBLISH_STATE(102u, vifColumnState.z);
+	VIF_PUBLISH_STATE(103u, vifColumnState.w);
+	VIF_PUBLISH_STATE(104u, stopReason == 13u ? vectorCursor : 0u);
+	VIF_PUBLISH_STATE(105u, stopReason == 13u ? sourceCursor : 0u);
+	VIF_PUBLISH_STATE(106u, stopReason == 13u ? destinationCursor : 0u);
+	VIF_PUBLISH_STATE(107u, stopReason == 13u ? cycleCursor : 0u);
+	VIF_PUBLISH_STATE(108u, stopReason == 13u ? generatedCursor : 0u);
+	VIF_PUBLISH_STATE(109u, stopReason == 13u ? commandMarker : 0u);
+	VIF_PUBLISH_STATE(110u, 0u);
+	VIF_PUBLISH_STATE(111u, 0u);
+#if !VITASX2_GPU_VU_INDEPENDENT_UNPACK
+	#pragma loop (unroll: never)
+	for (unsigned int publish = 0u; publish < writeCount; publish++)
+		VIF_PUBLISH_MEMORY(writeAddress[publish], writeValue[publish]);
+#endif
+
+	vPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	vResult = float4((float)vectorsExecuted, (float)stopReason,
+		(float)commandCursor, (float)aIndex);
+#undef VIF_PUBLISH_MEMORY
+#undef VIF_PUBLISH_STATE
+}

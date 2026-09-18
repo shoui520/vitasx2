@@ -10,7 +10,9 @@
 #include "vita/VitaGpuVuCgGenerator.h"
 #include "vita/VitaGpuVuDraw.h"
 #include "vita/VitaGpuVuGifContract.h"
+#include "vita/VitaGpuVuMicroProgram.h"
 #include "vita/VitaGpuVuProgramRegistry.h"
+#include "common/Timer.h"
 
 #include <algorithm>
 #include <array>
@@ -57,7 +59,11 @@ struct PreparedProgram {
   // candidate metadata is immutable and the 496 MHz hot descriptor path
   // avoids both the compiler-registry mutex and this preparation mutex.
   std::atomic<u32> ready_candidate_plus_one{0};
+  u64 source_hash = 0;
   u32 start_pc = 0;
+  u32 configuration_bits = 0;
+  u32 semantic_profile_key = 0;
+  u32 analysis_abi_version = GeneratedLoopAnalysisAbiVersion;
   // Publication is monotonic for one exact generation. The worker's hot
   // MSCAL/MSCNT stream may revisit a registered entry thousands of times, so
   // reject those hits before taking the cold preparation mutex.
@@ -130,9 +136,20 @@ std::array<CacheSlot, MaximumPreparedPrograms> s_cache;
 u64 s_cache_clock = 0;
 std::atomic<u64> s_cache_epoch{1};
 
+std::atomic<u64> s_preparation_requests{0};
 std::atomic<u64> s_prepared_programs{0};
 std::atomic<u64> s_preparation_cache_hits{0};
 std::atomic<u64> s_preparation_evictions{0};
+std::atomic<u64> s_preparation_wall_us{0};
+std::atomic<u64> s_preparation_wall_us_max{0};
+std::atomic<u64> s_source_hash_bytes{0};
+std::atomic<u64> s_source_compare_bytes{0};
+std::atomic<u64> s_source_copy_bytes{0};
+std::atomic<u64> s_analysis_builds{0};
+std::atomic<u64> s_analysis_wall_us{0};
+std::atomic<u64> s_analysis_wall_us_max{0};
+std::atomic<u64> s_candidate_proof_wall_us{0};
+std::atomic<u64> s_candidate_proof_wall_us_max{0};
 std::atomic<u64> s_analysis_failures{0};
 std::atomic<u64> s_programs_without_parallel_candidate{0};
 std::atomic<u64> s_parallel_candidates{0};
@@ -146,6 +163,66 @@ std::atomic<u64> s_compiler_requests{0};
 std::atomic<u64> s_compiler_request_retries{0};
 std::atomic<u64> s_shared_continuation_builds{0};
 std::atomic<u64> s_general_continuation_builds{0};
+std::atomic<u64> s_hybrid_input_attempts{0};
+std::atomic<u64> s_hybrid_input_hits{0};
+std::atomic<u64> s_hybrid_input_fallbacks{0};
+std::atomic<u64> s_hybrid_raw_bytes_retained{0};
+std::atomic<u64> s_hybrid_derived_bytes{0};
+std::atomic<u64> s_hybrid_copy_bytes_avoided{0};
+std::atomic<u64> s_canonical_input_bindings{0};
+std::atomic<u64> s_canonical_input_bytes{0};
+std::atomic<u64> s_persistent_raw_input_bindings{0};
+std::atomic<u64> s_persistent_raw_input_bytes{0};
+
+u64 ElapsedMicroseconds(Common::Timer::Value started) {
+  return static_cast<u64>(Common::Timer::ConvertValueToSeconds(
+      Common::Timer::GetCurrentValue() - started) * 1000000.0);
+}
+
+void RecordMaximum(std::atomic<u64>* maximum, u64 value) {
+  u64 observed = maximum->load(std::memory_order_relaxed);
+  while (value > observed &&
+         !maximum->compare_exchange_weak(
+             observed, value, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
+  }
+}
+
+class ScopedPreparationTimer final {
+public:
+  ScopedPreparationTimer()
+      : m_started(Common::Timer::GetCurrentValue()) {
+    s_preparation_requests.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  ~ScopedPreparationTimer() {
+    const u64 elapsed = ElapsedMicroseconds(m_started);
+    s_preparation_wall_us.fetch_add(elapsed, std::memory_order_relaxed);
+    RecordMaximum(&s_preparation_wall_us_max, elapsed);
+  }
+
+private:
+  Common::Timer::Value m_started;
+};
+
+u64 HashExactSource(const u8* micro, u32 micro_size) {
+  // FNV-1a is a cheap cache-directory key, not an admission proof. Matches()
+  // still compares all exact source bytes before reuse.
+  u64 hash = 1469598103934665603ull;
+  for (u32 index = 0; index < micro_size; index++) {
+    hash ^= micro[index];
+    hash *= 1099511628211ull;
+  }
+  s_source_hash_bytes.fetch_add(micro_size, std::memory_order_relaxed);
+  return hash;
+}
+
+u32 SemanticProfileKey(u32 configuration_bits) {
+  // The named Exact/OracleNearest/Playable product profiles resolve into
+  // distinct immutable configuration bit sets. Preserve that complete set in
+  // the analysis key so custom diagnostic profiles are isolated as well.
+  return configuration_bits & UniversalConfigurationKnownMask;
+}
 
 DirectProgramToken MakeToken(u32 slot, u32 generation) {
   return {((generation & TokenGenerationMask) << TokenSlotBits) |
@@ -163,9 +240,18 @@ bool DecodeToken(DirectProgramToken token, u32 *slot, u32 *generation) {
   return *generation != 0;
 }
 
-bool Matches(const PreparedProgram &program, const u8 *micro, u32 start_pc) {
-  return program.start_pc == start_pc &&
-         std::memcmp(program.micro.data(), micro, VU1_PROGSIZE) == 0;
+bool Matches(const PreparedProgram &program, const u8 *micro, u64 source_hash,
+             u32 start_pc, u32 configuration_bits,
+             u32 semantic_profile_key) {
+  if (program.source_hash != source_hash || program.start_pc != start_pc ||
+      program.configuration_bits != configuration_bits ||
+      program.semantic_profile_key != semantic_profile_key ||
+      program.analysis_abi_version != GeneratedLoopAnalysisAbiVersion) {
+    return false;
+  }
+  s_source_compare_bytes.fetch_add(VU1_PROGSIZE,
+                                   std::memory_order_relaxed);
+  return std::memcmp(program.micro.data(), micro, VU1_PROGSIZE) == 0;
 }
 
 // The returned pointer remains pinned in this thread's two-entry working set
@@ -228,25 +314,43 @@ PreparedProgram *LookupPinnedProgram(DirectProgramToken token) {
   return pinned.program.Get();
 }
 
-std::unique_ptr<PreparedProgram> BuildPreparedProgram(const u8 *micro,
-                                                      u32 start_pc) {
+std::unique_ptr<PreparedProgram> BuildPreparedProgram(
+    const u8* micro, u64 source_hash, u32 start_pc, u32 configuration_bits,
+    u32 semantic_profile_key) {
   auto prepared = std::make_unique<PreparedProgram>();
+  prepared->source_hash = source_hash;
   prepared->start_pc = start_pc;
+  prepared->configuration_bits = configuration_bits;
+  prepared->semantic_profile_key = semantic_profile_key;
   std::memcpy(prepared->micro.data(), micro, prepared->micro.size());
+  s_source_copy_bytes.fetch_add(prepared->micro.size(),
+                                std::memory_order_relaxed);
 
   std::string error;
-  if (!AnalyzeGpuVu1Program(prepared->micro.data(), prepared->micro.size(),
-                            start_pc, &prepared->analysis, &error)) {
+  s_analysis_builds.fetch_add(1, std::memory_order_relaxed);
+  const Common::Timer::Value analysis_started =
+      Common::Timer::GetCurrentValue();
+  const bool analyzed = AnalyzeGpuVu1ProgramForConfiguration(
+      prepared->micro.data(), prepared->micro.size(), start_pc,
+      (configuration_bits & UniversalConfigurationAssumeScheduled) != 0,
+      (configuration_bits & UniversalConfigurationInstantQp) != 0,
+      &prepared->analysis, &error);
+  const u64 analysis_elapsed = ElapsedMicroseconds(analysis_started);
+  s_analysis_wall_us.fetch_add(analysis_elapsed, std::memory_order_relaxed);
+  RecordMaximum(&s_analysis_wall_us_max, analysis_elapsed);
+  if (!analyzed) {
     s_analysis_failures.fetch_add(1, std::memory_order_relaxed);
     return {};
   }
 
+  const Common::Timer::Value proof_started = Common::Timer::GetCurrentValue();
   prepared->candidates.reserve(prepared->analysis.natural_loops.size());
   for (u32 loop_index = 0;
        loop_index < prepared->analysis.natural_loops.size(); loop_index++) {
     DirectCandidate candidate;
-    if (!BuildParallelLoopKernel(prepared->analysis, loop_index,
-                                 &candidate.kernel, &error) ||
+    if (!BuildParallelLoopKernelForConfiguration(
+            prepared->analysis, loop_index, configuration_bits,
+            &candidate.kernel, &error) ||
         !candidate.kernel.independent_store_values ||
         !BuildParallelInvocationPlan(prepared->analysis, candidate.kernel,
                                      &candidate.invocation, &error) ||
@@ -259,6 +363,10 @@ std::unique_ptr<PreparedProgram> BuildPreparedProgram(const u8 *micro,
     }
     prepared->candidates.push_back(std::move(candidate));
   }
+  const u64 proof_elapsed = ElapsedMicroseconds(proof_started);
+  s_candidate_proof_wall_us.fetch_add(proof_elapsed,
+                                      std::memory_order_relaxed);
+  RecordMaximum(&s_candidate_proof_wall_us_max, proof_elapsed);
 
   if (prepared->candidates.empty()) {
     s_programs_without_parallel_candidate.fetch_add(1,
@@ -274,19 +382,11 @@ bool ReadGifTag(const ParallelInvocationPlan &invocation,
                 const InvocationEvaluationContext &context,
                 InvocationEvaluationWorkspace *workspace,
                 std::array<u32, 4> *tag) {
-  if (!workspace || !tag || !context.read_memory_u32)
+  if (!workspace || !tag)
     return false;
-
-  u32 address = 0;
-  if (!EvaluateInvocationValue(invocation,
-                               invocation.gif_tag_qword_address, context,
-                               workspace, &address)) {
-    return false;
-  }
   for (u32 lane = 0; lane < tag->size(); lane++) {
-    if (!context.read_memory_u32(context.memory_user,
-                                 static_cast<u16>(address & 0x3ffu),
-                                 static_cast<u8>(lane), &(*tag)[lane])) {
+    if (!EvaluateInvocationValue(invocation, invocation.gif_tag_words[lane],
+                                 context, workspace, &(*tag)[lane])) {
       return false;
     }
   }
@@ -449,6 +549,8 @@ bool ClampStableSeedsHold(const GeneratedCgProgram &generated,
   if (!context.initial_vf_words)
     return false;
   for (const ClampStableLane &clamp : generated.clamp_stable_lanes) {
+    if (!context.InitialVfLaneAvailable(clamp.reg, clamp.lane))
+      return false;
     float seed = 0.0f;
     float bound = 0.0f;
     std::memcpy(&seed,
@@ -475,6 +577,22 @@ const VifUnpackSpan *FindInputSpan(
   for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
     if (BindAffineRawQwords(*it, first_qword, invocation_coefficient,
                            invocation_count, binding)) {
+      return &*it;
+    }
+  }
+  return nullptr;
+}
+
+const VifUnpackSpan* FindGridInputSpan(
+    const std::vector<VifUnpackSpan>& spans, u16 first_qword,
+    s32 outer_invocation_coefficient, u32 outer_invocation_count,
+    s32 child_invocation_coefficient, u32 child_invocation_count,
+    RawQwordBinding* binding) {
+  for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+    if (BindGridRawQwords(
+            *it, first_qword, outer_invocation_coefficient,
+            outer_invocation_count, child_invocation_coefficient,
+            child_invocation_count, binding)) {
       return &*it;
     }
   }
@@ -663,6 +781,9 @@ bool ResolveContinuationPair(
   if (!entry_ready || !resume_ready ||
       std::memcmp(entry->micro.data(), resume->micro.data(),
                   entry->micro.size()) != 0 ||
+      entry->configuration_bits != resume->configuration_bits ||
+      entry->semantic_profile_key != resume->semantic_profile_key ||
+      entry->analysis_abi_version != resume->analysis_abi_version ||
       entry->analysis.resume_pcs.size() != 1 ||
       entry->analysis.resume_pcs.front() != resume->start_pc ||
       resume->analysis.resume_pcs.size() != 1 ||
@@ -739,16 +860,46 @@ const ConstantUniform *FindConstantUniform(const GpuVuDraw &draw,
   return nullptr;
 }
 
-bool ConfigureGeometry(const DirectCandidate &candidate, GpuVuDraw *draw) {
+bool ConfigureGeometry(const DirectTfxContract& contract,
+                       const GeneratedCgProgram& generated,
+                       GpuVuDraw* draw,
+                       u32 active_nested_outer_iterations = 0u) {
   if (!draw)
     return false;
-  const u32 vertices = candidate.contract.vertex_count;
+  const u32 vertices = contract.vertex_count;
   if (vertices == 0)
     return false;
+  const u32 nested_outer_iterations = active_nested_outer_iterations != 0u
+      ? active_nested_outer_iterations
+      : generated.nested_outer_iterations;
+  const u64 nested_invocations =
+      static_cast<u64>(nested_outer_iterations) *
+      generated.nested_child_iterations;
+  const bool nested_flat_line_product = generated.uses_nested_iteration_grid &&
+      generated.uses_flat_index_inputs && !generated.uses_flat_instance_inputs &&
+      !generated.uses_loop_kernel_private_store_output &&
+      contract.primitive == GS_LINESTRIP && !contract.gouraud &&
+      (generated.loop_kernel_source_abi == GeneratedLoopKernelNestedFlatProductCgAbiVersion ||
+       generated.loop_kernel_source_abi == GeneratedLoopKernelNestedFlatPartialProductCgAbiVersion) &&
+      DirectTfxFlatLineIndexDomain(vertices) != 0u;
+  if (generated.uses_nested_iteration_grid) {
+    if (nested_invocations != vertices ||
+        nested_outer_iterations > generated.nested_outer_iterations ||
+        generated.nested_outer_iterations == 0u ||
+        generated.nested_child_iterations == 0u ||
+        !generated.uses_buffered_batch_inputs ||
+        generated.uses_flat_instance_inputs ||
+        (generated.uses_flat_index_inputs && !nested_flat_line_product)) {
+      return false;
+    }
+  } else if (generated.nested_outer_iterations != 0u ||
+             generated.nested_child_iterations != 0u) {
+    return false;
+  }
 
   u32 primitive_count = 0;
   u32 native_indices = vertices;
-  switch (candidate.contract.primitive) {
+  switch (contract.primitive) {
   case GS_POINTLIST:
     primitive_count = vertices;
     break;
@@ -777,12 +928,18 @@ bool ConfigureGeometry(const DirectCandidate &candidate, GpuVuDraw *draw) {
     return false;
   }
 
-  if (candidate.generated.uses_flat_instance_inputs) {
-    if (candidate.generated.flat_vertices_per_primitive == 0)
+  if (generated.uses_flat_instance_inputs ||
+      generated.uses_flat_index_inputs) {
+    if (generated.uses_flat_instance_inputs &&
+        generated.uses_flat_index_inputs)
       return false;
-    draw->primitive_boundary = PrimitiveBoundary::InstanceIndexed;
+    if (generated.flat_vertices_per_primitive == 0)
+      return false;
+    draw->primitive_boundary = generated.uses_flat_index_inputs
+        ? PrimitiveBoundary::ExpandedIndexed
+        : PrimitiveBoundary::InstanceIndexed;
     native_indices =
-        primitive_count * candidate.generated.flat_vertices_per_primitive;
+        primitive_count * generated.flat_vertices_per_primitive;
   } else {
     draw->primitive_boundary = PrimitiveBoundary::Native;
   }
@@ -791,23 +948,961 @@ bool ConfigureGeometry(const DirectCandidate &candidate, GpuVuDraw *draw) {
   draw->vertex_count = vertices;
   draw->primitive_count = primitive_count;
   draw->index_count = native_indices;
+  if (generated.uses_loop_kernel_state_canary) {
+    // A private canary must execute the complete compiled grid. Sparse output
+    // and variable-capacity prefixes cannot attest the omitted VU stores.
+    return HasGeneratedLoopKernelStateCanaryContract(generated) &&
+        nested_outer_iterations == generated.nested_outer_iterations &&
+        draw->ConfigurePrivateStatePoints();
+  }
   return primitive_count != 0 && native_indices != 0;
+}
+
+std::unique_ptr<GpuVuDraw> BuildGeneratedAffineGpuVuDrawInternal(
+    const ShaderKey& key, const DirectTfxContract& contract,
+    const std::array<u32, 4>& expected_gif_tag,
+    const ParallelInvocationPlan& invocation,
+    const GeneratedCgProgram& generated,
+    const InvocationEvaluationContext& context,
+    const std::vector<VifUnpackSpan>& spans,
+    DirectProgramToken continuation_override_token, std::string* error,
+    const std::array<u16, 16>* resolved_entry_vi = nullptr,
+    const std::array<u16, 16>* final_vi_override = nullptr,
+    u32 final_vi_override_mask = 0u,
+    bool gif_tag_pre_attested = false,
+    bool allow_compact_raw_inputs = false,
+    u32 active_nested_outer_iterations = 0u) {
+  const auto fail = [error](AdmissionFailure reason, const char* detail) {
+    RecordDirectAdmissionFailure(reason);
+    if (error)
+      *error = detail;
+    return std::unique_ptr<GpuVuDraw>{};
+  };
+  if (error)
+    error->clear();
+  if ((key.low == 0u && key.high == 0u) ||
+      !context.initial_vi || !context.initial_vf_words ||
+      !context.read_memory_u32) {
+    return fail(AdmissionFailure::NoInputSpans,
+                "generated affine draw lacks immutable inputs");
+  }
+
+  const auto read_memory_qwords = [&context](u16 first_qword,
+                                              u32 qword_count,
+                                              u32* values) {
+    if (!values || qword_count == 0u)
+      return false;
+    if (context.read_memory_qwords) {
+      return context.read_memory_qwords(context.memory_user, first_qword,
+                                        qword_count, values);
+    }
+    if (!context.read_memory_u32)
+      return false;
+    for (u32 qword = 0u; qword < qword_count; qword++) {
+      for (u32 lane = 0u; lane < 4u; lane++) {
+        if (!context.read_memory_u32(
+                context.memory_user,
+                static_cast<u16>((first_qword + qword) & 0x3ffu),
+                static_cast<u8>(lane), &values[qword * 4u + lane])) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
+  // One MTVU thread owns descriptor construction. Preserve the dense formula
+  // workspace between invocations; this executes address/control formulas,
+  // never VU arithmetic or a per-vertex transform.
+  thread_local InvocationEvaluationWorkspace evaluation_workspace;
+  evaluation_workspace.Begin(invocation.values.size());
+
+  std::array<u32, 4> tag{};
+  if (gif_tag_pre_attested) {
+    tag = expected_gif_tag;
+  } else if (!ReadGifTag(invocation, context, &evaluation_workspace, &tag) ||
+             tag != expected_gif_tag) {
+    return fail(AdmissionFailure::TagMismatch,
+                "generated affine GIF tag changed before effects");
+  }
+  if (!ClampStableSeedsHold(generated, context)) {
+    return fail(AdmissionFailure::SeedUnstable,
+                "generated affine seed is outside its clamp proof");
+  }
+
+  auto draw = std::make_unique<GpuVuDraw>();
+  draw->SetUniformBlock(
+      GpuVuUniformBlockRef::Adopt(new GpuVuUniformBlock()));
+  GpuVuUniformBlock* const uniforms = draw->UniformBlock().Get();
+  draw->program = key;
+  draw->direct_tfx = contract;
+  draw->gif_tag = tag;
+  draw->lowering = OutputLowering::DirectTfx;
+  draw->execution = ExecutionKind::GeneratedParallel;
+  if (!ConfigureGeometry(contract, generated, draw.get(),
+                         active_nested_outer_iterations)) {
+    return fail(AdmissionFailure::GeometryFailed,
+                "generated affine geometry is not representable");
+  }
+  // A capacity-compatible generated root may execute a strict prefix of its
+  // compiled outer grid.  The INDEX domain makes rows outside this count
+  // unreachable.  Resolve and copy only the active architectural sources;
+  // packed compact tables retain their compiler-visible capacity stride below
+  // so every emitted table offset remains unchanged.
+  const u32 active_outer_iterations = generated.uses_nested_iteration_grid
+      ? draw->invocation_count / generated.nested_child_iterations
+      : 1u;
+  if (generated.uses_loop_kernel_private_store_output) {
+    if (!draw->ConfigurePrivateStoreJournal(
+            generated.loop_kernel_private_store_count)) {
+      return fail(AdmissionFailure::GeometryFailed,
+                  "generated loop-kernel private store ABI is invalid");
+    }
+  } else if (generated.loop_kernel_private_store_count != 0u) {
+    return fail(AdmissionFailure::GeometryFailed,
+                "generated private store metadata lacks buffer ownership");
+  }
+
+  bool failed = false;
+  // Input binding is a pre-effect transaction.  Keep a compact stage code so
+  // physical failures identify the ownership transition which rejected the
+  // descriptor instead of collapsing raw-ring, canonical-memory and compact
+  // sidecar failures into one unhelpful message.
+  u32 input_failure_stage = 0u;
+  u32 input_failure_index = std::numeric_limits<u32>::max();
+  const auto resolve_entry_base = [&](u8 base_vi, u32* value) {
+    if (!value)
+      return false;
+    if (!resolved_entry_vi) {
+      return base_vi < invocation.loop_entry_vi.size() &&
+             EvaluateInvocationValue(
+                 invocation, invocation.loop_entry_vi[base_vi], context,
+                 &evaluation_workspace, value);
+    }
+    if (base_vi < resolved_entry_vi->size()) {
+      *value = (*resolved_entry_vi)[base_vi];
+      return true;
+    }
+    if (base_vi == AffineViBaseVifTop) {
+      *value = context.vif_top;
+      return true;
+    }
+    if (base_vi == AffineViBaseVifItop) {
+      *value = context.vif_itop;
+      return true;
+    }
+    return false;
+  };
+  constexpr size_t MaximumDescriptorMemoryInputs = 16u;
+  struct ResolvedRawInput {
+    RawVifPayloadRef payload;
+    RawQwordBinding binding;
+    bool available = false;
+    bool persistent = false;
+  };
+  struct ResolvedCanonicalInput {
+    StreamBinding binding;
+    bool available = false;
+  };
+  std::array<ResolvedRawInput, MaximumDescriptorMemoryInputs>
+      resolved_raw_inputs{};
+  std::array<ResolvedCanonicalInput, MaximumDescriptorMemoryInputs>
+      resolved_canonical_inputs{};
+  if (generated.memory_inputs.empty() ||
+      generated.memory_inputs.size() > resolved_raw_inputs.size()) {
+    failed = true;
+    input_failure_stage = 1u;
+  }
+  u32 raw_input_count = 0u;
+  u32 canonical_input_count = 0u;
+  for (u32 input_index = 0u;
+       !failed && input_index < generated.memory_inputs.size();
+       input_index++) {
+    const CgMemoryInput& input = generated.memory_inputs[input_index];
+    // CompactOuterInput tables are transaction-private qwords assembled from
+    // several architectural sources.  Their synthetic address is only a
+    // BUFFER0 binding marker; it must never be mistaken for VU-memory qword
+    // zero even when a live UNPACK happens to cover that address.
+    if (input.compact_outer_table ==
+        CgMemoryInput::PackedCompactOuterTables) {
+      continue;
+    }
+    u32 base_qword = 0;
+    if (!resolve_entry_base(input.address.base_vi, &base_qword)) {
+      failed = true;
+      input_failure_stage = 2u;
+      input_failure_index = input_index;
+      break;
+    }
+    const u16 first_qword = static_cast<u16>(
+        (base_qword + input.address.qword_offset) & 0x3ffu);
+    RawQwordBinding raw{};
+    const VifUnpackSpan* const span = generated.uses_nested_iteration_grid
+        ? FindGridInputSpan(
+              spans, first_qword,
+              input.address.outer_invocation_coefficient,
+              active_outer_iterations,
+              input.address.invocation_coefficient,
+              generated.nested_child_iterations, &raw)
+        : FindInputSpan(
+              spans, first_qword, input.address.invocation_coefficient,
+              draw->invocation_count, &raw);
+    if (span) {
+      resolved_raw_inputs[input_index] = {span->payload, raw, true, false};
+      raw_input_count++;
+      continue;
+    }
+    if (context.bind_memory_qwords_to_raw_payload) {
+      RawVifPayloadRef persistent_payload;
+      const bool persistent = context.bind_memory_qwords_to_raw_payload(
+          context.memory_user, first_qword,
+          generated.uses_nested_iteration_grid
+              ? input.address.outer_invocation_coefficient
+              : 0,
+          generated.uses_nested_iteration_grid
+              ? active_outer_iterations
+              : 1u,
+          input.address.invocation_coefficient,
+          generated.uses_nested_iteration_grid
+              ? generated.nested_child_iterations
+              : draw->invocation_count,
+          &persistent_payload, &raw);
+      if (persistent) {
+        resolved_raw_inputs[input_index] = {
+            persistent_payload, raw, true, true};
+        raw_input_count++;
+        continue;
+      }
+    }
+
+    // A qword which has not been superseded by a deferred UNPACK, a private
+    // generated store, or a CPU bridge still belongs to the canonical VU1
+    // generation. Bind that mapped owner directly instead of reconstructing
+    // and copying it into another ring on CPU1. Require one non-wrapping range
+    // so GXM can rebase the existing BUFFER0 input directly onto the canonical
+    // 16 KiB VU1-memory image. The generated root must not carry a second
+    // memory space or a per-load owner selection.
+    if (!generated.uses_buffered_batch_inputs ||
+        !context.memory_qwords_have_canonical_owner ||
+        !input.address.valid ||
+        input.address.invocation_coefficient < 0 ||
+        (generated.uses_nested_iteration_grid &&
+         input.address.outer_invocation_coefficient < 0)) {
+      continue;
+    }
+    const u32 outer_count = generated.uses_nested_iteration_grid
+        ? active_outer_iterations
+        : 1u;
+    const u32 child_count = generated.uses_nested_iteration_grid
+        ? generated.nested_child_iterations
+        : draw->invocation_count;
+    const u64 outer_coefficient = generated.uses_nested_iteration_grid
+        ? static_cast<u32>(input.address.outer_invocation_coefficient)
+        : 0u;
+    const u64 child_coefficient =
+        static_cast<u32>(input.address.invocation_coefficient);
+    if (outer_count == 0u || child_count == 0u)
+      continue;
+    const u64 extent_qwords =
+        static_cast<u64>(outer_count - 1u) * outer_coefficient +
+        static_cast<u64>(child_count - 1u) * child_coefficient + 1u;
+    if (extent_qwords == 0u || extent_qwords > 1024u ||
+        static_cast<u64>(first_qword) + extent_qwords > 1024u ||
+        !context.memory_qwords_have_canonical_owner(
+            context.memory_user, first_qword,
+            static_cast<u32>(extent_qwords))) {
+      continue;
+    }
+    StreamBinding binding{};
+    binding.payload_byte_offset = static_cast<u32>(first_qword) * 16u;
+    binding.byte_stride = static_cast<u32>(child_coefficient * 16u);
+    binding.input_span = std::numeric_limits<u16>::max();
+    binding.attribute_index = static_cast<u8>(input.attribute_index);
+    binding.owner = StreamInputOwner::CanonicalVuMemory;
+    binding.outer_byte_stride =
+        static_cast<u32>(outer_coefficient * 16u);
+    binding.payload_byte_extent = static_cast<u32>(extent_qwords * 16u);
+    resolved_canonical_inputs[input_index] = {binding, true};
+    canonical_input_count++;
+  }
+
+  constexpr u64 MaximumCompactQwords =
+      static_cast<u64>(std::numeric_limits<s16>::max()) + 1u;
+  const auto pack_compact_input =
+      [&](const CgMemoryInput& input, std::vector<u32>* compact_words,
+          StreamBinding* stream) {
+    if (!compact_words || !stream)
+      return false;
+    *stream = {};
+    if (input.compact_outer_table ==
+        CgMemoryInput::PackedCompactOuterTables) {
+      const u64 first_compact_qword = compact_words->size() / 4u;
+      u64 packed_qwords = 0u;
+      if (!generated.uses_nested_iteration_grid ||
+          generated.compact_outer_inputs.empty() ||
+          !input.address.valid || input.address.base_vi != 0u ||
+          input.address.qword_offset != 0 ||
+          input.address.invocation_coefficient != 0 ||
+          input.address.outer_invocation_coefficient != 0) {
+        return false;
+      }
+      for (const CompactOuterInputTable& table :
+           generated.compact_outer_inputs) {
+        if (table.sources.size() != generated.nested_outer_iterations ||
+            table.sources.size() > MaximumCompactQwords - packed_qwords) {
+          return false;
+        }
+        packed_qwords += table.sources.size();
+      }
+      if (packed_qwords == 0u ||
+          first_compact_qword > MaximumCompactQwords ||
+          packed_qwords > MaximumCompactQwords - first_compact_qword) {
+        return false;
+      }
+
+      compact_words->resize(
+          static_cast<size_t>(first_compact_qword + packed_qwords) * 4u);
+      u32* table_destination = compact_words->data() +
+          static_cast<size_t>(first_compact_qword) * 4u;
+      for (const CompactOuterInputTable& table :
+           generated.compact_outer_inputs) {
+        // The Cg root computes each table's base from its capacity-sized
+        // predecessor. Keep that layout, but do not demand sources for outer
+        // rows which the active INDEX draw cannot execute. resize() has
+        // value-initialized those inactive qwords, providing deterministic
+        // mapped padding for speculative cache-line fetches without granting
+        // them architectural provenance.
+        for (u32 outer = 0u; outer < active_outer_iterations; outer++) {
+          const CompactQwordSource& source = table.sources[outer];
+          u32* const destination = table_destination + outer * 4u;
+          if (source.kind == CompactQwordSourceKind::InitialVf) {
+            if (source.reg == 0u || source.reg >= 32u ||
+                !context.InitialVfRegisterAvailable(source.reg)) {
+              return false;
+            }
+            std::memcpy(destination,
+                        context.initial_vf_words + source.reg * 4u,
+                        4u * sizeof(u32));
+          } else if (source.kind == CompactQwordSourceKind::Memory) {
+            const AffineQwordAddress& address = source.memory_address;
+            u32 base_qword = 0u;
+            if (!address.valid ||
+                address.invocation_coefficient != 0 ||
+                address.outer_invocation_coefficient != 0 ||
+                !resolve_entry_base(address.base_vi, &base_qword)) {
+              return false;
+            }
+            const u16 source_qword = static_cast<u16>(
+                (base_qword + address.qword_offset) & 0x3ffu);
+            if (!read_memory_qwords(source_qword, 1u, destination))
+              return false;
+          } else {
+            return false;
+          }
+        }
+        table_destination += table.sources.size() * 4u;
+      }
+
+      stream->payload_byte_offset =
+          static_cast<u32>(first_compact_qword * 16u);
+      stream->byte_stride = 0u;
+      stream->input_span = std::numeric_limits<u16>::max();
+      stream->attribute_index = static_cast<u8>(input.attribute_index);
+      stream->outer_byte_stride = 0u;
+      stream->payload_byte_extent = static_cast<u32>(packed_qwords * 16u);
+      return true;
+    }
+    if (input.compact_outer_table != CgMemoryInput::OrdinaryVuMemory)
+      return false;
+
+    u32 base_qword = 0u;
+    if (!resolve_entry_base(input.address.base_vi, &base_qword) ||
+        input.address.invocation_coefficient < 0 ||
+        (generated.uses_nested_iteration_grid &&
+         input.address.outer_invocation_coefficient < 0)) {
+      return false;
+    }
+    const u32 outer_count = generated.uses_nested_iteration_grid
+        ? active_outer_iterations
+        : 1u;
+    const u32 child_count = generated.uses_nested_iteration_grid
+        ? generated.nested_child_iterations
+        : draw->invocation_count;
+    const u64 outer_coefficient = generated.uses_nested_iteration_grid
+        ? static_cast<u32>(input.address.outer_invocation_coefficient)
+        : 0u;
+    const u64 child_coefficient =
+        static_cast<u32>(input.address.invocation_coefficient);
+    if (outer_count == 0u || child_count == 0u)
+      return false;
+    const u64 extent_qwords =
+        static_cast<u64>(outer_count - 1u) * outer_coefficient +
+        static_cast<u64>(child_count - 1u) * child_coefficient + 1u;
+    const u64 first_compact_qword = compact_words->size() / 4u;
+    if (extent_qwords == 0u ||
+        first_compact_qword > MaximumCompactQwords ||
+        extent_qwords > MaximumCompactQwords - first_compact_qword) {
+      return false;
+    }
+    compact_words->resize(
+        static_cast<size_t>(first_compact_qword + extent_qwords) * 4u);
+    const u16 first_source_qword = static_cast<u16>(
+        (base_qword + input.address.qword_offset) & 0x3ffu);
+    bool copied = true;
+    if (child_coefficient == 0u && outer_coefficient == 0u) {
+      copied = read_memory_qwords(
+          first_source_qword, 1u,
+          compact_words->data() + first_compact_qword * 4u);
+    } else {
+      for (u32 outer = 0u; outer < outer_count && copied; outer++) {
+        const u64 outer_relative =
+            static_cast<u64>(outer) * outer_coefficient;
+        if (child_coefficient == 0u) {
+          const u16 source_qword = static_cast<u16>(
+              (static_cast<u64>(first_source_qword) + outer_relative) &
+              0x3ffu);
+          u32* const destination = compact_words->data() +
+              static_cast<size_t>(first_compact_qword + outer_relative) * 4u;
+          copied = read_memory_qwords(source_qword, 1u, destination);
+          continue;
+        }
+        if (child_coefficient == 1u) {
+          const u16 source_qword = static_cast<u16>(
+              (static_cast<u64>(first_source_qword) + outer_relative) &
+              0x3ffu);
+          u32* const destination = compact_words->data() +
+              static_cast<size_t>(first_compact_qword + outer_relative) * 4u;
+          copied = read_memory_qwords(
+              source_qword, child_count, destination);
+          continue;
+        }
+        for (u32 child = 0u; child < child_count && copied; child++) {
+          const u64 relative_qword =
+              outer_relative + static_cast<u64>(child) * child_coefficient;
+          const u16 source_qword = static_cast<u16>(
+              (static_cast<u64>(first_source_qword) + relative_qword) &
+              0x3ffu);
+          u32* const destination = compact_words->data() +
+              static_cast<size_t>(first_compact_qword + relative_qword) * 4u;
+          copied = read_memory_qwords(source_qword, 1u, destination);
+        }
+      }
+    }
+    if (!copied)
+      return false;
+
+    stream->payload_byte_offset =
+        static_cast<u32>(first_compact_qword * 16u);
+    stream->byte_stride = static_cast<u32>(child_coefficient * 16u);
+    stream->input_span = std::numeric_limits<u16>::max();
+    stream->attribute_index = static_cast<u8>(input.attribute_index);
+    stream->outer_byte_stride =
+        static_cast<u32>(outer_coefficient * 16u);
+    stream->payload_byte_extent = static_cast<u32>(extent_qwords * 16u);
+    return true;
+  };
+
+  std::array<RawVifPayloadRef, MaximumDescriptorMemoryInputs + 1u>
+      planned_payloads{};
+  std::array<StreamBinding, MaximumDescriptorMemoryInputs> planned_streams{};
+  size_t planned_payload_count = 0u;
+  size_t planned_stream_count = 0u;
+  bool descriptor_inputs_mutated = false;
+  const auto reset_input_plan = [&]() {
+    planned_payload_count = 0u;
+    planned_stream_count = 0u;
+  };
+  const auto add_planned_payload = [&](const RawVifPayloadRef& payload,
+                                       u16* span_index) {
+    if (!span_index || !payload.IsValid())
+      return false;
+    for (size_t index = 0u; index < planned_payload_count; index++) {
+      if (SamePayload(planned_payloads[index], payload)) {
+        *span_index = static_cast<u16>(index);
+        return true;
+      }
+    }
+    if (planned_payload_count >= planned_payloads.size())
+      return false;
+    *span_index = static_cast<u16>(planned_payload_count);
+    planned_payloads[planned_payload_count++] = payload;
+    return true;
+  };
+  const auto plan_raw_input = [&](u32 input_index) {
+    if (input_index >= generated.memory_inputs.size() ||
+        input_index >= resolved_raw_inputs.size() ||
+        !resolved_raw_inputs[input_index].available ||
+        planned_stream_count >= planned_streams.size()) {
+      return false;
+    }
+    const ResolvedRawInput& resolved = resolved_raw_inputs[input_index];
+    u16 span_index = 0u;
+    if (!add_planned_payload(resolved.payload, &span_index))
+      return false;
+    const CgMemoryInput& input = generated.memory_inputs[input_index];
+    StreamBinding& stream = planned_streams[planned_stream_count++];
+    stream.payload_byte_offset = resolved.binding.payload_byte_offset;
+    stream.byte_stride = resolved.binding.byte_stride;
+    stream.input_span = span_index;
+    stream.attribute_index = static_cast<u8>(input.attribute_index);
+    stream.owner = StreamInputOwner::RawInput;
+    stream.outer_byte_stride = resolved.binding.outer_byte_stride;
+    stream.payload_byte_extent = resolved.binding.payload_byte_extent;
+    return true;
+  };
+  const auto plan_canonical_input = [&](u32 input_index) {
+    if (input_index >= generated.memory_inputs.size() ||
+        input_index >= resolved_canonical_inputs.size() ||
+        !resolved_canonical_inputs[input_index].available ||
+        planned_stream_count >= planned_streams.size()) {
+      return false;
+    }
+    planned_streams[planned_stream_count++] =
+        resolved_canonical_inputs[input_index].binding;
+    return true;
+  };
+  const auto commit_input_plan = [&]() {
+    const bool installed = draw->SetGeneratedInputPlan(
+        planned_payloads.data(), planned_payload_count,
+        planned_streams.data(), planned_stream_count,
+        generated.uses_buffered_batch_inputs);
+    descriptor_inputs_mutated = installed;
+    return installed;
+  };
+
+#if defined(__vita__) && !defined(VITASX2_QEMU_VALIDATION)
+  // MTVU reuses one descriptor workspace and publishes only the finished
+  // sparse sidecar into the mapped input ring. No vector is retained by the
+  // draw after construction.
+  static thread_local std::vector<u32> compact_words_workspace;
+  std::vector<u32>& compact_words = compact_words_workspace;
+#else
+  std::vector<u32> compact_words;
+#endif
+
+  const u32 direct_input_count = raw_input_count + canonical_input_count;
+  const bool all_inputs_are_raw =
+      !failed && raw_input_count == generated.memory_inputs.size();
+  const bool all_inputs_are_canonical =
+      !failed && canonical_input_count == generated.memory_inputs.size();
+  const bool all_inputs_have_one_direct_owner =
+      all_inputs_are_raw || all_inputs_are_canonical;
+  bool inputs_bound = false;
+  if (all_inputs_have_one_direct_owner) {
+    reset_input_plan();
+    for (u32 input_index = 0u;
+         !failed && input_index < generated.memory_inputs.size();
+         input_index++) {
+      failed = all_inputs_are_raw ? !plan_raw_input(input_index)
+                                  : !plan_canonical_input(input_index);
+      if (failed)
+      {
+        input_failure_stage = 3u;
+        input_failure_index = input_index;
+      }
+    }
+    if (!failed) {
+      // SetGeneratedInputPlan() is the one construction-time preflight.  It
+      // retains every payload transactionally, proves this exact payload/stream
+      // set with ResolveGeneratedInputWindow(), and publishes neither
+      // collection on failure.  Queue sealing deliberately repeats the proof
+      // after sequence assignment; walking it once more immediately before
+      // installation added no independent ownership boundary.
+      inputs_bound = commit_input_plan();
+      failed = !inputs_bound;
+      if (failed)
+        input_failure_stage = 5u;
+    }
+  }
+
+#if defined(__vita__) && !defined(VITASX2_QEMU_VALIDATION)
+  if (!failed && !inputs_bound && allow_compact_raw_inputs &&
+      DerivedGpuVuPayloadSharesRawInputArena() &&
+      canonical_input_count == 0u &&
+      direct_input_count != 0u &&
+      direct_input_count < generated.memory_inputs.size()) {
+    // Mixed raw/derived transactions used to copy every input into a new table
+    // merely because one CompactOuterInput or inherited qword lacked a raw
+    // owner. Preserve raw VIF bytes in place and copy only that sparse subset.
+    reset_input_plan();
+    compact_words.clear();
+    s_hybrid_input_attempts.fetch_add(1u, std::memory_order_relaxed);
+    u64 hybrid_raw_bytes = 0u;
+    for (u32 input_index = 0u;
+         !failed && input_index < generated.memory_inputs.size();
+         input_index++) {
+      if (resolved_raw_inputs[input_index].available) {
+        hybrid_raw_bytes +=
+            resolved_raw_inputs[input_index].binding.payload_byte_extent;
+        failed = !plan_raw_input(input_index);
+        continue;
+      }
+      if (planned_stream_count >= planned_streams.size() ||
+          !pack_compact_input(generated.memory_inputs[input_index],
+                              &compact_words,
+                              &planned_streams[planned_stream_count])) {
+        failed = true;
+        input_failure_stage = 6u;
+        input_failure_index = input_index;
+        break;
+      }
+      planned_stream_count++;
+    }
+    RawVifPayloadRef sparse_payload;
+    if (!failed) {
+      const u64 compact_bytes =
+          static_cast<u64>(compact_words.size()) * sizeof(u32);
+      if (compact_bytes == 0u ||
+          compact_bytes > std::numeric_limits<u32>::max() ||
+          !CaptureDerivedGpuVuPayload(
+              compact_words.data(), static_cast<u32>(compact_bytes),
+              &sparse_payload)) {
+        failed = true;
+        input_failure_stage = 7u;
+      } else {
+        u16 sparse_span = 0u;
+        if (!add_planned_payload(sparse_payload, &sparse_span)) {
+          failed = true;
+          input_failure_stage = 8u;
+        } else {
+          for (size_t index = 0u; index < planned_stream_count; index++) {
+            if (planned_streams[index].input_span ==
+                    std::numeric_limits<u16>::max() &&
+                planned_streams[index].owner ==
+                    StreamInputOwner::RawInput) {
+              planned_streams[index].input_span = sparse_span;
+            }
+          }
+        }
+      }
+    }
+    if (!failed) {
+      inputs_bound = commit_input_plan();
+      failed = !inputs_bound;
+      if (failed)
+        input_failure_stage = 10u;
+    }
+    if (inputs_bound) {
+      const u64 hybrid_derived_bytes =
+          static_cast<u64>(compact_words.size()) * sizeof(u32);
+      s_hybrid_input_hits.fetch_add(1u, std::memory_order_relaxed);
+      s_hybrid_raw_bytes_retained.fetch_add(
+          hybrid_raw_bytes, std::memory_order_relaxed);
+      s_hybrid_derived_bytes.fetch_add(
+          hybrid_derived_bytes, std::memory_order_relaxed);
+      s_hybrid_copy_bytes_avoided.fetch_add(
+          hybrid_raw_bytes, std::memory_order_relaxed);
+    } else {
+      s_hybrid_input_fallbacks.fetch_add(1u, std::memory_order_relaxed);
+    }
+    ReleaseRawVifPayload(&sparse_payload);
+  }
+
+  // A failed mixed-window attempt must not turn into partial GPU ownership.
+  // Rebuild the old all-compact input table only when the failure happened
+  // before descriptor publication; otherwise the draw owns the complete plan.
+  if (failed && !inputs_bound && !descriptor_inputs_mutated &&
+      allow_compact_raw_inputs) {
+    failed = false;
+  }
+#endif
+
+  if (!failed && !inputs_bound) {
+    // Conservative fallback for inputs which cannot share BUFFER0 directly.
+    // Unlike the mixed fast path above this retains the old all-compact ABI.
+    if (!allow_compact_raw_inputs) {
+      failed = true;
+      input_failure_stage = 11u;
+    } else {
+      reset_input_plan();
+      compact_words.clear();
+      for (u32 input_index = 0u;
+           !failed && input_index < generated.memory_inputs.size();
+           input_index++) {
+        if (planned_stream_count >= planned_streams.size() ||
+            !pack_compact_input(generated.memory_inputs[input_index],
+                                &compact_words,
+                                &planned_streams[planned_stream_count])) {
+          failed = true;
+          input_failure_stage = 12u;
+          input_failure_index = input_index;
+          break;
+        }
+        planned_stream_count++;
+      }
+      if (!failed) {
+#if defined(__vita__) && !defined(VITASX2_QEMU_VALIDATION)
+        const u64 compact_bytes =
+            static_cast<u64>(compact_words.size()) * sizeof(u32);
+        RawVifPayloadRef compact_payload;
+        if (compact_bytes == 0u ||
+            compact_bytes > std::numeric_limits<u32>::max() ||
+            !CaptureDerivedGpuVuPayload(
+                compact_words.data(), static_cast<u32>(compact_bytes),
+                &compact_payload)) {
+          failed = true;
+          input_failure_stage = 13u;
+        } else {
+          u16 compact_span = 0u;
+          if (!add_planned_payload(compact_payload, &compact_span)) {
+            failed = true;
+            input_failure_stage = 14u;
+          } else {
+            for (size_t index = 0u; index < planned_stream_count; index++) {
+              planned_streams[index].input_span = compact_span;
+              planned_streams[index].owner = StreamInputOwner::RawInput;
+            }
+          }
+          if (!failed) {
+            inputs_bound = commit_input_plan();
+            failed = !inputs_bound;
+            if (failed)
+              input_failure_stage = 16u;
+          }
+          ReleaseRawVifPayload(&compact_payload);
+        }
+#else
+        for (size_t index = 0u; index < planned_stream_count; index++) {
+          planned_streams[index].input_span =
+              std::numeric_limits<u16>::max();
+          draw->streams.push_back(planned_streams[index]);
+        }
+        inputs_bound = draw->SetCompactRawInputWords(std::move(compact_words));
+        failed = !inputs_bound;
+#endif
+      }
+    }
+  }
+  if (failed ||
+      (generated.uses_buffered_batch_inputs &&
+       !draw->HasCompactRawInputs() &&
+       !draw->GeneratedInputWindowProof())) {
+    if (!failed)
+      input_failure_stage = 17u;
+    static std::atomic<u64> input_failure_reports{0u};
+    const u64 report = input_failure_reports.fetch_add(
+                           1u, std::memory_order_relaxed) +
+                       1u;
+    if (report <= 8u || (report & (report - 1u)) == 0u) {
+      Console.Warning(
+          "GPU-VU: immutable input binder rejected report=%llu stage=%u "
+          "input=%u "
+          "inputs=%u raw=%u canonical=%u direct=%u payloads=%u streams=%u "
+          "compact_words=%u compact_allowed=%u shared_arena=%u "
+          "descriptor_mutated=%u buffered=%u pre_effect=1.",
+          static_cast<unsigned long long>(report), input_failure_stage,
+          input_failure_index,
+          static_cast<u32>(generated.memory_inputs.size()), raw_input_count,
+          canonical_input_count, direct_input_count,
+          static_cast<u32>(planned_payload_count),
+          static_cast<u32>(planned_stream_count),
+          static_cast<u32>(compact_words.size()),
+          allow_compact_raw_inputs ? 1u : 0u,
+          DerivedGpuVuPayloadSharesRawInputArena() ? 1u : 0u,
+          descriptor_inputs_mutated ? 1u : 0u,
+          generated.uses_buffered_batch_inputs ? 1u : 0u);
+    }
+    return fail(AdmissionFailure::InputResolveFailed,
+                "generated affine stream is outside immutable input spans");
+  }
+
+  for (const CgConstantInput& input : generated.constant_inputs) {
+    const ContinuationConstantOverride* const override =
+        s_continuation_constant_override;
+    if (continuation_override_token.IsValid() && override &&
+        override->entry_program == continuation_override_token &&
+        override->seed && override->resume_generated &&
+        !HasConstantAddress(*override->resume_generated, input.address)) {
+      if (input.uniform_index >= override->seed->constant_values.size() ||
+          (override->seed->constant_mask &
+           (1u << input.uniform_index)) == 0u) {
+        failed = true;
+        break;
+      }
+      ConstantUniform uniform{};
+      uniform.input_index = static_cast<u8>(input.uniform_index);
+      uniform.bits = override->seed->constant_values[input.uniform_index];
+      uniforms->constant_uniforms.push_back(std::move(uniform));
+      continue;
+    }
+
+    u32 base_qword = 0;
+    if (!resolve_entry_base(input.address.base_vi, &base_qword)) {
+      failed = true;
+      break;
+    }
+    ConstantUniform uniform{};
+    uniform.input_index = static_cast<u8>(input.uniform_index);
+    const u16 address = static_cast<u16>(
+        (base_qword + input.address.qword_offset) & 0x3ffu);
+    // Constant records are complete qwords.  Resolve them through the same
+    // immutable bulk workspace as compact BUFFER0 input instead of performing
+    // four reverse searches through the deferred-UNPACK journal.  On Vita the
+    // first bulk request builds one qword-owner table for the whole descriptor;
+    // all later constants and final-state leaves are then O(1) pointer copies.
+    if (!read_memory_qwords(address, 1u, uniform.bits.data()))
+      failed = true;
+    if (failed)
+      break;
+    uniforms->constant_uniforms.push_back(uniform);
+  }
+  if (failed) {
+    return fail(AdmissionFailure::InputResolveFailed,
+                "generated affine constant input is unavailable");
+  }
+
+  for (u32 reg = 1; reg < 32; reg++) {
+    if ((generated.vf_uniform_mask & (1u << reg)) == 0u)
+      continue;
+    if (!context.InitialVfRegisterAvailable(reg)) {
+      return fail(AdmissionFailure::BuildFailed,
+                  "generated affine VF input is deferred");
+    }
+    VectorUniform uniform{};
+    uniform.register_index = static_cast<u8>(reg);
+    std::memcpy(uniform.bits.data(), context.initial_vf_words + reg * 4u,
+                sizeof(uniform.bits));
+    uniforms->vf_uniforms.push_back(uniform);
+  }
+  if (generated.uses_acc_uniform) {
+    if (!context.initial_acc_words ||
+        (context.unavailable_initial_acc_lanes & 0x0fu) != 0u)
+      return fail(AdmissionFailure::BuildFailed,
+                  "generated affine ACC input is unavailable");
+    std::memcpy(draw->acc_uniform.data(), context.initial_acc_words,
+                sizeof(draw->acc_uniform));
+  }
+  if (generated.uses_q_uniform) {
+    if (!context.initial_q_available)
+      return fail(AdmissionFailure::BuildFailed,
+                  "generated affine Q input is deferred");
+    draw->scalar_uniforms.present |= ScalarUniformQ;
+    draw->scalar_uniforms.q = context.initial_q;
+  }
+  if (generated.uses_p_uniform) {
+    if (!context.initial_p_available)
+      return fail(AdmissionFailure::BuildFailed,
+                  "generated affine P input is deferred");
+    draw->scalar_uniforms.present |= ScalarUniformP;
+    draw->scalar_uniforms.p = context.initial_p;
+  }
+  if (generated.uses_i_uniform) {
+    if (!context.initial_i_available)
+      return fail(AdmissionFailure::BuildFailed,
+                  "generated affine I input is deferred");
+    draw->scalar_uniforms.present |= ScalarUniformI;
+    draw->scalar_uniforms.i = context.initial_i;
+  }
+  if (generated.uses_gif_q_uniform) {
+    draw->scalar_uniforms.present |= ScalarUniformGifQ;
+    draw->scalar_uniforms.gif_q = 0x3f800000u;
+  }
+  if (final_vi_override) {
+    draw->final_vi_values = *final_vi_override;
+    draw->final_vi_write_mask = final_vi_override_mask;
+  } else if (!EvaluateFinalViState(
+                 invocation, context, &evaluation_workspace,
+                 &draw->final_vi_values, &draw->final_vi_write_mask)) {
+    return fail(AdmissionFailure::BuildFailed,
+                "generated affine final-VI formula rejected");
+  }
+  u64 canonical_bytes = 0u;
+  u64 canonical_bindings = 0u;
+  for (const StreamBinding& stream : draw->streams) {
+    if (stream.owner != StreamInputOwner::CanonicalVuMemory)
+      continue;
+    canonical_bindings++;
+    canonical_bytes += stream.payload_byte_extent;
+  }
+  s_canonical_input_bindings.fetch_add(
+      canonical_bindings, std::memory_order_relaxed);
+  s_canonical_input_bytes.fetch_add(
+      canonical_bytes, std::memory_order_relaxed);
+  u64 persistent_raw_bytes = 0u;
+  u64 persistent_raw_bindings = 0u;
+  for (const ResolvedRawInput& resolved : resolved_raw_inputs) {
+    if (!resolved.available || !resolved.persistent)
+      continue;
+    const bool retained = std::any_of(
+        draw->InputPayloads().begin(), draw->InputPayloads().end(),
+        [&resolved](const RawVifPayloadRef& payload) {
+          return SamePayload(payload, resolved.payload);
+        });
+    if (!retained)
+      continue;
+    persistent_raw_bindings++;
+    persistent_raw_bytes += resolved.binding.payload_byte_extent;
+  }
+  s_persistent_raw_input_bindings.fetch_add(
+      persistent_raw_bindings, std::memory_order_relaxed);
+  s_persistent_raw_input_bytes.fetch_add(
+      persistent_raw_bytes, std::memory_order_relaxed);
+  return draw;
 }
 
 } // namespace
 
+std::unique_ptr<GpuVuDraw> BuildGeneratedAffineGpuVuDraw(
+    const ShaderKey& key, const DirectTfxContract& contract,
+    const std::array<u32, 4>& gif_tag,
+    const ParallelInvocationPlan& invocation,
+    const GeneratedCgProgram& generated,
+    const InvocationEvaluationContext& context,
+    const std::vector<VifUnpackSpan>& spans, std::string* error) {
+  return BuildGeneratedAffineGpuVuDrawInternal(
+      key, contract, gif_tag, invocation, generated, context, spans, {},
+      error);
+}
+
+std::unique_ptr<GpuVuDraw> BuildGeneratedResolvedGridGpuVuDraw(
+    const ShaderKey& key, const DirectTfxContract& contract,
+    const std::array<u32, 4>& attested_gif_tag,
+    const GeneratedCgProgram& generated,
+    const std::array<u16, 16>& resolved_entry_vi,
+    const std::array<u16, 16>& final_vi, u32 final_vi_write_mask,
+    u32 active_nested_outer_iterations,
+    const InvocationEvaluationContext& context,
+    const std::vector<VifUnpackSpan>& spans, std::string* error) {
+  // The closed-form root has no legacy per-pair InvocationValue program: its
+  // complete entry and exit VI states were already reduced from the canonical
+  // PairPlan CFG.  Pass an empty legacy plan only as an unused ABI argument;
+  // all address bases, the GIF tag, and final VI values are supplied by the
+  // resolved proof below.
+  const ParallelInvocationPlan unused_invocation;
+  return BuildGeneratedAffineGpuVuDrawInternal(
+      key, contract, attested_gif_tag, unused_invocation, generated, context,
+      spans, {}, error, &resolved_entry_vi, &final_vi,
+      final_vi_write_mask, true, true, active_nested_outer_iterations);
+}
+
 DirectProgramToken PrepareDirectProgram(const u8 *micro, u32 micro_size,
                                         u32 start_pc) {
-  if (!micro || micro_size != VU1_PROGSIZE || (start_pc & 7u) != 0)
+  return PrepareDirectProgramForConfiguration(
+      micro, micro_size, start_pc,
+      GetCurrentUniversalMicroProgramConfigurationBits());
+}
+
+DirectProgramToken PrepareDirectProgramForConfiguration(
+    const u8* micro, u32 micro_size, u32 start_pc,
+    u32 configuration_bits) {
+  ScopedPreparationTimer preparation_timer;
+  if (!micro || micro_size != VU1_PROGSIZE || (start_pc & 7u) != 0 ||
+      (configuration_bits & ~UniversalConfigurationKnownMask) != 0) {
     return {};
+  }
   start_pc &= VU1_PROGMASK;
+  const u64 source_hash = HashExactSource(micro, micro_size);
+  const u32 semantic_profile_key = SemanticProfileKey(configuration_bits);
 
   {
     std::lock_guard lock(s_cache_mutex);
     for (u32 slot = 0; slot < s_cache.size(); slot++) {
       CacheSlot &entry = s_cache[slot];
-      if (!entry.program || !Matches(*entry.program, micro, start_pc))
+      if (!entry.program ||
+          !Matches(*entry.program, micro, source_hash, start_pc,
+                   configuration_bits, semantic_profile_key)) {
         continue;
+      }
       entry.last_use = ++s_cache_clock;
       s_preparation_cache_hits.fetch_add(1, std::memory_order_relaxed);
       return MakeToken(slot, entry.generation);
@@ -815,7 +1910,8 @@ DirectProgramToken PrepareDirectProgram(const u8 *micro, u32 micro_size,
   }
 
   std::unique_ptr<PreparedProgram> prepared =
-      BuildPreparedProgram(micro, start_pc);
+      BuildPreparedProgram(micro, source_hash, start_pc, configuration_bits,
+                           semantic_profile_key);
   if (!prepared)
     return {};
 
@@ -831,8 +1927,11 @@ DirectProgramToken PrepareDirectProgram(const u8 *micro, u32 micro_size,
     // diagnostic preparation raced it.
     for (u32 slot = 0; slot < s_cache.size(); slot++) {
       CacheSlot &entry = s_cache[slot];
-      if (!entry.program || !Matches(*entry.program, micro, start_pc))
+      if (!entry.program ||
+          !Matches(*entry.program, micro, source_hash, start_pc,
+                   configuration_bits, semantic_profile_key)) {
         continue;
+      }
       entry.last_use = ++s_cache_clock;
       s_preparation_cache_hits.fetch_add(1, std::memory_order_relaxed);
       return MakeToken(slot, entry.generation);
@@ -874,9 +1973,10 @@ DirectProgramToken PrepareDirectProgram(const u8 *micro, u32 micro_size,
   retired = {};
   Console.WriteLn(
       "GPU-VU: prepared VU1 entry %04x (%u blocks, %u loops, %u parallel "
-      "direct candidates).",
+      "direct candidates, config=%08x profile=%08x analysis_abi=%u).",
       published_start_pc, published_blocks, published_loops,
-      published_candidates);
+      published_candidates, configuration_bits, semantic_profile_key,
+      GeneratedLoopAnalysisAbiVersion);
   return token;
 }
 
@@ -927,9 +2027,11 @@ bool PrimeDirectProgram(DirectProgramToken token,
     std::string rejection;
     const bool requested = RequestCandidate(&candidate, tag, &rejection);
     Console.WriteLn(
-        "GPU-VU: prime entry %04x candidate %u tag @%04x = %08x %08x %08x "
+        "GPU-VU: prime entry %04x candidate %u tag %s%04x = %08x %08x %08x "
         "%08x -> requested %u, accepted %u%s%s.",
-        prepared->start_pc, index, address, tag[0], tag[1], tag[2], tag[3],
+        prepared->start_pc, index,
+        address_resolved ? "@" : "from-vf ", address,
+        tag[0], tag[1], tag[2], tag[3],
         requested ? 1u : 0u, candidate.request_accepted ? 1u : 0u,
         rejection.empty() ? "" : ", rejected: ", rejection.c_str());
     if (requested) {
@@ -1015,179 +2117,10 @@ BuildDirectGpuVuDraw(DirectProgramToken token,
   }
 
   const DirectCandidate &candidate = prepared->candidates[ready_candidate - 1];
-  // One MTVU thread owns direct descriptor construction. Preserve the dense
-  // evaluator storage between invocations and share its cache across every
-  // descriptor-scale formula for this immutable context.
-  thread_local InvocationEvaluationWorkspace evaluation_workspace;
-  evaluation_workspace.Begin(candidate.invocation.values.size());
-
-  std::array<u32, 4> tag{};
-  if (!ReadGifTag(candidate.invocation, context, &evaluation_workspace, &tag) ||
-      tag != candidate.gif_tag) {
-    RecordDirectAdmissionFailure(AdmissionFailure::TagMismatch);
-    return {};
-  }
-  if (!ClampStableSeedsHold(candidate.generated, context)) {
-    RecordDirectAdmissionFailure(AdmissionFailure::SeedUnstable);
-    return {};
-  }
-
-  auto draw = std::make_unique<GpuVuDraw>();
-  draw->SetUniformBlock(
-      GpuVuUniformBlockRef::Adopt(new GpuVuUniformBlock()));
-  GpuVuUniformBlock *const uniforms = draw->UniformBlock().Get();
-  draw->program = candidate.key;
-  draw->direct_tfx = candidate.contract;
-  draw->gif_tag = tag;
-  draw->lowering = OutputLowering::DirectTfx;
-  draw->execution = ExecutionKind::GeneratedParallel;
-  if (!ConfigureGeometry(candidate, draw.get())) {
-    RecordDirectAdmissionFailure(AdmissionFailure::GeometryFailed);
-    return {};
-  }
-
-  bool failed = false;
-  for (const CgMemoryInput &input : candidate.generated.memory_inputs) {
-    u32 base_qword = 0;
-    if (input.address.base_vi >= candidate.invocation.loop_entry_vi.size() ||
-        !EvaluateInvocationValue(
-            candidate.invocation,
-            candidate.invocation.loop_entry_vi[input.address.base_vi], context,
-            &evaluation_workspace, &base_qword)) {
-      failed = true;
-      break;
-    }
-    const u16 first_qword =
-        static_cast<u16>((base_qword + input.address.qword_offset) & 0x3ffu);
-    RawQwordBinding raw{};
-    const VifUnpackSpan *span =
-        FindInputSpan(spans, first_qword, input.address.invocation_coefficient,
-                      draw->invocation_count, &raw);
-    if (!span) {
-      failed = true;
-      break;
-    }
-
-    u16 span_index = 0;
-    bool retained = false;
-    const auto& retained_payloads = draw->InputPayloads();
-    for (u32 index = 0; index < retained_payloads.size(); index++) {
-      if (SamePayload(retained_payloads[index], span->payload)) {
-        span_index = static_cast<u16>(index);
-        retained = true;
-        break;
-      }
-    }
-    if (!retained) {
-      if (retained_payloads.size() >= std::numeric_limits<u16>::max() ||
-          !draw->AddInputPayload(span->payload)) {
-        failed = true;
-        break;
-      }
-      span_index = static_cast<u16>(draw->InputPayloads().size() - 1);
-    }
-    draw->streams.push_back({raw.payload_byte_offset, raw.byte_stride,
-                             span_index, static_cast<u8>(input.attribute_index),
-                             0});
-  }
-  if (failed) {
-    RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
-    return {};
-  }
-  if (candidate.generated.uses_buffered_batch_inputs &&
-      !HasSingleAddressableRawInputWindow(*draw)) {
-    RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
-    return {};
-  }
-
-  for (const CgConstantInput &input : candidate.generated.constant_inputs) {
-    const ContinuationConstantOverride *const override =
-        s_continuation_constant_override;
-    if (override && override->entry_program == token && override->seed &&
-        override->resume_generated &&
-        !HasConstantAddress(*override->resume_generated, input.address)) {
-      if (input.uniform_index >= override->seed->constant_values.size() ||
-          (override->seed->constant_mask & (1u << input.uniform_index)) == 0) {
-        failed = true;
-        break;
-      }
-      ConstantUniform uniform{};
-      uniform.input_index = static_cast<u8>(input.uniform_index);
-      uniform.bits = override->seed->constant_values[input.uniform_index];
-      uniforms->constant_uniforms.push_back(std::move(uniform));
-      continue;
-    }
-
-    u32 base_qword = 0;
-    if (input.address.base_vi >= candidate.invocation.loop_entry_vi.size() ||
-        !EvaluateInvocationValue(
-            candidate.invocation,
-            candidate.invocation.loop_entry_vi[input.address.base_vi], context,
-            &evaluation_workspace, &base_qword)) {
-      failed = true;
-      break;
-    }
-    ConstantUniform uniform{};
-    uniform.input_index = static_cast<u8>(input.uniform_index);
-    const u16 address =
-        static_cast<u16>((base_qword + input.address.qword_offset) & 0x3ffu);
-    for (u32 lane = 0; lane < uniform.bits.size(); lane++) {
-      if (!context.read_memory_u32(context.memory_user, address,
-                                   static_cast<u8>(lane),
-                                   &uniform.bits[lane])) {
-        failed = true;
-        break;
-      }
-    }
-    if (failed)
-      break;
-    uniforms->constant_uniforms.push_back(uniform);
-  }
-  if (failed) {
-    RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
-    return {};
-  }
-
-  for (u32 reg = 1; reg < 32; reg++) {
-    if ((candidate.generated.vf_uniform_mask & (1u << reg)) == 0)
-      continue;
-    VectorUniform uniform{};
-    uniform.register_index = static_cast<u8>(reg);
-    std::memcpy(uniform.bits.data(), context.initial_vf_words + reg * 4,
-                sizeof(uniform.bits));
-    uniforms->vf_uniforms.push_back(uniform);
-  }
-  if (candidate.generated.uses_acc_uniform) {
-    if (!context.initial_acc_words)
-      return {};
-    std::memcpy(draw->acc_uniform.data(), context.initial_acc_words,
-                sizeof(draw->acc_uniform));
-  }
-  if (candidate.generated.uses_q_uniform) {
-    draw->scalar_uniforms.present |= ScalarUniformQ;
-    draw->scalar_uniforms.q = context.initial_q;
-  }
-  if (candidate.generated.uses_p_uniform) {
-    draw->scalar_uniforms.present |= ScalarUniformP;
-    draw->scalar_uniforms.p = context.initial_p;
-  }
-  if (candidate.generated.uses_i_uniform) {
-    draw->scalar_uniforms.present |= ScalarUniformI;
-    draw->scalar_uniforms.i = context.initial_i;
-  }
-  if (candidate.generated.uses_gif_q_uniform) {
-    draw->scalar_uniforms.present |= ScalarUniformGifQ;
-    // GSState::Transfer resets packed-tag Q to 1.0 before the first register.
-    draw->scalar_uniforms.gif_q = 0x3f800000u;
-  }
-  if (!EvaluateFinalViState(candidate.invocation, context,
-                            &evaluation_workspace,
-                            &draw->final_vi_values,
-                            &draw->final_vi_write_mask)) {
-    RecordDirectAdmissionFailure(AdmissionFailure::BuildFailed);
-    return {};
-  }
-  return draw;
+  return BuildGeneratedAffineGpuVuDrawInternal(
+      candidate.key, candidate.contract, candidate.gif_tag,
+      candidate.invocation, candidate.generated, context, spans, token,
+      nullptr);
 }
 
 bool IsDirectContinuationPair(DirectProgramToken entry,
@@ -1224,14 +2157,27 @@ bool CaptureDirectContinuationSeed(
   captured.resume_program = resume;
   std::memcpy(captured.initial_vi.data(), entry_context.initial_vi,
               sizeof(captured.initial_vi));
+  for (u32 reg = 0u; reg < 32u; reg++) {
+    if (!entry_context.InitialVfRegisterAvailable(reg))
+      return false;
+  }
   std::memcpy(captured.initial_vf.data(), entry_context.initial_vf_words,
               sizeof(captured.initial_vf));
   if (entry_candidate->generated.uses_acc_uniform) {
-    if (!entry_context.initial_acc_words)
+    if (!entry_context.initial_acc_words ||
+        (entry_context.unavailable_initial_acc_lanes & 0x0fu) != 0u)
       return false;
     std::memcpy(captured.initial_acc.data(),
                 entry_context.initial_acc_words,
                 sizeof(captured.initial_acc));
+  }
+  if ((entry_candidate->generated.uses_q_uniform &&
+       !entry_context.initial_q_available) ||
+      (entry_candidate->generated.uses_p_uniform &&
+       !entry_context.initial_p_available) ||
+      (entry_candidate->generated.uses_i_uniform &&
+       !entry_context.initial_i_available)) {
+    return false;
   }
   captured.initial_q = entry_context.initial_q;
   captured.initial_p = entry_context.initial_p;
@@ -1287,9 +2233,14 @@ std::unique_ptr<GpuVuDraw> BuildDirectGpuVuContinuationDraw(
     entry_context.initial_vi = seed.initial_vi.data();
     entry_context.initial_vf_words = seed.initial_vf.data();
     entry_context.initial_acc_words = seed.initial_acc.data();
+    entry_context.unavailable_initial_vf_lanes = nullptr;
+    entry_context.unavailable_initial_acc_lanes = 0u;
     entry_context.initial_q = seed.initial_q;
     entry_context.initial_p = seed.initial_p;
     entry_context.initial_i = seed.initial_i;
+    entry_context.initial_q_available = true;
+    entry_context.initial_p_available = true;
+    entry_context.initial_i_available = true;
     ContinuationConstantOverride constant_override{
         seed.entry_program, &seed, &resume_candidate->generated};
     std::unique_ptr<GpuVuDraw> draw;
@@ -1360,9 +2311,16 @@ std::unique_ptr<GpuVuDraw> BuildDirectGpuVuContinuationDraw(
   draw->gif_tag = entry_candidate->gif_tag;
   draw->lowering = OutputLowering::DirectTfx;
   draw->execution = ExecutionKind::GeneratedParallel;
-  if (!ConfigureGeometry(*entry_candidate, draw.get()))
+  if (!ConfigureGeometry(entry_candidate->contract,
+                         entry_candidate->generated, draw.get()))
     return {};
 
+  constexpr size_t MaximumContinuationMemoryInputs = 16u;
+  std::array<RawVifPayloadRef, MaximumContinuationMemoryInputs>
+      planned_payloads{};
+  std::array<StreamBinding, MaximumContinuationMemoryInputs> planned_streams{};
+  size_t planned_payload_count = 0u;
+  size_t planned_stream_count = 0u;
   for (u32 index = 0;
        index < entry_candidate->generated.memory_inputs.size(); index++) {
     const CgMemoryInput &input =
@@ -1398,29 +2356,42 @@ std::unique_ptr<GpuVuDraw> BuildDirectGpuVuContinuationDraw(
     u16 span_index = 0;
     bool retained = false;
     for (u32 retained_index = 0;
-         retained_index < draw->InputPayloads().size(); retained_index++) {
-      if (SamePayload(draw->InputPayloads()[retained_index],
-                      span->payload)) {
+         retained_index < planned_payload_count; retained_index++) {
+      if (SamePayload(planned_payloads[retained_index], span->payload)) {
         span_index = static_cast<u16>(retained_index);
         retained = true;
         break;
       }
     }
     if (!retained) {
-      if (draw->InputPayloads().size() >=
-              std::numeric_limits<u16>::max() ||
-          !draw->AddInputPayload(span->payload)) {
+      if (planned_payload_count >= planned_payloads.size()) {
         return {};
       }
-      span_index =
-          static_cast<u16>(draw->InputPayloads().size() - 1);
+      span_index = static_cast<u16>(planned_payload_count);
+      planned_payloads[planned_payload_count++] = span->payload;
     }
-    draw->streams.push_back(
-        {raw.payload_byte_offset, raw.byte_stride, span_index,
-         static_cast<u8>(input.attribute_index), 0});
+    if (planned_stream_count >= planned_streams.size())
+      return {};
+    StreamBinding stream;
+    stream.payload_byte_offset = raw.payload_byte_offset;
+    stream.byte_stride = raw.byte_stride;
+    stream.input_span = span_index;
+    stream.attribute_index = static_cast<u8>(input.attribute_index);
+    stream.outer_byte_stride = raw.outer_byte_stride;
+    stream.payload_byte_extent = raw.payload_byte_extent;
+    planned_streams[planned_stream_count++] = stream;
   }
   if (entry_candidate->generated.uses_buffered_batch_inputs &&
-      !HasSingleAddressableRawInputWindow(*draw)) {
+      !HasSingleAddressableRawInputWindow(
+          planned_payloads.data(), planned_payload_count,
+          planned_streams.data(), planned_stream_count)) {
+    RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
+    return {};
+  }
+  if (!draw->SetGeneratedInputPlan(
+          planned_payloads.data(), planned_payload_count,
+          planned_streams.data(), planned_stream_count,
+          entry_candidate->generated.uses_buffered_batch_inputs)) {
     RecordDirectAdmissionFailure(AdmissionFailure::InputResolveFailed);
     return {};
   }
@@ -1457,6 +2428,9 @@ bool GetDirectProgramInfo(DirectProgramToken token, DirectProgramInfo *info) {
   if (!prepared)
     return false;
   info->start_pc = prepared->start_pc;
+  info->configuration_bits = prepared->configuration_bits;
+  info->semantic_profile_key = prepared->semantic_profile_key;
+  info->analysis_abi_version = prepared->analysis_abi_version;
   info->basic_blocks = static_cast<u32>(prepared->analysis.blocks.size());
   info->natural_loops =
       static_cast<u32>(prepared->analysis.natural_loops.size());
@@ -1472,12 +2446,33 @@ bool GetDirectProgramInfo(DirectProgramToken token, DirectProgramInfo *info) {
 
 DirectProgramStatistics GetDirectProgramStatistics() {
   DirectProgramStatistics stats;
+  stats.preparation_requests =
+      s_preparation_requests.load(std::memory_order_relaxed);
   stats.prepared_programs =
       s_prepared_programs.load(std::memory_order_relaxed);
   stats.preparation_cache_hits =
       s_preparation_cache_hits.load(std::memory_order_relaxed);
   stats.preparation_evictions =
       s_preparation_evictions.load(std::memory_order_relaxed);
+  stats.preparation_wall_us =
+      s_preparation_wall_us.load(std::memory_order_relaxed);
+  stats.preparation_wall_us_max =
+      s_preparation_wall_us_max.load(std::memory_order_relaxed);
+  stats.source_hash_bytes =
+      s_source_hash_bytes.load(std::memory_order_relaxed);
+  stats.source_compare_bytes =
+      s_source_compare_bytes.load(std::memory_order_relaxed);
+  stats.source_copy_bytes =
+      s_source_copy_bytes.load(std::memory_order_relaxed);
+  stats.analysis_builds = s_analysis_builds.load(std::memory_order_relaxed);
+  stats.analysis_wall_us =
+      s_analysis_wall_us.load(std::memory_order_relaxed);
+  stats.analysis_wall_us_max =
+      s_analysis_wall_us_max.load(std::memory_order_relaxed);
+  stats.candidate_proof_wall_us =
+      s_candidate_proof_wall_us.load(std::memory_order_relaxed);
+  stats.candidate_proof_wall_us_max =
+      s_candidate_proof_wall_us_max.load(std::memory_order_relaxed);
   stats.analysis_failures = s_analysis_failures.load(std::memory_order_relaxed);
   stats.programs_without_parallel_candidate =
       s_programs_without_parallel_candidate.load(std::memory_order_relaxed);
@@ -1499,6 +2494,26 @@ DirectProgramStatistics GetDirectProgramStatistics() {
       s_shared_continuation_builds.load(std::memory_order_relaxed);
   stats.general_continuation_builds =
       s_general_continuation_builds.load(std::memory_order_relaxed);
+  stats.hybrid_input_attempts =
+      s_hybrid_input_attempts.load(std::memory_order_relaxed);
+  stats.hybrid_input_hits =
+      s_hybrid_input_hits.load(std::memory_order_relaxed);
+  stats.hybrid_input_fallbacks =
+      s_hybrid_input_fallbacks.load(std::memory_order_relaxed);
+  stats.hybrid_raw_bytes_retained =
+      s_hybrid_raw_bytes_retained.load(std::memory_order_relaxed);
+  stats.hybrid_derived_bytes =
+      s_hybrid_derived_bytes.load(std::memory_order_relaxed);
+  stats.hybrid_copy_bytes_avoided =
+      s_hybrid_copy_bytes_avoided.load(std::memory_order_relaxed);
+  stats.canonical_input_bindings =
+      s_canonical_input_bindings.load(std::memory_order_relaxed);
+  stats.canonical_input_bytes =
+      s_canonical_input_bytes.load(std::memory_order_relaxed);
+  stats.persistent_raw_input_bindings =
+      s_persistent_raw_input_bindings.load(std::memory_order_relaxed);
+  stats.persistent_raw_input_bytes =
+      s_persistent_raw_input_bytes.load(std::memory_order_relaxed);
   return stats;
 }
 

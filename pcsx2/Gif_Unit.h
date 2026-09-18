@@ -497,6 +497,16 @@ struct Gif_Path
 		gsPack.offset = curOffset;
 	}
 
+	// MTVU has executed the VU program as a temporary correctness oracle, but a
+	// generated GPU-VU draw owns this PATH1 ordering point and its visible
+	// direct-TFX output. Drop the CPU packet without publishing it to MTGS. The
+	// bytes are immediately reusable because no consumer acquired them.
+	void DiscardGSPacketMTVU()
+	{
+		gsPack.Reset();
+		gsPack.offset = curOffset;
+	}
+
 	// MTVU: Gets called by MTGS thread
 	bool TryGetGSPacketMTVU(GS_Packet& packet)
 	{

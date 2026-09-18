@@ -1,0 +1,103 @@
+// VitaSX2 title-neutral exact generated-VU multiply stage.
+//
+// PCSX2 owner: VUops.cpp::_vuOpMUL/_vuOpMADD/_vuOpMSUB/_vuOPMSUB and
+// vuDouble().  The 16-bit limbs recover the discarded product remainder; the
+// Series5XT native result supplies the normalized round-toward-zero candidate
+// which is advanced by at most one ULP for the nearest-even product profile.
+#pragma warning (default:7203)
+#pragma readwrite_buffer BUFFER1
+
+unsigned int VitaVuF32NormalizeInputBits(unsigned int bits)
+{
+	const unsigned int exponent = bits & 2139095040u;
+	if (exponent == 0u) return bits & 2147483648u;
+	if (exponent == 2139095040u)
+		return (bits & 2147483648u) | 2139095039u;
+	return bits;
+}
+
+unsigned int VitaVuF32MulBits(unsigned int leftInput,
+	unsigned int rightInput)
+{
+	const unsigned int left = VitaVuF32NormalizeInputBits(leftInput);
+	const unsigned int right = VitaVuF32NormalizeInputBits(rightInput);
+	const unsigned int resultSignBits =
+		(left ^ right) & 2147483648u;
+	if ((left & 2147483647u) == 0u ||
+		(right & 2147483647u) == 0u)
+		return resultSignBits;
+	int exponent = int((left >> 23u) & 255u) +
+		int((right >> 23u) & 255u) - 127;
+	const unsigned int leftSignificand =
+		(left & 8388607u) | 8388608u;
+	const unsigned int rightSignificand =
+		(right & 8388607u) | 8388608u;
+	const unsigned int leftLow = leftSignificand & 65535u;
+	const unsigned int leftHigh = leftSignificand >> 16u;
+	const unsigned int rightLow = rightSignificand & 65535u;
+	const unsigned int rightHigh = rightSignificand >> 16u;
+	const unsigned int lowProduct = leftLow * rightLow;
+	const unsigned int crossProduct =
+		leftHigh * rightLow + leftLow * rightHigh;
+	const unsigned int productLow =
+		lowProduct + (crossProduct << 16u);
+	const unsigned int carry = productLow < lowProduct ? 1u : 0u;
+	const unsigned int productHigh =
+		leftHigh * rightHigh + (crossProduct >> 16u) + carry;
+	unsigned int truncated;
+	unsigned int remainder;
+	unsigned int halfway;
+	if ((productHigh & 32768u) != 0u)
+	{
+		truncated = (productHigh << 8u) | (productLow >> 24u);
+		remainder = productLow & 16777215u;
+		halfway = 8388608u;
+		exponent++;
+	}
+	else
+	{
+		truncated = (productHigh << 9u) | (productLow >> 23u);
+		remainder = productLow & 8388607u;
+		halfway = 4194304u;
+	}
+	const bool increment = remainder > halfway ||
+		(remainder == halfway && (truncated & 1u) != 0u);
+	if (exponent <= 0)
+	{
+		const unsigned int underflowRounded = truncated +
+			(increment ? 1u : 0u);
+		return exponent == 0 &&
+			(underflowRounded & 16777216u) != 0u ?
+			(resultSignBits | 8388608u) : resultSignBits;
+	}
+	if (exponent >= 255)
+		return resultSignBits | 2139095039u;
+	const float nativeLeft = intBitsToFloat(int(left));
+	const float nativeRight = intBitsToFloat(int(right));
+	const unsigned int nativeMagnitude =
+		unsigned int(floatToRawIntBits(nativeLeft * nativeRight)) &
+		2147483647u;
+	if ((nativeMagnitude >> 23u) >= 255u)
+		return resultSignBits | 2139095039u;
+	const unsigned int correctedMagnitude = nativeMagnitude +
+		(increment ? 1u : 0u);
+	return correctedMagnitude >= 2139095040u ?
+		(resultSignBits | 2139095039u) :
+		(resultSignBits | correctedMagnitude);
+}
+
+void main(
+	unsigned int aIndex : INDEX,
+	uniform unsigned int4 VuExactJobs[1] : BUFFER0,
+	uniform unsigned int VuExactResults[1] : BUFFER1,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPointSize = 1.0f;
+	const unsigned int4 job = VuExactJobs[aIndex];
+	const unsigned int result = VitaVuF32MulBits(job.x, job.y);
+	VuExactResults[job.w] = result;
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuResult = float4(float(result), float(aIndex), 0.0f, 0.0f);
+}

@@ -1,0 +1,10 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// Validation-only fragment half for the fixed GPU-VU1 executor. The linked
+// fragment program is created with an empty color mask; consuming vResult
+// keeps the vertex/fragment interface explicit without altering the display.
+float4 main(float4 vResult : TEXCOORD0) : COLOR0
+{
+	return vResult;
+}

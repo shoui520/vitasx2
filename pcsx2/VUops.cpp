@@ -306,17 +306,19 @@ static __fi void _vuTestALUStalls(VURegs* VU, _VURegsNum* VUregsn)
 
 static __fi bool _vu1AssumesScheduledMicrocode(const VURegs* VU)
 {
-	return VU == &VU1 && EmuConfig.Speedhacks.vu1AssumeScheduled;
+	return (VU == &VU1 || VU->idx == 1) &&
+		EmuConfig.Speedhacks.vu1AssumeScheduled;
 }
 
 static __fi bool _vu1UsesInstantQp(const VURegs* VU)
 {
-	return VU == &VU1 && EmuConfig.Speedhacks.vu1InstantQP;
+	return (VU == &VU1 || VU->idx == 1) &&
+		EmuConfig.Speedhacks.vu1InstantQP;
 }
 
 static __fi bool _vu1CanUseApproximateMath(const VURegs* VU)
 {
-	return VU == &VU1 &&
+	return (VU == &VU1 || VU->idx == 1) &&
 		EmuConfig.Cpu.VU1FPCR.GetRoundMode() == FPRoundMode::Nearest &&
 		EmuConfig.Cpu.VU1FPCR.GetFlushToZero() && CHECK_VU_OVERFLOW(1);
 }
@@ -1264,8 +1266,13 @@ static __fi void _vuMR32(VURegs* VU)
 
 __fi u32* GET_VU_MEM(VURegs* VU, u32 addr) // non-static, also used by sVU for now.
 {
-	if (VU == &vuRegs[1])
-		return (u32*)(vuRegs[1].Mem + (addr & 0x3fff));
+	// A transaction-private VU1 register image is not the global vuRegs[1]
+	// object, but it still owns an ordinary 16 KiB VU1 data image.  Use the
+	// architectural index recorded by vuMemReset() and validation scratch
+	// owners instead of redirecting those exact LSU bodies into global VU0
+	// memory merely because their host address differs.
+	if (VU == &vuRegs[1] || VU->idx == 1)
+		return (u32*)(VU->Mem + (addr & 0x3fff));
 	else if (addr & 0x4000)
 		return (u32*)((u8*)vuRegs[1].VF + (addr & 0x3ff)); // get VF and VI regs (they're mapped to 0x4xx0 in VU0 mem!)
 	else

@@ -1,0 +1,409 @@
+// VitaSX2 fixed, title-neutral parallel structured VU1 recurrence evaluator.
+// PairPlan-derived expression bytecode is data in BUFFER0; unfamiliar programs
+// never create a runtime Cg state root. The preceding fixed control job has
+// already published the loop shape and parent VI snapshots. One invocation
+// owns one output vector and one disjoint mapped scratch row.
+#pragma readwrite_buffer BUFFER9
+#pragma readwrite_buffer BUFFER11
+
+#define VITASX2_STRUCTURED_STATE_MODULES 34u
+#define VITASX2_STRUCTURED_STATE_INDEX_STRIDE 64u
+#define VITASX2_STRUCTURED_STATE_FORMAT 2u
+#define VITASX2_STRUCTURED_STATE_SLICES 4u
+#define VITASX2_STRUCTURED_STATE_OUTERS_PER_SLICE 16u
+#define VITASX2_STRUCTURED_STATE_SCRATCH_OFFSET 2624u
+#define VITASX2_STRUCTURED_STATE_SCRATCH_WORDS 129u
+#define VITASX2_STRUCTURED_STATE_PROGRESS_WORD 128u
+
+unsigned int VitaVuSelectU32(unsigned int4 value, unsigned int lane)
+{
+	if (lane == 0u) return value.x;
+	if (lane == 1u) return value.y;
+	if (lane == 2u) return value.z;
+	return value.w;
+}
+
+unsigned int VitaVuF32NormalizeInputBits(unsigned int bits)
+{
+	const unsigned int exponent = bits & 2139095040u;
+	if (exponent == 0u) return bits & 2147483648u;
+	if (exponent == 2139095040u)
+		return (bits & 2147483648u) | 2139095039u;
+	return bits;
+}
+
+unsigned int VitaVuF32ShiftRightJam(unsigned int value, unsigned int distance)
+{
+	if (distance == 0u) return value;
+	if (distance < 32u)
+	{
+		const unsigned int mask = (1u << distance) - 1u;
+		return (value >> distance) | ((value & mask) != 0u ? 1u : 0u);
+	}
+	return value != 0u ? 1u : 0u;
+}
+
+unsigned int VitaVuF32AddBits(
+	unsigned int leftInput, unsigned int rightInput, bool subtract)
+{
+	unsigned int left = VitaVuF32NormalizeInputBits(leftInput);
+	unsigned int right = VitaVuF32NormalizeInputBits(rightInput);
+	if (subtract) right ^= 2147483648u;
+	unsigned int leftMagnitude = left & 2147483647u;
+	unsigned int rightMagnitude = right & 2147483647u;
+	const unsigned int leftSign = left >> 31u;
+	const unsigned int rightSign = right >> 31u;
+	if (leftMagnitude == 0u && rightMagnitude == 0u)
+		return leftSign == rightSign ? leftSign << 31u : 0u;
+	if (leftMagnitude == 0u) return right;
+	if (rightMagnitude == 0u) return left;
+	if (leftMagnitude < rightMagnitude)
+	{
+		const unsigned int swapValue = left;
+		left = right;
+		right = swapValue;
+		const unsigned int swapMagnitude = leftMagnitude;
+		leftMagnitude = rightMagnitude;
+		rightMagnitude = swapMagnitude;
+	}
+	const unsigned int VuSign = left & 2147483648u;
+	int exponent = int((left >> 23u) & 255u);
+	const unsigned int rightExponent = (right >> 23u) & 255u;
+	const unsigned int leftSignificand =
+		((left & 8388607u) | 8388608u) << 3u;
+	unsigned int rightSignificand =
+		((right & 8388607u) | 8388608u) << 3u;
+	rightSignificand = VitaVuF32ShiftRightJam(
+		rightSignificand, unsigned int(exponent) - rightExponent);
+	unsigned int significand = 0u;
+	if (((left ^ right) & 2147483648u) == 0u)
+	{
+		significand = leftSignificand + rightSignificand;
+		if ((significand & 134217728u) != 0u)
+		{
+			significand = VitaVuF32ShiftRightJam(significand, 1u);
+			exponent++;
+		}
+	}
+	else
+	{
+		significand = leftSignificand - rightSignificand;
+		if (significand == 0u) return 0u;
+		#pragma loop (unroll: never)
+		while ((significand & 67108864u) == 0u)
+		{
+			significand <<= 1u;
+			exponent--;
+		}
+	}
+	if (exponent <= 0) return VuSign;
+	unsigned int rounded = significand >> 3u;
+	const unsigned int roundBits = significand & 7u;
+	if (roundBits > 4u || (roundBits == 4u && (rounded & 1u) != 0u))
+		rounded++;
+	if ((rounded & 16777216u) != 0u)
+	{
+		rounded >>= 1u;
+		exponent++;
+	}
+	if (exponent >= 255) return VuSign | 2139095039u;
+	return VuSign | (unsigned int(exponent) << 23u) | (rounded & 8388607u);
+}
+
+unsigned int VitaVuF32MulBits(
+	unsigned int leftInput, unsigned int rightInput)
+{
+	const unsigned int left = VitaVuF32NormalizeInputBits(leftInput);
+	const unsigned int right = VitaVuF32NormalizeInputBits(rightInput);
+	const unsigned int VuSign = (left ^ right) & 2147483648u;
+	if ((left & 2147483647u) == 0u || (right & 2147483647u) == 0u)
+		return VuSign;
+	int exponent = int((left >> 23u) & 255u) +
+		int((right >> 23u) & 255u) - 127;
+	const unsigned int leftSignificand = (left & 8388607u) | 8388608u;
+	const unsigned int rightSignificand = (right & 8388607u) | 8388608u;
+	const unsigned int leftLow = leftSignificand & 65535u;
+	const unsigned int leftHigh = leftSignificand >> 16u;
+	const unsigned int rightLow = rightSignificand & 65535u;
+	const unsigned int rightHigh = rightSignificand >> 16u;
+	const unsigned int lowProduct = leftLow * rightLow;
+	const unsigned int crossProduct =
+		leftHigh * rightLow + leftLow * rightHigh;
+	const unsigned int productLow = lowProduct + (crossProduct << 16u);
+	const unsigned int carry = productLow < lowProduct ? 1u : 0u;
+	const unsigned int productHigh =
+		leftHigh * rightHigh + (crossProduct >> 16u) + carry;
+	unsigned int rounded = 0u;
+	unsigned int remainder = 0u;
+	unsigned int halfway = 0u;
+	if ((productHigh & 32768u) != 0u)
+	{
+		rounded = (productHigh << 8u) | (productLow >> 24u);
+		remainder = productLow & 16777215u;
+		halfway = 8388608u;
+		exponent++;
+	}
+	else
+	{
+		rounded = (productHigh << 9u) | (productLow >> 23u);
+		remainder = productLow & 8388607u;
+		halfway = 4194304u;
+	}
+	if (remainder > halfway ||
+		(remainder == halfway && (rounded & 1u) != 0u)) rounded++;
+	if ((rounded & 16777216u) != 0u)
+	{
+		rounded >>= 1u;
+		exponent++;
+	}
+	if (exponent <= 0) return VuSign;
+	if (exponent >= 255) return VuSign | 2139095039u;
+	return VuSign | (unsigned int(exponent) << 23u) | (rounded & 8388607u);
+}
+
+void main(
+	unsigned int aIndex : INDEX,
+	uniform unsigned int VuProgram[32768] : BUFFER0,
+	uniform unsigned int4 VuPrivateVf[33] : BUFFER1,
+	uniform unsigned int VuPrivateState[112] : BUFFER2,
+	uniform unsigned int4 VuPrivateMemory[1024] : BUFFER3,
+	uniform unsigned int VuAuxiliary[7010] : BUFFER9,
+	uniform unsigned int4 VuOuterSnapshots[2304] : BUFFER11,
+	uniform unsigned int VuOuterState[16] : BUFFER12,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuPointSize = 1.0f;
+	VuResult = float4(0.0f);
+	if (aIndex >= VITASX2_STRUCTURED_STATE_INDEX_STRIDE *
+		VITASX2_STRUCTURED_STATE_SLICES) return;
+	const unsigned int VuSlice = aIndex >> 6u;
+	const unsigned int VuModule = aIndex & 63u;
+	const unsigned int VuTotalWords = VuProgram[1];
+	const unsigned int VuModuleCount = VuProgram[2];
+	const unsigned int VuModuleOffset = VuProgram[3];
+	const unsigned int VuOuterCount = VuOuterState[0];
+	const unsigned int VuTransactionGate = VuOuterState[15];
+	if (VuTransactionGate == 0u) return;
+	unsigned int VuFailure = VuSlice == 0u ? VuOuterState[3] :
+		VuAuxiliary[1152u + VuModule];
+	if (VuTransactionGate != 0u && VuTransactionGate != 1u)
+		VuFailure = 9u;
+	if (VuFailure == 0u && VuTransactionGate == 1u &&
+		(VuProgram[0] != VITASX2_STRUCTURED_STATE_FORMAT ||
+		 VuProgram[23] != VITASX2_STRUCTURED_STATE_SLICES ||
+		 VuTotalWords < 96u || VuTotalWords > 32768u ||
+		 VuModuleCount == 0u || VuModuleCount > 34u ||
+		 VuModuleOffset != 96u || VuOuterCount == 0u || VuOuterCount > 64u ||
+		 VuModule >= VuModuleCount))
+	{
+		VuFailure = 9u;
+	}
+
+	#pragma branch (flatten: never)
+	if (VuTransactionGate == 1u && VuFailure == 0u)
+	{
+		const unsigned int VuModuleWord = VuModuleOffset + VuModule * 10u;
+		const unsigned int VuExpressionOffset = VuProgram[VuModuleWord + 0u];
+		const unsigned int VuExpressionCount = VuProgram[VuModuleWord + 1u];
+		const unsigned int VuRecurrenceCount = VuProgram[VuModuleWord + 2u];
+		const unsigned int VuBindingOffset = VuProgram[VuModuleWord + 3u];
+		const unsigned int VuBindingCount = VuProgram[VuModuleWord + 4u];
+		const unsigned int VuUpdateOffset = VuProgram[VuModuleWord + 5u];
+		const unsigned int VuUpdateCount = VuProgram[VuModuleWord + 6u];
+		const unsigned int VuOutputOffset = VuProgram[VuModuleWord + 7u];
+		const unsigned int VuOutputCount = VuProgram[VuModuleWord + 8u];
+		const unsigned int VuOutputVector = VuProgram[VuModuleWord + 9u];
+		if (VuExpressionCount == 0u || VuExpressionCount > 96u ||
+			VuRecurrenceCount > 32u || VuBindingCount != VuRecurrenceCount ||
+			VuUpdateCount > 32u || VuOutputCount > 4u ||
+			(VuOutputCount != 0u && VuOutputVector > 32u) ||
+			VuExpressionOffset > VuTotalWords ||
+			VuExpressionCount > (VuTotalWords - VuExpressionOffset) / 8u ||
+			VuBindingOffset > VuTotalWords ||
+			VuBindingCount > (VuTotalWords - VuBindingOffset) / 2u ||
+			VuUpdateOffset > VuTotalWords ||
+			VuUpdateCount > (VuTotalWords - VuUpdateOffset) / 2u ||
+			VuOutputOffset > VuTotalWords ||
+			VuOutputCount > (VuTotalWords - VuOutputOffset) / 2u)
+		{
+			VuFailure = 9u;
+		}
+		if (VuFailure == 0u)
+		{
+			const unsigned int VuScratch =
+				VITASX2_STRUCTURED_STATE_SCRATCH_OFFSET +
+				VuModule * VITASX2_STRUCTURED_STATE_SCRATCH_WORDS;
+			const unsigned int VuRecurrence = VuScratch;
+			const unsigned int VuValues = VuScratch + 32u;
+			const unsigned int VuProgress =
+				VuScratch + VITASX2_STRUCTURED_STATE_PROGRESS_WORD;
+			if (VuSlice != 0u && VuAuxiliary[VuProgress] != VuSlice)
+				VuFailure = 9u;
+			if (VuSlice == 0u)
+			{
+				#pragma loop (unroll: never)
+				for (unsigned int VuSlot = 0u; VuSlot < 32u; VuSlot++)
+					VuAuxiliary[VuRecurrence + VuSlot] = 0u;
+				#pragma loop (unroll: never)
+				for (unsigned int VuNode = 0u; VuNode < 96u; VuNode++)
+					VuAuxiliary[VuValues + VuNode] = 0u;
+				#pragma loop (unroll: never)
+				for (unsigned int VuBinding = 0u;
+					 VuBinding < VuBindingCount && VuFailure == 0u; VuBinding++)
+				{
+					const unsigned int VuControl =
+						VuProgram[VuBindingOffset + VuBinding * 2u];
+					const unsigned int VuSlot = VuControl & 255u;
+					const unsigned int VuKind = (VuControl >> 8u) & 255u;
+					const unsigned int VuReg = (VuControl >> 16u) & 255u;
+					const unsigned int VuLane = VuControl >> 24u;
+					unsigned int VuValue = 0u;
+					if (VuLane > 3u || VuSlot >= VuRecurrenceCount)
+						VuFailure = 9u;
+					else if (VuKind == 1u && VuReg < 32u)
+						VuValue = VitaVuSelectU32(VuPrivateVf[VuReg], VuLane);
+					else if (VuKind == 2u)
+						VuValue = VitaVuSelectU32(VuPrivateVf[32], VuLane);
+					else if (VuKind == 3u) VuValue = VuPrivateState[25];
+					else if (VuKind == 4u) VuValue = VuPrivateState[26];
+					else if (VuKind == 5u) VuValue = VuPrivateState[24];
+					else VuFailure = 9u;
+					if (VuFailure == 0u)
+						VuAuxiliary[VuRecurrence + VuSlot] = VuValue;
+				}
+			}
+			const unsigned int VuOuterStart =
+				VuSlice * VITASX2_STRUCTURED_STATE_OUTERS_PER_SLICE;
+			#pragma loop (unroll: never)
+			for (unsigned int VuLocalOuter = 0u;
+				 VuLocalOuter < VITASX2_STRUCTURED_STATE_OUTERS_PER_SLICE &&
+				 VuFailure == 0u; VuLocalOuter++)
+			{
+				const unsigned int VuOuter = VuOuterStart + VuLocalOuter;
+				if (VuOuter >= VuOuterCount) break;
+				#pragma loop (unroll: never)
+				for (unsigned int VuNode = 1u;
+					 VuNode < VuExpressionCount && VuFailure == 0u; VuNode++)
+				{
+					const unsigned int VuExpression =
+						VuExpressionOffset + VuNode * 8u;
+					const unsigned int VuControl = VuProgram[VuExpression + 0u];
+					const unsigned int VuKind = VuControl & 255u;
+					const unsigned int VuDomain = (VuControl >> 8u) & 255u;
+					const unsigned int VuLane = VuControl >> 24u;
+					const unsigned int VuLeftNode = VuProgram[VuExpression + 1u];
+					const unsigned int VuRightNode = VuProgram[VuExpression + 2u];
+					if (VuLeftNode >= VuExpressionCount ||
+						VuRightNode >= VuExpressionCount || VuLane > 3u)
+					{
+						VuFailure = 9u;
+						continue;
+					}
+					const unsigned int VuLeft =
+						VuAuxiliary[VuValues + VuLeftNode];
+					const unsigned int VuRight =
+						VuAuxiliary[VuValues + VuRightNode];
+					unsigned int VuValue = 0u;
+					if (VuKind <= 2u)
+						VuValue = VuProgram[VuExpression + 4u];
+					else if (VuKind >= 3u && VuKind <= 12u)
+					{
+						const unsigned int VuSlot = VuProgram[VuExpression + 4u];
+						if (VuSlot >= VuRecurrenceCount) VuFailure = 9u;
+						else VuValue = VuAuxiliary[VuRecurrence + VuSlot];
+					}
+					else if (VuKind == 14u)
+					{
+						const unsigned int VuBase = VuProgram[VuExpression + 5u];
+						if (VuBase > 15u) VuFailure = 9u;
+						else
+						{
+							const unsigned int VuBaseValue = VuBase == 0u ? 0u :
+								VuAuxiliary[1600u + VuOuter * 16u + VuBase];
+							const unsigned int VuAddress =
+								(VuBaseValue + VuProgram[VuExpression + 7u]) & 1023u;
+							VuValue = VitaVuSelectU32(
+								VuPrivateMemory[VuAddress], VuLane);
+						}
+					}
+					else if (VuKind >= 15u && VuKind <= 17u)
+					{
+						if (VuDomain == 1u)
+						{
+							const float VuFirst = intBitsToFloat(int(VuLeft));
+							const float VuSecond = intBitsToFloat(int(VuRight));
+							const float VuFloatValue = VuKind == 15u ? VuFirst + VuSecond :
+								VuKind == 16u ? VuFirst - VuSecond : VuFirst * VuSecond;
+							VuValue = unsigned int(floatToRawIntBits(VuFloatValue));
+						}
+						else VuValue = VuKind == 15u ? VuLeft + VuRight :
+							VuKind == 16u ? VuLeft - VuRight : VuLeft * VuRight;
+					}
+					else if (VuKind == 18u)
+						VuValue = VitaVuF32AddBits(VuLeft, VuRight, false);
+					else if (VuKind == 19u)
+						VuValue = VitaVuF32AddBits(VuLeft, VuRight, true);
+					else if (VuKind == 20u)
+						VuValue = VitaVuF32MulBits(VuLeft, VuRight);
+					else if (VuKind == 24u)
+						VuValue = VuDomain == 1u ? VuLeft & 2147483647u :
+							(int(VuLeft) < 0 ? 0u - VuLeft : VuLeft);
+					else if (VuKind == 25u)
+						VuValue = VuDomain == 1u ? VuLeft ^ 2147483648u : 0u - VuLeft;
+					else if (VuKind == 34u)
+						VuValue = VitaVuF32NormalizeInputBits(VuLeft);
+					else VuFailure = 9u;
+					if (VuFailure == 0u)
+						VuAuxiliary[VuValues + VuNode] = VuValue;
+				}
+				if (VuFailure != 0u) break;
+				unsigned int4 VuOutput = 0u;
+				#pragma loop (unroll: never)
+				for (unsigned int VuOutputIndex = 0u;
+					 VuOutputIndex < VuOutputCount; VuOutputIndex++)
+				{
+					const unsigned int VuOutputWord =
+						VuOutputOffset + VuOutputIndex * 2u;
+					const unsigned int VuLane = VuProgram[VuOutputWord + 0u];
+					const unsigned int VuNode = VuProgram[VuOutputWord + 1u];
+					if (VuLane > 3u || VuNode >= VuExpressionCount)
+					{
+						VuFailure = 9u;
+						break;
+					}
+					const unsigned int VuValue =
+						VuAuxiliary[VuValues + VuNode];
+					if (VuLane == 0u) VuOutput.x = VuValue;
+					else if (VuLane == 1u) VuOutput.y = VuValue;
+					else if (VuLane == 2u) VuOutput.z = VuValue;
+					else VuOutput.w = VuValue;
+				}
+				// Output snapshots are private transactional storage, but malformed
+				// bytecode must still be effect-free within this stage.  In
+				// particular, do not publish a partially assembled vector after an
+				// invalid lane/node terminates the output loop.
+				if (VuFailure == 0u && VuOutputCount != 0u)
+					VuOuterSnapshots[VuOuter * 36u + VuOutputVector] = VuOutput;
+				#pragma loop (unroll: never)
+				for (unsigned int VuUpdate = 0u;
+					 VuUpdate < VuUpdateCount && VuFailure == 0u; VuUpdate++)
+				{
+					const unsigned int VuUpdateWord = VuUpdateOffset + VuUpdate * 2u;
+					const unsigned int VuSlot = VuProgram[VuUpdateWord + 0u];
+					const unsigned int VuNode = VuProgram[VuUpdateWord + 1u];
+					if (VuSlot >= VuRecurrenceCount || VuNode >= VuExpressionCount)
+						VuFailure = 9u;
+					else VuAuxiliary[VuRecurrence + VuSlot] =
+						VuAuxiliary[VuValues + VuNode];
+				}
+			}
+			VuAuxiliary[VuProgress] = VuSlice + 1u;
+		}
+	}
+	VuAuxiliary[1152u + VuModule] = VuFailure;
+	VuResult = float4(float(VuModule), float(VuFailure),
+		float(VuOuterCount), float(VuSlice));
+}

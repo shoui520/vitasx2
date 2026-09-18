@@ -3,6 +3,8 @@
 
 #include "vita/VitaGpuVuLoopKernel.h"
 
+#include "vita/VitaGpuVuMicroProgram.h"
+
 #include "VU.h"
 #include "VUmicroFast.h"
 
@@ -102,21 +104,23 @@ bool LowerSelfAffineWrite(const VitaVU::GpuPairPlan &plan, u32 reg,
 bool AnalyzeViEvolution(const BasicBlock &block, ViEvolution *evolution,
                         std::string *error) {
   *evolution = {};
+  auto pair_states = std::make_shared<ViEvolutionPairStates>();
   evolution->affine_mask = 0xffffu;
   for (u32 reg = 0; reg < 16; reg++) {
-    evolution->prefix[reg].resize(block.pairs.size() + 1);
-    evolution->prefix[reg][0] = 0;
+    pair_states->prefix[reg].resize(block.pairs.size() + 1);
+    pair_states->prefix[reg][0] = 0;
   }
 
   for (u32 pair_index = 0; pair_index < block.pairs.size(); pair_index++) {
     const VitaVU::GpuPairPlan &plan = block.pairs[pair_index].plan;
     for (u32 reg = 0; reg < 16; reg++)
-      evolution->prefix[reg][pair_index + 1] =
-          evolution->prefix[reg][pair_index];
+      pair_states->prefix[reg][pair_index + 1] =
+          pair_states->prefix[reg][pair_index];
 
     if (!plan.exec_lower || plan.lower_discarded_by_upper)
       continue;
     const u32 writes = plan.lower_vi_write & 0xffffu;
+    evolution->written_mask |= static_cast<u16>(writes & 0xfffeu);
     for (u32 reg = 1; reg < 16; reg++) {
       if ((writes & (1u << reg)) == 0)
         continue;
@@ -126,23 +130,125 @@ bool AnalyzeViEvolution(const BasicBlock &block, ViEvolution *evolution,
         continue;
       }
       if ((evolution->affine_mask & (1u << reg)) != 0)
-        evolution->prefix[reg][pair_index + 1] += delta;
+        pair_states->prefix[reg][pair_index + 1] += delta;
     }
   }
 
   for (u32 reg = 1; reg < 16; reg++) {
     if ((evolution->affine_mask & (1u << reg)) != 0) {
-      evolution->step[reg] = evolution->prefix[reg].back();
+      evolution->step[reg] = pair_states->prefix[reg].back();
       continue;
     }
-    std::fill(evolution->prefix[reg].begin(), evolution->prefix[reg].end(),
+    std::fill(pair_states->prefix[reg].begin(), pair_states->prefix[reg].end(),
               0);
   }
 
   // VI0 is architectural zero even though malformed encodings can advertise
   // it as a destination in register metadata.
   evolution->step[0] = 0;
-  std::fill(evolution->prefix[0].begin(), evolution->prefix[0].end(), 0);
+  std::fill(pair_states->prefix[0].begin(), pair_states->prefix[0].end(), 0);
+
+  // Re-run the lower VI bodies symbolically.  The first pass proves which
+  // entry registers advance affinely from one invocation to the next.  This
+  // second pass additionally preserves registers assigned from a known
+  // affine source inside the body.  PCSX2 owners are VUops.cpp's integer/LSU
+  // bodies and VUmicroFast.h's decoded source/destination metadata.
+  std::array<AffineQwordAddress, 16> state{};
+  state[0] = {0, 0, 0, true};
+  for (u32 reg = 1; reg < 16; reg++) {
+    if ((evolution->affine_mask & (1u << reg)) != 0)
+      state[reg] = {static_cast<u8>(reg), evolution->step[reg], 0, true};
+  }
+  for (u32 reg = 0; reg < 16; reg++)
+    pair_states->address_state[reg].resize(block.pairs.size() + 1);
+
+  const auto add_constant = [](AffineQwordAddress value, s32 delta) {
+    if (value.valid)
+      value.qword_offset += delta;
+    return value;
+  };
+  const auto combine = [](const AffineQwordAddress& left,
+                          const AffineQwordAddress& right,
+                          bool subtract) {
+    AffineQwordAddress result{};
+    const bool left_constant = left.valid && left.base_vi == 0 &&
+        left.invocation_coefficient == 0;
+    const bool right_constant = right.valid && right.base_vi == 0 &&
+        right.invocation_coefficient == 0;
+    if (left.valid && right_constant) {
+      result = left;
+      result.qword_offset += subtract ? -right.qword_offset :
+                                        right.qword_offset;
+    } else if (!subtract && right.valid && left_constant) {
+      result = right;
+      result.qword_offset += left.qword_offset;
+    }
+    return result;
+  };
+
+  for (u32 pair_index = 0; pair_index < block.pairs.size(); pair_index++) {
+    for (u32 reg = 0; reg < 16; reg++)
+      pair_states->address_state[reg][pair_index] = state[reg];
+
+    const VitaVU::GpuPairPlan& plan = block.pairs[pair_index].plan;
+    if (!plan.exec_lower || plan.lower_discarded_by_upper)
+      continue;
+    const LowerKind kind = static_cast<LowerKind>(plan.lower_kind);
+    const u32 code = plan.lower;
+    const u32 writes = plan.lower_vi_write & 0xffffu;
+    for (u32 reg = 1; reg < 16; reg++) {
+      if ((writes & (1u << reg)) == 0)
+        continue;
+      AffineQwordAddress next{};
+      switch (kind) {
+      case LowerKind::IADDIU:
+      case LowerKind::ISUBIU:
+      case LowerKind::IADDI:
+        if (VUInterpFast::It(code) == reg) {
+          next = add_constant(state[VUInterpFast::Is(code)],
+                              LowerImmediateDelta(kind, code));
+        }
+        break;
+      case LowerKind::IADD:
+      case LowerKind::ISUB:
+        if (VUInterpFast::Id(code) == reg) {
+          next = combine(state[VUInterpFast::Is(code)],
+                         state[VUInterpFast::It(code)],
+                         kind == LowerKind::ISUB);
+        }
+        break;
+      case LowerKind::LQI:
+        if (VUInterpFast::Is(code) == reg)
+          next = add_constant(state[reg], 1);
+        break;
+      case LowerKind::LQD:
+        if (VUInterpFast::Is(code) == reg)
+          next = add_constant(state[reg], -1);
+        break;
+      case LowerKind::SQI:
+        if (VUInterpFast::It(code) == reg)
+          next = add_constant(state[reg], 1);
+        break;
+      case LowerKind::SQD:
+        if (VUInterpFast::It(code) == reg)
+          next = add_constant(state[reg], -1);
+        break;
+      case LowerKind::BAL:
+      case LowerKind::JALR:
+        if (VUInterpFast::It(code) == reg) {
+          next = {0, 0, static_cast<s32>((plan.pc + 16u) / 8u), true};
+        }
+        break;
+      default:
+        break;
+      }
+      state[reg] = next;
+    }
+    state[0] = {0, 0, 0, true};
+  }
+  for (u32 reg = 0; reg < 16; reg++)
+    pair_states->address_state[reg].back() = state[reg];
+  evolution->pair_states = std::move(pair_states);
   if (error)
     error->clear();
   return true;
@@ -176,10 +282,19 @@ struct ResolveKey {
 class KernelBuilder {
 public:
   KernelBuilder(const ProgramAnalysis &program, const NaturalLoop &loop,
-                const BasicBlock &block, ParallelLoopKernel *kernel)
+                const BasicBlock &block, ParallelLoopKernel *kernel,
+                const std::array<u8, 32>* final_vf_lanes = nullptr,
+                u8 final_acc_lanes = 0, bool final_q = false,
+                bool final_p = false, bool final_i = false)
       : m_program(program), m_loop(loop), m_block(block), m_kernel(kernel) {
     // Node zero is an explicit invalid sentinel.
     m_kernel->expressions.emplace_back();
+    if (final_vf_lanes)
+      m_kernel->final_vf_lanes = *final_vf_lanes;
+    m_kernel->final_acc_lanes = final_acc_lanes;
+    m_kernel->final_q = final_q;
+    m_kernel->final_p = final_p;
+    m_kernel->final_i = final_i;
   }
 
   bool Build(std::string *error) {
@@ -205,6 +320,7 @@ public:
       store.source_vf = static_cast<u8>(VUInterpFast::Fs(plan.lower));
       if (!MemoryAddress(plan, pair_index, 0, &store.address)) {
         m_kernel->has_unsupported_expression = true;
+        RecordUnsupported(plan, "store address");
         continue;
       }
 
@@ -239,6 +355,62 @@ public:
       return Fail(error, std::move(detail));
     }
 
+    const bool final_state_requested =
+        std::any_of(m_kernel->final_vf_lanes.begin(),
+                    m_kernel->final_vf_lanes.end(),
+                    [](u8 lanes) { return lanes != 0; }) ||
+        m_kernel->final_acc_lanes != 0 || m_kernel->final_q ||
+        m_kernel->final_p || m_kernel->final_i;
+    bool final_state_complete = true;
+    m_current_store_pc = m_kernel->latch_pc;
+    for (u32 reg = 1; reg < m_kernel->final_vf_lanes.size(); reg++) {
+      for (u32 lane = 0; lane < 4; lane++) {
+        if (!LaneEnabled(m_kernel->final_vf_lanes[reg], lane))
+          continue;
+        u32 value = Resolve(
+            {SlotKind::Vf, static_cast<u8>(reg), static_cast<u8>(lane),
+             static_cast<u16>(m_block.pairs.size()), 0, ScalarDomain::Raw});
+        if (value != InvalidNode &&
+            m_kernel->expressions[value].domain == ScalarDomain::Float) {
+          value = Unary(ExpressionKind::Normalize, ScalarDomain::Float, value);
+        }
+        m_kernel->final_vf_values[reg][lane] = value;
+        final_state_complete &= value != InvalidNode;
+      }
+    }
+    for (u32 lane = 0; lane < 4; lane++) {
+      if (!LaneEnabled(m_kernel->final_acc_lanes, lane))
+        continue;
+      u32 value = Resolve(
+          {SlotKind::Acc, 0, static_cast<u8>(lane),
+           static_cast<u16>(m_block.pairs.size()), 0, ScalarDomain::Raw});
+      if (value != InvalidNode &&
+          m_kernel->expressions[value].domain == ScalarDomain::Float) {
+        value = Unary(ExpressionKind::Normalize, ScalarDomain::Float, value);
+      }
+      m_kernel->final_acc_values[lane] = value;
+      final_state_complete &= value != InvalidNode;
+    }
+    const auto resolve_scalar = [&](SlotKind kind, bool requested,
+                                    u32* destination) {
+      if (!requested)
+        return;
+      *destination = Resolve(
+          {kind, 0, 0, static_cast<u16>(m_block.pairs.size()), 0,
+           ScalarDomain::Raw});
+      final_state_complete &= *destination != InvalidNode;
+    };
+    resolve_scalar(SlotKind::Q, m_kernel->final_q,
+                   &m_kernel->final_q_value);
+    resolve_scalar(SlotKind::P, m_kernel->final_p,
+                   &m_kernel->final_p_value);
+    resolve_scalar(SlotKind::I, m_kernel->final_i,
+                   &m_kernel->final_i_value);
+    m_kernel->independent_final_state =
+        final_state_requested && final_state_complete &&
+        !m_kernel->has_true_recurrence &&
+        !m_kernel->has_unsupported_expression;
+
     bool complete = true;
     for (const LoopStore &store : m_kernel->stores) {
       complete &= store.address.valid;
@@ -266,12 +438,12 @@ public:
 
 private:
   u32 AddNode(ExpressionNode node) {
-    const auto key =
-        std::tuple(node.kind, node.domain, node.operands, node.memory_address.base_vi,
-                   node.memory_address.invocation_coefficient,
-                   node.memory_address.qword_offset,
-                   node.memory_address.valid, node.immediate, node.reg,
-                   node.lane);
+    const auto key = std::tuple(
+        node.kind, node.domain, node.operands, node.memory_address.base_vi,
+        node.memory_address.invocation_coefficient,
+        node.memory_address.qword_offset, node.memory_address.valid,
+        node.memory_address.outer_invocation_coefficient, node.immediate,
+        node.reg, node.lane);
     const auto existing = m_node_cache.find(key);
     if (existing != m_node_cache.end())
       return existing->second;
@@ -301,6 +473,17 @@ private:
     node.domain = domain;
     node.operands[0] = left;
     node.operands[1] = right;
+    return AddNode(node);
+  }
+
+  u32 Ternary(ExpressionKind kind, ScalarDomain domain, u32 first,
+              u32 second, u32 third) {
+    if (first == InvalidNode || second == InvalidNode || third == InvalidNode)
+      return InvalidNode;
+    ExpressionNode node{};
+    node.kind = kind;
+    node.domain = domain;
+    node.operands = {first, second, third};
     return AddNode(node);
   }
 
@@ -406,16 +589,14 @@ private:
       return false;
     }
 
-    if ((m_kernel->vi.affine_mask & (1u << base)) == 0 ||
-        pair_index >= m_kernel->vi.prefix[base].size()) {
+    if (pair_index >= m_kernel->vi.AddressesForRegister(base).size()) {
       return false;
     }
-    address->base_vi = static_cast<u8>(base);
-    address->invocation_coefficient = m_kernel->vi.step[base];
-    address->qword_offset =
-        iteration * m_kernel->vi.step[base] +
-        m_kernel->vi.prefix[base][pair_index] + immediate;
-    address->valid = true;
+    *address = m_kernel->vi.AddressesForRegister(base)[pair_index];
+    if (!address->valid)
+      return false;
+    address->qword_offset +=
+        iteration * address->invocation_coefficient + immediate;
     return true;
   }
 
@@ -427,6 +608,7 @@ private:
     node.lane = static_cast<u8>(lane);
     if (!MemoryAddress(plan, pair_index, iteration, &node.memory_address)) {
       m_kernel->has_unsupported_expression = true;
+      RecordUnsupported(plan, "load address");
       return InvalidNode;
     }
     return AddNode(node);
@@ -616,6 +798,18 @@ private:
       m_rejection_detail += "#";
       m_rejection_detail += std::to_string(path_key.iteration);
     }
+  }
+
+  void RecordUnsupported(const VitaVU::GpuPairPlan& plan,
+                         const char* reason) {
+    if (!m_rejection_detail.empty())
+      return;
+    m_rejection_detail =
+        "store_pc=" + std::to_string(m_current_store_pc) +
+        " store_lane=" + std::to_string(m_current_store_lane) +
+        " reason=" + reason + " source_pc=" + std::to_string(plan.pc) +
+        " upper_kind=" + std::to_string(plan.upper_kind) +
+        " lower_kind=" + std::to_string(plan.lower_kind);
   }
 
   static bool ReadsAcc(UpperKind kind) {
@@ -912,14 +1106,14 @@ private:
       constexpr std::array<u8, 3> fs_lane = {1, 2, 0};
       constexpr std::array<u8, 3> ft_lane = {2, 0, 1};
       const u32 product = Binary(
-          ExpressionKind::Multiply, ScalarDomain::Float,
+          ExpressionKind::RoundedMultiply, ScalarDomain::Float,
           ResolveBefore(SlotKind::Vf, fs_reg, fs_lane[lane], pair_index,
                         iteration, ScalarDomain::Float),
           ResolveBefore(SlotKind::Vf, VUInterpFast::Ft(code), ft_lane[lane],
                         pair_index, iteration, ScalarDomain::Float));
       if (kind == UpperKind::OPMULA)
         return product;
-      return Binary(ExpressionKind::Subtract, ScalarDomain::Float,
+      return Binary(ExpressionKind::RoundedSubtract, ScalarDomain::Float,
                     ResolveBefore(SlotKind::Acc, 0, lane, pair_index,
                                   iteration, ScalarDomain::Float),
                     product);
@@ -943,6 +1137,7 @@ private:
         kind == UpperKind::MINIw;
     if (!arithmetic) {
       m_kernel->has_unsupported_expression = true;
+      RecordUnsupported(plan, "upper expression");
       return InvalidNode;
     }
 
@@ -982,20 +1177,20 @@ private:
       value = Binary(ExpressionKind::Minimum, ScalarDomain::Float, left,
                      right);
     } else if (IsMadd(kind) || ReadsAcc(kind)) {
-      const u32 product = Binary(ExpressionKind::Multiply,
+      const u32 product = Binary(ExpressionKind::RoundedMultiply,
                                  ScalarDomain::Float, left, right);
       const u32 acc =
           ResolveBefore(SlotKind::Acc, 0, lane, pair_index, iteration,
                         ScalarDomain::Float);
-      value = Binary(IsSubtract(kind) ? ExpressionKind::Subtract
-                                      : ExpressionKind::Add,
+      value = Binary(IsSubtract(kind) ? ExpressionKind::RoundedSubtract
+                                      : ExpressionKind::RoundedAdd,
                      ScalarDomain::Float, acc, product);
     } else if (IsMultiply(kind)) {
-      value = Binary(ExpressionKind::Multiply, ScalarDomain::Float, left,
-                     right);
+      value = Binary(ExpressionKind::RoundedMultiply, ScalarDomain::Float,
+                     left, right);
     } else {
-      value = Binary(IsSubtract(kind) ? ExpressionKind::Subtract
-                                      : ExpressionKind::Add,
+      value = Binary(IsSubtract(kind) ? ExpressionKind::RoundedSubtract
+                                      : ExpressionKind::RoundedAdd,
                      ScalarDomain::Float, left, right);
     }
     return value;
@@ -1024,6 +1219,7 @@ private:
                              ScalarDomain::Float);
       }
       m_kernel->has_unsupported_expression = true;
+      RecordUnsupported(plan, "lower VF expression");
       return InvalidNode;
     case SlotKind::Q: {
       const u32 fs_lane = VUInterpFast::Fsf(code);
@@ -1057,18 +1253,46 @@ private:
                                     ScalarDomain::Float))));
       }
       m_kernel->has_unsupported_expression = true;
+      RecordUnsupported(plan, "lower Q expression");
       return InvalidNode;
     }
     case SlotKind::P:
+      if (kind == LowerKind::ERSADD &&
+          (m_kernel->configuration_bits &
+           UniversalConfigurationApproximateP) != 0) {
+        const u32 fs = VUInterpFast::Fs(code);
+        const u32 sum = Ternary(
+            ExpressionKind::EfuSumXyzSquares, ScalarDomain::Float,
+            ResolveBefore(SlotKind::Vf, fs, 0, pair_index, iteration,
+                          ScalarDomain::Float),
+            ResolveBefore(SlotKind::Vf, fs, 1, pair_index, iteration,
+                          ScalarDomain::Float),
+            ResolveBefore(SlotKind::Vf, fs, 2, pair_index, iteration,
+                          ScalarDomain::Float));
+        return Unary(ExpressionKind::ArmApproximateReciprocal,
+                     ScalarDomain::Float, sum);
+      }
+      if (kind == LowerKind::ESQRT &&
+          (m_kernel->configuration_bits &
+           UniversalConfigurationApproximateP) != 0) {
+        const u32 fs_lane = VUInterpFast::Fsf(code);
+        return Unary(
+            ExpressionKind::ArmApproximateSquareRoot, ScalarDomain::Float,
+            ResolveBefore(SlotKind::Vf, VUInterpFast::Fs(code), fs_lane,
+                          pair_index, iteration, ScalarDomain::Float));
+      }
       m_kernel->has_unsupported_expression = true;
+      RecordUnsupported(plan, "lower P expression");
       return InvalidNode;
     case SlotKind::I:
       if (plan.immediate_lower)
         return FloatConstant(plan.lower);
       m_kernel->has_unsupported_expression = true;
+      RecordUnsupported(plan, "lower I expression");
       return InvalidNode;
     case SlotKind::Acc:
       m_kernel->has_unsupported_expression = true;
+      RecordUnsupported(plan, "lower ACC expression");
       return InvalidNode;
     }
     return InvalidNode;
@@ -1086,18 +1310,168 @@ private:
   u32 m_current_store_lane = 0;
   using NodeCacheKey =
       std::tuple<ExpressionKind, ScalarDomain, std::array<u32, 3>, u8, s32,
-                 s32, bool, u32, u8, u8>;
+                 s32, bool, s32, u32, u8, u8>;
   std::map<NodeCacheKey, u32> m_node_cache;
 };
 
 } // namespace
 
+bool EvaluateAffineViRuntimeValue(
+    const AffineViValue& value, const std::array<u16, 16>& initial_vi,
+    u16 vif_top, u16 vif_itop, u16* result) {
+  if (!result || !value.valid)
+    return false;
+
+  u32 base = 0u;
+  if (value.base_vi > 0u && value.base_vi < initial_vi.size()) {
+    base = initial_vi[value.base_vi];
+  } else if (value.base_vi == AffineViBaseVifTop) {
+    base = vif_top;
+  } else if (value.base_vi == AffineViBaseVifItop) {
+    base = vif_itop;
+  } else if (value.base_vi != 0u) {
+    return false;
+  }
+  *result = static_cast<u16>(base + value.offset);
+  return true;
+}
+
+bool EvaluateAffineQwordRuntimeAddress(
+    const AffineQwordAddress& address,
+    const std::array<u16, 16>& child_entry_vi, u16 vif_top, u16 vif_itop,
+    u32 outer_iteration, u32 child_iteration, u16* qword) {
+  if (!qword || !address.valid)
+    return false;
+
+  u32 base = 0u;
+  if (address.base_vi < child_entry_vi.size()) {
+    base = address.base_vi == 0u ? 0u : child_entry_vi[address.base_vi];
+  } else if (address.base_vi == AffineViBaseVifTop) {
+    base = vif_top;
+  } else if (address.base_vi == AffineViBaseVifItop) {
+    base = vif_itop;
+  } else {
+    return false;
+  }
+
+  const s64 resolved =
+      static_cast<s64>(base) + address.qword_offset +
+      static_cast<s64>(outer_iteration) *
+          address.outer_invocation_coefficient +
+      static_cast<s64>(child_iteration) * address.invocation_coefficient;
+  *qword = static_cast<u16>(static_cast<u64>(resolved) & 1023u);
+  return true;
+}
+
+bool EvaluateClosedFormNestedLoopRuntimeControl(
+    const ClosedFormNestedLoopProof& proof,
+    const std::array<u16, 16>& initial_vi, u16 vif_top, u16 vif_itop,
+    u32* summarized_entry_iterations, u32* outer_iterations,
+    std::string* error) {
+  const auto fail = [error](const char* detail) {
+    if (error)
+      *error = detail;
+    return false;
+  };
+  if (!summarized_entry_iterations || !outer_iterations ||
+      !proof.parent_entry_reduced || !proof.child_entry_reduced ||
+      !proof.final_parent_state_reduced ||
+      proof.outer_iteration_count == 0u ||
+      proof.child_iteration_count == 0u) {
+    return fail("closed-form runtime control proof is incomplete");
+  }
+
+  const auto evaluate = [&](const AffineViValue& value, u16* result) {
+    return EvaluateAffineViRuntimeValue(
+        value, initial_vi, vif_top, vif_itop, result);
+  };
+  const auto trip_count = [&](u8 branch_kind, s32 counter_step,
+                              u16 counter, u16 limit, u32* result) {
+    if (!result || (counter_step != 1 && counter_step != -1))
+      return false;
+    switch (static_cast<LowerKind>(branch_kind)) {
+    case LowerKind::IBNE:
+      *result = counter_step > 0
+                    ? static_cast<u16>(limit - counter)
+                    : static_cast<u16>(counter - limit);
+      break;
+    case LowerKind::IBGTZ:
+      if (counter_step != -1 || limit != 0u ||
+          static_cast<s16>(counter) <= 0) {
+        return false;
+      }
+      *result = counter;
+      break;
+    default:
+      return false;
+    }
+    return *result != 0u;
+  };
+
+  u32 entry_count = 0u;
+  if (proof.summarized_entry_loop !=
+      std::numeric_limits<u32>::max()) {
+    if (proof.entry_loop_control_requires_pairplan_preflight) {
+      return fail("closed-form summarized entry needs PairPlan preflight");
+    }
+    u16 counter = 0u;
+    u16 limit = 0u;
+    if (proof.summarized_entry_loop_iterations == 0u ||
+        !proof.entry_loop_trip_count_requires_runtime_attestation ||
+        !evaluate(proof.summarized_entry_counter_value, &counter) ||
+        !evaluate(proof.summarized_entry_limit_value, &limit) ||
+        !trip_count(proof.summarized_entry_branch_kind,
+                    proof.summarized_entry_counter_step,
+                    counter, limit, &entry_count)) {
+      return fail("closed-form summarized entry trip count is invalid");
+    }
+  } else if (proof.summarized_entry_loop_iterations != 0u ||
+             proof.entry_loop_trip_count_requires_runtime_attestation) {
+    return fail("closed-form summarized entry control is inconsistent");
+  }
+
+  u16 parent_counter = 0u;
+  u16 parent_limit = 0u;
+  u32 parent_count = 0u;
+  if (!evaluate(proof.parent_counter_entry_value, &parent_counter) ||
+      !evaluate(proof.parent_counter_limit_value, &parent_limit) ||
+      !trip_count(proof.parent_branch_kind, proof.parent_counter_step,
+                  parent_counter, parent_limit, &parent_count)) {
+    return fail("closed-form enclosing trip count is invalid");
+  }
+
+  *summarized_entry_iterations = entry_count;
+  *outer_iterations = parent_count;
+  if (error)
+    error->clear();
+  return true;
+}
+
 bool BuildParallelLoopKernel(const ProgramAnalysis &program, u32 loop_index,
                              ParallelLoopKernel *kernel, std::string *error) {
+  return BuildParallelLoopKernelForConfiguration(program, loop_index, 0,
+                                                 kernel, error);
+}
+
+bool BuildParallelLoopKernelForConfiguration(
+    const ProgramAnalysis& program, u32 loop_index, u32 configuration_bits,
+    ParallelLoopKernel* kernel, std::string* error) {
+	static const std::array<u8, 32> NoFinalVfLanes{};
+	return BuildParallelLoopKernelWithFinalStateForConfiguration(
+		program, loop_index, configuration_bits, NoFinalVfLanes, 0, false,
+		false, false, kernel, error);
+}
+
+bool BuildParallelLoopKernelWithFinalStateForConfiguration(
+    const ProgramAnalysis& program, u32 loop_index, u32 configuration_bits,
+    const std::array<u8, 32>& final_vf_lanes, u8 final_acc_lanes,
+    bool final_q, bool final_p, bool final_i, ParallelLoopKernel* kernel,
+    std::string* error) {
   if (!kernel)
     return Fail(error, "null parallel-loop kernel output");
   *kernel = {};
   kernel->loop_index = loop_index;
+  kernel->configuration_bits = configuration_bits;
   if (loop_index >= program.natural_loops.size())
     return Fail(error, "parallel-loop index is out of range");
 
@@ -1116,7 +1490,8 @@ bool BuildParallelLoopKernel(const ProgramAnalysis &program, u32 loop_index,
     return Fail(error, "natural-loop latch control is not lowerable");
   }
 
-  KernelBuilder builder(program, loop, block, kernel);
+  KernelBuilder builder(program, loop, block, kernel, &final_vf_lanes,
+                        final_acc_lanes, final_q, final_p, final_i);
   return builder.Build(error);
 }
 

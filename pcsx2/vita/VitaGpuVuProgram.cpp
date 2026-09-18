@@ -9,8 +9,10 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <new>
 #include <set>
 #include <utility>
 
@@ -36,6 +38,12 @@ using IndirectResolutionMap = std::map<u32, IndirectResolution>;
 struct ViValue {
   std::set<u16> values;
   bool unknown = false;
+};
+
+struct AnalysisConfiguration {
+  bool immutable = false;
+  bool assume_scheduled = false;
+  bool instant_qp = false;
 };
 
 using ViState = std::array<ViValue, 16>;
@@ -84,12 +92,19 @@ u32 ReadWord(const u8 *micro, u32 address) {
 }
 
 bool DecodePair(const u8 *micro, u32 mask, u32 pc, bool delay_slot,
+                const AnalysisConfiguration& configuration,
                 ProgramPair *pair, std::string *error) {
   const u32 address = pc & mask;
   const u32 lower = ReadWord(micro, address);
   const u32 upper = ReadWord(micro, address + sizeof(u32));
   pair->delayed_pair = delay_slot;
-  if (!VitaVU::AnalyzeGpuVu1Pair(address, upper, lower, &pair->plan)) {
+  const bool analyzed = configuration.immutable
+      ? VitaVU::AnalyzeGpuVu1PairForConfiguration(
+            address, upper, lower, configuration.assume_scheduled,
+            configuration.instant_qp, &pair->plan)
+      : VitaVU::AnalyzeGpuVu1Pair(
+            address, upper, lower, &pair->plan);
+  if (!analyzed) {
     return Fail(error, "PairPlan rejected a reachable VU1 pair at pc=" +
                            std::to_string(address));
   }
@@ -105,6 +120,7 @@ u32 BranchTarget(u32 pc, u32 lower, u32 mask) {
 bool ScanBlock(const u8 *micro, u32 mask, u32 start_pc,
                const std::set<u32> &leaders,
                const IndirectResolutionMap &indirect_resolutions,
+               const AnalysisConfiguration& configuration,
                PendingBlock *pending, std::set<u32> *discovered_leaders,
                std::string *error) {
   pending->block = {};
@@ -125,7 +141,7 @@ bool ScanBlock(const u8 *micro, u32 mask, u32 start_pc,
     }
 
     ProgramPair pair;
-    if (!DecodePair(micro, mask, pc, false, &pair, error))
+    if (!DecodePair(micro, mask, pc, false, configuration, &pair, error))
       return false;
     pending->block.pairs.push_back(pair);
     pending->block.has_external_exit |= pair.plan.dflag || pair.plan.tflag;
@@ -147,7 +163,8 @@ bool ScanBlock(const u8 *micro, u32 mask, u32 start_pc,
 
     const u32 delay_pc = (pc + PairBytes) & mask;
     ProgramPair delay;
-    if (!DecodePair(micro, mask, delay_pc, true, &delay, error))
+    if (!DecodePair(
+            micro, mask, delay_pc, true, configuration, &delay, error))
       return false;
     pending->block.pairs.push_back(delay);
     pending->block.has_external_exit |= delay.plan.dflag || delay.plan.tflag;
@@ -197,6 +214,7 @@ bool ScanBlock(const u8 *micro, u32 mask, u32 start_pc,
 bool BuildBlocksForIndirectResolutions(
     const u8 *micro, u32 mask, u32 start_pc,
     const IndirectResolutionMap &indirect_resolutions,
+    const AnalysisConfiguration& configuration,
     std::vector<BasicBlock> *blocks, std::string *error) {
   std::set<u32> leaders{start_pc};
   std::map<u32, PendingBlock> pending_blocks;
@@ -209,6 +227,7 @@ bool BuildBlocksForIndirectResolutions(
       PendingBlock pending;
       std::set<u32> discovered;
       if (!ScanBlock(micro, mask, leader, leaders, indirect_resolutions,
+                     configuration,
                      &pending, &discovered, error)) {
         return false;
       }
@@ -228,8 +247,8 @@ bool BuildBlocksForIndirectResolutions(
   for (const u32 leader : leaders) {
     PendingBlock pending;
     std::set<u32> discovered;
-    if (!ScanBlock(micro, mask, leader, leaders, indirect_resolutions, &pending,
-                   &discovered, error)) {
+    if (!ScanBlock(micro, mask, leader, leaders, indirect_resolutions,
+                   configuration, &pending, &discovered, error)) {
       return false;
     }
     if (!std::includes(leaders.begin(), leaders.end(), discovered.begin(),
@@ -435,12 +454,14 @@ bool UpdateIndirectResolutions(
 }
 
 bool BuildBlocks(const u8 *micro, u32 mask, u32 start_pc,
+                 const AnalysisConfiguration& configuration,
                  std::vector<BasicBlock> *blocks, std::string *error) {
   IndirectResolutionMap indirect_resolutions;
   for (u32 resolution_pass = 0; resolution_pass <= MaxVu1Pairs;
        resolution_pass++) {
     if (!BuildBlocksForIndirectResolutions(
-            micro, mask, start_pc, indirect_resolutions, blocks, error)) {
+            micro, mask, start_pc, indirect_resolutions, configuration,
+            blocks, error)) {
       return false;
     }
 
@@ -504,7 +525,8 @@ std::vector<u32> CollectNaturalLoop(const std::vector<BasicBlock> &blocks,
   return {members.begin(), members.end()};
 }
 
-bool BranchCounter(const BasicBlock &latch, u32 *counter_reg) {
+bool BranchCounterOperands(const BasicBlock &latch, u32 *first_reg,
+                           u32 *second_reg) {
   if (!latch.has_branch || !latch.conditional_branch ||
       latch.pairs.size() < 2) {
     return false;
@@ -514,16 +536,18 @@ bool BranchCounter(const BasicBlock &latch, u32 *counter_reg) {
   const u32 is = VUInterpFast::Is(code);
   const u32 it = VUInterpFast::It(code);
   if (kind == LowerKind::IBEQ || kind == LowerKind::IBNE) {
-    if ((is == 0) == (it == 0))
+    if (is == it)
       return false;
-    *counter_reg = is == 0 ? it : is;
+    *first_reg = is;
+    *second_reg = it;
     return true;
   }
   if (kind == LowerKind::IBLTZ || kind == LowerKind::IBGTZ ||
       kind == LowerKind::IBLEZ || kind == LowerKind::IBGEZ) {
     if (is == 0)
       return false;
-    *counter_reg = is;
+    *first_reg = is;
+    *second_reg = 0;
     return true;
   }
   return false;
@@ -568,38 +592,62 @@ bool CounterUpdate(const ProgramPair &pair, u32 counter_reg, s32 *step) {
 void AnalyzeLoopCounter(const std::vector<BasicBlock> &blocks,
                         NaturalLoop *loop) {
   const BasicBlock &latch = blocks[loop->latch_block];
-  u32 counter_reg = 0;
-  if (!BranchCounter(latch, &counter_reg))
-    return;
-
-  u32 writes = 0;
-  s32 counter_step = 0;
-  for (const u32 block_index : loop->blocks) {
-    const BasicBlock &block = blocks[block_index];
-    for (const ProgramPair &pair : block.pairs) {
-      if ((pair.plan.lower_vi_write & (1u << counter_reg)) == 0) {
-        continue;
-      }
-      writes++;
-      s32 update = 0;
-      if (!CounterUpdate(pair, counter_reg, &update))
-        return;
-      counter_step = update;
-    }
-  }
-  if (writes != 1 || counter_step == 0)
-    return;
-
-  loop->counter_reg = counter_reg;
-  loop->counter_step = counter_step;
   loop->branch_kind = latch.branch_kind;
-  loop->affine_counter = true;
   for (const ControlEdge &edge : latch.successors) {
     if (edge.has_target && edge.target_block == loop->header_block) {
       loop->branch_taken_repeats = edge.kind == ControlEdgeKind::BranchTaken;
       break;
     }
   }
+  u32 first_reg = 0;
+  u32 second_reg = 0;
+  if (!BranchCounterOperands(latch, &first_reg, &second_reg))
+    return;
+
+  const auto register_evolution = [&](u32 reg, u32* writes, s32* step) {
+    *writes = 0;
+    *step = 0;
+    if (reg == 0)
+      return true;
+    for (const u32 block_index : loop->blocks) {
+      const BasicBlock& block = blocks[block_index];
+      for (const ProgramPair& pair : block.pairs) {
+        if ((pair.plan.lower_vi_write & (1u << reg)) == 0)
+          continue;
+        s32 update = 0;
+        if (!CounterUpdate(pair, reg, &update))
+          return false;
+        (*writes)++;
+        *step += update;
+      }
+    }
+    return true;
+  };
+  u32 first_writes = 0;
+  u32 second_writes = 0;
+  s32 first_step = 0;
+  s32 second_step = 0;
+  if (!register_evolution(first_reg, &first_writes, &first_step) ||
+      !register_evolution(second_reg, &second_writes, &second_step)) {
+    return;
+  }
+
+  // Canonical equality loops advance exactly one operand toward an invariant
+  // VI limit. Preserve the actual counter step for address/final-state
+  // evolution; two moving operands require a later relative-induction IR.
+  if (first_writes != 0 && second_writes == 0 && first_step != 0) {
+    loop->counter_reg = first_reg;
+    loop->counter_limit_reg = second_reg;
+    loop->counter_step = first_step;
+  } else if (second_writes != 0 && first_writes == 0 && second_step != 0) {
+    loop->counter_reg = second_reg;
+    loop->counter_limit_reg = first_reg;
+    loop->counter_step = second_step;
+  } else {
+    return;
+  }
+
+  loop->affine_counter = true;
 }
 
 void FindNaturalLoops(ProgramAnalysis *analysis, u32 entry_block) {
@@ -616,6 +664,68 @@ void FindNaturalLoops(ProgramAnalysis *analysis, u32 entry_block) {
           CollectNaturalLoop(analysis->blocks, edge.target_block, source);
       AnalyzeLoopCounter(analysis->blocks, &loop);
       analysis->natural_loops.push_back(std::move(loop));
+    }
+  }
+
+  // Build a canonical loop forest after every backedge has been collected.
+  // A parent is the smallest strict natural-loop superset. This is structural
+  // compiler metadata, not workload recognition, and lets the generated tier
+  // keep inner loops inside an enclosing invocation.
+  for (u32 loop_index = 0; loop_index < analysis->natural_loops.size();
+       loop_index++) {
+    NaturalLoop& loop = analysis->natural_loops[loop_index];
+    loop.single_entry = true;
+    for (const u32 block_index : loop.blocks) {
+      const BasicBlock& block = analysis->blocks[block_index];
+      loop.pair_count += static_cast<u32>(block.pairs.size());
+      for (const ProgramPair& pair : block.pairs) {
+        if (!pair.plan.exec_lower || pair.plan.lower_discarded_by_upper)
+          continue;
+        const LowerKind kind = static_cast<LowerKind>(pair.plan.lower_kind);
+        loop.qword_store_count +=
+            kind == LowerKind::SQ || kind == LowerKind::SQI ||
+                    kind == LowerKind::SQD
+                ? 1u
+                : 0u;
+        loop.xgkick_count += kind == LowerKind::XGKICK ? 1u : 0u;
+      }
+      for (const u32 predecessor : block.predecessors) {
+        if (analysis->blocks[predecessor].reachable_from_entry &&
+            !std::binary_search(loop.blocks.begin(), loop.blocks.end(),
+                                predecessor) &&
+            block_index != loop.header_block) {
+          loop.single_entry = false;
+        }
+      }
+    }
+    size_t parent_size = std::numeric_limits<size_t>::max();
+    for (u32 candidate_index = 0;
+         candidate_index < analysis->natural_loops.size();
+         candidate_index++) {
+      if (candidate_index == loop_index)
+        continue;
+      const NaturalLoop& candidate = analysis->natural_loops[candidate_index];
+      if (candidate.blocks.size() <= loop.blocks.size() ||
+          candidate.blocks.size() >= parent_size ||
+          !std::includes(candidate.blocks.begin(), candidate.blocks.end(),
+                         loop.blocks.begin(), loop.blocks.end())) {
+        continue;
+      }
+      loop.parent_loop = candidate_index;
+      parent_size = candidate.blocks.size();
+    }
+  }
+  for (u32 loop_index = 0; loop_index < analysis->natural_loops.size();
+       loop_index++) {
+    const u32 parent = analysis->natural_loops[loop_index].parent_loop;
+    if (parent < analysis->natural_loops.size())
+      analysis->natural_loops[parent].child_loops.push_back(loop_index);
+  }
+  for (NaturalLoop& loop : analysis->natural_loops) {
+    u32 parent = loop.parent_loop;
+    while (parent < analysis->natural_loops.size()) {
+      loop.nesting_depth++;
+      parent = analysis->natural_loops[parent].parent_loop;
     }
   }
 }
@@ -674,8 +784,10 @@ void AnalyzeExitReachability(ProgramAnalysis *analysis) {
 }
 } // namespace
 
-bool AnalyzeGpuVu1Program(const u8 *micro, u32 micro_size, u32 start_pc,
-                          ProgramAnalysis *analysis, std::string *error) {
+bool AnalyzeGpuVu1ProgramImpl(
+    const u8* micro, u32 micro_size, u32 start_pc,
+    const AnalysisConfiguration& configuration, ProgramAnalysis* analysis,
+    std::string* error) {
   if (!micro || !analysis)
     return Fail(error, "null VU1 program analysis input");
   if (micro_size != VU1_PROGSIZE || !std::has_single_bit(micro_size) ||
@@ -686,8 +798,8 @@ bool AnalyzeGpuVu1Program(const u8 *micro, u32 micro_size, u32 start_pc,
 
   *analysis = {};
   analysis->start_pc = start_pc & (micro_size - 1);
-  if (!BuildBlocks(micro, micro_size - 1, analysis->start_pc, &analysis->blocks,
-                   error)) {
+  if (!BuildBlocks(micro, micro_size - 1, analysis->start_pc, configuration,
+                   &analysis->blocks, error)) {
     return false;
   }
   if (analysis->blocks.empty())
@@ -722,6 +834,283 @@ bool AnalyzeGpuVu1Program(const u8 *micro, u32 micro_size, u32 start_pc,
   analysis->complete_cfg = !analysis->has_unresolved_indirect_control &&
                            !analysis->has_branch_in_delay_slot &&
                            !analysis->has_external_exit;
+  if (error)
+    error->clear();
+  return true;
+}
+
+bool AnalyzeGpuVu1Program(const u8 *micro, u32 micro_size, u32 start_pc,
+                          ProgramAnalysis *analysis, std::string *error) {
+  if (!analysis)
+    return AnalyzeGpuVu1ProgramImpl(
+        micro, micro_size, start_pc, {}, analysis, error);
+  ProgramAnalysis candidate;
+  try {
+    if (!AnalyzeGpuVu1ProgramImpl(
+            micro, micro_size, start_pc, {}, &candidate, error)) {
+      return false;
+    }
+  } catch (const std::bad_alloc&) {
+    if (error) {
+      try {
+        *error = "VU1 PairPlan analysis allocation failed";
+      } catch (...) {
+        error->clear();
+      }
+    }
+    return false;
+  }
+  *analysis = std::move(candidate);
+  return true;
+}
+
+bool AnalyzeGpuVu1ProgramForConfiguration(
+    const u8* micro, u32 micro_size, u32 start_pc, bool assume_scheduled,
+    bool instant_qp, ProgramAnalysis* analysis, std::string* error) {
+  if (!analysis) {
+    return AnalyzeGpuVu1ProgramImpl(
+        micro, micro_size, start_pc,
+        {true, assume_scheduled, instant_qp}, analysis, error);
+  }
+  ProgramAnalysis candidate;
+  try {
+    if (!AnalyzeGpuVu1ProgramImpl(
+            micro, micro_size, start_pc,
+            {true, assume_scheduled, instant_qp}, &candidate, error)) {
+      return false;
+    }
+  } catch (const std::bad_alloc&) {
+    if (error) {
+      try {
+        *error = "VU1 PairPlan analysis allocation failed";
+      } catch (...) {
+        error->clear();
+      }
+    }
+    return false;
+  }
+  *analysis = std::move(candidate);
+  return true;
+}
+
+bool BuildStructuredControlPlan(const ProgramAnalysis& analysis,
+                                StructuredControlPlan* plan,
+                                std::string* error) {
+  if (!plan)
+    return Fail(error, "null structured VU control plan");
+  *plan = {};
+  if (analysis.blocks.empty() || !analysis.complete_cfg ||
+      !analysis.has_program_exit ||
+      !analysis.every_block_can_reach_program_exit) {
+    return Fail(error, "structured VU control requires a complete exiting CFG");
+  }
+
+  const u32 no_loop = std::numeric_limits<u32>::max();
+  plan->block_innermost_loop.assign(analysis.blocks.size(), no_loop);
+  bool found_entry = false;
+  for (u32 block_index = 0; block_index < analysis.blocks.size(); block_index++) {
+    const BasicBlock& block = analysis.blocks[block_index];
+    if (!block.reachable_from_entry)
+      continue;
+    if (block.start_pc == analysis.start_pc) {
+      plan->entry_block = block_index;
+      found_entry = true;
+    }
+    plan->reachable_pair_count += static_cast<u32>(block.pairs.size());
+    for (const ProgramPair& pair : block.pairs) {
+      if (!pair.plan.exec_lower || pair.plan.lower_discarded_by_upper)
+        continue;
+      const LowerKind kind = static_cast<LowerKind>(pair.plan.lower_kind);
+      plan->qword_store_sites +=
+          kind == LowerKind::SQ || kind == LowerKind::SQI ||
+                  kind == LowerKind::SQD
+              ? 1u
+              : 0u;
+      plan->xgkick_sites += kind == LowerKind::XGKICK ? 1u : 0u;
+    }
+  }
+  if (!found_entry)
+    return Fail(error, "structured VU control has no reachable entry block");
+
+  std::vector<u32> dense_loop_index(analysis.natural_loops.size(), no_loop);
+  plan->loops.reserve(analysis.natural_loops.size());
+  for (u32 loop_index = 0; loop_index < analysis.natural_loops.size();
+       loop_index++) {
+    const NaturalLoop& loop = analysis.natural_loops[loop_index];
+    if (loop.header_block >= analysis.blocks.size() ||
+        !analysis.blocks[loop.header_block].reachable_from_entry) {
+      continue;
+    }
+    dense_loop_index[loop_index] = static_cast<u32>(plan->loops.size());
+    plan->loops.emplace_back();
+    StructuredControlLoop& output = plan->loops.back();
+    output.loop_index = loop_index;
+    output.parent_loop = loop.parent_loop;
+    output.header_block = loop.header_block;
+    output.latch_block = loop.latch_block;
+    output.nesting_depth = loop.nesting_depth;
+    output.counter_reg = loop.counter_reg;
+    output.counter_limit_reg = loop.counter_limit_reg;
+    output.counter_step = loop.counter_step;
+    for (const u32 child_loop : loop.child_loops) {
+      if (child_loop < analysis.natural_loops.size() &&
+          analysis.natural_loops[child_loop].header_block <
+              analysis.blocks.size() &&
+          analysis.blocks[analysis.natural_loops[child_loop].header_block]
+              .reachable_from_entry) {
+        output.child_loops.push_back(child_loop);
+      }
+    }
+    plan->maximum_nesting_depth =
+        std::max(plan->maximum_nesting_depth, loop.nesting_depth);
+    plan->has_nested_loops |= loop.nesting_depth != 0;
+
+    if (loop.latch_block >= analysis.blocks.size() || loop.blocks.empty()) {
+      return Fail(error, "structured VU loop has invalid block ownership");
+    }
+    if (!loop.single_entry || !loop.affine_counter ||
+        loop.counter_reg == 0 || loop.counter_step == 0) {
+      return Fail(error,
+                  "structured VU loop requires a single-entry affine counter");
+    }
+    if (!std::binary_search(loop.blocks.begin(), loop.blocks.end(),
+                            loop.header_block) ||
+        !std::binary_search(loop.blocks.begin(), loop.blocks.end(),
+                            loop.latch_block)) {
+      return Fail(error, "structured VU loop omits its header or latch");
+    }
+
+    bool has_repeat_edge = false;
+    bool has_exit_edge = false;
+    for (const ControlEdge& edge :
+         analysis.blocks[loop.latch_block].successors) {
+      if (!edge.has_target)
+        continue;
+      if (edge.target_block == loop.header_block) {
+        has_repeat_edge = true;
+        if ((edge.kind == ControlEdgeKind::BranchTaken) !=
+            loop.branch_taken_repeats) {
+          return Fail(error, "structured VU loop repeat polarity mismatch");
+        }
+      } else if (!std::binary_search(loop.blocks.begin(), loop.blocks.end(),
+                                     edge.target_block)) {
+        has_exit_edge = true;
+      }
+    }
+    if (!has_repeat_edge || !has_exit_edge ||
+        !analysis.blocks[loop.latch_block].conditional_branch) {
+      return Fail(error,
+                  "structured VU loop requires one conditional latch exit");
+    }
+  }
+
+  // Natural loops must be disjoint or strictly nested.  Overlapping loop
+  // bodies cannot be represented by a lexical loop forest without duplicating
+  // architectural effects.
+  for (u32 left = 0; left < analysis.natural_loops.size(); left++) {
+    if (dense_loop_index[left] == no_loop)
+      continue;
+    const auto& left_blocks = analysis.natural_loops[left].blocks;
+    for (u32 right = left + 1; right < analysis.natural_loops.size(); right++) {
+      if (dense_loop_index[right] == no_loop)
+        continue;
+      const auto& right_blocks = analysis.natural_loops[right].blocks;
+      std::vector<u32> intersection;
+      std::set_intersection(left_blocks.begin(), left_blocks.end(),
+                            right_blocks.begin(), right_blocks.end(),
+                            std::back_inserter(intersection));
+      if (intersection.empty())
+        continue;
+      const bool left_contains = std::includes(
+          left_blocks.begin(), left_blocks.end(), right_blocks.begin(),
+          right_blocks.end());
+      const bool right_contains = std::includes(
+          right_blocks.begin(), right_blocks.end(), left_blocks.begin(),
+          left_blocks.end());
+      if (!left_contains && !right_contains)
+        return Fail(error, "structured VU control has overlapping loops");
+    }
+  }
+
+  for (u32 block_index = 0; block_index < analysis.blocks.size(); block_index++) {
+    if (!analysis.blocks[block_index].reachable_from_entry)
+      continue;
+    u32 owner = no_loop;
+    u32 owner_depth = 0;
+    for (u32 loop_index = 0; loop_index < analysis.natural_loops.size();
+         loop_index++) {
+      const NaturalLoop& loop = analysis.natural_loops[loop_index];
+      if (!std::binary_search(loop.blocks.begin(), loop.blocks.end(),
+                              block_index)) {
+        continue;
+      }
+      if (owner == no_loop || loop.nesting_depth >= owner_depth) {
+        owner = loop_index;
+        owner_depth = loop.nesting_depth;
+      }
+    }
+    plan->block_innermost_loop[block_index] = owner;
+    if (owner == no_loop) {
+      plan->top_level_blocks.push_back(block_index);
+      continue;
+    }
+    if (owner >= dense_loop_index.size() ||
+        dense_loop_index[owner] == no_loop) {
+      return Fail(error, "structured VU block has no dense loop owner");
+    }
+    StructuredControlLoop& loop = plan->loops[dense_loop_index[owner]];
+    loop.exclusive_blocks.push_back(block_index);
+    loop.exclusive_pair_count +=
+        static_cast<u32>(analysis.blocks[block_index].pairs.size());
+    for (const ProgramPair& pair : analysis.blocks[block_index].pairs) {
+      if (!pair.plan.exec_lower || pair.plan.lower_discarded_by_upper)
+        continue;
+      const LowerKind kind = static_cast<LowerKind>(pair.plan.lower_kind);
+      loop.exclusive_qword_store_count +=
+          kind == LowerKind::SQ || kind == LowerKind::SQI ||
+                  kind == LowerKind::SQD
+              ? 1u
+              : 0u;
+      loop.exclusive_xgkick_count += kind == LowerKind::XGKICK ? 1u : 0u;
+    }
+  }
+
+  // Remove exactly the canonical latch-to-header backedges.  Any cycle left
+  // behind is irreducible or missing from the loop forest and must stay on the
+  // fixed interpreter/CPU fallback path until represented deliberately.
+  std::vector<u8> visit(analysis.blocks.size(), 0);
+  const auto is_backedge = [&](u32 source, const ControlEdge& edge) {
+    if (!edge.has_target)
+      return false;
+    for (const NaturalLoop& loop : analysis.natural_loops) {
+      if (source == loop.latch_block && edge.target_block == loop.header_block)
+        return true;
+    }
+    return false;
+  };
+  const auto visit_dag = [&](const auto& self, u32 block_index) -> bool {
+    if (!analysis.blocks[block_index].reachable_from_entry)
+      return true;
+    if (visit[block_index] == 1)
+      return false;
+    if (visit[block_index] == 2)
+      return true;
+    visit[block_index] = 1;
+    for (const ControlEdge& edge : analysis.blocks[block_index].successors) {
+      if (!edge.has_target || is_backedge(block_index, edge))
+        continue;
+      if (edge.target_block >= analysis.blocks.size() ||
+          !self(self, edge.target_block)) {
+        return false;
+      }
+    }
+    visit[block_index] = 2;
+    return true;
+  };
+  if (!visit_dag(visit_dag, plan->entry_block))
+    return Fail(error, "structured VU control retains an unclassified cycle");
+
+  plan->single_invocation_control_proven = true;
   if (error)
     error->clear();
   return true;

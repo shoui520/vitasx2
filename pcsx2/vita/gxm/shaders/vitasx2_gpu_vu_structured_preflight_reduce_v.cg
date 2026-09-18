@@ -1,0 +1,49 @@
+// VitaSX2 title-neutral structured-memory preflight address reducer.
+// One invocation owns one VU-memory address and scans the 64 disjoint rows.
+#pragma readwrite_buffer BUFFER9
+#pragma readwrite_buffer BUFFER10
+
+void main(
+	unsigned int aIndex : INDEX,
+	uniform unsigned int VuAuxiliary[7010] : BUFFER9,
+	uniform unsigned int VuOccupancyPlane[65536] : BUFFER10,
+	uniform unsigned int VuOuterState[16] : BUFFER12,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuPointSize = 1.0f;
+	VuResult = float4(0.0f);
+	if (aIndex >= 1024u) return;
+	unsigned int VuFailure = 0u;
+	unsigned int VuOccupancy = 0u;
+	const unsigned int VuOuterCount = VuOuterState[0];
+	const unsigned int VuGeneration = VuOuterState[11];
+	if (VuOuterState[3] == 0u && VuOuterState[15] == 1u &&
+		VuOuterCount != 0u && VuOuterCount <= 64u &&
+		VuGeneration != 0u && VuGeneration <= 16777215u)
+	{
+		#pragma loop (unroll: never)
+		for (unsigned int VuOuter = 0u;
+			 VuOuter < VuOuterCount && VuFailure == 0u; VuOuter++)
+		{
+			const unsigned int VuTaggedRow =
+				VuOccupancyPlane[VuOuter * 1024u + aIndex];
+			const unsigned int VuRow =
+				(VuTaggedRow >> 8u) == VuGeneration ?
+					VuTaggedRow & 255u : 0u;
+			const unsigned int VuLoads = VuRow & 15u;
+			const unsigned int VuStores = (VuRow >> 4u) & 15u;
+			const unsigned int VuPriorLoads = VuOccupancy & 15u;
+			const unsigned int VuPriorStores = (VuOccupancy >> 4u) & 15u;
+			if ((VuStores & VuPriorStores) != 0u) VuFailure = 6u;
+			else if ((VuStores & VuPriorLoads) != 0u) VuFailure = 5u;
+			else if ((VuLoads & VuPriorStores) != 0u) VuFailure = 4u;
+			VuOccupancy |= VuLoads | (VuStores << 4u);
+		}
+	}
+	VuAuxiliary[128u + aIndex] = VuFailure;
+	VuResult = float4(float(aIndex), float(VuFailure),
+		float(VuOccupancy), float(VuOuterCount));
+}

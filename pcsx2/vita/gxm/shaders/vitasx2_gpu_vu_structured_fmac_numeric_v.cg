@@ -1,0 +1,219 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// Title-neutral fixed exact-FMAC batch for generated structured VU1 roots.
+// PCSX2 owners: VUops.cpp::_vuOpADD/_vuOpSUB/_vuOpMUL/_vuOpMADD,
+// _vuOpMSUB/_vuOPMSUB and vuDouble(). PairPlan lowering places a bounded,
+// dependency-ordered operation stream in BUFFER0. Every invocation executes
+// that stream over its own transaction-private BUFFER10 scratch row. No title,
+// source PC, content hash, or hand-written microprogram shape is embedded.
+
+#pragma warning (default:7203)
+#pragma readwrite_buffer BUFFER10
+
+#define VITASX2_STRUCTURED_FMAC_FORMAT 2u
+#define VITASX2_STRUCTURED_FMAC_MAX_OPERATIONS 32u
+#define VITASX2_STRUCTURED_FMAC_ADD 1u
+#define VITASX2_STRUCTURED_FMAC_SUBTRACT 2u
+#define VITASX2_STRUCTURED_FMAC_MULTIPLY 3u
+#define VITASX2_STRUCTURED_FMAC_SCRATCH 1u
+#define VITASX2_STRUCTURED_FMAC_IMMEDIATE 2u
+#define VITASX2_STRUCTURED_SCRATCH_SLOTS 128u
+#define VITASX2_STRUCTURED_MAX_INVOCATIONS 4096u
+#define VITASX2_STRUCTURED_NUMERIC_MASK 4080u
+#define VITASX2_STRUCTURED_NUMERIC_PROFILE 3088u
+#define VITASX2_STRUCTURED_APPROXIMATE_FMAC 16384u
+#define VITASX2_STRUCTURED_CONFIGURATION_KNOWN_MASK 32767u
+
+unsigned int VitaVuF32NormalizeInputBits(unsigned int bits)
+{
+	const unsigned int exponent = bits & 2139095040u;
+	if (exponent == 0u) return bits & 2147483648u;
+	if (exponent == 2139095040u)
+		return (bits & 2147483648u) | 2139095039u;
+	return bits;
+}
+
+unsigned int VitaVuF32ShiftRightJam(unsigned int value, unsigned int distance)
+{
+	if (distance == 0u) return value;
+	if (distance < 32u)
+	{
+		const unsigned int mask = (1u << distance) - 1u;
+		return (value >> distance) | ((value & mask) != 0u ? 1u : 0u);
+	}
+	return value != 0u ? 1u : 0u;
+}
+
+unsigned int VitaVuF32AddBits(
+	unsigned int leftInput, unsigned int rightInput, bool subtract)
+{
+	unsigned int left = VitaVuF32NormalizeInputBits(leftInput);
+	unsigned int right = VitaVuF32NormalizeInputBits(rightInput);
+	if (subtract) right ^= 2147483648u;
+	unsigned int leftMagnitude = left & 2147483647u;
+	unsigned int rightMagnitude = right & 2147483647u;
+	const unsigned int leftSign = left >> 31u;
+	const unsigned int rightSign = right >> 31u;
+	if (leftMagnitude == 0u && rightMagnitude == 0u)
+		return leftSign == rightSign ? leftSign << 31u : 0u;
+	if (leftMagnitude == 0u) return right;
+	if (rightMagnitude == 0u) return left;
+	if (leftMagnitude < rightMagnitude)
+	{
+		const unsigned int swapValue = left;
+		left = right;
+		right = swapValue;
+		const unsigned int swapMagnitude = leftMagnitude;
+		leftMagnitude = rightMagnitude;
+		rightMagnitude = swapMagnitude;
+	}
+	const unsigned int sign = left & 2147483648u;
+	int exponent = int((left >> 23u) & 255u);
+	const unsigned int rightExponent = (right >> 23u) & 255u;
+	const unsigned int leftSignificand =
+		((left & 8388607u) | 8388608u) << 3u;
+	unsigned int rightSignificand =
+		((right & 8388607u) | 8388608u) << 3u;
+	rightSignificand = VitaVuF32ShiftRightJam(
+		rightSignificand, unsigned int(exponent) - rightExponent);
+	unsigned int significand = 0u;
+	if (((left ^ right) & 2147483648u) == 0u)
+	{
+		significand = leftSignificand + rightSignificand;
+		if ((significand & 134217728u) != 0u)
+		{
+			significand = VitaVuF32ShiftRightJam(significand, 1u);
+			exponent++;
+		}
+	}
+	else
+	{
+		significand = leftSignificand - rightSignificand;
+		if (significand == 0u) return 0u;
+		#pragma loop (unroll: never)
+		while ((significand & 67108864u) == 0u)
+		{
+			significand <<= 1u;
+			exponent--;
+		}
+	}
+	if (exponent <= 0) return sign;
+	unsigned int rounded = significand >> 3u;
+	const unsigned int roundBits = significand & 7u;
+	if (roundBits > 4u ||
+		(roundBits == 4u && (rounded & 1u) != 0u)) rounded++;
+	if ((rounded & 16777216u) != 0u)
+	{
+		rounded >>= 1u;
+		exponent++;
+	}
+	if (exponent >= 255) return sign | 2139095039u;
+	return sign | (unsigned int(exponent) << 23u) | (rounded & 8388607u);
+}
+
+unsigned int VitaVuF32MulBits(
+	unsigned int leftInput, unsigned int rightInput)
+{
+	const unsigned int left = VitaVuF32NormalizeInputBits(leftInput);
+	const unsigned int right = VitaVuF32NormalizeInputBits(rightInput);
+	const unsigned int sign = (left ^ right) & 2147483648u;
+	if ((left & 2147483647u) == 0u || (right & 2147483647u) == 0u)
+		return sign;
+	int exponent = int((left >> 23u) & 255u) +
+		int((right >> 23u) & 255u) - 127;
+	const unsigned int leftSignificand = (left & 8388607u) | 8388608u;
+	const unsigned int rightSignificand = (right & 8388607u) | 8388608u;
+	const unsigned int leftLow = leftSignificand & 65535u;
+	const unsigned int leftHigh = leftSignificand >> 16u;
+	const unsigned int rightLow = rightSignificand & 65535u;
+	const unsigned int rightHigh = rightSignificand >> 16u;
+	const unsigned int lowProduct = leftLow * rightLow;
+	const unsigned int crossProduct =
+		leftHigh * rightLow + leftLow * rightHigh;
+	const unsigned int productLow = lowProduct + (crossProduct << 16u);
+	const unsigned int carry = productLow < lowProduct ? 1u : 0u;
+	const unsigned int productHigh =
+		leftHigh * rightHigh + (crossProduct >> 16u) + carry;
+	unsigned int rounded = 0u;
+	unsigned int remainder = 0u;
+	unsigned int halfway = 0u;
+	if ((productHigh & 32768u) != 0u)
+	{
+		rounded = (productHigh << 8u) | (productLow >> 24u);
+		remainder = productLow & 16777215u;
+		halfway = 8388608u;
+		exponent++;
+	}
+	else
+	{
+		rounded = (productHigh << 9u) | (productLow >> 23u);
+		remainder = productLow & 8388607u;
+		halfway = 4194304u;
+	}
+	if (remainder > halfway ||
+		(remainder == halfway && (rounded & 1u) != 0u)) rounded++;
+	if ((rounded & 16777216u) != 0u)
+	{
+		rounded >>= 1u;
+		exponent++;
+	}
+	if (exponent <= 0) return sign;
+	if (exponent >= 255) return sign | 2139095039u;
+	return sign | (unsigned int(exponent) << 23u) | (rounded & 8388607u);
+}
+
+void main(
+	uniform unsigned int4 VuDescriptor[66] : BUFFER0,
+	uniform unsigned int VuScratchWords[1] : BUFFER10,
+	unsigned int VuInvocation : INDEX,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPointSize = 1.0f;
+	const unsigned int format = VuDescriptor[0].x;
+	const unsigned int operationCount = VuDescriptor[0].y;
+	const unsigned int configuration = VuDescriptor[0].z;
+	bool valid = format == VITASX2_STRUCTURED_FMAC_FORMAT &&
+		operationCount != 0u &&
+		operationCount <= VITASX2_STRUCTURED_FMAC_MAX_OPERATIONS &&
+		(configuration & ~VITASX2_STRUCTURED_CONFIGURATION_KNOWN_MASK) == 0u &&
+		(configuration & VITASX2_STRUCTURED_NUMERIC_MASK) ==
+			VITASX2_STRUCTURED_NUMERIC_PROFILE &&
+		(configuration & VITASX2_STRUCTURED_APPROXIMATE_FMAC) == 0u &&
+		VuDescriptor[1].w == 0u &&
+		VuInvocation < VITASX2_STRUCTURED_MAX_INVOCATIONS;
+	// The cache-owned descriptor is exhaustively validated on the CPU while it
+	// is copied into this immutable private transaction slot. Repeating that
+	// 32-record walk in every logical VU invocation multiplied host validation
+	// work by up to 4096 without strengthening the ownership boundary.
+
+	#pragma branch (flatten: never)
+	if (valid)
+	{
+		const unsigned int base =
+			VuInvocation * VITASX2_STRUCTURED_SCRATCH_SLOTS;
+		#pragma loop (unroll: never)
+		for (unsigned int index = 0u; index < operationCount; index++)
+		{
+			const unsigned int4 first = VuDescriptor[2u + index * 2u];
+			const unsigned int4 second = VuDescriptor[3u + index * 2u];
+			const unsigned int left =
+				first.z == VITASX2_STRUCTURED_FMAC_IMMEDIATE ?
+				first.w : VuScratchWords[base + first.w];
+			const unsigned int right =
+				second.x == VITASX2_STRUCTURED_FMAC_IMMEDIATE ?
+				second.y : VuScratchWords[base + second.y];
+			const unsigned int result =
+				first.x == VITASX2_STRUCTURED_FMAC_MULTIPLY ?
+				VitaVuF32MulBits(left, right) :
+				VitaVuF32AddBits(left, right,
+					first.x == VITASX2_STRUCTURED_FMAC_SUBTRACT);
+			VuScratchWords[base + first.y] = result;
+		}
+	}
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuResult = float4(float(operationCount), float(VuInvocation),
+		valid ? 1.0f : 0.0f, 0.0f);
+}

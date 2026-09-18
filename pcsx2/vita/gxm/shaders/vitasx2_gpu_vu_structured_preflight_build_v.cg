@@ -1,0 +1,173 @@
+// VitaSX2 title-neutral structured-memory preflight row builder.
+// One invocation owns one outer iteration and one disjoint 1024-qword row.
+#pragma readwrite_buffer BUFFER9
+#pragma readwrite_buffer BUFFER10
+
+unsigned int VitaSx2SelectVi(unsigned int4 value, unsigned int reg)
+{
+	const unsigned int lane = reg & 3u;
+	if (lane == 0u) return value.x;
+	if (lane == 1u) return value.y;
+	if (lane == 2u) return value.z;
+	return value.w;
+}
+
+unsigned int4 VitaSx2PreflightMetadata(
+	unsigned int auxiliary[7010], unsigned int vectorIndex)
+{
+	const unsigned int word = 1216u + vectorIndex * 4u;
+	return unsigned int4(auxiliary[word + 0u], auxiliary[word + 1u],
+		auxiliary[word + 2u], auxiliary[word + 3u]);
+}
+
+unsigned int VitaSx2StructuredAddress(
+	unsigned int4 viGroup, unsigned int4 descriptor,
+	unsigned int childIteration)
+{
+	const unsigned int base = descriptor.x == 0u ? 0u :
+		VitaSx2SelectVi(viGroup, descriptor.x);
+	return (base + childIteration * descriptor.y + descriptor.z) & 1023u;
+}
+
+void main(
+	unsigned int aIndex : INDEX,
+	uniform unsigned int VuAuxiliary[7010] : BUFFER9,
+	uniform unsigned int VuOccupancyPlane[65536] : BUFFER10,
+	uniform unsigned int VuOuterState[16] : BUFFER12,
+	uniform unsigned int4 VuOuterViSnapshots[256] : BUFFER13,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuPointSize = 1.0f;
+	VuResult = float4(0.0f);
+	if (aIndex >= 64u) return;
+	const unsigned int VuRow = aIndex * 1024u;
+
+	const unsigned int4 VuMetadata0 =
+		VitaSx2PreflightMetadata(VuAuxiliary, 0u);
+	const unsigned int4 VuMetadata1 =
+		VitaSx2PreflightMetadata(VuAuxiliary, 1u);
+	const unsigned int4 VuMetadata2 =
+		VitaSx2PreflightMetadata(VuAuxiliary, 2u);
+	const unsigned int VuEnabled = VuMetadata0.y;
+	const unsigned int VuAccessCount = VuMetadata0.z;
+	const unsigned int VuLoadCount = VuMetadata0.w;
+	const unsigned int VuStoreCount = VuMetadata1.x;
+	const unsigned int VuCounterReg = VuMetadata1.y;
+	const unsigned int VuLimitReg = VuMetadata1.z;
+	const unsigned int VuCounterStep = VuMetadata1.w;
+	const unsigned int VuOuterMaximum = VuMetadata2.x;
+	const unsigned int VuChildMaximum = VuMetadata2.y;
+	const unsigned int VuOuterCount = VuOuterState[0];
+	const unsigned int VuTransactionGate = VuOuterState[15];
+	const unsigned int VuGeneration = VuOuterState[11];
+	unsigned int VuFailure = VuOuterState[3];
+	unsigned int VuTripCount = 0u;
+	if (VuFailure == 0u && VuTransactionGate != 0u && VuTransactionGate != 1u)
+		VuFailure = 9u;
+	if (VuFailure == 0u && VuTransactionGate == 1u &&
+		(VuMetadata0.x != 1u || VuEnabled > 1u ||
+		 VuGeneration == 0u || VuGeneration > 16777215u ||
+		 VuAccessCount > 64u || VuLoadCount + VuStoreCount != VuAccessCount ||
+		 (VuEnabled != 0u && (VuStoreCount == 0u || VuStoreCount > 8u)) ||
+		 VuCounterReg == 0u || VuCounterReg > 15u || VuLimitReg > 15u ||
+		 (VuCounterStep != 1u && VuCounterStep != 4294967295u) ||
+		 VuOuterMaximum == 0u || VuOuterMaximum > 64u ||
+		 VuChildMaximum == 0u || VuChildMaximum > 1024u ||
+		 VuMetadata2.z != 0u || VuMetadata2.w != 0u ||
+		 (VuEnabled == 0u && (VuAccessCount != 0u || VuLoadCount != 0u ||
+			VuStoreCount != 0u))))
+	{
+		VuFailure = 9u;
+	}
+	if (VuFailure == 0u && VuTransactionGate == 1u &&
+		(VuOuterState[2] == 0u || VuOuterCount == 0u ||
+		 VuOuterCount > VuOuterMaximum))
+	{
+		VuFailure = 8u;
+	}
+	// Gate every descriptor-indexed read on the validated active transaction.
+	// A terminal passthrough deliberately carries gate zero; its metadata is not
+	// semantically consumed and corrupt/uninitialized counts must not create an
+	// unbounded loop or an out-of-range BUFFER9 read.
+	if (VuTransactionGate == 1u)
+	{
+		#pragma loop (unroll: never)
+		for (unsigned int VuDescriptorIndex = 0u;
+			 VuDescriptorIndex < VuAccessCount && VuFailure == 0u;
+			 VuDescriptorIndex++)
+		{
+			const unsigned int4 VuDescriptor =
+				VitaSx2PreflightMetadata(VuAuxiliary, 3u + VuDescriptorIndex);
+			const bool VuExpectedStore = VuDescriptorIndex >= VuLoadCount;
+			if (VuDescriptor.x > 15u || (VuDescriptor.w & 15u) == 0u ||
+				(VuDescriptor.w & 4294967024u) != 0u ||
+				(((VuDescriptor.w & 256u) != 0u) != VuExpectedStore))
+			{
+				VuFailure = 9u;
+			}
+		}
+	}
+	if (VuFailure == 0u && VuTransactionGate == 1u && aIndex < VuOuterCount)
+	{
+		const unsigned int4 VuCounterGroup = VuOuterViSnapshots[
+			aIndex * 4u + (VuCounterReg >> 2u)];
+		const unsigned int VuChildCounter =
+			VitaSx2SelectVi(VuCounterGroup, VuCounterReg);
+		unsigned int VuChildLimit = 0u;
+		if (VuLimitReg != 0u)
+		{
+			const unsigned int4 VuLimitGroup = VuOuterViSnapshots[
+				aIndex * 4u + (VuLimitReg >> 2u)];
+			VuChildLimit = VitaSx2SelectVi(VuLimitGroup, VuLimitReg);
+		}
+		VuTripCount = VuCounterStep == 1u ?
+			((VuChildLimit - VuChildCounter) & 65535u) :
+			((VuChildCounter - VuChildLimit) & 65535u);
+		if (VuTripCount == 0u || VuTripCount > VuChildMaximum)
+			VuFailure = 3u;
+		#pragma loop (unroll: never)
+		for (unsigned int VuChild = 0u;
+			 VuChild < VuTripCount && VuFailure == 0u; VuChild++)
+		{
+			#pragma loop (unroll: never)
+			for (unsigned int VuAccess = 0u;
+				 VuAccess < VuAccessCount && VuFailure == 0u; VuAccess++)
+			{
+				const unsigned int4 VuDescriptor =
+					VitaSx2PreflightMetadata(VuAuxiliary, 3u + VuAccess);
+				const unsigned int4 VuGroup = VuOuterViSnapshots[
+					aIndex * 4u + (VuDescriptor.x >> 2u)];
+				const unsigned int VuAddress = VitaSx2StructuredAddress(
+					VuGroup, VuDescriptor, VuChild);
+				const unsigned int VuLanes = VuDescriptor.w & 15u;
+				const unsigned int VuTaggedOccupancy =
+					VuOccupancyPlane[VuRow + VuAddress];
+				const unsigned int VuOccupancy =
+					(VuTaggedOccupancy >> 8u) == VuGeneration ?
+						VuTaggedOccupancy & 255u : 0u;
+				const bool VuStore = VuAccess >= VuLoadCount;
+				if (VuStore)
+				{
+					if ((VuOccupancy & (VuLanes | (VuLanes << 4u))) != 0u)
+						VuFailure = (VuOccupancy & (VuLanes << 4u)) != 0u ? 6u : 5u;
+					else
+						VuOccupancyPlane[VuRow + VuAddress] =
+							(VuGeneration << 8u) |
+							VuOccupancy | (VuLanes << 4u);
+				}
+				else if ((VuOccupancy & (VuLanes << 4u)) != 0u)
+					VuFailure = 4u;
+				else
+					VuOccupancyPlane[VuRow + VuAddress] =
+						(VuGeneration << 8u) | VuOccupancy | VuLanes;
+			}
+		}
+	}
+	VuAuxiliary[0u + aIndex] = VuFailure;
+	VuAuxiliary[64u + aIndex] = VuTripCount;
+	VuResult = float4(float(aIndex), float(VuFailure),
+		float(VuTripCount), float(VuAccessCount));
+}

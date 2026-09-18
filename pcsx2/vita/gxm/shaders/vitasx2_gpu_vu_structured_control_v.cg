@@ -1,0 +1,299 @@
+// VitaSX2 fixed title-neutral structured VU1 control evaluator.
+// One invocation resolves the bounded parent/child loop and publishes VI
+// snapshots. All dynamically indexed state lives in mapped auxiliary memory;
+// psp2cgc must not create indexable temporary arrays for this job.
+#pragma readwrite_buffer BUFFER9
+#pragma readwrite_buffer BUFFER12
+#pragma readwrite_buffer BUFFER13
+
+unsigned int VitaSx2ControlSelectLane(
+	unsigned int4 value, unsigned int reg)
+{
+	const unsigned int lane = reg & 3u;
+	if (lane == 0u) return value.x;
+	if (lane == 1u) return value.y;
+	if (lane == 2u) return value.z;
+	return value.w;
+}
+
+unsigned int VitaSx2ControlSelectVi(
+	unsigned int4 group0, unsigned int4 group1,
+	unsigned int4 group2, unsigned int4 group3,
+	unsigned int reg)
+{
+	const unsigned int group = (reg & 15u) >> 2u;
+	if (group == 0u) return VitaSx2ControlSelectLane(group0, reg);
+	if (group == 1u) return VitaSx2ControlSelectLane(group1, reg);
+	if (group == 2u) return VitaSx2ControlSelectLane(group2, reg);
+	return VitaSx2ControlSelectLane(group3, reg);
+}
+
+unsigned int4 VitaSx2ControlSetLane(
+	unsigned int4 value, unsigned int reg, unsigned int replacement)
+{
+	const unsigned int lane = reg & 3u;
+	if (lane == 0u) value.x = replacement;
+	else if (lane == 1u) value.y = replacement;
+	else if (lane == 2u) value.z = replacement;
+	else value.w = replacement;
+	return value;
+}
+
+void main(
+	uniform unsigned int VuProgram[32768] : BUFFER0,
+	uniform unsigned int VuPrivateState[112] : BUFFER2,
+	uniform unsigned int VuAuxiliary[7010] : BUFFER9,
+	uniform unsigned int VuOuterState[16] : BUFFER12,
+	uniform unsigned int4 VuOuterViSnapshots[256] : BUFFER13,
+	out float4 VuPosition : POSITION,
+	out float VuPointSize : PSIZE,
+	out float4 VuResult : TEXCOORD0)
+{
+	VuPosition = float4(2.0f, 2.0f, 2.0f, 1.0f);
+	VuPointSize = 1.0f;
+	VuResult = float4(0.0f);
+	const unsigned int VuFormat = VuProgram[0];
+	const unsigned int VuTotalWords = VuProgram[1];
+	const unsigned int VuModuleCount = VuProgram[2];
+	const unsigned int VuModuleOffset = VuProgram[3];
+	const unsigned int VuViOffset = VuProgram[4];
+	const unsigned int VuEntryPc = VuProgram[5];
+	const unsigned int VuMaximumOuter = VuProgram[6];
+	const unsigned int VuMaximumChild = VuProgram[7];
+	const unsigned int VuParentPrefixPairs = VuProgram[8];
+	const unsigned int VuChildPairs = VuProgram[9];
+	const unsigned int VuSuffixPairs = VuProgram[10];
+	const unsigned int VuPairUpperBound = VuProgram[11];
+	const unsigned int VuDemandedViMask = VuProgram[12];
+	const unsigned int VuParentLiveViMask = VuProgram[13];
+	const unsigned int VuOuterCounterReg = VuProgram[14];
+	const unsigned int VuOuterLimitReg = VuProgram[15];
+	const unsigned int VuChildCounterReg = VuProgram[16];
+	const unsigned int VuChildLimitReg = VuProgram[17];
+	const unsigned int VuChildCounterStep = VuProgram[18];
+	const unsigned int VuOuterBranch = VuProgram[19];
+	const bool VuBranchTakenRepeats = VuProgram[20] != 0u;
+	const unsigned int VuOuterCounterStep = VuProgram[21];
+	const unsigned int VuConfiguration = VuProgram[22];
+	const unsigned int VuGeneration = VuOuterState[11];
+	const bool VuTerminalPassthrough =
+		VuPrivateState[59] == 2u && VuPrivateState[2] == 1u;
+	const bool VuActive = !VuTerminalPassthrough;
+	unsigned int VuFailure = 0u;
+	if (VuFormat != 1u || VuTotalWords < 96u || VuTotalWords > 32768u ||
+		VuModuleCount == 0u || VuModuleCount > 34u ||
+		VuModuleOffset != 96u || VuViOffset != 32u ||
+		VuMaximumOuter == 0u || VuMaximumOuter > 64u ||
+		VuMaximumChild == 0u || VuMaximumChild > 1024u ||
+		VuOuterCounterReg == 0u || VuOuterCounterReg > 15u ||
+		VuOuterLimitReg > 15u || VuChildCounterReg == 0u ||
+		VuChildCounterReg > 15u || VuChildLimitReg > 15u ||
+		(VuChildCounterStep != 1u && VuChildCounterStep != 4294967295u) ||
+		VuOuterBranch == 0u || VuOuterBranch > 6u ||
+		VuProgram[20] > 1u || VuGeneration == 0u ||
+		VuGeneration > 16777215u ||
+		(VuConfiguration & 4294950912u) != 0u ||
+		(VuConfiguration & 4080u) != 3088u)
+	{
+		VuFailure = 9u;
+	}
+	else if (VuActive && VuPrivateState[0] != VuEntryPc)
+		VuFailure = 1u;
+	else if (VuActive && (VuPrivateState[59] != 1u ||
+		VuPrivateState[2] != 13u || VuPrivateState[61] == 0u))
+		VuFailure = 2u;
+
+	// Auxiliary layout: initial VI 1536, parent VI 1552, child VI 1568,
+	// and 64 parent snapshots at 1600. BUFFER9 is publish-only within this
+	// invocation. Sony's GXM visibility boundary is the following firmware job;
+	// do not store a dynamically selected VI here and immediately reload it in
+	// this job. Four register-resident groups retain the complete control state
+	// without creating a compiler-indexed temporary array.
+	unsigned int4 VuParent0 = unsigned int4(0u,
+		VuPrivateState[9u] & 65535u, VuPrivateState[10u] & 65535u,
+		VuPrivateState[11u] & 65535u);
+	unsigned int4 VuParent1 = unsigned int4(
+		VuPrivateState[12u] & 65535u, VuPrivateState[13u] & 65535u,
+		VuPrivateState[14u] & 65535u, VuPrivateState[15u] & 65535u);
+	unsigned int4 VuParent2 = unsigned int4(
+		VuPrivateState[16u] & 65535u, VuPrivateState[17u] & 65535u,
+		VuPrivateState[18u] & 65535u, VuPrivateState[19u] & 65535u);
+	unsigned int4 VuParent3 = unsigned int4(
+		VuPrivateState[20u] & 65535u, VuPrivateState[21u] & 65535u,
+		VuPrivateState[22u] & 65535u, VuPrivateState[23u] & 65535u);
+	#pragma loop (unroll: never)
+	for (unsigned int VuReg = 0u; VuReg < 16u; VuReg++)
+	{
+		const unsigned int VuValue = VitaSx2ControlSelectVi(
+			VuParent0, VuParent1, VuParent2, VuParent3, VuReg);
+		VuAuxiliary[1536u + VuReg] = VuValue;
+		VuAuxiliary[1552u + VuReg] = VuValue;
+		VuAuxiliary[1568u + VuReg] = 0u;
+	}
+
+	unsigned int VuOuterExecuted = 0u;
+	unsigned int VuStructuredPairs = 0u;
+	unsigned int VuLastChildTrip = 0u;
+	bool VuOuterCompleted = false;
+	#pragma loop (unroll: never)
+	for (unsigned int VuOuter = 0u;
+		 VuOuter < VuMaximumOuter && VuActive && VuFailure == 0u; VuOuter++)
+	{
+		unsigned int4 VuChild0 = 0u;
+		unsigned int4 VuChild1 = 0u;
+		unsigned int4 VuChild2 = 0u;
+		unsigned int4 VuChild3 = 0u;
+		#pragma loop (unroll: never)
+		for (unsigned int VuReg = 0u; VuReg < 16u; VuReg++)
+		{
+			const unsigned int VuParent = VitaSx2ControlSelectVi(
+				VuParent0, VuParent1, VuParent2, VuParent3, VuReg);
+			VuAuxiliary[1600u + VuOuter * 16u + VuReg] = VuParent;
+			const unsigned int VuMetadata = VuViOffset + VuReg * 4u;
+			const unsigned int VuBase = VuProgram[VuMetadata + 0u];
+			const unsigned int VuOffset = VuProgram[VuMetadata + 1u];
+			const bool VuValid = VuProgram[VuMetadata + 3u] != 0u;
+			const unsigned int VuBaseValue = VuBase == 0u ? 0u :
+				VitaSx2ControlSelectVi(
+					VuParent0, VuParent1, VuParent2, VuParent3, VuBase);
+			const unsigned int VuChild = VuValid ?
+				(VuBaseValue + VuOffset) & 65535u : 0u;
+			VuAuxiliary[1568u + VuReg] = VuChild;
+			if (VuReg < 4u)
+				VuChild0 = VitaSx2ControlSetLane(VuChild0, VuReg, VuChild);
+			else if (VuReg < 8u)
+				VuChild1 = VitaSx2ControlSetLane(VuChild1, VuReg, VuChild);
+			else if (VuReg < 12u)
+				VuChild2 = VitaSx2ControlSetLane(VuChild2, VuReg, VuChild);
+			else
+				VuChild3 = VitaSx2ControlSetLane(VuChild3, VuReg, VuChild);
+		}
+		const unsigned int VuChildCounter =
+			VitaSx2ControlSelectVi(
+				VuChild0, VuChild1, VuChild2, VuChild3, VuChildCounterReg);
+		const unsigned int VuChildLimit = VuChildLimitReg == 0u ? 0u :
+			VitaSx2ControlSelectVi(
+				VuChild0, VuChild1, VuChild2, VuChild3, VuChildLimitReg);
+		const unsigned int VuChildTrip = VuChildCounterStep == 1u ?
+			(VuChildLimit - VuChildCounter) & 65535u :
+			(VuChildCounter - VuChildLimit) & 65535u;
+		if (VuChildTrip == 0u || VuChildTrip > VuMaximumChild)
+		{
+			VuFailure = 3u;
+			break;
+		}
+		VuLastChildTrip = VuChildTrip;
+		VuStructuredPairs += VuParentPrefixPairs + VuChildTrip * VuChildPairs;
+		VuOuterViSnapshots[VuOuter * 4u + 0u] = unsigned int4(
+			(VuDemandedViMask & 1u) != 0u ? VuChild0.x : 0u,
+			(VuDemandedViMask & 2u) != 0u ? VuChild0.y : 0u,
+			(VuDemandedViMask & 4u) != 0u ? VuChild0.z : 0u,
+			(VuDemandedViMask & 8u) != 0u ? VuChild0.w : 0u);
+		VuOuterViSnapshots[VuOuter * 4u + 1u] = unsigned int4(
+			(VuDemandedViMask & 16u) != 0u ? VuChild1.x : 0u,
+			(VuDemandedViMask & 32u) != 0u ? VuChild1.y : 0u,
+			(VuDemandedViMask & 64u) != 0u ? VuChild1.z : 0u,
+			(VuDemandedViMask & 128u) != 0u ? VuChild1.w : 0u);
+		VuOuterViSnapshots[VuOuter * 4u + 2u] = unsigned int4(
+			(VuDemandedViMask & 256u) != 0u ? VuChild2.x : 0u,
+			(VuDemandedViMask & 512u) != 0u ? VuChild2.y : 0u,
+			(VuDemandedViMask & 1024u) != 0u ? VuChild2.z : 0u,
+			(VuDemandedViMask & 2048u) != 0u ? VuChild2.w : 0u);
+		VuOuterViSnapshots[VuOuter * 4u + 3u] = unsigned int4(
+			(VuDemandedViMask & 4096u) != 0u ? VuChild3.x : 0u,
+			(VuDemandedViMask & 8192u) != 0u ? VuChild3.y : 0u,
+			(VuDemandedViMask & 16384u) != 0u ? VuChild3.z : 0u,
+			(VuDemandedViMask & 32768u) != 0u ? VuChild3.w : 0u);
+		unsigned int4 VuNextParent0 = VuParent0;
+		unsigned int4 VuNextParent1 = VuParent1;
+		unsigned int4 VuNextParent2 = VuParent2;
+		unsigned int4 VuNextParent3 = VuParent3;
+		#pragma loop (unroll: never)
+		for (unsigned int VuReg = 1u; VuReg < 16u; VuReg++)
+		{
+			unsigned int VuValue = VitaSx2ControlSelectVi(
+				VuParent0, VuParent1, VuParent2, VuParent3, VuReg);
+			if ((VuParentLiveViMask & (1u << VuReg)) != 0u &&
+				VuReg != VuOuterCounterReg && VuReg != VuOuterLimitReg)
+			{
+				const unsigned int VuMetadata = VuViOffset + VuReg * 4u;
+				VuValue = (VitaSx2ControlSelectVi(
+					VuChild0, VuChild1, VuChild2, VuChild3, VuReg) +
+					VuChildTrip * VuProgram[VuMetadata + 2u]) & 65535u;
+			}
+			if (VuReg == VuOuterCounterReg)
+				VuValue = (VuValue + VuOuterCounterStep) & 65535u;
+			if (VuReg < 4u)
+				VuNextParent0 = VitaSx2ControlSetLane(
+					VuNextParent0, VuReg, VuValue);
+			else if (VuReg < 8u)
+				VuNextParent1 = VitaSx2ControlSetLane(
+					VuNextParent1, VuReg, VuValue);
+			else if (VuReg < 12u)
+				VuNextParent2 = VitaSx2ControlSetLane(
+					VuNextParent2, VuReg, VuValue);
+			else
+				VuNextParent3 = VitaSx2ControlSetLane(
+					VuNextParent3, VuReg, VuValue);
+		}
+		VuParent0 = VuNextParent0;
+		VuParent1 = VuNextParent1;
+		VuParent2 = VuNextParent2;
+		VuParent3 = VuNextParent3;
+		#pragma loop (unroll: never)
+		for (unsigned int VuReg = 0u; VuReg < 16u; VuReg++)
+			VuAuxiliary[1552u + VuReg] = VitaSx2ControlSelectVi(
+				VuParent0, VuParent1, VuParent2, VuParent3, VuReg);
+		const unsigned int VuCounter =
+			VitaSx2ControlSelectVi(
+				VuParent0, VuParent1, VuParent2, VuParent3, VuOuterCounterReg);
+		const unsigned int VuLimit = VuOuterLimitReg == 0u ? 0u :
+			VitaSx2ControlSelectVi(
+				VuParent0, VuParent1, VuParent2, VuParent3, VuOuterLimitReg);
+		const bool VuBranchTaken = VuOuterBranch == 1u ? VuCounter == VuLimit :
+			VuOuterBranch == 2u ? VuCounter != VuLimit :
+			VuOuterBranch == 3u ? int(short(VuCounter)) < 0 :
+			VuOuterBranch == 4u ? int(short(VuCounter)) > 0 :
+			VuOuterBranch == 5u ? int(short(VuCounter)) <= 0 :
+			int(short(VuCounter)) >= 0;
+		const bool VuRepeat = VuBranchTakenRepeats ?
+			VuBranchTaken : !VuBranchTaken;
+		VuOuterExecuted = VuOuter + 1u;
+		if (!VuRepeat)
+		{
+			VuOuterCompleted = true;
+			break;
+		}
+		VuStructuredPairs += VuSuffixPairs;
+	}
+	if (VuActive && VuFailure == 0u && !VuOuterCompleted) VuFailure = 8u;
+	if (VuActive && VuFailure == 0u &&
+		(VuStructuredPairs > VuPairUpperBound ||
+		 VuStructuredPairs >= VuPrivateState[61])) VuFailure = 7u;
+
+	// Keep corrupt descriptors fail-closed. VuOuterCounterReg participates in a
+	// mapped-buffer index, so do not evaluate that read after validation has
+	// rejected an out-of-range register number.
+	const unsigned int VuFinalOuterCounter =
+		VuOuterCounterReg <= 15u ? VitaSx2ControlSelectVi(
+			VuParent0, VuParent1, VuParent2, VuParent3,
+			VuOuterCounterReg) : 0u;
+	VuOuterState[0] = VuOuterExecuted;
+	VuOuterState[1] = VuFinalOuterCounter;
+	VuOuterState[2] = VuOuterCompleted ? 1u : 0u;
+	VuOuterState[3] = VuFailure;
+	VuOuterState[4] = VuStructuredPairs;
+	VuOuterState[5] = VuFailure;
+	VuOuterState[6] = VuPrivateState[61];
+	VuOuterState[7] = VuPrivateState[59];
+	VuOuterState[8] = VuPrivateState[27];
+	VuOuterState[9] = VuPrivateState[46];
+	VuOuterState[10] = VuLastChildTrip;
+	VuOuterState[11] = VuGeneration;
+	VuOuterState[12] = 0u;
+	VuOuterState[13] = 0u;
+	VuOuterState[14] = 0u;
+	VuOuterState[15] = VuActive ? 1u : 0u;
+	VuResult = float4(float(VuOuterExecuted), float(VuFailure),
+		float(VuStructuredPairs), float(VuGeneration));
+}
