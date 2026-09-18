@@ -1,0 +1,8 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 Vulkan tfx.glsl::atst/main: PS_ATST_NONE always passes and omits
+// discard. Keep fog and fixed coverage alpha; they are independent of ATST.
+#define VITASX2_TFX_FAST 1
+#define VITASX2_TFX_NO_ALPHA_TEST 1
+#include "vitasx2_tfx_f.cg"

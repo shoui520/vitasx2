@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <utility>
 #include <limits>
+#include <array>
 
 class GSHwHack;
 
@@ -439,6 +440,34 @@ protected:
 	HashCacheMap m_hash_cache;
 	u64 m_hash_cache_memory_usage = 0;
 	u64 m_hash_cache_replacement_memory_usage = 0;
+
+#if defined(__vita__)
+	static constexpr size_t VITA_HASH_KEY_MEMO_SIZE = 64;
+	static constexpr size_t VITA_HASH_KEY_MEMO_LEVELS = 7;
+	struct VitaHashKeyMemoEntry
+	{
+		bool valid = false;
+		u8 level_count = 0;
+		bool has_clut = false;
+		u8 reserved = 0;
+		u64 texa = 0;
+		u64 region = 0;
+		u64 clut_hash = 0;
+		std::array<u64, VITA_HASH_KEY_MEMO_LEVELS> level_tex0 = {};
+		std::array<u32, GS_MAX_PAGES> page_generations = {};
+		HashCacheKey key;
+	};
+	std::array<VitaHashKeyMemoEntry, VITA_HASH_KEY_MEMO_SIZE> m_vita_hash_key_memo = {};
+	std::array<u32, GS_MAX_PAGES> m_vita_gs_page_generations = {};
+	u32 m_vita_next_page_generation = 1;
+
+	void InvalidateVitaHashKeyMemo();
+	void InvalidateVitaHashKeyMemoPages(const GSOffset& off,
+		const GSVector4i& rect);
+	HashCacheKey CreateVitaMemoizedHashCacheKey(const GIFRegTEX0& TEX0,
+		const GIFRegTEXA& TEXA, const u32* clut, const GSVector2i* lod,
+		SourceRegion region);
+#endif
 
 	FastList<Target*> m_dst[2];
 	FastList<TargetHeightElem> m_target_heights;

@@ -501,15 +501,16 @@ namespace VitaGXM
 			if (result < 0)
 				return result;
 
-			// The official renderbuffer sample passes the logical surface width as
-			// the stride; GXM derives the whole-tile footprint internally.
+			// GPU User's Guide: tiled surfaces and texture views use whole 32x32
+			// tiles. The scanline stride must describe that allocated tile row,
+			// not the logical clip width (the sample's aligned widths hide this).
 			result = sceGxmColorSurfaceInit(&m_color_surface,
 				m_native_format.color_format, SCE_GXM_COLOR_SURFACE_TILED,
 				SCE_GXM_COLOR_SURFACE_SCALE_NONE,
 				m_native_format.output_register_size,
 				static_cast<std::uint32_t>(m_size.x),
 				static_cast<std::uint32_t>(m_size.y),
-				static_cast<std::uint32_t>(m_size.x), m_storage.Data());
+				static_cast<std::uint32_t>(storage_width), m_storage.Data());
 			if (result < 0)
 				return result;
 			m_has_color_surface = true;
@@ -705,7 +706,29 @@ namespace VitaGXM
 
 	void* GSTextureGXM::GetNativeHandle() const
 	{
-		return const_cast<SceGxmTexture*>(&m_texture);
+		return const_cast<SceGxmTexture*>(&Texture());
+	}
+
+	bool GSTextureGXM::SetLinearSamplingOverride(void* data,
+		std::uint32_t width, std::uint32_t height, std::uint32_t pitch)
+	{
+		if (!data || width == 0 || height == 0)
+			return false;
+		int result = sceGxmTextureInitLinearStrided(&m_sampling_texture, data,
+			m_native_format.texture_format, width, height, pitch);
+		if (result >= 0)
+			result = sceGxmTextureSetUAddrMode(&m_sampling_texture,
+				SCE_GXM_TEXTURE_ADDR_CLAMP);
+		if (result >= 0)
+			result = sceGxmTextureSetVAddrMode(&m_sampling_texture,
+				SCE_GXM_TEXTURE_ADDR_CLAMP);
+		if (result >= 0)
+			result = sceGxmTextureSetMagFilter(&m_sampling_texture,
+				SCE_GXM_TEXTURE_FILTER_POINT);
+		if (result >= 0)
+			result = sceGxmTextureValidate(&m_sampling_texture);
+		m_has_sampling_override = result >= 0;
+		return m_has_sampling_override;
 	}
 
 	bool GSTextureGXM::Update(const GSVector4i& rect, const void* data, int pitch,
@@ -946,6 +969,8 @@ namespace VitaGXM
 		if (source_pitch < row_bytes)
 			return false;
 
+		// A raw DF32M copy includes M in bit 31, unlike a GPU depth write.
+		InvalidateDepthMaskScissor();
 		const auto* input = static_cast<const std::uint8_t*>(source);
 		auto* output = static_cast<std::uint8_t*>(LevelData(level));
 		if (!layout->tiled)

@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+#define VITASX2_TFX_GS_BLEND 1
+#define VITASX2_TFX_NO_DATE 1
+#define VITASX2_TFX_FAST 1
+#define VITASX2_TFX_ZFLOOR 1
+#include "vitasx2_tfx_f.cg"

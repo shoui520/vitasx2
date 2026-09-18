@@ -9,6 +9,7 @@
 namespace VitaGpuVu
 {
 	class GpuVuDraw;
+	class UniversalGpuVuEpoch;
 }
 
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
@@ -31,6 +32,7 @@ public:
 	void ConsumeGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
 	void ConsumeGpuVuDraws(
 		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws);
+	void ServiceUniversalGpuVuEpoch(VitaGpuVu::UniversalGpuVuEpoch* epoch);
 
 	void Reset(bool hardware_reset) override;
 	void Draw() override;
@@ -64,6 +66,7 @@ public:
 	void ConsumeGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
 	void ConsumeGpuVuDraws(
 		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws);
+	void ServiceUniversalGpuVuEpoch(VitaGpuVu::UniversalGpuVuEpoch* epoch);
 	void Reset(bool hardware_reset) override;
 	void VSync(u32 field, bool registers_written, bool idle_frame) override;
 };
@@ -85,10 +88,19 @@ public:
 	void ConsumeGpuVuDraw(std::unique_ptr<VitaGpuVu::GpuVuDraw> draw);
 	void ConsumeGpuVuDraws(
 		std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws);
+	void ServiceUniversalGpuVuEpoch(VitaGpuVu::UniversalGpuVuEpoch* epoch);
 	void SubmitDrawConfig(GSHWDrawConfig& config) override;
 
 private:
 	std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> m_gpu_vu_draws;
+	// A consecutive GPU-VU run has already proven its GIF/GS contract before
+	// reaching this owner. Derive PCSX2's hardware state once from the first
+	// proxy packet, then reuse that immutable config for later generated-program
+	// groups in the same run. The GXM device still validates every descriptor,
+	// binds every program/input group, and records every target write.
+	GSHWDrawConfig m_gpu_vu_derived_config = {};
+	bool m_gpu_vu_derived_config_valid = false;
+	bool m_gpu_vu_derived_submit_succeeded = false;
 };
 
 #endif

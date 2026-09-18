@@ -46,6 +46,19 @@ namespace VitaGXM
 		bool depth_stencil = false;
 	};
 
+	struct GuestRenderTargetIdentity
+	{
+		std::uint32_t base_block = 0;
+		std::uint32_t buffer_width = 0;
+		std::uint32_t psm = 0;
+		std::uint32_t width = 0;
+		std::uint32_t height = 0;
+		std::uint32_t scale_bits = 0;
+		bool depth = false;
+
+		bool operator==(const GuestRenderTargetIdentity& other) const = default;
+	};
+
 	enum class TextureWriterKind : std::uint8_t
 	{
 		None = 0,
@@ -184,8 +197,17 @@ namespace VitaGXM
 #endif
 
 		const TextureFormatInfo& NativeFormat() const { return m_native_format; }
-		const SceGxmTexture& Texture() const { return m_texture; }
-		SceGxmTexture& Texture() { return m_texture; }
+		const SceGxmTexture& Texture() const
+		{
+			return m_has_sampling_override ? m_sampling_texture : m_texture;
+		}
+		SceGxmTexture& Texture()
+		{
+			return m_has_sampling_override ? m_sampling_texture : m_texture;
+		}
+		bool SetLinearSamplingOverride(void* data, std::uint32_t width,
+			std::uint32_t height, std::uint32_t pitch);
+		void ClearSamplingOverride() { m_has_sampling_override = false; }
 		const SceGxmColorSurface* ColorSurface() const;
 		SceGxmColorSurface* ColorSurface();
 		const SceGxmDepthStencilSurface* DepthStencilSurface() const;
@@ -202,6 +224,25 @@ namespace VitaGXM
 		std::uint32_t StencilPitch() const { return m_stencil_pitch; }
 		std::size_t StorageSize() const { return m_storage.Size(); }
 		std::size_t StencilStorageSize() const { return m_stencil_storage.Size(); }
+		void SetGuestRenderTargetIdentity(const GuestRenderTargetIdentity& identity)
+		{
+			m_guest_target = identity;
+			m_has_guest_target = true;
+		}
+		bool HasGuestRenderTargetIdentity() const { return m_has_guest_target; }
+		const GuestRenderTargetIdentity& GuestTargetIdentity() const
+		{
+			return m_guest_target;
+		}
+
+		// DF32M_S8's mask plane is loaded/stored with this texture, not with a
+		// color attachment or render-target geometry. Empty means unknown.
+		bool HasDepthMaskScissor(const GSVector4i& rect) const
+		{
+			return m_has_depth_surface && m_depth_mask_scissor.eq(rect);
+		}
+		void SetDepthMaskScissor(const GSVector4i& rect) { m_depth_mask_scissor = rect; }
+		void InvalidateDepthMaskScissor() { m_depth_mask_scissor = {}; }
 
 		void MarkSceneUse(std::uint64_t serial);
 		void MarkTransferUse(std::uint64_t serial);
@@ -240,6 +281,7 @@ namespace VitaGXM
 		TextureOwner* m_owner = nullptr;
 		TextureFormatInfo m_native_format{};
 		SceGxmTexture m_texture{};
+		SceGxmTexture m_sampling_texture{};
 		SceGxmColorSurface m_color_surface{};
 		SceGxmDepthStencilSurface m_depth_surface{};
 		ArenaAllocation m_storage;
@@ -248,11 +290,15 @@ namespace VitaGXM
 		PendingMap m_pending_map;
 		TextureCompletionFence m_fence{};
 		TextureWriterTelemetry m_writer_telemetry{};
+		GSVector4i m_depth_mask_scissor{};
 		std::uint32_t m_telemetry_id = 0;
 		std::uint32_t m_depth_pitch = 0;
 		std::uint32_t m_stencil_pitch = 0;
+		GuestRenderTargetIdentity m_guest_target{};
 		bool m_has_color_surface = false;
 		bool m_has_depth_surface = false;
+		bool m_has_guest_target = false;
+		bool m_has_sampling_override = false;
 		bool m_operation_failed = false;
 	};
 

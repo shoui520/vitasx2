@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
-// PCSX2 owner: bin/resources/shaders/opengl/tfx_fs.glsl. GXM has no runtime
-// compiler, so selector fields are branch-uniform inputs to one offline GXP.
-// The backend can split hot selector families into specialized GXPs without
-// changing this PS2-visible arithmetic.
+// PCSX2 owner: bin/resources/shaders/opengl/tfx_fs.glsl. This shared source
+// still carries uniform selectors for the legacy lowering and the native GS
+// migration kernels. Their capability families are compiled offline; neither
+// libGXM nor this path performs per-draw compilation. See TODO.md for the
+// remaining semantic source/sampling specialization, not a hardware limit.
 
 float4 SelectGsColor(float selector, float4 source, float4 destination)
 {
@@ -135,7 +136,7 @@ float4 SampleTextureLevel(uniform sampler2D textureSampler, float2 coordinate,
 
 float4 SampleOne(uniform sampler2D textureSampler, float2 coordinate,
 	float regionRect, float2 wrapMode, float4 textureSize,
-	float4 stRange, float4 nativeTextureSize, float2 stScale,
+	float4 stRange, float4 nativeTextureSize, float4 stScale,
 	float aem, float aemFormat, float4 textureAlpha, float lod,
 	float fst, float4 regionMaskFix)
 {
@@ -145,8 +146,18 @@ float4 SampleOne(uniform sampler2D textureSampler, float2 coordinate,
 		coordinate = ApplyRegionRepeat(coordinate, wrapMode, fst,
 			textureSize.xy, regionMaskFix);
 #endif
+		// PCSX2 tfx_fs.glsl::sample_c. GSRendererHW uses ADJS/ADJT when a
+		// texture-cache source is a sub-region of the host texture. STScale.zw
+		// carry those two selector bits because GXM has no runtime shader
+		// specialization; the arithmetic and STRange meanings remain identical.
+		coordinate.x = stScale.z > 0.5f ?
+			(coordinate.x - stRange.x) * stRange.z :
+			coordinate.x * stScale.x;
+		coordinate.y = stScale.w > 0.5f ?
+			(coordinate.y - stRange.y) * stRange.w :
+			coordinate.y * stScale.y;
 		return ApplyTextureAem(SampleTextureLevel(textureSampler,
-			coordinate * stScale, lod),
+			coordinate, lod),
 			aem, aemFormat, textureAlpha);
 	}
 
@@ -167,7 +178,7 @@ float4 SampleOne(uniform sampler2D textureSampler, float2 coordinate,
 float4 SampleTexture(uniform sampler2D textureSampler, float2 st,
 	float manualLinear, float4 halfTexel, float4 textureSize,
 	float regionRect, float2 wrapMode, float4 stRange,
-	float4 nativeTextureSize, float2 stScale, float aem,
+	float4 nativeTextureSize, float4 stScale, float aem,
 	float aemFormat, float4 textureAlpha, float lod, float fst,
 	float4 regionMaskFix)
 {
@@ -318,7 +329,7 @@ __nativecolor __regformat unsigned char4 main(
 #else
 		float4 sampled = SampleTexture(sourceTexture, st, Selector2.z,
 			HalfTexel, TextureSize, Selector6.x, Selector6.yz,
-			STRange, NativeTextureSize, STScale.xy, Selector2.x,
+			STRange, NativeTextureSize, STScale, Selector2.x,
 			Selector2.y, TextureAlpha, sampleLod,
 #if defined(VITASX2_TFX_UV_NO_FOG)
 			1.0f,
@@ -331,13 +342,14 @@ __nativecolor __regformat unsigned char4 main(
 			float4(0.0f));
 #endif
 #endif
-#if defined(VITASX2_TFX_NO_RTA_SOURCE_CORRECTION)
-#elif defined(VITASX2_TFX_DIRECT_TEXTURE)
+#if !defined(VITASX2_TFX_NO_RTA_SOURCE_CORRECTION)
+#if defined(VITASX2_TFX_DIRECT_TEXTURE)
 		if (Selector2.w > 0.5f)
 #else
 		if (Selector2.y < 0.5f && Selector2.w > 0.5f)
 #endif
 			sampled.a *= 128.5f / 255.0f;
+#endif
 		textureColor = trunc(sampled * 255.0f + 0.05f);
 	}
 
@@ -393,6 +405,7 @@ __nativecolor __regformat unsigned char4 main(
 	if (Selector6.w > 0.5f)
 		color.a = 128.0f;
 
+#if !defined(VITASX2_TFX_NO_ALPHA_TEST)
 	const float atst = Selector1.y;
 	bool alphaPass = true;
 	if (atst > 0.5f && atst < 1.5f) alphaPass = color.a <= FogColorAref.a;
@@ -401,6 +414,7 @@ __nativecolor __regformat unsigned char4 main(
 	else if (atst > 3.5f) alphaPass = abs(color.a - FogColorAref.a) >= 0.5f;
 	if (!alphaPass)
 		discard;
+#endif
 #endif
 
 #if defined(VITASX2_TFX_FAST) || \
@@ -438,7 +452,29 @@ __nativecolor __regformat unsigned char4 main(
 #endif
 #endif
 
-#if defined(VITASX2_TFX_SOURCE_ONLY)
+#if defined(VITASX2_TFX_GS_BLEND)
+	// Original GS equation, with no intermediate host blend operation. The GS
+	// signed multiplier truncates low bits before adding D (manual 3.8).
+	// As was saved before FBA above. PSMCT24 destination alpha is always 128.
+#if defined(VITASX2_TFX_GS_BLEND_CS_AD_CD)
+	// Canonical (Cs - 0) * Ad + Cd kernel. GSDeviceGXM proves the complete
+	// source/sampling/test/write tuple before selecting this offline program.
+	// Keeping this equation structural lets psp2cgc remove four blend selectors
+	// and every impossible source/destination choice from the SGX pixel loop.
+	color.rgb = floor(color.rgb * (destination.a / 128.0f)) + destination.rgb;
+#else
+	if (!(Selector4.x > 0.5f && secondary.a < 1.0f))
+	{
+		const float4 A = SelectGsColor(Selector3.x, color, destination);
+		const float4 B = SelectGsColor(Selector3.y, color, destination);
+		const float4 D = SelectGsColor(Selector3.w, color, destination);
+		const float coefficient = Selector3.z < 0.5f ? secondary.a :
+			(Selector3.z < 1.5f ?
+				(Selector1.w > 0.5f ? 1.0f : destination.a / 128.0f) : TextureAlpha.w);
+		color.rgb = floor((A.rgb - B.rgb) * coefficient) + D.rgb;
+	}
+#endif
+#elif defined(VITASX2_TFX_SOURCE_ONLY)
 	// CanUseSourceOnlyTfx() mirrors PCSX2's SW_BLEND_NEEDS_RT proof. A/B/D
 	// therefore select only Cs or zero, C selects only As or FIX, PABE is off,
 	// and software blending is known active. Keeping the impossible Cd/Ad/PABE
@@ -549,7 +585,19 @@ __nativecolor __regformat unsigned char4 main(
 		color.rgb += 7.0f;
 #endif
 
-#if defined(VITASX2_TFX_NO_COLCLIP)
+#if defined(VITASX2_TFX_GS_BLEND)
+	// GS COLCLAMP=0 retains the low byte of a signed intermediate. A direct
+	// float-to-unsigned conversion does not define that operation for negative
+	// inputs on PSP2. Reduce by an exact power of two before native conversion.
+#if defined(VITASX2_TFX_GS_CLAMP)
+	color.rgb = clamp(color.rgb, 0.0f, 255.0f);
+#else
+	if (Selector4.z > 0.5f)
+		color.rgb -= floor(color.rgb * (1.0f / 256.0f)) * 256.0f;
+	else
+		color.rgb = clamp(color.rgb, 0.0f, 255.0f);
+#endif
+#elif defined(VITASX2_TFX_NO_COLCLIP)
 	color.rgb = saturate(color.rgb / 255.0f) * 255.0f;
 #else
 	if (Selector4.z > 0.5f)
@@ -597,13 +645,18 @@ __nativecolor __regformat unsigned char4 main(
 #elif defined(VITASX2_TFX_FAST) || defined(VITASX2_TFX_SOURCE_ONLY)
 	float4 result = float4(color.rgb, outputAlpha);
 #else
+#if defined(VITASX2_TFX_GS_BLEND)
+	float4 result = float4(color.rgb, outputAlpha);
+#else
 	float4 source = float4(color.rgb, outputAlpha) / 255.0f;
 	float4 result = ApplyHardwareBlend(source, destination / 255.0f,
 		secondary, HardwareBlend0, HardwareBlend1) * 255.0f;
 	result = saturate(result / 255.0f) * 255.0f;
+#endif
 
 	// PCSX2's component write mask and exact per-bit GS FBMASK both preserve
 	// the ordered tile-local destination supplied through FRAGCOLOR.
+#if !defined(VITASX2_TFX_FULL_COLOR_WRITE)
 	result = lerp(destination, result, ColorMask);
 	if (Selector4.w > 0.5f)
 	{
@@ -614,6 +667,7 @@ __nativecolor __regformat unsigned char4 main(
 	}
 	if (Selector5.y > 0.5f)
 		result = destination;
+#endif
 #endif
 #if defined(VITASX2_TFX_SOURCE_ONLY) && \
 	!defined(VITASX2_TFX_PROGRAMMABLE_BLEND)

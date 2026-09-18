@@ -14,6 +14,11 @@
 #include "common/BitUtils.h"
 #include "common/HashCombine.h"
 #include "common/SmallString.h"
+#if defined(__vita__)
+#include "common/Timer.h"
+#include "vita/GSDeviceGXM.h"
+#include "vita/VitaPerformanceTelemetry.h"
+#endif
 
 #include "fmt/format.h"
 
@@ -27,6 +32,35 @@
 #endif
 
 std::unique_ptr<GSTextureCache> g_texture_cache;
+
+#if defined(__vita__)
+namespace
+{
+	class ScopedRendererStage final
+	{
+	public:
+		explicit ScopedRendererStage(VitaGxmRendererStage stage)
+			: m_stage(stage), m_enabled(VitaPerformanceTelemetry::IsEnabled()),
+			  m_started(m_enabled ? Common::Timer::GetCurrentValue() : 0)
+		{
+		}
+
+		~ScopedRendererStage()
+		{
+			if (!m_enabled)
+				return;
+			const u64 elapsed_us = static_cast<u64>(Common::Timer::ConvertValueToSeconds(
+				Common::Timer::GetCurrentValue() - m_started) * 1000000.0);
+			VitaGxmRecordRendererStageTime(m_stage, elapsed_us);
+		}
+
+	private:
+		VitaGxmRendererStage m_stage;
+		bool m_enabled;
+		Common::Timer::Value m_started;
+	};
+}
+#endif
 
 static u8* s_unswizzle_buffer;
 #if defined(__vita__)
@@ -155,6 +189,9 @@ void GSTextureCache::RemoveAll(bool sources, bool targets, bool hash_cache)
 		m_hash_cache.clear();
 		m_hash_cache_memory_usage = 0;
 		m_hash_cache_replacement_memory_usage = 0;
+#if defined(__vita__)
+		InvalidateVitaHashKeyMemo();
+#endif
 	}
 }
 
@@ -1107,6 +1144,9 @@ __ri static GSTextureCache::Source* FindSourceInMap(const GIFRegTEX0& TEX0, cons
 	const GSLocalMemory::psm_t& psm_s, const u32* clut, const GSTexture* gpu_clut, const GSVector2i& compare_lod,
 	const GSTextureCache::SourceRegion& region, u32 fixed_tex0, FastList<GSTextureCache::Source*>& map, const GIFRegCLAMP& CLAMP, GSVector4i read_area)
 {
+#if defined(__vita__)
+	const ScopedRendererStage vita_stage(VitaGxmRendererStage::SourceMapFind);
+#endif
 	GSTextureCache::Source* best_s = nullptr;
 
 	for (auto i = map.begin(); i != map.end(); ++i)
@@ -1177,6 +1217,9 @@ __ri static GSTextureCache::Source* FindSourceInMap(const GIFRegTEX0& TEX0, cons
 
 GSTextureCache::Source* GSTextureCache::LookupDepthSource(const bool is_depth, const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const GIFRegCLAMP& CLAMP, const GSVector4i& r, const bool possible_shuffle, const bool linear, const GIFRegFRAME& frame, bool req_color, bool req_alpha, bool palette)
 {
+#if defined(__vita__)
+	const ScopedRendererStage vita_stage(VitaGxmRendererStage::TextureDepthSourceLookup);
+#endif
 	if (GSConfig.UserHacks_DisableDepthSupport)
 	{
 		GL_CACHE("TC: LookupDepthSource not supported (0x%x, F:0x%x)", TEX0.TBP0, TEX0.PSM);
@@ -1369,6 +1412,9 @@ GSTextureCache::Source* GSTextureCache::LookupDepthSource(const bool is_depth, c
 
 GSTextureCache::Source* GSTextureCache::LookupSource(const bool is_color, const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const GIFRegCLAMP& CLAMP, const GSVector4i& r, const GSVector2i* lod, const bool possible_shuffle, const bool linear, const GIFRegFRAME& frame, bool req_color, bool req_alpha)
 {
+#if defined(__vita__)
+	const ScopedRendererStage vita_stage(VitaGxmRendererStage::TextureSourceLookup);
+#endif
 	GL_CACHE("TC: Lookup Source <%d,%d => %d,%d> (0x%x, %s, BW: %u, CBP: 0x%x, TW: %d, TH: %d)", r.x, r.y, r.z, r.w, TEX0.TBP0, GSUtil::GetPSMName(TEX0.PSM), TEX0.TBW, TEX0.CBP, 1 << TEX0.TW, 1 << TEX0.TH);
 
 	const GSLocalMemory::psm_t& psm_s = GSLocalMemory::m_psm[TEX0.PSM];
@@ -2483,6 +2529,9 @@ GSTextureCache::Target* GSTextureCache::LookupDrawTarget(GIFRegTEX0 TEX0, const 
 	bool used, u32 fbmask, bool preload, bool preserve_rgb, bool preserve_alpha, const GSVector4i draw_rect,
 	bool is_shuffle, bool possible_clear, bool preserve_scale, GSTextureCache::Source* src, GSTextureCache::Target* ds, int offset)
 {
+#if defined(__vita__)
+	const ScopedRendererStage vita_stage(VitaGxmRendererStage::TextureTargetLookup);
+#endif
 	const GSLocalMemory::psm_t& psm_s = GSLocalMemory::m_psm[TEX0.PSM];
 	const u32 bp = TEX0.TBP0;
 	
@@ -3325,6 +3374,9 @@ GSTextureCache::Target* GSTextureCache::ProcessTargetAfterLookup(RescaleHelper& 
 GSTextureCache::Target* GSTextureCache::CreateTarget(GIFRegTEX0 TEX0, const GSVector2i& size, const GSVector2i& valid_size, float scale, int type,
 	bool used, u32 fbmask, bool is_frame, bool preload, bool preserve_target, const GSVector4i draw_rect, GSTextureCache::Source* src)
 {
+#if defined(__vita__)
+	const ScopedRendererStage vita_stage(VitaGxmRendererStage::TextureTargetCreate);
+#endif
 	if (type == DepthStencil)
 	{
 		GL_CACHE("TC: Lookup Target(Depth) %dx%d, miss (0x%x, TBW %d, %s) draw %lld", size.x, size.y, TEX0.TBP0,
@@ -4711,6 +4763,10 @@ void GSTextureCache::InvalidateVideoMemType(int type, u32 bp, u32 write_psm, u32
 // Called each time you want to write to the GS memory
 void GSTextureCache::InvalidateVideoMem(const GSOffset& off, const GSVector4i& rect, bool target)
 {
+#if defined(__vita__)
+	if (target)
+		InvalidateVitaHashKeyMemoPages(off, rect);
+#endif
 	const u32 bp = off.bp();
 	const u32 bw = off.bw();
 	const u32 psm = off.psm();
@@ -6073,6 +6129,9 @@ void GSTextureCache::IncAge()
 //Fixme: Several issues in here. Not handling depth stencil, pitch conversion doesnt work.
 GSTextureCache::Source* GSTextureCache::CreateSource(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const GIFRegCLAMP& CLAMP, Target* dst, int x_offset, int y_offset, const GSVector2i* lod, const GSVector4i* src_range, GSTexture* gpu_clut, SourceRegion region, bool force_temp)
 {
+#if defined(__vita__)
+	const ScopedRendererStage vita_stage(VitaGxmRendererStage::SourceCreate);
+#endif
 	const GSLocalMemory::psm_t& psm = GSLocalMemory::m_psm[TEX0.PSM];
 	Source* src = new Source(TEX0, TEXA);
 
@@ -7001,8 +7060,117 @@ GSTextureCache::Source* GSTextureCache::CreateMergedSource(GIFRegTEX0 TEX0, GIFR
 // This really needs a better home...
 extern bool FMVstarted;
 
+#if defined(__vita__)
+void GSTextureCache::InvalidateVitaHashKeyMemo()
+{
+	m_vita_gs_page_generations.fill(0);
+	m_vita_next_page_generation = 1;
+	for (VitaHashKeyMemoEntry& entry : m_vita_hash_key_memo)
+		entry.valid = false;
+}
+
+void GSTextureCache::InvalidateVitaHashKeyMemoPages(const GSOffset& off,
+	const GSVector4i& rect)
+{
+	u32 generation = m_vita_next_page_generation++;
+	if (generation == 0)
+	{
+		InvalidateVitaHashKeyMemo();
+		generation = m_vita_next_page_generation++;
+	}
+	off.loopPages(rect, [this, generation](u32 page) {
+		m_vita_gs_page_generations[page] = generation;
+	});
+}
+
+GSTextureCache::HashCacheKey GSTextureCache::CreateVitaMemoizedHashCacheKey(
+	const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const u32* clut,
+	const GSVector2i* lod, SourceRegion region)
+{
+	std::array<u64, VITA_HASH_KEY_MEMO_LEVELS> level_tex0 = {};
+	level_tex0[0] = TEX0.U64;
+	u8 level_count = 1;
+	if (lod)
+	{
+		const int nmips = lod->y - lod->x + 1;
+		if (nmips <= 0 || nmips > static_cast<int>(VITA_HASH_KEY_MEMO_LEVELS))
+		{
+			VitaGxmRecordRendererStageTime(VitaGxmRendererStage::SourceHashMemoMiss, 0);
+			return HashCacheKey::Create(TEX0, TEXA, clut, lod, region);
+		}
+		level_count = static_cast<u8>(nmips);
+		for (int i = 1; i < nmips; i++)
+			level_tex0[i] = g_gs_renderer->GetTex0Layer(lod->x + i).U64;
+	}
+
+	const GSLocalMemory::psm_t& psm = GSLocalMemory::m_psm[TEX0.PSM];
+	const bool has_clut = clut != nullptr;
+	const u64 clut_hash = has_clut ? PaletteKeyHash{}({clut, psm.pal}) : 0;
+	std::size_t identity_hash = 0;
+	HashCombine(identity_hash, TEXA.U64, region.bits, clut_hash,
+		static_cast<u64>(has_clut), static_cast<u64>(level_count));
+	for (u8 i = 0; i < level_count; i++)
+		HashCombine(identity_hash, level_tex0[i]);
+
+	VitaHashKeyMemoEntry& entry =
+		m_vita_hash_key_memo[identity_hash & (VITA_HASH_KEY_MEMO_SIZE - 1)];
+	bool matches = entry.valid && entry.level_count == level_count &&
+		entry.has_clut == has_clut && entry.texa == TEXA.U64 &&
+		entry.region == region.bits && entry.clut_hash == clut_hash;
+	for (u8 i = 0; matches && i < level_count; i++)
+		matches = entry.level_tex0[i] == level_tex0[i];
+	for (u8 i = 0; matches && i < level_count; i++)
+	{
+		const GIFRegTEX0 level{level_tex0[i]};
+		const SourceRegion level_region = i == 0 ? region : region.AdjustForMipmap(i);
+		const GSLocalMemory::psm_t& level_psm = GSLocalMemory::m_psm[level.PSM];
+		const int tw = level_region.HasX() ? level_region.GetWidth() : (1 << level.TW);
+		const int th = level_region.HasY() ? level_region.GetHeight() : (1 << level.TH);
+		const GSVector4i rect = level_region.GetRect(tw, th).ralign<Align_Outside>(level_psm.bs);
+		const GSOffset off = g_gs_renderer->m_mem.GetOffset(level.TBP0, level.TBW, level.PSM);
+		off.pageLooperForRect(rect).loopPagesWithBreak([this, &entry, &matches](u32 page) {
+			matches = entry.page_generations[page] == m_vita_gs_page_generations[page];
+			return matches;
+		});
+	}
+	if (matches)
+	{
+		VitaGxmRecordRendererStageTime(VitaGxmRendererStage::SourceHashMemoHit, 0);
+		return entry.key;
+	}
+
+	VitaGxmRecordRendererStageTime(VitaGxmRendererStage::SourceHashMemoMiss, 0);
+	HashCacheKey key = HashCacheKey::Create(TEX0, TEXA, clut, lod, region);
+	entry.valid = true;
+	entry.level_count = level_count;
+	entry.has_clut = has_clut;
+	entry.texa = TEXA.U64;
+	entry.region = region.bits;
+	entry.clut_hash = clut_hash;
+	entry.level_tex0 = level_tex0;
+	for (u8 i = 0; i < level_count; i++)
+	{
+		const GIFRegTEX0 level{level_tex0[i]};
+		const SourceRegion level_region = i == 0 ? region : region.AdjustForMipmap(i);
+		const GSLocalMemory::psm_t& level_psm = GSLocalMemory::m_psm[level.PSM];
+		const int tw = level_region.HasX() ? level_region.GetWidth() : (1 << level.TW);
+		const int th = level_region.HasY() ? level_region.GetHeight() : (1 << level.TH);
+		const GSVector4i rect = level_region.GetRect(tw, th).ralign<Align_Outside>(level_psm.bs);
+		const GSOffset off = g_gs_renderer->m_mem.GetOffset(level.TBP0, level.TBW, level.PSM);
+		off.loopPages(rect, [this, &entry](u32 page) {
+			entry.page_generations[page] = m_vita_gs_page_generations[page];
+		});
+	}
+	entry.key = key;
+	return key;
+}
+#endif
+
 GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, bool& paltex, const u32* clut, const GSVector2i* lod, SourceRegion region)
 {
+#if defined(__vita__)
+	const ScopedRendererStage vita_stage(VitaGxmRendererStage::SourceHashCacheLookup);
+#endif
 	// don't bother hashing if we're not dumping or replacing.
 	const bool dump = GSConfig.DumpReplaceableTextures && (!FMVstarted || GSConfig.DumpTexturesWithFMVActive) &&
 	                  (clut ? GSConfig.DumpPaletteTextures : GSConfig.DumpDirectTextures);
@@ -7013,7 +7181,12 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 
 	// need the hash either for replacing, dumping or caching.
 	// if dumping/replacing is on, we compute the clut hash regardless, since replacements aren't indexed
-	HashCacheKey key{HashCacheKey::Create(TEX0, TEXA, (dump || replace || !paltex) ? clut : nullptr, lod, region)};
+	const u32* const hashed_clut = (dump || replace || !paltex) ? clut : nullptr;
+#if defined(__vita__)
+	HashCacheKey key{CreateVitaMemoizedHashCacheKey(TEX0, TEXA, hashed_clut, lod, region)};
+#else
+	HashCacheKey key{HashCacheKey::Create(TEX0, TEXA, hashed_clut, lod, region)};
+#endif
 
 	// handle dumping first, this is mostly isolated.
 	if (dump)
@@ -7232,6 +7405,15 @@ GSTextureCache::Target* GSTextureCache::Target::Create(GIFRegTEX0 TEX0, int w, i
 	if (!texture)
 		return nullptr;
 
+	// Preserve the GS page/layout identity across the generic host-surface
+	// allocation boundary. Desktop backends keep this in Target; the Vita's
+	// tile-renderer store uses it to make host textures cheap views of persistent
+	// physical color/depth backing without conflating equal-sized GS targets.
+	g_gs_device->SetRenderTargetIdentity(texture,
+		GSRenderTargetIdentity{static_cast<u32>(TEX0.TBP0),
+			static_cast<u32>(TEX0.TBW), static_cast<u32>(TEX0.PSM),
+			GSVector2i(w, h), scale, type == DepthStencil});
+
 	Target* t = new Target(TEX0, type, GSVector2i(w, h), scale, texture);
 
 	g_texture_cache->m_target_memory_usage += t->m_texture->GetMemUsage();
@@ -7434,6 +7616,9 @@ void GSTextureCache::Read(Target* t, const GSVector4i& r)
 
 	// Why does WritePixelNN() not take a const pointer?
 	const GSOffset off = g_gs_renderer->m_mem.GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM);
+#if defined(__vita__)
+	InvalidateVitaHashKeyMemoPages(off, r);
+#endif
 	u8* bits = const_cast<u8*>(dltex->get()->GetMapPointer());
 	const u32 pitch = dltex->get()->GetMapPitch();
 
@@ -7476,6 +7661,9 @@ void GSTextureCache::Read(Source* t, const GSVector4i& r)
 	if (m_color_download_texture->Map(drc))
 	{
 		const GSOffset off = g_gs_renderer->m_mem.GetOffset(t->m_TEX0.TBP0, t->m_TEX0.TBW, t->m_TEX0.PSM);
+#if defined(__vita__)
+		InvalidateVitaHashKeyMemoPages(off, r);
+#endif
 		g_gs_renderer->m_mem.WritePixel32(
 			const_cast<u8*>(m_color_download_texture->GetMapPointer()), m_color_download_texture->GetMapPitch(), off, r);
 		m_color_download_texture->Unmap();
@@ -7586,6 +7774,9 @@ void GSTextureCache::Source::SetPages()
 
 void GSTextureCache::Source::Update(const GSVector4i& rect, int level)
 {
+#if defined(__vita__)
+	const ScopedRendererStage vita_stage(VitaGxmRendererStage::SourceUpdate);
+#endif
 	m_age = 0;
 	if (m_from_target)
 		m_from_target->m_age = 0;
@@ -7808,6 +7999,9 @@ void GSTextureCache::Source::Flush(u32 count, int layer, const GSOffset& off)
 
 void GSTextureCache::Source::PreloadLevel(int level)
 {
+#if defined(__vita__)
+	const ScopedRendererStage vita_stage(VitaGxmRendererStage::SourcePreload);
+#endif
 	// m_TEX0 is adjusted for mips (messy, should be changed).
 	const HashType hash = HashTexture(m_TEX0, m_TEXA, m_region);
 

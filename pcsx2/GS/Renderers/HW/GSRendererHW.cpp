@@ -10,6 +10,11 @@
 #include "common/Console.h"
 #include "common/BitUtils.h"
 #include "common/StringUtil.h"
+#if defined(__vita__)
+#include "common/Timer.h"
+#include "vita/GSDeviceGXM.h"
+#include "vita/VitaPerformanceTelemetry.h"
+#endif
 #if defined(VITASX2_GS_DRAW_TRACE) && VITASX2_GS_DRAW_TRACE
 #include "DebugTools/GsTrace.h"
 #include "vita/VitaGsDrawTrace.h"
@@ -2762,6 +2767,25 @@ void GSRendererHW::RoundSpriteOffset()
 
 void GSRendererHW::Draw()
 {
+#if defined(__vita__)
+	const bool profile_draw = VitaPerformanceTelemetry::IsEnabled();
+	const Common::Timer::Value draw_started = profile_draw ?
+		Common::Timer::GetCurrentValue() : 0;
+	struct DrawTimer final
+	{
+		bool enabled;
+		Common::Timer::Value started;
+		~DrawTimer()
+		{
+			if (!enabled)
+				return;
+			const u64 elapsed_us = static_cast<u64>(
+				Common::Timer::ConvertValueToSeconds(
+					Common::Timer::GetCurrentValue() - started) * 1000000.0);
+			VitaGxmRecordRendererDrawTime(elapsed_us);
+		}
+	} draw_timer{profile_draw, draw_started};
+#endif
 	static u32 num_skipped_channel_shuffle_draws = 0;
 
 	// We mess with this state as an optimization, so take a copy and use that instead.
@@ -5759,6 +5783,23 @@ void GSRendererHW::CalculateAlphaRange(GSTextureCache::Target* rt, GSTextureCach
 void GSRendererHW::DetermineAlphaScaling(GSTextureCache::Target* rt, GSTextureCache::Source* tex,
 	bool req_src_update, int rt_new_alpha_max, bool& can_scale_rt_alpha, bool& new_scale_rt_alpha)
 {
+#if defined(VITASX2_GXM_GS_BLEND)
+	// Native GS color uses the original byte alpha. Do not create an alternate
+	// alpha representation solely to accommodate a desktop /255 blend unit.
+	if (m_conf.ps.dst_fmt <= 1)
+	{
+		can_scale_rt_alpha = false;
+		new_scale_rt_alpha = false;
+		if (rt && rt->m_rt_alpha_scale)
+		{
+			rt->UnscaleRTAlpha();
+			m_conf.rt = rt->m_texture;
+			if (req_src_update)
+				tex->m_texture = rt->m_texture;
+		}
+		return;
+	}
+#endif
 	if (rt)
 	{
 		const bool needs_ad = rt && m_context->ALPHA.C == 1 && rt->m_alpha_min != rt->m_alpha_max && rt->m_alpha_max > 128;
@@ -6720,6 +6761,32 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 	GSTextureCache::Target* rt, bool can_scale_rt_alpha, bool& new_rt_alpha_scale)
 {
 	const GIFRegALPHA& ALPHA = m_context->ALPHA;
+#if defined(VITASX2_GXM_GS_BLEND)
+	// Vita owns host lowering. Preserve the GS equation before GetBlend(),
+	// blend-mix rounding, dual-source factors and multipass decomposition.
+	// Other feature families remain explicitly on the tracked migration route.
+	if (ALPHA.A < 3 && ALPHA.B < 3 && ALPHA.C < 3 && ALPHA.D < 3 &&
+		m_conf.ps.dst_fmt <= 1 && !m_texture_shuffle && !m_channel_shuffle &&
+		!m_conf.ps.manual_lod && m_conf.ps.wms <= 1 && m_conf.ps.wmt <= 1 &&
+		(NeedsBlending() || IsCoverageAlpha()))
+	{
+		m_conf.gs_blend = {static_cast<u8>(ALPHA.A), static_cast<u8>(ALPHA.B),
+			static_cast<u8>(ALPHA.C), static_cast<u8>(ALPHA.D),
+			static_cast<u8>(ALPHA.FIX), !!m_draw_env->PABE.PABE, true,
+			!!m_draw_env->COLCLAMP.CLAMP};
+		m_conf.ps.blend_a = ALPHA.A;
+		m_conf.ps.blend_b = ALPHA.B;
+		m_conf.ps.blend_c = ALPHA.C;
+		m_conf.ps.blend_d = ALPHA.D;
+		m_conf.ps.pabe = m_draw_env->PABE.PABE;
+		m_conf.ps.colclip = !m_draw_env->COLCLAMP.CLAMP;
+		m_conf.cb_ps.TA_MaxDepth_Af.a = ALPHA.FIX / 128.0f;
+		m_conf.blend = {};
+		m_conf.blend_multi_pass = {};
+		m_conf.ps.no_color1 = true;
+		return;
+	}
+#endif
 	{
 		// PABE: Check condition early as an optimization, no blending when As < 128.
 		// For Cs*As + Cd*(1 - As) if As is 128 then blending can be disabled as well.
@@ -9241,6 +9308,24 @@ void GSRendererHW::ResetStates()
 
 __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Target* ds, GSTextureCache::Source* tex, const TextureMinMaxResult& tmm)
 {
+#if defined(__vita__)
+	const bool profile_draw_prims = VitaPerformanceTelemetry::IsEnabled();
+	const Common::Timer::Value draw_prims_started = profile_draw_prims ?
+		Common::Timer::GetCurrentValue() : 0;
+	struct DrawPrimsTimer final
+	{
+		bool enabled;
+		Common::Timer::Value started;
+		~DrawPrimsTimer()
+		{
+			if (!enabled)
+				return;
+			const u64 elapsed_us = static_cast<u64>(Common::Timer::ConvertValueToSeconds(
+				Common::Timer::GetCurrentValue() - started) * 1000000.0);
+			VitaGxmRecordRendererStageTime(VitaGxmRendererStage::DrawPrims, elapsed_us);
+		}
+	} draw_prims_timer{profile_draw_prims, draw_prims_started};
+#endif
 #ifdef ENABLE_OGL_DEBUG
 	const GSVector4i area_out = GSVector4i(m_vt.m_min.p.upld(m_vt.m_max.p)).rintersect(m_context->scissor.in);
 	const GSVector4i area_in = GSVector4i(m_vt.m_min.t.upld(m_vt.m_max.t));

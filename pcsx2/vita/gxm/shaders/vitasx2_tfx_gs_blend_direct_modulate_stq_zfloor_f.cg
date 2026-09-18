@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// Same canonical pixel operation as the non-Z-floor program, with PCSX2's
+// required integer-depth replacement retained as a separate GXM pass type.
+#define VITASX2_TFX_ZFLOOR 1
+#include "vitasx2_tfx_gs_blend_direct_modulate_stq_f.cg"

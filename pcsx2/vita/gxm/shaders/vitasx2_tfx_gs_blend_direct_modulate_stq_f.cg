@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: 2026 VitaSX2-NG Project
+// SPDX-License-Identifier: GPL-3.0+
+
+// PCSX2 owners: tfx_fs.glsl::sample_c/ps_color and
+// GSDrawScanline.cpp::AlphaBlend. This is the complete state-derived kernel
+// for direct FMT_32 STQ sampling, MODULATE/RGBA, no fog/test/FBA/correction,
+// full RGBA writes, COLCLAMP=1 and (Cs - 0) * Ad + Cd.
+#define VITASX2_TFX_GS_BLEND 1
+#define VITASX2_TFX_GS_BLEND_CS_AD_CD 1
+#define VITASX2_TFX_GS_CLAMP 1
+#define VITASX2_TFX_FULL_COLOR_WRITE 1
+#define VITASX2_TFX_NO_DATE 1
+#define VITASX2_TFX_DIRECT_TEXTURE 1
+#define VITASX2_TFX_MODULATE_RGBA 1
+#define VITASX2_TFX_STQ 1
+#define VITASX2_TFX_NO_RTA_SOURCE_CORRECTION 1
+#define VITASX2_TFX_NO_FOG_ALPHA_TEST 1
+#define VITASX2_TFX_NO_FBA 1
+#include "vitasx2_tfx_f.cg"

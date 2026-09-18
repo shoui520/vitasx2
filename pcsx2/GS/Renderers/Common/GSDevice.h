@@ -12,6 +12,7 @@
 #include "GS/Renderers/Common/GSVertex.h"
 #include "GS/GSAlignedClass.h"
 #include "GS/GSExtra.h"
+#include "vita/VitaGsBlend.h"
 #include <array>
 #include <span>
 
@@ -33,6 +34,21 @@ struct GPUPipelineStatistics
 {
 	u64 vs_invocations;
 	u64 ps_invocations;
+};
+
+// Guest render-target identity supplied by GSTextureCache after a pooled host
+// surface has been selected. Backends which virtualize render storage need the
+// GS address/layout rather than the transient GSTexture pointer: two logical
+// targets can describe the same GS pages, while two equal-sized targets can
+// describe unrelated contents.
+struct GSRenderTargetIdentity
+{
+	u32 base_block = 0;
+	u32 buffer_width = 0;
+	u32 psm = 0;
+	GSVector2i unscaled_size{};
+	float scale = 1.0f;
+	bool depth = false;
 };
 
 enum class ShaderConvert
@@ -1302,6 +1318,9 @@ struct alignas(16) GSHWDrawConfig
 	static_assert(sizeof(BlendMultiPass) == 8, "blend multi pass is 8 bytes");
 
 	BlendMultiPass blend_multi_pass;
+	// Captured before desktop blend decomposition. Zero/disabled retains the
+	// existing device contract during the Vita renderer migration.
+	VitaGS::BlendOperation gs_blend;
 
 	VSConstantBuffer cb_vs;
 	PSConstantBuffer cb_ps;
@@ -1323,7 +1342,7 @@ struct alignas(16) GSHWDrawConfig
 	
 	bool IsBlending()
 	{
-		return blend.enable || blend_multi_pass.enable || ps.IsSWBlending();
+		return gs_blend.enabled || blend.enable || blend_multi_pass.enable || ps.IsSWBlending();
 	}
 
 	// Dumping
@@ -1621,6 +1640,16 @@ public:
 
 	/// Get the pipeline statistics for the last frame.
 	virtual GPUPipelineStatistics GetAndResetAccumulatedGPUPipelineStatistics() = 0;
+
+	// PCSX2 owner: GSTextureCache::Target::Create(). The default device model
+	// keeps identity in the texture-cache Target; Vita overrides this because
+	// its physical render store is keyed by GS pages rather than host objects.
+	virtual void SetRenderTargetIdentity(GSTexture* texture,
+		const GSRenderTargetIdentity& identity)
+	{
+		(void)texture;
+		(void)identity;
+	}
 
 	/// Returns true if not enough time has passed for present to not block.
 	bool ShouldSkipPresentingFrame();

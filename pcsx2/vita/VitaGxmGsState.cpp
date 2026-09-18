@@ -3,6 +3,8 @@
 
 #include "vita/VitaGxmGsState.h"
 #include "vita/VitaGpuVuDraw.h"
+#include "vita/VitaGpuVuUniversalEpoch.h"
+#include "vita/VitaGsMailbox.h"
 #include "common/Console.h"
 
 #if defined(VITASX2_QEMU_VALIDATION) && VITASX2_QEMU_VALIDATION
@@ -308,6 +310,33 @@ namespace
 		return true;
 	}
 
+	bool SameGpuVuGsStateContract(const VitaGpuVu::GpuVuDraw& left,
+		const VitaGpuVu::GpuVuDraw& right)
+	{
+		if (!left.static_gs_writes.empty() || !right.static_gs_writes.empty())
+			return false;
+
+		GIFTag left_tag{};
+		GIFTag right_tag{};
+		std::memcpy(&left_tag, left.gif_tag.data(), sizeof(left_tag));
+		std::memcpy(&right_tag, right.gif_tag.data(), sizeof(right_tag));
+		// BuildGpuVuStatePacket() replaces NLOOP/EOP with its four conservative
+		// proxy vertices. Every remaining GIFtag field and the current GS context
+		// determine the PCSX2 hardware config. Geometry count and generated GXP
+		// identity are device bindings, not GS state.
+		return left_tag.PRE == right_tag.PRE &&
+			left_tag.PRIM == right_tag.PRIM &&
+			left_tag.FLG == right_tag.FLG &&
+			left_tag.NREG == right_tag.NREG &&
+			left_tag.REGS == right_tag.REGS &&
+			left.direct_tfx.primitive == right.direct_tfx.primitive &&
+			left.direct_tfx.gouraud == right.direct_tfx.gouraud &&
+			left.direct_tfx.textured == right.direct_tfx.textured &&
+			left.direct_tfx.fog_enabled == right.direct_tfx.fog_enabled &&
+			left.direct_tfx.fixed_texture_coordinates ==
+				right.direct_tfx.fixed_texture_coordinates;
+	}
+
 	using GpuVuInputGenerations =
 		std::array<VitaGpuVu::RawVifPayloadRef,
 			VitaGpuVu::InputRingSlotCount>;
@@ -376,51 +405,118 @@ namespace
 					found = true;
 					break;
 				}
-			}
-			if (!found)
-				return false;
-		}
-		return true;
-	}
+                        }
+                        if (!found)
+                          return false;
+                }
+                return true;
+        }
 
-	bool CanDeriveOneGpuVuState(const VitaGpuVu::GpuVuDraw& left,
-		const VitaGpuVu::GpuVuDraw& right)
-	{
-		// Instance-indexed roots fetch each object's immutable VU seeds from
-		// their batch record. Native roots still expose those seeds through the
-		// one-draw default uniform buffer and therefore require exact equality.
-		return left.program == right.program &&
-			left.gif_tag == right.gif_tag &&
-			left.direct_tfx.vertex_count == right.direct_tfx.vertex_count &&
-			left.direct_tfx.primitive == right.direct_tfx.primitive &&
-			left.direct_tfx.gouraud == right.direct_tfx.gouraud &&
-			left.direct_tfx.textured == right.direct_tfx.textured &&
-			left.direct_tfx.fog_enabled == right.direct_tfx.fog_enabled &&
-			left.direct_tfx.fixed_texture_coordinates ==
-				right.direct_tfx.fixed_texture_coordinates &&
-			left.invocation_count == right.invocation_count &&
-			left.vertex_count == right.vertex_count &&
-			left.primitive_count == right.primitive_count &&
-			left.index_count == right.index_count &&
-			left.lowering == right.lowering &&
-			left.execution == right.execution &&
-			left.primitive_boundary == right.primitive_boundary &&
-			left.static_gs_writes.empty() && right.static_gs_writes.empty() &&
-				!left.final_state.IsRequired() &&
-				!right.final_state.IsRequired() &&
-				SameGpuVuInputGenerations(left, right) &&
-				(left.primitive_boundary ==
-						VitaGpuVu::PrimitiveBoundary::InstanceIndexed ?
-					SameGpuVuUniformLayout(left, right) :
-					SameGpuVuUniforms(left, right));
-	}
-}
+        const char* DescribeGpuVuStateBatchIncompatibility(
+            const VitaGpuVu::GpuVuDraw &left,
+            const VitaGpuVu::GpuVuDraw &right) {
+          // Expanded roots fetch each object's immutable VU seeds from their
+          // batch record. Native roots still expose those seeds through the
+          // one-draw default uniform buffer and therefore require exact
+          // equality.
+          const bool private_transactional_final_state =
+              left.HasGeneratedLoopKernelTransaction() &&
+              right.HasGeneratedLoopKernelTransaction() &&
+              (left.primitive_boundary ==
+                   VitaGpuVu::PrimitiveBoundary::ExactPostLoopIndexed ||
+               left.HasExpandedExactIndices()) &&
+              right.primitive_boundary == left.primitive_boundary;
+          const bool variable_capacity_batch =
+              private_transactional_final_state &&
+              left.program == right.program;
+          const auto same_tag_except_nloop = [](const auto& first,
+                                                const auto& second) {
+            auto normalized_first = first;
+            auto normalized_second = second;
+            normalized_first[0] &= ~0x7fffu;
+            normalized_second[0] &= ~0x7fffu;
+            return normalized_first == normalized_second;
+          };
+          if (left.program != right.program)
+            return "program";
+          if (!VitaGpuVu::HasSamePrivateStoreBufferBinding(left, right))
+            return "private-store-buffer-binding";
+          if (left.precompute_program_count != right.precompute_program_count ||
+              left.precompute_stage_count != right.precompute_stage_count ||
+              !std::equal(left.precompute_programs.begin(),
+                          left.precompute_programs.begin() +
+                              left.precompute_program_count,
+                          right.precompute_programs.begin()) ||
+              !std::equal(left.precompute_stages.begin(),
+                          left.precompute_stages.begin() +
+                              left.precompute_program_count,
+                          right.precompute_stages.begin()))
+            return "precompute";
+          if (!(variable_capacity_batch ?
+                    same_tag_except_nloop(left.gif_tag, right.gif_tag) :
+                    left.gif_tag == right.gif_tag))
+            return "gif-tag";
+          if (!variable_capacity_batch &&
+              left.direct_tfx.vertex_count != right.direct_tfx.vertex_count)
+            return "contract-vertices";
+          if (left.direct_tfx.primitive != right.direct_tfx.primitive ||
+              left.direct_tfx.gouraud != right.direct_tfx.gouraud ||
+              left.direct_tfx.textured != right.direct_tfx.textured ||
+              left.direct_tfx.fog_enabled != right.direct_tfx.fog_enabled ||
+              left.direct_tfx.fixed_texture_coordinates !=
+                  right.direct_tfx.fixed_texture_coordinates)
+            return "direct-tfx-state";
+          if (!variable_capacity_batch &&
+              (left.invocation_count != right.invocation_count ||
+               left.vertex_count != right.vertex_count ||
+               left.primitive_count != right.primitive_count ||
+               left.index_count != right.index_count))
+            return "geometry";
+          if (left.lowering != right.lowering ||
+              left.execution != right.execution ||
+              left.primitive_boundary != right.primitive_boundary)
+            return "execution";
+          if (!left.static_gs_writes.empty() ||
+              !right.static_gs_writes.empty())
+            return "static-gs-write";
+          if ((left.final_state.IsRequired() ||
+               right.final_state.IsRequired()) &&
+              !private_transactional_final_state)
+            return "final-state";
+                 // Exact-post-loop ABI-26 descriptors carry one independently
+                 // retained raw-binding record per object.  Their VIF
+                 // input-ring generation is therefore data ownership, not
+                 // GS-state identity; GSDeviceGXM validates and groups each
+                 // generation before encoding. Native/legacy roots still
+                 // require one identical generation set.
+          if (!private_transactional_final_state &&
+              !SameGpuVuInputGenerations(left, right))
+            return "input-generation";
+          const bool indexed =
+              left.primitive_boundary ==
+                  VitaGpuVu::PrimitiveBoundary::InstanceIndexed ||
+              left.primitive_boundary ==
+                  VitaGpuVu::PrimitiveBoundary::ExpandedIndexed ||
+              left.primitive_boundary ==
+                  VitaGpuVu::PrimitiveBoundary::ExactPostLoopIndexed ||
+              left.HasExpandedExactIndices();
+          if (!(indexed ? SameGpuVuUniformLayout(left, right) :
+                          SameGpuVuUniforms(left, right)))
+            return "uniform-layout";
+          return nullptr;
+        }
 
-VitaGxmGsState::VitaGxmGsState(bool enable_native_presenter)
-	: GSRendererHW()
-{
-	(void)enable_native_presenter;
-}
+        bool CanDeriveOneGpuVuState(const VitaGpuVu::GpuVuDraw &left,
+                                    const VitaGpuVu::GpuVuDraw &right) {
+          return DescribeGpuVuStateBatchIncompatibility(left, right) ==
+                 nullptr;
+        }
+        } // namespace
+
+        VitaGxmGsState::VitaGxmGsState(bool enable_native_presenter)
+            : GSRendererHW() {
+          (void)enable_native_presenter;
+        }
 
 VitaGxmGsState::~VitaGxmGsState() = default;
 
@@ -441,7 +537,15 @@ void VitaGxmGsState::SubmitDrawConfig(GSHWDrawConfig& config)
 	std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> draws =
 		std::move(m_gpu_vu_draws);
 	const u32 count = static_cast<u32>(draws.size());
-	if (!device || !device->RenderGpuVuDraws(config, std::move(draws)))
+	// ConsumeGpuVuDraws() may have more generated-program groups with this
+	// exact GS contract. Save the fully PCSX2-derived config before the first
+	// group is moved into the device; transient proxy vertex/index pointers are
+	// never consulted by GSDeviceGXM's active GPU-VU path.
+	m_gpu_vu_derived_config = config;
+	m_gpu_vu_derived_config_valid = true;
+	m_gpu_vu_derived_submit_succeeded =
+		device && device->RenderGpuVuDraws(config, std::move(draws));
+	if (!m_gpu_vu_derived_submit_succeeded)
 	{
 		for (u32 index = 0; index < count; index++)
 			VitaGpuVu::RecordGpuVuDrawRejected();
@@ -449,6 +553,30 @@ void VitaGxmGsState::SubmitDrawConfig(GSHWDrawConfig& config)
 }
 
 #endif
+
+void VitaGxmGsState::ServiceUniversalGpuVuEpoch(
+	VitaGpuVu::UniversalGpuVuEpoch* epoch)
+{
+	if (!epoch)
+		return;
+#if (!defined(VITASX2_QEMU_VALIDATION) || !VITASX2_QEMU_VALIDATION) && \
+	(!defined(VITASX2_VITA_SOFTWARE_GS_CONTROL) || \
+	 !VITASX2_VITA_SOFTWARE_GS_CONTROL)
+	auto* const device = static_cast<GSDeviceGXM*>(g_gs_device.get());
+	if (device)
+	{
+		device->ServiceUniversalGpuVuEpoch(epoch);
+		return;
+	}
+#endif
+	if (epoch->Stage() == VitaGpuVu::UniversalGpuVuEpochStage::Prepared &&
+		epoch->MarkSubmitted())
+	{
+		epoch->MarkGpuRejected(
+			VitaGpuVu::UniversalGpuVuRejection::DeviceUnavailable, 0);
+	}
+}
+
 
 void VitaGxmGsState::ConsumeGpuVuDraw(
 	std::unique_ptr<VitaGpuVu::GpuVuDraw> draw)
@@ -476,6 +604,9 @@ void VitaGxmGsState::ConsumeGpuVuDraws(
 		return;
 	}
 
+	auto* const device = static_cast<GSDeviceGXM*>(g_gs_device.get());
+	const u32 consumer_total_draws = static_cast<u32>(draws.size());
+	u32 consumer_group_index = 0u;
 	for (u32 first = 0; first < draws.size();)
 	{
 		if (!draws[first])
@@ -493,45 +624,182 @@ void VitaGxmGsState::ConsumeGpuVuDraws(
 			continue;
 		}
 
-		u32 end = first + 1;
-		while (end < draws.size() && draws[end] &&
-			draws[end]->WasValidatedForQueue() &&
-			CanDeriveOneGpuVuState(*draws[first], *draws[end]))
+		u32 state_end = first + 1;
+		while (state_end < draws.size() && draws[state_end] &&
+			draws[state_end]->WasValidatedForQueue() &&
+			SameGpuVuGsStateContract(*draws[first], *draws[state_end]))
 		{
-			end++;
+			state_end++;
 		}
 
-		// Complete any older PATH output, then feed one descriptor-scale proxy
-		// through PCSX2's owning GS state derivation for the whole consecutive
-		// compatible run. The generated root consumes every immutable VIF span;
-		// none of the four conservative proxy vertices reaches GXM.
+		// Complete older PATH output once, then feed exactly one conservative
+		// proxy through PCSX2's owning GS state derivation. Subsequent generated
+		// program groups in this contiguous run reuse that immutable config;
+		// there is no intervening GIF packet or GS register write which could
+		// change it. Each group still reaches GSDeviceGXM in original order and
+		// receives its full program/input/target validation there.
 		Flush(GSFlushReason::CONTEXTCHANGE);
-		std::vector<u128> packet;
-		if (!BuildGpuVuStatePacket(*draws[first], *m_context, &packet))
+		m_gpu_vu_derived_config_valid = false;
+		m_gpu_vu_derived_submit_succeeded = false;
+		u32 group_count = 0;
+		u32 reused_group_count = 0;
+		u32 object_count = 0;
+		for (u32 group_first = first; group_first < state_end;)
 		{
-			for (u32 index = first; index < end; index++)
+			u32 group_end = group_first + 1;
+			while (group_end < state_end && draws[group_end] &&
+				draws[group_end]->WasValidatedForQueue() &&
+				CanDeriveOneGpuVuState(
+					*draws[group_first], *draws[group_end]))
 			{
-				VitaGpuVu::RecordGpuVuDrawRejected();
-				draws[index].reset();
+				group_end++;
 			}
-			first = end;
-			continue;
+			if (group_end < state_end && draws[group_end] &&
+				draws[group_end]->WasValidatedForQueue())
+			{
+				const char* const reason =
+					DescribeGpuVuStateBatchIncompatibility(
+						*draws[group_first], *draws[group_end]);
+				static u64 s_gpu_vu_state_batch_splits = 0;
+				const u64 split = ++s_gpu_vu_state_batch_splits;
+				if (reason && (split <= 8u || (split & (split - 1u)) == 0u))
+				{
+					Console.WriteLn(
+						"GPU-VU gs_state_batch_split=%llu reason=%s "
+						"left_vertices=%u right_vertices=%u "
+						"left_program=%016llx%016llx "
+						"right_program=%016llx%016llx pre_effect=0.",
+						static_cast<unsigned long long>(split), reason,
+						draws[group_first]->vertex_count,
+						draws[group_end]->vertex_count,
+						static_cast<unsigned long long>(
+							draws[group_first]->program.high),
+						static_cast<unsigned long long>(
+							draws[group_first]->program.low),
+						static_cast<unsigned long long>(
+							draws[group_end]->program.high),
+						static_cast<unsigned long long>(
+							draws[group_end]->program.low));
+				}
+			}
+			const u32 group_objects = group_end - group_first;
+			object_count += group_objects;
+			group_count++;
+			// flags: bit 0 identifies the proxy-derived first group; bit 1
+			// records a successful device return; bit 2 records a reusable
+			// PCSX2-derived draw config. The notification thread owns only this
+			// pointer-free copy and can report it while MTGS is stalled.
+			VitaGS::GpuVuGxmConsumerBreadcrumb consumer{
+				consumer_total_draws, first, state_end, group_first, group_end,
+				consumer_group_index,
+				group_first == first ? 1u : 0u};
+			VitaGS::UpdateActiveGpuVuGxmSubmissionWatchdog(
+				VitaGS::GpuVuGxmSubmissionStage::GsStateGroupBegin,
+				consumer);
+
+			if (group_first == first)
+			{
+				std::vector<u128> packet;
+				if (!BuildGpuVuStatePacket(
+						*draws[group_first], *m_context, &packet))
+				{
+					for (u32 index = group_first; index < state_end; index++)
+					{
+						if (draws[index])
+							VitaGpuVu::RecordGpuVuDrawRejected();
+						draws[index].reset();
+					}
+					group_first = state_end;
+					continue;
+				}
+				m_gpu_vu_draws.reserve(group_objects);
+				for (u32 index = group_first; index < group_end; index++)
+					m_gpu_vu_draws.push_back(std::move(draws[index]));
+				Transfer<3>(reinterpret_cast<const u8*>(packet.data()),
+					static_cast<u32>(packet.size()));
+				Flush(GSFlushReason::CONTEXTCHANGE);
+				if (m_gpu_vu_derived_submit_succeeded)
+					consumer.flags |= 1u << 1;
+				if (m_gpu_vu_derived_config_valid)
+					consumer.flags |= 1u << 2;
+				VitaGS::UpdateActiveGpuVuGxmSubmissionWatchdog(
+					VitaGS::GpuVuGxmSubmissionStage::GsStateGroupReturned,
+					consumer);
+				if (!m_gpu_vu_draws.empty())
+				{
+					for (const auto& pending : m_gpu_vu_draws)
+						VitaGpuVu::RecordGpuVuDrawRejected();
+					m_gpu_vu_draws.clear();
+					pxFailRel("GPU-VU proxy geometry produced no PCSX2 HW draw");
+				}
+				if (!m_gpu_vu_derived_config_valid ||
+					!m_gpu_vu_derived_submit_succeeded)
+				{
+					// SubmitDrawConfig() already accounted for the first group's
+					// rejection. No later group may reuse an unaccepted config.
+					for (u32 index = group_end; index < state_end; index++)
+					{
+						if (draws[index])
+							VitaGpuVu::RecordGpuVuDrawRejected();
+						draws[index].reset();
+					}
+					group_first = state_end;
+					continue;
+				}
+			}
+			else
+			{
+				std::vector<std::unique_ptr<VitaGpuVu::GpuVuDraw>> group;
+				group.reserve(group_objects);
+				for (u32 index = group_first; index < group_end; index++)
+					group.push_back(std::move(draws[index]));
+				GSHWDrawConfig config = m_gpu_vu_derived_config;
+				const bool rendered = device &&
+					device->RenderGpuVuDraws(config, std::move(group));
+				if (rendered)
+					consumer.flags |= 1u << 1;
+				if (m_gpu_vu_derived_config_valid)
+					consumer.flags |= 1u << 2;
+				VitaGS::UpdateActiveGpuVuGxmSubmissionWatchdog(
+					VitaGS::GpuVuGxmSubmissionStage::GsStateGroupReturned,
+					consumer);
+				if (!rendered)
+				{
+					for (u32 index = 0; index < group_objects; index++)
+						VitaGpuVu::RecordGpuVuDrawRejected();
+				}
+				else
+				{
+					reused_group_count++;
+				}
+			}
+			group_first = group_end;
+			VitaGS::UpdateActiveGpuVuGxmSubmissionWatchdog(
+				VitaGS::GpuVuGxmSubmissionStage::GsStateGroupAdvanced,
+				consumer);
+			consumer_group_index++;
 		}
-		m_gpu_vu_draws.reserve(end - first);
-		for (u32 index = first; index < end; index++)
-			m_gpu_vu_draws.push_back(std::move(draws[index]));
-		Transfer<3>(reinterpret_cast<const u8*>(packet.data()),
-			static_cast<u32>(packet.size()));
-		Flush(GSFlushReason::CONTEXTCHANGE);
-		if (!m_gpu_vu_draws.empty())
+
+		if (reused_group_count != 0u)
 		{
-			for (const auto& pending : m_gpu_vu_draws)
-				VitaGpuVu::RecordGpuVuDrawRejected();
-			m_gpu_vu_draws.clear();
-			pxFailRel("GPU-VU proxy geometry produced no PCSX2 HW draw");
+			static u64 s_gpu_vu_state_template_batches = 0;
+			const u64 batch = ++s_gpu_vu_state_template_batches;
+			if (batch <= 8u || (batch & (batch - 1u)) == 0u)
+			{
+				Console.WriteLn(
+					"GPU-VU gs_state_template_batch=%llu objects=%u "
+					"generated_groups=%u gs_derivations=1 reused_groups=%u "
+					"synthetic_path1_packets=1 order=preserved.",
+					static_cast<unsigned long long>(batch), object_count,
+					group_count, reused_group_count);
+			}
 		}
-		first = end;
+		first = state_end;
+		VitaGS::UpdateActiveGpuVuGxmSubmissionWatchdog(
+			VitaGS::GpuVuGxmSubmissionStage::GsStateContractAdvanced);
 	}
+	VitaGS::UpdateActiveGpuVuGxmSubmissionWatchdog(
+		VitaGS::GpuVuGxmSubmissionStage::GsStateConsumeReturned);
 	return;
 	#endif
 
