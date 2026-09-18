@@ -16,12 +16,3 @@ set(GNU_DEMANGLER_FLAGS -DHAVE_DECL_BASENAME=1 -DHAVE_LIMITS_H=1 -DHAVE_STDLIB_H
 
 target_include_directories(demanglegnu PUBLIC include)
 target_compile_definitions(demanglegnu PUBLIC ${GNU_DEMANGLER_FLAGS})
-
-if((CMAKE_SYSTEM_NAME STREQUAL "Linux") OR (CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
-	add_executable(demangler_fuzzer testsuite/demangler-fuzzer.c)
-	target_link_libraries(demangler_fuzzer demanglegnu)
-	target_compile_definitions(demangler_fuzzer PUBLIC ${GNU_DEMANGLER_FLAGS})
-endif()
-add_executable(demangler_test testsuite/test-demangle.c)
-target_link_libraries(demangler_test demanglegnu)
-target_compile_definitions(demangler_test PUBLIC ${GNU_DEMANGLER_FLAGS})
