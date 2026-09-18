@@ -50,6 +50,8 @@ namespace VitaA32
 			u64 helper_call_instructions = 0;
 			u64 state_load_instructions = 0;
 			u64 state_store_instructions = 0;
+			u64 stack_load_instructions = 0;
+			u64 stack_store_instructions = 0;
 		};
 
 		CodeBuffer() = default;
@@ -79,6 +81,8 @@ namespace VitaA32
 		// not pollute the telemetry and generated execution remains untouched.
 		GeneratedCodeStats AnalyzeGeneratedCode(
 			unsigned architectural_state_base = 4) const;
+		GeneratedCodeStats AnalyzeGeneratedCodeRange(size_t offset, size_t bytes,
+			unsigned architectural_state_base = 4) const;
 
 		bool EmitU32(u32 instruction);
 		bool EmitMovImm8(unsigned rd, u8 value, Condition condition = Condition::AL);
@@ -97,7 +101,8 @@ namespace VitaA32
 		bool EmitRscImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitAndImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitAndImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
-		bool EmitBicImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
+		bool EmitBicImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false,
+			Condition condition = Condition::AL);
 		bool EmitEorImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
 		bool EmitEorImm32(unsigned rd, unsigned rn, u32 value, bool set_flags = false);
 		bool EmitOrrImm8(unsigned rd, unsigned rn, u8 value, bool set_flags = false);
@@ -202,7 +207,10 @@ namespace VitaA32
 		bool EmitVmovI32Q(unsigned qd, u8 imm8, u8 left_shift);
 		bool EmitVbicI32Q(unsigned qd, u8 imm8, u8 left_shift);
 		bool EmitVmovS(unsigned sd, unsigned sm);
-		bool EmitVmovCoreToS(unsigned sd, unsigned rt);
+		bool EmitVabsF32(unsigned sd, unsigned sm);
+		bool EmitVnegF32(unsigned sd, unsigned sm);
+		bool EmitVmovCoreToS(unsigned sd, unsigned rt,
+			Condition condition = Condition::AL);
 		bool EmitVmovSToCore(unsigned rt, unsigned sd, Condition condition = Condition::AL);
 		bool EmitVmrsFpscr(unsigned rt);
 		bool EmitVmsrFpscr(unsigned rt);
@@ -254,6 +262,7 @@ namespace VitaA32
 		bool EmitVaddI32Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVaddI64Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVpaddI32D(unsigned dd, unsigned dn, unsigned dm);
+		bool EmitVpmaxU32D(unsigned dd, unsigned dn, unsigned dm);
 		bool EmitVsubI8Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVsubI16Q(unsigned qd, unsigned qn, unsigned qm);
 		bool EmitVsubI32Q(unsigned qd, unsigned qn, unsigned qm);
@@ -486,7 +495,10 @@ namespace VitaA32
 	u32 EncodeVmovI32Q(unsigned qd, u8 imm8, u8 left_shift);
 	u32 EncodeVbicI32Q(unsigned qd, u8 imm8, u8 left_shift);
 	u32 EncodeVmovS(unsigned sd, unsigned sm);
-	u32 EncodeVmovCoreToS(unsigned sd, unsigned rt);
+	u32 EncodeVabsF32(unsigned sd, unsigned sm);
+	u32 EncodeVnegF32(unsigned sd, unsigned sm);
+	u32 EncodeVmovCoreToS(unsigned sd, unsigned rt,
+		Condition condition = Condition::AL);
 	u32 EncodeVmovSToCore(unsigned rt, unsigned sd, Condition condition = Condition::AL);
 	u32 EncodeVmrsFpscr(unsigned rt);
 	u32 EncodeVmsrFpscr(unsigned rt);
@@ -538,6 +550,7 @@ namespace VitaA32
 	u32 EncodeVaddI32Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVaddI64Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVpaddI32D(unsigned dd, unsigned dn, unsigned dm);
+	u32 EncodeVpmaxU32D(unsigned dd, unsigned dn, unsigned dm);
 	u32 EncodeVsubI8Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVsubI16Q(unsigned qd, unsigned qn, unsigned qm);
 	u32 EncodeVsubI32Q(unsigned qd, unsigned qn, unsigned qm);
@@ -617,4 +630,5 @@ namespace VitaA32
 	u32 EncodeBx(unsigned rm);
 	u32 EncodeBlx(unsigned rm);
 	bool EncodeBranch(u8* instruction, u8* target, u32* out_instruction, Condition condition = Condition::AL);
+
 } // namespace VitaA32
