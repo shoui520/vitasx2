@@ -189,6 +189,8 @@ enum class SpeedHack
 	VU1InstantQP,
 	VU1ApproximateQ,
 	VU1ApproximateP,
+	VU1ApproximateFmac,
+	VU1ApproximateConversions,
 	MTVU,
 	EECycleRate,
 	MaxCount,
@@ -1143,7 +1145,9 @@ struct Pcsx2Config
 			vu1AssumeScheduled : 1, // VU1 microcode has no implicit data/resource stalls
 			vu1InstantQP : 1, // Publish VU1 Q/P results immediately without latency pipes
 			vu1ApproximateQ : 1, // Use Cortex-A9 NEON reciprocal refinement for VU1 Q division
-			vu1ApproximateP : 1; // Use Cortex-A9 NEON estimates/refinement for VU1 EFU results
+			vu1ApproximateP : 1, // Use Cortex-A9 NEON estimates/refinement for VU1 EFU results
+			vu1ApproximateFmac : 1, // Allow normalized native-host VU1 ADD/SUB/MUL rounding
+			vu1ApproximateConversions : 1; // Allow native-host VU1 FTOI/ITOF in the playable GPU profile
 		BITFIELD_END
 
 		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)

@@ -326,6 +326,8 @@ static constexpr const char* s_speed_hack_names[] = {
 	"vu1InstantQP",
 	"vu1ApproximateQ",
 	"vu1ApproximateP",
+	"vu1ApproximateFmac",
+	"vu1ApproximateConversions",
 	"mtvu",
 	"eeCycleRate",
 };
@@ -370,6 +372,12 @@ void Pcsx2Config::SpeedhackOptions::Set(SpeedHack id, int value)
 			break;
 		case SpeedHack::VU1ApproximateP:
 			vu1ApproximateP = (value != 0);
+			break;
+		case SpeedHack::VU1ApproximateFmac:
+			vu1ApproximateFmac = (value != 0);
+			break;
+		case SpeedHack::VU1ApproximateConversions:
+			vu1ApproximateConversions = (value != 0);
 			break;
 		case SpeedHack::MTVU:
 			vuThread = (value != 0);
@@ -427,6 +435,8 @@ void Pcsx2Config::SpeedhackOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(vu1InstantQP);
 	SettingsWrapBitBool(vu1ApproximateQ);
 	SettingsWrapBitBool(vu1ApproximateP);
+	SettingsWrapBitBool(vu1ApproximateFmac);
+	SettingsWrapBitBool(vu1ApproximateConversions);
 
 	EECycleRate = std::clamp(EECycleRate, MIN_EE_CYCLE_RATE, MAX_EE_CYCLE_RATE);
 	EECycleSkip = std::min(EECycleSkip, MAX_EE_CYCLE_SKIP);
