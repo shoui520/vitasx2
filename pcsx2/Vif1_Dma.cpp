@@ -12,10 +12,36 @@
 
 u32 g_vif1Cycles = 0;
 
+static void RecordGpuVuVifDependencyBarrierChain()
+{
+	static u64 chained_barriers = 0;
+	const u64 count = ++chained_barriers;
+	if (count <= 8u || (count & (count - 1u)) == 0u)
+	{
+		Console.WriteLn(
+			"GPU-VU: VIF1 dependency barrier chained behind private "
+			"generation count=%llu canonical_publication=deferred.",
+			static_cast<unsigned long long>(count));
+	}
+}
+
 __fi void vif1FLUSH()
 {
 	if (VU0.VI[REG_VPU_STAT].UL & 0x500) // T bit stop or Busy
 	{
+		// PCSX2's CPU MTVU must stop VIF1 until the prior VU program has
+		// physically completed because only canonical CPU state can seed the
+		// next Execute. A generated GPU-VU transaction already published an
+		// exact private successor and retained the immutable VIF journal. The
+		// following VIF command may therefore join that ordered private chain;
+		// this internal dependency barrier is not an EE-visible state observer.
+		// D/T programs are rejected before generated admission, while explicit
+		// memory/register observers still enter WaitVU().
+		if (THREAD_VU1 && vu1Thread.CanChainVifBehindGeneratedGpuVu())
+		{
+			RecordGpuVuVifDependencyBarrierChain();
+			return;
+		}
 		vif1.waitforvu = true;
 		vif1.vifstalled.enabled = VifStallEnable(vif1ch);
 		vif1.vifstalled.value = VIF_TIMING_BREAK;
@@ -230,6 +256,31 @@ __fi void vif1VUFinish()
 			break;
 
 		CpuVU1->ExecuteBlock();
+	}
+
+	// The VIF event can race CPU1's generated admission by one scheduler
+	// quantum. Once CPU1 has published a private successor, release only the
+	// internal VIF wait and let the next captured command become an ordered GPU
+	// dependency. Keep VPU_STAT busy until normal generated retirement so an EE
+	// status read remains conservative and guest state is never exposed early.
+	if (THREAD_VU1 && vif1.waitforvu &&
+		vu1Thread.CanChainVifBehindGeneratedGpuVu())
+	{
+		RecordGpuVuVifDependencyBarrierChain();
+		vif1Regs.stat.VEW = false;
+		vif1.waitforvu = false;
+		if ((cpuRegs.interrupt &
+				((1 << DMAC_VIF1) | (1 << DMAC_MFIFO_VIF))) == 0 &&
+			vif1ch.chcr.STR &&
+			!vif1Regs.stat.test(
+				VIF1_STAT_VSS | VIF1_STAT_VIS | VIF1_STAT_VFS))
+		{
+			if (dmacRegs.ctrl.MFD == MFD_VIF1)
+				vifMFIFOInterrupt();
+			else
+				vif1Interrupt();
+		}
+		return;
 	}
 
 	if (VU0.VI[REG_VPU_STAT].UL & 0x500)

@@ -16,6 +16,11 @@ extern void dVifRelease(int idx);
 extern void VifUnpackSSE_Init();
 
 _vifT extern void dVifUnpack(const u8* data, bool isFill);
+#if defined(VITASX2_VITA)
+// CPU0-owned entry used by Vif_Unpack.cpp. The ordinary entry is also called
+// by MTVU and therefore must not publish CPU0-only profiling state.
+_vifT extern void dVifUnpackCpu0(const u8* data, bool isFill);
+#endif
 
 struct nVifStruct
 {

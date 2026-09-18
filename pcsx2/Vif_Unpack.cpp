@@ -9,6 +9,10 @@
 #include "VUmicro.h"
 #include "MTVU.h"
 
+#if defined(VITASX2_CPU_PROFILER)
+#include "vita/VitaPerformanceTelemetry.h"
+#endif
+
 enum UnpackOffset {
 	OFFSET_X = 0,
 	OFFSET_Y = 1,
@@ -367,10 +371,23 @@ _vifT int nVifUnpack(const u8* data)
 		const u32 trace_packet_size = vif.vifpacketsize;
 		const u32 trace_cl = vifRegs.cycle.cl;
 		const u32 trace_wl = vifRegs.cycle.wl;
+		// This function executes on CPU0. VIF1 may enqueue conversion for MTVU,
+		// while VIF0 or non-MTVU VIF1 converts inline; nested leaf markers split
+		// only the latter and never publish worker-owned execution.
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::VifUnpackHandoff);
+#endif
 		if (!idx || !THREAD_VU1)
 		{
 			if (newVifDynaRec)
+			{
+#if defined(VITASX2_VITA)
+				dVifUnpackCpu0<idx>(data, isFill);
+#else
 				dVifUnpack<idx>(data, isFill);
+#endif
+			}
 			else
 				_nVifUnpack(idx, data, vifRegs.mode, isFill);
 		}

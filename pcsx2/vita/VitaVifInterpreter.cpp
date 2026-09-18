@@ -11,6 +11,10 @@
 #include "VUmicro.h"
 #include "MTVU.h"
 
+#if defined(VITASX2_CPU_PROFILER)
+#include "vita/VitaPerformanceTelemetry.h"
+#endif
+
 #include <cstring>
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -1328,7 +1332,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastSAndV2Burst(const u8* data, bool isFill)
+	bool VitaVifTryFastSAndV2Burst(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_S() and UNPACK_V2(). This path
 		// keeps only the contiguous no-mode/no-mask case; MODE, row/col masks,
@@ -1352,6 +1357,11 @@ namespace
 		if (vu_mem_offset + bytes > vu_mem_size)
 			return false;
 
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::VifUnpackWiden,
+			profile_cpu0);
+#endif
 		const u32 vsize = nVifT[format];
 		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
 		for (u32 i = 0; i < count; i++)
@@ -1372,7 +1382,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastV3Burst(const u8* data, bool isFill)
+	bool VitaVifTryFastV3Burst(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		// PCSX2 owners: x86/Vif_Dynarec.cpp::ModUnpack() and
 		// x86/Vif_UnpackSSE.cpp::xUPK_V3_*(). Generated V3 has alignment-based
@@ -1396,6 +1407,11 @@ namespace
 		if (vu_mem_offset + bytes > vu_mem_size)
 			return false;
 
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::VifUnpackWiden,
+			profile_cpu0);
+#endif
 		const u32 vsize = nVifT[format];
 		const u32 generated_alignment = VitaVifGeneratedAlignment(vif, format);
 		u32 generated_iteration = 0;
@@ -1429,7 +1445,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastV4Burst(const u8* data, bool isFill)
+	bool VitaVifTryFastV4Burst(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4(). This is the contiguous
 		// no-mask/no-mode V4 case; row/col, fill, skip, and VU-memory wrap
@@ -1454,6 +1471,13 @@ namespace
 		if (vu_mem_offset + bytes > vu_mem_size)
 			return false;
 
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			format == 0x0c ?
+				VitaPerformanceTelemetry::CpuStage::VifUnpackCopy :
+				VitaPerformanceTelemetry::CpuStage::VifUnpackWiden,
+			profile_cpu0);
+#endif
 		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
 		if (format == 0x0c)
 		{
@@ -1540,7 +1564,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastV4_5Burst(const u8* data, bool isFill)
+	bool VitaVifTryFastV4_5Burst(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		// PCSX2 owner: Vif_Unpack.cpp::UNPACK_V4_5(). V4-5 ignores USN/MODE,
 		// but row/col mask, fill, skip, and VU-memory wrap still need the
@@ -1562,6 +1587,11 @@ namespace
 		if (vu_mem_offset + bytes > vu_mem_size)
 			return false;
 
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::VifUnpackWiden,
+			profile_cpu0);
+#endif
 		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
 		for (u32 i = 0; i < count; i++)
 		{
@@ -1580,7 +1610,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastV4ModeBurst(const u8* data, bool isFill)
+	bool VitaVifTryFastV4ModeBurst(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		// PCSX2 owners: Vif_Unpack.cpp::UNPACK_V4() and writeXYZW().
 		// Contiguous unmasked V4 MODE traffic has no lane selectors, so keep the
@@ -1607,6 +1638,11 @@ namespace
 		if (vu_mem_offset + bytes > vu_mem_size)
 			return false;
 
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::VifUnpackModeMask,
+			profile_cpu0);
+#endif
 		u8* dest = vuRegs[idx].Mem + vu_mem_offset;
 #if VITASX2_VIF_HAS_ARM_NEON
 		if (format == 0x0c)
@@ -1689,7 +1725,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastModeMaskBurst(const u8* data, bool isFill)
+	bool VitaVifTryFastModeMaskBurst(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		// PCSX2 owners: Vif_Unpack.cpp::writeXYZW(), UNPACK_S(),
 		// UNPACK_V2(), UNPACK_V4(), UNPACK_V4_5(), and generated V3 from
@@ -1717,6 +1754,11 @@ namespace
 		if (vu_mem_offset + bytes > vu_mem_size)
 			return false;
 
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::VifUnpackModeMask,
+			profile_cpu0);
+#endif
 		const u32 vsize = nVifT[format];
 		const u32 generated_alignment = VitaVifGeneratedAlignment(vif, format);
 		u32 generated_iteration = 0;
@@ -1758,7 +1800,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastCycleBurst(const u8* data, bool isFill)
+	bool VitaVifTryFastCycleBurst(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		// PCSX2 owners: Vif_Unpack.cpp::_nVifUnpackLoop(), writeXYZW(),
 		// UNPACK_S(), UNPACK_V2(), UNPACK_V4(), UNPACK_V4_5(), and generated
@@ -1792,6 +1835,11 @@ namespace
 		if (vu_mem_offset + max_write_end > vu_mem_size)
 			return false;
 
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::VifUnpackCycle,
+			profile_cpu0);
+#endif
 		const u32 vsize = nVifT[format];
 		const u32 generated_alignment = VitaVifGeneratedAlignment(vif, format);
 		const u32 skip_size = isFill ? 0u : (static_cast<u32>(regs.cycle.cl) - wl) * 16u;
@@ -1853,7 +1901,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastPlainUnmasked(const u8* data, bool isFill)
+	bool VitaVifTryFastPlainUnmasked(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		vifStruct& vif = MTVU_VifX;
 		VIFregisters& regs = MTVU_VifXRegs;
@@ -1867,6 +1916,13 @@ namespace
 		if (VitaVifIsV3Format(format))
 			return false;
 
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			format == 0x0c ?
+				VitaPerformanceTelemetry::CpuStage::VifUnpackCopy :
+				VitaPerformanceTelemetry::CpuStage::VifUnpackWiden,
+			profile_cpu0);
+#endif
 		const int vsize = nVifT[format];
 		const int skip_size = (regs.cycle.cl - regs.cycle.wl) * 16;
 		do
@@ -1902,7 +1958,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastV4_5(const u8* data, bool isFill)
+	bool VitaVifTryFastV4_5(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		vifStruct& vif = MTVU_VifX;
 		VIFregisters& regs = MTVU_VifXRegs;
@@ -1911,6 +1968,12 @@ namespace
 			return false;
 
 		const bool doMask = (upk_num & 0x10) != 0;
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			doMask ? VitaPerformanceTelemetry::CpuStage::VifUnpackModeMask :
+				VitaPerformanceTelemetry::CpuStage::VifUnpackWiden,
+			profile_cpu0);
+#endif
 		constexpr int vsize = 2;
 		const int skip_size = (regs.cycle.cl - regs.cycle.wl) * 16;
 		do
@@ -1945,7 +2008,8 @@ namespace
 	}
 
 	template <int idx>
-	bool VitaVifTryFastUnpack(const u8* data, bool isFill)
+	bool VitaVifTryFastUnpack(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		vifStruct& vif = MTVU_VifX;
 		VIFregisters& regs = MTVU_VifXRegs;
@@ -1956,6 +2020,13 @@ namespace
 
 		const bool doMask = (upk_num & 0x10) != 0;
 		const u32 mode = regs.mode & 0x3;
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			doMask || mode != 0 ?
+				VitaPerformanceTelemetry::CpuStage::VifUnpackModeMask :
+				VitaPerformanceTelemetry::CpuStage::VifUnpackWiden,
+			profile_cpu0);
+#endif
 		const int vsize = nVifT[format];
 		const int skip_size = (regs.cycle.cl - regs.cycle.wl) * 16;
 		u32 generated_iteration = 0;
@@ -2001,7 +2072,8 @@ namespace
 	}
 
 	template <int idx>
-	void VitaVifGenericUnpackLoop(const u8* data, bool isFill)
+	void VitaVifGenericUnpackLoop(
+		const u8* data, bool isFill, bool profile_cpu0)
 	{
 		// PCSX2 owner: Vif_Unpack.cpp::_nVifUnpackLoop(). Vita reuses the
 		// interpreter-owned VIFfuncTable entries and avoids the desktop
@@ -2014,6 +2086,11 @@ namespace
 		const UNPACKFUNCTYPE unpack =
 			VIFfuncTable[idx][regs.mode ? regs.mode : 0][((vif.usn ? 1 : 0) * 2 * 16) + upk_num];
 
+#if defined(VITASX2_CPU_PROFILER)
+		const VitaPerformanceTelemetry::ScopedCpuStatisticalStage profile_stage(
+			VitaPerformanceTelemetry::CpuStage::VifUnpackGeneric,
+			profile_cpu0);
+#endif
 		do
 		{
 			unpack(VitaVifVuMemPtr<idx>(vif.tag.addr), data);
@@ -2057,40 +2134,57 @@ void dVifRelease(int idx)
 }
 
 template <int idx>
+static void VitaVifUnpack(
+	const u8* data, bool isFill, bool profile_cpu0)
+{
+	if (VitaVifTryFastV4Burst<idx>(data, isFill, profile_cpu0))
+		return;
+
+	if (VitaVifTryFastV4_5Burst<idx>(data, isFill, profile_cpu0))
+		return;
+
+	if (VitaVifTryFastSAndV2Burst<idx>(data, isFill, profile_cpu0))
+		return;
+
+	if (VitaVifTryFastV3Burst<idx>(data, isFill, profile_cpu0))
+		return;
+
+	if (VitaVifTryFastV4ModeBurst<idx>(data, isFill, profile_cpu0))
+		return;
+
+	if (VitaVifTryFastModeMaskBurst<idx>(data, isFill, profile_cpu0))
+		return;
+
+	if (VitaVifTryFastCycleBurst<idx>(data, isFill, profile_cpu0))
+		return;
+
+	if (VitaVifTryFastPlainUnmasked<idx>(data, isFill, profile_cpu0))
+		return;
+
+	if (VitaVifTryFastV4_5<idx>(data, isFill, profile_cpu0))
+		return;
+
+	if (VitaVifTryFastUnpack<idx>(data, isFill, profile_cpu0))
+		return;
+
+	VitaVifGenericUnpackLoop<idx>(data, isFill, profile_cpu0);
+}
+
+template <int idx>
 void dVifUnpack(const u8* data, bool isFill)
 {
-	if (VitaVifTryFastV4Burst<idx>(data, isFill))
-		return;
+	// This entry is called by MTVU. Never publish CPU0-only profiling state
+	// from the worker, even though VIF0 validation also exercises the symbol.
+	VitaVifUnpack<idx>(data, isFill, false);
+}
 
-	if (VitaVifTryFastV4_5Burst<idx>(data, isFill))
-		return;
-
-	if (VitaVifTryFastSAndV2Burst<idx>(data, isFill))
-		return;
-
-	if (VitaVifTryFastV3Burst<idx>(data, isFill))
-		return;
-
-	if (VitaVifTryFastV4ModeBurst<idx>(data, isFill))
-		return;
-
-	if (VitaVifTryFastModeMaskBurst<idx>(data, isFill))
-		return;
-
-	if (VitaVifTryFastCycleBurst<idx>(data, isFill))
-		return;
-
-	if (VitaVifTryFastPlainUnmasked<idx>(data, isFill))
-		return;
-
-	if (VitaVifTryFastV4_5<idx>(data, isFill))
-		return;
-
-	if (VitaVifTryFastUnpack<idx>(data, isFill))
-		return;
-
-	VitaVifGenericUnpackLoop<idx>(data, isFill);
+template <int idx>
+void dVifUnpackCpu0(const u8* data, bool isFill)
+{
+	VitaVifUnpack<idx>(data, isFill, true);
 }
 
 template void dVifUnpack<0>(const u8* data, bool isFill);
 template void dVifUnpack<1>(const u8* data, bool isFill);
+template void dVifUnpackCpu0<0>(const u8* data, bool isFill);
+template void dVifUnpackCpu0<1>(const u8* data, bool isFill);

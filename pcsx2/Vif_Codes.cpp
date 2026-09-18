@@ -9,11 +9,17 @@
 #include "Vif_Dma.h"
 #include "Vif_Dynarec.h"
 
+#if defined(VITASX2_VIF_EPOCH_CENSUS)
+#include "vita/VitaPerformanceTelemetry.h"
+#include "vita/VitaVifEpochCensus.h"
+#endif
+
 #if defined(ARCH_ARM32)
 #include <arm_neon.h>
 #endif
 
 #include <cstring>
+#include <iterator>
 
 #define vifOp(vifCodeName) _vifT int vifCodeName(int pass, const u32* data)
 #define pass1 if (pass == 0)
@@ -165,15 +171,68 @@ static __forceinline void VifMpgCopyBytes(void* dst, const void* src, size_t siz
 
 __ri void vifExecQueue(int idx)
 {
-	if (!GetVifX.queued_program || (VU0.VI[REG_VPU_STAT].UL & 1 << (idx * 8)))
-		return;
-
-	if (GetVifX.queued_gif_wait)
+#if defined(VITASX2_VIF_EPOCH_CENSUS)
+	const auto record_queue_result = [idx](
+		VitaVifEpochCensus::QueueResult result) {
+		const VitaVifEpochCensus::ScopedStatisticalStage accounting_stage(
+			VitaVifEpochCensus::StatisticalStage::Accounting);
+		VitaVifEpochCensus::RecordQueueResult(idx, result);
+	};
+	bool queued_program = false;
 	{
-		if (gifUnit.checkPaths(1, 1, 0))
-			return;
+		const VitaVifEpochCensus::ScopedStatisticalStage probe_stage(
+			VitaVifEpochCensus::StatisticalStage::QueueProbe);
+		queued_program = GetVifX.queued_program;
+	}
+	if (!queued_program)
+	{
+		record_queue_result(
+			VitaVifEpochCensus::QueueResult::Empty);
+		return;
 	}
 
+	bool queue_blocked = false;
+	{
+		const VitaVifEpochCensus::ScopedStatisticalStage observer_stage(
+			VitaVifEpochCensus::StatisticalStage::QueueObserver);
+		queue_blocked =
+			(VU0.VI[REG_VPU_STAT].UL & 1 << (idx * 8)) != 0;
+	}
+	if (queue_blocked)
+	{
+		record_queue_result(
+			VitaVifEpochCensus::QueueResult::BlockedVu);
+		return;
+	}
+
+	bool gif_blocked = false;
+	{
+		const VitaVifEpochCensus::ScopedStatisticalStage observer_stage(
+			VitaVifEpochCensus::StatisticalStage::QueueObserver);
+		gif_blocked = GetVifX.queued_gif_wait &&
+			gifUnit.checkPaths(1, 1, 0);
+	}
+	if (gif_blocked)
+	{
+		record_queue_result(
+			VitaVifEpochCensus::QueueResult::BlockedGif);
+		return;
+	}
+
+	record_queue_result(
+		VitaVifEpochCensus::QueueResult::Executed);
+	const VitaVifEpochCensus::ScopedStatisticalStage execution_stage(
+		VitaVifEpochCensus::StatisticalStage::QueueExecution);
+#else
+	if (!GetVifX.queued_program ||
+		(VU0.VI[REG_VPU_STAT].UL & 1 << (idx * 8)))
+	{
+		return;
+	}
+
+	if (GetVifX.queued_gif_wait && gifUnit.checkPaths(1, 1, 0))
+		return;
+#endif
 	GetVifX.queued_program = false;
 
 	if (!idx)
@@ -292,6 +351,15 @@ __fi int _vifCode_Direct(int pass, const u8* data, bool isDirectHL)
 		const char* name = isDirectHL ? "DirectHL" : "Direct";
 		const GIF_TRANSFER_TYPE tranType = isDirectHL ? GIF_TRANS_DIRECTHL : GIF_TRANS_DIRECT;
 		const uint size = std::min(vif1.vifpacketsize, vif1.tag.size) * 4; // Get size in bytes
+		// DIRECT is an architectural PATH1/PATH2 visibility boundary.  It can
+		// synchronously wait for MTGS consumption while this enclosing VIF1
+		// transfer still owns unpublished MTVU Execute/UNPACK records.  Publish
+		// those records and the final generated PATH1 marker before entering GIF.
+		if (THREAD_VU1)
+		{
+			vu1Thread.PublishPendingVifBatch();
+			vu1Thread.RequestGpuVuPath1Flush();
+		}
 		const uint ret = gifUnit.TransferGSPacketData(tranType, (u8*)data, size);
 
 		vif1.tag.size -= ret / 4; // Convert to u32's
@@ -900,42 +968,36 @@ vifOp(vifCode_Unpack)
 // Vif0/Vif1 Code Tables
 //------------------------------------------------------------------
 
+namespace
+{
+#define VITASX2_VIF_COMMAND(opcode, handler, name) opcode,
+	constexpr u8 VifCommandManifestOpcodes[] = {
+#include "Vif_CommandManifest.inc"
+	};
+
+	constexpr bool ValidateVifCommandManifestOpcodes()
+	{
+		if (std::size(VifCommandManifestOpcodes) != 128)
+			return false;
+		for (size_t index = 0; index < std::size(VifCommandManifestOpcodes); index++)
+		{
+			if (VifCommandManifestOpcodes[index] != index)
+				return false;
+		}
+		return true;
+	}
+
+	static_assert(ValidateVifCommandManifestOpcodes());
+} // namespace
+
 alignas(16) FnType_VifCmdHandler* const vifCmdHandler[2][128] =
 {
 	{
-		vifCode_Nop<0>     , vifCode_STCycl<0>  , vifCode_Offset<0>	, vifCode_Base<0>   , vifCode_ITop<0>   , vifCode_STMod<0>  , vifCode_MskPath3<0>, vifCode_Mark<0>,   /*0x00*/
-		vifCode_Null<0>    , vifCode_Null<0>    , vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>    , vifCode_Null<0>,   /*0x08*/
-		vifCode_FlushE<0>  , vifCode_Flush<0>   , vifCode_Null<0>	, vifCode_FlushA<0> , vifCode_MSCAL<0>  , vifCode_MSCALF<0> , vifCode_Null<0>	 , vifCode_MSCNT<0>,  /*0x10*/
-		vifCode_Null<0>    , vifCode_Null<0>    , vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>    , vifCode_Null<0>,   /*0x18*/
-		vifCode_STMask<0>  , vifCode_Null<0>    , vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>	 , vifCode_Null<0>,   /*0x20*/
-		vifCode_Null<0>    , vifCode_Null<0>    , vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>	 , vifCode_Null<0>,   /*0x28*/
-		vifCode_STRow<0>   , vifCode_STCol<0>	, vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>	 , vifCode_Null<0>,   /*0x30*/
-		vifCode_Null<0>    , vifCode_Null<0>    , vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>    , vifCode_Null<0>,   /*0x38*/
-		vifCode_Null<0>    , vifCode_Null<0>    , vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>    , vifCode_Null<0>,   /*0x40*/
-		vifCode_Null<0>    , vifCode_Null<0>    , vifCode_MPG<0>	, vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>    , vifCode_Null<0>,   /*0x48*/
-		vifCode_Direct<0>  , vifCode_DirectHL<0>, vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>    , vifCode_Null<0>,   /*0x50*/
-		vifCode_Null<0>	   , vifCode_Null<0>	, vifCode_Null<0>	, vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>   , vifCode_Null<0>    , vifCode_Null<0>,   /*0x58*/
-		vifCode_Unpack<0>  , vifCode_Unpack<0>  , vifCode_Unpack<0>	, vifCode_Unpack<0> , vifCode_Unpack<0> , vifCode_Unpack<0> , vifCode_Unpack<0>  , vifCode_Null<0>,   /*0x60*/
-		vifCode_Unpack<0>  , vifCode_Unpack<0>  , vifCode_Unpack<0>	, vifCode_Unpack<0> , vifCode_Unpack<0> , vifCode_Unpack<0> , vifCode_Unpack<0>  , vifCode_Unpack<0>, /*0x68*/
-		vifCode_Unpack<0>  , vifCode_Unpack<0>  , vifCode_Unpack<0>	, vifCode_Unpack<0> , vifCode_Unpack<0> , vifCode_Unpack<0> , vifCode_Unpack<0>  , vifCode_Null<0>,   /*0x70*/
-		vifCode_Unpack<0>  , vifCode_Unpack<0>  , vifCode_Unpack<0>	, vifCode_Null<0>   , vifCode_Unpack<0> , vifCode_Unpack<0> , vifCode_Unpack<0>  , vifCode_Unpack<0>  /*0x78*/
+#define VITASX2_VIF_COMMAND(opcode, handler, name) vifCode_##handler<0>,
+#include "Vif_CommandManifest.inc"
 	},
 	{
-		vifCode_Nop<1>     , vifCode_STCycl<1>  , vifCode_Offset<1>	, vifCode_Base<1>   , vifCode_ITop<1>   , vifCode_STMod<1>  , vifCode_MskPath3<1>, vifCode_Mark<1>,   /*0x00*/
-		vifCode_Null<1>    , vifCode_Null<1>    , vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>    , vifCode_Null<1>,   /*0x08*/
-		vifCode_FlushE<1>  , vifCode_Flush<1>   , vifCode_Null<1>	, vifCode_FlushA<1> , vifCode_MSCAL<1>  , vifCode_MSCALF<1> , vifCode_Null<1>	 , vifCode_MSCNT<1>,  /*0x10*/
-		vifCode_Null<1>    , vifCode_Null<1>    , vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>    , vifCode_Null<1>,   /*0x18*/
-		vifCode_STMask<1>  , vifCode_Null<1>    , vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>	 , vifCode_Null<1>,   /*0x20*/
-		vifCode_Null<1>    , vifCode_Null<1>    , vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>	 , vifCode_Null<1>,   /*0x28*/
-		vifCode_STRow<1>   , vifCode_STCol<1>	, vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>	 , vifCode_Null<1>,   /*0x30*/
-		vifCode_Null<1>    , vifCode_Null<1>    , vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>    , vifCode_Null<1>,   /*0x38*/
-		vifCode_Null<1>    , vifCode_Null<1>    , vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>    , vifCode_Null<1>,   /*0x40*/
-		vifCode_Null<1>    , vifCode_Null<1>    , vifCode_MPG<1>	, vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>    , vifCode_Null<1>,   /*0x48*/
-		vifCode_Direct<1>  , vifCode_DirectHL<1>, vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>    , vifCode_Null<1>,   /*0x50*/
-		vifCode_Null<1>	   , vifCode_Null<1>	, vifCode_Null<1>	, vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>   , vifCode_Null<1>    , vifCode_Null<1>,   /*0x58*/
-		vifCode_Unpack<1>  , vifCode_Unpack<1>  , vifCode_Unpack<1>	, vifCode_Unpack<1> , vifCode_Unpack<1> , vifCode_Unpack<1> , vifCode_Unpack<1>  , vifCode_Null<1>,   /*0x60*/
-		vifCode_Unpack<1>  , vifCode_Unpack<1>  , vifCode_Unpack<1>	, vifCode_Unpack<1> , vifCode_Unpack<1> , vifCode_Unpack<1> , vifCode_Unpack<1>  , vifCode_Unpack<1>, /*0x68*/
-		vifCode_Unpack<1>  , vifCode_Unpack<1>  , vifCode_Unpack<1>	, vifCode_Unpack<1> , vifCode_Unpack<1> , vifCode_Unpack<1> , vifCode_Unpack<1>  , vifCode_Null<1>,   /*0x70*/
-		vifCode_Unpack<1>  , vifCode_Unpack<1>  , vifCode_Unpack<1>	, vifCode_Null<1>   , vifCode_Unpack<1> , vifCode_Unpack<1> , vifCode_Unpack<1>  , vifCode_Unpack<1>  /*0x78*/
+#define VITASX2_VIF_COMMAND(opcode, handler, name) vifCode_##handler<1>,
+#include "Vif_CommandManifest.inc"
 	}
 };
