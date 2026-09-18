@@ -36,9 +36,8 @@ Retail games:
 * SLUS-20680 SpongeBob SquarePants - Battle for Bikini Bottom: 4 FPS
 * SLUS-20591 Dragon Ball Z - Budokai: 2 FPS
 
-## No more further optimization potential
-There's no "just optimize it more" for VitaSX2. All optimizations have already been used. VitaSX2 is already an extremely well optimized emulator.   
-VitaSX2 is already the fastest PS2 emulator that runs on AArch32 hardware, the hard bottleneck is the Vita's slow CPU.   
+## Further optimizations give diminishing returns
+There's no "just optimize it more" for VitaSX2. VitaSX2 is already an extremely well optimized emulator. The hard bottleneck is the Vita's slow CPU.   
 Optimizing further would yield a 1 or 2 FPS gain at best, not the 10x faster increase you'd want for a playable emulator. The SGX543MP4+ GPU is also the bottleneck in some workloads, notably the PS2 BIOS, with little to no optimization potential.  
 
 This emulator already pushes the Vita to its theoretical limit.
