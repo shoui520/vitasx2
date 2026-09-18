@@ -377,23 +377,36 @@ target_link_libraries(pcsx2core PUBLIC
 # Sony's api_libgxm/basic sample owns the shader pipeline used here: compile
 # Cg to GXP with psp2cgc, then embed the program with psp2bin at four-byte
 # alignment. VitaSDK deliberately does not ship Sony's shader compiler.
-set(VITASX2_PSP2_SDK_ROOT
-	"$ENV{VITASX2_PSP2_SDK_ROOT}"
+set(VITASX2_PSP2_SDK_ROOT_DEFAULT "")
+if(DEFINED ENV{VITASX2_PSP2_SDK_ROOT} AND
+		NOT "$ENV{VITASX2_PSP2_SDK_ROOT}" STREQUAL "")
+	file(TO_CMAKE_PATH "$ENV{VITASX2_PSP2_SDK_ROOT}"
+		VITASX2_PSP2_SDK_ROOT_DEFAULT)
+endif()
+set(VITASX2_PSP2_SDK_ROOT "${VITASX2_PSP2_SDK_ROOT_DEFAULT}"
 	CACHE PATH "Root of the official Sony PSP2 SDK used for GXM shader compilation")
-set(VITASX2_PSP2CGC_3570_PATCH
-	"$ENV{VITASX2_PSP2CGC}")
-set(VITASX2_PSP2CGC_DEFAULT
-	"${VITASX2_PSP2_SDK_ROOT}/host_tools/bin/psp2cgc.exe")
-if(EXISTS "${VITASX2_PSP2CGC_3570_PATCH}")
-	# Sony's 3.570.021 compiler patch is build 13284, superseding the base
-	# 3.5.0 build 13276. Both produce the same measured FMAC resource shape;
-	# prefer the maintenance build without making it a source-support gate.
-	set(VITASX2_PSP2CGC_DEFAULT "${VITASX2_PSP2CGC_3570_PATCH}")
+
+set(VITASX2_PSP2CGC_DEFAULT "")
+if(DEFINED ENV{VITASX2_PSP2CGC} AND
+		NOT "$ENV{VITASX2_PSP2CGC}" STREQUAL "")
+	file(TO_CMAKE_PATH "$ENV{VITASX2_PSP2CGC}" VITASX2_PSP2CGC_DEFAULT)
+elseif(VITASX2_PSP2_SDK_ROOT)
+	set(VITASX2_PSP2CGC_DEFAULT
+		"${VITASX2_PSP2_SDK_ROOT}/host_tools/bin/psp2cgc.exe")
 endif()
 set(VITASX2_PSP2CGC "${VITASX2_PSP2CGC_DEFAULT}"
 	CACHE FILEPATH "Official Sony PSP2 Cg compiler executable")
-set(VITASX2_PSP2BIN
-	"${VITASX2_PSP2_SDK_ROOT}/host_tools/build/bin/psp2bin.exe")
+
+set(VITASX2_PSP2BIN_DEFAULT "")
+if(DEFINED ENV{VITASX2_PSP2BIN} AND
+		NOT "$ENV{VITASX2_PSP2BIN}" STREQUAL "")
+	file(TO_CMAKE_PATH "$ENV{VITASX2_PSP2BIN}" VITASX2_PSP2BIN_DEFAULT)
+elseif(VITASX2_PSP2_SDK_ROOT)
+	set(VITASX2_PSP2BIN_DEFAULT
+		"${VITASX2_PSP2_SDK_ROOT}/host_tools/build/bin/psp2bin.exe")
+endif()
+set(VITASX2_PSP2BIN "${VITASX2_PSP2BIN_DEFAULT}"
+	CACHE FILEPATH "Official Sony PSP2 shader embedding tool executable")
 set(VITASX2_GXM_SHADER_OBJECTS)
 set(VITASX2_GXM_SHADER_ASSETS)
 set(VITASX2_GPU_VU_UNIVERSAL_CG_PATH
@@ -420,7 +433,7 @@ if(NOT EXISTS "${VITASX2_PSP2CGC}" OR NOT EXISTS "${VITASX2_PSP2BIN}")
 	# targeted diagnostic instead of silently producing a renderer without GXP.
 	add_custom_target(vitasx2-gxm-shaders
 		COMMAND "${CMAKE_COMMAND}" -E echo
-			"The official PSP2 SDK psp2cgc/psp2bin tools are required for pcsx2core; set VITASX2_PSP2_SDK_ROOT."
+			"The official PSP2 SDK psp2cgc/psp2bin tools are required for pcsx2core; export VITASX2_PSP2_SDK_ROOT or set VITASX2_PSP2CGC and VITASX2_PSP2BIN."
 		COMMAND "${CMAKE_COMMAND}" -E false
 		VERBATIM)
 else()
