@@ -31,6 +31,7 @@
 #include "common/FileSystem.h"
 #include "common/Path.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -149,6 +150,7 @@ namespace Pcsx2Trace
 			u64 vif_state_hash[2];
 			u64 dmac_state_hash;
 		};
+
 #pragma pack(pop)
 
 		static_assert(sizeof(MachineCheckpointTraceFileHeader) == 48,

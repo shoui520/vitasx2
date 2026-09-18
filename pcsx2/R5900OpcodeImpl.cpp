@@ -787,7 +787,7 @@ void SW()
 	if (addr & 3) [[unlikely]]
 		RaiseAddressError(addr, true);
 
-  memWrite32(addr, cpuRegs.GPR.r[_Rt_].UL[0]);
+	memWrite32(addr, cpuRegs.GPR.r[_Rt_].UL[0]);
 }
 
 static const u32 SWL_MASK[4] = { 0xffffff00, 0xffff0000, 0xff000000, 0x00000000 };
