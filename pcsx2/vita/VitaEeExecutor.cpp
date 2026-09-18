@@ -77,6 +77,40 @@ namespace
 			const u32 op = memRead32(start_pc + i * sizeof(u32));
 			const u32 primary = op >> 26;
 			mix.instructions++;
+			switch (primary)
+			{
+				case 0x1a: // LDL
+				case 0x1b: // LDR
+				case 0x1e: // LQ
+				case 0x20: // LB
+				case 0x21: // LH
+				case 0x22: // LWL
+				case 0x23: // LW
+				case 0x24: // LBU
+				case 0x25: // LHU
+				case 0x26: // LWR
+				case 0x27: // LWU
+				case 0x31: // LWC1
+				case 0x36: // LQC2
+				case 0x37: // LD
+					mix.memory_load++;
+					break;
+				case 0x1f: // SQ
+				case 0x28: // SB
+				case 0x29: // SH
+				case 0x2a: // SWL
+				case 0x2b: // SW
+				case 0x2c: // SDL
+				case 0x2d: // SDR
+				case 0x2e: // SWR
+				case 0x39: // SWC1
+				case 0x3e: // SQC2
+				case 0x3f: // SD
+					mix.memory_store++;
+					break;
+				default:
+					break;
+			}
 			// Keep this classification aligned with the top-level owners in
 			// BlockCompiler::CanCompileOpcode()/EmitOpcode().  Branch is checked
 			// first so COP0/1/2 conditional branches are control-flow work rather
@@ -151,6 +185,11 @@ namespace
 	extern "C" __attribute__((noinline)) u32 VitaEeA32EventExit()
 	{
 		return static_cast<u32>(VitaEE::BlockExitKind::Event);
+	}
+
+	extern "C" __attribute__((noinline)) u32 VitaEeA32SchedulerElidedDirectExit()
+	{
+		return EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN;
 	}
 
 	bool DecodeExitKind(u32 value, VitaEE::BlockExitKind* exit,
@@ -325,7 +364,7 @@ namespace VitaEE
 			if (GeneratedLookupPage* page =
 					GetGeneratedLookupPage(block.start_pc, true))
 			{
-				page->entry_points[index] = LinkedEntryPoint(block);
+				page->entry_points[index] = PublishedGeneratedEntry(block);
 			}
 		}
 	}
@@ -559,10 +598,10 @@ namespace VitaEE
 			return false;
 		}
 
-		if (block.poll_call_wait_loop_source_proof.valid &&
-			(!capture_span(block.poll_call_wait_loop_source_proof.call_pc,
+		if (block.poll_call_wait_loop_source_proof &&
+			(!capture_span(block.poll_call_wait_loop_source_proof->call_pc,
 					2 * sizeof(u32), true) ||
-			 !capture_span(block.poll_call_wait_loop_source_proof.leaf_pc,
+			 !capture_span(block.poll_call_wait_loop_source_proof->leaf_pc,
 					2 * sizeof(u32), true)))
 		{
 			// The call-through proof is novel only for ordinary EE RAM. Handler,
@@ -573,10 +612,10 @@ namespace VitaEE
 			block.ram_source_fragment_count = 0;
 			return false;
 		}
-		if (block.two_predicate_wait_loop_source_proof.valid &&
+		if (block.two_predicate_wait_loop_source_proof &&
 			!capture_span(
-				block.two_predicate_wait_loop_source_proof.loop_pc,
-				block.two_predicate_wait_loop_source_proof.instruction_count *
+				block.two_predicate_wait_loop_source_proof->loop_pc,
+				block.two_predicate_wait_loop_source_proof->instruction_count *
 					sizeof(u32),
 				true))
 		{
@@ -786,8 +825,15 @@ namespace VitaEE
 	{
 		if (context)
 		{
-			static_cast<BlockExecutor*>(context)->InvalidateRamSourceRange(
+			BlockExecutor* const executor =
+				static_cast<BlockExecutor*>(context);
+			const u32 invalidated = executor->InvalidateRamSourceRange(
 				backing_start, size);
+			if (invalidated != 0 &&
+				executor->m_persistent_region_resume_active != 0)
+			{
+				executor->m_persistent_region_resume_requires_boundary = 1;
+			}
 		}
 	}
 
@@ -843,10 +889,17 @@ namespace VitaEE
 		return nullptr;
 	}
 
+	void BlockExecutor::AdvanceSourceGeneration()
+	{
+		if (++m_source_generation == 0)
+			m_source_generation = 1;
+	}
+
 	void BlockExecutor::InvalidateCachedBlock(CachedBlock& block)
 	{
 		if (!block.valid)
 			return;
+		AdvanceSourceGeneration();
 
 		// A generated store can invalidate the block which is currently running.
 		// Restore every outgoing patch site before removing any metadata so its
@@ -873,8 +926,8 @@ namespace VitaEE
 		block.compatible_vtlb_fast_entries = {};
 		block.compatible_link_entry_loads = 0;
 		block.direct_links = {};
-		block.poll_call_wait_loop_source_proof = {};
-		block.two_predicate_wait_loop_source_proof = {};
+		block.poll_call_wait_loop_source_proof.reset();
+		block.two_predicate_wait_loop_source_proof.reset();
 		block.ram_source_fragments = {};
 		block.ram_source_fragment_count = 0;
 		block.source_serial = 0;
@@ -1004,14 +1057,25 @@ namespace VitaEE
 		m_persistent_dispatch_entry = nullptr;
 		m_persistent_direct_exit = nullptr;
 		m_persistent_scheduler_elided_direct_exit = nullptr;
+		m_persistent_scheduler_elided_redispatch = nullptr;
 		m_persistent_event_exit = nullptr;
 		m_persistent_retained_wait_event_exit = nullptr;
+		m_persistent_region_generated_failure_exit = nullptr;
+		m_persistent_region_resume_active = 0;
+		m_persistent_region_resume_requires_boundary = 0;
+		ReleasePersistentRegionContinuationCodeCache();
 		ReleaseCodeCache();
 		return invalidated;
 	}
 
 	u32 BlockExecutor::Reset()
 	{
+		AdvanceSourceGeneration();
+		ClearPersistentRegionContinuations();
+		m_persistent_generated_entries = {};
+		m_persistent_generated_entry_count = 0;
+		m_persistent_region_resume_active = 0;
+		m_persistent_region_resume_requires_boundary = 0;
 		u32 invalidated = 0;
 		m_free_cache_head = nullptr;
 		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
@@ -1028,8 +1092,8 @@ namespace VitaEE
 			block.dependency_start_pc = 0;
 			block.dependency_instruction_count = 0;
 			block.dependency_charged_cycles_before = 0;
-			block.poll_call_wait_loop_source_proof = {};
-			block.two_predicate_wait_loop_source_proof = {};
+			block.poll_call_wait_loop_source_proof.reset();
+			block.two_predicate_wait_loop_source_proof.reset();
 			block.ram_source_fragments = {};
 			block.ram_source_fragment_count = 0;
 			block.source_serial = 0;
@@ -1060,6 +1124,7 @@ namespace VitaEE
 		// the base while resettable block code starts after it.
 		m_code_cache_used = m_persistent_dispatch_entry ?
 			PERSISTENT_DISPATCH_CODE_CAPACITY : 0;
+		ResetRegionCodeArena();
 		return invalidated;
 	}
 
@@ -1328,6 +1393,37 @@ namespace VitaEE
 		return false;
 	}
 
+	const PersistentGeneratedEntry*
+	BlockExecutor::FindPersistentGeneratedEntryRecord(u32 pc) const
+	{
+		for (u8 index = 0; index < m_persistent_generated_entry_count; index++)
+		{
+			if (m_persistent_generated_entries[index].pc == pc)
+				return &m_persistent_generated_entries[index];
+		}
+		return nullptr;
+	}
+
+	const void* BlockExecutor::FindPersistentGeneratedEntry(u32 pc) const
+	{
+		const PersistentGeneratedEntry* const entry =
+			FindPersistentGeneratedEntryRecord(pc);
+		return entry ? entry->entry_point : nullptr;
+	}
+
+	const void* BlockExecutor::PublishedGeneratedEntry(
+		const CachedBlock& block) const
+	{
+		if (IsPersistentDispatchBarrier(block.start_pc))
+			return nullptr;
+		if (const void* const region =
+				FindPersistentGeneratedEntry(block.start_pc))
+		{
+			return region;
+		}
+		return LinkedEntryPoint(block);
+	}
+
 	bool BlockExecutor::SetPersistentDispatchBarrier(u32 pc, bool enabled)
 	{
 		if ((pc & 0x3u) != 0)
@@ -1360,9 +1456,152 @@ namespace VitaEE
 			block->direct_continuation_kind ==
 			DirectContinuationKind::SchedulerTestedTail;
 		contract->specialized_wait =
-			block->poll_call_wait_loop_source_proof.valid ||
-			block->two_predicate_wait_loop_source_proof.valid;
+			block->poll_call_wait_loop_source_proof ||
+			block->two_predicate_wait_loop_source_proof;
 		return true;
+	}
+
+	bool BlockExecutor::GetRegionSourceBlockTopology(
+		u32 start_pc, RegionSourceBlockTopology* topology)
+	{
+		if (!topology || (start_pc & 3u) != 0)
+			return false;
+
+		CachedBlock* const block = FindLookupBlockByStartPc(start_pc, true);
+		if (!block || !block->valid || !block->discovered_topology ||
+			!ValidateCachedBlock(*block, true))
+		{
+			return false;
+		}
+
+		*topology = {};
+		topology->contract.start_pc = block->start_pc;
+		topology->contract.instruction_count = block->instruction_count;
+		topology->contract.dependency_start_pc = block->dependency_start_pc;
+		topology->contract.dependency_instruction_count =
+			block->dependency_instruction_count;
+		topology->contract.charged_scaled_cycles_before =
+			block->dependency_charged_cycles_before;
+		topology->contract.scheduler_test_at_end =
+			block->direct_continuation_kind ==
+			DirectContinuationKind::SchedulerTestedTail;
+		topology->contract.specialized_wait =
+			block->poll_call_wait_loop_source_proof ||
+			block->two_predicate_wait_loop_source_proof;
+
+		for (const DirectLinkSlot& link : block->direct_links.slots)
+		{
+			if (!link.valid || (link.target_pc & 3u) != 0)
+				continue;
+			bool duplicate = false;
+			for (u8 index = 0; index < topology->successor_count; index++)
+				duplicate |= topology->successors[index] == link.target_pc;
+			if (duplicate)
+				continue;
+			if (topology->successor_count >= topology->successors.size())
+				return false;
+			topology->successors[topology->successor_count++] = link.target_pc;
+		}
+		return true;
+	}
+
+	bool BlockExecutor::GetRegionDirectCallPredecessors(u32 callee_pc,
+		RegionDirectCallPredecessors* predecessors)
+	{
+		if (!predecessors || (callee_pc & 3u) != 0)
+			return false;
+		*predecessors = {};
+		std::array<u32, RegionDirectCallPredecessors::CAPACITY> instruction_counts{};
+
+		s32 index = LastIncomingLinkIndex(callee_pc);
+		while (index >= 0 && m_incoming_links[index].TargetPc() == callee_pc)
+		{
+			IncomingLinkRecord& record = m_incoming_links[index--];
+			DirectLinkSlot* const link = GetRecordedDirectLink(record);
+			CachedBlock* const source = record.source;
+			if (!link || !source || !source->valid || !source->discovered_topology ||
+				!source->opcodes || source->instruction_count < 2 ||
+				!CachedBlockSourceMatches(*source))
+			{
+				continue;
+			}
+
+			const u32 control_index = source->instruction_count - 2;
+			const u32 control_pc = source->start_pc + control_index * sizeof(u32);
+			const u32 opcode = source->opcodes[control_index];
+			if ((opcode >> 26) != 0x03)
+				continue;
+			const u32 target = ((control_pc + sizeof(u32)) & 0xf0000000u) |
+				((opcode & 0x03ffffffu) << 2);
+			if (target != callee_pc || link->target_pc != callee_pc)
+				continue;
+			bool duplicate = false;
+			for (u8 existing = 0; existing < predecessors->count; existing++)
+				duplicate |= predecessors->entry_pcs[existing] == source->start_pc;
+			if (duplicate)
+				continue;
+
+			// Prefer the predecessor which can eliminate the most tier-zero work.
+			// The comparison is source metadata only; it is not an admission proof.
+			u8 position = 0;
+			while (position < predecessors->count &&
+				instruction_counts[position] >= source->instruction_count)
+			{
+				position++;
+			}
+			if (position >= RegionDirectCallPredecessors::CAPACITY)
+				continue;
+			const u8 new_count = std::min<u8>(
+				static_cast<u8>(predecessors->count + 1),
+				RegionDirectCallPredecessors::CAPACITY);
+			for (u8 move = new_count - 1; move > position; move--)
+			{
+				predecessors->entry_pcs[move] = predecessors->entry_pcs[move - 1];
+				instruction_counts[move] = instruction_counts[move - 1];
+			}
+			predecessors->entry_pcs[position] = source->start_pc;
+			instruction_counts[position] = source->instruction_count;
+			predecessors->count = new_count;
+		}
+		return predecessors->count != 0;
+	}
+
+	bool BlockExecutor::GetRegionSourceBlockPredecessors(u32 target_pc,
+		RegionSourceBlockPredecessors* predecessors)
+	{
+		if (!predecessors || (target_pc & 3u) != 0)
+			return false;
+		*predecessors = {};
+
+		s32 index = LastIncomingLinkIndex(target_pc);
+		while (index >= 0 && m_incoming_links[index].TargetPc() == target_pc)
+		{
+			IncomingLinkRecord& record = m_incoming_links[index--];
+			DirectLinkSlot* const link = GetRecordedDirectLink(record);
+			CachedBlock* const source = record.source;
+			if (!link || !source || !source->valid ||
+				!source->discovered_topology || !CachedBlockSourceMatches(*source) ||
+				link->target_pc != target_pc)
+			{
+				continue;
+			}
+
+			bool duplicate = false;
+			for (u8 existing = 0; existing < predecessors->count; existing++)
+				duplicate |= predecessors->entry_pcs[existing] == source->start_pc;
+			if (duplicate)
+				continue;
+			if (predecessors->count >= predecessors->entry_pcs.size())
+			{
+				predecessors->truncated = true;
+				continue;
+			}
+			predecessors->entry_pcs[predecessors->count++] = source->start_pc;
+		}
+
+		std::sort(predecessors->entry_pcs.begin(),
+			predecessors->entry_pcs.begin() + predecessors->count);
+		return predecessors->count != 0;
 	}
 
 	bool BlockExecutor::SetCanonicalPersistentDispatchBarrier(
@@ -1373,6 +1612,48 @@ namespace VitaEE
 		// that identity through a subsequently changed TLB mapping would turn
 		// remove/clear into a lookup for a different seam.
 		const u32 pc = canonical_pc;
+		// RAM source ownership is already indexed by physical page for exact SMC
+		// invalidation. Reuse that authoritative index here instead of walking the
+		// complete 32K-block cache whenever a transient lifecycle/admission owner is
+		// published. A source record is live only while both its block and serial
+		// match; stale records deliberately remain in the page vector until the next
+		// cache reset, exactly as in InvalidateRamSourceRange(). Non-RAM owner hooks
+		// retain the bounded full-cache fallback because they have no physical source
+		// page identity.
+		auto for_each_canonical_block = [&](auto&& visit) {
+			const u32 exposed_ram = std::min(Ps2MemSize::ExposedRam,
+				Ps2MemSize::MainRam);
+			if (pc < exposed_ram)
+			{
+				const u32 page_index = pc >> RAM_SOURCE_PAGE_SHIFT;
+				if (page_index < RAM_SOURCE_PAGE_COUNT)
+				{
+					for (const RamSourceRecord& record :
+						m_ram_source_pages[page_index])
+					{
+						CachedBlock* const block = record.block;
+						if (!block || !block->valid ||
+							block->source_serial != record.serial ||
+							CanonicalizeRamBackedPc(block->start_pc) != pc)
+						{
+							continue;
+						}
+						visit(*block);
+					}
+					return;
+				}
+			}
+
+			for (const std::unique_ptr<CachedBlock>& entry : m_cache)
+			{
+				CachedBlock& block = *entry;
+				if (block.valid &&
+					CanonicalizeRamBackedPc(block.start_pc) == pc)
+				{
+					visit(block);
+				}
+			}
+		};
 
 		u8 index = 0;
 		while (index < m_persistent_dispatch_barrier_count &&
@@ -1397,18 +1678,14 @@ namespace VitaEE
 			// before the block. Existing aliases have distinct raw lookup slots even
 			// though PCSX2 gives them one physical block identity.
 			bool unlinked = true;
-			for (const std::unique_ptr<CachedBlock>& entry : m_cache)
-			{
-				CachedBlock& block = *entry;
-				if (!block.valid || CanonicalizeRamBackedPc(block.start_pc) != pc)
-					continue;
+			for_each_canonical_block([&](CachedBlock& block) {
 				if (GeneratedLookupPage* page =
 						GetGeneratedLookupPage(block.start_pc, false))
 				{
 					page->entry_points[LookupEntryIndex(block.start_pc)] = nullptr;
 				}
 				unlinked &= UnlinkIncomingLinks(block.start_pc);
-			}
+			});
 			// Keep the barrier installed and every generated lookup suppressed if a
 			// branch patch or instruction-cache publication fails. Returning false
 			// then makes the provider stop instead of executing past an owner hook.
@@ -1420,23 +1697,19 @@ namespace VitaEE
 		m_persistent_dispatch_barriers[index] =
 			m_persistent_dispatch_barriers[--m_persistent_dispatch_barrier_count];
 
-		for (const std::unique_ptr<CachedBlock>& entry : m_cache)
-		{
-			CachedBlock& block = *entry;
-			if (!block.valid || CanonicalizeRamBackedPc(block.start_pc) != pc)
-				continue;
+		for_each_canonical_block([&](CachedBlock& block) {
 			if (block.discovered_topology)
 			{
 				if (GeneratedLookupPage* page =
 						GetGeneratedLookupPage(block.start_pc, true))
 				{
 					page->entry_points[LookupEntryIndex(block.start_pc)] =
-						LinkedEntryPoint(block);
+						PublishedGeneratedEntry(block);
 				}
 			}
 			if (m_direct_linking_enabled)
 				PatchIncomingLinks(block);
-		}
+		});
 		return true;
 	}
 
@@ -1502,6 +1775,551 @@ namespace VitaEE
 			SetCanonicalPersistentDispatchBarrier(pc, false);
 		}
 	}
+
+	bool BlockExecutor::SetPersistentGeneratedEntries(
+		const PersistentGeneratedEntry* entries, size_t count)
+	{
+		if ((count != 0 && !entries) ||
+			count > MAX_PERSISTENT_GENERATED_ENTRIES)
+		{
+			return false;
+		}
+
+		std::array<PersistentGeneratedEntry,
+			MAX_PERSISTENT_GENERATED_ENTRIES> desired{};
+		for (size_t index = 0; index < count; index++)
+		{
+			if ((entries[index].pc & 3u) != 0 || !entries[index].entry_point)
+				return false;
+			if (entries[index].internal_source_block_count >
+					PersistentGeneratedEntry::MAX_INTERNAL_SOURCE_BLOCKS ||
+				(entries[index].external_incoming_only &&
+				 entries[index].internal_source_block_count == 0) ||
+				(!entries[index].external_incoming_only &&
+				 entries[index].internal_source_block_count != 0))
+			{
+				return false;
+			}
+			for (u8 source = 0;
+				source < entries[index].internal_source_block_count; source++)
+			{
+				if ((entries[index].internal_source_blocks[source] & 3u) != 0)
+					return false;
+				for (u8 previous_source = 0; previous_source < source;
+					previous_source++)
+				{
+					if (entries[index].internal_source_blocks[previous_source] ==
+						entries[index].internal_source_blocks[source])
+					{
+						return false;
+					}
+				}
+			}
+			if ((entries[index].compatible_entry_point == nullptr) !=
+					!entries[index].compatible_signature.IsValid())
+			{
+				return false;
+			}
+			for (size_t previous = 0; previous < index; previous++)
+			{
+				if (entries[previous].pc == entries[index].pc)
+					return false;
+			}
+			desired[index] = entries[index];
+		}
+
+		std::array<u32, MAX_PERSISTENT_GENERATED_ENTRIES * 2> changed{};
+		size_t changed_count = 0;
+		auto entries_equal = [](const PersistentGeneratedEntry& left,
+			const PersistentGeneratedEntry& right) {
+			return left.pc == right.pc &&
+				left.entry_point == right.entry_point &&
+				left.compatible_entry_point == right.compatible_entry_point &&
+				left.compatible_signature == right.compatible_signature &&
+				left.internal_source_blocks == right.internal_source_blocks &&
+				left.internal_source_block_count ==
+					right.internal_source_block_count &&
+				left.external_incoming_only == right.external_incoming_only;
+		};
+		auto append_changed = [&](u32 pc) {
+			for (size_t index = 0; index < changed_count; index++)
+			{
+				if (changed[index] == pc)
+					return;
+			}
+			changed[changed_count++] = pc;
+		};
+		// Publication is a transactional directory replacement, but an unchanged
+		// owner is not an executable-ownership change.  The former implementation
+		// appended every old and desired PC, so rotating one bounded hotness probe
+		// repatched every other probe/region and all of their incoming branches.
+		// On Cortex-A9 that made cold admission maintenance a measurable share of EE
+		// time.  Diff the complete entry contract and touch only owners whose lookup
+		// destination or compatible ABI actually changed.
+		for (u8 index = 0; index < m_persistent_generated_entry_count; index++)
+		{
+			const PersistentGeneratedEntry& current =
+				m_persistent_generated_entries[index];
+			const auto replacement = std::find_if(desired.begin(),
+				desired.begin() + count,
+				[&](const PersistentGeneratedEntry& entry) {
+					return entry.pc == current.pc;
+				});
+			if (replacement == desired.begin() + count ||
+				!entries_equal(current, *replacement))
+			{
+				append_changed(current.pc);
+			}
+		}
+		for (size_t index = 0; index < count; index++)
+		{
+			const PersistentGeneratedEntry& replacement = desired[index];
+			const auto current = std::find_if(
+				m_persistent_generated_entries.begin(),
+				m_persistent_generated_entries.begin() +
+					m_persistent_generated_entry_count,
+				[&](const PersistentGeneratedEntry& entry) {
+					return entry.pc == replacement.pc;
+				});
+			if (current == m_persistent_generated_entries.begin() +
+					m_persistent_generated_entry_count ||
+				!entries_equal(*current, replacement))
+			{
+				append_changed(replacement.pc);
+			}
+		}
+
+		m_persistent_generated_entries = desired;
+		m_persistent_generated_entry_count = static_cast<u8>(count);
+		bool published = true;
+		for (size_t changed_index = 0; changed_index < changed_count;
+			changed_index++)
+		{
+#if defined(VITASX2_QEMU_VALIDATION)
+			m_persistent_generated_publication_patches++;
+#endif
+			const u32 pc = changed[changed_index];
+			CachedBlock* const block = FindLookupBlockByStartPc(pc, true);
+			if (GeneratedLookupPage* page = GetGeneratedLookupPage(pc,
+					block != nullptr || FindPersistentGeneratedEntry(pc) != nullptr))
+			{
+				page->entry_points[LookupEntryIndex(pc)] =
+					IsPersistentDispatchBarrier(pc) ? nullptr :
+					(FindPersistentGeneratedEntry(pc) ?
+						FindPersistentGeneratedEntry(pc) :
+						(block ? LinkedEntryPoint(*block) : nullptr));
+			}
+			if (block && block->valid)
+				PatchIncomingLinks(*block);
+			else
+				published &= UnlinkIncomingLinks(pc);
+		}
+		return published;
+	}
+
+	void BlockExecutor::ClearPersistentGeneratedEntries()
+	{
+		(void)SetPersistentGeneratedEntries(nullptr, 0);
+	}
+
+	bool BlockExecutor::GetPersistentRegionAbi(PersistentRegionAbi* abi)
+	{
+		if (!abi || !m_persistent_dispatch_enabled ||
+			!EnsurePersistentDispatcher())
+		{
+			return false;
+		}
+		abi->scheduler_elided_redispatch =
+			m_persistent_scheduler_elided_redispatch;
+		abi->event_exit = m_persistent_event_exit;
+		abi->generated_failure_exit =
+			m_persistent_region_generated_failure_exit;
+		abi->resumed_fragment_active = &m_persistent_region_resume_active;
+		return abi->scheduler_elided_redispatch && abi->event_exit &&
+		       abi->generated_failure_exit && abi->resumed_fragment_active;
+	}
+
+	const void* BlockExecutor::GetPersistentDispatchEntryPoint(u32 start_pc)
+	{
+		if (IsPersistentDispatchBarrier(start_pc))
+			return nullptr;
+		if (const void* const region = FindPersistentGeneratedEntry(start_pc))
+			return region;
+		return GetPersistentTierZeroEntryPoint(start_pc);
+	}
+
+	const void* BlockExecutor::GetPersistentCompatibleDispatchEntryPoint(
+		u32 start_pc, const GprLinkSignature& signature)
+	{
+		if (!signature.IsValid() || IsPersistentDispatchBarrier(start_pc))
+			return nullptr;
+		if (const PersistentGeneratedEntry* const region =
+				FindPersistentGeneratedEntryRecord(start_pc))
+		{
+			if (region->compatible_entry_point &&
+				region->compatible_signature == signature)
+			{
+				return region->compatible_entry_point;
+			}
+			// The immutable tier-zero owner remains valid for this source
+			// generation. If a later region cannot accept the carried state, bypass
+			// it rather than materializing state after this exit was emitted.
+		}
+
+		CachedBlock* const block = FindLookupBlockByStartPc(start_pc, true);
+		if (!block || !block->valid || !ValidateCachedBlock(*block, true) ||
+			block->gpr_link_signature != signature ||
+			block->compatible_link_entry_offset == static_cast<size_t>(-1) ||
+			block->compatible_link_entry_offset >= block->code.Size())
+		{
+			return nullptr;
+		}
+		return CompatibleLinkEntryPoint(*block);
+	}
+
+	const void* BlockExecutor::GetPersistentCompatibleTierZeroEntryPoint(
+		u32 start_pc, const GprLinkSignature& signature)
+	{
+		if (!signature.IsValid())
+			return nullptr;
+		CachedBlock* const block = FindLookupBlockByStartPc(start_pc, true);
+		if (!block || !block->valid || !ValidateCachedBlock(*block, true) ||
+			block->gpr_link_signature != signature ||
+			block->compatible_link_entry_offset == static_cast<size_t>(-1) ||
+			block->compatible_link_entry_offset >= block->code.Size())
+		{
+			return nullptr;
+		}
+		return CompatibleLinkEntryPoint(*block);
+	}
+
+	const void* BlockExecutor::GetPersistentTierZeroEntryPoint(u32 start_pc)
+	{
+		CachedBlock* const block = FindLookupBlockByStartPc(start_pc, true);
+		if (!block || !block->valid || !ValidateCachedBlock(*block, true))
+			return nullptr;
+		return LinkedEntryPoint(*block);
+	}
+
+	bool BlockExecutor::AppendPersistentTierZeroProbe(VitaA32::CodeBuffer* code,
+		u32 start_pc, u32* observations, u32* observation_epoch,
+		const u32* current_epoch, u32* samples,
+		volatile u32* promotion_requested,
+		u32 promotion_threshold, u32 sample_budget,
+		const PersistentProbeIterationGuard* iteration_guard,
+		size_t* entry_offset,
+		size_t* compatible_entry_offset,
+		GprLinkSignature* compatible_signature)
+	{
+		if (!code || !observations || !promotion_requested ||
+			((observation_epoch != nullptr) != (current_epoch != nullptr)) ||
+			((iteration_guard != nullptr) != (samples != nullptr)) ||
+			((samples != nullptr) != (sample_budget != 0)) ||
+			promotion_threshold == 0 || !entry_offset ||
+			!compatible_entry_offset || !compatible_signature ||
+			!m_persistent_dispatch_enabled)
+		{
+			return false;
+		}
+
+		CachedBlock* const block = FindLookupBlockByStartPc(start_pc, true);
+		if (!block || !block->valid || !ValidateCachedBlock(*block, true))
+			return false;
+		const void* const tier_zero = LinkedEntryPoint(*block);
+
+		// The canonical form uses the generated-directory ABI established by
+		// EnsurePersistentDispatcher(): r4 owns cpuRegs, r7/r8 own the vTLB bases,
+		// and r0-r3/r12 plus APSR are scratch. A compatible form may preserve live
+		// state in r3, r5-r12, lr and NEON, so both forms deliberately touch only
+		// r0-r2. Incoming incompatible edges run their compiler-owned
+		// canonicalization leaf before reaching the canonical form.
+		constexpr unsigned TEMP0 = 0;
+		constexpr unsigned TEMP1 = 1;
+		constexpr unsigned TEMP2 = 2;
+		using VitaA32::Condition;
+		using VitaA32::ShiftType;
+		constexpr size_t GPR_OFFSET = offsetof(cpuRegisters, GPR);
+		auto compatible_guard_supported = [&]() {
+			if (!iteration_guard)
+				return true;
+			auto supports = [&](u8 guest) {
+				for (u8 index = 0; index < block->gpr_link_signature.count; index++)
+				{
+					const GprLinkMapping& mapping =
+						block->gpr_link_signature.mappings[index];
+					if (mapping.guest == guest)
+						return mapping.width == GprLinkWidth::Low64;
+				}
+				return true;
+			};
+			return supports(iteration_guard->counter_gpr) &&
+				(iteration_guard->kind !=
+						PersistentProbeIterationGuard::Kind::IncreasingEndpoint ||
+				 iteration_guard->bound_is_immediate ||
+				 supports(iteration_guard->bound_gpr));
+		};
+		auto emit_probe = [&](const void* target, size_t* offset,
+			bool compatible) {
+			if (!target || !offset)
+				return false;
+			*offset = code->Size();
+			std::array<std::pair<size_t, Condition>, 8> guard_failures{};
+			u32 guard_failure_count = 0;
+			auto fail_guard = [&](Condition condition) {
+				if (guard_failure_count >= guard_failures.size())
+					return false;
+				const size_t branch = code->EmitBranchPlaceholder(condition);
+				if (branch == static_cast<size_t>(-1))
+					return false;
+				guard_failures[guard_failure_count++] = {branch, condition};
+				return true;
+			};
+			auto load_gpr_word = [&](u8 guest, u8 word, unsigned destination) {
+				if (guest == 0 || guest >= 32 || word >= 2)
+					return false;
+				if (compatible)
+				{
+					for (u8 index = 0;
+						index < block->gpr_link_signature.count; index++)
+					{
+						const GprLinkMapping& mapping =
+							block->gpr_link_signature.mappings[index];
+						if (mapping.guest != guest)
+							continue;
+						const unsigned source = word == 0 ? mapping.low_host :
+							(mapping.width == GprLinkWidth::Low64 ?
+								mapping.high_host : GprLinkMapping::NO_HOST);
+						return source != GprLinkMapping::NO_HOST &&
+							(source == destination || code->EmitMovRegShiftImm(
+								destination, source, ShiftType::LSL, 0));
+					}
+				}
+				const size_t address = GPR_OFFSET +
+					static_cast<size_t>(guest) * sizeof(GPR_reg) +
+					word * sizeof(u32);
+				return address <= 4095 && code->EmitLdrImm12(
+					destination, HOST_CPU_REGS, static_cast<u16>(address));
+			};
+			if (observation_epoch)
+			{
+				// Establish one profitable uninterrupted scheduler epoch. A cumulative
+				// counter across many short invocations would admit a region whose
+				// first-class entry cost cannot be amortized. The scheduler owner advances
+				// current_epoch; the next latch resets locally without a hot C++ callback.
+				if (!code->EmitMovImm32(TEMP0, static_cast<u32>(
+						reinterpret_cast<uptr>(observation_epoch))) ||
+					!code->EmitLdrImm12(TEMP1, TEMP0, 0) ||
+					!code->EmitMovImm32(TEMP2, static_cast<u32>(
+						reinterpret_cast<uptr>(current_epoch))) ||
+					!code->EmitLdrImm12(TEMP2, TEMP2, 0) ||
+					!code->EmitCmpReg(TEMP1, TEMP2))
+				{
+					return false;
+				}
+				const size_t same_epoch =
+					code->EmitBranchPlaceholder(Condition::EQ);
+				if (same_epoch == static_cast<size_t>(-1) ||
+					!code->EmitStrImm12(TEMP2, TEMP0, 0) ||
+					!code->EmitMovImm32(TEMP0, static_cast<u32>(
+						reinterpret_cast<uptr>(observations))) ||
+					!code->EmitMovImm8(TEMP1, 0) ||
+					!code->EmitStrImm12(TEMP1, TEMP0, 0) ||
+					!code->PatchBranch(same_epoch, code->Size(), Condition::EQ))
+				{
+					return false;
+				}
+			}
+			if (samples)
+			{
+				// A dynamic counted loop must not be classified forever by its first
+				// invocation. Sample a bounded sequence of external entries; only the
+				// final miss asks the cold owner to suspend this generated probe.
+				if (!code->EmitMovImm32(TEMP0, static_cast<u32>(
+						reinterpret_cast<uptr>(samples))) ||
+					!code->EmitLdrImm12(TEMP1, TEMP0, 0) ||
+					!code->EmitAddImm8(TEMP1, TEMP1, 1) ||
+					!code->EmitStrImm12(TEMP1, TEMP0, 0))
+				{
+					return false;
+				}
+			}
+
+			if (iteration_guard)
+			{
+				const PersistentProbeIterationGuard& guard = *iteration_guard;
+				if (!load_gpr_word(guard.counter_gpr, 1, TEMP0) ||
+					!code->EmitCmpImm32(TEMP0, 0) || !fail_guard(Condition::NE) ||
+					!load_gpr_word(guard.counter_gpr, 0, TEMP1))
+				{
+					return false;
+				}
+				if (guard.require_counter_nonnegative &&
+					(!code->EmitTstImm32(TEMP1, 0x80000000u) ||
+					 !fail_guard(Condition::NE)))
+				{
+					return false;
+				}
+				if (guard.kind ==
+					PersistentProbeIterationGuard::Kind::DecrementCounter)
+				{
+					if ((guard.alignment_mask != 0 &&
+						 (!code->EmitTstImm32(TEMP1, guard.alignment_mask) ||
+						  !fail_guard(Condition::NE))) ||
+						!code->EmitCmpImm32(TEMP1, guard.threshold) ||
+						!fail_guard(Condition::CC))
+					{
+						return false;
+					}
+				}
+				else
+				{
+					if (guard.bound_is_immediate)
+					{
+						if (!code->EmitMovImm32(TEMP0, guard.bound_immediate))
+							return false;
+					}
+					else if (!load_gpr_word(guard.bound_gpr, 1, TEMP0) ||
+						!code->EmitCmpImm32(TEMP0, 0) ||
+						!fail_guard(Condition::NE) ||
+						!load_gpr_word(guard.bound_gpr, 0, TEMP0))
+					{
+						return false;
+					}
+					if ((guard.require_bound_nonnegative &&
+						 (!code->EmitTstImm32(TEMP0, 0x80000000u) ||
+						  !fail_guard(Condition::NE))) ||
+						!code->EmitCmpReg(TEMP1, TEMP0) ||
+						!fail_guard(Condition::CS) ||
+						!code->EmitSubReg(TEMP1, TEMP0, TEMP1) ||
+						(guard.alignment_mask != 0 &&
+						 (!code->EmitTstImm32(TEMP1, guard.alignment_mask) ||
+						  !fail_guard(Condition::NE))) ||
+						(guard.threshold != 0 &&
+						 (!code->EmitCmpImm32(TEMP1, guard.threshold) ||
+						  !fail_guard(Condition::CC))))
+					{
+						return false;
+					}
+				}
+			}
+			if (!(code->EmitMovImm32(TEMP0, static_cast<u32>(
+				reinterpret_cast<uptr>(observations))) &&
+				code->EmitLdrImm12(TEMP1, TEMP0, 0) &&
+				code->EmitAddImm8(TEMP1, TEMP1, 1) &&
+				code->EmitStrImm12(TEMP1, TEMP0, 0)))
+			{
+				return false;
+			}
+			const size_t promotion = code->Size();
+			if (!(code->EmitMovImm32(TEMP2, static_cast<u32>(reinterpret_cast<uptr>(
+					const_cast<u32*>(promotion_requested)))) &&
+				code->EmitMovImm8(TEMP0, 1) &&
+				(samples ?
+					code->EmitStrImm12(TEMP0, TEMP2, 0) :
+					(code->EmitCmpImm32(TEMP1, promotion_threshold) &&
+					 // Request the cold ownership transaction exactly once. Using GE here
+					 // made every later loop iteration reassert the shared flag.
+					 code->EmitStrImm12(TEMP0, TEMP2, 0, Condition::EQ)))))
+			{
+				return false;
+			}
+			const size_t promotion_tail = code->EmitBranchPlaceholder();
+			if (promotion_tail == static_cast<size_t>(-1))
+				return false;
+			const size_t miss = code->Size();
+			if (samples &&
+				!(code->EmitMovImm32(TEMP0, static_cast<u32>(
+					reinterpret_cast<uptr>(samples))) &&
+				  code->EmitLdrImm12(TEMP1, TEMP0, 0) &&
+				  code->EmitCmpImm32(TEMP1, sample_budget) &&
+				  code->EmitMovImm32(TEMP2, static_cast<u32>(reinterpret_cast<uptr>(
+					  const_cast<u32*>(promotion_requested)))) &&
+				  code->EmitMovImm8(TEMP0, 1) &&
+				  code->EmitStrImm12(TEMP0, TEMP2, 0, Condition::CS)))
+			{
+				return false;
+			}
+			const size_t tail = code->EmitBranchPlaceholder();
+			if (tail == static_cast<size_t>(-1) ||
+				!code->PatchBranch(promotion_tail, tail, Condition::AL))
+				return false;
+			for (u32 index = 0; index < guard_failure_count; index++)
+			{
+				if (!code->PatchBranch(guard_failures[index].first,
+						samples ? miss : tail,
+						guard_failures[index].second))
+				{
+					return false;
+				}
+			}
+			return code->PatchBranchToAddress(tail, target);
+		};
+
+		*compatible_entry_offset = static_cast<size_t>(-1);
+		*compatible_signature = GprLinkSignature{};
+		if (!emit_probe(tier_zero, entry_offset, false))
+			return false;
+		if (!block->gpr_link_signature.IsValid() ||
+			block->compatible_link_entry_offset == static_cast<size_t>(-1) ||
+			block->compatible_link_entry_offset >= block->code.Size() ||
+			!compatible_guard_supported())
+		{
+			return true;
+		}
+
+		*compatible_signature = block->gpr_link_signature;
+		return emit_probe(CompatibleLinkEntryPoint(*block),
+			compatible_entry_offset, true);
+	}
+
+	bool BlockExecutor::GetPersistentTierZeroLinkSignature(u32 start_pc,
+		GprLinkSignature* signature)
+	{
+		if (!signature)
+			return false;
+		*signature = GprLinkSignature{};
+		CachedBlock* const block = FindLookupBlockByStartPc(start_pc, true);
+		if (!block || !block->valid || !ValidateCachedBlock(*block, true) ||
+			!block->gpr_link_signature.IsValid())
+		{
+			return false;
+		}
+		*signature = block->gpr_link_signature;
+		return true;
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	const void* BlockExecutor::GetGeneratedLookupEntryForValidation(u32 pc) const
+	{
+		if (!m_generated_lookup_pages)
+			return nullptr;
+		const GeneratedLookupPage* const page =
+			m_generated_lookup_pages[LookupPageIndex(pc)];
+		return page ? page->entry_points[LookupEntryIndex(pc)] : nullptr;
+	}
+
+	bool BlockExecutor::SetGeneratedLookupEntryForValidation(
+		u32 pc, const void* entry_point)
+	{
+		if ((pc & 3u) != 0)
+			return false;
+		GeneratedLookupPage* const page = GetGeneratedLookupPage(
+			pc, entry_point != nullptr);
+		if (!page)
+			return entry_point == nullptr;
+		page->entry_points[LookupEntryIndex(pc)] = entry_point;
+		return true;
+	}
+
+	bool BlockExecutor::GetCompiledBlockEvidenceForValidation(u32 pc,
+		BlockExecutionResult* result)
+	{
+		if (!result)
+			return false;
+		CachedBlock* block = nullptr;
+		return PrepareCompiledBlockAtPc(pc, &block, result);
+	}
+#endif
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	void BlockExecutor::SetCompatibleGprDirtyCarryEnabled(bool enabled)
@@ -1801,14 +2619,17 @@ namespace VitaEE
 			m_persistent_dispatch_entry = nullptr;
 			m_persistent_direct_exit = nullptr;
 			m_persistent_scheduler_elided_direct_exit = nullptr;
+			m_persistent_scheduler_elided_redispatch = nullptr;
 			m_persistent_event_exit = nullptr;
 			m_persistent_retained_wait_event_exit = nullptr;
+			m_persistent_region_generated_failure_exit = nullptr;
 			return false;
 		};
 
 		VitaA32::CodeBuffer& code = m_persistent_dispatch_code;
 		const u16 frame = BlockCompiler::LINK_FRAME_REGISTER_MASK;
 		if (!code.EmitPush(frame | REG_LR) ||
+			!code.EmitVpushDRange(8, 8) ||
 			!code.EmitSubImm8(HOST_SP, HOST_SP, PERSISTENT_METADATA_SIZE) ||
 			!code.EmitStrImm12(1, HOST_SP, PERSISTENT_CONTEXT_OFFSET) ||
 			!code.EmitStrImm12(2, HOST_SP, PERSISTENT_CALLBACK_OFFSET) ||
@@ -1832,23 +2653,97 @@ namespace VitaEE
 			return fail();
 		}
 
-		const size_t direct_exit_offset = code.Size();
-		if (!code.EmitMovImm8(0, static_cast<u8>(BlockExitKind::Direct)))
-			return fail();
-		const size_t direct_to_common = code.EmitBranchPlaceholder();
-		if (direct_to_common == static_cast<size_t>(-1))
-			return fail();
+		// PCSX2 owner: _DynGen_DispatcherReg() selects the next BaseBlock from its
+		// generated lookup without returning through recExecute(). A direct A32 edge
+		// which could not be statically linked must do the same. The C++ provider is
+		// only the cold owner for a missing, barriered, or suspended target.
+		const auto emit_generated_direct_lookup =
+			[&code, this](u8 fallback_token, size_t* entry_offset,
+				size_t* to_common) {
+				if (!entry_offset || !to_common)
+					return false;
+				*entry_offset = code.Size();
+				if (!code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_SP,
+						PERSISTENT_VTLB_VMAP_OFFSET) ||
+					!code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_SP,
+						PERSISTENT_VTLB_HOST_BASE_OFFSET) ||
+					!code.EmitLdrImm12(HOST_BRANCH_TARGET, HOST_CPU_REGS, PC_OFFSET) ||
+					!code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+						reinterpret_cast<uptr>(&m_active_generated_lookup_pages))) ||
+					!code.EmitTstImm32(HOST_BRANCH_TARGET, 0x3))
+				{
+					return false;
+				}
+				const size_t unaligned =
+					code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+				if (unaligned == static_cast<size_t>(-1) ||
+					!code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0) ||
+					!code.EmitMovRegShiftImm(HOST_TMP1, HOST_BRANCH_TARGET,
+						VitaA32::ShiftType::LSR, 16) ||
+					!code.EmitCmpImm32(HOST_TMP0, 0))
+				{
+					return false;
+				}
+				const size_t no_directory =
+					code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+				if (no_directory == static_cast<size_t>(-1) ||
+					!code.EmitLdrRegShift(HOST_TMP0, HOST_TMP0, HOST_TMP1,
+						VitaA32::ShiftType::LSL, 2) ||
+					!code.EmitUbfx(HOST_TMP1, HOST_BRANCH_TARGET, 2, 14) ||
+					!code.EmitCmpImm32(HOST_TMP0, 0))
+				{
+					return false;
+				}
+				const size_t no_page =
+					code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+				if (no_page == static_cast<size_t>(-1) ||
+					!code.EmitLdrRegShift(HOST_CALLBACK, HOST_TMP0, HOST_TMP1,
+						VitaA32::ShiftType::LSL, 2) ||
+					!code.EmitCmpImm32(HOST_CALLBACK, 0))
+				{
+					return false;
+				}
+				const size_t no_entry =
+					code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+				if (no_entry == static_cast<size_t>(-1) ||
+					!code.EmitBx(HOST_CALLBACK))
+				{
+					return false;
+				}
 
-		const size_t scheduler_elided_direct_exit_offset = code.Size();
-		if (!code.EmitMovImm8(0,
-				static_cast<u8>(EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN)))
+				const size_t fallback = code.Size();
+				if (!code.PatchBranch(unaligned, fallback,
+						VitaA32::Condition::NE) ||
+					!code.PatchBranch(no_directory, fallback,
+						VitaA32::Condition::EQ) ||
+					!code.PatchBranch(no_page, fallback,
+						VitaA32::Condition::EQ) ||
+					!code.PatchBranch(no_entry, fallback,
+						VitaA32::Condition::EQ) ||
+					!code.EmitMovImm8(HOST_TMP0, fallback_token))
+				{
+					return false;
+				}
+				*to_common = code.EmitBranchPlaceholder();
+				return *to_common != static_cast<size_t>(-1);
+			};
+
+		size_t direct_exit_offset = 0;
+		size_t direct_to_common = 0;
+		if (!emit_generated_direct_lookup(static_cast<u8>(BlockExitKind::Direct),
+				&direct_exit_offset, &direct_to_common))
 		{
 			return fail();
 		}
-		const size_t scheduler_elided_direct_to_common =
-			code.EmitBranchPlaceholder();
-		if (scheduler_elided_direct_to_common == static_cast<size_t>(-1))
+		size_t scheduler_elided_direct_exit_offset = 0;
+		size_t scheduler_elided_direct_to_common = 0;
+		if (!emit_generated_direct_lookup(
+				static_cast<u8>(EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN),
+				&scheduler_elided_direct_exit_offset,
+				&scheduler_elided_direct_to_common))
+		{
 			return fail();
+		}
 
 		const size_t event_exit_offset = code.Size();
 		// PCSX2 owner: x86/ix86-32/iR5900.cpp::_DynGen_DispatcherEvent()
@@ -1985,11 +2880,119 @@ namespace VitaEE
 		{
 			return fail();
 		}
+		const size_t event_unhandled_to_common = code.EmitBranchPlaceholder();
+		if (event_unhandled_to_common == static_cast<size_t>(-1))
+			return fail();
+
+		// A region's cold exact suffix is a physical fragment of the original
+		// PCSX2 block, not a new scheduler boundary.  Rejoin the live generated
+		// directory directly after that suffix.  A missing/barriered target falls
+		// through the ordinary scheduler-elided boundary callback, which can
+		// compile or run the owning region without unwinding the dispatcher frame.
+		const size_t scheduler_elided_redispatch_offset = code.Size();
+		if (!code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+				reinterpret_cast<uptr>(
+					&m_persistent_region_resume_requires_boundary))) ||
+			!code.EmitLdrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!code.EmitCmpImm32(HOST_TMP1, 0))
+		{
+			return fail();
+		}
+		const size_t redispatch_owner_change =
+			code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (redispatch_owner_change == static_cast<size_t>(-1) ||
+			!code.EmitLdrImm12(HOST_VTLB_VMAP, HOST_SP,
+				PERSISTENT_VTLB_VMAP_OFFSET) ||
+			!code.EmitLdrImm12(HOST_VTLB_HOST_MEMORY_BASE, HOST_SP,
+				PERSISTENT_VTLB_HOST_BASE_OFFSET) ||
+			!code.EmitLdrImm12(HOST_BRANCH_TARGET, HOST_CPU_REGS, PC_OFFSET) ||
+			!code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+				reinterpret_cast<uptr>(&m_active_generated_lookup_pages))) ||
+			!code.EmitTstImm32(HOST_BRANCH_TARGET, 0x3))
+		{
+			return fail();
+		}
+		const size_t redispatch_unaligned =
+			code.EmitBranchPlaceholder(VitaA32::Condition::NE);
+		if (redispatch_unaligned == static_cast<size_t>(-1) ||
+			!code.EmitLdrImm12(HOST_TMP0, HOST_TMP0, 0) ||
+			!code.EmitMovRegShiftImm(HOST_TMP1, HOST_BRANCH_TARGET,
+				VitaA32::ShiftType::LSR, 16) ||
+			!code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return fail();
+		}
+		const size_t redispatch_no_directory =
+			code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (redispatch_no_directory == static_cast<size_t>(-1) ||
+			!code.EmitLdrRegShift(HOST_TMP0, HOST_TMP0, HOST_TMP1,
+				VitaA32::ShiftType::LSL, 2) ||
+			!code.EmitUbfx(HOST_TMP1, HOST_BRANCH_TARGET, 2, 14) ||
+			!code.EmitCmpImm32(HOST_TMP0, 0))
+		{
+			return fail();
+		}
+		const size_t redispatch_no_page =
+			code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (redispatch_no_page == static_cast<size_t>(-1) ||
+			!code.EmitLdrRegShift(HOST_CALLBACK, HOST_TMP0, HOST_TMP1,
+				VitaA32::ShiftType::LSL, 2) ||
+			!code.EmitCmpImm32(HOST_CALLBACK, 0))
+		{
+			return fail();
+		}
+		const size_t redispatch_no_entry =
+			code.EmitBranchPlaceholder(VitaA32::Condition::EQ);
+		if (redispatch_no_entry == static_cast<size_t>(-1) ||
+			!code.EmitMovImm32(HOST_TMP0, static_cast<u32>(
+				reinterpret_cast<uptr>(
+					&m_persistent_region_resume_active))) ||
+			!code.EmitMovImm8(HOST_TMP1, 0) ||
+			!code.EmitStrImm12(HOST_TMP1, HOST_TMP0, 0) ||
+			!code.EmitBx(HOST_CALLBACK))
+		{
+			return fail();
+		}
+
+		const size_t redispatch_fallback = code.Size();
+		if (!code.PatchBranch(redispatch_owner_change, redispatch_fallback,
+				VitaA32::Condition::NE) ||
+			!code.PatchBranch(redispatch_unaligned, redispatch_fallback,
+				VitaA32::Condition::NE) ||
+			!code.PatchBranch(redispatch_no_directory, redispatch_fallback,
+				VitaA32::Condition::EQ) ||
+			!code.PatchBranch(redispatch_no_page, redispatch_fallback,
+				VitaA32::Condition::EQ) ||
+			!code.PatchBranch(redispatch_no_entry, redispatch_fallback,
+				VitaA32::Condition::EQ) ||
+			!code.EmitMovImm8(HOST_TMP0,
+				static_cast<u8>(EE_SCHEDULER_ELIDED_DIRECT_EXIT_TOKEN)))
+		{
+			return fail();
+		}
+		const size_t redispatch_to_common = code.EmitBranchPlaceholder();
+		if (redispatch_to_common == static_cast<size_t>(-1))
+			return fail();
+
+		// A dispatcher-ABI region has already committed every effect represented by
+		// its exit map. An impossible generated token or missing exact suffix cannot
+		// safely retry the region, so carry an invalid token through the ordinary
+		// common callback and make ExecutePersistentAtPc() fail closed.
+		const size_t region_generated_failure_offset = code.Size();
+		if (!code.EmitMovImm8(HOST_TMP0, 0))
+			return fail();
+		const size_t region_generated_failure_to_common =
+			code.EmitBranchPlaceholder();
+		if (region_generated_failure_to_common == static_cast<size_t>(-1))
+			return fail();
 
 		const size_t common_offset = code.Size();
 		if (!code.PatchBranch(direct_to_common, common_offset) ||
 			!code.PatchBranch(scheduler_elided_direct_to_common, common_offset) ||
 			!code.PatchBranch(handled_to_common, common_offset) ||
+			!code.PatchBranch(event_unhandled_to_common, common_offset) ||
+			!code.PatchBranch(redispatch_to_common, common_offset) ||
+			!code.PatchBranch(region_generated_failure_to_common, common_offset) ||
 			// Compatible chains may lend r7/r8 to GPR mappings. Restore the
 			// canonical dispatcher vTLB ABI once in this shared cold exit instead of
 			// duplicating reloads in every generated direct/event tail.
@@ -2013,6 +3016,7 @@ namespace VitaEE
 		if (!code.PatchBranch(return_branch, return_offset, VitaA32::Condition::EQ) ||
 			!code.EmitLdrImm12(0, HOST_SP, PERSISTENT_EXIT_VALUE_OFFSET) ||
 			!code.EmitAddImm8(HOST_SP, HOST_SP, PERSISTENT_METADATA_SIZE) ||
+			!code.EmitVpopDRange(8, 8) ||
 			!code.EmitPop(frame | REG_PC) || !code.Flush())
 		{
 			return fail();
@@ -2022,9 +3026,13 @@ namespace VitaEE
 		m_persistent_direct_exit = code.Data() + direct_exit_offset;
 		m_persistent_scheduler_elided_direct_exit =
 			code.Data() + scheduler_elided_direct_exit_offset;
+		m_persistent_scheduler_elided_redispatch =
+			code.Data() + scheduler_elided_redispatch_offset;
 		m_persistent_event_exit = code.Data() + event_exit_offset;
 		m_persistent_retained_wait_event_exit =
 			code.Data() + retained_wait_event_exit_offset;
+		m_persistent_region_generated_failure_exit =
+			code.Data() + region_generated_failure_offset;
 		return true;
 	}
 
@@ -2473,10 +3481,10 @@ namespace VitaEE
 			return false;
 
 		const auto poll_call_source_matches = [&]() {
-			const PollCallWaitLoopSourceProof& proof =
-				block.poll_call_wait_loop_source_proof;
-			if (!proof.valid)
+			if (!block.poll_call_wait_loop_source_proof)
 				return true;
+			const PollCallWaitLoopSourceProof& proof =
+				*block.poll_call_wait_loop_source_proof;
 			for (u32 i = 0; i < proof.call_opcodes.size(); i++)
 			{
 				if (memRead32(proof.call_pc + i * sizeof(u32)) !=
@@ -2495,10 +3503,10 @@ namespace VitaEE
 		if (!poll_call_source_matches())
 			return false;
 		const auto two_predicate_source_matches = [&]() {
-			const TwoPredicateWaitLoopSourceProof& proof =
-				block.two_predicate_wait_loop_source_proof;
-			if (!proof.valid)
+			if (!block.two_predicate_wait_loop_source_proof)
 				return true;
+			const TwoPredicateWaitLoopSourceProof& proof =
+				*block.two_predicate_wait_loop_source_proof;
 			if (proof.instruction_count == 0 ||
 				proof.instruction_count > proof.opcodes.size())
 			{
@@ -2880,11 +3888,27 @@ namespace VitaEE
 				m_code_cache ? EE_FALLBACK_CODE_CACHE_CAPACITY : 0;
 		}
 		m_code_cache_used = 0;
+		if (!m_code_cache ||
+			m_code_cache_capacity <= REGION_CODE_ARENA_CAPACITY +
+				PERSISTENT_DISPATCH_CODE_CAPACITY)
+		{
+			if (m_code_cache)
+				VitaVM::FreeJitMemory(m_code_cache);
+			m_code_cache = nullptr;
+			m_code_cache_capacity = 0;
+			m_region_code_arena_offset = 0;
+			return false;
+		}
+		m_region_code_arena_offset = Common::AlignDown(
+			m_code_cache_capacity - REGION_CODE_ARENA_CAPACITY,
+			static_cast<unsigned int>(CODE_CACHE_ALIGNMENT));
+		ResetRegionCodeArena();
 		return (m_code_cache != nullptr);
 	}
 
 	void BlockExecutor::ReleaseCodeCache()
 	{
+		ClearPersistentRegionContinuations();
 		if (!m_code_cache)
 			return;
 
@@ -2892,6 +3916,83 @@ namespace VitaEE
 		m_code_cache = nullptr;
 		m_code_cache_capacity = 0;
 		m_code_cache_used = 0;
+		m_region_code_arena_offset = 0;
+		ResetRegionCodeArena();
+	}
+
+	void BlockExecutor::ResetRegionCodeArena()
+	{
+		m_region_code_slots.fill(RegionCodeSlotState::Free);
+		m_region_probe_code_slots.fill(RegionCodeSlotState::Free);
+		m_persistent_region_continuation_code_slots.fill(
+			RegionCodeSlotState::Free);
+	}
+
+	bool BlockExecutor::EnsurePersistentRegionContinuationCodeCache()
+	{
+		if (m_persistent_region_continuation_code_cache)
+			return true;
+		constexpr size_t capacity = PERSISTENT_REGION_CONTINUATION_SLOT_COUNT *
+			PERSISTENT_REGION_CONTINUATION_CODE_CAPACITY;
+		m_persistent_region_continuation_code_cache = static_cast<u8*>(
+			VitaVM::AllocJitMemory(capacity));
+		return m_persistent_region_continuation_code_cache != nullptr;
+	}
+
+	void BlockExecutor::ReleasePersistentRegionContinuationCodeCache()
+	{
+		ClearPersistentRegionContinuations();
+		if (!m_persistent_region_continuation_code_cache)
+			return;
+		VitaVM::FreeJitMemory(m_persistent_region_continuation_code_cache);
+		m_persistent_region_continuation_code_cache = nullptr;
+	}
+
+	void BlockExecutor::ClearPersistentRegionContinuations()
+	{
+		for (PersistentRegionContinuation& continuation :
+			m_persistent_region_continuations)
+		{
+			continuation.code.Release();
+			continuation = {};
+		}
+	}
+
+	bool BlockExecutor::LocateRegionCodeSlot(size_t slice_offset, bool* probe,
+		size_t* slot_index, size_t* slot_capacity) const
+	{
+		if (!m_code_cache || m_region_code_arena_offset == 0 ||
+			!probe || !slot_index || !slot_capacity)
+		{
+			return false;
+		}
+
+		const size_t region_bytes =
+			REGION_CODE_SLOT_COUNT * REGION_CODE_BUFFER_CAPACITY;
+		if (slice_offset >= m_region_code_arena_offset &&
+			slice_offset < m_region_code_arena_offset + region_bytes)
+		{
+			const size_t relative = slice_offset - m_region_code_arena_offset;
+			if ((relative % REGION_CODE_BUFFER_CAPACITY) != 0)
+				return false;
+			*probe = false;
+			*slot_index = relative / REGION_CODE_BUFFER_CAPACITY;
+			*slot_capacity = REGION_CODE_BUFFER_CAPACITY;
+			return *slot_index < REGION_CODE_SLOT_COUNT;
+		}
+
+		const size_t probe_base = m_region_code_arena_offset + region_bytes;
+		const size_t probe_bytes =
+			REGION_PROBE_CODE_SLOT_COUNT * REGION_PROBE_CODE_BUFFER_CAPACITY;
+		if (slice_offset < probe_base || slice_offset >= probe_base + probe_bytes)
+			return false;
+		const size_t relative = slice_offset - probe_base;
+		if ((relative % REGION_PROBE_CODE_BUFFER_CAPACITY) != 0)
+			return false;
+		*probe = true;
+		*slot_index = relative / REGION_PROBE_CODE_BUFFER_CAPACITY;
+		*slot_capacity = REGION_PROBE_CODE_BUFFER_CAPACITY;
+		return *slot_index < REGION_PROBE_CODE_SLOT_COUNT;
 	}
 
 	u8* BlockExecutor::AllocateCodeSlice(size_t capacity, size_t* slice_offset)
@@ -2900,7 +4001,8 @@ namespace VitaEE
 			return nullptr;
 
 		const size_t aligned_offset = AlignUp(m_code_cache_used, CODE_CACHE_ALIGNMENT);
-		if (capacity > m_code_cache_capacity || aligned_offset > (m_code_cache_capacity - capacity))
+		const size_t linear_capacity = m_region_code_arena_offset;
+		if (capacity > linear_capacity || aligned_offset > (linear_capacity - capacity))
 			return nullptr;
 
 		if (slice_offset)
@@ -2908,6 +4010,374 @@ namespace VitaEE
 
 		m_code_cache_used = aligned_offset + capacity;
 		return m_code_cache + aligned_offset;
+	}
+
+	bool BlockExecutor::PrepareRegionCodeBuffer(VitaA32::CodeBuffer* code,
+		size_t capacity, size_t* slice_offset)
+	{
+		if (!code || !slice_offset || capacity == 0)
+			return false;
+
+		if (!EnsureCodeCache())
+			return false;
+
+		RegionCodeSlotState* state = nullptr;
+		size_t offset = 0;
+		size_t slot_capacity = 0;
+		if (capacity <= REGION_PROBE_CODE_BUFFER_CAPACITY)
+		{
+			for (size_t index = 0; index < m_region_probe_code_slots.size(); index++)
+			{
+				if (m_region_probe_code_slots[index] != RegionCodeSlotState::Free)
+					continue;
+				state = &m_region_probe_code_slots[index];
+				offset = m_region_code_arena_offset +
+					REGION_CODE_SLOT_COUNT * REGION_CODE_BUFFER_CAPACITY +
+					index * REGION_PROBE_CODE_BUFFER_CAPACITY;
+				slot_capacity = REGION_PROBE_CODE_BUFFER_CAPACITY;
+				break;
+			}
+		}
+		else if (capacity <= REGION_CODE_BUFFER_CAPACITY)
+		{
+			for (size_t index = 0; index < m_region_code_slots.size(); index++)
+			{
+				if (m_region_code_slots[index] != RegionCodeSlotState::Free)
+					continue;
+				state = &m_region_code_slots[index];
+				offset = m_region_code_arena_offset +
+					index * REGION_CODE_BUFFER_CAPACITY;
+				slot_capacity = REGION_CODE_BUFFER_CAPACITY;
+				break;
+			}
+		}
+		if (!state)
+			return false;
+
+		*state = RegionCodeSlotState::Reserved;
+		*slice_offset = offset;
+		if (code->Attach(m_code_cache + offset, slot_capacity))
+			return true;
+		*state = RegionCodeSlotState::Free;
+		return false;
+	}
+
+	bool BlockExecutor::CommitRegionCodeBuffer(size_t slice_offset,
+		size_t code_size)
+	{
+		bool probe = false;
+		size_t slot_index = 0;
+		size_t slot_capacity = 0;
+		if (!LocateRegionCodeSlot(slice_offset, &probe, &slot_index,
+				&slot_capacity) || code_size > slot_capacity)
+			return false;
+		RegionCodeSlotState& state = probe ?
+			m_region_probe_code_slots[slot_index] : m_region_code_slots[slot_index];
+		if (state != RegionCodeSlotState::Reserved)
+			return false;
+		state = RegionCodeSlotState::Committed;
+		return true;
+	}
+
+	void BlockExecutor::DiscardRegionCodeBuffer(VitaA32::CodeBuffer* code,
+		size_t slice_offset)
+	{
+		if (code)
+			code->Release();
+		bool probe = false;
+		size_t slot_index = 0;
+		size_t slot_capacity = 0;
+		if (!LocateRegionCodeSlot(slice_offset, &probe, &slot_index,
+				&slot_capacity))
+		{
+			return;
+		}
+		RegionCodeSlotState& state = probe ?
+			m_region_probe_code_slots[slot_index] : m_region_code_slots[slot_index];
+		if (state == RegionCodeSlotState::Reserved)
+			state = RegionCodeSlotState::Free;
+	}
+
+	bool BlockExecutor::RetireRegionCodeBuffer(VitaA32::CodeBuffer* code,
+		size_t slice_offset)
+	{
+		if (code)
+			code->Release();
+		bool probe = false;
+		size_t slot_index = 0;
+		size_t slot_capacity = 0;
+		if (!LocateRegionCodeSlot(slice_offset, &probe, &slot_index,
+				&slot_capacity))
+		{
+			return false;
+		}
+		RegionCodeSlotState& state = probe ?
+			m_region_probe_code_slots[slot_index] : m_region_code_slots[slot_index];
+		if (state == RegionCodeSlotState::Committed)
+			state = RegionCodeSlotState::Retired;
+		else if (state == RegionCodeSlotState::Reserved)
+			state = RegionCodeSlotState::Free;
+		else if (state != RegionCodeSlotState::Free &&
+			state != RegionCodeSlotState::Retired)
+			return false;
+		return true;
+	}
+
+	void BlockExecutor::AcknowledgeRegionCodeRetirements()
+	{
+		for (RegionCodeSlotState& state : m_region_code_slots)
+		{
+			if (state == RegionCodeSlotState::Retired)
+				state = RegionCodeSlotState::Free;
+		}
+		for (RegionCodeSlotState& state : m_region_probe_code_slots)
+		{
+			if (state == RegionCodeSlotState::Retired)
+				state = RegionCodeSlotState::Free;
+		}
+		for (RegionCodeSlotState& state :
+			m_persistent_region_continuation_code_slots)
+		{
+			if (state == RegionCodeSlotState::Retired)
+				state = RegionCodeSlotState::Free;
+		}
+	}
+
+	void BlockExecutor::RetirePersistentRegionContinuations()
+	{
+		for (size_t index = 0;
+			index < m_persistent_region_continuations.size(); index++)
+		{
+			PersistentRegionContinuation& continuation =
+				m_persistent_region_continuations[index];
+			continuation.code.Release();
+			continuation = {};
+			RegionCodeSlotState& state =
+				m_persistent_region_continuation_code_slots[index];
+			if (state == RegionCodeSlotState::Committed)
+				state = RegionCodeSlotState::Retired;
+			else if (state == RegionCodeSlotState::Reserved)
+				state = RegionCodeSlotState::Free;
+		}
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	size_t BlockExecutor::GetCommittedRegionCodeSlotCountForValidation() const
+	{
+		return static_cast<size_t>(std::count(m_region_code_slots.begin(),
+			m_region_code_slots.end(), RegionCodeSlotState::Committed)) +
+			static_cast<size_t>(std::count(m_region_probe_code_slots.begin(),
+				m_region_probe_code_slots.end(), RegionCodeSlotState::Committed));
+	}
+
+	size_t BlockExecutor::GetRetiredRegionCodeSlotCountForValidation() const
+	{
+		return static_cast<size_t>(std::count(m_region_code_slots.begin(),
+			m_region_code_slots.end(), RegionCodeSlotState::Retired)) +
+			static_cast<size_t>(std::count(m_region_probe_code_slots.begin(),
+				m_region_probe_code_slots.end(), RegionCodeSlotState::Retired));
+	}
+#endif
+
+	bool BlockExecutor::AppendRegionContinuation(VitaA32::CodeBuffer* code,
+		u32 start_pc, u32 instruction_count, u32 inherited_raw_cycles,
+		bool scheduler_test_at_end, bool persistent_dispatch_fragment,
+		size_t* entry_offset, u32* scaled_cycles)
+	{
+		if (!code || !entry_offset || instruction_count == 0 ||
+			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
+			instruction_count > ((UINT32_MAX - start_pc) / sizeof(u32)))
+		{
+			return false;
+		}
+		for (u32 index = 0; index < instruction_count; index++)
+		{
+			if (!BlockCompiler::CanCompileOpcode(
+					memRead32(start_pc + index * sizeof(u32))))
+			{
+				return false;
+			}
+		}
+		if (persistent_dispatch_fragment &&
+			(!m_persistent_dispatch_enabled || !EnsurePersistentDispatcher()))
+			return false;
+
+		const size_t callable_entry = code->Size();
+		BlockCompiler compiler(*code, RamSourcePageLiveFlags(),
+			RamSourceChunkLiveBits(), this,
+			&BlockExecutor::InvalidateRamSourceRangeThunk);
+		bool scheduler_elided_emitted = false;
+		const DirectContinuationKind continuation_kind = scheduler_test_at_end ?
+			DirectContinuationKind::SchedulerTestedTail :
+			DirectContinuationKind::A32PhysicalFragment;
+		const void* const direct_exit = persistent_dispatch_fragment ?
+			m_persistent_direct_exit :
+			reinterpret_cast<const void*>(&VitaEeA32DirectExit);
+		const void* const event_exit = persistent_dispatch_fragment ?
+			m_persistent_event_exit :
+			reinterpret_cast<const void*>(&VitaEeA32EventExit);
+		const void* const scheduler_elided_exit =
+			persistent_dispatch_fragment ?
+				m_persistent_scheduler_elided_redispatch :
+				reinterpret_cast<const void*>(
+					&VitaEeA32SchedulerElidedDirectExit);
+		if (!compiler.CompileStraightLineBlock(start_pc, instruction_count,
+				direct_exit, event_exit,
+				scaled_cycles, nullptr, nullptr, nullptr, nullptr,
+				persistent_dispatch_fragment,
+				nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+				continuation_kind, &scheduler_elided_emitted,
+				scheduler_elided_exit,
+				nullptr, nullptr, nullptr, inherited_raw_cycles, true) ||
+			code->Size() <= callable_entry ||
+			(!scheduler_test_at_end && !scheduler_elided_emitted))
+		{
+			return false;
+		}
+
+		*entry_offset = callable_entry;
+		return true;
+	}
+
+	bool BlockExecutor::GetOrCreatePersistentRegionContinuation(u32 start_pc,
+		u32 instruction_count, u32 inherited_raw_cycles,
+		bool scheduler_test_at_end, const void** entry_point,
+		u32* scaled_cycles)
+	{
+		if (!entry_point || instruction_count == 0 ||
+			instruction_count > MAX_STRAIGHT_LINE_BLOCK_INSTRUCTIONS ||
+			instruction_count > ((UINT32_MAX - start_pc) / sizeof(u32)) ||
+			!m_persistent_dispatch_enabled || !EnsurePersistentDispatcher())
+		{
+			return false;
+		}
+
+		*entry_point = nullptr;
+		const s8 ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
+		const u8 cp0_config_cycle_shift = static_cast<u8>(
+			(cpuRegs.CP0.n.Config >> 18) & 0x1);
+		for (PersistentRegionContinuation& continuation :
+			m_persistent_region_continuations)
+		{
+			if (!continuation.valid ||
+				continuation.source_generation != m_source_generation ||
+				continuation.start_pc != start_pc ||
+				continuation.instruction_count != instruction_count ||
+				continuation.inherited_raw_cycles != inherited_raw_cycles ||
+				continuation.scheduler_test_at_end != scheduler_test_at_end ||
+				continuation.ee_cycle_rate != ee_cycle_rate ||
+				continuation.cp0_config_cycle_shift != cp0_config_cycle_shift)
+			{
+				continue;
+			}
+
+			*entry_point = continuation.code.EntryPoint();
+			if (scaled_cycles)
+				*scaled_cycles = continuation.scaled_cycles;
+			return *entry_point != nullptr;
+		}
+
+		size_t record_index = m_persistent_region_continuations.size();
+		for (size_t index = 0;
+			index < m_persistent_region_continuations.size(); index++)
+		{
+			if (!m_persistent_region_continuations[index].valid &&
+				m_persistent_region_continuation_code_slots[index] ==
+					RegionCodeSlotState::Free)
+			{
+				record_index = index;
+				break;
+			}
+		}
+		if (record_index >= m_persistent_region_continuations.size() ||
+			!EnsurePersistentRegionContinuationCodeCache())
+		{
+			return false;
+		}
+		PersistentRegionContinuation& record =
+			m_persistent_region_continuations[record_index];
+
+		PersistentRegionAbi abi{};
+		if (!GetPersistentRegionAbi(&abi))
+		{
+			return false;
+		}
+
+		u8* const slice = m_persistent_region_continuation_code_cache +
+			record_index * PERSISTENT_REGION_CONTINUATION_CODE_CAPACITY;
+		RegionCodeSlotState& slot_state =
+			m_persistent_region_continuation_code_slots[record_index];
+		slot_state = RegionCodeSlotState::Reserved;
+		VitaA32::CodeBuffer code;
+		if (!code.Attach(slice,
+				PERSISTENT_REGION_CONTINUATION_CODE_CAPACITY) ||
+			!code.EmitMovImm32(0, static_cast<u32>(
+				reinterpret_cast<uptr>(abi.resumed_fragment_active))) ||
+			!code.EmitMovImm8(1, 1) ||
+			!code.EmitStrImm12(1, 0, 0))
+		{
+			code.Release();
+			slot_state = RegionCodeSlotState::Free;
+			return false;
+		}
+
+		size_t suffix_offset = 0;
+		u32 compiled_scaled_cycles = 0;
+		const bool appended = AppendRegionContinuation(&code, start_pc, instruction_count,
+				inherited_raw_cycles, scheduler_test_at_end, true,
+				&suffix_offset, &compiled_scaled_cycles);
+		const bool flushed = appended && suffix_offset >= 3 * sizeof(u32) &&
+			code.Flush();
+		if (!flushed)
+		{
+			code.Release();
+			slot_state = RegionCodeSlotState::Free;
+			return false;
+		}
+
+		record.code = std::move(code);
+		record.start_pc = start_pc;
+		record.instruction_count = instruction_count;
+		record.inherited_raw_cycles = inherited_raw_cycles;
+		record.source_generation = m_source_generation;
+		record.scaled_cycles = compiled_scaled_cycles;
+		record.ee_cycle_rate = ee_cycle_rate;
+		record.cp0_config_cycle_shift = cp0_config_cycle_shift;
+		record.scheduler_test_at_end = scheduler_test_at_end;
+		record.valid = true;
+		slot_state = RegionCodeSlotState::Committed;
+		*entry_point = record.code.EntryPoint();
+		if (scaled_cycles)
+			*scaled_cycles = compiled_scaled_cycles;
+		return *entry_point != nullptr;
+	}
+
+	bool BlockExecutor::ExecuteRegionContinuation(
+		const VitaA32::CodeBuffer& code, size_t entry_offset,
+		bool run_event_test, BlockExitKind* exit,
+		bool* scheduler_test_elided)
+	{
+		if (!exit || entry_offset >= code.Size() ||
+			(entry_offset & (sizeof(u32) - 1)) != 0)
+		{
+			return false;
+		}
+
+		RefreshRawGpr0KnownZero();
+		const u32 token = reinterpret_cast<GeneratedBlock>(
+			code.Data() + entry_offset)();
+		bool event_already_handled = false;
+		if (!DecodeExitKind(token, exit, scheduler_test_elided,
+				&event_already_handled))
+		{
+			return false;
+		}
+		if (*exit == BlockExitKind::Event && run_event_test &&
+			!event_already_handled)
+		{
+			_cpuEventTest_Shared();
+		}
+		return true;
 	}
 
 	void BlockExecutor::RewindCodeCache(size_t slice_offset)
@@ -3237,6 +4707,32 @@ namespace VitaEE
 		if (compiled_compatible_link_entry_offset == static_cast<size_t>(-1))
 			compiled_gpr_link_signature = GprLinkSignature{};
 
+		std::unique_ptr<PollCallWaitLoopSourceProof> poll_call_wait_proof;
+		std::unique_ptr<TwoPredicateWaitLoopSourceProof> two_predicate_wait_proof;
+		if (compiled_poll_call_wait_loop_source_proof.valid)
+		{
+			poll_call_wait_proof.reset(new (std::nothrow)
+				PollCallWaitLoopSourceProof(compiled_poll_call_wait_loop_source_proof));
+			if (!poll_call_wait_proof)
+			{
+				block.code.Release();
+				RewindCodeCache(block_code_slice_offset);
+				return false;
+			}
+		}
+		if (compiled_two_predicate_wait_loop_source_proof.valid)
+		{
+			two_predicate_wait_proof.reset(new (std::nothrow)
+				TwoPredicateWaitLoopSourceProof(
+					compiled_two_predicate_wait_loop_source_proof));
+			if (!two_predicate_wait_proof)
+			{
+				block.code.Release();
+				RewindCodeCache(block_code_slice_offset);
+				return false;
+			}
+		}
+
 		block.start_pc = start_pc;
 		block.instruction_count = compiled_instruction_count;
 		block.source_instruction_count = instruction_count;
@@ -3244,10 +4740,9 @@ namespace VitaEE
 		block.dependency_instruction_count = dependency_instruction_count;
 		block.dependency_charged_cycles_before =
 			dependency_charged_cycles_before;
-		block.poll_call_wait_loop_source_proof =
-			compiled_poll_call_wait_loop_source_proof;
+		block.poll_call_wait_loop_source_proof = std::move(poll_call_wait_proof);
 		block.two_predicate_wait_loop_source_proof =
-			compiled_two_predicate_wait_loop_source_proof;
+			std::move(two_predicate_wait_proof);
 		block.scaled_cycles = compiled_scaled_cycles;
 		block.ee_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 		block.cp0_config_cycle_shift = static_cast<u8>((cpuRegs.CP0.n.Config >> 18) & 0x1);
@@ -3401,7 +4896,8 @@ namespace VitaEE
 		if (!CaptureRamSourceFragments(block))
 		{
 			block.opcodes.reset();
-			block.two_predicate_wait_loop_source_proof = {};
+			block.poll_call_wait_loop_source_proof.reset();
+			block.two_predicate_wait_loop_source_proof.reset();
 			block.code.Release();
 			RewindCodeCache(block_code_slice_offset);
 			return false;
@@ -3417,7 +4913,8 @@ namespace VitaEE
 			block.ram_source_fragment_count = 0;
 			block.source_serial = 0;
 			block.opcodes.reset();
-			block.two_predicate_wait_loop_source_proof = {};
+			block.poll_call_wait_loop_source_proof.reset();
+			block.two_predicate_wait_loop_source_proof.reset();
 			block.code.Release();
 			RewindCodeCache(block_code_slice_offset);
 			return false;
@@ -3428,19 +4925,100 @@ namespace VitaEE
 		RegisterIncomingLinks(block);
 
 #if !defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_QEMU_FULL_CORE)
-		if (VitaPerformanceTelemetry::IsEnabled())
+		const bool needs_generated_profile =
+			VitaPerformanceTelemetry::IsEnabled()
+#if defined(VITASX2_CPU_PROFILER)
+			|| VitaPerformanceTelemetry::g_cpu_stage_profiler_enabled
+#endif
+			;
+		if (needs_generated_profile)
 		{
 			const VitaA32::CodeBuffer::GeneratedCodeStats generated =
 				block.code.AnalyzeGeneratedCode();
 			const VitaA32EeGeneratedGuestMix guest_mix =
 				AnalyzeGeneratedEeGuestMix(start_pc, compiled_instruction_count);
-			VitaRecordA32EeGeneratedCode(start_pc, guest_mix,
-				generated.host_instructions,
-				generated.host_load_instructions, generated.host_store_instructions,
-				generated.helper_call_instructions, generated.state_load_instructions,
-				generated.state_store_instructions,
-				block.poll_call_wait_loop_source_proof.valid,
-				block.two_predicate_wait_loop_source_proof.valid);
+#if defined(VITASX2_CPU_PROFILER)
+			VitaPerformanceTelemetry::EeTraceBlockRegistration trace_block;
+			trace_block.pc = block.start_pc;
+			trace_block.instruction_count = block.instruction_count;
+			trace_block.source_instruction_count = block.source_instruction_count;
+			trace_block.dependency_start_pc = block.dependency_start_pc;
+			trace_block.dependency_instruction_count =
+				block.dependency_instruction_count;
+			trace_block.scaled_cycles = block.scaled_cycles;
+			trace_block.emitted_bytes = static_cast<u32>(block.code.Size());
+			trace_block.host_instructions =
+				static_cast<u32>(generated.host_instructions);
+			trace_block.helper_calls =
+				static_cast<u32>(generated.helper_call_instructions);
+			trace_block.state_loads =
+				static_cast<u32>(generated.state_load_instructions);
+			trace_block.state_stores =
+				static_cast<u32>(generated.state_store_instructions);
+			trace_block.guest_integer = guest_mix.integer;
+			trace_block.guest_branches = guest_mix.branch;
+			trace_block.guest_memory_loads = guest_mix.memory_load;
+			trace_block.guest_memory_stores = guest_mix.memory_store;
+			trace_block.guest_mmi = guest_mix.mmi;
+			trace_block.guest_cop0 = guest_mix.cop0;
+			trace_block.guest_cop1 = guest_mix.cop1;
+			trace_block.guest_cop2 = guest_mix.cop2;
+			trace_block.guest_other = guest_mix.other;
+			if (block.discovered_topology)
+			{
+				trace_block.flags |=
+					VitaPerformanceTelemetry::EeTraceBlockDiscoveredTopology;
+			}
+			if (block.direct_continuation_kind ==
+				DirectContinuationKind::SchedulerTestedTail)
+			{
+				trace_block.flags |=
+					VitaPerformanceTelemetry::EeTraceBlockSchedulerTestAtEnd;
+			}
+			else
+			{
+				trace_block.flags |=
+					VitaPerformanceTelemetry::EeTraceBlockSchedulerElidedContinuation;
+			}
+			if (block.poll_call_wait_loop_source_proof ||
+				block.two_predicate_wait_loop_source_proof)
+			{
+				trace_block.flags |=
+					VitaPerformanceTelemetry::EeTraceBlockSpecializedWait;
+			}
+			for (const DirectLinkSlot& link : block.direct_links.slots)
+			{
+				if (!link.valid || (link.target_pc & 3u) != 0)
+					continue;
+				bool duplicate = false;
+				for (u32 i = 0; i < trace_block.successor_count; i++)
+					duplicate |= trace_block.successors[i] == link.target_pc;
+				if (duplicate || trace_block.successor_count >=
+					VitaPerformanceTelemetry::CPU_PROFILE_EE_TRACE_SUCCESSOR_COUNT)
+				{
+					continue;
+				}
+				trace_block.successors[trace_block.successor_count++] =
+					link.target_pc;
+			}
+			const u32 profiler_source_offset =
+				(block.start_pc - block.dependency_start_pc) / sizeof(u32);
+			VitaPerformanceTelemetry::RegisterEeGeneratedBlockTrace(trace_block,
+				block.opcodes.get() + profiler_source_offset,
+				block.instruction_count);
+#endif
+			if (VitaPerformanceTelemetry::IsEnabled())
+			{
+				VitaRecordA32EeGeneratedCode(start_pc, guest_mix,
+					generated.host_instructions,
+					generated.host_load_instructions,
+					generated.host_store_instructions,
+					generated.helper_call_instructions,
+					generated.state_load_instructions,
+					generated.state_store_instructions,
+					block.poll_call_wait_loop_source_proof != nullptr,
+					block.two_predicate_wait_loop_source_proof != nullptr);
+			}
 		}
 #endif
 
@@ -3532,6 +5110,19 @@ namespace VitaEE
 			return false;
 		if (target && IsPersistentDispatchBarrier(target->start_pc))
 			target = nullptr;
+		const PersistentGeneratedEntry* const published_generated_entry = target ?
+			FindPersistentGeneratedEntryRecord(target->start_pc) : nullptr;
+		// A compiled natural-loop region and its profitability probe own external
+		// invocation entries. Exact source-block membership lets tier-zero execution
+		// selected by an entry fallback retain its resident/compatible internal links
+		// through the complete invocation. The generated lookup still points at the
+		// region/probe, so indirect and truly external dispatch evaluate it once.
+		const PersistentGeneratedEntry* const generated_region =
+			published_generated_entry &&
+			!published_generated_entry->BypassesSource(block.start_pc) ?
+				published_generated_entry : nullptr;
+		const void* const generated_region_target =
+			generated_region ? generated_region->entry_point : nullptr;
 
 		const void* direct_exit = m_persistent_dispatch_enabled ?
 			m_persistent_direct_exit : reinterpret_cast<const void*>(&VitaEeA32DirectExit);
@@ -3542,10 +5133,12 @@ namespace VitaEE
 		// contract. An incompatible edge first runs its generated canonical
 		// publication and then uses a second reversible hardlink to the target's
 		// ordinary entry, matching BaseBlocks::Link() without exposing private state.
-		const bool use_resident_entry = target && m_persistent_dispatch_enabled &&
+		const bool use_resident_entry = target && !generated_region_target &&
+			m_persistent_dispatch_enabled &&
 			!link.canonicalizes_reclaimed_vtlb_hosts &&
 			link.target_pc == block.start_pc && block.resident_self_link_entry_loads != 0;
-		const bool use_compatible_entry = target && !use_resident_entry &&
+		const bool use_compatible_entry = target && !generated_region_target &&
+			!use_resident_entry &&
 			m_persistent_dispatch_enabled &&
 			!link.canonicalizes_reclaimed_vtlb_hosts &&
 			block.gpr_link_signature.IsValid() &&
@@ -3554,6 +5147,15 @@ namespace VitaEE
 			block.gpr_link_signature == target->gpr_link_signature &&
 			target->compatible_link_entry_offset != static_cast<size_t>(-1) &&
 			target->compatible_link_entry_offset < target->code.Size();
+		const bool use_generated_compatible_entry = target && generated_region &&
+			generated_region->compatible_entry_point &&
+			m_persistent_dispatch_enabled &&
+			!link.canonicalizes_reclaimed_vtlb_hosts &&
+			block.gpr_link_signature.IsValid() &&
+			block.compatible_link_entry_offset != static_cast<size_t>(-1) &&
+			block.compatible_link_entry_offset < block.code.Size() &&
+			block.gpr_link_signature ==
+				generated_region->compatible_signature;
 		const bool embedded_source_matches =
 			link.embedded_compatible_continuation &&
 			memRead32(link.target_pc) == link.embedded_source_opcodes[0] &&
@@ -3593,7 +5195,8 @@ namespace VitaEE
 #endif
 		const bool use_generated_fallback = !target ||
 			(link.requires_compatible_entry &&
-				 !use_resident_entry && !use_compatible_entry) ||
+				 !use_resident_entry && !use_compatible_entry &&
+				 !use_generated_compatible_entry) ||
 			(link.embedded_compatible_continuation && !use_embedded_continuation);
 		const bool has_canonical_target =
 			link.canonical_target_offset != static_cast<size_t>(-1);
@@ -3607,8 +5210,12 @@ namespace VitaEE
 		const void* patched_target = use_resident_entry ? ResidentSelfLinkEntryPoint(block) :
 			(use_prevalidated_vtlb_entry ?
 				CompatibleVtlbFastEntryPoint(*target, prevalidated_vtlb_guard) :
-			 (use_compatible_entry ? CompatibleLinkEntryPoint(*target) :
-				(!use_generated_fallback ? LinkedEntryPoint(*target) : direct_exit)));
+			 (use_generated_compatible_entry ?
+				generated_region->compatible_entry_point :
+			  (use_compatible_entry ? CompatibleLinkEntryPoint(*target) :
+				(!use_generated_fallback ?
+					(generated_region_target ? generated_region_target :
+						LinkedEntryPoint(*target)) : direct_exit))));
 		const VitaA32::Condition condition = link.branch_if_no_event ?
 			VitaA32::Condition::MI : link.branch_on_taken ?
 			(link.branch_on_unsigned_less ? VitaA32::Condition::CC : VitaA32::Condition::NE) :
@@ -3632,7 +5239,8 @@ namespace VitaEE
 		const bool canonical_patched = !has_canonical_target ||
 			(use_canonical_entry ?
 				block.code.PatchBranchToAddress(link.canonical_target_offset,
-					LinkedEntryPoint(*target), VitaA32::Condition::AL) :
+					generated_region_target ? generated_region_target :
+						LinkedEntryPoint(*target), VitaA32::Condition::AL) :
 				block.code.PatchInstruction(link.canonical_target_offset,
 					link.canonical_fallback_instruction));
 		if (!patched || !secondary_patched || !canonical_patched ||
@@ -3640,7 +5248,10 @@ namespace VitaEE
 			return false;
 
 		link.patched_to_resident_entry = !use_generated_fallback && use_resident_entry;
-		link.patched_to_compatible_entry = !use_generated_fallback && use_compatible_entry;
+		link.patched_to_compatible_entry = !use_generated_fallback &&
+			(use_compatible_entry || use_generated_compatible_entry);
+		link.patched_to_generated_compatible_entry =
+			!use_generated_fallback && use_generated_compatible_entry;
 		link.patched_to_canonical_entry = use_canonical_entry;
 		link.embedded_continuation_active = use_embedded_continuation;
 		const size_t selected_compatible_entry_offset = use_prevalidated_vtlb_entry ?
@@ -3649,8 +5260,8 @@ namespace VitaEE
 		link.compatible_entry_instructions = use_compatible_entry ? static_cast<u8>(
 			(selected_compatible_entry_offset - target->linked_entry_offset) /
 			sizeof(u32)) : 0;
-		link.compatible_entry_loads =
-			use_compatible_entry ? target->compatible_link_entry_loads : 0;
+		link.compatible_entry_loads = use_compatible_entry ?
+			target->compatible_link_entry_loads : 0;
 		return true;
 	}
 
@@ -3746,6 +5357,7 @@ namespace VitaEE
 		result->path = BlockExecutionPath::Compiled;
 		result->exit = exit;
 		result->exit_value = exit_value;
+		result->start_pc = block.start_pc;
 		result->scheduler_test_elided = scheduler_test_elided;
 		result->instruction_count = block.instruction_count;
 		result->source_instruction_count = block.source_instruction_count;
@@ -3789,6 +5401,8 @@ namespace VitaEE
 			if (link.valid && link.patched_to_compatible_entry)
 			{
 				result->compatible_gpr_links++;
+				result->compatible_generated_region_links +=
+					link.patched_to_generated_compatible_entry ? 1u : 0u;
 				result->compatible_gpr_link_entry_instructions +=
 					link.compatible_entry_instructions;
 				result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
@@ -3866,6 +5480,7 @@ namespace VitaEE
 			bool cache_hit) {
 			*block = entry;
 			result->path = BlockExecutionPath::Compiled;
+			result->start_pc = entry->start_pc;
 			result->instruction_count = entry->instruction_count;
 			result->source_instruction_count = entry->source_instruction_count;
 			result->scaled_cycles = entry->scaled_cycles;
@@ -3913,6 +5528,8 @@ namespace VitaEE
 				if (link.valid && link.patched_to_compatible_entry)
 				{
 					result->compatible_gpr_links++;
+					result->compatible_generated_region_links +=
+						link.patched_to_generated_compatible_entry ? 1u : 0u;
 					result->compatible_gpr_link_entry_instructions +=
 						link.compatible_entry_instructions;
 					result->compatible_gpr_link_entry_loads += link.compatible_entry_loads;
@@ -4104,6 +5721,10 @@ namespace VitaEE
 		{
 			return nullptr;
 		}
+		const bool resumed_fragment_requires_boundary =
+			context->executor->m_persistent_region_resume_requires_boundary != 0;
+		context->executor->m_persistent_region_resume_active = 0;
+		context->executor->m_persistent_region_resume_requires_boundary = 0;
 
 		BlockExitKind exit = BlockExitKind::Direct;
 		bool scheduler_test_elided = false;
@@ -4111,6 +5732,7 @@ namespace VitaEE
 		if (!DecodeExitKind(exit_value, &exit, &scheduler_test_elided,
 				&event_already_handled))
 		{
+			context->executor->m_persistent_generated_failure = true;
 			context->failed = true;
 			return nullptr;
 		}
@@ -4123,6 +5745,12 @@ namespace VitaEE
 		context->current_result.exit_value = event_already_handled ?
 			static_cast<u32>(BlockExitKind::Event) : exit_value;
 		context->current_result.scheduler_test_elided = scheduler_test_elided;
+		// A store in the resumed physical suffix can invalidate executable source
+		// after the bridge has supplied its metadata.  The invalidation thunk marks
+		// that dynamic owner change; carry it into the canonical boundary result
+		// before clearing the per-frame latch.
+		context->current_result.persistent_resume_requires_boundary |=
+			resumed_fragment_requires_boundary;
 		*context->final_result = context->current_result;
 
 		// PCSX2 owner: _DynGen_DispatcherEvent() calls recEventTest() without
@@ -4136,7 +5764,6 @@ namespace VitaEE
 		{
 			return nullptr;
 		}
-
 		BlockExecutionResult next_result;
 		CachedBlock* next_block = nullptr;
 		{
@@ -4149,17 +5776,23 @@ namespace VitaEE
 				return nullptr;
 			}
 		}
+		if (!next_result.cache_hit && context->prepared_callback &&
+			!context->prepared_callback(context->callback_userdata, next_result))
+		{
+			return nullptr;
+		}
 
 		context->current_block = next_block;
 		context->current_result = next_result;
 		RefreshRawGpr0KnownZero();
-		return context->executor->LinkedEntryPoint(*next_block);
+		return context->executor->PublishedGeneratedEntry(*next_block);
 	}
 
 	bool BlockExecutor::ExecutePersistentAtPc(u32 start_pc,
 		bool run_event_test_on_event_exit, PersistentBoundaryCallback boundary_callback,
 		void* callback_userdata, BlockExecutionResult* result,
-		PersistentEventCallback event_callback)
+		PersistentEventCallback event_callback,
+		PersistentPreparedCallback prepared_callback)
 	{
 		if (!result || !m_persistent_dispatch_enabled || !EnsurePersistentDispatcher())
 			return false;
@@ -4172,6 +5805,15 @@ namespace VitaEE
 			if (!PrepareCompiledBlockAtPc(start_pc, &block, &initial_result))
 				return false;
 		}
+		if (!initial_result.cache_hit && prepared_callback &&
+			!prepared_callback(callback_userdata, initial_result))
+		{
+			// No guest instruction ran, but this is an intentional outer-provider
+			// continuation rather than a compilation failure. The caller can now
+			// publish the discovered region entry barrier atomically.
+			*result = initial_result;
+			return true;
+		}
 
 		PersistentRunContext context;
 		context.executor = this;
@@ -4179,6 +5821,7 @@ namespace VitaEE
 		context.current_result = initial_result;
 		context.final_result = result;
 		context.boundary_callback = boundary_callback;
+		context.prepared_callback = prepared_callback;
 		context.callback_userdata = callback_userdata;
 		context.run_event_test_on_event_exit = run_event_test_on_event_exit;
 
@@ -4189,8 +5832,20 @@ namespace VitaEE
 		// than letting an Event tail run scheduler work the caller forbade.
 		if (!run_event_test_on_event_exit)
 			event_callback = nullptr;
+		m_persistent_generated_failure = false;
+		const void* initial_entry = PublishedGeneratedEntry(*block);
+		if (!initial_entry && IsPersistentDispatchBarrier(block->start_pc))
+		{
+			// The outer provider has just run the lifecycle/admission owner which
+			// requested this barrier. Enter the exact tier-zero block once under the
+			// live dispatcher instead of misclassifying the intentional null lookup
+			// as a compile failure and stepping one guest instruction in C++.
+			initial_entry = LinkedEntryPoint(*block);
+		}
+		if (!initial_entry)
+			return false;
 		const u32 exit_value = reinterpret_cast<PersistentDispatcher>(m_persistent_dispatch_entry)(
-			LinkedEntryPoint(*block), &context,
+			initial_entry, &context,
 			reinterpret_cast<const void*>(&BlockExecutor::PersistentDispatchThunk),
 			reinterpret_cast<const void*>(event_callback));
 		if (context.failed)
@@ -4198,6 +5853,13 @@ namespace VitaEE
 
 		BlockExitKind exit = BlockExitKind::Direct;
 		return DecodeExitKind(exit_value, &exit);
+	}
+
+	bool BlockExecutor::ConsumePersistentGeneratedFailure()
+	{
+		const bool failure = m_persistent_generated_failure;
+		m_persistent_generated_failure = false;
+		return failure;
 	}
 
 	bool BlockExecutor::ExecuteStraightLineBlockOrInterpreterStep(u32 start_pc, u32 instruction_count,

@@ -138,6 +138,132 @@ extern bool g_vita_a32_iop_scheduler_dispatch_cache_event_entry_enabled;
 extern u64 g_vita_a32_iop_private_event_entries;
 #endif
 
+struct VitaA32EeRegionEntryProfile
+{
+	u32 pc = 0;
+	u64 executions = 0;
+	u64 counted_iterations = 0;
+	u64 profitability_fallbacks = 0;
+	u64 entry_state_fallbacks = 0;
+	u32 block_count = 0;
+	u32 source_words = 0;
+	u32 host_instructions = 0;
+	u32 hot_host_instructions = 0;
+	u32 hot_host_loads = 0;
+	u32 hot_host_stores = 0;
+	u32 hot_state_loads = 0;
+	u32 hot_state_stores = 0;
+	u32 frame_bytes = 0;
+	u32 work_scratch_bytes = 0;
+	u32 hot_code_bytes = 0;
+	u32 cold_code_bytes = 0;
+	u32 prologue_hot_bytes = 0;
+	u32 entry_event_hot_bytes = 0;
+	u32 entry_iteration_hot_bytes = 0;
+	u32 entry_memory_hot_bytes = 0;
+	u32 block_hot_bytes = 0;
+	u32 block_host_loads = 0;
+	u32 block_host_stores = 0;
+	u32 entry_state_words = 0;
+	u32 output_state_words = 0;
+	u32 core_peak_words = 0;
+	u32 neon_peak_q = 0;
+	u32 spilled_values = 0;
+	u32 spill_bytes = 0;
+	u32 edge_moves = 0;
+	u32 preflight_accesses = 0;
+	u32 preflight_store_accesses = 0;
+	u32 preflight_stride = 0;
+	u32 minimum_profitable_iterations = 0;
+	u32 pre_entry_state_leaves = 0;
+	u32 entry_low32_guards = 0;
+	u32 semantic_kernel_kind = 0;
+	u32 semantic_kernel_hot_bytes = 0;
+	u32 semantic_kernel_bytes_per_iteration = 0;
+	u32 semantic_kernel_minimum_profitable_bytes = 0;
+	u32 semantic_kernel_target_cost_valid = 0;
+};
+
+// Cold diagnostic image of one validation-only ExactSupport allocation and
+// emission. It is deliberately plain telemetry data: no field is consulted by
+// region formation, publication, or generated execution.
+struct VitaA32EeRegionTargetCostProfile
+{
+	u32 entry_pc = 0;
+	u32 source_end_pc = 0;
+	u32 semantic_diagnostics = 0;
+	u32 blocks = 0;
+	u32 source_words = 0;
+	u32 direct_calls = 0;
+	u32 host_instructions = 0;
+	u32 hot_code_bytes = 0;
+	u32 entry_state_words = 0;
+	u32 output_state_words = 0;
+	u32 exit_sites = 0;
+	u32 exit_state_words = 0;
+	u64 exit_sites_by_kind = 0;
+	u64 exit_state_words_by_kind = 0;
+	u64 control_exit_sites_by_target = 0;
+	u64 control_exit_state_words_by_target = 0;
+	u32 compact_exit_descriptors = 0;
+	u32 compact_exit_words = 0;
+	u32 compact_snapshot_bytes = 0;
+	u32 core_peak_words = 0;
+	u32 vfp_peak_s = 0;
+	u32 neon_peak_q = 0;
+	u32 spilled_values = 0;
+	u32 spill_bytes = 0;
+	u32 spilled_core_values = 0;
+	u32 spilled_vfp_values = 0;
+	u32 spilled_neon_values = 0;
+	u32 edge_moves = 0;
+	u32 edge_call_moves = 0;
+	u32 edge_return_moves = 0;
+	u32 edge_backedge_moves = 0;
+	u32 edge_state_words = 0;
+	u32 memory_loads = 0;
+	u32 memory_stores = 0;
+	u32 forwarded_memory_loads = 0;
+	u32 memory_forward_candidates = 0;
+	u32 memory_forward_reaching_stores = 0;
+	u32 memory_forward_address_matches = 0;
+	u32 memory_forward_state_matches = 0;
+	u32 memory_preflight_ranges = 0;
+	u32 memory_preflight_accesses = 0;
+	u8 aggregate_cycle_plan_status = 0;
+	u32 failure_pc = 0;
+	u32 failure_detail = 0;
+	u32 failure_value = 0;
+	u16 failure_ir_opcode = UINT16_MAX;
+	u8 failure_stage = 0;
+	u8 backend_failure = 0;
+	u8 failure_emission_step = 0;
+	u8 backend_emitted = 0;
+	u8 valid = 0;
+};
+
+// Bounded cold attribution for the largest validation-only target-cost image.
+// It is copied only at the existing profiler snapshot boundary and is never
+// consumed by region formation, allocation, publication, or generated code.
+struct VitaA32EeRegionTargetCostBlock
+{
+	u32 pc = 0;
+	u32 source_instructions = 0;
+	u32 hot_bytes = 0;
+	u32 host_loads = 0;
+	u32 host_stores = 0;
+	u32 spilled_core_values = 0;
+	u32 spilled_vfp_values = 0;
+	u32 spilled_neon_values = 0;
+	u32 spill_loads = 0;
+	u32 spill_stores = 0;
+	u32 edge_moves = 0;
+	u32 edge_state_words = 0;
+	u32 exit_sites = 0;
+	u32 exit_state_words = 0;
+	u8 direct_call_roles = 0;
+};
+
 struct VitaA32EeProviderStats
 {
 	// Compile-time code-generation totals. These count each successfully
@@ -190,6 +316,7 @@ struct VitaA32EeProviderStats
 	u32 code_cache_resets = 0;
 	u32 code_cache_block_records = 0;
 	u32 code_cache_slots = 0;
+	u32 code_cache_slot_metadata_size = 0;
 	u64 code_cache_used = 0;
 	u64 code_cache_capacity = 0;
 	// Bounded product telemetry. Candidates are derived from tests-refusals so
@@ -201,6 +328,191 @@ struct VitaA32EeProviderStats
 	u32 retained_dmac_chcr_poll_events = 0;
 	u32 retained_ram_wait_events = 0;
 	u32 retained_ram_wait_write_exits = 0;
+	// Product-connected Phase 3 natural-loop cache. These remain zero when
+	// VITASX2_EE_REGION_EXECUTION is compiled out.
+	u64 region_candidates = 0;
+	u64 region_build_attempts = 0;
+	u64 region_compiles = 0;
+	u64 region_compile_failures = 0;
+	u64 region_compile_wall_us = 0;
+	u64 region_compile_budget_deferrals = 0;
+	u64 region_compile_budget_refills = 0;
+	u64 region_target_cost_analyses = 0;
+	u64 region_profitability_prescreen_passes = 0;
+	u64 region_profitability_prescreen_rejections = 0;
+	u64 region_profitability_prescreen_unknowns = 0;
+	u64 region_compiler_heap_failures = 0;
+	u64 region_code_cache_failures = 0;
+	u64 region_source_contract_deferrals = 0;
+	u64 region_source_contract_resumes = 0;
+	u64 region_source_contract_replacements = 0;
+	u64 region_source_contract_capacity_rejections = 0;
+	u64 region_source_graph_attempts = 0;
+	u64 region_source_graph_formations = 0;
+	u64 region_forward_event_samples = 0;
+	u64 region_forward_sample_collisions = 0;
+	u64 region_forward_sample_requests = 0;
+	u64 region_forward_sample_candidates = 0;
+	u64 region_forward_sample_rejections = 0;
+	u64 region_probe_observations = 0;
+	u64 region_maximum_event_scoped_probe_observations = 0;
+	u64 region_probe_sample_misses = 0;
+	u64 region_probe_sample_retries = 0;
+	u64 region_hot_promotions = 0;
+	u64 region_probe_evictions = 0;
+	u64 region_admission_saturations = 0;
+	u64 region_admission_capacity_deferrals = 0;
+	u64 region_admission_capacity_retries = 0;
+	u64 region_admission_capacity_rejections = 0;
+	u64 region_probe_directory_repairs = 0;
+	u64 region_evictions = 0;
+	u64 region_generation_resets = 0;
+	u64 region_executions = 0;
+	u64 region_boundary_exits = 0;
+	u64 region_event_exits = 0;
+	u64 region_profitability_fallbacks = 0;
+	u64 region_entry_state_fallbacks = 0;
+	u64 region_profitability_retirements = 0;
+	u64 region_memory_exits = 0;
+	u64 region_memory_alignment_exits = 0;
+	u64 region_memory_handler_exits = 0;
+	u64 region_memory_translation_exits = 0;
+	u64 region_self_modifying_code_exits = 0;
+	u64 region_continuation_exits = 0;
+	u64 region_continuation_nonzero_debt_exits = 0;
+	u64 region_continuation_event_exits = 0;
+	u64 region_continuation_scheduler_elided_exits = 0;
+	u64 region_continuation_failures = 0;
+	u64 persistent_region_resumes = 0;
+	u64 persistent_required_outer_unwinds = 0;
+	u32 region_translation_snapshot_valid = 0;
+	u32 region_translation_start_low = 0;
+	u32 region_translation_start_high = 0;
+	u32 region_translation_bound_low = 0;
+	u32 region_translation_bound_high = 0;
+	u32 region_translation_identity_limit = 0;
+	u32 region_translation_stride_bytes = 0;
+	u64 region_code_bytes = 0;
+	u64 region_one_block_executions = 0;
+	u64 region_multi_block_executions = 0;
+	u64 region_preflight_executions = 0;
+	u64 region_preflight_store_executions = 0;
+	u64 region_spill_executions = 0;
+	u64 region_weighted_host_instructions = 0;
+	u64 region_weighted_hot_code_bytes = 0;
+	u64 region_weighted_entry_state_words = 0;
+	u64 region_weighted_output_state_words = 0;
+	u64 region_semantic_kernel_executions = 0;
+	u64 region_semantic_kernel_iterations = 0;
+	u64 region_semantic_kernel_bytes = 0;
+	u64 region_semantic_fill_executions = 0;
+	u64 region_semantic_copy_executions = 0;
+	u64 region_semantic_unretained_executions = 0;
+	u32 region_active = 0;
+	u32 region_active_probes = 0;
+	u32 region_armed_probes = 0;
+	u32 region_deferred = 0;
+	u32 region_pending_candidate = 0;
+	u32 region_publication_dirty = 0;
+	u32 region_maintenance_requested = 0;
+	u32 region_compile_budget_tokens = 0;
+	u64 region_compile_budget_wait_cycles = 0;
+	std::array<VitaA32EeRegionEntryProfile, 4> region_entry_profile{};
+	u32 region_probe_snapshot_count = 0;
+	std::array<u32, 8> region_probe_entry_pc{};
+	std::array<u32, 8> region_probe_backedge_pc{};
+	std::array<u32, 8> region_probe_source_end_pc{};
+	std::array<u32, 8> region_probe_snapshot_observations{};
+	std::array<u32, 8> region_probe_maximum_observations{};
+	std::array<u32, 8> region_probe_samples{};
+	std::array<u32, 8> region_probe_required{};
+	std::array<u8, 8> region_probe_internal_blocks{};
+	std::array<u8, 8> region_probe_flags{};
+	u32 region_deferred_snapshot_count = 0;
+	std::array<u32, 8> region_deferred_entry_pc{};
+	std::array<u32, 8> region_deferred_backedge_pc{};
+	std::array<u32, 8> region_deferred_source_end_pc{};
+	std::array<u32, 8> region_deferred_missing_pc{};
+	std::array<u8, 8> region_deferred_flags{};
+	u32 region_repeated_candidate_snapshot_count = 0;
+	std::array<u32, 16> region_repeated_candidate_entry_pc{};
+	std::array<u32, 16> region_repeated_candidate_source_end_pc{};
+	std::array<u32, 16> region_repeated_candidate_detail_pc{};
+	std::array<u32, 16> region_repeated_candidate_observations{};
+	std::array<u8, 16> region_repeated_candidate_blocks{};
+	std::array<u8, 16> region_repeated_candidate_outcome{};
+	std::array<u8, 16> region_repeated_candidate_failure_stage{};
+	std::array<u32, 16> region_repeated_candidate_failure_detail{};
+	u32 region_target_cost_snapshot_count = 0;
+	std::array<VitaA32EeRegionTargetCostProfile, 4>
+		region_target_cost_snapshot{};
+	u32 region_target_cost_entry_pc = 0;
+	u32 region_target_cost_source_end_pc = 0;
+	u32 region_target_cost_semantic_diagnostics = 0;
+	u32 region_target_cost_blocks = 0;
+	u32 region_target_cost_source_words = 0;
+	u32 region_target_cost_direct_calls = 0;
+	u32 region_target_cost_host_instructions = 0;
+	u32 region_target_cost_hot_code_bytes = 0;
+	u32 region_target_cost_entry_state_words = 0;
+	u32 region_target_cost_output_state_words = 0;
+	u32 region_target_cost_exit_sites = 0;
+	u32 region_target_cost_exit_state_words = 0;
+	u64 region_target_cost_exit_sites_by_kind = 0;
+	u64 region_target_cost_exit_state_words_by_kind = 0;
+	u64 region_target_cost_control_exit_sites_by_target = 0;
+	u64 region_target_cost_control_exit_state_words_by_target = 0;
+	u32 region_target_cost_compact_exit_descriptors = 0;
+	u32 region_target_cost_compact_exit_words = 0;
+	u32 region_target_cost_compact_snapshot_bytes = 0;
+	u32 region_target_cost_core_peak_words = 0;
+	u32 region_target_cost_vfp_peak_s = 0;
+	u32 region_target_cost_neon_peak_q = 0;
+	u32 region_target_cost_spilled_values = 0;
+	u32 region_target_cost_spill_bytes = 0;
+	u32 region_target_cost_spilled_core_values = 0;
+	u32 region_target_cost_spilled_vfp_values = 0;
+	u32 region_target_cost_spilled_neon_values = 0;
+	u32 region_target_cost_edge_moves = 0;
+	u32 region_target_cost_edge_call_moves = 0;
+	u32 region_target_cost_edge_return_moves = 0;
+	u32 region_target_cost_edge_backedge_moves = 0;
+	u32 region_target_cost_edge_state_words = 0;
+	u32 region_target_cost_memory_loads = 0;
+	u32 region_target_cost_memory_stores = 0;
+	u32 region_target_cost_forwarded_memory_loads = 0;
+	u32 region_target_cost_memory_forward_candidates = 0;
+	u32 region_target_cost_memory_forward_reaching_stores = 0;
+	u32 region_target_cost_memory_forward_address_matches = 0;
+	u32 region_target_cost_memory_forward_state_matches = 0;
+	u32 region_target_cost_memory_preflight_ranges = 0;
+	u32 region_target_cost_memory_preflight_accesses = 0;
+	u8 region_target_cost_aggregate_cycle_plan_status = 0;
+	u32 region_target_cost_failure_pc = 0;
+	u32 region_target_cost_failure_detail = 0;
+	u32 region_target_cost_failure_value = 0;
+	u16 region_target_cost_failure_ir_opcode = UINT16_MAX;
+	u8 region_target_cost_failure_stage = 0;
+	u8 region_target_cost_backend_failure = 0;
+	u8 region_target_cost_failure_emission_step = 0;
+	u8 region_target_cost_backend_emitted = 0;
+	u8 region_target_cost_valid = 0;
+	u32 region_target_cost_block_snapshot_count = 0;
+	std::array<VitaA32EeRegionTargetCostBlock, 8>
+		region_target_cost_block_snapshot{};
+	u32 region_failure_snapshot_count = 0;
+	std::array<u32, 8> region_failure_entry_pc{};
+	std::array<u32, 8> region_failure_pc{};
+	std::array<u32, 8> region_failure_opcode{};
+	std::array<u8, 8> region_failure_stage{};
+	std::array<u8, 8> region_failure_backend{};
+	// Cold build diagnostics captured only at the existing performance-window
+	// boundary.  These complete BuildFailureRecord so a failed product candidate
+	// can be attributed without printing from the EE dispatcher.
+	std::array<u8, 8> region_failure_emission_step{};
+	std::array<u16, 8> region_failure_ir_opcode{};
+	std::array<u32, 8> region_failure_value{};
+	std::array<u32, 8> region_failure_detail{};
 	u32 first_interpreter_pc = 0;
 	u32 first_interpreter_opcode = 0;
 	u32 first_interpreter_reason = 0;
@@ -221,6 +533,8 @@ struct VitaA32EeGeneratedGuestMix
 	u32 branch = 0;
 	u32 gpr_load = 0;
 	u32 gpr_store = 0;
+	u32 memory_load = 0;
+	u32 memory_store = 0;
 	u32 mmi = 0;
 	u32 cop0 = 0;
 	u32 cop1 = 0;
@@ -360,6 +674,7 @@ enum class VitaA32EeFallbackReason : u32
 
 const char* VitaA32EeFallbackReasonName(VitaA32EeFallbackReason reason);
 void VitaResetA32EeProviderStats();
+void VitaBeginA32EeRegionStatisticsWindow();
 VitaA32EeProviderStats VitaGetA32EeProviderStats();
 void VitaRecordA32EeGeneratedCode(u32 start_pc,
 	const VitaA32EeGeneratedGuestMix& guest_mix, u64 host_instructions,

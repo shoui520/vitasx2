@@ -18,6 +18,7 @@
 #include "pcsx2/Config.h"
 #include "pcsx2/DebugTools/CoreEventTrace.h"
 #include "pcsx2/DebugTools/GsTrace.h"
+#include "pcsx2/DebugTools/MachineCheckpointTrace.h"
 #include "pcsx2/DebugTools/VuTrace.h"
 #include "pcsx2/Hw.h"
 #include "pcsx2/Dmac.h"
@@ -3995,6 +3996,11 @@ namespace VitaEE
 		{
 			return true;
 		}
+		if (immediate_target_branch && IsFastCOP2ControlWrite(delay_op) &&
+			RD(delay_op) != VU0_REG_CMSAR1 && CanCompileOpcode(delay_op))
+		{
+			return true;
+		}
 
 		// PCSX2 owners: x86/ix86-32/iR5900Jump.cpp::{recJR,recJALR} snapshot the
 		// register target in a callee-saved PCWRITEBACK register before compiling
@@ -4008,6 +4014,11 @@ namespace VitaEE
 		const bool jalr = (branch_op >> 26) == 0x00 && (branch_op & 0x3f) == 0x09;
 		if ((jr || jalr) && IsFastCOP2MacroInBlock(delay_op) &&
 			CanCompileOpcode(delay_op))
+		{
+			return true;
+		}
+		if ((jr || jalr) && IsFastCOP2ControlWrite(delay_op) &&
+			RD(delay_op) != VU0_REG_CMSAR1 && CanCompileOpcode(delay_op))
 		{
 			return true;
 		}
@@ -11497,7 +11508,8 @@ namespace VitaEE
 		const void* scheduler_test_elided_direct_exit,
 		const void* retained_wait_event_exit,
 		PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof,
-		TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof)
+		TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof,
+		u32 inherited_raw_cycles, bool exact_source_fragment)
 	{
 		if (scheduler_test_elided_continuation_emitted)
 			*scheduler_test_elided_continuation_emitted = false;
@@ -11647,57 +11659,65 @@ namespace VitaEE
 			!device_trace_enabled && !EmuConfig.Gamefixes.GoemonTlbHack &&
 			persistent_dispatch_exits && retained_wait_event_exit &&
 			direct_continuation_kind == DirectContinuationKind::SchedulerTestedTail;
-		if (retained_unconditional_wait_enabled &&
+		// A region continuation owns precisely one suffix of an original PCSX2
+		// source block.  It may use the ordinary instruction lowerings, but it
+		// must never widen that suffix into a whole-loop helper or wait fast path:
+		// the region has already accounted for the prefix, event horizon and
+		// continuation PC.  Re-running a source-shape specialization here would
+		// change both the instruction window and its observer boundary.
+		const bool may_specialize_source_shape = !exact_source_fragment &&
+			inherited_raw_cycles == 0;
+		if (may_specialize_source_shape && retained_unconditional_wait_enabled &&
 			IsRetainableUnconditionalWaitBlock(start_pc, instruction_count))
 		{
 			return CompileRetainedUnconditionalWaitBlock(start_pc,
 				instruction_count, retained_wait_event_exit, scaled_cycles,
 				linked_entry_offset);
 		}
-		if (gs_csr_poll_fast_forward_enabled && direct_links &&
+		if (may_specialize_source_shape && gs_csr_poll_fast_forward_enabled && direct_links &&
 			IsExactGsCsrVsintPollLoop(start_pc, instruction_count))
 		{
 			return CompileGsCsrVsintPollLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
-		if (dmac_chcr_poll_fast_forward_enabled && direct_links &&
+		if (may_specialize_source_shape && dmac_chcr_poll_fast_forward_enabled && direct_links &&
 			IsExactDmacChcrStrPollLoop(start_pc, instruction_count))
 		{
 			return CompileDmacChcrStrPollLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links,
 				linked_entry_offset);
 		}
-		if (memory_range_loop_batch_enabled && direct_links &&
+		if (may_specialize_source_shape && memory_range_loop_batch_enabled && direct_links &&
 			IsExactWordCopyLoop(start_pc, instruction_count))
 		{
 			return CompileWordCopyLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
-		if (memory_range_loop_batch_enabled && direct_links &&
+		if (may_specialize_source_shape && memory_range_loop_batch_enabled && direct_links &&
 			IsExactSelfAddressPairScan(start_pc, instruction_count))
 		{
 			return CompileSelfAddressPairScan(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
-		if (memory_range_loop_batch_enabled && direct_links &&
+		if (may_specialize_source_shape && memory_range_loop_batch_enabled && direct_links &&
 			IsExactFourWordFillLoop(start_pc, instruction_count))
 		{
 			return CompileFourWordFillLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
-		if (memory_range_loop_batch_enabled && direct_links &&
+		if (may_specialize_source_shape && memory_range_loop_batch_enabled && direct_links &&
 			IsExactPreincrementWordFillLoop(start_pc, instruction_count))
 		{
 			return CompilePreincrementWordFillLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
-		if (memory_range_loop_batch_enabled && direct_links &&
+		if (may_specialize_source_shape && memory_range_loop_batch_enabled && direct_links &&
 			IsExactPreincrementByteZeroFillLoop(start_pc, instruction_count))
 		{
 			return CompilePreincrementByteZeroFillLoop(start_pc, instruction_count,
 				direct_exit, event_exit, scaled_cycles, direct_links, linked_entry_offset);
 		}
-		if (signed_countdown_loop_batch_enabled && direct_links &&
+		if (may_specialize_source_shape && signed_countdown_loop_batch_enabled && direct_links &&
 			IsExactSignedCountdownLoop(start_pc, instruction_count))
 		{
 			return CompileSignedCountdownLoop(start_pc, instruction_count, direct_exit, event_exit,
@@ -11887,6 +11907,12 @@ namespace VitaEE
 		{
 			return false;
 		}
+		// Region continuations are cold correctness paths entered specifically when
+		// an aggregate proof refuses the hot region.  Do not bake the mapping state
+		// observed while the region was compiled into those suffixes: consult vmap
+		// at each memory operation just as the PCSX2 helper contract does.  The same
+		// flag also protects suffix instructions after an in-block TLB write.
+		m_runtime_tlb_mapping_may_have_changed = exact_source_fragment;
 		if (m_gpr_link_signature.IsValid() && m_pin_count != m_gpr_link_signature.count)
 			return false;
 		m_dirty_pins_enabled = dirty_pins_candidate &&
@@ -11996,7 +12022,13 @@ namespace VitaEE
 		if (!EmitCpuProfilerBlockPc(start_pc, true))
 			return false;
 
-		u32 raw_cycles = 0;
+		// A Region IR observer can leave after a semantically executed prefix of
+		// one original PCSX2 BaseBlock while deliberately keeping cpuRegs.cycle at
+		// that block's entry value.  Its private continuation starts at start_pc,
+		// appends this fixed-point prefix to the remaining opcode costs, and lets
+		// the ordinary block tail scale/publish the sum exactly once.  This is not
+		// an independently rounded A32 fragment boundary.
+		u32 raw_cycles = inherited_raw_cycles;
 		u32 committed_scaled_cycles = 0;
 		bool has_branch = false;
 		bool has_register_branch_target = false;
@@ -12469,7 +12501,8 @@ namespace VitaEE
 					}
 					const bool register_branch_delay_slot =
 						branch_delay_slot && has_register_branch_target;
-					if (branch_delay_slot && IsFastCOP2MacroInBlock(op) &&
+					if (branch_delay_slot &&
+						(IsFastCOP2MacroInBlock(op) || IsFastCOP2ControlWrite(op)) &&
 						branch_delay_selected_pc == UINT32_MAX &&
 						!register_branch_delay_slot)
 					{
@@ -12574,7 +12607,8 @@ namespace VitaEE
 		// fast-forward path unless PCSX2's SetBranchReg timing is proven equal.
 		PollCallWaitLoopSourceProof wait_loop_source_proof;
 		TwoPredicateWaitLoopSourceProof two_predicate_wait_loop_source_proof_value;
-		const bool wait_loop_body = range_loop_dispatch_enabled &&
+		const bool wait_loop_body = may_specialize_source_shape &&
+			range_loop_dispatch_enabled &&
 			!device_trace_enabled && EmuConfig.Speedhacks.WaitLoop &&
 			!EmuConfig.Gamefixes.GoemonTlbHack &&
 			!contains_in_block_tlb_write &&
@@ -16015,7 +16049,11 @@ namespace VitaEE
 		if (IsFastCOP2ControlRead(op))
 			return EmitCOP2ControlReadFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
 		if (IsFastCOP2ControlWrite(op))
-			return EmitCOP2ControlWriteFast(op, pc + 4, raw_cycles_through_instruction, event_exit);
+			return EmitCOP2ControlWriteFast(op, pc + 4,
+				raw_cycles_through_instruction, event_exit,
+				branch_delay_slot ? branch_delay_selected_pc : pc + 4,
+				branch_delay_slot ? branch_delay_fallthrough_pc : UINT32_MAX,
+				register_branch_delay_slot);
 		if (IsFastCOP2MacroInBlock(op))
 		{
 			if (branch_delay_slot && branch_delay_selected_pc == UINT32_MAX &&
@@ -18290,7 +18328,10 @@ namespace VitaEE
 				!m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, 0) ||
 				!EmitVu0ViAddress(HOST_TMP1, VU0_REG_STATUS_FLAG) ||
 				!m_code.EmitLdrImm12(HOST_TMP2, HOST_TMP1, 0) ||
-				!EmitBicImm32OrReg(HOST_TMP2, HOST_TMP2, 0x30u, HOST_TMP5) ||
+				// VUops.cpp::SYNCFDIV clears both the current D/I bits and their
+				// prior sticky mirrors before publishing this operation's result.
+				// BIC 0x30 preserved stale 0xc00 bits across macro FDIV operations.
+				!EmitAndImm32OrReg(HOST_TMP2, HOST_TMP2, 0x3cfu, HOST_TMP5) ||
 				!m_code.EmitOrrReg(HOST_TMP2, HOST_TMP2, HOST_TMP4) ||
 				!m_code.EmitOrrRegShiftImm(HOST_TMP2, HOST_TMP2, HOST_TMP4, VitaA32::ShiftType::LSL, 6) ||
 				!m_code.EmitStrImm12(HOST_TMP2, HOST_TMP1, 0))
@@ -18708,9 +18749,13 @@ namespace VitaEE
 	}
 
 	bool BlockCompiler::EmitCOP2ControlWriteFast(u32 op, u32 next_pc,
-		u32 raw_cycles_through_instruction, const void* event_exit)
+		u32 raw_cycles_through_instruction, const void* event_exit,
+		u32 running_exit_pc, u32 running_fallthrough_pc,
+		bool running_exit_from_register_branch)
 	{
-		if (!event_exit || raw_cycles_through_instruction == 0)
+		if (!event_exit || raw_cycles_through_instruction == 0 ||
+			(running_exit_from_register_branch &&
+			 running_fallthrough_pc != UINT32_MAX))
 			return false;
 
 		if (RD(op) == VU0_REG_CMSAR1)
@@ -18795,7 +18840,12 @@ namespace VitaEE
 		ClearGprQCache();
 		if (!m_code.EmitMovImm32(HOST_TMP0, op) ||
 			!m_code.EmitStrImm12(HOST_TMP0, HOST_CPU_REGS, static_cast<u16>(CODE_OFFSET)) ||
-			!EmitStorePc(next_pc) ||
+			!(running_exit_from_register_branch ?
+				EmitStorePcFromHostReg(HOST_BRANCH_TARGET) :
+				(running_fallthrough_pc == UINT32_MAX ?
+					EmitStorePc(running_exit_pc) :
+					EmitStoreBranchPc(running_exit_pc,
+						running_fallthrough_pc))) ||
 			!EmitAddScaledCyclesToCpu(cycles) ||
 			!m_code.EmitCallAbsolute(sync_mode == Vu0SyncMode::Finish ?
 				reinterpret_cast<const void*>(&_vu0FinishMicro) :
@@ -34847,6 +34897,7 @@ namespace VitaEE
 			// mechanisms already impose the deferred whole-cache boundary before
 			// generated code can be reused. Identity TLB publication preserves it.
 			const bool identity_main_ram =
+				!m_runtime_tlb_mapping_may_have_changed &&
 				vtlb_private::HasDefaultMainRamIdentityWindow();
 			size_t identity_direct = static_cast<size_t>(-1);
 			if (identity_main_ram)

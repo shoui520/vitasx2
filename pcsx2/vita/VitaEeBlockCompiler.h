@@ -175,6 +175,7 @@ namespace VitaEE
 		bool embedded_continuation_active = false;
 		bool patched_to_resident_entry = false;
 		bool patched_to_compatible_entry = false;
+		bool patched_to_generated_compatible_entry = false;
 		bool patched_to_canonical_entry = false;
 		bool requires_compatible_entry = false;
 		bool canonicalizes_reclaimed_vtlb_hosts = false;
@@ -732,7 +733,9 @@ namespace VitaEE
 			const void* scheduler_test_elided_direct_exit = nullptr,
 			const void* retained_wait_event_exit = nullptr,
 			PollCallWaitLoopSourceProof* poll_call_wait_loop_source_proof = nullptr,
-			TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof = nullptr);
+			TwoPredicateWaitLoopSourceProof* two_predicate_wait_loop_source_proof = nullptr,
+			u32 inherited_raw_cycles = 0,
+			bool exact_source_fragment = false);
 		bool EmitOpcode(u32 op, u32 pc = 0, u32 raw_cycles_through_instruction = 0,
 			const void* event_exit = nullptr, bool branch_delay_slot = false,
 			u32 branch_delay_selected_pc = UINT32_MAX,
@@ -945,7 +948,8 @@ namespace VitaEE
 		bool EmitCOP2ControlReadFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
 			const void* event_exit);
 		bool EmitCOP2ControlWriteFast(u32 op, u32 next_pc, u32 raw_cycles_through_instruction,
-			const void* event_exit);
+			const void* event_exit, u32 running_exit_pc,
+			u32 running_fallthrough_pc, bool running_exit_from_register_branch);
 		bool EmitCACHE(u32 op);
 		bool EmitSpecialExceptionExit(u32 op, u32 pc, u32 raw_cycles_through_instruction,
 			const void* event_exit, bool branch_delay_slot, const void* helper,

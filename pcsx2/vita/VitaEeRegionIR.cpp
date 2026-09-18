@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <type_traits>
 #include <utility>
 
 namespace VitaEE::RegionIR
@@ -34,10 +35,17 @@ namespace VitaEE::RegionIR
 			VU0_VF_PARAMETER_BASE + VU0_VF_COUNT;
 		constexpr u32 VU0_MACFLAG_PARAMETER = VU0_ACC_PARAMETER + 1;
 		constexpr u32 VU0_STATUSFLAG_PARAMETER = VU0_MACFLAG_PARAMETER + 1;
-		constexpr u32 VU0_VI_MAC_PARAMETER = VU0_STATUSFLAG_PARAMETER + 1;
-		constexpr u32 VU0_VI_STATUS_PARAMETER = VU0_VI_MAC_PARAMETER + 1;
-		constexpr u32 VU0_VPU_STAT_PARAMETER = VU0_VI_STATUS_PARAMETER + 1;
-		constexpr u32 CYCLE_PARAMETER = VU0_VPU_STAT_PARAMETER + 1;
+		constexpr u32 VU0_CLIPFLAG_PARAMETER = VU0_STATUSFLAG_PARAMETER + 1;
+		constexpr u32 VU0_Q_PARAMETER = VU0_CLIPFLAG_PARAMETER + 1;
+		constexpr u32 VU0_VI_PARAMETER_BASE = VU0_Q_PARAMETER + 1;
+		constexpr u32 VU0_VI_COUNT = 32;
+		constexpr u32 VU0_MICRO_MACFLAG_PARAMETER_BASE =
+			VU0_VI_PARAMETER_BASE + VU0_VI_COUNT;
+		constexpr u32 VU0_MICRO_CLIPFLAG_PARAMETER_BASE =
+			VU0_MICRO_MACFLAG_PARAMETER_BASE + 4;
+		constexpr u32 VU0_MICRO_STATUSFLAG_PARAMETER_BASE =
+			VU0_MICRO_CLIPFLAG_PARAMETER_BASE + 4;
+		constexpr u32 CYCLE_PARAMETER = VU0_MICRO_STATUSFLAG_PARAMETER_BASE + 4;
 		constexpr u32 MEMORY_EFFECT_PARAMETER = CYCLE_PARAMETER + 1;
 		constexpr u32 PARAMETER_COUNT = MEMORY_EFFECT_PARAMETER + 1;
 		enum class NoEffectKind : u32
@@ -45,6 +53,8 @@ namespace VitaEE::RegionIR
 			Sync,
 			Prefetch,
 			Cache,
+			Vu0Nop,
+			Vu0WaitQ,
 		};
 		enum class PureMmiKind : u8
 		{
@@ -64,6 +74,13 @@ namespace VitaEE::RegionIR
 			CopyUpperDoubleword,
 			CopyHalfword,
 		};
+		struct IntegerMultiplyOp
+		{
+			bool valid = false;
+			bool signed_multiply = false;
+			bool accumulate = false;
+			bool upper_pipeline = false;
+		};
 		enum class PureCop1StateKind : u8
 		{
 			MoveFromFpr,
@@ -79,6 +96,11 @@ namespace VitaEE::RegionIR
 			SubtractAccumulator,
 			MultiplyAccumulator,
 		};
+		enum class Cop1UnaryWordKind : u8
+		{
+			Absolute,
+			Negate,
+		};
 		enum class CompoundCop1ArithmeticKind : u8
 		{
 			MultiplyAdd,
@@ -91,19 +113,77 @@ namespace VitaEE::RegionIR
 			Less,
 			LessEqual,
 		};
-		enum class Vu0BroadcastFmacKind : u8
+		enum class Vu0FmacKind : u8
 		{
-			MultiplyAccumulator,
-			MultiplyAddAccumulator,
-			MultiplyAddVector,
+			Add,
+			Subtract,
+			Multiply,
+			MultiplyAdd,
+			MultiplySubtract,
+		};
+		enum class Vu0FmacOperand : u8
+		{
+			Vector,
+			BroadcastLane,
+			ScalarQ,
 		};
 
-		struct Vu0BroadcastFmacOp
+		struct Vu0FmacOp
 		{
 			bool valid = false;
-			Vu0BroadcastFmacKind kind =
-				Vu0BroadcastFmacKind::MultiplyAccumulator;
+			Vu0FmacKind kind = Vu0FmacKind::Multiply;
+			Vu0FmacOperand operand = Vu0FmacOperand::Vector;
+			bool accumulator_destination = false;
 			u32 lane = 0;
+		};
+		enum class Vu0FdivKind : u8
+		{
+			Divide,
+			SquareRoot,
+			ReciprocalSquareRoot,
+		};
+
+		struct Vu0FdivOp
+		{
+			bool valid = false;
+			Vu0FdivKind kind = Vu0FdivKind::Divide;
+			u32 fs_lane = 0;
+			u32 ft_lane = 0;
+		};
+		enum class Vu0UnaryKind : u8
+		{
+			Move,
+			ConvertFixed,
+			ConvertIntegerToFloat,
+			Rotate32,
+		};
+
+		struct Vu0UnaryOp
+		{
+			bool valid = false;
+			Vu0UnaryKind kind = Vu0UnaryKind::Move;
+			u32 offset = 0;
+		};
+		enum class Vu0VectorTransferKind : u8
+		{
+			FromVu0,
+			ToVu0,
+		};
+
+		struct Vu0VectorTransferOp
+		{
+			bool valid = false;
+			Vu0VectorTransferKind kind = Vu0VectorTransferKind::FromVu0;
+		};
+		struct Vu0ControlReadOp
+		{
+			bool valid = false;
+			u32 source = 0;
+		};
+		struct Vu0ControlWriteOp
+		{
+			bool valid = false;
+			u32 target = 0;
 		};
 
 		constexpr u32 COP1_SIGN = 0x80000000u;
@@ -122,6 +202,12 @@ namespace VitaEE::RegionIR
 		constexpr u32 VU_FLOAT_SIGN = 0x80000000u;
 		constexpr u32 VU_FLOAT_EXPONENT = 0x7f800000u;
 		constexpr u32 VU_FLOAT_MAX_FINITE = 0x7f7fffffu;
+		constexpr u32 VU0_STATUS_FLAG = 16;
+		constexpr u32 VU0_MAC_FLAG = 17;
+		constexpr u32 VU0_CLIP_FLAG = 18;
+		constexpr u32 VU0_R = 20;
+		constexpr u32 VU0_TPC = 26;
+		constexpr u32 VU0_VPU_STAT = 29;
 
 		constexpr u32 RS(u32 op) { return (op >> 21) & 0x1fu; }
 		constexpr u32 RT(u32 op) { return (op >> 16) & 0x1fu; }
@@ -144,8 +230,22 @@ namespace VitaEE::RegionIR
 			       ((op & 0x03ffffffu) << 2);
 		}
 
+		bool DecodeCop1Branch(u32 op, bool* branch_on_true = nullptr,
+			bool* likely = nullptr)
+		{
+			if ((op >> 26) != 0x11 || RS(op) != 0x08 || RT(op) > 0x03)
+				return false;
+			if (branch_on_true)
+				*branch_on_true = (RT(op) & 0x01u) != 0;
+			if (likely)
+				*likely = (RT(op) & 0x02u) != 0;
+			return true;
+		}
+
 		bool IsConditionalBranch(u32 op)
 		{
+			if (DecodeCop1Branch(op))
+				return true;
 			switch (op >> 26)
 			{
 				case 0x01:
@@ -239,6 +339,8 @@ namespace VitaEE::RegionIR
 				case 0x14: // DSLLV
 				case 0x16: // DSRLV
 				case 0x17: // DSRAV
+				case 0x18: // MULT
+				case 0x19: // MULTU
 				case 0x21: // ADDU
 				case 0x23: // SUBU
 				case 0x24: // AND
@@ -263,6 +365,43 @@ namespace VitaEE::RegionIR
 			}
 		}
 
+		IntegerMultiplyOp DecodeIntegerMultiply(u32 op)
+		{
+			IntegerMultiplyOp decoded{};
+			const u32 primary = op >> 26;
+			const u32 function = FUNCT(op);
+			if (primary == 0x00 && (function == 0x18 || function == 0x19))
+			{
+				decoded.valid = true;
+				decoded.signed_multiply = function == 0x18;
+				return decoded;
+			}
+			if (primary != 0x1c)
+				return decoded;
+
+			switch (function)
+			{
+				case 0x00: // MADD
+				case 0x01: // MADDU
+					decoded.accumulate = true;
+					break;
+				case 0x18: // MULT1
+				case 0x19: // MULTU1
+					decoded.upper_pipeline = true;
+					break;
+				case 0x20: // MADD1
+				case 0x21: // MADDU1
+					decoded.accumulate = true;
+					decoded.upper_pipeline = true;
+					break;
+				default:
+					return decoded;
+			}
+			decoded.valid = true;
+			decoded.signed_multiply = (function & 1u) == 0;
+			return decoded;
+		}
+
 		bool DecodeNoEffect(u32 op, const LiftOptions& options, NoEffectKind* kind)
 		{
 			NoEffectKind decoded{};
@@ -272,11 +411,32 @@ namespace VitaEE::RegionIR
 				decoded = NoEffectKind::Prefetch;
 			else if ((op >> 26) == 0x2f && !options.ee_cache_enabled)
 				decoded = NoEffectKind::Cache;
+			else if ((op >> 26) == 0x12 && (RS(op) & 0x10u) != 0 &&
+				(op & 0x3cu) == 0x3cu)
+			{
+				// PCSX2 owners: VU0.cpp::COP2_SPECIAL() and
+				// x86/microVU_Macro.inl::{recVNOP,recVWAITQ}. Their SPECIAL2
+				// bodies are empty, while the outer macro dispatcher still owns
+				// the VU0 interlock. LowerNonBranch installs that observer.
+				const u32 special2 = (op & 0x3u) | ((op >> 4) & 0x7cu);
+				if (special2 == 0x2f)
+					decoded = NoEffectKind::Vu0Nop;
+				else if (special2 == 0x3b)
+					decoded = NoEffectKind::Vu0WaitQ;
+				else
+					return false;
+			}
 			else
 				return false;
 			if (kind)
 				*kind = decoded;
 			return true;
+		}
+
+		bool NoEffectRequiresVu0Idle(NoEffectKind kind)
+		{
+			return kind == NoEffectKind::Vu0Nop ||
+			       kind == NoEffectKind::Vu0WaitQ;
 		}
 
 		bool IsVariableShift(u32 op)
@@ -397,6 +557,87 @@ namespace VitaEE::RegionIR
 					break;
 				default:
 					return false;
+			}
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
+		bool DecodePackedBinaryMmi(u32 op, PackedBinaryKind* kind)
+		{
+			if ((op >> 26) != 0x1c)
+				return false;
+
+			PackedBinaryKind decoded{};
+			const u32 sub = SA(op);
+			switch (FUNCT(op))
+			{
+				case 0x08: // SCE EE MMI0 instruction class.
+					switch (sub)
+					{
+						case 0x00: decoded = PackedBinaryKind::AddWrap32; break;
+						case 0x01: decoded = PackedBinaryKind::SubtractWrap32; break;
+						case 0x02: decoded = PackedBinaryKind::CompareGreaterSigned32; break;
+						case 0x03: decoded = PackedBinaryKind::MaximumSigned32; break;
+						case 0x04: decoded = PackedBinaryKind::AddWrap16; break;
+						case 0x05: decoded = PackedBinaryKind::SubtractWrap16; break;
+						case 0x06: decoded = PackedBinaryKind::CompareGreaterSigned16; break;
+						case 0x07: decoded = PackedBinaryKind::MaximumSigned16; break;
+						case 0x08: decoded = PackedBinaryKind::AddWrap8; break;
+						case 0x09: decoded = PackedBinaryKind::SubtractWrap8; break;
+						case 0x0a: decoded = PackedBinaryKind::CompareGreaterSigned8; break;
+						case 0x10: decoded = PackedBinaryKind::AddSaturateSigned32; break;
+						case 0x11: decoded = PackedBinaryKind::SubtractSaturateSigned32; break;
+						case 0x12: decoded = PackedBinaryKind::InterleaveLower32; break;
+						case 0x14: decoded = PackedBinaryKind::AddSaturateSigned16; break;
+						case 0x15: decoded = PackedBinaryKind::SubtractSaturateSigned16; break;
+						case 0x18: decoded = PackedBinaryKind::AddSaturateSigned8; break;
+						case 0x19: decoded = PackedBinaryKind::SubtractSaturateSigned8; break;
+						default: return false;
+					}
+					break;
+				case 0x28: // SCE EE MMI1 instruction class.
+					switch (sub)
+					{
+						case 0x02: decoded = PackedBinaryKind::CompareEqual32; break;
+						case 0x03: decoded = PackedBinaryKind::MinimumSigned32; break;
+						case 0x06: decoded = PackedBinaryKind::CompareEqual16; break;
+						case 0x07: decoded = PackedBinaryKind::MinimumSigned16; break;
+						case 0x0a: decoded = PackedBinaryKind::CompareEqual8; break;
+						case 0x10: decoded = PackedBinaryKind::AddSaturateUnsigned32; break;
+						case 0x11: decoded = PackedBinaryKind::SubtractSaturateUnsigned32; break;
+						case 0x12: decoded = PackedBinaryKind::InterleaveUpper32; break;
+						case 0x14: decoded = PackedBinaryKind::AddSaturateUnsigned16; break;
+						case 0x15: decoded = PackedBinaryKind::SubtractSaturateUnsigned16; break;
+						case 0x18: decoded = PackedBinaryKind::AddSaturateUnsigned8; break;
+						case 0x19: decoded = PackedBinaryKind::SubtractSaturateUnsigned8; break;
+						default: return false;
+					}
+					break;
+				default:
+					return false;
+			}
+
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
+		bool DecodePackedShiftMmi(u32 op, PackedShiftKind* kind)
+		{
+			if ((op >> 26) != 0x1c || RS(op) != 0)
+				return false;
+
+			PackedShiftKind decoded{};
+			switch (FUNCT(op))
+			{
+				case 0x34: decoded = PackedShiftKind::LeftLogical16; break;
+				case 0x36: decoded = PackedShiftKind::RightLogical16; break;
+				case 0x37: decoded = PackedShiftKind::RightArithmetic16; break;
+				case 0x3c: decoded = PackedShiftKind::LeftLogical32; break;
+				case 0x3e: decoded = PackedShiftKind::RightLogical32; break;
+				case 0x3f: decoded = PackedShiftKind::RightArithmetic32; break;
+				default: return false;
 			}
 			if (kind)
 				*kind = decoded;
@@ -586,6 +827,35 @@ namespace VitaEE::RegionIR
 			       FUNCT(op) == 0x24;
 		}
 
+		bool DecodeCop1UnaryWord(u32 op, Cop1UnaryWordKind* kind)
+		{
+			// EE Core Instruction Set Manual ABS.S/NEG.S: S format with ft
+			// reserved as zero. Undefined encodings remain on tier zero.
+			if ((op >> 26) != 0x11 || RS(op) != 0x10 || RT(op) != 0)
+				return false;
+			Cop1UnaryWordKind decoded{};
+			switch (FUNCT(op))
+			{
+				case 0x05:
+					decoded = Cop1UnaryWordKind::Absolute;
+					break;
+				case 0x07:
+					decoded = Cop1UnaryWordKind::Negate;
+					break;
+				default:
+					return false;
+			}
+			if (kind)
+				*kind = decoded;
+			return true;
+		}
+
+		Opcode Cop1UnaryWordOpcode(Cop1UnaryWordKind kind)
+		{
+			return kind == Cop1UnaryWordKind::Absolute ?
+				Opcode::Cop1AbsoluteWord : Opcode::Cop1NegateWord;
+		}
+
 		bool IsCop1ConvertSingle(u32 op)
 		{
 			// CVT.S.W uses the W format and reserves ft as zero.
@@ -593,32 +863,261 @@ namespace VitaEE::RegionIR
 			       FUNCT(op) == 0x20;
 		}
 
-		Vu0BroadcastFmacOp DecodeVu0BroadcastFmac(u32 op)
+		Vu0FmacOp DecodeVu0Fmac(u32 op)
 		{
 			if ((op >> 26) != 0x12 || (RS(op) & 0x10u) == 0)
 				return {};
 
 			const u32 function = FUNCT(op);
-			if (function >= 0x08 && function <= 0x0b)
-			{
-				return {true, Vu0BroadcastFmacKind::MultiplyAddVector,
-					function - 0x08};
-			}
 			if (function < 0x3c)
-				return {};
+			{
+				if (function <= 0x03)
+					return {true, Vu0FmacKind::Add,
+						Vu0FmacOperand::BroadcastLane, false, function};
+				if (function <= 0x07)
+					return {true, Vu0FmacKind::Subtract,
+						Vu0FmacOperand::BroadcastLane, false, function - 0x04};
+				if (function <= 0x0b)
+					return {true, Vu0FmacKind::MultiplyAdd,
+						Vu0FmacOperand::BroadcastLane, false, function - 0x08};
+				if (function <= 0x0f)
+					return {true, Vu0FmacKind::MultiplySubtract,
+						Vu0FmacOperand::BroadcastLane, false, function - 0x0c};
+				if (function >= 0x18 && function <= 0x1b)
+					return {true, Vu0FmacKind::Multiply,
+						Vu0FmacOperand::BroadcastLane, false, function - 0x18};
+				switch (function)
+				{
+					case 0x1c:
+						return {true, Vu0FmacKind::Multiply,
+							Vu0FmacOperand::ScalarQ, false, 0};
+					case 0x20:
+						return {true, Vu0FmacKind::Add,
+							Vu0FmacOperand::ScalarQ, false, 0};
+					case 0x21:
+						return {true, Vu0FmacKind::MultiplyAdd,
+							Vu0FmacOperand::ScalarQ, false, 0};
+					case 0x24:
+						return {true, Vu0FmacKind::Subtract,
+							Vu0FmacOperand::ScalarQ, false, 0};
+					case 0x25:
+						return {true, Vu0FmacKind::MultiplySubtract,
+							Vu0FmacOperand::ScalarQ, false, 0};
+					case 0x28:
+						return {true, Vu0FmacKind::Add,
+							Vu0FmacOperand::Vector, false, 0};
+					case 0x29:
+						return {true, Vu0FmacKind::MultiplyAdd,
+							Vu0FmacOperand::Vector, false, 0};
+					case 0x2a:
+						return {true, Vu0FmacKind::Multiply,
+							Vu0FmacOperand::Vector, false, 0};
+					case 0x2c:
+						return {true, Vu0FmacKind::Subtract,
+							Vu0FmacOperand::Vector, false, 0};
+					case 0x2d:
+						return {true, Vu0FmacKind::MultiplySubtract,
+							Vu0FmacOperand::Vector, false, 0};
+					default:
+						return {};
+				}
+			}
 
 			const u32 special2 = (op & 0x3u) | ((op >> 4) & 0x7cu);
-			if (special2 >= 0x08 && special2 <= 0x0b)
+			if (special2 <= 0x03)
 			{
-				return {true, Vu0BroadcastFmacKind::MultiplyAddAccumulator,
-					special2 - 0x08};
+				return {true, Vu0FmacKind::Add,
+					Vu0FmacOperand::BroadcastLane, true, special2};
+			}
+			if (special2 <= 0x07)
+			{
+				return {true, Vu0FmacKind::Subtract,
+					Vu0FmacOperand::BroadcastLane, true, special2 - 0x04};
+			}
+			if (special2 <= 0x0b)
+			{
+				return {true, Vu0FmacKind::MultiplyAdd,
+					Vu0FmacOperand::BroadcastLane, true, special2 - 0x08};
+			}
+			if (special2 <= 0x0f)
+			{
+				return {true, Vu0FmacKind::MultiplySubtract,
+					Vu0FmacOperand::BroadcastLane, true, special2 - 0x0c};
 			}
 			if (special2 >= 0x18 && special2 <= 0x1b)
 			{
-				return {true, Vu0BroadcastFmacKind::MultiplyAccumulator,
-					special2 - 0x18};
+				return {true, Vu0FmacKind::Multiply,
+					Vu0FmacOperand::BroadcastLane, true, special2 - 0x18};
+			}
+			switch (special2)
+			{
+				case 0x1c:
+					return {true, Vu0FmacKind::Multiply,
+						Vu0FmacOperand::ScalarQ, true, 0};
+				case 0x20:
+					return {true, Vu0FmacKind::Add,
+						Vu0FmacOperand::ScalarQ, true, 0};
+				case 0x21:
+					return {true, Vu0FmacKind::MultiplyAdd,
+						Vu0FmacOperand::ScalarQ, true, 0};
+				case 0x24:
+					return {true, Vu0FmacKind::Subtract,
+						Vu0FmacOperand::ScalarQ, true, 0};
+				case 0x25:
+					return {true, Vu0FmacKind::MultiplySubtract,
+						Vu0FmacOperand::ScalarQ, true, 0};
+				case 0x28:
+					return {true, Vu0FmacKind::Add,
+						Vu0FmacOperand::Vector, true, 0};
+				case 0x29:
+					return {true, Vu0FmacKind::MultiplyAdd,
+						Vu0FmacOperand::Vector, true, 0};
+				case 0x2a:
+					return {true, Vu0FmacKind::Multiply,
+						Vu0FmacOperand::Vector, true, 0};
+				case 0x2c:
+					return {true, Vu0FmacKind::Subtract,
+						Vu0FmacOperand::Vector, true, 0};
+				case 0x2d:
+					return {true, Vu0FmacKind::MultiplySubtract,
+						Vu0FmacOperand::Vector, true, 0};
+				default:
+					return {};
+			}
+		}
+
+		Vu0FdivOp DecodeVu0Fdiv(u32 op)
+		{
+			if ((op >> 26) != 0x12 || (RS(op) & 0x10u) == 0 ||
+				(op & 0x3cu) != 0x3cu)
+			{
+				return {};
+			}
+			const u32 special2 = (op & 0x3u) | ((op >> 4) & 0x7cu);
+			Vu0FdivKind kind{};
+			switch (special2)
+			{
+				case 0x38:
+					kind = Vu0FdivKind::Divide;
+					break;
+				case 0x39:
+					kind = Vu0FdivKind::SquareRoot;
+					break;
+				case 0x3a:
+					kind = Vu0FdivKind::ReciprocalSquareRoot;
+					break;
+				default:
+					return {};
+			}
+			return {true, kind, (op >> 21) & 0x3u, (op >> 23) & 0x3u};
+		}
+
+		u32 EncodeVu0FdivImmediate(const Vu0FdivOp& fdiv)
+		{
+			return static_cast<u32>(fdiv.kind) | (fdiv.fs_lane << 2) |
+			       (fdiv.ft_lane << 4);
+		}
+
+		Vu0FdivOp DecodeVu0FdivImmediate(u32 immediate)
+		{
+			if ((immediate & ~0x3fu) != 0 || (immediate & 0x3u) >
+				static_cast<u32>(Vu0FdivKind::ReciprocalSquareRoot))
+			{
+				return {};
+			}
+			return {true, static_cast<Vu0FdivKind>(immediate & 0x3u),
+				(immediate >> 2) & 0x3u, (immediate >> 4) & 0x3u};
+		}
+
+		Vu0UnaryOp DecodeVu0Unary(u32 op)
+		{
+			if ((op >> 26) != 0x12 || (RS(op) & 0x10u) == 0 ||
+				(op & 0x3cu) != 0x3cu)
+			{
+				return {};
+			}
+
+			const u32 special2 = (op & 0x3u) | ((op >> 4) & 0x7cu);
+			if (special2 == 0x30)
+				return {true, Vu0UnaryKind::Move, 0};
+			if (special2 == 0x31)
+				return {true, Vu0UnaryKind::Rotate32, 0};
+			switch (special2)
+			{
+				case 0x10:
+					return {true, Vu0UnaryKind::ConvertIntegerToFloat, 0};
+				case 0x11:
+					return {true, Vu0UnaryKind::ConvertIntegerToFloat, 4};
+				case 0x12:
+					return {true, Vu0UnaryKind::ConvertIntegerToFloat, 12};
+				case 0x13:
+					return {true, Vu0UnaryKind::ConvertIntegerToFloat, 15};
+				case 0x14:
+					return {true, Vu0UnaryKind::ConvertFixed, 0};
+				case 0x15:
+					return {true, Vu0UnaryKind::ConvertFixed, 4};
+				case 0x16:
+					return {true, Vu0UnaryKind::ConvertFixed, 12};
+				case 0x17:
+					return {true, Vu0UnaryKind::ConvertFixed, 15};
+				default:
+					return {};
+			}
+		}
+
+		Vu0VectorTransferOp DecodeVu0VectorTransfer(u32 op)
+		{
+			if ((op >> 26) != 0x12)
+				return {};
+			switch (RS(op))
+			{
+				case 0x01: // QMFC2, PCSX2 VU0.cpp::QMFC2().
+					return {true, Vu0VectorTransferKind::FromVu0};
+				case 0x05: // QMTC2, PCSX2 VU0.cpp::QMTC2().
+					// PCSX2 deliberately reads the raw backing GPR[0], whereas Region
+					// IR owns the architectural zero value. The read is irrelevant when
+					// VF0 discards the result; otherwise retain tier zero until raw GPR0
+					// is made an explicit state input.
+					if (RT(op) == 0 && RD(op) != 0)
+						return {};
+					return {true, Vu0VectorTransferKind::ToVu0};
+				default:
+					return {};
+			}
+		}
+
+		Vu0ControlReadOp DecodeVu0ControlRead(u32 op)
+		{
+			if ((op >> 26) != 0x12 || RS(op) != 0x02)
+				return {};
+
+			const u32 source = RD(op);
+			// PCSX2 owner: VU0.cpp::CFC2(), with the native contract mirrored by
+			// VitaEeBlockCompiler.cpp::EmitCOP2ControlReadBody().  Region state
+			// currently owns only these complete control words. VI0 is constant;
+			// rt=0 observes only vu0Sync() and discards any control-register read.
+			if (RT(op) == 0 || source == 0 || source == 16 || source == 17 ||
+				source == 29)
+			{
+				return {true, source};
 			}
 			return {};
+		}
+
+		Vu0ControlWriteOp DecodeVu0ControlWrite(u32 op)
+		{
+			if ((op >> 26) != 0x12 || RS(op) != 0x06)
+				return {};
+
+			const u32 target = RD(op);
+			// PCSX2 owner: x86/microVU_Macro.inl::recCTC2(), mirrored by
+			// VitaEeBlockCompiler.cpp::EmitCOP2ControlWriteBody().  FBRST can
+			// reset either VU and CMSAR1 starts VU1, so both remain exact cold
+			// observers.  Every other target is either ignored, a masked write, or
+			// one state-contained control-word write represented by Region IR.
+			if (target == 28 || target == 31)
+				return {};
+			return {true, target};
 		}
 
 		Opcode BasicCop1RawOpcode(BasicCop1ArithmeticKind kind)
@@ -677,6 +1176,12 @@ namespace VitaEE::RegionIR
 			if ((raw & COP1_EXPONENT) == 0 && (raw & COP1_FRACTION) != 0)
 				return raw & COP1_SIGN;
 			return raw;
+		}
+
+		bool IsExceptionalBasicCop1Result(u32 raw)
+		{
+			return (raw & ~COP1_SIGN) == COP1_EXPONENT ||
+			       ((raw & COP1_EXPONENT) == 0 && (raw & COP1_FRACTION) != 0);
 		}
 
 		u32 UpdateBasicCop1OuFlags(u32 fcr31, u32 raw)
@@ -747,6 +1252,188 @@ namespace VitaEE::RegionIR
 			return static_cast<u32>(half >> ((lane & 1u) * 32u));
 		}
 
+		template <typename Lane>
+		Lane PackedLane(const u128& value, u32 lane)
+		{
+			using Unsigned = std::make_unsigned_t<Lane>;
+			constexpr u32 bits = sizeof(Lane) * 8;
+			constexpr u32 lanes_per_half = sizeof(u64) / sizeof(Lane);
+			const u64 half = lane < lanes_per_half ? value.lo : value.hi;
+			const u32 shift = (lane % lanes_per_half) * bits;
+			const Unsigned raw = static_cast<Unsigned>(half >> shift);
+			return std::bit_cast<Lane>(raw);
+		}
+
+		template <typename Lane>
+		void SetPackedLane(u128* value, u32 lane, Lane lane_value)
+		{
+			using Unsigned = std::make_unsigned_t<Lane>;
+			constexpr u32 bits = sizeof(Lane) * 8;
+			constexpr u32 lanes_per_half = sizeof(u64) / sizeof(Lane);
+			const u32 shift = (lane % lanes_per_half) * bits;
+			const u64 lane_mask = sizeof(Lane) == sizeof(u32) ? UINT64_C(0xffffffff) :
+				((UINT64_C(1) << bits) - 1);
+			u64& half = lane < lanes_per_half ? value->lo : value->hi;
+			half = (half & ~(lane_mask << shift)) |
+			       ((static_cast<u64>(std::bit_cast<Unsigned>(lane_value)) & lane_mask)
+				   << shift);
+		}
+
+		template <typename Unsigned>
+		Unsigned PackedShiftRightArithmetic(Unsigned value, u32 amount)
+		{
+			static_assert(std::is_unsigned_v<Unsigned>);
+			constexpr u32 bits = sizeof(Unsigned) * 8;
+			if (amount == 0)
+				return value;
+			const u64 shifted = static_cast<u64>(value) >> amount;
+			if ((static_cast<u64>(value) & (UINT64_C(1) << (bits - 1))) == 0)
+				return static_cast<Unsigned>(shifted);
+			const u64 sign_fill = ((UINT64_C(1) << amount) - 1) << (bits - amount);
+			return static_cast<Unsigned>(shifted | sign_fill);
+		}
+
+		template <typename Lane>
+		u128 MapPackedBinary(const u128& left, const u128& right,
+			Lane (*operation)(Lane, Lane))
+		{
+			u128 result{};
+			for (u32 lane = 0; lane < sizeof(u128) / sizeof(Lane); lane++)
+			{
+				SetPackedLane(&result, lane,
+					operation(PackedLane<Lane>(left, lane),
+						PackedLane<Lane>(right, lane)));
+			}
+			return result;
+		}
+
+		template <typename Lane>
+		Lane PackedAddWrap(Lane left, Lane right)
+		{
+			using Unsigned = std::make_unsigned_t<Lane>;
+			return std::bit_cast<Lane>(static_cast<Unsigned>(
+				std::bit_cast<Unsigned>(left) + std::bit_cast<Unsigned>(right)));
+		}
+
+		template <typename Lane>
+		Lane PackedSubtractWrap(Lane left, Lane right)
+		{
+			using Unsigned = std::make_unsigned_t<Lane>;
+			return std::bit_cast<Lane>(static_cast<Unsigned>(
+				std::bit_cast<Unsigned>(left) - std::bit_cast<Unsigned>(right)));
+		}
+
+		template <typename Lane>
+		Lane PackedCompareGreaterSigned(Lane left, Lane right)
+		{
+			using Unsigned = std::make_unsigned_t<Lane>;
+			return std::bit_cast<Lane>(left > right ?
+				std::numeric_limits<Unsigned>::max() : Unsigned{0});
+		}
+
+		template <typename Lane>
+		Lane PackedCompareEqual(Lane left, Lane right)
+		{
+			using Unsigned = std::make_unsigned_t<Lane>;
+			return std::bit_cast<Lane>(left == right ?
+				std::numeric_limits<Unsigned>::max() : Unsigned{0});
+		}
+
+		template <typename Lane>
+		Lane PackedMaximumSigned(Lane left, Lane right)
+		{
+			return left > right ? left : right;
+		}
+
+		template <typename Lane>
+		Lane PackedMinimumSigned(Lane left, Lane right)
+		{
+			return left > right ? right : left;
+		}
+
+		template <typename Lane>
+		Lane PackedAddSaturateSigned(Lane left, Lane right)
+		{
+			using Wide = std::conditional_t<sizeof(Lane) < sizeof(s32), s32, s64>;
+			const Wide result = static_cast<Wide>(left) + static_cast<Wide>(right);
+			return static_cast<Lane>(std::clamp(result,
+				static_cast<Wide>(std::numeric_limits<Lane>::min()),
+				static_cast<Wide>(std::numeric_limits<Lane>::max())));
+		}
+
+		template <typename Lane>
+		Lane PackedSubtractSaturateSigned(Lane left, Lane right)
+		{
+			using Wide = std::conditional_t<sizeof(Lane) < sizeof(s32), s32, s64>;
+			const Wide result = static_cast<Wide>(left) - static_cast<Wide>(right);
+			return static_cast<Lane>(std::clamp(result,
+				static_cast<Wide>(std::numeric_limits<Lane>::min()),
+				static_cast<Wide>(std::numeric_limits<Lane>::max())));
+		}
+
+		template <typename Lane>
+		Lane PackedAddSaturateUnsigned(Lane left, Lane right)
+		{
+			const u64 result = static_cast<u64>(left) + static_cast<u64>(right);
+			return static_cast<Lane>(std::min<u64>(result,
+				std::numeric_limits<Lane>::max()));
+		}
+
+		template <typename Lane>
+		Lane PackedSubtractSaturateUnsigned(Lane left, Lane right)
+		{
+			return left > right ? static_cast<Lane>(left - right) : Lane{0};
+		}
+
+		u128 EvaluatePackedBinary(PackedBinaryKind kind, const u128& left,
+			const u128& right)
+		{
+			switch (kind)
+			{
+				case PackedBinaryKind::AddWrap8: return MapPackedBinary<s8>(left, right, PackedAddWrap<s8>);
+				case PackedBinaryKind::AddWrap16: return MapPackedBinary<s16>(left, right, PackedAddWrap<s16>);
+				case PackedBinaryKind::AddWrap32: return MapPackedBinary<s32>(left, right, PackedAddWrap<s32>);
+				case PackedBinaryKind::SubtractWrap8: return MapPackedBinary<s8>(left, right, PackedSubtractWrap<s8>);
+				case PackedBinaryKind::SubtractWrap16: return MapPackedBinary<s16>(left, right, PackedSubtractWrap<s16>);
+				case PackedBinaryKind::SubtractWrap32: return MapPackedBinary<s32>(left, right, PackedSubtractWrap<s32>);
+				case PackedBinaryKind::CompareGreaterSigned8: return MapPackedBinary<s8>(left, right, PackedCompareGreaterSigned<s8>);
+				case PackedBinaryKind::CompareGreaterSigned16: return MapPackedBinary<s16>(left, right, PackedCompareGreaterSigned<s16>);
+				case PackedBinaryKind::CompareGreaterSigned32: return MapPackedBinary<s32>(left, right, PackedCompareGreaterSigned<s32>);
+				case PackedBinaryKind::MaximumSigned16: return MapPackedBinary<s16>(left, right, PackedMaximumSigned<s16>);
+				case PackedBinaryKind::MaximumSigned32: return MapPackedBinary<s32>(left, right, PackedMaximumSigned<s32>);
+				case PackedBinaryKind::AddSaturateSigned8: return MapPackedBinary<s8>(left, right, PackedAddSaturateSigned<s8>);
+				case PackedBinaryKind::AddSaturateSigned16: return MapPackedBinary<s16>(left, right, PackedAddSaturateSigned<s16>);
+				case PackedBinaryKind::AddSaturateSigned32: return MapPackedBinary<s32>(left, right, PackedAddSaturateSigned<s32>);
+				case PackedBinaryKind::SubtractSaturateSigned8: return MapPackedBinary<s8>(left, right, PackedSubtractSaturateSigned<s8>);
+				case PackedBinaryKind::SubtractSaturateSigned16: return MapPackedBinary<s16>(left, right, PackedSubtractSaturateSigned<s16>);
+				case PackedBinaryKind::SubtractSaturateSigned32: return MapPackedBinary<s32>(left, right, PackedSubtractSaturateSigned<s32>);
+				case PackedBinaryKind::CompareEqual8: return MapPackedBinary<u8>(left, right, PackedCompareEqual<u8>);
+				case PackedBinaryKind::CompareEqual16: return MapPackedBinary<u16>(left, right, PackedCompareEqual<u16>);
+				case PackedBinaryKind::CompareEqual32: return MapPackedBinary<u32>(left, right, PackedCompareEqual<u32>);
+				case PackedBinaryKind::MinimumSigned16: return MapPackedBinary<s16>(left, right, PackedMinimumSigned<s16>);
+				case PackedBinaryKind::MinimumSigned32: return MapPackedBinary<s32>(left, right, PackedMinimumSigned<s32>);
+				case PackedBinaryKind::AddSaturateUnsigned8: return MapPackedBinary<u8>(left, right, PackedAddSaturateUnsigned<u8>);
+				case PackedBinaryKind::AddSaturateUnsigned16: return MapPackedBinary<u16>(left, right, PackedAddSaturateUnsigned<u16>);
+				case PackedBinaryKind::AddSaturateUnsigned32: return MapPackedBinary<u32>(left, right, PackedAddSaturateUnsigned<u32>);
+				case PackedBinaryKind::SubtractSaturateUnsigned8: return MapPackedBinary<u8>(left, right, PackedSubtractSaturateUnsigned<u8>);
+				case PackedBinaryKind::SubtractSaturateUnsigned16: return MapPackedBinary<u16>(left, right, PackedSubtractSaturateUnsigned<u16>);
+				case PackedBinaryKind::SubtractSaturateUnsigned32: return MapPackedBinary<u32>(left, right, PackedSubtractSaturateUnsigned<u32>);
+				case PackedBinaryKind::InterleaveLower32:
+				case PackedBinaryKind::InterleaveUpper32:
+				{
+					const u32 first = kind == PackedBinaryKind::InterleaveLower32 ? 0 : 2;
+					u128 result{};
+					SetPackedLane(&result, 0, PackedLane<u32>(right, first));
+					SetPackedLane(&result, 1, PackedLane<u32>(left, first));
+					SetPackedLane(&result, 2, PackedLane<u32>(right, first + 1));
+					SetPackedLane(&result, 3, PackedLane<u32>(left, first + 1));
+					return result;
+				}
+				case PackedBinaryKind::Count: break;
+			}
+			return {};
+		}
+
 		void SetVuVectorLane(u128* value, u32 lane, u32 word)
 		{
 			u64& half = lane < 2 ? value->lo : value->hi;
@@ -783,6 +1470,80 @@ namespace VitaEE::RegionIR
 			return result;
 		}
 
+		u128 BroadcastVuScalar(u32 value, bool overflow_clamp)
+		{
+			u128 result{};
+			const u32 normalized = NormalizeVuFloat(value, overflow_clamp);
+			for (u32 lane = 0; lane < 4; lane++)
+				SetVuVectorLane(&result, lane, normalized);
+			return result;
+		}
+
+		u32 EvaluateVu0FdivQ(const Vu0FdivOp& fdiv, const u128& fs_vector,
+			const u128& ft_vector, bool overflow_clamp)
+		{
+			const u32 fs_raw = VuVectorLane(fs_vector, fdiv.fs_lane);
+			const u32 ft_raw = VuVectorLane(ft_vector, fdiv.ft_lane);
+			const u32 fs_bits = NormalizeVuFloat(fs_raw, overflow_clamp);
+			const u32 ft_bits = NormalizeVuFloat(ft_raw, overflow_clamp);
+			const float fs = std::bit_cast<float>(fs_bits);
+			const float ft = std::bit_cast<float>(ft_bits);
+			u32 q = 0;
+			switch (fdiv.kind)
+			{
+				case Vu0FdivKind::Divide:
+					if ((ft_bits & ~VU_FLOAT_SIGN) == 0)
+					{
+						q = ((fs_raw ^ ft_raw) & VU_FLOAT_SIGN) |
+							VU_FLOAT_MAX_FINITE;
+					}
+					else
+					{
+						q = std::bit_cast<u32>(fs / ft);
+					}
+					break;
+				case Vu0FdivKind::SquareRoot:
+					q = std::bit_cast<u32>(std::sqrt(std::fabs(ft)));
+					break;
+				case Vu0FdivKind::ReciprocalSquareRoot:
+					if ((ft_bits & ~VU_FLOAT_SIGN) == 0)
+					{
+						q = (fs_raw ^ ft_raw) & VU_FLOAT_SIGN;
+						if ((fs_bits & ~VU_FLOAT_SIGN) != 0)
+							q |= VU_FLOAT_MAX_FINITE;
+					}
+					else
+					{
+						const float root = std::sqrt(std::fabs(ft));
+						q = std::bit_cast<u32>(fs / root);
+					}
+					break;
+			}
+			return NormalizeVuFloat(q, overflow_clamp);
+		}
+
+		u32 EvaluateVu0FdivFlags(const Vu0FdivOp& fdiv,
+			const u128& fs_vector, const u128& ft_vector, bool overflow_clamp)
+		{
+			const u32 fs = NormalizeVuFloat(
+				VuVectorLane(fs_vector, fdiv.fs_lane), overflow_clamp);
+			const u32 ft = NormalizeVuFloat(
+				VuVectorLane(ft_vector, fdiv.ft_lane), overflow_clamp);
+			const bool fs_zero = (fs & ~VU_FLOAT_SIGN) == 0;
+			const bool ft_zero = (ft & ~VU_FLOAT_SIGN) == 0;
+			switch (fdiv.kind)
+			{
+				case Vu0FdivKind::Divide:
+					return !ft_zero ? 0u : (fs_zero ? 0x10u : 0x20u);
+				case Vu0FdivKind::SquareRoot:
+					return !ft_zero && (ft & VU_FLOAT_SIGN) != 0 ? 0x10u : 0u;
+				case Vu0FdivKind::ReciprocalSquareRoot:
+					return ft_zero ? (fs_zero ? 0x30u : 0x20u) :
+						((ft & VU_FLOAT_SIGN) != 0 ? 0x10u : 0u);
+			}
+			return 0;
+		}
+
 		u128 EvaluateVuRawBinary(Opcode opcode, const u128& left,
 			const u128& right)
 		{
@@ -793,8 +1554,21 @@ namespace VitaEE::RegionIR
 					std::bit_cast<float>(VuVectorLane(left, lane));
 				const float right_value =
 					std::bit_cast<float>(VuVectorLane(right, lane));
-				const float raw = opcode == Opcode::Vu0MulRaw ?
-					left_value * right_value : left_value + right_value;
+				float raw = 0.0f;
+				switch (opcode)
+				{
+					case Opcode::Vu0MulRaw:
+						raw = left_value * right_value;
+						break;
+					case Opcode::Vu0AddRaw:
+						raw = left_value + right_value;
+						break;
+					case Opcode::Vu0SubRaw:
+						raw = left_value - right_value;
+						break;
+					default:
+						return {};
+				}
 				SetVuVectorLane(&result, lane, std::bit_cast<u32>(raw));
 			}
 			return result;
@@ -849,6 +1623,52 @@ namespace VitaEE::RegionIR
 			       ((mac & 0x00f0u) != 0 ? 0x2u : 0u) |
 			       ((mac & 0x0f00u) != 0 ? 0x4u : 0u) |
 			       ((mac & 0xf000u) != 0 ? 0x8u : 0u);
+		}
+
+		u128 ConvertVu0Fixed(const u128& source, u32 offset)
+		{
+			u128 result{};
+			const float scale = std::bit_cast<float>(
+				0x3f800000u + (offset << 23));
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				float value = std::bit_cast<float>(VuVectorLane(source, lane));
+				if (offset != 0)
+					value *= scale;
+				const u32 raw = std::bit_cast<u32>(value);
+				const u32 converted = (raw & VU_FLOAT_EXPONENT) >= 0x4f000000u ?
+					((raw & VU_FLOAT_SIGN) != 0 ? 0x80000000u : 0x7fffffffu) :
+					static_cast<u32>(static_cast<s32>(value));
+				SetVuVectorLane(&result, lane, converted);
+			}
+			return result;
+		}
+
+		u128 ConvertVu0IntegerToFloat(const u128& source, u32 offset)
+		{
+			u128 result{};
+			const float scale = std::bit_cast<float>(
+				0x3f800000u - (offset << 23));
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				float value = static_cast<float>(
+					static_cast<s32>(VuVectorLane(source, lane)));
+				if (offset != 0)
+					value *= scale;
+				SetVuVectorLane(&result, lane, std::bit_cast<u32>(value));
+			}
+			return result;
+		}
+
+		u128 RotateVu0Words(const u128& source)
+		{
+			u128 result{};
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				SetVuVectorLane(&result, lane,
+					VuVectorLane(source, (lane + 1u) & 3u));
+			}
+			return result;
 		}
 
 		u128 MergeVuMasked(const u128& old_value, const u128& new_value,
@@ -909,16 +1729,24 @@ namespace VitaEE::RegionIR
 				case 0x0f: // LUI
 				case 0x19: // DADDIU
 					return true;
-				case 0x1c: // Pure, non-multiplying MMI moves/logical/copies.
-					return DecodePureMmi(op, nullptr);
+				case 0x1c: // Scalar HI/LO arithmetic plus verified MMI operations.
+					return DecodeIntegerMultiply(op).valid || DecodePureMmi(op, nullptr) ||
+					       DecodePackedBinaryMmi(op, nullptr) ||
+					       DecodePackedShiftMmi(op, nullptr);
 				case 0x11: // Raw COP1 state plus exact S/W-format numerics.
 					return DecodePureCop1State(op, nullptr) || IsCop1ControlWrite(op) ||
+					       DecodeCop1UnaryWord(op, nullptr) ||
 					       DecodeBasicCop1Arithmetic(op, nullptr) ||
 					       DecodeCompoundCop1Arithmetic(op, nullptr) ||
 					       DecodeCop1Compare(op, nullptr) ||
 					       IsCop1ConvertWord(op) || IsCop1ConvertSingle(op);
-				case 0x12: // Guarded VU0 macro FMAC broadcast chains.
-					return DecodeVu0BroadcastFmac(op).valid;
+				case 0x12: // Guarded VU0 macro arithmetic and raw transfers.
+					return DecodeVu0ControlRead(op).valid ||
+					       DecodeVu0ControlWrite(op).valid ||
+					       DecodeVu0VectorTransfer(op).valid ||
+					       DecodeVu0Fdiv(op).valid ||
+					       DecodeVu0Fmac(op).valid ||
+					       DecodeVu0Unary(op).valid;
 				default:
 					return false;
 			}
@@ -988,11 +1816,6 @@ namespace VitaEE::RegionIR
 			return true;
 		}
 
-		bool IsMemoryLoad(MemoryAccessKind kind)
-		{
-			return kind <= MemoryAccessKind::LoadVu0Vector;
-		}
-
 		bool IsFprMemoryAccess(MemoryAccessKind kind)
 		{
 			return kind == MemoryAccessKind::LoadF32Bits ||
@@ -1005,44 +1828,29 @@ namespace VitaEE::RegionIR
 			       kind == MemoryAccessKind::StoreVu0Vector;
 		}
 
-		u32 MemoryAlignmentMask(MemoryAccessKind kind)
-		{
-			switch (kind)
-			{
-				case MemoryAccessKind::LoadS16:
-				case MemoryAccessKind::LoadU16:
-				case MemoryAccessKind::Store16:
-					return 1;
-				case MemoryAccessKind::LoadS32:
-				case MemoryAccessKind::LoadU32:
-				case MemoryAccessKind::LoadF32Bits:
-				case MemoryAccessKind::Store32:
-				case MemoryAccessKind::StoreF32Bits:
-					return 3;
-				case MemoryAccessKind::Load64:
-				case MemoryAccessKind::Store64:
-					return 7;
-				// Unlike EE LQ/SQ's masked address contract, the SCE COP2 transfer
-				// contract requires a 128-bit-aligned effective address.
-				case MemoryAccessKind::LoadVu0Vector:
-				case MemoryAccessKind::StoreVu0Vector:
-					return 15;
-				default:
-					return 0;
-			}
-		}
-
-		bool IsQuadMemoryAccess(MemoryAccessKind kind)
-		{
-			return kind == MemoryAccessKind::Load128 ||
-			       kind == MemoryAccessKind::Store128 ||
-			       IsVu0MemoryAccess(kind);
-		}
-
 		bool CanLowerNonBranch(u32 op, const LiftOptions& options)
 		{
 			return CanLowerPureNonBranch(op, options) ||
 			       DecodeMemoryAccess(op, nullptr);
+		}
+
+		bool CanLowerDelaySlot(u32 control, u32 delay,
+			const LiftOptions& options)
+		{
+			if (IsAnyControlFlow(delay))
+				return false;
+
+			// Branch-likely delay nodes are explicitly control-dependent on the taken
+			// edge: the interpreter and both A32 backends skip the complete delay-node
+			// slice on the annulled edge. Memory can therefore keep its exact
+			// pre-control restart transfer. ADDI's exceptional guard is not yet part of
+			// that taken-only contract and remains with tier zero.
+			if (IsLikelyBranch(control))
+			{
+				return CanLowerNonBranch(delay, options) &&
+				       !IsGuardedExceptionInstruction(delay);
+			}
+			return CanLowerNonBranch(delay, options);
 		}
 
 		bool IsExceptionCapableInstruction(u32 op)
@@ -1108,17 +1916,67 @@ namespace VitaEE::RegionIR
 			return ExitReason::UnsupportedOpcode;
 		}
 
-		bool ContainsPc(u32 base, u32 word_count, u32 pc)
+		const SourceSpan* FindSourceSpan(const std::vector<SourceSpan>& spans, u32 pc)
 		{
-			if ((pc & 3u) != 0 || pc < base)
-				return false;
-			const u64 offset = static_cast<u64>(pc) - base;
-			return offset < static_cast<u64>(word_count) * sizeof(u32);
+			if ((pc & 3u) != 0 || spans.empty())
+				return nullptr;
+			const auto after = std::upper_bound(spans.begin(), spans.end(), pc,
+				[](u32 address, const SourceSpan& span) {
+					return address < span.base_pc;
+				});
+			if (after == spans.begin())
+				return nullptr;
+			const SourceSpan& span = *std::prev(after);
+			const u64 offset = static_cast<u64>(pc) - span.base_pc;
+			return offset < static_cast<u64>(span.words.size()) * sizeof(u32) ?
+				&span : nullptr;
 		}
 
-		u32 ReadSourceWord(u32 base, const std::vector<u32>& words, u32 pc)
+		bool ContainsPc(const std::vector<SourceSpan>& spans, u32 pc)
 		{
-			return words[(pc - base) / sizeof(u32)];
+			return FindSourceSpan(spans, pc) != nullptr;
+		}
+
+		u32 ReadSourceWord(const std::vector<SourceSpan>& spans, u32 pc)
+		{
+			const SourceSpan* span = FindSourceSpan(spans, pc);
+			return span->words[(pc - span->base_pc) / sizeof(u32)];
+		}
+
+		bool ValidateSourceSpans(const std::vector<SourceSpan>& spans,
+			const LiftOptions& options, u32* failure_pc, std::string* detail)
+		{
+			const auto fail = [&](u32 pc, const char* message) {
+				if (failure_pc)
+					*failure_pc = pc;
+				if (detail)
+					*detail = message;
+				return false;
+			};
+			if (spans.empty())
+				return fail(0, "immutable source image is empty");
+
+			u64 total_words = 0;
+			u64 previous_end = 0;
+			for (u32 index = 0; index < spans.size(); index++)
+			{
+				const SourceSpan& span = spans[index];
+				const u64 end = static_cast<u64>(span.base_pc) +
+					static_cast<u64>(span.words.size()) * sizeof(u32);
+				if ((span.base_pc & 3u) != 0 || span.words.empty() ||
+					end > static_cast<u64>(UINT32_MAX) + 1)
+				{
+					return fail(span.base_pc,
+						"immutable source span is empty, unaligned, or wraps");
+				}
+				if (index != 0 && static_cast<u64>(span.base_pc) < previous_end)
+					return fail(span.base_pc, "immutable source spans overlap or are unsorted");
+				previous_end = end;
+				total_words += span.words.size();
+				if (total_words > options.max_source_instructions)
+					return fail(span.base_pc, "immutable source image exceeds its word limit");
+			}
+			return true;
 		}
 
 		const SourceBlockContract* FindSourceBlockContract(
@@ -1132,23 +1990,24 @@ namespace VitaEE::RegionIR
 				&*found : nullptr;
 		}
 
-		bool ValidateSourceBlockContracts(u32 source_base_pc,
-			const std::vector<u32>& source_words,
+		bool ValidateSourceBlockContracts(const std::vector<SourceSpan>& source_spans,
 			const std::vector<SourceBlockContract>& contracts, u32 entry_pc,
-			const LiftOptions& options, u32* failure_pc, std::string* detail)
+			const LiftOptions& options, u32* failure_pc, std::string* detail,
+			LiftFailureDetail* failure_detail)
 		{
-			const auto fail = [&](u32 pc, const char* message) {
+			const auto fail = [&](u32 pc, const char* message,
+				LiftFailureDetail reason) {
 				if (failure_pc)
 					*failure_pc = pc;
 				if (detail)
 					*detail = message;
+				if (failure_detail)
+					*failure_detail = reason;
 				return false;
 			};
 			if (contracts.empty())
 				return true;
 
-			const u64 source_end = static_cast<u64>(source_base_pc) +
-				static_cast<u64>(source_words.size()) * sizeof(u32);
 			u64 previous_end = 0;
 			for (u32 index = 0; index < contracts.size(); index++)
 			{
@@ -1158,25 +2017,37 @@ namespace VitaEE::RegionIR
 					contract.dependency_instruction_count == 0)
 				{
 					return fail(contract.start_pc,
-						"source-block range is empty or unaligned");
+						"source-block range is empty or unaligned",
+						LiftFailureDetail::SourceBlockInvalidRange);
 				}
 				const u64 end = static_cast<u64>(contract.start_pc) +
 					static_cast<u64>(contract.instruction_count) * sizeof(u32);
 				const u64 dependency_end =
 					static_cast<u64>(contract.dependency_start_pc) +
 					static_cast<u64>(contract.dependency_instruction_count) * sizeof(u32);
-				if (end > static_cast<u64>(UINT32_MAX) ||
-					dependency_end > static_cast<u64>(UINT32_MAX) ||
-					contract.start_pc < source_base_pc || end > source_end ||
-					contract.dependency_start_pc < source_base_pc ||
-					dependency_end > source_end ||
+				const SourceSpan* owner_span =
+					FindSourceSpan(source_spans, contract.start_pc);
+				const SourceSpan* dependency_span =
+					FindSourceSpan(source_spans, contract.dependency_start_pc);
+				const u64 owner_span_end = owner_span ?
+					static_cast<u64>(owner_span->base_pc) +
+						static_cast<u64>(owner_span->words.size()) * sizeof(u32) : 0;
+				const u64 dependency_span_end = dependency_span ?
+					static_cast<u64>(dependency_span->base_pc) +
+						static_cast<u64>(dependency_span->words.size()) * sizeof(u32) : 0;
+				if (end > static_cast<u64>(UINT32_MAX) + 1 ||
+					dependency_end > static_cast<u64>(UINT32_MAX) + 1 ||
+					!owner_span || !dependency_span || end > owner_span_end ||
+					dependency_end > dependency_span_end ||
 					contract.start_pc < contract.dependency_start_pc || end > dependency_end)
 				{
 					return fail(contract.start_pc,
-						"source-block or dependency range leaves the immutable image");
+						"source-block or dependency range leaves the immutable image",
+						LiftFailureDetail::SourceBlockInvalidRange);
 				}
 				if (index != 0 && contract.start_pc < previous_end)
-					return fail(contract.start_pc, "source-block contracts overlap");
+					return fail(contract.start_pc, "source-block contracts overlap",
+						LiftFailureDetail::SourceBlockOverlap);
 				previous_end = end;
 			}
 
@@ -1185,10 +2056,12 @@ namespace VitaEE::RegionIR
 					return contract.start_pc < pc;
 				});
 			if (entry_contract == contracts.end() || entry_contract->start_pc != entry_pc)
-				return fail(entry_pc, "entry is not an attested source-block start");
+				return fail(entry_pc, "entry is not an attested source-block start",
+					LiftFailureDetail::SourceBlockMissingEntry);
 			if (entry_contract->charged_scaled_cycles_before != 0)
 				return fail(entry_pc,
-					"entry begins inside a charged A32 split dependency");
+					"entry begins inside a charged A32 split dependency",
+					LiftFailureDetail::SourceBlockChargedEntry);
 			if (entry_contract != contracts.begin())
 			{
 				const SourceBlockContract& predecessor = *std::prev(entry_contract);
@@ -1196,7 +2069,8 @@ namespace VitaEE::RegionIR
 					predecessor.instruction_count * sizeof(u32);
 				if (predecessor_end == entry_pc && !predecessor.scheduler_test_at_end)
 					return fail(entry_pc,
-						"entry follows an untested scheduler continuation");
+						"entry follows an untested scheduler continuation",
+						LiftFailureDetail::SourceBlockUntestedEntryPredecessor);
 			}
 
 			for (const SourceBlockContract& contract : contracts)
@@ -1207,7 +2081,8 @@ namespace VitaEE::RegionIR
 					!FindSourceBlockContract(contracts, end))
 				{
 					return fail(contract.start_pc,
-						"scheduler-elided fragment has no owned continuation");
+						"scheduler-elided fragment has no owned continuation",
+						LiftFailureDetail::SourceBlockMissingContinuation);
 				}
 			}
 
@@ -1234,14 +2109,15 @@ namespace VitaEE::RegionIR
 						fragment.charged_scaled_cycles_before != charged_cycles)
 					{
 						return fail(fragment.start_pc,
-							"split dependency is not a complete charged-cycle chain");
+							"split dependency is not a complete charged-cycle chain",
+							LiftFailureDetail::SourceBlockDiscontinuousDependency);
 					}
 					u32 raw_cycles = 0;
 					for (u32 instruction = 0;
 						instruction < fragment.instruction_count; instruction++)
 					{
-						raw_cycles += RawRecompilerCycles(ReadSourceWord(source_base_pc,
-							source_words, fragment.start_pc + instruction * sizeof(u32)),
+						raw_cycles += RawRecompilerCycles(ReadSourceWord(source_spans,
+							fragment.start_pc + instruction * sizeof(u32)),
 							options.cycle_factor);
 					}
 					next_pc += fragment.instruction_count * sizeof(u32);
@@ -1249,31 +2125,28 @@ namespace VitaEE::RegionIR
 				}
 				if (next_pc != dependency_end)
 					return fail(owner.dependency_start_pc,
-						"split dependency is not fully represented by source blocks");
+						"split dependency is not fully represented by source blocks",
+						LiftFailureDetail::SourceBlockIncompleteDependency);
 			}
 			return true;
 		}
 
-		ExitReason ClassifyExternalResume(u32 source_base_pc,
-			const std::vector<u32>& source_words, u32 pc,
+		ExitReason ClassifyExternalResume(const std::vector<SourceSpan>& source_spans,
+			u32 pc,
 			const LiftOptions& options)
 		{
-			if (!ContainsPc(source_base_pc, static_cast<u32>(source_words.size()), pc))
+			if (!ContainsPc(source_spans, pc))
 				return ExitReason::RegionBoundary;
 
-			const u32 op = ReadSourceWord(source_base_pc, source_words, pc);
+			const u32 op = ReadSourceWord(source_spans, pc);
 			if (IsConditionalBranch(op) || CanLowerStaticJump(op, options) ||
 				CanLowerRegisterJump(op, options))
 			{
 				const u32 delay_pc = pc + sizeof(u32);
-				if (pc <= UINT32_MAX - sizeof(u32) &&
-					ContainsPc(source_base_pc, static_cast<u32>(source_words.size()), delay_pc))
+				if (pc <= UINT32_MAX - sizeof(u32) && ContainsPc(source_spans, delay_pc))
 				{
-					const u32 delay = ReadSourceWord(source_base_pc, source_words, delay_pc);
-					if (!IsAnyControlFlow(delay) &&
-						CanLowerPureNonBranch(delay, options) &&
-						!(IsLikelyBranch(op) &&
-						  IsGuardedExceptionInstruction(delay)))
+					const u32 delay = ReadSourceWord(source_spans, delay_pc);
+					if (CanLowerDelaySlot(op, delay, options))
 						return ExitReason::RegionBoundary;
 				}
 				return ExitReason::UnsupportedControlFlow;
@@ -1303,11 +2176,12 @@ namespace VitaEE::RegionIR
 			ExitReason transfer_reason = ExitReason::RegionBoundary;
 		};
 
-		bool ScanRawBlock(u32 source_base_pc, const std::vector<u32>& source_words,
+		bool ScanRawBlock(const std::vector<SourceSpan>& source_spans,
 			const std::vector<SourceBlockContract>& source_blocks,
 			const std::set<u32>& leaders, u32 start_pc, const LiftOptions& options,
 			RawBlock* output,
-			LiftFailure* failure, u32* failure_pc)
+			LiftFailure* failure, u32* failure_pc,
+			LiftFailureDetail* failure_detail)
 		{
 			RawBlock raw{};
 			raw.pc = start_pc;
@@ -1321,6 +2195,8 @@ namespace VitaEE::RegionIR
 						(UINT32_MAX - contract->start_pc) / sizeof(u32))
 				{
 					*failure = LiftFailure::SourceBlockContract;
+					if (failure_detail)
+						*failure_detail = LiftFailureDetail::SourceBlockMissingLeader;
 					*failure_pc = start_pc;
 					return false;
 				}
@@ -1338,6 +2214,8 @@ namespace VitaEE::RegionIR
 				if (!source_blocks.empty() && pc > contract_end_pc)
 				{
 					*failure = LiftFailure::SourceBlockContract;
+					if (failure_detail)
+						*failure_detail = LiftFailureDetail::SourceBlockCrossesContract;
 					*failure_pc = pc;
 					return false;
 				}
@@ -1346,6 +2224,8 @@ namespace VitaEE::RegionIR
 					if (!source_blocks.empty())
 					{
 						*failure = LiftFailure::SourceBlockContract;
+						if (failure_detail)
+							*failure_detail = LiftFailureDetail::SourceBlockCrossesContract;
 						*failure_pc = pc;
 						return false;
 					}
@@ -1353,29 +2233,27 @@ namespace VitaEE::RegionIR
 					break;
 				}
 
-				if (!ContainsPc(source_base_pc, static_cast<u32>(source_words.size()),
-						pc))
+				if (!ContainsPc(source_spans, pc))
 				{
 					raw.transfer_pc = pc;
 					break;
 				}
 
-				const u32 op = ReadSourceWord(source_base_pc, source_words, pc);
+				const u32 op = ReadSourceWord(source_spans, pc);
 				const bool conditional_branch = IsConditionalBranch(op);
 				const bool static_jump = CanLowerStaticJump(op, options);
 				const bool register_jump = CanLowerRegisterJump(op, options);
 				if (conditional_branch || static_jump || register_jump)
 				{
 					const u32 delay_pc = pc + sizeof(u32);
-					if (!ContainsPc(source_base_pc, static_cast<u32>(source_words.size()),
-							delay_pc))
+					if (!ContainsPc(source_spans, delay_pc))
 					{
 						*failure = LiftFailure::MissingDelaySlot;
 						*failure_pc = pc;
 						return false;
 					}
 
-					const u32 delay = ReadSourceWord(source_base_pc, source_words, delay_pc);
+					const u32 delay = ReadSourceWord(source_spans, delay_pc);
 					if (IsAnyControlFlow(delay))
 					{
 						*failure = LiftFailure::BranchInDelaySlot;
@@ -1385,15 +2263,16 @@ namespace VitaEE::RegionIR
 					if (!source_blocks.empty() && delay_pc + sizeof(u32) != contract_end_pc)
 					{
 						*failure = LiftFailure::SourceBlockContract;
+						if (failure_detail)
+							*failure_detail = LiftFailureDetail::SourceBlockControlNotAtEnd;
 						*failure_pc = pc;
 						return false;
 					}
 
 					// A branch and its delay slot are one architectural unit. If the
-					// delay is not expressible, or its guard would execute on an
-					// annulled likely edge, leave both to the existing provider.
-					if (!CanLowerPureNonBranch(delay, options) ||
-						(IsLikelyBranch(op) && IsGuardedExceptionInstruction(delay)))
+					// delay is not expressible with the exact edge/restart contract,
+					// leave both to the existing provider.
+					if (!CanLowerDelaySlot(op, delay, options))
 					{
 						raw.transfer_pc = pc;
 						// The existing provider must execute the branch and its
@@ -1431,6 +2310,130 @@ namespace VitaEE::RegionIR
 			}
 
 			*output = std::move(raw);
+			return true;
+		}
+
+		bool DescribeDirectCall(const std::vector<SourceSpan>& source_spans,
+			const std::vector<SourceBlockContract>& source_blocks,
+			const RawBlock& caller, const LiftOptions& options,
+			DirectCallContract* output,
+			const std::set<u32>* execution_owners = nullptr)
+		{
+			const auto execution_owns = [&](u32 pc) {
+				return !execution_owners || execution_owners->contains(pc);
+			};
+			if (!output || options.max_direct_calls == 0 || source_blocks.empty() ||
+				caller.control_kind != RawControlKind::StaticJump ||
+				(caller.branch_opcode >> 26) != 0x03 ||
+				caller.branch_pc > UINT32_MAX - 2 * sizeof(u32))
+			{
+				return false;
+			}
+
+			const u32 callee_pc = JumpTarget(caller.branch_pc, caller.branch_opcode);
+			const u32 return_pc = caller.branch_pc + 2 * sizeof(u32);
+			if (callee_pc == caller.pc || callee_pc == return_pc ||
+				!ContainsPc(source_spans, callee_pc) ||
+				!ContainsPc(source_spans, return_pc) ||
+				!FindSourceBlockContract(source_blocks, callee_pc) ||
+				!FindSourceBlockContract(source_blocks, return_pc))
+			{
+				return false;
+			}
+
+			// Prove the complete source-attested callee CFG rather than assuming that
+			// the first tier-zero block is also the return leaf.  SDK routines commonly
+			// have a scheduler-elided prologue followed by one reducible natural loop
+			// and a JR r31 tail.  Every traversed edge must land on an immutable PCSX2
+			// source-block contract; an omitted/cold arm therefore cannot accidentally
+			// become part of the call contract merely because its bytes share a span.
+			std::set<u32> callee_leaders;
+			for (const SourceBlockContract& contract : source_blocks)
+			{
+				if (execution_owns(contract.start_pc))
+					callee_leaders.insert(contract.start_pc);
+			}
+			std::deque<u32> pending = {callee_pc};
+			std::set<u32> visited;
+			u32 return_jump_pc = UINT32_MAX;
+			while (!pending.empty())
+			{
+				const u32 pc = pending.front();
+				pending.pop_front();
+				if (!visited.insert(pc).second)
+					continue;
+				if (visited.size() > options.max_blocks || pc == return_pc ||
+					!execution_owns(pc) ||
+					!ContainsPc(source_spans, pc) ||
+					!FindSourceBlockContract(source_blocks, pc))
+				{
+					return false;
+				}
+
+				RawBlock callee{};
+				LiftFailure ignored_failure = LiftFailure::None;
+				u32 ignored_pc = 0;
+				if (!ScanRawBlock(source_spans, source_blocks, callee_leaders,
+						pc, options, &callee, &ignored_failure, &ignored_pc,
+						nullptr))
+				{
+					return false;
+				}
+
+				std::array<u32, 2> successors{};
+				u32 successor_count = 0;
+				if (callee.control_kind == RawControlKind::ConditionalBranch)
+				{
+					successors[successor_count++] =
+						BranchTarget(callee.branch_pc, callee.branch_opcode);
+					successors[successor_count++] =
+						callee.branch_pc + 2 * sizeof(u32);
+				}
+				else if (callee.control_kind == RawControlKind::StaticJump)
+				{
+					// Nested link-register ownership needs a call stack contract.  Until
+					// that is represented explicitly, accept only an ordinary J/tail edge.
+					if ((callee.branch_opcode >> 26) != 0x02)
+						return false;
+					successors[successor_count++] =
+						JumpTarget(callee.branch_pc, callee.branch_opcode);
+				}
+				else if (callee.control_kind == RawControlKind::RegisterJump)
+				{
+					if ((callee.branch_opcode >> 26) != 0 ||
+						(callee.branch_opcode & 0x3fu) != 0x08 ||
+						RS(callee.branch_opcode) != 31 ||
+						(return_jump_pc != UINT32_MAX &&
+						 return_jump_pc != callee.branch_pc))
+					{
+						return false;
+					}
+					return_jump_pc = callee.branch_pc;
+					continue;
+				}
+				else
+				{
+					if (callee.transfer_reason != ExitReason::RegionBoundary)
+						return false;
+					successors[successor_count++] = callee.transfer_pc;
+				}
+
+				for (u32 index = 0; index < successor_count; index++)
+				{
+					const u32 target = successors[index];
+					if (target == return_pc || !execution_owns(target) ||
+						!ContainsPc(source_spans, target) ||
+						!FindSourceBlockContract(source_blocks, target))
+					{
+						return false;
+					}
+					pending.push_back(target);
+				}
+			}
+			if (return_jump_pc == UINT32_MAX)
+				return false;
+
+			*output = {caller.branch_pc, callee_pc, return_jump_pc, return_pc};
 			return true;
 		}
 
@@ -1492,15 +2495,36 @@ namespace VitaEE::RegionIR
 					block.parameters.vu0_statusflag = AddNode(block,
 						Opcode::Parameter, ValueType::I32, {}, 0,
 						VU0_STATUSFLAG_PARAMETER, 0, block.pc);
-					block.parameters.vu0_vi_mac = AddNode(block,
+					block.parameters.vu0_clipflag = AddNode(block,
 						Opcode::Parameter, ValueType::I32, {}, 0,
-						VU0_VI_MAC_PARAMETER, 0, block.pc);
-					block.parameters.vu0_vi_status = AddNode(block,
+						VU0_CLIPFLAG_PARAMETER, 0, block.pc);
+					block.parameters.vu0_q = AddNode(block,
 						Opcode::Parameter, ValueType::I32, {}, 0,
-						VU0_VI_STATUS_PARAMETER, 0, block.pc);
-					block.parameters.vu0_vpu_stat = AddNode(block,
-						Opcode::Parameter, ValueType::I32, {}, 0,
-						VU0_VPU_STAT_PARAMETER, 0, block.pc);
+						VU0_Q_PARAMETER, 0, block.pc);
+					for (u32 vi = 0; vi < VU0_VI_COUNT; vi++)
+					{
+						block.parameters.vu0_vi[vi] = AddNode(block,
+							Opcode::Parameter, ValueType::I32, {}, 0,
+							VU0_VI_PARAMETER_BASE + vi, 0, block.pc);
+					}
+					for (u32 instance = 0; instance < 4; instance++)
+					{
+						block.parameters.vu0_micro_macflags[instance] = AddNode(block,
+							Opcode::Parameter, ValueType::I32, {}, 0,
+							VU0_MICRO_MACFLAG_PARAMETER_BASE + instance, 0, block.pc);
+					}
+					for (u32 instance = 0; instance < 4; instance++)
+					{
+						block.parameters.vu0_micro_clipflags[instance] = AddNode(block,
+							Opcode::Parameter, ValueType::I32, {}, 0,
+							VU0_MICRO_CLIPFLAG_PARAMETER_BASE + instance, 0, block.pc);
+					}
+					for (u32 instance = 0; instance < 4; instance++)
+					{
+						block.parameters.vu0_micro_statusflags[instance] = AddNode(block,
+							Opcode::Parameter, ValueType::I32, {}, 0,
+							VU0_MICRO_STATUSFLAG_PARAMETER_BASE + instance, 0, block.pc);
+					}
 					block.parameters.cycle =
 						AddNode(block, Opcode::Parameter, ValueType::Cycle, {}, 0,
 							CYCLE_PARAMETER, 0, block.pc);
@@ -1517,9 +2541,20 @@ namespace VitaEE::RegionIR
 						block.parameters.vu0_acc == INVALID_VALUE ||
 						block.parameters.vu0_macflag == INVALID_VALUE ||
 						block.parameters.vu0_statusflag == INVALID_VALUE ||
-						block.parameters.vu0_vi_mac == INVALID_VALUE ||
-						block.parameters.vu0_vi_status == INVALID_VALUE ||
-						block.parameters.vu0_vpu_stat == INVALID_VALUE ||
+						block.parameters.vu0_clipflag == INVALID_VALUE ||
+						block.parameters.vu0_q == INVALID_VALUE ||
+						std::find(block.parameters.vu0_vi.begin(),
+							block.parameters.vu0_vi.end(), INVALID_VALUE) !=
+							block.parameters.vu0_vi.end() ||
+						std::find(block.parameters.vu0_micro_macflags.begin(),
+							block.parameters.vu0_micro_macflags.end(), INVALID_VALUE) !=
+							block.parameters.vu0_micro_macflags.end() ||
+						std::find(block.parameters.vu0_micro_clipflags.begin(),
+							block.parameters.vu0_micro_clipflags.end(), INVALID_VALUE) !=
+							block.parameters.vu0_micro_clipflags.end() ||
+						std::find(block.parameters.vu0_micro_statusflags.begin(),
+							block.parameters.vu0_micro_statusflags.end(), INVALID_VALUE) !=
+							block.parameters.vu0_micro_statusflags.end() ||
 						block.parameters.cycle == INVALID_VALUE ||
 						block.parameters.memory_effect == INVALID_VALUE)
 					{
@@ -1690,6 +2725,81 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
+			ValueId HiLoLaneLowWord(Block& block, ValueId value,
+				bool upper_pipeline, u32 source_pc)
+			{
+				if (!upper_pipeline)
+				{
+					return Unary(block, Opcode::ExtractLow32, ValueType::I32,
+						value, source_pc);
+				}
+				const ValueId high = Unary(block, Opcode::ExtractHigh64,
+					ValueType::I64, value, source_pc);
+				return Unary(block, Opcode::Truncate64To32, ValueType::I32,
+					high, source_pc);
+			}
+
+			bool LowerIntegerMultiply(Block& block, StateMap* state, u32 op,
+				u32 pc, const IntegerMultiplyOp& multiply)
+			{
+				if (!multiply.valid)
+					return false;
+				const ValueId left = Low32(block, *state, RS(op), pc);
+				const ValueId right = Low32(block, *state, RT(op), pc);
+				ValueId result = Binary(block,
+					multiply.signed_multiply ? Opcode::MultiplySigned32 :
+					                           Opcode::MultiplyUnsigned32,
+					ValueType::I64, left, right, pc);
+				if (result == INVALID_VALUE)
+					return false;
+
+				if (multiply.accumulate)
+				{
+					const ValueId lo_word = HiLoLaneLowWord(block, state->lo,
+						multiply.upper_pipeline, pc);
+					const ValueId hi_word = HiLoLaneLowWord(block, state->hi,
+						multiply.upper_pipeline, pc);
+					const ValueId lo = Unary(block, Opcode::ZeroExtend32To64,
+						ValueType::I64, lo_word, pc);
+					ValueId hi = Unary(block, Opcode::ZeroExtend32To64,
+						ValueType::I64, hi_word, pc);
+					hi = Unary(block, Opcode::ShiftLeft64, ValueType::I64, hi,
+						pc, 32);
+					const ValueId accumulator = Binary(block, Opcode::Or64,
+						ValueType::I64, lo, hi, pc);
+					result = Binary(block, Opcode::Add64, ValueType::I64,
+						accumulator, result, pc);
+					if (result == INVALID_VALUE)
+						return false;
+				}
+
+				const ValueId low_word = Unary(block, Opcode::Truncate64To32,
+					ValueType::I32, result, pc);
+				const ValueId shifted_high = Unary(block,
+					Opcode::ShiftRightLogical64, ValueType::I64, result, pc, 32);
+				const ValueId high_word = Unary(block, Opcode::Truncate64To32,
+					ValueType::I32, shifted_high, pc);
+				const ValueId low_lane = Unary(block, Opcode::SignExtend32To64,
+					ValueType::I64, low_word, pc);
+				const ValueId high_lane = Unary(block, Opcode::SignExtend32To64,
+					ValueType::I64, high_word, pc);
+				if (low_lane == INVALID_VALUE || high_lane == INVALID_VALUE)
+					return false;
+
+				// The selected pipeline is a lane of the architectural 128-bit HI/LO
+				// values. Keep the other lane byte-exact, including for MULT1/MADD1.
+				const bool wrote_lo = multiply.upper_pipeline ?
+					WriteHiLoHigh64(block, state, false, low_lane, pc) :
+					WriteHiLoLow64(block, state, false, low_lane, pc);
+				if (!wrote_lo)
+					return false;
+				const bool wrote_hi = multiply.upper_pipeline ?
+					WriteHiLoHigh64(block, state, true, high_lane, pc) :
+					WriteHiLoLow64(block, state, true, high_lane, pc);
+				return wrote_hi &&
+				       WriteLow64(block, state, RD(op), low_lane, pc);
+			}
+
 			bool WriteSa(Block& block, StateMap* state, ValueId value, u32 source_pc)
 			{
 				if (value == INVALID_VALUE ||
@@ -1749,10 +2859,240 @@ namespace VitaEE::RegionIR
 				return true;
 			}
 
-			bool LowerVu0BroadcastFmac(Block& block, StateMap* state, u32 op,
-				u32 pc)
+			bool WriteVu0IndexedState(Block& block, ValueId* destination,
+				Opcode bind, u32 index, ValueId value, u32 source_pc)
 			{
-				const Vu0BroadcastFmacOp fmac = DecodeVu0BroadcastFmac(op);
+				if (!destination || value == INVALID_VALUE ||
+					AddNode(block, bind, ValueType::Void,
+						{value, INVALID_VALUE, INVALID_VALUE}, 1, index, 0,
+						source_pc) == INVALID_VALUE)
+				{
+					return false;
+				}
+				*destination = value;
+				return true;
+			}
+
+			ValueId RequireVu0Idle(Block& block, const StateMap& state,
+				ValueId value, ValueType value_type,
+				const StateMap& fallback_state, u32 fallback_resume_pc, u32 pc,
+				u32 pending_raw_cycles)
+			{
+				Transfer fallback = MakeDeferredObserverTransfer(block, fallback_state,
+					fallback_resume_pc, ExitReason::HelperObserver, pc,
+					pending_raw_cycles);
+				if (fallback.pc == INVALID_VALUE)
+					return INVALID_VALUE;
+				const ValueId guarded = Binary(block, Opcode::Vu0RequireIdle,
+					value_type, state.vu0_vi[29], value, pc);
+				if (guarded == INVALID_VALUE)
+					return INVALID_VALUE;
+				block.observer_exits.push_back({guarded, std::move(fallback)});
+				return guarded;
+			}
+
+			bool LowerVu0VectorTransfer(Block& block, StateMap* state, u32 op,
+				u32 pc, const StateMap& fallback_state, u32 fallback_resume_pc,
+				u32 pending_raw_cycles)
+			{
+				const Vu0VectorTransferOp transfer = DecodeVu0VectorTransfer(op);
+				if (!transfer.valid)
+					return false;
+
+				const u32 rt = RT(op);
+				const u32 vf = RD(op);
+				if (transfer.kind == Vu0VectorTransferKind::FromVu0)
+				{
+					const ValueId guarded = RequireVu0Idle(block, *state,
+						state->vu0_vf[vf], ValueType::VuF32x4Bits,
+						fallback_state, fallback_resume_pc, pc, pending_raw_cycles);
+					if (guarded == INVALID_VALUE)
+						return false;
+					if (rt == 0)
+						return true;
+					const ValueId bits = Unary(block,
+						Opcode::BitcastVuF32x4BitsToI128, ValueType::I128,
+						guarded, pc);
+					return WriteFullGpr(block, state, rt, bits, pc);
+				}
+
+				// A VF0 destination discards the transfer but retains vu0Sync() and
+				// the optional M-bit interlock. For a real destination, the decoder
+				// has already rejected PCSX2's non-architectural raw-GPR0 source.
+				if (vf == 0)
+				{
+					return RequireVu0Idle(block, *state, state->vu0_vf[0],
+						ValueType::VuF32x4Bits, fallback_state, fallback_resume_pc,
+						pc, pending_raw_cycles) != INVALID_VALUE;
+				}
+				const ValueId guarded = RequireVu0Idle(block, *state,
+					state->gpr[rt], ValueType::I128, fallback_state,
+					fallback_resume_pc, pc, pending_raw_cycles);
+				if (guarded == INVALID_VALUE)
+					return false;
+				const ValueId bits = Unary(block,
+					Opcode::BitcastI128ToVuF32x4Bits, ValueType::VuF32x4Bits,
+					guarded, pc);
+				return WriteVu0Vf(block, state, vf, bits, pc);
+			}
+
+			bool LowerVu0ControlRead(Block& block, StateMap* state, u32 op,
+				u32 pc, const StateMap& fallback_state, u32 fallback_resume_pc,
+				u32 pending_raw_cycles)
+			{
+				const Vu0ControlReadOp read = DecodeVu0ControlRead(op);
+				if (!read.valid)
+					return false;
+
+				ValueId value = state->vu0_vi[29];
+				if (RT(op) != 0)
+				{
+					switch (read.source)
+					{
+						case 0:
+							value = Constant32(block, 0, pc);
+							break;
+						case 16:
+							value = state->vu0_vi[16];
+							break;
+						case 17:
+							value = state->vu0_vi[17];
+							break;
+						case 29:
+							value = state->vu0_vi[29];
+							break;
+						default:
+							return false;
+					}
+				}
+
+				const ValueId guarded = RequireVu0Idle(block, *state, value,
+					ValueType::I32, fallback_state, fallback_resume_pc, pc,
+					pending_raw_cycles);
+				if (guarded == INVALID_VALUE || RT(op) == 0)
+					return guarded != INVALID_VALUE;
+				const ValueId extended = Unary(block, Opcode::SignExtend32To64,
+					ValueType::I64, guarded, pc);
+				return extended != INVALID_VALUE &&
+				       WriteLow64(block, state, RT(op), extended, pc);
+			}
+
+			bool LowerVu0ControlWrite(Block& block, StateMap* state, u32 op,
+				u32 pc, const StateMap& fallback_state, u32 fallback_resume_pc,
+				u32 pending_raw_cycles)
+			{
+				const Vu0ControlWriteOp write = DecodeVu0ControlWrite(op);
+				if (!write.valid)
+					return false;
+
+				const ValueId source = Unary(block, Opcode::ExtractLow32,
+					ValueType::I32, state->gpr[RT(op)], pc);
+				const ValueId guarded = RequireVu0Idle(block, *state, source,
+					ValueType::I32, fallback_state, fallback_resume_pc, pc,
+					pending_raw_cycles);
+				if (guarded == INVALID_VALUE)
+					return false;
+
+				const ValueId value = AddNode(block, Opcode::Vu0ControlWrite,
+					ValueType::I32,
+					{state->vu0_vi[write.target], guarded, INVALID_VALUE}, 2,
+					write.target, 0, pc);
+				if (value == INVALID_VALUE)
+					return false;
+
+				// VI0 and the three read-only controls retain their current state.
+				if (write.target == 0 || write.target == VU0_MAC_FLAG ||
+					write.target == VU0_TPC || write.target == VU0_VPU_STAT)
+				{
+					return true;
+				}
+
+				if (write.target == VU0_STATUS_FLAG)
+				{
+					const ValueId micro = Unary(block, Opcode::Vu0DenormalizeStatus,
+						ValueType::I32, value, pc);
+					if (micro == INVALID_VALUE ||
+						!WriteVu0IndexedState(block, &state->vu0_vi[write.target],
+							Opcode::BindVu0Vi, write.target, value, pc))
+					{
+						return false;
+					}
+					for (u32 instance = 0; instance < 4; instance++)
+					{
+						if (!WriteVu0IndexedState(block,
+								&state->vu0_micro_statusflags[instance],
+								Opcode::BindVu0MicroStatusFlag, instance, micro, pc))
+						{
+							return false;
+						}
+					}
+					return true;
+				}
+
+				if (write.target == VU0_CLIP_FLAG &&
+					!WriteVu0IndexedState(block, &state->vu0_clipflag,
+						Opcode::BindVu0ClipFlag, 0, value, pc))
+				{
+					return false;
+				}
+				return WriteVu0IndexedState(block, &state->vu0_vi[write.target],
+					Opcode::BindVu0Vi, write.target, value, pc);
+			}
+
+			bool LowerVu0Unary(Block& block, StateMap* state, u32 op, u32 pc,
+				const StateMap& fallback_state, u32 fallback_resume_pc,
+				u32 pending_raw_cycles)
+			{
+				const Vu0UnaryOp unary = DecodeVu0Unary(op);
+				if (!unary.valid)
+					return false;
+
+				const u32 mask = RS(op) & 0x0fu;
+				const u32 destination = RT(op);
+				const u32 source = RD(op);
+				const ValueId guarded = RequireVu0Idle(block, *state,
+					state->vu0_vf[source], ValueType::VuF32x4Bits, fallback_state,
+					fallback_resume_pc, pc, pending_raw_cycles);
+				if (guarded == INVALID_VALUE)
+					return false;
+				if (mask == 0 || destination == 0)
+					return true;
+
+				ValueId value = guarded;
+				if (unary.kind == Vu0UnaryKind::ConvertFixed)
+				{
+					value = Unary(block, Opcode::Vu0ConvertFixed,
+						ValueType::VuF32x4Bits, guarded, pc, unary.offset);
+					if (value == INVALID_VALUE)
+						return false;
+				}
+				else if (unary.kind == Vu0UnaryKind::ConvertIntegerToFloat)
+				{
+					value = Unary(block, Opcode::Vu0ConvertIntegerToFloat,
+						ValueType::VuF32x4Bits, guarded, pc, unary.offset);
+					if (value == INVALID_VALUE)
+						return false;
+				}
+				else if (unary.kind == Vu0UnaryKind::Rotate32)
+				{
+					value = Unary(block, Opcode::Vu0Rotate32,
+						ValueType::VuF32x4Bits, guarded, pc);
+					if (value == INVALID_VALUE)
+						return false;
+				}
+				const ValueId merged = AddNode(block, Opcode::Vu0MergeMasked,
+					ValueType::VuF32x4Bits,
+					{state->vu0_vf[destination], value, INVALID_VALUE}, 2,
+					mask, 0, pc);
+				return merged != INVALID_VALUE &&
+				       WriteVu0Vf(block, state, destination, merged, pc);
+			}
+
+			bool LowerVu0Fmac(Block& block, StateMap* state, u32 op,
+				u32 pc, const StateMap& fallback_state, u32 fallback_resume_pc,
+				u32 pending_raw_cycles)
+			{
+				const Vu0FmacOp fmac = DecodeVu0Fmac(op);
 				if (!fmac.valid)
 					return false;
 
@@ -1760,35 +3100,69 @@ namespace VitaEE::RegionIR
 				const u32 ft = RT(op);
 				const u32 fs = RD(op);
 				const u32 fd = SA(op);
-				const ValueId guarded_fs = Binary(block, Opcode::Vu0RequireIdle,
-					ValueType::VuF32x4Bits, state->vu0_vpu_stat,
-					state->vu0_vf[fs], pc);
+				const ValueId guarded_fs = RequireVu0Idle(block, *state,
+					state->vu0_vf[fs], ValueType::VuF32x4Bits, fallback_state,
+					fallback_resume_pc, pc, pending_raw_cycles);
 				const ValueId normalized_fs = Unary(block, Opcode::Vu0NormalizeVector,
 					ValueType::VuF32x4Bits, guarded_fs, pc);
-				const ValueId normalized_ft = Unary(block, Opcode::Vu0NormalizeVector,
-					ValueType::VuF32x4Bits, state->vu0_vf[ft], pc);
-				const ValueId broadcast = Unary(block, Opcode::Vu0BroadcastLane,
-					ValueType::VuF32x4Bits, normalized_ft, pc, fmac.lane);
-				const ValueId product = Binary(block, Opcode::Vu0MulRaw,
-					ValueType::VuF32x4Bits, normalized_fs, broadcast, pc);
+				ValueId operand = INVALID_VALUE;
+				if (fmac.operand == Vu0FmacOperand::ScalarQ)
+				{
+					operand = Unary(block, Opcode::Vu0BroadcastScalar,
+						ValueType::VuF32x4Bits, state->vu0_vi[22], pc);
+				}
+				else
+				{
+					const ValueId normalized_ft = Unary(block,
+						Opcode::Vu0NormalizeVector, ValueType::VuF32x4Bits,
+						state->vu0_vf[ft], pc);
+					operand = normalized_ft;
+					if (fmac.operand == Vu0FmacOperand::BroadcastLane)
+					{
+						operand = Unary(block, Opcode::Vu0BroadcastLane,
+							ValueType::VuF32x4Bits, normalized_ft, pc, fmac.lane);
+					}
+				}
 				if (guarded_fs == INVALID_VALUE || normalized_fs == INVALID_VALUE ||
-					normalized_ft == INVALID_VALUE || broadcast == INVALID_VALUE ||
-					product == INVALID_VALUE)
+					operand == INVALID_VALUE)
 				{
 					return false;
 				}
 
-				ValueId raw = product;
-				if (fmac.kind != Vu0BroadcastFmacKind::MultiplyAccumulator)
+				ValueId raw = INVALID_VALUE;
+				switch (fmac.kind)
 				{
-					const ValueId normalized_acc = Unary(block,
-						Opcode::Vu0NormalizeVector, ValueType::VuF32x4Bits,
-						state->vu0_acc, pc);
-					raw = Binary(block, Opcode::Vu0AddRaw,
-						ValueType::VuF32x4Bits, normalized_acc, product, pc);
-					if (normalized_acc == INVALID_VALUE || raw == INVALID_VALUE)
-						return false;
+					case Vu0FmacKind::Add:
+						raw = Binary(block, Opcode::Vu0AddRaw,
+							ValueType::VuF32x4Bits, normalized_fs, operand, pc);
+						break;
+					case Vu0FmacKind::Subtract:
+						raw = Binary(block, Opcode::Vu0SubRaw,
+							ValueType::VuF32x4Bits, normalized_fs, operand, pc);
+						break;
+					case Vu0FmacKind::Multiply:
+						raw = Binary(block, Opcode::Vu0MulRaw,
+							ValueType::VuF32x4Bits, normalized_fs, operand, pc);
+						break;
+					case Vu0FmacKind::MultiplyAdd:
+					case Vu0FmacKind::MultiplySubtract:
+					{
+						const ValueId product = Binary(block, Opcode::Vu0MulRaw,
+							ValueType::VuF32x4Bits, normalized_fs, operand, pc);
+						const ValueId normalized_acc = Unary(block,
+							Opcode::Vu0NormalizeVector, ValueType::VuF32x4Bits,
+							state->vu0_acc, pc);
+						raw = Binary(block,
+							fmac.kind == Vu0FmacKind::MultiplyAdd ?
+								Opcode::Vu0AddRaw : Opcode::Vu0SubRaw,
+							ValueType::VuF32x4Bits, normalized_acc, product, pc);
+						if (product == INVALID_VALUE || normalized_acc == INVALID_VALUE)
+							return false;
+						break;
+					}
 				}
+				if (raw == INVALID_VALUE)
+					return false;
 
 				const ValueId result = Unary(block, Opcode::Vu0ClampFmacResult,
 					ValueType::VuF32x4Bits, raw, pc, mask);
@@ -1797,16 +3171,16 @@ namespace VitaEE::RegionIR
 				const ValueId status = Unary(block, Opcode::Vu0StatusFlagsFromMac,
 					ValueType::I32, mac, pc);
 				const ValueId vi_status = Binary(block, Opcode::Vu0SyncStatusControl,
-					ValueType::I32, state->vu0_vi_status, status, pc);
+					ValueType::I32, state->vu0_vi[16], status, pc);
 				if (result == INVALID_VALUE || mac == INVALID_VALUE ||
 					status == INVALID_VALUE || vi_status == INVALID_VALUE ||
 					!WriteVu0State(block, &state->vu0_macflag,
 						Opcode::BindVu0MacFlag, mac, pc) ||
 					!WriteVu0State(block, &state->vu0_statusflag,
 						Opcode::BindVu0StatusFlag, status, pc) ||
-					!WriteVu0State(block, &state->vu0_vi_mac,
+					!WriteVu0State(block, &state->vu0_vi[17],
 						Opcode::BindVu0ViMac, mac, pc) ||
-					!WriteVu0State(block, &state->vu0_vi_status,
+					!WriteVu0State(block, &state->vu0_vi[16],
 						Opcode::BindVu0ViStatus, vi_status, pc))
 				{
 					return false;
@@ -1814,21 +3188,63 @@ namespace VitaEE::RegionIR
 
 				if (mask == 0)
 					return true;
-				const bool acc_destination =
-					fmac.kind != Vu0BroadcastFmacKind::MultiplyAddVector;
-				ValueId& old_destination = acc_destination ?
+				ValueId& old_destination = fmac.accumulator_destination ?
 					state->vu0_acc : state->vu0_vf[fd];
 				const ValueId merged = AddNode(block, Opcode::Vu0MergeMasked,
 					ValueType::VuF32x4Bits,
 					{old_destination, result, INVALID_VALUE}, 2, mask, 0, pc);
 				if (merged == INVALID_VALUE)
 					return false;
-				if (acc_destination)
+				if (fmac.accumulator_destination)
 				{
 					return WriteVu0State(block, &state->vu0_acc,
 						Opcode::BindVu0Acc, merged, pc);
 				}
 				return fd == 0 || WriteVu0Vf(block, state, fd, merged, pc);
+			}
+
+			bool LowerVu0Fdiv(Block& block, StateMap* state, u32 op,
+				u32 pc, const StateMap& fallback_state, u32 fallback_resume_pc,
+				u32 pending_raw_cycles)
+			{
+				const Vu0FdivOp fdiv = DecodeVu0Fdiv(op);
+				if (!fdiv.valid)
+					return false;
+
+				const u32 fs = RD(op);
+				const u32 ft = RT(op);
+				const bool sqrt_only = fdiv.kind == Vu0FdivKind::SquareRoot;
+				const u32 guarded_register = sqrt_only ? ft : fs;
+				const ValueId guarded = RequireVu0Idle(block, *state,
+					state->vu0_vf[guarded_register], ValueType::VuF32x4Bits,
+					fallback_state, fallback_resume_pc, pc, pending_raw_cycles);
+				if (guarded == INVALID_VALUE)
+					return false;
+				const ValueId fs_value = guarded;
+				const ValueId ft_value = sqrt_only || fs == ft ?
+					guarded : state->vu0_vf[ft];
+				const u32 immediate = EncodeVu0FdivImmediate(fdiv);
+				const ValueId q = AddNode(block, Opcode::Vu0FdivQ, ValueType::I32,
+					{fs_value, ft_value, INVALID_VALUE}, 2, immediate, 0, pc);
+				const ValueId flags = AddNode(block, Opcode::Vu0FdivFlags, ValueType::I32,
+					{fs_value, ft_value, INVALID_VALUE}, 2, immediate, 0, pc);
+				const ValueId status = Binary(block, Opcode::Vu0UpdateFdivStatus,
+					ValueType::I32, state->vu0_statusflag, flags, pc);
+				const ValueId vi_status = Binary(block,
+					Opcode::Vu0SyncFdivStatusControl, ValueType::I32,
+					state->vu0_vi[16], status, pc);
+				if (q == INVALID_VALUE || flags == INVALID_VALUE ||
+					status == INVALID_VALUE || vi_status == INVALID_VALUE ||
+					!WriteVu0State(block, &state->vu0_q, Opcode::BindVu0Q, q, pc) ||
+					!WriteVu0State(block, &state->vu0_vi[22], Opcode::BindVu0ViQ, q, pc) ||
+					!WriteVu0State(block, &state->vu0_statusflag,
+						Opcode::BindVu0StatusFlag, status, pc) ||
+					!WriteVu0State(block, &state->vu0_vi[16],
+						Opcode::BindVu0ViStatus, vi_status, pc))
+				{
+					return false;
+				}
+				return true;
 			}
 
 			bool WriteFcr31(Block& block, StateMap* state, ValueId value,
@@ -1877,6 +3293,13 @@ namespace VitaEE::RegionIR
 					ValueType::F32Bits, left, right, pc);
 				if (raw == INVALID_VALUE)
 					return false;
+				if (m_program->options.cop1_lazy_ou_guards)
+				{
+					const ValueId exceptional = Unary(block,
+						Opcode::Cop1ExceptionalOuResult, ValueType::I1, raw, pc);
+					if (exceptional == INVALID_VALUE)
+						return false;
+				}
 				const ValueId result = Unary(block, Opcode::Cop1ClampOuResult,
 					ValueType::F32Bits, raw, pc);
 				if (result == INVALID_VALUE)
@@ -1955,11 +3378,20 @@ namespace VitaEE::RegionIR
 				}
 				const ValueId raw = Binary(block, CompoundCop1FinalRawOpcode(kind),
 					ValueType::F32Bits, normalized_acc, normalized_product, pc);
+				if (raw == INVALID_VALUE)
+					return false;
+				if (m_program->options.cop1_lazy_ou_guards)
+				{
+					const ValueId exceptional = Unary(block,
+						Opcode::Cop1ExceptionalOuResult, ValueType::I1, raw, pc);
+					if (exceptional == INVALID_VALUE)
+						return false;
+				}
 				const ValueId result = Unary(block, Opcode::Cop1ClampOuResult,
 					ValueType::F32Bits, raw, pc);
 				const ValueId flags = Binary(block, Opcode::Cop1UpdateOuFlags,
 					ValueType::I32, state->fcr31, raw, pc);
-				if (raw == INVALID_VALUE || result == INVALID_VALUE ||
+				if (result == INVALID_VALUE ||
 					flags == INVALID_VALUE || !WriteFcr31(block, state, flags, pc))
 				{
 					return false;
@@ -1968,8 +3400,14 @@ namespace VitaEE::RegionIR
 			}
 
 			bool LowerMemory(Block& block, StateMap* state, u32 op, u32 pc,
-				MemoryAccessKind kind)
+				MemoryAccessKind kind, const StateMap& fallback_state,
+				u32 fallback_resume_pc, u32 pending_raw_cycles)
 			{
+				Transfer fallback = MakeDeferredObserverTransfer(block, fallback_state,
+					fallback_resume_pc, ExitReason::MemoryObserver, pc,
+					pending_raw_cycles);
+				if (fallback.pc == INVALID_VALUE)
+					return false;
 				const bool fpr_access = IsFprMemoryAccess(kind);
 				const bool vu0_access = IsVu0MemoryAccess(kind);
 				const u32 destination = RT(op);
@@ -1978,9 +3416,9 @@ namespace VitaEE::RegionIR
 					              state->gpr[destination]);
 				if (vu0_access)
 				{
-					architectural_value = Binary(block, Opcode::Vu0RequireIdle,
-						ValueType::VuF32x4Bits, state->vu0_vpu_stat,
-						architectural_value, pc);
+					architectural_value = RequireVu0Idle(block, *state,
+						architectural_value, ValueType::VuF32x4Bits, fallback_state,
+						fallback_resume_pc, pc, pending_raw_cycles);
 					if (architectural_value == INVALID_VALUE)
 						return false;
 				}
@@ -2002,6 +3440,7 @@ namespace VitaEE::RegionIR
 						encoded_kind, 0, pc);
 					if (effect == INVALID_VALUE)
 						return false;
+					block.memory_exits.push_back({effect, std::move(fallback)});
 					state->memory_effect = effect;
 					if (!fpr_access && destination == 0)
 						return true;
@@ -2030,6 +3469,7 @@ namespace VitaEE::RegionIR
 					encoded_kind, 0, pc);
 				if (effect == INVALID_VALUE)
 					return false;
+				block.memory_exits.push_back({effect, std::move(fallback)});
 				state->memory_effect = effect;
 				return true;
 			}
@@ -2041,17 +3481,69 @@ namespace VitaEE::RegionIR
 				NoEffectKind no_effect{};
 				if (DecodeNoEffect(op, m_program->options, &no_effect))
 				{
+					// PCSX2 owner: VU0.cpp::COP2_SPECIAL(). Even VNOP and
+					// VWAITQ pass through _vu0FinishMicro() before the empty
+					// SPECIAL2 body. Preserve that observer on a running VU0;
+					// only the already-idle operation body is a no-op.
+					if (NoEffectRequiresVu0Idle(no_effect) &&
+						RequireVu0Idle(block, *state, state->vu0_vf[0],
+							ValueType::VuF32x4Bits, exceptional_state,
+							exceptional_resume_pc, pc, pending_raw_cycles) == INVALID_VALUE)
+					{
+						return false;
+					}
 					return AddNode(block, Opcode::NoEffect, ValueType::Void, {}, 0,
 						static_cast<u32>(no_effect), 0, pc) != INVALID_VALUE;
 				}
 
 				MemoryAccessKind memory_kind{};
 				if (DecodeMemoryAccess(op, &memory_kind))
-					return LowerMemory(block, state, op, pc, memory_kind);
+				{
+					return LowerMemory(block, state, op, pc, memory_kind,
+						exceptional_state, exceptional_resume_pc,
+						pending_raw_cycles);
+				}
+				const IntegerMultiplyOp integer_multiply =
+					DecodeIntegerMultiply(op);
+				if (integer_multiply.valid)
+					return LowerIntegerMultiply(block, state, op, pc, integer_multiply);
 
 				const u32 primary = op >> 26;
 				if (primary == 0x12)
-					return LowerVu0BroadcastFmac(block, state, op, pc);
+				{
+					if (DecodeVu0Fdiv(op).valid)
+					{
+						return LowerVu0Fdiv(block, state, op, pc,
+							exceptional_state, exceptional_resume_pc,
+							pending_raw_cycles);
+					}
+					if (DecodeVu0ControlRead(op).valid)
+					{
+						return LowerVu0ControlRead(block, state, op, pc,
+							exceptional_state, exceptional_resume_pc,
+							pending_raw_cycles);
+					}
+					if (DecodeVu0ControlWrite(op).valid)
+					{
+						return LowerVu0ControlWrite(block, state, op, pc,
+							exceptional_state, exceptional_resume_pc,
+							pending_raw_cycles);
+					}
+					if (DecodeVu0VectorTransfer(op).valid)
+					{
+						return LowerVu0VectorTransfer(block, state, op, pc,
+							exceptional_state, exceptional_resume_pc,
+							pending_raw_cycles);
+					}
+					if (DecodeVu0Fmac(op).valid)
+					{
+						return LowerVu0Fmac(block, state, op, pc,
+							exceptional_state, exceptional_resume_pc,
+							pending_raw_cycles);
+					}
+					return LowerVu0Unary(block, state, op, pc, exceptional_state,
+						exceptional_resume_pc, pending_raw_cycles);
+				}
 				if (primary == 0x11)
 				{
 					PureCop1StateKind kind{};
@@ -2062,17 +3554,29 @@ namespace VitaEE::RegionIR
 							return WriteFcr31(block, state,
 								Low32(block, *state, RT(op), pc), pc);
 						}
+						Cop1UnaryWordKind unary_kind{};
+						if (DecodeCop1UnaryWord(op, &unary_kind))
+						{
+							const ValueId result = Unary(block,
+								Cop1UnaryWordOpcode(unary_kind), ValueType::F32Bits,
+								state->fpr[FS(op)], pc);
+							const ValueId flags = Unary(block, Opcode::Cop1ClearOuFlags,
+								ValueType::I32, state->fcr31, pc);
+							return result != INVALID_VALUE && flags != INVALID_VALUE &&
+							       WriteFcr31(block, state, flags, pc) &&
+							       WriteFpr(block, state, FD(op), result, pc);
+						}
 						BasicCop1ArithmeticKind arithmetic{};
 						if (DecodeBasicCop1Arithmetic(op, &arithmetic))
 						{
-							return LowerBasicCop1Arithmetic(block, state, op, pc,
-								arithmetic);
+							return LowerBasicCop1Arithmetic(
+								block, state, op, pc, arithmetic);
 						}
 						CompoundCop1ArithmeticKind compound{};
 						if (DecodeCompoundCop1Arithmetic(op, &compound))
 						{
-							return LowerCompoundCop1Arithmetic(block, state, op, pc,
-								compound);
+							return LowerCompoundCop1Arithmetic(
+								block, state, op, pc, compound);
 						}
 						Cop1CompareKind compare{};
 						if (DecodeCop1Compare(op, &compare))
@@ -2111,6 +3615,26 @@ namespace VitaEE::RegionIR
 				}
 				if (primary == 0x1c)
 				{
+					PackedShiftKind shift_kind{};
+					if (DecodePackedShiftMmi(op, &shift_kind))
+					{
+						const u32 amount = static_cast<u32>(SA(op)) &
+							(shift_kind <= PackedShiftKind::RightArithmetic16 ? 0x0fu : 0x1fu);
+						const ValueId value = AddNode(block, Opcode::PackedShift128,
+							ValueType::I128,
+							{state->gpr[RT(op)], INVALID_VALUE, INVALID_VALUE}, 1,
+							static_cast<u32>(shift_kind), amount, pc);
+						return WriteFullGpr(block, state, RD(op), value, pc);
+					}
+					PackedBinaryKind packed_kind{};
+					if (DecodePackedBinaryMmi(op, &packed_kind))
+					{
+						const ValueId value = AddNode(block, Opcode::PackedBinary128,
+							ValueType::I128,
+							{state->gpr[RS(op)], state->gpr[RT(op)], INVALID_VALUE}, 2,
+							static_cast<u32>(packed_kind), 0, pc);
+						return WriteFullGpr(block, state, RD(op), value, pc);
+					}
 					PureMmiKind kind{};
 					if (!DecodePureMmi(op, &kind))
 						return false;
@@ -2396,6 +3920,12 @@ namespace VitaEE::RegionIR
 			ValueId LowerBranchCondition(Block& block, const StateMap& state, u32 op,
 				u32 pc)
 			{
+				bool cop1_true = false;
+				if (DecodeCop1Branch(op, &cop1_true))
+				{
+					return Unary(block, Opcode::Cop1BranchCondition, ValueType::I1,
+						state.fcr31, pc, cop1_true ? 1u : 0u);
+				}
 				const u32 encoded_primary = op >> 26;
 				const u32 primary = encoded_primary >= 0x14 && encoded_primary <= 0x17 ?
 				                        encoded_primary - 0x10 :
@@ -2459,13 +3989,17 @@ namespace VitaEE::RegionIR
 
 			Transfer MakeRegisterTransfer(
 				const StateMap& state, ValueId target, ExitReason reason,
-				bool event_horizon_check = true)
+				bool event_horizon_check = true,
+				u32 target_block = INVALID_BLOCK, u32 proven_target_pc = 0)
 			{
 				Transfer transfer{};
 				transfer.state = state;
 				transfer.pc = target;
 				transfer.external_reason = reason;
 				transfer.event_horizon_check = event_horizon_check;
+				transfer.target_block = target_block;
+				transfer.register_target_proven = target_block != INVALID_BLOCK;
+				transfer.proven_register_target_pc = proven_target_pc;
 				return transfer;
 			}
 
@@ -2525,9 +4059,12 @@ namespace VitaEE::RegionIR
 			       left.vu0_acc == right.vu0_acc &&
 			       left.vu0_macflag == right.vu0_macflag &&
 			       left.vu0_statusflag == right.vu0_statusflag &&
-			       left.vu0_vi_mac == right.vu0_vi_mac &&
-			       left.vu0_vi_status == right.vu0_vi_status &&
-			       left.vu0_vpu_stat == right.vu0_vpu_stat &&
+			       left.vu0_clipflag == right.vu0_clipflag &&
+			       left.vu0_q == right.vu0_q &&
+			       left.vu0_vi == right.vu0_vi &&
+			       left.vu0_micro_macflags == right.vu0_micro_macflags &&
+			       left.vu0_micro_clipflags == right.vu0_micro_clipflags &&
+			       left.vu0_micro_statusflags == right.vu0_micro_statusflags &&
 			       left.cycle == right.cycle &&
 			       left.memory_effect == right.memory_effect;
 		}
@@ -2546,6 +4083,243 @@ namespace VitaEE::RegionIR
 			return value;
 		}
 	} // namespace
+
+	u128 NormalizeVu0Vector(const u128& value, bool overflow_clamp)
+	{
+		return NormalizeVuVector(value, overflow_clamp);
+	}
+
+	u128 BroadcastVu0Lane(const u128& value, u32 lane)
+	{
+		return BroadcastVuLane(value, lane);
+	}
+
+	u128 EvaluateVu0RawBinary(Opcode opcode, const u128& left,
+		const u128& right)
+	{
+		return EvaluateVuRawBinary(opcode, left, right);
+	}
+
+	u128 ClampVu0FmacResult(const u128& raw, u32 mask,
+		bool overflow_clamp)
+	{
+		return ClampVuFmacResult(raw, mask, overflow_clamp);
+	}
+
+	u32 EvaluateVu0MacFlags(const u128& raw, u32 mask)
+	{
+		return VuMacFlagsFromRaw(raw, mask);
+	}
+
+	u32 EvaluateVu0StatusFlags(u32 mac)
+	{
+		return VuStatusFlagsFromMac(mac);
+	}
+
+	u128 MergeVu0Masked(const u128& old_value, const u128& new_value,
+		u32 mask)
+	{
+		return MergeVuMasked(old_value, new_value, mask);
+	}
+
+	u32 SyncVu0StatusControl(u32 old_status, u32 current_status)
+	{
+		return (old_status & 0x0fc0u) | current_status |
+			(current_status << 6);
+	}
+
+	bool IsMemoryLoad(MemoryAccessKind kind)
+	{
+		return kind <= MemoryAccessKind::LoadVu0Vector;
+	}
+
+	SourceSpanMergeFailure MergeImmutableSourceSpan(
+		std::vector<SourceSpan>* spans, SourceSpan incoming,
+		u32 max_source_instructions, u32* required_source_instructions)
+	{
+		if (required_source_instructions)
+			*required_source_instructions = 0;
+		if (!spans || max_source_instructions == 0)
+			return SourceSpanMergeFailure::InvalidSource;
+
+		std::vector<SourceSpan> pending = *spans;
+		pending.push_back(std::move(incoming));
+		for (const SourceSpan& span : pending)
+		{
+			const u64 end = static_cast<u64>(span.base_pc) +
+				static_cast<u64>(span.words.size()) * sizeof(u32);
+			if ((span.base_pc & 3u) != 0 || span.words.empty() ||
+				end > static_cast<u64>(UINT32_MAX) + 1)
+			{
+				return SourceSpanMergeFailure::InvalidSource;
+			}
+		}
+
+		std::sort(pending.begin(), pending.end(),
+			[](const SourceSpan& left, const SourceSpan& right) {
+				return left.base_pc < right.base_pc;
+			});
+		std::vector<SourceSpan> merged;
+		merged.reserve(pending.size());
+		for (SourceSpan& next : pending)
+		{
+			if (merged.empty())
+			{
+				merged.push_back(std::move(next));
+				continue;
+			}
+
+			SourceSpan& current = merged.back();
+			const u64 current_end = static_cast<u64>(current.base_pc) +
+				static_cast<u64>(current.words.size()) * sizeof(u32);
+			if (static_cast<u64>(next.base_pc) > current_end)
+			{
+				merged.push_back(std::move(next));
+				continue;
+			}
+
+			const size_t offset =
+				static_cast<size_t>((next.base_pc - current.base_pc) / sizeof(u32));
+			const size_t overlap = offset < current.words.size() ?
+				std::min(current.words.size() - offset, next.words.size()) : 0;
+			for (size_t index = 0; index < overlap; index++)
+			{
+				if (current.words[offset + index] != next.words[index])
+					return SourceSpanMergeFailure::ConflictingSource;
+			}
+			if (next.words.size() > overlap)
+			{
+				current.words.insert(current.words.end(),
+					next.words.begin() + overlap, next.words.end());
+			}
+		}
+
+		u64 total_words = 0;
+		for (const SourceSpan& span : merged)
+			total_words += span.words.size();
+		if (required_source_instructions)
+		{
+			*required_source_instructions = static_cast<u32>(
+				std::min<u64>(total_words, UINT32_MAX));
+		}
+		if (total_words > max_source_instructions)
+			return SourceSpanMergeFailure::SourceLimit;
+
+		*spans = std::move(merged);
+		return SourceSpanMergeFailure::None;
+	}
+
+	SuffixPartitionFailure BuildCycleProvenSuffixPartition(
+		const SourceBlockContract& wide, const SourceBlockContract& suffix,
+		bool cycle_timeline_proven, SourceBlockContract* prefix)
+	{
+		if (!prefix || (wide.start_pc & 3u) != 0 ||
+			(suffix.start_pc & 3u) != 0 || wide.instruction_count == 0 ||
+			suffix.instruction_count == 0 || suffix.start_pc <= wide.start_pc)
+		{
+			return SuffixPartitionFailure::InvalidRange;
+		}
+
+		const u64 wide_end = static_cast<u64>(wide.start_pc) +
+			static_cast<u64>(wide.instruction_count) * sizeof(u32);
+		const u64 suffix_end = static_cast<u64>(suffix.start_pc) +
+			static_cast<u64>(suffix.instruction_count) * sizeof(u32);
+		if (wide_end > static_cast<u64>(UINT32_MAX) + 1 ||
+			suffix_end > static_cast<u64>(UINT32_MAX) + 1 ||
+			wide_end != suffix_end)
+		{
+			return SuffixPartitionFailure::NotExactSuffix;
+		}
+		if (wide.dependency_start_pc != wide.start_pc ||
+			wide.dependency_instruction_count != wide.instruction_count ||
+			wide.charged_scaled_cycles_before != 0 ||
+			suffix.dependency_start_pc != suffix.start_pc ||
+			suffix.dependency_instruction_count != suffix.instruction_count ||
+			suffix.charged_scaled_cycles_before != 0)
+		{
+			return SuffixPartitionFailure::NonStandaloneDependency;
+		}
+		if (wide.scheduler_test_at_end != suffix.scheduler_test_at_end)
+			return SuffixPartitionFailure::SchedulerMismatch;
+		if (!cycle_timeline_proven)
+			return SuffixPartitionFailure::CycleTimeline;
+
+		const u32 prefix_instructions =
+			(suffix.start_pc - wide.start_pc) / sizeof(u32);
+		if (prefix_instructions == 0 ||
+			prefix_instructions >= wide.instruction_count)
+		{
+			return SuffixPartitionFailure::InvalidRange;
+		}
+		*prefix = {wide.start_pc, prefix_instructions, wide.start_pc,
+			prefix_instructions, 0, false};
+		return SuffixPartitionFailure::None;
+	}
+
+	u32 MemoryAccessWidth(MemoryAccessKind kind)
+	{
+		switch (kind)
+		{
+			case MemoryAccessKind::LoadS8:
+			case MemoryAccessKind::LoadU8:
+			case MemoryAccessKind::Store8:
+				return 1;
+			case MemoryAccessKind::LoadS16:
+			case MemoryAccessKind::LoadU16:
+			case MemoryAccessKind::Store16:
+				return 2;
+			case MemoryAccessKind::LoadS32:
+			case MemoryAccessKind::LoadU32:
+			case MemoryAccessKind::LoadF32Bits:
+			case MemoryAccessKind::Store32:
+			case MemoryAccessKind::StoreF32Bits:
+				return 4;
+			case MemoryAccessKind::Load64:
+			case MemoryAccessKind::Store64:
+				return 8;
+			case MemoryAccessKind::Load128:
+			case MemoryAccessKind::LoadVu0Vector:
+			case MemoryAccessKind::Store128:
+			case MemoryAccessKind::StoreVu0Vector:
+				return 16;
+		}
+		return 0;
+	}
+
+	u32 MemoryAlignmentMask(MemoryAccessKind kind)
+	{
+		switch (kind)
+		{
+			case MemoryAccessKind::LoadS16:
+			case MemoryAccessKind::LoadU16:
+			case MemoryAccessKind::Store16:
+				return 1;
+			case MemoryAccessKind::LoadS32:
+			case MemoryAccessKind::LoadU32:
+			case MemoryAccessKind::LoadF32Bits:
+			case MemoryAccessKind::Store32:
+			case MemoryAccessKind::StoreF32Bits:
+				return 3;
+			case MemoryAccessKind::Load64:
+			case MemoryAccessKind::Store64:
+				return 7;
+			// EE LQ/SQ mask the effective address down. The SCE COP2 transfer
+			// contract instead requires a 128-bit-aligned effective address.
+			case MemoryAccessKind::LoadVu0Vector:
+			case MemoryAccessKind::StoreVu0Vector:
+				return 15;
+			default:
+				return 0;
+		}
+	}
+
+	bool IsQuadMemoryAccess(MemoryAccessKind kind)
+	{
+		return kind == MemoryAccessKind::Load128 ||
+		       kind == MemoryAccessKind::Store128 ||
+		       kind == MemoryAccessKind::LoadVu0Vector ||
+		       kind == MemoryAccessKind::StoreVu0Vector;
+	}
 
 	u32 ScaleBlockCycles(u32 raw_cycles, s8 ee_cycle_rate)
 	{
@@ -2580,38 +4354,46 @@ namespace VitaEE::RegionIR
 		       cycle_factor;
 	}
 
-	static LiftResult LiftInternal(u32 source_base_pc, const u32* source_words,
-		u32 source_word_count, const SourceBlockContract* source_blocks,
-		u32 source_block_count, u32 entry_pc, const LiftOptions& options)
+	static LiftResult LiftInternal(const SourceSpan* source_spans,
+		u32 source_span_count, const SourceBlockContract* source_blocks,
+		u32 source_block_count, u32 entry_pc, const LiftOptions& options,
+		const u32* execution_owner_pcs = nullptr,
+		u32 execution_owner_count = 0)
 	{
 		LiftResult result{};
-		if (!source_words || source_word_count == 0 || (source_base_pc & 3u) != 0 ||
+		if (!source_spans || source_span_count == 0 ||
 			options.cycle_factor < 1 || options.cycle_factor > 2 ||
-			options.max_blocks == 0 || options.max_source_instructions == 0 ||
-			static_cast<u64>(source_base_pc) +
-					static_cast<u64>(source_word_count) * sizeof(u32) >
-				static_cast<u64>(UINT32_MAX) + 1)
+			options.max_blocks == 0 || options.max_source_instructions == 0)
 		{
 			result.failure = LiftFailure::InvalidSource;
-			result.failure_pc = source_base_pc;
+			result.failure_pc = entry_pc;
 			return result;
 		}
-		if (source_word_count > options.max_source_instructions)
+		result.program.source_spans.assign(source_spans,
+			source_spans + source_span_count);
+		u64 total_source_words = 0;
+		for (const SourceSpan& span : result.program.source_spans)
+			total_source_words += span.words.size();
+		if (total_source_words > options.max_source_instructions)
 		{
 			result.failure = LiftFailure::SourceLimit;
-			result.failure_pc = source_base_pc;
+			result.failure_pc = result.program.source_spans.front().base_pc;
 			return result;
 		}
-		if (!ContainsPc(source_base_pc, source_word_count, entry_pc))
+		std::string source_span_detail;
+		if (!ValidateSourceSpans(result.program.source_spans, options,
+				&result.failure_pc, &source_span_detail))
+		{
+			result.failure = LiftFailure::InvalidSource;
+			return result;
+		}
+		if (!ContainsPc(result.program.source_spans, entry_pc))
 		{
 			result.failure = LiftFailure::EntryOutsideSource;
 			result.failure_pc = entry_pc;
 			return result;
 		}
 
-		result.program.source_base_pc = source_base_pc;
-		result.program.source_words.assign(source_words,
-			source_words + source_word_count);
 		if (source_blocks && source_block_count != 0)
 			result.program.source_blocks.assign(source_blocks,
 				source_blocks + source_block_count);
@@ -2623,20 +4405,56 @@ namespace VitaEE::RegionIR
 			return result;
 		}
 		std::string source_contract_detail;
-		if (!ValidateSourceBlockContracts(source_base_pc,
-				result.program.source_words, result.program.source_blocks, entry_pc,
-				options, &result.failure_pc, &source_contract_detail))
+		if (!ValidateSourceBlockContracts(result.program.source_spans,
+				result.program.source_blocks, entry_pc,
+				options, &result.failure_pc, &source_contract_detail,
+				&result.failure_detail))
 		{
 			result.failure = LiftFailure::SourceBlockContract;
 			return result;
 		}
+		std::set<u32> execution_owners;
+		if (execution_owner_count != 0)
+		{
+			if (!execution_owner_pcs)
+			{
+				result.failure = LiftFailure::SourceBlockContract;
+				result.failure_pc = entry_pc;
+				return result;
+			}
+			execution_owners.insert(execution_owner_pcs,
+				execution_owner_pcs + execution_owner_count);
+			if (!execution_owners.contains(entry_pc))
+			{
+				result.failure = LiftFailure::SourceBlockContract;
+				result.failure_pc = entry_pc;
+				result.failure_detail = LiftFailureDetail::SourceBlockMissingEntry;
+				return result;
+			}
+			for (const u32 pc : execution_owners)
+			{
+				if (!FindSourceBlockContract(result.program.source_blocks, pc))
+				{
+					result.failure = LiftFailure::SourceBlockContract;
+					result.failure_pc = pc;
+					result.failure_detail =
+						LiftFailureDetail::SourceBlockMissingLeader;
+					return result;
+				}
+			}
+		}
+		const auto execution_owns = [&](u32 pc) {
+			return execution_owners.empty() || execution_owners.contains(pc);
+		};
 
 		std::set<u32> leaders = {entry_pc};
 		std::map<u32, RawBlock> raw_blocks;
+		std::map<u32, DirectCallContract> direct_calls;
 		for (u32 pass = 0; pass <= options.max_blocks; pass++)
 		{
 			const size_t old_leader_count = leaders.size();
 			raw_blocks.clear();
+			direct_calls.clear();
 			std::deque<u32> pending = {entry_pc};
 			std::set<u32> visited;
 
@@ -2654,9 +4472,10 @@ namespace VitaEE::RegionIR
 				}
 
 				RawBlock raw{};
-				if (!ScanRawBlock(source_base_pc, result.program.source_words,
+				if (!ScanRawBlock(result.program.source_spans,
 						result.program.source_blocks, leaders, pc, options, &raw,
-						&result.failure, &result.failure_pc))
+						&result.failure, &result.failure_pc,
+						&result.failure_detail))
 				{
 					return result;
 				}
@@ -2668,29 +4487,84 @@ namespace VitaEE::RegionIR
 						raw.branch_pc + 2 * sizeof(u32)};
 					for (const u32 target : targets)
 					{
-						if (ContainsPc(source_base_pc, source_word_count, target))
+						if (execution_owns(target) &&
+							ContainsPc(result.program.source_spans, target) &&
+							(result.program.source_blocks.empty() ||
+							 FindSourceBlockContract(result.program.source_blocks,
+								target)))
 						{
 							leaders.insert(target);
 							pending.push_back(target);
 						}
 					}
 				}
-				else if (raw.control_kind == RawControlKind::StaticJump ||
-						 raw.control_kind == RawControlKind::RegisterJump)
+				else if (raw.control_kind == RawControlKind::StaticJump)
 				{
-					// Jumps are complete Region IR control units, but do not recursively
-					// pull a call/jump target into this first bounded CFG. A static jump
-					// may still link to a target already owned through conditional
-					// control; a register target always returns to dispatch. Wider
-					// call/return construction belongs to the profiled reducible-CFG
-					// phase and must not turn a useful prefix into a whole-region
-					// block/overlap failure.
+					const u32 static_target =
+						JumpTarget(raw.branch_pc, raw.branch_opcode);
+					// A source-attested J is ordinary intraprocedural control flow. The
+					// old single-span lifter left every static jump external because JAL
+					// needs a separately proven return contract; that also prevented a
+					// natural loop from spanning disjoint immutable source blocks. J has
+					// no link-register effect, so an exact target already present in the
+					// bounded source/contract set is safe to traverse like a branch edge.
+					const bool internal_jump = (raw.branch_opcode >> 26) == 0x02 &&
+						execution_owns(static_target) &&
+						ContainsPc(result.program.source_spans, static_target) &&
+						FindSourceBlockContract(result.program.source_blocks,
+							static_target);
+					if (internal_jump)
+					{
+						leaders.insert(static_target);
+						pending.push_back(static_target);
+					}
+					else
+					{
+						DirectCallContract call{};
+						const u32 return_pc = raw.branch_pc + 2 * sizeof(u32);
+						const u32 callee_pc =
+							JumpTarget(raw.branch_pc, raw.branch_opcode);
+						bool unique = execution_owns(callee_pc) &&
+							execution_owns(return_pc) && DescribeDirectCall(
+							result.program.source_spans,
+							result.program.source_blocks, raw, options, &call,
+							execution_owners.empty() ? nullptr : &execution_owners) &&
+							direct_calls.size() < options.max_direct_calls;
+						for (const auto& [other_pc, other] : direct_calls)
+						{
+							(void)other_pc;
+							// Several call sites may share one immutable callee/JR pair.
+							// Their link values and return blocks must remain distinct,
+							// while a shared callee must identify the same JR source.
+							unique &= other.call_pc != call.call_pc &&
+								other.return_pc != call.return_pc &&
+								(other.callee_pc != call.callee_pc ||
+								 other.return_jump_pc == call.return_jump_pc) &&
+								(other.return_jump_pc != call.return_jump_pc ||
+								 other.callee_pc == call.callee_pc);
+						}
+						if (unique)
+						{
+							direct_calls.emplace(call.call_pc, call);
+							leaders.insert(call.callee_pc);
+							leaders.insert(call.return_pc);
+							pending.push_back(call.callee_pc);
+							pending.push_back(call.return_pc);
+						}
+					}
+					// Other jumps remain complete external control units. We never
+					// recursively absorb arbitrary jump targets or unproven returns.
 				}
-				else if ((leaders.contains(raw.transfer_pc) ||
+				else if (raw.control_kind == RawControlKind::RegisterJump)
+				{
+					// A register target is external unless it is the exact callee return
+					// paired with an admitted direct-call contract above.
+				}
+				else if (execution_owns(raw.transfer_pc) &&
+						(leaders.contains(raw.transfer_pc) ||
 							 FindSourceBlockContract(result.program.source_blocks,
 								raw.transfer_pc)) &&
-						 ContainsPc(source_base_pc, source_word_count,
-							 raw.transfer_pc))
+						 ContainsPc(result.program.source_spans, raw.transfer_pc))
 				{
 					leaders.insert(raw.transfer_pc);
 					pending.push_back(raw.transfer_pc);
@@ -2711,8 +4585,15 @@ namespace VitaEE::RegionIR
 		if (raw_blocks.empty() || raw_blocks.size() > options.max_blocks)
 		{
 			result.failure = LiftFailure::InternalError;
+			result.internal_stage = LiftInternalStage::RawBlockSet;
 			result.failure_pc = entry_pc;
 			return result;
+		}
+		result.program.direct_calls.reserve(direct_calls.size());
+		for (const auto& [call_pc, call] : direct_calls)
+		{
+			(void)call_pc;
+			result.program.direct_calls.push_back(call);
 		}
 
 		std::set<u32> source_owners;
@@ -2759,6 +4640,14 @@ namespace VitaEE::RegionIR
 		for (const auto& [pc, raw] : raw_blocks)
 		{
 			Block& block = result.program.blocks[block_indices.at(pc)];
+			std::vector<const DirectCallContract*> direct_returns;
+			for (const DirectCallContract& call : result.program.direct_calls)
+			{
+				if (call.return_jump_pc == raw.branch_pc)
+				{
+					direct_returns.push_back(&call);
+				}
+			}
 			const SourceBlockContract* source_contract =
 				FindSourceBlockContract(result.program.source_blocks, block.pc);
 			const bool event_horizon_check = !source_contract ||
@@ -2776,6 +4665,7 @@ namespace VitaEE::RegionIR
 						body_raw_cycles))
 				{
 					result.failure = LiftFailure::InternalError;
+					result.internal_stage = LiftInternalStage::Instruction;
 					result.failure_pc = instruction.pc;
 					return result;
 				}
@@ -2806,6 +4696,7 @@ namespace VitaEE::RegionIR
 					if (condition == INVALID_VALUE)
 					{
 						result.failure = LiftFailure::InternalError;
+						result.internal_stage = LiftInternalStage::BranchCondition;
 						result.failure_pc = raw.branch_pc;
 						return result;
 					}
@@ -2849,6 +4740,7 @@ namespace VitaEE::RegionIR
 						body_raw_cycles))
 				{
 					result.failure = LiftFailure::InternalError;
+					result.internal_stage = LiftInternalStage::DelaySlot;
 					result.failure_pc = raw.branch_pc;
 					return result;
 				}
@@ -2922,9 +4814,28 @@ namespace VitaEE::RegionIR
 				block.terminator.kind = TerminatorKind::RegisterJump;
 				block.terminator.branch_pc = raw.branch_pc;
 				block.terminator.delay_slot_pc = raw.delay.pc;
-				block.terminator.taken = builder.MakeRegisterTransfer(
-					state, register_target, ExitReason::RegionBoundary,
+				u32 return_block = INVALID_BLOCK;
+				u32 return_pc = 0;
+				block.terminator.taken = builder.MakeRegisterTransfer(state,
+					register_target, ExitReason::RegionBoundary,
 					event_horizon_check);
+				for (const DirectCallContract* direct_return : direct_returns)
+				{
+					const auto found = block_indices.find(direct_return->return_pc);
+					if (found == block_indices.end() ||
+						state.gpr[31] != block.parameters.gpr[31])
+					{
+						result.failure = LiftFailure::DirectCallContract;
+						result.failure_pc = raw.branch_pc;
+						return result;
+					}
+					return_block = found->second;
+					return_pc = direct_return->return_pc;
+					block.terminator.register_targets.push_back(
+						builder.MakeRegisterTransfer(state, register_target,
+							ExitReason::RegionBoundary, event_horizon_check,
+							return_block, return_pc));
+				}
 			}
 			else
 			{
@@ -2951,6 +4862,8 @@ namespace VitaEE::RegionIR
 		if (!verified)
 		{
 			result.failure = LiftFailure::InternalError;
+			result.internal_stage = LiftInternalStage::Verification;
+			result.verify_failure = verified.failure;
 			result.failure_pc = verified.block < result.program.blocks.size() ? result.program.blocks[verified.block].pc : entry_pc;
 		}
 		return result;
@@ -2961,8 +4874,17 @@ namespace VitaEE::RegionIR
 	{
 		// Semantic/adversarial and source-coverage fixtures may remain unattested.
 		// This overload cannot authorize future product execution.
-		return LiftInternal(source_base_pc, source_words, source_word_count,
-			nullptr, 0, entry_pc, options);
+		if (!source_words || source_word_count == 0)
+		{
+			LiftResult result{};
+			result.failure = LiftFailure::InvalidSource;
+			result.failure_pc = source_base_pc;
+			return result;
+		}
+		SourceSpan span{};
+		span.base_pc = source_base_pc;
+		span.words.assign(source_words, source_words + source_word_count);
+		return LiftInternal(&span, 1, nullptr, 0, entry_pc, options);
 	}
 
 	LiftResult LiftWithSourceBlocks(u32 source_base_pc, const u32* source_words,
@@ -2976,35 +4898,129 @@ namespace VitaEE::RegionIR
 			result.failure_pc = entry_pc;
 			return result;
 		}
-		return LiftInternal(source_base_pc, source_words, source_word_count,
-			source_blocks, source_block_count, entry_pc, options);
+		if (!source_words || source_word_count == 0)
+		{
+			LiftResult result{};
+			result.failure = LiftFailure::InvalidSource;
+			result.failure_pc = source_base_pc;
+			return result;
+		}
+		SourceSpan span{};
+		span.base_pc = source_base_pc;
+		span.words.assign(source_words, source_words + source_word_count);
+		return LiftInternal(&span, 1, source_blocks, source_block_count,
+			entry_pc, options);
+	}
+
+	LiftResult LiftWithSourceSpans(const SourceSpan* source_spans,
+		u32 source_span_count, const SourceBlockContract* source_blocks,
+		u32 source_block_count, u32 entry_pc, const LiftOptions& options,
+		const u32* execution_owner_pcs, u32 execution_owner_count)
+	{
+		if (!source_blocks || source_block_count == 0)
+		{
+			LiftResult result{};
+			result.failure = LiftFailure::SourceBlockContract;
+			result.failure_pc = entry_pc;
+			return result;
+		}
+		return LiftInternal(source_spans, source_span_count, source_blocks,
+			source_block_count, entry_pc, options, execution_owner_pcs,
+			execution_owner_count);
+	}
+
+	bool ProgramContainsPc(const Program& program, u32 pc)
+	{
+		return ContainsPc(program.source_spans, pc);
+	}
+
+	bool ReadProgramSourceWord(const Program& program, u32 pc, u32* word)
+	{
+		if (!word || !ContainsPc(program.source_spans, pc))
+			return false;
+		*word = ReadSourceWord(program.source_spans, pc);
+		return true;
+	}
+
+	u32 ProgramSourceInstructionCount(const Program& program)
+	{
+		u64 count = 0;
+		for (const SourceSpan& span : program.source_spans)
+			count += span.words.size();
+		return count <= UINT32_MAX ? static_cast<u32>(count) : UINT32_MAX;
+	}
+
+	bool HasExhaustiveDirectReturnTargets(const Program& program, u32 block_index)
+	{
+		if (block_index >= program.blocks.size())
+			return false;
+		const Block& block = program.blocks[block_index];
+		if (block.terminator.kind != TerminatorKind::RegisterJump ||
+			block.terminator.register_targets.empty())
+		{
+			return false;
+		}
+
+		u32 matching_calls = 0;
+		for (const DirectCallContract& call : program.direct_calls)
+		{
+			if (call.return_jump_pc != block.terminator.branch_pc)
+				continue;
+			matching_calls++;
+			u32 matches = 0;
+			for (const Transfer& target : block.terminator.register_targets)
+			{
+				matches += target.register_target_proven &&
+					target.proven_register_target_pc == call.return_pc &&
+					target.target_block < program.blocks.size() &&
+					program.blocks[target.target_block].pc == call.return_pc;
+			}
+			if (matches != 1)
+				return false;
+		}
+		if (matching_calls == 0 ||
+			matching_calls != block.terminator.register_targets.size())
+		{
+			return false;
+		}
+		for (const Transfer& target : block.terminator.register_targets)
+		{
+			u32 matches = 0;
+			for (const DirectCallContract& call : program.direct_calls)
+			{
+				matches += call.return_jump_pc == block.terminator.branch_pc &&
+					target.register_target_proven &&
+					target.proven_register_target_pc == call.return_pc;
+			}
+			if (matches != 1)
+				return false;
+		}
+		return true;
 	}
 
 	VerifyResult Verify(const Program& program)
 	{
+		std::string source_span_detail;
 		if (program.blocks.empty() || program.value_count == 0 ||
 			program.blocks.size() > program.options.max_blocks ||
-			program.source_words.empty() ||
-			program.source_words.size() > program.options.max_source_instructions ||
+			!ValidateSourceSpans(program.source_spans, program.options, nullptr,
+				&source_span_detail) ||
 			program.options.max_blocks == 0 ||
 			program.options.max_source_instructions == 0 ||
-			program.options.cycle_factor < 1 || program.options.cycle_factor > 2 ||
-			(program.source_base_pc & 3u) != 0 ||
-			static_cast<u64>(program.source_base_pc) +
-					static_cast<u64>(program.source_words.size()) * sizeof(u32) >
-				static_cast<u64>(UINT32_MAX) + 1)
+			program.options.cycle_factor < 1 || program.options.cycle_factor > 2)
 		{
 			return Fail(VerifyFailure::InvalidProgram, INVALID_BLOCK, UINT32_MAX,
-				"invalid region or lift options");
+				source_span_detail.empty() ? "invalid region or lift options" :
+					std::move(source_span_detail));
 		}
 		if (program.entry_block >= program.blocks.size())
 			return Fail(VerifyFailure::InvalidEntry, program.entry_block, UINT32_MAX,
 				"entry block is outside the CFG");
 		std::string source_contract_detail;
-		if (!ValidateSourceBlockContracts(program.source_base_pc,
-				program.source_words, program.source_blocks,
+		if (!ValidateSourceBlockContracts(program.source_spans,
+				program.source_blocks,
 				program.blocks[program.entry_block].pc, program.options,
-				nullptr, &source_contract_detail))
+				nullptr, &source_contract_detail, nullptr))
 		{
 			return Fail(VerifyFailure::SourceBlockContract, program.entry_block,
 				UINT32_MAX, std::move(source_contract_detail));
@@ -3045,26 +5061,183 @@ namespace VitaEE::RegionIR
 		if (std::find(seen.begin(), seen.end(), false) != seen.end())
 			return Fail(VerifyFailure::ValueIdMismatch, INVALID_BLOCK, UINT32_MAX,
 				"value IDs are not dense");
+		if (program.direct_calls.size() > program.options.max_direct_calls)
+		{
+			return Fail(VerifyFailure::DirectCallContract, INVALID_BLOCK, UINT32_MAX,
+				"direct-call count exceeds the configured semantic bound");
+		}
+		std::set<u32> direct_call_pcs;
+		std::set<u32> direct_return_pcs;
+		std::map<u32, u32> direct_return_jump_owners;
+		std::map<u32, u32> expected_callee_callers;
+		for (const DirectCallContract& call : program.direct_calls)
+		{
+			const auto callee_found = pc_to_block.find(call.callee_pc);
+			const auto return_found = pc_to_block.find(call.return_pc);
+			const auto return_block_found = std::find_if(program.blocks.begin(),
+				program.blocks.end(), [&](const Block& block) {
+					return block.terminator.branch_pc == call.return_jump_pc;
+				});
+			const auto caller_found = std::find_if(program.blocks.begin(),
+				program.blocks.end(), [&](const Block& block) {
+					return block.terminator.branch_pc == call.call_pc;
+				});
+			u32 call_opcode = 0;
+			u32 return_opcode = 0;
+			if (!direct_call_pcs.insert(call.call_pc).second ||
+				!direct_return_pcs.insert(call.return_pc).second ||
+				caller_found == program.blocks.end() ||
+				callee_found == pc_to_block.end() ||
+				return_found == pc_to_block.end() ||
+				return_block_found == program.blocks.end() ||
+				call.call_pc > UINT32_MAX - 2 * sizeof(u32) ||
+				call.return_pc != call.call_pc + 2 * sizeof(u32) ||
+				!ReadProgramSourceWord(program, call.call_pc, &call_opcode) ||
+				!ReadProgramSourceWord(program, call.return_jump_pc, &return_opcode) ||
+				(call_opcode >> 26) != 0x03 ||
+				JumpTarget(call.call_pc, call_opcode) != call.callee_pc ||
+				(return_opcode >> 26) != 0 ||
+				(return_opcode & 0x3fu) != 0x08 || RS(return_opcode) != 31)
+			{
+				return Fail(VerifyFailure::DirectCallContract, INVALID_BLOCK,
+					UINT32_MAX,
+					"direct-call source, target, return, or uniqueness proof is invalid");
+			}
+			const auto return_owner =
+				direct_return_jump_owners.emplace(call.return_jump_pc, call.callee_pc);
+			if (!return_owner.second && return_owner.first->second != call.callee_pc)
+			{
+				return Fail(VerifyFailure::DirectCallContract, INVALID_BLOCK,
+					UINT32_MAX, "one leaf-return instruction belongs to two callees");
+			}
+
+			const u32 caller_index = static_cast<u32>(
+				caller_found - program.blocks.begin());
+			const Block& caller = *caller_found;
+			const u32 return_block_index = static_cast<u32>(
+				return_block_found - program.blocks.begin());
+			const Block& return_block = *return_block_found;
+			const auto internal_return = std::find_if(
+				return_block.terminator.register_targets.begin(),
+				return_block.terminator.register_targets.end(),
+				[&](const Transfer& transfer) {
+					return transfer.target_block == return_found->second &&
+						transfer.register_target_proven &&
+						transfer.proven_register_target_pc == call.return_pc;
+				});
+
+			// Mechanically prove that every internal path from the callee entry reaches
+			// its attested return block without changing r31.  This admits reducible
+			// prologue/loop/tail routines while retaining the exact link-register
+			// invariant previously obtained only from a one-block leaf.
+			std::deque<u32> pending_callee = {callee_found->second};
+			std::set<u32> visited_callee;
+			bool complete_callee = true;
+			while (!pending_callee.empty() && complete_callee)
+			{
+				const u32 block_index = pending_callee.front();
+				pending_callee.pop_front();
+				if (!visited_callee.insert(block_index).second)
+					continue;
+				const Block& block = program.blocks[block_index];
+				if (block_index == return_block_index)
+				{
+					complete_callee =
+						block.terminator.kind == TerminatorKind::RegisterJump &&
+						block.terminator.branch_pc == call.return_jump_pc &&
+						block.terminator.taken.state.gpr[31] ==
+							block.parameters.gpr[31];
+					continue;
+				}
+
+				u32 internal_successors = 0;
+				auto inspect_transfer = [&](const Transfer& transfer, u8) {
+					if (transfer.target_block == INVALID_BLOCK ||
+						transfer.state.gpr[31] != block.parameters.gpr[31])
+					{
+						complete_callee = false;
+						return false;
+					}
+					internal_successors++;
+					pending_callee.push_back(transfer.target_block);
+					return true;
+				};
+				complete_callee =
+					block.terminator.kind != TerminatorKind::RegisterJump &&
+					VisitInternalTransfers(block.terminator, inspect_transfer) &&
+					internal_successors != 0;
+			}
+			complete_callee &= visited_callee.contains(return_block_index);
+			if (caller.terminator.kind != TerminatorKind::Jump ||
+				caller.terminator.taken.target_block != callee_found->second ||
+				internal_return == return_block.terminator.register_targets.end() ||
+				!complete_callee)
+			{
+				return Fail(VerifyFailure::DirectCallContract, caller_index,
+					UINT32_MAX,
+					"direct-call IR edges or unchanged r31 return proof disagree");
+			}
+
+			expected_callee_callers[call.callee_pc]++;
+		}
+		for (const auto& [callee_pc, expected_callers] : expected_callee_callers)
+		{
+			const u32 callee_index = pc_to_block.at(callee_pc);
+			u32 incoming_callee_edges = 0;
+			for (const Block& source : program.blocks)
+			{
+				incoming_callee_edges +=
+					source.terminator.taken.target_block == callee_index;
+				if (source.terminator.kind == TerminatorKind::Branch)
+				{
+					incoming_callee_edges +=
+						source.terminator.not_taken.target_block == callee_index;
+				}
+				for (const Transfer& target : source.terminator.register_targets)
+					incoming_callee_edges += target.target_block == callee_index;
+			}
+			const auto direct_call = std::find_if(program.direct_calls.begin(),
+				program.direct_calls.end(), [&](const DirectCallContract& call) {
+					return call.callee_pc == callee_pc;
+				});
+			const auto return_owner = direct_call == program.direct_calls.end() ?
+				program.blocks.end() : std::find_if(program.blocks.begin(),
+					program.blocks.end(), [&](const Block& block) {
+						return block.terminator.branch_pc ==
+							direct_call->return_jump_pc;
+					});
+			if (incoming_callee_edges != expected_callers ||
+				return_owner == program.blocks.end() ||
+				return_owner->terminator.register_targets.size() != expected_callers)
+			{
+				return Fail(VerifyFailure::DirectCallContract, callee_index,
+					UINT32_MAX,
+					"shared direct-call callers and return targets disagree");
+			}
+		}
 
 		auto type_is = [&](ValueId value, ValueType type) {
 			return value < types.size() && types[value] == type;
 		};
 		auto source_word_matches = [&](const SourceInstruction& source) {
-			return ContainsPc(program.source_base_pc,
-					   static_cast<u32>(program.source_words.size()),
-					   source.pc) &&
-			       ReadSourceWord(program.source_base_pc, program.source_words,
-					   source.pc) == source.opcode;
+			return ContainsPc(program.source_spans, source.pc) &&
+			       ReadSourceWord(program.source_spans, source.pc) == source.opcode;
 		};
 
 		for (u32 block_index = 0; block_index < program.blocks.size();
 			 block_index++)
 		{
 			const Block& block = program.blocks[block_index];
+			auto direct_return_for_pc = [&](u32 return_pc) {
+				return std::find_if(program.direct_calls.begin(),
+					program.direct_calls.end(), [&](const DirectCallContract& call) {
+						return call.return_jump_pc == block.terminator.branch_pc &&
+							call.return_pc == return_pc;
+					});
+			};
 			const SourceBlockContract* source_contract =
 				FindSourceBlockContract(program.source_blocks, block.pc);
-			if (!ContainsPc(program.source_base_pc,
-					static_cast<u32>(program.source_words.size()), block.pc))
+			if (!ContainsPc(program.source_spans, block.pc))
 			{
 				return Fail(VerifyFailure::SourceMismatch, block_index, UINT32_MAX,
 					"block entry is outside the immutable source image");
@@ -3076,6 +5249,41 @@ namespace VitaEE::RegionIR
 			{
 				return Fail(VerifyFailure::ControlFlowMismatch, block_index, UINT32_MAX,
 					"block has an invalid terminator kind");
+			}
+			if (block.terminator.kind != TerminatorKind::RegisterJump &&
+				!block.terminator.register_targets.empty())
+			{
+				return Fail(VerifyFailure::DirectCallContract, block_index,
+					UINT32_MAX,
+					"non-register terminator carries internal register targets");
+			}
+			if (block.terminator.kind == TerminatorKind::RegisterJump)
+			{
+				if (block.terminator.register_targets.size() >
+						program.options.max_direct_calls ||
+					block.terminator.taken.register_target_proven ||
+					block.terminator.taken.proven_register_target_pc != 0)
+				{
+					return Fail(VerifyFailure::DirectCallContract, block_index,
+						UINT32_MAX,
+						"register target set exceeds its bound or forges the unmatched edge");
+				}
+				std::set<u32> proven_pcs;
+				std::set<u32> proven_blocks;
+				for (const Transfer& target : block.terminator.register_targets)
+				{
+					if (target.target_block == INVALID_BLOCK ||
+						!target.register_target_proven ||
+						target.proven_register_target_pc == 0 ||
+						!proven_pcs.insert(
+							target.proven_register_target_pc).second ||
+						!proven_blocks.insert(target.target_block).second)
+					{
+						return Fail(VerifyFailure::DirectCallContract, block_index,
+							UINT32_MAX,
+							"register return targets are absent, external, or ambiguous");
+					}
+				}
 			}
 			if (block.nodes.size() < PARAMETER_COUNT)
 				return Fail(VerifyFailure::ParameterContract, block_index, UINT32_MAX,
@@ -3089,15 +5297,21 @@ namespace VitaEE::RegionIR
 				                           slot < FPR_PARAMETER_BASE + FPR_COUNT;
 				const bool vu0_vf_parameter = slot >= VU0_VF_PARAMETER_BASE &&
 				                              slot < VU0_VF_PARAMETER_BASE + VU0_VF_COUNT;
+				const bool vu0_vi_parameter = slot >= VU0_VI_PARAMETER_BASE &&
+				                              slot < VU0_VI_PARAMETER_BASE + VU0_VI_COUNT;
+				const bool vu0_micro_flag_parameter =
+					slot >= VU0_MICRO_MACFLAG_PARAMETER_BASE &&
+					slot < VU0_MICRO_STATUSFLAG_PARAMETER_BASE + 4;
 				const bool i32_parameter = slot == SA_PARAMETER ||
 				                           slot == FCR0_PARAMETER ||
 				                           slot == FCR31_PARAMETER ||
 				                           slot == ACC_FLAG_PARAMETER ||
 				                           slot == VU0_MACFLAG_PARAMETER ||
 				                           slot == VU0_STATUSFLAG_PARAMETER ||
-				                           slot == VU0_VI_MAC_PARAMETER ||
-				                           slot == VU0_VI_STATUS_PARAMETER ||
-				                           slot == VU0_VPU_STAT_PARAMETER;
+				                           slot == VU0_CLIPFLAG_PARAMETER ||
+					                           slot == VU0_Q_PARAMETER ||
+				                           vu0_vi_parameter ||
+				                           vu0_micro_flag_parameter;
 				const ValueType expected_type = i32_parameter ? ValueType::I32 :
 					fpr_parameter ? ValueType::F32Bits :
 					slot == ACC_PARAMETER ? ValueType::F32Bits :
@@ -3139,12 +5353,30 @@ namespace VitaEE::RegionIR
 					expected.vu0_macflag = parameter.id;
 				else if (slot == VU0_STATUSFLAG_PARAMETER)
 					expected.vu0_statusflag = parameter.id;
-				else if (slot == VU0_VI_MAC_PARAMETER)
-					expected.vu0_vi_mac = parameter.id;
-				else if (slot == VU0_VI_STATUS_PARAMETER)
-					expected.vu0_vi_status = parameter.id;
-				else if (slot == VU0_VPU_STAT_PARAMETER)
-					expected.vu0_vpu_stat = parameter.id;
+				else if (slot == VU0_CLIPFLAG_PARAMETER)
+					expected.vu0_clipflag = parameter.id;
+				else if (slot == VU0_Q_PARAMETER)
+					expected.vu0_q = parameter.id;
+				else if (vu0_vi_parameter)
+					expected.vu0_vi[slot - VU0_VI_PARAMETER_BASE] = parameter.id;
+				else if (slot >= VU0_MICRO_MACFLAG_PARAMETER_BASE &&
+					slot < VU0_MICRO_MACFLAG_PARAMETER_BASE + 4)
+				{
+					expected.vu0_micro_macflags[
+						slot - VU0_MICRO_MACFLAG_PARAMETER_BASE] = parameter.id;
+				}
+				else if (slot >= VU0_MICRO_CLIPFLAG_PARAMETER_BASE &&
+					slot < VU0_MICRO_CLIPFLAG_PARAMETER_BASE + 4)
+				{
+					expected.vu0_micro_clipflags[
+						slot - VU0_MICRO_CLIPFLAG_PARAMETER_BASE] = parameter.id;
+				}
+				else if (slot >= VU0_MICRO_STATUSFLAG_PARAMETER_BASE &&
+					slot < VU0_MICRO_STATUSFLAG_PARAMETER_BASE + 4)
+				{
+					expected.vu0_micro_statusflags[
+						slot - VU0_MICRO_STATUSFLAG_PARAMETER_BASE] = parameter.id;
+				}
 				else if (slot == CYCLE_PARAMETER)
 					expected.cycle = parameter.id;
 				else
@@ -3277,20 +5509,38 @@ namespace VitaEE::RegionIR
 			std::map<u32, u32> addi_overflow_count;
 			std::map<u32, ValueId> addi_overflow_condition;
 			std::map<u32, u32> addi_guard_count;
+			std::map<u32, u32> cop1_exception_count;
 			std::map<u32, u32> addi_gpr_bind_count;
 			std::vector<bool> guarded_exit_seen(block.guarded_exits.size(), false);
+			std::vector<bool> observer_exit_seen(block.observer_exits.size(), false);
+			std::vector<bool> memory_exit_seen(block.memory_exits.size(), false);
 			std::map<u32, u32> extended_gpr_bind_count;
+			std::map<u32, u32> integer_multiply_gpr_bind_count;
+			std::map<u32, ValueId> integer_multiply_result;
 			std::map<u32, u32> pure_mmi_gpr_bind_count;
 			std::map<u32, u32> pure_cop1_gpr_bind_count;
 			std::map<u32, u32> fpr_bind_count;
 			std::map<u32, u32> vu0_idle_guard_count;
 			std::map<u32, ValueId> vu0_idle_guard_value;
+			std::map<u32, u32> vu0_control_read_gpr_bind_count;
+			std::map<u32, ValueId> vu0_control_write_result;
+			std::map<u32, ValueId> vu0_denormalized_status_result;
+			std::map<u32, u32> vu0_vi_bind_count;
+			std::map<u32, u32> vu0_clipflag_bind_count;
+			std::map<u32, u32> vu0_micro_status_bind_count;
+			std::map<u32, u32> vu0_transfer_gpr_bind_count;
 			std::map<u32, u32> vu0_vf_bind_count;
 			std::map<u32, u32> vu0_acc_bind_count;
 			std::map<u32, u32> vu0_macflag_bind_count;
 			std::map<u32, u32> vu0_statusflag_bind_count;
 			std::map<u32, u32> vu0_vi_mac_bind_count;
 			std::map<u32, u32> vu0_vi_status_bind_count;
+			std::map<u32, u32> vu0_q_bind_count;
+			std::map<u32, u32> vu0_vi_q_bind_count;
+			std::map<u32, ValueId> vu0_fdiv_q_result;
+			std::map<u32, ValueId> vu0_fdiv_flags_result;
+			std::map<u32, ValueId> vu0_fdiv_status_result;
+			std::map<u32, ValueId> vu0_fdiv_vi_status_result;
 			std::map<u32, ValueId> vu0_fmac_raw_result;
 			std::map<u32, u32> fcr31_bind_count;
 			std::map<u32, u32> acc_bind_count;
@@ -3468,6 +5718,139 @@ namespace VitaEE::RegionIR
 				       exact_unary(replace->operands[1], Opcode::ExtractLow64,
 						input.gpr[RS(source_opcode)], bind.source_pc);
 			};
+			auto exact_integer_multiply_result = [&](ValueId value,
+				u32 source_opcode, u32 source_pc, const StateMap& input) {
+				const IntegerMultiplyOp multiply = DecodeIntegerMultiply(source_opcode);
+				if (!multiply.valid)
+					return false;
+
+				const Node* product = local_node(value);
+				if (multiply.accumulate)
+				{
+					const Node* sum = product;
+					if (!sum || sum->opcode != Opcode::Add64 ||
+						sum->operand_count != 2 || sum->source_pc != source_pc)
+						return false;
+					product = local_node(sum->operands[1]);
+					const Node* accumulator = local_node(sum->operands[0]);
+					if (!product || !accumulator ||
+						accumulator->opcode != Opcode::Or64 ||
+						accumulator->operand_count != 2 ||
+						accumulator->source_pc != source_pc)
+						return false;
+
+					const Node* lo_extend = local_node(accumulator->operands[0]);
+					const Node* hi_shift = local_node(accumulator->operands[1]);
+					const Node* hi_extend = hi_shift && hi_shift->operand_count == 1 ?
+						local_node(hi_shift->operands[0]) : nullptr;
+					if (!lo_extend || lo_extend->opcode != Opcode::ZeroExtend32To64 ||
+						lo_extend->operand_count != 1 ||
+						lo_extend->source_pc != source_pc || !hi_shift ||
+						hi_shift->opcode != Opcode::ShiftLeft64 ||
+						hi_shift->operand_count != 1 || hi_shift->immediate != 32 ||
+						hi_shift->source_pc != source_pc ||
+						!hi_extend || hi_extend->opcode != Opcode::ZeroExtend32To64 ||
+						hi_extend->operand_count != 1 ||
+						hi_extend->source_pc != source_pc)
+						return false;
+
+					auto exact_lane_word = [&](ValueId word, ValueId hilo) {
+						if (!multiply.upper_pipeline)
+							return exact_unary(word, Opcode::ExtractLow32, hilo,
+								source_pc);
+						const Node* truncate = local_node(word);
+						return truncate && truncate->opcode == Opcode::Truncate64To32 &&
+						       truncate->operand_count == 1 &&
+						       truncate->source_pc == source_pc &&
+						       exact_unary(truncate->operands[0], Opcode::ExtractHigh64,
+							   hilo, source_pc);
+					};
+					if (!exact_lane_word(lo_extend->operands[0], input.lo) ||
+						!exact_lane_word(hi_extend->operands[0], input.hi))
+						return false;
+				}
+
+				const Opcode expected_product = multiply.signed_multiply ?
+					Opcode::MultiplySigned32 : Opcode::MultiplyUnsigned32;
+				return product && product->opcode == expected_product &&
+				       product->operand_count == 2 && product->source_pc == source_pc &&
+				       exact_unary(product->operands[0], Opcode::ExtractLow32,
+					   input.gpr[RS(source_opcode)], source_pc) &&
+				       exact_unary(product->operands[1], Opcode::ExtractLow32,
+					   input.gpr[RT(source_opcode)], source_pc);
+			};
+			auto exact_integer_multiply_lane = [&](ValueId value,
+				u32 source_opcode, u32 source_pc, const StateMap& input,
+				bool high_word, ValueId* result) {
+				const Node* extend = local_node(value);
+				if (!extend || extend->opcode != Opcode::SignExtend32To64 ||
+					extend->operand_count != 1 || extend->source_pc != source_pc)
+					return false;
+				const Node* truncate = local_node(extend->operands[0]);
+				if (!truncate || truncate->opcode != Opcode::Truncate64To32 ||
+					truncate->operand_count != 1 || truncate->source_pc != source_pc)
+					return false;
+
+				ValueId raw_result = truncate->operands[0];
+				if (high_word)
+				{
+					const Node* shift = local_node(raw_result);
+					if (!shift || shift->opcode != Opcode::ShiftRightLogical64 ||
+						shift->operand_count != 1 || shift->immediate != 32 ||
+						shift->source_pc != source_pc)
+						return false;
+					raw_result = shift->operands[0];
+				}
+				if (!exact_integer_multiply_result(raw_result, source_opcode,
+						source_pc, input))
+				{
+					return false;
+				}
+				if (result)
+					*result = raw_result;
+				return true;
+			};
+			auto record_integer_multiply_result = [&](u32 source_pc,
+				ValueId value) {
+				const auto [found, inserted] =
+					integer_multiply_result.emplace(source_pc, value);
+				return inserted || found->second == value;
+			};
+			auto exact_integer_multiply_gpr_bind = [&](const Node& bind,
+				u32 source_opcode, const StateMap& input) {
+				const u32 destination = RD(source_opcode);
+				const Node* replace = local_node(bind.operands[0]);
+				if (destination == 0 || bind.immediate != destination || !replace ||
+					replace->opcode != Opcode::ReplaceLow64 ||
+					replace->operand_count != 2 ||
+					replace->operands[0] != input.gpr[destination] ||
+					replace->source_pc != bind.source_pc)
+				{
+					return false;
+				}
+				ValueId result = INVALID_VALUE;
+				return exact_integer_multiply_lane(replace->operands[1],
+						source_opcode, bind.source_pc, input, false, &result) &&
+				       record_integer_multiply_result(bind.source_pc, result);
+			};
+			auto exact_integer_multiply_hilo_bind = [&](const Node& bind,
+				u32 source_opcode, const StateMap& input, bool hi) {
+				const IntegerMultiplyOp multiply = DecodeIntegerMultiply(source_opcode);
+				const Node* replace = local_node(bind.operands[0]);
+				const Opcode expected_replace = multiply.upper_pipeline ?
+					Opcode::ReplaceHigh64 : Opcode::ReplaceLow64;
+				if (!multiply.valid || !replace || replace->opcode != expected_replace ||
+					replace->operand_count != 2 ||
+					replace->operands[0] != (hi ? input.hi : input.lo) ||
+					replace->source_pc != bind.source_pc)
+				{
+					return false;
+				}
+				ValueId result = INVALID_VALUE;
+				return exact_integer_multiply_lane(replace->operands[1],
+						source_opcode, bind.source_pc, input, hi, &result) &&
+				       record_integer_multiply_result(bind.source_pc, result);
+			};
 			auto exact_move_to_sa = [&](const Node& bind, u32 source_opcode,
 				const StateMap& input) {
 				if (!IsMoveToSa(source_opcode))
@@ -3569,6 +5952,44 @@ namespace VitaEE::RegionIR
 				return exact_binary(bind.operands[0], operation,
 					input.gpr[RS(source_opcode)], input.gpr[RT(source_opcode)],
 					bind.source_pc);
+			};
+			auto exact_packed_mmi_gpr_bind = [&](const Node& bind,
+				u32 source_opcode, const StateMap& input) {
+				PackedBinaryKind kind{};
+				const u32 destination = RD(source_opcode);
+				if (!DecodePackedBinaryMmi(source_opcode, &kind) || destination == 0 ||
+					bind.immediate != destination)
+				{
+					return false;
+				}
+				const Node* operation = local_node(bind.operands[0]);
+				return operation && operation->opcode == Opcode::PackedBinary128 &&
+				       operation->type == ValueType::I128 &&
+				       operation->operand_count == 2 &&
+				       operation->operands[0] == input.gpr[RS(source_opcode)] &&
+				       operation->operands[1] == input.gpr[RT(source_opcode)] &&
+				       operation->immediate == static_cast<u32>(kind) &&
+				       operation->source_pc == bind.source_pc;
+			};
+			auto exact_packed_shift_gpr_bind = [&](const Node& bind,
+				u32 source_opcode, const StateMap& input) {
+				PackedShiftKind kind{};
+				const u32 destination = RD(source_opcode);
+				if (!DecodePackedShiftMmi(source_opcode, &kind) || destination == 0 ||
+					bind.immediate != destination)
+				{
+					return false;
+				}
+				const u32 amount = static_cast<u32>(SA(source_opcode)) &
+					(kind <= PackedShiftKind::RightArithmetic16 ? 0x0fu : 0x1fu);
+				const Node* operation = local_node(bind.operands[0]);
+				return operation && operation->opcode == Opcode::PackedShift128 &&
+				       operation->type == ValueType::I128 &&
+				       operation->operand_count == 1 &&
+				       operation->operands[0] == input.gpr[RT(source_opcode)] &&
+				       operation->immediate == static_cast<u32>(kind) &&
+				       operation->literal == amount &&
+				       operation->source_pc == bind.source_pc;
 			};
 			auto exact_pure_cop1_gpr_bind = [&](const Node& bind, u32 source_opcode,
 				const StateMap& input) {
@@ -3751,41 +6172,73 @@ namespace VitaEE::RegionIR
 			};
 			auto exact_vu0_fmac_raw = [&](ValueId value, u32 source_opcode,
 				u32 source_pc, const StateMap& input) {
-				const Vu0BroadcastFmacOp fmac =
-					DecodeVu0BroadcastFmac(source_opcode);
+				const Vu0FmacOp fmac = DecodeVu0Fmac(source_opcode);
 				const auto guard = vu0_idle_guard_value.find(source_pc);
 				if (!fmac.valid || guard == vu0_idle_guard_value.end())
 					return false;
 
-				const Node* final_raw = local_node(value);
-				const Node* product = final_raw;
-				if (fmac.kind != Vu0BroadcastFmacKind::MultiplyAccumulator)
-				{
-					if (!final_raw || final_raw->opcode != Opcode::Vu0AddRaw ||
-						final_raw->operand_count != 2 ||
-						final_raw->source_pc != source_pc ||
-						!exact_unary(final_raw->operands[0],
-							Opcode::Vu0NormalizeVector, input.vu0_acc, source_pc))
+				auto exact_operand = [&](ValueId operand) {
+					if (fmac.operand == Vu0FmacOperand::ScalarQ)
 					{
-						return false;
+						return exact_unary(operand, Opcode::Vu0BroadcastScalar,
+							input.vu0_vi[22], source_pc);
 					}
-					product = local_node(final_raw->operands[1]);
-				}
-				if (!product || product->opcode != Opcode::Vu0MulRaw ||
-					product->operand_count != 2 || product->source_pc != source_pc ||
-					!exact_unary(product->operands[0], Opcode::Vu0NormalizeVector,
-						guard->second, source_pc))
+					if (fmac.operand == Vu0FmacOperand::Vector)
+					{
+						return exact_unary(operand, Opcode::Vu0NormalizeVector,
+							input.vu0_vf[RT(source_opcode)], source_pc);
+					}
+					const Node* broadcast = local_node(operand);
+					return broadcast && broadcast->opcode == Opcode::Vu0BroadcastLane &&
+					       broadcast->operand_count == 1 &&
+					       broadcast->immediate == fmac.lane &&
+					       broadcast->source_pc == source_pc &&
+					       exact_unary(broadcast->operands[0],
+							Opcode::Vu0NormalizeVector, input.vu0_vf[RT(source_opcode)],
+							source_pc);
+				};
+				auto exact_binary = [&](const Node* raw, Opcode opcode,
+					ValueId left, bool normalized_left) {
+					return raw && raw->opcode == opcode && raw->operand_count == 2 &&
+					       raw->source_pc == source_pc &&
+					       (normalized_left ?
+							exact_unary(raw->operands[0], Opcode::Vu0NormalizeVector,
+								left, source_pc) : raw->operands[0] == left) &&
+					       exact_operand(raw->operands[1]);
+				};
+
+				const Node* const final_raw = local_node(value);
+				switch (fmac.kind)
 				{
-					return false;
+					case Vu0FmacKind::Add:
+						return exact_binary(final_raw, Opcode::Vu0AddRaw,
+							guard->second, true);
+					case Vu0FmacKind::Subtract:
+						return exact_binary(final_raw, Opcode::Vu0SubRaw,
+							guard->second, true);
+					case Vu0FmacKind::Multiply:
+						return exact_binary(final_raw, Opcode::Vu0MulRaw,
+							guard->second, true);
+					case Vu0FmacKind::MultiplyAdd:
+					case Vu0FmacKind::MultiplySubtract:
+					{
+						const Opcode final_opcode =
+							fmac.kind == Vu0FmacKind::MultiplyAdd ?
+								Opcode::Vu0AddRaw : Opcode::Vu0SubRaw;
+						if (!final_raw || final_raw->opcode != final_opcode ||
+							final_raw->operand_count != 2 ||
+							final_raw->source_pc != source_pc ||
+							!exact_unary(final_raw->operands[0],
+								Opcode::Vu0NormalizeVector, input.vu0_acc, source_pc))
+						{
+							return false;
+						}
+						const Node* const product = local_node(final_raw->operands[1]);
+						return exact_binary(product, Opcode::Vu0MulRaw,
+							guard->second, true);
+					}
 				}
-				const Node* broadcast = local_node(product->operands[1]);
-				return broadcast && broadcast->opcode == Opcode::Vu0BroadcastLane &&
-				       broadcast->operand_count == 1 &&
-				       broadcast->immediate == fmac.lane &&
-				       broadcast->source_pc == source_pc &&
-				       exact_unary(broadcast->operands[0],
-						Opcode::Vu0NormalizeVector, input.vu0_vf[RT(source_opcode)],
-						source_pc);
+				return false;
 			};
 			auto exact_vu0_fmac_clamp = [&](ValueId value, ValueId raw,
 				u32 source_opcode, u32 source_pc) {
@@ -3794,6 +6247,49 @@ namespace VitaEE::RegionIR
 				       clamp->operand_count == 1 && clamp->operands[0] == raw &&
 				       clamp->immediate == (RS(source_opcode) & 0x0fu) &&
 				       clamp->source_pc == source_pc;
+			};
+			auto exact_vu0_fdiv_node = [&](ValueId value, Opcode opcode,
+				u32 source_opcode, u32 source_pc, const StateMap& input) {
+				const Vu0FdivOp fdiv = DecodeVu0Fdiv(source_opcode);
+				const auto guard = vu0_idle_guard_value.find(source_pc);
+				const Node* node = local_node(value);
+				if (!fdiv.valid || guard == vu0_idle_guard_value.end() || !node ||
+					node->opcode != opcode || node->type != ValueType::I32 ||
+					node->operand_count != 2 ||
+					node->immediate != EncodeVu0FdivImmediate(fdiv) ||
+					node->literal != 0 || node->source_pc != source_pc)
+				{
+					return false;
+				}
+				const bool sqrt_only = fdiv.kind == Vu0FdivKind::SquareRoot;
+				const u32 fs = RD(source_opcode);
+				const u32 ft = RT(source_opcode);
+				const ValueId expected_guarded = guard->second;
+				const ValueId expected_ft = sqrt_only || fs == ft ?
+					expected_guarded : input.vu0_vf[ft];
+				return node->operands[0] == expected_guarded &&
+				       node->operands[1] == expected_ft;
+			};
+			auto exact_vu0_unary_result = [&](ValueId value, u32 source_opcode,
+				u32 source_pc) {
+				const Vu0UnaryOp unary = DecodeVu0Unary(source_opcode);
+				const auto guard = vu0_idle_guard_value.find(source_pc);
+				if (!unary.valid || guard == vu0_idle_guard_value.end())
+					return false;
+				if (unary.kind == Vu0UnaryKind::Move)
+					return value == guard->second;
+				const Node* convert = local_node(value);
+				Opcode expected_opcode = Opcode::Vu0ConvertIntegerToFloat;
+				if (unary.kind == Vu0UnaryKind::ConvertFixed)
+					expected_opcode = Opcode::Vu0ConvertFixed;
+				else if (unary.kind == Vu0UnaryKind::Rotate32)
+					expected_opcode = Opcode::Vu0Rotate32;
+				return convert && convert->opcode == expected_opcode &&
+				       convert->type == ValueType::VuF32x4Bits &&
+				       convert->operand_count == 1 &&
+				       convert->operands[0] == guard->second &&
+				       convert->immediate == unary.offset && convert->literal == 0 &&
+				       convert->source_pc == source_pc;
 			};
 			auto require_operand = [&](const Node& node, u32 node_index, u32 operand,
 									   ValueType required) -> VerifyResult {
@@ -3887,7 +6383,7 @@ namespace VitaEE::RegionIR
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
-								"no-effect node does not match SYNC/PREF/CACHE source");
+								"no-effect node does not match its decoded source");
 							break;
 						}
 						no_effect_count[node.source_pc]++;
@@ -3910,6 +6406,33 @@ namespace VitaEE::RegionIR
 					case Opcode::BitcastF32BitsToI32:
 						checked = unary(ValueType::F32Bits, ValueType::I32);
 						break;
+					case Opcode::BitcastI128ToVuF32x4Bits:
+					case Opcode::BitcastVuF32x4BitsToI128:
+					{
+						const bool to_vu0 =
+							node.opcode == Opcode::BitcastI128ToVuF32x4Bits;
+						checked = to_vu0 ?
+							unary(ValueType::I128, ValueType::VuF32x4Bits) :
+							unary(ValueType::VuF32x4Bits, ValueType::I128);
+						u32 source_opcode = 0;
+						const Vu0VectorTransferOp transfer =
+							source_opcode_at(node.source_pc, &source_opcode) ?
+								DecodeVu0VectorTransfer(source_opcode) :
+								Vu0VectorTransferOp{};
+						const auto guard = vu0_idle_guard_value.find(node.source_pc);
+						if (checked && (!transfer.valid ||
+							(to_vu0 != (transfer.kind ==
+								Vu0VectorTransferKind::ToVu0)) ||
+							guard == vu0_idle_guard_value.end() ||
+							node.operands[0] != guard->second || node.immediate != 0 ||
+							node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 vector-transfer bitcast does not consume its exact idle-guarded source");
+						}
+						break;
+					}
 					case Opcode::Cop1NormalizeInput:
 					case Opcode::Cop1ClampOuResult:
 					{
@@ -3951,6 +6474,32 @@ namespace VitaEE::RegionIR
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
 								"COP1 raw arithmetic node does not match source");
+						}
+						break;
+					}
+					case Opcode::Cop1ExceptionalOuResult:
+					{
+						checked = unary(ValueType::F32Bits, ValueType::I1);
+						u32 source_opcode = 0;
+						const auto input = source_input_state.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !IsCop1OuArithmetic(source_opcode) ||
+							 input == source_input_state.end() ||
+							 !exact_cop1_ou_raw(node.operands[0], source_opcode,
+								node.source_pc, input->second)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 exceptional predicate does not own the exact final raw result");
+							break;
+						}
+						if (cop1_exception_count[node.source_pc]++ != 0)
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 arithmetic owns more than one exceptional predicate");
+							break;
 						}
 						break;
 					}
@@ -4003,6 +6552,65 @@ namespace VitaEE::RegionIR
 						}
 						break;
 					}
+					case Opcode::Cop1BranchCondition:
+					{
+						checked = unary(ValueType::I32, ValueType::I1);
+						u32 source_opcode = 0;
+						bool branch_on_true = false;
+						const auto input = source_input_state.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeCop1Branch(source_opcode, &branch_on_true) ||
+							 input == source_input_state.end() ||
+							 node.operands[0] != input->second.fcr31 ||
+							 node.immediate != (branch_on_true ? 1u : 0u) ||
+							 node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 branch predicate does not snapshot decoded FCR31.C");
+						}
+						break;
+					}
+					case Opcode::Cop1AbsoluteWord:
+					case Opcode::Cop1NegateWord:
+					{
+						checked = unary(ValueType::F32Bits, ValueType::F32Bits);
+						u32 source_opcode = 0;
+						Cop1UnaryWordKind kind{};
+						const auto input = source_input_state.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeCop1UnaryWord(source_opcode, &kind) ||
+							 node.opcode != Cop1UnaryWordOpcode(kind) ||
+							 input == source_input_state.end() ||
+							 node.operands[0] != input->second.fpr[FS(source_opcode)] ||
+							 node.immediate != 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 unary word transform does not match its decoded source");
+						}
+						break;
+					}
+					case Opcode::Cop1ClearOuFlags:
+					{
+						checked = unary(ValueType::I32, ValueType::I32);
+						u32 source_opcode = 0;
+						const auto input = source_input_state.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeCop1UnaryWord(source_opcode, nullptr) ||
+							 input == source_input_state.end() ||
+							 node.operands[0] != input->second.fcr31 ||
+							 node.immediate != 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"COP1 unary O/U clear does not consume exact entry FCR31");
+						}
+						break;
+					}
 					case Opcode::Cop1ConvertWord:
 					{
 						checked = unary(ValueType::F32Bits, ValueType::F32Bits);
@@ -4047,6 +6655,34 @@ namespace VitaEE::RegionIR
 							checked =
 								Fail(VerifyFailure::OperandNotLocal, block_index, node_index,
 									"zero-extension operand is not a prior local value");
+						break;
+					case Opcode::MultiplySigned32:
+					case Opcode::MultiplyUnsigned32:
+					{
+						checked = binary(ValueType::I32, ValueType::I32,
+							ValueType::I64);
+						u32 source_opcode = 0;
+						const auto input = source_input_state.find(node.source_pc);
+						const IntegerMultiplyOp multiply =
+							source_opcode_at(node.source_pc, &source_opcode) ?
+								DecodeIntegerMultiply(source_opcode) : IntegerMultiplyOp{};
+						if (checked && (!multiply.valid ||
+							(node.opcode == Opcode::MultiplySigned32) !=
+								multiply.signed_multiply ||
+							input == source_input_state.end() ||
+							!exact_unary(node.operands[0], Opcode::ExtractLow32,
+								input->second.gpr[RS(source_opcode)], node.source_pc) ||
+							!exact_unary(node.operands[1], Opcode::ExtractLow32,
+								input->second.gpr[RT(source_opcode)], node.source_pc)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"integer multiply does not match its decoded low-word operands");
+						}
+						break;
+					}
+					case Opcode::Truncate64To32:
+						checked = unary(ValueType::I64, ValueType::I32);
 						break;
 					case Opcode::Add32:
 					case Opcode::Sub32:
@@ -4101,6 +6737,50 @@ namespace VitaEE::RegionIR
 						checked = binary(ValueType::I128, ValueType::I128,
 							ValueType::I128);
 						break;
+					case Opcode::PackedBinary128:
+					{
+						checked = binary(ValueType::I128, ValueType::I128,
+							ValueType::I128);
+						u32 source_opcode = 0;
+						PackedBinaryKind kind{};
+						const auto input = source_input_state.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodePackedBinaryMmi(source_opcode, &kind) ||
+							 node.immediate != static_cast<u32>(kind) ||
+							 node.immediate >= static_cast<u32>(PackedBinaryKind::Count) ||
+							 input == source_input_state.end() ||
+							 node.operands[0] != input->second.gpr[RS(source_opcode)] ||
+							 node.operands[1] != input->second.gpr[RT(source_opcode)]))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"packed MMI operation does not match its decoded lane semantics");
+						}
+						break;
+					}
+					case Opcode::PackedShift128:
+					{
+						checked = unary(ValueType::I128, ValueType::I128);
+						u32 source_opcode = 0;
+						PackedShiftKind kind{};
+						const auto input = source_input_state.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodePackedShiftMmi(source_opcode, &kind) ||
+							 node.immediate != static_cast<u32>(kind) ||
+							 node.immediate >= static_cast<u32>(PackedShiftKind::Count) ||
+							 input == source_input_state.end() ||
+							 node.operands[0] != input->second.gpr[RT(source_opcode)] ||
+							 node.literal != (static_cast<u32>(SA(source_opcode)) &
+								(kind <= PackedShiftKind::RightArithmetic16 ? 0x0fu : 0x1fu))))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"packed shift does not match its decoded lane semantics");
+						}
+						break;
+					}
 					case Opcode::BroadcastLowHalfwordPer64:
 						checked = unary(ValueType::I128, ValueType::I128);
 						break;
@@ -4167,10 +6847,6 @@ namespace VitaEE::RegionIR
 						break;
 					case Opcode::Vu0RequireIdle:
 					{
-						checked = binary(ValueType::I32, ValueType::VuF32x4Bits,
-							ValueType::VuF32x4Bits);
-						if (!checked)
-							break;
 						u32 source_opcode = 0;
 						MemoryAccessKind kind{};
 						const bool have_source =
@@ -4178,16 +6854,89 @@ namespace VitaEE::RegionIR
 						const bool vector_memory = have_source &&
 							DecodeMemoryAccess(source_opcode, &kind) &&
 							IsVu0MemoryAccess(kind);
-						const Vu0BroadcastFmacOp fmac = have_source ?
-							DecodeVu0BroadcastFmac(source_opcode) :
-							Vu0BroadcastFmacOp{};
-						const u32 source_vf = vector_memory ? RT(source_opcode) :
-							RD(source_opcode);
+						const Vu0FmacOp fmac = have_source ?
+							DecodeVu0Fmac(source_opcode) : Vu0FmacOp{};
+						const Vu0FdivOp fdiv = have_source ?
+							DecodeVu0Fdiv(source_opcode) : Vu0FdivOp{};
+						const Vu0UnaryOp unary = have_source ?
+							DecodeVu0Unary(source_opcode) : Vu0UnaryOp{};
+						const Vu0VectorTransferOp vector_transfer = have_source ?
+							DecodeVu0VectorTransfer(source_opcode) :
+							Vu0VectorTransferOp{};
+						const Vu0ControlReadOp control_read = have_source ?
+							DecodeVu0ControlRead(source_opcode) : Vu0ControlReadOp{};
+						const Vu0ControlWriteOp control_write = have_source ?
+							DecodeVu0ControlWrite(source_opcode) : Vu0ControlWriteOp{};
+						NoEffectKind no_effect{};
+						const bool vu0_no_effect = have_source &&
+							DecodeNoEffect(source_opcode, program.options, &no_effect) &&
+							NoEffectRequiresVu0Idle(no_effect);
+						const bool transfer_gpr = vector_transfer.valid &&
+							vector_transfer.kind == Vu0VectorTransferKind::ToVu0 &&
+							RD(source_opcode) != 0;
+						const ValueType guarded_type =
+							(control_read.valid || control_write.valid) ?
+							ValueType::I32 : (transfer_gpr ?
+								ValueType::I128 : ValueType::VuF32x4Bits);
+						checked = binary(ValueType::I32, guarded_type, guarded_type);
+						if (!checked)
+							break;
+						const u32 source_vf = vu0_no_effect ? 0u :
+							(vector_memory ? RT(source_opcode) :
+							 (fdiv.valid && fdiv.kind == Vu0FdivKind::SquareRoot ?
+								RT(source_opcode) : RD(source_opcode)));
+						ValueId expected_guarded = transfer_gpr ?
+							expected.gpr[RT(source_opcode)] : expected.vu0_vf[source_vf];
+						if (control_read.valid)
+						{
+							if (RT(source_opcode) == 0 || control_read.source == 29)
+								expected_guarded = expected.vu0_vi[29];
+							else if (control_read.source == 16)
+								expected_guarded = expected.vu0_vi[16];
+							else if (control_read.source == 17)
+								expected_guarded = expected.vu0_vi[17];
+							else if (control_read.source == 0)
+							{
+								const Node* zero = local_node(node.operands[1]);
+								expected_guarded = node.operands[1];
+								if (!zero || zero->opcode != Opcode::ConstantI32 ||
+									zero->type != ValueType::I32 || zero->operand_count != 0 ||
+									zero->literal != 0 || zero->source_pc != node.source_pc)
+								{
+									checked = Fail(VerifyFailure::SourceMismatch, block_index,
+										node_index,
+										"CFC2 VI0 guard does not consume an exact zero");
+									break;
+								}
+							}
+						}
+						else if (control_write.valid)
+						{
+							const Node* source_low = local_node(node.operands[1]);
+							const auto input = source_input_state.find(node.source_pc);
+							if (!source_low || input == source_input_state.end() ||
+								source_low->opcode != Opcode::ExtractLow32 ||
+								source_low->type != ValueType::I32 ||
+								source_low->operand_count != 1 ||
+								source_low->operands[0] != input->second.gpr[RT(source_opcode)] ||
+								source_low->immediate != 0 || source_low->literal != 0 ||
+								source_low->source_pc != node.source_pc)
+							{
+								checked = Fail(VerifyFailure::SourceMismatch, block_index,
+									node_index,
+									"CTC2 idle guard does not consume the decoded low GPR word");
+								break;
+							}
+							expected_guarded = node.operands[1];
+						}
 						if (!source_opcode_at(node.source_pc, &source_opcode) ||
-							(!vector_memory && !fmac.valid) || node.immediate != 0 ||
+							(!vector_memory && !fmac.valid && !fdiv.valid && !unary.valid &&
+								!vu0_no_effect && !vector_transfer.valid &&
+								!control_read.valid && !control_write.valid) ||
+							node.immediate != 0 ||
 							node.literal != 0 ||
-							node.operands[0] != expected.vu0_vpu_stat ||
-							node.operands[1] != expected.vu0_vf[source_vf] ||
+							node.operands[0] != expected.vu0_vi[29] ||
+							node.operands[1] != expected_guarded ||
 							!vu0_idle_guard_value.emplace(node.source_pc, node.id).second)
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
@@ -4195,7 +6944,180 @@ namespace VitaEE::RegionIR
 								"VU0 idle guard does not consume the decoded live state exactly once");
 							break;
 						}
+
+						size_t observer_index = block.observer_exits.size();
+						for (size_t index = 0; index < block.observer_exits.size(); index++)
+						{
+							if (block.observer_exits[index].operation != node.id)
+								continue;
+							if (observer_index != block.observer_exits.size())
+							{
+								checked = Fail(VerifyFailure::ExitContractMismatch,
+									block_index, node_index,
+									"VU0 idle observer has duplicate fallback transfers");
+								break;
+							}
+							observer_index = index;
+						}
+						if (!checked)
+							break;
+						const auto source = std::find_if(block.source.begin(),
+							block.source.end(), [&](const SourceInstruction& candidate) {
+								return candidate.pc == node.source_pc;
+							});
+						const bool delay_slot = source != block.source.end() &&
+							source->delay_slot;
+						const auto input = source_input_state.find(node.source_pc);
+						if (observer_index == block.observer_exits.size() ||
+							observer_exit_seen[observer_index] || source == block.source.end() ||
+							(delay_slot && (!has_delayed_control ||
+								!captured_control_input)) ||
+							(!delay_slot && input == source_input_state.end()))
+						{
+							checked = Fail(VerifyFailure::ExitContractMismatch,
+								block_index, node_index,
+								"VU0 idle observer lacks one exact restartable fallback");
+							break;
+						}
+						const StateMap& fallback_state =
+							delay_slot ? control_input : input->second;
+						const u32 resume_pc = delay_slot ?
+							block.terminator.branch_pc : node.source_pc;
+						const auto prefix = raw_cycles_before_source.find(resume_pc);
+						const Transfer& transfer =
+							block.observer_exits[observer_index].transfer;
+						const Node* transfer_pc = local_node(transfer.pc);
+						if (prefix == raw_cycles_before_source.end() ||
+							!StateMapsEqual(transfer.state, fallback_state) ||
+							transfer.target_block != INVALID_BLOCK ||
+							transfer.external_reason != ExitReason::HelperObserver ||
+							!transfer.cycle_commit_deferred ||
+							transfer.pending_raw_cycles != prefix->second ||
+							transfer.event_horizon_check || !transfer_pc ||
+							transfer_pc->opcode != Opcode::ConstantAddress ||
+							transfer_pc->type != ValueType::Address ||
+							transfer_pc->operand_count != 0 ||
+							transfer_pc->source_pc != node.source_pc ||
+							static_cast<u32>(transfer_pc->literal) != resume_pc ||
+							defining_node[transfer.pc] >= node_index)
+						{
+							checked = Fail(VerifyFailure::ExitContractMismatch,
+								block_index, node_index,
+								"VU0 idle observer loses pre-instruction state, PC, or cycle debt");
+							break;
+						}
+						observer_exit_seen[observer_index] = true;
 						vu0_idle_guard_count[node.source_pc]++;
+						break;
+					}
+					case Opcode::Vu0ControlWrite:
+					{
+						checked = binary(ValueType::I32, ValueType::I32,
+							ValueType::I32);
+						u32 source_opcode = 0;
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const Vu0ControlWriteOp write = have_source ?
+							DecodeVu0ControlWrite(source_opcode) : Vu0ControlWriteOp{};
+						const auto guard = vu0_idle_guard_value.find(node.source_pc);
+						if (checked && (!write.valid || node.immediate != write.target ||
+							node.literal != 0 ||
+							node.operands[0] != expected.vu0_vi[write.target] ||
+							guard == vu0_idle_guard_value.end() ||
+							node.operands[1] != guard->second ||
+							!vu0_control_write_result.emplace(node.source_pc,
+								node.id).second))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"CTC2 result loses its decoded target, old word, or guarded source");
+						}
+						break;
+					}
+					case Opcode::Vu0DenormalizeStatus:
+					{
+						checked = unary(ValueType::I32, ValueType::I32);
+						u32 source_opcode = 0;
+						const auto write = vu0_control_write_result.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 DecodeVu0ControlWrite(source_opcode).target != VU0_STATUS_FLAG ||
+							 write == vu0_control_write_result.end() ||
+							 node.operands[0] != write->second || node.immediate != 0 ||
+							 node.literal != 0 ||
+							 !vu0_denormalized_status_result.emplace(node.source_pc,
+								node.id).second))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"CTC2 STATUS denormalization does not consume its exact result");
+						}
+						break;
+					}
+					case Opcode::Vu0ConvertFixed:
+					{
+						checked = unary(ValueType::VuF32x4Bits,
+							ValueType::VuF32x4Bits);
+						u32 source_opcode = 0;
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const Vu0UnaryOp decoded = have_source ?
+							DecodeVu0Unary(source_opcode) : Vu0UnaryOp{};
+						const auto guard = vu0_idle_guard_value.find(node.source_pc);
+						if (checked && (!decoded.valid ||
+							decoded.kind != Vu0UnaryKind::ConvertFixed ||
+							guard == vu0_idle_guard_value.end() ||
+							node.operands[0] != guard->second ||
+							node.immediate != decoded.offset || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 fixed conversion does not match its decoded source");
+						}
+						break;
+					}
+					case Opcode::Vu0ConvertIntegerToFloat:
+					{
+						checked = unary(ValueType::VuF32x4Bits,
+							ValueType::VuF32x4Bits);
+						u32 source_opcode = 0;
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const Vu0UnaryOp decoded = have_source ?
+							DecodeVu0Unary(source_opcode) : Vu0UnaryOp{};
+						const auto guard = vu0_idle_guard_value.find(node.source_pc);
+						if (checked && (!decoded.valid ||
+							decoded.kind != Vu0UnaryKind::ConvertIntegerToFloat ||
+							guard == vu0_idle_guard_value.end() ||
+							node.operands[0] != guard->second ||
+							node.immediate != decoded.offset || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 integer-to-float conversion does not match its decoded source");
+						}
+						break;
+					}
+					case Opcode::Vu0Rotate32:
+					{
+						checked = unary(ValueType::VuF32x4Bits,
+							ValueType::VuF32x4Bits);
+						u32 source_opcode = 0;
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const Vu0UnaryOp decoded = have_source ?
+							DecodeVu0Unary(source_opcode) : Vu0UnaryOp{};
+						const auto guard = vu0_idle_guard_value.find(node.source_pc);
+						if (checked && (!decoded.valid ||
+							decoded.kind != Vu0UnaryKind::Rotate32 ||
+							guard == vu0_idle_guard_value.end() ||
+							node.operands[0] != guard->second ||
+							node.immediate != 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 MR32 does not consume its exact guarded source");
+						}
 						break;
 					}
 					case Opcode::Vu0NormalizeVector:
@@ -4205,12 +7127,12 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 !DecodeVu0Fmac(source_opcode).valid ||
 							 node.immediate != 0 || node.literal != 0))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
-								"VU0 normalization has no broadcast FMAC owner");
+								"VU0 normalization has no FMAC owner");
 						}
 						break;
 					}
@@ -4221,10 +7143,11 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						const bool have_source =
 							source_opcode_at(node.source_pc, &source_opcode);
-						const Vu0BroadcastFmacOp fmac = have_source ?
-							DecodeVu0BroadcastFmac(source_opcode) :
-							Vu0BroadcastFmacOp{};
-						if (checked && (!fmac.valid || node.immediate != fmac.lane ||
+						const Vu0FmacOp fmac = have_source ?
+							DecodeVu0Fmac(source_opcode) : Vu0FmacOp{};
+						if (checked && (!fmac.valid ||
+							fmac.operand != Vu0FmacOperand::BroadcastLane ||
+							node.immediate != fmac.lane ||
 							node.literal != 0))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
@@ -4233,22 +7156,141 @@ namespace VitaEE::RegionIR
 						}
 						break;
 					}
+					case Opcode::Vu0BroadcastScalar:
+					{
+						checked = unary(ValueType::I32, ValueType::VuF32x4Bits);
+						u32 source_opcode = 0;
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const Vu0FmacOp fmac = have_source ?
+							DecodeVu0Fmac(source_opcode) : Vu0FmacOp{};
+						if (checked && (!fmac.valid ||
+							fmac.operand != Vu0FmacOperand::ScalarQ ||
+							node.operands[0] != expected.vu0_vi[22] ||
+							node.immediate != 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 Q broadcast does not consume the current VI[Q]");
+						}
+						break;
+					}
+					case Opcode::Vu0FdivQ:
+					case Opcode::Vu0FdivFlags:
+					{
+						checked = binary(ValueType::VuF32x4Bits,
+							ValueType::VuF32x4Bits, ValueType::I32);
+						u32 source_opcode = 0;
+						const auto input = source_input_state.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 input == source_input_state.end() ||
+							 !exact_vu0_fdiv_node(node.id, node.opcode,
+								source_opcode, node.source_pc, input->second)))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 FDIV result/flags do not match decoded lanes");
+							break;
+						}
+						const bool unique = node.opcode == Opcode::Vu0FdivQ ?
+							vu0_fdiv_q_result.emplace(node.source_pc, node.id).second :
+							vu0_fdiv_flags_result.emplace(node.source_pc, node.id).second;
+						if (!unique)
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index, "VU0 FDIV has duplicate result/flags nodes");
+						}
+						break;
+					}
+					case Opcode::Vu0UpdateFdivStatus:
+					{
+						checked = binary(ValueType::I32, ValueType::I32,
+							ValueType::I32);
+						u32 source_opcode = 0;
+						const auto flags = vu0_fdiv_flags_result.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0Fdiv(source_opcode).valid ||
+							 flags == vu0_fdiv_flags_result.end() ||
+							 node.operands[0] != expected.vu0_statusflag ||
+							 node.operands[1] != flags->second ||
+							 node.immediate != 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 FDIV status update loses old or current D/I flags");
+						}
+						if (checked &&
+							!vu0_fdiv_status_result.emplace(node.source_pc, node.id).second)
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index, "VU0 FDIV has duplicate status updates");
+						}
+						break;
+					}
+					case Opcode::Vu0SyncFdivStatusControl:
+					{
+						checked = binary(ValueType::I32, ValueType::I32,
+							ValueType::I32);
+						u32 source_opcode = 0;
+						const auto status = vu0_fdiv_status_result.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0Fdiv(source_opcode).valid ||
+							 node.operands[0] != expected.vu0_vi[16] ||
+							 status == vu0_fdiv_status_result.end() ||
+							 node.operands[1] != status->second ||
+							 node.immediate != 0 || node.literal != 0))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 FDIV VI status mirror loses current/sticky D/I bits");
+						}
+						if (checked &&
+							!vu0_fdiv_vi_status_result.emplace(node.source_pc, node.id).second)
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index, "VU0 FDIV has duplicate VI status updates");
+						}
+						break;
+					}
 					case Opcode::Vu0MulRaw:
 					case Opcode::Vu0AddRaw:
+					case Opcode::Vu0SubRaw:
 					{
 						checked = binary(ValueType::VuF32x4Bits,
 							ValueType::VuF32x4Bits, ValueType::VuF32x4Bits);
 						u32 source_opcode = 0;
 						const bool have_source =
 							source_opcode_at(node.source_pc, &source_opcode);
-						const Vu0BroadcastFmacOp fmac = have_source ?
-							DecodeVu0BroadcastFmac(source_opcode) :
-							Vu0BroadcastFmacOp{};
-						const bool add_allowed = fmac.valid &&
-							fmac.kind != Vu0BroadcastFmacKind::MultiplyAccumulator;
+						const Vu0FmacOp fmac = have_source ?
+							DecodeVu0Fmac(source_opcode) : Vu0FmacOp{};
+						bool operation_allowed = false;
+						if (fmac.valid)
+						{
+							switch (node.opcode)
+							{
+								case Opcode::Vu0MulRaw:
+									operation_allowed =
+										fmac.kind == Vu0FmacKind::Multiply ||
+										fmac.kind == Vu0FmacKind::MultiplyAdd ||
+										fmac.kind == Vu0FmacKind::MultiplySubtract;
+									break;
+								case Opcode::Vu0AddRaw:
+									operation_allowed = fmac.kind == Vu0FmacKind::Add ||
+										fmac.kind == Vu0FmacKind::MultiplyAdd;
+									break;
+								case Opcode::Vu0SubRaw:
+									operation_allowed = fmac.kind == Vu0FmacKind::Subtract ||
+										fmac.kind == Vu0FmacKind::MultiplySubtract;
+									break;
+								default:
+									break;
+							}
+						}
 						if (checked && (!fmac.valid || node.immediate != 0 ||
-							node.literal != 0 ||
-							(node.opcode == Opcode::Vu0AddRaw && !add_allowed)))
+							node.literal != 0 || !operation_allowed))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
@@ -4265,7 +7307,7 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 !DecodeVu0Fmac(source_opcode).valid ||
 							 node.immediate != (RS(source_opcode) & 0x0fu) ||
 							 node.literal != 0))
 						{
@@ -4281,7 +7323,7 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 !DecodeVu0Fmac(source_opcode).valid ||
 							 node.immediate != 0 || node.literal != 0))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
@@ -4297,13 +7339,14 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 (!DecodeVu0Fmac(source_opcode).valid &&
+							  !DecodeVu0Unary(source_opcode).valid) ||
 							 node.immediate != (RS(source_opcode) & 0x0fu) ||
 							 node.immediate == 0 || node.literal != 0))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
-								"VU0 masked merge does not match its FMAC source");
+								"VU0 masked merge does not match its decoded source");
 						}
 						break;
 					}
@@ -4314,7 +7357,7 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 !DecodeVu0Fmac(source_opcode).valid ||
 							 node.immediate != 0 || node.literal != 0))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
@@ -4417,6 +7460,70 @@ namespace VitaEE::RegionIR
 								"memory effective address operands do not match decoded source");
 							break;
 						}
+
+						size_t memory_exit_index = block.memory_exits.size();
+						for (size_t index = 0; index < block.memory_exits.size(); index++)
+						{
+							if (block.memory_exits[index].operation != node.id)
+								continue;
+							if (memory_exit_index != block.memory_exits.size())
+							{
+								checked = Fail(VerifyFailure::ExitContractMismatch,
+									block_index, node_index,
+									"memory operation has duplicate fallback transfers");
+								break;
+							}
+							memory_exit_index = index;
+						}
+						if (!checked)
+							break;
+						const auto source = std::find_if(block.source.begin(),
+							block.source.end(), [&](const SourceInstruction& candidate) {
+								return candidate.pc == node.source_pc;
+							});
+						const bool delay_slot = source != block.source.end() &&
+							source->delay_slot;
+						const auto input = source_input_state.find(node.source_pc);
+						if (memory_exit_index == block.memory_exits.size() ||
+							memory_exit_seen[memory_exit_index] ||
+							source == block.source.end() ||
+							(delay_slot && (!has_delayed_control ||
+								!captured_control_input)) ||
+							(!delay_slot && input == source_input_state.end()))
+						{
+							checked = Fail(VerifyFailure::ExitContractMismatch,
+								block_index, node_index,
+								"memory operation lacks one exact restartable fallback");
+							break;
+						}
+						const StateMap& fallback_state =
+							delay_slot ? control_input : input->second;
+						const u32 resume_pc = delay_slot ?
+							block.terminator.branch_pc : node.source_pc;
+						const auto prefix = raw_cycles_before_source.find(resume_pc);
+						const Transfer& transfer =
+							block.memory_exits[memory_exit_index].transfer;
+						const Node* transfer_pc = local_node(transfer.pc);
+						if (prefix == raw_cycles_before_source.end() ||
+							!StateMapsEqual(transfer.state, fallback_state) ||
+							transfer.target_block != INVALID_BLOCK ||
+							transfer.external_reason != ExitReason::MemoryObserver ||
+							!transfer.cycle_commit_deferred ||
+							transfer.pending_raw_cycles != prefix->second ||
+							transfer.event_horizon_check || !transfer_pc ||
+							transfer_pc->opcode != Opcode::ConstantAddress ||
+							transfer_pc->type != ValueType::Address ||
+							transfer_pc->operand_count != 0 ||
+							transfer_pc->source_pc != node.source_pc ||
+							static_cast<u32>(transfer_pc->literal) != resume_pc ||
+							defining_node[transfer.pc] >= node_index)
+						{
+							checked = Fail(VerifyFailure::ExitContractMismatch,
+								block_index, node_index,
+								"memory fallback loses pre-access state, PC, or cycle debt");
+							break;
+						}
+						memory_exit_seen[memory_exit_index] = true;
 						expected.memory_effect = node.id;
 						memory_operation_count[node.source_pc]++;
 						break;
@@ -4478,6 +7585,18 @@ namespace VitaEE::RegionIR
 							PureMmiKind pure_mmi_kind{};
 							const bool pure_mmi =
 								DecodePureMmi(source_opcode, &pure_mmi_kind);
+							PackedBinaryKind packed_mmi_kind{};
+							const bool packed_mmi =
+								DecodePackedBinaryMmi(source_opcode, &packed_mmi_kind);
+							PackedShiftKind packed_shift_kind{};
+							const bool packed_shift =
+								DecodePackedShiftMmi(source_opcode, &packed_shift_kind);
+							const IntegerMultiplyOp integer_multiply =
+								DecodeIntegerMultiply(source_opcode);
+							const Vu0VectorTransferOp vu0_transfer =
+								DecodeVu0VectorTransfer(source_opcode);
+							const Vu0ControlReadOp vu0_control_read =
+								DecodeVu0ControlRead(source_opcode);
 							PureCop1StateKind pure_cop1_kind{};
 							const bool pure_cop1 =
 								DecodePureCop1State(source_opcode, &pure_cop1_kind);
@@ -4495,6 +7614,66 @@ namespace VitaEE::RegionIR
 									break;
 								}
 								addi_gpr_bind_count[node.source_pc]++;
+							}
+							else if (integer_multiply.valid)
+							{
+								const auto input = source_input_state.find(node.source_pc);
+								if (input == source_input_state.end() ||
+									!exact_integer_multiply_gpr_bind(node,
+										source_opcode, input->second))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"integer multiply GPR result is not its exact LO lane");
+									break;
+								}
+								integer_multiply_gpr_bind_count[node.source_pc]++;
+							}
+							else if (vu0_control_read.valid)
+							{
+								const auto guard =
+									vu0_idle_guard_value.find(node.source_pc);
+								const Node* replace = local_node(node.operands[0]);
+								const Node* extension = replace && replace->operand_count == 2 ?
+									local_node(replace->operands[1]) : nullptr;
+								if (RT(source_opcode) == 0 ||
+									node.immediate != RT(source_opcode) ||
+									guard == vu0_idle_guard_value.end() || !replace ||
+									replace->opcode != Opcode::ReplaceLow64 ||
+									replace->type != ValueType::I128 ||
+									replace->operand_count != 2 ||
+									replace->operands[0] != expected.gpr[RT(source_opcode)] ||
+									replace->source_pc != node.source_pc || !extension ||
+									extension->opcode != Opcode::SignExtend32To64 ||
+									extension->type != ValueType::I64 ||
+									extension->operand_count != 1 ||
+									extension->operands[0] != guard->second ||
+									extension->source_pc != node.source_pc)
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"CFC2 GPR binding does not sign-extend its guarded control word");
+									break;
+								}
+								vu0_control_read_gpr_bind_count[node.source_pc]++;
+							}
+							else if (vu0_transfer.valid &&
+								vu0_transfer.kind == Vu0VectorTransferKind::FromVu0)
+							{
+								const Node* value = local_node(node.operands[0]);
+								const auto guard = vu0_idle_guard_value.find(node.source_pc);
+								if (node.immediate != RT(source_opcode) || !value ||
+									value->opcode != Opcode::BitcastVuF32x4BitsToI128 ||
+									value->operand_count != 1 ||
+									guard == vu0_idle_guard_value.end() ||
+									value->operands[0] != guard->second)
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"QMFC2 GPR binding does not consume its guarded VF source");
+									break;
+								}
+								vu0_transfer_gpr_bind_count[node.source_pc]++;
 							}
 							else if (IsExtendedScalarGprWrite(source_opcode))
 							{
@@ -4520,6 +7699,32 @@ namespace VitaEE::RegionIR
 								}
 								pure_mmi_gpr_bind_count[node.source_pc]++;
 							}
+							else if (packed_mmi)
+							{
+								if (!exact_packed_mmi_gpr_bind(node, source_opcode,
+										expected))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"packed MMI GPR binding does not match source");
+									break;
+								}
+								pure_mmi_gpr_bind_count[node.source_pc]++;
+							}
+							else if (packed_shift)
+							{
+								const auto input = source_input_state.find(node.source_pc);
+								if (input == source_input_state.end() ||
+									!exact_packed_shift_gpr_bind(node, source_opcode,
+										input->second))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"packed shift GPR binding is not the decoded result");
+									break;
+								}
+								pure_mmi_gpr_bind_count[node.source_pc]++;
+							}
 							else if (pure_cop1 &&
 								pure_cop1_kind == PureCop1StateKind::MoveFromFpr)
 							{
@@ -4535,8 +7740,8 @@ namespace VitaEE::RegionIR
 							}
 							else if (IsMoveToHiLo(source_opcode) ||
 								IsMoveToSa(source_opcode) ||
-								pure_mmi ||
-								pure_cop1 ||
+								integer_multiply.valid || pure_mmi || packed_mmi ||
+								pure_cop1 || vu0_control_read.valid || vu0_transfer.valid ||
 								DecodeNoEffect(source_opcode, program.options,
 									&no_effect_kind))
 							{
@@ -4602,12 +7807,22 @@ namespace VitaEE::RegionIR
 						if (checked)
 						{
 							u32 source_opcode = 0;
-							if (!source_opcode_at(node.source_pc, &source_opcode) ||
-								!exact_hilo_bind(node, source_opcode, expected, true))
+							const auto input = source_input_state.find(node.source_pc);
+							const bool have_source =
+								source_opcode_at(node.source_pc, &source_opcode);
+							const IntegerMultiplyOp multiply = have_source ?
+								DecodeIntegerMultiply(source_opcode) : IntegerMultiplyOp{};
+							const bool exact = multiply.valid ?
+								(input != source_input_state.end() &&
+								 exact_integer_multiply_hilo_bind(node, source_opcode,
+									 input->second, true)) :
+								(have_source &&
+								 exact_hilo_bind(node, source_opcode, expected, true));
+							if (!exact)
 							{
 								checked = Fail(VerifyFailure::SourceMismatch,
 									block_index, node_index,
-									"HI binding does not match decoded move");
+									"HI binding does not match decoded owner");
 								break;
 							}
 							hi_bind_count[node.source_pc]++;
@@ -4619,12 +7834,22 @@ namespace VitaEE::RegionIR
 						if (checked)
 						{
 							u32 source_opcode = 0;
-							if (!source_opcode_at(node.source_pc, &source_opcode) ||
-								!exact_hilo_bind(node, source_opcode, expected, false))
+							const auto input = source_input_state.find(node.source_pc);
+							const bool have_source =
+								source_opcode_at(node.source_pc, &source_opcode);
+							const IntegerMultiplyOp multiply = have_source ?
+								DecodeIntegerMultiply(source_opcode) : IntegerMultiplyOp{};
+							const bool exact = multiply.valid ?
+								(input != source_input_state.end() &&
+								 exact_integer_multiply_hilo_bind(node, source_opcode,
+									 input->second, false)) :
+								(have_source &&
+								 exact_hilo_bind(node, source_opcode, expected, false));
+							if (!exact)
 							{
 								checked = Fail(VerifyFailure::SourceMismatch,
 									block_index, node_index,
-									"LO binding does not match decoded move");
+									"LO binding does not match decoded owner");
 								break;
 							}
 							lo_bind_count[node.source_pc]++;
@@ -4676,6 +7901,9 @@ namespace VitaEE::RegionIR
 								!IsBasicCop1Accumulator(arithmetic_kind);
 							const bool compound_arithmetic =
 								DecodeCompoundCop1Arithmetic(source_opcode, nullptr);
+							Cop1UnaryWordKind unary_word_kind{};
+							const bool unary_word =
+								DecodeCop1UnaryWord(source_opcode, &unary_word_kind);
 							const bool convert_word = IsCop1ConvertWord(source_opcode);
 							const bool convert_single = IsCop1ConvertSingle(source_opcode);
 							if (memory_load)
@@ -4703,6 +7931,19 @@ namespace VitaEE::RegionIR
 									checked = Fail(VerifyFailure::SourceMismatch,
 										block_index, node_index,
 										"basic COP1 result does not bind decoded fd");
+									break;
+								}
+							}
+							else if (unary_word)
+							{
+								if (node.immediate != FD(source_opcode) ||
+									!exact_unary(node.operands[0],
+										Cop1UnaryWordOpcode(unary_word_kind),
+										expected.fpr[FS(source_opcode)], node.source_pc))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"COP1 unary result does not bind decoded fd");
 									break;
 								}
 							}
@@ -4766,8 +8007,10 @@ namespace VitaEE::RegionIR
 							const bool vector_load =
 								DecodeMemoryAccess(source_opcode, &kind) &&
 								kind == MemoryAccessKind::LoadVu0Vector;
-							const Vu0BroadcastFmacOp fmac =
-								DecodeVu0BroadcastFmac(source_opcode);
+							const Vu0FmacOp fmac = DecodeVu0Fmac(source_opcode);
+							const Vu0UnaryOp unary = DecodeVu0Unary(source_opcode);
+							const Vu0VectorTransferOp vector_transfer =
+								DecodeVu0VectorTransfer(source_opcode);
 							if (vector_load)
 							{
 								if (node.immediate != RT(source_opcode) || !value ||
@@ -4781,12 +8024,27 @@ namespace VitaEE::RegionIR
 								}
 								memory_bind_count[node.source_pc]++;
 							}
-							else
+							else if (vector_transfer.valid &&
+								vector_transfer.kind == Vu0VectorTransferKind::ToVu0)
+							{
+								const auto guard = vu0_idle_guard_value.find(node.source_pc);
+								if (node.immediate != RD(source_opcode) || !value ||
+									value->opcode != Opcode::BitcastI128ToVuF32x4Bits ||
+									value->operand_count != 1 ||
+									guard == vu0_idle_guard_value.end() ||
+									value->operands[0] != guard->second)
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"QMTC2 VF binding does not consume its guarded GPR source");
+									break;
+								}
+							}
+							else if (fmac.valid)
 							{
 								const auto raw = vu0_fmac_raw_result.find(node.source_pc);
 								const u32 mask = RS(source_opcode) & 0x0fu;
-								if (!fmac.valid ||
-									fmac.kind != Vu0BroadcastFmacKind::MultiplyAddVector ||
+								if (fmac.accumulator_destination ||
 									mask == 0 || node.immediate != SA(source_opcode) ||
 									raw == vu0_fmac_raw_result.end() || !value ||
 									value->opcode != Opcode::Vu0MergeMasked ||
@@ -4801,10 +8059,98 @@ namespace VitaEE::RegionIR
 									break;
 								}
 							}
+							else
+							{
+								const u32 mask = RS(source_opcode) & 0x0fu;
+								if (!unary.valid || mask == 0 ||
+									node.immediate != RT(source_opcode) || !value ||
+									value->opcode != Opcode::Vu0MergeMasked ||
+									value->operand_count != 2 ||
+									value->immediate != mask ||
+									value->operands[0] != expected.vu0_vf[node.immediate] ||
+									!exact_vu0_unary_result(value->operands[1],
+										source_opcode, node.source_pc))
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"VU0 unary result does not bind decoded ft exactly");
+									break;
+								}
+							}
 							vu0_vf_bind_count[node.source_pc]++;
 							expected.vu0_vf[node.immediate] = node.operands[0];
 						}
 						break;
+					case Opcode::BindVu0Vi:
+					{
+						checked = unary(ValueType::I32, ValueType::Void);
+						u32 source_opcode = 0;
+						const auto value = vu0_control_write_result.find(node.source_pc);
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const Vu0ControlWriteOp write = have_source ?
+							DecodeVu0ControlWrite(source_opcode) : Vu0ControlWriteOp{};
+						if (checked && (!write.valid || node.immediate == 0 ||
+							node.immediate >= VU0_VI_COUNT ||
+							node.immediate != write.target ||
+							write.target == VU0_MAC_FLAG || write.target == VU0_TPC ||
+							write.target == VU0_VPU_STAT ||
+							value == vu0_control_write_result.end() ||
+							node.operands[0] != value->second))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"CTC2 VI binding does not publish its exact decoded result");
+							break;
+						}
+						vu0_vi_bind_count[node.source_pc]++;
+						expected.vu0_vi[node.immediate] = node.operands[0];
+						break;
+					}
+					case Opcode::BindVu0ClipFlag:
+					{
+						checked = unary(ValueType::I32, ValueType::Void);
+						u32 source_opcode = 0;
+						const auto value = vu0_control_write_result.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 DecodeVu0ControlWrite(source_opcode).target != VU0_CLIP_FLAG ||
+							 node.immediate != 0 ||
+							 value == vu0_control_write_result.end() ||
+							 node.operands[0] != value->second))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"CTC2 CLIP scalar mirror differs from its VI result");
+							break;
+						}
+						vu0_clipflag_bind_count[node.source_pc]++;
+						expected.vu0_clipflag = node.operands[0];
+						break;
+					}
+					case Opcode::BindVu0MicroStatusFlag:
+					{
+						checked = unary(ValueType::I32, ValueType::Void);
+						u32 source_opcode = 0;
+						const auto value =
+							vu0_denormalized_status_result.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 DecodeVu0ControlWrite(source_opcode).target != VU0_STATUS_FLAG ||
+							 node.immediate >= 4 ||
+							 value == vu0_denormalized_status_result.end() ||
+							 node.operands[0] != value->second))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"CTC2 STATUS hidden mirror is missing or not denormalized");
+							break;
+						}
+						vu0_micro_status_bind_count[node.source_pc]++;
+						expected.vu0_micro_statusflags[node.immediate] =
+							node.operands[0];
+						break;
+					}
 					case Opcode::BindVu0MacFlag:
 					{
 						checked = unary(ValueType::I32, ValueType::Void);
@@ -4812,7 +8158,7 @@ namespace VitaEE::RegionIR
 						const Node* value = local_node(node.operands[0]);
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 !DecodeVu0Fmac(source_opcode).valid ||
 							 node.immediate != 0 || !value ||
 							 value->opcode != Opcode::Vu0MacFlagsFromRaw ||
 							 value->operand_count != 1 ||
@@ -4831,22 +8177,78 @@ namespace VitaEE::RegionIR
 						expected.vu0_macflag = node.operands[0];
 						break;
 					}
+					case Opcode::BindVu0Q:
+					{
+						checked = unary(ValueType::I32, ValueType::Void);
+						u32 source_opcode = 0;
+						const auto q = vu0_fdiv_q_result.find(node.source_pc);
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0Fdiv(source_opcode).valid ||
+							 node.immediate != 0 ||
+							 q == vu0_fdiv_q_result.end() ||
+							 node.operands[0] != q->second))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 Q binding does not publish the exact FDIV result");
+							break;
+						}
+						vu0_q_bind_count[node.source_pc]++;
+						expected.vu0_q = node.operands[0];
+						break;
+					}
+					case Opcode::BindVu0ViQ:
+					{
+						checked = unary(ValueType::I32, ValueType::Void);
+						u32 source_opcode = 0;
+						if (checked &&
+							(!source_opcode_at(node.source_pc, &source_opcode) ||
+							 !DecodeVu0Fdiv(source_opcode).valid ||
+							 node.immediate != 0 ||
+							 node.operands[0] != expected.vu0_q))
+						{
+							checked = Fail(VerifyFailure::SourceMismatch, block_index,
+								node_index,
+								"VU0 VI[Q] binding differs from the current Q result");
+							break;
+						}
+						vu0_vi_q_bind_count[node.source_pc]++;
+						expected.vu0_vi[22] = node.operands[0];
+						break;
+					}
 					case Opcode::BindVu0StatusFlag:
 					{
 						checked = unary(ValueType::I32, ValueType::Void);
 						u32 source_opcode = 0;
 						const Node* value = local_node(node.operands[0]);
-						if (checked &&
-							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
-							 node.immediate != 0 || !value ||
-							 value->opcode != Opcode::Vu0StatusFlagsFromMac ||
-							 value->operand_count != 1 ||
-							 value->operands[0] != expected.vu0_macflag))
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const bool fmac = have_source &&
+							DecodeVu0Fmac(source_opcode).valid;
+						const bool fdiv = have_source &&
+							DecodeVu0Fdiv(source_opcode).valid;
+						const auto flags = vu0_fdiv_flags_result.find(node.source_pc);
+						const auto fdiv_status =
+							vu0_fdiv_status_result.find(node.source_pc);
+						const bool exact_fmac = fmac && value &&
+							value->opcode == Opcode::Vu0StatusFlagsFromMac &&
+							value->operand_count == 1 &&
+							value->operands[0] == expected.vu0_macflag;
+						const bool exact_fdiv = fdiv && value &&
+							fdiv_status != vu0_fdiv_status_result.end() &&
+							node.operands[0] == fdiv_status->second &&
+							value->opcode == Opcode::Vu0UpdateFdivStatus &&
+							value->operand_count == 2 &&
+							value->operands[0] == expected.vu0_statusflag &&
+							flags != vu0_fdiv_flags_result.end() &&
+							value->operands[1] == flags->second;
+						if (checked && (node.immediate != 0 ||
+							(!exact_fmac && !exact_fdiv)))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
-								"VU0 status binding does not reduce the current MAC flags");
+								"VU0 status binding does not match FMAC or FDIV flags");
 							break;
 						}
 						vu0_statusflag_bind_count[node.source_pc]++;
@@ -4859,7 +8261,7 @@ namespace VitaEE::RegionIR
 						u32 source_opcode = 0;
 						if (checked &&
 							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
+							 !DecodeVu0Fmac(source_opcode).valid ||
 							 node.immediate != 0 ||
 							 node.operands[0] != expected.vu0_macflag))
 						{
@@ -4869,7 +8271,7 @@ namespace VitaEE::RegionIR
 							break;
 						}
 						vu0_vi_mac_bind_count[node.source_pc]++;
-						expected.vu0_vi_mac = node.operands[0];
+						expected.vu0_vi[17] = node.operands[0];
 						break;
 					}
 					case Opcode::BindVu0ViStatus:
@@ -4877,22 +8279,36 @@ namespace VitaEE::RegionIR
 						checked = unary(ValueType::I32, ValueType::Void);
 						u32 source_opcode = 0;
 						const Node* value = local_node(node.operands[0]);
-						if (checked &&
-							(!source_opcode_at(node.source_pc, &source_opcode) ||
-							 !DecodeVu0BroadcastFmac(source_opcode).valid ||
-							 node.immediate != 0 || !value ||
-							 value->opcode != Opcode::Vu0SyncStatusControl ||
-							 value->operand_count != 2 ||
-							 value->operands[0] != expected.vu0_vi_status ||
-							 value->operands[1] != expected.vu0_statusflag))
+						const bool have_source =
+							source_opcode_at(node.source_pc, &source_opcode);
+						const bool fmac = have_source &&
+							DecodeVu0Fmac(source_opcode).valid;
+						const bool fdiv = have_source &&
+							DecodeVu0Fdiv(source_opcode).valid;
+						const auto fdiv_vi_status =
+							vu0_fdiv_vi_status_result.find(node.source_pc);
+						const bool exact_fmac = fmac && value &&
+							value->opcode == Opcode::Vu0SyncStatusControl &&
+							value->operand_count == 2 &&
+							value->operands[0] == expected.vu0_vi[16] &&
+							value->operands[1] == expected.vu0_statusflag;
+						const bool exact_fdiv = fdiv && value &&
+							fdiv_vi_status != vu0_fdiv_vi_status_result.end() &&
+							node.operands[0] == fdiv_vi_status->second &&
+							value->opcode == Opcode::Vu0SyncFdivStatusControl &&
+							value->operand_count == 2 &&
+							value->operands[0] == expected.vu0_vi[16] &&
+							value->operands[1] == expected.vu0_statusflag;
+						if (checked && (node.immediate != 0 ||
+							(!exact_fmac && !exact_fdiv)))
 						{
 							checked = Fail(VerifyFailure::SourceMismatch, block_index,
 								node_index,
-								"VU0 VI status mirror loses current or sticky flags");
+								"VU0 VI status mirror loses FMAC/FDIV state");
 							break;
 						}
 						vu0_vi_status_bind_count[node.source_pc]++;
-						expected.vu0_vi_status = node.operands[0];
+						expected.vu0_vi[16] = node.operands[0];
 						break;
 					}
 					case Opcode::BindVu0Acc:
@@ -4902,14 +8318,13 @@ namespace VitaEE::RegionIR
 						const Node* value = local_node(node.operands[0]);
 						const bool have_source =
 							source_opcode_at(node.source_pc, &source_opcode);
-						const Vu0BroadcastFmacOp fmac = have_source ?
-							DecodeVu0BroadcastFmac(source_opcode) :
-							Vu0BroadcastFmacOp{};
+						const Vu0FmacOp fmac = have_source ?
+							DecodeVu0Fmac(source_opcode) : Vu0FmacOp{};
 						const auto raw = vu0_fmac_raw_result.find(node.source_pc);
 						const u32 mask = RS(source_opcode) & 0x0fu;
 						if (checked &&
 							(!fmac.valid ||
-							 fmac.kind == Vu0BroadcastFmacKind::MultiplyAddVector ||
+							 !fmac.accumulator_destination ||
 							 mask == 0 || node.immediate != 0 ||
 							 raw == vu0_fmac_raw_result.end() || !value ||
 							 value->opcode != Opcode::Vu0MergeMasked ||
@@ -4971,6 +8386,20 @@ namespace VitaEE::RegionIR
 									break;
 								}
 							}
+							else if (DecodeCop1UnaryWord(source_opcode, nullptr))
+							{
+								if (value->opcode != Opcode::Cop1ClearOuFlags ||
+									value->operand_count != 1 ||
+									value->source_pc != node.source_pc ||
+									value->operands[0] != expected.fcr31 ||
+									value->immediate != 0 || value->literal != 0)
+								{
+									checked = Fail(VerifyFailure::SourceMismatch,
+										block_index, node_index,
+										"COP1 unary FCR31 binding does not clear exact O/U causes");
+									break;
+								}
+							}
 							else if (DecodeCop1Compare(source_opcode, nullptr))
 							{
 								if (value->opcode != Opcode::Cop1UpdateConditionFlag ||
@@ -5024,15 +8453,17 @@ namespace VitaEE::RegionIR
 					case Opcode::ExitIfTrue:
 					{
 						checked = unary(ValueType::I1, ValueType::Void);
-						const auto condition =
+						const auto addi_condition =
 							addi_overflow_condition.find(node.source_pc);
 						const auto source = std::find_if(block.source.begin(),
 							block.source.end(), [&](const SourceInstruction& candidate) {
 								return candidate.pc == node.source_pc;
 							});
+						const bool addi_guard =
+							addi_condition != addi_overflow_condition.end() &&
+							addi_condition->second == node.operands[0];
 						if (checked &&
-							(condition == addi_overflow_condition.end() ||
-							 condition->second != node.operands[0] ||
+							(!addi_guard ||
 							 source == block.source.end() ||
 							 !IsGuardedExceptionInstruction(source->opcode) ||
 							 node.immediate >= block.guarded_exits.size() ||
@@ -5040,7 +8471,7 @@ namespace VitaEE::RegionIR
 						{
 							checked = Fail(VerifyFailure::ExitContractMismatch,
 								block_index, node_index,
-								"conditional exit is not the unique guard for decoded ADDI");
+								"conditional exit is not the unique guard for its decoded instruction");
 							break;
 						}
 
@@ -5052,7 +8483,7 @@ namespace VitaEE::RegionIR
 						{
 							checked = Fail(VerifyFailure::ExitContractMismatch,
 								block_index, node_index,
-								"ADDI guard has no exact restartable source state");
+								"guarded instruction has no exact restartable source state");
 							break;
 						}
 						const StateMap& exceptional_state =
@@ -5078,7 +8509,7 @@ namespace VitaEE::RegionIR
 						{
 							checked = Fail(VerifyFailure::ExitContractMismatch,
 								block_index, node_index,
-								"ADDI guard loses its pre-instruction/pair state, PC, or cycle debt");
+								"guarded instruction loses its pre-instruction/pair state, PC, or cycle debt");
 							break;
 						}
 						guarded_exit_seen[node.immediate] = true;
@@ -5135,10 +8566,31 @@ namespace VitaEE::RegionIR
 					UINT32_MAX,
 					"guarded transfer has no unique executable condition node");
 			}
+			if (std::find(memory_exit_seen.begin(), memory_exit_seen.end(), false) !=
+				memory_exit_seen.end())
+			{
+				return Fail(VerifyFailure::ExitContractMismatch, block_index,
+					UINT32_MAX,
+					"memory fallback transfer has no unique memory operation");
+			}
+			if (std::find(observer_exit_seen.begin(), observer_exit_seen.end(), false) !=
+				observer_exit_seen.end())
+			{
+				return Fail(VerifyFailure::ExitContractMismatch, block_index,
+					UINT32_MAX,
+					"observer fallback transfer has no unique synchronization node");
+			}
 			for (const SourceInstruction& source : block.source)
 			{
-				const Vu0BroadcastFmacOp vu0_fmac =
-					DecodeVu0BroadcastFmac(source.opcode);
+				const Vu0ControlReadOp vu0_control_read =
+					DecodeVu0ControlRead(source.opcode);
+				const Vu0ControlWriteOp vu0_control_write =
+					DecodeVu0ControlWrite(source.opcode);
+				const Vu0VectorTransferOp vu0_transfer =
+					DecodeVu0VectorTransfer(source.opcode);
+				const Vu0FdivOp vu0_fdiv = DecodeVu0Fdiv(source.opcode);
+				const Vu0FmacOp vu0_fmac = DecodeVu0Fmac(source.opcode);
+				const Vu0UnaryOp vu0_unary = DecodeVu0Unary(source.opcode);
 				NoEffectKind no_effect_kind{};
 				if (IsGuardedExceptionInstruction(source.opcode))
 				{
@@ -5160,11 +8612,148 @@ namespace VitaEE::RegionIR
 							"ADDI lacks one exact overflow guard and normal result binding");
 					}
 				}
+				else if (vu0_control_read.valid)
+				{
+					const u32 expected_gpr = RT(source.opcode) != 0 ? 1u : 0u;
+					if (vu0_idle_guard_count[source.pc] != 1 ||
+						vu0_control_read_gpr_bind_count[source.pc] != expected_gpr ||
+						vu0_transfer_gpr_bind_count[source.pc] != 0 ||
+						vu0_vf_bind_count[source.pc] != 0 ||
+						vu0_acc_bind_count[source.pc] != 0 ||
+						vu0_macflag_bind_count[source.pc] != 0 ||
+						vu0_statusflag_bind_count[source.pc] != 0 ||
+						vu0_vi_mac_bind_count[source.pc] != 0 ||
+						vu0_vi_status_bind_count[source.pc] != 0 ||
+						memory_operation_count[source.pc] != 0 ||
+						no_effect_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						integer_multiply_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
+						fcr31_bind_count[source.pc] != 0 ||
+						acc_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"CFC2 lacks its exact idle guard or control-word destination");
+					}
+				}
+				else if (vu0_control_write.valid)
+				{
+					const bool read_only = vu0_control_write.target == 0 ||
+						vu0_control_write.target == VU0_MAC_FLAG ||
+						vu0_control_write.target == VU0_TPC ||
+						vu0_control_write.target == VU0_VPU_STAT;
+					const u32 expected_vi = read_only ? 0u : 1u;
+					const u32 expected_clip =
+						vu0_control_write.target == VU0_CLIP_FLAG ? 1u : 0u;
+					const u32 expected_micro_status =
+						vu0_control_write.target == VU0_STATUS_FLAG ? 4u : 0u;
+					const bool have_status_conversion =
+						vu0_denormalized_status_result.contains(source.pc);
+					if (vu0_idle_guard_count[source.pc] != 1 ||
+						!vu0_control_write_result.contains(source.pc) ||
+						vu0_vi_bind_count[source.pc] != expected_vi ||
+						vu0_clipflag_bind_count[source.pc] != expected_clip ||
+						vu0_micro_status_bind_count[source.pc] != expected_micro_status ||
+						have_status_conversion != (expected_micro_status != 0) ||
+						vu0_control_read_gpr_bind_count[source.pc] != 0 ||
+						vu0_transfer_gpr_bind_count[source.pc] != 0 ||
+						vu0_vf_bind_count[source.pc] != 0 ||
+						vu0_acc_bind_count[source.pc] != 0 ||
+						vu0_macflag_bind_count[source.pc] != 0 ||
+						vu0_statusflag_bind_count[source.pc] != 0 ||
+						vu0_vi_mac_bind_count[source.pc] != 0 ||
+						vu0_vi_status_bind_count[source.pc] != 0 ||
+						vu0_q_bind_count[source.pc] != 0 ||
+						vu0_vi_q_bind_count[source.pc] != 0 ||
+						memory_operation_count[source.pc] != 0 ||
+						no_effect_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
+						fcr31_bind_count[source.pc] != 0 || acc_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"CTC2 lacks its exact guard, target write, or hidden mirrors");
+					}
+				}
+				else if (vu0_transfer.valid)
+				{
+					const bool from_vu0 = vu0_transfer.kind ==
+						Vu0VectorTransferKind::FromVu0;
+					const u32 expected_gpr = from_vu0 && RT(source.opcode) != 0 ? 1u : 0u;
+					const u32 expected_vf = !from_vu0 && RD(source.opcode) != 0 ? 1u : 0u;
+					if (vu0_idle_guard_count[source.pc] != 1 ||
+						vu0_transfer_gpr_bind_count[source.pc] != expected_gpr ||
+						vu0_vf_bind_count[source.pc] != expected_vf ||
+						vu0_acc_bind_count[source.pc] != 0 ||
+						vu0_macflag_bind_count[source.pc] != 0 ||
+						vu0_statusflag_bind_count[source.pc] != 0 ||
+						vu0_vi_mac_bind_count[source.pc] != 0 ||
+						vu0_vi_status_bind_count[source.pc] != 0 ||
+						memory_operation_count[source.pc] != 0 ||
+						no_effect_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						integer_multiply_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
+						fcr31_bind_count[source.pc] != 0 ||
+						acc_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"VU0 vector transfer lacks its exact guard or destination");
+					}
+				}
+				else if (vu0_fdiv.valid)
+				{
+					if (vu0_idle_guard_count[source.pc] != 1 ||
+						vu0_q_bind_count[source.pc] != 1 ||
+						vu0_vi_q_bind_count[source.pc] != 1 ||
+						vu0_statusflag_bind_count[source.pc] != 1 ||
+						vu0_vi_status_bind_count[source.pc] != 1 ||
+						!vu0_fdiv_q_result.contains(source.pc) ||
+						!vu0_fdiv_flags_result.contains(source.pc) ||
+						!vu0_fdiv_status_result.contains(source.pc) ||
+						!vu0_fdiv_vi_status_result.contains(source.pc) ||
+						vu0_vf_bind_count[source.pc] != 0 ||
+						vu0_acc_bind_count[source.pc] != 0 ||
+						vu0_macflag_bind_count[source.pc] != 0 ||
+						vu0_vi_mac_bind_count[source.pc] != 0 ||
+						memory_operation_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
+						fcr31_bind_count[source.pc] != 0 ||
+						acc_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"VU0 FDIV lacks its exact guard, Q mirrors, or D/I flags");
+					}
+				}
 				else if (vu0_fmac.valid)
 				{
 					const u32 mask = RS(source.opcode) & 0x0fu;
-					const bool vector_destination = vu0_fmac.kind ==
-						Vu0BroadcastFmacKind::MultiplyAddVector;
+					const bool vector_destination =
+						!vu0_fmac.accumulator_destination;
 					const u32 expected_vf =
 						vector_destination && mask != 0 && SA(source.opcode) != 0 ?
 							1u : 0u;
@@ -5191,12 +8780,49 @@ namespace VitaEE::RegionIR
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
-							"VU0 broadcast FMAC lacks its exact guard, flags, or destination");
+							"VU0 FMAC lacks its exact guard, flags, or destination");
+					}
+				}
+				else if (vu0_unary.valid)
+				{
+					const u32 mask = RS(source.opcode) & 0x0fu;
+					const u32 expected_vf =
+						mask != 0 && RT(source.opcode) != 0 ? 1u : 0u;
+					if (vu0_idle_guard_count[source.pc] != 1 ||
+						vu0_vf_bind_count[source.pc] != expected_vf ||
+						vu0_acc_bind_count[source.pc] != 0 ||
+						vu0_macflag_bind_count[source.pc] != 0 ||
+						vu0_statusflag_bind_count[source.pc] != 0 ||
+						vu0_vi_mac_bind_count[source.pc] != 0 ||
+						vu0_vi_status_bind_count[source.pc] != 0 ||
+						memory_operation_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
+						fcr31_bind_count[source.pc] != 0 ||
+						acc_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"VU0 unary source lacks its exact guard or destination");
 					}
 				}
 				else if (DecodeNoEffect(source.opcode, program.options, &no_effect_kind))
 				{
+					const u32 expected_idle =
+						NoEffectRequiresVu0Idle(no_effect_kind) ? 1u : 0u;
 					if (no_effect_count[source.pc] != 1 ||
+						vu0_idle_guard_count[source.pc] != expected_idle ||
+						vu0_vf_bind_count[source.pc] != 0 ||
+						vu0_acc_bind_count[source.pc] != 0 ||
+						vu0_macflag_bind_count[source.pc] != 0 ||
+						vu0_statusflag_bind_count[source.pc] != 0 ||
+						vu0_vi_mac_bind_count[source.pc] != 0 ||
+						vu0_vi_status_bind_count[source.pc] != 0 ||
 						extended_gpr_bind_count[source.pc] != 0 ||
 						pure_mmi_gpr_bind_count[source.pc] != 0 ||
 						pure_cop1_gpr_bind_count[source.pc] != 0 ||
@@ -5207,6 +8833,28 @@ namespace VitaEE::RegionIR
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
 							"no-effect source lacks one exact witness or changes state");
+					}
+				}
+				else if (const IntegerMultiplyOp multiply =
+						DecodeIntegerMultiply(source.opcode); multiply.valid)
+				{
+					const u32 expected_gpr = RD(source.opcode) != 0 ? 1u : 0u;
+					if (integer_multiply_gpr_bind_count[source.pc] != expected_gpr ||
+						hi_bind_count[source.pc] != 1 ||
+						lo_bind_count[source.pc] != 1 ||
+						!integer_multiply_result.contains(source.pc) ||
+						memory_operation_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						fpr_bind_count[source.pc] != 0 ||
+						fcr31_bind_count[source.pc] != 0 ||
+						acc_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"integer multiply lacks exact shared GPR/HI/LO publication");
 					}
 				}
 				else if (IsExtendedScalarGprWrite(source.opcode))
@@ -5275,7 +8923,10 @@ namespace VitaEE::RegionIR
 				{
 					const bool accumulator =
 						IsBasicCop1Accumulator(arithmetic_kind);
-					if (fcr31_bind_count[source.pc] != 1 ||
+					const u32 expected_guard =
+						program.options.cop1_lazy_ou_guards ? 1u : 0u;
+					if (cop1_exception_count[source.pc] != expected_guard ||
+						fcr31_bind_count[source.pc] != 1 ||
 						fpr_bind_count[source.pc] != (accumulator ? 0u : 1u) ||
 						acc_bind_count[source.pc] != (accumulator ? 1u : 0u) ||
 						extended_gpr_bind_count[source.pc] != 0 ||
@@ -5287,12 +8938,15 @@ namespace VitaEE::RegionIR
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
-							"basic COP1 arithmetic lacks exact result and FCR31 bindings");
+							"basic COP1 arithmetic lacks its exact guard, result, or FCR31 binding");
 					}
 				}
 				else if (DecodeCompoundCop1Arithmetic(source.opcode, nullptr))
 				{
-					if (fcr31_bind_count[source.pc] != 1 ||
+					const u32 expected_guard =
+						program.options.cop1_lazy_ou_guards ? 1u : 0u;
+					if (cop1_exception_count[source.pc] != expected_guard ||
+						fcr31_bind_count[source.pc] != 1 ||
 						fpr_bind_count[source.pc] != 1 ||
 						acc_bind_count[source.pc] != 0 ||
 						extended_gpr_bind_count[source.pc] != 0 ||
@@ -5304,7 +8958,7 @@ namespace VitaEE::RegionIR
 					{
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
-							"MADD.S/MSUB.S lacks exact FPR and FCR31 bindings");
+							"MADD.S/MSUB.S lacks its exact guard, FPR, or FCR31 binding");
 					}
 				}
 				else if (DecodeCop1Compare(source.opcode, nullptr))
@@ -5322,6 +8976,23 @@ namespace VitaEE::RegionIR
 						return Fail(VerifyFailure::SourceMismatch, block_index,
 							UINT32_MAX,
 							"COP1 comparison lacks one exact FCR31.C binding");
+					}
+				}
+				else if (DecodeCop1UnaryWord(source.opcode, nullptr))
+				{
+					if (fpr_bind_count[source.pc] != 1 ||
+						fcr31_bind_count[source.pc] != 1 ||
+						acc_bind_count[source.pc] != 0 ||
+						extended_gpr_bind_count[source.pc] != 0 ||
+						pure_mmi_gpr_bind_count[source.pc] != 0 ||
+						pure_cop1_gpr_bind_count[source.pc] != 0 ||
+						hi_bind_count[source.pc] != 0 ||
+						lo_bind_count[source.pc] != 0 ||
+						sa_bind_count[source.pc] != 0)
+					{
+						return Fail(VerifyFailure::SourceMismatch, block_index,
+							UINT32_MAX,
+							"COP1 unary source lacks exact FPR and FCR31 bindings");
 					}
 				}
 				else if (IsCop1ConvertWord(source.opcode) ||
@@ -5363,6 +9034,36 @@ namespace VitaEE::RegionIR
 							return Fail(VerifyFailure::SourceMismatch, block_index,
 								UINT32_MAX,
 								"pure MMI source has the wrong architectural binding");
+						}
+					}
+					else if (DecodePackedBinaryMmi(source.opcode, nullptr))
+					{
+						const u32 expected_gpr = RD(source.opcode) != 0 ? 1u : 0u;
+						if (pure_mmi_gpr_bind_count[source.pc] != expected_gpr ||
+							hi_bind_count[source.pc] != 0 ||
+							lo_bind_count[source.pc] != 0 ||
+							extended_gpr_bind_count[source.pc] != 0 ||
+							pure_cop1_gpr_bind_count[source.pc] != 0 ||
+							fpr_bind_count[source.pc] != 0 ||
+							sa_bind_count[source.pc] != 0)
+						{
+							return Fail(VerifyFailure::SourceMismatch, block_index,
+								UINT32_MAX,
+								"packed MMI source has the wrong architectural binding");
+						}
+					}
+					else if (DecodePackedShiftMmi(source.opcode, nullptr))
+					{
+						const u32 expected_gpr = RD(source.opcode) != 0 ? 1u : 0u;
+						if (pure_mmi_gpr_bind_count[source.pc] != expected_gpr ||
+							hi_bind_count[source.pc] != 0 || lo_bind_count[source.pc] != 0 ||
+							extended_gpr_bind_count[source.pc] != 0 ||
+							pure_cop1_gpr_bind_count[source.pc] != 0 ||
+							fpr_bind_count[source.pc] != 0 || sa_bind_count[source.pc] != 0)
+						{
+							return Fail(VerifyFailure::SourceMismatch, block_index,
+								UINT32_MAX,
+								"packed shift source has the wrong architectural binding");
 						}
 					}
 					else
@@ -5437,7 +9138,16 @@ namespace VitaEE::RegionIR
 			auto verify_transfer = [&](const Transfer& transfer,
 				const StateMap& expected_state, bool expected_deferred,
 				u32 expected_pending_raw_cycles,
-				bool expected_event_horizon_check) -> VerifyResult {
+				bool expected_event_horizon_check,
+				const DirectCallContract* internal_return = nullptr) -> VerifyResult {
+				if (block.terminator.kind != TerminatorKind::RegisterJump &&
+					(transfer.register_target_proven ||
+					 transfer.proven_register_target_pc != 0))
+				{
+					return Fail(VerifyFailure::ControlFlowMismatch, block_index,
+						UINT32_MAX,
+						"non-register edge carries a forged register-target proof");
+				}
 				if (!StateMapsEqual(transfer.state, expected_state))
 					return Fail(
 						VerifyFailure::StateMapMismatch, block_index, UINT32_MAX,
@@ -5470,7 +9180,18 @@ namespace VitaEE::RegionIR
 				if (block.terminator.kind == TerminatorKind::RegisterJump)
 				{
 					if (!captured_control_input ||
-						transfer.target_block != INVALID_BLOCK ||
+						(internal_return ?
+							(transfer.target_block == INVALID_BLOCK ||
+							 !transfer.register_target_proven ||
+							 transfer.proven_register_target_pc !=
+								internal_return->return_pc ||
+							 transfer.target_block >= program.blocks.size() ||
+							 program.blocks[transfer.target_block].pc !=
+								internal_return->return_pc ||
+							 expected_state.gpr[31] != block.parameters.gpr[31]) :
+							(transfer.target_block != INVALID_BLOCK ||
+							 transfer.register_target_proven ||
+							 transfer.proven_register_target_pc != 0)) ||
 						transfer.external_reason != ExitReason::RegionBoundary ||
 						pc_node.opcode != Opcode::AddressFromI32 ||
 						pc_node.source_pc != block.terminator.branch_pc ||
@@ -5478,7 +9199,7 @@ namespace VitaEE::RegionIR
 					{
 						return Fail(VerifyFailure::ControlFlowMismatch, block_index,
 							UINT32_MAX,
-							"register jump target is not one external pre-delay Address");
+							"register jump target lacks its exact pre-delay or internal-return proof");
 					}
 					const Node& target =
 						block.nodes[defining_node[pc_node.operands[0]]];
@@ -5521,8 +9242,7 @@ namespace VitaEE::RegionIR
 				else
 				{
 					const ExitReason expected_reason = ClassifyExternalResume(
-						program.source_base_pc, program.source_words, static_pc,
-						program.options);
+						program.source_spans, static_pc, program.options);
 					if (transfer.external_reason != expected_reason)
 					{
 						return Fail(VerifyFailure::ExitContractMismatch, block_index,
@@ -5541,6 +9261,25 @@ namespace VitaEE::RegionIR
 				expected_event_horizon_check);
 			if (!transfer_check)
 				return transfer_check;
+			if (block.terminator.kind == TerminatorKind::RegisterJump)
+			{
+				for (const Transfer& target : block.terminator.register_targets)
+				{
+					const auto direct_return =
+						direct_return_for_pc(target.proven_register_target_pc);
+					if (direct_return == program.direct_calls.end())
+					{
+						return Fail(VerifyFailure::DirectCallContract, block_index,
+							UINT32_MAX,
+							"register return target has no attested call site");
+					}
+					transfer_check = verify_transfer(target, primary_expected,
+						deferred_observer, deferred_observer ? raw_cycles : 0,
+						expected_event_horizon_check, &*direct_return);
+					if (!transfer_check)
+						return transfer_check;
+				}
+			}
 			if (source_contract && !source_contract->scheduler_test_at_end &&
 				!deferred_observer &&
 				block.terminator.kind != TerminatorKind::Transfer)
@@ -5591,6 +9330,9 @@ namespace VitaEE::RegionIR
 					       extract.source_pc == block.terminator.branch_pc;
 				};
 				const u32 branch_opcode = block.source[block.source.size() - 2].opcode;
+				bool cop1_branch_on_true = false;
+				const bool cop1_branch =
+					DecodeCop1Branch(branch_opcode, &cop1_branch_on_true);
 				const u32 encoded_primary = branch_opcode >> 26;
 				const u32 primary =
 					encoded_primary >= 0x14 && encoded_primary <= 0x17 ?
@@ -5598,7 +9340,16 @@ namespace VitaEE::RegionIR
 						encoded_primary;
 				Opcode expected_condition = Opcode::CompareEqual64;
 				bool predicate_matches = false;
-				switch (primary)
+				if (cop1_branch)
+				{
+					predicate_matches =
+						condition.opcode == Opcode::Cop1BranchCondition &&
+						condition.operand_count == 1 &&
+						condition.operands[0] == control_input.fcr31 &&
+						condition.immediate == (cop1_branch_on_true ? 1u : 0u) &&
+						condition.literal == 0;
+				}
+				else switch (primary)
 				{
 					case 0x01:
 						expected_condition = (RT(branch_opcode) & 1u) == 0 ? Opcode::CompareSignedLessZero64 : Opcode::CompareSignedGreaterEqualZero64;
@@ -5729,6 +9480,11 @@ namespace VitaEE::RegionIR
 			{
 				pending.push_back(block.terminator.not_taken.target_block);
 			}
+			for (const Transfer& target : block.terminator.register_targets)
+			{
+				if (target.target_block != INVALID_BLOCK)
+					pending.push_back(target.target_block);
+			}
 		}
 		if (std::find(reachable.begin(), reachable.end(), false) != reachable.end())
 			return Fail(VerifyFailure::UnreachableBlock, INVALID_BLOCK, UINT32_MAX,
@@ -5794,12 +9550,22 @@ namespace VitaEE::RegionIR
 				{ValueType::I32, Bits(state.vu0_macflag)};
 			values[block.parameters.vu0_statusflag] =
 				{ValueType::I32, Bits(state.vu0_statusflag)};
-			values[block.parameters.vu0_vi_mac] =
-				{ValueType::I32, Bits(state.vu0_vi_mac)};
-			values[block.parameters.vu0_vi_status] =
-				{ValueType::I32, Bits(state.vu0_vi_status)};
-			values[block.parameters.vu0_vpu_stat] =
-				{ValueType::I32, Bits(state.vu0_vpu_stat)};
+			values[block.parameters.vu0_clipflag] =
+				{ValueType::I32, Bits(state.vu0_clipflag)};
+			values[block.parameters.vu0_q] =
+				{ValueType::I32, Bits(state.vu0_q)};
+			for (u32 vi = 0; vi < VU0_VI_COUNT; vi++)
+				values[block.parameters.vu0_vi[vi]] =
+					{ValueType::I32, Bits(state.vu0_vi[vi])};
+			for (u32 instance = 0; instance < 4; instance++)
+			{
+				values[block.parameters.vu0_micro_macflags[instance]] =
+					{ValueType::I32, Bits(state.vu0_micro_macflags[instance])};
+				values[block.parameters.vu0_micro_clipflags[instance]] =
+					{ValueType::I32, Bits(state.vu0_micro_clipflags[instance])};
+				values[block.parameters.vu0_micro_statusflags[instance]] =
+					{ValueType::I32, Bits(state.vu0_micro_statusflags[instance])};
+			}
 			values[block.parameters.cycle] = {ValueType::Cycle, Bits(state.cycle)};
 			values[block.parameters.memory_effect] = memory_effect;
 		};
@@ -5827,12 +9593,22 @@ namespace VitaEE::RegionIR
 				values[transfer.state.vu0_macflag].bits.lo);
 			state.vu0_statusflag = static_cast<u32>(
 				values[transfer.state.vu0_statusflag].bits.lo);
-			state.vu0_vi_mac = static_cast<u32>(
-				values[transfer.state.vu0_vi_mac].bits.lo);
-			state.vu0_vi_status = static_cast<u32>(
-				values[transfer.state.vu0_vi_status].bits.lo);
-			state.vu0_vpu_stat = static_cast<u32>(
-				values[transfer.state.vu0_vpu_stat].bits.lo);
+			state.vu0_clipflag = static_cast<u32>(
+				values[transfer.state.vu0_clipflag].bits.lo);
+			state.vu0_q = static_cast<u32>(
+				values[transfer.state.vu0_q].bits.lo);
+			for (u32 vi = 0; vi < VU0_VI_COUNT; vi++)
+				state.vu0_vi[vi] = static_cast<u32>(
+					values[transfer.state.vu0_vi[vi]].bits.lo);
+			for (u32 instance = 0; instance < 4; instance++)
+			{
+				state.vu0_micro_macflags[instance] = static_cast<u32>(
+					values[transfer.state.vu0_micro_macflags[instance]].bits.lo);
+				state.vu0_micro_clipflags[instance] = static_cast<u32>(
+					values[transfer.state.vu0_micro_clipflags[instance]].bits.lo);
+				state.vu0_micro_statusflags[instance] = static_cast<u32>(
+					values[transfer.state.vu0_micro_statusflags[instance]].bits.lo);
+			}
 			state.cycle = values[transfer.state.cycle].bits.lo;
 			state.pc = static_cast<u32>(values[transfer.pc].bits.lo);
 			return state;
@@ -5841,37 +9617,66 @@ namespace VitaEE::RegionIR
 		u32 block_index = program.entry_block;
 		assign_parameters(program.blocks[block_index], current,
 			{ValueType::MemoryEffect, Bits(0)});
-		auto exit_before_source = [&](const Block& block, const Node& node,
+		auto exit_before_observer = [&](const Block& block, const Node& node,
 									 ExitReason reason) {
-			u32 pending_raw_cycles = 0;
-			u32 source_instructions_executed = 0;
+			const auto found = std::find_if(block.observer_exits.begin(),
+				block.observer_exits.end(), [&](const ObserverExit& exit) {
+					return exit.operation == node.id;
+				});
+			if (found == block.observer_exits.end())
+			{
+				result.error = "synchronization observer lacks its verified fallback transfer";
+				return;
+			}
+			const Transfer& transfer = found->transfer;
+			current = materialize(transfer);
 			for (const SourceInstruction& source : block.source)
 			{
-				if (source.pc == node.source_pc)
+				if (source.pc == current.pc)
 					break;
-				pending_raw_cycles += RawRecompilerCycles(source.opcode,
-					program.options.cycle_factor);
-				source_instructions_executed++;
+				result.source_instructions_executed++;
 			}
-			result.source_instructions_executed +=
-				source_instructions_executed;
-			current.gpr[0] = {};
-			current.pc = node.source_pc;
 			*output = current;
 			result.completed = true;
 			result.reason = reason;
-			result.cycle_commit_deferred = true;
-			result.pending_raw_cycles = pending_raw_cycles;
+			result.cycle_commit_deferred = transfer.cycle_commit_deferred;
+			result.pending_raw_cycles = transfer.pending_raw_cycles;
 		};
 		auto exit_before_memory = [&](const Block& block, const Node& node,
 									  u32 address, ExitReason reason) {
-			exit_before_source(block, node, reason);
+			const auto found = std::find_if(block.memory_exits.begin(),
+				block.memory_exits.end(), [&](const MemoryExit& exit) {
+					return exit.operation == node.id;
+				});
+			if (found == block.memory_exits.end())
+			{
+				result.error = "memory operation lacks its verified fallback transfer";
+				return;
+			}
+			const Transfer& transfer = found->transfer;
+			current = materialize(transfer);
+			for (const SourceInstruction& source : block.source)
+			{
+				if (source.pc == current.pc)
+					break;
+				result.source_instructions_executed++;
+			}
+			*output = current;
+			result.completed = true;
+			result.reason = reason;
+			result.cycle_commit_deferred = transfer.cycle_commit_deferred;
+			result.pending_raw_cycles = transfer.pending_raw_cycles;
 			result.memory_address = address;
 		};
 		for (;;)
 		{
 			if (result.blocks_executed >= options.max_block_executions)
 			{
+				// Preserve the last mechanically materialized edge state for bounded
+				// differential diagnostics.  This is not a successful execution result,
+				// but it identifies the exact looping PC/state without another hot-path
+				// logging mechanism.
+				*output = current;
 				result.error = "Region IR execution exceeded its validation block budget";
 				return result;
 			}
@@ -5881,6 +9686,13 @@ namespace VitaEE::RegionIR
 				 node_index++)
 			{
 				const Node& node = block.nodes[node_index];
+				const bool annulled_likely_delay =
+					block.terminator.kind == TerminatorKind::Branch &&
+					block.terminator.likely && node.opcode != Opcode::Parameter &&
+					node.source_pc == block.terminator.delay_slot_pc &&
+					values[block.terminator.condition].bits.lo == 0;
+				if (annulled_likely_delay)
+					continue;
 				const u64 left =
 					node.operand_count > 0 ? values[node.operands[0]].bits.lo : 0;
 				const u64 right =
@@ -5921,6 +9733,10 @@ namespace VitaEE::RegionIR
 					case Opcode::BitcastF32BitsToI32:
 						bits = Bits(static_cast<u32>(left));
 						break;
+					case Opcode::BitcastI128ToVuF32x4Bits:
+					case Opcode::BitcastVuF32x4BitsToI128:
+						bits = values[node.operands[0]].bits;
+						break;
 					case Opcode::Cop1NormalizeInput:
 						bits = Bits(NormalizeCop1Input(static_cast<u32>(left)));
 						break;
@@ -5929,6 +9745,10 @@ namespace VitaEE::RegionIR
 					case Opcode::Cop1MulRaw:
 						bits = Bits(EvaluateBasicCop1Raw(node.opcode,
 							static_cast<u32>(left), static_cast<u32>(right)));
+						break;
+					case Opcode::Cop1ExceptionalOuResult:
+						bits = Bits(IsExceptionalBasicCop1Result(
+							static_cast<u32>(left)) ? 1u : 0u);
 						break;
 					case Opcode::Cop1ClampOuResult:
 						bits = Bits(ClampBasicCop1Result(static_cast<u32>(left)));
@@ -5947,6 +9767,19 @@ namespace VitaEE::RegionIR
 						bits = Bits(UpdateCop1ConditionFlag(static_cast<u32>(left),
 							right != 0));
 						break;
+					case Opcode::Cop1BranchCondition:
+						bits = Bits((((static_cast<u32>(left) & FCR31_C) != 0) ==
+							(node.immediate != 0)) ? 1u : 0u);
+						break;
+					case Opcode::Cop1AbsoluteWord:
+						bits = Bits(static_cast<u32>(left) & 0x7fffffffu);
+						break;
+					case Opcode::Cop1NegateWord:
+						bits = Bits(static_cast<u32>(left) ^ 0x80000000u);
+						break;
+					case Opcode::Cop1ClearOuFlags:
+						bits = Bits(static_cast<u32>(left) & ~(FCR31_O | FCR31_U));
+						break;
 					case Opcode::Cop1ConvertWord:
 						bits = Bits(ConvertCop1Word(static_cast<u32>(left)));
 						break;
@@ -5958,6 +9791,18 @@ namespace VitaEE::RegionIR
 							static_cast<s64>(std::bit_cast<s32>(static_cast<u32>(left)))));
 						break;
 					case Opcode::ZeroExtend32To64:
+						bits = Bits(static_cast<u32>(left));
+						break;
+					case Opcode::MultiplySigned32:
+						bits = Bits(static_cast<u64>(
+							static_cast<s64>(std::bit_cast<s32>(static_cast<u32>(left))) *
+							static_cast<s64>(std::bit_cast<s32>(static_cast<u32>(right)))));
+						break;
+					case Opcode::MultiplyUnsigned32:
+						bits = Bits(static_cast<u64>(static_cast<u32>(left)) *
+							static_cast<u64>(static_cast<u32>(right)));
+						break;
+					case Opcode::Truncate64To32:
 						bits = Bits(static_cast<u32>(left));
 						break;
 					case Opcode::Add32:
@@ -6026,6 +9871,51 @@ namespace VitaEE::RegionIR
 							~(values[node.operands[0]].bits.hi |
 								values[node.operands[1]].bits.hi)};
 						break;
+					case Opcode::PackedBinary128:
+						bits = EvaluatePackedBinary(
+							static_cast<PackedBinaryKind>(node.immediate),
+							values[node.operands[0]].bits,
+							values[node.operands[1]].bits);
+						break;
+					case Opcode::PackedShift128:
+					{
+						const PackedShiftKind kind =
+							static_cast<PackedShiftKind>(node.immediate);
+						const u32 amount = static_cast<u32>(node.literal);
+						const u128 source = values[node.operands[0]].bits;
+						bits = {};
+						if (kind <= PackedShiftKind::RightArithmetic16)
+						{
+							for (u32 lane = 0; lane < 8; lane++)
+							{
+								const u16 raw = PackedLane<u16>(source, lane);
+								u16 value = raw;
+								if (kind == PackedShiftKind::LeftLogical16)
+									value = static_cast<u16>(raw << amount);
+								else if (kind == PackedShiftKind::RightLogical16)
+									value = static_cast<u16>(raw >> amount);
+								else
+									value = PackedShiftRightArithmetic(raw, amount);
+								SetPackedLane(&bits, lane, value);
+							}
+						}
+						else
+						{
+							for (u32 lane = 0; lane < 4; lane++)
+							{
+								const u32 raw = PackedLane<u32>(source, lane);
+								u32 value = raw;
+								if (kind == PackedShiftKind::LeftLogical32)
+									value = raw << amount;
+								else if (kind == PackedShiftKind::RightLogical32)
+									value = raw >> amount;
+								else
+									value = PackedShiftRightArithmetic(raw, amount);
+								SetPackedLane(&bits, lane, value);
+							}
+						}
+						break;
+					}
 					case Opcode::PackLow64:
 						bits = {values[node.operands[1]].bits.lo,
 							values[node.operands[0]].bits.lo};
@@ -6119,11 +10009,22 @@ namespace VitaEE::RegionIR
 					case Opcode::Vu0RequireIdle:
 						if ((static_cast<u32>(left) & 1u) != 0)
 						{
-							exit_before_source(block, node,
+							exit_before_observer(block, node,
 								ExitReason::HelperObserver);
 							return result;
 						}
 						bits = values[node.operands[1]].bits;
+						break;
+					case Opcode::Vu0ConvertFixed:
+						bits = ConvertVu0Fixed(values[node.operands[0]].bits,
+							node.immediate);
+						break;
+					case Opcode::Vu0ConvertIntegerToFloat:
+						bits = ConvertVu0IntegerToFloat(
+							values[node.operands[0]].bits, node.immediate);
+						break;
+					case Opcode::Vu0Rotate32:
+						bits = RotateVu0Words(values[node.operands[0]].bits);
 						break;
 					case Opcode::Vu0NormalizeVector:
 						bits = NormalizeVuVector(values[node.operands[0]].bits,
@@ -6133,8 +10034,42 @@ namespace VitaEE::RegionIR
 						bits = BroadcastVuLane(values[node.operands[0]].bits,
 							node.immediate);
 						break;
+					case Opcode::Vu0BroadcastScalar:
+						bits = BroadcastVuScalar(static_cast<u32>(left),
+							program.options.vu0_overflow_clamp);
+						break;
+					case Opcode::Vu0FdivQ:
+					{
+						const Vu0FdivOp fdiv = DecodeVu0FdivImmediate(node.immediate);
+						bits = Bits(EvaluateVu0FdivQ(fdiv,
+							values[node.operands[0]].bits,
+							values[node.operands[1]].bits,
+							program.options.vu0_overflow_clamp));
+						break;
+					}
+					case Opcode::Vu0FdivFlags:
+					{
+						const Vu0FdivOp fdiv = DecodeVu0FdivImmediate(node.immediate);
+						bits = Bits(EvaluateVu0FdivFlags(fdiv,
+							values[node.operands[0]].bits,
+							values[node.operands[1]].bits,
+							program.options.vu0_overflow_clamp));
+						break;
+					}
+					case Opcode::Vu0UpdateFdivStatus:
+						bits = Bits((static_cast<u32>(left) & ~0x30u) |
+							(static_cast<u32>(right) & 0x30u));
+						break;
+					case Opcode::Vu0SyncFdivStatusControl:
+					{
+						const u32 current = static_cast<u32>(right) & 0x30u;
+						bits = Bits((static_cast<u32>(left) & 0x3cfu) |
+							current | (current << 6));
+						break;
+					}
 					case Opcode::Vu0MulRaw:
 					case Opcode::Vu0AddRaw:
+					case Opcode::Vu0SubRaw:
 						bits = EvaluateVuRawBinary(node.opcode,
 							values[node.operands[0]].bits,
 							values[node.operands[1]].bits);
@@ -6159,6 +10094,34 @@ namespace VitaEE::RegionIR
 							static_cast<u32>(right) |
 							(static_cast<u32>(right) << 6));
 						break;
+					case Opcode::Vu0ControlWrite:
+					{
+						const u32 target = node.immediate;
+						const u32 old_value = static_cast<u32>(left);
+						const u32 source = static_cast<u32>(right);
+						u32 value = source;
+						if (target == 0 || target == VU0_MAC_FLAG ||
+							target == VU0_TPC || target == VU0_VPU_STAT)
+						{
+							value = old_value;
+						}
+						else if (target < VU0_STATUS_FLAG)
+							value = (old_value & 0xffff0000u) | (source & 0xffffu);
+						else if (target == VU0_STATUS_FLAG)
+							value = (old_value & 0x3fu) | (source & 0x0fc0u);
+						else if (target == VU0_R)
+							value = (source & 0x007fffffu) | 0x3f800000u;
+						bits = Bits(value);
+						break;
+					}
+					case Opcode::Vu0DenormalizeStatus:
+					{
+						const u32 status = static_cast<u32>(left);
+						bits = Bits(((status >> 3) & 0x18u) |
+							((status << 11) & 0x1800u) |
+							((status << 14) & 0x03cf0000u));
+						break;
+					}
 					case Opcode::MemoryLoad:
 					case Opcode::MemoryStore:
 					{
@@ -6301,10 +10264,26 @@ namespace VitaEE::RegionIR
 						current.vu0_statusflag = static_cast<u32>(left);
 						break;
 					case Opcode::BindVu0ViMac:
-						current.vu0_vi_mac = static_cast<u32>(left);
+						current.vu0_vi[17] = static_cast<u32>(left);
 						break;
 					case Opcode::BindVu0ViStatus:
-						current.vu0_vi_status = static_cast<u32>(left);
+						current.vu0_vi[16] = static_cast<u32>(left);
+						break;
+					case Opcode::BindVu0Q:
+						current.vu0_q = static_cast<u32>(left);
+						break;
+					case Opcode::BindVu0ViQ:
+						current.vu0_vi[22] = static_cast<u32>(left);
+						break;
+					case Opcode::BindVu0Vi:
+						current.vu0_vi[node.immediate] = static_cast<u32>(left);
+						break;
+					case Opcode::BindVu0ClipFlag:
+						current.vu0_clipflag = static_cast<u32>(left);
+						break;
+					case Opcode::BindVu0MicroStatusFlag:
+						current.vu0_micro_statusflags[node.immediate] =
+							static_cast<u32>(left);
 						break;
 					case Opcode::BindFcr31:
 						current.fcr31 =
@@ -6348,6 +10327,20 @@ namespace VitaEE::RegionIR
 				values[block.terminator.condition].bits.lo == 0)
 			{
 				transfer = &block.terminator.not_taken;
+			}
+			else if (block.terminator.kind == TerminatorKind::RegisterJump)
+			{
+				const u32 target_pc =
+					static_cast<u32>(values[block.terminator.taken.pc].bits.lo);
+				const auto internal = std::find_if(
+					block.terminator.register_targets.begin(),
+					block.terminator.register_targets.end(),
+					[&](const Transfer& target) {
+						return target.register_target_proven &&
+							target.proven_register_target_pc == target_pc;
+					});
+				if (internal != block.terminator.register_targets.end())
+					transfer = &*internal;
 			}
 			u32 block_source_instructions =
 				static_cast<u32>(block.source.size());

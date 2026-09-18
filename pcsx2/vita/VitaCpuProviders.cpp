@@ -31,6 +31,8 @@
 #include "vita/VitaEeBlockCompiler.h"
 #include "vita/VitaEeDmacWait.h"
 #include "vita/VitaEeExecutor.h"
+#include "vita/VitaEeRegionRuntime.h"
+#include "vita/VitaEeSemanticKernel.h"
 #include "vita/VitaIopBlockCompiler.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
@@ -50,6 +52,11 @@ static VitaEePreInstructionTraceCallback s_ee_pre_instruction_trace_callback = n
 static VitaEePreInstructionTraceWindowSkipCallback s_ee_pre_instruction_trace_window_skip_callback = nullptr;
 static VitaIopPreInstructionTraceCallback s_iop_pre_instruction_trace_callback = nullptr;
 static VitaEE::BlockExecutor s_ee_a32_executor;
+static u32 s_ee_region_generated_failure_reports = 0;
+#if defined(VITASX2_EE_REGION_EXECUTION)
+static VitaEE::RegionRuntime::Runtime s_ee_region_runtime{
+	&s_ee_a32_executor};
+#endif
 static VitaIOP::BlockExecutor s_iop_a32_executor{true};
 static VitaA32EeWaitSchedulerCertificate s_ee_wait_scheduler_certificate;
 static VitaA32EeWaitSchedulerCertificate
@@ -739,7 +746,11 @@ static bool recRefreshEeLifecycleDispatchBarriers()
 	// collide (or be distinct virtual aliases of one RAM word), so publish the
 	// complete desired union in one executor transaction. EELOAD_START remains
 	// present for later BIOS/OSDSYS reloads even after the other hooks move.
-	std::array<u32, 4> barriers{};
+	std::array<u32, 4
+#if defined(VITASX2_EE_REGION_EXECUTION)
+		+ VitaEE::RegionRuntime::Runtime::MAX_ARMED_PROBES
+#endif
+		> barriers{};
 	size_t count = 0;
 	barriers[count++] = EELOAD_START;
 	if (g_eeloadMain)
@@ -749,12 +760,43 @@ static bool recRefreshEeLifecycleDispatchBarriers()
 	const u32 entry = VMManager::Internal::GetCurrentELFEntryPoint();
 	if (entry != UINT32_MAX)
 		barriers[count++] = entry;
-	return s_ee_a32_executor.SetPersistentDispatchBarriers(
-		barriers.data(), count);
+#if defined(VITASX2_EE_REGION_EXECUTION)
+	const size_t region_count = s_ee_region_runtime.CopyBarrierPcs(
+		barriers.data() + count, barriers.size() - count);
+	if (region_count > barriers.size() - count)
+		return false;
+	count += region_count;
+#endif
+	if (!s_ee_a32_executor.SetPersistentDispatchBarriers(
+			barriers.data(), count))
+	{
+		return false;
+	}
+#if defined(VITASX2_EE_REGION_EXECUTION)
+	std::array<VitaEE::PersistentGeneratedEntry,
+		VitaEE::RegionRuntime::Runtime::MAX_GENERATED_OWNERS> generated_entries{};
+	const size_t generated_count =
+		s_ee_region_runtime.CopyPersistentGeneratedEntries(
+			generated_entries.data(), generated_entries.size());
+	if (generated_count > generated_entries.size())
+		return false;
+	if (!s_ee_a32_executor.SetPersistentGeneratedEntries(
+			generated_entries.data(), generated_count))
+	{
+		return false;
+	}
+	if (!s_ee_region_runtime.RepatchPersistentGeneratedExits())
+		return false;
+	s_ee_region_runtime.AcknowledgePublishedCodeRetirements();
+	return true;
+#else
+	return true;
+#endif
 }
 
 static void recResetEeLifecycleDispatchBarriers()
 {
+	s_ee_a32_executor.ClearPersistentGeneratedEntries();
 	s_ee_a32_executor.ClearPersistentDispatchBarriers();
 	// PCSX2's recRecompile() discovers the EELOAD main hook when it compiles
 	// this entry. Keep only this exceptional entry on the provider boundary;
@@ -841,6 +883,20 @@ static bool recProcessEeLifecycleBoundary(u32 pc)
 	// PCSX2 updates these hooks only at the EELOAD/ELF seams above, so reconcile
 	// the executor only when one of those owners was actually observed.
 	return !refresh_barriers || recRefreshEeLifecycleDispatchBarriers();
+}
+
+static bool recIsEeLifecycleBoundary(u32 pc)
+{
+	const u32 lifecycle_pc =
+		VitaEE::BlockExecutor::CanonicalizeRamBackedPc(pc);
+	const u32 entry = VMManager::Internal::GetCurrentELFEntryPoint();
+	return (entry != UINT32_MAX && lifecycle_pc ==
+			VitaEE::BlockExecutor::CanonicalizeRamBackedPc(entry)) ||
+		lifecycle_pc == EELOAD_START ||
+		(g_eeloadMain && lifecycle_pc ==
+			VitaEE::BlockExecutor::CanonicalizeRamBackedPc(g_eeloadMain)) ||
+		(g_eeloadExec && lifecycle_pc ==
+			VitaEE::BlockExecutor::CanonicalizeRamBackedPc(g_eeloadExec));
 }
 
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
@@ -1121,9 +1177,17 @@ recRunEeEventForGeneratedResumeCore(
 			retained_ram_wait_events;
 		s_ee_a32_stats.retained_ram_wait_write_exits +=
 			retained_ram_wait_write_exits;
-		if (!resume)
-			s_ee_a32_stats.in_frame_event_resume_refusals++;
 	}
+#if defined(VITASX2_EE_REGION_EXECUTION)
+	// The generated dispatcher normally resumes in-frame here, bypassing the
+	// outer provider for thousands of events. Generated probes and regions set one
+	// shared maintenance flag; after the complete PCSX2 event owner, unwind only
+	// when that flag identifies a real compilation or publication transaction.
+	if (s_ee_region_runtime.ObservePersistentEventBoundary(cpuRegs.pc))
+		resume = false;
+#endif
+	if (VitaPerformanceTelemetry::IsEnabled() && !resume)
+		s_ee_a32_stats.in_frame_event_resume_refusals++;
 	if (resume)
 		VitaEE::RefreshRawGpr0KnownZero();
 	return resume ? 1u : 0u;
@@ -1142,10 +1206,17 @@ static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& r
 	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
 		VitaPerformanceTelemetry::CpuStage::EeProvider);
 	recAccountEeBlockExecution(result, cpuRegs.pc);
-	if (!recProcessEeLifecycleBoundary(cpuRegs.pc))
+	if (result.persistent_resume_requires_boundary)
 	{
-		Console.Error("Vita EE could not preserve a PCSX2 lifecycle dispatch seam.");
-		s_ee_a32_exit_execution = true;
+		s_ee_a32_stats.persistent_required_outer_unwinds++;
+		return false;
+	}
+	// Lifecycle hooks may reset providers or republish executable ownership.
+	// Detect them without mutation and let recExecute() run the owner only after
+	// this generated dispatcher frame has unwound.
+	if (recIsEeLifecycleBoundary(cpuRegs.pc))
+	{
+		s_ee_a32_stats.persistent_required_outer_unwinds++;
 		return false;
 	}
 #if defined(VITASX2_QEMU_VALIDATION) || defined(VITASX2_PORTABLE_REPLAY_VALIDATION) || \
@@ -1162,6 +1233,7 @@ static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& r
 	if (natural_scheduler_boundary && recDidEeTraceLimitHitAtNaturalBoundary())
 	{
 		s_ee_a32_exit_execution = true;
+		s_ee_a32_stats.persistent_required_outer_unwinds++;
 		return false;
 	}
 #endif
@@ -1171,6 +1243,45 @@ static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& r
 	{
 		s_ee_a32_persistent_boundary_hit_limit = true;
 		s_ee_a32_exit_execution = true;
+		s_ee_a32_stats.persistent_required_outer_unwinds++;
+		return false;
+	}
+#endif
+	const bool can_continue = !s_ee_a32_exit_execution &&
+		!s_ee_a32_cache_reset_requested &&
+		s_ee_a32_persistent_dispatch_enabled &&
+		s_ee_pre_instruction_trace_callback == nullptr;
+#if defined(VITASX2_EE_REGION_EXECUTION)
+#if defined(VITASX2_QEMU_VALIDATION)
+	if (can_continue &&
+		s_ee_region_runtime.ObserveTierZeroBoundary(result, cpuRegs.pc))
+	{
+		if (s_ee_region_runtime.RequiresOuterBoundary())
+		{
+			s_ee_a32_stats.persistent_required_outer_unwinds++;
+			return false;
+		}
+		// Active regions are published in the generated directory. Returning to the
+		// dispatcher makes its ordinary prepared-target path select that A32 entry;
+		// never invoke the callable Runtime::ExecuteAtPc() seam from this callback.
+		return true;
+	}
+#else
+	// Product discovery happens only when a tier-zero source owner is first
+	// prepared, and generated probes/regions request publication through the
+	// scheduler-event maintenance flag. Both seams already return false before an
+	// ownership transaction. Active regions are first-class generated-directory
+	// entries, so re-hashing cpuRegs.pc at every ordinary provider boundary can
+	// neither discover nor select one; it only taxes all EE execution.
+#endif
+	// A generated event callback which found admission/retirement work returns to
+	// this cold dispatcher seam.  It has not reached recExecute() yet: accepting
+	// the boundary here would merely perform a C++ lookup and re-enter generated
+	// code with the same pending ownership transaction on every subsequent event.
+	// Unwind exactly once so the outer owner can compile and publish it.
+	if (can_continue && s_ee_region_runtime.RequiresOuterBoundary())
+	{
+		s_ee_a32_stats.persistent_required_outer_unwinds++;
 		return false;
 	}
 #endif
@@ -1179,10 +1290,20 @@ static bool recPersistentEeBoundary(void*, const VitaEE::BlockExecutionResult& r
 	// point, so it must unwind that frame before newly compiled callable/persistent
 	// code can be entered.  Continuing here would tail-enter a block compiled for
 	// the replacement ABI from the old dispatch frame.
-	return !s_ee_a32_exit_execution && !s_ee_a32_cache_reset_requested &&
-		s_ee_a32_persistent_dispatch_enabled &&
-		s_ee_pre_instruction_trace_callback == nullptr;
+	if (!can_continue)
+		s_ee_a32_stats.persistent_required_outer_unwinds++;
+	return can_continue;
 }
+
+#if defined(VITASX2_EE_REGION_EXECUTION)
+static bool recPersistentEePrepared(void*,
+	const VitaEE::BlockExecutionResult& result)
+{
+	const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+		VitaPerformanceTelemetry::CpuStage::EeProvider);
+	return !s_ee_region_runtime.ObservePreparedTierZeroBlock(result);
+}
+#endif
 
 static bool recCanSplitEeBlockForCodeBudget()
 {
@@ -1206,6 +1327,11 @@ static void recReserve()
 
 static void recShutdown()
 {
+#if defined(VITASX2_EE_REGION_EXECUTION)
+	s_ee_region_runtime.ResetCode();
+	s_ee_region_runtime.ResetStatistics();
+	s_ee_region_generated_failure_reports = 0;
+#endif
 	s_ee_a32_executor.ClearPersistentDispatchBarriers();
 	s_ee_a32_executor.Shutdown();
 	recResetEeDispatchState();
@@ -1219,6 +1345,11 @@ static void recReset()
 	intCpu.Reset();
 	VitaEE::RefreshRawGpr0KnownZero();
 	s_ee_a32_executor.Reset();
+#if defined(VITASX2_EE_REGION_EXECUTION)
+	s_ee_region_runtime.ResetCode();
+	s_ee_region_runtime.ResetStatistics();
+	s_ee_region_generated_failure_reports = 0;
+#endif
 	recResetEeDispatchState();
 	recResetEeLifecycleDispatchBarriers();
 	VitaResetA32EeProviderStats();
@@ -1289,6 +1420,31 @@ static void recExecute()
 		if (fast_dispatch && !s_ee_a32_persistent_dispatch_enabled)
 			continue;
 
+#if defined(VITASX2_EE_REGION_EXECUTION)
+		bool region_barriers_changed = false;
+		{
+			const VitaPerformanceTelemetry::ScopedCpuStage profile_stage(
+				VitaPerformanceTelemetry::CpuStage::EeProvider);
+			region_barriers_changed = s_ee_region_runtime.Synchronize();
+			region_barriers_changed |=
+				s_ee_region_runtime.PreparePendingAtOuterBoundary();
+		}
+		if (region_barriers_changed && !recRefreshEeLifecycleDispatchBarriers())
+		{
+			// No region may execute unless every incoming tier-zero edge is forced
+			// through the outer canonical-state boundary. Drop the complete region
+			// owner set and republish only the PCSX2 lifecycle owners on failure.
+			s_ee_region_runtime.ResetCode();
+			if (!recRefreshEeLifecycleDispatchBarriers())
+			{
+				Console.Error("Vita EE could not publish the region/lifecycle barrier union.");
+				s_ee_a32_exit_execution = true;
+				break;
+			}
+		}
+
+#endif
+
 		if (!s_ee_pre_instruction_trace_callback)
 		{
 			VitaEE::BlockExecutionResult result;
@@ -1310,7 +1466,11 @@ static void recExecute()
 			const bool executed = fast_dispatch ?
 				s_ee_a32_executor.ExecutePersistentAtPc(pc, true,
 					&recPersistentEeBoundary, nullptr, &result,
-					event_callback) :
+					event_callback
+#if defined(VITASX2_EE_REGION_EXECUTION)
+					, &recPersistentEePrepared
+#endif
+					) :
 				s_ee_a32_executor.ExecuteCompiledBlockAtPc(pc, true, &result);
 			s_ee_a32_running_compiled_block = false;
 			if (executed)
@@ -1337,6 +1497,21 @@ static void recExecute()
 
 			if (fast_dispatch)
 			{
+				if (s_ee_a32_executor.ConsumePersistentGeneratedFailure())
+				{
+					// The generated region may already have committed memory effects.
+					// Retrying cpuRegs.pc in the interpreter would execute them twice;
+					// unwind this provider invocation and fail closed instead.
+					if (s_ee_region_generated_failure_reports < 8)
+					{
+						Console.Error("Vita EE generated region exact-continuation "
+							"failure at pc=%08x; execution stopped without retry.",
+							cpuRegs.pc);
+						s_ee_region_generated_failure_reports++;
+					}
+					s_ee_a32_exit_execution = true;
+					break;
+				}
 				// A persistent block can only fail before entering generated code or
 				// while resolving its next boundary. Step the current instruction
 				// through PCSX2's interpreter and retry the dispatcher at the new PC;
@@ -1954,6 +2129,9 @@ void VitaSelectConfiguredCpuProviders()
 void VitaResetA32EeProviderStats()
 {
 	s_ee_a32_stats = {};
+#if defined(VITASX2_EE_REGION_EXECUTION)
+	s_ee_region_runtime.ResetStatistics();
+#endif
 	s_ee_wait_scheduler_certificate = {};
 	s_active_ee_wait_scheduler_certificate = {};
 	s_last_ee_wait_scheduler_ram_write_observed = false;
@@ -1961,6 +2139,13 @@ void VitaResetA32EeProviderStats()
 	s_ee_a32_executor.ResetDirectLinkRejectionProfile();
 	s_ee_a32_persistent_boundaries = 0;
 	s_ee_a32_persistent_boundary_hit_limit = false;
+#endif
+}
+
+void VitaBeginA32EeRegionStatisticsWindow()
+{
+#if defined(VITASX2_EE_REGION_EXECUTION)
+	s_ee_region_runtime.BeginStatisticsWindow();
 #endif
 }
 
@@ -2121,12 +2306,422 @@ bool VitaWasA32EeWaitSchedulerRamWriteObserved()
 VitaA32EeProviderStats VitaGetA32EeProviderStats()
 {
 	VitaA32EeProviderStats result = s_ee_a32_stats;
+#if defined(VITASX2_EE_REGION_EXECUTION)
+	const VitaEE::RegionRuntime::Statistics region =
+		s_ee_region_runtime.GetStatistics();
+	result.region_candidates = region.candidates;
+	result.region_build_attempts = region.build_attempts;
+	result.region_compiles = region.compiles;
+	result.region_compile_failures = region.compile_failures;
+	result.region_compile_wall_us = region.compile_wall_us;
+	result.region_compile_budget_deferrals = region.compile_budget_deferrals;
+	result.region_compile_budget_refills = region.compile_budget_refills;
+	result.region_target_cost_analyses = region.target_cost_analyses;
+	result.region_profitability_prescreen_passes =
+		region.profitability_prescreen_passes;
+	result.region_profitability_prescreen_rejections =
+		region.profitability_prescreen_rejections;
+	result.region_profitability_prescreen_unknowns =
+		region.profitability_prescreen_unknowns;
+	result.region_compiler_heap_failures = region.compiler_heap_failures;
+	result.region_code_cache_failures = region.code_cache_failures;
+	result.region_source_contract_deferrals = region.source_contract_deferrals;
+	result.region_source_contract_resumes = region.source_contract_resumes;
+	result.region_source_contract_replacements =
+		region.source_contract_replacements;
+	result.region_source_contract_capacity_rejections =
+		region.source_contract_capacity_rejections;
+	result.region_source_graph_attempts = region.source_graph_attempts;
+	result.region_source_graph_formations = region.source_graph_formations;
+	result.region_forward_event_samples = region.forward_event_samples;
+	result.region_forward_sample_collisions = region.forward_sample_collisions;
+	result.region_forward_sample_requests = region.forward_sample_requests;
+	result.region_forward_sample_candidates = region.forward_sample_candidates;
+	result.region_forward_sample_rejections = region.forward_sample_rejections;
+	result.region_probe_observations = region.probe_observations;
+	result.region_maximum_event_scoped_probe_observations =
+		region.maximum_event_scoped_probe_observations;
+	result.region_probe_sample_misses = region.probe_sample_misses;
+	result.region_probe_sample_retries = region.probe_sample_retries;
+	result.region_hot_promotions = region.hot_promotions;
+	result.region_probe_evictions = region.probe_evictions;
+	result.region_admission_saturations = region.admission_saturations;
+	result.region_admission_capacity_deferrals =
+		region.admission_capacity_deferrals;
+	result.region_admission_capacity_retries =
+		region.admission_capacity_retries;
+	result.region_admission_capacity_rejections =
+		region.admission_capacity_rejections;
+	result.region_probe_directory_repairs = region.probe_directory_repairs;
+	result.region_evictions = region.evictions;
+	result.region_generation_resets = region.generation_resets;
+	result.region_executions = region.executions;
+	// First-class region entries execute inside the generated dispatcher and do
+	// not visit recPersistentEeBoundary at their entry. The generated per-entry
+	// counter is therefore the authoritative resume count.
+	result.persistent_region_resumes = region.executions;
+	result.region_boundary_exits = region.boundary_exits;
+	result.region_event_exits = region.event_exits;
+	result.region_profitability_fallbacks = region.profitability_fallbacks;
+	result.region_entry_state_fallbacks = region.entry_state_fallbacks;
+	result.region_profitability_retirements = region.profitability_retirements;
+	result.region_memory_exits = region.memory_exits;
+	result.region_memory_alignment_exits = region.memory_alignment_exits;
+	result.region_memory_handler_exits = region.memory_handler_exits;
+	result.region_memory_translation_exits = region.memory_translation_exits;
+	result.region_self_modifying_code_exits = region.self_modifying_code_exits;
+	result.region_continuation_exits = region.continuation_exits;
+	result.region_continuation_nonzero_debt_exits =
+		region.continuation_nonzero_debt_exits;
+	result.region_continuation_event_exits = region.continuation_event_exits;
+	result.region_continuation_scheduler_elided_exits =
+		region.continuation_scheduler_elided_exits;
+	result.region_continuation_failures = region.continuation_failures;
+	result.region_translation_snapshot_valid = region.translation_snapshot_valid;
+	result.region_translation_start_low = region.translation_start_low;
+	result.region_translation_start_high = region.translation_start_high;
+	result.region_translation_bound_low = region.translation_bound_low;
+	result.region_translation_bound_high = region.translation_bound_high;
+	result.region_translation_identity_limit = region.translation_identity_limit;
+	result.region_translation_stride_bytes = region.translation_stride_bytes;
+	result.region_code_bytes = region.code_bytes;
+	result.region_one_block_executions = region.one_block_executions;
+	result.region_multi_block_executions = region.multi_block_executions;
+	result.region_preflight_executions = region.preflight_executions;
+	result.region_preflight_store_executions =
+		region.preflight_store_executions;
+	result.region_spill_executions = region.spill_executions;
+	result.region_weighted_host_instructions =
+		region.weighted_host_instructions;
+	result.region_weighted_hot_code_bytes = region.weighted_hot_code_bytes;
+	result.region_weighted_entry_state_words =
+		region.weighted_entry_state_words;
+	result.region_weighted_output_state_words =
+		region.weighted_output_state_words;
+	result.region_semantic_kernel_executions =
+		region.semantic_kernel_executions;
+	result.region_semantic_kernel_iterations =
+		region.semantic_kernel_iterations;
+	result.region_semantic_kernel_bytes = region.semantic_kernel_bytes;
+	result.region_semantic_fill_executions =
+		region.semantic_kernel_executions_by_kind[static_cast<size_t>(
+			VitaEE::SemanticKernel::Kind::PatternFill)];
+	result.region_semantic_copy_executions =
+		region.semantic_kernel_executions_by_kind[static_cast<size_t>(
+			VitaEE::SemanticKernel::Kind::ForwardCopy)];
+	result.region_semantic_unretained_executions =
+		region.semantic_kernel_executions_by_kind[static_cast<size_t>(
+			VitaEE::SemanticKernel::Kind::Vu0AffineTransform)];
+	result.region_active = region.active_regions;
+	result.region_active_probes = region.active_probes;
+	result.region_armed_probes = region.armed_probes;
+	result.region_deferred = region.deferred_candidates;
+	result.region_pending_candidate = region.pending_candidate;
+	result.region_publication_dirty = region.publication_dirty;
+	result.region_maintenance_requested = region.maintenance_requested;
+	result.region_compile_budget_tokens = region.compile_budget_tokens;
+	result.region_compile_budget_wait_cycles =
+		region.compile_budget_wait_cycles;
+	for (size_t index = 0; index < region.entry_snapshot.size(); index++)
+	{
+		const VitaEE::RegionRuntime::Statistics::EntrySnapshot& source =
+			region.entry_snapshot[index];
+		VitaA32EeRegionEntryProfile& destination =
+			result.region_entry_profile[index];
+		destination.pc = source.pc;
+		destination.executions = source.executions;
+		destination.counted_iterations = source.counted_iterations;
+		destination.profitability_fallbacks =
+			source.profitability_fallbacks;
+		destination.entry_state_fallbacks = source.entry_state_fallbacks;
+		destination.block_count = source.block_count;
+		destination.source_words = source.source_words;
+		destination.host_instructions = source.host_instructions;
+		destination.hot_host_instructions = source.hot_host_instructions;
+		destination.hot_host_loads = source.hot_host_loads;
+		destination.hot_host_stores = source.hot_host_stores;
+		destination.hot_state_loads = source.hot_state_loads;
+		destination.hot_state_stores = source.hot_state_stores;
+		destination.frame_bytes = source.frame_bytes;
+		destination.work_scratch_bytes = source.work_scratch_bytes;
+		destination.hot_code_bytes = source.hot_code_bytes;
+		destination.cold_code_bytes = source.cold_code_bytes;
+		destination.prologue_hot_bytes = source.prologue_hot_bytes;
+		destination.entry_event_hot_bytes = source.entry_event_hot_bytes;
+		destination.entry_iteration_hot_bytes = source.entry_iteration_hot_bytes;
+		destination.entry_memory_hot_bytes = source.entry_memory_hot_bytes;
+		destination.block_hot_bytes = source.block_hot_bytes;
+		destination.block_host_loads = source.block_host_loads;
+		destination.block_host_stores = source.block_host_stores;
+		destination.entry_state_words = source.entry_state_words;
+		destination.output_state_words = source.output_state_words;
+		destination.core_peak_words = source.core_peak_words;
+		destination.neon_peak_q = source.neon_peak_q;
+		destination.spilled_values = source.spilled_values;
+		destination.spill_bytes = source.spill_bytes;
+		destination.edge_moves = source.edge_moves;
+		destination.preflight_accesses = source.preflight_accesses;
+		destination.preflight_store_accesses =
+			source.preflight_store_accesses;
+		destination.preflight_stride = source.preflight_stride;
+		destination.minimum_profitable_iterations =
+			source.minimum_profitable_iterations;
+		destination.pre_entry_state_leaves = source.pre_entry_state_leaves;
+		destination.entry_low32_guards = source.entry_low32_guards;
+		destination.semantic_kernel_kind = source.semantic_kernel_kind;
+		destination.semantic_kernel_hot_bytes = source.semantic_kernel_hot_bytes;
+		destination.semantic_kernel_bytes_per_iteration =
+			source.semantic_kernel_bytes_per_iteration;
+		destination.semantic_kernel_minimum_profitable_bytes =
+			source.semantic_kernel_minimum_profitable_bytes;
+		destination.semantic_kernel_target_cost_valid =
+			source.semantic_kernel_target_cost_valid ? 1u : 0u;
+	}
+	result.region_probe_snapshot_count = region.probe_snapshot_count;
+	for (size_t index = 0; index < region.probe_snapshot.size(); index++)
+	{
+		const VitaEE::RegionRuntime::Statistics::ProbeSnapshot& probe =
+			region.probe_snapshot[index];
+		result.region_probe_entry_pc[index] = probe.entry_pc;
+		result.region_probe_backedge_pc[index] = probe.backedge_pc;
+		result.region_probe_source_end_pc[index] = probe.source_end_pc;
+		result.region_probe_snapshot_observations[index] = probe.observations;
+		result.region_probe_maximum_observations[index] =
+			probe.maximum_observations;
+		result.region_probe_samples[index] = probe.samples;
+		result.region_probe_required[index] = probe.required_observations;
+		result.region_probe_internal_blocks[index] = probe.internal_source_blocks;
+		result.region_probe_flags[index] =
+			(probe.guarded ? 0x01 : 0) |
+			(probe.event_scoped ? 0x02 : 0) |
+			(probe.armed ? 0x04 : 0) |
+			(probe.dormant ? 0x08 : 0) |
+			(probe.live ? 0x10 : 0);
+	}
+	result.region_deferred_snapshot_count = region.deferred_snapshot_count;
+	for (size_t index = 0; index < region.deferred_snapshot.size(); index++)
+	{
+		const VitaEE::RegionRuntime::Statistics::DeferredSnapshot& deferred =
+			region.deferred_snapshot[index];
+		result.region_deferred_entry_pc[index] = deferred.entry_pc;
+		result.region_deferred_backedge_pc[index] = deferred.backedge_pc;
+		result.region_deferred_source_end_pc[index] = deferred.source_end_pc;
+		result.region_deferred_missing_pc[index] = deferred.missing_contract_pc;
+		result.region_deferred_flags[index] =
+			(deferred.admission_capacity ? 0x01 : 0) |
+			(deferred.classification_prepared ? 0x02 : 0);
+	}
+	result.region_repeated_candidate_snapshot_count =
+		region.repeated_candidate_snapshot_count;
+	for (size_t index = 0;
+		index < region.repeated_candidate_snapshot.size(); index++)
+	{
+		const VitaEE::RegionRuntime::Statistics::RepeatedCandidateSnapshot&
+			repeated = region.repeated_candidate_snapshot[index];
+		result.region_repeated_candidate_entry_pc[index] = repeated.entry_pc;
+		result.region_repeated_candidate_source_end_pc[index] =
+			repeated.source_end_pc;
+		result.region_repeated_candidate_detail_pc[index] = repeated.detail_pc;
+		result.region_repeated_candidate_observations[index] =
+			repeated.observations;
+		result.region_repeated_candidate_blocks[index] =
+			repeated.internal_source_blocks;
+		result.region_repeated_candidate_outcome[index] =
+			static_cast<u8>(repeated.outcome);
+		result.region_repeated_candidate_failure_stage[index] =
+			static_cast<u8>(repeated.failure_stage);
+		result.region_repeated_candidate_failure_detail[index] =
+			repeated.failure_detail;
+	}
+	result.region_target_cost_snapshot_count =
+		std::min<u32>(region.target_cost_snapshot_count,
+			result.region_target_cost_snapshot.size());
+	for (u32 index = 0; index < result.region_target_cost_snapshot_count; index++)
+	{
+		const auto& source = region.target_cost_snapshots[index];
+		VitaA32EeRegionTargetCostProfile& destination =
+			result.region_target_cost_snapshot[index];
+		destination.entry_pc = source.entry_pc;
+		destination.source_end_pc = source.source_end_pc;
+		destination.semantic_diagnostics = source.semantic_diagnostics;
+		destination.blocks = source.blocks;
+		destination.source_words = source.source_words;
+		destination.direct_calls = source.direct_calls;
+		destination.host_instructions = source.host_instructions;
+		destination.hot_code_bytes = source.hot_code_bytes;
+		destination.entry_state_words = source.entry_state_words;
+		destination.output_state_words = source.output_state_words;
+		destination.exit_sites = source.exit_sites;
+		destination.exit_state_words = source.exit_state_words;
+		destination.exit_sites_by_kind = source.exit_sites_by_kind;
+		destination.exit_state_words_by_kind = source.exit_state_words_by_kind;
+		destination.control_exit_sites_by_target =
+			source.control_exit_sites_by_target;
+		destination.control_exit_state_words_by_target =
+			source.control_exit_state_words_by_target;
+		destination.compact_exit_descriptors = source.compact_exit_descriptors;
+		destination.compact_exit_words = source.compact_exit_words;
+		destination.compact_snapshot_bytes = source.compact_snapshot_bytes;
+		destination.core_peak_words = source.core_peak_words;
+		destination.vfp_peak_s = source.vfp_peak_s;
+		destination.neon_peak_q = source.neon_peak_q;
+		destination.spilled_values = source.spilled_values;
+		destination.spill_bytes = source.spill_bytes;
+		destination.spilled_core_values = source.spilled_core_values;
+		destination.spilled_vfp_values = source.spilled_vfp_values;
+		destination.spilled_neon_values = source.spilled_neon_values;
+		destination.edge_moves = source.edge_moves;
+		destination.edge_call_moves = source.edge_call_moves;
+		destination.edge_return_moves = source.edge_return_moves;
+		destination.edge_backedge_moves = source.edge_backedge_moves;
+		destination.edge_state_words = source.edge_state_words;
+		destination.memory_loads = source.memory_loads;
+		destination.memory_stores = source.memory_stores;
+		destination.forwarded_memory_loads = source.forwarded_memory_loads;
+		destination.memory_forward_candidates = source.memory_forward_candidates;
+		destination.memory_forward_reaching_stores =
+			source.memory_forward_reaching_stores;
+		destination.memory_forward_address_matches =
+			source.memory_forward_address_matches;
+		destination.memory_forward_state_matches =
+			source.memory_forward_state_matches;
+		destination.memory_preflight_ranges = source.memory_preflight_ranges;
+		destination.memory_preflight_accesses = source.memory_preflight_accesses;
+		destination.aggregate_cycle_plan_status =
+			source.aggregate_cycle_plan_status;
+		destination.failure_pc = source.failure_pc;
+		destination.failure_detail = source.failure_detail;
+		destination.failure_value = source.failure_value;
+		destination.failure_ir_opcode = source.failure_ir_opcode;
+		destination.failure_stage = static_cast<u8>(source.failure_stage);
+		destination.backend_failure = static_cast<u8>(source.backend_failure);
+		destination.failure_emission_step = source.failure_emission_step;
+		destination.backend_emitted = source.backend_emitted ? 1 : 0;
+		destination.valid = source.valid ? 1 : 0;
+	}
+	const auto& target_cost = region.target_cost_snapshot;
+	result.region_target_cost_valid = target_cost.valid ? 1 : 0;
+	result.region_target_cost_entry_pc = target_cost.entry_pc;
+	result.region_target_cost_source_end_pc = target_cost.source_end_pc;
+	result.region_target_cost_semantic_diagnostics =
+		target_cost.semantic_diagnostics;
+	result.region_target_cost_blocks = target_cost.blocks;
+	result.region_target_cost_source_words = target_cost.source_words;
+	result.region_target_cost_direct_calls = target_cost.direct_calls;
+	result.region_target_cost_host_instructions = target_cost.host_instructions;
+	result.region_target_cost_hot_code_bytes = target_cost.hot_code_bytes;
+	result.region_target_cost_entry_state_words = target_cost.entry_state_words;
+	result.region_target_cost_output_state_words = target_cost.output_state_words;
+	result.region_target_cost_exit_sites = target_cost.exit_sites;
+	result.region_target_cost_exit_state_words = target_cost.exit_state_words;
+	result.region_target_cost_exit_sites_by_kind = target_cost.exit_sites_by_kind;
+	result.region_target_cost_exit_state_words_by_kind =
+		target_cost.exit_state_words_by_kind;
+	result.region_target_cost_control_exit_sites_by_target =
+		target_cost.control_exit_sites_by_target;
+	result.region_target_cost_control_exit_state_words_by_target =
+		target_cost.control_exit_state_words_by_target;
+	result.region_target_cost_compact_exit_descriptors =
+		target_cost.compact_exit_descriptors;
+	result.region_target_cost_compact_exit_words = target_cost.compact_exit_words;
+	result.region_target_cost_compact_snapshot_bytes =
+		target_cost.compact_snapshot_bytes;
+	result.region_target_cost_core_peak_words = target_cost.core_peak_words;
+	result.region_target_cost_vfp_peak_s = target_cost.vfp_peak_s;
+	result.region_target_cost_neon_peak_q = target_cost.neon_peak_q;
+	result.region_target_cost_spilled_values = target_cost.spilled_values;
+	result.region_target_cost_spill_bytes = target_cost.spill_bytes;
+	result.region_target_cost_spilled_core_values =
+		target_cost.spilled_core_values;
+	result.region_target_cost_spilled_vfp_values =
+		target_cost.spilled_vfp_values;
+	result.region_target_cost_spilled_neon_values =
+		target_cost.spilled_neon_values;
+	result.region_target_cost_edge_moves = target_cost.edge_moves;
+	result.region_target_cost_edge_call_moves = target_cost.edge_call_moves;
+	result.region_target_cost_edge_return_moves = target_cost.edge_return_moves;
+	result.region_target_cost_edge_backedge_moves =
+		target_cost.edge_backedge_moves;
+	result.region_target_cost_edge_state_words = target_cost.edge_state_words;
+	result.region_target_cost_memory_loads = target_cost.memory_loads;
+	result.region_target_cost_memory_stores = target_cost.memory_stores;
+	result.region_target_cost_forwarded_memory_loads =
+		target_cost.forwarded_memory_loads;
+	result.region_target_cost_memory_forward_candidates =
+		target_cost.memory_forward_candidates;
+	result.region_target_cost_memory_forward_reaching_stores =
+		target_cost.memory_forward_reaching_stores;
+	result.region_target_cost_memory_forward_address_matches =
+		target_cost.memory_forward_address_matches;
+	result.region_target_cost_memory_forward_state_matches =
+		target_cost.memory_forward_state_matches;
+	result.region_target_cost_memory_preflight_ranges =
+		target_cost.memory_preflight_ranges;
+	result.region_target_cost_memory_preflight_accesses =
+		target_cost.memory_preflight_accesses;
+	result.region_target_cost_aggregate_cycle_plan_status =
+		target_cost.aggregate_cycle_plan_status;
+	result.region_target_cost_failure_pc = target_cost.failure_pc;
+	result.region_target_cost_failure_detail = target_cost.failure_detail;
+	result.region_target_cost_failure_value = target_cost.failure_value;
+	result.region_target_cost_failure_ir_opcode = target_cost.failure_ir_opcode;
+	result.region_target_cost_failure_stage =
+		static_cast<u8>(target_cost.failure_stage);
+	result.region_target_cost_backend_failure =
+		static_cast<u8>(target_cost.backend_failure);
+	result.region_target_cost_failure_emission_step =
+		target_cost.failure_emission_step;
+	result.region_target_cost_backend_emitted =
+		target_cost.backend_emitted ? 1 : 0;
+	result.region_target_cost_block_snapshot_count = std::min<u32>(
+		target_cost.block_snapshot_count,
+		result.region_target_cost_block_snapshot.size());
+	for (u32 index = 0;
+		index < result.region_target_cost_block_snapshot_count; index++)
+	{
+		const auto& source = target_cost.block_snapshot[index];
+		auto& destination = result.region_target_cost_block_snapshot[index];
+		destination.pc = source.pc;
+		destination.source_instructions = source.source_instructions;
+		destination.hot_bytes = source.hot_bytes;
+		destination.host_loads = source.host_loads;
+		destination.host_stores = source.host_stores;
+		destination.spilled_core_values = source.spilled_core_values;
+		destination.spilled_vfp_values = source.spilled_vfp_values;
+		destination.spilled_neon_values = source.spilled_neon_values;
+		destination.spill_loads = source.spill_loads;
+		destination.spill_stores = source.spill_stores;
+		destination.edge_moves = source.edge_moves;
+		destination.edge_state_words = source.edge_state_words;
+		destination.exit_sites = source.exit_sites;
+		destination.exit_state_words = source.exit_state_words;
+		destination.direct_call_roles = source.direct_call_roles;
+	}
+	result.region_failure_snapshot_count = region.failure_snapshot_count;
+	for (size_t index = 0; index < region.failure_snapshot.size(); index++)
+	{
+		const VitaEE::RegionRuntime::BuildFailureRecord& failure =
+			region.failure_snapshot[index];
+		result.region_failure_entry_pc[index] = failure.entry_pc;
+		result.region_failure_pc[index] = failure.failure_pc;
+		result.region_failure_opcode[index] = failure.opcode;
+		result.region_failure_stage[index] = static_cast<u8>(failure.stage);
+		result.region_failure_backend[index] = static_cast<u8>(failure.backend);
+		result.region_failure_emission_step[index] =
+			failure.backend_emission_step;
+		result.region_failure_ir_opcode[index] = failure.backend_ir_opcode;
+		result.region_failure_value[index] = failure.backend_value;
+		result.region_failure_detail[index] = failure.failure_detail;
+	}
+#endif
 	result.in_frame_event_resume_candidates =
 		result.in_frame_event_tests - result.in_frame_event_resume_refusals;
 	result.code_cache_resets = s_ee_a32_executor.GetCodeCacheResetCount();
 	result.code_cache_block_records =
 		s_ee_a32_executor.GetCodeCacheBlockRecordCount();
 	result.code_cache_slots = s_ee_a32_executor.GetCodeCacheSlotCount();
+	result.code_cache_slot_metadata_size =
+		s_ee_a32_executor.GetCodeCacheSlotMetadataSize();
 	result.code_cache_used = s_ee_a32_executor.GetCodeCacheUsed();
 	result.code_cache_capacity = s_ee_a32_executor.GetCodeCacheCapacity();
 	return result;

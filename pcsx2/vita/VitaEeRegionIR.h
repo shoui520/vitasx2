@@ -38,6 +38,63 @@ namespace VitaEE::RegionIR
 		MemoryEffect,
 	};
 
+	// Lane-wise EE MMI operations which map exactly to one AArch32 NEON
+	// instruction.  The semantic kind is carried by PackedBinary128 rather than
+	// split into opcode-specific IR nodes so decoding, interpretation, exit-map
+	// verification, allocation, and native lowering share one complete contract.
+	enum class PackedBinaryKind : u8
+	{
+		AddWrap8,
+		AddWrap16,
+		AddWrap32,
+		SubtractWrap8,
+		SubtractWrap16,
+		SubtractWrap32,
+		CompareGreaterSigned8,
+		CompareGreaterSigned16,
+		CompareGreaterSigned32,
+		MaximumSigned16,
+		MaximumSigned32,
+		AddSaturateSigned8,
+		AddSaturateSigned16,
+		AddSaturateSigned32,
+		SubtractSaturateSigned8,
+		SubtractSaturateSigned16,
+		SubtractSaturateSigned32,
+		CompareEqual8,
+		CompareEqual16,
+		CompareEqual32,
+		MinimumSigned16,
+		MinimumSigned32,
+		AddSaturateUnsigned8,
+		AddSaturateUnsigned16,
+		AddSaturateUnsigned32,
+		SubtractSaturateUnsigned8,
+		SubtractSaturateUnsigned16,
+		SubtractSaturateUnsigned32,
+		// MMI.cpp::{PEXTLW,PEXTUW}: interleave the lower or upper pair of
+		// 32-bit lanes as RT0,RS0,RT1,RS1 or RT2,RS2,RT3,RS3.  These are
+		// binary 128-bit operations even though the natural A32 lowering is
+		// the corresponding half of one destructive VZIP.32 pair.
+		InterleaveLower32,
+		InterleaveUpper32,
+		Count,
+	};
+
+	// The six immediate packed shifts share one exact unary I128 contract.  The
+	// kind selects the lane width and signedness; Node::literal owns the decoded
+	// shift amount so a verifier can compare both independently with the source.
+	enum class PackedShiftKind : u8
+	{
+		LeftLogical16,
+		RightLogical16,
+		RightArithmetic16,
+		LeftLogical32,
+		RightLogical32,
+		RightArithmetic32,
+		Count,
+	};
+
 	enum class Opcode : u8
 	{
 		Parameter,
@@ -45,8 +102,9 @@ namespace VitaEE::RegionIR
 		ConstantI32,
 		ConstantI64,
 		ConstantAddress,
-		// A source-backed instruction which has no observable effect under the
-		// selected PCSX2 recompiler contract (SYNC, PREF, or cache-disabled CACHE).
+		// A source-backed instruction which has no operation-body effect under the
+		// selected PCSX2 recompiler contract (SYNC, PREF, cache-disabled CACHE, or
+		// an idle-guarded VNOP/VWAITQ). Required observers remain separate nodes.
 		NoEffect,
 		ExtractLow32,
 		ExtractLow64,
@@ -55,6 +113,11 @@ namespace VitaEE::RegionIR
 		ReplaceHigh64,
 		BitcastI32ToF32Bits,
 		BitcastF32BitsToI32,
+		// Raw, bit-preserving EE GPR <-> VU0 VF transfers. Keeping these
+		// explicit prevents an arbitrary I128 from entering the floating-point
+		// register file without a decoded QMFC2/QMTC2 ownership witness.
+		BitcastI128ToVuF32x4Bits,
+		BitcastVuF32x4BitsToI128,
 		// PCSX2 FPU.cpp::fpuDouble() operand normalization, followed by one
 		// uncontracted single-precision operation and its architectural O/U
 		// result/flag normalization. Keeping the raw result shared prevents the
@@ -63,6 +126,11 @@ namespace VitaEE::RegionIR
 		Cop1AddRaw,
 		Cop1SubRaw,
 		Cop1MulRaw,
+		// True when the final raw arithmetic result requires PCSX2's ordered
+		// overflow/underflow correction. A guarded cold exit re-enters tier zero
+		// at the owning instruction, leaving the ordinary region path finite and
+		// normalized without weakening the exact decomposed result/flag graph.
+		Cop1ExceptionalOuResult,
 		Cop1ClampOuResult,
 		Cop1UpdateOuFlags,
 		// Comparisons consume PCSX2 fpuDouble()-normalized raw FPR words and
@@ -71,6 +139,17 @@ namespace VitaEE::RegionIR
 		Cop1CompareLess,
 		Cop1CompareLessEqual,
 		Cop1UpdateConditionFlag,
+		// BC1F/T/FL/TL snapshots FCR31.C before its delay slot.  immediate is
+		// zero for the false forms and one for the true forms, so this node is
+		// the exact branch-taken predicate rather than a generic bit test.
+		Cop1BranchCondition,
+		// ABS.S and NEG.S are raw word transformations on the EE: they clear or
+		// toggle only the sign bit and do not normalize NaNs or denormals.
+		Cop1AbsoluteWord,
+		Cop1NegateWord,
+		// Both instructions clear only the current O/U cause bits.  The sticky
+		// SO/SU bits and every unrelated FCR31 field remain unchanged.
+		Cop1ClearOuFlags,
 		// SCE CVT.W.S writes the truncated/saturated signed word as raw FPR
 		// bits and leaves FCR31 untouched.
 		Cop1ConvertWord,
@@ -80,6 +159,13 @@ namespace VitaEE::RegionIR
 		Cop1ConvertSingle,
 		SignExtend32To64,
 		ZeroExtend32To64,
+		// EE scalar multiply consumes the low 32 bits of two GPRs and produces
+		// one raw 64-bit product. HI/LO lane selection, multiply-add accumulation,
+		// and the architecturally sign-extended word publications remain explicit
+		// IR around this value so both accumulator banks share one contract.
+		MultiplySigned32,
+		MultiplyUnsigned32,
+		Truncate64To32,
 		Add32,
 		// Signed ADD/ADDI overflow is an architectural condition, not host UB.
 		// The first admitted use is ADDI; keeping the predicate separate from
@@ -99,6 +185,8 @@ namespace VitaEE::RegionIR
 		Or128,
 		Xor128,
 		Nor128,
+		PackedBinary128,
+		PackedShift128,
 		PackLow64,
 		PackHigh64,
 		BroadcastLowHalfwordPer64,
@@ -128,24 +216,55 @@ namespace VitaEE::RegionIR
 		MemoryLoad,
 		MemoryLoadValue,
 		MemoryStore,
-		// LQC2/SQC2 are direct only while VU0 is idle. The node consumes the
-		// current VPU_STAT and exact VF value, exits before the source instruction
-		// when bit zero says micro mode is running, and otherwise forwards the VF
-		// value. Making the transfer depend on this result prevents a backend from
-		// moving the memory effect ahead of the synchronization observer.
+		// Direct VU0 macro operations are admitted only while VU0 is idle. The
+		// node consumes current VPU_STAT and the exact value used after the
+		// observer, exits before the source instruction when bit zero says micro
+		// mode is running, and otherwise forwards that value. Making the operation
+		// depend on this result prevents a backend from moving it ahead of the
+		// synchronization observer.
 		Vu0RequireIdle,
-		// VU0 FMAC arithmetic remains decomposed into uncontracted multiply/add,
+		// Macro-mode VFTOI0/4/12/15 consumes one raw VU vector, applies the
+		// source-selected fixed-point scale, truncates toward zero, and saturates
+		// out-of-range lanes. The scale exponent is carried in immediate.
+		Vu0ConvertFixed,
+		// Macro-mode ITOF0/4/12/15 consumes signed 32-bit fixed-point lanes,
+		// converts them with the EE/VU rounding contract, and applies the exact
+		// 2^-offset scale. The fractional-bit count is carried in immediate.
+		Vu0ConvertIntegerToFloat,
+		// VMR32 rotates the source's four raw 32-bit lanes left by one. It is a
+		// bit permutation, not floating-point arithmetic, and therefore must not
+		// normalize its input or output.
+		Vu0Rotate32,
+		// VU0 FMAC arithmetic remains decomposed into uncontracted multiply/add/sub,
 		// one shared raw result, architectural result normalization, and explicit
 		// flag publication. The lane/mask lives in immediate where applicable.
 		Vu0NormalizeVector,
 		Vu0BroadcastLane,
+		Vu0BroadcastScalar,
+		Vu0FdivQ,
+		Vu0FdivFlags,
+		Vu0UpdateFdivStatus,
+		Vu0SyncFdivStatusControl,
 		Vu0MulRaw,
 		Vu0AddRaw,
+		Vu0SubRaw,
 		Vu0ClampFmacResult,
 		Vu0MacFlagsFromRaw,
 		Vu0StatusFlagsFromMac,
 		Vu0MergeMasked,
 		Vu0SyncStatusControl,
+		// CTC2 is represented as one decoded control-register operation rather
+		// than an arbitrary integer-expression graph.  Operand zero is the old
+		// target VI word, operand one is the idle-guarded low GPR word, and the
+		// target control-register index is carried in immediate.  This lets the
+		// verifier mechanically enforce the target-specific masks and mirrors.
+		Vu0ControlWrite,
+		// PCSX2 microVU_Macro.inl::mVUallocSFLAGd() conversion used when CTC2
+		// writes STATUS.  Keeping it semantic prevents four hidden micro-status
+		// mirrors from drifting away from the architectural VI word.
+		Vu0DenormalizeStatus,
+		BindVu0Q,
+		BindVu0ViQ,
 		BindGpr,
 		BindHi,
 		BindLo,
@@ -157,6 +276,9 @@ namespace VitaEE::RegionIR
 		BindVu0StatusFlag,
 		BindVu0ViMac,
 		BindVu0ViStatus,
+		BindVu0Vi,
+		BindVu0ClipFlag,
+		BindVu0MicroStatusFlag,
 		BindFcr31,
 		BindAcc,
 		// Operand zero is an I1 condition. immediate indexes Block::guarded_exits;
@@ -200,16 +322,22 @@ namespace VitaEE::RegionIR
 		ValueId fcr31 = INVALID_VALUE;
 		ValueId acc = INVALID_VALUE;
 		ValueId acc_flag = INVALID_VALUE;
-		// VU0 vector/ACC state and the FMAC flag mirrors are explicit. Remaining
-		// VI state stays outside the admitted surface except for VPU_STAT, which
-		// is the PCSX2 VU0.cpp::vu0Sync() busy observer.
+		// VU0 state which an admitted macro region can read or write is one
+		// mechanically mapped register file.  VI entries are not duplicated as
+		// named STATUS/MAC/Q/VPU_STAT fields: CFC2/CTC2, macro arithmetic and the
+		// micro-mode boundary must all observe the same SSA value.  PCSX2's scalar
+		// interpreter flags and four microVU flag instances remain explicit because
+		// they are provider-visible mirrors, not aliases of VI[16..18].
 		std::array<ValueId, 32> vu0_vf{};
 		ValueId vu0_acc = INVALID_VALUE;
 		ValueId vu0_macflag = INVALID_VALUE;
 		ValueId vu0_statusflag = INVALID_VALUE;
-		ValueId vu0_vi_mac = INVALID_VALUE;
-		ValueId vu0_vi_status = INVALID_VALUE;
-		ValueId vu0_vpu_stat = INVALID_VALUE;
+		ValueId vu0_clipflag = INVALID_VALUE;
+		ValueId vu0_q = INVALID_VALUE;
+		std::array<ValueId, 32> vu0_vi{};
+		std::array<ValueId, 4> vu0_micro_macflags{};
+		std::array<ValueId, 4> vu0_micro_clipflags{};
+		std::array<ValueId, 4> vu0_micro_statusflags{};
 		ValueId cycle = INVALID_VALUE;
 		// Ordered, non-architectural memory state. It prevents loads and stores
 		// from being reordered across each other while remaining absent from the
@@ -251,6 +379,31 @@ namespace VitaEE::RegionIR
 		SelfModifyingCode,
 	};
 
+	// Shared decoded-memory facts for the interpreter and every generated
+	// backend. Backends consume these semantics instead of decoding source
+	// opcodes a second time.
+	bool IsMemoryLoad(MemoryAccessKind kind);
+	u32 MemoryAccessWidth(MemoryAccessKind kind);
+	u32 MemoryAlignmentMask(MemoryAccessKind kind);
+	bool IsQuadMemoryAccess(MemoryAccessKind kind);
+
+	// Shared exact scalar authority for VU0 macro FMAC primitives. Semantic
+	// kernels compose these same operations as the Region IR interpreter, so a
+	// batch lowering cannot silently acquire a second normalization, rounding,
+	// flag, or mask contract. Raw multiply/add remain separate calls: contraction
+	// is not PS2-equivalent under the selected VU numeric contract.
+	u128 NormalizeVu0Vector(const u128& value, bool overflow_clamp);
+	u128 BroadcastVu0Lane(const u128& value, u32 lane);
+	u128 EvaluateVu0RawBinary(Opcode opcode, const u128& left,
+		const u128& right);
+	u128 ClampVu0FmacResult(const u128& raw, u32 mask,
+		bool overflow_clamp);
+	u32 EvaluateVu0MacFlags(const u128& raw, u32 mask);
+	u32 EvaluateVu0StatusFlags(u32 mac);
+	u128 MergeVu0Masked(const u128& old_value, const u128& new_value,
+		u32 mask);
+	u32 SyncVu0StatusControl(u32 old_status, u32 current_status);
+
 	struct MemoryRequest
 	{
 		u32 source_pc = 0;
@@ -290,6 +443,19 @@ namespace VitaEE::RegionIR
 		// returning-helper continuation.
 		ExceptionObserver,
 		EventHorizon,
+		// The generated region has not observed an event. Its entry proof could
+		// not establish that every internal PCSX2 timing boundary precedes the
+		// current horizon, so tier zero must execute once from canonical entry.
+		EventBudgetFallback,
+		// The entry state is semantically valid, but the exact natural-loop trip
+		// count is too small to amortize this Cortex-A9 region's mechanically
+		// required range, event, and source-ownership proof. No guest instruction
+		// has executed; tier zero owns the complete source fragment once.
+		ProfitabilityFallback,
+		// A verifier-derived compact representation was not true of the external
+		// canonical entry value. No guest instruction or architectural effect has
+		// occurred; tier zero owns the complete source fragment once.
+		EntryStateFallback,
 	};
 
 	// A transfer owns one complete canonical-state map. If target_block is
@@ -312,6 +478,11 @@ namespace VitaEE::RegionIR
 		// True only at a real PCSX2 scheduler boundary. A cycle-publishing A32
 		// physical continuation may deliberately leave this false.
 		bool event_horizon_check = true;
+		// A register jump is internal only when the verifier proves its dynamic
+		// source still equals this exact architectural target. The first supported
+		// case is an attested bounded direct callee returning through unchanged r31.
+		bool register_target_proven = false;
+		u32 proven_register_target_pc = 0;
 	};
 
 	enum class TerminatorKind : u8
@@ -331,10 +502,79 @@ namespace VitaEE::RegionIR
 		ValueId condition = INVALID_VALUE;
 		Transfer taken{};
 		Transfer not_taken{};
+		// A shared direct callee may be reached from several statically proven JAL
+		// sites. Its JR r31 has one dynamic source but a bounded set of internal
+		// return PCs. Each entry is a verifier-proven alternative using the same
+		// post-callee state; taken remains the exact unmatched-target side exit.
+		std::vector<Transfer> register_targets;
 		// For Branch and Jump these identify the indivisible control/delay
 		// source pair. Transfer has neither.
 		u32 branch_pc = 0;
 		u32 delay_slot_pc = 0;
+	};
+
+	// Visit every internal CFG edge and its stable parallel-copy index. The primary
+	// edge is zero, a conditional not-taken edge is one, and shared-callee return
+	// targets start at one. External side exits are deliberately excluded.
+	template <typename Callback>
+	bool VisitInternalTransfers(const Terminator& terminator, Callback&& callback)
+	{
+		if (terminator.taken.target_block != INVALID_BLOCK &&
+			!callback(terminator.taken, static_cast<u8>(0)))
+		{
+			return false;
+		}
+		if (terminator.kind == TerminatorKind::Branch &&
+			terminator.not_taken.target_block != INVALID_BLOCK &&
+			!callback(terminator.not_taken, static_cast<u8>(1)))
+		{
+			return false;
+		}
+		if (terminator.kind == TerminatorKind::RegisterJump)
+		{
+			for (size_t index = 0; index < terminator.register_targets.size(); index++)
+			{
+				if (terminator.register_targets[index].target_block != INVALID_BLOCK &&
+					!callback(terminator.register_targets[index],
+						static_cast<u8>(index + 1)))
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	inline bool TerminatorTargetsBlock(const Terminator& terminator, u32 target)
+	{
+		bool found = false;
+		(void)VisitInternalTransfers(terminator,
+			[&](const Transfer& transfer, u8) {
+				found |= transfer.target_block == target;
+				return !found;
+			});
+		return found;
+	}
+
+	// Every fallible memory operation owns the same complete architectural
+	// transfer contract as a control-flow or conditional-exception exit. The
+	// backend may classify the runtime failure as alignment, handler,
+	// translation, or SMC, but it must materialize this exact pre-access state,
+	// resume PC, and fixed-point cycle debt for all of them.
+	struct MemoryExit
+	{
+		ValueId operation = INVALID_VALUE;
+		Transfer transfer{};
+	};
+
+	// A synchronization observer which may reject an instruction before it has
+	// produced any architectural effect.  The operation identifies the exact IR
+	// node which performs the runtime test; the transfer owns the mechanically
+	// derived pre-instruction state, restart PC, and fixed-point cycle debt.
+	struct ObserverExit
+	{
+		ValueId operation = INVALID_VALUE;
+		Transfer transfer{};
 	};
 
 	struct SourceInstruction
@@ -360,6 +600,13 @@ namespace VitaEE::RegionIR
 		// nodes. Each ExitIfTrue owns exactly one entry here, and the verifier
 		// derives its complete state, resume PC, and cycle debt from source.
 		std::vector<Transfer> guarded_exits;
+		// One entry for every MemoryLoad/MemoryStore node. Unlike a guarded exit,
+		// the generated backend supplies the runtime condition and concrete reason.
+		std::vector<MemoryExit> memory_exits;
+		// One entry for every Vu0RequireIdle node.  This is separate from memory
+		// fallback because VU0-busy is a COP2 synchronization observation even when
+		// the owning instruction is LQC2/SQC2.
+		std::vector<ObserverExit> observer_exits;
 		Terminator terminator{};
 	};
 
@@ -380,6 +627,68 @@ namespace VitaEE::RegionIR
 		bool scheduler_test_at_end = true;
 	};
 
+	// Tier zero can legitimately publish both a wide fallthrough owner and an
+	// independently entered suffix owner ending at the same guest PC. A region
+	// needs one disjoint ownership partition, but may synthesize the prefix only
+	// after the owning EE compiler proves that introducing the split preserves
+	// PCSX2's complete scaled-cycle timeline.
+	enum class SuffixPartitionFailure : u8
+	{
+		None,
+		InvalidRange,
+		NotExactSuffix,
+		NonStandaloneDependency,
+		SchedulerMismatch,
+		CycleTimeline,
+	};
+
+	SuffixPartitionFailure BuildCycleProvenSuffixPartition(
+		const SourceBlockContract& wide, const SourceBlockContract& suffix,
+		bool cycle_timeline_proven, SourceBlockContract* prefix);
+
+	// One disjoint immutable guest-code range. Region source is represented as
+	// ordered spans rather than one artificial address extent so a bounded region
+	// may own a caller and a direct callee without attesting the untouched gap.
+	// Spans are byte-exact snapshots and must be sorted, non-overlapping, aligned,
+	// and collectively fit max_source_instructions.
+	struct SourceSpan
+	{
+		u32 base_pc = 0;
+		std::vector<u32> words;
+	};
+
+	// Canonicalize one additional immutable source owner into an ordered,
+	// disjoint source image. PCSX2 tier-zero fragments can expose partially
+	// overlapping dependency ranges when independently discovered entries were
+	// split from different original blocks. Those ranges describe the same guest
+	// bytes and therefore form one ownership union, not two overlapping IR spans.
+	// The operation is transactional and rejects disagreeing snapshots so an SMC
+	// change observed while a region is being assembled cannot be hidden.
+	enum class SourceSpanMergeFailure : u8
+	{
+		None,
+		InvalidSource,
+		ConflictingSource,
+		SourceLimit,
+	};
+
+	SourceSpanMergeFailure MergeImmutableSourceSpan(
+		std::vector<SourceSpan>* spans, SourceSpan incoming,
+		u32 max_source_instructions,
+		u32* required_source_instructions = nullptr);
+
+	// One mechanically proven direct-call/leaf-return pair. This metadata is part
+	// of the verified program contract; it is never inferred from a title, PC, or
+	// content identity. The caller JAL, callee JR r31, both delay slots, unchanged
+	// link value, and internal return target are all re-derived by Verify().
+	struct DirectCallContract
+	{
+		u32 call_pc = 0;
+		u32 callee_pc = 0;
+		u32 return_jump_pc = 0;
+		u32 return_pc = 0;
+	};
+
 	struct LiftOptions
 	{
 		// Interpreter.cpp::execI() multiplies each opcode cost by this value,
@@ -395,22 +704,39 @@ namespace VitaEE::RegionIR
 		// PCSX2 CHECK_VU_OVERFLOW(0). This is part of the selected VU numeric
 		// contract and therefore cannot be read implicitly by disconnected IR.
 		bool vu0_overflow_clamp = true;
+		// Product-disabled Phase 4 proof: guard final COP1 O/U correction with an
+		// exact pre-instruction cold exit so the ordinary reducible path may carry
+		// normalized values and demanded flags lazily. This remains false until
+		// cold exits are compact enough for general region publication.
+		bool cop1_lazy_ou_guards = false;
 		u32 max_blocks = 8;
 		u32 max_source_instructions = 64;
+		// Zero preserves the original intraprocedural CFG. A nonzero bound permits
+		// only unique attested direct-call leaves with statically proven returns.
+		u32 max_direct_calls = 0;
 	};
 
 	struct Program
 	{
-		u32 source_base_pc = 0;
-		std::vector<u32> source_words;
+		std::vector<SourceSpan> source_spans;
 		// Empty only for the explicitly unattested validation overload of Lift().
-		// Product compilation must use LiftWithSourceBlocks().
+		// Product compilation must use LiftWithSourceBlocks() or the multi-span
+		// LiftWithSourceSpans() equivalent.
 		std::vector<SourceBlockContract> source_blocks;
+		std::vector<DirectCallContract> direct_calls;
 		LiftOptions options{};
 		u32 entry_block = INVALID_BLOCK;
 		u32 value_count = 0;
 		std::vector<Block> blocks;
 	};
+
+	// Valid only for a Program which has passed Verify().  Verify mechanically
+	// proves the complete direct-callee CFG, unchanged r31 on every path, exact
+	// incoming JAL ownership, and a one-to-one set of internal return targets.
+	// Allocated backends may therefore omit the otherwise general unmatched-JR
+	// side exit for this block; the semantic IR/interpreter deliberately retains
+	// that fallback as part of the architectural register-jump contract.
+	bool HasExhaustiveDirectReturnTargets(const Program& program, u32 block_index);
 
 	enum class LiftFailure : u8
 	{
@@ -423,17 +749,46 @@ namespace VitaEE::RegionIR
 		BranchInDelaySlot,
 		OverlappingSource,
 		SourceBlockContract,
+		DirectCallContract,
 		ValueLimit,
 		InternalError,
 	};
 
-	struct LiftResult
+	// Stable, allocation-free detail for LiftFailure::SourceBlockContract.
+	// Product discovery records this value in cold failure telemetry, while the
+	// host and Cortex-A9 fixtures use it to distinguish malformed ownership from
+	// a valid but incompatible tier-zero partition.  Keep these semantic rather
+	// than tied to a workload address.
+	enum class LiftFailureDetail : u8
 	{
-		Program program{};
-		LiftFailure failure = LiftFailure::None;
-		u32 failure_pc = 0;
+		None,
+		SourceBlockInvalidRange,
+		SourceBlockOverlap,
+		SourceBlockMissingEntry,
+		SourceBlockChargedEntry,
+		SourceBlockUntestedEntryPredecessor,
+		SourceBlockMissingContinuation,
+		SourceBlockDiscontinuousDependency,
+		SourceBlockIncompleteDependency,
+		SourceBlockMissingLeader,
+		SourceBlockCrossesContract,
+		SourceBlockControlNotAtEnd,
+	};
 
-		explicit operator bool() const { return failure == LiftFailure::None; }
+	// Stable, allocation-free stage for LiftFailure::InternalError.  The lifter
+	// deliberately keeps unsupported guest semantics in the ordinary LiftFailure
+	// categories; InternalError therefore means that a supposedly supported unit
+	// failed while constructing or mechanically verifying the IR.  Product cold
+	// telemetry records this stage so a broad reducible candidate cannot collapse
+	// into an address-shaped "failed to lift" diagnosis.
+	enum class LiftInternalStage : u8
+	{
+		None,
+		RawBlockSet,
+		Instruction,
+		BranchCondition,
+		DelaySlot,
+		Verification,
 	};
 
 	enum class VerifyFailure : u8
@@ -452,10 +807,23 @@ namespace VitaEE::RegionIR
 		SourceMismatch,
 		SourceOverlap,
 		SourceBlockContract,
+		DirectCallContract,
 		CycleMismatch,
 		ExitContractMismatch,
 		ControlFlowMismatch,
 		UnreachableBlock,
+	};
+
+	struct LiftResult
+	{
+		Program program{};
+		LiftFailure failure = LiftFailure::None;
+		LiftFailureDetail failure_detail = LiftFailureDetail::None;
+		LiftInternalStage internal_stage = LiftInternalStage::None;
+		VerifyFailure verify_failure = VerifyFailure::None;
+		u32 failure_pc = 0;
+
+		explicit operator bool() const { return failure == LiftFailure::None; }
 	};
 
 	struct VerifyResult
@@ -483,9 +851,12 @@ namespace VitaEE::RegionIR
 		u128 vu0_acc{};
 		u32 vu0_macflag = 0;
 		u32 vu0_statusflag = 0;
-		u32 vu0_vi_mac = 0;
-		u32 vu0_vi_status = 0;
-		u32 vu0_vpu_stat = 0;
+		u32 vu0_clipflag = 0;
+		u32 vu0_q = 0;
+		std::array<u32, 32> vu0_vi{};
+		std::array<u32, 4> vu0_micro_macflags{};
+		std::array<u32, 4> vu0_micro_clipflags{};
+		std::array<u32, 4> vu0_micro_statusflags{};
 		u32 pc = 0;
 		u64 cycle = 0;
 	};
@@ -527,6 +898,15 @@ namespace VitaEE::RegionIR
 		u32 source_word_count, const SourceBlockContract* source_blocks,
 		u32 source_block_count, u32 entry_pc,
 		const LiftOptions& options = {});
+	LiftResult LiftWithSourceSpans(const SourceSpan* source_spans,
+		u32 source_span_count, const SourceBlockContract* source_blocks,
+		u32 source_block_count, u32 entry_pc,
+		const LiftOptions& options = {},
+		const u32* execution_owner_pcs = nullptr,
+		u32 execution_owner_count = 0);
+	bool ProgramContainsPc(const Program& program, u32 pc);
+	bool ReadProgramSourceWord(const Program& program, u32 pc, u32* word);
+	u32 ProgramSourceInstructionCount(const Program& program);
 	VerifyResult Verify(const Program& program);
 	InterpretResult Interpret(const Program& program, const CanonicalState& input,
 		CanonicalState* output,
