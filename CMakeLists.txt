@@ -77,6 +77,101 @@ if(VITASX2_CPU_PROFILER)
 	add_compile_definitions(VITASX2_CPU_PROFILER=1)
 endif()
 
+option(VITASX2_VIF_EPOCH_CENSUS
+	"Compile the default-off observation-bounded VIF command-epoch census."
+	OFF)
+if(VITASX2_VIF_EPOCH_CENSUS)
+	if(NOT VITASX2_CPU_PROFILER)
+		message(FATAL_ERROR
+			"VITASX2_VIF_EPOCH_CENSUS requires VITASX2_CPU_PROFILER")
+	endif()
+	# This is measurement-only. It classifies the existing PCSX2 VIF command
+	# state machine and never changes command admission, execution, or timing.
+	add_compile_definitions(VITASX2_VIF_EPOCH_CENSUS=1)
+endif()
+
+option(VITASX2_GPU_VU_OPPORTUNITY_CENSUS
+	"Compile the default-off exact PairPlan/VIF GPU-VU opportunity census."
+	OFF)
+if(VITASX2_GPU_VU_OPPORTUNITY_CENSUS)
+	if(NOT VITASX2_CPU_PROFILER)
+		message(FATAL_ERROR
+			"VITASX2_GPU_VU_OPPORTUNITY_CENSUS requires VITASX2_CPU_PROFILER")
+	endif()
+	# Measurement-only. Direct VU block links are disabled while the runtime
+	# profiler is enabled so every executed natural block can be classified by
+	# the existing PairPlan owner. Its correlated report uses a bounded
+	# VSync-1-to-8 excerpt because that attribution seam can make VU-heavy
+	# retail more than an order of magnitude slower. This build must never be
+	# used for timing.
+	add_compile_definitions(VITASX2_GPU_VU_OPPORTUNITY_CENSUS=1)
+endif()
+
+option(VITASX2_EE_REGION_EXECUTION
+	"Execute source-attested integer EE natural-loop regions through the bounded A32 region cache."
+	OFF)
+if(VITASX2_EE_REGION_EXECUTION)
+	# This is the product-connected Phase 3 activation gate. Keep it process-wide:
+	# EE dispatch, source invalidation, lifecycle barriers, and telemetry must all
+	# agree on region ownership. The normal product remains on the SDK-green
+	# tier-zero provider until two profiler-off retail replay gates pass.
+	add_compile_definitions(VITASX2_EE_REGION_EXECUTION=1)
+endif()
+
+option(VITASX2_EE_SEMANTIC_KERNEL_VALIDATION
+	"Exercise retained Phase 5 EE semantic kernels in a controlled Vita build."
+	OFF)
+if(VITASX2_EE_SEMANTIC_KERNEL_VALIDATION)
+	if(NOT VITASX2_EE_REGION_EXECUTION)
+		message(FATAL_ERROR
+			"VITASX2_EE_SEMANTIC_KERNEL_VALIDATION requires VITASX2_EE_REGION_EXECUTION")
+	endif()
+	# This enables only native subclasses which already passed the inclusive
+	# physical Cortex-A9 >=8x gate. It remains OFF in ordinary product builds
+	# until rotated-corpus residency and two matched profiler-off Vita A/Bs pass.
+	add_compile_definitions(VITASX2_EE_SEMANTIC_KERNEL_VALIDATION=1)
+endif()
+
+option(VITASX2_EE_REGION_VU0_VALIDATION
+	"Allow oracle-attested Phase 4 VU0 regions in diagnostic Vita builds."
+	OFF)
+if(VITASX2_EE_REGION_VU0_VALIDATION)
+	if(NOT VITASX2_EE_REGION_EXECUTION)
+		message(FATAL_ERROR
+			"VITASX2_EE_REGION_VU0_VALIDATION requires VITASX2_EE_REGION_EXECUTION")
+	endif()
+	# This is a hardware activation gate, not a product default. It is retired
+	# once two structurally different VU0 workloads pass exact oracle, whole-CPU0,
+	# and full SDK gates.
+	add_compile_definitions(VITASX2_EE_REGION_VU0_VALIDATION=1)
+endif()
+
+option(VITASX2_EE_REGION_TARGET_COST_DIAGNOSTIC
+	"Compile and discard unclassified multi-block EE regions for cold target-cost evidence."
+	OFF)
+if(VITASX2_EE_REGION_TARGET_COST_DIAGNOSTIC)
+	if(NOT VITASX2_EE_REGION_EXECUTION)
+		message(FATAL_ERROR
+			"VITASX2_EE_REGION_TARGET_COST_DIAGNOSTIC requires VITASX2_EE_REGION_EXECUTION")
+	endif()
+	# This never publishes the unclassified region. It spends one ordinary cold
+	# compile token, records emitted-A32/state-contract attribution, discards the
+	# code, and remembers the candidate as rejected. It exists only to let real
+	# complete CFGs identify a missing generic cost class without weakening the
+	# product profitability gate or instrumenting generated execution.
+	add_compile_definitions(VITASX2_EE_REGION_TARGET_COST_DIAGNOSTIC=1)
+endif()
+
+option(VITASX2_SHORT_CORRELATED_PROFILE_WINDOW
+	"Use an 8-VSync warmup and 32-VSync correlated telemetry window for bounded hardware comparisons."
+	OFF)
+if(VITASX2_SHORT_CORRELATED_PROFILE_WINDOW)
+	# This changes only when the already opt-in telemetry snapshot is published.
+	# It lets crash-prone retail workload capsules finish a matched measurement
+	# before their known late failure without adding sampling to hot execution.
+	add_compile_definitions(VITASX2_SHORT_CORRELATED_PROFILE_WINDOW=1)
+endif()
+
 option(VITASX2_IOP_SCHEDULER_PRE_EVENT_WAIT_ADVANCE_CONTROL
 	"Diagnostic control: restore the complete IOP wait-resume body even when the retained normal-clock wait cannot reach its next event."
 	OFF)
@@ -156,10 +251,26 @@ if(VITASX2_GPU_VU_DIRECT_ADMISSION)
 	# and compiles all disconnected capture work out.
 	add_compile_definitions(VITASX2_GPU_VU_DIRECT_ADMISSION=1)
 endif()
+
+option(VITASX2_GPU_VU_UNIVERSAL_VALIDATION
+	"Offline-compile the fixed serial GPU-VU1 micro-op interpreter feasibility program."
+	OFF)
+if(VITASX2_GPU_VU_UNIVERSAL_VALIDATION)
+	# The fixed GXP is validation-only until its GPU-resident state, bounded
+	# command-chain, observation exit, and coarse output contracts pass PCSX2
+	# differentials and a profiler-off Vita frame-time gate.
+	add_compile_definitions(VITASX2_GPU_VU_UNIVERSAL_VALIDATION=1)
+endif()
 if(VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY AND
 	VITASX2_GPU_VU_DIRECT_ADMISSION)
 	message(FATAL_ERROR
 		"VITASX2_GPU_VU_CAPTURE_WITH_CPU_REPLAY is a disconnected control; "
+		"configure VITASX2_GPU_VU_DIRECT_ADMISSION=OFF with it.")
+endif()
+if(VITASX2_GPU_VU_OPPORTUNITY_CENSUS AND
+	VITASX2_GPU_VU_DIRECT_ADMISSION)
+	message(FATAL_ERROR
+		"VITASX2_GPU_VU_OPPORTUNITY_CENSUS measures the CPU1 VU fallback; "
 		"configure VITASX2_GPU_VU_DIRECT_ADMISSION=OFF with it.")
 endif()
 

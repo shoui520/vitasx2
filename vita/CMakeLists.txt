@@ -29,11 +29,40 @@ target_link_libraries(vitasx2
 	LZMA::LZMA
 )
 
+# VitaSX2's persistent emulator/JIT/GXM owners require the supported extended
+# application-memory budget. This emits PARAM.SFO ATTRIBUTE2=12 (365 MiB) for
+# the sole VSX200001 product container; it is not an unsafe runtime allocation
+# workaround and leaves CDRAM ownership unchanged.
+set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 vita_create_self(vitasx2.self vitasx2 UNSAFE)
 vita_create_vpk(vitasx2.vpk ${VITASX2_TITLEID} vitasx2.self
 	VERSION "00.01"
 	NAME "VitaSX2"
 )
+
+# Explicit compiler-service lifecycle regression, never part of a product
+# build. Compile the actual owner against the real SDK/runtime; only the GS
+# wakeup sink is replaced (no renderer or guest execution in this executable).
+add_executable(vitasx2-shader-compiler-service-validation EXCLUDE_FROM_ALL
+	validation/ShaderCompilerServiceMain.cpp
+	../pcsx2/vita/VitaGpuVuShaderCompiler.cpp
+	../pcsx2/vita/VitaGpuVuGxpResource.cpp
+)
+target_include_directories(vitasx2-shader-compiler-service-validation PRIVATE
+	"${CMAKE_SOURCE_DIR}/pcsx2")
+target_compile_definitions(vitasx2-shader-compiler-service-validation PRIVATE
+	VITASX2_GPU_VU_COMPILER_CACHE_DIRECTORY="ux0:data/vitasx2/compiler-service-validation/cache"
+	VITASX2_GPU_VU_COMPILER_AUDIT_DIRECTORY="ux0:data/vitasx2/compiler-service-validation/audit"
+)
+target_link_libraries(vitasx2-shader-compiler-service-validation PRIVATE
+	common SceKernelModulemgr_stub SceShaccCg_stub SceShaccCgExt
+	SceSysmodule_stub taihen_stub)
+vita_create_self(vitasx2-shader-compiler-service-validation.self
+	vitasx2-shader-compiler-service-validation UNSAFE)
+set_target_properties(
+	vitasx2-shader-compiler-service-validation-velf
+	vitasx2-shader-compiler-service-validation.self-self
+	PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 # --- finite Venezia/NEON hardware characterization --------------------------
 # This target deliberately reuses the normal VSX200001 container. It is absent

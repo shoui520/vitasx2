@@ -3,8 +3,9 @@ add_library(pcsx2core STATIC
 	Cache.cpp
 	CDVD/CDVD.cpp
 	CDVD/CDVDcommon.cpp
-	CDVD/CDVDdiscReader.cpp
-	CDVD/CDVDdiscThread.cpp
+	# Vita has no host optical drive. Do not link PCSX2's physical-drive
+	# worker/cache or VitaCdvdDevice's former IOCtlSrc stubs. The ISO reader
+	# and emulated CDVD command/timing owners below remain unchanged.
 	CDVD/CDVDisoReader.cpp
 	CDVD/FlatFileReader.cpp
 	CDVD/InputIsoFile.cpp
@@ -170,15 +171,29 @@ add_library(pcsx2core STATIC
 	vita/VitaAudioStream.cpp
 	vita/A32Emitter.cpp
 	vita/VitaCaptureDisabled.cpp
-	vita/VitaCdvdDevice.cpp
 	vita/VitaCpuProviders.cpp
 	vita/VitaDisabledDevices.cpp
 	vita/VitaEeBlockCompiler.cpp
 	vita/VitaEeExecutor.cpp
 	vita/VitaEeRegionA32.cpp
+	vita/VitaEeRegionAllocatedA32.cpp
+	vita/VitaEeRegionExecutionPlan.cpp
+	vita/VitaEeRegionAllocation.cpp
 	vita/VitaEeRegionIR.cpp
 	vita/VitaEeRegionMemory.cpp
+	vita/VitaEeSemanticIsland.cpp
+	vita/VitaEeAdpcmDecode.cpp
+	vita/VitaEeSemanticKernel.cpp
+	vita/VitaEeRegionRuntime.cpp
 	vita/VitaGpuVuProgram.cpp
+	vita/VitaGpuVuArchitectureLedger.cpp
+	vita/VitaGpuVuMicroProgram.cpp
+	vita/VitaGpuVuCommandEpoch.cpp
+	vita/VitaGpuVuUniversalEpoch.cpp
+	vita/VitaGpuVuGeneratedUniversal.cpp
+	vita/VitaGpuVuGxpResource.cpp
+	vita/VitaGpuVuHealthJournal.cpp
+	vita/VitaGpuVuOpportunityCensus.cpp
 	vita/VitaGpuVuVifInput.cpp
 	vita/VitaGpuVuLoopKernel.cpp
 	vita/VitaGpuVuInvocationPlan.cpp
@@ -195,6 +210,7 @@ add_library(pcsx2core STATIC
 	vita/VitaGxmGsState.cpp
 	vita/VitaGxmDisplay.cpp
 	vita/VitaGxmMemory.cpp
+	vita/VitaGxmRenderStore.cpp
 	vita/VitaGxmTexture.cpp
 	vita/VitaGsDrawTrace.cpp
 	vita/VitaGsMailbox.cpp
@@ -209,6 +225,7 @@ add_library(pcsx2core STATIC
 	vita/VitaPerformanceTelemetry.cpp
 	vita/VitaSaveState.cpp
 	vita/VitaUsbDeviceRegistry.cpp
+	vita/VitaVifEpochCensus.cpp
 	vita/VitaVifInterpreter.cpp
 	vita/VitaVmState.cpp
 	vita/VitaVuBlockCompiler.cpp
@@ -221,6 +238,58 @@ add_library(pcsx2core STATIC
 set_source_files_properties(vita/VitaIopBlockCompiler.cpp PROPERTIES
 	COMPILE_OPTIONS "-fno-pie;-marm"
 )
+option(VITASX2_GXM_GS_BLEND
+	"Lower GS blend equations directly to GXM (renderer migration candidate)." OFF)
+option(VITASX2_GXM_GS_BLEND_VALIDATION
+	"Validate direct GS blending on private GXM surfaces." OFF)
+if(VITASX2_GXM_GS_BLEND)
+	set_property(SOURCE GS/Renderers/HW/GSRendererHW.cpp vita/GSDeviceGXM.cpp APPEND PROPERTY
+		COMPILE_DEFINITIONS VITASX2_GXM_GS_BLEND=1)
+endif()
+if(VITASX2_GXM_GS_BLEND_VALIDATION)
+	set_property(SOURCE vita/GSDeviceGXM.cpp APPEND PROPERTY
+		COMPILE_DEFINITIONS VITASX2_GXM_GS_BLEND_VALIDATION=1)
+endif()
+option(VITASX2_GXM_FUSE_ATTACHMENT_CLEARS
+	"Materialize lazy clears in the requested GXM attachment scene."
+	OFF)
+option(VITASX2_GXM_ATTACHMENT_CLEAR_VALIDATION
+	"Compare separate and fused lazy clears on private startup surfaces."
+	OFF)
+foreach(option_name VITASX2_GXM_FUSE_ATTACHMENT_CLEARS VITASX2_GXM_ATTACHMENT_CLEAR_VALIDATION)
+	if(${option_name})
+		set_property(SOURCE vita/GSDeviceGXM.cpp APPEND PROPERTY
+			COMPILE_DEFINITIONS ${option_name}=1)
+	endif()
+endforeach()
+option(VITASX2_GXM_TFX_ALPHA_VALIDATION
+	"Compare opaque alpha-test specializations on private startup surfaces."
+	OFF)
+if(VITASX2_GXM_TFX_ALPHA_VALIDATION)
+	set_property(SOURCE vita/GSDeviceGXM.cpp APPEND PROPERTY
+		COMPILE_DEFINITIONS VITASX2_GXM_TFX_ALPHA_VALIDATION=1)
+endif()
+option(VITASX2_GXM_SCISSOR_VALIDATION
+	"Validate persistent scissor mask/depth/color storage on private startup surfaces."
+	OFF)
+if(VITASX2_GXM_SCISSOR_VALIDATION)
+	set_property(SOURCE vita/GSDeviceGXM.cpp APPEND PROPERTY
+		COMPILE_DEFINITIONS VITASX2_GXM_SCISSOR_VALIDATION=1)
+endif()
+option(VITASX2_GXM_SCISSOR_REBUILD_CONTROL
+	"Force mask reconstruction at every depth scene for matched Vita controls."
+	OFF)
+if(VITASX2_GXM_SCISSOR_REBUILD_CONTROL)
+	set_property(SOURCE vita/GSDeviceGXM.cpp APPEND PROPERTY
+		COMPILE_DEFINITIONS VITASX2_GXM_SCISSOR_REBUILD_CONTROL=1)
+endif()
+option(VITASX2_GXM_PERSISTENT_RENDER_STORE
+	"Use the experimental shared GXM render-store residency planner."
+	OFF)
+if(VITASX2_GXM_PERSISTENT_RENDER_STORE)
+	set_property(SOURCE vita/GSDeviceGXM.cpp APPEND PROPERTY
+		COMPILE_DEFINITIONS VITASX2_GXM_PERSISTENT_RENDER_STORE=1)
+endif()
 if(VITASX2_IOP_SCHEDULER_PRE_EVENT_WAIT_ADVANCE_CONTROL)
 	set_property(SOURCE vita/VitaIopBlockCompiler.cpp APPEND PROPERTY
 		COMPILE_DEFINITIONS
@@ -292,12 +361,14 @@ target_link_libraries(pcsx2core PUBLIC
 	demanglegnu
 	SceCtrl_stub
 	SceAudio_stub
+	SceAppMgr_stub
 	SceDisplay_stub
 	SceGxm_stub
 	SceKernelModulemgr_stub
 	SceShaccCg_stub
 	SceShaccCgExt
 	SceSysmodule_stub
+	SceNet_stub
 	SceVshBridge_stub
 	taihen_stub
 	kubridge_stub_weak
@@ -309,11 +380,40 @@ target_link_libraries(pcsx2core PUBLIC
 set(VITASX2_PSP2_SDK_ROOT
 	"$ENV{VITASX2_PSP2_SDK_ROOT}"
 	CACHE PATH "Root of the official Sony PSP2 SDK used for GXM shader compilation")
-set(VITASX2_PSP2CGC
+set(VITASX2_PSP2CGC_3570_PATCH
+	"$ENV{VITASX2_PSP2CGC}")
+set(VITASX2_PSP2CGC_DEFAULT
 	"${VITASX2_PSP2_SDK_ROOT}/host_tools/bin/psp2cgc.exe")
+if(EXISTS "${VITASX2_PSP2CGC_3570_PATCH}")
+	# Sony's 3.570.021 compiler patch is build 13284, superseding the base
+	# 3.5.0 build 13276. Both produce the same measured FMAC resource shape;
+	# prefer the maintenance build without making it a source-support gate.
+	set(VITASX2_PSP2CGC_DEFAULT "${VITASX2_PSP2CGC_3570_PATCH}")
+endif()
+set(VITASX2_PSP2CGC "${VITASX2_PSP2CGC_DEFAULT}"
+	CACHE FILEPATH "Official Sony PSP2 Cg compiler executable")
 set(VITASX2_PSP2BIN
 	"${VITASX2_PSP2_SDK_ROOT}/host_tools/build/bin/psp2bin.exe")
 set(VITASX2_GXM_SHADER_OBJECTS)
+set(VITASX2_GXM_SHADER_ASSETS)
+set(VITASX2_GPU_VU_UNIVERSAL_CG_PATH
+	"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_gpu_vu_universal_v.cg")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+	"${VITASX2_GPU_VU_UNIVERSAL_CG_PATH}")
+file(READ "${VITASX2_GPU_VU_UNIVERSAL_CG_PATH}"
+	VITASX2_GPU_VU_UNIVERSAL_CG_SOURCE)
+configure_file(
+	"${CMAKE_CURRENT_SOURCE_DIR}/vita/VitaGpuVuUniversalCgSource.h.in"
+	"${CMAKE_CURRENT_BINARY_DIR}/VitaGpuVuUniversalCgSource.h" @ONLY)
+set(VITASX2_GPU_VU_STRUCTURED_PREFLIGHT_CG_PATH
+	"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_gpu_vu_structured_preflight_v.cg")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+	"${VITASX2_GPU_VU_STRUCTURED_PREFLIGHT_CG_PATH}")
+file(READ "${VITASX2_GPU_VU_STRUCTURED_PREFLIGHT_CG_PATH}"
+	VITASX2_GPU_VU_STRUCTURED_PREFLIGHT_CG_SOURCE)
+configure_file(
+	"${CMAKE_CURRENT_SOURCE_DIR}/vita/VitaGpuVuStructuredPreflightCgSource.h.in"
+	"${CMAKE_CURRENT_BINARY_DIR}/VitaGpuVuStructuredPreflightCgSource.h" @ONLY)
 if(NOT EXISTS "${VITASX2_PSP2CGC}" OR NOT EXISTS "${VITASX2_PSP2BIN}")
 	# Keep non-core utilities configurable without the proprietary shader tools.
 	# The dependency makes every pcsx2core-linked build fail at build time with a
@@ -345,6 +445,152 @@ else()
 			${VITASX2_GXM_SHADER_OBJECTS} "${shader_object}" PARENT_SCOPE)
 	endfunction()
 
+	# Validation-only programs read through an explicitly bounded GXM state
+	# owner must not also remain duplicated in the SELF's writable data. Compile
+	# the GXP as a sidecar and retain it only through shader unregister.
+	function(vitasx2_add_gxm_shader_asset shader_name profile)
+		set(shader_source
+			"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/${shader_name}.cg")
+		set(shader_gxp "${CMAKE_CURRENT_BINARY_DIR}/${shader_name}.gxp")
+		add_custom_command(
+			OUTPUT "${shader_gxp}"
+			COMMAND "${VITASX2_PSP2CGC}" --profile "${profile}"
+				-nofastmath -bestprecision
+				-DVITASX2_GPU_VU_DUAL_PRIVATE_GENERATION=1
+				"${shader_source}" -o "${shader_gxp}"
+			DEPENDS "${shader_source}" ${ARGN}
+			VERBATIM)
+		set(VITASX2_GXM_SHADER_ASSETS
+			${VITASX2_GXM_SHADER_ASSETS} "${shader_gxp}" PARENT_SCOPE)
+	endfunction()
+
+	# A playable-profile arithmetic asset still preserves operation order and
+	# native binary32 precision, but intentionally accepts the attested SGX final
+	# rounding result instead of the integer nearest-even helpers compiled into
+	# the exact sibling GXP.
+	function(vitasx2_add_gxm_native_shader_asset shader_name profile)
+		set(shader_source
+			"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/${shader_name}.cg")
+		set(shader_gxp "${CMAKE_CURRENT_BINARY_DIR}/${shader_name}.gxp")
+		add_custom_command(
+			OUTPUT "${shader_gxp}"
+			COMMAND "${VITASX2_PSP2CGC}" --profile "${profile}"
+				-O3 -nofastmath -nofastprecision
+				-DVITASX2_GPU_VU_DUAL_PRIVATE_GENERATION=1
+				"${shader_source}" -o "${shader_gxp}"
+			DEPENDS "${shader_source}" ${ARGN}
+			VERBATIM)
+		set(VITASX2_GXM_SHADER_ASSETS
+			${VITASX2_GXM_SHADER_ASSETS} "${shader_gxp}" PARENT_SCOPE)
+	endfunction()
+
+	# VIF UNPACK has two title-neutral fixed tiers from the same PCSX2-owned
+	# source. The independent root handles non-row-recursive, non-skipping
+	# commands without a 128-entry indexable local journal. Both roots mirror
+	# sparse writes into the two private banks, which were initialized
+	# byte-identically before submission, so an UNPACK job need not copy 16 KiB
+	# or alternate banks. The serial sibling retains complete supported-command
+	# compatibility when vector order is architecturally observable.
+	function(vitasx2_add_gpu_vu_vif_unpack_assets)
+		set(shader_source
+			"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_gpu_vif_unpack_v.cg")
+		set(serial_gxp
+			"${CMAKE_CURRENT_BINARY_DIR}/vitasx2_gpu_vif_unpack_v.gxp")
+		set(independent_gxp
+			"${CMAKE_CURRENT_BINARY_DIR}/vitasx2_gpu_vif_unpack_independent_v.gxp")
+		add_custom_command(
+			OUTPUT "${serial_gxp}"
+			COMMAND "${VITASX2_PSP2CGC}" --profile sce_vp_psp2
+				-nofastmath -bestprecision
+				-DVITASX2_GPU_VU_DUAL_PRIVATE_GENERATION=1
+				-DVITASX2_GPU_VU_MIRRORED_PRIVATE_GENERATION=1
+				"${shader_source}" -o "${serial_gxp}"
+			DEPENDS "${shader_source}"
+			VERBATIM)
+		add_custom_command(
+			OUTPUT "${independent_gxp}"
+			COMMAND "${VITASX2_PSP2CGC}" --profile sce_vp_psp2
+				-O3 -nofastmath -bestprecision
+				-DVITASX2_GPU_VU_DUAL_PRIVATE_GENERATION=1
+				-DVITASX2_GPU_VU_MIRRORED_PRIVATE_GENERATION=1
+				-DVITASX2_GPU_VU_INDEPENDENT_UNPACK=1
+				"${shader_source}" -o "${independent_gxp}"
+			DEPENDS "${shader_source}"
+			VERBATIM)
+		set(VITASX2_GXM_SHADER_ASSETS
+			${VITASX2_GXM_SHADER_ASSETS} "${serial_gxp}"
+			"${independent_gxp}" PARENT_SCOPE)
+	endfunction()
+
+	# The scheduled universal continuation is a fixed product provider, not a
+	# generated-program cache entry. Compile the same semantic core offline with
+	# the command scanner and unscheduled hazard machinery removed. Runtime
+	# ShaccCg 3.0 cannot compile this complete core within its bounded arena,
+	# while Sony's offline compiler accepts it comfortably inside the sidecar
+	# reservation.
+	function(vitasx2_add_gpu_vu_compact_asset)
+		set(shader_source
+			"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_gpu_vu_universal_v.cg")
+		set(shader_gxp
+			"${CMAKE_CURRENT_BINARY_DIR}/vitasx2_gpu_vu_compact_v.gxp")
+		add_custom_command(
+			OUTPUT "${shader_gxp}"
+			COMMAND "${VITASX2_PSP2CGC}" --profile sce_vp_psp2
+				-O1 -nofastmath -bestprecision
+				-DVITASX2_GPU_VU_COMPACT_CONTINUATION=1
+				-DVITASX2_GPU_VU_DUAL_PRIVATE_GENERATION=1
+				-DVITASX2_UNIVERSAL_PAIR_SLICE=256
+				"${shader_source}" -o "${shader_gxp}"
+			DEPENDS "${shader_source}"
+			VERBATIM)
+		set(VITASX2_GXM_SHADER_ASSETS
+			${VITASX2_GXM_SHADER_ASSETS} "${shader_gxp}" PARENT_SCOPE)
+	endfunction()
+
+	function(vitasx2_add_gpu_vu_structured_preflight_assets)
+		set(preflight_assets)
+		foreach(stage build reduce finalize)
+			set(shader_source
+				"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_gpu_vu_structured_preflight_${stage}_v.cg")
+			set(shader_gxp
+				"${CMAKE_CURRENT_BINARY_DIR}/vitasx2_gpu_vu_structured_preflight_${stage}_v.gxp")
+			add_custom_command(
+				OUTPUT "${shader_gxp}"
+				COMMAND "${VITASX2_PSP2CGC}" --profile sce_vp_psp2
+					-O1 -nofastmath -bestprecision
+					"${shader_source}" -o "${shader_gxp}"
+				DEPENDS "${shader_source}"
+				VERBATIM)
+			list(APPEND preflight_assets "${shader_gxp}")
+		endforeach()
+		set(VITASX2_GXM_SHADER_ASSETS
+			${VITASX2_GXM_SHADER_ASSETS} ${preflight_assets} PARENT_SCOPE)
+	endfunction()
+
+	# Architectural loop control and state recurrence are interpreted from
+	# bounded PairPlan-derived bytecode by two dependency-ordered offline GXPs.
+	# Runtime ShaccCg is deliberately absent from these stages; physical r31/r32
+	# showed repeatable compiler faults even for one isolated recurrence vector.
+	function(vitasx2_add_gpu_vu_structured_fixed_assets)
+		set(structured_fixed_assets)
+		foreach(stage control state)
+			set(shader_source
+				"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_gpu_vu_structured_${stage}_v.cg")
+			set(shader_gxp
+				"${CMAKE_CURRENT_BINARY_DIR}/vitasx2_gpu_vu_structured_${stage}_v.gxp")
+			add_custom_command(
+				OUTPUT "${shader_gxp}"
+				COMMAND "${VITASX2_PSP2CGC}" --profile sce_vp_psp2
+					-O1 -nofastmath -bestprecision
+					"${shader_source}" -o "${shader_gxp}"
+				DEPENDS "${shader_source}"
+				VERBATIM)
+			list(APPEND structured_fixed_assets "${shader_gxp}")
+		endforeach()
+		set(VITASX2_GXM_SHADER_ASSETS
+			${VITASX2_GXM_SHADER_ASSETS} ${structured_fixed_assets} PARENT_SCOPE)
+	endfunction()
+
 	vitasx2_add_gxm_shader(vitasx2_color_v sce_vp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_color_f sce_fp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_present_v sce_vp_psp2)
@@ -357,6 +603,15 @@ else()
 	vitasx2_add_gxm_shader(vitasx2_mad_reconstruct_f sce_fp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_tfx_v sce_vp_psp2)
 	vitasx2_add_gxm_shader(vitasx2_tfx_f sce_fp_psp2)
+	foreach(variant "" _zfloor _no_atst _no_atst_zfloor
+		_source _source_zfloor _source_no_atst _source_no_atst_zfloor)
+		vitasx2_add_gxm_shader(vitasx2_tfx_gs_blend${variant}_f sce_fp_psp2
+			"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	endforeach()
+	vitasx2_add_gxm_shader(vitasx2_tfx_gs_blend_direct_modulate_stq_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	vitasx2_add_gxm_shader(vitasx2_tfx_gs_blend_direct_modulate_stq_zfloor_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_manual_lod_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_manual_lod_zfloor_f sce_fp_psp2
@@ -370,6 +625,8 @@ else()
 	vitasx2_add_gxm_shader(vitasx2_tfx_zfloor_source_direct_decal_af_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_fast_f sce_fp_psp2
+		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	vitasx2_add_gxm_shader(vitasx2_tfx_fast_no_atst_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_uv_no_fog_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
@@ -399,10 +656,23 @@ else()
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
 	vitasx2_add_gxm_shader(vitasx2_tfx_source_untextured_f sce_fp_psp2
 		"${CMAKE_CURRENT_SOURCE_DIR}/vita/gxm/shaders/vitasx2_tfx_f.cg")
+	if(VITASX2_GPU_VU_UNIVERSAL_VALIDATION)
+		vitasx2_add_gxm_shader_asset(vitasx2_gpu_vu_universal_v sce_vp_psp2)
+		vitasx2_add_gpu_vu_vif_unpack_assets()
+		vitasx2_add_gxm_shader_asset(vitasx2_gpu_vu_structured_qp_numeric_v sce_vp_psp2)
+		vitasx2_add_gxm_shader_asset(vitasx2_gpu_vu_structured_fmac_numeric_v sce_vp_psp2)
+		vitasx2_add_gxm_native_shader_asset(vitasx2_gpu_vu_structured_fmac_native_v sce_vp_psp2)
+		vitasx2_add_gxm_shader_asset(vitasx2_gpu_vu_path1_commit_v sce_vp_psp2)
+		vitasx2_add_gpu_vu_compact_asset()
+		vitasx2_add_gpu_vu_structured_fixed_assets()
+		vitasx2_add_gpu_vu_structured_preflight_assets()
+		vitasx2_add_gxm_shader(vitasx2_gpu_vu_universal_f sce_fp_psp2)
+	endif()
 	# INTERFACE object sources are direct final-link inputs, but CMake does not
 	# retain their generation edge. Give the outputs an owner and pass them to
 	# final executables because GNU ar does not index psp2bin's slot-zero symbol.
-	add_custom_target(vitasx2-gxm-shaders DEPENDS ${VITASX2_GXM_SHADER_OBJECTS})
+	add_custom_target(vitasx2-gxm-shaders DEPENDS
+		${VITASX2_GXM_SHADER_OBJECTS} ${VITASX2_GXM_SHADER_ASSETS})
 	target_sources(pcsx2core INTERFACE ${VITASX2_GXM_SHADER_OBJECTS})
 endif()
 add_dependencies(pcsx2core vitasx2-gxm-shaders)
