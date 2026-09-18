@@ -78,7 +78,9 @@ namespace Threading
 		u64 GetCPUTime() const;
 
 		/// Sets the affinity for a thread to the specified processors.
-		/// Obviously, only works up to 64 processors.
+		/// Obviously, only works up to 64 processors. On Vita, an exact one-CPU
+		/// affinity and USER_ALL also normalize the priority into Sony's matching
+		/// individual/common ready-queue range.
 		bool SetAffinity(u64 processor_mask) const;
 
 	protected:

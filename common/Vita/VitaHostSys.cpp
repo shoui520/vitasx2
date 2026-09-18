@@ -19,20 +19,21 @@
 #include "common/Assertions.h"
 #include "common/Console.h"
 #include "common/Error.h"
+#include "common/Threading.h"
 #include "common/Vita/VitaJitMemory.h"
 
-#include <condition_variable>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <new>
-#include <thread>
 
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/vshbridge.h>
 #include <kubridge.h>
 
@@ -52,8 +53,17 @@ extern "C"
 	// arena reached 64,833,032 bytes in use and retained 15,907,320 bytes of
 	// aggregate heap headroom. The final exact 14 MiB EE / 3 MiB IOP split
 	// retained 14,823,144 bytes after an additional fourth 120-VSync window.
-	// Keep the 77 MiB ceiling measured by those boundaries; allocator headroom
-	// is not a largest-contiguous-allocation guarantee.
+	// The compiler now owns an independent 16 MiB cached memblock. Reducing
+	// newlib to 53 MiB made PES's first resumed frame exhaust its ~9.4 MiB
+	// post-load headroom, even with generated execution/analysis disabled.
+	// GSDeviceGXM::{CreatePatcher,CreateGeometry} now place 18.5 MiB of GPU
+	// buffers in CDRAM (19 MiB including kernel rounding/fetch guards). Return
+	// 16 MiB of the released LPDDR to cached CPU allocations. Excluding the
+	// unused desktop CDVDdiscReader/CDVDdiscThread path also removes its
+	// 9,634,816-byte physical optical-drive cache from BSS; return another
+	// 8 MiB to restore the previous 77 MiB heap. ISO/CDVD guest semantics,
+	// compiler and raw-input arenas are unchanged. Retail/GPU cache high-water
+	// and frame-time gates still own admission of this complete memory layout.
 	unsigned int _newlib_heap_size_user = 77u * 1024u * 1024u;
 }
 
@@ -63,7 +73,7 @@ namespace VitaSharedMemory
 	// legacy code-map allocation is deliberately omitted on this target. Retain
 	// the kernel identity rather than rediscovering it from a caller-supplied
 	// address, which could otherwise name an unrelated cached-RW memblock.
-	static std::mutex s_mutex;
+	static Threading::KernelMutex s_mutex;
 	static SceUID s_uid = -1;
 	static void* s_base = nullptr;
 	static size_t s_size = 0;
@@ -117,7 +127,7 @@ namespace VitaVM
 		BlockBackend backend;
 	};
 
-	static std::mutex s_blocks_mutex;
+	static Threading::KernelMutex s_blocks_mutex;
 	static std::map<uptr, Block> s_blocks; // base address -> block
 	static std::map<uptr, Allocation> s_allocations; // slice base -> ownership
 	static SceUID s_arena_uid = -1;
@@ -126,10 +136,13 @@ namespace VitaVM
 	static BlockBackend s_arena_backend = BlockBackend::OfficialVmDomain;
 	static JitMemoryDiagnostics s_diagnostics;
 	static u32 s_arena_slots = 0;
-	static std::mutex s_write_mutex;
-	static std::condition_variable s_write_cv;
+	// BeginJitWrite owns this native Vita mutex until EndJitWrite publishes or
+	// abandons the code range. Vita libstdc++'s weak gthread probe resolves false
+	// in the product ELF, so std::mutex/condition_variable did not serialize EE,
+	// IOP, and VU code writers at all.
+	static Threading::KernelMutex s_write_mutex;
 	static bool s_write_active = false;
-	static std::thread::id s_write_owner;
+	static std::atomic<SceUID> s_write_owner{-1};
 	static bool s_write_vm_domain_open = false;
 	static BlockBackend s_write_backend = BlockBackend::OfficialVmDomain;
 	static u8* s_write_target_base = nullptr;
@@ -254,16 +267,15 @@ namespace VitaVM
 		return true;
 	}
 
-	static void FinishJitWrite(std::unique_lock<std::mutex>& lock)
+	static void FinishJitWrite()
 	{
 		s_write_active = false;
-		s_write_owner = {};
 		s_write_vm_domain_open = false;
 		s_write_backend = BlockBackend::OfficialVmDomain;
 		s_write_target_base = nullptr;
 		s_write_target_capacity = 0;
-		lock.unlock();
-		s_write_cv.notify_one();
+		s_write_owner.store(-1, std::memory_order_release);
+		s_write_mutex.unlock();
 	}
 
 	static bool RegisterArenaLocked(SceUID uid, void* base, size_t size,
@@ -496,6 +508,24 @@ namespace VitaVM
 
 	void FreeJitMemory(void* ptr)
 	{
+		const SceUID owner = sceKernelGetThreadId();
+		if (s_write_owner.load(std::memory_order_acquire) == owner)
+		{
+			pxFailRel("FreeJitMemory() called by an active JIT writer");
+			return;
+		}
+
+		// A writer retains this mutex from BeginJitWrite() through publication.
+		// Serialize slice release with that complete interval so an allocation
+		// cannot be freed and reused at the same address before the old writer
+		// reaches EndJitWriteAndSync(). Keep the global lock order write->blocks.
+		std::unique_lock<Threading::KernelMutex> write_lock(s_write_mutex);
+		if (s_write_active ||
+			s_write_owner.load(std::memory_order_acquire) != -1)
+		{
+			pxFailRel("FreeJitMemory() observed an abandoned JIT writer");
+			return;
+		}
 		std::unique_lock lock(s_blocks_mutex);
 		const auto it = s_allocations.find(reinterpret_cast<uptr>(ptr));
 		if (it == s_allocations.end())
@@ -566,15 +596,19 @@ namespace VitaVM
 			return false;
 		}
 
-		const std::thread::id owner = std::this_thread::get_id();
-		std::unique_lock lock(s_write_mutex);
-		if (s_write_active && s_write_owner == owner)
+		const SceUID owner = sceKernelGetThreadId();
+		if (s_write_owner.load(std::memory_order_acquire) == owner)
 		{
 			Console.Error("Nested Vita JIT code writes are unsupported.");
 			return false;
 		}
+		std::unique_lock<Threading::KernelMutex> lock(s_write_mutex);
+		if (s_write_active)
+		{
+			Console.Error("Vita JIT write ownership remained active after locking.");
+			return false;
+		}
 
-		s_write_cv.wait(lock, [] { return !s_write_active; });
 		BlockBackend backend = BlockBackend::OfficialVmDomain;
 		{
 			std::unique_lock blocks_lock(s_blocks_mutex);
@@ -617,33 +651,39 @@ namespace VitaVM
 		}
 
 		s_write_active = true;
-		s_write_owner = owner;
 		s_write_vm_domain_open = vm_domain_open;
 		s_write_backend = backend;
 		s_write_target_base = static_cast<u8*>(address);
 		s_write_target_capacity = capacity;
 		*write_address = selected_write_address;
 		*write_capacity = selected_write_capacity;
+		s_write_owner.store(owner, std::memory_order_release);
+		(void)lock.release();
 		return true;
 	}
 
 	bool BeginJitWrite()
 	{
-		const std::thread::id owner = std::this_thread::get_id();
-		std::unique_lock lock(s_write_mutex);
-		if (s_write_active && s_write_owner == owner)
+		const SceUID owner = sceKernelGetThreadId();
+		if (s_write_owner.load(std::memory_order_acquire) == owner)
 		{
 			Console.Error("Nested Vita JIT code writes are unsupported.");
 			return false;
 		}
-		s_write_cv.wait(lock, [] { return !s_write_active; });
+		std::unique_lock<Threading::KernelMutex> lock(s_write_mutex);
+		if (s_write_active)
+		{
+			Console.Error("Vita JIT write ownership remained active after locking.");
+			return false;
+		}
 		const int result = sceKernelOpenVMDomain();
 		if (result < 0)
 			return false;
 		s_write_active = true;
-		s_write_owner = owner;
 		s_write_vm_domain_open = true;
 		s_write_backend = BlockBackend::OfficialVmDomain;
+		s_write_owner.store(owner, std::memory_order_release);
+		(void)lock.release();
 		return true;
 	}
 
@@ -659,9 +699,9 @@ namespace VitaVM
 	{
 		if (!write_address || !write_capacity)
 			return false;
-		std::unique_lock lock(s_write_mutex);
-		if (!s_write_active ||
-			s_write_owner != std::this_thread::get_id())
+		const SceUID owner = sceKernelGetThreadId();
+		if (s_write_owner.load(std::memory_order_acquire) != owner ||
+			!s_write_active)
 		{
 			Console.Error(
 				"Vita JIT staging growth requested without an owned write.");
@@ -682,21 +722,22 @@ namespace VitaVM
 
 	bool EndJitWrite()
 	{
-		std::unique_lock lock(s_write_mutex);
-		if (!s_write_active)
+		const SceUID owner = s_write_owner.load(std::memory_order_acquire);
+		if (owner < 0)
 		{
 			Console.Error("Vita JIT write end requested without an active code write.");
 			return false;
 		}
-		if (s_write_owner != std::this_thread::get_id())
+		if (owner != sceKernelGetThreadId())
 		{
 			Console.Error("Vita JIT write end requested by a non-owner thread.");
 			return false;
 		}
+		pxAssertRel(s_write_active, "Vita JIT write owner lost active state");
 
 		const int result = s_write_vm_domain_open ?
 			sceKernelCloseVMDomain() : 0;
-		FinishJitWrite(lock);
+		FinishJitWrite();
 		if (result < 0)
 		{
 			Console.Error("sceKernelCloseVMDomain() failed: %08x",
@@ -708,17 +749,18 @@ namespace VitaVM
 
 	bool EndJitWriteAndSync(void* address, size_t size)
 	{
-		std::unique_lock lock(s_write_mutex);
-		if (!s_write_active)
+		const SceUID owner = s_write_owner.load(std::memory_order_acquire);
+		if (owner < 0)
 		{
 			Console.Error("Vita JIT publication requested without an active code write.");
 			return false;
 		}
-		if (s_write_owner != std::this_thread::get_id())
+		if (owner != sceKernelGetThreadId())
 		{
 			Console.Error("Vita JIT publication requested by a non-owner thread.");
 			return false;
 		}
+		pxAssertRel(s_write_active, "Vita JIT write owner lost active state");
 
 		const int close_result = s_write_vm_domain_open ?
 			sceKernelCloseVMDomain() : 0;
@@ -759,7 +801,7 @@ namespace VitaVM
 		{
 			sync_result = SyncJitMemoryLocked(address, size);
 		}
-		FinishJitWrite(lock);
+		FinishJitWrite();
 		if (close_result < 0)
 		{
 			Console.Error("sceKernelCloseVMDomain() failed before publication: %08x",
@@ -771,8 +813,13 @@ namespace VitaVM
 
 	bool SyncJitMemory(void* address, size_t size)
 	{
-		std::unique_lock write_lock(s_write_mutex);
-		s_write_cv.wait(write_lock, [] { return !s_write_active; });
+		std::unique_lock<Threading::KernelMutex> write_lock(s_write_mutex);
+		if (s_write_active ||
+			s_write_owner.load(std::memory_order_acquire) != -1)
+		{
+			Console.Error("Vita JIT synchronization observed an abandoned writer.");
+			return false;
+		}
 		return SyncJitMemoryLocked(address, size);
 	}
 

@@ -5,10 +5,12 @@
 #include "common/Assertions.h"
 #include "common/FileSystem.h"
 #include "common/SmallString.h"
+#include "common/Threading.h"
 #include "common/Timer.h"
 
 #include "fmt/format.h"
 
+#include <array>
 #include <mutex>
 #include <vector>
 
@@ -54,7 +56,15 @@ namespace Log
 
 	static FileSystem::ManagedCFilePtr s_file_handle;
 	static std::string s_file_path;
-	static std::mutex s_file_mutex;
+	static Threading::KernelMutex s_file_mutex;
+#ifdef __vita__
+	// ux0 is durable flash-backed storage.  Flushing every INFO line serialized
+	// EE, MTVU and MTGS behind storage I/O precisely when GPU-VU emitted a burst
+	// of attestation records.  Keep one process-lifetime stdio buffer and expose
+	// fresh log evidence at a bounded cadence; warnings/errors still flush below.
+	static std::array<char, 64 * 1024> s_vita_file_buffer;
+	static Common::Timer::Value s_vita_file_last_flush = 0;
+#endif
 
 	static HostCallbackType s_host_callback;
 
@@ -331,7 +341,19 @@ __ri void Log::WriteToFile(LOGLEVEL level, ConsoleColors color, std::string_view
 		}
 	}
 
+#ifdef __vita__
+	const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+	const bool flush_due = s_vita_file_last_flush == 0 ||
+		Common::Timer::ConvertValueToSeconds(
+			now - s_vita_file_last_flush) >= 0.25;
+	if (level <= LOGLEVEL_WARNING || flush_due)
+	{
+		std::fflush(s_file_handle.get());
+		s_vita_file_last_flush = now;
+	}
+#else
 	std::fflush(s_file_handle.get());
+#endif
 }
 
 bool Log::IsFileOutputEnabled()
@@ -355,6 +377,11 @@ bool Log::SetFileOutputLevel(LOGLEVEL level, std::string path)
 				s_file_handle = FileSystem::OpenManagedSharedCFile(path.c_str(), "wb", FileSystem::FileShareMode::DenyWrite);
 				if (s_file_handle)
 				{
+				#ifdef __vita__
+					std::setvbuf(s_file_handle.get(), s_vita_file_buffer.data(),
+						_IOFBF, s_vita_file_buffer.size());
+					s_vita_file_last_flush = 0;
+				#endif
 					s_file_path = std::move(path);
 				}
 				else
@@ -370,6 +397,9 @@ bool Log::SetFileOutputLevel(LOGLEVEL level, std::string path)
 		{
 			s_file_handle.reset();
 			s_file_path = {};
+		#ifdef __vita__
+			s_vita_file_last_flush = 0;
+		#endif
 		}
 	}
 

@@ -92,7 +92,7 @@ namespace MTGS
 	static std::atomic<int> s_QueuedFrameCount;
 	static std::atomic<bool> s_VsyncSignalListener;
 
-	static std::mutex s_mtx_RingBufferBusy2; // Gets released on semaXGkick waiting...
+	static Threading::KernelMutex s_mtx_RingBufferBusy2; // Gets released on semaXGkick waiting...
 	static Threading::WorkSema s_sem_event;
 	static Threading::UserspaceSemaphore s_sem_OnRingReset;
 	static Threading::UserspaceSemaphore s_sem_Vsync;

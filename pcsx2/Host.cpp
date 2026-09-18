@@ -13,11 +13,11 @@
 #include "common/HeterogeneousContainers.h"
 #include "common/Path.h"
 #include "common/StringUtil.h"
+#include "common/Threading.h"
 
 #include "fmt/format.h"
 
 #include <cstdarg>
-#include <shared_mutex>
 
 namespace Host
 {
@@ -42,7 +42,7 @@ namespace Host
 #endif
 	using TranslationStringMap = UnorderedStringMap<std::pair<u32, u32>>;
 	using TranslationStringContextMap = UnorderedStringMap<TranslationStringMap>;
-	static std::shared_mutex s_translation_string_mutex;
+	static Threading::KernelMutex s_translation_string_mutex;
 	static TranslationStringContextMap s_translation_string_map;
 	static std::vector<char> s_translation_string_cache;
 	static u32 s_translation_string_cache_pos;
@@ -65,24 +65,19 @@ std::pair<const char*, u32> Host::LookupTranslationString(const std::string_view
 		return ret;
 	}
 
-	s_translation_string_mutex.lock_shared();
+	std::lock_guard lock(s_translation_string_mutex);
 	ctx_it = s_translation_string_map.find(context);
 
-	if (ctx_it == s_translation_string_map.end()) [[unlikely]]
-		goto add_string;
-
-	msg_it = ctx_it->second.find(msg);
-	if (msg_it == ctx_it->second.end()) [[unlikely]]
-		goto add_string;
-
-	ret.first = &s_translation_string_cache[msg_it->second.first];
-	ret.second = msg_it->second.second;
-	s_translation_string_mutex.unlock_shared();
-	return ret;
-
-add_string:
-	s_translation_string_mutex.unlock_shared();
-	std::lock_guard lock(s_translation_string_mutex);
+	if (ctx_it != s_translation_string_map.end()) [[likely]]
+	{
+		msg_it = ctx_it->second.find(msg);
+		if (msg_it != ctx_it->second.end()) [[likely]]
+		{
+			ret.first = &s_translation_string_cache[msg_it->second.first];
+			ret.second = msg_it->second.second;
+			return ret;
+		}
+	}
 
 	if (s_translation_string_cache.empty()) [[unlikely]]
 	{
