@@ -3694,8 +3694,14 @@ template <int index>
 void GSState::Transfer(const u8* mem, u32 size)
 {
 	const u8* start = mem;
-	const u8 trace_source = Pcsx2Trace::ResolveGsTraceSource(GsTraceSourceForPathIndex(index));
-	Pcsx2Trace::RecordGsRawTransfer(trace_source, mem, static_cast<size_t>(size) * 16u);
+	// Trace enablement cannot change while MTGS owns this transfer. Cache it once:
+	// the normal Vita product path otherwise makes an out-of-line inactive-trace
+	// query for every GIF register, despite emitting no trace records at all.
+	const bool trace_enabled = Pcsx2Trace::IsGsTraceEnabled();
+	const u8 trace_source = trace_enabled ?
+		Pcsx2Trace::ResolveGsTraceSource(GsTraceSourceForPathIndex(index)) : 0;
+	if (trace_enabled)
+		Pcsx2Trace::RecordGsRawTransfer(trace_source, mem, static_cast<size_t>(size) * 16u);
 
 	GIFPath& path = m_path[index];
 
@@ -3718,7 +3724,8 @@ void GSState::Transfer(const u8* mem, u32 size)
 
 				if (path.tag.PRE && path.tag.FLG == GIF_FLG_PACKED)
 				{
-					GsTracePrimWrite(trace_source, path.tag.PRIM);
+					if (trace_enabled)
+						GsTracePrimWrite(trace_source, path.tag.PRIM);
 					ApplyPRIM(path.tag.PRIM);
 				}
 			}
@@ -3736,9 +3743,12 @@ void GSState::Transfer(const u8* mem, u32 size)
 						do
 						{
 							const u32 trace_reg = path.GetReg();
-							GsTracePackedRegWrite(trace_source, trace_reg,
-								reinterpret_cast<const GIFPackedReg*>(mem),
-								GsTraceFloatBits(m_q));
+							if (trace_enabled)
+							{
+								GsTracePackedRegWrite(trace_source, trace_reg,
+									reinterpret_cast<const GIFPackedReg*>(mem),
+									GsTraceFloatBits(m_q));
+							}
 							(this->*m_fpGIFPackedRegHandlers[trace_reg])((GIFPackedReg*)mem);
 
 							mem += sizeof(GIFPackedReg);
@@ -3763,9 +3773,12 @@ void GSState::Transfer(const u8* mem, u32 size)
 								do
 								{
 									const u32 trace_reg = path.GetReg(reg++);
-									GsTracePackedRegWrite(trace_source, trace_reg,
-										reinterpret_cast<const GIFPackedReg*>(mem),
-										GsTraceFloatBits(m_q));
+									if (trace_enabled)
+									{
+										GsTracePackedRegWrite(trace_source, trace_reg,
+											reinterpret_cast<const GIFPackedReg*>(mem),
+											GsTraceFloatBits(m_q));
+									}
 									(this->*m_fpGIFPackedRegHandlers[trace_reg])((GIFPackedReg*)mem);
 
 									mem += sizeof(GIFPackedReg);
@@ -3779,8 +3792,11 @@ void GSState::Transfer(const u8* mem, u32 size)
 								{
 									const GIFPackedReg* const trace_reg =
 										reinterpret_cast<const GIFPackedReg*>(mem);
-									GsTraceRegWrite(trace_source, trace_reg->A_D.ADDR & 0x7F,
-										&trace_reg->r);
+									if (trace_enabled)
+									{
+										GsTraceRegWrite(trace_source, trace_reg->A_D.ADDR & 0x7F,
+											&trace_reg->r);
+									}
 									(this->*m_fpGIFRegHandlers[((GIFPackedReg*)mem)->A_D.ADDR & 0x7F])(&((GIFPackedReg*)mem)->r);
 
 									mem += sizeof(GIFPackedReg);
@@ -3788,18 +3804,24 @@ void GSState::Transfer(const u8* mem, u32 size)
 
 								break;
 							case GIFPath::TYPE_STQRGBAXYZF2: // majority of the vertices are formatted like this
-								GsTracePackedStqRgbaXyz(trace_source,
-									reinterpret_cast<const GIFPackedReg*>(mem), total,
-									GIF_REG_XYZF2, GsTraceFloatBits(m_q));
+								if (trace_enabled)
+								{
+									GsTracePackedStqRgbaXyz(trace_source,
+										reinterpret_cast<const GIFPackedReg*>(mem), total,
+										GIF_REG_XYZF2, GsTraceFloatBits(m_q));
+								}
 								(this->*m_fpGIFPackedRegHandlersC[GIF_REG_STQRGBAXYZF2])((GIFPackedReg*)mem, total);
 
 								mem += total * sizeof(GIFPackedReg);
 
 								break;
 							case GIFPath::TYPE_STQRGBAXYZ2:
-								GsTracePackedStqRgbaXyz(trace_source,
-									reinterpret_cast<const GIFPackedReg*>(mem), total,
-									GIF_REG_XYZ2, GsTraceFloatBits(m_q));
+								if (trace_enabled)
+								{
+									GsTracePackedStqRgbaXyz(trace_source,
+										reinterpret_cast<const GIFPackedReg*>(mem), total,
+										GIF_REG_XYZ2, GsTraceFloatBits(m_q));
+								}
 								(this->*m_fpGIFPackedRegHandlersC[GIF_REG_STQRGBAXYZ2])((GIFPackedReg*)mem, total);
 
 								mem += total * sizeof(GIFPackedReg);
@@ -3816,9 +3838,12 @@ void GSState::Transfer(const u8* mem, u32 size)
 						do
 						{
 							const u32 trace_reg = path.GetReg();
-							GsTracePackedRegWrite(trace_source, trace_reg,
-								reinterpret_cast<const GIFPackedReg*>(mem),
-								GsTraceFloatBits(m_q));
+							if (trace_enabled)
+							{
+								GsTracePackedRegWrite(trace_source, trace_reg,
+									reinterpret_cast<const GIFPackedReg*>(mem),
+									GsTraceFloatBits(m_q));
+							}
 							(this->*m_fpGIFPackedRegHandlers[trace_reg])((GIFPackedReg*)mem);
 
 							mem += sizeof(GIFPackedReg);
@@ -3835,8 +3860,11 @@ void GSState::Transfer(const u8* mem, u32 size)
 					do
 					{
 						const u32 trace_reg = path.GetReg() & 0x7F;
-						GsTraceRegWrite(trace_source, trace_reg,
-							reinterpret_cast<const GIFReg*>(mem));
+						if (trace_enabled)
+						{
+							GsTraceRegWrite(trace_source, trace_reg,
+								reinterpret_cast<const GIFReg*>(mem));
+						}
 						(this->*m_fpGIFRegHandlers[trace_reg])((GIFReg*)mem);
 
 						mem += sizeof(GIFReg);
@@ -3860,9 +3888,12 @@ void GSState::Transfer(const u8* mem, u32 size)
 					switch (m_env.TRXDIR.XDIR)
 					{
 					case 0:
-						Pcsx2Trace::RecordGsImageTransfer(trace_source,
-							m_env.BITBLTBUF.DBP, m_env.BITBLTBUF.DBW, m_env.BITBLTBUF.DPSM,
-							m_env.TRXREG.RRW, m_env.TRXREG.RRH, mem, len * 16);
+						if (trace_enabled)
+						{
+							Pcsx2Trace::RecordGsImageTransfer(trace_source,
+								m_env.BITBLTBUF.DBP, m_env.BITBLTBUF.DBW, m_env.BITBLTBUF.DPSM,
+								m_env.TRXREG.RRW, m_env.TRXREG.RRH, mem, len * 16);
+						}
 						Write(mem, len * 16);
 						break;
 					case 2:

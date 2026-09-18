@@ -14,6 +14,7 @@
 #include "GS/GSVector.h"
 #include "GSAlignedClass.h"
 
+
 class GSDumpBase;
 
 class GSState : public GSAlignedClass<32>

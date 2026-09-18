@@ -28,6 +28,7 @@ namespace Pcsx2Trace
 		static constexpr u8 GS_TRACE_SOURCE_NONE = 0xff;
 		static constexpr u64 FNV1A64_OFFSET = 14695981039346656037ull;
 		static constexpr u64 FNV1A64_PRIME = 1099511628211ull;
+		static constexpr u64 RAW_STREAM_HASH_BASE = 1099511628211ull;
 
 		struct GsTraceFileHeader
 		{
@@ -130,6 +131,18 @@ namespace Pcsx2Trace
 				hash ^= bytes ? bytes[i] : 0;
 				hash *= FNV1A64_PRIME;
 			}
+			return hash;
+		}
+
+		// PCSX2 DebugTools/GsTrace.cpp::HashRawStreamBytes supplies composable
+		// raw-transfer metadata alongside the existing per-packet FNV hash.
+		u64 HashRawStreamBytes(const void* data, size_t size)
+		{
+			const u8* bytes = static_cast<const u8*>(data);
+			u64 hash = 0;
+			for (size_t i = 0; i < size; i++)
+				hash = hash * RAW_STREAM_HASH_BASE +
+					static_cast<u64>(bytes ? bytes[i] : 0) + 1u;
 			return hash;
 		}
 
@@ -409,6 +422,11 @@ namespace Pcsx2Trace
 	bool RecordGsImageTransfer(u8 source, u32 dbp, u32 dbw, u32 dpsm, u32 rrw, u32 rrh,
 		const void* data, size_t size)
 	{
+		// The product build invokes this hook from every GS image upload. Hashing
+		// the payload before WriteRecord() discovers that tracing is disabled
+		// turns a dormant correctness oracle into unconditional CPU2 work.
+		if (!s_trace_file || !s_started || s_hit_limit)
+			return true;
 		return WriteRecord(GsTraceKindImageTransfer, source, 0, 0, 0, dbp,
 			(dbw & 0xffffu) | ((dpsm & 0xffffu) << 16),
 			(rrw & 0xffffu) | ((rrh & 0xffffu) << 16), HashBytes(data, size));
@@ -416,8 +434,15 @@ namespace Pcsx2Trace
 
 	bool RecordGsRawTransfer(u8 source, const void* data, size_t size)
 	{
+		// Preserve the trace oracle exactly when active, but do not walk every
+		// GIF packet twice in normal Vita execution. WriteRecord() already has
+		// the same inactive/limited contract; this guard must precede both hashes.
+		if (!s_trace_file || !s_started || s_hit_limit)
+			return true;
+		const u64 stream_hash = HashRawStreamBytes(data, size);
 		return WriteRecord(GsTraceKindRawTransfer, source, 0, 0,
-			static_cast<u64>(size / 16), 0, 0, 0, HashBytes(data, size));
+			static_cast<u64>(size / 16), static_cast<u32>(stream_hash),
+			static_cast<u32>(stream_hash >> 32), 0, HashBytes(data, size));
 	}
 
 	bool RecordGsVSync(u8 phase, u64 ee_cycle)
