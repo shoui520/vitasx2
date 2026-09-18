@@ -32,6 +32,7 @@
 #include "SaveState.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Pad/Pad.h"
+#include "SIO/Pad/PadBase.h"
 #include "VMManager.h"
 #include "VUmicro.h"
 #include "common/Console.h"
@@ -44,6 +45,8 @@
 #include "common/Threading.h"
 #include "ps2/BiosTools.h"
 #include "vita/VitaCore.h"
+#include "vita/VitaGpuVuUniversalEpoch.h"
+#include "vita/VitaGpuVuHealthJournal.h"
 #include "vita/VitaGsMailbox.h"
 #include "vita/VitaPerformanceTelemetry.h"
 #include "vita/VitaVuBlockCompiler.h"
@@ -137,6 +140,13 @@ namespace
 		Bios,
 		Disc,
 		Elf,
+	};
+
+	enum class ProductVu1ExecutionProfile : u8
+	{
+		Exact,
+		OracleNearest,
+		Playable,
 	};
 
 	// Sony PSP2 SDK target/include/sceerror.h::SCE_ERROR_ERRNO_ENOENT.
@@ -476,6 +486,27 @@ namespace
 				"Workload disc '{}' is not the expected regular {}-byte file.",
 				path, identity.bytes);
 			return false;
+		}
+
+		// A hardware replay may use a disc which was staged and hashed by the
+		// host before launch.  Do not turn workload startup into a multi-gigabyte
+		// Cortex-A9 SHA-256 job in that explicitly requested mode.  The manifest
+		// still closes the expected host identity, while the Vita independently
+		// checks the selected basename, regular-file type, and exact byte count
+		// above.  Keep strict content verification as the default.
+		if (!VITASX2_PRODUCT_BOOT_VALIDATION &&
+			FileSystem::FileExists(PRODUCT_CONFIG_PATH))
+		{
+			INISettingsInterface settings(PRODUCT_CONFIG_PATH);
+			if (settings.Load() && settings.GetBoolValue("Workload",
+					"TrustHostStagedDiscIdentity", false))
+			{
+				Console.Warning(
+					"VitaSX2 workload disc uses host-staged identity without on-device content hashing: bytes=%llu host_sha256=%s path=%s.",
+					static_cast<unsigned long long>(identity.bytes),
+					identity.sha256.c_str(), path.c_str());
+				return true;
+			}
 		}
 
 		// The disc is an immutable product asset shared by many replay capsules.
@@ -1256,8 +1287,122 @@ namespace
 		return true;
 	}
 
+	ProductVu1ExecutionProfile ReadProductVu1ExecutionProfile(
+		const char** source)
+	{
+		if (source)
+			*source = VITASX2_PRODUCT_BOOT_VALIDATION ?
+				"boot-validation" : "default";
+		if (VITASX2_PRODUCT_BOOT_VALIDATION ||
+			!FileSystem::FileExists(PRODUCT_CONFIG_PATH))
+		{
+			return VITASX2_PRODUCT_BOOT_VALIDATION ?
+				ProductVu1ExecutionProfile::Exact :
+				ProductVu1ExecutionProfile::Playable;
+		}
+
+		INISettingsInterface settings(PRODUCT_CONFIG_PATH);
+		if (!settings.Load())
+		{
+			Console.Warning(
+				"VitaSX2 could not parse %s; GPU-VU retains the Playable execution profile.",
+				PRODUCT_CONFIG_PATH);
+			return ProductVu1ExecutionProfile::Playable;
+		}
+
+		constexpr const char* section = "GPUVU";
+		constexpr const char* key = "ExecutionProfile";
+		if (!settings.ContainsValue(section, key))
+			return ProductVu1ExecutionProfile::Playable;
+		const std::string value = settings.GetStringValue(section, key, "Playable");
+		if (StringUtil::Strcasecmp(value.c_str(), "Exact") == 0)
+		{
+			if (source)
+				*source = PRODUCT_CONFIG_PATH;
+			return ProductVu1ExecutionProfile::Exact;
+		}
+		if (StringUtil::Strcasecmp(value.c_str(), "OracleNearest") == 0)
+		{
+			if (source)
+				*source = PRODUCT_CONFIG_PATH;
+			return ProductVu1ExecutionProfile::OracleNearest;
+		}
+		if (StringUtil::Strcasecmp(value.c_str(), "Playable") == 0)
+		{
+			if (source)
+				*source = PRODUCT_CONFIG_PATH;
+			return ProductVu1ExecutionProfile::Playable;
+		}
+
+		Console.Warning(
+			"VitaSX2 ignored unknown [%s] %s='%s' in %s; GPU-VU retains the Playable execution profile.",
+			section, key, value.c_str(), PRODUCT_CONFIG_PATH);
+		return ProductVu1ExecutionProfile::Playable;
+	}
+
 	void ConfigureProductSettings()
 	{
+		const char* vu1_profile_source = nullptr;
+		const ProductVu1ExecutionProfile vu1_profile =
+			ReadProductVu1ExecutionProfile(&vu1_profile_source);
+		bool generated_provider_enabled = true;
+		const char* generated_provider_source = "default";
+		bool fragment_completion_isolation_enabled = false;
+		const char* fragment_completion_isolation_source = "default";
+		if (!VITASX2_PRODUCT_BOOT_VALIDATION &&
+			FileSystem::FileExists(PRODUCT_CONFIG_PATH))
+		{
+			INISettingsInterface settings(PRODUCT_CONFIG_PATH);
+			if (settings.Load())
+			{
+				if (settings.ContainsValue("GPUVU", "EnableGeneratedProvider"))
+				{
+					if (settings.GetBoolValue("GPUVU", "EnableGeneratedProvider",
+							&generated_provider_enabled))
+					{
+						generated_provider_source = PRODUCT_CONFIG_PATH;
+					}
+					else
+					{
+						generated_provider_enabled = true;
+						Console.Warning(
+							"VitaSX2 ignored malformed [GPUVU] EnableGeneratedProvider in %s; generated admission remains enabled.",
+							PRODUCT_CONFIG_PATH);
+					}
+				}
+				if (settings.ContainsValue(
+						"GPUVU", "FragmentCompletionIsolation"))
+				{
+					if (settings.GetBoolValue("GPUVU",
+							"FragmentCompletionIsolation",
+							&fragment_completion_isolation_enabled))
+					{
+						fragment_completion_isolation_source = PRODUCT_CONFIG_PATH;
+					}
+					else
+					{
+						fragment_completion_isolation_enabled = false;
+						Console.Warning(
+							"VitaSX2 ignored malformed [GPUVU] FragmentCompletionIsolation in %s; fragment serialization remains disabled.",
+							PRODUCT_CONFIG_PATH);
+					}
+				}
+			}
+		}
+		VitaGpuVu::SetGeneratedLoopKernelProductAdmissionEnabled(
+			generated_provider_enabled);
+		VitaGS::SetGpuVuFragmentCompletionIsolationEnabled(
+			fragment_completion_isolation_enabled);
+		const bool playable_vu1 =
+			vu1_profile == ProductVu1ExecutionProfile::Playable;
+		// OracleNearest preserves the generated tier's already-attested
+		// scheduled/instant pipeline contract while selecting its software
+		// nearest-even FMAC owner. It exists only to compare one private GPU
+		// transaction byte-for-byte with PCSX2 configured identically. Exact
+		// remains the PS2 chop/accurate-pipeline profile and never silently
+		// changes rounding merely to enter the current generated tier.
+		const bool scheduled_vu1 =
+			vu1_profile != ProductVu1ExecutionProfile::Exact;
 		// Until the settings frontend lands, begin from PCSX2's defaults and
 		// override only target invariants and unsupported desktop mechanisms.
 		EmuConfig = Pcsx2Config();
@@ -1285,8 +1430,10 @@ namespace
 		// datapath. Product boot/oracle validation retains PS2 chop mode below by
 		// construction; the scalar VFP path also remains available whenever VU1's
 		// configured FPCR is not nearest+FZ with standard overflow clamping.
-		if (!VITASX2_PRODUCT_BOOT_VALIDATION)
+		if (scheduled_vu1)
 			EmuConfig.Cpu.VU1FPCR.SetRoundMode(FPRoundMode::Nearest);
+		else
+			EmuConfig.Cpu.VU1FPCR.SetRoundMode(FPRoundMode::ChopZero);
 		// Performance VU1 tier. PCSX2 owners:
 		// x86/microVU_Flags.inl::mVUsetFlags() and
 		// VU1micro.cpp::vu1ExecMicro(), plus VUops.cpp's implicit stall tests.
@@ -1294,19 +1441,19 @@ namespace
 		// inheriting constructor defaults so the Vita product contract remains
 		// visible when upstream defaults change. Deterministic oracle validation
 		// below disables every speedhack and therefore retains the accurate tier.
-		EmuConfig.Speedhacks.vuFlagHack = true;
-		EmuConfig.Speedhacks.vu1Instant = true;
+		EmuConfig.Speedhacks.vuFlagHack = scheduled_vu1;
+		EmuConfig.Speedhacks.vu1Instant = scheduled_vu1;
 		// PS2 VU microprograms are statically scheduled. Preserve explicit
 		// WAITQ/WAITP synchronization, result publication, and flag timing, but
 		// do not spend Cortex-A9 instructions proving that automatic FMAC,
 		// FDIV/EFU-resource, branch-after-IALU stalls, or the old-VI branch
 		// compatibility window are absent at runtime.
-		EmuConfig.Speedhacks.vu1AssumeScheduled = true;
+		EmuConfig.Speedhacks.vu1AssumeScheduled = scheduled_vu1;
 		// Sony VU User Manual 3.4.5/3.4.6 permits unsynchronized consumers to
 		// observe the old Q/P value. The Performance tier deliberately assumes
 		// microcode wants the newly computed value immediately, eliminating the
 		// pending FDIV/EFU timestamp and readiness machinery around scalar VFP.
-		EmuConfig.Speedhacks.vu1InstantQP = true;
+		EmuConfig.Speedhacks.vu1InstantQP = scheduled_vu1;
 		// Maximum-tier arithmetic approximations. ARM ARM A8.6.371-372 and
 		// A8.6.378-379 define the Advanced SIMD reciprocal/reciprocal-square-root
 		// estimate and Newton refinement operations; the Cortex-A9 MPE TRM table
@@ -1318,13 +1465,31 @@ namespace
 		// Approximate Q caused visible refmap corruption for negligible speed
 		// gain on real Vita hardware. Keep exact Q in the playable default.
 		EmuConfig.Speedhacks.vu1ApproximateQ = false;
-		EmuConfig.Speedhacks.vu1ApproximateP = true;
+		EmuConfig.Speedhacks.vu1ApproximateP = scheduled_vu1;
+		// The GPU structured tier selects a separate small native-SGX FMAC GXP
+		// for this bit. Inputs and outputs retain VU normalization, but finite
+		// ADD/SUB/MUL rounding may differ by one ULP. The exact offline GXP remains
+		// selected by boot/oracle validation after DisableAll().
+		EmuConfig.Speedhacks.vu1ApproximateFmac = playable_vu1;
+		// Generated playable GXPs use SGX vector conversion instructions. Edge
+		// saturation and NaN differences remain isolated behind this named
+		// profile; exact and oracle-nearest runs retain PCSX2's bitwise helpers.
+		// Native FTOI/ITOF contracts the generated loop without shader scratch.
+		// MIN/MAX deliberately remains on PCSX2's exact bit-order helper: Sony's
+		// allocator spills when those operations join this approximation.
+		EmuConfig.Speedhacks.vu1ApproximateConversions = playable_vu1;
 		// PCSX2 owner: Pcsx2Config::SpeedhackOptions::MTVU and
 		// VMManager::SetEmuThreadAffinities(). Normal Vita execution overlaps
 		// VU1 micro work with EE/IOP on the three documented application cores.
-		// Oracle validation remains single-threaded so every checkpoint is an
-		// immediately quiescent architectural boundary.
-		EmuConfig.Speedhacks.vuThread = !VITASX2_PRODUCT_BOOT_VALIDATION;
+		// Both boot-oracle and workload-checkpoint validation remain
+		// single-threaded. MTVU is a host optimization whose worker progress and
+		// coalesced E/T atomics are deliberately not architectural PS2 state;
+		// exact checkpoint A/Bs therefore use the existing synchronous VU1
+		// provider and reserve MTVU for the separate profiler-off performance
+		// gate.
+		EmuConfig.Speedhacks.vuThread =
+			!(VITASX2_PRODUCT_BOOT_VALIDATION ||
+				VITASX2_WORKLOAD_REPLAY_CHECKPOINT);
 		EmuConfig.DEV9.EthEnable = false;
 		EmuConfig.DEV9.HddEnable = false;
 
@@ -1362,12 +1527,44 @@ namespace
 			EmuConfig.RtcSecond = 0;
 			EmuConfig.Speedhacks.DisableAll();
 		}
+
+		const char* const vu1_profile_name =
+			vu1_profile == ProductVu1ExecutionProfile::Exact ? "exact" :
+			vu1_profile == ProductVu1ExecutionProfile::OracleNearest ?
+				"oracle-nearest" : "playable";
+		Console.WriteLn(
+			"VitaSX2 VU1 execution profile: profile=%s source=%s round=%u "
+			"flag_hack=%u instant=%u assume_scheduled=%u instant_qp=%u "
+			"approximate_q=%u approximate_p=%u approximate_fmac=%u "
+			"approximate_conversions=%u mtvu=%u.",
+			vu1_profile_name,
+			vu1_profile_source ? vu1_profile_source : "default",
+			static_cast<u32>(EmuConfig.Cpu.VU1FPCR.GetRoundMode()),
+			static_cast<u32>(EmuConfig.Speedhacks.vuFlagHack),
+			static_cast<u32>(EmuConfig.Speedhacks.vu1Instant),
+			static_cast<u32>(EmuConfig.Speedhacks.vu1AssumeScheduled),
+			static_cast<u32>(EmuConfig.Speedhacks.vu1InstantQP),
+			static_cast<u32>(EmuConfig.Speedhacks.vu1ApproximateQ),
+			static_cast<u32>(EmuConfig.Speedhacks.vu1ApproximateP),
+			static_cast<u32>(EmuConfig.Speedhacks.vu1ApproximateFmac),
+			static_cast<u32>(EmuConfig.Speedhacks.vu1ApproximateConversions),
+			static_cast<u32>(EmuConfig.Speedhacks.vuThread));
+		Console.WriteLn(
+			"VitaSX2 generated GPU-VU provider: enabled=%u source=%s.",
+			generated_provider_enabled ? 1u : 0u,
+			generated_provider_source);
+		Console.WriteLn(
+			"VitaSX2 GPU-VU fragment completion isolation: enabled=%u source=%s.",
+			fragment_completion_isolation_enabled ? 1u : 0u,
+			fragment_completion_isolation_source);
 	}
 
 	void ConfigureProductPerformanceTelemetry()
 	{
 		bool enabled = VITASX2_PRODUCT_BOOT_VALIDATION;
 		bool cpu_stage_profiler_enabled = false;
+		std::string health_probe_token;
+		u32 health_probe_port = 0;
 		const char* source = VITASX2_PRODUCT_BOOT_VALIDATION ?
 			"boot-validation" : "default";
 		if (!VITASX2_PRODUCT_BOOT_VALIDATION &&
@@ -1377,6 +1574,8 @@ namespace
 			if (settings.Load())
 			{
 				constexpr const char* section = "Diagnostics";
+				health_probe_token = settings.GetStringValue(section, "GpuVuHealthProbeToken", "");
+				(void)settings.GetUIntValue(section, "GpuVuHealthProbePort", &health_probe_port);
 				constexpr const char* key = "EnablePerformanceTelemetry";
 				if (settings.ContainsValue(section, key) &&
 					!settings.GetBoolValue(section, key, &enabled))
@@ -1419,6 +1618,14 @@ namespace
 		// created later by CPUThreadInitialize()/OpenGS(), so their plain reads
 		// observe this startup configuration without hot-path atomic traffic.
 		VitaPerformanceTelemetry::SetEnabledBeforeVmStart(enabled);
+		const bool health_probe_configured =
+			VitaGpuVu::HealthJournal::ConfigureLiveProbeBeforeVmStart(
+				health_probe_token.c_str(), health_probe_port);
+		if (!health_probe_token.empty())
+		{
+			Console.WriteLn("VitaSX2 GPU-VU live probe: configured=%u port=%u.",
+				health_probe_configured ? 1u : 0u, health_probe_port);
+		}
 		if (!enabled)
 			cpu_stage_profiler_enabled = false;
 		VitaPerformanceTelemetry::ConfigureCpuStageProfilerBeforeVmStart(
@@ -1442,6 +1649,7 @@ namespace
 		const char* button_name = "None";
 		const char* source = "default";
 		bool accept_physical_input = true;
+		std::string frame_script;
 
 		if (workload.enabled)
 		{
@@ -1461,6 +1669,8 @@ namespace
 			if (settings.Load())
 			{
 				constexpr const char* section = "InputAutomation";
+				frame_script = settings.GetStringValue(section, "FrameScript", "");
+				accept_physical_input = settings.GetBoolValue(section, "AcceptPhysicalInput", true);
 				const std::string configured_button =
 					settings.GetStringValue(section, "AutoFireButton", "None");
 				if (StringUtil::Strcasecmp(configured_button.c_str(), "Cross") == 0)
@@ -1530,6 +1740,14 @@ namespace
 			button_name, pressed_frames, released_frames,
 			workload.enabled ? "workload-replay" : "game-elf",
 			accept_physical_input ? 1u : 0u, source);
+		const bool script_valid = InputManager::ConfigureVitaPadFrameScript(frame_script);
+		if (!script_valid)
+			Console.Warning("VitaSX2 rejected malformed input FrameScript; no script pulses will run.");
+		Console.WriteLn(
+			"VitaSX2 input script: configured=%u valid=%u start=first-guest-vsync-after-elf "
+			"physical_input=%u source=%s script=%s.",
+			(script_valid && !frame_script.empty()) ? 1u : 0u, script_valid ? 1u : 0u,
+			accept_physical_input ? 1u : 0u, source, frame_script.c_str());
 	}
 
 	bool NativeProvidersSelected()
@@ -1537,6 +1755,29 @@ namespace
 		return Cpu == &recCpu && psxCpu == &psxRec &&
 			CpuVU0 == static_cast<BaseVUmicroCPU*>(&CpuMicroVU0) &&
 			CpuVU1 == static_cast<BaseVUmicroCPU*>(&CpuMicroVU1);
+	}
+
+	void ReportProductMemory(const char* phase)
+	{
+		if (!VitaPerformanceTelemetry::IsEnabled())
+			return;
+		const struct mallinfo heap = mallinfo();
+		const u32 arena = static_cast<u32>(heap.arena);
+		const u32 remaining = _newlib_heap_size_user > arena ?
+			_newlib_heap_size_user - arena : 0u;
+		SceKernelFreeMemorySizeInfo memory = {};
+		memory.size = sizeof(memory);
+		const s32 result = sceKernelGetFreeMemorySize(&memory);
+		Console.WriteLn(
+			"VitaSX2 memory phase=%s heap_limit=%u heap_arena=%u heap_used=%u "
+			"heap_free=%u heap_top=%u heap_chunks=%u heap_sbrk_remaining=%u "
+			"heap_headroom=%llu kernel_result=%08x user=%d cdram=%d phycont=%d.",
+			phase, _newlib_heap_size_user, arena, static_cast<u32>(heap.uordblks),
+			static_cast<u32>(heap.fordblks), static_cast<u32>(heap.keepcost),
+			static_cast<u32>(heap.ordblks), remaining,
+			static_cast<unsigned long long>(remaining) + static_cast<u32>(heap.fordblks),
+			static_cast<u32>(result), memory.size_user, memory.size_cdram,
+			memory.size_phycont);
 	}
 
 #if VITASX2_PRODUCT_BOOT_VALIDATION
@@ -1569,6 +1810,7 @@ namespace
 		u32 heap_headroom = 0;
 		u32 lpddr_free = 0;
 		s32 lpddr_result = 0;
+		bool lpddr_valid = false;
 	};
 
 	ValidationMemorySnapshot CaptureValidationMemory()
@@ -1590,7 +1832,11 @@ namespace
 		SceKernelFreeMemorySizeInfo free_info = {};
 		free_info.size = sizeof(free_info);
 		snapshot.lpddr_result = sceKernelGetFreeMemorySize(&free_info);
-		if (snapshot.lpddr_result >= 0)
+		constexpr s32 MaximumCredibleLpddrBytes = 512 * 1024 * 1024;
+		snapshot.lpddr_valid = snapshot.lpddr_result >= 0 &&
+			free_info.size_user >= 0 &&
+			free_info.size_user <= MaximumCredibleLpddrBytes;
+		if (snapshot.lpddr_valid)
 			snapshot.lpddr_free = static_cast<u32>(free_info.size_user);
 		return snapshot;
 	}
@@ -1611,7 +1857,7 @@ namespace
 		s_validation_progress.sampled_minimum_heap_headroom = std::min(
 			s_validation_progress.sampled_minimum_heap_headroom,
 			memory.heap_headroom);
-		if (memory.lpddr_result >= 0)
+		if (memory.lpddr_valid)
 		{
 			if (!s_validation_progress.has_lpddr_sample)
 			{
@@ -1668,7 +1914,7 @@ namespace
 			"heap_sampled_peak=%u heap_sampled_min_free=%u "
 			"heap_sampled_min_headroom=%u lpddr_free=%u "
 			"lpddr_sampled_min_free=%u "
-			"lpddr_result=%08x\n",
+			"lpddr_valid=%u lpddr_result=%08x\n",
 			s_validation_progress.next_sequence, phase, g_FrameCount, frame_delta,
 			cpuRegs.pc, static_cast<unsigned long long>(cpuRegs.cycle),
 			static_cast<unsigned long long>(Pcsx2Trace::GetEeTraceRecordsWritten()),
@@ -1692,6 +1938,7 @@ namespace
 			s_validation_progress.sampled_minimum_heap_headroom,
 			memory.lpddr_free,
 			s_validation_progress.sampled_minimum_lpddr_free,
+			memory.lpddr_valid ? 1u : 0u,
 			static_cast<u32>(memory.lpddr_result));
 		if (length <= 0 || static_cast<size_t>(length) >= sizeof(text) ||
 			!AppendValidationProgress(
@@ -1811,7 +2058,8 @@ namespace
 			"heap_free_chunks=%u\nheap_top_free=%u\nheap_sbrk_remaining=%u\n"
 			"heap_headroom=%u\nheap_sampled_peak=%u\n"
 			"heap_sampled_min_free=%u\nheap_sampled_min_headroom=%u\n"
-			"lpddr_free=%u\nlpddr_sampled_min_free=%u\nlpddr_result=%08x\n"
+			"lpddr_free=%u\nlpddr_sampled_min_free=%u\nlpddr_valid=%u\n"
+			"lpddr_result=%08x\n"
 			"gs_ring_canonical_bytes=%u\ngs_ring_packet_qwc=%u\n"
 			"gs_ring_packet_hash=%016llx\ngs_ring_local_hash=%016llx\n"
 			"gs_ring_pixel_checks=%u\ngs_ring_address_checks=%u\n"
@@ -1848,6 +2096,7 @@ namespace
 			s_validation_progress.sampled_minimum_heap_headroom,
 			memory.lpddr_free,
 			s_validation_progress.sampled_minimum_lpddr_free,
+			memory.lpddr_valid ? 1u : 0u,
 			static_cast<u32>(memory.lpddr_result),
 			gs_ring.canonical_bytes, gs_ring.packet_qwc,
 			static_cast<unsigned long long>(gs_ring.packet_hash),
@@ -1945,7 +2194,12 @@ int main()
 		}
 	}
 
-	Log::SetConsoleOutputLevel(LOGLEVEL_INFO);
+	// The Vita stdout/debug transport is synchronous and can block every
+	// emulation thread which emits INFO telemetry.  GPU-VU deliberately keeps
+	// detailed live evidence in the ux0 file below; duplicate only warnings and
+	// errors to the console so attestation bursts cannot become execution
+	// barriers on CPU1/MTGS.
+	Log::SetConsoleOutputLevel(LOGLEVEL_WARNING);
 	if (!Log::SetFileOutputLevel(
 			VITASX2_PRODUCT_BOOT_VALIDATION ? LOGLEVEL_DEV : LOGLEVEL_INFO,
 			log_path))
@@ -2005,6 +2259,7 @@ int main()
 		goto fail;
 	}
 	cpu_thread_initialized = true;
+	ReportProductMemory("cpu-thread-initialized");
 
 	{
 		VMBootParameters boot;
@@ -2048,6 +2303,7 @@ int main()
 			goto fail;
 	}
 	vm_initialized = true;
+	ReportProductMemory("vm-initialized");
 	{
 		const std::string configured_bios_path =
 			Path::Combine(EmuFolders::Bios, BIOS_FILE);
@@ -2108,9 +2364,22 @@ int main()
 		// The portable payload owns emulated PAD/SIO state, while the product's
 		// frame-driven autofire phase and correlated profiler origin are host
 		// state. Re-arm both only after every load owner has succeeded.
-		InputManager::ResetVitaPadAutoFire();
+		InputManager::ResetVitaPadAutomation();
 		InputManager::BeginVitaPadDeterministicReplay();
+		PadBase* const workload_pad = Pad::GetPad(0);
+		if (!workload_pad ||
+			workload_pad->GetType() != Pad::ControllerType::DualShock2 ||
+			workload_pad->ejectTicks != 0)
+		{
+			Error::SetString(&error,
+				"Workload replay did not retain a connected, non-ejected DualShock 2 in port 1.");
+			goto fail;
+		}
+		Console.WriteLn(
+			"VitaSX2 workload pad attestation: port=1 type=DualShock2 connected=1 eject_ticks=0 analog=%u.",
+			workload_pad->IsAnalogLightEnabled() ? 1u : 0u);
 		VitaGS::NotifyPerformanceWorkloadReplayLoaded();
+		ReportProductMemory("workload-resumed");
 #if VITASX2_WORKLOAD_REPLAY_CHECKPOINT
 		Pcsx2Trace::BeginPortableReplayExternalDeviceAccessWindow();
 		workload_external_window = true;
