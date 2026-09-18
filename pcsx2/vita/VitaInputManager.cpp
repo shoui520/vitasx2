@@ -6,8 +6,11 @@
 #include "Config.h"
 #include "SIO/Pad/Pad.h"
 #include "SIO/Pad/PadDualshock2.h"
+#include "common/Console.h"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <limits>
 #include <mutex>
 #include <string_view>
@@ -39,6 +42,107 @@ namespace
 	u32 s_auto_fire_phase = 0;
 	bool s_auto_fire_active = false;
 	bool s_accept_physical_input = true;
+	struct FramePulse
+	{
+		u32 frame = 0;
+		u32 buttons = 0;
+		u32 duration = 0;
+	};
+	std::array<FramePulse, 64> s_frame_script{};
+	u32 s_frame_script_count = 0;
+	u32 s_frame_script_index = 0;
+	u64 s_frame_script_frame = 0;
+	u32 s_frame_script_remaining = 0;
+	u32 s_frame_script_buttons = 0;
+	bool s_frame_script_active = false;
+
+	void ResetFrameScript(bool active)
+	{
+		s_frame_script_index = 0;
+		s_frame_script_frame = 0;
+		s_frame_script_remaining = 0;
+		s_frame_script_buttons = 0;
+		s_frame_script_active = active && s_frame_script_count != 0;
+	}
+
+	std::string_view TrimFrameScriptToken(std::string_view token)
+	{
+		const size_t begin = token.find_first_not_of(" \t\r\n");
+		return begin == std::string_view::npos ? std::string_view{} :
+			token.substr(begin, token.find_last_not_of(" \t\r\n") - begin + 1);
+	}
+
+	bool ParseFrameScriptNumber(std::string_view token, u32* value)
+	{
+		token = TrimFrameScriptToken(token);
+		if (token.empty())
+			return false;
+		const auto result = std::from_chars(token.data(), token.data() + token.size(), *value);
+		return result.ec == std::errc{} && result.ptr == token.data() + token.size();
+	}
+
+	u32 ParseFrameScriptButtons(std::string_view token)
+	{
+		static constexpr std::array<std::pair<std::string_view, u32>, 12> buttons = {{
+			{"Select", InputManager::VitaPadButton_Select},
+			{"Start", InputManager::VitaPadButton_Start},
+			{"Up", InputManager::VitaPadButton_Up},
+			{"Right", InputManager::VitaPadButton_Right},
+			{"Down", InputManager::VitaPadButton_Down},
+			{"Left", InputManager::VitaPadButton_Left},
+			{"L1", InputManager::VitaPadButton_L1},
+			{"R1", InputManager::VitaPadButton_R1},
+			{"Triangle", InputManager::VitaPadButton_Triangle},
+			{"Circle", InputManager::VitaPadButton_Circle},
+			{"Cross", InputManager::VitaPadButton_Cross},
+			{"Square", InputManager::VitaPadButton_Square},
+		}};
+		u32 mask = 0;
+		while (true)
+		{
+			const size_t separator = token.find('+');
+			const std::string_view name = TrimFrameScriptToken(token.substr(0, separator));
+			const auto found = std::find_if(buttons.begin(), buttons.end(), [&](const auto& button) {
+				return name.size() == button.first.size() &&
+					std::equal(name.begin(), name.end(), button.first.begin(), [](char a, char b) {
+						const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
+						return lower(a) == lower(b);
+					});
+			});
+			if (found == buttons.end() || (mask & found->second) != 0)
+				return 0;
+			mask |= found->second;
+			if (separator == std::string_view::npos)
+				return mask;
+			token.remove_prefix(separator + 1);
+		}
+	}
+
+	void AdvanceFrameScript()
+	{
+		if (!s_frame_script_active)
+			return;
+		// Only VMManager's guest-VSync owner advances time. Idle input polls
+		// simply reuse this snapshot; there is no file/network work here.
+		if (s_frame_script_remaining != 0 && --s_frame_script_remaining == 0)
+		{
+			Console.WriteLn("VitaSX2 input script: frame=%llu event=release buttons=%08x.",
+				static_cast<unsigned long long>(s_frame_script_frame), s_frame_script_buttons);
+			s_frame_script_buttons = 0;
+		}
+		if (s_frame_script_index < s_frame_script_count &&
+			s_frame_script[s_frame_script_index].frame == s_frame_script_frame)
+		{
+			const FramePulse& pulse = s_frame_script[s_frame_script_index++];
+			s_frame_script_buttons = pulse.buttons;
+			s_frame_script_remaining = pulse.duration;
+			Console.WriteLn("VitaSX2 input script: frame=%llu event=press buttons=%08x duration=%u.",
+				static_cast<unsigned long long>(s_frame_script_frame), pulse.buttons, pulse.duration);
+		}
+		s_frame_script_frame++;
+		if (s_frame_script_index == s_frame_script_count && s_frame_script_remaining == 0)
+			s_frame_script_active = false;
+	}
 
 #if defined(VITASX2_QEMU_VALIDATION)
 	VitaPadSnapshot s_qemu_snapshot;
@@ -294,7 +398,7 @@ void InputManager::ReloadBindings(const SettingsInterface& si, const SettingsInt
 void InputManager::CloseSources()
 {
 	InvalidateVitaPadStateCache();
-	ResetVitaPadAutoFire();
+	ResetVitaPadAutomation();
 	PauseVibration();
 }
 
@@ -307,7 +411,7 @@ void InputManager::InvalidateVitaPadStateCache()
 
 void InputManager::PollSources()
 {
-	const u32 automation_buttons = GetVitaPadAutoFireMask();
+	const u32 automation_buttons = GetVitaPadAutoFireMask() | s_frame_script_buttons;
 	if (!s_accept_physical_input)
 	{
 		ApplyVitaPadState(automation_buttons,
@@ -348,12 +452,13 @@ bool InputManager::ConfigureVitaPadAutoFire(
 	s_auto_fire_pressed_frames = std::max(pressed_frames, 1u);
 	s_auto_fire_released_frames = std::max(released_frames, 1u);
 	s_accept_physical_input = accept_physical_input;
-	ResetVitaPadAutoFire();
+	ResetVitaPadAutomation();
 	return true;
 }
 
 void InputManager::NotifyVitaPadElfEntry()
 {
+	ResetFrameScript(true);
 	s_auto_fire_active = (s_auto_fire_button != VitaPadAutoFireButton::None);
 	s_auto_fire_phase = s_auto_fire_active ?
 		(s_auto_fire_pressed_frames + s_auto_fire_released_frames - 1) : 0;
@@ -362,6 +467,9 @@ void InputManager::NotifyVitaPadElfEntry()
 
 void InputManager::BeginVitaPadDeterministicReplay()
 {
+	// A replay capsule owns its input stream; product-only scripts never leak
+	// into a restored deterministic replay.
+	ResetFrameScript(false);
 	// PCSX2's trace input owner presents phase zero before the first restored
 	// guest instruction. Do the same at the Vita workload seam, rather than
 	// waiting for a host controller poll or the following VSync.
@@ -371,15 +479,17 @@ void InputManager::BeginVitaPadDeterministicReplay()
 	PollSources();
 }
 
-void InputManager::ResetVitaPadAutoFire()
+void InputManager::ResetVitaPadAutomation()
 {
+	ResetFrameScript(false);
 	s_auto_fire_phase = 0;
 	s_auto_fire_active = false;
 	InvalidateVitaPadStateCache();
 }
 
-void InputManager::AdvanceVitaPadAutoFireFrame()
+void InputManager::AdvanceVitaPadAutomationFrame()
 {
+	AdvanceFrameScript();
 	if (!s_auto_fire_active)
 		return;
 
@@ -387,6 +497,53 @@ void InputManager::AdvanceVitaPadAutoFireFrame()
 	s_auto_fire_phase++;
 	if (s_auto_fire_phase == period)
 		s_auto_fire_phase = 0;
+}
+
+bool InputManager::ConfigureVitaPadFrameScript(std::string_view script)
+{
+	// Parse once before VM execution, into bounded storage. Reject the entire
+	// script on any error; never leave a partially configured/held button.
+	s_frame_script_count = 0;
+	ResetFrameScript(false);
+	InvalidateVitaPadStateCache();
+	script = TrimFrameScriptToken(script);
+	if (script.size() > 8192)
+		return false;
+	if (script.empty())
+		return true;
+	std::array<FramePulse, 64> parsed{};
+	u32 count = 0;
+	u64 previous_release = 0;
+	while (!script.empty())
+	{
+		if (count == parsed.size())
+			return false;
+		const size_t separator = script.find(';');
+		const std::string_view event = script.substr(0, separator);
+		const size_t first = event.find(':');
+		const size_t second = first == std::string_view::npos ? first : event.find(':', first + 1);
+		FramePulse& pulse = parsed[count];
+		if (first == std::string_view::npos || second == std::string_view::npos ||
+			!ParseFrameScriptNumber(event.substr(0, first), &pulse.frame) ||
+			!ParseFrameScriptNumber(event.substr(second + 1), &pulse.duration) ||
+			pulse.duration == 0 || pulse.duration > 600 ||
+			(pulse.buttons = ParseFrameScriptButtons(event.substr(first + 1, second - first - 1))) == 0)
+			return false;
+		const u64 release = static_cast<u64>(pulse.frame) + pulse.duration;
+		if (release > std::numeric_limits<u32>::max() ||
+			(count != 0 && pulse.frame <= previous_release))
+			return false;
+		previous_release = release;
+		count++;
+		if (separator == std::string_view::npos)
+			break;
+		script = TrimFrameScriptToken(script.substr(separator + 1));
+		if (script.empty())
+			return false;
+	}
+	s_frame_script = parsed;
+	s_frame_script_count = count;
+	return true;
 }
 
 void InputManager::PauseVibration()

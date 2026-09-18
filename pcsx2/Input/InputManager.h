@@ -69,10 +69,13 @@ namespace InputManager
 	void InvalidateVitaPadStateCache();
 	bool ConfigureVitaPadAutoFire(VitaPadAutoFireButton button, u32 pressed_frames,
 		u32 released_frames, bool accept_physical_input = true);
+	// Finite pulses: "frame:Button[+Button]:duration;...". Frame zero is the
+	// first guest VSync after ELF entry. Every pulse has an automatic release.
+	bool ConfigureVitaPadFrameScript(std::string_view script);
 	void NotifyVitaPadElfEntry();
 	void BeginVitaPadDeterministicReplay();
-	void ResetVitaPadAutoFire();
-	void AdvanceVitaPadAutoFireFrame();
+	void ResetVitaPadAutomation();
+	void AdvanceVitaPadAutomationFrame();
 	void PauseVibration();
 	void SetPadVibrationIntensity(u32 pad, float large_or_single_motor, float small_motor);
 

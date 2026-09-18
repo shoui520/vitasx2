@@ -59,6 +59,9 @@ namespace Pad
 	std::string GetConfigSection(u32 pad_index);
 
 	bool HasConnectedPad(u8 unifiedSlot);
+	// Portable replay currently supports a host-independent port-1 DualShock 2
+	// and disconnected remaining slots.
+	bool IsPortableReplayControllerTypeSupported(u8 unifiedSlot, ControllerType type);
 
 	PadBase* GetPad(u8 port, u8 slot);
 	PadBase* GetPad(const u8 unifiedSlot);
@@ -68,9 +71,10 @@ namespace Pad
 
 	bool Freeze(StateWrapper& sw);
 #if defined(VITASX2_VITA)
-	// Consumes the canonical disconnected-PAD payload used by portable replay,
-	// while preserving and freshly recreating the product's configured pads.
-	// SaveState's workload-replay context is the only caller.
+	// Loads the exact portable port-1 DualShock 2 protocol state when present.
+	// Legacy disconnected-PAD payloads remain supported by freshly recreating
+	// the product's configured controller without an eject interval. SaveState's
+	// workload-replay context is the only caller.
 	bool FreezePortableReplayWithConfiguredPads(StateWrapper& sw);
 #endif
 

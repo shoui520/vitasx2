@@ -136,7 +136,7 @@ namespace VMManager
 		s_elf_executed = false;
 		s_elf_path = {};
 		s_elf_entry_point = 0xFFFFFFFFu;
-		InputManager::ResetVitaPadAutoFire();
+		InputManager::ResetVitaPadAutomation();
 	}
 
 	static void ClearDiscInfo()
@@ -852,7 +852,7 @@ namespace VMManager
 			// called by Counters.cpp::VSyncStart() after the frame push. Keep
 			// Vita controller sampling on that emulated-frame boundary so SIO2
 			// observes one coherent snapshot for the following frame.
-			InputManager::AdvanceVitaPadAutoFireFrame();
+			InputManager::AdvanceVitaPadAutomationFrame();
 			InputManager::PollSources();
 		}
 	} // namespace Internal

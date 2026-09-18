@@ -52,6 +52,20 @@ namespace Pad
 
 		return s_controllers[unified_slot].get();
 	}
+
+	bool IsPortableReplayControllerTypeSupported(
+		u8 unified_slot, ControllerType type)
+	{
+		// PCSX2's PAD protocol state is host independent: PadBase::Freeze()
+		// serializes the command/mode state and PadDualshock2::Freeze()
+		// serializes the emulated controller configuration, while live host
+		// buttons and axes are supplied separately by InputManager.  Port 1's
+		// DualShock 2 can therefore cross the portable replay boundary exactly.
+		// Keep every other controller type outside the format until its protocol
+		// state has equivalent cross-host evidence.
+		return type == ControllerType::NotConnected ||
+			(unified_slot == 0 && type == ControllerType::DualShock2);
+	}
 } // namespace Pad
 
 bool Pad::Initialize()
@@ -202,7 +216,8 @@ namespace Pad
 		{
 			for (u8 i = 0; i < NUM_CONTROLLER_PORTS; i++)
 			{
-				if (EnsurePad(i)->GetType() != ControllerType::NotConnected)
+				if (!IsPortableReplayControllerTypeSupported(
+						i, EnsurePad(i)->GetType()))
 				{
 					sw.SetError();
 					return false;
@@ -222,8 +237,12 @@ namespace Pad
 			const ControllerType current_type = EnsurePad(i)->GetType();
 			ControllerType type = current_type;
 			sw.Do(&type);
-			if (sw.HasError() ||
-				(sw.IsPortableReplay() && type != ControllerType::NotConnected))
+			if (sw.HasError() || (sw.IsPortableReplay() &&
+					!IsPortableReplayControllerTypeSupported(i, type)) ||
+				(sw.IsReading() && sw.IsPortableReplay() &&
+					!preserve_configured_pads && type != current_type) ||
+				(sw.IsReading() && preserve_configured_pads &&
+					type != current_type && type != ControllerType::NotConnected))
 			{
 				sw.SetError();
 				return false;
@@ -234,10 +253,11 @@ namespace Pad
 				s_controllers[i] = CreatePad(type, i);
 				if (!EnsurePad(i)->Freeze(sw))
 					return false;
-				// Portable replay deliberately remaps the source host's disconnected
-				// controller to the Vita's configured controller.  This is not a guest
-				// hot-plug: an ejection interval would make games pause or open their
-				// controller-disconnected UI immediately after loading the capsule.
+				// Backward compatibility for legacy capsules which transported a
+				// disconnected PAD: consume that payload, then restore the Vita's
+				// configured controller without a guest-visible ejection interval.
+				// New capsules carry the exact port-1 DualShock 2 protocol state and
+				// take the matching-type path below.
 				s_controllers[i] = CreatePad(current_type, i);
 			}
 			else
