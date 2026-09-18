@@ -340,7 +340,11 @@ void CDVDsys_ChangeSource(CDVD_SourceType type)
 			break;
 
 		case CDVD_SourceType::Disc:
-			CDVD = &CDVDapi_Disc;
+			// PCSX2's Disc API owns a host optical drive, not PS2 CDVD
+			// emulation. Vita supports image-backed media only. Keep a safe
+			// closeable API during failed initialization, but reject the open
+			// below instead of treating this request as a successful no-disc boot.
+			CDVD = &CDVDapi_NoDisc;
 			break;
 
 		case CDVD_SourceType::NoDisc:
@@ -354,6 +358,12 @@ void CDVDsys_ChangeSource(CDVD_SourceType type)
 bool DoCDVDopen(Error* error)
 {
 	CheckNullCDVD();
+	if (m_CurrentSourceType == CDVD_SourceType::Disc)
+	{
+		Error::SetStringView(error,
+			"VitaSX2 does not support host optical drives; select a disc image.");
+		return false;
+	}
 
 	CDVD->newDiskCB(cdvdNewDiskCB);
 
