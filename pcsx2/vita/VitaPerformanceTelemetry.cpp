@@ -3,6 +3,13 @@
 
 #include "vita/VitaPerformanceTelemetry.h"
 
+#if defined(VITASX2_VIF_EPOCH_CENSUS)
+#include "vita/VitaVifEpochCensus.h"
+#endif
+#if defined(VITASX2_GPU_VU_OPPORTUNITY_CENSUS)
+#include "vita/VitaGpuVuOpportunityCensus.h"
+#endif
+
 #if defined(VITASX2_CPU_PROFILER)
 #include "common/Threading.h"
 #include "IopMem.h"
@@ -68,6 +75,7 @@ namespace VitaPerformanceTelemetry
 		{
 			std::atomic<u64> sequence{0};
 			std::atomic<u32> pc{UINT32_MAX};
+			std::atomic<u32> block_generation{0};
 		};
 		std::array<StatisticalGuestPcSample,
 			STATISTICAL_GUEST_PC_RING_SIZE> s_statistical_ee_pc_ring{};
@@ -77,56 +85,269 @@ namespace VitaPerformanceTelemetry
 		std::atomic<u64> s_statistical_iop_pc_sequence{0};
 		// Capturing source words on the sparse sampler thread would race guest
 		// memory mutation and could invoke a handler-backed read from a foreign
-		// thread. Instead, the IOP compiler publishes the already-decoded words
-		// at its cold, source-generation-owned commit seam. A direct-mapped
-		// profiler registry can lose a colliding diagnostic, but cannot affect
-		// execution or turn stale source into semantic authority.
+		// thread. Instead, each CPU compiler publishes its already-decoded words
+		// at its cold, source-generation-owned commit seam. The profiler-only
+		// registries use bounded open addressing: a retail window can contain more
+		// than 20,000 EE blocks, so a direct-mapped 4,096-slot table discarded most
+		// of the hot-PC source attribution through ordinary hash collisions.
+		// Entries never move or delete during a profile window and no lookup result
+		// participates in execution, admission, or source validity.
+		constexpr size_t EE_CODE_SNAPSHOT_REGISTRY_SIZE = 32768;
 		constexpr size_t IOP_CODE_SNAPSHOT_REGISTRY_SIZE = 4096;
-		static_assert(
-			std::has_single_bit(IOP_CODE_SNAPSHOT_REGISTRY_SIZE));
-		struct IopCodeSnapshot
+		static_assert(std::has_single_bit(EE_CODE_SNAPSHOT_REGISTRY_SIZE));
+		static_assert(std::has_single_bit(IOP_CODE_SNAPSHOT_REGISTRY_SIZE));
+		constexpr u32 GUEST_CODE_SNAPSHOT_RESERVED_PC = UINT32_MAX - 1;
+		enum EeTraceField : size_t
+		{
+			EeTraceInstructionCount,
+			EeTraceSourceInstructionCount,
+			EeTraceDependencyStartPc,
+			EeTraceDependencyInstructionCount,
+			EeTraceScaledCycles,
+			EeTraceEmittedBytes,
+			EeTraceHostInstructions,
+			EeTraceHelperCalls,
+			EeTraceStateLoads,
+			EeTraceStateStores,
+			EeTraceGuestInteger,
+			EeTraceGuestBranches,
+			EeTraceGuestMemoryLoads,
+			EeTraceGuestMemoryStores,
+			EeTraceGuestMmi,
+			EeTraceGuestCop0,
+			EeTraceGuestCop1,
+			EeTraceGuestCop2,
+			EeTraceGuestOther,
+			EeTraceFlags,
+			EeTraceSuccessorCount,
+			EeTraceSuccessor0,
+			EeTraceSuccessor1,
+			EeTraceFieldCount,
+		};
+		struct GuestCodeSnapshot
 		{
 			std::atomic<u32> sequence{0};
 			std::atomic<u32> pc{UINT32_MAX};
 			std::atomic<u32> code_words{0};
 			std::array<std::atomic<u32>,
 				CPU_PROFILE_CODE_WORD_COUNT> code{};
+			std::atomic<u32> ee_trace_generation{0};
+			std::array<std::atomic<u32>, EeTraceFieldCount>
+				ee_trace_fields{};
+			std::atomic<u32> ee_trace_predecessor_count{0};
+			std::atomic<u32> ee_trace_predecessor_truncated{0};
+			std::array<std::atomic<u32>,
+				CPU_PROFILE_EE_TRACE_PREDECESSOR_COUNT>
+				ee_trace_predecessors{};
 		};
-		std::array<IopCodeSnapshot,
-			IOP_CODE_SNAPSHOT_REGISTRY_SIZE> s_iop_code_snapshots{};
+		template <size_t Capacity>
+		using GuestCodeSnapshotRegistry =
+			std::array<GuestCodeSnapshot, Capacity>;
+		GuestCodeSnapshotRegistry<EE_CODE_SNAPSHOT_REGISTRY_SIZE>
+			s_ee_code_snapshots{};
+		GuestCodeSnapshotRegistry<IOP_CODE_SNAPSHOT_REGISTRY_SIZE>
+			s_iop_code_snapshots{};
 
-		constexpr size_t IopCodeSnapshotIndex(u32 pc)
+		template <size_t Capacity>
+		constexpr size_t GuestCodeSnapshotIndex(u32 pc)
 		{
 			return ((pc >> 2) * 2654435761u) &
-				(IOP_CODE_SNAPSHOT_REGISTRY_SIZE - 1);
+				(Capacity - 1);
 		}
 
-		bool ReadIopCodeSnapshot(u32 pc, u32* code_words,
+		template <size_t Capacity>
+		GuestCodeSnapshot* FindOrClaimGuestCodeSnapshot(
+			GuestCodeSnapshotRegistry<Capacity>& registry, u32 pc)
+		{
+			const size_t first = GuestCodeSnapshotIndex<Capacity>(pc);
+			for (size_t probe = 0; probe < Capacity; probe++)
+			{
+				GuestCodeSnapshot& slot =
+					registry[(first + probe) & (Capacity - 1)];
+				u32 stored_pc = slot.pc.load(std::memory_order_acquire);
+				if (stored_pc == pc)
+					return &slot;
+				if (stored_pc != UINT32_MAX)
+					continue;
+				if (slot.pc.compare_exchange_strong(stored_pc,
+						GUEST_CODE_SNAPSHOT_RESERVED_PC,
+						std::memory_order_acq_rel, std::memory_order_acquire))
+				{
+					slot.pc.store(pc, std::memory_order_release);
+					return &slot;
+				}
+				if (stored_pc == pc)
+					return &slot;
+			}
+			return nullptr;
+		}
+
+		template <size_t Capacity>
+		bool ReadGuestCodeSnapshot(
+			const GuestCodeSnapshotRegistry<Capacity>& registry,
+			u32 pc, u32* code_words,
 			std::array<u32, CPU_PROFILE_CODE_WORD_COUNT>* code)
 		{
-			const IopCodeSnapshot& slot =
-				s_iop_code_snapshots[IopCodeSnapshotIndex(pc)];
-			const u32 before =
-				slot.sequence.load(std::memory_order_acquire);
-			if ((before & 1u) != 0)
-				return false;
-			const u32 stored_pc = slot.pc.load(std::memory_order_relaxed);
-			const u32 stored_words =
-				slot.code_words.load(std::memory_order_relaxed);
-			std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> stored_code{};
-			for (size_t i = 0; i < stored_code.size(); i++)
+			const size_t first = GuestCodeSnapshotIndex<Capacity>(pc);
+			for (size_t probe = 0; probe < Capacity; probe++)
 			{
-				stored_code[i] =
-					slot.code[i].load(std::memory_order_relaxed);
+				const GuestCodeSnapshot& slot =
+					registry[(first + probe) & (Capacity - 1)];
+				const u32 stored_pc = slot.pc.load(std::memory_order_acquire);
+				if (stored_pc == UINT32_MAX)
+					return false;
+				if (stored_pc != pc)
+					continue;
+				const u32 before =
+					slot.sequence.load(std::memory_order_acquire);
+				if ((before & 1u) != 0)
+					return false;
+				const u32 stored_words =
+					slot.code_words.load(std::memory_order_relaxed);
+				std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> stored_code{};
+				for (size_t i = 0; i < stored_code.size(); i++)
+				{
+					stored_code[i] =
+						slot.code[i].load(std::memory_order_relaxed);
+				}
+				std::atomic_thread_fence(std::memory_order_acquire);
+				const u32 after =
+					slot.sequence.load(std::memory_order_relaxed);
+				if (before != after)
+					return false;
+				*code_words = stored_words;
+				*code = stored_code;
+				return true;
 			}
-			std::atomic_thread_fence(std::memory_order_acquire);
-			const u32 after =
-				slot.sequence.load(std::memory_order_relaxed);
-			if (before != after || stored_pc != pc)
-				return false;
-			*code_words = stored_words;
-			*code = stored_code;
-			return true;
+			return false;
+		}
+
+		u32 ReadEeTraceGeneration(u32 pc)
+		{
+			const size_t first =
+				GuestCodeSnapshotIndex<EE_CODE_SNAPSHOT_REGISTRY_SIZE>(pc);
+			for (size_t probe = 0;
+				probe < EE_CODE_SNAPSHOT_REGISTRY_SIZE; probe++)
+			{
+				const GuestCodeSnapshot& slot = s_ee_code_snapshots[
+					(first + probe) & (EE_CODE_SNAPSHOT_REGISTRY_SIZE - 1)];
+				const u32 stored_pc = slot.pc.load(std::memory_order_acquire);
+				if (stored_pc == UINT32_MAX)
+					return 0;
+				if (stored_pc != pc)
+					continue;
+				const u32 before =
+					slot.sequence.load(std::memory_order_acquire);
+				if ((before & 1u) != 0)
+					return 0;
+				const u32 generation = slot.ee_trace_generation.load(
+					std::memory_order_relaxed);
+				std::atomic_thread_fence(std::memory_order_acquire);
+				const u32 after =
+					slot.sequence.load(std::memory_order_relaxed);
+				return before == after ? generation : 0;
+			}
+			return 0;
+		}
+
+		template <size_t Capacity>
+		void PublishGuestCodeSnapshot(
+			GuestCodeSnapshotRegistry<Capacity>& registry,
+			u32 pc, const u32* code, u32 code_words,
+			const EeTraceBlockRegistration* ee_trace = nullptr)
+		{
+			if (!g_cpu_stage_profiler_enabled || !code)
+				return;
+			GuestCodeSnapshot* const selected =
+				FindOrClaimGuestCodeSnapshot(registry, pc);
+			if (!selected)
+				return;
+			GuestCodeSnapshot& slot = *selected;
+			const u32 sequence =
+				slot.sequence.fetch_add(1, std::memory_order_acq_rel);
+			const u32 retained_words = std::min<u32>(
+				code_words, CPU_PROFILE_CODE_WORD_COUNT);
+			slot.code_words.store(retained_words, std::memory_order_relaxed);
+			for (size_t i = 0; i < CPU_PROFILE_CODE_WORD_COUNT; i++)
+			{
+				slot.code[i].store(
+					i < retained_words ? code[i] : 0,
+					std::memory_order_relaxed);
+			}
+			if (ee_trace)
+			{
+				const std::array<u32, EeTraceFieldCount> fields = {{
+					ee_trace->instruction_count,
+					ee_trace->source_instruction_count,
+					ee_trace->dependency_start_pc,
+					ee_trace->dependency_instruction_count,
+					ee_trace->scaled_cycles,
+					ee_trace->emitted_bytes,
+					ee_trace->host_instructions,
+					ee_trace->helper_calls,
+					ee_trace->state_loads,
+					ee_trace->state_stores,
+					ee_trace->guest_integer,
+					ee_trace->guest_branches,
+					ee_trace->guest_memory_loads,
+					ee_trace->guest_memory_stores,
+					ee_trace->guest_mmi,
+					ee_trace->guest_cop0,
+					ee_trace->guest_cop1,
+					ee_trace->guest_cop2,
+					ee_trace->guest_other,
+					ee_trace->flags,
+					std::min<u32>(ee_trace->successor_count,
+						CPU_PROFILE_EE_TRACE_SUCCESSOR_COUNT),
+					ee_trace->successors[0],
+					ee_trace->successors[1],
+				}};
+				for (size_t i = 0; i < fields.size(); i++)
+				{
+					slot.ee_trace_fields[i].store(
+						fields[i], std::memory_order_relaxed);
+				}
+				u32 generation =
+					slot.ee_trace_generation.load(std::memory_order_relaxed) + 1;
+				if (generation == 0)
+					generation = 1;
+				slot.ee_trace_generation.store(
+					generation, std::memory_order_relaxed);
+			}
+			slot.sequence.store(sequence + 2, std::memory_order_release);
+		}
+
+		void PublishEeTracePredecessor(u32 target_pc, u32 source_pc)
+		{
+			GuestCodeSnapshot* const selected = FindOrClaimGuestCodeSnapshot(
+				s_ee_code_snapshots, target_pc);
+			if (!selected)
+				return;
+			GuestCodeSnapshot& slot = *selected;
+			const u32 sequence =
+				slot.sequence.fetch_add(1, std::memory_order_acq_rel);
+			u32 count = std::min<u32>(
+				slot.ee_trace_predecessor_count.load(std::memory_order_relaxed),
+				CPU_PROFILE_EE_TRACE_PREDECESSOR_COUNT);
+			bool duplicate = false;
+			for (u32 i = 0; i < count; i++)
+			{
+				duplicate |= slot.ee_trace_predecessors[i].load(
+					std::memory_order_relaxed) == source_pc;
+			}
+			if (!duplicate && count < CPU_PROFILE_EE_TRACE_PREDECESSOR_COUNT)
+			{
+				slot.ee_trace_predecessors[count].store(
+					source_pc, std::memory_order_relaxed);
+				slot.ee_trace_predecessor_count.store(
+					count + 1, std::memory_order_relaxed);
+			}
+			else if (!duplicate)
+			{
+				slot.ee_trace_predecessor_truncated.store(
+					1, std::memory_order_relaxed);
+			}
+			slot.sequence.store(sequence + 2, std::memory_order_release);
 		}
 
 #if defined(__vita__)
@@ -149,6 +370,9 @@ namespace VitaPerformanceTelemetry
 			{
 				const u32 stage = g_cpu_stage_statistical_marker.load(
 					std::memory_order_relaxed);
+#if defined(VITASX2_VIF_EPOCH_CENSUS)
+				VitaVifEpochCensus::RecordStatisticalSample();
+#endif
 				s_statistical_samples.fetch_add(1,
 					std::memory_order_relaxed);
 				if (stage < CPU_STAGE_COUNT)
@@ -180,11 +404,15 @@ namespace VitaPerformanceTelemetry
 						published_pc.load(std::memory_order_relaxed);
 					if (pc != UINT32_MAX)
 					{
+						const u32 block_generation = sample_ee ?
+							ReadEeTraceGeneration(pc) : 0;
 						const u64 sequence = published_sequence.fetch_add(
 							1, std::memory_order_relaxed) + 1;
 						StatisticalGuestPcSample& sample =
 							ring[sequence % STATISTICAL_GUEST_PC_RING_SIZE];
 						sample.pc.store(pc, std::memory_order_relaxed);
+						sample.block_generation.store(
+							block_generation, std::memory_order_relaxed);
 						sample.sequence.store(sequence,
 							std::memory_order_release);
 					}
@@ -283,23 +511,27 @@ namespace VitaPerformanceTelemetry
 	void RegisterIopGeneratedBlockCode(
 		u32 pc, const u32* code, u32 code_words)
 	{
-		if (!g_cpu_stage_profiler_enabled || !code)
-			return;
-		IopCodeSnapshot& slot =
-			s_iop_code_snapshots[IopCodeSnapshotIndex(pc)];
-		const u32 sequence =
-			slot.sequence.fetch_add(1, std::memory_order_acq_rel);
-		slot.pc.store(pc, std::memory_order_relaxed);
-		const u32 retained_words = std::min<u32>(
-			code_words, CPU_PROFILE_CODE_WORD_COUNT);
-		slot.code_words.store(retained_words, std::memory_order_relaxed);
-		for (size_t i = 0; i < CPU_PROFILE_CODE_WORD_COUNT; i++)
+		PublishGuestCodeSnapshot(s_iop_code_snapshots, pc, code, code_words);
+	}
+
+	void RegisterEeGeneratedBlockCode(
+		u32 pc, const u32* code, u32 code_words)
+	{
+		PublishGuestCodeSnapshot(s_ee_code_snapshots, pc, code, code_words);
+	}
+
+	void RegisterEeGeneratedBlockTrace(const EeTraceBlockRegistration& block,
+		const u32* code, u32 code_words)
+	{
+		PublishGuestCodeSnapshot(s_ee_code_snapshots, block.pc,
+			code, code_words, &block);
+		const u32 successor_count = std::min<u32>(block.successor_count,
+			CPU_PROFILE_EE_TRACE_SUCCESSOR_COUNT);
+		for (u32 i = 0; i < successor_count; i++)
 		{
-			slot.code[i].store(
-				i < retained_words ? code[i] : 0,
-				std::memory_order_relaxed);
+			if ((block.successors[i] & 3u) == 0)
+				PublishEeTracePredecessor(block.successors[i], block.pc);
 		}
-		slot.sequence.store(sequence + 2, std::memory_order_release);
 	}
 #endif
 
@@ -312,6 +544,12 @@ namespace VitaPerformanceTelemetry
 	{
 #if defined(VITASX2_CPU_PROFILER)
 		g_cpu_stage_profiler_enabled = enabled;
+#if defined(VITASX2_VIF_EPOCH_CENSUS)
+		VitaVifEpochCensus::ResetBeforeVmStart();
+#endif
+#if defined(VITASX2_GPU_VU_OPPORTUNITY_CENSUS)
+		VitaGpuVuOpportunityCensus::ConfigureBeforeVmStart(enabled);
+#endif
 		g_cpu_stage_sample_active = false;
 		s_cpu_stage_profiler = {};
 		s_cpu_stage_profiler.scheduler_until_sample =
@@ -331,21 +569,39 @@ namespace VitaPerformanceTelemetry
 		for (StatisticalGuestPcSample& sample : s_statistical_ee_pc_ring)
 		{
 			sample.pc.store(UINT32_MAX, std::memory_order_relaxed);
+			sample.block_generation.store(0, std::memory_order_relaxed);
 			sample.sequence.store(0, std::memory_order_relaxed);
 		}
 		for (StatisticalGuestPcSample& sample : s_statistical_iop_pc_ring)
 		{
 			sample.pc.store(UINT32_MAX, std::memory_order_relaxed);
+			sample.block_generation.store(0, std::memory_order_relaxed);
 			sample.sequence.store(0, std::memory_order_relaxed);
 		}
-		for (IopCodeSnapshot& slot : s_iop_code_snapshots)
-		{
-			slot.pc.store(UINT32_MAX, std::memory_order_relaxed);
-			slot.code_words.store(0, std::memory_order_relaxed);
-			for (std::atomic<u32>& word : slot.code)
-				word.store(0, std::memory_order_relaxed);
-			slot.sequence.store(0, std::memory_order_relaxed);
-		}
+		const auto clear_code_registry = [](auto& registry) {
+			for (GuestCodeSnapshot& slot : registry)
+			{
+				slot.pc.store(UINT32_MAX, std::memory_order_relaxed);
+				slot.code_words.store(0, std::memory_order_relaxed);
+				for (std::atomic<u32>& word : slot.code)
+					word.store(0, std::memory_order_relaxed);
+				slot.ee_trace_generation.store(0, std::memory_order_relaxed);
+				for (std::atomic<u32>& field : slot.ee_trace_fields)
+					field.store(0, std::memory_order_relaxed);
+				slot.ee_trace_predecessor_count.store(
+					0, std::memory_order_relaxed);
+				slot.ee_trace_predecessor_truncated.store(
+					0, std::memory_order_relaxed);
+				for (std::atomic<u32>& predecessor :
+					slot.ee_trace_predecessors)
+				{
+					predecessor.store(0, std::memory_order_relaxed);
+				}
+				slot.sequence.store(0, std::memory_order_relaxed);
+			}
+		};
+		clear_code_registry(s_ee_code_snapshots);
+		clear_code_registry(s_iop_code_snapshots);
 		for (std::atomic<u32>& samples : s_statistical_stage_samples)
 			samples.store(0, std::memory_order_relaxed);
 #if defined(__vita__)
@@ -597,7 +853,7 @@ namespace VitaPerformanceTelemetry
 
 #if defined(VITASX2_CPU_PROFILER)
 	static CpuProfileHotPcSnapshot GetCpuProfileHotGuestPcSnapshot(
-		u64 first_sequence, u64 next_sequence,
+		u64 first_sequence, u64 next_sequence, u32 first_rank,
 		const std::array<StatisticalGuestPcSample,
 			STATISTICAL_GUEST_PC_RING_SIZE>& ring,
 		const std::atomic<u64>& sequence_source)
@@ -621,7 +877,8 @@ namespace VitaPerformanceTelemetry
 			first_sequence = retained_first;
 		}
 
-		constexpr size_t CANDIDATE_COUNT = 32;
+		constexpr size_t CANDIDATE_COUNT =
+			CPU_PROFILE_HOT_GUEST_PC_CANDIDATE_COUNT;
 		struct Candidate
 		{
 			u32 pc = 0;
@@ -699,14 +956,24 @@ namespace VitaPerformanceTelemetry
 				}
 			}
 		}
-		if (&ring == &s_statistical_iop_pc_ring)
+		const bool ee_registry = &ring == &s_statistical_ee_pc_ring;
+		const bool iop_registry = &ring == &s_statistical_iop_pc_ring;
+		if (ee_registry || iop_registry)
 		{
 			for (CpuProfileHotPc& hot_pc : exact)
 			{
 				if (hot_pc.samples == 0)
 					continue;
-				ReadIopCodeSnapshot(hot_pc.pc, &hot_pc.code_words,
-					&hot_pc.code);
+				if (ee_registry)
+				{
+					ReadGuestCodeSnapshot(s_ee_code_snapshots, hot_pc.pc,
+						&hot_pc.code_words, &hot_pc.code);
+				}
+				else
+				{
+					ReadGuestCodeSnapshot(s_iop_code_snapshots, hot_pc.pc,
+						&hot_pc.code_words, &hot_pc.code);
+				}
 			}
 		}
 		std::sort(exact.begin(), exact.end(),
@@ -714,24 +981,203 @@ namespace VitaPerformanceTelemetry
 				const CpuProfileHotPc& right) {
 				return left.samples > right.samples;
 			});
-		std::copy_n(exact.begin(), snapshot.pcs.size(),
-			snapshot.pcs.begin());
+		if (first_rank < exact.size())
+		{
+			const size_t retained = std::min<size_t>(snapshot.pcs.size(),
+				exact.size() - first_rank);
+			std::copy_n(exact.begin() + first_rank, retained,
+				snapshot.pcs.begin());
+		}
 		return snapshot;
 	}
 
 	CpuProfileHotPcSnapshot GetCpuProfileHotEePcSnapshot(
-		u64 first_sequence, u64 next_sequence)
+		u64 first_sequence, u64 next_sequence, u32 first_rank)
 	{
 		return GetCpuProfileHotGuestPcSnapshot(first_sequence, next_sequence,
+			first_rank,
 			s_statistical_ee_pc_ring, s_statistical_ee_pc_sequence);
 	}
 
 	CpuProfileHotPcSnapshot GetCpuProfileHotIopPcSnapshot(
-		u64 first_sequence, u64 next_sequence)
+		u64 first_sequence, u64 next_sequence, u32 first_rank)
 	{
 		return GetCpuProfileHotGuestPcSnapshot(first_sequence, next_sequence,
+			first_rank,
 			s_statistical_iop_pc_ring, s_statistical_iop_pc_sequence);
 	}
+
+	CpuProfileEeSampleSnapshot GetCpuProfileEeSampleSnapshot(
+		u64 first_sequence, u64 next_sequence, u32 first_sample_index)
+	{
+		CpuProfileEeSampleSnapshot snapshot;
+		snapshot.valid = s_cpu_stage_profiler.totals.valid;
+		snapshot.first_sequence = first_sequence;
+		snapshot.next_sequence = next_sequence;
+		snapshot.first_sample_index = first_sample_index;
+		if (!snapshot.valid || first_sequence >= next_sequence)
+			return snapshot;
+
+		const u64 published =
+			s_statistical_ee_pc_sequence.load(std::memory_order_acquire);
+		next_sequence = std::min(next_sequence, published + 1);
+		snapshot.next_sequence = next_sequence;
+		const u64 retained_first =
+			published >= STATISTICAL_GUEST_PC_RING_SIZE ?
+				published - STATISTICAL_GUEST_PC_RING_SIZE + 1 : 1;
+		if (first_sequence < retained_first)
+		{
+			snapshot.dropped_samples =
+				std::min(next_sequence, retained_first) - first_sequence;
+			first_sequence = std::min(next_sequence, retained_first);
+		}
+
+		u64 valid_index = 0;
+		for (u64 sequence = first_sequence;
+			sequence < next_sequence; sequence++)
+		{
+			const StatisticalGuestPcSample& stored =
+				s_statistical_ee_pc_ring[
+					sequence % STATISTICAL_GUEST_PC_RING_SIZE];
+			const u64 before = stored.sequence.load(std::memory_order_acquire);
+			const u32 pc = stored.pc.load(std::memory_order_relaxed);
+			const u32 generation = stored.block_generation.load(
+				std::memory_order_relaxed);
+			const u64 after = stored.sequence.load(std::memory_order_acquire);
+			if (before != sequence || after != sequence || pc == UINT32_MAX)
+			{
+				snapshot.invalid_samples++;
+				continue;
+			}
+			if (valid_index >= first_sample_index &&
+				snapshot.sample_count < snapshot.samples.size())
+			{
+				CpuProfileEeSample& sample =
+					snapshot.samples[snapshot.sample_count++];
+				sample.sequence = sequence;
+				sample.pc = pc;
+				sample.block_generation = generation;
+			}
+			valid_index++;
+		}
+		snapshot.valid_samples = valid_index;
+		return snapshot;
+	}
+
+	CpuProfileEeTraceBlock GetCpuProfileEeTraceBlock(
+		u32 pc, u32 expected_generation)
+	{
+		CpuProfileEeTraceBlock result;
+		const size_t first =
+			GuestCodeSnapshotIndex<EE_CODE_SNAPSHOT_REGISTRY_SIZE>(pc);
+		for (size_t probe = 0;
+			probe < EE_CODE_SNAPSHOT_REGISTRY_SIZE; probe++)
+		{
+			const GuestCodeSnapshot& slot = s_ee_code_snapshots[
+				(first + probe) & (EE_CODE_SNAPSHOT_REGISTRY_SIZE - 1)];
+			const u32 stored_pc = slot.pc.load(std::memory_order_acquire);
+			if (stored_pc == UINT32_MAX)
+				return result;
+			if (stored_pc != pc)
+				continue;
+			const u32 before = slot.sequence.load(std::memory_order_acquire);
+			if ((before & 1u) != 0)
+				return result;
+			const u32 generation = slot.ee_trace_generation.load(
+				std::memory_order_relaxed);
+			if (generation == 0 ||
+				(expected_generation != 0 && generation != expected_generation))
+			{
+				return result;
+			}
+			std::array<u32, EeTraceFieldCount> fields{};
+			for (size_t i = 0; i < fields.size(); i++)
+			{
+				fields[i] = slot.ee_trace_fields[i].load(
+					std::memory_order_relaxed);
+			}
+			const u32 predecessor_count =
+				slot.ee_trace_predecessor_count.load(
+					std::memory_order_relaxed);
+			const u32 predecessor_truncated =
+				slot.ee_trace_predecessor_truncated.load(
+					std::memory_order_relaxed);
+			std::array<u32, CPU_PROFILE_EE_TRACE_PREDECESSOR_COUNT>
+				predecessors{};
+			for (size_t i = 0; i < predecessors.size(); i++)
+			{
+				predecessors[i] = slot.ee_trace_predecessors[i].load(
+					std::memory_order_relaxed);
+			}
+			const u32 code_words =
+				slot.code_words.load(std::memory_order_relaxed);
+			std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> code{};
+			for (size_t i = 0; i < code.size(); i++)
+				code[i] = slot.code[i].load(std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			const u32 after = slot.sequence.load(std::memory_order_relaxed);
+			if (before != after ||
+				fields[EeTraceSuccessorCount] >
+					CPU_PROFILE_EE_TRACE_SUCCESSOR_COUNT ||
+				predecessor_count > CPU_PROFILE_EE_TRACE_PREDECESSOR_COUNT ||
+				code_words > CPU_PROFILE_CODE_WORD_COUNT)
+			{
+				return result;
+			}
+
+			result.valid = true;
+			result.generation = generation;
+			result.block.pc = pc;
+			result.block.instruction_count = fields[EeTraceInstructionCount];
+			result.block.source_instruction_count =
+				fields[EeTraceSourceInstructionCount];
+			result.block.dependency_start_pc = fields[EeTraceDependencyStartPc];
+			result.block.dependency_instruction_count =
+				fields[EeTraceDependencyInstructionCount];
+			result.block.scaled_cycles = fields[EeTraceScaledCycles];
+			result.block.emitted_bytes = fields[EeTraceEmittedBytes];
+			result.block.host_instructions = fields[EeTraceHostInstructions];
+			result.block.helper_calls = fields[EeTraceHelperCalls];
+			result.block.state_loads = fields[EeTraceStateLoads];
+			result.block.state_stores = fields[EeTraceStateStores];
+			result.block.guest_integer = fields[EeTraceGuestInteger];
+			result.block.guest_branches = fields[EeTraceGuestBranches];
+			result.block.guest_memory_loads = fields[EeTraceGuestMemoryLoads];
+			result.block.guest_memory_stores = fields[EeTraceGuestMemoryStores];
+			result.block.guest_mmi = fields[EeTraceGuestMmi];
+			result.block.guest_cop0 = fields[EeTraceGuestCop0];
+			result.block.guest_cop1 = fields[EeTraceGuestCop1];
+			result.block.guest_cop2 = fields[EeTraceGuestCop2];
+			result.block.guest_other = fields[EeTraceGuestOther];
+			result.block.flags = fields[EeTraceFlags];
+			result.block.successor_count = fields[EeTraceSuccessorCount];
+			result.block.successors[0] = fields[EeTraceSuccessor0];
+			result.block.successors[1] = fields[EeTraceSuccessor1];
+			result.predecessor_count = predecessor_count;
+			result.predecessor_truncated = predecessor_truncated != 0;
+			result.predecessors = predecessors;
+			result.code_words = code_words;
+			result.code = code;
+			return result;
+		}
+		return result;
+	}
+
+#if defined(VITASX2_QEMU_VALIDATION)
+	void RecordEeStatisticalSampleForValidation(u32 pc)
+	{
+		if (!g_cpu_stage_profiler_enabled || pc == UINT32_MAX)
+			return;
+		const u64 sequence = s_statistical_ee_pc_sequence.fetch_add(
+			1, std::memory_order_relaxed) + 1;
+		StatisticalGuestPcSample& sample = s_statistical_ee_pc_ring[
+			sequence % STATISTICAL_GUEST_PC_RING_SIZE];
+		sample.pc.store(pc, std::memory_order_relaxed);
+		sample.block_generation.store(
+			ReadEeTraceGeneration(pc), std::memory_order_relaxed);
+		sample.sequence.store(sequence, std::memory_order_release);
+	}
+#endif
 #endif
 
 #if defined(VITASX2_CPU_PROFILER)

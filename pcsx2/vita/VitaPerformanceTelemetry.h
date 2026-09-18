@@ -69,6 +69,16 @@ namespace VitaPerformanceTelemetry
 		// callbacks. Keep them separate so Phase 1 profiles do not treat VIF
 		// feeding, GIF feeding, and VU completion publication as one owner.
 		VifDma,
+		// Vif_Transfer.cpp::vifTransfer() is nested beneath VifDma for ordinary
+		// DMA callbacks. These are statistical CPU0 subowners only: VIF1 unpack
+		// can execute on MTVU, so the worker must never publish this CPU0 marker.
+		VifTransfer,
+		VifUnpackHandoff,
+		VifUnpackCopy,
+		VifUnpackWiden,
+		VifUnpackModeMask,
+		VifUnpackCycle,
+		VifUnpackGeneric,
 		GifDma,
 		VifVuFinish,
 #endif
@@ -104,11 +114,33 @@ namespace VitaPerformanceTelemetry
 	// this profiler-only storage tied to that owning enum with a static assert.
 	static constexpr size_t EE_DEADLINE_EVENT_SLOT_COUNT = 21;
 	// PES currently produces about 214 records per 120-VSync measurement
-	// window at the 1/1024 cadence. 307 widened records retain a complete
-	// ordinary window while keeping fixed interval storage below 96 KiB.
-	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 307;
+	// window at the 1/1024 cadence. The VIF subowner census widens each
+	// profiler-only record to 352 bytes; 279 records retain the measured window
+	// plus margin while preserving the existing fixed-storage ceiling below
+	// 96 KiB.
+	static constexpr size_t CPU_PROFILE_INTERVAL_RING_SIZE = 279;
 	static constexpr size_t CPU_PROFILE_HOT_EDGE_COUNT = 8;
-	static constexpr size_t CPU_PROFILE_HOT_IOP_PC_COUNT = 8;
+	static constexpr size_t CPU_PROFILE_EE_SAMPLE_PAGE_SIZE = 32;
+	static constexpr size_t CPU_PROFILE_EE_TRACE_SUCCESSOR_COUNT = 2;
+	static constexpr size_t CPU_PROFILE_EE_TRACE_PREDECESSOR_COUNT = 4;
+	// The former eight-entry report hid most generated-EE residency in retail
+	// windows with thousands of live blocks. Keep each returned page fixed at 32
+	// entries: a validation experiment which enlarged this by-value object to 128
+	// produced corrupt records beyond rank 32 on the Vita. The cold profiler may
+	// rank a wider candidate set, but callers must retrieve it in fixed-size pages.
+	// Preserve the ordinary product snapshot layout when this diagnostic is
+	// compiled out.
+#if defined(VITASX2_CPU_PROFILER)
+	static constexpr size_t CPU_PROFILE_HOT_GUEST_PC_COUNT = 32;
+	static constexpr size_t CPU_PROFILE_HOT_GUEST_PC_CANDIDATE_COUNT = 128;
+#else
+	static constexpr size_t CPU_PROFILE_HOT_GUEST_PC_COUNT = 8;
+	static constexpr size_t CPU_PROFILE_HOT_GUEST_PC_CANDIDATE_COUNT = 8;
+#endif
+	static_assert(CPU_PROFILE_HOT_GUEST_PC_CANDIDATE_COUNT >=
+		CPU_PROFILE_HOT_GUEST_PC_COUNT);
+	static_assert(CPU_PROFILE_HOT_GUEST_PC_CANDIDATE_COUNT %
+		CPU_PROFILE_HOT_GUEST_PC_COUNT == 0);
 
 	enum class EeDeadlineOwner : u8
 	{
@@ -374,8 +406,85 @@ namespace VitaPerformanceTelemetry
 		u64 dropped_samples = 0;
 		u64 invalid_samples = 0;
 		std::array<CpuProfileHotPc,
-			CPU_PROFILE_HOT_IOP_PC_COUNT> pcs{};
+			CPU_PROFILE_HOT_GUEST_PC_COUNT> pcs{};
 	};
+
+#if defined(VITASX2_CPU_PROFILER)
+	// Immutable facts published by the EE compiler at the same source-generation
+	// ownership seam as the generated block. They are diagnostic inputs only:
+	// neither execution, support, nor profitability reads this record.
+	enum EeTraceBlockFlags : u32
+	{
+		EeTraceBlockDiscoveredTopology = 1u << 0,
+		EeTraceBlockSchedulerTestAtEnd = 1u << 1,
+		EeTraceBlockSpecializedWait = 1u << 2,
+		EeTraceBlockSchedulerElidedContinuation = 1u << 3,
+	};
+
+	struct EeTraceBlockRegistration
+	{
+		u32 pc = 0;
+		u32 instruction_count = 0;
+		u32 source_instruction_count = 0;
+		u32 dependency_start_pc = 0;
+		u32 dependency_instruction_count = 0;
+		u32 scaled_cycles = 0;
+		u32 emitted_bytes = 0;
+		u32 host_instructions = 0;
+		u32 helper_calls = 0;
+		u32 state_loads = 0;
+		u32 state_stores = 0;
+		u32 guest_integer = 0;
+		u32 guest_branches = 0;
+		u32 guest_memory_loads = 0;
+		u32 guest_memory_stores = 0;
+		u32 guest_mmi = 0;
+		u32 guest_cop0 = 0;
+		u32 guest_cop1 = 0;
+		u32 guest_cop2 = 0;
+		u32 guest_other = 0;
+		u32 flags = 0;
+		u32 successor_count = 0;
+		std::array<u32, CPU_PROFILE_EE_TRACE_SUCCESSOR_COUNT> successors{};
+	};
+
+	struct CpuProfileEeSample
+	{
+		u64 sequence = 0;
+		u32 pc = UINT32_MAX;
+		// Per-PC compiler publication generation. A mismatch at report time is
+		// classified as source/code-generation churn instead of borrowing the
+		// newest block description for an older sample.
+		u32 block_generation = 0;
+	};
+
+	struct CpuProfileEeSampleSnapshot
+	{
+		bool valid = false;
+		u64 first_sequence = 0;
+		u64 next_sequence = 0;
+		u64 dropped_samples = 0;
+		u64 invalid_samples = 0;
+		u64 valid_samples = 0;
+		u32 first_sample_index = 0;
+		u32 sample_count = 0;
+		std::array<CpuProfileEeSample,
+			CPU_PROFILE_EE_SAMPLE_PAGE_SIZE> samples{};
+	};
+
+	struct CpuProfileEeTraceBlock
+	{
+		bool valid = false;
+		u32 generation = 0;
+		EeTraceBlockRegistration block{};
+		u32 predecessor_count = 0;
+		bool predecessor_truncated = false;
+		std::array<u32, CPU_PROFILE_EE_TRACE_PREDECESSOR_COUNT>
+			predecessors{};
+		u32 code_words = 0;
+		std::array<u32, CPU_PROFILE_CODE_WORD_COUNT> code{};
+	};
+#endif
 
 	// SCE_SYSMODULE_PERF is devkit-only and is rejected on retail hardware.
 	// The CEX profiler therefore uses the documented process-time clock on a
@@ -395,10 +504,21 @@ namespace VitaPerformanceTelemetry
 #if defined(VITASX2_CPU_PROFILER)
 	void RegisterIopGeneratedBlockCode(
 		u32 pc, const u32* code, u32 code_words);
+	void RegisterEeGeneratedBlockCode(
+		u32 pc, const u32* code, u32 code_words);
+	void RegisterEeGeneratedBlockTrace(const EeTraceBlockRegistration& block,
+		const u32* code, u32 code_words);
 	CpuProfileHotPcSnapshot GetCpuProfileHotEePcSnapshot(
-		u64 first_sequence, u64 next_sequence);
+		u64 first_sequence, u64 next_sequence, u32 first_rank);
 	CpuProfileHotPcSnapshot GetCpuProfileHotIopPcSnapshot(
-		u64 first_sequence, u64 next_sequence);
+		u64 first_sequence, u64 next_sequence, u32 first_rank);
+	CpuProfileEeSampleSnapshot GetCpuProfileEeSampleSnapshot(
+		u64 first_sequence, u64 next_sequence, u32 first_sample_index);
+	CpuProfileEeTraceBlock GetCpuProfileEeTraceBlock(
+		u32 pc, u32 expected_generation = 0);
+#if defined(VITASX2_QEMU_VALIDATION)
+	void RecordEeStatisticalSampleForValidation(u32 pc);
+#endif
 #else
 	inline void RegisterIopGeneratedBlockCode(
 		u32 pc, const u32* code, u32 code_words)
@@ -407,18 +527,27 @@ namespace VitaPerformanceTelemetry
 		(void)code;
 		(void)code_words;
 	}
+	inline void RegisterEeGeneratedBlockCode(
+		u32 pc, const u32* code, u32 code_words)
+	{
+		(void)pc;
+		(void)code;
+		(void)code_words;
+	}
 	inline CpuProfileHotPcSnapshot GetCpuProfileHotEePcSnapshot(
-		u64 first_sequence, u64 next_sequence)
+		u64 first_sequence, u64 next_sequence, u32 first_rank)
 	{
 		(void)first_sequence;
 		(void)next_sequence;
+		(void)first_rank;
 		return {};
 	}
 	inline CpuProfileHotPcSnapshot GetCpuProfileHotIopPcSnapshot(
-		u64 first_sequence, u64 next_sequence)
+		u64 first_sequence, u64 next_sequence, u32 first_rank)
 	{
 		(void)first_sequence;
 		(void)next_sequence;
+		(void)first_rank;
 		return {};
 	}
 #endif
@@ -818,6 +947,53 @@ namespace VitaPerformanceTelemetry
 		bool m_sampled = false;
 		u32 m_previous_statistical_stage =
 			static_cast<u32>(CpuStage::Count);
+#endif
+	};
+
+	// Changes only the asynchronous statistical marker. This deliberately does
+	// not enter the sparse exact-timing stack: a sampled VIF command can contain
+	// many small unpack operations, and process-time reads at each leaf change
+	// the workload being measured. Callers must also prove that they execute on
+	// CPU0; in particular, MTVU's worker-side dVifUnpack() is not eligible.
+	class ScopedCpuStatisticalStage
+	{
+	public:
+		explicit ScopedCpuStatisticalStage(CpuStage stage, bool cpu0_owned = true)
+		{
+#if defined(VITASX2_CPU_PROFILER)
+			m_entered = cpu0_owned && g_cpu_stage_profiler_enabled;
+			if (m_entered)
+			{
+				m_previous_stage = g_cpu_stage_statistical_marker.load(
+					std::memory_order_relaxed);
+				g_cpu_stage_statistical_marker.store(
+					static_cast<u32>(stage), std::memory_order_relaxed);
+			}
+#else
+			(void)stage;
+			(void)cpu0_owned;
+#endif
+		}
+
+		~ScopedCpuStatisticalStage()
+		{
+#if defined(VITASX2_CPU_PROFILER)
+			if (m_entered)
+			{
+				g_cpu_stage_statistical_marker.store(
+					m_previous_stage, std::memory_order_relaxed);
+			}
+#endif
+		}
+
+		ScopedCpuStatisticalStage(const ScopedCpuStatisticalStage&) = delete;
+		ScopedCpuStatisticalStage& operator=(
+			const ScopedCpuStatisticalStage&) = delete;
+
+	private:
+#if defined(VITASX2_CPU_PROFILER)
+		bool m_entered = false;
+		u32 m_previous_stage = static_cast<u32>(CpuStage::Count);
 #endif
 	};
 
